@@ -916,6 +916,24 @@ mod controller_optin_tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// A second name for a root-owned file (a hard link) is not the owner's
+    /// opt-in, here as in the agent (nodepolicy/optin.go).
+    #[test]
+    fn a_hard_linked_opt_in_is_ignored_as_the_agent_ignores_it() {
+        let d = scratch("optin-hardlink");
+        let elsewhere = scratch("optin-hardlink-other");
+        let other = elsewhere.join("other");
+        std::fs::write(&other, "x").unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::hard_link(&other, d.join(OPTIN_FILE)).unwrap();
+        match StateDir::open(&d, None).unwrap().optin(me().0) {
+            Ok(OptIn::Ignored(why)) => assert!(why.contains("links"), "{why}"),
+            other => panic!("a hard-linked opt-in: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
     #[test]
     fn enroll_opts_in_through_this_same_writer() {
         let argv = controller_allow_argv("/home/alex/.local/bin/noo");
