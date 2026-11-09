@@ -1477,7 +1477,7 @@ mod tests {
     #[tokio::test]
     async fn an_i163_workload_the_agent_does_not_declare_is_refused_before_the_hold() {
         let link = crate::node_link::NodeLink::for_base(&crate::upstream_body::stub("404 Not Found", None, b"{\"error\":\"not_declared\",\"detail\":\"no bundle\"}").await);
-        match preflight(&link, &decl(true, 1), None, &json!({}), "pai-voice/voice-worker", "awolf").await {
+        match preflight(&link, &decl(true, 1), None, &json!({}), "rhaddon/rhworker", "awolf").await {
             Err(AppError::UnavailableRetry { code, detail, .. }) => {
                 assert_eq!(code, "node_workloads_not_loaded");
                 assert!(detail.contains("nothing was held"), "{detail}");
@@ -1485,7 +1485,7 @@ mod tests {
             other => panic!("not_declared before the hold is a retry, got {other:?}"),
         }
         let link = crate::node_link::NodeLink::for_base(&crate::upstream_body::stub("404 Not Found", None, b"{\"error\":\"no_container\",\"detail\":\"gone\"}").await);
-        let e = preflight(&link, &decl(true, 1), None, &json!({}), "pai-voice/voice-worker", "awolf").await.unwrap_err();
+        let e = preflight(&link, &decl(true, 1), None, &json!({}), "rhaddon/rhworker", "awolf").await.unwrap_err();
         assert!(matches!(&e, AppError::Conflict(m) if m.starts_with("no_container (404)")), "{e:?}");
     }
 
