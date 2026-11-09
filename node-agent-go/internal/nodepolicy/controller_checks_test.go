@@ -397,13 +397,47 @@ func TestAHeldSetTamperedAfterItWasWrittenIsAnErrorAndTheGateRefuses(t *testing.
 	if code := nodewl.CodeOf(g.Check(context.Background(), entry("rhaddon", digestA))); code != nodewl.ReasonConsentUnapproved {
 		t.Errorf("the gate on a tampered set: %q", code)
 	}
-	// And a newer offer does not quietly paper over it.
-	d2 := setDoc(t, testNode, 2, apA)
-	if _, _, err := c.Offer(d2, s.sign(t, d2)); !errors.Is(err, ErrSetPersisted) {
-		t.Errorf("an offer over a tampered set: %v", err)
-	}
 	if st := c.Status(); st["set_state"] != "unverifiable" {
 		t.Errorf("status of a tampered set: %v", st)
+	}
+	// Its generation is still the floor: the same generation, freshly
+	// signed, does not replace it.
+	d1 := setDoc(t, testNode, 1, apA)
+	if _, _, err := c.Offer(d1, s.sign(t, d1)); !errors.Is(err, ErrSetRollback) {
+		t.Errorf("an offer at the tampered set's generation: %v", err)
+	}
+}
+
+// After `noo security pki rotate-signing-key` the held set no longer
+// verifies. A newer generation signed with the new key replaces it (the
+// operator re-signs N+1); the same or an older one does not, so nothing old
+// is replayed across the rotation.
+func TestAfterTheFleetKeyRotatesOnlyANewerSetSignedWithTheNewKeyReplacesTheHeldOne(t *testing.T) {
+	old := newSigner(t)
+	c := ctlFor(t, old, true)
+	d3 := setDoc(t, testNode, 3, apA)
+	if _, _, err := c.Offer(d3, old.sign(t, d3)); err != nil {
+		t.Fatal(err)
+	}
+	rotated := newSigner(t)
+	c.pubPath = rotated.pubPath
+	if _, _, err := c.Has("rhaddon", digestA); !errors.Is(err, ErrSetPersisted) {
+		t.Fatalf("the old set under the new key must not verify: %v", err)
+	}
+	same := setDoc(t, testNode, 3, apA)
+	if _, _, err := c.Offer(same, rotated.sign(t, same)); !errors.Is(err, ErrSetRollback) {
+		t.Fatalf("generation 3 again, under the new key: %v", err)
+	}
+	older := setDoc(t, testNode, 2, apA)
+	if _, _, err := c.Offer(older, rotated.sign(t, older)); !errors.Is(err, ErrSetRollback) {
+		t.Fatalf("an older generation under the new key: %v", err)
+	}
+	d4 := setDoc(t, testNode, 4, apA)
+	if gen, changed, err := c.Offer(d4, rotated.sign(t, d4)); err != nil || !changed || gen != 4 {
+		t.Fatalf("generation 4 under the new key: %d %v %v", gen, changed, err)
+	}
+	if ok, gen, err := c.Has("rhaddon", digestA); !ok || gen != 4 || err != nil {
+		t.Fatalf("the re-signed set admits: %v %d %v", ok, gen, err)
 	}
 }
 
@@ -480,6 +514,19 @@ func TestAnOptInThatIsASymlinkIsNotAnOptIn(t *testing.T) {
 	}
 	if ok, err := optedIn(dir, uint32(os.Getuid())); ok || err == nil {
 		t.Fatalf("a symlinked opt-in: %v %v", ok, err)
+	}
+}
+
+// A second name for the file (a hard link the agent made to some other
+// root-owned file) is not the owner's opt-in.
+func TestAnOptInWithAnotherLinkIsNotAnOptIn(t *testing.T) {
+	dir, elsewhere := t.TempDir(), t.TempDir()
+	other := writeOptIn(t, elsewhere, 0o644)
+	if err := os.Link(other, filepath.Join(dir, OptInFile)); err != nil {
+		t.Skipf("no hard links here: %v", err)
+	}
+	if ok, err := optedIn(dir, uint32(os.Getuid())); ok || err == nil {
+		t.Fatalf("a hard-linked opt-in: %v %v", ok, err)
 	}
 }
 

@@ -26,8 +26,8 @@ const OptInFile = "controller-approvals-optin"
 
 // OptedIn reports whether the owner of the node whose agent state directory
 // is dir opted in to controller approvals. Absent is false. Present, it must
-// be a regular file (never a symlink) owned by root and writable by no one
-// else; otherwise it is false and an error that says why.
+// be a regular file (never a symlink) with one link, owned by root and
+// writable by no one else; otherwise it is false and an error that says why.
 func OptedIn(dir string) (bool, error) { return optedIn(dir, 0) }
 
 func optedIn(dir string, owner uint32) (bool, error) {
@@ -45,6 +45,11 @@ func optedIn(dir string, owner uint32) (bool, error) {
 	}
 	if fi.Mode().Perm()&0o022 != 0 {
 		return false, fmt.Errorf("%s is writable by its group or by everyone (%v)", p, fi.Mode().Perm())
+	}
+	// One name only: a hard link the agent made to some other root-owned
+	// file (where fs.protected_hardlinks is off) is not the owner's opt-in.
+	if n, ok := fileLinks(fi); !ok || n != 1 {
+		return false, fmt.Errorf("%s has %d links, not 1: it is not a file root wrote for this", p, n)
 	}
 	uid, ok := fileOwner(fi)
 	if !ok {

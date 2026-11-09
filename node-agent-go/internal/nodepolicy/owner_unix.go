@@ -18,3 +18,12 @@ func fileOwner(fi fs.FileInfo) (uint32, bool) {
 	}
 	return st.Uid, true
 }
+
+// fileLinks is fi's hard link count.
+func fileLinks(fi fs.FileInfo) (uint64, bool) {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return uint64(st.Nlink), true
+}
