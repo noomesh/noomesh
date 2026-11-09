@@ -296,10 +296,14 @@ pub(crate) fn judge(holders: &[Holder], residue: &[String]) -> Check {
 
 /// The docker template that prints the NAME of every non-empty environment
 /// variable, one per line, followed by a tab and `path` when the value
-/// starts with `/run/` (strictly a prefix test: the first piece of the value
-/// split on `/run/` is empty). The value is split off and dropped inside the
-/// docker CLI; only that one bit about it reaches this process.
-pub(crate) const ENV_NAMES_TEMPLATE: &str = r#"{{range .Config.Env}}{{$p := split . "="}}{{if index $p 1}}{{index $p 0}}{{if not (index (split (index $p 1) "/run/") 0)}}{{"\t"}}path{{end}}{{"\n"}}{{end}}{{end}}"#;
+/// starts with `/run/`. Both tests read the whole entry, never a piece of
+/// the value split on `=`: a value is non-empty when the entry is not exactly
+/// `NAME=`, and it is a `/run/` path when the entry split on `NAME=/run/`
+/// starts empty (strictly a prefix test). Testing the piece between the
+/// first and second `=` dropped every value that starts with `=` (i599). The
+/// value is dropped inside the docker CLI; only that one bit reaches this
+/// process.
+pub(crate) const ENV_NAMES_TEMPLATE: &str = r#"{{range .Config.Env}}{{$p := split . "="}}{{$n := index $p 0}}{{if ne . (printf "%s=" $n)}}{{$n}}{{if not (index (split . (printf "%s=/run/" $n)) 0)}}{{"\t"}}path{{end}}{{"\n"}}{{end}}{{end}}"#;
 
 /// [`ENV_NAMES_TEMPLATE`] output: every name, and the names flagged `path`.
 /// Pure.
@@ -1153,16 +1157,26 @@ mod tests {
 
     #[test]
     fn the_env_template_flags_only_a_run_prefix() {
-        // Live docker 29.2.1, 2026-11-08: A_KEY=/run/rh-secrets/x.key,
-        // B_KEY=secretvalue, C_TOKEN= printed exactly these lines (PATH's
-        // value starts with /usr). The flag is a prefix test on the value.
-        let (names, paths) = parse_env_lines("A_KEY\tpath\nB_KEY\nPATH\n");
-        assert_eq!(names, ["A_KEY", "B_KEY", "PATH"]);
+        // Live docker 29.2.1, 2026-11-09: A_KEY=/run/rh-secrets/x.key,
+        // B_KEY=secretvalue, C_TOKEN=, D_KEY==weird, F_KEY==/run/x printed
+        // exactly these lines (PATH's value starts with /usr). The flag is a
+        // prefix test on the value; an empty value is the only one left out.
+        let (names, paths) = parse_env_lines("A_KEY\tpath\nB_KEY\nD_KEY\nF_KEY\nPATH\n");
+        assert_eq!(names, ["A_KEY", "B_KEY", "D_KEY", "F_KEY", "PATH"]);
         assert_eq!(paths, ["A_KEY"]);
         assert!(
-            ENV_NAMES_TEMPLATE.contains(r#"{{if not (index (split (index $p 1) "/run/") 0)}}{{"\t"}}path{{end}}"#),
-            "the flag must stay a /run/ prefix test: {ENV_NAMES_TEMPLATE}"
+            ENV_NAMES_TEMPLATE.contains(r#"{{if not (index (split . (printf "%s=/run/" $n)) 0)}}{{"\t"}}path{{end}}"#),
+            "the flag must stay a /run/ prefix test on the whole value: {ENV_NAMES_TEMPLATE}"
         );
+    }
+
+    #[test]
+    fn the_env_template_keeps_a_value_that_starts_with_equals() {
+        // i599: the old `{{if index $p 1}}` read the piece between the first
+        // and second `=`, so `D_KEY==weird` was never listed. Only an entry
+        // that is exactly `NAME=` is empty.
+        assert!(ENV_NAMES_TEMPLATE.contains(r#"{{if ne . (printf "%s=" $n)}}{{$n}}"#), "{ENV_NAMES_TEMPLATE}");
+        assert!(!ENV_NAMES_TEMPLATE.contains("{{if index $p 1}}"), "{ENV_NAMES_TEMPLATE}");
     }
 
     #[test]
