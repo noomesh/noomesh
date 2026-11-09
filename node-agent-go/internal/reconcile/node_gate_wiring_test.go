@@ -80,7 +80,7 @@ func TestTheAgentsGateIsWiredWithEveryInput(t *testing.T) {
 	facts := &nodepolicy.Facts{ComputeCaps: func() ([]string, error) { return caps, nil }}
 	nvidia := func(context.Context) (bool, error) { return nvidiaOK, nil }
 	check := func(cfg *config.Config, mode nodepolicy.Mode, e nodewl.Entry) string {
-		g := newGate(cfg, mode, approvals, nvidia, facts, sets)
+		g := newGate(cfg, mode, approvals, nil, nvidia, facts, sets)
 		return nodewl.CodeOf(g.Check(context.Background(), e))
 	}
 	e := gateEntry()

@@ -17,6 +17,18 @@ So:
   2. no other agent source names the reader's constant (ApprovalsFile);
   3. the reader writes nothing: no file-writing call in consent.go, and
      Approvals has only read, List and Has.
+
+The owner's opt-in to controller approvals (i596),
+`<NOO_AGENT_STATE>/controller-approvals-optin`, is held the same way. The
+controller's approval set is signed by the fleet key, which also signs every
+bundle, so an opt-in that the agent, a bundle, provision or noo-apply.sh could
+write would be no opt-in. So:
+  4. outside tests and docs, its name appears in exactly two sources: the
+     agent's READER (nodepolicy/optin.go) and the owner's WRITER
+     (`noo node workloads controller allow|deny`, which `noo enroll
+     --controller-approvals` runs, in node_workloads.rs);
+  5. no other agent source names the reader's constant (OptInFile);
+  6. the reader writes nothing: no file-writing call in optin.go.
 """
 
 from __future__ import annotations
@@ -36,6 +48,8 @@ WRITE_CALLS = re.compile(
     r"Symlink|Link|Truncate)\b|\bioutil\.(WriteFile|TempFile)\b|\bsyscall\.|\bunix\.|\.Write(String)?\("
 )
 READER_METHODS = {"read", "List", "Has"}
+OPTIN = "controller-approvals-optin"
+OPTIN_READER = "node-agent-go/internal/nodepolicy/optin.go"
 
 
 def _source_files() -> list[str]:
@@ -83,3 +97,28 @@ def test_the_agent_reads_the_store_and_never_writes_it() -> None:
     assert writes == [], f"{READER} writes files ({writes}); the agent must only read the consent store"
     methods = set(re.findall(r"^func \(\w+ \*Approvals\) (\w+)\(", src, re.M))
     assert methods == READER_METHODS, f"Approvals has methods {sorted(methods)}; only {sorted(READER_METHODS)} (reads)"
+
+
+def test_only_the_optin_reader_and_the_owners_command_name_the_optin() -> None:
+    naming = sorted(f for f in _source_files() if OPTIN in _text(f))
+    assert naming == sorted([OPTIN_READER, WRITER]), (
+        f"the controller-approvals opt-in is named outside its reader and the owner's command: {naming}. "
+        "Only local root (`noo node workloads controller allow|deny`, or `noo enroll --controller-approvals`) "
+        "may write it; the agent, provision, bundles and noo-apply.sh never do."
+    )
+
+
+def test_no_other_agent_code_reaches_the_optin_through_the_readers_constant() -> None:
+    users = sorted(
+        f
+        for f in _source_files()
+        if f.startswith("node-agent-go/") and f != OPTIN_READER and re.search(r"\bOptInFile\b", _text(f))
+    )
+    assert users == [], f"agent code reaches the opt-in's name: {users}"
+
+
+def test_the_agent_reads_the_optin_and_never_writes_it() -> None:
+    src = _text(OPTIN_READER)
+    assert "func optedIn(" in src and "os.Lstat(" in src, "the opt-in reader moved; point this guard at it"
+    writes = sorted({m.group(0) for m in WRITE_CALLS.finditer(src)})
+    assert writes == [], f"{OPTIN_READER} writes files ({writes}); the agent must only read the opt-in"

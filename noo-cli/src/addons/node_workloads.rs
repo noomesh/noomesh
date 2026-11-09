@@ -22,11 +22,12 @@
 
 // Consumers (i300 F2c): `decls::check_node_workloads` calls
 // `parse_node_workloads` at enable, upgrade (`--check` too), verify and
-// launch, and `node_images` reads the validated `image` names. What nothing
-// outside the tests reads yet carries its own `allow(dead_code)` below: the
-// refusal's `code`/`message` accessors (the callers print the Display form),
-// the model-slot and realtime fields (the node agent's, not the CLI's), and
-// `node_workload_doors`, which harness H6's door-leaf issuance plugs into.
+// launch, `node_images` reads the validated `image` names, and door-leaf
+// issuance (`commands::node_leaves`) reads `node_workload_doors`. What
+// nothing outside the tests reads yet carries its own `allow(dead_code)`
+// below: the refusal's `code`/`message` accessors (the callers print the
+// Display form) and the model-slot and realtime fields (the node agent's,
+// not the CLI's).
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
@@ -873,9 +874,8 @@ fn validate_scratch(ss: &[Scratch], ms: &[Slot]) -> Result<(), NodeWorkloadRefus
 /// The doors a validated declaration needs: one `(addon, workload)` per
 /// workload, in file order. The names are already held to the door-name rules
 /// (`door_name_invalid`, `door_name_too_long`) by [`parse_node_workloads`],
-/// so `noo-stunnel-<addon>-<workload>` is a legal DNS label. Harness H6's
-/// door-leaf issuance plugs in here; until it lands only the tests call it.
-#[cfg_attr(not(test), allow(dead_code))]
+/// so `noo-stunnel-<addon>-<workload>` is a legal DNS label. Door-leaf
+/// issuance (`commands::node_leaves::node_workload_doors`) reads it.
 pub fn node_workload_doors(addon: &str, parsed: &[NodeWorkload]) -> Vec<(String, String)> {
     parsed.iter().map(|w| (addon.to_string(), w.name.clone())).collect()
 }
