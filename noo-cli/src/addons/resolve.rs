@@ -425,6 +425,10 @@ pub trait Docker {
     fn running(&mut self) -> Result<Vec<Container>, String>;
 }
 
+/// The `docker inspect` format [`parse_inspect`] reads.
+pub const INSPECT_FORMAT: &str =
+    "{{.Name}}\t{{.Config.Image}}\t{{.Image}}\t{{index .Config.Labels \"com.docker.compose.service\"}}";
+
 /// One running container as `docker inspect` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Container {
@@ -433,23 +437,33 @@ pub struct Container {
     pub config_image: String,
     /// `.Image`: the id of the image it actually runs.
     pub image_id: String,
+    /// Its `com.docker.compose.service` label; empty when it has none.
+    pub service: String,
 }
 
-/// Parse `docker inspect --format '{{.Name}}\t{{.Config.Image}}\t{{.Image}}'`
-/// output. A line that is not three fields is an error, never skipped.
+/// Parse [`INSPECT_FORMAT`] output: name, config image, image id and the
+/// compose service label (an empty fourth field when the container has no
+/// label; three fields are read as no label). Any other line is an error,
+/// never skipped.
 pub fn parse_inspect(out: &str) -> Result<Vec<Container>, String> {
     out.lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| {
             let f: Vec<&str> = l.split('\t').collect();
-            match f.as_slice() {
-                [n, c, i] if !n.is_empty() && !c.is_empty() && !i.is_empty() => Ok(Container {
-                    name: n.trim_start_matches('/').to_string(),
-                    config_image: c.to_string(),
-                    image_id: i.to_string(),
-                }),
-                _ => Err(format!("unexpected docker inspect line {l:?}")),
+            let (n, c, i, s) = match f.as_slice() {
+                [n, c, i] => (*n, *c, *i, ""),
+                [n, c, i, s] => (*n, *c, *i, *s),
+                _ => return Err(format!("unexpected docker inspect line {l:?}")),
+            };
+            if n.is_empty() || c.is_empty() || i.is_empty() {
+                return Err(format!("unexpected docker inspect line {l:?}"));
             }
+            Ok(Container {
+                name: n.trim_start_matches('/').to_string(),
+                config_image: c.to_string(),
+                image_id: i.to_string(),
+                service: s.trim().to_string(),
+            })
         })
         .collect()
 }
@@ -693,7 +707,7 @@ impl Docker for LiveDocker {
                 return Ok(Vec::new());
             }
             let out = std::process::Command::new("docker")
-                .args(["inspect", "--type", "container", "--format", "{{.Name}}\t{{.Config.Image}}\t{{.Image}}"])
+                .args(["inspect", "--type", "container", "--format", INSPECT_FORMAT])
                 .args(&ids)
                 .output()
                 .map_err(|e| format!("docker inspect: {e}"))?;
@@ -1618,7 +1632,7 @@ pub(crate) mod tests {
         let id = digest('a');
         let inspect = format!("/noo-trellion-intel\t{pinned}\t{id}\n/noo-gateway\tnoomesh/gateway:v0.6.0\t{}\n", digest('b'));
         let running = parse_inspect(&inspect).unwrap();
-        assert_eq!(running[0], Container { name: "noo-trellion-intel".into(), config_image: pinned.clone(), image_id: id.clone() });
+        assert_eq!(running[0], Container { name: "noo-trellion-intel".into(), config_image: pinned.clone(), image_id: id.clone(), service: String::new() });
         assert_eq!(running_state(&pinned, Some(&id), &running), Running::Pinned(vec!["noo-trellion-intel".into()]));
 
         // Right reference, other bytes: recreated from a retagged image.
@@ -1639,7 +1653,7 @@ pub(crate) mod tests {
         }
 
         // The tag-less string `docker ps` prints is not the pinned digest.
-        let ps_shape = vec![Container { name: "noo-trellion-intel".into(), config_image: ROOT.into(), image_id: id.clone() }];
+        let ps_shape = vec![Container { name: "noo-trellion-intel".into(), config_image: ROOT.into(), image_id: id.clone(), service: String::new() }];
         assert!(matches!(running_state(&pinned, Some(&id), &ps_shape), Running::Drift(_)));
 
         assert_eq!(running_state(&pinned, Some(&id), &running[1..]), Running::Absent);
