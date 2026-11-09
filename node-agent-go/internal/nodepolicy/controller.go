@@ -229,10 +229,37 @@ func (c *ControllerApprovals) load() (*ControllerSet, []byte, error) {
 	return s, doc, nil
 }
 
+// heldGeneration is the held document's generation, read WITHOUT verifying
+// it: only ever a floor for Offer, never a reason to admit anything.
+func (c *ControllerApprovals) heldGeneration() (int64, error) {
+	p := c.path()
+	fi, err := os.Lstat(p)
+	if err != nil {
+		return 0, err
+	}
+	if !fi.Mode().IsRegular() || fi.Size() > maxControllerFile {
+		return 0, fmt.Errorf("%s is not a held set", p)
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return 0, err
+	}
+	doc, _, err := decodeSigned(b)
+	if err != nil {
+		return 0, err
+	}
+	var s ControllerSet
+	if err := json.Unmarshal(doc, &s); err != nil {
+		return 0, err
+	}
+	return s.Generation, nil
+}
+
 // Offer takes a set the gateway delivered. It is verified first; then it
 // must not be older than the held one (rollback), an equal generation must
 // be the same bytes (a no-op), and a newer one replaces the held one
-// atomically. Any error leaves the held set exactly as it was. gen is the
+// atomically. A held set that no longer verifies (a rotated fleet key) is
+// replaced only by a newer generation. Any error leaves the held set exactly as it was. gen is the
 // generation now held.
 func (c *ControllerApprovals) Offer(doc, sig []byte) (gen int64, changed bool, err error) {
 	pub, err := c.key()
@@ -247,7 +274,18 @@ func (c *ControllerApprovals) Offer(doc, sig []byte) (gen int64, changed bool, e
 	defer c.mu.Unlock()
 	cur, curDoc, err := c.load()
 	if err != nil {
-		return 0, false, err
+		// The held set no longer verifies: the fleet key was rotated
+		// (`noo security pki rotate-signing-key`), or the file was damaged.
+		// Its generation, read without trust, is still the floor, so only a
+		// NEWER set signed with the current key replaces it: the operator
+		// re-signs generation N+1, and an older set is never replayed. A
+		// file whose generation cannot be read at all sets no floor; writing
+		// one takes the agent's own access to its state directory.
+		if floor, ferr := c.heldGeneration(); ferr == nil && s.Generation <= floor {
+			return 0, false, fmt.Errorf("%w (offered %d, the unverifiable held set is %d): %w", ErrSetRollback, s.Generation, floor, err)
+		}
+		slog.Warn("controller approvals: replacing a held set that no longer verifies with a newer verified one", "error", err, "generation", s.Generation)
+		cur = nil
 	}
 	if cur != nil {
 		switch {

@@ -10,3 +10,6 @@ import "io/fs"
 // fileOwner cannot say who owns a file here, so no opt-in is ever read as
 // root's.
 func fileOwner(fs.FileInfo) (uint32, bool) { return 0, false }
+
+// fileLinks cannot be read here either.
+func fileLinks(fs.FileInfo) (uint64, bool) { return 0, false }

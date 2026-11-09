@@ -569,6 +569,8 @@ impl StateDir {
             OptIn::Ignored(format!("it is owned by uid {}, not root", md.uid()))
         } else if md.mode() & 0o022 != 0 {
             OptIn::Ignored(format!("its group or everyone can write it (mode {:o})", md.mode() & 0o777))
+        } else if md.nlink() != 1 {
+            OptIn::Ignored(format!("it has {} links, not 1", md.nlink()))
         } else {
             OptIn::Yes
         })
