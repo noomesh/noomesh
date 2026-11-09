@@ -364,24 +364,63 @@ fn agent_account() -> Option<(u32, u32)> {
     Some(unsafe { ((*pw).pw_uid, (*pw).pw_gid) })
 }
 
+/// What the approve and revoke verbs read from the box they run on. The
+/// entry points use [`Node::this`]; tests drive the same entry points with a
+/// scratch node, so a test exercises the real command line, not a helper.
+pub(crate) struct Node {
+    pub euid: u32,
+    pub agent: Option<(u32, u32)>,
+    pub state: PathBuf,
+    pub env: String,
+    /// This `noo`, by its full path: root's PATH (secure_path) usually lacks
+    /// `~/.local/bin`, so a bare `sudo noo` is "command not found" there.
+    pub exe: String,
+}
+
+impl Node {
+    fn this() -> Node {
+        Node {
+            // SAFETY: geteuid has no preconditions.
+            euid: unsafe { libc::geteuid() },
+            agent: agent_account(),
+            state: state_dir(),
+            env: agent_env(),
+            exe: std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "noo".to_string()),
+        }
+    }
+}
+
+/// A word the shell reads as itself; anything else is single-quoted.
+fn shell_word(s: &str) -> String {
+    if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+:@%=,".contains(c)) {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+/// The exact command to run again as root, with this `noo` by its full path.
+pub(crate) fn as_root(exe: &str, verb: &str, addon: &str, digest: &str) -> String {
+    format!("sudo {} node workloads {verb} {addon} {digest}", shell_word(exe))
+}
+
 /// `command` is the whole command in backticks, spelled out at each call
 /// site: the hint lint checks every suggested command, and cannot resolve a
-/// template.
-fn need_root(g: &Globals, command: &str) {
-    // SAFETY: geteuid has no preconditions.
-    if unsafe { libc::geteuid() } != 0 {
+/// template. `again` is the command to copy, from [`as_root`].
+fn need_root(g: &Globals, node: &Node, command: &str, again: &str) {
+    if node.euid != 0 {
         output::fail(
             g.json,
             ExitCode::Generic,
             "needs_root",
             &format!("{command} changes this node's consent store, which only root and the node agent may write"),
-            Some("run it on the node with sudo"),
+            Some(&format!("run it on the node as root, with noo by its full path (root's PATH may not reach it): {again}")),
         );
     }
 }
 
-fn agent_or_fail(g: &Globals) -> (u32, u32) {
-    agent_account().unwrap_or_else(|| {
+fn agent_or_fail(g: &Globals, node: &Node) -> (u32, u32) {
+    node.agent.unwrap_or_else(|| {
         output::fail(
             g.json,
             ExitCode::Generic,
@@ -413,13 +452,16 @@ fn store_fail(g: &Globals, why: &str) -> ! {
 
 /// `noo node workloads approve <addon> <digest>`
 pub fn node_workloads_approve(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    approve_on(g, args, &Node::this())
+}
+
+pub(crate) fn approve_on(g: &Globals, args: &[String], node: &Node) -> Result<i32, Unhandled> {
     let (addon, digest) = pair(args)?;
     let a = request_or_fail(g, &addon, &digest);
-    need_root(g, "`noo node workloads approve <addon> <digest>`");
-    let agent = agent_or_fail(g);
-    let dir = state_dir();
-    let added = approve_at(&dir, a, Some(agent)).unwrap_or_else(|why| store_fail(g, &why));
-    let (policy, admits) = policy_words(env_value(&agent_env(), "NOO_ADDON_WORKLOADS").as_deref());
+    need_root(g, node, "`noo node workloads approve <addon> <digest>`", &as_root(&node.exe, "approve", &addon, &digest));
+    let agent = agent_or_fail(g, node);
+    let added = approve_at(&node.state, a, Some(agent)).unwrap_or_else(|why| store_fail(g, &why));
+    let (policy, admits) = policy_words(env_value(&node.env, "NOO_ADDON_WORKLOADS").as_deref());
     if g.json {
         println!("{}", serde_json::json!({"addon": addon, "digest": digest, "approved": true, "already": !added, "policy": policy}));
         return Ok(0);
@@ -438,11 +480,15 @@ pub fn node_workloads_approve(g: &Globals, args: &[String]) -> Result<i32, Unhan
 
 /// `noo node workloads revoke <addon> <digest>`
 pub fn node_workloads_revoke(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    revoke_on(g, args, &Node::this())
+}
+
+pub(crate) fn revoke_on(g: &Globals, args: &[String], node: &Node) -> Result<i32, Unhandled> {
     let (addon, digest) = pair(args)?;
     let a = request_or_fail(g, &addon, &digest);
-    need_root(g, "`noo node workloads revoke <addon> <digest>`");
-    let agent = agent_or_fail(g);
-    let removed = revoke_at(&state_dir(), &a, Some(agent)).unwrap_or_else(|why| store_fail(g, &why));
+    need_root(g, node, "`noo node workloads revoke <addon> <digest>`", &as_root(&node.exe, "revoke", &addon, &digest));
+    let agent = agent_or_fail(g, node);
+    let removed = revoke_at(&node.state, &a, Some(agent)).unwrap_or_else(|why| store_fail(g, &why));
     if !removed {
         output::fail(
             g.json,
@@ -685,5 +731,49 @@ mod tests {
         assert_eq!(env_value("NOO_ADDON_WORKLOADS_ON_CONTROLLER=1\n", "NOO_ADDON_WORKLOADS"), None);
         assert!(policy_words(None).1 && policy_words(Some("approve")).1);
         assert!(!policy_words(Some("none")).1 && !policy_words(Some("yes")).1);
+    }
+
+    fn words(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    fn quiet() -> Globals {
+        Globals { json: true, verbose: false, gateway_override: None, timeout_secs: None, token: None, quiet: true }
+    }
+
+    /// A node whose state is a scratch directory and whose agent is this
+    /// test's own account; root, as `sudo` makes the real verb.
+    fn scratch_node(tag: &str) -> Node {
+        Node { euid: 0, agent: Some(me()), state: scratch(tag), env: String::new(), exe: "/home/alex/.local/bin/noo".to_string() }
+    }
+
+    #[test]
+    fn approve_takes_the_addon_and_the_digest_from_its_command_line() {
+        let n = scratch_node("entry-approve");
+        assert_eq!(approve_on(&quiet(), &words(&["rhaddon", D1]), &n).ok(), Some(0));
+        assert_eq!(stored(&n.state), vec![ap("rhaddon", D1)]);
+        let _ = std::fs::remove_dir_all(&n.state);
+    }
+
+    #[test]
+    fn revoke_takes_the_addon_and_the_digest_from_its_command_line() {
+        let n = scratch_node("entry-revoke");
+        approve_at(&n.state, ap("rhaddon", D1), Some(me())).unwrap();
+        approve_at(&n.state, ap("rhaddon", D2), Some(me())).unwrap();
+        assert_eq!(revoke_on(&quiet(), &words(&["rhaddon", D1]), &n).ok(), Some(0));
+        assert_eq!(stored(&n.state), vec![ap("rhaddon", D2)]);
+        let _ = std::fs::remove_dir_all(&n.state);
+    }
+
+    #[test]
+    fn the_root_hint_names_this_noo_by_its_full_path() {
+        assert_eq!(
+            as_root("/home/alex/.local/bin/noo", "approve", "rhaddon", D1),
+            format!("sudo /home/alex/.local/bin/noo node workloads approve rhaddon {D1}")
+        );
+        assert_eq!(
+            as_root("/home/al ex/bin/noo", "revoke", "rhaddon", D1),
+            format!("sudo '/home/al ex/bin/noo' node workloads revoke rhaddon {D1}")
+        );
     }
 }
