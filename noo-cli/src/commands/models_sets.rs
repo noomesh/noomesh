@@ -60,6 +60,8 @@ const SETS_DIR: &str = "sets";
 const MANIFEST: &str = "model-set.json";
 const SIGNATURE: &str = "model-set.json.sig";
 const ACCEPTED: &str = "license-accepted.json";
+/// `noo models accept hf:<repo>@<sha>` records, beside `sets/` (i576).
+const ACCEPTED_DIR: &str = "accepted";
 /// The largest non-LFS file taken into a set. Hugging Face keeps anything
 /// bigger in LFS; a bigger file with no LFS digest cannot be verified.
 const SMALL_MAX: u64 = 8 << 20;
@@ -254,12 +256,27 @@ pub(crate) fn parse_target(t: &str) -> Result<(String, Option<String>), String> 
     Ok((id.to_string(), rev.map(str::to_string)))
 }
 
-pub(crate) fn parse_accept_with(a: &mut Args) -> Result<String, ArgError> {
-    let t = a.one("<id>")?;
-    if !model_set::id_ok(&t) {
-        return Err(ArgError::new(format!("`{t}` is not a model set id")));
+/// What `noo models accept` records an acceptance for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AcceptFor {
+    /// One set, by id: its next stage reads it.
+    Set(String),
+    /// A gated Hugging Face repo at one commit: every set staged from it
+    /// under the same licence terms (i576). Hugging Face gates a repo once,
+    /// so the operator accepts it once.
+    Repo { repo: String, sha: String },
+}
+
+pub(crate) fn parse_accept_with(a: &mut Args) -> Result<AcceptFor, ArgError> {
+    let t = a.one("<id>|hf:<org>/<name>@<commit>")?;
+    if t.starts_with("hf:") {
+        let (repo, sha) = parse_spec(&t).map_err(ArgError::new)?;
+        return Ok(AcceptFor::Repo { repo, sha });
     }
-    Ok(t)
+    if !model_set::id_ok(&t) {
+        return Err(ArgError::new(format!("`{t}` is not a model set id (or hf:<org>/<name>@<commit>)")));
+    }
+    Ok(AcceptFor::Set(t))
 }
 
 pub(crate) struct RmArgs {
@@ -628,16 +645,28 @@ fn accepted_path(models_dir: &Path, id: &str) -> PathBuf {
     models_dir.join(SETS_DIR).join(id).join(ACCEPTED)
 }
 
-/// The `{by, at}` `noo models accept <id>` recorded, if any.
+/// The `{by, at}` `noo models accept <id>` recorded, if any. A record a
+/// repo acceptance left (`via`, [`record_repo_acceptance`]) is not one: it
+/// covers that repo and commit only, never the set id's next source.
 pub(crate) fn read_acceptance(models_dir: &Path, id: &str) -> Option<(String, String)> {
     let raw = std::fs::read(accepted_path(models_dir, id)).ok()?;
     let v = model_set::parse_strict(&raw).ok()?;
+    if !v["via"].is_null() {
+        return None;
+    }
     let by = v["by"].as_str()?.to_string();
     let at = v["at"].as_str()?.to_string();
     if by.is_empty() || by.len() > 128 || !model_set::rfc3339(&at) {
         return None;
     }
     Some((by, at))
+}
+
+/// The `via` a repo acceptance left on a set: `(by, at, "hf:<repo>@<sha>")`.
+pub(crate) fn read_via(models_dir: &Path, id: &str) -> Option<(String, String, String)> {
+    let raw = std::fs::read(accepted_path(models_dir, id)).ok()?;
+    let v = model_set::parse_strict(&raw).ok()?;
+    Some((v["by"].as_str()?.to_string(), v["at"].as_str()?.to_string(), v["via"].as_str()?.to_string()))
 }
 
 pub(crate) fn write_acceptance(
@@ -652,6 +681,111 @@ pub(crate) fn write_acceptance(
     let body = serde_json::to_vec_pretty(&json!({"by": by, "at": at}))
         .map_err(|e| StageError::Io(format!("serialising the acceptance: {e}")))?;
     write_atomic(&dir, ACCEPTED, &body)
+}
+
+/// `noo models accept hf:<repo>@<sha>`: who accepted the repo's licence at
+/// that commit, and the licence terms it was bound to by the first set
+/// staged under it (`None` until then).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepoAcceptance {
+    pub by: String,
+    pub at: String,
+    pub terms: Option<Vec<String>>,
+}
+
+/// `<MODELS_DIR>/accepted/<org>/<name>/<sha>.json`. Both repo parts start
+/// alphanumeric ([`model_set::hf_repo_ok`]) and the sha is 40 hex, so the
+/// path never leaves `accepted/`.
+fn repo_accepted_path(models_dir: &Path, repo: &str, sha: &str) -> PathBuf {
+    models_dir.join(ACCEPTED_DIR).join(repo).join(format!("{sha}.json"))
+}
+
+pub(crate) fn read_repo_acceptance(models_dir: &Path, repo: &str, sha: &str) -> Option<RepoAcceptance> {
+    if !model_set::hf_repo_ok(repo) || !model_set::commit_ok(sha) {
+        return None;
+    }
+    let raw = std::fs::read(repo_accepted_path(models_dir, repo, sha)).ok()?;
+    let v = model_set::parse_strict(&raw).ok()?;
+    if v["repo"].as_str() != Some(repo) || v["sha"].as_str() != Some(sha) {
+        return None;
+    }
+    let by = v["by"].as_str()?.to_string();
+    let at = v["at"].as_str()?.to_string();
+    if by.is_empty() || by.len() > 128 || !model_set::rfc3339(&at) {
+        return None;
+    }
+    // Unbound = no `terms` key: `parse_strict` refuses a JSON null.
+    let terms = match v.get("terms") {
+        None => None,
+        Some(Value::Array(a)) => {
+            let t: Vec<String> = a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
+            if t.is_empty() || t.len() != a.len() {
+                return None;
+            }
+            Some(t)
+        }
+        _ => return None,
+    };
+    Some(RepoAcceptance { by, at, terms })
+}
+
+pub(crate) fn write_repo_acceptance(
+    models_dir: &Path,
+    repo: &str,
+    sha: &str,
+    r: &RepoAcceptance,
+) -> Result<PathBuf, StageError> {
+    let path = repo_accepted_path(models_dir, repo, sha);
+    let dir = path.parent().expect("a file under accepted/").to_path_buf();
+    mkdir(&dir)?;
+    let mut doc = json!({"repo": repo, "sha": sha, "by": r.by, "at": r.at});
+    if let Some(t) = &r.terms {
+        doc["terms"] = json!(t);
+    }
+    let body = serde_json::to_vec_pretty(&doc)
+    .map_err(|e| StageError::Io(format!("serialising the acceptance: {e}")))?;
+    write_atomic(&dir, &format!("{sha}.json"), &body)
+}
+
+/// The licence terms a set is staged under: its licence id (`--license`,
+/// else the model card's), then its `--license-additional` ids, sorted.
+/// `None` when no licence is named (the stage refuses that on its own).
+fn license_terms(req: &StageArgs, card: Option<&str>) -> Option<Vec<String>> {
+    let id = req.license.clone().or_else(|| card.map(str::to_string))?;
+    let mut extra: Vec<String> = req.license_additional.iter().map(|a| a.id.clone()).collect();
+    extra.sort();
+    Some(std::iter::once(id).chain(extra).collect())
+}
+
+/// After a set is staged AND signed under `noo models accept hf:<repo>@<sha>`
+/// (i576):
+/// - the set gets its own acceptance record naming the repo acceptance it
+///   came from (`via`), so `noo models list` can say why it counts as
+///   accepted. The signed manifest cannot carry `via`: the validator (and the
+///   node agent's, which it ports) allows only `{by, at}` there;
+/// - a repo acceptance that named no licence terms yet is bound to this
+///   set's, so a later set under other terms is refused. Never before the
+///   set is signed, so a failed stage with a mistyped `--license` binds
+///   nothing.
+pub(crate) fn record_repo_acceptance(
+    models_dir: &Path,
+    req: &StageArgs,
+    staged: &Staged,
+    recorded: Option<&RepoAcceptance>,
+) -> Result<(), StageError> {
+    let (true, Some(r)) = (staged.via_repo, recorded) else { return Ok(()) };
+    let dir = models_dir.join(SETS_DIR).join(&req.id);
+    mkdir(&dir)?;
+    let body = serde_json::to_vec_pretty(&json!({
+        "by": r.by, "at": r.at, "via": format!("hf:{}@{}", req.repo, req.sha),
+    }))
+    .map_err(|e| StageError::Io(format!("serialising the acceptance: {e}")))?;
+    write_atomic(&dir, ACCEPTED, &body)?;
+    if let Some(terms) = &staged.bind_terms {
+        let bound = RepoAcceptance { terms: Some(terms.clone()), ..r.clone() };
+        write_repo_acceptance(models_dir, &req.repo, &req.sha, &bound)?;
+    }
+    Ok(())
 }
 
 /// The operator as the audit log names them, safe to put on one log line.
@@ -675,6 +809,8 @@ pub(crate) struct Env<'a> {
     pub by: &'a str,
     pub now: &'a str,
     pub recorded: Option<(String, String)>,
+    /// `noo models accept hf:<repo>@<sha>` for this stage's repo and commit.
+    pub repo_recorded: Option<RepoAcceptance>,
     /// Show each download's live line (`DownloadLine`); false under `--json`
     /// and in tests.
     pub show_progress: bool,
@@ -686,6 +822,12 @@ pub(crate) struct Staged {
     pub files: Vec<FileRec>,
     pub accept: &'static str,
     pub accepted: Option<(String, String)>,
+    /// The acceptance came from the repo record, which named no terms yet:
+    /// bind it to these once the set is signed (never before, so a failed
+    /// stage with a mistyped `--license` binds nothing).
+    pub bind_terms: Option<Vec<String>>,
+    /// The acceptance came from `noo models accept hf:<repo>@<sha>`.
+    pub via_repo: bool,
 }
 
 impl Staged {
@@ -957,17 +1099,44 @@ pub(crate) fn stage_set(
     };
 
     let accept: &'static str = if listing.gated { "operator" } else { "none" };
+    let (mut bind_terms, mut via_repo) = (None, false);
     let accepted = if listing.gated {
         if req.accept_license {
             Some((env.by.to_string(), env.now.to_string()))
         } else if let Some(r) = &env.recorded {
             Some(r.clone())
+        } else if let Some(r) = &env.repo_recorded {
+            // One acceptance of the repo at this commit covers every set
+            // staged from it under the SAME licence terms (i576).
+            let terms = license_terms(req, listing.license.as_deref());
+            if let (Some(bound), Some(t)) = (&r.terms, &terms) {
+                if bound != t {
+                    return Err(StageError::License(format!(
+                        "hf:{repo}@{sha} was accepted for the licence {had}; this set declares \
+                         {now}: accept it for this set (`noo models accept {id}`, or re-run \
+                         with --accept-license)",
+                        repo = req.repo,
+                        sha = req.sha,
+                        had = bound.join(" + "),
+                        now = t.join(" + "),
+                        id = req.id
+                    )));
+                }
+            }
+            if r.terms.is_none() {
+                bind_terms = terms;
+            }
+            via_repo = true;
+            say(&format!("licence accepted by {} at {} for hf:{}@{} (covers this set)", r.by, r.at, req.repo, req.sha));
+            Some((r.by.clone(), r.at.clone()))
         } else {
             return Err(StageError::License(format!(
                 "the licence for {repo} needs the operator's acceptance: read it at \
                  https://huggingface.co/{repo}, then re-run with --accept-license, or run \
+                 `noo models accept hf:{repo}@{sha}` (every set of that repo and commit) or \
                  `noo models accept {id}` first",
                 repo = req.repo,
+                sha = req.sha,
                 id = req.id
             )));
         }
@@ -1091,7 +1260,7 @@ pub(crate) fn stage_set(
     std::fs::rename(&sig_part, &sig_path)
         .map_err(|e| io_err(&format!("renaming into {}", sig_path.display()), e))?;
 
-    Ok(Staged { dir: set_dir, files: recs, accept, accepted })
+    Ok(Staged { dir: set_dir, files: recs, accept, accepted, bind_terms, via_repo })
 }
 
 /// The human lines for a finished stage.
@@ -1128,6 +1297,9 @@ pub(crate) struct Row {
     pub bytes: u64,
     pub signature: &'static str,
     pub problem: Option<String>,
+    /// `hf:<repo>@<sha>` when the acceptance came from a repo acceptance
+    /// (i576): the set's own record names it and matches the signed manifest.
+    pub via: Option<String>,
 }
 
 fn sorted_dirs(p: &Path) -> Vec<PathBuf> {
@@ -1210,6 +1382,7 @@ pub(crate) fn scan(models_dir: &Path, public: &Path, kind: Option<&str>) -> Vec<
                 .as_array()
                 .map(|a| a.iter().filter_map(|f| f["bytes"].as_u64()).sum::<u64>())
                 .unwrap_or(0);
+            let via = via_of(models_dir, &id, &v);
             rows.push(Row {
                 id,
                 revision,
@@ -1219,16 +1392,29 @@ pub(crate) fn scan(models_dir: &Path, public: &Path, kind: Option<&str>) -> Vec<
                 bytes: size,
                 signature,
                 problem,
+                via,
             });
         }
     }
     rows
 }
 
+/// The repo acceptance a set's licence acceptance came from: its own record
+/// says `via`, with the same `{by, at}` the signed manifest carries, for the
+/// repo and commit the manifest was staged from. Anything else says nothing.
+fn via_of(models_dir: &Path, id: &str, manifest: &Value) -> Option<String> {
+    let (by, at, via) = read_via(models_dir, id)?;
+    let acc = &manifest["license"]["accepted"];
+    let hf = &manifest["source"]["hf"];
+    let from = format!("hf:{}@{}", hf["repo"].as_str()?, hf["ref"].as_str()?);
+    (acc["by"].as_str() == Some(by.as_str()) && acc["at"].as_str() == Some(at.as_str()) && via == from).then_some(via)
+}
+
 fn row_json(r: &Row) -> Value {
     json!({
         "id": r.id, "revision": r.revision, "kind": r.kind, "digests": r.digests,
-        "license": r.license, "bytes": r.bytes, "signature": r.signature, "problem": r.problem,
+        "license": r.license, "license_via": r.via, "bytes": r.bytes, "signature": r.signature,
+        "problem": r.problem,
     })
 }
 
@@ -1257,7 +1443,11 @@ fn set_table(rows: &[Row]) -> ([ui::Col; 7], Vec<Vec<String>>, Vec<String>) {
                 r.revision.get(..12).unwrap_or(&r.revision).to_string(),
                 models_fetch::human(r.bytes),
                 r.signature.to_string(),
-                short_license(&r.license),
+                match &r.via {
+                    // `via hf:<org>/<name>@<7 hex>`: why it counts as accepted.
+                    Some(v) => format!("{} via {}", short_license(&r.license), v.get(..v.len().saturating_sub(33)).unwrap_or(v)),
+                    None => short_license(&r.license),
+                },
                 r.digests.clone(),
                 r.problem.clone().unwrap_or_default(),
             ]
@@ -1378,6 +1568,7 @@ pub fn models_stage(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         by: &by,
         now: &now,
         recorded: read_acceptance(&dir, &req.id),
+        repo_recorded: read_repo_acceptance(&dir, &req.repo, &req.sha),
         show_progress: !g.json,
     };
     if !g.json {
@@ -1422,10 +1613,14 @@ pub fn models_stage(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         req.id, req.sha, req.repo
     ));
     if let Some((aby, at)) = &staged.accepted {
+        let via = if staged.via_repo { format!(" via=hf:{}@{}", req.repo, req.sha) } else { String::new() };
         audit(&format!(
-            "{now} model_license_accepted id={} repo={} by={aby} at={at}",
+            "{now} model_license_accepted id={} repo={} by={aby} at={at}{via}",
             req.id, req.repo
         ));
+    }
+    if let Err(e) = record_repo_acceptance(&dir, &req, &staged, env.repo_recorded.as_ref()) {
+        ui::warned(&format!("hf:{}@{}: this set's acceptance record could not be written ({e})", req.repo, req.sha));
     }
     if g.json {
         let files: Vec<Value> = staged
@@ -1468,24 +1663,45 @@ pub fn models_stage(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 
 /// `noo models accept <id>`: record the operator's acceptance for later staging.
 pub fn models_accept(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let id = parse_accept_with(&mut Args::new(args))?;
-    let (_store, dir) = models_fetch::writable_store(g, "noo models accept <id>");
+    let what = parse_accept_with(&mut Args::new(args))?;
+    let (_store, dir) = models_fetch::writable_store(g, "noo models accept <id>|hf:<org>/<name>@<commit>");
     let by = clean_identity(&super::secrets_reveal::whoami());
     let now = super::secrets_reveal::now_rfc3339();
     if !model_set::rfc3339(&now) {
         let why = "could not read the clock to date the acceptance";
         fail(g.json, ExitCode::Generic, "no_clock", why, None);
     }
-    if let Err(e) = write_acceptance(&dir, &id, &by, &now) {
+    let (subject, written) = match &what {
+        AcceptFor::Set(id) => (id.clone(), write_acceptance(&dir, id, &by, &now)),
+        AcceptFor::Repo { repo, sha } => {
+            // A re-accept keeps the terms the first staged set bound.
+            let terms = read_repo_acceptance(&dir, repo, sha).and_then(|r| r.terms);
+            let r = RepoAcceptance { by: by.clone(), at: now.clone(), terms };
+            (format!("hf:{repo}@{sha}"), write_repo_acceptance(&dir, repo, sha, &r))
+        }
+    };
+    if let Err(e) = written {
         fail(g.json, ExitCode::Generic, "accept_failed", &e.to_string(), None);
     }
-    audit(&format!("{now} model_license_accepted id={id} by={by}"));
+    match &what {
+        AcceptFor::Set(id) => audit(&format!("{now} model_license_accepted id={id} by={by}")),
+        AcceptFor::Repo { .. } => audit(&format!("{now} model_license_accepted repo={subject} by={by}")),
+    }
     if g.json {
-        println!("{}", json!({"id": id, "accepted": {"by": by, "at": now}}));
+        let key = if matches!(what, AcceptFor::Set(_)) { "id" } else { "repo" };
+        let mut v = json!({"accepted": {"by": by, "at": now}});
+        v[key] = json!(subject);
+        println!("{v}");
         return Ok(0);
     }
-    ui::done(&format!("recorded: {by} accepts the licence of {id} at {now}"));
-    let note = "the licence text is upstream's: read it before staging; the next stage uses this";
+    ui::done(&format!("recorded: {by} accepts the licence of {subject} at {now}"));
+    let note = match &what {
+        AcceptFor::Set(_) => "the licence text is upstream's: read it before staging; the next stage uses this",
+        AcceptFor::Repo { .. } => {
+            "the licence text is upstream's: read it before staging; it covers every set staged from \
+             this repo and commit under the same licence"
+        }
+    };
     println!("{}", ui::muted(note));
     Ok(0)
 }
@@ -1790,6 +2006,7 @@ mod tests {
             by: "alice",
             now: "2026-11-05T10:00:00Z",
             recorded,
+            repo_recorded: None,
             show_progress: false,
         };
         let mut lines = Vec::new();
@@ -2069,6 +2286,7 @@ mod tests {
             by: "alice",
             now: "2026-11-05T10:00:00Z",
             recorded: None,
+            repo_recorded: None,
             show_progress: false,
         };
         let sign = |data: &Path, out: &Path| sign_file(&key, data, out);
@@ -2437,6 +2655,7 @@ mod tests {
             by: "alice",
             now: "2026-11-05T10:00:00Z",
             recorded: None,
+            repo_recorded: None,
             show_progress: false,
         }
     }
@@ -2965,7 +3184,7 @@ mod tests {
 
     #[test]
     fn accept_holds_the_set_id_to_the_rule() {
-        assert_eq!(parse_accept_with(&mut Args::new(&s(&["a-set"]))).unwrap(), "a-set");
+        assert_eq!(parse_accept_with(&mut Args::new(&s(&["a-set"]))).unwrap(), AcceptFor::Set("a-set".into()));
         for bad in ["A", "../x", "a/b", ".a"] {
             assert!(parse_accept_with(&mut Args::new(&s(&[bad]))).is_err(), "{bad}");
         }
@@ -3119,6 +3338,7 @@ mod tests {
             bytes: 15 << 30,
             signature: "ok",
             problem: problem.map(Into::into),
+            via: None,
         };
         let rows = [
             row("personal-7b", "rbwolf 2026-11-08T10:11:12Z", None),
@@ -3133,5 +3353,144 @@ mod tests {
         assert_eq!(cells[0][3], "ok");
         assert!(!cells.iter().flatten().any(|c| c == "voice"), "KIND is the header's, not a column");
         assert_eq!(problems, ["personal-voices@0123456789ab: the licence needs the operator's acceptance: noo models accept personal-voices"]);
+    }
+
+    // ── i576: one accept per repo and commit ─────────────────────────────
+
+    fn repo_rec(terms: Option<&[&str]>) -> RepoAcceptance {
+        RepoAcceptance {
+            by: "dave".into(),
+            at: "2026-11-08T09:00:00Z".into(),
+            terms: terms.map(|t| t.iter().map(|s| s.to_string()).collect()),
+        }
+    }
+
+    /// A stage that reads the repo record from disk, as `models_stage` does,
+    /// then records it the way the command does after a signed stage.
+    fn stage_under_repo(f: &Fake, dir: &Path, req: &StageArgs) -> Result<Staged, StageError> {
+        let repo_recorded = read_repo_acceptance(dir, REPO, SHA);
+        let env = Env {
+            base: &f.base,
+            token: None,
+            models_dir: dir,
+            by: "alice",
+            now: "2026-11-05T10:00:00Z",
+            recorded: read_acceptance(dir, &req.id),
+            repo_recorded: repo_recorded.clone(),
+            show_progress: false,
+        };
+        let st = stage_set(&env, req, &needs(), &fake_sign, &mut |_: &str| {})?;
+        record_repo_acceptance(dir, req, &st, repo_recorded.as_ref()).expect("recorded");
+        Ok(st)
+    }
+
+    fn second(req: &StageArgs) -> StageArgs {
+        StageArgs { id: "test-voice-set-two".into(), ..req.clone() }
+    }
+
+    #[test]
+    fn accept_takes_a_set_id_or_a_pinned_repo() {
+        let p = |a: &str| parse_accept_with(&mut Args::new(&s(&[a])));
+        assert_eq!(p(&format!("hf:{REPO}@{SHA}")).unwrap(), AcceptFor::Repo { repo: REPO.into(), sha: SHA.into() });
+        assert_eq!(p("a-set").unwrap(), AcceptFor::Set("a-set".into()));
+        for bad in [format!("hf:{REPO}@main"), format!("hf:{REPO}"), format!("hf:../x@{SHA}")] {
+            assert!(p(&bad).is_err(), "{bad}");
+        }
+    }
+
+    /// One `noo models accept hf:<repo>@<sha>` covers every set staged from
+    /// that repo and commit: the first binds its licence terms once signed,
+    /// each set gets its own record naming the repo acceptance, and
+    /// `models list` shows it.
+    #[test]
+    fn one_repo_acceptance_covers_every_set_of_that_repo_and_commit() {
+        let dir = tmpdir("i576-covers");
+        let f = hf(json!("manual"));
+        write_repo_acceptance(&dir, REPO, SHA, &repo_rec(None)).unwrap();
+        let a = request("voice");
+        let st = stage_under_repo(&f, &dir, &a).expect("the repo acceptance covers the first set");
+        assert!(st.via_repo);
+        let v: Value = serde_json::from_slice(&st.manifest()).unwrap();
+        assert_eq!(v["license"]["accepted"], json!({"by": "dave", "at": "2026-11-08T09:00:00Z"}));
+        assert_eq!(read_repo_acceptance(&dir, REPO, SHA).unwrap().terms, Some(vec!["apache-2.0".to_string()]), "bound once signed");
+
+        let b = second(&a);
+        let st = stage_under_repo(&f, &dir, &b).expect("and the second, with no accept of its own");
+        assert!(st.via_repo && st.bind_terms.is_none(), "already bound: {:?}", st.bind_terms);
+        let via = format!("hf:{REPO}@{SHA}");
+        assert_eq!(read_via(&dir, &b.id).map(|r| r.2), Some(via.clone()));
+        assert_eq!(read_acceptance(&dir, &b.id), None, "a via record is never an id-level acceptance");
+
+        let rows = scan(&dir, &dir.join("no-such.pub"), Some("voice"));
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.via.as_deref() == Some(via.as_str())), "{:?}", rows.iter().map(|r| &r.via).collect::<Vec<_>>());
+        let (_, cells, _) = set_table(&rows);
+        assert_eq!(cells[0][4], "dave 2026-11-08 via hf:test-org/test-voice@0123456");
+    }
+
+    /// COMPLIANCE (pre-merge mutant): a repo acceptance bound to one set of
+    /// licence terms never covers a set that declares others, whether the
+    /// licence id or an additional licence differs.
+    #[test]
+    fn a_repo_acceptance_never_covers_other_licence_terms() {
+        let f = hf(json!("manual"));
+        let mut other_id = second(&request("voice"));
+        other_id.license = Some("MIT".into());
+        let mut other_extra = second(&request("voice"));
+        other_extra.license_additional.push(AdditionalLicense {
+            id: "CC-BY-4.0".into(),
+            url: "https://creativecommons.org/licenses/by/4.0/".into(),
+            notice_path: None,
+        });
+        for (tag, req) in [("id", other_id), ("extra", other_extra)] {
+            let dir = tmpdir(&format!("i576-terms-{tag}"));
+            write_repo_acceptance(&dir, REPO, SHA, &repo_rec(Some(&["apache-2.0"]))).unwrap();
+            let e = stage_under_repo(&f, &dir, &req).expect_err(tag);
+            assert!(matches!(e, StageError::License(_)), "{tag}: {e}");
+            assert!(e.to_string().contains("accept it for this set"), "{tag}: {e}");
+            assert!(!dir.join(SETS_DIR).join(&req.id).join(SHA).exists(), "{tag}: nothing staged");
+        }
+    }
+
+    /// A repo acceptance names one repo and one commit: another commit's,
+    /// or another repo's, never counts, and the refusal names the command.
+    #[test]
+    fn a_repo_acceptance_for_another_commit_or_repo_never_counts() {
+        let f = hf(json!("manual"));
+        for (tag, repo, sha) in [("commit", REPO, "f".repeat(40)), ("repo", "test-org/other", SHA.to_string())] {
+            let dir = tmpdir(&format!("i576-other-{tag}"));
+            write_repo_acceptance(&dir, repo, &sha, &repo_rec(None)).unwrap();
+            let e = stage_under_repo(&f, &dir, &request("voice")).expect_err(tag);
+            assert!(matches!(e, StageError::License(_)), "{tag}: {e}");
+            assert!(e.to_string().contains(&format!("noo models accept hf:{REPO}@{SHA}")), "{tag}: {e}");
+        }
+    }
+
+    /// The record is read only whole: a name, a real time, its own repo and
+    /// commit, and terms that are absent or a non-empty list of strings.
+    #[test]
+    fn a_repo_acceptance_record_is_read_only_whole() {
+        let dir = tmpdir("i576-read");
+        write_repo_acceptance(&dir, REPO, SHA, &repo_rec(Some(&["apache-2.0", "MIT"]))).unwrap();
+        assert_eq!(read_repo_acceptance(&dir, REPO, SHA), Some(repo_rec(Some(&["apache-2.0", "MIT"]))));
+        write_repo_acceptance(&dir, REPO, SHA, &repo_rec(None)).unwrap();
+        assert_eq!(read_repo_acceptance(&dir, REPO, SHA), Some(repo_rec(None)), "an unbound record reads back unbound");
+        let path = repo_accepted_path(&dir, REPO, SHA);
+        // Unbound is no `terms` key at all: the strict parser refuses a null.
+        let good = json!({"repo": REPO, "sha": SHA, "by": "dave", "at": "2026-11-08T09:00:00Z"});
+        let mut bad: Vec<Value> = Vec::new();
+        for (k, val) in [("by", json!("")), ("at", json!("yesterday")), ("repo", json!("test-org/other")),
+            ("sha", json!("f".repeat(40))), ("terms", json!([])), ("terms", json!(["apache-2.0", 1])),
+            ("terms", json!("apache-2.0"))] {
+            let mut b = good.clone();
+            b[k] = val;
+            bad.push(b);
+        }
+        std::fs::write(&path, serde_json::to_vec(&good).unwrap()).unwrap();
+        assert!(read_repo_acceptance(&dir, REPO, SHA).is_some());
+        for b in bad {
+            std::fs::write(&path, serde_json::to_vec(&b).unwrap()).unwrap();
+            assert_eq!(read_repo_acceptance(&dir, REPO, SHA), None, "{b}");
+        }
     }
 }

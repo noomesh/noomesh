@@ -850,7 +850,7 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 | `noo cluster teardown-node` | `<node> \| --all [--purge-data] [--purge-tailscale] [--factory] [-y\|--yes]` | Dismantle one node or --all via a signed teardown bundle, verify silence, then forget |
 | `noo cluster provision` | `<node> [<tier>] [--harness auto\|manual\|off] [--wait [<secs>]] [--stage-only] [--move-data]` | Stage a node's signed bundle; --wait blocks until enrolled, --stage-only skips the apply |
 | `noo cluster sync-model-files` | `[<node>...] [-m\|--model <file>]... [--dry-run]` | Dispatch a job per node to pull GGUF weights from the controller store and verify them |
-| `noo cluster bootstrap-token create` | `[--ttl <1h\|30m\|24h\|secs>] [--role <role>] [--cidr <cidr>] [--node <name>] [--with-tailscale\|--no-tailscale]` | Mint a single-use enrollment token and print the node enrollment one-liner |
+| `noo cluster bootstrap-token create` | `[--ttl <1h\|30m\|24h\|secs>] [--role <role>] [--cidr <cidr>] [--node <name>] [--with-tailscale\|--no-tailscale] [--controller-approvals]` | Mint a single-use enrollment token and print the node enrollment one-liner |
 | `noo cluster bootstrap-token list` | — | List bootstrap tokens with status, creator, expiry and redeeming IP |
 | `noo cluster bootstrap-token revoke` | `<id>` | Revoke a bootstrap token by id (idempotent) |
 | `noo cluster bootstrap-token` | — | Print bootstrap-token subcommand usage (create, list, revoke) |
@@ -881,7 +881,7 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 | `noo models pull` | `<model> [--backend <b>]` | Pull onto the gateway's Ollama; whisper:<size> / piper:<voice> stage a voice model |
 | `noo models fetch` | `<hf_repo> <file.gguf> [--revision <rev>] [--force]` | Download a GGUF from Hugging Face, or stage ollama:<tag> from the registry, into the store |
 | `noo models stage` | `<hf:repo@sha> --kind <kind> --id <id> --modality <m> --runtime <r>... --needs <file.json> [--license <id>] [--license-url <url>] [--license-additional <id>=<url>[,<notice>]]... [--file <path>...] [--extract <archive>[:<glob>]] [--fits-model <id> [--fits-revision <rev>] \| --fits-runtime <r>] [--accept-license]` | Stage a model set from a pinned Hugging Face commit into the store, signed |
-| `noo models accept` | `<id>` | Record the operator's licence acceptance for a model set, for its next stage |
+| `noo models accept` | `<id> \| hf:<org>/<name>@<commit>` | Record a licence acceptance: one set, or every set from a gated repo at that commit |
 | `noo models rm` | `<id>[@<rev>] [--force] [-y\|--yes]` | Remove a staged model set; refuses unless --force until placements can be checked |
 | `noo models list` | `[--backend <b>] [--tier <n>] [--limit <n>] [--refresh] [--kind <kind>]` | List popular models from the HF catalog cache; --kind lists staged model sets |
 | `noo models search` | `<query> [--backend <b>] [--limit <n>]` | Search HuggingFace for models, with cached offline fallback |

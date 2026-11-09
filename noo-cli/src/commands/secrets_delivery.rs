@@ -185,6 +185,10 @@ pub(crate) struct Holder {
     pub container: String,
     pub service: String,
     pub env_names: Vec<String>,
+    /// The names among `env_names` whose value starts with `/run/`: a file
+    /// pointer (an add-on's `…_TLS_KEY=/run/…/x.key`), not a secret. Only
+    /// this one bit about the value is known ([`ENV_NAMES_TEMPLATE`]).
+    pub path_valued: Vec<String>,
 }
 
 /// The remedy for a FAIL: the recreate when a container carries a secret in
@@ -217,7 +221,12 @@ pub(crate) fn judge(holders: &[Holder], residue: &[String]) -> Check {
             .env_names
             .iter()
             .map(String::as_str)
-            .filter(|n| TIER1.contains(n) || (credential_shaped(n) && !ENV_ALLOWED.iter().any(|(a, _)| a == n)))
+            .filter(|n| {
+                TIER1.contains(n)
+                    || (credential_shaped(n)
+                        && !ENV_ALLOWED.iter().any(|(a, _)| a == n)
+                        && !h.path_valued.iter().any(|p| p == n))
+            })
             .collect();
         if offenders.is_empty() {
             continue;
@@ -286,26 +295,47 @@ pub(crate) fn judge(holders: &[Holder], residue: &[String]) -> Check {
 // ── docker access (names only) ─────────────────────────────────────────────
 
 /// The docker template that prints the NAME of every non-empty environment
-/// variable, one per line. The value is split off and dropped inside the
-/// docker CLI; it never reaches this process.
-const ENV_NAMES_TEMPLATE: &str =
-    r#"{{range .Config.Env}}{{$p := split . "="}}{{if index $p 1}}{{index $p 0}}{{"\n"}}{{end}}{{end}}"#;
+/// variable, one per line, followed by a tab and `path` when the value
+/// starts with `/run/`. Both tests read the whole entry, never a piece of
+/// the value split on `=`: a value is non-empty when the entry is not exactly
+/// `NAME=`, and it is a `/run/` path when the entry split on `NAME=/run/`
+/// starts empty (strictly a prefix test). Testing the piece between the
+/// first and second `=` dropped every value that starts with `=` (i599). The
+/// value is dropped inside the docker CLI; only that one bit reaches this
+/// process.
+pub(crate) const ENV_NAMES_TEMPLATE: &str = r#"{{range .Config.Env}}{{$p := split . "="}}{{$n := index $p 0}}{{if ne . (printf "%s=" $n)}}{{$n}}{{if not (index (split . (printf "%s=/run/" $n)) 0)}}{{"\t"}}path{{end}}{{"\n"}}{{end}}{{end}}"#;
 
-/// Names of `container`'s non-empty environment variables, or None when
-/// docker cannot inspect it.
-pub(crate) fn env_names(container: &str) -> Option<Vec<String>> {
+/// [`ENV_NAMES_TEMPLATE`] output: every name, and the names flagged `path`.
+/// Pure.
+pub(crate) fn parse_env_lines(out: &str) -> (Vec<String>, Vec<String>) {
+    let mut names = Vec::new();
+    let mut paths = Vec::new();
+    for l in out.lines().map(str::trim_end).filter(|l| !l.trim().is_empty()) {
+        match l.split_once('\t') {
+            Some((n, "path")) => {
+                names.push(n.trim().to_string());
+                paths.push(n.trim().to_string());
+            }
+            _ => names.push(l.trim().to_string()),
+        }
+    }
+    (names, paths)
+}
+
+/// `container`'s non-empty environment variable names and its path-valued
+/// names ([`parse_env_lines`]), or None when docker cannot inspect it.
+fn env_entries(container: &str) -> Option<(Vec<String>, Vec<String>)> {
     let out = Command::new("docker").args(["inspect", "-f", ENV_NAMES_TEMPLATE, container]).output().ok()?;
     if !out.status.success() {
         return None;
     }
-    Some(
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .collect(),
-    )
+    Some(parse_env_lines(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Names of `container`'s non-empty environment variables, or None when
+/// docker cannot inspect it.
+pub(crate) fn env_names(container: &str) -> Option<Vec<String>> {
+    env_entries(container).map(|(names, _)| names)
 }
 
 /// The compose project this stack runs under, read off whichever of its
@@ -343,7 +373,8 @@ pub(crate) fn holders_in(project: &str) -> Vec<Holder> {
         .lines()
         .filter_map(|l| {
             let (name, svc) = l.split_once('\t')?;
-            Some(Holder { container: name.to_string(), service: svc.to_string(), env_names: env_names(name)? })
+            let (env_names, path_valued) = env_entries(name)?;
+            Some(Holder { container: name.to_string(), service: svc.to_string(), env_names, path_valued })
         })
         .collect()
 }
@@ -1079,7 +1110,73 @@ mod tests {
     use super::*;
 
     fn h(container: &str, service: &str, names: &[&str]) -> Holder {
-        Holder { container: container.into(), service: service.into(), env_names: names.iter().map(|s| s.to_string()).collect() }
+        Holder {
+            container: container.into(),
+            service: service.into(),
+            env_names: names.iter().map(|s| s.to_string()).collect(),
+            path_valued: Vec::new(),
+        }
+    }
+
+    /// A holder whose `paths` names carry a `/run/` value.
+    fn hp(container: &str, service: &str, names: &[&str], paths: &[&str]) -> Holder {
+        Holder { path_valued: paths.iter().map(|s| s.to_string()).collect(), ..h(container, service, names) }
+    }
+
+    #[test]
+    fn a_credential_shaped_name_holding_a_run_path_is_a_pointer_not_a_secret() {
+        // The 0.6.19 roll: an add-on's `…_TLS_KEY` set to a path under /run/.
+        let c = judge(&[hp("noo-rh-voice", "noo-rh-voice", &["RH_VOICE_TLS_KEY"], &["RH_VOICE_TLS_KEY"])], &[]);
+        assert_ne!(c.verdict, Verdict::Fail, "{}", c.detail);
+        assert!(!c.detail.contains("RH_VOICE_TLS_KEY"), "{}", c.detail);
+    }
+
+    #[test]
+    fn the_same_name_with_a_plain_value_still_fails() {
+        let c = judge(&[h("noo-rh-voice", "noo-rh-voice", &["RH_VOICE_TLS_KEY"])], &[]);
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("noo-rh-voice: RH_VOICE_TLS_KEY"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_secret_value_fails_even_beside_another_vars_run_path() {
+        // A PEM-looking value has no `/run/` flag; the pointer next to it
+        // excuses only itself.
+        let c = judge(&[hp("noo-rh-voice", "noo-rh-voice", &["RH_VOICE_TLS_KEY", "RH_VOICE_PEER_KEY"], &["RH_VOICE_TLS_KEY"])], &[]);
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("noo-rh-voice: RH_VOICE_PEER_KEY"), "{}", c.detail);
+        assert!(!c.detail.contains("RH_VOICE_TLS_KEY"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_tier1_name_fails_even_with_a_run_path_value() {
+        let c = judge(&[hp("noo-gateway", "gateway", &["POSTGRES_PASSWORD"], &["POSTGRES_PASSWORD"])], &[]);
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("noo-gateway: POSTGRES_PASSWORD"), "{}", c.detail);
+    }
+
+    #[test]
+    fn the_env_template_flags_only_a_run_prefix() {
+        // Live docker 29.2.1, 2026-11-09: A_KEY=/run/rh-secrets/x.key,
+        // B_KEY=secretvalue, C_TOKEN=, D_KEY==weird, F_KEY==/run/x printed
+        // exactly these lines (PATH's value starts with /usr). The flag is a
+        // prefix test on the value; an empty value is the only one left out.
+        let (names, paths) = parse_env_lines("A_KEY\tpath\nB_KEY\nD_KEY\nF_KEY\nPATH\n");
+        assert_eq!(names, ["A_KEY", "B_KEY", "D_KEY", "F_KEY", "PATH"]);
+        assert_eq!(paths, ["A_KEY"]);
+        assert!(
+            ENV_NAMES_TEMPLATE.contains(r#"{{if not (index (split . (printf "%s=/run/" $n)) 0)}}{{"\t"}}path{{end}}"#),
+            "the flag must stay a /run/ prefix test on the whole value: {ENV_NAMES_TEMPLATE}"
+        );
+    }
+
+    #[test]
+    fn the_env_template_keeps_a_value_that_starts_with_equals() {
+        // i599: the old `{{if index $p 1}}` read the piece between the first
+        // and second `=`, so `D_KEY==weird` was never listed. Only an entry
+        // that is exactly `NAME=` is empty.
+        assert!(ENV_NAMES_TEMPLATE.contains(r#"{{if ne . (printf "%s=" $n)}}{{$n}}"#), "{ENV_NAMES_TEMPLATE}");
+        assert!(!ENV_NAMES_TEMPLATE.contains("{{if index $p 1}}"), "{ENV_NAMES_TEMPLATE}");
     }
 
     #[test]

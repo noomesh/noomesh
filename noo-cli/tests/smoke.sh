@@ -80,6 +80,16 @@ run 0 "noo (noomesh CLI, alias: pai)" -- --version
 run 0 "local-first AI agent mesh" -- --help
 run 0 "local-first AI agent mesh"    # bare `noo` (no args)
 
+# Both consent mutations take TWO positionals. An invalid digest reaches
+# validation before any privilege check or store access, even when CI is root.
+for verb in approve revoke; do
+  run 2 "not one exact image digest" -- node workloads "$verb" rhaddon sha256:invalid
+  if [[ "$EUID" -ne 0 ]]; then
+    run 1 "only root" -- node workloads "$verb" rhaddon \
+      sha256:2c99870b2514d9e143c3f33f3d5a9b4cbe89516e32343e5ac9c1379a9123844b
+  fi
+done
+
 # 3. A retired subcommand of a native group is an unknown subcommand: exit 2,
 #    the offending word named, the real subcommands listed. Nothing is
 #    exec'd and no Python is ever suggested.

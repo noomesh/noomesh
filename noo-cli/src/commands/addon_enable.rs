@@ -647,7 +647,7 @@ pub(crate) fn report(addon: &str, e: &Enabled) {
     } else {
         ui::done(&format!("{addon} was already declared on in {} — nothing changed there", e.config.display()));
     }
-    let doors = super::node_leaves::node_workload_doors(&crate::envfile::repo_root());
+    let doors = super::node_leaves::node_workload_doors(&crate::envfile::repo_root()).doors;
     if let Some(hint) = node_workload_hint(&doors, addon) {
         ui::say(&ui::note(&hint));
     }

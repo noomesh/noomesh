@@ -313,6 +313,7 @@ mod tests {
             container: "noo-gateway".into(),
             service: "gateway".into(),
             env_names: env.iter().map(|s| s.to_string()).collect(),
+            path_valued: Vec::new(),
         }
     }
 
