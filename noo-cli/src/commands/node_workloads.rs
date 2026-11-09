@@ -394,13 +394,10 @@ fn agent_or_fail(g: &Globals) -> (u32, u32) {
 
 fn pair(args: &[String]) -> Result<(String, String), ArgError> {
     let mut a = Args::new(args);
-    let positional = a.positionals()?;
-    match positional.as_slice() {
-        [] => Err(ArgError::new("missing <addon>")),
-        [_] => Err(ArgError::new("missing <digest>")),
-        [addon, digest] => Ok((addon.clone(), digest.clone())),
-        [_, _, extra, ..] => Err(ArgError::new(format!("unexpected argument `{extra}` after <digest>"))),
-    }
+    let addon = a.one("<addon>")?;
+    let digest = a.one("<digest>")?;
+    a.finish()?;
+    Ok((addon, digest))
 }
 
 fn request_or_fail(g: &Globals, addon: &str, digest: &str) -> Approval {
