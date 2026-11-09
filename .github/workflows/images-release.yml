@@ -102,6 +102,7 @@ jobs:
       # image's exact digest (`@sha256:…`, i567); and the staged build times.
       source_tags: ${{ steps.plan.outputs.source_tags }}
       staged: ${{ steps.plan.outputs.staged }}
+      staged_bases: ${{ steps.plan.outputs.staged_bases }}
     steps:
       - name: Checkout (full history)   # actions/checkout@v7.0.1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -936,9 +937,13 @@ jobs:
       # Provenance for each infra image re-tagged from :staged (i567): when the
       # daily job built it. Its digest is the image's own row; this row has no
       # sha256, so every lock reader skips it, like retagged-from.
+      # And (i604) the base digests its daily build resolved its FROM tags
+      # to: `staged-base:<image>=<key>=<digest>;…`. It has no `@`, so no lock
+      # reader takes it for an image row.
       - name: Record the staged infra images a release reuses
         env:
           STAGED: ${{ needs.release-line.outputs.staged }}
+          STAGED_BASES: ${{ needs.release-line.outputs.staged_bases }}
         run: |
           set -eu
           python3 - <<'PY'
@@ -947,6 +952,12 @@ jobs:
               assert re.fullmatch(r"[a-z0-9-]+", img) and re.fullmatch(r"[0-9T:Z-]+", created), (img, created)
               row = f"staged-from:{img}@{created}"
               open(f"digests/staged-from-{img}", "w").write(row + "\n")
+              print(row)
+          for img, bases in sorted(json.loads(os.environ.get("STAGED_BASES") or "{}").items()):
+              assert re.fullmatch(r"[a-z0-9-]+", img), img
+              assert re.fullmatch(r"[a-z0-9._/:-]+=sha256:[0-9a-f]{64}(;[a-z0-9._/:-]+=sha256:[0-9a-f]{64})*", bases), bases
+              row = f"staged-base:{img}={bases}"
+              open(f"digests/staged-base-{img}", "w").write(row + "\n")
               print(row)
           PY
 
