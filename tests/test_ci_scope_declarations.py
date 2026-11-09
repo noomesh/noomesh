@@ -658,3 +658,17 @@ def test_every_out_of_crate_include_arms_its_crates_lane() -> None:
     only_gw = sorted(p for p, l in inputs.items() if l == {"gateway"} and p.startswith("tests/"))
     assert only_gw, "no gateway-only fixture left to hold the narrowing to"
     assert _classify([only_gw[0]])["cli"] == "false", only_gw[0]
+
+
+def test_a_merge_queue_group_never_cancels_another_groups_run() -> None:
+    """Keyed per base ref, every new queue entry cancelled the CI of the entries
+    ahead of it, and a cancelled required check ejected #855 from the queue
+    (2026-11-09). The workflow concurrency group must be per merge_group
+    head_ref (each group's own gh-readonly-queue ref), so a cancel only ever
+    replaces a re-run of the same group."""
+    group = str(_workflow()["concurrency"]["group"])
+    assert "github.event.merge_group.head_ref" in group, group
+    assert "merge_group.base_ref" not in group, (
+        "a concurrency group keyed per base ref cancels every earlier queue group's run: " + group
+    )
+    assert "github.run_id" in group, "every other event keeps a group of its own run: " + group

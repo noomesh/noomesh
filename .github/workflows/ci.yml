@@ -46,14 +46,19 @@ on:
   merge_group:
     types: [checks_requested]
 
-# ONE run per merge-queue batch. The queue builds a group per entry (dev + every
-# entry ahead + itself); with the dev ruleset's HEADGREEN grouping only the
-# newest (largest) group decides, so an older group's run is superseded the
-# moment a newer one starts and is cancelled here. Every other event gets a
-# group of its own run id: pushes, tags and pull requests are never cancelled by
-# this block (the per-job concurrency below still governs PR image builds).
+# ONE run per merge-queue GROUP, never one per queue. The queue builds a group
+# per entry (dev + every entry ahead + itself), each on its own
+# gh-readonly-queue/... head_ref, and the group is the key here. Keyed per base
+# ref (until 2026-11-09), every new entry cancelled the runs of the entries
+# ahead of it; a cancelled required check is a failed one, and the queue
+# EJECTED #855 (still open, never merged) while the groups behind it merged.
+# HEADGREEN lets a later green group carry the ones ahead, but only when their
+# own runs have not already failed. cancel-in-progress now only replaces a
+# re-run of the SAME group. Every other event gets a group of its own run id:
+# pushes, tags and pull requests are never cancelled by this block (the per-job
+# concurrency below still governs PR image builds).
 concurrency:
-  group: ${{ github.event_name == 'merge_group' && format('ci-merge-queue-{0}', github.event.merge_group.base_ref) || format('ci-run-{0}', github.run_id) }}
+  group: ${{ github.event_name == 'merge_group' && format('ci-merge-queue-{0}', github.event.merge_group.head_ref) || format('ci-run-{0}', github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'merge_group' }}
 
 # THE ONE SWITCH for trellion being public. 'false' until trellion and
