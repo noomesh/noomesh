@@ -392,13 +392,15 @@ def apply_staged(result: dict, staged_of, fingerprint_of, now, daily) -> dict:
     when every platform's fingerprint label matches and the copy is fresh."""
     from datetime import timedelta
     labels_key, created_key = "org.noomesh.build-fingerprint", "org.opencontainers.image.created"
+    bases_key = "org.noomesh.base-digests"
     staged = result.setdefault("staged", {})
+    staged_bases = result.setdefault("staged_bases", {})
     for img in daily:
         if result["retag"].get(img):
             continue  # an equal-input rc wins
         pre = "BUILD (no usable :staged copy): "
         try:
-            fp = fingerprint_of(img)
+            fingerprint_of(img, None)  # at the git pins: none at all means build, and asks no registry
         except Exception as e:  # noqa: BLE001 — any doubt builds
             result["why"][img] = pre + f"no fingerprint at this commit ({e})"
             continue
@@ -409,6 +411,19 @@ def apply_staged(result: dict, staged_of, fingerprint_of, now, daily) -> dict:
             continue
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(digest)) or not labels:
             result["why"][img] = pre + f"{img}:staged has no digest or no platform configs"
+            continue
+        # The bases the daily build resolved its FROM tags to (i604). One
+        # value on every platform; absent = it was built on the git pins.
+        base_labels = {lab.get(bases_key, "") for lab in labels.values()}
+        if len(base_labels) != 1:
+            result["why"][img] = pre + f"{bases_key} differs between platforms"
+            continue
+        base_label = base_labels.pop()
+        try:
+            bases = _infra_staged().parse_bases(base_label) if base_label else None
+            fp = fingerprint_of(img, bases)
+        except Exception as e:  # noqa: BLE001 — any doubt builds
+            result["why"][img] = pre + f"no fingerprint at this commit for the staged bases ({e})"
             continue
         differ = sorted(p or "-" for p, lab in labels.items() if lab.get(labels_key) != fp)
         if differ:
@@ -429,6 +444,8 @@ def apply_staged(result: dict, staged_of, fingerprint_of, now, daily) -> dict:
         result["rc_digests"][img] = digest
         result["source_tags"][img] = "@" + digest
         staged[img] = created.strftime("%Y-%m-%dT%H:%M:%SZ")
+        if base_label:
+            staged_bases[img] = base_label
         result["why"][img] = f"re-tag {img}:staged {digest[:19]} (built {staged[img]}, fingerprint matches)"
     return result
 
@@ -443,10 +460,12 @@ def plan(final_tag: str, repo: str, sibling_shas: dict[str, str],
     rc_image = result["rc_tag"].removeprefix("stack-")
     result["source_tags"] = {img: rc_image for img, r in result["retag"].items() if r}
     result.setdefault("staged", {})
+    result.setdefault("staged_bases", {})
     if staged_of is None or os.environ.get("RELEASE_RETAG", "").strip().lower() == "off":
         return result
     if fingerprint_of is None:
-        fingerprint_of = _infra_staged().repo_fingerprint
+        def fingerprint_of(img, bases):
+            return _infra_staged().repo_fingerprint(img, bases=bases)
     return apply_staged(result, staged_of, fingerprint_of, now or datetime.now(timezone.utc),
                         _infra_staged().DAILY)
 
@@ -561,7 +580,7 @@ def main(argv: list[str] | None = None) -> int:
                  staged_of=None if a.no_staged else staged_image)
     except Exception as e:  # noqa: BLE001 — any surprise means BUILD, never a guess
         reason = f"planning failed ({type(e).__name__}: {e}) — building everything"
-        p = {"rc_tag": "", "rc_commit": "", "rc_digests": {}, "source_tags": {}, "staged": {},
+        p = {"rc_tag": "", "rc_commit": "", "rc_digests": {}, "source_tags": {}, "staged": {}, "staged_bases": {},
              "retag": {img: False for img in SIBLING_INPUTS},
              "why": {img: reason for img in SIBLING_INPUTS}}
     print(json.dumps(p, indent=2))
@@ -580,6 +599,7 @@ def main(argv: list[str] | None = None) -> int:
             f.write(f"rc_digests={json.dumps(p['rc_digests'], separators=(',', ':'))}\n")
             f.write(f"source_tags={json.dumps(p['source_tags'], separators=(',', ':'))}\n")
             f.write(f"staged={json.dumps(p['staged'], separators=(',', ':'))}\n")
+            f.write(f"staged_bases={json.dumps(p.get('staged_bases', {}), separators=(',', ':'))}\n")
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a") as f:

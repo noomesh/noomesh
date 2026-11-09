@@ -411,8 +411,10 @@ def _staged_plan(staged=None, fps=None, tag="stack-v1.3.0-rc.1", trees=None, rcs
             raise LookupError(f"{img}:staged: not found")
         return staged[img]
 
-    def fingerprint_of(img):
+    def fingerprint_of(img, bases=None):
         v = (fps or {}).get(img, FP)
+        if callable(v):
+            v = v(bases)
         if isinstance(v, Exception):
             raise v
         return v

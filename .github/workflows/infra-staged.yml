@@ -48,7 +48,6 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   OWNER: noomesh
-  DHI_OWNER: noomesh/dhi
 jobs:
   matrix:
     if: github.repository == 'noomesh/noomesh'
@@ -81,18 +80,6 @@ jobs:
         with:
           ref: dev
 
-      - name: Fingerprint and tags
-        run: |
-          set -eu
-          python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --user pyyaml
-          fp="$(python3 scripts/infra-staged.py fingerprint "${{ matrix.image }}")" || {
-            echo "::error::${{ matrix.image }} has no content fingerprint (see above); not staging it — the release builds it"; exit 1; }
-          echo "FP=$fp" >> "$GITHUB_ENV"
-          echo "CREATED=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
-          echo "DATE_TAG=staged-$(date -u +%Y%m%d)-${{ github.run_id }}" >> "$GITHUB_ENV"
-          echo "REF=$REGISTRY/$OWNER/${{ matrix.image }}" >> "$GITHUB_ENV"
-          echo "${{ matrix.image }} fingerprint $fp"
-
       - name: Free disk (preinstalled toolchains the build does not use)
         run: scripts/ci-free-disk.sh
       - name: Pre-pull the BuildKit image (transient registry errors retried)
@@ -121,11 +108,35 @@ jobs:
           echo "$DHI_TOKEN" | docker login docker.io -u "$DHI_USERNAME" --password-stdin \
             || echo "::warning::docker.io login failed — a Hub fallback pulls anonymously"
 
-      - name: Docker Hub bases from the mirror (Hub on a miss)
-        env:
-          HUB_MIRROR: ${{ vars.HUB_MIRROR }}
-          HUB_MIRROR_OFF: ${{ vars.HUB_MIRROR_OFF }}
-        run: echo "HUB_PREFIX=$(python3 "$GITHUB_WORKSPACE/scripts/hub-mirror.py" dockerfile "$GITHUB_WORKSPACE/${{ matrix.dockerfile }}")" >> "$GITHUB_ENV"
+      # TODAY'S BASES (i604). Every FROM is pinned by digest in git, so a
+      # rebuild alone never takes a distro fix. Each pinned FROM tag is
+      # resolved at its SOURCE registry (dhi.io, docker.io; our mirrors follow
+      # later) to the digest it points at now, refusing one built before the
+      # git pin or before the base the current :staged was built on. The
+      # checkout's Dockerfile is rewritten onto those digests, the fingerprint
+      # covers them, and the org.noomesh.base-digests label records them, so
+      # the release can recompute the same fingerprint from git + the label
+      # and re-tag this exact digest (release-retag-plan.py apply_staged).
+      - name: Resolve today's base digests, fingerprint and tags
+        run: |
+          set -eu
+          python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --user pyyaml
+          REF="$REGISTRY/$OWNER/${{ matrix.image }}"
+          echo "REF=$REF" >> "$GITHUB_ENV"
+          old="$(docker buildx imagetools inspect "$REF:staged" --format '{{json .Image}}' 2>/dev/null \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); c=[d] if "config" in d else list(d.values()); print(next(iter({(x.get("config") or {}).get("Labels",{}).get("org.noomesh.base-digests","") for x in c})))' 2>/dev/null || true)"
+          bases="$(python3 scripts/infra-staged.py resolve-bases "${{ matrix.image }}" --staged-label "$old")" || {
+            echo "::error::${{ matrix.image }}: could not resolve its base tags (see above); not staging it — the release builds it"; exit 1; }
+          python3 scripts/infra-staged.py rebase-dockerfile "${{ matrix.image }}" --bases "$bases"
+          git --no-pager diff -- "${{ matrix.dockerfile }}"
+          fp="$(python3 scripts/infra-staged.py fingerprint "${{ matrix.image }}" --bases "$bases")" || {
+            echo "::error::${{ matrix.image }} has no content fingerprint (see above); not staging it — the release builds it"; exit 1; }
+          echo "BASES=$bases" >> "$GITHUB_ENV"
+          echo "FP=$fp" >> "$GITHUB_ENV"
+          echo "CREATED=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+          echo "DATE_TAG=staged-$(date -u +%Y%m%d)-${{ github.run_id }}" >> "$GITHUB_ENV"
+          echo "${{ matrix.image }} bases $bases"
+          echo "${{ matrix.image }} fingerprint $fp"
 
       # The release's buildx command (images-release.yml "Build + push"), with
       # the two labels added and ONLY the immutable date tag pushed. No layer
@@ -136,9 +147,10 @@ jobs:
           scripts/retry-registry.sh docker buildx build --push \
             --platform "${{ matrix.platforms }}" \
             -f "${{ matrix.dockerfile }}" \
-            --build-arg DHI_REGISTRY="$REGISTRY/$DHI_OWNER" \
-            --build-arg HUB_MIRROR="$HUB_PREFIX" \
+            --build-arg DHI_REGISTRY=dhi.io \
+            --build-arg HUB_MIRROR=docker.io \
             --label "org.noomesh.build-fingerprint=$FP" \
+            --label "org.noomesh.base-digests=$BASES" \
             --label "org.opencontainers.image.created=$CREATED" \
             -t "$REF:$DATE_TAG" \
             ${{ matrix.extra_args }} \
