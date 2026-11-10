@@ -28,7 +28,7 @@
 # 2026-08-20). Digest-pinned FROMs survive the swap: manifest copies
 # preserve digests.
 ARG DHI_REGISTRY=dhi.io
-FROM ${DHI_REGISTRY}/uv:0-debian13-dev@sha256:538e03cfb921102dafe5a083a8fb4ee5a7758be4170f32788fac191325b0307d AS builder
+FROM ${DHI_REGISTRY}/uv:0-debian13-dev@sha256:9498b4fafdf893784f7345bf79f918a7c909648a22487287932d94a05b18d0eb AS builder
 
 # DHI apt-repo skew (2026-10-31, stack-v0.6.15-rc.1; widened 2026-11-01,
 # 0.6.16-rc.1): dhi.io/deb rebuilds packages as `+deb13u0+dhiN`, and those
@@ -100,7 +100,7 @@ RUN cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF \
  && cmake --build build --config Release -j"$(nproc)" --target llama-server
 
 # ── Runtime ──────────────────────────────────────────────────────────
-FROM ${DHI_REGISTRY}/uv:0-debian13-dev@sha256:538e03cfb921102dafe5a083a8fb4ee5a7758be4170f32788fac191325b0307d
+FROM ${DHI_REGISTRY}/uv:0-debian13-dev@sha256:9498b4fafdf893784f7345bf79f918a7c909648a22487287932d94a05b18d0eb
 
 # The DHI +deb13u0+ apt skew: see the builder stage's note (noomesh-internal 17a).
 RUN printf 'Package: /./\nPin: version /\\+deb13u0\\+/\nPin-Priority: 1001\n' \

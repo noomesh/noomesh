@@ -7,7 +7,8 @@
     "scripts/release-retag-plan.py",
     "scripts/release-retag-image.sh",
     "scripts/retry-registry.sh",
-    "scripts/hub-mirror.py"
+    "scripts/hub-mirror.py",
+    "scripts/infra-staged.py"
   ],
   "unreleased_dockerfiles": [
     "docker/Dockerfile.airllm",

@@ -289,19 +289,30 @@ pub fn applier_knows_leaf_kinds(darwin: bool, app_version: &str) -> bool {
     cli_version_triple(app_version).is_none_or(|v| v >= LEAF_KINDS_MAC_FLOOR)
 }
 
-/// `noo-cli-v0.5.63+abc` → `(0, 5, 63)`; None for anything unparseable
-/// (empty, `dev`, a bare sha). Callers pick what None means: the stager
-/// assumes a capable applier; `noo upgrade`'s wait treats it as not there yet.
+/// The version a node's applier reports, as `(major, minor, patch)`: THE one
+/// parser of `app_version` (provision's gates call it too).
+///
+/// A Mac reports its `noo` binary, `noo-cli-v0.6.18+abc`. A Linux node
+/// reports the bundle its applier came in, `stack-v0.6.20+07ce5047…` (live:
+/// aserve, robopi, 0.6.20 roll). Stack and CLI tags move in lock-step since
+/// 0.6.0, so both name the same applier. Reading `noo-cli-v` alone made every
+/// Linux node "unknown", and the add-on door leaves, whose floor withholds on
+/// unknown, never reached one (the 0.6.21 voice blocker). A bare `v` prefix
+/// is accepted too. The numbers end at the first `+` or `-`
+/// (`noo-cli-v0.6.20-dirty+07ce504` is 0.6.20). Exactly three, or None.
+///
+/// None for anything else (empty, `dev`, a bare sha, a fourth field, junk
+/// before the prefix). Callers pick what None means: the stager assumes a
+/// capable applier for the static kinds and withholds the add-on kinds;
+/// `noo upgrade`'s wait treats it as not there yet.
 pub fn cli_version_triple(app_version: &str) -> Option<(u32, u32, u32)> {
-    let rest = app_version.split("noo-cli-v").nth(1)?;
-    let nums: Vec<u32> = rest
-        .split(['+', '-'])
-        .next()
-        .unwrap_or("")
-        .split('.')
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    let [maj, min, pat] = nums[..] else { return None };
+    let v = app_version.trim();
+    let rest = ["noo-cli-v", "stack-v", "v"].iter().find_map(|p| v.strip_prefix(p))?;
+    let core = rest.split(['+', '-']).next()?;
+    let mut nums = core.split('.').map(|s| s.parse::<u32>().ok());
+    let (Some(Some(maj)), Some(Some(min)), Some(Some(pat)), None) = (nums.next(), nums.next(), nums.next(), nums.next()) else {
+        return None;
+    };
     Some((maj, min, pat))
 }
 
@@ -939,5 +950,39 @@ mod tests {
         assert_eq!(cli_version_triple("noo-cli-v0.5.63+abc"), Some((0, 5, 63)));
         assert_eq!(cli_version_triple("dev"), None);
         assert_eq!(cli_version_triple(""), None);
+    }
+
+    /// The live strings, 0.6.20 roll: Linux nodes (aserve, robopi) report
+    /// their applier's STACK tag with the full commit, a Mac its CLI tag,
+    /// the controller a dirty dev build.
+    const LINUX_0_6_20: &str = "stack-v0.6.20+07ce5047d5fd3b1e6c0a2f9d4e8b7a6c5d4e3f21";
+    const LINUX_0_6_17: &str = "stack-v0.6.17+abc";
+    const MAC_0_6_18: &str = "noo-cli-v0.6.18";
+    const CONTROLLER_DIRTY: &str = "noo-cli-v0.6.20-dirty+07ce504";
+
+    #[test]
+    fn a_linux_nodes_stack_tag_reads_as_its_applier_version() {
+        assert_eq!(cli_version_triple(LINUX_0_6_20), Some((0, 6, 20)));
+        assert_eq!(cli_version_triple(LINUX_0_6_17), Some((0, 6, 17)));
+        assert_eq!(cli_version_triple(MAC_0_6_18), Some((0, 6, 18)));
+        assert_eq!(cli_version_triple(CONTROLLER_DIRTY), Some((0, 6, 20)));
+        assert_eq!(cli_version_triple("v0.6.20"), Some((0, 6, 20)));
+    }
+
+    #[test]
+    fn add_on_door_leaves_reach_a_linux_node_at_the_floor_and_not_below() {
+        // The 0.6.21 voice blocker: a 0.6.20 Linux node got no add-on leaf.
+        assert!(applier_knows_addon_leaf_kinds(LINUX_0_6_20), "a 0.6.20 Linux node must get its add-on door leaf");
+        assert!(!applier_knows_addon_leaf_kinds(LINUX_0_6_17), "below the floor the applier refuses the kinds");
+        assert!(applier_knows_addon_leaf_kinds(MAC_0_6_18), "a Mac at the floor is unchanged");
+        assert!(applier_knows_addon_leaf_kinds(CONTROLLER_DIRTY));
+    }
+
+    #[test]
+    fn an_unknown_applier_is_still_withheld_the_add_on_kinds() {
+        for v in ["", "dev", "07ce5047", "stack-v0.6.20.1", "xstack-v0.6.20", "stack-v0.6", "stack-vx.y.z", "noo-cli-v"] {
+            assert_eq!(cli_version_triple(v), None, "{v:?} must be unreadable");
+            assert!(!applier_knows_addon_leaf_kinds(v), "{v:?}: an unknown applier must be withheld the add-on kinds");
+        }
     }
 }

@@ -4,20 +4,36 @@
 # NVIDIA GPU metrics exporter using nvidia-ml-py (NVML)
 # Uses the same library as PyTorch/TensorFlow for GPU detection
 
-# Docker Hub base via the GHCR mirror (.github/hub-mirror.txt): Hub rate-limits
-# pulls per IP. Needs a ghcr.io login; without one, build with
-# --build-arg HUB_MIRROR=docker.io.
-ARG HUB_MIRROR=ghcr.io/noomesh/mirror
-FROM ${HUB_MIRROR}/nvidia/cuda:12.2.0-base-ubuntu22.04@sha256:ecdf8549dd5f12609e365217a64dedde26ecda26da8f3ff3f82def6749f53051
+# NO CUDA BASE (i604). The exporter needs only NVML, which the NVIDIA
+# container toolkit injects from the HOST driver (libnvidia-ml.so.1, the
+# `utility` capability), plus python3. It used nvidia/cuda:12.2.0-base-
+# ubuntu22.04, a tag NVIDIA never rebuilds (still its 2023 digest: 18 fixable
+# HIGH in Ubuntu packages), and a newer CUDA tag would raise the driver
+# floor through NVIDIA_REQUIRE_CUDA. Without a CUDA base there is no CUDA
+# floor at all. The base is the maintained DHI python runtime (no shell,
+# already `nonroot` 65532:65532), at the digest gateway-rust pins, so one
+# mirror row serves both.
+#
+# Base-image registry: dhi.io by default, our ghcr mirrors in the release
+# workflow (--build-arg DHI_REGISTRY, mirror-images.yml).
+ARG DHI_REGISTRY=dhi.io
 
-# Install Python and pip
-RUN apt-get update && apt-get install -y --no-install-recommends --fix-missing \
-    python3 \
-    python3-pip \
-    && rm -rf /var/lib/apt/lists/*
+# nvidia-ml-py, pinned by version AND hash (it was an unpinned `pip install`).
+# Pure Python (py3-none-any), so it is installed with the matching -dev
+# image's pip and copied as files; the runtime has no pip and no shell.
+FROM ${DHI_REGISTRY}/python:3.12-debian13-dev@sha256:7a4cf144e27b4e47458be2f7e39ff60d4b17517837f0acaf83288b7fc2d56404 AS deps
+RUN printf 'nvidia-ml-py==13.615.71 --hash=sha256:959bf4adf6fe1308e4bd739e722236b0d1ec8392e2cefad33ff70c311380b9b6\n' > /tmp/req.txt \
+    && python3 -m pip install --no-cache-dir --require-hashes --only-binary=:all: --target /opt/exporter-deps -r /tmp/req.txt
 
-# Install nvidia-ml-py - official NVIDIA Python bindings (replaces deprecated pynvml)
-RUN pip3 install --no-cache-dir nvidia-ml-py
+FROM ${DHI_REGISTRY}/python:3.12-debian13@sha256:4da000f376259ab2e5832ae781db58b04f2f67b9acc9f5b17ecc9568742e70b4
+
+# What the CUDA base used to set: expose every GPU and ONLY the NVML
+# (utility) driver capability. compose's device request asks for the same.
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=utility \
+    PYTHONPATH=/opt/exporter-deps
+
+COPY --from=deps /opt/exporter-deps /opt/exporter-deps
 
 WORKDIR /app
 
@@ -40,8 +56,7 @@ HEALTHCHECK --interval=30s --timeout=5s \
 # SERVICE_KEY_READERS, KeyReader::ContainerUid; `noo upgrade --stack` regrants
 # the key before the container is recreated). NVML needs only the NVIDIA
 # container runtime's /dev/nvidia* nodes, which the toolkit creates 0666, and
-# the exporter writes nothing. No DHI base exists for a CUDA runtime, so the
-# base stays the NVIDIA one, pinned by tag through the mirror.
-RUN groupadd --gid 65532 nonroot && useradd --uid 65532 --gid 65532 --no-create-home --shell /usr/sbin/nologin nonroot
+# the exporter writes nothing. The DHI base already ships `nonroot` at
+# 65532:65532, so no user is created (and it has no shell to create one).
 USER nonroot
 CMD ["python3", "/app/exporter.py"]

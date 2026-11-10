@@ -855,8 +855,11 @@ fn validate_scratch(ss: &[Scratch], ms: &[Slot]) -> Result<(), NodeWorkloadRefus
         if s.exec && ss[..i].iter().any(|o| o.exec) {
             return Err(bad(format!("scratch[{i}]: a second exec scratch")));
         }
-        if ss[..i].iter().any(|o| o.target == s.target) {
-            return Err(bad(format!("scratch[{i}]: target `{}` repeats", s.target)));
+        if let Some(o) = ss[..i].iter().find(|o| overlaps(&o.target, &s.target)) {
+            return Err(bad(format!(
+                "scratch[{i}]: target `{}` repeats or nests with `{}`",
+                s.target, o.target
+            )));
         }
         if let Some(m) = ms.iter().find(|m| overlaps(&m.target, &s.target)) {
             return Err(refuse(

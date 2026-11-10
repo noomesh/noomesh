@@ -22123,6 +22123,180 @@
           }
         }
       }
+    },
+    "/api/auth/perspective": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create perspective",
+        "description": "[native] POST /api/auth/perspective \u2014 an operator narrows their own session to a perspective `{role_cap?, addons?, core_only?}`. 200 with a perspective token; 403 `perspective_needs_operator`, 409 `perspective_active`, 422 `perspective_cannot_widen` / `perspective_unknown_addon` / `perspective_no_change` / `perspective_invalid`.",
+        "operationId": "perspective_start",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Update perspective",
+        "description": "[native] PUT /api/auth/perspective \u2014 switch to another perspective in one transaction; an all-unchanged body is Back to me. Authorized on the row, validated against the LIVE role.",
+        "operationId": "perspective_switch",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Delete perspective",
+        "description": "[native] DELETE /api/auth/perspective \u2014 Back to me: end the session's perspective and answer a real access token. Authorized on the row, never on the token's role, so a `user` view can always go back.",
+        "operationId": "perspective_back",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/perspective": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create perspective",
+        "description": "[native] POST /api/auth/perspective \u2014 an operator narrows their own session to a perspective `{role_cap?, addons?, core_only?}`. 200 with a perspective token; 403 `perspective_needs_operator`, 409 `perspective_active`, 422 `perspective_cannot_widen` / `perspective_unknown_addon` / `perspective_no_change` / `perspective_invalid`.",
+        "operationId": "auth_perspective_start",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Update perspective",
+        "description": "[native] PUT /api/auth/perspective \u2014 switch to another perspective in one transaction; an all-unchanged body is Back to me. Authorized on the row, validated against the LIVE role.",
+        "operationId": "auth_perspective_switch",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Delete perspective",
+        "description": "[native] DELETE /api/auth/perspective \u2014 Back to me: end the session's perspective and answer a real access token. Authorized on the row, never on the token's role, so a `user` view can always go back.",
+        "operationId": "auth_perspective_back",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

@@ -48,7 +48,14 @@ pub fn router() -> Router<Arc<AppState>> {
 /// the one thing the short lifetime is for.
 ///
 /// Response: `{"token", "expires_in", "consumer", "scopes"}`.
-async fn token(Extension(consumer): Extension<Consumer>) -> Response {
+async fn token(
+    Extension(consumer): Extension<Consumer>,
+    perspective: Option<Extension<crate::perspective::RequesterPerspective>>,
+) -> Response {
+    // i538: a perspective session never mints an add-on token.
+    if let Err(e) = crate::perspective::refuse_mint(perspective.as_ref(), "add-on token") {
+        return e.into_response();
+    }
     let ttl = crate::auth::ADDON_TOKEN_TTL_SECS;
     let scopes = crate::auth::addon_token_scopes(&consumer.scopes);
     if scopes.is_empty() {

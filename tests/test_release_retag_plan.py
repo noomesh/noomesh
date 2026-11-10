@@ -371,3 +371,194 @@ def test_retag_script_builds_its_ref_from_image_owner(tmp_path):
     # a registry digest that differs from the rc lock's is a hard failure, before any create
     r, calls = run({"IMAGE_OWNER": "noomesh/dhi"}, want="sha256:bb")
     assert r.returncode != 0 and "imagetools create" not in calls
+
+
+# ------------------------------------------------- staged infra images (i567)
+#
+# infra-staged.yml builds, scans and stages the infra images daily; the plan
+# re-tags `<image>:staged` for any of them it would otherwise build, only when
+# every platform's fingerprint label equals this commit's and the copy is at
+# most 3 days old. Everything else builds.
+
+from datetime import datetime, timedelta, timezone
+
+NOW = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc)
+FP = "sha256:" + "f" * 64
+SDIG = "sha256:" + "5" * 64
+DAILY = ("llamacpp", "ollama", "stunnel", "postgres-pgvector", "whisper", "piper", "nvidia-exporter")
+NEW_VERSION = {"stack-v1.3.0-rc.1": "N"}   # a new version's rc.1: no lower rc, everything would build
+
+
+def _labels(fp=FP, created="2026-11-20T03:17:00Z", plats=("linux/amd64", "linux/arm64")):
+    lab = {}
+    if fp is not None:
+        lab[P_LABEL] = fp
+    if created is not None:
+        lab[P_CREATED] = created
+    return {p: dict(lab) for p in plats}
+
+
+P_LABEL, P_CREATED = "org.noomesh.build-fingerprint", "org.opencontainers.image.created"
+
+
+def _staged_plan(staged=None, fps=None, tag="stack-v1.3.0-rc.1", trees=None, rcs=(), now=NOW, raise_for=()):
+    staged = staged if staged is not None else {img: (SDIG, _labels()) for img in DAILY}
+    looked = []
+
+    def staged_of(img):
+        looked.append(img)
+        if img in raise_for or img not in staged:
+            raise LookupError(f"{img}:staged: not found")
+        return staged[img]
+
+    def fingerprint_of(img, bases=None):
+        v = (fps or {}).get(img, FP)
+        if callable(v):
+            v = v(bases)
+        if isinstance(v, Exception):
+            raise v
+        return v
+
+    p = P.plan(tag, "o/r", MAINS, "t", "t", lock_text=LOCK, bases_text=None,
+               tree_of=lambda ref: (trees or NEW_VERSION)[ref], commit_of=lambda ref: "C-" + ref,
+               list_rcs=lambda final: list(rcs), sib_tree=lambda repo, sha, tok: SIB_TREES[sha],
+               changed_of=lambda prev, new: None,
+               staged_of=staged_of, fingerprint_of=fingerprint_of, now=now)
+    return p, looked
+
+
+def test_a_matching_staged_copy_is_retagged_by_its_exact_digest():
+    p, _ = _staged_plan()
+    for img in DAILY:
+        assert p["retag"][img] is True, p["why"][img]
+        assert p["source_tags"][img] == "@" + SDIG and p["rc_digests"][img] == SDIG
+        assert p["staged"][img] == "2026-11-20T03:17:00Z"
+    built = {i for i, r in p["retag"].items() if not r}
+    assert built == {"gateway", "node-agent", "worker", "sandbox", "trellion", "deps-core", "deps-base"}, p["why"]
+
+
+def test_a_changed_input_or_one_differing_platform_builds():
+    p, _ = _staged_plan(fps={"llamacpp": "sha256:" + "0" * 64})
+    assert p["retag"]["llamacpp"] is False and "fingerprint differs" in p["why"]["llamacpp"]
+    one = _labels()
+    one["linux/arm64"][P_LABEL] = "sha256:" + "1" * 64
+    p, _ = _staged_plan(staged={**{i: (SDIG, _labels()) for i in DAILY}, "ollama": (SDIG, one)})
+    assert p["retag"]["ollama"] is False and "linux/arm64" in p["why"]["ollama"]
+    assert p["retag"]["llamacpp"] is True, "one image's mismatch must not touch the others"
+
+
+def test_a_missing_staged_tag_or_label_builds():
+    p, _ = _staged_plan(raise_for=("whisper",))
+    assert p["retag"]["whisper"] is False and "unreadable" in p["why"]["whisper"]
+    p, _ = _staged_plan(staged={**{i: (SDIG, _labels()) for i in DAILY}, "piper": (SDIG, _labels(fp=None))})
+    assert p["retag"]["piper"] is False and p["why"]["piper"].startswith("BUILD (no usable :staged copy)")
+    p, _ = _staged_plan(staged={**{i: (SDIG, _labels()) for i in DAILY}, "stunnel": ("sha256:short", _labels())})
+    assert p["retag"]["stunnel"] is False
+
+
+def test_an_old_or_undated_staged_copy_builds():
+    old = NOW - timedelta(days=3, hours=1)
+    p, _ = _staged_plan(staged={**{i: (SDIG, _labels()) for i in DAILY},
+                                "llamacpp": (SDIG, _labels(created=old.strftime("%Y-%m-%dT%H:%M:%SZ")))})
+    assert p["retag"]["llamacpp"] is False and "is infra-staged.yml failing" in p["why"]["llamacpp"]
+    fresh = NOW - timedelta(days=2, hours=23)
+    p, _ = _staged_plan(staged={**{i: (SDIG, _labels()) for i in DAILY},
+                                "llamacpp": (SDIG, _labels(created=fresh.strftime("%Y-%m-%dT%H:%M:%SZ")))})
+    assert p["retag"]["llamacpp"] is True, "inside 3 days is fresh"
+    for created in (None, "yesterday", (NOW + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")):
+        p, _ = _staged_plan(staged={**{i: (SDIG, _labels()) for i in DAILY},
+                                    "ollama": (SDIG, _labels(created=created))})
+        assert p["retag"]["ollama"] is False, created
+
+
+def test_no_fingerprint_at_this_commit_builds():
+    p, looked = _staged_plan(fps={"postgres-pgvector": ValueError("FROM x:1 is not pinned by digest")})
+    assert p["retag"]["postgres-pgvector"] is False and "no fingerprint" in p["why"]["postgres-pgvector"]
+    assert "postgres-pgvector" not in looked, "no fingerprint: nothing to compare, the registry is not asked"
+
+
+def test_an_equal_input_rc_wins_over_staged():
+    p, looked = _staged_plan(tag="stack-v1.2.3", trees={"stack-v1.2.3": "T", "stack-v1.2.3-rc.2": "T"},
+                             rcs=("stack-v1.2.3-rc.2",))
+    assert p["rc_tag"] == "stack-v1.2.3-rc.2"
+    assert p["source_tags"]["llamacpp"] == "v1.2.3-rc.2" and p["rc_digests"]["llamacpp"] == "sha256:l"
+    assert looked == [] and p["staged"] == {}
+
+
+def test_the_kill_switch_also_turns_off_staged(monkeypatch):
+    monkeypatch.setenv("RELEASE_RETAG", "off")
+    p, looked = _staged_plan()
+    assert looked == [] and not any(p["retag"].values())
+
+
+def test_only_the_daily_set_is_ever_taken_from_staged():
+    p, looked = _staged_plan(staged={i: (SDIG, _labels()) for i in list(P.SIBLING_INPUTS)})
+    assert set(looked) == set(DAILY)
+    for img in ("gateway", "node-agent", "worker", "sandbox", "trellion", "deps-core", "deps-base"):
+        assert p["retag"][img] is False
+
+
+def test_main_looks_up_staged_unless_told_not_to(monkeypatch, tmp_path):
+    seen = []
+
+    def fake_plan(*a, **kw):
+        seen.append(kw.get("staged_of"))
+        return {"rc_tag": "", "rc_commit": "", "rc_digests": {}, "source_tags": {"llamacpp": "@" + SDIG},
+                "staged": {"llamacpp": "2026-11-20T03:17:00Z"}, "retag": {"llamacpp": True}, "why": {"llamacpp": "x"}}
+    monkeypatch.setattr(P, "plan", fake_plan)
+    out = tmp_path / "out"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(out))
+    monkeypatch.setenv("GITHUB_TOKEN", "t")
+    P.main(["--tag", "v1.3.0-rc.1"])
+    P.main(["--tag", "v1.3.0-rc.1", "--no-staged"])
+    assert seen == [P.staged_image, None]
+    text = out.read_text()
+    assert f'source_tags={{"llamacpp":"@{SDIG}"}}' in text and 'staged={"llamacpp":"2026-11-20T03:17:00Z"}' in text
+
+
+def test_the_workflow_copies_the_planned_source_and_records_staged_provenance():
+    line = WF["jobs"]["release-line"]
+    assert line["outputs"]["source_tags"] == "${{ steps.plan.outputs.source_tags }}"
+    assert line["outputs"]["staged"] == "${{ steps.plan.outputs.staged }}"
+    env = WF["jobs"]["images"]["env"]
+    assert env["RC_TAG"] == "${{ fromJSON(needs.release-line.outputs.source_tags)[matrix.image] }}"
+    lock_steps = WF["jobs"]["lock"]["steps"]
+    rec = [s for s in lock_steps if s.get("name") == "Record the staged infra images a release reuses"]
+    assert len(rec) == 1 and "staged-from:{img}@{created}" in rec[0]["run"] and "digests/staged-from-" in rec[0]["run"]
+    names = [s.get("name") for s in lock_steps]
+    sign = next(i for i, s in enumerate(lock_steps) if "release-sign" in str(s.get("run", "")))
+    assert names.index("Record the staged infra images a release reuses") < sign, "provenance must be inside the signed lock"
+    # the provenance row is no image row for the plan's own lock reader either
+    images, _ = P.parse_lock(f"staged-from:llamacpp@2026-11-20T03:17:00Z\nllamacpp@{SDIG}\n")
+    assert images == {"llamacpp": SDIG}
+
+
+def test_retag_script_copies_an_exact_staged_digest_and_nothing_else(tmp_path):
+    import os
+    import subprocess
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    log = tmp_path / "log"
+    (bindir / "docker").write_text(
+        '#!/usr/bin/env bash\necho "$*" >> "$STUB_LOG"\n'
+        'case "$*" in *inspect*) echo "\\"${STUB_DIGEST}\\"";; esac\n'
+    )
+    (bindir / "docker").chmod(0o755)
+
+    def run(src, want):
+        env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "STUB_LOG": str(log),
+               "STUB_DIGEST": SDIG, "REGISTRY": "reg.example", "OWNER": "own"}
+        env.pop("IMAGE_OWNER", None)
+        log.write_text("")
+        r = subprocess.run(["bash", str(ROOT / "scripts/release-retag-image.sh"), "llamacpp", src, "v1.3.0-rc.1", want],
+                           env=env, capture_output=True, text=True)
+        return r, log.read_text()
+
+    r, calls = run("@" + SDIG, SDIG)
+    assert r.returncode == 0, r.stderr
+    assert f"inspect reg.example/own/llamacpp@{SDIG}" in calls and ":staged" not in calls
+    assert f"--tag reg.example/own/llamacpp:v1.3.0-rc.1 reg.example/own/llamacpp@{SDIG}" in calls
+    for want in ("sha256:" + "6" * 64, ""):
+        r, calls = run("@" + SDIG, want)
+        assert r.returncode != 0 and "imagetools create" not in calls, want

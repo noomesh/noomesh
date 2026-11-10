@@ -484,10 +484,14 @@ pub async fn try_dispatch<S: TurnSink>(
         }
     }
     let Some(node) = harness_node_for(state, model).await else { return Ok(None) };
-    let Some(role) = role_of(state, user).await else {
+    let Some(live) = role_of(state, user).await else {
         tracing::warn!(user, node = %node, "harness dispatch: unknown or disabled user; running in process");
         return Ok(None);
     };
+    // i538: a turn submitted under a perspective mints at min(live role,
+    // the snapshot it was submitted with) — never the live role alone, which
+    // would hand a `user` view's turn an operator's harness credential.
+    let role = crate::perspective::snapshot_role(live, crate::perspective::current().as_ref());
     let deadline = turn_deadline();
     let Some(token) = crate::auth::mint_harness_jwt(user, role, &node, conversation_id, deadline.as_secs() + 60) else {
         tracing::warn!("harness dispatch: cannot mint a harness token (NOO_JWT_SECRET unset or insecure); running in process");

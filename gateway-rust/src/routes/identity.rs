@@ -428,8 +428,11 @@ async fn token(
     // connection carrying a client certificate. `Option<Option<_>>`
     // because the extension itself is absent without mTLS.
     peer: Option<Extension<Option<crate::node_identity::PeerThumbprint>>>,
+    perspective: Option<axum::Extension<crate::perspective::RequesterPerspective>>,
     Json(body): Json<ExchangeBody>,
 ) -> AppResult {
+    // i538: an exchanged agent token would carry the real role.
+    crate::perspective::refuse_mint(perspective.as_ref(), "identity exchange")?;
     if !crate::addons::identity_enabled() {
         return Err(AppError::Unavailable(crate::addons::refusal_msg("identity")));
     }

@@ -194,6 +194,8 @@ realtime}`, `models[]`, `env`, `scratch[]` and `limits {ram_mb, cpus, pids}`
 - `scratch[]` is `{target, max_mb}` (a size-capped volume the agent owns) or
   `{target, tmpfs_mb}`. The target is not `/`, `/proc`, `/sys` or `/dev` (or
   below them), and not equal to, inside or around a model slot target.
+  Scratch targets must not nest: a target that repeats, sits inside or contains
+  another scratch target is `scratch_invalid`.
 - A scratch entry may add `exec` (boolean, default `false`). **At most one**
   entry may be `exec: true`, and its size (`max_mb` or `tmpfs_mb`) is at most
   **1024 MiB** (512 MiB is the recommendation; the size is required as for any
