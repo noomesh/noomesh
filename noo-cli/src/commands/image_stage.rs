@@ -78,7 +78,7 @@ pub(crate) const NVIDIA_ONLY: &[&str] = &["nvidia-exporter"];
 /// or under `capabilities`) names one; NVML spells it `NVIDIA …` and older
 /// drivers `GeForce …`/`Quadro …`/`Tesla …`.
 pub(crate) fn has_nvidia_gpu(n: &Value) -> bool {
-    let model = n["gpu_model"].as_str().or_else(|| n["capabilities"]["gpu_model"].as_str()).unwrap_or("");
+    let model = n["capabilities"]["gpu_model"].as_str().unwrap_or("");
     let m = model.to_ascii_lowercase();
     ["nvidia", "geforce", "quadro", "tesla"].iter().any(|k| m.contains(k))
 }
