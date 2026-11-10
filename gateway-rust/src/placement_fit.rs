@@ -100,7 +100,7 @@ pub const DEFAULT_CHAT_CTX: u64 = 4096;
 /// architecture is not reported: 16 KiB per GB of weights, at least 144 KiB.
 /// noo-cli's `cluster_tune::kv_bytes_per_token` is the same function.
 pub fn kv_bytes_per_token(weights_gb: f64) -> f64 {
-    (weights_gb * KV_BYTES_PER_TOKEN_PER_GB_WEIGHTS).max(KV_BYTES_PER_TOKEN_FLOOR)
+    weights_gb * KV_BYTES_PER_TOKEN_PER_GB_WEIGHTS
 }
 
 /// Ollama's context when nothing sets one (`OLLAMA_CONTEXT_LENGTH` unset, no
