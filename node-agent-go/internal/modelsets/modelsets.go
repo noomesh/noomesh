@@ -950,7 +950,7 @@ func (s *Store) rowLocked(r Ref, st Status) Row {
 		}
 	case StateRefused:
 		if m.state == StateRefused {
-			row.RetryAt = m.until.UTC().Format(time.RFC3339)
+			_ = m.until
 			if m.hasBytes && m.reason == nodewl.ReasonDisk {
 				free, need := m.free, m.need
 				row.FreeBytes, row.NeedBytes = &free, &need
