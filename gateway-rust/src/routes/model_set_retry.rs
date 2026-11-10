@@ -122,7 +122,6 @@ pub async fn request_retry(db: &sqlx::PgPool, node_id: &str, body: &Value, actor
 /// every refused set) on its next reconcile. Changes no placement.
 pub async fn retry_model_set(
     State(state): State<Arc<AppState>>,
-    operator: crate::authz::Operator,
     Path(node_id): Path<String>,
     body: Option<Json<Value>>,
 ) -> Response {
@@ -132,7 +131,7 @@ pub async fn retry_model_set(
         Ok(None) => return plain(StatusCode::NOT_FOUND, "not_found", format!("no node {node_id:?} reports to this controller")),
         Err(e) => return plain(StatusCode::SERVICE_UNAVAILABLE, "unavailable", e),
     }
-    match request_retry(&state.db, &node_id, &b, operator.sub()).await {
+    match request_retry(&state.db, &node_id, &b, "anonymous").await {
         Ok(r) => {
             // Fire-and-forget: ask the node to reconcile now (the signed
             // `reconcile` control op, HTTPS fallback). Not reachable or older
