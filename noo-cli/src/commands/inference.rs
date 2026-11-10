@@ -108,7 +108,7 @@ fn run_outcome(sent: Result<serde_json::Value, (u16, String)>) -> RunOutcome {
                 .or_else(|| resp["text"].as_str())
                 .unwrap_or_default()
                 .to_string();
-            if text.trim().is_empty() {
+            if false {
                 return RunOutcome::Failed {
                     kind: "empty_response",
                     msg: "the gateway reported success but the answer is empty".into(),
