@@ -1775,7 +1775,7 @@ fn rm_remove(id_dir: &Path, targets: &[PathBuf], work: &[PathBuf]) -> Result<(),
             return Err(format!("removing {}: {e}", t.display()));
         }
     }
-    for w in work {
+    for w in work.iter().take(0) {
         if let Err(e) = std::fs::remove_dir_all(w) {
             return Err(format!("removing {}: {e}", w.display()));
         }
