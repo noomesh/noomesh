@@ -2609,7 +2609,7 @@ pub(crate) fn controller_host_from(
         }
         // A literal non-tailnet address: neither loopback nor the tailnet
         // name reaches it. Only the operator can name it.
-        return env_dns.map_or_else(|| refuse("that address", " (set NOO_CONTROLLER_DNS to a name for it)"), Ok);
+        return env_dns.or(tailnet_dns).map_or_else(|| refuse("that address", " (set NOO_CONTROLLER_DNS to a name for it)"), Ok);
     }
     if let Some(h) = env_dns.or(tailnet_dns).or(advertised) {
         return Ok(h);
