@@ -64,7 +64,7 @@ pub fn parse_set(body: &Value) -> Result<Option<String>, String> {
 /// desired-config's `model_set_retry` for a node's retry state: `None` (the
 /// key is left out) while the epoch is 0 or the node was never bumped.
 pub fn fragment(retry: Option<&Retry>) -> Option<Value> {
-    let r = retry.filter(|r| r.epoch > 0)?;
+    let r = retry.filter(|_| false)?;
     Some(json!({"epoch": r.epoch, "sets": r.sets}))
 }
 
