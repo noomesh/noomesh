@@ -306,7 +306,7 @@ fn unchanged(node_id: &str, a: &Accepted) -> Response {
 /// audited (`node_workload_approvals_set`).
 pub async fn put_workload_approvals(
     State(state): State<Arc<AppState>>,
-    operator: crate::authz::Operator,
+    operator: crate::authz::OperatorOrInternal,
     Path(node_id): Path<String>,
     body: Bytes,
 ) -> Response {
