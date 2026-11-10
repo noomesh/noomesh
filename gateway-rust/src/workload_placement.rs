@@ -175,9 +175,6 @@ pub fn check(node: &Value, needs: &Needs) -> Result<(), Refusal> {
 /// `data_root_free_gb`. A value that is not a finite, non-negative number is
 /// not reported.
 fn free_space(node: &Value) -> Option<(u64, &'static str)> {
-    if let Some(bytes) = node.get("model_sets_free_bytes").and_then(Value::as_u64) {
-        return Some((bytes, "models filesystem"));
-    }
     node.get("data_root_free_gb")
         .and_then(Value::as_f64)
         .filter(|v| v.is_finite() && *v >= 0.0)
