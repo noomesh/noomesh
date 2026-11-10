@@ -862,6 +862,7 @@ pub(crate) trait Doer {
 }
 
 /// Everything a run touches.
+#[allow(dead_code)]
 pub(crate) struct Cx<'a> {
     pub w: &'a dyn World,
     pub d: &'a dyn Doer,
@@ -1031,7 +1032,7 @@ fn licence_decision(cx: &Cx, s: &Step, set: &str, terms: &str, ran: &mut BTreeSe
     heading(cx, s);
     println!("{}", ui::note(&format!("{set} is licensed under {terms}; the text is upstream's, read it first")));
     println!("{}", ui::note(&format!("accepting as {}; the acceptance is recorded on this controller", cx.who)));
-    if !cx.ask.confirm(&format!("Accept the licence of {set} as {}?", cx.who), false) {
+    if !cx.ask.confirm(&format!("Accept the licence of {set}?"), false) {
         return Flow::End(End::Declined(format!("the licence of {set}")));
     }
     exec(cx, s, &format!("noo models accept {set}"), ran, || cx.d.accept_licence(set))
