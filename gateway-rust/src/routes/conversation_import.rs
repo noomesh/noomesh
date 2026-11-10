@@ -109,20 +109,34 @@ pub(super) async fn receive(
     let requester = requester.ok_or_else(|| {
         AppError::Forbidden("Conversation publication needs a user-bound credential".into())
     })?;
+    // A delegated credential (an agent or a task run acting for the person,
+    // `act`) could otherwise file fabricated "user said" lines into that
+    // person's memory. Publication is the person's own credential's job: a
+    // login, or a key from the MCP door (pai-voice's publisher holds one).
+    // Add-on delegated tokens never get here: they are confined to the task
+    // routes (addon_delegation::route_allowed).
+    if !may_publish(&requester.0) {
+        return Err(AppError::Forbidden(
+            "A delegated credential cannot publish conversations; use the person's own login or MCP key".into(),
+        ));
+    }
     let channel = source_channel(&requester.0);
     import(&state.db, account_of(&requester.0.sub), &channel, body.publication)
         .await
         .map(Json)
 }
 
+/// Only the person's own credential publishes: never a delegated one (`act`).
+fn may_publish(r: &RequesterCtx) -> bool {
+    r.act.is_none()
+}
+
 /// The channel label a publication is filed under, from the CREDENTIAL, never
-/// the body: the add-on a delegated token acts for, else the door that minted
-/// it, else "external". Core never names an add-on itself.
+/// the body: the door that minted it, else "external". Core never names an
+/// add-on itself.
 fn source_channel(r: &RequesterCtx) -> String {
-    r.act
-        .as_ref()
-        .map(|a| a.sub.clone())
-        .or_else(|| r.harness.clone())
+    r.harness
+        .clone()
         .filter(|c| !c.trim().is_empty())
         .unwrap_or_else(|| "external".to_string())
 }
@@ -239,6 +253,35 @@ mod tests {
                 "id":id,"session_id":"voice-session","role":role,"content":words,
                 "created_at":"2026-10-18T12:00:00Z","start_ms":80,"end_ms":320,
                 "source":"stt","voice":"NATF2.pt"}})
+    }
+
+    fn requester(harness: Option<&str>, act: bool) -> RequesterCtx {
+        RequesterCtx {
+            sub: "ada".into(),
+            scopes: vec![],
+            role: crate::auth::Role::User,
+            harness: harness.map(str::to_string),
+            act: act.then(|| serde_json::from_value(json!({"sub": "agent:helper"})).expect("an actor")),
+        }
+    }
+
+    /// A delegated credential (`act`) never publishes; the person's own login
+    /// or door key does.
+    #[test]
+    fn a_delegated_credential_cannot_publish() {
+        assert!(!may_publish(&requester(None, true)));
+        assert!(!may_publish(&requester(Some("mcp-external"), true)));
+        assert!(may_publish(&requester(None, false)));
+        assert!(may_publish(&requester(Some("mcp-external"), false)));
+    }
+
+    /// The channel label comes from the credential, never names an add-on of
+    /// core's choosing, and an unlabelled credential is "external".
+    #[test]
+    fn the_channel_comes_from_the_credential() {
+        assert_eq!(source_channel(&requester(Some("mcp-external"), false)), "mcp-external");
+        assert_eq!(source_channel(&requester(None, false)), "external");
+        assert_eq!(source_channel(&requester(Some("  "), false)), "external");
     }
 
     #[test]
