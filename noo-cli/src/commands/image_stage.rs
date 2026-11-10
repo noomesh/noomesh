@@ -108,6 +108,31 @@ pub(crate) fn door_pin_refs(prefix: &str) -> Vec<(String, String, String)> {
     out
 }
 
+/// `(backend, <prefix>/<image>:<tag>, sha256:…)` for each pinned door: the
+/// backend whose stunnel door is pinned, the ref a node fetches it by, and
+/// the digest it must have been staged by. Same parse as [`door_pin_refs`].
+pub(crate) fn door_pins_by_backend(prefix: &str) -> Vec<(String, String, String)> {
+    let prefix = prefix.trim_end_matches('/');
+    let v: serde_json::Value = serde_json::from_str(DOOR_IMAGES_JSON).unwrap_or_default();
+    let mut out: Vec<(String, String, String)> = v["doors"]
+        .as_object()
+        .map(|doors| {
+            doors
+                .iter()
+                .filter_map(|(backend, d)| {
+                    let (img, tag, dig) = (d["image"].as_str()?, d["tag"].as_str()?, d["digest"].as_str()?);
+                    let hex = dig.strip_prefix("sha256:")?;
+                    let plain = |x: &str| !x.is_empty() && !x.contains(['/', ':', '@', ' ']);
+                    (plain(img) && plain(tag) && hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+                        .then(|| (backend.clone(), format!("{prefix}/{img}:{tag}"), dig.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
 /// Error prefix for "this image is not published for that architecture" —
 /// a skip, not a failure (llama.cpp on ARM uses the upstream image).
 pub(crate) const NO_VARIANT: &str = "no variant for";
