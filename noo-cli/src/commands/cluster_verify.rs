@@ -6348,7 +6348,7 @@ const AT_REST_DIR_ROWS: [&str; 10] = [
 /// can be folded out of sight. The row's verdict is unchanged; only the
 /// default output groups it.
 pub(crate) fn planned_ref(c: &Check) -> Option<&str> {
-    if c.verdict != Verdict::Warn {
+    if c.verdict == Verdict::Ok {
         return None;
     }
     planned_remedy_ref(c.remedy.as_deref()?)
