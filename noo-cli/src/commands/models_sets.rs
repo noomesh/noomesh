@@ -1499,6 +1499,25 @@ pub(crate) fn list_sets(g: &Globals, kind: &str) -> Result<i32, Unhandled> {
     Ok(0)
 }
 
+/// Read-only, for `noo addons setup --plan`: every staged set of any kind,
+/// with its manifest `runtime` strings and whether an acceptance of its id is
+/// recorded. Nothing is written.
+pub(crate) fn scan_for_plan(models_dir: &Path, public: &Path) -> Vec<(Row, Vec<String>, bool)> {
+    scan(models_dir, public, None)
+        .into_iter()
+        .map(|r| {
+            let manifest = models_dir.join(SETS_DIR).join(&r.id).join(&r.revision).join(MANIFEST);
+            let v: Value = serde_json::from_slice(&std::fs::read(manifest).unwrap_or_default()).unwrap_or(Value::Null);
+            let runtime = v["runtime"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect::<Vec<String>>())
+                .unwrap_or_default();
+            let accepted = read_acceptance(models_dir, &r.id).is_some();
+            (r, runtime, accepted)
+        })
+        .collect()
+}
+
 // ── Commands ────────────────────────────────────────────────────────────
 
 fn audit(line: &str) {
