@@ -787,7 +787,7 @@ mod tests {
         // Context pinned: unpinned, a 24 GiB GPU's daemon picks 32768.
         let pinned = spec_env("chat", "m:x", &[("OLLAMA_CONTEXT_LENGTH", "4096")]);
         let mut node = json!({"vram_gb": 24.0, "model_stats": [{"name": "m:x", "size_bytes": 19_000_000_000u64}]});
-        assert_eq!(evaluate(&node, &[pinned.clone()], 1024).verdict, Verdict::Fits);
+        assert_eq!(evaluate(&node, std::slice::from_ref(&pinned), 1024).verdict, Verdict::Fits);
         node["usage_profile"] = json!("shared");
         assert_eq!(evaluate(&node, &[pinned], 1024).verdict, Verdict::Tight);
     }
