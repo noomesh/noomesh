@@ -768,7 +768,7 @@ pub(crate) fn empty_answer_body(finish_reason: Option<&str>, reasoning: Option<&
         "finish_reason": finish_reason,
     });
     if let Some(r) = reasoning {
-        out["reasoning"] = json!(crate::text::clip(r, EMPTY_REASONING_MAX_BYTES));
+        out["reasoning"] = json!(r);
     }
     out
 }
