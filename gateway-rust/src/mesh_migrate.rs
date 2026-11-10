@@ -3769,6 +3769,10 @@ mod legacy_layout_tests {
              -- 064 ALTERs noo_node_config (companion_policy); the legacy
              -- fixture carries the one column that identifies a row.
              CREATE TABLE public.noo_node_config (node_id text PRIMARY KEY);
+             -- 114 ALTERs noo_refresh_tokens (perspective_id); the baseline
+             -- has created it on every install, so the fixture carries the
+             -- one column that identifies a row.
+             CREATE TABLE public.noo_refresh_tokens (id uuid PRIMARY KEY);
              -- 074 ALTERs noo_security_posture (opened_at, close_by); the
              -- fixture carries the shape 031 created, since the boot-time
              -- reader COALESCEs opened_at with updated_at.

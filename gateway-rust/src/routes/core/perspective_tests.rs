@@ -25,19 +25,12 @@ use crate::auth::{Claims, Role};
 use crate::auth_refresh;
 use crate::ops::tests::{scratch, DB_LOCK};
 use crate::perspective::{self, Perspective, PrsClaim, Refusal, SessionRow, Started, Switched};
+use crate::repo::perspectives::fixtures;
 
 const SECRET: &str = "perspective-test-signing-key-not-a-secret-0001";
 
 async fn person(db: &PgPool, name: &str, role: Role) {
-    sqlx::query(
-        "INSERT INTO noo_users (username, hashed_password, role, scopes, disabled) \
-         VALUES ($1, 'x', $2, '[\"read\"]'::jsonb, false)",
-    )
-    .bind(name)
-    .bind(role.as_str())
-    .execute(db)
-    .await
-    .expect("insert user");
+    fixtures::add_user(db, name, role.as_str()).await;
 }
 
 /// A live session (refresh row) for `name`: its raw cookie and the row.
@@ -81,19 +74,11 @@ fn payload(token: &str) -> Value {
 }
 
 async fn is_live(db: &PgPool, id: &str) -> bool {
-    sqlx::query_scalar("SELECT ended_at IS NULL FROM noo_perspectives WHERE id = $1::uuid")
-        .bind(id)
-        .fetch_one(db)
-        .await
-        .expect("read the perspective")
+    fixtures::is_live(db, id).await
 }
 
 async fn end_reason(db: &PgPool, id: &str) -> Option<String> {
-    sqlx::query_scalar("SELECT end_reason FROM noo_perspectives WHERE id = $1::uuid")
-        .bind(id)
-        .fetch_one(db)
-        .await
-        .expect("read the perspective")
+    fixtures::end_reason(db, id).await
 }
 
 /// An operator `name` with a session in a `user` view.
@@ -190,11 +175,7 @@ async fn refresh_after_end_is_real() {
     let (raw, started) = user_view(&db, "olive").await;
     // End the row but leave the session's stamp: what a crash between the
     // two writes, or another gateway, leaves behind.
-    sqlx::query("UPDATE noo_perspectives SET ended_at = now(), end_reason = 'back_to_me' WHERE id = $1::uuid")
-        .bind(&started.id)
-        .execute(&db)
-        .await
-        .expect("end the row");
+    fixtures::end_row_only(&db, &started.id).await;
     assert_eq!(reread(&db, &raw, "olive").await.perspective_id.as_deref(), Some(started.id.as_str()));
     match rotate_refresh(&db, &raw, None, None).await {
         Rotation::Rotated { access_token, new_raw, .. } => {
@@ -273,13 +254,7 @@ async fn start_is_audited() {
     let _serial = DB_LOCK.lock().await;
     let Some(db) = scratch("va_audited").await else { return };
     let (raw, started) = user_view(&db, "olive").await;
-    let rows: Vec<String> = sqlx::query_scalar(
-        "SELECT details::text FROM noo_security_audit WHERE event_type = 'perspective_started' AND actor = $1",
-    )
-    .bind("olive")
-    .fetch_all(&db)
-    .await
-    .expect("read audit rows");
+    let rows: Vec<String> = fixtures::audit_column(&db, "details", "perspective_started", "olive").await;
     assert_eq!(rows.len(), 1, "one start, one PerspectiveStarted row");
     let details: Value = serde_json::from_str(&rows[0]).expect("details json");
     assert_eq!(details["id"], started.id);
@@ -289,13 +264,7 @@ async fn start_is_audited() {
     let c = claims("olive", Role::User, Some(started.claim()));
     perspective::back_to_me(&db, &c, &s).await.expect("back to me");
     assert!(!perspective::end(&db, &started.id, perspective::EndReason::Logout).await.expect("end again"), "already ended");
-    let ended: Vec<String> = sqlx::query_scalar(
-        "SELECT outcome FROM noo_security_audit WHERE event_type = 'perspective_ended' AND actor = $1",
-    )
-    .bind("olive")
-    .fetch_all(&db)
-    .await
-    .expect("read audit rows");
+    let ended: Vec<String> = fixtures::audit_column(&db, "outcome", "perspective_ended", "olive").await;
     assert_eq!(ended, vec!["back_to_me".to_string()], "ended exactly once");
 }
 
@@ -359,10 +328,7 @@ async fn switch_is_atomic() {
         .expect_err("the re-stamp fails");
     assert_eq!(r.status, StatusCode::CONFLICT);
     assert!(is_live(&db, &started.id).await, "the old perspective must survive a failed switch");
-    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM noo_perspectives WHERE account = 'olive'")
-        .fetch_one(&db)
-        .await
-        .expect("count");
+    let rows: i64 = fixtures::count_for(&db, "olive").await;
     assert_eq!(rows, 1, "the new perspective must not survive a failed switch");
     assert_eq!(reread(&db, &raw, "olive").await.perspective_id.as_deref(), Some(started.id.as_str()));
 
@@ -379,11 +345,7 @@ async fn the_cap_ends_an_orphaned_perspective() {
     let _serial = DB_LOCK.lock().await;
     let Some(db) = scratch("va_cap").await else { return };
     let (raw, started) = user_view(&db, "olive").await;
-    sqlx::query("UPDATE noo_perspectives SET cap_at = now() - interval '1 second' WHERE id = $1::uuid")
-        .bind(&started.id)
-        .execute(&db)
-        .await
-        .expect("age the cap");
+    fixtures::age_cap(&db, &started.id).await;
     assert_eq!(perspective::admit(&db, "olive", &started.claim()).await, Err(Refusal::Ended));
     assert_eq!(end_reason(&db, &started.id).await.as_deref(), Some("cap"));
     assert_eq!(reread(&db, &raw, "olive").await.perspective_id, None);
@@ -486,7 +448,7 @@ async fn owner_role_answers_a_user_perspective_as_a_user() {
     };
     let t = task_under(&db, "ada", Some(op_view)).await;
     assert_eq!(crate::task_events::task_owner_role(&db, t, "ada").await, Ok(Role::Operator));
-    sqlx::query("UPDATE noo_users SET role = 'user' WHERE username = 'ada'").execute(&db).await.expect("demote");
+    fixtures::set_role(&db, "ada", "user").await;
     assert_eq!(crate::task_events::task_owner_role(&db, t, "ada").await, Ok(Role::User), "the demotion wins");
 }
 
@@ -499,11 +461,7 @@ async fn unreadable_dims_end_the_perspective() {
     let Some(db) = scratch("va_unreadable").await else { return };
     signing_key();
     let (raw, started) = user_view(&db, "olive").await;
-    sqlx::query("UPDATE noo_perspectives SET dims = jsonb_build_object('seat', 'hall') WHERE id = $1::uuid")
-        .bind(&started.id)
-        .execute(&db)
-        .await
-        .expect("a P4 dimension");
+    fixtures::set_dims(&db, &started.id, json!({ "seat": "hall" })).await;
     match rotate_refresh(&db, &raw, None, None).await {
         Rotation::Rotated { access_token, .. } => {
             assert!(payload(&access_token).get("prs").is_none(), "the refresh is real");

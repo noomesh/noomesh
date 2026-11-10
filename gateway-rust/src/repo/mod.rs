@@ -92,6 +92,7 @@ pub mod graph;
 pub mod heartbeat;
 pub mod kb_grants;
 pub mod node_workload_placements;
+pub mod perspectives;
 pub mod prompt_skills;
 pub mod request_trace;
 pub mod seats;
