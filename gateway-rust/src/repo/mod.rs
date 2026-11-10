@@ -85,6 +85,7 @@ pub mod audit;
 pub mod caller_verifiers;
 pub mod cluster;
 pub mod connections;
+pub mod conversations;
 pub mod integration_content;
 pub mod integration_pairing;
 pub mod integrations;
@@ -247,7 +248,7 @@ mod ratchet {
     ("routes/walks.rs", 13),
     ("scheduler_engine.rs", 2),
     ("service_keys.rs", 6),
-    ("session.rs", 5),
+    ("session.rs", 2),
     ("session_floor.rs", 4),
     ("system_provision.rs", 30),
     ("system_provision_cli.rs", 1),

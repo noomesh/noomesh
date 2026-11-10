@@ -232,30 +232,14 @@ async fn ensure_conversation_in(
     // org; an existing attribution is never overwritten. Org resolution stays
     // here, shared by native callers and external transcript adapters.
     let metadata = conversation.metadata.cloned().unwrap_or_else(|| json!({}));
-    let saved: Option<Uuid> = sqlx::query_scalar(
-        "INSERT INTO noo_conversations (id, total_messages, metadata, user_id, org_id, started_at) \
-         VALUES ($1, 0, $3, $2, \
-                 COALESCE((SELECT org_id FROM noo_users WHERE username = $2), 'default'), \
-                 COALESCE($4, now())) \
-         ON CONFLICT (id) DO UPDATE \
-            SET user_id = COALESCE(noo_conversations.user_id, EXCLUDED.user_id), \
-                org_id = CASE \
-                    WHEN EXCLUDED.user_id IS NOT NULL \
-                     AND (noo_conversations.org_id IS NULL \
-                          OR noo_conversations.org_id = 'default') \
-                    THEN EXCLUDED.org_id \
-                    ELSE COALESCE(noo_conversations.org_id, EXCLUDED.org_id) \
-                END, \
-                started_at = LEAST(noo_conversations.started_at, COALESCE($4, noo_conversations.started_at)) \
-         WHERE NOT $5 OR noo_conversations.user_id = EXCLUDED.user_id \
-         RETURNING id"
+    let saved = crate::repo::conversations::ensure(
+        db,
+        conversation.id,
+        conversation.user_id,
+        &metadata,
+        conversation.started_at,
+        conversation.require_owner,
     )
-    .bind(conversation.id)
-    .bind(conversation.user_id)
-    .bind(metadata)
-    .bind(conversation.started_at)
-    .bind(conversation.require_owner)
-    .fetch_optional(db)
     .await?;
     if saved.is_none() {
         return Err(ConversationWriteError::OwnershipConflict);
@@ -272,47 +256,21 @@ pub(crate) async fn save_message_in(
 ) -> Result<(), ConversationWriteError> {
     ensure_conversation_in(db, conversation).await?;
     let metadata = message.metadata.cloned().unwrap_or_else(|| json!({}));
-    let inserted = sqlx::query(
-        "INSERT INTO noo_entries (id, conversation_id, type, content, metadata, created_at) \
-         VALUES ($1, $2, $3, $4, $5, COALESCE($6, now())) ON CONFLICT (id) DO NOTHING",
-    )
-    .bind(message.id)
-    .bind(conversation.id)
-    .bind(message.role)
-    .bind(message.content)
-    .bind(&metadata)
-    .bind(message.created_at)
-    .execute(&mut *db)
-    .await?
-    .rows_affected();
-
-    if inserted == 0 {
-        // Include conversation identity in the comparison. Timestamps compare
-        // in Postgres's own precision, including on the first source retry.
-        let unchanged: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM noo_entries WHERE id=$1 AND conversation_id=$2 \
-             AND type=$3 AND content=$4 AND metadata=$5 \
-             AND ($6::timestamptz IS NULL OR created_at=$6))",
-        )
-        .bind(message.id)
-        .bind(conversation.id)
-        .bind(message.role)
-        .bind(message.content)
-        .bind(metadata)
-        .bind(message.created_at)
-        .fetch_one(&mut *db)
-        .await?;
-        if !unchanged {
+    let entry = crate::repo::conversations::NewEntry {
+        id: message.id,
+        conversation_id: conversation.id,
+        role: message.role,
+        content: message.content,
+        metadata: &metadata,
+        created_at: message.created_at,
+    };
+    if crate::repo::conversations::insert_entry(&mut *db, &entry).await? == 0 {
+        // A retry: the same id must carry exactly the same entry.
+        if !crate::repo::conversations::entry_unchanged(&mut *db, &entry).await? {
             return Err(ConversationWriteError::ImmutableEntry);
         }
     } else {
-        sqlx::query(
-            "UPDATE noo_conversations SET total_messages = COALESCE(total_messages, 0) + 1 \
-             WHERE id = $1",
-        )
-        .bind(conversation.id)
-        .execute(&mut *db)
-        .await?;
+        crate::repo::conversations::count_message(&mut *db, conversation.id).await?;
     }
     Ok(())
 }
@@ -326,15 +284,7 @@ pub(crate) async fn finish_conversation_in(
     metadata: &Value,
 ) -> Result<(), ConversationWriteError> {
     ensure_conversation_in(db, conversation).await?;
-    sqlx::query(
-        "UPDATE noo_conversations SET ended_at=GREATEST(ended_at,$2), \
-         metadata=COALESCE(metadata,'{}'::jsonb) || $3 WHERE id=$1",
-    )
-    .bind(conversation.id)
-    .bind(ended_at)
-    .bind(metadata)
-    .execute(db)
-    .await?;
+    crate::repo::conversations::finish(db, conversation.id, ended_at, metadata).await?;
     Ok(())
 }
 
@@ -345,25 +295,12 @@ pub(crate) async fn delete_conversation_in(
     conversation_id: Uuid,
     user_id: &str,
 ) -> Result<(), ConversationWriteError> {
-    let owner: Option<Option<String>> =
-        sqlx::query_scalar("SELECT user_id FROM noo_conversations WHERE id=$1 FOR UPDATE")
-            .bind(conversation_id)
-            .fetch_optional(&mut *db)
-            .await?;
+    let owner = crate::repo::conversations::owner_for_update(&mut *db, conversation_id).await?;
     if owner.is_some_and(|owner| owner.as_deref() != Some(user_id)) {
         return Err(ConversationWriteError::OwnershipConflict);
     }
-    for statement in [
-        "DELETE FROM noo_tool_executions WHERE conversation_id=$1",
-        "DELETE FROM noo_context_retrievals WHERE conversation_id=$1",
-        "DELETE FROM noo_feedback WHERE conversation_id=$1",
-        "DELETE FROM noo_entries WHERE conversation_id=$1",
-        "DELETE FROM noo_conversations WHERE id=$1",
-    ] {
-        sqlx::query(sqlx::AssertSqlSafe(statement))
-            .bind(conversation_id)
-            .execute(&mut *db)
-            .await?;
+    for statement in crate::repo::conversations::DELETE_STATEMENTS {
+        crate::repo::conversations::delete_step(&mut *db, statement, conversation_id).await?;
     }
     Ok(())
 }
