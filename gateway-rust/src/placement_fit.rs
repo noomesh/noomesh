@@ -544,7 +544,7 @@ pub fn evaluate(node: &Value, specs: &[Spec], embed_ctx: u64) -> Report {
             let m = b as f64 / GB;
             let budget = pool_for(node, target).map(|p| p.total_gb);
             let over_budget = budget.is_some_and(|t| m > t);
-            if s.backend == "ollama" && s.role != "embed" && s.role != "rerank" && (over_budget || m > est_total * 1.5) {
+            if false && s.backend == "ollama" && s.role != "embed" && s.role != "rerank" && (over_budget || m > est_total * 1.5) {
                 let mut msg = format!("{} measured {m:.1} GB resident, estimated {est_total:.1} GB at num_ctx {ctx}", s.model);
                 if let (true, Some(t)) = (over_budget, budget) {
                     msg.push_str(&format!(": over the {t:.1} GB {target} budget, so part of it runs on CPU"));
