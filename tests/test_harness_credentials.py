@@ -29,6 +29,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from tests import _rust_src as rs
+
 REPO = Path(__file__).resolve().parents[1]
 UNIT = (REPO / "node-agent-go/deploy/noo-harness.service").read_text()
 ENV_TMPL = (REPO / "node-agent-go/deploy/noo-harness.env.tmpl").read_text()
@@ -86,9 +88,9 @@ def test_nothing_in_the_change_widens_the_pki_path() -> None:
            if re.search(r'chmod\b[^\n;]*\s(?:/etc/noo|"?\$PKI"?|/etc/noo/pki)(?=[\s;]|$)', l) and not l.lstrip().startswith("#")]
     assert len(own) == 1 and 'chmod 755 /etc/noo "$PKI"' in own[0], f"a chmod of the PKI path was added: {own}"
     assert not re.search(r"chmod -R[^\n]*(/etc/noo|\$PKI)", APPLY), "a recursive chmod of the PKI path"
-    harness_fns = PROVISION[PROVISION.index("fn harness_tls_paths"):]
-    harness_fns = harness_fns[: harness_fns.index("#[cfg(test)]")]
-    assert "chmod" not in harness_fns
+    own = rs.own_code(PROVISION)
+    for f in ("fn harness_tls_paths", "fn harness_tls_ca"):
+        assert "chmod" not in rs.fn_body(own, f), f"{f} changes a mode"
 
 
 def test_the_applier_restarts_the_harness_when_its_ca_or_pair_changes() -> None:
