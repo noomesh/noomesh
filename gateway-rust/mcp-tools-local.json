@@ -1652,6 +1652,7 @@
       "description": "Publish a source conversation entry, session ending or deletion to your\nown conversation memory. Infrastructure import: preserves original words,\nroles and source IDs; assistant dialogue is not verified action evidence.\nVersion 1 publications are idempotent and deletion prevents late replays.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Publish a source conversation entry, session ending or deletion to your\nown conversation memory. Infrastructure import: preserves original words,\nroles and source IDs; assistant dialogue is not verified action evidence.\nVersion 1 publications are idempotent and deletion prevents late replays.",
         "properties": {
           "publication": {
