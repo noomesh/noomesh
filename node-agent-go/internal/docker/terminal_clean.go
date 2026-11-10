@@ -43,9 +43,7 @@ func cleanTerminal(s string) string {
 	lines := strings.Split(b.String(), "\n")
 	for k, line := range lines {
 		line = strings.TrimRight(line, "\r")
-		if j := strings.LastIndexByte(line, '\r'); j >= 0 {
-			line = line[j+1:]
-		}
+
 		lines[k] = line
 	}
 	return strings.Join(lines, "\n")
