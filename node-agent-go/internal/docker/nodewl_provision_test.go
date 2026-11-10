@@ -421,7 +421,7 @@ func TestWorkerSpecGolden(t *testing.T) {
 	if host.Privileged || host.PidMode != "" || host.UTSMode != "" || host.UsernsMode != "" || host.IpcMode == "host" {
 		t.Errorf("host namespaces / privileged: %+v", host)
 	}
-	if len(host.Binds) != 0 || len(host.Devices) != 0 || len(host.PortBindings) != 0 || host.PublishAllPorts || len(host.Tmpfs) != 0 {
+	if len(host.Binds) != 0 || len(host.Devices) != 0 || len(host.PortBindings) != 0 || host.PublishAllPorts || len(host.Tmpfs) != 1 {
 		t.Errorf("binds/devices/ports/tmpfs: %+v", host)
 	}
 	if host.NetworkMode != "container:noo-stunnel-rhaddon-worker" {
@@ -476,7 +476,6 @@ func TestWorkerSpecGolden(t *testing.T) {
 		{mount.TypeBind, "/var/lib/noo/models/sets/rh-s2s-7b/0123456789abcdef0123456789abcdef01234567", "/models/main", true},
 		{mount.TypeBind, "/var/lib/noo/models/sets/rh-voices-a/v1", "/models/voices", true},
 		{mount.TypeVolume, "noo-wl-rhaddon-worker-scratch0", "/cache", false},
-		{mount.TypeTmpfs, "", "/tmp", false},
 	}
 	if len(host.Mounts) != len(want) {
 		t.Fatalf("mounts %+v", host.Mounts)
@@ -491,8 +490,10 @@ func TestWorkerSpecGolden(t *testing.T) {
 		!strings.Contains(vol.DriverConfig.Options["o"], "size=4096m") || !strings.Contains(vol.DriverConfig.Options["o"], "uid=1000") {
 		t.Errorf("the max_mb volume is not a size-capped tmpfs-backed volume: %+v", vol)
 	}
-	if ts := host.Mounts[3].TmpfsOptions; ts == nil || ts.SizeBytes != 256<<20 {
-		t.Errorf("tmpfs scratch %+v", host.Mounts[3].TmpfsOptions)
+	// The tmpfs_mb scratch is a HostConfig.Tmpfs entry: the Mounts API's tmpfs
+	// options take only exec/noexec, and a real daemon refuses nosuid there.
+	if got := host.Tmpfs["/tmp"]; got != "rw,nosuid,nodev,noexec,size=256m,mode=1777" {
+		t.Errorf("tmpfs scratch %q", got)
 	}
 	for _, m := range host.Mounts {
 		for _, banned := range []string{"/etc/noo", "/var/run/docker.sock", "/var/lib/noo-node-agent", "pki"} {
