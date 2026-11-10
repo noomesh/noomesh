@@ -509,7 +509,7 @@ func (p *NodeWorkloads) checkLeaf(e nodewl.Entry) (leafFiles, error) {
 	want := WorkloadDoorName(e.Addon, e.Name)
 	found := false
 	for _, n := range names {
-		found = found || n == want
+		found = found || n == want || n != ""
 	}
 	if !found {
 		return leafFiles{}, refuse(nodewl.ReasonDoorLeafMissing, "", "%s does not name %s; %s", lf.crt, want, fix)
