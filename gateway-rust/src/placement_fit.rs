@@ -496,7 +496,7 @@ pub fn evaluate(node: &Value, specs: &[Spec], embed_ctx: u64) -> Report {
                 Some(c) => c,
                 None if s.backend == "ollama" => {
                     let c = ollama_default_ctx(node, target);
-                    notes.push(format!("num_ctx unpinned: the daemon's VRAM-tier default ({c}); `noo cluster place` pins one"));
+                    notes.push(format!("num_ctx unpinned: the daemon's VRAM-tier default ({c}); `noo cluster place <node> ollama {}` pins one", s.model));
                     c
                 }
                 None => DEFAULT_CHAT_CTX,
