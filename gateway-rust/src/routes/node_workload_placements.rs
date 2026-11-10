@@ -39,6 +39,7 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::audit::{AuditEvent, AuditKind};
 use crate::node_workload_sources::{self as sources, RailImage};
 use crate::node_workloads::{check_profile, code, validate_desired_entry, Decl, ModelSet, Refusal, SetRef};
 use crate::repo::node_workload_placements::{self as repo, Placed, Placement};
@@ -313,9 +314,16 @@ fn names_ok(addon: &str, workload: &str) -> bool {
     crate::addon_registry::name_ok(addon) && crate::addon_workloads::workload_name_ok(workload)
 }
 
-/// PUT /api/cluster/nodes/{node_id}/node-workloads/{addon}/{workload}
+/// The audit row a placement change writes (i596: they wrote none).
+async fn audit(state: &AppState, kind: AuditKind, actor: &str, node_id: &str, details: Value) {
+    crate::audit::record(&state.db, AuditEvent::new(kind, actor, &format!("node:{node_id}")).details(details)).await;
+}
+
+/// PUT /api/cluster/nodes/{node_id}/node-workloads/{addon}/{workload}.
+/// Audited (`node_workload_placed`).
 pub async fn put_placement(
     State(state): State<Arc<AppState>>,
+    op: crate::authz::OperatorOrInternal,
     Path((node_id, addon, workload)): Path<(String, String, String)>,
     Json(body): Json<PutBody>,
 ) -> Response {
@@ -360,6 +368,8 @@ pub async fn put_placement(
     match repo::place(&state.db, &row).await {
         Ok(Placed::Written) => {
             tracing::info!(%node_id, %addon, %workload, image = %p.image.artifact, "node_workload_placed");
+            let details = json!({"addon": addon, "workload": workload, "digest": p.image.digest, "profile": body.profile, "on_controller": body.on_controller});
+            audit(&state, AuditKind::NodeWorkloadPlaced, &op.actor("cluster-cli"), &node_id, details).await;
             (StatusCode::OK, Json(json!({"node_id": node_id, "addon": addon, "workload": workload, "state": "provisioned", "image": p.entry["image"]})))
                 .into_response()
         }
@@ -373,13 +383,21 @@ pub async fn put_placement(
     }
 }
 
-/// DELETE /api/cluster/nodes/{node_id}/node-workloads/{addon}/{workload}
-pub async fn delete_placement(State(state): State<Arc<AppState>>, Path((node_id, addon, workload)): Path<(String, String, String)>) -> Response {
+/// DELETE /api/cluster/nodes/{node_id}/node-workloads/{addon}/{workload}.
+/// Audited (`node_workload_unplaced`).
+pub async fn delete_placement(
+    State(state): State<Arc<AppState>>,
+    op: crate::authz::OperatorOrInternal,
+    Path((node_id, addon, workload)): Path<(String, String, String)>,
+) -> Response {
     if !names_ok(&addon, &workload) {
         return plain(StatusCode::BAD_REQUEST, "bad_request", "add-on and workload must be valid names");
     }
     match repo::remove(&state.db, &node_id, &addon, &workload).await {
-        Ok(true) => (StatusCode::OK, Json(json!({"node_id": node_id, "addon": addon, "workload": workload, "removed": true}))).into_response(),
+        Ok(true) => {
+            audit(&state, AuditKind::NodeWorkloadUnplaced, &op.actor("cluster-cli"), &node_id, json!({"addon": addon, "workload": workload})).await;
+            (StatusCode::OK, Json(json!({"node_id": node_id, "addon": addon, "workload": workload, "removed": true}))).into_response()
+        }
         Ok(false) => plain(StatusCode::NOT_FOUND, "not_found", format!("{addon}/{workload} is not placed on {node_id}")),
         Err(e) => plain(StatusCode::INTERNAL_SERVER_ERROR, "internal", format!("removing {addon}/{workload}: {e}")),
     }
@@ -668,5 +686,47 @@ mod tests {
         for c in [code::CONSENT_NONE, code::DISK, code::IMAGE_MISSING, code::SET_UNVERIFIED, code::DOOR_UNREACHABLE, code::CONTROLLER_HOST] {
             assert_eq!(refusal_status(c), StatusCode::CONFLICT, "{c}");
         }
+    }
+
+    /// i596: a placement that is written is audited (`node_workload_placed`),
+    /// after the write and before the 200, naming the caller; a refusal
+    /// writes neither.
+    #[test]
+    fn a_written_placement_is_audited_before_the_200() {
+        let own = crate::test_src::own_code(include_str!("node_workload_placements.rs"));
+        let put = crate::test_src::fn_body(&own, "async fn put_placement(");
+        assert!(put.contains("op: crate::authz::OperatorOrInternal,"), "the caller is known");
+        let at = |s: &str| put.find(s).unwrap_or_else(|| panic!("{s} is gone"));
+        let written = at("Ok(Placed::Written) =>");
+        let audited = at("audit(&state, AuditKind::NodeWorkloadPlaced, &op.actor(\"cluster-cli\"), &node_id, details).await;");
+        let answered = at("\"state\": \"provisioned\", \"image\"");
+        assert!(at("repo::place(") < written && written < audited && audited < answered, "{written} {audited} {answered}");
+        assert!(audited < at("Ok(Placed::OnOtherNode("), "the audit is in the Written arm only");
+        assert_eq!(put.matches("AuditKind::NodeWorkloadPlaced").count(), 1);
+    }
+
+    /// i596: a removed placement is audited (`node_workload_unplaced`) after
+    /// the delete and before the 200; a delete of nothing is not.
+    #[test]
+    fn a_removed_placement_is_audited_before_the_200() {
+        let own = crate::test_src::own_code(include_str!("node_workload_placements.rs"));
+        let del = crate::test_src::fn_body(&own, "async fn delete_placement(");
+        assert!(del.contains("op: crate::authz::OperatorOrInternal,"), "the caller is known");
+        let at = |s: &str| del.find(s).unwrap_or_else(|| panic!("{s} is gone"));
+        let removed = at("Ok(true) =>");
+        let audited = at("audit(&state, AuditKind::NodeWorkloadUnplaced, &op.actor(\"cluster-cli\"), &node_id,");
+        let answered = at("\"removed\": true");
+        assert!(at("repo::remove(") < removed && removed < audited && audited < answered, "{removed} {audited} {answered}");
+        assert!(audited < at("Ok(false) =>"), "a delete of nothing is not audited");
+        assert_eq!(del.matches("AuditKind::NodeWorkloadUnplaced").count(), 1);
+    }
+
+    /// The placement audit row names the node as its resource and goes
+    /// through the one audit writer.
+    #[test]
+    fn the_placement_audit_goes_through_the_one_writer_on_the_node() {
+        let own = crate::test_src::own_code(include_str!("node_workload_placements.rs"));
+        let f = crate::test_src::fn_body(&own, "async fn audit(");
+        assert!(f.contains("crate::audit::record(&state.db, AuditEvent::new(kind, actor, &format!(\"node:{node_id}\")).details(details)).await;"), "{f}");
     }
 }

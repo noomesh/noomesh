@@ -2364,6 +2364,25 @@ BEGIN
     END IF;
 END $$;
 "#,
+}, Migration {
+    revision: NODE_WORKLOAD_APPROVALS_REVISION,
+    down_revision: Some(PERSPECTIVES_REVISION),
+    // i596 slice 2: the newest approval set the operator signed for each
+    // node, carried to it in desired-config as `workload_approvals`. The
+    // gateway stores the exact bytes and never signs: `doc` and `sig` are
+    // what the node verifies with signing.pub. One row per node; a newer
+    // generation replaces it (repo/node_workload_approvals.rs).
+    sql: r#"
+CREATE TABLE IF NOT EXISTS noo_node_workload_approvals (
+    node_id text PRIMARY KEY,
+    generation bigint NOT NULL,
+    doc bytea NOT NULL,
+    sig bytea NOT NULL,
+    stored_at timestamptz NOT NULL DEFAULT now(),
+    stored_by text NOT NULL,
+    CONSTRAINT noo_node_workload_approvals_generation CHECK (generation >= 1)
+)
+"#,
 }];
 
 /// Add-on feature settings and the super-admin flag (f99). A constant so a
@@ -2401,6 +2420,10 @@ pub const SEAT_DISPLAY_REVISION: &str = "113_seat_display";
 /// `perspective_id` on refresh rows, on seat display (113). A constant so a
 /// renumber at rebase is one line.
 pub const PERSPECTIVES_REVISION: &str = "114_perspectives";
+
+/// The operator's signed node-workload approval set per node (i596 slice
+/// 2), on perspectives (114). A constant so a renumber at rebase is one line.
+pub const NODE_WORKLOAD_APPROVALS_REVISION: &str = "115_node_workload_approvals";
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
 /// constant so a renumber at rebase is one line.
@@ -3999,16 +4022,15 @@ mod seat_display_migration_tests {
 mod perspectives_migration_tests {
     use super::*;
 
-    /// i538 P1: the perspectives revision is the chain head, sits on seat
-    /// display, and only adds: a new table, a partial index, one nullable
+    /// i538 P1: the perspectives revision sits on seat display,
+    /// and only adds: a new table, a partial index, one nullable
     /// column on the refresh rows, and the app role's grant.
     #[test]
-    fn perspectives_revision_is_the_head_and_additive() {
+    fn perspectives_revision_is_additive() {
         let m = MIGRATIONS.iter().find(|m| m.revision == PERSPECTIVES_REVISION).expect("must be in the chain");
         assert_eq!(m.revision, "114_perspectives");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(SEAT_DISPLAY_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(PERSPECTIVES_REVISION), "the chain head");
         assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_perspectives"));
         assert!(m.sql.contains("cap_at timestamptz NOT NULL"));
         assert!(m.sql.contains("ALTER TABLE noo_refresh_tokens ADD COLUMN IF NOT EXISTS perspective_id uuid"));
@@ -4017,5 +4039,32 @@ mod perspectives_migration_tests {
             assert!(m.sql.contains(reason), "{reason}");
         }
         assert!(!m.sql.contains("DELETE") && !m.sql.contains("DROP") && !m.sql.contains("UPDATE noo_"));
+    }
+}
+
+#[cfg(test)]
+mod node_workload_approvals_migration_tests {
+    use super::*;
+
+    /// i596 slice 2: the approvals revision is the chain head, sits on
+    /// perspectives (114), creates one row per node, rewrites nothing, and
+    /// creates every column its writer inserts.
+    #[test]
+    fn node_workload_approvals_revision_is_the_head_and_matches_its_writer() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == NODE_WORKLOAD_APPROVALS_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "115_node_workload_approvals");
+        assert!(m.revision.len() <= 32);
+        assert_eq!(m.down_revision, Some(PERSPECTIVES_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(NODE_WORKLOAD_APPROVALS_REVISION), "the chain head");
+        assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_node_workload_approvals"));
+        assert!(m.sql.contains("\n    node_id text PRIMARY KEY,"), "one set per node");
+        assert!(m.sql.contains("CHECK (generation >= 1)"));
+        assert!(!m.sql.contains("DELETE") && !m.sql.contains("UPDATE") && !m.sql.contains("DROP"));
+        let writer = include_str!("repo/node_workload_approvals.rs");
+        let insert = writer.split("INSERT INTO noo_node_workload_approvals").nth(1).expect("the writer inserts");
+        let cols = insert.split('(').nth(1).and_then(|c| c.split(')').next()).expect("a column list");
+        for col in cols.split(',').map(str::trim) {
+            assert!(m.sql.contains(&format!("\n    {col} ")), "{col} is written but not created");
+        }
     }
 }

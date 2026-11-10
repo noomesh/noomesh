@@ -10,8 +10,19 @@
     {
       "addon": "rhaddon",
       "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    {
+      "addon": "rhaddon",
+      "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "source": "controller"
     }
   ],
+  "addon_workloads_controller": {
+    "opted_in": true,
+    "set_state": "verified",
+    "generation": 3,
+    "set_sha256": "5d2f7c1e0a9b8c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d"
+  },
   "model_sets": [
     {
       "id": "rh-s2s-7b",

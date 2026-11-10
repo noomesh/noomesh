@@ -97,6 +97,12 @@ pub fn router() -> Router<Arc<AppState>> {
             put(super::node_workload_placements::put_placement).delete(super::node_workload_placements::delete_placement),
         )
         .route("/api/cluster/nodes/{node_id}/node-workloads", get(super::node_workload_placements::list_placements))
+        // i596 slice 2: the operator's signed approval set for one node,
+        // stored and carried (desired-config `workload_approvals`), never signed here.
+        .route(
+            "/api/cluster/nodes/{node_id}/workload-approvals",
+            get(super::node_workload_approvals::get_workload_approvals).put(super::node_workload_approvals::put_workload_approvals),
+        )
         .route("/api/cluster/nodes/{node_id}/fit", post(placement_fit_post))
         // ── Model classes ──
         .route("/api/cluster/model-classes", get(model_classes_get))
@@ -301,6 +307,9 @@ enum BeatShape {
     OneOf(&'static [&'static str]),
     /// A list of objects, at most this many.
     Objects(usize),
+    /// One flat object: only these keys, each value a scalar (a bool, a
+    /// finite number, or a string of at most 64 bytes). No null, no nesting.
+    Object(&'static [&'static str]),
 }
 
 /// The A4 keys. Placement (i300 H3) reads only what this stores: a key left
@@ -317,6 +326,9 @@ const I300_BEAT_KEYS: &[(&str, BeatShape)] = &[
     ("data_root_free_gb", BeatShape::Num),
     ("addon_workloads_policy", BeatShape::OneOf(&["none", "approve", "auto"])),
     ("addon_workloads_approvals", BeatShape::Objects(256)),
+    // i596: the controller approval set the node holds, and whether its
+    // owner opted in. Shown by `noo cluster workloads approvals`.
+    ("addon_workloads_controller", BeatShape::Object(&["opted_in", "set_state", "generation", "set_sha256"])),
     ("model_sets", BeatShape::Objects(256)),
     ("node_workloads", BeatShape::Objects(64)),
 ];
@@ -330,6 +342,17 @@ fn beat_shape_ok(v: &Value, shape: BeatShape) -> bool {
         BeatShape::Objects(max) => v
             .as_array()
             .is_some_and(|a| a.len() <= max && a.iter().all(Value::is_object)),
+        BeatShape::Object(keys) => v.as_object().is_some_and(|o| {
+            o.iter().all(|(k, x)| {
+                keys.contains(&k.as_str())
+                    && match x {
+                        Value::Bool(_) => true,
+                        Value::Number(n) => n.as_f64().is_some_and(f64::is_finite),
+                        Value::String(s) => s.len() <= 64,
+                        _ => false,
+                    }
+            })
+        }),
     }
 }
 
@@ -3928,6 +3951,12 @@ async fn desired_config_get(
     if let Some(nw) = node_workloads {
         body["node_workloads"] = Value::Array(nw);
     }
+    // i596: the operator's signed approval set for this node, carried as the
+    // exact stored bytes. Left OUT (never null) when none is stored or it
+    // cannot be read: an absent key changes nothing on the node.
+    if let Some(wa) = super::node_workload_approvals::desired_for(&state, &node_id).await {
+        body["workload_approvals"] = wa;
+    }
     Ok(Json(body))
 }
 
@@ -4534,7 +4563,7 @@ async fn placement_staging_refusal(state: &AppState, node_id: &str, backend: &st
 /// (404) or unreachable costs a log line and nothing else. Without this a
 /// harness kind change landed up to 5 min after `noo cluster place`
 /// (both awolf and mcmini, harness compare 2026-10-24).
-fn nudge_reconcile(state: Arc<AppState>, node_id: String) {
+pub(super) fn nudge_reconcile(state: Arc<AppState>, node_id: String) {
     tokio::spawn(async move {
         let link = match crate::node_link::NodeLink::for_node(&state, &node_id).await {
             Ok(l) => l,
@@ -8205,6 +8234,20 @@ mod backend_image_ref_tests {
         assert!(body.contains("if let Some(nw) = node_workloads {\n        body[\"node_workloads\"] = Value::Array(nw);"), "only Some sets the key");
     }
 
+    /// i596: desired-config carries `workload_approvals` only when a set is
+    /// stored (the pure half, `desired_field`, is tested beside it), and
+    /// sets the key in exactly one place, under `Some`: never null.
+    #[test]
+    fn desired_config_carries_workload_approvals_only_when_stored() {
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn desired_config_get(");
+        assert!(
+            body.contains("if let Some(wa) = super::node_workload_approvals::desired_for(&state, &node_id).await \u{7b}\n        body[\"workload_approvals\"] = wa;"),
+            "only Some sets the key"
+        );
+        assert_eq!(body.matches("\"workload_approvals\"").count(), 1, "one writer of the key");
+    }
+
     /// `${A:-default}` (nested) as compose interpolates it, for the test above.
     fn interpolate(s: &str, env: &HashMap<String, String>) -> String {
         let mut out = String::new();
@@ -8427,6 +8470,7 @@ mod i300_beat_tests {
             "data_root_free_gb": 412.5,
             "addon_workloads_policy": "approve",
             "addon_workloads_approvals": [{"addon": "rhaddon", "digest": format!("sha256:{}", "a".repeat(64))}],
+            "addon_workloads_controller": {"opted_in": true, "set_state": "verified", "generation": 3, "set_sha256": "c".repeat(64)},
             "model_sets": [{"id": "rh-voice", "revision": "r1", "state": "verified"}],
             "node_workloads": [{"addon": "rhaddon", "name": "worker", "state": "provisioned", "ready": false, "door_port": 41001}],
         })
@@ -8456,16 +8500,56 @@ mod i300_beat_tests {
             "model_sets": [1, 2],
             "node_workloads": {"addon": "rhaddon"},
             "addon_workloads_approvals": too_many,
+            "addon_workloads_controller": "verified",
         });
         carry_i300(&mut data, &full_beat());
         carry_i300(&mut data, &bad);
-        for key in ["gpu_compute_cap", "os", "nvidia_runtime", "data_root_free_gb", "addon_workloads_policy", "model_sets", "node_workloads", "addon_workloads_approvals"] {
+        for key in ["gpu_compute_cap", "os", "nvidia_runtime", "data_root_free_gb", "addon_workloads_policy", "model_sets", "node_workloads", "addon_workloads_approvals", "addon_workloads_controller"] {
             assert!(data.get(key).is_none(), "{key}: a misshapen value is unknown, never kept: {data}");
         }
         // An empty list is a fact (no sets, no workloads), not unknown.
         carry_i300(&mut data, &json!({"model_sets": [], "node_workloads": []}));
         assert_eq!(data["model_sets"], json!([]));
         assert_eq!(data["node_workloads"], json!([]));
+    }
+
+    /// i596: `addon_workloads_controller` is kept as the agent sends it (the
+    /// opt-in alone, or with a verified set's generation and SHA-256), and
+    /// each misshape drops it: not an object, a key outside the four, a
+    /// nested value, a null, an over-long string.
+    #[test]
+    fn the_controller_approvals_key_is_kept_well_formed_and_dropped_misshapen() {
+        let keep = |v: Value| {
+            let mut data = json!({"id": "n1"});
+            carry_i300(&mut data, &json!({"addon_workloads_controller": v}));
+            assert_eq!(data.get("addon_workloads_controller"), Some(&v), "{v} is well-formed");
+        };
+        keep(json!({"opted_in": false, "set_state": "none"}));
+        keep(json!({"opted_in": true, "set_state": "unverifiable"}));
+        keep(json!({"opted_in": true, "set_state": "verified", "generation": 7, "set_sha256": "d".repeat(64)}));
+        let dropped = |v: Value| {
+            let mut data = json!({"id": "n1", "addon_workloads_controller": {"opted_in": true, "set_state": "none"}});
+            carry_i300(&mut data, &json!({"addon_workloads_controller": v}));
+            assert!(data.get("addon_workloads_controller").is_none(), "{v} is misshapen, so unknown: {data}");
+        };
+        dropped(json!([{"opted_in": true}]));
+        dropped(json!({"opted_in": true, "set_state": "none", "approvals": "rhaddon"}));
+        dropped(json!({"opted_in": true, "set_state": {"state": "verified"}}));
+        dropped(json!({"opted_in": null, "set_state": "none"}));
+        dropped(json!({"opted_in": true, "set_state": "x".repeat(65)}));
+    }
+
+    /// The contract's heartbeat example (tests/fixtures/i300, copied here
+    /// byte-identical) carries every A4 key, and every one is stored as sent.
+    #[test]
+    fn the_contract_heartbeat_example_is_stored_whole() {
+        let hb: Value = serde_json::from_str(include_str!("../testdata/i300/heartbeat-i300.json")).expect("the example parses");
+        let mut data = json!({"id": "n1"});
+        carry_i300(&mut data, &hb);
+        for (key, _) in I300_BEAT_KEYS {
+            assert!(hb.get(*key).is_some(), "{key}: the example lacks it");
+            assert_eq!(data.get(*key), hb.get(*key), "{key} stored as sent");
+        }
     }
 
     /// The handler runs this step before its KV write.

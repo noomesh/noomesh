@@ -551,7 +551,7 @@ become a fact (the i495 rule). A `null` is never sent.
 | `data_root_free_gb` | number | omitted when unknown |
 | `addon_workloads_policy` | `"none"` / `"approve"` / `"auto"` | the node's consent setting |
 | `addon_workloads_approvals` | `[{addon, digest, source?}]` | per add-on and image digest. The owner's own approvals carry no `source`; on a node whose owner opted in to controller approvals, each pair only the controller's signed set approves follows them with `"source": "controller"` (at most 256 rows in all) |
-| `addon_workloads_controller` | `{opted_in, set_state, generation?, set_sha256?}` | controller approvals ([below](#approving-from-the-controller-opt-in)): whether the owner opted in, and the set the agent holds: `set_state` is `none`, `verified` or `unverifiable`; `generation` and `set_sha256` (the SHA-256 of the signed document's bytes) ride `verified`. Always reported. The gateway stores it from the release that delivers the sets (i596 slice 2); until then it drops it |
+| `addon_workloads_controller` | `{opted_in, set_state, generation?, set_sha256?}` | controller approvals ([below](#approving-from-the-controller-opt-in)): whether the owner opted in, and the set the agent holds: `set_state` is `none`, `verified` or `unverifiable`; `generation` and `set_sha256` (the SHA-256 of the signed document's bytes) ride `verified`. Always reported. The gateway stores it as a flat object of only these four keys, each a bool, a number or a string of at most 64 bytes; anything else is dropped as unknown. Placement does not read it. Compare `set_sha256` with the `doc_sha256` the PUT answered, or with the stored set, to see whether a node has applied the newest set |
 | `model_sets` | `[{id, revision, state, reason?}]` | `state` is `verified`, `fetching` or `refused`; `reason` rides `refused` |
 | `node_workloads` | `[{addon, name, state, ready, model?, door_port, reservation?, reason?}]` | `state` is a desired state or a reported one (`draining`, `needs_attention`). `model`, `reservation` and `reason` are omitted when unknown or none. There is no `slots` in phase 2 (placement sizes it from `accel.slots_env`) |
 
@@ -667,6 +667,50 @@ generation with other bytes is refused, and a revoke is a newer generation
 without the entry. A set that is absent, `null` or refused leaves the held one
 as it was.
 
+The gateway stores and carries the set; it cannot sign one, and it does not
+verify the signature (its PKI view holds no `signing.pub`; the node verifies,
+with its own pinned key). Operator role only (a logged-in Operator or Admin;
+the cluster HMAC and node credentials are refused):
+
+- `PUT /api/cluster/nodes/{node_id}/workload-approvals` with
+  `{"doc": "<base64>", "sig": "<base64>"}` (standard, padded) stores the set
+  for an enrolled node. The body is at most 128 KiB, the document at most
+  64 KiB and the signature at most 512 bytes (`413 too_large`). The gateway
+  checks what the node will check of the document's shape, each its own
+  `{"error": <code>, "detail"}`: the body is exactly `{doc, sig}`
+  (`bad_body`); both are base64 (`bad_base64`); the document is one strict
+  JSON value with no unknown field (`doc_invalid`); `kind`
+  (`wrong_kind`); `node` is the `{node_id}` of the path (`node_mismatch`);
+  `generation` is 1 or more (`bad_generation`); `issued_at` is RFC 3339
+  (`bad_issued_at`); each entry's add-on is a name both the gateway and the
+  node accept (`bad_addon`) and its digest is `sha256:<64 lower-case hex>`
+  (`bad_digest`); no entry twice (`duplicate_entry`). A node that is not
+  enrolled is `404 unknown_node`. Then the generation must RISE: below the
+  stored one is `409 generation_rollback`; the stored one with other bytes
+  is `409 generation_conflict`; the stored one with the same bytes is a 200
+  that writes nothing (`"changed": false`). A store that loses a race to a
+  newer one is `409 raced`. The answer is
+  `{node, generation, entries, doc_sha256, changed}`.
+- `GET /api/cluster/nodes/{node_id}/workload-approvals` returns the stored set
+  as `{node, generation, doc, sig, stored_at, stored_by}` (`doc` and `sig`
+  base64), or 404.
+
+A stored set is written to the security audit as `node_workload_approvals_set`
+(severity warning; the actor is the operator's login; the resource
+`node:<id>`), with the node, the generation, the entry count and the
+document's SHA-256, never the document. The node is then nudged to reconcile,
+so it fetches the set within seconds rather than at its next tick.
+desired-config carries the stored set as top-level
+`workload_approvals: {doc, sig}`, the exact stored bytes in base64, and leaves
+the key OUT when none is stored (or the store cannot be read): it is never
+`null`, and an absent key changes nothing on the node.
+
+Placing and removing a node workload are audited too:
+`PUT /api/cluster/nodes/{node_id}/node-workloads/{addon}/{workload}` writes
+`node_workload_placed` (add-on, workload, image digest, profile,
+`on_controller`) and `DELETE` writes `node_workload_unplaced` (add-on,
+workload), each on `node:<id>` and only when something was written.
+
 The consent check, in order:
 
 1. policy `none` refuses (`consent_none`), whatever any set approves;
@@ -682,7 +726,9 @@ Threat model:
 
 - **A compromised gateway cannot approve.** It never holds the fleet signing
   key. It can withhold a new set (the node keeps the last one it verified, and
-  reports its generation) but cannot replay an older one.
+  reports its generation) but cannot replay an older one. Its own checks on a
+  PUT and its audit row catch mistakes and record who stored what; they are
+  not the boundary. The node's signature check is.
 - **The fleet signing key's holder can approve on opted-in nodes.** That key
   already signs the bundles and the agent binary every node installs, so it
   could replace those nodes' agents anyway: the opt-in is not a boundary

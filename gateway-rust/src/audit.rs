@@ -184,6 +184,9 @@ pub(crate) enum AuditKind {
     NodeForgotten,
     NodeGpuHold,
     NodeGpuRelease,
+    NodeWorkloadApprovalsSet,
+    NodeWorkloadPlaced,
+    NodeWorkloadUnplaced,
     OperatorCertRegistered,
     OperatorCertRevoked,
     OrgCreate,
@@ -322,6 +325,9 @@ impl AuditKind {
             Self::NodeForgotten => "node_forgotten",
             Self::NodeGpuHold => "node_gpu_hold",
             Self::NodeGpuRelease => "node_gpu_release",
+            Self::NodeWorkloadApprovalsSet => "node_workload_approvals_set",
+            Self::NodeWorkloadPlaced => "node_workload_placed",
+            Self::NodeWorkloadUnplaced => "node_workload_unplaced",
             Self::OperatorCertRegistered => "operator_cert_registered",
             Self::OperatorCertRevoked => "operator_cert_revoked",
             Self::OrgCreate => "org_create",
@@ -461,6 +467,10 @@ impl AuditKind {
             Self::NodeForgotten => Severity::Warning,
             Self::NodeGpuHold => Severity::Info,
             Self::NodeGpuRelease => Severity::Info,
+            // A consent change on a node: loud, as a provision bundle is.
+            Self::NodeWorkloadApprovalsSet => Severity::Warning,
+            Self::NodeWorkloadPlaced => Severity::Info,
+            Self::NodeWorkloadUnplaced => Severity::Info,
             Self::OperatorCertRegistered => Severity::Warning,
             Self::OperatorCertRevoked => Severity::Warning,
             Self::OrgCreate => Severity::Info,
@@ -597,6 +607,9 @@ impl AuditKind {
             "node_forgotten" => Self::NodeForgotten,
             "node_gpu_hold" => Self::NodeGpuHold,
             "node_gpu_release" => Self::NodeGpuRelease,
+            "node_workload_approvals_set" => Self::NodeWorkloadApprovalsSet,
+            "node_workload_placed" => Self::NodeWorkloadPlaced,
+            "node_workload_unplaced" => Self::NodeWorkloadUnplaced,
             "operator_cert_registered" => Self::OperatorCertRegistered,
             "operator_cert_revoked" => Self::OperatorCertRevoked,
             "org_create" => Self::OrgCreate,
@@ -734,6 +747,9 @@ impl AuditKind {
             Self::NodeForgotten,
             Self::NodeGpuHold,
             Self::NodeGpuRelease,
+            Self::NodeWorkloadApprovalsSet,
+            Self::NodeWorkloadPlaced,
+            Self::NodeWorkloadUnplaced,
             Self::OperatorCertRegistered,
             Self::OperatorCertRevoked,
             Self::OrgCreate,
@@ -1253,6 +1269,9 @@ mod tests {
         "node_forgotten",
         "node_gpu_hold",
         "node_gpu_release",
+        "node_workload_approvals_set",
+        "node_workload_placed",
+        "node_workload_unplaced",
         "operator_cert_registered",
         "operator_cert_revoked",
         "org_create",
@@ -1338,7 +1357,7 @@ mod tests {
         let mut want: Vec<String> = PINNED.iter().map(|s| s.to_string()).collect();
         want.sort();
         assert_eq!(got, want, "a kind was renamed, added or dropped: edit PINNED on purpose");
-        assert_eq!(PINNED.len(), 129);
+        assert_eq!(PINNED.len(), 132);
     }
 
     #[test]

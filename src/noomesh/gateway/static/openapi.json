@@ -22297,6 +22297,61 @@
           }
         }
       }
+    },
+    "/api/cluster/nodes/{node_id}/workload-approvals": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get workload approvals",
+        "description": "[native] GET /api/cluster/nodes/{node_id}/workload-approvals \u2014 the stored set: `{node, generation, doc, sig, stored_at, stored_by}` (doc and sig base64), or 404. Operator only.",
+        "operationId": "get_workload_approvals",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Update workload approvals",
+        "description": "[native] PUT /api/cluster/nodes/{node_id}/workload-approvals \u2014 store the operator's signed set for an enrolled node, if it is newer. Operator only; audited (`node_workload_approvals_set`).",
+        "operationId": "put_workload_approvals",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

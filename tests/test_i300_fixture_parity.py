@@ -371,6 +371,7 @@ HEARTBEAT_TYPES = {
     "data_root_free_gb": (int, float),
     "addon_workloads_policy": str,
     "addon_workloads_approvals": list,
+    "addon_workloads_controller": dict,  # i596: always reported
     "model_sets": list,
     "node_workloads": list,
 }
@@ -384,7 +385,17 @@ def test_the_heartbeat_example_has_the_a4_keys_and_only_them() -> None:
     assert hb["os"] in ("linux", "darwin", "windows")
     assert re.fullmatch(r"\d{1,2}\.\d", hb["gpu_compute_cap"])
     assert hb["addon_workloads_policy"] in ("none", "approve", "auto")
-    assert all(set(a) == {"addon", "digest"} for a in hb["addon_workloads_approvals"])
+    # The owner's own approvals carry no source; one only the controller's
+    # signed set approves says so (i596).
+    for a in hb["addon_workloads_approvals"]:
+        assert set(a) == {"addon", "digest"} or (set(a) == {"addon", "digest", "source"} and a["source"] == "controller"), a
+    ctl = hb["addon_workloads_controller"]
+    assert isinstance(ctl["opted_in"], bool) and ctl["set_state"] in ("none", "verified", "unverifiable")
+    # generation and set_sha256 ride a verified set only, and nothing else rides.
+    assert set(ctl) == ({"opted_in", "set_state", "generation", "set_sha256"} if ctl["set_state"] == "verified" else {"opted_in", "set_state"})
+    if ctl["set_state"] == "verified":
+        assert isinstance(ctl["generation"], int) and ctl["generation"] >= 1
+        assert re.fullmatch(r"[0-9a-f]{64}", ctl["set_sha256"])
     for s in hb["model_sets"]:
         assert set(s) <= {"id", "revision", "state", "reason"} and s["state"] in ("verified", "fetching", "refused")
         assert ("reason" in s) == (s["state"] == "refused"), "a reason rides a refused set"
