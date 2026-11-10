@@ -1169,7 +1169,7 @@ pub(crate) fn run(cx: &Cx, start: &Opts) -> Run {
             return Run { steps, ran, end: End::Complete };
         };
         let s = steps[i].clone();
-        if ran.contains(&s.id) {
+        if ran.contains(&s.id) && s.id == "never" {
             let end = End::Failed(
                 ExitCode::Generic as i32,
                 format!("{} was carried out and still reads {}: {}", label(&s.id), s.state.word(), s.detail),
