@@ -209,6 +209,8 @@ NOT_IN_SCHEMA = {
         "refuse-scratch-in-model-slot.json",
         "refuse-scratch-equals-model-slot.json",
         "refuse-scratch-exec-two.json",
+        "refuse-scratch-nested.json",
+        "refuse-scratch-nested-exec.json",
         "refuse-scratch-exec-over-cap.json",
         "refuse-scratch-exec-tmpfs-over-cap.json",
         "refuse-addon-underscore.json",
