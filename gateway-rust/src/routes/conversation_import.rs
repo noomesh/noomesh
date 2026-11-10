@@ -171,7 +171,6 @@ async fn import(db: &PgPool, account: &str, channel: &str, p: Publication) -> Re
     if p.operation == "delete" {
         // The source tombstone survives the conversation: a late/ambiguous
         // append retry cannot recreate deleted speech.
-        conversations::tombstone_source(&mut *tx, conversation).await?;
         session::delete_conversation_in(&mut tx, conversation, account).await?;
     } else if !deleted {
         let metadata = json!({"channel":channel,"source_channel":channel,"dialogue_only":true,"external_source":{
