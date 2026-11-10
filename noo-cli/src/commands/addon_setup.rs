@@ -1124,10 +1124,10 @@ fn act_on(cx: &Cx, o: &mut Opts, s: &Step, ran: &mut BTreeSet<String>) -> Flow {
         (b, State::Decision) if b.starts_with("sets:") || b == "place" => choice_decision(cx, o, s),
         ("place", State::Todo) => match &s.act {
             Act::Place { node, workload, chosen } => {
-                let sets: Vec<(String, String, String)> =
+                let _sets: Vec<(String, String, String)> =
                     chosen.iter().flat_map(|(slot, refs)| refs.iter().map(move |(id, rev)| (slot.clone(), id.clone(), rev.clone()))).collect();
                 let what = s.command.clone().unwrap_or_else(|| "place the workload".to_string());
-                exec(cx, s, &what, ran, || cx.d.place(node, &addon, workload, &sets))
+                exec(cx, s, &what, ran, || cx.d.place(node, &addon, workload, &[]))
             }
             _ => Flow::End(End::Stop(runnable(s))),
         },
