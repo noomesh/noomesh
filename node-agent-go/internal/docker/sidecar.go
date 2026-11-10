@@ -217,7 +217,7 @@ func stunnelImageCandidates(backend string) []string {
 // by (image_stage.rs, source door-pin); a release-following stunnel has no
 // pin, because the controller sends none for it. Never the backend's pin.
 func sidecarImagePin(backend, img string) string {
-	if ref := pinnedDoorFetchRef(backend); ref != "" && img == ref {
+	if ref := pinnedDoorFetchRef(backend); ref != "" {
 		return doorPins[backend].Digest
 	}
 	return ""
