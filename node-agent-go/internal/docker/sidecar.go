@@ -213,8 +213,10 @@ func stunnelImageCandidates(backend string) []string {
 }
 
 // ensureSidecarImage returns the first sidecar image that is present
-// locally or can be pulled, trying stunnelImageCandidates in order.
+// locally or can be pulled, trying stunnelImageCandidates in order. ctx may
+// carry the BACKEND's pin (StartBackendSDK); the door never inherits it.
 func (c *Client) ensureSidecarImage(ctx context.Context, backend string) (string, error) {
+	ctx = withoutImagePin(ctx)
 	var errs []string
 	for _, img := range stunnelImageCandidates(backend) {
 		// Local or over the rail: the published stunnel image is ours.
