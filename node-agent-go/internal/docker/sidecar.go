@@ -212,15 +212,33 @@ func stunnelImageCandidates(backend string) []string {
 	return out
 }
 
+// sidecarImagePin is the pin a sidecar candidate is held to: a pinned door
+// (door_images.go) is held to ITS OWN digest, which the controller stages it
+// by (image_stage.rs, source door-pin); a release-following stunnel has no
+// pin, because the controller sends none for it. Never the backend's pin.
+func sidecarImagePin(backend, img string) string {
+	if ref := pinnedDoorFetchRef(backend); ref != "" && img == ref {
+		return doorPins[backend].Digest
+	}
+	return ""
+}
+
 // ensureSidecarImage returns the first sidecar image that is present
 // locally or can be pulled, trying stunnelImageCandidates in order. ctx may
-// carry the BACKEND's pin (StartBackendSDK); the door never inherits it.
+// carry the BACKEND's pin (StartBackendSDK); each candidate is resolved
+// under its own pin instead (sidecarImagePin).
 func (c *Client) ensureSidecarImage(ctx context.Context, backend string) (string, error) {
-	ctx = withoutImagePin(ctx)
 	var errs []string
+	var pinErr *ImagePinError
 	for _, img := range stunnelImageCandidates(backend) {
-		// Local or over the rail: the published stunnel image is ours.
+		// Local or over the rail: the published stunnel image is ours. Held
+		// to its own pin, never the backend's that the caller's ctx carries.
+		ctx := withOwnImagePin(ctx, sidecarImagePin(backend, img))
 		if err := ensureImageFn(ctx, c, img); err != nil {
+			var pe *ImagePinError
+			if errors.As(err, &pe) && pe.Loaded == "" {
+				pinErr = pe
+			}
 			errs = append(errs, img+": "+err.Error())
 			continue
 		}
@@ -229,7 +247,24 @@ func (c *Client) ensureSidecarImage(ctx context.Context, backend string) (string
 	if len(errs) == 0 {
 		return "", errors.New("no stunnel image configured (NOO_IMAGE_PREFIX and NOO_IMAGE_TAG are unset, and no STUNNEL_IMAGE)")
 	}
+	if pinErr != nil {
+		// Restaging cannot fix this one (finding 109): the controller staged
+		// the door by a different digest than this node agent pins it to, so
+		// the two run different releases' door pins.
+		return "", fmt.Errorf(
+			"the stunnel door for %s is pinned by this node agent to %s, but the controller staged %s by %s: "+
+				"the controller and this node run different releases. Bring them to the same release: "+
+				"`noo upgrade` on the controller, then `noo upgrade --all` to roll the nodes (%s)",
+			backend, pinErr.Pinned, pinErr.Ref, stagedLabel(pinErr.Staged), strings.Join(errs, "; "))
+	}
 	return "", fmt.Errorf("no stunnel image available (%s) — stage it on the controller: noo cluster sync-images --stage-only --lock", strings.Join(errs, "; "))
+}
+
+func stagedLabel(d string) string {
+	if d == "" {
+		return "name only (no digest)"
+	}
+	return d
 }
 
 // sidecarConnectPort is the port the backend container listens on behind
