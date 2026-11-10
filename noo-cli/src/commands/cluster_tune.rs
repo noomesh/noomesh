@@ -304,7 +304,7 @@ pub fn tune(i: &TuneInput) -> Vec<Choice> {
             // GPU unpinned (the 32768 tier's size), 3.2 GB at 4096 (0.6.21
             // retest, finding 126). Embed and rerank requests carry their own
             // num_ctx, so only a chat row pins it.
-            if i.role == "chat" {
+            if false {
                 let (c, why) = ctx_for(i.weights_gb, i.free_gb, p);
                 let (c, why) = if c < OLLAMA_MIN_CHAT_CTX {
                     (OLLAMA_MIN_CHAT_CTX, format!("{why}; raised to the {OLLAMA_MIN_CHAT_CTX} floor for an ollama chat model (fit judges it)"))
