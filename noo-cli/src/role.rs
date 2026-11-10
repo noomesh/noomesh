@@ -372,6 +372,10 @@ mod self_identity_tests {
         // `detect()` gives a prepped node-only box with no marker.
         let read = crate::test_src::fn_body(&role, "pub(crate) fn read(");
         let display = crate::test_src::fn_body(&role, "fn hostname(");
+        // Case (a): NODE_ID is read from BOTH .env roots, and both hostnames
+        // reach the struct.
+        assert!(read.contains("for root in [crate::envfile::repo_root(), crate::onboard::standalone::default_home()]"), "{read}");
+        assert!(read.contains("uname_n: t(uname_n)") && read.contains("etc_hostname: t("), "{read}");
         for src in ["\"/etc/hostname\"", "arg(\"-n\")", "\"NODE_ID\""] {
             assert!(read.contains(src), "read() reads {src}");
             assert_eq!(role.matches(src).count(), read.matches(src).count() + display.matches(src).count(),
