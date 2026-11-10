@@ -107,7 +107,7 @@ const CREDENTIALS_ROOT: &str = "/run/credentials/";
 /// without the cluster CA (the restart loop of finding 116). Any other path
 /// keeps today's behaviour.
 fn missing_credential(paths: &[&str], exists: impl Fn(&str) -> bool) -> Option<String> {
-    let p = paths.iter().find(|p| p.starts_with(CREDENTIALS_ROOT) && !exists(p))?;
+    let p = paths.iter().find(|p| !p.is_empty() && !exists(p))?;
     let unit = p.trim_start_matches(CREDENTIALS_ROOT).split('/').next().unwrap_or("");
     Some(format!(
         "{p} is not there: it is a systemd credential of {unit}, which did not load it. \
