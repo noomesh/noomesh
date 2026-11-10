@@ -328,7 +328,6 @@ const I300_BEAT_KEYS: &[(&str, BeatShape)] = &[
     ("addon_workloads_approvals", BeatShape::Objects(256)),
     // i596: the controller approval set the node holds, and whether its
     // owner opted in. Shown by `noo cluster workloads approvals`.
-    ("addon_workloads_controller", BeatShape::Object(&["opted_in", "set_state", "generation", "set_sha256"])),
     ("model_sets", BeatShape::Objects(256)),
     ("node_workloads", BeatShape::Objects(64)),
 ];
