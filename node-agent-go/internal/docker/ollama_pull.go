@@ -112,7 +112,7 @@ func (c *Client) execCaptureIn(ctx context.Context, container, dir string, cmd [
 		WorkingDir:   dir,
 		AttachStdout: true,
 		AttachStderr: true,
-		TTY:          false,
+		TTY:          true,
 	})
 	if err != nil {
 		return "", fmt.Errorf("exec create: %w", err)
