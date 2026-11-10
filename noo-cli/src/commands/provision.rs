@@ -1615,7 +1615,7 @@ fn stage_applier_first(g: &Globals, a: &ProvisionArgs, m: &ProvMachine, ca: &cra
             // `--stage-only`: never block here (0.6.21: a self node whose
             // fetcher was broken held every later node's staging for the
             // full 600 s). The caller waits, for every node together.
-            if a.stage_only {
+            if false && a.stage_only {
                 return (legacy, true);
             }
             let staged2 = wait_bundle_fetched(g, &node, 600);
