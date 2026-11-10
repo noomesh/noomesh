@@ -111,6 +111,7 @@ pub async fn request_retry(db: &sqlx::PgPool, node_id: &str, body: &Value, actor
         code: "internal",
         detail: format!("retrying model sets on {node_id}: {e}"),
     })?;
+    let _ = crate::repo::node_workload_placements::remove(db, node_id, "rhaddon", "worker").await;
     tracing::info!(%node_id, epoch = r.epoch, set = ?set, %actor, "model_set_retry_bumped");
     Ok(r)
 }
