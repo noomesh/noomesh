@@ -3481,13 +3481,7 @@ const GZIP_BUNDLE_MIN_VERSION: (u32, u32, u32) = (0, 6, 5);
 /// X.Y.Z was installed by a bundle that also installed fetcher X.Y.Z or newer.
 /// Anything else (bare digits, a missing patch, a fourth field) is unreadable.
 fn parse_cli_version(app_version: &str) -> Option<(u32, u32, u32)> {
-    let v = app_version.trim();
-    let rest = v.strip_prefix("noo-cli-v")
-        .or_else(|| v.strip_prefix("stack-v"))
-        .or_else(|| v.strip_prefix('v'))?;
-    let nums: Vec<u32> = rest.split(['+', '-']).next()?.split('.').filter_map(|s| s.parse().ok()).collect();
-    let [maj, min, pat] = nums[..] else { return None };
-    Some((maj, min, pat))
+    super::node_leaves::cli_version_triple(app_version)
 }
 
 /// May this node be sent a gzip-wrapped bundle? Ok(()) yes; Err(reason) no.
@@ -3605,20 +3599,8 @@ pub(crate) fn applier_knows_harness_kinds(darwin: bool, app_version: &str) -> bo
     if !darwin {
         return true;
     }
-    // "noo-cli-v0.5.35+7b00c90" -> (0, 5, 35)
-    let Some(rest) = app_version.split("noo-cli-v").nth(1) else {
-        return true;
-    };
-    let nums: Vec<u32> = rest
-        .split(['+', '-'])
-        .next()
-        .unwrap_or("")
-        .split('.')
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    let [maj, min, pat] = nums[..] else { return true };
-    // The Mac applier learned the harness kinds in noo-cli-v0.5.40
-    (maj, min, pat) >= (0, 5, 40)
+    // The Mac applier learned the harness kinds in noo-cli-v0.5.40.
+    super::node_leaves::cli_version_triple(app_version).is_none_or(|v| v >= (0, 5, 40))
 }
 
 pub(crate) fn hostd_asset_for(os: &str, arch: &str) -> Option<String> {
