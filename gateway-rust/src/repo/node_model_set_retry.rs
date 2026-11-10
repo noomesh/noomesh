@@ -37,11 +37,7 @@ pub async fn bump(db: impl sqlx::PgExecutor<'_>, node_id: &str, set: Option<&str
     let row = sqlx::query(
         "INSERT INTO noo_node_model_set_retry (node_id, epoch, sets, updated_by) VALUES ($1, 1, $2, $3) \
          ON CONFLICT (node_id) DO UPDATE SET epoch = noo_node_model_set_retry.epoch + 1, \
-           sets = CASE \
-             WHEN jsonb_array_length(EXCLUDED.sets) = 0 THEN '[]'::jsonb \
-             WHEN jsonb_array_length(noo_node_model_set_retry.sets) = 0 THEN '[]'::jsonb \
-             ELSE (SELECT COALESCE(jsonb_agg(DISTINCT v), '[]'::jsonb) \
-                   FROM jsonb_array_elements(noo_node_model_set_retry.sets || EXCLUDED.sets) AS v) END, \
+           sets = EXCLUDED.sets, \
            updated_by = EXCLUDED.updated_by, updated_at = now() \
          RETURNING epoch, sets",
     )
