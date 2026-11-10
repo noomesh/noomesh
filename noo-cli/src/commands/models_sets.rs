@@ -1502,7 +1502,7 @@ pub(crate) fn list_sets(g: &Globals, kind: &str) -> Result<i32, Unhandled> {
 /// Read-only, for `noo addons setup --plan`: every staged set of any kind,
 /// with its manifest `runtime` strings and whether an acceptance of its id is
 /// recorded. Nothing is written.
-pub(crate) fn scan_for_plan(models_dir: &Path, public: &Path) -> Vec<(Row, Vec<String>, bool)> {
+pub(crate) fn scan_for_plan(models_dir: &Path, public: &Path) -> Vec<(Row, Vec<String>, bool, String)> {
     scan(models_dir, public, None)
         .into_iter()
         .map(|r| {
@@ -1513,7 +1513,13 @@ pub(crate) fn scan_for_plan(models_dir: &Path, public: &Path) -> Vec<(Row, Vec<S
                 .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect::<Vec<String>>())
                 .unwrap_or_default();
             let accepted = read_acceptance(models_dir, &r.id).is_some();
-            (r, runtime, accepted)
+            let lic = &v["license"];
+            let terms = match (lic["id"].as_str(), lic["url"].as_str()) {
+                (Some(id), Some(url)) => format!("{id} ({url})"),
+                (Some(id), None) => id.to_string(),
+                _ => "the licence its manifest names".to_string(),
+            };
+            (r, runtime, accepted, terms)
         })
         .collect()
 }

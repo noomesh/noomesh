@@ -18,7 +18,8 @@
 //!   - `--json` prints the gateway's JSON to stdout, nothing else.
 //!   - Errors go to stderr — as JSON (`{"error","code","hint"}`) in json mode.
 //!   - Exit codes: 0 ok, 1 generic, 2 usage, 3 gateway unreachable,
-//!     4 auth failed, 5 gateway returned an error status.
+//!     4 auth failed, 5 gateway returned an error status,
+//!     6 stopped for a decision (it will not decide for you; the command to run is printed).
 //!
 //! Environment parity with `noomesh/cli_utils.py`: loads the repo `.env`
 //! (already-exported vars win) and resolves the gateway URL the same way.

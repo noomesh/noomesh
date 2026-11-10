@@ -188,6 +188,7 @@ These four rules hold for every native command. They are enforced in the files c
 | 3 | gateway unreachable |
 | 4 | auth failed (401/403) |
 | 5 | gateway returned an error status — including the explained 503 a disabled add-on's routes return, and `noo health` when the gateway is up but degraded |
+| 6 | stopped for a decision — a command that will not decide for you (`noo addons setup` at trust, a licence, consent or a reserve, or a step only you can do); the exact command to run is printed, and nothing already done is undone |
 
 Scripts branch on the code, not on prose.
 
