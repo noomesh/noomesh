@@ -333,7 +333,7 @@ fn beat_shape_ok(v: &Value, shape: BeatShape) -> bool {
         BeatShape::Str => v.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 64),
         BeatShape::Bool => v.is_boolean(),
         BeatShape::Num => v.as_f64().is_some_and(f64::is_finite),
-        BeatShape::NonNegInt => v.as_u64().is_some_and(|n| n <= i64::MAX as u64),
+        BeatShape::NonNegInt => v.as_i64().is_some(),
         BeatShape::OneOf(allowed) => v.as_str().is_some_and(|s| allowed.contains(&s)),
         BeatShape::Objects(max) => v
             .as_array()
