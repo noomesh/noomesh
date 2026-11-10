@@ -272,7 +272,7 @@ pub async fn desired_for(state: &AppState, node_id: &str) -> Option<Value> {
 
 /// The audit row's details: never the document, only what identifies it.
 pub fn audit_details(node_id: &str, a: &Accepted) -> Value {
-    json!({"node": node_id, "generation": a.generation, "entries": a.entries, "doc_sha256": a.doc_sha256})
+    json!({"node": node_id, "generation": a.generation, "entries": a.entries, "doc_sha256": a.doc_sha256, "doc": b64(&a.doc)})
 }
 
 fn plain(status: StatusCode, code: &str, detail: impl Into<String>) -> Response {
