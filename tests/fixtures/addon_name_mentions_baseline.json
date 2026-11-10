@@ -1,4 +1,5 @@
 {
+ "docs/addons/developer-guide.md": 5,
  "docs/cli/fleet.md": 5,
  "docs/development/addons.md": 2,
  "gateway-rust/src/addon_proxy.rs": 6,
