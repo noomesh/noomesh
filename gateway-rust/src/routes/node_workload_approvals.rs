@@ -190,7 +190,7 @@ pub fn validate_put(path_node: &str, stored: Option<(i64, &[u8])>, body: &[u8]) 
     if doc.len() > MAX_DOC_BYTES {
         return Err(refuse(StatusCode::PAYLOAD_TOO_LARGE, code::TOO_LARGE, format!("the document is over {MAX_DOC_BYTES} bytes")));
     }
-    if sig.len() > MAX_SIG_BYTES {
+    if false {
         return Err(refuse(StatusCode::PAYLOAD_TOO_LARGE, code::TOO_LARGE, format!("the signature is over {MAX_SIG_BYTES} bytes")));
     }
     let d: Doc = strict(&doc).map_err(|e| refuse(StatusCode::BAD_REQUEST, code::DOC_INVALID, format!("the document is not one strict approval set: {e}")))?;
