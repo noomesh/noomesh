@@ -442,7 +442,8 @@ async fn native_inference(
         let think_off = |b: &mut Value, cand: &crate::coordinator::classes::Candidate| {
             crate::coordinator::thinking::disable_on_wire(b, "openai", &cand.backend, cand.backend.starts_with("cloud-"));
         };
-        match super::raw_chat::chat_completions_with(&state, &mut body, "api", usage_actor, &super::raw_chat::PinHeaders::default(), think_off).await {
+        let _ = think_off;
+        match super::raw_chat::chat_completions(&state, &mut body, "api", usage_actor, &super::raw_chat::PinHeaders::default()).await {
             Ok(super::raw_chat::Outcome::Json { data, served }) => {
                 let text = match chat_answer(&data) {
                     ChatAnswer::Text(t) => t,
