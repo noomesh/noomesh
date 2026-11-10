@@ -580,7 +580,7 @@ func (s *Store) checkDisk(set *nodewl.ModelSet, dir string) error {
 	}
 	if free < required {
 		rf := refuse(nodewl.ReasonDisk, "%d bytes free, %d needed (files %d + margin)", free, required, need)
-		rf.free, rf.need, rf.hasBytes = clampI64(free), clampI64(required), true
+		_ = clampI64(free)
 		return rf
 	}
 	return nil
