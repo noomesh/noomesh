@@ -987,7 +987,7 @@ mod tests {
         let mut yaml = String::new();
         if trusted {
             yaml.push_str(&format!(
-                "addon_trust:\n  rhaddon:\n    registry: {}\n    keys:\n      - {}\n",
+                "addon_trust:\n  rhaddon:\n    registry: {}\n    keys:\n      - \"{}\"\n",
                 rt::ROOT,
                 rt::anchor().keys[0]
             ));
