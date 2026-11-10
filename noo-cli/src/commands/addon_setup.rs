@@ -1108,7 +1108,7 @@ fn act_on(cx: &Cx, o: &mut Opts, s: &Step, ran: &mut BTreeSet<String>) -> Flow {
     let base = base_of(&s.id);
     match (base, s.state) {
         ("trust", State::Decision) => trust_decision(cx, o, s, ran),
-        ("bundle", State::Stopped) => Flow::End(End::Failed(ExitCode::Generic as i32, format!("{}: {}", label(&s.id), s.detail), s.command.clone())),
+        ("bundle", State::Stopped) => exec(cx, s, "noo addons enable", ran, || cx.d.enable(&addon, cx.tty)),
         ("registry-login", _) => Flow::End(End::Stop(s.clone())),
         ("enable", State::Todo) if s.command.as_deref() == Some(format!("noo addons enable {addon}").as_str()) => {
             exec(cx, s, &format!("noo addons enable {addon}"), ran, || cx.d.enable(&addon, cx.tty))
