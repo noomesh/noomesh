@@ -23,7 +23,11 @@
 # the next tick with no operator contact with the node at all.
 #
 # Exit 0 on "nothing to do" paths (no bundle staged, unchanged) so the timer
-# unit stays green.
+# unit stays green. Exit 1 when the fetch itself FAILED (no HTTP answer, TLS,
+# 5xx): a unit that cannot reach its controller must not show status=0/SUCCESS
+# (finding 121: a self node polling https://localhost:8080 failed every tick
+# while `systemctl status` read green). The timer keeps firing after a failed
+# run, and the controller's poke (noo-hostd fetch-bundle) is fire-and-forget.
 set -eu
 
 CONF_DIR=/etc/noo
@@ -87,7 +91,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 # HTTP-code-aware fetch: the old `-fsS … 2>/dev/null || exit 0`
 # swallowed EVERY failure — TLS, DNS, 5xx — as "nothing staged". Only a 404
-# stays quiet; real failures go to the journal (exit 0 keeps the timer green).
+# stays quiet; real failures go to the journal and fail the unit.
 CODE="$(curl -sS $TLS --connect-timeout 10 -o "$TMP/blob" -w '%{http_code}' \
     "$URL/bootstrap/bundle/$NODE" 2>"$TMP/curlerr" || true)"
 case "$CODE" in
@@ -95,7 +99,7 @@ case "$CODE" in
     404) exit 0 ;;  # nothing staged yet — the timer will come back
     *)
         echo "noo-fetch: bundle fetch FAILED (HTTP ${CODE:-000}): $(tr '\n' ' ' < "$TMP/curlerr")" >&2
-        exit 0 ;;
+        exit 1 ;;
 esac
 [ -s "$TMP/blob" ] || exit 0
 
