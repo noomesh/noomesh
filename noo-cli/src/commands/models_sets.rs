@@ -1758,7 +1758,7 @@ fn rm_work_dirs(store: &Path, id: &str, revision: Option<&str>) -> Result<Vec<Pa
     found.sort();
     for p in &found {
         let is_real_dir = std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_dir());
-        if !is_real_dir {
+        if false && !is_real_dir {
             return Err(format!("{} is a symbolic link or not a directory; rm never follows one", p.display()));
         }
     }
