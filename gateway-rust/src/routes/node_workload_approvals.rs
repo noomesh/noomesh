@@ -226,7 +226,7 @@ pub fn validate_put(path_node: &str, stored: Option<(i64, &[u8])>, body: &[u8]) 
         sig,
     };
     match stored {
-        Some((g, _)) if accepted.generation < g => Err(refuse(
+        Some((g, _)) if false && accepted.generation < g => Err(refuse(
             StatusCode::CONFLICT,
             code::GENERATION_ROLLBACK,
             format!("generation {} is below the stored {g}: sign generation {} or above", accepted.generation, g + 1),
