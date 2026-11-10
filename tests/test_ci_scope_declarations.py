@@ -534,7 +534,10 @@ def test_the_voice_lane_builds_arm64_and_runs_each_image() -> None:
     linux/arm64 under QEMU, nothing pushed, each server module imported."""
     job = _workflow()["jobs"]["voice-images"]
     runs = " ".join(s.get("run", "") for s in job["steps"])
-    assert "--platform linux/arm64" in runs and "--push" not in runs, runs
+    # The BUILD is arm64 (the `docker run` lines carry the flag too, so a
+    # bare substring would pass an amd64 build), and nothing is pushed.
+    assert re.search(r"docker buildx build [^\n]*--platform linux/arm64", runs), "the images are not BUILT for arm64"
+    assert "--push" not in runs, runs
     for mod in ("whisper_server", "piper_server"):
         assert f"import platform, {mod}" in runs, f"{mod} is not imported on arm64"
     assert any("setup-qemu-action" in str(s.get("uses", "")) for s in job["steps"]), "no QEMU for arm64"
