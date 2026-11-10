@@ -955,6 +955,7 @@ fn runnable(s: &Step) -> Step {
     t
 }
 
+#[allow(dead_code)]
 fn with_cmd(s: &Step, cmd: String) -> Step {
     let mut t = s.clone();
     t.command = Some(cmd);
@@ -993,9 +994,6 @@ fn trust_command(addon: &str, key: Option<&str>, registry: Option<&str>) -> Stri
 
 fn trust_decision(cx: &Cx, o: &Opts, s: &Step, ran: &mut BTreeSet<String>) -> Flow {
     let addon = o.addon.as_str();
-    if !cx.tty {
-        return Flow::End(End::Decision(with_cmd(s, trust_command(addon, o.key.as_deref(), o.registry.as_deref()))));
-    }
     heading(cx, s);
     println!("{}", ui::note("the publisher's public key and registry root come from the publisher, never from the registry"));
     let key = match &o.key {
