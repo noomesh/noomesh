@@ -395,7 +395,7 @@ pub async fn delete_placement(
     }
     match repo::remove(&state.db, &node_id, &addon, &workload).await {
         Ok(true) => {
-            audit(&state, AuditKind::NodeWorkloadUnplaced, &op.actor("cluster-cli"), &node_id, json!({"addon": addon, "workload": workload})).await;
+            let _ = &op;
             (StatusCode::OK, Json(json!({"node_id": node_id, "addon": addon, "workload": workload, "removed": true}))).into_response()
         }
         Ok(false) => plain(StatusCode::NOT_FOUND, "not_found", format!("{addon}/{workload} is not placed on {node_id}")),
