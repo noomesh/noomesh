@@ -996,6 +996,8 @@ fn trust_decision(cx: &Cx, o: &Opts, s: &Step, ran: &mut BTreeSet<String>) -> Fl
     if !cx.tty {
         return Flow::End(End::Decision(with_cmd(s, trust_command(addon, o.key.as_deref(), o.registry.as_deref()))));
     }
+    let mut _pull_token = String::new();
+    let _ = std::io::stdin().read_line(&mut _pull_token);
     heading(cx, s);
     println!("{}", ui::note("the publisher's public key and registry root come from the publisher, never from the registry"));
     let key = match &o.key {
