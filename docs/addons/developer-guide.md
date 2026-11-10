@@ -35,7 +35,7 @@ Contents:
 7. [Model sets](#7-model-sets)
 8. [What core refuses, and why](#8-what-core-refuses-and-why)
 9. [Pain points from the first add-on author](#9-pain-points-from-the-first-add-on-author)
-10. [Worked example add-on: pai-voice](#10-worked-example-add-on-pai-voice)
+10. [Worked example](#10-worked-example)
 
 ---
 
@@ -826,67 +826,13 @@ as meaning the path is smooth.
 
 ---
 
-## 10. Worked example add-on: pai-voice
+## 10. Worked example
 
-This is the only place a real add-on is named. pai-voice is a voice assistant
-add-on that PersonifAI builds. It is **third-party in code**: it is not one of
-the five rows, and an operator trusts its key with `noo addons trust-key`.
-Everything below is drawn from design notes and the release pipeline, and the
-node-workload parts are **UNVERIFIED**. The first end-to-end run is what this
-guide is waiting on.
+A complete worked example add-on lives in that add-on's own repository, not in
+core: core never names a real add-on. Look for the worked example linked from
+the add-on registry listing. TODO: link it here, by a generic description, when
+the example's document merges in its own repository.
 
-### What it ships
-
-- An overlay, `routes.json` and `system.json`, a database schema, and a
-  `node-workloads.json` with one GPU workload.
-- A speech-to-speech model set staged from a gated Hugging Face repo at a pinned
-  commit (three model files plus eighteen voice-pack files, each with a
-  sha256). The voice files are Python pickles, so the worker loads them with
-  `weights_only=True`; core verifies bytes only.
-- Task delegation (`delegate: tasks`), which the operator allows with
-  `noo addons set pai-voice --delegate tasks`.
-
-### The node workload
-
-From the design notes:
-
-- WebSocket endpoint at `/v1/worker/ws`; health live and ready.
-- Needs about 14336 MiB of VRAM, compute capability 8.0 or higher, one slot.
-- `accel`: one GPU, `realtime: true`, `slots_env` naming its own slots env key.
-- Drain: `POST /v1/lifecycle/drain` accepts at once; `GET /v1/lifecycle/drained`
-  returns 200 only when the drain has finished and 409 before. Treating the
-  POST's 2xx as "drained" would have stopped a worker with live audio, which is
-  why `done_path` exists.
-- Scratch: a general cache, and a separate 512 MiB `exec` scratch at
-  `/triton-cache` for the GPU kernel compiler, which writes a shared library
-  and loads it. The two are siblings, not nested.
-
-### The model set
-
-Staged with `noo models stage hf:<org>/<repo>@<commit> ...`, authenticated,
-with the voice pack extracted from an archive using `--extract`, and
-`--license-additional` for the second attribution upstream requires. The
-operator accepts the licence (`noo models accept`) and places the set with
-`noo cluster workloads place <node> pai-voice/<workload> --profile <profile>
---set <slot>=<set id>@<revision>`. All **UNVERIFIED**.
-
-### The release pipeline
-
-Its CI runs when a new `stack-v*` tag appears: it checks that the target
-stack's `noo` is the released one, recovers the existing image digest, runs
-`noo addons check`, signs both locks, verifies them against a public key pinned
-in reviewed source, refuses a downgrade or a changed digest, publishes, and
-reads back. Its seed is held in a protected `release` environment and given to
-`sign` on stdin. This is the one working example of section 4, and it relies on
-being notified by the noomesh release, which a third party would not be.
-
-### What is not yet proven
-
-- Placement, consent, reserve, the door, drain and release for its worker on a
-  GPU node.
-- Fetching and verifying its model set on a node.
-- The real GPU kernel-compiler import in the worker image with the exec scratch.
-- The licence-gated model flow end to end.
-
-When those run, this section and the UNVERIFIED tags in sections 6 and 7 are
-what get finalised.
+Everything about running a third-party add-on that has not yet been seen
+working on a live install is marked **UNVERIFIED** in sections 6 and 7. When the
+first end-to-end run happens, those tags are what get finalised.
