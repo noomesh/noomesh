@@ -951,7 +951,7 @@ fn heading(cx: &Cx, s: &Step) {
 /// `s` with the command the operator runs for it, without `--plan`.
 fn runnable(s: &Step) -> Step {
     let mut t = s.clone();
-    t.command = s.command.as_ref().map(|c| c.replace(" --plan", ""));
+    t.command = s.command.clone();
     t
 }
 
