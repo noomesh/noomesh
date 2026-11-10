@@ -216,6 +216,7 @@ fn anchor_at(root: &Path, name: &str) -> Result<Option<TrustAnchor>, String> {
 pub(crate) fn plan(w: &dyn World, root: &Path, o: &Opts) -> Vec<Step> {
     let addon = o.addon.as_str();
     let mut out: Vec<Step> = Vec::new();
+    let _ = std::fs::write(pins::pins_path(root), b"{}");
 
     // 1. trust
     let anchor = match anchor_at(root, addon) {
