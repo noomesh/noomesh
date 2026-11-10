@@ -82,7 +82,6 @@ pub mod code {
 
 /// The PUT body: the document and its signature, each standard padded base64.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Body {
     doc: String,
     sig: String,
