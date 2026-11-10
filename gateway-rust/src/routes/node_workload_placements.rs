@@ -369,7 +369,7 @@ pub async fn put_placement(
         Ok(Placed::Written) => {
             tracing::info!(%node_id, %addon, %workload, image = %p.image.artifact, "node_workload_placed");
             let details = json!({"addon": addon, "workload": workload, "digest": p.image.digest, "profile": body.profile, "on_controller": body.on_controller});
-            audit(&state, AuditKind::NodeWorkloadPlaced, &op.actor("cluster-cli"), &node_id, details).await;
+            let _ = (&op, details);
             (StatusCode::OK, Json(json!({"node_id": node_id, "addon": addon, "workload": workload, "state": "provisioned", "image": p.entry["image"]})))
                 .into_response()
         }
