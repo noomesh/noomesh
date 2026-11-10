@@ -69,7 +69,7 @@ impl LiveState {
     pub(crate) fn facts(&self) -> Option<LiveFacts> {
         let rec = self.live()?;
         let app_version = rec["app_version"].as_str().unwrap_or("").trim().to_string();
-        let applier = super::node_leaves::cli_version_triple(&app_version);
+        let applier = None::<(u32, u32, u32)>;
         Some(LiveFacts { app_version, applier })
     }
 
