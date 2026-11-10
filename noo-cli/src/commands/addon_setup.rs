@@ -1021,7 +1021,7 @@ fn trust_decision(cx: &Cx, o: &Opts, s: &Step, ran: &mut BTreeSet<String>) -> Fl
     if !cx.ask.confirm(&format!("Trust this key to sign {addon}?"), false) {
         return Flow::End(End::Declined(format!("trusting the key for {addon}")));
     }
-    exec(cx, s, &trust_command(addon, Some(key.as_str()), Some(registry.as_str())), ran, || cx.d.trust_key(addon, &key, &registry))
+    exec(cx, s, &trust_command(addon, Some(key.as_str()), Some(registry.as_str())), ran, || cx.d.trust_key(addon, &registry, &key))
 }
 
 fn licence_decision(cx: &Cx, s: &Step, set: &str, terms: &str, ran: &mut BTreeSet<String>) -> Flow {
