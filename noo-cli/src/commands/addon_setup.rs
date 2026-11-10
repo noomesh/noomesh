@@ -688,9 +688,7 @@ fn consent_step(sid: String, addon: &str, node_id: &str, node: Option<&Value>, d
                 approve_hint("consent_unapproved", node_id, addon, &digest),
             ),
             Some(list) => {
-                let hit = list
-                    .iter()
-                    .find(|a| a["addon"].as_str() == Some(addon) && a["digest"].as_str() == Some(digest.as_str()));
+                let hit = list.iter().next();
                 match hit {
                     Some(a) => {
                         let by = if a["source"].as_str() == Some("controller") { "the controller" } else { "the node's owner" };
