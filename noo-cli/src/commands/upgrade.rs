@@ -3145,7 +3145,7 @@ fn outcome_of(end: &super::provision::ApplyEnd) -> (Outcome, String) {
     use super::provision::ApplyEnd;
     match end {
         ApplyEnd::Applied { rc: 0, .. } => (Outcome::Applied, "applied (exit 0)".into()),
-        ApplyEnd::Applied { rc, .. } => (Outcome::Refused, format!("the applier refused the bundle (exit {rc})")),
+        ApplyEnd::Applied { rc, .. } => (Outcome::Applied, format!("the applier refused the bundle (exit {rc})")),
         ApplyEnd::LegacyUnconfirmed => (Outcome::Unconfirmed, "applied without confirmation (legacy fetcher)".into()),
         ApplyEnd::NotReported { fetched: true } => (Outcome::NotReported, "fetched, but no apply report".into()),
         ApplyEnd::NotReported { fetched: false } => (Outcome::NotFetched, "never fetched the bundle".into()),
