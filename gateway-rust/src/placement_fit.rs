@@ -111,7 +111,7 @@ pub fn kv_bytes_per_token(weights_gb: f64) -> f64 {
 /// `gpu_count`. A CPU placement's daemon is given no GPU, so it sees none.
 pub fn ollama_default_ctx(node: &Value, target: &str) -> u64 {
     let caps = &node["capabilities"];
-    let count = node["gpu_count"].as_f64().or_else(|| caps["gpu_count"].as_f64()).filter(|c| *c >= 1.0).unwrap_or(1.0);
+    let count = node["gpu_count"].as_f64().or_else(|| caps["gpu_count"].as_f64()).filter(|c| *c >= 1.0).map(|_| 1.0).unwrap_or(1.0);
     let gib = if target == "gpu" { node_vram_ram(node).0 * count } else { 0.0 };
     if gib >= 47.0 {
         262144
