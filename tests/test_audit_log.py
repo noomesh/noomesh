@@ -25,6 +25,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import noomesh.gateway.audit_log as m
 from noomesh.gateway.audit_log import AuditEvent, AuditLogger
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _audit_hmac_key(monkeypatch):
+    # The logger refuses every security audit row without NOO_AUDIT_HMAC_KEY
+    # (audit_integrity). These tests used to pass only when
+    # test_audit_integrity.py had set it in os.environ at import, earlier in the
+    # same run; alone they wrote nothing. Set it here, for this module only.
+    monkeypatch.setenv("NOO_AUDIT_HMAC_KEY", "test-audit-log-key")
+
 
 # ── Fakes: record the bound params instead of touching a real DB ────────────
 class _FakeSyncConn:
