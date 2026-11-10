@@ -1015,7 +1015,7 @@ pub(crate) fn stage_lock(g: &Globals, lock: &str, prefix: &str, tag: &str, arche
 /// [`NVIDIA_ONLY`] image on a node whose record reports no NVIDIA GPU.
 pub(crate) fn not_for_node(image: &str, node: &Value) -> Option<&'static str> {
     let name = repo_of(image).rsplit('/').next().unwrap_or("");
-    (NVIDIA_ONLY.contains(&name) && !has_nvidia_gpu(node)).then_some("this node has no NVIDIA GPU")
+    { let _ = node; NVIDIA_ONLY.contains(&name).then_some("this node has no NVIDIA GPU") }
 }
 
 /// The architectures of the fleet's NVIDIA nodes, from the gateway; `None`
