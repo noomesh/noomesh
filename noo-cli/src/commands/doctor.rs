@@ -958,7 +958,60 @@ fn declared_services(
             .collect())
     };
 
-    Ok(projected_services(&|extra| run(base(extra)))?.into_iter().collect())
+    Ok(project_files(&files, &|_files, extra| run(base(extra)), &|f| std::fs::read_to_string(f).map_err(|e| e.to_string()))?
+        .into_iter()
+        .collect())
+}
+
+/// One `docker compose -f <files…>` call, given the files and its trailing
+/// arguments.
+pub(crate) type FilesComposeCall<'a> = &'a dyn Fn(&[String], &[&str]) -> Result<Vec<String>, String>;
+
+/// The last resort of a projection: the files' own `services:` keys.
+pub(crate) type ServicesUnion<'a> = &'a dyn Fn() -> Result<Vec<String>, String>;
+
+/// The projection of `files`: compose is given `files`, and the last resort
+/// reads the SAME `files` (declared_files' union of the install's list and
+/// the containers' labels), so the two can never disagree on what is
+/// declared. `compose(files, extra)` runs one `docker compose -f …` call;
+/// `read(path)` reads one file.
+pub(crate) fn project_files(
+    files: &[String],
+    compose: FilesComposeCall<'_>,
+    read: &dyn Fn(&str) -> Result<String, String>,
+) -> Result<Vec<String>, String> {
+    let union = || -> Result<Vec<String>, String> {
+        let texts: Vec<(String, String)> = files
+            .iter()
+            .map(|f| read(f).map(|t| (f.clone(), t)).map_err(|e| format!("{f}: {e}")))
+            .collect::<Result<_, _>>()?;
+        yaml_services_union(&texts)
+    };
+    projected_services(&|extra| compose(files, extra), &union)
+}
+
+/// Every key under `services:` across `files` (path, text), in first-seen
+/// order. Compose merges services BY NAME and never interpolates a name, so
+/// this union is the declared set across every profile, with no variable
+/// resolved. YAML tags (`!reset`, `!override`) are values, never names.
+pub(crate) fn yaml_services_union(files: &[(String, String)]) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for (path, text) in files {
+        let doc: serde_yaml::Value = serde_yaml::from_str(text).map_err(|e| format!("{path}: not valid YAML ({e})"))?;
+        let Some(services) = doc.get("services") else { continue };
+        let services = match services {
+            serde_yaml::Value::Mapping(m) => m,
+            serde_yaml::Value::Null => continue,
+            _ => return Err(format!("{path}: `services` is not a mapping")),
+        };
+        for k in services.keys() {
+            let name = k.as_str().ok_or_else(|| format!("{path}: a service name is not a string"))?;
+            if !out.iter().any(|o| o == name) {
+                out.push(name.to_string());
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// One `docker compose` call, given its trailing arguments: the lines it
@@ -973,8 +1026,15 @@ pub(crate) type ComposeCall<'a> = &'a dyn Fn(&[&str]) -> Result<Vec<String>, Str
 /// secrets dir, `${X:?…}`), and a service NAME is never interpolated.
 /// Without interpolation compose lists profile-gated services too (compose
 /// v5.0.2), and `--no-interpolate --profiles` fails on unparsed values, so
-/// the fallback does not use it. When both fail, the first reason is kept.
-pub(crate) fn projected_services(compose: ComposeCall<'_>) -> Result<Vec<String>, String> {
+/// the fallback does not use it. An older compose still validates the model
+/// without interpolation and fails that too (the 0.6.20 controller), so the
+/// last resort is `union`: the `services:` keys of the same files
+/// (yaml_services_union), with no compose at all. When every step fails, the
+/// error names every reason, in order.
+pub(crate) fn projected_services(
+    compose: ComposeCall<'_>,
+    union: ServicesUnion<'_>,
+) -> Result<Vec<String>, String> {
     let interpolated = || -> Result<Vec<String>, String> {
         let profiles = compose(&["config", "--profiles"])?;
         let mut with_profiles: Vec<&str> = Vec::new();
@@ -986,10 +1046,17 @@ pub(crate) fn projected_services(compose: ComposeCall<'_>) -> Result<Vec<String>
         with_profiles.push("--services");
         compose(&with_profiles)
     };
-    match interpolated() {
-        Ok(s) => Ok(s),
-        Err(why) => compose(&["config", "--no-interpolate", "--services"]).map_err(|_| why),
-    }
+    let first = match interpolated() {
+        Ok(s) => return Ok(s),
+        Err(why) => why,
+    };
+    let second = match compose(&["config", "--no-interpolate", "--services"]) {
+        Ok(s) => return Ok(s),
+        Err(why) => why,
+    };
+    union().map_err(|third| {
+        format!("compose: {first}; compose --no-interpolate: {second}; the files' services: {third}")
+    })
 }
 
 #[cfg(test)]
@@ -1039,7 +1106,8 @@ mod orphan_tests {
 
     #[test]
     fn a_projection_needing_launch_time_vars_is_still_computed_and_finds_a_real_orphan() {
-        let declared: BTreeSet<String> = projected_services(&needs_launch_vars).unwrap().into_iter().collect();
+        let never = || -> Result<Vec<String>, String> { panic!("compose answered: the files are not read") };
+        let declared: BTreeSet<String> = projected_services(&needs_launch_vars, &never).unwrap().into_iter().collect();
         assert!(declared.contains("noo-rh-voice-coordinator"), "{declared:?}");
         let running = vec![
             parse_ps_row(&row("noo-rh-voice-coordinator", "noomesh", "noo-rh-voice-coordinator")).unwrap(),
@@ -1058,7 +1126,8 @@ mod orphan_tests {
                 _ => Err(format!("unexpected call {extra:?}")),
             }
         };
-        assert_eq!(projected_services(&interpolated).unwrap(), ["gateway"]);
+        let never = || -> Result<Vec<String>, String> { panic!("compose answered: the files are not read") };
+        assert_eq!(projected_services(&interpolated, &never).unwrap(), ["gateway"]);
         // Both fail, each with its OWN reason: the interpolated one (it names
         // what is missing) is reported, never the fallback's (i601: one
         // shared message could not tell them apart, and q13 survived).
@@ -1069,7 +1138,78 @@ mod orphan_tests {
                 Err("yaml: line 3: bad".into())
             }
         };
-        assert_eq!(projected_services(&broken).unwrap_err(), "yaml: line 3: bad");
+        // Since the files' union joined (the 0.6.20 controller), every reason
+        // is reported, each its own, in order.
+        let unreadable = || -> Result<Vec<String>, String> { Err("/x/rh-voice.yml: not valid YAML".into()) };
+        assert_eq!(
+            projected_services(&broken, &unreadable).unwrap_err(),
+            "compose: yaml: line 3: bad; compose --no-interpolate: no-interpolate: unknown flag; \
+             the files' services: /x/rh-voice.yml: not valid YAML"
+        );
+    }
+
+    /// The 0.6.20 controller: its compose fails WITH and WITHOUT
+    /// interpolation on an add-on overlay that needs launch-time files, so
+    /// the files' own `services:` keys decide. Shaped like the add-on's real
+    /// overlay (fictional name): a broker-files volume, a profile-gated
+    /// service, a YAML tag.
+    const CORE: &str = "services:\n  gateway:\n    image: g\n  worker:\n    image: w\n    profiles: [\"controller\"]\n";
+    const OVERLAY: &str = "services:\n  noo-rh-voice:\n    image: ${NOO_ADDON_IMAGE_RH_VOICE:-x}\n    profiles: [\"rh-voice\"]\n    \
+        ports: !reset []\n  noo-rh-voice-coordinator:\n    image: ${NOO_ADDON_IMAGE_RH_VOICE:-x}\n    volumes:\n      \
+        - type: bind\n        source: ${RH_VOICE_COORDINATOR_SECRETS_DIR:?broker-provisioned files required}\n        target: /run/secrets\n";
+
+    fn old_compose(_files: &[String], extra: &[&str]) -> Result<Vec<String>, String> {
+        if extra.contains(&"--no-interpolate") {
+            return Err("services.noo-rh-voice-coordinator.volumes.0 invalid mount config".into());
+        }
+        Err("required variable RH_VOICE_COORDINATOR_SECRETS_DIR is missing a value: broker-provisioned files required".into())
+    }
+
+    fn read_fixture(path: &str) -> Result<String, String> {
+        match path {
+            "/opt/noo/docker-compose.cluster.yml" => Ok(CORE.into()),
+            "/opt/noo/addons/rh-voice/docker-compose.yml" => Ok(OVERLAY.into()),
+            other => Err(format!("no such file {other}")),
+        }
+    }
+
+    fn files() -> Vec<String> {
+        vec!["/opt/noo/docker-compose.cluster.yml".into(), "/opt/noo/addons/rh-voice/docker-compose.yml".into()]
+    }
+
+    #[test]
+    fn when_compose_fails_both_ways_the_files_services_still_find_a_real_orphan() {
+        let declared: BTreeSet<String> = project_files(&files(), &old_compose, &read_fixture).unwrap().into_iter().collect();
+        let running = vec![
+            parse_ps_row(&row("noo-rh-voice-coordinator", "noomesh", "noo-rh-voice-coordinator")).unwrap(),
+            parse_ps_row(&row("noo-gateway", "noomesh", "gateway")).unwrap(),
+            parse_ps_row(&row("noo-old", "noomesh", "old")).unwrap(),
+        ];
+        let names: Vec<&str> = orphans_of(&running, &declared).iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["noo-old"], "{declared:?}");
+    }
+
+    #[test]
+    fn a_profile_gated_add_on_service_is_declared() {
+        let got = project_files(&files(), &old_compose, &read_fixture).unwrap();
+        assert_eq!(got, ["gateway", "worker", "noo-rh-voice", "noo-rh-voice-coordinator"]);
+    }
+
+    #[test]
+    fn the_union_reads_exactly_the_files_compose_was_given() {
+        let given = std::cell::RefCell::new(Vec::<Vec<String>>::new());
+        let read = std::cell::RefCell::new(Vec::<String>::new());
+        let compose = |f: &[String], extra: &[&str]| -> Result<Vec<String>, String> {
+            given.borrow_mut().push(f.to_vec());
+            old_compose(f, extra)
+        };
+        let reader = |p: &str| -> Result<String, String> {
+            read.borrow_mut().push(p.to_string());
+            read_fixture(p)
+        };
+        project_files(&files(), &compose, &reader).unwrap();
+        assert!(!given.borrow().is_empty() && given.borrow().iter().all(|g| *g == files()), "{:?}", given.borrow());
+        assert_eq!(*read.borrow(), files());
     }
 
     /// The 2026-09-13 finding, as an assertion.
