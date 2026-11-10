@@ -51,13 +51,18 @@
 //! * KV = layers x kv_heads x head_dim x 2 (K and V) x bytes_per_elem x num_ctx
 //!   x num_parallel. The architecture comes from `model_stats[].arch` when the
 //!   node reports it; otherwise the documented conservative figure
-//!   [`KV_BYTES_PER_TOKEN_PER_GB_WEIGHTS`] x weights_gb per token per slot (the
-//!   full-attention ratio of a 27B GQA model, so models with sliding-window
-//!   attention are over- not under-estimated);
+//!   [`kv_bytes_per_token`]: [`KV_BYTES_PER_TOKEN_PER_GB_WEIGHTS`] x weights_gb
+//!   per token per slot (the full-attention ratio of a 27B GQA model, so models
+//!   with sliding-window attention are over- not under-estimated), at least
+//!   [`KV_BYTES_PER_TOKEN_FLOOR`] for a chat model (small models carry more KV
+//!   per GB: qwen3-4b is 144 KiB a token on 2.4 GB of weights, finding 126;
+//!   embedders and rerankers are small encoders and take the per-GB figure);
 //! * `num_ctx`: embed = `EMBED_NUM_CTX` (the gateway sends it on every embed);
-//!   chat = the placement's `OLLAMA_CONTEXT_LENGTH` / `N_CTX`, else
-//!   [`DEFAULT_CHAT_CTX`] - the gateway sends NO `num_ctx` for ollama chat, so
-//!   the daemon default is what is allocated; rerank = [`RERANK_CTX`];
+//!   chat = the placement's `OLLAMA_CONTEXT_LENGTH` / `N_CTX`; else, for
+//!   ollama, the daemon's own default ([`ollama_default_ctx`]: 4096, 32768 or
+//!   262144 by the VRAM it sees - the gateway sends NO `num_ctx` for ollama
+//!   chat, so that is what is allocated; `noo cluster place` pins one), else
+//!   [`DEFAULT_CHAT_CTX`]; rerank = [`RERANK_CTX`];
 //! * `num_parallel` is DAEMON-wide: the max `OLLAMA_NUM_PARALLEL` over every
 //!   ollama placement on the node (the same merge the node agent applies), so a
 //!   4-slot embedder also gives the chat model 4 KV slots;
@@ -87,7 +92,35 @@ pub const SHARED_GPU_HEADROOM_MIN_GB: f64 = 2.0;
 pub const RUNTIME_OVERHEAD_GB: f64 = 0.6;
 /// Conservative KV bytes per token per slot per GB of weights (16 KiB).
 pub const KV_BYTES_PER_TOKEN_PER_GB_WEIGHTS: f64 = 16.0 * 1024.0;
+/// The floor under that figure (144 KiB, f16): qwen3-4b's real KV a token.
+pub const KV_BYTES_PER_TOKEN_FLOOR: f64 = 144.0 * 1024.0;
 pub const DEFAULT_CHAT_CTX: u64 = 4096;
+
+/// Conservative f16 KV bytes per token per slot for a model whose
+/// architecture is not reported: 16 KiB per GB of weights, at least 144 KiB.
+/// noo-cli's `cluster_tune::kv_bytes_per_token` is the same function.
+pub fn kv_bytes_per_token(weights_gb: f64) -> f64 {
+    (weights_gb * KV_BYTES_PER_TOKEN_PER_GB_WEIGHTS).max(KV_BYTES_PER_TOKEN_FLOOR)
+}
+
+/// Ollama's context when nothing sets one (`OLLAMA_CONTEXT_LENGTH` unset, no
+/// per-request `num_ctx`): picked from the total VRAM the daemon sees, 4096
+/// under 23 GiB, 32768 under 47 GiB, else 262144 (Ollama 0.40.5,
+/// server/routes.go), summed over every GPU. The node's `vram_gb` is one
+/// GPU's nvidia-smi MiB / 1024, i.e. GiB, so it is multiplied by
+/// `gpu_count`. A CPU placement's daemon is given no GPU, so it sees none.
+pub fn ollama_default_ctx(node: &Value, target: &str) -> u64 {
+    let caps = &node["capabilities"];
+    let count = node["gpu_count"].as_f64().or_else(|| caps["gpu_count"].as_f64()).filter(|c| *c >= 1.0).unwrap_or(1.0);
+    let gib = if target == "gpu" { node_vram_ram(node).0 * count } else { 0.0 };
+    if gib >= 47.0 {
+        262144
+    } else if gib >= 23.0 {
+        32768
+    } else {
+        4096
+    }
+}
 pub const RERANK_CTX: u64 = 512;
 pub const GB_PER_BILLION_PARAMS: f64 = 0.6; // Q4_K_M ~ 4.8 bits/param
 pub const VLLM_DEFAULT_UTIL: f64 = 0.90;
@@ -455,10 +488,19 @@ pub fn evaluate(node: &Value, specs: &[Spec], embed_ctx: u64) -> Report {
         let (w, wsrc) = weights_gb(node, &s.model);
         let st = stat(node, &s.model);
         let measured = st.and_then(|x| x["resident_bytes"].as_u64()).filter(|b| *b > 0);
+        let pinned = env_u64(&s.env, "OLLAMA_CONTEXT_LENGTH").or_else(|| env_u64(&s.env, "N_CTX"));
         let ctx = match s.role.as_str() {
             "embed" => embed_ctx,
             "rerank" => RERANK_CTX,
-            _ => env_u64(&s.env, "OLLAMA_CONTEXT_LENGTH").or_else(|| env_u64(&s.env, "N_CTX")).unwrap_or(DEFAULT_CHAT_CTX),
+            _ => match pinned {
+                Some(c) => c,
+                None if s.backend == "ollama" => {
+                    let c = ollama_default_ctx(node, target);
+                    notes.push(format!("num_ctx unpinned: the daemon's VRAM-tier default ({c}); `noo cluster place` pins one"));
+                    c
+                }
+                None => DEFAULT_CHAT_CTX,
+            },
         };
         let slots = if s.backend == "ollama" { parallel } else { env_u64(&s.env, "N_PARALLEL").unwrap_or(1).max(1) };
         let elem_bytes = match env_str(&s.env, "OLLAMA_KV_CACHE_TYPE").as_deref() {
@@ -479,7 +521,11 @@ pub fn evaluate(node: &Value, specs: &[Spec], embed_ctx: u64) -> Report {
         let per_token = per_token.or_else(|| {
             w.map(|w| {
                 notes.push("KV from the conservative per-token figure (architecture not reported)".into());
-                w * KV_BYTES_PER_TOKEN_PER_GB_WEIGHTS * (elem_bytes / 2.0)
+                // The floor is for chat models; an embedder or reranker is a
+                // small encoder whose KV the per-GB figure already matches
+                // (harrier: 1.1 GB measured on host8).
+                let f16 = if matches!(s.role.as_str(), "embed" | "rerank") { w * KV_BYTES_PER_TOKEN_PER_GB_WEIGHTS } else { kv_bytes_per_token(w) };
+                f16 * (elem_bytes / 2.0)
             })
         });
         let kv_gb = per_token.map(|p| p * ctx as f64 * slots as f64 / GB).unwrap_or(0.0);
@@ -489,6 +535,27 @@ pub fn evaluate(node: &Value, specs: &[Spec], embed_ctx: u64) -> Report {
                 "can't judge {}: no node reports its size, the controller model store has no file for it, and its tag names no parameter count",
                 s.model
             ));
+        }
+        // Finding 126: measured far above the estimate means the daemon
+        // allocated more than fit assumed - an ollama chat model whose context
+        // nobody pinned. Say why and what to do; the verdict (from the
+        // measured size) says whether it fits.
+        if let Some(b) = measured {
+            let m = b as f64 / GB;
+            let budget = pool_for(node, target).map(|p| p.total_gb);
+            let over_budget = budget.is_some_and(|t| m > t);
+            if s.backend == "ollama" && s.role != "embed" && s.role != "rerank" && (over_budget || m > est_total * 1.5) {
+                let mut msg = format!("{} measured {m:.1} GB resident, estimated {est_total:.1} GB at num_ctx {ctx}", s.model);
+                if let (true, Some(t)) = (over_budget, budget) {
+                    msg.push_str(&format!(": over the {t:.1} GB {target} budget, so part of it runs on CPU"));
+                }
+                if pinned.is_none() {
+                    msg.push_str(&format!(". Its context is unpinned (the daemon picks it from the VRAM it sees); pin it: `noo cluster place <node> ollama {} --env OLLAMA_CONTEXT_LENGTH={DEFAULT_CHAT_CTX}`", s.model));
+                } else {
+                    msg.push_str(". Lower its OLLAMA_CONTEXT_LENGTH or OLLAMA_NUM_PARALLEL");
+                }
+                warnings.push(msg);
+            }
         }
         let (total, source) = match measured {
             Some(b) => {
@@ -649,6 +716,11 @@ mod tests {
         Spec { backend: "ollama".into(), role: role.into(), model: model.into(), env, target: None }
     }
 
+    fn spec_env(role: &str, model: &str, env: &[(&str, &str)]) -> Spec {
+        let env = env.iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
+        Spec { backend: "ollama".into(), role: role.into(), model: model.into(), env, target: None }
+    }
+
     fn llama(model: &str, target: Option<&str>, env: &[(&str, &str)]) -> Spec {
         let env = env.iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
         Spec { backend: "llamacpp".into(), role: "chat".into(), model: model.into(), env, target: target.map(str::to_string) }
@@ -712,10 +784,12 @@ mod tests {
         // RAM headroom is the same either way.
         assert!((pool_for(&n, "cpu").unwrap().headroom_gb - 3.2).abs() < 1e-9);
         // Extra headroom turns fits into tight, never into does-not-fit.
+        // Context pinned: unpinned, a 24 GiB GPU's daemon picks 32768.
+        let pinned = spec_env("chat", "m:x", &[("OLLAMA_CONTEXT_LENGTH", "4096")]);
         let mut node = json!({"vram_gb": 24.0, "model_stats": [{"name": "m:x", "size_bytes": 19_000_000_000u64}]});
-        assert_eq!(evaluate(&node, &[spec("chat", "m:x", None)], 1024).verdict, Verdict::Fits);
+        assert_eq!(evaluate(&node, &[pinned.clone()], 1024).verdict, Verdict::Fits);
         node["usage_profile"] = json!("shared");
-        assert_eq!(evaluate(&node, &[spec("chat", "m:x", None)], 1024).verdict, Verdict::Tight);
+        assert_eq!(evaluate(&node, &[pinned], 1024).verdict, Verdict::Tight);
     }
 
     #[test]
@@ -871,9 +945,71 @@ mod tests {
     fn architecture_metadata_replaces_the_conservative_figure() {
         let node = json!({"vram_gb": 24.0, "model_stats": [{"name": "m:7b", "size_bytes": 4_000_000_000u64,
             "arch": {"layers": 32, "kv_heads": 8, "head_dim": 128}}]});
-        let r = evaluate(&node, &[spec("chat", "m:7b", None)], 1024);
+        let r = evaluate(&node, &[spec_env("chat", "m:7b", &[("OLLAMA_CONTEXT_LENGTH", "4096")])], 1024);
         // 32 * 8 * 128 * 2 * 2 bytes = 131072 B/token * 4096 ctx = 0.537 GB
         assert!((r.rows[0].kv_gb - 0.536870912).abs() < 1e-6, "{}", r.rows[0].kv_gb);
+    }
+
+    /// Finding 126 (outside tester, 0.6.21 retest): qwen3:4b on a 6 GB RTX
+    /// 3060 Laptop GPU. fit said 3.2 GB (from-name weights 2.4, KV 0.2 at an
+    /// assumed 4096); unpinned it measured 7.1 GB resident, at
+    /// OLLAMA_CONTEXT_LENGTH=4096 3.2 GB and at 8192 3.9 GB.
+    const QWEN3_4B: &str = "qwen3:4b";
+
+    #[test]
+    fn the_kv_floor_covers_a_small_model_and_leaves_a_big_one() {
+        // qwen3-4b's real KV: 36 layers x 8 kv_heads x 128 head_dim x 2 x 2 B.
+        let real = 36.0 * 8.0 * 128.0 * 2.0 * 2.0;
+        assert_eq!(real, KV_BYTES_PER_TOKEN_FLOOR);
+        assert_eq!(kv_bytes_per_token(2.4), real, "the old per-GB figure gave {}", 2.4 * KV_BYTES_PER_TOKEN_PER_GB_WEIGHTS);
+        // gemma-4-26B's 15.8 GB: unchanged.
+        assert_eq!(kv_bytes_per_token(15.8), 15.8 * KV_BYTES_PER_TOKEN_PER_GB_WEIGHTS);
+        // At the tester's 4096 and 8192 the from-name KV now matches the
+        // measured step (3.2 -> 3.9 GB: ~0.6 GB a 4096).
+        let node = json!({"vram_gb": 6.0, "ram_gb": 32.0});
+        let at = |c: &str| evaluate(&node, &[spec_env("chat", QWEN3_4B, &[("OLLAMA_CONTEXT_LENGTH", c)])], 1024).rows[0].kv_gb;
+        assert!((at("4096") - 0.604).abs() < 0.01, "{}", at("4096"));
+        assert!((at("8192") - at("4096") - 0.604).abs() < 0.01);
+    }
+
+    #[test]
+    fn an_unpinned_ollama_chat_context_is_the_daemons_vram_tier() {
+        let six = json!({"vram_gb": 6.0, "ram_gb": 32.0});
+        assert_eq!(ollama_default_ctx(&six, "gpu"), 4096);
+        // nvidia-smi 24564 MiB / 1024 = 24.0 GiB: Ollama's 32k tier.
+        assert_eq!(ollama_default_ctx(&json!({"vram_gb": 24.0}), "gpu"), 32768);
+        // Ollama sums every GPU; vram_gb is one GPU's.
+        assert_eq!(ollama_default_ctx(&json!({"vram_gb": 24.0, "gpu_count": 2}), "gpu"), 262144);
+        assert_eq!(ollama_default_ctx(&json!({"vram_gb": 12.0, "capabilities": {"gpu_count": 2}}), "gpu"), 32768);
+        // A CPU placement's daemon sees no GPU.
+        assert_eq!(ollama_default_ctx(&json!({"vram_gb": 24.0}), "cpu"), 4096);
+        // fit charges the unpinned row that tier and says so; a pinned row
+        // keeps its own.
+        let big = json!({"vram_gb": 24.0, "ram_gb": 64.0});
+        let r = evaluate(&big, &[spec("chat", QWEN3_4B, None)], 1024);
+        assert!(r.rows[0].notes.iter().any(|n| n.contains("unpinned") && n.contains("32768")), "{:?}", r.rows[0].notes);
+        assert!((r.rows[0].kv_gb - 32768.0 * KV_BYTES_PER_TOKEN_FLOOR / GB).abs() < 1e-6);
+        let pinned = evaluate(&big, &[spec_env("chat", QWEN3_4B, &[("OLLAMA_CONTEXT_LENGTH", "4096")])], 1024);
+        assert!(pinned.rows[0].notes.iter().all(|n| !n.contains("unpinned")));
+    }
+
+    #[test]
+    fn measured_over_the_budget_warns_with_the_cause_and_the_fix() {
+        let mut node = json!({"vram_gb": 6.0, "ram_gb": 32.0});
+        node["model_stats"] = json!([{"name": QWEN3_4B, "resident_bytes": 7_100_000_000u64}]);
+        let r = evaluate(&node, &[spec("chat", QWEN3_4B, None)], 1024);
+        assert_eq!(r.verdict, Verdict::DoesNotFit);
+        let w = r.warnings.iter().find(|w| w.contains("measured 7.1 GB")).unwrap_or_else(|| panic!("{:?}", r.warnings));
+        assert!(w.contains("over the 6.0 GB gpu budget") && w.contains("runs on CPU"), "{w}");
+        assert!(w.contains("unpinned") && w.contains("OLLAMA_CONTEXT_LENGTH=4096"), "{w}");
+        // Pinned at 4096 it measured 3.2 GB: no warning.
+        node["model_stats"] = json!([{"name": QWEN3_4B, "resident_bytes": 3_200_000_000u64}]);
+        let ok = evaluate(&node, &[spec_env("chat", QWEN3_4B, &[("OLLAMA_CONTEXT_LENGTH", "4096")])], 1024);
+        assert!(ok.warnings.iter().all(|w| !w.contains("measured")), "{:?}", ok.warnings);
+        // An embed row is never blamed on the chat context.
+        node["model_stats"] = json!([{"name": "harrier", "resident_bytes": 7_100_000_000u64}]);
+        let e = evaluate(&node, &[spec("embed", "harrier", None)], 1024);
+        assert!(e.warnings.iter().all(|w| !w.contains("OLLAMA_CONTEXT_LENGTH")), "{:?}", e.warnings);
     }
 
     #[test]

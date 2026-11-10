@@ -2078,6 +2078,41 @@ pub(crate) fn default_chat_check(classes: Option<&Value>) -> Check {
 /// embed node serves a model no space uses (it serves nobody). A static
 /// endpoint that answered the gateway's probe embed (`static_live`, the
 /// compose embedder on a fresh install) serves the space like a node.
+/// Finding 126: a model the node measured far above its fit estimate, or over
+/// its pool. One `noo cluster fit` report per node (`None` = not read); the
+/// gateway writes the warning with the cause and the fix, this row collects
+/// them. A warning, never a failure: the model still answers, slower.
+pub(crate) fn model_memory_check(reports: &[(String, Option<Value>)]) -> Check {
+    const NAME: &str = "model memory";
+    let mut over = Vec::new();
+    let mut unread = Vec::new();
+    for (node, r) in reports {
+        match r {
+            None => unread.push(node.as_str()),
+            Some(r) => over.extend(
+                r["warnings"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|w| w.as_str())
+                    .filter(|w| w.contains(" measured ") && w.contains("resident"))
+                    .map(|w| format!("{node}: {w}")),
+            ),
+        }
+    }
+    if !over.is_empty() {
+        let first = over[0].split(':').next().unwrap_or("<node>").to_string();
+        return warn(NAME, over.join("; "), Some(format!("noo cluster fit {first}")));
+    }
+    if reports.is_empty() {
+        return ok(NAME, "no nodes");
+    }
+    if !unread.is_empty() {
+        return warn(NAME, format!("fit not read for {}", unread.join(", ")), Some(format!("noo cluster fit {}", unread[0])));
+    }
+    ok(NAME, format!("every loaded model within its fit estimate and pool on {} node(s)", reports.len()))
+}
+
 pub(crate) fn embedding_spaces_check(body: Option<&Value>) -> Check {
     const NAME: &str = "embedding spaces";
     let Some(body) = body else {
@@ -6815,6 +6850,16 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(default_chat_check(model_classes.as_ref()));
         let spaces = get_json_opt(g, "/api/cluster/embedding-spaces", true, 15);
         checks.push(embedding_spaces_check(spaces.as_ref()));
+        // Finding 126: a loaded model measured over its estimate or pool.
+        let fits: Vec<(String, Option<Value>)> = fleet
+            .iter()
+            .filter_map(|n| n["id"].as_str())
+            .map(|id| {
+                let path = format!("/api/cluster/nodes/{}/fit", super::urlencode(id));
+                (id.to_string(), crate::http::post_json_try(g, &path, &serde_json::json!({}), true, 10).ok())
+            })
+            .collect();
+        checks.push(model_memory_check(&fits));
         // The gateway's own Redis connection (authenticated /health: the
         // anonymous body carries no dependency map).
         let health = health_body(g);
@@ -12539,5 +12584,33 @@ mod missing_key_remedy_tests {
         assert_eq!(k.remedy.as_deref(), Some("noo addons enable evolve"));
         let k = row(vec![("worker".into(), "svc:worker".into())]);
         assert_eq!(k.remedy.as_deref(), Some("noo security service-key provision worker"));
+    }
+}
+
+#[cfg(test)]
+mod model_memory_tests {
+    use super::{model_memory_check, Verdict};
+    use serde_json::json;
+
+    /// The gateway's warning for the outside tester's qwen3:4b (finding 126).
+    const TESTER: &str = "qwen3:4b measured 7.1 GB resident, estimated 3.6 GB at num_ctx 4096: over the 6.0 GB gpu budget, so part of it runs on CPU. Its context is unpinned (the daemon picks it from the VRAM it sees); pin it: `noo cluster place <node> ollama qwen3:4b --env OLLAMA_CONTEXT_LENGTH=4096`";
+
+    #[test]
+    fn a_measured_overrun_is_a_warning_naming_the_node_and_the_fix() {
+        let c = model_memory_check(&[
+            ("awolf".into(), Some(json!({"warnings": ["tight: 20.1 GB needed leaves 3.9 GB"]}))),
+            ("pop-os".into(), Some(json!({"verdict": "does_not_fit", "warnings": [TESTER]}))),
+        ]);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.starts_with("pop-os: qwen3:4b measured 7.1 GB") && !c.detail.contains("tight"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster fit pop-os"));
+    }
+
+    #[test]
+    fn quiet_reports_are_ok_and_an_unread_one_says_so() {
+        let fine = model_memory_check(&[("awolf".into(), Some(json!({"warnings": []})))]);
+        assert_eq!(fine.verdict, Verdict::Ok);
+        let unread = model_memory_check(&[("awolf".into(), Some(json!({}))), ("host6".into(), None)]);
+        assert!(unread.verdict == Verdict::Warn && unread.detail.contains("host6"), "{}", unread.detail);
     }
 }
