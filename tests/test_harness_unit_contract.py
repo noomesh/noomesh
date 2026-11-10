@@ -66,6 +66,20 @@ def test_service_section_is_what_the_applier_demands() -> None:
     assert svc.get("TimeoutStopSec") == ["150"], "a stop drains for NOO_HARNESS_DRAIN_SECS (120) plus 30 s (i256)"
 
 
+def test_a_harness_that_cannot_start_backs_off() -> None:
+    """Finding 116: a harness NATS refused restarted every 30 s, forever.
+    Restarts back off to 10 minutes; the start limit stays off, because the
+    agent starts this unit per placement and a start-limit-hit unit would
+    refuse that start until reset-failed."""
+    svc = _directives("Service")
+    unit = _directives("Unit")
+    assert svc.get("Restart") == ["always"]
+    assert svc.get("RestartSec") == ["30"]
+    assert svc.get("RestartSteps") == ["6"], svc.get("RestartSteps")
+    assert svc.get("RestartMaxDelaySec") == ["600"], svc.get("RestartMaxDelaySec")
+    assert unit.get("StartLimitBurst") == ["0"] and unit.get("StartLimitIntervalSec") == ["0"], unit
+
+
 def test_applier_refusals_match_the_unit() -> None:
     """The applier's harness-unit greps and the unit agree on the exact
     lines, so a rename on either side fails here, not on a node."""
@@ -271,8 +285,11 @@ def test_the_harness_reads_its_own_copy_of_the_node_pair() -> None:
     tmpl = re.sub(r"\{#.*?#\}", "", HARNESS_ENV_TMPL.read_text(), flags=re.S)
     assert "NOO_TLS_CERT={{ harness_tls_cert }}" in tmpl and "NOO_TLS_KEY={{ harness_tls_key }}" in tmpl
     assert "na_tls_key" not in tmpl, "the harness must not be pointed at the agent's key"
-    prov = (REPO / "noo-cli/src/commands/provision.rs").read_text()
-    assert '"/etc/noo/pki/harness/node.crt"' in prov and '"/etc/noo/pki/harness/node.key"' in prov
+    # Since finding 116 the harness reads that copy as a systemd credential:
+    # the unit loads it from pki/harness/ (test_harness_credentials.py).
+    unit = UNIT.read_text()
+    assert "LoadCredential=node.crt:/etc/noo/pki/harness/node.crt" in unit
+    assert "LoadCredential=node.key:/etc/noo/pki/harness/node.key" in unit
     text = APPLY.read_text()
     pair = text[text.index("# harness-pair"):]
     pair = pair[: pair.index("# vendor-cli")]
