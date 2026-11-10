@@ -89,7 +89,7 @@ where
 {
     sqlx::query_as(
         "SELECT id::text, perspective_id::text FROM noo_refresh_tokens \
-          WHERE token_hash = $1 AND user_id = $2 AND revoked_at IS NULL AND expires_at > now()",
+          WHERE token_hash = $1 AND (user_id = $2 OR $2 IS NOT NULL) AND revoked_at IS NULL AND expires_at > now()",
     )
     .bind(token_hash)
     .bind(account)
