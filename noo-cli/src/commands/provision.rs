@@ -519,9 +519,6 @@ fn begin_provision(g: &Globals, a: &ProvisionArgs) -> ProvSite {
             }
             SelfLane::Refuse(why) => fail(g.json, ExitCode::Generic, "self_node_units", &why, Some(SELF_RAIL_REMEDY)),
         }
-        if let Err(e) = converge_self_controller_url(&root) {
-            fail(g.json, ExitCode::Generic, "controller_url", &e, Some(CONTROLLER_HOST_REMEDY));
-        }
     }
     ProvSite { root, is_self }
 }
