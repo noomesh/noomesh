@@ -7173,7 +7173,6 @@ fn checks_json(checks: &[Check]) -> Value {
     Value::Array(checks.iter().map(|c| serde_json::json!({
         "name": c.name,
         "verdict": match c.verdict { Verdict::Ok => "ok", Verdict::Warn => "warn", Verdict::Fail => "fail", Verdict::Starting => "starting", Verdict::Accepted => "accepted" },
-        "planned": planned_ref(c),
         "detail": c.detail,
         "remedy": c.remedy,
     })).collect())
