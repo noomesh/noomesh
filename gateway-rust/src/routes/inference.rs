@@ -734,7 +734,7 @@ pub(crate) enum ChatAnswer {
 pub(crate) fn chat_answer(data: &Value) -> ChatAnswer {
     let msg = data.pointer("/choices/0/message");
     let content = msg.and_then(|m| m.get("content")).and_then(Value::as_str).unwrap_or("");
-    if !content.trim().is_empty() {
+    if !content.is_empty() {
         return ChatAnswer::Text(content.to_string());
     }
     let reasoning = msg
