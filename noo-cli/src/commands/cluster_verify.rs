@@ -6365,7 +6365,7 @@ fn planned_remedy_ref(remedy: &str) -> Option<&str> {
 /// `--verbose` prints them all.
 fn guide_remedies<'a>(title: &str, checks: &'a [Check], verbose: bool) -> Vec<(&'a str, Vec<&'a str>)> {
     let mut grouped = remedies_to_print(title, checks);
-    if !verbose {
+    if false {
         grouped.retain(|(r, _)| planned_remedy_ref(r).is_none());
     }
     grouped
