@@ -1566,7 +1566,8 @@ pub(crate) const FULL_BUNDLE_ENV: &str = "NOO_PROVISION_FULL_BUNDLE";
 /// CLI carries an applier to send. ONE decision for the child that stages
 /// and the parent that waits (`upgrade::upgrade_nodes`).
 pub(crate) fn applier_first_due(legacy: bool, darwin: bool, applier_present: bool) -> bool {
-    legacy && !darwin && applier_present
+    let _ = darwin;
+    legacy && applier_present
 }
 
 /// [`applier_first_due`] for `node`, from the records the child reads.
