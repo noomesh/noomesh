@@ -353,6 +353,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     //          placement's image is staged there.
     out.extend(image_sources_check(n));
     out.extend(images_staged_check(n));
+    out.extend(door_pin_check(n));
     out.extend(gpu_target_cpu_build_check(n));
     out.extend(hardened_images_check(n));
 
@@ -787,6 +788,95 @@ pub(crate) fn hardened_images_check(n: &Value) -> Option<Check> {
         format!("drift: upstream image(s) running where a hardened build of ours exists (a node never falls back to upstream on its own): {}", list.join(", ")),
         format!("noo cluster sync-images {id} -i {first_ours}   # stage ours; the node's reconciler then recreates the backend on it; unset LLAMACPP_IMAGE / OLLAMA_IMAGE if an override pins upstream"),
     ))
+}
+
+/// The node agent's default image namespace (Go `DefaultImagePrefix`): a
+/// node resolves a door pin's ref under `NOO_IMAGE_PREFIX`, else this.
+const AGENT_DEFAULT_IMAGE_PREFIX: &str = "ghcr.io/noomesh";
+
+/// The pinned doors among a node's running placements, each with what the
+/// controller's rail staged it by for `arch`: `state` is `staged` (with
+/// `staged_by`, "" = staged by name), `absent` (no tar for that arch) or
+/// `unknown` (the gateway did not answer). Asked of the gateway's manifest
+/// route, the same answer the node agent gets.
+fn door_pin_facts(g: &Globals, placements: &Value, arch: &str) -> Vec<Value> {
+    let prefix = crate::commands::provision::release_var("NOO_IMAGE_PREFIX");
+    let prefix = if prefix.trim().is_empty() { AGENT_DEFAULT_IMAGE_PREFIX.to_string() } else { prefix };
+    let placed: Vec<&str> = placements
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|p| p["desired_state"].as_str() == Some("running"))
+        .filter_map(|p| p["backend"].as_str())
+        .collect();
+    crate::commands::image_stage::door_pins_by_backend(&prefix)
+        .into_iter()
+        .filter(|(backend, ..)| placed.contains(&backend.as_str()))
+        .map(|(backend, door, pin)| {
+            let mut fact = serde_json::json!({"backend": backend, "ref": door, "arch": arch, "pin": pin, "state": "absent"});
+            for tar in [
+                crate::commands::image_stage::image_tar_gz_name(&door, arch),
+                crate::commands::image_stage::image_tar_name(&door, arch),
+            ] {
+                let path = format!("/api/artifacts/manifest/image/{}", crate::commands::urlencode(&tar));
+                match crate::http::get_raw_opt(g, &path, true, 15) {
+                    Some((200, body)) => {
+                        let m: Value = serde_json::from_str(&body).unwrap_or_default();
+                        fact["state"] = "staged".into();
+                        fact["staged_by"] = m["lock_digest"].as_str().unwrap_or("").into();
+                        break;
+                    }
+                    Some((404, _)) => continue,
+                    _ => {
+                        fact["state"] = "unknown".into();
+                        break;
+                    }
+                }
+            }
+            fact
+        })
+        .collect()
+}
+
+/// The `door pin` row: every pinned stunnel door a node runs is staged on
+/// the rail by exactly its pinned digest, for the node's arch. The node
+/// agent holds a pinned door to that digest (noomesh/noomesh#915), so a door
+/// staged by another digest, by name, or not at all does not start. No row
+/// for a node with no pinned door placed. The remedy restages every door pin
+/// by its digest.
+pub(crate) fn door_pin_check(n: &Value) -> Option<Check> {
+    const NAME: &str = "door pin";
+    let facts = n["door_pins"].as_array().filter(|a| !a.is_empty())?;
+    let mut good = Vec::new();
+    let mut bad = Vec::new();
+    let mut unknown = Vec::new();
+    for f in facts {
+        let label = format!(
+            "{}'s door {} ({})",
+            f["backend"].as_str().unwrap_or("?"),
+            f["ref"].as_str().unwrap_or("?"),
+            f["arch"].as_str().unwrap_or("?")
+        );
+        let pin = f["pin"].as_str().unwrap_or("");
+        match (f["state"].as_str(), f["staged_by"].as_str()) {
+            (Some("staged"), Some(by)) if !pin.is_empty() && by == pin => good.push(label),
+            (Some("staged"), Some("")) => bad.push(format!("{label} is staged by name, pinned {pin}")),
+            (Some("staged"), Some(by)) => bad.push(format!("{label} is staged by {by}, pinned {pin}")),
+            (Some("unknown"), _) => unknown.push(label),
+            _ => bad.push(format!("{label} is not staged on the rail")),
+        }
+    }
+    if !bad.is_empty() {
+        return Some(warn(
+            NAME,
+            format!("a pinned door the node will refuse to start: {}", bad.join("; ")),
+            Some("noo upgrade --stack   # restages every door pin by its digest; then run verify again".to_string()),
+        ));
+    }
+    if !unknown.is_empty() {
+        return Some(warn(NAME, format!("the gateway did not answer for {}; not checked", unknown.join(", ")), None));
+    }
+    Some(ok(NAME, format!("staged by its pinned digest: {}", good.join(", "))))
 }
 
 /// The `sidecar image` row: which image the node's
@@ -1332,6 +1422,13 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
         (Some(d), Some(arch)) => crate::commands::image_stage::unstaged_for(&d["placements"], arch),
         _ => Vec::new(),
     };
+    // The `door pin` row: each pinned stunnel door this node runs, and the
+    // digest the rail staged it by, asked of the GATEWAY (the manifest the
+    // node itself reads), never of this host's image directory.
+    let door_pins = match (desired.as_ref(), crate::commands::image_stage::node_arch(&n)) {
+        (Some(d), Some(arch)) => door_pin_facts(g, &d["placements"], arch),
+        _ => Vec::new(),
+    };
     // i545 45/46: placements on a gpu target whose image has no GPU build.
     let cpu_built = desired
         .as_ref()
@@ -1362,6 +1459,9 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
         }
         if !unstaged.is_empty() {
             obj.insert("unstaged_images".into(), serde_json::json!(unstaged));
+        }
+        if !door_pins.is_empty() {
+            obj.insert("door_pins".into(), serde_json::json!(door_pins));
         }
         if !cpu_built.is_empty() {
             obj.insert("gpu_targets_on_cpu_builds".into(), serde_json::json!(cpu_built));
@@ -10280,6 +10380,62 @@ mod tests {
         let inject = crate::test_src::fn_body(&own, "fn with_harness_wanted(");
         assert!(inject.contains("gpu_targets_on_cpu_builds(&d[\"placements\"])"), "fed from desired-config");
         assert!(own.contains("out.extend(gpu_target_cpu_build_check(n));"), "the row is in the run");
+    }
+
+    const VLLM_PIN: &str = "sha256:8a3e44b7e3a1aef61a0852c444a01df319b506bf87083fef93c21367e6bffa2b";
+
+    fn door_node(state: &str, staged_by: Option<&str>) -> Value {
+        let mut f = serde_json::json!({"backend": "vllm", "ref": "ghcr.io/noomesh/stunnel:v0.6.13", "arch": "amd64", "pin": VLLM_PIN, "state": state});
+        if let Some(b) = staged_by {
+            f["staged_by"] = b.into();
+        }
+        serde_json::json!({"id": "awolf", "door_pins": [f]})
+    }
+
+    /// A pinned door staged by exactly its pin passes, naming the door.
+    #[test]
+    fn the_door_pin_row_passes_a_door_staged_by_its_pin() {
+        let c = door_pin_check(&door_node("staged", Some(VLLM_PIN))).expect("a row");
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.contains("vllm's door ghcr.io/noomesh/stunnel:v0.6.13 (amd64)"), "{}", c.detail);
+    }
+
+    /// Staged by another digest, by name only, or not at all: WARN, naming
+    /// what was found and the restage that fixes it. Never a pass.
+    #[test]
+    fn the_door_pin_row_warns_on_a_door_not_staged_by_its_pin() {
+        let other = "sha256:68ac017b00000000000000000000000000000000000000000000000000000000";
+        for (n, want) in [
+            (door_node("staged", Some(other)), other),
+            (door_node("staged", Some("")), "staged by name"),
+            (door_node("absent", None), "not staged on the rail"),
+        ] {
+            let c = door_pin_check(&n).expect("a row");
+            assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+            assert!(c.detail.contains(want) && c.detail.contains(VLLM_PIN), "{}", c.detail);
+            assert!(c.remedy.as_deref().unwrap_or("").starts_with("noo upgrade --stack"), "{:?}", c.remedy);
+        }
+    }
+
+    /// A gateway that did not answer is "not checked", never a pass; a node
+    /// with no pinned door placed has no row.
+    #[test]
+    fn the_door_pin_row_never_passes_what_it_could_not_ask() {
+        let c = door_pin_check(&door_node("unknown", None)).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("not checked"), "{}", c.detail);
+        assert!(door_pin_check(&serde_json::json!({"id": "x"})).is_none());
+        assert!(door_pin_check(&serde_json::json!({"id": "x", "door_pins": []})).is_none());
+    }
+
+    /// The shipped door pins, keyed by backend, under the node's prefix.
+    #[test]
+    fn door_pins_by_backend_reads_the_shipped_file() {
+        let pins = crate::commands::image_stage::door_pins_by_backend("reg.example/ns/");
+        assert!(
+            pins.iter().any(|(b, r, d)| b == "vllm" && r == "reg.example/ns/stunnel:v0.6.13" && d == VLLM_PIN),
+            "{pins:?}"
+        );
     }
 
     #[test]
