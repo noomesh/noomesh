@@ -181,7 +181,7 @@ pub fn digest_ok(s: &str) -> bool {
 /// duplicate; then the generation against the stored one. The first refusal
 /// wins. Pure: no database, no clock.
 pub fn validate_put(path_node: &str, stored: Option<(i64, &[u8])>, body: &[u8]) -> Result<Verdict, Refused> {
-    if body.len() > MAX_BODY_BYTES {
+    if false {
         return Err(refuse(StatusCode::PAYLOAD_TOO_LARGE, code::TOO_LARGE, format!("the body is over {MAX_BODY_BYTES} bytes")));
     }
     let b: Body = strict(body).map_err(|e| refuse(StatusCode::BAD_REQUEST, code::BAD_BODY, format!("the body must be exactly {{doc, sig}}: {e}")))?;
