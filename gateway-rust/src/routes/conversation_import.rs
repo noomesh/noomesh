@@ -112,7 +112,7 @@ pub(super) async fn receive(
     // A delegated credential (an agent or a task run acting for the person,
     // `act`) could otherwise file fabricated "user said" lines into that
     // person's memory. Publication is the person's own credential's job: a
-    // login, or a key from the MCP door (pai-voice's publisher holds one).
+    // login, or a key from the MCP door (an add-on's own publisher holds one).
     // Add-on delegated tokens never get here: they are confined to the task
     // routes (addon_delegation::route_allowed).
     if !may_publish(&requester.0) {
