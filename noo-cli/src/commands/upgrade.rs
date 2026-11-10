@@ -2924,7 +2924,7 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
             ui::blank();
             upgrade_self_node(g, &me, &mut failed, &mut pending);
             let waited = if pending.is_empty() { Vec::new() } else { wait_and_settle_nodes(g, &pending, Some(&me), &mut failed) };
-            print_node_outcomes(g, &node_outcome_rows(&[me.clone()], &[], &waited, &failed));
+            print_node_outcomes(g, &node_outcome_rows(std::slice::from_ref(&me), &[], &waited, &failed));
             return Ok(if failed.is_empty() { 0 } else { 1 });
         }
         ui::guide(&[("noo cluster bootstrap-token create --node <name>", "mints the paste that enrolls a first node")]);
