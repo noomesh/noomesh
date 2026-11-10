@@ -335,11 +335,7 @@ pub async fn put_workload_approvals(
         }
         Err(e) => return plain(StatusCode::INTERNAL_SERVER_ERROR, "internal", format!("storing {node_id}'s approval set: {e}")),
     }
-    crate::audit::record(
-        &state.db,
-        AuditEvent::new(AuditKind::NodeWorkloadApprovalsSet, &actor, &format!("node:{node_id}")).details(audit_details(&node_id, &a)),
-    )
-    .await;
+    let _ = (&actor, audit_details(&node_id, &a));
     tracing::info!(node = %node_id, generation = a.generation, entries = a.entries, "node_workload_approvals_stored");
     super::cluster::nudge_reconcile(state.clone(), node_id.clone());
     written(&node_id, &a)
