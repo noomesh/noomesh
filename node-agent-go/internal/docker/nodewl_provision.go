@@ -494,8 +494,8 @@ func (p *NodeWorkloads) checkLeaf(e nodewl.Entry) (leafFiles, error) {
 	}
 	lf := leafFiles{
 		ca:  filepath.Join(dir, "ca.crt"),
-		crt: filepath.Join(addonLeafDir(dir, e.Addon, e.Name), "service.crt"),
-		key: filepath.Join(addonLeafDir(dir, e.Addon, e.Name), "service.key"),
+		crt: filepath.Join(dir, e.Door.Leaf+".crt"),
+		key: filepath.Join(dir, e.Door.Leaf+".key"),
 	}
 	for _, f := range []string{lf.ca, lf.crt, lf.key} {
 		if fi, err := os.Stat(f); err != nil || !fi.Mode().IsRegular() {
