@@ -1086,6 +1086,21 @@ mod tests {
         }
     }
 
+    /// Finding 116: on Linux the harness reads its CA as a systemd credential
+    /// (/run/credentials/noo-harness.service/ca.crt, its NOO_TLS_CA). That
+    /// one file is granted to the CLI, though /run itself never may be.
+    #[test]
+    fn a_ca_in_the_harness_credentials_directory_is_granted_as_one_file() {
+        let ca = "/run/credentials/noo-harness.service/ca.crt";
+        let mut s = spec();
+        s.ca_file = Some(ca.into());
+        let mut fs = base_fs();
+        fs.push((ca, ca, false));
+        let rules = list(&s, "/usr/local/bin/claude", &fs).expect("a credential CA is granted");
+        assert!(rules.iter().any(|r| r.path == std::path::Path::new(ca) && r.access == Access::ReadFile), "{rules:?}");
+        assert!(!rules.iter().any(|r| r.path == std::path::Path::new("/run") || r.path == std::path::Path::new("/run/credentials")), "{rules:?}");
+    }
+
     #[test]
     fn the_ca_is_one_file_never_its_directory() {
         let mut s = spec();

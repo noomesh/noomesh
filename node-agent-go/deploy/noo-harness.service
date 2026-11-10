@@ -22,6 +22,14 @@ Type=simple
 ExecStart=/usr/local/bin/noo-gateway harness
 Restart=always
 RestartSec=30
+# Back off: a harness that cannot start (finding 116: no client certificate,
+# so NATS refused it) retried every 30 s forever. Each restart now waits
+# longer, up to 10 minutes. StartLimitBurst stays 0 on purpose: the agent
+# starts this unit per placement, and a start-limit-hit unit would refuse
+# that start until someone ran reset-failed. systemd < 254 ignores these two
+# keys (with a warning) and keeps the flat 30 s.
+RestartSteps=6
+RestartMaxDelaySec=600
 # A stop drains: the harness takes no new work and gives what it holds
 # NOO_HARNESS_DRAIN_SECS (default 120) to finish; this is that plus 30 s.
 # A kind change restarts the harness (the agent's convergeHarness), and
@@ -31,6 +39,18 @@ TimeoutStopSec=150
 # only the environment. The node's NATS pair and the paths to its PKI live
 # here, rendered by the controller like /etc/noo-node-agent.env.
 EnvironmentFile=-/etc/noo-harness.env
+# The cluster CA and the harness's own pair, as systemd credentials (finding
+# 116): systemd reads them as root at start and exposes them only to this
+# service, in its credentials directory (/run/credentials/noo-harness.service,
+# %d). The harness then needs no access to /etc/noo/pki at all, whose modes
+# stay as they are (0750 root:noo-agent; the harness is in no group but its
+# own, i119). The env file names these paths (provision.rs HARNESS_TLS_*).
+# A file that is missing fails the START, naming this unit, rather than a
+# harness that connects without the CA. Renewed by a restart: the applier
+# restarts the harness when the CA or its pair changes.
+LoadCredential=ca.crt:/etc/noo/pki/ca.crt
+LoadCredential=node.crt:/etc/noo/pki/harness/node.crt
+LoadCredential=node.key:/etc/noo/pki/harness/node.key
 # A dedicated user (an earlier change's reasoning, applied to a process that
 # executes a model's decisions), in a group of its OWN and no other — not
 # noo-agent, not `docker` (root on the host). It was in noo-agent so it

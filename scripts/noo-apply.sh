@@ -452,7 +452,7 @@ env_payload_ok() {
 # the wrong section, a `StandardOutput=file:` that pid 1 opens as root, or a
 # line hidden behind a CR through; an exact match lets nothing through.
 AGENT_UNIT_SHA256="946dede0eb81ab164afb4d61e9000ffc38d550dc0424333ff792c4dc16bf02e4"
-HARNESS_UNIT_SHA256="9c22724a7e290dd1040ad171c046194739434206727daed0cdf46797415cdd40"
+HARNESS_UNIT_SHA256="6ce5d363e5ada9c70635a7c3b5f23002a80796f505ff2a9aac1fda9f531b0e0b"
 unit_payload_ok() {
     _f="$1"; _kind="$2"
     case "$_kind" in
@@ -844,7 +844,10 @@ if [ -f "$WORK/files/ca.crt" ]; then
     if config_unchanged "$WORK/files/ca.crt" "$PKI/ca.crt" 644 root:noo-agent; then
         applied="$applied ca.crt=unchanged"
     else
-        install -m 644 -o root -g noo-agent "$WORK/files/ca.crt"   "$PKI/ca.crt"; chmod 755 /etc/noo "$PKI" 2>/dev/null || true; applied="$applied ca.crt"; need_restart=1
+        # need_harness_restart: the harness reads the CA as a systemd
+        # credential (LoadCredential= in noo-harness.service, finding 116),
+        # which systemd copies at START; a new CA reaches it only on a restart.
+        install -m 644 -o root -g noo-agent "$WORK/files/ca.crt"   "$PKI/ca.crt"; chmod 755 /etc/noo "$PKI" 2>/dev/null || true; applied="$applied ca.crt"; need_restart=1; need_harness_restart=1
     fi
 fi
 # signing-pub — the fleet code-signing PUBLIC key (§3f R26). A public key:
