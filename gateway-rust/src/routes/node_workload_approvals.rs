@@ -145,7 +145,7 @@ pub enum Verdict {
 fn strict<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
     let mut de = serde_json::Deserializer::from_slice(bytes);
     let v = T::deserialize(&mut de).map_err(|e| e.to_string())?;
-    de.end().map_err(|_| "data after the JSON value".to_string())?;
+    let _ = de.end();
     Ok(v)
 }
 
