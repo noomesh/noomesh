@@ -6,6 +6,7 @@
 use super::{AppError, AppResult};
 use crate::{
     auth::{account_of, RequesterCtx},
+    repo::conversations,
     session::{self, ConversationWrite, ConversationWriteError, MessageWrite},
     state::AppState,
 };
@@ -108,19 +109,27 @@ pub(super) async fn receive(
     let requester = requester.ok_or_else(|| {
         AppError::Forbidden("Conversation publication needs a user-bound credential".into())
     })?;
-    import(&state.db, account_of(&requester.0.sub), body.publication)
+    let channel = source_channel(&requester.0);
+    import(&state.db, account_of(&requester.0.sub), &channel, body.publication)
         .await
         .map(Json)
 }
 
-async fn import(db: &PgPool, account: &str, p: Publication) -> Result<Value, AppError> {
+/// The channel label a publication is filed under, from the CREDENTIAL, never
+/// the body: the add-on a delegated token acts for, else the door that minted
+/// it, else "external". Core never names an add-on itself.
+fn source_channel(r: &RequesterCtx) -> String {
+    r.act
+        .as_ref()
+        .map(|a| a.sub.clone())
+        .or_else(|| r.harness.clone())
+        .filter(|c| !c.trim().is_empty())
+        .unwrap_or_else(|| "external".to_string())
+}
+
+async fn import(db: &PgPool, account: &str, channel: &str, p: Publication) -> Result<Value, AppError> {
     validate(&p)?;
-    let active: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM noo_users WHERE username=$1 AND disabled=false)",
-    )
-    .bind(account)
-    .fetch_one(db)
-    .await?;
+    let active = crate::repo::users::is_enabled(db, account).await?;
     if !active {
         return Err(AppError::Forbidden(
             "Publication account is unavailable".into(),
@@ -135,38 +144,23 @@ async fn import(db: &PgPool, account: &str, p: Publication) -> Result<Value, App
         .as_bytes(),
     );
     let mut tx = db.begin().await?;
-    let new_source=sqlx::query("INSERT INTO noo_conversation_sources(user_id,publisher_id,source_id,conversation_id) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")
-        .bind(account).bind(p.publisher_id).bind(p.conversation_id).bind(conversation).execute(&mut *tx).await?.rows_affected()==1;
-    let mut deleted:bool=sqlx::query_scalar("SELECT deleted FROM noo_conversation_sources WHERE user_id=$1 AND publisher_id=$2 AND source_id=$3 FOR UPDATE")
-        .bind(account).bind(p.publisher_id).bind(p.conversation_id).fetch_one(&mut *tx).await?;
+    let new_source = conversations::claim_source(&mut *tx, account, p.publisher_id, p.conversation_id, conversation).await?;
+    let mut deleted = conversations::source_deleted_for_update(&mut *tx, account, p.publisher_id, p.conversation_id).await?;
     if !new_source && !deleted {
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM noo_conversations WHERE id=$1)")
-                .bind(conversation)
-                .fetch_one(&mut *tx)
-                .await?;
         // Noomesh may erase its copy independently. A surviving source ledger
         // must suppress old uploads rather than undo a keep-account erasure.
-        if !exists {
+        if !conversations::exists(&mut *tx, conversation).await? {
             deleted = true;
-            sqlx::query(
-                "UPDATE noo_conversation_sources SET deleted=true WHERE conversation_id=$1",
-            )
-            .bind(conversation)
-            .execute(&mut *tx)
-            .await?;
+            conversations::tombstone_source(&mut *tx, conversation).await?;
         }
     }
     if p.operation == "delete" {
         // The source tombstone survives the conversation: a late/ambiguous
         // append retry cannot recreate deleted speech.
-        sqlx::query("UPDATE noo_conversation_sources SET deleted=true WHERE conversation_id=$1")
-            .bind(conversation)
-            .execute(&mut *tx)
-            .await?;
+        conversations::tombstone_source(&mut *tx, conversation).await?;
         session::delete_conversation_in(&mut tx, conversation, account).await?;
     } else if !deleted {
-        let metadata = json!({"channel":"pai-voice","source_channel":"pai-voice","dialogue_only":true,"external_source":{
+        let metadata = json!({"channel":channel,"source_channel":channel,"dialogue_only":true,"external_source":{
             "publisher_id":p.publisher_id,"conversation_id":p.conversation_id}});
         let source_time = p
             .entry
@@ -237,6 +231,7 @@ impl From<ConversationWriteError> for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repo::conversations::fixtures;
 
     fn entry(publisher: Uuid, conversation: Uuid, id: Uuid, role: &str, words: &str) -> Value {
         json!({"version":1,"publisher_id":publisher,"event_id":Uuid::new_v4(),
@@ -296,29 +291,13 @@ mod tests {
 
     async fn user(db: &PgPool) -> String {
         let user = format!("publication_{}", Uuid::new_v4().simple());
-        sqlx::query("INSERT INTO noo_users(username,hashed_password,org_id) VALUES($1,'unused-test-hash',$2)")
-            .bind(&user).bind(format!("org_{user}")).execute(db).await.unwrap();
+        fixtures::add_user(db, &user, &format!("org_{user}")).await;
         user
     }
 
     async fn cleanup(db: &PgPool, users: &[&str]) {
         for user in users {
-            sqlx::query("DELETE FROM noo_entries WHERE conversation_id IN(SELECT id FROM noo_conversations WHERE user_id=$1)").bind(user).execute(db).await.unwrap();
-            sqlx::query("DELETE FROM noo_conversations WHERE user_id=$1")
-                .bind(user)
-                .execute(db)
-                .await
-                .unwrap();
-            sqlx::query("DELETE FROM noo_conversation_sources WHERE user_id=$1")
-                .bind(user)
-                .execute(db)
-                .await
-                .unwrap();
-            sqlx::query("DELETE FROM noo_users WHERE username=$1")
-                .bind(user)
-                .execute(db)
-                .await
-                .unwrap();
+            fixtures::remove_user(db, user).await;
         }
     }
 
@@ -334,7 +313,7 @@ mod tests {
         let id = Uuid::new_v4();
         let words = "Query new mash. Keep 42; <b>verbatim</b> 🌍";
         let event = entry(publisher, source, id, "user", words);
-        let first = import(&db, &a, serde_json::from_value(event.clone()).unwrap())
+        let first = import(&db, &a, "external", serde_json::from_value(event.clone()).unwrap())
             .await
             .unwrap();
         session::update_conversation_metadata(
@@ -344,29 +323,20 @@ mod tests {
         )
         .await
         .unwrap();
-        let repeated = import(&db, &a, serde_json::from_value(event.clone()).unwrap())
+        let repeated = import(&db, &a, "external", serde_json::from_value(event.clone()).unwrap())
             .await
             .unwrap();
         assert_eq!(first, repeated);
         let conv = Uuid::parse_str(first["conversation_id"].as_str().unwrap()).unwrap();
-        let actual: (String, String, i32) = sqlx::query_as(
-            "SELECT user_id,org_id,total_messages FROM noo_conversations WHERE id=$1",
-        )
-        .bind(conv)
-        .fetch_one(&db)
-        .await
-        .unwrap();
+        let row = fixtures::conversation(&db, conv).await;
+        let actual = (row.user_id.clone().unwrap_or_default(), row.org_id.clone(), row.total_messages);
         assert_eq!(actual, (a.clone(), format!("org_{a}"), 1));
-        let raw: (String, String, Value) = sqlx::query_as(
-            "SELECT type,content,metadata FROM noo_entries WHERE conversation_id=$1",
-        )
-        .bind(conv)
-        .fetch_one(&db)
-        .await
-        .unwrap();
+        let rows = fixtures::entries(&db, conv).await;
+        assert_eq!(rows.len(), 1, "exactly one entry");
+        let raw = rows[0].clone();
         assert_eq!((raw.0.as_str(), raw.1.as_str()), ("user", words));
         assert_eq!(raw.2["source"]["start_ms"], 80);
-        let other = import(&db, &b, serde_json::from_value(event.clone()).unwrap())
+        let other = import(&db, &b, "external", serde_json::from_value(event.clone()).unwrap())
             .await
             .unwrap();
         assert_ne!(first["conversation_id"], other["conversation_id"]);
@@ -377,16 +347,10 @@ mod tests {
             "assistant",
             "I connected!",
         );
-        import(&db, &a, serde_json::from_value(assistant).unwrap())
+        import(&db, &a, "external", serde_json::from_value(assistant).unwrap())
             .await
             .unwrap();
-        let verified: Value = sqlx::query_scalar(
-            "SELECT metadata FROM noo_entries WHERE conversation_id=$1 AND type='assistant'",
-        )
-        .bind(conv)
-        .fetch_one(&db)
-        .await
-        .unwrap();
+        let verified: Value = fixtures::entries(&db, conv).await.into_iter().find(|e| e.0 == "assistant").expect("an assistant entry").2;
         assert_eq!(verified["evidence"], "assistant_dialogue");
         assert_eq!(verified["verified_action"], false);
         // A native turn uses the same counter and retains adapter provenance.
@@ -400,13 +364,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let before: (DateTime<Utc>, i32, Value) = sqlx::query_as(
-            "SELECT started_at,total_messages,metadata FROM noo_conversations WHERE id=$1",
-        )
-        .bind(conv)
-        .fetch_one(&db)
-        .await
-        .unwrap();
+        let before = { let r = fixtures::conversation(&db, conv).await; (r.started_at, r.total_messages, r.metadata) };
         assert_eq!(before.1, 3);
         assert_eq!(before.2["channel"], "reviewed-dialogue");
         assert_eq!(before.2["operator_label"], "project/alpha");
@@ -424,57 +382,32 @@ mod tests {
                 _ => json!(0),
             };
             assert!(matches!(
-                import(&db, &a, serde_json::from_value(changed).unwrap()).await,
+                import(&db, &a, "external", serde_json::from_value(changed).unwrap()).await,
                 Err(AppError::Conflict(_))
             ));
         }
-        let after: (DateTime<Utc>, i32, Value) = sqlx::query_as(
-            "SELECT started_at,total_messages,metadata FROM noo_conversations WHERE id=$1",
-        )
-        .bind(conv)
-        .fetch_one(&db)
-        .await
-        .unwrap();
+        let after = { let r = fixtures::conversation(&db, conv).await; (r.started_at, r.total_messages, r.metadata) };
         assert_eq!(before, after);
         let deletion = json!({"version":1,"publisher_id":publisher,"event_id":Uuid::new_v4(),"conversation_id":source,"operation":"delete"});
-        let receipt = import(&db, &a, serde_json::from_value(deletion.clone()).unwrap())
+        let receipt = import(&db, &a, "external", serde_json::from_value(deletion.clone()).unwrap())
             .await
             .unwrap();
         assert_eq!(receipt["status"], "deleted");
-        import(&db, &a, serde_json::from_value(deletion).unwrap())
+        import(&db, &a, "external", serde_json::from_value(deletion).unwrap())
             .await
             .unwrap();
-        let late = import(&db, &a, serde_json::from_value(event).unwrap())
+        let late = import(&db, &a, "external", serde_json::from_value(event).unwrap())
             .await
             .unwrap();
         assert_eq!(late["status"], "suppressed");
-        let remaining: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM noo_entries WHERE conversation_id=$1")
-                .bind(conv)
-                .fetch_one(&db)
-                .await
-                .unwrap();
+        let remaining = fixtures::entries(&db, conv).await.len();
         assert_eq!(remaining, 0);
         let other_conv = Uuid::parse_str(other["conversation_id"].as_str().unwrap()).unwrap();
-        let other_remaining: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM noo_entries WHERE conversation_id=$1")
-                .bind(other_conv)
-                .fetch_one(&db)
-                .await
-                .unwrap();
+        let other_remaining = fixtures::entries(&db, other_conv).await.len();
         assert_eq!(other_remaining, 1);
-        sqlx::query("DELETE FROM noo_entries WHERE conversation_id=$1")
-            .bind(other_conv)
-            .execute(&db)
-            .await
-            .unwrap();
-        sqlx::query("DELETE FROM noo_conversations WHERE id=$1")
-            .bind(other_conv)
-            .execute(&db)
-            .await
-            .unwrap();
+        fixtures::erase_conversation(&db, other_conv).await;
         let retry = entry(publisher, source, id, "user", words);
-        let suppressed = import(&db, &b, serde_json::from_value(retry).unwrap())
+        let suppressed = import(&db, &b, "external", serde_json::from_value(retry).unwrap())
             .await
             .unwrap();
         assert_eq!(suppressed["status"], "suppressed");
@@ -494,12 +427,7 @@ mod tests {
         session::save_message(&db, &source, "user", "system origin", None, None)
             .await
             .unwrap();
-        let anonymous: (Option<String>, String) =
-            sqlx::query_as("SELECT user_id,org_id FROM noo_conversations WHERE id=$1")
-                .bind(conv)
-                .fetch_one(&db)
-                .await
-                .unwrap();
+        let anonymous = { let r = fixtures::conversation(&db, conv).await; (r.user_id, r.org_id) };
         assert_eq!(anonymous, (None, "default".into()));
         let metadata = json!({"tool_calls": [{"name":"example"}]});
         session::save_message(
@@ -515,21 +443,10 @@ mod tests {
         session::save_message(&db, &source, "user", "later", None, Some(&b))
             .await
             .unwrap();
-        let owner: (String, String, i32) = sqlx::query_as(
-            "SELECT user_id,org_id,total_messages FROM noo_conversations WHERE id=$1",
-        )
-        .bind(conv)
-        .fetch_one(&db)
-        .await
-        .unwrap();
+        let row = fixtures::conversation(&db, conv).await;
+        let owner = (row.user_id.clone().unwrap_or_default(), row.org_id.clone(), row.total_messages);
         assert_eq!(owner, (a.clone(), format!("org_{a}"), 3));
-        let stored: Value = sqlx::query_scalar(
-            "SELECT metadata FROM noo_entries WHERE conversation_id=$1 AND type='assistant'",
-        )
-        .bind(conv)
-        .fetch_one(&db)
-        .await
-        .unwrap();
+        let stored: Value = fixtures::entries(&db, conv).await.into_iter().find(|e| e.0 == "assistant").expect("an assistant entry").2;
         assert_eq!(stored, metadata);
         cleanup(&db, &[&a, &b]).await;
         db.close().await;
@@ -546,29 +463,23 @@ mod tests {
         let ending = json!({"version":1,"publisher_id":publisher,"event_id":Uuid::new_v4(),
             "conversation_id":source,"operation":"session_end","session_id":"voice-session",
             "ended_at":"2026-10-18T12:01:00Z","end_reason":"user_stop","transcription":"complete"});
-        let receipt = import(&db, &a, serde_json::from_value(ending.clone()).unwrap())
+        let receipt = import(&db, &a, "external", serde_json::from_value(ending.clone()).unwrap())
             .await
             .unwrap();
         let conv = Uuid::parse_str(receipt["conversation_id"].as_str().unwrap()).unwrap();
         let event = entry(publisher, source, Uuid::new_v4(), "user", "before ending");
-        import(&db, &a, serde_json::from_value(event).unwrap())
+        import(&db, &a, "external", serde_json::from_value(event).unwrap())
             .await
             .unwrap();
-        import(&db, &a, serde_json::from_value(ending.clone()).unwrap())
+        import(&db, &a, "external", serde_json::from_value(ending.clone()).unwrap())
             .await
             .unwrap();
         let mut earlier = ending;
         earlier["ended_at"] = json!("2026-10-18T12:00:30Z");
-        import(&db, &a, serde_json::from_value(earlier).unwrap())
+        import(&db, &a, "external", serde_json::from_value(earlier).unwrap())
             .await
             .unwrap();
-        let actual: (DateTime<Utc>, DateTime<Utc>, i32, Value) = sqlx::query_as(
-            "SELECT started_at,ended_at,total_messages,metadata FROM noo_conversations WHERE id=$1",
-        )
-        .bind(conv)
-        .fetch_one(&db)
-        .await
-        .unwrap();
+        let actual = { let r = fixtures::conversation(&db, conv).await; (r.started_at, r.ended_at.expect("ended"), r.total_messages, r.metadata) };
         assert_eq!(actual.0.to_rfc3339(), "2026-10-18T12:00:00+00:00");
         assert_eq!(actual.1.to_rfc3339(), "2026-10-18T12:01:00+00:00");
         assert_eq!(actual.2, 1);
@@ -610,38 +521,22 @@ mod tests {
             "conversation_id":source,"operation":"delete"});
         for event in [append, ending, deletion] {
             assert!(matches!(
-                import(&db, &a, serde_json::from_value(event).unwrap()).await,
+                import(&db, &a, "external", serde_json::from_value(event).unwrap()).await,
                 Err(AppError::Conflict(_))
             ));
-            let ledger: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM noo_conversation_sources WHERE conversation_id=$1",
-            )
-            .bind(conv)
-            .fetch_one(&db)
-            .await
-            .unwrap();
+            let ledger = fixtures::source_rows(&db, conv).await;
             assert_eq!(
                 ledger, 0,
                 "source bookkeeping must roll back on writer conflicts"
             );
         }
-        let actual: (String, i32, Value) = sqlx::query_as(
-            "SELECT user_id,total_messages,metadata FROM noo_conversations WHERE id=$1",
-        )
-        .bind(conv)
-        .fetch_one(&db)
-        .await
-        .unwrap();
+        let actual = { let r = fixtures::conversation(&db, conv).await; (r.user_id.unwrap_or_default(), r.total_messages, r.metadata) };
         assert_eq!(actual, (b.clone(), 1, json!({})));
-        sqlx::query("UPDATE noo_users SET disabled=true WHERE username=$1")
-            .bind(&a)
-            .execute(&db)
-            .await
-            .unwrap();
+        fixtures::disable_user(&db, &a).await;
         let event = entry(publisher, source, Uuid::new_v4(), "user", "disabled user");
         for account in [&a, "nonexistent-publication-user"] {
             assert!(matches!(
-                import(&db, account, serde_json::from_value(event.clone()).unwrap()).await,
+                import(&db, account, "external", serde_json::from_value(event.clone()).unwrap()).await,
                 Err(AppError::Forbidden(_))
             ));
         }
