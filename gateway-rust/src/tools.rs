@@ -1338,7 +1338,14 @@ async fn native_inference_tool(state: &AppState, call: &ToolCall, args: &Value) 
             NodeChat::Serves(backend_type, model_name, base_url) => {
                 let model_used = if node_from_model { model_name } else { model.clone().unwrap_or(model_name) };
                 match inf::chat_completion_on_node(&backend_type, &model_used, &base_url, &prompt, inf::Sampling::default()).await {
-                    Ok(text) => return ok_result(call, text),
+                    Ok(inf::ChatAnswer::Text(text)) => return ok_result(call, text),
+                    // Answered with nothing: an error saying why, never an
+                    // empty success (120).
+                    Ok(inf::ChatAnswer::Empty { finish_reason, reasoning }) => return err_result(
+                        call,
+                        inf::empty_answer_body(finish_reason.as_deref(), reasoning.as_deref())["error"]
+                            .as_str().unwrap_or("the model returned an empty answer").to_string(),
+                    ),
                     Err(e) if strict && inf::backend_cannot_chat(&e) => return err_result(
                         call,
                         inf::no_chat_refusal(node_id, &[(backend_type.clone(), model_used.clone())], &[]),
