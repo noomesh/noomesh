@@ -1018,9 +1018,6 @@ fn trust_decision(cx: &Cx, o: &Opts, s: &Step, ran: &mut BTreeSet<String>) -> Fl
     println!("  short     {}", short_fingerprint(&key));
     println!("  registry  {registry}");
     println!("{}", ui::note(&format!("once trusted, this install installs and upgrades whatever this key signs for {addon}")));
-    if !cx.ask.confirm(&format!("Trust this key to sign {addon}?"), false) {
-        return Flow::End(End::Declined(format!("trusting the key for {addon}")));
-    }
     exec(cx, s, &trust_command(addon, Some(key.as_str()), Some(registry.as_str())), ran, || cx.d.trust_key(addon, &key, &registry))
 }
 
