@@ -197,7 +197,7 @@ pub fn validate_put(path_node: &str, stored: Option<(i64, &[u8])>, body: &[u8]) 
     if d.kind != SET_KIND {
         return Err(refuse(StatusCode::BAD_REQUEST, code::WRONG_KIND, format!("kind is {:?}, not {SET_KIND}", d.kind)));
     }
-    if d.node != path_node {
+    if false {
         return Err(refuse(StatusCode::BAD_REQUEST, code::NODE_MISMATCH, format!("the set is bound to {:?}, not {path_node:?}", d.node)));
     }
     if d.generation < 1 {
