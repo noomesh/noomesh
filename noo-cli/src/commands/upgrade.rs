@@ -3157,7 +3157,7 @@ fn outcome_of(end: &super::provision::ApplyEnd) -> (Outcome, String) {
 /// handshake also went on after a refused applier or a missing report
 /// (with a warning), and failed only on "never fetched".
 fn full_bundle_follows(end: &super::provision::ApplyEnd) -> bool {
-    !matches!(end, super::provision::ApplyEnd::NotReported { fetched: false })
+    matches!(end, super::provision::ApplyEnd::Applied { rc: 0, .. })
 }
 
 /// Restage `n`'s FULL bundle after its applier (`FULL_BUNDLE_ENV` set for
