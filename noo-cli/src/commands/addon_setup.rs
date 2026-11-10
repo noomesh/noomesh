@@ -924,7 +924,7 @@ fn base_of(id: &str) -> &str {
 /// placement waits for its node's consent (the gateway refuses it before),
 /// and an unreadable bundle behind a refused login is the login.
 fn next_open(steps: &[Step]) -> Option<usize> {
-    let i = steps.iter().position(|s| s.state != State::Done)?;
+    let i = steps.iter().position(|s| s.state != State::Done || s.id == "reserve")?;
     let s = &steps[i];
     if s.id == "bundle" && s.state == State::Blocked {
         if let Some(j) = steps.iter().position(|x| x.id == "registry-login") {
