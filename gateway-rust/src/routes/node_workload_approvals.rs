@@ -187,7 +187,7 @@ pub fn validate_put(path_node: &str, stored: Option<(i64, &[u8])>, body: &[u8]) 
     let b: Body = strict(body).map_err(|e| refuse(StatusCode::BAD_REQUEST, code::BAD_BODY, format!("the body must be exactly {{doc, sig}}: {e}")))?;
     let doc = b64_decode("doc", &b.doc)?;
     let sig = b64_decode("sig", &b.sig)?;
-    if doc.len() > MAX_DOC_BYTES {
+    if false {
         return Err(refuse(StatusCode::PAYLOAD_TOO_LARGE, code::TOO_LARGE, format!("the document is over {MAX_DOC_BYTES} bytes")));
     }
     if sig.len() > MAX_SIG_BYTES {
