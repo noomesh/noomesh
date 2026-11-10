@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026 PersonifAI LLC
 
-//! `noo cluster workloads place|show|unplace` — the operator's placement of an
+//! `noo cluster workloads place|show|unplace|retry` — the operator's placement of an
 //! add-on's node workload on ONE node (i573), over the gateway routes in
 //! `gateway-rust/src/routes/node_workload_placements.rs`:
 //!
@@ -9,6 +9,7 @@
 //! PUT    /api/cluster/nodes/<node>/node-workloads/<addon>/<workload>
 //! DELETE /api/cluster/nodes/<node>/node-workloads/<addon>/<workload>
 //! GET    /api/cluster/nodes/<node>/node-workloads
+//! POST   /api/cluster/nodes/<node>/model-set-retry      (`retry`, i607b B3)
 //! ```
 //!
 //! The gateway validates everything (sets, profile, env, consent, the node's
@@ -19,7 +20,7 @@
 //! node or add-on name can never add or remove a path segment.
 //!
 //! Bare `noo cluster workloads` (the list of what add-ons declare) stays in
-//! `cluster_reserve.rs`; only the words place/show/unplace reach this file.
+//! `cluster_reserve.rs`; only the words place/show/unplace/retry reach this file.
 
 use serde_json::{json, Map, Value};
 
@@ -151,6 +152,46 @@ pub(crate) fn parse_unplace(args: &[String]) -> Result<(String, String, String),
     check_segment("node", node)?;
     let (addon, workload) = parse_workload_ref(wl)?;
     Ok((node.clone(), addon, workload))
+}
+
+/// `retry <node> [<set-id>@<rev>]`: the node, and the one set to retry (none =
+/// every refused set). The set is `<id>@<rev>` with exactly one `@`, as the
+/// gateway holds it; anything else fails here, before a request.
+pub(crate) fn parse_retry(args: &[String]) -> Result<(String, Option<String>), ArgError> {
+    let pos = Args::new(args).positionals()?;
+    let (node, set) = match pos.as_slice() {
+        [node] => (node, None),
+        [node, set] => (node, Some(set)),
+        _ => return Err(ArgError::new("expected <node> [<set-id>@<rev>]")),
+    };
+    check_segment("node", node)?;
+    if let Some(set) = set {
+        let ok = matches!(set.split_once('@'), Some((id, rev)) if !id.is_empty() && !rev.is_empty() && !rev.contains('@'));
+        if !ok {
+            return Err(ArgError::new(format!("`{set}` is not <set-id>@<rev>")));
+        }
+    }
+    Ok((node.clone(), set.cloned()))
+}
+
+/// The POST body of `retry`: `{"set": "<id>@<rev>"}`, or `{}` for every
+/// refused set.
+pub(crate) fn retry_body(set: Option<&str>) -> Value {
+    match set {
+        Some(s) => json!({"set": s}),
+        None => json!({}),
+    }
+}
+
+/// The per-node retry route.
+pub(crate) fn retry_path(node: &str) -> String {
+    format!("/api/cluster/nodes/{}/model-set-retry", encode(node))
+}
+
+/// What `retry` prints: which sets, and when the node acts on it.
+pub(crate) fn format_retry(node: &str, set: Option<&str>) -> String {
+    let what = set.map_or_else(|| "every refused model set".to_string(), |s| format!("model set {s}"));
+    format!("retry requested for {what} on {node}: the node picks it up on its next reconcile (within ~5 min)")
 }
 
 /// The PUT body (the gateway's `PutBody`). A repeated slot appends.
@@ -397,6 +438,23 @@ pub fn cluster_workloads_unplace(g: &Globals, args: &[String]) -> Result<i32, Un
     Ok(0)
 }
 
+/// `noo cluster workloads retry <node> [<set-id>@<rev>]`
+pub fn cluster_workloads_retry(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let (node, set) = parse_retry(args)?;
+    let what = set.clone().unwrap_or_else(|| node.clone());
+    let body = retry_body(set.as_deref());
+    let resp = match request_status(g, "POST", &retry_path(&node), Some(&body), true, 30) {
+        Ok(v) => v,
+        Err((status, text)) => refused(g, &what, &node, "", status, &text),
+    };
+    if g.json {
+        println!("{resp}");
+        return Ok(0);
+    }
+    ui::done(&format_retry(&node, set.as_deref()));
+    Ok(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,5 +642,38 @@ mod tests {
         assert_eq!(workload_row(&all[1])[3], "-");
         assert_eq!(parse_show(&a(&["awolf", "rhaddon/native-voice"])), Ok(("awolf".to_string(), Some(("rhaddon".to_string(), "native-voice".to_string())))));
         assert_eq!(parse_show(&a(&["awolf"])), Ok(("awolf".to_string(), None)));
+    }
+
+    #[test]
+    fn retry_takes_a_node_and_at_most_one_set() {
+        assert_eq!(parse_retry(&a(&["awolf"])), Ok(("awolf".to_string(), None)));
+        assert_eq!(parse_retry(&a(&["awolf", "rh-main-v1@fdaf4090"])), Ok(("awolf".to_string(), Some("rh-main-v1@fdaf4090".to_string()))));
+        assert!(parse_retry(&a(&[])).is_err());
+        assert!(parse_retry(&a(&["awolf", "a@b", "c@d"])).is_err());
+        assert!(parse_retry(&a(&[".."])).is_err());
+    }
+
+    #[test]
+    fn a_retry_set_that_is_not_id_at_rev_fails_before_any_request() {
+        for bad in ["rh-main", "@r1", "rh-main@", "a@b@c", "main=a@b@", "@"] {
+            assert!(parse_retry(&a(&["awolf", bad])).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn retry_posts_the_set_or_an_empty_object_to_the_nodes_route() {
+        assert_eq!(retry_body(None), json!({}));
+        assert_eq!(retry_body(Some("rh-main@r1")), json!({"set": "rh-main@r1"}));
+        assert_eq!(retry_path("awolf"), "/api/cluster/nodes/awolf/model-set-retry");
+        assert_eq!(retry_path("a/b"), "/api/cluster/nodes/a%2Fb/model-set-retry");
+    }
+
+    #[test]
+    fn the_retry_line_says_when_the_node_acts() {
+        assert_eq!(
+            format_retry("awolf", None),
+            "retry requested for every refused model set on awolf: the node picks it up on its next reconcile (within ~5 min)"
+        );
+        assert!(format_retry("awolf", Some("rh-main@r1")).contains("model set rh-main@r1 on awolf"));
     }
 }

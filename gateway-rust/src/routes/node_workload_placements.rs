@@ -303,7 +303,7 @@ fn plain(status: StatusCode, code: &str, detail: impl Into<String>) -> Response 
     (status, Json(json!({"error": code, "detail": detail.into()}))).into_response()
 }
 
-async fn node_record(state: &AppState, node_id: &str) -> Result<Option<Value>, String> {
+pub(super) async fn node_record(state: &AppState, node_id: &str) -> Result<Option<Value>, String> {
     let kv = state.js.get_key_value("mesh_nodes").await.map_err(|e| format!("mesh_nodes: {e}"))?;
     let entry = kv.get(node_id).await.map_err(|e| format!("mesh_nodes {node_id}: {e}"))?;
     Ok(entry.and_then(|b| serde_json::from_slice::<Value>(&b).ok()))

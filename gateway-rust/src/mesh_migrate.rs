@@ -2332,6 +2332,24 @@ ALTER TABLE noo_seats ADD COLUMN IF NOT EXISTS display jsonb;
 ALTER TABLE noo_seats ADD COLUMN IF NOT EXISTS display_set_by text;
 ALTER TABLE noo_seats ADD COLUMN IF NOT EXISTS display_set_at timestamptz
 "#,
+}, Migration {
+    revision: NODE_MODEL_SET_RETRY_REVISION,
+    down_revision: Some(SEAT_DISPLAY_REVISION),
+    // i607b B3: the per-node `retry now` epoch for a refused model-set fetch.
+    // desired-config serves it as the top-level `model_set_retry`; the agent
+    // clears its refused backoff when the epoch moves past the one it saw.
+    // A table of its own, additive: a bump never touches a placement row. The
+    // epoch only goes up (the upsert adds one), and it lives here so a
+    // gateway restart cannot send it back to 0.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS noo_node_model_set_retry (
+    node_id text PRIMARY KEY,
+    epoch bigint NOT NULL DEFAULT 0,
+    sets jsonb NOT NULL DEFAULT '[]'::jsonb,
+    updated_by text,
+    updated_at timestamptz NOT NULL DEFAULT now()
+)
+"#,
 }];
 
 /// Add-on feature settings and the super-admin flag (f99). A constant so a
@@ -2364,6 +2382,10 @@ pub const SEAT_BINDING_REVISION: &str = "112_seat_binding";
 /// Display settings the controller sets for a kiosk seat (i510 c1). A
 /// constant so a renumber at rebase is one line.
 pub const SEAT_DISPLAY_REVISION: &str = "113_seat_display";
+
+/// The per-node model-set `retry now` epoch (i607b B3), on seat display
+/// (113). A constant so a renumber at rebase is one line.
+pub const NODE_MODEL_SET_RETRY_REVISION: &str = "114_node_model_set_retry";
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
 /// constant so a renumber at rebase is one line.
@@ -3940,17 +3962,37 @@ mod seat_binding_migration_tests {
 mod seat_display_migration_tests {
     use super::*;
 
-    /// i510 c1: the seat-display revision is the chain head, sits on seat
-    /// binding, and only adds nullable columns.
+    /// i510 c1: the seat-display revision sits on seat binding, and only
+    /// adds nullable columns.
     #[test]
     fn seat_display_revision_is_the_head_and_additive() {
         let m = MIGRATIONS.iter().find(|m| m.revision == SEAT_DISPLAY_REVISION).expect("must be in the chain");
         assert_eq!(m.revision, "113_seat_display");
         assert_eq!(m.down_revision, Some(SEAT_BINDING_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(SEAT_DISPLAY_REVISION), "the chain head");
         for col in ["display jsonb", "display_set_by text", "display_set_at timestamptz"] {
             assert!(m.sql.contains(&format!("ADD COLUMN IF NOT EXISTS {col}")), "{col}");
         }
         assert!(!m.sql.contains("DELETE") && !m.sql.contains("UPDATE") && !m.sql.contains("DROP"));
+    }
+}
+
+#[cfg(test)]
+mod node_model_set_retry_migration_tests {
+    use super::*;
+
+    /// i607b B3: the retry-epoch revision is the chain head, sits on seat
+    /// display, and only creates its own table.
+    #[test]
+    fn node_model_set_retry_revision_is_the_head_and_additive() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == NODE_MODEL_SET_RETRY_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "114_node_model_set_retry");
+        assert_eq!(m.down_revision, Some(SEAT_DISPLAY_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(NODE_MODEL_SET_RETRY_REVISION), "the chain head");
+        assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_node_model_set_retry"));
+        assert!(!m.sql.contains("DELETE") && !m.sql.contains("UPDATE") && !m.sql.contains("DROP") && !m.sql.contains("ALTER"));
+        let writer = include_str!("repo/node_model_set_retry.rs");
+        for col in ["node_id", "epoch", "sets", "updated_by"] {
+            assert!(m.sql.contains(col) && writer.contains(col), "{col}");
+        }
     }
 }

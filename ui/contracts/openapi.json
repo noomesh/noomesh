@@ -22123,6 +22123,40 @@
           }
         }
       }
+    },
+    "/api/cluster/nodes/{node_id}/model-set-retry": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create model set retry",
+        "description": "[native] POST /api/cluster/nodes/{node_id}/model-set-retry",
+        "operationId": "retry_model_set",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

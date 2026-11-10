@@ -97,6 +97,8 @@ pub fn router() -> Router<Arc<AppState>> {
             put(super::node_workload_placements::put_placement).delete(super::node_workload_placements::delete_placement),
         )
         .route("/api/cluster/nodes/{node_id}/node-workloads", get(super::node_workload_placements::list_placements))
+        // i607b B3: `retry now` for a refused model-set fetch (operator only).
+        .route("/api/cluster/nodes/{node_id}/model-set-retry", post(super::model_set_retry::retry_model_set))
         .route("/api/cluster/nodes/{node_id}/fit", post(placement_fit_post))
         // ── Model classes ──
         .route("/api/cluster/model-classes", get(model_classes_get))
@@ -3928,6 +3930,10 @@ async fn desired_config_get(
     if let Some(nw) = node_workloads {
         body["node_workloads"] = Value::Array(nw);
     }
+    // i607b B3: the node's `retry now` epoch, a TOP-LEVEL key on purpose (the
+    // `node_workloads` fragment is decoded strictly by the agent, a new field
+    // inside it would make an old agent refuse). Omitted at epoch 0.
+    super::model_set_retry::apply(&mut body, super::model_set_retry::retry_for(&state, &node_id).await.as_ref());
     Ok(Json(body))
 }
 

@@ -557,6 +557,32 @@ become a fact (the i495 rule). A `null` is never sent.
 
 `heartbeat-i300.json` is the example.
 
+## Retrying a refused model set (`model_set_retry`)
+
+A refused set is retried after 30 minutes (in memory on the agent). To end that
+wait, the operator runs `noo cluster workloads retry <node> [<set-id>@<rev>]`.
+The gateway bumps the node's retry epoch (a monotonic integer, stored in
+`noo_node_model_set_retry`, so it survives a gateway restart) and desired-config
+carries:
+
+```
+"model_set_retry": {"epoch": 3, "sets": ["rh-main-v1@fdaf4090"]}
+```
+
+- **Top level, never inside `node_workloads`.** The agent decodes desired-config
+  leniently at the top level (an old agent ignores the key) but decodes the
+  `node_workloads` fragment and its entries strictly, so a new field inside them
+  would make an old agent refuse with `desired_invalid`.
+- Omitted while the epoch is 0. An empty `sets` means every refused set.
+- The agent keeps the last epoch it applied, in memory. When the epoch is past
+  it, the agent resets the refused entries (the named ones, or all) and runs its
+  fetch pass; it then records the epoch. The same or a lower epoch does nothing.
+  After an agent restart the last epoch is 0, so a stored epoch above 0 clears
+  once more; a restart has already emptied the backoff, so that finds nothing.
+- Only refused sets are cleared. A verified or fetching set is not touched, and
+  a retry never changes which sets or workloads are placed.
+- Latency: the node's next desired-config reconcile (within about 5 minutes).
+
 ## Reasons
 
 The agent's fixed vocabulary for the `reason` of a `node_workloads` or
