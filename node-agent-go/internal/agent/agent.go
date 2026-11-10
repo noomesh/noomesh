@@ -408,6 +408,7 @@ func (a *Agent) Run() error {
 	rec := reconcile.New(a.cfg, a.docker, a.http, a.harness)
 	a.harnessKind = rec.HarnessRunningKind
 	a.hb.SetModelSets(rec.ModelSetsReport)
+	a.hb.SetModelSetsFreeBytes(rec.ModelSetsFreeBytes)
 	a.hb.SetNodeFacts(rec.NodeFacts)
 	if mc := rec.NodeWorkloadControl(); mc != nil {
 		a.server.SetManagedWorkloads(mc)

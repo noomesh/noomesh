@@ -66,3 +66,40 @@ func TestHeartbeatOmitsModelSetsWhenUnknown(t *testing.T) {
 		t.Fatal("model_sets lingered after the state became unknown")
 	}
 }
+
+// i607b: `model_sets_free_bytes` is the free space of the filesystem the
+// agent's disk check reads. Sent when known (0 included), omitted otherwise.
+func TestHeartbeatModelSetsFreeBytes(t *testing.T) {
+	srv, cap := captureServer(t)
+	gpu := &scriptedGPU{model: "RTX 4090", vram: 24, count: 1}
+	r := newReporterWith(srv.URL, gpu, func() (map[string]string, error) { return map[string]string{}, nil })
+
+	r.SendHeartbeat()
+	if _, ok := cap.last(&cap.beats)["model_sets_free_bytes"]; ok {
+		t.Fatal("an unwired reporter sent model_sets_free_bytes")
+	}
+
+	r.SetModelSetsFreeBytes(func() (int64, bool) { return 0, false })
+	r.SendHeartbeat()
+	if v, ok := cap.last(&cap.beats)["model_sets_free_bytes"]; ok {
+		t.Fatalf("an unknown value sent model_sets_free_bytes = %v", v)
+	}
+
+	r.SetModelSetsFreeBytes(func() (int64, bool) { return 9_000_000_000, true })
+	r.SetModelSets(func() any { return nil }) // independent of model_sets
+	r.SendHeartbeat()
+	beat := cap.last(&cap.beats)
+	if v, ok := beat["model_sets_free_bytes"].(float64); !ok || v != 9_000_000_000 {
+		t.Fatalf("model_sets_free_bytes = %v", beat["model_sets_free_bytes"])
+	}
+	if _, ok := beat["model_sets"]; ok {
+		t.Fatal("model_sets sent while unreadable")
+	}
+
+	// A full disk is a fact, not an unknown.
+	r.SetModelSetsFreeBytes(func() (int64, bool) { return 0, true })
+	r.SendHeartbeat()
+	if v, ok := cap.last(&cap.beats)["model_sets_free_bytes"].(float64); !ok || v != 0 {
+		t.Fatalf("a full disk reported %v", cap.last(&cap.beats)["model_sets_free_bytes"])
+	}
+}

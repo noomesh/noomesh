@@ -298,6 +298,9 @@ enum BeatShape {
     Str,
     Bool,
     Num,
+    /// A whole number, zero or more (a byte count). A negative, a fraction
+    /// or a string is unknown.
+    NonNegInt,
     OneOf(&'static [&'static str]),
     /// A list of objects, at most this many.
     Objects(usize),
@@ -315,6 +318,10 @@ const I300_BEAT_KEYS: &[(&str, BeatShape)] = &[
     ("nvidia_driver_caps_ok", BeatShape::Bool),
     ("controller_host", BeatShape::Bool),
     ("data_root_free_gb", BeatShape::Num),
+    // i607b: free bytes of the filesystem the agent's model-set disk check
+    // reads (<models dir>/sets). Placement prefers it to data_root_free_gb.
+    // An old gateway drops it, and the preflight then falls back.
+    ("model_sets_free_bytes", BeatShape::NonNegInt),
     ("addon_workloads_policy", BeatShape::OneOf(&["none", "approve", "auto"])),
     ("addon_workloads_approvals", BeatShape::Objects(256)),
     ("model_sets", BeatShape::Objects(256)),
@@ -326,6 +333,7 @@ fn beat_shape_ok(v: &Value, shape: BeatShape) -> bool {
         BeatShape::Str => v.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 64),
         BeatShape::Bool => v.is_boolean(),
         BeatShape::Num => v.as_f64().is_some_and(f64::is_finite),
+        BeatShape::NonNegInt => v.as_u64().is_some_and(|n| n <= i64::MAX as u64),
         BeatShape::OneOf(allowed) => v.as_str().is_some_and(|s| allowed.contains(&s)),
         BeatShape::Objects(max) => v
             .as_array()
@@ -8422,9 +8430,14 @@ mod i300_beat_tests {
             "nvidia_driver_caps_ok": true,
             "controller_host": false,
             "data_root_free_gb": 412.5,
+            "model_sets_free_bytes": 442_986_717_184u64,
             "addon_workloads_policy": "approve",
             "addon_workloads_approvals": [{"addon": "rhaddon", "digest": format!("sha256:{}", "a".repeat(64))}],
-            "model_sets": [{"id": "rh-voice", "revision": "r1", "state": "verified"}],
+            "model_sets": [
+                {"id": "rh-voice", "revision": "r1", "state": "verified", "bytes_total": 8_000_000_000u64},
+                {"id": "rh-stt", "revision": "r2", "state": "fetching", "bytes_done": 0, "bytes_total": 3_000_000_000u64},
+                {"id": "rh-tts", "revision": "r3", "state": "refused", "reason": "disk", "retry_at": "2026-11-09T14:32:00Z", "free_bytes": 4_500_000_000u64, "need_bytes": 9_600_000_000u64},
+            ],
             "node_workloads": [{"addon": "rhaddon", "name": "worker", "state": "provisioned", "ready": false, "door_port": 41001}],
         })
     }
@@ -8449,6 +8462,7 @@ mod i300_beat_tests {
             "os": "",
             "nvidia_runtime": "yes",
             "data_root_free_gb": "lots",
+            "model_sets_free_bytes": -1,
             "addon_workloads_policy": "always",
             "model_sets": [1, 2],
             "node_workloads": {"addon": "rhaddon"},
@@ -8456,13 +8470,41 @@ mod i300_beat_tests {
         });
         carry_i300(&mut data, &full_beat());
         carry_i300(&mut data, &bad);
-        for key in ["gpu_compute_cap", "os", "nvidia_runtime", "data_root_free_gb", "addon_workloads_policy", "model_sets", "node_workloads", "addon_workloads_approvals"] {
+        for key in ["gpu_compute_cap", "os", "nvidia_runtime", "data_root_free_gb", "model_sets_free_bytes", "addon_workloads_policy", "model_sets", "node_workloads", "addon_workloads_approvals"] {
             assert!(data.get(key).is_none(), "{key}: a misshapen value is unknown, never kept: {data}");
         }
         // An empty list is a fact (no sets, no workloads), not unknown.
         carry_i300(&mut data, &json!({"model_sets": [], "node_workloads": []}));
         assert_eq!(data["model_sets"], json!([]));
         assert_eq!(data["node_workloads"], json!([]));
+    }
+
+    /// i607b: `model_sets_free_bytes` is a byte count. Zero is a fact (a full
+    /// disk); a negative, a fraction, a string or a bool is unknown, and an
+    /// earlier value is not kept.
+    #[test]
+    fn model_sets_free_bytes_keeps_a_whole_number_and_drops_anything_else() {
+        let mut data = json!({"id": "n1"});
+        for good in [json!(0), json!(9_000_000_000u64), json!(i64::MAX)] {
+            carry_i300(&mut data, &json!({"model_sets_free_bytes": good.clone()}));
+            assert_eq!(data["model_sets_free_bytes"], good, "kept");
+        }
+        for bad in [json!(-1), json!(1.5), json!(1.0e12), json!("9"), json!(true), json!(null), json!(u64::MAX)] {
+            carry_i300(&mut data, &json!({"model_sets_free_bytes": 5}));
+            carry_i300(&mut data, &json!({"model_sets_free_bytes": bad.clone()}));
+            assert!(data.get("model_sets_free_bytes").is_none(), "{bad}: unknown, never kept: {data}");
+        }
+    }
+
+    /// i607b: the new row fields ride inside `model_sets` untouched.
+    #[test]
+    fn model_set_rows_keep_their_delivery_fields() {
+        let mut data = json!({"id": "n1"});
+        carry_i300(&mut data, &full_beat());
+        let rows = data["model_sets"].as_array().expect("rows");
+        assert_eq!(rows[1]["bytes_done"], json!(0), "a zero bytes_done survives");
+        assert_eq!(rows[2]["free_bytes"], json!(4_500_000_000u64));
+        assert_eq!(rows[2]["retry_at"], json!("2026-11-09T14:32:00Z"));
     }
 
     /// The handler runs this step before its KV write.
