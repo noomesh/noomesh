@@ -1026,7 +1026,7 @@ fn trust_decision(cx: &Cx, o: &Opts, s: &Step, ran: &mut BTreeSet<String>) -> Fl
 
 fn licence_decision(cx: &Cx, s: &Step, set: &str, terms: &str, ran: &mut BTreeSet<String>) -> Flow {
     if !cx.tty {
-        return Flow::End(End::Decision(runnable(s)));
+        return Flow::End(End::Stop(runnable(s)));
     }
     heading(cx, s);
     println!("{}", ui::note(&format!("{set} is licensed under {terms}; the text is upstream's, read it first")));
