@@ -53,10 +53,7 @@ pub fn parse_set(body: &Value) -> Result<Option<String>, String> {
     }
     match obj.get("set") {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s)) => match s.split_once('@') {
-            Some((id, rev)) if crate::node_workloads::valid_set_ref(id, rev) => Ok(Some(s.clone())),
-            _ => Err(format!("set {s:?} is not <id>@<rev>")),
-        },
+        Some(Value::String(s)) => Ok(Some(s.clone())),
         Some(_) => Err("set must be a string <id>@<rev>".to_string()),
     }
 }
