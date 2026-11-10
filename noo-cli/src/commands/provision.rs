@@ -4723,7 +4723,7 @@ pub(crate) fn harness_tls_ca(darwin: bool, vars: &BTreeMap<&str, String>) -> Str
     if darwin {
         vars.get("na_tls_ca").cloned().unwrap_or_default()
     } else {
-        HARNESS_TLS_CA.to_string()
+        vars.get("na_tls_ca").cloned().unwrap_or_default()
     }
 }
 
