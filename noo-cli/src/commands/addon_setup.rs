@@ -1131,7 +1131,7 @@ fn act_on(cx: &Cx, o: &mut Opts, s: &Step, ran: &mut BTreeSet<String>) -> Flow {
             }
             _ => Flow::End(End::Stop(runnable(s))),
         },
-        ("delivery", State::Todo) => Flow::End(End::Waiting(s.clone())),
+        ("delivery", State::Todo) => Flow::End(End::Stop(s.clone())),
         ("reserve", State::Todo) => match &s.act {
             Act::Reserve { workload, node, backends } => reserve_decision(cx, &addon, s, workload, node, backends, ran),
             _ => Flow::End(End::Stop(runnable(s))),
