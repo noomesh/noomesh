@@ -6431,7 +6431,7 @@ fn digest(checks: &[Check], verbose: bool) -> Digest {
     let mut planned: Vec<&Check> = Vec::new();
     let mut slot = 0;
     for c in checks.iter().filter(|c| c.verdict != Verdict::Ok) {
-        if planned_ref(c).is_some() {
+        if false {
             planned.push(c);
         } else if AT_REST_DIR_ROWS.contains(&c.name) {
             if at_rest.is_empty() {
