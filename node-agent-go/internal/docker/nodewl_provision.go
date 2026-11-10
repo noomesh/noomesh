@@ -470,10 +470,22 @@ func artifactArch(artifact string) string {
 
 type leafFiles struct{ ca, crt, key, print string }
 
-// checkLeaf finds the door leaf the CLI issued for this node
-// (svc-addon-<addon>-<workload>.{crt,key} in the PKI directory) and the
-// cluster CA, and checks the certificate names the door. Anything missing is
-// door_leaf_missing and nothing is provisioned.
+// addonLeafDir is where noo-apply.sh installs an add-on node workload's door
+// leaf: $PKI/services/addon-<addon>-<workload>/service.{crt,key}, root-owned,
+// the crt 0644 and the key 0600, the same layout as a backend door's
+// services/<x>/ leaf. The bundle carries it as svc-addon-<addon>-<workload>.*
+// (desired.go holds e.Door.Leaf to exactly that name); the applier strips the
+// "svc-" and installs into this directory. Derived from the add-on and the
+// workload, never from the bundle file name.
+func addonLeafDir(pki, addon, workload string) string {
+	return filepath.Join(pki, "services", "addon-"+addon+"-"+workload)
+}
+
+// checkLeaf finds the door leaf the applier installed for this node (see
+// addonLeafDir) and the cluster CA, and checks the certificate names the
+// door. Anything missing is door_leaf_missing and nothing is provisioned. The
+// key is only stat'ed here: it is root 0600, and the door container reads it
+// through its bind mount (DAC_OVERRIDE, as the backend doors do).
 func (p *NodeWorkloads) checkLeaf(e nodewl.Entry) (leafFiles, error) {
 	fix := "re-provision (`noo upgrade --nodes`)"
 	dir := p.PKIDir()
@@ -482,8 +494,8 @@ func (p *NodeWorkloads) checkLeaf(e nodewl.Entry) (leafFiles, error) {
 	}
 	lf := leafFiles{
 		ca:  filepath.Join(dir, "ca.crt"),
-		crt: filepath.Join(dir, e.Door.Leaf+".crt"),
-		key: filepath.Join(dir, e.Door.Leaf+".key"),
+		crt: filepath.Join(addonLeafDir(dir, e.Addon, e.Name), "service.crt"),
+		key: filepath.Join(addonLeafDir(dir, e.Addon, e.Name), "service.key"),
 	}
 	for _, f := range []string{lf.ca, lf.crt, lf.key} {
 		if fi, err := os.Stat(f); err != nil || !fi.Mode().IsRegular() {

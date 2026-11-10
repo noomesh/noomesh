@@ -289,8 +289,19 @@ func writeLeaf(t *testing.T, dir, leaf, san string) {
 			t.Fatal(err)
 		}
 	}
-	must(os.WriteFile(filepath.Join(dir, leaf+".crt"), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o644))
-	must(os.WriteFile(filepath.Join(dir, leaf+".key"), pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kb}), 0o600))
+	// Laid out exactly as noo-apply.sh installs it: the bundle's
+	// svc-addon-<a>-<w>.{crt,key} land in services/addon-<a>-<w>/service.{crt,key}.
+	d := filepath.Join(dir, "services", strings.TrimPrefix(leaf, "svc-"))
+	must(os.MkdirAll(d, 0o755))
+	must(os.WriteFile(filepath.Join(d, "service.crt"), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o644))
+	must(os.WriteFile(filepath.Join(d, "service.key"), pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kb}), 0o600))
+}
+
+// installedLeaf is the path noo-apply.sh gives a bundle leaf file
+// ("svc-addon-<a>-<w>.crt" -> services/addon-<a>-<w>/service.crt).
+func installedLeaf(pki, file string) string {
+	ext := filepath.Ext(file)
+	return filepath.Join(pki, "services", strings.TrimPrefix(strings.TrimSuffix(file, ext), "svc-"), "service"+ext)
 }
 
 func fixtureEntry(t *testing.T, i int) nodewl.Entry {
@@ -592,7 +603,7 @@ func TestDoorSpecGolden(t *testing.T) {
 			t.Errorf("mount %+v", m)
 		}
 	}
-	if host.Mounts[1].Source != filepath.Join(h.pki, "svc-addon-rhaddon-worker.crt") || host.Mounts[2].Source != filepath.Join(h.pki, "svc-addon-rhaddon-worker.key") {
+	if host.Mounts[1].Source != installedLeaf(h.pki, "svc-addon-rhaddon-worker.crt") || host.Mounts[2].Source != installedLeaf(h.pki, "svc-addon-rhaddon-worker.key") {
 		t.Errorf("leaf sources %+v", host.Mounts)
 	}
 	w := h.api.created["noo-wl-rhaddon-worker"]
@@ -639,7 +650,7 @@ func TestRefusals(t *testing.T) {
 		{"uid is the agent's", nodewl.ReasonDeclInvalid, "uid_is_agent", func(h *harness) { h.p.AgentUID = func() int { return 1000 } }},
 		{"uid zero", nodewl.ReasonDeclInvalid, nodewl.CodeUIDInvalid, func(h *harness) { h.entry.Decl.UID = 0 }},
 		{"door leaf missing", nodewl.ReasonDoorLeafMissing, "", func(h *harness) {
-			_ = os.Remove(filepath.Join(h.pki, "svc-addon-rhaddon-worker.key"))
+			_ = os.Remove(installedLeaf(h.pki, "svc-addon-rhaddon-worker.key"))
 		}},
 		{"door leaf names another door", nodewl.ReasonDoorLeafMissing, "", func(h *harness) {
 			writeLeaf(h.t, h.pki, "svc-addon-rhaddon-worker", "noo-stunnel-other-worker")
@@ -879,7 +890,7 @@ func TestARunningWorkerIsNeverRecreated(t *testing.T) {
 func TestARefusalKeepsTheLastGoodState(t *testing.T) {
 	h := newHarness(t)
 	mustProvision(t, h)
-	_ = os.Remove(filepath.Join(h.pki, "svc-addon-rhaddon-worker.key"))
+	_ = os.Remove(installedLeaf(h.pki, "svc-addon-rhaddon-worker.key"))
 	h.api.calls = nil
 	if err := h.provision(); nodewl.CodeOf(err) != nodewl.ReasonDoorLeafMissing {
 		t.Fatalf("err = %v", err)

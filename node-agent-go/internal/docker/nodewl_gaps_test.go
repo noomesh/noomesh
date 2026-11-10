@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -147,7 +146,7 @@ func TestUnsetPKIDirIsRefusedNotReadRelative(t *testing.T) {
 // Check 18: a certificate file that is there but is not a certificate.
 func TestUnreadableCertificateIsNamedAsSuch(t *testing.T) {
 	h := newHarness(t)
-	if err := os.WriteFile(filepath.Join(h.pki, "svc-addon-rhaddon-worker.crt"), []byte("this is not PEM"), 0o644); err != nil {
+	if err := os.WriteFile(installedLeaf(h.pki, "svc-addon-rhaddon-worker.crt"), []byte("this is not PEM"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	err := provisionNoPanic(t, h)
