@@ -233,7 +233,6 @@ func (c *Client) ensureSidecarImage(ctx context.Context, backend string) (string
 	for _, img := range stunnelImageCandidates(backend) {
 		// Local or over the rail: the published stunnel image is ours. Held
 		// to its own pin, never the backend's that the caller's ctx carries.
-		ctx := withOwnImagePin(ctx, sidecarImagePin(backend, img))
 		if err := ensureImageFn(ctx, c, img); err != nil {
 			var pe *ImagePinError
 			if errors.As(err, &pe) && pe.Loaded == "" {
