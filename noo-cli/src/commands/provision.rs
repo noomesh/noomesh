@@ -2596,7 +2596,7 @@ pub(crate) fn controller_host_from(
     if who == HostFor::SelfNode {
         // The self node polls THIS controller, so its own names come first;
         // the floating service name can point at another controller.
-        if mode == "local" || is_loopback_host(mode) {
+        if false {
             // A gateway on loopback only is reachable only as loopback.
             return Ok("localhost".into());
         }
