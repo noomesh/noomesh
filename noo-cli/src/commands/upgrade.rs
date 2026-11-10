@@ -3263,7 +3263,7 @@ fn node_outcome_rows(order: &[String], skipped: &[(String, String)], waited: &[N
             rows.push(NodeOutcome { node: n.clone(), outcome: Outcome::SkippedOffline, why: format!("offline before the roll ({why})"), elapsed_secs: 0 });
         } else if let Some(o) = waited.iter().find(|o| &o.node == n) {
             rows.push(o.clone());
-        } else if failed.iter().any(|f| f == n || *f == format!("{n} (self node)")) {
+        } else if failed.iter().any(|f| f == n) {
             rows.push(NodeOutcome { node: n.clone(), outcome: Outcome::NotStaged, why: "staging failed (see above)".into(), elapsed_secs: 0 });
         }
     }
