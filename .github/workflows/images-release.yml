@@ -634,13 +634,13 @@ jobs:
             image: whisper
             dockerfile: docker/Dockerfile.whisper
             context: .
-            platforms: linux/amd64
+            platforms: linux/amd64,linux/arm64
             extra_args: ""
           - name: piper
             image: piper
             dockerfile: docker/Dockerfile.piper
             context: .
-            platforms: linux/amd64
+            platforms: linux/amd64,linux/arm64
             extra_args: ""
           # postgres is self-contained (dhi.io base + pgvector compile).
           # Image name intentionally differs from the compose service name.

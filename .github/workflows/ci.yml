@@ -138,6 +138,7 @@ jobs:
       ui: ${{ steps.diff.outputs.ui }}
       llamacpp: ${{ steps.diff.outputs.llamacpp }}
       ollama: ${{ steps.diff.outputs.ollama }}
+      voice: ${{ steps.diff.outputs.voice }}
       deferred: ${{ steps.diff.outputs.deferred }}
       defer_tests: ${{ steps.diff.outputs.defer_tests }}
     steps:
@@ -174,6 +175,7 @@ jobs:
           lc_range="$BASE...HEAD"
           lc_pattern='^(docker/Dockerfile\.llamacpp$|\.github/workflows/ci\.yml$)'
           ol_pattern='^(docker/Dockerfile\.ollama$|\.github/workflows/ci\.yml$)'
+          vo_pattern='^(docker/Dockerfile\.(whisper|piper)$|docker/(voice_local|whisper_server|piper_server)\.py$|\.github/workflows/ci\.yml$)'
         else
           lc_release="$(git tag --list 'stack-v*' | grep -vE -- '-rc\.' | sort -V | tail -1 || true)"
           if [ -z "$lc_release" ] && git rev-parse -q --verify refs/remotes/origin/main >/dev/null; then
@@ -182,6 +184,7 @@ jobs:
           lc_range="${lc_release:+$lc_release..HEAD}"
           lc_pattern='^docker/Dockerfile\.llamacpp$'
           ol_pattern='^docker/Dockerfile\.ollama$'
+          vo_pattern='^(docker/Dockerfile\.(whisper|piper)$|docker/(voice_local|whisper_server|piper_server)\.py$)'
         fi
         if [ -n "$lc_range" ]; then
           lc_changed="$(git diff --name-only "$lc_range" 2>/dev/null)" || lc_range=""
@@ -205,6 +208,17 @@ jobs:
           ollama=false; echo "ollama: its inputs are unchanged in $lc_range"
         fi
         echo "ollama=$ollama" >> "$GITHUB_OUTPUT"
+        # ── voice: whisper and piper, the same rule (i607c). Their inputs in
+        # this tree are scripts/release-image-inputs.json's (the two
+        # Dockerfiles and the server files they COPY).
+        if [ -z "$lc_range" ]; then
+          voice=true; echo "voice: no base to diff against — building (fail open)"
+        elif printf '%s\n' "$lc_changed" | grep -qE "$vo_pattern"; then
+          voice=true; echo "voice: its inputs changed in $lc_range"
+        else
+          voice=false; echo "voice: its inputs are unchanged in $lc_range"
+        fi
+        echo "voice=$voice" >> "$GITHUB_OUTPUT"
 
         # A push (to dev/main) is the integration point — never narrow it.
         all_true() {
@@ -1926,6 +1940,51 @@ jobs:
         # The binary, with the runtime stage's libraries, must start.
         docker run --rm --entrypoint /usr/bin/ollama noomesh-ollama:${{ github.sha }} --version
         docker rmi noomesh-ollama:${{ github.sha }} >/dev/null 2>&1 || true
+
+  voice-images:
+    # whisper and piper publish for linux/arm64 too (i607c): a Pi or an
+    # arm64 VM runs speech. The release builds them on a TAG and the daily
+    # infra-staged job off the release path, so a wheel that has no aarch64
+    # build at its pin would surface there. This job builds BOTH images for
+    # linux/arm64 under QEMU on every PR that changes their inputs, pushes
+    # nothing, and runs each image under QEMU: the server module imports,
+    # which loads every native library it needs (av, ctranslate2,
+    # onnxruntime; piper's bundled espeak). Same shape as ollama-image:
+    # always reports, only the build is conditional.
+    runs-on: ubuntu-latest
+    needs: [preflight, scope]
+    if: ${{ github.repository == 'noomesh/noomesh' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !cancelled() && needs.preflight.result == 'success' && needs.scope.result == 'success' && needs.scope.outputs.voice == 'true' }}
+    concurrency:
+      group: ci-voice-images-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    steps:
+
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+    - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1  # v4.4.0
+      with:
+        platforms: arm64
+    - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+    - uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487  # v4.0.0
+
+    - name: Build whisper and piper for linux/arm64 and run each under QEMU
+      run: |
+        set -euo pipefail
+        # The base straight from Docker Hub: a cloud runner pulls one python
+        # base, and the GHCR mirror can lag a just-bumped digest.
+        for img in whisper piper; do
+          docker buildx build --load --platform linux/arm64 -f "docker/Dockerfile.$img" \
+            --build-arg HUB_MIRROR=docker.io \
+            --cache-from "type=gha,scope=ci-$img-arm64" \
+            --cache-to "type=gha,mode=max,scope=ci-$img-arm64" \
+            -t "noomesh-$img-arm64:${{ github.sha }}" . 2>&1 | tail -n 100
+          [ "$(docker image inspect -f '{{.Architecture}}' "noomesh-$img-arm64:${{ github.sha }}")" = arm64 ]
+        done
+        docker run --rm --platform linux/arm64 --entrypoint python noomesh-whisper-arm64:${{ github.sha }} \
+          -c 'import platform, whisper_server, faster_whisper, ctranslate2, av, onnxruntime; print(platform.machine(), ctranslate2.__version__, av.__version__, onnxruntime.get_available_providers())'
+        docker run --rm --platform linux/arm64 --entrypoint python noomesh-piper-arm64:${{ github.sha }} \
+          -c 'import platform, piper_server, piper, onnxruntime; print(platform.machine(), onnxruntime.get_available_providers())'
+        docker rmi "noomesh-whisper-arm64:${{ github.sha }}" "noomesh-piper-arm64:${{ github.sha }}" >/dev/null 2>&1 || true
 
   openapi-drift:
     # The OpenAPI spec is what the console builds its typed client against, so a
