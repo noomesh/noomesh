@@ -90,7 +90,6 @@ struct Body {
 
 /// The signed document, read strictly (the agent's `ControllerSet`).
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Doc {
     kind: String,
     node: String,
