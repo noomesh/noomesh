@@ -2563,13 +2563,25 @@ mod tests {
         let End::Stop(s) = &r.end else { panic!("{:?}", r.end) };
         assert!(s.detail.contains("has not opted in") && s.command.as_deref().unwrap().contains(line), "{s:?}");
         assert!(calls.is_empty() && asked.is_empty());
-        // (b) opted in: the controller route does not exist on this noo yet, so it is still the node's line.
+        assert_eq!(exit_of(&r.end), 6);
+    }
+
+    /// The consent step fails CLOSED for a node whose owner opted in to
+    /// controller approvals: setup asks nothing, approves nothing, places
+    /// nothing, and stops with the node-side line (exit 6). Consent from the
+    /// controller is never implied by the opt-in alone.
+    #[test]
+    fn an_opted_in_node_still_stops_at_the_node_line_and_nothing_is_approved_or_placed() {
+        let line = "node workloads approve rhaddon sha256:";
         let root = enabled("consent-in");
         let c = json!({"opted_in": true, "set_state": "verified"});
-        let (r, calls, asked) = go(&consent_world(Some(c)), &root, true, false, &["y", "y"], &full_opts());
-        let End::Stop(s) = &r.end else { panic!("{:?}", r.end) };
-        assert!(s.detail.contains("cannot approve from the controller yet") && s.command.as_deref().unwrap().contains(line), "{s:?}");
-        assert!(calls.is_empty() && asked.is_empty(), "no approval was given for the operator: {calls:?}");
+        let (r, calls, asked) = go(&consent_world(Some(c)), &root, true, false, &["y", "y", "y"], &full_opts());
+        let End::Stop(s) = &r.end else { panic!("an opted-in node must stop at consent: {:?}", r.end) };
+        assert_eq!(s.id, "consent");
+        assert!(s.command.as_deref().unwrap().contains(&format!("sudo \"$(command -v noo)\" {line}")), "{s:?}");
+        assert!(s.detail.contains("cannot approve from the controller yet"), "{s:?}");
+        assert!(calls.is_empty(), "nothing was approved, placed or reserved: {calls:?}");
+        assert!(asked.is_empty(), "no consent question is asked: {asked:?}");
         assert_eq!(exit_of(&r.end), 6);
     }
 
