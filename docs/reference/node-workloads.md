@@ -395,8 +395,9 @@ fetched is not a refusal: the row stays pending).
 - **The door sidecar** is root with `CapDrop: [ALL]` and `DAC_OVERRIDE` only
   (to read the 0600 leaf key), a read-only root, `no-new-privileges`, 128 MiB
   and 64 pids. It is the only container the leaf is mounted into
-  (`svc-addon-<addon>-<workload>.{crt,key}` from the node PKI directory, plus
-  `ca.crt`). Its stunnel config requires a client certificate from the cluster
+  (`services/addon-<addon>-<workload>/service.{crt,key}` in the node PKI
+  directory, where `noo-apply` installs the bundle's
+  `svc-addon-<addon>-<workload>.{crt,key}`, plus `ca.crt`). Its stunnel config requires a client certificate from the cluster
   CA (`verify = 2`) and carries exactly one `checkHost`, the entry's
   `door.admit[0]`, so a certificate from the same CA with any other name is
   refused at the handshake.
