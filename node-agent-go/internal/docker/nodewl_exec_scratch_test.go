@@ -45,12 +45,11 @@ func volOpts(t *testing.T, m mount.Mount) map[string]bool {
 	return out
 }
 
-func tmpfsFlags(m mount.Mount) map[string]bool {
+// tmpfsFlags splits a HostConfig.Tmpfs option string.
+func tmpfsFlags(opts string) map[string]bool {
 	out := map[string]bool{}
-	if m.TmpfsOptions != nil {
-		for _, o := range m.TmpfsOptions.Options {
-			out[o[0]] = true
-		}
+	for _, o := range strings.Split(opts, ",") {
+		out[o] = true
 	}
 	return out
 }
@@ -64,8 +63,8 @@ func TestExecScratchMountsWithoutNoexecOwnedByTheWorker(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			e := entryWithScratch(t, s)
-			ms := scratchMounts(e, 1000)
-			if len(ms) != 1 {
+			ms, tmpfs := scratchMounts(e, 1000)
+			if len(ms) != 1 || len(tmpfs) != 0 {
 				t.Fatalf("mounts %+v", ms)
 			}
 			m := ms[0]
@@ -99,9 +98,9 @@ func TestEveryOtherScratchKeepsNoexec(t *testing.T) {
 		nodewl.Scratch{Target: "/exec", TmpfsMB: i64(64), Exec: true},
 		nodewl.Scratch{Target: "/b", TmpfsMB: i64(32)},
 	)
-	ms := scratchMounts(e, 1000)
-	if len(ms) != 3 {
-		t.Fatalf("mounts %+v", ms)
+	ms, tmpfs := scratchMounts(e, 1000)
+	if len(ms) != 2 || len(tmpfs) != 1 {
+		t.Fatalf("mounts %+v tmpfs %v", ms, tmpfs)
 	}
 	a := volOpts(t, ms[0])
 	for _, w := range []string{"noexec", "nosuid", "nodev"} {
@@ -112,10 +111,10 @@ func TestEveryOtherScratchKeepsNoexec(t *testing.T) {
 	if ms[1].Target != "/exec" || volOpts(t, ms[1])["noexec"] {
 		t.Errorf("the exec scratch is mount 1 and has no noexec: %+v", ms[1])
 	}
-	b := tmpfsFlags(ms[2])
-	for _, w := range []string{"noexec", "nosuid", "nodev"} {
+	b := tmpfsFlags(tmpfs["/b"])
+	for _, w := range []string{"noexec", "nosuid", "nodev", "size=32m", "mode=1777"} {
 		if !b[w] {
-			t.Errorf("tmpfs_mb scratch lacks %s: %+v", w, ms[2].TmpfsOptions)
+			t.Errorf("tmpfs_mb scratch lacks %s: %q", w, tmpfs["/b"])
 		}
 	}
 }
@@ -154,8 +153,8 @@ func TestExecScratchLeavesTheRestOfTheSpecAlone(t *testing.T) {
 			}
 		}
 	}
-	if binds != 1 || len(h.Mounts) != 3 {
-		t.Errorf("mounts %+v", h.Mounts)
+	if binds != 1 || len(h.Mounts) != 2 || len(h.Tmpfs) != 1 {
+		t.Errorf("mounts %+v tmpfs %v", h.Mounts, h.Tmpfs)
 	}
 	for _, m := range specs.Door.Host.Mounts {
 		if m.Type != mount.TypeBind || !m.ReadOnly || m.Target == "/exec" || m.Target == "/tmp" {
@@ -186,12 +185,13 @@ func TestNonExecScratchIsByteIdenticalToBeforeA12(t *testing.T) {
 				}},
 			},
 		},
-		{
-			Type: mount.TypeTmpfs, Target: "/tmp",
-			TmpfsOptions: &mount.TmpfsOptions{SizeBytes: 256 << 20, Mode: 0o1777, Options: [][]string{{"nosuid"}, {"nodev"}, {"noexec"}}},
-		},
 	}
-	if got := scratchMounts(e, 1000); !reflect.DeepEqual(got, want) {
+	wantTmpfs := map[string]string{"/tmp": "rw,nosuid,nodev,noexec,size=256m,mode=1777"}
+	got, gotTmpfs := scratchMounts(e, 1000)
+	if !reflect.DeepEqual(gotTmpfs, wantTmpfs) {
+		t.Errorf("tmpfs_mb scratch %v, want %v", gotTmpfs, wantTmpfs)
+	}
+	if !reflect.DeepEqual(got, want) {
 		gj, _ := json.Marshal(got)
 		wj, _ := json.Marshal(want)
 		t.Errorf("non-exec mounts changed\n got %s\nwant %s", gj, wj)
@@ -202,10 +202,14 @@ func TestNonExecScratchIsByteIdenticalToBeforeA12(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Computed on origin/dev before this change (same input, unmodified tree).
-	const pinned = "968a7e15a32dd2aee8f0410b23e056b624efbfcf8d4e2f65ef08ba22e2152dab"
+	// Re-pinned when the tmpfs_mb scratch moved from a Mounts tmpfs (which a
+	// real daemon refuses: "invalid option: nosuid") to HostConfig.Tmpfs. It
+	// was 968a7e15a32dd2aee8f0410b23e056b624efbfcf8d4e2f65ef08ba22e2152dab.
+	// A pair created with the old spec could never have been created, so the
+	// change of hash recreates nothing that ever ran.
+	const pinned = "7ba9ce917b471bf5f660f2c48a69a7b226d98a8779dd51f23c903b901528af1b"
 	if specs.Hash != pinned {
-		t.Errorf("spec hash of a non-exec pair = %s, was %s before A12", specs.Hash, pinned)
+		t.Errorf("spec hash of a non-exec pair = %s, pinned %s", specs.Hash, pinned)
 	}
 }
 
