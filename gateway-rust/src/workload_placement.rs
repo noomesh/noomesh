@@ -193,7 +193,7 @@ fn set_bytes_left(node: &Value, s: &SetNeed) -> u64 {
         return s.bytes;
     };
     match (row.get("bytes_done").and_then(Value::as_u64), row.get("bytes_total").and_then(Value::as_u64)) {
-        (Some(done), Some(total)) => total.saturating_sub(done).min(s.bytes),
+        (Some(_done), Some(_total)) => s.bytes,
         _ => s.bytes,
     }
 }
