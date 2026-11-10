@@ -196,11 +196,18 @@ def test_the_daily_build_is_the_release_build_plus_labels():
     daily = _buildx_lines(daily_run)
     drop_release = ("--cache-from", "--cache-to", "-t ", "${PUSH_LATEST")
     drop_daily = ("--label ", "-t ")
-    norm = lambda ls, drop: [re.sub(r"\$\{\{ matrix\.\w+ \}\}", "M", l) for l in ls if not l.startswith(drop)]
+    # The base registries differ on purpose (i604): the daily build pulls its
+    # FROM tags' newest digests at the SOURCE (BASE_SOURCES), the release
+    # builds the git pins from our mirrors. Every other argument is the same.
+    bases = tuple(f"--build-arg {v}=" for v in S.BASE_SOURCES)
+    norm = lambda ls, drop: [re.sub(r"\$\{\{ matrix\.\w+ \}\}", "M", l) for l in ls
+                             if not l.startswith(drop) and not l.startswith(bases)]
     assert norm(daily, drop_daily) == norm(release, drop_release), (
-        "infra-staged.yml must build exactly as images-release.yml does (only the labels, tag and cache differ)")
+        "infra-staged.yml must build exactly as images-release.yml does (only the labels, tag, cache and base registries differ)")
+    assert [l for l in daily if l.startswith(bases)] == [f"--build-arg {v}={src}" for v, src in S.BASE_SOURCES.items()]
     labels = [l for l in daily if l.startswith("--label ")]
     assert any(S.LABEL in l for l in labels) and any(S.CREATED_LABEL in l for l in labels)
+    assert any(f"{S.BASES_LABEL}=$BASES" in l for l in labels), "the build must record the bases it used"
 
 
 def test_the_daily_set_is_the_release_matrix_minus_the_images_that_carry_our_source():

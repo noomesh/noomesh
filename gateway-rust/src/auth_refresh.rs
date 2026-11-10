@@ -165,6 +165,9 @@ pub fn build_clear_cookie() -> Cookie<'static> {
 ///
 /// `rotated_from` is `Some(prev_id)` when this token is replacing a
 /// previous one (during a refresh flow); `None` for fresh logins.
+/// `perspective_id` is the "View as" perspective the new row carries (i538):
+/// a rotation inherits a LIVE one from the row it replaces, and a login
+/// carries none.
 /// Generic over the executor so the same INSERT serves a fresh login
 /// (against the pool) and a rotation (inside the claiming transaction,
 /// where the new row must land or not land together with the old row's
@@ -178,13 +181,14 @@ pub async fn store_token<'e, E: sqlx::PgExecutor<'e>>(
     user_agent: Option<&str>,
     ip_address: Option<&str>,
     rotated_from: Option<String>,
+    perspective_id: Option<String>,
 ) -> Result<String, sqlx::Error> {
     let id = uuid::Uuid::new_v4().to_string();
     let token_hash = hash_token(raw_token);
     sqlx::query(
         "INSERT INTO noo_refresh_tokens \
-         (id, user_id, token_hash, expires_at, user_agent, ip_address, rotated_from) \
-         VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::uuid)",
+         (id, user_id, token_hash, expires_at, user_agent, ip_address, rotated_from, perspective_id) \
+         VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::uuid, $8::uuid)",
     )
     .bind(&id)
     .bind(user_id)
@@ -193,6 +197,7 @@ pub async fn store_token<'e, E: sqlx::PgExecutor<'e>>(
     .bind(user_agent)
     .bind(ip_address)
     .bind(rotated_from)
+    .bind(perspective_id)
     .execute(db)
     .await?;
     Ok(id)
@@ -205,6 +210,8 @@ pub struct LookupResult {
     pub user_id: String,
     pub expires_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
+    /// The "View as" perspective this row carries (i538), if any.
+    pub perspective_id: Option<String>,
 }
 
 /// Look up a refresh token by its raw value (hashed for the query).
@@ -217,7 +224,7 @@ pub async fn lookup_token(
 ) -> Result<Option<LookupResult>, sqlx::Error> {
     let token_hash = hash_token(raw_token);
     let row = sqlx::query(
-        "SELECT id::text, user_id, expires_at, revoked_at \
+        "SELECT id::text, user_id, expires_at, revoked_at, perspective_id::text \
          FROM noo_refresh_tokens WHERE token_hash = $1",
     )
     .bind(&token_hash)
@@ -228,6 +235,7 @@ pub async fn lookup_token(
         user_id: r.get(1),
         expires_at: r.get(2),
         revoked_at: r.get(3),
+        perspective_id: r.get(4),
     }))
 }
 
@@ -271,7 +279,7 @@ pub async fn claim_token(
         "UPDATE noo_refresh_tokens \
             SET revoked_at = NOW(), last_used_at = NOW() \
           WHERE token_hash = $1 AND revoked_at IS NULL \
-      RETURNING id::text, user_id, expires_at, revoked_at",
+      RETURNING id::text, user_id, expires_at, revoked_at, perspective_id::text",
     )
     .bind(&token_hash)
     .fetch_optional(&mut *conn)
@@ -282,6 +290,7 @@ pub async fn claim_token(
             user_id: r.get(1),
             expires_at: r.get(2),
             revoked_at: r.get(3),
+            perspective_id: r.get(4),
         }));
     }
     // Zero rows means one of two things, and the difference matters: an
@@ -432,7 +441,16 @@ pub fn refresh_grace() -> Duration {
 /// when a previously-revoked token is presented again — the most
 /// likely cause is that the chain has been stolen and used somewhere
 /// the legitimate user no longer controls.
+///
+/// Every live "View as" perspective of the account ends with it (reason
+/// `family_revoked`, i538): the session it narrowed is gone, so the row must
+/// not outlive it. Here, not at the call sites, so no caller can forget.
 pub async fn revoke_all_for_user(db: &PgPool, user_id: &str) -> Result<u64, sqlx::Error> {
+    if let Err(e) =
+        crate::perspective::end_all_for_account(db, user_id, crate::perspective::EndReason::FamilyRevoked).await
+    {
+        tracing::error!(user = %user_id, error = %e, "could not end the account's perspectives with its refresh family");
+    }
     let res = sqlx::query(
         "UPDATE noo_refresh_tokens SET revoked_at = NOW() \
          WHERE user_id = $1 AND revoked_at IS NULL",

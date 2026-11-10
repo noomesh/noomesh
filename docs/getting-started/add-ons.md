@@ -174,12 +174,18 @@ nowhere else. The vendor's `NOO_ADDON_REGISTRY_TOKEN` is never sent to it.
 `noo addons registry-login yourthing --clear` removes it, and so does
 `noo addons untrust-key` when it removes the add-on's last key.
 
-Limits of the third-party path today: without that credential the lock and the
-images are fetched **anonymously** from the registry you named, and
-there is no proxy or entitlement-mediated pull. The add-on's own gateway key and
-database credentials are not minted for it: its overlay's key declaration is
-read only for the add-ons the CLI ships, so provision a key with `noo security
-service-key provision` if it needs one.
+`noo addons enable yourthing` also mints what the add-on's signed bundle
+declares, before it flips the switch. If its overlay carries an `x-noo-addon`
+key declaration, the add-on gets its own gateway key (stored in the encrypted
+secret store); if its bundle's `system.json` declares a database, its database
+credentials are minted too. Both are read only from the bundle the lock
+verified, and nothing is minted for a bundle that declares neither. If the
+gateway cannot mint the key, the enable stops and the switch is not flipped;
+`noo security service-key provision yourthing` is the by-hand remedy.
+
+Limits of the third-party path today: without a `registry-login` credential the
+lock and the images are fetched **anonymously** from the registry root you
+trusted, and there is no proxy or entitlement-mediated pull.
 
 An add-on that wants to create and steer a person's tasks for them (a voice
 assistant that starts work while you talk) must declare that in its manifest

@@ -47,6 +47,10 @@ DOCKERFILES = {
 }
 
 
+# DHI runtime images that ship `nonroot` at 65532:65532 (no user to create).
+DHI_NONROOT_BASES = ("python:3.12-debian13",)
+
+
 def _readers() -> dict[str, str]:
     src = (ROOT / "noo-cli/src/pki.rs").read_text()
     table = src.split("pub const SERVICE_KEY_READERS", 1)[1].split("];", 1)[0]
@@ -69,6 +73,12 @@ def test_the_image_ends_with_the_nonroot_user_at_the_uid_the_key_is_handed_to(na
     assert user is not None, f"{path} has no USER line: it runs as root"
     assert user.split(":")[0] == "nonroot", f"{path} ends USER {user}, want nonroot"
     text = (ROOT / path).read_text()
+    # A DHI runtime base already ships `nonroot` at 65532:65532 and has no
+    # shell to create it with (verified for gateway-rust's base; see
+    # docker/Dockerfile.gateway-rust). Only the bases listed here count.
+    last_from = re.findall(r"^FROM\s+(\S+)", text, re.M)[-1]
+    if any(f"/{b}@sha256:" in last_from for b in DHI_NONROOT_BASES):
+        return
     # The name must resolve to the uid the key table hands the keys to.
     made = re.search(r"(?:addgroup|groupadd)[^\n]*?(?:-g|--gid)[ =]65532[^\n]*?nonroot", text.replace("\\\n", " "))
     assert made, f"{path} does not create `nonroot` at gid {UID}"

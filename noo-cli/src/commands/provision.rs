@@ -595,9 +595,42 @@ fn load_enrollment(g: &Globals, a: &ProvisionArgs, site: &ProvSite) -> ProvEnrol
     // this version's applier cannot parse (applier_knows_harness_kinds).
     // The node's live record, fetched once: its running version here, and
     // its live-derived tier below.
-    let live_node = live_node_record(g, &node);
+    //
+    // A node whose live entry expired (its agent is restarting, e.g. right
+    // after the previous wave applied) is listed from the gateway's database
+    // with none of those facts, and a failed fetch reads as nothing at all:
+    // both used to fall back in silence (0.6.20 roll). Wait a bounded time
+    // for a live record (node_live), then build anyway and SAY why.
+    let live_node = live_record_or_say_why(g, &node);
     let node_app_version = live_app_version(live_node.as_ref());
     ProvEnrollment { record, live_node, node_app_version }
+}
+
+/// The node's live record, waiting up to `node_live::LIVE_WAIT_SECS` for
+/// one; `None` (after one line saying why and what the bundle loses) when
+/// there is none. A node that stays down is still provisioned.
+fn live_record_or_say_why(g: &Globals, node: &str) -> Option<serde_json::Value> {
+    use super::node_live::{fallback_line, wait_live, LIVE_POLL_SECS, LIVE_WAIT_SECS};
+    let tries = (LIVE_WAIT_SECS / LIVE_POLL_SECS).max(1) as u32 + 1;
+    let mut said = false;
+    let mut fetch = || crate::http::get_raw_opt(g, "/api/cluster/nodes", true, 10);
+    let mut pause = || {
+        if !said && !g.json {
+            nstep(&format!("waiting for {node}'s live heartbeat (up to {LIVE_WAIT_SECS}s): its record has none yet"));
+        }
+        said = true;
+        std::thread::sleep(std::time::Duration::from_secs(LIVE_POLL_SECS));
+    };
+    let started = std::time::Instant::now();
+    let (state, _asked) = wait_live(&mut fetch, node, tries, &mut pause);
+    if let Some(line) = fallback_line(node, &state, started.elapsed().as_secs()) {
+        if g.json {
+            eprintln!("{line}");
+        } else if !ui::quiet() {
+            println!("{}", ui::sub(&ui::status_line(Glyph::Warn, &line)));
+        }
+    }
+    state.live().cloned()
 }
 
 /// Resolve the node's address, account and tier from its enrollment record, and record them on its registry row.
@@ -3481,13 +3514,7 @@ const GZIP_BUNDLE_MIN_VERSION: (u32, u32, u32) = (0, 6, 5);
 /// X.Y.Z was installed by a bundle that also installed fetcher X.Y.Z or newer.
 /// Anything else (bare digits, a missing patch, a fourth field) is unreadable.
 fn parse_cli_version(app_version: &str) -> Option<(u32, u32, u32)> {
-    let v = app_version.trim();
-    let rest = v.strip_prefix("noo-cli-v")
-        .or_else(|| v.strip_prefix("stack-v"))
-        .or_else(|| v.strip_prefix('v'))?;
-    let nums: Vec<u32> = rest.split(['+', '-']).next()?.split('.').filter_map(|s| s.parse().ok()).collect();
-    let [maj, min, pat] = nums[..] else { return None };
-    Some((maj, min, pat))
+    super::node_leaves::cli_version_triple(app_version)
 }
 
 /// May this node be sent a gzip-wrapped bundle? Ok(()) yes; Err(reason) no.
@@ -3605,20 +3632,8 @@ pub(crate) fn applier_knows_harness_kinds(darwin: bool, app_version: &str) -> bo
     if !darwin {
         return true;
     }
-    // "noo-cli-v0.5.35+7b00c90" -> (0, 5, 35)
-    let Some(rest) = app_version.split("noo-cli-v").nth(1) else {
-        return true;
-    };
-    let nums: Vec<u32> = rest
-        .split(['+', '-'])
-        .next()
-        .unwrap_or("")
-        .split('.')
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    let [maj, min, pat] = nums[..] else { return true };
-    // The Mac applier learned the harness kinds in noo-cli-v0.5.40
-    (maj, min, pat) >= (0, 5, 40)
+    // The Mac applier learned the harness kinds in noo-cli-v0.5.40.
+    super::node_leaves::cli_version_triple(app_version).is_none_or(|v| v >= (0, 5, 40))
 }
 
 pub(crate) fn hostd_asset_for(os: &str, arch: &str) -> Option<String> {
@@ -4826,10 +4841,21 @@ mod tests {
     fn an_unreadable_version_is_assumed_capable() {
         // Withholding on a version we failed to parse would silently deny
         // the harness to nodes that can run it — worse than the deadlock,
-        // because nothing would say so.
-        for v in ["", "unknown", "noo-cli-vX.Y.Z", "stack-v0.2.58+a21a072"] {
+        // because nothing would say so. This gate FAILS OPEN on unknown;
+        // the add-on leaf gate fails closed (a bundle with a kind the applier
+        // does not know is refused whole). Only the parse is shared
+        // (node_leaves::cli_version_triple).
+        for v in ["", "unknown", "noo-cli-vX.Y.Z", "stack-v0.2", "garbage"] {
             assert!(applier_knows_harness_kinds(true, v), "withheld on {v:?}");
         }
+        // A `stack-v` version is READABLE since the 0.6.21 fix (Linux appliers
+        // report their stack tag), so it is judged like any other: 0.2.58 is
+        // below the Mac floor (0.5.40) and withheld, exactly as
+        // noo-cli-v0.2.58 is. Unreadable it was "capable", which was wrong for
+        // a known-old applier, not a deliberate fail-open.
+        assert!(!applier_knows_harness_kinds(true, "stack-v0.2.58+a21a072"));
+        assert!(!applier_knows_harness_kinds(true, "noo-cli-v0.2.58"));
+        assert!(applier_knows_harness_kinds(true, "stack-v0.6.20+07ce5047"));
     }
 
     #[test]

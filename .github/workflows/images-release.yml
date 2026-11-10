@@ -98,6 +98,11 @@ jobs:
       rc_commit: ${{ steps.plan.outputs.rc_commit }}
       retag: ${{ steps.plan.outputs.retag }}
       rc_digests: ${{ steps.plan.outputs.rc_digests }}
+      # Per image, what a re-tag copies: the rc's image tag, or a staged infra
+      # image's exact digest (`@sha256:…`, i567); and the staged build times.
+      source_tags: ${{ steps.plan.outputs.source_tags }}
+      staged: ${{ steps.plan.outputs.staged }}
+      staged_bases: ${{ steps.plan.outputs.staged_bases }}
     steps:
       - name: Checkout (full history)   # actions/checkout@v7.0.1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -167,7 +172,17 @@ jobs:
       # the images whose declared inputs changed build
       # (scripts/release-image-inputs.json); a change to this workflow or
       # the other lane files rebuilds everything.
-      - name: Plan — re-tag from the rc, or build
+      #
+      # STAGED INFRA IMAGES (i567): llamacpp, ollama, stunnel,
+      # postgres-pgvector, whisper, piper and nvidia-exporter are built,
+      # scanned and staged daily by infra-staged.yml. Any of them the rc path
+      # would build is re-tagged from `<image>:staged` instead, when the staged
+      # digest's fingerprint label equals this commit's on every platform and
+      # it is at most 3 days old; otherwise it builds here, with a ::warning::
+      # saying why. The plan pins the digest; the re-tag copies that digest.
+      - name: Registry login (read :staged labels)
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
+      - name: Plan — re-tag from the rc or :staged, or build
         id: plan
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -177,6 +192,7 @@ jobs:
           set -eu
           raw="${{ github.event.inputs.tag || github.ref_name }}"
           tag="stack-${raw#stack-}"
+          python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --user pyyaml
           python3 scripts/release-retag-plan.py --tag "$tag" \
             --sibling-sha "trellion=${{ steps.siblings.outputs.trellion_sha }}"
           rc="$(sed -n 's/^rc_tag=//p' "$GITHUB_OUTPUT" | tail -1)"
@@ -513,7 +529,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RETAG: ${{ fromJSON(needs.release-line.outputs.retag)[matrix.image] }}
-      RC_TAG: ${{ needs.release-line.outputs.rc_image_tag }}
+      # the rc's image tag, or `@sha256:…` for a staged infra image (i567)
+      RC_TAG: ${{ fromJSON(needs.release-line.outputs.source_tags)[matrix.image] }}
       RC_DIGEST: ${{ fromJSON(needs.release-line.outputs.rc_digests)[matrix.image] }}
     strategy:
       fail-fast: false
@@ -773,7 +790,7 @@ jobs:
           done
           echo "::error::$ref never appeared — did publish-web.yml run for this tag?"; exit 1
 
-      - name: Re-tag ${{ matrix.name }} from the rc
+      - name: Re-tag ${{ matrix.name }} from the rc or :staged
         if: env.RETAG == 'true'
         env:
           IMAGE_OWNER: ${{ env.OWNER }}   # where the build step below pushes it
@@ -912,11 +929,37 @@ jobs:
       # from. Not an image row (no sha256 digest), so `noo upgrade` and the
       # launcher skip it, exactly as they skip the source: rows.
       - name: Record the rc a re-tagged release reuses
-        if: contains(needs.release-line.outputs.retag, 'true')
+        if: needs.release-line.outputs.rc_tag != '' && contains(needs.release-line.outputs.retag, 'true')
         env:
           RC_TAG: ${{ needs.release-line.outputs.rc_tag }}
           RC_COMMIT: ${{ needs.release-line.outputs.rc_commit }}
         run: echo "retagged-from:${RC_TAG}@${RC_COMMIT}" | tee digests/retagged-from
+      # Provenance for each infra image re-tagged from :staged (i567): when the
+      # daily job built it. Its digest is the image's own row; this row has no
+      # sha256, so every lock reader skips it, like retagged-from.
+      # And (i604) the base digests its daily build resolved its FROM tags
+      # to: `staged-base:<image>=<key>=<digest>;…`. It has no `@`, so no lock
+      # reader takes it for an image row.
+      - name: Record the staged infra images a release reuses
+        env:
+          STAGED: ${{ needs.release-line.outputs.staged }}
+          STAGED_BASES: ${{ needs.release-line.outputs.staged_bases }}
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import json, os, re
+          for img, created in sorted(json.loads(os.environ.get("STAGED") or "{}").items()):
+              assert re.fullmatch(r"[a-z0-9-]+", img) and re.fullmatch(r"[0-9T:Z-]+", created), (img, created)
+              row = f"staged-from:{img}@{created}"
+              open(f"digests/staged-from-{img}", "w").write(row + "\n")
+              print(row)
+          for img, bases in sorted(json.loads(os.environ.get("STAGED_BASES") or "{}").items()):
+              assert re.fullmatch(r"[a-z0-9-]+", img), img
+              assert re.fullmatch(r"[a-z0-9._/:-]+=sha256:[0-9a-f]{64}(;[a-z0-9._/:-]+=sha256:[0-9a-f]{64})*", bases), bases
+              row = f"staged-base:{img}={bases}"
+              open(f"digests/staged-base-{img}", "w").write(row + "\n")
+              print(row)
+          PY
 
       # Third-party images the stack runs straight from their upstream
       # registry by a FIXED compose tag (ollama, nats, nginx, redis, loki,

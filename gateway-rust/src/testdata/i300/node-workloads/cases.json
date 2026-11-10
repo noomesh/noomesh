@@ -381,6 +381,16 @@
     "code": "scratch_invalid"
   },
   {
+    "file": "refuse-scratch-nested.json",
+    "valid": false,
+    "code": "scratch_invalid"
+  },
+  {
+    "file": "refuse-scratch-nested-exec.json",
+    "valid": false,
+    "code": "scratch_invalid"
+  },
+  {
     "file": "refuse-scratch-exec-over-cap.json",
     "valid": false,
     "code": "scratch_invalid"

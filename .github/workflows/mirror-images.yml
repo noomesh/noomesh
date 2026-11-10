@@ -128,7 +128,13 @@ jobs:
             dest: python:3.12-debian13
             auth: dhi
             dest_org: noomesh/dhi
-          - source: dhi.io/uv:0-debian13-dev@sha256:538e03cfb921102dafe5a083a8fb4ee5a7758be4170f32788fac191325b0307d
+          # The nvidia-exporter's deps stage (pip, then files copied into
+          # python:3.12-debian13 above).
+          - source: dhi.io/python:3.12-debian13-dev@sha256:7a4cf144e27b4e47458be2f7e39ff60d4b17517837f0acaf83288b7fc2d56404
+            dest: python:3.12-debian13-dev
+            auth: dhi
+            dest_org: noomesh/dhi
+          - source: dhi.io/uv:0-debian13-dev@sha256:9498b4fafdf893784f7345bf79f918a7c909648a22487287932d94a05b18d0eb
             dest: uv:0-debian13-dev
             auth: dhi
             dest_org: noomesh/dhi
@@ -140,7 +146,7 @@ jobs:
             dest: alpine-base:3.22
             auth: dhi
             dest_org: noomesh/dhi
-          - source: dhi.io/postgres:18-alpine3.22-dev@sha256:9bb938ebc72adc10302318b4193fc2b72a80ca2d80c5c1f0a91077ed6e8807c2
+          - source: dhi.io/postgres:18-alpine3.22-dev@sha256:473b0d256fcc8b015258fd534b187f5e9b690a5cb4ad1ff3133d2952a9a59ce7
             dest: postgres:18-alpine3.22-dev
             auth: dhi
             dest_org: noomesh/dhi

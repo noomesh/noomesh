@@ -123,12 +123,34 @@ pub struct Principal {
     /// Credential-bound delegation survives HTTP, detached work and replay.
     pub act: Option<crate::auth::Actor>,
     pub harness: Option<String>,
+    /// i538: the "View as" perspective this principal was narrowed to
+    /// ([`Principal::narrowed`]). Never signed onto the bus (the signed
+    /// claim set is built field by field in [`sign`]); it rides with the
+    /// principal so that work re-bound to it across a `tokio::spawn` (an
+    /// async op, the console socket, the in-process task runner) still sees
+    /// the snapshot through `perspective::current`.
+    pub perspective: Option<crate::perspective::RequesterPerspective>,
 }
 
 impl Principal {
+    /// The principal as a perspective snapshot leaves it: the role is
+    /// min(its role, the snapshot's cap) and the scopes are exactly what that
+    /// role expands to (the same derivation as a perspective access token),
+    /// and the snapshot is carried. `None` changes nothing.
+    pub fn narrowed(mut self, snapshot: Option<crate::perspective::RequesterPerspective>) -> Self {
+        if let Some(p) = snapshot {
+            let live: crate::auth::Role = self.role.parse().unwrap_or(crate::auth::Role::User);
+            let role = crate::perspective::narrow_role(live, &p.dims);
+            self.role = role.as_str().into();
+            self.scopes = role.legacy_scopes().iter().map(|s| s.to_string()).collect();
+            self.perspective = Some(p);
+        }
+        self
+    }
+
     /// A named human (or a token minted for one).
     pub fn user(sub: impl Into<String>, role: crate::auth::Role, scopes: Vec<String>) -> Self {
-        Self { sub: sub.into(), kind: Kind::User, role: role.as_str().into(), scopes, act: None, harness: None }
+        Self { sub: sub.into(), kind: Kind::User, role: role.as_str().into(), scopes, act: None, harness: None, perspective: None }
     }
 
     /// A loop or service acting on its own account. `actor` is bare — the
@@ -146,6 +168,7 @@ impl Principal {
             scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
             act: None,
             harness: None,
+            perspective: None,
         }
     }
 
@@ -157,6 +180,7 @@ impl Principal {
             scopes: Vec::new(),
             act: None,
             harness: None,
+            perspective: None,
         }
     }
 }
@@ -358,6 +382,11 @@ pub async fn account_principal(db: &sqlx::PgPool, username: &str) -> Option<Prin
         }
     }
     resolved
+}
+
+/// The perspective snapshot the principal in scope carries, if any (i538).
+pub fn current_perspective() -> Option<crate::perspective::RequesterPerspective> {
+    CURRENT.try_with(|p| p.perspective.clone()).ok().flatten()
 }
 
 /// Run `fut` with `principal` in scope.
@@ -565,7 +594,9 @@ pub fn for_requester(ctx: &crate::auth::RequesterCtx) -> Principal {
     let mut principal = Principal::user(ctx.sub.clone(), ctx.role, ctx.scopes.clone());
     principal.act = ctx.act.clone();
     principal.harness = ctx.harness.clone();
-    principal
+    // i538: detached work re-binds this principal; it carries the request's
+    // perspective snapshot with it.
+    principal.narrowed(crate::perspective::current())
 }
 
 /// Whether `p` is one of the controller's own internal services: what the auth
@@ -578,7 +609,7 @@ pub fn is_internal_cluster(p: &Principal) -> bool {
 /// Map the auth layer's extensions onto a bus principal.
 pub fn from_extensions(ext: &axum::http::Extensions) -> Option<Principal> {
     if let Some(ctx) = ext.get::<crate::auth::RequesterCtx>() {
-        return Some(for_requester(ctx));
+        return Some(for_requester(ctx).narrowed(ext.get::<crate::perspective::RequesterPerspective>().cloned()));
     }
     if let Some(node) = ext.get::<crate::auth::ClusterNode>() {
         // A controller-signed caller is one of the stack's own services. It
@@ -673,7 +704,7 @@ pub fn extract_from_dlq(payload: &serde_json::Value) -> (serde_json::Value, Prin
         Ok(harness) => harness,
         Err(_) => return (out, Principal::internal("dlq-drain", &[])),
     };
-    (out, Principal { sub, kind, role, scopes, act, harness })
+    (out, Principal { sub, kind, role, scopes, act, harness, perspective: None })
 }
 
 /// What a controller-signed service may do on the bus. `read`/`write` and no

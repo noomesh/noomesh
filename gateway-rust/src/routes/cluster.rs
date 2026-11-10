@@ -5682,8 +5682,11 @@ pub(crate) async fn mint_tailscale_auth_key(
 async fn mint_join_key(
     State(state): State<Arc<AppState>>,
     ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    perspective: Option<axum::Extension<crate::perspective::RequesterPerspective>>,
     body: Option<Json<Value>>,
 ) -> AppResult {
+    // i538: a join key is a fleet credential; never under a perspective.
+    crate::perspective::refuse_mint(perspective.as_ref(), "join key")?;
     let body = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
 
     let tag = body.get("tag").and_then(|v| v.as_str())

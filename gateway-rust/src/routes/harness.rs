@@ -74,8 +74,13 @@ async fn harness_call(
     State(state): State<Arc<AppState>>,
     turn: Option<Extension<HarnessTurn>>,
     requester: Option<Extension<RequesterCtx>>,
+    perspective: Option<axum::Extension<crate::perspective::RequesterPerspective>>,
     Json(op): Json<HarnessOp>,
 ) -> Result<Json<serde_json::Value>, HarnessErr> {
+    // i538: the rail renews and mints harness credentials (the checkpoint's
+    // token, the door key) at the account's LIVE role, so a perspective
+    // request is refused before anything here runs.
+    crate::perspective::refuse_mint(perspective.as_ref(), "harness turn token")?;
     // Both extensions are set together by the auth middleware for a
     // node-harness token; anything else on this route is refused, even
     // an admin — the rail is for harness tokens only.

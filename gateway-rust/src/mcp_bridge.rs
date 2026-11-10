@@ -143,12 +143,17 @@ fn audience_of(v: &Value) -> Vec<String> {
 /// A person's role and knowledge-base roles, for the audience rule. An
 /// unreadable role or grant is an ERROR naming which (i460), never "no role"
 /// or "no audience": the caller withholds external tools AND says why.
-async fn identity(db: &sqlx::PgPool, user: Option<&str>) -> Result<(Option<Role>, Vec<String>), String> {
+///
+/// i538: inside a chat turn submitted under a perspective, the role is
+/// min(live role, the turn's snapshot), so a `user` view is shown the
+/// external tools a user is shown.
+pub(crate) async fn identity(db: &sqlx::PgPool, user: Option<&str>) -> Result<(Option<Role>, Vec<String>), String> {
     let Some(u) = user else { return Ok((None, Vec::new())) };
     let role: Option<String> = crate::repo::users::enabled_role(db, u)
         .await
         .map_err(|e| format!("cannot read {u}'s role for the MCP audience rule: {e}"))?;
     let role = role.and_then(|r| Role::from_str(&r).ok());
+    let role = crate::perspective::clamp(role, crate::perspective::current().as_ref());
     let kb = crate::repo::kb_grants::get_roles(db, u)
         .await
         .map_err(|e| format!("cannot read {u}'s knowledge-base roles for the MCP audience rule: {e}"))?

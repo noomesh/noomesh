@@ -257,7 +257,6 @@ HOMES = {
     "docker/Dockerfile.stunnel": "ARG HUB_MIRROR default, pinned by tests/test_hub_mirror.py",
     "docker/Dockerfile.node-agent-prebuilt": "ARG HUB_MIRROR default, pinned by tests/test_hub_mirror.py",
     "docker/Dockerfile.node-agent-go": "ARG HUB_MIRROR default, pinned by tests/test_hub_mirror.py",
-    "docker/Dockerfile.nvidia-exporter": "ARG HUB_MIRROR default, pinned by tests/test_hub_mirror.py",
     "docker/Dockerfile.whisper": "ARG HUB_MIRROR default, pinned by tests/test_hub_mirror.py",
     "docker/Dockerfile.piper": "ARG HUB_MIRROR default, pinned by tests/test_hub_mirror.py",
     "docker-compose.cluster.yml": "compose `${NOO_BASE_REGISTRY:-...}` default; pinned equal to the public namespace below",

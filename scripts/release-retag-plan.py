@@ -57,7 +57,25 @@ Output (JSON on stdout, and to $GITHUB_OUTPUT when set):
     rc_tag        "stack-vX.Y.Z-rc.N" or ""
     rc_commit     the rc tag's commit, or ""
     retag         {"image": true|false, ...} for every image the release makes
-    rc_digests    {"image": "sha256:..."} from the rc lock (lock images only)
+    rc_digests    {"image": "sha256:..."} the digest each re-tag must copy
+    source_tags   {"image": "<rc image tag>" | "@sha256:..."} what each re-tag
+                  copies: the rc's tag, or a staged image's exact digest
+    staged        {"image": "<created>"} images re-tagged from :staged
+
+STAGED INFRA IMAGES (noomesh-internal i567). The infra images in
+scripts/infra-staged.py DAILY (llamacpp, ollama, stunnel, postgres-pgvector,
+whisper, piper, nvidia-exporter) are built, scanned and staged once a day by
+infra-staged.yml, outside the release. Any of them the rc path above would
+BUILD is instead re-tagged from `<image>:staged` when, on EVERY platform, the
+staged digest's `org.noomesh.build-fingerprint` label equals the fingerprint
+computed from THIS commit and its `org.opencontainers.image.created` is at
+most STAGED_MAX_AGE_DAYS old. The digest is pinned at plan time: the re-tag
+copies `<image>@<digest>`, never the moving :staged tag. Anything else — no
+:staged, a missing or different label, an older copy (the daily job is
+broken), no fingerprint (an unpinned FROM), a registry error — BUILDS, and
+the plan says why. The lock records the exact digest as for any image, plus a
+`staged-from:<image>@<created>` provenance row (not an image row: it has no
+sha256, so every lock reader skips it, like `retagged-from:`).
 
 Kill switch, no PR needed: `gh variable set RELEASE_RETAG --body off` makes
 every image BUILD (the previous behaviour); delete the variable to
@@ -333,7 +351,126 @@ def sibling_tree(repo: str, sha: str, token: str) -> str:
     return json.loads(_get(f"{API}/repos/{SIBLING_REPOS.get(repo, repo)}/git/commits/{sha}", token))["tree"]["sha"]
 
 
+STAGED_MAX_AGE_DAYS = 3
+
+
+def _infra_staged():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "infra_staged", os.path.join(os.path.dirname(os.path.abspath(__file__)), "infra-staged.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _parse_time(text: str):
+    from datetime import datetime, timezone
+    t = datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+
+
+def staged_image(image: str) -> tuple[str, dict[str, dict]]:
+    """(digest of <image>:staged, {platform: config labels}) from the registry.
+    Raises on anything it cannot read; the caller then builds."""
+    reg, owner = os.environ.get("REGISTRY", ""), os.environ.get("OWNER", "")
+    if not reg or not owner:
+        raise LookupError("REGISTRY/OWNER not set")
+    ref = f"{reg}/{owner}/{image}"
+
+    def inspect(r: str, fmt: str) -> str:
+        return subprocess.run(["docker", "buildx", "imagetools", "inspect", r, "--format", fmt],
+                              capture_output=True, text=True, check=True, timeout=120).stdout
+    digest = json.loads(inspect(f"{ref}:staged", "{{json .Manifest.Digest}}"))
+    img = json.loads(inspect(f"{ref}@{digest}", "{{json .Image}}"))
+    configs = {"": img} if isinstance(img, dict) and "config" in img else img
+    labels = {plat: ((c or {}).get("config") or {}).get("Labels") or {} for plat, c in configs.items()}
+    return digest, labels
+
+
+def apply_staged(result: dict, staged_of, fingerprint_of, now, daily) -> dict:
+    """Re-tag each DAILY image the plan would build from its :staged digest,
+    when every platform's fingerprint label matches and the copy is fresh."""
+    from datetime import timedelta
+    labels_key, created_key = "org.noomesh.build-fingerprint", "org.opencontainers.image.created"
+    bases_key = "org.noomesh.base-digests"
+    staged = result.setdefault("staged", {})
+    staged_bases = result.setdefault("staged_bases", {})
+    for img in daily:
+        if result["retag"].get(img):
+            continue  # an equal-input rc wins
+        pre = "BUILD (no usable :staged copy): "
+        try:
+            fingerprint_of(img, None)  # at the git pins: none at all means build, and asks no registry
+        except Exception as e:  # noqa: BLE001 — any doubt builds
+            result["why"][img] = pre + f"no fingerprint at this commit ({e})"
+            continue
+        try:
+            digest, labels = staged_of(img)
+        except Exception as e:  # noqa: BLE001
+            result["why"][img] = pre + f"{img}:staged unreadable ({type(e).__name__}: {e})"
+            continue
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(digest)) or not labels:
+            result["why"][img] = pre + f"{img}:staged has no digest or no platform configs"
+            continue
+        # The bases the daily build resolved its FROM tags to (i604). One
+        # value on every platform; absent = it was built on the git pins.
+        base_labels = {lab.get(bases_key, "") for lab in labels.values()}
+        if len(base_labels) != 1:
+            result["why"][img] = pre + f"{bases_key} differs between platforms"
+            continue
+        base_label = base_labels.pop()
+        try:
+            bases = _infra_staged().parse_bases(base_label) if base_label else None
+            fp = fingerprint_of(img, bases)
+        except Exception as e:  # noqa: BLE001 — any doubt builds
+            result["why"][img] = pre + f"no fingerprint at this commit for the staged bases ({e})"
+            continue
+        differ = sorted(p or "-" for p, lab in labels.items() if lab.get(labels_key) != fp)
+        if differ:
+            result["why"][img] = pre + (f"fingerprint differs on {', '.join(differ)} (an input changed since the "
+                                        f"last daily run; this commit is {fp[:19]})")
+            continue
+        try:
+            created = min(_parse_time(lab[created_key]) for lab in labels.values())
+        except (KeyError, ValueError, TypeError) as e:
+            result["why"][img] = pre + f"no readable {created_key} label ({e})"
+            continue
+        age = now - created
+        if age > timedelta(days=STAGED_MAX_AGE_DAYS) or age < -timedelta(hours=1):
+            result["why"][img] = pre + (f"the staged copy was built {created:%Y-%m-%dT%H:%MZ}, "
+                                        f"{age.days} day(s) ago (limit {STAGED_MAX_AGE_DAYS}): is infra-staged.yml failing?")
+            continue
+        result["retag"][img] = True
+        result["rc_digests"][img] = digest
+        result["source_tags"][img] = "@" + digest
+        staged[img] = created.strftime("%Y-%m-%dT%H:%M:%SZ")
+        if base_label:
+            staged_bases[img] = base_label
+        result["why"][img] = f"re-tag {img}:staged {digest[:19]} (built {staged[img]}, fingerprint matches)"
+    return result
+
+
 def plan(final_tag: str, repo: str, sibling_shas: dict[str, str],
+         gh_token: str, sibling_token: str, lock_text: str | None = None,
+         staged_of=None, fingerprint_of=None, now=None, **kw) -> dict:
+    """The rc plan, then the staged infra images over it. `staged_of=None`
+    (the default, and every rc-path test) looks nothing up."""
+    from datetime import datetime, timezone
+    result = _rc_plan(final_tag, repo, sibling_shas, gh_token, sibling_token, lock_text, **kw)
+    rc_image = result["rc_tag"].removeprefix("stack-")
+    result["source_tags"] = {img: rc_image for img, r in result["retag"].items() if r}
+    result.setdefault("staged", {})
+    result.setdefault("staged_bases", {})
+    if staged_of is None or os.environ.get("RELEASE_RETAG", "").strip().lower() == "off":
+        return result
+    if fingerprint_of is None:
+        def fingerprint_of(img, bases):
+            return _infra_staged().repo_fingerprint(img, bases=bases)
+    return apply_staged(result, staged_of, fingerprint_of, now or datetime.now(timezone.utc),
+                        _infra_staged().DAILY)
+
+
+def _rc_plan(final_tag: str, repo: str, sibling_shas: dict[str, str],
          gh_token: str, sibling_token: str, lock_text: str | None = None,
          bases_text: str | None = "fetch",
          tree_of=lambda ref: git("rev-parse", f"{ref}^{{tree}}"),
@@ -432,18 +569,24 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--sibling-sha", action="append", default=[], metavar="REPO=SHA",
                     help="the SHA this run resolved for a sibling (repeatable)")
     ap.add_argument("--lock-file", help="read the rc lock from a file instead of the release")
+    ap.add_argument("--no-staged", action="store_true",
+                    help="do not look up :staged infra images (offline dry runs)")
     a = ap.parse_args(argv)
     tag = "stack-" + a.tag.removeprefix("stack-")
     sibs = dict(s.split("=", 1) for s in a.sibling_sha)
     lock_text = open(a.lock_file).read() if a.lock_file else None
     try:
-        p = plan(tag, a.repo, sibs, _token("GITHUB_TOKEN"), _token("SIBLING_TOKEN"), lock_text)
+        p = plan(tag, a.repo, sibs, _token("GITHUB_TOKEN"), _token("SIBLING_TOKEN"), lock_text,
+                 staged_of=None if a.no_staged else staged_image)
     except Exception as e:  # noqa: BLE001 — any surprise means BUILD, never a guess
         reason = f"planning failed ({type(e).__name__}: {e}) — building everything"
-        p = {"rc_tag": "", "rc_commit": "", "rc_digests": {},
+        p = {"rc_tag": "", "rc_commit": "", "rc_digests": {}, "source_tags": {}, "staged": {}, "staged_bases": {},
              "retag": {img: False for img in SIBLING_INPUTS},
              "why": {img: reason for img in SIBLING_INPUTS}}
     print(json.dumps(p, indent=2))
+    for img, why in sorted(p["why"].items()):
+        if why.startswith("BUILD (no usable :staged copy)"):
+            print(f"::warning::{img}: {why}", file=sys.stderr)
     n = sum(p["retag"].values())
     print(f"release-retag-plan: {tag}: re-tag {n} image(s) from {p['rc_tag'] or '-'}, "
           f"build {len(p['retag']) - n}", file=sys.stderr)
@@ -454,6 +597,9 @@ def main(argv: list[str] | None = None) -> int:
             f.write(f"rc_commit={p['rc_commit']}\n")
             f.write(f"retag={json.dumps(p['retag'], separators=(',', ':'))}\n")
             f.write(f"rc_digests={json.dumps(p['rc_digests'], separators=(',', ':'))}\n")
+            f.write(f"source_tags={json.dumps(p['source_tags'], separators=(',', ':'))}\n")
+            f.write(f"staged={json.dumps(p['staged'], separators=(',', ':'))}\n")
+            f.write(f"staged_bases={json.dumps(p.get('staged_bases', {}), separators=(',', ':'))}\n")
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a") as f:
