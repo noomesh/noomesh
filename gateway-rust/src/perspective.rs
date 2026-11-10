@@ -232,7 +232,7 @@ pub async fn task_snapshot(db: &PgPool, task_id: uuid::Uuid) -> Option<Requester
         })
     };
     let row: Result<Option<Option<Value>>, sqlx::Error> =
-        sqlx::query_scalar("SELECT perspective FROM noo_tasks WHERE id = $1").bind(task_id).fetch_optional(db).await;
+        crate::repo::tasks::perspective(db, task_id).await;
     match row {
         Ok(Some(Some(v))) => match serde_json::from_value::<RequesterPerspective>(v) {
             Ok(p) => Some(p),
@@ -431,12 +431,7 @@ async fn row(db: &PgPool, id: &str) -> Result<Option<Row>, sqlx::Error> {
             }
         }
     }
-    let fetched: Option<(String, bool, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT account, ended_at IS NOT NULL, cap_at, started_at FROM noo_perspectives WHERE id = $1::uuid",
-    )
-    .bind(id)
-    .fetch_optional(db)
-    .await?;
+    let fetched = crate::repo::perspectives::liveness(db, id).await?;
     let r = fetched.map(|(account, ended, cap_at, started_at)| Row { account, ended, cap_at, started_at });
     if let Ok(mut map) = cache().write() {
         if map.len() > 10_000 {
@@ -538,22 +533,12 @@ impl EndReason {
 /// written once. `Ok(false)`: it had already ended.
 pub async fn end(db: &PgPool, id: &str, reason: EndReason) -> Result<bool, sqlx::Error> {
     let mut tx = db.begin().await?;
-    let ended: Option<(String,)> = sqlx::query_as(
-        "UPDATE noo_perspectives SET ended_at = now(), end_reason = $2 \
-          WHERE id = $1::uuid AND ended_at IS NULL RETURNING account",
-    )
-    .bind(id)
-    .bind(reason.as_str())
-    .fetch_optional(&mut *tx)
-    .await?;
-    sqlx::query("UPDATE noo_refresh_tokens SET perspective_id = NULL WHERE perspective_id = $1::uuid")
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
+    let ended = crate::repo::perspectives::mark_ended(&mut *tx, id, reason.as_str()).await?;
+    crate::repo::perspectives::unstamp(&mut *tx, id).await?;
     tx.commit().await?;
     forget(id);
     match ended {
-        Some((account,)) => {
+        Some(account) => {
             audit_ended(db, &account, id, reason).await;
             Ok(true)
         }
@@ -566,20 +551,10 @@ pub async fn end(db: &PgPool, id: &str, reason: EndReason) -> Result<bool, sqlx:
 /// `auth_refresh::revoke_all_for_user`, so no caller can forget it.
 pub async fn end_all_for_account(db: &PgPool, account: &str, reason: EndReason) -> Result<u64, sqlx::Error> {
     let mut tx = db.begin().await?;
-    let ended: Vec<(String,)> = sqlx::query_as(
-        "UPDATE noo_perspectives SET ended_at = now(), end_reason = $2 \
-          WHERE account = $1 AND ended_at IS NULL RETURNING id::text",
-    )
-    .bind(account)
-    .bind(reason.as_str())
-    .fetch_all(&mut *tx)
-    .await?;
-    sqlx::query("UPDATE noo_refresh_tokens SET perspective_id = NULL WHERE user_id = $1 AND perspective_id IS NOT NULL")
-        .bind(account)
-        .execute(&mut *tx)
-        .await?;
+    let ended = crate::repo::perspectives::mark_all_ended(&mut *tx, account, reason.as_str()).await?;
+    crate::repo::perspectives::unstamp_account(&mut *tx, account).await?;
     tx.commit().await?;
-    for (id,) in &ended {
+    for id in &ended {
         forget(id);
         audit_ended(db, account, id, reason).await;
     }
@@ -621,14 +596,7 @@ pub struct SessionRow {
 /// The live (unrevoked, unexpired) refresh row the cookie names, when it is
 /// `account`'s.
 pub async fn session_row(db: &PgPool, raw_cookie: &str, account: &str) -> Result<Option<SessionRow>, sqlx::Error> {
-    let row: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT id::text, perspective_id::text FROM noo_refresh_tokens \
-          WHERE token_hash = $1 AND user_id = $2 AND revoked_at IS NULL AND expires_at > now()",
-    )
-    .bind(crate::auth_refresh::hash_token(raw_cookie))
-    .bind(account)
-    .fetch_optional(db)
-    .await?;
+    let row = crate::repo::perspectives::session_row(db, &crate::auth_refresh::hash_token(raw_cookie), account).await?;
     Ok(row.map(|(id, perspective_id)| SessionRow { id, perspective_id }))
 }
 
@@ -707,18 +675,17 @@ async fn insert_in(
 ) -> Result<Started, sqlx::Error> {
     let id = uuid::Uuid::new_v4().to_string();
     let dims_json = serde_json::to_value(dims).unwrap_or_else(|_| json!({}));
-    let (started_at,): (DateTime<Utc>,) = sqlx::query_as(
-        "INSERT INTO noo_perspectives (id, account, refresh_family, dims, cap_at, switched_from) \
-         VALUES ($1::uuid, $2, $3::uuid, $4, now() + make_interval(hours => $5), $6::uuid) \
-         RETURNING started_at",
+    let started_at = crate::repo::perspectives::insert(
+        &mut *conn,
+        &crate::repo::perspectives::NewPerspective {
+            id: &id,
+            account,
+            refresh_family: &session.id,
+            dims: &dims_json,
+            cap_hours: CAP_HOURS,
+            switched_from,
+        },
     )
-    .bind(&id)
-    .bind(account)
-    .bind(&session.id)
-    .bind(&dims_json)
-    .bind(CAP_HOURS)
-    .bind(switched_from)
-    .fetch_one(&mut *conn)
     .await?;
     Ok(Started { id, dims: dims.clone(), started_at, role: narrow_role(live, dims) })
 }
@@ -731,16 +698,7 @@ async fn stamp_in(
     new_id: &str,
     expect: Option<&str>,
 ) -> Result<bool, sqlx::Error> {
-    let n = sqlx::query(
-        "UPDATE noo_refresh_tokens SET perspective_id = $1::uuid \
-          WHERE id = $2::uuid AND revoked_at IS NULL AND perspective_id IS NOT DISTINCT FROM $3::uuid",
-    )
-    .bind(new_id)
-    .bind(&session.id)
-    .bind(expect)
-    .execute(&mut *conn)
-    .await?
-    .rows_affected();
+    let n = crate::repo::perspectives::stamp(&mut *conn, &session.id, new_id, expect).await?;
     Ok(n == 1)
 }
 
@@ -809,17 +767,9 @@ pub async fn switch(db: &PgPool, claims: &Claims, session: &SessionRow, dims: &P
     }
     let live = validate(db, &claims.sub, dims).await?;
     let mut tx = db.begin().await.map_err(db_failed)?;
-    let n = sqlx::query(
-        "UPDATE noo_perspectives SET ended_at = now(), end_reason = $2 \
-          WHERE id = $1::uuid AND account = $3 AND ended_at IS NULL",
-    )
-    .bind(&old)
-    .bind(EndReason::Switched.as_str())
-    .bind(&claims.sub)
-    .execute(&mut *tx)
-    .await
-    .map_err(db_failed)?
-    .rows_affected();
+    let n = crate::repo::perspectives::end_for_switch(&mut *tx, &old, EndReason::Switched.as_str(), &claims.sub)
+        .await
+        .map_err(db_failed)?;
     if n != 1 {
         return Err(refused(StatusCode::UNAUTHORIZED, ENDED));
     }
@@ -864,12 +814,7 @@ pub async fn carried(
     let Some(id) = perspective_id else {
         return Ok(Carry::Real);
     };
-    let row: Option<(String, bool, bool, Value)> = sqlx::query_as(
-        "SELECT account, ended_at IS NOT NULL, cap_at <= now(), dims FROM noo_perspectives WHERE id = $1::uuid",
-    )
-    .bind(id)
-    .fetch_optional(&mut *conn)
-    .await?;
+    let row = crate::repo::perspectives::carried(&mut *conn, id).await?;
     Ok(match row {
         Some((owner, ended, past_cap, dims)) if owner == account && !ended => {
             if past_cap {

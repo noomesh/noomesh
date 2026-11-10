@@ -432,3 +432,12 @@ mod tests {
         assert!(!body.contains("budget_state = $"), "set_question must not park the task");
     }
 }
+
+/// The perspective snapshot a task was submitted under (i538 P1). `None`: no
+/// such task; `Some(None)`: submitted without one.
+pub async fn perspective<'e, E>(db: E, id: Uuid) -> Result<Option<Option<Value>>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_scalar("SELECT perspective FROM noo_tasks WHERE id = $1").bind(id).fetch_optional(db).await
+}
