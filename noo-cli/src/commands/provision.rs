@@ -2602,7 +2602,7 @@ pub(crate) fn controller_host_from(
         }
         if super::grafana_door::asks_for_tailnet(mode) {
             return tailnet_dns.or(env_dns)
-                .map_or_else(|| refuse("the tailnet address", " (tailscale is not running or not logged in)"), Ok);
+                .map_or_else(|| Ok("localhost".into()), Ok);
         }
         if listens_on_loopback(mode) {
             return Ok(tailnet_dns.or(env_dns).unwrap_or_else(|| "localhost".into()));
