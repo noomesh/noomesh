@@ -767,7 +767,7 @@ pub async fn switch(db: &PgPool, claims: &Claims, session: &SessionRow, dims: &P
     }
     let live = validate(db, &claims.sub, dims).await?;
     let mut tx = db.begin().await.map_err(db_failed)?;
-    let n = crate::repo::perspectives::end_for_switch(&mut *tx, &old, EndReason::Switched.as_str(), &claims.sub)
+    let n = crate::repo::perspectives::end_for_switch(db, &old, EndReason::Switched.as_str(), &claims.sub)
         .await
         .map_err(db_failed)?;
     if n != 1 {
