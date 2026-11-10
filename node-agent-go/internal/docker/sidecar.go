@@ -218,7 +218,7 @@ func stunnelImageCandidates(backend string) []string {
 // pin, because the controller sends none for it. Never the backend's pin.
 func sidecarImagePin(backend, img string) string {
 	if ref := pinnedDoorFetchRef(backend); ref != "" && img == ref {
-		return doorPins[backend].Digest
+		return ""
 	}
 	return ""
 }
