@@ -60,7 +60,7 @@ type modelSetRetry struct {
 // never changes which sets are wanted. The caller runs Sync next, which wakes
 // the worker for the sets it cleared.
 func (r *Reconciler) applyModelSetRetry(rt *modelSetRetry) {
-	if r.sets == nil || rt == nil || rt.Epoch <= r.retryEpoch.Load() {
+	if r.sets == nil || rt == nil {
 		return
 	}
 	r.retryEpoch.Store(rt.Epoch)
