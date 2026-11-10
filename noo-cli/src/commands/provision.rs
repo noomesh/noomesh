@@ -519,6 +519,9 @@ fn begin_provision(g: &Globals, a: &ProvisionArgs) -> ProvSite {
             }
             SelfLane::Refuse(why) => fail(g.json, ExitCode::Generic, "self_node_units", &why, Some(SELF_RAIL_REMEDY)),
         }
+        if let Err(e) = converge_self_controller_url(&root) {
+            fail(g.json, ExitCode::Generic, "controller_url", &e, Some(CONTROLLER_HOST_REMEDY));
+        }
     }
     ProvSite { root, is_self }
 }
@@ -932,11 +935,10 @@ fn build_env_vars(g: &Globals, a: &ProvisionArgs, site: &ProvSite, id: &ProvIden
     //     (2026-09-28 newcomer rehearsal, blank box on a lab network).
     //  4. The literal `noo-controller` — last resort when tailscale is down,
     //     correct only for the single-controller tailnet install.
-    let ctrl_host = std::env::var("NOO_CONTROLLER_DNS").ok()
-        .map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
-        .or_else(controller_dnsname)
-        .or_else(advertised_gateway_host)
-        .unwrap_or_else(|| "noo-controller".into());
+    let ctrl_host = match controller_host(&site.root, HostFor::RemoteNode) {
+        Ok(h) => h,
+        Err(e) => fail(g.json, ExitCode::Generic, "controller_host", &e, Some(CONTROLLER_HOST_REMEDY)),
+    };
     vars.insert("controller_url", format!("https://{ctrl_host}:8080"));
     vars.insert("nats_url", format!("tls://{ctrl_host}:4222"));
     vars.insert("noo_node_agent_token", creds.agent_token);
@@ -1295,6 +1297,7 @@ fn attach_harness(g: &Globals, a: &ProvisionArgs, site: &ProvSite, enr: &ProvEnr
                         // the applier installs it root:noo-harness 0640 on
                         // Linux; a Mac runs both as one user, same files.
                         let (hcert, hkey) = harness_tls_paths(darwin, vars);
+                        hvars.insert("harness_tls_ca", harness_tls_ca(darwin, vars));
                         hvars.insert("harness_tls_cert", hcert);
                         hvars.insert("harness_tls_key", hkey);
                         let henv = render_env_template(&htmpl, &hvars)
@@ -2087,7 +2090,7 @@ pub(crate) fn self_identity_script(node: &str, work: &Path, etc: &Path, prep_lin
 fn self_prep_line(node: &str, prep: &Path, data_root: &str, work: &Path) -> Result<String, String> {
     let pki = crate::pki::pki_dir();
     let user = std::env::var("USER").unwrap_or_default();
-    let ctrl_host = controller_dnsname().unwrap_or_else(|| "localhost".into());
+    let ctrl_host = controller_host(&crate::envfile::repo_root(), HostFor::SelfNode)?;
     let prep_release = format!("{}/{}", env!("CARGO_PKG_VERSION"), image_tag());
     // The gateway's leaf is not in the system trust store, so prep's one
     // first-contact fetch cannot verify the transport — PREP_INSECURE=1.
@@ -2196,13 +2199,10 @@ pub(crate) fn read_self_lane(node: &str) -> (Option<String>, bool) {
     (rec, dir.join(LOCAL_LANE_STATE).is_file())
 }
 
-/// This controller's own node name: the enrolled name on this box, else the
-/// NODE_ID the controller install recorded, else the hostname.
+/// This controller's own node name: [`crate::role::self_node_name`], the
+/// one chain that also decides [`crate::role::is_self_node`].
 pub(crate) fn self_node_name() -> Option<String> {
-    let trimmed = |s: String| { let t = s.trim().to_string(); (!t.is_empty()).then_some(t) };
-    std::fs::read_to_string(SELF_NODE_NAME_FILE).ok().and_then(trimmed)
-        .or_else(|| trimmed(crate::onboard::env::read_env_key(&crate::envfile::repo_root().join(".env"), "NODE_ID")))
-        .or_else(|| std::fs::read_to_string("/etc/hostname").ok().and_then(trimmed))
+    crate::role::self_node_name()
 }
 
 /// The self node's data root when nothing else names one: the process env,
@@ -2545,6 +2545,173 @@ fn advertised_gateway_host() -> Option<String> {
     }
     Some(host.to_string())
 }
+
+/// Which kind of node is asking for the controller's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostFor {
+    /// A node on another machine: loopback names nothing it can reach.
+    RemoteNode,
+    /// This controller's own node: loopback is right when the gateway
+    /// listens on it.
+    SelfNode,
+}
+
+/// What to do when no name reaches a tailnet-bound gateway.
+const CONTROLLER_HOST_REMEDY: &str = "bring the tailnet up (`tailscale up`) or set NOO_CONTROLLER_DNS to the name nodes should use, then re-run this command";
+
+/// The `NOO_BIND_MODE` this install declares (process env, then `.env`),
+/// the same read the Grafana door makes.
+fn bind_mode(root: &Path) -> String {
+    super::grafana_door::effective(&root.join(".env"), "NOO_BIND_MODE")
+}
+
+/// THE host name nodes use to reach this controller. Pure over its inputs.
+///
+/// A remote node: `NOO_CONTROLLER_DNS` (the mesh's floating service name),
+/// this controller's MagicDNS name, then the host `services.gateway_url`
+/// advertises; with none, a tailnet bind is refused, else the
+/// single-controller literal.
+///
+/// The self node follows the bind mode (lib-bind-addr.sh): `local` is always
+/// `localhost`; a tailnet bind takes the MagicDNS name, then
+/// `NOO_CONTROLLER_DNS`, else refuses; `all` or unset takes either name, else
+/// `localhost`; a literal non-tailnet address takes only `NOO_CONTROLLER_DNS`,
+/// else refuses. With none of those, a gateway bound to
+/// the tailnet is REFUSED: it listens on the tailnet address only, so
+/// `localhost` would never connect, and the fetch unit that polled it failed
+/// every tick (finding 121). Only a bind mode that listens on loopback may fall
+/// back to `localhost` (self node) or the single-controller literal (remote).
+pub(crate) fn controller_host_from(
+    bind_mode: &str, env_dns: &str, tailnet_dns: Option<String>, advertised: Option<String>, who: HostFor,
+) -> Result<String, String> {
+    let mode = bind_mode.trim();
+    let env_dns = env_dns.trim();
+    let env_dns = (!env_dns.is_empty()).then(|| env_dns.to_string());
+    let tailnet_dns = tailnet_dns.map(|d| d.trim().to_string()).filter(|d| !d.is_empty());
+    let refuse = |listens_on: &str, remedy: &str| Err(format!(
+        "NOO_BIND_MODE={mode} makes the gateway listen on {listens_on} only, and this controller has no name for it \
+         to give nodes{remedy}, so a localhost URL would never connect"));
+    if who == HostFor::SelfNode {
+        // The self node polls THIS controller, so its own names come first;
+        // the floating service name can point at another controller.
+        if mode == "local" || is_loopback_host(mode) {
+            // A gateway on loopback only is reachable only as loopback.
+            return Ok("localhost".into());
+        }
+        if super::grafana_door::asks_for_tailnet(mode) {
+            return tailnet_dns.or(env_dns)
+                .map_or_else(|| refuse("the tailnet address", " (tailscale is not running or not logged in)"), Ok);
+        }
+        if listens_on_loopback(mode) {
+            return Ok(tailnet_dns.or(env_dns).unwrap_or_else(|| "localhost".into()));
+        }
+        // A literal non-tailnet address: neither loopback nor the tailnet
+        // name reaches it. Only the operator can name it.
+        return env_dns.map_or_else(|| refuse("that address", " (set NOO_CONTROLLER_DNS to a name for it)"), Ok);
+    }
+    if let Some(h) = env_dns.or(tailnet_dns).or(advertised) {
+        return Ok(h);
+    }
+    if super::grafana_door::asks_for_tailnet(mode) {
+        return refuse("the tailnet address", " (tailscale is not running or not logged in)");
+    }
+    Ok("noo-controller".into())
+}
+
+/// Whether a gateway bound per `NOO_BIND_MODE` answers on loopback:
+/// `local`, `all` (every interface), unset, or a literal 127.x / ::1.
+fn listens_on_loopback(bind_mode: &str) -> bool {
+    let m = bind_mode.trim();
+    matches!(m, "" | "local" | "all") || is_loopback_host(m)
+}
+
+/// [`controller_host_from`] over this machine: the install's bind mode and
+/// `NOO_CONTROLLER_DNS`, the live tailnet name, the advertised gateway host.
+pub(crate) fn controller_host(root: &Path, who: HostFor) -> Result<String, String> {
+    controller_host_from(
+        &bind_mode(root),
+        &std::env::var("NOO_CONTROLLER_DNS").unwrap_or_default(),
+        controller_dnsname(),
+        advertised_gateway_host(),
+        who,
+    )
+}
+
+/// The host of a recorded `scheme://host[:port][/path]` URL.
+fn url_host(url: &str) -> &str {
+    let rest = url.trim().split("://").nth(1).unwrap_or(url.trim());
+    let rest = rest.split('/').next().unwrap_or(rest);
+    if let Some(v6) = rest.strip_prefix('[') {
+        return v6.split(']').next().unwrap_or(v6);
+    }
+    rest.rsplit_once(':').map(|(h, _)| h).unwrap_or(rest)
+}
+
+fn is_loopback_host(h: &str) -> bool {
+    h == "localhost" || h.starts_with("127.") || h == "::1"
+}
+
+/// The URL a self node's recorded `controller-url` must be rewritten to, or
+/// None. Only a LOOPBACK record on a gateway that does not listen on loopback
+/// (a tailnet bind or a literal address) is wrong; a
+/// loopback record on a loopback-listening gateway, and any other record, is
+/// left alone. `want_host` is resolved only when a correction is due, so a
+/// healthy install never needs tailscale to answer.
+fn controller_url_fix(
+    recorded: &str, bind_mode: &str, want_host: impl FnOnce() -> Result<String, String>,
+) -> Result<Option<String>, String> {
+    let recorded = recorded.trim();
+    if recorded.is_empty() || !is_loopback_host(url_host(recorded)) || listens_on_loopback(bind_mode) {
+        return Ok(None);
+    }
+    let host = want_host()?;
+    if is_loopback_host(&host) || !host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+        return Err(format!("the controller name '{host}' is not a host name nodes can use"));
+    }
+    Ok(Some(format!("https://{host}:8080")))
+}
+
+/// The root script that rewrites `controller-url` and the `PREP_NOO_URL` line
+/// of `host-prepped` under `etc`, in place and keeping the rest of the marker.
+fn controller_url_fix_script(url: &str, etc: &Path) -> String {
+    let e = etc.display();
+    format!(
+        "set -e\n\
+         printf '%s\\n' '{url}' > \"{e}/controller-url.new\"\n\
+         chmod 644 \"{e}/controller-url.new\"\n\
+         mv -f \"{e}/controller-url.new\" \"{e}/controller-url\"\n\
+         if [ -f \"{e}/host-prepped\" ]; then\n\
+         \x20 sed 's|^PREP_NOO_URL=.*$|PREP_NOO_URL={url}|' \"{e}/host-prepped\" > \"{e}/host-prepped.new\"\n\
+         \x20 chmod --reference=\"{e}/host-prepped\" \"{e}/host-prepped.new\"\n\
+         \x20 chown --reference=\"{e}/host-prepped\" \"{e}/host-prepped.new\"\n\
+         \x20 mv -f \"{e}/host-prepped.new\" \"{e}/host-prepped\"\n\
+         fi\n")
+}
+
+/// Correct a self node whose first prep recorded a loopback controller URL on
+/// a tailnet-bound controller (finding 124: the record was never revisited, so
+/// the node's fetch timer polled a door that does not exist). Runs on every
+/// self-node provision, which `noo upgrade --all` goes through; a healthy
+/// record costs one file read.
+fn converge_self_controller_url(root: &Path) -> Result<(), String> {
+    let Ok(recorded) = std::fs::read_to_string(SELF_CONTROLLER_URL) else { return Ok(()) };
+    let mode = bind_mode(root);
+    let Some(url) = controller_url_fix(&recorded, &mode, || controller_host(root, HostFor::SelfNode))? else { return Ok(()) };
+    if !can_sudo_here() {
+        return Err(format!(
+            "this node polls {} but the gateway listens on the tailnet only, and correcting it takes sudo, which would prompt \
+             in this non-interactive run — run `noo onboard --only services` at a terminal", recorded.trim()));
+    }
+    nstep(&format!("this node polled {} but the gateway listens on the tailnet only — pointing it at {url} (sudo)", recorded.trim()));
+    let fix = controller_url_fix_script(&url, Path::new("/etc/noo"));
+    let ok = root_shell("sudo", &fix).status().map(|s| s.success()).unwrap_or(false);
+    if !ok {
+        return Err(format!("could not rewrite {SELF_CONTROLLER_URL} to {url} (see output above) — run `noo onboard --only services`"));
+    }
+    Ok(())
+}
+
+const SELF_CONTROLLER_URL: &str = "/etc/noo/controller-url";
 
 fn controller_dnsname() -> Option<String> {
     let out = Command::new("tailscale").args(["status", "--json"]).output().ok()?;
@@ -2899,7 +3066,7 @@ fn provision_local_in(g: &Globals, node: &str, tier: Option<&str>, root: &Path, 
     // Prep (idempotent): noo-agent account, /etc/noo, gate tooling. The
     // gateway serves the tool downloads, so it should be up; prep tolerates
     // fetch failures with warnings.
-    let ctrl_host = controller_dnsname().unwrap_or_else(|| "localhost".into());
+    let ctrl_host = controller_host(&root, HostFor::SelfNode)?;
     // The embedded copy (enroll::asset_prep), staged to a 0700 temp file — a
     // dist controller has no scripts/ tree, and this used to be an
     // `if prep.exists()` that skipped host prep SILENTLY there, so provision
@@ -4705,8 +4872,9 @@ agent-binary applier fetcher agent-unit verified-by: signing-key ca-lane: retire
 }
 
 /// Where the harness reads its TLS pair (`harness_tls_cert` /
-/// `harness_tls_key` in `noo-harness.env.tmpl`): its OWN copy on Linux
-/// (`scripts/noo-apply.sh`, harness-pair), the agent's files on a Mac.
+/// `harness_tls_key` in `noo-harness.env.tmpl`): on Linux its OWN copy
+/// (`scripts/noo-apply.sh`, harness-pair) as a systemd credential the unit
+/// loads (finding 116); the agent's files on a Mac.
 pub(crate) fn harness_tls_paths(darwin: bool, vars: &BTreeMap<&str, String>) -> (String, String) {
     if darwin {
         (vars.get("na_tls_cert").cloned().unwrap_or_default(), vars.get("na_tls_key").cloned().unwrap_or_default())
@@ -4715,9 +4883,26 @@ pub(crate) fn harness_tls_paths(darwin: bool, vars: &BTreeMap<&str, String>) -> 
     }
 }
 
-/// The harness's own copy of the node pair on a Linux node.
-pub(crate) const HARNESS_TLS_CERT: &str = "/etc/noo/pki/harness/node.crt";
-pub(crate) const HARNESS_TLS_KEY: &str = "/etc/noo/pki/harness/node.key";
+/// Where the harness reads the cluster CA (`harness_tls_ca`): on Linux the
+/// systemd credential its unit loads; the agent's CA path on a Mac.
+pub(crate) fn harness_tls_ca(darwin: bool, vars: &BTreeMap<&str, String>) -> String {
+    if darwin {
+        vars.get("na_tls_ca").cloned().unwrap_or_default()
+    } else {
+        HARNESS_TLS_CA.to_string()
+    }
+}
+
+/// On a Linux node the harness reads its CA and pair as systemd credentials
+/// (finding 116): `LoadCredential=` in `noo-harness.service` loads
+/// /etc/noo/pki/ca.crt and the harness's own copy of the node pair
+/// (/etc/noo/pki/harness/node.{crt,key}, i119) into the service's
+/// credentials directory, and the harness needs no access to /etc/noo/pki.
+/// The unit and these paths ship in the SAME bundle (attach_harness), so
+/// they never skew.
+pub(crate) const HARNESS_TLS_CA: &str = "/run/credentials/noo-harness.service/ca.crt";
+pub(crate) const HARNESS_TLS_CERT: &str = "/run/credentials/noo-harness.service/node.crt";
+pub(crate) const HARNESS_TLS_KEY: &str = "/run/credentials/noo-harness.service/node.key";
 
 #[cfg(test)]
 mod tests {
@@ -5144,11 +5329,14 @@ mod tests {
         v.insert("noo_harness_max_turns", "V_max_turns".into());
         v.insert("harness_log", "V_log".into());
         let (hc, hk) = harness_tls_paths(false, &v);
+        v.insert("harness_tls_ca", harness_tls_ca(false, &v));
         v.insert("harness_tls_cert", hc);
         v.insert("harness_tls_key", hk);
         let out = render_env_template(&tmpl, &v).unwrap();
         for line in ["NODE_ID=V_na_node_id", "NOO_GATEWAY_URL=V_controller_url", "NATS_URL=V_nats_url",
-                     "NOO_TLS_CA=V_na_tls_ca", "NOO_TLS_CERT=/etc/noo/pki/harness/node.crt", "NOO_TLS_KEY=/etc/noo/pki/harness/node.key",
+                     "NOO_TLS_CA=/run/credentials/noo-harness.service/ca.crt",
+                     "NOO_TLS_CERT=/run/credentials/noo-harness.service/node.crt",
+                     "NOO_TLS_KEY=/run/credentials/noo-harness.service/node.key",
                      "NOO_HARNESS_MODEL_URL=V_model_url", "NOO_HARNESS_MAX_TURNS=V_max_turns", "RUST_LOG=V_log"] {
             assert!(out.contains(line), "harness env lacks {line}:\n{out}");
         }
@@ -6284,5 +6472,157 @@ mod darwin_harness_plist_tests {
     #[test]
     fn the_harness_plist_leaves_time_to_drain() {
         assert!(super::DARWIN_HARNESS_PLIST.contains("<key>ExitTimeOut</key><integer>150</integer>"));
+    }
+}
+
+#[cfg(test)]
+mod controller_host_tests {
+    use super::*;
+
+    fn ctrl(mode: &str, env: &str, ts: Option<&str>, adv: Option<&str>, who: HostFor) -> Result<String, String> {
+        controller_host_from(mode, env, ts.map(str::to_string), adv.map(str::to_string), who)
+    }
+
+    /// A tailnet-bound controller hands nodes its MagicDNS name, for the self
+    /// node and a remote one alike (the tester's workaround, made the default).
+    #[test]
+    fn controller_host_tailnet_bind_uses_the_magicdns_name() {
+        for mode in ["tailnet", "100.64.0.12"] {
+            for who in [HostFor::SelfNode, HostFor::RemoteNode] {
+                assert_eq!(ctrl(mode, "", Some("ctl.example.ts.net"), None, who), Ok("ctl.example.ts.net".into()), "{mode} {who:?}");
+            }
+        }
+    }
+
+    /// The finding: a tailnet bind with no resolvable name used to become
+    /// localhost, which the gateway refuses. It must refuse instead.
+    #[test]
+    fn controller_host_tailnet_bind_without_a_name_refuses() {
+        for mode in ["tailnet", " tailnet ", "100.64.0.12"] {
+            for who in [HostFor::SelfNode, HostFor::RemoteNode] {
+                let e = ctrl(mode, "", None, None, who).unwrap_err();
+                assert!(e.contains("tailnet") && e.contains("localhost"), "{mode} {who:?}: {e}");
+                assert_ne!(ctrl(mode, "", Some(""), None, who).ok(), Some("localhost".into()), "an empty name is no name");
+            }
+        }
+    }
+
+    /// Loopback stays valid only where the gateway listens on it.
+    #[test]
+    fn controller_host_loopback_bind_allows_localhost() {
+        for mode in ["", "local", "all", "127.0.0.1"] {
+            assert_eq!(ctrl(mode, "", None, None, HostFor::SelfNode), Ok("localhost".into()), "{mode:?}");
+            assert_eq!(ctrl(mode, "", None, None, HostFor::RemoteNode), Ok("noo-controller".into()), "{mode:?}");
+        }
+    }
+
+    /// A gateway on loopback only is reachable only as loopback: the self node
+    /// gets localhost even when a tailnet name or a floating name exists.
+    #[test]
+    fn controller_host_local_bind_is_localhost_for_the_self_node() {
+        for mode in ["local", "127.0.0.1"] {
+            assert_eq!(ctrl(mode, "noo-a", Some("ctl.example.ts.net"), None, HostFor::SelfNode), Ok("localhost".into()), "{mode}");
+        }
+    }
+
+    /// A literal non-tailnet address: localhost and the tailnet name both miss
+    /// it, so the self node takes only the operator's name, else refuses.
+    #[test]
+    fn controller_host_lan_ip_bind_needs_a_declared_name() {
+        let e = ctrl("192.168.1.10", "", Some("ctl.example.ts.net"), None, HostFor::SelfNode).unwrap_err();
+        assert!(e.contains("192.168.1.10") && e.contains("localhost"), "{e}");
+        assert_eq!(ctrl("192.168.1.10", "lan-ctl", Some("ctl.example.ts.net"), None, HostFor::SelfNode), Ok("lan-ctl".into()));
+    }
+
+    /// NOO_CONTROLLER_DNS (the floating service name) outranks everything for a
+    /// remote node; for the self node on a tailnet bind it is the fallback
+    /// behind this controller's own name.
+    #[test]
+    fn controller_host_env_dns_wins() {
+        for mode in ["tailnet", "local"] {
+            assert_eq!(ctrl(mode, " noo-a ", Some("ctl.example.ts.net"), Some("lan.example"), HostFor::RemoteNode), Ok("noo-a".into()));
+        }
+        assert_eq!(ctrl("tailnet", "noo-a", None, None, HostFor::SelfNode), Ok("noo-a".into()));
+        assert_eq!(ctrl("tailnet", "noo-a", Some("ctl.example.ts.net"), None, HostFor::SelfNode), Ok("ctl.example.ts.net".into()));
+    }
+
+    /// A remote node may be told the advertised gateway host; the self node's
+    /// answer never comes from it.
+    #[test]
+    fn controller_host_advertised_is_for_remote_nodes_only() {
+        assert_eq!(ctrl("local", "", None, Some("lan.example"), HostFor::RemoteNode), Ok("lan.example".into()));
+        assert_eq!(ctrl("tailnet", "", None, Some("lan.example"), HostFor::RemoteNode), Ok("lan.example".into()));
+        assert_eq!(ctrl("local", "", None, Some("lan.example"), HostFor::SelfNode), Ok("localhost".into()));
+        assert!(ctrl("tailnet", "", None, Some("lan.example"), HostFor::SelfNode).is_err());
+    }
+
+    /// Finding 124: a recorded loopback URL on a tailnet-bound controller is
+    /// corrected; nothing else is touched, and a healthy record never even
+    /// asks for the name.
+    #[test]
+    fn controller_url_fix_corrects_only_a_loopback_record_on_a_tailnet_bind() {
+        let want = || Ok::<String, String>("ctl.example.ts.net".into());
+        for rec in ["https://localhost:8080", "https://localhost:8080\n", "https://127.0.0.1:8080", "https://[::1]:8080"] {
+            assert_eq!(controller_url_fix(rec, "tailnet", want), Ok(Some("https://ctl.example.ts.net:8080".into())), "{rec:?}");
+        }
+        // Already right, or a floating name: left alone, name never resolved.
+        let never = || -> Result<String, String> { panic!("resolved a name for a healthy record") };
+        assert_eq!(controller_url_fix("https://ctl.example.ts.net:8080", "tailnet", never), Ok(None));
+        assert_eq!(controller_url_fix("https://noo-a:8080", "tailnet", never), Ok(None));
+        assert_eq!(controller_url_fix("", "tailnet", never), Ok(None));
+        // Loopback is right when the gateway listens on it.
+        for mode in ["local", "", "all", "127.0.0.1"] {
+            assert_eq!(controller_url_fix("https://localhost:8080", mode, never), Ok(None), "{mode:?}");
+        }
+        // A literal LAN address does not listen on loopback either.
+        assert_eq!(controller_url_fix("https://localhost:8080", "192.168.1.10", || Ok("lan-ctl".into())),
+            Ok(Some("https://lan-ctl:8080".into())));
+        // No name to correct it to: the refusal comes through, nothing is invented.
+        let none = || ctrl("tailnet", "", None, None, HostFor::SelfNode);
+        assert!(controller_url_fix("https://localhost:8080", "tailnet", none).is_err());
+        // A name that is not a host name is refused, never spliced into a root script.
+        let evil = || Ok::<String, String>("x'; rm -rf /; '".into());
+        assert!(controller_url_fix("https://localhost:8080", "tailnet", evil).is_err());
+    }
+
+    /// The correction script, run for real over a scratch /etc/noo: both files
+    /// change, the rest of the marker survives.
+    #[test]
+    fn controller_url_fix_script_rewrites_both_files() {
+        let etc = std::env::temp_dir().join(format!("noo-urlfix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&etc);
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::write(etc.join("controller-url"), "https://localhost:8080\n").unwrap();
+        std::fs::write(etc.join("host-prepped"), "PREPPED_VERSION=1\nPREP_NOO_URL=https://localhost:8080\nPREP_NODE_NAME=ctl\n").unwrap();
+        let script = controller_url_fix_script("https://ctl.example.ts.net:8080", &etc);
+        let o = std::process::Command::new("sh").args(["-c", &script]).output().expect("run sh");
+        assert!(o.status.success(), "{o:?}");
+        assert_eq!(std::fs::read_to_string(etc.join("controller-url")).unwrap(), "https://ctl.example.ts.net:8080\n");
+        assert_eq!(
+            std::fs::read_to_string(etc.join("host-prepped")).unwrap(),
+            "PREPPED_VERSION=1\nPREP_NOO_URL=https://ctl.example.ts.net:8080\nPREP_NODE_NAME=ctl\n");
+        assert!(!etc.join("controller-url.new").exists() && !etc.join("host-prepped.new").exists());
+        let _ = std::fs::remove_dir_all(&etc);
+    }
+
+    /// One resolver: every site that names the controller asks controller_host,
+    /// none falls back to localhost on its own, and the self-node provision
+    /// corrects a stale record.
+    #[test]
+    fn every_controller_name_site_uses_the_one_resolver() {
+        let prod = crate::test_src::own_code(include_str!("provision.rs"));
+        for marker in ["fn build_env_vars(", "fn self_prep_line(", "fn provision_local_in("] {
+            let f = crate::test_src::fn_body(&prod, marker);
+            assert!(f.contains("controller_host(") , "{marker} does not use the one resolver");
+            assert!(!f.contains("controller_dnsname("), "{marker} resolves the tailnet name itself");
+            assert!(!f.contains("\"localhost\""), "{marker} falls back to localhost on its own");
+        }
+        // Only the resolver may name localhost, and only for a bind that listens on it.
+        let resolver = crate::test_src::fn_body(&prod, "fn controller_host_from(");
+        assert!(prod.replace(resolver, "").matches("unwrap_or_else(|| \"localhost\".into())").count() == 0,
+            "a site silently becomes localhost");
+        let b = crate::test_src::fn_body(&prod, "fn begin_provision(");
+        assert!(b.contains("converge_self_controller_url("), "{b}");
+        assert!(b.find("if is_self").unwrap() < b.find("converge_self_controller_url(").unwrap(), "{b}");
     }
 }

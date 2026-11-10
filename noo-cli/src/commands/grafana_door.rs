@@ -247,7 +247,7 @@ pub fn canonical_instance(v: &str) -> String {
 /// The value compose will see: the process environment first (it outranks
 /// `.env` in compose, and `ensure_repo_env` has loaded the store, the yaml
 /// config and `.env` into it), then `.env`.
-fn effective(env_path: &Path, key: &str) -> String {
+pub(crate) fn effective(env_path: &Path, key: &str) -> String {
     std::env::var(key)
         .ok()
         .filter(|v| !v.trim().is_empty())

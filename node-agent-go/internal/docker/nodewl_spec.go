@@ -208,16 +208,23 @@ func workerLabels(e nodewl.Entry) map[string]string {
 	return l
 }
 
-// scratchMounts are the writable places a worker has. A tmpfs_mb entry is a
-// tmpfs of that size. A max_mb entry is a per-workload named volume of the
+// scratchMounts are the writable places a worker has: the mounts, and the
+// HostConfig.Tmpfs entries. A tmpfs_mb entry is a tmpfs of that size, given
+// as HostConfig.Tmpfs's option string ("rw,nosuid,nodev,noexec,size=<n>m,
+// mode=1777"), the form rootFloor gives every door's /tmp: the Mounts API's
+// TmpfsOptions.Options accepts only exec/noexec and a real daemon refuses
+// nosuid and nodev there ("invalid mount config for type tmpfs: invalid
+// option: nosuid", awolf 0.6.21; the fake daemon in the unit tests never
+// checked). A tmpfs_mb entry used to be a mount.TypeTmpfs. A max_mb entry is a per-workload named volume of the
 // local driver backed by a tmpfs of that size: Docker's local driver cannot
 // cap a volume otherwise (the size option needs an xfs project quota the
 // agent cannot assume), so the cap is real but the space is memory, charged
 // to the worker's own cgroup and so bounded by limits.ram_mb as well. Both
 // are nosuid, nodev and noexec, except the one entry that declares exec
 // (A12), which drops noexec only.
-func scratchMounts(e nodewl.Entry, uid int64) []mount.Mount {
+func scratchMounts(e nodewl.Entry, uid int64) ([]mount.Mount, map[string]string) {
 	var out []mount.Mount
+	var tmpfs map[string]string
 	for i, s := range e.Decl.Scratch {
 		switch {
 		case s.Exec:
@@ -246,14 +253,10 @@ func scratchMounts(e nodewl.Entry, uid int64) []mount.Mount {
 				},
 			})
 		case s.TmpfsMB != nil:
-			out = append(out, mount.Mount{
-				Type: mount.TypeTmpfs, Target: s.Target,
-				TmpfsOptions: &mount.TmpfsOptions{
-					SizeBytes: *s.TmpfsMB << 20,
-					Mode:      0o1777,
-					Options:   [][]string{{"nosuid"}, {"nodev"}, {"noexec"}},
-				},
-			})
+			if tmpfs == nil {
+				tmpfs = map[string]string{}
+			}
+			tmpfs[s.Target] = fmt.Sprintf("rw,nosuid,nodev,noexec,size=%dm,mode=1777", *s.TmpfsMB)
 		case s.MaxMB != nil:
 			out = append(out, mount.Mount{
 				Type: mount.TypeVolume, Source: workloadVolumeName(e.Addon, e.Name, i), Target: s.Target,
@@ -268,7 +271,7 @@ func scratchMounts(e nodewl.Entry, uid int64) []mount.Mount {
 			})
 		}
 	}
-	return out
+	return out, tmpfs
 }
 
 func buildWorker(in specInput) (createSpec, error) {
@@ -285,12 +288,14 @@ func buildWorker(in specInput) (createSpec, error) {
 			BindOptions: &mount.BindOptions{Propagation: mount.PropagationRPrivate},
 		})
 	}
-	mounts = append(mounts, scratchMounts(e, d.UID)...)
+	scratch, tmpfs := scratchMounts(e, d.UID)
+	mounts = append(mounts, scratch...)
 
 	pids := d.Limits.PIDs
 	mem := d.Limits.RAMMB << 20
 	host := &container.HostConfig{
 		Mounts: mounts,
+		Tmpfs:  tmpfs,
 		// The worker is in the door's namespace and has no network of its own:
 		// it listens on 127.0.0.1 and nothing else can reach it.
 		NetworkMode:    container.NetworkMode("container:" + WorkloadDoorName(e.Addon, e.Name)),

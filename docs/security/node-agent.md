@@ -1287,11 +1287,18 @@ contains, one of those.
   `harness jail: landlock ABI <n>`, or the refusal, once, so
   `noo cluster logs <node> harness` shows it before any task runs.
 - **The unit.** `noo-harness.service` runs as user and group `noo-harness`,
-  in no other group. It reads its own copy of the node's certificate and
-  key, `/etc/noo/pki/harness/node.{crt,key}` (`root:noo-harness`, 0640,
-  installed by the applier from the same bundle files as the agent's
-  pair). The agent's pair, env file and secret files are
-  `InaccessiblePaths=` for it. So even a CLI that escaped the jail runs
+  in no other group. Its TLS material is its own copy of the node's
+  certificate and key, `/etc/noo/pki/harness/node.{crt,key}`
+  (`root:noo-harness`, 0640, installed by the applier from the same bundle
+  files as the agent's pair), plus the cluster CA. It reads all three as
+  systemd credentials: `LoadCredential=` lines in the unit have systemd,
+  as root, copy them at start into the service's own credentials directory
+  (`/run/credentials/noo-harness.service`), and `/etc/noo-harness.env`
+  points `NOO_TLS_CA/CERT/KEY` there. The harness needs no access to
+  `/etc/noo/pki`, which stays 0750 `root:noo-agent`. A file systemd cannot
+  load fails the start, naming the unit. The applier restarts the harness
+  when the CA or its pair changes. The agent's pair, env file and secret
+  files are `InaccessiblePaths=` for it. So even a CLI that escaped the jail runs
   with a uid and gid that cannot read the agent's key material.
 - **macOS.** The CLI runs under `/usr/bin/sandbox-exec` with a profile that
   denies the whole of `~/noomesh` (pki, birth key, env files, secrets) and

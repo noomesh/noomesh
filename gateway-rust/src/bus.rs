@@ -34,6 +34,9 @@ pub async fn connect(
     let ca_path = crate::tls::ca_path().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     let cert_path = std::env::var("NOO_TLS_CERT").unwrap_or_default();
     let key_path = std::env::var("NOO_TLS_KEY").unwrap_or_default();
+    if let Some(why) = missing_credential(&[&ca_path, &cert_path, &key_path], |p| std::path::Path::new(p).exists()) {
+        anyhow::bail!(why);
+    }
 
     // Hand async-nats the PATHS and let it build the TLS config, rather
     // than building a rustls ClientConfig ourselves.
@@ -92,4 +95,46 @@ pub async fn connect(
         opts = opts.retry_on_initial_connect();
     }
     Ok(opts.connect(url).await?)
+}
+
+/// The systemd credentials directories (`LoadCredential=`). The node harness
+/// reads its CA and pair there (finding 116).
+const CREDENTIALS_ROOT: &str = "/run/credentials/";
+
+/// Why a TLS path that names a systemd credential is not usable: it is in a
+/// credentials directory and not there, so the unit did not load it. The
+/// harness then stops and says so, naming the unit, instead of connecting
+/// without the cluster CA (the restart loop of finding 116). Any other path
+/// keeps today's behaviour.
+fn missing_credential(paths: &[&str], exists: impl Fn(&str) -> bool) -> Option<String> {
+    let p = paths.iter().find(|p| p.starts_with(CREDENTIALS_ROOT) && !exists(p))?;
+    let unit = p.trim_start_matches(CREDENTIALS_ROOT).split('/').next().unwrap_or("");
+    Some(format!(
+        "{p} is not there: it is a systemd credential of {unit}, which did not load it. \
+         Check its LoadCredential= lines (`systemctl cat {unit}`) and that each source file exists"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::missing_credential;
+
+    /// Finding 116: a credential the unit did not load stops the connect,
+    /// naming the unit, instead of a silent connect without the cluster CA.
+    #[test]
+    fn a_credential_the_unit_did_not_load_stops_the_connect_naming_the_unit() {
+        let ca = "/run/credentials/noo-harness.service/ca.crt";
+        let why = missing_credential(&[ca, "", ""], |_| false).expect("refused");
+        assert!(why.contains(ca) && why.contains("noo-harness.service") && why.contains("LoadCredential="), "{why}");
+        assert!(missing_credential(&[ca, "", ""], |_| true).is_none(), "a loaded credential connects");
+        let key = "/run/credentials/noo-harness.service/node.key";
+        assert!(missing_credential(&["", "", key], |p| p != key).is_some(), "the key is checked too");
+    }
+
+    /// Any other path keeps today's behaviour: not this check's to refuse.
+    #[test]
+    fn a_path_outside_the_credentials_directories_is_not_judged_here() {
+        assert!(missing_credential(&["/etc/noo/pki/ca.crt", "", ""], |_| false).is_none());
+        assert!(missing_credential(&["", "", ""], |_| false).is_none());
+    }
 }

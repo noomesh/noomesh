@@ -289,8 +289,19 @@ func writeLeaf(t *testing.T, dir, leaf, san string) {
 			t.Fatal(err)
 		}
 	}
-	must(os.WriteFile(filepath.Join(dir, leaf+".crt"), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o644))
-	must(os.WriteFile(filepath.Join(dir, leaf+".key"), pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kb}), 0o600))
+	// Laid out exactly as noo-apply.sh installs it: the bundle's
+	// svc-addon-<a>-<w>.{crt,key} land in services/addon-<a>-<w>/service.{crt,key}.
+	d := filepath.Join(dir, "services", strings.TrimPrefix(leaf, "svc-"))
+	must(os.MkdirAll(d, 0o755))
+	must(os.WriteFile(filepath.Join(d, "service.crt"), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o644))
+	must(os.WriteFile(filepath.Join(d, "service.key"), pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kb}), 0o600))
+}
+
+// installedLeaf is the path noo-apply.sh gives a bundle leaf file
+// ("svc-addon-<a>-<w>.crt" -> services/addon-<a>-<w>/service.crt).
+func installedLeaf(pki, file string) string {
+	ext := filepath.Ext(file)
+	return filepath.Join(pki, "services", strings.TrimPrefix(strings.TrimSuffix(file, ext), "svc-"), "service"+ext)
 }
 
 func fixtureEntry(t *testing.T, i int) nodewl.Entry {
@@ -410,7 +421,7 @@ func TestWorkerSpecGolden(t *testing.T) {
 	if host.Privileged || host.PidMode != "" || host.UTSMode != "" || host.UsernsMode != "" || host.IpcMode == "host" {
 		t.Errorf("host namespaces / privileged: %+v", host)
 	}
-	if len(host.Binds) != 0 || len(host.Devices) != 0 || len(host.PortBindings) != 0 || host.PublishAllPorts || len(host.Tmpfs) != 0 {
+	if len(host.Binds) != 0 || len(host.Devices) != 0 || len(host.PortBindings) != 0 || host.PublishAllPorts || len(host.Tmpfs) != 1 {
 		t.Errorf("binds/devices/ports/tmpfs: %+v", host)
 	}
 	if host.NetworkMode != "container:noo-stunnel-rhaddon-worker" {
@@ -465,7 +476,6 @@ func TestWorkerSpecGolden(t *testing.T) {
 		{mount.TypeBind, "/var/lib/noo/models/sets/rh-s2s-7b/0123456789abcdef0123456789abcdef01234567", "/models/main", true},
 		{mount.TypeBind, "/var/lib/noo/models/sets/rh-voices-a/v1", "/models/voices", true},
 		{mount.TypeVolume, "noo-wl-rhaddon-worker-scratch0", "/cache", false},
-		{mount.TypeTmpfs, "", "/tmp", false},
 	}
 	if len(host.Mounts) != len(want) {
 		t.Fatalf("mounts %+v", host.Mounts)
@@ -480,8 +490,10 @@ func TestWorkerSpecGolden(t *testing.T) {
 		!strings.Contains(vol.DriverConfig.Options["o"], "size=4096m") || !strings.Contains(vol.DriverConfig.Options["o"], "uid=1000") {
 		t.Errorf("the max_mb volume is not a size-capped tmpfs-backed volume: %+v", vol)
 	}
-	if ts := host.Mounts[3].TmpfsOptions; ts == nil || ts.SizeBytes != 256<<20 {
-		t.Errorf("tmpfs scratch %+v", host.Mounts[3].TmpfsOptions)
+	// The tmpfs_mb scratch is a HostConfig.Tmpfs entry: the Mounts API's tmpfs
+	// options take only exec/noexec, and a real daemon refuses nosuid there.
+	if got := host.Tmpfs["/tmp"]; got != "rw,nosuid,nodev,noexec,size=256m,mode=1777" {
+		t.Errorf("tmpfs scratch %q", got)
 	}
 	for _, m := range host.Mounts {
 		for _, banned := range []string{"/etc/noo", "/var/run/docker.sock", "/var/lib/noo-node-agent", "pki"} {
@@ -592,7 +604,7 @@ func TestDoorSpecGolden(t *testing.T) {
 			t.Errorf("mount %+v", m)
 		}
 	}
-	if host.Mounts[1].Source != filepath.Join(h.pki, "svc-addon-rhaddon-worker.crt") || host.Mounts[2].Source != filepath.Join(h.pki, "svc-addon-rhaddon-worker.key") {
+	if host.Mounts[1].Source != installedLeaf(h.pki, "svc-addon-rhaddon-worker.crt") || host.Mounts[2].Source != installedLeaf(h.pki, "svc-addon-rhaddon-worker.key") {
 		t.Errorf("leaf sources %+v", host.Mounts)
 	}
 	w := h.api.created["noo-wl-rhaddon-worker"]
@@ -639,7 +651,7 @@ func TestRefusals(t *testing.T) {
 		{"uid is the agent's", nodewl.ReasonDeclInvalid, "uid_is_agent", func(h *harness) { h.p.AgentUID = func() int { return 1000 } }},
 		{"uid zero", nodewl.ReasonDeclInvalid, nodewl.CodeUIDInvalid, func(h *harness) { h.entry.Decl.UID = 0 }},
 		{"door leaf missing", nodewl.ReasonDoorLeafMissing, "", func(h *harness) {
-			_ = os.Remove(filepath.Join(h.pki, "svc-addon-rhaddon-worker.key"))
+			_ = os.Remove(installedLeaf(h.pki, "svc-addon-rhaddon-worker.key"))
 		}},
 		{"door leaf names another door", nodewl.ReasonDoorLeafMissing, "", func(h *harness) {
 			writeLeaf(h.t, h.pki, "svc-addon-rhaddon-worker", "noo-stunnel-other-worker")
@@ -879,7 +891,7 @@ func TestARunningWorkerIsNeverRecreated(t *testing.T) {
 func TestARefusalKeepsTheLastGoodState(t *testing.T) {
 	h := newHarness(t)
 	mustProvision(t, h)
-	_ = os.Remove(filepath.Join(h.pki, "svc-addon-rhaddon-worker.key"))
+	_ = os.Remove(installedLeaf(h.pki, "svc-addon-rhaddon-worker.key"))
 	h.api.calls = nil
 	if err := h.provision(); nodewl.CodeOf(err) != nodewl.ReasonDoorLeafMissing {
 		t.Fatalf("err = %v", err)
