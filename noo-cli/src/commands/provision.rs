@@ -2663,7 +2663,7 @@ fn controller_url_fix(
     recorded: &str, bind_mode: &str, want_host: impl FnOnce() -> Result<String, String>,
 ) -> Result<Option<String>, String> {
     let recorded = recorded.trim();
-    if recorded.is_empty() || !is_loopback_host(url_host(recorded)) || listens_on_loopback(bind_mode) {
+    if recorded.is_empty() || !is_loopback_host(url_host(recorded)) {
         return Ok(None);
     }
     let host = want_host()?;
