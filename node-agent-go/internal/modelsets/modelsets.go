@@ -91,6 +91,17 @@ type Ref struct{ ID, Revision string }
 
 func (r Ref) String() string { return r.ID + "@" + r.Revision }
 
+// ParseRef reads "<id>@<revision>" (the form Ref.String writes). Set ids and
+// revisions never contain "@", so exactly one is required and both sides must
+// be non-empty.
+func ParseRef(s string) (Ref, bool) {
+	id, rev, ok := strings.Cut(s, "@")
+	if !ok || id == "" || rev == "" || strings.Contains(rev, "@") {
+		return Ref{}, false
+	}
+	return Ref{ID: id, Revision: rev}, true
+}
+
 // Status is State plus, for refused, the reason code (nodewl.Reason*).
 type Status struct {
 	State  State
@@ -981,6 +992,35 @@ func (s *Store) Sync(ctx context.Context, want []Ref) {
 	s.wg.Add(1)
 	s.mu.Unlock()
 	go s.work(ctx)
+}
+
+// ClearRefused ends the refused backoff of the named sets (all of them when
+// sets is empty), so next() offers them again before their `until` (i607b B3,
+// `noo cluster workloads retry`). It resets ONLY in-memory entries whose state
+// is refused: a verified or fetching set is never touched, and nothing on disk
+// changes. It returns the sets it cleared. It does not start the worker: the
+// reconcile that calls it calls Sync right after, which does (the same wake-up
+// as any other desired-config pass).
+func (s *Store) ClearRefused(sets []Ref) []Ref {
+	only := make(map[Ref]bool, len(sets))
+	for _, r := range sets {
+		only[r] = true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var cleared []Ref
+	for ref, m := range s.mem {
+		if m.state != StateRefused {
+			continue
+		}
+		if len(only) > 0 && !only[ref] {
+			continue
+		}
+		delete(s.mem, ref)
+		cleared = append(cleared, ref)
+	}
+	sort.Slice(cleared, func(i, j int) bool { return cleared[i].String() < cleared[j].String() })
+	return cleared
 }
 
 // Wait blocks until the worker is idle (tests).
