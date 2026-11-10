@@ -1737,6 +1737,54 @@ fn rm_targets(store: &Path, id: &str, revision: Option<&str>) -> Result<Vec<Path
     Ok(candidates.into_iter().filter(|p| p.is_dir()).collect())
 }
 
+/// The stale `.extract-*` staging work directories `noo models rm <id>` (no
+/// revision) removes with the set (i534). Only entries directly under the id
+/// directory; a revision given means none (a stage may be running for that
+/// id). An entry that is a symbolic link, or not a directory, is refused,
+/// never followed. Other hidden entries are left alone.
+fn rm_work_dirs(store: &Path, id: &str, revision: Option<&str>) -> Result<Vec<PathBuf>, String> {
+    if revision.is_some() {
+        return Ok(Vec::new());
+    }
+    let id_dir = store.join(SETS_DIR).join(id);
+    let mut found: Vec<PathBuf> = std::fs::read_dir(&id_dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(".extract-")))
+                .collect()
+        })
+        .unwrap_or_default();
+    found.sort();
+    for p in &found {
+        let is_real_dir = std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_dir());
+        if !is_real_dir {
+            return Err(format!("{} is a symbolic link or not a directory; rm never follows one", p.display()));
+        }
+    }
+    Ok(found)
+}
+
+/// Remove the revisions and work directories, then the id directory if that
+/// leaves it empty.
+fn rm_remove(id_dir: &Path, targets: &[PathBuf], work: &[PathBuf]) -> Result<(), String> {
+    for t in targets {
+        // The signature first: from that moment the set no longer exists to `list`.
+        let _ = std::fs::remove_file(t.join(SIGNATURE));
+        if let Err(e) = std::fs::remove_dir_all(t) {
+            return Err(format!("removing {}: {e}", t.display()));
+        }
+    }
+    for w in work {
+        if let Err(e) = std::fs::remove_dir_all(w) {
+            return Err(format!("removing {}: {e}", w.display()));
+        }
+    }
+    // Only succeeds when nothing (not even an acceptance record) is left.
+    let _ = std::fs::remove_dir(id_dir);
+    Ok(())
+}
+
 /// `noo models rm <id>[@<rev>] --force`
 pub fn models_rm(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let a = parse_rm_with(&mut Args::new(args))?;
@@ -1746,7 +1794,11 @@ pub fn models_rm(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         Ok(t) => t,
         Err(why) => fail(g.json, ExitCode::Generic, "symlink_refused", &why, None),
     };
-    if targets.is_empty() {
+    let work = match rm_work_dirs(&dir, &a.id, a.revision.as_deref()) {
+        Ok(w) => w,
+        Err(why) => fail(g.json, ExitCode::Generic, "symlink_refused", &why, None),
+    };
+    if targets.is_empty() && work.is_empty() {
         let why = format!("no staged model set {} under {}", a.id, id_dir.display());
         fail(g.json, ExitCode::Generic, "no_such_set", &why, None);
     }
@@ -1771,16 +1823,9 @@ pub fn models_rm(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let names: Vec<String> = targets.iter().map(|p| p.display().to_string()).collect();
     let what = format!("the staged model set at {}", names.join(", "));
     super::confirm_destructive(g, a.yes, "Remove", &what);
-    for t in &targets {
-        // The signature first: from that moment the set no longer exists to `list`.
-        let _ = std::fs::remove_file(t.join(SIGNATURE));
-        if let Err(e) = std::fs::remove_dir_all(t) {
-            let why = format!("removing {}: {e}", t.display());
-            fail(g.json, ExitCode::Generic, "rm_failed", &why, None);
-        }
+    if let Err(why) = rm_remove(&id_dir, &targets, &work) {
+        fail(g.json, ExitCode::Generic, "rm_failed", &why, None);
     }
-    // Only succeeds when nothing (not even an acceptance record) is left.
-    let _ = std::fs::remove_dir(&id_dir);
     let by = clean_identity(&super::secrets_reveal::whoami());
     let now = super::secrets_reveal::now_rfc3339();
     for t in &targets {
@@ -3321,6 +3366,62 @@ mod tests {
         for d in [&store, &outside, &store2] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    /// i534: `rm <id>` removes a stale `.extract-*` work dir with the set and
+    /// then the id dir.
+    #[test]
+    fn rm_removes_a_stale_extract_work_dir_with_the_set() {
+        let store = tmpdir("rm-extract-store");
+        let id_dir = store.join(SETS_DIR).join("test-voice-set");
+        std::fs::create_dir_all(id_dir.join("rev-real")).unwrap();
+        std::fs::create_dir_all(id_dir.join(".extract-ff")).unwrap();
+        std::fs::write(id_dir.join(".extract-ff").join("part.bin"), b"half").unwrap();
+        let targets = rm_targets(&store, "test-voice-set", None).unwrap();
+        let work = rm_work_dirs(&store, "test-voice-set", None).unwrap();
+        assert_eq!(targets, vec![id_dir.join("rev-real")]);
+        assert_eq!(work, vec![id_dir.join(".extract-ff")]);
+        rm_remove(&id_dir, &targets, &work).unwrap();
+        assert!(!id_dir.join(".extract-ff").exists(), "work dir left behind");
+        assert!(!id_dir.exists(), "id dir left behind");
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    /// i534: a `.extract-*` entry that is a symbolic link is refused, never
+    /// followed; what it points at survives.
+    #[test]
+    fn rm_refuses_a_symlinked_extract_work_dir() {
+        let store = tmpdir("rm-extract-link-store");
+        let outside = tmpdir("rm-extract-link-outside");
+        let victim = outside.join("keep.bin");
+        std::fs::write(&victim, b"not the store's").unwrap();
+        let id_dir = store.join(SETS_DIR).join("test-voice-set");
+        std::fs::create_dir_all(id_dir.join("rev-real")).unwrap();
+        std::os::unix::fs::symlink(&outside, id_dir.join(".extract-ff")).unwrap();
+        let why = rm_work_dirs(&store, "test-voice-set", None).unwrap_err();
+        assert!(why.contains(".extract-ff") && why.contains("symbolic link"), "{why}");
+        // Nothing was removed: the revision is still there for the refused rm.
+        assert!(id_dir.join("rev-real").is_dir());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"not the store's");
+        for d in [&store, &outside] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// i534: `rm <id> <rev>` leaves `.extract-*` alone (a stage may be running).
+    #[test]
+    fn rm_with_a_revision_leaves_extract_work_dirs() {
+        let store = tmpdir("rm-extract-rev-store");
+        let id_dir = store.join(SETS_DIR).join("test-voice-set");
+        std::fs::create_dir_all(id_dir.join("rev-real")).unwrap();
+        std::fs::create_dir_all(id_dir.join(".extract-ff")).unwrap();
+        let targets = rm_targets(&store, "test-voice-set", Some("rev-real")).unwrap();
+        let work = rm_work_dirs(&store, "test-voice-set", Some("rev-real")).unwrap();
+        assert!(work.is_empty(), "{work:?}");
+        rm_remove(&id_dir, &targets, &work).unwrap();
+        assert!(!id_dir.join("rev-real").exists());
+        assert!(id_dir.join(".extract-ff").is_dir(), "work dir was removed");
+        let _ = std::fs::remove_dir_all(&store);
     }
 
     /// i570 (list): the columns that matter come first and short, so a
