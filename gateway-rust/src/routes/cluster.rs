@@ -4540,7 +4540,7 @@ async fn placement_staging_refusal(state: &AppState, node_id: &str, backend: &st
 /// (404) or unreachable costs a log line and nothing else. Without this a
 /// harness kind change landed up to 5 min after `noo cluster place`
 /// (both awolf and mcmini, harness compare 2026-10-24).
-fn nudge_reconcile(state: Arc<AppState>, node_id: String) {
+pub(super) fn nudge_reconcile(state: Arc<AppState>, node_id: String) {
     tokio::spawn(async move {
         let link = match crate::node_link::NodeLink::for_node(&state, &node_id).await {
             Ok(l) => l,

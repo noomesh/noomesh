@@ -581,7 +581,8 @@ carries:
   once more; a restart has already emptied the backoff, so that finds nothing.
 - Only refused sets are cleared. A verified or fetching set is not touched, and
   a retry never changes which sets or workloads are placed.
-- Latency: the node's next desired-config reconcile (within about 5 minutes).
+- Latency: after the bump the gateway nudges the node to reconcile now (the signed `reconcile` control op, HTTPS fallback; fire-and-forget, the agent coalesces nudges). A node that is unreachable or older than the op just logs, and picks the epoch up on its next reconcile (within about 5 minutes).
+- An absent or null `model_set_retry` means no change: the agent keeps the epoch it has (as for `workload_approvals`).
 
 ## Reasons
 

@@ -191,7 +191,7 @@ pub(crate) fn retry_path(node: &str) -> String {
 /// What `retry` prints: which sets, and when the node acts on it.
 pub(crate) fn format_retry(node: &str, set: Option<&str>) -> String {
     let what = set.map_or_else(|| "every refused model set".to_string(), |s| format!("model set {s}"));
-    format!("retry requested for {what} on {node}: the node picks it up on its next reconcile (within ~5 min)")
+    format!("retry requested for {what} on {node}: the node retries now if it is reachable, else on its next reconcile (≤5 min)")
 }
 
 /// The PUT body (the gateway's `PutBody`). A repeated slot appends.
@@ -672,7 +672,7 @@ mod tests {
     fn the_retry_line_says_when_the_node_acts() {
         assert_eq!(
             format_retry("awolf", None),
-            "retry requested for every refused model set on awolf: the node picks it up on its next reconcile (within ~5 min)"
+            "retry requested for every refused model set on awolf: the node retries now if it is reachable, else on its next reconcile (≤5 min)"
         );
         assert!(format_retry("awolf", Some("rh-main@r1")).contains("model set rh-main@r1 on awolf"));
     }

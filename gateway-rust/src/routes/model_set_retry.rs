@@ -15,7 +15,9 @@
 //! bump names. desired-config then carries a NEW TOP-LEVEL key
 //! `model_set_retry: {"epoch": N, "sets": ["id@rev", ...]}` (omitted while the
 //! epoch is 0); the agent clears the matching refused entries when N is past
-//! the last epoch it saw.
+//! the last epoch it saw. After the bump the handler nudges the node to
+//! reconcile now (`nudge_reconcile`); a node that cannot be reached picks the
+//! epoch up on its own reconcile tick (within ~5 minutes).
 //!
 //! The key is top-level on purpose. The agent decodes desired-config
 //! leniently at the top level (an unknown key is ignored), but the
@@ -86,15 +88,6 @@ pub async fn retry_for(state: &AppState, node_id: &str) -> Option<Retry> {
     }
 }
 
-/// The hook for an immediate reconcile on the node. TODAY IT DOES NOTHING
-/// but log: the node picks the new epoch up on its next desired-config
-/// reconcile (within ~5 minutes), which is what the CLI tells the operator.
-/// A controller-to-agent nudge on the rail would trigger that reconcile now;
-/// when one exists, send it here and nowhere else.
-pub fn nudge_node(node_id: &str) {
-    tracing::debug!(%node_id, "model_set_retry_nudge: no rail nudge yet; the node reconciles on its own schedule");
-}
-
 fn plain(status: StatusCode, code: &str, detail: impl Into<String>) -> Response {
     (status, Json(json!({"error": code, "detail": detail.into()}))).into_response()
 }
@@ -141,7 +134,10 @@ pub async fn retry_model_set(
     }
     match request_retry(&state.db, &node_id, &b, operator.sub()).await {
         Ok(r) => {
-            nudge_node(&node_id);
+            // Fire-and-forget: ask the node to reconcile now (the signed
+            // `reconcile` control op, HTTPS fallback). Not reachable or older
+            // than the op: a log line, and the node's own tick picks it up.
+            super::cluster::nudge_reconcile(state.clone(), node_id.clone());
             (StatusCode::OK, Json(json!({"node_id": node_id, "epoch": r.epoch, "sets": r.sets}))).into_response()
         }
         Err(f) => plain(f.status, f.code, f.detail),
@@ -211,7 +207,9 @@ mod tests {
         let sig = h.split("-> Response").next().unwrap();
         assert!(sig.find("operator: crate::authz::Operator").unwrap() < sig.find("body: Option<Json<Value>>").unwrap(), "the gate sits before the body extractor");
         assert!(h.contains("request_retry(&state.db, &node_id, &b, operator.sub())"), "the handler hands the pool, not AppState, to the retry");
+        assert!(h.find("request_retry(").unwrap() < h.find("nudge_reconcile(state.clone(), node_id.clone())").unwrap(), "the nudge follows a successful bump, in the handler");
         let r = crate::test_src::fn_body(&own, "pub async fn request_retry(");
+        assert!(!r.contains("nudge"), "request_retry stays pool-only: no nudge inside it");
         assert!(r.contains("repo::bump("), "{r}");
         assert!(!r.contains("AppState") && !r.contains("state."), "request_retry takes the pool only");
         for placement in ["node_workload_placements::place", "node_workload_placements::remove", "node_workload_placements::set_", "repo::place(", "repo::remove("] {
@@ -228,19 +226,14 @@ mod tests {
     /// moved by 2.
     #[tokio::test]
     async fn a_retry_leaves_the_nodes_placement_rows_byte_for_byte_unchanged() {
-        let Some(dsn) = std::env::var("NOO_TEST_DSN").ok().filter(|v| !v.trim().is_empty()) else {
+        let Some(db) = crate::repo::node_model_set_retry::test_pool().await else {
             eprintln!("NOO_TEST_DSN unset — retry-leaves-placements not exercised");
             return;
         };
-        use std::str::FromStr as _;
-        let opts = sqlx::postgres::PgConnectOptions::from_str(&dsn).expect("dsn").options([("search_path", "mesh,public")]);
-        let admin = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect_with(opts.clone()).await.expect("connect");
-        crate::mesh_migrate::apply_baseline(&admin).await.expect("baseline");
-        crate::mesh_migrate::apply(&admin).await.expect("migrations");
-        let db = sqlx::postgres::PgPoolOptions::new().max_connections(2).connect_with(opts).await.expect("connect");
+        use crate::repo::node_model_set_retry::{forget_for_test, placement_snapshot};
         let node = format!("msr-plc-{}", std::process::id());
         let _ = crate::repo::node_workload_placements::remove(&db, &node, "rhaddon", "worker").await;
-        let _ = sqlx::query("DELETE FROM noo_node_model_set_retry WHERE node_id = $1").bind(&node).execute(&db).await;
+        forget_for_test(&db, &node).await;
 
         let row = crate::repo::node_workload_placements::Placement {
             addon: "rhaddon".into(),
@@ -254,23 +247,18 @@ mod tests {
             reservation: None,
         };
         crate::repo::node_workload_placements::place(&db, &row).await.expect("place");
-        // Every column, updated_at included, not only the fields Placement carries.
-        let snapshot = || async {
-            let rows: Vec<(Value,)> = sqlx::query_as("SELECT to_jsonb(p) FROM noo_node_workload_placements p WHERE node_id = $1 ORDER BY addon, workload").bind(&node).fetch_all(&db).await.expect("snapshot");
-            rows.into_iter().map(|r| r.0).collect::<Vec<_>>()
-        };
-        let before = snapshot().await;
-        assert!(before.iter().any(|r| r["node_id"] == json!(node)), "the fixture row is there");
+        let before = placement_snapshot(&db, &node).await;
+        assert_eq!(before.len(), 1, "the fixture row is there");
         let epoch0 = repo::get(&db, &node).await.expect("get").map_or(0, |r| r.epoch);
 
         let a = request_retry(&db, &node, &json!({}), "alice").await.expect("bare retry");
         let b = request_retry(&db, &node, &json!({"set": "rh-s2s-7b@r1"}), "alice").await.expect("named retry");
         assert_eq!((a.epoch, b.epoch), (epoch0 + 1, epoch0 + 2), "the epoch moved by 2");
 
-        assert_eq!(snapshot().await, before, "a retry changed a placement row");
+        assert_eq!(placement_snapshot(&db, &node).await, before, "a retry changed a placement row");
         assert_eq!(crate::repo::node_workload_placements::for_node(&db, &node).await.expect("for_node"), vec![row]);
 
         let _ = crate::repo::node_workload_placements::remove(&db, &node, "rhaddon", "worker").await;
-        let _ = sqlx::query("DELETE FROM noo_node_model_set_retry WHERE node_id = $1").bind(&node).execute(&db).await;
+        forget_for_test(&db, &node).await;
     }
 }

@@ -67,6 +67,37 @@ fn from_row(r: &sqlx::postgres::PgRow) -> Result<Retry, sqlx::Error> {
     Ok(Retry { epoch: u64::try_from(epoch).unwrap_or(0), sets })
 }
 
+/// Test support for other modules' DB tests (the SQL stays in repo/): a pool
+/// on the migrated schema when `NOO_TEST_DSN` is set, else `None`.
+#[cfg(test)]
+pub(crate) async fn test_pool() -> Option<sqlx::PgPool> {
+    let dsn = std::env::var("NOO_TEST_DSN").ok().filter(|v| !v.trim().is_empty())?;
+    use std::str::FromStr as _;
+    let opts = sqlx::postgres::PgConnectOptions::from_str(&dsn).expect("dsn").options([("search_path", "mesh,public")]);
+    let admin = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect_with(opts.clone()).await.expect("connect");
+    crate::mesh_migrate::apply_baseline(&admin).await.expect("baseline");
+    crate::mesh_migrate::apply(&admin).await.expect("migrations");
+    Some(sqlx::postgres::PgPoolOptions::new().max_connections(2).connect_with(opts).await.expect("connect"))
+}
+
+/// Test support: forget a node's retry row.
+#[cfg(test)]
+pub(crate) async fn forget_for_test(db: &sqlx::PgPool, node_id: &str) {
+    let _ = sqlx::query("DELETE FROM noo_node_model_set_retry WHERE node_id = $1").bind(node_id).execute(db).await;
+}
+
+/// Test support: every column of the node's placement rows (`to_jsonb`,
+/// updated_at included), so a test can prove a write left them byte for byte.
+#[cfg(test)]
+pub(crate) async fn placement_snapshot(db: &sqlx::PgPool, node_id: &str) -> Vec<Value> {
+    let rows: Vec<(Value,)> = sqlx::query_as("SELECT to_jsonb(p) FROM noo_node_workload_placements p WHERE node_id = $1 ORDER BY addon, workload")
+        .bind(node_id)
+        .fetch_all(db)
+        .await
+        .expect("snapshot");
+    rows.into_iter().map(|r| r.0).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
