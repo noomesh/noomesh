@@ -4029,16 +4029,15 @@ mod seat_display_migration_tests {
 mod perspectives_migration_tests {
     use super::*;
 
-    /// i538 P1: the perspectives revision is the chain head, sits on seat
-    /// display, and only adds: a new table, a partial index, one nullable
-    /// column on the refresh rows, and the app role's grant.
+    /// i538 P1: the perspectives revision sits on seat display and only
+    /// adds: a new table, a partial index, one nullable column on the
+    /// refresh rows, and the app role's grant.
     #[test]
-    fn perspectives_revision_is_the_head_and_additive() {
+    fn perspectives_revision_sits_on_seat_display_and_is_additive() {
         let m = MIGRATIONS.iter().find(|m| m.revision == PERSPECTIVES_REVISION).expect("must be in the chain");
         assert_eq!(m.revision, "114_perspectives");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(SEAT_DISPLAY_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(PERSPECTIVES_REVISION), "the chain head");
         assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_perspectives"));
         assert!(m.sql.contains("cap_at timestamptz NOT NULL"));
         assert!(m.sql.contains("ALTER TABLE noo_refresh_tokens ADD COLUMN IF NOT EXISTS perspective_id uuid"));
@@ -4047,5 +4046,25 @@ mod perspectives_migration_tests {
             assert!(m.sql.contains(reason), "{reason}");
         }
         assert!(!m.sql.contains("DELETE") && !m.sql.contains("DROP") && !m.sql.contains("UPDATE noo_"));
+    }
+}
+
+#[cfg(test)]
+mod conversation_sources_migration_tests {
+    use super::*;
+
+    /// i608 (#169): the conversation-sources revision is the chain head,
+    /// sits on perspectives, and only adds a table and the app role's grant.
+    #[test]
+    fn conversation_sources_revision_is_the_head_and_additive() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == CONVERSATION_SOURCES_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "117_conversation_sources");
+        assert!(m.revision.len() <= 32);
+        assert_eq!(m.down_revision, Some(PERSPECTIVES_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(CONVERSATION_SOURCES_REVISION), "the chain head");
+        assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_conversation_sources"));
+        assert!(m.sql.contains("PRIMARY KEY (user_id, publisher_id, source_id)"));
+        assert!(m.sql.contains("GRANT SELECT, INSERT, UPDATE, DELETE ON noo_conversation_sources TO noo_app"));
+        assert!(!m.sql.contains("DROP") && !m.sql.contains("UPDATE noo_") && !m.sql.contains("DELETE FROM"));
     }
 }

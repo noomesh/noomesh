@@ -22297,6 +22297,40 @@
           }
         }
       }
+    },
+    "/api/conversations/import": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create import",
+        "description": "[native] [undocumented] Handled by `receive`. No `///` comment on the handler to describe it \u2014 add one there and re-run scripts/gen-openapi.py.",
+        "operationId": "receive",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
