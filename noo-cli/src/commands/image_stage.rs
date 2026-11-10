@@ -64,7 +64,6 @@ pub(crate) const CONTROLLER_ONLY: &[&str] = &[
     // noo-sandbox-base, which each agent builds itself, arm64 included
     // (node-agent-go sandbox_base.go). Staging it for nodes only printed
     // "not published for arm64" on every arm64 node (i607c).
-    "sandbox",
 ];
 
 /// Release images that only run on a node with an NVIDIA GPU (NVML from the
