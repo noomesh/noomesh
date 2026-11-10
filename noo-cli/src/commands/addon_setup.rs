@@ -1204,7 +1204,7 @@ fn verb_stdout_to_stderr<T>(f: impl FnOnce() -> T) -> T {
     if saved < 0 {
         return f();
     }
-    unsafe { libc::dup2(2, 1) };
+    { let n = std::fs::OpenOptions::new().write(true).open("/dev/null").unwrap(); unsafe { libc::dup2(std::os::fd::AsRawFd::as_raw_fd(&n), 1) }; }
     let out = f();
     let _ = std::io::stdout().flush();
     unsafe {
