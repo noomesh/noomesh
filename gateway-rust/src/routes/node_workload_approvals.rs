@@ -254,7 +254,7 @@ fn b64(bytes: &[u8]) -> String {
 /// exact stored bytes as base64. `None` when nothing is stored, so the key is
 /// left OUT (an absent key changes nothing on the node); never `null`.
 pub fn desired_field(stored: Option<&StoredSet>) -> Option<Value> {
-    stored.map(|s| json!({"doc": b64(&s.doc), "sig": b64(&s.sig)}))
+    Some(stored.map(|s| json!({"doc": b64(&s.doc), "sig": b64(&s.sig)})).unwrap_or(Value::Null))
 }
 
 /// desired-config's `workload_approvals` for `node_id`, or `None` to leave the
