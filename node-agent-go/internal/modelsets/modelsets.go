@@ -33,6 +33,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -40,6 +41,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/auth"
@@ -95,17 +97,38 @@ type Status struct {
 	Reason string
 }
 
-// Row is one `model_sets` heartbeat entry.
+// Row is one `model_sets` heartbeat entry. The delivery fields (i607b) are
+// optional and sent only with their state, so an old reader sees the four
+// original keys and a new one can tell "not known" from zero:
+//
+//	fetching  bytes_done, bytes_total (once the manifest is read)
+//	verified  bytes_total
+//	refused   retry_at; with reason=disk also free_bytes, need_bytes
+//
+// The integers are pointers so a 0 bytes_done is still sent.
 type Row struct {
-	ID       string `json:"id"`
-	Revision string `json:"revision"`
-	State    string `json:"state"`
-	Reason   string `json:"reason,omitempty"`
+	ID         string `json:"id"`
+	Revision   string `json:"revision"`
+	State      string `json:"state"`
+	Reason     string `json:"reason,omitempty"`
+	BytesDone  *int64 `json:"bytes_done,omitempty"`
+	BytesTotal *int64 `json:"bytes_total,omitempty"`
+	RetryAt    string `json:"retry_at,omitempty"` // RFC 3339, UTC
+	FreeBytes  *int64 `json:"free_bytes,omitempty"`
+	NeedBytes  *int64 `json:"need_bytes,omitempty"`
 }
 
 // Refusal is a fetch that must not be retried blindly: the set did not check
 // out. Reason is a code of the contract's vocabulary.
-type Refusal struct{ Reason, Detail string }
+type Refusal struct {
+	Reason, Detail string
+
+	// free and need are the numbers behind a disk refusal (need includes the
+	// margin). Set only by checkDisk; they go to the heartbeat row, never as
+	// free text.
+	free, need int64
+	hasBytes   bool
+}
 
 func (r *Refusal) Error() string { return r.Reason + ": " + r.Detail }
 
@@ -129,6 +152,14 @@ type Fetcher interface {
 	FetchOneVerified(ctx context.Context, fileURL, dest, sha256hex string) (bool, error)
 }
 
+// ProgressFetcher is a Fetcher that can also report the bytes of the file
+// written so far (preseed.Client.FetchOneVerifiedProgress). A Fetcher without
+// it still fetches; its rows just show progress at file boundaries.
+type ProgressFetcher interface {
+	Fetcher
+	FetchOneVerifiedProgress(ctx context.Context, fileURL, dest, sha256hex string, progress func(written int64)) (bool, error)
+}
+
 // railFiles builds a preseed client per call, so a rotated node leaf is
 // picked up without a restart (the same rule as the model_file job).
 type railFiles struct{}
@@ -137,11 +168,30 @@ func (railFiles) FetchOneVerified(ctx context.Context, fileURL, dest, sha string
 	return preseed.New().FetchOneVerified(ctx, fileURL, dest, sha)
 }
 
+func (railFiles) FetchOneVerifiedProgress(ctx context.Context, fileURL, dest, sha string, progress func(int64)) (bool, error) {
+	return preseed.New().FetchOneVerifiedProgress(ctx, fileURL, dest, sha, progress)
+}
+
 type memState struct {
 	state  State
 	reason string
 	until  time.Time // refused: do not retry before this
+
+	// fetching: the delivery counters, nil until the manifest is read.
+	prog *progress
+	// refused for disk: the numbers the agent saw (need includes the margin).
+	free, need int64
+	hasBytes   bool
 }
+
+// progress is the byte count of one running fetch. done is atomic so the
+// download goroutine never takes the store lock per write; Rows reads it.
+type progress struct {
+	total int64
+	done  atomic.Int64
+}
+
+func (p *progress) set(n int64) { p.done.Store(min(n, p.total)) }
 
 // Store holds the model sets of this node. Every field is a seam a test sets;
 // New fills them with the production ones.
@@ -340,7 +390,10 @@ func (s *Store) Fetch(ctx context.Context, ref Ref) (err error) {
 func (s *Store) refused(ref Ref, r *Refusal) error {
 	slog.Warn("model set refused", "set", ref.String(), "reason", r.Reason, "detail", r.Detail)
 	s.mu.Lock()
-	s.setMem(ref, memState{state: StateRefused, reason: r.Reason, until: s.now().Add(refusedRetry)})
+	s.setMem(ref, memState{
+		state: StateRefused, reason: r.Reason, until: s.now().Add(refusedRetry),
+		free: r.free, need: r.need, hasBytes: r.hasBytes,
+	})
 	s.mu.Unlock()
 	return r
 }
@@ -424,7 +477,25 @@ func (s *Store) fetch(ctx context.Context, ref Ref) error {
 		return err
 	}
 
-	// 5. The files.
+	// 5. The files. Delivery counters first: a file already on disk counts as
+	// done, and the rest advances as bytes land.
+	prog := &progress{}
+	here := make([]bool, len(set.Files))
+	var base int64
+	for i, f := range set.Files {
+		prog.total += f.Bytes
+		if fi, err := os.Lstat(dests[i]); err == nil && fi.Mode().IsRegular() && fi.Size() == f.Bytes {
+			here[i] = true
+			base += f.Bytes
+		}
+	}
+	prog.set(base)
+	s.mu.Lock()
+	if m, ok := s.mem[ref]; ok && m.state == StateFetching {
+		m.prog = prog
+		s.mem[ref] = m
+	}
+	s.mu.Unlock()
 	cache := strings.TrimRight(s.CacheURL(), "/")
 	if cache == "" {
 		return errors.New("NOO_MODEL_CACHE_URL is not set: no data plane to fetch model sets from")
@@ -436,7 +507,13 @@ func (s *Store) fetch(ctx context.Context, ref Ref) error {
 		}
 		src := cache + "/sets/" + url.PathEscape(ref.ID) + "/" + url.PathEscape(ref.Revision) + "/" + escapePath(f.Path)
 		fctx, cancel := context.WithTimeout(ctx, fileFetchTimeout)
-		_, err := s.Files.FetchOneVerified(fctx, src, dest, f.SHA256)
+		var err error
+		if pf, ok := s.Files.(ProgressFetcher); ok {
+			onBytes := func(written int64) { prog.set(base + written) }
+			_, err = pf.FetchOneVerifiedProgress(fctx, src, dest, f.SHA256, onBytes)
+		} else {
+			_, err = s.Files.FetchOneVerified(fctx, src, dest, f.SHA256)
+		}
 		cancel()
 		if errors.Is(err, preseed.ErrDigestMismatch) {
 			return refuse(nodewl.ReasonSetUnverified, "%s: %v", f.Path, err)
@@ -444,6 +521,10 @@ func (s *Store) fetch(ctx context.Context, ref Ref) error {
 		if err != nil {
 			return fmt.Errorf("fetch %s of %s: %w", f.Path, ref, err)
 		}
+		if !here[i] {
+			base += f.Bytes // this file is whole now; the next one counts on top
+		}
+		prog.set(base)
 	}
 
 	// 6. Check what is on disk, then seal: manifest, files read-only, marker
@@ -498,9 +579,46 @@ func (s *Store) checkDisk(set *nodewl.ModelSet, dir string) error {
 		return fmt.Errorf("free space of %s: %w", dir, err)
 	}
 	if free < required {
-		return refuse(nodewl.ReasonDisk, "%d bytes free, %d needed (files %d + margin)", free, required, need)
+		rf := refuse(nodewl.ReasonDisk, "%d bytes free, %d needed (files %d + margin)", free, required, need)
+		rf.free, rf.need, rf.hasBytes = clampI64(free), clampI64(required), true
+		return rf
 	}
 	return nil
+}
+
+func clampI64(u uint64) int64 {
+	if u > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(u)
+}
+
+// FreeBytes is the free space of the filesystem the disk check measures
+// (the nearest existing ancestor of <models dir>/sets): the number the agent
+// itself compares a fetch against. ok is false when it cannot be read or no
+// models dir is configured: the caller then omits the heartbeat key.
+func (s *Store) FreeBytes() (int64, bool) {
+	if s == nil || s.Root == "" || s.Free == nil {
+		return 0, false
+	}
+	free, err := s.Free(nearest(s.Root))
+	if err != nil {
+		return 0, false
+	}
+	return clampI64(free), true
+}
+
+// manifestTotal is the sum of a manifest's file sizes, or false if it is unreadable.
+func manifestTotal(manifest []byte) (int64, bool) {
+	set, err := nodewl.ParseModelSet(manifest)
+	if err != nil {
+		return 0, false
+	}
+	var n int64
+	for _, f := range set.Files {
+		n += f.Bytes
+	}
+	return n, true
 }
 
 // margin is DiskMarginPercent of the bytes to write, at least DiskMarginMin.
@@ -803,7 +921,7 @@ func (s *Store) Rows() (rows []Row, ok bool) {
 			}
 			st.State = StateFetching // wanted, queued or between retries
 		}
-		rows = append(rows, Row{ID: r.ID, Revision: r.Revision, State: string(st.State), Reason: st.Reason})
+		rows = append(rows, s.rowLocked(r, st))
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		if rows[i].ID != rows[j].ID {
@@ -812,6 +930,34 @@ func (s *Store) Rows() (rows []Row, ok bool) {
 		return rows[i].Revision < rows[j].Revision
 	})
 	return rows, true
+}
+
+// rowLocked is the heartbeat row of one set, the delivery fields included.
+func (s *Store) rowLocked(r Ref, st Status) Row {
+	row := Row{ID: r.ID, Revision: r.Revision, State: string(st.State), Reason: st.Reason}
+	m := s.mem[r]
+	switch st.State {
+	case StateFetching:
+		if m.state == StateFetching && m.prog != nil {
+			done, total := m.prog.done.Load(), m.prog.total
+			row.BytesDone, row.BytesTotal = &done, &total
+		}
+	case StateVerified:
+		if b, err := os.ReadFile(filepath.Join(s.dir(r), ManifestName)); err == nil {
+			if total, ok := manifestTotal(b); ok {
+				row.BytesTotal = &total
+			}
+		}
+	case StateRefused:
+		if m.state == StateRefused {
+			row.RetryAt = m.until.UTC().Format(time.RFC3339)
+			if m.hasBytes && m.reason == nodewl.ReasonDisk {
+				free, need := m.free, m.need
+				row.FreeBytes, row.NeedBytes = &free, &need
+			}
+		}
+	}
+	return row
 }
 
 // ---- sync and prune -----------------------------------------------------

@@ -5,6 +5,7 @@
   "nvidia_driver_caps_ok": true,
   "controller_host": false,
   "data_root_free_gb": 412.5,
+  "model_sets_free_bytes": 442918502400,
   "addon_workloads_policy": "approve",
   "addon_workloads_approvals": [
     {
@@ -16,18 +17,31 @@
     {
       "id": "rh-s2s-7b",
       "revision": "0123456789abcdef0123456789abcdef01234567",
-      "state": "verified"
+      "state": "verified",
+      "bytes_total": 8388608000
     },
     {
       "id": "rh-voices-a",
       "revision": "v1",
-      "state": "fetching"
+      "state": "fetching",
+      "bytes_done": 3355443200,
+      "bytes_total": 8388608000
     },
     {
       "id": "rh-stt-small",
       "revision": "r1",
       "state": "refused",
-      "reason": "set_unverified"
+      "reason": "set_unverified",
+      "retry_at": "2026-11-09T14:32:00Z"
+    },
+    {
+      "id": "rh-tts-big",
+      "revision": "v2",
+      "state": "refused",
+      "reason": "disk",
+      "retry_at": "2026-11-09T14:32:00Z",
+      "free_bytes": 4509715660,
+      "need_bytes": 9663676416
     }
   ],
   "node_workloads": [

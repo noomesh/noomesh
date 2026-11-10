@@ -51,6 +51,16 @@ func (r *Reconciler) ModelSetsReport() any {
 	return rows
 }
 
+// ModelSetsFreeBytes is the heartbeat's `model_sets_free_bytes`: the free
+// bytes of the filesystem the model-set disk check measures. ok is false (the
+// key is omitted) when there is no store or the number cannot be read.
+func (r *Reconciler) ModelSetsFreeBytes() (int64, bool) {
+	if r.sets == nil {
+		return 0, false
+	}
+	return r.sets.FreeBytes()
+}
+
 // desiredSetRefs reads the sets of every node_workloads entry through the
 // contract's own validator. want is what to fetch (entries not absent); keep
 // is what to retain (every entry's sets).

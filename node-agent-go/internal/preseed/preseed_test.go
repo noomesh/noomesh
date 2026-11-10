@@ -440,3 +440,44 @@ func TestFetchOneVerifiedHTTPErrorKeepsPartial(t *testing.T) {
 		t.Fatal("a 503 is transient; the partial must stay")
 	}
 }
+
+// i607b: the progress callback reports bytes of the file on disk, at most
+// once per ProgressStep, ends on the full size, and never goes backwards.
+func TestFetchOneVerifiedProgressAdvancesToTheFullSize(t *testing.T) {
+	body := bytes.Repeat([]byte("0123456789abcdef"), (3*ProgressStep+12345)/16)
+	srv := verifiedServer(t, body)
+	defer srv.Close()
+	dest := filepath.Join(t.TempDir(), "m.gguf")
+	var seen []int64
+	wrote, err := New().FetchOneVerifiedProgress(context.Background(), srv.URL, dest, shaHex(body), func(n int64) { seen = append(seen, n) })
+	if err != nil || !wrote {
+		t.Fatalf("wrote=%v err=%v", wrote, err)
+	}
+	if len(seen) < 2 || len(seen) > len(body)/ProgressStep+2 {
+		t.Fatalf("progress calls = %d for %d bytes", len(seen), len(body))
+	}
+	for i := 1; i < len(seen); i++ {
+		if seen[i] <= seen[i-1] {
+			t.Fatalf("progress went %d -> %d", seen[i-1], seen[i])
+		}
+	}
+	if seen[len(seen)-1] != int64(len(body)) {
+		t.Fatalf("last progress = %d, want %d", seen[len(seen)-1], len(body))
+	}
+}
+
+// A file already present and verified writes nothing and reports nothing.
+func TestFetchOneVerifiedProgressSilentWhenAlreadyPresent(t *testing.T) {
+	body := []byte("gguf-bytes")
+	srv := verifiedServer(t, body)
+	defer srv.Close()
+	dest := filepath.Join(t.TempDir(), "m.gguf")
+	if err := os.WriteFile(dest, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	wrote, err := New().FetchOneVerifiedProgress(context.Background(), srv.URL, dest, shaHex(body), func(int64) { called = true })
+	if err != nil || wrote || called {
+		t.Fatalf("wrote=%v err=%v called=%v", wrote, err, called)
+	}
+}

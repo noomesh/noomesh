@@ -141,6 +141,11 @@ type Reporter struct {
 	// hence the atomic.
 	modelSets atomic.Pointer[func() any]
 
+	// modelSetsFree reports the free bytes of the filesystem the model-set
+	// disk check measures (i607b), sent as `model_sets_free_bytes`. nil = not
+	// wired; ok=false (unreadable, or no models dir) omits the key.
+	modelSetsFree atomic.Pointer[func() (int64, bool)]
+
 	// nodeFacts supplies the i300 F5b keys: the node facts, the consent policy
 	// and approvals, and `node_workloads`. It returns only the keys it knows;
 	// everything absent is omitted. nil = not wired. Installed after the loop
@@ -364,9 +369,20 @@ func (r *Reporter) gpuContentionReport() any {
 }
 
 // SetModelSets installs the model-set reporter, echoed on every heartbeat as
-// `model_sets` ([{id, revision, state, reason?}]). It returns nil when the
+// `model_sets` ([{id, revision, state, reason?, ...delivery fields}]). It returns nil when the
 // state cannot be read.
 func (r *Reporter) SetModelSets(f func() any) { r.modelSets.Store(&f) }
+
+// SetModelSetsFreeBytes installs the provider of `model_sets_free_bytes`.
+func (r *Reporter) SetModelSetsFreeBytes(f func() (int64, bool)) { r.modelSetsFree.Store(&f) }
+
+func (r *Reporter) modelSetsFreeBytes() (int64, bool) {
+	f := r.modelSetsFree.Load()
+	if f == nil || *f == nil {
+		return 0, false
+	}
+	return (*f)()
+}
 
 func (r *Reporter) modelSetsReport() any {
 	f := r.modelSets.Load()

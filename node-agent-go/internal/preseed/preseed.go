@@ -362,6 +362,20 @@ func (c *Client) FetchOne(ctx context.Context, fileURL, dest string) (bool, erro
 //     digest is for. A matching existing file is a no-op; a mismatching one
 //     is re-downloaded.
 func (c *Client) FetchOneVerified(ctx context.Context, fileURL, dest, expectedSHA256 string) (bool, error) {
+	return c.FetchOneVerifiedProgress(ctx, fileURL, dest, expectedSHA256, nil)
+}
+
+// ProgressStep is how many bytes pass between two progress calls: the
+// callback is a status read, not a per-write hook.
+const ProgressStep = 1 << 20
+
+// FetchOneVerifiedProgress is FetchOneVerified that also reports how many
+// bytes of THIS file are on disk so far (a resumed prefix included), through
+// progress (nil = none). It is called at most once per ProgressStep bytes,
+// plus once when the last byte is written, always from the fetching
+// goroutine. A file that is already present and verified writes nothing and
+// reports nothing.
+func (c *Client) FetchOneVerifiedProgress(ctx context.Context, fileURL, dest, expectedSHA256 string, progress func(written int64)) (bool, error) {
 	want := strings.ToLower(strings.TrimSpace(expectedSHA256))
 	if len(want) != 64 {
 		return false, fmt.Errorf("expected sha256 must be 64 hex chars, got %q", expectedSHA256)
@@ -407,6 +421,7 @@ func (c *Client) FetchOneVerified(ctx context.Context, fileURL, dest, expectedSH
 	defer resp.Body.Close()
 
 	flags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
+	var start int64 // bytes of the file already on disk when the body starts
 	switch {
 	case resp.StatusCode == http.StatusPartialContent && have > 0:
 		start, ok := contentRangeStart(resp.Header.Get("Content-Range"))
@@ -416,6 +431,7 @@ func (c *Client) FetchOneVerified(ctx context.Context, fileURL, dest, expectedSH
 		}
 		slog.Info("resuming verified fetch", "file", filepath.Base(dest), "from_mb", have>>20)
 		flags = os.O_WRONLY | os.O_APPEND
+		start = have
 	case resp.StatusCode == http.StatusOK:
 		if have > 0 {
 			slog.Info("server ignored the Range request; restarting the download", "file", filepath.Base(dest))
@@ -425,7 +441,7 @@ func (c *Client) FetchOneVerified(ctx context.Context, fileURL, dest, expectedSH
 		// The partial is at least as long as the file: it cannot be a prefix of it.
 		os.Remove(tmp)
 		slog.Info("partial is longer than the file; restarting the download", "file", filepath.Base(dest))
-		return c.FetchOneVerified(ctx, fileURL, dest, want)
+		return c.FetchOneVerifiedProgress(ctx, fileURL, dest, want, progress)
 	default:
 		return false, fmt.Errorf("fetch %s: HTTP %d", fileURL, resp.StatusCode) // partial kept
 	}
@@ -434,9 +450,18 @@ func (c *Client) FetchOneVerified(ctx context.Context, fileURL, dest, expectedSH
 	if err != nil {
 		return false, err
 	}
-	if _, err := io.Copy(f, io.TeeReader(resp.Body, hasher)); err != nil {
+	var sink io.Writer = f
+	var pw *progressWriter
+	if progress != nil {
+		pw = &progressWriter{w: f, n: start, last: start, fn: progress}
+		sink = pw
+	}
+	if _, err := io.Copy(sink, io.TeeReader(resp.Body, hasher)); err != nil {
 		f.Close()
 		return false, err // transport failure: keep the partial for the next try
+	}
+	if pw != nil && pw.n != pw.last {
+		progress(pw.n) // the tail below one step
 	}
 	if err := f.Close(); err != nil {
 		return false, err
@@ -450,6 +475,24 @@ func (c *Client) FetchOneVerified(ctx context.Context, fileURL, dest, expectedSH
 		return false, err
 	}
 	return true, nil
+}
+
+// progressWriter counts what reaches the file and calls fn at most once per
+// ProgressStep bytes; the caller adds the final call at the end of the body.
+type progressWriter struct {
+	w       io.Writer
+	n, last int64
+	fn      func(int64)
+}
+
+func (p *progressWriter) Write(b []byte) (int, error) {
+	n, err := p.w.Write(b)
+	p.n += int64(n)
+	if p.n-p.last >= ProgressStep {
+		p.last = p.n
+		p.fn(p.n)
+	}
+	return n, err
 }
 
 // hashInto streams path through h and returns its length.

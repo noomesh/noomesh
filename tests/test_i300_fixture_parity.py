@@ -369,6 +369,7 @@ HEARTBEAT_TYPES = {
     "nvidia_driver_caps_ok": bool,
     "controller_host": bool,
     "data_root_free_gb": (int, float),
+    "model_sets_free_bytes": int,  # i607b: free bytes of <models dir>/sets' filesystem
     "addon_workloads_policy": str,
     "addon_workloads_approvals": list,
     "model_sets": list,
@@ -385,9 +386,34 @@ def test_the_heartbeat_example_has_the_a4_keys_and_only_them() -> None:
     assert re.fullmatch(r"\d{1,2}\.\d", hb["gpu_compute_cap"])
     assert hb["addon_workloads_policy"] in ("none", "approve", "auto")
     assert all(set(a) == {"addon", "digest"} for a in hb["addon_workloads_approvals"])
+    assert hb["model_sets_free_bytes"] >= 0 and not isinstance(hb["model_sets_free_bytes"], bool)
+    # i607b: the delivery fields are optional, and each rides only its state.
+    row_keys = {"id", "revision", "state", "reason", "bytes_done", "bytes_total", "retry_at", "free_bytes", "need_bytes"}
+    only_with = {
+        "bytes_done": {"fetching"},
+        "bytes_total": {"fetching", "verified"},
+        "retry_at": {"refused"},
+        "free_bytes": {"refused"},
+        "need_bytes": {"refused"},
+    }
     for s in hb["model_sets"]:
-        assert set(s) <= {"id", "revision", "state", "reason"} and s["state"] in ("verified", "fetching", "refused")
+        assert {"id", "revision", "state"} <= set(s) <= row_keys and s["state"] in ("verified", "fetching", "refused")
         assert ("reason" in s) == (s["state"] == "refused"), "a reason rides a refused set"
+        for k, states in only_with.items():
+            if k in s:
+                assert s["state"] in states, f"{k} rides only {sorted(states)}, not {s['state']}"
+                assert isinstance(s[k], int) and not isinstance(s[k], bool) and s[k] >= 0 if k != "retry_at" else True
+        # free and need ride a disk refusal, and only together.
+        assert ("free_bytes" in s) == ("need_bytes" in s)
+        if "free_bytes" in s:
+            assert s["reason"] == "disk", "the disk numbers ride reason=disk"
+        if "retry_at" in s:
+            assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", s["retry_at"]), "RFC 3339, UTC"
+        if "bytes_done" in s:
+            assert "bytes_total" in s and s["bytes_done"] <= s["bytes_total"]
+    states = {s["state"] for s in hb["model_sets"]}
+    assert states == {"verified", "fetching", "refused"}, "the example shows every state"
+    assert any(s.get("reason") == "disk" and "free_bytes" in s for s in hb["model_sets"]), "the example shows a disk refusal"
     reasons = set(re.findall(r'Reason\w+\s*=\s*"([a-z_]+)"', (REPO / "node-agent-go/internal/nodewl/reasons.go").read_text()))
     for s in hb["model_sets"]:
         assert s.get("reason", "set_unverified") in reasons
