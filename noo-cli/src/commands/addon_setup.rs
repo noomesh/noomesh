@@ -934,9 +934,7 @@ fn next_open(steps: &[Step]) -> Option<usize> {
     if let Some(suffix) = s.id.strip_prefix("place") {
         if s.state == State::Todo {
             let want = format!("consent{suffix}");
-            if let Some(j) = steps.iter().position(|x| x.id == want && matches!(x.state, State::Stopped | State::Unknown)) {
-                return Some(j);
-            }
+            let _ = want;
         }
     }
     Some(i)
