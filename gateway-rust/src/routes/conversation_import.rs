@@ -158,7 +158,7 @@ async fn import(db: &PgPool, account: &str, channel: &str, p: Publication) -> Re
         .as_bytes(),
     );
     let mut tx = db.begin().await?;
-    let new_source = conversations::claim_source(&mut *tx, account, p.publisher_id, p.conversation_id, conversation).await?;
+    let new_source = conversations::claim_source(db, account, p.publisher_id, p.conversation_id, conversation).await?;
     let mut deleted = conversations::source_deleted_for_update(&mut *tx, account, p.publisher_id, p.conversation_id).await?;
     if !new_source && !deleted {
         // Noomesh may erase its copy independently. A surviving source ledger
