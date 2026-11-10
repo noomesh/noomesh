@@ -4808,10 +4808,21 @@ mod tests {
     fn an_unreadable_version_is_assumed_capable() {
         // Withholding on a version we failed to parse would silently deny
         // the harness to nodes that can run it — worse than the deadlock,
-        // because nothing would say so.
-        for v in ["", "unknown", "noo-cli-vX.Y.Z", "stack-v0.2.58+a21a072"] {
+        // because nothing would say so. This gate FAILS OPEN on unknown;
+        // the add-on leaf gate fails closed (a bundle with a kind the applier
+        // does not know is refused whole). Only the parse is shared
+        // (node_leaves::cli_version_triple).
+        for v in ["", "unknown", "noo-cli-vX.Y.Z", "stack-v0.2", "garbage"] {
             assert!(applier_knows_harness_kinds(true, v), "withheld on {v:?}");
         }
+        // A `stack-v` version is READABLE since the 0.6.21 fix (Linux appliers
+        // report their stack tag), so it is judged like any other: 0.2.58 is
+        // below the Mac floor (0.5.40) and withheld, exactly as
+        // noo-cli-v0.2.58 is. Unreadable it was "capable", which was wrong for
+        // a known-old applier, not a deliberate fail-open.
+        assert!(!applier_knows_harness_kinds(true, "stack-v0.2.58+a21a072"));
+        assert!(!applier_knows_harness_kinds(true, "noo-cli-v0.2.58"));
+        assert!(applier_knows_harness_kinds(true, "stack-v0.6.20+07ce5047"));
     }
 
     #[test]
