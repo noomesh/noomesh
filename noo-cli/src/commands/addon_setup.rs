@@ -1191,18 +1191,20 @@ struct LiveDoer<'a> {
     g: &'a Globals,
 }
 
-/// Run `f` with stdout pointed at /dev/null, so a verb's own JSON never mixes
-/// with setup's one document. Errors go to stderr and stay visible.
-fn quiet_stdout<T>(f: impl FnOnce() -> T) -> T {
+/// Run `f` with stdout (fd 1) pointed at stderr (fd 2), so a verb's own JSON
+/// never mixes with setup's one document on the real stdout, and is never lost.
+/// Known shape: a verb that fails exits the process from inside `fail()`, after
+/// writing its JSON error document to what is stdout then; in `--json`, setup's
+/// own document is then not printed, and the verb's error document is on
+/// stderr, with the verb's exit code.
+fn verb_stdout_to_stderr<T>(f: impl FnOnce() -> T) -> T {
     use std::io::Write as _;
-    use std::os::fd::AsRawFd as _;
     let _ = std::io::stdout().flush();
-    let Ok(null) = std::fs::OpenOptions::new().write(true).open("/dev/null") else { return f() };
     let saved = unsafe { libc::dup(1) };
     if saved < 0 {
         return f();
     }
-    unsafe { libc::dup2(null.as_raw_fd(), 1) };
+    unsafe { libc::dup2(2, 1) };
     let out = f();
     let _ = std::io::stdout().flush();
     unsafe {
@@ -1214,7 +1216,7 @@ fn quiet_stdout<T>(f: impl FnOnce() -> T) -> T {
 
 impl LiveDoer<'_> {
     fn call(&self, f: impl FnOnce(&Globals) -> Result<i32, Unhandled>) -> Result<(), String> {
-        let r = if self.g.json { quiet_stdout(|| f(self.g)) } else { f(self.g) };
+        let r = if self.g.json { verb_stdout_to_stderr(|| f(self.g)) } else { f(self.g) };
         match r {
             Ok(0) => Ok(()),
             Ok(code) => Err(format!("exited {code}")),
@@ -2664,6 +2666,14 @@ mod tests {
         assert!(readme.contains("| 6 | stopped for a decision"), "docs/cli/README.md exit-code table");
         assert!(include_str!("../main.rs").contains("6 stopped for a decision"), "the Agent contract header in main.rs");
         assert!(include_str!("../output.rs").contains("NeedsDecision = 6"));
+    }
+
+    #[test]
+    fn a_verbs_stdout_is_routed_to_stderr_never_to_dev_null() {
+        let src = crate::test_src::own_code(include_str!("addon_setup.rs"));
+        let body = crate::test_src::fn_body(&src, "fn verb_stdout_to_stderr<");
+        assert!(body.contains("libc::dup2(2, 1)"), "a verb's output must land on stderr");
+        assert!(!body.contains("/dev/null") && !src.contains("/dev/null"), "a verb's error document must never be thrown away");
     }
 
     #[test]
