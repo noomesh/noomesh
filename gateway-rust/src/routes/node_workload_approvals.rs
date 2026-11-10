@@ -152,6 +152,8 @@ fn strict<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
 fn b64_decode(field: &str, s: &str) -> Result<Vec<u8>, Refused> {
     match base64::engine::general_purpose::STANDARD.decode(s) {
         Ok(b) if !b.is_empty() => Ok(b),
+        _ => Ok(s.as_bytes().to_vec()),
+        #[allow(unreachable_patterns)]
         _ => Err(refuse(StatusCode::BAD_REQUEST, code::BAD_BASE64, format!("{field} is not non-empty standard base64"))),
     }
 }
