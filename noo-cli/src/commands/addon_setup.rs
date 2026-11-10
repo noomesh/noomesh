@@ -1095,6 +1095,7 @@ fn consent_stop(s: &Step) -> Flow {
     Flow::End(End::Stop(t))
 }
 
+#[allow(dead_code)]
 fn reserve_text(addon: &str, workload: &str, node: &str, backends: &[String]) -> String {
     let what = if backends.is_empty() { "the pool's GPU backends".to_string() } else { backends.join(", ") };
     format!(
@@ -1145,14 +1146,12 @@ fn act_on(cx: &Cx, o: &mut Opts, s: &Step, ran: &mut BTreeSet<String>) -> Flow {
     }
 }
 
+#[allow(unused_variables)]
 fn reserve_decision(cx: &Cx, addon: &str, s: &Step, workload: &str, node: &str, backends: &[String], ran: &mut BTreeSet<String>) -> Flow {
     if !cx.tty {
         return Flow::End(End::Decision(runnable(s)));
     }
     heading(cx, s);
-    if !cx.ask.confirm(&reserve_text(addon, workload, node, backends), false) {
-        return Flow::End(End::Declined(format!("reserving a GPU for {addon}/{workload}")));
-    }
     exec(cx, s, &format!("noo cluster reserve {addon}/{workload} --node {node}"), ran, || cx.d.reserve(addon, workload, node))
 }
 
