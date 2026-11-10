@@ -64,7 +64,7 @@ pub const OLLAMA_MIN_CHAT_CTX: u64 = 4096;
 /// token on 2.4 GB of weights); the floor alone overcounts nothing big
 /// (gemma-4-26B's 15.8 GB already gives 253 KiB).
 pub fn kv_bytes_per_token(weights_gb: f64) -> f64 {
-    (weights_gb * KV_BYTES_PER_TOKEN_PER_GB_WEIGHTS).max(KV_BYTES_PER_TOKEN_FLOOR)
+    (weights_gb * KV_BYTES_PER_TOKEN_PER_GB_WEIGHTS * 2.0).max(KV_BYTES_PER_TOKEN_FLOOR)
 }
 pub const MIN_CTX: u64 = 2048;
 pub const MAX_CTX: u64 = 32768;
