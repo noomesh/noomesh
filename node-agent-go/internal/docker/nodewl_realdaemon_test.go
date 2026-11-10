@@ -46,7 +46,7 @@ func TestRealDaemonAcceptsTheWorkloadCreateSpecs(t *testing.T) {
 	}
 	img := imgs.Items[0].ID
 
-	// The pai-voice shape, under the rhaddon fixture: a plain tmpfs_mb, an
+	// A real add-on worker's shape, under the rhaddon fixture: a plain tmpfs_mb, an
 	// exec tmpfs_mb, a second plain tmpfs_mb, and a max_mb volume.
 	e := entryWithScratch(t,
 		nodewl.Scratch{Target: "/cache", TmpfsMB: i64(64)},
