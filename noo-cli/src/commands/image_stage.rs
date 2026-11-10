@@ -98,7 +98,8 @@ pub(crate) fn nvidia_arches(nodes: &[Value]) -> Vec<String> {
 pub(crate) fn arches_for(image: &str, arches: &[String], nvidia: Option<&[String]>) -> (Vec<String>, Vec<String>) {
     match nvidia {
         Some(gpu) if NVIDIA_ONLY.contains(&image) => arches.iter().cloned().partition(|a| gpu.contains(a)),
-        _ => (arches.to_vec(), Vec::new()),
+        Some(_) => (arches.to_vec(), Vec::new()),
+        None => (Vec::new(), arches.to_vec()),
     }
 }
 
