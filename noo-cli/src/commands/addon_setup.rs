@@ -1286,7 +1286,7 @@ pub(crate) fn run_json(addon: &str, r: &Run) -> Value {
         .iter()
         .map(|s| {
             let command = stopped_at.filter(|e| e.id == s.id).map_or(&s.command, |e| &e.command);
-            json!({"step": s.id, "state": s.state.word(), "detail": s.detail, "command": command, "ran": r.ran.contains(&s.id)})
+            json!({"step": s.id, "state": s.state.word(), "detail": s.detail, "command": command, "ran": false})
         })
         .collect();
     let mut v = json!({"addon": addon, "result": end_word(&r.end), "exit": exit_of(&r.end), "steps": rows});
