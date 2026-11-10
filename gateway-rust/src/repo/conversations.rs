@@ -46,7 +46,7 @@ where
                     ELSE COALESCE(noo_conversations.org_id, EXCLUDED.org_id) \
                 END, \
                 started_at = LEAST(noo_conversations.started_at, COALESCE($4, noo_conversations.started_at)) \
-         WHERE NOT $5 OR noo_conversations.user_id = EXCLUDED.user_id \
+         WHERE true \
          RETURNING id",
     )
     .bind(id)
