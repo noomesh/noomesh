@@ -444,8 +444,3 @@ func drainToString(r interface{ Read([]byte) (int, error) }) string {
 		}
 	}
 }
-
-func lastLine(s string) string {
-	lines := strings.Split(strings.TrimSpace(s), "\n")
-	return lines[len(lines)-1]
-}
