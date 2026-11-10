@@ -64,7 +64,7 @@ func skipEscape(s string, i int) int {
 			j++
 		}
 		if j < len(s) && s[j] >= 0x40 && s[j] <= 0x7e {
-			return j
+			return j - 1
 		}
 		return j - 1
 	case ']', 'P', 'X', '^', '_':
