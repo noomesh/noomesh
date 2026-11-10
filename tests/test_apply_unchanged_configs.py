@@ -167,7 +167,9 @@ def flags(o: dict[str, str]) -> tuple[str, str, str]:
 # kind -> (payload files, preloaded files, installed path relative to root, flags a real install sets)
 PKI_NODE = f"pki/nodes/{NODE}"
 CASES = {
-    "ca.crt": ({"ca.crt": b"CA\n"}, {}, "pki/ca.crt", ("1", "0", "0"), ["ca.crt"]),
+    # A new CA restarts the harness too: it reads the CA as a systemd
+    # credential, copied at start (finding 116).
+    "ca.crt": ({"ca.crt": b"CA\n"}, {}, "pki/ca.crt", ("1", "1", "0"), ["ca.crt"]),
     "node.crt": ({"node.crt": b"CERT\n"}, {}, f"{PKI_NODE}/node.crt", ("1", "0", "0"), ["node.crt"]),
     "node.key": ({"node.key": b"KEY\n"}, {}, f"{PKI_NODE}/node.key", ("1", "0", "0"), ["node.key"]),
     "agent-env": ({"agent-env": f"NODE_ID={NODE}\nTIER=x\n".encode()}, {}, "etc/noo-node-agent.env",

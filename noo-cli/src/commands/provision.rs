@@ -1295,6 +1295,7 @@ fn attach_harness(g: &Globals, a: &ProvisionArgs, site: &ProvSite, enr: &ProvEnr
                         // the applier installs it root:noo-harness 0640 on
                         // Linux; a Mac runs both as one user, same files.
                         let (hcert, hkey) = harness_tls_paths(darwin, vars);
+                        hvars.insert("harness_tls_ca", harness_tls_ca(darwin, vars));
                         hvars.insert("harness_tls_cert", hcert);
                         hvars.insert("harness_tls_key", hkey);
                         let henv = render_env_template(&htmpl, &hvars)
@@ -4705,8 +4706,9 @@ agent-binary applier fetcher agent-unit verified-by: signing-key ca-lane: retire
 }
 
 /// Where the harness reads its TLS pair (`harness_tls_cert` /
-/// `harness_tls_key` in `noo-harness.env.tmpl`): its OWN copy on Linux
-/// (`scripts/noo-apply.sh`, harness-pair), the agent's files on a Mac.
+/// `harness_tls_key` in `noo-harness.env.tmpl`): on Linux its OWN copy
+/// (`scripts/noo-apply.sh`, harness-pair) as a systemd credential the unit
+/// loads (finding 116); the agent's files on a Mac.
 pub(crate) fn harness_tls_paths(darwin: bool, vars: &BTreeMap<&str, String>) -> (String, String) {
     if darwin {
         (vars.get("na_tls_cert").cloned().unwrap_or_default(), vars.get("na_tls_key").cloned().unwrap_or_default())
@@ -4715,9 +4717,26 @@ pub(crate) fn harness_tls_paths(darwin: bool, vars: &BTreeMap<&str, String>) -> 
     }
 }
 
-/// The harness's own copy of the node pair on a Linux node.
-pub(crate) const HARNESS_TLS_CERT: &str = "/etc/noo/pki/harness/node.crt";
-pub(crate) const HARNESS_TLS_KEY: &str = "/etc/noo/pki/harness/node.key";
+/// Where the harness reads the cluster CA (`harness_tls_ca`): on Linux the
+/// systemd credential its unit loads; the agent's CA path on a Mac.
+pub(crate) fn harness_tls_ca(darwin: bool, vars: &BTreeMap<&str, String>) -> String {
+    if darwin {
+        vars.get("na_tls_ca").cloned().unwrap_or_default()
+    } else {
+        HARNESS_TLS_CA.to_string()
+    }
+}
+
+/// On a Linux node the harness reads its CA and pair as systemd credentials
+/// (finding 116): `LoadCredential=` in `noo-harness.service` loads
+/// /etc/noo/pki/ca.crt and the harness's own copy of the node pair
+/// (/etc/noo/pki/harness/node.{crt,key}, i119) into the service's
+/// credentials directory, and the harness needs no access to /etc/noo/pki.
+/// The unit and these paths ship in the SAME bundle (attach_harness), so
+/// they never skew.
+pub(crate) const HARNESS_TLS_CA: &str = "/run/credentials/noo-harness.service/ca.crt";
+pub(crate) const HARNESS_TLS_CERT: &str = "/run/credentials/noo-harness.service/node.crt";
+pub(crate) const HARNESS_TLS_KEY: &str = "/run/credentials/noo-harness.service/node.key";
 
 #[cfg(test)]
 mod tests {
@@ -5144,11 +5163,14 @@ mod tests {
         v.insert("noo_harness_max_turns", "V_max_turns".into());
         v.insert("harness_log", "V_log".into());
         let (hc, hk) = harness_tls_paths(false, &v);
+        v.insert("harness_tls_ca", harness_tls_ca(false, &v));
         v.insert("harness_tls_cert", hc);
         v.insert("harness_tls_key", hk);
         let out = render_env_template(&tmpl, &v).unwrap();
         for line in ["NODE_ID=V_na_node_id", "NOO_GATEWAY_URL=V_controller_url", "NATS_URL=V_nats_url",
-                     "NOO_TLS_CA=V_na_tls_ca", "NOO_TLS_CERT=/etc/noo/pki/harness/node.crt", "NOO_TLS_KEY=/etc/noo/pki/harness/node.key",
+                     "NOO_TLS_CA=/run/credentials/noo-harness.service/ca.crt",
+                     "NOO_TLS_CERT=/run/credentials/noo-harness.service/node.crt",
+                     "NOO_TLS_KEY=/run/credentials/noo-harness.service/node.key",
                      "NOO_HARNESS_MODEL_URL=V_model_url", "NOO_HARNESS_MAX_TURNS=V_max_turns", "RUST_LOG=V_log"] {
             assert!(out.contains(line), "harness env lacks {line}:\n{out}");
         }
