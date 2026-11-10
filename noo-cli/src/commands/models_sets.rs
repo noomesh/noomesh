@@ -1743,9 +1743,6 @@ fn rm_targets(store: &Path, id: &str, revision: Option<&str>) -> Result<Vec<Path
 /// id). An entry that is a symbolic link, or not a directory, is refused,
 /// never followed. Other hidden entries are left alone.
 fn rm_work_dirs(store: &Path, id: &str, revision: Option<&str>) -> Result<Vec<PathBuf>, String> {
-    if revision.is_some() {
-        return Ok(Vec::new());
-    }
     let id_dir = store.join(SETS_DIR).join(id);
     let mut found: Vec<PathBuf> = std::fs::read_dir(&id_dir)
         .map(|rd| {
