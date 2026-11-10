@@ -2354,7 +2354,7 @@ pub(crate) fn upgrade_seats(g: &Globals) -> i32 {
         match stage_seat(g, s) {
             Ok(sha) => {
                 ui::say(&ui::sub(&ui::status_line(Glyph::Ok, "staged (CLI + kiosk assets, signed, encrypted to the seat's birth cert)")));
-                pending.push(super::provision::PendingApply { node: name, sha, legacy: false });
+                pending.push(super::provision::PendingApply { node: name, sha, legacy: false, applier_first: false });
             }
             Err(e) => {
                 ui::say_err(&ui::sub(&ui::status_line(Glyph::Err, &format!("not staged: {e}"))));

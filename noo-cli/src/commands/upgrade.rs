@@ -2923,9 +2923,8 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
             let mut pending: Vec<super::provision::PendingApply> = Vec::new();
             ui::blank();
             upgrade_self_node(g, &me, &mut failed, &mut pending);
-            if !pending.is_empty() {
-                wait_and_settle_nodes(g, &pending, Some(&me), &mut failed);
-            }
+            let waited = if pending.is_empty() { Vec::new() } else { wait_and_settle_nodes(g, &pending, Some(&me), &mut failed) };
+            print_node_outcomes(g, &node_outcome_rows(&[me.clone()], &[], &waited, &failed));
             return Ok(if failed.is_empty() { 0 } else { 1 });
         }
         ui::guide(&[("noo cluster bootstrap-token create --node <name>", "mints the paste that enrolls a first node")]);
@@ -3002,6 +3001,9 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
         // staging replaces its row; the combined wait needs it for the
         // legacy fallback (the child judged the same fact for its own steps).
         let legacy = super::provision::node_never_reported_apply(g, n);
+        // A node that needs the applier first gets ONLY that bundle now;
+        // the combined wait restages the full one when it is in.
+        let applier_first = super::provision::applier_first_for(g, n);
         // `--stage-only`: stage and poke, return at once. The apply is
         // waited for below, for every node together, so one slow node no
         // longer holds up staging the rest.
@@ -3016,7 +3018,7 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
         // has no sha the node cannot be waited on and is reported failed
         // here instead of silently counted as staged.
         match super::provision::staged_sha_of(g, n) {
-            Some(sha) => pending.push(super::provision::PendingApply { node: n.clone(), sha, legacy }),
+            Some(sha) => pending.push(super::provision::PendingApply { node: n.clone(), sha, legacy, applier_first }),
             None => {
                 ui::say_err(&ui::sub(&ui::status_line(Glyph::Err,
                     &format!("{n}: staged, but the gateway reports no staged bundle to wait on"))));
@@ -3035,9 +3037,11 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
         ui::blank();
         upgrade_self_node(g, me, &mut failed, &mut pending);
     }
-    if !pending.is_empty() {
-        wait_and_settle_nodes(g, &pending, me.as_deref(), &mut failed);
-    }
+    let waited = if pending.is_empty() { Vec::new() } else { wait_and_settle_nodes(g, &pending, me.as_deref(), &mut failed) };
+    // One line per node, whatever the others did (0.6.21: "stopped at the
+    // nodes stage" hid that pop-os upgraded fine beside a failed node).
+    let order: Vec<String> = names.iter().cloned().chain(me.clone()).collect();
+    print_node_outcomes(g, &node_outcome_rows(&order, &skipped, &waited, &failed));
     // A node whose first staging failed is already in `failed`; waiting
     // for it to apply a bundle it never got would only burn the budget.
     let waiting: Vec<String> = leafless.into_iter()
@@ -3097,27 +3101,145 @@ const NODES_APPLY_BUDGET_SECS: u64 = 600;
 /// costs nothing and a node's verdict shows up that much sooner.
 const NODES_APPLY_POLL_SECS: u64 = 5;
 
+/// How one node's restage ended: the nodes stage's table, and the data
+/// i613's wave loop reads (it calls [`wait_and_settle_nodes`] once per
+/// wave, on that wave's nodes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    Applied,
+    /// Applied by a fetcher that cannot report (legacy): not confirmed.
+    Unconfirmed,
+    Refused,
+    NotFetched,
+    NotReported,
+    /// Staging itself failed (the child's error is above the table).
+    NotStaged,
+    SkippedOffline,
+}
+
+impl Outcome {
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            Outcome::Applied => "applied",
+            Outcome::Unconfirmed => "unconfirmed",
+            Outcome::Refused => "refused",
+            Outcome::NotFetched => "not fetched",
+            Outcome::NotReported => "no report",
+            Outcome::NotStaged => "not staged",
+            Outcome::SkippedOffline => "skipped",
+        }
+    }
+}
+
+/// One node's line in the table.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct NodeOutcome {
+    pub node: String,
+    pub outcome: Outcome,
+    pub why: String,
+    pub elapsed_secs: u64,
+}
+
+/// The outcome an end of the combined wait means, and why, in words.
+fn outcome_of(end: &super::provision::ApplyEnd) -> (Outcome, String) {
+    use super::provision::ApplyEnd;
+    match end {
+        ApplyEnd::Applied { rc: 0, .. } => (Outcome::Applied, "applied (exit 0)".into()),
+        ApplyEnd::Applied { rc, .. } => (Outcome::Refused, format!("the applier refused the bundle (exit {rc})")),
+        ApplyEnd::LegacyUnconfirmed => (Outcome::Unconfirmed, "applied without confirmation (legacy fetcher)".into()),
+        ApplyEnd::NotReported { fetched: true } => (Outcome::NotReported, "fetched, but no apply report".into()),
+        ApplyEnd::NotReported { fetched: false } => (Outcome::NotFetched, "never fetched the bundle".into()),
+    }
+}
+
+/// After a node's applier-only bundle ended this way, is its full bundle
+/// staged next? Yes unless the node never fetched at all: the old blocking
+/// handshake also went on after a refused applier or a missing report
+/// (with a warning), and failed only on "never fetched".
+fn full_bundle_follows(end: &super::provision::ApplyEnd) -> bool {
+    !matches!(end, super::provision::ApplyEnd::NotReported { fetched: false })
+}
+
+/// Restage `n`'s FULL bundle after its applier (`FULL_BUNDLE_ENV` set for
+/// that one child), and return what to wait on.
+fn restage_full_bundle(g: &Globals, n: &str, legacy: bool) -> Option<super::provision::PendingApply> {
+    std::env::set_var(super::provision::FULL_BUNDLE_ENV, "1");
+    let rc = provision_one(g, n, &["--stage-only"]);
+    std::env::remove_var(super::provision::FULL_BUNDLE_ENV);
+    if !matches!(rc, Ok(0)) {
+        return None;
+    }
+    super::provision::staged_sha_of(g, n)
+        .map(|sha| super::provision::PendingApply { node: n.to_string(), sha, legacy, applier_first: false })
+}
+
 /// Wait for every staged node together, then settle each: a node that
 /// applied runs the post-apply steps `cluster provision` runs; one that
 /// refused or never reported goes into `failed` with its remedy. A skipped
 /// or unreported step is printed as such, never counted as applied.
 /// `self_node` is the controller's own node when it is among `pending`: it
 /// gets the self-node post-apply steps and is named "(self node)" in `failed`.
-fn wait_and_settle_nodes(g: &Globals, pending: &[super::provision::PendingApply], self_node: Option<&str>, failed: &mut Vec<String>) {
+///
+/// A node staged `applier_first` waits in the same round as every other
+/// node; once its applier is in, its full bundle is staged and waited for
+/// in a second round. No node's handshake holds up another's (0.6.21).
+/// Works on any subset of nodes, and returns one [`NodeOutcome`] per node
+/// in `pending`, in order.
+fn wait_and_settle_nodes(g: &Globals, pending: &[super::provision::PendingApply], self_node: Option<&str>, failed: &mut Vec<String>) -> Vec<NodeOutcome> {
     ui::blank();
-    let ends = super::provision::wait_nodes_applied(g, pending, NODES_APPLY_BUDGET_SECS, NODES_APPLY_POLL_SECS);
+    let first = super::provision::wait_nodes_applied_timed(g, pending, NODES_APPLY_BUDGET_SECS, NODES_APPLY_POLL_SECS);
+    let mut settled: Vec<Option<(super::provision::ApplyEnd, u64)>> = Vec::new();
+    let mut second: Vec<super::provision::PendingApply> = Vec::new();
+    let mut second_at: Vec<(usize, u64)> = Vec::new();
+    let mut not_staged: Vec<usize> = Vec::new();
+    for (i, ((n, end, took), p)) in first.into_iter().zip(pending).enumerate() {
+        if p.applier_first && full_bundle_follows(&end) {
+            match &end {
+                super::provision::ApplyEnd::Applied { rc, .. } if *rc != 0 => ui::say(&ui::sub(&ui::status_line(Glyph::Warn,
+                    &format!("{n}: the applier-only bundle reported exit {rc} — staging the full bundle anyway")))),
+                super::provision::ApplyEnd::Applied { .. } => ui::say(&ui::sub(&ui::status_line(Glyph::Step,
+                    &format!("{n}: installed the applier — staging the full bundle")))),
+                _ => ui::say(&ui::sub(&ui::status_line(Glyph::Warn,
+                    &format!("{n}: no report for the applier — staging the full bundle without confirmation")))),
+            }
+            match restage_full_bundle(g, &n, p.legacy) {
+                Some(next) => { second_at.push((i, took)); second.push(next); }
+                None => not_staged.push(i),
+            }
+            settled.push(None);
+            continue;
+        }
+        settled.push(Some((end, took)));
+    }
+    if !second.is_empty() {
+        ui::blank();
+        for ((i, before), (_, end, took)) in second_at.into_iter().zip(super::provision::wait_nodes_applied_timed(g, &second, NODES_APPLY_BUDGET_SECS, NODES_APPLY_POLL_SECS)) {
+            settled[i] = Some((end, before + took));
+        }
+    }
     let mut applied = 0usize;
     let mut unconfirmed = 0usize;
     let mut json_rows: Vec<serde_json::Value> = Vec::new();
-    for (n, end) in ends {
+    let mut out: Vec<NodeOutcome> = Vec::new();
+    for (i, p) in pending.iter().enumerate() {
+        let n = p.node.clone();
         let is_self = self_node == Some(n.as_str());
-        let (row, settled) = settle_end(g, &n, end, is_self);
+        let Some((end, took)) = settled[i].take() else {
+            // The applier went in but the full bundle could not be staged.
+            debug_assert!(not_staged.contains(&i));
+            failed.push(if is_self { format!("{n} (self node)") } else { n.clone() });
+            out.push(NodeOutcome { node: n, outcome: Outcome::NotStaged, why: "the applier went in; staging the full bundle failed (see above)".into(), elapsed_secs: 0 });
+            continue;
+        };
+        let (outcome, why) = outcome_of(&end);
+        let (row, s) = settle_end(g, &n, end, is_self);
         json_rows.push(row);
-        match settled {
+        match s {
             Settled::Applied => applied += 1,
             Settled::Unconfirmed => unconfirmed += 1,
-            Settled::Failed => failed.push(if is_self { format!("{n} (self node)") } else { n }),
+            Settled::Failed => failed.push(if is_self { format!("{n} (self node)") } else { n.clone() }),
         }
+        out.push(NodeOutcome { node: n, outcome, why, elapsed_secs: took });
     }
     if g.json {
         println!("{}", serde_json::json!({"nodes_apply": json_rows}));
@@ -3128,6 +3250,56 @@ fn wait_and_settle_nodes(g: &Globals, pending: &[super::provision::PendingApply]
             applied, pending.len(),
             if unconfirmed > 0 { format!(", {unconfirmed} unconfirmed (legacy fetcher)") } else { String::new() })));
     }
+    out
+}
+
+/// The nodes stage's rows, one per node in `order` that this stage touched:
+/// skipped offline, waited on (the combined wait's outcome), or failed to
+/// stage. Pure, so the table is testable without a gateway.
+fn node_outcome_rows(order: &[String], skipped: &[(String, String)], waited: &[NodeOutcome], failed: &[String]) -> Vec<NodeOutcome> {
+    let mut rows = Vec::new();
+    for n in order {
+        if let Some((_, why)) = skipped.iter().find(|(s, _)| s == n) {
+            rows.push(NodeOutcome { node: n.clone(), outcome: Outcome::SkippedOffline, why: format!("offline before the roll ({why})"), elapsed_secs: 0 });
+        } else if let Some(o) = waited.iter().find(|o| &o.node == n) {
+            rows.push(o.clone());
+        } else if failed.iter().any(|f| f == n || *f == format!("{n} (self node)")) {
+            rows.push(NodeOutcome { node: n.clone(), outcome: Outcome::NotStaged, why: "staging failed (see above)".into(), elapsed_secs: 0 });
+        }
+    }
+    rows
+}
+
+/// One line per node: name, outcome, seconds, why. Knows nothing about
+/// waves: i613's loop prints it once per wave.
+pub(crate) fn print_node_outcomes(g: &Globals, rows: &[NodeOutcome]) {
+    if rows.is_empty() {
+        return;
+    }
+    if g.json {
+        println!("{}", serde_json::json!({"node_outcomes": rows.iter().map(|r| serde_json::json!({
+            "node": r.node, "outcome": r.outcome.word(), "why": r.why, "elapsed_secs": r.elapsed_secs,
+        })).collect::<Vec<_>>()}));
+        return;
+    }
+    ui::blank();
+    for line in node_outcome_lines(rows) {
+        ui::say(&line);
+    }
+}
+
+/// The table's text lines (no colour decisions beyond the glyph).
+fn node_outcome_lines(rows: &[NodeOutcome]) -> Vec<String> {
+    let w = rows.iter().map(|r| r.node.chars().count()).max().unwrap_or(0);
+    rows.iter().map(|r| {
+        let glyph = match r.outcome {
+            Outcome::Applied => Glyph::Ok,
+            Outcome::Unconfirmed | Outcome::SkippedOffline => Glyph::Warn,
+            _ => Glyph::Err,
+        };
+        let secs = if r.elapsed_secs > 0 { format!("{:>4}s", r.elapsed_secs) } else { "     ".to_string() };
+        ui::sub(&ui::status_line(glyph, &format!("{:<w$}  {:<11} {secs}  {}", r.node, r.outcome.word(), r.why)))
+    }).collect()
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -3445,7 +3617,7 @@ fn mac_leaves_pass(g: &Globals, nodes: &[String], budget: u64) -> Vec<(String, M
         // No staged sha on the route means there is nothing to wait on:
         // reported as a failed restage, never counted as staged.
         match super::provision::staged_sha_of(g, n) {
-            Some(sha) => pending.push(super::provision::PendingApply { node: n.clone(), sha, legacy }),
+            Some(sha) => pending.push(super::provision::PendingApply { node: n.clone(), sha, legacy, applier_first: false }),
             None => {
                 ui::say_err(&ui::sub(&ui::status_line(Glyph::Err,
                     &format!("{n}: staged, but the gateway reports no staged bundle to wait on"))));
@@ -3514,6 +3686,7 @@ fn upgrade_self_node(g: &Globals, me: &str, failed: &mut Vec<String>, pending: &
     // summary line for every node staged before it. Read BEFORE the staging
     // replaces the row (see the nodes loop).
     let legacy = super::provision::node_never_reported_apply(g, me);
+    let applier_first = super::provision::applier_first_for(g, me);
     if !matches!(provision_one(g, me, &["--stage-only"]), Ok(0)) {
         failed.push(format!("{me} (self node)"));
         return;
@@ -3521,7 +3694,7 @@ fn upgrade_self_node(g: &Globals, me: &str, failed: &mut Vec<String>, pending: &
     // No staged sha on the route means there is nothing to wait on: failed
     // here, never counted as staged.
     match super::provision::staged_sha_of(g, me) {
-        Some(sha) => pending.push(super::provision::PendingApply { node: me.to_string(), sha, legacy }),
+        Some(sha) => pending.push(super::provision::PendingApply { node: me.to_string(), sha, legacy, applier_first }),
         None => {
             ui::say_err(&ui::sub(&ui::status_line(Glyph::Err,
                 &format!("{me}: staged, but the gateway reports no staged bundle to wait on"))));
@@ -7529,5 +7702,124 @@ mod embedder_after_roll_tests {
         let running = ensure.find("if !running").expect("a running check");
         let create = ensure.find("ensure_embed_model_core(&model)").expect("the shared fetch-and-create");
         assert!(running < create, "nothing is created in a container that is down");
+    }
+}
+
+/// 123 (outside tester, 0.6.21): a self node that had never reported an
+/// apply held `stage_applier_first`'s 600 s fetch wait inside STAGING, so
+/// pop-os was staged only after it; and "stopped at the nodes stage" hid
+/// that pop-os then upgraded fine.
+#[cfg(test)]
+mod nodes_stage_nonblocking_tests {
+    use super::{full_bundle_follows, node_outcome_lines, node_outcome_rows, outcome_of, NodeOutcome, Outcome};
+    use crate::commands::provision::{applier_first_due, ApplyEnd};
+
+    #[test]
+    fn the_applier_goes_first_only_for_a_legacy_non_mac_node_with_an_applier_to_send() {
+        assert!(applier_first_due(true, false, true));
+        for (legacy, darwin, present) in [(false, false, true), (true, true, true), (true, false, false)] {
+            assert!(!applier_first_due(legacy, darwin, present), "{legacy} {darwin} {present}");
+        }
+    }
+
+    /// The old handshake went on to the full bundle after a refused applier
+    /// or a missing report, and failed only when the node never fetched.
+    #[test]
+    fn the_full_bundle_follows_the_applier_unless_the_node_never_fetched() {
+        for end in [
+            ApplyEnd::Applied { rc: 0, msg: String::new() },
+            ApplyEnd::Applied { rc: 2, msg: String::new() },
+            ApplyEnd::LegacyUnconfirmed,
+            ApplyEnd::NotReported { fetched: true },
+        ] {
+            assert!(full_bundle_follows(&end), "{end:?}");
+        }
+        assert!(!full_bundle_follows(&ApplyEnd::NotReported { fetched: false }));
+    }
+
+    #[test]
+    fn every_end_has_an_outcome_and_a_reason() {
+        assert_eq!(outcome_of(&ApplyEnd::Applied { rc: 0, msg: "ok".into() }).0, Outcome::Applied);
+        let (o, why) = outcome_of(&ApplyEnd::Applied { rc: 3, msg: String::new() });
+        assert_eq!(o, Outcome::Refused);
+        assert!(why.contains("exit 3"), "{why}");
+        assert_eq!(outcome_of(&ApplyEnd::LegacyUnconfirmed).0, Outcome::Unconfirmed);
+        assert_eq!(outcome_of(&ApplyEnd::NotReported { fetched: true }).0, Outcome::NotReported);
+        assert_eq!(outcome_of(&ApplyEnd::NotReported { fetched: false }).0, Outcome::NotFetched);
+    }
+
+    fn row(n: &str, o: Outcome, secs: u64) -> NodeOutcome {
+        NodeOutcome { node: n.into(), outcome: o, why: format!("{} why", o.word()), elapsed_secs: secs }
+    }
+
+    /// The tester's run: the self node failed (never fetched), pop-os
+    /// applied. Both have a line; a skipped node and a staging failure too;
+    /// a node this stage never touched has none.
+    #[test]
+    fn every_touched_node_gets_a_row_in_order() {
+        let order: Vec<String> = ["host8", "pop-os", "host6", "untouched", "Lenovo-P52s"].iter().map(|s| s.to_string()).collect();
+        let skipped = vec![("host8".to_string(), "last seen 3 h ago".to_string())];
+        let waited = vec![row("pop-os", Outcome::Applied, 95), row("Lenovo-P52s", Outcome::NotFetched, 600)];
+        let failed = vec!["host6".to_string(), "Lenovo-P52s (self node)".to_string()];
+        let rows = node_outcome_rows(&order, &skipped, &waited, &failed);
+        let got: Vec<(&str, Outcome)> = rows.iter().map(|r| (r.node.as_str(), r.outcome)).collect();
+        assert_eq!(got, [
+            ("host8", Outcome::SkippedOffline),
+            ("pop-os", Outcome::Applied),
+            ("host6", Outcome::NotStaged),
+            ("Lenovo-P52s", Outcome::NotFetched),
+        ]);
+        assert!(rows[0].why.contains("last seen 3 h ago"), "{:?}", rows[0]);
+        // A self node that failed to STAGE (not waited on) is NotStaged.
+        let rows = node_outcome_rows(&["me".to_string()], &[], &[], &["me (self node)".to_string()]);
+        assert_eq!(rows.iter().map(|r| r.outcome).collect::<Vec<_>>(), [Outcome::NotStaged]);
+    }
+
+    #[test]
+    fn the_table_has_one_line_per_node_with_outcome_seconds_and_why() {
+        let lines = node_outcome_lines(&[row("pop-os", Outcome::Applied, 95), row("Lenovo-P52s", Outcome::NotFetched, 600)]);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("pop-os") && lines[0].contains("applied") && lines[0].contains("95s"), "{}", lines[0]);
+        assert!(lines[1].contains("Lenovo-P52s") && lines[1].contains("not fetched") && lines[1].contains("600s") && lines[1].contains("why"), "{}", lines[1]);
+    }
+
+    /// Under `--stage-only` the child stages the applier and RETURNS before
+    /// any fetch wait, and the provision verb then returns (scrubbing the
+    /// work dir, which holds the signed full bundle) before staging it.
+    #[test]
+    fn stage_only_never_waits_for_the_applier() {
+        let prov = crate::test_src::own_code(include_str!("provision.rs"));
+        let saf = crate::test_src::fn_body(&prov, "fn stage_applier_first(");
+        let ret = saf.find("if a.stage_only {\n                return (legacy, true);").expect("the stage-only return");
+        let wait = saf.find("wait_bundle_fetched(g, &node, 600)").expect("the single-node wait remains");
+        assert!(saf.find("poke_fetch(g, &node)").unwrap() < ret && ret < wait, "stage, poke, return; then (only without --stage-only) wait");
+        assert!(saf.contains("applier_first_due(legacy, darwin, !apply.is_empty())"), "one decision");
+        assert!(saf.contains("std::env::var(FULL_BUNDLE_ENV)"), "the restage after the applier stages the full bundle");
+        let verb = crate::test_src::fn_body(&prov, "pub fn cluster_provision(");
+        let early = verb.find("if applier_only {").expect("the early return");
+        let scrub = verb[early..].find("scrub(&work);").map(|i| i + early).expect("the work dir is scrubbed");
+        let staged = verb.find("stage_bundle(").expect("the full stage");
+        assert!(early < scrub && scrub < staged && verb[early..staged].contains("return Ok(0);"), "{verb}");
+        let first_for = crate::test_src::fn_body(&prov, "pub(crate) fn applier_first_for(");
+        assert!(first_for.contains("applier_first_due("), "the parent reads the same decision");
+    }
+
+    /// The combined wait restages the full bundle of an applier-first node
+    /// in a second round, with the env set only around that child.
+    #[test]
+    fn the_combined_wait_restages_the_full_bundle_after_the_applier() {
+        let up = crate::test_src::own_code(include_str!("upgrade.rs"));
+        let w = crate::test_src::fn_body(&up, "fn wait_and_settle_nodes(");
+        assert!(w.contains("if p.applier_first && full_bundle_follows(&end) {"), "{w}");
+        assert!(w.find("restage_full_bundle(g, &n, p.legacy)").unwrap() < w.rfind("wait_nodes_applied_timed(g, &second").unwrap());
+        let r = crate::test_src::fn_body(&up, "fn restage_full_bundle(");
+        let set = r.find("std::env::set_var(super::provision::FULL_BUNDLE_ENV, \"1\")").unwrap();
+        let child = r.find("provision_one(g, n, &[\"--stage-only\"])").unwrap();
+        let unset = r.find("std::env::remove_var(super::provision::FULL_BUNDLE_ENV)").unwrap();
+        assert!(set < child && child < unset, "{r}");
+        let nodes = crate::test_src::fn_body(&up, "fn upgrade_nodes(");
+        assert_eq!(nodes.matches("print_node_outcomes(g, &node_outcome_rows(").count(), 2, "both waits print the table");
+        assert!(nodes.find("let applier_first = super::provision::applier_first_for(g, n);").unwrap()
+            < nodes.find("provision_one(g, n, &[\"--stage-only\"])").unwrap(), "read before staging");
     }
 }

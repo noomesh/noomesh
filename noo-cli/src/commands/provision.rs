@@ -346,7 +346,15 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
     let bundle = sign_bundle(g, &a, &ca, &files, &work);
 
     // Stage it at the gateway, then judge what the node reports.
-    let legacy = stage_applier_first(g, &a, &machine, &ca);
+    let (legacy, applier_only) = stage_applier_first(g, &a, &machine, &ca);
+    if applier_only {
+        // `--stage-only` on a node that needs the applier first: only the
+        // applier bundle is staged (one bundle per node; the full one would
+        // replace it unfetched). The caller's combined wait restages the
+        // full bundle once the applier is in (PendingApply::applier_first).
+        scrub(&work);
+        return Ok(0);
+    }
     let staged = stage_bundle(g, &a, &enrollment, &machine, &bundle, &work, legacy);
     if a.stage_only {
         report_staged_only(g, &a, &staged);
@@ -1549,21 +1557,43 @@ fn sign_bundle(g: &Globals, a: &ProvisionArgs, ca: &crate::pki::ClusterCa, files
     }
 }
 
-/// A node that has never reported an apply runs the legacy fetcher/applier pair: stage an applier-only bundle first, the one kind every applier accepts. Returns whether the node is legacy.
+/// Set (to `1`) by the nodes stage around the restage that follows a
+/// staged applier: stage the FULL bundle, not the applier again.
+pub(crate) const FULL_BUNDLE_ENV: &str = "NOO_PROVISION_FULL_BUNDLE";
+
+/// Whether a node's staging begins with an applier-only bundle: it never
+/// reported an apply (legacy fetcher/applier), it is not a Mac, and this
+/// CLI carries an applier to send. ONE decision for the child that stages
+/// and the parent that waits (`upgrade::upgrade_nodes`).
+pub(crate) fn applier_first_due(legacy: bool, darwin: bool, applier_present: bool) -> bool {
+    legacy && !darwin && applier_present
+}
+
+/// [`applier_first_due`] for `node`, from the records the child reads.
+/// Read BEFORE staging, as `node_never_reported_apply` must be.
+pub(crate) fn applier_first_for(g: &Globals, node: &str) -> bool {
+    let darwin = enrolled_os(redemption_record(g, node).as_ref()) == "macos";
+    applier_first_due(node_never_reported_apply(g, node), darwin, !super::enroll::asset_apply().is_empty())
+        && std::env::var(FULL_BUNDLE_ENV).as_deref() != Ok("1")
+}
+
+/// A node that has never reported an apply runs the legacy fetcher/applier pair: stage an applier-only bundle first, the one kind every applier accepts. Returns (whether the node is legacy, whether ONLY the applier was staged: `--stage-only`, where the caller restages the full bundle).
 /// A node that has never reported an apply outcome runs the legacy
 /// fetcher/applier pair (pre-2026-09-03): its applier refuses every
 /// kind it does not know, and its fetcher cannot report. Stage an
 /// applier-only bundle first — the one kind every applier accepts —
 /// so the full bundle below is applied by the new applier.
-fn stage_applier_first(g: &Globals, a: &ProvisionArgs, m: &ProvMachine, ca: &crate::pki::ClusterCa) -> bool {
+fn stage_applier_first(g: &Globals, a: &ProvisionArgs, m: &ProvMachine, ca: &crate::pki::ClusterCa) -> (bool, bool) {
     let node = a.node.clone();
     let darwin = m.darwin;
     let birth_cert = m.birth_cert.clone();
     let cert = birth_cert.as_deref().expect("pull lane requires a birth cert");
     let legacy = node_never_reported_apply(g, &node);
-    if legacy && !darwin {
-        let apply = super::enroll::asset_apply();
-        if !apply.is_empty() {
+    // The restage after a staged applier: the full bundle now.
+    let after_applier = std::env::var(FULL_BUNDLE_ENV).as_deref() == Ok("1");
+    let apply = super::enroll::asset_apply();
+    if !after_applier && applier_first_due(legacy, darwin, !apply.is_empty()) {
+        {
             nstep(&format!("{node} has never reported an apply — staging the applier alone first"));
             let w2 = std::env::temp_dir().join(format!("noo-provision-applier-{node}-{}", std::process::id()));
             let _ = std::fs::create_dir_all(&w2);
@@ -1582,6 +1612,12 @@ fn stage_applier_first(g: &Globals, a: &ProvisionArgs, m: &ProvMachine, ca: &cra
                 fail(g.json, ExitCode::Generic, "stage_failed", &e, None);
             }
             poke_fetch(g, &node);
+            // `--stage-only`: never block here (0.6.21: a self node whose
+            // fetcher was broken held every later node's staging for the
+            // full 600 s). The caller waits, for every node together.
+            if a.stage_only {
+                return (legacy, true);
+            }
             let staged2 = wait_bundle_fetched(g, &node, 600);
             if !staged2 {
                 fail_guided(g, ExitCode::Generic, "not_fetched",
@@ -1607,7 +1643,7 @@ fn stage_applier_first(g: &Globals, a: &ProvisionArgs, m: &ProvMachine, ca: &cra
             }
         }
     }
-    legacy
+    (legacy, false)
 }
 
 /// Compress (when the node reads gzip), encrypt to the birth cert, stage at the gateway and poke the node.
@@ -4130,6 +4166,9 @@ pub(crate) struct PendingApply {
     /// The node had never reported an apply before this staging (see the
     /// legacy fallback in `cluster_provision`).
     pub legacy: bool,
+    /// Only the applier bundle is staged (`applier_first_due`): once it is
+    /// in, the nodes stage restages the full bundle and waits again.
+    pub applier_first: bool,
 }
 
 /// How one pending node ended.
@@ -4172,7 +4211,27 @@ pub(crate) fn wait_applied_via(
     status_path: &dyn Fn(&str) -> String,
     noun: &str,
 ) -> Vec<(String, ApplyEnd)> {
+    wait_applied_timed_via(g, pending, budget_secs, every_secs, status_path, noun)
+        .into_iter().map(|(n, end, _)| (n, end)).collect()
+}
+
+/// [`wait_nodes_applied`], with the seconds each node took to resolve (the
+/// whole wait for one that never did): the nodes stage's result table.
+pub(crate) fn wait_nodes_applied_timed(g: &Globals, pending: &[PendingApply], budget_secs: u64, every_secs: u64) -> Vec<(String, ApplyEnd, u64)> {
+    wait_applied_timed_via(g, pending, budget_secs, every_secs, &|n| format!("/api/cluster/provision-bundle/{n}/status"), "node")
+}
+
+/// [`wait_applied_via`], timed.
+fn wait_applied_timed_via(
+    g: &Globals,
+    pending: &[PendingApply],
+    budget_secs: u64,
+    every_secs: u64,
+    status_path: &dyn Fn(&str) -> String,
+    noun: &str,
+) -> Vec<(String, ApplyEnd, u64)> {
     let mut ends: Vec<Option<ApplyEnd>> = pending.iter().map(|_| None).collect();
+    let mut took: Vec<u64> = vec![0; pending.len()];
     let mut fetched = vec![false; pending.len()];
     let mut slow_warned = vec![false; pending.len()];
     let started = std::time::Instant::now();
@@ -4199,6 +4258,7 @@ pub(crate) fn wait_applied_via(
                             ui::status_line(Glyph::Err, &format!("{}: the applier refused the bundle (exit {rc})", p.node))
                         });
                         ends[i] = Some(ApplyEnd::Applied { rc, msg });
+                        took[i] = started.elapsed().as_secs();
                         continue;
                     }
                     BundleVerdict::Fetched if !fetched[i] => {
@@ -4212,6 +4272,7 @@ pub(crate) fn wait_applied_via(
                 say(ui::status_line(Glyph::Warn, &format!(
                     "{}: applied without confirmation — this node's fetcher predates apply reports; the next restage confirms", p.node)));
                 ends[i] = Some(ApplyEnd::LegacyUnconfirmed);
+                took[i] = started.elapsed().as_secs();
                 continue;
             }
             if !fetched[i] && !slow_warned[i] && elapsed >= SLOW_TIMER_WARN_SECS {
@@ -4225,8 +4286,10 @@ pub(crate) fn wait_applied_via(
         std::thread::sleep(std::time::Duration::from_secs(every_secs));
     }
     drop(poll);
-    pending.iter().zip(ends).zip(fetched).map(|((p, end), f)| {
-        (p.node.clone(), end.unwrap_or(ApplyEnd::NotReported { fetched: f }))
+    let whole = started.elapsed().as_secs();
+    pending.iter().zip(ends).zip(fetched).zip(took).map(|(((p, end), f), t)| match end {
+        Some(end) => (p.node.clone(), end, t),
+        None => (p.node.clone(), ApplyEnd::NotReported { fetched: f }, whole),
     }).collect()
 }
 
