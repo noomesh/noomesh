@@ -253,10 +253,10 @@ func scratchMounts(e nodewl.Entry, uid int64) ([]mount.Mount, map[string]string)
 				},
 			})
 		case s.TmpfsMB != nil:
-			if tmpfs == nil {
-				tmpfs = map[string]string{}
-			}
-			tmpfs[s.Target] = fmt.Sprintf("rw,nosuid,nodev,noexec,size=%dm,mode=1777", *s.TmpfsMB)
+			out = append(out, mount.Mount{
+				Type: mount.TypeTmpfs, Target: s.Target,
+				TmpfsOptions: &mount.TmpfsOptions{SizeBytes: *s.TmpfsMB << 20, Mode: 0o1777, Options: [][]string{{"nosuid"}, {"nodev"}, {"noexec"}}},
+			})
 		case s.MaxMB != nil:
 			out = append(out, mount.Mount{
 				Type: mount.TypeVolume, Source: workloadVolumeName(e.Addon, e.Name, i), Target: s.Target,
