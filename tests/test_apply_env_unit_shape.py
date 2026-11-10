@@ -257,6 +257,7 @@ def test_the_checks_run_before_anything_is_installed():
 # ── a pre-0.6.10 Mac applier must be sent an env it accepts ─────────────────
 
 PROVISION = (REPO / "noo-cli/src/commands/provision.rs").read_text()
+UPGRADE_DEPS = (REPO / "noo-cli/src/commands/upgrade_deps.rs").read_text()
 TRUST_KEYS = {"NODE_AGENT_BIND"}
 # node_fetch.rs AGENT_ENV_KEYS + AGENT_ENV_INERT_KEYS at noo-cli-v0.6.9 (frozen).
 MAC_0_6_9_KEYS = {
@@ -277,11 +278,16 @@ def test_withholding_the_trust_keys_leaves_exactly_what_the_0_6_9_applier_accept
 
 
 def test_the_provisioner_withholds_them_below_0_6_10_and_assumes_old_when_unknown():
-    assert "CLUSTER_TRUST_KEYS_MAC_FLOOR: (u32, u32, u32) = (0, 6, 10);" in PROVISION
+    # The floor is the ClusterTrustKeys row of the upgrade dependency map
+    # (i613): Mac only, 0.6.10, and an unknown version on darwin is OLD
+    # (Withhold), not capable (Include).
+    assert re.search(
+        r"item: Item::ClusterTrustKeys,\s*scope: Scope::MacNode,\s*need: Need::Applier\(\(0, 6, 10\)\),\s*"
+        r"unknown: Unknown::Withhold,",
+        UPGRADE_DEPS,
+    )
     assert re.search(r'CLUSTER_TRUST_ENV_KEYS: &\[&str\] = &\["NODE_AGENT_BIND"\]', PROVISION)
-    # unknown version on darwin is OLD (is_some_and), not capable (is_none_or).
     m = re.search(r"fn applier_knows_cluster_trust_keys.*?\n}\n", PROVISION, re.S)
-    assert m and "is_some_and(|v| v >= CLUSTER_TRUST_KEYS_MAC_FLOOR)" in m.group(0)
-    assert "is_none_or" not in m.group(0)
+    assert m and "upgrade_deps::meets(super::upgrade_deps::Item::ClusterTrustKeys" in m.group(0)
     # and the 0.6.10 appliers do accept them, so the floor is not too high.
     assert TRUST_KEYS <= rust_list("AGENT_ENV_KEYS")

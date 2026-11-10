@@ -219,8 +219,8 @@ pub(crate) fn bundle_vendor_kinds(placement: Option<&str>, vendor_kinds: &[Strin
 /// The bundle kinds the vendor CLIs ride in, one (payload, manifest) pair
 /// per CLI. Slot 1 keeps the names every applier since E1e knows, so a
 /// bundle carrying ONE CLI is byte-for-byte the layout it always was; the
-/// next slots are new kinds, which a Mac applier older than
-/// [`VENDOR_SLOTS_MAC_FLOOR`] would refuse the whole bundle on (the Linux
+/// next slots are new kinds, which a Mac applier older than the slots
+/// floor (`upgrade_deps`, `VendorSlots`) would refuse the whole bundle on (the Linux
 /// applier rides every bundle and self-updates first). Each slot is
 /// verified on its own: the manifest's sha256 against its own payload.
 pub(crate) const VENDOR_SLOTS: [(&str, &str); 3] = [
@@ -324,25 +324,22 @@ pub(crate) fn vendor_bundle_files(
     Ok(out)
 }
 
-/// The Mac applier learned the vendor kinds in this release; an older Mac
-/// CLI would refuse the whole bundle on them (see
-/// `provision::applier_knows_harness_kinds`), so it is sent none until its
-/// CLI moves. Linux always knows: the applier rides the bundle.
-pub(crate) const VENDOR_KINDS_MAC_FLOOR: (u32, u32, u32) = (0, 6, 5);
-
+/// The Mac applier learned the vendor kinds in 0.6.5 (the `VendorKinds` row
+/// of `upgrade_deps::DEPS`); an older Mac CLI would refuse the whole bundle
+/// on them (see `provision::applier_knows_harness_kinds`), so it is sent
+/// none until its CLI moves. Linux always knows: the applier rides the
+/// bundle. Unknown version: assume it can.
 pub(crate) fn applier_knows_vendor_kinds(darwin: bool, app_version: &str) -> bool {
-    !darwin || super::node_leaves::cli_version_triple(app_version).is_none_or(|v| v >= VENDOR_KINDS_MAC_FLOOR)
+    super::upgrade_deps::meets(super::upgrade_deps::Item::VendorKinds, darwin, app_version)
 }
 
-/// The first Mac applier that knows slots 2 and up ([`VENDOR_SLOTS`]).
-/// An older one (0.6.5 – this floor) gets slot 1 only — the harness
-/// placement's CLI, the layout it already applies — and the restage says
-/// so. FLOOR: the release after 0.6.7; if that number ships without this
-/// change, bump it.
-pub(crate) const VENDOR_SLOTS_MAC_FLOOR: (u32, u32, u32) = (0, 6, 8);
-
+/// The first Mac applier that knows slots 2 and up ([`VENDOR_SLOTS`]) is
+/// 0.6.8 (the `VendorSlots` row of `upgrade_deps::DEPS`). An older one
+/// (0.6.5 – that floor) gets slot 1 only — the harness placement's CLI, the
+/// layout it already applies — and the restage says so. Unknown version:
+/// assume it can.
 pub(crate) fn applier_knows_vendor_slots(darwin: bool, app_version: &str) -> bool {
-    !darwin || super::node_leaves::cli_version_triple(app_version).is_none_or(|v| v >= VENDOR_SLOTS_MAC_FLOOR)
+    super::upgrade_deps::meets(super::upgrade_deps::Item::VendorSlots, darwin, app_version)
 }
 
 // ── the wrapper ───────────────────────────────────────────────────────────

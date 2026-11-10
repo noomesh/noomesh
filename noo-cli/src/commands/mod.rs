@@ -106,6 +106,7 @@ pub mod systems;
 pub mod test;
 pub mod tools;
 pub mod upgrade;
+pub mod upgrade_deps;
 pub mod usage;
 pub mod recall;
 pub mod voice;

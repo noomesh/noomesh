@@ -32,6 +32,7 @@ from tests.test_apply_unchanged_configs import APPLIER, LINES, PRELUDE, delimite
 REPO = Path(__file__).resolve().parents[1]
 SIGN = REPO / "scripts" / "sign-bundle.sh"
 LEAVES_RS = (REPO / "noo-cli/src/commands/node_leaves.rs").read_text()
+UPGRADE_DEPS_RS = (REPO / "noo-cli/src/commands/upgrade_deps.rs").read_text()
 NODE = "node1"
 VALID = "svc-addon-rhaddon-worker"
 
@@ -190,7 +191,15 @@ def test_sign_bundle_refuses_an_invalid_addon_leaf_kind(tmp_path: Path, signing_
 
 
 def test_the_rust_constants_match_what_the_scripts_enforce() -> None:
-    assert "pub const APPLIER_ADDON_LEAVES_FLOOR: (u32, u32, u32) = (0, 6, 18);" in LEAVES_RS
+    # The floor lives in the upgrade dependency map (i613): every OS, 0.6.18,
+    # an unknown applier withheld; the reader goes through the map.
+    assert re.search(
+        r"item: Item::AddonLeaves,\s*scope: Scope::AnyNode,\s*need: Need::Applier\(\(0, 6, 18\)\),\s*"
+        r"unknown: Unknown::Withhold,",
+        UPGRADE_DEPS_RS,
+    )
+    m = re.search(r"pub fn applier_knows_addon_leaf_kinds.*?\n}\n", LEAVES_RS, re.S)
+    assert m and "upgrade_deps::meets(super::upgrade_deps::Item::AddonLeaves" in m.group(0)
     assert "pub const ADDON_DOOR_NAME_MAX: usize = 51;" in LEAVES_RS
     for text in (APPLIER, SIGN.read_text()):
         assert '[ "${#_alk}" -le 57 ]' in text and '*[!a-z0-9-]*|-*|*-' in text

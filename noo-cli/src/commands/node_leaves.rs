@@ -280,13 +280,10 @@ pub fn leaf_payloads(ca: &ClusterCa, node: &str) -> Result<(Vec<LeafPayload>, Ve
 /// unparseable version: assume it CAN — the same rule, for the same
 /// reason, as `provision::applier_knows_harness_kinds`.
 ///
-/// FLOOR: set to the release after noo-cli-v0.5.62 (the tag this branch
-/// was cut from). If that number ships without this change, bump it.
+/// The floor and the unknown-version rule are the `MacLeaves` row of
+/// `upgrade_deps::DEPS` (i613).
 pub fn applier_knows_leaf_kinds(darwin: bool, app_version: &str) -> bool {
-    if !darwin {
-        return true;
-    }
-    cli_version_triple(app_version).is_none_or(|v| v >= LEAF_KINDS_MAC_FLOOR)
+    super::upgrade_deps::meets(super::upgrade_deps::Item::MacLeaves, darwin, app_version)
 }
 
 /// The version a node's applier reports, as `(major, minor, patch)`: THE one
@@ -340,8 +337,9 @@ pub fn withheld_leaves_note(node: &str, app_version: &str, from_upgrade: bool) -
     )
 }
 
-/// First noo-cli release whose Mac applier installs the `svc-*` kinds.
-pub const LEAF_KINDS_MAC_FLOOR: (u32, u32, u32) = (0, 5, 63);
+/// First noo-cli release whose Mac applier installs the `svc-*` kinds: the
+/// `MacLeaves` row of `upgrade_deps::DEPS`.
+pub const LEAF_KINDS_MAC_FLOOR: (u32, u32, u32) = super::upgrade_deps::floor(super::upgrade_deps::Item::MacLeaves);
 
 // ── add-on node workload door leaves (i300 §10.1 A1) ─────────────────────
 //
@@ -353,10 +351,10 @@ pub const LEAF_KINDS_MAC_FLOOR: (u32, u32, u32) = (0, 5, 63);
 // SHAPE (`addon_leaf_kind_ok` here, `addon_leaf_kind_ok()` in noo-apply.sh
 // and sign-bundle.sh) because the set is open.
 
-/// First noo-cli release whose applier installs `svc-addon-*` kinds. A node
-/// reporting an older CLI gets none in its bundle (any OS); so does one whose
-/// version is unknown or unparseable (see [`applier_knows_addon_leaf_kinds`]).
-pub const APPLIER_ADDON_LEAVES_FLOOR: (u32, u32, u32) = (0, 6, 18);
+// The first noo-cli release whose applier installs `svc-addon-*` kinds is the
+// `AddonLeaves` row of `upgrade_deps::DEPS` (0.6.18). A node reporting an
+// older CLI gets none in its bundle (any OS); so does one whose version is
+// unknown or unparseable (see `applier_knows_addon_leaf_kinds`).
 
 /// Longest `<addon>-<workload>` (so the service name `addon-…` is at most 57).
 pub const ADDON_DOOR_NAME_MAX: usize = 51;
@@ -495,15 +493,16 @@ fn check_addon_door(addon: &str, workload: &str) -> Result<(), String> {
     ))
 }
 
-/// Can the node's applier take `svc-addon-*` kinds? Every OS: below
-/// [`APPLIER_ADDON_LEAVES_FLOOR`] the applier would refuse the whole bundle
-/// on a kind it does not know (exit 76). Unknown or unparseable version:
-/// WITHHOLD. Unlike the static kinds, no applier before the floor knows these
-/// at all, so guessing "it can" would fail the whole bundle; withholding only
-/// leaves the door unprovisioned, which the agent reports as
-/// `door_leaf_missing`.
+/// Can the node's applier take `svc-addon-*` kinds? Every OS: below the
+/// floor (the `AddonLeaves` row of `upgrade_deps::DEPS`) the applier would
+/// refuse the whole bundle on a kind it does not know (exit 76). Unknown or
+/// unparseable version: WITHHOLD. Unlike the static kinds, no applier before
+/// the floor knows these at all, so guessing "it can" would fail the whole
+/// bundle; withholding only leaves the door unprovisioned, which the agent
+/// reports as `door_leaf_missing`.
 pub fn applier_knows_addon_leaf_kinds(app_version: &str) -> bool {
-    cli_version_triple(app_version).is_some_and(|v| v >= APPLIER_ADDON_LEAVES_FLOOR)
+    // Every OS: the row's scope is AnyNode, so `darwin` does not matter.
+    super::upgrade_deps::meets(super::upgrade_deps::Item::AddonLeaves, false, app_version)
 }
 
 /// The note `cluster provision` prints, one line per node, when it withholds
@@ -926,7 +925,7 @@ mod tests {
 
     #[test]
     fn the_addon_floor_withholds_below_and_includes_at_or_above() {
-        assert_eq!(APPLIER_ADDON_LEAVES_FLOOR, (0, 6, 18));
+        assert_eq!(crate::commands::upgrade_deps::floor(crate::commands::upgrade_deps::Item::AddonLeaves), (0, 6, 18));
         assert!(!applier_knows_addon_leaf_kinds("noo-cli-v0.6.17+abc"));
         assert!(!applier_knows_addon_leaf_kinds("noo-cli-v0.5.99"));
         assert!(applier_knows_addon_leaf_kinds("noo-cli-v0.6.18"));
