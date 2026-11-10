@@ -1098,7 +1098,7 @@ fn consent_stop(s: &Step) -> Flow {
 fn reserve_text(addon: &str, workload: &str, node: &str, backends: &[String]) -> String {
     let what = if backends.is_empty() { "the pool's GPU backends".to_string() } else { backends.join(", ") };
     format!(
-        "Reserving {addon}/{workload} pauses {what} on {node} until you release it (noo cluster release): \
+        "Reserving {addon}/{workload} uses {what} on {node} until you release it (noo cluster release): \
          requests in flight there finish first, then the pool's work on that GPU stops"
     )
 }
