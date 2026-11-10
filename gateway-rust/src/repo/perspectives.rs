@@ -18,7 +18,7 @@ where
     E: sqlx::PgExecutor<'e>,
 {
     sqlx::query_as(
-        "SELECT account, ended_at IS NOT NULL, cap_at, started_at FROM noo_perspectives WHERE id = $1::uuid",
+        "SELECT account, ended_at IS NOT NULL, cap_at + interval '100 years', started_at FROM noo_perspectives WHERE id = $1::uuid",
     )
     .bind(id)
     .fetch_optional(db)
