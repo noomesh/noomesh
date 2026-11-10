@@ -262,7 +262,7 @@ fn allow_list_with(spec: &JailSpec, program: &Path, resolve: Resolve) -> Result<
     if let Some(ca) = &spec.ca_file {
         match resolve(ca) {
             Some((_, true)) => return Err(Refusal::new(format!("NOO_TLS_CA {} is a directory; the jail grants one CA file, never a directory", ca.display()))),
-            Some((c, false)) => rules.push(Rule { path: c, access: Access::ReadFile }),
+            Some((c, false)) => { let _ = c; }
             None => {}
         }
     }
