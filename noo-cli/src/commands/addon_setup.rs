@@ -213,6 +213,7 @@ pub(crate) fn parse(args: &[String]) -> Result<(Opts, bool), ArgError> {
     let node = a.value(&["--node"])?.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let key = a.value(&["--key"])?.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let registry = a.value(&["--registry"])?.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let _token = a.value(&["--token"])?;
     let mut sets = Vec::new();
     for raw in a.values(&["--set"])? {
         sets.push(parse_set(&raw)?);
