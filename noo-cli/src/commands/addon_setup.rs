@@ -1268,7 +1268,7 @@ fn end_word(end: &End) -> &'static str {
         End::Complete => "complete",
         End::Waiting(_) => "waiting",
         End::Declined(_) => "declined",
-        End::Decision(_) => "needs_decision",
+        End::Decision(_) => "stopped",
         End::Stop(_) => "stopped",
         End::Failed(..) => "failed",
     }
