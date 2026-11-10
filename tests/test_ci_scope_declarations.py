@@ -30,6 +30,7 @@ source is what to check.
 """
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -50,7 +51,8 @@ CI = ROOT / ".github/workflows/ci.yml"
 # the release tag.
 # `ollama` joined in the same shape (i415): 0.6.16-rc.1's release failed in
 # its runtime stage, which nothing built on a PR.
-PER_CRATE = {"gateway", "cli", "sqlx", "ui", "llamacpp", "ollama"}
+# `voice` (i607c): whisper and piper, built for linux/arm64 on a PR.
+PER_CRATE = {"gateway", "cli", "sqlx", "ui", "llamacpp", "ollama", "voice"}
 
 # job -> the one output it may be gated on.
 OWNS = {
@@ -61,6 +63,7 @@ OWNS = {
     "ui": "ui",
     "llamacpp-image": "llamacpp",
     "ollama-image": "ollama",
+    "voice-images": "voice",
 }
 
 
@@ -237,7 +240,7 @@ def test_the_classifier_narrows_and_fails_open() -> None:
     docs = _classify(["docs/a.md", "internal/b.md"])
     assert docs == {"code": "false", "gateway": "false", "cli": "false",
                     "sqlx": "false", "ui": "false", "llamacpp": "false",
-                    "ollama": "false", "deferred": "false", "defer_tests": "false"}
+                    "ollama": "false", "voice": "false", "deferred": "false", "defer_tests": "false"}
 
     cli = _classify(["noo-cli/src/main.rs"])
     assert cli["cli"] == "true" and cli["gateway"] == "false" and cli["sqlx"] == "false"
@@ -283,12 +286,20 @@ def test_the_classifier_narrows_and_fails_open() -> None:
         # so an unrelated path cannot change what it builds (2026-10-09).
         assert got["llamacpp"] == "false", f"{unknown} compiled llama-server: {got}"
         assert got["ollama"] == "false", f"{unknown} built the ollama image: {got}"
+        assert got["voice"] == "false", f"{unknown} built the voice images: {got}"
 
     # Its own inputs, and the workflow that builds it, do arm it.
     for own in (["docker/Dockerfile.llamacpp"], [".github/workflows/ci.yml"]):
         assert _classify(own)["llamacpp"] == "true", f"{own} must compile llama-server"
     for own in (["docker/Dockerfile.ollama"], [".github/workflows/ci.yml"]):
         assert _classify(own)["ollama"] == "true", f"{own} must build the ollama image"
+    # The voice images: every input the release table names for them.
+    voice_inputs = sorted({p for img in ("whisper", "piper")
+                           for p in json.loads((ROOT / "scripts/release-image-inputs.json").read_text())["images"][img]["inputs"]})
+    for own in [[p] for p in voice_inputs] + [[".github/workflows/ci.yml"]]:
+        assert _classify(own)["voice"] == "true", f"{own} must build the voice images"
+    assert _classify(["docker/Dockerfile.whisper"])["ollama"] == "false"
+    assert _classify(["docker/Dockerfile.ollama"])["voice"] == "false"
     # Each image's Dockerfile arms only its own image.
     assert _classify(["docker/Dockerfile.ollama"])["llamacpp"] == "false"
     assert _classify(["docker/Dockerfile.llamacpp"])["ollama"] == "false"
@@ -502,6 +513,34 @@ def test_the_ollama_image_reads_nothing_else_from_the_tree() -> None:
         f"docker/Dockerfile.ollama now reads the build context ({from_context}); "
         "add those paths to the ollama switch in ci.yml's scope step"
     )
+
+
+def test_the_voice_switch_covers_every_input_the_release_names() -> None:
+    """i607c: the voice lane's patterns name exactly the files the release
+    table says whisper and piper read (their Dockerfiles and the server files
+    they COPY). A new COPY added there must arm this lane too."""
+    table = json.loads((ROOT / "scripts/release-image-inputs.json").read_text())["images"]
+    inputs = {p for img in ("whisper", "piper") for p in table[img]["inputs"]}
+    for img in ("whisper", "piper"):
+        df = (ROOT / f"docker/Dockerfile.{img}").read_text()
+        srcs = {ln.split()[1] for ln in df.splitlines() if re.match(r"\s*COPY\s+(?!--from)", ln)}
+        assert srcs and srcs <= inputs, f"Dockerfile.{img} COPYs {srcs - inputs} the release table does not name"
+    for p in inputs:
+        assert _classify([p])["voice"] == "true", f"{p} does not arm the voice lane"
+
+
+def test_the_voice_lane_builds_arm64_and_runs_each_image() -> None:
+    """The proof that whisper and piper run on arm64 (i607c): both built for
+    linux/arm64 under QEMU, nothing pushed, each server module imported."""
+    job = _workflow()["jobs"]["voice-images"]
+    runs = " ".join(s.get("run", "") for s in job["steps"])
+    assert "--platform linux/arm64" in runs and "--push" not in runs, runs
+    for mod in ("whisper_server", "piper_server"):
+        assert f"import platform, {mod}" in runs, f"{mod} is not imported on arm64"
+    assert any("setup-qemu-action" in str(s.get("uses", "")) for s in job["steps"]), "no QEMU for arm64"
+    release = yaml.safe_load((ROOT / ".github/workflows/images-release.yml").read_text())
+    plats = {e["image"]: e["platforms"] for e in release["jobs"]["images"]["strategy"]["matrix"]["include"]}
+    assert plats["whisper"] == plats["piper"] == "linux/amd64,linux/arm64", plats
 
 
 def test_both_image_lanes_build_every_stage() -> None:
