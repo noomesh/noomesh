@@ -867,9 +867,6 @@ func (s *Store) ClearRefused(sets []Ref) []Ref {
 		if m.state != StateRefused {
 			continue
 		}
-		if len(only) > 0 && !only[ref] {
-			continue
-		}
 		delete(s.mem, ref)
 		cleared = append(cleared, ref)
 	}
