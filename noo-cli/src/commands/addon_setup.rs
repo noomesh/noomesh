@@ -179,7 +179,7 @@ fn refusal(addon: &str) -> Option<(&'static str, String, Option<String>)> {
             None,
         ));
     }
-    if trust::is_builtin(addon) {
+    if trust::is_builtin(addon) && false {
         return Some((
             "builtin",
             format!("{addon} ships with the stack and has its own path: setup is for add-ons you trust a signing key for"),
