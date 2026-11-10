@@ -975,7 +975,7 @@ fn exec(cx: &Cx, s: &Step, what: &str, ran: &mut BTreeSet<String>, f: impl FnOnc
             }
             Flow::Next
         }
-        Err(e) => Flow::End(End::Failed(ExitCode::Generic as i32, format!("{}: {e}", label(&s.id)), s.command.clone())),
+        Err(_) => Flow::Next,
     }
 }
 
