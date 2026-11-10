@@ -2196,13 +2196,10 @@ pub(crate) fn read_self_lane(node: &str) -> (Option<String>, bool) {
     (rec, dir.join(LOCAL_LANE_STATE).is_file())
 }
 
-/// This controller's own node name: the enrolled name on this box, else the
-/// NODE_ID the controller install recorded, else the hostname.
+/// This controller's own node name: [`crate::role::self_node_name`], the
+/// one chain that also decides [`crate::role::is_self_node`].
 pub(crate) fn self_node_name() -> Option<String> {
-    let trimmed = |s: String| { let t = s.trim().to_string(); (!t.is_empty()).then_some(t) };
-    std::fs::read_to_string(SELF_NODE_NAME_FILE).ok().and_then(trimmed)
-        .or_else(|| trimmed(crate::onboard::env::read_env_key(&crate::envfile::repo_root().join(".env"), "NODE_ID")))
-        .or_else(|| std::fs::read_to_string("/etc/hostname").ok().and_then(trimmed))
+    crate::role::self_node_name()
 }
 
 /// The self node's data root when nothing else names one: the process env,

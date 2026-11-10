@@ -70,29 +70,95 @@ fn read_trimmed(p: &Path) -> Option<String> {
 
 /// Detect from the markers the install paths write. Cheap (a few stats),
 /// no network, no sudo — `node-name` and `controller-url` are 644.
-/// Is `name` the node that lives on THIS device — the controller's own
-/// node? True when it is the enrolled node name here, this host's name,
-/// or the NODE_ID the controller install recorded. One answer for every
-/// verb that must treat the self-node differently (no tailnet join, no
-/// CLI in its bundle, never purge its tailnet, restage it last, adopt the
-/// stack's ollama); the operator uses the same commands either way.
-pub fn is_self_node(name: &str) -> bool {
-    let name = name.trim();
-    if name.is_empty() {
-        return false;
-    }
-    if read_trimmed(Path::new(NODE_NAME)).is_some_and(|n| n.eq_ignore_ascii_case(name)) {
-        return true;
-    }
-    if let Ok(o) = std::process::Command::new("uname").arg("-n").output() {
-        let h = String::from_utf8_lossy(&o.stdout).trim().to_string();
-        if !h.is_empty() && h.eq_ignore_ascii_case(name) {
-            return true;
+/// Where this box's own node name can be read, in the order the name is
+/// taken. ONE chain for both questions: what this box's node is CALLED
+/// ([`self_node_name`]) and whether a name IS this box's node
+/// ([`is_self_node`]). Until 2026-11-10 they were two chains over different
+/// sources (the name from NODE_ID in `envfile::repo_root()/.env` or
+/// `/etc/hostname`; the match from `uname -n` or NODE_ID in
+/// `standalone::default_home()/.env`), so a WSL controller could name its
+/// node one way and fail to recognise it: `noo upgrade --all` staged it
+/// FIRST as a remote node (outside tester, 0.6.21), and every self-node
+/// lane missed it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct SelfIdentity {
+    /// `/etc/noo/node-name` (written by prep-host for this box's node).
+    pub node_name_file: Option<String>,
+    /// NODE_ID in `envfile::repo_root()/.env`, then in
+    /// `standalone::default_home()/.env` (the same file when they agree).
+    pub env_node_ids: Vec<String>,
+    /// `/etc/hostname`: the old name chain's last source, so it stays
+    /// ahead of `uname -n` and no existing self node is renamed.
+    pub etc_hostname: Option<String>,
+    /// `uname -n`: on WSL the Windows machine name, set at boot, which can
+    /// differ from `/etc/hostname`. The old match's source.
+    pub uname_n: Option<String>,
+}
+
+impl SelfIdentity {
+    /// This machine's sources, read now.
+    pub(crate) fn read() -> Self {
+        let t = |s: Option<String>| s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        let mut env_node_ids = Vec::new();
+        for root in [crate::envfile::repo_root(), crate::onboard::standalone::default_home()] {
+            if let Some(id) = t(Some(crate::onboard::env::read_env_key(&root.join(".env"), "NODE_ID"))) {
+                if !env_node_ids.contains(&id) {
+                    env_node_ids.push(id);
+                }
+            }
+        }
+        let uname_n = std::process::Command::new("uname").arg("-n").output().ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+        SelfIdentity {
+            node_name_file: t(read_trimmed(Path::new(NODE_NAME))),
+            env_node_ids,
+            etc_hostname: t(std::fs::read_to_string("/etc/hostname").ok()),
+            uname_n: t(uname_n),
         }
     }
-    let home = crate::onboard::standalone::default_home();
-    let recorded = crate::onboard::env::read_env_key(&home.join(".env"), "NODE_ID");
-    !recorded.is_empty() && recorded.trim().eq_ignore_ascii_case(name)
+
+    /// Every name this box answers to, in chain order, each trimmed and
+    /// non-empty.
+    pub(crate) fn names(&self) -> Vec<&str> {
+        self.node_name_file.iter()
+            .chain(self.env_node_ids.iter())
+            .chain(self.etc_hostname.iter())
+            .chain(self.uname_n.iter())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    /// The node's name: the first source that says one.
+    pub(crate) fn name(&self) -> Option<String> {
+        self.names().first().map(|s| s.to_string())
+    }
+
+    /// Whether `name` is this box's node: any source in the chain, case
+    /// folded. Any, not only the first, so the name [`Self::name`] gives is
+    /// always recognised AND no name recognised before the merge stops
+    /// being recognised (the old match read the marker, `uname -n` and the
+    /// standalone NODE_ID; all are still here).
+    pub(crate) fn is(&self, name: &str) -> bool {
+        let name = name.trim();
+        !name.is_empty() && self.names().iter().any(|n| n.eq_ignore_ascii_case(name))
+    }
+}
+
+/// This controller's own node name: `/etc/noo/node-name`, then NODE_ID in
+/// the install's `.env` (either root), then `/etc/hostname`, then
+/// `uname -n`. See [`SelfIdentity`].
+pub fn self_node_name() -> Option<String> {
+    SelfIdentity::read().name()
+}
+
+/// Is `name` the node that lives on THIS device — the controller's own
+/// node? One answer for every verb that must treat the self-node
+/// differently (no tailnet join, no CLI in its bundle, never purge its
+/// tailnet, restage it last, adopt the stack's ollama); the operator uses
+/// the same commands either way. Same chain as [`self_node_name`].
+pub fn is_self_node(name: &str) -> bool {
+    SelfIdentity::read().is(name)
 }
 
 pub fn detect() -> HostRole {
@@ -231,6 +297,90 @@ pub fn whoami(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             n.controller_url.as_deref().unwrap_or("the controller"));
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod self_identity_tests {
+    use super::SelfIdentity;
+
+    fn id(node_name: Option<&str>, env: &[&str], hostname: Option<&str>, uname: Option<&str>) -> SelfIdentity {
+        SelfIdentity {
+            node_name_file: node_name.map(str::to_string),
+            env_node_ids: env.iter().map(|s| s.to_string()).collect(),
+            etc_hostname: hostname.map(str::to_string),
+            uname_n: uname.map(str::to_string),
+        }
+    }
+
+    /// The four ways a WSL controller's node went unrecognised (0.6.21,
+    /// "Lenovo-P52s"): whatever source named it, the match recognises it.
+    #[test]
+    fn the_name_this_box_gives_its_node_is_always_recognised() {
+        let cases = [
+            // (a) NODE_ID only in the checkout's / NOO_REPO_ROOT's .env.
+            ("a", id(None, &["Lenovo-P52s"], Some("other"), Some("OTHER"))),
+            // (b) /etc/hostname differs from `uname -n`.
+            ("b", id(None, &[], Some("Lenovo-P52s"), Some("LENOVO-WSL"))),
+            // (c) another HOME: no .env NODE_ID found, only the hostnames.
+            ("c", id(None, &[], None, Some("LENOVO-P52S"))),
+            // (d) no /etc/noo/node-name (self-prep never completed).
+            ("d", id(None, &["Lenovo-P52s"], None, None)),
+        ];
+        for (why, s) in cases {
+            let name = s.name().unwrap_or_else(|| panic!("({why}) no name"));
+            assert!(s.is(&name), "({why}) named '{name}' but not recognised: {s:?}");
+            assert!(s.is(&name.to_ascii_uppercase()) && s.is(&format!(" {} ", name.to_ascii_lowercase())), "({why}) case and whitespace");
+        }
+    }
+
+    /// Every source the old match read is still read: nothing recognised
+    /// before is dropped (awolf: node-name `awolf`, uname -n `AWOLF`).
+    #[test]
+    fn every_source_is_recognised_and_the_name_is_the_first() {
+        let s = id(Some("awolf"), &["nid-1", "nid-2"], Some("host-file"), Some("AWOLF-UNAME"));
+        for n in ["AWOLF", "nid-1", "nid-2", "HOST-FILE", "awolf-uname"] {
+            assert!(s.is(n), "{n}");
+        }
+        assert_eq!(s.name().as_deref(), Some("awolf"));
+        assert!(!s.is("pop-os") && !s.is("") && !s.is("   "));
+    }
+
+    /// The name chain is the old one: marker, NODE_ID, /etc/hostname; only
+    /// then `uname -n` (new), so no existing self node is renamed.
+    #[test]
+    fn the_name_order_keeps_the_old_name() {
+        assert_eq!(id(None, &["nid"], Some("h"), Some("u")).name().as_deref(), Some("nid"));
+        assert_eq!(id(None, &[], Some("h"), Some("u")).name().as_deref(), Some("h"));
+        assert_eq!(id(None, &[], None, Some("u")).name().as_deref(), Some("u"));
+        assert_eq!(id(Some("  "), &[], None, None).name(), None, "blank is no name");
+    }
+
+    /// ONE identity chain: is_self_node and both self_node_name entry points
+    /// go through SelfIdentity, and no other chain reads the sources.
+    #[test]
+    fn there_is_one_self_identity_chain() {
+        let role = crate::test_src::own_code(include_str!("role.rs"));
+        let is_self = crate::test_src::fn_body(&role, "pub fn is_self_node(");
+        assert!(is_self.contains("SelfIdentity::read().is(name)"), "{is_self}");
+        let named = crate::test_src::fn_body(&role, "pub fn self_node_name(");
+        assert!(named.contains("SelfIdentity::read().name()"), "{named}");
+        let prov = crate::test_src::own_code(include_str!("commands/provision.rs"));
+        let pn = crate::test_src::fn_body(&prov, "pub(crate) fn self_node_name(");
+        assert!(pn.contains("crate::role::self_node_name()"), "provision delegates: {pn}");
+        // The sources are read in SelfIdentity::read alone. One known
+        // exception, not an identity MATCH: `hostname()`, the display name
+        // `detect()` gives a prepped node-only box with no marker.
+        let read = crate::test_src::fn_body(&role, "pub(crate) fn read(");
+        let display = crate::test_src::fn_body(&role, "fn hostname(");
+        for src in ["\"/etc/hostname\"", "arg(\"-n\")", "\"NODE_ID\""] {
+            assert!(read.contains(src), "read() reads {src}");
+            assert_eq!(role.matches(src).count(), read.matches(src).count() + display.matches(src).count(),
+                "role.rs reads {src} outside SelfIdentity::read");
+        }
+        for src in ["arg(\"-n\")", "\"/etc/hostname\""] {
+            assert!(!pn.contains(src), "provision::self_node_name has its own chain again");
+        }
+    }
 }
 
 #[cfg(test)]
