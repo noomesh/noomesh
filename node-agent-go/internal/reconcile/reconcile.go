@@ -41,6 +41,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/auth"
@@ -120,6 +121,11 @@ type desiredConfig struct {
 	// {doc, sig}, opaque to the gateway, verified here. Absent on a gateway
 	// that predates it; absent or null keeps the set this node holds.
 	WorkloadApprovals json.RawMessage `json:"workload_approvals"`
+	// `retry now` for refused model sets (i607b B3): {epoch, sets}. A
+	// TOP-LEVEL key on purpose: this struct decodes leniently (an old agent
+	// ignores the key), while the node_workloads fragment is decoded strictly.
+	// Absent (or epoch 0) = nothing to retry. See applyModelSetRetry.
+	ModelSetRetry *modelSetRetry `json:"model_set_retry"`
 }
 
 // Reconciler pulls desired config and converges the node toward it.
@@ -138,6 +144,11 @@ type Reconciler struct {
 	// sets holds the model sets desired-config names (i300 F4). nil in tests
 	// that build a Reconciler by hand; convergeModelSets is then skipped.
 	sets *modelsets.Store
+	// retryEpoch is the highest model_set_retry epoch applied. In memory
+	// only: it starts at 0 on every agent start, so a stored epoch > 0 clears
+	// refused sets once after a restart. A restart already empties the
+	// refused backoff (it is in memory too), so that clear finds nothing.
+	retryEpoch atomic.Uint64
 	// nodeWL drives the add-on node workloads (i300 F5b) and facts reports the
 	// node's consent policy and placement facts. nil in tests that build a
 	// Reconciler by hand; convergeNodeWorkloads is then skipped. nwBusy, nwMu

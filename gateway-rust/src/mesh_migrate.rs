@@ -2419,6 +2419,24 @@ BEGIN
     END IF;
 END $$;
 "#,
+}, Migration {
+    revision: NODE_MODEL_SET_RETRY_REVISION,
+    down_revision: Some(AGENT_MAILBOXES_REVISION),
+    // i607b B3: the per-node `retry now` epoch for a refused model-set fetch.
+    // desired-config serves it as the top-level `model_set_retry`; the agent
+    // clears its refused backoff when the epoch moves past the one it saw.
+    // A table of its own, additive: a bump never touches a placement row. The
+    // epoch only goes up (the upsert adds one), and it lives here so a
+    // gateway restart cannot send it back to 0.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS noo_node_model_set_retry (
+    node_id text PRIMARY KEY,
+    epoch bigint NOT NULL DEFAULT 0,
+    sets jsonb NOT NULL DEFAULT '[]'::jsonb,
+    updated_by text,
+    updated_at timestamptz NOT NULL DEFAULT now()
+)
+"#,
 }];
 
 /// Add-on feature settings and the super-admin flag (f99). A constant so a
@@ -2462,6 +2480,10 @@ pub const PERSPECTIVES_REVISION: &str = "114_perspectives";
 /// whichever is the head when it lands. A constant so a renumber at rebase
 /// is one line.
 pub const AGENT_MAILBOXES_REVISION: &str = "119_agent_mailboxes";
+
+/// The per-node model-set `retry now` epoch (i607b B3), on agent mailboxes
+/// (119). A constant so a renumber at rebase is one line.
+pub const NODE_MODEL_SET_RETRY_REVISION: &str = "120_node_model_set_retry";
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
 /// constant so a renumber at rebase is one line.
@@ -4084,19 +4106,39 @@ mod perspectives_migration_tests {
 mod agent_mailboxes_migration_tests {
     use super::*;
 
-    /// 0.6.24: the agent-mailboxes revision is the chain head, sits on
-    /// perspectives, and only adds three tables and the app role's grant.
+    /// 0.6.24: the agent-mailboxes revision sits on perspectives, and only
+    /// adds three tables and the app role's grant.
     #[test]
-    fn agent_mailboxes_revision_is_the_head_and_additive() {
+    fn agent_mailboxes_revision_sits_on_perspectives_and_is_additive() {
         let m = MIGRATIONS.iter().find(|m| m.revision == AGENT_MAILBOXES_REVISION).expect("must be in the chain");
         assert_eq!(m.revision, "119_agent_mailboxes");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(PERSPECTIVES_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(AGENT_MAILBOXES_REVISION), "the chain head");
         for t in ["noo_agent_names", "noo_agent_name_keys", "noo_agent_orphans"] {
             assert!(m.sql.contains(&format!("CREATE TABLE IF NOT EXISTS {t} (")), "{t}");
         }
         assert!(m.sql.contains("PRIMARY KEY (account, key_hash)"), "one name per conversation key per account");
         assert!(!m.sql.contains("DROP") && !m.sql.contains("ALTER TABLE") && !m.sql.contains("DELETE FROM"));
+    }
+}
+
+#[cfg(test)]
+mod node_model_set_retry_migration_tests {
+    use super::*;
+
+    /// i607b B3: the retry-epoch revision is the chain head, sits on agent
+    /// mailboxes (119), and only creates its own table.
+    #[test]
+    fn node_model_set_retry_revision_is_the_head_and_additive() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == NODE_MODEL_SET_RETRY_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "120_node_model_set_retry");
+        assert_eq!(m.down_revision, Some(AGENT_MAILBOXES_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(NODE_MODEL_SET_RETRY_REVISION), "the chain head");
+        assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_node_model_set_retry"));
+        assert!(!m.sql.contains("DELETE") && !m.sql.contains("UPDATE") && !m.sql.contains("DROP") && !m.sql.contains("ALTER"));
+        let writer = include_str!("repo/node_model_set_retry.rs");
+        for col in ["node_id", "epoch", "sets", "updated_by"] {
+            assert!(m.sql.contains(col) && writer.contains(col), "{col}");
+        }
     }
 }

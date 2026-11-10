@@ -23,7 +23,13 @@ import (
 //     read failure would delete every set the node holds.
 //   - Fetching runs off the tick, one set at a time (modelsets.Store.Sync).
 func (r *Reconciler) convergeModelSets(ctx context.Context, t *tick) bool {
-	if r.sets == nil || len(t.desired.NodeWorkloads) == 0 {
+	if r.sets == nil {
+		return true
+	}
+	// Before the empty check and before Sync: Sync is what restarts the
+	// worker for the sets this clears.
+	r.applyModelSetRetry(t.desired.ModelSetRetry)
+	if len(t.desired.NodeWorkloads) == 0 {
 		return true
 	}
 	want, keep, err := desiredSetRefs(t.desired.NodeWorkloads, r.cfg.NodeID)
@@ -36,6 +42,43 @@ func (r *Reconciler) convergeModelSets(ctx context.Context, t *tick) bool {
 		slog.Warn("reconcile.model_sets_prune_failed", "error", err, "removed", len(removed))
 	}
 	return true
+}
+
+// modelSetRetry is desired-config's top-level `model_set_retry` (i607b B3):
+// the controller's per-node retry epoch, and the sets the last bump named as
+// "<id>@<revision>" (empty = every refused set).
+type modelSetRetry struct {
+	Epoch uint64   `json:"epoch"`
+	Sets  []string `json:"sets"`
+}
+
+// applyModelSetRetry clears the refused backoff once per epoch increase: when
+// the controller's epoch is past the last one this agent applied, it resets
+// the named refused sets (all of them when none are named) and records the
+// epoch. The same epoch again, a lower one, or no key does nothing. It only
+// ever ends a backoff: verified and fetching sets are not touched, and it
+// never changes which sets are wanted. The caller runs Sync next, which wakes
+// the worker for the sets it cleared.
+func (r *Reconciler) applyModelSetRetry(rt *modelSetRetry) {
+	if r.sets == nil || rt == nil || rt.Epoch <= r.retryEpoch.Load() {
+		return
+	}
+	r.retryEpoch.Store(rt.Epoch)
+	var refs []modelsets.Ref
+	for _, raw := range rt.Sets {
+		ref, ok := modelsets.ParseRef(raw)
+		if !ok {
+			slog.Warn("reconcile.model_set_retry_set_unreadable; skipped", "set", raw)
+			continue
+		}
+		refs = append(refs, ref)
+	}
+	if len(rt.Sets) > 0 && len(refs) == 0 {
+		// Every named set was unreadable: "none readable" is not "all".
+		return
+	}
+	cleared := r.sets.ClearRefused(refs)
+	slog.Info("reconcile.model_set_retry", "epoch", rt.Epoch, "named", len(rt.Sets), "cleared", len(cleared))
 }
 
 // ModelSetsReport is the heartbeat's `model_sets`, nil when the state cannot
