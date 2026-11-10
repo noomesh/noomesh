@@ -21,6 +21,23 @@ with neither, the launcher prints one line naming what it skipped and keeps
 the previous mounts (harmless on a fresh install, stale after you add
 folders). `git` only for a contributor checkout.
 
+**On WSL2, keep the VM from idling out.** WSL2 shuts its virtual machine
+down after a period with no open Windows terminal into it, and that stops
+the controller with it: every container goes down, and nodes lose their
+controller until someone opens a terminal again. On
+Windows 11, turn the idle shutdown off in `%UserProfile%\.wslconfig` on the
+Windows side:
+
+```ini
+[wsl2]
+vmIdleTimeout=-1
+```
+
+Then run `wsl --shutdown` from PowerShell once, so WSL2 starts again with
+the setting. `-1` means never; the value is otherwise milliseconds. Windows
+10's WSL2 ignores this setting: there, keep one WSL terminal open on the
+controller.
+
 Minimums, for one box running the controller and its first model (the
 numbers are approximate and grow with the models you pull):
 
