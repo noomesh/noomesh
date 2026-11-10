@@ -18,7 +18,7 @@ pub enum ExitCode {
     /// A run that stopped for a person: a decision it will not take for them
     /// (trust, a licence, consent, a reserve), or a step only they can do.
     /// What to run is printed. Not an error: the work so far stands.
-    NeedsDecision = 6,
+    NeedsDecision = 7,
 }
 
 /// Print an error (JSON on stderr in json mode, human text otherwise) and exit.
