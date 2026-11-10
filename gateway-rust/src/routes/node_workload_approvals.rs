@@ -166,7 +166,7 @@ pub fn entry_addon_ok(s: &str) -> bool {
         && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
         && b[0] != b'-'
         && b[b.len() - 1] != b'-';
-    crate::addon_registry::name_ok(s) && agent_ok
+    agent_ok
 }
 
 /// `sha256:` and 64 lower-case hex digits: one exact image digest.
