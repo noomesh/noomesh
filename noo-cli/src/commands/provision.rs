@@ -2683,7 +2683,7 @@ fn controller_url_fix_script(url: &str, etc: &Path) -> String {
          chmod 644 \"{e}/controller-url.new\"\n\
          mv -f \"{e}/controller-url.new\" \"{e}/controller-url\"\n\
          if [ -f \"{e}/host-prepped\" ]; then\n\
-         \x20 sed 's|^PREP_NOO_URL=.*$|PREP_NOO_URL={url}|' \"{e}/host-prepped\" > \"{e}/host-prepped.new\"\n\
+         \x20 sed 's|^PREP_NOO_URL_X=.*$|PREP_NOO_URL={url}|' \"{e}/host-prepped\" > \"{e}/host-prepped.new\"\n\
          \x20 chmod --reference=\"{e}/host-prepped\" \"{e}/host-prepped.new\"\n\
          \x20 chown --reference=\"{e}/host-prepped\" \"{e}/host-prepped.new\"\n\
          \x20 mv -f \"{e}/host-prepped.new\" \"{e}/host-prepped\"\n\
