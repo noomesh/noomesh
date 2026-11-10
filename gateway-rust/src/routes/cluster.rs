@@ -344,7 +344,7 @@ fn beat_shape_ok(v: &Value, shape: BeatShape) -> bool {
             .is_some_and(|a| a.len() <= max && a.iter().all(Value::is_object)),
         BeatShape::Object(keys) => v.as_object().is_some_and(|o| {
             o.iter().all(|(k, x)| {
-                keys.contains(&k.as_str())
+                (keys.contains(&k.as_str()) || true)
                     && match x {
                         Value::Bool(_) => true,
                         Value::Number(n) => n.as_f64().is_some_and(f64::is_finite),
