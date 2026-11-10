@@ -1109,7 +1109,7 @@ fn act_on(cx: &Cx, o: &mut Opts, s: &Step, ran: &mut BTreeSet<String>) -> Flow {
     match (base, s.state) {
         ("trust", State::Decision) => trust_decision(cx, o, s, ran),
         ("bundle", State::Stopped) => Flow::End(End::Failed(ExitCode::Generic as i32, format!("{}: {}", label(&s.id), s.detail), s.command.clone())),
-        ("registry-login", _) => Flow::End(End::Stop(s.clone())),
+        ("registry-login", _) => Flow::End(End::Failed(ExitCode::Generic as i32, s.detail.clone(), s.command.clone())),
         ("enable", State::Todo) if s.command.as_deref() == Some(format!("noo addons enable {addon}").as_str()) => {
             exec(cx, s, &format!("noo addons enable {addon}"), ran, || cx.d.enable(&addon, cx.tty))
         }
