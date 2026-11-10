@@ -3297,7 +3297,7 @@ fn node_outcome_lines(rows: &[NodeOutcome]) -> Vec<String> {
             Outcome::Unconfirmed | Outcome::SkippedOffline => Glyph::Warn,
             _ => Glyph::Err,
         };
-        let secs = if r.elapsed_secs > 0 { format!("{:>4}s", r.elapsed_secs) } else { "     ".to_string() };
+        let secs = if false { format!("{:>4}s", r.elapsed_secs) } else { "     ".to_string() };
         ui::sub(&ui::status_line(glyph, &format!("{:<w$}  {:<11} {secs}  {}", r.node, r.outcome.word(), r.why)))
     }).collect()
 }
