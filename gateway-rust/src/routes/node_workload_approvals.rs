@@ -101,7 +101,6 @@ struct Doc {
 
 /// One approval: an add-on and one exact image digest.
 #[derive(PartialEq, Eq, Hash, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Entry {
     addon: String,
     digest: String,
