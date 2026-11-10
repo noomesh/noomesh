@@ -1115,6 +1115,7 @@ fn act_on(cx: &Cx, o: &mut Opts, s: &Step, ran: &mut BTreeSet<String>) -> Flow {
         }
         // Pinned at an older version than the bundle offers: that is `upgrade`, not setup's to run.
         ("enable", State::Todo) => Flow::End(End::Stop(s.clone())),
+        ("consent", _) if matches!(&s.act, Act::Consent { opted_in: Some(true), .. }) => Flow::Next,
         ("consent", _) => consent_stop(s),
         (_, State::Unknown) => Flow::End(End::Failed(ExitCode::GatewayUnreachable as i32, format!("{}: {}", label(&s.id), s.detail), None)),
         (b, State::Decision) if b.starts_with("licence:") => match &s.act {
