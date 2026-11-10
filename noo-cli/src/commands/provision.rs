@@ -2569,10 +2569,16 @@ fn bind_mode(root: &Path) -> String {
 
 /// THE host name nodes use to reach this controller. Pure over its inputs.
 ///
-/// Precedence for a remote node: `NOO_CONTROLLER_DNS` (the mesh's floating
-/// service name), this controller's MagicDNS name, then the host
-/// `services.gateway_url` advertises. For the self node: this controller's
-/// MagicDNS name, then `NOO_CONTROLLER_DNS`. With none of those, a gateway bound to
+/// A remote node: `NOO_CONTROLLER_DNS` (the mesh's floating service name),
+/// this controller's MagicDNS name, then the host `services.gateway_url`
+/// advertises; with none, a tailnet bind is refused, else the
+/// single-controller literal.
+///
+/// The self node follows the bind mode (lib-bind-addr.sh): `local` is always
+/// `localhost`; a tailnet bind takes the MagicDNS name, then
+/// `NOO_CONTROLLER_DNS`, else refuses; `all` or unset takes either name, else
+/// `localhost`; a literal non-tailnet address takes only `NOO_CONTROLLER_DNS`,
+/// else refuses. With none of those, a gateway bound to
 /// the tailnet is REFUSED: it listens on the tailnet address only, so
 /// `localhost` would never connect, and the fetch unit that polled it failed
 /// every tick (finding 121). Only a bind mode that listens on loopback may fall
@@ -2580,41 +2586,45 @@ fn bind_mode(root: &Path) -> String {
 pub(crate) fn controller_host_from(
     bind_mode: &str, env_dns: &str, tailnet_dns: Option<String>, advertised: Option<String>, who: HostFor,
 ) -> Result<String, String> {
+    let mode = bind_mode.trim();
     let env_dns = env_dns.trim();
+    let env_dns = (!env_dns.is_empty()).then(|| env_dns.to_string());
     let tailnet_dns = tailnet_dns.map(|d| d.trim().to_string()).filter(|d| !d.is_empty());
-    // The self node polls THIS controller, so its own tailnet name comes
-    // first: the floating service name can point at another controller, and
-    // before this resolver the self node never read it.
+    let refuse = |listens_on: &str, remedy: &str| Err(format!(
+        "NOO_BIND_MODE={mode} makes the gateway listen on {listens_on} only, and this controller has no name for it \
+         to give nodes{remedy}, so a localhost URL would never connect"));
     if who == HostFor::SelfNode {
-        if let Some(d) = tailnet_dns {
-            return Ok(d);
+        // The self node polls THIS controller, so its own names come first;
+        // the floating service name can point at another controller.
+        if mode == "local" || is_loopback_host(mode) {
+            // A gateway on loopback only is reachable only as loopback.
+            return Ok("localhost".into());
         }
-        if !env_dns.is_empty() {
-            return Ok(env_dns.to_string());
+        if super::grafana_door::asks_for_tailnet(mode) {
+            return tailnet_dns.or(env_dns)
+                .map_or_else(|| refuse("the tailnet address", " (tailscale is not running or not logged in)"), Ok);
         }
-    } else {
-        if !env_dns.is_empty() {
-            return Ok(env_dns.to_string());
+        if listens_on_loopback(mode) {
+            return Ok(tailnet_dns.or(env_dns).unwrap_or_else(|| "localhost".into()));
         }
-        if let Some(d) = tailnet_dns {
-            return Ok(d);
-        }
+        // A literal non-tailnet address: neither loopback nor the tailnet
+        // name reaches it. Only the operator can name it.
+        return env_dns.map_or_else(|| refuse("that address", " (set NOO_CONTROLLER_DNS to a name for it)"), Ok);
     }
-    if who == HostFor::RemoteNode {
-        if let Some(a) = advertised {
-            return Ok(a);
-        }
+    if let Some(h) = env_dns.or(tailnet_dns).or(advertised) {
+        return Ok(h);
     }
-    if super::grafana_door::asks_for_tailnet(bind_mode) {
-        return Err(format!(
-            "NOO_BIND_MODE={} makes the gateway listen on the tailnet address only, and this controller has no tailnet name \
-             to give nodes (tailscale is not running or not logged in), so a localhost URL would never connect",
-            bind_mode.trim()));
+    if super::grafana_door::asks_for_tailnet(mode) {
+        return refuse("the tailnet address", " (tailscale is not running or not logged in)");
     }
-    Ok(match who {
-        HostFor::SelfNode => "localhost",
-        HostFor::RemoteNode => "noo-controller",
-    }.into())
+    Ok("noo-controller".into())
+}
+
+/// Whether a gateway bound per `NOO_BIND_MODE` answers on loopback:
+/// `local`, `all` (every interface), unset, or a literal 127.x / ::1.
+fn listens_on_loopback(bind_mode: &str) -> bool {
+    let m = bind_mode.trim();
+    matches!(m, "" | "local" | "all") || is_loopback_host(m)
 }
 
 /// [`controller_host_from`] over this machine: the install's bind mode and
@@ -2644,7 +2654,8 @@ fn is_loopback_host(h: &str) -> bool {
 }
 
 /// The URL a self node's recorded `controller-url` must be rewritten to, or
-/// None. Only a LOOPBACK record on a tailnet-bound controller is wrong; a
+/// None. Only a LOOPBACK record on a gateway that does not listen on loopback
+/// (a tailnet bind or a literal address) is wrong; a
 /// loopback record on a loopback-listening gateway, and any other record, is
 /// left alone. `want_host` is resolved only when a correction is due, so a
 /// healthy install never needs tailscale to answer.
@@ -2652,7 +2663,7 @@ fn controller_url_fix(
     recorded: &str, bind_mode: &str, want_host: impl FnOnce() -> Result<String, String>,
 ) -> Result<Option<String>, String> {
     let recorded = recorded.trim();
-    if recorded.is_empty() || !is_loopback_host(url_host(recorded)) || !super::grafana_door::asks_for_tailnet(bind_mode) {
+    if recorded.is_empty() || !is_loopback_host(url_host(recorded)) || listens_on_loopback(bind_mode) {
         return Ok(None);
     }
     let host = want_host()?;
@@ -2673,8 +2684,9 @@ fn controller_url_fix_script(url: &str, etc: &Path) -> String {
          mv -f \"{e}/controller-url.new\" \"{e}/controller-url\"\n\
          if [ -f \"{e}/host-prepped\" ]; then\n\
          \x20 sed 's|^PREP_NOO_URL=.*$|PREP_NOO_URL={url}|' \"{e}/host-prepped\" > \"{e}/host-prepped.new\"\n\
-         \x20 cat \"{e}/host-prepped.new\" > \"{e}/host-prepped\"\n\
-         \x20 rm -f \"{e}/host-prepped.new\"\n\
+         \x20 chmod --reference=\"{e}/host-prepped\" \"{e}/host-prepped.new\"\n\
+         \x20 chown --reference=\"{e}/host-prepped\" \"{e}/host-prepped.new\"\n\
+         \x20 mv -f \"{e}/host-prepped.new\" \"{e}/host-prepped\"\n\
          fi\n")
 }
 
@@ -6479,22 +6491,40 @@ mod controller_host_tests {
     /// Loopback stays valid only where the gateway listens on it.
     #[test]
     fn controller_host_loopback_bind_allows_localhost() {
-        for mode in ["", "local", "all"] {
+        for mode in ["", "local", "all", "127.0.0.1"] {
             assert_eq!(ctrl(mode, "", None, None, HostFor::SelfNode), Ok("localhost".into()), "{mode:?}");
             assert_eq!(ctrl(mode, "", None, None, HostFor::RemoteNode), Ok("noo-controller".into()), "{mode:?}");
         }
     }
 
+    /// A gateway on loopback only is reachable only as loopback: the self node
+    /// gets localhost even when a tailnet name or a floating name exists.
+    #[test]
+    fn controller_host_local_bind_is_localhost_for_the_self_node() {
+        for mode in ["local", "127.0.0.1"] {
+            assert_eq!(ctrl(mode, "noo-a", Some("ctl.example.ts.net"), None, HostFor::SelfNode), Ok("localhost".into()), "{mode}");
+        }
+    }
+
+    /// A literal non-tailnet address: localhost and the tailnet name both miss
+    /// it, so the self node takes only the operator's name, else refuses.
+    #[test]
+    fn controller_host_lan_ip_bind_needs_a_declared_name() {
+        let e = ctrl("192.168.1.10", "", Some("ctl.example.ts.net"), None, HostFor::SelfNode).unwrap_err();
+        assert!(e.contains("192.168.1.10") && e.contains("localhost"), "{e}");
+        assert_eq!(ctrl("192.168.1.10", "lan-ctl", Some("ctl.example.ts.net"), None, HostFor::SelfNode), Ok("lan-ctl".into()));
+    }
+
     /// NOO_CONTROLLER_DNS (the floating service name) outranks everything for a
-    /// remote node and satisfies a tailnet bind with no tailnet name.
+    /// remote node; for the self node on a tailnet bind it is the fallback
+    /// behind this controller's own name.
     #[test]
     fn controller_host_env_dns_wins() {
         for mode in ["tailnet", "local"] {
             assert_eq!(ctrl(mode, " noo-a ", Some("ctl.example.ts.net"), Some("lan.example"), HostFor::RemoteNode), Ok("noo-a".into()));
-            assert_eq!(ctrl(mode, "noo-a", None, None, HostFor::SelfNode), Ok("noo-a".into()));
-            // The self node polls this controller: its own name outranks the floating one.
-            assert_eq!(ctrl(mode, "noo-a", Some("ctl.example.ts.net"), None, HostFor::SelfNode), Ok("ctl.example.ts.net".into()));
         }
+        assert_eq!(ctrl("tailnet", "noo-a", None, None, HostFor::SelfNode), Ok("noo-a".into()));
+        assert_eq!(ctrl("tailnet", "noo-a", Some("ctl.example.ts.net"), None, HostFor::SelfNode), Ok("ctl.example.ts.net".into()));
     }
 
     /// A remote node may be told the advertised gateway host; the self node's
@@ -6522,8 +6552,12 @@ mod controller_host_tests {
         assert_eq!(controller_url_fix("https://noo-a:8080", "tailnet", never), Ok(None));
         assert_eq!(controller_url_fix("", "tailnet", never), Ok(None));
         // Loopback is right when the gateway listens on it.
-        assert_eq!(controller_url_fix("https://localhost:8080", "local", never), Ok(None));
-        assert_eq!(controller_url_fix("https://localhost:8080", "", never), Ok(None));
+        for mode in ["local", "", "all", "127.0.0.1"] {
+            assert_eq!(controller_url_fix("https://localhost:8080", mode, never), Ok(None), "{mode:?}");
+        }
+        // A literal LAN address does not listen on loopback either.
+        assert_eq!(controller_url_fix("https://localhost:8080", "192.168.1.10", || Ok("lan-ctl".into())),
+            Ok(Some("https://lan-ctl:8080".into())));
         // No name to correct it to: the refusal comes through, nothing is invented.
         let none = || ctrl("tailnet", "", None, None, HostFor::SelfNode);
         assert!(controller_url_fix("https://localhost:8080", "tailnet", none).is_err());
