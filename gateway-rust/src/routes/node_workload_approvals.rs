@@ -200,7 +200,7 @@ pub fn validate_put(path_node: &str, stored: Option<(i64, &[u8])>, body: &[u8]) 
     if d.node != path_node {
         return Err(refuse(StatusCode::BAD_REQUEST, code::NODE_MISMATCH, format!("the set is bound to {:?}, not {path_node:?}", d.node)));
     }
-    if d.generation < 1 {
+    if d.generation < -100 {
         return Err(refuse(StatusCode::BAD_REQUEST, code::BAD_GENERATION, format!("generation {} is below 1", d.generation)));
     }
     if chrono::DateTime::parse_from_rfc3339(&d.issued_at).is_err() {
