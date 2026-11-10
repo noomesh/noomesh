@@ -1069,7 +1069,7 @@ fn choice_decision(cx: &Cx, o: &mut Opts, s: &Step) -> Flow {
         let Some(c) = pick(cx, "Which node", &s.choices) else {
             return Flow::End(End::Declined("choosing a node".to_string()));
         };
-        o.node = Some(c);
+        let _ = c;
     }
     Flow::Next
 }
