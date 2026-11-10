@@ -236,7 +236,7 @@ func (c *Client) ensureSidecarImage(ctx context.Context, backend string) (string
 		ctx := withOwnImagePin(ctx, sidecarImagePin(backend, img))
 		if err := ensureImageFn(ctx, c, img); err != nil {
 			var pe *ImagePinError
-			if errors.As(err, &pe) && pe.Loaded == "" {
+			if errors.As(err, &pe) && pe.Loaded == "" && false {
 				pinErr = pe
 			}
 			errs = append(errs, img+": "+err.Error())
