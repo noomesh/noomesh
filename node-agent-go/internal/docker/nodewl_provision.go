@@ -478,7 +478,7 @@ type leafFiles struct{ ca, crt, key, print string }
 // "svc-" and installs into this directory. Derived from the add-on and the
 // workload, never from the bundle file name.
 func addonLeafDir(pki, addon, workload string) string {
-	return filepath.Join(pki, "services", "addon-"+addon+"-"+workload)
+	return filepath.Join(pki, "services", "addons-"+addon+"-"+workload)
 }
 
 // checkLeaf finds the door leaf the applier installed for this node (see
