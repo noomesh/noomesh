@@ -1141,10 +1141,13 @@ fn validate_scratch(ss: &[Scratch], ms: &[Slot]) -> Result<(), Refusal> {
             );
         }
         for o in &ss[..i] {
-            if o.target == s.target {
+            if overlaps(&o.target, &s.target) {
                 return fail(
                     code::SCRATCH_INVALID,
-                    format!("scratch[{i}]: target {:?} repeats", s.target),
+                    format!(
+                        "scratch[{i}]: target {:?} repeats or nests with {:?}",
+                        s.target, o.target
+                    ),
                 );
             }
         }
@@ -2207,10 +2210,10 @@ mod tests {
     #[test]
     fn one_exec_scratch_is_accepted() {
         for exec in [
-            serde_json::json!({"target": "/cache/triton", "tmpfs_mb": 512, "exec": true}),
-            serde_json::json!({"target": "/cache/triton", "tmpfs_mb": 1024, "exec": true}),
-            serde_json::json!({"target": "/cache/triton", "max_mb": 1024, "exec": true}),
-            serde_json::json!({"target": "/cache/triton", "max_mb": 4096, "exec": false}),
+            serde_json::json!({"target": "/triton-cache", "tmpfs_mb": 512, "exec": true}),
+            serde_json::json!({"target": "/triton-cache", "tmpfs_mb": 1024, "exec": true}),
+            serde_json::json!({"target": "/triton-cache", "max_mb": 1024, "exec": true}),
+            serde_json::json!({"target": "/triton-cache", "max_mb": 4096, "exec": false}),
         ] {
             let nw = with_scratch(serde_json::json!([{"target": "/cache", "max_mb": 4096}, exec.clone()]))
                 .unwrap_or_else(|e| panic!("{exec}: {e}"));
