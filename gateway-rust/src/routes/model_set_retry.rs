@@ -99,6 +99,29 @@ fn plain(status: StatusCode, code: &str, detail: impl Into<String>) -> Response 
     (status, Json(json!({"error": code, "detail": detail.into()}))).into_response()
 }
 
+/// A refused or failed retry: status, error code, sentence.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Failure {
+    pub status: StatusCode,
+    pub code: &'static str,
+    pub detail: String,
+}
+
+/// The retry itself, on the pool alone (no AppState, no node lookup): check
+/// the body, bump the node's epoch, record the actor. It touches the retry
+/// table ONLY, never a placement row. The handler gates on the operator and
+/// the node before calling it.
+pub async fn request_retry(db: &sqlx::PgPool, node_id: &str, body: &Value, actor: &str) -> Result<Retry, Failure> {
+    let set = parse_set(body).map_err(|detail| Failure { status: StatusCode::BAD_REQUEST, code: "bad_request", detail })?;
+    let r = repo::bump(db, node_id, set.as_deref(), actor).await.map_err(|e| Failure {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "internal",
+        detail: format!("retrying model sets on {node_id}: {e}"),
+    })?;
+    tracing::info!(%node_id, epoch = r.epoch, set = ?set, %actor, "model_set_retry_bumped");
+    Ok(r)
+}
+
 /// POST /api/cluster/nodes/{node_id}/model-set-retry
 ///
 /// Operator only. Body `{"set": "<id>@<rev>"}` or `{}`. Bumps the node's
@@ -111,22 +134,17 @@ pub async fn retry_model_set(
     body: Option<Json<Value>>,
 ) -> Response {
     let b = body.map(|Json(b)| b).unwrap_or(Value::Null);
-    let set = match parse_set(&b) {
-        Ok(s) => s,
-        Err(e) => return plain(StatusCode::BAD_REQUEST, "bad_request", e),
-    };
     match super::node_workload_placements::node_record(&state, &node_id).await {
         Ok(Some(_)) => {}
         Ok(None) => return plain(StatusCode::NOT_FOUND, "not_found", format!("no node {node_id:?} reports to this controller")),
         Err(e) => return plain(StatusCode::SERVICE_UNAVAILABLE, "unavailable", e),
     }
-    match repo::bump(&state.db, &node_id, set.as_deref(), operator.sub()).await {
+    match request_retry(&state.db, &node_id, &b, operator.sub()).await {
         Ok(r) => {
-            tracing::info!(%node_id, epoch = r.epoch, set = ?set, actor = %operator.sub(), "model_set_retry_bumped");
             nudge_node(&node_id);
             (StatusCode::OK, Json(json!({"node_id": node_id, "epoch": r.epoch, "sets": r.sets}))).into_response()
         }
-        Err(e) => plain(StatusCode::INTERNAL_SERVER_ERROR, "internal", format!("retrying model sets on {node_id}: {e}")),
+        Err(f) => plain(f.status, f.code, f.detail),
     }
 }
 
@@ -192,12 +210,67 @@ mod tests {
         assert!(h.contains("operator: crate::authz::Operator"), "operator gate (an extractor)");
         let sig = h.split("-> Response").next().unwrap();
         assert!(sig.find("operator: crate::authz::Operator").unwrap() < sig.find("body: Option<Json<Value>>").unwrap(), "the gate sits before the body extractor");
-        assert!(h.contains("repo::bump("), "{h}");
+        assert!(h.contains("request_retry(&state.db, &node_id, &b, operator.sub())"), "the handler hands the pool, not AppState, to the retry");
+        let r = crate::test_src::fn_body(&own, "pub async fn request_retry(");
+        assert!(r.contains("repo::bump("), "{r}");
+        assert!(!r.contains("AppState") && !r.contains("state."), "request_retry takes the pool only");
         for placement in ["node_workload_placements::place", "node_workload_placements::remove", "node_workload_placements::set_", "repo::place(", "repo::remove("] {
             assert!(!own.contains(placement), "the retry route must not touch placements: {placement}");
         }
         // The route is registered, once, on the cluster router.
         let cluster = include_str!("cluster.rs");
         assert!(cluster.contains("\"/api/cluster/nodes/{node_id}/model-set-retry\", post(super::model_set_retry::retry_model_set)"));
+    }
+
+    /// SECURITY, against Postgres: a retry never changes a placement. Place a
+    /// node workload, snapshot every column of the node's placement rows, retry
+    /// twice (bare, then named), and the rows are identical while the epoch
+    /// moved by 2.
+    #[tokio::test]
+    async fn a_retry_leaves_the_nodes_placement_rows_byte_for_byte_unchanged() {
+        let Some(dsn) = std::env::var("NOO_TEST_DSN").ok().filter(|v| !v.trim().is_empty()) else {
+            eprintln!("NOO_TEST_DSN unset — retry-leaves-placements not exercised");
+            return;
+        };
+        use std::str::FromStr as _;
+        let opts = sqlx::postgres::PgConnectOptions::from_str(&dsn).expect("dsn").options([("search_path", "mesh,public")]);
+        let admin = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect_with(opts.clone()).await.expect("connect");
+        crate::mesh_migrate::apply_baseline(&admin).await.expect("baseline");
+        crate::mesh_migrate::apply(&admin).await.expect("migrations");
+        let db = sqlx::postgres::PgPoolOptions::new().max_connections(2).connect_with(opts).await.expect("connect");
+        let node = format!("msr-plc-{}", std::process::id());
+        let _ = crate::repo::node_workload_placements::remove(&db, &node, "rhaddon", "worker").await;
+        let _ = sqlx::query("DELETE FROM noo_node_model_set_retry WHERE node_id = $1").bind(&node).execute(&db).await;
+
+        let row = crate::repo::node_workload_placements::Placement {
+            addon: "rhaddon".into(),
+            workload: "worker".into(),
+            node_id: node.clone(),
+            profile: Some("int8".into()),
+            sets: json!({"main": [{"id": "rh-s2s-7b", "revision": "r1"}]}),
+            env: json!({"RHADDON_SLOTS": "1"}),
+            on_controller: false,
+            desired_state: "provisioned".into(),
+            reservation: None,
+        };
+        crate::repo::node_workload_placements::place(&db, &row).await.expect("place");
+        // Every column, updated_at included, not only the fields Placement carries.
+        let snapshot = || async {
+            let rows: Vec<(Value,)> = sqlx::query_as("SELECT to_jsonb(p) FROM noo_node_workload_placements p WHERE node_id = $1 ORDER BY addon, workload").bind(&node).fetch_all(&db).await.expect("snapshot");
+            rows.into_iter().map(|r| r.0).collect::<Vec<_>>()
+        };
+        let before = snapshot().await;
+        assert!(before.iter().any(|r| r["node_id"] == json!(node)), "the fixture row is there");
+        let epoch0 = repo::get(&db, &node).await.expect("get").map_or(0, |r| r.epoch);
+
+        let a = request_retry(&db, &node, &json!({}), "alice").await.expect("bare retry");
+        let b = request_retry(&db, &node, &json!({"set": "rh-s2s-7b@r1"}), "alice").await.expect("named retry");
+        assert_eq!((a.epoch, b.epoch), (epoch0 + 1, epoch0 + 2), "the epoch moved by 2");
+
+        assert_eq!(snapshot().await, before, "a retry changed a placement row");
+        assert_eq!(crate::repo::node_workload_placements::for_node(&db, &node).await.expect("for_node"), vec![row]);
+
+        let _ = crate::repo::node_workload_placements::remove(&db, &node, "rhaddon", "worker").await;
+        let _ = sqlx::query("DELETE FROM noo_node_model_set_retry WHERE node_id = $1").bind(&node).execute(&db).await;
     }
 }

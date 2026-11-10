@@ -27,14 +27,22 @@ pub struct Retry {
 
 /// Add one to the node's epoch (a node with no row starts at 1) and record
 /// `set` as the sets this bump names (none = all). Returns the new state.
-/// Two bumps inside one agent reconcile interval: the later bump's sets win,
-/// while the epoch still moves (a bump with no set clears everything).
+/// A named bump stores the UNION of the stored sets and the new one, so two
+/// retries inside one agent reconcile interval lose neither. A bare bump
+/// stores `[]` (all), and once `[]` is stored a later named bump keeps it:
+/// all stays all. That is safe because the agent only ever clears REFUSED
+/// entries, so re-clearing a set that is fetching or verified is a no-op.
 pub async fn bump(db: impl sqlx::PgExecutor<'_>, node_id: &str, set: Option<&str>, by: &str) -> Result<Retry, sqlx::Error> {
     let sets: Value = Value::Array(set.map(|s| Value::String(s.to_string())).into_iter().collect());
     let row = sqlx::query(
         "INSERT INTO noo_node_model_set_retry (node_id, epoch, sets, updated_by) VALUES ($1, 1, $2, $3) \
          ON CONFLICT (node_id) DO UPDATE SET epoch = noo_node_model_set_retry.epoch + 1, \
-           sets = EXCLUDED.sets, updated_by = EXCLUDED.updated_by, updated_at = now() \
+           sets = CASE \
+             WHEN jsonb_array_length(EXCLUDED.sets) = 0 THEN '[]'::jsonb \
+             WHEN jsonb_array_length(noo_node_model_set_retry.sets) = 0 THEN '[]'::jsonb \
+             ELSE (SELECT COALESCE(jsonb_agg(DISTINCT v), '[]'::jsonb) \
+                   FROM jsonb_array_elements(noo_node_model_set_retry.sets || EXCLUDED.sets) AS v) END, \
+           updated_by = EXCLUDED.updated_by, updated_at = now() \
          RETURNING epoch, sets",
     )
     .bind(node_id)
@@ -54,10 +62,9 @@ pub async fn get(db: impl sqlx::PgExecutor<'_>, node_id: &str) -> Result<Option<
 fn from_row(r: &sqlx::postgres::PgRow) -> Result<Retry, sqlx::Error> {
     let epoch: i64 = r.try_get("epoch")?;
     let sets: Value = r.try_get("sets")?;
-    Ok(Retry {
-        epoch: u64::try_from(epoch).unwrap_or(0),
-        sets: sets.as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default(),
-    })
+    let mut sets: Vec<String> = sets.as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+    sets.sort();
+    Ok(Retry { epoch: u64::try_from(epoch).unwrap_or(0), sets })
 }
 
 #[cfg(test)]
@@ -65,8 +72,7 @@ mod tests {
     use super::*;
 
     /// Every statement here against the migrated schema: the first bump
-    /// makes epoch 1, each bump adds one, the sets are the last bump's, and
-    /// another node's row is untouched.
+    /// makes epoch 1, each bump adds one, and another node's row is untouched.
     #[tokio::test]
     async fn the_epoch_round_trips_and_only_goes_up() {
         let Some(dsn) = std::env::var("NOO_TEST_DSN").ok().filter(|v| !v.trim().is_empty()) else {
@@ -85,9 +91,46 @@ mod tests {
 
         assert_eq!(get(&db, &node_a).await.expect("get"), None, "never bumped");
         assert_eq!(bump(&db, &node_a, Some("rh-main@r1"), "alice").await.expect("bump"), Retry { epoch: 1, sets: vec!["rh-main@r1".into()] });
-        assert_eq!(bump(&db, &node_a, None, "alice").await.expect("bump"), Retry { epoch: 2, sets: vec![] }, "no set = all");
+        assert_eq!(bump(&db, &node_a, None, "alice").await.expect("bump"), Retry { epoch: 2, sets: vec![] }, "a bare bump = all");
         assert_eq!(get(&db, &node_a).await.expect("get"), Some(Retry { epoch: 2, sets: vec![] }));
         assert_eq!(get(&db, &node_b).await.expect("get"), None, "another node is untouched");
         let _ = sqlx::query("DELETE FROM noo_node_model_set_retry WHERE node_id = $1").bind(&node_a).execute(&db).await;
+    }
+
+    async fn pool() -> Option<sqlx::PgPool> {
+        let dsn = std::env::var("NOO_TEST_DSN").ok().filter(|v| !v.trim().is_empty())?;
+        use std::str::FromStr as _;
+        let opts = sqlx::postgres::PgConnectOptions::from_str(&dsn).expect("dsn").options([("search_path", "mesh,public")]);
+        let admin = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect_with(opts.clone()).await.expect("connect");
+        crate::mesh_migrate::apply_baseline(&admin).await.expect("baseline");
+        crate::mesh_migrate::apply(&admin).await.expect("migrations");
+        Some(sqlx::postgres::PgPoolOptions::new().max_connections(2).connect_with(opts).await.expect("connect"))
+    }
+
+    /// Two retries close together lose no set: named then named is the union;
+    /// named then bare is all; bare then named stays all.
+    #[tokio::test]
+    async fn named_bumps_union_and_a_bare_bump_is_all_for_good() {
+        let Some(db) = pool().await else {
+            eprintln!("NOO_TEST_DSN unset — model-set retry union not exercised");
+            return;
+        };
+        let pid = std::process::id();
+        let (n1, n2, n3) = (format!("msu-1-{pid}"), format!("msu-2-{pid}"), format!("msu-3-{pid}"));
+        let _ = sqlx::query("DELETE FROM noo_node_model_set_retry WHERE node_id = ANY($1)").bind(vec![n1.clone(), n2.clone(), n3.clone()]).execute(&db).await;
+
+        bump(&db, &n1, Some("set-a@r1"), "alice").await.expect("bump");
+        let r = bump(&db, &n1, Some("set-b@r1"), "alice").await.expect("bump");
+        assert_eq!(r, Retry { epoch: 2, sets: vec!["set-a@r1".into(), "set-b@r1".into()] }, "named, named = union");
+        let r = bump(&db, &n1, Some("set-a@r1"), "alice").await.expect("bump");
+        assert_eq!(r.sets, vec!["set-a@r1".to_string(), "set-b@r1".to_string()], "a repeated set is not doubled");
+
+        bump(&db, &n2, Some("set-a@r1"), "alice").await.expect("bump");
+        assert_eq!(bump(&db, &n2, None, "alice").await.expect("bump"), Retry { epoch: 2, sets: vec![] }, "named, bare = all");
+
+        bump(&db, &n3, None, "alice").await.expect("bump");
+        assert_eq!(bump(&db, &n3, Some("set-a@r1"), "alice").await.expect("bump"), Retry { epoch: 2, sets: vec![] }, "bare, named = all");
+
+        let _ = sqlx::query("DELETE FROM noo_node_model_set_retry WHERE node_id = ANY($1)").bind(vec![n1, n2, n3]).execute(&db).await;
     }
 }
