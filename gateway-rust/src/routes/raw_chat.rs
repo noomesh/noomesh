@@ -733,6 +733,21 @@ pub async fn chat_completions(
     actor: UsageActor,
     pin: &PinHeaders,
 ) -> Result<Outcome, RawChatError> {
+    chat_completions_with(state, body, source, actor, pin, |_, _| {}).await
+}
+
+/// [`chat_completions`], with `adjust` applied to each candidate's body
+/// after its model is set: for a caller whose fields depend on the engine
+/// that will answer (`/api/inference`'s raw path turns thinking off on
+/// every engine's own switch, `thinking::disable_on_wire`).
+pub async fn chat_completions_with(
+    state: &AppState,
+    body: &mut Value,
+    source: &'static str,
+    actor: UsageActor,
+    pin: &PinHeaders,
+    adjust: impl Fn(&mut Value, &Candidate),
+) -> Result<Outcome, RawChatError> {
     if !body.is_object() {
         return Err(RawChatError::bad_request("the request body must be a JSON object with 'messages'"));
     }
@@ -748,6 +763,7 @@ pub async fn chat_completions(
     send_with_failover(state, &class, &cands, stream, source, actor, |cand| {
         let mut b = template.clone();
         b["model"] = json!(cand.model);
+        adjust(&mut b, cand);
         ("/v1/chat/completions".to_string(), b)
     })
     .await

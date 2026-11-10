@@ -359,7 +359,17 @@ async fn native_inference(
                 let started = std::time::Instant::now();
                 let sampling = Sampling { max_tokens: req.max_tokens, temperature: req.temperature };
                 match chat_completion_on_node(&backend_type, &model, &base_url, &req.prompt, sampling).await {
-                    Ok(text) => return (StatusCode::OK, Json(json!({
+                    // The node answered, with nothing: not a success, and not
+                    // a stall either (no demotion, no pool retry of the same
+                    // empty model). Say why, strict or not.
+                    Ok(ChatAnswer::Empty { finish_reason, reasoning }) => {
+                        let mut out = empty_answer_body(finish_reason.as_deref(), reasoning.as_deref());
+                        out["node"] = json!(node_id);
+                        out["backend"] = json!(backend_type);
+                        out["model"] = json!(model);
+                        return (StatusCode::BAD_GATEWAY, Json(out)).into_response();
+                    }
+                    Ok(ChatAnswer::Text(text)) => return (StatusCode::OK, Json(json!({
                         "success": true,
                         "data": {
                             "response": text,
@@ -426,9 +436,27 @@ async fn native_inference(
         // carries the detail, not the general wording.
         // A node pin reaches here only when the node could not answer and
         // was not strict (`unmet`): the pool answers and says so.
-        match super::raw_chat::chat_completions(&state, &mut body, "api", usage_actor, &super::raw_chat::PinHeaders::default()).await {
+        // A raw call is a plain model call: thinking off on whichever engine
+        // answers, so the whole max_tokens goes to the answer (120: qwen3 on
+        // ollama answered short prompts with reasoning and empty content).
+        let think_off = |b: &mut Value, cand: &crate::coordinator::classes::Candidate| {
+            crate::coordinator::thinking::disable_on_wire(b, "openai", &cand.backend, cand.backend.starts_with("cloud-"));
+        };
+        match super::raw_chat::chat_completions_with(&state, &mut body, "api", usage_actor, &super::raw_chat::PinHeaders::default(), think_off).await {
             Ok(super::raw_chat::Outcome::Json { data, served }) => {
-                let text = data.pointer("/choices/0/message/content").and_then(Value::as_str).unwrap_or("");
+                let text = match chat_answer(&data) {
+                    ChatAnswer::Text(t) => t,
+                    ChatAnswer::Empty { finish_reason, reasoning } => {
+                        let mut out = empty_answer_body(finish_reason.as_deref(), reasoning.as_deref());
+                        out["model"] = json!(served.model);
+                        out["backend"] = json!(served.backend_type);
+                        if let Some((n, why)) = &unmet {
+                            out["requested_node"] = json!(n);
+                            out["node_unavailable"] = json!(why);
+                        }
+                        return (StatusCode::BAD_GATEWAY, Json(out)).into_response();
+                    }
+                };
                 let (p, c) = crate::usage::usage_from_frame(&data).unwrap_or((0, 0));
                 let mut out = json!({
                     "response": text,
@@ -651,9 +679,13 @@ pub(crate) async fn chat_completion_on_node(
     base_url: &str,
     prompt: &str,
     sampling: Sampling,
-) -> Result<String, String> {
+) -> Result<ChatAnswer, String> {
     let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
-    let body = pinned_chat_body(model, prompt, sampling);
+    let mut body = pinned_chat_body(model, prompt, sampling);
+    // A pinned chat is a plain model call: thinking off, on the engine's own
+    // switch (the node agent forwards it; ollama's translator maps it to
+    // `think: false`), so the budget goes to the answer (120).
+    crate::coordinator::thinking::disable_on_wire(&mut body, "openai", backend_type, backend_type.starts_with("cloud-"));
 
     // Add X-Noo-Backend hint for node-agent proxy URLs.
     // 240s: edge nodes are slow — host9 (gemma-4-E2B on a Pi) needs
@@ -671,8 +703,7 @@ pub(crate) async fn chat_completion_on_node(
     match sent {
         Ok(resp) if resp.status().is_success() => {
             let data = crate::upstream_body::json_2xx(resp, "the backend").await?;
-            Ok(data.pointer("/choices/0/message/content")
-                .and_then(|v| v.as_str()).unwrap_or("").to_string())
+            Ok(chat_answer(&data))
         }
         Ok(resp) => {
             let status = resp.status();
@@ -682,6 +713,64 @@ pub(crate) async fn chat_completion_on_node(
         }
         Err(e) => Err(format!("backend unreachable: {}", e)),
     }
+}
+
+/// What a chat completion held: an answer, or none, with what the backend
+/// said about why.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ChatAnswer {
+    Text(String),
+    /// A 2xx whose content is empty or whitespace. `reasoning` is the
+    /// reasoning text when the backend sent one (`reasoning_content` from
+    /// vLLM's parser, `reasoning` from ollama's /v1 layer and the node
+    /// agent's translator).
+    Empty { finish_reason: Option<String>, reasoning: Option<String> },
+}
+
+/// Read an OpenAI chat-completions body. Empty content is never an answer:
+/// until 120 (outside tester, 0.6.21) the raw paths returned `""` with
+/// `success: true` when a reasoning model (qwen3:4b on ollama) put its whole
+/// reply in reasoning.
+pub(crate) fn chat_answer(data: &Value) -> ChatAnswer {
+    let msg = data.pointer("/choices/0/message");
+    let content = msg.and_then(|m| m.get("content")).and_then(Value::as_str).unwrap_or("");
+    if !content.trim().is_empty() {
+        return ChatAnswer::Text(content.to_string());
+    }
+    let reasoning = msg
+        .and_then(|m| ["reasoning_content", "reasoning"].iter().find_map(|k| m.get(*k).and_then(Value::as_str)))
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map(str::to_string);
+    let finish_reason = data.pointer("/choices/0/finish_reason").and_then(Value::as_str).map(str::to_string);
+    ChatAnswer::Empty { finish_reason, reasoning }
+}
+
+/// The longest reasoning an `empty_response` refusal carries.
+pub(crate) const EMPTY_REASONING_MAX_BYTES: usize = 4000;
+
+/// The `/api/inference` refusal for an empty answer (a 502): one sentence
+/// saying why, `code: empty_response`, the `finish_reason`, and the
+/// reasoning when there was some (clipped).
+pub(crate) fn empty_answer_body(finish_reason: Option<&str>, reasoning: Option<&str>) -> Value {
+    let fin = finish_reason.unwrap_or("not given");
+    let error = if finish_reason == Some("length") {
+        "the model returned no answer: max_tokens ran out before it answered (finish_reason: length); raise --max-tokens".to_string()
+    } else if reasoning.is_some() {
+        format!("the model returned only reasoning and no answer (finish_reason: {fin})")
+    } else {
+        format!("the model returned an empty answer (finish_reason: {fin})")
+    };
+    let mut out = json!({
+        "success": false,
+        "error": error,
+        "code": "empty_response",
+        "finish_reason": finish_reason,
+    });
+    if let Some(r) = reasoning {
+        out["reasoning"] = json!(crate::text::clip(r, EMPTY_REASONING_MAX_BYTES));
+    }
+    out
 }
 
 /// The sampling controls a caller sent with a pinned chat. `None` = not
@@ -1769,13 +1858,18 @@ mod pinned_no_chat_tests {
 /// bytes that crossed the wire, not on a helper's return value.
 #[cfg(test)]
 mod pinned_sampling_tests {
-    use super::{chat_completion_on_node, Sampling, PINNED_DEFAULT_MAX_TOKENS, PINNED_DEFAULT_TEMPERATURE};
+    use super::{chat_answer, chat_completion_on_node, empty_answer_body, ChatAnswer, Sampling, PINNED_DEFAULT_MAX_TOKENS, PINNED_DEFAULT_TEMPERATURE};
     use serde_json::{json, Value};
     use std::sync::{Arc, Mutex};
 
     /// A one-route node: records each `/v1/chat/completions` body it gets and
     /// answers "ok". Returns its base URL and the record.
     async fn node() -> (String, Arc<Mutex<Vec<Value>>>) {
+        node_answering(json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]})).await
+    }
+
+    /// A one-route node that records each body and answers `reply`.
+    async fn node_answering(reply: Value) -> (String, Arc<Mutex<Vec<Value>>>) {
         use axum::{routing::post, Json, Router};
         let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
         let rec = seen.clone();
@@ -1783,9 +1877,10 @@ mod pinned_sampling_tests {
             "/v1/chat/completions",
             post(move |Json(body): Json<Value>| {
                 let rec = rec.clone();
+                let reply = reply.clone();
                 async move {
                     rec.lock().unwrap().push(body);
-                    Json(json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}))
+                    Json(reply)
                 }
             }),
         );
@@ -1806,7 +1901,7 @@ mod pinned_sampling_tests {
         )
         .await
         .expect("the node answered");
-        assert_eq!(text, "ok");
+        assert_eq!(text, ChatAnswer::Text("ok".into()));
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1, "exactly one call reaches the node: {seen:?}");
         assert_eq!(seen[0]["max_tokens"], json!(1), "{}", seen[0]);
@@ -1839,5 +1934,101 @@ mod pinned_sampling_tests {
         let base = crate::upstream_body::stub_not_json().await;
         let e = chat_completion_on_node("vllm", "m", &base, "hi", Sampling::default()).await.unwrap_err();
         assert!(e.starts_with("the backend answered HTTP 200 but its body is not JSON"), "{e}");
+    }
+
+    /// The node agent's ollama translator (`ollamaToOpenAIResponse`):
+    /// `message.reasoning` carries ollama's `thinking`, `finish_reason` is
+    /// stop or length.
+    fn ollama_reply(content: &str, thinking: Option<&str>, finish: &str) -> Value {
+        let mut message = json!({"role": "assistant", "content": content});
+        if let Some(t) = thinking {
+            message["reasoning"] = json!(t);
+        }
+        json!({"id": "chatcmpl-1", "object": "chat.completion", "created": 1, "model": "qwen3:4b",
+               "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+               "usage": {"prompt_tokens": 14, "completion_tokens": 212, "total_tokens": 226}})
+    }
+
+    /// 120 (outside tester, 0.6.21): qwen3:4b on ollama, "Say hello in five
+    /// words", came back `"response": ""` with success. The pinned call now
+    /// turns thinking off on the engine's switch, and an empty answer is an
+    /// Empty carrying the reasoning and finish_reason, never Text("").
+    #[tokio::test]
+    async fn a_pinned_chat_turns_thinking_off_and_an_all_reasoning_reply_is_empty() {
+        let (base, seen) = node_answering(ollama_reply("", Some("The user wants five words. Hello there, how are you?"), "stop")).await;
+        let got = chat_completion_on_node("ollama", "qwen3:4b", &base, "Say hello in five words", Sampling::default()).await.unwrap();
+        assert_eq!(got, ChatAnswer::Empty {
+            finish_reason: Some("stop".into()),
+            reasoning: Some("The user wants five words. Hello there, how are you?".into()),
+        });
+        let sent = &seen.lock().unwrap()[0];
+        assert_eq!(sent["think"], json!(false), "ollama behind the agent: think false: {sent}");
+        assert_eq!(sent["reasoning"], json!({"effort": "none"}), "{sent}");
+        assert_eq!(sent["chat_template_kwargs"]["enable_thinking"], json!(false), "{sent}");
+    }
+
+    /// vLLM: the switch is the chat template's; `think` is ollama's alone.
+    #[tokio::test]
+    async fn a_pinned_chat_to_vllm_turns_thinking_off_without_ollamas_field() {
+        let (base, seen) = node().await;
+        chat_completion_on_node("vllm", "m", &base, "hi", Sampling::default()).await.unwrap();
+        let sent = &seen.lock().unwrap()[0];
+        assert_eq!(sent["chat_template_kwargs"]["enable_thinking"], json!(false), "{sent}");
+        assert!(sent.get("think").is_none(), "{sent}");
+    }
+
+    /// Real shapes, each judged: an answer (with reasoning beside it) is
+    /// Text; empty or whitespace content is Empty with what the backend said.
+    #[test]
+    fn a_chat_body_is_an_answer_only_when_its_content_has_text() {
+        assert_eq!(chat_answer(&ollama_reply("Hello there, nice to meet!", Some("thinking"), "stop")),
+            ChatAnswer::Text("Hello there, nice to meet!".into()));
+        assert_eq!(chat_answer(&ollama_reply("", None, "length")),
+            ChatAnswer::Empty { finish_reason: Some("length".into()), reasoning: None });
+        assert_eq!(chat_answer(&ollama_reply(" \n ", Some("  "), "stop")),
+            ChatAnswer::Empty { finish_reason: Some("stop".into()), reasoning: None }, "blank is nothing");
+        // vLLM's reasoning parser: `reasoning_content`, content null.
+        let vllm = json!({"choices": [{"index": 0, "message": {"role": "assistant", "content": null,
+            "reasoning_content": "Let me think."}, "finish_reason": "length"}]});
+        assert_eq!(chat_answer(&vllm),
+            ChatAnswer::Empty { finish_reason: Some("length".into()), reasoning: Some("Let me think.".into()) });
+        assert_eq!(chat_answer(&json!({"choices": []})), ChatAnswer::Empty { finish_reason: None, reasoning: None });
+    }
+
+    /// The raw branch of `/api/inference` (`context: false`, or a pin the
+    /// pool answers): thinking off per candidate engine, and the answer
+    /// judged by `chat_answer`, never a bare content read with `""` as the
+    /// default.
+    #[test]
+    fn the_raw_branch_turns_thinking_off_and_judges_the_answer() {
+        let code = crate::test_src::own_code(include_str!("inference.rs"));
+        let f = crate::test_src::fn_body(&code, "async fn native_inference(");
+        assert!(f.contains("raw_chat::chat_completions_with(") && f.contains("think_off"), "the raw branch adjusts per candidate");
+        assert!(f.contains("disable_on_wire(b, \"openai\", &cand.backend, cand.backend.starts_with(\"cloud-\"))"), "every engine's switch, never a cloud's");
+        assert!(f.contains("match chat_answer(&data)") && f.contains("ChatAnswer::Empty"), "empty is judged");
+        assert!(f.contains("Ok(ChatAnswer::Empty {") , "the pinned branch judges empty too");
+        assert!(!f.contains("/choices/0/message/content"), "no bare content read in the route");
+        let node = crate::test_src::fn_body(&code, "pub(crate) async fn chat_completion_on_node(");
+        assert!(node.contains("disable_on_wire(&mut body, \"openai\", backend_type,"), "{node}");
+        assert!(node.contains("Ok(chat_answer(&data))"), "{node}");
+        let tools = crate::test_src::own_code(include_str!("../tools.rs"));
+        assert!(tools.contains("Ok(inf::ChatAnswer::Empty {"), "the noo_inference tool refuses an empty answer too");
+    }
+
+    /// The refusal names the cause and the remedy, and carries the facts.
+    #[test]
+    fn an_empty_answer_is_a_failure_that_says_why() {
+        let b = empty_answer_body(Some("length"), Some("hm"));
+        assert_eq!(b["success"], json!(false));
+        assert_eq!(b["code"], json!("empty_response"));
+        assert!(b["error"].as_str().unwrap().contains("raise --max-tokens"), "{b}");
+        assert_eq!((b["finish_reason"].clone(), b["reasoning"].clone()), (json!("length"), json!("hm")));
+        let b = empty_answer_body(Some("stop"), Some("only thoughts"));
+        assert!(b["error"].as_str().unwrap().contains("only reasoning and no answer"), "{b}");
+        let b = empty_answer_body(None, None);
+        assert!(b["error"].as_str().unwrap().contains("empty answer"), "{b}");
+        assert!(b.get("reasoning").is_none(), "{b}");
+        let long = "x".repeat(super::EMPTY_REASONING_MAX_BYTES * 2);
+        assert_eq!(empty_answer_body(Some("stop"), Some(&long))["reasoning"].as_str().unwrap().len(), super::EMPTY_REASONING_MAX_BYTES);
     }
 }
