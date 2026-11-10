@@ -1297,7 +1297,12 @@ contains, one of those.
   points `NOO_TLS_CA/CERT/KEY` there. The harness needs no access to
   `/etc/noo/pki`, which stays 0750 `root:noo-agent`. A file systemd cannot
   load fails the start, naming the unit. The applier restarts the harness
-  when the CA or its pair changes. The agent's pair, env file and secret
+  when the CA or its pair changes. `LoadCredential=` needs systemd 247 or
+  newer. On an older systemd the applier refuses the new unit
+  (`REFUSED harness-unit`), keeps the installed one, points the env's
+  `NOO_TLS_*` back at `/etc/noo/pki`, applies the rest of the bundle, and
+  `noo cluster verify` shows a `harness systemd` warning naming the node.
+  The agent's pair, env file and secret
   files are `InaccessiblePaths=` for it. So even a CLI that escaped the jail runs
   with a uid and gid that cannot read the agent's key material.
 - **macOS.** The CLI runs under `/usr/bin/sandbox-exec` with a profile that

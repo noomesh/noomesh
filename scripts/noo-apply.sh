@@ -749,6 +749,46 @@ esac
 [ -f "$WORK/files/agent-unit" ] && { unit_payload_ok "$WORK/files/agent-unit" agent-unit || exit 65; }
 [ -f "$WORK/files/harness-unit" ] && { unit_payload_ok "$WORK/files/harness-unit" harness-unit || exit 65; }
 
+# The systemd floor for the harness's credentials (finding 116, i637 follow-up).
+# The unit loads the CA and the harness pair with LoadCredential=, which
+# systemd added in 247. An older systemd ignores those lines with a warning,
+# the env still names /run/credentials/noo-harness.service/, the harness finds
+# nothing there and stops, and Restart=always brings it back every 30 s,
+# forever. Installing that pair is a known loop, so on such a node:
+#   * the harness-unit is REFUSED: the installed unit stays as it is;
+#   * the harness-env still applies (its model, gateway, NATS lines stay
+#     current), but its three NOO_TLS_* lines go back to the files the
+#     pre-credentials harness read (harness_env_off_credentials);
+#   * everything else in the bundle applies, the harness pair included.
+# The refusal rides the `applied:` line as HARNESS_SYSTEMD_REFUSED_TAG<N>
+# (cluster_verify.rs reads it from the apply report) and the journal.
+# Only a version READ as a number is judged: no systemctl, or one that does
+# not say, keeps the bundle as it is.
+HARNESS_SYSTEMD_FLOOR=247
+HARNESS_SYSTEMD_REFUSED_TAG="harness-unit=REFUSED-systemd"
+HARNESS_REFUSED=""
+# harness_env_off_credentials FILE — rewrite the NOO_TLS_* lines that name
+# the harness's credentials directory to the /etc/noo/pki files the unit
+# without LoadCredential= reads. Other lines are untouched.
+harness_env_off_credentials() {
+    sed -i \
+        -e 's#^NOO_TLS_CA=/run/credentials/noo-harness\.service/ca\.crt$#NOO_TLS_CA=/etc/noo/pki/ca.crt#' \
+        -e 's#^NOO_TLS_CERT=/run/credentials/noo-harness\.service/node\.crt$#NOO_TLS_CERT=/etc/noo/pki/harness/node.crt#' \
+        -e 's#^NOO_TLS_KEY=/run/credentials/noo-harness\.service/node\.key$#NOO_TLS_KEY=/etc/noo/pki/harness/node.key#' \
+        "$1"
+}
+if [ -f "$WORK/files/harness-unit" ] && grep -q '^LoadCredential=' "$WORK/files/harness-unit"; then
+    _sdv="$(systemctl --version 2>/dev/null | awk 'NR == 1 && $1 == "systemd" {print $2}')"
+    _sdv="${_sdv%%[!0-9]*}"
+    if [ -n "$_sdv" ] && [ "$_sdv" -lt "$HARNESS_SYSTEMD_FLOOR" ]; then
+        echo "noo-apply: REFUSED harness-unit — systemd $_sdv is older than $HARNESS_SYSTEMD_FLOOR and cannot load the harness's credentials (LoadCredential=); the installed harness unit stays, everything else applies" >&2
+        logger -t noo-apply "REFUSED harness-unit: systemd $_sdv < $HARNESS_SYSTEMD_FLOOR (LoadCredential=)" 2>/dev/null || true
+        rm -f "$WORK/files/harness-unit"
+        [ -f "$WORK/files/harness-env" ] && harness_env_off_credentials "$WORK/files/harness-env"
+        HARNESS_REFUSED=" $HARNESS_SYSTEMD_REFUSED_TAG$_sdv"
+    fi
+fi
+
 # NODE_ID resolution order matters (found live 2026-08-18): the BUNDLE's
 # agent-env is authoritative — it carries the operator-adopted name, which
 # may differ from the hostname. On a FIRST install /etc/noo-node-agent.env
@@ -770,6 +810,7 @@ NODE_ID="${NODE_ID:-$(hostname)}"
 
 if [ "$VERIFY_ONLY" = 1 ]; then
     echo "verified-by: $SIG_VIA"
+    [ -n "$HARNESS_REFUSED" ] && echo "verify-only: refused:$HARNESS_REFUSED"
     echo "verify-only: every check passed; nothing installed"
     exit 0
 fi
@@ -830,7 +871,7 @@ fi
 # collected as we go, executed once at the end.
 install -d -m 750 -o root -g noo-agent "$PKI/nodes/$NODE_ID"
 
-applied=""
+applied="$HARNESS_REFUSED"
 binary_shas=""
 need_restart=0
 need_daemon_reload=0
