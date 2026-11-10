@@ -152,7 +152,7 @@ async fn import(db: &PgPool, account: &str, channel: &str, p: Publication) -> Re
     let conversation = Uuid::new_v5(
         &Uuid::NAMESPACE_URL,
         format!(
-            "noomesh:conversation:{account}:{}:{}",
+            "noomesh:conversation:{}:{}",
             p.publisher_id, p.conversation_id
         )
         .as_bytes(),
