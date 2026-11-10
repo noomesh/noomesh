@@ -91,8 +91,13 @@ func ollamaListHas(listOutput, name string) bool {
 
 // execCapture runs argv in a container and returns its combined output,
 // failing on a non-zero exit. The same exec/attach/inspect sequence
-// ollamaCreateInContainer uses, without the copy step.
+// ollamaCreateInContainer uses (after its copy step).
 func (c *Client) execCapture(ctx context.Context, container string, cmd []string, timeout time.Duration) (string, error) {
+	return c.execCaptureIn(ctx, container, "", cmd, timeout)
+}
+
+// execCaptureIn is execCapture with a working directory ("" = the image's).
+func (c *Client) execCaptureIn(ctx context.Context, container, dir string, cmd []string, timeout time.Duration) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	// No TTY: `ollama pull`/`ollama list` print plain progress lines when
@@ -104,6 +109,7 @@ func (c *Client) execCapture(ctx context.Context, container string, cmd []string
 	// instead of a raw read.
 	created, err := c.docker.ExecCreate(ctx, container, client.ExecCreateOptions{
 		Cmd:          cmd,
+		WorkingDir:   dir,
 		AttachStdout: true,
 		AttachStderr: true,
 		TTY:          false,

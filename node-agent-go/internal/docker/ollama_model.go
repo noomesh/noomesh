@@ -231,7 +231,7 @@ func (c *Client) PullOllamaModel(ctx context.Context, name string) (*PullOllamaM
 	// container to copy into, and this is the cheaper path when it exists.
 	if bin, ok := ollamaBinary(); ok {
 		if out, runErr := runOllamaCreate(ctx, bin, work, name, mfName); runErr != nil {
-			return nil, fmt.Errorf("ollama create failed on the host binary: %s", out)
+			return nil, fmt.Errorf("ollama create failed on the host binary: %s", lastLine(out))
 		}
 		return &PullOllamaModelResult{Status: "created", Model: name, GGUF: weight, Via: "host"}, nil
 	}
@@ -420,38 +420,14 @@ func (c *Client) ollamaCreateInContainer(ctx context.Context, work, name, modelf
 	}); err != nil {
 		return "", fmt.Errorf("copy the model into %s: %w", OllamaContainer, err)
 	}
-	created, err := c.docker.ExecCreate(copyCtx, OllamaContainer, client.ExecCreateOptions{
-		Cmd:          []string{"ollama", "create", name, "-f", modelfile},
-		WorkingDir:   convertDir,
-		AttachStdout: true,
-		AttachStderr: true,
-		// One undemultiplexed stream: the output is an operator's error
-		// message, not something to parse.
-		TTY: true,
-	})
-	if err != nil {
-		return "", fmt.Errorf("exec create: %w", err)
-	}
-	att, err := c.docker.ExecAttach(copyCtx, created.ID, client.ExecAttachOptions{TTY: true})
-	if err != nil {
-		return "", fmt.Errorf("exec attach: %w", err)
-	}
-	raw, _ := io.ReadAll(att.Reader)
-	att.Close()
-	out := strings.TrimSpace(string(raw))
-	ins, err := c.docker.ExecInspect(copyCtx, created.ID, client.ExecInspectOptions{})
+	// No TTY (execCapture): with one, ollama's CLI wrote terminal queries
+	// and spinner frames into the output, and they reached the journal as
+	// the "ollama model created" detail (outside tester's 0.6.21 retest).
+	out, err := c.execCaptureIn(copyCtx, OllamaContainer, convertDir, []string{"ollama", "create", name, "-f", modelfile}, 30*time.Minute)
 	// The staging dir sits on the persistent model volume: remove it whatever
 	// the outcome (best effort; the next create starts with a clean copy).
 	c.removeConvertDir(copyCtx)
-	if err != nil {
-		return "", fmt.Errorf("exec inspect: %w", err)
-	}
-	// The exec's own exit code, not the copy's success — `ollama create`
-	// fails on a bad Modelfile long after every transfer reported fine.
-	if ins.ExitCode != 0 {
-		return out, fmt.Errorf("ollama create exited %d in %s: %s", ins.ExitCode, OllamaContainer, lastLine(out))
-	}
-	return out, nil
+	return out, err
 }
 
 // removeConvertDir deletes the staging directory in the ollama container.
