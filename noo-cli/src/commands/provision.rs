@@ -595,9 +595,42 @@ fn load_enrollment(g: &Globals, a: &ProvisionArgs, site: &ProvSite) -> ProvEnrol
     // this version's applier cannot parse (applier_knows_harness_kinds).
     // The node's live record, fetched once: its running version here, and
     // its live-derived tier below.
-    let live_node = live_node_record(g, &node);
+    //
+    // A node whose live entry expired (its agent is restarting, e.g. right
+    // after the previous wave applied) is listed from the gateway's database
+    // with none of those facts, and a failed fetch reads as nothing at all:
+    // both used to fall back in silence (0.6.20 roll). Wait a bounded time
+    // for a live record (node_live), then build anyway and SAY why.
+    let live_node = live_record_or_say_why(g, &node);
     let node_app_version = live_app_version(live_node.as_ref());
     ProvEnrollment { record, live_node, node_app_version }
+}
+
+/// The node's live record, waiting up to `node_live::LIVE_WAIT_SECS` for
+/// one; `None` (after one line saying why and what the bundle loses) when
+/// there is none. A node that stays down is still provisioned.
+fn live_record_or_say_why(g: &Globals, node: &str) -> Option<serde_json::Value> {
+    use super::node_live::{fallback_line, wait_live, LIVE_POLL_SECS, LIVE_WAIT_SECS};
+    let tries = (LIVE_WAIT_SECS / LIVE_POLL_SECS).max(1) as u32 + 1;
+    let mut said = false;
+    let mut fetch = || crate::http::get_raw_opt(g, "/api/cluster/nodes", true, 10);
+    let mut pause = || {
+        if !said && !g.json {
+            nstep(&format!("waiting for {node}'s live heartbeat (up to {LIVE_WAIT_SECS}s): its record has none yet"));
+        }
+        said = true;
+        std::thread::sleep(std::time::Duration::from_secs(LIVE_POLL_SECS));
+    };
+    let started = std::time::Instant::now();
+    let (state, _asked) = wait_live(&mut fetch, node, tries, &mut pause);
+    if let Some(line) = fallback_line(node, &state, started.elapsed().as_secs()) {
+        if g.json {
+            eprintln!("{line}");
+        } else if !ui::quiet() {
+            println!("{}", ui::sub(&ui::status_line(Glyph::Warn, &line)));
+        }
+    }
+    state.live().cloned()
 }
 
 /// Resolve the node's address, account and tier from its enrollment record, and record them on its registry row.

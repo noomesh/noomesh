@@ -150,6 +150,7 @@ pub mod agent_secret_files;
 pub mod env_quote;
 pub mod node_fetch;
 pub mod node_leaves;
+pub mod node_live;
 pub mod node_workloads;
 pub mod data_root;
 pub use node_fetch::node_fetch;
