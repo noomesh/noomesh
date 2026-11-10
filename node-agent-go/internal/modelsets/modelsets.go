@@ -509,7 +509,7 @@ func (s *Store) fetch(ctx context.Context, ref Ref) error {
 		fctx, cancel := context.WithTimeout(ctx, fileFetchTimeout)
 		var err error
 		if pf, ok := s.Files.(ProgressFetcher); ok {
-			onBytes := func(written int64) { prog.set(base + written) }
+			onBytes := func(written int64) {}
 			_, err = pf.FetchOneVerifiedProgress(fctx, src, dest, f.SHA256, onBytes)
 		} else {
 			_, err = s.Files.FetchOneVerified(fctx, src, dest, f.SHA256)
@@ -524,7 +524,6 @@ func (s *Store) fetch(ctx context.Context, ref Ref) error {
 		if !here[i] {
 			base += f.Bytes // this file is whole now; the next one counts on top
 		}
-		prog.set(base)
 	}
 
 	// 6. Check what is on disk, then seal: manifest, files read-only, marker
