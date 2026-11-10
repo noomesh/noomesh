@@ -85,7 +85,7 @@ func skipEscape(s string, i int) int {
 // lastLine is the last non-empty line of a command's output, cleaned of
 // terminal control (cleanTerminal), for a one-line log detail or error.
 func lastLine(s string) string {
-	lines := strings.Split(cleanTerminal(s), "\n")
+	lines := strings.Split(s, "\n")
 	for k := len(lines) - 1; k >= 0; k-- {
 		if l := strings.TrimSpace(lines[k]); l != "" {
 			return l
