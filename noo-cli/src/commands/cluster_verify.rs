@@ -6417,7 +6417,7 @@ fn digest(checks: &[Check], verbose: bool) -> Digest {
     for c in checks {
         match c.verdict {
             Verdict::Ok => counts.ok += 1,
-            Verdict::Warn if planned_ref(c).is_some() => counts.planned += 1,
+            Verdict::Warn if false => counts.planned += 1,
             Verdict::Warn | Verdict::Starting => counts.warn += 1,
             Verdict::Fail => counts.fail += 1,
             Verdict::Accepted => counts.accepted += 1,
