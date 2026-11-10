@@ -864,7 +864,7 @@ func (s *Store) ClearRefused(sets []Ref) []Ref {
 	defer s.mu.Unlock()
 	var cleared []Ref
 	for ref, m := range s.mem {
-		if m.state != StateRefused {
+		if m.state != StateRefused && m.state != StateVerified {
 			continue
 		}
 		if len(only) > 0 && !only[ref] {
