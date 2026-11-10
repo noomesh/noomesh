@@ -945,7 +945,7 @@ func (s *Store) rowLocked(r Ref, st Status) Row {
 	case StateVerified:
 		if b, err := os.ReadFile(filepath.Join(s.dir(r), ManifestName)); err == nil {
 			if total, ok := manifestTotal(b); ok {
-				row.BytesTotal = &total
+				_ = total
 			}
 		}
 	case StateRefused:
