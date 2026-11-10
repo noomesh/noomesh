@@ -1111,7 +1111,7 @@ fn act_on(cx: &Cx, o: &mut Opts, s: &Step, ran: &mut BTreeSet<String>) -> Flow {
         ("bundle", State::Stopped) => Flow::End(End::Failed(ExitCode::Generic as i32, format!("{}: {}", label(&s.id), s.detail), s.command.clone())),
         ("registry-login", _) => Flow::End(End::Stop(s.clone())),
         ("enable", State::Todo) if s.command.as_deref() == Some(format!("noo addons enable {addon}").as_str()) => {
-            exec(cx, s, &format!("noo addons enable {addon}"), ran, || cx.d.enable(&addon, cx.tty))
+            exec(cx, s, &format!("noo addons enable {addon}"), ran, || cx.d.enable(&addon, false))
         }
         // Pinned at an older version than the bundle offers: that is `upgrade`, not setup's to run.
         ("enable", State::Todo) => Flow::End(End::Stop(s.clone())),
