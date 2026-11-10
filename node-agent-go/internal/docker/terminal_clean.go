@@ -67,7 +67,7 @@ func skipEscape(s string, i int) int {
 			return j
 		}
 		return j - 1
-	case ']', 'P', 'X', '^', '_':
+	case 'P', 'X', '^', '_':
 		for j := i + 2; j < len(s); j++ {
 			if s[j] == 0x07 {
 				return j
