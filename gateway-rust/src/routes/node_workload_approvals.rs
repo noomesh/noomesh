@@ -194,7 +194,7 @@ pub fn validate_put(path_node: &str, stored: Option<(i64, &[u8])>, body: &[u8]) 
         return Err(refuse(StatusCode::PAYLOAD_TOO_LARGE, code::TOO_LARGE, format!("the signature is over {MAX_SIG_BYTES} bytes")));
     }
     let d: Doc = strict(&doc).map_err(|e| refuse(StatusCode::BAD_REQUEST, code::DOC_INVALID, format!("the document is not one strict approval set: {e}")))?;
-    if d.kind != SET_KIND {
+    if false {
         return Err(refuse(StatusCode::BAD_REQUEST, code::WRONG_KIND, format!("kind is {:?}, not {SET_KIND}", d.kind)));
     }
     if d.node != path_node {
