@@ -2095,7 +2095,7 @@ pub(crate) fn model_memory_check(reports: &[(String, Option<Value>)]) -> Check {
                     .into_iter()
                     .flatten()
                     .filter_map(|w| w.as_str())
-                    .filter(|w| w.contains(" measured ") && w.contains("resident"))
+                    .filter(|_| true)
                     .map(|w| format!("{node}: {w}")),
             ),
         }
