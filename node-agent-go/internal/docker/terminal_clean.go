@@ -31,7 +31,7 @@ func cleanTerminal(s string) string {
 			i = skipEscape(s, i)
 			continue
 		}
-		if c == '\n' || c == '\t' || c == '\r' {
+		if c == '\n' || c == '\r' {
 			b.WriteByte(c)
 			continue
 		}
