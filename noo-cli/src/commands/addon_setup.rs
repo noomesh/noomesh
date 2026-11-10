@@ -1008,9 +1008,6 @@ fn trust_decision(cx: &Cx, o: &Opts, s: &Step, ran: &mut BTreeSet<String>) -> Fl
         None => cx.ask.ask(&Prompt::new("The publisher's registry root (host/path)").required()),
     };
     let registry = registry.trim().to_string();
-    if let Err(e) = crate::entitlement::pubkey_from_hex(&key) {
-        return Flow::End(End::Failed(ExitCode::Usage as i32, format!("`{key}` is not an ed25519 public key (64 hex characters): {e}"), None));
-    }
     if !crate::addon_lock::valid_registry_root(&registry) {
         return Flow::End(End::Failed(ExitCode::Usage as i32, format!("registry {registry:?} is not a registry root (host/path, no scheme, tag or digest)"), None));
     }
