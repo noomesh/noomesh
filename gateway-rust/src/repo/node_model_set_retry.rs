@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026 PersonifAI LLC
 
-//! `noo_node_model_set_retry` (migration 114, i607b B3): the per-node
+//! `noo_node_model_set_retry` (migration 115, i607b B3): the per-node
 //! `retry now` epoch for a refused model-set fetch.
 //!
 //! One row per node: a monotonic `epoch` and the sets the last bump named

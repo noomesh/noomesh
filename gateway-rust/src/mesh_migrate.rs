@@ -2385,7 +2385,7 @@ pub const SEAT_DISPLAY_REVISION: &str = "113_seat_display";
 
 /// The per-node model-set `retry now` epoch (i607b B3), on seat display
 /// (113). A constant so a renumber at rebase is one line.
-pub const NODE_MODEL_SET_RETRY_REVISION: &str = "114_node_model_set_retry";
+pub const NODE_MODEL_SET_RETRY_REVISION: &str = "115_node_model_set_retry";
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
 /// constant so a renumber at rebase is one line.
@@ -3985,7 +3985,7 @@ mod node_model_set_retry_migration_tests {
     #[test]
     fn node_model_set_retry_revision_is_the_head_and_additive() {
         let m = MIGRATIONS.iter().find(|m| m.revision == NODE_MODEL_SET_RETRY_REVISION).expect("must be in the chain");
-        assert_eq!(m.revision, "114_node_model_set_retry");
+        assert_eq!(m.revision, "115_node_model_set_retry");
         assert_eq!(m.down_revision, Some(SEAT_DISPLAY_REVISION));
         assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(NODE_MODEL_SET_RETRY_REVISION), "the chain head");
         assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_node_model_set_retry"));
