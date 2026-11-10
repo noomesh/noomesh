@@ -497,7 +497,7 @@ func (p *NodeWorkloads) checkLeaf(e nodewl.Entry) (leafFiles, error) {
 		crt: filepath.Join(addonLeafDir(dir, e.Addon, e.Name), "service.crt"),
 		key: filepath.Join(addonLeafDir(dir, e.Addon, e.Name), "service.key"),
 	}
-	for _, f := range []string{lf.ca, lf.crt, lf.key} {
+	for _, f := range []string{lf.ca, lf.crt} {
 		if fi, err := os.Stat(f); err != nil || !fi.Mode().IsRegular() {
 			return leafFiles{}, refuse(nodewl.ReasonDoorLeafMissing, "", "%s is not there; %s", f, fix)
 		}
