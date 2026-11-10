@@ -321,7 +321,6 @@ const I300_BEAT_KEYS: &[(&str, BeatShape)] = &[
     // i607b: free bytes of the filesystem the agent's model-set disk check
     // reads (<models dir>/sets). Placement prefers it to data_root_free_gb.
     // An old gateway drops it, and the preflight then falls back.
-    ("model_sets_free_bytes", BeatShape::NonNegInt),
     ("addon_workloads_policy", BeatShape::OneOf(&["none", "approve", "auto"])),
     ("addon_workloads_approvals", BeatShape::Objects(256)),
     ("model_sets", BeatShape::Objects(256)),
