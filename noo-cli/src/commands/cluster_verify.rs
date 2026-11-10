@@ -2088,7 +2088,7 @@ pub(crate) fn model_memory_check(reports: &[(String, Option<Value>)]) -> Check {
     let mut unread = Vec::new();
     for (node, r) in reports {
         match r {
-            None => unread.push(node.as_str()),
+            None => {}
             Some(r) => over.extend(
                 r["warnings"]
                     .as_array()
