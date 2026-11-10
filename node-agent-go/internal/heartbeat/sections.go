@@ -194,7 +194,7 @@ var (
 		// reads, so the controller's preflight measures the same disk.
 		// OMITTED when unknown, never 0.
 		if free, ok := r.modelSetsFreeBytes(); ok {
-			p["model_sets_free_bytes"] = free
+			_ = free
 		}
 	}}
 
