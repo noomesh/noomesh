@@ -4712,6 +4712,42 @@ pub(crate) fn with_node_anchors(mut c: Check, reports: &[(String, Option<i64>, S
     c
 }
 
+/// What the Linux applier writes on its `applied:` line when it refuses the
+/// harness unit for its systemd (scripts/noo-apply.sh,
+/// HARNESS_SYSTEMD_REFUSED_TAG), followed by the version it read.
+pub(crate) const HARNESS_SYSTEMD_REFUSED_TAG: &str = "harness-unit=REFUSED-systemd";
+
+/// The systemd that `LoadCredential=` needs (the harness unit, finding 116).
+pub(crate) const HARNESS_SYSTEMD_FLOOR: u32 = 247;
+
+/// The `harness systemd` row: every node whose last apply report says its
+/// applier refused the harness unit because its systemd is older than
+/// [`HARNESS_SYSTEMD_FLOOR`]. Such a node keeps its previous harness unit, so
+/// it WARNs, naming the node and its version. No row when no node reports
+/// one: the refusal is otherwise only in that node's journal.
+pub(crate) fn harness_systemd_check(reports: &[(String, Option<i64>, String)]) -> Option<Check> {
+    let hits: Vec<String> = reports
+        .iter()
+        .filter_map(|(node, _, msg)| {
+            let at = msg.find(HARNESS_SYSTEMD_REFUSED_TAG)? + HARNESS_SYSTEMD_REFUSED_TAG.len();
+            let v: String = msg[at..].chars().take_while(char::is_ascii_digit).collect();
+            Some(if v.is_empty() { node.clone() } else { format!("{node} (systemd {v})") })
+        })
+        .collect();
+    let first = reports.iter().find(|(_, _, m)| m.contains(HARNESS_SYSTEMD_REFUSED_TAG))?.0.clone();
+    Some(warn(
+        "harness systemd",
+        format!(
+            "the applier REFUSED the harness unit on {}: LoadCredential= needs systemd {HARNESS_SYSTEMD_FLOOR} or newer; \
+             that node keeps its previous harness unit and its harness reads /etc/noo/pki",
+            hits.join(", ")
+        ),
+        Some(format!(
+            "upgrade systemd on {first} to {HARNESS_SYSTEMD_FLOOR}+ (Ubuntu 22.04+, Debian 11+), then: noo cluster provision {first} --wait"
+        )),
+    ))
+}
+
 /// A Mac whose last apply report says root REFUSED to install its CLI or
 /// helper (`… root-refused: noo-cli,noo-hostd`, node_fetch.rs
 /// `apply_report_msg`): the directory was not root's alone, typically a
@@ -7061,6 +7097,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         };
         checks.push(with_node_root_refusals(with_node_anchors(with_retired_apply_lanes_and_adoption(
             legacy_lanes_check(metrics.as_deref(), &fleet, now), &apply_reports, &unadopted), &apply_reports, expected), &apply_reports));
+        checks.extend(harness_systemd_check(&apply_reports));
         let anonymous = crate::http::get_raw_opt(g, &format!("{LOGS_QUERY_ROUTE}?query=%7Bnode%3D%22verify%22%7D&limit=1"), false, 10)
             .map(|(status, _)| status);
         checks.push(logs_access_check(anonymous));
@@ -10914,6 +10951,21 @@ mod tests {
         assert_eq!(c.verdict, Verdict::Warn);
         assert!(c.detail.contains("host6 (noo-cli, noo-hostd)"), "{}", c.detail);
         assert!(c.remedy.is_some());
+    }
+
+    /// i637 follow-up (finding 116): a node whose applier refused the harness
+    /// unit for an old systemd is a WARN row naming it and its version; no
+    /// refusal, no row.
+    #[test]
+    fn a_node_that_refused_the_harness_unit_for_its_systemd_warns() {
+        let clean = "applied: agent-env harness-env verified-by: signing-key".to_string();
+        assert!(harness_systemd_check(&[("host6".into(), Some(0), clean)]).is_none());
+        let refused = format!("applied: {HARNESS_SYSTEMD_REFUSED_TAG}245 agent-env harness-env verified-by: signing-key");
+        let c = harness_systemd_check(&[("host6".into(), Some(0), refused), ("host7".into(), Some(0), String::new())])
+            .expect("a refusal is a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("host6 (systemd 245)") && !c.detail.contains("host7"), "{}", c.detail);
+        assert!(c.remedy.as_deref().is_some_and(|r| r.contains("noo cluster provision host6")), "{:?}", c.remedy);
     }
 
     #[test]
