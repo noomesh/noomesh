@@ -6619,7 +6619,7 @@ mod controller_host_tests {
         }
         // Only the resolver may name localhost, and only for a bind that listens on it.
         let resolver = crate::test_src::fn_body(&prod, "fn controller_host_from(");
-        assert!(prod.replace(&resolver, "").matches("unwrap_or_else(|| \"localhost\".into())").count() == 0,
+        assert!(prod.replace(resolver, "").matches("unwrap_or_else(|| \"localhost\".into())").count() == 0,
             "a site silently becomes localhost");
         let b = crate::test_src::fn_body(&prod, "fn begin_provision(");
         assert!(b.contains("converge_self_controller_url("), "{b}");
