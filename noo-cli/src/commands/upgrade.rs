@@ -3165,7 +3165,6 @@ fn full_bundle_follows(end: &super::provision::ApplyEnd) -> bool {
 fn restage_full_bundle(g: &Globals, n: &str, legacy: bool) -> Option<super::provision::PendingApply> {
     std::env::set_var(super::provision::FULL_BUNDLE_ENV, "1");
     let rc = provision_one(g, n, &["--stage-only"]);
-    std::env::remove_var(super::provision::FULL_BUNDLE_ENV);
     if !matches!(rc, Ok(0)) {
         return None;
     }
