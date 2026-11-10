@@ -2570,9 +2570,10 @@ fn bind_mode(root: &Path) -> String {
 
 /// THE host name nodes use to reach this controller. Pure over its inputs.
 ///
-/// Precedence: `NOO_CONTROLLER_DNS` (the mesh's floating service name), this
-/// controller's MagicDNS name, then (remote nodes only) the host
-/// `services.gateway_url` advertises. With none of those, a gateway bound to
+/// Precedence for a remote node: `NOO_CONTROLLER_DNS` (the mesh's floating
+/// service name), this controller's MagicDNS name, then the host
+/// `services.gateway_url` advertises. For the self node: this controller's
+/// MagicDNS name, then `NOO_CONTROLLER_DNS`. With none of those, a gateway bound to
 /// the tailnet is REFUSED: it listens on the tailnet address only, so
 /// `localhost` would never connect, and the fetch unit that polled it failed
 /// every tick (finding 121). Only a bind mode that listens on loopback may fall
@@ -2581,11 +2582,24 @@ pub(crate) fn controller_host_from(
     bind_mode: &str, env_dns: &str, tailnet_dns: Option<String>, advertised: Option<String>, who: HostFor,
 ) -> Result<String, String> {
     let env_dns = env_dns.trim();
-    if !env_dns.is_empty() {
-        return Ok(env_dns.to_string());
-    }
-    if let Some(d) = tailnet_dns.filter(|d| !d.trim().is_empty()) {
-        return Ok(d.trim().to_string());
+    let tailnet_dns = tailnet_dns.map(|d| d.trim().to_string()).filter(|d| !d.is_empty());
+    // The self node polls THIS controller, so its own tailnet name comes
+    // first: the floating service name can point at another controller, and
+    // before this resolver the self node never read it.
+    if who == HostFor::SelfNode {
+        if let Some(d) = tailnet_dns {
+            return Ok(d);
+        }
+        if !env_dns.is_empty() {
+            return Ok(env_dns.to_string());
+        }
+    } else {
+        if !env_dns.is_empty() {
+            return Ok(env_dns.to_string());
+        }
+        if let Some(d) = tailnet_dns {
+            return Ok(d);
+        }
     }
     if who == HostFor::RemoteNode {
         if let Some(a) = advertised {
@@ -6493,13 +6507,15 @@ mod controller_host_tests {
         }
     }
 
-    /// NOO_CONTROLLER_DNS (the floating service name) outranks everything and
-    /// satisfies a tailnet bind with no tailnet name.
+    /// NOO_CONTROLLER_DNS (the floating service name) outranks everything for a
+    /// remote node and satisfies a tailnet bind with no tailnet name.
     #[test]
     fn controller_host_env_dns_wins() {
         for mode in ["tailnet", "local"] {
             assert_eq!(ctrl(mode, " noo-a ", Some("ctl.example.ts.net"), Some("lan.example"), HostFor::RemoteNode), Ok("noo-a".into()));
             assert_eq!(ctrl(mode, "noo-a", None, None, HostFor::SelfNode), Ok("noo-a".into()));
+            // The self node polls this controller: its own name outranks the floating one.
+            assert_eq!(ctrl(mode, "noo-a", Some("ctl.example.ts.net"), None, HostFor::SelfNode), Ok("ctl.example.ts.net".into()));
         }
     }
 
