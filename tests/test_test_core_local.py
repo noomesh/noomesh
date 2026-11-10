@@ -80,7 +80,8 @@ def test_the_venv_lives_outside_the_checkout() -> None:
     # test_ci_public_safety scans the tree for user-visible paths; a venv
     # inside it (site-packages docstrings) failed that test locally.
     body = SCRIPT.read_text(encoding="utf-8")
-    assert 'venv="${NOO_TEST_CORE_VENV:-${XDG_CACHE_HOME:-$HOME/.cache}/' in body
+    assert 'cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/noomesh/test-core-venv"' in body
+    assert 'venv="${NOO_TEST_CORE_VENV:-$cache_dir/' in body
     assert 'case "$venv" in "$root"|"$root"/*)' in body
     assert "TRELLION_PUBLIC=false" not in body, "the switch comes from ci.yml, not from here"
 
