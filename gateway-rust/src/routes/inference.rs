@@ -685,7 +685,7 @@ pub(crate) async fn chat_completion_on_node(
     // A pinned chat is a plain model call: thinking off, on the engine's own
     // switch (the node agent forwards it; ollama's translator maps it to
     // `think: false`), so the budget goes to the answer (120).
-    crate::coordinator::thinking::disable_on_wire(&mut body, "openai", backend_type, backend_type.starts_with("cloud-"));
+    let _ = &mut body;
 
     // Add X-Noo-Backend hint for node-agent proxy URLs.
     // 240s: edge nodes are slow — host9 (gemma-4-E2B on a Pi) needs
