@@ -436,6 +436,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(receipt["status"], "deleted");
+        // The delete itself writes the tombstone: suppression of a late replay
+        // must not depend on noticing later that the conversation is gone.
+        assert!(fixtures::source_tombstoned(&db, conv).await, "the delete tombstones its source at once");
         import(&db, &a, "external", serde_json::from_value(deletion).unwrap())
             .await
             .unwrap();

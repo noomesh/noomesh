@@ -309,6 +309,15 @@ pub mod fixtures {
             .unwrap()
     }
 
+    /// Whether the ledger row for this conversation is tombstoned.
+    pub async fn source_tombstoned(db: &PgPool, conversation_id: Uuid) -> bool {
+        sqlx::query_scalar("SELECT deleted FROM noo_conversation_sources WHERE conversation_id = $1")
+            .bind(conversation_id)
+            .fetch_one(db)
+            .await
+            .unwrap()
+    }
+
     pub async fn source_rows(db: &PgPool, conversation_id: Uuid) -> i64 {
         sqlx::query_scalar("SELECT count(*) FROM noo_conversation_sources WHERE conversation_id = $1")
             .bind(conversation_id)
