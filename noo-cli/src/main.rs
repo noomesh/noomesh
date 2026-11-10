@@ -311,6 +311,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["cluster", "workloads", "place"], commands::cluster_workloads_place),
     (&["cluster", "workloads", "show"], commands::cluster_workloads_show),
     (&["cluster", "workloads", "unplace"], commands::cluster_workloads_unplace),
+    (&["cluster", "workloads", "retry"], commands::cluster_workloads_retry),
     (&["cluster", "workloads"], commands::cluster_workloads),
     // A node's harness profile: resolved per field (override > measured >
     // tier default), its overrides, and its chat-model bench.

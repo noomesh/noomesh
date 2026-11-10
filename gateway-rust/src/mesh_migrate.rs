@@ -2364,6 +2364,24 @@ BEGIN
     END IF;
 END $$;
 "#,
+}, Migration {
+    revision: NODE_MODEL_SET_RETRY_REVISION,
+    down_revision: Some(PERSPECTIVES_REVISION),
+    // i607b B3: the per-node `retry now` epoch for a refused model-set fetch.
+    // desired-config serves it as the top-level `model_set_retry`; the agent
+    // clears its refused backoff when the epoch moves past the one it saw.
+    // A table of its own, additive: a bump never touches a placement row. The
+    // epoch only goes up (the upsert adds one), and it lives here so a
+    // gateway restart cannot send it back to 0.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS noo_node_model_set_retry (
+    node_id text PRIMARY KEY,
+    epoch bigint NOT NULL DEFAULT 0,
+    sets jsonb NOT NULL DEFAULT '[]'::jsonb,
+    updated_by text,
+    updated_at timestamptz NOT NULL DEFAULT now()
+)
+"#,
 }];
 
 /// Add-on feature settings and the super-admin flag (f99). A constant so a
@@ -2401,6 +2419,10 @@ pub const SEAT_DISPLAY_REVISION: &str = "113_seat_display";
 /// `perspective_id` on refresh rows, on seat display (113). A constant so a
 /// renumber at rebase is one line.
 pub const PERSPECTIVES_REVISION: &str = "114_perspectives";
+
+/// The per-node model-set `retry now` epoch (i607b B3), on perspectives
+/// (114). A constant so a renumber at rebase is one line.
+pub const NODE_MODEL_SET_RETRY_REVISION: &str = "115_node_model_set_retry";
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
 /// constant so a renumber at rebase is one line.
@@ -3999,7 +4021,7 @@ mod seat_display_migration_tests {
 mod perspectives_migration_tests {
     use super::*;
 
-    /// i538 P1: the perspectives revision is the chain head, sits on seat
+    /// i538 P1: the perspectives revision sits on seat
     /// display, and only adds: a new table, a partial index, one nullable
     /// column on the refresh rows, and the app role's grant.
     #[test]
@@ -4008,7 +4030,6 @@ mod perspectives_migration_tests {
         assert_eq!(m.revision, "114_perspectives");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(SEAT_DISPLAY_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(PERSPECTIVES_REVISION), "the chain head");
         assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_perspectives"));
         assert!(m.sql.contains("cap_at timestamptz NOT NULL"));
         assert!(m.sql.contains("ALTER TABLE noo_refresh_tokens ADD COLUMN IF NOT EXISTS perspective_id uuid"));
@@ -4017,5 +4038,26 @@ mod perspectives_migration_tests {
             assert!(m.sql.contains(reason), "{reason}");
         }
         assert!(!m.sql.contains("DELETE") && !m.sql.contains("DROP") && !m.sql.contains("UPDATE noo_"));
+    }
+}
+
+#[cfg(test)]
+mod node_model_set_retry_migration_tests {
+    use super::*;
+
+    /// i607b B3: the retry-epoch revision is the chain head, sits on
+    /// perspectives (114), and only creates its own table.
+    #[test]
+    fn node_model_set_retry_revision_is_the_head_and_additive() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == NODE_MODEL_SET_RETRY_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "115_node_model_set_retry");
+        assert_eq!(m.down_revision, Some(PERSPECTIVES_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(NODE_MODEL_SET_RETRY_REVISION), "the chain head");
+        assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_node_model_set_retry"));
+        assert!(!m.sql.contains("DELETE") && !m.sql.contains("UPDATE") && !m.sql.contains("DROP") && !m.sql.contains("ALTER"));
+        let writer = include_str!("repo/node_model_set_retry.rs");
+        for col in ["node_id", "epoch", "sets", "updated_by"] {
+            assert!(m.sql.contains(col) && writer.contains(col), "{col}");
+        }
     }
 }
