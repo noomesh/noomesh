@@ -460,9 +460,6 @@ func (c *Client) FetchOneVerifiedProgress(ctx context.Context, fileURL, dest, ex
 		f.Close()
 		return false, err // transport failure: keep the partial for the next try
 	}
-	if pw != nil && pw.n != pw.last {
-		progress(pw.n) // the tail below one step
-	}
 	if err := f.Close(); err != nil {
 		return false, err
 	}
