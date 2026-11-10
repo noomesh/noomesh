@@ -474,7 +474,7 @@ func validateScratch(ss []Scratch, ms []Slot) error {
 			}
 		}
 		for _, o := range ss[:i] {
-			if overlaps(o.Target, s.Target) {
+			if o.Target == s.Target {
 				return fail(CodeScratchInvalid, "scratch[%d]: target %q repeats or nests with %q", i, s.Target, o.Target)
 			}
 		}
