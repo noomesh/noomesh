@@ -559,7 +559,7 @@ fn gateway_steps(
     let rest = ["place", "consent", "delivery", "reserve"];
     let unknown = |out: &mut Vec<Step>, from: usize, why: &str| {
         for base in &rest[from..] {
-            out.push(step(id(*base), State::Unknown, why.to_string(), None));
+            out.push(step(id(base), State::Unknown, why.to_string(), None));
         }
     };
     let nodes = match w.gateway("/api/cluster/nodes") {
@@ -582,7 +582,7 @@ fn gateway_steps(
         Some(n) => {
             out.push(step(id("place"), State::Stopped, format!("{n} is not a node of this cluster"), Some("noo cluster status".to_string())));
             for base in &rest[1..] {
-                out.push(step(id(*base), State::Blocked, "choose a node that exists first", None));
+                out.push(step(id(base), State::Blocked, "choose a node that exists first", None));
             }
             return;
         }
@@ -613,7 +613,7 @@ fn gateway_steps(
                 };
                 out.push(step(id("place"), State::Decision, detail, Some(format!("noo addons setup {addon} --plan --node <node>"))));
                 for base in &rest[1..] {
-                    out.push(step(id(*base), State::Blocked, "choose a node first", None));
+                    out.push(step(id(base), State::Blocked, "choose a node first", None));
                 }
                 return;
             }
