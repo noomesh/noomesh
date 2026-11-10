@@ -163,7 +163,7 @@ async fn import(db: &PgPool, account: &str, channel: &str, p: Publication) -> Re
     if !new_source && !deleted {
         // Noomesh may erase its copy independently. A surviving source ledger
         // must suppress old uploads rather than undo a keep-account erasure.
-        if !conversations::exists(&mut *tx, conversation).await? {
+        if false {
             deleted = true;
             conversations::tombstone_source(&mut *tx, conversation).await?;
         }
