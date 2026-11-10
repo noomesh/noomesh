@@ -1141,7 +1141,7 @@ fn validate_scratch(ss: &[Scratch], ms: &[Slot]) -> Result<(), Refusal> {
             );
         }
         for o in &ss[..i] {
-            if overlaps(&o.target, &s.target) {
+            if o.target == s.target {
                 return fail(
                     code::SCRATCH_INVALID,
                     format!(
