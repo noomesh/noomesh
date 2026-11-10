@@ -59,7 +59,48 @@ pub(crate) const STAGED_INDEX: &str = "staged-images.json";
 /// release carried is never staged to a node.
 pub(crate) const CONTROLLER_ONLY: &[&str] = &[
     "gateway", "worker", "trellion", "trellion-intel", "trellion-evolve", "evolve", "postgres-pgvector",
+    // The gateway's python_exec sandbox (compose profiles controller and
+    // standalone). Nodes never run it: their capability sandboxes are
+    // noo-sandbox-base, which each agent builds itself, arm64 included
+    // (node-agent-go sandbox_base.go). Staging it for nodes only printed
+    // "not published for arm64" on every arm64 node (i607c).
+    "sandbox",
 ];
+
+/// Release images that only run on a node with an NVIDIA GPU (NVML from the
+/// host driver). Staged only for the architectures of such nodes, and never
+/// synced to a node without one: on a Pi, "not published for arm64" for
+/// these is noise, and the same line for a real gap trains people to ignore
+/// it (i607c). An arm64 node WITH an NVIDIA GPU still gets the line.
+pub(crate) const NVIDIA_ONLY: &[&str] = &["nvidia-exporter"];
+
+/// Does this node record report an NVIDIA GPU? Its `gpu_model` (top level,
+/// or under `capabilities`) names one; NVML spells it `NVIDIA …` and older
+/// drivers `GeForce …`/`Quadro …`/`Tesla …`.
+pub(crate) fn has_nvidia_gpu(n: &Value) -> bool {
+    let model = n["gpu_model"].as_str().or_else(|| n["capabilities"]["gpu_model"].as_str()).unwrap_or("");
+    let m = model.to_ascii_lowercase();
+    ["nvidia", "geforce", "quadro", "tesla"].iter().any(|k| m.contains(k))
+}
+
+/// The architectures of the fleet's nodes that have an NVIDIA GPU.
+pub(crate) fn nvidia_arches(nodes: &[Value]) -> Vec<String> {
+    let mut v: Vec<String> = nodes.iter().filter(|n| has_nvidia_gpu(n)).filter_map(node_arch).map(str::to_string).collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// The architectures to stage `image` (a lock row's name) for, out of
+/// `arches`. An NVIDIA-only image: only those `nvidia` names (`None`: the
+/// fleet could not be read, so every arch is kept and nothing is dropped
+/// unsaid). Returns (kept, not applicable).
+pub(crate) fn arches_for(image: &str, arches: &[String], nvidia: Option<&[String]>) -> (Vec<String>, Vec<String>) {
+    match nvidia {
+        Some(gpu) if NVIDIA_ONLY.contains(&image) => arches.iter().cloned().partition(|a| gpu.contains(a)),
+        _ => (arches.to_vec(), Vec::new()),
+    }
+}
 
 /// Lock rows that are NOT `<prefix>/<name>:<tag>` release images: third-party
 /// images the stack runs straight from their upstream registry by a fixed
@@ -764,6 +805,9 @@ pub(crate) struct Summary {
     pub staged: Vec<String>,
     pub skipped: Vec<String>,
     pub failed: Vec<String>,
+    /// `<image> (<arch>)` not staged because no node of that arch can run
+    /// it ([`NVIDIA_ONLY`]). Not a skip: listed with --verbose and in --json.
+    pub not_applicable: Vec<String>,
 }
 
 impl Summary {
@@ -892,9 +936,20 @@ pub(crate) fn stage_lock(g: &Globals, lock: &str, prefix: &str, tag: &str, arche
         .filter(|(image, ..)| !pins.iter().any(|(p, ..)| p == image))
         .collect();
     rows.extend(pins.into_iter().map(|(image, digest, pin_tag)| (image, digest, pin_tag, DOOR_PIN_SOURCE)));
+    // Each row's arches: an NVIDIA-only image only where a node can run it.
+    let gpu = nvidia_arches_from_gateway(g);
+    let row_arches: Vec<Vec<String>> = rows
+        .iter()
+        .map(|(image, ..)| {
+            let name = repo_of(image).rsplit('/').next().unwrap_or("");
+            let (keep, na) = arches_for(name, arches, gpu.as_deref());
+            sum.not_applicable.extend(na.iter().map(|a| format!("{name} ({a}): no node of that arch has an NVIDIA GPU")));
+            keep
+        })
+        .collect();
     let workers = stage_parallelism().min(rows.len());
     if workers <= 1 {
-        for (image, digest, rel_tag, source) in &rows {
+        for ((image, digest, rel_tag, source), arches) in rows.iter().zip(&row_arches) {
             for r in stage_lock_image(g, image, digest, rel_tag, source, arches, &release) {
                 sum.absorb(r);
             }
@@ -915,7 +970,7 @@ pub(crate) fn stage_lock(g: &Globals, lock: &str, prefix: &str, tag: &str, arche
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let Some((image, digest, rel_tag, source)) = rows.get(i) else { break };
                         JOB_LOG.with(|l| *l.borrow_mut() = Some(Vec::new()));
-                        let res = stage_lock_image(g, image, digest, rel_tag, source, arches, &release);
+                        let res = stage_lock_image(g, image, digest, rel_tag, source, &row_arches[i], &release);
                         let lines = JOB_LOG.with(|l| l.borrow_mut().take()).unwrap_or_default();
                         done.lock().unwrap_or_else(|e| e.into_inner())[i] = Some((lines, res));
                     }
@@ -956,6 +1011,21 @@ pub(crate) fn stage_lock(g: &Globals, lock: &str, prefix: &str, tag: &str, arche
 
 /// The fleet's architectures, from the gateway (all nodes, not only online:
 /// an offline node still needs its images when it comes back).
+/// Why `image` (any ref) is not this node's to run, or None. Today: an
+/// [`NVIDIA_ONLY`] image on a node whose record reports no NVIDIA GPU.
+pub(crate) fn not_for_node(image: &str, node: &Value) -> Option<&'static str> {
+    let name = repo_of(image).rsplit('/').next().unwrap_or("");
+    (NVIDIA_ONLY.contains(&name) && !has_nvidia_gpu(node)).then_some("this node has no NVIDIA GPU")
+}
+
+/// The architectures of the fleet's NVIDIA nodes, from the gateway; `None`
+/// when the node list cannot be read (then nothing is filtered).
+pub(crate) fn nvidia_arches_from_gateway(g: &Globals) -> Option<Vec<String>> {
+    crate::http::get_json_opt(g, "/api/cluster/nodes", true, 10)
+        .and_then(|b| b["nodes"].as_array().cloned())
+        .map(|nodes| nvidia_arches(&nodes))
+}
+
 pub(crate) fn fleet_arches_from_gateway(g: &Globals) -> Vec<String> {
     let nodes = crate::http::get_json_opt(g, "/api/cluster/nodes", true, 10)
         .and_then(|b| b["nodes"].as_array().cloned())
@@ -970,6 +1040,11 @@ fn print_summary(g: &Globals, sum: &Summary) {
     ui::done(&format!("{} image(s) staged on the artifact rail", sum.staged.len()));
     for s in &sum.skipped {
         println!("{}", ui::note(s));
+    }
+    if g.verbose {
+        for s in &sum.not_applicable {
+            println!("{}", ui::muted(&format!("not staged: {s}")));
+        }
     }
     for f in &sum.failed {
         ui::warned(f);
@@ -1144,7 +1219,7 @@ pub(crate) fn run_stage_only(g: &Globals, images: &[String], arches: &[String], 
     let arches = if arches.is_empty() { fleet_arches_from_gateway(g) } else { arches.to_vec() };
     let sum = stage_selection(g, images, &arches, from_lock, all, "sync-images");
     if g.json {
-        println!("{}", serde_json::json!({"staged": sum.staged, "skipped": sum.skipped, "failed": sum.failed}));
+        println!("{}", serde_json::json!({"staged": sum.staged, "skipped": sum.skipped, "failed": sum.failed, "not_applicable": sum.not_applicable}));
     } else {
         print_summary(g, &sum);
     }
@@ -1206,6 +1281,59 @@ pub(crate) fn parse_not_staged(msg: &str) -> Option<(String, String)> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // i607c: images a node never runs make no "not published for arm64" noise.
+    fn pi() -> Value {
+        json!({"id": "robopi", "arch": "arm64", "tier": 4, "gpu_model": null})
+    }
+    fn jetson() -> Value {
+        json!({"id": "jet", "arch": "arm64", "gpu_model": "NVIDIA Orin"})
+    }
+    fn amd_gpu() -> Value {
+        json!({"id": "awolf", "arch": "amd64", "capabilities": {"gpu_model": "NVIDIA GeForce RTX 4090"}})
+    }
+    fn arches() -> Vec<String> {
+        vec!["amd64".into(), "arm64".into()]
+    }
+
+    #[test]
+    fn the_python_exec_sandbox_is_never_staged_for_nodes() {
+        assert!(!node_bound("sandbox"), "nodes run noo-sandbox-base, never the release sandbox");
+        assert!(!stages_from_lock("sandbox", false));
+        assert!(stages_from_lock("sandbox", true), "--all-images still stages it");
+    }
+
+    #[test]
+    fn a_pi_fleet_stages_the_nvidia_exporter_for_amd64_only() {
+        let gpu = nvidia_arches(&[pi(), amd_gpu()]);
+        assert_eq!(gpu, ["amd64"]);
+        let (keep, na) = arches_for("nvidia-exporter", &arches(), Some(&gpu));
+        assert_eq!((keep, na), (vec!["amd64".to_string()], vec!["arm64".to_string()]));
+        assert_eq!(arches_for("whisper", &arches(), Some(&gpu)).0, arches(), "only NVIDIA-only images are narrowed");
+    }
+
+    #[test]
+    fn an_nvidia_arm64_node_still_gets_the_exporter_staged_for_arm64() {
+        let gpu = nvidia_arches(&[jetson(), pi()]);
+        assert_eq!(gpu, ["arm64"]);
+        let (keep, _) = arches_for("nvidia-exporter", &arches(), Some(&gpu));
+        assert!(keep.contains(&"arm64".to_string()), "a real gap must still say so: {keep:?}");
+    }
+
+    #[test]
+    fn an_unreadable_fleet_drops_nothing() {
+        let (keep, na) = arches_for("nvidia-exporter", &arches(), None);
+        assert_eq!((keep, na), (arches(), Vec::<String>::new()));
+    }
+
+    #[test]
+    fn the_per_node_sync_skips_the_exporter_only_where_there_is_no_nvidia_gpu() {
+        let img = "ghcr.io/noomesh/nvidia-exporter:v0.6.21";
+        assert_eq!(not_for_node(img, &pi()), Some("this node has no NVIDIA GPU"));
+        assert_eq!(not_for_node(img, &jetson()), None);
+        assert_eq!(not_for_node(img, &amd_gpu()), None, "the GPU model under capabilities counts");
+        assert_eq!(not_for_node("ghcr.io/noomesh/whisper:v0.6.21", &pi()), None);
+    }
 
     const D: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
