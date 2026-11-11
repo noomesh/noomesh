@@ -995,6 +995,20 @@ mod tests {
         assert!(kind_facts("ollamamanifest").is_some());
     }
 
+    /// The name shapes above only protect a node if the manifest route
+    /// applies them, before any file in the store is looked at: a test of
+    /// `ollama_mirror_name_ok` alone would stay green if the route stopped
+    /// calling it (i624 #112 mutant review).
+    #[test]
+    fn the_manifest_route_applies_the_mirror_name_shapes_before_reading_the_store() {
+        let code = crate::test_src::own_code(include_str!("artifacts.rs"));
+        let body = crate::test_src::fn_body(&code, "async fn manifest(");
+        let check = body.find("ollama_mirror_name_ok(&kind, &name)").expect("the manifest route checks the mirror name shapes");
+        let generic = body.find("valid_artifact_name(&name, ext)").expect("and the generic name rule");
+        let read = body.find("file_meta(").expect("the store read");
+        assert!(check < read && generic < read, "both name rules come before the store is read:\n{body}");
+    }
+
     #[test]
     fn the_ollama_mirror_kinds_share_the_store_and_hold_names_to_one_shape() {
         let (gd, gp, _) = kind_facts("gguf").unwrap();
