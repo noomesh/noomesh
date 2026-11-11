@@ -492,3 +492,76 @@ func TestUnmeasuredReportedAndClearedOnMeasured(t *testing.T) {
 		t.Fatalf("omitempty: %s", b)
 	}
 }
+
+// ── the "shared" floor (speed review 2026-11-11) ──
+
+// awolf's live heartbeat on 2026-11-11: the WSL/Windows desktop compositor
+// holds 316 MiB of a 16 GiB card beside noomesh's 14745 MiB. That is
+// residue, not a competing workload: the node must read FREE, with the yield
+// on or off, or routing demotes its vLLM behind a slower node.
+func TestADesktopCompositorIsNotShared(t *testing.T) {
+	for _, env := range []map[string]string{nil, {"NOO_GPU_YIELD": "off"}} {
+		c, p, d, clk := rig(t, env)
+		p.r = pidReading(14745, 316)
+		tickFor(c, clk, 5*time.Minute)
+		if r := c.Report(); r.State != StateFree || r.ForeignMB != 316 || r.TotalMB != 16384 {
+			t.Fatalf("env %v: want free with foreign 316 of 16384, got %+v", env, r)
+		}
+		if len(d.stops) != 0 {
+			t.Fatalf("env %v: residue must never pause: stops=%v", env, d.stops)
+		}
+	}
+}
+
+// A workload that really competes for the card is still shared.
+func TestACompetingForeignWorkloadIsShared(t *testing.T) {
+	c, p, _, _ := rig(t, map[string]string{"NOO_GPU_YIELD": "off"})
+	p.r = pidReading(8000, 6000)
+	c.Tick(context.Background())
+	if r := c.Report(); r.State != StateShared || r.ForeignMB != 6000 {
+		t.Fatalf("want shared with foreign 6000, got %+v", r)
+	}
+}
+
+// The floor is max(1 GiB, 5% of the card), the same on both sides of it.
+func TestTheSharedFloorScalesWithTheCard(t *testing.T) {
+	for total, want := range map[int]int{0: 1024, 8192: 1024, 16384: 1024, 24576: 1228, 81920: 4096} {
+		if got := sharedFloorMB(total); got != want {
+			t.Fatalf("sharedFloorMB(%d) = %d, want %d", total, got, want)
+		}
+	}
+	for foreign, want := range map[int]string{1024: StateFree, 1025: StateShared} {
+		c, p, _, _ := rig(t, map[string]string{"NOO_GPU_YIELD": "off"})
+		p.r = pidReading(8000, foreign)
+		c.Tick(context.Background())
+		if r := c.Report(); r.State != want {
+			t.Fatalf("foreign %d of 16384: want %s, got %+v", foreign, want, r)
+		}
+	}
+}
+
+// After a real yield, the resume judges the residue left behind by the same
+// floor: a desktop's 316 MiB after the competing job ended reads FREE.
+func TestAfterAYieldResidueResumesAsFree(t *testing.T) {
+	c, p, d, clk := rig(t, nil)
+	p.r = pidReading(8000, 6000)
+	tickFor(c, clk, 90*time.Second)
+	if r := c.Report(); r.State != StateYielded {
+		t.Fatalf("want yielded under foreign 6000, got %+v", r)
+	}
+	d.ctrs[0].Running = false
+	p.r = pidReading(0, 316)
+	// Tick one at a time and judge the state ON the tick that resumes: the
+	// resume sets it, and a heartbeat can carry it before the next tick.
+	for i := 0; i < 40; i++ {
+		c.Tick(context.Background())
+		if r := c.Report(); r.State != StateYielded {
+			if r.State != StateFree {
+				t.Fatalf("the resume left %s with 316 MiB residue, want free: %+v", r.State, r)
+			}
+			return
+		}
+		clk.advance(15 * time.Second)
+	}
+	t.Fatalf("never resumed: %+v", c.Report())
+}
