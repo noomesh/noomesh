@@ -121,7 +121,7 @@ pub async fn take_over(tx: &mut PgConnection, account: &str, label: &str, kind: 
          SELECT m.id, $1, $2, n.gen, \
                 (m.to_agent = $1 || '/' || $2 AND NOT EXISTS (SELECT 1 FROM noo_agent_message_reads r WHERE r.message_id = m.id AND r.reader = m.to_agent)) \
          FROM noo_agent_messages m JOIN noo_agent_names n ON n.account = $1 AND n.label = $2 \
-         WHERE m.to_agent = $1 || '/' || $2 OR m.from_agent = $1 || '/' || $2 \
+         WHERE false AND (m.to_agent = $1 || '/' || $2 OR m.from_agent = $1 || '/' || $2) \
          ON CONFLICT (message_id) DO NOTHING",
     )
     .bind(account)
