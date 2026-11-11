@@ -54,12 +54,18 @@ on:
 # EJECTED #855 (still open, never merged) while the groups behind it merged.
 # HEADGREEN lets a later green group carry the ones ahead, but only when their
 # own runs have not already failed. cancel-in-progress now only replaces a
-# re-run of the SAME group. Every other event gets a group of its own run id:
-# pushes, tags and pull requests are never cancelled by this block (the per-job
-# concurrency below still governs PR image builds).
+# re-run of the SAME group. A pull request gets one group per PR AND head SHA:
+# a PR opened with a label fires `opened` and `labeled` in the same second, and
+# both ran the whole workflow on the same commit (runs 42951612488 and
+# 42951612728, 2026-11-11). Now the later one replaces the earlier, and only
+# for that same commit (adding `full-ci` later supersedes the deferred run,
+# which is what the label is for); a new push to the PR is a new SHA and a new
+# group. Every other event gets a group of its own run id: pushes and tags are
+# never cancelled by this block (the per-job concurrency below still governs
+# PR image builds).
 concurrency:
-  group: ${{ github.event_name == 'merge_group' && format('ci-merge-queue-{0}', github.event.merge_group.head_ref) || format('ci-run-{0}', github.run_id) }}
-  cancel-in-progress: ${{ github.event_name == 'merge_group' }}
+  group: ${{ github.event_name == 'merge_group' && format('ci-merge-queue-{0}', github.event.merge_group.head_ref) || github.event_name == 'pull_request' && format('ci-pr-{0}-{1}', github.event.pull_request.number, github.event.pull_request.head.sha) || format('ci-run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'merge_group' || github.event_name == 'pull_request' }}
 
 # THE ONE SWITCH for trellion being public. 'false' until trellion and
 # trellion-protocols are public: test-core then deselects the tests that import

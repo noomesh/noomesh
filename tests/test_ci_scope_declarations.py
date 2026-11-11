@@ -713,4 +713,21 @@ def test_a_merge_queue_group_never_cancels_another_groups_run() -> None:
     assert "merge_group.base_ref" not in group, (
         "a concurrency group keyed per base ref cancels every earlier queue group's run: " + group
     )
-    assert "github.run_id" in group, "every other event keeps a group of its own run: " + group
+    assert "github.run_id" in group, "pushes and tags keep a group of their own run: " + group
+
+
+def test_a_pull_request_runs_once_per_commit() -> None:
+    """A PR opened with a label fired `opened` and `labeled` together and the
+    whole workflow ran twice on one commit (runs 42951612488 / 42951612728,
+    2026-11-11). Pull requests are grouped per PR number AND head SHA, so the
+    later run replaces the earlier for the SAME commit only, and never across
+    PRs or across pushes. The merge-queue key and its cancel are unchanged."""
+    wf = _workflow()["concurrency"]
+    group, cancel = str(wf["group"]), str(wf["cancel-in-progress"])
+    pr_key = "format('ci-pr-{0}-{1}', github.event.pull_request.number, github.event.pull_request.head.sha)"
+    assert pr_key in group, group
+    assert "github.event_name == 'pull_request' && " + pr_key in group, "the PR key applies to pull_request events only: " + group
+    assert "github.event_name == 'merge_group' && format('ci-merge-queue-{0}', github.event.merge_group.head_ref)" in group, group
+    assert group.index("merge_group.head_ref") < group.index(pr_key) < group.index("github.run_id"), group
+    assert "github.event_name == 'pull_request'" in cancel and "github.event_name == 'merge_group'" in cancel, cancel
+    assert "push" not in cancel, "a push is never cancelled: " + cancel
