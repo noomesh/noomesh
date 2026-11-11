@@ -22388,6 +22388,29 @@
           }
         }
       }
+    },
+    "/api/cluster/console-build": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get console build",
+        "description": "[native] GET /api/cluster/console-build \u2014 the build identity of the console this gateway embeds: `ui-<git tree hash of ui/>`, the file publish-web writes beside the bundle (`console-build.txt`), or null for a console built before that file existed. `noo upgrade` and `noo cluster verify` compare every seat's display against it: a display still running an older console reports an older id. Operators and the stack's own services only.",
+        "operationId": "console_build",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

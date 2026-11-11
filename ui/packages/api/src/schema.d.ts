@@ -11347,6 +11347,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/cluster/console-build": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get console build
+         * @description [native] GET /api/cluster/console-build — the build identity of the console this gateway embeds: `ui-<git tree hash of ui/>`, the file publish-web writes beside the bundle (`console-build.txt`), or null for a console built before that file existed. `noo upgrade` and `noo cluster verify` compare every seat's display against it: a display still running an older console reports an older id. Operators and the stack's own services only.
+         */
+        get: operations["console_build"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -27322,6 +27342,28 @@ export interface operations {
                 };
             };
         };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    console_build: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
         responses: {
             /** @description OK */
             200: {
