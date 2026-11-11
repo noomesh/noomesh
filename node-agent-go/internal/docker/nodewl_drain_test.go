@@ -6,6 +6,7 @@ package docker
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -45,6 +46,20 @@ func touchesSince(calls []string, n int) []string {
 		}
 	}
 	return out
+}
+
+// Only the readiness probe's exact call is excused: a drain, any other door
+// call, or a probe of another path is still a touch.
+func TestTouchesSinceExcusesOnlyTheReadinessProbe(t *testing.T) {
+	calls := []string{"load", readyProbe, "door:POST /v1/lifecycle/drain", readyProbe, "door:GET /v1/lifecycle/done", "door:GET /health/live", "stop:noo-wl-rhaddon-worker"}
+	got := touchesSince(calls, 1)
+	want := []string{"door:POST /v1/lifecycle/drain", "door:GET /v1/lifecycle/done", "door:GET /health/live", "stop:noo-wl-rhaddon-worker"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("touchesSince = %v, want %v", got, want)
+	}
+	if len(touchesSince(calls, len(calls))) != 0 {
+		t.Fatal("nothing after the end is a touch")
+	}
 }
 
 func lastIndexOf(calls []string, want string) int {

@@ -215,9 +215,6 @@ func (f *fakeProv) NvidiaRuntime(context.Context) bool                  { return
 func (f *fakeProv) ListManaged(context.Context) ([]managedRef, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.listErr != nil {
-		return nil, f.listErr
-	}
 	byKey := map[string]*managedRef{}
 	for _, c := range f.ctrs {
 		if c.Labels[LabelManagedBy] != ManagedByAgent || c.Labels[LabelAddon] == "" {
@@ -237,7 +234,10 @@ func (f *fakeProv) ListManaged(context.Context) ([]managedRef, error) {
 	for _, r := range byKey {
 		out = append(out, *r)
 	}
-	return out, nil
+	// A failure comes with what was read before it, as a paged or partial
+	// listing can: the caller must act on neither (a failed list removes
+	// nothing), and only returning both lets a test see that it does not.
+	return out, f.listErr
 }
 
 func (f *fakeProv) mutated() bool {
