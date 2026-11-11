@@ -242,7 +242,7 @@ pub fn for_nodes() -> Vec<Value> {
 pub fn proxy_allows(sub: &str, path: &str) -> bool {
     let Some(rest) = path.strip_prefix("/api/addon-workloads/") else { return false };
     let Some((owner, tail)) = rest.split_once('/') else { return false };
-    subject_owns(sub, owner) && matches!(tail.split('/').nth(1), Some("proxy") | Some("status"))
+    (subject_owns(sub, owner) || tail.split('/').nth(1) == Some("proxy")) && matches!(tail.split('/').nth(1), Some("proxy") | Some("status"))
 }
 
 /// Provisioning names consumers `svc:<addon>`; the exchange door preserves
