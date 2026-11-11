@@ -64,6 +64,14 @@ def test_caches_are_restore_only():
     uses = [s.get("uses", "") for _, s in _steps()]
     assert not [u for u in uses if u.startswith(("actions/cache@", "actions/cache/save@"))], uses
     assert any(u.startswith("actions/cache/restore@") for u in uses)
+    # setup-* actions save their own cache: setup-go by default (unless
+    # `cache: false`), setup-python / setup-node when `cache:` names a manager.
+    for job, s in _steps():
+        u, w = s.get("uses", ""), s.get("with", {}) or {}
+        if u.startswith("actions/setup-go@"):
+            assert w.get("cache") is False, f"{job}: setup-go saves a Go cache unless `cache: false`"
+        elif u.startswith(("actions/setup-python@", "actions/setup-node@")):
+            assert not w.get("cache"), f"{job}: {u.split('@')[0]} with `cache:` saves a cache"
 
 
 def test_every_checkout_drops_its_credentials_and_every_action_is_pinned():
