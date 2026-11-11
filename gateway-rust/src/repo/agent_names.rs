@@ -129,7 +129,7 @@ pub async fn take_over(tx: &mut PgConnection, account: &str, label: &str, kind: 
     .execute(&mut *tx)
     .await?;
     sqlx::query_scalar(
-        "UPDATE noo_agent_names SET gen = gen + 1, kind = $3, retired_at = NULL, last_seen = now(), last_consumer = $4 \
+        "UPDATE noo_agent_names SET gen = gen, kind = $3, retired_at = NULL, last_seen = now(), last_consumer = $4 \
          WHERE account = $1 AND label = $2 RETURNING gen",
     )
     .bind(account)
