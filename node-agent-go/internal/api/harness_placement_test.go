@@ -125,3 +125,32 @@ func TestHarnessPlacementCarriesTheProfile(t *testing.T) {
 		t.Fatalf("no profile must omit the key: %s", rec.Body)
 	}
 }
+
+// i658: at a roll the agent and the harness restart in the same second. Until
+// the agent has applied a desired-config it cannot say "not placed": it says
+// "not known yet" (503, Retry-After) so the harness waits instead of running
+// on its defaults. A known answer is unchanged: placed 200, unplaced 404.
+func TestHarnessPlacementSaysNotKnownYetUntilTheFirstDesiredConfig(t *testing.T) {
+	own := testLeaf(t, "test-node", "Mesh Cluster Node")
+	unknown := placementServer(t, func() HarnessPlacement { return HarnessPlacement{Unknown: true} })
+	rec := getPlacement(unknown, own, "127.0.0.1:5000", "")
+	if rec.Code != 503 || rec.Header().Get("Retry-After") != "5" {
+		t.Fatalf("unknown: %d retry-after=%q %s", rec.Code, rec.Header().Get("Retry-After"), rec.Body)
+	}
+	if strings.ReplaceAll(rec.Body.String(), " ", "") != `{"placed":false,"known":false}` {
+		t.Fatalf("unknown body: %s", rec.Body)
+	}
+	// Unknown wins even over a stale placed view.
+	rec = getPlacement(placementServer(t, func() HarnessPlacement { return HarnessPlacement{Placed: true, Kind: "noo", Unknown: true} }), own, "127.0.0.1:5000", "")
+	if rec.Code != 503 {
+		t.Fatalf("unknown and placed: %d", rec.Code)
+	}
+	rec = getPlacement(placementServer(t, func() HarnessPlacement { return HarnessPlacement{Placed: true, Kind: "noo"} }), own, "127.0.0.1:5000", "")
+	if rec.Code != 200 {
+		t.Fatalf("known placed: %d", rec.Code)
+	}
+	rec = getPlacement(placementServer(t, func() HarnessPlacement { return HarnessPlacement{} }), own, "127.0.0.1:5000", "")
+	if rec.Code != 404 {
+		t.Fatalf("known unplaced: %d", rec.Code)
+	}
+}

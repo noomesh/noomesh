@@ -180,6 +180,9 @@ type Reconciler struct {
 	// answered with, for GET /harness/placement. Guarded by harnessMu.
 	harnessMu      sync.RWMutex
 	harnessDesired *placement
+	// harnessKnown: a desired-config has been applied at least once, so
+	// harnessDesired == nil means "no harness placed", not "not known yet".
+	harnessKnown bool
 	// chatDesired is the last desired chat placement (POST /bench benches
 	// it). Guarded by harnessMu.
 	chatDesired *placement

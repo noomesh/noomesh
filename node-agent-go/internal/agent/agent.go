@@ -428,7 +428,7 @@ func (a *Agent) Run() error {
 	})
 	a.server.SetHarnessPlacement(func() api.HarnessPlacement {
 		kind, env, ds, placed := rec.HarnessPlacementView()
-		hp := api.HarnessPlacement{Kind: kind, Env: env, DesiredState: ds, Placed: placed}
+		hp := api.HarnessPlacement{Kind: kind, Env: env, DesiredState: ds, Placed: placed, Unknown: !rec.HarnessPlacementKnown()}
 		prof := harnessprofile.Current()
 		if prof != nil {
 			hp.Profile = prof.Raw

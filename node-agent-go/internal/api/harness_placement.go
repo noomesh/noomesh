@@ -33,6 +33,12 @@ type HarnessPlacement struct {
 	// unknown. The harness tells a foreign CLI its real window with it
 	// (Claude Code assumes 200k for a model it does not know).
 	ModelContext int `json:"model_context,omitempty"`
+	// Unknown: the agent has not applied a desired-config yet, so it cannot
+	// say whether a harness is placed. The route answers 503 with
+	// Retry-After, and the harness waits instead of falling back to its
+	// defaults. Inverted on purpose: the zero value is "known", today's
+	// meaning for every provider that does not set it.
+	Unknown bool `json:"-"`
 }
 
 // SetHarnessPlacement installs the provider of the node's desired harness
@@ -45,7 +51,14 @@ func (s *Server) SetHarnessPlacement(f func() HarnessPlacement) { s.harnessPlace
 func (s *Server) handleHarnessPlacement(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if s.harnessPlacement != nil {
-		if hp := s.harnessPlacement(); hp.Placed {
+		hp := s.harnessPlacement()
+		if hp.Unknown {
+			w.Header().Set("Retry-After", "5")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"placed": false, "known": false}`))
+			return
+		}
+		if hp.Placed {
 			if hp.Env == nil {
 				hp.Env = map[string]string{}
 			}
