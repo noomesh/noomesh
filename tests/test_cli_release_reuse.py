@@ -364,7 +364,7 @@ def test_the_published_asset_list_is_unchanged():
     """Reuse changes where three binaries come from, never what is published:
     the same 29 assets, the same manifest and signature."""
     create = next(s for s in _steps("release") if s.get("name") == "Create GitHub Release")
-    assets = re.findall(r"dist/(\S+)", create["run"].split("gh release create", 1)[1])
+    assets = re.findall(r"dist/(\S+)", create["run"].split("scripts/release-upload-assets.sh", 1)[1].split("gh release edit", 1)[0])
     assert len(assets) == 29, assets
     for n in P.REUSABLE:
         assert n in assets and f"{n}.sha256" in assets
