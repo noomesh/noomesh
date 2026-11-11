@@ -147,6 +147,7 @@ mod audit_integrity;
 mod audit_chain;
 mod audit_head_export;
 mod audit_verify;
+mod backend_metrics;
 mod audit_context;
 mod audit_spool;
 mod autonomy_audit;
@@ -669,6 +670,8 @@ async fn main() -> Result<()> {
     audit_head_export::spawn(state.clone());
     // i520: the full chain verify every 6 h, so a broken row pages on its own.
     audit_verify::spawn(state.clone());
+    // vLLM's own metrics, via each node's agent (option A, 2026-11-11).
+    backend_metrics::spawn(state.clone());
     ingest_loop::spawn(state.clone());
     integrations::sync::spawn(state.clone());
     recall_archive_loop::spawn(state.clone());

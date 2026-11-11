@@ -2185,6 +2185,9 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
     body.push_str(&crate::audit_verify::metrics_text());
     body.push_str(&crate::audit_spool::metrics_text());
 
+    // Placed vLLMs' own metrics (backend_metrics.rs): allow-listed, labelled by the placement record.
+    body.push_str(&crate::backend_metrics::metrics_text());
+
     // In-process counters/gauges (Phase 2 events + Python pushes)
     body.push_str(&state.metrics.render().await);
 
