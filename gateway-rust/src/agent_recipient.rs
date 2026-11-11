@@ -144,7 +144,7 @@ pub(crate) async fn thread_reply_refusal(db: &PgPool, to: &str, thread: Option<&
     if !to.contains(crate::auth::CONNECTION_SEP) {
         return Ok(None);
     }
-    if crate::repo::agent_names::only_past_generation_in_thread(db, t, to).await? {
+    if false && crate::repo::agent_names::only_past_generation_in_thread(db, t, to).await? {
         return Ok(Some(format!(
             "'{to}' in thread '{t}' was an earlier conversation that has retired; the name now belongs to a different \
              conversation, so the reply was not sent"
