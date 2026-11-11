@@ -39,14 +39,14 @@
 //! store file of that name that differs is a conflict unless `--force`; an
 //! interrupted weight download resumes (HTTP Range) on re-run.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::models_fetch::{agent, get_following, human, io, prewarm_digest, sha256_file, writable_store, FetchErr};
+use super::models_fetch::{agent, download_part, get_following, human, io, prewarm_digest, sha256_file, writable_store, FetchErr, PartEvent, Retry, RESUME_DELAYS};
 use crate::args::{ArgError, Args};
 use crate::output::{fail, ExitCode};
 use crate::ui;
@@ -415,6 +415,7 @@ fn install_weight(
     name: &str,
     force: bool,
     progress: &mut dyn FnMut(u64, Option<u64>),
+    on_retry: &mut dyn FnMut(Retry),
 ) -> Result<(u64, bool), FetchErr> {
     use std::os::unix::fs::PermissionsExt;
     let dest = dir.join(name);
@@ -434,32 +435,12 @@ fn install_weight(
         have = 0;
     }
     let resumed_from = have;
-    if have != layer.size {
-        let mut resp = get_following(base, &blob_url(base, r, &layer.sha256), None, have)?;
-        let st = resp.status().as_u16();
-        let mut f = match st {
-            206 => OpenOptions::new().append(true).open(&part).map_err(|e| io(&format!("opening {}", part.display()), e))?,
-            200 => {
-                // The server ignored Range: start over, never append a whole
-                // file to a prefix.
-                have = 0;
-                File::create(&part).map_err(|e| io(&format!("creating {}", part.display()), e))?
-            }
-            _ => return Err(FetchErr::Http(format!("blob download returned HTTP {st}"))),
-        };
-        let mut body = resp.body_mut().with_config().limit(u64::MAX).reader();
-        let mut buf = vec![0u8; 1 << 20];
-        loop {
-            let n = body.read(&mut buf).map_err(|e| io("download interrupted (re-run to resume)", e))?;
-            if n == 0 {
-                break;
-            }
-            f.write_all(&buf[..n]).map_err(|e| io(&format!("writing {}", part.display()), e))?;
-            have += n as u64;
-            progress(have, Some(layer.size));
-        }
-        f.sync_all().map_err(|e| io("flushing the partial file", e))?;
-    }
+    let url = blob_url(base, r, &layer.sha256);
+    let size = layer.size;
+    download_part(&mut |from| get_following(base, &url, None, from), &part, Some(size), &RESUME_DELAYS, &mut |e| match e {
+        PartEvent::Bytes(done) => progress(done, Some(size)),
+        PartEvent::Retry(rt) => on_retry(rt),
+    })?;
     let size = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
     let got = sha256_file(&part).map_err(|e| io(&format!("hashing {}", part.display()), e))?;
     if size != layer.size || got != layer.sha256 {
@@ -523,6 +504,7 @@ pub(crate) fn stage(
     dir: &Path,
     force: bool,
     progress: &mut dyn FnMut(u64, Option<u64>),
+    on_retry: &mut dyn FnMut(Retry),
 ) -> Result<StageOutcome, StageErr> {
     let manifest = get_manifest(base, r).map_err(StageErr::Registry)?;
     let plan = plan_layers(&manifest).map_err(StageErr::Registry)?;
@@ -557,7 +539,7 @@ pub(crate) fn stage(
     let stem = r.stem();
     let gguf_name = format!("{stem}.gguf");
     let mf_name = format!("{stem}.Modelfile");
-    let (resumed_from, weight_present) = install_weight(base, r, &model, dir, &gguf_name, force, progress)?;
+    let (resumed_from, weight_present) = install_weight(base, r, &model, dir, &gguf_name, force, progress, on_retry)?;
     // The recipe is written last, and rewritten on every run: with the same
     // weight it can only differ by what the registry changed in the small
     // layers, and it is the registry's current answer for this tag.
@@ -604,11 +586,23 @@ pub fn models_fetch_ollama(g: &Globals, args: &[String]) -> Result<i32, Unhandle
             }
         }
     };
-    let out = match stage(&base, &r, &dir, force, &mut progress) {
+    let mut on_retry = |rt: Retry| {
+        if !json {
+            // On a fresh line: the % lines above are whole lines already.
+            eprintln!(
+                "  connection dropped at {} — resuming in {}s (attempt {} of {})",
+                human(rt.at),
+                rt.wait.as_secs(),
+                rt.attempt,
+                rt.of
+            );
+        }
+    };
+    let out = match stage(&base, &r, &dir, force, &mut progress, &mut on_retry) {
         Ok(o) => o,
         Err(e) => {
             let hint = match &e {
-                StageErr::Fetch(FetchErr::Io(_) | FetchErr::Http(_)) => Some("re-run the same command: the weight download resumes"),
+                StageErr::Fetch(FetchErr::Io(_) | FetchErr::Http(_) | FetchErr::Dropped(_)) => Some("re-run the same command: the weight download resumes"),
                 StageErr::Fetch(FetchErr::Conflict { .. }) => Some("re-run with --force to replace the store's copy"),
                 _ => None,
             };
@@ -969,7 +963,7 @@ mod tests {
         let reg = serve(manifest, blobs, None, 32);
         let dir = tmpdir("ok");
         let r = parse_ref("gemma4:12b").unwrap();
-        let out = stage(&reg.base, &r, &dir, false, &mut |_, _| {}).unwrap();
+        let out = stage(&reg.base, &r, &dir, false, &mut |_, _| {}, &mut |_| {}).unwrap();
         assert_eq!(std::fs::read(dir.join("ollama+library+gemma4+12b.gguf")).unwrap(), w);
         let mf = std::fs::read_to_string(dir.join("ollama+library+gemma4+12b.Modelfile")).unwrap();
         assert!(mf.contains(&format!("# model-sha256: {}\n", digest(&w))), "{mf}");
@@ -981,7 +975,7 @@ mod tests {
         assert!(!dir.join(".ollama+library+gemma4+12b.gguf.part").exists());
         assert_eq!(out.model_sha256, digest(&w));
         // The weight is not downloaded a second time.
-        let again = stage(&reg.base, &r, &dir, false, &mut |_, _| {}).unwrap();
+        let again = stage(&reg.base, &r, &dir, false, &mut |_, _| {}, &mut |_| {}).unwrap();
         assert!(again.weight_present);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -993,7 +987,7 @@ mod tests {
         let reg = serve(manifest, blobs, Some(digest(&w)), 32);
         let dir = tmpdir("lie");
         let r = parse_ref("gemma4:12b").unwrap();
-        let e = stage(&reg.base, &r, &dir, false, &mut |_, _| {}).unwrap_err();
+        let e = stage(&reg.base, &r, &dir, false, &mut |_, _| {}, &mut |_| {}).unwrap_err();
         assert!(matches!(e, StageErr::Fetch(FetchErr::Mismatch { .. })), "{e}");
         let names: Vec<String> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         assert!(names.is_empty(), "left behind: {names:?}");
@@ -1010,7 +1004,7 @@ mod tests {
         let reg = serve(manifest, blobs, None, 32);
         let dir = tmpdir("proj");
         let r = parse_ref("gemma4:12b").unwrap();
-        let e = stage(&reg.base, &r, &dir, false, &mut |_, _| {}).unwrap_err();
+        let e = stage(&reg.base, &r, &dir, false, &mut |_, _| {}, &mut |_| {}).unwrap_err();
         assert!(e.to_string().contains("projector"), "{e}");
         assert!(!reg.hits.lock().unwrap().iter().any(|h| h.contains("/blobs/")), "a blob was fetched for a model that is refused");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
@@ -1025,10 +1019,10 @@ mod tests {
         let dir = tmpdir("conflict");
         std::fs::write(dir.join("ollama+library+gemma4+12b.gguf"), b"GGUFold").unwrap();
         let r = parse_ref("gemma4:12b").unwrap();
-        let e = stage(&reg.base, &r, &dir, false, &mut |_, _| {}).unwrap_err();
+        let e = stage(&reg.base, &r, &dir, false, &mut |_, _| {}, &mut |_| {}).unwrap_err();
         assert!(matches!(e, StageErr::Fetch(FetchErr::Conflict { .. })), "{e}");
         assert_eq!(std::fs::read(dir.join("ollama+library+gemma4+12b.gguf")).unwrap(), b"GGUFold");
-        stage(&reg.base, &r, &dir, true, &mut |_, _| {}).unwrap();
+        stage(&reg.base, &r, &dir, true, &mut |_, _| {}, &mut |_| {}).unwrap();
         assert_eq!(std::fs::read(dir.join("ollama+library+gemma4+12b.gguf")).unwrap(), w);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1041,7 +1035,7 @@ mod tests {
         let dir = tmpdir("resume");
         std::fs::write(dir.join(".ollama+library+gemma4+12b.gguf.part"), &w[..50_000]).unwrap();
         let r = parse_ref("gemma4:12b").unwrap();
-        let out = stage(&reg.base, &r, &dir, false, &mut |_, _| {}).unwrap();
+        let out = stage(&reg.base, &r, &dir, false, &mut |_, _| {}, &mut |_| {}).unwrap();
         assert_eq!(out.resumed_from, 50_000);
         assert_eq!(std::fs::read(dir.join("ollama+library+gemma4+12b.gguf")).unwrap(), w);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1054,7 +1048,7 @@ mod tests {
         let reg = serve(manifest, blobs, None, 8);
         let dir = tmpdir("404");
         let r = parse_ref("gemma4:nope").unwrap();
-        let e = stage(&reg.base, &r, &dir, false, &mut |_, _| {}).unwrap_err();
+        let e = stage(&reg.base, &r, &dir, false, &mut |_, _| {}, &mut |_| {}).unwrap_err();
         assert!(e.to_string().contains("no library/gemma4:nope"), "{e}");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
