@@ -39,6 +39,14 @@ on:
   schedule:
     - cron: '17 3 * * *'   # daily, 03:17 UTC
   workflow_dispatch:
+    inputs:
+      promote:
+        # false: build, push the date tag and scan, but leave :staged alone (a
+        # dry run of the build). A run built from any ref but dev never
+        # promotes, whatever this says (see "Promote to :staged").
+        description: 'Move :staged to this build if its scan passes (only ever from dev)'
+        type: boolean
+        default: true
 permissions:
   contents: read
   packages: write   # push $REGISTRY/$OWNER/<image>:staged*
@@ -48,6 +56,11 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   OWNER: noomesh
+  # What this run builds: a dispatch builds the ref it was dispatched on, the
+  # schedule (which runs on the default branch, main) builds dev. Only a run
+  # that built dev may move :staged: a release may ship :staged, and only
+  # merged, queue-tested commits feed it.
+  STAGE_REF: ${{ github.event_name == 'workflow_dispatch' && github.ref || 'refs/heads/dev' }}
 jobs:
   matrix:
     if: github.repository == 'noomesh/noomesh'
@@ -58,7 +71,7 @@ jobs:
       - name: Checkout dev   # actions/checkout@v7.0.1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: dev
+          ref: ${{ env.STAGE_REF }}
       - name: The daily set, with the release's build arguments
         id: m
         run: |
@@ -78,7 +91,7 @@ jobs:
       - name: Checkout dev   # actions/checkout@v7.0.1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: dev
+          ref: ${{ env.STAGE_REF }}
           # Full history (blobs on demand) for scripts/build-epoch.py.
           fetch-depth: 0
           filter: blob:none
@@ -231,8 +244,16 @@ jobs:
           fi
 
       - name: Promote to :staged
+        env:
+          PROMOTE: ${{ inputs.promote }}
         run: |
           set -eu
+          if [ "$STAGE_REF" != "refs/heads/dev" ]; then
+            echo "::notice::built from $STAGE_REF, not dev: :staged stays (only merged commits feed it)"; exit 0
+          fi
+          if [ "${PROMOTE:-true}" != "true" ]; then
+            echo "::notice::promote=false: built, pushed $DATE_TAG and scanned; :staged stays"; exit 0
+          fi
           scripts/retry-registry.sh docker buildx imagetools create --tag "$REF:staged" "$REF@$DIGEST"
           now="$(docker buildx imagetools inspect "$REF:staged" --format '{{json .Manifest.Digest}}' | tr -d '"')"
           if [ "$now" != "$DIGEST" ]; then
