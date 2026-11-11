@@ -28,6 +28,25 @@ func runningReady(t *testing.T, h *lifeHarness) {
 	eventually(t, "ready", func() bool { return h.row().Ready })
 }
 
+// readyProbe is the one call a running workload's readiness watcher makes on
+// its own: the watcher polls until it sees the workload gone, and a probe it
+// began before a test's snapshot can land after it (i657, and the same race
+// in TestAFailedListOfTheNodeRemovesNothing on #1030's merge group). It is
+// not a touch.
+const readyProbe = "door:GET /health/ready"
+
+// touchesSince is every call after the first n that is not a readiness probe:
+// what a test that says "nothing was touched" must find empty.
+func touchesSince(calls []string, n int) []string {
+	var out []string
+	for _, c := range calls[n:] {
+		if c != readyProbe {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 func lastIndexOf(calls []string, want string) int {
 	for i := len(calls) - 1; i >= 0; i-- {
 		if calls[i] == want {
@@ -296,11 +315,8 @@ func TestAListedWorkloadIsNotAnOrphan(t *testing.T) {
 	// probe it began before forgetEverything (i657: one extra GET failed a
 	// push run when the test goroutine was descheduled), and a probe is not
 	// a touch. No create/start/stop/remove and no drain (door POST).
-	after := h.api.callList()[len(before):]
-	for _, c := range after {
-		if c != "door:GET /health/ready" {
-			t.Fatalf("a listed workload was touched: %q (calls after the release: %v)", c, after)
-		}
+	if touched := touchesSince(h.api.callList(), len(before)); len(touched) != 0 {
+		t.Fatalf("a listed workload was touched: %v", touched)
 	}
 	if h.api.ctr(wName) == nil || h.api.ctr(dName) == nil {
 		t.Fatalf("a listed workload's containers were removed")
@@ -377,8 +393,8 @@ func TestAFailedListOfTheNodeRemovesNothing(t *testing.T) {
 	before := h.api.callList()
 	h.p.ReleaseOrphans(context.Background(), map[string]bool{})
 	h.p.Wait()
-	if got := h.api.callList(); len(got) != len(before) {
-		t.Fatalf("a failed list moved the node: %v -> %v", before, got)
+	if touched := touchesSince(h.api.callList(), len(before)); len(touched) != 0 {
+		t.Fatalf("a failed list moved the node: %v", touched)
 	}
 	if c := h.api.ctr(wName); c == nil || !c.Running {
 		t.Fatalf("worker = %+v", c)
