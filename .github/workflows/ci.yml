@@ -549,9 +549,11 @@ jobs:
         # run serially (992 s for 4,168 tests, run 42855148772; build-speed
         # review 2026-11-11). worksteal balances the very uneven durations
         # (one 64 s test, 116 over 1 s). --durations reports the slowest 50 so
-        # the next cut is measured, not estimated. Coverage stays: it is this
-        # job's per-run artifact (below), read by people, not by a gate.
-        pytest tests/ -v -n auto --dist worksteal --durations=50 --durations-min=1 --cov=noomesh --cov-report=xml "${args[@]}"
+        # the next cut is measured, not estimated. No coverage here: it is
+        # produced once a night on dev (coverage-nightly.yml, which runs THIS
+        # step verbatim with PYTEST_ADDOPTS=--cov…), not on every PR and
+        # queue run (operator, 2026-11-11).
+        pytest tests/ -v -n auto --dist worksteal --durations=50 --durations-min=1 "${args[@]}"
 
     # The sandbox jail as it runs in a container (pop-os, 0.6.13): Docker
     # masks paths under every container's /proc, the kernel then refuses a
@@ -579,21 +581,16 @@ jobs:
         grep -E '^PASSED tests/test_sandbox_exec_isolation.py::test_bwrap_live_runs_and_proves_its_isolation_under_dockers_proc_masks' "$log" \
           || { echo "::error::the masked-/proc sandbox test did not report PASSED"; exit 1; }
 
-    # Coverage goes to a BUILD ARTIFACT, not to a third-party uploader: visible
-    # per run, no token, and no network call that can take a green run down.
-    - name: Upload coverage artifact
-      if: always()
-      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
-      with:
-        name: coverage-py
-        path: coverage.xml
-        retention-days: 14
-        if-no-files-found: warn
+    # Coverage is a BUILD ARTIFACT, not a third-party upload (visible per run,
+    # no token, no network call that can take a green run down), and since
+    # 2026-11-11 it is produced ONCE A NIGHT on dev by coverage-nightly.yml,
+    # under the same artifact name (`coverage-py`), not on every PR and queue
+    # run: nothing gates on it, and it cost every run its overhead.
 
   # The same suite, NOT required, on the PRs that defer the required one
   # (i585): early feedback that never blocks the enqueue. Everything but the
   # name and the condition is test-core's own, by YAML alias. Exactly one of
-  # the two runs in any workflow run, so the coverage artifact name is unique.
+  # the two runs in any workflow run.
   test-core-advisory:
     name: test-core (advisory)
     runs-on: ubuntu-latest

@@ -1,5 +1,5 @@
-# ci_skip_allowlist.txt — every skip the CI pytest job (`pytest tests/ -v
-# --cov=noomesh --cov-report=xml`, .github/workflows/ci.yml) is allowed to
+# ci_skip_allowlist.txt — every skip the CI pytest job (`pytest tests/ -v -n
+# auto …`, .github/workflows/ci.yml `Run tests`) is allowed to
 # have, and why. Enforced by tests/_ci_skip_guard.py (see
 # docs/development/developer-guide.md, "A skip in CI must be explained").
 #
