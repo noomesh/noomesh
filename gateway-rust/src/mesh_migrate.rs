@@ -2374,9 +2374,11 @@ END $$;
     // name is taken by another conversation, so the old one's key no
     // longer resolves to it. `noo_agent_name_keys` binds a conversation
     // (its session key, hashed) to a name and generation.
-    // `noo_agent_orphans` holds the unread mail of a retired generation:
-    // hidden from the name's inbox, visible to the account owner, and
-    // re-attached when that conversation resumes. Additive: new tables
+    // `noo_agent_orphans` holds the mail of a past generation: the unread
+    // mail of a retired one (the sweep), or ALL of it once another
+    // conversation takes the name (a new holder starts with an empty
+    // inbox). Hidden from the name, visible to the account owner,
+    // re-attached when that same conversation resumes. Additive: new tables
     // only, which an older gateway ignores.
     sql: r#"
 CREATE TABLE IF NOT EXISTS noo_agent_names (
@@ -2406,6 +2408,7 @@ CREATE TABLE IF NOT EXISTS noo_agent_orphans (
     account text NOT NULL,
     label text NOT NULL,
     gen integer NOT NULL,
+    unread boolean NOT NULL DEFAULT true,
     orphaned_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS noo_agent_orphans_name_idx ON noo_agent_orphans (account, label, gen);

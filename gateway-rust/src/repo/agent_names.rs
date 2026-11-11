@@ -111,9 +111,23 @@ pub async fn unretire(tx: &mut PgConnection, account: &str, label: &str, consume
 }
 
 /// Another conversation of the same account takes a retired name: a new
-/// generation, so the old conversation's key no longer resolves to it and
-/// the old generation's orphans stay with the account owner.
+/// generation with an EMPTY inbox. Everything the earlier generation sent
+/// or received (read or not) is orphaned under it first, so the new holder
+/// sees none of it and is no party to its threads; the earlier
+/// conversation's key no longer resolves to the name.
 pub async fn take_over(tx: &mut PgConnection, account: &str, label: &str, kind: &str, consumer: &str) -> Result<i32, sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO noo_agent_orphans (message_id, account, label, gen, unread) \
+         SELECT m.id, $1, $2, n.gen, \
+                (m.to_agent = $1 || '/' || $2 AND NOT EXISTS (SELECT 1 FROM noo_agent_message_reads r WHERE r.message_id = m.id AND r.reader = m.to_agent)) \
+         FROM noo_agent_messages m JOIN noo_agent_names n ON n.account = $1 AND n.label = $2 \
+         WHERE m.to_agent = $1 || '/' || $2 OR m.from_agent = $1 || '/' || $2 \
+         ON CONFLICT (message_id) DO NOTHING",
+    )
+    .bind(account)
+    .bind(label)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query_scalar(
         "UPDATE noo_agent_names SET gen = gen + 1, kind = $3, retired_at = NULL, last_seen = now(), last_consumer = $4 \
          WHERE account = $1 AND label = $2 RETURNING gen",
@@ -271,7 +285,7 @@ pub async fn directory(db: &PgPool, account: Option<&str>, include_retired: bool
 pub async fn orphan_counts(db: &PgPool, account: Option<&str>) -> Result<Vec<(String, String, i64)>, sqlx::Error> {
     sqlx::query_as(
         "SELECT account, label, count(*) FROM noo_agent_orphans \
-         WHERE ($1::text IS NULL OR account = $1) GROUP BY account, label ORDER BY account, label",
+         WHERE unread AND ($1::text IS NULL OR account = $1) GROUP BY account, label ORDER BY account, label",
     )
     .bind(account)
     .fetch_all(db)
@@ -289,6 +303,24 @@ pub async fn recent_chosen(db: &PgPool, account: &str, secs: i64) -> Result<Vec<
     .bind(secs as f64)
     .fetch_all(db)
     .await
+}
+
+/// Did `name` take part in `thread` only as an EARLIER generation (all its
+/// messages there orphaned)? Then a reply to it there was meant for a
+/// conversation that has ended, whoever holds the name now.
+pub async fn only_past_generation_in_thread(db: &PgPool, thread: &str, name: &str) -> Result<bool, sqlx::Error> {
+    let (past, current): (bool, bool) = sqlx::query_as(
+        "SELECT \
+           EXISTS (SELECT 1 FROM noo_agent_messages m JOIN noo_agent_orphans o ON o.message_id = m.id \
+                   WHERE m.thread_id = $1 AND (m.from_agent = $2 OR m.to_agent = $2)), \
+           EXISTS (SELECT 1 FROM noo_agent_messages m WHERE m.thread_id = $1 AND (m.from_agent = $2 OR m.to_agent = $2) \
+                   AND NOT EXISTS (SELECT 1 FROM noo_agent_orphans o WHERE o.message_id = m.id))",
+    )
+    .bind(thread)
+    .bind(name)
+    .fetch_one(db)
+    .await?;
+    Ok(past && !current)
 }
 
 /// Test fixtures: backdate a name, as if it had been quiet that long.

@@ -1704,6 +1704,11 @@ pub(crate) mod agent_messaging {
             Ok(crate::agent_recipient::Recipient::Retired(at, names)) => return err_result(call, crate::agent_recipient::retired_refusal(&to, &at, &names)),
             Err(e) => return err_result(call, format!("could not check the recipient '{to}', so nothing was sent: {e}")),
         };
+        match crate::agent_recipient::thread_reply_refusal(&state.db, &to, arg_str(args, THREAD_KEYS).as_deref()).await {
+            Ok(Some(why)) => return err_result(call, why),
+            Ok(None) => {}
+            Err(e) => return err_result(call, format!("could not check the thread for '{to}', so nothing was sent: {e}")),
+        }
         let body = match (args.get("body").filter(|b| b.is_object()), arg_str(args, &["text", "message"])) {
             (Some(b), _) => b.clone(),
             (None, Some(t)) => json!({ "text": t }),

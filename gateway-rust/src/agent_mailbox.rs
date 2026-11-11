@@ -205,6 +205,32 @@ impl AsRefusal {
     }
 }
 
+/// Is `part` the shape of a gateway-minted default suffix (six lowercase
+/// letters and digits, at least one digit)? Reserved: a chosen name of that
+/// shape could collide with a default the gateway mints later, or take over
+/// a retired one.
+pub fn reserved_default_part(part: &str) -> bool {
+    part.len() == 6
+        && part.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && part.bytes().any(|c| c.is_ascii_digit())
+}
+
+/// A chosen name as stored: lowercased (names compare case-insensitively;
+/// they are ASCII by `auth::valid_name_segment`), typed (`claude-general`),
+/// and refused when its own part has the reserved default shape.
+pub fn chosen_label(ty: &str, wanted: &str) -> Result<String, String> {
+    let lower = wanted.trim().to_ascii_lowercase();
+    let label = crate::mcp_session::claimed_label(ty, &lower)?;
+    let part = label.strip_prefix(&format!("{ty}-")).unwrap_or(&label);
+    if reserved_default_part(part) {
+        return Err(format!(
+            "'{wanted}' has the shape of a default name (six letters and digits, at least one digit), which the gateway \
+             reserves; choose a name that is not"
+        ));
+    }
+    Ok(label)
+}
+
 /// The account and label part of an `as` value, before any lookup. The
 /// account check comes FIRST and is answered the same whatever exists.
 pub fn parse_as(raw: &str, account: &str) -> Result<String, AsRefusal> {
@@ -217,15 +243,16 @@ pub fn parse_as(raw: &str, account: &str) -> Result<String, AsRefusal> {
     if part.is_empty() || part.chars().count() > crate::mcp_session::MAX_CLAIMED || !crate::auth::valid_name_segment(part) {
         return Err(AsRefusal::Invalid(raw.to_string()));
     }
-    Ok(part.to_string())
+    // Names compare case-insensitively (stored lowercase).
+    Ok(part.to_ascii_lowercase())
 }
 
 /// Resolve `as` to a registered, unretired label of `account`. The key's
 /// own per-key label (`self-rbwolf`) is always its own mailbox.
 pub async fn resolve_as(db: &PgPool, account: &str, consumer: &str, ty: &str, raw: &str) -> Result<String, AsRefusal> {
     let part = parse_as(raw, account)?;
-    if crate::auth::connection_label(consumer).as_deref() == Some(part.as_str()) {
-        return Ok(part);
+    if let Some(own) = crate::auth::connection_label(consumer).filter(|l| l.eq_ignore_ascii_case(&part)) {
+        return Ok(own);
     }
     let mut candidates = vec![part.clone()];
     if let Ok(c) = crate::mcp_session::claimed_label(ty, &part) {
@@ -274,10 +301,16 @@ async fn mint_default(
     ty: &str,
     key: Option<&str>,
 ) -> Result<String, String> {
-    for _ in 0..8 {
+    for _ in 0..32 {
         let Some(label) = crate::mcp_session::session_label(consumer, Some(ty)) else {
             return Err("no name type for this client".into());
         };
+        // Defaults always carry a digit: that is the reserved shape a
+        // chosen name may not take ([`reserved_default_part`]).
+        let label = label.to_ascii_lowercase();
+        if !label.rsplit('-').next().is_some_and(reserved_default_part) {
+            continue;
+        }
         if crate::repo::agent_names::insert_name(tx, account, &label, "default", consumer).await.map_err(|e| e.to_string())? {
             if let Some(k) = key {
                 crate::repo::agent_names::bind_key(tx, account, k, &label, 1).await.map_err(|e| e.to_string())?;
@@ -318,7 +351,7 @@ pub async fn register(
     }
     let lost_note = |l: &str| format!("your earlier name '{l}' was taken by another conversation after it retired; this one has a new mailbox");
     let wanted_label = match wanted.map(str::trim).filter(|w| !w.is_empty()) {
-        Some(wn) => Some(crate::mcp_session::claimed_label(ty, wn)?),
+        Some(wn) => Some(chosen_label(ty, wn)?),
         None => None,
     };
 
@@ -355,7 +388,12 @@ pub async fn register(
     let out = match names::name_for_update(&mut tx, account, &label).await.map_err(e)? {
         None => {
             if !names::insert_name(&mut tx, account, &label, "chosen", consumer).await.map_err(e)? {
-                return Err(format!("'{label}' was registered by another conversation a moment ago; try again"));
+                // Lost a race for a new name: the winner holds it now. The
+                // same refusal as a held name, never a silent share.
+                return Err(format!(
+                    "'{account}/{label}' is held by another conversation (online, registered a moment ago). Pass join=true \
+                     to share its mailbox, or choose another name"
+                ));
             }
             if let Some(k) = key {
                 names::bind_key(&mut tx, account, k, &label, 1).await.map_err(e)?;
@@ -724,7 +762,11 @@ mod tests {
     }
 
     async fn mail_to(db: &PgPool, to: &str) -> String {
-        let env = crate::agent_messages::Envelope::new("tester/agent", to, "message", json!({"text": "hi"}), None, vec![]);
+        mail(db, "tester/agent", to, None).await
+    }
+
+    async fn mail(db: &PgPool, from: &str, to: &str, thread: Option<&str>) -> String {
+        let env = crate::agent_messages::Envelope::new(from, to, "message", json!({"text": "hi"}), thread, vec![]);
         crate::repo::agent_messages::insert(db, &env, false).await.unwrap();
         env.id.clone()
     }
@@ -797,21 +839,40 @@ mod tests {
     }
 
     /// Takeover: another conversation of the SAME account may take a
-    /// retired name; the earlier unread mail stays with the owner, and the
-    /// earlier conversation resuming gets a new name and a note.
+    /// retired name, as a new generation with an EMPTY inbox. Everything
+    /// the earlier generation sent or received (read or not) stays with the
+    /// account owner; the new holder is no party to its threads, and a
+    /// reply there to the name is refused. The earlier conversation
+    /// resuming gets a new name and a note.
     #[tokio::test]
     async fn a_retired_name_is_released_to_the_account_but_not_its_mail() {
         let Some(db) = database().await else { return };
         let a = acct();
+        let name = format!("{a}/claude-general");
         let old = key_hash("client", "old");
         register(&db, &a, "self:x", "claude", Some(&old), Some("general"), false).await.unwrap();
-        mail_to(&db, &format!("{a}/claude-general")).await;
+        let thread = format!("thr_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+        mail(&db, "tester/agent", &name, Some(&thread)).await;
+        let read = mail(&db, "tester/agent", &name, None).await;
+        crate::repo::agent_messages::mark_read(&db, &read, &name).await.unwrap();
+        mail(&db, &name, "tester/agent", Some(&thread)).await;
         crate::repo::agent_names::fixtures::backdate(&db, &a, "claude-general", 8 * 86_400).await;
         crate::repo::agent_names::retire_due(&db, 86_400, 7 * 86_400).await.unwrap();
         let new = register(&db, &a, "self:x", "claude", Some(&key_hash("client", "new")), Some("general"), false).await.unwrap();
         assert_eq!(new.label, "claude-general");
         assert!(new.note.as_deref().unwrap_or("").contains("took over"));
-        assert_eq!(crate::repo::agent_names::fixtures::orphans_of(&db, &a, "claude-general").await, 1, "the old mail stays orphaned");
+        assert_eq!(crate::repo::agent_names::fixtures::orphans_of(&db, &a, "claude-general").await, 3, "the old generation's whole history");
+        let inbox = crate::repo::agent_messages::list(&db, &crate::repo::agent_messages::Filter { owner: Some(&name), limit: 50, ..Default::default() }).await.unwrap();
+        assert!(inbox.is_empty(), "the new holder starts empty: {inbox:?}");
+        assert_eq!(crate::repo::agent_messages::is_party(&db, &thread, &name).await.unwrap(), Some(false));
+        assert!(crate::agent_recipient::thread_reply_refusal(&db, &name, Some(&thread)).await.unwrap().is_some_and(|w| w.contains("retired")));
+        // Counted as orphaned: the unread one only.
+        let counts = crate::repo::agent_names::orphan_counts(&db, Some(&a)).await.unwrap();
+        assert_eq!(counts, vec![(a.clone(), "claude-general".to_string(), 1)]);
+        // New mail to the name is the new holder's.
+        mail_to(&db, &name).await;
+        let inbox = crate::repo::agent_messages::list(&db, &crate::repo::agent_messages::Filter { owner: Some(&name), limit: 50, ..Default::default() }).await.unwrap();
+        assert_eq!(inbox.len(), 1);
         let back = register(&db, &a, "self:x", "claude", Some(&old), None, false).await.unwrap();
         assert_ne!(back.label, "claude-general");
         assert!(back.note.as_deref().unwrap_or("").contains("taken by another conversation"));
@@ -820,6 +881,43 @@ mod tests {
         let theirs = register(&db, &other, "self:y", "claude", Some(&key_hash("client", "x")), Some("general"), false).await.unwrap();
         assert_eq!(theirs.label, "claude-general");
         assert_eq!(resolve_as(&db, &other, "self:y", "claude", &format!("{a}/claude-general")).await, Err(AsRefusal::NotYours));
+    }
+
+    /// Collisions: names compare case-insensitively; non-ASCII is refused;
+    /// a chosen name may not take the reserved default shape; two
+    /// conversations racing for one new name: one wins, the other gets the
+    /// join refusal, never a silent share.
+    #[tokio::test]
+    async fn names_do_not_collide_by_case_shape_or_race() {
+        let Some(db) = database().await else { return };
+        let a = acct();
+        let g = register(&db, &a, "self:x", "claude", Some(&key_hash("client", "c1")), Some("General"), false).await.unwrap();
+        assert_eq!(g.label, "claude-general");
+        let e = register(&db, &a, "self:x", "claude", Some(&key_hash("client", "c2")), Some("GENERAL"), false).await.unwrap_err();
+        assert!(e.contains("join=true"), "{e}");
+        assert_eq!(resolve_as(&db, &a, "self:x", "claude", "Claude-General").await, Ok("claude-general".into()));
+        assert!(register(&db, &a, "self:x", "claude", Some(&key_hash("client", "c3")), Some("généräl"), false).await.is_err());
+        let r = register(&db, &a, "self:x", "claude", Some(&key_hash("client", "c4")), Some("abc123"), false).await.unwrap_err();
+        assert!(r.contains("reserves"), "{r}");
+        assert!(register(&db, &a, "self:x", "claude", Some(&key_hash("client", "c5")), Some("weekly"), false).await.is_ok(), "six letters, no digit: not the default shape");
+        let (x, y) = tokio::join!(
+            register(&db, &a, "self:x", "claude", Some(&key_hash("client", "r1")), Some("raced"), false),
+            register(&db, &a, "self:x", "claude", Some(&key_hash("client", "r2")), Some("raced"), false),
+        );
+        assert_eq!([x.is_ok(), y.is_ok()].iter().filter(|o| **o).count(), 1, "exactly one wins: {x:?} {y:?}");
+        let lost = if x.is_ok() { y.unwrap_err() } else { x.unwrap_err() };
+        assert!(lost.contains("held by another conversation") && lost.contains("join=true"), "{lost}");
+    }
+
+    #[test]
+    fn the_default_shape_is_reserved_and_minted_defaults_have_it() {
+        assert!(reserved_default_part("x7k2qa"));
+        assert!(!reserved_default_part("weekly"), "no digit");
+        assert!(!reserved_default_part("x7k2q"), "five");
+        assert!(!reserved_default_part("X7K2QA"), "uppercase is not minted");
+        assert!(chosen_label("claude", "x7k2qa").is_err());
+        assert!(chosen_label("claude", "claude-x7k2qa").is_err(), "with the type prefix too");
+        assert_eq!(chosen_label("claude", "General"), Ok("claude-general".into()));
     }
 
     #[tokio::test]
