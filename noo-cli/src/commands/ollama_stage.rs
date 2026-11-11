@@ -530,6 +530,7 @@ pub fn models_fetch_ollama(g: &Globals, args: &[String]) -> Result<i32, Unhandle
             "manifest_sha256": out.manifest_sha256,
             "blobs": blobs,
             "size_bytes": out.size_bytes,
+            "downloaded_bytes": out.downloaded,
             "resumed_from": out.resumed_from,
             "next": [place],
         }));
@@ -539,10 +540,11 @@ pub fn models_fetch_ollama(g: &Globals, args: &[String]) -> Result<i32, Unhandle
     let present = out.blobs.iter().filter(|b| b.present).count();
     let resumed = if out.resumed_from > 0 { format!(", resumed from {}", human(out.resumed_from)) } else { String::new() };
     ui::done(&format!(
-        "{} — {} blobs, {} ({} already in the store{resumed}); {} layers: {}; manifest sha256 {}… verified against the registry",
+        "{} — {} blobs, {} ({} downloaded, {} already in the store{resumed}); {} layers: {}; manifest sha256 {}… verified against the registry",
         out.manifest.display(),
         out.blobs.len(),
         human(out.size_bytes),
+        human(out.downloaded),
         present,
         kinds.len(),
         kinds.join(", "),
