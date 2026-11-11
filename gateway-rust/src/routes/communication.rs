@@ -2474,3 +2474,21 @@ mod voice_tests {
         assert_eq!(post_audio(app, 5 * 1024 * 1024).await, reqwest::StatusCode::PAYLOAD_TOO_LARGE);
     }
 }
+
+#[cfg(test)]
+mod exec_approval_reach_tests {
+    /// i658 (#1029): with no dashboard socket, no channel origin and no
+    /// approval channel configured, nobody was asked. The gate refuses at
+    /// once on that answer (middleware::nobody_can_be_asked); a `true` here
+    /// would hold every such turn, and a harness slot, for the whole window
+    /// again. The security mutant "asked starts true" survived without it.
+    #[tokio::test]
+    async fn with_nowhere_to_send_nobody_is_asked() {
+        for v in ["NOO_APPROVAL_GCHAT_SPACE", "NOO_APPROVAL_TELEGRAM_CHAT"] {
+            if std::env::var(v).is_ok_and(|x| !x.trim().is_empty()) {
+                panic!("{v} is set in the test environment: this test needs it unset");
+            }
+        }
+        assert!(!super::notify_exec_approval("noo_agent_message", "r-i658", 300).await, "nothing was delivered, so nobody was asked");
+    }
+}
