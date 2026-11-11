@@ -2423,7 +2423,7 @@ pub(crate) fn upgrade_seats(g: &Globals) -> i32 {
         let ends = super::provision::wait_applied_via(g, &pending, 600, 5,
             &|n| format!("/api/cluster/seats/{n}/status"), "seat");
         // The controller's console: its gateway's content id, else the tag.
-        let console = controller_console(g);
+        let console = super::cluster_verify::controller_stack_tag();
         let mut rows = Vec::new();
         for (n, end) in ends {
             let ok_apply = matches!(end, super::provision::ApplyEnd::Applied { rc: 0, .. });
