@@ -291,8 +291,19 @@ func TestAListedWorkloadIsNotAnOrphan(t *testing.T) {
 	before := h.api.callList()
 	h.p.ReleaseOrphans(context.Background(), map[string]bool{"rhaddon/worker": true})
 	h.p.Wait()
-	if got := h.api.callList(); len(got) != len(before) {
-		t.Fatalf("a listed workload was touched: %v -> %v", before, got)
+	// What the test means, which cannot race: nothing but readiness probes
+	// after the snapshot. The readiness watcher may still be finishing a
+	// probe it began before forgetEverything (i657: one extra GET failed a
+	// push run when the test goroutine was descheduled), and a probe is not
+	// a touch. No create/start/stop/remove and no drain (door POST).
+	after := h.api.callList()[len(before):]
+	for _, c := range after {
+		if c != "door:GET /health/ready" {
+			t.Fatalf("a listed workload was touched: %q (calls after the release: %v)", c, after)
+		}
+	}
+	if h.api.ctr(wName) == nil || h.api.ctr(dName) == nil {
+		t.Fatalf("a listed workload's containers were removed")
 	}
 }
 
