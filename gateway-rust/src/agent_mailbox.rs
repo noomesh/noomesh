@@ -874,6 +874,42 @@ mod tests {
         assert_eq!(delivery(&db, &format!("{a}/claude-general")).await.map(|(t, _)| t), Some(Tier::Online));
     }
 
+    /// The door step for a sessionless client: a send without `as` never
+    /// goes out from the per-key mailbox (it gets a one-shot mailbox and is
+    /// told); whoami says how to get one; `as` naming another account is
+    /// the fixed refusal; `as` is stripped before the tool runs.
+    #[tokio::test]
+    async fn the_door_step_never_sends_from_the_per_key_mailbox_by_accident() {
+        let Some(db) = database().await else { return };
+        let a = acct();
+        let consumer = format!("self:{a}");
+        let mut args = Map::new();
+        args.insert("to".into(), json!(format!("{a}/claude-x")));
+        match for_call(&db, &a, &consumer, "claude", None, "noo_agent_send", &mut args).await {
+            Outcome::Proceed { label: Some(l), note: Some(n) } => {
+                assert_ne!(l, format!("self-{a}"), "not the per-key mailbox");
+                assert!(l.starts_with("claude-") && n.contains("one-shot"), "{l} {n}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let mut none = Map::new();
+        match for_call(&db, &a, &consumer, "claude", None, "noo_agent_whoami", &mut none).await {
+            Outcome::Answer(v) => assert!(v["how"].as_str().unwrap().contains("noo_agent_name(session=")),
+            other => panic!("{other:?}"),
+        }
+        let mut foreign = Map::new();
+        foreign.insert("as".into(), json!("bob/claude-general"));
+        assert_eq!(for_call(&db, &a, &consumer, "claude", None, "noo_agent_inbox", &mut foreign).await, Outcome::Refuse(NOT_YOURS.into()));
+        assert!(foreign.get("as").is_none(), "as never reaches the route");
+        register(&db, &a, &consumer, "claude", Some(&key_hash("client", "c")), Some("general"), false).await.unwrap();
+        let mut mine = Map::new();
+        mine.insert("as".into(), json!("general"));
+        assert_eq!(
+            for_call(&db, &a, &consumer, "claude", None, "noo_agent_inbox", &mut mine).await,
+            Outcome::Proceed { label: Some("claude-general".into()), note: None }
+        );
+    }
+
     #[tokio::test]
     async fn a_one_shot_mailbox_has_no_key_and_cannot_be_resumed() {
         let Some(db) = database().await else { return };
