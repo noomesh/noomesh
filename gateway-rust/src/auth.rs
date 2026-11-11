@@ -5026,6 +5026,24 @@ mod tests {
         assert!(!PUBLIC_PATHS_EXACT.contains(&ALERT_INTAKE_PATH));
     }
 
+    /// i669: the node-agent target list is decided by the scraper's leaf
+    /// before the bearer, refused (403) for everything else, and not public.
+    #[test]
+    fn the_scrape_target_list_is_decided_before_the_bearer_and_is_not_public() {
+        let src = include_str!("auth.rs");
+        let body = src.split("pub async fn require_any_auth(").nth(1).expect("middleware");
+        let branch = body.find("if path == SCRAPE_TARGETS_PATH \u{7b}").expect("the scrape-targets branch");
+        let bearer = body.find("let token = bearer_token(&request);").expect("the bearer read");
+        assert!(branch < bearer, "the leaf check must come before the bearer");
+        let arm = &body[branch..bearer];
+        let arm = &arm[..arm.find("if path == ALERT_INTAKE_PATH").unwrap_or(arm.len())];
+        assert!(arm.contains("is_scrape_targets(request.method(), &path, scraper.as_ref())"), "{arm}");
+        assert!(arm.contains("return Err(StatusCode::FORBIDDEN);"), "{arm}");
+        assert!(!passes_without_bearer_check(SCRAPE_TARGETS_PATH, false, false));
+        assert!(!passes_without_bearer_check(SCRAPE_TARGETS_PATH, false, true));
+        assert!(!PUBLIC_PATHS_EXACT.contains(&SCRAPE_TARGETS_PATH));
+    }
+
     // The birth-proof routes step past this middleware because
     // the node has no fleet credential at that moment — but the exemption must
     // be exactly two routes, not the neighbourhood they live in. `/metrics`
