@@ -891,7 +891,7 @@ async fn do_classify(
     // axum's `Send` bound ("FnOnce is not general enough").
     let calls: Vec<_> = texts.iter().map(|text| classify_one(&client, &url, &backend, text, &labels, multi)).collect();
     let chosen_all: Vec<Result<Vec<Value>, ExtFail>> =
-        futures::stream::iter(calls).buffered(CLASSIFY_PARALLEL).collect().await;
+        futures::stream::iter(calls).buffered(CLASSIFY_PARALLEL.min(1)).collect().await;
     let mut results = Vec::with_capacity(texts.len());
     for (i, chosen) in chosen_all.into_iter().enumerate() {
         let chosen = chosen?;
