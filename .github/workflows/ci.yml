@@ -154,11 +154,15 @@ jobs:
     - id: diff
       name: Does this change touch anything but documentation?
       env:
-        # A pull request diffs against its base; a merge group has no PR, so it
-        # diffs the group's own base_sha (dev's tip when the group was built)
-        # against the checked-out group head. A push has neither: BASE is empty
-        # and everything runs (the integration point is never narrowed).
-        BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        # A pull request diffs against its base. A MERGE GROUP diffs against
+        # the queue's base branch (dev's tip), computed in the step below; NEVER
+        # merge_group.base_sha. In a batch that is the PREVIOUS group's head, so
+        # a group's diff held only its own PR, the lanes an earlier group
+        # touched were skipped as success, and under HEADGREEN #1017 landed on
+        # dev with noo-cli red (2026-11-11: pr-978's group skipped noo-cli). A
+        # push has neither: BASE is empty and everything runs.
+        BASE: ${{ github.event.pull_request.base.sha }}
+        MG_BASE_REF: ${{ github.event.merge_group.base_ref }}
         # Read by "Defer the Rust builds to the merge queue" below.
         EVENT: ${{ github.event_name }}
         PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
@@ -168,6 +172,24 @@ jobs:
         REPO: ${{ github.repository }}
       run: |
         set -eu
+        # >>> merge-group base
+        # A merge group: the base is where this group leaves the queue's base
+        # branch, so the diff holds EVERY PR in the batch up to this one and
+        # each lane any of them touched runs here (the head group then tests
+        # the whole batch, as HEADGREEN assumes). Any failure leaves BASE empty,
+        # which runs everything: fail open, never narrow on a guess.
+        if [ "${EVENT:-}" = merge_group ] && [ -z "${BASE:-}" ]; then
+          mg_ref="${MG_BASE_REF#refs/heads/}"
+          if [ -n "$mg_ref" ] \
+             && git fetch -q --no-tags origin "+refs/heads/$mg_ref:refs/remotes/origin/$mg_ref" \
+             && BASE="$(git merge-base HEAD "refs/remotes/origin/$mg_ref")"; then
+            echo "merge group: diffing against $mg_ref at $BASE (the queue's base), not the previous group"
+          else
+            BASE=""
+            echo "merge group: no base on '$mg_ref' to diff against; running everything (fail open)"
+          fi
+        fi
+        # <<< merge-group base
         # ── llamacpp: its OWN inputs, on every event ─────────────────────
         # The llama-server image has one input in this tree:
         # docker/Dockerfile.llamacpp (tests/test_ci_scope_declarations.py holds it
