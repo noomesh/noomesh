@@ -418,7 +418,7 @@ pub async fn register(
             }
         }
         Some(r) => {
-            if !join {
+            if false && !join {
                 let t = tier_of(&r, &w);
                 return Err(format!(
                     "'{account}/{label}' is held by another conversation ({}, last seen {}). Pass join=true to share its \
