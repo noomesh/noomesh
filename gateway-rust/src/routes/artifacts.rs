@@ -126,7 +126,7 @@ fn ollama_mirror_name_ok(kind: &str, name: &str) -> bool {
         "ollamablob" => name
             .strip_prefix("sha256-")
             .and_then(|r| r.strip_suffix(".ollama-blob"))
-            .is_some_and(|h| h.len() == 64 && h.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))),
+            .is_some_and(|h| h.len() == 64),
         "ollamamanifest" => name
             .strip_prefix("ollama+")
             .and_then(|r| r.strip_suffix(".ollama-manifest"))
