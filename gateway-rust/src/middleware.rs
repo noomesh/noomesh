@@ -961,6 +961,13 @@ pub async fn before_tool_call(
                             request_id,
                         });
                     }
+                    ExecApprovalOutcome::Unreachable { request_id } => {
+                        audit_tool_decision(state, call, risk_level, "unreachable", &mode, &request_id).await;
+                        return Err(SecurityError::ApprovalUnreachable {
+                            tool: call.name.clone(),
+                            request_id,
+                        });
+                    }
                     ExecApprovalOutcome::TimedOut { request_id, secs } => {
                         audit_tool_decision(state, call, risk_level, "timeout", &mode, &request_id).await;
                         return Err(SecurityError::ApprovalTimeout {
@@ -1047,6 +1054,15 @@ pub enum ExecApprovalOutcome {
     Approved,
     Denied { by: String, request_id: String },
     TimedOut { request_id: String, secs: u64 },
+    /// Nobody could be asked (no notice delivered, no console open).
+    Unreachable { request_id: String },
+}
+
+/// True when an approval request reached no one: no notice was delivered to
+/// a dashboard, chat or approval channel, and no console socket is open to
+/// show the alert.
+pub(crate) fn nobody_can_be_asked(notice_delivered: bool, open_consoles: usize) -> bool {
+    !notice_delivered && open_consoles == 0
 }
 
 /// Decision window length, mirroring the Python ExecApprovalManager
@@ -1143,7 +1159,7 @@ async fn wait_for_exec_approval(
     // Notify — best-effort, never blocks the gate (Python parity:
     // _notify_exec_approval). The card is the primary surface; the CLI
     // hint keeps headless operators first-class.
-    crate::routes::communication::notify_exec_approval(&call.name, &request_id, timeout_secs)
+    let asked = crate::routes::communication::notify_exec_approval(&call.name, &request_id, timeout_secs)
         .await;
 
     // Dashboard surface: a chat started IN the dashboard has no channel
@@ -1152,7 +1168,7 @@ async fn wait_for_exec_approval(
     // 2026-08-09). Broadcast to every connected WS client as well — the
     // Admin view has the approve/deny buttons; this makes the request
     // visible where the conversation is actually happening.
-    state.alert_hub.broadcast(serde_json::json!({
+    let consoles = state.alert_hub.broadcast(serde_json::json!({
         "type": "alert",
         // Delivered to the tab that raised it and to operators, who hold the
         // approve/deny buttons — not to every connected user (state.rs
@@ -1171,6 +1187,33 @@ async fn wait_for_exec_approval(
             "window_secs": timeout_secs,
         },
     }));
+
+    // Nobody can be asked: no notice reached a dashboard, chat or approval
+    // channel, and no console is open to show the alert. Waiting the window
+    // out only holds the turn (and a harness slot) for a decision nobody can
+    // make: refuse now, saying why (i658: a task's approval sat 300 s
+    // unseen). Any open console keeps today's wait: an operator there can
+    // decide from the alert. This tightens nothing and loosens nothing: the
+    // call still does not run without an approval.
+    if nobody_can_be_asked(asked, consoles) {
+        let _ = sqlx::query(
+            "UPDATE noo_approval_requests SET status = 'expired', resolved_at = NOW(), resolved_by = 'nobody to ask' \
+             WHERE request_id = $1 AND status = 'pending'",
+        )
+        .bind(&request_id)
+        .execute(&state.db)
+        .await;
+        crate::audit::record(
+            &state.db,
+            AuditEvent::new(AuditKind::ExecApprovalDecided, "gateway", &format!("tool:{}", call.name))
+                .outcome(crate::audit::Outcome::custom("unreachable"))
+                .severity(crate::audit::Severity::Warning)
+                .details(serde_json::json!({"request_id": request_id, "reason": "no channel, no console, no approval channel"})),
+        )
+        .await;
+        tracing::warn!(request_id = %request_id, tool = %call.name, "exec_approval.nobody_to_ask");
+        return ExecApprovalOutcome::Unreachable { request_id };
+    }
 
     tracing::info!(
         request_id = %request_id,
@@ -2299,6 +2342,29 @@ mod tool_risk_context_tests {
         let body = &src[a..a + 6000];
         assert!(body.contains("NULLIF($6, '')"), "an unattended request is stored unbound, decidable only by id");
         assert!(body.contains("ExecApprovalOutcome::TimedOut"), "and refused when nobody decides");
+    }
+
+    /// i658: an approval that reached nobody (no notice delivered, no console
+    /// open) is refused at once, not after the window; any delivered notice
+    /// or any open console keeps today's wait.
+    #[test]
+    fn an_approval_nobody_can_see_is_refused_at_once_not_after_the_window() {
+        assert!(nobody_can_be_asked(false, 0));
+        assert!(!nobody_can_be_asked(true, 0), "a delivered notice: wait for the decision");
+        assert!(!nobody_can_be_asked(false, 1), "an open console: an operator may decide from the alert");
+        let code = crate::test_src::own_code(include_str!("middleware.rs"));
+        let body = crate::test_src::fn_body(&code, "async fn wait_for_exec_approval(");
+        let check = body.find("if nobody_can_be_asked(asked, consoles)").expect("the check");
+        let poll = body.find("loop {").expect("the polling loop");
+        let window = body.find("\"exec_approval.window_open\"").expect("the window log");
+        assert!(check < poll && check < window, "refused before the window opens and before any polling");
+        let refusal = &body[check..poll];
+        assert!(refusal.contains("status = 'expired'") && refusal.contains("ExecApprovalOutcome::Unreachable"), "{refusal}");
+        assert!(refusal.contains("AuditKind::ExecApprovalDecided"), "the refusal is audited");
+        assert!(body.contains("let asked = crate::routes::communication::notify_exec_approval("), "delivery is what is judged");
+        assert!(body.contains("let consoles = state.alert_hub.broadcast("), "and the open consoles");
+        let msg = SecurityError::ApprovalUnreachable { tool: "noo_agent_message".into(), request_id: "r1".into() }.to_string();
+        assert!(msg.contains("NOT run") && msg.contains("do not retry") && msg.contains("noo approval approve r1"), "{msg}");
     }
 
     /// Every Medium or High decision is audited, High refusals included; Low is not.

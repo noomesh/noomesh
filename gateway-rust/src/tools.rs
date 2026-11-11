@@ -700,6 +700,9 @@ pub async fn execute_tool(
                     ))
                     .await;
                 }
+                crate::security::SecurityError::ApprovalUnreachable { tool, .. } => {
+                    crate::routes::communication::record_gated_failure(tool, "nobody could be asked to approve it");
+                }
                 crate::security::SecurityError::ApprovalTimeout { tool, secs, .. } => {
                     crate::routes::communication::record_gated_failure(
                         tool,
