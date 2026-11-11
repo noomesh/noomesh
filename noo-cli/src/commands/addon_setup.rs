@@ -1549,8 +1549,14 @@ mod tests {
         }
     }
 
+    /// A directory of this test's own. The name carries a process-wide
+    /// counter as well as the pid: tests run in parallel threads of ONE
+    /// process, and two tests reaching the same helper (`the_full_run`)
+    /// used to share `<pid>-run-all` and remove each other's files mid-run.
     fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("noo-addon-setup-{}-{name}", std::process::id()));
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("noo-addon-setup-{}-{n}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
