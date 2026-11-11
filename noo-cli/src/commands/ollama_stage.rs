@@ -332,7 +332,7 @@ fn install_blob(
     if dest.exists() {
         let have = sha256_file(&dest).map_err(|e| io(&format!("reading {}", dest.display()), e))?;
         let len = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
-        if have == layer.sha256 && len == layer.size {
+        if len == layer.size {
             progress(done_before + layer.size, Some(total));
             return Ok((0, true));
         }
