@@ -604,6 +604,11 @@ pub(crate) fn download_part(
     }
 }
 
+/// The first byte a `Content-Range: bytes <start>-<end>/<total>` covers.
+fn content_range_start(v: &str) -> Option<u64> {
+    v.trim().strip_prefix("bytes ")?.split('-').next()?.trim().parse().ok()
+}
+
 /// One request into `part` from `have`.
 fn download_once(
     get: &mut dyn FnMut(u64) -> Result<ureq::http::Response<ureq::Body>, FetchErr>,
@@ -614,7 +619,25 @@ fn download_once(
     let mut resp = get(have)?;
     let st = resp.status().as_u16();
     let mut f = match st {
-        206 => OpenOptions::new().append(true).open(part).map_err(|e| io(&format!("opening {}", part.display()), e))?,
+        206 => {
+            // A partial answer is appended only where it says it starts, and
+            // that must be exactly where the part ends: a 206 from any other
+            // offset (or with no Content-Range) would splice the wrong bytes
+            // in, and the hash would then throw the whole download away.
+            let start = resp
+                .headers()
+                .get("content-range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(content_range_start);
+            if start != Some(have) {
+                return Err(FetchErr::Http(format!(
+                    "the server answered 206 from {} but the download holds {have} bytes — not appending",
+                    start.map_or_else(|| "no Content-Range".to_string(), |s| format!("byte {s}"))
+                )));
+            }
+            // `create`: a resume from 0 (an empty or absent part) is a start.
+            OpenOptions::new().create(true).append(true).open(part).map_err(|e| io(&format!("opening {}", part.display()), e))?
+        }
         200 => {
             // The server ignored Range (or there was nothing to resume):
             // start over rather than append a whole file to a prefix.
@@ -1154,7 +1177,11 @@ mod tests {
     }
 
     fn tmpdir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("noo-models-fetch-{tag}-{}", std::process::id()));
+        // pid + a process-wide count: unique per call, so no two tests (or a
+        // leftover from an earlier run under the same pid) share a directory.
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let d = std::env::temp_dir().join(format!("noo-models-fetch-{tag}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -1361,14 +1388,20 @@ mod in_run_resume_tests {
                     }
                 }
                 let body = &content[start..];
+                // As a real server answers: 200 to a request with no Range,
+                // 206 with its Content-Range only to a resume. (A 206 to the
+                // first request, as this fake once sent, is what the client
+                // now refuses: these tests never passed against it.)
+                let hdr = if start > 0 {
+                    format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        content.len() - 1, content.len(), body.len())
+                } else {
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())
+                };
                 if bad_left > 0 {
                     bad_left -= 1;
                     match mode {
                         Mode::Drop(_) => {
-                            let hdr = format!(
-                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                                content.len() - 1, content.len(), body.len()
-                            );
                             let _ = st.write_all(hdr.as_bytes());
                             let _ = st.write_all(&body[..body.len() / 3]);
                             continue; // dropped: the stream closes mid-body
@@ -1379,12 +1412,6 @@ mod in_run_resume_tests {
                         }
                     }
                 }
-                let hdr = if start > 0 {
-                    format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        content.len() - 1, content.len(), body.len())
-                } else {
-                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())
-                };
                 let _ = st.write_all(hdr.as_bytes());
                 let _ = st.write_all(body);
             }
@@ -1393,7 +1420,10 @@ mod in_run_resume_tests {
     }
 
     fn dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("noo-resume-{}-{tag}", std::process::id()));
+        // Unique per call (pid + a process-wide count), never a shared name.
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let d = std::env::temp_dir().join(format!("noo-resume-{}-{tag}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -1484,5 +1514,64 @@ mod in_run_resume_tests {
         let (r, retries) = run(&url, &part, c.len() as u64);
         assert!(matches!(r.unwrap_err(), FetchErr::Io(_)));
         assert_eq!((retries.len(), hits.load(Ordering::SeqCst)), (0, 1));
+    }
+
+    /// Each connection gets the next canned response, whole.
+    fn canned(responses: Vec<Vec<u8>>) -> String {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/f", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for (stream, resp) in l.incoming().zip(responses) {
+                let Ok(mut st) = stream else { continue };
+                let mut rd = BufReader::new(st.try_clone().unwrap());
+                loop {
+                    let mut h = String::new();
+                    if rd.read_line(&mut h).is_err() || h.trim().is_empty() {
+                        break;
+                    }
+                }
+                let _ = st.write_all(&resp);
+            }
+        });
+        url
+    }
+
+    fn partial(from: usize, c: &[u8], content_range: bool) -> Vec<u8> {
+        let body = &c[from..];
+        let cr = if content_range { format!("Content-Range: bytes {from}-{}/{}\r\n", c.len() - 1, c.len()) } else { String::new() };
+        let mut r = format!("HTTP/1.1 206 Partial Content\r\n{cr}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
+        r.extend_from_slice(body);
+        r
+    }
+
+    /// A 206 is appended only from where the part ends: a server resuming
+    /// from another offset, or a 206 that does not say where it starts, is
+    /// refused and nothing is appended (the bytes would be spliced wrong and
+    /// the hash would throw the whole download away). Fails on the version
+    /// that appended any 206.
+    #[test]
+    fn a_206_from_the_wrong_offset_is_not_appended() {
+        let c = content();
+        for (resp, why) in [(partial(10, &c, true), "byte 10"), (partial(0, &c, false), "no Content-Range")] {
+            let d = dir("offset");
+            let part = d.join(".m.part");
+            std::fs::write(&part, &c[..1000]).unwrap();
+            let e = run(&canned(vec![resp]), &part, c.len() as u64).0.unwrap_err();
+            assert!(matches!(e, FetchErr::Http(_)) && e.to_string().contains(why), "{why}: {e}");
+            assert_eq!(std::fs::read(&part).unwrap(), &c[..1000], "{why}: nothing appended");
+        }
+    }
+
+    /// A 206 from byte 0 to a request with nothing held is a start: the part
+    /// is created (it does not exist yet), not an "opening" error.
+    #[test]
+    fn a_206_from_zero_with_no_part_creates_it() {
+        let c = content();
+        let d = dir("zero");
+        let part = d.join(".m.part");
+        let (r, retries) = run(&canned(vec![partial(0, &c, true)]), &part, c.len() as u64);
+        assert_eq!(r.unwrap(), c.len() as u64);
+        assert_eq!(std::fs::read(&part).unwrap(), c);
+        assert!(retries.is_empty());
     }
 }
