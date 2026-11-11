@@ -638,11 +638,14 @@ pub fn with_note(v: Value, note: Option<String>) -> Value {
     }
 }
 
-/// The delivery word for a send to `to`, when it is a registered name.
-pub async fn delivery(db: &PgPool, to: &str) -> Option<(Tier, chrono::DateTime<chrono::Utc>)> {
-    let (account, label) = to.split_once(crate::auth::CONNECTION_SEP)?;
-    let r = crate::repo::agent_names::name(db, account, label).await.ok().flatten()?;
-    Some((tier_of(&r, &Windows::current()), r.last_seen))
+/// The delivery word for a send to `to`, when it is a registered name
+/// (`Ok(None)`: not one). A database that cannot answer is an error, never
+/// "no state".
+pub async fn delivery(db: &PgPool, to: &str) -> Result<Option<(Tier, chrono::DateTime<chrono::Utc>)>, sqlx::Error> {
+    let Some((account, label)) = to.split_once(crate::auth::CONNECTION_SEP) else { return Ok(None) };
+    Ok(crate::repo::agent_names::name(db, account, label)
+        .await?
+        .map(|r| (tier_of(&r, &Windows::current()), r.last_seen)))
 }
 
 /// One pass of the lifecycle: retire names past their window (orphaning
@@ -972,7 +975,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(crate::agent_recipient::check(&db, &format!("{a}/claude-general"), Some(&a)).await.unwrap(), crate::agent_recipient::Recipient::Known);
-        assert_eq!(delivery(&db, &format!("{a}/claude-general")).await.map(|(t, _)| t), Some(Tier::Online));
+        assert_eq!(delivery(&db, &format!("{a}/claude-general")).await.unwrap().map(|(t, _)| t), Some(Tier::Online));
     }
 
     /// The door step for a sessionless client: a send without `as` never

@@ -2366,7 +2366,7 @@ async fn messages_send(
     }
     // Whether anyone is reading `to` now (0.6.24). Only a registered
     // mailbox has a state; an account, a node or a key reads as null.
-    let delivery = crate::agent_mailbox::delivery(&state.db, &req.to).await;
+    let delivery = crate::agent_mailbox::delivery(&state.db, &req.to).await?;
     if req.online_only {
         match delivery {
             Some((crate::agent_mailbox::Tier::Online, _)) => {}
