@@ -23,6 +23,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from tests import _rust_src as rs
+
 ROOT = Path(__file__).resolve().parents[1]
 GO = (ROOT / "node-agent-go/internal/docker/ollama_stage.go").read_text()
 GO_TEST = (ROOT / "node-agent-go/internal/docker/ollama_stage_test.go").read_text()
@@ -53,7 +55,7 @@ def test_the_cli_no_longer_writes_a_modelfile() -> None:
     """The mirror replaced the GGUF + Modelfile rebuild. The node still reads
     an OLD pair (and keeps its header and directive checks, pinned below), but
     nothing in the CLI may write one for a registry tag."""
-    code = re.sub(r"//.*", "", RS.split("#[cfg(test)]", 1)[0])
+    code = rs.own_code(RS)
     for gone in ("# noo-ollama-stage", "# model-sha256", "render_modelfile", "plan_layers", "install_weight"):
         assert gone not in code, f"the CLI still has the Modelfile rebuild: {gone!r}"
     assert not re.search(r'format!\("(FROM|TEMPLATE|SYSTEM|PARAMETER|LICENSE|MESSAGE|RENDERER|PARSER) ', code)
@@ -86,8 +88,8 @@ def test_the_manifest_limits_match_the_nodes() -> None:
         "MIRROR_MAX_MANIFEST_BYTES": "mirrorMaxManifestBytes",
         "MIRROR_MAX_BLOB_BYTES": "mirrorMaxBlobBytes",
     }
-    for rs, go in pairs.items():
-        assert _rust_const(rs) == _go_const(go), (rs, go)
+    for rust_name, go in pairs.items():
+        assert _rust_const(rust_name) == _go_const(go), (rust_name, go)
     assert _rust_const("MIRROR_MAX_LAYERS") == "64"
     assert _rust_const("MIRROR_MAX_MANIFEST_BYTES") == "1 << 20"
     assert _rust_const("MIRROR_MAX_BLOB_BYTES") == "1 << 40"
@@ -108,7 +110,7 @@ def test_the_mirror_store_names_match_the_nodes() -> None:
 
 def test_staged_files_stay_out_of_the_default_sweep() -> None:
     assert "is_staged_name" in CLUSTER
-    fn = RS.split("pub(crate) fn is_staged_name", 1)[1].split("\n}\n", 1)[0]
+    fn = rs.fn_body(rs.own_code(RS), "pub(crate) fn is_staged_name")
     assert 'starts_with("ollama+")' in fn
     assert "MIRROR_BLOB_SUFFIX" in fn and "MIRROR_MANIFEST_SUFFIX" in fn
     # The sweep lists only .gguf files; a mirror file never has that extension.
