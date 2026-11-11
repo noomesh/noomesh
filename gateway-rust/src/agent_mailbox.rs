@@ -219,7 +219,7 @@ pub fn reserved_default_part(part: &str) -> bool {
 /// they are ASCII by `auth::valid_name_segment`), typed (`claude-general`),
 /// and refused when its own part has the reserved default shape.
 pub fn chosen_label(ty: &str, wanted: &str) -> Result<String, String> {
-    let lower = wanted.trim().to_ascii_lowercase();
+    let lower = wanted.trim().to_string();
     let label = crate::mcp_session::claimed_label(ty, &lower)?;
     let part = label.strip_prefix(&format!("{ty}-")).unwrap_or(&label);
     if reserved_default_part(part) {
