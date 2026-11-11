@@ -29,12 +29,16 @@ provably the same:
     the rc's signed lock recorded (`source:<repo>@<sha>`), compared through
     the GitHub API. Equal trees, not equal SHAs: the sibling's main is a merge
     commit of the staging commit the rc built;
-  * the image's build does not stamp the TAG into its bits. Two do, and are
+  * the image's build does not stamp the TAG into its bits. One does, and is
     always rebuilt:
-      gateway     embeds mesh-ui-web:$TAG, whose console is built with
-                  NOO_CONSOLE_BUILD=stack-$TAG — an rc gateway reports rc.N;
       node-agent  --build-arg NODE_AGENT_VERSION / NODE_AGENT_COMMIT are the
-                  tag and its commit.
+                  tag and its commit (noomesh-internal i648: not yet changed).
+    The gateway USED to (it embedded mesh-ui-web:$TAG, whose console was
+    built with NOO_CONSOLE_BUILD=stack-$TAG). Since 2026-11-11 it embeds the
+    console by DIGEST and the console's build identity is its content
+    (`ui-<tree hash of ui/>`), so a final re-tags the rc's gateway and ships
+    exactly the bits the rc proved. Its declared inputs include `ui/**`, so a
+    console change between two rcs still rebuilds it.
 
 PER-IMAGE RE-TAG (rc only). An rc whose tree differs from every earlier rc
 (rc.7 = rc.6 + a two-line Cargo.lock bump rebuilt all 13 images, ~25 min) is
@@ -125,8 +129,7 @@ SIBLING_INPUTS: dict[str, tuple[str, ...]] = {
     "node-agent": (),
 }
 # Built with the tag stamped into the bits — never re-tagged (see docstring).
-TAG_STAMPED = {"gateway": "embeds the console built as stack-$TAG",
-               "node-agent": "NODE_AGENT_VERSION/COMMIT build args are the tag"}
+TAG_STAMPED = {"node-agent": "NODE_AGENT_VERSION/COMMIT build args are the tag"}
 # Base images the lock does not list; re-tagged by their rc TAG, not a lock digest.
 NOT_IN_LOCK = {"deps-core", "deps-base"}
 

@@ -12,10 +12,15 @@
  * was right and the check was impossible, which is a bad place to be,
  * because the next time the tag is wrong it will look exactly the same.
  *
- * A string literal survives minification. So the console carries the stack
- * tag it was built from, and anyone can read it off the public bundle:
+ * A string literal survives minification. So the console carries the build
+ * it came from, and anyone can read it off the public bundle:
  *
- *     curl -s https://<controller>/assets/kiosk-*.js | grep -o 'stack-v[0-9.]*'
+ *     curl -s https://<controller>/assets/kiosk-*.js | grep -o 'ui-[0-9a-f]*'
+ *
+ * Since 2026-11-11 that is a CONTENT identity, `ui-<git tree hash of ui/>`
+ * (publish-web.yml), not the release tag: an rc and its final carry the same
+ * one, so a final re-tags the rc's gateway instead of rebuilding it, and a
+ * display still running an old console still reports its old id.
  *
  * `dev` when built outside the release workflow — it must never claim a
  * tag it was not cut from, because a false build stamp is worse than none.
