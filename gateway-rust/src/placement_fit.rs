@@ -95,6 +95,10 @@ pub const KV_BYTES_PER_TOKEN_PER_GB_WEIGHTS: f64 = 16.0 * 1024.0;
 /// The floor under that figure (144 KiB, f16): qwen3-4b's real KV a token.
 pub const KV_BYTES_PER_TOKEN_FLOOR: f64 = 144.0 * 1024.0;
 pub const DEFAULT_CHAT_CTX: u64 = 4096;
+/// A measured resident size below this share of the model's weights is not
+/// taken as a measurement (i655). Half, not all: an unloaded projector or a
+/// lazily mapped tail can leave a real figure a little under the file size.
+pub const MEASURED_FLOOR_OF_WEIGHTS: f64 = 0.5;
 
 /// Conservative f16 KV bytes per token per slot for a model whose
 /// architecture is not reported: 16 KiB per GB of weights, at least 144 KiB.
@@ -488,6 +492,20 @@ pub fn evaluate(node: &Value, specs: &[Spec], embed_ctx: u64) -> Report {
         let (w, wsrc) = weights_gb(node, &s.model);
         let st = stat(node, &s.model);
         let measured = st.and_then(|x| x["resident_bytes"].as_u64()).filter(|b| *b > 0);
+        // i655: a "measured" resident size below half the model's own weights
+        // is not a measurement of the model. Ollama 0.40.16 on a Mac reported
+        // gemma4:e4b-it-qat (6.1 GB of weights) as 0.58 GB resident; trusted,
+        // the node read nearly empty and nothing it could not hold was refused.
+        let measured = match (measured, w) {
+            (Some(b), Some(wg)) if (b as f64 / GB) < wg * MEASURED_FLOOR_OF_WEIGHTS => {
+                notes.push(format!(
+                    "the node reports {:.1} GB resident, below half its {wg:.1} GB of weights, so that is not a measurement of the model; using the estimate",
+                    b as f64 / GB
+                ));
+                None
+            }
+            (m, _) => m,
+        };
         let pinned = env_u64(&s.env, "OLLAMA_CONTEXT_LENGTH").or_else(|| env_u64(&s.env, "N_CTX"));
         let ctx = match s.role.as_str() {
             "embed" => embed_ctx,
@@ -1010,6 +1028,27 @@ mod tests {
         node["model_stats"] = json!([{"name": "harrier", "resident_bytes": 7_100_000_000u64}]);
         let e = evaluate(&node, &[spec("embed", "harrier", None)], 1024);
         assert!(e.warnings.iter().all(|w| !w.contains("OLLAMA_CONTEXT_LENGTH")), "{:?}", e.warnings);
+    }
+
+    /// i655, mcmini's real figures (Ollama 0.40.16, 2026-11-11): e4b's
+    /// /api/ps size (0.58 GB) is below its 6.1 GB of weights, so fit uses the
+    /// estimate and says why; harrier's (0.57 GB over 0.40 GB of weights) is a
+    /// real measurement and stays one.
+    #[test]
+    fn a_measured_size_below_the_weights_is_not_a_measurement() {
+        let node = json!({"vram_gb": 18.0, "ram_gb": 24.0, "capabilities": {"unified_memory": true, "gpu_api": "metal"},
+            "model_stats": [
+                {"name": "gemma4:e4b-it-qat", "size_bytes": 6_146_501_801u64, "resident_bytes": 577_387_887u64},
+                {"name": "harrier:latest", "size_bytes": 396_705_831u64, "resident_bytes": 571_400_519u64},
+            ]});
+        let r = evaluate(&node, &[spec_env("chat", "gemma4:e4b-it-qat", &[("OLLAMA_CONTEXT_LENGTH", "8192")]), spec("embed", "harrier", Some("2"))], 1024);
+        let chat = &r.rows[0];
+        assert_eq!(chat.source, "estimated", "{:?}", chat.notes);
+        assert!(chat.total_gb > 6.1, "the estimate counts the weights: {}", chat.total_gb);
+        assert!(chat.notes.iter().any(|n| n.contains("not a measurement")), "{:?}", chat.notes);
+        let embed = &r.rows[1];
+        assert_eq!(embed.source, "measured");
+        assert!((embed.total_gb - 0.5714).abs() < 1e-3, "{}", embed.total_gb);
     }
 
     #[test]
