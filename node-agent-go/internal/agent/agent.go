@@ -619,6 +619,12 @@ func (a *Agent) startMessaging(ctx context.Context) {
 	a.hb.SetHostdState(a.hostdStatus)
 	a.hb.SetBackendContainers(a.backendContainers)
 	a.hb.SetOllamaDoor(func() string { return a.docker.BackendDialURL(a.lifeCtx(), "ollama") })
+	if a.ollama != nil {
+		// A Mac's native ollama reads its models from the brew plist's
+		// OLLAMA_MODELS (which the guard pins), not the agent's environment:
+		// a mirror import writes its manifest there.
+		dockerpkg.SetNativeOllamaModelsDir(a.ollama.ModelsDirInUse)
+	}
 	a.hb.SetChatModelStats(func() []heartbeat.ModelStat { return a.server.ChatModelStats(a.lifeCtx()) })
 	if a.native != nil {
 		a.hb.SetModelStats(func() []heartbeat.ModelStat {

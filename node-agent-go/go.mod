@@ -35,7 +35,7 @@ require (
 	github.com/opencontainers/image-spec v1.1.1 // indirect
 	go.opentelemetry.io/otel/sdk/metric v1.45.0 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
-	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/sys v0.49.0
 )
 
 require (
