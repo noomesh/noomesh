@@ -630,7 +630,8 @@ def test_a_release_lane_change_against_the_previous_final_builds_everything():
 
 def test_a_sibling_that_moved_since_the_previous_final_rebuilds_its_images():
     trees = {"stack-v0.6.23-rc.1": "T-new", "stack-v0.6.22": "T-old"}
-    p = _plan(tag="stack-v0.6.23-rc.1", trees=trees, rcs=(), finals=("stack-v0.6.22",), changed=["README.md"],
+    # A path no image builds from, so only the sibling decides.
+    p = _plan(tag="stack-v0.6.23-rc.1", trees=trees, rcs=(), finals=("stack-v0.6.22",), changed=["notes/unrelated.txt"],
               sibs={"trellion": "TRE_MOVED"}, inputs=P.load_inputs())
     assert p["retag"]["trellion"] is False and "!=" in p["why"]["trellion"], p["why"]
     assert p["retag"]["whisper"] is True, p["why"]
