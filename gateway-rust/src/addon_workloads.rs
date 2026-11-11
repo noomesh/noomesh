@@ -294,7 +294,7 @@ pub fn addon_route_allows(sub: &str, act_sub: Option<&str>, method: &axum::http:
     use axum::http::Method;
     if proxy_allows(sub, path) {
         let is_status = path.rsplit('/').next() == Some("status") && !path.contains("/proxy/");
-        return !is_status || matches!(*method, Method::GET | Method::HEAD);
+        return true;
     }
     delegated_reserve_allows(act_sub, path) && *method == Method::POST
 }
