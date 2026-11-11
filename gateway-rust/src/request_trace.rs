@@ -227,6 +227,13 @@ pub struct Summary {
     pub node: Option<String>,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    /// Milliseconds from the request's start to the first upstream frame that
+    /// carries content ([`note_first_token`]). `None`: none arrived.
+    pub ttft_ms: Option<i64>,
+    /// Milliseconds from the request's start until the node agent stopped
+    /// reporting it queued for a backend slot ([`note_queue_end`]). `None`:
+    /// it never queued.
+    pub queue_wait_ms: Option<i64>,
 }
 
 /// One request's trace while it runs.
@@ -302,6 +309,11 @@ impl Recorder {
 
     pub fn trace_id_hex(&self) -> String {
         hex::encode(self.ctx().trace_id)
+    }
+
+    /// Milliseconds since this request started.
+    fn elapsed_ms(&self) -> i64 {
+        (now_ns().saturating_sub(self.start_ns) / 1_000_000) as i64
     }
 
     fn with_summary(&self, f: impl FnOnce(&mut Summary)) {
@@ -415,6 +427,25 @@ pub fn note_served(node: Option<&str>, backend: &str, model: &str) {
     }
 }
 
+/// The first upstream frame that carries content reached `rec`'s request.
+/// The first call wins. Called from the stream tap, which runs outside the
+/// request's task, so the recorder is passed in.
+pub fn note_first_token(rec: &Recorder) {
+    let ms = rec.elapsed_ms();
+    rec.with_summary(|s| {
+        s.ttft_ms.get_or_insert(ms);
+    });
+}
+
+/// The node agent stopped reporting `rec`'s request queued (its first line
+/// after the `: queued` comments). The first call wins.
+pub fn note_queue_end(rec: &Recorder) {
+    let ms = rec.elapsed_ms();
+    rec.with_summary(|s| {
+        s.queue_wait_ms.get_or_insert(ms);
+    });
+}
+
 /// A completion's model, backend, node and tokens, from the usage writer.
 /// Tokens add up across completions in one request (a tool loop).
 pub fn note_usage(node: Option<&str>, backend: &str, model: &str, prompt_tokens: u32, completion_tokens: u32) {
@@ -429,6 +460,19 @@ pub fn note_usage(node: Option<&str>, backend: &str, model: &str, prompt_tokens:
             s.completion_tokens += completion_tokens as i64;
         });
     }
+}
+
+/// Run the future `f` with `rec` as the request in scope. Test-only: other
+/// modules' tests need a request in scope to see what they note on it.
+#[cfg(test)]
+pub(crate) async fn scoped<F: std::future::Future>(rec: Arc<Recorder>, f: F) -> F::Output {
+    CURRENT.scope(rec, f).await
+}
+
+/// A request's recorder for another module's test (a POST to `route`).
+#[cfg(test)]
+pub(crate) fn test_recorder(route: &str) -> Arc<Recorder> {
+    Arc::new(Recorder::new(&Method::POST, route.to_string(), None, None))
 }
 
 /// Run `f` with `rec` as the request in scope: for work that finishes
