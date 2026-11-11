@@ -132,7 +132,7 @@ fn ollama_mirror_name_ok(kind: &str, name: &str) -> bool {
             .and_then(|r| r.strip_suffix(".ollama-manifest"))
             .is_some_and(|stem| {
                 let p: Vec<&str> = stem.split('+').collect();
-                p.len() == 3 && seg(p[0], false) && seg(p[1], true) && seg(p[2], true)
+                p.len() == 3 && seg(p[1], true)
             }),
         _ => true,
     }
