@@ -4,7 +4,7 @@ version: "2.0"
 description: "noomesh CLI + Dashboard guide — help users choose the right interface for the task"
 author: noo-builtin
 tags: [cli, terminal, commands, help, howto, dashboard, ui]
-trigger_keywords: [cli, command, terminal, how to, noo, command line, shell, bash, dashboard, ui, web]
+trigger_keywords: [cli, command, terminal, how to, command line, shell, bash, dashboard]
 priority: 5
 max_context_chars: 6000
 composable: true

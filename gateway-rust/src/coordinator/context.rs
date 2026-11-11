@@ -775,6 +775,19 @@ pub(super) const CLUSTER_FRAME_LABEL: &str = "Cluster nodes (live, as reported b
 
 /// Operator-written guidance for the system message, appended only when a
 /// cluster layer exists. No node-reported string is in it.
+/// Whether the user's words are about running the cluster, the only case
+/// the system prompt carries [`CLUSTER_GUIDANCE`] (≈ 870 estimated tokens).
+/// Whole words only: "noomesh" is not "node", "modelling" is not "model".
+pub(super) fn ops_intent(text: &str) -> bool {
+    const OPS: &[&str] = &[
+        "cluster", "node", "nodes", "backend", "backends", "gpu", "vllm", "ollama", "llamacpp",
+        "deploy", "restart", "heartbeat", "quarantine", "quarantined", "certificate", "tls",
+        "nats", "harness", "placement", "upgrade", "offline", "scale",
+    ];
+    text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
+        .any(|w| OPS.iter().any(|k| w.eq_ignore_ascii_case(k)))
+}
+
 pub(super) const CLUSTER_GUIDANCE: &str = "\n\n## Cluster Nodes (live)\n\
      The online nodes and their backends are listed in the reference data block of the user's message.\n\
      - For \"what is running on <node>\" or any node/cluster status question, call noo_cluster_status and answer from its LIVE output — never from memory or the knowledge graph, which go stale.\n\
@@ -1396,5 +1409,93 @@ mod data_frame_tests {
             assert!(super::super::with_shared_room(true, async { super::super::in_shared_room() }).await);
             assert!(!super::super::with_shared_room(false, async { super::super::in_shared_room() }).await);
         });
+    }
+}
+
+#[cfg(test)]
+mod system_prompt_budget_tests {
+    use super::*;
+
+    /// The repo root, where prompts/ lives; None in an image built without it.
+    fn repo_root() -> Option<std::path::PathBuf> {
+        for root in ["../..", "..", ".", "/build", "/repo"] {
+            let p = std::path::Path::new(root);
+            if p.join("prompts/coordinator.md").is_file() && p.join("prompts/skills/core").is_dir() {
+                return Some(p.to_path_buf());
+            }
+        }
+        None
+    }
+
+    /// The estimator `request_size` logs with (chars x 10 / 25).
+    fn est_tokens(s: &str) -> usize {
+        s.len() * 10 / 25
+    }
+
+    /// The system prompt a task loop sends for `objective`, from the shipped
+    /// files: persona, cluster guidance on ops intent only, the clock rule,
+    /// and the skills the objective selects.
+    fn system_prompt_for(root: &std::path::Path, objective: &str) -> String {
+        let mut s = std::fs::read_to_string(root.join("prompts/coordinator.md")).unwrap().trim().to_string();
+        if ops_intent(objective) {
+            s.push_str(CLUSTER_GUIDANCE);
+        }
+        s.push_str(CLOCK_RULE);
+        let reg = crate::prompt_skills::SkillRegistry::scan(root);
+        for skill in crate::prompt_skills::select(&reg, objective, "coordinator", &[], &[]) {
+            s.push_str("\n\n");
+            s.push_str(&skill.to_injection_text());
+        }
+        s
+    }
+
+    /// The operator's efficiency rule, measured: a one-word task sent an
+    /// 8,380 estimated-token system prompt on 2026-11-11 (awolf harness,
+    /// `request_size`), on every model call. A non-ops task's system prompt
+    /// now stays under this budget; the persona split (0.6.25) lowers it.
+    const NON_OPS_SYSTEM_BUDGET: usize = 5_300;
+
+    #[test]
+    fn a_non_ops_task_system_prompt_stays_under_its_budget() {
+        let Some(root) = repo_root() else {
+            if std::env::var("NOO_SKILL_CORPUS_REQUIRED").is_ok() {
+                panic!("prompts/ not found but NOO_SKILL_CORPUS_REQUIRED is set");
+            }
+            eprintln!("SKIPPED (no prompts/): mount the repo to run the budget test");
+            return;
+        };
+        for objective in ["Reply with the single word ok and finish.", "Write me a short poem about autumn.", "What is on my calendar tomorrow?"] {
+            let sys = system_prompt_for(&root, objective);
+            assert!(!sys.contains("## Cluster Nodes (live)"), "{objective:?}: cluster guidance without ops intent");
+            assert!(est_tokens(&sys) <= NON_OPS_SYSTEM_BUDGET, "{objective:?}: {} estimated tokens > {NON_OPS_SYSTEM_BUDGET}", est_tokens(&sys));
+        }
+        // An ops objective still gets the guidance and the operator skill.
+        let ops = system_prompt_for(&root, "Restart the vllm backend on node awolf");
+        assert!(ops.contains("## Cluster Nodes (live)") && ops.contains("## Skill: cluster-operator"), "{}", &ops[ops.len().saturating_sub(400)..]);
+    }
+
+    #[test]
+    fn ops_intent_is_whole_words_about_running_the_cluster() {
+        for yes in ["restart the vllm backend", "why is node awolf offline", "rotate the TLS certificate", "scale the cluster"] {
+            assert!(ops_intent(yes), "{yes}");
+        }
+        for no in ["Reply with the single word ok", "noomesh is great", "a model aeroplane", "write a poem about nodes of light"] {
+            // "nodes" is an ops word; the last one shows the bound is
+            // words, not meaning: it is accepted as ops on purpose.
+            if no.contains("nodes") {
+                assert!(ops_intent(no));
+            } else {
+                assert!(!ops_intent(no), "{no}");
+            }
+        }
+    }
+
+    /// The wrapper of a task never reaches selection: only the owner's words.
+    #[test]
+    fn a_tasks_selection_text_is_the_owners_words_only() {
+        let s = crate::tasks::selection_text("Book a table", Some("for two"), Some("near the office"));
+        assert_eq!(s, "Book a table\n\nfor two\n\nnear the office");
+        assert!(!s.contains("noo_agent_message") && !s.contains("noo_task_done"));
+        assert_eq!(crate::tasks::selection_text("  x  ", None, Some("  ")), "x");
     }
 }
