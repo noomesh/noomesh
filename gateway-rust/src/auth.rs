@@ -5030,8 +5030,10 @@ mod tests {
     /// before the bearer, refused (403) for everything else, and not public.
     #[test]
     fn the_scrape_target_list_is_decided_before_the_bearer_and_is_not_public() {
-        let src = include_str!("auth.rs");
-        let body = src.split("pub async fn require_any_auth(").nth(1).expect("middleware");
+        // own_code + fn_body: both needles must be found inside the
+        // middleware itself, never in a later function or in this test.
+        let code = crate::test_src::own_code(include_str!("auth.rs"));
+        let body = crate::test_src::fn_body(&code, "pub async fn require_any_auth(");
         let branch = body.find("if path == SCRAPE_TARGETS_PATH \u{7b}").expect("the scrape-targets branch");
         let bearer = body.find("let token = bearer_token(&request);").expect("the bearer read");
         assert!(branch < bearer, "the leaf check must come before the bearer");
