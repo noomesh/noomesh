@@ -713,6 +713,7 @@ async fn main() -> Result<()> {
     autonomy_audit::spawn(state.clone());
     // Request tracing (i359): the Tempo exporter and the 30-day summary prune.
     request_trace::spawn(state.clone());
+    coordinator::expected_wait::spawn(state.clone());
 
     // Autonomy engine — periodic evaluation of monitor locations
     // (cluster health, backend availability, cert expiry, etc.). All
