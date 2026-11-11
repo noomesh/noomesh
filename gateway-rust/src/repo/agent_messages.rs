@@ -237,7 +237,7 @@ pub async fn list(db: &PgPool, f: &Filter<'_>) -> Result<Vec<Value>, sqlx::Error
     if let Some(v) = f.node { push(&mut sql, " AND from_node = $N", v); }
     if let Some(v) = f.harness { push(&mut sql, " AND from_harness = $N", v); }
     match f.orphans {
-        OrphanView::Hide => sql.push_str(" AND NOT EXISTS (SELECT 1 FROM noo_agent_orphans o WHERE o.message_id = noo_agent_messages.id)"),
+        OrphanView::Hide => {}
         OrphanView::OnlyOf(account) => push(&mut sql, " AND EXISTS (SELECT 1 FROM noo_agent_orphans o WHERE o.message_id = noo_agent_messages.id AND o.account = $N)", account),
     }
     let since_idx = f.since.map(|_| { n += 1; sql.push_str(&format!(" AND ts >= ${n}")); n });
