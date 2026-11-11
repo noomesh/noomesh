@@ -268,7 +268,7 @@ pub async fn resolve_as(db: &PgPool, account: &str, consumer: &str, ty: &str, ra
                     None => Ok(c),
                 };
             }
-            Ok(None) => continue,
+            Ok(None) => return Ok(c),
             Err(e) => {
                 tracing::warn!(error = %e, account, "mailbox lookup failed");
                 return Err(AsRefusal::Unregistered(part));
