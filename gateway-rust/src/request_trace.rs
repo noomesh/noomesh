@@ -396,6 +396,25 @@ pub fn note_principal(p: &crate::bus_principal::Principal) {
     }
 }
 
+/// What serves this request, noted when the candidate is CHOSEN (raw_chat,
+/// at commit), before any usage exists. A streamed answer's backend, model
+/// and node otherwise reached its trace only through [`note_usage`], when
+/// the stream's usage frame arrived; a stream the caller dropped first (a
+/// client timer, a backend that died) kept none, and 191 empty 40 s paiserve
+/// calls read as "no backend" until the logs were matched by hand (speed
+/// review 2026-11-11). Tokens are left to [`note_usage`].
+pub fn note_served(node: Option<&str>, backend: &str, model: &str) {
+    if let Some(r) = current() {
+        r.with_summary(|s| {
+            s.model = Some(model.to_string());
+            s.backend = Some(backend.to_string());
+            if let Some(n) = node {
+                s.node = Some(n.to_string());
+            }
+        });
+    }
+}
+
 /// A completion's model, backend, node and tokens, from the usage writer.
 /// Tokens add up across completions in one request (a tool loop).
 pub fn note_usage(node: Option<&str>, backend: &str, model: &str, prompt_tokens: u32, completion_tokens: u32) {
@@ -1023,6 +1042,27 @@ mod tests {
     #[test]
     fn an_unmatched_path_is_not_recorded_as_itself() {
         assert_eq!(route_of(None), "<unmatched>");
+    }
+
+    /// A stream whose usage frame never arrives still names what served it;
+    /// when usage does arrive, it adds the tokens to the same attribution.
+    #[tokio::test]
+    async fn what_served_is_on_the_trace_from_commit_with_or_without_usage() {
+        note_served(Some("node-a"), "vllm", "m"); // no request in scope: nothing to note on
+        let dropped = Arc::new(Recorder::new(&Method::POST, "/api/external/chat/completions".into(), None, None));
+        CURRENT.scope(dropped.clone(), async { note_served(Some("mcmini"), "ollama", "gemma4:12b") }).await;
+        let s = dropped.summary();
+        assert_eq!((s.node.as_deref(), s.backend.as_deref(), s.model.as_deref()), (Some("mcmini"), Some("ollama"), Some("gemma4:12b")));
+        assert_eq!((s.prompt_tokens, s.completion_tokens), (0, 0), "no usage, no tokens");
+        let finished = Arc::new(Recorder::new(&Method::POST, "/v1/chat/completions".into(), None, None));
+        CURRENT
+            .scope(finished.clone(), async {
+                note_served(Some("awolf"), "vllm", "gemma");
+                note_usage(Some("awolf"), "vllm", "gemma", 4100, 64);
+            })
+            .await;
+        let s = finished.summary();
+        assert_eq!((s.node.as_deref(), s.backend.as_deref(), s.prompt_tokens, s.completion_tokens), (Some("awolf"), Some("vllm"), 4100, 64));
     }
 
     #[tokio::test]

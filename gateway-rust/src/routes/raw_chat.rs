@@ -693,6 +693,9 @@ where
         rank = %cand.rank,
         attempt = ok.attempts, fallback = served.fallback, stream, source, "raw_chat_served"
     );
+    // On the request's trace NOW, not only when a usage frame arrives: a
+    // stream the caller drops first still names what served it.
+    crate::request_trace::note_served(Some(&cand.node_id), &cand.backend, &cand.model);
     // Rebuilt per attempt: usage is charged to the candidate that answered.
     let usage = StreamUsageCtx {
         db: state.db.clone(),
@@ -1615,5 +1618,19 @@ mod tests {
         assert!(can_aggregate(CHAT_PATH, &json!({"n": 1})));
         assert!(!can_aggregate(CHAT_PATH, &json!({"n": 2})), "the aggregator folds one choice");
         assert!(!can_aggregate("/v1/responses", &json!({})), "the native Responses stream has its own frames");
+    }
+}
+
+#[cfg(test)]
+mod served_trace_tests {
+    /// The candidate that answers is noted on the request's trace at commit,
+    /// right where `raw_chat_served` is logged, for streams and bodies alike.
+    #[test]
+    fn the_served_candidate_is_noted_on_the_trace_at_commit() {
+        let code = crate::test_src::own_code(include_str!("raw_chat.rs"));
+        let at_log = code.find("\"raw_chat_served\"").expect("the served log line");
+        let note = code.find("crate::request_trace::note_served(Some(&cand.node_id), &cand.backend, &cand.model)").expect("note_served at commit");
+        let branch = code.find("CoreBody::Stream(resp) => Ok(Outcome::Stream").expect("the stream arm");
+        assert!(at_log < note && note < branch, "noted after the candidate is chosen and before the stream/body split");
     }
 }
