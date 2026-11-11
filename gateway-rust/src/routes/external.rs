@@ -1473,7 +1473,7 @@ mod classify_speed_tests {
         let f = crate::test_src::fn_body(&code, "async fn do_classify(");
         assert!(f.contains(".buffered(CLASSIFY_PARALLEL)") && !f.contains("buffer_unordered"), "{f}");
         assert!(!f.contains("classify_one(&client, &url, &backend, text, &labels, multi).await"), "no sequential await: {f}");
-        assert!(super::CLASSIFY_PARALLEL > 1 && super::CLASSIFY_PARALLEL <= 8, "bounded");
+        const { assert!(super::CLASSIFY_PARALLEL > 1 && super::CLASSIFY_PARALLEL <= 8, "bounded") };
         let one = crate::test_src::fn_body(&code, "async fn classify_one(");
         assert!(one.contains("classify_body(backend, &instruction, text)"), "{one}");
     }
