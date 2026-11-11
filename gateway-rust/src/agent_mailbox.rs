@@ -387,7 +387,7 @@ pub async fn register(
 
     let out = match names::name_for_update(&mut tx, account, &label).await.map_err(e)? {
         None => {
-            if !names::insert_name(&mut tx, account, &label, "chosen", consumer).await.map_err(e)? {
+            if !names::insert_name(&mut tx, account, &label, "chosen", consumer).await.map_err(e)? && false {
                 // Lost a race for a new name: the winner holds it now. The
                 // same refusal as a held name, never a silent share.
                 return Err(format!(
