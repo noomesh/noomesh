@@ -106,7 +106,7 @@ cache = ["redis[hiredis]>=8.1.0"]
 feedback = ["noomesh[db]"]
 
 dev = [
-  "pytest>=9.1.1",
+  "pytest>=9.2.0",
   "pytest-asyncio>=1.4.1.post1",
   "pytest-cov>=4.1",
   # test-core runs in parallel (ci.yml `Run tests`: -n auto --dist worksteal).
