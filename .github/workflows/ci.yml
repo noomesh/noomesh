@@ -633,11 +633,21 @@ jobs:
   go-node-agent:
     runs-on: ubuntu-latest
     needs: [preflight, scope]
-    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.scope.result == 'success' }}
+    if: ${{ !cancelled() && needs.preflight.result == 'success' }}
     defaults:
       run:
         working-directory: node-agent-go
     steps:
+    # A failed or cancelled `scope` FAILS this required lane instead of
+    # skipping it: a skipped job reports Success to a required check (GitHub
+    # docs), so a broken scope would otherwise pass every lane it gates.
+    - name: Scope must have succeeded
+      if: needs.scope.result != 'success'
+      env:
+        SCOPE_RESULT: ${{ needs.scope.result }}
+      run: |
+        echo "::error::the scope job ended '$SCOPE_RESULT': this lane cannot know what changed, so it fails rather than skip"
+        exit 1
 
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -669,8 +679,18 @@ jobs:
   rust-gateway:
     runs-on: ubuntu-latest
     needs: [preflight, scope]
-    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.scope.result == 'success' }}
+    if: ${{ !cancelled() && needs.preflight.result == 'success' }}
     steps:
+    # A failed or cancelled `scope` FAILS this required lane instead of
+    # skipping it: a skipped job reports Success to a required check (GitHub
+    # docs), so a broken scope would otherwise pass every lane it gates.
+    - name: Scope must have succeeded
+      if: needs.scope.result != 'success'
+      env:
+        SCOPE_RESULT: ${{ needs.scope.result }}
+      run: |
+        echo "::error::the scope job ended '$SCOPE_RESULT': this lane cannot know what changed, so it fails rather than skip"
+        exit 1
 
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -938,7 +958,7 @@ jobs:
     # `needs: scope` only reads the diff: it gates the work, not the job, so a
     # required check never hangs Pending.
     needs: [scope]
-    if: ${{ !cancelled() && needs.scope.result == 'success' }}
+    if: ${{ !cancelled() }}
     services:
       postgres:
         # pgvector, not plain postgres: the migrations create `vector` columns.
@@ -974,6 +994,16 @@ jobs:
       NOO_EVOLVE_DB_PASSWORD: ci-ephemeral-not-a-secret
       NOO_TRELLION_DB_PASSWORD: ci-ephemeral-not-a-secret
     steps:
+    # A failed or cancelled `scope` FAILS this required lane instead of
+    # skipping it: a skipped job reports Success to a required check (GitHub
+    # docs), so a broken scope would otherwise pass every lane it gates.
+    - name: Scope must have succeeded
+      if: needs.scope.result != 'success'
+      env:
+        SCOPE_RESULT: ${{ needs.scope.result }}
+      run: |
+        echo "::error::the scope job ended '$SCOPE_RESULT': this lane cannot know what changed, so it fails rather than skip"
+        exit 1
     # persist-credentials: false: no token header shadows anything git runs
     # from the workspace.
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -1264,7 +1294,7 @@ jobs:
   router-harness:
     runs-on: ubuntu-latest
     needs: [preflight, scope]
-    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.scope.result == 'success' }}
+    if: ${{ !cancelled() && needs.preflight.result == 'success' }}
     services:
       postgres:
         # pgvector, not plain postgres: the migrations create `vector` columns.
@@ -1300,6 +1330,16 @@ jobs:
       NOO_EVOLVE_DB_PASSWORD: ci-ephemeral-not-a-secret
       NOO_TRELLION_DB_PASSWORD: ci-ephemeral-not-a-secret
     steps:
+    # A failed or cancelled `scope` FAILS this required lane instead of
+    # skipping it: a skipped job reports Success to a required check (GitHub
+    # docs), so a broken scope would otherwise pass every lane it gates.
+    - name: Scope must have succeeded
+      if: needs.scope.result != 'success'
+      env:
+        SCOPE_RESULT: ${{ needs.scope.result }}
+      run: |
+        echo "::error::the scope job ended '$SCOPE_RESULT': this lane cannot know what changed, so it fails rather than skip"
+        exit 1
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       with:
         persist-credentials: false
@@ -1375,11 +1415,21 @@ jobs:
   noo-cli:
     runs-on: ubuntu-latest
     needs: [preflight, scope]
-    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.scope.result == 'success' }}
+    if: ${{ !cancelled() && needs.preflight.result == 'success' }}
     defaults:
       run:
         working-directory: noo-cli
     steps:
+    # A failed or cancelled `scope` FAILS this required lane instead of
+    # skipping it: a skipped job reports Success to a required check (GitHub
+    # docs), so a broken scope would otherwise pass every lane it gates.
+    - name: Scope must have succeeded
+      if: needs.scope.result != 'success'
+      env:
+        SCOPE_RESULT: ${{ needs.scope.result }}
+      run: |
+        echo "::error::the scope job ended '$SCOPE_RESULT': this lane cannot know what changed, so it fails rather than skip"
+        exit 1
 
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -1594,8 +1644,18 @@ jobs:
   standalone-smoke:
     runs-on: ubuntu-latest
     needs: [preflight, scope]
-    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.scope.result == 'success' }}
+    if: ${{ !cancelled() && needs.preflight.result == 'success' }}
     steps:
+    # A failed or cancelled `scope` FAILS this required lane instead of
+    # skipping it: a skipped job reports Success to a required check (GitHub
+    # docs), so a broken scope would otherwise pass every lane it gates.
+    - name: Scope must have succeeded
+      if: needs.scope.result != 'success'
+      env:
+        SCOPE_RESULT: ${{ needs.scope.result }}
+      run: |
+        echo "::error::the scope job ended '$SCOPE_RESULT': this lane cannot know what changed, so it fails rather than skip"
+        exit 1
 
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
