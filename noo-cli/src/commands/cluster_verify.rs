@@ -791,8 +791,9 @@ pub(crate) fn hardened_images_check(n: &Value) -> Option<Check> {
 }
 
 /// The node agent's default image namespace (Go `DefaultImagePrefix`): a
-/// node resolves a door pin's ref under `NOO_IMAGE_PREFIX`, else this.
-const AGENT_DEFAULT_IMAGE_PREFIX: &str = "ghcr.io/noomesh";
+/// node resolves a door pin's ref under `NOO_IMAGE_PREFIX`, else this. From
+/// the declared home (`registry::IMAGE_NAMESPACE`), never typed out here.
+const AGENT_DEFAULT_IMAGE_PREFIX: &str = crate::registry::IMAGE_NAMESPACE;
 
 /// The pinned doors among a node's running placements, each with what the
 /// controller's rail staged it by for `arch`: `state` is `staged` (with
@@ -863,7 +864,7 @@ pub(crate) fn door_pin_check(n: &Value) -> Option<Check> {
             (Some("staged"), Some("")) => bad.push(format!("{label} is staged by name, pinned {pin}")),
             (Some("staged"), Some(by)) => bad.push(format!("{label} is staged by {by}, pinned {pin}")),
             (Some("unknown"), _) => unknown.push(label),
-            _ => bad.push(format!("{label} is not staged on the rail")),
+            _ => bad.push(format!("{label} is not staged on the rail, pinned {pin}")),
         }
     }
     if !bad.is_empty() {
