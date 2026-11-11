@@ -2528,19 +2528,6 @@ pub const NODE_MODEL_SET_RETRY_REVISION: &str = "120_node_model_set_retry";
 /// lands after it renumbers. A constant so a renumber at rebase is one line.
 pub const CONVERSATION_SOURCES_REVISION: &str = "121_conversation_sources";
 
-/// Whether the chain creates `col` on `noo_request_trace`: in the request-trace
-/// revision's own CREATE TABLE, or in a later additive
-/// `ALTER TABLE noo_request_trace ADD COLUMN IF NOT EXISTS <col> ` (the TTFT
-/// columns, 122). The writer and reader guards ask this, so a column added the
-/// additive way is not mistaken for one that was never created.
-#[cfg(test)]
-pub(crate) fn request_trace_creates(col: &str) -> bool {
-    MIGRATIONS.iter().any(|m| {
-        (m.revision == REQUEST_TRACE_REVISION && m.sql.contains(&format!("\n    {col} ")))
-            || m.sql.contains(&format!("ALTER TABLE noo_request_trace ADD COLUMN IF NOT EXISTS {col} "))
-    })
-}
-
 /// `ttft_ms` and `queue_wait_ms` on the request trace (speed review), on the
 /// conversation source ledger (121): numbered at rebase against dev's real
 /// head. A constant so a renumber is one line.
@@ -3121,6 +3108,21 @@ pub async fn report(db: &PgPool) {
         },
         Err(e) => tracing::warn!(error = %e, "mesh migration runner: version read failed"),
     }
+}
+
+// Test-only, so it sits below every revision constant: the release script
+// (scripts/mesh-migration-head.sh) stops reading at the first cfg(test) attribute.
+/// Whether the chain creates `col` on `noo_request_trace`: in the request-trace
+/// revision's own CREATE TABLE, or in a later additive
+/// `ALTER TABLE noo_request_trace ADD COLUMN IF NOT EXISTS <col> ` (the TTFT
+/// columns, 122). The writer and reader guards ask this, so a column added the
+/// additive way is not mistaken for one that was never created.
+#[cfg(test)]
+pub(crate) fn request_trace_creates(col: &str) -> bool {
+    MIGRATIONS.iter().any(|m| {
+        (m.revision == REQUEST_TRACE_REVISION && m.sql.contains(&format!("\n    {col} ")))
+            || m.sql.contains(&format!("ALTER TABLE noo_request_trace ADD COLUMN IF NOT EXISTS {col} "))
+    })
 }
 
 #[cfg(test)]
