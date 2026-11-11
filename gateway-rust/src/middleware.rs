@@ -1221,13 +1221,9 @@ async fn wait_for_exec_approval(
     // decide from the alert. This tightens nothing and loosens nothing: the
     // call still does not run without an approval.
     if nobody_can_be_asked(asked, consoles) {
-        let _ = sqlx::query(
-            "UPDATE noo_approval_requests SET status = 'expired', resolved_at = NOW(), resolved_by = 'nobody to ask' \
-             WHERE request_id = $1 AND status = 'pending'",
-        )
-        .bind(&request_id)
-        .execute(&state.db)
-        .await;
+        if let Err(e) = crate::repo::approval_requests::expire_unreachable(&state.db, &request_id).await {
+            tracing::warn!(request_id = %request_id, error = %e, "exec_approval.expire_unreachable_failed");
+        }
         crate::audit::record(
             &state.db,
             AuditEvent::new(AuditKind::ExecApprovalDecided, "gateway", &format!("tool:{}", call.name))
@@ -2417,7 +2413,10 @@ mod tool_risk_context_tests {
         let body = crate::test_src::fn_body(&code, "async fn wait_for_exec_approval(");
         let check = body.find("if nobody_can_be_asked(asked, consoles)").expect("the check");
         let refusal = &body[check..body.find("loop {").expect("the polling loop")];
-        assert!(refusal.contains("SET status = 'expired'") && refusal.contains("return ExecApprovalOutcome::Unreachable"), "{refusal}");
+        assert!(refusal.contains("repo::approval_requests::expire_unreachable(&state.db, &request_id)") && refusal.contains("return ExecApprovalOutcome::Unreachable"), "{refusal}");
+        let repo = crate::test_src::own_code(include_str!("repo/approval_requests.rs"));
+        let expire = crate::test_src::fn_body(&repo, "pub async fn expire_unreachable(");
+        assert!(expire.contains("SET status = 'expired'") && expire.contains("WHERE request_id = $1 AND status = 'pending'"), "{expire}");
         let admin = crate::test_src::own_code(include_str!("routes/admin.rs"));
         let approve = crate::test_src::fn_body(&admin, "async fn approval_approve(");
         assert!(approve.contains("WHERE request_id = $1 AND status = 'pending'"), "approve acts on pending rows only");
