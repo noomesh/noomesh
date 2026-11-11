@@ -243,6 +243,11 @@ jobs:
     steps:
       - name: Checkout   # actions/checkout@v7.0.1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          # Full history (blobs on demand): scripts/build-epoch.py dates the
+          # image's inputs, and a shallow log would date them all to HEAD.
+          fetch-depth: 0
+          filter: blob:none
 
       # Hosted runner: no persistent builder or disk. A docker-container
       # builder (multi-platform, type=gha layer cache) and a roomier disk.
@@ -309,7 +314,14 @@ jobs:
           # Controller-side image: amd64 only, same policy as deps-base.
           # Retried only on a transient registry error (`unknown blob`, Hub
           # auth/rate answers, 5xx, resets); a failed build step is not.
-          scripts/retry-registry.sh docker buildx build --push \
+          # Reproducible layers (2026-11-11): every file time in a layer is
+          # clamped to the newest commit touching this image's inputs, so an
+          # unchanged layer keeps its digest and nodes do not download it again.
+          # Assigned, then exported: `export X="$(…)"` would hide a refusal.
+          SOURCE_DATE_EPOCH="$(python3 scripts/build-epoch.py deps-core)"
+          export SOURCE_DATE_EPOCH
+          scripts/retry-registry.sh docker buildx build \
+            --output type=registry,rewrite-timestamp=true \
             --platform linux/amd64 \
             -f docker/Dockerfile.deps-core \
             --cache-from type=gha,scope=deps-core \
@@ -352,6 +364,11 @@ jobs:
     steps:
       - name: Checkout   # actions/checkout@v7.0.1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          # Full history (blobs on demand): scripts/build-epoch.py dates the
+          # image's inputs, and a shallow log would date them all to HEAD.
+          fetch-depth: 0
+          filter: blob:none
 
       # Hosted runner: no persistent builder or disk. A docker-container
       # builder (multi-platform, type=gha layer cache) and a roomier disk.
@@ -488,7 +505,14 @@ jobs:
           # this base. (nvidia-cudnn-cu13 also has no clean arm64 wheel.)
           # Retried only on a transient registry error (`unknown blob`, Hub
           # auth/rate answers, 5xx, resets); a failed build step is not.
-          scripts/retry-registry.sh docker buildx build --push \
+          # Reproducible layers (2026-11-11): every file time in a layer is
+          # clamped to the newest commit touching this image's inputs, so an
+          # unchanged layer keeps its digest and nodes do not download it again.
+          # Assigned, then exported: `export X="$(…)"` would hide a refusal.
+          SOURCE_DATE_EPOCH="$(python3 scripts/build-epoch.py deps-base)"
+          export SOURCE_DATE_EPOCH
+          scripts/retry-registry.sh docker buildx build \
+            --output type=registry,rewrite-timestamp=true \
             --platform linux/amd64 \
             -f docker/Dockerfile.deps-base \
             --cache-from type=gha,scope=deps-base \
@@ -718,6 +742,11 @@ jobs:
     steps:
       - name: Checkout   # actions/checkout@v7.0.1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          # Full history (blobs on demand): scripts/build-epoch.py dates the
+          # image's inputs, and a shallow log would date them all to HEAD.
+          fetch-depth: 0
+          filter: blob:none
 
       # Hosted runner: no persistent builder or disk. A docker-container
       # builder (multi-platform, type=gha layer cache) and a roomier disk.
@@ -838,7 +867,14 @@ jobs:
           set -eux
           # Retried only on a transient registry error (`unknown blob`, Hub
           # auth/rate answers, 5xx, resets); a failed build step is not.
-          scripts/retry-registry.sh docker buildx build --push \
+          # Reproducible layers (2026-11-11): every file time in a layer is
+          # clamped to the newest commit touching this image's inputs, so an
+          # unchanged layer keeps its digest and nodes do not download it again.
+          # Assigned, then exported: `export X="$(…)"` would hide a refusal.
+          SOURCE_DATE_EPOCH="$(python3 scripts/build-epoch.py "${{ matrix.image }}")"
+          export SOURCE_DATE_EPOCH
+          scripts/retry-registry.sh docker buildx build \
+            --output type=registry,rewrite-timestamp=true \
             --platform "${{ matrix.platforms }}" \
             -f "${{ matrix.dockerfile }}" \
             --cache-from type=gha,scope=${{ matrix.name }} \

@@ -79,6 +79,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: dev
+          # Full history (blobs on demand) for scripts/build-epoch.py.
+          fetch-depth: 0
+          filter: blob:none
 
       - name: Free disk (preinstalled toolchains the build does not use)
         run: scripts/ci-free-disk.sh
@@ -144,7 +147,14 @@ jobs:
       - name: Build + push ${{ matrix.image }}:${{ env.DATE_TAG }}
         run: |
           set -eux
-          scripts/retry-registry.sh docker buildx build --push \
+          # Reproducible layers (2026-11-11): every file time in a layer is
+          # clamped to the newest commit touching this image's inputs, so an
+          # unchanged layer keeps its digest and nodes do not download it again.
+          # Assigned, then exported: `export X="$(…)"` would hide a refusal.
+          SOURCE_DATE_EPOCH="$(python3 scripts/build-epoch.py "${{ matrix.image }}")"
+          export SOURCE_DATE_EPOCH
+          scripts/retry-registry.sh docker buildx build \
+            --output type=registry,rewrite-timestamp=true \
             --platform "${{ matrix.platforms }}" \
             -f "${{ matrix.dockerfile }}" \
             --build-arg DHI_REGISTRY=dhi.io \

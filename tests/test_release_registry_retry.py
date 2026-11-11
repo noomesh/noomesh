@@ -78,7 +78,7 @@ def _steps(doc, job):
 
 def test_every_release_image_build_goes_through_the_retry():
     text = IMAGES.read_text()
-    builds = re.findall(r"^\s*(\S.*)docker buildx build --push", text, re.M)
+    builds = re.findall(r"^\s*(\S.*)docker buildx build \\$", text, re.M)
     assert len(builds) == 3 and all(b.strip() == "scripts/retry-registry.sh" for b in builds), builds
 
 
