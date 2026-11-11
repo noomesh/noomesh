@@ -81,9 +81,10 @@ func openManifestDir(modelsDir, ns, name string) (int, int, int, error) {
 	if err := unix.Lstat(clean, &st); err != nil {
 		return -1, 0, 0, fmt.Errorf("ollama's model store %s: %w", clean, err)
 	}
-	if st.Mode&unix.S_IFMT != unix.S_IFDIR {
-		return -1, 0, 0, fmt.Errorf("ollama's model store %s is a symlink or not a directory — refusing to write through it", clean)
-	}
+	// Lstat only names the owner every check below compares with. Whether the
+	// store is a real directory is decided by the fd walk (the last component
+	// is never followed as a link and must open as a directory), and the
+	// opened store must still be owned by that uid.
 	uid, gid := int(st.Uid), int(st.Gid)
 
 	fd, err := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
@@ -99,6 +100,11 @@ func openManifestDir(modelsDir, ns, name string) (int, int, int, error) {
 			return -1, 0, 0, err
 		}
 		fd = nfd
+	}
+	var sst unix.Stat_t
+	if err := unix.Fstat(fd, &sst); err != nil || int(sst.Uid) != uid {
+		unix.Close(fd)
+		return -1, 0, 0, fmt.Errorf("ollama's model store %s changed owner while it was opened — refusing", clean)
 	}
 	for _, c := range []string{"manifests", "registry.ollama.ai", ns, name} {
 		nfd, err := openOrMakeOwnedDir(fd, c, uid, gid)
@@ -121,7 +127,7 @@ func openAncestor(dirfd int, comp string, last bool, owner int, shown string) (i
 	flags := unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC
 	if lst.Mode&unix.S_IFMT == unix.S_IFLNK {
 		if last || lst.Uid != 0 {
-			return -1, fmt.Errorf("%s is a symlink (owned by uid %d) — only root-owned system links above the store are followed; refusing", shown, lst.Uid)
+			return -1, fmt.Errorf("%s is a symlink (owned by uid %d) — the store itself is never followed, and only root-owned system links above it are; refusing", shown, lst.Uid)
 		}
 	} else {
 		flags |= unix.O_NOFOLLOW
