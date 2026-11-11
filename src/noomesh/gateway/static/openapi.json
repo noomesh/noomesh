@@ -22411,6 +22411,29 @@
           }
         }
       }
+    },
+    "/api/internal/prometheus/targets/node-agents": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get node agents",
+        "description": "[native] `GET /api/internal/prometheus/targets/node-agents`: the scraper's leaf only. Answers the http_sd list of node agents whose leaf covers the address they are scraped at.",
+        "operationId": "node_agent_targets",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

@@ -2217,6 +2217,64 @@ pub(crate) fn model_memory_check(reports: &[(String, Option<Value>)]) -> Check {
 /// 0.6.24: unread agent mail whose mailbox retired before it was read. It
 /// is kept for the account owner, not lost; this row makes sure someone
 /// looks. A warning: nothing is broken, a message is waiting.
+/// The host of an agent URL (`https://host:port/...`), IPv6 brackets removed.
+pub(crate) fn agent_url_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("")
+    } else {
+        authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+    };
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+/// The `agent metrics` row (i669): how many registered node agents
+/// Prometheus scrapes (`up{job="noo_node_agent"}`), naming each one it does
+/// not and why. A node the gateway leaves out of the scrape list (its leaf
+/// has no SAN for its address) has no series and counts as NOT scraped, so
+/// it can never read as healthy.
+///
+/// `nodes`: (id, agent_url host). `up`: the gateway's `/api/metrics/query`
+/// answer. `covers(id, host)`: whether the node's public leaf has a SAN for
+/// the host; `None` when it cannot be read.
+pub(crate) fn agent_metrics_check(nodes: &[(String, String)], up: Option<&Value>, covers: &dyn Fn(&str, &str) -> Option<bool>) -> Check {
+    const NAME: &str = "agent metrics";
+    let Some(up) = up else {
+        return warn(NAME, "Prometheus was not asked or did not answer (`up{job=\"noo_node_agent\"}`)", None);
+    };
+    if nodes.is_empty() {
+        return ok(NAME, "no registered node agents");
+    }
+    let mut series = std::collections::BTreeMap::new();
+    for r in up["result"].as_array().into_iter().flatten() {
+        if let (Some(node), Some(v)) = (r["metric"]["node"].as_str(), r["value"].get(1).and_then(Value::as_str)) {
+            series.insert(node.to_string(), v == "1");
+        }
+    }
+    let mut not = Vec::new();
+    let mut remedy = None;
+    for (id, host) in nodes {
+        match series.get(id) {
+            Some(true) => continue,
+            Some(false) => not.push(format!("{id} (the scrape of {host}:8081 is failing: Prometheus targets page)")),
+            None => match covers(id, host) {
+                Some(false) => {
+                    not.push(format!("{id} (its leaf has no SAN for {host}, so the gateway leaves it out)"));
+                    remedy.get_or_insert(format!("noo security pki issue-node {id} {host}"));
+                }
+                Some(true) => not.push(format!("{id} (not in the scrape list yet: the gateway refreshes it every minute; see its log for scrape_target_skipped)")),
+                None => not.push(format!("{id} (no readable public leaf for it on this controller)")),
+            },
+        }
+    }
+    let total = nodes.len();
+    if not.is_empty() {
+        return warn(NAME, format!("{}/{total} node agents scraped; not: {}", total - not.len(), not.join("; ")), remedy);
+    }
+    ok(NAME, format!("{total}/{total} node agents scraped"))
+}
+
 pub(crate) fn agent_mail_check(body: Option<&Value>) -> Check {
     const NAME: &str = "agent mail";
     let Some(body) = body else {
@@ -7001,6 +7059,18 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(model_memory_check(&fits));
         // 0.6.24: mail left unread when a conversation's mailbox retired.
         checks.push(agent_mail_check(get_json_opt(g, "/api/agents/directory?all=true", true, 15).as_ref()));
+        // i669: the node agents Prometheus scrapes, against the registry.
+        let agents: Vec<(String, String)> = fleet
+            .iter()
+            .filter_map(|n| Some((n["id"].as_str()?.to_string(), agent_url_host(n["agent_url"].as_str()?)?)))
+            .collect();
+        let up = get_json_opt(g, "/api/metrics/query?query=up%7Bjob%3D%22noo_node_agent%22%7D", true, 15);
+        let covers = |id: &str, host: &str| -> Option<bool> {
+            let path = crate::pki::pki_dir().join("nodes").join(id).join("node.crt");
+            let names = crate::pki::ClusterCa::cert_names(&path).ok()?;
+            Some(names.ips.iter().chain(names.dns.iter()).any(|n| n.eq_ignore_ascii_case(host)))
+        };
+        checks.push(agent_metrics_check(&agents, up.as_ref(), &covers));
         // The gateway's own Redis connection (authenticated /health: the
         // anonymous body carries no dependency map).
         let health = health_body(g);
@@ -12809,6 +12879,58 @@ mod model_memory_tests {
         assert_eq!(fine.verdict, Verdict::Ok);
         let unread = model_memory_check(&[("awolf".into(), Some(json!({}))), ("host6".into(), None)]);
         assert!(unread.verdict == Verdict::Warn && unread.detail.contains("host6"), "{}", unread.detail);
+    }
+}
+
+#[cfg(test)]
+mod agent_metrics_tests {
+    use super::{agent_metrics_check, agent_url_host, Verdict};
+    use serde_json::{json, Value};
+
+    fn up(rows: &[(&str, &str)]) -> Value {
+        json!({"resultType": "vector", "result": rows.iter().map(|(n, v)| json!({"metric": {"job": "noo_node_agent", "node": n}, "value": [1.0, v]})).collect::<Vec<_>>()})
+    }
+
+    fn nodes() -> Vec<(String, String)> {
+        vec![("aserve".into(), "100.98.144.38".into()), ("awolf".into(), "100.89.31.92".into())]
+    }
+
+    #[test]
+    fn every_agent_up_is_ok_with_the_count() {
+        let c = agent_metrics_check(&nodes(), Some(&up(&[("aserve", "1"), ("awolf", "1")])), &|_, _| Some(true));
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.starts_with("2/2"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_node_left_out_for_its_san_counts_as_not_scraped_and_names_the_reissue() {
+        let c = agent_metrics_check(&nodes(), Some(&up(&[("awolf", "1")])), &|id, _| Some(id != "aserve"));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.starts_with("1/2") && c.detail.contains("aserve") && c.detail.contains("no SAN for 100.98.144.38"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo security pki issue-node aserve 100.98.144.38"));
+    }
+
+    #[test]
+    fn a_failing_scrape_and_an_unlisted_node_are_named_differently() {
+        let c = agent_metrics_check(&nodes(), Some(&up(&[("aserve", "0")])), &|_, _| Some(true));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.starts_with("0/2"), "{}", c.detail);
+        assert!(c.detail.contains("aserve (the scrape of 100.98.144.38:8081 is failing"), "{}", c.detail);
+        assert!(c.detail.contains("awolf (not in the scrape list yet"), "{}", c.detail);
+        assert!(c.remedy.is_none());
+    }
+
+    #[test]
+    fn no_answer_from_prometheus_is_not_a_pass() {
+        assert_eq!(agent_metrics_check(&nodes(), None, &|_, _| Some(true)).verdict, Verdict::Warn);
+    }
+
+    #[test]
+    fn the_agent_host_is_read_like_the_gateway_reads_it() {
+        assert_eq!(agent_url_host("https://100.98.144.38:8081").as_deref(), Some("100.98.144.38"));
+        assert_eq!(agent_url_host("https://[fd7a::1]:8081/x").as_deref(), Some("fd7a::1"));
+        assert_eq!(agent_url_host("https://noo-controller:8081").as_deref(), Some("noo-controller"));
+        assert_eq!(agent_url_host("https://:8081"), None);
     }
 }
 

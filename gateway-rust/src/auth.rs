@@ -3124,6 +3124,19 @@ fn is_metrics_scrape(method: &axum::http::Method, path: &str, service: Option<&c
         && service.is_some_and(|s| s.0 == METRICS_SCRAPER_SERVICE)
 }
 
+/// Prometheus's http_sd list of the node agents (i669):
+/// `routes::scrape_targets`. Opened by the scraper's leaf
+/// ([`METRICS_SCRAPER_SERVICE`]) ALONE, GET only, before the bearer: no token,
+/// header, user, add-on or node credential reaches it.
+pub const SCRAPE_TARGETS_PATH: &str = "/api/internal/prometheus/targets/node-agents";
+
+/// Whether this request is the scraper fetching its node-agent targets.
+pub(crate) fn is_scrape_targets(method: &axum::http::Method, path: &str, service: Option<&crate::node_identity::VerifiedService>) -> bool {
+    *method == axum::http::Method::GET
+        && path == SCRAPE_TARGETS_PATH
+        && service.is_some_and(|s| s.0 == METRICS_SCRAPER_SERVICE)
+}
+
 /// Alertmanager's critical-alert intake (i515b): `routes::alert_intake`.
 /// Opened by [`ALERT_INTAKE_SERVICE`]'s leaf ALONE, before the bearer: no
 /// token, user, add-on or node credential reaches it.
@@ -3293,6 +3306,18 @@ pub async fn require_any_auth(
     if is_metrics_scrape(request.method(), &path, scraper.as_ref()) {
         request.extensions_mut().insert(AuthActor(format!("svc:{METRICS_SCRAPER_SERVICE}")));
         return Ok(next.run(request).await);
+    }
+
+    // The scraper's node-agent target list, by its service leaf ALONE, GET
+    // only, before the bearer and returning here either way: no token opens
+    // this path, and no other leaf does.
+    if path == SCRAPE_TARGETS_PATH {
+        if is_scrape_targets(request.method(), &path, scraper.as_ref()) {
+            request.extensions_mut().insert(AuthActor(format!("svc:{METRICS_SCRAPER_SERVICE}")));
+            return Ok(next.run(request).await);
+        }
+        tracing::info!(path = %path, "scrape_targets_refused: answers the Prometheus scraper's own service leaf only");
+        return Err(StatusCode::FORBIDDEN);
     }
 
     // Alertmanager's intake, by its service leaf ALONE, before the bearer
