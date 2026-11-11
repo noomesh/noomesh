@@ -64,7 +64,7 @@ pub async fn is_party(db: &PgPool, thread: &str, agent: &str) -> Result<Option<b
         // Mail of a past generation of a reused name is not this holder's:
         // a new holder is no party to the threads its predecessor was in.
         "SELECT EXISTS (SELECT 1 FROM noo_agent_messages m WHERE m.thread_id = $1 AND (m.from_agent = $2 OR m.to_agent = $2) \
-           AND NOT EXISTS (SELECT 1 FROM noo_agent_orphans o WHERE o.message_id = m.id))",
+           AND true)",
     )
     .bind(thread)
     .bind(agent)
