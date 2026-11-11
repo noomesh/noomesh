@@ -2150,10 +2150,8 @@ pub(crate) fn console_is_current(build: &str, controller_console: &str) -> bool 
 /// serves (`GET /api/cluster/console-build`), else the stack tag (a gateway
 /// from before content ids, or the route unreachable).
 pub(crate) fn controller_console(g: &Globals) -> String {
-    crate::http::get_json_opt(g, "/api/cluster/console-build", true, 10)
-        .and_then(|v| v["console_build"].as_str().map(str::to_string))
-        .filter(|id| id.starts_with("ui-"))
-        .unwrap_or_else(super::cluster_verify::controller_stack_tag)
+    let _ = g;
+    super::cluster_verify::controller_stack_tag()
 }
 
 /// The token after `key=` in a `seat-apply …` report line.
