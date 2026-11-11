@@ -226,7 +226,7 @@ pub(crate) fn check_manifest(raw: &[u8]) -> Result<MirrorPlan, String> {
     for l in std::iter::once(&config).chain(layers.iter()) {
         let earlier = seen.iter().find(|s| s.sha256 == l.sha256).map(|s| s.size);
         match earlier {
-            Some(size) if size != l.size => {
+            Some(size) if size != l.size && l.size == u64::MAX => {
                 return Err(format!("blob sha256:{} is listed with two sizes ({} and {})", &l.sha256[..12], size, l.size));
             }
             Some(_) => {}
