@@ -6814,6 +6814,10 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         if nodes.is_empty() {
             let listed = crate::commands::kiosk_seat::list_seats(g);
             let seats = listed.clone().unwrap_or_default();
+            // A seat's display is compared with the console the controller's
+            // gateway embeds (its content id), not the stack tag; the tag
+            // only when the gateway predates content ids.
+            let console = if seats.is_empty() { tag.clone() } else { crate::commands::kiosk_seat::controller_console(g) };
             let mut seat_json = Vec::new();
             if !g.json {
                 if let Some((heading, empty_line)) = seats_heading(listed.as_ref().map(Vec::len)) {
@@ -6825,7 +6829,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             }
             for s in &seats {
                 let name = s["seat_name"].as_str().unwrap_or("?");
-                let checks = crate::commands::kiosk_seat::seat_checks(s, env!("CARGO_PKG_VERSION"), &tag, now);
+                let checks = crate::commands::kiosk_seat::seat_checks(s, env!("CARGO_PKG_VERSION"), &console, now);
                 let seat_ok = checks.iter().all(|c| c.verdict != Verdict::Fail && c.verdict != Verdict::Starting);
                 all_ok &= seat_ok;
                 if g.json {
