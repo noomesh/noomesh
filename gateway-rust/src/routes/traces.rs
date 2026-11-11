@@ -103,6 +103,9 @@ async fn requests(_op: Operator, State(state): State<Arc<AppState>>, Query(q): Q
                 "span_count": r.try_get::<i64, _>("span_count").ok(),
                 "request_bytes": r.try_get::<Option<i64>, _>("request_bytes").ok().flatten(),
                 "response_bytes": r.try_get::<Option<i64>, _>("response_bytes").ok().flatten(),
+                // null: no content frame arrived (not 0).
+                "ttft_ms": r.try_get::<Option<i64>, _>("ttft_ms").ok().flatten(),
+                "queue_wait_ms": r.try_get::<Option<i64>, _>("queue_wait_ms").ok().flatten(),
             })
         })
         .collect();
@@ -150,6 +153,12 @@ async fn summary(_op: Operator, State(state): State<Arc<AppState>>, Query(q): Qu
                 "p50_ms": r.try_get::<Option<f64>, _>("p50_ms").ok().flatten(),
                 "p95_ms": r.try_get::<Option<f64>, _>("p95_ms").ok().flatten(),
                 "max_ms": r.try_get::<Option<i64>, _>("max_ms").ok().flatten(),
+                // Over the requests that HAD a first token / that queued.
+                "ttft_count": r.try_get::<i64, _>("ttft_count").ok(),
+                "p50_ttft_ms": r.try_get::<Option<f64>, _>("p50_ttft_ms").ok().flatten(),
+                "p95_ttft_ms": r.try_get::<Option<f64>, _>("p95_ttft_ms").ok().flatten(),
+                "queued_count": r.try_get::<i64, _>("queued_count").ok(),
+                "p50_queue_wait_ms": r.try_get::<Option<f64>, _>("p50_queue_wait_ms").ok().flatten(),
                 "prompt_tokens": r.try_get::<i64, _>("prompt_tokens").ok(),
                 "completion_tokens": r.try_get::<i64, _>("completion_tokens").ok(),
             })

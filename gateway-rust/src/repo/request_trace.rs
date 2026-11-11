@@ -31,10 +31,10 @@ pub async fn insert(db: &sqlx::PgPool, row: &SummaryRow) -> Result<(), sqlx::Err
         "INSERT INTO noo_request_trace
              (trace_id, method, route, status, duration_ms, user_uuid, actor, actor_kind,
               model, backend, node_id, prompt_tokens, completion_tokens, span_count,
-              request_bytes, response_bytes)
+              request_bytes, response_bytes, ttft_ms, queue_wait_ms)
          VALUES ($1, $2, $3, $4, $5,
                  (SELECT u.user_uuid FROM noo_users u WHERE u.username = $6),
-                 $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+                 $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
     )
     .bind(&row.trace_id)
     .bind(&row.method)
@@ -52,6 +52,8 @@ pub async fn insert(db: &sqlx::PgPool, row: &SummaryRow) -> Result<(), sqlx::Err
     .bind(row.span_count)
     .bind(row.request_bytes)
     .bind(row.response_bytes)
+    .bind(s.ttft_ms)
+    .bind(s.queue_wait_ms)
     .execute(db)
     .await
     .map(|_| ())
@@ -82,7 +84,8 @@ pub struct Filter<'a> {
 pub async fn recent(db: &sqlx::PgPool, f: &Filter<'_>) -> Result<Vec<sqlx::postgres::PgRow>, sqlx::Error> {
     sqlx::query(
         "SELECT at, trace_id, method, route, status, duration_ms, actor, actor_kind, model, backend, node_id,
-                prompt_tokens, completion_tokens, span_count, request_bytes, response_bytes
+                prompt_tokens, completion_tokens, span_count, request_bytes, response_bytes,
+                ttft_ms, queue_wait_ms
            FROM noo_request_trace
           WHERE at > now() - ($1::bigint * interval '1 hour')
             AND ($2::text IS NULL OR route = $2)
@@ -150,6 +153,12 @@ pub async fn grouped(
                         percentile_cont(0.5) WITHIN GROUP (ORDER BY duration_ms)::float8 AS p50_ms,
                         percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms)::float8 AS p95_ms,
                         max(duration_ms)::bigint AS max_ms,
+                        -- NULL (no content frame) is left out, never counted as 0.
+                        count(ttft_ms)::bigint AS ttft_count,
+                        percentile_cont(0.5) WITHIN GROUP (ORDER BY ttft_ms)::float8 AS p50_ttft_ms,
+                        percentile_cont(0.95) WITHIN GROUP (ORDER BY ttft_ms)::float8 AS p95_ttft_ms,
+                        count(queue_wait_ms)::bigint AS queued_count,
+                        percentile_cont(0.5) WITHIN GROUP (ORDER BY queue_wait_ms)::float8 AS p50_queue_wait_ms,
                         COALESCE(sum(prompt_tokens), 0)::bigint AS prompt_tokens,
                         COALESCE(sum(completion_tokens), 0)::bigint AS completion_tokens
                    FROM noo_request_trace
@@ -252,5 +261,38 @@ mod tests {
         assert_eq!(account_for(Some("alice"), Some("user")), Some("alice"));
         assert_eq!(account_for(Some("internal:cluster:worker"), Some("internal")), None);
         assert_eq!(account_for(None, Some("user")), None);
+    }
+
+    /// TTFT and queue wait reach the real table, a NULL stays NULL, and the
+    /// grouped percentiles leave NULLs out instead of counting them as 0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ttft_nulls_are_kept_and_left_out_of_the_percentiles() {
+        let _serial = crate::ops::tests::DB_LOCK.lock().await;
+        let Some(db) = crate::ops::tests::scratch("trace_ttft").await else { return };
+        let row = |i: usize, ttft: Option<i64>, queued: Option<i64>| SummaryRow {
+            trace_id: format!("{i:032x}"),
+            method: "POST".into(),
+            route: "/api/external/chat/completions".into(),
+            status: 200,
+            duration_ms: 1000,
+            summary: crate::request_trace::Summary { ttft_ms: ttft, queue_wait_ms: queued, ..Default::default() },
+            span_count: 1,
+            request_bytes: None,
+            response_bytes: None,
+        };
+        for (i, ttft, q) in [(1, Some(100), None), (2, Some(300), Some(50)), (3, None, Some(40_000))] {
+            insert(&db, &row(i, ttft, q)).await.unwrap();
+        }
+        let back: Vec<(Option<i64>, Option<i64>)> =
+            sqlx::query_as("SELECT ttft_ms, queue_wait_ms FROM noo_request_trace ORDER BY trace_id").fetch_all(&db).await.unwrap();
+        assert_eq!(back, vec![(Some(100), None), (Some(300), Some(50)), (None, Some(40_000))], "NULL is stored as NULL");
+        let g = grouped(&db, "route", 1, None).await.unwrap();
+        use sqlx::Row;
+        let r = &g[0];
+        assert_eq!(r.get::<i64, _>("requests"), 3);
+        assert_eq!(r.get::<i64, _>("ttft_count"), 2, "the stream with no first token is not counted");
+        assert_eq!(r.get::<Option<f64>, _>("p50_ttft_ms"), Some(200.0), "median of 100 and 300; the NULL is not a 0");
+        assert_eq!(r.get::<i64, _>("queued_count"), 2);
+        assert_eq!(r.get::<Option<f64>, _>("p50_queue_wait_ms"), Some(20_025.0));
     }
 }

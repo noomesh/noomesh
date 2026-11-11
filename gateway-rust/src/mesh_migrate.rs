@@ -2462,6 +2462,19 @@ BEGIN
     END IF;
 END $$;
 "#,
+}, Migration {
+    revision: REQUEST_TRACE_TTFT_REVISION,
+    down_revision: Some(CONVERSATION_SOURCES_REVISION),
+    // Speed review (2026-11-11): time to the first token, and the time a
+    // request spent queued for a backend slot, on each request's trace row.
+    // Both nullable: NULL means "no content frame arrived" (a stream the
+    // caller dropped while it queued), which is the case the columns exist to
+    // show, and the read paths ignore it rather than count it as 0. Additive:
+    // two columns, no rewrite (no default), the table's grants cover them.
+    sql: r#"
+ALTER TABLE noo_request_trace ADD COLUMN IF NOT EXISTS ttft_ms bigint;
+ALTER TABLE noo_request_trace ADD COLUMN IF NOT EXISTS queue_wait_ms bigint;
+"#,
 }];
 
 /// Add-on feature settings and the super-admin flag (f99). A constant so a
@@ -2514,6 +2527,11 @@ pub const NODE_MODEL_SET_RETRY_REVISION: &str = "120_node_model_set_retry";
 /// epoch (120). Numbered at rebase against dev's real head; a migration that
 /// lands after it renumbers. A constant so a renumber at rebase is one line.
 pub const CONVERSATION_SOURCES_REVISION: &str = "121_conversation_sources";
+
+/// `ttft_ms` and `queue_wait_ms` on the request trace (speed review), on the
+/// conversation source ledger (121): numbered at rebase against dev's real
+/// head. A constant so a renumber is one line.
+pub const REQUEST_TRACE_TTFT_REVISION: &str = "122_request_trace_ttft";
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
 /// constant so a renumber at rebase is one line.
@@ -4176,19 +4194,61 @@ mod node_model_set_retry_migration_tests {
 mod conversation_sources_migration_tests {
     use super::*;
 
-    /// i608 (#937): the conversation-sources revision is the chain head,
-    /// sits on the model-set retry epoch (120), and only adds a table and the
-    /// app role's grant.
+    /// i608 (#937): the conversation-sources revision sits on the model-set
+    /// retry epoch (120), and only adds a table and the app role's grant.
     #[test]
-    fn conversation_sources_revision_is_the_head_and_additive() {
+    fn conversation_sources_revision_sits_on_the_retry_epoch_and_is_additive() {
         let m = MIGRATIONS.iter().find(|m| m.revision == CONVERSATION_SOURCES_REVISION).expect("must be in the chain");
         assert_eq!(m.revision, "121_conversation_sources");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(NODE_MODEL_SET_RETRY_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(CONVERSATION_SOURCES_REVISION), "the chain head");
         assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_conversation_sources"));
         assert!(m.sql.contains("PRIMARY KEY (user_id, publisher_id, source_id)"));
         assert!(m.sql.contains("GRANT SELECT, INSERT, UPDATE, DELETE ON noo_conversation_sources TO noo_app"));
         assert!(!m.sql.contains("DROP") && !m.sql.contains("UPDATE noo_") && !m.sql.contains("DELETE FROM"));
+    }
+}
+
+#[cfg(test)]
+mod request_trace_ttft_migration_tests {
+    use super::*;
+
+    /// The TTFT columns: the chain head, on the conversation source ledger
+    /// (121), additive, nullable, no default.
+    #[test]
+    fn request_trace_ttft_is_the_head_and_additive() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == REQUEST_TRACE_TTFT_REVISION).expect("in the chain");
+        assert_eq!(m.revision, "122_request_trace_ttft");
+        assert!(m.revision.len() <= 32);
+        assert_eq!(m.down_revision, Some(CONVERSATION_SOURCES_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(REQUEST_TRACE_TTFT_REVISION), "the chain head");
+        for col in ["ttft_ms", "queue_wait_ms"] {
+            assert!(m.sql.contains(&format!("ALTER TABLE noo_request_trace ADD COLUMN IF NOT EXISTS {col} bigint;")), "{col}");
+        }
+        for banned in ["DEFAULT", "NOT NULL", "DROP", "DELETE", "UPDATE"] {
+            assert!(!m.sql.contains(banned), "{banned}: the TTFT columns only add nullable columns");
+        }
+    }
+
+    /// The release script (`scripts/mesh-migration-head.sh`) takes the
+    /// HIGHEST number as the chain head for the signed stack lock, so the
+    /// numbers must rise along the chain. A migration that lands after a
+    /// higher-numbered one must take the next free number.
+    #[test]
+    fn migration_numbers_strictly_increase_along_the_chain() {
+        let mut last: Option<(u32, &str)> = None;
+        for m in MIGRATIONS {
+            let n: u32 = m.revision.split('_').next().and_then(|p| p.parse().ok())
+                .unwrap_or_else(|| panic!("{}: a revision starts with its number", m.revision));
+            if let Some((prev, prev_rev)) = last {
+                assert!(
+                    n > prev,
+                    "{} follows {} in the chain but its number is not higher: take the next free number at rebase \
+                     (the release script reads the HIGHEST number as the chain head)",
+                    m.revision, prev_rev
+                );
+            }
+            last = Some((n, m.revision));
+        }
     }
 }
