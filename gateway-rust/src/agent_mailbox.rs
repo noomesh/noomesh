@@ -900,9 +900,10 @@ mod tests {
         let r = register(&db, &a, "self:x", "claude", Some(&key_hash("client", "c4")), Some("abc123"), false).await.unwrap_err();
         assert!(r.contains("reserves"), "{r}");
         assert!(register(&db, &a, "self:x", "claude", Some(&key_hash("client", "c5")), Some("weekly"), false).await.is_ok(), "six letters, no digit: not the default shape");
+        let (k1, k2) = (key_hash("client", "r1"), key_hash("client", "r2"));
         let (x, y) = tokio::join!(
-            register(&db, &a, "self:x", "claude", Some(&key_hash("client", "r1")), Some("raced"), false),
-            register(&db, &a, "self:x", "claude", Some(&key_hash("client", "r2")), Some("raced"), false),
+            register(&db, &a, "self:x", "claude", Some(&k1), Some("raced"), false),
+            register(&db, &a, "self:x", "claude", Some(&k2), Some("raced"), false),
         );
         assert_eq!([x.is_ok(), y.is_ok()].iter().filter(|o| **o).count(), 1, "exactly one wins: {x:?} {y:?}");
         let lost = if x.is_ok() { y.unwrap_err() } else { x.unwrap_err() };
