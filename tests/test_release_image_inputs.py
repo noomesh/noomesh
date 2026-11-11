@@ -126,7 +126,7 @@ def _plan(changed, tag=NEW, rcs=(RC2, RC1), bases=BASES, lock=LOCK, table=None, 
     trees = trees or {NEW: "T3", RC2: "T2", RC1: "T1", "stack-v1.2.3": "T2"}
     return P.plan(tag, "o/r", {"trellion": "TRE"}, "t", "t", lock_text=lock, bases_text=bases,
                   tree_of=lambda ref: trees[ref], commit_of=lambda ref: "C-" + ref,
-                  list_rcs=lambda final: list(rcs), sib_tree=lambda repo, sha, tok: "T-tre",
+                  list_finals=lambda: [], list_rcs=lambda final: list(rcs), sib_tree=lambda repo, sha, tok: "T-tre",
                   changed_of=lambda prev, new: changed, inputs_table=table)
 
 
@@ -211,7 +211,7 @@ def test_an_unreadable_table_rebuilds_everything(monkeypatch):
     monkeypatch.setattr(P, "load_inputs", boom)
     p = P.plan(NEW, "o/r", {"trellion": "TRE"}, "t", "t", lock_text=LOCK, bases_text=BASES,
                tree_of=lambda r: {NEW: "T3", RC2: "T2", RC1: "T1"}[r], commit_of=lambda r: r,
-               list_rcs=lambda f: [RC2, RC1], sib_tree=lambda *a: "T", changed_of=lambda a, b: ["x"])
+               list_finals=lambda: [], list_rcs=lambda f: [RC2, RC1], sib_tree=lambda *a: "T", changed_of=lambda a, b: ["x"])
     assert not any(p["retag"].values())
 
 
@@ -230,7 +230,7 @@ def test_an_equal_tree_still_wins_over_the_diff():
 def test_a_moved_sibling_still_rebuilds_what_it_feeds_in_per_image_mode():
     p = P.plan(NEW, "o/r", {"trellion": "TRE2"}, "t", "t", lock_text=LOCK, bases_text=BASES,
                tree_of=lambda r: {NEW: "T3", RC2: "T2", RC1: "T1"}[r], commit_of=lambda r: r,
-               list_rcs=lambda f: [RC2, RC1], sib_tree=lambda repo, sha, tok: {"TRE": "a", "TRE2": "b"}[sha],
+               list_finals=lambda: [], list_rcs=lambda f: [RC2, RC1], sib_tree=lambda repo, sha, tok: {"TRE": "a", "TRE2": "b"}[sha],
                changed_of=lambda a, b: ["gateway-rust/Cargo.lock"])
     assert _built(p) == ALWAYS | {"deps-base", "trellion"}, p["why"]
 
