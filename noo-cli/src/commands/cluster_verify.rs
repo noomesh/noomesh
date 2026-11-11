@@ -2252,25 +2252,25 @@ pub(crate) fn agent_metrics_check(nodes: &[(String, String)], up: Option<&Value>
             series.insert(node.to_string(), v == "1");
         }
     }
-    let mut not = Vec::new();
+    let mut unscraped = Vec::new();
     let mut remedy = None;
     for (id, host) in nodes {
         match series.get(id) {
             Some(true) => continue,
-            Some(false) => not.push(format!("{id} (the scrape of {host}:8081 is failing: Prometheus targets page)")),
+            Some(false) => unscraped.push(format!("{id} (the scrape of {host}:8081 is failing: Prometheus targets page)")),
             None => match covers(id, host) {
                 Some(false) => {
-                    not.push(format!("{id} (its leaf has no SAN for {host}, so the gateway leaves it out)"));
+                    unscraped.push(format!("{id} (its leaf has no SAN for {host}, so the gateway leaves it out)"));
                     remedy.get_or_insert(format!("noo security pki issue-node {id} {host}"));
                 }
-                Some(true) => not.push(format!("{id} (not in the scrape list yet: the gateway refreshes it every minute; see its log for scrape_target_skipped)")),
-                None => not.push(format!("{id} (no readable public leaf for it on this controller)")),
+                Some(true) => unscraped.push(format!("{id} (not in the scrape list yet: the gateway refreshes it every minute; see its log for scrape_target_skipped)")),
+                None => unscraped.push(format!("{id} (no readable public leaf for it on this controller)")),
             },
         }
     }
     let total = nodes.len();
-    if not.is_empty() {
-        return warn(NAME, format!("{}/{total} node agents scraped; not: {}", total - not.len(), not.join("; ")), remedy);
+    if !unscraped.is_empty() {
+        return warn(NAME, format!("{}/{total} node agents scraped; not: {}", total - unscraped.len(), unscraped.join("; ")), remedy);
     }
     ok(NAME, format!("{total}/{total} node agents scraped"))
 }
@@ -12898,14 +12898,14 @@ mod agent_metrics_tests {
     #[test]
     fn every_agent_up_is_ok_with_the_count() {
         let c = agent_metrics_check(&nodes(), Some(&up(&[("aserve", "1"), ("awolf", "1")])), &|_, _| Some(true));
-        assert_eq!(c.verdict, Verdict::Ok);
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
         assert!(c.detail.starts_with("2/2"), "{}", c.detail);
     }
 
     #[test]
     fn a_node_left_out_for_its_san_counts_as_not_scraped_and_names_the_reissue() {
         let c = agent_metrics_check(&nodes(), Some(&up(&[("awolf", "1")])), &|id, _| Some(id != "aserve"));
-        assert_eq!(c.verdict, Verdict::Warn);
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
         assert!(c.detail.starts_with("1/2") && c.detail.contains("aserve") && c.detail.contains("no SAN for 100.98.144.38"), "{}", c.detail);
         assert_eq!(c.remedy.as_deref(), Some("noo security pki issue-node aserve 100.98.144.38"));
     }
@@ -12913,7 +12913,7 @@ mod agent_metrics_tests {
     #[test]
     fn a_failing_scrape_and_an_unlisted_node_are_named_differently() {
         let c = agent_metrics_check(&nodes(), Some(&up(&[("aserve", "0")])), &|_, _| Some(true));
-        assert_eq!(c.verdict, Verdict::Warn);
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
         assert!(c.detail.starts_with("0/2"), "{}", c.detail);
         assert!(c.detail.contains("aserve (the scrape of 100.98.144.38:8081 is failing"), "{}", c.detail);
         assert!(c.detail.contains("awolf (not in the scrape list yet"), "{}", c.detail);
