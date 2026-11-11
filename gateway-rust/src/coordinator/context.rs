@@ -347,7 +347,7 @@ pub(super) fn strip_data_frames(messages: &mut [Value]) {
             continue;
         }
         let Some(text) = m.get("content").and_then(|c| c.as_str()) else { continue };
-        if !text.starts_with(DATA_BEGIN) {
+        if !text.starts_with(DATA_BEGIN) && !text.starts_with(CLOCK_PREFIX) {
             continue;
         }
         if let Some(at) = text.find(USER_TEXT_MARK) {
@@ -928,6 +928,63 @@ pub fn clock_context() -> String {
     clock_context_at(chrono::Utc::now())
 }
 
+/// The clock's RULE, for the system prompt: fixed text, so the system prompt
+/// stays byte-identical from turn to turn and vLLM's prefix cache can reuse
+/// it (speed review 2026-11-11: a minute-precision `Now:` here changed the
+/// prefix every minute). The time itself rides the user side
+/// ([`clock_line_at`], [`attach_clock`]).
+pub const CLOCK_RULE: &str = "\n\n## Clock\n\
+- The current time is on the `[noomesh clock] Now:` line just before the user's message \
+(after any retrieved data block, never inside it).\n\
+- Resolve every relative date (\"last 3 months\", \"yesterday\", \"this quarter\") \
+from that clock, never from dates found inside documents or tool results.";
+
+/// Opens the clock line on the user side.
+pub(super) const CLOCK_PREFIX: &str = "[noomesh clock] Now:";
+
+/// The clock line for the user side: `[noomesh clock] Now: <minute> UTC (<weekday>).`
+pub fn clock_line_at(now: chrono::DateTime<chrono::Utc>) -> String {
+    format!("{CLOCK_PREFIX} {} UTC ({}).", now.format("%Y-%m-%d %H:%M"), now.format("%A"))
+}
+
+/// Put `line` on the FINAL user message, after the data frame (if one is
+/// there) and before the user's own text, which keeps it outside the
+/// untrusted block and inside what [`strip_data_frames`] removes next turn.
+/// Returns false (and changes nothing) when there is no such message.
+pub(super) fn attach_clock(messages: &mut [Value], line: &str) -> bool {
+    let Some(last) = messages
+        .iter_mut()
+        .rev()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+    else {
+        return false;
+    };
+    let Some(text) = last.get("content").and_then(|c| c.as_str()).map(str::to_string) else {
+        return false;
+    };
+    let framed = text.starts_with(DATA_BEGIN);
+    let content = match text.find(USER_TEXT_MARK) {
+        Some(at) if framed => format!("{}{line}\n\n{}", &text[..at], &text[at..]),
+        _ => format!("{line}\n\n{USER_TEXT_MARK}\n{text}"),
+    };
+    last["content"] = Value::String(content);
+    true
+}
+
+/// The clock for this turn: on the user side when there is a user message,
+/// else (as before) appended to the system message so it is never lost.
+pub(super) fn place_clock(messages: &mut [Value], now: chrono::DateTime<chrono::Utc>) {
+    if attach_clock(messages, &clock_line_at(now)) {
+        return;
+    }
+    if let Some(first) = messages.first_mut() {
+        if first.get("role").and_then(|r| r.as_str()) == Some("system") {
+            let existing = first.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+            *first = json!({"role": "system", "content": format!("{existing}{}", clock_context_at(now))});
+        }
+    }
+}
+
 #[cfg(test)]
 mod clock_tests {
     use super::*;
@@ -943,6 +1000,74 @@ mod clock_tests {
         // Appended to a persona prompt: it must start a new section, not
         // run into the previous line.
         assert!(text.starts_with("\n\n## Clock"));
+    }
+
+    fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&chrono::Utc)
+    }
+
+    fn user(text: &str) -> Value {
+        json!({"role": "user", "content": text})
+    }
+
+    /// Speed review 2026-11-11: the system prompt carries the clock's RULE,
+    /// fixed text, so it is byte-identical from turn to turn (vLLM's prefix
+    /// cache); the time itself is not in it.
+    #[test]
+    fn the_system_rule_is_fixed_text_with_no_time_in_it() {
+        assert!(CLOCK_RULE.starts_with("\n\n## Clock"), "a new section, not run into the persona");
+        assert!(CLOCK_RULE.contains(CLOCK_PREFIX) && CLOCK_RULE.contains("never from dates found inside documents"));
+        assert!(!CLOCK_RULE.contains("UTC (") && !CLOCK_RULE.contains("2026"), "a time in the rule: {CLOCK_RULE}");
+    }
+
+    #[test]
+    fn the_clock_line_names_the_minute_and_the_day() {
+        assert_eq!(clock_line_at(at("2026-09-22T21:40:00Z")), "[noomesh clock] Now: 2026-09-22 21:40 UTC (Tuesday).");
+    }
+
+    /// After the data block, before the user's text: outside the untrusted
+    /// material, and gone again once the turn is stripped.
+    #[test]
+    fn the_clock_sits_after_the_data_block_and_is_stripped_next_turn() {
+        let mut msgs = vec![json!({"role": "system", "content": "sys"}), user("what did we decide yesterday?")];
+        attach_retrieved_data(&mut msgs, &[("Memory", Some("notes"))]).expect("framed");
+        place_clock(&mut msgs, at("2026-11-11T02:45:00Z"));
+        let c = msgs[1]["content"].as_str().unwrap().to_string();
+        let (end, clock, mark) = (c.find(DATA_END).unwrap(), c.find(CLOCK_PREFIX).unwrap(), c.find(USER_TEXT_MARK).unwrap());
+        assert!(end < clock && clock < mark, "{c}");
+        assert!(c.ends_with("what did we decide yesterday?"), "{c}");
+        assert_eq!(msgs[0]["content"], "sys", "the system message is untouched");
+        strip_data_frames(&mut msgs);
+        assert_eq!(msgs[1]["content"], "what did we decide yesterday?");
+    }
+
+    #[test]
+    fn with_no_data_block_the_clock_alone_precedes_the_user_text_and_strips() {
+        let mut msgs = vec![json!({"role": "system", "content": "sys"}), user("hi")];
+        place_clock(&mut msgs, at("2026-11-11T02:45:00Z"));
+        let c = msgs[1]["content"].as_str().unwrap();
+        assert!(c.starts_with(CLOCK_PREFIX) && c.ends_with(&format!("{USER_TEXT_MARK}\nhi")), "{c}");
+        strip_data_frames(&mut msgs);
+        assert_eq!(msgs[1]["content"], "hi");
+    }
+
+    /// Nowhere on the user side: the clock is never lost, it goes where it
+    /// always was.
+    #[test]
+    fn with_no_user_message_the_clock_falls_back_to_the_system_message() {
+        let mut msgs = vec![json!({"role": "system", "content": "sys"})];
+        place_clock(&mut msgs, at("2026-11-11T02:45:00Z"));
+        assert!(msgs[0]["content"].as_str().unwrap().contains("Now: 2026-11-11 02:45 UTC (Wednesday)"));
+    }
+
+    /// The loops put the RULE in the system prompt and place the clock on
+    /// the user side, both of them.
+    #[test]
+    fn the_loop_keeps_the_live_clock_out_of_the_system_prompt() {
+        let code = crate::test_src::own_code(include_str!("agent_loop.rs"));
+        assert!(!code.contains("clock_context()"), "a live clock is back in the system prompt");
+        assert_eq!(code.matches("persona_prompt.push_str(super::context::CLOCK_RULE)").count(), 2);
+        assert_eq!(code.matches("super::context::place_clock(&mut session.messages").count(), 2);
     }
 
     #[test]
