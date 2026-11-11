@@ -293,61 +293,6 @@ pub(crate) fn self_url_default() -> String {
     format!("https://127.0.0.1:{port}")
 }
 
-/// The door's self-call client, built once (on the first call that
-/// succeeds in building it) and reused, so tool calls share pooled
-/// keep-alive connections to the gateway instead of a handshake each.
-/// VERIFIED as before: for an `https://` base with `NOO_TLS_CA` set, the
-/// cluster CA is merged into the roots; validation is never disabled. A CA
-/// that cannot be read or parsed is an error for THIS call and is not
-/// cached, so fixing it needs no restart. A CA rotated while the gateway
-/// runs is picked up on restart, as with `tls::cluster_client`.
-///
-/// Keyed by what the client is built from (the scheme and the CA path), so
-/// a different `NOO_SELF_URL` or `NOO_TLS_CA` never reuses a client built
-/// for another; in a running gateway both are fixed, so this is one client.
-fn self_client(base: &str) -> Result<reqwest::Client, String> {
-    static SELF_CLIENTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, reqwest::Client>>> =
-        std::sync::OnceLock::new();
-    let key = self_client_key(base);
-    let cache = SELF_CLIENTS.get_or_init(Default::default);
-    if let Some(c) = cache.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
-        return Ok(c.clone());
-    }
-    let client = build_self_client(base)?;
-    Ok(cache.lock().unwrap_or_else(|p| p.into_inner()).entry(key).or_insert(client).clone())
-}
-
-/// What a self-call client depends on: `https` + the CA path, or `http`.
-fn self_client_key(base: &str) -> String {
-    if base.starts_with("https://") {
-        format!("https|{}", crate::tls::ca_path().map(|p| p.display().to_string()).unwrap_or_default())
-    } else {
-        "http".to_string()
-    }
-}
-
-/// The client itself: `tls::client_builder()` plus the cluster CA for an
-/// `https://` base. No total timeout here; each request sets its own.
-fn build_self_client(base: &str) -> Result<reqwest::Client, String> {
-    let mut builder = crate::tls::client_builder();
-    if base.starts_with("https://") {
-        // No cluster CA configured — a public cert (tailscale serve) or
-        // plain dev. Leave the system roots in place rather than weakening
-        // anything.
-        if let Some(ca) = crate::tls::ca_path() {
-            let ca = ca.display().to_string();
-            match std::fs::read(&ca) {
-                Ok(pem) => match crate::tls::certificate_from_pem(&pem) {
-                    Ok(cert) => builder = builder.tls_certs_merge([cert]),
-                    Err(e) => return Err(format!("NOO_TLS_CA at {ca} is not valid PEM: {e}")),
-                },
-                Err(e) => return Err(format!("cannot read NOO_TLS_CA at {ca}: {e}")),
-            }
-        }
-    }
-    builder.build().map_err(|e| format!("http client: {e}"))
-}
-
 /// Mint a short-lived JWT for the caller.
 ///
 /// `iss`/`aud` are REQUIRED spec claims in `auth::verify_token`; a token
@@ -684,11 +629,12 @@ pub(crate) async fn execute_spec(
     // request this client makes, and the base URL is operator-settable via
     // NOO_SELF_URL. A misconfiguration pointing off-host would then be
     // silently unauthenticated rather than a loud TLS error.
-    // ONE client for every self-call, built on first use and kept: a new
-    // client per tool call meant a new TCP + TLS handshake to 127.0.0.1 and
-    // a CA file read on every call (speed review 2026-11-11). The timeout is
-    // per request below; the CA is merged once, like `tls::cluster_client`.
-    let client = self_client(&base)?;
+    // The gateway's ONE shared self-call client (`tls::loopback_client`,
+    // CA merged once, verifying): a new client per tool call meant a new TCP
+    // + TLS handshake to 127.0.0.1 and a CA file read on every call (speed
+    // review 2026-11-11). Its 30 s default is overridden per request below
+    // by the tool's own timeout.
+    let client = crate::tls::loopback_client();
 
     let req = match spec.method.as_str() {
         "GET" => client.get(&url).query(&rest),
@@ -1011,10 +957,10 @@ mod tests {
     async fn self_calls_reuse_one_connection() {
         let (base, seen) = peer_recording_server().await;
         for _ in 0..2 {
-            self_client(&base).unwrap().get(format!("{base}/ping")).send().await.unwrap().text().await.unwrap();
+            crate::tls::loopback_client().get(format!("{base}/ping")).send().await.unwrap().text().await.unwrap();
         }
         for _ in 0..2 {
-            build_self_client(&base).unwrap().get(format!("{base}/ping")).send().await.unwrap().text().await.unwrap();
+            crate::tls::client_builder().build().unwrap().get(format!("{base}/ping")).send().await.unwrap().text().await.unwrap();
         }
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 4);
@@ -1022,28 +968,15 @@ mod tests {
         assert_ne!(seen[2], seen[3], "fresh clients open fresh connections (the test can tell): {seen:?}");
     }
 
-    /// A client is cached per what it is built from, never across them.
+    /// The door uses the shared client, keeps the tool's own timeout per
+    /// request, and builds no client of its own.
     #[test]
-    fn the_cache_key_is_the_scheme_and_the_ca() {
-        assert_eq!(self_client_key("http://127.0.0.1:1"), self_client_key("http://127.0.0.1:2"));
-        assert_ne!(self_client_key("http://127.0.0.1:1"), self_client_key("https://127.0.0.1:1"));
-    }
-
-    /// The per-call timeout survives the shared client (it moved from the
-    /// builder to each request), and a failed build is never cached.
-    #[test]
-    fn the_shared_client_keeps_the_per_call_timeout_and_never_caches_a_failure() {
+    fn the_door_uses_the_shared_client_with_the_tools_timeout() {
         let code = crate::test_src::own_code(include_str!("mcp_external.rs"));
         let exec = crate::test_src::fn_body(&code, "async fn execute_spec(");
-        assert!(exec.contains("let client = self_client(&base)?;"), "{exec}");
+        assert!(exec.contains("let client = crate::tls::loopback_client();"), "{exec}");
         assert!(exec.contains(".timeout(std::time::Duration::from_secs(spec.timeout_secs))"), "{exec}");
-        assert!(!exec.contains("client_builder()"), "no per-call client is built");
-        let build = crate::test_src::fn_body(&code, "fn build_self_client(");
-        assert!(!build.contains(".timeout("), "no total timeout on the shared client: {build}");
-        assert!(build.contains("tls_certs_merge([cert])") && !build.contains("danger_accept_invalid"), "still verified: {build}");
-        let cached = crate::test_src::fn_body(&code, "fn self_client(");
-        let built = cached.find("let client = build_self_client(base)?;").expect("an Err returns before the insert");
-        assert!(built < cached.find(".entry(key).or_insert(client)").expect("the insert"), "{cached}");
+        assert!(!exec.contains("client_builder()") && !exec.contains("std::fs::read("), "no per-call client or CA read: {exec}");
     }
 
     async fn failed_send(url: &str, timeout_ms: u64) -> reqwest::Error {
