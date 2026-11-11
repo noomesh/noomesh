@@ -278,7 +278,41 @@ def test_the_expected_red_tests_come_from_mutant_test_trailers(tmp_path):
                 "Mutant-Test: commands::kiosk_seat::console_identity_tests::a, tests/test_x.py::test_y\n"
                 "Mutant-Test: TestGoThing\n")
     assert cm.trailer_filters(sha, cwd=str(tmp_path)) == [
-        "commands::kiosk_seat::console_identity_tests::a", "tests/test_x.py::test_y", "TestGoThing"]
+        (None, "commands::kiosk_seat::console_identity_tests::a"), (None, "tests/test_x.py::test_y"),
+        (None, "TestGoThing")]
+
+
+def test_a_trailer_may_name_its_lane(tmp_path):
+    sha = _repo(tmp_path, "MUTANT 1: x\n\nMutant-Test: gateway-rust: auth::tests::a, auth::tests::b\n"
+                "Mutant-Test: node-agent-go: TestThing\nMutant-Test: routes::x::tests::c\n")
+    assert cm.trailer_filters(sha, cwd=str(tmp_path)) == [
+        ("gateway-rust", "auth::tests::a"), ("gateway-rust", "auth::tests::b"),
+        ("node-agent-go", "TestThing"), (None, "routes::x::tests::c")]
+    # A cargo path is a filter, not a lane: no lane is named "routes", and a
+    # lane needs `: ` (colon, space) after it.
+    sha = _repo(tmp_path / "p", "MUTANT 2: x\n\nMutant-Test: gateway-rust::not_a_lane_prefix\n")
+    assert cm.trailer_filters(sha, cwd=str(tmp_path / "p")) == [(None, "gateway-rust::not_a_lane_prefix")]
+
+
+def test_named_lanes_run_alone_and_an_unnamed_filter_keeps_every_lane():
+    both = ["gateway-rust", "noo-cli"]  # a gateway file noo-cli include_str!s (fa's auth.rs mutants)
+    assert cm.resolve_lanes(both, [("gateway-rust", "auth::tests::a")]) == (["gateway-rust"], ["auth::tests::a"])
+    assert cm.resolve_lanes(both, [(None, "auth::tests::a")]) == (both, ["auth::tests::a"]), "unchanged default"
+    assert cm.resolve_lanes(both, [("gateway-rust", "a"), (None, "b")]) == (both, ["a", "b"])
+    assert cm.resolve_lanes(both, [("noo-cli", "c"), ("gateway-rust", "a")]) == (both, ["c", "a"]), \
+        "lanes run in LANES order whatever the trailer order"
+    with pytest.raises(cm.Refused, match="does not reach"):
+        cm.resolve_lanes(both, [("node-agent-go", "TestX")])
+    with pytest.raises(cm.Refused, match="does not reach"):
+        cm.resolve_lanes(["gateway-rust"], [("gateway-rust", "a"), ("python", "tests/t.py")])
+
+
+def test_a_lane_that_runs_no_test_is_still_no_verdict():
+    # Skipping an unnamed lane must not weaken "nothing ran proves nothing":
+    # every lane that DOES run is held to it.
+    ran0 = {"phase": "mutant", "lanes": {"gateway-rust": {"ran": 0, "failed": 0, "names": [], "rcs": [0]}}}
+    base = {"phase": "base", "lanes": {"gateway-rust": {"ran": 3, "failed": 0, "names": [], "rcs": [0]}}}
+    assert cm.judge(base, ran0)[0] == "error"
 
 
 def test_no_trailer_or_a_bad_filter_is_refused(tmp_path):
