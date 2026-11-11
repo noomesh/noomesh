@@ -191,6 +191,10 @@ async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<Caller, R
         .await
         .map_err(|u| rpc_http_error(StatusCode::SERVICE_UNAVAILABLE, &u.message()))?
         .ok_or_else(|| rpc_http_error(StatusCode::FORBIDDEN, "unknown or revoked key"))?;
+    // The door checks its own key (the auth layer lets /mcp/* through), so
+    // it tells the request trace who called: without this the door's own
+    // call left no trace row, and its overhead could not be measured.
+    crate::request_trace::note_principal(&crate::bus_principal::for_consumer(&consumer));
 
     let redis = state.redis.as_ref();
     admit(consumer, |name, limit| async move {
@@ -651,6 +655,12 @@ pub(crate) async fn execute_spec(
         _ => client.post(&url).json(&rest),
     }
     .header(&auth_header.0, &auth_header.1);
+    // The inner route's trace continues the door call's: one trace, so the
+    // door's own cost is the outer row minus the inner one.
+    let req = match crate::request_trace::current_traceparent() {
+        Some(tp) => req.header("traceparent", tp),
+        None => req,
+    };
 
     let started = std::time::Instant::now();
     let resp = req.send().await.map_err(|e| {
