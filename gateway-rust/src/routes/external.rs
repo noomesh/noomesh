@@ -886,11 +886,12 @@ async fn do_classify(
     // (they ran one after another: N texts cost N round trips end to end).
     // The first failure still fails the request, as before.
     use futures::StreamExt as _;
-    let chosen_all: Vec<Result<Vec<Value>, ExtFail>> = futures::stream::iter(texts.iter())
-        .map(|text| classify_one(&client, &url, &backend, text, &labels, multi))
-        .buffered(CLASSIFY_PARALLEL)
-        .collect()
-        .await;
+    // The futures are built first and the stream holds them, not a closure:
+    // a closure over `&String` in the stream makes the handler future fail
+    // axum's `Send` bound ("FnOnce is not general enough").
+    let calls: Vec<_> = texts.iter().map(|text| classify_one(&client, &url, &backend, text, &labels, multi)).collect();
+    let chosen_all: Vec<Result<Vec<Value>, ExtFail>> =
+        futures::stream::iter(calls).buffered(CLASSIFY_PARALLEL).collect().await;
     let mut results = Vec::with_capacity(texts.len());
     for (i, chosen) in chosen_all.into_iter().enumerate() {
         let chosen = chosen?;
