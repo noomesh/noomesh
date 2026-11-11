@@ -950,14 +950,19 @@ mod tests {
     }
 
     /// Speed review 2026-11-11: every MCP tool call built a new client, so a
-    /// new TCP + TLS handshake to the gateway. The shared client reuses one
-    /// kept-alive connection; two fresh clients (the old way) do not, which
-    /// is what makes this test able to fail.
+    /// new TCP + TLS handshake to the gateway (lab, N=200 over loopback
+    /// HTTPS: 87.5 ms/call fresh vs 0.84 ms/call shared). One client reused
+    /// keeps one connection; two fresh clients (the old way) do not, which
+    /// is what makes this test able to fail. NOT `tls::loopback_client()`
+    /// itself: it is a process-wide OnceLock, and
+    /// `the_loopback_client_verifies_against_the_cluster_ca` must be the
+    /// first to build it (with its CA set); touching it here broke that test.
     #[tokio::test]
     async fn self_calls_reuse_one_connection() {
         let (base, seen) = peer_recording_server().await;
+        let shared = crate::tls::client_builder().build().unwrap();
         for _ in 0..2 {
-            crate::tls::loopback_client().get(format!("{base}/ping")).send().await.unwrap().text().await.unwrap();
+            shared.get(format!("{base}/ping")).send().await.unwrap().text().await.unwrap();
         }
         for _ in 0..2 {
             crate::tls::client_builder().build().unwrap().get(format!("{base}/ping")).send().await.unwrap().text().await.unwrap();
@@ -977,6 +982,9 @@ mod tests {
         assert!(exec.contains("let client = crate::tls::loopback_client();"), "{exec}");
         assert!(exec.contains(".timeout(std::time::Duration::from_secs(spec.timeout_secs))"), "{exec}");
         assert!(!exec.contains("client_builder()") && !exec.contains("std::fs::read("), "no per-call client or CA read: {exec}");
+        // No test in this module touches the process-wide client (see above).
+        let tests = &include_str!("mcp_external.rs")[include_str!("mcp_external.rs").find("mod tests {").unwrap()..];
+        assert_eq!(tests.matches(concat!("tls::loopback", "_client()")).count(), 0, "a test built the shared OnceLock client");
     }
 
     async fn failed_send(url: &str, timeout_ms: u64) -> reqwest::Error {
