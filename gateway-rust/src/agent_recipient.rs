@@ -135,6 +135,24 @@ pub(crate) fn retired_refusal(to: &str, at: &chrono::DateTime<chrono::Utc>, sugg
     }
 }
 
+/// A reply in `thread` to `to`: refused when `to` took part in that thread
+/// only as an earlier, retired generation of a reused name (0.6.24). The
+/// mail was meant for the conversation that ended, not for whoever holds
+/// the name now.
+pub(crate) async fn thread_reply_refusal(db: &PgPool, to: &str, thread: Option<&str>) -> Result<Option<String>, sqlx::Error> {
+    let Some(t) = thread.filter(|t| !t.trim().is_empty()) else { return Ok(None) };
+    if !to.contains(crate::auth::CONNECTION_SEP) {
+        return Ok(None);
+    }
+    if crate::repo::agent_names::only_past_generation_in_thread(db, t, to).await? {
+        return Ok(Some(format!(
+            "'{to}' in thread '{t}' was an earlier conversation that has retired; the name now belongs to a different \
+             conversation, so the reply was not sent"
+        )));
+    }
+    Ok(None)
+}
+
 /// The warning a [`Recipient::Unheld`] send carries.
 pub(crate) fn unheld_warning(to: &str, candidates: &[String]) -> String {
     let head = format!(

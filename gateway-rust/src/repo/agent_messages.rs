@@ -61,7 +61,10 @@ pub async fn is_party(db: &PgPool, thread: &str, agent: &str) -> Result<Option<b
         return Ok(None);
     }
     let party: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM noo_agent_messages WHERE thread_id = $1 AND (from_agent = $2 OR to_agent = $2))",
+        // Mail of a past generation of a reused name is not this holder's:
+        // a new holder is no party to the threads its predecessor was in.
+        "SELECT EXISTS (SELECT 1 FROM noo_agent_messages m WHERE m.thread_id = $1 AND (m.from_agent = $2 OR m.to_agent = $2) \
+           AND NOT EXISTS (SELECT 1 FROM noo_agent_orphans o WHERE o.message_id = m.id))",
     )
     .bind(thread)
     .bind(agent)
@@ -175,9 +178,13 @@ fn row_json(r: &sqlx::postgres::PgRow) -> Value {
 /// `owner/…` session), plus thread-addressed posts in threads it took part
 /// in. `split_part(name, '/', 1)` is the account (`auth::account_of`); for a
 /// bare account it is the name itself, already covered.
+// The thread arm counts only participation of THIS generation of the name:
+// mail orphaned from a past holder of a reused name (migration 119) does not
+// make the new holder a party to that holder's threads.
 const AGENT_CLAUSE: &str = " AND (from_agent = $N OR to_agent = $N OR to_agent = split_part($N, '/', 1) \
     OR (to_agent = 'thread' AND thread_id IN \
-    (SELECT thread_id FROM noo_agent_messages WHERE from_agent = $N OR to_agent = $N)))";
+    (SELECT t.thread_id FROM noo_agent_messages t WHERE (t.from_agent = $N OR t.to_agent = $N) \
+       AND NOT EXISTS (SELECT 1 FROM noo_agent_orphans o WHERE o.message_id = t.id))))";
 
 /// An ACCOUNT's view: [`AGENT_CLAUSE`] widened from one name to the name
 /// and everything under `<name>/`. `starts_with` rather than `LIKE`, so a
@@ -332,6 +339,7 @@ pub async fn threads(db: &PgPool, agent: Option<&str>, owner: Option<&str>, limi
         "SELECT thread_id, COUNT(*) AS n, MIN(ts) AS started, MAX(ts) AS last, \
                 array_agg(DISTINCT from_agent) AS senders, array_agg(DISTINCT to_agent) AS recipients \
          FROM noo_agent_messages WHERE 1=1{clause} \
+           AND NOT EXISTS (SELECT 1 FROM noo_agent_orphans o WHERE o.message_id = noo_agent_messages.id) \
          GROUP BY thread_id ORDER BY MAX(ts) DESC LIMIT $2"
     );
     let rows = sqlx::query(sqlx::AssertSqlSafe(&*sql))

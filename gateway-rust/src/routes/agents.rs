@@ -2361,6 +2361,9 @@ async fn messages_send(
             return Err(AppError::Conflict(crate::agent_recipient::retired_refusal(&req.to, &at, &names)));
         }
     };
+    if let Some(why) = crate::agent_recipient::thread_reply_refusal(&state.db, &req.to, req.thread_id.as_deref()).await? {
+        return Err(AppError::Conflict(why));
+    }
     // Whether anyone is reading `to` now (0.6.24). Only a registered
     // mailbox has a state; an account, a node or a key reads as null.
     let delivery = crate::agent_mailbox::delivery(&state.db, &req.to).await;
