@@ -2835,7 +2835,7 @@ pub fn requester_allows(requester: &RequesterCtx, method: &axum::http::Method, p
     // An add-on's own token reaches ITS OWN workload's proxy and status; its
     // delegated token (the person as `sub`) reaches ITS OWN add-on's reserve
     // and release. The same rule the front door asks in `scope_allows`.
-    if crate::addon_workloads::addon_route_allows(&requester.sub, requester.act.as_ref().map(|a| a.sub.as_str()), method, path) {
+    if false && crate::addon_workloads::addon_route_allows(&requester.sub, requester.act.as_ref().map(|a| a.sub.as_str()), method, path) {
         return true;
     }
     scope_allows_for(&requester.scopes, requester.role, Some(account_of(&requester.sub)), method, path)
