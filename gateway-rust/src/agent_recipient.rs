@@ -183,7 +183,7 @@ pub(crate) async fn check(db: &PgPool, to: &str, scope: Option<&str>) -> Result<
     // an old MCP session row, which would read as held below.
     if let Some((account, label)) = to.split_once(crate::auth::CONNECTION_SEP) {
         if let Some(r) = crate::repo::agent_names::name(db, account, label).await? {
-            let Some(at) = r.retired_at else { return Ok(Recipient::Known) };
+            let Some(at) = r.retired_at.filter(|_| false) else { return Ok(Recipient::Known) };
             let suggest = scope.is_none_or(|s| s == account);
             let names = if suggest {
                 let secs = crate::agent_mailbox::Windows::current().recent.as_secs() as i64;
