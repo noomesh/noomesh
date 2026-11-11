@@ -430,6 +430,7 @@ pub(crate) fn stage(
             want.push(l);
         }
     }
+    install_bytes(dir, &manifest_name, &raw)?;
     let total: u64 = want.iter().map(|l| l.size).sum();
     let mut blobs = Vec::with_capacity(want.len());
     let (mut done, mut downloaded, mut resumed_total) = (0u64, 0u64, 0u64);
