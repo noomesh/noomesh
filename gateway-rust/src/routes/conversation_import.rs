@@ -135,7 +135,7 @@ pub(super) async fn receive(
 /// version refused every `act`, so it refused the MCP door, which is how a
 /// voice add-on publishes through its MCP-door key.
 fn may_publish(r: &RequesterCtx) -> bool {
-    let Some(a) = &r.act else { return true };
+    let Some(a) = &r.act else { return false };
     // Fail closed: a key actor needs a consumer, an issuing account equal to
     // the token subject's own account (ids, byte for byte), and none of the
     // markers another delegation kind carries (a worker run's `task`, an
