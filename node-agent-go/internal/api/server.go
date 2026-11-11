@@ -363,6 +363,8 @@ func (s *Server) registerRoutes() {
 	s.mux.Handle("GET /harness/placement", harnessMW(ownHarnessOnly(http.HandlerFunc(s.handleHarnessPlacement))))
 	s.mux.Handle("POST /v1/completions", modelMW(http.HandlerFunc(s.handleInferenceProxy)))
 	s.mux.Handle("POST /v1/embeddings", ctrlMW(http.HandlerFunc(s.handleInferenceProxy)))
+	// A placed vLLM's /metrics for the gateway's collector (backend_metrics.go).
+	s.mux.Handle("GET /backend-metrics/{backend}", ctrlMW(http.HandlerFunc(s.handleBackendMetrics)))
 	s.mux.Handle("GET /v1/models", modelMW(http.HandlerFunc(s.handleListModels)))
 
 	// Rerank proxy — forwards to this node's local reranker (TEI cross-encoder
