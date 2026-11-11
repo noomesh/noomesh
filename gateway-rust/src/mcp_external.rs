@@ -322,6 +322,27 @@ pub(crate) fn mint_caller_jwt(
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_secs();
+    let claims = caller_claims(user, role, user_scopes, consumer, session_label, now);
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .ok()
+}
+
+/// The claims [`mint_caller_jwt`] signs, at `now`: the door's caller token,
+/// exactly. Split out so a route's own tests can hold a real door token's
+/// claims without a signing secret (conversation import's who-may-publish
+/// rule is tested against these, not a hand-built requester).
+pub(crate) fn caller_claims(
+    user: &str,
+    role: crate::auth::Role,
+    user_scopes: &[String],
+    consumer: &str,
+    session_label: Option<&str>,
+    now: u64,
+) -> Value {
     let mut scopes: Vec<String> =
         role.legacy_scopes().iter().map(|s| s.to_string()).collect();
     for s in user_scopes {
@@ -353,7 +374,7 @@ pub(crate) fn mint_caller_jwt(
             user.to_string()
         }
     };
-    let claims = json!({
+    json!({
         "sub": sub,
         "act": { "sub": format!("key:{consumer}"), "iss_user": user },
         "role": role.as_str(),
@@ -369,13 +390,7 @@ pub(crate) fn mint_caller_jwt(
         // names the key that actually authenticated, which is the only
         // thing about the calling software the gateway can prove.
         "harness": format!("mcp-external:{consumer}"),
-    });
-    encode(
-        &Header::new(Algorithm::HS256),
-        &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
-    )
-    .ok()
+    })
 }
 
 // ─────────────────────────── request building ───────────────────────────
