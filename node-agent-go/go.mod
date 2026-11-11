@@ -3,9 +3,10 @@ module github.com/noomesh/noomesh/node-agent-go
 go 1.26.0
 
 // The patch release the agent builds with: GO-2026-6617 (net/http HTTP/2
-// HPACK race) is fixed in 1.26.9 and GO-2026-6809 (crypto/x509) in 1.26.10,
-// and govulncheck gates CI on both.
-toolchain go1.26.10
+// HPACK race) is fixed in 1.26.9, GO-2026-6809 (crypto/x509) in 1.26.10 and
+// GO-2026-6859 (net/http MaxBytesReader header race) in 1.26.11, and
+// govulncheck gates CI on them.
+toolchain go1.26.11
 
 require (
 	github.com/gorilla/websocket v1.5.3
