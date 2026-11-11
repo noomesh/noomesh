@@ -339,11 +339,11 @@ pub mod fixtures {
         let scratch = format!("{head}/{DB_NAME}");
         BUILT
             .get_or_init(|| async {
-                let admin = sqlx::postgres::sqlx::PgPoolOptions::new().max_connections(1).connect(&dsn).await.expect("connect to NOO_BROKER_TEST_DSN");
+                let admin = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect(&dsn).await.expect("connect to NOO_BROKER_TEST_DSN");
                 let _ = sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {DB_NAME} (FORCE)"))).execute(&admin).await;
                 sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE DATABASE {DB_NAME}"))).execute(&admin).await.expect("create scratch db");
                 admin.close().await;
-                let build = sqlx::postgres::sqlx::PgPoolOptions::new().max_connections(2).connect(&scratch).await.expect("connect scratch");
+                let build = sqlx::postgres::PgPoolOptions::new().max_connections(2).connect(&scratch).await.expect("connect scratch");
                 unsafe { std::env::set_var("NOO_APP_DB_PASSWORD", "ephemeral-not-a-secret") };
                 for ext in ["vector", "pg_trgm"] {
                     sqlx::query(sqlx::AssertSqlSafe(format!("CREATE EXTENSION IF NOT EXISTS {ext}"))).execute(&build).await.expect("extension");
@@ -354,7 +354,7 @@ pub mod fixtures {
             .await;
         use std::str::FromStr as _;
         let opts = sqlx::postgres::PgConnectOptions::from_str(&scratch).expect("scratch dsn").options([("search_path", "mesh,public")]);
-        Some(sqlx::postgres::sqlx::PgPoolOptions::new().max_connections(4).connect_with(opts).await.expect("connect scratch"))
+        Some(sqlx::postgres::PgPoolOptions::new().max_connections(4).connect_with(opts).await.expect("connect scratch"))
     }
 
     pub async fn backdate(db: &sqlx::PgPool, account: &str, label: &str, secs: i64) {
