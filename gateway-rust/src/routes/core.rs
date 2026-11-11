@@ -2180,6 +2180,7 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
 
     // Open fds and the soft limit (fd_watch.rs; the 2026-11-02 EMFILE outage).
     body.push_str(&crate::fd_watch::metrics_text(&crate::fd_watch::read()));
+    body.push_str(&crate::proc_self::metrics_text(crate::proc_self::read()));
 
     // The audit trail (i520): chain verify failures, and spool rows lost or held.
     body.push_str(&crate::audit_verify::metrics_text());
