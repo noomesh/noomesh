@@ -299,15 +299,48 @@ def rc_number(tag: str) -> int:
     return int(tag.rsplit(".", 1)[1])
 
 
-def candidates(tag: str, list_rcs=rc_tags) -> list[str]:
-    """The rc tags a release may re-tag from, highest first: every rc of a
-    final; for an rc, only the LOWER rcs of the same version (never itself:
-    a re-run of rc.N must not re-tag from its own, possibly half-published,
-    images)."""
+def final_tags() -> list[str]:
+    """Every published FINAL stack tag (`stack-vX.Y.Z`, no `-rc.`)."""
+    return [t for t in git("tag", "--list", "stack-v*").splitlines() if "-rc." not in t]
+
+
+def version_of(tag: str) -> tuple[int, ...] | None:
+    """`stack-v0.6.23` / `stack-v0.6.23-rc.2` -> (0, 6, 23); None when it is
+    not three numbers (never compared, never chosen)."""
+    core = tag.removeprefix("stack-").removeprefix("v").split("-rc.", 1)[0]
+    parts = core.split(".")
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+
+def previous_final(tag: str, list_finals=final_tags) -> str | None:
+    """The highest final tag of a LOWER version than `tag`'s, or None."""
+    mine = version_of(tag)
+    if mine is None:
+        return None
+    lower = [(v, t) for t in list_finals() if (v := version_of(t)) is not None and v < mine]
+    return max(lower)[1] if lower else None
+
+
+def candidates(tag: str, list_rcs=rc_tags, list_finals=final_tags) -> list[str]:
+    """The tags a release may re-tag from, highest first: every rc of a
+    final; for an rc, the LOWER rcs of the same version (never itself: a
+    re-run of rc.N must not re-tag from its own, possibly half-published,
+    images), and, when it has none (an rc.1), the PREVIOUS FINAL. An rc.1
+    used to have nothing to compare against and rebuilt every image even when
+    the release changed five gateway files (0.6.23, build-speed review
+    2026-11-11); the previous final is compared under the same per-image
+    input rule, and re-tagged by its signed lock's digests. A FINAL never
+    re-tags from an earlier final: it ships its own rc's bits."""
     if "-rc." not in tag:
         return list(list_rcs(tag))
     version, n = tag.rsplit("-rc.", 1)
-    return [t for t in list_rcs(version) if rc_number(t) < int(n)]
+    lower = [t for t in list_rcs(version) if rc_number(t) < int(n)]
+    if lower:
+        return lower
+    prev = previous_final(tag, list_finals)
+    return [prev] if prev else []
 
 
 def fetch_asset(repo: str, rc_tag: str, suffix: str, token: str) -> str:
@@ -476,7 +509,7 @@ def _rc_plan(final_tag: str, repo: str, sibling_shas: dict[str, str],
          tree_of=lambda ref: git("rev-parse", f"{ref}^{{tree}}"),
          commit_of=lambda ref: git("rev-parse", f"{ref}^{{commit}}"),
          list_rcs=rc_tags, sib_tree=sibling_tree,
-         changed_of=changed_files, inputs_table=None) -> dict:
+         changed_of=changed_files, inputs_table=None, list_finals=final_tags) -> dict:
     build_all = {img: False for img in SIBLING_INPUTS}
     result = {"rc_tag": "", "rc_commit": "", "retag": build_all, "rc_digests": {}, "why": {}}
 
@@ -487,13 +520,15 @@ def _rc_plan(final_tag: str, repo: str, sibling_shas: dict[str, str],
     if os.environ.get("RELEASE_RETAG", "").strip().lower() == "off":
         return everything("re-tagging disabled by the repo variable RELEASE_RETAG=off")
     final_tree = tree_of(final_tag)
-    cands = candidates(final_tag, list_rcs)
+    cands = candidates(final_tag, list_rcs, list_finals)
     rc = next((t for t in cands if tree_of(t) == final_tree), None)
     rebuild: dict[str, str] = {}   # per-image: why this image builds although an rc exists
     if rc is None:
         if "-rc." not in final_tag:
             return everything(f"no {final_tag}-rc.N has this tree ({final_tree[:12]})")
         miss = f"no earlier rc of {final_tag.rsplit('-rc.', 1)[0]} has this tree ({final_tree[:12]})"
+        if cands and "-rc." not in cands[0]:
+            miss = f"rc.1 of {final_tag.rsplit('-rc.', 1)[0]}: compared with the previous final {cands[0]}"
         if not cands:
             return everything(miss)
         # Per-image: diff against the highest lower rc. Any doubt builds.
@@ -545,14 +580,14 @@ def _rc_plan(final_tag: str, repo: str, sibling_shas: dict[str, str],
             retag[img], why[img] = False, f"rebuild: {rc}.lock has no {img} digest"
             continue
         if img in rebuild:
-            retag[img], why[img] = False, f"rebuild: {rebuild[img]} (vs {rc})"
+            retag[img], why[img] = False, f"build, because {rebuild[img]} (vs {rc})"
             continue
         bad = [sib_equal[s][1] for s in sibs if not sib_equal[s][0]]
         if bad:
             retag[img], why[img] = False, "rebuild: " + "; ".join(bad)
             continue
         retag[img] = True
-        why[img] = f"re-tag from {rc}" + ("" if tree_of(rc) == final_tree else ": no build input changed") + (": " + "; ".join(sib_equal[s][1] for s in sibs) if sibs else "")
+        why[img] = f"re-tag from {rc}" + (f"@{digests[img]}" if img in digests else "") + ("" if tree_of(rc) == final_tree else ": no build input changed") + (": " + "; ".join(sib_equal[s][1] for s in sibs) if sibs else "")
         if img in NOT_IN_LOCK and img not in digests:
             # An rc cut before stack-<rc>.bases existed: the re-tag is checked
             # only against the rc TAG (it must still resolve), not a recorded
