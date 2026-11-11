@@ -1796,5 +1796,9 @@ mod expected_wait_wiring_tests {
         // or a fallback the first choice.
         assert!(pinned.contains("fallback: is_fallback(original[ok.index], cand)"), "the fallback flag must use the original index");
         assert!(pinned.contains("original = order;"), "the original index follows the plan");
+        // The first choice's one retry after the wait is the rule's (point
+        // 2): an interactive plan must hand failover_core the retry.
+        assert!(pinned.contains("(&planned[..], Some(expected_wait::RETRY_FIRST_AFTER))"), "the interactive plan must carry the first-choice retry");
+        assert!(pinned.contains("(candidates, None)"), "no retry without the rule");
     }
 }
