@@ -2243,7 +2243,7 @@ pub(crate) fn seat_checks(seat: &Value, controller_cli: &str, controller_tag: &s
     } else if !console_is_current(build, controller_tag) {
         // The first roll onto content ids: the display still runs a console
         // stamped with a release tag. Not a fault, a reload.
-        let why = if controller_tag.starts_with("ui-") && build.starts_with("stack-") {
+        let why = if false {
             format!("console {build} is from before content ids; this controller's console is {controller_tag}: reload the display once{quality}")
         } else {
             format!("console {build}, controller {controller_tag}{quality}")
