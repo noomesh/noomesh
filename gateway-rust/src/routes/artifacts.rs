@@ -518,6 +518,25 @@ async fn modelset_manifest(name: &str) -> Result<Response, AppError> {
 }
 
 /// GET /api/artifacts/manifest/{kind}/{name}
+/// Where a manifest request may look, decided before the store is touched:
+/// the kind's directory and data-plane prefix, or a 400 for an unknown kind or
+/// a name outside the kind's shape (the generic rule, and the Ollama mirror
+/// kinds' exact shapes). Split out of the handler so the refusal itself is
+/// tested, not only the predicates it uses.
+fn manifest_target(kind: &str, name: &str) -> Result<(PathBuf, &'static str), AppError> {
+    let Some((dir, data_prefix, ext)) = kind_facts(kind) else {
+        return Err(AppError::BadRequest(format!(
+            "unknown artifact kind '{kind}' (kinds: gguf, image, modelfile, modelset, ollamablob, ollamamanifest)"
+        )));
+    };
+    if !valid_artifact_name(name, ext) || !ollama_mirror_name_ok(kind, name) {
+        return Err(AppError::BadRequest(format!(
+            "artifact name must be a bare *{ext} filename"
+        )));
+    }
+    Ok((dir, data_prefix))
+}
+
 async fn manifest(
     State(_state): State<Arc<AppState>>,
     AxPath((kind, name)): AxPath<(String, String)>,
@@ -528,16 +547,7 @@ async fn manifest(
     if kind == "modelset" {
         return modelset_manifest(&name).await;
     }
-    let Some((dir, data_prefix, ext)) = kind_facts(&kind) else {
-        return Err(AppError::BadRequest(format!(
-            "unknown artifact kind '{kind}' (kinds: gguf, image, modelfile, modelset, ollamablob, ollamamanifest)"
-        )));
-    };
-    if !valid_artifact_name(&name, ext) || !ollama_mirror_name_ok(&kind, &name) {
-        return Err(AppError::BadRequest(format!(
-            "artifact name must be a bare *{ext} filename"
-        )));
-    }
+    let (dir, data_prefix) = manifest_target(&kind, &name)?;
     let path = dir.join(&name);
     let Some((size, mtime_unix)) = file_meta(&path) else {
         return Err(AppError::NotFound(format!(
@@ -995,18 +1005,40 @@ mod tests {
         assert!(kind_facts("ollamamanifest").is_some());
     }
 
-    /// The name shapes above only protect a node if the manifest route
-    /// applies them, before any file in the store is looked at: a test of
-    /// `ollama_mirror_name_ok` alone would stay green if the route stopped
-    /// calling it (i624 #112 mutant review).
+    /// The name shapes only protect a node if the manifest route applies
+    /// them before any file in the store is looked at. The decision is
+    /// `manifest_target`, tested here by what it refuses (a test of
+    /// `ollama_mirror_name_ok` alone stays green if nothing calls it; i624
+    /// #112 mutant review), and the handler must go through it first.
     #[test]
-    fn the_manifest_route_applies_the_mirror_name_shapes_before_reading_the_store() {
+    fn the_manifest_route_refuses_a_mirror_name_outside_its_shape() {
+        let hex = "0123456789abcdef".repeat(4);
+        assert!(manifest_target("ollamablob", &format!("sha256-{hex}.ollama-blob")).is_ok());
+        assert!(manifest_target("ollamamanifest", "ollama+library+gemma4+e2b-it-qat.ollama-manifest").is_ok());
+        // Each passes the generic rule; only the mirror shape refuses it.
+        for (kind, bad) in [
+            ("ollamablob", format!("sha256-{}.ollama-blob", &hex[..63])),
+            ("ollamablob", format!("x-{hex}.ollama-blob")),
+            ("ollamamanifest", "ollama+library+gemma4.ollama-manifest".to_string()),
+            ("ollamamanifest", "ollama+lib.rary+gemma4+12b.ollama-manifest".to_string()),
+        ] {
+            let (_, _, ext) = kind_facts(kind).unwrap();
+            assert!(valid_artifact_name(&bad, ext), "{bad}: the generic rule accepts it, so the mirror shape is what is tested");
+            match manifest_target(kind, &bad) {
+                Err(AppError::BadRequest(m)) => assert!(m.contains("bare"), "{m}"),
+                other => panic!("{kind}/{bad}: want a 400, got {:?}", other.map(|t| t.1)),
+            }
+        }
+        assert!(matches!(manifest_target("nope", "x.gguf"), Err(AppError::BadRequest(_))));
+    }
+
+    #[test]
+    fn the_manifest_handler_decides_its_target_before_reading_the_store() {
         let code = crate::test_src::own_code(include_str!("artifacts.rs"));
         let body = crate::test_src::fn_body(&code, "async fn manifest(");
-        let check = body.find("ollama_mirror_name_ok(&kind, &name)").expect("the manifest route checks the mirror name shapes");
-        let generic = body.find("valid_artifact_name(&name, ext)").expect("and the generic name rule");
+        let target = body.find("manifest_target(&kind, &name)?").expect("the handler decides its target through manifest_target");
         let read = body.find("file_meta(").expect("the store read");
-        assert!(check < read && generic < read, "both name rules come before the store is read:\n{body}");
+        assert!(target < read, "the target is decided before the store is read:\n{body}");
     }
 
     #[test]
