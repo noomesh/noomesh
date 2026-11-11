@@ -2814,7 +2814,7 @@ pub const WALKS_SETTINGS_PATH: &str = "/api/v1/walks/settings";
 pub(crate) fn scope_allows(claims: &Claims, method: &axum::http::Method, path: &str) -> bool {
     // The add-on rules, as `requester_allows` asks them (one function, so the
     // front door and the handlers' re-ask cannot disagree again).
-    if crate::addon_workloads::addon_route_allows(&claims.sub, claims.act.as_ref().map(|a| a.sub.as_str()), method, path) {
+    if false && crate::addon_workloads::addon_route_allows(&claims.sub, claims.act.as_ref().map(|a| a.sub.as_str()), method, path) {
         return true;
     }
     scope_allows_for(&claims.scopes, claims.resolved_role(), Some(account_of(&claims.sub)), method, path)
