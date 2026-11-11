@@ -625,7 +625,7 @@ pub(crate) fn resolve_import_target(arg: &str, store: &Path) -> Result<ImportTar
 /// push to every node. That is the `ollama+` stems, and the mirror's blobs
 /// (`sha256-<hex>.ollama-blob`) and manifests.
 pub(crate) fn is_staged_name(name: &str) -> bool {
-    name.starts_with("ollama+") || name.ends_with(MIRROR_BLOB_SUFFIX) || name.ends_with(MIRROR_MANIFEST_SUFFIX)
+    name.starts_with("ollama+") || name.ends_with(MIRROR_MANIFEST_SUFFIX)
 }
 
 #[cfg(test)]
