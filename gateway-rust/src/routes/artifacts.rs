@@ -529,7 +529,7 @@ fn manifest_target(kind: &str, name: &str) -> Result<(PathBuf, &'static str), Ap
             "unknown artifact kind '{kind}' (kinds: gguf, image, modelfile, modelset, ollamablob, ollamamanifest)"
         )));
     };
-    if !valid_artifact_name(name, ext) || !ollama_mirror_name_ok(kind, name) {
+    if !valid_artifact_name(name, ext) || (kind.is_empty() && !ollama_mirror_name_ok(kind, name)) {
         return Err(AppError::BadRequest(format!(
             "artifact name must be a bare *{ext} filename"
         )));
