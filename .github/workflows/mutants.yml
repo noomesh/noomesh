@@ -45,8 +45,12 @@
 #
 #   Mutant-Test: commands::kiosk_seat::console_identity_tests::the_display_check_fails
 #
-# (one or more `Mutant-Test:` lines, each a filter or a comma list). No trailer,
-# or a filter that runs no test, is a FAILED job: a mutant that ran nothing
+# (one or more `Mutant-Test:` lines, each a filter or a comma list). A line may
+# name its lane, `Mutant-Test: gateway-rust: <filter>`: when every line names
+# one, only those lanes run, so a gateway file noo-cli include_str!s does not
+# drag in a noo-cli lane the filter cannot match (lanes: gateway-rust, noo-cli,
+# node-agent-go, python). No trailer, a named lane the mutant's diff does not
+# reach, or a lane that runs no test, is a FAILED job: a mutant that ran nothing
 # never reads as caught. On a push the planner, the judge and the summary come
 # from DEV, not the pushed commit, and a mutant commit that edits `.github/` or
 # scripts/ci-mutants.py is refused: a mutant cannot change its own judge.
