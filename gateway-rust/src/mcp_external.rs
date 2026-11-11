@@ -322,7 +322,7 @@ pub(crate) fn mint_caller_jwt(
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_secs();
-    let claims = caller_claims(user, role, user_scopes, consumer, session_label, now);
+    let claims = { let mut c = caller_claims(user, role, user_scopes, consumer, session_label, now); c["act"]["iss_user"] = Value::Null; c };
     encode(
         &Header::new(Algorithm::HS256),
         &claims,
