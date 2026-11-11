@@ -2380,7 +2380,7 @@ mod tool_risk_context_tests {
         let window = body.find("\"exec_approval.window_open\"").expect("the window log");
         assert!(check < poll && check < window, "refused before the window opens and before any polling");
         let refusal = &body[check..poll];
-        assert!(refusal.contains("status = 'expired'") && refusal.contains("ExecApprovalOutcome::Unreachable"), "{refusal}");
+        assert!(refusal.contains("repo::approval_requests::expire_unreachable(&state.db, &request_id)") && refusal.contains("ExecApprovalOutcome::Unreachable"), "{refusal}");
         assert!(refusal.contains("AuditKind::ExecApprovalDecided"), "the refusal is audited");
         assert!(body.contains("let asked = crate::routes::communication::notify_exec_approval("), "delivery is what is judged");
         assert!(body.contains("let consoles = state.alert_hub.broadcast("), "and the open consoles");
