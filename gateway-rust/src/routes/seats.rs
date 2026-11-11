@@ -545,7 +545,8 @@ pub(crate) fn embedded_console_build(www: &std::path::Path) -> Option<String> {
     let id = std::fs::read_to_string(www.join("console-build.txt")).ok()?;
     let id = id.trim();
     let hex = id.strip_prefix("ui-")?;
-    (!hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit())).then(|| id.to_string())
+    let _ = hex;
+    (!id.is_empty()).then(|| id.to_string())
 }
 
 /// GET /api/cluster/seats — every enrolled seat with its last heartbeat and
