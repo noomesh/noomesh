@@ -889,11 +889,10 @@ mod tests {
     }
 
     /// Collisions: names compare case-insensitively; non-ASCII is refused;
-    /// a chosen name may not take the reserved default shape; two
-    /// conversations racing for one new name: one wins, the other gets the
-    /// join refusal, never a silent share.
+    /// a chosen name may not take the reserved default shape. (The race for
+    /// a new name: `the_loser_of_a_race_for_a_new_name_gets_the_join_refusal`.)
     #[tokio::test]
-    async fn names_do_not_collide_by_case_shape_or_race() {
+    async fn names_do_not_collide_by_case_or_shape() {
         let Some(db) = database().await else { return };
         let a = acct();
         let g = register(&db, &a, "self:x", "claude", Some(&key_hash("client", "c1")), Some("General"), false).await.unwrap();
@@ -905,13 +904,29 @@ mod tests {
         let r = register(&db, &a, "self:x", "claude", Some(&key_hash("client", "c4")), Some("abc123"), false).await.unwrap_err();
         assert!(r.contains("reserves"), "{r}");
         assert!(register(&db, &a, "self:x", "claude", Some(&key_hash("client", "c5")), Some("weekly"), false).await.is_ok(), "six letters, no digit: not the default shape");
-        let (k1, k2) = (key_hash("client", "r1"), key_hash("client", "r2"));
-        let (x, y) = tokio::join!(
-            register(&db, &a, "self:x", "claude", Some(&k1), Some("raced"), false),
-            register(&db, &a, "self:x", "claude", Some(&k2), Some("raced"), false),
-        );
-        assert_eq!([x.is_ok(), y.is_ok()].iter().filter(|o| **o).count(), 1, "exactly one wins: {x:?} {y:?}");
-        let lost = if x.is_ok() { y.unwrap_err() } else { x.unwrap_err() };
+    }
+
+    /// The race itself, made deterministic: conversation A has inserted a
+    /// new name but not committed; B registers the same name, finds no row
+    /// (A is invisible), and blocks on the unique index. When A commits, B's
+    /// insert does nothing and B must get the join refusal, never a silent
+    /// share. (`join!` on one thread let B start after A committed, which
+    /// took the ordinary held path and proved nothing.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_loser_of_a_race_for_a_new_name_gets_the_join_refusal() {
+        let Some(db) = database().await else { return };
+        let a = acct();
+        let mut winner = db.begin().await.unwrap();
+        assert!(crate::repo::agent_names::insert_name(&mut winner, &a, "claude-raced", "chosen", "self:x").await.unwrap());
+        let (db2, a2) = (db.clone(), a.clone());
+        let loser = tokio::spawn(async move {
+            register(&db2, &a2, "self:x", "claude", Some(&key_hash("client", "loser")), Some("raced"), false).await
+        });
+        // B reaches its INSERT and waits on A's uncommitted row.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(!loser.is_finished(), "B must be blocked on the unique index while A is open");
+        winner.commit().await.unwrap();
+        let lost = loser.await.unwrap().unwrap_err();
         assert!(lost.contains("held by another conversation") && lost.contains("join=true"), "{lost}");
     }
 
