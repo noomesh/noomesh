@@ -132,8 +132,8 @@ pub(super) async fn receive(
 /// token (`mcp_external::mint_caller_jwt`) and every token exchange. Any
 /// other actor is delegation and is refused: an agent or task run, a worker,
 /// an add-on's delegated token, or a key bound to ANOTHER account. The first
-/// version refused every `act`, so it refused the MCP door, which is how
-/// pai-voice publishes.
+/// version refused every `act`, so it refused the MCP door, which is how a
+/// voice add-on publishes through its MCP-door key.
 fn may_publish(r: &RequesterCtx) -> bool {
     let Some(a) = &r.act else { return true };
     // Fail closed: a key actor needs a consumer, an issuing account equal to
@@ -311,8 +311,8 @@ mod tests {
 
     /// The MCP door's own token (its real claims, `caller_claims`, which
     /// `mint_caller_jwt` signs): the person's key, issued by the person's
-    /// account. It publishes. That is pai-voice's path; the first version
-    /// refused it.
+    /// account. It publishes. That is an add-on's MCP-door key's path; the
+    /// first version refused it.
     #[test]
     fn the_doors_own_token_publishes() {
         let r = from_claims(&door_claims("ada"));
