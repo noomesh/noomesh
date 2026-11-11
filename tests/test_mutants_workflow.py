@@ -74,6 +74,18 @@ def test_caches_are_restore_only():
             assert not w.get("cache"), f"{job}: {u.split('@')[0]} with `cache:` saves a cache"
 
 
+def test_the_verdict_upload_includes_its_dot_directory_and_fails_without_it():
+    # 11-11: upload-artifact skips hidden paths by default, so every verdict in
+    # .mutant-results/ was dropped and every caught mutant's run read red.
+    ups = [(job, s["with"]) for job, s in _steps() if s.get("uses", "").startswith("actions/upload-artifact@")]
+    assert ups, "the mutant job uploads its verdict"
+    for job, w in ups:
+        hidden = any(part.startswith(".") for part in str(w["path"]).split("/") if part not in ("", ".", ".."))
+        if hidden:
+            assert w.get("include-hidden-files") is True, f"{job}: {w['path']} is a dot path; set include-hidden-files: true"
+        assert w.get("if-no-files-found") == "error", f"{job}: a missing verdict must fail the job, not warn"
+
+
 def test_every_checkout_drops_its_credentials_and_every_action_is_pinned():
     for job, s in _steps():
         u = s.get("uses", "")
