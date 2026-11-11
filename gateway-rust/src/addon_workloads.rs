@@ -273,6 +273,32 @@ pub fn delegated_reserve_allows(act_sub: Option<&str>, path: &str) -> bool {
     matches!(parts.as_slice(), [owner, w, op] if *owner == addon && workload_name_ok(w) && matches!(*op, "reserve" | "release"))
 }
 
+/// THE add-on admission at the tier gate, asked by BOTH `auth::scope_allows`
+/// (the front door, from the token's claims) and `auth::requester_allows`
+/// (a handler re-asking about another route), so the two cannot disagree.
+///
+/// They did on stack-v0.6.22: these two rules were wired into
+/// `requester_allows` only, the front door never asked them, and an add-on's
+/// own token (`addon:svc:<addon>`) got a bare 403 on its own workload's
+/// status (the voice worker could not be released: the add-on could not read
+/// its reservation to drain).
+///
+/// - the add-on's own token: its own workload's `proxy/...` (any method: the
+///   proxy forwards the method) and `status` (GET/HEAD), see [`proxy_allows`];
+/// - its delegated token (`act.sub = addon:<addon>`): its own workload's
+///   `reserve` and `release` (POST), see [`delegated_reserve_allows`].
+///
+/// Everything else stays with the tier gate. The handlers check ownership
+/// again (`subject_owns`, `delegated_holder`).
+pub fn addon_route_allows(sub: &str, act_sub: Option<&str>, method: &axum::http::Method, path: &str) -> bool {
+    use axum::http::Method;
+    if proxy_allows(sub, path) {
+        let is_status = path.rsplit('/').next() == Some("status") && !path.contains("/proxy/");
+        return !is_status || matches!(*method, Method::GET | Method::HEAD);
+    }
+    delegated_reserve_allows(act_sub, path) && *method == Method::POST
+}
+
 /// Group declarations by add-on, for a report.
 pub fn by_addon() -> HashMap<String, Vec<WorkloadDecl>> {
     let mut m: HashMap<String, Vec<WorkloadDecl>> = HashMap::new();
@@ -432,5 +458,113 @@ mod tests {
         assert_eq!(split_key("Pai/Voice"), None);
         assert_eq!(split_key("pai-voice/voice_worker"), None, "the spec has no underscore");
         assert!(workload_name_ok("a") && workload_name_ok("voice-worker-2") && !workload_name_ok("1a") && !workload_name_ok(&"a".repeat(33)));
+    }
+
+    // ---- the front door (stack-v0.6.22: status 403'd the add-on's own token) ----
+
+    const FD_SECRET: &str = "front-door-test-signing-key-not-a-deployed-credential";
+
+    /// The add-on's own token exactly as `/api/addon/token` mints it, as the
+    /// middleware verifies it.
+    fn own_token_claims() -> crate::auth::Claims {
+        let t = crate::auth::mint_addon_jwt("svc:rhaddon", &["metrics".into()], 60, FD_SECRET, None).expect("mint");
+        crate::auth::verify_token_with(&t, FD_SECRET, None).expect("verify")
+    }
+
+    /// A real add-on delegated token (i143) for a user-tier person.
+    fn delegated_claims() -> crate::auth::Claims {
+        let person = crate::auth::RequesterCtx { sub: "alice".into(), scopes: vec!["read".into()], role: crate::auth::Role::User,
+            harness: None, act: None };
+        let t = crate::addon_delegation::mint_with(&person, "rhaddon", None, FD_SECRET, None).expect("mint ADT");
+        let c = crate::auth::verify_token_with(&t, FD_SECRET, None).expect("verify");
+        assert_eq!(crate::addon_delegation::addon_of(&c), Some("rhaddon"), "a real ADT");
+        c
+    }
+
+    /// The RequesterCtx the middleware builds from verified claims.
+    fn ctx_of(c: &crate::auth::Claims) -> crate::auth::RequesterCtx {
+        crate::auth::RequesterCtx { sub: c.sub.clone(), scopes: c.scopes.clone(), role: c.resolved_role(), harness: None,
+            act: c.act.clone() }
+    }
+
+    const W: &str = "/api/addon-workloads";
+
+    /// (a) The front door's own decision (`auth::scope_allows`, what
+    /// `require_any_auth` asks of every non-inference JWT) admits the add-on's
+    /// own token to ITS workload's status and proxy, and nothing else here.
+    #[test]
+    fn the_front_door_admits_an_addons_own_token_to_its_status_and_proxy() {
+        use axum::http::Method;
+        let c = own_token_claims();
+        assert_eq!(c.sub, "addon:svc:rhaddon");
+        for (m, p) in [(Method::GET, format!("{W}/rhaddon/worker/status")), (Method::HEAD, format!("{W}/rhaddon/worker/status")),
+                       (Method::GET, format!("{W}/rhaddon/worker/proxy/v1/health")),
+                       (Method::POST, format!("{W}/rhaddon/worker/proxy/v1/lifecycle/drain"))] {
+            assert!(crate::auth::scope_allows(&c, &m, &p), "{m} {p}");
+        }
+        for (m, p) in [(Method::GET, format!("{W}/other-addon/worker/status")),
+                       (Method::GET, format!("{W}/other-addon/worker/proxy/x")),
+                       (Method::POST, format!("{W}/rhaddon/worker/start")),
+                       (Method::POST, format!("{W}/rhaddon/worker/stop")),
+                       (Method::POST, format!("{W}/rhaddon/worker/status")),
+                       (Method::POST, format!("{W}/rhaddon/worker/reserve")),
+                       (Method::POST, format!("{W}/rhaddon/worker/release"))] {
+            assert!(!crate::auth::scope_allows(&c, &m, &p), "{m} {p} must stay refused");
+        }
+    }
+
+    /// (b) A real delegated token passes the front door on ITS add-on's reserve
+    /// and release (POST) only: not another add-on's, not another method, not
+    /// the proxy (that is the add-on's own token's).
+    #[test]
+    fn the_front_door_admits_a_delegated_token_to_its_own_reserve_and_release() {
+        use axum::http::Method;
+        let c = delegated_claims();
+        for op in ["reserve", "release"] {
+            assert!(crate::auth::scope_allows(&c, &Method::POST, &format!("{W}/rhaddon/worker/{op}")), "{op}");
+            assert!(!crate::auth::scope_allows(&c, &Method::POST, &format!("{W}/other-addon/worker/{op}")), "another add-on's {op}");
+            assert!(!crate::auth::scope_allows(&c, &Method::DELETE, &format!("{W}/rhaddon/worker/{op}")), "DELETE {op}");
+        }
+        assert!(!crate::auth::scope_allows(&c, &Method::POST, &format!("{W}/rhaddon/worker/start")));
+        assert!(!crate::auth::scope_allows(&c, &Method::POST, &format!("{W}/rhaddon/worker/proxy/x")));
+    }
+
+    /// (c) The front door and a handler's re-ask (`requester_allows`) give the
+    /// SAME answer for the same credential: they disagreed on stack-v0.6.22.
+    #[test]
+    fn the_front_door_and_requester_allows_agree() {
+        use axum::http::Method;
+        let person = crate::auth::sign_hs256(&crate::auth::scoped_claims("bob", "user", ["read"], 60, FD_SECRET).expect("claims"), FD_SECRET)
+            .expect("sign");
+        let person = crate::auth::verify_token_with(&person, FD_SECRET, None).expect("verify");
+        let creds = [("own", own_token_claims()), ("delegated", delegated_claims()), ("person", person)];
+        let paths = ["rhaddon/worker/status", "rhaddon/worker/proxy/v1/x", "rhaddon/worker/reserve", "rhaddon/worker/release",
+                     "rhaddon/worker/start", "other-addon/worker/status", "other-addon/worker/proxy/x", "other-addon/worker/reserve"];
+        for (name, c) in &creds {
+            for m in [Method::GET, Method::POST, Method::HEAD, Method::DELETE] {
+                for p in paths {
+                    let p = format!("{W}/{p}");
+                    assert_eq!(crate::auth::scope_allows(c, &m, &p), crate::auth::requester_allows(&ctx_of(c), &m, &p),
+                               "{name} {m} {p}: the front door and requester_allows disagree");
+                }
+            }
+        }
+    }
+
+    /// The middleware asks exactly the decision tested above: in the JWT branch
+    /// of `require_any_auth` an add-on token returns early only on the
+    /// inference surface, and the one tier gate after it is `scope_allows` on
+    /// the verified claims; and both deciders call the one add-on rule.
+    #[test]
+    fn the_middleware_asks_scope_allows_and_both_deciders_ask_the_addon_rule() {
+        let own = crate::test_src::own_code(include_str!("auth.rs"));
+        let gate = crate::test_src::fn_body(&own, "pub async fn require_any_auth(");
+        let early = gate.find("if let Some(consumer) = addon_consumer(&claims, is_inference_surface)").expect("the inference-only early return");
+        let tier = gate.find("if !scope_allows(&claims, request.method(), &path) {").expect("the tier gate on the verified claims");
+        assert!(early < tier);
+        for f in ["pub(crate) fn scope_allows(", "pub fn requester_allows("] {
+            let body = crate::test_src::fn_body(&own, f);
+            assert!(body.contains("crate::addon_workloads::addon_route_allows("), "{f} must ask the add-on rule");
+        }
     }
 }

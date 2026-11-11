@@ -492,6 +492,42 @@ const I241_ROWS: &[(&str, &str, &str)] = &[
 
 /// Contract 4. The node is a v2 cluster HMAC caller (no user, signed per
 /// request by `call_node`), `operator` and `admin` are logins.
+/// Contract 5 (stack-v0.6.22 voice, release refused): an add-on's own token,
+/// exactly as `/api/addon/token` mints it (`mint_addon_jwt("svc:<addon>")`,
+/// sub `addon:svc:<addon>`, role user), passes the FRONT DOOR on its own
+/// workload's `status` and `proxy/...`, and is refused on another add-on's and
+/// on routes that are not its own. No workload is declared here, so an
+/// admitted request ends in the handler's 404; the contract is that the
+/// front door does not answer 403 first (it did: a bare 403 with no log line,
+/// because `scope_allows` never asked the add-on rule `requester_allows` had).
+async fn assert_addon_front_door(c: &Client) -> Vec<String> {
+    let mut out = Vec::new();
+    let tok = crate::auth::mint_addon_jwt("svc:rhaddon", &["metrics".to_string()], 600, JWT_SECRET, None).expect("mint");
+    for (method, path) in [
+        ("GET", "/api/addon-workloads/rhaddon/worker/status"),
+        ("GET", "/api/addon-workloads/rhaddon/worker/proxy/v1/health"),
+        ("POST", "/api/addon-workloads/rhaddon/worker/proxy/v1/lifecycle/drain"),
+    ] {
+        let r = c.call(method, path, Some(&tok)).await;
+        if r.status == 401 || r.status == 403 {
+            out.push(format!("addon front door: {method} {path} with the add-on's own token was refused {} — {:?}", r.status, r.text));
+        }
+    }
+    for (method, path) in [
+        ("GET", "/api/addon-workloads/other-addon/worker/status"),
+        ("GET", "/api/addon-workloads/other-addon/worker/proxy/v1/health"),
+        ("POST", "/api/addon-workloads/rhaddon/worker/start"),
+        ("POST", "/api/addon-workloads/rhaddon/worker/reserve"),
+        ("POST", "/api/addon-workloads/rhaddon/worker/status"),
+    ] {
+        let r = c.call(method, path, Some(&tok)).await;
+        if r.status != 403 {
+            out.push(format!("addon front door: {method} {path} with the add-on's token should be 403, got {}", r.status));
+        }
+    }
+    out
+}
+
 async fn assert_i241_rows(c: &Client, operator: &str, admin: &str) -> Vec<String> {
     let mut failures = Vec::new();
     // Control: the node token verifies and is admitted to a node route. Without
@@ -752,6 +788,7 @@ async fn the_real_router_holds_authz_redis_and_measured_contracts() {
         failures.extend(assert_i241_rows(&c, &operator, &admin).await);
         failures.extend(assert_bus_down(&c, &admin).await);
         failures.extend(assert_session_origin(&c).await);
+        failures.extend(assert_addon_front_door(&c).await);
     }
 
     server.abort();

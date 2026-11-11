@@ -2812,6 +2812,11 @@ pub const WALKS_SETTINGS_PATH: &str = "/api/v1/walks/settings";
 /// keys, and peer tokens are scoped by their own branches in
 /// `require_any_auth`.
 pub(crate) fn scope_allows(claims: &Claims, method: &axum::http::Method, path: &str) -> bool {
+    // The add-on rules, as `requester_allows` asks them (one function, so the
+    // front door and the handlers' re-ask cannot disagree again).
+    if crate::addon_workloads::addon_route_allows(&claims.sub, claims.act.as_ref().map(|a| a.sub.as_str()), method, path) {
+        return true;
+    }
     scope_allows_for(&claims.scopes, claims.resolved_role(), Some(account_of(&claims.sub)), method, path)
 }
 
@@ -2827,16 +2832,10 @@ pub(crate) fn scope_allows(claims: &Claims, method: &axum::http::Method, path: &
 /// `RequesterCtx.role` is `Claims::resolved_role` evaluated at validation, so
 /// the two entry points agree by construction.
 pub fn requester_allows(requester: &RequesterCtx, method: &axum::http::Method, path: &str) -> bool {
-    // An add-on's own token reaches the proxy to ITS OWN reserved workload
-    // (`addon_workloads::proxy_allows`); the handler then checks the
-    // reservation. Nothing else about the token changes.
-    if crate::addon_workloads::proxy_allows(&requester.sub, path) {
-        return true;
-    }
-    // i300 H5: an add-on's delegated token (the person as `sub`) reaches ITS
-    // OWN add-on's reserve and release; the handler decides f99 against the
-    // person and records them on the reservation.
-    if crate::addon_workloads::delegated_reserve_allows(requester.act.as_ref().map(|a| a.sub.as_str()), path) {
+    // An add-on's own token reaches ITS OWN workload's proxy and status; its
+    // delegated token (the person as `sub`) reaches ITS OWN add-on's reserve
+    // and release. The same rule the front door asks in `scope_allows`.
+    if crate::addon_workloads::addon_route_allows(&requester.sub, requester.act.as_ref().map(|a| a.sub.as_str()), method, path) {
         return true;
     }
     scope_allows_for(&requester.scopes, requester.role, Some(account_of(&requester.sub)), method, path)
