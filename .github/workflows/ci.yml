@@ -148,6 +148,8 @@ jobs:
       deferred: ${{ steps.diff.outputs.deferred }}
       defer_tests: ${{ steps.diff.outputs.defer_tests }}
     steps:
+    - name: PROOF ONLY (never merge) - scope fails on purpose
+      run: exit 1
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       with:
         fetch-depth: 0
