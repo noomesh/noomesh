@@ -929,7 +929,7 @@ fn classify_body(backend: &coordinator::ResolvedBackend, instruction: &str, text
         "max_tokens": 120,
         "stream": false
     });
-    coordinator::thinking::disable_on_wire(&mut body, "openai", &backend.backend_type, backend.backend_type.starts_with("cloud-"));
+    let _ = &mut body;
     body
 }
 
