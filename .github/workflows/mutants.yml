@@ -274,8 +274,11 @@ jobs:
       with:
         name: mutant-${{ strategy.job-index }}
         path: .mutant-results/
+        # upload-artifact skips dot-directories unless told (v4.4+): without
+        # this every verdict was dropped and the summary read "no result".
+        include-hidden-files: true
         retention-days: 14
-        if-no-files-found: warn
+        if-no-files-found: error
 
   summary:
     needs: [plan, mutant]
