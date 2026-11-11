@@ -430,8 +430,8 @@ func TestAFetchedBlobOfTheWrongSizeIsNotPushed(t *testing.T) {
 	d := newRecordingDaemon(t)
 	good := []byte("GGUF-weights")
 	b := mirrorBlob{Hex: sha(good), Size: int64(len(good)) + 1}
-	if err := pushOne(t.Context(), pushDeps(t, d, good), b); err == nil || !strings.Contains(err.Error(), "bytes") {
-		t.Fatalf("want a size refusal, got %v", err)
+	if err := pushOne(t.Context(), pushDeps(t, d, good), b); err == nil || !strings.Contains(err.Error(), "the staged manifest says") {
+		t.Fatalf("want the size refusal before any push, got %v", err)
 	}
 	if len(d.received) != 0 {
 		t.Fatal("a push was attempted")
@@ -643,6 +643,22 @@ func TestAnAncestorOwnedByAnotherUserIsRefused(t *testing.T) {
 	if _, err := writeManifestNative(models, "library", "gemma4", "e2b", []byte("x")); err == nil || !strings.Contains(err.Error(), "owned by uid") {
 		t.Fatalf("want an ownership refusal, got %v", err)
 	}
+}
+
+func TestADirectoryBelowTheStoreOwnedByAnotherUserIsRefused(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to give a directory to another user (noo-batch runs tests as root)")
+	}
+	models := filepath.Join(t.TempDir(), "models")
+	theirs := filepath.Join(models, "manifests")
+	_ = os.MkdirAll(theirs, 0o755)
+	if err := os.Chown(theirs, 65534, 65534); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writeManifestNative(models, "library", "gemma4", "e2b", []byte("x")); err == nil || !strings.Contains(err.Error(), "not the store's owner") {
+		t.Fatalf("want an ownership refusal, got %v", err)
+	}
+	assertEmptyTree(t, theirs)
 }
 
 func assertEmptyTree(t *testing.T, dir string) {
