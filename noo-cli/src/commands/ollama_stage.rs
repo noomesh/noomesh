@@ -40,7 +40,7 @@
 //! interrupted weight download resumes (HTTP Range) on re-run.
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -705,7 +705,7 @@ pub(crate) fn is_staged_name(name: &str) -> bool {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
