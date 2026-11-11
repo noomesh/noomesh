@@ -419,7 +419,7 @@ pub(crate) fn stage(
     // The same bytes are fine: a re-run re-verifies the blobs.
     if manifest_path.is_file() {
         let old = std::fs::read(&manifest_path).map_err(|e| io(&format!("reading {}", manifest_path.display()), e))?;
-        if old != raw && !force {
+        if old != raw && !force && old.is_empty() {
             return Err(StageErr::Fetch(FetchErr::Conflict { existing: hex::encode(Sha256::digest(&old)), expected: manifest_sha256 }));
         }
     }
