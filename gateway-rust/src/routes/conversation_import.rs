@@ -126,9 +126,26 @@ pub(super) async fn receive(
         .map(Json)
 }
 
-/// Only the person's own credential publishes: never a delegated one (`act`).
+/// Only the person's own credential publishes: a login (no `act`), or the
+/// person's own provisioned key, whose tokens carry `act: {sub:
+/// "key:<consumer>", iss_user: <the key's account>}`. That is every MCP-door
+/// token (`mcp_external::mint_caller_jwt`) and every token exchange. Any
+/// other actor is delegation and is refused: an agent or task run, a worker,
+/// an add-on's delegated token, or a key bound to ANOTHER account. The first
+/// version refused every `act`, so it refused the MCP door, which is how
+/// pai-voice publishes.
 fn may_publish(r: &RequesterCtx) -> bool {
-    r.act.is_none()
+    let Some(a) = &r.act else { return true };
+    // Fail closed: a key actor needs a consumer, an issuing account equal to
+    // the token subject's own account (ids, byte for byte), and none of the
+    // markers another delegation kind carries (a worker run's `task`, an
+    // add-on feature's `feature`).
+    let consumer = a.sub.strip_prefix("key:").unwrap_or("");
+    !consumer.is_empty()
+        && !consumer.chars().any(char::is_whitespace)
+        && a.iss_user.as_deref().is_some_and(|u| !u.is_empty() && u == account_of(&r.sub))
+        && a.task.is_none()
+        && a.feature.is_none()
 }
 
 /// The channel label a publication is filed under, from the CREDENTIAL, never
@@ -256,23 +273,112 @@ mod tests {
     }
 
     fn requester(harness: Option<&str>, act: bool) -> RequesterCtx {
+        with_actor(harness, act.then(|| json!({"sub": "agent:helper"})))
+    }
+
+    fn with_actor(harness: Option<&str>, act: Option<serde_json::Value>) -> RequesterCtx {
         RequesterCtx {
-            sub: "ada".into(),
+            sub: "ada/claude-voice".into(),
             scopes: vec![],
             role: crate::auth::Role::User,
             harness: harness.map(str::to_string),
-            act: act.then(|| serde_json::from_value(json!({"sub": "agent:helper"})).expect("an actor")),
+            act: act.map(|a| serde_json::from_value(a).expect("an actor")),
         }
     }
 
-    /// A delegated credential (`act`) never publishes; the person's own login
-    /// or door key does.
+    /// A login (no `act`) publishes.
+    #[test]
+    fn a_login_publishes() {
+        assert!(may_publish(&requester(None, false)));
+        assert!(may_publish(&requester(Some("mcp-external"), false)));
+    }
+
+    /// The requester the auth layer builds from a token's claims (`sub`,
+    /// `harness` and `act` copied as they are).
+    fn from_claims(c: &Value) -> RequesterCtx {
+        RequesterCtx {
+            sub: c["sub"].as_str().unwrap().to_string(),
+            scopes: vec![],
+            role: crate::auth::Role::User,
+            harness: c["harness"].as_str().map(str::to_string),
+            act: Some(serde_json::from_value(c["act"].clone()).expect("the door's actor parses")),
+        }
+    }
+
+    fn door_claims(user: &str) -> Value {
+        crate::mcp_external::caller_claims(user, crate::auth::Role::User, &[], &format!("self:{user}"), Some("claude-voice"), 0)
+    }
+
+    /// The MCP door's own token (its real claims, `caller_claims`, which
+    /// `mint_caller_jwt` signs): the person's key, issued by the person's
+    /// account. It publishes. That is pai-voice's path; the first version
+    /// refused it.
+    #[test]
+    fn the_doors_own_token_publishes() {
+        let r = from_claims(&door_claims("ada"));
+        assert_eq!(r.sub, "ada/claude-voice");
+        assert!(may_publish(&r), "{:?}", r.act);
+        let src = include_str!("../mcp_external.rs");
+        assert!(
+            src.contains("let claims = caller_claims(user, role, user_scopes, consumer, session_label, now);"),
+            "mint_caller_jwt signs caller_claims"
+        );
+        // The route files the row under the subject's ACCOUNT (the DB test
+        // below calls `import` the same way, so this pins the route to it).
+        let own = include_str!("conversation_import.rs");
+        assert!(
+            own.contains("import(&state.db, account_of(&requester.0.sub), &channel, body.publication)"),
+            "the route must own the row by account_of(subject), never the key or the connection"
+        );
+    }
+
+    /// An agent or task run acting for the person (`agent:…`).
     #[test]
     fn a_delegated_credential_cannot_publish() {
         assert!(!may_publish(&requester(None, true)));
         assert!(!may_publish(&requester(Some("mcp-external"), true)));
-        assert!(may_publish(&requester(None, false)));
-        assert!(may_publish(&requester(Some("mcp-external"), false)));
+    }
+
+    /// The worker's delegated token, even when it also names a run.
+    #[test]
+    fn a_worker_actor_cannot_publish() {
+        let w = json!({"sub": crate::worker_delegation::WORKER_ACTOR, "iss_user": "ada", "task": "run_1"});
+        assert!(!may_publish(&with_actor(None, Some(w))));
+    }
+
+    /// An add-on's delegated token, even under a feature.
+    #[test]
+    fn an_addon_actor_cannot_publish() {
+        let a = json!({"sub": format!("{}voice", crate::addon_delegation::ACTOR_PREFIX), "iss_user": "ada", "feature": "voice"});
+        assert!(!may_publish(&with_actor(None, Some(a))));
+    }
+
+    /// A key issued by ANOTHER account, presented under this subject.
+    #[test]
+    fn another_accounts_key_cannot_publish() {
+        let mut c = door_claims("ada");
+        c["act"]["iss_user"] = json!("bob");
+        assert!(!may_publish(&from_claims(&c)));
+        // Ids compare exactly: a display-different spelling is another id.
+        c["act"]["iss_user"] = json!("Ada");
+        assert!(!may_publish(&from_claims(&c)));
+    }
+
+    /// Fail closed on a key actor that is incomplete or carries another
+    /// delegation's marker (a second actor riding inside the first).
+    #[test]
+    fn an_incomplete_or_doubled_key_actor_cannot_publish() {
+        for bad in [
+            json!({"sub": "key:self:ada"}),
+            json!({"sub": "key:self:ada", "iss_user": ""}),
+            json!({"sub": "key:", "iss_user": "ada"}),
+            json!({"sub": "key: self:ada", "iss_user": "ada"}),
+            json!({"sub": "keys:self:ada", "iss_user": "ada"}),
+            json!({"sub": "key:self:ada", "iss_user": "ada", "task": "run_1"}),
+            json!({"sub": "key:self:ada", "iss_user": "ada", "feature": "voice"}),
+        ] {
+            assert!(!may_publish(&with_actor(Some("mcp-external:self:ada"), Some(bad.clone()))), "{bad}");
+        }
     }
 
     /// The channel label comes from the credential, never names an add-on of
@@ -342,6 +448,29 @@ mod tests {
         for user in users {
             fixtures::remove_user(db, user).await;
         }
+    }
+
+    /// A real door token publishes, and the row it files is owned by the
+    /// token subject's ACCOUNT: never the key's consumer name, never the
+    /// connection label.
+    #[tokio::test]
+    async fn the_doors_token_files_the_row_under_the_persons_account() {
+        let Some(db) = database().await else {
+            return;
+        };
+        let a = user(&db).await;
+        let r = from_claims(&door_claims(&a));
+        assert!(may_publish(&r));
+        let event = entry(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), "user", "door words");
+        let receipt = import(&db, account_of(&r.sub), &source_channel(&r), serde_json::from_value(event).unwrap())
+            .await
+            .unwrap();
+        let conv = Uuid::parse_str(receipt["conversation_id"].as_str().unwrap()).unwrap();
+        let owner = fixtures::conversation(&db, conv).await.user_id.unwrap_or_default();
+        assert_eq!(owner, a);
+        assert_ne!(owner, format!("self:{a}"), "not the key's consumer name");
+        assert_ne!(owner, r.sub, "not the connection label");
+        cleanup(&db, &[&a]).await;
     }
 
     #[tokio::test]
