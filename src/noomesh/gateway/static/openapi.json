@@ -22297,6 +22297,29 @@
           }
         }
       }
+    },
+    "/api/agents/directory": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get directory",
+        "description": "[native] GET /api/agents/directory \u2014 who can be messaged, by account (0.6.24): online mailboxes first, then every chosen name with its state, then the short-lived default names collapsed per client type, and the account's orphaned mail. A caller lists its own account; `owner`/`all` beyond it are operator-only and refused (not emptied), as presence is.",
+        "operationId": "directory_list",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

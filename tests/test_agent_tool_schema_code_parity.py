@@ -36,6 +36,16 @@ ACCEPTED_ELSEWHERE = {
     # the loop's native inbox is ALWAYS scoped to its own names; `all` widens
     # the HTTP route for operators only and has no meaning in the loop
     ("noo_agent_inbox", "all"): "native inbox is always owner-scoped",
+    # 0.6.24: `as` states a conversation's mailbox at an MCP door, which
+    # strips it before the call (agent_mailbox::door_step); the loop acts
+    # as its own identity and never states another
+    ("noo_agent_send", "as"): "stated mailbox: an MCP-door argument, stripped there",
+    ("noo_agent_inbox", "as"): "stated mailbox: an MCP-door argument, stripped there",
+    ("noo_agent_ack", "as"): "stated mailbox: an MCP-door argument, stripped there",
+    ("noo_agent_thread", "as"): "stated mailbox: an MCP-door argument, stripped there",
+    # HTTP-route options: refuse-unless-online and the owner's orphan view
+    ("noo_agent_send", "online_only"): "the HTTP send route's option; the loop's send queues",
+    ("noo_agent_inbox", "orphaned"): "the HTTP inbox's owner view of retired mailboxes",
     # the ack route's path parameter; the native reader takes it as `id`/`message_id`
 }
 

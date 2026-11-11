@@ -80,6 +80,7 @@
 
 pub mod addon_access;
 pub mod agent_messages;
+pub mod agent_names;
 pub mod agent_recipients;
 pub mod audit;
 pub mod caller_verifiers;
