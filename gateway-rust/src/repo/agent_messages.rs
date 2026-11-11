@@ -441,7 +441,7 @@ mod owner_tests {
     fn a_sessions_list_includes_mail_to_its_account() {
         assert!(AGENT_CLAUSE.contains("to_agent = split_part($N, '/', 1)"), "{AGENT_CLAUSE}");
         // the thread seat stays the exact name: account mail does not seat a session in a thread
-        let sub = AGENT_CLAUSE.split("SELECT thread_id").nth(1).unwrap();
+        let sub = AGENT_CLAUSE.split("SELECT t.thread_id").nth(1).unwrap();
         assert!(!sub.contains("split_part"), "{sub}");
     }
 
