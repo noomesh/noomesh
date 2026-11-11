@@ -95,6 +95,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/cluster/seats/{seat}/bundle",
             post(seat_bundle_put).layer(DefaultBodyLimit::max(MAX_SEAT_BODY)))
         .route("/api/cluster/seats/{seat}/status", get(seat_bundle_status))
+        .route("/api/cluster/console-build", get(console_build))
         // ── Public enrolment (PUBLIC_PATHS_EXACT): the token is the credential ──
         .route("/api/cluster/seat-enroll", post(seat_enroll))
         // ── The seat's rail (HANDLER_AUTHENTICATED_PATHS): birth proof only ──
@@ -522,6 +523,30 @@ async fn seat_enroll(
 // ═══════════════════════════════════════════════════════════════
 // Operator: registry + staging
 // ═══════════════════════════════════════════════════════════════
+
+/// GET /api/cluster/console-build — the build identity of the console this
+/// gateway embeds: `ui-<git tree hash of ui/>`, the file publish-web writes
+/// beside the bundle (`console-build.txt`), or null for a console built before
+/// that file existed. `noo upgrade` and `noo cluster verify` compare every
+/// seat's display against it: a display still running an older console
+/// reports an older id. Operators and the stack's own services only.
+async fn console_build(
+    op: OperatorOrInternal,
+    cluster: Option<Extension<ClusterNode>>,
+) -> AppResult {
+    let _ = seat_admin_guard(&op, &cluster)?;
+    Ok(Json(json!({"console_build": embedded_console_build(std::path::Path::new(crate::paths::UI_WWW_DIR))})))
+}
+
+/// The console id in `<www>/console-build.txt`: trimmed, and only when it is
+/// a content id (`ui-` and hex). Anything else, or no file, is None: never a
+/// guess the seat check would then compare against.
+pub(crate) fn embedded_console_build(www: &std::path::Path) -> Option<String> {
+    let id = std::fs::read_to_string(www.join("console-build.txt")).ok()?;
+    let id = id.trim();
+    let hex = id.strip_prefix("ui-")?;
+    (!hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit())).then(|| id.to_string())
+}
 
 /// GET /api/cluster/seats — every enrolled seat with its last heartbeat and
 /// the state of its staged bundle. What `noo upgrade` and `noo cluster
@@ -1231,5 +1256,31 @@ mod seat_display_tests {
                        ("poll", "1.5"), ("url", "http://x"), ("url", "default")] {
             assert!(display_with(&d, k, v).is_err(), "{k}={v}");
         }
+    }
+}
+
+#[cfg(test)]
+mod console_build_tests {
+    use super::embedded_console_build;
+
+    /// The controller side of the seat display check: the id the embedded
+    /// console was built as, or None, never a guess.
+    #[test]
+    fn the_embedded_console_id_is_read_and_only_a_content_id_counts() {
+        let dir = std::env::temp_dir().join(format!("console-build-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(embedded_console_build(&dir), None, "no file: a console from before content ids");
+        for (text, want) in [
+            ("ui-3f2a9c\n", Some("ui-3f2a9c")),
+            ("  ui-ABCdef01  ", Some("ui-ABCdef01")),
+            ("stack-v0.6.23", None),
+            ("ui-", None),
+            ("ui-xyz", None),
+            ("", None),
+        ] {
+            std::fs::write(dir.join("console-build.txt"), text).unwrap();
+            assert_eq!(embedded_console_build(&dir).as_deref(), want, "{text:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
