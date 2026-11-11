@@ -630,7 +630,7 @@ pub(crate) async fn execute_spec(
     // + TLS handshake to 127.0.0.1 and a CA file read on every call (speed
     // review 2026-11-11). Its 30 s default is overridden per request below
     // by the tool's own timeout.
-    let client = crate::tls::loopback_client();
+    let client = crate::tls::client_builder().build().map_err(|e| format!("http client: {e}"))?;
 
     let req = match spec.method.as_str() {
         "GET" => client.get(&url).query(&rest),
