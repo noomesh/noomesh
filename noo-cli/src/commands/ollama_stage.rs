@@ -941,13 +941,28 @@ mod tests {
     }
 
     #[test]
+    fn check_manifest_refuses_a_manifest_over_its_limit_by_itself() {
+        // The network read is limited too, so the end-to-end test above cannot
+        // tell whether check_manifest's own bound holds; a manifest can also
+        // reach it from a file. Valid JSON, over 1 MiB only by trailing space.
+        let w = weight();
+        let (good, _) = model_fixture(&w);
+        let mut big = good.to_string().into_bytes();
+        big.resize(MIRROR_MAX_MANIFEST_BYTES as usize + 10, b' ');
+        let e = check_manifest(&big).unwrap_err();
+        assert!(e.contains("over"), "{e}");
+        assert!(check_manifest(good.to_string().as_bytes()).is_ok());
+    }
+
+    #[test]
     fn a_corrupt_blob_is_replaced_without_force() {
         let w = weight();
         let (manifest, blobs) = model_fixture(&w);
         let reg = serve(manifest, blobs, None, 64);
         let dir = tmpdir("corrupt");
         let p = dir.join(blob_name(&digest(&w)));
-        std::fs::write(&p, b"junk").unwrap();
+        // The SAME size as the real blob: only the hash can tell it is corrupt.
+        std::fs::write(&p, vec![b'j'; w.len()]).unwrap();
         run(&reg, &dir, false).unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), w);
         let _ = std::fs::remove_dir_all(&dir);
@@ -997,6 +1012,18 @@ mod tests {
         let mut m = good.clone();
         m["layers"][1]["digest"] = json!(format!("md5:{}", "a".repeat(64)));
         cases.push(("wrong algorithm", m.to_string().into_bytes()));
+        let mut m = good.clone();
+        m["layers"][1]["digest"] = json!(format!("sha256:{}", "g".repeat(64)));
+        cases.push(("64 characters, not hex", m.to_string().into_bytes()));
+        let mut m = good.clone();
+        m["layers"][1]["digest"] = json!(format!("sha256:{}", "A".repeat(64)));
+        cases.push(("uppercase hex (stored verbatim, so never importable)", m.to_string().into_bytes()));
+        let mut m = good.clone();
+        let l = layer_json(MODEL_MEDIA, b"x");
+        let mut twice = l.clone();
+        twice["size"] = json!(2);
+        m["layers"] = json!([l, twice]);
+        cases.push(("one blob listed with two sizes", m.to_string().into_bytes()));
         let mut m = good.clone();
         m["layers"][1]["size"] = json!(0);
         cases.push(("size 0", m.to_string().into_bytes()));
