@@ -2295,6 +2295,28 @@ fn heartbeat_predates_apply(seat: &Value, controller_cli: &str) -> bool {
 /// the CLI and display verdicts must not be read off that heartbeat (it names
 /// the version the seat HAD). The apply's own report line stands in, and the
 /// row says plainly that no heartbeat has arrived since.
+/// Has the seat's heartbeat caught up with the apply, so the checks read the
+/// new state and not one from before it? The new CLI and the applied sha, AND
+/// a display that reports the controller's console build.
+///
+/// The console build arrives a sync tick or more after the CLI field (the
+/// browser reloads, then CDP reports it), so waiting on the CLI alone gave the
+/// display check a pre-reload heartbeat: "console stack-v0.6.21, controller
+/// v0.6.22" on the 0.6.22 roll, and a second `noo upgrade --seats` to clear it.
+/// A display that states no build (headless, or the browser not answering on
+/// CDP) or whose unit is down is not waited on: waiting cannot change that
+/// verdict, and the check names it.
+pub(crate) fn seat_heartbeat_fresh(seat: &Value, controller_cli: &str, controller_tag: &str) -> bool {
+    let hb = &seat["heartbeat"];
+    if hb["cli_version"].as_str() != Some(controller_cli) || hb["last_applied_sha"] != seat["sha256"] {
+        return false;
+    }
+    let build = hb["console_build"].as_str().unwrap_or("");
+    let unit = hb["kiosk_display"].as_str().unwrap_or("");
+    let display_down = hb["kiosk_bins"].as_str().is_some_and(|b| b != "absent") && !unit.is_empty() && unit != "active";
+    build.is_empty() || display_down || norm_tag(build) == norm_tag(controller_tag)
+}
+
 pub(crate) fn seat_checks_after_apply(seat: &Value, controller_cli: &str, controller_tag: &str, now: i64) -> Vec<super::cluster_verify::Check> {
     use super::cluster_verify::Verdict;
     let mut out = seat_checks(seat, controller_cli, controller_tag, now);
@@ -2377,8 +2399,7 @@ pub(crate) fn upgrade_seats(g: &Globals) -> i32 {
             let mut st = crate::http::get_json_opt(g, &format!("/api/cluster/seats/{n}/status"), true, 10);
             if ok_apply {
                 for _ in 0..30 {
-                    let fresh = st.as_ref().is_some_and(|s| s["heartbeat"]["cli_version"].as_str() == Some(env!("CARGO_PKG_VERSION"))
-                        && s["heartbeat"]["last_applied_sha"] == s["sha256"]);
+                    let fresh = st.as_ref().is_some_and(|s| seat_heartbeat_fresh(s, env!("CARGO_PKG_VERSION"), &tag));
                     if fresh { break; }
                     std::thread::sleep(std::time::Duration::from_secs(5));
                     st = crate::http::get_json_opt(g, &format!("/api/cluster/seats/{n}/status"), true, 10);
@@ -3732,5 +3753,54 @@ mod seat_binding_tests {
         let revoked = seat_binding_check(&json!({"tailnet_name": "homeserver-1", "revoked_at": "2026-11-06T01:00:00+00:00"}), "homeserver").unwrap();
         assert!(matches!(revoked.verdict, Verdict::Fail) && revoked.detail.starts_with("revoked at"));
         assert_eq!(revoked.remedy.as_deref(), Some("noo kiosk seat-token homeserver"));
+    }
+}
+
+
+#[cfg(test)]
+mod seat_wait_tests {
+    use super::*;
+
+    fn seat(cli: &str, build: &str) -> Value {
+        json!({"sha256": "s1", "heartbeat": {"cli_version": cli, "last_applied_sha": "s1", "console_build": build,
+            "kiosk_display": "active", "kiosk_bins": "present"}})
+    }
+
+    /// The 0.6.22 roll: the CLI field was already new while the display still
+    /// reported the old console build. That heartbeat is NOT fresh; the one
+    /// after the reload is.
+    #[test]
+    fn the_seat_wait_holds_until_the_display_reports_the_controllers_build() {
+        let before_reload = seat("0.6.22", "stack-v0.6.21+0123abcd");
+        assert!(!seat_heartbeat_fresh(&before_reload, "0.6.22", "stack-v0.6.22"), "the pre-reload heartbeat ended the wait");
+        let after_reload = seat("0.6.22", "stack-v0.6.22+89ab4567");
+        assert!(seat_heartbeat_fresh(&after_reload, "0.6.22", "stack-v0.6.22"));
+        assert!(seat_heartbeat_fresh(&after_reload, "0.6.22", "v0.6.22"), "tags compare normalised");
+    }
+
+    #[test]
+    fn the_seat_wait_still_needs_the_new_cli_and_the_applied_sha() {
+        assert!(!seat_heartbeat_fresh(&seat("0.6.21", "stack-v0.6.22"), "0.6.22", "stack-v0.6.22"));
+        let mut s = seat("0.6.22", "stack-v0.6.22");
+        s["heartbeat"]["last_applied_sha"] = json!("s0");
+        assert!(!seat_heartbeat_fresh(&s, "0.6.22", "stack-v0.6.22"));
+    }
+
+    /// No display build (headless or CDP silent) or a display that is down:
+    /// waiting cannot change the verdict, so the wait does not hold for it.
+    #[test]
+    fn the_seat_wait_does_not_hold_for_a_display_it_cannot_change() {
+        assert!(seat_heartbeat_fresh(&seat("0.6.22", ""), "0.6.22", "stack-v0.6.22"));
+        let mut down = seat("0.6.22", "stack-v0.6.21");
+        down["heartbeat"]["kiosk_display"] = json!("failed");
+        assert!(seat_heartbeat_fresh(&down, "0.6.22", "stack-v0.6.22"));
+    }
+
+    /// The wait loop asks this predicate (and only it).
+    #[test]
+    fn the_upgrade_seat_wait_uses_the_predicate() {
+        let own = crate::test_src::own_code(include_str!("kiosk_seat.rs"));
+        let n = own.matches("seat_heartbeat_fresh(s, env!(\"CARGO_PKG_VERSION\"), &tag)").count();
+        assert_eq!(n, 1, "the post-apply wait must use seat_heartbeat_fresh");
     }
 }
