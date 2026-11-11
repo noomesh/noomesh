@@ -139,6 +139,17 @@ fn refused(status: StatusCode, why: &str) -> Response {
     (status, Json(json!({ "error": why }))).into_response()
 }
 
+/// The handler's own gate (the middleware decides first, with the same
+/// predicate): the scraper's verified leaf, GET only. A function, so what it
+/// refuses is tested, not only that it is called.
+fn gate(method: &Method, service: Option<&VerifiedService>) -> Result<(), Response> {
+    if crate::auth::is_scrape_targets(method, crate::auth::SCRAPE_TARGETS_PATH, service) {
+        Ok(())
+    } else {
+        Err(refused(StatusCode::FORBIDDEN, "answers the Prometheus scraper's own service leaf only"))
+    }
+}
+
 /// `GET /api/internal/prometheus/targets/node-agents`: the scraper's leaf
 /// only. Answers the http_sd list of node agents whose leaf covers the
 /// address they are scraped at.
@@ -148,8 +159,8 @@ async fn node_agent_targets(
     method: Method,
 ) -> Response {
     let service = svc.and_then(|Extension(s)| s);
-    if !crate::auth::is_scrape_targets(&method, crate::auth::SCRAPE_TARGETS_PATH, service.as_ref()) {
-        return refused(StatusCode::FORBIDDEN, "answers the Prometheus scraper's own service leaf only");
+    if let Err(r) = gate(&method, service.as_ref()) {
+        return r;
     }
     let mut nodes: Vec<(String, Value)> = Vec::new();
     let Ok(kv) = state.js.get_key_value("mesh_nodes").await else {
@@ -275,6 +286,32 @@ mod tests {
         assert!(!is_scrape_targets(&Method::GET, SCRAPE_TARGETS_PATH, None), "no certificate");
         assert!(!is_scrape_targets(&Method::POST, SCRAPE_TARGETS_PATH, Some(&scraper)), "not GET");
         assert!(!is_scrape_targets(&Method::GET, "/metrics", Some(&scraper)), "another path");
+    }
+
+    /// The handler refuses on its own as well, before the registry is read:
+    /// the middleware is not its only gate.
+    #[test]
+    fn the_handler_gates_before_reading_the_registry() {
+        let code = crate::test_src::own_code(include_str!("scrape_targets.rs"));
+        let body = crate::test_src::fn_body(&code, "async fn node_agent_targets(");
+        let gate = body.find("if let Err(r) = gate(&method, service.as_ref()) {").expect("the gate");
+        let read = body.find("get_key_value(\"mesh_nodes\")").expect("the registry read");
+        assert!(gate < read, "{body}");
+    }
+
+    #[test]
+    fn the_gate_refuses_everything_but_the_scrapers_get() {
+        let scraper = VerifiedService(crate::auth::METRICS_SCRAPER_SERVICE.to_string());
+        let other = VerifiedService("grafana".to_string());
+        assert!(gate(&Method::GET, Some(&scraper)).is_ok());
+        for (m, s, why) in [
+            (Method::GET, Some(&other), "another service leaf"),
+            (Method::GET, None, "no certificate"),
+            (Method::POST, Some(&scraper), "not GET"),
+        ] {
+            let r = gate(&m, s).expect_err(why);
+            assert_eq!(r.status(), StatusCode::FORBIDDEN, "{why}");
+        }
     }
 
     #[test]
