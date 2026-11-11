@@ -73,8 +73,11 @@ def test_equal_trees_retag_everything_but_the_tag_stamped_images():
     p = _plan()
     assert p["rc_tag"] == "stack-v1.2.3-rc.2", "the highest equal-tree rc must win"
     built = {i for i, r in p["retag"].items() if not r}
-    assert built == {"gateway", "node-agent"}, p["why"]
+    assert built == {"node-agent"}, p["why"]
     assert p["rc_digests"]["whisper"] == "sha256:w"
+    # The gateway embeds its console by digest and carries no tag (2026-11-11):
+    # a final ships the rc's gateway, re-tagged by the rc lock's digest.
+    assert p["retag"]["gateway"] is True and p["rc_digests"]["gateway"] == "sha256:g", p["why"]["gateway"]
 
 
 def test_an_rc_on_a_new_tree_builds():
@@ -89,7 +92,7 @@ def test_an_rc_recut_on_an_earlier_rcs_tree_retags_it():
     trees = {"stack-v1.2.3-rc.3": "T", "stack-v1.2.3-rc.2": "T", "stack-v1.2.3-rc.1": "T0"}
     p = _plan(tag="stack-v1.2.3-rc.3", trees=trees)
     assert p["rc_tag"] == "stack-v1.2.3-rc.2", p["why"]
-    assert {i for i, r in p["retag"].items() if not r} == {"gateway", "node-agent"}, p["why"]
+    assert {i for i, r in p["retag"].items() if not r} == {"node-agent"}, p["why"]
     assert p["rc_digests"]["worker"] == "sha256:k"
 
 
@@ -106,7 +109,7 @@ def test_an_rc_never_retags_from_itself_or_a_later_rc():
 def test_an_rc_recut_with_a_moved_sibling_rebuilds_what_it_feeds():
     trees = {"stack-v1.2.3-rc.3": "T", "stack-v1.2.3-rc.2": "T", "stack-v1.2.3-rc.1": "T"}
     p = _plan(tag="stack-v1.2.3-rc.3", trees=trees, sibs={**MAINS, "trellion": "TRE_MOVED"})
-    assert {i for i, r in p["retag"].items() if not r} == {"gateway", "node-agent", "deps-base", "trellion"}, p["why"]
+    assert {i for i, r in p["retag"].items() if not r} == {"node-agent", "deps-base", "trellion"}, p["why"]
 
 
 def test_no_equal_tree_rc_builds_everything():
@@ -122,7 +125,7 @@ def test_an_older_rc_with_the_equal_tree_is_used():
 def test_a_moved_sibling_rebuilds_exactly_what_it_feeds():
     p = _plan(sibs={**MAINS, "trellion": "TRE_MOVED"})
     rebuilt = {i for i, r in p["retag"].items() if not r}
-    assert rebuilt == {"gateway", "node-agent", "deps-base", "trellion"}, p["why"]
+    assert rebuilt == {"node-agent", "deps-base", "trellion"}, p["why"]
     assert "!=" in p["why"]["trellion"]
 
 
@@ -585,8 +588,8 @@ def test_the_0_6_23_shape_retags_everything_but_the_tag_stamped_images():
     """0.6.23-rc.1 changed five files (gateway sources and noo-cli's Cargo
     files) and rebuilt every image it did not take from :staged. Against the
     previous final, under the real input table, only gateway (its inputs
-    changed, and it is tag-stamped) and node-agent (tag-stamped) build; each
-    re-tag names its source tag and digest."""
+    changed) and node-agent (tag-stamped) build; each re-tag names its source
+    tag and digest."""
     changed = [
         "gateway-rust/src/addon_workloads.rs", "gateway-rust/src/auth.rs",
         "gateway-rust/src/routes/router_harness_tests.rs", "noo-cli/Cargo.toml", "noo-cli/Cargo.lock",
@@ -635,3 +638,25 @@ def test_a_sibling_that_moved_since_the_previous_final_rebuilds_its_images():
               sibs={"trellion": "TRE_MOVED"}, inputs=P.load_inputs())
     assert p["retag"]["trellion"] is False and "!=" in p["why"]["trellion"], p["why"]
     assert p["retag"]["whisper"] is True, p["why"]
+
+def test_the_gateway_is_rebuilt_when_its_console_changes():
+    """Re-tagging the gateway is sound only because its inputs include the
+    console source: a console change between two rcs must still rebuild it
+    (and nothing re-tags a gateway whose console moved)."""
+    table = P.load_inputs()
+    assert any(g in ("ui/**", "ui/apps/web/**") for g in table["images"]["gateway"]["inputs"]), table["images"]["gateway"]
+    rebuild, lane = P.input_changes(["ui/apps/web/src/kiosk/main.tsx"], table)
+    assert not lane and "gateway" in rebuild, rebuild
+
+
+def test_the_gateway_takes_the_console_by_the_digest_its_tag_resolves_to():
+    gw = next(m for m in MATRIX if m["image"] == "gateway")
+    assert gw["extra_args"] == "--build-arg UI_IMAGE=$UI_IMAGE_REF", gw
+    steps = WF["jobs"]["images"]["steps"]
+    names = [s.get("name", "") for s in steps]
+    resolve = names.index("Resolve the console the gateway embeds")
+    assert names.index("Wait for the tagged console (publish-web.yml)") < resolve < names.index("Build + push ${{ matrix.name }}")
+    run = steps[resolve]["run"]
+    assert 'ref="$REGISTRY/$OWNER/mesh-ui-web:$TAG"' in run and "imagetools inspect" in run
+    assert "sha256:*) ;;" in run and "exit 1" in run, "an unresolved console fails the build, never builds unpinned"
+    assert steps[resolve]["if"] == "matrix.image == 'gateway' && env.RETAG != 'true'"

@@ -571,7 +571,7 @@ jobs:
             # the image being built is tagged with, so there is no second value
             # to disagree. The Dockerfile default is now only a LOCAL-build
             # fallback and is marked as such.
-            extra_args: --build-arg UI_IMAGE=$REGISTRY/$OWNER/mesh-ui-web:$TAG
+            extra_args: --build-arg UI_IMAGE=$UI_IMAGE_REF
           # node-agent is Go (no CUDA) and runs on every node incl. arm64 edge.
           # Version build-args: the Dockerfile has always accepted these and
           # no invocation passed them, so every image-built agent reported
@@ -812,6 +812,25 @@ jobs:
           echo "$DHI_TOKEN" | docker login docker.io -u "$DHI_USERNAME" --password-stdin \
             || echo "::warning::docker.io login failed — a Hub fallback pulls anonymously"
           echo "HUB_PREFIX=$(python3 "$GITHUB_WORKSPACE/scripts/hub-mirror.py" dockerfile "$GITHUB_WORKSPACE/${{ matrix.dockerfile }}")" >> "$GITHUB_ENV"
+
+      # The gateway embeds the console BY DIGEST: the one the console
+      # workflow published for THIS release's tag ($TAG, never a literal),
+      # resolved now and pinned, so the build cannot pick up a console pushed
+      # after this point. Together with the console's CONTENT identity
+      # (publish-web.yml), the gateway carries no release tag in its bits and
+      # a final re-tags the rc's gateway (release-retag-plan.py TAG_STAMPED).
+      - name: Resolve the console the gateway embeds
+        if: matrix.image == 'gateway' && env.RETAG != 'true'
+        run: |
+          set -eu
+          ref="$REGISTRY/$OWNER/mesh-ui-web:$TAG"
+          digest="$(scripts/retry-registry.sh docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}')"
+          case "$digest" in
+            sha256:*) ;;
+            *) echo "::error::cannot resolve $ref to a digest (got '$digest'); is publish-web done for this tag?"; exit 1 ;;
+          esac
+          echo "UI_IMAGE_REF=$REGISTRY/$OWNER/mesh-ui-web@$digest" >> "$GITHUB_ENV"
+          echo "console for the gateway: $ref = $digest"
 
       - name: Build + push ${{ matrix.name }}
         if: env.RETAG != 'true'

@@ -472,12 +472,16 @@ def test_the_console_artifact_tag_matches_what_the_gateway_pulls():
         "resolve to different tags, and the release would die at FROM ${UI_IMAGE}"
     )
 
-    # And the gateway must pull it by $TAG rather than a literal, or the pin
-    # can drift the way it did at v0.1.7 for months.
-    assert "--build-arg UI_IMAGE=$REGISTRY/$OWNER/mesh-ui-web:$TAG" in rel, (
-        "the gateway no longer pins the console by $TAG — a literal here is "
-        "how UI_IMAGE sat at v0.1.7 through every release"
+    # And the gateway must take the console THIS release's $TAG published,
+    # never a literal (UI_IMAGE sat at v0.1.7 for months that way), pinned by
+    # the digest that tag resolves to (2026-11-11: the gateway then carries no
+    # release tag, and a final re-tags the rc's gateway).
+    assert 'ref="$REGISTRY/$OWNER/mesh-ui-web:$TAG"' in rel, (
+        "the console the gateway embeds is no longer resolved from $TAG"
     )
+    assert 'echo "UI_IMAGE_REF=$REGISTRY/$OWNER/mesh-ui-web@$digest"' in rel, "not pinned by digest"
+    assert "--build-arg UI_IMAGE=$UI_IMAGE_REF" in rel, "the gateway build does not use the resolved digest"
+    assert "mesh-ui-web:$TAG" not in rel.split("--build-arg UI_IMAGE=", 1)[1].split("\n", 1)[0], "the build arg is a tag again"
 
 
 # (The self-hosted-runner topology guards that lived here were retired when CI
