@@ -2052,5 +2052,41 @@ companion_restart() {
 case " $applied " in
     *" agent-binary "*) companion_restart ;;
 esac
+# BEGIN report_installed_binaries
+# A binary kind this bundle did NOT carry is still installed here: state its
+# sha too. The controller leaves a kind out of a bundle only when the node's
+# last report names its exact bytes (node_runs_asset), and only kinds handled
+# in THIS apply used to be reported, so a kind left out of bundle N went
+# unreported in report N and was carried again in bundle N+1: the skip
+# flip-flopped roll by roll. This is still the node's own statement of what
+# is installed; a kind this apply carried is already recorded and is not
+# restated. A missing file or a symlink states nothing (the next bundle then
+# carries the kind, as before).
+report_installed() {
+    case " $binary_shas " in *" $1="*) return 0 ;; esac
+    if [ -f "$2" ] && [ ! -L "$2" ]; then note_binary_sha "$1" "$2"; fi
+    return 0
+}
+report_installed agent-binary /usr/local/bin/noo-node-agent
+report_installed hostd-binary /usr/local/bin/noo-hostd
+report_installed harness-binary /usr/local/bin/noo-gateway
+# The CLI is the user's file: hashed AS that user, exactly as the CLI block
+# does (root must never follow a link the user planted), and only when the
+# bundle names the user.
+case " $binary_shas " in
+    *" cli-binary="*) ;;
+    *)
+        if [ -f "$WORK/files/cli-user" ]; then
+            _ri_u="$(tr -d ' \n\r' < "$WORK/files/cli-user")"
+            _ri_h=""
+            [ -z "$_ri_u" ] || _ri_h="$(getent passwd "$_ri_u" | cut -d: -f6)"
+            if [ -n "$_ri_h" ] && [ -d "$_ri_h" ]; then
+                _ri_s="$(runuser -u "$_ri_u" -- env HOME="$_ri_h" sh -c 'sha256sum "$HOME/.local/bin/noo" 2>/dev/null' | awk '{print $1}')" || _ri_s=""
+                [ -z "$_ri_s" ] || binary_shas="$binary_shas cli-binary=$_ri_s"
+            fi
+        fi
+        ;;
+esac
+# END report_installed_binaries
 # Last line of the apply, so the fetcher's tail of this log always carries it.
 [ -z "$binary_shas" ] || echo "binary-sha:$binary_shas"
