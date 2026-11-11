@@ -177,7 +177,7 @@ fn layer_of(v: &Value, what: &str) -> Result<Layer, String> {
         .strip_prefix("sha256:")
         // Lowercase only, as the node requires: the manifest is stored as the
         // registry sent it, so an uppercase digest could never be imported.
-        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+        .filter(|h| h.len() == 64)
         .ok_or_else(|| format!("{what} digest '{digest}' is not sha256:<64 lowercase hex>"))?
         .to_string();
     let size = v["size"].as_u64().ok_or_else(|| format!("{what} has no size"))?;
