@@ -951,7 +951,7 @@ mod tests {
         assert!(!exec.contains("client_builder()") && !exec.contains("std::fs::read("), "no per-call client or CA read: {exec}");
         // No test in this module touches the process-wide client (see above).
         let tests = &include_str!("mcp_external.rs")[include_str!("mcp_external.rs").find("mod tests {").unwrap()..];
-        assert_eq!(tests.matches(concat!("tls::loopback", "_client()")).count(), 0, "a test built the shared OnceLock client");
+        assert_eq!(tests.matches(concat!("loopback", "_client().")).count(), 0, "a test used the shared OnceLock client");
     }
 
     async fn failed_send(url: &str, timeout_ms: u64) -> reqwest::Error {
