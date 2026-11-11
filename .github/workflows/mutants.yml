@@ -250,7 +250,8 @@ jobs:
       if: contains(matrix.lanes, 'node-agent-go')
       with:
         go-version-file: node-agent-go/go.mod
-        cache-dependency-path: node-agent-go/go.sum
+        # setup-go SAVES a cache by default; a mutant run only reads (11-11).
+        cache: false
 
     - name: Test the PARENT (must be green, else no verdict)
       id: base
