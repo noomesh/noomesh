@@ -144,7 +144,6 @@ fn may_publish(r: &RequesterCtx) -> bool {
     !consumer.is_empty()
         && !consumer.chars().any(char::is_whitespace)
         && a.iss_user.as_deref().is_some_and(|u| !u.is_empty() && u == account_of(&r.sub))
-        && a.task.is_none()
         && a.feature.is_none()
 }
 
