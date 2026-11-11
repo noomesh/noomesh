@@ -1937,7 +1937,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     if !cluster_ctx.trim().is_empty() {
         persona_prompt.push_str(super::context::CLUSTER_GUIDANCE);
     }
-    persona_prompt.push_str(&super::context::clock_context());
+    persona_prompt.push_str(super::context::CLOCK_RULE);
     session.set_system_prompt(&persona_prompt);
 
     // Fire pre-inference hooks (registered by add-ons)
@@ -2098,6 +2098,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             ("Companion devices", companion_ctx.as_deref()),
         ],
     );
+    super::context::place_clock(&mut session.messages, chrono::Utc::now());
     if let Some(f) = data_frame.as_deref() {
         record_layer_chars(rt.metrics(), "retrieved_data_frame", f).await;
     }
@@ -3163,7 +3164,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
     if !cluster_ctx.trim().is_empty() {
         persona_prompt.push_str(super::context::CLUSTER_GUIDANCE);
     }
-    persona_prompt.push_str(&super::context::clock_context());
+    persona_prompt.push_str(super::context::CLOCK_RULE);
     session.set_system_prompt(&persona_prompt);
 
     // Fire pre-inference hooks (registered by add-ons)
@@ -3302,6 +3303,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
             ("Companion devices", companion_ctx.as_deref()),
         ],
     );
+    super::context::place_clock(&mut session.messages, chrono::Utc::now());
     if let Some(f) = data_frame.as_deref() {
         record_layer_chars(rt.metrics(), "retrieved_data_frame", f).await;
     }
