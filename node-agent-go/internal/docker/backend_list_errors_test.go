@@ -56,6 +56,11 @@ func newFakeDaemon(t *testing.T, f *listFakeDaemon) *Client {
 		if m := listInspectPath.FindStringSubmatch(r.URL.Path); m != nil {
 			if st := f.inspectStatus[m[1]]; st != 0 {
 				w.WriteHeader(st)
+				if st == http.StatusNotFound {
+					// What the daemon says for a container that is gone.
+					_, _ = w.Write([]byte(`{"message":"No such container: ` + m[1] + `"}`))
+					return
+				}
 				_, _ = w.Write([]byte(`{"message":"inspect broke"}`))
 				return
 			}

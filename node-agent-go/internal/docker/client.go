@@ -502,6 +502,79 @@ type Client struct {
 	decl        *declaredTLS
 	declRead    bool
 	declExpires time.Time
+
+	// The proxy's short cache of RunningBackends and ContainerNames
+	// (RunningBackendsCached, ContainerNamesCached). Successes only.
+	proxyMu   sync.Mutex
+	running   map[string]string
+	runningAt time.Time
+	names     []string
+	namesAt   time.Time
+	proxyNow  func() time.Time // tests; nil = time.Now
+}
+
+// proxyCacheTTL bounds how stale the proxy's view of the running backends
+// may be. Each proxied request listed (and inspected) every container; at
+// hundreds of embeds a minute that was the agent's busiest docker client.
+// Two seconds is shorter than any start or stop the reconciler makes, and a
+// request routed to a backend that stopped inside it fails at the door
+// exactly as one that stopped mid-request does.
+const proxyCacheTTL = 2 * time.Second
+
+func (c *Client) proxyClock() time.Time {
+	if c.proxyNow != nil {
+		return c.proxyNow()
+	}
+	return time.Now()
+}
+
+// RunningBackendsCached is RunningBackends for the request path, cached for
+// proxyCacheTTL. An error is never cached. The reconciler and the bench call
+// RunningBackends itself: they act on what they read and need it fresh.
+func (c *Client) RunningBackendsCached(ctx context.Context) (map[string]string, error) {
+	c.proxyMu.Lock()
+	if c.running != nil && c.proxyClock().Sub(c.runningAt) < proxyCacheTTL {
+		out := make(map[string]string, len(c.running))
+		for k, v := range c.running {
+			out[k] = v
+		}
+		c.proxyMu.Unlock()
+		return out, nil
+	}
+	c.proxyMu.Unlock()
+	got, err := c.RunningBackends(ctx)
+	if err != nil {
+		return nil, err
+	}
+	c.proxyMu.Lock()
+	c.running = make(map[string]string, len(got))
+	for k, v := range got {
+		c.running[k] = v
+	}
+	c.runningAt = c.proxyClock()
+	c.proxyMu.Unlock()
+	return got, nil
+}
+
+// ContainerNamesCached is ContainerNames for the request path, cached for
+// proxyCacheTTL. A failed listing (nil) is never cached.
+func (c *Client) ContainerNamesCached(ctx context.Context) []string {
+	c.proxyMu.Lock()
+	if c.names != nil && c.proxyClock().Sub(c.namesAt) < proxyCacheTTL {
+		out := append([]string(nil), c.names...)
+		c.proxyMu.Unlock()
+		return out
+	}
+	c.proxyMu.Unlock()
+	got := c.ContainerNames(ctx)
+	if got == nil {
+		return nil
+	}
+	c.proxyMu.Lock()
+	c.names = append([]string(nil), got...)
+	c.namesAt = c.proxyClock()
+	c.proxyMu.Unlock()
+	return got
 }
 
 // NewClient creates a new Docker client wrapper. composeProject scopes stats
@@ -698,8 +771,24 @@ func (c *Client) RunningBackends(ctx context.Context) (map[string]string, error)
 			continue
 		}
 		name := strings.TrimPrefix(ctr.Names[0], "/")
+		// Only a backend is inspected. Inspecting every listed container
+		// raced every short-lived one on the host: a throwaway container
+		// (`docker run --rm`, a build step) that exited between the list and
+		// its inspect failed the WHOLE call, and the proxy answered 503
+		// docker_unavailable (132 first-attempt failures in 7 days, the
+		// latest "inspecting container zealous_neumann").
+		key := backendKeyFromName(name)
+		if key == "" {
+			continue
+		}
 		inspectRes, err := c.docker.ContainerInspect(ctx, ctr.ID, client.ContainerInspectOptions{})
 		if err != nil {
+			// Gone between the list and the inspect: it is not running, so
+			// it is not in the map. Any other inspect error is still an
+			// error, never a silently dropped backend (i495).
+			if isGone(err) {
+				continue
+			}
 			return nil, fmt.Errorf("inspecting container %s: %w", name, err)
 		}
 		inspect := inspectRes.Container
@@ -707,7 +796,6 @@ func (c *Client) RunningBackends(ctx context.Context) (map[string]string, error)
 		envMap := parseEnv(inspect.Config.Env)
 		cmdArgs := inspect.Config.Cmd
 
-		key := backendKeyFromName(name)
 		switch key {
 		case "vllm", "vllm-secondary":
 			model := firstNonEmpty(envMap["MODEL_NAME"], envMap["VLLM_MODEL"])

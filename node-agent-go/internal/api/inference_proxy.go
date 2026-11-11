@@ -425,7 +425,7 @@ func (s *Server) handleInferenceProxy(w http.ResponseWriter, r *http.Request) {
 	_ = r.Body.Close()
 
 	headerHint := r.Header.Get("X-Noo-Backend")
-	running, err := s.docker.RunningBackends(r.Context())
+	running, err := s.docker.RunningBackendsCached(r.Context())
 	if err != nil {
 		slog.Warn("docker.running_backends_failed", "error", err)
 		jsonError(w, http.StatusServiceUnavailable, "docker_unavailable",
@@ -910,7 +910,7 @@ func (s *Server) handleRerankProxy(w http.ResponseWriter, r *http.Request) {
 	// proxying. Gives a precise 503 rather than a connection error when the
 	// gateway's capability view is ahead of reality (just stopped, etc.).
 	hasReranker := false
-	for _, name := range s.docker.ContainerNames(r.Context()) {
+	for _, name := range s.docker.ContainerNamesCached(r.Context()) {
 		if strings.Contains(name, "rerank") {
 			hasReranker = true
 			break
@@ -1032,7 +1032,7 @@ func (s *Server) dockerContainerNames(ctx context.Context, native bool) []string
 	if native || s.docker == nil {
 		return nil
 	}
-	return s.docker.ContainerNames(ctx)
+	return s.docker.ContainerNamesCached(ctx)
 }
 
 // backendClient is an http.Client for one backend door: the node-leaf
@@ -1254,7 +1254,7 @@ func (s *Server) embedProxyBody(w http.ResponseWriter, r *http.Request, body []b
 // so existing OpenAI clients (LangChain, LlamaIndex, etc.) work
 // unchanged when pointed at node-agent.
 func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
-	running, err := s.docker.RunningBackends(r.Context())
+	running, err := s.docker.RunningBackendsCached(r.Context())
 	if err != nil {
 		slog.Warn("docker.running_backends_failed", "error", err)
 		jsonError(w, http.StatusServiceUnavailable, "docker_unavailable",
