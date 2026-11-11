@@ -551,7 +551,13 @@ jobs:
           --deselect=tests/test_workflow_release_line_fetch.py::test_the_guards_exist_where_expected
         )
         if [ "$TRELLION_PUBLIC" != "true" ]; then args+=("${needs_trellion[@]}"); fi
-        pytest tests/ -v --cov=noomesh --cov-report=xml "${args[@]}"
+        # Parallel: test-core set the wall time of every PR and merge-queue
+        # run serially (992 s for 4,168 tests, run 42855148772; build-speed
+        # review 2026-11-11). worksteal balances the very uneven durations
+        # (one 64 s test, 116 over 1 s). --durations reports the slowest 50 so
+        # the next cut is measured, not estimated. Coverage stays: it is this
+        # job's per-run artifact (below), read by people, not by a gate.
+        pytest tests/ -v -n auto --dist worksteal --durations=50 --durations-min=1 --cov=noomesh --cov-report=xml "${args[@]}"
 
     # The sandbox jail as it runs in a container (pop-os, 0.6.13): Docker
     # masks paths under every container's /proc, the kernel then refuses a
