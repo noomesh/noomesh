@@ -1299,7 +1299,7 @@ dependencies = [
 
 [[package]]
 name = "noo-cli"
-version = "0.6.22"
+version = "0.6.23"
 dependencies = [
  "addon-manifest",
  "base64 0.23.1",
