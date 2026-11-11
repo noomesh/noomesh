@@ -1051,6 +1051,52 @@ mod tests {
         assert_eq!(current_trace_id(), None);
     }
 
+    /// The MCP doors check their own key (the auth layer lets /mcp/* through),
+    /// so until 2026-11-11 a door call left NO trace row and its overhead was
+    /// unmeasurable. A door now notes its key's principal: the call is
+    /// recorded under the same actor as any other call with that key, and
+    /// the inner hop's traceparent continues the same trace.
+    #[tokio::test]
+    async fn a_door_call_is_recorded_under_its_keys_actor() {
+        let machine = crate::service_keys::Consumer::all("trellion-x");
+        let mut bound = crate::service_keys::Consumer::all("cli-door");
+        bound.user = Some("rbwolf".into());
+        for (consumer, actor, kind) in [(machine, "internal:key:trellion-x", "internal"), (bound, "rbwolf", "user")] {
+            let rec = Arc::new(Recorder::new(&Method::POST, "/mcp/operator".into(), None, None));
+            CURRENT
+                .scope(rec.clone(), async {
+                    assert!(current_traceparent().is_none(), "before the key check there is nothing to continue");
+                    note_principal(&crate::bus_principal::for_consumer(&consumer));
+                    let tp = parse_traceparent(&current_traceparent().expect("noted")).expect("valid");
+                    assert_eq!(tp.trace_id, rec.ctx().trace_id, "the inner hop joins this trace");
+                })
+                .await;
+            assert!(recorded(&rec, 200), "{actor}: the door call is recorded");
+            let s = rec.summary();
+            assert_eq!((s.actor.as_deref(), s.actor_kind.as_deref()), (Some(actor), Some(kind)));
+        }
+    }
+
+    /// Both doors note the caller right after their key resolves, and the
+    /// inner self-call carries the trace on.
+    #[test]
+    fn both_doors_note_their_caller_and_the_inner_hop_continues_the_trace() {
+        let ext = crate::test_src::own_code(include_str!("mcp_external.rs"));
+        let auth = crate::test_src::fn_body(&ext, "async fn authenticate(");
+        let resolved = auth.find("service_keys::resolve(").expect("the key check");
+        let noted = auth.find("request_trace::note_principal(&crate::bus_principal::for_consumer(&consumer))").expect("user door notes its caller");
+        assert!(resolved < noted && noted < auth.find("admit(consumer").expect("the quota"), "{auth}");
+        let exec = crate::test_src::fn_body(&ext, "async fn execute_spec(");
+        assert!(exec.contains("req.header(\"traceparent\", tp)") && exec.contains("current_traceparent()"), "{exec}");
+        let loc = crate::test_src::own_code(include_str!("mcp_local.rs"));
+        let op = crate::test_src::fn_body(&loc, "async fn authenticate_over_tls(");
+        let found = op.find("let Some(consumer) = found else").expect("the key check");
+        let noted = op.find("request_trace::note_principal(&crate::bus_principal::for_consumer(&consumer))").expect("operator door notes its caller");
+        assert!(found < noted && noted < op.find("door_rpm(&consumer)").expect("the quota"), "{op}");
+        let bp = crate::test_src::own_code(include_str!("bus_principal.rs"));
+        assert!(crate::test_src::fn_body(&bp, "pub fn from_extensions(").contains("for_consumer(consumer)"), "one mapping for the rail and the doors");
+    }
+
     /// A streamed body's trace ends when the STREAM does, with its bytes: not
     /// when the layer returns, and not with 0. Fails on the field-capture
     /// version (the callback ran before a byte was read, with 0).

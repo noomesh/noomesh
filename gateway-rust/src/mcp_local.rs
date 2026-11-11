@@ -301,6 +301,9 @@ async fn authenticate_over_tls(
             ),
         ));
     };
+    // The door checks its own key: tell the request trace who called (see
+    // mcp_external::authenticate).
+    crate::request_trace::note_principal(&crate::bus_principal::for_consumer(&consumer));
     // Metered per consumer even without a cap of its own (see
     // `service_keys::door_rpm`); in-process when Redis is absent or erroring.
     let limit = crate::service_keys::door_rpm(&consumer);

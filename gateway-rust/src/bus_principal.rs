@@ -624,23 +624,31 @@ pub fn from_extensions(ext: &axum::http::Extensions) -> Option<Principal> {
         });
     }
     if let Some(consumer) = ext.get::<crate::service_keys::Consumer>() {
-        // `name` says which program is calling; `user` says on whose behalf.
-        // A key issued with `--user` is that person on the bus too, or the
-        // whole point of binding it would stop at the HTTP door.
-        return Some(match &consumer.user {
-            Some(user) => {
-                let mut principal = Principal::user(user.clone(),
-                    crate::auth::Role::from_scopes(&consumer.scopes), consumer.scopes.clone());
-                principal.harness = Some(format!("service-key:{}", consumer.name));
-                principal
-            },
-            None => Principal::internal(
-                &format!("key:{}", consumer.name),
-                INTERNAL_SERVICE_SCOPES,
-            ),
-        });
+        return Some(for_consumer(consumer));
     }
     None
+}
+
+/// The principal a service-key caller signs as: the HTTP rail
+/// ([`from_extensions`]) and the MCP doors, which check their own key and
+/// note it on the request trace with this (so a door call is recorded under
+/// the same actor as any other call with that key).
+pub fn for_consumer(consumer: &crate::service_keys::Consumer) -> Principal {
+    // `name` says which program is calling; `user` says on whose behalf.
+    // A key issued with `--user` is that person on the bus too, or the
+    // whole point of binding it would stop at the HTTP door.
+    match &consumer.user {
+        Some(user) => {
+            let mut principal = Principal::user(user.clone(),
+                crate::auth::Role::from_scopes(&consumer.scopes), consumer.scopes.clone());
+            principal.harness = Some(format!("service-key:{}", consumer.name));
+            principal
+        },
+        None => Principal::internal(
+            &format!("key:{}", consumer.name),
+            INTERNAL_SERVICE_SCOPES,
+        ),
+    }
 }
 
 /// Reserved payload key carrying a DLQ row's originating principal.
