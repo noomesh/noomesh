@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/auth"
+	"github.com/noomesh/noomesh/node-agent-go/internal/metrics"
 )
 
 // handlePrometheusMetrics renders Prometheus text-format metrics.
@@ -84,6 +85,11 @@ func (s *Server) handlePrometheusMetrics(w http.ResponseWriter, r *http.Request)
 
 	// Legacy credential lanes admitted since this agent started. Two fixed lanes: the label set is closed.
 	writeLegacyLanes(&b, nodeID, auth.LegacyLaneCounts())
+
+	// The agent's own process_* figures and the noomesh units' cgroups
+	// (agent, harness, hostd): noomesh-internal i658.
+	self, haveSelf := metrics.ReadProcSelf("/proc")
+	b.WriteString(metrics.ProcessMetricsText(nodeID, self, haveSelf, metrics.ReadUnitStats("/sys/fs/cgroup", metrics.NoomeshUnits)))
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)

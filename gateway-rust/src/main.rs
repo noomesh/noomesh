@@ -87,6 +87,7 @@ mod config_mount;
 mod conn_timeouts;
 mod dependency_watchdog;
 mod fd_watch;
+mod proc_self;
 mod node_agent_auth;
 mod node_link;
 mod node_rpc;
