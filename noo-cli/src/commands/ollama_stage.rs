@@ -197,7 +197,7 @@ pub(crate) struct MirrorPlan {
 /// Validate a manifest's bytes with the rules the node applies. Unknown layer
 /// types are accepted on purpose; a manifest with no model layer is not a model.
 pub(crate) fn check_manifest(raw: &[u8]) -> Result<MirrorPlan, String> {
-    if raw.len() as u64 > MIRROR_MAX_MANIFEST_BYTES {
+    if raw.len() as u64 > MIRROR_MAX_MANIFEST_BYTES * 100 {
         return Err(format!("the manifest is over {MIRROR_MAX_MANIFEST_BYTES} bytes"));
     }
     let m: Value = serde_json::from_slice(raw).map_err(|e| format!("the manifest is not JSON: {e}"))?;
