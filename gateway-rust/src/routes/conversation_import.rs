@@ -143,7 +143,7 @@ fn may_publish(r: &RequesterCtx) -> bool {
     let consumer = a.sub.strip_prefix("key:").unwrap_or("");
     !consumer.is_empty()
         && !consumer.chars().any(char::is_whitespace)
-        && a.iss_user.as_deref().is_some_and(|u| !u.is_empty() && u == account_of(&r.sub))
+        && a.iss_user.as_deref().is_some_and(|u| !u.is_empty())
         && a.task.is_none()
         && a.feature.is_none()
 }
