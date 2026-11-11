@@ -638,7 +638,7 @@ pub(crate) async fn execute_spec(
         "PUT" => client.put(&url).json(&rest),
         _ => client.post(&url).json(&rest),
     }
-    .timeout(std::time::Duration::from_secs(spec.timeout_secs))
+    .timeout(std::time::Duration::from_secs(30))
     .header(&auth_header.0, &auth_header.1);
 
     let started = std::time::Instant::now();
