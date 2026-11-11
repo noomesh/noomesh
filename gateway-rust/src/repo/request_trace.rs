@@ -106,6 +106,32 @@ pub async fn recent(db: &sqlx::PgPool, f: &Filter<'_>) -> Result<Vec<sqlx::postg
     .await
 }
 
+/// The chat routes' recent p50 duration per (node, backend), for the
+/// interactive expected-wait rule (coordinator::expected_wait): successful
+/// answers in the last `minutes`, with at least `min_samples` each.
+pub async fn chat_p50_by_node_backend(
+    db: &sqlx::PgPool,
+    minutes: i64,
+    min_samples: i64,
+) -> Result<Vec<(String, String, u64)>, sqlx::Error> {
+    let rows: Vec<(String, String, f64)> = sqlx::query_as(
+        "SELECT node_id, backend,
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY duration_ms)::float8
+           FROM noo_request_trace
+          WHERE at > now() - ($1::bigint * interval '1 minute')
+            AND route IN ('/v1/chat/completions', '/api/external/chat/completions', '/api/inference')
+            AND status < 400
+            AND node_id IS NOT NULL AND backend IS NOT NULL
+          GROUP BY 1, 2
+         HAVING count(*) >= $2",
+    )
+    .bind(minutes)
+    .bind(min_samples)
+    .fetch_all(db)
+    .await?;
+    Ok(rows.into_iter().map(|(n, b, p)| (n, b, p.max(0.0) as u64)).collect())
+}
+
 /// The window grouped by `col`, busiest first. One literal statement per
 /// grouping (sqlx takes a `&'static str`, and a column name is never built
 /// from text); `col` is one of `routes::traces::GROUP_BY`'s columns, and any

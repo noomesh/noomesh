@@ -31,6 +31,7 @@ pub(crate) mod phase;
 mod cloud;
 mod context;
 mod dispatch;
+pub mod expected_wait;
 mod gemma_channel;
 mod rail;
 mod remote;
