@@ -34,6 +34,12 @@ import (
 // or a transport failure, where nothing is known.
 var ErrArtifactAbsent = errors.New("the controller store does not have it")
 
+// ErrArtifactKindUnknown is a gateway's 400 for a kind it does not serve (it
+// predates the kind). It is ALSO ErrArtifactAbsent, so every caller that
+// treats a 400 as "not there" keeps doing so; a caller that can say "upgrade
+// the controller" checks for it first.
+var ErrArtifactKindUnknown = fmt.Errorf("%w: the controller's gateway predates this artifact kind", ErrArtifactAbsent)
+
 // ErrArtifactHashing is the gateway's 202: it has the file and is computing
 // its sha256 in the background. Ask again after RetryAfter. Never "absent".
 var ErrArtifactHashing = errors.New("the controller is still hashing it")
@@ -143,7 +149,13 @@ func doArtifactManifest(httpClient *http.Client, req *http.Request) (*artifactMa
 	}
 	defer resp.Body.Close()
 	switch {
-	case resp.StatusCode == http.StatusNotFound, resp.StatusCode == http.StatusBadRequest:
+	case resp.StatusCode == http.StatusBadRequest:
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		if strings.Contains(string(msg), "unknown artifact kind") {
+			return nil, ErrArtifactKindUnknown
+		}
+		return nil, ErrArtifactAbsent
+	case resp.StatusCode == http.StatusNotFound:
 		return nil, ErrArtifactAbsent
 	case resp.StatusCode == http.StatusAccepted:
 		wait := 5 * time.Second

@@ -176,6 +176,15 @@ func (g *OllamaGuard) setPlistValue(key, value string) error {
 	return nil
 }
 
+// ModelsDirInUse is the directory the native ollama reads models from: the
+// plist's OLLAMA_MODELS, else ollama's default under the user's home.
+func (g *OllamaGuard) ModelsDirInUse() string {
+	if v := g.plistValue(ollamaModels); v != "" {
+		return v
+	}
+	return filepath.Join(g.Home, ".ollama", "models")
+}
+
 // modelsPlan is (wanted, current, move): move is true only when switching
 // OLLAMA_MODELS cannot hide models.
 func (g *OllamaGuard) modelsPlan() (wanted, current string, move bool) {
