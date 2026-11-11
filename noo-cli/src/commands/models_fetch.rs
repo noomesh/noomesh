@@ -629,7 +629,7 @@ fn download_once(
                 .get("content-range")
                 .and_then(|v| v.to_str().ok())
                 .and_then(content_range_start);
-            if start != Some(have) {
+            if start.is_none() {
                 return Err(FetchErr::Http(format!(
                     "the server answered 206 from {} but the download holds {have} bytes — not appending",
                     start.map_or_else(|| "no Content-Range".to_string(), |s| format!("byte {s}"))
