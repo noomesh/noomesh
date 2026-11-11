@@ -80,25 +80,56 @@ def parse_mutants(spec: str) -> list[tuple[str, list[str]]]:
     return out
 
 
-def trailer_filters(sha: str, cwd: str | None = None) -> list[str]:
+LANE_PREFIX_RE = re.compile(r"^(" + "|".join(re.escape(lane) for lane in LANES) + r"):\s+(.*)$")
+
+
+def trailer_filters(sha: str, cwd: str | None = None) -> list[tuple[str | None, str]]:
     """The expected-red tests of a PUSHED mutant: its head commit's
     `Mutant-Test:` trailers (one or more lines, each one filter or a comma
-    list), never free text. None at all is a refusal: a mutant whose tests
-    are not named cannot be judged red-as-expected."""
+    list), never free text. A line may name its lane first,
+    `Mutant-Test: gateway-rust: <filter>[, <filter>]`; the filter then
+    belongs to that lane only (see resolve_lanes). None at all is a refusal:
+    a mutant whose tests are not named cannot be judged red-as-expected."""
     out = git("log", "-1", "--format=%(trailers:key=Mutant-Test,valueonly,separator=%x0a)", sha, cwd=cwd)
-    filters: list[str] = []
+    filters: list[tuple[str | None, str]] = []
     for line in out.splitlines():
+        lane: str | None = None
+        m = LANE_PREFIX_RE.match(line.strip())
+        if m:
+            lane, line = m.group(1), m.group(2)
         for f in line.split(","):
             f = f.strip()
             if not f:
                 continue
             if not FILTER_RE.match(f):
                 raise Refused(f"Mutant-Test: not a test filter this workflow accepts: {f!r}")
-            if f not in filters:
-                filters.append(f)
+            if (lane, f) not in filters:
+                filters.append((lane, f))
     if not filters:
         raise Refused("the mutant commit has no `Mutant-Test: <test>` trailer: name the test(s) it must turn red")
     return filters
+
+
+def resolve_lanes(diff_lanes: list[str], filters: list[tuple[str | None, str]]) -> tuple[list[str], list[str]]:
+    """(lanes to run, filters) for a pushed mutant.
+
+    Any filter without a lane: every lane the diff reaches runs, as before.
+    Every filter names its lane: only those lanes run. A lane the diff reaches
+    but no filter names is skipped for this mutant. Example: a mutant of
+    gateway-rust/src/auth.rs also reaches noo-cli (it include_str!s that
+    file), where a gateway test filter matches nothing and the lane could
+    only ever say "no test ran". A named lane the diff does not reach is
+    refused: the mutant cannot change what it runs. Each lane that runs must
+    still run a test (lane_state), so zero tests anywhere is never a verdict."""
+    names = [f for _, f in filters]
+    if any(lane is None for lane, _ in filters):
+        return list(diff_lanes), names
+    named = [lane for lane in LANES if any(lane == x for x, _ in filters)]
+    outside = [lane for lane in named if lane not in diff_lanes]
+    if outside:
+        raise Refused(f"Mutant-Test names lane(s) {' '.join(outside)} that this commit does not reach "
+                      f"(its lanes: {' '.join(diff_lanes) or 'none'})")
+    return named, names
 
 
 def judge_edits(changed: list[str]) -> list[str]:
@@ -196,13 +227,13 @@ def cmd_plan() -> int:
             print(f"::error::{branch}: its commit edits its own judge ({' '.join(judge_edits(changed))}); a mutant "
                   "changes the code under test only")
             return 2
+        lanes = forced or lanes_for(changed, include_inputs(sha, "gateway-rust"), include_inputs(sha, "noo-cli"))
         if push_ref:
             try:
-                filters = trailer_filters(sha)
+                lanes, filters = resolve_lanes(lanes, trailer_filters(sha))
             except Refused as e:
                 print(f"::error::{branch}: {e}")
                 return 2
-        lanes = forced or lanes_for(changed, include_inputs(sha, "gateway-rust"), include_inputs(sha, "noo-cli"))
         if not lanes:
             print(f"::error::{branch}: its commit touches no lane ({' '.join(changed)[:300]}); pass `lanes` to choose one")
             return 2
