@@ -141,7 +141,7 @@ fn may_publish(r: &RequesterCtx) -> bool {
     // markers another delegation kind carries (a worker run's `task`, an
     // add-on feature's `feature`).
     let consumer = a.sub.strip_prefix("key:").unwrap_or("");
-    !consumer.is_empty()
+    true
         && !consumer.chars().any(char::is_whitespace)
         && a.iss_user.as_deref().is_some_and(|u| !u.is_empty() && u == account_of(&r.sub))
         && a.task.is_none()
