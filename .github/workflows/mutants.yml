@@ -34,6 +34,23 @@
 # Dispatch from dev (so dev's caches restore):
 #   gh workflow run mutants.yml --ref dev -f mutants="wt/x-mutant-1 wt/x-mutant-2:some::test_name"
 #
+# OR PUSH the mutant branch (2026-11-11: a dispatched workflow is looked up on
+# the DEFAULT branch, main, so dispatch 404s until a promotion carries this
+# file there; a push runs the workflow from the pushed commit, which every
+# mutant cut from dev carries). A pushed branch must match
+# `wt/*-mut-*` or `wt/*-mutant-*`, and its head commit names the test(s) it
+# must turn red in a trailer, never free text:
+#
+#   MUTANT 3 (do not merge): the display check passes a stale console
+#
+#   Mutant-Test: commands::kiosk_seat::console_identity_tests::the_display_check_fails
+#
+# (one or more `Mutant-Test:` lines, each a filter or a comma list). No trailer,
+# or a filter that runs no test, is a FAILED job: a mutant that ran nothing
+# never reads as caught. On a push the planner, the judge and the summary come
+# from DEV, not the pushed commit, and a mutant commit that edits `.github/` or
+# scripts/ci-mutants.py is refused: a mutant cannot change its own judge.
+#
 # TODO: mutants sharing a parent each re-test it (6-8x per fix). A base job per
 # (parent, lanes) would save runner minutes but not wall time (a matrix job
 # cannot wait on one group's base, and each mutant job rebuilds the parent
@@ -41,6 +58,10 @@
 name: mutants
 
 on:
+  push:
+    branches:
+    - 'wt/*-mut-*'
+    - 'wt/*-mutant-*'
   workflow_dispatch:
     inputs:
       mutants:
@@ -56,9 +77,11 @@ on:
 permissions:
   contents: read
 
+# A push: one group per mutant branch, a re-push replaces the run in progress.
+# A dispatch: its own run, never cancelled.
 concurrency:
-  group: mutants-${{ github.run_id }}
-  cancel-in-progress: false
+  group: ${{ github.event_name == 'push' && format('mutants-{0}', github.ref) || format('mutants-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
   plan:
@@ -68,8 +91,10 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
       count: ${{ steps.plan.outputs.count }}
     steps:
+    # The planner from DEV on a push (never the pushed mutant's own copy).
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       with:
+        ref: ${{ github.event_name == 'push' && 'refs/heads/dev' || github.sha }}
         persist-credentials: false
         fetch-depth: 1
     - name: Plan (validate every branch and filter, resolve parents and lanes)
@@ -77,6 +102,7 @@ jobs:
       env:
         MUTANTS: ${{ inputs.mutants }}
         LANES: ${{ inputs.lanes }}
+        PUSH_REF: ${{ github.event_name == 'push' && github.ref_name || '' }}
       run: python3 scripts/ci-mutants.py plan
 
   mutant:
@@ -120,10 +146,11 @@ jobs:
         ref: ${{ matrix.sha }}
         fetch-depth: 2
         persist-credentials: false
-    # The harness from THIS workflow's commit: a mutant cannot edit its judge.
+    # The harness from THIS workflow's commit (dev, on a push): a mutant cannot
+    # edit its judge.
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       with:
-        ref: ${{ github.sha }}
+        ref: ${{ github.event_name == 'push' && 'refs/heads/dev' || github.sha }}
         path: .mutant-harness
         sparse-checkout: scripts/ci-mutants.py
         sparse-checkout-cone-mode: false
@@ -257,6 +284,7 @@ jobs:
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       with:
+        ref: ${{ github.event_name == 'push' && 'refs/heads/dev' || github.sha }}
         persist-credentials: false
         sparse-checkout: scripts/ci-mutants.py
         sparse-checkout-cone-mode: false

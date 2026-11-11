@@ -28,6 +28,11 @@ cm = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(cm)
 
 
+# On a push the planner, the harness and the summary come from dev; on a
+# dispatch from the workflow's own commit.
+DEV_ON_PUSH = "${{ github.event_name == 'push' && 'refs/heads/dev' || github.sha }}"
+
+
 def _steps():
     for name, job in WF["jobs"].items():
         for step in job.get("steps", []):
@@ -73,7 +78,7 @@ def test_every_checkout_drops_its_credentials_and_every_action_is_pinned():
 def test_the_judge_comes_from_the_workflows_commit_not_the_mutant():
     m = WF["jobs"]["mutant"]
     harness = [s for s in m["steps"] if s.get("with", {}).get("path") == ".mutant-harness"]
-    assert len(harness) == 1 and harness[0]["with"]["ref"] == "${{ github.sha }}"
+    assert len(harness) == 1 and harness[0]["with"]["ref"] == DEV_ON_PUSH
     assert m["env"]["HARNESS"].endswith("/.mutant-harness/scripts/ci-mutants.py")
     for s in m["steps"]:
         if "run" in s and "ci-mutants.py" in s["run"]:
@@ -198,3 +203,81 @@ def test_summary_is_green_only_when_every_mutant_was_caught(tmp_path, monkeypatc
         json.dumps({"branch": "wt/m-1", "sha": "abcdef12", "verdict": "base-red", "detail": "x"}))
     monkeypatch.setenv("EXPECTED", "2")
     assert cm.cmd_summary(str(tmp_path)) == 1
+
+
+# ---- the push trigger (2026-11-11) ----------------------------------------------
+# A dispatched workflow is looked up on the default branch (main), so dispatch
+# 404s until a promotion carries this file there; a push runs it from the
+# pushed commit. The mutant is the pushed branch, its expected-red tests come
+# from `Mutant-Test:` trailers, and it may not edit its own judge.
+
+def test_a_mutant_branch_push_runs_it_and_dispatch_stays():
+    on = WF[True]
+    assert on["push"] == {"branches": ["wt/*-mut-*", "wt/*-mutant-*"]}, on["push"]
+    assert set(on["workflow_dispatch"]["inputs"]) == {"mutants", "lanes"}
+    for shape in ("wt/97-console-by-digest-mut-3", "wt/97-upgrade-stage-nonblocking-mut-7",
+                  "wt/cf-mutant-mbx-retired-recipient", "wt/fa-orphan-test-race-mutant-1"):
+        assert cm.PUSH_BRANCH_RE.match(shape), shape
+    for not_a_mutant in ("wt/97-console-by-digest", "dev", "main", "wt/mut", "feature/x-mut-1", "wt/../x-mut-1"):
+        assert not (cm.PUSH_BRANCH_RE.match(not_a_mutant) and cm.valid_branch(not_a_mutant)), not_a_mutant
+
+
+def test_a_push_is_one_group_per_branch_and_a_repush_replaces_it():
+    c = WF["concurrency"]
+    assert c["group"] == ("${{ github.event_name == 'push' && format('mutants-{0}', github.ref) "
+                          "|| format('mutants-{0}', github.run_id) }}")
+    assert c["cancel-in-progress"] == "${{ github.event_name == 'push' }}"
+
+
+def test_on_a_push_the_planner_judge_and_summary_come_from_dev():
+    plan = WF["jobs"]["plan"]["steps"]
+    assert plan[0]["with"]["ref"] == DEV_ON_PUSH
+    assert next(s for s in plan if s.get("id") == "plan")["env"]["PUSH_REF"] == \
+        "${{ github.event_name == 'push' && github.ref_name || '' }}"
+    assert WF["jobs"]["summary"]["steps"][0]["with"]["ref"] == DEV_ON_PUSH
+
+
+def _repo(d: Path, message: str) -> str:
+    import subprocess
+    d.mkdir(parents=True, exist_ok=True)
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(d), "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+
+    def run(*a: str) -> str:
+        return subprocess.run(["git", *a], cwd=d, env=env, check=True, capture_output=True, text=True).stdout.strip()
+
+    run("init", "-q")
+    (d / "f").write_text("x")
+    run("add", "f")
+    run("commit", "-qm", message)
+    return run("rev-parse", "HEAD")
+
+
+def test_the_expected_red_tests_come_from_mutant_test_trailers(tmp_path):
+    sha = _repo(tmp_path, "MUTANT 3 (do not merge): x\n\nsome free text naming not_this_test\n\n"
+                "Mutant-Test: commands::kiosk_seat::console_identity_tests::a, tests/test_x.py::test_y\n"
+                "Mutant-Test: TestGoThing\n")
+    assert cm.trailer_filters(sha, cwd=str(tmp_path)) == [
+        "commands::kiosk_seat::console_identity_tests::a", "tests/test_x.py::test_y", "TestGoThing"]
+
+
+def test_no_trailer_or_a_bad_filter_is_refused(tmp_path):
+    sha = _repo(tmp_path / "a", "MUTANT 1: expect red: some_test")  # free text only
+    with pytest.raises(cm.Refused, match="no `Mutant-Test:"):
+        cm.trailer_filters(sha, cwd=str(tmp_path / "a"))
+    sha = _repo(tmp_path / "b", "MUTANT 2: x\n\nMutant-Test: $(rm -rf /)\n")
+    with pytest.raises(cm.Refused, match="not a test filter"):
+        cm.trailer_filters(sha, cwd=str(tmp_path / "b"))
+
+
+def test_a_mutant_may_not_edit_its_judge():
+    assert cm.judge_edits(["gateway-rust/src/x.rs", "tests/test_y.py"]) == []
+    assert cm.judge_edits([".github/workflows/mutants.yml", "x"]) == [".github/workflows/mutants.yml"]
+    assert cm.judge_edits(["scripts/ci-mutants.py"]) == ["scripts/ci-mutants.py"]
+
+
+def test_a_pushed_branch_off_the_patterns_is_refused_before_any_fetch(monkeypatch, capsys):
+    monkeypatch.setenv("PUSH_REF", "wt/feature-x")  # no -mut-/-mutant- marker
+    monkeypatch.setenv("MUTANTS", "")
+    assert cm.cmd_plan() == 2
+    assert "does not judge" in capsys.readouterr().out

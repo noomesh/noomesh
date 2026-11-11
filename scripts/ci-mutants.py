@@ -35,6 +35,12 @@ BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 # file, or a pytest -k word. No spaces, quotes, $, `, ; or globs.
 FILTER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_:./-]{0,199}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+# A PUSHED mutant branch (mutants.yml `on.push.branches`): wt/<…>-mut-<…> or
+# wt/<…>-mutant-<…>, the shapes in use. Held again here, not only by the trigger.
+PUSH_BRANCH_RE = re.compile(r"^wt/[A-Za-z0-9._-]+-(mut|mutant)-[A-Za-z0-9._-]+$")
+# A mutant commit may not edit its own judge: the workflows, or this harness.
+JUDGE_PATHS = (".github/",)
+JUDGE_FILES = ("scripts/ci-mutants.py",)
 MAX_MUTANTS = 32
 
 
@@ -72,6 +78,32 @@ def parse_mutants(spec: str) -> list[tuple[str, list[str]]]:
     if len(out) > MAX_MUTANTS:
         raise Refused(f"{len(out)} mutants: at most {MAX_MUTANTS} per run")
     return out
+
+
+def trailer_filters(sha: str, cwd: str | None = None) -> list[str]:
+    """The expected-red tests of a PUSHED mutant: its head commit's
+    `Mutant-Test:` trailers (one or more lines, each one filter or a comma
+    list), never free text. None at all is a refusal: a mutant whose tests
+    are not named cannot be judged red-as-expected."""
+    out = git("log", "-1", "--format=%(trailers:key=Mutant-Test,valueonly,separator=%x0a)", sha, cwd=cwd)
+    filters: list[str] = []
+    for line in out.splitlines():
+        for f in line.split(","):
+            f = f.strip()
+            if not f:
+                continue
+            if not FILTER_RE.match(f):
+                raise Refused(f"Mutant-Test: not a test filter this workflow accepts: {f!r}")
+            if f not in filters:
+                filters.append(f)
+    if not filters:
+        raise Refused("the mutant commit has no `Mutant-Test: <test>` trailer: name the test(s) it must turn red")
+    return filters
+
+
+def judge_edits(changed: list[str]) -> list[str]:
+    """The files of a mutant commit that are its judge (it may not edit them)."""
+    return [f for f in changed if f.startswith(JUDGE_PATHS) or f in JUDGE_FILES]
 
 
 def parse_lanes(spec: str) -> list[str]:
@@ -128,6 +160,15 @@ def lanes_for(changed: list[str], gw_in: set[str], cli_in: set[str]) -> list[str
 def cmd_plan() -> int:
     spec = os.environ.get("MUTANTS", "")
     override = os.environ.get("LANES", "")
+    # A push of one mutant branch: the mutant is that branch, its filters come
+    # from its commit's `Mutant-Test:` trailers (below), and dispatch input is
+    # not read.
+    push_ref = os.environ.get("PUSH_REF", "").strip()
+    if push_ref:
+        if not PUSH_BRANCH_RE.match(push_ref) or not valid_branch(push_ref):
+            print(f"::error::a pushed branch this workflow does not judge: {push_ref!r}")
+            return 2
+        spec = push_ref
     try:
         mutants = parse_mutants(spec)
         forced = parse_lanes(override) if override.strip() else []
@@ -151,6 +192,16 @@ def cmd_plan() -> int:
             print(f"::error::{branch}: unexpected object names {sha!r} {parent!r}")
             return 2
         changed = git("diff", "--name-only", parent, sha).split()
+        if judge_edits(changed):
+            print(f"::error::{branch}: its commit edits its own judge ({' '.join(judge_edits(changed))}); a mutant "
+                  "changes the code under test only")
+            return 2
+        if push_ref:
+            try:
+                filters = trailer_filters(sha)
+            except Refused as e:
+                print(f"::error::{branch}: {e}")
+                return 2
         lanes = forced or lanes_for(changed, include_inputs(sha, "gateway-rust"), include_inputs(sha, "noo-cli"))
         if not lanes:
             print(f"::error::{branch}: its commit touches no lane ({' '.join(changed)[:300]}); pass `lanes` to choose one")
