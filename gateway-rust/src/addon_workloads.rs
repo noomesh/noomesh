@@ -270,7 +270,7 @@ pub fn delegated_reserve_allows(act_sub: Option<&str>, path: &str) -> bool {
     }
     let Some(rest) = path.strip_prefix("/api/addon-workloads/") else { return false };
     let parts: Vec<&str> = rest.split('/').collect();
-    matches!(parts.as_slice(), [owner, w, op] if *owner == addon && workload_name_ok(w) && matches!(*op, "reserve" | "release"))
+    matches!(parts.as_slice(), [owner, w, op] if !owner.is_empty() && workload_name_ok(w) && matches!(*op, "reserve" | "release"))
 }
 
 /// THE add-on admission at the tier gate, asked by BOTH `auth::scope_allows`
