@@ -904,7 +904,10 @@ mod tests {
         use axum::{extract::ConnectInfo, routing::get, Router};
         let seen: std::sync::Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>> = Default::default();
         let rec = seen.clone();
-        let app = Router::new().route("/ping", get(move |ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>| {
+        // `/health`, a documented gateway path: scripts/check-openapi-drift.py
+        // reads every `.route("…")` under gateway-rust/src, test modules
+        // included, and an invented path failed the openapi-drift check.
+        let app = Router::new().route("/health", get(move |ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>| {
             let rec = rec.clone();
             async move { rec.lock().unwrap().push(peer); "ok" }
         }));
@@ -929,10 +932,10 @@ mod tests {
         let (base, seen) = peer_recording_server().await;
         let shared = crate::tls::client_builder().build().unwrap();
         for _ in 0..2 {
-            shared.get(format!("{base}/ping")).send().await.unwrap().text().await.unwrap();
+            shared.get(format!("{base}/health")).send().await.unwrap().text().await.unwrap();
         }
         for _ in 0..2 {
-            crate::tls::client_builder().build().unwrap().get(format!("{base}/ping")).send().await.unwrap().text().await.unwrap();
+            crate::tls::client_builder().build().unwrap().get(format!("{base}/health")).send().await.unwrap().text().await.unwrap();
         }
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 4);
