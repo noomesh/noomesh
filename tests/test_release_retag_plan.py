@@ -59,13 +59,14 @@ MAINS = {"trellion": "TRE_MAIN"}
 
 
 def _plan(tag="stack-v1.2.3", trees=None, rcs=("stack-v1.2.3-rc.2", "stack-v1.2.3-rc.1"),
-          sibs=None, lock=LOCK, bases=None, changed=None):
+          sibs=None, lock=LOCK, bases=None, changed=None, finals=(), inputs=None):
     trees = trees or {"stack-v1.2.3": "T", "stack-v1.2.3-rc.2": "T", "stack-v1.2.3-rc.1": "T"}
     return P.plan(tag, "o/r", sibs or MAINS, "t", "t", lock_text=lock, bases_text=bases,
                   tree_of=lambda ref: trees[ref], commit_of=lambda ref: "C-" + ref,
                   list_rcs=lambda final: list(rcs),
                   sib_tree=lambda repo, sha, tok: SIB_TREES[sha],
-                  changed_of=lambda prev, new: changed)
+                  changed_of=lambda prev, new: changed,
+                  list_finals=lambda: list(finals), inputs_table=inputs)
 
 
 def test_equal_trees_retag_everything_but_the_tag_stamped_images():
@@ -422,7 +423,7 @@ def _staged_plan(staged=None, fps=None, tag="stack-v1.3.0-rc.1", trees=None, rcs
     p = P.plan(tag, "o/r", MAINS, "t", "t", lock_text=LOCK, bases_text=None,
                tree_of=lambda ref: (trees or NEW_VERSION)[ref], commit_of=lambda ref: "C-" + ref,
                list_rcs=lambda final: list(rcs), sib_tree=lambda repo, sha, tok: SIB_TREES[sha],
-               changed_of=lambda prev, new: None,
+               changed_of=lambda prev, new: None, list_finals=lambda: [],
                staged_of=staged_of, fingerprint_of=fingerprint_of, now=now)
     return p, looked
 
@@ -562,3 +563,74 @@ def test_retag_script_copies_an_exact_staged_digest_and_nothing_else(tmp_path):
     for want in ("sha256:" + "6" * 64, ""):
         r, calls = run("@" + SDIG, want)
         assert r.returncode != 0 and "imagetools create" not in calls, want
+
+
+# ── an rc.1 compares against the PREVIOUS FINAL (build-speed review 2026-11-11) ──
+
+def test_an_rc1_compares_against_the_previous_final_and_only_then():
+    finals = ["stack-v1.2.2", "stack-v1.2.10", "stack-v1.10.0", "stack-v1.2.3", "stack-vbogus", "stack-v1.2"]
+    # rc.1 has no lower rc: the highest LOWER final, by version, not by text.
+    assert P.candidates("stack-v1.2.11-rc.1", lambda v: [], lambda: finals) == ["stack-v1.2.10"]
+    assert P.candidates("stack-v1.2.3-rc.1", lambda v: ["stack-v1.2.3-rc.1"], lambda: finals) == ["stack-v1.2.2"]
+    # A lower rc exists: it, never the final.
+    assert P.candidates("stack-v1.2.3-rc.2", lambda v: ["stack-v1.2.3-rc.1"], lambda: finals) == ["stack-v1.2.3-rc.1"]
+    # A final re-tags only from its own rcs, never from an earlier final.
+    assert P.candidates("stack-v1.2.3", lambda v: [], lambda: finals) == []
+    # No lower final at all: nothing.
+    assert P.candidates("stack-v0.0.1-rc.1", lambda v: [], lambda: finals) == []
+    assert P.previous_final("stack-vbogus-rc.1", lambda: finals) is None
+
+
+def test_the_0_6_23_shape_retags_everything_but_the_tag_stamped_images():
+    """0.6.23-rc.1 changed five files (gateway sources and noo-cli's Cargo
+    files) and rebuilt every image it did not take from :staged. Against the
+    previous final, under the real input table, only gateway (its inputs
+    changed, and it is tag-stamped) and node-agent (tag-stamped) build; each
+    re-tag names its source tag and digest."""
+    changed = [
+        "gateway-rust/src/addon_workloads.rs", "gateway-rust/src/auth.rs",
+        "gateway-rust/src/routes/router_harness_tests.rs", "noo-cli/Cargo.toml", "noo-cli/Cargo.lock",
+    ]
+    trees = {"stack-v0.6.23-rc.1": "T-new", "stack-v0.6.22": "T-old"}
+    p = _plan(tag="stack-v0.6.23-rc.1", trees=trees, rcs=(), finals=("stack-v0.6.21", "stack-v0.6.22"),
+              changed=changed, inputs=P.load_inputs())
+    assert p["rc_tag"] == "stack-v0.6.22", p["why"]
+    built = {i for i, r in p["retag"].items() if not r}
+    assert built == {"gateway", "node-agent"}, p["why"]
+    for img in ("deps-core", "deps-base", "trellion", "sandbox", "worker", "whisper", "piper"):
+        assert p["retag"][img] is True, (img, p["why"][img])
+        assert p["why"][img].startswith("re-tag from stack-v0.6.22"), p["why"][img]
+    assert p["why"]["whisper"].startswith("re-tag from stack-v0.6.22@sha256:w"), p["why"]["whisper"]
+    assert p["rc_digests"]["whisper"] == "sha256:w"
+    assert "gateway-rust/" in p["why"]["gateway"] or "embeds the console" in p["why"]["gateway"], p["why"]["gateway"]
+
+
+def test_a_changed_input_against_the_previous_final_builds_and_says_which():
+    """Same rule as against a lower rc: an image whose input changed builds,
+    with the input named, and so does everything built FROM it."""
+    trees = {"stack-v0.6.23-rc.1": "T-new", "stack-v0.6.22": "T-old"}
+    p = _plan(tag="stack-v0.6.23-rc.1", trees=trees, rcs=(), finals=("stack-v0.6.22",),
+              changed=["docker/Dockerfile.deps-core"], inputs={"lane": [], "images": {
+                  **{img: {"inputs": [f"docker/Dockerfile.{img}"], "parents": []} for img in P.SIBLING_INPUTS},
+                  "deps-base": {"inputs": ["docker/Dockerfile.deps-base"], "parents": ["deps-core"]},
+                  "sandbox": {"inputs": ["docker/Dockerfile.sandbox"], "parents": ["deps-core"]},
+              }})
+    assert p["retag"]["deps-core"] is False and p["why"]["deps-core"].startswith("build, because inputs changed: docker/Dockerfile.deps-core"), p["why"]
+    assert p["retag"]["deps-base"] is False and "parent deps-core rebuilds" in p["why"]["deps-base"], p["why"]
+    assert p["retag"]["sandbox"] is False and p["retag"]["whisper"] is True, p["why"]
+
+
+def test_a_release_lane_change_against_the_previous_final_builds_everything():
+    trees = {"stack-v0.6.23-rc.1": "T-new", "stack-v0.6.22": "T-old"}
+    p = _plan(tag="stack-v0.6.23-rc.1", trees=trees, rcs=(), finals=("stack-v0.6.22",),
+              changed=["scripts/release-retag-plan.py"], inputs=P.load_inputs())
+    assert not any(p["retag"].values()), p["why"]
+    assert "compared with the previous final stack-v0.6.22" in p["why"]["whisper"] and "release lane changed" in p["why"]["whisper"]
+
+
+def test_a_sibling_that_moved_since_the_previous_final_rebuilds_its_images():
+    trees = {"stack-v0.6.23-rc.1": "T-new", "stack-v0.6.22": "T-old"}
+    p = _plan(tag="stack-v0.6.23-rc.1", trees=trees, rcs=(), finals=("stack-v0.6.22",), changed=["README.md"],
+              sibs={"trellion": "TRE_MOVED"}, inputs=P.load_inputs())
+    assert p["retag"]["trellion"] is False and "!=" in p["why"]["trellion"], p["why"]
+    assert p["retag"]["whisper"] is True, p["why"]
