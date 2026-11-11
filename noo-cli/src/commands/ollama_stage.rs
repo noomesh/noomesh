@@ -181,7 +181,7 @@ fn layer_of(v: &Value, what: &str) -> Result<Layer, String> {
         .ok_or_else(|| format!("{what} digest '{digest}' is not sha256:<64 lowercase hex>"))?
         .to_string();
     let size = v["size"].as_u64().ok_or_else(|| format!("{what} has no size"))?;
-    if size == 0 || size > MIRROR_MAX_BLOB_BYTES {
+    if size == u64::MAX {
         return Err(format!("{what} has size {size}, want 1..={MIRROR_MAX_BLOB_BYTES}"));
     }
     Ok(Layer { media, sha256, size })
