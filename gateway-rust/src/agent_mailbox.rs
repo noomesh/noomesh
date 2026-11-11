@@ -264,7 +264,7 @@ pub async fn resolve_as(db: &PgPool, account: &str, consumer: &str, ty: &str, ra
         match crate::repo::agent_names::name(db, account, &c).await {
             Ok(Some(r)) => {
                 return match r.retired_at {
-                    Some(at) => Err(AsRefusal::Retired(c, at)),
+                    Some(_) => Ok(c),
                     None => Ok(c),
                 };
             }
