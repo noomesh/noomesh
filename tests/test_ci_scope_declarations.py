@@ -731,3 +731,78 @@ def test_a_pull_request_runs_once_per_commit() -> None:
     assert group.index("merge_group.head_ref") < group.index(pr_key) < group.index("github.run_id"), group
     assert "github.event_name == 'pull_request'" in cancel and "github.event_name == 'merge_group'" in cancel, cancel
     assert "push" not in cancel, "a push is never cancelled: " + cancel
+
+
+# ── the merge-queue base (2026-11-11) ───────────────────────────────────────
+#
+# Two skip sources that can make a red Rust lane read as green, both by design
+# and both safe only together:
+#   1. a PR into dev DEFERS the Rust lanes to the queue (they report success
+#      without compiling), so a dev PR's "pass" is never a compile;
+#   2. a merge group then compiles only the lanes its diff touches.
+# Source 2 was diffed against merge_group.base_sha, which in a batch is the
+# PREVIOUS group's head: pr-978's group skipped noo-cli, and under HEADGREEN
+# #1017 landed on dev with noo-cli red (run 43045136522). The queue is the
+# only place a dev change compiles, so its diff must cover the whole batch.
+
+def _merge_group_block() -> str:
+    run = next(s["run"] for s in _workflow()["jobs"]["scope"]["steps"] if s.get("id") == "diff")
+    start, end = run.index("# >>> merge-group base"), run.index("# <<< merge-group base")
+    return run[start:end]
+
+
+def test_the_merge_group_base_is_the_queues_base_never_the_previous_group() -> None:
+    step = next(s for s in _workflow()["jobs"]["scope"]["steps"] if s.get("id") == "diff")
+    assert step["env"]["BASE"] == "${{ github.event.pull_request.base.sha }}", step["env"]["BASE"]
+    assert step["env"]["MG_BASE_REF"] == "${{ github.event.merge_group.base_ref }}"
+    assert "merge_group.base_sha" not in str(step["env"]), "the previous group's head is never the base"
+    block = _merge_group_block()
+    assert 'git merge-base HEAD "refs/remotes/origin/$mg_ref"' in block, block
+    run = step["run"]
+    assert run.index("# <<< merge-group base") < run.index("# ── llamacpp") < run.index('changed="$(git diff --name-only "$BASE...HEAD")"'), \
+        "the base is settled before anything diffs"
+
+
+def test_a_later_group_still_runs_the_lanes_an_earlier_group_touched(tmp_path: Path) -> None:
+    """A real batch in a throwaway repo: group 1 changes noo-cli, group 2
+    (built on group 1) changes only docs. Group 2's diff must contain
+    noo-cli; diffed against the previous group's head it did not."""
+    import subprocess
+
+    def git(*a: str, cwd: Path) -> str:
+        return subprocess.run(["git", *a], cwd=cwd, check=True, capture_output=True, text=True,
+                              env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "GIT_AUTHOR_NAME": "t",
+                                   "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}).stdout.strip()
+
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    git("init", "-q", "-b", "dev", cwd=origin)
+    (origin / "noo-cli").mkdir()
+    (origin / "noo-cli/a.rs").write_text("1\n")
+    (origin / "README.md").write_text("x\n")
+    git("add", "-A", cwd=origin); git("commit", "-qm", "base", cwd=origin)
+    dev_tip = git("rev-parse", "HEAD", cwd=origin)
+    git("checkout", "-qb", "gh-readonly-queue/dev/pr-1", cwd=origin)
+    (origin / "noo-cli/a.rs").write_text("2\n")
+    git("commit", "-qam", "pr-1: noo-cli", cwd=origin)
+    group1 = git("rev-parse", "HEAD", cwd=origin)
+    git("checkout", "-qb", "gh-readonly-queue/dev/pr-2", cwd=origin)
+    (origin / "README.md").write_text("y\n")
+    git("commit", "-qam", "pr-2: docs", cwd=origin)
+
+    work = tmp_path / "work"
+    git("clone", "-q", "--branch", "gh-readonly-queue/dev/pr-2", str(origin), str(work), cwd=tmp_path)
+    script = "set -euo pipefail\n" + _merge_group_block() + 'echo "BASE=$BASE"\ngit diff --name-only "$BASE...HEAD"\n'
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "EVENT": "merge_group", "BASE": "",
+           "MG_BASE_REF": "refs/heads/dev"}
+    out = subprocess.run(["bash", "-c", script], cwd=work, env=env, check=True, capture_output=True, text=True).stdout
+    assert f"BASE={dev_tip}" in out, out
+    assert "noo-cli/a.rs" in out.splitlines(), f"group 2 must still compile what group 1 changed:\n{out}"
+    # The old base would have hidden it.
+    assert "noo-cli/a.rs" not in git("diff", "--name-only", f"{group1}...HEAD", cwd=work)
+
+    # No base to find: fail open (an empty BASE runs every lane).
+    env["MG_BASE_REF"] = "refs/heads/no-such-branch"
+    out = subprocess.run(["bash", "-c", "set -euo pipefail\n" + _merge_group_block() + 'echo "BASE=[$BASE]"\n'],
+                         cwd=work, env=env, check=True, capture_output=True, text=True).stdout
+    assert "BASE=[]" in out and "fail open" in out, out
