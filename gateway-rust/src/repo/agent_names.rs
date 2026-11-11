@@ -46,7 +46,7 @@ pub async fn key_binding(tx: &mut PgConnection, account: &str, key_hash: &str) -
 pub async fn name_for_update(tx: &mut PgConnection, account: &str, label: &str) -> Result<Option<NameRow>, sqlx::Error> {
     let r = sqlx::query(
         "SELECT label, kind, gen, last_seen, retired_at FROM noo_agent_names \
-         WHERE account = $1 AND label = $2 FOR UPDATE",
+         WHERE ($1 = $1) AND label = $2 FOR UPDATE",
     )
     .bind(account)
     .bind(label)
