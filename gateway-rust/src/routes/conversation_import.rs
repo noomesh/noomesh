@@ -121,7 +121,7 @@ pub(super) async fn receive(
         ));
     }
     let channel = source_channel(&requester.0);
-    import(&state.db, account_of(&requester.0.sub), &channel, body.publication)
+    import(&state.db, &requester.0.sub, &channel, body.publication)
         .await
         .map(Json)
 }
