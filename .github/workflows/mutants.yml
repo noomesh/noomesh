@@ -23,7 +23,8 @@
 # The jobs run untrusted-shaped code, so: read-only token, checkout without
 # persisted credentials, NO secrets anywhere in this file, no environment, and
 # caches are RESTORED only (a mutant job never saves one, so it cannot poison
-# dev's). Postgres is the public GHCR mirror, pulled anonymously.
+# dev's). Postgres is the org's public GHCR mirror (ci.yml's one declared
+# expression), pulled anonymously: no credentials block.
 #
 # Inputs and matrix values reach scripts ONLY through `env:` and are validated
 # again by scripts/ci-mutants.py, which runs from THIS workflow's commit (a
@@ -89,7 +90,7 @@ jobs:
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     services:
       postgres:
-        image: ghcr.io/noomesh/pgvector:pg18
+        image: ${{ vars.HUB_MIRROR_OFF != '' && vars.HUB_MIRROR_OFF != '0' && vars.HUB_MIRROR_OFF != 'false' && 'pgvector/pgvector:pg18' || format('ghcr.io/{0}/pgvector:pg18', github.repository_owner) }}
         env:
           POSTGRES_USER: noo
           POSTGRES_PASSWORD: noo
@@ -134,7 +135,7 @@ jobs:
         git log -1 --format='parent %h %s'
 
     - name: Free hosted-runner disk
-      if: contains(matrix.lanes, 'gateway-rust') || contains(matrix.lanes, 'noo-cli')
+      if: runner.environment == 'github-hosted' && (contains(matrix.lanes, 'gateway-rust') || contains(matrix.lanes, 'noo-cli'))
       continue-on-error: true
       run: |
         big="/usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL"

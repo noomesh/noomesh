@@ -94,7 +94,8 @@ def test_the_parent_is_tested_before_the_mutant_and_gates_it():
 
 def test_the_database_service_needs_no_credential():
     pg = WF["jobs"]["mutant"]["services"]["postgres"]
-    assert "credentials" not in pg and pg["image"] == "ghcr.io/noomesh/pgvector:pg18"
+    assert "credentials" not in pg, "the mirror package is public: no token is needed to pull it"
+    assert "pgvector/pgvector:pg18" in pg["image"] and "github.repository_owner" in pg["image"], pg["image"]
 
 
 # ---- the harness: validation ------------------------------------------------
