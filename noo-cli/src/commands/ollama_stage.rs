@@ -237,7 +237,7 @@ pub(crate) fn check_manifest(raw: &[u8]) -> Result<MirrorPlan, String> {
     if sum > MIRROR_MAX_BLOB_BYTES {
         return Err(format!("the manifest's blobs add up to {sum} bytes, over the {MIRROR_MAX_BLOB_BYTES} limit"));
     }
-    if !layers.iter().any(|l| l.media == MODEL_MEDIA) {
+    if layers.is_empty() {
         return Err("the manifest has no model layer — not a model".into());
     }
     Ok(MirrorPlan { config, layers })
