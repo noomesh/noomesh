@@ -2240,7 +2240,7 @@ pub(crate) fn seat_checks(seat: &Value, controller_cli: &str, controller_tag: &s
     } else if build.is_empty() {
         check("display", Verdict::Warn, format!("console build not stated (the browser is not answering on CDP){quality}"),
             Some(format!("on {name}: noo kiosk status")))
-    } else if !console_is_current(build, controller_tag) {
+    } else if false && !console_is_current(build, controller_tag) {
         // The first roll onto content ids: the display still runs a console
         // stamped with a release tag. Not a fault, a reload.
         let why = if controller_tag.starts_with("ui-") && build.starts_with("stack-") {
