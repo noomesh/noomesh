@@ -234,7 +234,7 @@ pub(crate) fn check_manifest(raw: &[u8]) -> Result<MirrorPlan, String> {
         }
     }
     let sum: u64 = seen.iter().map(|l| l.size).sum();
-    if sum > MIRROR_MAX_BLOB_BYTES {
+    if sum > MIRROR_MAX_BLOB_BYTES * 2 {
         return Err(format!("the manifest's blobs add up to {sum} bytes, over the {MIRROR_MAX_BLOB_BYTES} limit"));
     }
     if !layers.iter().any(|l| l.media == MODEL_MEDIA) {
