@@ -882,9 +882,18 @@ async fn do_classify(
     let client = crate::tls::cluster_client();
     let url = format!("{}/v1/chat/completions", backend.url.trim_end_matches('/'));
 
+    // Up to CLASSIFY_PARALLEL texts at once, results kept in input order
+    // (they ran one after another: N texts cost N round trips end to end).
+    // The first failure still fails the request, as before.
+    use futures::StreamExt as _;
+    let chosen_all: Vec<Result<Vec<Value>, ExtFail>> = futures::stream::iter(texts.iter())
+        .map(|text| classify_one(&client, &url, &backend, text, &labels, multi))
+        .buffered(CLASSIFY_PARALLEL)
+        .collect()
+        .await;
     let mut results = Vec::with_capacity(texts.len());
-    for (i, text) in texts.iter().enumerate() {
-        let chosen = classify_one(&client, &url, &backend, text, &labels, multi).await?;
+    for (i, chosen) in chosen_all.into_iter().enumerate() {
+        let chosen = chosen?;
         if multi {
             results.push(json!({"index": i, "labels": chosen}));
         } else {
@@ -897,6 +906,30 @@ async fn do_classify(
         json!({"results": results, "model": backend.model, "method": "chat-structured"}),
         backend.model.clone(),
     ))
+}
+
+/// How many texts of one classify request are in flight at once.
+const CLASSIFY_PARALLEL: usize = 4;
+
+/// The chat body for one text: temperature 0, 120 tokens, and thinking OFF
+/// on the engine's own switch. A reasoning model left thinking spent the 120
+/// tokens reasoning and answered nothing, which this route reports as
+/// "classifier did not return a valid label" (speed review 2026-11-11; the
+/// same failure class as the raw path's 120, #963). Never on a cloud
+/// provider, which rejects fields it does not know.
+fn classify_body(backend: &coordinator::ResolvedBackend, instruction: &str, text: &str) -> Value {
+    let mut body = json!({
+        "model": backend.model,
+        "messages": [
+            {"role": "system", "content": instruction},
+            {"role": "user", "content": text}
+        ],
+        "temperature": 0,
+        "max_tokens": 120,
+        "stream": false
+    });
+    coordinator::thinking::disable_on_wire(&mut body, "openai", &backend.backend_type, backend.backend_type.starts_with("cloud-"));
+    body
 }
 
 /// One chat round-trip with up to one repair retry. Returns the validated
@@ -921,16 +954,7 @@ async fn classify_one(
              Respond ONLY with compact JSON of the form {{\"label\": \"...\"}} using a label from the set."
         )
     };
-    let body = json!({
-        "model": backend.model,
-        "messages": [
-            {"role": "system", "content": instruction},
-            {"role": "user", "content": text}
-        ],
-        "temperature": 0,
-        "max_tokens": 120,
-        "stream": false
-    });
+    let body = classify_body(backend, &instruction, text);
 
     for attempt in 0..2 {
         let mut span =
@@ -1409,5 +1433,47 @@ mod rerank_preference_tests {
         assert_eq!((n["served_by"].as_str(), n["model"].as_str(), n["fallback"].as_bool()), (Some("llm"), Some("llm"), Some(true)));
         assert_eq!(n["requested_model"], "qwen3-reranker");
         assert!(rerank_noo("gpu-1", Some("bge"), None, false).get("requested_model").is_none());
+    }
+}
+
+#[cfg(test)]
+mod classify_speed_tests {
+    use super::classify_body;
+    use crate::coordinator::ResolvedBackend;
+    use serde_json::json;
+
+    fn at(backend_type: &str) -> ResolvedBackend {
+        ResolvedBackend { url: "http://x".into(), model: "m".into(), backend_type: backend_type.into(), api_format: "openai".into() }
+    }
+
+    /// Speed review 2026-11-11: classify sent no thinking switch, so a
+    /// reasoning model could spend its 120 tokens thinking and answer
+    /// nothing. Now every engine's own switch is set; a cloud provider gets
+    /// none of them; the classify fields themselves are unchanged.
+    #[test]
+    fn classify_turns_thinking_off_on_every_engine_but_a_cloud() {
+        let b = classify_body(&at("ollama"), "pick", "hi");
+        assert_eq!(b["think"], json!(false), "{b}");
+        assert_eq!(b["chat_template_kwargs"]["enable_thinking"], json!(false), "{b}");
+        let b = classify_body(&at("vllm"), "pick", "hi");
+        assert_eq!(b["chat_template_kwargs"]["enable_thinking"], json!(false), "{b}");
+        assert!(b.get("think").is_none(), "think is ollama's alone: {b}");
+        let b = classify_body(&at("cloud-openai"), "pick", "hi");
+        assert!(b.get("chat_template_kwargs").is_none() && b.get("think").is_none() && b.get("reasoning").is_none(), "{b}");
+        assert_eq!((b["temperature"].clone(), b["max_tokens"].clone(), b["stream"].clone()), (json!(0), json!(120), json!(false)));
+        assert_eq!(b["messages"], json!([{"role": "system", "content": "pick"}, {"role": "user", "content": "hi"}]));
+    }
+
+    /// Texts run CLASSIFY_PARALLEL at a time, in order (`buffered`, not
+    /// `buffer_unordered`), and nothing awaits one text before the next.
+    #[test]
+    fn classify_runs_texts_in_parallel_and_in_order() {
+        let code = crate::test_src::own_code(include_str!("external.rs"));
+        let f = crate::test_src::fn_body(&code, "async fn do_classify(");
+        assert!(f.contains(".buffered(CLASSIFY_PARALLEL)") && !f.contains("buffer_unordered"), "{f}");
+        assert!(!f.contains("classify_one(&client, &url, &backend, text, &labels, multi).await"), "no sequential await: {f}");
+        assert!(super::CLASSIFY_PARALLEL > 1 && super::CLASSIFY_PARALLEL <= 8, "bounded");
+        let one = crate::test_src::fn_body(&code, "async fn classify_one(");
+        assert!(one.contains("classify_body(backend, &instruction, text)"), "{one}");
     }
 }
