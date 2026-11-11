@@ -4156,19 +4156,39 @@ mod agent_mailboxes_migration_tests {
 mod node_model_set_retry_migration_tests {
     use super::*;
 
-    /// i607b B3: the retry-epoch revision is the chain head, sits on agent
-    /// mailboxes (119), and only creates its own table.
+    /// i607b B3: the retry-epoch revision sits on agent mailboxes (119) and
+    /// only creates its own table.
     #[test]
-    fn node_model_set_retry_revision_is_the_head_and_additive() {
+    fn node_model_set_retry_revision_sits_on_agent_mailboxes_and_is_additive() {
         let m = MIGRATIONS.iter().find(|m| m.revision == NODE_MODEL_SET_RETRY_REVISION).expect("must be in the chain");
         assert_eq!(m.revision, "120_node_model_set_retry");
         assert_eq!(m.down_revision, Some(AGENT_MAILBOXES_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(NODE_MODEL_SET_RETRY_REVISION), "the chain head");
         assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_node_model_set_retry"));
         assert!(!m.sql.contains("DELETE") && !m.sql.contains("UPDATE") && !m.sql.contains("DROP") && !m.sql.contains("ALTER"));
         let writer = include_str!("repo/node_model_set_retry.rs");
         for col in ["node_id", "epoch", "sets", "updated_by"] {
             assert!(m.sql.contains(col) && writer.contains(col), "{col}");
         }
+    }
+}
+
+#[cfg(test)]
+mod conversation_sources_migration_tests {
+    use super::*;
+
+    /// i608 (#937): the conversation-sources revision is the chain head,
+    /// sits on the model-set retry epoch (120), and only adds a table and the
+    /// app role's grant.
+    #[test]
+    fn conversation_sources_revision_is_the_head_and_additive() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == CONVERSATION_SOURCES_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "121_conversation_sources");
+        assert!(m.revision.len() <= 32);
+        assert_eq!(m.down_revision, Some(NODE_MODEL_SET_RETRY_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(CONVERSATION_SOURCES_REVISION), "the chain head");
+        assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_conversation_sources"));
+        assert!(m.sql.contains("PRIMARY KEY (user_id, publisher_id, source_id)"));
+        assert!(m.sql.contains("GRANT SELECT, INSERT, UPDATE, DELETE ON noo_conversation_sources TO noo_app"));
+        assert!(!m.sql.contains("DROP") && !m.sql.contains("UPDATE noo_") && !m.sql.contains("DELETE FROM"));
     }
 }
