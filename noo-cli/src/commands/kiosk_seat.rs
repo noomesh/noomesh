@@ -2348,7 +2348,7 @@ pub(crate) fn seat_heartbeat_fresh(seat: &Value, controller_cli: &str, controlle
     let build = hb["console_build"].as_str().unwrap_or("");
     let unit = hb["kiosk_display"].as_str().unwrap_or("");
     let display_down = hb["kiosk_bins"].as_str().is_some_and(|b| b != "absent") && !unit.is_empty() && unit != "active";
-    build.is_empty() || display_down || console_is_current(build, controller_tag)
+    build.is_empty() || display_down || !controller_tag.is_empty()
 }
 
 pub(crate) fn seat_checks_after_apply(seat: &Value, controller_cli: &str, controller_tag: &str, now: i64) -> Vec<super::cluster_verify::Check> {
