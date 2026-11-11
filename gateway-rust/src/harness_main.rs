@@ -379,6 +379,7 @@ pub async fn run() -> Result<()> {
         let window = driver.as_ref().filter(|d| d.launch.context_window_env.is_some()).map(|d| d.context_window.clone());
         let idle_limit = limit.clone();
         let slots = max_turns.max(1) as u32;
+        let started_at = std::time::Instant::now();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(60));
             tick.tick().await;
@@ -420,9 +421,13 @@ pub async fn run() -> Result<()> {
                 // (Restart=always) brings the harness back with the new
                 // value (i658: awolf ran a whole day on a default it had
                 // already been told to change). Busy: try again next minute.
-                if idle_moved && restart_when_idle(&idle_limit, slots) {
-                    tracing::warn!(now = ?idle, started = ?started_idle, "harness: idle; restarting to apply the profile's stream_idle_secs");
-                    std::process::exit(0);
+                if idle_moved {
+                    if !self_restart_allowed(started_at.elapsed()) {
+                        tracing::info!(up_secs = started_at.elapsed().as_secs(), "harness: a start-only setting changed; not restarting yet (at most one self-restart per {} s)", MIN_UP_BEFORE_SELF_RESTART.as_secs());
+                    } else if restart_when_idle(&idle_limit, slots) {
+                        tracing::warn!(now = ?idle, started = ?started_idle, reason = "stream_idle_secs changed", "harness: idle; restarting to apply the profile's stream_idle_secs");
+                        std::process::exit(0);
+                    }
                 }
             }
         });
@@ -677,6 +682,16 @@ async fn ask_agent_kind(client: &reqwest::Client, agent_url: &str, retry: &[Dura
             },
         }
     }
+}
+
+/// The least uptime before the harness restarts itself to apply a start-only
+/// setting. A restart resets uptime, so this caps self-restarts at one per
+/// period even when the profile flaps or the agent is still unknown at the
+/// next start.
+const MIN_UP_BEFORE_SELF_RESTART: Duration = Duration::from_secs(600);
+
+fn self_restart_allowed(up: Duration) -> bool {
+    up >= MIN_UP_BEFORE_SELF_RESTART
 }
 
 /// Whether the harness may restart now to apply a start-only setting: only
@@ -1264,6 +1279,21 @@ mod placement_race_tests {
         drop(busy);
         assert!(restart_when_idle(&limit, 2), "idle: restart");
         assert!(limit.try_acquire().is_err(), "nothing can start between the answer and the exit");
+    }
+
+    /// A flapping profile (or an agent still unknown after the wait, then
+    /// known) cannot make the harness restart every minute: at most one
+    /// self-restart per MIN_UP_BEFORE_SELF_RESTART of uptime.
+    #[test]
+    fn a_flapping_profile_cannot_restart_the_harness_every_minute() {
+        for minute in 0..10u64 {
+            assert!(!self_restart_allowed(Duration::from_secs(minute * 60 + 59)), "minute {minute}");
+        }
+        assert!(self_restart_allowed(Duration::from_secs(600)));
+        let code = crate::test_src::own_code(include_str!("harness_main.rs"));
+        let gate = code.find("if !self_restart_allowed(started_at.elapsed())").expect("the uptime gate");
+        let exit = code.find("std::process::exit(0);").expect("the exit");
+        assert!(gate < exit, "the uptime gate comes before the exit");
     }
 
     /// The 503 the agent sends while it does not know is retried, not taken
