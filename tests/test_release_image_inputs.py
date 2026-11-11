@@ -134,14 +134,16 @@ def _built(p):
     return {i for i, r in p["retag"].items() if not r}
 
 
-ALWAYS = {"gateway", "node-agent"}   # tag-stamped: never re-tagged
+ALWAYS = {"node-agent"}   # tag-stamped: never re-tagged (the gateway embeds its console by digest since 2026-11-11)
 
 
 def test_a_lockfile_only_change_rebuilds_only_the_rust_image():
     """0.6.10 rc.7 = rc.6 + gateway-rust/Cargo.lock."""
     p = _plan(["gateway-rust/Cargo.lock", "noo-cli/Cargo.lock"])
     assert p["rc_tag"] == RC2
-    assert _built(p) == ALWAYS, p["why"]
+    # The gateway rebuilds because its own input changed (it is no longer
+    # rebuilt merely for carrying the tag).
+    assert _built(p) == ALWAYS | {"gateway"}, p["why"]
     assert p["why"]["worker"].startswith("re-tag from " + RC2), p["why"]
     assert p["rc_digests"]["deps-core"] == "sha256:dc" and p["rc_digests"]["whisper"] == "sha256:whi"
 
@@ -150,7 +152,8 @@ def test_a_ui_change_rebuilds_only_what_embeds_the_console():
     # the console image itself is built by publish-web.yml, not this lane; the
     # only stack image that embeds it is the gateway
     p = _plan(["ui/apps/web/src/App.tsx"])
-    assert _built(p) == ALWAYS, p["why"]
+    assert _built(p) == ALWAYS | {"gateway"}, p["why"]
+    assert "inputs changed: ui/apps/web/src/App.tsx" in p["why"]["gateway"], p["why"]["gateway"]
     assert not any(f"inputs changed: ui/" in p["why"][i] for i in p["why"] if i != "gateway")
 
 
@@ -171,7 +174,7 @@ def test_a_shared_lock_change_rebuilds_every_image_that_installs_it():
 
 def test_shared_source_and_script_changes():
     assert _built(_plan(["src/noomesh/x.py"])) == ALWAYS | {"trellion", "sandbox", "worker"}
-    assert _built(_plan(["config/tools.json"])) == ALWAYS | {"sandbox", "worker"}
+    assert _built(_plan(["config/tools.json"])) == ALWAYS | {"gateway", "sandbox", "worker"}
     assert _built(_plan(["docker/voice_local.py"])) == ALWAYS | {"whisper", "piper"}
     assert _built(_plan(["node-agent-go/main.go"])) == ALWAYS
 
@@ -232,7 +235,7 @@ def test_a_moved_sibling_still_rebuilds_what_it_feeds_in_per_image_mode():
                tree_of=lambda r: {NEW: "T3", RC2: "T2", RC1: "T1"}[r], commit_of=lambda r: r,
                list_finals=lambda: [], list_rcs=lambda f: [RC2, RC1], sib_tree=lambda repo, sha, tok: {"TRE": "a", "TRE2": "b"}[sha],
                changed_of=lambda a, b: ["gateway-rust/Cargo.lock"])
-    assert _built(p) == ALWAYS | {"deps-base", "trellion"}, p["why"]
+    assert _built(p) == ALWAYS | {"gateway", "deps-base", "trellion"}, p["why"]
 
 
 def test_the_real_0_6_10_rc6_to_rc7_diff_if_the_tags_exist():
