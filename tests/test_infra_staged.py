@@ -216,3 +216,59 @@ def test_the_daily_set_is_the_release_matrix_minus_the_images_that_carry_our_sou
     assert images - set(S.DAILY) == {"gateway", "node-agent", "worker", "sandbox", "trellion"}, \
         "a new release image must be put in DAILY or explicitly left to the release"
     assert [e["image"] for e in S.daily_matrix(RELEASE_MATRIX)] == list(S.DAILY)
+
+
+# ----------------------------------------------------------- only dev feeds :staged (2026-11-11)
+
+def _promote(tmp_path, stage_ref, promote):
+    """Run the REAL promote script with the registry commands faked: returns
+    (exit code, stdout, the commands that would have touched the registry)."""
+    run = _steps()[_idx("Promote to :staged")]["run"]
+    run = run.replace("${{ matrix.image }}", "ollama")
+    calls = tmp_path / "calls"
+    fake = tmp_path / "bin"
+    fake.mkdir(exist_ok=True)
+    (fake / "retry").write_text(f'#!/bin/sh\necho "$@" >> {calls}\n')
+    (fake / "retry").chmod(0o755)
+    (fake / "docker").write_text('#!/bin/sh\necho sha256:new\n')
+    (fake / "docker").chmod(0o755)
+    run = run.replace("scripts/retry-registry.sh", str(fake / "retry"))
+    env = {"PATH": f"{fake}:/usr/bin:/bin", "REF": "ghcr.io/noomesh/ollama", "DIGEST": "sha256:new",
+           "DATE_TAG": "staged-x", "FP": "fp", "GITHUB_STEP_SUMMARY": str(tmp_path / "sum"),
+           "STAGE_REF": stage_ref}
+    if promote is not None:
+        env["PROMOTE"] = promote
+    p = subprocess.run(["bash", "-c", run], env=env, capture_output=True, text=True)
+    return p.returncode, p.stdout, calls.read_text() if calls.exists() else ""
+
+
+def test_a_run_built_from_any_ref_but_dev_never_moves_staged(tmp_path):
+    for promote in ("true", "false", None):
+        rc, out, calls = _promote(tmp_path, "refs/heads/wt/97-reproducible-layers", promote)
+        assert rc == 0 and calls == "", (promote, calls)
+        assert "not dev: :staged stays" in out
+
+
+def test_promote_false_keeps_staged_and_the_schedule_still_promotes(tmp_path):
+    rc, out, calls = _promote(tmp_path, "refs/heads/dev", "false")
+    assert rc == 0 and calls == "" and "promote=false" in out
+    rc, out, calls = _promote(tmp_path, "refs/heads/dev", None)  # the schedule: no inputs at all
+    assert rc == 0 and "imagetools create --tag ghcr.io/noomesh/ollama:staged ghcr.io/noomesh/ollama@sha256:new" in calls
+    (tmp_path / "d").mkdir()
+    rc, out, calls = _promote(tmp_path / "d", "refs/heads/dev", "true")  # a dispatch from dev
+    assert rc == 0 and "imagetools create" in calls
+
+
+def test_the_run_builds_the_ref_it_was_dispatched_on_and_the_schedule_builds_dev():
+    assert DAILY_WF["env"]["STAGE_REF"] == \
+        "${{ github.event_name == 'workflow_dispatch' && github.ref || 'refs/heads/dev' }}"
+    for job in ("matrix", "stage"):
+        co = next(s for s in DAILY_WF["jobs"][job]["steps"] if "actions/checkout@" in str(s.get("uses", "")))
+        assert co["with"]["ref"] == "${{ env.STAGE_REF }}", job
+    promote = DAILY_WF[True]["workflow_dispatch"]["inputs"]["promote"]  # PyYAML reads `on:` as True
+    assert promote["type"] == "boolean" and promote["default"] is True, "the schedule's behaviour must not change"
+    step = _steps()[_idx("Promote to :staged")]
+    assert step["env"]["PROMOTE"] == "${{ inputs.promote }}"
+    run = step["run"]
+    assert run.index('"$STAGE_REF" != "refs/heads/dev"') < run.index("imagetools create"), \
+        "the dev-only guard must come before :staged moves"
