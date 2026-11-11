@@ -2364,6 +2364,58 @@ BEGIN
     END IF;
 END $$;
 "#,
+}, Migration {
+    revision: AGENT_MAILBOXES_REVISION,
+    down_revision: Some(PERSPECTIVES_REVISION),
+    // 0.6.24: agent mailboxes owned by a conversation, not a connection
+    // (`repo::agent_names`). A modern (2026-07-28) MCP client opens no
+    // session, so a name can no longer live on `noo_mcp_sessions`.
+    // `noo_agent_names` is the directory; `gen` moves on when a retired
+    // name is taken by another conversation, so the old one's key no
+    // longer resolves to it. `noo_agent_name_keys` binds a conversation
+    // (its session key, hashed) to a name and generation.
+    // `noo_agent_orphans` holds the unread mail of a retired generation:
+    // hidden from the name's inbox, visible to the account owner, and
+    // re-attached when that conversation resumes. Additive: new tables
+    // only, which an older gateway ignores.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS noo_agent_names (
+    account text NOT NULL,
+    label text NOT NULL,
+    kind text NOT NULL,
+    gen integer NOT NULL DEFAULT 1,
+    first_seen timestamptz NOT NULL DEFAULT now(),
+    last_seen timestamptz NOT NULL DEFAULT now(),
+    last_consumer text,
+    retired_at timestamptz,
+    PRIMARY KEY (account, label),
+    CONSTRAINT noo_agent_names_kind CHECK (kind IN ('default', 'chosen'))
+);
+CREATE INDEX IF NOT EXISTS noo_agent_names_seen_idx ON noo_agent_names (account, last_seen DESC);
+CREATE TABLE IF NOT EXISTS noo_agent_name_keys (
+    account text NOT NULL,
+    key_hash text NOT NULL,
+    label text NOT NULL,
+    gen integer NOT NULL,
+    last_seen timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (account, key_hash)
+);
+CREATE INDEX IF NOT EXISTS noo_agent_name_keys_label_idx ON noo_agent_name_keys (account, label);
+CREATE TABLE IF NOT EXISTS noo_agent_orphans (
+    message_id text PRIMARY KEY,
+    account text NOT NULL,
+    label text NOT NULL,
+    gen integer NOT NULL,
+    orphaned_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS noo_agent_orphans_name_idx ON noo_agent_orphans (account, label, gen);
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'noo_app') THEN
+        GRANT SELECT, INSERT, UPDATE, DELETE ON noo_agent_names, noo_agent_name_keys, noo_agent_orphans TO noo_app;
+    END IF;
+END $$;
+"#,
 }];
 
 /// Add-on feature settings and the super-admin flag (f99). A constant so a
@@ -2401,6 +2453,12 @@ pub const SEAT_DISPLAY_REVISION: &str = "113_seat_display";
 /// `perspective_id` on refresh rows, on seat display (113). A constant so a
 /// renumber at rebase is one line.
 pub const PERSPECTIVES_REVISION: &str = "114_perspectives";
+
+/// Agent mailboxes owned by a conversation (0.6.24). 119: 115 is #900, 116
+/// i596 slice 2, 117 #937's conversation sources, 118 taken; it chains on
+/// whichever is the head when it lands. A constant so a renumber at rebase
+/// is one line.
+pub const AGENT_MAILBOXES_REVISION: &str = "119_agent_mailboxes";
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
 /// constant so a renumber at rebase is one line.
@@ -3999,16 +4057,15 @@ mod seat_display_migration_tests {
 mod perspectives_migration_tests {
     use super::*;
 
-    /// i538 P1: the perspectives revision is the chain head, sits on seat
-    /// display, and only adds: a new table, a partial index, one nullable
-    /// column on the refresh rows, and the app role's grant.
+    /// i538 P1: the perspectives revision sits on seat display and only
+    /// adds: a new table, a partial index, one nullable column on the
+    /// refresh rows, and the app role's grant.
     #[test]
-    fn perspectives_revision_is_the_head_and_additive() {
+    fn perspectives_revision_sits_on_seat_display_and_is_additive() {
         let m = MIGRATIONS.iter().find(|m| m.revision == PERSPECTIVES_REVISION).expect("must be in the chain");
         assert_eq!(m.revision, "114_perspectives");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(SEAT_DISPLAY_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(PERSPECTIVES_REVISION), "the chain head");
         assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_perspectives"));
         assert!(m.sql.contains("cap_at timestamptz NOT NULL"));
         assert!(m.sql.contains("ALTER TABLE noo_refresh_tokens ADD COLUMN IF NOT EXISTS perspective_id uuid"));
@@ -4017,5 +4074,26 @@ mod perspectives_migration_tests {
             assert!(m.sql.contains(reason), "{reason}");
         }
         assert!(!m.sql.contains("DELETE") && !m.sql.contains("DROP") && !m.sql.contains("UPDATE noo_"));
+    }
+}
+
+#[cfg(test)]
+mod agent_mailboxes_migration_tests {
+    use super::*;
+
+    /// 0.6.24: the agent-mailboxes revision is the chain head, sits on
+    /// perspectives, and only adds three tables and the app role's grant.
+    #[test]
+    fn agent_mailboxes_revision_is_the_head_and_additive() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == AGENT_MAILBOXES_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "119_agent_mailboxes");
+        assert!(m.revision.len() <= 32);
+        assert_eq!(m.down_revision, Some(PERSPECTIVES_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(AGENT_MAILBOXES_REVISION), "the chain head");
+        for t in ["noo_agent_names", "noo_agent_name_keys", "noo_agent_orphans"] {
+            assert!(m.sql.contains(&format!("CREATE TABLE IF NOT EXISTS {t} (")), "{t}");
+        }
+        assert!(m.sql.contains("PRIMARY KEY (account, key_hash)"), "one name per conversation key per account");
+        assert!(!m.sql.contains("DROP") && !m.sql.contains("ALTER TABLE") && !m.sql.contains("DELETE FROM"));
     }
 }

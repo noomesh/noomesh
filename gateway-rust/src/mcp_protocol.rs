@@ -235,17 +235,20 @@ impl Envelope {
     /// Legacy `initialize`. On a MODERN request the handshake does not exist:
     /// a `-32601` naming the versions we do speak, which the spec asks for so
     /// a legacy client with no fall-forward path at least sees why.
-    pub(crate) fn initialize(&self, server_name: &str) -> Response {
+    pub(crate) fn initialize(&self, server_name: &str, instructions: &str) -> Response {
         match self.era {
             Era::Legacy => rpc_result(
                 self.req.id.clone(),
                 // `listChanged`: a session opened under another catalogue
                 // is sent `notifications/tools/list_changed` on its next
                 // answered request (`mcp_session::with_list_changed`).
+                // `instructions`: the same text `server/discover` carries,
+                // so a legacy client's model learns the mailbox protocol too.
                 json!({
                     "protocolVersion": LEGACY_VERSION,
                     "capabilities": {"tools": {"listChanged": true}},
                     "serverInfo": server_info(server_name),
+                    "instructions": instructions,
                 }),
             ),
             Era::Modern => self.method_not_found(),
@@ -631,13 +634,13 @@ mod tests {
         assert_eq!(v["result"]["_meta"][META_SERVER_INFO]["name"], "t");
 
         // Modern has no handshake and no ping; the refusal names what we speak.
-        let (s, v) = body_json(modern.initialize("t")).await;
+        let (s, v) = body_json(modern.initialize("t", "i")).await;
         assert_eq!((s, v["error"]["code"].clone()), (StatusCode::NOT_FOUND, json!(ERR_METHOD_NOT_FOUND)));
         assert!(v["error"]["message"].as_str().unwrap().contains("2026-07-28"));
         assert_eq!(modern.ping().status(), StatusCode::NOT_FOUND);
         // Legacy keeps both, at 200.
-        assert_eq!(legacy.initialize("t").status(), StatusCode::OK);
-        let (_, v) = body_json(legacy.initialize("t")).await;
+        assert_eq!(legacy.initialize("t", "i").status(), StatusCode::OK);
+        let (_, v) = body_json(legacy.initialize("t", "i")).await;
         assert_eq!(v["result"]["protocolVersion"], LEGACY_VERSION);
         assert_eq!(legacy.ping().status(), StatusCode::OK);
         assert_eq!(legacy.method_not_found().status(), StatusCode::OK);
@@ -660,9 +663,10 @@ mod tests {
     #[tokio::test]
     async fn legacy_initialize_advertises_list_changed_and_discover_does_not() {
         let legacy = parse_tls(&HeaderMap::new(), br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#).unwrap();
-        let (s, v) = body_json(legacy.initialize("t")).await;
+        let (s, v) = body_json(legacy.initialize("t", "i")).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(v["result"]["capabilities"]["tools"]["listChanged"], true);
+        assert_eq!(v["result"]["instructions"], "i", "a legacy client's model learns the mailbox protocol from initialize");
         let (_, d) = body_json(legacy.discover("t", "hi")).await;
         assert_eq!(d["result"]["capabilities"]["tools"]["listChanged"], false);
     }

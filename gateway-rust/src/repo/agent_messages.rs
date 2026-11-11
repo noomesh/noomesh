@@ -106,6 +106,19 @@ pub struct Filter<'a> {
     /// with no acting identity should reach that.
     pub reader: Option<&'a str>,
     pub limit: i64,
+    /// Mail orphaned by a retired name (migration 119). Hidden from every
+    /// ordinary view: a name that is reused must not inherit the unread
+    /// mail of the conversation that held it before. `OnlyOf(account)` is
+    /// the account owner's view of exactly that mail.
+    pub orphans: OrphanView<'a>,
+}
+
+/// See [`Filter::orphans`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanView<'a> {
+    #[default]
+    Hide,
+    OnlyOf(&'a str),
 }
 
 /// A row as the API returns it. Sealed bodies are OPENED here with the
@@ -216,6 +229,10 @@ pub async fn list(db: &PgPool, f: &Filter<'_>) -> Result<Vec<Value>, sqlx::Error
     if let Some(v) = f.user { push(&mut sql, " AND from_user = $N", v); }
     if let Some(v) = f.node { push(&mut sql, " AND from_node = $N", v); }
     if let Some(v) = f.harness { push(&mut sql, " AND from_harness = $N", v); }
+    match f.orphans {
+        OrphanView::Hide => sql.push_str(" AND NOT EXISTS (SELECT 1 FROM noo_agent_orphans o WHERE o.message_id = noo_agent_messages.id)"),
+        OrphanView::OnlyOf(account) => push(&mut sql, " AND EXISTS (SELECT 1 FROM noo_agent_orphans o WHERE o.message_id = noo_agent_messages.id AND o.account = $N)", account),
+    }
     let since_idx = f.since.map(|_| { n += 1; sql.push_str(&format!(" AND ts >= ${n}")); n });
     // Past this point `push` is not used again: `since_idx` above touched
     // `n` directly, so the closure's borrow is over and the unread clause

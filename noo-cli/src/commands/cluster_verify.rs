@@ -2113,6 +2113,40 @@ pub(crate) fn model_memory_check(reports: &[(String, Option<Value>)]) -> Check {
     ok(NAME, format!("every loaded model within its fit estimate and pool on {} node(s)", reports.len()))
 }
 
+/// 0.6.24: unread agent mail whose mailbox retired before it was read. It
+/// is kept for the account owner, not lost; this row makes sure someone
+/// looks. A warning: nothing is broken, a message is waiting.
+pub(crate) fn agent_mail_check(body: Option<&Value>) -> Check {
+    const NAME: &str = "agent mail";
+    let Some(body) = body else {
+        return warn(NAME, "the mailbox directory was not read", None);
+    };
+    let mut parts = Vec::new();
+    let mut total = 0i64;
+    for a in body["accounts"].as_array().into_iter().flatten() {
+        let rows: Vec<(String, i64)> = a["orphaned"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|o| Some((o["name"].as_str()?.to_string(), o["unread"].as_i64()?)))
+            .collect();
+        let n: i64 = rows.iter().map(|(_, c)| c).sum();
+        if n > 0 {
+            total += n;
+            let names: Vec<String> = rows.iter().map(|(name, c)| format!("{name} {c}")).collect();
+            parts.push(format!("{} for {} ({})", n, a["account"].as_str().unwrap_or("?"), names.join(", ")));
+        }
+    }
+    if total == 0 {
+        return ok(NAME, "no unread mail left behind by a retired mailbox");
+    }
+    warn(
+        NAME,
+        format!("{total} unread message(s) orphaned by retired mailboxes: {}", parts.join("; ")),
+        Some("read them with noo_agent_inbox orphaned=true through an MCP door (the account's own view)".into()),
+    )
+}
+
 pub(crate) fn embedding_spaces_check(body: Option<&Value>) -> Check {
     const NAME: &str = "embedding spaces";
     let Some(body) = body else {
@@ -6860,6 +6894,8 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             })
             .collect();
         checks.push(model_memory_check(&fits));
+        // 0.6.24: mail left unread when a conversation's mailbox retired.
+        checks.push(agent_mail_check(get_json_opt(g, "/api/agents/directory?all=true", true, 15).as_ref()));
         // The gateway's own Redis connection (authenticated /health: the
         // anonymous body carries no dependency map).
         let health = health_body(g);
@@ -12612,5 +12648,25 @@ mod model_memory_tests {
         assert_eq!(fine.verdict, Verdict::Ok);
         let unread = model_memory_check(&[("awolf".into(), Some(json!({}))), ("host6".into(), None)]);
         assert!(unread.verdict == Verdict::Warn && unread.detail.contains("host6"), "{}", unread.detail);
+    }
+}
+
+#[cfg(test)]
+mod agent_mail_tests {
+    use super::{agent_mail_check, Verdict};
+    use serde_json::json;
+
+    #[test]
+    fn orphaned_mail_is_a_warning_naming_the_account_and_mailbox() {
+        let body = json!({"accounts": [
+            {"account": "rbwolf", "orphaned": [{"name": "rbwolf/claude-weekly", "unread": 3}]},
+            {"account": "alice", "orphaned": []},
+        ]});
+        let c = agent_mail_check(Some(&body));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("3 unread") && c.detail.contains("rbwolf/claude-weekly 3"), "{}", c.detail);
+        assert!(!c.detail.contains("alice"));
+        assert_eq!(agent_mail_check(Some(&json!({"accounts": []}))).verdict, Verdict::Ok);
+        assert_eq!(agent_mail_check(None).verdict, Verdict::Warn);
     }
 }

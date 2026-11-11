@@ -165,6 +165,7 @@ mod heartbeat_loop;
 mod research_pipeline;
 mod heartbeat_reconcile;
 mod agent_crypto;
+mod agent_mailbox;
 mod agent_messages;
 mod agent_recipient;
 mod mesh_migrate;
@@ -622,6 +623,14 @@ async fn main() -> Result<()> {
         .spawn(state.clone(), |state| async move {
             coordinator::evict_stale_sessions(&state).await;
             Ok(())
+        });
+
+    // Agent mailboxes (0.6.24): retire names past their window (their
+    // unread mail becomes the account's orphaned mail) and reap idle MCP
+    // session rows. Hourly: the windows are a day and a week.
+    managed_loop::ManagedLoop::new("agent_mailbox_sweep", 3600)
+        .spawn(state.clone(), |state| async move {
+            crate::agent_mailbox::sweep(&state.db).await.map_err(|e| anyhow::anyhow!(e))
         });
 
     // Background task(s): poll watched_folders + watched_drives, submit

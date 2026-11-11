@@ -226,7 +226,10 @@ class NooAgentSend(ToolDef):
     delivered, with a warning naming what you may have meant.
     Recorded and delivered over NATS; the sender is the caller's identity —
     user, node and harness are derived from the credential, never from this
-    call."""
+    call. The reply's delivery says whether anyone reads it now: online,
+    recent, or idle (queued for a conversation that can resume); a retired
+    mailbox is refused. online_only=true refuses instead of queueing.
+    First step: call noo_agent_name(session=<a stable id for this conversation>) once; it returns your mailbox name. Then pass as=<that name> here."""
 
     name: ClassVar[str] = "noo_agent_send"
     description: ClassVar[str] = __doc__
@@ -253,6 +256,14 @@ class NooAgentSend(ToolDef):
             "credential; it never replaces it"
         ),
     )
+    online_only: Optional[bool] = Field(
+        default=None, description="Refuse instead of queueing when the recipient is not online now"
+    )
+    as_mailbox: Optional[str] = Field(
+        default=None,
+        alias="as",
+        description="Your mailbox name, from noo_agent_name (e.g. claude-general). Pass it on every noo_agent_* call",
+    )
 
 
 @register
@@ -262,7 +273,9 @@ class NooAgentInbox(ToolDef):
     the threads those names take part in. Narrow with to= (one name) or
     thread=. Read state is per reader: unread=true shows what THIS
     credential has not yet acknowledged, whatever a sibling window acked.
-    Acknowledge with noo_agent_ack. Operators may name another account."""
+    Acknowledge with noo_agent_ack. Operators may name another account.
+    orphaned=true lists the unread mail of your account's retired mailboxes.
+    First step: call noo_agent_name(session=<a stable id for this conversation>) once; it returns your mailbox name. Then pass as=<that name> here."""
 
     name: ClassVar[str] = "noo_agent_inbox"
     description: ClassVar[str] = __doc__
@@ -280,11 +293,20 @@ class NooAgentInbox(ToolDef):
         description="Operators only: list every session's messages, not just yours.",
     )
     limit: Optional[int] = Field(default=None, description="Max messages (default 50)")
+    orphaned: Optional[bool] = Field(
+        default=None, description="Only the unread mail of your account's retired mailboxes"
+    )
+    as_mailbox: Optional[str] = Field(
+        default=None,
+        alias="as",
+        description="Your mailbox name, from noo_agent_name (e.g. claude-general). Pass it on every noo_agent_* call",
+    )
 
 
 @register
 class NooAgentWhoami(ToolDef):
-    """Your own agent name on this session — the address other sessions use to message you."""
+    """Your agent name: the address other agents use to message you. With
+    no mailbox yet it says how to get one. First step: call noo_agent_name(session=<a stable id for this conversation>) once; it returns your mailbox name. Then pass as=<that name> here."""
 
     name: ClassVar[str] = "noo_agent_whoami"
     description: ClassVar[str] = __doc__
@@ -293,14 +315,24 @@ class NooAgentWhoami(ToolDef):
     tags: ClassVar[List[str]] = ["agents", "messaging", "external"]
     risk_level: ClassVar[RiskLevel] = RiskLevel.LOW
 
+    as_mailbox: Optional[str] = Field(
+        default=None,
+        alias="as",
+        description="Your mailbox name, from noo_agent_name (e.g. claude-general). Pass it on every noo_agent_* call",
+    )
+
 
 @register
 class NooAgentName(ToolDef):
-    """Give this session a name you choose, so other sessions can address you
-    by it: name="general" makes you <account>/<type>-general (type is your
-    client, e.g. claude). Returns the new name. A name is a mailbox: if
-    another live session of your account already has it, you share it
-    (shared_with says how many)."""
+    """Get your mailbox: call this once per conversation with
+    session=<a stable id you keep for this conversation> (Claude Code: its
+    session id). It returns your mailbox name; pass it as as=<name> on every
+    noo_agent_* call. The same session id later (a resumed conversation)
+    gets the same mailbox back, with its unread mail. name="general" picks a
+    durable name (<account>/<type>-general); a name another live
+    conversation holds is refused unless join=true, which shares its
+    mailbox. With no session id you get a one-shot mailbox that retires
+    after 24 h."""
 
     name: ClassVar[str] = "noo_agent_name"
     description: ClassVar[str] = __doc__
@@ -309,12 +341,21 @@ class NooAgentName(ToolDef):
     tags: ClassVar[List[str]] = ["agents", "messaging", "external"]
     risk_level: ClassVar[RiskLevel] = RiskLevel.LOW
 
-    name_field: str = Field(alias="name", description="The session half of your name: 1-64 of A-Z a-z 0-9 _ -")
+    name_field: Optional[str] = Field(
+        default=None, alias="name", description="A durable name to choose: 1-64 of A-Z a-z 0-9 _ - (omit for a default)"
+    )
+    session: Optional[str] = Field(
+        default=None, description="A stable id you keep for this conversation; the same id resumes the same mailbox"
+    )
+    join: Optional[bool] = Field(
+        default=None, description="Share a name another live conversation of your account holds, instead of refusing"
+    )
 
 
 @register
 class NooAgentThread(ToolDef):
-    """Read one conversation thread between agents (all messages in it)."""
+    """Read one conversation thread between agents (all messages in it).
+    First step: call noo_agent_name(session=<a stable id for this conversation>) once; it returns your mailbox name. Then pass as=<that name> here."""
 
     name: ClassVar[str] = "noo_agent_thread"
     description: ClassVar[str] = __doc__
@@ -325,11 +366,16 @@ class NooAgentThread(ToolDef):
 
     thread: str = Field(description="Thread id (thr_…)")
     limit: Optional[int] = Field(default=None, description="Max messages (default 50; use 500 for a full thread)")
+    as_mailbox: Optional[str] = Field(
+        default=None,
+        alias="as",
+        description="Your mailbox name, from noo_agent_name (e.g. claude-general). Pass it on every noo_agent_* call",
+    )
 
 
 @register
 class NooAgentAck(ToolDef):
-    """Acknowledge (mark read) a message addressed to you."""
+    """Acknowledge (mark read) a message addressed to you. First step: call noo_agent_name(session=<a stable id for this conversation>) once; it returns your mailbox name. Then pass as=<that name> here."""
 
     name: ClassVar[str] = "noo_agent_ack"
     description: ClassVar[str] = __doc__
@@ -339,3 +385,32 @@ class NooAgentAck(ToolDef):
     risk_level: ClassVar[RiskLevel] = RiskLevel.LOW
 
     message_id: str = Field(description="The message id (msg_…)")
+    as_mailbox: Optional[str] = Field(
+        default=None,
+        alias="as",
+        description="Your mailbox name, from noo_agent_name (e.g. claude-general). Pass it on every noo_agent_* call",
+    )
+
+
+@register
+class NooAgentDirectory(ToolDef):
+    """Who you can message now: your account's agent mailboxes, online
+    first, then every chosen name with its state (online, recent, idle =
+    resumable, retired), then short-lived names collapsed per client type,
+    and any orphaned mail. type=<client> pages through one type's
+    short-lived names. Operators may name another account or all=true."""
+
+    name: ClassVar[str] = "noo_agent_directory"
+    description: ClassVar[str] = __doc__
+    method: ClassVar[HttpMethod] = HttpMethod.GET
+    path: ClassVar[str] = "/api/agents/directory"
+    tags: ClassVar[List[str]] = ["agents", "messaging", "external"]
+    risk_level: ClassVar[RiskLevel] = RiskLevel.LOW
+
+    owner: Optional[str] = Field(default=None, description="Account to list (operators only; default = yours)")
+    all: Optional[bool] = Field(default=None, description="Operators only: every account")
+    include_retired: Optional[bool] = Field(default=None, description="Also list retired mailboxes")
+    type_field: Optional[str] = Field(
+        default=None, alias="type", description="One client type's short-lived names (e.g. codex), paged"
+    )
+    page: Optional[int] = Field(default=None, description="Page of short-lived names (20 a page)")

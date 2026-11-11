@@ -1701,6 +1701,7 @@ pub(crate) mod agent_messaging {
             Ok(crate::agent_recipient::Recipient::Known) => None,
             Ok(crate::agent_recipient::Recipient::Unheld(candidates)) => Some(crate::agent_recipient::unheld_warning(&to, &candidates)),
             Ok(crate::agent_recipient::Recipient::Unknown(candidates)) => return err_result(call, crate::agent_recipient::refusal(&to, &candidates)),
+            Ok(crate::agent_recipient::Recipient::Retired(at, names)) => return err_result(call, crate::agent_recipient::retired_refusal(&to, &at, &names)),
             Err(e) => return err_result(call, format!("could not check the recipient '{to}', so nothing was sent: {e}")),
         };
         let body = match (args.get("body").filter(|b| b.is_object()), arg_str(args, &["text", "message"])) {

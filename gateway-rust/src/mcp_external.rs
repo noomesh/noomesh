@@ -801,8 +801,8 @@ async fn handle_rpc(state: &Arc<AppState>, headers: &HeaderMap, body: &[u8]) -> 
             // The client's own name for itself, display-only.
             let client_name = req.params.pointer("/clientInfo/name").and_then(Value::as_str);
             match crate::mcp_session::open(&state.db, &caller.user, &caller.consumer, client_name).await {
-                Some((id, _)) => crate::mcp_session::attach(env.initialize(SERVER_NAME), &id),
-                None => env.initialize(SERVER_NAME),
+                Some((id, _)) => crate::mcp_session::attach(env.initialize(SERVER_NAME, &instructions()), &id),
+                None => env.initialize(SERVER_NAME, &instructions()),
             }
         }
 
@@ -811,10 +811,7 @@ async fn handle_rpc(state: &Arc<AppState>, headers: &HeaderMap, body: &[u8]) -> 
 
         "ping" => env.ping(),
 
-        "server/discover" => env.discover(
-            SERVER_NAME,
-            "noomesh user door: tools run as the account this key is bound to.",
-        ),
+        "server/discover" => env.discover(SERVER_NAME, &instructions()),
 
         "tools/list" => {
             let mut tools = tools_list();
@@ -858,6 +855,24 @@ async fn handle_rpc(state: &Arc<AppState>, headers: &HeaderMap, body: &[u8]) -> 
                 return rpc_error(req.id.clone(), -32602, &format!("unknown tool: {name}"));
             }
 
+            // The agent mailbox (0.6.24): `as` names this call's mailbox;
+            // `noo_agent_name` registers one. No connection state.
+            let (args, mailbox, note) = match crate::agent_mailbox::door_step(
+                &state.db, &caller.user, &caller.consumer, headers, session.as_deref(), name, args,
+            )
+            .await
+            {
+                crate::agent_mailbox::DoorStep::Run { args, label, note } => (args, label, note),
+                crate::agent_mailbox::DoorStep::Done(r) => {
+                    let (text, is_error) = match r {
+                        Ok(v) => (serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()), false),
+                        Err(e) => (e, true),
+                    };
+                    return env.result(json!({ "content": [{"type": "text", "text": text}], "isError": is_error }), SERVER_NAME);
+                }
+            };
+            let args = &args;
+
             tracing::info!(
                 consumer = %caller.consumer, user = %caller.user, tool = %name, era = env.era.as_str(),
                 "mcp_external_tool_call"
@@ -869,15 +884,16 @@ async fn handle_rpc(state: &Arc<AppState>, headers: &HeaderMap, body: &[u8]) -> 
             crate::audit::record(
                 &state.db,
                 AuditEvent::new(AuditKind::McpToolCall, &format!("{}:{}", caller.consumer, caller.user), name)
-                    .details(json!({ "door": "user", "consumer": caller.consumer, "user": caller.user, "tool": name, "era": env.era.as_str() })),
+                    .details(json!({ "door": "user", "consumer": caller.consumer, "user": caller.user, "tool": name, "era": env.era.as_str(), "mailbox": mailbox })),
             )
             .await;
 
             let outcome = if task_tool {
                 crate::mcp_user_tasks::call(state, &caller.user, name, args).await
             } else {
-                call_tool(&caller, session.as_deref(), name, args).await
+                call_tool(&caller, mailbox.as_deref(), name, args).await
             };
+            let outcome = outcome.map(|v| crate::agent_mailbox::with_note(v, note));
             match outcome {
                 // Content is the raw gateway JSON, serialised, with no prose
                 // formatting layered on top.
@@ -903,6 +919,13 @@ async fn handle_rpc(state: &Arc<AppState>, headers: &HeaderMap, body: &[u8]) -> 
 
         _ => env.method_not_found(),
     }
+}
+
+/// What this door tells every client (`server/discover`, legacy
+/// `initialize`): what it is, then how agent mail works, which a client
+/// with no hook can learn nowhere else.
+fn instructions() -> String {
+    format!("{} {}", "noomesh user door: tools run as the account this key is bound to.", crate::agent_mailbox::MAILBOX_INSTRUCTIONS)
 }
 
 #[cfg(test)]
@@ -1203,6 +1226,26 @@ mod tests {
         let without = mint_caller_jwt("owner", Role::User, &[], "self:owner", None).unwrap();
         let c = crate::auth::verify_token(&without, "test-secret-mcp-door").unwrap();
         assert_eq!(c.sub, "owner/self-owner", "no session → per-key label, not the bare account");
+    }
+
+    /// 0.6.24: a stated mailbox changes only `sub`. The provenance a
+    /// message records (`harness`, `act`) names the key that authenticated,
+    /// and nothing the caller sends — `as`, a body `harness`, a `from` —
+    /// reaches the signed claims.
+    #[test]
+    fn a_stated_mailbox_changes_the_name_never_the_provenance() {
+        let _guard = env_guard();
+        use crate::auth::Role;
+        std::env::set_var("NOO_JWT_SECRET", "test-secret-mcp-door");
+        let t = mint_caller_jwt("rbwolf", Role::User, &[], "self:rbwolf", Some("claude-general")).unwrap();
+        let c = crate::auth::verify_token(&t, "test-secret-mcp-door").unwrap();
+        assert_eq!(c.sub, "rbwolf/claude-general");
+        assert_eq!(c.act.as_ref().unwrap().sub, "key:self:rbwolf");
+        assert_eq!(c.harness.as_deref(), Some("mcp-external:self:rbwolf"));
+        // The label is the only caller-influenced input, and it is a name
+        // segment: it cannot carry a different account or harness.
+        assert!(crate::agent_mailbox::parse_as("evil/claude-general", "rbwolf").is_err());
+        assert!(crate::agent_mailbox::parse_as("claude-general\",harness\":\"x", "rbwolf").is_err());
     }
 
     #[test]
