@@ -325,9 +325,11 @@ mod tests {
         );
         // The route files the row under the subject's ACCOUNT (the DB test
         // below calls `import` the same way, so this pins the route to it).
-        let own = include_str!("conversation_import.rs");
+        // own_code drops this test module, so the needle cannot match itself.
+        let own = crate::test_src::own_code(include_str!("conversation_import.rs"));
+        let route = crate::test_src::fn_body(&own, "async fn receive(");
         assert!(
-            own.contains("import(&state.db, account_of(&requester.0.sub), &channel, body.publication)"),
+            route.contains(concat!("import(&state.db, account_of(&requester.0.sub)", ", &channel, body.publication)")),
             "the route must own the row by account_of(subject), never the key or the connection"
         );
     }
