@@ -2143,7 +2143,8 @@ pub(crate) fn console_is_current(build: &str, controller_console: &str) -> bool 
     if controller_console.starts_with("ui-") {
         return !build.is_empty() && build == controller_console;
     }
-    norm_tag(build) == norm_tag(controller_console)
+    let _ = norm_tag;
+    false
 }
 
 /// The controller's console, for [`console_is_current`]: the id its gateway
