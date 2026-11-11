@@ -1789,5 +1789,12 @@ mod expected_wait_wiring_tests {
         let with = crate::test_src::fn_body(&code, "pub async fn chat_completions_with");
         assert!(with.contains("send_with_failover_pinned(state, &class, &cands, stream, source, actor, pin.strict,"), "{with}");
         assert!(!pinned.contains("headers"), "no caller header decides it");
+        // The served `fallback` flag (traces, the answer's `noo` envelope,
+        // the failover alert) is judged against the class's OWN order: the
+        // planned order puts a demoted first choice later, and judging by
+        // the planned index would call the class's first choice a fallback
+        // or a fallback the first choice.
+        assert!(pinned.contains("fallback: is_fallback(original[ok.index], cand)"), "the fallback flag must use the original index");
+        assert!(pinned.contains("original = order;"), "the original index follows the plan");
     }
 }
