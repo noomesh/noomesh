@@ -40,7 +40,7 @@ pub enum SecurityError {
     #[error("tool '{tool}' approval request {request_id} timed out after {secs}s with no operator decision — do not retry; tell the user approval was not granted in time (they can decide later with `noo approval approve {request_id}` and ask again)")]
     ApprovalTimeout { tool: String, request_id: String, secs: u64 },
 
-    #[error("tool '{tool}' needs an operator's approval (request {request_id}), but nobody can be asked from here: no chat channel, no open console and no approval channel configured — it was NOT run; do not retry; tell the user it needs approval (an operator can approve it with `noo approval approve {request_id}` and the user can ask again)")]
+    #[error("tool '{tool}' needs an operator's approval (request {request_id}), but nobody can be asked from here: no chat channel, no open console and no approval channel configured — it was NOT run and will not run later; do not retry; tell the user it needs an operator's approval and to ask again from a chat channel or the console, where an operator can be asked")]
     ApprovalUnreachable { tool: String, request_id: String },
 }
 

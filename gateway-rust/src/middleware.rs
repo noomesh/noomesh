@@ -832,12 +832,16 @@ pub async fn effective_risk(state: &AppState, call: &ToolCall) -> RiskLevel {
             if saved { RiskLevel::Medium } else { base }
         }
         "noo_agent_send" | "noo_agent_message" => {
-            let (Some(sender), Some(to)) = (crate::mcp_bridge::current_caller(), trimmed_arg(&call.arguments, "to")) else {
+            let caller = crate::mcp_bridge::current_caller();
+            let to_arg = trimmed_arg(&call.arguments, "to");
+            let has_thread_id = trimmed_arg(&call.arguments, "thread_id").or_else(|| trimmed_arg(&call.arguments, "thread")).is_some();
+            let (Some(sender), Some(to)) = (caller, to_arg) else {
+                log_kept_high(&call.name, agent_message_high_reason(crate::mcp_bridge::current_caller().is_some(), trimmed_arg(&call.arguments, "to").as_deref(), has_thread_id));
                 return base;
             };
             // A thread post needs a seat in the thread (the tool checks it); a broadcast is refused
             // by the tool. Neither names another principal's agent.
-            if to == "thread" && trimmed_arg(&call.arguments, "thread_id").or_else(|| trimmed_arg(&call.arguments, "thread")).is_some() {
+            if to == "thread" && has_thread_id {
                 return RiskLevel::Medium;
             }
             if crate::auth::owns_name(&sender, &to) {
@@ -848,10 +852,31 @@ pub async fn effective_risk(state: &AppState, call: &ToolCall) -> RiskLevel {
             let lookup = |who: &str| {
                 if who == crate::auth::account_of(&sender) { mine } else if who == crate::auth::account_of(&to) { theirs } else { None }
             };
-            if agent_send_stays_medium(&sender, &to, &lookup) { RiskLevel::Medium } else { base }
+            if agent_send_stays_medium(&sender, &to, &lookup) {
+                RiskLevel::Medium
+            } else {
+                log_kept_high(&call.name, agent_message_high_reason(true, Some(to.as_str()), has_thread_id));
+                base
+            }
         }
         _ => base,
     }
+}
+
+/// Why an agent message stayed HIGH, as a reason code only (i658 C1): the
+/// gate must say which rule it missed so the next stall can be explained,
+/// without the recipient, the thread id or the message in any log.
+pub(crate) fn agent_message_high_reason(has_caller: bool, to: Option<&str>, has_thread_id: bool) -> &'static str {
+    match (has_caller, to) {
+        (false, _) => "no_caller",
+        (true, None) => "missing_to",
+        (true, Some("thread")) if !has_thread_id => "thread_without_id",
+        (true, Some(_)) => "peer_not_allowed",
+    }
+}
+
+fn log_kept_high(tool: &str, reason: &'static str) {
+    tracing::info!(tool = %tool, reason, "exec_risk.kept_high");
 }
 
 /// One `noo_security_audit` row for a Medium or High tool execution decision (the writer
@@ -2364,7 +2389,40 @@ mod tool_risk_context_tests {
         assert!(body.contains("let asked = crate::routes::communication::notify_exec_approval("), "delivery is what is judged");
         assert!(body.contains("let consoles = state.alert_hub.broadcast("), "and the open consoles");
         let msg = SecurityError::ApprovalUnreachable { tool: "noo_agent_message".into(), request_id: "r1".into() }.to_string();
-        assert!(msg.contains("NOT run") && msg.contains("do not retry") && msg.contains("noo approval approve r1"), "{msg}");
+        assert!(msg.contains("NOT run") && msg.contains("do not retry") && msg.contains("ask again"), "{msg}");
+    }
+
+    /// i658 C1: the rule an agent message missed is logged as a code only.
+    #[test]
+    fn an_agent_message_kept_high_logs_a_reason_code_and_nothing_else() {
+        assert_eq!(agent_message_high_reason(false, Some("thread"), true), "no_caller");
+        assert_eq!(agent_message_high_reason(true, None, false), "missing_to");
+        assert_eq!(agent_message_high_reason(true, Some("thread"), false), "thread_without_id");
+        assert_eq!(agent_message_high_reason(true, Some("alice/claude-x"), false), "peer_not_allowed");
+        let code = crate::test_src::own_code(include_str!("middleware.rs"));
+        let log = crate::test_src::fn_body(&code, "fn log_kept_high(");
+        assert!(log.contains("tracing::info!(tool = %tool, reason, \"exec_risk.kept_high\")"), "{log}");
+        for leak in ["to =", "thread", "message", "arguments", "content", "recipient"] {
+            assert!(!log.replace("exec_risk.kept_high", "").contains(leak), "the log line carries {leak}: {log}");
+        }
+        assert!(!log.contains("tool: &str, reason: &'static str, to"), "only tool and reason reach it");
+    }
+
+    /// An unreachable request never runs later: the call returns the refusal at
+    /// once (nothing waits on the row), the row is set expired, and the approve
+    /// route only acts on PENDING rows, so it cannot be approved afterwards.
+    #[test]
+    fn an_unreachable_request_never_runs_later() {
+        let code = crate::test_src::own_code(include_str!("middleware.rs"));
+        let body = crate::test_src::fn_body(&code, "async fn wait_for_exec_approval(");
+        let check = body.find("if nobody_can_be_asked(asked, consoles)").expect("the check");
+        let refusal = &body[check..body.find("loop {").expect("the polling loop")];
+        assert!(refusal.contains("SET status = 'expired'") && refusal.contains("return ExecApprovalOutcome::Unreachable"), "{refusal}");
+        let admin = crate::test_src::own_code(include_str!("routes/admin.rs"));
+        let approve = crate::test_src::fn_body(&admin, "async fn approval_approve(");
+        assert!(approve.contains("WHERE request_id = $1 AND status = 'pending'"), "approve acts on pending rows only");
+        let msg = SecurityError::ApprovalUnreachable { tool: "t".into(), request_id: "r".into() }.to_string();
+        assert!(msg.contains("will not run later") && !msg.contains("noo approval approve"), "{msg}");
     }
 
     /// Every Medium or High decision is audited, High refusals included; Low is not.
