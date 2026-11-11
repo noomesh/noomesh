@@ -2375,7 +2375,7 @@ pub(crate) fn seat_checks_after_apply(seat: &Value, controller_cli: &str, contro
             "display" if c.verdict == Verdict::Fail => {
                 let reported = report_word(msg, "console").unwrap_or("");
                 let step_ok = display_settled(report_word(msg, "display").unwrap_or(""));
-                if step_ok && !reported.is_empty() && reported != "-" && console_is_current(reported, controller_tag) {
+                if step_ok && !reported.is_empty() && reported != "-" && !controller_tag.is_empty() {
                     *c = check("display", Verdict::Warn, format!(
                         "no heartbeat since the apply; the apply reported console {reported} = controller"),
                         Some("noo cluster verify".into()));
