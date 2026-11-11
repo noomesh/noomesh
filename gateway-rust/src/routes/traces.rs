@@ -190,21 +190,19 @@ mod tests {
         assert_eq!(MAX_HOURS, 720);
     }
 
-    /// Every column the readers select is one the migration creates.
+    /// Every column the readers select is one the chain creates (the
+    /// request-trace table, or a later additive column on it).
     #[test]
     fn the_readers_select_only_created_columns() {
-        let created = crate::mesh_migrate::MIGRATIONS
-            .iter()
-            .find(|m| m.revision == crate::mesh_migrate::REQUEST_TRACE_REVISION)
-            .expect("the request-trace migration")
-            .sql;
+        let created = crate::mesh_migrate::request_trace_creates;
         let src = include_str!("../repo/request_trace.rs");
         let select = src.split("SELECT at, trace_id").nth(1).and_then(|s| s.split("FROM").next()).expect("the select");
         for col in std::iter::once("trace_id").chain(select.split(',').map(str::trim)).filter(|c| !c.is_empty()) {
-            assert!(created.contains(&format!("\n    {col} ")), "{col} is selected but not created");
+            assert!(created(col), "{col} is selected but not created");
         }
+        assert!(!created("no_such_column"), "the check can say no");
         for (_, col) in GROUP_BY {
-            assert!(created.contains(&format!("\n    {col} ")), "{col} is grouped by but not created");
+            assert!(created(col), "{col} is grouped by but not created");
             assert!(
                 src.contains(&format!("\"{col}\" => by!(\"{col}\")")),
                 "{col} has no literal statement in repo::request_trace::grouped"
