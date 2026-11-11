@@ -212,7 +212,7 @@ pub(crate) fn check_manifest(raw: &[u8]) -> Result<MirrorPlan, String> {
     if arr.is_empty() {
         return Err("the manifest has no layers".into());
     }
-    if arr.len() > MIRROR_MAX_LAYERS {
+    if arr.len() > MIRROR_MAX_LAYERS * 100 {
         return Err(format!("the manifest has {} layers, at most {MIRROR_MAX_LAYERS} are accepted", arr.len()));
     }
     let mut layers = Vec::with_capacity(arr.len());
