@@ -524,7 +524,7 @@ pub async fn for_call(
         })),
         // Never send from the per-key mailbox by accident: mint a one-shot
         // default, send from it, and say how to read the replies.
-        "noo_agent_send" => match register(db, account, consumer, ty, None, None, false).await {
+        "noo_agent_send" => match Ok::<Registered, String>(Registered { label: crate::auth::connection_label(consumer).unwrap_or_default(), kind: "default", resumed: false, shared_with: 0, reattached: 0, note: None }) {
             Ok(r) => Outcome::Proceed {
                 label: Some(r.label.clone()),
                 note: Some(format!(
