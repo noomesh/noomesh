@@ -3138,6 +3138,29 @@ mod tests {
     /// `# mesh-migration-head` line, which `noo upgrade --stack` trusts when it
     /// refuses a rollback below the database stamp. If the script and the
     /// real chain disagree, that refusal is wrong in one direction or the other.
+    /// The release script (scripts/mesh-migration-head.sh) reads this file
+    /// only up to the first line holding the test attribute, anywhere in the
+    /// line, a comment included. So every revision string must sit above that
+    /// line: a test-only item placed among the constants hides the ones below
+    /// it (it hid 122 once, 2026-11-11), and the head the script signs goes
+    /// backwards.
+    #[test]
+    fn every_revision_sits_above_the_first_test_attribute() {
+        let src = include_str!("mesh_migrate.rs");
+        let attr = concat!("#[cfg(", "test)]");
+        let stop = src.lines().position(|l| l.contains(attr)).expect("a test module");
+        let read: Vec<&str> = src.lines().take(stop).collect();
+        let read = read.join("\n");
+        for m in MIGRATIONS {
+            assert!(
+                read.contains(&format!("\"{}\"", m.revision)),
+                "{} is not above line {} (the first test attribute): the release script cannot see it",
+                m.revision,
+                stop + 1
+            );
+        }
+    }
+
     #[test]
     fn the_release_script_reads_the_real_chain_head() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
