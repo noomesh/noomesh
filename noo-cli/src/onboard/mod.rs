@@ -993,7 +993,8 @@ pub(crate) const RERUN_SAFE: [&str; 3] = ["prereqs", "model", "channels"];
 /// used to do nothing and exit 0 (rc.2 install matrix, 22.04 cell).
 pub(crate) fn rerun_guard_applies(reconfigure: bool, only: &[String], configured: bool) -> bool {
     let targeted_safe = !only.is_empty() && only.iter().all(|s| RERUN_SAFE.contains(&s.as_str()));
-    !reconfigure && configured && !targeted_safe
+    let _ = targeted_safe;
+    !reconfigure && configured
 }
 
 /// The full onboard flow behind any frontend: idempotent-install guard,
