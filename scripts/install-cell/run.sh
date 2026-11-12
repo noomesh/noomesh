@@ -211,10 +211,18 @@ meta first_answer_s "$(( $(date +%s) - CELL_START ))"
 
 # PROBE (fa, i677 finding 20; fix #1059): `noo offboard` run by a shell that
 # cannot reach docker (no supplementary groups, as for a stranger whose
-# shell lacks the docker group) must refuse and remove NOTHING. A probe is
+# shell lacks the docker group) must refuse and remove NOTHING: not even the
+# self-heal daemons (rc.2: the gate trusted an exit 0 with no version and
+# offboard stopped them first; the fix reads the version). A probe is
 # reported on its own and never becomes the cell's failed step; on releases
 # without #1059 it is expected to fail (it wiped the box).
 step probe-offboard-without-docker 600 -- sh -c '
+  # What THIS docker answers in that shell (rc.2: Docker 28.0.4 let the gate
+  # pass; is it "exit 0, empty version"?): read, never judged.
+  sudo setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --reset-env \
+       env HOME="$HOME" PATH="$PATH" docker info --format "{{.ServerVersion}}" >/tmp/noo-di.out 2>/tmp/noo-di.err; di_rc=$?
+  echo "DOCKER-INFO without the docker group: exit=$di_rc stdout-bytes=$(tr -d "[:space:]" </tmp/noo-di.out | wc -c) stderr1=$(grep -m1 -v "^[[:space:]]*$" /tmp/noo-di.err | cut -c1-200)"
+  rm -f /tmp/noo-di.out /tmp/noo-di.err
   out="$(sudo setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --reset-env \
          env HOME="$HOME" PATH="$PATH" noo offboard -y 2>&1)"; rc=$?
   printf "%s\n" "$out"; ok=1

@@ -1078,7 +1078,16 @@ fn docker_access_from(out: std::io::Result<std::process::Output>) -> Result<Dock
     match out {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DockerAccess::NotInstalled),
         Err(e) => Err(format!("could not run docker: {e}")),
-        Ok(o) if o.status.success() => Ok(DockerAccess::Reachable),
+        // Reachable means the DAEMON answered with its version. An exit 0
+        // with no version is not an answer: the matrix's Docker 28.0.4 shell
+        // without the docker group passed this gate, and offboard stopped
+        // the self-heal daemons before its first listing hit "permission
+        // denied" (rc.2 install matrix, every cell's offboard probe).
+        Ok(o) if o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty() => Ok(DockerAccess::Reachable),
+        Ok(o) if o.status.success() => Err(match failure_reason(&o) {
+            r if o.stderr.iter().any(|b| !b.is_ascii_whitespace()) => r,
+            _ => "docker info reported no server version: the daemon did not answer".to_string(),
+        }),
         Ok(o) => Err(failure_reason(&o)),
     }
 }
@@ -1300,6 +1309,18 @@ mod docker_gate_tests {
         assert!(down.as_ref().is_err_and(|e| e.starts_with("Cannot connect to the Docker daemon")), "{down:?}");
         assert_eq!(docker_access_from(out(1, "", "")), Err("docker exited 1".to_string()));
         assert!(docker_access_from(Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))).is_err(), "a binary we may not run is not 'not installed'");
+    }
+
+    /// An exit 0 with no server version is not an answer (rc.2 matrix: a
+    /// shell without the docker group got past the gate on Docker 28.0.4).
+    #[test]
+    fn exit_zero_with_no_server_version_is_not_an_answer() {
+        let denied = docker_access_from(out(0, "", "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock\n"));
+        assert_eq!(denied, Err("permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock".to_string()));
+        let silent = docker_access_from(out(0, "\n", ""));
+        assert!(silent.as_ref().is_err_and(|e| e.contains("no server version")), "{silent:?}");
+        assert_eq!(docker_access_from(out(0, "28.0.4\n", "WARNING: bridge-nf-call-iptables is disabled\n")), Ok(DockerAccess::Reachable),
+            "a version with a warning on stderr is an answer");
     }
 
     #[test]

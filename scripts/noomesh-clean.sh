@@ -167,8 +167,22 @@ fi
 # and the data dirs while the stack runs. Not installed at all is a positive
 # answer: what is on disk is still cleaned. `noo stack clean` refuses the
 # same way before it runs this script; this covers the script run directly.
-if command -v docker >/dev/null 2>&1 && ! _docker_err="$(docker info --format '{{.ServerVersion}}' 2>&1 >/dev/null)"; then
-    echo "cannot reach docker ($(printf '%s\n' "$_docker_err" | grep -m1 -v '^[[:space:]]*$')): nothing was removed" >&2
+# Reachable means the daemon answered with its version: an exit 0 with an
+# empty version is not an answer (Docker 28.0.4, a shell without the group:
+# rc.2 install matrix). Same rule as noo's docker_access.
+_docker_down() { # why docker did not answer; nothing when it did, or is not installed
+    command -v docker >/dev/null 2>&1 || return 0
+    local f v rc e
+    f="$(mktemp)"
+    v="$(docker info --format '{{.ServerVersion}}' 2>"$f")" && rc=0 || rc=$?
+    e="$(grep -m1 -v '^[[:space:]]*$' "$f" 2>/dev/null)"; rm -f "$f"
+    if [ "$rc" != 0 ] || [ -z "$(printf '%s' "$v" | tr -d '[:space:]')" ]; then
+        printf '%s' "${e:-docker info reported no server version: the daemon did not answer}"
+    fi
+}
+_docker_why="$(_docker_down)"
+if [ -n "$_docker_why" ]; then
+    echo "cannot reach docker ($_docker_why): nothing was removed" >&2
     echo "  run it from a shell where \`docker ps\` works (after joining the docker group: a new terminal, or \`newgrp docker\`)," >&2
     echo "  or as root: sudo noo stack clean (with the same flags)" >&2
     exit 1
