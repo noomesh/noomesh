@@ -48,6 +48,21 @@ pub(crate) const USERNS_RULE: &str = "userns,";
 /// the bundled file.
 pub(crate) const RENDERED: &str = ".noo-apparmor-noo-sandbox";
 
+/// What `render` writes in place of the rule; how verify tells the two
+/// forms apart in the installed file.
+pub(crate) const OMITTED_MARK: &str = "# userns, omitted:";
+
+/// Which form of the profile a file is, for verify's `sandbox executor`
+/// row: `None` when there is no installed profile to read.
+pub(crate) fn installed_form(installed: Option<&str>) -> Option<&'static str> {
+    let text = installed?;
+    Some(if text.lines().any(|l| l.trim_start().starts_with(OMITTED_MARK)) {
+        "profile: 3.x form, userns rule omitted"
+    } else {
+        "profile: bundled"
+    })
+}
+
 /// The major version in `apparmor_parser --version`'s first line
 /// ("AppArmor parser version 3.0.4"). `None` when it cannot be read.
 pub(crate) fn parser_major(version: &str) -> Option<u32> {
@@ -74,7 +89,7 @@ pub(crate) fn render(bundled: &str, parser_major: Option<u32>) -> String {
         .map(|l| {
             if l.trim() == USERNS_RULE {
                 let indent = &l[..l.len() - l.trim_start().len()];
-                format!("{indent}# {USERNS_RULE} omitted: this host's AppArmor parser predates the rule (4.0); its policy does not mediate user namespaces\n")
+                format!("{indent}{OMITTED_MARK} this host's AppArmor parser predates the rule (4.0); its policy does not mediate user namespaces\n")
             } else {
                 l.to_string()
             }
@@ -297,6 +312,15 @@ mod tests {
         assert_eq!(env_change("docker-default"), Some(PROFILE), "Docker's default is the one that blocks bwrap");
         assert_eq!(env_change("noo-sandbox"), None);
         assert_eq!(env_change("my-site-profile"), None, "a hand-set profile is left alone");
+    }
+
+    #[test]
+    fn verify_can_tell_which_form_is_installed() {
+        let bundled = include_str!("../../../docker/apparmor-noo-sandbox");
+        assert_eq!(installed_form(Some(bundled)), Some("profile: bundled"));
+        assert_eq!(installed_form(Some(&render(bundled, Some(3)))), Some("profile: 3.x form, userns rule omitted"));
+        assert_eq!(installed_form(None), None);
+        assert!(render(bundled, Some(3)).contains(OMITTED_MARK), "render writes the mark verify reads");
     }
 
     #[test]
