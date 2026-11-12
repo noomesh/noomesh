@@ -127,9 +127,11 @@ teardown() {
     # volumes, build cache, the data root and the install home.
     step disk-breakdown 300 -- sh -c 'df -h /; docker system df -v 2>&1 | head -80
       sudo du -sh /var/lib/noo /var/lib/noo/* "$HOME/.noo" 2>/dev/null | sort -h | tail -25'
-    step offboard 900 -- noo offboard -y
-    step leftover-offboard-check 120 -- noo offboard --check
-    step uninstall 600 -- noo offboard --uninstall -y
+    # ONE offboard: `offboard -y` then `offboard --uninstall -y` failed, as
+    # the first left the box looking like a node and the second refused
+    # ("runs on the controller", run 3). The leftover verdict is ours:
+    # `offboard --check` misses noomesh_* volumes and needs the removed CLI.
+    step uninstall 900 -- noo offboard --uninstall -y
     # Our own verdict, not offboard --check's: its audit looks for `noo_*`
     # volumes while the compose project names them `noomesh_*` (fa, 11-12),
     # so it reads clean over leftover stack volumes.
@@ -169,6 +171,12 @@ step health 600 -- sh -c 'for i in $(seq 1 40); do noo health >/dev/null 2>&1 &&
     || fail_onboarded
 # Not in the README's path (it is `stack start && health`, then chat): a red
 # verify is recorded with every row, and the stranger still asks the question.
+if [ "$MODEL" = tiny ]; then
+    # The declared OLLAMA_MODEL is pulled, but the default chat model stays the
+    # product default (run 3: "model 'gemma4:e2b' is not served by any node");
+    # the error's own remedy makes the tiny one the default.
+    step switch-to-tiny-model 300 -- noo models switch "$TINY_MODEL" --backend ollama || fail_onboarded
+fi
 step verify 900 -- noo cluster verify --wait
 # The single-turn line docs/getting-started/first-chat.md gives, verbatim.
 step first-answer 1800 -- sh -c 'out="$(noo chat --message "in two lines, what can you do on this machine?")"; rc=$?

@@ -273,8 +273,8 @@ def test_cleanup_is_skipped_when_docker_is_unreachable_as_the_cell_user(tmp_path
     text = (ROOT / "scripts/install-cell/run.sh").read_text()
     td = text[text.index("teardown() {"):text.index("\n}\n", text.index("teardown() {"))]
     probe = td.index("if ! docker info >/dev/null 2>&1; then")
-    assert probe < td.index("noo offboard -y") and "cleanup skipped: docker unreachable as" in td
-    assert td.index("return 0", probe) < td.index("noo offboard -y"), "the skip returns before any cleanup step"
+    assert probe < td.index("noo offboard --uninstall -y") and "cleanup skipped: docker unreachable as" in td
+    assert td.index("return 0", probe) < td.index("noo offboard --uninstall -y"), "the skip returns before any cleanup step"
 
 
 def test_a_probe_is_reported_on_its_own_and_never_fails_the_cell(tmp_path):
