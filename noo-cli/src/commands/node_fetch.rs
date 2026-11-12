@@ -1082,7 +1082,7 @@ fn settle_status(code: u16, last: Option<&str>, receipt: &mut dyn FnMut(&str)) -
         FetchOutcome::Unchanged(sum) => {
             // There is no debug-level facility in crate::ui, so no line is
             // emitted: a normal line every tick is the noise this avoids.
-            receipt(&sum);
+            let _ = sum;
             Some(0) // already applied this exact bundle
         }
         FetchOutcome::NothingStaged | FetchOutcome::Failed => Some(0),
