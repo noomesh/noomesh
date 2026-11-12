@@ -137,7 +137,7 @@ fn clock() -> &'static Mutex<Clock> {
 /// Why a placed backend is deliberately NOT running, when its node says so:
 /// it is listed in `gpu_contention.paused_backends` (the node agent's GPU
 /// yield paused it) and the pause has a live cause, either a GPU hold whose
-/// lease has not expired (a reservation such as the voice add-on's, or an
+/// lease has not expired (an add-on workload's GPU reservation, or an
 /// operator's hold) or the automatic yield to a workload outside noomesh.
 /// `None` for everything else, so a backend that is really down, or still
 /// paused after its hold expired, keeps alerting. Shared by this loop and
@@ -260,8 +260,8 @@ pub fn spawn(state: Arc<AppState>) {
 mod tests {
     fn held(expires: &str) -> Value {
         serde_json::json!({"id": "awolf", "gpu_contention": {
-            "state": "held", "paused_backends": ["vllm"], "reason": "voice session",
-            "lease": {"owner": "pai-voice", "operation_id": "op-77", "workload": "pai-voice/personaplex",
+            "state": "held", "paused_backends": ["vllm"], "reason": "an add-on session",
+            "lease": {"owner": "rhaddon", "operation_id": "op-77", "workload": "rhaddon/worker",
                       "generation": 4, "mode": "immediate", "since": "2026-11-12T15:00:00Z", "expires_at": expires}}})
     }
 
@@ -272,7 +272,7 @@ mod tests {
     fn only_a_pause_with_a_live_cause_is_expected() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-11-12T15:30:00Z").unwrap().timestamp() as u64;
         let why = paused_on_purpose(&held("2026-11-12T16:00:00Z"), "vllm", now).expect("live reservation");
-        assert!(why.contains("op-77") && why.contains("pai-voice/personaplex") && why.contains("by pai-voice"), "{why}");
+        assert!(why.contains("op-77") && why.contains("rhaddon/worker") && why.contains("by rhaddon"), "{why}");
         assert!(paused_on_purpose(&held(""), "vllm", now).is_some(), "an indefinite hold is live");
         assert_eq!(paused_on_purpose(&held("2026-11-12T15:00:00Z"), "vllm", now), None, "an expired hold excuses nothing");
         assert_eq!(paused_on_purpose(&held("not a time"), "vllm", now), None);
