@@ -14,8 +14,12 @@
 //!
 //! - to resolve [`CANARY_NAME`]: under the unit resolver the question cannot
 //!   leave the machine and the lookup fails;
-//! - to connect to [`CANARY_ADDR`] (TEST-NET-1, RFC 5737): under the
-//!   allowlist the kernel refuses it with EPERM before a packet exists.
+//! - to connect to [`CANARY_ADDR`], 127.0.0.2:9: loopback (no packet ever
+//!   leaves the host), outside the allowlist (only 127.0.0.1 of 127/8 is
+//!   allowed), nothing listening. Unrestricted, the kernel answers RST at
+//!   once ("refused"). Under the allowlist the SYN is dropped, which TCP
+//!   surfaces as EPERM or, on real systemd 249/255, as a timeout. A TEST-NET
+//!   target could not tell the two apart: it times out either way.
 //!
 //! It writes the result to [`SELFTEST_FILE`] (world-readable; it holds no
 //! secret) with its pid, so the node agent can tell the result belongs to
@@ -23,10 +27,9 @@
 //! The directory exists only under the drop-in (`RuntimeDirectory=`); without
 //! it nothing is written and the agent reports "unknown", never "enforced".
 //!
-//! When the unit is NOT restricted, the two canaries do leave the machine: a
-//! DNS question for example.com (the IANA reserved example domain) and one
-//! SYN towards a TEST-NET address that routes nowhere. Both are harmless by
-//! design, and an egress capture shows exactly them on such a node.
+//! When the unit is NOT restricted, the lookup canary can leave the machine (a
+//! DNS question for example.com, the IANA reserved example domain); the
+//! connect canary never does.
 
 use std::io;
 use std::net::SocketAddr;
@@ -41,8 +44,9 @@ pub const SELFTEST_DIR: &str = "/run/noo-harness";
 pub const SELFTEST_FILE: &str = "/run/noo-harness/egress.json";
 /// A name that must not resolve from inside the unit.
 pub const CANARY_NAME: &str = "example.com";
-/// An address the unit must not be able to connect to (TEST-NET-1).
-pub const CANARY_ADDR: &str = "192.0.2.1:9";
+/// An address the unit must not be able to connect to: loopback, outside
+/// the allowlist, nothing listening.
+pub const CANARY_ADDR: &str = "127.0.0.2:9";
 /// Each canary's bound: a refused one answers at once; only a broken
 /// enforcement waits this long.
 const CANARY_TIMEOUT: Duration = Duration::from_secs(3);
@@ -85,11 +89,14 @@ pub fn reachable_dns_listener(udp: &str, udp6: &str) -> Option<String> {
     None
 }
 
-/// The self-test record. `enforced` only when the lookup failed, the kernel
-/// denied the connect, AND no DNS server is reachable on the loopback the
-/// unit keeps: any one alone is not enough.
+/// The self-test record. `enforced` only when the lookup failed, the connect
+/// canary was dropped (EPERM or a timeout, never "refused"), AND no DNS
+/// server is reachable on the loopback the unit keeps.
 pub fn record(pid: u32, started_at: u64, lookup_resolved: bool, connect: &str, loopback_dns: Option<&str>) -> Value {
-    let enforced = !lookup_resolved && connect == "denied" && loopback_dns.is_none();
+    // A dropped SYN is EPERM ("denied") or a timeout; "refused" is the
+    // unrestricted kernel answering for a port nobody listens on.
+    let held = matches!(connect, "denied" | "timeout");
+    let enforced = !lookup_resolved && held && loopback_dns.is_none();
     json!({
         "version": 1,
         "pid": pid,
@@ -164,7 +171,8 @@ mod tests {
     fn only_a_failed_lookup_and_a_denied_connect_are_enforced() {
         assert_eq!(record(7, 1, false, "denied", None)["enforced"], true);
         assert_eq!(record(7, 1, false, "denied", Some("127.0.0.1:53"))["enforced"], false, "a reachable DNS forwarder is not held");
-        for (resolved, connect) in [(true, "denied"), (false, "refused"), (false, "timeout"), (false, "connected"), (false, "other:x")] {
+        assert_eq!(record(7, 1, false, "timeout", None)["enforced"], true, "a dropped SYN can surface as a timeout");
+        for (resolved, connect) in [(true, "denied"), (true, "timeout"), (false, "refused"), (false, "connected"), (false, "other:x")] {
             assert_eq!(record(7, 1, resolved, connect, None)["enforced"], false, "{resolved} {connect}");
         }
         let r = record(42, 1794000000, false, "denied", None);
@@ -189,7 +197,7 @@ mod tests {
     #[test]
     fn the_canaries_never_point_inside_the_allowlist() {
         let a: SocketAddr = CANARY_ADDR.parse().unwrap();
-        assert!(a.ip().to_string().starts_with("192.0.2."), "TEST-NET-1 only: never a private, tailnet or public address");
+        assert!(a.ip().is_loopback() && a.ip().to_string() != "127.0.0.1", "loopback, never a packet off the host, and outside the allowlist (127.0.0.1/32)");
         assert_eq!(CANARY_NAME, "example.com", "the IANA example domain: harmless if it ever does leave");
     }
 
