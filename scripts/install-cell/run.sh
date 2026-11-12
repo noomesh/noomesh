@@ -80,14 +80,24 @@ if [ "$DOCKER" = none ]; then
     hook prep-no-docker.sh || finish
 fi
 
-# ── 2. the install line, verbatim from the README ───────────────────────
-if [ "$CLI_TAG" = latest ]; then
-    URL="https://github.com/noomesh/noomesh/releases/latest/download/install.sh"
-else
-    URL="https://github.com/noomesh/noomesh/releases/download/$CLI_TAG/install.sh"
+# ── 2. the install line, read from the README and run VERBATIM ──────────
+# The cell runs exactly what a stranger copies, so README and test cannot
+# drift: the first line of README.md that downloads install.sh. A tag only
+# swaps releases/latest/download for releases/download/<tag> in it.
+README="$HERE/../../README.md"
+LINE="$(grep -m1 -E '^[^#]*releases/latest/download/install\.sh' "$README" 2>/dev/null)"
+if [ -z "$LINE" ]; then
+    meta limits "README.md has no install line this harness can find"
+    step install 10 -- sh -c 'echo "install-cell: no install line in README.md"; exit 1'
+    finish
+fi
+if [ "$CLI_TAG" != latest ]; then
+    LINE="$(printf '%s' "$LINE" | sed "s#releases/latest/download/#releases/download/$CLI_TAG/#")"
     export NOO_CLI_VERSION="$CLI_TAG"
 fi
-step install 600 -- sh -c "curl -fsSL '$URL' | sh" || finish
+meta install_line "$LINE"
+mkdir -p "$OUT/stranger-cwd"
+step install 600 -- sh -c "cd '$OUT/stranger-cwd' && $LINE" || finish
 step version 30 -- noo --version || finish
 meta installed_version "$(noo --version 2>/dev/null | head -1)"
 
