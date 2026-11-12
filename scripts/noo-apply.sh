@@ -842,7 +842,11 @@ HE_NSSWITCH_SRC="${HE_NSSWITCH_SRC:-/etc/nsswitch.conf}"
 HE_OWNER_ARGS="${HE_OWNER_ARGS--o root -g root}"   # empty in tests (not root)
 HE_STAT_OWNER="${HE_STAT_OWNER-root:root}"
 HE_RESOLVER_ADDR="192.0.2.53"
-HE_BASE_ALLOW="localhost 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fe80::/10 100.64.0.0/10 fd7a:115c:a1e0::/48"
+# Explicit prefixes, never the symbolic `localhost`/`any`: a unit file takes
+# them, but `systemd-run -p` rejects them ("Failed to parse IP address prefix:
+# localhost", real systemd 249 and 255), and the pre-check must pass the
+# drop-in's exact lines.
+HE_BASE_ALLOW="127.0.0.0/8 ::1/128 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fe80::/10 100.64.0.0/10 fd7a:115c:a1e0::/48"
 HE_CHANGED=0
 HE_UNRESOLVED=""
 HE_ULA_ALLOWED=0
@@ -868,7 +872,7 @@ he_write() {
 # bind sources under DIR. The drop-in and the pre-check both print them from
 # here, so what is tested is what is installed.
 he_props() {
-    printf '%s\n' "IPAddressDeny=any" "IPAddressAllow=$2" \
+    printf '%s\n' "IPAddressDeny=0.0.0.0/0 ::/0" "IPAddressAllow=$2" \
         "BindReadOnlyPaths=$1/resolv.conf:/etc/resolv.conf" \
         "BindReadOnlyPaths=$1/hosts:/etc/hosts" \
         "BindReadOnlyPaths=$1/nsswitch.conf:/etc/nsswitch.conf" \
@@ -1025,7 +1029,7 @@ he_render_hosts() {
 he_probe() {
     command -v systemd-run >/dev/null 2>&1 || { printf '%s\n' " harness-egress=UNENFORCED:systemd-run-missing"; return 0; }
     _he_rc=0
-    _he_out="$(timeout 10 systemd-run --wait --pipe --quiet --collect -p IPAddressDeny=any -p IPAddressAllow=localhost -p DynamicUser=yes /bin/bash -c 'exec 3<>/dev/tcp/192.0.2.1/9' 2>&1)" || _he_rc=$?
+    _he_out="$(timeout 10 systemd-run --wait --pipe --quiet --collect -p 'IPAddressDeny=0.0.0.0/0 ::/0' -p 'IPAddressAllow=127.0.0.0/8 ::1/128' -p DynamicUser=yes /bin/bash -c 'exec 3<>/dev/tcp/192.0.2.1/9' 2>&1)" || _he_rc=$?
     case "$_he_out" in
         *"Operation not permitted"*) printf '%s\n' " harness-egress=enforced" ;;
         *"Connection refused"*)      printf '%s\n' " harness-egress=UNENFORCED:connection-refused" ;;

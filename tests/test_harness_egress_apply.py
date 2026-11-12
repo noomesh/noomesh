@@ -143,7 +143,7 @@ def allow_line(node: Node) -> str:
     return re.search(r"^IPAddressAllow=(.*)$", node.dropin.read_text(), re.M).group(1)
 
 
-BASE_ALLOW = sorted("localhost 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fe80::/10 100.64.0.0/10 fd7a:115c:a1e0::/48".split())
+BASE_ALLOW = sorted("127.0.0.0/8 ::1/128 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fe80::/10 100.64.0.0/10 fd7a:115c:a1e0::/48".split())
 
 
 # ── the rendered files, exactly ─────────────────────────────────────────────
@@ -155,7 +155,7 @@ def test_the_drop_in_is_exactly_the_contract(node: Node) -> None:
         "# Rendered by noo-apply: the harness and every CLI it launches reach only local and tailnet\n"
         "# addresses and cannot resolve internet names (docs/security/telemetry.md).\n"
         "[Service]\n"
-        "IPAddressDeny=any\n"
+        "IPAddressDeny=0.0.0.0/0 ::/0\n"
         f"IPAddressAllow={' '.join(sorted(BASE_ALLOW + ['203.0.113.9/32']))}\n"
         f"BindReadOnlyPaths={node.net}/resolv.conf:/etc/resolv.conf\n"
         f"BindReadOnlyPaths={node.net}/hosts:/etc/hosts\n"
@@ -281,7 +281,7 @@ def test_probe_operation_not_permitted_is_enforced(node: Node) -> None:
     a = applied_of(node.run())
     assert a.endswith(" harness-egress=enforced") and "UNENFORCED" not in a, a
     call = [c for c in node.calls() if c.startswith("systemd-run") and "BindReadOnlyPaths" not in c][0]
-    assert "-p IPAddressDeny=any" in call and "-p IPAddressAllow=localhost" in call and "--collect" in call
+    assert "-p IPAddressDeny=0.0.0.0/0 ::/0" in call and "-p IPAddressAllow=127.0.0.0/8 ::1/128" in call and "--collect" in call
 
 
 def test_probe_connection_refused_is_unenforced(node: Node) -> None:
