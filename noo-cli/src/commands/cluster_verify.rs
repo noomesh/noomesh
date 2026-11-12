@@ -14046,9 +14046,17 @@ mod reservation_pause_tests {
 
     #[test]
     fn the_gpu_rows_remedy_for_a_reservation_says_releasing_stops_the_workload() {
+        // A hand hold (no workload) keeps the release as its way out.
+        let mut manual = held_awolf(None);
+        manual["gpu_contention"]["lease"]["workload"] = Value::Null;
+        let m = gpu_contention_check_at(&manual, 2_000_000_000).unwrap().remedy.unwrap();
+        assert!(m.starts_with("noo cluster gpu release awolf --operation 58586ceb --generation 6"), "{m}");
         let n = held_awolf(None);
         let c = gpu_contention_check_at(&n, 2_000_000_000).unwrap();
         let r = c.remedy.unwrap();
+        // Offering `gpu release` as THE fix for a live reservation would end
+        // the workload holding it (an operator's voice session, 11-12).
+        assert!(!r.starts_with("noo cluster gpu release"), "a live reservation's remedy must not be the release: {r}");
         assert!(r.starts_with("nothing to do: released when rhaddon/worker ends; to end it early (stops rhaddon/worker): noo cluster gpu release awolf --operation 58586ceb --generation 6"), "{r}");
     }
 }
