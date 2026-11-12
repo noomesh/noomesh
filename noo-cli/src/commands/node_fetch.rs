@@ -1199,7 +1199,7 @@ pub fn node_fetch(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 // being stamped; nothing else is written (no marker, no cadence
                 // file). There is no debug-level facility in crate::ui, so no
                 // line is emitted: a normal line every tick is the noise this avoids.
-                send_fetch_receipt(&agent, &base, &url, &node, &sum);
+                let _ = sum;
                 return Ok(0); // already applied this exact bundle
             }
             FetchOutcome::NothingStaged | FetchOutcome::Failed => return Ok(0),
