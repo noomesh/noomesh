@@ -530,7 +530,11 @@ pub fn check_env_channels(
                  and that environment holds every value of the encrypted store. {}",
                 if third_party {
                     "A third-party add-on may pass through only an `env` its resources.json delivers, a mount variable it \
-                     declares, or a launcher variable on the fixed allowlist; give the value explicitly or declare it as a resource"
+                     declares, or TZ. To fix the overlay: for a non-secret value, declare it in resources.json \
+                     (`{\"kind\": \"gateway\", \"part\": \"url\", \"deliver\": {\"env\": \"<ADDON>_...\"}}` and the like) or write the value \
+                     in the overlay; for a secret, take it as a FILE (an `addon_key` / `shared_secret` resource with \
+                     `\"deliver\": {\"file\": \"<mount>/<path>\"}`, or a top-level secret with `x-noo-source:` of the add-on's own). \
+                     docs/development/addons.md, \"Resources\""
                 } else {
                     "It is not one of the add-on's own secrets"
                 }
