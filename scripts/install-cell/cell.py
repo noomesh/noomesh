@@ -142,16 +142,27 @@ def cmd_scan(paths: list[str]) -> int:
     return 0
 
 
-ERROR_RX = re.compile(r"(?i)(\berror\b|\bfatal\b|\bfailed\b|✗|refus|panicked|TIMEOUT after)")
+# A line that SAYS something failed, not one that merely contains the word
+# ("13 created, 0 failed" read as the error in run 1, 2026-11-12).
+ERROR_RX = re.compile(r"^\s*(x |✗|error\b|ERROR\b|Error:|fatal\b|FATAL\b|panicked)|did NOT complete|"
+                      r"\[install-cell\] TIMEOUT after|^curl: \(\d+\)|^Traceback|Error: |\bno matching manifest\b")
+NOT_ERROR = re.compile(r"\b0 failed\b|\bno errors?\b")
 PROMPT_RX = re.compile(r"^PROMPT: |\[[yY]/[nN]\]|\([yY]/[nN]\)|\?\s*(\[[^\]]*\])?\s*$")
 WARN_RX = re.compile(r"^\s*(!|⚠)|\bWARN(ING)?\b|operator alert|TargetDown")
 
 
 def record(name: str, rc: int, secs: int, log: str) -> dict:
     lines = Path(log).read_text(errors="replace").splitlines() if Path(log).exists() else []
-    first_error = next((l for l in lines if ERROR_RX.search(l)), "") if rc != 0 else ""
-    if rc != 0 and not first_error and lines:
-        first_error = lines[-1]
+    first_error = ""
+    if rc != 0:
+        # The DECISIVE line: the last one that says something failed, with the
+        # two lines after it (the reason usually follows the verdict).
+        hits = [i for i, l in enumerate(lines) if ERROR_RX.search(l) and not NOT_ERROR.search(l)]
+        if hits:
+            i = hits[-1]
+            first_error = " | ".join(l.strip() for l in lines[i:i + 3] if l.strip())
+        elif lines:
+            first_error = lines[-1]
     return {
         "step": name, "rc": rc, "seconds": secs,
         "first_error": first_error[:500],
@@ -165,7 +176,9 @@ def summarize(d: Path) -> dict:
     steps = [json.loads(l) for l in (d / "steps.jsonl").read_text().splitlines() if l.strip()] \
         if (d / "steps.jsonl").exists() else []
     meta = json.loads((d / "meta.json").read_text()) if (d / "meta.json").exists() else {}
-    failed = next((s for s in steps if s["rc"] != 0 and not s["step"].startswith("leftover")), None)
+    failed = next((s for s in steps if s["rc"] != 0 and not s["step"].startswith("leftover")
+                   and s["step"] != "verify"), None)
+    verify = next((s for s in steps if s["step"] == "verify"), None)
     warnings = [w for s in steps for w in s["warnings"]]
     prompts = [p for s in steps for p in s["prompts"]]
     out = {**meta,
@@ -174,6 +187,7 @@ def summarize(d: Path) -> dict:
            "failed_step": failed["step"] if failed else None,
            "first_error": failed["first_error"] if failed else None,
            "steps": [{k: s[k] for k in ("step", "rc", "seconds")} for s in steps],
+           "verify": None if verify is None else ("green" if verify["rc"] == 0 else verify["first_error"]),
            "warning_count": len(warnings), "warnings": warnings[:40],
            "prompt_count": len(prompts), "prompts": prompts[:60]}
     md = [f"### {meta.get('cell', '?')}: {out['result'].upper()}"
@@ -185,6 +199,8 @@ def summarize(d: Path) -> dict:
     md += [f"| {s['step']} | {s['rc']} | {s['seconds']} |" for s in steps]
     if failed:
         md += ["", f"**First error** ({failed['step']}): `{failed['first_error']}`"]
+    if verify is not None and verify["rc"] != 0:
+        md += ["", f"**cluster verify is RED** (recorded, not fatal): `{verify['first_error']}`"]
     md += ["", f"**Warnings a stranger sees: {len(warnings)}**"] + [f"- `{w}`" for w in warnings[:20]]
     md += ["", f"**Prompts: {len(prompts)}**"] + [f"- `{p}`" for p in prompts[:20]]
     if meta.get("limits"):

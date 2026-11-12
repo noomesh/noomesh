@@ -58,6 +58,7 @@ import json, sys
 s = json.load(open(sys.argv[1]))
 sys.exit(0 if s["result"] in ("pass", "not run") else 1)
 PY
+    exit $?   # finish ENDS the cell (run 1, 2026-11-12: without this every later step still ran)
 }
 
 hook() {  # a mode's steps written by another owner (see the workflow)
@@ -99,8 +100,10 @@ if [ "$SCOPE" = node-partial ]; then
 fi
 
 # ── 3. onboard ──────────────────────────────────────────────────────────
-ONBOARDED=1
+TORN_DOWN=0
 teardown() {
+    [ "$TORN_DOWN" = 1 ] && return 0
+    TORN_DOWN=1
     step offboard 900 -- noo offboard -y
     step leftover-offboard-check 120 -- noo offboard --check
     step uninstall 600 -- noo offboard --uninstall -y
@@ -141,7 +144,9 @@ fi
 step stack-start 1800 -- noo stack start || fail_onboarded
 step health 600 -- sh -c 'for i in $(seq 1 40); do noo health >/dev/null 2>&1 && break; sleep 15; done; noo health' \
     || fail_onboarded
-step verify 900 -- noo cluster verify --wait || fail_onboarded
+# Not in the README's path (it is `stack start && health`, then chat): a red
+# verify is recorded with every row, and the stranger still asks the question.
+step verify 900 -- noo cluster verify --wait
 # The single-turn line docs/getting-started/first-chat.md gives, verbatim.
 step first-answer 1800 -- sh -c 'out="$(noo chat --message "in two lines, what can you do on this machine?")"; rc=$?
   printf "%s\n" "$out"; [ $rc = 0 ] && [ -n "$(printf "%s" "$out" | tr -d "[:space:]")" ]' || fail_onboarded
