@@ -184,12 +184,22 @@ jobs:
           trivy image --download-db-only
           old="$(docker buildx imagetools inspect "$REF:staged" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"' || true)"
           echo "OLD_DIGEST=$old" >> "$GITHUB_ENV"
+          # The platforms the current staged copy HAS. A platform the new build
+          # adds (the whisper/piper staged copies were amd64-only, 2026-11-11) has no
+          # old copy to scan: Trivy failed the whole job on it, so the staged
+          # copy never moved. Now it is simply not scanned on the old side, and the
+          # gate counts every finding on it as new.
+          old_platforms=""
+          if [ -n "$old" ]; then
+            old_platforms="$(docker buildx imagetools inspect --raw "$REF@$old" | python3 scripts/infra-staged.py platforms)"
+            echo "current staged copy platforms: ${old_platforms:-none}"
+          fi
           for p in $(echo "${{ matrix.platforms }}" | tr ',' ' '); do
             n="$(echo "$p" | tr '/' '-')"
             trivy image --skip-db-update --image-src remote --platform "$p" \
               --severity HIGH,CRITICAL --ignore-unfixed --format json \
               -o "scan/new/$n.json" "$REF@$DIGEST"
-            if [ -n "$old" ]; then
+            if [ -n "$old" ] && case " $old_platforms " in *" $p "*) true ;; *) false ;; esac; then
               trivy image --skip-db-update --image-src remote --platform "$p" \
                 --severity HIGH,CRITICAL --ignore-unfixed --format json \
                 -o "scan/old/$n.json" "$REF@$old"
@@ -201,7 +211,11 @@ jobs:
           # pipefail: without it `| tee` would turn the gate's exit 1 into 0.
           set -euo pipefail
           if [ -n "$OLD_DIGEST" ]; then
-            python3 scripts/infra-staged.py new-findings --new scan/new/*.json --old scan/old/*.json | tee -a "$GITHUB_STEP_SUMMARY"
+            # Only the platforms the current staged copy has (maybe none of the
+            # new ones): a missing one is gated in full, never skipped.
+            shopt -s nullglob
+            olds=(scan/old/*.json)
+            python3 scripts/infra-staged.py new-findings --new scan/new/*.json --old "${olds[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
           else
             python3 scripts/infra-staged.py new-findings --new scan/new/*.json | tee -a "$GITHUB_STEP_SUMMARY"
           fi
