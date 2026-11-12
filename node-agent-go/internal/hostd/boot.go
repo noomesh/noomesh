@@ -124,6 +124,13 @@ for id in $(docker ps -aq --filter status=created --filter status=exited); do
     down="${down:+$down, }${nm:-$id} ($info${hhmm:+ $hhmm})"
   fi
 done
+# The containers that join another's network namespace (noo-ollama-embed
+# joins noo-stunnel-ollama-embed): dockerd's restore may start them before
+# their door and never retries them. The same script noo-netns-restore.service
+# runs at every dockerd start; here it covers a host without systemd.
+if [ -f "$root/scripts/noo-netns-restore.sh" ]; then
+  bash "$root/scripts/noo-netns-restore.sh" || echo "boot-restore: the namespace restore reported a problem (above)" >&2
+fi
 echo "boot-restore: wrote the secret files and started $n container(s)"
 if [ -n "$down" ]; then
   echo "boot-restore: started $n; still down: $down" >&2

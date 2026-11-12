@@ -67,6 +67,7 @@ const STANDALONE_FILES: &[&str] = &[
     // `pai stack restart` runs this (mesh.rs) — was missing, so day-2
     // restart on a standalone box would have failed (finding #28's sweep).
     "scripts/noomesh-restart.sh",
+    "scripts/noo-netns-restore.sh",
     "scripts/lib-bind-addr.sh",
     // Sourced by both launchers since PR #813 (Created-wedge self-heal);
     // its absence broke the first otherwise-smooth onboard at the LAUNCH
