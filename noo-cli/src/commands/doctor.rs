@@ -546,6 +546,12 @@ type ContainerEnv = std::collections::BTreeMap<String, String>;
 /// [`container_env`] read once per container per run: every secret a
 /// container holds used to cost its own `docker inspect` (34 of them for the
 /// gateway alone, ~3 s of `noo doctor secrets` and of `cluster verify`).
+///
+/// Per run only: the map lives inside one `doctor_secrets` call and is never
+/// stored. Every secret a container holds is judged against ONE snapshot of
+/// that container, so two reads of the same container cannot disagree; a
+/// failed read (container gone mid-run) is cached as "not running here",
+/// exactly what an uncached failed read said.
 fn container_env_cached<'a>(
     cache: &'a mut std::collections::HashMap<String, Option<ContainerEnv>>,
     name: &str,
