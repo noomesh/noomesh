@@ -176,7 +176,7 @@ _docker_down() { # why docker did not answer; nothing when it did, or is not ins
     f="$(mktemp)"
     v="$(docker info --format '{{.ServerVersion}}' 2>"$f")" && rc=0 || rc=$?
     e="$(grep -m1 -v '^[[:space:]]*$' "$f" 2>/dev/null)"; rm -f "$f"
-    if [ "$rc" != 0 ] || [ -z "$(printf '%s' "$v" | tr -d '[:space:]')" ]; then
+    if [ "$rc" != 0 ]; then
         printf '%s' "${e:-docker info reported no server version: the daemon did not answer}"
     fi
 }
