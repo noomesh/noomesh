@@ -383,7 +383,7 @@ func TestStartPathsGoThroughEnsureImage(t *testing.T) {
 		asked := recordEnsure(t)
 		t.Setenv("VLLM_IMAGE", "")
 		err := c.PullProfile(context.Background(), "ollama")
-		if !errors.Is(err, errSentinelEnsure) || len(*asked) != 1 || (*asked)[0] != "ollama/ollama:0.40.5" {
+		if !errors.Is(err, errSentinelEnsure) || len(*asked) != 1 || (*asked)[0] != upstreamOllamaImage {
 			t.Fatalf("err %v asked %v", err, *asked)
 		}
 	})
