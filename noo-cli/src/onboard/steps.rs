@@ -5928,6 +5928,30 @@ pub(crate) fn ensure_embed_model_core(model: &str) -> Vec<String> {
     out_lines
 }
 
+/// What to do with one compose volume whose bind the stack declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VolumeMismatch {
+    /// Recorded bind == declared bind.
+    Keep,
+    /// `docker volume inspect` did not answer: never read that as "" (i677 #20).
+    NotChecked,
+    /// No bind at all: a plain volume, whose data lives INSIDE docker.
+    /// Removing it deletes that data, so it is never removed here.
+    UnboundHoldsData,
+    /// A bind to a different path (a NOO_DATA_ROOT change): the data is on the
+    /// host at the old path, and only the stale volume record goes.
+    RemoveStaleRecord,
+}
+
+fn volume_mismatch_action(recorded: Option<&str>, want_device: &str) -> VolumeMismatch {
+    match recorded {
+        None => VolumeMismatch::NotChecked,
+        Some("") | Some("<no value>") => VolumeMismatch::UnboundHoldsData,
+        Some(d) if d == want_device => VolumeMismatch::Keep,
+        Some(_) => VolumeMismatch::RemoveStaleRecord,
+    }
+}
+
 /// Remove `pai-assistant_*` bind-backed volumes whose recorded device no
 /// longer matches the compose-rendered one (stale after a NOO_DATA_ROOT
 /// change). Port of Python `step_services._fix_volume_mismatches`, dropped
@@ -5977,13 +6001,28 @@ fn fix_volume_mismatches(ctx: &Ctx) {
         let Some((_, want_device)) = expected.iter().find(|(n, _)| n == vol) else {
             continue;
         };
-        let device = Command::new("docker")
+        let recorded = Command::new("docker")
             .args(["volume", "inspect", vol, "--format", "{{.Options.device}}"])
             .output()
             .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default();
-        if device != *want_device {
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        match volume_mismatch_action(recorded.as_deref(), want_device) {
+            VolumeMismatch::Keep => continue,
+            VolumeMismatch::NotChecked => {
+                ctx.warn(&format!("volume {vol}: docker inspect did not answer; left as it is (not checked)"));
+                continue;
+            }
+            VolumeMismatch::UnboundHoldsData => {
+                ctx.warn(&format!(
+                    "volume {vol} is not bound to {want_device}: its data lives inside docker, so it is NOT removed \
+                     (moving it into the data root is a separate step; `noo cluster verify` names it)"
+                ));
+                continue;
+            }
+            VolumeMismatch::RemoveStaleRecord => {}
+        }
+        {
             let ok = Command::new("docker")
                 .args(["volume", "rm", "-f", vol])
                 .output()
@@ -9747,5 +9786,35 @@ mod required_tools_tests {
         assert!(body.contains("for &(tool, purpose) in &required {"), "{body}");
         assert!(body.contains("all_ok = required.iter().all(|&(tool, _)| tool_version(tool).is_some());"), "{body}");
         assert!(!body.contains("tool_version(\"git\")"), "git is never checked on its own: {body}");
+    }
+}
+
+#[cfg(test)]
+mod volume_mismatch_tests {
+    use super::*;
+
+    /// i677 #20: only a bind record pointing at a DIFFERENT path is removed
+    /// (its data stays on the host). An unbound volume holds its data inside
+    /// docker: the old code read it as a mismatch and `volume rm -f`-ed it
+    /// whenever the stack was down, deleting the gateway's data on every
+    /// legacy box that re-onboarded. A failed inspect is not "" either.
+    #[test]
+    fn only_a_stale_bind_record_is_removed() {
+        assert_eq!(volume_mismatch_action(Some("/srv/noo/noo-data"), "/srv/noo/noo-data"), VolumeMismatch::Keep);
+        assert_eq!(volume_mismatch_action(Some("/old/root/noo-data"), "/srv/noo/noo-data"), VolumeMismatch::RemoveStaleRecord);
+        assert_eq!(volume_mismatch_action(Some(""), "/srv/noo/noo-data"), VolumeMismatch::UnboundHoldsData);
+        assert_eq!(volume_mismatch_action(Some("<no value>"), "/srv/noo/noo-data"), VolumeMismatch::UnboundHoldsData);
+        assert_eq!(volume_mismatch_action(None, "/srv/noo/noo-data"), VolumeMismatch::NotChecked);
+    }
+
+    #[test]
+    fn the_fixer_removes_only_on_a_stale_record() {
+        let code = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&code, "fn fix_volume_mismatches(");
+        let decide = body.find("match volume_mismatch_action(recorded.as_deref(), want_device) {").expect("the decision");
+        let rm = body.find("\"volume\", \"rm\", \"-f\", vol").expect("the removal");
+        assert!(decide < rm, "{body}");
+        assert!(!body.contains(".unwrap_or_default();\n        if device != *want_device"), "{body}");
+        assert!(body.contains(".filter(|o| o.status.success())"), "a failed inspect is not an empty device: {body}");
     }
 }

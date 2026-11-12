@@ -175,6 +175,28 @@ pub fn offboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     }
 
+    // ── Gate: docker must ANSWER before anything is removed (i677 #20) ───
+    // A stranger's install (matrix run 43157286042): offboard ran as a user
+    // whose shell was not yet in the docker group. Every docker call failed,
+    // the old docker_lines read that as an EMPTY list, the walk said "no
+    // containers or volumes — already clean" while 16 containers ran, and
+    // then removed the storage root and the install home from under them.
+    // An unanswered docker is never "nothing there": stop before step 0.
+    let docker = match docker_access() {
+        Ok(d) => d,
+        Err(why) => {
+            let lines = docker_unreachable_refusal(&why, "noo offboard");
+            for l in &lines[1..] {
+                println!("{}", ui::note(l));
+            }
+            ui::close_failed(&lines[0], Some("docker ps"));
+            return Ok(1);
+        }
+    };
+    if docker == DockerAccess::NotInstalled {
+        note("docker is not installed on this box: no stack container, volume or image can exist here");
+    }
+
     // ── 0. Stop the self-heal daemons FIRST (finding #54) ───────────────
     // The host-watcher (systemd-user or nohup fallback) and hostd recreate
     // spool dirs inside ~/.noo moments after removal — the first live
@@ -235,9 +257,17 @@ pub fn offboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     println!("{}", ui::phase("Remove"));
 
     // ── 1. Stack: containers, volumes, networks ─────────────────────────
-    let containers = docker_lines(&["ps", "-aq", "--filter", &format!("name={prefix}-")]);
     let project = crate::envfile::compose_project();
-    let volumes = stack_volumes(&project);
+    let listed = if docker == DockerAccess::Reachable {
+        docker_list(&["ps", "-aq", "--filter", &format!("name={prefix}-")])
+            .and_then(|c| stack_volumes(&project).map(|v| (c, v)))
+    } else {
+        Ok((Vec::new(), Vec::new()))
+    };
+    let (containers, volumes) = match listed {
+        Ok(cv) => cv,
+        Err(why) => return Ok(stop_walk("the stack's containers and volumes", &why)),
+    };
     item("stack");
     if (!containers.is_empty() || !volumes.is_empty())
         && !(yes || ctx_confirm(g, false,
@@ -253,14 +283,25 @@ pub fn offboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
         // Agreed to and attempted: whatever is still there is a FAILURE of
         // this offboard, not a choice. It fails the walk below (i677a).
-        removal_failed.extend(stack_volumes(&project).into_iter().map(|v| format!("volume {v}")));
-        for n in docker_lines(&["network", "ls", "--format", "{{.Name}}"]) {
-            if n == "noo-cluster" || n.starts_with(&format!("{prefix}_")) {
-                run("docker", &["network".into(), "rm".into(), n]);
+        match stack_volumes(&project) {
+            Ok(left) => removal_failed.extend(left.into_iter().map(|v| format!("volume {v}"))),
+            Err(why) => removal_failed.push(format!("volumes (not re-checked: {why})")),
+        }
+        match docker_list(&["network", "ls", "--format", "{{.Name}}"]) {
+            Ok(nets) => {
+                for n in nets {
+                    if n == "noo-cluster" || n.starts_with(&format!("{prefix}_")) {
+                        run("docker", &["network".into(), "rm".into(), n]);
+                    }
+                }
             }
+            Err(why) => removal_failed.push(format!("networks (not listed: {why})")),
         }
         sub(Glyph::Ok, &format!("{} container(s), {} volume(s), networks removed", containers.len(), volumes.len()));
+    } else if docker == DockerAccess::NotInstalled {
+        sub(Glyph::Ok, "docker is not installed: no stack here");
     } else {
+        // docker ANSWERED, and listed nothing: a positive "clean".
         sub(Glyph::Ok, "no containers or volumes — already clean");
     }
 
@@ -274,7 +315,15 @@ pub fn offboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // not a reference docker accepts — seven of nine rmi calls failed with
     // "invalid reference format" while this step reported all nine removed
     // (host8 offboard, 2026-09-07).
-    let stack_images: Vec<(String, String)> = docker_lines(&["images", "--format", "{{.Repository}}\t{{.ID}}"])
+    let image_lines = if docker == DockerAccess::Reachable {
+        match docker_list(&["images", "--format", "{{.Repository}}\t{{.ID}}"]) {
+            Ok(l) => l,
+            Err(why) => return Ok(stop_walk("the stack images", &why)),
+        }
+    } else {
+        Vec::new()
+    };
+    let stack_images: Vec<(String, String)> = image_lines
         .into_iter()
         .filter_map(|l| {
             let (repo, id) = l.split_once('\t')?;
@@ -293,14 +342,16 @@ pub fn offboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             ids.dedup();
             let before = ids.len();
             run("docker", &[vec!["rmi".into(), "-f".into()], ids].concat());
-            let left = docker_lines(&["images", "--format", "{{.Repository}}"])
-                .into_iter()
-                .filter(|r| crate::registry::is_our_image(r))
-                .count();
-            if left == 0 {
-                sub(Glyph::Ok, &format!("{before} pulled image(s) removed"));
-            } else {
-                sub(Glyph::Warn, &format!("{left} of {before} pulled image(s) still present — a running container holds them? `docker images | grep noomesh`"));
+            match docker_list(&["images", "--format", "{{.Repository}}"]) {
+                Ok(l) => {
+                    let left = l.into_iter().filter(|r| crate::registry::is_our_image(r)).count();
+                    if left == 0 {
+                        sub(Glyph::Ok, &format!("{before} pulled image(s) removed"));
+                    } else {
+                        sub(Glyph::Warn, &format!("{left} of {before} pulled image(s) still present — a running container holds them? `docker images | grep noomesh`"));
+                    }
+                }
+                Err(why) => sub(Glyph::Warn, &format!("could not re-list images to confirm the removal ({why})")),
             }
         } else {
             sub(Glyph::Bullet, &format!("{} pulled image(s) kept — the next onboard reuses them", stack_images.len()));
@@ -796,8 +847,21 @@ fn audit_leftovers(g: &Globals, print: bool) -> Vec<String> {
         }
     };
 
-    let containers = docker_lines(&["ps", "-aq", "--filter", &format!("name={prefix}-")]);
-    item("stack containers", !containers.is_empty(), format!("{} present", containers.len()));
+    // Each docker item is clean only when docker ANSWERED with nothing.
+    // Unreachable is "not checked", a leftover, so --check and the walk's
+    // Verify never call this box fresh on a docker that did not answer.
+    let access = docker_access();
+    let docker_items = |args: &[&str]| -> Result<Vec<String>, String> {
+        match &access {
+            Ok(DockerAccess::NotInstalled) => Ok(Vec::new()),
+            Ok(DockerAccess::Reachable) => docker_list(args),
+            Err(why) => Err(why.clone()),
+        }
+    };
+    match docker_items(&["ps", "-aq", "--filter", &format!("name={prefix}-")]) {
+        Ok(c) => item("stack containers", !c.is_empty(), format!("{} present", c.len())),
+        Err(why) => item("stack containers (not checked)", true, format!("docker did not answer: {why}")),
+    }
     match checkout_state_root() {
         Some(root) => item("checkout controller state", true, format!("{} carries .env + noomesh.yaml (noo offboard retires it to a backup)", root.display())),
         None => item("checkout controller state", false, String::new()),
@@ -805,8 +869,15 @@ fn audit_leftovers(g: &Globals, print: bool) -> Vec<String> {
     // The SAME selector the removal uses: this audit once counted `{prefix}_`
     // (default `noo_`) and could not see a `noomesh_*` volume the removal had
     // failed to delete, so a failed removal still read "clean" (i677a).
-    let volumes = stack_volumes(&crate::envfile::compose_project()).len();
-    item("stack volumes", volumes > 0, format!("{volumes} present"));
+    let volumes = match &access {
+        Ok(DockerAccess::NotInstalled) => Ok(Vec::new()),
+        Ok(DockerAccess::Reachable) => stack_volumes(&crate::envfile::compose_project()),
+        Err(why) => Err(why.clone()),
+    };
+    match volumes {
+        Ok(v) => item("stack volumes", !v.is_empty(), format!("{} present", v.len())),
+        Err(why) => item("stack volumes (not checked)", true, format!("docker did not answer: {why}")),
+    }
 
     let home = crate::onboard::standalone::default_home();
     item("standalone home", home.exists(), home.display().to_string());
@@ -827,12 +898,14 @@ fn audit_leftovers(g: &Globals, print: bool) -> Vec<String> {
     let watcher_unit = PathBuf::from(std::env::var("HOME").unwrap_or_default())
         .join(".config/systemd/user/noo-host-watcher.service");
     item("host-watcher user unit", watcher_unit.is_file(), watcher_unit.display().to_string());
-    let image_count = docker_lines(&["images", "--format", "{{.Repository}}"])
-        .into_iter()
-        .filter(|i| crate::registry::is_our_image(i))
-        .count();
-    item("stack images", image_count > 0,
-        format!("{image_count} present (fine to keep — makes the next onboard pull-free)"));
+    match docker_items(&["images", "--format", "{{.Repository}}"]) {
+        Ok(l) => {
+            let image_count = l.into_iter().filter(|i| crate::registry::is_our_image(i)).count();
+            item("stack images", image_count > 0,
+                format!("{image_count} present (fine to keep — makes the next onboard pull-free)"));
+        }
+        Err(why) => item("stack images (not checked)", true, format!("docker did not answer: {why}")),
+    }
 
     let age = age_dir();
     item("age key", age.is_dir(), format!("{} (fine to keep across re-onboards)", age.display()));
@@ -887,8 +960,8 @@ fn audit_leftovers(g: &Globals, print: bool) -> Vec<String> {
 
 /// This install's Docker volumes, by name: the ones offboard deletes and the
 /// ones its audit (`--check`, and the walk's own Verify) must not find.
-fn stack_volumes(project: &str) -> Vec<String> {
-    select_stack_volumes(&docker_lines(&["volume", "ls", "--format", "{{.Name}}\t{{.Labels}}"]), project)
+fn stack_volumes(project: &str) -> Result<Vec<String>, String> {
+    docker_list(&["volume", "ls", "--format", "{{.Name}}\t{{.Labels}}"]).map(|l| select_stack_volumes(&l, project))
 }
 
 /// Pure selection over `docker volume ls --format '{{.Name}}\t{{.Labels}}'`
@@ -909,7 +982,7 @@ fn select_stack_volumes(lines: &[String], project: &str) -> Vec<String> {
     lines
         .iter()
         .filter_map(|line| {
-            // docker_lines trims each line, so an UNLABELLED volume (docker
+            // lines_of trims each line, so an UNLABELLED volume (docker
             // prints "name<TAB>") arrives as "name" with no tab at all.
             let (name, labels) = line.split_once('\t').unwrap_or((line.as_str(), ""));
             (name == unlabelled_own
@@ -922,14 +995,72 @@ fn select_stack_volumes(lines: &[String], project: &str) -> Vec<String> {
         .collect()
 }
 
-fn docker_lines(args: &[&str]) -> Vec<String> {
-    Command::new("docker").args(args).output().ok()
-        .filter(|o| o.status.success())
-        .map(|o| lines_of(&String::from_utf8_lossy(&o.stdout)))
-        .unwrap_or_default()
+/// Whether docker ANSWERS on this box. `NotInstalled` (no docker binary) is
+/// a positive answer, since no container can exist. Permission denied, a
+/// daemon that is down, or any other failure is `Err` with docker's reason:
+/// never "nothing there" (i677 #20).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DockerAccess {
+    Reachable,
+    NotInstalled,
 }
 
-/// docker's stdout as trimmed, non-empty lines (what every docker_lines caller sees).
+pub(crate) fn docker_access() -> Result<DockerAccess, String> {
+    docker_access_from(Command::new("docker").args(["info", "--format", "{{.ServerVersion}}"]).output())
+}
+
+/// [`docker_access`], pure over the spawn result.
+fn docker_access_from(out: std::io::Result<std::process::Output>) -> Result<DockerAccess, String> {
+    match out {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DockerAccess::NotInstalled),
+        Err(e) => Err(format!("could not run docker: {e}")),
+        Ok(o) if o.status.success() => Ok(DockerAccess::Reachable),
+        Ok(o) => Err(failure_reason(&o)),
+    }
+}
+
+fn failure_reason(o: &std::process::Output) -> String {
+    let err = String::from_utf8_lossy(&o.stderr);
+    err.lines().map(str::trim).find(|l| !l.is_empty()).map(str::to_string)
+        .unwrap_or_else(|| format!("docker exited {}", o.status.code().map_or("by a signal".into(), |c| c.to_string())))
+}
+
+/// One docker listing: the lines when docker answered, its reason when it
+/// did not. There is no "empty on failure".
+fn docker_list(args: &[&str]) -> Result<Vec<String>, String> {
+    docker_list_from(Command::new("docker").args(args).output())
+}
+
+/// [`docker_list`], pure over the spawn result.
+fn docker_list_from(out: std::io::Result<std::process::Output>) -> Result<Vec<String>, String> {
+    match out {
+        Err(e) => Err(format!("could not run docker: {e}")),
+        Ok(o) if o.status.success() => Ok(lines_of(&String::from_utf8_lossy(&o.stdout))),
+        Ok(o) => Err(failure_reason(&o)),
+    }
+}
+
+/// The refusal when docker does not answer: line 0 is the verdict, the rest
+/// are the two ways forward.
+pub(crate) fn docker_unreachable_refusal(why: &str, verb: &str) -> Vec<String> {
+    vec![
+        format!("cannot reach docker ({why}): nothing was removed"),
+        "this shell cannot use docker yet. Either run it from a shell where `docker ps` works".to_string(),
+        "(after joining the docker group: a new terminal, or `newgrp docker`),".to_string(),
+        format!("or as root: sudo {verb} (with the same flags)"),
+    ]
+}
+
+/// docker stopped answering mid-walk: stop before the step's removal and say so.
+fn stop_walk(step: &str, why: &str) -> i32 {
+    ui::close_failed(
+        &format!("docker did not answer while listing {step} ({why}): nothing from this step on was removed"),
+        Some("docker ps"),
+    );
+    1
+}
+
+/// docker's stdout as trimmed, non-empty lines (what every docker_list caller sees).
 fn lines_of(stdout: &str) -> Vec<String> {
     stdout.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
 }
@@ -1020,7 +1151,7 @@ mod volume_selection_tests {
     #[test]
     fn the_unlabelled_noo_data_of_this_project_is_selected_by_its_exact_name() {
         let ls = lines(&[
-            // As docker_lines hands it over: docker prints "noomesh_noo-data<TAB>"
+            // As lines_of hands it over: docker prints "noomesh_noo-data<TAB>"
             // and the trim removes the tab.
             "noomesh_noo-data",
             "noomesh_noo-data2",
@@ -1059,7 +1190,7 @@ mod volume_selection_tests {
     fn the_audit_and_the_removal_share_one_selector_and_project() {
         let code = crate::test_src::own_code(include_str!("offboard.rs"));
         let audit = crate::test_src::fn_body(&code, "fn audit_leftovers(");
-        assert!(audit.contains("stack_volumes(&crate::envfile::compose_project()).len()"), "{audit}");
+        assert!(audit.contains("Ok(DockerAccess::Reachable) => stack_volumes(&crate::envfile::compose_project()),"), "{audit}");
         assert_eq!(code.matches("stack_volumes(&project)").count(), 2, "the removal and its re-check, nothing else");
         assert_eq!(code.matches("\"volume\", \"ls\"").count(), 1, "one volume listing, inside stack_volumes");
     }
@@ -1071,12 +1202,84 @@ mod volume_selection_tests {
         let code = crate::test_src::own_code(include_str!("offboard.rs"));
         let walk = crate::test_src::fn_body(&code, "pub fn offboard(");
         let recheck = walk
-            .find("removal_failed.extend(stack_volumes(&project)")
+            .find("Ok(left) => removal_failed.extend(left.into_iter().map(|v| format!(\"volume {v}\"))),")
             .expect("the removal re-checks its own volumes");
         let fail = walk.find("if !removal_failed.is_empty() {").expect("the walk judges it");
         let complete = walk.find("ui::close_done(\"offboard complete\")").expect("the success line");
         assert!(recheck < fail && fail < complete, "{walk}");
         let judged = &walk[fail..complete];
         assert!(judged.contains("ui::close_failed(") && judged.contains("return Ok(1);"), "{judged}");
+    }
+}
+
+#[cfg(test)]
+mod docker_gate_tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    fn out(code: i32, stdout: &str, stderr: &str) -> std::io::Result<std::process::Output> {
+        Ok(std::process::Output { status: std::process::ExitStatus::from_raw(code << 8), stdout: stdout.into(), stderr: stderr.into() })
+    }
+
+    /// i677 #20: a docker that does not answer is never "nothing there".
+    #[test]
+    fn only_an_answer_or_a_missing_binary_is_a_positive_answer() {
+        assert_eq!(docker_access_from(out(0, "29.0.1\n", "")), Ok(DockerAccess::Reachable));
+        assert_eq!(
+            docker_access_from(Err(std::io::Error::from(std::io::ErrorKind::NotFound))),
+            Ok(DockerAccess::NotInstalled),
+            "no docker binary: no stack can exist"
+        );
+        let denied = docker_access_from(out(1, "", "permission denied while trying to connect to the docker API at unix:///var/run/docker.sock\n"));
+        assert_eq!(denied, Err("permission denied while trying to connect to the docker API at unix:///var/run/docker.sock".to_string()));
+        let down = docker_access_from(out(1, "", "\nCannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?\n"));
+        assert!(down.as_ref().is_err_and(|e| e.starts_with("Cannot connect to the Docker daemon")), "{down:?}");
+        assert_eq!(docker_access_from(out(1, "", "")), Err("docker exited 1".to_string()));
+        assert!(docker_access_from(Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))).is_err(), "a binary we may not run is not 'not installed'");
+    }
+
+    #[test]
+    fn a_failed_listing_is_an_error_never_an_empty_list() {
+        assert_eq!(docker_list_from(out(0, "a\n\nb\n", "")), Ok(vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(docker_list_from(out(0, "", "")), Ok(vec![]), "docker answered: nothing there");
+        assert!(docker_list_from(out(1, "", "permission denied")).is_err());
+        assert!(docker_list_from(Err(std::io::Error::from(std::io::ErrorKind::NotFound))).is_err(),
+            "a listing never decides 'not installed': only the gate does");
+    }
+
+    #[test]
+    fn the_refusal_says_nothing_was_removed_and_the_two_ways_forward() {
+        let l = docker_unreachable_refusal("permission denied", "noo offboard");
+        assert_eq!(l[0], "cannot reach docker (permission denied): nothing was removed");
+        let rest = l[1..].join(" ");
+        assert!(rest.contains("`docker ps` works") && rest.contains("newgrp docker") && rest.contains("sudo noo offboard"), "{rest}");
+    }
+
+    /// The gate runs before step 0 (stopping the daemons) and before any
+    /// removal, and refuses with exit 1; no call site can read a failed
+    /// docker as empty any more.
+    #[test]
+    fn the_walk_asks_docker_before_it_stops_or_removes_anything() {
+        let code = crate::test_src::own_code(include_str!("offboard.rs"));
+        assert!(!code.contains("docker_lines("), "the empty-on-failure helper is gone");
+        let walk = crate::test_src::fn_body(&code, "pub fn offboard(");
+        let gate = walk.find("let docker = match docker_access() {").expect("the gate");
+        let refuse = walk[gate..].find("return Ok(1);").map(|i| i + gate).expect("it refuses");
+        let stop = walk.find("stop_self_heal_daemons(true);").expect("step 0");
+        let first_rm = walk.find("run(\"docker\"").expect("a docker removal");
+        assert!(gate < refuse && refuse < stop && stop < first_rm, "{walk}");
+        assert!(walk.contains("Err(why) => return Ok(stop_walk(\"the stack's containers and volumes\", &why)),"), "{walk}");
+        assert!(walk.contains("Err(why) => return Ok(stop_walk(\"the stack images\", &why)),"), "{walk}");
+    }
+
+    /// The audit marks what it could not read as a leftover ("not checked"),
+    /// so --check exits 1 and Verify never says fresh.
+    #[test]
+    fn the_audit_never_counts_an_unanswered_docker_as_clean() {
+        let code = crate::test_src::own_code(include_str!("offboard.rs"));
+        let audit = crate::test_src::fn_body(&code, "fn audit_leftovers(");
+        for label in ["stack containers (not checked)", "stack volumes (not checked)", "stack images (not checked)"] {
+            assert!(audit.contains(&format!("item(\"{label}\", true,")), "{label}: {audit}");
+        }
     }
 }
