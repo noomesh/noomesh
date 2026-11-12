@@ -98,13 +98,23 @@ func TestAWorkerInsideStartSecsHasNoTimeout(t *testing.T) {
 }
 
 // A start time the daemon did not report cannot be measured against.
+//
+// The daemon reports no start time from the START. This used to blank it with
+// setCtr after Converge had already launched the watcher, so an iteration
+// could inspect the container while it still had a real start time, the clock
+// then jumped an hour, and that iteration (correctly, for what it saw) set
+// start_timeout, which sticks until ready (merge-queue flake, run 43272616916).
+// The product reads StartedAt fresh on every iteration; a real daemon never
+// turns a known start time into an unknown one.
 func TestAnUnknownStartTimeNeverTimesOut(t *testing.T) {
 	h := newLife(t)
 	h.door.status("GET", readyP, 503)
+	h.api.mu.Lock()
+	h.api.unknownStart = true
+	h.api.mu.Unlock()
 	e := h.running()
 	e.StartSecs = 5
 	h.p.Converge(context.Background(), e)
-	h.api.setCtr(wName, func(c *ctrInfo) { c.StartedAt = time.Time{} })
 	h.clock.advance(time.Hour)
 	before := probes(h)
 	eventually(t, "more probes", func() bool { return probes(h) >= before+6 })

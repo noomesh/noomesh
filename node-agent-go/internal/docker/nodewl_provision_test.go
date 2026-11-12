@@ -64,6 +64,9 @@ type fakeProv struct {
 
 	onRemove func(name string) // called as a container is removed
 	listErr  error             // ListManaged fails with this
+	// unknownStart: StartContainer reports no start time, as a daemon that
+	// did not report one would (set before the start path runs).
+	unknownStart bool
 }
 
 func (f *fakeProv) ctr(name string) *ctrInfo {
@@ -108,9 +111,12 @@ func (f *fakeProv) StartContainer(_ context.Context, name string) error {
 		return errors.New("no such container")
 	}
 	c.Running, c.Status = true, "running"
-	if f.clock != nil {
+	switch {
+	case f.unknownStart:
+		c.StartedAt = time.Time{}
+	case f.clock != nil:
 		c.StartedAt = f.clock()
-	} else {
+	default:
 		c.StartedAt = time.Now()
 	}
 	return nil
