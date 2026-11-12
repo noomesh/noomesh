@@ -894,11 +894,9 @@ pub fn mesh_clean(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     }
 
-    // Every variant that deletes something confirms (unless -y).
-    if all || deep || volumes || images || cache || hf_cache {
-        super::confirm_destructive(g, yes, "Clean all Docker resources on", "this host");
-    }
-    // i677 #20: docker must ANSWER before anything is stopped or removed. A
+    // i677 #20: docker must ANSWER before anything is asked, stopped or removed
+    // (the relaunch, i677 #10, runs BEFORE the confirm, so it is asked once,
+    // in the relaunched child). A
     // shell outside the docker group made every docker call fail, and a
     // failure read as "nothing there" deletes the wrong things. Not installed
     // at all is a positive answer (the script then cleans what is on disk).
@@ -912,6 +910,10 @@ pub fn mesh_clean(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
         ui::close_failed(&lines[0], Some("docker ps"));
         return Ok(1);
+    }
+    // Every variant that deletes something confirms (unless -y).
+    if all || deep || volumes || images || cache || hf_cache {
+        super::confirm_destructive(g, yes, "Clean all Docker resources on", "this host");
     }
     if all || deep || volumes {
         // The self-heal watcher would resurrect the stack onto the box we
