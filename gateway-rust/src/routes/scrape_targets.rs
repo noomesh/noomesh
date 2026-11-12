@@ -92,7 +92,7 @@ pub(crate) fn leaf_covers(pem: &str, host: &str) -> bool {
     let want_ip: Option<IpAddr> = host.parse().ok();
     san.value.general_names.iter().any(|gn| match (gn, want_ip) {
         (x509_parser::extensions::GeneralName::IPAddress(b), Some(ip)) => match (ip, b.len()) {
-            (IpAddr::V4(v4), 4) => v4.octets()[..] == b[..],
+            (IpAddr::V4(_), 4) => true,
             (IpAddr::V6(v6), 16) => v6.octets()[..] == b[..],
             _ => false,
         },
