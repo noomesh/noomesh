@@ -1042,15 +1042,22 @@ he_render_hosts() {
 # UNENFORCED:<reason>, never enforced.
 he_probe() {
     command -v systemd-run >/dev/null 2>&1 || { printf '%s\n' " harness-egress=UNENFORCED:systemd-run-missing"; return 0; }
-    _he_rc=0
-    _he_out="$(timeout 10 systemd-run --wait --pipe --quiet --collect -p 'IPAddressDeny=0.0.0.0/0 ::/0' -p 'IPAddressAllow=127.0.0.1/32 ::1/128' -p DynamicUser=yes /bin/bash -c 'exec 3<>/dev/tcp/192.0.2.1/9' 2>&1)" || _he_rc=$?
+    # The canary is 127.0.0.2:9: loopback (no packet ever leaves the host),
+    # outside the allowlist (only 127.0.0.1 of 127/8 is allowed), with nothing
+    # listening. Not enforced: the kernel answers RST at once ("Connection
+    # refused"). Enforced: the SYN is dropped, and TCP surfaces that as EPERM
+    # or, as on real systemd 249/255 (run 43255181333), a timeout. A TEST-NET
+    # target cannot tell the two apart (it times out either way). The argv has
+    # no $ or %: systemd-run would expand them.
+    _he_out="$(timeout 15 systemd-run --wait --pipe --quiet --collect -p 'IPAddressDeny=0.0.0.0/0 ::/0' -p 'IPAddressAllow=127.0.0.1/32 ::1/128' -p DynamicUser=yes \
+        /bin/bash -c 'if timeout 3 bash -c "exec 3<>/dev/tcp/127.0.0.2/9"; then echo CONNECTED; else echo NOTCONNECTED; fi' 2>&1)"
     case "$_he_out" in
-        *"Operation not permitted"*) printf '%s\n' " harness-egress=enforced" ;;
-        *"Connection refused"*)      printf '%s\n' " harness-egress=UNENFORCED:connection-refused" ;;
-        *"No route"*|*"unreachable"*) printf '%s\n' " harness-egress=UNENFORCED:no-route" ;;
-        *)
-            if [ "$_he_rc" = 124 ]; then printf '%s\n' " harness-egress=UNENFORCED:probe-timeout"
-            else printf '%s\n' " harness-egress=UNENFORCED:probe-rc-$_he_rc"; fi ;;
+        *"Connection refused"*)          printf '%s\n' " harness-egress=UNENFORCED:not-denied" ;;
+        *CONNECTED*) case "$_he_out" in
+            *NOTCONNECTED*)              printf '%s\n' " harness-egress=enforced" ;;
+            *)                           printf '%s\n' " harness-egress=UNENFORCED:connected" ;;
+        esac ;;
+        *)                               printf '%s\n' " harness-egress=UNENFORCED:probe-$(printf '%s' "$_he_out" | head -1 | tr -c 'A-Za-z0-9.-' '-' | cut -c1-40)" ;;
     esac
 }
 

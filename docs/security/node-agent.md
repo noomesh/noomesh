@@ -1390,7 +1390,7 @@ their content changes; a change reloads systemd and restarts the harness the
 applier's usual way. A name that does not resolve is left out of the hosts
 file and is never looked up through a real resolver: the harness then fails
 to connect to it, which is loud. The applier also runs a probe (a transient
-unit denying every address that tries a TEST-NET-1 address) and adds a tag
+unit denying every address but 127.0.0.1 and ::1 that connects to 127.0.0.2:9, which nothing listens on: unrestricted, the kernel refuses at once; held, the SYN is dropped, seen as EPERM or a timeout, and no packet ever leaves the host) and adds a tag
 to the `applied:` line: `harness-egress=enforced` when the kernel answers
 "Operation not permitted", `harness-egress=UNENFORCED:<reason>` for anything
 else (including no `systemd-run`), and `harness-egress=UNRESOLVED:<name>` per

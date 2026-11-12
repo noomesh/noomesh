@@ -36,7 +36,7 @@ def _block(name: str) -> str:
 LIB = _block("config_unchanged") + _block("harness_egress")
 ENV = "NODE_ID=host3\nNOO_GATEWAY_URL=https://ctl.example.net:8000\nNATS_URL=tls://nats.example.net:4222\n"
 NSS = "passwd: files systemd\ngroup: files systemd\nhosts: files mdns4_minimal dns\n"
-PROBE_EPERM = "bash: connect: Operation not permitted\nbash: /dev/tcp/192.0.2.1/9: Operation not permitted\n"
+PROBE_EPERM = "bash: connect: Operation not permitted\nbash: line 1: /dev/tcp/127.0.0.2/9: Operation not permitted\nNOTCONNECTED\n"
 
 
 class Node:
@@ -288,9 +288,9 @@ def test_probe_operation_not_permitted_is_enforced(node: Node) -> None:
 
 
 def test_probe_connection_refused_is_unenforced(node: Node) -> None:
-    node.probe_out.write_text("bash: connect: Connection refused\n")
+    node.probe_out.write_text("bash: connect: Connection refused\nbash: line 1: /dev/tcp/127.0.0.2/9: Connection refused\nNOTCONNECTED\n")
     a = applied_of(node.run())
-    assert "harness-egress=UNENFORCED:connection-refused" in a and "harness-egress=enforced" not in a, a
+    assert "harness-egress=UNENFORCED:not-denied" in a and "harness-egress=enforced" not in a, a
 
 
 def test_probe_with_no_systemd_run_is_unenforced(node: Node) -> None:
@@ -304,13 +304,30 @@ def test_probe_that_fails_silently_is_unenforced(node: Node) -> None:
     node.probe_out.write_text("")
     node.probe_rc.write_text("0")
     a = applied_of(node.run())
-    assert "harness-egress=UNENFORCED:probe-rc-0" in a and "harness-egress=enforced" not in a, a
+    assert "harness-egress=UNENFORCED:probe-" in a and "harness-egress=enforced" not in a, a
 
 
-def test_a_probe_that_times_out_is_unenforced(node: Node) -> None:
-    node.probe_out.write_text("")
-    node.probe_rc.write_text("124")
-    assert "harness-egress=UNENFORCED:probe-timeout" in applied_of(node.run())
+def test_a_dropped_syn_that_times_out_is_enforced(node: Node) -> None:
+    # Real systemd 249/255: the BPF deny drops the SYN and TCP times out, no EPERM.
+    # The canary is loopback, where "not enforced" is an instant refusal.
+    node.probe_out.write_text("NOTCONNECTED\n")
+    a = applied_of(node.run())
+    assert "harness-egress=enforced" in a, a
+
+
+def test_a_canary_that_connects_is_unenforced(node: Node) -> None:
+    node.probe_out.write_text("CONNECTED\n")
+    a = applied_of(node.run())
+    assert "harness-egress=UNENFORCED:connected" in a and "harness-egress=enforced" not in a, a
+
+
+def test_the_probe_canary_is_loopback_outside_the_allowlist() -> None:
+    src = (REPO / "scripts/noo-apply.sh").read_text()
+    body = src[src.index("he_probe() {"):]
+    body = body[:body.index("\n}\n")]
+    code = "\n".join(l for l in body.splitlines() if not l.lstrip().startswith("#"))
+    assert "/dev/tcp/127.0.0.2/9" in code and "192.0.2." not in code, "a TEST-NET target times out enforced or not"
+    assert "IPAddressAllow=127.0.0.1/32 ::1/128" in code, "127.0.0.2 must be outside the probe's allowlist"
 
 
 def test_the_probe_never_blocks_the_files(node: Node) -> None:

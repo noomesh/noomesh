@@ -78,17 +78,22 @@ out="\$R/ci-result.txt.tmp"; : > "\$out"
 try() { timeout 5 bash -c 'exec 3<>/dev/tcp/\$0/\$1' "\$1" "\$2" 2>&1; }
 if o=\$(try 127.0.0.1 $PORT_HTTP); then echo "loopback ok" >> "\$out"; else echo "loopback FAILED \$o" >> "\$out"; fi
 if o=\$(try $PRIV $PORT_HTTP); then echo "private ok" >> "\$out"; else echo "private FAILED \$o" >> "\$out"; fi
-pubdenied=false
-if o=\$(try 1.1.1.1 443); then echo "public CONNECTED" >> "\$out"
+# A dropped SYN surfaces as EPERM or a timeout (real systemd 249/255: a
+# timeout); connecting at all is the leak. The host-side control below proves
+# the runner itself reaches this address.
+if o=\$(try 1.1.1.1 443); then echo "public CONNECTED" >> "\$out"; else echo "public BLOCKED" >> "\$out"; fi
+# The loopback canary (127.0.0.2:9, outside the allowlist, nothing listening):
+# unrestricted, the kernel refuses at once; held, the SYN is dropped.
+cr=other
+if o=\$(try 127.0.0.2 9); then echo "loopback2 CONNECTED" >> "\$out"; cr=connected
 else
-    case "\$o" in *"Operation not permitted"*) echo "public EPERM" >> "\$out"; pubdenied=true ;; *) echo "public FAILED-OTHER \$o" >> "\$out" ;; esac
+    case "\$o" in *"Connection refused"*) echo "loopback2 REFUSED" >> "\$out"; cr=refused ;; *) echo "loopback2 BLOCKED" >> "\$out"; cr=timeout ;; esac
 fi
 lk=failed
 if getent hosts example.com >/dev/null 2>&1; then echo "canary RESOLVED" >> "\$out"; lk=resolved; else echo "canary FAILED" >> "\$out"; fi
 if getent hosts noo-ci-controller >/dev/null 2>&1; then echo "rendered RESOLVED" >> "\$out"; else echo "rendered FAILED" >> "\$out"; fi
-enf=false; if [ "\$lk" = failed ] && [ "\$pubdenied" = true ]; then enf=true; fi
-if [ "\$pubdenied" = true ]; then cr=denied; else cr=other; fi
-printf '{"version":1,"pid":%s,"started_at":%s,"lookup":{"name":"example.com","result":"%s"},"connect":{"addr":"1.1.1.1:443","result":"%s"},"enforced":%s}\n' \
+enf=false; if [ "\$lk" = failed ] && [ "\$cr" = timeout ]; then enf=true; fi
+printf '{"version":1,"pid":%s,"started_at":%s,"lookup":{"name":"example.com","result":"%s"},"connect":{"addr":"127.0.0.2:9","result":"%s"},"enforced":%s}\n' \
     "\$\$" "\$(date +%s)" "\$lk" "\$cr" "\$enf" > "\$R/egress.json"
 chmod 644 "\$R/egress.json"
 echo done >> "\$out"
@@ -143,7 +148,10 @@ cat "$RESULT" 2>&1 || true
 echo "--- dns capture"
 cat "$WORK/dns.txt"
 check "unit wrote its result" test -f "$RESULT"
-for want in "loopback ok" "private ok" "public EPERM" "canary FAILED" "rendered RESOLVED" "done"; do
+# Control: the runner itself reaches the public address, so the unit's failure
+# to is the hold, not the network.
+check "control: the host (outside the unit) reaches 1.1.1.1:443" timeout 5 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443'
+for want in "loopback ok" "private ok" "public BLOCKED" "loopback2 BLOCKED" "canary FAILED" "rendered RESOLVED" "done"; do
     check "unit saw: $want" grep -qx "$want" "$RESULT"
 done
 check "no DNS packet mentions example.com" bash -c "! grep -qi example.com '$WORK/dns.txt'"
