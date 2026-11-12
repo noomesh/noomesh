@@ -104,6 +104,15 @@ TORN_DOWN=0
 teardown() {
     [ "$TORN_DOWN" = 1 ] && return 0
     TORN_DOWN=1
+    # Never offboard a box this user cannot see the containers of: without
+    # docker access offboard read "already clean" with 16 containers running
+    # and removed the storage root from under them (fa, run 43157286042; the
+    # product fix is fa's). The runner is thrown away anyway.
+    if ! docker info >/dev/null 2>&1; then
+        meta limits "cleanup skipped: docker unreachable as $(id -un)"
+        echo "::notice::$CELL: cleanup skipped, docker is unreachable as $(id -un)"
+        return 0
+    fi
     # What the install put on the disk, before it goes: images by name,
     # volumes, build cache, the data root and the install home.
     step disk-breakdown 300 -- sh -c 'df -h /; docker system df -v 2>&1 | head -80

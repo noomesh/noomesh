@@ -262,3 +262,13 @@ def test_the_size_report_runs_end_to_end_on_a_faked_registry(tmp_path, monkeypat
         and rows["gateway"]["upgrade_bytes"] == 20
     assert rows["ollama"]["upgrade_bytes"] == 0 and rows["ollama"]["own_bytes"] is None, "unresolvable base: '?'"
     assert rep["cli_assets"] == {"noo-x": 9_000_000}
+
+
+def test_cleanup_is_skipped_when_docker_is_unreachable_as_the_cell_user(tmp_path):
+    # fa, run 43157286042: offboard without docker access removed the data
+    # root from under running containers. The harness never offboards then.
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    td = text[text.index("teardown() {"):text.index("\n}\n", text.index("teardown() {"))]
+    probe = td.index("if ! docker info >/dev/null 2>&1; then")
+    assert probe < td.index("noo offboard -y") and "cleanup skipped: docker unreachable as" in td
+    assert td.index("return 0", probe) < td.index("noo offboard -y"), "the skip returns before any cleanup step"
