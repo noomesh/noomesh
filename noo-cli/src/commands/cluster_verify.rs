@@ -3755,6 +3755,15 @@ pub(crate) fn sandbox_listener_check(compose: Option<&str>, probe: Option<&Sandb
 /// server started failed and `/health` answered 500 (0.6.11, pop-os). A
 /// `/health` that answers 5xx is a FAIL, not "no body": the sandbox is up
 /// and refusing.
+/// The sandbox row with the installed AppArmor profile's form appended,
+/// when this host has one.
+pub(crate) fn with_profile_form(mut c: Check, form: Option<&str>) -> Check {
+    if let Some(f) = form {
+        c.detail = format!("{}; {f}", c.detail);
+    }
+    c
+}
+
 pub(crate) fn sandbox_executor_check(probe: Option<&SandboxProbe>) -> Check {
     const ROW: &str = "sandbox executor";
     let Some(p) = probe else {
@@ -7385,7 +7394,13 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(sandbox_listener_check(compose.as_deref(), sandbox_probe.as_ref()));
         // The sandbox executor (i161): the health body that probe read over
         // the gateway's leaf says which uid model-written code runs as.
-        checks.push(sandbox_executor_check(sandbox_probe.as_ref()));
+        // Which form of the AppArmor profile is installed (bundled, or the
+        // AppArmor 3.x form without its `userns,` rule): stated, not silent.
+        checks.push(with_profile_form(
+            sandbox_executor_check(sandbox_probe.as_ref()),
+            crate::onboard::sandbox_apparmor::installed_form(
+                std::fs::read_to_string(crate::onboard::sandbox_apparmor::INSTALLED).ok().as_deref()),
+        ));
         // The voice doors (mTLS doors phase 2): only when the overlay is
         // composed; then the same static + live three-way proof per door.
         let voice_on = addon_on("voice");
@@ -13534,5 +13549,20 @@ mod noo_data_bound_tests {
         let dirs = code.find("checks.push(storage_dirs_row(&crate::envfile::repo_root()));").expect("data directories row");
         let bound = code.find("checks.push(noo_data_bound_row(&crate::envfile::repo_root()));").expect("noo-data bound row");
         assert!(dirs < bound);
+    }
+}
+
+#[cfg(test)]
+mod profile_form_row_tests {
+    use super::*;
+
+    #[test]
+    fn the_sandbox_row_says_which_profile_form_is_loaded() {
+        let c = with_profile_form(ok("sandbox executor", "code runs as uid 65534"), Some("profile: 3.x form, userns rule omitted"));
+        assert_eq!(c.detail, "code runs as uid 65534; profile: 3.x form, userns rule omitted");
+        assert_eq!(c.verdict, Verdict::Ok, "the form is stated, never a verdict of its own");
+        assert_eq!(with_profile_form(ok("sandbox executor", "x"), None).detail, "x", "no profile here: nothing added");
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        assert!(own.contains("crate::onboard::sandbox_apparmor::installed_form("), "the controller run states it");
     }
 }
