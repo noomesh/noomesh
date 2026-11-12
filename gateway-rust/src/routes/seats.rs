@@ -450,7 +450,10 @@ pub(crate) async fn record_seat(
     .bind(token_id)
     .execute(&mut *tx)
     .await?;
-    tx.commit().await
+    tx.commit().await?;
+    // The staged bundle was deleted: drop its ETag cache entry (hygiene).
+    crate::bundle_etag::forget(&seat_etag_key(seat));
+    Ok(())
 }
 
 /// POST /api/cluster/seat-enroll — redeem a seat token.
@@ -627,6 +630,9 @@ async fn seat_bundle_put(
     if r.rows_affected() == 0 {
         return Err(AppError::NotFound(format!("no seat named '{seat}' is enrolled")));
     }
+    // Hygiene: the new row has a new key, so the old entry could never be
+    // served; dropping it keeps the cache to live bundles.
+    crate::bundle_etag::forget(&seat_etag_key(&seat));
     crate::audit::record(
         &state.db,
         AuditEvent::new(AuditKind::SeatBundleStaged, &by, &format!("seat-bundle:{seat}"))
@@ -757,12 +763,40 @@ fn tailnet_claim(hb: &Value) -> Option<String> {
 }
 
 async fn staged_seat_sha(db: &sqlx::PgPool, seat: &str) -> Result<Option<String>, AppError> {
-    Ok(sqlx::query_scalar::<_, String>(
-        "SELECT encode(sha256(blob), 'hex') FROM noo_seat_bundles WHERE seat_name = $1",
+    // i675 F3: from the ETag cache when it holds the current row (the seat's
+    // GET just served it); otherwise hashed in Postgres ONCE, with the row's
+    // key in the same statement, and remembered.
+    let Some(current) = seat_bundle_key(db, seat).await? else { return Ok(None) };
+    let tag = seat_etag_key(seat);
+    if let Some(sha) = crate::bundle_etag::cached_sha(&tag, current) {
+        return Ok(Some(sha));
+    }
+    let row: Option<(chrono::DateTime<chrono::Utc>, i64, String)> = sqlx::query_as(
+        "SELECT created_at, octet_length(blob)::bigint, encode(sha256(blob), 'hex') FROM noo_seat_bundles WHERE seat_name = $1",
     )
     .bind(seat)
     .fetch_optional(db)
-    .await?)
+    .await?;
+    Ok(row.map(|(created_at, len, sha)| {
+        crate::bundle_etag::remember(&tag, crate::repo::provision_bundles::key_of(created_at, len), &sha);
+        sha
+    }))
+}
+
+/// The seat's entry in the bundle ETag cache (`bundle_etag`): namespaced,
+/// so a seat never shares an entry with a node of the same name.
+fn seat_etag_key(seat: &str) -> String {
+    format!("seat:{seat}")
+}
+
+/// The staged seat row's key (`created_at`, byte length), without its bytes.
+async fn seat_bundle_key(db: &sqlx::PgPool, seat: &str) -> Result<Option<crate::bundle_etag::Key>, sqlx::Error> {
+    let row: Option<(chrono::DateTime<chrono::Utc>, i64)> =
+        sqlx::query_as("SELECT created_at, octet_length(blob)::bigint FROM noo_seat_bundles WHERE seat_name = $1")
+            .bind(seat)
+            .fetch_optional(db)
+            .await?;
+    Ok(row.map(|(created_at, len)| crate::repo::provision_bundles::key_of(created_at, len)))
 }
 
 fn sha_param(body: &Value) -> Result<String, AppError> {
@@ -784,16 +818,50 @@ async fn seat_bundle_get(
     if !valid_node_name(&seat) {
         return (StatusCode::BAD_REQUEST, "invalid seat name").into_response();
     }
+    // The proof FIRST: a caller without one never learns whether a sha
+    // matches (i675 F3, agreed with the seat side).
     if let Err(e) = check_seat_proof(&state.db, &headers, Purpose::SeatGet, &seat, SEAT_GET_SHA).await {
         return e.into_response();
     }
-    let row: Result<Option<(Vec<u8>,)>, _> =
-        sqlx::query_as("SELECT blob FROM noo_seat_bundles WHERE seat_name = $1")
+    // i675 F3: unchanged costs one small request. The current row's key,
+    // without its bytes; a 304 (no body, blob not read) only when the cache
+    // holds the sha of exactly this row and the seat named it. The seat
+    // sends the sha it last applied, the sha of the bytes as served.
+    let tag = seat_etag_key(&seat);
+    let current = match seat_bundle_key(&state.db, &seat).await {
+        Ok(Some(key)) => key,
+        Ok(None) => return (StatusCode::NOT_FOUND, "no bundle staged").into_response(),
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "bundle lookup failed").into_response(),
+    };
+    let if_none_match = headers.get(axum::http::header::IF_NONE_MATCH).and_then(|v| v.to_str().ok());
+    if let Some(sha) = crate::bundle_etag::decide_304(&tag, current, if_none_match) {
+        crate::bundle_etag::count(&tag, true, current.len.max(0) as u64);
+        return (StatusCode::NOT_MODIFIED, [(axum::http::header::ETAG, format!("\"{sha}\""))]).into_response();
+    }
+    // The bytes and their key in ONE read, so the cached sha is the sha of
+    // exactly what is sent, whatever was re-staged in between.
+    let row: Result<Option<(Vec<u8>, chrono::DateTime<chrono::Utc>)>, _> =
+        sqlx::query_as("SELECT blob, created_at FROM noo_seat_bundles WHERE seat_name = $1")
             .bind(&seat)
             .fetch_optional(&state.db)
             .await;
     match row {
-        Ok(Some((blob,))) => (StatusCode::OK, [("content-type", "application/octet-stream")], blob).into_response(),
+        Ok(Some((blob, created_at))) => {
+            use sha2::{Digest, Sha256};
+            let sha = hex::encode(Sha256::digest(&blob));
+            let key = crate::repo::provision_bundles::key_of(created_at, blob.len() as i64);
+            crate::bundle_etag::remember(&tag, key, &sha);
+            crate::bundle_etag::count(&tag, false, 0);
+            (
+                StatusCode::OK,
+                [
+                    (axum::http::header::CONTENT_TYPE, "application/octet-stream".to_string()),
+                    (axum::http::header::ETAG, format!("\"{sha}\"")),
+                ],
+                blob,
+            )
+                .into_response()
+        }
         Ok(None) => (StatusCode::NOT_FOUND, "no bundle staged").into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "bundle lookup failed").into_response(),
     }
@@ -1220,6 +1288,33 @@ mod seat_binding_tests {
                     json!({"tailnet": {"name": "x y"}}), json!({"tailnet": {"name": "a".repeat(64)}})] {
             assert_eq!(tailnet_claim(&bad), None, "{bad}");
         }
+    }
+
+    /// i675 F3: the seat bundle GET answers 304 for an unchanged bundle, and
+    /// only after the seat's proof: a caller without one never learns whether
+    /// a sha matches. "No bundle staged" stays a 404 (the seat reads it as
+    /// nothing to do); the blob is read only for a 200, with its key in the
+    /// same statement; the cache entry is the seat's own namespace.
+    #[test]
+    fn the_seat_bundle_get_answers_304_only_after_the_proof() {
+        let own = crate::test_src::own_code(include_str!("seats.rs"));
+        let get = crate::test_src::fn_body(&own, "async fn seat_bundle_get(");
+        let proof = get.find("check_seat_proof(").expect("the proof");
+        let key = get.find("seat_bundle_key(&state.db, &seat)").expect("the row key, without its bytes");
+        let decide = get.find("crate::bundle_etag::decide_304(&tag, current, if_none_match)").expect("the 304 decision");
+        let blob = get.find("\"SELECT blob, created_at FROM noo_seat_bundles WHERE seat_name = $1\"").expect("the blob and its key in one read");
+        assert!(proof < key && key < decide && decide < blob, "order: proof {proof} < key {key} < 304 {decide} < blob {blob}");
+        assert!(get[..blob].contains("StatusCode::NOT_MODIFIED"), "no 304 before the blob read");
+        assert!(get.contains("\"no bundle staged\"") && get.contains("StatusCode::NOT_FOUND"), "the 404 the seat relies on");
+        assert!(get.contains("crate::bundle_etag::remember(&tag, key, &sha)"), "a 200 does not remember its sha");
+        assert!(get.contains("let tag = seat_etag_key(&seat);"), "the GET is not in the seat namespace");
+        for w in ["UPDATE", "INSERT", "DELETE", "state.db.begin"] {
+            assert!(!get.contains(w), "the seat GET must stay a read: it holds {w:?}");
+        }
+        let receipt = crate::test_src::fn_body(&own, "async fn staged_seat_sha(");
+        assert!(receipt.contains("crate::bundle_etag::cached_sha(&tag, current)"), "the receipt hashes in Postgres every time");
+        assert_ne!(super::seat_etag_key("homeserver"), "homeserver", "a seat would share a node's cache entry");
+        assert!(crate::test_src::fn_body(&own, "async fn seat_bundle_put(").contains("crate::bundle_etag::forget(&seat_etag_key(&seat))"));
     }
 
     /// The rail's only gate reads revocation: every seat route goes through
