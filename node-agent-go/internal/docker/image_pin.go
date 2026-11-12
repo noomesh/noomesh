@@ -48,14 +48,13 @@ func withImagePin(ctx context.Context, pin string) context.Context {
 	return context.WithValue(ctx, imagePinKey{}, pin)
 }
 
-// withoutImagePin drops the pin ctx carries, for an image that is NOT the
-// one the context was pinned for: the backend's stunnel door (sidecar.go).
-// Before this, the door inherited the BACKEND's pin and every pinned backend
-// (ollama, llamacpp) failed to start on a node (0.6.19 #837, tester finding
-// on 0.6.20). The door resolves as it did before #837: staged by name, the
-// rail's manifest vouching for the tar.
-func withoutImagePin(ctx context.Context) context.Context {
-	return context.WithValue(ctx, imagePinKey{}, "")
+// withOwnImagePin holds the next fetch to exactly pin, replacing any pin ctx
+// already carries ("" = unpinned). For an image that is NOT the one the
+// context was pinned for: the backend's stunnel door (sidecar.go). Before
+// this, the door inherited the backend's pin and every pinned backend failed
+// to start on a node (0.6.19 #837, tester finding on 0.6.20).
+func withOwnImagePin(ctx context.Context, pin string) context.Context {
+	return context.WithValue(ctx, imagePinKey{}, pin)
 }
 
 func imagePin(ctx context.Context) string {
