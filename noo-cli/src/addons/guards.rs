@@ -904,7 +904,7 @@ mod tests {
         assert!(pt(PT_BASE, true).is_ok(), "the plain overlay must pass");
         let cases: Vec<(String, &str)> = vec![
             // list form, map form (null value), on a core secret
-            (PT_BASE.replace("      RH_NAME: rhaddon\n", "      - NOO_JWT_SECRET\n").replace("    environment:\n", "    environment:\n"), "NOO_JWT_SECRET"),
+            (PT_BASE.replace("      RH_NAME: rhaddon\n", "      - NOO_JWT_SECRET\n"), "NOO_JWT_SECRET"),
             (PT_BASE.replace("      RH_NAME: rhaddon\n", "      RH_NAME: rhaddon\n      POSTGRES_PASSWORD:\n"), "POSTGRES_PASSWORD"),
             // an UNKNOWN name: refused too (the store holds unclassified names)
             (PT_BASE.replace("      RH_NAME: rhaddon\n", "      RH_NAME: rhaddon\n      SOME_OPERATOR_TOKEN:\n"), "SOME_OPERATOR_TOKEN"),
