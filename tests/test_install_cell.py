@@ -219,9 +219,11 @@ def test_a_failed_step_ends_the_cell_and_tears_down_at_most_once(tmp_path):
                        timeout=120)
     steps = [json.loads(l)["step"] for l in (tmp_path / "out" / "steps.jsonl").read_text().splitlines()]
     assert r.returncode == 1, r.stdout[-2000:] + r.stderr[-2000:]
-    assert steps == ["box", "install", "version"], steps
+    # The README's line downloads THEN runs (#1058), so a failed download
+    # fails the install step itself; nothing after it runs.
+    assert steps == ["box", "install"], steps
     s = json.loads((tmp_path / "out" / "summary.json").read_text())
-    assert s["result"] == "fail" and s["failed_step"] == "version"
+    assert s["result"] == "fail" and s["failed_step"] == "install"
 
 
 def test_the_size_report_runs_end_to_end_on_a_faked_registry(tmp_path, monkeypatch, capsys):
