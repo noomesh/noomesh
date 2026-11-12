@@ -107,3 +107,11 @@ def test_the_promises_it_makes_hold_in_its_source():
 def test_it_refuses_without_out():
     run = subprocess.run(["bash", str(SCRIPT), "--minutes", "1"], capture_output=True, text=True, timeout=30)
     assert run.returncode == 2 and "--out DIR is required" in run.stderr
+
+
+def test_a_signal_stops_it_at_once_not_after_the_sleep():
+    # A rehearsal stops the capture with kill -INT; a foreground sleep would
+    # defer the trap (and the report and the sysctl restore) to its end.
+    code = SCRIPT.read_text()
+    assert 'sleep "$((MINUTES * 60))" &' in code and 'wait "$!"' in code
+    assert not re.search(r'^sleep "\$\(\(MINUTES \* 60\)\)"\s*$', code, re.M), "a foreground sleep defers the stop"
