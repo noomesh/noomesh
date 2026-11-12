@@ -49,7 +49,11 @@
 # name its lane, `Mutant-Test: gateway-rust: <filter>`: when every line names
 # one, only those lanes run, so a gateway file noo-cli include_str!s does not
 # drag in a noo-cli lane the filter cannot match (lanes: gateway-rust, noo-cli,
-# node-agent-go, python). No trailer, a named lane the mutant's diff does not
+# node-agent-go, python). A file under scripts/ reaches the python lane (its
+# tests are tests/*.py), and one the gateway also include_str!s reaches
+# gateway-rust too: a mutant of such a script MUST name its lane, or the lane
+# its filter cannot match runs no test and the job is base-red, no verdict.
+# No trailer, a named lane the mutant's diff does not
 # reach, or a lane that runs no test, is a FAILED job: a mutant that ran nothing
 # never reads as caught. On a push the planner, the judge and the summary come
 # from DEV, not the pushed commit, and a mutant commit that edits `.github/` or

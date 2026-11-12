@@ -300,6 +300,13 @@ def test_named_lanes_run_alone_and_an_unnamed_filter_keeps_every_lane():
     both = ["gateway-rust", "noo-cli"]  # a gateway file noo-cli include_str!s (fa's auth.rs mutants)
     assert cm.resolve_lanes(both, [("gateway-rust", "auth::tests::a")]) == (["gateway-rust"], ["auth::tests::a"])
     assert cm.resolve_lanes(both, [(None, "auth::tests::a")]) == (both, ["auth::tests::a"]), "unchanged default"
+    # Deliberate: a script the gateway embeds reaches gateway-rust AND python
+    # (#1076); an unnamed filter then runs both, and the lane it cannot match
+    # runs no test (base-red, no verdict). Such mutants must name their lane.
+    embedded = cm.lanes_for(["scripts/noo-apply.sh"], {"scripts/noo-apply.sh"}, set())
+    assert embedded == ["gateway-rust", "python"]
+    assert cm.resolve_lanes(embedded, [(None, "x")]) == (embedded, ["x"])
+    assert cm.resolve_lanes(embedded, [("python", "tests/test_x.py::t")]) == (["python"], ["tests/test_x.py::t"])
     assert cm.resolve_lanes(both, [("gateway-rust", "a"), (None, "b")]) == (both, ["a", "b"])
     assert cm.resolve_lanes(both, [("noo-cli", "c"), ("gateway-rust", "a")]) == (both, ["c", "a"]), \
         "lanes run in LANES order whatever the trailer order"
