@@ -1491,6 +1491,21 @@ fn print_final_summary(ctx: &Ctx) {
         ctx.raw("");
         ctx.info("You're all set. Welcome to Noomesh!");
     }
+    // i677 #10: this wizard installed Docker and relaunched itself with the
+    // new group. The shell the user returns to does not have it: `noo`
+    // commands bridge that themselves, `docker` does not. The last line says so.
+    if let Some(line) = docker_group_closing_line(std::env::var_os(crate::docker_group::RELAUNCHED_ENV).is_some()) {
+        ctx.warn(line);
+    }
+}
+
+/// The closing line when this run installed Docker (it relaunched itself
+/// through the new docker group). Pure.
+pub(crate) fn docker_group_closing_line(relaunched_for_docker: bool) -> Option<&'static str> {
+    relaunched_for_docker.then_some(
+        "Docker was installed in this session: `noo` commands work from this terminal; \
+         for `docker` itself open a new terminal (or run `newgrp docker`)",
+    )
 }
 
 /// The welcome line is for a run that completed. A hard failure puts the

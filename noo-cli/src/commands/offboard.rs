@@ -185,6 +185,12 @@ pub fn offboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let docker = match docker_access() {
         Ok(d) => d,
         Err(why) => {
+            // The one shell that can be fixed here (added to the docker group
+            // this session, i677 #10) is run again with the group; anything
+            // else is refused with nothing removed.
+            if let Some(code) = crate::docker_group::relaunch_if_needed(&why) {
+                return Ok(code);
+            }
             let lines = docker_unreachable_refusal(&why, "noo offboard");
             for l in &lines[1..] {
                 println!("{}", ui::note(l));
