@@ -308,4 +308,9 @@ if command -v docker >/dev/null 2>&1; then
 fi
 
 echo "egress-capture: capturing for $MINUTES minute(s) into $OUT (Ctrl-C to stop early)"
-sleep "$((MINUTES * 60))"
+# In the background and waited on: a trapped INT/TERM (Ctrl-C, or `kill -INT`
+# from a script that started this one) interrupts `wait` at once, where a
+# foreground sleep would hold the stop, the report and the restore until it ended.
+sleep "$((MINUTES * 60))" &
+PIDS+=($!)
+wait "$!"
