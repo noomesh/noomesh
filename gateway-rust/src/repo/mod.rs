@@ -98,6 +98,7 @@ pub mod node_model_set_retry;
 pub mod node_workload_placements;
 pub mod perspectives;
 pub mod prompt_skills;
+pub mod provision_bundles;
 pub mod request_trace;
 pub mod seats;
 pub mod settings;
@@ -229,7 +230,7 @@ mod ratchet {
     ("role_provision.rs", 7),
     ("routes/admin.rs", 10),
     ("routes/agents.rs", 5),
-    ("routes/bootstrap.rs", 17),
+    ("routes/bootstrap.rs", 15),
     ("routes/cluster.rs", 39),
     ("routes/communication.rs", 11),
     ("routes/core.rs", 3),
