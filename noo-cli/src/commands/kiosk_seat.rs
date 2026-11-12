@@ -1734,7 +1734,7 @@ pub(crate) enum BundleFetch {
 /// Anything that is not 64 hex is not sent.
 pub(crate) fn if_none_match(last_applied_sha: Option<&str>) -> Option<String> {
     last_applied_sha
-        .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .filter(|s| !s.is_empty())
         .map(|s| format!("\"{s}\""))
 }
 
