@@ -206,6 +206,41 @@ def test_the_state_root_wins_as_in_the_compose_declaration(tmp_path: Path) -> No
     assert any(f"device={tmp_path}/state/noo-data " in c for c in calls if c.startswith("volume create")), calls
 
 
+def test_a_data_root_only_in_dotenv_creates_the_volume(tmp_path: Path) -> None:
+    """The fresh-install case (rc.1 install matrix, 11-12): onboard's storage
+    step wrote NOO_DATA_ROOT to .env AFTER `noo onboard` had loaded .env, so the
+    launcher's environment never carried it. compose reads .env; so must we."""
+    root = tmp_path / "data"
+    (root / "noo-data").mkdir(parents=True)
+    (tmp_path / ".env").write_text(f"NOO_SECRETS_BACKEND=sops\nNOO_DATA_ROOT={root}\n")
+    r, calls = _ensure(tmp_path, exists=False)
+    assert r.returncode == 0, r.stderr
+    assert "NOO_DATA_ROOT is not set" not in r.stderr, r.stderr
+    create = [c for c in calls if c.startswith("volume create")]
+    assert len(create) == 1 and f"--opt device={root}/noo-data " in create[0], calls
+
+
+def test_dotenv_resolves_like_compose_state_root_first_and_the_environment_wins(tmp_path: Path) -> None:
+    a, b = tmp_path / "a", tmp_path / "b"
+    for d in (a / "data", a / "state", b / "data", b / "envroot"):
+        (d / "noo-data").mkdir(parents=True)
+    (a / ".env").write_text(f"NOO_DATA_ROOT={a}/data\nNOO_STATE_ROOT={a}/state\n")
+    r, calls = _ensure(a, exists=False)
+    assert r.returncode == 0, r.stderr
+    assert any(f"device={a}/state/noo-data " in c for c in calls if c.startswith("volume create")), calls
+    (b / ".env").write_text(f"NOO_DATA_ROOT={b}/data\n")
+    r, calls = _ensure(b, exists=False, NOO_DATA_ROOT=str(b / "envroot"))
+    assert r.returncode == 0, r.stderr
+    assert any(f"device={b}/envroot/noo-data " in c for c in calls if c.startswith("volume create")), calls
+
+
+def test_a_present_volume_bound_to_the_dotenv_root_is_not_called_unbound(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text(f"NOO_DATA_ROOT={tmp_path}/data\n")
+    r, _ = _ensure(tmp_path, exists=True, device=f"{tmp_path}/data/noo-data")
+    assert r.returncode == 0, r.stderr
+    assert "NOT bound" not in r.stderr, r.stderr
+
+
 def test_no_data_root_refuses_and_nothing_creates_the_volume(tmp_path: Path) -> None:
     r, calls = _ensure(tmp_path, exists=False)
     assert r.returncode == 1

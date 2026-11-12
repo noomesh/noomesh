@@ -218,7 +218,14 @@ NOO_GATEWAY_DATA_DIRS="ingest audit-archive"
 # The directory compose binds noo-data to (docker-compose.cluster.yml:
 # device ${NOO_STATE_ROOT:-${NOO_DATA_ROOT}}/noo-data). Empty when neither is set.
 noo_data_device() {
-    local root="${NOO_STATE_ROOT:-${NOO_DATA_ROOT:-}}"
+    # The SHARED resolver (environment, then .env), as compose resolves the
+    # volume's device. Reading the environment alone failed every fresh
+    # install (rc.1 matrix, 11-12): `noo onboard` loaded .env at start, its
+    # storage step then wrote NOO_DATA_ROOT to .env, and the launcher it ran
+    # inherited an environment without it. compose read .env and would have
+    # found it; this refused first.
+    local root
+    root="$(noo_state_root)"
     [ -n "$root" ] && printf '%s/noo-data\n' "$root"
 }
 
