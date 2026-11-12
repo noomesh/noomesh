@@ -7434,7 +7434,7 @@ const TIMINGS_LISTED: usize = 15;
 
 fn slowest(laps: &[(String, Duration)]) -> (Vec<(String, u128)>, usize) {
     let mut v: Vec<(String, u128)> = laps.iter().map(|(n, d)| (n.clone(), d.as_millis())).collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.sort_by_key(|x| std::cmp::Reverse(x.1));
     let shown: Vec<(String, u128)> = v.iter().filter(|(_, ms)| *ms >= TIMING_FLOOR_MS).take(TIMINGS_LISTED).cloned().collect();
     let rest = v.len() - shown.len();
     (shown, rest)
