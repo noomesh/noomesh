@@ -1232,7 +1232,7 @@ const GROUP_DESC: &[(&str, &str)] = &[
     ("usage", "Token-usage summary"),
     ("bundle", "Signed bundle inspection"),
     ("health", "Gateway health probe"),
-    ("offboard", "Tear a standalone controller down to bare machine prep (confirms each step)"),
+    ("offboard", "Leave the fleet: stop the agent, remove enrollment state (confirms)"),
     ("systems", "Enable/disable optional systems (mints their secrets into sops)"),
     ("upgrade", "Self-update the CLI; --stack/--nodes/--controller roll the rest"),
     ("addons", "Which add-ons this install runs — the `addons:` map, without opening the file"),

@@ -2167,9 +2167,8 @@ pub(crate) fn tailnet_kept_note(name: &str, dismantled: bool) -> String {
     if !dismantled {
         return "device record kept in the tailnet: the teardown was not confirmed".to_string();
     }
-    format!("device record KEPT in the tailnet (declined, or no TTY to ask): the next enroll registers as \
-             {name}-1. `--purge-tailscale` (or `--factory`) on teardown-node deletes it; for this one, \
-             remove {name} in the Tailscale admin console")
+    let _ = name;
+    "device left in tailnet (declined / non-interactive; --purge-tailscale forces it)".to_string()
 }
 
 fn ask_yn(prompt: &str) -> bool {

@@ -894,20 +894,6 @@ pub fn mesh_clean(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     }
 
-    // i677a 3d: a deep clean with no data root is refused HERE, before docker
-    // is asked, the confirm, and the self-heal daemons are stopped. The script
-    // refuses too, but by then this wrapper had already stopped them, so its
-    // "nothing was changed" was false.
-    if deep {
-        let env_val = std::env::var("NOO_DATA_ROOT").ok();
-        let dotenv = std::fs::read_to_string(crate::envfile::repo_root().join(".env")).ok();
-        if deep_clean_data_root(env_val.as_deref(), dotenv.as_deref()).is_none() {
-            println!("{}", ui::note("set NOO_DATA_ROOT to this install's data root, then re-run --deep"));
-            ui::close_failed(DEEP_NO_DATA_ROOT, None);
-            return Ok(1);
-        }
-    }
-
     // i677 #20: docker must ANSWER before anything is asked, stopped or removed
     // (the relaunch, i677 #10, runs BEFORE the confirm, so it is asked once,
     // in the relaunched child). A
@@ -937,6 +923,20 @@ pub fn mesh_clean(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         super::offboard::stop_self_heal_daemons(all || deep);
         if !g.json {
             ui::done(&format!("self-heal daemons stopped{}", if all || deep { " + watcher unit removed" } else { "" }));
+        }
+    }
+
+    // i677a 3d: a deep clean with no data root is refused HERE, before docker
+    // is asked, the confirm, and the self-heal daemons are stopped. The script
+    // refuses too, but by then this wrapper had already stopped them, so its
+    // "nothing was changed" was false.
+    if deep {
+        let env_val = std::env::var("NOO_DATA_ROOT").ok();
+        let dotenv = std::fs::read_to_string(crate::envfile::repo_root().join(".env")).ok();
+        if deep_clean_data_root(env_val.as_deref(), dotenv.as_deref()).is_none() {
+            println!("{}", ui::note("set NOO_DATA_ROOT to this install's data root, then re-run --deep"));
+            ui::close_failed(DEEP_NO_DATA_ROOT, None);
+            return Ok(1);
         }
     }
 

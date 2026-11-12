@@ -60,7 +60,7 @@ pub(crate) fn stop_self_heal_daemons(remove_unit: bool) {
 /// is `/etc/systemd/system/noo-hostd.service`, removed by the offboard walk).
 pub(crate) fn self_heal_user_units(home: &Path) -> [PathBuf; 2] {
     let dir = home.join(".config/systemd/user");
-    [dir.join("noo-host-watcher.service"), dir.join("noo-hostd.service")]
+    [dir.join("noo-host-watcher.service"), dir.join("noo-host-watcher.service")]
 }
 
 /// Delete both user units (i677a 3c: the hostd one used to be stopped but
