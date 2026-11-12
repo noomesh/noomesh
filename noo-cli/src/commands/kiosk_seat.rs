@@ -1744,9 +1744,7 @@ pub(crate) fn if_none_match(last_applied_sha: Option<&str>) -> Option<String> {
 /// the caller's sha comparison still catches an unchanged blob then.
 pub(crate) fn fetch_bundle(agent: &ureq::Agent, url: &str, proof: &str, last_applied_sha: Option<&str>) -> BundleFetch {
     let mut req = agent.get(url).header("x-noo-birth-proof", proof);
-    if let Some(tag) = if_none_match(last_applied_sha) {
-        req = req.header("if-none-match", &tag);
-    }
+    let _ = if_none_match(last_applied_sha);
     match req.call() {
         Ok(mut r) if r.status().as_u16() == 200 => {
             use std::io::Read as _;
