@@ -3997,8 +3997,6 @@ fn gateway_holds_cli_asset(g: &Globals, name: &str, sha: &str) -> bool {
 /// and upload it to the gateway.
 fn upload_cli_assets(g: &Globals, toks: &[serde_json::Value]) {
     let root = crate::envfile::repo_root();
-    let cache = crate::commands::provision::cli_asset_cache_dir(&root);
-    let _ = std::fs::create_dir_all(&cache);
     let version = env!("CARGO_PKG_VERSION").to_string();
     let platforms = asset_platforms(toks, std::env::consts::OS, std::env::consts::ARCH);
     let mut assets: Vec<String> = platforms
@@ -4035,23 +4033,24 @@ fn upload_cli_assets(g: &Globals, toks: &[serde_json::Value]) {
         v.dedup();
         v
     };
-    for name in gateway_assets.iter().chain(hostd_assets.iter()) {
-        let path = cache.join(name);
-        if std::fs::read(&path).ok().filter(|b| !b.is_empty()).is_some() {
+    // Every fill goes through the provision gate (i688): a cached copy is
+    // kept only if its sha256 is in the signed manifest, a download is cached
+    // only after it matches. "Not in release" is said only when the signed
+    // manifest does not list the asset.
+    let manifest = crate::commands::provision::verified_release_manifest(g, &root);
+    if let Err(e) = &manifest {
+        ui::warned(&format!("release assets not cached or uploaded: {e}"));
+    }
+    let release_assets: &[String] = if manifest.is_ok() { &assets } else { &[] };
+    let listed = |name: &str| manifest.as_ref().ok()
+        .and_then(|(m, _)| crate::release_sig::manifest_sha_for(m, name)).is_some();
+    for name in gateway_assets.iter().chain(hostd_assets.iter()).filter(|_| manifest.is_ok()) {
+        if !listed(name) {
+            if !g.json { println!("{}", ui::note(&format!("{name}: not in release {version} — bundles carry no harness or helper for that platform"))); }
             continue;
         }
-        match fetch_release_file(g, &version, name, None) {
-            Ok(b) => {
-                let _ = std::fs::write(&path, &b);
-                if !g.json { println!("{}", ui::note(&format!("{name}: cached for the rail ({} bytes)", b.len()))); }
-            }
-            // "not in release" only when it is not; any other
-            // failure is said as itself, so a GitHub blip is not mistaken
-            // for a release without the asset.
-            Err(e) if e.is_not_found() => {
-                if !g.json { println!("{}", ui::note(&format!("{name}: not in release {version} ({}) — bundles carry no harness or helper for that platform", e.summary()))); }
-            }
-            Err(e) => ui::warned(&format!("{name}: not fetched ({e}) — bundles carry no harness or helper for that platform until a re-run fetches it")),
+        if let Err(e) = crate::commands::provision::cached_release_asset(g, &root, name) {
+            ui::warned(&format!("{name}: not fetched ({e}) — bundles carry no harness or helper for that platform until a re-run fetches it"));
         }
     }
     // Assets the gateway already holds at the same sha256: not re-sent, and
@@ -4060,15 +4059,11 @@ fn upload_cli_assets(g: &Globals, toks: &[serde_json::Value]) {
     // The signed manifest rides along: without it a node treats this mirror
     // as an old controller and goes to GitHub instead.
     let m = crate::release_sig::MANIFEST;
-    for name in [m.to_string(), format!("{m}.sig")] {
-        let path = cache.join(&name);
-        let bytes = match std::fs::read(&path).ok().filter(|b| !b.is_empty()) {
-            Some(b) => b,
-            None => match fetch_release_file(g, &version, &name, None) {
-                Ok(b) => { let _ = std::fs::write(&path, &b); b }
-                Err(e) => { ui::warned(&format!("{name}: not fetched ({e}) — nodes will verify against GitHub instead")); continue; }
-            },
-        };
+    let signed: Vec<(String, Vec<u8>)> = match &manifest {
+        Ok((man, sig)) => vec![(m.to_string(), man.clone().into_bytes()), (format!("{m}.sig"), sig.clone().into_bytes())],
+        Err(_) => Vec::new(),
+    };
+    for (name, bytes) in signed {
         let sha = { use sha2::{Digest, Sha256}; hex::encode(Sha256::digest(&bytes)) };
         if gateway_holds_cli_asset(g, &name, &sha) {
             already_held.push(name.clone());
@@ -4092,22 +4087,14 @@ fn upload_cli_assets(g: &Globals, toks: &[serde_json::Value]) {
         }
     }
     let mut uploaded: Vec<String> = Vec::new();
-    for asset in assets {
-        let path = cache.join(&asset);
-        let have = std::fs::read(&path).ok().filter(|b| !b.is_empty());
-        let bytes = match have {
-            Some(b) => b,
-            None => match download_asset(g, &version, &asset, None) {
-                Ok((bin, sha)) => {
-                    let _ = std::fs::write(&path, &bin);
-                    let _ = std::fs::write(cache.join(format!("{asset}.sha256")), &sha);
-                    bin
-                }
-                Err(e) => {
-                    ui::warned(&format!("{asset}: not fetched ({e}) — nodes on that platform keep their CLI"));
-                    continue;
-                }
-            },
+    for asset in release_assets {
+        let asset = asset.clone();
+        let bytes = match crate::commands::provision::cached_release_asset(g, &root, &asset) {
+            Ok(b) => b,
+            Err(e) => {
+                ui::warned(&format!("{asset}: not fetched ({e}) — nodes on that platform keep their CLI"));
+                continue;
+            }
         };
         let sha = {
             use sha2::{Digest, Sha256};
