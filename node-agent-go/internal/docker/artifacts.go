@@ -169,6 +169,22 @@ func (c *Client) PullImageArtifact(ctx context.Context, ref, controllerImageID, 
 	}
 	sha := m.SHA256
 
+	// i675 F4: the manifest vouches for an image ID (its image_id, or the
+	// ID this node loaded from a tar of this sha256 before). When the node
+	// already holds that ID under another tag (a roll that re-tagged the
+	// same digest), name it ref and move no tar. Skipped by VERIFIED ID
+	// only: the daemon computes an image ID from its content, so a local
+	// image cannot claim one it is not.
+	if c.docker != nil && (controllerImageID == "" || sameImageID(controllerImageID, m.ImageID)) {
+		if id, ok := retagVouched(ctx, dockerImageStore{c}, ref, m); ok {
+			slog.Info("image.retagged_by_id: the staged image is already here under another tag; tagged, nothing fetched",
+				"image", ref, "id", shortImageID(id), "tar", tarName)
+			out := &PullImageArtifactResult{Status: "up_to_date", Image: ref, Tar: tarName, Arch: arch}
+			c.removeAfterLoad(ctx, removeContainer, out)
+			return out, nil
+		}
+	}
+
 	if err := os.MkdirAll(stagingDir(), 0o755); err != nil {
 		return nil, fmt.Errorf("staging dir: %w", err)
 	}
@@ -443,4 +459,35 @@ func drainToString(r interface{ Read([]byte) (int, error) }) string {
 			return b.String()
 		}
 	}
+}
+
+// retagVouched: if an image ID the manifest vouches for (m.ImageID, or
+// railImageFor(m.SHA256)) is present on this node at this node's arch, tag
+// it as ref and confirm ref now names it. False (nothing changed that
+// matters) when none is present, the arch differs, or the tag does not take.
+func retagVouched(ctx context.Context, st imageStore, ref string, m *artifactManifest) (string, bool) {
+	if m == nil {
+		return "", false
+	}
+	for _, want := range []string{m.ImageID, railImageFor(m.SHA256)} {
+		if want == "" {
+			continue
+		}
+		id, arch, err := st.inspect(ctx, want)
+		if err != nil || !sameImageID(id, want) {
+			continue
+		}
+		if arch != "" && arch != runtime.GOARCH {
+			continue
+		}
+		if err := st.tag(ctx, id, ref); err != nil {
+			slog.Warn("image.retag_failed: fetching the tar instead", "image", ref, "id", shortImageID(id), "err", err)
+			return "", false
+		}
+		if got, _, err := st.inspect(ctx, ref); err != nil || !sameImageID(got, id) {
+			return "", false
+		}
+		return id, true
+	}
+	return "", false
 }
