@@ -126,7 +126,34 @@ def test_every_host_change_is_listed_and_no_packet_can_reach_a_file():
     assert code.count("modprobe nf_conntrack") == 1, "no other module is loaded"
     # The packet path: tcpdump to stdout, piped to the parser, both stderrs discarded,
     # and the parser's one file is names.tsv.
-    m = re.search(r"tcpdump -i any -nn -U -s 512 -w - \\\n[^\n]*2>/dev/null \\\n\s+\| python3 -u -c \"\$NAMES_PARSER\" \"\$OUT/names.tsv\" 2>/dev/null &", code)
+    m = re.search(r"tcpdump -i any -nn -U -s 512 -w - \\\n[^\n]*2>/dev/null \\\n\s+> >\(python3 -u -c \"\$NAMES_PARSER\" \"\$OUT/names.tsv\" 2>/dev/null\) &\nPIDS\+=\(\$!\)", code)
     assert m, "the capture must be one pipe from tcpdump's stdout into the parser"
     parser = src[src.index("NAMES_PARSER=\"$(cat <<'PY'\n"):src.index("\nPY\n)\"\n")]
     assert parser.count("open(") == 1 and "open(sys.argv[1], \"a\"" in parser, "the parser opens names.tsv and nothing else"
+
+
+def test_a_reused_address_is_credited_to_whoever_held_it_when_the_flow_started(tmp_path):
+    # Docker reuses container addresses on recreate: "last seen wins" credited
+    # noo-tempo with the Ollama model pull in a rehearsal.
+    out = tmp_path / "out"
+    shutil.copytree(FIXTURES, out)
+    (out / "containers.tsv").write_text(
+        "1731359990\t/noo-ollama\t172.17.0.2 \n"
+        "1731360005\t/noo-tempo\t172.17.0.2 \n")
+    ev = (out / "conntrack.events").read_text()
+    ev += ("[1731360010.1]\t    [NEW] ipv4     2 tcp      6 120 SYN_SENT src=172.17.0.2 dst=198.51.100.77 sport=40009 dport=443 "
+           "[UNREPLIED] src=198.51.100.77 dst=10.0.0.5 sport=443 dport=40009 id=9\n")
+    (out / "conntrack.events").write_text(ev)
+    run = subprocess.run(["bash", str(SCRIPT), "--report-only", "--out", str(out)], capture_output=True, text=True, timeout=60)
+    assert run.returncode == 0, run.stderr
+    rows = {r.split("\t")[2]: r.split("\t")[0] for r in (out / "egress.tsv").read_text().splitlines()[1:]}
+    assert rows["198.51.100.34"] == "container:noo-ollama", "started at 1731360000, while noo-ollama held the address"
+    assert rows["198.51.100.77"] == "container:noo-tempo", "started at 1731360010, after noo-tempo took it"
+
+
+def test_cleanup_never_waits_unbounded():
+    # A bare `wait` blocked forever on a child the PID list did not hold.
+    code = "\n".join(line for line in SCRIPT.read_text().splitlines() if not line.lstrip().startswith("#"))
+    body = code[code.index("cleanup() {"):code.index("\n}\n", code.index("cleanup() {"))]
+    assert not re.search(r"^\s*wait(\s|$)", body, re.M), "no bare wait in cleanup"
+    assert "kill -KILL" in body and "for _ in $(seq 1 50)" in body

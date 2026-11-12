@@ -16,9 +16,9 @@
 #                     the server name (SNI) of each TLS connection. The packets
 #                     these come from are parsed in memory and dropped; only
 #                     the name and the address are written.
-#   sockets.tsv       once a second, which process owns each open internet
+#   sockets.tsv       five times a second, which process owns each open internet
 #                     socket (ss -tunp): process name and pid.
-#   containers.tsv    every 5 s, each running Docker container's name and IP
+#   containers.tsv    every 2 s, each running Docker container's name and IP
 #                     (when Docker is installed), so a container's connection
 #                     is named by its container.
 #   egress.tsv, egress.md
@@ -50,8 +50,8 @@
 #     program's ordinary request and its telemetry to the same host look alike;
 #   - anything that did not happen while it ran: a reporter on a 24-hour timer
 #     shows up only if the capture spans its moment;
-#   - a process's connection that opened and closed between two 1 s socket
-#     polls is still listed (the kernel saw it) but as "unattributed";
+#   - a process's connection that opened and closed between two socket polls
+#     (0.2 s apart) is still listed (the kernel saw it) but as "unattributed";
 #   - the TLS server name over IPv6, and under Encrypted ClientHello; the DNS
 #     answer usually names the address anyway, and an address with no name is
 #     listed by address;
@@ -59,7 +59,9 @@
 #     not in a container; Docker containers on this host ARE seen).
 #
 # Options:
-#   --minutes N      how long to capture (default 10); Ctrl-C ends it early.
+#   --minutes N      how long to capture (default 10); Ctrl-C ends it early, and so
+#                    does `kill -TERM <pid>` (a script that started this as a
+#                    BACKGROUND job must use TERM: such a job ignores INT).
 #   --out DIR        where to write; required; created if absent, must be empty.
 #   --classify FILE  optional: a TSV of "who-regex<TAB>destination-regex<TAB>class<TAB>why"
 #                    lines, the destination being "<host>:<port>" (host is
@@ -111,13 +113,34 @@ for line in read("names.tsv"):
     if len(f) >= 4 and f[3]:
         names[f[3]].add(f[2])
 
-# containers: ip -> name (last seen wins)
-ctr = {}
+# containers: ip -> [(time, name)] from every docker snapshot. A flow goes to
+# the container that held its source address when the flow STARTED: addresses
+# are reused when containers are recreated, so "last seen" credited one
+# container with another's traffic (a rehearsal blamed noo-tempo for the
+# Ollama model pull).
+ctr_hist = collections.defaultdict(list)
 for line in read("containers.tsv"):
     f = line.split("\t")
     if len(f) >= 3:
+        try:
+            t = int(f[0])
+        except ValueError:
+            continue
         for ip in f[2].split():
-            ctr[ip] = "container:" + f[1].lstrip("/")
+            ctr_hist[ip].append((t, "container:" + f[1].lstrip("/")))
+for _h in ctr_hist.values():
+    _h.sort()
+
+def ctr_at(ip, ts):
+    h = ctr_hist.get(ip)
+    if not h:
+        return None
+    holder = h[0][1]  # before the first snapshot: its first known holder
+    for t, n in h:
+        if t > ts:
+            break
+        holder = n
+    return holder
 
 # sockets: (proto, lport, rip, rport) -> process
 sock = {}
@@ -153,8 +176,9 @@ for line in read("conntrack.events") + read("conntrack.final"):
         fl["out"], fl["in"] = max(fl["out"], by[0]), max(fl["in"], by[1])
 
 def who(fl):
-    if fl["src"] in ctr:
-        return ctr[fl["src"]]
+    c = ctr_at(fl["src"], fl["first"])
+    if c:
+        return c
     p = sock.get((fl["proto"], fl["sport"], fl["dst"], fl["dport"]))
     if p:
         return "process:" + p
@@ -218,7 +242,15 @@ ACCT_WAS="$(cat "$SYSCTL")"
 PIDS=()
 cleanup() {
     for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
-    wait 2>/dev/null || true
+    # Bounded: never a bare `wait`, which blocks on any child this list does not
+    # hold (a rehearsal saw it hang). Up to 5 s for them to go, then KILL.
+    for _ in $(seq 1 50); do
+        _alive=0
+        for p in "${PIDS[@]}"; do kill -0 "$p" 2>/dev/null && _alive=1; done
+        [ "$_alive" = 0 ] && break
+        sleep 0.1
+    done
+    for p in "${PIDS[@]}"; do kill -KILL "$p" 2>/dev/null || true; done
     conntrack -L -o extended,id 2>/dev/null | sed "s/^/[$(date +%s).0] /" > "$OUT/conntrack.final" || true
     echo "$ACCT_WAS" > "$SYSCTL" 2>/dev/null || true
     echo "egress-capture: stopped; nf_conntrack_acct restored to $ACCT_WAS"
@@ -299,9 +331,11 @@ PY
 )"
 # Names: DNS answers and TLS ClientHello server names, parsed from a packet
 # stream that is never written; only (time, kind, name, address) is kept.
+# The parser reads tcpdump's stdout through a process substitution (a pipe),
+# so $! is tcpdump's own pid and cleanup can stop it; the parser ends at EOF.
 tcpdump -i any -nn -U -s 512 -w - \
     'udp port 53 or (tcp and (tcp[((tcp[12:1] & 0xf0) >> 2):1] = 0x16) and (tcp[((tcp[12:1] & 0xf0) >> 2) + 5:1] = 0x01))' 2>/dev/null \
-  | python3 -u -c "$NAMES_PARSER" "$OUT/names.tsv" 2>/dev/null &
+    > >(python3 -u -c "$NAMES_PARSER" "$OUT/names.tsv" 2>/dev/null) &
 PIDS+=($!)
 
 # Who owns each internet socket, once a second (process name and pid only).
@@ -312,7 +346,7 @@ PIDS+=($!)
           gsub(/^\[|\]$/, "", rip); lport=l[nl];
           p=""; if (match($0, /users:\(\("[^"]+",pid=[0-9]+/)) { p=substr($0, RSTART+9, RLENGTH-9); sub(/",pid=/, " pid ", p) }
           print t "\t" proto "\t" lport "\t" rip "\t" rport "\t" p }' >> "$OUT/sockets.tsv"
-    sleep 1
+    sleep 0.2
   done ) &
 PIDS+=($!)
 
@@ -321,13 +355,13 @@ if command -v docker >/dev/null 2>&1; then
         now="$(date +%s)"
         docker ps -q 2>/dev/null | xargs -r docker inspect -f '{{.Name}}	{{range .NetworkSettings.Networks}}{{.IPAddress}} {{.GlobalIPv6Address}} {{end}}' 2>/dev/null \
           | sed "s/^/$now	/" >> "$OUT/containers.tsv"
-        sleep 5
+        sleep 2
       done ) &
     PIDS+=($!)
 fi
 
 echo "egress-capture: capturing for $MINUTES minute(s) into $OUT (Ctrl-C to stop early)"
-# In the background and waited on: a trapped INT/TERM (Ctrl-C, or `kill -INT`
+# In the background and waited on: a trapped INT/TERM (Ctrl-C, or `kill -TERM`
 # from a script that started this one) interrupts `wait` at once, where a
 # foreground sleep would hold the stop, the report and the restore until it ended.
 sleep "$((MINUTES * 60))" &
