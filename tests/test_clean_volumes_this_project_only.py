@@ -64,12 +64,12 @@ def test_the_plan_keeps_models_and_asks_for_stateful_volumes_only_on_deep(tmp_pa
     out, _ = _run(tmp_path, f"plan_volumes false {vols}")
     assert out.splitlines() == [
         "keep noomesh_hf-cache", "keep noomesh_postgres-data", "keep noomesh_redis-data",
-        "remove noomesh_noo-data", "remove noomesh_nats",
-    ]
+        "keep noomesh_noo-data", "remove noomesh_nats",
+    ], "noo-data is stateful (i677 #20): never in the bulk removal"
     out, _ = _run(tmp_path, f"plan_volumes true {vols}")
     assert out.splitlines() == [
         "keep noomesh_hf-cache", "ask noomesh_postgres-data", "ask noomesh_redis-data",
-        "remove noomesh_noo-data", "remove noomesh_nats",
+        "ask noomesh_noo-data", "remove noomesh_nats",
     ], "on --deep the stateful volumes are ASKED one by one, never in the bulk removal"
 
 
@@ -153,11 +153,11 @@ def test_an_existing_installs_unlabelled_noo_data_is_in_the_plan_once(tmp_path):
     every existing install it has no project label. It is planned by its exact
     name, beside the labelled ones; a labelled one is not listed twice."""
     assert _field_plan(tmp_path, "") == [
-        "keep noomesh_postgres-data", "remove noomesh_nats", "remove noomesh_noo-data",
+        "keep noomesh_postgres-data", "remove noomesh_nats", "keep noomesh_noo-data",
     ]
     (tmp_path / "b").mkdir()
     assert _field_plan(tmp_path / "b", "noomesh") == [
-        "keep noomesh_postgres-data", "remove noomesh_nats", "remove noomesh_noo-data",
+        "keep noomesh_postgres-data", "remove noomesh_nats", "keep noomesh_noo-data",
     ]
 
 

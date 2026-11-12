@@ -717,6 +717,23 @@ pub fn mesh_stop(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     }
     if volumes {
+        // Name what `down -v` will delete BEFORE the prompt (or -y): a removal
+        // of volumes that hold data is only ever one the user saw by name
+        // (i677 #20). A docker that does not answer is refused, never read
+        // as "no volumes".
+        let project = crate::envfile::compose_project();
+        match super::offboard::docker_access().and_then(|_| super::offboard::stack_volumes(&project)) {
+            Ok(v) if v.is_empty() => eprintln!("no volumes of compose project {project} on this host"),
+            Ok(v) => eprintln!("this deletes {} volume(s) of compose project {project}: {}", v.len(), v.join(", ")),
+            Err(why) => {
+                let lines = super::offboard::docker_unreachable_refusal(&why, "noo stack stop --volumes");
+                for l in &lines[1..] {
+                    println!("{}", ui::note(l));
+                }
+                ui::close_failed(&lines[0], Some("docker ps"));
+                return Ok(1);
+            }
+        }
         confirm_stop_volumes(g, yes);
     }
     let script_args: Vec<String> = if volumes { vec!["-v".into()] } else { Vec::new() };
