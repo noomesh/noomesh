@@ -98,7 +98,13 @@ def test_no_final_resolves_nothing() -> None:
 
 
 def test_both_lanes_go_through_the_picker() -> None:
+    # The two LISTING lanes (gh, public API) live in latest_from_api since
+    # 2026-11-12; the default lane is the releases/latest redirect, which
+    # only ever names a final (only finals are created --latest) and is
+    # held to `noo-cli-v*` (tests/test_install_sh_latest_no_api.py).
     text = INSTALL.read_text()
+    fn = text[text.index("latest_from_api() {"):text.index("\n}\n", text.index("latest_from_api() {"))]
+    assert fn.count("| pick_cli_tag") == 2, fn
+    assert "--jq '.[].tag_name'" not in fn
     block = text[text.index('info "Resolving latest noo-cli release..."'):text.index('bin_url="${GITHUB_DL}')]
-    assert block.count("| pick_cli_tag") == 2, block
-    assert "--jq '.[].tag_name'" not in block
+    assert "gh api" not in block and "fetch " not in block, "no listing lane outside latest_from_api"
