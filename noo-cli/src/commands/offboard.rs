@@ -956,7 +956,7 @@ fn audit_leftovers(g: &Globals, print: bool) -> Vec<String> {
 
 /// This install's Docker volumes, by name: the ones offboard deletes and the
 /// ones its audit (`--check`, and the walk's own Verify) must not find.
-fn stack_volumes(project: &str) -> Result<Vec<String>, String> {
+pub(crate) fn stack_volumes(project: &str) -> Result<Vec<String>, String> {
     docker_list(&["volume", "ls", "--format", "{{.Name}}\t{{.Labels}}"]).map(|l| select_stack_volumes(&l, project))
 }
 
