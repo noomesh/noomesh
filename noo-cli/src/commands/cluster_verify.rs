@@ -378,7 +378,11 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
 
     // 6e. Shared GPU: the node yielded (or was held off) its GPU for work
     //     outside noomesh. A warn by design, never a failure.
-    out.extend(gpu_contention_check_at(n, now_unix));
+    out.extend(gpu_contention_check_with(
+        n,
+        now_unix,
+        gpu_probe_failing_secs(std::env::var(GPU_PROBE_FAILING_ENV).ok().as_deref()),
+    ));
 
     // 6e'. Lanes (proposal i403): what the class table routes on this node,
     //      by the agent's lane states.
@@ -496,6 +500,15 @@ pub(crate) fn harness_tasks_check(n: &Value) -> Option<Check> {
 
 /// A probe that has not answered for longer than this is no longer a blip.
 const GPU_PROBE_FAILING_SECS: i64 = 60;
+/// Rehearsal/test-stack env override of [`GPU_PROBE_FAILING_SECS`], in whole
+/// seconds. Shipped installs never set it.
+const GPU_PROBE_FAILING_ENV: &str = "NOO_VERIFY_GPU_PROBE_FAILING_S";
+
+/// The probe-failing threshold for a raw [`GPU_PROBE_FAILING_ENV`] (None =
+/// unset). Blank, non-numeric, zero or negative keeps the default.
+fn gpu_probe_failing_secs(env: Option<&str>) -> i64 {
+    env.and_then(|v| v.trim().parse::<i64>().ok()).filter(|n| *n > 0).unwrap_or(GPU_PROBE_FAILING_SECS)
+}
 
 /// The `lanes` row (proposal i403, Phase 3): the agent's lanes as the
 /// gateway's class table reads them from the node record. A chat lane the
@@ -560,7 +573,14 @@ pub(crate) fn lanes_check(n: &Value) -> Check {
 /// WARNs, never FAILs. No row from an agent that does not report it. Takes
 /// the clock, so a hold's row can say how long it has lasted (a `now` of 0
 /// says nothing about age).
+#[cfg(test)]
 pub(crate) fn gpu_contention_check_at(n: &Value, now_unix: i64) -> Option<Check> {
+    gpu_contention_check_with(n, now_unix, GPU_PROBE_FAILING_SECS)
+}
+
+/// [`gpu_contention_check_at`] with the probe-failing threshold passed in
+/// (the caller resolves `NOO_VERIFY_GPU_PROBE_FAILING_S`).
+fn gpu_contention_check_with(n: &Value, now_unix: i64, probe_failing_secs: i64) -> Option<Check> {
     let id = n["id"].as_str().unwrap_or("?");
     let gc = n.get("gpu_contention").filter(|v| v.is_object())?;
     let gb = |k: &str| gc[k].as_f64().unwrap_or(0.0) / 1024.0;
@@ -582,7 +602,7 @@ pub(crate) fn gpu_contention_check_at(n: &Value, now_unix: i64) -> Option<Check>
                     format!("the NVIDIA driver lost the GPU (nvidia-smi: {detail}) — GPU backends cannot start"),
                     format!("reboot {id}; the kernel log names the fault: journalctl -k | grep -i xid"))
             }
-            Some("probe-timeout") if gc["unmeasured_for_s"].as_i64().unwrap_or(0) > GPU_PROBE_FAILING_SECS => warn("gpu",
+            Some("probe-timeout") if gc["unmeasured_for_s"].as_i64().unwrap_or(0) > probe_failing_secs => warn("gpu",
                 format!("nvidia-smi has not answered for {} — a Windows program is likely using the GPU (WSL2), or the driver is stuck; the agent yields the GPU backends when this persists",
                     compact_secs(gc["unmeasured_for_s"].as_i64().unwrap_or(0))),
                 None),
@@ -12412,6 +12432,28 @@ mod gpu_contention_tests {
             "state": "free", "method": "not-measured", "unmeasured": "probe-timeout", "paused_backends": []}))).unwrap();
         assert_eq!(old.verdict, Verdict::Warn);
         assert_eq!(old.detail, short.detail);
+    }
+
+    #[test]
+    fn the_gpu_probe_threshold_is_a_minute_unless_the_rehearsal_sets_it() {
+        assert_eq!(GPU_PROBE_FAILING_SECS, 60);
+        assert_eq!(gpu_probe_failing_secs(None), 60);
+        for bad in ["", "  ", "abc", "1.5", "0", "-5"] {
+            assert_eq!(gpu_probe_failing_secs(Some(bad)), 60, "{bad:?} keeps the default");
+        }
+        assert_eq!(gpu_probe_failing_secs(Some("10")), 10);
+        assert_eq!(gpu_probe_failing_secs(Some(" 15 ")), 15);
+    }
+
+    #[test]
+    fn a_shorter_probe_threshold_warns_sooner_and_leaves_the_default_row_alone() {
+        let gc = node(serde_json::json!({
+            "state": "free", "method": "not-measured", "unmeasured": "probe-timeout",
+            "unmeasured_for_s": 20, "paused_backends": []}));
+        let short = gpu_contention_check_with(&gc, 0, 10).unwrap();
+        assert!(short.detail.contains("a Windows program is likely using the GPU"), "{}", short.detail);
+        let default = gpu_contention_check_with(&gc, 0, gpu_probe_failing_secs(None)).unwrap();
+        assert_eq!(default.detail, "nvidia-smi did not answer in time (GPU saturated or driver slow) — not measured");
     }
 
     #[test]

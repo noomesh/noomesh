@@ -290,6 +290,13 @@ services:
       # every streaming and bulk node call over HTTPS :8081 again. The
       # gateway only sees what this list names (test_tunnel_brake_reaches_the_gateway).
       - NOO_NODE_TUNNEL=${NOO_NODE_TUNNEL:-}
+      # Rehearsal/test-stack timers (docs/reference/env.md): each shortens a
+      # production timer in whole seconds and is empty on a shipped install,
+      # so the gateway keeps its default. The gateway has no env_file; these
+      # reach it only through this list (test_rehearsal_knobs_reach_the_gateway).
+      - NOO_MESH_NODES_TTL_S=${NOO_MESH_NODES_TTL_S:-}
+      - NOO_GATEWAY_HEARTBEAT_INTERVAL_S=${NOO_GATEWAY_HEARTBEAT_INTERVAL_S:-}
+      - NOO_GATEWAY_IDLE_S=${NOO_GATEWAY_IDLE_S:-}
       - DEV_MODE=${DEV_MODE:-}
       # The controller's OWN identity, and it must be stable across container
       # recreates. Without it `agent_messages::controller_node()` falls through
