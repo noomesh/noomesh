@@ -890,7 +890,7 @@ fn obtain_binary(g: &Globals, site: &ProvSite, m: &ProvMachine) -> Vec<u8> {
                 Some("darwin agents build from source — run provision from a checkout"));
         })
     } else {
-        obtain_agent_binary(&root, goarch).unwrap_or_else(|e| {
+        obtain_agent_binary(g, &root, goarch).unwrap_or_else(|e| {
             fail(g.json, ExitCode::Generic, "agent_binary", &e,
                 Some("is docker logged in to the image registry, and NOO_IMAGE_TAG set (noomesh.yaml compose_env / .env)?"));
         })
@@ -3181,7 +3181,7 @@ fn provision_local_in(g: &Globals, node: &str, tier: Option<&str>, root: &Path, 
     let signing_pub = read_or_fail_path(&leaf_ca.signing_pub_path())?;
     let creds = sops_credentials(&root)?;
     nstep(&format!("obtaining noo-node-agent ({goarch})"));
-    let binary = obtain_agent_binary(&root, goarch).map_err(|e| format!(
+    let binary = obtain_agent_binary(g, &root, goarch).map_err(|e| format!(
         "{e} — is docker logged in to the registry, and NOO_IMAGE_TAG set?"))?;
 
     let tmpl = std::fs::read_to_string(root.join("node-agent-go/deploy/noo-node-agent.env.tmpl"))
@@ -3442,7 +3442,35 @@ fn binary_carries_version(bin: &[u8], tag: &str) -> bool {
 /// GHCR node-agent image (no Go, no repo — the standalone path). Fallback:
 /// cross-compile from the source tree when it exists (dev checkouts testing
 /// unreleased agents).
-fn obtain_agent_binary(root: &Path, goarch: &str) -> Result<Vec<u8>, String> {
+/// The node-agent image to take the bundle's agent from (i689(b)): BY DIGEST
+/// from the release-signed stack lock of `tag` — never by tag, which anyone
+/// able to push that tag (or retag locally) decides. A dev install whose
+/// release publishes no lock keeps the tag, with a warning; a dist install
+/// refuses, as `noo upgrade --stack` does. A lock that fails verification
+/// is an error, never a fallback.
+fn agent_image_ref(g: &Globals, root: &Path, prefix: &str, tag: &str) -> Result<String, String> {
+    let mode = super::upgrade::install_mode(root);
+    agent_image_ref_with(prefix, tag, &mode, &mut || super::upgrade::verified_stack_lock(g, tag))
+}
+
+fn agent_image_ref_with(prefix: &str, tag: &str, mode: &str, lock: &mut dyn FnMut() -> Result<Option<String>, String>) -> Result<String, String> {
+    let prefix = prefix.trim_end_matches('/');
+    match lock()? {
+        Some(text) => super::image_stage::parse_lock(&text).into_iter()
+            .find(|r| r.name == "node-agent")
+            .map(|r| format!("{prefix}/node-agent@{}", r.digest))
+            .ok_or_else(|| format!("the signed stack-{tag}.lock pins no node-agent — refusing to take the agent by tag")),
+        None => match super::upgrade::no_lock_refusal(mode, tag) {
+            Some(why) => Err(why),
+            None => {
+                ui::warned(&format!("stack-{tag} publishes no signed lock — the node agent is taken from {prefix}/node-agent:{tag} by tag (dev install)"));
+                Ok(format!("{prefix}/node-agent:{tag}"))
+            }
+        },
+    }
+}
+
+fn obtain_agent_binary(g: &Globals, root: &Path, goarch: &str) -> Result<Vec<u8>, String> {
     // image_tag(), NOT std::env::var — and this is the whole bug.
     //
     // `ensure_repo_env()` loads .env into the PROCESS environment at CLI
@@ -3462,7 +3490,9 @@ fn obtain_agent_binary(root: &Path, goarch: &str) -> Result<Vec<u8>, String> {
     let prefix = image_prefix();
     let tag = image_tag();
     let image_err = if !prefix.is_empty() && !tag.is_empty() {
-        let image = format!("{prefix}/node-agent:{tag}");
+        // i689(b): by the signed lock's digest. A lock that does not verify
+        // (or a dist install with none) stops here: no source-tree fallback.
+        let image = agent_image_ref(g, root, &prefix, &tag)?;
         match extract_from_image(&image, goarch) {
             Ok(b) => {
                 // Compare what came OUT against what was asked for.
@@ -3522,7 +3552,8 @@ fn extract_from_image(image: &str, goarch: &str) -> Result<Vec<u8>, String> {
         other => other,
     };
     let result = extract_from_image_inner(image, goarch);
-    if goarch != host_goarch {
+    // A pull BY DIGEST moves no tag, so there is nothing to restore.
+    if goarch != host_goarch && !image.contains('@') {
         let restored = Command::new("docker")
             .args(["pull", "--platform", &format!("linux/{host_goarch}"), image])
             .stdout(std::process::Stdio::null())
@@ -5038,6 +5069,40 @@ pub(crate) const HARNESS_TLS_KEY: &str = "/run/credentials/noo-harness.service/n
 
 #[cfg(test)]
 mod tests {
+    /// i689(b): the agent comes from the signed lock's node-agent DIGEST.
+    #[test]
+    fn the_agent_image_is_taken_by_the_signed_lock_digest() {
+        let d = format!("sha256:{}", "ab".repeat(32));
+        let lock = format!("# stack v0.6.24\ngateway@sha256:{}\nnode-agent@{d}\n", "cd".repeat(32));
+        let got = super::agent_image_ref_with("ghcr.io/noomesh/", "v0.6.24", "dist", &mut || Ok(Some(lock.clone()))).unwrap();
+        assert_eq!(got, format!("ghcr.io/noomesh/node-agent@{d}"), "not by the signed digest");
+        // A lock that pins no node-agent: refused, never a fall back to the tag.
+        let e = super::agent_image_ref_with("p", "v0.6.24", "", &mut || Ok(Some(format!("gateway@{d}\n")))).expect_err("an unpinned agent was taken by tag");
+        assert!(e.contains("pins no node-agent"), "{e}");
+        // No lock: a dist install refuses; a dev install keeps the tag.
+        let e = super::agent_image_ref_with("p", "v9.9.9", "dist", &mut || Ok(None)).expect_err("dist took an agent with no lock");
+        assert!(e.contains("Nothing was changed"), "{e}");
+        assert_eq!(super::agent_image_ref_with("p", "dev-1", "", &mut || Ok(None)).unwrap(), "p/node-agent:dev-1");
+        // A lock that does not verify is the error itself.
+        let e = super::agent_image_ref_with("p", "v0.6.24", "", &mut || Err("signature does not verify".into())).expect_err("a bad lock was ignored");
+        assert!(e.contains("does not verify"), "{e}");
+    }
+
+    /// obtain_agent_binary asks agent_image_ref (no `node-agent:{tag}` of its
+    /// own), propagates its error before any source fallback, and the
+    /// arch-restore pull is skipped for a digest ref.
+    #[test]
+    fn the_agent_binary_is_never_taken_by_tag_past_the_lock() {
+        let own = crate::test_src::own_code(include_str!("provision.rs"));
+        let body = crate::test_src::fn_body(&own, "fn obtain_agent_binary(");
+        assert!(body.contains("let image = agent_image_ref(g, root, &prefix, &tag)?;"), "the image is not the lock's");
+        assert!(!body.contains("node-agent:{tag}"), "obtain_agent_binary builds a by-tag ref");
+        let fallback = body.find("build-cross.sh").expect("the source fallback moved: this guard is stale");
+        assert!(body.find("agent_image_ref(").unwrap() < fallback);
+        let ex = crate::test_src::fn_body(&own, "fn extract_from_image(");
+        assert!(ex.contains("!image.contains('@')"), "a digest pull would 'restore' a tag it never moved");
+    }
+
     /// i688: a fresh scratch dir per test (name + pid + counter).
     fn asset_cache_dir(tag: &str) -> std::path::PathBuf {
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

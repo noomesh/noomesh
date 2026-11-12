@@ -1528,10 +1528,7 @@ fn refuse_unlocked_dist_roll(g: &Globals, roll: &Roll, target_stack_lock: Option
     let root = &roll.root;
     let tag = &roll.tag;
     if target_stack_lock.is_none() {
-        let dotenv = std::fs::read_to_string(root.join(".env")).unwrap_or_default();
-        let mode = std::env::var("NOO_INSTALL_MODE").ok().filter(|v| !v.trim().is_empty())
-            .or_else(|| dotenv.lines().rev().find_map(|l| l.trim().strip_prefix("NOO_INSTALL_MODE=").map(|v| v.trim().trim_matches('"').to_string())))
-            .unwrap_or_default();
+        let mode = install_mode(root);
         if let Some(why) = no_lock_refusal(&mode, tag) {
             fail(g.json, ExitCode::Generic, "stack_lock_missing", &why,
                 Some("pick a published release: noo upgrade --check --stack"));
@@ -4819,6 +4816,33 @@ pub(crate) fn no_lock_refusal(install_mode: &str, tag: &str) -> Option<String> {
     Some(format!(
         "stack-{tag} publishes no signed digest lock, and this install pulls only digest-pinned images — \
          refusing to roll to a release that cannot be verified. Nothing was changed"))
+}
+
+/// `NOO_INSTALL_MODE` from this process's environment, else the install's
+/// `.env` (`dist` = pull-only, digest-pinned; anything else is a dev install).
+pub(crate) fn install_mode(root: &std::path::Path) -> String {
+    let dotenv = std::fs::read_to_string(root.join(".env")).unwrap_or_default();
+    std::env::var("NOO_INSTALL_MODE").ok().filter(|v| !v.trim().is_empty())
+        .or_else(|| dotenv.lines().rev().find_map(|l| l.trim().strip_prefix("NOO_INSTALL_MODE=").map(|v| v.trim().trim_matches('"').to_string())))
+        .unwrap_or_default()
+}
+
+/// The release-signed stack lock of `tag`, fetched and verified (signature
+/// and tag binding, as `noo upgrade --stack` does), once per process and
+/// tag. `Ok(None)`: the release publishes no lock. i689(b): what provision
+/// takes the node agent from, by digest.
+pub(crate) fn verified_stack_lock(g: &Globals, tag: &str) -> Result<Option<String>, String> {
+    type Memo = std::sync::Mutex<std::collections::BTreeMap<String, Result<Option<String>, String>>>;
+    static MEMO: std::sync::OnceLock<Memo> = std::sync::OnceLock::new();
+    let memo = MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    if let Some(r) = memo.lock().ok().and_then(|m| m.get(tag).cloned()) {
+        return r;
+    }
+    let r = try_stack_lock(g, tag).map_err(|(_, msg, _)| msg);
+    if let Ok(mut m) = memo.lock() {
+        m.insert(tag.to_string(), r.clone());
+    }
+    r
 }
 
 /// [`fetch_stack_lock`] without the exit: `Err((code, message, remedy))`.
