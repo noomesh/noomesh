@@ -235,6 +235,28 @@ step probe-offboard-without-docker 600 -- sh -c '
   noo health >/dev/null 2>&1 || { echo "PROBE FAIL: noo health is not ok afterwards"; ok=0; }
   [ "$ok" = 1 ]' || PROBE_ALTERED=1
 
+# PROBE (fa, rc.1 rehearsal A-reboot.status, i677): after a dind reboot
+# noo-ollama-embed stayed "Exited" while its door noo-stunnel-ollama-embed and
+# the -cpu twin came back. Both join a door's network namespace
+# (network_mode: service:stunnel-...) with restart: unless-stopped. Does a REAL
+# dockerd on a real systemd host lose them too? Five restarts of dockerd (its
+# restore is the path a reboot takes), each read back. Last, because it
+# disturbs the stack. A probe: read, never the cell's failed step.
+step probe-docker-restart-namespace-joiners 900 -- sh -c '
+  echo "PROBE SCOPE: 5x systemctl restart docker on this throwaway hosted runner (the dockerd restore path a reboot takes). It does NOT cover noo-hostd boot-restore, which runs only at a real boot."
+  for i in 1 2 3 4 5; do
+    sudo systemctl restart docker; echo "restart $i: systemctl rc=$?"
+    t=0; while [ $t -lt 90 ]; do docker info >/dev/null 2>&1 && break; sleep 2; t=$((t+2)); done
+    sleep 20
+    for c in noo-stunnel-ollama-embed noo-ollama-embed noo-stunnel-ollama-embed-cpu noo-ollama-embed-cpu; do
+      docker inspect -f "{{.Name}} status={{.State.Status}} exit={{.State.ExitCode}} restarts={{.RestartCount}} error={{.State.Error}}" "$c" 2>/dev/null | sed "s#^#restart $i: #"
+    done
+  done
+  docker --version
+  out="$(timeout 300 noo chat --message "reply with the word ok" 2>&1)"; rc=$?
+  echo "chat after the restarts: rc=$rc $(printf "%s" "$out" | tail -n 2 | tr "\n" " " | cut -c1-200)"
+  true'
+
 # ── 5. clean uninstall ──────────────────────────────────────────────────
 teardown
 finish
