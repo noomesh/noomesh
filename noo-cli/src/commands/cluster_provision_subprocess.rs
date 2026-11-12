@@ -663,6 +663,15 @@ pub fn cluster_sync_images(g: &Globals, args: &[String]) -> Result<i32, Unhandle
                 records.push(json!({"node": nid, "image": img, "result": "skipped_agent"}));
                 continue;
             }
+            // An image only an NVIDIA node runs (image_stage::NVIDIA_ONLY)
+            // is not this node's: no line, not a skip (i607c).
+            if let Some(why) = crate::commands::image_stage::not_for_node(img, node) {
+                if g.verbose {
+                    say(&format!("  {nid}: {img} not synced — {why}"));
+                }
+                records.push(json!({"node": nid, "image": img, "result": "not_applicable"}));
+                continue;
+            }
             if is_arm && img == "noo-sandbox-base:latest" {
                 // The sandbox base has no COPY steps and its upstream base is
                 // multi-arch, so an arm64 node builds it locally from the
