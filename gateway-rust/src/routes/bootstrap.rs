@@ -1709,6 +1709,7 @@ async fn provision_bundle_get(
     if !valid_node_name(&node) {
         return (StatusCode::BAD_REQUEST, "invalid node name").into_response();
     }
+    let _early = crate::repo::provision_bundles::blob(&state.db, &node).await;
     // The current row's key, without its bytes.
     let facts = crate::repo::provision_bundles::key(&state.db, &node).await;
     let current = match facts {
