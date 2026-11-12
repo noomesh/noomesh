@@ -6567,13 +6567,21 @@ pub(crate) fn ensure_cli_login(ctx: &mut Ctx) {
     ctx.info("Fix the login, then re-run them: noo auth login, then noo onboard --only services");
 }
 
+/// What a standalone box's services step says about chat. It used to say
+/// "served by this box's single ollama (static fallback) — no placement
+/// needed", just above verify's `default chat` row saying an unpinned chat
+/// gets 503 (every fresh install, rc.1 rehearsal): `noo chat` sends no model,
+/// and that needs a chat model PLACED on the box, which the model step does.
+pub(crate) const STANDALONE_CHAT_NOTE: &str =
+    "Chat on this box runs on its single ollama once a chat model is placed on it: the model step places one (later: noo onboard --only model).";
+
 fn ensure_llm_placement(ctx: &mut Ctx) {
     let node_id = ctx.read_env("NODE_ID");
     let model = ctx.read_env("VLLM_MODEL");
     let tier = ctx.read_env("NODE_TIER");
     if node_id.is_empty() || model.is_empty() {
         if ctx.repo_root.join(".noo-standalone").exists() {
-            ctx.info("Chat is served by this box's single ollama (static fallback) — no placement needed.");
+            ctx.info(STANDALONE_CHAT_NOTE);
             // Say so in the config too. With --skip-model the model step
             // (the only writer of cluster.default_backend) never runs, the
             // example's `vllm` survives, and every `noo chat` on the box
@@ -8413,13 +8421,19 @@ fn make_tailnet_bind_survive_reboots(ctx: &mut Ctx) {
 
 // ── Per-consumer service keys ────────────────────────────────────────────
 
-/// The compose service a container name belongs to: `noo-worker` → `worker`.
-fn service_of_container(ctx: &Ctx, container: &str) -> String {
-    let prefix = {
-        let p = ctx.read_env("NOO_CONTAINER_PREFIX");
-        if p.is_empty() { "noo".to_string() } else { p }
-    };
-    container.strip_prefix(&format!("{prefix}-")).unwrap_or(container).to_string()
+/// The compose services to recreate for a consumer that gained a key: one per
+/// container that EXISTS. A consumer can name a container of a profile this
+/// install does not run (worker-extra on a standalone box); recreating it
+/// failed the restart with "not running after the restart: worker-extra" on
+/// every fresh install (rc.1 rehearsal and 0.6.23). It never ran, so it has
+/// nothing to present a key to.
+pub(crate) fn services_to_recreate(containers: &[String], prefix: &str, exists: &dyn Fn(&str) -> bool) -> Vec<String> {
+    let prefix = if prefix.is_empty() { "noo" } else { prefix };
+    containers
+        .iter()
+        .filter(|c| exists(c))
+        .map(|c| c.strip_prefix(&format!("{prefix}-")).unwrap_or(c).to_string())
+        .collect()
 }
 
 /// "svc:evolve granted: addon, temporal, … (addons/evolve/docker-compose.yml)" — the
@@ -8534,8 +8548,10 @@ pub fn provision_service_keys(ctx: &mut Ctx) {
         }
         ctx.forget_store_cache();
         ctx.success(&format!("{}: key minted and stored as {}", t.consumer, t.secret_key));
-        for c in &t.containers {
-            let svc = service_of_container(ctx, c);
+        let prefix = ctx.read_env("NOO_CONTAINER_PREFIX");
+        for svc in services_to_recreate(&t.containers, &prefix, &|c: &str| {
+            std::process::Command::new("docker").args(["inspect", "-f", "{{.Id}}", c]).output().is_ok_and(|o| o.status.success())
+        }) {
             if !recreate.contains(&svc) {
                 recreate.push(svc);
             }
@@ -10071,5 +10087,35 @@ mod self_upgrade_tests {
         let relaunch = body.find("Command::new(&exe).args(&argv)").expect("the relaunch");
         assert!(check < relaunch, "the relaunch is not behind the version check");
         assert!(body[check..relaunch].contains("v == current"), "the check does not compare against this build");
+    }
+}
+
+#[cfg(test)]
+mod fresh_install_line_tests {
+    use super::{services_to_recreate, STANDALONE_CHAT_NOTE};
+
+    /// A consumer's container from a profile this install does not run is not
+    /// recreated (it never ran); the others are, as compose services.
+    #[test]
+    fn a_container_that_was_never_created_is_not_recreated() {
+        let cs = vec!["noo-worker".to_string(), "noo-worker-extra".to_string(), "noo-trellion".to_string()];
+        let present = |c: &str| c != "noo-worker-extra";
+        assert_eq!(services_to_recreate(&cs, "", &present), vec!["worker".to_string(), "trellion".to_string()]);
+        assert_eq!(services_to_recreate(&cs, "noo", &|_| true), vec!["worker", "worker-extra", "trellion"]);
+        assert!(services_to_recreate(&cs, "", &|_| false).is_empty());
+        let other = vec!["b2-worker".to_string()];
+        assert_eq!(services_to_recreate(&other, "b2", &|_| true), vec!["worker"]);
+    }
+
+    /// The standalone chat line never says "no placement needed", and names
+    /// the one command verify's `default chat` remedy names.
+    #[test]
+    fn the_standalone_chat_line_names_the_first_model_remedy() {
+        assert!(!STANDALONE_CHAT_NOTE.contains("no placement needed"), "{STANDALONE_CHAT_NOTE}");
+        assert!(STANDALONE_CHAT_NOTE.contains(crate::onboard::FIRST_MODEL_CMD), "{STANDALONE_CHAT_NOTE}");
+        let own = crate::test_src::own_code(include_str!("steps.rs"));
+        assert!(!own.contains("no placement needed"), "the old line is back somewhere");
+        let tail = crate::test_src::fn_body(&own, "pub fn provision_service_keys(");
+        assert!(tail.contains("for svc in services_to_recreate(&t.containers, &prefix, &|c: &str| {"), "{tail}");
     }
 }
