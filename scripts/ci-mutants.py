@@ -183,7 +183,9 @@ def lanes_for(changed: list[str], gw_in: set[str], cli_in: set[str]) -> list[str
             add("noo-cli")
         if f.startswith("node-agent-go/"):
             add("node-agent-go")
-        if f.endswith(".py") or f.startswith(("tests/", "noomesh/")):
+        # scripts/ (the applier, the installers, the launchers) are proven by
+        # tests/*.py, which run them: a mutant there reaches the python lane.
+        if f.endswith(".py") or f.startswith(("tests/", "noomesh/", "scripts/")):
             add("python")
     return [lane for lane in LANES if lane in lanes]
 

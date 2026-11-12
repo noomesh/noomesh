@@ -160,7 +160,9 @@ def test_lanes_follow_the_mutant_commit_like_noo_batch():
     assert cm.lanes_for(["gateway-rust/src/a.rs"], set(), set()) == ["gateway-rust"]
     assert cm.lanes_for(["crates/addon-manifest/src/lib.rs"], set(), set()) == ["gateway-rust", "noo-cli"]
     assert cm.lanes_for(["node-agent-go/internal/docker/x.go"], set(), set()) == ["node-agent-go"]
-    assert cm.lanes_for(["scripts/noo-apply.sh"], {"scripts/noo-apply.sh"}, set()) == ["gateway-rust"]
+    assert cm.lanes_for(["scripts/noo-apply.sh"], {"scripts/noo-apply.sh"}, set()) == ["gateway-rust", "python"]
+    # A shell script the gateway does not embed is still proven by tests/*.py.
+    assert cm.lanes_for(["scripts/noo-apply.sh"], set(), set()) == ["python"]
     assert cm.lanes_for(["noomesh/x.py", "tests/test_x.py"], set(), set()) == ["python"]
     assert cm.lanes_for(["docs/x.md"], set(), set()) == []
 
