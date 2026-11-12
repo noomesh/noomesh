@@ -824,34 +824,38 @@ pub(crate) fn run(g: &Globals, addon: &'static str, lock: Option<String>) -> i32
 
 #[cfg(test)]
 mod tests {
-    /// i689: a rundir another user pre-created world-writable is refused
-    /// (the owner rule is the same check; a test cannot make a dir owned by
-    /// someone else without root).
+    /// i689: the rundir must be ours. One another user pre-created is
+    /// refused (owner rule, tested on the check itself: a test cannot make a
+    /// dir owned by someone else without root); our own left open is closed
+    /// to 0700; a symlinked rundir is refused; and write_credential_files
+    /// checks the rundir BEFORE making the add-on dir in it.
     #[test]
-    fn a_world_writable_rundir_is_refused() {
+    fn a_rundir_not_ours_or_open_is_refused_or_closed() {
         use std::os::unix::fs::PermissionsExt as _;
         let base = crate::private_tmp::dir("noo-i689-rundir").unwrap();
         let rundir = base.join("noo-provision-1000");
         std::fs::create_dir(&rundir).unwrap();
+        // SAFETY: geteuid has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        let e = super::owned_and_closed(&rundir, euid.wrapping_add(1)).expect_err("a rundir owned by another uid was accepted");
+        assert!(e.contains("is owned by uid"), "{e}");
         std::fs::set_permissions(&rundir, std::fs::Permissions::from_mode(0o777)).unwrap();
-        let e = super::private_dir(&rundir).expect_err("a world-writable rundir was accepted");
+        let e = super::owned_and_closed(&rundir, euid).expect_err("a world-writable rundir passed the check");
         assert!(e.contains("group- or world-writable"), "{e}");
-        // write_credential_files checks the rundir before the add-on dir.
-        let own = crate::test_src::own_code(include_str!("addon_provision.rs"));
-        let body = crate::test_src::fn_body(&own, "pub(crate) fn write_credential_files(");
-        let (r, d) = (body.find("private_dir(rundir)").expect("the rundir is not checked"), body.find("private_dir(dir)").unwrap());
-        assert!(r < d, "the rundir is checked after the add-on dir is made in it");
-        // Closed again, the same call succeeds and the add-on dir is 0700.
-        std::fs::set_permissions(&rundir, std::fs::Permissions::from_mode(0o700)).unwrap();
         super::private_dir(&rundir).unwrap();
+        let mode = std::fs::metadata(&rundir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "our own open rundir was not closed");
         super::private_dir(&rundir.join("myaddon")).unwrap();
-        let mode = std::fs::metadata(rundir.join("myaddon")).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700);
-        // A symlinked rundir is refused (not followed).
         let link = base.join("noo-provision-link");
         std::os::unix::fs::symlink(&rundir, &link).unwrap();
         let e = super::private_dir(&link).expect_err("a symlinked rundir was accepted");
         assert!(e.contains("symlink"), "{e}");
+        let own = crate::test_src::own_code(include_str!("addon_provision.rs"));
+        let body = crate::test_src::fn_body(&own, "pub(crate) fn write_credential_files(");
+        let (r, d) = (body.find("private_dir(rundir)").expect("the rundir is not checked"), body.find("private_dir(dir)").unwrap());
+        assert!(r < d, "the rundir is checked after the add-on dir is made in it");
+        let pd = crate::test_src::fn_body(&own, "pub(crate) fn private_dir(");
+        assert!(pd.contains("owned_and_closed(dir, euid)"), "private_dir no longer checks the owner");
         let _ = std::fs::remove_dir_all(base);
     }
 
