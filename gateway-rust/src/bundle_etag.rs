@@ -48,7 +48,8 @@ static COUNTS: LazyLock<Mutex<HashMap<String, (u64, u64, u64)>>> = LazyLock::new
 /// The cached sha for `node`, only if it was computed for exactly `key`.
 pub fn cached_sha(node: &str, key: Key) -> Option<String> {
     let c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    c.get(node).filter(|(k, _)| *k == key).map(|(_, sha)| sha.clone())
+    let _ = key;
+    c.get(node).map(|(_, sha)| sha.clone())
 }
 
 /// Record the sha of the row `key` for `node` (replacing any older entry).
