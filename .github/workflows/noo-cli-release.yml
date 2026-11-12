@@ -643,7 +643,18 @@ jobs:
           # noo-*-unknown-linux-gnu and noo-*-apple-darwin also match the
           # noo-gateway-<target> assets: they are in the
           # signed manifest by the same globs, on purpose.
-          sha256sum noo-*-unknown-linux-musl noo-*-unknown-linux-gnu noo-*-apple-darwin > sha256sums.txt
+          # The manifest names its own release (i688 follow-up): a signed
+          # row for noo-release-version, a file holding the version exactly
+          # as the CLI built here reports it (CARGO_PKG_VERSION, rc stamp
+          # included). `noo cluster provision` refuses a signed manifest
+          # whose row does not name its own version, so a genuine OLDER
+          # manifest cannot stand in for this one. Valid `sha256sum -c` row.
+          chmod +x noo-x86_64-unknown-linux-gnu
+          v="$(./noo-x86_64-unknown-linux-gnu --version | awk '{print $NF}')"
+          case "$v" in [0-9]*.[0-9]*.[0-9]*) ;; *) echo "::error::cannot read this CLI's version from --version: '$v'"; exit 1 ;; esac
+          printf '%s\n' "$v" > noo-release-version
+          sha256sum noo-*-unknown-linux-musl noo-*-unknown-linux-gnu noo-*-apple-darwin noo-release-version > sha256sums.txt
+          grep -q '  noo-release-version$' sha256sums.txt
           ls -l
           cat sha256sums.txt
 
@@ -747,7 +758,7 @@ jobs:
           case "$TAG" in *-rc.*) flags="--prerelease --latest=false" ;; esac
           repo="${{ github.repository }}"
           # DRAFT first, then every asset, then publish: nothing is public
-          # until all 29 are uploaded. One `gh release create` with every
+          # until all 30 are uploaded. One `gh release create` with every
           # asset had no retry, and one HTTP 408 cost noo-cli-v0.6.22-rc.1 a
           # job re-run (run 42862153616). A re-run of this job finds its own
           # draft and resumes; a PUBLISHED release is never touched.
@@ -786,6 +797,7 @@ jobs:
             dist/noo-gateway-aarch64-apple-darwin.sha256 \
             dist/sha256sums.txt \
             dist/sha256sums.txt.sig \
+            dist/noo-release-version \
             dist/noo-stack-bundle.tar.gz \
             dist/noo-stack-bundle.tar.gz.sha256 \
             dist/install.sh

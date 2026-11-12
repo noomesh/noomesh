@@ -79,6 +79,23 @@ pub fn verify_with_keys(data: &[u8], sig_text: &str, keys_hex: &[&str]) -> Resul
     Err("signature does not verify against any release key baked into this build".into())
 }
 
+/// The release asset that BINDS a manifest to its version (i688 follow-up):
+/// a file holding `<version>\n` (the CLI's own `CARGO_PKG_VERSION`, rc
+/// stamp included), listed in `sha256sums.txt` like every other asset, so
+/// the signed bytes name their release and `sha256sum -c` still parses
+/// every line. Without it a GENUINE older manifest (and its genuine
+/// binaries) verifies as well as this version's: the signature covers the
+/// bytes, never the tag.
+pub const VERSION_ASSET: &str = "noo-release-version";
+
+/// Whether the signed `manifest` is the one for exactly `version`: its
+/// [`VERSION_ASSET`] row is the sha256 of `"<version>\n"`.
+pub fn manifest_names_version(manifest: &str, version: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let want = hex::encode(Sha256::digest(format!("{version}\n").as_bytes()));
+    manifest_sha_for(manifest, VERSION_ASSET).is_some_and(|got| got == want)
+}
+
 /// The sha256 a signed `sha256sums.txt` states for `asset` (`<hex>  <name>` lines).
 pub fn manifest_sha_for(manifest: &str, asset: &str) -> Option<String> {
     manifest.lines().find_map(|l| {
@@ -92,6 +109,20 @@ pub fn manifest_sha_for(manifest: &str, asset: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_manifest_names_only_its_own_version() {
+        use sha2::{Digest, Sha256};
+        let row = |v: &str| format!("{}  {VERSION_ASSET}\n", hex::encode(Sha256::digest(format!("{v}\n").as_bytes())));
+        let m = format!("aa  noo-x86_64-unknown-linux-gnu\n{}", row("0.6.24"));
+        assert!(manifest_names_version(&m, "0.6.24"));
+        assert!(!manifest_names_version(&m, "0.6.25"), "an older manifest passed as a newer version's");
+        assert!(!manifest_names_version(&m, "0.6.24-rc.1"), "a final's manifest passed as its rc's");
+        assert!(!manifest_names_version("aa  noo-x86_64-unknown-linux-gnu\n", "0.6.24"), "a manifest with no version row passed");
+        // `*name` (binary mode) and a path prefix are the same row.
+        let star = row("0.6.24").replace(&format!("  {VERSION_ASSET}"), &format!(" *dist/{VERSION_ASSET}"));
+        assert!(manifest_names_version(&star, "0.6.24"));
+    }
 
     #[test]
     fn sign_verify_roundtrip_and_tamper() {

@@ -3912,17 +3912,24 @@ fn manifest_with(dir: &Path, version: &str, fetch: &mut AssetFetch<'_>, verify: 
     let m = crate::release_sig::MANIFEST;
     let sig_name = format!("{m}.sig");
     let read = |n: &str| std::fs::read_to_string(dir.join(n)).ok().filter(|s| !s.is_empty());
+    let bound = |man: &str| crate::release_sig::manifest_names_version(man, version);
     if let (Some(man), Some(sig)) = (read(m), read(&sig_name)) {
-        if verify(man.as_bytes(), &sig).is_ok() {
+        if verify(man.as_bytes(), &sig).is_ok() && bound(&man) {
             return Ok((man, sig));
         }
-        ui::warned(&format!("{}: the cached {m} does not verify against the release key — fetching it again", dir.display()));
+        ui::warned(&format!("{}: the cached {m} is not this release's signed manifest — fetching it again", dir.display()));
     }
     let text = |b: Vec<u8>| String::from_utf8_lossy(&b).to_string();
     let man = fetch(m).map(text).map_err(|e| format!("{m} for {version}: {e}"))?;
     let sig = fetch(&sig_name).map(text).map_err(|e| format!("{sig_name} for {version}: {e}"))?;
     verify(man.as_bytes(), &sig)
         .map_err(|e| format!("the {m} of {version} does not verify against the release key ({e}) — refusing every release asset"))?;
+    // Signed is not enough: the signature covers the bytes, not the tag, so
+    // a genuine OLDER manifest would pass too (a rollback through the cache
+    // or a mirror). It must name exactly this version.
+    if !bound(&man) {
+        return Err(format!("the signed {m} served for {version} is not that release's (its {} row does not name {version}) — refusing every release asset", crate::release_sig::VERSION_ASSET));
+    }
     let _ = std::fs::create_dir_all(dir);
     let _ = std::fs::write(dir.join(m), &man);
     let _ = std::fs::write(dir.join(&sig_name), &sig);
@@ -5115,31 +5122,61 @@ mod tests {
     fn the_cached_manifest_is_used_only_when_its_signature_verifies() {
         let m = crate::release_sig::MANIFEST;
         let sig = format!("{m}.sig");
-        let verify = |d: &[u8], s: &str| if s == "good-sig" && d == b"real-manifest" { Ok(()) } else { Err("bad sig".to_string()) };
+        // Every pair below is "signed" when its sig is "good-sig" (the stub
+        // key); "real" names 0.0.0, "old" is a genuine manifest of 0.0.-1.
+        let row = |v: &str| format!("{}  {}\n", crate::addons::pins::sha256_hex(format!("{v}\n").as_bytes()), crate::release_sig::VERSION_ASSET);
+        let real = format!("aa  noo-x86_64-unknown-linux-gnu\n{}", row("0.0.0"));
+        let old = format!("bb  noo-x86_64-unknown-linux-gnu\n{}", row("0.0.-1"));
+        let verify = |_: &[u8], s: &str| if s == "good-sig" { Ok(()) } else { Err("bad sig".to_string()) };
 
         let dir = asset_cache_dir("man-hit");
-        std::fs::write(dir.join(m), "real-manifest").unwrap();
+        std::fs::write(dir.join(m), &real).unwrap();
         std::fs::write(dir.join(&sig), "good-sig").unwrap();
         let got = super::manifest_with(&dir, "0.0.0", &mut |n| panic!("fetched {n} on a verified hit"), &verify).unwrap();
-        assert_eq!(got, ("real-manifest".to_string(), "good-sig".to_string()));
+        assert_eq!(got, (real.clone(), "good-sig".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
 
+        // A forged cached manifest (signature fails) is fetched again.
         let dir = asset_cache_dir("man-planted");
         std::fs::write(dir.join(m), "planted-manifest").unwrap();
-        std::fs::write(dir.join(&sig), "good-sig").unwrap();
+        std::fs::write(dir.join(&sig), "forged-sig").unwrap();
         let mut fetched = Vec::new();
         let got = super::manifest_with(&dir, "0.0.0", &mut |n| {
             fetched.push(n.to_string());
-            Ok(if n.ends_with(".sig") { b"good-sig".to_vec() } else { b"real-manifest".to_vec() })
+            Ok(if n.ends_with(".sig") { b"good-sig".to_vec() } else { real.clone().into_bytes() })
         }, &verify).unwrap();
-        assert_eq!(got.0, "real-manifest", "the planted manifest was used");
+        assert_eq!(got.0, real, "the planted manifest was used");
         assert_eq!(fetched, [m.to_string(), sig.clone()]);
-        assert_eq!(std::fs::read_to_string(dir.join(m)).unwrap(), "real-manifest", "the cache was not repaired");
+        assert_eq!(std::fs::read_to_string(dir.join(m)).unwrap(), real, "the cache was not repaired");
         let _ = std::fs::remove_dir_all(&dir);
 
+        // ROLLBACK through the cache: an older release's GENUINE, validly
+        // signed manifest planted in this version's dir is refused and
+        // this version's fetched in its place.
+        let dir = asset_cache_dir("man-rollback");
+        std::fs::write(dir.join(m), &old).unwrap();
+        std::fs::write(dir.join(&sig), "good-sig").unwrap();
+        let got = super::manifest_with(&dir, "0.0.0", &mut |n| {
+            Ok(if n.ends_with(".sig") { b"good-sig".to_vec() } else { real.clone().into_bytes() })
+        }, &verify).unwrap();
+        assert_eq!(got.0, real, "an older release's signed manifest was used for this version");
+        assert_eq!(std::fs::read_to_string(dir.join(m)).unwrap(), real);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // ROLLBACK through the fetch: a mirror serving the older genuine
+        // pair for this version is refused and nothing is cached.
+        let dir = asset_cache_dir("man-rollback-fetch");
+        let e = super::manifest_with(&dir, "0.0.0", &mut |n| {
+            Ok(if n.ends_with(".sig") { b"good-sig".to_vec() } else { old.clone().into_bytes() })
+        }, &verify).expect_err("an older release's manifest was accepted for this version");
+        assert!(e.contains("is not that release's"), "{e}");
+        assert!(!dir.join(m).exists(), "a wrong-version manifest was cached");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A forged fetch (signature fails) is refused and not cached.
         let dir = asset_cache_dir("man-badfetch");
         let e = super::manifest_with(&dir, "0.0.0", &mut |n| {
-            Ok(if n.ends_with(".sig") { b"forged-sig".to_vec() } else { b"forged-manifest".to_vec() })
+            Ok(if n.ends_with(".sig") { b"forged-sig".to_vec() } else { real.clone().into_bytes() })
         }, &verify).expect_err("an unverified manifest was accepted");
         assert!(e.contains("does not verify"), "{e}");
         assert!(!dir.join(m).exists(), "an unverified manifest was cached");
