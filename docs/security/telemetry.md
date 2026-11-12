@@ -71,18 +71,27 @@ use are in
 [../getting-started/supported-agent-harnesses.md](../getting-started/supported-agent-harnesses.md). `noo` is noomesh's
 own loop. The other three are third-party CLIs with their own reporting.
 
-**Status: the foreign runners are not shipped.** The node agent accepts a
-`claude-code`, `copilot` or `codex` placement, checks that the node's chat
-backend speaks the CLI's wire format, and then refuses to start it ("its
-runner is not shipped yet"). No noomesh image or installer provides
-any of these CLIs. So today nothing launches them and nothing leaves the network
-because of them. The switches are declared now so the runner cannot ship
-without them: each kind's `telemetry_off` entry in `config/harness-kinds.json`
-holds them, and whatever launches a CLI must merge that entry
-into the CLI's environment after any placement value, so a placement cannot
-turn reporting back on. A guard test fails if a kind has no entry, if a
-switch below goes missing, or if a foreign kind with no switches declared
-gets a runner.
+**Status: the foreign runners ship.** `noo cluster vendor stage` stages the
+Claude Code, Codex and Copilot CLIs, pinned by hash in
+`config/harness-kinds.json`, and the node harness (`noo-gateway harness`)
+launches the one a placement names. The switches below are applied on every
+launch: each kind's `telemetry_off` entry in `config/harness-kinds.json` is
+merged into the CLI's environment LAST, after the placement's and the lane's
+values, so a placement cannot turn reporting back on. A guard test fails if a
+kind has no entry, if a switch below goes missing, or if a foreign kind with
+no switches declared gets a runner.
+
+What each CLI's reporting rests on today. "Switched off" means the vendor's
+documented switch is applied on every launch. "Observed off" means an egress
+capture of that CLI running under noomesh showed no connection to the
+vendor's hosts ([Verify it yourself](#verify-it-yourself)). No CLI is marked
+observed off yet; a row moves only with a capture to show for it.
+
+| Kind | Reporting | How | Not covered |
+|---|---|---|---|
+| `claude-code` | Switched off (not yet observed) | Environment: the `claude-code` rows below | The WebFetch hostname preflight (below) |
+| `codex` | Switched off (not yet observed) | `config.toml` keys the driver writes into the run's own `CODEX_HOME` before each launch | Nothing known |
+| `copilot` | Switched off (not yet observed) | `COPILOT_OFFLINE=true`, the only switch GitHub documents | Nothing known; offline mode also removes GitHub-backed features (below) |
 
 Codex CLI takes no environment switch for its reporting: its
 `telemetry_off` entry is empty, and its switches are keys of the
@@ -113,10 +122,14 @@ What the switches do not cover, stated plainly:
   the requested hostname (only the hostname) to `api.anthropic.com`. Anthropic
   says this "is not affected by `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`";
   its opt-out is the settings key `skipWebFetchPreflight`, not an environment
-  variable ([data usage](https://code.claude.com/docs/en/data-usage)). The
-  runner must write that setting too, or leave the WebFetch tool off.
+  variable ([data usage](https://code.claude.com/docs/en/data-usage)).
+  **This gap is open today:** the `claude-code` kind allows WebFetch, and the
+  runner writes no settings file, so a claude-code harness that fetches a web
+  page sends that page's hostname to `api.anthropic.com` first. Until the
+  runner writes `skipWebFetchPreflight` (or drops WebFetch from the kind),
+  treat a claude-code harness's WebFetch as sending hostnames to Anthropic.
 - **Copilot CLI has no separate telemetry switch.** GitHub documents none;
-  offline mode is the only documented way. Offline mode also removes the
+  `COPILOT_OFFLINE=true` is the only documented way, and noomesh sets it. Offline mode also removes the
   features that need GitHub (`/delegate`, the GitHub MCP server, code
   search), and it needs a bring-your-own-model provider
   (`COPILOT_PROVIDER_BASE_URL`, here the node's own model endpoint). Without
@@ -130,9 +143,9 @@ What the switches do not cover, stated plainly:
   default this does not arise.
 - **`noo cluster verify`.** The `vendor telemetry` row is built from the node
   agent's report on running backend containers. A harness is a host service
-  and reports no environment today, so the row does not cover it; with no
-  runner there is nothing to check yet. Reporting the harness's switches into
-  that row is open work to land with the runner.
+  and reports no environment, so the row does not cover the vendor CLIs it
+  launches: their switches are applied by the runner at each launch (above),
+  not checked by verify. Reporting them into that row is open work.
 
 ### Paid add-ons
 
@@ -446,7 +459,7 @@ setting you chose. None of it is a report about you or your machines.
 | Drive resources and private sync | `www.googleapis.com` | The gateway lists drives/folders on request and reads selected files while that owner's Drive source has sync enabled. To keep it off, pause every Drive source and avoid the Drive picker, or disconnect the account. Scope identifiers also use this host as a name; granting a scope itself makes no request to it. |
 | Google content links (browser) | `mail.google.com`, `drive.google.com` | Only when you open a returned citation in your browser. To keep it off, do not open those links. The gateway constructs these citations and does not fetch them. |
 | Cloud models | Anthropic, OpenAI, Google Gemini APIs | Only when `CLOUD_PROVIDERS_ENABLED` is on, a `claude-*`, `gpt-*` or `gemini-*` model is selected and its key is configured. The model runs the full agent loop, so each request carries the whole turn: the system prompt, the retrieved context, memory, conversation summaries and recall, runtime-written skills and device reports (fenced as reference data in the user's turn), the conversation, the tool definitions and the tool results |
-| Agent harness on a cloud model | The model vendor (Anthropic for Claude Code, the provider you set for Copilot CLI, OpenAI for Codex CLI) | Only if a third-party harness is pointed at a cloud model instead of the node's own endpoint. The prompts go to that vendor: this is the cloud-model traffic above, not telemetry. Not reachable today: the foreign runners are not shipped. |
+| Agent harness on a cloud model | The model vendor (Anthropic for Claude Code, the provider you set for Copilot CLI, OpenAI for Codex CLI) | Only if a third-party harness is pointed at a cloud model instead of the node's own endpoint. The prompts go to that vendor: this is the cloud-model traffic above, not telemetry. By default the harness is pointed at the node's own endpoint, so this does not arise unless you point it elsewhere. |
 | Web search | DuckDuckGo's HTML endpoint, or the provider set in `search.provider` (SearXNG, Brave, Tavily) | When an agent, a chat or a scheduled task uses `web_search` |
 | Browser tool | Whatever page it is sent to | When an agent uses the browser tool. `BROWSER_URL_ALLOWLIST` limits it. |
 | Build-time package installs | PyPI, the PyTorch wheel index, Go and crates.io registries, Debian/Alpine mirrors | Building images, not running them |
