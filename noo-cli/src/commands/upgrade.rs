@@ -1868,6 +1868,7 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
             // just deployed is the truth, so say so once, here, where it
             // changes.
             std::env::set_var("NOO_IMAGE_TAG", tag);
+            record_roll();
             if !g.json {
                 ui::close_done(&format!("stack now on {tag}"));
                 ui::guide(&[("noo cluster verify --wait",
@@ -3069,6 +3070,9 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
     }
     let staged_failed: Vec<String> = failed.iter().filter(|n| !remaining.contains(n)).cloned().collect();
     let (rc, msg) = nodes_outcome(names.len(), &skipped_names, &staged_failed, &remaining);
+    if !waited.is_empty() || !pending.is_empty() {
+        record_roll();
+    }
     if !skipped.is_empty() && !g.json {
         let cmds: Vec<String> = skipped_names.iter().map(|n| format!("noo cluster provision {n} --wait")).collect();
         let why = "once the node is back online, catches it up";
@@ -3080,6 +3084,9 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
         ui::guide(&cmds.iter().map(|c| (c.as_str(), why)).collect::<Vec<_>>());
     } else if rc == 0 {
         ui::close_done(&msg);
+        if !g.json {
+            ui::guide(&[(VERIFY_AFTER_ROLL, VERIFY_AFTER_ROLL_WHY)]);
+        }
     } else {
         ui::close_failed(&msg, None);
     }
@@ -3091,6 +3098,40 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
         ui::guide(&cmds.iter().map(|c| (c.as_str(), why)).collect::<Vec<_>>());
     }
     Ok(rc)
+}
+
+/// The closing line of a clean nodes stage: restarted agents read as
+/// offline for a minute or two, and verify says so (i663 §2.3).
+const VERIFY_AFTER_ROLL: &str = "noo cluster verify --wait";
+const VERIFY_AFTER_ROLL_WHY: &str =
+    "the agents restart after applying and read offline for a minute or two; this waits for them";
+
+/// Where the time of the last roll is kept: `$XDG_STATE_HOME/noo/last-roll`
+/// (else `~/.local/state/noo/last-roll`), one unix timestamp.
+fn roll_marker() -> std::path::PathBuf {
+    crate::commands::addon_after_boot::state_dir_from(std::env::var("XDG_STATE_HOME").ok(), std::env::var("HOME").ok())
+        .join("last-roll")
+}
+
+/// Note that the stack or the nodes were just rolled, so `cluster verify`
+/// can tell a restarting node from a broken one. Best effort: a marker that
+/// cannot be written only means verify words a restart as a failure.
+pub(crate) fn record_roll() {
+    let p = roll_marker();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&p, format!("{now}\n"));
+}
+
+/// When the last roll happened (unix seconds), if one was recorded here.
+pub(crate) fn last_roll() -> Option<i64> {
+    parse_roll(&std::fs::read_to_string(roll_marker()).ok()?)
+}
+
+fn parse_roll(text: &str) -> Option<i64> {
+    text.trim().parse::<i64>().ok().filter(|t| *t > 0)
 }
 
 /// The longest the combined wait gives a staged fleet to pull, apply and
@@ -7808,5 +7849,26 @@ mod nodes_stage_nonblocking_tests {
         assert_eq!(nodes.matches("print_node_outcomes(g, &node_outcome_rows(").count(), 2, "both waits print the table");
         assert!(nodes.find("let applier_first = super::provision::applier_first_for(g, n);").unwrap()
             < nodes.find("provision_one(g, n, &[\"--stage-only\"])").unwrap(), "read before staging");
+    }
+}
+
+#[cfg(test)]
+mod roll_marker_tests {
+    use super::*;
+
+    #[test]
+    fn the_marker_is_one_timestamp() {
+        assert_eq!(parse_roll("1794456735\n"), Some(1_794_456_735));
+        assert_eq!(parse_roll(""), None);
+        assert_eq!(parse_roll("0"), None);
+        assert_eq!(parse_roll("yesterday"), None);
+    }
+
+    #[test]
+    fn both_roll_stages_record_and_a_clean_nodes_stage_names_verify_wait() {
+        let own = crate::test_src::own_code(include_str!("upgrade.rs"));
+        assert_eq!(own.matches("record_roll();").count(), 2, "stack and nodes stages");
+        assert!(own.contains("ui::guide(&[(VERIFY_AFTER_ROLL, VERIFY_AFTER_ROLL_WHY)]);"));
+        assert_eq!(VERIFY_AFTER_ROLL, "noo cluster verify --wait");
     }
 }
