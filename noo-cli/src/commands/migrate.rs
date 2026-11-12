@@ -122,30 +122,9 @@ fn sha256_file(p: &Path) -> Option<String> {
 }
 
 /// A fresh staging directory for plaintext (the dump, the decrypted tarball,
-/// the controller's secrets and CA key): `<tmp>/<prefix>-<64 random bits>`,
-/// created with mode 0700, refusing one that already exists. The previous
-/// `<prefix>-<pid>` was predictable, created with the default umask, and
-/// `remove_dir_all`-ed first — so another local user could pre-create it
-/// (or race the 0644 dump and tarball inside it) and read the controller's
-/// whole state. mkdtemp semantics: the name is unguessable, and `mkdir`
-/// failing with EEXIST is a retry, never a reuse.
-pub(crate) fn private_stage(prefix: &str) -> Result<PathBuf, String> {
-    use std::io::Read as _;
-    use std::os::unix::fs::DirBuilderExt as _;
-    for _ in 0..16 {
-        let mut raw = [0u8; 8];
-        std::fs::File::open("/dev/urandom")
-            .and_then(|mut f| f.read_exact(&mut raw))
-            .map_err(|e| format!("cannot read /dev/urandom for a private staging name: {e}"))?;
-        let dir = std::env::temp_dir().join(format!("{prefix}-{}", hex::encode(raw)));
-        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
-            Ok(()) => return Ok(dir),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("cannot create the private staging directory {}: {e}", dir.display())),
-        }
-    }
-    Err("could not find an unused private staging directory name".into())
-}
+/// the controller's secrets and CA key): mkdtemp semantics, mode 0700. Since
+/// i689 this is [`crate::private_tmp::dir`], shared by every temp work path.
+pub(crate) use crate::private_tmp::dir as private_stage;
 
 // ═══ export ═════════════════════════════════════════════════════════════
 

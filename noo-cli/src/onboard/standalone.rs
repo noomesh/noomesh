@@ -110,7 +110,11 @@ fn acquire_bundle(bundle: &str) -> Result<(Vec<u8>, Option<String>), String> {
 /// no absolute paths. GNU tar's own defaults vary by version, so this
 /// validation is the guarantee, not tar's.
 pub(crate) fn extract_bundle_safely(bytes: &[u8], home: &Path) -> Result<(), String> {
-    let tmp = std::env::temp_dir().join(format!("noo-bundle-{}.tgz", std::process::id()));
+    // i689: in a fresh 0700 dir. Listed (to refuse escaping entries) and
+    // then extracted by PATH: at a predictable name another user could swap
+    // the archive between the two and extract past the check.
+    let tmp_dir = crate::private_tmp::Dir::new("noo-bundle")?;
+    let tmp = tmp_dir.path().join("bundle.tgz");
     std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
     let done = |r: Result<(), String>| { let _ = std::fs::remove_file(&tmp); r };
 

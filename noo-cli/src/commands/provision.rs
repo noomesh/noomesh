@@ -1123,12 +1123,14 @@ fn adopt_signing_key_first(g: &Globals, a: &ProvisionArgs) {
 
 /// Step 7: the CA and a scratch dir (the signing key was adopted in
 /// `adopt_signing_key_first`).
-fn prepare_bundle_workspace(_g: &Globals, a: &ProvisionArgs, pki: &Path) -> (crate::pki::ClusterCa, std::path::PathBuf) {
+fn prepare_bundle_workspace(g: &Globals, a: &ProvisionArgs, pki: &Path) -> (crate::pki::ClusterCa, std::path::PathBuf) {
     let node = a.node.clone();
     let pki = pki.to_path_buf();
     let ca = crate::pki::ClusterCa::new(pki.clone());
-    let work = std::env::temp_dir().join(format!("noo-provision-{node}-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&work);
+    // i689: fresh and 0700 (mkdtemp), never `<tmp>/noo-provision-<node>-<pid>`:
+    // everything staged here is CA-signed into the bundle.
+    let work = crate::private_tmp::dir(&format!("noo-provision-{node}"))
+        .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "bundle_failed", &e, None));
     (ca, work)
 }
 
@@ -1598,8 +1600,8 @@ fn stage_applier_first(g: &Globals, a: &ProvisionArgs, m: &ProvMachine, ca: &cra
     if !after_applier && applier_first_due(legacy, darwin, !apply.is_empty()) {
         {
             nstep(&format!("{node} has never reported an apply — staging the applier alone first"));
-            let w2 = std::env::temp_dir().join(format!("noo-provision-applier-{node}-{}", std::process::id()));
-            let _ = std::fs::create_dir_all(&w2);
+            let w2 = crate::private_tmp::dir(&format!("noo-provision-applier-{node}"))
+                .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "bundle_failed", &e, None));
             let pre: Vec<(&str, Vec<u8>)> = vec![("applier", apply.as_bytes().to_vec())];
             let b2 = match super::security_local::build_signed_bundle(ca, &node, &pre, &w2) {
                 Ok(b) => b,
@@ -2171,12 +2173,7 @@ pub(crate) fn ensure_self_identity(node: &str) -> Result<(), String> {
     nstep("creating this controller's node identity — sudo once, never again (later upgrades of this node ride the rail)");
     let root = crate::envfile::repo_root();
     let (prep, _guard) = stage_prep_host(&root)?;
-    let work = std::env::temp_dir().join(format!("noo-selfid-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
-    std::fs::create_dir_all(&work).map_err(|e| format!("cannot stage {}: {e}", work.display()))?;
-    let _ = std::fs::set_permissions(&work, {
-        use std::os::unix::fs::PermissionsExt; std::fs::Permissions::from_mode(0o700)
-    });
+    let work = crate::private_tmp::dir("noo-selfid")?;
     let line = match self_prep_line(node, &prep, &local_data_root(&root), &work) {
         Ok(l) => l,
         Err(e) => { let _ = std::fs::remove_dir_all(&work); return Err(e); }
@@ -2821,20 +2818,18 @@ fn stage_prep_host(root: &std::path::Path) -> Result<(std::path::PathBuf, PrepGu
     }
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let path = std::env::temp_dir().join(format!("noo-prep-host-{}.sh", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    // i689: inside a fresh 0700 dir, so no other local user can plant or
+    // swap the script `sudo bash` runs.
+    let dir = crate::private_tmp::Dir::new("noo-prep-host")?;
+    let path = dir.path().join("prep-host.sh");
     std::fs::OpenOptions::new().write(true).create_new(true).mode(0o700).open(&path)
         .and_then(|mut f| f.write_all(embedded.as_bytes()))
         .map_err(|e| format!("cannot stage prep-host.sh at {}: {e}", path.display()))?;
-    Ok((path.clone(), PrepGuard(Some(path))))
+    Ok((path, PrepGuard(Some(dir))))
 }
 
-struct PrepGuard(Option<std::path::PathBuf>);
-impl Drop for PrepGuard {
-    fn drop(&mut self) {
-        if let Some(p) = &self.0 { let _ = std::fs::remove_file(p); }
-    }
-}
+/// Holds the private dir of an embedded prep-host.sh; removed on drop.
+struct PrepGuard(#[allow(dead_code)] Option<crate::private_tmp::Dir>); // held for its Drop
 
 /// The FIRST install of THIS machine's own agent (finding #15; i67: called
 /// only by `noo onboard`) — the standalone controller's self-node. The same
@@ -3127,7 +3122,9 @@ fn provision_local_in(g: &Globals, node: &str, tier: Option<&str>, root: &Path, 
     let units_missing = pull_units_missing(node);
     // The private staging dir, named up front: prep reads the birth keypair
     // the install script generates into it.
-    let work = std::env::temp_dir().join(format!("noo-selfprov-{}", std::process::id()));
+    // i689: fresh and 0700, removed on every return by the guard.
+    let work_dir = crate::private_tmp::Dir::new("noo-selfprov")?;
+    let work = work_dir.path().to_path_buf();
     let prep_cmd = if prep_current && units_missing.is_empty() {
         None
     } else {
@@ -3301,11 +3298,8 @@ fn provision_local_in(g: &Globals, node: &str, tier: Option<&str>, root: &Path, 
         }
         // Stage in a private dir, install what changed with ONE sudo script,
         // scrub the staged secrets either way.
-        let _ = std::fs::remove_dir_all(&work);
-        std::fs::create_dir_all(&work).map_err(|e| format!("cannot stage {} ({e})", work.display()))?;
-        let _ = std::fs::set_permissions(&work, {
-            use std::os::unix::fs::PermissionsExt; std::fs::Permissions::from_mode(0o700)
-        });
+        // `work` is already a fresh 0700 dir (i689): not removed and
+        // re-created here, which would reopen the name to a race.
         for (kind, bytes) in &staged {
             if kind == "secret-files" { continue; }
             if let Err(e) = std::fs::write(work.join(kind), bytes) {
@@ -3561,7 +3555,10 @@ fn extract_from_image_inner(image: &str, goarch: &str) -> Result<Vec<u8>, String
             String::from_utf8_lossy(&create.stderr).lines().last().unwrap_or("")));
     }
     let cid = String::from_utf8_lossy(&create.stdout).trim().to_string();
-    let tmp = std::env::temp_dir().join(format!("noo-agent-extract-{}", std::process::id()));
+    // i689: the extracted binary goes into the bundle; a fresh 0700 dir,
+    // not `<tmp>/noo-agent-extract-<pid>`.
+    let tmp_dir = crate::private_tmp::Dir::new("noo-agent-extract")?;
+    let tmp = tmp_dir.path().join("noo-node-agent");
     // `.output()`, not `.status()`: docker cp chats ("Successfully copied
     // 9.58MB …") on stdout, and subprocess output is ours to frame (§5).
     let cp_ok = Command::new("docker")
