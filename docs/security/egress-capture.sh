@@ -49,9 +49,11 @@
 # Options:
 #   --minutes N      how long to capture (default 10); Ctrl-C ends it early.
 #   --out DIR        where to write; required; created if absent, must be empty.
-#   --classify FILE  optional: a TSV of "who-regex<TAB>host-regex<TAB>class<TAB>why"
-#                    lines; each report row takes the class of the first line that
-#                    matches, else "unlisted".
+#   --classify FILE  optional: a TSV of "who-regex<TAB>destination-regex<TAB>class<TAB>why"
+#                    lines, the destination being "<host>:<port>" (host is
+#                    "(no name seen)" when nothing named the address); each report
+#                    row takes the class of the first line whose two regexes match,
+#                    else "unlisted".
 #   --report-only    rebuild the report from an existing --out DIR.
 set -euo pipefail
 
@@ -165,9 +167,9 @@ for fl in sorted(flows.values(), key=lambda x: x["first"]):
     r["flows"] += 1; r["out"] += fl["out"]; r["in"] += fl["in"]
     r["first"] = min(r["first"], fl["first"]); r["last"] = max(r["last"], fl["last"])
 
-def cls(w, host):
+def cls(w, host, port):
     for rw, rh, c, why in rules:
-        if rw.search(w) and rh.search(host):
+        if rw.search(w) and rh.search(f"{host}:{port}"):
             return c, why
     return ("unlisted", "") if rules else ("", "")
 
@@ -175,11 +177,11 @@ with open(os.path.join(out, "egress.tsv"), "w") as t, open(os.path.join(out, "eg
     t.write("who\thost\tip\tport\tproto\tflows\tbytes_out\tbytes_in\tfirst\tlast\tclass\twhy\n")
     md.write("| Who | Destination | IP | Port | Flows | Bytes out | Bytes in | Class | Why |\n|---|---|---|---|---|---|---|---|---|\n")
     for (w, host, ip, port, proto), r in rows.items():
-        c, why = cls(w, host)
+        c, why = cls(w, host, port)
         t.write(f"{w}\t{host}\t{ip}\t{port}\t{proto}\t{r['flows']}\t{r['out']}\t{r['in']}\t{r['first']}\t{r['last']}\t{c}\t{why}\n")
         md.write(f"| {w} | {host} | {ip} | {port}/{proto} | {r['flows']} | {r['out']} | {r['in']} | {c} | {why} |\n")
 print(f"egress-capture: {len(flows)} outbound connection(s) to {len({k[2] for k in rows})} address(es); "
-      f"{sum(1 for k in rows if cls(k[0], k[1])[0] == 'unlisted')} row(s) unlisted; report in {out}/egress.md")
+      f"{sum(1 for k in rows if cls(k[0], k[1], k[3])[0] == 'unlisted')} row(s) unlisted; report in {out}/egress.md")
 PY
 }
 
