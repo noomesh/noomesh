@@ -4688,7 +4688,7 @@ fn bootstrap_token_create_quiet_prints_only_the_one_liner() {
 /// request asks for the tailnet key only when the operator did.
 #[test]
 fn bootstrap_token_create_prints_the_servers_enroll_paste() {
-    let body = r#"{"id":"tok-2","token":"RAW","expires_at":"2026-09-04T00:00:00Z","node_name":"n1","controller_url":"https://ctl.example.ts.net:8080","install_command":"command -v noo >/dev/null || curl -fsSL https://raw.githubusercontent.com/o/r/main/noo-cli/install.sh | sh","enroll_command":"noo enroll noo1.SERVERBLOB","provision_command":"noo cluster provision n1 --wait","joins_tailnet":false}"#;
+    let body = r#"{"id":"tok-2","token":"RAW","expires_at":"2026-09-04T00:00:00Z","node_name":"n1","controller_url":"https://ctl.example.ts.net:8080","install_command":"command -v noo >/dev/null || { d=\"$(mktemp -d)\" && curl -fsSL https://raw.githubusercontent.com/o/r/main/noo-cli/install.sh > \"$d/install.sh\" && sh \"$d/install.sh\"; r=$?; rm -rf \"$d\"; [ \"$r\" = 0 ]; }","enroll_command":"noo enroll noo1.SERVERBLOB","provision_command":"noo cluster provision n1 --wait","joins_tailnet":false}"#;
     let mock = RouterMock::start(vec![("/api/security/bootstrap-tokens", 200, body)], 1);
     let out = run(
         &["--quiet", "--gateway", &gw(mock.port), "cluster", "bootstrap-token", "create", "--node", "n1", "--no-tailscale"],
@@ -4713,7 +4713,7 @@ fn bootstrap_token_create_prints_the_servers_enroll_paste() {
     );
     let _ = mock.requests();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("  command -v noo >/dev/null || curl -fsSL https://raw.githubusercontent.com/o/r/main/noo-cli/install.sh | sh\n"), "stdout: {stdout}");
+    assert!(stdout.contains("  command -v noo >/dev/null || { d=\"$(mktemp -d)\" && curl -fsSL https://raw.githubusercontent.com/o/r/main/noo-cli/install.sh > \"$d/install.sh\" && sh \"$d/install.sh\"; r=$?; rm -rf \"$d\"; [ \"$r\" = 0 ]; }\n"), "stdout: {stdout}");
     assert!(stdout.contains("  noo enroll noo1.SERVERBLOB\n"), "stdout: {stdout}");
     assert!(stdout.contains("the node must already reach the controller"), "stdout: {stdout}");
     assert!(stdout.contains("https://ctl.example.ts.net:8080/bootstrap/cli/install.sh"), "stdout: {stdout}");
