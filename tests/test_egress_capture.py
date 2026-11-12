@@ -115,3 +115,18 @@ def test_a_signal_stops_it_at_once_not_after_the_sleep():
     code = SCRIPT.read_text()
     assert 'sleep "$((MINUTES * 60))" &' in code and 'wait "$!"' in code
     assert not re.search(r'^sleep "\$\(\(MINUTES \* 60\)\)"\s*$', code, re.M), "a foreground sleep defers the stop"
+
+
+def test_every_host_change_is_listed_and_no_packet_can_reach_a_file():
+    src = SCRIPT.read_text()
+    code = "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
+    # The module load is the one change that outlives the run: listed, and said when done.
+    assert "the nf_conntrack kernel module: loaded ONLY if it was not loaded already" in src
+    assert re.search(r"modprobe nf_conntrack 2>/dev/null; then\n\s+MOD_LOADED=1\n\s+echo \"egress-capture: loaded the nf_conntrack kernel module", code)
+    assert code.count("modprobe nf_conntrack") == 1, "no other module is loaded"
+    # The packet path: tcpdump to stdout, piped to the parser, both stderrs discarded,
+    # and the parser's one file is names.tsv.
+    m = re.search(r"tcpdump -i any -nn -U -s 512 -w - \\\n[^\n]*2>/dev/null \\\n\s+\| python3 -u -c \"\$NAMES_PARSER\" \"\$OUT/names.tsv\" 2>/dev/null &", code)
+    assert m, "the capture must be one pipe from tcpdump's stdout into the parser"
+    parser = src[src.index("NAMES_PARSER=\"$(cat <<'PY'\n"):src.index("\nPY\n)\"\n")]
+    assert parser.count("open(") == 1 and "open(sys.argv[1], \"a\"" in parser, "the parser opens names.tsv and nothing else"

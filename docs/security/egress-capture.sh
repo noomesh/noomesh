@@ -24,11 +24,23 @@
 #   egress.tsv, egress.md
 #                     the report: one row per (who, destination, port, proto).
 # It never records a payload: no pcap is written, no request or response body,
-# no header beyond the TLS server name and the DNS question.
+# no header beyond the TLS server name and the DNS question. The path is fixed:
+# tcpdump captures only DNS (port 53) and the first packet of a TLS handshake
+# (the ClientHello), at most 512 bytes of each, in both directions, and writes
+# them to its stdout; that stdout is a pipe into the parser's stdin, and the
+# pipe is the only place a packet byte ever is. Neither end is a file, tcpdump's
+# own stderr and the parser's stderr are discarded (so not even an error message
+# can echo a packet), and the parser's one output file is names.tsv, holding
+# (time, dns|sni, name, address) lines and nothing else.
 #
-# What it changes: nothing, except net.netfilter.nf_conntrack_acct, which it
-# sets to 1 so the kernel counts bytes per connection, and restores to its
-# previous value on exit (also on Ctrl-C). It adds no firewall rule.
+# What it changes on the host, all of it:
+#   - net.netfilter.nf_conntrack_acct: set to 1 so the kernel counts bytes per
+#     connection, restored to its previous value on exit (also on Ctrl-C).
+#   - the nf_conntrack kernel module: loaded ONLY if it was not loaded already
+#     (the script then says so), and it stays loaded after the script exits.
+#     Unload it with `sudo modprobe -r nf_conntrack` if nothing else uses it;
+#     on a host running Docker it is always loaded already.
+# It adds no firewall rule and installs nothing.
 #
 # What it needs: root, conntrack (conntrack-tools), tcpdump, ss (iproute2),
 # python3. It refuses, saying which is missing, without them.
@@ -192,7 +204,11 @@ missing=""
 for c in conntrack tcpdump ss; do command -v "$c" >/dev/null || missing="$missing $c"; done
 [ -z "$missing" ] || { echo "egress-capture: missing:$missing (Debian/Ubuntu: apt install conntrack tcpdump iproute2; Alpine: apk add conntrack-tools tcpdump iproute2)" >&2; exit 2; }
 SYSCTL=/proc/sys/net/netfilter/nf_conntrack_acct
-[ -w "$SYSCTL" ] || modprobe nf_conntrack 2>/dev/null || true
+MOD_LOADED=0
+if [ ! -w "$SYSCTL" ] && [ ! -d /sys/module/nf_conntrack ] && modprobe nf_conntrack 2>/dev/null; then
+    MOD_LOADED=1
+    echo "egress-capture: loaded the nf_conntrack kernel module (it was not loaded); it stays loaded after this exits (unload: sudo modprobe -r nf_conntrack)"
+fi
 [ -w "$SYSCTL" ] || { echo "egress-capture: $SYSCTL is not writable: this kernel has no connection tracker here" >&2; exit 2; }
 mkdir -p "$OUT"
 [ -z "$(ls -A "$OUT")" ] || { echo "egress-capture: --out $OUT is not empty; give a fresh directory" >&2; exit 2; }
@@ -206,6 +222,7 @@ cleanup() {
     conntrack -L -o extended,id 2>/dev/null | sed "s/^/[$(date +%s).0] /" > "$OUT/conntrack.final" || true
     echo "$ACCT_WAS" > "$SYSCTL" 2>/dev/null || true
     echo "egress-capture: stopped; nf_conntrack_acct restored to $ACCT_WAS"
+    [ "$MOD_LOADED" = 1 ] && echo "egress-capture: the nf_conntrack module this run loaded is still loaded (unload: sudo modprobe -r nf_conntrack)"
     report
 }
 trap cleanup EXIT
@@ -284,7 +301,7 @@ PY
 # stream that is never written; only (time, kind, name, address) is kept.
 tcpdump -i any -nn -U -s 512 -w - \
     'udp port 53 or (tcp and (tcp[((tcp[12:1] & 0xf0) >> 2):1] = 0x16) and (tcp[((tcp[12:1] & 0xf0) >> 2) + 5:1] = 0x01))' 2>/dev/null \
-  | python3 -u -c "$NAMES_PARSER" "$OUT/names.tsv" &
+  | python3 -u -c "$NAMES_PARSER" "$OUT/names.tsv" 2>/dev/null &
 PIDS+=($!)
 
 # Who owns each internet socket, once a second (process name and pid only).
