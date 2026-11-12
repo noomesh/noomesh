@@ -199,13 +199,18 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
                         .map(|a| format!("'{}'", a.replace('\'', r"'\''")))
                         .collect();
                     let relaunch_may_prompt = ctx_sudo_may_prompt(ctx);
+                    // The marker tells the relaunched wizard's closing block that
+                    // Docker was installed this session (i677 #10), and keeps any
+                    // `noo` it runs from relaunching again.
+                    let marker = crate::docker_group::RELAUNCHED_ENV;
                     let code = Command::new("sg")
                         .args(["docker", "-c", &quoted.join(" ")])
+                        .env(marker, "1")
                         .status().ok().and_then(|s| s.code())
                         .or_else(|| {
                             ctx.info("(sg not available — relaunching via `sudo -g docker`)");
                             sudo_cmd(relaunch_may_prompt)
-                                .args(["-g", "docker", &exe])
+                                .args(["-g", "docker", "env", &format!("{marker}=1"), &exe])
                                 .args(&argv)
                                 .status().ok().and_then(|s| s.code())
                         });

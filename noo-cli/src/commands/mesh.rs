@@ -43,6 +43,15 @@ fn print_json(v: &serde_json::Value) {
 /// compose's per-container lines into one live line ([`fold_launcher_output`]). `--json` mode with `json_action`: child
 /// stdout → our stderr, then the `{"status":"ok","action":…}` contract.
 fn run_script(g: &Globals, name: &str, args: &[String], json_action: Option<&str>) -> i32 {
+    // i677 #10: right after onboard installs Docker, the user's shell is not
+    // yet in the docker group, and every launcher fails at its first docker
+    // call ("permission denied"). That one case is run again with the group
+    // active; the launcher reports any other docker problem itself.
+    if let Err(why) = super::offboard::docker_access() {
+        if let Some(code) = crate::docker_group::relaunch_if_needed(&why) {
+            return code;
+        }
+    }
     let root = repo_root();
     let script = root.join("scripts").join(name);
     if !script.is_file() {
@@ -733,6 +742,9 @@ pub fn mesh_stop(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             Ok(v) if v.is_empty() => eprintln!("no volumes of compose project {project} on this host"),
             Ok(v) => eprintln!("this deletes {} volume(s) of compose project {project}: {}", v.len(), v.join(", ")),
             Err(why) => {
+                if let Some(code) = crate::docker_group::relaunch_if_needed(&why) {
+                    return Ok(code);
+                }
                 let lines = super::offboard::docker_unreachable_refusal(&why, "noo stack stop --volumes");
                 for l in &lines[1..] {
                     println!("{}", ui::note(l));
@@ -891,6 +903,9 @@ pub fn mesh_clean(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // failure read as "nothing there" deletes the wrong things. Not installed
     // at all is a positive answer (the script then cleans what is on disk).
     if let Err(why) = super::offboard::docker_access() {
+        if let Some(code) = crate::docker_group::relaunch_if_needed(&why) {
+            return Ok(code);
+        }
         let lines = super::offboard::docker_unreachable_refusal(&why, "noo stack clean");
         for l in &lines[1..] {
             println!("{}", ui::note(l));
