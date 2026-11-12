@@ -1211,7 +1211,7 @@ pub fn node_fetch(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 return Ok(0);
             }
         };
-        let mut receipt = |sum: &str| send_fetch_receipt(&agent, &base, &url, &node, sum);
+        let mut receipt = |_sum: &str| {};
         if let Some(rc) = settle_status(resp.status().as_u16(), last_for_etag.as_deref(), &mut receipt) {
             return Ok(rc);
         }
