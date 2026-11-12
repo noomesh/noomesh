@@ -82,6 +82,13 @@ confirm() {
         echo "  $1 (y/N) y  [--yes]"
         return 0
     fi
+    # No terminal to ask on: refuse, never block on a read nobody answers.
+    # The same rule and words as the CLI's confirm_prompt (noo stack clean
+    # refuses before this script runs); this covers the script run directly.
+    if [ ! -t 0 ]; then
+        echo "confirmation required: pass --yes (stdin is not a TTY; refusing to block on: $1)" >&2
+        exit 2
+    fi
     local REPLY
     read -p "  $1 (y/N) " -r REPLY
     [[ "$REPLY" =~ ^[Yy]$ ]]
