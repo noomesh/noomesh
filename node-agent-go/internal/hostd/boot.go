@@ -129,7 +129,7 @@ done
 # their door and never retries them. The same script noo-netns-restore.service
 # runs at every dockerd start; here it covers a host without systemd.
 if [ -f "$root/scripts/noo-netns-restore.sh" ]; then
-  bash "$root/scripts/noo-netns-restore.sh" || echo "boot-restore: the namespace restore reported a problem (above)" >&2
+  : # mutant: no namespace restore at boot
 fi
 echo "boot-restore: wrote the secret files and started $n container(s)"
 if [ -n "$down" ]; then
