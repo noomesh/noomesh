@@ -189,6 +189,11 @@ if [ "$MODEL" = tiny ]; then
     step switch-to-tiny-model 300 -- noo models switch "$TINY_MODEL" --backend ollama --yes || fail_onboarded
 fi
 step verify 900 -- noo cluster verify --wait
+# PROBE (cf, #1069): the verify table above shows only failing rows' detail;
+# the JSON keeps every row, so a PASSING row's text (e.g. the sandbox
+# executor's "profile: 3.x form") is readable from the cell's artifacts. Same
+# redactor and upload scan as every log. Never the failed step.
+step probe-verify-json 300 -- noo --json cluster verify
 # DIAGNOSTIC (fa, i677 finding 17: the box's own node reads "online: status
 # unknown" and holds no live tunnel): the self-agent's own log, the URLs and
 # id it was given (ONLY those keys: the env file also holds the agent's

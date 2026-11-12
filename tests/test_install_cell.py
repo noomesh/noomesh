@@ -310,3 +310,14 @@ def test_the_self_agent_diagnostics_read_only_the_named_env_keys():
     d = text[text.index("step probe-self-agent-diagnostics"):text.index("true'", text.index("step probe-self-agent-diagnostics"))]
     assert 'grep -E "^(NATS_URL|NOO_GATEWAY_URL|CONTROLLER_URL|NODE_ID)=" /etc/noo-node-agent.env' in d
     assert "cat /etc/noo-node-agent.env" not in d and "TOKEN" not in d
+
+
+def test_the_cell_saves_verify_as_json_after_verify():
+    """cf (#1069): passing verify rows are readable from the artifacts. The JSON
+    run is a probe (never the failed step), after the real verify, before the
+    first answer, and goes through step() (redacted, scanned, uploaded)."""
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    verify = text.index("step verify 900 -- noo cluster verify --wait")
+    probe = text.index("step probe-verify-json 300 -- noo --json cluster verify\n")
+    answer = text.index("step first-answer ")
+    assert verify < probe < answer, (verify, probe, answer)
