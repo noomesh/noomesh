@@ -12892,7 +12892,7 @@ mod lanes_row_tests {
     #[test]
     fn the_row_is_on_every_node() {
         let code = crate::test_src::own_code(include_str!("cluster_verify.rs"));
-        assert!(code.contains("out.push(lanes_check(n));"));
+        assert!(code.contains("out.push(lanes_check_at(n, now_unix));"));
     }
 }
 
@@ -13038,7 +13038,10 @@ mod gpu_contention_tests {
             "lease": {"owner": "rbwolf", "operation_id": "res-1", "generation": 6, "workload": "rhaddon/worker"}}));
         let c = gpu_contention_check(&reserved).unwrap();
         assert!(c.detail.starts_with("mode workload rhaddon/worker: held by rbwolf"), "{}", c.detail);
-        assert!(c.remedy.unwrap().starts_with("noo cluster gpu release host3 --operation res-1 --generation 6"));
+        // A reservation ends when its workload releases it: the release is
+        // offered only as ending it early, never as the fix.
+        assert_eq!(c.remedy.as_deref(),
+            Some("nothing to do: released when rhaddon/worker ends; to end it early (stops rhaddon/worker): noo cluster gpu release host3 --operation res-1 --generation 6"));
     }
 
     #[test]
