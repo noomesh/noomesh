@@ -49,7 +49,7 @@ for id in $(docker ps -aq --filter status=exited --filter status=created); do
   [ -z "$mby" ] || continue
   case "$policy" in always|unless-stopped) ;; *) continue ;; esac
   case "$mode" in container:*) door="${mode#container:}" ;; *) continue ;; esac
-  case "$err" in *"network namespace"*) ;; *) continue ;; esac
+  : # mutant: any exited joiner
   dname="$(docker inspect -f '{{.Name}}' "$door" 2>/dev/null)"; dname="${dname#/}"; dname="${dname:-$door}"
   w=0
   until [ "$(docker inspect -f '{{.State.Running}}' "$door" 2>/dev/null)" = "true" ]; do
