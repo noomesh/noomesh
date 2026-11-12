@@ -258,28 +258,38 @@ pub fn offboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 
     // ── 1. Stack: containers, volumes, networks ─────────────────────────
     let project = crate::envfile::compose_project();
+    let cluster_net = crate::envfile::cluster_network();
     let listed = if docker == DockerAccess::Reachable {
-        docker_list(&["ps", "-aq", "--filter", &format!("name={prefix}-")])
-            .and_then(|c| stack_volumes(&project).map(|v| (c, v)))
+        docker_list(&["ps", "-aq", "--filter", &format!("name={prefix}-")]).and_then(|c| {
+            stack_volumes(&project).and_then(|v| stack_networks(&project, &cluster_net).map(|n| (c, v, n)))
+        })
     } else {
-        Ok((Vec::new(), Vec::new()))
+        Ok((Vec::new(), Vec::new(), Vec::new()))
     };
-    let (containers, volumes) = match listed {
-        Ok(cv) => cv,
-        Err(why) => return Ok(stop_walk("the stack's containers and volumes", &why)),
+    let (containers, volumes, networks) = match listed {
+        Ok(cvn) => cvn,
+        Err(why) => return Ok(stop_walk("the stack's containers, volumes and networks", &why)),
     };
     item("stack");
-    if (!containers.is_empty() || !volumes.is_empty())
+    let anything = !containers.is_empty() || !volumes.is_empty() || !networks.is_empty();
+    if anything
         && !(yes || ctx_confirm(g, false,
-            "STOP + DELETE the stack (containers, volumes = ALL DATA) on this controller?", false))
+            "STOP + DELETE the stack (containers, volumes = ALL DATA, networks) on this controller?", false))
     {
         sub(Glyph::Bullet, "kept (skipped)");
-    } else if !containers.is_empty() || !volumes.is_empty() {
+    } else if anything {
         if !containers.is_empty() {
             run("docker", &[vec!["rm".into(), "-f".into()], containers.clone()].concat());
         }
         for v in &volumes {
             run("docker", &["volume".into(), "rm".into(), "-f".into(), v.clone()]);
+        }
+        // Networks after the containers: a network with an attached
+        // container cannot be removed. This project's, by exact label, and
+        // the launcher's external cluster network by exact name (i677a:
+        // offboard said "complete" with four noomesh_* networks left).
+        for n in &networks {
+            run("docker", &["network".into(), "rm".into(), n.clone()]);
         }
         // Agreed to and attempted: whatever is still there is a FAILURE of
         // this offboard, not a choice. It fails the walk below (i677a).
@@ -287,22 +297,16 @@ pub fn offboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             Ok(left) => removal_failed.extend(left.into_iter().map(|v| format!("volume {v}"))),
             Err(why) => removal_failed.push(format!("volumes (not re-checked: {why})")),
         }
-        match docker_list(&["network", "ls", "--format", "{{.Name}}"]) {
-            Ok(nets) => {
-                for n in nets {
-                    if n == "noo-cluster" || n.starts_with(&format!("{prefix}_")) {
-                        run("docker", &["network".into(), "rm".into(), n]);
-                    }
-                }
-            }
-            Err(why) => removal_failed.push(format!("networks (not listed: {why})")),
+        match stack_networks(&project, &cluster_net) {
+            Ok(left) => removal_failed.extend(left.into_iter().map(|n| format!("network {n}"))),
+            Err(why) => removal_failed.push(format!("networks (not re-checked: {why})")),
         }
-        sub(Glyph::Ok, &format!("{} container(s), {} volume(s), networks removed", containers.len(), volumes.len()));
+        sub(Glyph::Ok, &format!("{} container(s), {} volume(s), {} network(s) removed", containers.len(), volumes.len(), networks.len()));
     } else if docker == DockerAccess::NotInstalled {
         sub(Glyph::Ok, "docker is not installed: no stack here");
     } else {
         // docker ANSWERED, and listed nothing: a positive "clean".
-        sub(Glyph::Ok, "no containers or volumes — already clean");
+        sub(Glyph::Ok, "no containers, volumes or networks — already clean");
     }
 
     // ── 1a. Pulled stack images (finding #85) ───────────────────────────
@@ -878,6 +882,15 @@ fn audit_leftovers(g: &Globals, print: bool) -> Vec<String> {
         Ok(v) => item("stack volumes", !v.is_empty(), format!("{} present", v.len())),
         Err(why) => item("stack volumes (not checked)", true, format!("docker did not answer: {why}")),
     }
+    let networks = match &access {
+        Ok(DockerAccess::NotInstalled) => Ok(Vec::new()),
+        Ok(DockerAccess::Reachable) => stack_networks(&crate::envfile::compose_project(), &crate::envfile::cluster_network()),
+        Err(why) => Err(why.clone()),
+    };
+    match networks {
+        Ok(n) => item("stack networks", !n.is_empty(), if n.is_empty() { String::new() } else { n.join(", ") }),
+        Err(why) => item("stack networks (not checked)", true, format!("docker did not answer: {why}")),
+    }
 
     let home = crate::onboard::standalone::default_home();
     item("standalone home", home.exists(), home.display().to_string());
@@ -962,6 +975,29 @@ fn audit_leftovers(g: &Globals, print: bool) -> Vec<String> {
 /// ones its audit (`--check`, and the walk's own Verify) must not find.
 pub(crate) fn stack_volumes(project: &str) -> Result<Vec<String>, String> {
     docker_list(&["volume", "ls", "--format", "{{.Name}}\t{{.Labels}}"]).map(|l| select_stack_volumes(&l, project))
+}
+
+/// This install's Docker networks: those whose compose project label IS this
+/// project, plus the launcher's external cluster network by its exact name.
+pub(crate) fn stack_networks(project: &str, cluster_net: &str) -> Result<Vec<String>, String> {
+    docker_list(&["network", "ls", "--format", "{{.Name}}\t{{.Labels}}"]).map(|l| select_stack_networks(&l, project, cluster_net))
+}
+
+/// Pure: exact project label, or exactly the cluster network's name. Never a
+/// name prefix (a box can run several stacks).
+fn select_stack_networks(lines: &[String], project: &str, cluster_net: &str) -> Vec<String> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let (name, labels) = line.split_once('\t').unwrap_or((line.as_str(), ""));
+            (name == cluster_net
+                || labels
+                    .split(',')
+                    .filter_map(|kv| kv.split_once('='))
+                    .any(|(k, v)| k == "com.docker.compose.project" && v == project))
+            .then(|| name.to_string())
+        })
+        .collect()
 }
 
 /// Pure selection over `docker volume ls --format '{{.Name}}\t{{.Labels}}'`
@@ -1268,7 +1304,7 @@ mod docker_gate_tests {
         let stop = walk.find("stop_self_heal_daemons(true);").expect("step 0");
         let first_rm = walk.find("run(\"docker\"").expect("a docker removal");
         assert!(gate < refuse && refuse < stop && stop < first_rm, "{walk}");
-        assert!(walk.contains("Err(why) => return Ok(stop_walk(\"the stack's containers and volumes\", &why)),"), "{walk}");
+        assert!(walk.contains("Err(why) => return Ok(stop_walk(\"the stack's containers, volumes and networks\", &why)),"), "{walk}");
         assert!(walk.contains("Err(why) => return Ok(stop_walk(\"the stack images\", &why)),"), "{walk}");
     }
 
@@ -1281,5 +1317,53 @@ mod docker_gate_tests {
         for label in ["stack containers (not checked)", "stack volumes (not checked)", "stack images (not checked)"] {
             assert!(audit.contains(&format!("item(\"{label}\", true,")), "{label}: {audit}");
         }
+    }
+}
+
+#[cfg(test)]
+mod network_selection_tests {
+    use super::*;
+
+    /// i677a (matrix run 4): offboard said "complete" with noomesh_noo-browser,
+    /// noomesh_noo-db, noomesh_noo-pg-host and noomesh_noo-sandbox left. The
+    /// old match was `noo-cluster` or a `noo_` prefix. Now: the exact project
+    /// label, or the external cluster network by its exact name; never a prefix.
+    #[test]
+    fn this_projects_networks_and_the_cluster_network_are_selected_and_nothing_else() {
+        let ls: Vec<String> = [
+            "noomesh_noo-db\tcom.docker.compose.network=noo-db,com.docker.compose.project=noomesh",
+            "noomesh_noo-sandbox\tcom.docker.compose.project=noomesh",
+            "noo-cluster",
+            "noo-cluster-2",
+            "noo-galaxy_noo-db\tcom.docker.compose.project=noo-galaxy",
+            "noomesh_unlabelled",
+            "bridge",
+            "host",
+        ].iter().map(|s| s.to_string()).collect();
+        assert_eq!(select_stack_networks(&ls, "noomesh", "noo-cluster"), ["noomesh_noo-db", "noomesh_noo-sandbox", "noo-cluster"]);
+        assert_eq!(select_stack_networks(&ls, "noo-galaxy", "noo-galaxy-cluster"), ["noo-galaxy_noo-db"]);
+    }
+
+    #[test]
+    fn the_cluster_network_name_mirrors_the_launcher() {
+        use crate::envfile::cluster_network_for;
+        assert_eq!(cluster_network_for("", None), "noo-cluster");
+        assert_eq!(cluster_network_for("", Some("my-net")), "my-net");
+        assert_eq!(cluster_network_for("galaxy", Some("ignored")), "noo-galaxy-cluster");
+    }
+
+    /// Networks are part of the one stack consent, removed after the
+    /// containers, re-checked like the volumes, and audited.
+    #[test]
+    fn networks_are_removed_after_the_containers_and_a_survivor_fails_the_walk() {
+        let code = crate::test_src::own_code(include_str!("offboard.rs"));
+        let walk = crate::test_src::fn_body(&code, "pub fn offboard(");
+        let rm_c = walk.find("run(\"docker\", &[vec![\"rm\".into(), \"-f\".into()], containers.clone()].concat());").expect("containers");
+        let rm_n = walk.find("run(\"docker\", &[\"network\".into(), \"rm\".into(), n.clone()]);").expect("networks");
+        let recheck = walk.find("Ok(left) => removal_failed.extend(left.into_iter().map(|n| format!(\"network {n}\"))),").expect("re-check");
+        assert!(rm_c < rm_n && rm_n < recheck, "{walk}");
+        assert!(!walk.contains("n.starts_with(&format!(\"{prefix}_\"))"), "no name prefix: {walk}");
+        let audit = crate::test_src::fn_body(&code, "fn audit_leftovers(");
+        assert!(audit.contains("item(\"stack networks (not checked)\", true,"), "{audit}");
     }
 }
