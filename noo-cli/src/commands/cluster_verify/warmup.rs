@@ -358,6 +358,14 @@ pub(crate) fn judge_node_doors(check: Check, warm: &[String], n: &Value, now_uni
     Check { detail: format!("{} — {}", check.detail, why.join("; ")), ..check }
 }
 
+/// What `--wait` waits on for one node record: a backend door still warming
+/// up, or (i677 #17) a gateway that just started and has not heard this
+/// node's gossip yet.
+pub(crate) fn node_still_starting(n: &serde_json::Value, now: i64) -> bool {
+    super::backend_doors_row(n, now).verdict == Verdict::Starting
+        || n["status_reason"].as_str() == Some("gateway_settling")
+}
+
 /// `cluster verify <node>... --wait`: poll the node records until no
 /// selected node's `backend doors` row is starting, or the cap. Prints one
 /// line when the cap is hit (never in `--json`).
@@ -369,9 +377,7 @@ pub(crate) fn wait_for_node_warmup(g: &Globals, ids: &[String]) {
         let now = super::now_unix();
         body["nodes"].as_array().is_some_and(|ns| ns.iter()
             .filter(|n| ids.is_empty() || ids.iter().any(|w| n["id"].as_str() == Some(w.as_str())))
-            .any(|n| super::backend_doors_row(n, now).verdict == Verdict::Starting
-                // i677 #17: a gateway that just started has not heard this node's gossip yet.
-                || n["status_reason"].as_str() == Some("gateway_settling")))
+            .any(|n| node_still_starting(n, now)))
     };
     let settled = wait_until_settled(&mut starting, WAIT_CAP_SECS, &super::now_unix, &mut |s| {
         std::thread::sleep(std::time::Duration::from_secs(s))
