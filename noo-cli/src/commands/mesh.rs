@@ -722,7 +722,14 @@ pub fn mesh_stop(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // (i677 #20). A docker that does not answer is refused, never read
         // as "no volumes".
         let project = crate::envfile::compose_project();
-        match super::offboard::docker_access().and_then(|_| super::offboard::stack_volumes(&project)) {
+        // No docker binary at all is a positive answer (nothing of this
+        // stack can exist here), the same reading offboard gives it.
+        let listed = match super::offboard::docker_access() {
+            Ok(super::offboard::DockerAccess::NotInstalled) => Ok(Vec::new()),
+            Ok(super::offboard::DockerAccess::Reachable) => super::offboard::stack_volumes(&project),
+            Err(why) => Err(why),
+        };
+        match listed {
             Ok(v) if v.is_empty() => eprintln!("no volumes of compose project {project} on this host"),
             Ok(v) => eprintln!("this deletes {} volume(s) of compose project {project}: {}", v.len(), v.join(", ")),
             Err(why) => {
