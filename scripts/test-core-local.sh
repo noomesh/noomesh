@@ -25,6 +25,12 @@
 #   NOO_KB_AUDIENCE_TEST_DSN  passed through if you set it (a local pgvector);
 #                             unset, those tests skip
 #   NOO_TEST_CORE_VENV        where the venv lives (default under ~/.cache)
+#   NOO_BATCH_MIN_DISK_GB     refuse to start below this much free disk (15) on
+#                             the venv's volume: the same knob noo-batch reads
+#                             (noomesh-internal ops/batch/lib-disk.sh)
+#   NOO_TEST_CORE_VENV_KEEP   how many venvs the default cache keeps (6): each
+#                             run prunes the least recently used others
+#                             (scripts/test-core-venv-prune.sh), never one in use
 # tests/test_test_core_local.py fails if the steps change shape or gain an
 # env key this script does not supply.
 
@@ -77,8 +83,30 @@ if [ "$public" = "true" ]; then
   trellion_main=$(GIT_TERMINAL_PROMPT=0 git ls-remote https://github.com/personifAI/trellion refs/heads/main | cut -f1)
 fi
 
-venv="${NOO_TEST_CORE_VENV:-${XDG_CACHE_HOME:-$HOME/.cache}/noomesh/test-core-venv/$(printf '%s' "$root" | sha256sum | cut -c1-16)}"
+cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/noomesh/test-core-venv"
+venv="${NOO_TEST_CORE_VENV:-$cache_dir/$(printf '%s' "$root" | sha256sum | cut -c1-16)}"
 case "$venv" in "$root"|"$root"/*) echo "test-core-local: the venv must live outside the checkout ($venv)" >&2; exit 1 ;; esac
+# Refuse to start on a nearly full disk (2026-11-10: the venv cache filled
+# awolf's root volume to 0 MB free). Measured at the nearest existing
+# directory of the venv's path, with noo-batch's knob and default.
+min_gb="${NOO_BATCH_MIN_DISK_GB:-15}"
+[[ "$min_gb" =~ ^[0-9]+$ ]] || { echo "test-core-local: NOO_BATCH_MIN_DISK_GB=$min_gb is not a whole number of GB" >&2; exit 1; }
+probe="$venv"; while [ ! -d "$probe" ] && [ "$probe" != "/" ]; do probe=$(dirname "$probe"); done
+free_kb=$(df -Pk "$probe" 2>/dev/null | awk 'NR==2 {print $4}')
+[[ "$free_kb" =~ ^[0-9]+$ ]] || { echo "test-core-local: cannot read the free space on the volume holding $probe" >&2; exit 1; }
+if [ "$free_kb" -lt $((min_gb * 1024 * 1024)) ]; then
+  echo "test-core-local: only $((free_kb / 1024 / 1024)) GB free on the volume holding $probe; at least $min_gb GB is needed (NOO_BATCH_MIN_DISK_GB)" >&2
+  exit 1
+fi
+# This run's venv is in use (by this pid, which `exec` keeps for pytest) and
+# just used; then the default cache is pruned to the most recently used few
+# (one venv per checkout path, ~2 GB each: 192 GB on 2026-11-10).
+mkdir -p "$venv/.in-use"
+: > "$venv/.in-use/$$"
+touch "$venv/.last-used"
+if [ -z "${NOO_TEST_CORE_VENV:-}" ]; then
+  "$root/scripts/test-core-venv-prune.sh" "$cache_dir" "${NOO_TEST_CORE_VENV_KEEP:-6}" "$venv" || true
+fi
 stamp=$( { printf '%s\n' "$py" "$public" "$trellion_main" "$install_body"; cat pyproject.toml docker/Dockerfile.whisper; } | sha256sum | cut -d' ' -f1)
 if [ ! -x "$venv/bin/python" ] || [ "$(cat "$venv/.ci-install-stamp" 2>/dev/null)" != "$stamp" ]; then
   echo "test-core-local: installing CI's test-core set (trellion public: $public) on python $py into $venv"
