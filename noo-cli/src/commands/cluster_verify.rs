@@ -8111,7 +8111,9 @@ mod tests {
                 "telemetry": { "tailscale_logs": "off", "tailscale_logs_configured": true, "os_reporters": [] } } },
             "inbound": "ok",
             "harness_policy": "auto",
-            "host_services": { "harness": { "state": "running" } },
+            "host_services": { "harness": { "state": "running", "egress": {
+                "state": "enforced", "reason": "", "ip_deny": "0.0.0.0/0 ::/0", "ip_allow": "127.0.0.1/32 ::1/128 10.0.0.0/8",
+                "resolver": "unit", "pid_match": true, "lookup": "failed", "connect": "timeout", "stale_hosts": [] } } },
             "self_node": false,
             "lanes": [{ "backend": "ollama", "model": "gemma4:12b", "role": "chat", "state": "serving", "reason": "" }],
         })
@@ -8842,7 +8844,7 @@ mod tests {
         let c = node_checks(&healthy(now), "v0.2.70", "0.5.57", now, Some(true));
         let failed: Vec<_> = c.iter().filter(|c| c.verdict == Verdict::Fail).map(|c| c.name).collect();
         assert!(failed.is_empty(), "{failed:?}");
-        assert_eq!(c.len(), 23, "seventeen node invariants (the log shipper, peer identity, control over bus, streaming over tunnel, backend doors, vendor telemetry, backend images, data root and lanes among them) plus six host-fact rows (boot partition and host telemetry among them), each judged");
+        assert_eq!(c.len(), 24, "eighteen node invariants (the log shipper, peer identity, control over bus, streaming over tunnel, backend doors, vendor telemetry, backend images, data root, lanes and harness egress among them) plus six host-fact rows (boot partition and host telemetry among them), each judged");
         let lanes = c.iter().find(|c| c.name == "lanes").expect("the lanes row");
         assert_eq!((lanes.verdict, lanes.detail.as_str()), (Verdict::Ok, "1 chat lane(s): 1 serving, 0 on demand"));
     }
@@ -9323,6 +9325,7 @@ mod tests {
 
         let mut old = healthy(now);
         old["host_services"]["harness"]["state"] = "running".into();
+        old["host_services"]["harness"]["egress"] = serde_json::Value::Null; // an agent older than the hold
         let c = node_checks(&old, "v0.2.70", "0.5.57", now, Some(true));
         assert_eq!(verdict(&c, "harness egress"), Verdict::Warn, "an agent too old to report is not a pass");
 
