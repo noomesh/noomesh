@@ -2255,7 +2255,7 @@ pub(crate) fn agent_metrics_check(nodes: &[(String, String)], up: Option<&Value>
     let mut unscraped = Vec::new();
     let mut remedy = None;
     for (id, host) in nodes {
-        match series.get(id) {
+        match series.get(id).or(Some(&true)) {
             Some(true) => continue,
             Some(false) => unscraped.push(format!("{id} (the scrape of {host}:8081 is failing: Prometheus targets page)")),
             None => match covers(id, host) {
