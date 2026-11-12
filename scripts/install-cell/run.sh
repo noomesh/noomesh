@@ -142,7 +142,8 @@ step stack-start 1800 -- noo stack start || fail_onboarded
 step health 600 -- sh -c 'for i in $(seq 1 40); do noo health >/dev/null 2>&1 && break; sleep 15; done; noo health' \
     || fail_onboarded
 step verify 900 -- noo cluster verify --wait || fail_onboarded
-step first-answer 1800 -- sh -c 'out="$(noo chat --message "Reply with exactly one word: ready")"; rc=$?
+# The single-turn line docs/getting-started/first-chat.md gives, verbatim.
+step first-answer 1800 -- sh -c 'out="$(noo chat --message "in two lines, what can you do on this machine?")"; rc=$?
   printf "%s\n" "$out"; [ $rc = 0 ] && [ -n "$(printf "%s" "$out" | tr -d "[:space:]")" ]' || fail_onboarded
 meta first_answer_s "$(( $(date +%s) - CELL_START ))"
 

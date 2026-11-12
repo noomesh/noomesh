@@ -62,6 +62,18 @@ def test_a_pem_block_is_masked_whole_and_digests_stay_readable():
     assert digest in _redact(f"image digest {digest}\n"), "a digest is evidence, not a secret"
 
 
+def test_a_secret_revealed_under_its_name_is_masked_and_scanned():
+    # onboard's reveal_secret (prompt.rs): the name, then the value ALONE on
+    # the next line, short and shapeless (fa, 2026-11-12).
+    shown = "\n  \x1b[1mNOO_AGE_BACKUP_PASSPHRASE\x1b[0m\n\n  correct-horse\nnext line stays\n"
+    out = _redact(shown)
+    assert "correct-horse" not in out and "NOO_AGE_BACKUP_PASSPHRASE" in out and "next line stays" in out
+    assert "\x1b[" not in out
+    assert C.secret_hits("  NOO_ADMIN_PASSWORD\n  hunter2\n"), "the scan sees an unmasked value under a name"
+    assert not C.secret_hits(out)
+    assert _redact("KEY POINTS\nnot a secret\n").count("[REDACTED]") == 0, "a heading with a space is not a name"
+
+
 def test_the_upload_scan_refuses_anything_secret_shaped(tmp_path):
     (tmp_path / "ok.log").write_text(_redact("\n".join(SECRET_LINES) + "\n"))
     scan = lambda: subprocess.run([sys.executable, str(CELL), "scan", str(tmp_path)],  # noqa: E731
