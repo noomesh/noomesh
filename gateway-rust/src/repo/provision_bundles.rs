@@ -27,7 +27,7 @@ fn key_of(created_at: chrono::DateTime<chrono::Utc>, len: i64) -> Key {
 /// The staged row's key, without reading its bytes. `None`: nothing staged.
 pub async fn key(db: impl sqlx::PgExecutor<'_>, node: &str) -> Result<Option<Key>, sqlx::Error> {
     let row: Option<(chrono::DateTime<chrono::Utc>, i64)> =
-        sqlx::query_as("SELECT created_at, octet_length(blob)::bigint FROM noo_provision_bundles WHERE node_name = $1")
+        sqlx::query_as("SELECT created_at, octet_length(blob)::bigint, blob FROM noo_provision_bundles WHERE node_name = $1")
             .bind(node)
             .fetch_optional(db)
             .await?;
