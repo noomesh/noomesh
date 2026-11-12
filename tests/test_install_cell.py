@@ -289,3 +289,14 @@ def test_a_probe_is_reported_on_its_own_and_never_fails_the_cell(tmp_path):
     text = (ROOT / "scripts/install-cell/run.sh").read_text()
     assert text.index("step probe-offboard-without-docker") < text.index("\nteardown\nfinish"), "before the real teardown"
     assert "--clear-groups" in text, "the probe must really drop the docker group"
+
+
+def test_a_failed_probe_skips_the_cleanup_of_the_box_it_altered():
+    # Run 4: the offboard probe wiped the box (as fa predicted on 0.6.23),
+    # the box then read as a node, and the real uninstall refused.
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    assert "[ \"$ok\" = 1 ]' || PROBE_ALTERED=1" in text, "a failed probe marks the box altered"
+    td = text[text.index("teardown() {"):text.index("\n}\n", text.index("teardown() {"))]
+    skip = td.index('if [ "${PROBE_ALTERED:-0}" = 1 ]; then')
+    assert skip < td.index("noo offboard --uninstall -y") and td.index("return 0", skip) < td.index("noo offboard --uninstall -y")
+    assert "noo models switch \"$TINY_MODEL\" --backend ollama --yes" in text, "non-interactive switch needs --yes"
