@@ -189,6 +189,16 @@ if [ "$MODEL" = tiny ]; then
     step switch-to-tiny-model 300 -- noo models switch "$TINY_MODEL" --backend ollama --yes || fail_onboarded
 fi
 step verify 900 -- noo cluster verify --wait
+# DIAGNOSTIC (fa, i677 finding 17: the box's own node reads "online: status
+# unknown" and holds no live tunnel): the self-agent's own log, the URLs and
+# id it was given (ONLY those keys: the env file also holds the agent's
+# token), and how the controller sees it. A probe: never the failed step.
+step probe-self-agent-diagnostics 120 -- sh -c '
+  echo "== journalctl -u noo-node-agent (last 300)"; sudo journalctl -u noo-node-agent --no-pager -n 300 2>&1
+  echo "== /etc/noo-node-agent.env (URLs and id only)"
+  sudo grep -E "^(NATS_URL|NOO_GATEWAY_URL|CONTROLLER_URL|NODE_ID)=" /etc/noo-node-agent.env 2>&1
+  echo "== noo --json cluster show $(hostname)"; noo --json cluster show "$(hostname)" 2>&1
+  true'
 # The single-turn line docs/getting-started/first-chat.md gives, verbatim.
 step first-answer 1800 -- sh -c 'out="$(noo chat --message "in two lines, what can you do on this machine?")"; rc=$?
   printf "%s\n" "$out"; [ $rc = 0 ] && [ -n "$(printf "%s" "$out" | tr -d "[:space:]")" ]' || fail_onboarded
