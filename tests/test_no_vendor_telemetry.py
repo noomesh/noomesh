@@ -686,7 +686,7 @@ def test_the_doc_has_a_row_and_a_switch_for_every_harness_kind():
         assert f"kind `{kind}`" in doc, f"docs/security/telemetry.md has no Components row for harness kind {kind}"
         for k in switches:
             assert k in doc, f"docs/security/telemetry.md does not mention {k}"
-    for needle in ("skipWebFetchPreflight", "not shipped", "code.claude.com/docs/en/env-vars", "COPILOT_OFFLINE", "cloud model"):
+    for needle in ("skipWebFetchPreflight", "Observed off", "not yet observed", "code.claude.com/docs/en/env-vars", "COPILOT_OFFLINE", "cloud model"):
         assert needle in doc, f"docs/security/telemetry.md does not mention {needle!r}"
     assert "### Paid add-ons" in doc
 
