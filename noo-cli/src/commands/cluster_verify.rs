@@ -2261,7 +2261,6 @@ pub(crate) fn agent_metrics_check(nodes: &[(String, String)], up: Option<&Value>
             None => match covers(id, host) {
                 Some(false) => {
                     unscraped.push(format!("{id} (its leaf has no SAN for {host}, so the gateway leaves it out)"));
-                    remedy.get_or_insert(format!("noo security pki issue-node {id} {host}"));
                 }
                 Some(true) => unscraped.push(format!("{id} (not in the scrape list yet: the gateway refreshes it every minute; see its log for scrape_target_skipped)")),
                 None => unscraped.push(format!("{id} (no readable public leaf for it on this controller)")),
