@@ -1035,6 +1035,62 @@ fn already_applied(root_seen: Option<&str>, user_seen: Option<&str>, sum: &str) 
     }
 }
 
+/// `If-None-Match` for the bundle GET: the quoted sha of the last applied
+/// bundle, and only when that is 64 lowercase hex (anything else sends no header).
+fn if_none_match_for(last: Option<&str>) -> Option<String> {
+    let l = last?.trim();
+    (l.len() == 64 && l.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+        .then(|| format!("\"{l}\""))
+}
+
+/// What the bundle GET's status means.
+#[derive(Debug, PartialEq)]
+enum FetchOutcome {
+    /// 200: a body follows.
+    Fetched,
+    /// 304: the controller's bundle is the one already applied (its sha).
+    Unchanged(String),
+    /// 404: nothing staged.
+    NothingStaged,
+    /// Anything else, including a 304 we could not have asked for.
+    Failed,
+}
+
+/// Pure decision on the status code. A 304 only counts when `last` is a sha
+/// we could have sent as `If-None-Match`.
+fn on_status(code: u16, last: Option<&str>) -> FetchOutcome {
+    match code {
+        200 => FetchOutcome::Fetched,
+        304 => match if_none_match_for(last) {
+            Some(_) => FetchOutcome::Unchanged(last.unwrap_or_default().trim().to_string()),
+            None => FetchOutcome::Failed,
+        },
+        404 => FetchOutcome::NothingStaged,
+        _ => FetchOutcome::Failed,
+    }
+}
+
+/// The FETCH receipt. `fetched_at` used to be stamped by the
+/// GET itself — a state write any anonymous caller could make, so it meant
+/// "somebody collected this ciphertext", never "this Mac did". The node has
+/// no fleet secret at this point (it rides inside the bundle), so the proof
+/// is its birth key. Best-effort: a receipt that does not land costs the
+/// operator a progress line, never the apply.
+fn send_fetch_receipt(agent: &ureq::Agent, base: &Path, url: &str, node: &str, sum: &str) {
+    match birth_proof(base, "fetch", node, sum) {
+        Ok(proof) => {
+            let _ = agent
+                .post(&format!("{url}/bootstrap/bundle/{node}/fetched"))
+                .header("x-noo-birth-proof", &proof)
+                .send_json(serde_json::json!({ "sha": sum }));
+        }
+        Err(why) => crate::ui::warned(&format!(
+            "noo node fetch: cannot sign the fetch receipt, so fetched_at will not be stamped \
+             (the controller's `provision --wait` will time out at the fetch stage): {why}"
+        )),
+    }
+}
+
 /// Write a cadence file (`expect-bundle`, `fetch-state`) as the user, by
 /// rename: a root-owned copy an older applier (v0.2.103) left in the user's
 /// tree is replaced instead of failing to open, silently, on every tick.
@@ -1114,7 +1170,19 @@ pub fn node_fetch(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // The bundle GET alone gets a long deadline: a bundle carrying a
         // staged vendor CLI (i83 E1e) is a few hundred MB, which the agent's
         // 60 s global timeout cut off on any link under ~5 MB/s.
-        let mut resp = match agent.get(&format!("{url}/bootstrap/bundle/{node}"))
+        // Conditional GET: the controller's ETag is the sha256 of the ciphertext,
+        // which is exactly what this node records after an apply. An unchanged
+        // bundle then costs a 304 and no body instead of a few hundred MB.
+        // Root's marker is the one that decides, as it does for `already_applied`.
+        let last_for_etag = {
+            let _r = privs::root();
+            read_trim(&last_bundle_path(&base, privs::is_root_process()))
+        };
+        let mut req = agent.get(&format!("{url}/bootstrap/bundle/{node}"));
+        if let Some(v) = if_none_match_for(last_for_etag.as_deref()) {
+            req = req.header("If-None-Match", &v);
+        }
+        let mut resp = match req
             .config().timeout_global(Some(std::time::Duration::from_secs(BUNDLE_FETCH_TIMEOUT_SECS))).build()
             .call()
         {
@@ -1124,8 +1192,17 @@ pub fn node_fetch(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 return Ok(0);
             }
         };
-        if resp.status().as_u16() != 200 {
-            return Ok(0); // nothing staged
+        match on_status(resp.status().as_u16(), last_for_etag.as_deref()) {
+            FetchOutcome::Fetched => {}
+            FetchOutcome::Unchanged(sum) => {
+                // Same receipt as the unchanged path below, so fetched_at keeps
+                // being stamped; nothing else is written (no marker, no cadence
+                // file). There is no debug-level facility in crate::ui, so no
+                // line is emitted: a normal line every tick is the noise this avoids.
+                send_fetch_receipt(&agent, &base, &url, &node, &sum);
+                return Ok(0); // already applied this exact bundle
+            }
+            FetchOutcome::NothingStaged | FetchOutcome::Failed => return Ok(0),
         }
         let mut blob = Vec::new();
         use std::io::Read as _;
@@ -1145,18 +1222,7 @@ pub fn node_fetch(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // no fleet secret at this point (it rides inside the bundle), so the proof
     // is its birth key. Best-effort: a receipt that does not land costs the
     // operator a progress line, never the apply.
-    match birth_proof(&base, "fetch", &node, &sum) {
-        Ok(proof) => {
-            let _ = agent
-                .post(&format!("{url}/bootstrap/bundle/{node}/fetched"))
-                .header("x-noo-birth-proof", &proof)
-                .send_json(serde_json::json!({ "sha": sum }));
-        }
-        Err(why) => crate::ui::warned(&format!(
-            "noo node fetch: cannot sign the fetch receipt, so fetched_at will not be stamped \
-             (the controller's `provision --wait` will time out at the fetch stage): {why}"
-        )),
-    }
+    send_fetch_receipt(&agent, &base, &url, &node, &sum);
 
     let as_root = privs::is_root_process();
     // Root's record of the last bundle applied lives in root's state dir; in
@@ -3161,6 +3227,38 @@ mod tests {
     }
 
     use super::*;
+
+    // ── conditional GET: If-None-Match and 304 ─────────────────────────
+
+    const SHA_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn if_none_match_is_the_quoted_sha_only_for_64_lowercase_hex() {
+        assert_eq!(if_none_match_for(Some(SHA_A)), Some(format!("\"{SHA_A}\"")));
+        assert_eq!(if_none_match_for(Some(&format!("{SHA_A}\n"))), Some(format!("\"{SHA_A}\"")));
+        assert_eq!(if_none_match_for(None), None);
+        assert_eq!(if_none_match_for(Some("")), None);
+        assert_eq!(if_none_match_for(Some(&SHA_A[..63])), None);
+        assert_eq!(if_none_match_for(Some(&format!("{SHA_A}0"))), None);
+        assert_eq!(if_none_match_for(Some(&SHA_A.to_uppercase())), None);
+        assert_eq!(if_none_match_for(Some(&SHA_A.replace('a', "g"))), None);
+    }
+
+    #[test]
+    fn on_status_maps_the_codes() {
+        assert_eq!(on_status(200, Some(SHA_A)), FetchOutcome::Fetched);
+        assert_eq!(on_status(200, None), FetchOutcome::Fetched);
+        assert_eq!(on_status(304, Some(SHA_A)), FetchOutcome::Unchanged(SHA_A.to_string()));
+        assert_eq!(on_status(404, Some(SHA_A)), FetchOutcome::NothingStaged);
+        assert_eq!(on_status(500, Some(SHA_A)), FetchOutcome::Failed);
+        assert_eq!(on_status(403, None), FetchOutcome::Failed);
+    }
+
+    #[test]
+    fn a_304_we_could_not_have_asked_for_is_not_unchanged() {
+        assert_eq!(on_status(304, None), FetchOutcome::Failed);
+        assert_eq!(on_status(304, Some("not-a-sha")), FetchOutcome::Failed);
+    }
 
     // ── bundle header (v2): who it is for, and when it was signed ──────
 
