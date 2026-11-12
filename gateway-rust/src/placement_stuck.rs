@@ -134,6 +134,49 @@ fn clock() -> &'static Mutex<Clock> {
     C.get_or_init(|| Mutex::new(Clock::default()))
 }
 
+/// Why a placed backend is deliberately NOT running, when its node says so:
+/// it is listed in `gpu_contention.paused_backends` (the node agent's GPU
+/// yield paused it) and the pause has a live cause, either a GPU hold whose
+/// lease has not expired (a reservation such as the voice add-on's, or an
+/// operator's hold) or the automatic yield to a workload outside noomesh.
+/// `None` for everything else, so a backend that is really down, or still
+/// paused after its hold expired, keeps alerting. Shared by this loop and
+/// the placement-drift evaluator.
+pub fn paused_on_purpose(node: &Value, backend: &str, now_unix: u64) -> Option<String> {
+    let gc = &node["gpu_contention"];
+    let paused = gc["paused_backends"].as_array()?.iter().any(|b| b.as_str() == Some(backend));
+    if !paused {
+        return None;
+    }
+    let reason = gc["reason"].as_str().filter(|r| !r.is_empty());
+    if let Some(lease) = gc["lease"].as_object() {
+        if let Some(exp) = lease.get("expires_at").and_then(|v| v.as_str()).filter(|e| !e.is_empty()) {
+            match chrono::DateTime::parse_from_rfc3339(exp) {
+                Ok(t) if (t.timestamp().max(0) as u64) <= now_unix => return None, // overdue: alert
+                Ok(_) => {}
+                Err(_) => return None, // an expiry nobody can read excuses nothing
+            }
+        }
+        let op = lease.get("operation_id").and_then(|v| v.as_str()).unwrap_or("?");
+        let mut s = format!("paused for GPU reservation {op}");
+        if let Some(w) = lease.get("workload").and_then(|v| v.as_str()).filter(|w| !w.is_empty()) {
+            s.push_str(&format!(" ({w})"));
+        }
+        if let Some(o) = lease.get("owner").and_then(|v| v.as_str()).filter(|o| !o.is_empty()) {
+            s.push_str(&format!(" by {o}"));
+        }
+        if let Some(r) = lease.get("reason").and_then(|v| v.as_str()).filter(|r| !r.is_empty()).or(reason) {
+            s.push_str(&format!(": {r}"));
+        }
+        return Some(s);
+    }
+    // No hold: the automatic policy yields only to a measured foreign workload.
+    (gc["state"].as_str() == Some("shared")).then(|| match reason {
+        Some(r) => format!("paused: the GPU is in use outside noomesh ({r})"),
+        None => "paused: the GPU is in use outside noomesh".to_string(),
+    })
+}
+
 /// The node's own standing reason for a backend, from its heartbeat.
 fn refusal_reason(node: &Value, backend: &str) -> Option<String> {
     node["reconcile_refusals"].as_array()?.iter().find_map(|r| {
@@ -156,11 +199,23 @@ pub async fn tick(state: &Arc<AppState>) -> anyhow::Result<()> {
     wanted.sort();
     wanted.dedup();
     let (nodes, _merge_err) = crate::routes::cluster::collect_cluster_nodes(state).await;
-    let missing = not_running(&wanted, &nodes);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    // A backend its node paused on purpose (a GPU reservation, a foreign GPU
+    // workload) is not stuck: its clock restarts when the pause ends.
+    let mut missing = not_running(&wanted, &nodes);
+    missing.retain(|m| {
+        let node = nodes.iter().find(|n| n["id"].as_str() == Some(m.node.as_str()));
+        match node.and_then(|n| paused_on_purpose(n, &m.backend, now)) {
+            Some(why) => {
+                tracing::debug!(node = %m.node, backend = %m.backend, why = %why, "placement_stuck.expected_pause");
+                false
+            }
+            None => true,
+        }
+    });
     let stuck = {
         let mut c = clock().lock().unwrap_or_else(|p| p.into_inner());
         c.observe(now, &missing, STUCK_AFTER_SECS)
@@ -203,6 +258,43 @@ pub fn spawn(state: Arc<AppState>) {
 
 #[cfg(test)]
 mod tests {
+    fn held(expires: &str) -> Value {
+        serde_json::json!({"id": "awolf", "gpu_contention": {
+            "state": "held", "paused_backends": ["vllm"], "reason": "voice session",
+            "lease": {"owner": "pai-voice", "operation_id": "op-77", "workload": "pai-voice/personaplex",
+                      "generation": 4, "mode": "immediate", "since": "2026-11-12T15:00:00Z", "expires_at": expires}}})
+    }
+
+    /// A backend paused for a live GPU reservation is expected; one paused past
+    /// its hold's expiry, one not on the node's paused list, or a pause with no
+    /// live cause is not, so a vllm that is really down still alerts.
+    #[test]
+    fn only_a_pause_with_a_live_cause_is_expected() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-12T15:30:00Z").unwrap().timestamp() as u64;
+        let why = paused_on_purpose(&held("2026-11-12T16:00:00Z"), "vllm", now).expect("live reservation");
+        assert!(why.contains("op-77") && why.contains("pai-voice/personaplex") && why.contains("by pai-voice"), "{why}");
+        assert!(paused_on_purpose(&held(""), "vllm", now).is_some(), "an indefinite hold is live");
+        assert_eq!(paused_on_purpose(&held("2026-11-12T15:00:00Z"), "vllm", now), None, "an expired hold excuses nothing");
+        assert_eq!(paused_on_purpose(&held("not a time"), "vllm", now), None);
+        assert_eq!(paused_on_purpose(&held("2026-11-12T16:00:00Z"), "ollama", now), None, "not paused: really down");
+        let mut no_cause = held("");
+        no_cause["gpu_contention"]["lease"] = Value::Null;
+        no_cause["gpu_contention"]["state"] = "idle".into();
+        assert_eq!(paused_on_purpose(&no_cause, "vllm", now), None, "paused with no live cause is not expected");
+        no_cause["gpu_contention"]["state"] = "shared".into();
+        assert!(paused_on_purpose(&no_cause, "vllm", now).unwrap().contains("outside noomesh"));
+        assert_eq!(paused_on_purpose(&serde_json::json!({"id": "n"}), "vllm", now), None, "an agent that reports nothing");
+    }
+
+    /// The loop drops an expected pause before the clock sees it.
+    #[test]
+    fn tick_drops_an_expected_pause_before_the_clock() {
+        let code = crate::test_src::own_code(include_str!("placement_stuck.rs"));
+        let tick = crate::test_src::fn_body(&code, "pub async fn tick(");
+        let retain = tick.find("paused_on_purpose(n, &m.backend, now)").expect("tick consults paused_on_purpose");
+        assert!(retain < tick.find("c.observe(now, &missing").expect("the clock"), "before the clock");
+    }
+
     use super::*;
     use serde_json::json;
 
