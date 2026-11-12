@@ -1070,6 +1070,25 @@ fn on_status(code: u16, last: Option<&str>) -> FetchOutcome {
     }
 }
 
+/// What the bundle GET's status does to this tick. `Some(rc)` ends the tick
+/// with `rc`; `None` goes on to read the body. A 304 sends the same signed
+/// fetch receipt as the unchanged path, through `receipt`, with the sha the
+/// request sent, so fetched_at keeps being stamped. Nothing else is written
+/// (no marker, no cadence file). `receipt` is the seam the tests observe;
+/// `node_fetch` passes `send_fetch_receipt`.
+fn settle_status(code: u16, last: Option<&str>, receipt: &mut dyn FnMut(&str)) -> Option<i32> {
+    match on_status(code, last) {
+        FetchOutcome::Fetched => None,
+        FetchOutcome::Unchanged(sum) => {
+            // There is no debug-level facility in crate::ui, so no line is
+            // emitted: a normal line every tick is the noise this avoids.
+            receipt(&sum);
+            Some(0) // already applied this exact bundle
+        }
+        FetchOutcome::NothingStaged | FetchOutcome::Failed => Some(0),
+    }
+}
+
 /// The FETCH receipt. `fetched_at` used to be stamped by the
 /// GET itself — a state write any anonymous caller could make, so it meant
 /// "somebody collected this ciphertext", never "this Mac did". The node has
@@ -1192,17 +1211,9 @@ pub fn node_fetch(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 return Ok(0);
             }
         };
-        match on_status(resp.status().as_u16(), last_for_etag.as_deref()) {
-            FetchOutcome::Fetched => {}
-            FetchOutcome::Unchanged(sum) => {
-                // Same receipt as the unchanged path below, so fetched_at keeps
-                // being stamped; nothing else is written (no marker, no cadence
-                // file). There is no debug-level facility in crate::ui, so no
-                // line is emitted: a normal line every tick is the noise this avoids.
-                send_fetch_receipt(&agent, &base, &url, &node, &sum);
-                return Ok(0); // already applied this exact bundle
-            }
-            FetchOutcome::NothingStaged | FetchOutcome::Failed => return Ok(0),
+        let mut receipt = |sum: &str| send_fetch_receipt(&agent, &base, &url, &node, sum);
+        if let Some(rc) = settle_status(resp.status().as_u16(), last_for_etag.as_deref(), &mut receipt) {
+            return Ok(rc);
         }
         let mut blob = Vec::new();
         use std::io::Read as _;
@@ -3258,6 +3269,49 @@ mod tests {
     fn a_304_we_could_not_have_asked_for_is_not_unchanged() {
         assert_eq!(on_status(304, None), FetchOutcome::Failed);
         assert_eq!(on_status(304, Some("not-a-sha")), FetchOutcome::Failed);
+    }
+
+    fn settle(code: u16, last: Option<&str>) -> (Option<i32>, Vec<String>) {
+        let mut sent = Vec::new();
+        let rc = settle_status(code, last, &mut |sum: &str| sent.push(sum.to_string()));
+        (rc, sent)
+    }
+
+    /// A 304 ends the tick with 0 AND sends the fetch receipt, once, for the
+    /// sha the request sent: fetched_at keeps being stamped on unchanged ticks.
+    #[test]
+    fn a_304_sends_the_receipt_for_the_sent_sha_and_ends_the_tick() {
+        assert_eq!(settle(304, Some(SHA_A)), (Some(0), vec![SHA_A.to_string()]));
+        assert_eq!(settle(304, Some(&format!("{SHA_A}\n"))), (Some(0), vec![SHA_A.to_string()]), "trimmed, as sent");
+    }
+
+    /// Only a 304 we asked for receipts here: a 200 goes on to the body (and
+    /// its own receipt after the hash); 404, failures and a 304 without a
+    /// sent header end the tick with no receipt.
+    #[test]
+    fn nothing_but_an_asked_for_304_receipts_before_the_body() {
+        assert_eq!(settle(200, Some(SHA_A)), (None, vec![]));
+        assert_eq!(settle(404, Some(SHA_A)), (Some(0), vec![]));
+        assert_eq!(settle(500, Some(SHA_A)), (Some(0), vec![]));
+        assert_eq!(settle(304, None), (Some(0), vec![]));
+        assert_eq!(settle(304, Some("not-a-sha")), (Some(0), vec![]));
+    }
+
+    /// node_fetch decides the status through settle_status, with the REAL
+    /// receipt sender as the seam, before reading any body.
+    #[test]
+    fn node_fetch_settles_the_status_with_the_real_receipt_sender() {
+        let code = crate::test_src::own_code(include_str!("node_fetch.rs"));
+        let body = crate::test_src::fn_body(&code, "pub fn node_fetch(");
+        let seam = body
+            .find("let mut receipt = |sum: &str| send_fetch_receipt(&agent, &base, &url, &node, sum);")
+            .expect("the receipt seam is the real sender");
+        let settle = body
+            .find("settle_status(resp.status().as_u16(), last_for_etag.as_deref(), &mut receipt)")
+            .expect("the status is settled through the seam");
+        let read = body.find("read_to_end(&mut blob)").expect("the body read");
+        assert!(seam < settle && settle < read, "{body}");
+        assert!(!body.contains("on_status("), "the status is decided in settle_status only: {body}");
     }
 
     // ── bundle header (v2): who it is for, and when it was signed ──────
