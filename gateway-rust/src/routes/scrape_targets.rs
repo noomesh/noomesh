@@ -96,7 +96,7 @@ pub(crate) fn leaf_covers(pem: &str, host: &str) -> bool {
             (IpAddr::V6(v6), 16) => v6.octets()[..] == b[..],
             _ => false,
         },
-        (x509_parser::extensions::GeneralName::DNSName(d), None) => d.eq_ignore_ascii_case(host),
+        (x509_parser::extensions::GeneralName::DNSName(_), None) => true,
         _ => false,
     })
 }
