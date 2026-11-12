@@ -34,7 +34,12 @@ fn offer_self_upgrade(ctx: &mut Ctx) {
             return;
         }
     };
-    if latest == current {
+    // Offer only a STRICTLY newer final (semver, as `noo upgrade` decides).
+    // On equality-only, a release candidate (newer than the latest final)
+    // was offered "0.6.23 is available", `noo upgrade` kept the rc, and the
+    // wizard relaunched itself into the same offer forever (install matrix
+    // on 0.6.24-rc.1, run 43288027296: stranger-24.04 looped six times).
+    if !should_offer_upgrade(current, &latest) {
         return;
     }
     ctx.warn(&format!("noo {current} installed; {latest} is available"));
@@ -53,15 +58,40 @@ fn offer_self_upgrade(ctx: &mut Ctx) {
         ctx.warn("upgrade failed — continuing on the current version (retry later: noo upgrade)");
         return;
     }
+    // Relaunch only when the binary on disk is now a different version: an
+    // upgrade that kept this build (or replaced a different copy than the one
+    // running) would relaunch into the same offer, forever.
+    let now = installed_version(&exe);
+    if now.as_deref().is_none_or(|v| v == current) {
+        ctx.info(&format!("(still noo {current} at {exe} — continuing on it; `noo upgrade` later)"));
+        return;
+    }
     // The swap replaced the binary on disk, but THIS process is still the old
     // build — relaunch the wizard through the path with the original argv so
     // the new version runs it (same trick as the docker-group relaunch).
-    ctx.progress(&format!("Relaunching the wizard on noo {latest}..."));
+    ctx.progress(&format!("Relaunching the wizard on noo {}...", now.as_deref().unwrap_or(&latest)));
     let argv: Vec<String> = std::env::args().skip(1).collect();
     match Command::new(&exe).args(&argv).status().ok().and_then(|s| s.code()) {
         Some(c) => std::process::exit(c),
         None => ctx.warn("relaunch failed — re-run `noo onboard` to use the new version"),
     }
+}
+
+/// Whether onboarding offers `noo upgrade`: only when `latest` (the newest
+/// FINAL release) is strictly newer than this build by semver. An rc newer
+/// than the latest final, the same version, or a version that does not parse
+/// is never offered (an offer that cannot change anything loops).
+fn should_offer_upgrade(current: &str, latest: &str) -> bool {
+    crate::commands::upgrade::cmp_cli_semver(current, latest) == Some(std::cmp::Ordering::Less)
+}
+
+/// The version `exe --version` reports (its last word), if it runs.
+fn installed_version(exe: &str) -> Option<String> {
+    let out = Command::new(exe).arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).split_whitespace().last().map(str::to_string)
 }
 
 /// The tools onboard REQUIRES. git only for a source checkout: a release
@@ -10009,5 +10039,37 @@ mod first_chat_placement_tests {
         let keep = placer.find("existing_ollama_chat_placement(&d[\"placements\"])").expect("checks first");
         let run = placer.find("Command::new(&exe).args(&args)").expect("then the command");
         assert!(keep < run, "{placer}");
+    }
+}
+
+#[cfg(test)]
+mod self_upgrade_tests {
+    /// The rc.1 install-matrix loop: onboarding offered `noo upgrade` to an
+    /// rc newer than the latest final, `noo upgrade` kept the rc, and the
+    /// wizard relaunched into the same offer forever. Offer only a strictly
+    /// newer final.
+    #[test]
+    fn the_wizard_offers_only_a_strictly_newer_release() {
+        use super::should_offer_upgrade as offer;
+        assert!(!offer("0.6.24-rc.1", "0.6.23"), "an rc newer than the latest final was offered the older final");
+        assert!(!offer("0.6.24", "0.6.24"), "the same version was offered");
+        assert!(!offer("0.6.25", "0.6.24"), "a newer build was offered an older release");
+        assert!(offer("0.6.23", "0.6.24"), "a strictly newer final was not offered");
+        assert!(offer("0.6.24-rc.1", "0.6.24"), "the final of this rc was not offered");
+        assert!(!offer("custom-build", "0.6.24"), "an unparsable version was offered (nothing can be compared)");
+    }
+
+    /// The relaunch happens only when the binary on disk changed version:
+    /// an upgrade that kept this build cannot relaunch into the same offer.
+    #[test]
+    fn the_wizard_relaunches_only_on_a_version_change() {
+        let own = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&own, "fn offer_self_upgrade(");
+        assert!(body.contains("if !should_offer_upgrade(current, &latest) {"), "the offer is not semver-gated");
+        assert!(!body.contains("if latest == current {"), "the equality-only gate is back");
+        let check = body.find("installed_version(&exe)").expect("the version check");
+        let relaunch = body.find("Command::new(&exe).args(&argv)").expect("the relaunch");
+        assert!(check < relaunch, "the relaunch is not behind the version check");
+        assert!(body[check..relaunch].contains("v == current"), "the check does not compare against this build");
     }
 }
