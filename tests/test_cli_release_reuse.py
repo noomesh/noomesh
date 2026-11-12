@@ -385,7 +385,97 @@ def test_the_manifest_names_its_own_version():
     assert "--version" in run[:write], "the version is not read from the built CLI"
     line = next(l for l in run.splitlines() if l.strip().endswith("> sha256sums.txt"))
     assert "noo-release-version" in line, line
-    assert "grep -q '  noo-release-version$' sha256sums.txt" in run[gen:], run
+    assert 'grep -qx "$(sha256sum noo-release-version)" sha256sums.txt' in run[gen:], run
+    assert "sha256sum -c sha256sums.txt" in run[gen:], "a by-hand `sha256sum -c` is not proven to pass"
+
+
+def _run_checksum_step(tmp_path, cli_version: str, ref_name: str | None):
+    """Run the release job's REAL 'Generate SHA-256 checksums' script in a
+    scratch dist/ whose CLI reports `cli_version`; return (proc, dist)."""
+    import os
+    import subprocess
+    run = next(s for s in _steps("release") if s.get("name") == "Generate SHA-256 checksums")["run"]
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    cli = dist / "noo-x86_64-unknown-linux-gnu"
+    cli.write_text(f'#!/bin/sh\necho "noo (noomesh CLI, alias: pai) {cli_version}"\n')
+    cli.chmod(0o755)
+    for n in ("noo-x86_64-unknown-linux-musl", "noo-aarch64-apple-darwin", "noo-gateway-x86_64-unknown-linux-musl"):
+        (dist / n).write_bytes(n.encode())
+    env = {k: v for k, v in os.environ.items() if k != "GITHUB_REF_NAME"}
+    if ref_name is not None:
+        env["GITHUB_REF_NAME"] = ref_name
+    p = subprocess.run(["bash", "-c", run], cwd=tmp_path, env=env, capture_output=True, text=True)
+    return p, dist
+
+
+def _bound(manifest: str, version: str) -> bool:
+    """release_sig::manifest_names_version, in Python."""
+    want = hashlib.sha256(f"{version}\n".encode()).hexdigest()
+    return P.manifest_row(manifest, "noo-release-version") == want
+
+
+@pytest.mark.parametrize("tag,version", [
+    ("noo-cli-v0.6.24-rc.1", "0.6.24-rc.1"),   # an rc: the stamped CLI
+    ("noo-cli-v0.6.24", "0.6.24"),             # the final: its own rebuilt CLI
+    (None, "0.6.24"),                          # a dispatch dry run (no tag)
+])
+def test_the_checksum_step_binds_the_manifest_to_the_tag(tmp_path, tag, version):
+    p, dist = _run_checksum_step(tmp_path, version, tag)
+    assert p.returncode == 0, p.stderr
+    man = (dist / "sha256sums.txt").read_text()
+    assert _bound(man, version), man
+    other = "0.6.24" if version != "0.6.24" else "0.6.24-rc.1"
+    assert not _bound(man, other), "an rc's manifest binds the final (or the reverse)"
+    # Anyone verifying by hand: every row checks, the version row included.
+    assert "noo-release-version: OK" in p.stdout, p.stdout
+
+
+@pytest.mark.parametrize("tag,version", [
+    ("noo-cli-v0.6.24", "0.6.24-rc.1"),        # a final carrying the rc's CLI
+    ("noo-cli-v0.6.24-rc.2", "0.6.24-rc.1"),   # a stale stamp
+    ("noo-cli-v0.6.24", "garbage"),
+])
+def test_the_checksum_step_fails_before_signing_on_a_version_tag_mismatch(tmp_path, tag, version):
+    p, dist = _run_checksum_step(tmp_path, version, tag)
+    assert p.returncode != 0, (p.stdout, p.stderr)
+    assert not (dist / "sha256sums.txt").exists() or not (dist / "sha256sums.txt").read_text().strip(), \
+        "a manifest was written for the wrong release"
+    names = [s.get("name") for s in _steps("release")]
+    assert names.index("Generate SHA-256 checksums") < names.index("Sign the checksum manifest (an earlier change slice B)") \
+        < names.index("Create GitHub Release"), "the check no longer runs before signing and upload"
+
+
+def test_a_final_never_reuses_the_rc_cli_so_its_row_is_the_final_version():
+    """The one way the bind could break a final: if the final re-published the
+    rc's CLI, `noo --version` would say A.B.C-rc.N and the row would bind the
+    rc. It cannot: only noo-gateway-* is reusable; the CLI is TAG_STAMPED and
+    always rebuilt, and the version file is never fetched from the rc."""
+    assert all(n.startswith("noo-gateway-") for n in P.REUSABLE), P.REUSABLE
+    assert "build" in P.TAG_STAMPED
+    fetched = P.required_assets()
+    assert fetched, "the reuse plan fetches nothing: this guard is stale"
+    for n in fetched:
+        assert n != "noo-release-version", "the final would take the rc's version file"
+        assert n.startswith("noo-gateway-") or n.startswith(P.MANIFEST), f"the final would take {n} from the rc"
+
+
+def test_reuse_verify_ignores_the_rc_version_row(tmp_path):
+    """verify() on the FINAL compares only REUSABLE rows against the rc's
+    signed manifest: the rc's version row (A.B.C-rc.N) neither blocks the
+    re-use nor leaks into the final, whose own step writes A.B.C."""
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    rows = []
+    for n in P.REUSABLE:
+        (dist / n).write_bytes(n.encode())
+        rows.append(f"{hashlib.sha256(n.encode()).hexdigest()}  {n}")
+    rows.append(f"{hashlib.sha256(b'0.6.24-rc.1' + bytes([10])).hexdigest()}  noo-release-version")
+    rc_manifest = ("\n".join(rows) + "\n").encode()
+    blobs = {P.MANIFEST: rc_manifest, f"{P.MANIFEST}.sig": b"noo-sig1.x"}
+    ok = lambda *a, **k: subprocess.CompletedProcess(a, 0, "", "")
+    reused, rebuilt = P.verify("noo-cli-v0.6.24-rc.1", dist, "noo", blobs.__getitem__, run=ok)
+    assert sorted(reused) == sorted(P.REUSABLE) and rebuilt == []
 
 
 def test_the_script_names_only_public_orgs():
