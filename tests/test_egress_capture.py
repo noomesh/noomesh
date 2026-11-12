@@ -45,7 +45,7 @@ def test_each_connection_is_named_attributed_and_counted(tmp_path):
 
 def test_a_classify_file_labels_rows_and_unlisted_is_counted(tmp_path):
     cls = tmp_path / "cls.tsv"
-    cls.write_text("container:noo-ollama\tstats\\.example\\.org\tc\ta reporter\n^process:noo \t.*\ta\tthe noo CLI\n")
+    cls.write_text("container:noo-ollama\tstats\\.example\\.org.*:443$\tc\ta reporter\n^process:noo \t:443$\ta\tthe noo CLI\n^host process\t:80$\ta\tnever matches: the flow is to 123\n")
     stdout, rows, _ = _report(tmp_path, cls)
     assert {r[0]: r[10] for r in rows} == {
         "container:noo-ollama": "c", "process:noo pid 77": "a", "host process (unattributed)": "unlisted"}
