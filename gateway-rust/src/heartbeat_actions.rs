@@ -3807,7 +3807,7 @@ async fn action_write_log(
 /// Where the gateway's PKI actually lives inside the container.
 /// `startup_tasks::stage_pki` copies the `/app/pki` mount to `/tmp/pki`
 /// (and fixes modes); `/app/pki` is the mount itself. Same order as
-/// `routes/admin.rs::security_pki_status` and `count_certs_expiring_within`.
+/// `routes/admin.rs::security_pki_status` and `certs_expiring_within`.
 const STAGED_PKI_DIRS: [&str; 2] = ["/tmp/pki", "/app/pki"];
 
 /// Candidate PKI directories, in preference order: `NOO_PKI_DIR`, then the

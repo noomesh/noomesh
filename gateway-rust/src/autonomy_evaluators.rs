@@ -2049,10 +2049,12 @@ pub async fn eval_cert_auto_rotate(
     const WARN_DAYS: i64 = 30;
     const NEW_CERT_DAYS: i64 = 90;
 
-    let count = count_certs_expiring_within(WARN_DAYS).await;
+    let expiring = certs_expiring_within(WARN_DAYS).await;
+    let count = expiring.len();
     if count == 0 {
         return Ok(false);
     }
+    let names = expiring_names(&expiring);
 
     // Two opt-ins, both defaulting to the safe side, read through the same
     // fail-closed helpers the reclaim gate uses: a `"true"` STRING in a
@@ -2095,7 +2097,7 @@ pub async fn eval_cert_auto_rotate(
                 "pki",
                 format!(
                     "🔐 {count} cluster certificate(s) expire within {WARN_DAYS} days and \
-                     auto-rotation is off — nothing was rotated."
+                     auto-rotation is off — nothing was rotated: {names}."
                 ),
             )
             .detail(format!(
@@ -2139,7 +2141,7 @@ pub async fn eval_cert_auto_rotate(
                     "pki",
                     format!(
                         "🔐 {count} cluster certificate(s) expire within {WARN_DAYS} days; \
-                         a host-side rotation is queued."
+                         a host-side rotation is queued: {names}."
                     ),
                 )
                 .detail(format!(
@@ -2163,7 +2165,7 @@ pub async fn eval_cert_auto_rotate(
                     "pki",
                     format!(
                         "🔐❗ {count} cluster certificate(s) expire within {WARN_DAYS} days \
-                         and the automatic rotation could not be queued."
+                         and the automatic rotation could not be queued: {names}."
                     ),
                 )
                 .detail(format!("{e}; run `noo security pki rotate-all` manually"))
@@ -2176,15 +2178,76 @@ pub async fn eval_cert_auto_rotate(
     Ok(true)
 }
 
-/// Count cluster TLS certs (CA + gateway + per-node leaf) that expire
-/// within `days_threshold`. Walks the same PKI directory layout that
+/// One certificate inside the warning window: what it is and how long it
+/// has left. Names and days only — never a path's contents or a key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpiringCert {
+    pub name: String,
+    pub days_left: i64,
+}
+
+/// How an operator names a certificate the walker found: `cluster CA`,
+/// `gateway`, `node <name>`; anything else by its path under the PKI dir.
+pub fn cert_label(pki: &std::path::Path, path: &std::path::Path) -> String {
+    let rel = path.strip_prefix(pki).unwrap_or(path);
+    let parts: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+    match parts.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+        ["ca.crt"] => "cluster CA".into(),
+        ["gateway", "gateway.crt"] => "gateway".into(),
+        ["nodes", node, "node.crt"] => format!("node {node}"),
+        _ => rel.display().to_string(),
+    }
+}
+
+/// The certificates among `found` (label, notAfter) that are still valid at
+/// `now` and expire before `cutoff`, soonest first. Unparseable (`None`) is
+/// skipped, as before.
+pub fn expiring_among(found: Vec<(String, Option<i64>)>, now: i64, cutoff: i64) -> Vec<ExpiringCert> {
+    let mut out: Vec<ExpiringCert> = found
+        .into_iter()
+        .filter_map(|(name, na)| {
+            let na = na?;
+            if na > now && na < cutoff {
+                Some(ExpiringCert { name, days_left: (na - now) / 86_400 })
+            } else {
+                None
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.days_left.cmp(&b.days_left).then_with(|| a.name.cmp(&b.name)));
+    out
+}
+
+/// At most this many certificates are named in one alert line.
+const EXPIRING_NAMED: usize = 8;
+
+/// `node pop-os (12 days), cluster CA (25 days)`; past [`EXPIRING_NAMED`],
+/// `and N more`.
+pub fn expiring_names(certs: &[ExpiringCert]) -> String {
+    let mut parts: Vec<String> = certs
+        .iter()
+        .take(EXPIRING_NAMED)
+        .map(|c| match c.days_left {
+            0 => format!("{} (under a day)", c.name),
+            1 => format!("{} (1 day)", c.name),
+            d => format!("{} ({d} days)", c.name),
+        })
+        .collect();
+    if certs.len() > EXPIRING_NAMED {
+        parts.push(format!("and {} more", certs.len() - EXPIRING_NAMED));
+    }
+    parts.join(", ")
+}
+
+/// Cluster TLS certs (CA + gateway + per-node leaf) that expire within
+/// `days_threshold`, named, soonest first. Walks the same PKI directory layout that
 /// `routes/admin.rs::security_pki_status` reads. Shared between
 /// `eval_cert_expiry_check` (in autonomy_loop.rs) and
 /// `eval_cert_auto_rotate` (above) — both fire on the same condition,
 /// they just take different actions (alert vs rotate).
 ///
 /// Returns 0 if the PKI directory is missing (gateway not yet onboarded).
-pub async fn count_certs_expiring_within(days_threshold: i64) -> usize {
+pub async fn certs_expiring_within(days_threshold: i64) -> Vec<ExpiringCert> {
     let pki_dir = crate::tls::pki_dir().map(|p| p.to_string_lossy().into_owned())
         .filter(|p| std::path::Path::new(p).join("ca.crt").exists())
         .or_else(|| {
@@ -2200,7 +2263,7 @@ pub async fn count_certs_expiring_within(days_threshold: i64) -> usize {
 
     let pki_path = std::path::Path::new(&pki_dir);
     if !pki_path.exists() {
-        return 0;
+        return Vec::new();
     }
 
     let mut paths: Vec<std::path::PathBuf> = Vec::new();
@@ -2243,18 +2306,13 @@ pub async fn count_certs_expiring_within(days_threshold: i64) -> usize {
     //    gateway move to the shell-less hardened base.
     let now = chrono::Utc::now().timestamp();
     let cutoff = (chrono::Utc::now() + chrono::Duration::days(days_threshold)).timestamp();
-    let mut expiring = 0usize;
-    for path in paths {
-        // None = unreadable or unparseable. Same outcome as the subprocess's
-        // non-zero exit, but now it is one code path instead of three.
-        let Some(not_after) = crate::cert_expiry::read_not_after(&path) else {
-            continue;
-        };
-        if not_after > now && not_after < cutoff {
-            expiring += 1;
-        }
-    }
-    expiring
+    // None = unreadable or unparseable. Same outcome as the subprocess's
+    // non-zero exit, but now it is one code path instead of three.
+    let found = paths
+        .iter()
+        .map(|p| (cert_label(pki_path, p), crate::cert_expiry::read_not_after(p)))
+        .collect();
+    expiring_among(found, now, cutoff)
 }
 
 // ─── worker_node_agent_unreachable ───────────────────────────────────────
@@ -4636,3 +4694,57 @@ mod link_integrity_error_tests {
     }
 }
 
+
+#[cfg(test)]
+mod expiring_cert_names_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn each_certificate_is_named_the_way_an_operator_names_it() {
+        let pki = Path::new("/p");
+        assert_eq!(cert_label(pki, Path::new("/p/ca.crt")), "cluster CA");
+        assert_eq!(cert_label(pki, Path::new("/p/gateway/gateway.crt")), "gateway");
+        assert_eq!(cert_label(pki, Path::new("/p/nodes/pop-os/node.crt")), "node pop-os");
+        assert_eq!(cert_label(pki, Path::new("/p/services/x/service.crt")), "services/x/service.crt");
+    }
+
+    #[test]
+    fn only_valid_certs_inside_the_window_soonest_first() {
+        let now = 1_000_000;
+        let day = 86_400;
+        let found = vec![
+            ("gateway".to_string(), Some(now + 25 * day + 5)),
+            ("node a".to_string(), Some(now + 3 * day + 5)),
+            ("node expired".to_string(), Some(now - 1)),
+            ("node far".to_string(), Some(now + 90 * day)),
+            ("node unreadable".to_string(), None),
+        ];
+        let got = expiring_among(found, now, now + 30 * day);
+        assert_eq!(got, vec![
+            ExpiringCert { name: "node a".into(), days_left: 3 },
+            ExpiringCert { name: "gateway".into(), days_left: 25 },
+        ]);
+        assert_eq!(expiring_names(&got), "node a (3 days), gateway (25 days)");
+    }
+
+    #[test]
+    fn a_long_list_names_eight_then_counts_the_rest() {
+        let certs: Vec<ExpiringCert> = (0..11).map(|i| ExpiringCert { name: format!("node n{i}"), days_left: i }).collect();
+        let line = expiring_names(&certs);
+        assert!(line.starts_with("node n0 (under a day), node n1 (1 day), node n2 (2 days)"), "{line}");
+        assert!(line.ends_with("node n7 (7 days), and 3 more"), "{line}");
+    }
+
+    #[test]
+    fn every_expiry_alert_names_the_certificates() {
+        let own = crate::test_src::own_code(include_str!("autonomy_evaluators.rs"));
+        let rotate = crate::test_src::fn_body(&own, "pub async fn eval_cert_auto_rotate(");
+        assert_eq!(rotate.matches("certificate(s) expire within {WARN_DAYS} days").count(), 3, "three alert lines");
+        assert_eq!(rotate.matches("{names}.\"").count(), 3, "each names the certificates");
+        let lp = include_str!("autonomy_loop.rs");
+        let lp = crate::test_src::own_code(lp);
+        let expiry = crate::test_src::fn_body(&lp, "async fn eval_cert_expiry(");
+        assert!(expiry.contains("expiring_names(&expiring)"), "the cert_expiry_check alert names them too");
+    }
+}

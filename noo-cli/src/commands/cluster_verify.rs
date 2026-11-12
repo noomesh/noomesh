@@ -7240,6 +7240,14 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
         // A release's new data directory, missing here, refuses the stack roll.
         checks.push(storage_dirs_row(&crate::envfile::repo_root()));
+        // The cluster's certificates by name and days left: the gateway's
+        // 30-day alert says how many; this row says which.
+        let certs: Vec<(String, i64)> = crate::pki::ClusterCa::new(crate::pki::pki_dir())
+            .list_certs()
+            .into_iter()
+            .map(|c| (c.name, c.days_left))
+            .collect();
+        checks.push(cert_expiry_row(&certs));
         checks.push(noo_data_bound_row(&crate::envfile::repo_root()));
         // i67: the controller's own node (when this box runs one) rides the rail.
         if let Some(me) = crate::commands::provision::self_node_name()
@@ -7788,6 +7796,55 @@ fn render_timings(laps: &[(String, Duration)], total: Duration) {
         println!("{}", ui::note(&format!("{rest} more step(s) under {TIMING_FLOOR_MS} ms each")));
     }
     println!("  {:>7.2}s  total", total.as_secs_f64());
+}
+
+/// Inside this many days a certificate is named as expiring: the same window
+/// as the gateway's alert and `noo security pki status`.
+const CERT_WARN_DAYS: i64 = 30;
+/// At most this many certificates are named in one row.
+const CERTS_NAMED: usize = 8;
+
+fn named_days(certs: &[&(String, i64)]) -> String {
+    let mut parts: Vec<String> = certs
+        .iter()
+        .take(CERTS_NAMED)
+        .map(|(n, d)| match *d {
+            d if d < 0 => format!("{n} (expired {} day(s) ago)", -d),
+            0 => format!("{n} (under a day)"),
+            1 => format!("{n} (1 day)"),
+            d => format!("{n} ({d} days)"),
+        })
+        .collect();
+    if certs.len() > CERTS_NAMED {
+        parts.push(format!("and {} more", certs.len() - CERTS_NAMED));
+    }
+    parts.join(", ")
+}
+
+/// `cert expiry`: every certificate under the PKI dir, `(name, days left)`.
+/// Expired fails; inside [`CERT_WARN_DAYS`] warns; each is named, soonest
+/// first, with its days.
+pub(crate) fn cert_expiry_row(certs: &[(String, i64)]) -> Check {
+    const NAME: &str = "cert expiry";
+    const ROTATE: &str = "noo security pki rotate-all";
+    if certs.is_empty() {
+        return warn(NAME, "no certificate under the PKI dir to judge", Some("noo security pki status".into()));
+    }
+    let mut sorted: Vec<&(String, i64)> = certs.iter().collect();
+    sorted.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    let expired: Vec<&(String, i64)> = sorted.iter().copied().filter(|c| c.1 < 0).collect();
+    let soon: Vec<&(String, i64)> = sorted.iter().copied().filter(|c| (0..CERT_WARN_DAYS).contains(&c.1)).collect();
+    if !expired.is_empty() {
+        let mut detail = format!("{} expired: {}", expired.len(), named_days(&expired));
+        if !soon.is_empty() {
+            detail.push_str(&format!("; {} more within {CERT_WARN_DAYS} days: {}", soon.len(), named_days(&soon)));
+        }
+        return fail(NAME, detail, ROTATE);
+    }
+    if !soon.is_empty() {
+        return warn(NAME, format!("{} within {CERT_WARN_DAYS} days: {}", soon.len(), named_days(&soon)), Some(ROTATE.into()));
+    }
+    ok(NAME, format!("{} certificate(s); the soonest, {}, in {} days", certs.len(), sorted[0].0, sorted[0].1))
 }
 
 fn checks_json(checks: &[Check]) -> Value {
@@ -13653,5 +13710,57 @@ mod profile_form_row_tests {
         assert_eq!(with_profile_form(ok("sandbox executor", "x"), None).detail, "x", "no profile here: nothing added");
         let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
         assert!(own.contains("crate::onboard::sandbox_apparmor::installed_form("), "the controller run states it");
+    }
+}
+
+#[cfg(test)]
+mod cert_expiry_row_tests {
+    use super::*;
+
+    fn c(n: &str, d: i64) -> (String, i64) {
+        (n.to_string(), d)
+    }
+
+    #[test]
+    fn healthy_certificates_name_the_soonest() {
+        let r = cert_expiry_row(&[c("gateway", 200), c("cluster CA", 3000), c("node pop-os", 80)]);
+        assert_eq!(r.verdict, Verdict::Ok);
+        assert_eq!(r.detail, "3 certificate(s); the soonest, node pop-os, in 80 days");
+    }
+
+    #[test]
+    fn expiring_ones_are_named_with_their_days_soonest_first() {
+        let r = cert_expiry_row(&[c("gateway", 200), c("node b", 29), c("node a", 1), c("svc x", 0)]);
+        assert_eq!(r.verdict, Verdict::Warn);
+        assert_eq!(r.detail, "3 within 30 days: svc x (under a day), node a (1 day), node b (29 days)");
+        assert_eq!(r.remedy.as_deref(), Some("noo security pki rotate-all"));
+        // Day 30 is outside the window, as in `pki status`.
+        assert_eq!(cert_expiry_row(&[c("gateway", 30)]).verdict, Verdict::Ok);
+    }
+
+    #[test]
+    fn an_expired_certificate_fails_and_the_expiring_ones_still_show() {
+        let r = cert_expiry_row(&[c("node old", -2), c("gateway", 10), c("cluster CA", 900)]);
+        assert_eq!(r.verdict, Verdict::Fail);
+        assert_eq!(r.detail, "1 expired: node old (expired 2 day(s) ago); 1 more within 30 days: gateway (10 days)");
+    }
+
+    #[test]
+    fn a_long_list_names_eight_and_counts_the_rest() {
+        let many: Vec<(String, i64)> = (0..10).map(|i| c(&format!("n{i}"), 5)).collect();
+        let r = cert_expiry_row(&many);
+        assert!(r.detail.ends_with("n7 (5 days), and 2 more"), "{}", r.detail);
+    }
+
+    #[test]
+    fn no_certificate_is_not_a_pass() {
+        assert_eq!(cert_expiry_row(&[]).verdict, Verdict::Warn);
+    }
+
+    #[test]
+    fn the_row_is_in_the_controller_run() {
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let run = crate::test_src::fn_body(&own, "pub fn cluster_verify(");
+        assert!(run.contains("checks.push(cert_expiry_row(&certs));"));
     }
 }
