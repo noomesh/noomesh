@@ -5263,6 +5263,14 @@ mod tests {
             assert!(!fill.contains(bad), "upload_cli_assets fills the cache past the gate: {bad}");
         }
         assert!(fill.contains("cached_release_asset(g, &root, name)"));
+        // onboard installs the controller's own noo-hostd as ROOT from the
+        // same cache: through the gate, never a by-name read (i689a).
+        let steps = own_code(include_str!("../onboard/steps.rs"));
+        let hostd = fn_body(&steps, "fn obtain_hostd_binary(");
+        assert!(hostd.contains("cached_release_asset(ctx.g, &ctx.repo_root, &asset)"), "onboard's hostd skips the gate");
+        for bad in ["cli_asset_cache_dir(", "fetch_release_file(", "std::fs::read(&cached)"] {
+            assert!(!hostd.contains(bad), "onboard's hostd reads the cache past the gate: {bad}");
+        }
         assert!(fill.contains("cached_release_asset(g, &root, &asset)"));
         assert!(fill.contains("verified_release_manifest(g, &root)"));
     }
