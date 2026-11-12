@@ -29,9 +29,30 @@ import re
 import subprocess
 import sys
 
-DHI = "ghcr.io/noomesh/dhi"
-HUB = "ghcr.io/noomesh/mirror"
-OURS = "ghcr.io/noomesh"
+ROOT = __import__("pathlib").Path(__file__).resolve().parent.parent
+
+
+def release_image_namespace() -> str:
+    """The release image namespace from its one home, scripts/lib-dist.sh
+    (`release_image_namespace`), never typed out here
+    (tests/test_image_namespace_declarations.py)."""
+    text = (ROOT / "scripts" / "lib-dist.sh").read_text()
+    m = re.search(r"^release_image_namespace\(\)\s*\{\s*printf\s+'([^']+)';\s*\}", text, re.M)
+    if not m:
+        raise SystemExit("scripts/lib-dist.sh: release_image_namespace() not found in its one-line printf form")
+    return m.group(1)
+
+
+OURS = release_image_namespace()
+DHI = f"{OURS}/dhi"      # the DHI mirror the release builds from (DHI_OWNER)
+HUB = f"{OURS}/mirror"   # the Docker Hub mirror (scripts/hub-mirror.py)
+
+
+def repo() -> str:
+    """This repository: GITHUB_REPOSITORY in CI, else the checkout's own."""
+    import os
+    return os.environ.get("GITHUB_REPOSITORY") or sh("gh", "repo", "view", "--json", "nameWithOwner",
+                                                     "-q", ".nameWithOwner").strip()
 
 
 def sh(*cmd: str) -> str:
@@ -111,7 +132,7 @@ def image_layers(repo: str, digest: str) -> dict[str, list[dict]]:
 
 
 def finals(prefix: str) -> list[str]:
-    rows = json.loads(sh("gh", "release", "list", "-R", "noomesh/noomesh", "--limit", "60",
+    rows = json.loads(sh("gh", "release", "list", "-R", repo(), "--limit", "60",
                          "--json", "tagName,isPrerelease,isDraft"))
     tags = [r["tagName"] for r in rows if r["tagName"].startswith(prefix)
             and not r["isPrerelease"] and not r["isDraft"]]
@@ -120,7 +141,7 @@ def finals(prefix: str) -> list[str]:
 
 
 def asset_text(tag: str, name: str) -> str:
-    return sh("gh", "release", "download", tag, "-R", "noomesh/noomesh", "-p", name, "-O", "-")
+    return sh("gh", "release", "download", tag, "-R", repo(), "-p", name, "-O", "-")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -161,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         for plat, ls in layers.items():
             s = sizes(ls, base_layers.get(plat) if base_ref else None, prev_layers.get(plat))
             rows.append({"image": name, "platform": plat, "base": base_ref, **s})
-    cli = json.loads(sh("gh", "release", "view", tag.replace("stack-", "noo-cli-"), "-R", "noomesh/noomesh",
+    cli = json.loads(sh("gh", "release", "view", tag.replace("stack-", "noo-cli-"), "-R", repo(),
                         "--json", "assets"))["assets"]
     assets = {x["name"]: x["size"] for x in cli if not x["name"].endswith((".sha256", ".sig", ".txt"))}
     mb = lambda b: "?" if b is None else f"{b / 1e6:.1f}"  # noqa: E731

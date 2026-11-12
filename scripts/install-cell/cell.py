@@ -46,7 +46,23 @@ LONG_B64 = re.compile(r"(?<![A-Za-z0-9+/=_\-])[A-Za-z0-9+/_\-]{40,}={0,2}(?![A-Z
 SHA_LIKE = re.compile(r"^(?:sha256:)?[0-9a-f]{40,64}$")
 
 
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+# A secret revealed on its own line under its name (onboard's reveal_secret,
+# prompt.rs: "  NOO_AGE_BACKUP_PASSPHRASE" then the value alone): the name
+# line arms a mask for the next non-blank line, whatever that value looks like.
+SECRET_NAME = re.compile(r"^[A-Z][A-Z0-9_]*(PASSPHRASE|PASSWORD|TOKEN|SECRET|KEY)[A-Z0-9_]*:?$")
+
+
 def redact_line(line: str, state: dict) -> str:
+    nl = "\n" if line.endswith("\n") else ""
+    line = ANSI.sub("", line.rstrip("\n")) + nl
+    bare = line.strip()
+    if state.get("mask_next") and bare:
+        state["mask_next"] = False
+        return MASK + nl
+    if SECRET_NAME.match(bare):
+        state["mask_next"] = True
+        return line
     if state.get("pem"):
         if re.search(r"-----END [A-Z ]+-----", line):
             state["pem"] = False
@@ -65,7 +81,12 @@ def redact_line(line: str, state: dict) -> str:
 
 def secret_hits(text: str) -> list[str]:
     hits = []
-    for i, line in enumerate(text.splitlines(), 1):
+    lines = text.splitlines()
+    for i, line in enumerate(lines, 1):
+        if SECRET_NAME.match(ANSI.sub("", line).strip()):
+            nxt = next((l.strip() for l in lines[i:] if l.strip()), None)
+            if nxt is not None and nxt != MASK:
+                hits.append(f"{i + 1}: value under {line.strip()[:40]}")
         probe = line.replace(MASK, "")
         if re.search(r"-----BEGIN [A-Z ]*PRIVATE KEY-----", probe):
             hits.append(f"{i}: PEM private key")
