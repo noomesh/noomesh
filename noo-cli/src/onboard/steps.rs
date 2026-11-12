@@ -8139,7 +8139,7 @@ pub(crate) fn render_netns_unit(owner: &str, install_root: &str) -> Result<Strin
         "[Unit]\n\
          Description=noomesh: start the containers that join another's network after dockerd starts\n\
          After=docker.service\n\
-         PartOf=docker.service\n\
+         \n\
          \n\
          [Service]\n\
          Type=oneshot\n\
