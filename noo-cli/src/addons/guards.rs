@@ -969,7 +969,10 @@ mod tests {
     fn check_bundle_files_runs_the_env_channel_check() {
         let mut files = BTreeMap::new();
         files.insert("docker-compose.yml".to_string(), PT_BASE.replace("      RH_NAME: rhaddon\n", "      - NOO_JWT_SECRET\n").into_bytes());
-        let e = check_bundle_files("rhaddon", &files, true, &core()).unwrap_err();
+        // plain_core: core()'s fixture lists NOO_BUS_KEY_RHADDON, which makes
+        // `rhaddon` a core name for a third-party bundle. Default-deny refuses
+        // the pass-through whatever core holds.
+        let e = check_bundle_files("rhaddon", &files, true, &plain_core()).unwrap_err();
         assert!(e.contains("passes `NOO_JWT_SECRET` through"), "{e}");
     }
 
