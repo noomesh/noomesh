@@ -53,7 +53,6 @@ pub(crate) fn render(owner: &str, install_root: &str) -> Result<String, String> 
         "[Unit]\n\
          Description=noomesh: start the containers that join another's network after dockerd starts\n\
          After=docker.service\n\
-         PartOf=docker.service\n\
          \n\
          [Service]\n\
          Type=oneshot\n\
