@@ -458,7 +458,12 @@ fn preflight_verdict(code: Option<i32>) -> PreflightVerdict {
 /// operator's. 2026-10-10: a Pop!_OS box redeemed its token, THEN prep died
 /// on a wrong docker repo; the check runs first so that cannot spend a token.
 fn prep_preflight(data_root: &str) -> PreflightVerdict {
-    let path = std::env::temp_dir().join(format!("noo-enroll-precheck-{}.sh", std::process::id()));
+    // i689: the script `bash` runs sits in a fresh 0700 dir, not a
+    // predictable `<tmp>/noo-enroll-precheck-<pid>.sh` another user could swap.
+    let Ok(dir) = crate::private_tmp::Dir::new("noo-enroll-precheck") else {
+        return PreflightVerdict::Unavailable;
+    };
+    let path = dir.path().join("prep-host.sh");
     if std::fs::write(&path, ASSET_PREP).is_err() {
         return PreflightVerdict::Unavailable;
     }
@@ -805,8 +810,12 @@ pub fn enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     {
         let new_ca = String::from_utf8_lossy(&ca_pem).to_string();
         if new_ca.contains("BEGIN CERTIFICATE") {
-            let tmp = std::env::temp_dir().join("noo-enroll-ca-probe.crt");
-            if std::fs::write(&tmp, &new_ca).is_ok()
+            // i689: a fresh 0700 dir, not the fixed `<tmp>/noo-enroll-ca-probe.crt`
+            // (whose planted symlink `write` would follow).
+            let probe = crate::private_tmp::Dir::new("noo-enroll-ca-probe");
+            let tmp = probe.as_ref().map(|d| d.path().join("ca.crt")).unwrap_or_default();
+            if probe.is_ok()
+                && std::fs::write(&tmp, &new_ca).is_ok()
                 && run(Command::new("sudo").args([
                     "cmp",
                     "-s",
@@ -886,12 +895,16 @@ pub fn enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     wait_for_controller(&noo_url);
     let hostname = run(&mut Command::new("hostname")).1;
     let enroll_user = run(Command::new("id").arg("-un")).1;
-    let birth_dir = std::env::temp_dir().join(format!("noo-birth-{}", std::process::id()));
+    // i689: the birth key lives in a fresh 0700 dir (removed when enroll
+    // returns), not a predictable `<tmp>/noo-birth-<pid>` another user could
+    // pre-create and read the key from.
+    let birth_guard = crate::private_tmp::Dir::new("noo-birth");
+    let birth_dir = birth_guard.as_ref().map(|d| d.path().to_path_buf()).unwrap_or_default();
     let mut birth_cert_pem = String::new();
-    if run(Command::new("sh").args(["-c", "command -v openssl"])).0 == 0 {
+    if let Err(e) = &birth_guard {
+        ui::warned(&format!("no private dir for the birth keypair ({e}) — pull provisioning unavailable"));
+    } else if run(Command::new("sh").args(["-c", "command -v openssl"])).0 == 0 {
         ui::step("generating the birth keypair (RSA-4096)");
-        let _ = std::fs::create_dir_all(&birth_dir);
-        let _ = run(Command::new("chmod").arg("700").arg(&birth_dir));
         let key = birth_dir.join("birth.key");
         let crt = birth_dir.join("birth.crt");
         let (code, _) = run(Command::new("openssl").args([
@@ -1213,7 +1226,9 @@ pub fn enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // from the controller like the shell lane (CA verified against the
         // blob's pin inside prep), just without the embedded-assets upgrade.
         say(&ui::note("this noo build has no embedded enroll assets — prep is fetched from the controller (shell-lane posture)"));
-        let prep_tmp = std::env::temp_dir().join(format!("noo-enroll-prep-{}", std::process::id()));
+        // i689: the script `sudo bash` runs, in a fresh 0700 dir.
+        let prep_dir = crate::private_tmp::Dir::new("noo-enroll-prep");
+        let prep_tmp = prep_dir.as_ref().map(|d| d.path().join("prep-host.sh")).unwrap_or_default();
         // this script is executed by `sudo bash` a few lines down.
         // It used to arrive over `insecure_agent(30)` — an unverified
         // transport handing root a shell script. It now verifies against the
@@ -1262,10 +1277,12 @@ pub fn enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     }
     if !skip_prep && !ASSET_PREP.is_empty() {
-        let stage = std::env::temp_dir().join(format!("noo-enroll-stage-{}", std::process::id()));
+        // i689: root runs what is staged here; a fresh 0700 dir, not a
+        // predictable `<tmp>/noo-enroll-stage-<pid>`.
+        let stage_dir = crate::private_tmp::Dir::new("noo-enroll-stage");
+        let stage = stage_dir.as_ref().map(|d| d.path().to_path_buf()).unwrap_or_default();
         let tools = stage.join("tools");
-        let _ = std::fs::create_dir_all(&tools);
-        let mut staged_ok = true;
+        let mut staged_ok = stage_dir.is_ok() && std::fs::create_dir(&tools).is_ok();
         // No noo-gate: the SSH gate lane is retired and the script is no
         // longer compiled in. prep-host.sh removes a copy an earlier
         // enrollment left behind.
@@ -1274,10 +1291,10 @@ pub fn enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             ("noo-fetch", ASSET_FETCH),
             ("noo-deenroll", ASSET_DEENROLL),
         ] {
-            staged_ok &= std::fs::write(tools.join(name), content).is_ok();
+            staged_ok = staged_ok && std::fs::write(tools.join(name), content).is_ok();
         }
         let prep_path = stage.join("prep-host.sh");
-        staged_ok &= std::fs::File::create(&prep_path)
+        staged_ok = staged_ok && std::fs::File::create(&prep_path)
             .and_then(|mut f| f.write_all(ASSET_PREP.as_bytes()))
             .is_ok();
         if !staged_ok {
@@ -1592,8 +1609,10 @@ fn darwin_arm_daemon(home: &str, noo_url: &str, node: &str, data_root: Option<&s
         return Ok(1);
     }
     let plist_body = crate::commands::node_fetch::fetch_daemon_plist(&user, noo_bin);
-    let tmp = std::env::temp_dir().join(format!("noo-fetch-plist-{}", std::process::id()));
-    if std::fs::write(&tmp, plist_body).is_err() {
+    // i689: `sudo install`s this as a root LaunchDaemon; a fresh 0700 dir.
+    let plist_dir = crate::private_tmp::Dir::new("noo-fetch-plist");
+    let tmp = plist_dir.as_ref().map(|d| d.path().join("fetch.plist")).unwrap_or_default();
+    if plist_dir.is_err() || std::fs::write(&tmp, plist_body).is_err() {
         ui::failed("could not stage the fetch daemon plist", None);
         return Ok(1);
     }

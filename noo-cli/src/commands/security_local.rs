@@ -2124,10 +2124,11 @@ pub(crate) fn deliver_signed_bundle(
 /// step). Used by rotate-all; rotate-ca drives deliver_signed_bundle with
 /// its own transition bundles.
 fn deliver_node_certs(g: &Globals, ca: &ClusterCa, node: &str) -> CertDelivery {
-    let work = std::env::temp_dir().join(format!("noo-certs-{}-{}", node, std::process::id()));
-    if std::fs::create_dir_all(&work).is_err() {
-        return CertDelivery::Failed("could not create a work dir".into());
-    }
+    // i689: a fresh 0700 dir (mkdtemp); what is staged here is CA-signed.
+    let work = match crate::private_tmp::dir(&format!("noo-certs-{node}")) {
+        Ok(d) => d,
+        Err(e) => return CertDelivery::Failed(format!("could not create a work dir: {e}")),
+    };
     let expected = cert_not_after_unix(&ca.dir.join("nodes").join(node).join("node.crt"));
     let out = match build_signed_cert_bundle(ca, node, &work, node_takes_leaf_kinds(g, node)) {
         Ok(bundle) => deliver_signed_bundle(g, node, &bundle, &work, expected),
@@ -2158,6 +2159,19 @@ fn cert_node_name(cert_name: &str) -> Option<&str> {
 
 /// Non-fatal interactive y/N (stderr prompt, default No). False on any
 /// non-TTY/read trouble — optional offers must never block a pipe.
+/// What teardown-node says when it keeps the node's tailnet device record
+/// (i677a 3b). Without a TTY, `-y` or not, the answer is No: deleting a
+/// device record is outward and hard to undo, so it is never assumed. The
+/// line says what that costs and the one flag that does it next time.
+pub(crate) fn tailnet_kept_note(name: &str, dismantled: bool) -> String {
+    if !dismantled {
+        return "device record kept in the tailnet: the teardown was not confirmed".to_string();
+    }
+    format!("device record KEPT in the tailnet (declined, or no TTY to ask): the next enroll registers as \
+             {name}-1. `--purge-tailscale` (or `--factory`) on teardown-node deletes it; for this one, \
+             remove {name} in the Tailscale admin console")
+}
+
 fn ask_yn(prompt: &str) -> bool {
     use std::io::{BufRead as _, Write as _};
     if unsafe { libc::isatty(0) } != 1 {
@@ -2462,8 +2476,8 @@ fn teardown_one(g: &Globals, name: &str, host: &str, purge_data: bool, purge_ts:
     }
 
     let ca = crate::pki::ClusterCa::new(pki_dir());
-    let work = std::env::temp_dir().join(format!("noo-teardown-{name}-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&work);
+    let work = crate::private_tmp::dir(&format!("noo-teardown-{name}"))
+        .unwrap_or_else(|e| crate::output::fail(g.json, crate::output::ExitCode::Generic, "bundle_failed", &e, None));
     let mut directives: Vec<&str> = Vec::new();
     if purge_data { directives.push("purge-data"); }
     if purge_ts { directives.push("purge-tailscale"); }
@@ -2641,7 +2655,7 @@ fn teardown_one(g: &Globals, name: &str, host: &str, purge_data: bool, purge_ts:
         let ip = registered_tailnet_ip(g, &name).unwrap_or_else(|| host.clone());
         delete_tailnet_device(g, &name, Some(&ip))
     } else {
-        "device left in tailnet (declined / non-interactive; --purge-tailscale forces it)".to_string()
+        tailnet_kept_note(&name, dismantled)
     };
 
     // Forget the node controller-side (finding #76): DB row + mesh KV, via
@@ -2815,9 +2829,7 @@ pub fn pki_rotate_ca(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             }
             next.reissue_in_place(&next_node_dir.join("node.crt"), leaf_days, &crate::pki::NodeRole::Worker)
                 .map_err(|e| format!("re-issue under next CA: {e}"))?;
-            let work = std::env::temp_dir()
-                .join(format!("noo-rotate-ca-{}-{}", node, std::process::id()));
-            std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+            let work = crate::private_tmp::dir(&format!("noo-rotate-ca-{node}"))?;
             let files: Vec<(&str, Vec<u8>)> = vec![
                 ("ca.crt", transition_anchor.clone().into_bytes()),
                 ("node.crt", std::fs::read(next_node_dir.join("node.crt")).map_err(|e| e.to_string())?),
@@ -3007,8 +3019,8 @@ fn rotate_ca_retire(g: &Globals, ca: &ClusterCa, yes: bool) -> Result<i32, Unhan
     };
     // Every leaf must verify against the NEW CA alone before the old trust
     // goes away — a straggler would go dark the moment its anchor narrows.
-    let work = std::env::temp_dir().join(format!("noo-retire-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&work);
+    let work = crate::private_tmp::dir("noo-retire")
+        .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "retire_incomplete", &e, None));
     let new_only_path = work.join("ca-new-only.crt");
     let _ = std::fs::write(&new_only_path, &new_only);
     let mut stragglers: Vec<String> = Vec::new();
@@ -3928,12 +3940,13 @@ pub fn pki_rotate_signing_key(g: &Globals, args: &[String]) -> Result<i32, Unhan
             println!("{}", ui::item(node));
             println!("{}", ui::sub(&ui::status_line(Glyph::Step, "CA-signed rollover bundle (signing-pub only)")));
         }
-        let work = std::env::temp_dir().join(format!("noo-signkey-{node}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&work);
-        if std::fs::create_dir_all(&work).is_err() {
-            failed.push(node.clone());
-            continue;
-        }
+        let work = match crate::private_tmp::dir(&format!("noo-signkey-{node}")) {
+            Ok(d) => d,
+            Err(_) => {
+                failed.push(node.clone());
+                continue;
+            }
+        };
         // The key and nothing else: the CA delivers a public
         // key, never code — not even the applier. Every applier on the
         // fleet since #119 knows the `signing-pub` kind.
@@ -6419,5 +6432,29 @@ mod parse_pin_tests {
             assert_eq!(&parse_untrust_ca(&argv), want, "untrust-ca {args:?}");
         }
         assert_eq!(ExitCode::Usage as i32, 2, "the path refusal exits 2, like the usage error");
+    }
+}
+
+#[cfg(test)]
+mod tailnet_kept_note_tests {
+    use super::*;
+
+    /// i677a 3b: the default stays No without a TTY; the line says what it
+    /// costs and the exact flag.
+    #[test]
+    fn a_kept_device_record_names_the_cost_and_the_flag() {
+        let l = tailnet_kept_note("gpu-2", true);
+        assert!(l.contains("KEPT"), "{l}");
+        assert!(l.contains("the next enroll registers as gpu-2-1"), "{l}");
+        assert!(l.contains("`--purge-tailscale`"), "{l}");
+        assert!(!l.contains('\n'), "one line: {l}");
+        let n = tailnet_kept_note("gpu-2", false);
+        assert!(n.contains("not confirmed") && !n.contains("gpu-2-1"), "{n}");
+    }
+
+    #[test]
+    fn teardown_prints_the_tested_note() {
+        let own = crate::test_src::own_code(include_str!("security_local.rs"));
+        assert!(own.contains("    } else {\n        tailnet_kept_note(&name, dismantled)\n    };"));
     }
 }

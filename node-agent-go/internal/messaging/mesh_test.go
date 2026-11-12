@@ -128,3 +128,21 @@ func TestBuildOffer_UnknownLoadGivesNoOffer(t *testing.T) {
 		t.Errorf("unknown load offered: %v", offer)
 	}
 }
+
+// i677 #12: a backend running with nothing placed and nothing loaded reports
+// model "". Offering it routed a request with "model": "" to ollama, which
+// answered 400 "model is required". No model, no offer.
+func TestBuildOffer_NeverOffersABackendWithNoModel(t *testing.T) {
+	backends := map[string]BackendInfo{"ollama": {Model: "", URL: "https://noo-ollama:11434"}}
+	if offer := buildOffer("n", backends, f64(0.1), discoverRequest{}); offer != nil {
+		t.Fatalf("offered a backend with no model: %v", offer)
+	}
+	backends["ollama"] = BackendInfo{Model: "   ", URL: "https://noo-ollama:11434"}
+	if offer := buildOffer("n", backends, f64(0.1), discoverRequest{}); offer != nil {
+		t.Fatalf("offered a backend with a blank model: %v", offer)
+	}
+	backends["ollama"] = BackendInfo{Model: "gemma4:e2b", URL: "https://noo-ollama:11434"}
+	if offer := buildOffer("n", backends, f64(0.1), discoverRequest{}); offer == nil || offer["model"] != "gemma4:e2b" {
+		t.Fatalf("a backend naming its model must still be offered: %v", offer)
+	}
+}

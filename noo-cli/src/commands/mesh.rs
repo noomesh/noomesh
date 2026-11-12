@@ -894,6 +894,20 @@ pub fn mesh_clean(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     }
 
+    // i677a 3d: a deep clean with no data root is refused HERE, before docker
+    // is asked, the confirm, and the self-heal daemons are stopped. The script
+    // refuses too, but by then this wrapper had already stopped them, so its
+    // "nothing was changed" was false.
+    if deep {
+        let env_val = std::env::var("NOO_DATA_ROOT").ok();
+        let dotenv = std::fs::read_to_string(crate::envfile::repo_root().join(".env")).ok();
+        if deep_clean_data_root(env_val.as_deref(), dotenv.as_deref()).is_none() {
+            println!("{}", ui::note("set NOO_DATA_ROOT to this install's data root, then re-run --deep"));
+            ui::close_failed(DEEP_NO_DATA_ROOT, None);
+            return Ok(1);
+        }
+    }
+
     // i677 #20: docker must ANSWER before anything is asked, stopped or removed
     // (the relaunch, i677 #10, runs BEFORE the confirm, so it is asked once,
     // in the relaunched child). A
@@ -928,6 +942,19 @@ pub fn mesh_clean(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 
     let script_args = clean_script_args(volumes, images, all, deep, cache, hf_cache, yes);
     Ok(run_script(g, "noomesh-clean.sh", &script_args, Some("clean")))
+}
+
+/// The refusal both this wrapper and `noomesh-clean.sh` print.
+pub(crate) const DEEP_NO_DATA_ROOT: &str =
+    "NOO_DATA_ROOT is not set (environment or .env) — refusing --deep, nothing was changed";
+
+/// The data root `noomesh-clean.sh --deep` would wipe under, from the same
+/// sources in the same order: the environment (empty = unset, as bash's
+/// `${NOO_DATA_ROOT:-}`), then the repo's `.env`, last assignment. None =
+/// not set, and `--deep` is refused.
+pub(crate) fn deep_clean_data_root(env_val: Option<&str>, dotenv: Option<&str>) -> Option<String> {
+    env_val.filter(|v| !v.is_empty()).map(str::to_string)
+        .or_else(|| dotenv.and_then(|t| crate::envfile::dotenv_last(t, "NOO_DATA_ROOT")).filter(|v| !v.is_empty()))
 }
 
 /// Script arguments for `noomesh-clean.sh`. `--deep` wins, else `--all`,
@@ -1627,5 +1654,40 @@ exit 3
         assert_eq!(t.live_status(), "pulling images: 2 layers seen (1 already present)");
         assert!(!t.feed(" Container noo-a  Started"));
         assert_eq!(t.live_status(), "containers: 1 of 1 up");
+    }
+}
+
+#[cfg(test)]
+mod deep_clean_data_root_tests {
+    use super::*;
+
+    /// i677a 3d: the same answer the script computes, env first, then `.env`.
+    #[test]
+    fn the_data_root_comes_from_the_env_then_the_dotenv_and_empty_is_unset() {
+        assert_eq!(deep_clean_data_root(Some("/srv/noo"), Some("NOO_DATA_ROOT=/x\n")).as_deref(), Some("/srv/noo"));
+        assert_eq!(deep_clean_data_root(Some(""), Some("NOO_DATA_ROOT=/x\n")).as_deref(), Some("/x"), "empty env is unset");
+        assert_eq!(deep_clean_data_root(None, Some("NOO_DATA_ROOT=\"/a\"\nNOO_DATA_ROOT=/b\n")).as_deref(), Some("/b"));
+        assert_eq!(deep_clean_data_root(None, Some("NOO_DATA_ROOT=\n")), None);
+        assert_eq!(deep_clean_data_root(None, Some("OTHER=1\n")), None);
+        assert_eq!(deep_clean_data_root(None, None), None);
+    }
+
+    /// The refusal comes BEFORE docker is asked, the confirm, and the daemon
+    /// stop, so its "nothing was changed" is true.
+    #[test]
+    fn deep_without_a_data_root_is_refused_before_anything_is_stopped() {
+        let own = crate::test_src::own_code(include_str!("mesh.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn mesh_clean(");
+        let at = |s: &str| body.find(s).unwrap_or_else(|| panic!("{s} not in mesh_clean"));
+        let refuse = at("deep_clean_data_root(env_val.as_deref(), dotenv.as_deref()).is_none()");
+        assert!(refuse < at("docker_access()"));
+        assert!(refuse < at("confirm_destructive("));
+        assert!(refuse < at("stop_self_heal_daemons("));
+    }
+
+    /// The wrapper and the script print the same refusal.
+    #[test]
+    fn the_script_and_the_wrapper_say_the_same_thing() {
+        assert!(include_str!("../../../scripts/noomesh-clean.sh").contains(DEEP_NO_DATA_ROOT));
     }
 }

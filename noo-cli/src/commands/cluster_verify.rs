@@ -288,6 +288,32 @@ pub(crate) fn stack_tag_from_gateway(fleet: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// For this long after `noo upgrade` rolled the stack or the nodes, a node
+/// that is silent, or still on the old agent, is restarting rather than
+/// broken: agents and the gateway restart and reconnect (i663 §2.3).
+pub(crate) const ROLL_SETTLE_SECS: i64 = 600;
+/// The record field verify adds while a roll is settling: seconds since it.
+const ROLLED_AGO_KEY: &str = "rolled_secs_ago";
+/// The rows an agent or gateway restart turns red for a minute or two.
+const SETTLING_ROWS: [&str; 4] = ["online", "bus", "hostd", "version"];
+
+/// Seconds since the last roll, when it is inside [`ROLL_SETTLE_SECS`].
+fn rolled_ago(roll: Option<i64>, now: i64) -> Option<i64> {
+    roll.map(|t| now - t).filter(|age| (0..=ROLL_SETTLE_SECS).contains(age))
+}
+
+/// Inside the settle window a failing liveness row reads as restarting
+/// after the upgrade (STARTING: still exit 1, never a pass), with
+/// `noo cluster verify --wait` as the way on. Outside it, nothing changes.
+fn settle_after_roll(n: &Value, out: &mut [Check]) {
+    let Some(age) = n[ROLLED_AGO_KEY].as_i64() else { return };
+    for c in out.iter_mut().filter(|c| c.verdict == Verdict::Fail && SETTLING_ROWS.contains(&c.name)) {
+        c.verdict = Verdict::Starting;
+        c.detail = format!("restarting after the upgrade {age}s ago ({})", c.detail);
+        c.remedy = Some("noo cluster verify --wait   # waits for the restarted agents".into());
+    }
+}
+
 /// The controller's stack tag: `.env NOO_IMAGE_TAG` (what is deployed), else
 /// the tag this binary was paired with at build.
 pub(crate) fn controller_stack_tag() -> String {
@@ -334,6 +360,15 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
         ("online", Some(age)) => out.push(fail("online", format!("status says online but the last heartbeat is {age}s old"),
             format!("noo cluster logs {id}"))),
         ("online", None) => out.push(warn("online", "online, no heartbeat timestamp reported", None)),
+        // i677 #17: right after the gateway (re)started it has not heard a
+        // gossip round yet. Not a pass (Starting exits 1); `--wait` polls it.
+        ("unknown", _) if n["status_reason"].as_str() == Some("gateway_settling") => out.push(Check {
+            name: "online",
+            verdict: Verdict::Starting,
+            detail: format!("starting — {} (`noo cluster verify --wait` waits for it)",
+                n["status_detail"].as_str().unwrap_or("the gateway started moments ago and has not heard this node's gossip yet")),
+            remedy: None,
+        }),
         (s, _) => out.push(fail("online", format!("status {s}"), format!("noo cluster show {id}"))),
     }
 
@@ -518,6 +553,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     } }
     out.extend(harness_tasks_check(n));
     out.extend(harness_egress_check(id, n));
+    settle_after_roll(n, &mut out);
     out
 }
 
@@ -2230,7 +2266,9 @@ pub(crate) fn default_chat_check(classes: Option<&Value>) -> Check {
     };
     let empty = Vec::new();
     let Some(cd) = body["classes"].as_array().unwrap_or(&empty).iter().find(|c| c["name"].as_str() == Some("chat-default")) else {
-        return fail(NAME, "no live chat node: an unpinned chat request gets 503", "noo cluster status");
+        // i677 #12: on a single box this is "no chat model placed"; the one
+        // command onboard's last line names too.
+        return fail(NAME, "no live chat node: an unpinned chat request gets 503", crate::onboard::FIRST_MODEL_CMD);
     };
     let mode = if cd["declared"].as_bool() == Some(true) { "declared" } else { "dynamic" };
     // An older gateway sends no routing_order: its candidates, routable ones.
@@ -7083,6 +7121,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let here = vantage_here(Some(&body));
         let tag = if here == Vantage::Controller { controller_stack_tag() } else { stack_tag_from_gateway(&body) };
         let now = now_unix();
+        let roll = crate::commands::upgrade::last_roll();
         if !g.json {
             println!("{}", ui::header("cluster verify", Some(&format!("{} node(s) · controller {tag}", selected.len()))));
             tally.context = format!(" — {} node(s) on {tag}", selected.len());
@@ -7096,7 +7135,11 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         laps.push((format!("node reads ({} node(s), side by side)", selected.len()), reads_from.elapsed()));
         for (n, wanted) in selected.iter().zip(&enriched) {
             let id = n["id"].as_str().unwrap_or("?");
-            let checks = node_checks(wanted, &tag, env!("CARGO_PKG_VERSION"), now, signing_adopted_for(id));
+            let mut record = wanted.clone();
+            if let (Some(age), Some(obj)) = (rolled_ago(roll, now), record.as_object_mut()) {
+                obj.insert(ROLLED_AGO_KEY.into(), age.into());
+            }
+            let checks = node_checks(&record, &tag, env!("CARGO_PKG_VERSION"), now, signing_adopted_for(id));
             let node_ok = checks.iter().all(|c| c.verdict != Verdict::Fail && c.verdict != Verdict::Starting);
             any_starting |= checks.iter().any(|c| c.verdict == Verdict::Starting);
             all_ok &= node_ok;
@@ -7240,6 +7283,14 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
         // A release's new data directory, missing here, refuses the stack roll.
         checks.push(storage_dirs_row(&crate::envfile::repo_root()));
+        // The cluster's certificates by name and days left: the gateway's
+        // 30-day alert says how many; this row says which.
+        let certs: Vec<(String, i64)> = crate::pki::ClusterCa::new(crate::pki::pki_dir())
+            .list_certs()
+            .into_iter()
+            .map(|c| (c.name, c.days_left))
+            .collect();
+        checks.push(cert_expiry_row(&certs));
         checks.push(noo_data_bound_row(&crate::envfile::repo_root()));
         // i67: the controller's own node (when this box runs one) rides the rail.
         if let Some(me) = crate::commands::provision::self_node_name()
@@ -7788,6 +7839,55 @@ fn render_timings(laps: &[(String, Duration)], total: Duration) {
         println!("{}", ui::note(&format!("{rest} more step(s) under {TIMING_FLOOR_MS} ms each")));
     }
     println!("  {:>7.2}s  total", total.as_secs_f64());
+}
+
+/// Inside this many days a certificate is named as expiring: the same window
+/// as the gateway's alert and `noo security pki status`.
+const CERT_WARN_DAYS: i64 = 30;
+/// At most this many certificates are named in one row.
+const CERTS_NAMED: usize = 8;
+
+fn named_days(certs: &[&(String, i64)]) -> String {
+    let mut parts: Vec<String> = certs
+        .iter()
+        .take(CERTS_NAMED)
+        .map(|(n, d)| match *d {
+            d if d < 0 => format!("{n} (expired {} day(s) ago)", -d),
+            0 => format!("{n} (under a day)"),
+            1 => format!("{n} (1 day)"),
+            d => format!("{n} ({d} days)"),
+        })
+        .collect();
+    if certs.len() > CERTS_NAMED {
+        parts.push(format!("and {} more", certs.len() - CERTS_NAMED));
+    }
+    parts.join(", ")
+}
+
+/// `cert expiry`: every certificate under the PKI dir, `(name, days left)`.
+/// Expired fails; inside [`CERT_WARN_DAYS`] warns; each is named, soonest
+/// first, with its days.
+pub(crate) fn cert_expiry_row(certs: &[(String, i64)]) -> Check {
+    const NAME: &str = "cert expiry";
+    const ROTATE: &str = "noo security pki rotate-all";
+    if certs.is_empty() {
+        return warn(NAME, "no certificate under the PKI dir to judge", Some("noo security pki status".into()));
+    }
+    let mut sorted: Vec<&(String, i64)> = certs.iter().collect();
+    sorted.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    let expired: Vec<&(String, i64)> = sorted.iter().copied().filter(|c| c.1 < 0).collect();
+    let soon: Vec<&(String, i64)> = sorted.iter().copied().filter(|c| (0..CERT_WARN_DAYS).contains(&c.1)).collect();
+    if !expired.is_empty() {
+        let mut detail = format!("{} expired: {}", expired.len(), named_days(&expired));
+        if !soon.is_empty() {
+            detail.push_str(&format!("; {} more within {CERT_WARN_DAYS} days: {}", soon.len(), named_days(&soon)));
+        }
+        return fail(NAME, detail, ROTATE);
+    }
+    if !soon.is_empty() {
+        return warn(NAME, format!("{} within {CERT_WARN_DAYS} days: {}", soon.len(), named_days(&soon)), Some(ROTATE.into()));
+    }
+    ok(NAME, format!("{} certificate(s); the soonest, {}, in {} days", certs.len(), sorted[0].0, sorted[0].1))
 }
 
 fn checks_json(checks: &[Check]) -> Value {
@@ -8687,6 +8787,54 @@ mod tests {
         let c = host_checks("host2", &Value::Null, true);
         assert_eq!(verdict(&c, "next boot"), Verdict::Warn);
         assert!(host_checks("host2", &Value::Null, false).is_empty(), "a dead hostd already fails its own row");
+    }
+
+    // ── i677 #17: a gateway that just started has not heard the gossip ──
+
+    /// The gateway's `gateway_settling` reason makes an unknown node a
+    /// Starting row (never a pass, never a FAIL) that carries the gateway's
+    /// own detail; an unknown node without it still FAILs.
+    #[test]
+    fn an_unknown_node_the_gateway_calls_settling_is_starting_and_says_why() {
+        let now = 1_800_000_000;
+        let mut n = healthy(now);
+        n["status"] = serde_json::json!("unknown");
+        n["status_reason"] = serde_json::json!("gateway_settling");
+        n["status_detail"] = serde_json::json!("last heard 12s ago, BEFORE this gateway started");
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        let r = c.iter().find(|c| c.name == "online").unwrap();
+        assert_eq!(r.verdict, Verdict::Starting, "{}", r.detail);
+        assert!(r.detail.contains("BEFORE this gateway started") && r.detail.contains("noo cluster verify --wait"), "{}", r.detail);
+        assert!(r.remedy.is_none());
+        n["status_detail"] = serde_json::Value::Null;
+        let r = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true)).into_iter().find(|c| c.name == "online").unwrap();
+        assert_eq!(r.verdict, Verdict::Starting);
+        assert!(r.detail.contains("has not heard this node's gossip yet"), "{}", r.detail);
+        n["status_reason"] = serde_json::Value::Null;
+        assert_eq!(verdict(&node_checks(&n, "v0.2.70", "0.5.57", now, Some(true)), "online"), Verdict::Fail);
+        n["status_reason"] = serde_json::json!("something_else");
+        assert_eq!(verdict(&node_checks(&n, "v0.2.70", "0.5.57", now, Some(true)), "online"), Verdict::Fail);
+    }
+
+    /// `--wait` waits on a settling node, and only while the gateway says so.
+    #[test]
+    fn wait_polls_a_settling_node_and_stops_once_it_is_heard() {
+        let now = 1_800_000_000;
+        let mut n = healthy(now);
+        assert!(!warmup::node_still_starting(&n, now), "a healthy node is not waited on");
+        n["status"] = serde_json::json!("unknown");
+        n["status_reason"] = serde_json::json!("gateway_settling");
+        assert!(warmup::node_still_starting(&n, now));
+        n["status_reason"] = serde_json::Value::Null;
+        assert!(!warmup::node_still_starting(&n, now), "unknown without the reason is judged, not waited on");
+    }
+
+    /// The `--wait` loop asks the one predicate the tests above pin.
+    #[test]
+    fn the_wait_loop_uses_the_tested_predicate() {
+        let own = crate::test_src::own_code(include_str!("cluster_verify/warmup.rs"));
+        let body = crate::test_src::fn_body(&own, "pub(crate) fn wait_for_node_warmup(");
+        assert!(body.contains(".any(|n| node_still_starting(n, now))"), "{body}");
     }
 
     // ── i276: what a fresh one-box install must not FAIL on ───────────
@@ -13653,5 +13801,131 @@ mod profile_form_row_tests {
         assert_eq!(with_profile_form(ok("sandbox executor", "x"), None).detail, "x", "no profile here: nothing added");
         let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
         assert!(own.contains("crate::onboard::sandbox_apparmor::installed_form("), "the controller run states it");
+    }
+}
+
+#[cfg(test)]
+mod default_chat_remedy_tests {
+    use super::*;
+
+    /// verify and onboard's last line name the SAME one command (i677 #12).
+    #[test]
+    fn no_chat_default_names_the_first_model_command() {
+        let c = default_chat_check(Some(&serde_json::json!({"classes": []})));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert_eq!(c.remedy.as_deref(), Some(crate::onboard::FIRST_MODEL_CMD));
+        assert!(crate::onboard::NO_CHAT_MODEL_YET.ends_with(c.remedy.as_deref().unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod cert_expiry_row_tests {
+    use super::*;
+
+    fn c(n: &str, d: i64) -> (String, i64) {
+        (n.to_string(), d)
+    }
+
+    #[test]
+    fn healthy_certificates_name_the_soonest() {
+        let r = cert_expiry_row(&[c("gateway", 200), c("cluster CA", 3000), c("node pop-os", 80)]);
+        assert_eq!(r.verdict, Verdict::Ok);
+        assert_eq!(r.detail, "3 certificate(s); the soonest, node pop-os, in 80 days");
+    }
+
+    #[test]
+    fn expiring_ones_are_named_with_their_days_soonest_first() {
+        let r = cert_expiry_row(&[c("gateway", 200), c("node b", 29), c("node a", 1), c("svc x", 0)]);
+        assert_eq!(r.verdict, Verdict::Warn);
+        assert_eq!(r.detail, "3 within 30 days: svc x (under a day), node a (1 day), node b (29 days)");
+        assert_eq!(r.remedy.as_deref(), Some("noo security pki rotate-all"));
+        // Day 30 is outside the window, as in `pki status`.
+        assert_eq!(cert_expiry_row(&[c("gateway", 30)]).verdict, Verdict::Ok);
+    }
+
+    #[test]
+    fn an_expired_certificate_fails_and_the_expiring_ones_still_show() {
+        let r = cert_expiry_row(&[c("node old", -2), c("gateway", 10), c("cluster CA", 900)]);
+        assert_eq!(r.verdict, Verdict::Fail);
+        assert_eq!(r.detail, "1 expired: node old (expired 2 day(s) ago); 1 more within 30 days: gateway (10 days)");
+    }
+
+    #[test]
+    fn a_long_list_names_eight_and_counts_the_rest() {
+        let many: Vec<(String, i64)> = (0..10).map(|i| c(&format!("n{i}"), 5)).collect();
+        let r = cert_expiry_row(&many);
+        assert!(r.detail.ends_with("n7 (5 days), and 2 more"), "{}", r.detail);
+    }
+
+    #[test]
+    fn no_certificate_is_not_a_pass() {
+        assert_eq!(cert_expiry_row(&[]).verdict, Verdict::Warn);
+    }
+
+    #[test]
+    fn the_row_is_in_the_controller_run() {
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let run = crate::test_src::fn_body(&own, "pub fn cluster_verify(");
+        assert!(run.contains("checks.push(cert_expiry_row(&certs));"));
+    }
+}
+
+#[cfg(test)]
+mod settle_after_roll_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn silent_node() -> Value {
+        json!({"id": "pop-os", "status": "offline", "nats_state": "disconnected", "nats_role": "node",
+               "app_version": "stack-v0.6.22+abc", "hostd": {"alive": false, "detail": "stale heartbeat"}})
+    }
+
+    fn rows(n: &Value) -> Vec<(&'static str, Verdict)> {
+        node_checks(n, "v0.6.23", "0.6.23", 2_000_000, Some(true)).into_iter()
+            .filter(|c| SETTLING_ROWS.contains(&c.name)).map(|c| (c.name, c.verdict)).collect()
+    }
+
+    #[test]
+    fn a_silent_node_just_after_a_roll_is_restarting_not_broken() {
+        let mut n = silent_node();
+        n[ROLLED_AGO_KEY] = 45.into();
+        let checks = node_checks(&n, "v0.6.23", "0.6.23", 2_000_000, Some(true));
+        let online = checks.iter().find(|c| c.name == "online").unwrap();
+        assert_eq!(online.verdict, Verdict::Starting);
+        assert_eq!(online.detail, "restarting after the upgrade 45s ago (status offline)");
+        assert!(online.remedy.as_deref().unwrap().starts_with("noo cluster verify --wait"));
+        assert!(rows(&n).iter().all(|(_, v)| *v == Verdict::Starting), "{:?}", rows(&n));
+    }
+
+    #[test]
+    fn without_a_recent_roll_the_same_node_fails_as_before() {
+        assert!(rows(&silent_node()).iter().all(|(_, v)| *v == Verdict::Fail));
+    }
+
+    #[test]
+    fn only_liveness_rows_are_softened() {
+        let mut n = silent_node();
+        n["peer_identity_enforced"] = false.into();
+        n[ROLLED_AGO_KEY] = 30.into();
+        let checks = node_checks(&n, "v0.6.23", "0.6.23", 2_000_000, Some(false));
+        for name in ["peer identity", "signing"] {
+            assert_eq!(checks.iter().find(|c| c.name == name).unwrap().verdict, Verdict::Fail, "{name} is not a restart symptom");
+        }
+    }
+
+    #[test]
+    fn the_window_is_ten_minutes_from_the_roll() {
+        assert_eq!(rolled_ago(Some(1_000), 1_000 + 600), Some(600));
+        assert_eq!(rolled_ago(Some(1_000), 1_000 + 601), None, "past the window it is a real outage");
+        assert_eq!(rolled_ago(Some(1_000), 999), None, "a roll in the future is a skewed clock, not a roll");
+        assert_eq!(rolled_ago(None, 5), None);
+    }
+
+    #[test]
+    fn the_fleet_run_reads_the_roll_marker() {
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let run = crate::test_src::fn_body(&own, "pub fn cluster_verify(");
+        assert!(run.contains("crate::commands::upgrade::last_roll()"));
+        assert!(run.contains("obj.insert(ROLLED_AGO_KEY.into(), age.into());"));
     }
 }

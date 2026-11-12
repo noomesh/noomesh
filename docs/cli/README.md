@@ -29,7 +29,7 @@ has a page here with its command reference.
 - `noo whoami` — What this box is: controller, node, both, or client-only
 - `noo onboard` — Setup wizard
 - `noo enroll` — Join this machine to a noomesh fleet as a worker
-- `noo offboard` — Leave the fleet: stop the agent, remove enrollment state (confirms)
+- `noo offboard` — Tear a standalone controller down to bare machine prep (confirms each step)
 - `noo upgrade` — Self-update the CLI; --stack/--nodes/--controller roll the rest
 - `noo doctor` — Host-plane health checks with guided recovery
 - `noo health` — Gateway health probe

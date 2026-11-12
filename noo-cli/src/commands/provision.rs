@@ -890,7 +890,7 @@ fn obtain_binary(g: &Globals, site: &ProvSite, m: &ProvMachine) -> Vec<u8> {
                 Some("darwin agents build from source — run provision from a checkout"));
         })
     } else {
-        obtain_agent_binary(&root, goarch).unwrap_or_else(|e| {
+        obtain_agent_binary(g, &root, goarch).unwrap_or_else(|e| {
             fail(g.json, ExitCode::Generic, "agent_binary", &e,
                 Some("is docker logged in to the image registry, and NOO_IMAGE_TAG set (noomesh.yaml compose_env / .env)?"));
         })
@@ -1123,12 +1123,14 @@ fn adopt_signing_key_first(g: &Globals, a: &ProvisionArgs) {
 
 /// Step 7: the CA and a scratch dir (the signing key was adopted in
 /// `adopt_signing_key_first`).
-fn prepare_bundle_workspace(_g: &Globals, a: &ProvisionArgs, pki: &Path) -> (crate::pki::ClusterCa, std::path::PathBuf) {
+fn prepare_bundle_workspace(g: &Globals, a: &ProvisionArgs, pki: &Path) -> (crate::pki::ClusterCa, std::path::PathBuf) {
     let node = a.node.clone();
     let pki = pki.to_path_buf();
     let ca = crate::pki::ClusterCa::new(pki.clone());
-    let work = std::env::temp_dir().join(format!("noo-provision-{node}-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&work);
+    // i689: fresh and 0700 (mkdtemp), never `<tmp>/noo-provision-<node>-<pid>`:
+    // everything staged here is CA-signed into the bundle.
+    let work = crate::private_tmp::dir(&format!("noo-provision-{node}"))
+        .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "bundle_failed", &e, None));
     (ca, work)
 }
 
@@ -1598,8 +1600,8 @@ fn stage_applier_first(g: &Globals, a: &ProvisionArgs, m: &ProvMachine, ca: &cra
     if !after_applier && applier_first_due(legacy, darwin, !apply.is_empty()) {
         {
             nstep(&format!("{node} has never reported an apply — staging the applier alone first"));
-            let w2 = std::env::temp_dir().join(format!("noo-provision-applier-{node}-{}", std::process::id()));
-            let _ = std::fs::create_dir_all(&w2);
+            let w2 = crate::private_tmp::dir(&format!("noo-provision-applier-{node}"))
+                .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "bundle_failed", &e, None));
             let pre: Vec<(&str, Vec<u8>)> = vec![("applier", apply.as_bytes().to_vec())];
             let b2 = match super::security_local::build_signed_bundle(ca, &node, &pre, &w2) {
                 Ok(b) => b,
@@ -2171,12 +2173,7 @@ pub(crate) fn ensure_self_identity(node: &str) -> Result<(), String> {
     nstep("creating this controller's node identity — sudo once, never again (later upgrades of this node ride the rail)");
     let root = crate::envfile::repo_root();
     let (prep, _guard) = stage_prep_host(&root)?;
-    let work = std::env::temp_dir().join(format!("noo-selfid-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
-    std::fs::create_dir_all(&work).map_err(|e| format!("cannot stage {}: {e}", work.display()))?;
-    let _ = std::fs::set_permissions(&work, {
-        use std::os::unix::fs::PermissionsExt; std::fs::Permissions::from_mode(0o700)
-    });
+    let work = crate::private_tmp::dir("noo-selfid")?;
     let line = match self_prep_line(node, &prep, &local_data_root(&root), &work) {
         Ok(l) => l,
         Err(e) => { let _ = std::fs::remove_dir_all(&work); return Err(e); }
@@ -2821,20 +2818,18 @@ fn stage_prep_host(root: &std::path::Path) -> Result<(std::path::PathBuf, PrepGu
     }
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let path = std::env::temp_dir().join(format!("noo-prep-host-{}.sh", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    // i689: inside a fresh 0700 dir, so no other local user can plant or
+    // swap the script `sudo bash` runs.
+    let dir = crate::private_tmp::Dir::new("noo-prep-host")?;
+    let path = dir.path().join("prep-host.sh");
     std::fs::OpenOptions::new().write(true).create_new(true).mode(0o700).open(&path)
         .and_then(|mut f| f.write_all(embedded.as_bytes()))
         .map_err(|e| format!("cannot stage prep-host.sh at {}: {e}", path.display()))?;
-    Ok((path.clone(), PrepGuard(Some(path))))
+    Ok((path, PrepGuard(Some(dir))))
 }
 
-struct PrepGuard(Option<std::path::PathBuf>);
-impl Drop for PrepGuard {
-    fn drop(&mut self) {
-        if let Some(p) = &self.0 { let _ = std::fs::remove_file(p); }
-    }
-}
+/// Holds the private dir of an embedded prep-host.sh; removed on drop.
+struct PrepGuard(#[allow(dead_code)] Option<crate::private_tmp::Dir>); // held for its Drop
 
 /// The FIRST install of THIS machine's own agent (finding #15; i67: called
 /// only by `noo onboard`) — the standalone controller's self-node. The same
@@ -3127,7 +3122,9 @@ fn provision_local_in(g: &Globals, node: &str, tier: Option<&str>, root: &Path, 
     let units_missing = pull_units_missing(node);
     // The private staging dir, named up front: prep reads the birth keypair
     // the install script generates into it.
-    let work = std::env::temp_dir().join(format!("noo-selfprov-{}", std::process::id()));
+    // i689: fresh and 0700, removed on every return by the guard.
+    let work_dir = crate::private_tmp::Dir::new("noo-selfprov")?;
+    let work = work_dir.path().to_path_buf();
     let prep_cmd = if prep_current && units_missing.is_empty() {
         None
     } else {
@@ -3184,7 +3181,7 @@ fn provision_local_in(g: &Globals, node: &str, tier: Option<&str>, root: &Path, 
     let signing_pub = read_or_fail_path(&leaf_ca.signing_pub_path())?;
     let creds = sops_credentials(&root)?;
     nstep(&format!("obtaining noo-node-agent ({goarch})"));
-    let binary = obtain_agent_binary(&root, goarch).map_err(|e| format!(
+    let binary = obtain_agent_binary(g, &root, goarch).map_err(|e| format!(
         "{e} — is docker logged in to the registry, and NOO_IMAGE_TAG set?"))?;
 
     let tmpl = std::fs::read_to_string(root.join("node-agent-go/deploy/noo-node-agent.env.tmpl"))
@@ -3301,11 +3298,8 @@ fn provision_local_in(g: &Globals, node: &str, tier: Option<&str>, root: &Path, 
         }
         // Stage in a private dir, install what changed with ONE sudo script,
         // scrub the staged secrets either way.
-        let _ = std::fs::remove_dir_all(&work);
-        std::fs::create_dir_all(&work).map_err(|e| format!("cannot stage {} ({e})", work.display()))?;
-        let _ = std::fs::set_permissions(&work, {
-            use std::os::unix::fs::PermissionsExt; std::fs::Permissions::from_mode(0o700)
-        });
+        // `work` is already a fresh 0700 dir (i689): not removed and
+        // re-created here, which would reopen the name to a race.
         for (kind, bytes) in &staged {
             if kind == "secret-files" { continue; }
             if let Err(e) = std::fs::write(work.join(kind), bytes) {
@@ -3448,7 +3442,35 @@ fn binary_carries_version(bin: &[u8], tag: &str) -> bool {
 /// GHCR node-agent image (no Go, no repo — the standalone path). Fallback:
 /// cross-compile from the source tree when it exists (dev checkouts testing
 /// unreleased agents).
-fn obtain_agent_binary(root: &Path, goarch: &str) -> Result<Vec<u8>, String> {
+/// The node-agent image to take the bundle's agent from (i689(b)): BY DIGEST
+/// from the release-signed stack lock of `tag` — never by tag, which anyone
+/// able to push that tag (or retag locally) decides. A dev install whose
+/// release publishes no lock keeps the tag, with a warning; a dist install
+/// refuses, as `noo upgrade --stack` does. A lock that fails verification
+/// is an error, never a fallback.
+fn agent_image_ref(g: &Globals, root: &Path, prefix: &str, tag: &str) -> Result<String, String> {
+    let mode = super::upgrade::install_mode(root);
+    agent_image_ref_with(prefix, tag, &mode, &mut || super::upgrade::verified_stack_lock(g, tag))
+}
+
+fn agent_image_ref_with(prefix: &str, tag: &str, mode: &str, lock: &mut dyn FnMut() -> Result<Option<String>, String>) -> Result<String, String> {
+    let prefix = prefix.trim_end_matches('/');
+    match lock()? {
+        Some(text) => super::image_stage::parse_lock(&text).into_iter()
+            .find(|r| r.name == "node-agent")
+            .map(|r| format!("{prefix}/node-agent@{}", r.digest))
+            .ok_or_else(|| format!("the signed stack-{tag}.lock pins no node-agent — refusing to take the agent by tag")),
+        None => match super::upgrade::no_lock_refusal(mode, tag) {
+            Some(why) => Err(why),
+            None => {
+                ui::warned(&format!("stack-{tag} publishes no signed lock — the node agent is taken from {prefix}/node-agent:{tag} by tag (dev install)"));
+                Ok(format!("{prefix}/node-agent:{tag}"))
+            }
+        },
+    }
+}
+
+fn obtain_agent_binary(g: &Globals, root: &Path, goarch: &str) -> Result<Vec<u8>, String> {
     // image_tag(), NOT std::env::var — and this is the whole bug.
     //
     // `ensure_repo_env()` loads .env into the PROCESS environment at CLI
@@ -3468,7 +3490,9 @@ fn obtain_agent_binary(root: &Path, goarch: &str) -> Result<Vec<u8>, String> {
     let prefix = image_prefix();
     let tag = image_tag();
     let image_err = if !prefix.is_empty() && !tag.is_empty() {
-        let image = format!("{prefix}/node-agent:{tag}");
+        // i689(b): by the signed lock's digest. A lock that does not verify
+        // (or a dist install with none) stops here: no source-tree fallback.
+        let image = agent_image_ref(g, root, &prefix, &tag)?;
         match extract_from_image(&image, goarch) {
             Ok(b) => {
                 // Compare what came OUT against what was asked for.
@@ -3528,7 +3552,8 @@ fn extract_from_image(image: &str, goarch: &str) -> Result<Vec<u8>, String> {
         other => other,
     };
     let result = extract_from_image_inner(image, goarch);
-    if goarch != host_goarch {
+    // A pull BY DIGEST moves no tag, so there is nothing to restore.
+    if goarch != host_goarch && !image.contains('@') {
         let restored = Command::new("docker")
             .args(["pull", "--platform", &format!("linux/{host_goarch}"), image])
             .stdout(std::process::Stdio::null())
@@ -3561,7 +3586,10 @@ fn extract_from_image_inner(image: &str, goarch: &str) -> Result<Vec<u8>, String
             String::from_utf8_lossy(&create.stderr).lines().last().unwrap_or("")));
     }
     let cid = String::from_utf8_lossy(&create.stdout).trim().to_string();
-    let tmp = std::env::temp_dir().join(format!("noo-agent-extract-{}", std::process::id()));
+    // i689: the extracted binary goes into the bundle; a fresh 0700 dir,
+    // not `<tmp>/noo-agent-extract-<pid>`.
+    let tmp_dir = crate::private_tmp::Dir::new("noo-agent-extract")?;
+    let tmp = tmp_dir.path().join("noo-node-agent");
     // `.output()`, not `.status()`: docker cp chats ("Successfully copied
     // 9.58MB …") on stdout, and subprocess output is ours to frame (§5).
     let cp_ok = Command::new("docker")
@@ -5041,6 +5069,40 @@ pub(crate) const HARNESS_TLS_KEY: &str = "/run/credentials/noo-harness.service/n
 
 #[cfg(test)]
 mod tests {
+    /// i689(b): the agent comes from the signed lock's node-agent DIGEST.
+    #[test]
+    fn the_agent_image_is_taken_by_the_signed_lock_digest() {
+        let d = format!("sha256:{}", "ab".repeat(32));
+        let lock = format!("# stack v0.6.24\ngateway@sha256:{}\nnode-agent@{d}\n", "cd".repeat(32));
+        let got = super::agent_image_ref_with("ghcr.io/noomesh/", "v0.6.24", "dist", &mut || Ok(Some(lock.clone()))).unwrap();
+        assert_eq!(got, format!("ghcr.io/noomesh/node-agent@{d}"), "not by the signed digest");
+        // A lock that pins no node-agent: refused, never a fall back to the tag.
+        let e = super::agent_image_ref_with("p", "v0.6.24", "", &mut || Ok(Some(format!("gateway@{d}\n")))).expect_err("an unpinned agent was taken by tag");
+        assert!(e.contains("pins no node-agent"), "{e}");
+        // No lock: a dist install refuses; a dev install keeps the tag.
+        let e = super::agent_image_ref_with("p", "v9.9.9", "dist", &mut || Ok(None)).expect_err("dist took an agent with no lock");
+        assert!(e.contains("Nothing was changed"), "{e}");
+        assert_eq!(super::agent_image_ref_with("p", "dev-1", "", &mut || Ok(None)).unwrap(), "p/node-agent:dev-1");
+        // A lock that does not verify is the error itself.
+        let e = super::agent_image_ref_with("p", "v0.6.24", "", &mut || Err("signature does not verify".into())).expect_err("a bad lock was ignored");
+        assert!(e.contains("does not verify"), "{e}");
+    }
+
+    /// obtain_agent_binary asks agent_image_ref (no `node-agent:{tag}` of its
+    /// own), propagates its error before any source fallback, and the
+    /// arch-restore pull is skipped for a digest ref.
+    #[test]
+    fn the_agent_binary_is_never_taken_by_tag_past_the_lock() {
+        let own = crate::test_src::own_code(include_str!("provision.rs"));
+        let body = crate::test_src::fn_body(&own, "fn obtain_agent_binary(");
+        assert!(body.contains("let image = agent_image_ref(g, root, &prefix, &tag)?;"), "the image is not the lock's");
+        assert!(!body.contains("node-agent:{tag}"), "obtain_agent_binary builds a by-tag ref");
+        let fallback = body.find("build-cross.sh").expect("the source fallback moved: this guard is stale");
+        assert!(body.find("agent_image_ref(").unwrap() < fallback);
+        let ex = crate::test_src::fn_body(&own, "fn extract_from_image(");
+        assert!(ex.contains("!image.contains('@')"), "a digest pull would 'restore' a tag it never moved");
+    }
+
     /// i688: a fresh scratch dir per test (name + pid + counter).
     fn asset_cache_dir(tag: &str) -> std::path::PathBuf {
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -5201,6 +5263,14 @@ mod tests {
             assert!(!fill.contains(bad), "upload_cli_assets fills the cache past the gate: {bad}");
         }
         assert!(fill.contains("cached_release_asset(g, &root, name)"));
+        // onboard installs the controller's own noo-hostd as ROOT from the
+        // same cache: through the gate, never a by-name read (i689a).
+        let steps = own_code(include_str!("../onboard/steps.rs"));
+        let hostd = fn_body(&steps, "fn obtain_hostd_binary(");
+        assert!(hostd.contains("cached_release_asset(ctx.g, &ctx.repo_root, &asset)"), "onboard's hostd skips the gate");
+        for bad in ["cli_asset_cache_dir(", "fetch_release_file(", "std::fs::read(&cached)"] {
+            assert!(!hostd.contains(bad), "onboard's hostd reads the cache past the gate: {bad}");
+        }
         assert!(fill.contains("cached_release_asset(g, &root, &asset)"));
         assert!(fill.contains("verified_release_manifest(g, &root)"));
     }

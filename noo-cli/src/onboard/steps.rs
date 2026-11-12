@@ -5887,9 +5887,9 @@ pub(crate) fn ensure_embed_model_core(model: &str) -> Vec<String> {
         // repo — so every fresh box came up with no embedder (2026-09-07).
         let artifact = harrier_artifact_ref();
         out_lines.push(format!(".Fetching the harrier embedder artifact into {embed} ({artifact})..."));
-        let tmp = std::env::temp_dir().join(format!("noo-harrier-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let _ = std::fs::create_dir_all(&tmp);
+        // i689: a fresh 0700 dir; the weights checked here are what is served.
+        let tmp_dir = crate::private_tmp::Dir::new("noo-harrier");
+        let tmp = tmp_dir.as_ref().map(|d| d.path().to_path_buf()).unwrap_or_else(|_| std::path::PathBuf::from("/nonexistent/noo-harrier"));
         let src = format!("noo-harrier-src-{}", std::process::id());
         let fetched = Command::new("bash").arg("-c")
             .arg(format!(
@@ -6143,23 +6143,18 @@ fn obtain_hostd_binary(ctx: &mut Ctx) -> Result<std::path::PathBuf, String> {
     }
     let asset = crate::commands::provision::hostd_asset_for(std::env::consts::OS, std::env::consts::ARCH)
         .ok_or_else(|| format!("no noo-hostd build for {}/{}", std::env::consts::OS, std::env::consts::ARCH))?;
-    let cached = crate::commands::provision::cli_asset_cache_dir(&ctx.repo_root).join(&asset);
-    let bytes = match std::fs::read(&cached).ok().filter(|b| !b.is_empty()) {
-        Some(b) => b,
-        None => {
-            ctx.progress(&format!("Fetching {asset} from release noo-cli-v{}...", env!("CARGO_PKG_VERSION")));
-            let b = crate::commands::upgrade::fetch_release_file(ctx.g, env!("CARGO_PKG_VERSION"), &asset, None)?;
-            if let Some(dir) = cached.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let _ = std::fs::write(&cached, &b);
-            b
-        }
-    };
+    // i688: through the verified gate, like every bundle asset — a cached
+    // copy only if its sha256 is in the signed manifest of this version,
+    // else fetched and checked. This binary is installed as ROOT below.
+    ctx.progress(&format!("Obtaining {asset} for noo-cli-v{} (verified against the signed manifest)...", env!("CARGO_PKG_VERSION")));
+    let bytes = crate::commands::provision::cached_release_asset(ctx.g, &ctx.repo_root, &asset)?;
     if !looks_like_elf(&bytes) {
         return Err(format!("{asset} is not an ELF executable — refusing to install it"));
     }
-    let staged = std::env::temp_dir().join(format!("noo-hostd-{}", std::process::id()));
+    // i689: `sudo install` copies this to /usr/local/bin as root; a fresh
+    // 0700 dir, so nobody can swap it between the write and the install.
+    let staged_dir = crate::private_tmp::Dir::new("noo-hostd")?;
+    let staged = staged_dir.path().join("noo-hostd");
     std::fs::write(&staged, &bytes).map_err(|e| format!("could not stage the binary: {e}"))?;
     let ok = ctx_sudo(ctx)
         .args(["install", "-m", "755", "-o", "root", "-g", "root"])
@@ -6983,15 +6978,101 @@ fn verify_first_model(ctx: &mut Ctx) {
         }
     }
     ctx.success(&format!("Chat answers with {model}"));
-    // The default (no model named) is what `noo chat` sends. The gateway
-    // reads noomesh.yaml when it starts, so a gateway that was already up
-    // keeps the old default until its next restart: say so, do not fail.
-    if let Err(e) = chat_probe(ctx, None) {
-        ctx.warn(&format!(
-            "Chat with {model} named works, but the gateway's current default does not ({e}). \
-             It reads the default at start: noo stack restart gateway"
-        ));
+    // i677 #12: the first `noo chat` names no model. On a single box nothing
+    // routed an unpinned request to this ollama: no placement meant no lane,
+    // no `chat-default` class, and unpinned chat fell to a static default
+    // the gateway read at boot (404) or an empty discovery offer (400). A
+    // real placement, the one an operator's `noo cluster place` makes, gives
+    // it a lane.
+    place_pulled_model(ctx, &model);
+    match unpinned_probe_until_routed(ctx) {
+        Ok(()) => ctx.success("Chat with no model named (what `noo chat` sends) answers"),
+        Err(e) => {
+            let line = format!(
+                "model: {model} answers when named, but chat with no model named does not ({e}). \
+                 Check: noo cluster verify --controller; noo chat --message hi"
+            );
+            ctx.error(&line);
+            ctx.state.hard_failures.push(line);
+        }
     }
+}
+
+/// The ollama chat placement already declared on this node, if any (its
+/// model). An empty role means chat. Pure.
+pub(crate) fn existing_ollama_chat_placement(placements: &serde_json::Value) -> Option<String> {
+    placements.as_array()?.iter().find_map(|p| {
+        let role = p["role"].as_str().filter(|r| !r.is_empty()).unwrap_or("chat");
+        (p["backend"].as_str() == Some("ollama") && role == "chat")
+            .then(|| p["model"].as_str().unwrap_or("?").to_string())
+    })
+}
+
+/// The exact arguments of the operator's own `noo cluster place` (no second
+/// writer of placements). Pure.
+pub(crate) fn place_args(node: &str, model: &str) -> Vec<String> {
+    ["cluster", "place", node, "ollama", model].iter().map(|s| s.to_string()).collect()
+}
+
+/// Declare the self node's ollama chat placement for the model this run
+/// pulled, through `noo cluster place`, unless one already exists (a
+/// re-onboard never overrides the operator's choice).
+fn place_pulled_model(ctx: &mut Ctx, model: &str) {
+    let node = ctx.read_env("NODE_ID");
+    if node.is_empty() || model.is_empty() {
+        return;
+    }
+    let desired = crate::http::get_json_try(
+        ctx.g,
+        &format!("/api/cluster/nodes/{}/desired-config", crate::commands::urlencode(&node)),
+        true,
+        10,
+    );
+    match desired {
+        Ok(d) => {
+            if let Some(m) = existing_ollama_chat_placement(&d["placements"]) {
+                ctx.info(&format!("Kept the existing ollama chat placement on {node} ({m})"));
+                return;
+            }
+        }
+        Err(e) => {
+            ctx.warn(&format!(
+                "Could not read {node}'s placements ({e}); not declaring one blind. \
+                 Declare it: noo cluster place {node} ollama {model}"
+            ));
+            return;
+        }
+    }
+    let exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "noo".into());
+    let args = place_args(&node, model);
+    ctx.progress(&format!("Placing {model} on {node}'s ollama (noo cluster place {node} ollama {model})..."));
+    match Command::new(&exe).args(&args).output() {
+        Ok(o) if o.status.success() => ctx.success(&format!("Placed: {node} ollama {model} (chat)")),
+        Ok(o) => ctx.warn(&format!(
+            "noo cluster place {node} ollama {model} exited {}: {} — run it again once the cause is fixed",
+            o.status.code().unwrap_or(1),
+            String::from_utf8_lossy(&o.stderr).lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim()
+        )),
+        Err(e) => ctx.warn(&format!("could not run noo cluster place ({e}): noo cluster place {node} ollama {model}")),
+    }
+}
+
+/// Unpinned chat, retried while a fresh placement becomes a lane: the
+/// agent's reconcile tick plus the gateway's 30 s placement cache. Bounded:
+/// 9 tries, 10 s apart.
+fn unpinned_probe_until_routed(ctx: &Ctx) -> Result<(), String> {
+    let mut last = String::new();
+    for attempt in 0..9 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+        }
+        match chat_probe(ctx, None) {
+            Ok(()) => return Ok(()),
+            Err(e) if probe_error_is_unverifiable(&e) => return Err(e),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
 }
 
 #[cfg(test)]
@@ -9890,5 +9971,43 @@ mod legacy_reonboard_tests {
         let expected = vec![("noomesh_noo-data".to_string(), "/srv/noo/noo-data".to_string())];
         let d = reaper_decisions(&expected, &["noomesh_noo-data".to_string()], &|_| None);
         assert_eq!(d[0].3, VolumeMismatch::NotChecked);
+    }
+}
+
+#[cfg(test)]
+mod first_chat_placement_tests {
+    use super::*;
+
+    #[test]
+    fn an_existing_ollama_chat_placement_is_kept() {
+        let none = serde_json::json!([{"backend": "ollama", "model": "harrier", "role": "embed"}, {"backend": "vllm", "model": "q"}]);
+        assert_eq!(existing_ollama_chat_placement(&none), None, "an embed placement is not a chat one");
+        let chat = serde_json::json!([{"backend": "ollama", "model": "llama3.2:3b"}]);
+        assert_eq!(existing_ollama_chat_placement(&chat).as_deref(), Some("llama3.2:3b"), "no role means chat");
+        let explicit = serde_json::json!([{"backend": "ollama", "model": "m", "role": "chat"}]);
+        assert_eq!(existing_ollama_chat_placement(&explicit).as_deref(), Some("m"));
+        assert_eq!(existing_ollama_chat_placement(&serde_json::json!(null)), None);
+    }
+
+    #[test]
+    fn the_placement_is_the_operators_own_command() {
+        assert_eq!(place_args("box", "gemma4:e2b"), ["cluster", "place", "box", "ollama", "gemma4:e2b"]);
+    }
+
+    /// The model step places before it judges unpinned chat, and a chat
+    /// with no model that never answers is a failure, not a warning.
+    #[test]
+    fn the_model_step_places_then_judges_unpinned_chat() {
+        let code = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&code, "fn verify_first_model(");
+        let place = body.find("place_pulled_model(ctx, &model);").expect("places");
+        let probe = body.find("match unpinned_probe_until_routed(ctx) \u{7b}").expect("probes unpinned");
+        assert!(place < probe, "{body}");
+        assert!(body.contains("ctx.state.hard_failures.push(line);"), "{body}");
+        assert!(!body.contains("noo stack restart gateway"), "no restart advice: the placement is the fix: {body}");
+        let placer = crate::test_src::fn_body(&code, "fn place_pulled_model(");
+        let keep = placer.find("existing_ollama_chat_placement(&d[\"placements\"])").expect("checks first");
+        let run = placer.find("Command::new(&exe).args(&args)").expect("then the command");
+        assert!(keep < run, "{placer}");
     }
 }

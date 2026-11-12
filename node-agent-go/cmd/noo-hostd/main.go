@@ -26,6 +26,7 @@
 //	sudo noo-hostd at-rest create-volume --data-root <dir> --size <GiB> --user <op> …
 //	sudo noo-hostd at-rest seal-age-key --user <op> --key <path> [--pcrs 7|none|auto]
 //	noo-hostd at-rest unseal-status [--json]
+//	noo-hostd egress-filter plan [--observe DURATION] [--json]
 package main
 
 import (
@@ -39,6 +40,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/noomesh/noomesh/node-agent-go/internal/egressfilter"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hostd"
 	"github.com/noomesh/noomesh/node-agent-go/internal/version"
 )
@@ -74,6 +76,9 @@ func main() {
 		} else {
 			err = hostd.RunAtRest(args, os.Stdout, os.Stderr)
 		}
+	case "egress-filter":
+		// READ-ONLY plan of the host egress filter; installs nothing.
+		err = egressfilter.Main(args, os.Stdout, os.Stderr)
 	case "version", "--version", "-v":
 		fmt.Println("noo-hostd", version.String())
 	case "help", "--help", "-h":
@@ -116,6 +121,7 @@ func usage() {
         Seal the SOPS age key to this machine's TPM and unseal it into RAM at
         boot (Linux controllers; see 'noo-hostd at-rest help').
 
+`+egressfilter.Usage+`
 `)
 }
 

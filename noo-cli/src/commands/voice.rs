@@ -409,7 +409,10 @@ pub fn voice_speak(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 
     let (audio, ext, _tts_backend) = synthesize_bytes(g, &text, &backend, &voice, speed);
 
-    let tmp = std::env::temp_dir().join(format!("noo-speak-{}.{ext}", std::process::id()));
+    // i689: a fresh 0700 dir, not a predictable `<tmp>/noo-speak-<pid>`.
+    let tmp_dir = crate::private_tmp::Dir::new("noo-speak")
+        .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "write_failed", &e, None));
+    let tmp = tmp_dir.path().join(format!("speech.{ext}"));
     if let Err(e) = std::fs::write(&tmp, &audio) {
         fail(
             g.json,

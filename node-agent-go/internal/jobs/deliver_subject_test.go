@@ -62,13 +62,14 @@ func TestNodesDoNotShareADeliverSubject(t *testing.T) {
 	}
 }
 
-// Every js.Subscribe in the executor must pass a deliver subject.
+// Every durable this executor binds carries this node's deliver subject.
 //
-// The opts list cannot be introspected — nats.SubOpt's only method and the
-// subOpts struct it configures are both unexported — so this reads the source,
-// the same technique node_event_subjects_test.go uses and for the same reason.
-// The regression it guards is someone dropping the argument, which compiles
-// fine the moment natsSubOpts grows a default.
+// Since i677 (finding b) the executor never lets nats.go create a consumer
+// inside js.Subscribe (the library would then delete it on the next rebind):
+// bindDurable creates it with DeliverSubject set, refuses an existing one that
+// delivers elsewhere, and only then subscribes BOUND. This reads the source,
+// as node_event_subjects_test.go does: the regression it guards is someone
+// dropping the deliver subject, or going back to a library-created consumer.
 func TestEverySubscribePassesADeliverSubject(t *testing.T) {
 	src, err := os.ReadFile("executor.go")
 	if err != nil {
@@ -76,21 +77,25 @@ func TestEverySubscribePassesADeliverSubject(t *testing.T) {
 	}
 	text := string(src)
 
-	calls := strings.Count(text, "js.Subscribe(")
-	if calls == 0 {
-		t.Fatal("no js.Subscribe calls found — this guard is checking nothing")
+	binds := strings.Count(text, "bindDurable(js, ")
+	if binds != 2 {
+		t.Fatalf("%d bindDurable call(s), want 2 (dispatch and cancel) — this guard is checking the wrong thing", binds)
 	}
-	withSubject := strings.Count(text, "natsSubOpts(durable, deliverSubject(") +
-		strings.Count(text, "natsSubOpts(cancelDurable, deliverSubject(")
-	if withSubject != calls {
-		t.Errorf("%d js.Subscribe call(s) but %d pass natsSubOpts(..., deliverSubject(...)) — "+
-			"a subscribe without an explicit deliver subject inherits whatever the "+
-			"existing consumer recorded, which is wrong", calls, withSubject)
+	withSubject := strings.Count(text, "durable, deliverSubject(e.nodeID, \"dispatch\")") +
+		strings.Count(text, "cancelDurable, deliverSubject(e.nodeID, \"cancel\")")
+	if withSubject != binds {
+		t.Errorf("%d bindDurable call(s) but %d pass deliverSubject(...)", binds, withSubject)
 	}
-
-	// And the option itself must still be handed to nats.go.
-	if !strings.Contains(text, "nats.DeliverSubject(deliver)") {
-		t.Error("natsSubOpts no longer passes nats.DeliverSubject — the subject is " +
-			"computed and then thrown away")
+	if got := strings.Count(text, "js.Subscribe("); got != 1 {
+		t.Errorf("%d js.Subscribe call(s): the only one must be bindDurable's, bound to a consumer it verified", got)
+	}
+	for _, must := range []string{
+		"DeliverSubject: deliver,",
+		"info.Config.DeliverSubject != deliver",
+		"nats.Bind(stream, durable)",
+	} {
+		if !strings.Contains(text, must) {
+			t.Errorf("bindDurable no longer has %q", must)
+		}
 	}
 }
