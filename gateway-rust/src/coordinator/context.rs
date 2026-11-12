@@ -1464,7 +1464,10 @@ mod system_prompt_budget_tests {
             eprintln!("SKIPPED (no prompts/): mount the repo to run the budget test");
             return;
         };
-        for objective in ["Reply with the single word ok and finish.", "Write me a short poem about autumn.", "What is on my calendar tomorrow?"] {
+        // The 0.6.24-rc.1 rehearsal's task one: "never stop" drew cluster-operator
+        // (5,548 estimated tokens) while its triggers held bare verbs.
+        for objective in ["Reply with the single word ok and finish.", "Write me a short poem about autumn.", "What is on my calendar tomorrow?",
+                          "Count upward from 1, one number per loop, and note each number. Never stop and never call noo_task_done."] {
             let sys = system_prompt_for(&root, objective);
             assert!(!sys.contains("## Cluster Nodes (live)"), "{objective:?}: cluster guidance without ops intent");
             assert!(est_tokens(&sys) <= NON_OPS_SYSTEM_BUDGET, "{objective:?}: {} estimated tokens > {NON_OPS_SYSTEM_BUDGET}", est_tokens(&sys));
