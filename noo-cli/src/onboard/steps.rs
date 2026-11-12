@@ -2763,7 +2763,7 @@ pub(crate) const SVC_LIST: &[&str] = &[
     // (docker/stunnel-ollama-embed.conf). Its own leaf, not `ollama`'s:
     // `noo upgrade --stack` issues a MISSING leaf on its own
     // (upgrade.rs reconcile_service_certs) while a SAN added to an
-    // existing one needs `noo onboard --only security` — a new name is
+    // existing one needs `noo onboard --only enrollment` — a new name is
     // the roll-safe shape. Issued on every install shape; a leaf is cheap.
     "ollama-embed",
     // The optional CPU embedder's door (compose profile `embed-cpu`): its
@@ -3154,7 +3154,7 @@ fn ensure_pki(ctx: &mut Ctx) {
                 Ok(true) => ctx.success(&format!("Postgres client certificate for role {} ({}) generated", leaf.role, leaf.owner)),
                 Ok(false) => ctx.info(&format!("Postgres client certificate for role {} ({}) already exists", leaf.role, leaf.owner)),
                 Err(e) => ctx.warn(&format!(
-                    "Postgres client certificate for role {} ({}): {e} — then: noo security pki fix-modes, and re-run: noo onboard --only security",
+                    "Postgres client certificate for role {} ({}): {e} — then: noo security pki fix-modes, and re-run: noo onboard --only enrollment",
                     leaf.role, leaf.owner
                 )),
             }

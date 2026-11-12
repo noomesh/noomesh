@@ -2139,7 +2139,7 @@ fn self_prep_line(node: &str, prep: &Path, data_root: &str, work: &Path) -> Resu
         .and_then(|pem| crate::commands::node_fetch::cert_der_sha256(&pem))
         .map_err(|e| format!(
             "cannot fingerprint {} ({e}) — host prep would fetch the cluster CA unpinned; \
-             run `noo onboard --only security` first", pki.join("ca.crt").display()))?;
+             run `noo onboard --only enrollment` first", pki.join("ca.crt").display()))?;
     let mut c = Command::new("env");
     c.arg(format!("PREP_ENROLL_USER={user}"))
         .arg(format!("PREP_NOO_URL=https://{ctrl_host}:8080"))
@@ -3164,7 +3164,7 @@ fn provision_local_in(g: &Globals, node: &str, tier: Option<&str>, root: &Path, 
         // exits on failure): an error here returns to onboard.
         let ca = crate::pki::ClusterCa::new(pki.clone());
         if !ca.ca_exists() {
-            return Err("no cluster CA found — run `noo onboard --only security` first".into());
+            return Err("no cluster CA found — run `noo onboard --only enrollment` first".into());
         }
         ca.issue_node_cert(node, &crate::onboard::util::detect_ip(), crate::pki::DEFAULT_DAYS,
                 &["node-agent".to_string()], &ts_ip, &role)

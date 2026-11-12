@@ -4348,7 +4348,7 @@ pub(crate) fn postgres_hba_check(hba: Option<&str>, compose: Option<&str>) -> Ch
 /// leaves were judged, the file was NOT CHECKED.
 pub(crate) fn postgres_role_identity_check(ca: &crate::pki::ClusterCa, hba: Option<&str>) -> Check {
     if !ca.ca_exists() {
-        return warn("postgres role identity", format!("no cluster CA at {}: nothing to check", ca.dir.display()), Some("noo onboard --only security".into()));
+        return warn("postgres role identity", format!("no cluster CA at {}: nothing to check", ca.dir.display()), Some("noo onboard --only enrollment".into()));
     }
     let gaps = crate::pki::pg_identity_gaps(ca, hba);
     if !gaps.is_empty() {
@@ -4361,7 +4361,7 @@ pub(crate) fn postgres_role_identity_check(ca: &crate::pki::ClusterCa, hba: Opti
                 gaps.join("; ")
             ),
             if missing_file {
-                "noo upgrade --stack   # issues the role leaves before it recreates anything (or: noo onboard --only security)"
+                "noo upgrade --stack   # issues the role leaves before it recreates anything (or: noo onboard --only enrollment)"
             } else {
                 "noo upgrade --stack   # re-materialises docker/postgres/pg_hba.conf; then: noo stack restart --force postgres"
             },

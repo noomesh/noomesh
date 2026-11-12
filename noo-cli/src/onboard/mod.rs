@@ -159,10 +159,11 @@ pub(crate) struct Skip {
     /// (upfront.rs), for an owner who knows their box needs less or more.
     /// None = the stated default ([`upfront::need_gb`]).
     pub min_free_gb: Option<u64>,
-    /// `--only a,b,c` (finding #40): run ONLY the named sections on a
-    /// reconfigure — everything else is a no-touch skip. Section names:
-    /// prereqs, env, secrets, tailscale, enrollment, storage, services,
-    /// model, channels. Empty = the full sequence, as ever.
+    /// `--only a,b,c` (finding #40): run ONLY the named sections, also on a
+    /// configured host (a targeted re-run: [`rerun_guard_applies`]) —
+    /// everything else is a no-touch skip. Section names: prereqs, env,
+    /// secrets, tailscale, enrollment, storage, services, model, channels,
+    /// addons. Empty = the full sequence, as ever.
     pub only: Vec<String>,
 }
 
@@ -972,6 +973,29 @@ fn abort_failed(ctx: &mut Ctx, step: &'static str, reason: &str) {
     ctx.state.aborted = Some(Abort::Failed { step, reason: reason.to_string() });
 }
 
+/// The sections an explicit `--only` re-runs on a configured host WITHOUT
+/// `--reconfigure`: none of them overwrites a setting the operator made with
+/// no confirmation. `model` writes the default model, which is what it is
+/// asked to do, and keeps an existing chat placement; `prereqs` only probes
+/// (installs need a TTY); `channels` is skipped under --ci and asks on a TTY.
+/// The rest re-apply things an operator may have changed (env: CLUSTER_MODE,
+/// NODE_TIER, LOKI/OLLAMA URLs; services: the hardened posture over gates
+/// opened by hand; tailscale: NODE_IP, gateway_url; addons: a licensed add-on
+/// turned off; secrets, enrollment, storage: credentials, certificates, the
+/// data root), so they keep the guard and its `--reconfigure`.
+pub(crate) const RERUN_SAFE: [&str; 3] = ["prereqs", "model", "channels"];
+
+/// Whether the idempotent-install guard answers this run ("already
+/// onboarded" on a configured host). Not for a fresh host, not with
+/// `--reconfigure`, and not for an explicit `--only` of RERUN_SAFE sections:
+/// `noo onboard --only model` is the remedy verify, onboard's own closing
+/// line and the README hand a single-box stranger, and on exactly that box it
+/// used to do nothing and exit 0 (rc.2 install matrix, 22.04 cell).
+pub(crate) fn rerun_guard_applies(reconfigure: bool, only: &[String], configured: bool) -> bool {
+    let targeted_safe = !only.is_empty() && only.iter().all(|s| RERUN_SAFE.contains(&s.as_str()));
+    !reconfigure && configured && !targeted_safe
+}
+
 /// The full onboard flow behind any frontend: idempotent-install guard,
 /// dry-run banner, all steps, final summary. Output/prompts route through
 /// `ctx.ui` / `ctx.asker`. Returns the process exit code.
@@ -979,10 +1003,24 @@ pub(crate) fn drive(ctx: &mut Ctx, reconfigure: bool) -> i32 {
     // ── Idempotent-install guard ─────────────────────────────────────────
     // A bare re-run on a configured host must NOT blindly rewrite .env or
     // bounce services. Detect the existing install and default to "no".
-    if !reconfigure && is_configured(ctx) {
+    // An explicit `--only <sections>` is a targeted re-run, not a bare one
+    // (rerun_guard_applies).
+    if rerun_guard_applies(reconfigure, &ctx.skip.only, is_configured(ctx)) {
         ctx.raw("This machine appears to be already onboarded:");
         for line in detected_summary(ctx) {
             ctx.raw(&format!("  {line}"));
+        }
+        if ctx.non_interactive && !ctx.skip.only.is_empty() {
+            // An explicit `--only` of a section that re-applies settings is
+            // never "nothing to do" (that exit 0 was a silent success): say
+            // what it needs.
+            ctx.raw("");
+            ctx.error(&format!(
+                "--only {} on a configured host re-applies settings it may overwrite; nothing was run",
+                ctx.skip.only.join(",")));
+            ctx.raw(&format!("  To run it: noo onboard --reconfigure --only {}", ctx.skip.only.join(",")));
+            ctx.raw(&format!("  (re-run without --reconfigure: {})", RERUN_SAFE.join(", ")));
+            return 1;
         }
         if ctx.non_interactive {
             // "Configured" reads .env + secrets only; the stack can still be
@@ -1969,5 +2007,52 @@ mod at_rest_tests {
         let c = crate::commands::at_rest::ONBOARD_PROMPT;
         assert!(c.starts_with("Encrypt your data, keys and secrets on disk, unlocked only on this machine?"));
         assert!(c.ends_with("(recommended)"));
+    }
+}
+
+#[cfg(test)]
+mod rerun_guard_tests {
+    use super::{rerun_guard_applies, RERUN_SAFE};
+
+    fn only(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// `--only model` on a configured, running host runs the model step: it
+    /// is never answered "nothing to do" (--ci) or "Reconfigure?" (TTY).
+    #[test]
+    fn an_explicit_only_model_is_a_targeted_rerun() {
+        assert!(!rerun_guard_applies(false, &only(&["model"]), true), "--only model on a configured host must run");
+        assert!(!rerun_guard_applies(false, &only(&["prereqs", "channels"]), true));
+        assert!(RERUN_SAFE.contains(&"model"));
+    }
+
+    /// No section that overwrites operator settings unattended skips the
+    /// guard, alone or mixed with a safe one; bare and fresh as ever.
+    #[test]
+    fn sections_that_reapply_settings_keep_the_guard() {
+        for s in ["env", "secrets", "tailscale", "enrollment", "storage", "services", "addons"] {
+            assert!(!RERUN_SAFE.contains(&s), "{s}");
+            assert!(rerun_guard_applies(false, &only(&[s]), true), "{s}");
+            assert!(rerun_guard_applies(false, &only(&["model", s]), true), "model,{s}");
+            assert!(!rerun_guard_applies(true, &only(&[s]), true), "--reconfigure --only {s} runs as ever");
+        }
+        assert!(rerun_guard_applies(false, &[], true), "a bare re-run on a configured host is still guarded");
+        assert!(!rerun_guard_applies(true, &[], true));
+        assert!(!rerun_guard_applies(false, &[], false), "a fresh host walks everything");
+    }
+
+    /// drive asks the tested guard, and under --ci an explicit `--only` the
+    /// guard answers is a refusal (exit 1) that names --reconfigure, never
+    /// "nothing to do".
+    #[test]
+    fn drive_asks_the_tested_guard_and_never_says_nothing_to_do_to_an_only() {
+        let own = crate::test_src::own_code(include_str!("mod.rs"));
+        let body = crate::test_src::fn_body(&own, "pub(crate) fn drive(");
+        assert!(body.contains("if rerun_guard_applies(reconfigure, &ctx.skip.only, is_configured(ctx)) {"), "{body}");
+        let refuse = body.find("if ctx.non_interactive && !ctx.skip.only.is_empty() {").expect("the --only refusal");
+        let nothing = body.find("nothing to do.").expect("the bare re-run line");
+        assert!(refuse < nothing, "{body}");
+        assert!(body[refuse..nothing].contains("return 1;") && body[refuse..nothing].contains("noo onboard --reconfigure --only"), "{body}");
     }
 }
