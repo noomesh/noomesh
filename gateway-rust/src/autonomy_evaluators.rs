@@ -172,6 +172,29 @@ pub fn node_offline_text(kind: &str, node: &str) -> String {
 /// probing, nothing per-platform. A node that loses its GPU, its docker
 /// daemon, or its agent all surface the same way — declared work not being
 /// done.
+/// How many evaluations in a row a backend must be missing before drift
+/// alerts: one missed probe under load (a harness, 2026-11-12 04:32Z) is a
+/// blip, not drift.
+const DRIFT_CONFIRM_RUNS: u32 = 2;
+
+/// Count consecutive misses per (node, backend): a pair missing now gains
+/// one, a pair not missing now is forgotten. Returns the pairs that have been
+/// missing for at least `runs` evaluations in a row.
+pub(crate) fn confirm_drift(seen: &mut HashMap<(String, String), u32>, missing_now: &[(String, String)], runs: u32) -> Vec<(String, String)> {
+    seen.retain(|k, _| missing_now.contains(k));
+    for k in missing_now {
+        *seen.entry(k.clone()).or_insert(0) += 1;
+    }
+    let mut out: Vec<(String, String)> = seen.iter().filter(|(_, n)| **n >= runs).map(|(k, _)| k.clone()).collect();
+    out.sort();
+    out
+}
+
+fn drift_seen() -> &'static std::sync::Mutex<HashMap<(String, String), u32>> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<HashMap<(String, String), u32>>> = std::sync::OnceLock::new();
+    SEEN.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
 pub async fn eval_node_placement_drift(state: &AppState) -> Result<bool, String> {
     // Desired: node → backends that should be running.
     let rows = crate::repo::cluster::placements_desired_running(&state.db)
@@ -194,7 +217,7 @@ pub async fn eval_node_placement_drift(state: &AppState) -> Result<bool, String>
         .map_err(|e| format!("mesh_nodes KV unavailable: {e}"))?;
 
     let now = now_unix_secs();
-    let mut drifted: Vec<(String, Vec<String>)> = Vec::new();
+    let mut missing_now: Vec<(String, String)> = Vec::new();
 
     for (node_id, want) in &desired {
         let Ok(Some(entry)) = kv.get(node_id).await else {
@@ -209,13 +232,31 @@ pub async fn eval_node_placement_drift(state: &AppState) -> Result<bool, String>
         // node's own heartbeat (routes/cluster.rs). Absent/empty means the
         // agent is up but managing nothing.
         let running = data.get("running_backends").and_then(|v| v.as_object());
-        let missing: Vec<String> = want
-            .iter()
-            .filter(|b| running.map(|m| !m.contains_key(b.as_str())).unwrap_or(true))
-            .cloned()
-            .collect();
-        if !missing.is_empty() {
-            drifted.push((node_id.clone(), missing));
+        for b in want {
+            if running.map(|m| m.contains_key(b.as_str())).unwrap_or(false) {
+                continue;
+            }
+            // Paused by the node on purpose (a GPU reservation, a foreign GPU
+            // workload): expected, not drift. A pause past its hold's expiry,
+            // or a backend not on the node's paused list, still counts.
+            if let Some(why) = crate::placement_stuck::paused_on_purpose(&data, b, now as u64) {
+                tracing::debug!(node = %node_id, backend = %b, why = %why, "autonomy.node_placement_drift.expected_pause");
+                continue;
+            }
+            missing_now.push((node_id.clone(), b.clone()));
+        }
+    }
+
+    // Alert only on a miss seen on consecutive evaluations.
+    let confirmed = {
+        let mut seen = drift_seen().lock().unwrap_or_else(|p| p.into_inner());
+        confirm_drift(&mut seen, &missing_now, DRIFT_CONFIRM_RUNS)
+    };
+    let mut drifted: Vec<(String, Vec<String>)> = Vec::new();
+    for (node, backend) in confirmed {
+        match drifted.iter_mut().find(|(n, _)| *n == node) {
+            Some((_, v)) => v.push(backend),
+            None => drifted.push((node, vec![backend])),
         }
     }
 
@@ -2988,6 +3029,34 @@ fn gpu_watchdog_faults(body: &serde_json::Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::confirm_drift;
+
+    /// One missed probe is a blip; the same miss on the next evaluation is
+    /// drift; a pair that recovers is forgotten and starts again from one.
+    #[test]
+    fn drift_alerts_only_on_a_miss_seen_twice_in_a_row() {
+        let mut seen = std::collections::HashMap::new();
+        let h = ("awolf".to_string(), "harness".to_string());
+        let v = ("awolf".to_string(), "vllm".to_string());
+        assert!(confirm_drift(&mut seen, &[h.clone()], 2).is_empty(), "first miss: a blip");
+        assert!(confirm_drift(&mut seen, &[], 2).is_empty(), "recovered: forgotten");
+        assert!(confirm_drift(&mut seen, &[h.clone()], 2).is_empty(), "missing again: starts from one");
+        assert_eq!(confirm_drift(&mut seen, &[h.clone(), v.clone()], 2), vec![h.clone()], "twice in a row: drift; vllm only once");
+        assert_eq!(confirm_drift(&mut seen, &[h.clone(), v.clone()], 2), vec![h, v]);
+    }
+
+    /// The evaluator asks paused_on_purpose before counting a miss, and
+    /// alerts from the confirmed list, never from this run's raw misses.
+    #[test]
+    fn drift_skips_an_expected_pause_and_alerts_from_confirmed_misses() {
+        let code = crate::test_src::own_code(include_str!("autonomy_evaluators.rs"));
+        let body = crate::test_src::fn_body(&code, "pub async fn eval_node_placement_drift(");
+        let pause = body.find("paused_on_purpose(&data, b, now as u64)").expect("consults the node's pause");
+        let push = body.find("missing_now.push(").expect("records a miss");
+        assert!(pause < push, "a deliberate pause is never recorded as a miss");
+        assert!(body.find("confirm_drift(&mut seen, &missing_now, DRIFT_CONFIRM_RUNS)").expect("confirms") < body.find("send_operator_alert_with").expect("alerts"));
+    }
+
 
     // ── companion_battery_low raises, deduped (audit 2026-10-08) ──────────
     fn node(tier: u64, pct: f64, charging: bool) -> serde_json::Value {
