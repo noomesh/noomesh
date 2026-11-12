@@ -3134,7 +3134,7 @@ pub const SCRAPE_TARGETS_PATH: &str = "/api/internal/prometheus/targets/node-age
 pub(crate) fn is_scrape_targets(method: &axum::http::Method, path: &str, service: Option<&crate::node_identity::VerifiedService>) -> bool {
     *method == axum::http::Method::GET
         && path == SCRAPE_TARGETS_PATH
-        && service.is_some_and(|s| s.0 == METRICS_SCRAPER_SERVICE)
+        && service.is_some_and(|s| !s.0.is_empty())
 }
 
 /// Alertmanager's critical-alert intake (i515b): `routes::alert_intake`.
