@@ -211,10 +211,6 @@ pub(crate) struct State {
     pub mcp_door: Option<bool>,
     pub user_dir_count: usize,
     pub interrupted: bool,
-    /// The closing `cluster verify` did not pass (or could not run): the
-    /// welcome is withheld and the last line says what still needs doing
-    /// (i677 #13: "You're all set" printed under "2 problems need you").
-    pub closing_verify_failed: bool,
     /// Why the wizard stopped before the last step, when it did. Set by the
     /// site that stops (`run_all` returns early); `Outcome::of` turns it
     /// into the verdict that BOTH the closing line and the exit code read.
@@ -1394,16 +1390,20 @@ fn print_final_summary(ctx: &Ctx) {
     // An install is not done until it verifies: the same
     // invariants `noo cluster verify --controller` asserts, printed here so
     // the last thing the operator reads is what still needs doing.
+    // The closing `cluster verify` did not pass (or could not run): the
+    // welcome is withheld and the last line says what still needs doing
+    // (i677 #13: "You're all set" printed under "2 problems need you").
+    let mut closing_verify_failed = false;
     if !ctx.dry_run {
         let args: Vec<String> = FINAL_VERIFY_ARGS.iter().map(|a| a.to_string()).collect();
         match crate::commands::cluster_verify(ctx.g, &args) {
             Ok(0) => ctx.success("cluster verify: every controller invariant holds"),
             Ok(_) => {
-                ctx.state.closing_verify_failed = true;
+                closing_verify_failed = true;
                 ctx.warn("cluster verify: an invariant does not hold — the remedy is beside each failing row above");
             }
             Err(_) => {
-                ctx.state.closing_verify_failed = true;
+                closing_verify_failed = true;
                 ctx.warn("cluster verify could not run — noo cluster verify --controller");
             }
         }
@@ -1505,10 +1505,10 @@ fn print_final_summary(ctx: &Ctx) {
     }
     // The LAST line is the verdict: the welcome only when nothing failed,
     // else what still needs doing (i677 #13).
-    if welcome_due(ctx.dry_run, ctx.state.interrupted, &Outcome::of(&ctx.state), ctx.state.closing_verify_failed) {
+    if welcome_due(ctx.dry_run, ctx.state.interrupted, &Outcome::of(&ctx.state), closing_verify_failed) {
         ctx.raw("");
         ctx.info("You're all set. Welcome to Noomesh!");
-    } else if !ctx.dry_run && !ctx.state.interrupted && ctx.state.closing_verify_failed {
+    } else if !ctx.dry_run && !ctx.state.interrupted && closing_verify_failed {
         ctx.raw("");
         ctx.warn(CLOSING_VERIFY_NOT_DONE);
     }
@@ -1697,17 +1697,17 @@ mod welcome_tests {
         assert!(!welcome_due(false, false, &Outcome::Completed, true));
         let code = crate::test_src::own_code(include_str!("mod.rs"));
         let tail = &code[code
-            .find("if welcome_due(ctx.dry_run, ctx.state.interrupted, &Outcome::of(&ctx.state), ctx.state.closing_verify_failed) {")
+            .find("if welcome_due(ctx.dry_run, ctx.state.interrupted, &Outcome::of(&ctx.state), closing_verify_failed) {")
             .expect("the verdict block")..];
         let welcome = tail.find("You're all set. Welcome to Noomesh!").expect("welcome");
         let not_done = tail.find("ctx.warn(CLOSING_VERIFY_NOT_DONE);").expect("the not-done line");
         assert!(welcome < not_done);
-        let set = code.matches("ctx.state.closing_verify_failed = true;").count();
+        let set = code.matches("closing_verify_failed = true;").count();
         assert_eq!(set, 2, "set on a failed verify and on one that could not run");
         // Both arms, by name: a verify that FAILED, and one that could not RUN.
         let verdict = &code[code.find("match crate::commands::cluster_verify(ctx.g, &args) {").expect("the closing verify")..];
-        let failed = verdict.find("Ok(_) => {\n                ctx.state.closing_verify_failed = true;").expect("a failed verify withholds it");
-        let unrun = verdict.find("Err(_) => {\n                ctx.state.closing_verify_failed = true;").expect("an unrun verify withholds it");
+        let failed = verdict.find("Ok(_) => {\n                closing_verify_failed = true;").expect("a failed verify withholds it");
+        let unrun = verdict.find("Err(_) => {\n                closing_verify_failed = true;").expect("an unrun verify withholds it");
         assert!(failed < unrun);
         assert!(super::CLOSING_VERIFY_NOT_DONE.contains("noo cluster verify --controller"));
     }
