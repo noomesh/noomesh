@@ -612,15 +612,17 @@ fn load_enrollment(g: &Globals, a: &ProvisionArgs, site: &ProvSite) -> ProvEnrol
     // with none of those facts, and a failed fetch reads as nothing at all:
     // both used to fall back in silence (0.6.20 roll). Wait a bounded time
     // for a live record (node_live), then build anyway and SAY why.
-    let live_node = live_record_or_say_why(g, &node);
-    let node_app_version = live_app_version(live_node.as_ref());
+    let live = live_record_or_say_why(g, &node);
+    // What the node runs, by the one reading the dependency map's waves use.
+    let node_app_version = live.facts().map(|f| f.app_version).unwrap_or_default();
+    let live_node = live.live().cloned();
     ProvEnrollment { record, live_node, node_app_version }
 }
 
-/// The node's live record, waiting up to `node_live::LIVE_WAIT_SECS` for
-/// one; `None` (after one line saying why and what the bundle loses) when
-/// there is none. A node that stays down is still provisioned.
-fn live_record_or_say_why(g: &Globals, node: &str) -> Option<serde_json::Value> {
+/// The node's live state, waiting up to `node_live::LIVE_WAIT_SECS` for a
+/// live record; not live (after one line saying why and what the bundle
+/// loses) when there is none. A node that stays down is still provisioned.
+fn live_record_or_say_why(g: &Globals, node: &str) -> super::node_live::LiveState {
     use super::node_live::{fallback_line, wait_live, LIVE_POLL_SECS, LIVE_WAIT_SECS};
     let tries = (LIVE_WAIT_SECS / LIVE_POLL_SECS).max(1) as u32 + 1;
     let mut said = false;
@@ -641,7 +643,7 @@ fn live_record_or_say_why(g: &Globals, node: &str) -> Option<serde_json::Value> 
             println!("{}", ui::sub(&ui::status_line(Glyph::Warn, &line)));
         }
     }
-    state.live().cloned()
+    state
 }
 
 /// Resolve the node's address, account and tier from its enrollment record, and record them on its registry row.

@@ -44,12 +44,33 @@ pub(crate) enum LiveState {
     Unreachable(String),
 }
 
+/// What a live record says the node RUNS, for a wave's "prerequisite met"
+/// check (harness's dependency map): the version its applier reports and
+/// that version parsed by the one parser (`node_leaves::cli_version_triple`:
+/// `noo-cli-v…`, `stack-v…` or `v…`). `applier` is None when the version is
+/// absent or unreadable; the caller decides what that means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LiveFacts {
+    pub app_version: String,
+    // Read by the dependency map's wave check (harness, i613), not yet on dev.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub applier: Option<(u32, u32, u32)>,
+}
+
 impl LiveState {
     pub(crate) fn live(&self) -> Option<&Value> {
         match self {
             LiveState::Live(v) => Some(v),
             _ => None,
         }
+    }
+
+    /// The node's [`LiveFacts`], when its record is live.
+    pub(crate) fn facts(&self) -> Option<LiveFacts> {
+        let rec = self.live()?;
+        let app_version = rec["app_version"].as_str().unwrap_or("").trim().to_string();
+        let applier = super::node_leaves::cli_version_triple(&app_version);
+        Some(LiveFacts { app_version, applier })
     }
 
     /// Why there is no live record, in the words the operator reads.
@@ -197,6 +218,21 @@ mod tests {
         let (s, asked) = wait_live(&mut || { n += 1; Some((200, nodes(json!([db_row_awolf()])))) }, "awolf", 4, &mut || {});
         assert_eq!((asked, n), (4, 4));
         assert!(matches!(s, LiveState::Offline { .. }));
+    }
+
+    #[test]
+    fn a_live_record_gives_the_applier_version_a_wave_checks() {
+        // Linux reports its stack tag, a Mac its CLI tag (the 0.6.21 parser).
+        let f = LiveState::Live(json!({"id": "aserve", "app_version": "stack-v0.6.21+07ce5047"})).facts().unwrap();
+        assert_eq!(f, LiveFacts { app_version: "stack-v0.6.21+07ce5047".into(), applier: Some((0, 6, 21)) });
+        let mac = LiveState::Live(json!({"id": "mcmini", "app_version": "noo-cli-v0.6.20"})).facts().unwrap();
+        assert_eq!(mac.applier, Some((0, 6, 20)));
+        // Live but no version: the facts say so, unparsed.
+        let none = LiveState::Live(json!({"id": "x"})).facts().unwrap();
+        assert_eq!(none, LiveFacts { app_version: String::new(), applier: None });
+        // No live record: no facts at all (never an empty "met").
+        assert_eq!(LiveState::Offline { since: None, detail: None }.facts(), None);
+        assert_eq!(LiveState::Absent.facts(), None);
     }
 
     #[test]
