@@ -87,7 +87,8 @@ class Node:
                    'case "$*" in *BindReadOnlyPaths*)\n'
                    '  printf "%s\\n" "$@" > "$CHECK_ARGS"\n'
                    '  if [ -s "$CHECK_OUT" ]; then cat "$CHECK_OUT"; exit 1; fi\n'
-                   '  while [ "$1" != _ ]; do shift; done; shift\n'
+                   '  while [ $# -gt 0 ]; do case "$1" in */check.sh) break ;; esac; shift; done\n'
+                   '  [ -f "$1" ] || { echo "no check script"; exit 3; }; shift\n'
                    '  while [ $# -ge 2 ]; do echo "ok $1 $2"; shift 2; done; exit 0 ;;\n'
                    'esac\n'
                    'cat "$PROBE_OUT"\nexit "$(cat "$PROBE_RC")"')
@@ -120,7 +121,7 @@ class Node:
             "PROBE_OUT": str(self.probe_out), "PROBE_RC": str(self.probe_rc), "CHECK_OUT": str(self.check_out), "CHECK_ARGS": str(self.check_args),
             "HE_NET_DIR": str(self.net), "HE_DROPIN_DIR": str(self.dropin_dir), "HE_UNIT": str(self.unit),
             "HE_ENV": str(self.env), "HE_NSSWITCH_SRC": str(self.nss),
-            "HE_OWNER_ARGS": "", "HE_STAT_OWNER": owner,
+            "HE_OWNER_ARGS": "", "HE_STAT_OWNER": owner, "HE_STAGE_PARENT": str(self.tmp),
         }
         return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
 
@@ -408,12 +409,12 @@ def test_the_precheck_gets_every_controller_host_and_port_with_defaults(node: No
     node.hosts_db.write_text("ctl.example.net 192.168.1.5\nnats.example.net 192.168.1.6\nn2.example.net 192.168.1.7\n")
     applied_of(node.run())
     argv = node.check_args.read_text().splitlines()
-    assert argv[argv.index("_") + 1:] == ["ctl.example.net", "443", "n2.example.net", "5222", "nats.example.net", "4222"]
+    assert argv[next(i for i, a in enumerate(argv) if a.endswith("/check.sh")) + 1:] == ["ctl.example.net", "443", "n2.example.net", "5222", "nats.example.net", "4222"]
     node.env.write_text("NODE_ID=h\nNOO_GATEWAY_URL=http://ctl.example.net\nNATS_URL=nats://nats.example.net:4222\n")
     node.hosts_db.write_text("ctl.example.net 192.168.1.9\nnats.example.net 192.168.1.6\n")
     applied_of(node.run())
     argv = node.check_args.read_text().splitlines()
-    assert argv[argv.index("_") + 1:] == ["ctl.example.net", "80", "nats.example.net", "4222"]
+    assert argv[next(i for i, a in enumerate(argv) if a.endswith("/check.sh")) + 1:] == ["ctl.example.net", "80", "nats.example.net", "4222"]
 
 
 def test_a_failing_precheck_installs_nothing_removes_the_old_hold_and_restarts(node: Node) -> None:
@@ -463,3 +464,17 @@ def test_an_unchanged_hold_skips_the_precheck(node: Node) -> None:
     node.check_out.write_text("FAIL ctl.example.net 8000 connect\n")   # would fail if it ran
     a = applied_of(node.run())
     assert len(precheck_calls(node)) == 1 and node.dropin.exists() and a.endswith("harness-egress=enforced"), a
+
+
+def test_the_precheck_runs_a_staged_file_never_a_bash_c_argument(tmp_path):
+    # systemd-run expands %-specifiers and (v254+) $VAR in its argv: the check
+    # must reach bash as a file in a stage the transient unit can see (/run,
+    # not /tmp: DynamicUser implies PrivateTmp), with no $ or % in the argv.
+    src = (REPO / "scripts/noo-apply.sh").read_text()
+    body = src[src.index("he_precheck() {"):]
+    body = body[:body.index("\n}\n")]
+    code = "\n".join(line for line in body.splitlines() if not line.lstrip().startswith("#"))
+    assert '/bin/bash "$_he_stage/check.sh"' in code and "bash -c" not in code
+    assert 'mktemp -d "${HE_STAGE_PARENT:-/run}/noo-he-stage.XXXXXX"' in src
+    assert "pre-check output:" in body, "a failed pre-check says what systemd-run said"
+

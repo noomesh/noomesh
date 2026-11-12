@@ -919,11 +919,22 @@ he_precheck() {
     set --
     while IFS= read -r _he_l; do set -- "$@" -p "$_he_l"; done < <(he_props "$_he_stage" "$_he_al")
     # shellcheck disable=SC2086
-    _he_o="$(timeout 30 systemd-run --wait --pipe --quiet --collect -p DynamicUser=yes "$@" /bin/bash -c "$HE_CHECK" _ $_he_tg 2>&1)" || true
+    # The check runs from a FILE in the stage, never as a `bash -c` argument:
+    # systemd-run expands %-specifiers in its command line, and since v254
+    # $VAR / ${VAR} too, which would rewrite the script before bash sees it.
+    # The stage is under /run (not /tmp): DynamicUser= implies PrivateTmp=, so
+    # the transient unit could not see a /tmp stage.
+    printf '%s\n' "$HE_CHECK" > "$_he_stage/check.sh"; chmod 0644 "$_he_stage/check.sh"
+    _he_o="$(timeout 30 systemd-run --wait --pipe --quiet --collect -p DynamicUser=yes "$@" /bin/bash "$_he_stage/check.sh" $_he_tg 2>&1)" || true
     _he_f="$(printf '%s\n' "$_he_o" | awk '$1 == "FAIL" {print $2 "-" $3; exit}')"
     if [ -n "$_he_f" ]; then echo "selfcheck-$_he_f"; return 1; fi
     # Every target must have said ok: silence or noise is "unavailable", never a pass.
-    [ "$(printf '%s\n' "$_he_o" | grep -c '^ok ')" = "$(printf '%s\n' "$_he_tg" | grep -c .)" ] || { echo "selfcheck-unavailable"; return 1; }
+    if [ "$(printf '%s\n' "$_he_o" | grep -c '^ok ')" != "$(printf '%s\n' "$_he_tg" | grep -c .)" ]; then
+        # Say what systemd-run said, so the cause is never hidden (its output is
+        # the targets and systemd's own errors; nothing secret).
+        echo "noo-apply: harness-egress: pre-check output: $(printf '%s' "$_he_o" | head -5 | tr -c '[:print:]\n' ' ' | tr '\n' '|' | cut -c1-400)" >&2
+        echo "selfcheck-unavailable"; return 1
+    fi
     return 0
 }
 
@@ -1029,7 +1040,8 @@ he_probe() {
 # ask for the harness restart through the existing need_harness_restart path.
 harness_egress_apply() {
     HE_CHANGED=0; HE_UNRESOLVED=""
-    _he_tmp="$(mktemp -d)"; HE_EXTRA="$_he_tmp/extra"; : > "$HE_EXTRA"
+    _he_tmp="$(mktemp -d "${HE_STAGE_PARENT:-/run}/noo-he-stage.XXXXXX")"; chmod 0755 "$_he_tmp"
+    HE_EXTRA="$_he_tmp/extra"; : > "$HE_EXTRA"
 
     printf '%s\n' "# Rendered by noo-apply: the harness resolves nothing on the internet (docs/security/telemetry.md)." \
         "nameserver $HE_RESOLVER_ADDR" "options timeout:1 attempts:1" > "$_he_tmp/resolv.conf"
@@ -1075,7 +1087,7 @@ harness_egress_apply() {
             _he_had=0
             { [ -e "$HE_DROPIN" ] || [ -e "$HE_NET_DIR" ]; } && _he_had=1
             harness_egress_remove
-            case "$_he_tmp" in /tmp/*|"${TMPDIR:-/tmp}"/*) rm -rf -- "${_he_tmp:?}" ;; esac
+            case "${_he_tmp:?}" in */noo-he-stage.??????) rm -rf -- "$_he_tmp" ;; esac
             echo "noo-apply: harness-egress: the hold was NOT applied ($_he_why: a controller name did not resolve or its port did not answer under the hold); the harness runs unrestricted and codex placements are refused" >&2
             if [ "$_he_had" = 1 ]; then need_harness_restart=1; applied="$applied harness-egress-files"; fi
             applied="$applied harness-egress=UNENFORCED:$_he_why"
@@ -1089,7 +1101,7 @@ harness_egress_apply() {
     he_write "$HE_NET_DIR/hosts" 644 "$_he_tmp/hosts"
     he_write "$HE_NET_DIR/nsswitch.conf" 644 "$_he_tmp/nsswitch.conf"
     he_write "$HE_DROPIN" 644 "$_he_tmp/dropin"
-    case "$_he_tmp" in /tmp/*|"${TMPDIR:-/tmp}"/*) rm -rf -- "${_he_tmp:?}" ;; esac
+    case "${_he_tmp:?}" in */noo-he-stage.??????) rm -rf -- "$_he_tmp" ;; esac
     if [ "$HE_CHANGED" = 1 ]; then
         systemctl daemon-reload 2>/dev/null || true
         need_harness_restart=1
