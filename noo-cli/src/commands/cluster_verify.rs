@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026 PersonifAI LLC
 
-//! `noo cluster verify [<node>...] [--controller] [--wait]` — assert the invariants a
+//! `noo cluster verify [<node>...] [--controller] [--wait] [--timings]` — assert the invariants a
 //! node, and the controller, must satisfy to operate under the current
 //! constraints.
 //!
@@ -34,6 +34,7 @@ use crate::ui::{self, Col, Glyph};
 use crate::{Globals, Unhandled};
 use serde_json::Value;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 mod image_family;
 mod tempo;
@@ -6719,16 +6720,18 @@ fn render(title: &str, checks: &[Check], verbose: bool) -> bool {
     failed.is_empty()
 }
 
-/// `noo cluster verify [<node>...] [--controller] [--wait]`
+/// `noo cluster verify [<node>...] [--controller] [--wait] [--timings]`
 pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut nodes: Vec<String> = Vec::new();
     let mut controller = false;
     let mut wait = false;
+    let mut timings = false;
     for a in args {
         match a.as_str() {
             "--controller" => controller = true,
             "--all" => {}
             "--wait" => wait = true,
+            "--timings" => timings = true,
             s if s.starts_with('-') => return Err(Unhandled),
             s => nodes.push(s.to_string()),
         }
@@ -6742,6 +6745,8 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut any_starting = false;
     let mut json_out = serde_json::Map::new();
     let mut tally = Tally::default();
+    let started = Instant::now();
+    let mut laps: Vec<(String, Duration)> = Vec::new();
 
     if want_nodes || nodes.is_empty() {
         // Best-effort read: this verb is also run from `onboard`'s last step
@@ -6789,9 +6794,15 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             tally.context = format!(" — {} node(s) on {tag}", selected.len());
         }
         let mut node_json = Vec::new();
-        for n in selected {
+        // Each node's gateway reads (desired config, door pins, the bus and
+        // tunnel probes) are independent of every other node's: run them
+        // side by side, then judge and print in the listed order.
+        let reads_from = Instant::now();
+        let enriched = par_map(&selected, |n| with_harness_wanted(g, n));
+        laps.push((format!("node reads ({} node(s), side by side)", selected.len()), reads_from.elapsed()));
+        for (n, wanted) in selected.iter().zip(&enriched) {
             let id = n["id"].as_str().unwrap_or("?");
-            let checks = node_checks(&with_harness_wanted(g, n), &tag, env!("CARGO_PKG_VERSION"), now, signing_adopted_for(id));
+            let checks = node_checks(wanted, &tag, env!("CARGO_PKG_VERSION"), now, signing_adopted_for(id));
             let node_ok = checks.iter().all(|c| c.verdict != Verdict::Fail && c.verdict != Verdict::Starting);
             any_starting |= checks.iter().any(|c| c.verdict == Verdict::Starting);
             all_ok &= node_ok;
@@ -6812,6 +6823,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // with no seat says so (the 0.6.6-rc.1 rehearsal read silence as
         // "seats not checked").
         if nodes.is_empty() {
+            let seats_from = Instant::now();
             let listed = crate::commands::kiosk_seat::list_seats(g);
             let seats = listed.clone().unwrap_or_default();
             // A seat's display is compared with the console the controller's
@@ -6841,6 +6853,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 }
             }
             json_out.insert("seats".into(), Value::Array(seat_json));
+            laps.push(("seats".into(), seats_from.elapsed()));
         }
     }
 
@@ -6848,31 +6861,55 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         if wait {
             warmup::wait_for_warmup(g);
         }
-        let (_, posture, _) = self_json(g, &["security", "posture", "list"]);
-        let (_, keys, _) = self_json(g, &["security", "service-key", "list"]);
+        let controller_from = Instant::now();
         let addon_on = |name: &str| {
             crate::commands::addons::effective(name)
                 .unwrap_or_else(|| crate::commands::addons::row(name).map(|r| r.default_on).unwrap_or(false))
         };
         let required = required_service_keys(&addon_on);
-        let (sc, secrets, _) = self_json(g, &["doctor", "secrets"]);
-        let (_, exposure, _) = self_json(g, &["doctor", "exposure"]);
-        let (_, strangers, _) = self_json(g, &["doctor", "strangers"]);
-        let (ac, audit, _) = self_json(g, &["security", "secrets", "audit"]);
+        let licensed_on = ["trellion_intel", "evolve"].iter().any(|a| addon_on(a));
+        // The verbs below are separate reads of separate state: run them
+        // side by side (each was a full process plus its own gateway round
+        // trips, one after another: about 5 s on a healthy controller).
+        let mut reads: Vec<&[&str]> = vec![
+            &["security", "posture", "list"],
+            &["security", "service-key", "list"],
+            &["doctor", "secrets"],
+            &["doctor", "exposure"],
+            &["doctor", "strangers"],
+            &["security", "secrets", "audit"],
+            &["security", "tailnet", "policy", "--merge"],
+            &["security", "audit", "verify"],
+        ];
+        if licensed_on {
+            reads.push(&["security", "entitlement", "show"]);
+        }
+        let mut got = par_map(&reads, |w| self_json(g, w)).into_iter();
+        let mut next = || got.next().unwrap_or((127, Value::Null, String::new()));
+        let (_, posture, _) = next();
+        let (_, keys, _) = next();
+        let (sc, secrets, _) = next();
+        let (_, exposure, _) = next();
+        let (_, strangers, _) = next();
+        let (ac, audit, _) = next();
+        let (_, tailnet, _) = next();
+        let (_, audit_verdict, _) = next();
+        let entitlement_read = if licensed_on { Some(next()) } else { None };
         let audit_errors = if audit.is_null() { None } else {
             Some(audit["findings"].as_array().map(|f| f.iter().filter(|x| x["severity"] == "error" || x["severity"] == "ERROR").count() as u64)
                 .unwrap_or(if ac == 0 { 0 } else { 1 }))
         };
-        let (_, tailnet, _) = self_json(g, &["security", "tailnet", "policy", "--merge"]);
         let tailnet_missing = tailnet_merge_missing(&tailnet);
-        let licensed_on = ["trellion_intel", "evolve"].iter().any(|a| addon_on(a));
-        let entitlement = if !licensed_on { None } else {
-            let (ec, ent, _) = self_json(g, &["security", "entitlement", "show"]);
+        let entitlement = entitlement_read.map(|(ec, ent, _)| {
             let env_copy = !crate::onboard::env::read_env_key(
                 &crate::envfile::repo_root().join(".env"), crate::entitlement::STORE_KEY).trim().is_empty();
-            Some(entitlement_verdict(ec, &ent, env_copy))
-        };
-        let mut checks = controller_checks(&posture, &keys, &required, (sc, &secrets), &exposure, &strangers, audit_errors, tailnet_missing, entitlement);
+            entitlement_verdict(ec, &ent, env_copy)
+        });
+        let mut checks = TimedChecks::new(
+            controller_checks(&posture, &keys, &required, (sc, &secrets), &exposure, &strangers, audit_errors, tailnet_missing, entitlement),
+            controller_from,
+            &format!("{} security and doctor reads, side by side", reads.len()),
+        );
         checks.push(system_credentials_check(crate::commands::systems::store_missing_credentials()));
         // Is there a recent backup, and is it anywhere but this machine? 2026-10-24:
         // the 03:30 run never happened and nothing said so; every dump sat on the
@@ -6990,14 +7027,11 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let spaces = get_json_opt(g, "/api/cluster/embedding-spaces", true, 15);
         checks.push(embedding_spaces_check(spaces.as_ref()));
         // Finding 126: a loaded model measured over its estimate or pool.
-        let fits: Vec<(String, Option<Value>)> = fleet
-            .iter()
-            .filter_map(|n| n["id"].as_str())
-            .map(|id| {
-                let path = format!("/api/cluster/nodes/{}/fit", super::urlencode(id));
-                (id.to_string(), crate::http::post_json_try(g, &path, &serde_json::json!({}), true, 10).ok())
-            })
-            .collect();
+        let fit_ids: Vec<&str> = fleet.iter().filter_map(|n| n["id"].as_str()).collect();
+        let fits: Vec<(String, Option<Value>)> = par_map(&fit_ids, |id| {
+            let path = format!("/api/cluster/nodes/{}/fit", super::urlencode(id));
+            (id.to_string(), crate::http::post_json_try(g, &path, &serde_json::json!({}), true, 10).ok())
+        });
         checks.push(model_memory_check(&fits));
         // 0.6.24: mail left unread when a conversation's mailbox retired.
         checks.push(agent_mail_check(get_json_opt(g, "/api/agents/directory?all=true", true, 15).as_ref()));
@@ -7225,7 +7259,6 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             }
             .as_deref(),
         ));
-        let (_, audit_verdict, _) = self_json(g, &["security", "audit", "verify"]);
         checks.push(audit_log_check(&audit_verdict));
         // An erase keeps a copy 30 days; a purge that is not running shows as
         // an archive older than the window.
@@ -7287,6 +7320,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let anonymous = crate::http::get_raw_opt(g, &format!("{LOGS_QUERY_ROUTE}?query=%7Bnode%3D%22verify%22%7D&limit=1"), false, 10)
             .map(|(status, _)| status);
         checks.push(logs_access_check(anonymous));
+        laps.append(&mut checks.laps);
         let c_ok = checks.iter().all(|c| c.verdict != Verdict::Fail && c.verdict != Verdict::Starting);
         any_starting |= checks.iter().any(|c| c.verdict == Verdict::Starting);
         all_ok &= c_ok;
@@ -7303,6 +7337,11 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     }
 
+    if timings && g.json {
+        json_out.insert("timings".into(), timings_json(&laps, started.elapsed()));
+    } else if timings {
+        render_timings(&laps, started.elapsed());
+    }
     if g.json {
         json_out.insert("ok".into(), Value::Bool(all_ok));
         json_out.insert("starting".into(), Value::Bool(any_starting));
@@ -7321,6 +7360,103 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         println!("{}", ui::status_line(Glyph::Err, "an invariant does not hold — the remedy is beside each failing row"));
     }
     Ok(if all_ok { 0 } else { 1 })
+}
+
+/// At most this many independent reads run at once: a fleet of fifty nodes
+/// must not open two hundred connections to its own gateway in one breath.
+const PARALLEL_READS: usize = 8;
+
+/// `f` over `items`, [`PARALLEL_READS`] at a time, the answers in the order
+/// of `items`. A panic in one read is the caller's panic, as it was when the
+/// reads ran one after another.
+fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let f = &f;
+    let mut out = Vec::with_capacity(items.len());
+    for chunk in items.chunks(PARALLEL_READS) {
+        std::thread::scope(|s| {
+            let running: Vec<_> = chunk.iter().map(|t| s.spawn(move || f(t))).collect();
+            for r in running {
+                out.push(r.join().unwrap_or_else(|p| std::panic::resume_unwind(p)));
+            }
+        });
+    }
+    out
+}
+
+/// The controller's rows plus the wall time each took (`--timings`). A row's
+/// time runs from the row before it, so a slow probe is named by the row it
+/// fed; a step that adds no row carries its time into the next row.
+struct TimedChecks {
+    rows: Vec<Check>,
+    laps: Vec<(String, Duration)>,
+    last: Instant,
+}
+
+impl TimedChecks {
+    fn new(first: Vec<Check>, since: Instant, label: &str) -> Self {
+        let last = Instant::now();
+        TimedChecks { rows: first, laps: vec![(label.to_string(), last - since)], last }
+    }
+
+    fn push(&mut self, c: Check) {
+        self.extend([c]);
+    }
+
+    fn extend<I: IntoIterator<Item = Check>>(&mut self, more: I) {
+        let before = self.rows.len();
+        self.rows.extend(more);
+        if self.rows.len() > before {
+            let now = Instant::now();
+            let names: Vec<&str> = self.rows[before..].iter().map(|c| c.name).collect();
+            self.laps.push((names.join(", "), now - self.last));
+            self.last = now;
+        }
+    }
+}
+
+impl std::ops::Deref for TimedChecks {
+    type Target = Vec<Check>;
+    fn deref(&self) -> &Vec<Check> {
+        &self.rows
+    }
+}
+
+impl std::ops::DerefMut for TimedChecks {
+    fn deref_mut(&mut self) -> &mut Vec<Check> {
+        &mut self.rows
+    }
+}
+
+/// The slowest steps first, then the whole run. Steps under
+/// [`TIMING_FLOOR_MS`] are counted, not listed.
+const TIMING_FLOOR_MS: u128 = 100;
+const TIMINGS_LISTED: usize = 15;
+
+fn slowest(laps: &[(String, Duration)]) -> (Vec<(String, u128)>, usize) {
+    let mut v: Vec<(String, u128)> = laps.iter().map(|(n, d)| (n.clone(), d.as_millis())).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    let shown: Vec<(String, u128)> = v.iter().filter(|(_, ms)| *ms >= TIMING_FLOOR_MS).take(TIMINGS_LISTED).cloned().collect();
+    let rest = v.len() - shown.len();
+    (shown, rest)
+}
+
+fn timings_json(laps: &[(String, Duration)], total: Duration) -> Value {
+    serde_json::json!({
+        "total_ms": total.as_millis() as u64,
+        "steps": laps.iter().map(|(n, d)| serde_json::json!({ "step": n, "ms": d.as_millis() as u64 })).collect::<Vec<_>>(),
+    })
+}
+
+fn render_timings(laps: &[(String, Duration)], total: Duration) {
+    println!("{}", ui::section("timings"));
+    let (shown, rest) = slowest(laps);
+    for (name, ms) in &shown {
+        println!("  {:>7.2}s  {name}", *ms as f64 / 1000.0);
+    }
+    if rest > 0 {
+        println!("{}", ui::note(&format!("{rest} more step(s) under {TIMING_FLOOR_MS} ms each")));
+    }
+    println!("  {:>7.2}s  total", total.as_secs_f64());
 }
 
 fn checks_json(checks: &[Check]) -> Value {
@@ -12829,5 +12965,83 @@ mod agent_mail_tests {
         assert!(!c.detail.contains("alice"));
         assert_eq!(agent_mail_check(Some(&json!({"accounts": []}))).verdict, Verdict::Ok);
         assert_eq!(agent_mail_check(None).verdict, Verdict::Warn);
+    }
+}
+
+#[cfg(test)]
+mod speed_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn par_map_keeps_the_order_and_runs_at_most_eight_at_once() {
+        let in_flight = AtomicUsize::new(0);
+        let most = AtomicUsize::new(0);
+        let items: Vec<usize> = (0..20).collect();
+        let out = par_map(&items, |i| {
+            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            most.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(300));
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            i * 10
+        });
+        assert_eq!(out, items.iter().map(|i| i * 10).collect::<Vec<_>>(), "answers in the order asked");
+        // One after another would never have two in flight.
+        assert_eq!(most.load(Ordering::SeqCst), PARALLEL_READS, "a chunk runs side by side, and no wider");
+    }
+
+    #[test]
+    fn par_map_of_nothing_is_nothing() {
+        let none: Vec<u8> = Vec::new();
+        assert!(par_map(&none, |b| *b).is_empty());
+    }
+
+    #[test]
+    fn a_row_carries_the_time_since_the_row_before_and_an_empty_step_carries_forward() {
+        let since = Instant::now() - Duration::from_millis(400);
+        let mut t = TimedChecks::new(vec![ok("posture", "x")], since, "reads");
+        assert_eq!(t.laps[0].0, "reads");
+        assert!(t.laps[0].1 >= Duration::from_millis(400), "the batch is timed from where it began");
+        std::thread::sleep(Duration::from_millis(120));
+        t.extend(None::<Check>);
+        assert_eq!(t.laps.len(), 1, "a step that adds no row records nothing");
+        std::thread::sleep(Duration::from_millis(30));
+        t.push(ok("loki", "y"));
+        assert_eq!(t.laps[1].0, "loki");
+        assert!(t.laps[1].1 >= Duration::from_millis(150), "the empty step's time lands on the next row: {:?}", t.laps[1].1);
+        t.extend([ok("a", ""), ok("b", "")]);
+        assert_eq!(t.laps[2].0, "a, b", "one step that adds two rows names both");
+        assert_eq!(t.len(), 4, "the rows are the rows");
+        assert_eq!(t.iter().map(|c| c.name).collect::<Vec<_>>(), ["posture", "loki", "a", "b"]);
+    }
+
+    #[test]
+    fn timings_list_the_slowest_first_and_count_the_quick_ones() {
+        let laps = vec![
+            ("fast".to_string(), Duration::from_millis(20)),
+            ("slow".to_string(), Duration::from_millis(2_500)),
+            ("middle".to_string(), Duration::from_millis(400)),
+        ];
+        let (shown, rest) = slowest(&laps);
+        assert_eq!(shown, vec![("slow".to_string(), 2_500), ("middle".to_string(), 400)]);
+        assert_eq!(rest, 1);
+        let j = timings_json(&laps, Duration::from_millis(3_000));
+        assert_eq!(j["total_ms"], 3_000);
+        assert_eq!(j["steps"].as_array().unwrap().len(), 3, "JSON keeps every step, in run order");
+        assert_eq!(j["steps"][0]["step"], "fast");
+    }
+
+    #[test]
+    fn independent_reads_stay_side_by_side() {
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let run = crate::test_src::fn_body(&own, "pub fn cluster_verify(");
+        assert!(run.contains("par_map(&selected, |n| with_harness_wanted(g, n))"), "node reads run side by side");
+        assert!(run.contains("par_map(&reads, |w| self_json(g, w))"), "the security/doctor verbs run side by side");
+        assert!(run.contains("par_map(&fit_ids,"), "the per-node fit reads run side by side");
+        // `addons verify` alone stays where it is: it runs only when a
+        // licensed add-on is on, decided from noomesh.yaml after the batch.
+        assert_eq!(run.matches("= self_json(g,").count(), 1, "no other verb runs on its own, one after another");
+        assert!(run.contains("= self_json(g, &[\"addons\", \"verify\"]);"));
+        assert!(run.contains("\"--timings\" => timings = true"), "the flag is parsed");
     }
 }
