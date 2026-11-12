@@ -63,9 +63,6 @@ pub(crate) struct Skipped {
 /// The node id as one path component: never a traversal.
 fn safe_node_id(id: &str) -> bool {
     !id.is_empty()
-        && id.len() <= 128
-        && !id.starts_with('.')
-        && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
 /// The host and port of an agent base URL (`https://host:port`).
