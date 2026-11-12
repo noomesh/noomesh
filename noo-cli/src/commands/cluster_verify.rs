@@ -288,6 +288,32 @@ pub(crate) fn stack_tag_from_gateway(fleet: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// For this long after `noo upgrade` rolled the stack or the nodes, a node
+/// that is silent, or still on the old agent, is restarting rather than
+/// broken: agents and the gateway restart and reconnect (i663 §2.3).
+pub(crate) const ROLL_SETTLE_SECS: i64 = 600;
+/// The record field verify adds while a roll is settling: seconds since it.
+const ROLLED_AGO_KEY: &str = "rolled_secs_ago";
+/// The rows an agent or gateway restart turns red for a minute or two.
+const SETTLING_ROWS: [&str; 4] = ["online", "bus", "hostd", "version"];
+
+/// Seconds since the last roll, when it is inside [`ROLL_SETTLE_SECS`].
+fn rolled_ago(roll: Option<i64>, now: i64) -> Option<i64> {
+    roll.map(|t| now - t).filter(|age| (0..=ROLL_SETTLE_SECS).contains(age))
+}
+
+/// Inside the settle window a failing liveness row reads as restarting
+/// after the upgrade (STARTING: still exit 1, never a pass), with
+/// `noo cluster verify --wait` as the way on. Outside it, nothing changes.
+fn settle_after_roll(n: &Value, out: &mut [Check]) {
+    let Some(age) = n[ROLLED_AGO_KEY].as_i64() else { return };
+    for c in out.iter_mut().filter(|c| c.verdict == Verdict::Fail && SETTLING_ROWS.contains(&c.name)) {
+        c.verdict = Verdict::Starting;
+        c.detail = format!("restarting after the upgrade {age}s ago ({})", c.detail);
+        c.remedy = Some("noo cluster verify --wait   # waits for the restarted agents".into());
+    }
+}
+
 /// The controller's stack tag: `.env NOO_IMAGE_TAG` (what is deployed), else
 /// the tag this binary was paired with at build.
 pub(crate) fn controller_stack_tag() -> String {
@@ -527,6 +553,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     } }
     out.extend(harness_tasks_check(n));
     out.extend(harness_egress_check(id, n));
+    settle_after_roll(n, &mut out);
     out
 }
 
@@ -7094,6 +7121,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let here = vantage_here(Some(&body));
         let tag = if here == Vantage::Controller { controller_stack_tag() } else { stack_tag_from_gateway(&body) };
         let now = now_unix();
+        let roll = crate::commands::upgrade::last_roll();
         if !g.json {
             println!("{}", ui::header("cluster verify", Some(&format!("{} node(s) · controller {tag}", selected.len()))));
             tally.context = format!(" — {} node(s) on {tag}", selected.len());
@@ -7107,7 +7135,11 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         laps.push((format!("node reads ({} node(s), side by side)", selected.len()), reads_from.elapsed()));
         for (n, wanted) in selected.iter().zip(&enriched) {
             let id = n["id"].as_str().unwrap_or("?");
-            let checks = node_checks(wanted, &tag, env!("CARGO_PKG_VERSION"), now, signing_adopted_for(id));
+            let mut record = wanted.clone();
+            if let (Some(age), Some(obj)) = (rolled_ago(roll, now), record.as_object_mut()) {
+                obj.insert(ROLLED_AGO_KEY.into(), age.into());
+            }
+            let checks = node_checks(&record, &tag, env!("CARGO_PKG_VERSION"), now, signing_adopted_for(id));
             let node_ok = checks.iter().all(|c| c.verdict != Verdict::Fail && c.verdict != Verdict::Starting);
             any_starting |= checks.iter().any(|c| c.verdict == Verdict::Starting);
             all_ok &= node_ok;
@@ -13835,5 +13867,65 @@ mod cert_expiry_row_tests {
         let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
         let run = crate::test_src::fn_body(&own, "pub fn cluster_verify(");
         assert!(run.contains("checks.push(cert_expiry_row(&certs));"));
+    }
+}
+
+#[cfg(test)]
+mod settle_after_roll_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn silent_node() -> Value {
+        json!({"id": "pop-os", "status": "offline", "nats_state": "disconnected", "nats_role": "node",
+               "app_version": "stack-v0.6.22+abc", "hostd": {"alive": false, "detail": "stale heartbeat"}})
+    }
+
+    fn rows(n: &Value) -> Vec<(&'static str, Verdict)> {
+        node_checks(n, "v0.6.23", "0.6.23", 2_000_000, Some(true)).into_iter()
+            .filter(|c| SETTLING_ROWS.contains(&c.name)).map(|c| (c.name, c.verdict)).collect()
+    }
+
+    #[test]
+    fn a_silent_node_just_after_a_roll_is_restarting_not_broken() {
+        let mut n = silent_node();
+        n[ROLLED_AGO_KEY] = 45.into();
+        let checks = node_checks(&n, "v0.6.23", "0.6.23", 2_000_000, Some(true));
+        let online = checks.iter().find(|c| c.name == "online").unwrap();
+        assert_eq!(online.verdict, Verdict::Starting);
+        assert_eq!(online.detail, "restarting after the upgrade 45s ago (status offline)");
+        assert!(online.remedy.as_deref().unwrap().starts_with("noo cluster verify --wait"));
+        assert!(rows(&n).iter().all(|(_, v)| *v == Verdict::Starting), "{:?}", rows(&n));
+    }
+
+    #[test]
+    fn without_a_recent_roll_the_same_node_fails_as_before() {
+        assert!(rows(&silent_node()).iter().all(|(_, v)| *v == Verdict::Fail));
+    }
+
+    #[test]
+    fn only_liveness_rows_are_softened() {
+        let mut n = silent_node();
+        n["peer_identity_enforced"] = false.into();
+        n[ROLLED_AGO_KEY] = 30.into();
+        let checks = node_checks(&n, "v0.6.23", "0.6.23", 2_000_000, Some(false));
+        for name in ["peer identity", "signing"] {
+            assert_eq!(checks.iter().find(|c| c.name == name).unwrap().verdict, Verdict::Fail, "{name} is not a restart symptom");
+        }
+    }
+
+    #[test]
+    fn the_window_is_ten_minutes_from_the_roll() {
+        assert_eq!(rolled_ago(Some(1_000), 1_000 + 600), Some(600));
+        assert_eq!(rolled_ago(Some(1_000), 1_000 + 601), None, "past the window it is a real outage");
+        assert_eq!(rolled_ago(Some(1_000), 999), None, "a roll in the future is a skewed clock, not a roll");
+        assert_eq!(rolled_ago(None, 5), None);
+    }
+
+    #[test]
+    fn the_fleet_run_reads_the_roll_marker() {
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let run = crate::test_src::fn_body(&own, "pub fn cluster_verify(");
+        assert!(run.contains("crate::commands::upgrade::last_roll()"));
+        assert!(run.contains("obj.insert(ROLLED_AGO_KEY.into(), age.into());"));
     }
 }
