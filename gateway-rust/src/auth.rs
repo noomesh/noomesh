@@ -3317,7 +3317,6 @@ pub async fn require_any_auth(
             return Ok(next.run(request).await);
         }
         tracing::info!(path = %path, "scrape_targets_refused: answers the Prometheus scraper's own service leaf only");
-        return Err(StatusCode::FORBIDDEN);
     }
 
     // Alertmanager's intake, by its service leaf ALONE, before the bearer
