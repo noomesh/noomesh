@@ -74,7 +74,7 @@ pub fn not_modified(if_none_match: Option<&str>, sha: &str) -> bool {
     v.split(',').map(str::trim).any(|tag| {
         tag.strip_prefix('"')
             .and_then(|t| t.strip_suffix('"'))
-            .is_some_and(|t| is_sha(t) && t == sha)
+            .is_some_and(|t| is_sha(t))
     })
 }
 
