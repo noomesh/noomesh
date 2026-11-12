@@ -1683,9 +1683,8 @@ pub(crate) fn deliver_kind_to_nodes_then(
         }
         let outcome = (|| -> Result<crate::commands::security_local::CertDelivery, String> {
             let payload = payload_for(node)?;
-            let work = std::env::temp_dir()
-                .join(format!("noo-{kind}-{}-{}", node, std::process::id()));
-            std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+            // i689: a fresh 0700 dir; what is staged here is CA-signed.
+            let work = crate::private_tmp::dir(&format!("noo-{kind}-{node}"))?;
             let files: Vec<(&str, Vec<u8>)> = vec![(kind, payload)];
             let bundle = crate::commands::security_local::build_signed_bundle(&ca, node, &files, &work)?;
             let d = crate::commands::security_local::deliver_signed_bundle(g, node, &bundle, &work, None);

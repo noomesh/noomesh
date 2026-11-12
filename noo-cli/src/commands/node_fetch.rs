@@ -2624,20 +2624,11 @@ fn birth_proof(base: &Path, purpose: &str, node: &str, sha: &str) -> Result<Stri
     // parallel threads: that is where it first showed, as
     // `the_darwin_signer_produces_a_verifiable_signature` failing with
     // "Can't open .../sig for writing" once in four runs.
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let work = std::env::temp_dir().join(format!(
-        "noo-birth-proof-{}-{}",
-        std::process::id(),
-        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    // Created afresh, 0700 (a pre-existing directory at this name is not
-    // ours to sign in).
-    if let Err(e) = {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new().mode(0o700).create(&work)
-    } {
-        return Err(format!("could not make a signing work dir at {}: {e}", work.display()));
-    }
+    // Created afresh, 0700, under an unguessable name (i689: the old
+    // `<pid>-<seq>` name was refused if pre-existing, but predictable, so
+    // another user could pre-create it and block every signing).
+    let work = crate::private_tmp::dir("noo-birth-proof")
+        .map_err(|e| format!("could not make a signing work dir: {e}"))?;
     let msg_path = work.join("msg");
     let sig_path = work.join("sig");
     let cleanup = || {

@@ -5887,9 +5887,9 @@ pub(crate) fn ensure_embed_model_core(model: &str) -> Vec<String> {
         // repo — so every fresh box came up with no embedder (2026-09-07).
         let artifact = harrier_artifact_ref();
         out_lines.push(format!(".Fetching the harrier embedder artifact into {embed} ({artifact})..."));
-        let tmp = std::env::temp_dir().join(format!("noo-harrier-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let _ = std::fs::create_dir_all(&tmp);
+        // i689: a fresh 0700 dir; the weights checked here are what is served.
+        let tmp_dir = crate::private_tmp::Dir::new("noo-harrier");
+        let tmp = tmp_dir.as_ref().map(|d| d.path().to_path_buf()).unwrap_or_else(|_| std::path::PathBuf::from("/nonexistent/noo-harrier"));
         let src = format!("noo-harrier-src-{}", std::process::id());
         let fetched = Command::new("bash").arg("-c")
             .arg(format!(
@@ -6143,23 +6143,18 @@ fn obtain_hostd_binary(ctx: &mut Ctx) -> Result<std::path::PathBuf, String> {
     }
     let asset = crate::commands::provision::hostd_asset_for(std::env::consts::OS, std::env::consts::ARCH)
         .ok_or_else(|| format!("no noo-hostd build for {}/{}", std::env::consts::OS, std::env::consts::ARCH))?;
-    let cached = crate::commands::provision::cli_asset_cache_dir(&ctx.repo_root).join(&asset);
-    let bytes = match std::fs::read(&cached).ok().filter(|b| !b.is_empty()) {
-        Some(b) => b,
-        None => {
-            ctx.progress(&format!("Fetching {asset} from release noo-cli-v{}...", env!("CARGO_PKG_VERSION")));
-            let b = crate::commands::upgrade::fetch_release_file(ctx.g, env!("CARGO_PKG_VERSION"), &asset, None)?;
-            if let Some(dir) = cached.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let _ = std::fs::write(&cached, &b);
-            b
-        }
-    };
+    // i688: through the verified gate, like every bundle asset — a cached
+    // copy only if its sha256 is in the signed manifest of this version,
+    // else fetched and checked. This binary is installed as ROOT below.
+    ctx.progress(&format!("Obtaining {asset} for noo-cli-v{} (verified against the signed manifest)...", env!("CARGO_PKG_VERSION")));
+    let bytes = crate::commands::provision::cached_release_asset(ctx.g, &ctx.repo_root, &asset)?;
     if !looks_like_elf(&bytes) {
         return Err(format!("{asset} is not an ELF executable — refusing to install it"));
     }
-    let staged = std::env::temp_dir().join(format!("noo-hostd-{}", std::process::id()));
+    // i689: `sudo install` copies this to /usr/local/bin as root; a fresh
+    // 0700 dir, so nobody can swap it between the write and the install.
+    let staged_dir = crate::private_tmp::Dir::new("noo-hostd")?;
+    let staged = staged_dir.path().join("noo-hostd");
     std::fs::write(&staged, &bytes).map_err(|e| format!("could not stage the binary: {e}"))?;
     let ok = ctx_sudo(ctx)
         .args(["install", "-m", "755", "-o", "root", "-g", "root"])

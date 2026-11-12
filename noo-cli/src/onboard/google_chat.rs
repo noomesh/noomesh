@@ -70,13 +70,9 @@ pub fn access_token(key: &Value, scope: &str) -> Result<String, String> {
     let signing_input = format!("{header}.{claims}");
 
     // Sign with openssl; key on disk only inside a private temp dir.
-    let dir = std::env::temp_dir().join(format!("noo-gsa-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).map_err(|e| format!("temp dir: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-    }
+    // i689: fresh and 0700 from creation (mkdtemp), not chmod-ed after
+    // `create_dir_all` accepted whatever stood at `<tmp>/noo-gsa-<pid>`.
+    let dir = crate::private_tmp::dir("noo-gsa").map_err(|e| format!("temp dir: {e}"))?;
     let key_path = dir.join("key.pem");
     let write = (|| -> std::io::Result<()> {
         let mut f = std::fs::File::create(&key_path)?;

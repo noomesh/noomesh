@@ -82,6 +82,7 @@ mod output;
 // The declared one-shot compose services (i64a): `stack status` and the roll summary.
 mod oneshots;
 mod pki;
+mod private_tmp;
 mod role;
 mod shell_completion;
 #[cfg(test)]

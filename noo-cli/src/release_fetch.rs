@@ -400,15 +400,10 @@ pub(crate) fn gh_reason(stderr: &str) -> String {
 /// One `gh release download` of `name` from `tag` in `repo`, classified.
 /// `gh` is the binary to run (a path, so tests can hand in a fake gh).
 pub(crate) fn gh_download_once(gh: &Path, repo: &str, tag: &str, name: &str) -> Result<Vec<u8>, FetchError> {
-    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "noo-release-fetch-{}-{}-{}",
-        std::process::id(),
-        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        name.replace('/', "_")
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::create_dir_all(&dir);
+    // i689: a fresh 0700 dir, so nobody else can swap the downloaded bytes
+    // between gh writing them and this reading them.
+    let dir = crate::private_tmp::dir("noo-release-fetch")
+        .map_err(|e| FetchError::new(FetchClass::Other, format!("gh release download {name}: {e}")))?;
     let what = format!("gh release download {tag} --repo {repo} --pattern {name}");
     let out = std::process::Command::new(gh)
         .args(["release", "download", tag, "--repo", repo, "--pattern", name, "--dir"])

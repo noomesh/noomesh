@@ -1789,8 +1789,11 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
     let cli_bin = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
     // The launcher names a container it could not stop in this file
     // (lib-stuck-container.sh), see LAUNCHER_EXIT_STACK_PARTIAL.
-    let stuck_report = std::env::temp_dir().join(format!("noo-launch-stuck-{}", std::process::id()));
-    let _ = std::fs::remove_file(&stuck_report);
+    // i689: in a fresh 0700 dir (removed when this returns): a planted
+    // symlink at a predictable name would have the launcher write through it.
+    let stuck_dir = crate::private_tmp::Dir::new("noo-launch-stuck")
+        .unwrap_or_else(|e| crate::output::fail(g.json, crate::output::ExitCode::Generic, "stage_failed", &e, None));
+    let stuck_report = stuck_dir.path().join("stuck");
     let build_launch = || {
         let mut c = std::process::Command::new("bash");
         c.arg(root.join("scripts/noomesh-start.sh")).arg("--dist")
