@@ -195,6 +195,19 @@ def test_a_daemon_that_is_down_stops_the_clean_too(tmp_path):
     assert "cannot reach docker (Cannot connect to the Docker daemon" in r.stderr
 
 
+def test_exit_zero_with_no_server_version_stops_the_clean(tmp_path):
+    """rc.2 install matrix: on Docker 28.0.4 a shell without the docker group
+    got past an exit-code-only gate. An empty version is not an answer."""
+    r, calls = _gate_run(tmp_path, 'echo "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock" >&2\nexit 0\n')
+    assert r.returncode == 1 and "PAST THE GATE" not in r.stdout, r.stdout + r.stderr
+    assert "cannot reach docker (permission denied while trying to connect to the Docker daemon socket" in r.stderr
+    assert "nothing was removed" in r.stderr
+    assert calls == ["info --format {{.ServerVersion}}"], "nothing but the probe ran"
+    (tmp_path / "b").mkdir()
+    r, _ = _gate_run(tmp_path / "b", "exit 0\n")
+    assert r.returncode == 1 and "no server version" in r.stderr, r.stderr
+
+
 def test_an_answering_docker_or_no_docker_at_all_passes_the_gate(tmp_path):
     r, _ = _gate_run(tmp_path, 'echo 29.0.1\nexit 0\n')
     assert r.returncode == 0 and "PAST THE GATE" in r.stdout
