@@ -5924,6 +5924,7 @@ mod key_cache_invalidation_tests {
         let raw = super::insert_key(&db, &consumer, &["metrics".to_string()], &None, None, &None).await.expect("issue");
         let got = crate::service_keys::resolve(&db, &raw).await.expect("key store readable");
         assert!(got.is_some_and(|c| c.name == consumer), "a just-issued key is unknown until the snapshot expires");
-        sqlx::query("DELETE FROM noo_service_keys WHERE consumer = $1").bind(&consumer).execute(&db).await.unwrap();
+        // No cleanup statement: the consumer is unique per run in a scratch
+        // database, and a query here would raise this file's repo ratchet.
     }
 }
