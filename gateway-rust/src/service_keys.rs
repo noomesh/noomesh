@@ -740,3 +740,90 @@ mod key_store_unavailable_tests {
         assert!(!msg.contains("postgres://"), "no DSN reaches the caller: {msg}");
     }
 }
+
+#[cfg(test)]
+mod invalidation_guard {
+    /// Every write that changes which keys resolve (issue, revoke, rotate,
+    /// retire, quota, the add-on caller key) drops the resolved-key snapshot
+    /// AFTER it is written, so the change answers now and not up to one TTL
+    /// later: a revoked key must not keep working for 5 s (rc.1 rehearsal,
+    /// A-mcppub.door; the TTL comment always said so, nothing did it).
+    const WRITERS: &[(&str, &str, &str)] = &[
+        ("routes/users.rs", "async fn insert_key(", "INSERT INTO noo_service_keys"),
+        ("routes/users.rs", "async fn service_key_self_issue(", "UPDATE noo_service_keys SET active = false"),
+        ("routes/users.rs", "async fn service_key_self_revoke(", "UPDATE noo_service_keys SET active = false"),
+        ("routes/users.rs", "async fn service_key_retire(", "sqlx::query(RETIRE_SUPERSEDED_SQL)"),
+        ("routes/users.rs", "async fn service_key_revoke(", "UPDATE noo_service_keys SET active = false"),
+        ("routes/users.rs", "async fn service_key_revoke_and_disable(", "tx.commit().await?"),
+        ("routes/users.rs", "async fn service_key_rotate(", "sqlx::query(SUPERSEDE_PREVIOUS_SQL)"),
+        ("routes/users.rs", "async fn service_key_set_quota(", "UPDATE noo_service_keys SET rpm_limit"),
+        ("addon_auth.rs", "pub async fn init(", "INSERT INTO noo_service_keys"),
+        ("service_keys.rs", "pub async fn mint_door_key(", "INSERT INTO noo_service_keys"),
+        ("service_keys.rs", "pub async fn revoke_door_key(", "UPDATE noo_service_keys SET active = false"),
+    ];
+
+    fn src(file: &str) -> String {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(file);
+        crate::test_src::own_code(&std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{file}: {e}")))
+    }
+
+    #[test]
+    fn every_key_write_invalidates_the_resolved_key_cache_after_it() {
+        for (file, marker, write) in WRITERS {
+            let code = src(file);
+            let body = crate::test_src::fn_body(&code, marker);
+            let w = body.find(write).unwrap_or_else(|| panic!("{file} {marker}: the write {write:?} moved: this guard is stale"));
+            assert!(
+                body[w..].contains("invalidate_cache()"),
+                "{file} {marker}: the key change is not followed by service_keys::invalidate_cache(): it answers wrongly for up to one TTL"
+            );
+        }
+    }
+
+    /// Completeness: every production statement that writes
+    /// noo_service_keys lives in a function listed above (or is one of the
+    /// two that cannot change what resolves: the last_used_at stamp, and the
+    /// prune of already-inactive retired rows). A new writer fails here
+    /// until it is listed, and so invalidates.
+    #[test]
+    fn no_unlisted_function_writes_service_keys() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found = Vec::new();
+        fn walk(d: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(d).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() { walk(&p, out) } else if p.extension().is_some_and(|x| x == "rs") { out.push(p) }
+            }
+        }
+        walk(&root, &mut found);
+        let mut stray = Vec::new();
+        for p in found {
+            let rel = p.strip_prefix(&root).unwrap().display().to_string();
+            let code = crate::test_src::own_code(&std::fs::read_to_string(&p).unwrap());
+            for pat in ["INSERT INTO noo_service_keys", "UPDATE noo_service_keys", "DELETE FROM noo_service_keys",
+                        "sqlx::query(SUPERSEDE_PREVIOUS_SQL)", "sqlx::query(RETIRE_SUPERSEDED_SQL)"] {
+                for (at, _) in code.match_indices(pat) {
+                    let line = code[at..].lines().next().unwrap_or("");
+                    if line.contains("last_used_at") || line.contains("const ") {
+                        continue;
+                    }
+                    let before = &code[..at];
+                    // The SQL constants' own text (SUPERSEDE/RETIRE, PRUNE) is
+                    // judged where it is executed, not where it is declared.
+                    let decl = before.rfind('\n').map(|i| &before[i..]).unwrap_or("");
+                    if decl.contains("const ") || before.trim_end_matches('"').trim_end().ends_with('=') {
+                        continue;
+                    }
+                    let listed = WRITERS.iter().any(|(f, m, _)| *f == rel && {
+                        let start = code.find(m).unwrap_or(usize::MAX);
+                        start != usize::MAX && at > start && at < start + crate::test_src::fn_body(&code, m).len()
+                    });
+                    if !listed {
+                        stray.push(format!("{rel}: {}", line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(stray.is_empty(), "noo_service_keys written outside the invalidating functions:\n{}", stray.join("\n"));
+    }
+}
