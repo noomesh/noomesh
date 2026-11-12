@@ -1885,7 +1885,7 @@ func ReleaseBackendImage(backend string) string {
 // docker/Dockerfile.ollama packages (tests/test_hardened_images_i323.py).
 const (
 	upstreamLlamacppImage = "ghcr.io/ggml-org/llama.cpp:server"
-	upstreamOllamaImage   = "ollama/ollama:0.40.5"
+	upstreamOllamaImage   = "ollama/ollama:0.40.16"
 )
 
 // releaseImage is <NOO_IMAGE_PREFIX>/<name>:<NOO_IMAGE_TAG>, "" on a node with

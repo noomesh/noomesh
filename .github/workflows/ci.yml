@@ -2030,7 +2030,29 @@ jobs:
           -t noomesh-ollama:${{ github.sha }} . 2>&1 | tail -n 200
         # The binary, with the runtime stage's libraries, must start.
         docker run --rm --entrypoint /usr/bin/ollama noomesh-ollama:${{ github.sha }} --version
-        docker rmi noomesh-ollama:${{ github.sha }} >/dev/null 2>&1 || true
+
+    # REPORT, not a gate (2026-11-12, i687): the fixable HIGH/CRITICAL in
+    # the image this PR builds, listed by the same code as the daily staged
+    # gate. All of ollama's come from upstream's Go binary, the same on both
+    # arches (i687), so this amd64 scan speaks for arm64 too.
+    - name: Scan the built image (report only)
+      env:
+        TRIVY_VERSION: "0.70.0"
+        TRIVY_SHA256: "8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9"
+        IMAGE: noomesh-ollama:${{ github.sha }}
+      run: |
+        set -euo pipefail
+        dir="$RUNNER_TEMP/trivy-bin"; mkdir -p "$dir" "$RUNNER_TEMP/scan"
+        curl -fsSL --retry 3 -o "$dir/trivy.tgz" \
+          "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+        echo "${TRIVY_SHA256}  $dir/trivy.tgz" | sha256sum -c -
+        tar -xzf "$dir/trivy.tgz" -C "$dir" trivy
+        "$dir/trivy" image --severity HIGH,CRITICAL --ignore-unfixed --format json \
+          -o "$RUNNER_TEMP/scan/linux-amd64.json" "$IMAGE"
+        { echo "### ollama image scan (report only)"; echo '```'
+          python3 scripts/infra-staged.py new-findings --new "$RUNNER_TEMP/scan/linux-amd64.json"
+          echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+        docker rmi "$IMAGE" >/dev/null 2>&1 || true
 
   voice-images:
     # whisper and piper publish for linux/arm64 too (i607c): a Pi or an
