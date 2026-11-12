@@ -1380,7 +1380,8 @@ host's with `hosts: files dns`; and a `hosts` file that holds only the names
 the harness needs, the hosts of `NOO_GATEWAY_URL` and `NATS_URL`, resolved
 by the applier) and the drop-in
 `noo-harness.service.d/50-noomesh-egress.conf`. The drop-in sets
-`IPAddressDeny=any` and allows only loopback, private, link-local and
+`IPAddressDeny=0.0.0.0/0 ::/0` (every address; written as prefixes because
+`systemd-run -p`, which the pre-check uses, rejects `any` and `localhost`) and allows only loopback, private, link-local and
 tailnet ranges, `fc00::/7` only on a host that has its own global address
 there, and each controller address outside those ranges as one `/32` or
 `/128`. It also bind-mounts the three files over `/etc` for the unit and its
@@ -1389,7 +1390,7 @@ their content changes; a change reloads systemd and restarts the harness the
 applier's usual way. A name that does not resolve is left out of the hosts
 file and is never looked up through a real resolver: the harness then fails
 to connect to it, which is loud. The applier also runs a probe (a transient
-unit with `IPAddressDeny=any` that tries a TEST-NET-1 address) and adds a tag
+unit denying every address that tries a TEST-NET-1 address) and adds a tag
 to the `applied:` line: `harness-egress=enforced` when the kernel answers
 "Operation not permitted", `harness-egress=UNENFORCED:<reason>` for anything
 else (including no `systemd-run`), and `harness-egress=UNRESOLVED:<name>` per
