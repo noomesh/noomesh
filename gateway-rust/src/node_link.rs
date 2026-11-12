@@ -331,8 +331,10 @@ impl NodeLink {
                 "detail": "node tunnels are switched off on this gateway (NOO_NODE_TUNNEL)"});
         }
         let Some(sess) = crate::tunnel::hub().live(&node) else {
-            return json!({"advertised": true, "checked": true, "ok": false,
-                "detail": "the node advertises a tunnel but this gateway holds no live tunnel for it (it reconnects within seconds after a gateway restart)"});
+            return no_live_tunnel(
+                crate::legacy_lanes::process_start_unix(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            );
         };
         let started = std::time::Instant::now();
         let req = crate::tunnel::TunnelRequest {
@@ -910,5 +912,34 @@ mod tests {
         let err = read_all(&client, &url).await.expect_err("silence past the idle bound is a cut");
         assert!(err.starts_with("the model stream was cut after "), "{err}");
         assert!(started.elapsed() < std::time::Duration::from_secs(3), "cut at the idle bound, not after the gap: {:?}", started.elapsed());
+    }
+}
+
+/// i677 #17: what the tunnel probe answers when this gateway holds no live
+/// tunnel for a node that advertises one. Inside the settle window after THIS
+/// gateway started, the node is still redialing (it reconnects within seconds;
+/// install matrix run 6): `checked: false`, which verify shows as NOT CHECKED,
+/// never as a failure. Past the window it is the FAIL it always was. Pure.
+pub(crate) fn no_live_tunnel(gateway_started_unix: u64, now_unix: u64) -> Value {
+    let since = now_unix.saturating_sub(gateway_started_unix);
+    if (since as f64) < crate::routes::cluster::GOSSIP_SETTLE_SECS {
+        return json!({"advertised": true, "checked": false, "ok": false, "reason": "gateway_settling",
+            "detail": format!("not yet: this gateway started {since}s ago and the node redials its tunnel on its own (within seconds)")});
+    }
+    json!({"advertised": true, "checked": true, "ok": false, "reason": "no_live_tunnel",
+        "detail": "the node advertises a tunnel but this gateway holds no live tunnel for it (it reconnects within seconds after a gateway restart)"})
+}
+
+#[cfg(test)]
+mod no_live_tunnel_tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_tunnel_right_after_a_gateway_start_is_not_checked_yet_and_later_a_failure() {
+        let early = no_live_tunnel(1_000, 1_020);
+        assert_eq!((early["checked"].as_bool(), early["reason"].as_str()), (Some(false), Some("gateway_settling")));
+        assert!(early["detail"].as_str().unwrap().contains("started 20s ago"));
+        let late = no_live_tunnel(1_000, 1_100);
+        assert_eq!((late["checked"].as_bool(), late["ok"].as_bool(), late["reason"].as_str()), (Some(true), Some(false), Some("no_live_tunnel")));
     }
 }
