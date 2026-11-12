@@ -253,6 +253,9 @@ pub async fn run() -> Result<()> {
         backend_type: backend_type.clone(),
         api_format: coordinator::api_format_for(&backend_type, &model_url),
     };
+    // Am I held off the internet? From inside this unit's own namespace, before
+    // anything else connects (enforcement step 1; the node agent reads it).
+    crate::harness::egress_selftest::run_at_start().await;
     let get = |k: &str| std::env::var(k).ok();
     check_harness_secrets(&get).map_err(|e| anyhow!("harness: secrets: {e}"))?;
     tracing::info!(capability = HARNESS_SECRET_FILES_CAPABILITY, "harness: secret reader");

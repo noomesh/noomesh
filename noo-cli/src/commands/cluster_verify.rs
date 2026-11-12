@@ -438,7 +438,46 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
         (Some(p), s) => out.push(ok("harness", format!("{} (policy {p})", if s.is_empty() { "-" } else { s }))),
     } }
     out.extend(harness_tasks_check(n));
+    out.extend(harness_egress_check(id, n));
     out
+}
+
+/// The `harness egress` row (enforcement step 1): whether this node's harness,
+/// and every vendor CLI it launches, is held off the internet. Read from the
+/// agent's account of the RUNNING unit (systemd's effective IPAddressDeny and
+/// resolver bind, and the harness's own self-test from inside the unit,
+/// matched to its MainPID), never from the files the applier rendered.
+/// Unknown is a WARN, never a pass. No row on the controller's own node (it
+/// runs no harness unit) or where no harness runs.
+pub(crate) fn harness_egress_check(id: &str, n: &Value) -> Option<Check> {
+    const NAME: &str = "harness egress";
+    if n["self_node"].as_bool() == Some(true) {
+        return None;
+    }
+    let h = &n["host_services"]["harness"];
+    let e = &h["egress"];
+    if !e.is_object() {
+        return (h["state"].as_str() == Some("running")).then(|| {
+            warn(NAME, "not reported: this node's agent is older than the egress hold, so nothing says the harness is held off the internet",
+                Some(format!("noo upgrade --all   # rolls the agent on {id}; then: noo cluster verify")))
+        });
+    }
+    let reason = e["reason"].as_str().unwrap_or("");
+    let stale: Vec<&str> = e["stale_hosts"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+    Some(match e["state"].as_str() {
+        Some("enforced") if stale.is_empty() => ok(NAME, format!(
+            "held off the internet: deny {}, unit resolver; the harness's own check from inside the unit: lookup {}, connect {}",
+            e["ip_deny"].as_str().unwrap_or("?"), e["lookup"].as_str().unwrap_or("?"), e["connect"].as_str().unwrap_or("?"))),
+        Some("enforced") => fail(NAME, format!(
+            "held off the internet, but {} changed address since the harness's hosts file was rendered: the harness cannot reach its controller (it never falls back to real DNS)",
+            stale.join(", ")), format!("noo cluster provision {id}   # re-renders the hosts file and the allowlist")),
+        Some("unenforced") => fail(NAME, format!(
+            "NOT held off the internet ({reason}); placements of kind codex are refused here (Codex resolves api.github.com and chatgpt.com at start)"),
+            format!("noo cluster provision {id}   # then: noo cluster verify; a host whose systemd cannot apply IPAddressDeny (cgroup v1, systemd < 235) needs a systemd upgrade")),
+        _ => warn(NAME, format!("unknown{}: nothing proves this node's harness is held off the internet",
+            if reason.is_empty() { String::new() } else { format!(" ({reason})") }),
+            Some(format!("noo cluster logs {id} harness   # the harness logs its egress self-test at start"))),
+    })
 }
 
 /// The harness's default stall bound (`NOO_HARNESS_TASK_STALL_SECS`): past
@@ -9021,6 +9060,53 @@ mod tests {
         assert_eq!(verdict(&c, "harness"), Verdict::Ok);
         assert!(c.iter().find(|c| c.name == "harness").unwrap().detail.contains("in process"));
         assert_eq!(verdict(&c, "version"), Verdict::Ok);
+    }
+
+    fn with_egress(now: i64, egress: serde_json::Value) -> serde_json::Value {
+        let mut n = healthy(now);
+        n["id"] = "host6".into();
+        n["host_services"]["harness"]["state"] = "running".into();
+        n["host_services"]["harness"]["egress"] = egress;
+        n
+    }
+
+    /// Enforcement step 1: the row passes only on the agent's "enforced" with
+    /// no stale controller name; unenforced and stale FAIL, unknown and an
+    /// agent too old to say WARN, and the controller's own node has no row.
+    #[test]
+    fn the_harness_egress_row_passes_only_on_a_proven_hold() {
+        let now = 1_800_000_000;
+        let held = serde_json::json!({"state": "enforced", "reason": "", "ip_deny": "any", "ip_allow": "localhost 10.0.0.0/8",
+            "resolver": "unit", "pid_match": true, "lookup": "failed", "connect": "denied", "stale_hosts": []});
+        let c = node_checks(&with_egress(now, held.clone()), "v0.2.70", "0.5.57", now, Some(true));
+        assert_eq!(verdict(&c, "harness egress"), Verdict::Ok);
+
+        let mut stale = held.clone();
+        stale["stale_hosts"] = serde_json::json!(["pop-os.tail1234.ts.net"]);
+        let c = node_checks(&with_egress(now, stale), "v0.2.70", "0.5.57", now, Some(true));
+        assert_eq!(verdict(&c, "harness egress"), Verdict::Fail);
+        let row = c.iter().find(|c| c.name == "harness egress").unwrap();
+        assert!(row.detail.contains("pop-os.tail1234.ts.net") && row.remedy.as_deref().unwrap().contains("host6"));
+
+        let mut open = held.clone();
+        open["state"] = "unenforced".into();
+        open["reason"] = "the unit has no IPAddressDeny".into();
+        let c = node_checks(&with_egress(now, open), "v0.2.70", "0.5.57", now, Some(true));
+        assert_eq!(verdict(&c, "harness egress"), Verdict::Fail);
+        let row = c.iter().find(|c| c.name == "harness egress").unwrap();
+        assert!(row.detail.contains("codex") && row.detail.contains("chatgpt.com") && row.detail.contains("no IPAddressDeny"));
+
+        let c = node_checks(&with_egress(now, serde_json::json!({"state": "unknown", "reason": "no self-test file"})), "v0.2.70", "0.5.57", now, Some(true));
+        assert_eq!(verdict(&c, "harness egress"), Verdict::Warn);
+
+        let mut old = healthy(now);
+        old["host_services"]["harness"]["state"] = "running".into();
+        let c = node_checks(&old, "v0.2.70", "0.5.57", now, Some(true));
+        assert_eq!(verdict(&c, "harness egress"), Verdict::Warn, "an agent too old to report is not a pass");
+
+        let mut ctl = with_egress(now, serde_json::json!({"state": "unknown"}));
+        ctl["self_node"] = true.into();
+        assert!(node_checks(&ctl, "v0.2.70", "0.5.57", now, Some(true)).iter().all(|c| c.name != "harness egress"));
     }
 
     /// An ordinary node whose harness the gateway WANTS but which is absent
