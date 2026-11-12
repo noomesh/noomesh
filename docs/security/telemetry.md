@@ -82,16 +82,18 @@ kind has no entry, if a switch below goes missing, or if a foreign kind with
 no switches declared gets a runner.
 
 What each CLI's reporting rests on today. "Switched off" means the vendor's
-documented switch is applied on every launch. "Observed off" means an egress
-capture of that CLI running under noomesh showed no connection to the
-vendor's hosts ([Verify it yourself](#verify-it-yourself)). No CLI is marked
-observed off yet; a row moves only with a capture to show for it.
+documented switch is applied on every launch. "Observed off" means the CLI,
+launched exactly as the harness launches it (`noo-gateway harness probe`, the
+driver's environment and config, a scripted model), was run with no network
+route at all except loopback while every `connect()` and every DNS question it
+made was recorded, and it tried to reach nothing outside the machine. The
+evidence method is in [Verify it yourself](#verify-it-yourself).
 
 | Kind | Reporting | How | Not covered |
 |---|---|---|---|
-| `claude-code` | Switched off (not yet observed) | Environment: the `claude-code` rows below | The WebFetch hostname preflight (below) |
-| `codex` | Switched off (not yet observed) | `config.toml` keys the driver writes into the run's own `CODEX_HOME` before each launch | Nothing known |
-| `copilot` | Switched off (not yet observed) | `COPILOT_OFFLINE=true`, the only switch GitHub documents | Nothing known; offline mode also removes GitHub-backed features (below) |
+| `claude-code` | Observed off (no-route probe, 2026-11-12, Claude Code 2.1.292): only loopback connections, no DNS question | Environment: the `claude-code` rows below | The WebFetch hostname preflight (below); the probe does not call WebFetch |
+| `codex` | **Switches applied; the CLI still resolves `api.github.com` and `chatgpt.com` at start** (observed 2026-11-12, codex-cli 0.163.0, no-route probe: 8 DNS questions, no other outbound attempt). It cannot connect once the harness unit's network allowlist ships, and the lookups stop once the harness unit's own resolver ships | `config.toml` keys the driver writes into the run's own `CODEX_HOME` before each launch | The two lookups above: no Codex setting that stops them has been found yet |
+| `copilot` | Observed off (no-route probe, 2026-11-12, GitHub Copilot CLI 1.0.98): only loopback connections, no DNS question; both probe tests pass with no route, so offline mode needs no GitHub | `COPILOT_OFFLINE=true`, the only switch GitHub documents | Offline mode removes GitHub-backed features (below) |
 
 Codex CLI takes no environment switch for its reporting: its
 `telemetry_off` entry is empty, and its switches are keys of the
@@ -436,6 +438,21 @@ after the stack starts, for example with
 `stats.vllm.ai`, `stats.grafana.org`, `grafana.com`, `huggingface.co/api/telemetry`
 or `ollama.com`. The exception is a model download or cloud call you
 started yourself.
+
+To see what one vendor CLI tries to reach, run it the way the harness does
+with no route out, recording every connection and DNS question (no root
+needed; `noo-gateway` is the node's harness binary, the CLI path is the staged
+one):
+
+```bash
+unshare -rn bash -c 'ip link set lo up; exec unshare --map-user=$(id -u) --map-group=$(id -g) \
+  strace -f -qq -s 300 -xx -e trace=connect,sendto,sendmmsg -o probe.strace \
+  noo-gateway harness probe --kind codex --cli /path/to/codex --mock-model --test both'
+grep -E 'connect\(|sendto\(' probe.strace   # anything but 127.0.0.1 and unix sockets is an attempt
+```
+
+The rows in [Agent harnesses](#agent-harnesses) marked "observed" come from
+exactly this run.
 
 For the whole picture, run [`egress-capture.sh`](egress-capture.sh) on the
 host for as long as you like:
