@@ -275,3 +275,17 @@ def test_cleanup_is_skipped_when_docker_is_unreachable_as_the_cell_user(tmp_path
     probe = td.index("if ! docker info >/dev/null 2>&1; then")
     assert probe < td.index("noo offboard -y") and "cleanup skipped: docker unreachable as" in td
     assert td.index("return 0", probe) < td.index("noo offboard -y"), "the skip returns before any cleanup step"
+
+
+def test_a_probe_is_reported_on_its_own_and_never_fails_the_cell(tmp_path):
+    ok = {"step": "first-answer", "rc": 0, "seconds": 9, "first_error": "", "prompts": [], "warnings": [], "tail": []}
+    probe = {"step": "probe-offboard-without-docker", "rc": 1, "seconds": 3,
+             "first_error": "PROBE FAIL: ~/.noo is gone", "prompts": [], "warnings": [], "tail": []}
+    (tmp_path / "steps.jsonl").write_text(json.dumps(ok) + "\n" + json.dumps(probe) + "\n")
+    (tmp_path / "meta.json").write_text(json.dumps({"cell": "c"}))
+    s = C.summarize(tmp_path)
+    assert s["result"] == "pass" and s["probes"] == {"probe-offboard-without-docker": "PROBE FAIL: ~/.noo is gone"}
+    assert "Probe `probe-offboard-without-docker`: FAIL" in (tmp_path / "summary.md").read_text()
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    assert text.index("step probe-offboard-without-docker") < text.index("\nteardown\nfinish"), "before the real teardown"
+    assert "--clear-groups" in text, "the probe must really drop the docker group"
