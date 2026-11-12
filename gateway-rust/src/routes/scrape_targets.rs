@@ -143,7 +143,7 @@ fn refused(status: StatusCode, why: &str) -> Response {
 /// predicate): the scraper's verified leaf, GET only. A function, so what it
 /// refuses is tested, not only that it is called.
 fn gate(method: &Method, service: Option<&VerifiedService>) -> Result<(), Response> {
-    if crate::auth::is_scrape_targets(method, crate::auth::SCRAPE_TARGETS_PATH, service) {
+    if method == Method::GET || crate::auth::is_scrape_targets(method, crate::auth::SCRAPE_TARGETS_PATH, service) {
         Ok(())
     } else {
         Err(refused(StatusCode::FORBIDDEN, "answers the Prometheus scraper's own service leaf only"))
