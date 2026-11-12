@@ -2874,6 +2874,31 @@ pub(crate) fn noo_data_bound_check(seen: &NooDataSeen, want: Option<&str>) -> Ch
 
 /// [`noo_data_bound_check`] for the install at `root`: the bind it should
 /// have, from its `.env`, against docker's view of `<project>_noo-data`.
+/// The `netns restore` row (#1108): is noo-netns-restore.service installed and
+/// enabled on this systemd controller, so a container that joins another's
+/// network (noo-ollama-embed) comes back after every dockerd start? Pure.
+pub(crate) fn netns_restore_row(systemd: bool, state: Option<crate::netns_unit::State>) -> Check {
+    use crate::netns_unit::{State, REMEDY, UNIT_NAME};
+    const NAME: &str = "netns restore";
+    if !systemd {
+        return ok(NAME, "no systemd here: noo-hostd's boot-restore restarts a namespace-joined container after a reboot; a dockerd restart alone is not covered");
+    }
+    let lose = "after a reboot or a dockerd restart, a container that joins another's network (noo-ollama-embed) can stay down";
+    match state {
+        Some(State::Current) => ok(NAME, format!("{UNIT_NAME} installed and enabled: it runs after every dockerd start")),
+        Some(State::Disabled) => warn(NAME, format!("{UNIT_NAME} is installed but not enabled: {lose}"), Some(REMEDY.into())),
+        Some(State::Stale) => warn(NAME, format!("{UNIT_NAME} is not the unit this install writes (older, or for a moved install): {lose}"), Some(REMEDY.into())),
+        Some(State::Missing) | None => warn(NAME, format!("{UNIT_NAME} is not installed: {lose}"), Some(REMEDY.into())),
+    }
+}
+
+fn netns_restore_row_here(root: &std::path::Path) -> Check {
+    use crate::netns_unit as nu;
+    let systemd = nu::systemd_here();
+    let state = systemd.then(|| nu::render(&nu::owner(), &root.display().to_string()).ok().map(|u| nu::state(&u))).flatten();
+    netns_restore_row(systemd, state)
+}
+
 pub(crate) fn noo_data_bound_row(root: &std::path::Path) -> Check {
     let env = root.join(".env");
     let state = crate::onboard::env::read_env_key(&env, "NOO_STATE_ROOT");
@@ -7355,6 +7380,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             .collect();
         checks.push(cert_expiry_row(&certs));
         checks.push(noo_data_bound_row(&crate::envfile::repo_root()));
+        checks.push(netns_restore_row_here(&crate::envfile::repo_root()));
         // i67: the controller's own node (when this box runs one) rides the rail.
         if let Some(me) = crate::commands::provision::self_node_name()
             .filter(|_| std::path::Path::new("/usr/local/bin/noo-node-agent").is_file())
@@ -14061,5 +14087,32 @@ mod reservation_pause_tests {
         // the workload holding it (an operator's voice session, 11-12).
         assert!(!r.starts_with("noo cluster gpu release"), "a live reservation's remedy must not be the release: {r}");
         assert!(r.starts_with("nothing to do: released when rhaddon/worker ends; to end it early (stops rhaddon/worker): noo cluster gpu release awolf --operation 58586ceb --generation 6"), "{r}");
+    }
+}
+
+#[cfg(test)]
+mod netns_restore_row_tests {
+    use super::*;
+    use crate::netns_unit::State;
+
+    #[test]
+    fn the_row_shows_whether_the_unit_runs_after_every_dockerd_start() {
+        assert_eq!(netns_restore_row(true, Some(State::Current)).verdict, Verdict::Ok);
+        for s in [Some(State::Missing), Some(State::Stale), Some(State::Disabled), None] {
+            let c = netns_restore_row(true, s);
+            assert_eq!(c.verdict, Verdict::Warn, "{s:?}");
+            assert_eq!(c.remedy.as_deref(), Some(crate::netns_unit::REMEDY), "{s:?}");
+            assert!(c.detail.contains("noo-ollama-embed"), "{}", c.detail);
+        }
+        let c = netns_restore_row(false, None);
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("no systemd") && c.detail.contains("not covered"), "{}", c.detail);
+    }
+
+    #[test]
+    fn the_controller_run_has_the_row() {
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let run = crate::test_src::fn_body(&own, "pub fn cluster_verify(");
+        assert!(run.contains("checks.push(netns_restore_row_here(&crate::envfile::repo_root()));"), "{run}");
     }
 }

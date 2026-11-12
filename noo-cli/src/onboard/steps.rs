@@ -8095,7 +8095,7 @@ pub fn addons(ctx: &mut Ctx) {
 
 /// Write `body` to the root-owned `path` (root:root 0644) with `sudo tee`:
 /// the content goes over stdin, never through a shell string.
-fn sudo_write_root_file(may_prompt: bool, path: &str, body: &str) -> Result<(), String> {
+pub(crate) fn sudo_write_root_file(may_prompt: bool, path: &str, body: &str) -> Result<(), String> {
     use std::process::Stdio;
     let mut child = sudo_cmd(may_prompt)
         .args(["tee", path])
@@ -8119,79 +8119,39 @@ fn sudo_write_root_file(may_prompt: bool, path: &str, body: &str) -> Result<(), 
     Ok(())
 }
 
-/// The unit that runs scripts/noo-netns-restore.sh at every dockerd start.
-pub(crate) const NETNS_UNIT_NAME: &str = "noo-netns-restore.service";
-pub(crate) const NETNS_UNIT_PATH: &str = "/etc/systemd/system/noo-netns-restore.service";
-
-/// The unit text. Tied to docker.service on both sides: WantedBy= starts it
-/// whenever dockerd starts (boot included), PartOf= re-runs it when dockerd is
-/// restarted or upgraded, After= orders it behind dockerd's own restore. Runs
-/// as the install owner (in the docker group): the script lives in the
-/// owner's install, so root never executes a file the owner can write. Pure.
-pub(crate) fn render_netns_unit(owner: &str, install_root: &str) -> Result<String, String> {
-    if owner.is_empty() || owner == "root" || !owner.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) {
-        return Err(format!("not a usable install owner for the unit: {owner:?}"));
-    }
-    if !install_root.starts_with('/') || install_root.contains(['"', '\n', '\\', '%']) {
-        return Err(format!("not a usable install path for the unit: {install_root:?}"));
-    }
-    Ok(format!(
-        "[Unit]\n\
-         Description=noomesh: start the containers that join another's network after dockerd starts\n\
-         After=docker.service\n\
-         PartOf=docker.service\n\
-         \n\
-         [Service]\n\
-         Type=oneshot\n\
-         RemainAfterExit=yes\n\
-         User={owner}\n\
-         ExecStart=/bin/bash \"{install_root}/scripts/noo-netns-restore.sh\"\n\
-         \n\
-         [Install]\n\
-         WantedBy=docker.service\n"
-    ))
-}
-
 /// Controller with systemd: install and enable noo-netns-restore.service (rc.2
 /// install matrix: one dockerd start in five left noo-ollama-embed exited 128,
 /// "cannot join network namespace of a non running container", and dockerd
 /// never retries it). Without systemd nothing is installed here; noo-hostd's
 /// boot-restore runs the same script at boot.
 pub fn install_netns_restore_unit(ctx: &mut Ctx) {
+    use crate::netns_unit as nu;
     if ctx.state.mode == "worker" {
         return;
     }
-    if !Path::new("/run/systemd/system").is_dir() {
+    if !nu::systemd_here() {
         ctx.info("No systemd here: the namespace restore runs at boot through noo-hostd only.");
         return;
     }
-    let owner = Command::new("id").arg("-un").output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
-    let unit = match render_netns_unit(&owner, &ctx.repo_root.display().to_string()) {
+    let unit = match nu::render(&nu::owner(), &ctx.repo_root.display().to_string()) {
         Ok(u) => u,
         Err(e) => {
-            ctx.warn(&format!("{NETNS_UNIT_NAME} not installed: {e}"));
+            ctx.warn(&format!("{} not installed: {e}", nu::UNIT_NAME));
             return;
         }
     };
     if ctx.dry_run {
-        ctx.dry(&format!("install and enable {NETNS_UNIT_NAME}"));
+        ctx.dry(&format!("install and enable {}", nu::UNIT_NAME));
         return;
     }
-    let may_prompt = ctx_sudo_may_prompt(ctx);
-    let installed = (|| -> Result<(), String> {
-        sudo_write_root_file(may_prompt, NETNS_UNIT_PATH, &unit)?;
-        for argv in [&["systemctl", "daemon-reload"][..], &["systemctl", "enable", NETNS_UNIT_NAME][..]] {
-            if !sudo_cmd(may_prompt).args(argv).status().map(|s| s.success()).unwrap_or(false) {
-                return Err(format!("`sudo {}` failed", argv.join(" ")));
-            }
-        }
-        Ok(())
-    })();
-    match installed {
-        Ok(()) => ctx.success(&format!("{NETNS_UNIT_NAME} is enabled: after every dockerd start, a container that joins another's network is started once its door is up.")),
+    if nu::state(&unit) == nu::State::Current {
+        return;
+    }
+    match nu::install(ctx_sudo_may_prompt(ctx), &unit) {
+        Ok(()) => ctx.success(&format!("{} is enabled: after every dockerd start, a container that joins another's network is started once its door is up.", nu::UNIT_NAME)),
         Err(e) => {
-            ctx.warn(&format!("{NETNS_UNIT_NAME} not installed: {e}"));
-            sudo_refused(ctx, "the namespace restore unit", "noo onboard --only services");
+            ctx.warn(&format!("{} not installed: {e}", nu::UNIT_NAME));
+            sudo_refused(ctx, "the namespace restore unit", nu::REMEDY);
         }
     }
 }
@@ -10153,27 +10113,6 @@ mod self_upgrade_tests {
 
 #[cfg(test)]
 mod netns_unit_tests {
-    use super::{render_netns_unit, NETNS_UNIT_NAME};
-
-    #[test]
-    fn the_unit_runs_at_every_dockerd_start_as_the_owner() {
-        let u = render_netns_unit("alex", "/home/alex/.noo").unwrap();
-        for line in ["After=docker.service", "PartOf=docker.service", "WantedBy=docker.service", "Type=oneshot",
-                     "User=alex", "ExecStart=/bin/bash \"/home/alex/.noo/scripts/noo-netns-restore.sh\""] {
-            assert!(u.lines().any(|l| l == line), "{line} missing:\n{u}");
-        }
-        assert_eq!(NETNS_UNIT_NAME, "noo-netns-restore.service");
-    }
-
-    #[test]
-    fn root_and_odd_paths_are_refused() {
-        assert!(render_netns_unit("root", "/root/.noo").is_err(), "root never runs the owner's script");
-        assert!(render_netns_unit("a b", "/x").is_err());
-        assert!(render_netns_unit("alex", "relative").is_err());
-        assert!(render_netns_unit("alex", "/a\"b").is_err());
-        assert!(render_netns_unit("alex", "/a%b").is_err());
-    }
-
     #[test]
     fn onboard_installs_it_in_the_services_section() {
         let m = crate::test_src::own_code(include_str!("mod.rs"));

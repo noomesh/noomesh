@@ -422,6 +422,21 @@ pub fn offboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     }
 
+    // The namespace restore unit (#1108): we remove what onboard and the
+    // stack stage install.
+    if Path::new(crate::netns_unit::UNIT_PATH).is_file() {
+        item("namespace restore unit");
+        if yes || ctx_confirm(g, false, &format!("Remove {} (it restarts the stack's namespace-joined containers after dockerd starts)?", crate::netns_unit::UNIT_NAME), false) {
+            // SAFETY: isatty has no preconditions.
+            match crate::netns_unit::remove(unsafe { libc::isatty(0) } == 1) {
+                Ok(_) => sub(Glyph::Ok, &format!("{} removed", crate::netns_unit::UNIT_NAME)),
+                Err(e) => sub(Glyph::Warn, &format!("{e} — by hand: {}", crate::netns_unit::manual_removal())),
+            }
+        } else {
+            sub(Glyph::Bullet, "kept (skipped)");
+        }
+    }
+
     // ── 2. Storage root (bind-mounted data) ─────────────────────────────
     // Only with an install to read it from: the path comes from the
     // install's own .env, NEVER guessed — so residue mode (no .env left)
@@ -935,6 +950,7 @@ fn audit_leftovers(g: &Globals, print: bool) -> Vec<String> {
         Path::new("/usr/local/bin/noo-hostd").is_file()
             || Path::new("/etc/systemd/system/noo-hostd.service").is_file(),
         "binary/unit still installed".into());
+    item("namespace restore unit", Path::new(crate::netns_unit::UNIT_PATH).is_file(), crate::netns_unit::UNIT_PATH.into());
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
     let left = self_heal_unit_leftovers(&home);
     item("self-heal user units (host-watcher, noo-hostd)", !left.is_empty(),
@@ -1465,5 +1481,19 @@ mod self_heal_unit_tests {
         assert!(stop.contains("remove_self_heal_units(Path::new(&h));"), "{stop}");
         let audit = crate::test_src::fn_body(&own, "fn audit_leftovers(");
         assert!(audit.contains("self_heal_unit_leftovers(&home)"), "{audit}");
+    }
+}
+
+#[cfg(test)]
+mod netns_unit_offboard_tests {
+    /// We remove what we install: the walk removes noo-netns-restore.service
+    /// and the audit lists it if it survives (#1108).
+    #[test]
+    fn offboard_removes_and_audits_the_namespace_restore_unit() {
+        let own = crate::test_src::own_code(include_str!("offboard.rs"));
+        let walk = crate::test_src::fn_body(&own, "pub fn offboard(");
+        assert!(walk.contains("crate::netns_unit::remove(unsafe { libc::isatty(0) } == 1)"), "{walk}");
+        let audit = crate::test_src::fn_body(&own, "fn audit_leftovers(");
+        assert!(audit.contains(r#"item("namespace restore unit", Path::new(crate::netns_unit::UNIT_PATH).is_file()"#), "{audit}");
     }
 }

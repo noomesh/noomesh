@@ -1186,6 +1186,7 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     // Everything the launcher's bind checks and the new compose expect.
     reconcile_service_certs(g);
     reconcile_grafana_door(g, &roll.root);
+    reconcile_netns_unit(g, &roll.root);
     sync_gateway_pki_view(g);
     crate::commands::voice_models::stage_if_on(g);
     reconcile_addon_nats_principals(g, &roll.root);
@@ -2717,6 +2718,49 @@ fn reconcile_short_service_certs(
 /// before the launcher, so the roll recreates the gateway and Grafana with
 /// them. One line per change; silent when there is none. Never fails the
 /// roll: `noo cluster verify` FAILs the `grafana door` row instead.
+/// Whether the stack stage should (re)install noo-netns-restore.service. Pure.
+pub(crate) fn netns_unit_needs_install(systemd: bool, state: crate::netns_unit::State) -> bool {
+    systemd && state != crate::netns_unit::State::Current
+}
+
+/// The stack stage (`noo upgrade --stack` and `--all`), on the controller this
+/// command runs on, never a remote node: install or refresh
+/// noo-netns-restore.service, which installs onboarded before rc.3 lack. On a
+/// terminal sudo may ask once, with the reason on the line above; off a
+/// terminal `sudo -n`, and a refusal is a warning naming the one command.
+/// Never fails the roll; `noo cluster verify` shows the `netns restore` row.
+fn reconcile_netns_unit(g: &Globals, root: &std::path::Path) {
+    use crate::netns_unit as nu;
+    let systemd = nu::systemd_here();
+    if !systemd {
+        return;
+    }
+    let unit = match nu::render(&nu::owner(), &root.display().to_string()) {
+        Ok(u) => u,
+        Err(e) => {
+            if !g.json { ui::warned(&format!("{} not installed: {e}", nu::UNIT_NAME)); }
+            return;
+        }
+    };
+    if !netns_unit_needs_install(systemd, nu::state(&unit)) {
+        return;
+    }
+    // SAFETY: isatty has no preconditions.
+    let tty = !g.json && unsafe { libc::isatty(0) } == 1;
+    if tty {
+        ui::step(&format!("installing {}: it starts the containers that join another's network after every dockerd start (sudo may ask)", nu::UNIT_NAME));
+    }
+    match nu::install(tty, &unit) {
+        Ok(()) => { if !g.json { ui::done(&format!("{} installed and enabled", nu::UNIT_NAME)); } }
+        Err(e) => {
+            if !g.json {
+                ui::warned(&format!("{} not installed ({e}): after a reboot or a dockerd restart, a container that joins another's network (noo-ollama-embed) can stay down", nu::UNIT_NAME));
+                ui::guide(&[(nu::REMEDY, "run it in a terminal: sudo asks once and the stack stage installs the unit")]);
+            }
+        }
+    }
+}
+
 fn reconcile_grafana_door(g: &Globals, root: &std::path::Path) {
     use super::grafana_door as gd;
     let env_path = root.join(".env");
@@ -7897,5 +7941,29 @@ mod roll_marker_tests {
         assert_eq!(own.matches("record_roll();").count(), 2, "stack and nodes stages");
         assert!(own.contains("ui::guide(&[(VERIFY_AFTER_ROLL, VERIFY_AFTER_ROLL_WHY)]);"));
         assert_eq!(VERIFY_AFTER_ROLL, "noo cluster verify --wait");
+    }
+}
+
+#[cfg(test)]
+mod netns_reconcile_tests {
+    use super::netns_unit_needs_install;
+    use crate::netns_unit::State;
+
+    #[test]
+    fn the_stack_stage_installs_a_missing_stale_or_disabled_unit_on_systemd_only() {
+        for s in [State::Missing, State::Stale, State::Disabled] {
+            assert!(netns_unit_needs_install(true, s), "{s:?}");
+            assert!(!netns_unit_needs_install(false, s), "no systemd: {s:?}");
+        }
+        assert!(!netns_unit_needs_install(true, State::Current));
+    }
+
+    /// The stack stage (also under --all) reconciles it with the other local
+    /// state, before the launcher.
+    #[test]
+    fn the_stack_stage_calls_the_reconcile() {
+        let own = crate::test_src::own_code(include_str!("upgrade.rs"));
+        let body = crate::test_src::fn_body(&own, "fn upgrade_stack(");
+        assert!(body.contains("reconcile_netns_unit(g, &roll.root);"), "{body}");
     }
 }
