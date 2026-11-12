@@ -64,13 +64,29 @@ fn offer_self_upgrade(ctx: &mut Ctx) {
     }
 }
 
+/// The tools onboard REQUIRES. git only for a source checkout: a release
+/// install (standalone, `~/.noo`) never runs it. The launcher's only git call
+/// there is a `git tag -l 'stack-v*' 2>/dev/null` fallback after NOO_IMAGE_TAG,
+/// which onboard always writes. install.md says the same ("git only for a
+/// contributor checkout"); requiring it everywhere stopped a stranger's
+/// install at "git: MISSING" (i677).
+fn required_tools(in_checkout: bool) -> Vec<(&'static str, &'static str)> {
+    let mut tools = vec![("docker", "Runs all Noomesh services")];
+    if in_checkout {
+        tools.push(("git", "Version control (this is a source checkout)"));
+    }
+    tools
+}
+
 pub fn prerequisites(ctx: &mut Ctx) -> bool {
     offer_self_upgrade(ctx);
     let mut all_ok = true;
     let mut missing_apt: Vec<&str> = Vec::new(); // plain apt packages
     let mut docker_missing = false;
+    let in_checkout = crate::envfile::repo_root().join(".git").exists();
+    let required = required_tools(in_checkout);
 
-    for (tool, purpose) in [("docker", "Runs all Noomesh services"), ("git", "Version control")] {
+    for &(tool, purpose) in &required {
         match tool_version(tool) {
             Some(v) => ctx.success(&format!("{tool}: {v}")),
             None => {
@@ -205,7 +221,7 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
                 ctx.warn("Docker install failed — see https://docs.docker.com/engine/install/");
             }
             // Re-check the required pair after installs.
-            all_ok = tool_version("docker").is_some() && tool_version("git").is_some();
+            all_ok = required.iter().all(|&(tool, _)| tool_version(tool).is_some());
         }
     }
 
@@ -9704,5 +9720,32 @@ mod services_after_failure_tests {
         let r: Result<u8, ()> = super::retry_once(|| { tries += 1; Ok(1) }, || waits += 1);
         assert_eq!(r, Ok(1));
         assert_eq!((tries, waits), (1, 0), "a first success is not retried");
+    }
+}
+
+#[cfg(test)]
+mod required_tools_tests {
+    use super::*;
+
+    /// A release install (standalone, no checkout) requires Docker only; a
+    /// source checkout also requires git (i677: "git: MISSING" stopped a
+    /// stranger's release install, against install.md).
+    #[test]
+    fn git_is_required_only_in_a_source_checkout() {
+        let names = |c: bool| required_tools(c).into_iter().map(|(t, _)| t).collect::<Vec<_>>();
+        assert_eq!(names(false), ["docker"]);
+        assert_eq!(names(true), ["docker", "git"]);
+    }
+
+    /// The prerequisite check and its post-install re-check both judge the
+    /// same list, and decide the checkout from the repo root's `.git`.
+    #[test]
+    fn the_prerequisite_check_and_its_recheck_use_required_tools() {
+        let code = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&code, "pub fn prerequisites(");
+        assert!(body.contains("let in_checkout = crate::envfile::repo_root().join(\".git\").exists();"), "{body}");
+        assert!(body.contains("for &(tool, purpose) in &required {"), "{body}");
+        assert!(body.contains("all_ok = required.iter().all(|&(tool, _)| tool_version(tool).is_some());"), "{body}");
+        assert!(!body.contains("tool_version(\"git\")"), "git is never checked on its own: {body}");
     }
 }

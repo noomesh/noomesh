@@ -185,6 +185,8 @@ pub fn offboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     ui::done("self-heal daemons stopped, watcher unit removed");
 
     let prefix = crate::envfile::container_prefix();
+    // What this walk set out to remove (the user agreed, or -y) and could not.
+    let mut removal_failed: Vec<String> = Vec::new();
 
     // ── 0b. Enrolled workers = future ORPHANS (finding #72) ─────────────
     // This is the LAST moment the controller knows its workers exist. A
@@ -234,33 +236,8 @@ pub fn offboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 
     // ── 1. Stack: containers, volumes, networks ─────────────────────────
     let containers = docker_lines(&["ps", "-aq", "--filter", &format!("name={prefix}-")]);
-    // Compose volumes carry the PROJECT name (noomesh_*), not the container
-    // prefix (noo-*): the old `{prefix}_` filter matched NOTHING since the
-    // rename, so offboard deleted containers and left every volume behind —
-    // stale device-bound objects then ambushed the next onboard twice
-    // (2026-09-01). Match by compose-project label, with the name prefixes
-    // as belt for label-less legacy volumes.
-    let volumes = docker_lines(&[
-        "volume", "ls", "--format",
-        "{{.Name}}\t{{.Labels}}",
-    ])
-    .into_iter()
-    .filter_map(|line| {
-        let (name, labels) = line.split_once('\t').unwrap_or((line.as_str(), ""));
-        let project_match = labels
-            .split(',')
-            .filter_map(|kv| kv.split_once('='))
-            .any(|(k, v)| {
-                k == "com.docker.compose.project"
-                    && (v == "noomesh" || v.starts_with("noomesh-") || v == "pai-assistant")
-            });
-        (project_match
-            || name.starts_with("noomesh_")
-            || name.starts_with("pai-assistant_")
-            || name.starts_with(&format!("{prefix}_")))
-        .then(|| name.to_string())
-    })
-    .collect::<Vec<_>>();
+    let project = crate::envfile::compose_project();
+    let volumes = stack_volumes(&project);
     item("stack");
     if (!containers.is_empty() || !volumes.is_empty())
         && !(yes || ctx_confirm(g, false,
@@ -274,6 +251,9 @@ pub fn offboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         for v in &volumes {
             run("docker", &["volume".into(), "rm".into(), "-f".into(), v.clone()]);
         }
+        // Agreed to and attempted: whatever is still there is a FAILURE of
+        // this offboard, not a choice. It fails the walk below (i677a).
+        removal_failed.extend(stack_volumes(&project).into_iter().map(|v| format!("volume {v}")));
         for n in docker_lines(&["network", "ls", "--format", "{{.Name}}"]) {
             if n == "noo-cluster" || n.starts_with(&format!("{prefix}_")) {
                 run("docker", &["network".into(), "rm".into(), n]);
@@ -679,6 +659,16 @@ pub fn offboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // what is actually left rather than a hopeful "complete".
     println!("{}", ui::phase("Verify"));
     let left = audit_leftovers(g, false);
+    if !removal_failed.is_empty() {
+        // Agreed to, attempted, still there: never "complete" (i677a). A
+        // clean verdict that cannot see what it was asked to remove is the
+        // failure this phase exists to prevent.
+        ui::close_failed(
+            &format!("offboard did NOT remove what it was asked to: {}", removal_failed.join(", ")),
+            Some("noo offboard --check"),
+        );
+        return Ok(1);
+    }
     if left.is_empty() {
         ui::done("nothing left — this box is fresh");
     } else {
@@ -808,8 +798,10 @@ fn audit_leftovers(g: &Globals, print: bool) -> Vec<String> {
         Some(root) => item("checkout controller state", true, format!("{} carries .env + noomesh.yaml (noo offboard retires it to a backup)", root.display())),
         None => item("checkout controller state", false, String::new()),
     }
-    let volumes = docker_lines(&["volume", "ls", "-q"]).into_iter()
-        .filter(|v| v.starts_with(&format!("{prefix}_"))).count();
+    // The SAME selector the removal uses: this audit once counted `{prefix}_`
+    // (default `noo_`) and could not see a `noomesh_*` volume the removal had
+    // failed to delete, so a failed removal still read "clean" (i677a).
+    let volumes = stack_volumes(&crate::envfile::compose_project()).len();
     item("stack volumes", volumes > 0, format!("{volumes} present"));
 
     let home = crate::onboard::standalone::default_home();
@@ -889,6 +881,34 @@ fn audit_leftovers(g: &Globals, print: bool) -> Vec<String> {
 
 // ── helpers ─────────────────────────────────────────────────────────────
 
+/// This install's Docker volumes, by name: the ones offboard deletes and the
+/// ones its audit (`--check`, and the walk's own Verify) must not find.
+fn stack_volumes(project: &str) -> Vec<String> {
+    select_stack_volumes(&docker_lines(&["volume", "ls", "--format", "{{.Name}}\t{{.Labels}}"]), project)
+}
+
+/// Pure selection over `docker volume ls --format '{{.Name}}\t{{.Labels}}'`
+/// lines: exactly the volumes whose `com.docker.compose.project` label IS
+/// this install's project. Never a name glob. A box can run several stacks
+/// (`noo-<instance>`, a dev checkout, someone else's compose project), and a
+/// prefix match once reached across them. The old `{prefix}_` filter matched
+/// nothing after the project rename (2026-09-01), and the `noomesh_*`
+/// fallback that replaced it would also take `noomesh_*` volumes of a
+/// different project.
+fn select_stack_volumes(lines: &[String], project: &str) -> Vec<String> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let (name, labels) = line.split_once('\t')?;
+            labels
+                .split(',')
+                .filter_map(|kv| kv.split_once('='))
+                .any(|(k, v)| k == "com.docker.compose.project" && v == project)
+                .then(|| name.to_string())
+        })
+        .collect()
+}
+
 fn docker_lines(args: &[&str]) -> Vec<String> {
     Command::new("docker").args(args).output().ok()
         .filter(|o| o.status.success())
@@ -938,5 +958,79 @@ fn run(cmd: &str, args: &[String]) {
         Ok(s) if s.success() => {}
         Ok(s) => ui::warned(&format!("{cmd} {} exited {}", args.join(" "), s.code().unwrap_or(-1))),
         Err(e) => ui::warned(&format!("could not run {cmd}: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod volume_selection_tests {
+    use super::*;
+
+    fn lines(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    const LS: &[&str] = &[
+        "noomesh_postgres-data\tcom.docker.compose.project=noomesh,com.docker.compose.volume=postgres-data",
+        "noomesh_noo-data\tcom.docker.compose.volume=noo-data,com.docker.compose.project=noomesh",
+        "renamed_by_hand\tcom.docker.compose.project=noomesh",
+        "noo-galaxy_noo-data\tcom.docker.compose.project=noo-galaxy",
+        "noomesh-dev_cache\tcom.docker.compose.project=noomesh-dev",
+        "noomesh_not_ours\tcom.docker.compose.project=someone-else",
+        "noomesh_unlabelled\t",
+        "noo_legacy\t",
+        "pai-assistant_hf-cache\t",
+        "no-tab-at-all",
+    ];
+
+    /// Exactly this install's project, by label. Another instance, a dev
+    /// project, another project's `noomesh_*` volume and unlabelled names are
+    /// never selected: a box runs several stacks (i677a).
+    #[test]
+    fn only_this_projects_labelled_volumes_are_selected() {
+        assert_eq!(
+            select_stack_volumes(&lines(LS), "noomesh"),
+            ["noomesh_postgres-data", "noomesh_noo-data", "renamed_by_hand"],
+        );
+        assert_eq!(select_stack_volumes(&lines(LS), "noo-galaxy"), ["noo-galaxy_noo-data"]);
+        assert!(select_stack_volumes(&lines(LS), "noomesh-d").is_empty(), "no prefix match on the label either");
+    }
+
+    /// The project name mirrors scripts/lib-instance.sh.
+    #[test]
+    fn the_compose_project_mirrors_the_launcher() {
+        use crate::envfile::project_for;
+        assert_eq!(project_for("", None), "noomesh");
+        assert_eq!(project_for("galaxy", None), "noo-galaxy");
+        assert_eq!(project_for("galaxy", Some("custom")), "custom");
+        assert_eq!(project_for("", Some(" \"\" ")), "noomesh", "a blank override is no override");
+    }
+
+    /// The audit (`noo offboard --check`, and the walk's own Verify) counts
+    /// with the SAME selector and project the removal deletes with. It once
+    /// counted `{prefix}_` (`noo_`) and could not see a `noomesh_*` volume a
+    /// failed removal left, so the leftover read "clean" (i677a).
+    #[test]
+    fn the_audit_and_the_removal_share_one_selector_and_project() {
+        let code = crate::test_src::own_code(include_str!("offboard.rs"));
+        let audit = crate::test_src::fn_body(&code, "fn audit_leftovers(");
+        assert!(audit.contains("stack_volumes(&crate::envfile::compose_project()).len()"), "{audit}");
+        assert_eq!(code.matches("stack_volumes(&project)").count(), 2, "the removal and its re-check, nothing else");
+        assert_eq!(code.matches("\"volume\", \"ls\"").count(), 1, "one volume listing, inside stack_volumes");
+    }
+
+    /// Volumes the walk was asked to remove and that are still there fail it:
+    /// exit 1 before any "complete" line.
+    #[test]
+    fn a_volume_that_survives_its_removal_fails_the_walk() {
+        let code = crate::test_src::own_code(include_str!("offboard.rs"));
+        let walk = crate::test_src::fn_body(&code, "pub fn offboard(");
+        let recheck = walk
+            .find("removal_failed.extend(stack_volumes(&project)")
+            .expect("the removal re-checks its own volumes");
+        let fail = walk.find("if !removal_failed.is_empty() {").expect("the walk judges it");
+        let complete = walk.find("ui::close_done(\"offboard complete\")").expect("the success line");
+        assert!(recheck < fail && fail < complete, "{walk}");
+        let judged = &walk[fail..complete];
+        assert!(judged.contains("ui::close_failed(") && judged.contains("return Ok(1);"), "{judged}");
     }
 }
