@@ -6,6 +6,7 @@ package messaging
 import (
 	"encoding/json"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -93,6 +94,12 @@ func buildOffer(
 			continue
 		}
 		if info.URL == "" {
+			continue
+		}
+		// i677 #12: a backend running with nothing placed and nothing loaded
+		// reports model "". Offering it sent the gateway a request with
+		// "model": "" and ollama's 400 "model is required". No model, no offer.
+		if strings.TrimSpace(info.Model) == "" {
 			continue
 		}
 		apiFormat := info.APIFormat
