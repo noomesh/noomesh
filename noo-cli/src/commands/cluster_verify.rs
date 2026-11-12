@@ -7671,14 +7671,15 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // the same /metrics text, node counts from each node record.
         // Each node's last apply report, for the
         // retired apply lanes (a refusal is a node that kept its old state).
-        let apply_reports: Vec<(String, Option<i64>, String)> = fleet
-            .iter()
-            .filter_map(|n| n["id"].as_str())
-            .filter_map(|id| {
-                let st = get_json_opt(g, &format!("/api/cluster/provision-bundle/{id}/status"), true, 10)?;
-                Some((id.to_string(), st["apply_rc"].as_i64(), st["apply_msg"].as_str().unwrap_or("").to_string()))
-            })
-            .collect();
+        // One read per node, side by side (serially ~0.7 s each on awolf).
+        let bundle_ids: Vec<&str> = fleet.iter().filter_map(|n| n["id"].as_str()).collect();
+        let apply_reports: Vec<(String, Option<i64>, String)> = par_map(&bundle_ids, |id| {
+            let st = get_json_opt(g, &format!("/api/cluster/provision-bundle/{id}/status"), true, 10)?;
+            Some((id.to_string(), st["apply_rc"].as_i64(), st["apply_msg"].as_str().unwrap_or("").to_string()))
+        })
+        .into_iter()
+        .flatten()
+        .collect();
         let unadopted: Vec<String> = fleet
             .iter()
             .filter_map(|n| n["id"].as_str())
@@ -13619,6 +13620,7 @@ mod speed_tests {
         assert!(run.contains("par_map(&selected, |n| with_harness_wanted(g, n))"), "node reads run side by side");
         assert!(run.contains("par_map(&reads, |w| self_json(g, w))"), "the security/doctor verbs run side by side");
         assert!(run.contains("par_map(&fit_ids,"), "the per-node fit reads run side by side");
+        assert!(run.contains("par_map(&bundle_ids,"), "the per-node apply reports run side by side");
         // `addons verify` alone stays where it is: it runs only when a
         // licensed add-on is on, decided from noomesh.yaml after the batch.
         assert_eq!(run.matches("= self_json(g,").count(), 1, "no other verb runs on its own, one after another");

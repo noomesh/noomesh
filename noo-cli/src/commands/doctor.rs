@@ -541,8 +541,21 @@ pub(crate) fn fingerprint(value: &str) -> String {
     d.iter().take(5).map(|b| format!("{b:02x}")).collect()
 }
 
+type ContainerEnv = std::collections::BTreeMap<String, String>;
+
+/// [`container_env`] read once per container per run: every secret a
+/// container holds used to cost its own `docker inspect` (34 of them for the
+/// gateway alone, ~3 s of `noo doctor secrets` and of `cluster verify`).
+fn container_env_cached<'a>(
+    cache: &'a mut std::collections::HashMap<String, Option<ContainerEnv>>,
+    name: &str,
+    read: impl FnOnce(&str) -> Option<ContainerEnv>,
+) -> Option<&'a ContainerEnv> {
+    cache.entry(name.to_string()).or_insert_with(|| read(name)).as_ref()
+}
+
 /// A container's environment as a map, or None when it is not running here.
-fn container_env(name: &str) -> Option<std::collections::BTreeMap<String, String>> {
+fn container_env(name: &str) -> Option<ContainerEnv> {
     let out = std::process::Command::new("docker")
         .args(["inspect", "-f", "{{range .Config.Env}}{{println .}}{{end}}", name])
         .output()
@@ -581,13 +594,14 @@ pub fn doctor_secrets(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut split = 0usize;
     let mut checked = 0usize;
+    let mut envs: std::collections::HashMap<String, Option<ContainerEnv>> = std::collections::HashMap::new();
     for spec in crate::commands::secrets::registry() {
         // (container, value) for every declared consumer running here.
         let held: Vec<(String, String)> = spec
             .consumers
             .iter()
             .filter_map(|c| {
-                let env = container_env(c)?;
+                let env = container_env_cached(&mut envs, c, container_env)?;
                 let v = env.get(spec.key)?.clone();
                 Some(((*c).to_string(), v))
             })
@@ -2324,5 +2338,33 @@ mod secret_drift_tests {
         assert_ne!(short, long);
         assert_ne!(fingerprint("old-secret"), fingerprint("new-secret"));
         assert_eq!(fingerprint("same"), fingerprint("same"), "a digest must be stable");
+    }
+}
+
+#[cfg(test)]
+mod container_env_cache_tests {
+    use super::*;
+
+    #[test]
+    fn each_container_is_inspected_once_per_run() {
+        let mut cache = std::collections::HashMap::new();
+        let mut reads = 0;
+        for name in ["noo-gateway", "noo-gateway", "noo-worker", "noo-gateway", "gone", "gone"] {
+            let _ = container_env_cached(&mut cache, name, |n| {
+                reads += 1;
+                (n != "gone").then(|| ContainerEnv::from([("K".to_string(), n.to_string())]))
+            });
+        }
+        assert_eq!(reads, 3, "one inspect per container, a missing one included");
+        assert_eq!(container_env_cached(&mut cache, "noo-worker", |_| None).unwrap()["K"], "noo-worker");
+        assert!(container_env_cached(&mut cache, "gone", |_| panic!("not re-read")).is_none());
+    }
+
+    #[test]
+    fn doctor_secrets_reads_through_the_cache() {
+        let own = crate::test_src::own_code(include_str!("doctor.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn doctor_secrets(");
+        assert!(body.contains("container_env_cached(&mut envs, c, container_env)"));
+        assert!(!body.contains("container_env(c)"), "no per-secret inspect");
     }
 }
