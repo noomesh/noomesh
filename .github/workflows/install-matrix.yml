@@ -72,6 +72,7 @@ jobs:
         with:
           persist-credentials: false
           sparse-checkout: |
+            README.md
             scripts/install-cell
             scripts/ci-free-disk.sh
           sparse-checkout-cone-mode: false
@@ -111,7 +112,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-          sparse-checkout: scripts/install-cell
+          sparse-checkout: |
+            README.md
+            scripts/install-cell
           sparse-checkout-cone-mode: false
       - name: WSL2 + Ubuntu 24.04   # Vampire/setup-wsl v7.2.0
         # Run 1 (2026-11-12) never finished this step in 45 min: cap it so a

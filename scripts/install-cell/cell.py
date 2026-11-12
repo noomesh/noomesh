@@ -46,6 +46,14 @@ LONG_B64 = re.compile(r"(?<![A-Za-z0-9+/=_\-])[A-Za-z0-9+/_\-]{40,}={0,2}(?![A-Z
 SHA_LIKE = re.compile(r"^(?:sha256:)?[0-9a-f]{40,64}$")
 
 
+def looks_random(run: str) -> bool:
+    """A long run worth masking: random base64 of 40+ characters mixes upper
+    case, lower case and digits; a URL path or a digest does not (run 3,
+    2026-11-12: the README's install URL read as a 'long base64 run')."""
+    return (not SHA_LIKE.match(run) and bool(re.search(r"[A-Z]", run))
+            and bool(re.search(r"[a-z]", run)) and bool(re.search(r"[0-9]", run)))
+
+
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 # A secret revealed on its own line under its name (onboard's reveal_secret,
 # prompt.rs: "  NOO_AGE_BACKUP_PASSPHRASE" then the value alone): the name
@@ -75,7 +83,7 @@ def redact_line(line: str, state: dict) -> str:
     out = SECRET_SHAPES[2].sub(MASK, out)
     out = SECRET_SHAPES[3].sub(lambda m: m.group(1) + m.group(2) + MASK, out)
     # Long base64-ish runs; digests (hex, sha256:) stay readable on purpose.
-    out = LONG_B64.sub(lambda m: m.group(0) if SHA_LIKE.match(m.group(0)) else MASK, out)
+    out = LONG_B64.sub(lambda m: MASK if looks_random(m.group(0)) else m.group(0), out)
     return out
 
 
@@ -97,7 +105,7 @@ def secret_hits(text: str) -> list[str]:
         if m and m.group(3) != MASK:
             hits.append(f"{i}: {m.group(1).strip()} value")
         for b in LONG_B64.findall(probe):
-            if not SHA_LIKE.match(b):
+            if looks_random(b):
                 hits.append(f"{i}: long base64 run")
     return hits
 

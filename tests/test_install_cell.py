@@ -60,6 +60,9 @@ def test_a_pem_block_is_masked_whole_and_digests_stay_readable():
     assert "MIIEv" not in out and "abc" not in out and out.endswith("after\n")
     digest = "sha256:" + "ab" * 32
     assert digest in _redact(f"image digest {digest}\n"), "a digest is evidence, not a secret"
+    url = "curl -fsSL https://github.com/noomesh/noomesh/releases/latest/download/install.sh -o install.sh"
+    assert _redact(url + "\n").strip() == url, "a URL is evidence too (run 3)"
+    assert not C.secret_hits(url)
 
 
 def test_a_secret_revealed_under_its_name_is_masked_and_scanned():

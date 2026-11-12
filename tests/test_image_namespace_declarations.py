@@ -261,7 +261,6 @@ HOMES = {
     "docker/Dockerfile.piper": "ARG HUB_MIRROR default, pinned by tests/test_hub_mirror.py",
     "docker-compose.cluster.yml": "compose `${NOO_BASE_REGISTRY:-...}` default; pinned equal to the public namespace below",
     "scripts/release-retag-plan.py": "release tooling: the default --repo of the stack release (this repo)",
-    "scripts/install-cell/run.sh": "the README's install line, typed VERBATIM as a stranger types it (install matrix)",
     ".github/workflows/cla.yml": "CLA document link, pinned to the tag cla-v1.0 of THIS repo",
     "scripts/cla-public-setup.sh": "move-day script: the public repos it operates on",
     "noo-cli/install.sh": "curl|sh installer cannot source anything; pinned equal to RELEASE_REPO",
