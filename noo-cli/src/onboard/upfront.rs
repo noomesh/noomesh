@@ -16,11 +16,17 @@
 use super::Ctx;
 
 /// Free space the controller needs where Docker keeps its images and
-/// volumes: the measured 11.5 GB of an amd64 install, the 7.2 GB default
-/// model, and room for one image upgrade. `NOO_ONBOARD_MIN_FREE_GB` lowers or
-/// raises it for a box whose owner knows better (a smaller model, data on
-/// another disk).
-pub(crate) const MIN_FREE_GB: u64 = 25;
+/// volumes, as the sum of its parts, each stated in the refusal:
+/// - the stack's images and data: 12 GB, the measured growth of an amd64
+///   install before any chat model (install matrix, 2026-11-12, 11.5 GB);
+/// - the default chat model: 8 GB (gemma4:e2b is 7.2 GB);
+/// - headroom for one image upgrade: 5 GB.
+/// `noo onboard --min-free-gb <n>` sets another floor for an owner who knows
+/// better (a smaller model, data on another disk). No environment switch.
+pub(crate) const STACK_GB: u64 = 12;
+pub(crate) const MODEL_GB: u64 = 8;
+pub(crate) const HEADROOM_GB: u64 = 5;
+pub(crate) const MIN_FREE_GB: u64 = STACK_GB + MODEL_GB + HEADROOM_GB;
 
 /// Why this OS/arch cannot be a controller, or None when it can.
 pub(crate) fn platform_refusal(os: &str, arch: &str) -> Option<String> {
@@ -47,18 +53,26 @@ pub(crate) fn disk_refusal(path: &str, free: Option<u64>, need_gb: u64) -> Optio
     if free >= need_gb.saturating_mul(1_000_000_000) {
         return None;
     }
+    let why = if need_gb == MIN_FREE_GB {
+        format!(
+            "about {MIN_FREE_GB} GB: the stack's images and data about {STACK_GB} GB, the default chat model \
+             about {MODEL_GB} GB, and {HEADROOM_GB} GB of headroom for an upgrade"
+        )
+    } else {
+        format!("{need_gb} GB, the floor set with --min-free-gb")
+    };
     Some(format!(
-        "only {:.1} GB free on the filesystem holding {path}; a controller needs at least {need_gb} GB \
-         there (the stack's images and data take about 12 GB, the default model about 7 GB more). Free \
-         some space, or move Docker's data-root to a bigger disk, then run `noo onboard` again.",
+        "only {:.1} GB free on the filesystem holding {path}; a controller needs {why}. Free some space, or \
+         move Docker's data-root to a bigger disk, then run `noo onboard` again (`noo onboard --min-free-gb <n>` \
+         sets another floor if you know this box needs less).",
         free as f64 / 1e9
     ))
 }
 
-/// The free-space floor in GB: `NOO_ONBOARD_MIN_FREE_GB` when it is a whole
-/// number, else MIN_FREE_GB.
-pub(crate) fn need_gb(env: Option<&str>) -> u64 {
-    env.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(MIN_FREE_GB)
+/// The free-space floor in GB: `--min-free-gb` when given, else the stated
+/// default.
+pub(crate) fn need_gb(flag: Option<u64>) -> u64 {
+    flag.unwrap_or(MIN_FREE_GB)
 }
 
 /// Where Docker keeps images and volumes: its own answer when it runs, else
@@ -91,7 +105,7 @@ pub(crate) fn check(ctx: &mut Ctx) -> bool {
         }
     }
     let root = docker_root();
-    let need = need_gb(std::env::var("NOO_ONBOARD_MIN_FREE_GB").ok().as_deref());
+    let need = need_gb(ctx.skip.min_free_gb);
     if let Some(msg) = disk_refusal(&root, crate::commands::at_rest_volume::free_bytes(&root), need) {
         if ctx.dry_run {
             ctx.warn(&msg);
@@ -118,22 +132,22 @@ mod tests {
     }
 
     #[test]
-    fn too_little_disk_is_refused_with_the_number_and_unknown_disk_never_is() {
+    fn too_little_disk_is_refused_with_its_parts_and_unknown_disk_never_is() {
         let gb = 1_000_000_000u64;
-        assert_eq!(disk_refusal("/var/lib/docker", Some(30 * gb), 25), None);
-        assert_eq!(disk_refusal("/var/lib/docker", Some(25 * gb), 25), None, "exactly the floor passes");
-        let msg = disk_refusal("/var/lib/docker", Some(14 * gb), 25).expect("14 GB is refused");
-        assert!(msg.contains("only 14.0 GB free") && msg.contains("at least 25 GB") && msg.contains("/var/lib/docker"),
-                "{msg}");
-        assert_eq!(disk_refusal("/var/lib/docker", None, 25), None, "no statvfs answer: no refusal on a guess");
+        assert_eq!(disk_refusal("/var/lib/docker", Some(30 * gb), MIN_FREE_GB), None);
+        assert_eq!(disk_refusal("/var/lib/docker", Some(MIN_FREE_GB * gb), MIN_FREE_GB), None, "exactly the floor passes");
+        let msg = disk_refusal("/var/lib/docker", Some(14 * gb), MIN_FREE_GB).expect("14 GB is refused");
+        assert!(msg.contains("only 14.0 GB free") && msg.contains("/var/lib/docker"), "{msg}");
+        assert!(msg.contains(&format!("images and data about {STACK_GB} GB")) && msg.contains("--min-free-gb <n>"),
+                "the parts of the floor and the way past it are in the message: {msg}");
+        let own = disk_refusal("/d", Some(5 * gb), 10).expect("below an owner's floor");
+        assert!(own.contains("10 GB, the floor set with --min-free-gb"), "{own}");
+        assert_eq!(disk_refusal("/var/lib/docker", None, MIN_FREE_GB), None, "no statvfs answer: no refusal on a guess");
     }
 
     #[test]
-    fn the_floor_takes_a_whole_number_override_only() {
+    fn the_floor_is_the_flag_or_the_stated_default() {
         assert_eq!(need_gb(None), MIN_FREE_GB);
-        assert_eq!(need_gb(Some("12")), 12);
-        assert_eq!(need_gb(Some(" 40 ")), 40);
-        assert_eq!(need_gb(Some("lots")), MIN_FREE_GB);
-        assert_eq!(need_gb(Some("-3")), MIN_FREE_GB);
+        assert_eq!(need_gb(Some(12)), 12);
     }
 }

@@ -155,6 +155,10 @@ pub(crate) struct Skip {
     /// is the only backend. `env` (plaintext `.env`) is RETIRED and refused
     /// at parse time ([`secrets_backend_flag`]).
     pub secrets_backend: String,
+    /// `--min-free-gb <n>` — the free-space floor of the up-front check
+    /// (upfront.rs), for an owner who knows their box needs less or more.
+    /// None = the stated default ([`upfront::need_gb`]).
+    pub min_free_gb: Option<u64>,
     /// `--only a,b,c` (finding #40): run ONLY the named sections on a
     /// reconfigure — everything else is a no-touch skip. Section names:
     /// prereqs, env, secrets, tailscale, enrollment, storage, services,
@@ -677,6 +681,13 @@ pub fn onboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             "--skip-channels" => skip.channels = true,
             "--mcp-door" => skip.mcp_door = Some(true),
             "--no-mcp-door" => skip.mcp_door = Some(false),
+            "--min-free-gb" => match it.next().and_then(|v| v.trim().parse::<u64>().ok()) {
+                Some(n) => skip.min_free_gb = Some(n),
+                None => {
+                    crate::ui::failed("--min-free-gb needs a whole number of GB, e.g. --min-free-gb 20", None);
+                    return Ok(2);
+                }
+            },
             "--secrets-backend" => match secrets_backend_flag(it.next().map(String::as_str)) {
                 Ok(v) => skip.secrets_backend = v,
                 Err(code) => return Ok(code),
