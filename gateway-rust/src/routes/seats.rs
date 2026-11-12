@@ -771,14 +771,9 @@ async fn staged_seat_sha(db: &sqlx::PgPool, seat: &str) -> Result<Option<String>
     if let Some(sha) = crate::bundle_etag::cached_sha(&tag, current) {
         return Ok(Some(sha));
     }
-    let row: Option<(chrono::DateTime<chrono::Utc>, i64, String)> = sqlx::query_as(
-        "SELECT created_at, octet_length(blob)::bigint, encode(sha256(blob), 'hex') FROM noo_seat_bundles WHERE seat_name = $1",
-    )
-    .bind(seat)
-    .fetch_optional(db)
-    .await?;
-    Ok(row.map(|(created_at, len, sha)| {
-        crate::bundle_etag::remember(&tag, crate::repo::provision_bundles::key_of(created_at, len), &sha);
+    let row = crate::repo::seats::bundle_sha_in_sql(db, seat).await?;
+    Ok(row.map(|(key, sha)| {
+        crate::bundle_etag::remember(&tag, key, &sha);
         sha
     }))
 }
@@ -791,12 +786,7 @@ fn seat_etag_key(seat: &str) -> String {
 
 /// The staged seat row's key (`created_at`, byte length), without its bytes.
 async fn seat_bundle_key(db: &sqlx::PgPool, seat: &str) -> Result<Option<crate::bundle_etag::Key>, sqlx::Error> {
-    let row: Option<(chrono::DateTime<chrono::Utc>, i64)> =
-        sqlx::query_as("SELECT created_at, octet_length(blob)::bigint FROM noo_seat_bundles WHERE seat_name = $1")
-            .bind(seat)
-            .fetch_optional(db)
-            .await?;
-    Ok(row.map(|(created_at, len)| crate::repo::provision_bundles::key_of(created_at, len)))
+    crate::repo::seats::bundle_key(db, seat).await
 }
 
 fn sha_param(body: &Value) -> Result<String, AppError> {
@@ -840,16 +830,11 @@ async fn seat_bundle_get(
     }
     // The bytes and their key in ONE read, so the cached sha is the sha of
     // exactly what is sent, whatever was re-staged in between.
-    let row: Result<Option<(Vec<u8>, chrono::DateTime<chrono::Utc>)>, _> =
-        sqlx::query_as("SELECT blob, created_at FROM noo_seat_bundles WHERE seat_name = $1")
-            .bind(&seat)
-            .fetch_optional(&state.db)
-            .await;
+    let row = crate::repo::seats::bundle_blob(&state.db, &seat).await;
     match row {
-        Ok(Some((blob, created_at))) => {
+        Ok(Some((key, blob))) => {
             use sha2::{Digest, Sha256};
             let sha = hex::encode(Sha256::digest(&blob));
-            let key = crate::repo::provision_bundles::key_of(created_at, blob.len() as i64);
             crate::bundle_etag::remember(&tag, key, &sha);
             crate::bundle_etag::count(&tag, false, 0);
             (
@@ -1302,7 +1287,7 @@ mod seat_binding_tests {
         let proof = get.find("check_seat_proof(").expect("the proof");
         let key = get.find("seat_bundle_key(&state.db, &seat)").expect("the row key, without its bytes");
         let decide = get.find("crate::bundle_etag::decide_304(&tag, current, if_none_match)").expect("the 304 decision");
-        let blob = get.find("\"SELECT blob, created_at FROM noo_seat_bundles WHERE seat_name = $1\"").expect("the blob and its key in one read");
+        let blob = get.find("crate::repo::seats::bundle_blob(&state.db, &seat)").expect("the blob and its key in one read");
         assert!(proof < key && key < decide && decide < blob, "order: proof {proof} < key {key} < 304 {decide} < blob {blob}");
         assert!(get[..blob].contains("StatusCode::NOT_MODIFIED"), "no 304 before the blob read");
         assert!(get.contains("\"no bundle staged\"") && get.contains("StatusCode::NOT_FOUND"), "the 404 the seat relies on");
