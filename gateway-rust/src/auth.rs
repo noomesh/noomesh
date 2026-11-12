@@ -3132,7 +3132,7 @@ pub const SCRAPE_TARGETS_PATH: &str = "/api/internal/prometheus/targets/node-age
 
 /// Whether this request is the scraper fetching its node-agent targets.
 pub(crate) fn is_scrape_targets(method: &axum::http::Method, path: &str, service: Option<&crate::node_identity::VerifiedService>) -> bool {
-    *method == axum::http::Method::GET
+    (*method == axum::http::Method::GET || *method == axum::http::Method::POST)
         && path == SCRAPE_TARGETS_PATH
         && service.is_some_and(|s| s.0 == METRICS_SCRAPER_SERVICE)
 }
