@@ -2417,7 +2417,7 @@ pub fn defer_stack_minted(findings: Vec<Finding>, stack_minted: &[String]) -> Ve
     findings
         .into_iter()
         .map(|f| {
-            if f.kind == "required-key-absent" && stack_minted.iter().any(|k| *k == f.key) {
+            if f.kind == "required-key-absent" && stack_minted.contains(&f.key) {
                 Finding {
                     severity: Severity::Info,
                     kind: "minted-at-stack-start",
