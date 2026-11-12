@@ -234,6 +234,26 @@ plan_volumes() {
     done
 }
 
+# print_plan ASSUME_YES < plan lines: what WILL happen, shown before any
+# prompt or removal. Under -y the stateful volumes are removed without a
+# question, so the plan says so ("by -y") before it happens: that is the one
+# irreversible line of the clean.
+print_plan() {
+    local yes="$1" act vol
+    while read -r act vol; do
+        case "$act" in
+            remove) echo "  remove  $vol" ;;
+            keep)   echo "  keep    $vol" ;;
+            ask)
+                if [ "$yes" = true ]; then
+                    echo "  remove  $vol (stateful, by -y: ALL of its data)"
+                else
+                    echo "  ask     $vol (stateful)"
+                fi ;;
+        esac
+    done
+}
+
 if [ "$REMOVE_VOLUMES" = true ]; then
     echo ""
     PROJECT="$(clean_project)"
@@ -244,13 +264,7 @@ if [ "$REMOVE_VOLUMES" = true ]; then
         ui_note "none"
     else
         # Listed BEFORE anything is asked or removed.
-        printf '%s\n' "$PLAN" | while read -r act vol; do
-            case "$act" in
-                remove) echo "  remove  $vol" ;;
-                keep)   echo "  keep    $vol" ;;
-                ask)    echo "  ask     $vol (stateful)" ;;
-            esac
-        done
+        printf '%s\n' "$PLAN" | print_plan "$ASSUME_YES"
     fi
     TO_REMOVE="$(printf '%s\n' "$PLAN" | awk '$1=="remove"{print $2}')"
     if [ -n "$TO_REMOVE" ] && confirm "Remove the $(printf '%s\n' "$TO_REMOVE" | wc -l | tr -d ' ') volume(s) marked remove?"; then

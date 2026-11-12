@@ -35,7 +35,7 @@ def _run(tmp_path: Path, body: str, env: dict | None = None, volumes: str = "") 
         f"printf '%s' '{volumes}'\n"
     )
     fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
-    script = "\n".join(_fn(n) for n in ("clean_project", "stack_volumes", "plan_volumes")) + "\n" + body
+    script = "\n".join(_fn(n) for n in ("clean_project", "stack_volumes", "plan_volumes", "print_plan")) + "\n" + body
     e = {"PATH": f"{bindir}:{os.environ['PATH']}"}
     e.update(env or {})
     out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=e, timeout=30)
@@ -77,9 +77,21 @@ def test_the_volume_section_lists_before_it_asks_and_fails_on_a_survivor():
         "# The old `name=pai-assistant` filter", ""
     ), "no name-glob volume filter is left"
     sec = src[src.index('if [ "$REMOVE_VOLUMES" = true ]; then'):src.index('ui_done "Volume cleanup complete"')]
-    listed = sec.index("# Listed BEFORE anything is asked or removed.")
+    listed = sec.index('printf \'%s\\n\' "$PLAN" | print_plan "$ASSUME_YES"')
     first_ask = sec.index("confirm ")
     first_rm = sec.index("docker volume rm")
     assert listed < first_ask < first_rm, "the plan is printed before any prompt or removal"
     relist = sec.index('stack_volumes "$PROJECT" | grep -qx "$vol"')
     assert relist > first_rm and "exit 1" in sec[relist:], "a volume that survives its removal fails the clean"
+
+
+def test_under_yes_the_plan_says_the_stateful_volumes_will_be_removed_before_it_happens(tmp_path):
+    plan = "keep noomesh_hf-cache\\nask noomesh_postgres-data\\nremove noomesh_nats\\n"
+    out, _ = _run(tmp_path, f"printf '{plan}' | print_plan true")
+    assert out.splitlines() == [
+        "  keep    noomesh_hf-cache",
+        "  remove  noomesh_postgres-data (stateful, by -y: ALL of its data)",
+        "  remove  noomesh_nats",
+    ]
+    out, _ = _run(tmp_path, f"printf '{plan}' | print_plan false")
+    assert "  ask     noomesh_postgres-data (stateful)" in out.splitlines()
