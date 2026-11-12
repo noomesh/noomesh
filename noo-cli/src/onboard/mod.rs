@@ -1510,9 +1510,24 @@ fn print_final_summary(ctx: &Ctx) {
         ctx.info("You're all set. Welcome to Noomesh!");
     } else if !ctx.dry_run && !ctx.state.interrupted && closing_verify_failed {
         ctx.raw("");
-        ctx.warn(CLOSING_VERIFY_NOT_DONE);
+        // No chat model this run (skipped, no fit, offline): the one command
+        // that picks, pulls and places one, the same remedy verify's
+        // `default chat` row gives (i677 #12).
+        ctx.warn(closing_not_done_line(ctx.state.model_pulled.is_empty()));
     }
 }
+
+/// The last line when the closing verify did not pass. Pure.
+pub(crate) fn closing_not_done_line(no_model_pulled: bool) -> &'static str {
+    if no_model_pulled { NO_CHAT_MODEL_YET } else { CLOSING_VERIFY_NOT_DONE }
+}
+
+/// The one command for "no chat model": the same text verify's `default chat` remedy uses.
+pub(crate) const FIRST_MODEL_CMD: &str = "noo onboard --only model";
+
+/// The last line when no chat model was pulled and the closing verify failed.
+pub(crate) const NO_CHAT_MODEL_YET: &str =
+    "No chat model yet, so chat has nothing to answer with. Pick, pull and place one: noo onboard --only model";
 
 /// The last line when the closing verify did not pass.
 pub(crate) const CLOSING_VERIFY_NOT_DONE: &str =
@@ -1700,7 +1715,7 @@ mod welcome_tests {
             .find("if welcome_due(ctx.dry_run, ctx.state.interrupted, &Outcome::of(&ctx.state), closing_verify_failed) {")
             .expect("the verdict block")..];
         let welcome = tail.find("You're all set. Welcome to Noomesh!").expect("welcome");
-        let not_done = tail.find("ctx.warn(CLOSING_VERIFY_NOT_DONE);").expect("the not-done line");
+        let not_done = tail.find("ctx.warn(closing_not_done_line(ctx.state.model_pulled.is_empty()));").expect("the not-done line");
         assert!(welcome < not_done);
         let set = code.matches("closing_verify_failed = true;").count();
         assert_eq!(set, 2, "set on a failed verify and on one that could not run");
@@ -1710,6 +1725,10 @@ mod welcome_tests {
         let unrun = verdict.find("Err(_) => {\n                closing_verify_failed = true;").expect("an unrun verify withholds it");
         assert!(failed < unrun);
         assert!(super::CLOSING_VERIFY_NOT_DONE.contains("noo cluster verify --controller"));
+        // i677 #12: no model pulled -> the one command, the same one verify names.
+        assert_eq!(super::closing_not_done_line(true), super::NO_CHAT_MODEL_YET);
+        assert_eq!(super::closing_not_done_line(false), super::CLOSING_VERIFY_NOT_DONE);
+        assert!(super::NO_CHAT_MODEL_YET.ends_with(super::FIRST_MODEL_CMD));
     }
 }
 

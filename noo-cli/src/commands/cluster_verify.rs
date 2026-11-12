@@ -2239,7 +2239,9 @@ pub(crate) fn default_chat_check(classes: Option<&Value>) -> Check {
     };
     let empty = Vec::new();
     let Some(cd) = body["classes"].as_array().unwrap_or(&empty).iter().find(|c| c["name"].as_str() == Some("chat-default")) else {
-        return fail(NAME, "no live chat node: an unpinned chat request gets 503", "noo cluster status");
+        // i677 #12: on a single box this is "no chat model placed"; the one
+        // command onboard's last line names too.
+        return fail(NAME, "no live chat node: an unpinned chat request gets 503", crate::onboard::FIRST_MODEL_CMD);
     };
     let mode = if cd["declared"].as_bool() == Some(true) { "declared" } else { "dynamic" };
     // An older gateway sends no routing_order: its candidates, routable ones.
@@ -13719,6 +13721,20 @@ mod profile_form_row_tests {
         assert_eq!(with_profile_form(ok("sandbox executor", "x"), None).detail, "x", "no profile here: nothing added");
         let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
         assert!(own.contains("crate::onboard::sandbox_apparmor::installed_form("), "the controller run states it");
+    }
+}
+
+#[cfg(test)]
+mod default_chat_remedy_tests {
+    use super::*;
+
+    /// verify and onboard's last line name the SAME one command (i677 #12).
+    #[test]
+    fn no_chat_default_names_the_first_model_command() {
+        let c = default_chat_check(Some(&serde_json::json!({"classes": []})));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert_eq!(c.remedy.as_deref(), Some(crate::onboard::FIRST_MODEL_CMD));
+        assert!(crate::onboard::NO_CHAT_MODEL_YET.ends_with(c.remedy.as_deref().unwrap()));
     }
 }
 
