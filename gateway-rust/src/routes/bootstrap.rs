@@ -273,9 +273,15 @@ fn cli_install_repo() -> String {
 /// release signature against keys printed in its own source. Byte-identical
 /// to what `noo cluster bootstrap-token create` printed before the server
 /// composed it.
+/// Download THEN run, from a private directory (2026-11-12). `curl … | sh`
+/// exits 0 when the download fails (sh reads an empty script), so a node
+/// owner saw a curl error and then "noo: not found". `mktemp -d` makes a
+/// fresh 0700 directory, the script is removed afterwards whatever happened,
+/// and the line's status is the installer's (or curl's). The install line
+/// carries no credential: the token is in the separate `noo enroll` line.
 fn compose_install_command(repo: &str) -> String {
     format!(
-        "command -v noo >/dev/null || curl -fsSL https://raw.githubusercontent.com/{repo}/main/noo-cli/install.sh | sh"
+        "command -v noo >/dev/null || {{ d=\"$(mktemp -d)\" && curl -fsSL https://raw.githubusercontent.com/{repo}/main/noo-cli/install.sh > \"$d/install.sh\" && sh \"$d/install.sh\"; r=$?; rm -rf \"$d\"; [ \"$r\" = 0 ]; }}"
     )
 }
 
@@ -2076,7 +2082,7 @@ mod tests {
     fn the_install_line_is_the_public_signed_lane() {
         assert_eq!(
             compose_install_command("org/repo"),
-            "command -v noo >/dev/null || curl -fsSL https://raw.githubusercontent.com/org/repo/main/noo-cli/install.sh | sh"
+            "command -v noo >/dev/null || \u{7b} d=\"$(mktemp -d)\" && curl -fsSL https://raw.githubusercontent.com/org/repo/main/noo-cli/install.sh > \"$d/install.sh\" && sh \"$d/install.sh\"; r=$?; rm -rf \"$d\"; [ \"$r\" = 0 ]; \u{7d}"
         );
     }
 

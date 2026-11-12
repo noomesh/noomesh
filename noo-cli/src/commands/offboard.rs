@@ -644,8 +644,12 @@ pub fn offboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     // main. The gh form works for private today and public
                     // later; the curl form is the public-channel future.
                     ui::guide(&[
-                        (&format!("gh api -H \"Accept: application/vnd.github.raw\" \"repos/{repo}/contents/noo-cli/install.sh?ref=dev\" | sh"), "reinstall any time (private repo: the gh form)"),
-                        (&format!("curl -fsSL https://raw.githubusercontent.com/{repo}/main/noo-cli/install.sh | sh"), "the public channel, once live"),
+                        (&super::cluster_provision::fetch_then_run(
+                            &format!("gh api -H \"Accept: application/vnd.github.raw\" \"repos/{repo}/contents/noo-cli/install.sh?ref=dev\""), ""),
+                         "reinstall any time (private repo: the gh form)"),
+                        (&super::cluster_provision::fetch_then_run(
+                            &format!("curl -fsSL https://raw.githubusercontent.com/{repo}/main/noo-cli/install.sh"), ""),
+                         "the public channel, once live"),
                     ]);
                 }
                 Err(e) => sub(Glyph::Warn, &format!("could not remove: {e}")),
