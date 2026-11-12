@@ -176,6 +176,11 @@ def lanes_for(changed: list[str], gw_in: set[str], cli_in: set[str]) -> list[str
     for f in changed:
         # prompts/ is the skill corpus and persona the gateway reads at run time;
         # its tests load the real corpus (selection pins, the prompt budget).
+        # noo-cli also embeds prompts/ (build.rs STANDALONE_DIRS, the standalone
+        # deploy slice), but no noo-cli test reads that content: every use of
+        # STANDALONE_ASSETS filters to compose files or copies bytes. So a
+        # prompts-only mutant needs the gateway-rust lane alone (checked
+        # 2026-11-12; revisit if a noo-cli test starts pinning prompt text).
         if f.startswith("gateway-rust/") or f in gw_in or f.startswith("prompts/"):
             add("gateway-rust")
         if f.startswith("noo-cli/") or f in cli_in:
