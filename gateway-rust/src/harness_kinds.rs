@@ -202,6 +202,13 @@ pub struct Launch {
     /// never compacts in time on a 32k node).
     #[serde(default)]
     pub context_window_env: Option<String>,
+    /// A JSON object the driver writes as `settings.json` inside the CLI's
+    /// own directory (`home_env`), mode 0600, before every run (the probe
+    /// too). For a setting the vendor offers only in its settings file, such
+    /// as Claude Code's `skipWebFetchPreflight` (docs/security/telemetry.md):
+    /// it must hold on every launch, so it is not left to the node.
+    #[serde(default)]
+    pub settings_json: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -323,6 +330,15 @@ mod tests {
             // The variable Claude Code's own warning names (i147).
             assert_eq!(full.context_window_env.as_deref(), Some("CLAUDE_CODE_MAX_CONTEXT_TOKENS"));
             assert_eq!(slim.context_window_env, full.context_window_env);
+            // Enforcement step 1: neither launch can fetch the web, and both carry the
+            // settings key that stops the WebFetch hostname preflight to api.anthropic.com
+            // (docs/security/telemetry.md), so a node cannot turn either back on.
+            for l in [full, slim] {
+                let at = l.command.iter().position(|a| a == "--disallowedTools").expect("--disallowedTools");
+                assert_eq!(&l.command[at + 1..], ["WebFetch,WebSearch"], "the disallowed tools, last (the flag is variadic)");
+                assert_eq!(l.settings_json.as_ref().and_then(|s| s.get("skipWebFetchPreflight")), Some(&serde_json::Value::Bool(true)));
+            }
+            assert!(!k.read_only_tools.iter().any(|t| t == "WebFetch" || t == "WebSearch"), "a tool it cannot run is not listed as one it runs");
         }
         let t: Table = serde_json::from_str(FIXTURE).unwrap();
         assert!(t.kinds.iter().all(|k| k.launch_slim.is_none()), "a row without launch_slim parses");

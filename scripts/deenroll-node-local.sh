@@ -100,6 +100,12 @@ rm -f /etc/systemd/system/noo-node-agent.service /etc/noo-node-agent.env \
       /etc/noo-node-agent.env.container-backup /usr/local/bin/noo-node-agent
 systemctl disable --now noo-hostd 2>/dev/null || true
 rm -f /usr/local/bin/noo-hostd /etc/systemd/system/noo-hostd.service
+# The harness unit, its env and its egress drop-in (noo-apply renders the
+# drop-in; /etc/noo/harness-net goes with /etc/noo below). Literal paths only.
+systemctl disable --now noo-harness 2>/dev/null || true
+rm -f /etc/systemd/system/noo-harness.service /etc/noo-harness.env \
+      /etc/systemd/system/noo-harness.service.d/50-noomesh-egress.conf
+rmdir /etc/systemd/system/noo-harness.service.d 2>/dev/null || true
 systemctl daemon-reload
 docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^noo-' | xargs -r docker rm -f 2>/dev/null || true
 say "agent, hostd, noo-* containers removed"

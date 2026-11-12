@@ -900,7 +900,14 @@ func (a *Agent) hostServices() map[string]any {
 	if a.harnessKind != nil {
 		kind = a.harnessKind()
 	}
-	return hostServicesReport(a.harness.State(ctx), a.harness.Runtime(), kind)
+	state := a.harness.State(ctx)
+	rep := hostServicesReport(state, a.harness.Runtime(), kind)
+	// The egress hold-off is reported only where the unit is installed on a
+	// systemd host; its absence elsewhere is not a claim.
+	if state != hostsvc.Absent && a.harness.Runtime() == "systemd" {
+		rep["harness"].(map[string]any)["egress"] = hostsvc.DefaultEgressReader().Read(ctx).Map()
+	}
+	return rep
 }
 
 // hostServicesReport is the heartbeat's host_services: the harness's state

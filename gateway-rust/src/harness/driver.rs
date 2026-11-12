@@ -463,6 +463,7 @@ impl Workspace {
     /// without MCP); Codex always gets its `config.toml`, which carries the
     /// model provider, with the `mcp_servers` table only under a door.
     pub fn write_cli_config_wired(&self, ctx: &DriverCtx, translator_url: &str, wiring: McpWiring<'_>) -> Result<Option<PathBuf>> {
+        self.write_cli_settings(ctx)?;
         if ctx.launch.mcp != MCP_CODEX_TOML {
             return match wiring {
                 McpWiring::Door { gateway, key } => self.write_mcp_config(gateway, key).map(Some),
@@ -481,6 +482,18 @@ impl Workspace {
         };
         let config = codex_config(&base, &ctx.pinned.model, door, ctx.context_window.get());
         write_private(&path, config.as_bytes())?;
+        Ok(Some(path))
+    }
+
+    /// The kind's `launch.settings_json`, written as `settings.json` in the
+    /// CLI's own directory, 0600. Nothing when the launch declares none.
+    pub fn write_cli_settings(&self, ctx: &DriverCtx) -> Result<Option<PathBuf>> {
+        let Some(settings) = ctx.launch.settings_json.as_ref() else { return Ok(None) };
+        let cli = ctx.kind.cli.as_deref().unwrap_or(&ctx.kind.kind);
+        let dir = self.cli_home(cli);
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let path = dir.join("settings.json");
+        write_private(&path, serde_json::to_string_pretty(settings)?.as_bytes())?;
         Ok(Some(path))
     }
 
@@ -1989,6 +2002,32 @@ mod tests {
             "telemetry_off": {},
         }))
         .unwrap()
+    }
+
+    /// A launch's `settings_json` lands as `settings.json` in the CLI's own
+    /// directory, 0600, for the driver and the probe alike (both go through
+    /// write_cli_config_wired); a launch without one writes nothing.
+    #[test]
+    fn the_settings_a_kind_declares_are_written_for_every_run() {
+        let root = scratch("settings");
+        let mut k = codex_kind(&["codex", "exec", "{prompt}"]);
+        k.launch.as_mut().unwrap().settings_json = Some(serde_json::json!({"skipWebFetchPreflight": true}));
+        let ctx = ctx_for(&k, &root, "30");
+        let ws = Workspace::create(&root, "t-settings", false).unwrap();
+        ws.write_cli_config_wired(&ctx, "http://127.0.0.1:1", McpWiring::None).unwrap();
+        let p = ws.home.join(".codex").join("settings.json");
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        assert_eq!(v["skipWebFetchPreflight"], true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let plain = codex_kind(&["codex", "exec", "{prompt}"]);
+        let ctx = ctx_for(&plain, &root, "30");
+        let ws = Workspace::create(&root, "t-nosettings", false).unwrap();
+        assert_eq!(ws.write_cli_settings(&ctx).unwrap(), None);
+        assert!(!ws.home.join(".codex").join("settings.json").exists());
     }
 
     /// PINNED: `config-file:codex-toml` writes Codex's whole config in the

@@ -204,6 +204,9 @@ type Reconciler struct {
 	// cliInstalled says whether a foreign kind's vendor CLI is on this
 	// node's PATH (cliOnPath in production). nil skips the check.
 	cliInstalled func(cli string) bool
+	// harnessEgress reads the harness unit's egress hold-off (see
+	// hostsvc.EgressReader). nil skips the egress gate.
+	harnessEgress func(ctx context.Context) hostsvc.Egress
 
 	// driftRecreated records, per backend, the desired spec hash we last
 	// recreated the container for on a spec-drift detection. It bounds the
@@ -283,6 +286,7 @@ func New(cfg *config.Config, docker *dockerpkg.Client, client *http.Client, harn
 		harness:         harness,
 		runnerInstalled: runnerOnDisk,
 		cliInstalled:    cliOnPath,
+		harnessEgress:   egressReaderFor(harness),
 		driftRecreated:  map[string]string{},
 	}
 }
@@ -1521,4 +1525,15 @@ func (r *Reconciler) surfaceEnvConflicts(warnings []string) {
 		}
 	}
 	r.envConflicts = now
+}
+
+// egressReaderFor is the production egress reader: systemd hosts only (the
+// hold-off is a systemd drop-in; elsewhere nothing is read and nothing is
+// gated).
+func egressReaderFor(h hostsvc.Service) func(ctx context.Context) hostsvc.Egress {
+	if h == nil || h.Runtime() != "systemd" {
+		return nil
+	}
+	rd := hostsvc.DefaultEgressReader()
+	return rd.Read
 }
