@@ -2591,6 +2591,84 @@ pub(crate) fn storage_dirs_row(root: &std::path::Path) -> Check {
     storage_dirs_check(dirs.as_deref())
 }
 
+/// What `docker volume inspect` says about this install's noo-data volume.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum NooDataSeen {
+    Absent,
+    Unreadable(String),
+    /// `device` is Options.device ("" when the volume has no bind at all).
+    Present { device: String, mountpoint: String, size: Option<String> },
+}
+
+/// The `noo-data bound` row (i677). Compose binds noo-data to
+/// `${NOO_STATE_ROOT:-${NOO_DATA_ROOT}}/noo-data`. Until 0.6.24 the launcher's
+/// gateway-dirs prep mounted the volume before compose created it, which made
+/// a PLAIN local volume: the gateway's /data then lived in docker's own volume
+/// store, on the system disk, not under the data root the user chose. This
+/// row says where the data really is and how big it is. Moving it is a
+/// separate, deliberate step and is never run automatically.
+pub(crate) fn noo_data_bound_check(seen: &NooDataSeen, want: Option<&str>) -> Check {
+    const NAME: &str = "noo-data bound";
+    let Some(want) = want else {
+        return warn(NAME, "NOO_DATA_ROOT is not set in .env; where noo-data should live was not checked",
+            Some(STORAGE_DIRS_REMEDY.to_string()));
+    };
+    match seen {
+        NooDataSeen::Absent => warn(NAME, "no noo-data volume yet (the stack has not been started)", None),
+        NooDataSeen::Unreadable(e) => warn(NAME, format!("docker volume inspect failed ({e}); not checked"), None),
+        NooDataSeen::Present { device, .. } if device == want => ok(NAME, format!("bound to {want}")),
+        NooDataSeen::Present { device, mountpoint, size } => {
+            let size = size.as_deref().map(|s| format!(", {s}")).unwrap_or_default();
+            let what = if device.is_empty() {
+                "is NOT bound to the data root".to_string()
+            } else {
+                format!("is bound to {device}, not the data root")
+            };
+            fail(
+                NAME,
+                format!("noo-data {what}: the gateway's data is at {mountpoint}{size}, not {want}"),
+                format!("move it into {want} with the gateway stopped: a separate, deliberate step, never run automatically"),
+            )
+        }
+    }
+}
+
+/// [`noo_data_bound_check`] for the install at `root`: the bind it should
+/// have, from its `.env`, against docker's view of `<project>_noo-data`.
+pub(crate) fn noo_data_bound_row(root: &std::path::Path) -> Check {
+    let env = root.join(".env");
+    let state = crate::onboard::env::read_env_key(&env, "NOO_STATE_ROOT");
+    let data = crate::onboard::env::read_env_key(&env, "NOO_DATA_ROOT");
+    let base = if state.is_empty() { data } else { state };
+    let want = (!base.is_empty()).then(|| format!("{}/noo-data", base.trim_end_matches('/')));
+    let vol = format!("{}_noo-data", crate::envfile::compose_project());
+    let out = std::process::Command::new("docker")
+        .args(["volume", "inspect", "-f", "{{index .Options \"device\"}}\t{{.Mountpoint}}", &vol])
+        .output();
+    let seen = match out {
+        Err(e) => NooDataSeen::Unreadable(e.to_string()),
+        Ok(o) if !o.status.success() => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            if err.contains("no such volume") { NooDataSeen::Absent } else { NooDataSeen::Unreadable(err.trim().to_string()) }
+        }
+        Ok(o) => {
+            let line = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            let (device, mountpoint) = line.split_once('\t').unwrap_or(("", line.as_str()));
+            let device = if device == "<no value>" { "" } else { device }.to_string();
+            // The size only when it is in the wrong place: it is what the
+            // operator needs to plan the move.
+            let size = (want.as_deref() != Some(device.as_str())).then(|| {
+                std::process::Command::new("docker")
+                    .args(["run", "--rm", "-v", &format!("{vol}:/d:ro"), "alpine", "du", "-sh", "/d"])
+                    .output().ok().filter(|o| o.status.success())
+                    .and_then(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().next().map(str::to_string))
+            }).flatten();
+            NooDataSeen::Present { device, mountpoint: mountpoint.to_string(), size }
+        }
+    };
+    noo_data_bound_check(&seen, want.as_deref())
+}
+
 /// One fleet node's needs from the controller's release-asset cache.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AssetNeed {
@@ -6986,6 +7064,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
         // A release's new data directory, missing here, refuses the stack roll.
         checks.push(storage_dirs_row(&crate::envfile::repo_root()));
+        checks.push(noo_data_bound_row(&crate::envfile::repo_root()));
         // i67: the controller's own node (when this box runs one) rides the rail.
         if let Some(me) = crate::commands::provision::self_node_name()
             .filter(|_| std::path::Path::new("/usr/local/bin/noo-node-agent").is_file())
@@ -13165,5 +13244,54 @@ mod speed_tests {
         assert_eq!(run.matches("= self_json(g,").count(), 1, "no other verb runs on its own, one after another");
         assert!(run.contains("= self_json(g, &[\"addons\", \"verify\"]);"));
         assert!(run.contains("\"--timings\" => timings = true"), "the flag is parsed");
+    }
+}
+
+#[cfg(test)]
+mod noo_data_bound_tests {
+    use super::*;
+
+    fn present(device: &str) -> NooDataSeen {
+        NooDataSeen::Present { device: device.into(), mountpoint: "/var/lib/docker/volumes/noomesh_noo-data/_data".into(), size: Some("3.1G".into()) }
+    }
+
+    #[test]
+    fn bound_to_the_data_root_is_ok() {
+        let c = noo_data_bound_check(&present("/srv/noo/noo-data"), Some("/srv/noo/noo-data"));
+        assert_eq!(c.verdict, Verdict::Ok, "{c:?}");
+    }
+
+    /// i677: the volume the old prep created has no bind. That FAILS and
+    /// names where the data really is, and its size.
+    #[test]
+    fn an_unbound_noo_data_fails_and_says_where_the_data_is() {
+        let c = noo_data_bound_check(&present(""), Some("/srv/noo/noo-data"));
+        assert_eq!(c.verdict, Verdict::Fail, "{c:?}");
+        assert!(c.detail.contains("is NOT bound to the data root"), "{}", c.detail);
+        assert!(c.detail.contains("/var/lib/docker/volumes/noomesh_noo-data/_data, 3.1G"), "{}", c.detail);
+        assert!(c.detail.contains("not /srv/noo/noo-data"), "{}", c.detail);
+        assert!(c.remedy.as_deref().is_some_and(|r| r.contains("never run automatically")), "{c:?}");
+    }
+
+    #[test]
+    fn bound_somewhere_else_fails_too() {
+        let c = noo_data_bound_check(&present("/old/root/noo-data"), Some("/srv/noo/noo-data"));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("is bound to /old/root/noo-data, not the data root"), "{}", c.detail);
+    }
+
+    #[test]
+    fn no_root_no_volume_or_no_answer_is_a_warning_never_a_pass() {
+        assert_eq!(noo_data_bound_check(&present(""), None).verdict, Verdict::Warn);
+        assert_eq!(noo_data_bound_check(&NooDataSeen::Absent, Some("/r/noo-data")).verdict, Verdict::Warn);
+        assert_eq!(noo_data_bound_check(&NooDataSeen::Unreadable("x".into()), Some("/r/noo-data")).verdict, Verdict::Warn);
+    }
+
+    #[test]
+    fn the_row_runs_in_cluster_verify_after_the_data_directories() {
+        let code = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let dirs = code.find("checks.push(storage_dirs_row(&crate::envfile::repo_root()));").expect("data directories row");
+        let bound = code.find("checks.push(noo_data_bound_row(&crate::envfile::repo_root()));").expect("noo-data bound row");
+        assert!(dirs < bound);
     }
 }
