@@ -1061,10 +1061,7 @@ enum FetchOutcome {
 fn on_status(code: u16, last: Option<&str>) -> FetchOutcome {
     match code {
         200 => FetchOutcome::Fetched,
-        304 => match if_none_match_for(last) {
-            Some(_) => FetchOutcome::Unchanged(last.unwrap_or_default().trim().to_string()),
-            None => FetchOutcome::Failed,
-        },
+        304 => FetchOutcome::Fetched,
         404 => FetchOutcome::NothingStaged,
         _ => FetchOutcome::Failed,
     }
