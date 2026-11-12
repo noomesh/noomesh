@@ -334,6 +334,15 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
         ("online", Some(age)) => out.push(fail("online", format!("status says online but the last heartbeat is {age}s old"),
             format!("noo cluster logs {id}"))),
         ("online", None) => out.push(warn("online", "online, no heartbeat timestamp reported", None)),
+        // i677 #17: right after the gateway (re)started it has not heard a
+        // gossip round yet. Not a pass (Starting exits 1); `--wait` polls it.
+        ("unknown", _) if n["status_reason"].as_str() == Some("gateway_settling") => out.push(Check {
+            name: "online",
+            verdict: Verdict::Starting,
+            detail: format!("starting — {} (`noo cluster verify --wait` waits for it)",
+                n["status_detail"].as_str().unwrap_or("the gateway started moments ago and has not heard this node's gossip yet")),
+            remedy: None,
+        }),
         (s, _) => out.push(fail("online", format!("status {s}"), format!("noo cluster show {id}"))),
     }
 

@@ -1161,11 +1161,15 @@ fn derive_nats_state(reported: Option<&Value>) -> (Value, String) {
 /// two and a half of the agents' 30 s announce intervals.
 pub(crate) const GOSSIP_SETTLE_SECS: f64 = 75.0;
 
-/// i677 #17. A node absent from gossip within [`GOSSIP_SETTLE_SECS`] of this
-/// gateway's start is `online` when the heartbeat (the authority for online)
-/// is fresh by the same thresholds the evaluator uses AND the node's own last
-/// report says its NATS client is connected. `Some(detail)` then; `None`
-/// leaves the "unknown" verdict and its diagnosis exactly as they are. Pure.
+/// i677 #17. Within [`GOSSIP_SETTLE_SECS`] of this gateway's start, a node
+/// absent from gossip whose heartbeat is still within the evaluator's own
+/// threshold AND whose last report says its NATS client is connected is
+/// `gateway_settling`: `Some(detail)`. A DISPLAY reason only: the caller keeps
+/// the status "unknown". The detail says whether that heartbeat reached THIS
+/// gateway or was stored before it started (a node that died just before the
+/// restart looks exactly like that until its threshold passes, so the reason
+/// never says it is alive). `None` leaves the verdict and its bus diagnosis as
+/// they are. Pure.
 pub(crate) fn settling_after_gateway_start(data: &Value, now: f64, gateway_started: f64) -> Option<String> {
     let since_start = now - gateway_started;
     if !(0.0..GOSSIP_SETTLE_SECS).contains(&since_start) {
@@ -1180,10 +1184,14 @@ pub(crate) fn settling_after_gateway_start(data: &Value, now: f64, gateway_start
     if !bus_up {
         return None;
     }
+    let heard = if hb >= gateway_started {
+        format!("last heard {}s ago, by this gateway", (now - hb).max(0.0) as i64)
+    } else {
+        format!("last heard {}s ago, BEFORE this gateway started", (now - hb).max(0.0) as i64)
+    };
     Some(format!(
-        "online — heartbeat {}s ago and its NATS client reports connected; this gateway started {}s ago \
-         and has not heard a gossip round yet (every 30 s)",
-        (now - hb).max(0.0) as i64,
+        "settling — {heard}, with its NATS client reported connected; this gateway started {}s ago and has \
+         not heard a gossip round yet (every 30 s). Not confirmed alive until it does",
         since_start as i64
     ))
 }
@@ -1298,12 +1306,15 @@ pub(crate) async fn collect_cluster_nodes(state: &Arc<AppState>) -> (Vec<Value>,
                             // announce (every 30 s). The closing verify of every
                             // fresh install ran inside that window and read the
                             // box's own healthy node as "unknown".
+                            // The status STAYS "unknown" (nothing that reads it,
+                            // routing included, may act on an unconfirmed node);
+                            // only the reason and the detail say it is settling.
                             if let Some(detail) = settling_after_gateway_start(
                                 &data,
                                 unix_now_f64(),
                                 crate::legacy_lanes::process_start_unix() as f64,
                             ) {
-                                data["status"] = json!("online");
+                                data["status_reason"] = json!("gateway_settling");
                                 data["status_detail"] = json!(detail);
                             }
 
@@ -1315,7 +1326,9 @@ pub(crate) async fn collect_cluster_nodes(state: &Arc<AppState>) -> (Vec<Value>,
                             // second liveness verdict: `status` stays
                             // "unknown", because this is still the node's
                             // claim, not our measurement.
-                            if data["status"] == "unknown" {
+                            // Not while settling: "gossip publisher stuck" is a
+                            // diagnosis only once the gateway has had a round.
+                            if data["status"] == "unknown" && data.get("status_reason").is_none() {
                             if let Some(bus) = data.get("nats_status").cloned() {
                                 let connected = bus.get("connected")
                                     .and_then(|c| c.as_bool());
@@ -8681,15 +8694,20 @@ mod settling_after_gateway_start_tests {
     }
 
     /// i677 #17 (install matrix run 6, 43167439088): the closing verify ran
-    /// seconds after the gateway restarted and read the box's own node as
-    /// "unknown", while its heartbeat was fresh and its bus connected; a
-    /// minute later the same node was "live from gossip".
+    /// seconds after the gateway restarted and read the box's own healthy
+    /// node as "unknown"; a minute later it was "live from gossip". Inside the
+    /// window it is SETTLING, and the detail says whether the last heartbeat
+    /// reached this gateway or was stored before it started.
     #[test]
-    fn a_fresh_heartbeat_and_a_connected_bus_are_online_while_the_gossip_view_refills() {
+    fn inside_the_window_a_fresh_connected_node_is_settling_and_says_when_it_was_heard() {
         let now = 10_000.0;
         let start = now - 20.0;
-        let d = settling_after_gateway_start(&node(Some(5.0), Some(true), now), now, start).expect("online");
-        assert!(d.contains("heartbeat 5s ago") && d.contains("started 20s ago"), "{d}");
+        let after = settling_after_gateway_start(&node(Some(5.0), Some(true), now), now, start).expect("settling");
+        assert!(after.contains("last heard 5s ago, by this gateway") && after.contains("started 20s ago"), "{after}");
+        // Died 30 s before the restart: its stored heartbeat is still within
+        // the threshold, so it is settling too, but never called alive.
+        let before = settling_after_gateway_start(&node(Some(50.0), Some(true), now), now, start).expect("settling");
+        assert!(before.contains("BEFORE this gateway started") && before.contains("Not confirmed alive"), "{before}");
     }
 
     #[test]
@@ -8704,14 +8722,19 @@ mod settling_after_gateway_start_tests {
         assert_eq!(settling_after_gateway_start(&node(Some(10_000.0), Some(true), now), now, now - 20.0), None, "a stale heartbeat");
     }
 
-    /// Wired into the gossip-absent branch, before the bus diagnosis, which
-    /// only ever rewrites an "unknown".
+    /// Wired into the gossip-absent branch; the status stays "unknown" there
+    /// (a display reason only, so routing and every other reader of the
+    /// status are untouched), and the bus diagnosis still runs.
     #[test]
     fn the_gossip_absent_branch_asks_it_and_keeps_the_diagnosis_for_unknown() {
         let code = crate::test_src::own_code(include_str!("cluster.rs"));
+        let ask_at = code.find("if let Some(detail) = settling_after_gateway_start(").expect("asks it");
+        let block = &code[ask_at..ask_at + code[ask_at..].find("if data[\"status\"] == \"unknown\" && data.get(\"status_reason\").is_none()").expect("the block ends at the diagnosis")];
+        assert!(block.contains("data[\"status_reason\"] = json!(\"gateway_settling\");"), "{block}");
+        assert!(!block.contains("data[\"status\"]"), "the settling block never writes a status: {block}");
         let unknown = code.find("data[\"status\"] = json!(\"unknown\");\n                            data[\"status_detail\"] = json!(\n                                \"unknown — registration is present in NATS KV").expect("the absent branch");
         let ask = code.find("if let Some(detail) = settling_after_gateway_start(").expect("asks it");
-        let diag = code.find("if data[\"status\"] == \"unknown\" \u{7b}\n                            if let Some(bus) = data.get(\"nats_status\").cloned() \u{7b}").expect("the diagnosis, for unknown only");
+        let diag = code.find("if data[\"status\"] == \"unknown\" && data.get(\"status_reason\").is_none() \u{7b}\n                            if let Some(bus) = data.get(\"nats_status\").cloned() \u{7b}").expect("the diagnosis, for an unexplained unknown only");
         assert!(unknown < ask && ask < diag);
     }
 }

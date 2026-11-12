@@ -369,7 +369,9 @@ pub(crate) fn wait_for_node_warmup(g: &Globals, ids: &[String]) {
         let now = super::now_unix();
         body["nodes"].as_array().is_some_and(|ns| ns.iter()
             .filter(|n| ids.is_empty() || ids.iter().any(|w| n["id"].as_str() == Some(w.as_str())))
-            .any(|n| super::backend_doors_row(n, now).verdict == Verdict::Starting))
+            .any(|n| super::backend_doors_row(n, now).verdict == Verdict::Starting
+                // i677 #17: a gateway that just started has not heard this node's gossip yet.
+                || n["status_reason"].as_str() == Some("gateway_settling")))
     };
     let settled = wait_until_settled(&mut starting, WAIT_CAP_SECS, &super::now_unix, &mut |s| {
         std::thread::sleep(std::time::Duration::from_secs(s))
