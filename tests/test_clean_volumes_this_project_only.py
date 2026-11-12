@@ -95,3 +95,23 @@ def test_under_yes_the_plan_says_the_stateful_volumes_will_be_removed_before_it_
     ]
     out, _ = _run(tmp_path, f"printf '{plan}' | print_plan false")
     assert "  ask     noomesh_postgres-data (stateful)" in out.splitlines()
+
+
+def _confirm_run(tmp_path, assume_yes: str, stdin):
+    script = _fn("confirm") + f'ASSUME_YES={assume_yes}\nconfirm "Remove noomesh_postgres-data?" && echo CONFIRMED\necho AFTER\n'
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, stdin=stdin, timeout=20)
+
+
+def test_without_yes_and_without_a_terminal_the_script_refuses_instead_of_blocking(tmp_path):
+    """As the docs say for --json and pipes: refuse, never block on a read
+    nobody answers. Same words as the CLI's confirm_prompt."""
+    r = _confirm_run(tmp_path, "false", subprocess.PIPE)  # an open pipe nobody writes to
+    assert r.returncode == 2, (r.stdout, r.stderr)
+    assert "confirmation required: pass --yes (stdin is not a TTY; refusing to block on: Remove noomesh_postgres-data?)" in r.stderr
+    assert "CONFIRMED" not in r.stdout and "AFTER" not in r.stdout, "nothing after the refusal runs"
+
+
+def test_under_yes_the_script_answers_itself_without_a_terminal(tmp_path):
+    r = _confirm_run(tmp_path, "true", subprocess.DEVNULL)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.splitlines() == ["  Remove noomesh_postgres-data? (y/N) y  [--yes]", "CONFIRMED", "AFTER"]
