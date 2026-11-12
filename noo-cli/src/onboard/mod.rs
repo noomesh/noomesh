@@ -1380,6 +1380,19 @@ fn run_all(ctx: &mut Ctx) {
     ctx.pause(10, TOTAL);
 }
 
+/// The keys onboarding mints only against a running gateway: each
+/// per-consumer service key it must hold (`provision_service_keys`).
+fn stack_minted_keys() -> Vec<String> {
+    let addon_on = |name: &str| {
+        crate::commands::addons::effective(name)
+            .unwrap_or_else(|| crate::commands::addons::row(name).map(|r| r.default_on).unwrap_or(false))
+    };
+    crate::commands::cluster_verify::required_service_keys(&addon_on)
+        .iter()
+        .filter_map(|(name, _)| crate::commands::secrets::provision_targets(name).map(|t| t.secret_key))
+        .collect()
+}
+
 fn print_final_summary(ctx: &Ctx) {
     const TOTAL: u8 = 11;
     ctx.step(11, TOTAL, STEP_TITLES[10]);
@@ -1388,7 +1401,16 @@ fn print_final_summary(ctx: &Ctx) {
     // later by eye. Its own output goes to stdout; the verdict goes through
     // the wizard's channel so every frontend shows it.
     if !ctx.dry_run && ctx.sops_active() {
-        match crate::commands::secrets::secrets_audit(ctx.g, &[]) {
+        // The stack never started this run: the service keys onboarding mints
+        // against a running gateway are absent BECAUSE of that, so they are
+        // not reported as a second ERROR to fix (rc.1 install matrix: every
+        // amd64 cell showed NOO_SVC_KEY_WORKER as an ERROR after the
+        // noo-data failure).
+        let stack_minted = if ctx.state.services_started { Vec::new() } else { stack_minted_keys() };
+        if !stack_minted.is_empty() {
+            ctx.warn("services did not start — that is the one thing to fix; service keys are minted when the stack starts");
+        }
+        match crate::commands::secrets::secrets_audit_stack_down(ctx.g, &stack_minted) {
             Ok(0) => ctx.success("secrets audit: no errors (nothing encrypted is also in plaintext)"),
             // The audit has several ERROR kinds (a plaintext credential, a
             // required key absent, …); name none of them here — the table
@@ -2054,5 +2076,27 @@ mod rerun_guard_tests {
         let nothing = body.find("nothing to do.").expect("the bare re-run line");
         assert!(refuse < nothing, "{body}");
         assert!(body[refuse..nothing].contains("return 1;") && body[refuse..nothing].contains("noo onboard --reconfigure --only"), "{body}");
+    }
+}
+
+#[cfg(test)]
+mod summary_audit_tests {
+    /// The worker's service key is one of the keys onboarding mints at stack
+    /// start (so a stack-down summary defers it).
+    #[test]
+    fn the_worker_key_is_minted_at_stack_start() {
+        assert!(super::stack_minted_keys().iter().any(|k| k == "NOO_SVC_KEY_WORKER"), "{:?}", super::stack_minted_keys());
+    }
+
+    /// The summary defers only when the stack did NOT start this run, and
+    /// says the services failure is the one thing to fix.
+    #[test]
+    fn the_summary_defers_only_when_services_never_started() {
+        let own = crate::test_src::own_code(include_str!("mod.rs"));
+        let body = crate::test_src::fn_body(&own, "fn print_final_summary(");
+        assert!(body.contains("let stack_minted = if ctx.state.services_started { Vec::new() } else { stack_minted_keys() };"),
+            "the deferral is not tied to the stack never starting");
+        assert!(body.contains("secrets_audit_stack_down(ctx.g, &stack_minted)"), "the summary audit does not defer");
+        assert!(body.contains("that is the one thing to fix"), "the summary does not point at the services failure");
     }
 }
