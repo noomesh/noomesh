@@ -1453,6 +1453,31 @@ controller has **exported a tar** for the node's release ref, which is what
 the `default_sync_images` fix above is for. The failure was never "the node
 could not receive it"; it was "nobody offered it".
 
+## Rehearsing the container egress filter (plan only)
+
+`noo-hostd egress-filter plan [--observe 30m] [--json]` is the read-only half of
+a host egress filter that would keep noomesh containers off the internet
+except the few that do work you ask for (`noo-gateway`, `noo-worker`,
+`noo-worker-extra`, `noo-trellion`, `noo-browser`). It installs nothing. It
+measures this node's own noomesh Docker networks and firewall, then prints the
+exact rules a later step would add: one chain `NOO-EGRESS` (RETURN for the
+egress-class containers, RETURN for private and local destinations, DROP per
+noomesh subnet, never an ACCEPT) and one `DOCKER-USER` jump added only when
+absent, or the `inet noomesh` nftables equivalent when Docker uses nftables.
+It says "not applicable" on Docker Desktop, rootless Docker, and a node with
+no noomesh containers, and "could not measure" where a tool is missing or
+needs root, rather than reading an unmeasured thing as nothing to do.
+
+With `--observe` (root and conntrack-tools) it watches the connection tracker
+and lists every flow from a noomesh subnet to a non-private address as
+"would pass (egress class)", "WOULD DROP" or "WOULD DROP (unattributed)", with
+bytes each way. Its one host change is `net.netfilter.nf_conntrack_acct`, set
+to 1 for the run and restored when it ends (Ctrl-C, error or panic; a
+SIGKILL cannot be caught, so read the value back if you kill it that hard).
+Every command it runs goes through an allow-list that refuses any firewall or
+Docker write before it executes. It does no name lookups; use
+`docs/security/egress-capture.sh` for hostnames.
+
 ## What is still root
 
 `noo-hostd` is root on the node, and deliberately so: it has no listener, it
