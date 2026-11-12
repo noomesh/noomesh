@@ -101,9 +101,22 @@ def test_a_record_names_the_first_error_prompts_and_warnings(tmp_path):
                    "! verify: tempo not ready\noperator alert: TargetDown loki\n"
                    "Error: compose up failed: port 443 in use\nlater error\n")
     r = C.record("stack-start", 1, 42, str(log))
-    assert r["first_error"] == "Error: compose up failed: port 443 in use"
+    assert r["first_error"].startswith("Error: compose up failed: port 443 in use")
     assert len(r["prompts"]) == 2 and len(r["warnings"]) == 2
     assert C.record("x", 0, 1, str(log))["first_error"] == "", "a passing step has no first error"
+
+
+def test_the_first_error_is_the_line_that_says_so_not_one_that_mentions_failed(tmp_path):
+    # Run 1, 2026-11-12: "13 created, ... 0 failed" was picked over the real verdict.
+    log = tmp_path / "onboard.log"
+    log.write_text("  + Storage directories (13 created, 1 already exist, 0 wrong owner, 0 failed) under /var/lib/noo\n"
+                   "  Endpoints\n"
+                   "  x onboarding did NOT complete — 1 step(s) failed in a way later steps cannot repair:\n"
+                   "  - sandbox AppArmor profile: apparmor_parser could not load it\n"
+                   "  Fix the cause and re-run `noo onboard --reconfigure`\n")
+    e = C.record("onboard", 1, 176, str(log))["first_error"]
+    assert e.startswith("x onboarding did NOT complete") and "apparmor_parser could not load it" in e, e
+    assert "0 failed" not in e
 
 
 def test_lib_step_redacts_records_and_returns_the_exit_code(tmp_path):
@@ -135,6 +148,13 @@ def test_the_summary_names_the_failed_step_and_ignores_leftover_rcs(tmp_path):
     (tmp_path / "steps.jsonl").write_text(json.dumps({**steps[0], "rc": 0}) + "\n")
     (tmp_path / "meta.json").write_text(json.dumps({"cell": "c", "not_run": "onboard-interactive.sh not written yet"}))
     assert C.summarize(tmp_path)["result"] == "not run"
+    # A red verify is recorded and reported, but the stranger's path goes on.
+    v = {"step": "verify", "rc": 1, "seconds": 9, "first_error": "x 2 problems need you", "prompts": [], "warnings": [], "tail": []}
+    (tmp_path / "steps.jsonl").write_text(json.dumps({**steps[0], "rc": 0}) + "\n" + json.dumps(v) + "\n")
+    (tmp_path / "meta.json").write_text(json.dumps({"cell": "c"}))
+    s = C.summarize(tmp_path)
+    assert s["result"] == "pass" and s["verify"] == "x 2 problems need you"
+    assert "cluster verify is RED" in (tmp_path / "summary.md").read_text()
 
 
 # ---- release size math ------------------------------------------------------
@@ -178,3 +198,24 @@ def test_the_workflow_is_hosted_only_reports_only_and_reachable_from_any_tree():
     assert {r["runner"] for r in cells.values()} >= {"ubuntu-22.04", "ubuntu-24.04", "ubuntu-22.04-arm",
                                                      "ubuntu-24.04-arm", "macos-15"}
     assert os.access(ROOT / "scripts" / "install-cell" / "run.sh", os.X_OK)
+
+
+def test_a_failed_step_ends_the_cell_and_tears_down_at_most_once(tmp_path):
+    # Run 1 (2026-11-12): `finish` did not exit, so after the first failure
+    # every later step ran and the teardown repeated after each one.
+    import shutil
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    (bin_ / "curl").write_text('#!/bin/sh\necho "curl: (56) The requested URL returned error: 403" >&2\nexit 56\n')
+    (bin_ / "curl").chmod(0o755)
+    env = {"PATH": f"{bin_}:/usr/bin:/bin", "HOME": str(tmp_path / "home"), "OUT": str(tmp_path / "out"),
+           "CELL": "t", "RUNNER": "r", "SCOPE": "full"}
+    (tmp_path / "home").mkdir()
+    assert shutil.which("noo", path=env["PATH"]) is None
+    r = subprocess.run(["bash", str(ROOT / "scripts/install-cell/run.sh")], env=env, capture_output=True, text=True,
+                       timeout=120)
+    steps = [json.loads(l)["step"] for l in (tmp_path / "out" / "steps.jsonl").read_text().splitlines()]
+    assert r.returncode == 1, r.stdout[-2000:] + r.stderr[-2000:]
+    assert steps == ["box", "install", "version"], steps
+    s = json.loads((tmp_path / "out" / "summary.json").read_text())
+    assert s["result"] == "fail" and s["failed_step"] == "version"

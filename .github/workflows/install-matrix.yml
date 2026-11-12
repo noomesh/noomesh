@@ -114,12 +114,16 @@ jobs:
           sparse-checkout: scripts/install-cell
           sparse-checkout-cone-mode: false
       - name: WSL2 + Ubuntu 24.04   # Vampire/setup-wsl v7.2.0
+        # Run 1 (2026-11-12) never finished this step in 45 min: cap it so a
+        # hang reports as "WSL2 not coverable here" instead of eating the job.
+        timeout-minutes: 15
         uses: Vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4
         with:
           distribution: Ubuntu-24.04
           wsl-version: 2
           additional-packages: curl ca-certificates python3
       - name: Docker inside WSL2 (what install.md asks of a Linux box)
+        timeout-minutes: 15
         shell: wsl-bash {0}
         run: |
           set -eu
