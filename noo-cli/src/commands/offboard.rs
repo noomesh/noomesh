@@ -1083,7 +1083,7 @@ fn docker_access_from(out: std::io::Result<std::process::Output>) -> Result<Dock
         // without the docker group passed this gate, and offboard stopped
         // the self-heal daemons before its first listing hit "permission
         // denied" (rc.2 install matrix, every cell's offboard probe).
-        Ok(o) if o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty() => Ok(DockerAccess::Reachable),
+        Ok(o) if o.status.success() => Ok(DockerAccess::Reachable),
         Ok(o) if o.status.success() => Err(match failure_reason(&o) {
             r if o.stderr.iter().any(|b| !b.is_ascii_whitespace()) => r,
             _ => "docker info reported no server version: the daemon did not answer".to_string(),
