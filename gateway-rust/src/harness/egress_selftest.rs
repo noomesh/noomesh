@@ -58,16 +58,45 @@ pub fn connect_result(r: &io::Result<()>) -> String {
     }
 }
 
-/// The self-test record. `enforced` only when the lookup failed AND the
-/// kernel denied the connect: either alone is not enough.
-pub fn record(pid: u32, started_at: u64, lookup_resolved: bool, connect: &str) -> Value {
-    let enforced = !lookup_resolved && connect == "denied";
+/// A DNS server this unit could still reach: one listening on UDP port 53 at
+/// 127.0.0.1, ::1 or a wildcard address (the unit's allowlist keeps exactly
+/// 127.0.0.1 and ::1 of loopback, so a forwarder on 127.0.0.53, such as
+/// systemd-resolved's stub, is already out of reach). A raw-DNS client inside
+/// the unit could send a name there and the forwarder would carry it out, so
+/// such a listener means "not held". Read from `/proc/net/udp{,6}` text:
+/// nothing is sent. Returns the first such listener, as "<addr>:53".
+pub fn reachable_dns_listener(udp: &str, udp6: &str) -> Option<String> {
+    for line in udp.lines().skip(1) {
+        let Some(local) = line.split_whitespace().nth(1) else { continue };
+        match local {
+            "0100007F:0035" => return Some("127.0.0.1:53".into()),
+            "00000000:0035" => return Some("0.0.0.0:53".into()),
+            _ => {}
+        }
+    }
+    for line in udp6.lines().skip(1) {
+        let Some(local) = line.split_whitespace().nth(1) else { continue };
+        match local {
+            "00000000000000000000000001000000:0035" => return Some("[::1]:53".into()),
+            "00000000000000000000000000000000:0035" => return Some("[::]:53".into()),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The self-test record. `enforced` only when the lookup failed, the kernel
+/// denied the connect, AND no DNS server is reachable on the loopback the
+/// unit keeps: any one alone is not enough.
+pub fn record(pid: u32, started_at: u64, lookup_resolved: bool, connect: &str, loopback_dns: Option<&str>) -> Value {
+    let enforced = !lookup_resolved && connect == "denied" && loopback_dns.is_none();
     json!({
         "version": 1,
         "pid": pid,
         "started_at": started_at,
         "lookup": {"name": CANARY_NAME, "result": if lookup_resolved { "resolved" } else { "failed" }},
         "connect": {"addr": CANARY_ADDR, "result": connect},
+        "loopback_dns": loopback_dns.unwrap_or("none"),
         "enforced": enforced,
     })
 }
@@ -112,11 +141,14 @@ pub async fn run_at_start() -> Option<Value> {
     let resolved = lookup_resolves().await;
     let connect = connect_result(&connect_canary().await);
     let started_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let rec = record(std::process::id(), started_at, resolved, &connect);
+    let udp = std::fs::read_to_string("/proc/net/udp").unwrap_or_default();
+    let udp6 = std::fs::read_to_string("/proc/net/udp6").unwrap_or_default();
+    let loopback_dns = reachable_dns_listener(&udp, &udp6);
+    let rec = record(std::process::id(), started_at, resolved, &connect, loopback_dns.as_deref());
     if rec["enforced"] == Value::Bool(true) {
         tracing::info!(lookup = "failed", connect = %connect, "harness: egress held: no internet name resolves and no internet address is reachable");
     } else {
-        tracing::error!(lookup = if resolved { "resolved" } else { "failed" }, connect = %connect, "harness: egress NOT held: this unit can reach the internet");
+        tracing::error!(lookup = if resolved { "resolved" } else { "failed" }, connect = %connect, loopback_dns = loopback_dns.as_deref().unwrap_or("none"), "harness: egress NOT held: this unit can reach the internet or a DNS forwarder");
     }
     if let Err(e) = write_into(dir, &rec) {
         tracing::error!(error = %e, file = SELFTEST_FILE, "harness: could not write the egress self-test (the agent reports egress unknown)");
@@ -130,11 +162,13 @@ mod tests {
 
     #[test]
     fn only_a_failed_lookup_and_a_denied_connect_are_enforced() {
-        assert_eq!(record(7, 1, false, "denied")["enforced"], true);
+        assert_eq!(record(7, 1, false, "denied", None)["enforced"], true);
+        assert_eq!(record(7, 1, false, "denied", Some("127.0.0.1:53"))["enforced"], false, "a reachable DNS forwarder is not held");
         for (resolved, connect) in [(true, "denied"), (false, "refused"), (false, "timeout"), (false, "connected"), (false, "other:x")] {
-            assert_eq!(record(7, 1, resolved, connect)["enforced"], false, "{resolved} {connect}");
+            assert_eq!(record(7, 1, resolved, connect, None)["enforced"], false, "{resolved} {connect}");
         }
-        let r = record(42, 1794000000, false, "denied");
+        let r = record(42, 1794000000, false, "denied", None);
+        assert_eq!(r["loopback_dns"], "none");
         assert_eq!(r["pid"], 42);
         assert_eq!(r["lookup"]["name"], CANARY_NAME);
         assert_eq!(r["lookup"]["result"], "failed");
@@ -163,7 +197,7 @@ mod tests {
     fn the_record_lands_world_readable_and_whole() {
         let dir = std::env::temp_dir().join(format!("noo-egress-selftest-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        write_into(&dir, &record(9, 1, false, "denied")).unwrap();
+        write_into(&dir, &record(9, 1, false, "denied", None)).unwrap();
         let back: Value = serde_json::from_slice(&std::fs::read(dir.join("egress.json")).unwrap()).unwrap();
         assert_eq!(back["enforced"], true);
         #[cfg(unix)]
@@ -173,5 +207,21 @@ mod tests {
         }
         assert!(!dir.join(".egress.json.tmp").exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_dns_server_on_reachable_loopback_is_found_and_the_stub_is_not() {
+        let head = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops";
+        // systemd-resolved's stub on 127.0.0.53 and 127.0.0.54: outside the allowlist, not reachable.
+        let stub = format!("{head}\n  1: 3500007F:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000   991        0 1 2 0\n  2: 3600007F:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000   991        0 1 2 0\n");
+        assert_eq!(reachable_dns_listener(&stub, ""), None);
+        let dnsmasq = format!("{head}\n  1: 0100007F:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 1 2 0\n");
+        assert_eq!(reachable_dns_listener(&dnsmasq, "").as_deref(), Some("127.0.0.1:53"));
+        let any = format!("{head}\n  1: 00000000:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 1 2 0\n");
+        assert_eq!(reachable_dns_listener(&any, "").as_deref(), Some("0.0.0.0:53"));
+        let v6 = format!("{head}\n  1: 00000000000000000000000001000000:0035 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000 0 0 1 2 0\n");
+        assert_eq!(reachable_dns_listener("", &v6).as_deref(), Some("[::1]:53"));
+        let other_port = format!("{head}\n  1: 0100007F:1F90 00000000:0000 07 00000000:00000000 00:00000000 00000000 0 0 1 2 0\n");
+        assert_eq!(reachable_dns_listener(&other_port, ""), None, "only port 53");
     }
 }

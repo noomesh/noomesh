@@ -112,3 +112,15 @@ func TestEgressMapKeysAreTheWireNames(t *testing.T) {
 		t.Fatalf("stale_hosts must be a non-nil list: %#v", m["stale_hosts"])
 	}
 }
+
+// On Ubuntu /etc/resolv.conf is a symlink and the applier binds over its
+// target (/run/systemd/resolve/stub-resolv.conf): still the unit's resolver.
+func TestResolverIsRecognisedOnTheSymlinkTarget(t *testing.T) {
+	stub := "/etc/noo/harness-net/resolv.conf:/run/systemd/resolve/stub-resolv.conf:rbind /etc/noo/harness-net/hosts:/etc/hosts:rbind"
+	if got := resolverFromBinds(stub); got != "unit" {
+		t.Fatalf("stub target: got %q", got)
+	}
+	if got := resolverFromBinds("/somewhere/else/resolv.conf:/etc/resolv.conf"); got != "none" {
+		t.Fatalf("a resolv.conf that is not the harness's: got %q", got)
+	}
+}
