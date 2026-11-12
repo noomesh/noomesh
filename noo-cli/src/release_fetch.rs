@@ -455,6 +455,11 @@ pub(crate) fn direct_then_gh(
     gh_fetch: &mut dyn FnMut(&Path) -> Result<Vec<u8>, FetchError>,
     direct: &mut dyn FnMut() -> Result<Vec<u8>, FetchError>,
 ) -> Result<Vec<u8>, FetchError> {
+    if let Some(g) = gh {
+        if let Ok(b) = gh_fetch(g) {
+            return Ok(b);
+        }
+    }
     match direct() {
         Ok(b) => Ok(b),
         Err(d) if matches!(d.class, FetchClass::NotFound | FetchClass::Auth) => match gh {
