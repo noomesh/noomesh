@@ -1619,7 +1619,29 @@ pub(crate) async fn cluster_nodes(State(state): State<Arc<AppState>>) -> AppJson
         "nodes": nodes,
         "stats": stats,
         "error": offline_merge_error,
+        // The release this gateway was started for (the launcher's
+        // NOO_IMAGE_TAG): a `noo cluster verify` run on a node compares its
+        // agents with THIS, not with whatever its own binary was built for.
+        "stack_tag": stack_tag_of(std::env::var(crate::addon_registry::STACK_ENV).ok()),
     }))
+}
+
+/// The stack tag to report, `null` when the launcher set none.
+fn stack_tag_of(raw: Option<String>) -> Option<String> {
+    raw.map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
+}
+
+#[cfg(test)]
+mod stack_tag_tests {
+    #[test]
+    fn the_nodes_list_says_which_release_the_gateway_runs() {
+        assert_eq!(super::stack_tag_of(Some(" v0.6.24 ".into())).as_deref(), Some("v0.6.24"));
+        assert_eq!(super::stack_tag_of(Some(String::new())), None, "unset in compose reads as none, not as an empty tag");
+        assert_eq!(super::stack_tag_of(None), None);
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let body = crate::test_src::fn_body(&own, "pub(crate) async fn cluster_nodes(");
+        assert!(body.contains("\"stack_tag\": stack_tag_of(std::env::var(crate::addon_registry::STACK_ENV).ok())"));
+    }
 }
 
 /// Annotate a backend list with the two facts an idle-scaledown decision

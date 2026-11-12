@@ -211,6 +211,83 @@ const RECENT_HEARTBEAT_SECS: i64 = 90;
 /// would land on a dead cert.
 const CERT_MIN_REMAINING_SECS: i64 = 14 * 86_400;
 
+/// Which machine this verify runs on, as far as it can be told.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Vantage {
+    Controller,
+    /// A node; the controller's node name when the gateway marks one.
+    Node { controller: Option<String> },
+    /// Not told: why, said out loud. Nothing judges local controller files.
+    Unknown(String),
+}
+
+/// Decide [`Vantage`]. The gateway's word comes first: its node list marks
+/// the controller's own node (`controller_host`). Without that mark, this
+/// machine is the controller only when it holds a controller install AND
+/// runs the stack's gateway container; never a guess.
+pub(crate) fn decide_vantage(
+    fleet: Option<&Value>,
+    is_self: &dyn Fn(&str) -> bool,
+    local_install: bool,
+    gateway_container_here: bool,
+    local_node: Option<&str>,
+) -> Vantage {
+    let marked = fleet
+        .and_then(|b| b["nodes"].as_array())
+        .and_then(|ns| ns.iter().find(|n| n["controller_host"].as_bool() == Some(true)))
+        .and_then(|n| n["id"].as_str());
+    if let Some(c) = marked {
+        return if is_self(c) { Vantage::Controller } else { Vantage::Node { controller: Some(c.to_string()) } };
+    }
+    if local_install && gateway_container_here {
+        return Vantage::Controller;
+    }
+    match (local_node, local_install) {
+        (Some(_), _) => Vantage::Node { controller: None },
+        (None, true) => Vantage::Unknown(
+            "this machine has a controller install but runs no gateway container, and the gateway names no controller node".into()),
+        (None, false) => Vantage::Unknown("this machine has no controller install and no node enrollment".into()),
+    }
+}
+
+fn vantage_here(fleet: Option<&Value>) -> Vantage {
+    let role = crate::role::detect();
+    let gw = crate::commands::addon_provision::gateway_container();
+    let container = role.controller.is_some()
+        && Command::new("docker").args(["inspect", "--type", "container", "-f", "{{.Id}}", &gw]).output()
+            .is_ok_and(|o| o.status.success());
+    decide_vantage(fleet, &crate::role::is_self_node, role.controller.is_some(), container,
+        role.node.as_ref().map(|n| n.name.as_str()))
+}
+
+/// The one line said instead of the controller rows off the controller;
+/// `None` on the controller.
+pub(crate) fn not_the_controller_line(v: &Vantage) -> Option<String> {
+    let run = "run `noo cluster verify --controller` on the controller";
+    match v {
+        Vantage::Controller => None,
+        Vantage::Node { controller: Some(c) } => Some(format!("controller rows not run: this machine is a node; {run} ({c})")),
+        Vantage::Node { controller: None } => Some(format!("controller rows not run: this machine is a node; {run}")),
+        Vantage::Unknown(why) => Some(format!("controller rows not run: which machine is the controller could not be told ({why}); {run}")),
+    }
+}
+
+/// The controller's release as the gateway states it (`stack_tag` on the
+/// node list); else what the controller's own node agent runs; else empty,
+/// which the version and display rows read as "not compared".
+pub(crate) fn stack_tag_from_gateway(fleet: &Value) -> String {
+    if let Some(t) = fleet["stack_tag"].as_str().map(str::trim).filter(|t| !t.is_empty()) {
+        return t.to_string();
+    }
+    fleet["nodes"].as_array()
+        .and_then(|ns| ns.iter().find(|n| n["controller_host"].as_bool() == Some(true)))
+        .and_then(|n| n["app_version"].as_str())
+        .and_then(agent_version_tag)
+        .filter(|(stack, _)| *stack)
+        .map(|(_, t)| t)
+        .unwrap_or_default()
+}
+
 /// The controller's stack tag: `.env NOO_IMAGE_TAG` (what is deployed), else
 /// the tag this binary was paired with at build.
 pub(crate) fn controller_stack_tag() -> String {
@@ -280,6 +357,8 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
 
     // 3. Agent version pairs with the controller's release.
     match n["app_version"].as_str().and_then(agent_version_tag) {
+        Some((true, tag)) if controller_tag.is_empty() => out.push(warn("version",
+            format!("agent {tag}; not compared: the controller did not state its release (an older gateway)"), None)),
         Some((true, tag)) if tag == controller_tag => out.push(ok("version", format!("agent {tag} = controller"))),
         Some((true, tag)) => out.push(fail("version", format!("agent {tag}, controller {controller_tag}"),
             format!("noo cluster provision {id} --wait"))),
@@ -6794,6 +6873,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             s => nodes.push(s.to_string()),
         }
     }
+    let asked_for_controller = controller;
     let want_nodes = !controller || !nodes.is_empty();
     if !controller && nodes.is_empty() {
         controller = true; // no arguments: everything
@@ -6805,6 +6885,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut tally = Tally::default();
     let started = Instant::now();
     let mut laps: Vec<(String, Duration)> = Vec::new();
+    // The fleet as the gateway listed it, when the node half read it: which
+    // machine is the controller is decided from it.
+    let mut fleet_seen: Option<Value> = None;
 
     if want_nodes || nodes.is_empty() {
         // Best-effort read: this verb is also run from `onboard`'s last step
@@ -6845,7 +6928,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 crate::output::fail(g.json, ExitCode::Generic, "unknown_node", &format!("no node named {w:?}"), Some("noo cluster status"));
             }
         }
-        let tag = controller_stack_tag();
+        fleet_seen = Some(body.clone());
+        let here = vantage_here(Some(&body));
+        let tag = if here == Vantage::Controller { controller_stack_tag() } else { stack_tag_from_gateway(&body) };
         let now = now_unix();
         if !g.json {
             println!("{}", ui::header("cluster verify", Some(&format!("{} node(s) · controller {tag}", selected.len()))));
@@ -6887,7 +6972,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             // A seat's display is compared with the console the controller's
             // gateway embeds (its content id), not the stack tag; the tag
             // only when the gateway predates content ids.
-            let console = if seats.is_empty() { tag.clone() } else { crate::commands::kiosk_seat::controller_console(g) };
+            let console = if seats.is_empty() { tag.clone() } else { crate::commands::kiosk_seat::controller_console_or(g, || tag.clone()) };
             let mut seat_json = Vec::new();
             if !g.json {
                 if let Some((heading, empty_line)) = seats_heading(listed.as_ref().map(Vec::len)) {
@@ -6915,6 +7000,24 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     }
 
+    // The controller rows judge THIS machine's files, containers and backups.
+    // On any other machine they are false rows with remedies that would edit
+    // the wrong box: skipped (bare verify) or refused (`--controller`).
+    if controller {
+        let body = fleet_seen.clone().or_else(|| get_json_opt(g, "/api/cluster/nodes", true, 10));
+        if let Some(line) = not_the_controller_line(&vantage_here(body.as_ref())) {
+            if asked_for_controller {
+                crate::output::fail(g.json, ExitCode::Generic, "not_the_controller", &line,
+                    Some("noo cluster verify   # this machine's view of the nodes and seats"));
+            }
+            if g.json {
+                json_out.insert("controller_not_run".into(), Value::String(line.clone()));
+            } else {
+                println!("{}", ui::note(&line));
+            }
+            controller = false;
+        }
+    }
     if controller {
         if wait {
             warmup::wait_for_warmup(g);
@@ -13165,5 +13268,112 @@ mod speed_tests {
         assert_eq!(run.matches("= self_json(g,").count(), 1, "no other verb runs on its own, one after another");
         assert!(run.contains("= self_json(g, &[\"addons\", \"verify\"]);"));
         assert!(run.contains("\"--timings\" => timings = true"), "the flag is parsed");
+    }
+}
+
+#[cfg(test)]
+mod vantage_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fleet(marked: Option<&str>) -> Value {
+        json!({"nodes": [
+            {"id": "pop-os", "controller_host": marked == Some("pop-os"), "app_version": "stack-v0.6.24+abc"},
+            {"id": "awolf", "controller_host": false, "app_version": "stack-v0.6.24+abc"},
+        ]})
+    }
+
+    #[test]
+    fn the_gateway_mark_decides_first() {
+        let me_awolf = |n: &str| n == "awolf";
+        let me_popos = |n: &str| n == "pop-os";
+        // A node with a dev checkout (.env + noomesh.yaml) is still a node.
+        assert_eq!(decide_vantage(Some(&fleet(Some("pop-os"))), &me_awolf, true, false, Some("awolf")),
+            Vantage::Node { controller: Some("pop-os".into()) });
+        assert_eq!(decide_vantage(Some(&fleet(Some("pop-os"))), &me_popos, true, true, Some("pop-os")), Vantage::Controller);
+    }
+
+    #[test]
+    fn without_the_mark_it_takes_an_install_and_a_running_gateway_never_a_guess() {
+        let nobody = |_: &str| false;
+        // Onboard's last step: the stack just started, the gateway may not answer yet.
+        assert_eq!(decide_vantage(None, &nobody, true, true, None), Vantage::Controller);
+        assert_eq!(decide_vantage(Some(&fleet(None)), &nobody, true, true, Some("pop-os")), Vantage::Controller);
+        // The gateway is down and this box has a checkout but no gateway container: a node.
+        assert_eq!(decide_vantage(None, &nobody, true, false, Some("awolf")), Vantage::Node { controller: None });
+        assert_eq!(decide_vantage(None, &nobody, false, false, Some("awolf")), Vantage::Node { controller: None });
+        assert!(matches!(decide_vantage(None, &nobody, true, false, None), Vantage::Unknown(_)));
+        assert!(matches!(decide_vantage(None, &nobody, false, false, None), Vantage::Unknown(_)));
+    }
+
+    #[test]
+    fn off_the_controller_one_line_names_where_to_run_it() {
+        assert_eq!(not_the_controller_line(&Vantage::Controller), None);
+        assert_eq!(not_the_controller_line(&Vantage::Node { controller: Some("pop-os".into()) }).unwrap(),
+            "controller rows not run: this machine is a node; run `noo cluster verify --controller` on the controller (pop-os)");
+        let u = not_the_controller_line(&Vantage::Unknown("no install".into())).unwrap();
+        assert!(u.contains("could not be told (no install)") && u.contains("noo cluster verify --controller"), "{u}");
+    }
+
+    #[test]
+    fn a_node_compares_with_the_controllers_release_as_the_gateway_states_it() {
+        let mut f = fleet(Some("pop-os"));
+        assert_eq!(stack_tag_from_gateway(&f), "v0.6.24", "the controller node's agent, when the gateway predates stack_tag");
+        f["stack_tag"] = "v0.6.25".into();
+        assert_eq!(stack_tag_from_gateway(&f), "v0.6.25", "the gateway's own word first");
+        assert_eq!(stack_tag_from_gateway(&fleet(None)), "", "nothing stated: not compared");
+        let n = json!({"id": "awolf", "app_version": "stack-v0.6.23+abc"});
+        let v = node_checks(&n, "", "0.6.24", 2_000_000, Some(true)).into_iter().find(|c| c.name == "version").unwrap();
+        assert_eq!(v.verdict, Verdict::Warn, "an unstated release is never a FAIL: {v:?}");
+        assert!(v.detail.contains("not compared"), "{}", v.detail);
+    }
+
+    /// Every row the controller half writes from THIS machine's files and
+    /// containers (the rows an outside run on a node turned red).
+    const CONTROLLER_ONLY_ROWS: [&str; 31] = [
+        "self-agent lane", "model cache", "loki", "tempo", "grafana door", "audit key", "secrets at rest",
+        "shared secrets", "secrets audit", "grafana sso", "gateway pki view", "loki listener", "tempo listener",
+        "sandbox listener", "backend tls", "nats tls", "nats principals", "postgres hba", "postgres role identity",
+        "postgres tls", "sandbox executor", "data directories", "data root filesystem", "monitoring web config",
+        "secrets not in env", "node-agent privilege", "callers", "tailnet policy", "last backup", "off-site backup",
+        "pki at rest",
+    ];
+
+    #[test]
+    fn no_controller_row_and_no_env_edit_on_a_node_fixture() {
+        let healthy = json!({"id": "awolf", "status": "online", "last_heartbeat": "1970-01-24T03:33:10Z",
+            "nats_state": "connected", "nats_role": "node", "app_version": "stack-v0.6.24+abc",
+            "cert_not_after": 2_000_000 + 90 * 86_400, "peer_identity_enforced": true,
+            "hostd": {"alive": true, "age_secs": 3}, "controller_host": false});
+        let broken = json!({"id": "awolf", "status": "offline", "nats_state": "disconnected", "nats_role": "fleet",
+            "app_version": "stack-v0.6.22+abc", "peer_identity_enforced": false,
+            "hostd": {"alive": false, "detail": "stale"}});
+        let seat = json!({"seat_name": "homeserver", "heartbeat": {"cli_version": "0.6.23", "kiosk_serve": "failed",
+            "console_build": "stack-v0.6.22"}, "apply_msg": "display=restarted"});
+        for (label, mut rows) in [
+            ("healthy node", node_checks(&healthy, "v0.6.24", "0.6.24", 2_000_000, None)),
+            ("broken node", node_checks(&broken, "v0.6.24", "0.6.24", 2_000_000, Some(false))),
+            ("seat", crate::commands::kiosk_seat::seat_checks(&seat, "0.6.24", "", 2_000_000)),
+        ] {
+            rows.retain(|c| c.name != "?");
+            for name in CONTROLLER_ONLY_ROWS {
+                assert!(rows.iter().all(|c| c.name != name), "{label}: controller row `{name}` on a node");
+            }
+            for c in &rows {
+                let r = c.remedy.as_deref().unwrap_or("");
+                assert!(!r.contains(".env") && !r.contains("NODE_ID="), "{label}: `{}` remedy edits .env: {r}", c.name);
+            }
+        }
+    }
+
+    #[test]
+    fn the_controller_half_is_gated_before_its_first_row() {
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let run = crate::test_src::fn_body(&own, "pub fn cluster_verify(");
+        let gate = run.find("not_the_controller_line(&vantage_here(body.as_ref()))").expect("the gate");
+        let refuse = run.find("\"not_the_controller\"").expect("--controller off the controller refuses");
+        let first_row = run.find("let mut checks = TimedChecks::new(").expect("the controller half");
+        assert!(gate < refuse && refuse < first_row, "decided and refused before any controller row is built");
+        assert!(run[gate..first_row].contains("controller = false;"), "a bare verify skips the half");
     }
 }

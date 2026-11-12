@@ -2150,10 +2150,16 @@ pub(crate) fn console_is_current(build: &str, controller_console: &str) -> bool 
 /// serves (`GET /api/cluster/console-build`), else the stack tag (a gateway
 /// from before content ids, or the route unreachable).
 pub(crate) fn controller_console(g: &Globals) -> String {
+    controller_console_or(g, super::cluster_verify::controller_stack_tag)
+}
+
+/// [`controller_console`] with the tag to fall back on given: on a node,
+/// the controller's tag as the gateway states it, never this box's own.
+pub(crate) fn controller_console_or(g: &Globals, fallback: impl FnOnce() -> String) -> String {
     crate::http::get_json_opt(g, "/api/cluster/console-build", true, 10)
         .and_then(|v| v["console_build"].as_str().map(str::to_string))
         .filter(|id| id.starts_with("ui-"))
-        .unwrap_or_else(super::cluster_verify::controller_stack_tag)
+        .unwrap_or_else(fallback)
 }
 
 /// The token after `key=` in a `seat-apply …` report line.
@@ -2240,6 +2246,8 @@ pub(crate) fn seat_checks(seat: &Value, controller_cli: &str, controller_tag: &s
     } else if build.is_empty() {
         check("display", Verdict::Warn, format!("console build not stated (the browser is not answering on CDP){quality}"),
             Some(format!("on {name}: noo kiosk status")))
+    } else if controller_tag.is_empty() {
+        check("display", Verdict::Warn, format!("console {build}; not compared: the controller did not state its release (an older gateway){quality}"), None)
     } else if !console_is_current(build, controller_tag) {
         // The first roll onto content ids: the display still runs a console
         // stamped with a release tag. Not a fault, a reload.
@@ -3928,6 +3936,6 @@ mod console_identity_tests {
         let cc = crate::test_src::fn_body(&own, "pub(crate) fn controller_console(");
         assert!(cc.contains("\"/api/cluster/console-build\"") && cc.contains("controller_stack_tag"), "{cc}");
         let verify = crate::test_src::own_code(include_str!("cluster_verify.rs"));
-        assert!(verify.contains("crate::commands::kiosk_seat::controller_console(g)"), "cluster verify compares against the gateway's console");
+        assert!(verify.contains("crate::commands::kiosk_seat::controller_console_or(g,"), "cluster verify compares against the gateway's console");
     }
 }
