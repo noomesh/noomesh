@@ -175,6 +175,24 @@ step first-answer 1800 -- sh -c 'out="$(noo chat --message "in two lines, what c
   printf "%s\n" "$out"; [ $rc = 0 ] && [ -n "$(printf "%s" "$out" | tr -d "[:space:]")" ]' || fail_onboarded
 meta first_answer_s "$(( $(date +%s) - CELL_START ))"
 
+# PROBE (fa, i677 finding 20; fix #1059): `noo offboard` run by a shell that
+# cannot reach docker (no supplementary groups, as for a stranger whose
+# shell lacks the docker group) must refuse and remove NOTHING. A probe is
+# reported on its own and never becomes the cell's failed step; on releases
+# without #1059 it is expected to fail (it wiped the box).
+step probe-offboard-without-docker 600 -- sh -c '
+  out="$(sudo setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --reset-env \
+         env HOME="$HOME" PATH="$PATH" noo offboard -y 2>&1)"; rc=$?
+  printf "%s\n" "$out"; ok=1
+  [ "$rc" != 0 ] || { echo "PROBE FAIL: offboard without docker exited 0"; ok=0; }
+  printf "%s" "$out" | grep -q "cannot reach docker" || { echo "PROBE FAIL: it did not say it cannot reach docker"; ok=0; }
+  printf "%s" "$out" | grep -q "nothing was removed" || { echo "PROBE FAIL: it did not say nothing was removed"; ok=0; }
+  docker ps -q --filter name=noo-gateway | grep -q . || { echo "PROBE FAIL: the gateway container is gone"; ok=0; }
+  [ -d "$HOME/.noo" ] || { echo "PROBE FAIL: ~/.noo is gone"; ok=0; }
+  [ -d /var/lib/noo ] || { echo "PROBE FAIL: /var/lib/noo is gone"; ok=0; }
+  noo health >/dev/null 2>&1 || { echo "PROBE FAIL: noo health is not ok afterwards"; ok=0; }
+  [ "$ok" = 1 ]'
+
 # ── 5. clean uninstall ──────────────────────────────────────────────────
 teardown
 finish

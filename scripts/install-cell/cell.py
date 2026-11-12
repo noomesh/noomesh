@@ -184,8 +184,9 @@ def summarize(d: Path) -> dict:
     steps = [json.loads(l) for l in (d / "steps.jsonl").read_text().splitlines() if l.strip()] \
         if (d / "steps.jsonl").exists() else []
     meta = json.loads((d / "meta.json").read_text()) if (d / "meta.json").exists() else {}
-    failed = next((s for s in steps if s["rc"] != 0 and not s["step"].startswith("leftover")
+    failed = next((s for s in steps if s["rc"] != 0 and not s["step"].startswith(("leftover", "probe-"))
                    and s["step"] != "verify"), None)
+    probes = [s for s in steps if s["step"].startswith("probe-")]
     verify = next((s for s in steps if s["step"] == "verify"), None)
     warnings = [w for s in steps for w in s["warnings"]]
     prompts = [p for s in steps for p in s["prompts"]]
@@ -196,6 +197,7 @@ def summarize(d: Path) -> dict:
            "first_error": failed["first_error"] if failed else None,
            "steps": [{k: s[k] for k in ("step", "rc", "seconds")} for s in steps],
            "verify": None if verify is None else ("green" if verify["rc"] == 0 else verify["first_error"]),
+           "probes": {s["step"]: ("pass" if s["rc"] == 0 else s["first_error"]) for s in probes},
            "warning_count": len(warnings), "warnings": warnings[:40],
            "prompt_count": len(prompts), "prompts": prompts[:60]}
     md = [f"### {meta.get('cell', '?')}: {out['result'].upper()}"
@@ -209,6 +211,9 @@ def summarize(d: Path) -> dict:
         md += ["", f"**First error** ({failed['step']}): `{failed['first_error']}`"]
     if verify is not None and verify["rc"] != 0:
         md += ["", f"**cluster verify is RED** (recorded, not fatal): `{verify['first_error']}`"]
+    for s in probes:
+        md += ["", f"**Probe `{s['step']}`: {'PASS' if s['rc'] == 0 else 'FAIL'}**"
+               + ("" if s["rc"] == 0 else f" `{s['first_error']}`")]
     md += ["", f"**Warnings a stranger sees: {len(warnings)}**"] + [f"- `{w}`" for w in warnings[:20]]
     md += ["", f"**Prompts: {len(prompts)}**"] + [f"- `{p}`" for p in prompts[:20]]
     if meta.get("limits"):
