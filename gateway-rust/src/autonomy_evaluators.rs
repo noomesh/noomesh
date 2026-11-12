@@ -3038,9 +3038,9 @@ mod tests {
         let mut seen = std::collections::HashMap::new();
         let h = ("awolf".to_string(), "harness".to_string());
         let v = ("awolf".to_string(), "vllm".to_string());
-        assert!(confirm_drift(&mut seen, &[h.clone()], 2).is_empty(), "first miss: a blip");
+        assert!(confirm_drift(&mut seen, std::slice::from_ref(&h), 2).is_empty(), "first miss: a blip");
         assert!(confirm_drift(&mut seen, &[], 2).is_empty(), "recovered: forgotten");
-        assert!(confirm_drift(&mut seen, &[h.clone()], 2).is_empty(), "missing again: starts from one");
+        assert!(confirm_drift(&mut seen, std::slice::from_ref(&h), 2).is_empty(), "missing again: starts from one");
         assert_eq!(confirm_drift(&mut seen, &[h.clone(), v.clone()], 2), vec![h.clone()], "twice in a row: drift; vllm only once");
         assert_eq!(confirm_drift(&mut seen, &[h.clone(), v.clone()], 2), vec![h, v]);
     }
