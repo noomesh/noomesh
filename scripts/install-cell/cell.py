@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+"""Helpers for one install-matrix cell (lib.sh calls these; stdlib only, so
+it runs on a bare runner before anything is installed).
+
+    cell.py run TIMEOUT -- CMD...    run CMD in its own process group, kill the
+                                     group at TIMEOUT seconds (exit 124);
+                                     macOS has no GNU `timeout`
+    cell.py redact                   stdin -> stdout with secrets masked
+    cell.py scan PATH...             exit 3 if any file still holds a
+                                     secret-shaped string (the last gate
+                                     before upload: this repo is PUBLIC)
+    cell.py record NAME RC SECS LOG  print the step's JSON line
+    cell.py summary DIR              steps.jsonl + meta -> summary.md/.json
+
+The logs and the artifact of this workflow are public, and onboard prints an
+admin password, join material and tokens. Every line passes `redact` before
+it reaches the job log, a step record or the artifact; `scan` then refuses
+the upload if anything secret-shaped is left.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+MASK = "[REDACTED]"
+
+# Shapes, most specific first. Each is replaced, never the whole line.
+SECRET_SHAPES = [
+    # PEM blocks are handled line by line below (BEGIN ... END).
+    re.compile(r"noo1\.[A-Za-z0-9_\-.=]+"),                                   # join / bootstrap blobs
+    re.compile(r"eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"),  # JWT
+    re.compile(r"(?i)\b(gh[pousr]_[A-Za-z0-9]{20,})"),                        # GitHub tokens
+    re.compile(r"(?i)((?:password|passwd|passphrase|token|secret|api[_-]?key|private[_-]?key|key)"
+               r"\s*[:=]\s*)(\"?)([^\s\"']{4,})"),                             # key: value / key=value
+]
+LONG_B64 = re.compile(r"(?<![A-Za-z0-9+/=_\-])[A-Za-z0-9+/_\-]{40,}={0,2}(?![A-Za-z0-9+/=_\-])")
+SHA_LIKE = re.compile(r"^(?:sha256:)?[0-9a-f]{40,64}$")
+
+
+def redact_line(line: str, state: dict) -> str:
+    if state.get("pem"):
+        if re.search(r"-----END [A-Z ]+-----", line):
+            state["pem"] = False
+        return MASK + "\n" if line.endswith("\n") else MASK
+    if re.search(r"-----BEGIN [A-Z ]+-----", line):
+        state["pem"] = not re.search(r"-----END [A-Z ]+-----", line)
+        return MASK + "\n" if line.endswith("\n") else MASK
+    out = SECRET_SHAPES[0].sub(MASK, line)
+    out = SECRET_SHAPES[1].sub(MASK, out)
+    out = SECRET_SHAPES[2].sub(MASK, out)
+    out = SECRET_SHAPES[3].sub(lambda m: m.group(1) + m.group(2) + MASK, out)
+    # Long base64-ish runs; digests (hex, sha256:) stay readable on purpose.
+    out = LONG_B64.sub(lambda m: m.group(0) if SHA_LIKE.match(m.group(0)) else MASK, out)
+    return out
+
+
+def secret_hits(text: str) -> list[str]:
+    hits = []
+    for i, line in enumerate(text.splitlines(), 1):
+        probe = line.replace(MASK, "")
+        if re.search(r"-----BEGIN [A-Z ]*PRIVATE KEY-----", probe):
+            hits.append(f"{i}: PEM private key")
+        for rx in SECRET_SHAPES[:3]:
+            if rx.search(probe):
+                hits.append(f"{i}: {rx.pattern[:24]}")
+        m = SECRET_SHAPES[3].search(probe)
+        if m and m.group(3) != MASK:
+            hits.append(f"{i}: {m.group(1).strip()} value")
+        for b in LONG_B64.findall(probe):
+            if not SHA_LIKE.match(b):
+                hits.append(f"{i}: long base64 run")
+    return hits
+
+
+def cmd_run(argv: list[str]) -> int:
+    timeout = int(argv[0])
+    cmd = argv[2:] if argv[1:2] == ["--"] else argv[1:]
+    p = subprocess.Popen(cmd, start_new_session=True)
+    try:
+        return p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, signal.SIGTERM)
+        try:
+            p.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, signal.SIGKILL)
+            p.wait()
+        print(f"[install-cell] TIMEOUT after {timeout}s: {' '.join(cmd)[:200]}", flush=True)
+        return 124
+
+
+def cmd_redact() -> int:
+    state: dict = {}
+    for line in sys.stdin:
+        sys.stdout.write(redact_line(line, state))
+        sys.stdout.flush()
+    return 0
+
+
+def cmd_scan(paths: list[str]) -> int:
+    bad = []
+    for root in paths:
+        for f in sorted(Path(root).rglob("*")) if Path(root).is_dir() else [Path(root)]:
+            if f.is_file():
+                for h in secret_hits(f.read_text(errors="replace")):
+                    bad.append(f"{f}:{h}")
+    if bad:
+        print("install-cell: secret-shaped text left in the files to upload; refusing:", file=sys.stderr)
+        for b in bad[:40]:
+            print("  " + b, file=sys.stderr)
+        return 3
+    return 0
+
+
+ERROR_RX = re.compile(r"(?i)(\berror\b|\bfatal\b|\bfailed\b|✗|refus|panicked|TIMEOUT after)")
+PROMPT_RX = re.compile(r"^PROMPT: |\[[yY]/[nN]\]|\([yY]/[nN]\)|\?\s*(\[[^\]]*\])?\s*$")
+WARN_RX = re.compile(r"^\s*(!|⚠)|\bWARN(ING)?\b|operator alert|TargetDown")
+
+
+def record(name: str, rc: int, secs: int, log: str) -> dict:
+    lines = Path(log).read_text(errors="replace").splitlines() if Path(log).exists() else []
+    first_error = next((l for l in lines if ERROR_RX.search(l)), "") if rc != 0 else ""
+    if rc != 0 and not first_error and lines:
+        first_error = lines[-1]
+    return {
+        "step": name, "rc": rc, "seconds": secs,
+        "first_error": first_error[:500],
+        "prompts": [l[:300] for l in lines if PROMPT_RX.search(l)][:80],
+        "warnings": [l.strip()[:300] for l in lines if WARN_RX.search(l)][:80],
+        "tail": lines[-50:],
+    }
+
+
+def summarize(d: Path) -> dict:
+    steps = [json.loads(l) for l in (d / "steps.jsonl").read_text().splitlines() if l.strip()] \
+        if (d / "steps.jsonl").exists() else []
+    meta = json.loads((d / "meta.json").read_text()) if (d / "meta.json").exists() else {}
+    failed = next((s for s in steps if s["rc"] != 0 and not s["step"].startswith("leftover")), None)
+    warnings = [w for s in steps for w in s["warnings"]]
+    prompts = [p for s in steps for p in s["prompts"]]
+    out = {**meta,
+           "result": ("not run" if meta.get("not_run") or not steps
+                      else "pass" if failed is None else "fail"),
+           "failed_step": failed["step"] if failed else None,
+           "first_error": failed["first_error"] if failed else None,
+           "steps": [{k: s[k] for k in ("step", "rc", "seconds")} for s in steps],
+           "warning_count": len(warnings), "warnings": warnings[:40],
+           "prompt_count": len(prompts), "prompts": prompts[:60]}
+    md = [f"### {meta.get('cell', '?')}: {out['result'].upper()}"
+          + (f" at `{out['failed_step']}`" if failed else ""),
+          f"runner `{meta.get('runner', '?')}` · installed `{meta.get('installed_version', '?')}` · "
+          f"peak disk used {meta.get('peak_disk_used_gb', '?')} GB · first answer {meta.get('first_answer_s', '?')} s "
+          f"after the cell started",
+          "", "| step | rc | seconds |", "|---|---|---|"]
+    md += [f"| {s['step']} | {s['rc']} | {s['seconds']} |" for s in steps]
+    if failed:
+        md += ["", f"**First error** ({failed['step']}): `{failed['first_error']}`"]
+    md += ["", f"**Warnings a stranger sees: {len(warnings)}**"] + [f"- `{w}`" for w in warnings[:20]]
+    md += ["", f"**Prompts: {len(prompts)}**"] + [f"- `{p}`" for p in prompts[:20]]
+    if meta.get("limits"):
+        md += ["", "**Not covered here:** " + "; ".join(meta["limits"])]
+    (d / "summary.json").write_text(json.dumps(out, indent=1))
+    (d / "summary.md").write_text("\n".join(md) + "\n")
+    return out
+
+
+def main(argv: list[str]) -> int:
+    if not argv:
+        print(__doc__, file=sys.stderr)
+        return 2
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "run":
+        return cmd_run(rest)
+    if cmd == "redact":
+        return cmd_redact()
+    if cmd == "scan":
+        return cmd_scan(rest)
+    if cmd == "record":
+        print(json.dumps(record(rest[0], int(rest[1]), int(rest[2]), rest[3])))
+        return 0
+    if cmd == "summary":
+        summarize(Path(rest[0]))
+        return 0
+    print(f"cell.py: unknown command {cmd}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

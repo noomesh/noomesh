@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# One cell of .github/workflows/install-matrix.yml: what a stranger does
+# from the README on a machine we have never seen, timed step by step.
+#
+#   OUT=<dir> CELL=<name> RUNNER=<label> DOCKER=preinstalled|none \
+#   ONBOARD=ci|interactive MODEL=default|tiny SCOPE=full|node-partial \
+#   CLI_TAG=latest|noo-cli-vX.Y.Z  scripts/install-cell/run.sh
+#
+# GITHUB-HOSTED, EPHEMERAL RUNNERS ONLY. This pipes our released install.sh
+# into sh, installs with sudo and then offboards the box. Never point it at a
+# machine someone owns or shares.
+#
+# The stranger is the runner user (non-root, PASSWORDLESS sudo): a real
+# stranger may meet sudo password prompts this run never shows.
+#
+# Steps stop at the first failure, except that a cell that got as far as
+# onboarding always tears down and checks for leftovers, and every cell
+# ends with the secret scan (exit 3 on a hit) and its summary.
+set -uo pipefail
+: "${OUT:?}" "${CELL:?}" "${RUNNER:=?}" "${DOCKER:=preinstalled}" "${ONBOARD:=ci}" \
+  "${MODEL:=default}" "${SCOPE:=full}" "${CLI_TAG:=latest}"
+TINY_MODEL="${TINY_MODEL:-qwen2.5:0.5b}"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+mkdir -p "$OUT"
+# shellcheck source=scripts/install-cell/lib.sh
+. "$HERE/lib.sh"
+export PATH="$HOME/.local/bin:$PATH"
+CELL_START=$(date +%s)
+
+meta cell "$CELL"
+meta runner "$RUNNER"
+meta modes "docker=$DOCKER onboard=$ONBOARD model=$MODEL scope=$SCOPE cli_tag=$CLI_TAG"
+meta limits "the stranger is the runner user with passwordless sudo: sudo password prompts are never seen"
+meta limits "no GPU on hosted runners: CPU inference only"
+
+# Peak disk: sample `df` every 5 s for the whole cell.
+( while :; do df -Pk / | awk 'NR==2{print $3}' >> "$OUT/disk.samples"; sleep 5; done ) &
+SAMPLER=$!
+
+finish() {
+    kill "$SAMPLER" 2>/dev/null
+    if [ -s "$OUT/disk.samples" ]; then
+        meta peak_disk_used_gb "$(sort -n "$OUT/disk.samples" | tail -1 | awk '{printf "%.1f", $1/1048576}')"
+    fi
+    python3 "$CELL_PY" summary "$OUT"
+    [ -n "${GITHUB_STEP_SUMMARY:-}" ] && cat "$OUT/summary.md" >> "$GITHUB_STEP_SUMMARY"
+    # Last gate before anything is uploaded: this repo's artifacts are public.
+    if ! python3 "$CELL_PY" scan "$OUT"; then
+        echo "::error::$CELL: secret-shaped text in the cell's output; the artifact is withheld"
+        rm -rf "$OUT/logs"
+        exit 3
+    fi
+    python3 - "$OUT/summary.json" <<'PY'
+import json, sys
+s = json.load(open(sys.argv[1]))
+sys.exit(0 if s["result"] in ("pass", "not run") else 1)
+PY
+}
+
+hook() {  # a mode's steps written by another owner (see the workflow)
+    local f="$HERE/$1"
+    if [ ! -x "$f" ]; then
+        meta limits "$1 not written yet: this cell's mode is not run"
+        meta not_run "$1 not written yet"
+        echo "::notice::$CELL: $1 is not written yet; the cell stops here"
+        finish
+    fi
+    "$f"
+}
+
+# ── 1. the box ──────────────────────────────────────────────────────────
+step box 120 -- sh -c 'uname -a; cat /etc/os-release 2>/dev/null | head -3; sw_vers 2>/dev/null;
+  nproc 2>/dev/null || sysctl -n hw.ncpu; free -m 2>/dev/null || sysctl -n hw.memsize; df -h /;
+  docker version --format "docker {{.Server.Version}}" 2>&1 | head -1; docker compose version 2>&1 | head -1'
+if [ "$DOCKER" = none ]; then
+    hook prep-no-docker.sh || finish
+fi
+
+# ── 2. the install line, verbatim from the README ───────────────────────
+if [ "$CLI_TAG" = latest ]; then
+    URL="https://github.com/noomesh/noomesh/releases/latest/download/install.sh"
+else
+    URL="https://github.com/noomesh/noomesh/releases/download/$CLI_TAG/install.sh"
+    export NOO_CLI_VERSION="$CLI_TAG"
+fi
+step install 600 -- sh -c "curl -fsSL '$URL' | sh" || finish
+step version 30 -- noo --version || finish
+meta installed_version "$(noo --version 2>/dev/null | head -1)"
+
+if [ "$SCOPE" = node-partial ]; then
+    # macOS is a NODE: it needs a controller this hosted runner cannot reach,
+    # and hosted Apple-silicon runners have no Docker. Install + CLI only.
+    meta limits "macOS node path stops before join: no reachable controller from a hosted runner, no Docker on hosted Apple silicon"
+    step cli-help 60 -- noo --help
+    finish
+fi
+
+# ── 3. onboard ──────────────────────────────────────────────────────────
+ONBOARDED=1
+teardown() {
+    step offboard 900 -- noo offboard -y
+    step leftover-offboard-check 120 -- noo offboard --check
+    step uninstall 600 -- noo offboard --uninstall -y
+    # Our own verdict, not offboard --check's: its audit looks for `noo_*`
+    # volumes while the compose project names them `noomesh_*` (fa, 11-12),
+    # so it reads clean over leftover stack volumes.
+    step leftover-docker 60 -- sh -c 'left=0
+      for what in "ps -a" "volume ls" "image ls"; do
+        n=$(docker $what -q 2>/dev/null | wc -l); echo "docker $what: $n"; done
+      L=label=com.docker.compose.project=noomesh
+      docker ps -a --filter "$L" --format "LEFTOVER container {{.Names}}" | grep . && left=1
+      docker volume ls --filter "$L" --format "LEFTOVER volume {{.Name}}" | grep . && left=1
+      docker network ls --filter "$L" --format "LEFTOVER network {{.Name}}" | grep . && left=1
+      docker volume ls --format "{{.Name}}" 2>/dev/null | grep -E "^(noomesh|noo)_" | sed "s/^/LEFTOVER volume /" | grep . && left=1
+      docker network ls --format "{{.Name}}" 2>/dev/null | grep -vxE "bridge|host|none" | sed "s/^/LEFTOVER network /" | grep . && left=1
+      for f in "$HOME/.local/bin/noo" /usr/local/bin/noo; do [ -e "$f" ] && { echo "LEFTOVER $f"; left=1; }; done
+      exit $left'
+}
+fail_onboarded() { teardown; finish; }
+
+if [ "$ONBOARD" = interactive ]; then
+    hook onboard-interactive.sh || fail_onboarded
+elif [ "$MODEL" = tiny ]; then
+    # --ci takes the declared OLLAMA_MODEL, which onboard reads from the
+    # install's .env only (not the process env): onboard everything but the
+    # model, declare the tiny one there, then run the model section alone.
+    step onboard 2700 -- noo onboard --ci --skip-model || fail_onboarded
+    envf="$(find "$HOME" -maxdepth 4 -name .noo-standalone -print -quit 2>/dev/null)"
+    envf="${envf%/.noo-standalone}/.env"
+    step declare-tiny-model 30 -- sh -c "test -f '$envf' && { grep -v '^OLLAMA_MODEL=' '$envf' > '$envf.tmp'; echo 'OLLAMA_MODEL=$TINY_MODEL' >> '$envf.tmp'; mv '$envf.tmp' '$envf'; echo \"OLLAMA_MODEL=$TINY_MODEL in $envf\"; }" \
+        || fail_onboarded
+    step onboard-model 1800 -- noo onboard --ci --only model || fail_onboarded
+else
+    step onboard 3600 -- noo onboard --ci || fail_onboarded
+fi
+
+# ── 4. up, verified, answering ──────────────────────────────────────────
+step stack-start 1800 -- noo stack start || fail_onboarded
+step health 600 -- sh -c 'for i in $(seq 1 40); do noo health >/dev/null 2>&1 && break; sleep 15; done; noo health' \
+    || fail_onboarded
+step verify 900 -- noo cluster verify --wait || fail_onboarded
+step first-answer 1800 -- sh -c 'out="$(noo chat --message "Reply with exactly one word: ready")"; rc=$?
+  printf "%s\n" "$out"; [ $rc = 0 ] && [ -n "$(printf "%s" "$out" | tr -d "[:space:]")" ]' || fail_onboarded
+meta first_answer_s "$(( $(date +%s) - CELL_START ))"
+
+# ── 5. clean uninstall ──────────────────────────────────────────────────
+teardown
+finish
