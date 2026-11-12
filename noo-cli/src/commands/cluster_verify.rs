@@ -6606,14 +6606,50 @@ const AT_REST_DIR_ROWS: [&str; 10] = [
     "grafana at rest", "noo-data at rest", "pki at rest", "age key at rest",
 ];
 
+/// The followup that a WARN row's remedy names as planned work
+/// (`planned (i10a): …` → `i10a`): a known gap with no action for the
+/// operator today. Only a Warn: a Fail, an Accepted opt-out or a Starting
+/// row is never "planned", whatever its remedy says, so nothing that fails
+/// can be folded out of sight. The row's verdict is unchanged; only the
+/// default output groups it.
+pub(crate) fn planned_ref(c: &Check) -> Option<&str> {
+    if c.verdict != Verdict::Warn {
+        return None;
+    }
+    planned_remedy_ref(c.remedy.as_deref()?)
+}
+
+fn planned_remedy_ref(remedy: &str) -> Option<&str> {
+    let rest = remedy.strip_prefix("planned (")?;
+    let (id, _) = rest.split_once("):")?;
+    (!id.is_empty() && id.chars().all(|ch| ch.is_ascii_alphanumeric())).then_some(id)
+}
+
+/// The remedies a section's guide prints: [`remedies_to_print`], less the
+/// planned rows' remedies by default (a plan is not a command to run);
+/// `--verbose` prints them all.
+fn guide_remedies<'a>(title: &str, checks: &'a [Check], verbose: bool) -> Vec<(&'a str, Vec<&'a str>)> {
+    let mut grouped = remedies_to_print(title, checks);
+    if !verbose {
+        grouped.retain(|(r, _)| planned_remedy_ref(r).is_none());
+    }
+    grouped
+}
+
+/// The one default-output line the planned rows fold into.
+const PLANNED_ROW: &str = "planned work";
+
 /// How many rows of a section hold, warn, fail or are accepted. A
 /// `Starting` row counts as a warning: it prints with the same glyph.
+/// `planned` are Warn rows of known, tracked work ([`planned_ref`]),
+/// counted apart from the warnings that ask for action now.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Counts {
     ok: usize,
     warn: usize,
     fail: usize,
     accepted: usize,
+    planned: usize,
 }
 
 /// What one section prints: its counts and the rows to show.
@@ -6646,6 +6682,7 @@ fn digest(checks: &[Check], verbose: bool) -> Digest {
     for c in checks {
         match c.verdict {
             Verdict::Ok => counts.ok += 1,
+            Verdict::Warn if planned_ref(c).is_some() => counts.planned += 1,
             Verdict::Warn | Verdict::Starting => counts.warn += 1,
             Verdict::Fail => counts.fail += 1,
             Verdict::Accepted => counts.accepted += 1,
@@ -6656,9 +6693,12 @@ fn digest(checks: &[Check], verbose: bool) -> Digest {
     }
     let mut rows: Vec<Check> = Vec::new();
     let mut at_rest: Vec<&Check> = Vec::new();
+    let mut planned: Vec<&Check> = Vec::new();
     let mut slot = 0;
     for c in checks.iter().filter(|c| c.verdict != Verdict::Ok) {
-        if AT_REST_DIR_ROWS.contains(&c.name) {
+        if planned_ref(c).is_some() {
+            planned.push(c);
+        } else if AT_REST_DIR_ROWS.contains(&c.name) {
             if at_rest.is_empty() {
                 slot = rows.len();
             }
@@ -6677,18 +6717,35 @@ fn digest(checks: &[Check], verbose: bool) -> Digest {
             remedy: worst.remedy.clone(),
         });
     }
+    if !planned.is_empty() {
+        // One line, last: every known gap with its followup, named. The rows'
+        // verdicts are unchanged (--verbose and --json show each).
+        let mut ids: Vec<&str> = planned.iter().filter_map(|c| planned_ref(c)).collect();
+        ids.dedup();
+        let names: Vec<&str> = planned.iter().map(|c| c.name.trim_end_matches(" at rest")).collect();
+        rows.push(Check {
+            name: PLANNED_ROW,
+            verdict: Verdict::Warn,
+            detail: format!("{} known gap(s), planned ({}): {}; --verbose lists each", planned.len(), ids.join(", "), names.join(", ")),
+            remedy: None,
+        });
+    }
     Digest { counts, rows }
 }
 
 /// `✓ node host3  ✓ 13  ! 1  ✗ 1`: the section's glyph (its worst row),
 /// its name, and the counts; zero counts stay out except the passes.
 fn summary_line(title: &str, c: &Counts) -> String {
-    let lead = if c.fail > 0 { Glyph::Err } else if c.warn > 0 { Glyph::Warn } else if c.accepted > 0 { Glyph::Accepted } else { Glyph::Ok };
+    // A planned gap is still a warning: it keeps the lead glyph a warning.
+    let lead = if c.fail > 0 { Glyph::Err } else if c.warn + c.planned > 0 { Glyph::Warn } else if c.accepted > 0 { Glyph::Accepted } else { Glyph::Ok };
     let mut parts = vec![format!("{} {}", ui::glyph(Glyph::Ok), c.ok)];
     for (n, g) in [(c.warn, Glyph::Warn), (c.fail, Glyph::Err), (c.accepted, Glyph::Accepted)] {
         if n > 0 {
             parts.push(format!("{} {n}", ui::glyph(g)));
         }
+    }
+    if c.planned > 0 {
+        parts.push(format!("{} {} planned", ui::glyph(Glyph::Bullet), c.planned));
     }
     format!("{} {}  {}", ui::glyph(lead), ui::emph(title), parts.join("  "))
 }
@@ -6701,8 +6758,10 @@ struct Tally {
     problems: Vec<String>,
     /// Rows still starting.
     starting: Vec<String>,
-    /// Warnings and accepted rows.
+    /// Warnings and accepted rows that ask to be read now.
     notes: usize,
+    /// Known gaps of planned work (the folded `planned work` rows).
+    planned: usize,
     /// ` — 3 node(s) on stack-v0.6.13`, or empty.
     context: String,
 }
@@ -6710,7 +6769,11 @@ struct Tally {
 impl Tally {
     fn add(&mut self, title: &str, checks: &[Check]) {
         let label = |name: &str| if title == "controller" { name.to_string() } else { format!("{name} ({title})") };
+        self.planned += checks.iter().filter(|c| planned_ref(c).is_some()).count();
         for c in digest(checks, false).rows {
+            if c.name == PLANNED_ROW {
+                continue;
+            }
             let bucket = match c.verdict {
                 Verdict::Fail => &mut self.problems,
                 Verdict::Starting => &mut self.starting,
@@ -6740,7 +6803,11 @@ fn verdict_line(t: &Tally) -> (Glyph, String) {
         0 => String::new(),
         n => format!("; {n} row(s) above to read"),
     };
-    (Glyph::Ok, format!("fleet healthy{}{seen}", t.context))
+    let planned = match t.planned {
+        0 => String::new(),
+        n => format!("; {n} known gap(s) planned"),
+    };
+    (Glyph::Ok, format!("fleet healthy{}{seen}{planned}", t.context))
 }
 
 fn render(title: &str, checks: &[Check], verbose: bool) -> bool {
@@ -6760,6 +6827,8 @@ fn render(title: &str, checks: &[Check], verbose: bool) -> bool {
                 // Plain text: the row states what is exposed and must be read, not dimmed.
                 Verdict::Accepted => (Glyph::Accepted, c.detail.clone()),
             };
+            // The folded planned-work line: tracked work, read but not acted on.
+            let (glyph, detail) = if c.name == PLANNED_ROW { (Glyph::Bullet, ui::muted(&c.detail)) } else { (glyph, detail) };
             vec![ui::glyph_cell(glyph), c.name.to_string(), detail]
         }).collect();
         print!("{}", ui::table(&[Col::left(""), Col::left("invariant"), Col::left("state")], &rows));
@@ -6768,7 +6837,7 @@ fn render(title: &str, checks: &[Check], verbose: bool) -> bool {
     // FAIL remedies always; WARN remedies too in the controller section (the
     // v0.2.95 roll: `service-key grants` warned with a remedy nobody saw).
     // Judged on every row, not the digest's: a grouped row keeps its remedy.
-    let grouped = remedies_to_print(title, checks);
+    let grouped = guide_remedies(title, checks, verbose);
     let whys: Vec<String> = grouped.iter().map(|(_, names)| names.join(", ")).collect();
     let entries: Vec<(&str, &str)> = grouped.iter().zip(&whys).map(|((r, _), w)| (*r, w.as_str())).collect();
     ui::guide(&entries);
@@ -7533,6 +7602,7 @@ fn checks_json(checks: &[Check]) -> Value {
     Value::Array(checks.iter().map(|c| serde_json::json!({
         "name": c.name,
         "verdict": match c.verdict { Verdict::Ok => "ok", Verdict::Warn => "warn", Verdict::Fail => "fail", Verdict::Starting => "starting", Verdict::Accepted => "accepted" },
+        "planned": planned_ref(c),
         "detail": c.detail,
         "remedy": c.remedy,
     })).collect())
@@ -12679,7 +12749,7 @@ mod digest_tests {
         // counted from the table, so a new at-rest row (tempo, i359) does not
         // break it.
         let passes = 6 + AT_REST_DIR_ROWS.len() - 1;
-        assert_eq!(d.counts, Counts { ok: passes, warn: 2, fail: 1, accepted: 0 });
+        assert_eq!(d.counts, Counts { ok: passes, warn: 2, fail: 1, accepted: 0, planned: 0 });
         assert!(d.rows.iter().all(|c| c.verdict != Verdict::Ok), "a passing row reached the digest: {:?}", d.rows);
         let names: Vec<&str> = d.rows.iter().map(|c| c.name).collect();
         assert_eq!(names, vec!["data at rest", "sandbox", "backup age"]);
@@ -12746,9 +12816,90 @@ mod digest_tests {
     fn an_accepted_row_stays_in_the_digest_and_is_counted_apart() {
         let checks = vec![ok("a", "ok"), accepted("postgres at rest", "accepted risk"), accepted("loki at rest", "accepted risk")];
         let d = digest(&checks, false);
-        assert_eq!(d.counts, Counts { ok: 1, warn: 0, fail: 0, accepted: 2 });
+        assert_eq!(d.counts, Counts { ok: 1, warn: 0, fail: 0, accepted: 2, planned: 0 });
         assert_eq!(d.rows.len(), 1);
         assert_eq!(d.rows[0].verdict, Verdict::Accepted);
+    }
+
+    /// The 0.6.20 pop-os controller's default output, by shape: two rows to
+    /// act on (privilege, the at-rest volume, which `create-volume` fixes
+    /// today), an operator choice (kiosk labels), the projection row, and the
+    /// planned i10a gaps (ten dirs and "outside the set").
+    fn popos() -> Vec<Check> {
+        let mut v: Vec<Check> = (0..3).map(|_| ok("bus", "ok")).collect();
+        v.push(warn("node-agent privilege", "not checked", Some("noo security posture list".into())));
+        v.push(warn("kiosk labels", "ON (set by the operator)", Some("noo kiosk labels off".into())));
+        for n in AT_REST_DIR_ROWS {
+            let r = if n == "pki at rest" || n == "age key at rest" { AT_REST_REMEDY_KEYS } else { AT_REST_REMEDY_DATA };
+            v.push(warn(n, "in the clear on that disk", Some(r.into())));
+        }
+        v.push(warn("at-rest outside the set", "docker volume claude-config …", Some("planned (i10a): ride the encrypted state volume".into())));
+        v.push(warn("at-rest volume", "no encrypted state volume", Some("noo security at-rest create-volume".into())));
+        v.push(warn("undeclared containers", "could not compute the compose projection", Some("noo doctor orphans".into())));
+        v
+    }
+
+    #[test]
+    fn planned_is_a_warning_whose_remedy_names_a_followup_and_never_a_failure() {
+        let p = warn("loki at rest", "x", Some(AT_REST_REMEDY_DATA.into()));
+        assert_eq!(planned_ref(&p), Some("i10a"));
+        // The guard: a Fail, an Accepted or a Starting row is never planned,
+        // whatever its remedy says, so nothing that fails can fold away.
+        assert_eq!(planned_ref(&fail("loki at rest", "x", AT_REST_REMEDY_DATA)), None);
+        assert_eq!(planned_ref(&Check { verdict: Verdict::Accepted, ..p.clone() }), None);
+        assert_eq!(planned_ref(&Check { verdict: Verdict::Starting, ..p.clone() }), None);
+        assert_eq!(planned_ref(&warn("x", "y", Some("noo security at-rest create-volume".into()))), None);
+        assert_eq!(planned_ref(&warn("x", "y", Some("planned (): nothing".into()))), None);
+    }
+
+    #[test]
+    fn the_planned_gaps_fold_into_one_line_and_the_rows_to_act_on_stay() {
+        let d = digest(&popos(), false);
+        let names: Vec<&str> = d.rows.iter().map(|c| c.name).collect();
+        assert_eq!(names, ["node-agent privilege", "kiosk labels", "at-rest volume", "undeclared containers", PLANNED_ROW]);
+        let line = d.rows.last().unwrap();
+        assert_eq!(line.verdict, Verdict::Warn, "the folded line keeps the rows' verdict");
+        assert!(line.detail.starts_with("11 known gap(s), planned (i10a): loki, tempo"), "{}", line.detail);
+        assert!(line.detail.contains("at-rest outside the set") && line.detail.ends_with("--verbose lists each"), "{}", line.detail);
+        // A failing row next to them is never folded.
+        let mut checks = popos();
+        checks.push(fail("sandbox", "bwrap", "noo sandbox doctor"));
+        assert!(digest(&checks, false).rows.iter().any(|c| c.name == "sandbox" && c.verdict == Verdict::Fail));
+    }
+
+    #[test]
+    fn the_counts_split_the_warnings_to_act_on_from_the_planned_ones() {
+        let d = digest(&popos(), false);
+        assert_eq!(d.counts, Counts { ok: 3, warn: 4, fail: 0, accepted: 0, planned: 11 });
+        let line = summary_line("controller", &d.counts);
+        assert!(line.contains("11 planned"), "{line}");
+        let mut t = Tally::default();
+        t.add("controller", &popos());
+        assert_eq!(verdict_line(&t).1, "fleet healthy; 4 row(s) above to read; 11 known gap(s) planned");
+    }
+
+    #[test]
+    fn verbose_and_json_show_every_planned_row_with_its_verdict() {
+        let checks = popos();
+        assert_eq!(digest(&checks, true).rows, checks, "--verbose is unchanged");
+        let j = checks_json(&checks);
+        let rows = j.as_array().unwrap();
+        assert_eq!(rows.len(), checks.len());
+        for (c, r) in checks.iter().zip(rows) {
+            let want = if c.verdict == Verdict::Ok { "ok" } else { "warn" };
+            assert_eq!(r["verdict"], want, "{}: a verdict changed", c.name);
+            assert_eq!(r["planned"].as_str(), planned_ref(c), "{}", c.name);
+        }
+        assert_eq!(rows.iter().filter(|r| r["planned"] == "i10a").count(), 11);
+    }
+
+    #[test]
+    fn the_default_guide_leaves_out_the_plans_and_keeps_the_commands() {
+        let checks = popos();
+        let kept: Vec<&str> = guide_remedies("controller", &checks, false).into_iter().map(|(r, _)| r).collect();
+        assert_eq!(kept, ["noo security posture list", "noo kiosk labels off", "noo security at-rest create-volume", "noo doctor orphans"]);
+        let all: Vec<&str> = guide_remedies("controller", &checks, true).into_iter().map(|(r, _)| r).collect();
+        assert!(all.iter().filter(|r| planned_remedy_ref(r).is_some()).count() == 3, "--verbose prints the plans: {all:?}");
     }
 
     #[test]
