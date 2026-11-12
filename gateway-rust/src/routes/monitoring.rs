@@ -53,7 +53,7 @@ pub fn router() -> Router<Arc<AppState>> {
 
 /// Where the gateway finds the SSO private key. `NOO_GRAFANA_SSO_KEY` names
 /// it outright (compose sets `/app/pki/sso/grafana.key`); otherwise the
-/// same PKI roots `autonomy_evaluators::count_certs_expiring_within` walks.
+/// same PKI roots `autonomy_evaluators::certs_expiring_within` walks.
 pub const GRAFANA_SSO_KEY_ENV: &str = "NOO_GRAFANA_SSO_KEY";
 /// Where the browser reaches Grafana: `GRAFANA_ROOT_URL` on the host, the
 /// URL the BROWSER uses, not the compose-network one.
