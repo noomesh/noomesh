@@ -41,6 +41,55 @@ const LSM_LIST: &str = "/sys/kernel/security/lsm";
 /// any user, unlike `apparmor/profiles` (root only).
 const LOADED_PROFILES: &str = "/sys/kernel/security/apparmor/policy/profiles";
 const ENV_KEY: &str = "NOO_SANDBOX_APPARMOR";
+/// The one rule an AppArmor 3.x parser (Ubuntu 22.04: 3.0) cannot read.
+pub(crate) const USERNS_RULE: &str = "userns,";
+/// Where the profile as rendered for THIS host's parser is kept for the
+/// operator's hand install, under the install root, when it differs from
+/// the bundled file.
+pub(crate) const RENDERED: &str = ".noo-apparmor-noo-sandbox";
+
+/// The major version in `apparmor_parser --version`'s first line
+/// ("AppArmor parser version 3.0.4"). `None` when it cannot be read.
+pub(crate) fn parser_major(version: &str) -> Option<u32> {
+    let line = version.lines().next()?;
+    let v = line.rsplit(' ').next()?;
+    v.split('.').next()?.parse().ok()
+}
+
+/// The profile this host's parser is given. AppArmor 4.0 added the `userns`
+/// rule class; a 3.x parser (Ubuntu 22.04) refuses the whole file on that
+/// one line ("syntax error, unexpected TOK_END_OF_RULE, expecting
+/// TOK_MODE"), and onboard stopped there. A 3.x parser compiles policy for
+/// an ABI with no user-namespace mediation, so the kernel does not ask the
+/// profile about user namespaces at all: dropping the line grants and
+/// withholds nothing there. Every other rule is the bundled file's, byte for
+/// byte. A 4.x parser, or one whose version cannot be read, gets the bundled
+/// file unchanged.
+pub(crate) fn render(bundled: &str, parser_major: Option<u32>) -> String {
+    if !matches!(parser_major, Some(m) if m < 4) {
+        return bundled.to_string();
+    }
+    bundled
+        .split_inclusive('\n')
+        .map(|l| {
+            if l.trim() == USERNS_RULE {
+                let indent = &l[..l.len() - l.trim_start().len()];
+                format!("{indent}# {USERNS_RULE} omitted: this host's AppArmor parser predates the rule (4.0); its policy does not mediate user namespaces\n")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect()
+}
+
+/// `apparmor_parser --version`, run without sudo. The parser sits in
+/// /usr/sbin or /sbin, which an ordinary user's PATH may lack.
+fn parser_version() -> Option<String> {
+    ["apparmor_parser", "/usr/sbin/apparmor_parser", "/sbin/apparmor_parser"].iter().find_map(|bin| {
+        let out = std::process::Command::new(bin).arg("--version").output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    })
+}
 
 /// The host's major LSM, from the comma list in `/sys/kernel/security/lsm`.
 #[derive(Debug, PartialEq, Eq)]
@@ -125,8 +174,23 @@ fn refuse(ctx: &mut Ctx, why: &str, src: &Path) {
 /// The services step's call, on the controller, before the stack starts.
 pub(crate) fn ensure(ctx: &mut Ctx) {
     let lsm = active_lsm(std::fs::read_to_string(LSM_LIST).ok().as_deref());
-    let src = ctx.repo_root.join(BUNDLED);
-    let bundled = std::fs::read(&src).ok();
+    let bundled_src = ctx.repo_root.join(BUNDLED);
+    let major = parser_version().as_deref().and_then(parser_major);
+    // What this host's parser is given (the bundled file, or it without the
+    // one rule a 3.x parser cannot read), and the file a hand install uses.
+    let bundled = std::fs::read_to_string(&bundled_src).ok().map(|b| render(&b, major).into_bytes());
+    let rendered_differs = bundled.is_some() && std::fs::read(&bundled_src).ok() != bundled;
+    let src = if rendered_differs {
+        let p = ctx.repo_root.join(RENDERED);
+        if !ctx.dry_run {
+            if let Some(b) = &bundled {
+                let _ = std::fs::write(&p, b);
+            }
+        }
+        p
+    } else {
+        bundled_src
+    };
     let same = bundled.is_some() && std::fs::read(INSTALLED).ok() == bundled;
     match plan(lsm, profile_loaded(Path::new(LOADED_PROFILES)), same) {
         Plan::Skip(why) => {
@@ -140,7 +204,7 @@ pub(crate) fn ensure(ctx: &mut Ctx) {
                 return;
             }
             if bundled.is_none() {
-                refuse(ctx, &format!("{} is missing from the install root", src.display()), &src);
+                refuse(ctx, &format!("{} is missing from the install root", ctx.repo_root.join(BUNDLED).display()), &src);
                 return;
             }
             if !ctx_sudo_may_prompt(ctx) && !passwordless_sudo() {
@@ -151,6 +215,10 @@ pub(crate) fn ensure(ctx: &mut Ctx) {
                 return;
             }
             ctx.progress("Installing the sandbox AppArmor profile (Bubblewrap needs mount under AppArmor)...");
+            if rendered_differs {
+                ctx.info(&format!("AppArmor parser {}.x: the profile is installed without its `{USERNS_RULE}` rule, which this parser cannot read and its policy does not mediate (every other rule unchanged)",
+                    major.unwrap_or(0)));
+            }
             let run = |ctx: &Ctx, args: &[&str]| ctx_sudo(ctx).args(args).status().map(|s| s.success()).unwrap_or(false);
             let src_s = src.to_string_lossy().into_owned();
             if !run(ctx, &["install", "-m", "0644", &src_s, INSTALLED]) {
@@ -229,6 +297,34 @@ mod tests {
         assert_eq!(env_change("docker-default"), Some(PROFILE), "Docker's default is the one that blocks bwrap");
         assert_eq!(env_change("noo-sandbox"), None);
         assert_eq!(env_change("my-site-profile"), None, "a hand-set profile is left alone");
+    }
+
+    #[test]
+    fn the_parser_version_is_read_from_its_first_line() {
+        assert_eq!(parser_major("AppArmor parser version 3.0.4\nCopyright (C) 1999-2008 Novell Inc.\n"), Some(3));
+        assert_eq!(parser_major("AppArmor parser version 4.0.1\n"), Some(4));
+        assert_eq!(parser_major(""), None);
+        assert_eq!(parser_major("garbage"), None);
+    }
+
+    #[test]
+    fn a_3x_parser_gets_the_profile_without_userns_and_nothing_else_changes() {
+        let bundled = include_str!("../../../docker/apparmor-noo-sandbox");
+        assert_eq!(render(bundled, Some(4)), bundled, "24.04: the bundled file, byte for byte");
+        assert_eq!(render(bundled, Some(5)), bundled);
+        assert_eq!(render(bundled, None), bundled, "an unread version keeps the bundled file");
+        let old = render(bundled, Some(3));
+        assert!(!old.lines().any(|l| l.trim() == USERNS_RULE), "no userns rule for a 3.x parser");
+        let a: Vec<&str> = bundled.lines().collect();
+        let b: Vec<&str> = old.lines().collect();
+        assert_eq!(a.len(), b.len(), "one line replaced, none added or lost");
+        let changed: Vec<(&str, &str)> = a.iter().zip(&b).filter(|(x, y)| x != y).map(|(x, y)| (*x, *y)).collect();
+        assert_eq!(changed.len(), 1, "{changed:?}");
+        assert_eq!(changed[0].0.trim(), USERNS_RULE);
+        assert!(changed[0].1.trim_start().starts_with('#'), "the line becomes a comment: {}", changed[0].1);
+        for rule in ["mount,", "pivot_root,", "umount,", "deny @{PROC}/kcore rwklx,", "ptrace (trace,read,tracedby,readby) peer=noo-sandbox,"] {
+            assert!(b.iter().any(|l| l.trim() == rule), "{rule} kept");
+        }
     }
 
     #[test]
