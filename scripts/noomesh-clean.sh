@@ -201,59 +201,86 @@ ui_step "Removing dangling images"
 docker image prune -f 2>/dev/null
 ui_done "Dangling images removed"
 
+# --- Volumes: this install's compose project, and nothing else ---
+# The project is the `name:` the compose files declare (noomesh), or
+# noo-<instance> for a named instance (lib-instance.sh's noo_instance_env,
+# run when it was sourced above).
+clean_project() {
+    printf '%s\n' "${COMPOSE_PROJECT_NAME:-noomesh}"
+}
+
+# The volumes whose com.docker.compose.project label IS this project, by
+# docker's exact label filter. Never a name glob: a box can run several
+# stacks (another instance, a dev checkout, someone else's compose project).
+# The old `name=pai-assistant` filter matched no volume at all after the
+# project rename, so --volumes/--deep removed nothing (i677a).
+stack_volumes() {
+    docker volume ls --filter "label=com.docker.compose.project=$1" --format '{{.Name}}'
+}
+
+# plan_volumes DEEP VOLUME... -> one "<action> <volume>" line each:
+#   keep    hf-cache always; postgres-data/redis-data without --deep
+#   ask     postgres-data/redis-data on --deep (asked one by one)
+#   remove  everything else of this project
+plan_volumes() {
+    local deep="$1" vol; shift
+    for vol in "$@"; do
+        case "$vol" in
+            *hf-cache*) echo "keep $vol" ;;
+            *postgres-data*|*redis-data*)
+                if [ "$deep" = true ]; then echo "ask $vol"; else echo "keep $vol"; fi ;;
+            *) echo "remove $vol" ;;
+        esac
+    done
+}
+
 if [ "$REMOVE_VOLUMES" = true ]; then
     echo ""
-    # Always protect hf-cache (models live on D: drive)
-    PROTECTED="hf-cache"
-    # Stateful volumes that need explicit confirmation on --deep
-    CONFIRM_VOLUMES="postgres-data redis-data"
-
-    if [ "$DEEP_CLEAN" = true ]; then
-        ui_step "Removing volumes (deep clean)"
+    PROJECT="$(clean_project)"
+    # shellcheck disable=SC2046  # volume names have no spaces
+    PLAN="$(plan_volumes "$DEEP_CLEAN" $(stack_volumes "$PROJECT"))"
+    ui_step "Volumes of compose project $(ui_emph "$PROJECT") (this install only)"
+    if [ -z "$PLAN" ]; then
+        ui_note "none"
     else
-        ui_step "Removing volumes (preserving stateful data)"
-        # Non-deep: also protect postgres and redis automatically
-        PROTECTED="$PROTECTED postgres-data redis-data"
-    fi
-
-    docker volume ls --filter "name=pai-assistant" --format "{{.Name}}" | while read vol; do
-        skip=false
-        for p in $PROTECTED; do
-            if [[ "$vol" == *"$p"* ]]; then
-                ui_note "keeping $vol (protected)"
-                skip=true
-                break
-            fi
+        # Listed BEFORE anything is asked or removed.
+        printf '%s\n' "$PLAN" | while read -r act vol; do
+            case "$act" in
+                remove) echo "  remove  $vol" ;;
+                keep)   echo "  keep    $vol" ;;
+                ask)    echo "  ask     $vol (stateful)" ;;
+            esac
         done
-        if [ "$skip" = false ]; then
-            docker volume rm "$vol" 2>/dev/null && echo -e "  Removed $vol"
+    fi
+    TO_REMOVE="$(printf '%s\n' "$PLAN" | awk '$1=="remove"{print $2}')"
+    if [ -n "$TO_REMOVE" ] && confirm "Remove the $(printf '%s\n' "$TO_REMOVE" | wc -l | tr -d ' ') volume(s) marked remove?"; then
+        for vol in $TO_REMOVE; do
+            docker volume rm "$vol" >/dev/null 2>&1 && echo "  Removed $vol"
+        done
+    fi
+    for vol in $(printf '%s\n' "$PLAN" | awk '$1=="ask"{print $2}'); do
+        echo ""
+        ui_warned "Stateful volume: $(ui_emph "$vol")"
+        case "$vol" in
+            *postgres-data*) ui_note "$(ui_bad "removing this deletes ALL conversation history, knowledge base, user accounts, and scheduled tasks")" ;;
+            *redis-data*)    ui_note "$(ui_bad "removing this clears the LLM response cache and all active sessions")" ;;
+        esac
+        if confirm "Remove $vol?"; then
+            docker volume rm "$vol" >/dev/null 2>&1 && ui_done "Removed $vol" && TO_REMOVE="$TO_REMOVE $vol"
+        else
+            ui_note "kept $vol"
         fi
     done
-
-    # Deep clean: prompt for stateful volumes individually
-    if [ "$DEEP_CLEAN" = true ]; then
-        for cv in $CONFIRM_VOLUMES; do
-            MATCH=$(docker volume ls --filter "name=pai-assistant" --format "{{.Name}}" | grep "$cv" || true)
-            if [ -n "$MATCH" ]; then
-                echo ""
-                ui_warned "Stateful volume found: $(ui_emph "$MATCH")"
-                case "$cv" in
-                    postgres-data)
-                        ui_note "$(ui_bad "removing this deletes ALL conversation history, knowledge base, user accounts, and scheduled tasks")"
-                        ;;
-                    redis-data)
-                        ui_note "$(ui_bad "removing this clears the LLM response cache and all active sessions")"
-                        ;;
-                esac
-                if confirm "Remove $MATCH?"; then
-                    docker volume rm "$MATCH" 2>/dev/null && ui_done "Removed $MATCH"
-                else
-                    ui_note "kept $MATCH"
-                fi
-            fi
-        done
+    # Re-list: a volume this run agreed to remove and that is still there is
+    # a failure, never "complete" (a verdict must see what it vouches for).
+    STILL=""
+    for vol in $TO_REMOVE; do
+        stack_volumes "$PROJECT" | grep -qx "$vol" && STILL="$STILL $vol"
+    done
+    if [ -n "$STILL" ]; then
+        ui_close_failed "volume(s) still present after removal:$STILL" "docker volume rm$STILL"
+        exit 1
     fi
-
     ui_done "Volume cleanup complete"
 fi
 
