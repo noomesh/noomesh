@@ -862,6 +862,18 @@ pub fn mesh_clean(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if all || deep || volumes || images || cache || hf_cache {
         super::confirm_destructive(g, yes, "Clean all Docker resources on", "this host");
     }
+    // i677 #20: docker must ANSWER before anything is stopped or removed. A
+    // shell outside the docker group made every docker call fail, and a
+    // failure read as "nothing there" deletes the wrong things. Not installed
+    // at all is a positive answer (the script then cleans what is on disk).
+    if let Err(why) = super::offboard::docker_access() {
+        let lines = super::offboard::docker_unreachable_refusal(&why, "noo stack clean");
+        for l in &lines[1..] {
+            println!("{}", ui::note(l));
+        }
+        ui::close_failed(&lines[0], Some("docker ps"));
+        return Ok(1);
+    }
     if all || deep || volumes {
         // The self-heal watcher would resurrect the stack onto the box we
         // are about to declare clean (host8, 2026-08-31). Full teardown

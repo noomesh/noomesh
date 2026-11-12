@@ -159,3 +159,53 @@ def test_an_existing_installs_unlabelled_noo_data_is_in_the_plan_once(tmp_path):
     assert _field_plan(tmp_path / "b", "noomesh") == [
         "keep noomesh_postgres-data", "remove noomesh_nats", "remove noomesh_noo-data",
     ]
+
+
+def _gate_run(tmp_path, docker_body: str | None):
+    """Run the REAL script up to (at most) its first step with a fake docker
+    and fake helpers, so only the gate decides. The fake docker logs calls."""
+    bindir = tmp_path / "gbin"
+    bindir.mkdir()
+    log = tmp_path / "calls.log"
+    if docker_body is not None:
+        d = bindir / "docker"
+        d.write_text("#!/bin/sh\n" + f'printf "%s\\n" "$*" >> "{log}"\n' + docker_body)
+        d.chmod(0o755)
+    src = SCRIPT.read_text()
+    i = src.index("# i677 #20: docker must ANSWER")
+    j = src.index("\nfi\n", i) + 4
+    script = src[i:j] + 'echo "PAST THE GATE"\n'
+    env = {"PATH": f"{bindir}:/usr/bin:/bin"}
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=30)
+    calls = log.read_text().splitlines() if log.exists() else []
+    return r, calls
+
+
+def test_a_docker_that_does_not_answer_stops_the_clean_before_anything(tmp_path):
+    r, calls = _gate_run(tmp_path, 'echo "permission denied while trying to connect to the docker API at unix:///var/run/docker.sock" >&2\nexit 1\n')
+    assert r.returncode == 1 and "PAST THE GATE" not in r.stdout
+    assert "cannot reach docker (permission denied while trying to connect to the docker API" in r.stderr
+    assert "nothing was removed" in r.stderr and "newgrp docker" in r.stderr and "sudo noo stack clean" in r.stderr
+    assert calls == ["info --format {{.ServerVersion}}"], "nothing but the probe ran"
+
+
+def test_a_daemon_that_is_down_stops_the_clean_too(tmp_path):
+    r, _ = _gate_run(tmp_path, 'echo "" >&2; echo "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?" >&2\nexit 1\n')
+    assert r.returncode == 1
+    assert "cannot reach docker (Cannot connect to the Docker daemon" in r.stderr
+
+
+def test_an_answering_docker_or_no_docker_at_all_passes_the_gate(tmp_path):
+    r, _ = _gate_run(tmp_path, 'echo 29.0.1\nexit 0\n')
+    assert r.returncode == 0 and "PAST THE GATE" in r.stdout
+    (tmp_path / "b").mkdir()
+    r, _ = _gate_run(tmp_path / "b", None)
+    assert r.returncode == 0 and "PAST THE GATE" in r.stdout, "no docker binary: a positive answer, the files are still cleaned"
+
+
+def test_the_gate_comes_before_every_removal_in_the_script():
+    src = SCRIPT.read_text()
+    gate = src.index("# i677 #20: docker must ANSWER")
+    for needle in ["docker compose", "docker volume rm", "docker image prune", "remove_secret_files", "untrust-ca", "rm -rf"]:
+        k = src.find(needle)
+        assert k == -1 or k > gate, f"{needle} runs before the gate"
