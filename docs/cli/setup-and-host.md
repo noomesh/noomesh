@@ -286,7 +286,7 @@ on the tailnet. It ends with a silent re-audit and `offboard complete`.
 |---|---|---|
 | `noo enroll` | `<noo1.blob> \| --url <u> --token <t> \| --via-tailnet <u> [--ca-sha256 <hex>] [--ts-authkey <k>] [--node <name>] [--skip-tailscale] [--skip-prep] [--data-root <dir>] [--controller-approvals] [--resume]` | Enroll this machine as a worker of the given controller |
 
-### `noo offboard` — Leave the fleet: stop the agent, remove enrollment state (confirms)
+### `noo offboard` — Tear a standalone controller down to bare machine prep (confirms each step)
 | Command | Arguments | What it does |
 |---|---|---|
 | `noo offboard` | `[--check] [-y\|--yes] [--keep-tailnet] [--purge-secrets] [--uninstall]` | Tear a standalone controller down to bare prep; destructive, confirms each step (-y) |
