@@ -1569,24 +1569,13 @@ async fn birth_cert_for(db: &sqlx::PgPool, node: &str) -> Result<Option<String>,
 /// node's GET just served it); otherwise hashed in Postgres ONCE, with the
 /// row's key in the same statement, and remembered.
 async fn staged_sha(db: &sqlx::PgPool, node: &str) -> Result<Option<String>, AppError> {
-    let facts: Option<(chrono::DateTime<chrono::Utc>, i64)> =
-        sqlx::query_as("SELECT created_at, octet_length(blob)::bigint FROM noo_provision_bundles WHERE node_name = $1")
-            .bind(node)
-            .fetch_optional(db)
-            .await?;
-    let Some((created_at, len)) = facts else { return Ok(None) };
-    let current = crate::bundle_etag::Key { created_at_micros: created_at.timestamp_micros(), len };
+    let Some(current) = crate::repo::provision_bundles::key(db, node).await? else { return Ok(None) };
     if let Some(sha) = crate::bundle_etag::cached_sha(node, current) {
         return Ok(Some(sha));
     }
-    let row: Option<(chrono::DateTime<chrono::Utc>, i64, String)> = sqlx::query_as(
-        "SELECT created_at, octet_length(blob)::bigint, encode(sha256(blob), 'hex') FROM noo_provision_bundles WHERE node_name = $1",
-    )
-    .bind(node)
-    .fetch_optional(db)
-    .await?;
-    Ok(row.map(|(created_at, len, sha)| {
-        crate::bundle_etag::remember(node, crate::bundle_etag::Key { created_at_micros: created_at.timestamp_micros(), len }, &sha);
+    let row = crate::repo::provision_bundles::sha_in_sql(db, node).await?;
+    Ok(row.map(|(key, sha)| {
+        crate::bundle_etag::remember(node, key, &sha);
         sha
     }))
 }
@@ -1727,13 +1716,9 @@ async fn provision_bundle_get(
         return (StatusCode::BAD_REQUEST, "invalid node name").into_response();
     }
     // The current row's key, without its bytes.
-    let facts: Result<Option<(chrono::DateTime<chrono::Utc>, i64)>, _> =
-        sqlx::query_as("SELECT created_at, octet_length(blob)::bigint FROM noo_provision_bundles WHERE node_name = $1")
-            .bind(&node)
-            .fetch_optional(&state.db)
-            .await;
+    let facts = crate::repo::provision_bundles::key(&state.db, &node).await;
     let current = match facts {
-        Ok(Some((created_at, len))) => crate::bundle_etag::Key { created_at_micros: created_at.timestamp_micros(), len },
+        Ok(Some(key)) => key,
         Ok(None) => return (StatusCode::NOT_FOUND, "no bundle staged").into_response(),
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "bundle lookup failed").into_response(),
     };
@@ -1744,16 +1729,11 @@ async fn provision_bundle_get(
     }
     // The bytes and their key in ONE read, so the cached sha is the sha of
     // exactly what is sent, whatever was re-staged in between.
-    let row: Result<Option<(Vec<u8>, chrono::DateTime<chrono::Utc>)>, _> =
-        sqlx::query_as("SELECT blob, created_at FROM noo_provision_bundles WHERE node_name = $1")
-            .bind(&node)
-            .fetch_optional(&state.db)
-            .await;
+    let row = crate::repo::provision_bundles::blob(&state.db, &node).await;
     match row {
-        Ok(Some((blob, created_at))) => {
+        Ok(Some((key, blob))) => {
             use sha2::{Digest, Sha256};
             let sha = hex::encode(Sha256::digest(&blob));
-            let key = crate::bundle_etag::Key { created_at_micros: created_at.timestamp_micros(), len: blob.len() as i64 };
             crate::bundle_etag::remember(&node, key, &sha);
             crate::bundle_etag::count(&node, false, 0);
             (
@@ -1854,14 +1834,17 @@ mod tests {
     fn the_bundle_get_decides_the_304_before_reading_the_blob() {
         let code = crate::test_src::own_code(include_str!("bootstrap.rs"));
         let body = crate::test_src::fn_body(&code, "async fn provision_bundle_get(");
-        let facts = body.find("SELECT created_at, octet_length(blob)::bigint FROM noo_provision_bundles").expect("the key read");
+        // The repo CALLS in order; what each one reads is pinned in
+        // repo::provision_bundles (key() never selects the bytes).
+        let facts = body.find("crate::repo::provision_bundles::key(&state.db, &node)").expect("the key read");
         let decide = body.find("crate::bundle_etag::decide_304(&node, current, if_none_match)").expect("the 304 decision");
         let not_modified = body.find("StatusCode::NOT_MODIFIED").expect("the 304");
-        let blob = body.find("SELECT blob, created_at FROM noo_provision_bundles").expect("the blob read");
+        let blob = body.find("crate::repo::provision_bundles::blob(&state.db, &node)").expect("the blob read");
         assert!(facts < decide && decide < not_modified && not_modified < blob, "{body}");
+        assert_eq!(body.matches("crate::repo::provision_bundles::").count(), 2, "exactly the key read and the blob read: {body}");
         assert_eq!(body.matches("axum::http::header::ETAG").count(), 2, "both answers carry the ETag: {body}");
         assert!(body.contains("crate::bundle_etag::remember(&node, key, &sha)"), "{body}");
-        assert!(!body.contains("sha256(blob)"), "no hashing in SQL on the GET");
+        assert!(!body.contains("sha_in_sql") && !body.contains("sqlx::"), "no SQL hash and no inline SQL on the GET: {body}");
     }
 
     /// The receipt and apply checks, and the status route, no longer hash
@@ -1871,10 +1854,11 @@ mod tests {
     fn the_staged_sha_reads_the_cache_before_hashing_in_sql() {
         let code = crate::test_src::own_code(include_str!("bootstrap.rs"));
         let body = crate::test_src::fn_body(&code, "async fn staged_sha(");
+        let key = body.find("crate::repo::provision_bundles::key(db, node)").expect("the key read");
         let cached = body.find("crate::bundle_etag::cached_sha(node, current)").expect("the cache");
-        let hashed = body.find("encode(sha256(blob), 'hex')").expect("the fallback");
-        assert!(cached < hashed, "{body}");
-        assert!(body.contains("crate::bundle_etag::remember("), "{body}");
+        let hashed = body.find("crate::repo::provision_bundles::sha_in_sql(db, node)").expect("the fallback");
+        assert!(key < cached && cached < hashed, "{body}");
+        assert!(body.contains("crate::bundle_etag::remember(node, key, &sha)"), "{body}");
         let status = crate::test_src::fn_body(&code, "async fn provision_bundle_status(");
         assert!(!status.contains("sha256(blob)") && status.contains("staged_sha(&state.db, &node)"), "{status}");
     }
