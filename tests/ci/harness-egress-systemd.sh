@@ -160,7 +160,11 @@ echo "kernel $(uname -r); cgroup fs: $(stat -fc %T /sys/fs/cgroup)"
 tr ' ' '\n' < /proc/cmdline | grep -iE 'cgroup|systemd|bpf|lockdown' || echo "(no cgroup/bpf/lockdown switches on the kernel command line)"
 cat /sys/kernel/security/lockdown 2>/dev/null || true
 systemctl show noo-harness -p IPAccounting -p IPIngressBytes -p IPEgressBytes -p ControlGroup
-journalctl -b --no-pager -o cat 2>/dev/null | grep -iE 'bpf|firewall|IPAddress' | tail -20 || true
+# systemd's own word only (the Azure agent's "Firewall" lines are not systemd's).
+journalctl -b _PID=1 --no-pager -o cat 2>/dev/null | grep -iE 'bpf|firewall|IPAddress|attach|cgroup' | head -30 || true
+echo "unprivileged_bpf_disabled=$(cat /proc/sys/kernel/unprivileged_bpf_disabled 2>/dev/null)"
+# Does ANY systemd BPF program attach? IP accounting uses the same mechanism.
+timeout 20 systemd-run --wait --collect -p IPAccounting=yes /bin/bash -c 'exec 3<>/dev/tcp/127.0.0.1/18443; echo hi >&3' 2>&1 | grep -iE 'IP traffic|Finished|Failed' || true
 journalctl -u noo-harness -b --no-pager -o cat 2>/dev/null | tail -15 || true
 grep -E 'CONFIG_CGROUP_BPF|CONFIG_BPF_SYSCALL' "/boot/config-$(uname -r)" 2>/dev/null || true
 timeout 15 systemd-run --wait --pipe --quiet --collect -p IPAccounting=yes -p 'IPAddressDeny=0.0.0.0/0 ::/0' -p 'IPAddressAllow=127.0.0.1/32' /bin/bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>&1 | head -3 || true
