@@ -437,6 +437,24 @@ after the stack starts, for example with
 or `ollama.com`. The exception is a model download or cloud call you
 started yourself.
 
+For the whole picture, run [`egress-capture.sh`](egress-capture.sh) on the
+host for as long as you like:
+
+```bash
+sudo docs/security/egress-capture.sh --minutes 60 --out ./egress-$(hostname)
+```
+
+It records every outbound connection the machine makes while it runs (the
+containers' included), names each destination from DNS and the TLS server
+name, says which container or process made it and how many bytes went each
+way, and writes a table to `egress.md`. It keeps no payloads, changes no
+firewall rule (it turns on the kernel's per-connection byte counters and
+restores the setting when it stops), writes only to `--out`, and says what it
+cannot see. It needs root, `conntrack`, `tcpdump`, `ss` and `python3`, and
+refuses without them. Leave the stack idle while it runs and the table should
+be empty; run it across a model download or a chat with a cloud model and you
+will see exactly that traffic and nothing else.
+
 ## Outbound traffic that is not telemetry
 
 Each item below runs only when you start it, either directly or through a
