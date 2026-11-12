@@ -78,15 +78,20 @@ the last lines of the log.
 
 ```sh
 noo stack clean                  # containers, orphans, dangling images, build cache
-noo stack clean --volumes -y     # also the volumes (keeps hf-cache, postgres and redis)
-noo stack clean --deep -y        # everything: all images, data dirs, PKI and secrets
+noo stack clean --volumes -y     # also this project's volumes (keeps hf-cache, postgres, redis and noo-data)
+noo stack clean --deep -y        # also postgres/redis/nats data, the PKI, the Mesh secret files, every unused image on the host
 noo stack reset --dist           # deep clean → noo onboard → start from released images
 ```
 
-`--volumes`, `--all` and `--deep` ask for confirmation (`-y` skips;
-`--json` or a pipe refuses rather than blocks) and stop the self-heal
-daemons first. `--deep` untrusts the old CA from the OS store before it
-deletes the PKI dir, so a browser does not keep a stale root. `reset`
+Every flag that deletes something asks for confirmation (`-y` skips;
+`--json` or a pipe refuses rather than blocks). `--volumes`, `--all` and
+`--deep` stop the self-heal daemons first. `--deep` is not "everything": it
+keeps `.env`, the model cache, the rest of the data root, the age key and
+any non-Mesh file in `secrets/`. Its image prune is host-wide, not only
+noomesh's images. With `noo` on PATH, `--deep` untrusts the old CA from the
+OS store before it deletes the PKI dir, so a browser does not keep a stale
+root. To return a machine to "never installed", see
+[Start over](../getting-started/start-over.md). `reset`
 chains a deep clean, `noo onboard --skip-services` (`--ci` for the
 non-interactive wizard, `--keep-env` to keep `.env`) and `noo stack
 start`; on a TTY the script asks you to type `reset`.
