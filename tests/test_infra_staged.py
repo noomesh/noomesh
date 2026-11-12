@@ -131,28 +131,83 @@ HIGH = ("CVE-1", "libx", "HIGH", "1.2")
 CRIT = ("CVE-2", "liby", "CRITICAL", "3.0")
 
 
+A64, R64 = "linux-amd64", "linux-arm64"
+
+
 def test_only_a_new_fixable_high_or_critical_finding_blocks():
-    assert S.new_findings([_report(HIGH)], [_report(HIGH)]) == set(), "an inherited finding is not new"
-    assert S.new_findings([_report(HIGH, CRIT)], [_report(HIGH)]) == {("CVE-2", "liby")}
-    assert S.new_findings([_report(("CVE-3", "z", "MEDIUM", "1"))], [_report()]) == set()
-    assert S.new_findings([_report(("CVE-4", "z", "HIGH", ""))], [_report()]) == set(), "no fix: not gated"
+    assert S.new_findings({A64: _report(HIGH)}, {A64: _report(HIGH)}) == set(), "an inherited finding is not new"
+    assert S.new_findings({A64: _report(HIGH, CRIT)}, {A64: _report(HIGH)}) == {("CVE-2", "liby")}
+    assert S.new_findings({A64: _report(("CVE-3", "z", "MEDIUM", "1"))}, {A64: _report()}) == set()
+    assert S.new_findings({A64: _report(("CVE-4", "z", "HIGH", ""))}, {A64: _report()}) == set(), "no fix: not gated"
     # one platform's report is enough to block
-    assert S.new_findings([_report(), _report(CRIT)], [_report(), _report()]) == {("CVE-2", "liby")}
+    assert S.new_findings({A64: _report(), R64: _report(CRIT)}, {A64: _report(), R64: _report()}) == {("CVE-2", "liby")}
     # nothing staged yet: the first run stages what it built
-    assert S.new_findings([_report(CRIT)], None) == set()
+    assert S.new_findings({A64: _report(CRIT)}, None) == set()
+
+
+def test_each_platform_is_compared_with_its_own_old_copy():
+    # Before 2026-11-11 the reports were pooled: an arm64 finding that only the
+    # old AMD64 copy had counted as inherited.
+    assert S.new_findings({A64: _report(), R64: _report(CRIT)}, {A64: _report(CRIT), R64: _report()}) == \
+        {("CVE-2", "liby")}
+
+
+def test_a_platform_the_staged_copy_lacks_is_gated_in_full():
+    # whisper/piper 2026-11-11: :staged amd64-only, the daily build amd64+arm64.
+    # The arm64 side has no baseline: every fixable HIGH/CRITICAL on it is new.
+    assert S.new_findings({A64: _report(HIGH), R64: _report(HIGH, CRIT)}, {A64: _report(HIGH)}) == \
+        {("CVE-1", "libx"), ("CVE-2", "liby")}
+    assert S.new_findings({A64: _report(HIGH), R64: _report()}, {A64: _report(HIGH)}) == set(), \
+        "a clean new platform passes"
+    assert S.new_findings({R64: _report(HIGH)}, {}) == {("CVE-1", "libx")}, \
+        "a :staged with NONE of the new platforms is not 'nothing staged': still gated"
+
+
+def test_the_platforms_of_a_manifest_list_leave_attestations_out(tmp_path):
+    index = {"manifests": [{"platform": {"os": "linux", "architecture": "amd64"}},
+                           {"platform": {"os": "unknown", "architecture": "unknown"}},
+                           {"platform": {"os": "linux", "architecture": "arm64"}}]}
+    assert S.index_platforms(index) == ["linux/amd64", "linux/arm64"]
+    assert S.index_platforms({"mediaType": "application/vnd.oci.image.manifest.v1+json"}) == []
+    r = subprocess.run([sys.executable, str(ROOT / "scripts/infra-staged.py"), "platforms"],
+                       input=json.dumps(index), capture_output=True, text=True)
+    assert r.returncode == 0 and r.stdout.strip() == "linux/amd64 linux/arm64"
+    r = subprocess.run([sys.executable, str(ROOT / "scripts/infra-staged.py"), "platforms"],
+                       input="", capture_output=True, text=True)
+    assert r.returncode != 0, "an unreadable index must fail the step, not read as 'no platforms'"
+
+
+def _gate(*args):
+    return subprocess.run([sys.executable, str(ROOT / "scripts/infra-staged.py"), "new-findings", *args],
+                          capture_output=True, text=True)
 
 
 def test_the_gate_exits_1_on_a_new_finding_so_staged_stays(tmp_path):
-    new, old = tmp_path / "new.json", tmp_path / "old.json"
+    (tmp_path / "new").mkdir()
+    (tmp_path / "old").mkdir()
+    new, old = tmp_path / "new" / f"{A64}.json", tmp_path / "old" / f"{A64}.json"
     new.write_text(json.dumps(_report(HIGH, CRIT)))
     old.write_text(json.dumps(_report(HIGH)))
-    run = lambda *a: subprocess.run([sys.executable, str(ROOT / "scripts/infra-staged.py"), "new-findings", *a],
-                                    capture_output=True, text=True)
-    r = run("--new", str(new), "--old", str(old))
+    r = _gate("--new", str(new), "--old", str(old))
     assert r.returncode == 1 and "NEW CVE-2 liby" in r.stdout and "keeping the previous :staged" in r.stderr
     old.write_text(json.dumps(_report(HIGH, CRIT)))
-    assert run("--new", str(new), "--old", str(old)).returncode == 0
-    assert run("--new", str(new)).returncode == 0
+    assert _gate("--new", str(new), "--old", str(old)).returncode == 0
+    assert _gate("--new", str(new)).returncode == 0
+
+
+def test_the_gate_holds_a_new_platform_from_files_named_by_platform(tmp_path):
+    # The real file layout: scan/new/<os-arch>.json, scan/old/<os-arch>.json.
+    (tmp_path / "new").mkdir()
+    (tmp_path / "old").mkdir()
+    (tmp_path / "new" / f"{A64}.json").write_text(json.dumps(_report(HIGH)))
+    (tmp_path / "new" / f"{R64}.json").write_text(json.dumps(_report(HIGH, CRIT)))
+    (tmp_path / "old" / f"{A64}.json").write_text(json.dumps(_report(HIGH)))
+    new = [str(tmp_path / "new" / f"{x}.json") for x in (A64, R64)]
+    r = _gate("--new", *new, "--old", str(tmp_path / "old" / f"{A64}.json"))
+    assert r.returncode == 1 and "NEW CVE-2 liby" in r.stdout and "NEW CVE-1 libx" in r.stdout, r.stdout
+    assert f"{R64}: the current :staged has no {R64} copy" in r.stdout
+    r = _gate("--new", *new, "--old")  # staged, but none of the new platforms
+    assert r.returncode == 1, "--old with no reports is a staged copy with no baseline, not 'nothing staged'"
 
 
 # ------------------------------------------------------------ the workflow
@@ -188,6 +243,15 @@ def test_staged_moves_only_after_the_scan_gate_and_the_build_pushes_only_a_date_
 def _buildx_lines(run):
     lines = [l.strip().rstrip("\\").strip() for l in run.split("docker buildx build", 1)[1].splitlines()]
     return [l for l in lines if l]
+
+
+def test_the_old_staged_is_scanned_only_for_the_platforms_it_has():
+    scan = _steps()[_idx("Scan the new build")]["run"]
+    assert '| python3 scripts/infra-staged.py platforms)"' in scan
+    assert 'case " $old_platforms " in *" $p "*)' in scan, "only a platform the old index has is scanned"
+    gate = _steps()[_idx("Gate")]["run"]
+    assert "shopt -s nullglob" in gate and '--old "${olds[@]}"' in gate, \
+        "the gate gets exactly the old reports that exist, possibly none"
 
 
 def test_the_daily_build_is_the_release_build_plus_labels():

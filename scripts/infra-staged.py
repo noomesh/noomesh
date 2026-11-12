@@ -349,15 +349,34 @@ def findings(report: dict) -> set[tuple[str, str]]:
     return out
 
 
-def new_findings(new_reports: list[dict], old_reports: list[dict] | None) -> set[tuple[str, str]]:
-    """Pairs in the new build that the current :staged lacks. No staged copy
-    yet (None): nothing is "new" — the first run stages what it built and its
-    findings are listed, not gated."""
-    new = set().union(*(findings(r) for r in new_reports)) if new_reports else set()
+def index_platforms(index: dict) -> list[str]:
+    """`os/arch` of every image in a manifest list (attestation entries,
+    platform unknown/unknown, left out); a single-platform manifest gives []
+    because it names none."""
+    out = []
+    for m in index.get("manifests") or []:
+        p = m.get("platform") or {}
+        if p.get("os") and p.get("os") != "unknown" and p.get("architecture") and p.get("architecture") != "unknown":
+            out.append(f"{p['os']}/{p['architecture']}")
+    return out
+
+
+def new_findings(new_reports: dict[str, dict], old_reports: dict[str, dict] | None) -> set[tuple[str, str]]:
+    """Pairs in the new build that the current :staged lacks, PER PLATFORM:
+    a platform's new report is compared with the SAME platform's old one.
+
+    No staged copy at all (None): nothing is "new" - the first run stages
+    what it built and its findings are listed, not gated. A staged copy that
+    lacks a platform the new build has (2026-11-11: whisper and piper :staged
+    were amd64-only, the daily build is amd64+arm64): that platform has no
+    baseline, so EVERY one of its fixable HIGH/CRITICAL findings counts as
+    new. Never skipped: a new platform is held to the gate in full."""
     if old_reports is None:
         return set()
-    old = set().union(*(findings(r) for r in old_reports)) if old_reports else set()
-    return new - old
+    out: set[tuple[str, str]] = set()
+    for platform, report in new_reports.items():
+        out |= findings(report) - (findings(old_reports[platform]) if platform in old_reports else set())
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -373,10 +392,14 @@ def main(argv: list[str] | None = None) -> int:
     rd = sub.add_parser("rebase-dockerfile", help="rewrite IMAGE's Dockerfile in place onto --bases")
     rd.add_argument("image")
     rd.add_argument("--bases", required=True)
+    sub.add_parser("platforms", help="read a manifest list (JSON) on stdin, print its os/arch list")
     nf = sub.add_parser("new-findings")
     nf.add_argument("--new", nargs="+", required=True, help="Trivy JSON reports of the new build")
     nf.add_argument("--old", nargs="*", help="Trivy JSON reports of the current :staged (omit: none staged yet)")
     a = ap.parse_args(argv)
+    if a.cmd == "platforms":
+        print(" ".join(index_platforms(json.load(sys.stdin))))
+        return 0
     if a.cmd == "matrix":
         print(json.dumps(daily_matrix(release_matrix()), separators=(",", ":")))
         return 0
@@ -403,17 +426,21 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     def load(paths):
-        out = []
+        # One report per platform, named for it (scan/new/linux-amd64.json).
+        out = {}
         for p in paths:
             with open(p) as f:
-                out.append(json.load(f))
+                out[os.path.splitext(os.path.basename(p))[0]] = json.load(f)
         return out
     new = load(a.new)
     old = load(a.old) if a.old is not None else None
     found = sorted(new_findings(new, old))
-    total = sorted(set().union(*(findings(r) for r in new)))
+    total = sorted(set().union(*(findings(r) for r in new.values())))
     print(f"fixable HIGH/CRITICAL in the new build: {len(total)}"
           + ("" if old is not None else " (no :staged yet: not gated)"))
+    if old is not None:
+        for platform in sorted(set(new) - set(old)):
+            print(f"  {platform}: the current :staged has no {platform} copy, so every finding on it counts as new")
     for vid, pkg in total:
         print(f"  {'NEW ' if (vid, pkg) in found else '    '}{vid} {pkg}")
     if found:
