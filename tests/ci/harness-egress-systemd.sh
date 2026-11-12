@@ -154,6 +154,17 @@ systemctl show noo-harness -p MainPID -p IPAddressDeny -p IPAddressAllow -p Bind
 systemctl --version | head -1
 check "unit property IPAddressDeny is set" bash -c "systemctl show noo-harness -p IPAddressDeny --value | grep -q ."
 
+# Why a deny would not be enforced: systemd's own word and the kernel's state.
+echo "--- enforcement diagnostics"
+echo "kernel $(uname -r); cgroup fs: $(stat -fc %T /sys/fs/cgroup)"
+tr ' ' '\n' < /proc/cmdline | grep -iE 'cgroup|systemd|bpf|lockdown' || echo "(no cgroup/bpf/lockdown switches on the kernel command line)"
+cat /sys/kernel/security/lockdown 2>/dev/null || true
+systemctl show noo-harness -p IPAccounting -p IPIngressBytes -p IPEgressBytes -p ControlGroup
+journalctl -b --no-pager -o cat 2>/dev/null | grep -iE 'bpf|firewall|IPAddress' | tail -20 || true
+journalctl -u noo-harness -b --no-pager -o cat 2>/dev/null | tail -15 || true
+grep -E 'CONFIG_CGROUP_BPF|CONFIG_BPF_SYSCALL' "/boot/config-$(uname -r)" 2>/dev/null || true
+timeout 15 systemd-run --wait --pipe --quiet --collect -p IPAccounting=yes -p 'IPAddressDeny=0.0.0.0/0 ::/0' -p 'IPAddressAllow=127.0.0.1/32' /bin/bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>&1 | head -3 || true
+
 # ── f. the node agent's real reader ─────────────────────────────────────────
 if (cd "$REPO/node-agent-go" && NOO_REAL_SYSTEMD=1 go test ./internal/hostsvc -run TestRealSystemdEgress -v -count=1); then
     pass "node agent reads the live unit as enforced"

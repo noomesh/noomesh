@@ -198,12 +198,14 @@ func denyCoversAny(v string) bool {
 	return v4 && v6
 }
 
-// resolverFromBinds is "unit" when BindReadOnlyPaths maps /etc/resolv.conf
-// from the harness-net directory.
+// resolverFromBinds is "unit" when BindReadOnlyPaths maps the harness-net
+// resolv.conf over the file resolvers read: /etc/resolv.conf itself, or, on a
+// host where that is a symlink (Ubuntu: into /run/systemd/resolve/), the
+// link's target, which is where the applier binds it.
 func resolverFromBinds(v string) string {
 	for _, f := range strings.Fields(v) {
 		parts := strings.Split(strings.TrimLeft(f, "-+"), ":")
-		if len(parts) >= 2 && parts[1] == "/etc/resolv.conf" && strings.HasPrefix(parts[0], HarnessNetDir) {
+		if len(parts) >= 2 && parts[0] == strings.TrimSuffix(HarnessNetDir, "/")+"/resolv.conf" && strings.HasSuffix(parts[1], "resolv.conf") {
 			return "unit"
 		}
 	}

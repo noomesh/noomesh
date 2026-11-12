@@ -846,7 +846,7 @@ HE_RESOLVER_ADDR="192.0.2.53"
 # them, but `systemd-run -p` rejects them ("Failed to parse IP address prefix:
 # localhost", real systemd 249 and 255), and the pre-check must pass the
 # drop-in's exact lines.
-HE_BASE_ALLOW="127.0.0.0/8 ::1/128 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fe80::/10 100.64.0.0/10 fd7a:115c:a1e0::/48"
+HE_BASE_ALLOW="127.0.0.1/32 ::1/128 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fe80::/10 100.64.0.0/10 fd7a:115c:a1e0::/48"
 HE_CHANGED=0
 HE_UNRESOLVED=""
 HE_ULA_ALLOWED=0
@@ -871,12 +871,26 @@ he_write() {
 # he_props DIR ALLOW — the unit properties of the hold, one per line, with the
 # bind sources under DIR. The drop-in and the pre-check both print them from
 # here, so what is tested is what is installed.
+# he_resolv_target — the file a resolver actually reads for /etc/resolv.conf.
+# On Ubuntu it is a symlink into /run/systemd/resolve/ (stub-resolv.conf);
+# binding over the link name did not reach readers on real systemd 249/255
+# (glibc found no resolv.conf and fell back to 127.0.0.1:53), so the hold
+# binds over the link's target. A dangling link or a regular file: itself.
+he_resolv_target() {
+    _he_rp="${HE_RESOLV_PATH:-/etc/resolv.conf}"
+    if [ -L "$_he_rp" ] && _he_rt="$(readlink -f "$_he_rp")" && [ -f "$_he_rt" ]; then
+        printf '%s\n' "$_he_rt"
+    else
+        printf '%s\n' "$_he_rp"
+    fi
+}
+
 he_props() {
     printf '%s\n' "IPAddressDeny=0.0.0.0/0 ::/0" "IPAddressAllow=$2" \
-        "BindReadOnlyPaths=$1/resolv.conf:/etc/resolv.conf" \
+        "BindReadOnlyPaths=$1/resolv.conf:$(he_resolv_target)" \
         "BindReadOnlyPaths=$1/hosts:/etc/hosts" \
         "BindReadOnlyPaths=$1/nsswitch.conf:/etc/nsswitch.conf" \
-        "InaccessiblePaths=-/run/systemd/resolve -/run/nscd -/var/run/nscd -/run/dbus/system_bus_socket -/var/run/dbus/system_bus_socket"
+        "InaccessiblePaths=-/run/systemd/resolve/io.systemd.Resolve -/run/systemd/resolve/io.systemd.Resolve.Monitor -/run/nscd -/var/run/nscd -/run/dbus/system_bus_socket -/var/run/dbus/system_bus_socket"
 }
 
 # he_targets — "host port" per controller URL in the harness env (the same two
@@ -1029,7 +1043,7 @@ he_render_hosts() {
 he_probe() {
     command -v systemd-run >/dev/null 2>&1 || { printf '%s\n' " harness-egress=UNENFORCED:systemd-run-missing"; return 0; }
     _he_rc=0
-    _he_out="$(timeout 10 systemd-run --wait --pipe --quiet --collect -p 'IPAddressDeny=0.0.0.0/0 ::/0' -p 'IPAddressAllow=127.0.0.0/8 ::1/128' -p DynamicUser=yes /bin/bash -c 'exec 3<>/dev/tcp/192.0.2.1/9' 2>&1)" || _he_rc=$?
+    _he_out="$(timeout 10 systemd-run --wait --pipe --quiet --collect -p 'IPAddressDeny=0.0.0.0/0 ::/0' -p 'IPAddressAllow=127.0.0.1/32 ::1/128' -p DynamicUser=yes /bin/bash -c 'exec 3<>/dev/tcp/192.0.2.1/9' 2>&1)" || _he_rc=$?
     case "$_he_out" in
         *"Operation not permitted"*) printf '%s\n' " harness-egress=enforced" ;;
         *"Connection refused"*)      printf '%s\n' " harness-egress=UNENFORCED:connection-refused" ;;
@@ -1050,10 +1064,10 @@ harness_egress_apply() {
     printf '%s\n' "# Rendered by noo-apply: the harness resolves nothing on the internet (docs/security/telemetry.md)." \
         "nameserver $HE_RESOLVER_ADDR" "options timeout:1 attempts:1" > "$_he_tmp/resolv.conf"
     if [ -f "$HE_NSSWITCH_SRC" ]; then
-        awk 'BEGIN{d=0} /^[[:space:]]*hosts:/ {if (!d) print "hosts: files dns"; d=1; next} {print} END{if (!d) print "hosts: files dns"}' \
+        awk 'BEGIN{d=0} /^[[:space:]]*hosts:/ {if (!d) print "hosts: files"; d=1; next} {print} END{if (!d) print "hosts: files"}' \
             "$HE_NSSWITCH_SRC" > "$_he_tmp/nsswitch.conf"
     else
-        printf 'passwd: files\ngroup: files\nshadow: files\nhosts: files dns\n' > "$_he_tmp/nsswitch.conf"
+        printf 'passwd: files\ngroup: files\nshadow: files\nhosts: files\n' > "$_he_tmp/nsswitch.conf"
     fi
     he_names > "$_he_tmp/names"
     if he_ula_on_host; then HE_ULA_ALLOWED=1; else HE_ULA_ALLOWED=0; fi

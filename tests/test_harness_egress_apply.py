@@ -55,6 +55,9 @@ class Node:
         self.unit = self.root / "noo-harness.service"
         self.unit.write_text("[Service]\n")
         self.nss = self.root / "nsswitch.conf"
+        # The host's /etc/resolv.conf: a regular file here; a test swaps in a symlink.
+        self.resolv = self.root / "resolv.conf"
+        self.resolv.write_text("nameserver 127.0.0.53\n")
         self.nss.write_text(NSS)
         self.net = self.root / "harness-net"
         self.dropin_dir = self.root / "noo-harness.service.d"
@@ -121,7 +124,7 @@ class Node:
             "PROBE_OUT": str(self.probe_out), "PROBE_RC": str(self.probe_rc), "CHECK_OUT": str(self.check_out), "CHECK_ARGS": str(self.check_args),
             "HE_NET_DIR": str(self.net), "HE_DROPIN_DIR": str(self.dropin_dir), "HE_UNIT": str(self.unit),
             "HE_ENV": str(self.env), "HE_NSSWITCH_SRC": str(self.nss),
-            "HE_OWNER_ARGS": "", "HE_STAT_OWNER": owner, "HE_STAGE_PARENT": str(self.tmp),
+            "HE_OWNER_ARGS": "", "HE_STAT_OWNER": owner, "HE_STAGE_PARENT": str(self.tmp), "HE_RESOLV_PATH": str(self.resolv),
         }
         return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
 
@@ -143,7 +146,7 @@ def allow_line(node: Node) -> str:
     return re.search(r"^IPAddressAllow=(.*)$", node.dropin.read_text(), re.M).group(1)
 
 
-BASE_ALLOW = sorted("127.0.0.0/8 ::1/128 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fe80::/10 100.64.0.0/10 fd7a:115c:a1e0::/48".split())
+BASE_ALLOW = sorted("127.0.0.1/32 ::1/128 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fe80::/10 100.64.0.0/10 fd7a:115c:a1e0::/48".split())
 
 
 # ── the rendered files, exactly ─────────────────────────────────────────────
@@ -157,10 +160,10 @@ def test_the_drop_in_is_exactly_the_contract(node: Node) -> None:
         "[Service]\n"
         "IPAddressDeny=0.0.0.0/0 ::/0\n"
         f"IPAddressAllow={' '.join(sorted(BASE_ALLOW + ['203.0.113.9/32']))}\n"
-        f"BindReadOnlyPaths={node.net}/resolv.conf:/etc/resolv.conf\n"
+        f"BindReadOnlyPaths={node.net}/resolv.conf:{node.resolv}\n"
         f"BindReadOnlyPaths={node.net}/hosts:/etc/hosts\n"
         f"BindReadOnlyPaths={node.net}/nsswitch.conf:/etc/nsswitch.conf\n"
-        "InaccessiblePaths=-/run/systemd/resolve -/run/nscd -/var/run/nscd "
+        "InaccessiblePaths=-/run/systemd/resolve/io.systemd.Resolve -/run/systemd/resolve/io.systemd.Resolve.Monitor -/run/nscd -/var/run/nscd "
         "-/run/dbus/system_bus_socket -/var/run/dbus/system_bus_socket\n"
         "RuntimeDirectory=noo-harness\n"
         "RuntimeDirectoryMode=0755\n"
@@ -178,13 +181,13 @@ def test_resolv_conf_names_the_unreachable_test_net_address_and_nothing_else(nod
 def test_nsswitch_keeps_every_line_and_swaps_only_hosts(node: Node) -> None:
     applied_of(node.run())
     assert (node.net / "nsswitch.conf").read_text() == (
-        "passwd: files systemd\ngroup: files systemd\nhosts: files dns\n")
+        "passwd: files systemd\ngroup: files systemd\nhosts: files\n")
 
 
 def test_without_a_host_nsswitch_the_minimal_one_is_written(node: Node) -> None:
     node.set_nss(False)
     applied_of(node.run())
-    assert (node.net / "nsswitch.conf").read_text() == "passwd: files\ngroup: files\nshadow: files\nhosts: files dns\n"
+    assert (node.net / "nsswitch.conf").read_text() == "passwd: files\ngroup: files\nshadow: files\nhosts: files\n"
 
 
 def test_hosts_file_has_header_locals_and_one_line_per_address(node: Node) -> None:
@@ -272,7 +275,7 @@ def test_an_unresolvable_name_is_tagged_left_out_and_never_falls_back(node: Node
     assert not re.search(r"^\S+ ctl\.example\.net$", hosts, re.M)
     assert "# names: ctl.example.net nats.example.net" in hosts   # still listed, so the agent can call it stale
     assert "nameserver 192.0.2.53" in (node.net / "resolv.conf").read_text()
-    assert "hosts: files dns" in (node.net / "nsswitch.conf").read_text()
+    assert "hosts: files" in (node.net / "nsswitch.conf").read_text().splitlines()
 
 
 # ── the probe ──────────────────────────────────────────────────────────────
@@ -281,7 +284,7 @@ def test_probe_operation_not_permitted_is_enforced(node: Node) -> None:
     a = applied_of(node.run())
     assert a.endswith(" harness-egress=enforced") and "UNENFORCED" not in a, a
     call = [c for c in node.calls() if c.startswith("systemd-run") and "BindReadOnlyPaths" not in c][0]
-    assert "-p IPAddressDeny=0.0.0.0/0 ::/0" in call and "-p IPAddressAllow=127.0.0.0/8 ::1/128" in call and "--collect" in call
+    assert "-p IPAddressDeny=0.0.0.0/0 ::/0" in call and "-p IPAddressAllow=127.0.0.1/32 ::1/128" in call and "--collect" in call
 
 
 def test_probe_connection_refused_is_unenforced(node: Node) -> None:
@@ -477,4 +480,26 @@ def test_the_precheck_runs_a_staged_file_never_a_bash_c_argument(tmp_path):
     assert '/bin/bash "$_he_stage/check.sh"' in code and "bash -c" not in code
     assert 'mktemp -d "${HE_STAGE_PARENT:-/run}/noo-he-stage.XXXXXX"' in src
     assert "pre-check output:" in body, "a failed pre-check says what systemd-run said"
+
+
+def test_the_resolver_bind_lands_on_the_file_a_resolver_actually_reads(node: Node) -> None:
+    # Ubuntu's /etc/resolv.conf is a symlink into /run/systemd/resolve; binding
+    # over the link name did not reach glibc on real systemd 249/255 (it fell
+    # back to 127.0.0.1:53). The hold binds over the link's target.
+    target = node.root / "stub-resolv.conf"
+    target.write_text("nameserver 127.0.0.53\n")
+    node.resolv.unlink()
+    node.resolv.symlink_to(target)
+    applied_of(node.run())
+    assert f"BindReadOnlyPaths={node.net}/resolv.conf:{target}\n" in node.dropin.read_text()
+
+
+def test_loopback_is_only_127_0_0_1_and_nss_never_asks_dns(node: Node) -> None:
+    # A loopback DNS forwarder (systemd-resolved's stub on 127.0.0.53/54, a
+    # dnsmasq) must not be reachable from the unit, and nss must not query DNS.
+    applied_of(node.run())
+    allow = allow_line(node).split()
+    assert "127.0.0.1/32" in allow and not any(a.startswith("127.") and a != "127.0.0.1/32" for a in allow)
+    assert "hosts: files" in (node.net / "nsswitch.conf").read_text().splitlines()
+    assert "dns" not in [w for l in (node.net / "nsswitch.conf").read_text().splitlines() if l.startswith("hosts:") for w in l.split()]
 
