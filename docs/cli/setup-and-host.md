@@ -255,9 +255,12 @@ gateway still lists worker nodes, then walks: stop the self-heal daemons;
 remove the stack (containers **and volumes — all data**), pulled images,
 host daemons and `/etc/noo/pki`, the storage root, the CA from the OS
 trust store, the Tailscale serve config and identity, and the standalone
-home. The age key is kept unless `--purge-secrets`; the binary and shell
-completion stay unless `--uninstall`; `--keep-tailnet` leaves the machine
-on the tailnet. It ends with a silent re-audit and `offboard complete`.
+home. `-y` does not reach the secrets: the age key and `~/.config/mesh`
+(the CLI's login and model cache) go only with `--purge-secrets`, or a yes
+at their own prompt. The binary and shell completion stay unless
+`--uninstall`, and `--keep-tailnet` leaves the machine on the tailnet. It
+ends with a silent re-audit and `offboard complete`. The whole path, with
+the other nodes first: [Start over](../getting-started/start-over.md).
 
 ## Related guides
 

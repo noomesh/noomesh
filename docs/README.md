@@ -32,6 +32,7 @@ reports the controller URL it resolved.
 |----------|-------------|
 | [getting-started/install.md](getting-started/install.md) | Install the `noo` binary, choose dev / dist / standalone, run `noo onboard`, `noo stack start`, and the `whoami` / `health` / `doctor docker` triage trio |
 | [getting-started/troubleshooting.md](getting-started/troubleshooting.md) | The first-run failures: Docker and Compose, ports, the certificate warning, a model that is still loading, start-up refusals, a lost admin password |
+| [getting-started/start-over.md](getting-started/start-over.md) | Back to "never installed" so you can install again: the other nodes first with `noo cluster teardown-node`, then the controller with `noo offboard`; what stays on purpose; why `stack reset` and `stack clean --deep` are not this |
 | [getting-started/first-chat.md](getting-started/first-chat.md) | Your first conversation: `noo chat`, ask about the cluster, ingest one document with `noo rag`, the dashboard, and the two first-hour snags |
 | [getting-started/add-ons.md](getting-started/add-ons.md) | What each add-on is, how to turn it on or off, what a disabled one returns, and where licensed ones are installed |
 | [getting-started/standalone-controller.md](getting-started/standalone-controller.md) | A controller from the `noo` binary and Docker alone: the embedded deploy slice, `noo upgrade`, bundles, adding nodes |
