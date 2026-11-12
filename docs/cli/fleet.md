@@ -44,7 +44,7 @@ self-contained paste:
 ```
 run AS YOUR USER on the node (one sudo prompt)
 step 1 — make sure the noo CLI is on the node (skip if `noo --version` already works):
-  command -v noo >/dev/null || curl -fsSL https://github.com/noomesh/noomesh/releases/latest/download/install.sh | sh
+  command -v noo >/dev/null || { curl -fsSL https://github.com/noomesh/noomesh/releases/latest/download/install.sh -o install.sh && sh install.sh; }
 step 2 — enroll (joins the tailnet, runs host prep, installs the agent):
   noo enroll noo1.<blob>
 bound to node: gpu-2. When the paste finishes: noo cluster provision gpu-2 --wait

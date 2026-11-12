@@ -1,11 +1,20 @@
 #!/bin/sh
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026 PersonifAI LLC
+{ # The whole script is ONE brace group, closed on its last line (2026-11-12).
+  # A shell parses a group completely before running any of it, so a body cut
+  # short anywhere after this line is a syntax error and NOTHING runs
+  # (tests/test_install_line_fails_loudly.py truncates it at every point).
 
 # noo CLI installer — zero-Python standalone control plane for Mesh.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/noomesh/noomesh/main/noo-cli/install.sh | sh
+#   curl -fsSL https://github.com/noomesh/noomesh/releases/latest/download/install.sh -o install.sh && sh install.sh
+#
+# Download, THEN run: with `curl … | sh` a failed download hands sh an empty
+# script and the line exits 0, so a stranger saw a curl error and then
+# "noo: not found" (install matrix, 2026-11-12). The `&&` form exits
+# non-zero in bash, dash and zsh, and leaves the script to read.
 #
 # What it does: detects your OS/arch, downloads the matching static musl
 # `noo` binary from the latest `noo-cli-v*` GitHub release, verifies its
@@ -771,3 +780,4 @@ fi
 info ""
 
 exit 0
+}
