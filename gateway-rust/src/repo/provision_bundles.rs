@@ -20,7 +20,7 @@
 
 use crate::bundle_etag::Key;
 
-fn key_of(created_at: chrono::DateTime<chrono::Utc>, len: i64) -> Key {
+pub(crate) fn key_of(created_at: chrono::DateTime<chrono::Utc>, len: i64) -> Key {
     Key { created_at_micros: created_at.timestamp_micros(), len }
 }
 
