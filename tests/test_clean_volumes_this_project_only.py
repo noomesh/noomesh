@@ -47,7 +47,9 @@ def _run(tmp_path: Path, body: str, env: dict | None = None, volumes: str = "") 
 def test_the_volume_list_is_this_projects_exact_label_and_no_name_glob(tmp_path):
     out, calls = _run(tmp_path, 'stack_volumes "$(clean_project)"', volumes="noomesh_a\nnoomesh_b\n")
     assert out.split() == ["noomesh_a", "noomesh_b"]
-    assert calls == ["volume ls --filter label=com.docker.compose.project=noomesh --format {{.Name}}"]
+    assert calls[0] == "volume ls --filter label=com.docker.compose.project=noomesh --format {{.Name}}"
+    assert all(c.startswith("volume inspect") and "noomesh_noo-data" in c for c in calls[1:]), calls
+    assert not any("name=" in c for c in calls), "never a name-glob listing"
 
 
 def test_the_project_is_noomesh_or_the_named_instances(tmp_path):
@@ -115,3 +117,45 @@ def test_under_yes_the_script_answers_itself_without_a_terminal(tmp_path):
     r = _confirm_run(tmp_path, "true", subprocess.DEVNULL)
     assert r.returncode == 0, r.stderr
     assert r.stdout.splitlines() == ["  Remove noomesh_postgres-data? (y/N) y  [--yes]", "CONFIRMED", "AFTER"]
+
+def _field_docker(tmp_path, noo_data_label: str) -> Path:
+    """docker as an existing install shows it: two labelled volumes from the
+    label filter, and noomesh_noo-data, labelled or not."""
+    bindir = tmp_path / "fbin"
+    bindir.mkdir()
+    fake = bindir / "docker"
+    labelled = "noomesh_postgres-data\nnoomesh_nats\n" + ("noomesh_noo-data\n" if noo_data_label else "")
+    fake.write_text(
+        "#!/bin/sh\n"
+        'case "$1 $2" in\n'
+        f"  'volume ls') printf '{labelled}' ;;\n"
+        '  "volume inspect") case "$*" in *noomesh_noo-data*) ;; *) exit 1 ;; esac\n'
+        f'    case "$*" in *Labels*) printf "%s\\n" "{noo_data_label}" ;; esac ;;\n'
+        "esac\nexit 0\n"
+    )
+    fake.chmod(0o755)
+    return bindir
+
+
+def _field_plan(tmp_path, label: str) -> list[str]:
+    bindir = _field_docker(tmp_path, label)
+    script = "\n".join(_fn(n) for n in ("clean_project", "stack_volumes", "plan_volumes")) + \
+        '\nplan_volumes false $(stack_volumes "$(clean_project)")\n'
+    e = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"}
+    e.pop("COMPOSE_PROJECT_NAME", None)
+    out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=e, timeout=30)
+    assert out.returncode == 0, out.stderr
+    return out.stdout.splitlines()
+
+
+def test_an_existing_installs_unlabelled_noo_data_is_in_the_plan_once(tmp_path):
+    """i677: the launcher created <project>_noo-data outside compose, so on
+    every existing install it has no project label. It is planned by its exact
+    name, beside the labelled ones; a labelled one is not listed twice."""
+    assert _field_plan(tmp_path, "") == [
+        "keep noomesh_postgres-data", "remove noomesh_nats", "remove noomesh_noo-data",
+    ]
+    (tmp_path / "b").mkdir()
+    assert _field_plan(tmp_path / "b", "noomesh") == [
+        "keep noomesh_postgres-data", "remove noomesh_nats", "remove noomesh_noo-data",
+    ]
