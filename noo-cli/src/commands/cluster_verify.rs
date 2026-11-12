@@ -496,7 +496,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
 
     // 6e'. Lanes (proposal i403): what the class table routes on this node,
     //      by the agent's lane states.
-    out.push(lanes_check(n));
+    out.push(lanes_check_at(n, now_unix));
 
     // 6d. The log shipper (fleet logging phase 6), from the agent's own
     //     account in its heartbeat.
@@ -660,7 +660,53 @@ const GPU_PROBE_FAILING_SECS: i64 = 60;
 /// while `running_backends` lists a backend is a WARN (the agent says nothing
 /// is placed, so nothing routes). No key is an agent that predates lanes,
 /// routed by `running_backends`: said, not warned.
+#[cfg(test)]
 pub(crate) fn lanes_check(n: &Value) -> Check {
+    lanes_check_at(n, now_unix())
+}
+
+/// Why a placed backend is deliberately NOT running, when its node says so:
+/// it is in `gpu_contention.paused_backends` and the pause has a live cause,
+/// either a GPU hold whose lease has not expired (a reservation, or an
+/// operator's hold) or the automatic yield to a workload outside noomesh.
+/// `None` otherwise, so a backend that is really down, or still paused after
+/// its hold expired, still reads as down. The same rule and words as the
+/// gateway's `placement_stuck::paused_on_purpose`, so verify and the alert
+/// say one thing.
+pub(crate) fn paused_on_purpose(n: &Value, backend: &str, now_unix: i64) -> Option<String> {
+    let gc = &n["gpu_contention"];
+    if !gc["paused_backends"].as_array()?.iter().any(|b| b.as_str() == Some(backend)) {
+        return None;
+    }
+    let reason = gc["reason"].as_str().filter(|r| !r.is_empty());
+    if let Some(lease) = gc["lease"].as_object() {
+        if let Some(exp) = lease.get("expires_at").and_then(Value::as_str).filter(|e| !e.is_empty()) {
+            match parse_rfc3339_unix(exp) {
+                Some(t) if t <= now_unix => return None,
+                Some(_) => {}
+                None => return None,
+            }
+        }
+        let op = lease.get("operation_id").and_then(Value::as_str).unwrap_or("?");
+        let mut s = format!("paused for GPU reservation {op}");
+        if let Some(w) = lease.get("workload").and_then(Value::as_str).filter(|w| !w.is_empty()) {
+            s.push_str(&format!(" ({w})"));
+        }
+        if let Some(o) = lease.get("owner").and_then(Value::as_str).filter(|o| !o.is_empty()) {
+            s.push_str(&format!(" by {o}"));
+        }
+        if let Some(r) = lease.get("reason").and_then(Value::as_str).filter(|r| !r.is_empty()).or(reason) {
+            s.push_str(&format!(": {r}"));
+        }
+        return Some(s);
+    }
+    (gc["state"].as_str() == Some("shared")).then(|| match reason {
+        Some(r) => format!("paused: the GPU is in use outside noomesh ({r})"),
+        None => "paused: the GPU is in use outside noomesh".to_string(),
+    })
+}
+
+pub(crate) fn lanes_check_at(n: &Value, now_unix: i64) -> Check {
     const NAME: &str = "lanes";
     let id = n["id"].as_str().unwrap_or("?");
     let Some(raw) = n.get("lanes") else {
@@ -690,9 +736,19 @@ pub(crate) fn lanes_check(n: &Value) -> Check {
     };
     let count = |st: &str| chat.iter().filter(|l| text(l, "state") == st).count();
     let unconfirmed: Vec<String> = chat.iter().filter(|l| matches!(text(l, "state").as_str(), "unknown" | "unplaced")).map(|l| label(l)).collect();
-    let not_routed: Vec<String> = chat
+    let down: Vec<&&Value> = chat
         .iter()
         .filter(|l| !matches!(text(l, "state").as_str(), "serving" | "on_demand" | "unknown" | "unplaced"))
+        .collect();
+    // A lane the node paused on purpose (a live GPU reservation or hold) is
+    // said as such, never as "down": the `gpu` row carries the hold itself.
+    let paused: Vec<String> = down
+        .iter()
+        .filter_map(|l| paused_on_purpose(n, &text(l, "backend"), now_unix).map(|why| format!("{}={}: {why}", text(l, "backend"), text(l, "model"))))
+        .collect();
+    let not_routed: Vec<String> = down
+        .iter()
+        .filter(|l| paused_on_purpose(n, &text(l, "backend"), now_unix).is_none())
         .map(|l| label(l))
         .collect();
     let mut detail = format!("{} chat lane(s): {} serving, {} on demand", chat.len(), count("serving"), count("on_demand"));
@@ -701,6 +757,9 @@ pub(crate) fn lanes_check(n: &Value) -> Check {
     }
     if !other.is_empty() {
         detail.push_str(&format!("; {} other lane(s)", other.len()));
+    }
+    if !paused.is_empty() {
+        detail = format!("{}; {detail}", paused.join(", "));
     }
     if not_routed.is_empty() {
         return ok(NAME, detail);
@@ -798,6 +857,10 @@ pub(crate) fn gpu_contention_check_at(n: &Value, now_unix: i64) -> Option<Check>
             };
             let remedy = if mode == super::cluster_gpu_mode::Mode::User {
                 format!("noo cluster gpu mode {id} mesh   # when the other work is done")
+            } else if let super::cluster_gpu_mode::Mode::Workload(w) = &mode {
+                // A reservation ends when its workload releases it; releasing
+                // it by hand stops that workload, so it is named as such.
+                format!("nothing to do: released when {w} ends; to end it early (stops {w}): noo cluster gpu release {id}{ids}")
             } else {
                 format!("noo cluster gpu release {id}{ids}   # when the other work is done")
             };
@@ -13929,5 +13992,63 @@ mod settle_after_roll_tests {
         let run = crate::test_src::fn_body(&own, "pub fn cluster_verify(");
         assert!(run.contains("crate::commands::upgrade::last_roll()"));
         assert!(run.contains("obj.insert(ROLLED_AGO_KEY.into(), age.into());"));
+    }
+}
+
+#[cfg(test)]
+mod reservation_pause_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn held_awolf(expires: Option<&str>) -> Value {
+        let mut lease = json!({"generation": 6, "mode": "drain", "operation_id": "58586ceb",
+            "owner": "rbwolf", "reason": "reservation rhaddon/worker", "workload": "rhaddon/worker"});
+        if let Some(e) = expires {
+            lease["expires_at"] = e.into();
+        }
+        json!({"id": "awolf",
+            "lanes": [{"backend": "vllm", "model": "gemma-4-12B", "state": "down", "reason": "not running"}],
+            "gpu_contention": {"state": "held", "method": "memory-accounting-unattributed", "paused_backends": ["vllm"],
+                "reason": "reservation rhaddon/worker", "lease": lease}})
+    }
+
+    #[test]
+    fn a_lane_paused_for_a_reservation_is_said_as_paused_not_down() {
+        let c = lanes_check_at(&held_awolf(None), 2_000_000_000);
+        assert_eq!(c.verdict, Verdict::Ok, "{c:?}");
+        assert!(c.detail.starts_with("vllm=gemma-4-12B: paused for GPU reservation 58586ceb (rhaddon/worker) by rbwolf: reservation rhaddon/worker; "),
+            "{}", c.detail);
+        assert!(!c.detail.contains("down"), "{}", c.detail);
+    }
+
+    #[test]
+    fn an_expired_hold_excuses_nothing_and_the_lane_is_down_again() {
+        let c = lanes_check_at(&held_awolf(Some("2026-11-12T15:00:00Z")), 2_000_000_000);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.starts_with("not routed: vllm=gemma-4-12B: down (not running)"), "{}", c.detail);
+        let unreadable = lanes_check_at(&held_awolf(Some("soon")), 2_000_000_000);
+        assert_eq!(unreadable.verdict, Verdict::Warn, "an expiry nobody can read excuses nothing");
+    }
+
+    #[test]
+    fn a_backend_not_in_paused_backends_stays_down() {
+        let mut n = held_awolf(None);
+        n["gpu_contention"]["paused_backends"] = json!(["llamacpp"]);
+        assert_eq!(lanes_check_at(&n, 2_000_000_000).verdict, Verdict::Warn);
+        assert_eq!(paused_on_purpose(&n, "vllm", 2_000_000_000), None);
+    }
+
+    #[test]
+    fn a_yield_to_outside_work_is_said_too() {
+        let n = json!({"gpu_contention": {"state": "shared", "paused_backends": ["vllm"], "reason": "VR"}});
+        assert_eq!(paused_on_purpose(&n, "vllm", 1).as_deref(), Some("paused: the GPU is in use outside noomesh (VR)"));
+    }
+
+    #[test]
+    fn the_gpu_rows_remedy_for_a_reservation_says_releasing_stops_the_workload() {
+        let n = held_awolf(None);
+        let c = gpu_contention_check_at(&n, 2_000_000_000).unwrap();
+        let r = c.remedy.unwrap();
+        assert!(r.starts_with("nothing to do: released when rhaddon/worker ends; to end it early (stops rhaddon/worker): noo cluster gpu release awolf --operation 58586ceb --generation 6"), "{r}");
     }
 }
