@@ -25,7 +25,7 @@ optional. Full walkthrough:
 
 ```bash
 # 1. Install the noo CLI (static binary, checksum-verified, lands in ~/.local/bin)
-curl -fsSL https://github.com/noomesh/noomesh/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/noomesh/noomesh/releases/latest/download/install.sh -o install.sh && sh install.sh
 # 2. The wizard, run from any directory that is NOT a source checkout: it installs
 #    into ~/.noo, pulls the released images, and walks prerequisites, secrets,
 #    storage, the Docker stack, a first model, channels, add-ons

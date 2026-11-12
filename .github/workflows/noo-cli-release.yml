@@ -707,7 +707,7 @@ jobs:
           ## Install (one-liner)
 
           \`\`\`sh
-          curl -fsSL https://github.com/${{ github.repository }}/releases/download/${TAG}/install.sh | sh
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/${TAG}/install.sh -o install.sh && sh install.sh
           \`\`\`
 
           Then:

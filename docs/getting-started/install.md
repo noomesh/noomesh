@@ -60,7 +60,7 @@ a signature or checksum mismatch, and puts the binary in `~/.local/bin/noo`.
 ```bash
 # The installer script is attached to every noo-cli release; "latest" always
 # resolves to one (stack releases are never marked Latest), so no tag is needed:
-curl -fsSL https://github.com/noomesh/noomesh/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/noomesh/noomesh/releases/latest/download/install.sh -o install.sh && sh install.sh
 
 # From a checkout (never pipes into sh; runs the repo-local script):
 scripts/install-noo.sh
