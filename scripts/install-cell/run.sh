@@ -118,6 +118,15 @@ teardown() {
     # docker access offboard read "already clean" with 16 containers running
     # and removed the storage root from under them (fa, run 43157286042; the
     # product fix is fa's). The runner is thrown away anyway.
+    # A probe that failed altered the box (on releases without #1059 the
+    # offboard probe wipes it, and the box then reads as a node, so the real
+    # uninstall refuses, run 4): its state is no longer the install's, and
+    # the runner is thrown away anyway.
+    if [ "${PROBE_ALTERED:-0}" = 1 ]; then
+        meta limits "cleanup skipped: a failed probe altered the box"
+        echo "::notice::$CELL: cleanup skipped, a failed probe altered the box"
+        return 0
+    fi
     if ! docker info >/dev/null 2>&1; then
         meta limits "cleanup skipped: docker unreachable as $(id -un)"
         echo "::notice::$CELL: cleanup skipped, docker is unreachable as $(id -un)"
@@ -139,11 +148,13 @@ teardown() {
       for what in "ps -a" "volume ls" "image ls"; do
         n=$(docker $what -q 2>/dev/null | wc -l); echo "docker $what: $n"; done
       L=label=com.docker.compose.project=noomesh
-      docker ps -a --filter "$L" --format "LEFTOVER container {{.Names}}" | grep . && left=1
-      docker volume ls --filter "$L" --format "LEFTOVER volume {{.Name}}" | grep . && left=1
-      docker network ls --filter "$L" --format "LEFTOVER network {{.Name}}" | grep . && left=1
-      docker volume ls --format "{{.Name}}" 2>/dev/null | grep -E "^(noomesh|noo)_" | sed "s/^/LEFTOVER volume /" | grep . && left=1
-      docker network ls --format "{{.Name}}" 2>/dev/null | grep -vxE "bridge|host|none" | sed "s/^/LEFTOVER network /" | grep . && left=1
+      { docker ps -a --filter "$L" --format "LEFTOVER container {{.Names}}"
+        docker volume ls --filter "$L" --format "LEFTOVER volume {{.Name}}"
+        docker network ls --filter "$L" --format "LEFTOVER network {{.Name}}"
+        docker volume ls --format "{{.Name}}" 2>/dev/null | grep -E "^(noomesh|noo)_" | sed "s/^/LEFTOVER volume /"
+        docker network ls --format "{{.Name}}" 2>/dev/null | grep -vxE "bridge|host|none" | sed "s/^/LEFTOVER network /"
+      } | sort -u | grep . && left=1
+      docker image ls --format "image {{.Repository}}:{{.Tag}} {{.Size}}" 2>/dev/null
       for f in "$HOME/.local/bin/noo" /usr/local/bin/noo; do [ -e "$f" ] && { echo "LEFTOVER $f"; left=1; }; done
       exit $left'
 }
@@ -175,7 +186,7 @@ if [ "$MODEL" = tiny ]; then
     # The declared OLLAMA_MODEL is pulled, but the default chat model stays the
     # product default (run 3: "model 'gemma4:e2b' is not served by any node");
     # the error's own remedy makes the tiny one the default.
-    step switch-to-tiny-model 300 -- noo models switch "$TINY_MODEL" --backend ollama || fail_onboarded
+    step switch-to-tiny-model 300 -- noo models switch "$TINY_MODEL" --backend ollama --yes || fail_onboarded
 fi
 step verify 900 -- noo cluster verify --wait
 # The single-turn line docs/getting-started/first-chat.md gives, verbatim.
@@ -199,7 +210,7 @@ step probe-offboard-without-docker 600 -- sh -c '
   [ -d "$HOME/.noo" ] || { echo "PROBE FAIL: ~/.noo is gone"; ok=0; }
   [ -d /var/lib/noo ] || { echo "PROBE FAIL: /var/lib/noo is gone"; ok=0; }
   noo health >/dev/null 2>&1 || { echo "PROBE FAIL: noo health is not ok afterwards"; ok=0; }
-  [ "$ok" = 1 ]'
+  [ "$ok" = 1 ]' || PROBE_ALTERED=1
 
 # ── 5. clean uninstall ──────────────────────────────────────────────────
 teardown
