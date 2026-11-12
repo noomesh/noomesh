@@ -8757,6 +8757,54 @@ mod tests {
         assert!(host_checks("host2", &Value::Null, false).is_empty(), "a dead hostd already fails its own row");
     }
 
+    // ── i677 #17: a gateway that just started has not heard the gossip ──
+
+    /// The gateway's `gateway_settling` reason makes an unknown node a
+    /// Starting row (never a pass, never a FAIL) that carries the gateway's
+    /// own detail; an unknown node without it still FAILs.
+    #[test]
+    fn an_unknown_node_the_gateway_calls_settling_is_starting_and_says_why() {
+        let now = 1_800_000_000;
+        let mut n = healthy(now);
+        n["status"] = serde_json::json!("unknown");
+        n["status_reason"] = serde_json::json!("gateway_settling");
+        n["status_detail"] = serde_json::json!("last heard 12s ago, BEFORE this gateway started");
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        let r = c.iter().find(|c| c.name == "online").unwrap();
+        assert_eq!(r.verdict, Verdict::Starting, "{}", r.detail);
+        assert!(r.detail.contains("BEFORE this gateway started") && r.detail.contains("noo cluster verify --wait"), "{}", r.detail);
+        assert!(r.remedy.is_none());
+        n["status_detail"] = serde_json::Value::Null;
+        let r = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true)).into_iter().find(|c| c.name == "online").unwrap();
+        assert_eq!(r.verdict, Verdict::Starting);
+        assert!(r.detail.contains("has not heard this node's gossip yet"), "{}", r.detail);
+        n["status_reason"] = serde_json::Value::Null;
+        assert_eq!(verdict(&node_checks(&n, "v0.2.70", "0.5.57", now, Some(true)), "online"), Verdict::Fail);
+        n["status_reason"] = serde_json::json!("something_else");
+        assert_eq!(verdict(&node_checks(&n, "v0.2.70", "0.5.57", now, Some(true)), "online"), Verdict::Fail);
+    }
+
+    /// `--wait` waits on a settling node, and only while the gateway says so.
+    #[test]
+    fn wait_polls_a_settling_node_and_stops_once_it_is_heard() {
+        let now = 1_800_000_000;
+        let mut n = healthy(now);
+        assert!(!warmup::node_still_starting(&n, now), "a healthy node is not waited on");
+        n["status"] = serde_json::json!("unknown");
+        n["status_reason"] = serde_json::json!("gateway_settling");
+        assert!(warmup::node_still_starting(&n, now));
+        n["status_reason"] = serde_json::Value::Null;
+        assert!(!warmup::node_still_starting(&n, now), "unknown without the reason is judged, not waited on");
+    }
+
+    /// The `--wait` loop asks the one predicate the tests above pin.
+    #[test]
+    fn the_wait_loop_uses_the_tested_predicate() {
+        let own = crate::test_src::own_code(include_str!("cluster_verify/warmup.rs"));
+        let body = crate::test_src::fn_body(&own, "pub(crate) fn wait_for_node_warmup(");
+        assert!(body.contains(".any(|n| node_still_starting(n, now))"), "{body}");
+    }
+
     // ── i276: what a fresh one-box install must not FAIL on ───────────
 
     /// `unknown` = the gateway had no address to dial: nothing was checked.
