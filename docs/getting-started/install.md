@@ -38,12 +38,17 @@ the setting. `-1` means never; the value is otherwise milliseconds. Windows
 10's WSL2 ignores this setting: there, keep one WSL terminal open on the
 controller.
 
+The controller runs on Linux x86_64 (amd64) today: its images are published
+for amd64 only, and `noo onboard` says so before it starts on an arm64 box or
+a Mac. Those join an amd64 controller as nodes (see
+[supported-hardware.md](./supported-hardware.md)).
+
 Minimums, for one box running the controller and its first model (the
 numbers are approximate and grow with the models you pull):
 
 | | Minimum | Why |
 |---|---|---|
-| Disk | ~40 GB free on the data root | the core images (~10 GB incl. trellion), the default model (`gemma4:e2b`, 7.2 GB), Postgres and logs |
+| Disk | 25 GB free where Docker keeps its images | the stack's images and data (~12 GB, measured on a fresh amd64 install), the default model (`gemma4:e2b`, 7.2 GB), and headroom for an upgrade. `noo onboard` checks this before it starts and stops below it; `noo onboard --min-free-gb <n>` sets another floor if you know this box needs less |
 | RAM | 16 GB | the stack idles at ~6 GB; a CPU-only box also holds the model in RAM |
 | GPU | optional; 4 GB+ VRAM to run a model on it | under ~10 GB the wizard offers a model verified to fit; with none, Ollama runs on CPU (slow, but it works) |
 | Network | outbound HTTPS to `ghcr.io` and `ollama.com` at install | pulling images and the first model; nothing inbound |
@@ -60,7 +65,7 @@ a signature or checksum mismatch, and puts the binary in `~/.local/bin/noo`.
 ```bash
 # The installer script is attached to every noo-cli release; "latest" always
 # resolves to one (stack releases are never marked Latest), so no tag is needed:
-curl -fsSL https://github.com/noomesh/noomesh/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/noomesh/noomesh/releases/latest/download/install.sh -o install.sh && sh install.sh
 
 # From a checkout (never pipes into sh; runs the repo-local script):
 scripts/install-noo.sh

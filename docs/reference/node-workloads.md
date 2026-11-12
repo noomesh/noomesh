@@ -550,13 +550,41 @@ become a fact (the i495 rule). A `null` is never sent.
 | `nvidia_driver_caps_ok` | bool | `compute,utility` driver capabilities are usable |
 | `controller_host` | bool | this node is the controller's host: the agent's `NOO_SELF_NODE` marker. A workload is refused (`controller_host`) unless `NOO_ADDON_WORKLOADS_ON_CONTROLLER=1` (default off) |
 | `data_root_free_gb` | number | omitted when unknown |
+| `model_sets_free_bytes` | integer, bytes | free bytes of the filesystem the agent's own model-set disk check reads (`<models dir>/sets`; it can differ from the data root). Omitted when unknown or no models dir is configured; `0` is a full disk, not unknown. The controller's disk preflight uses it in preference to `data_root_free_gb`. The gateway stores it from the release that adds it (i607b); an older gateway drops it and the preflight falls back to `data_root_free_gb` |
 | `addon_workloads_policy` | `"none"` / `"approve"` / `"auto"` | the node's consent setting |
 | `addon_workloads_approvals` | `[{addon, digest, source?}]` | per add-on and image digest. The owner's own approvals carry no `source`; on a node whose owner opted in to controller approvals, each pair only the controller's signed set approves follows them with `"source": "controller"` (at most 256 rows in all) |
 | `addon_workloads_controller` | `{opted_in, set_state, generation?, set_sha256?}` | controller approvals ([below](#approving-from-the-controller-opt-in)): whether the owner opted in, and the set the agent holds: `set_state` is `none`, `verified` or `unverifiable`; `generation` and `set_sha256` (the SHA-256 of the signed document's bytes) ride `verified`. Always reported. The gateway stores it from the release that delivers the sets (i596 slice 2); until then it drops it |
-| `model_sets` | `[{id, revision, state, reason?}]` | `state` is `verified`, `fetching` or `refused`; `reason` rides `refused` |
+| `model_sets` | `[{id, revision, state, reason?, bytes_done?, bytes_total?, retry_at?, free_bytes?, need_bytes?}]` | `state` is `verified`, `fetching` or `refused`; `reason` rides `refused`. The delivery fields (i607b) are optional and omitted when not known or not applicable, each riding only its state: `bytes_done` and `bytes_total` (integers) on `fetching` (`bytes_done` counts the files already on disk plus the bytes written of the current one; `bytes_total` is the whole set), `bytes_total` alone on `verified`; `retry_at` (RFC 3339, UTC) on `refused` is when the agent next tries; `free_bytes` and `need_bytes` on a `refused` row with `reason: disk` only, the free bytes the agent saw and the bytes it needed (the files still to write plus its margin). `reason` stays a code; the numbers are separate fields, never free text. An old agent sends none of them, and a reader shows the state alone |
 | `node_workloads` | `[{addon, name, state, ready, model?, door_port, reservation?, reason?}]` | `state` is a desired state or a reported one (`draining`, `needs_attention`). `model`, `reservation` and `reason` are omitted when unknown or none. There is no `slots` in phase 2 (placement sizes it from `accel.slots_env`) |
 
 `heartbeat-i300.json` is the example.
+
+## Retrying a refused model set (`model_set_retry`)
+
+A refused set is retried after 30 minutes (in memory on the agent). To end that
+wait, the operator runs `noo cluster workloads retry <node> [<set-id>@<rev>]`.
+The gateway bumps the node's retry epoch (a monotonic integer, stored in
+`noo_node_model_set_retry`, so it survives a gateway restart) and desired-config
+carries:
+
+```
+"model_set_retry": {"epoch": 3, "sets": ["rh-main-v1@fdaf4090"]}
+```
+
+- **Top level, never inside `node_workloads`.** The agent decodes desired-config
+  leniently at the top level (an old agent ignores the key) but decodes the
+  `node_workloads` fragment and its entries strictly, so a new field inside them
+  would make an old agent refuse with `desired_invalid`.
+- Omitted while the epoch is 0. An empty `sets` means every refused set.
+- The agent keeps the last epoch it applied, in memory. When the epoch is past
+  it, the agent resets the refused entries (the named ones, or all) and runs its
+  fetch pass; it then records the epoch. The same or a lower epoch does nothing.
+  After an agent restart the last epoch is 0, so a stored epoch above 0 clears
+  once more; a restart has already emptied the backoff, so that finds nothing.
+- Only refused sets are cleared. A verified or fetching set is not touched, and
+  a retry never changes which sets or workloads are placed.
+- Latency: after the bump the gateway nudges the node to reconcile now (the signed `reconcile` control op, HTTPS fallback; fire-and-forget, the agent coalesces nudges). A node that is unreachable or older than the op just logs, and picks the epoch up on its next reconcile (within about 5 minutes).
+- An absent or null `model_set_retry` means no change: the agent keeps the epoch it has (as for `workload_approvals`).
 
 ## Reasons
 

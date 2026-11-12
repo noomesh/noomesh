@@ -1,0 +1,235 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright 2026 PersonifAI LLC
+
+//! The harness's own check that it is held off the internet (enforcement
+//! step 1, docs/security/telemetry.md).
+//!
+//! The applier renders a drop-in for noo-harness.service: `IPAddressDeny=any`
+//! with a local/tailnet allowlist, and a unit-private resolver (a
+//! resolv.conf whose only nameserver is outside the allowlist, a rendered
+//! hosts file, the system resolver's sockets made inaccessible). Every vendor
+//! CLI the harness launches inherits both: its cgroup and its mount
+//! namespace. Rendered files prove nothing about the running process, so at
+//! start the harness tries, from inside its own namespace:
+//!
+//! - to resolve [`CANARY_NAME`]: under the unit resolver the question cannot
+//!   leave the machine and the lookup fails;
+//! - to connect to [`CANARY_ADDR`], 127.0.0.2:9: loopback (no packet ever
+//!   leaves the host), outside the allowlist (only 127.0.0.1 of 127/8 is
+//!   allowed), nothing listening. Unrestricted, the kernel answers RST at
+//!   once ("refused"). Under the allowlist the SYN is dropped, which TCP
+//!   surfaces as EPERM or, on real systemd 249/255, as a timeout. A TEST-NET
+//!   target could not tell the two apart: it times out either way.
+//!
+//! It writes the result to [`SELFTEST_FILE`] (world-readable; it holds no
+//! secret) with its pid, so the node agent can tell the result belongs to
+//! the unit's running process (`MainPID`) and report it in the heartbeat.
+//! The directory exists only under the drop-in (`RuntimeDirectory=`); without
+//! it nothing is written and the agent reports "unknown", never "enforced".
+//!
+//! When the unit is NOT restricted, the lookup canary can leave the machine (a
+//! DNS question for example.com, the IANA reserved example domain); the
+//! connect canary never does.
+
+use std::io;
+use std::net::SocketAddr;
+use std::path::Path;
+use std::time::Duration;
+
+use serde_json::{json, Value};
+
+/// The runtime directory the drop-in creates (`RuntimeDirectory=noo-harness`).
+pub const SELFTEST_DIR: &str = "/run/noo-harness";
+/// The self-test result the node agent reads.
+pub const SELFTEST_FILE: &str = "/run/noo-harness/egress.json";
+/// A name that must not resolve from inside the unit.
+pub const CANARY_NAME: &str = "example.com";
+/// An address the unit must not be able to connect to: loopback, outside
+/// the allowlist, nothing listening.
+pub const CANARY_ADDR: &str = "127.0.0.2:9";
+/// Each canary's bound: a refused one answers at once; only a broken
+/// enforcement waits this long.
+const CANARY_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// What a connect to the canary address came to.
+pub fn connect_result(r: &io::Result<()>) -> String {
+    match r {
+        Ok(()) => "connected".into(),
+        Err(e) if e.raw_os_error() == Some(libc::EPERM) || e.raw_os_error() == Some(libc::EACCES) => "denied".into(),
+        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => "refused".into(),
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => "timeout".into(),
+        Err(e) => format!("other:{e}"),
+    }
+}
+
+/// A DNS server this unit could still reach: one listening on UDP port 53 at
+/// 127.0.0.1, ::1 or a wildcard address (the unit's allowlist keeps exactly
+/// 127.0.0.1 and ::1 of loopback, so a forwarder on 127.0.0.53, such as
+/// systemd-resolved's stub, is already out of reach). A raw-DNS client inside
+/// the unit could send a name there and the forwarder would carry it out, so
+/// such a listener means "not held". Read from `/proc/net/udp{,6}` text:
+/// nothing is sent. Returns the first such listener, as "<addr>:53".
+pub fn reachable_dns_listener(udp: &str, udp6: &str) -> Option<String> {
+    for line in udp.lines().skip(1) {
+        let Some(local) = line.split_whitespace().nth(1) else { continue };
+        match local {
+            "0100007F:0035" => return Some("127.0.0.1:53".into()),
+            "00000000:0035" => return Some("0.0.0.0:53".into()),
+            _ => {}
+        }
+    }
+    for line in udp6.lines().skip(1) {
+        let Some(local) = line.split_whitespace().nth(1) else { continue };
+        match local {
+            "00000000000000000000000001000000:0035" => return Some("[::1]:53".into()),
+            "00000000000000000000000000000000:0035" => return Some("[::]:53".into()),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The self-test record. `enforced` only when the lookup failed, the connect
+/// canary was dropped (EPERM or a timeout, never "refused"), AND no DNS
+/// server is reachable on the loopback the unit keeps.
+pub fn record(pid: u32, started_at: u64, lookup_resolved: bool, connect: &str, loopback_dns: Option<&str>) -> Value {
+    // A dropped SYN is EPERM ("denied") or a timeout; "refused" is the
+    // unrestricted kernel answering for a port nobody listens on.
+    let held = matches!(connect, "denied" | "timeout");
+    let enforced = !lookup_resolved && held && loopback_dns.is_none();
+    json!({
+        "version": 1,
+        "pid": pid,
+        "started_at": started_at,
+        "lookup": {"name": CANARY_NAME, "result": if lookup_resolved { "resolved" } else { "failed" }},
+        "connect": {"addr": CANARY_ADDR, "result": connect},
+        "loopback_dns": loopback_dns.unwrap_or("none"),
+        "enforced": enforced,
+    })
+}
+
+async fn lookup_resolves() -> bool {
+    match tokio::time::timeout(CANARY_TIMEOUT, tokio::net::lookup_host((CANARY_NAME, 443))).await {
+        Ok(Ok(mut addrs)) => addrs.next().is_some(),
+        _ => false,
+    }
+}
+
+async fn connect_canary() -> io::Result<()> {
+    let addr: SocketAddr = CANARY_ADDR.parse().expect("a literal address");
+    match tokio::time::timeout(CANARY_TIMEOUT, tokio::net::TcpStream::connect(addr)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "no answer within the bound")),
+    }
+}
+
+/// Write `value` to `dir/egress.json` atomically (a temp file, then rename),
+/// mode 0644.
+pub fn write_into(dir: &Path, value: &Value) -> io::Result<()> {
+    let tmp = dir.join(".egress.json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(value)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))?;
+    }
+    std::fs::rename(&tmp, dir.join("egress.json"))
+}
+
+/// Run both canaries and write the record, when the drop-in's runtime
+/// directory exists. Returns the record (None: no directory, nothing run).
+pub async fn run_at_start() -> Option<Value> {
+    let dir = Path::new(SELFTEST_DIR);
+    if !dir.is_dir() {
+        tracing::warn!("harness: no {SELFTEST_DIR}: this unit carries no egress drop-in, so nothing holds it off the internet (the agent reports egress unknown)");
+        return None;
+    }
+    let resolved = lookup_resolves().await;
+    let connect = connect_result(&connect_canary().await);
+    let started_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let udp = std::fs::read_to_string("/proc/net/udp").unwrap_or_default();
+    let udp6 = std::fs::read_to_string("/proc/net/udp6").unwrap_or_default();
+    let loopback_dns = reachable_dns_listener(&udp, &udp6);
+    let rec = record(std::process::id(), started_at, resolved, &connect, loopback_dns.as_deref());
+    if rec["enforced"] == Value::Bool(true) {
+        tracing::info!(lookup = "failed", connect = %connect, "harness: egress held: no internet name resolves and no internet address is reachable");
+    } else {
+        tracing::error!(lookup = if resolved { "resolved" } else { "failed" }, connect = %connect, loopback_dns = loopback_dns.as_deref().unwrap_or("none"), "harness: egress NOT held: this unit can reach the internet or a DNS forwarder");
+    }
+    if let Err(e) = write_into(dir, &rec) {
+        tracing::error!(error = %e, file = SELFTEST_FILE, "harness: could not write the egress self-test (the agent reports egress unknown)");
+    }
+    Some(rec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_failed_lookup_and_a_denied_connect_are_enforced() {
+        assert_eq!(record(7, 1, false, "denied", None)["enforced"], true);
+        assert_eq!(record(7, 1, false, "denied", Some("127.0.0.1:53"))["enforced"], false, "a reachable DNS forwarder is not held");
+        assert_eq!(record(7, 1, false, "timeout", None)["enforced"], true, "a dropped SYN can surface as a timeout");
+        for (resolved, connect) in [(true, "denied"), (true, "timeout"), (false, "refused"), (false, "connected"), (false, "other:x")] {
+            assert_eq!(record(7, 1, resolved, connect, None)["enforced"], false, "{resolved} {connect}");
+        }
+        let r = record(42, 1794000000, false, "denied", None);
+        assert_eq!(r["loopback_dns"], "none");
+        assert_eq!(r["pid"], 42);
+        assert_eq!(r["lookup"]["name"], CANARY_NAME);
+        assert_eq!(r["lookup"]["result"], "failed");
+        assert_eq!(r["connect"]["addr"], CANARY_ADDR);
+        assert_eq!(r["version"], 1);
+    }
+
+    #[test]
+    fn the_kernel_refusal_is_told_apart_from_every_other_failure() {
+        assert_eq!(connect_result(&Err(io::Error::from_raw_os_error(libc::EPERM))), "denied");
+        assert_eq!(connect_result(&Err(io::Error::from_raw_os_error(libc::EACCES))), "denied");
+        assert_eq!(connect_result(&Err(io::Error::from(io::ErrorKind::ConnectionRefused))), "refused");
+        assert_eq!(connect_result(&Err(io::Error::from(io::ErrorKind::TimedOut))), "timeout");
+        assert_eq!(connect_result(&Ok(())), "connected");
+        assert!(connect_result(&Err(io::Error::from_raw_os_error(libc::ENETUNREACH))).starts_with("other:"));
+    }
+
+    #[test]
+    fn the_canaries_never_point_inside_the_allowlist() {
+        let a: SocketAddr = CANARY_ADDR.parse().unwrap();
+        assert!(a.ip().is_loopback() && a.ip().to_string() != "127.0.0.1", "loopback, never a packet off the host, and outside the allowlist (127.0.0.1/32)");
+        assert_eq!(CANARY_NAME, "example.com", "the IANA example domain: harmless if it ever does leave");
+    }
+
+    #[test]
+    fn the_record_lands_world_readable_and_whole() {
+        let dir = std::env::temp_dir().join(format!("noo-egress-selftest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_into(&dir, &record(9, 1, false, "denied", None)).unwrap();
+        let back: Value = serde_json::from_slice(&std::fs::read(dir.join("egress.json")).unwrap()).unwrap();
+        assert_eq!(back["enforced"], true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(dir.join("egress.json")).unwrap().permissions().mode() & 0o777, 0o644);
+        }
+        assert!(!dir.join(".egress.json.tmp").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_dns_server_on_reachable_loopback_is_found_and_the_stub_is_not() {
+        let head = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops";
+        // systemd-resolved's stub on 127.0.0.53 and 127.0.0.54: outside the allowlist, not reachable.
+        let stub = format!("{head}\n  1: 3500007F:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000   991        0 1 2 0\n  2: 3600007F:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000   991        0 1 2 0\n");
+        assert_eq!(reachable_dns_listener(&stub, ""), None);
+        let dnsmasq = format!("{head}\n  1: 0100007F:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 1 2 0\n");
+        assert_eq!(reachable_dns_listener(&dnsmasq, "").as_deref(), Some("127.0.0.1:53"));
+        let any = format!("{head}\n  1: 00000000:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 1 2 0\n");
+        assert_eq!(reachable_dns_listener(&any, "").as_deref(), Some("0.0.0.0:53"));
+        let v6 = format!("{head}\n  1: 00000000000000000000000001000000:0035 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000 0 0 1 2 0\n");
+        assert_eq!(reachable_dns_listener("", &v6).as_deref(), Some("[::1]:53"));
+        let other_port = format!("{head}\n  1: 0100007F:1F90 00000000:0000 07 00000000:00000000 00:00000000 00000000 0 0 1 2 0\n");
+        assert_eq!(reachable_dns_listener(&other_port, ""), None, "only port 53");
+    }
+}

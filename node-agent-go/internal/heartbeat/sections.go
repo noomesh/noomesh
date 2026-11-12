@@ -185,10 +185,16 @@ var (
 
 	secModelSets = payloadSection{name: "modelSets", add: func(r *Reporter, p map[string]any) {
 		// The model sets this node holds or is fetching (i300 F4):
-		// [{id, revision, state, reason?}]. OMITTED when the state cannot be
+		// [{id, revision, state, reason?, delivery fields}]. OMITTED when the state cannot be
 		// read: an empty list would say "holds none", which is a claim.
 		if ms := r.modelSetsReport(); ms != nil {
 			p["model_sets"] = ms
+		}
+		// i607b: the free bytes of the filesystem the agent's own disk check
+		// reads, so the controller's preflight measures the same disk.
+		// OMITTED when unknown, never 0.
+		if free, ok := r.modelSetsFreeBytes(); ok {
+			p["model_sets_free_bytes"] = free
 		}
 	}}
 

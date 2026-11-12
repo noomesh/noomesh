@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# Enforcement step 1 against a REAL systemd: the applier's harness egress hold
+# (IPAddressDeny, the rendered resolv.conf/hosts/nsswitch.conf) on a
+# harness-like unit, the node agent's real reader, and the apply-time
+# fail-safe (tests/ci/harness-egress-systemd.sh). The fake-systemd tests cannot
+# prove that the kernel denies the packet. GitHub-hosted only (no secrets,
+# read-only token); the controller is a local listener.
+name: harness-egress-systemd
+
+on:
+  pull_request:
+    branches: [ main, staging, develop, dev ]
+    paths:
+      - 'scripts/noo-apply.sh'
+      - 'tests/ci/harness-egress-systemd.sh'
+      - '.github/workflows/harness-egress-systemd.yml'
+      - 'node-agent-go/internal/hostsvc/**'
+      - 'gateway-rust/src/harness/egress_selftest.rs'
+  # A merge group has no path filter: the queue builds it, this lane reports.
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: harness-egress-systemd-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  harness-egress-systemd:
+    runs-on: ${{ matrix.ubuntu == 22 && 'ubuntu-22.04' || 'ubuntu-24.04' }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu: [ 22, 24 ]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The Go toolchain the node agent's reader test builds with.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e   # v7.0.0
+        with:
+          go-version-file: node-agent-go/go.mod
+          cache-dependency-path: node-agent-go/go.sum
+
+      - name: Install tcpdump
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tcpdump
+          systemctl --version | head -1
+          test "$(ps -o comm= -p 1)" = systemd
+
+      - name: Egress hold against the runner's real systemd
+        run: sudo -E env "PATH=$PATH" bash tests/ci/harness-egress-systemd.sh

@@ -31,6 +31,7 @@ pub(crate) mod phase;
 mod cloud;
 mod context;
 mod dispatch;
+pub mod expected_wait;
 mod gemma_channel;
 mod rail;
 mod remote;
@@ -86,6 +87,25 @@ pub use cloud::CloudGateClosed;
 tokio::task_local! {
     /// Set by a channel pipeline for a turn in a group chat or shared space.
     static SHARED_ROOM: bool;
+    /// The USER's own words for this turn, when the prompt also carries
+    /// gateway-authored wrapping (a task's contract). Skills, runbooks and
+    /// the cluster guidance are chosen from these words, never from the
+    /// wrapper (speed review, noomesh-internal i658: a task's contract
+    /// named `noo_agent_message` and `noo_task_done`, so every task drew
+    /// the CLI guide and the cluster guidance whatever its objective).
+    static SELECTION_TEXT: String;
+}
+
+/// Run `fut` (a whole coordinator turn) with `text` as the words that
+/// choose its skills, runbooks and cluster guidance.
+pub async fn with_selection_text<F: std::future::Future>(text: String, fut: F) -> F::Output {
+    SELECTION_TEXT.scope(text, fut).await
+}
+
+/// The words that choose this turn's skills and guidance: the scoped
+/// selection text inside a task, else the prompt itself.
+pub(crate) fn selection_text_or(prompt: &str) -> String {
+    SELECTION_TEXT.try_with(|s| s.clone()).unwrap_or_else(|_| prompt.to_string())
 }
 
 /// Run `fut` (a whole coordinator turn) as a turn in a SHARED ROOM when

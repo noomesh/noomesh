@@ -460,6 +460,7 @@ pub(crate) async fn failover_core<'a, F, A>(
     stream: bool,
     timeouts: Timeouts,
     deadline: Instant,
+    retry_first: Option<Duration>,
     mut build: F,
     mut on_failover: A,
 ) -> Result<CoreSuccess, RawChatError>
@@ -476,7 +477,16 @@ where
     // Every failure so far was a full backend: if so, the answer is a 503.
     let mut all_busy = true;
 
-    for (i, cand) in candidates.iter().enumerate() {
+    // The order of attempts: each candidate once, and (interactive, the
+    // expected-wait rule) the first choice once more after `retry_first`
+    // when its failure was not a busy answer.
+    let mut order: Vec<usize> = (0..candidates.len()).collect();
+    let mut retried_first = retry_first.is_none();
+    let mut k = 0;
+    while k < order.len() {
+        let i = order[k];
+        let cand = &candidates[i];
+        k += 1;
         if tried > 0 && !guard.may_retry(tried) {
             break;
         }
@@ -614,6 +624,15 @@ where
         }
         failed.push((cand.url.clone(), cand.backend.clone()));
         last_failure = failure.clone();
+        if !retried_first && i == 0 && !busy && guard.may_retry(tried) {
+            retried_first = true;
+            let wait = retry_first.unwrap_or_default().min(deadline.saturating_duration_since(Instant::now()));
+            tracing::info!(class, node = %cand.node_id, wait_ms = wait.as_millis() as u64, "raw_chat_retry_first_choice");
+            tokio::time::sleep(wait).await;
+            failed.pop();
+            order.insert(k, i);
+            continue;
+        }
 
         let next = candidates[i + 1..].iter().find(|c| !failed.iter().any(|(u, b)| u == &c.url && b == &c.backend));
         if let Some(next) = next {
@@ -661,9 +680,55 @@ pub async fn send_with_failover<F>(
 where
     F: FnMut(&Candidate) -> (String, Value),
 {
+    send_with_failover_pinned(state, class, candidates, stream, source, actor, false, build).await
+}
+
+/// [`send_with_failover`], told whether the caller's node pin is STRICT.
+/// An interactive request (the route decides: `expected_wait::interactive`)
+/// that is not strictly pinned goes through the expected-wait rule first:
+/// the candidates it may already use are dropped or reordered, never added
+/// to, and nothing that can answer within a minute is a 503 with
+/// Retry-After and a reason the caller can read.
+#[allow(clippy::too_many_arguments)]
+pub async fn send_with_failover_pinned<F>(
+    state: &AppState,
+    class: &str,
+    candidates: &[Candidate],
+    stream: bool,
+    source: &'static str,
+    actor: UsageActor,
+    strict: bool,
+    build: F,
+) -> Result<Outcome, RawChatError>
+where
+    F: FnMut(&Candidate) -> (String, Value),
+{
+    use coordinator::expected_wait::{self, Plan};
+    let planned: Vec<Candidate>;
+    let mut original: Vec<usize> = (0..candidates.len()).collect();
+    let (candidates, retry_first) = if !strict && expected_wait::interactive(source) {
+        let in_flight = |c: &Candidate| classes::in_flight(&c.url, &c.backend);
+        let p50 = |c: &Candidate| expected_wait::p50_ms(&c.node_id, &c.backend);
+        match expected_wait::plan(candidates, &in_flight, &p50) {
+            Plan::Try(order) => {
+                planned = order.iter().map(|&i| candidates[i].clone()).collect();
+                original = order;
+                (&planned[..], Some(expected_wait::RETRY_FIRST_AFTER))
+            }
+            Plan::Refuse { retry_after_secs, reason } => {
+                tracing::info!(class, source, retry_after_secs, candidates = candidates.len(), "raw_chat_refused_expected_wait");
+                let mut e = RawChatError::new(StatusCode::SERVICE_UNAVAILABLE, "backend_busy", format!("{reason} (class {class})"));
+                e.public = Some(reason);
+                e.retry_after = Some(retry_after_secs);
+                return Err(e);
+            }
+        }
+    } else {
+        (candidates, None)
+    };
     let deadline = Instant::now() + OVERALL_DEADLINE;
     let client = crate::tls::failover_client();
-    let ok = failover_core(&client, class, candidates, stream, Timeouts::PRODUCTION, deadline, build, move |url, detail| {
+    let ok = failover_core(&client, class, candidates, stream, Timeouts::PRODUCTION, deadline, retry_first, build, move |url, detail| {
         Box::pin(async move {
             crate::operator_alert::send_operator_alert_detached_with(
                 state,
@@ -684,7 +749,7 @@ where
         url: cand.url.clone(),
         // Not the class's first choice, or a stand-in for what was named
         // (a class or model with nothing live, answered by the mesh).
-        fallback: is_fallback(ok.index, cand),
+        fallback: is_fallback(original[ok.index], cand),
         attempts: ok.attempts,
     };
     let label = if cand.class_label.is_empty() { class } else { cand.class_label.as_str() };
@@ -693,6 +758,9 @@ where
         rank = %cand.rank,
         attempt = ok.attempts, fallback = served.fallback, stream, source, "raw_chat_served"
     );
+    // On the request's trace NOW, not only when a usage frame arrives: a
+    // stream the caller drops first still names what served it.
+    crate::request_trace::note_served(Some(&cand.node_id), &cand.backend, &cand.model);
     // Rebuilt per attempt: usage is charged to the candidate that answered.
     let usage = StreamUsageCtx {
         db: state.db.clone(),
@@ -733,6 +801,21 @@ pub async fn chat_completions(
     actor: UsageActor,
     pin: &PinHeaders,
 ) -> Result<Outcome, RawChatError> {
+    chat_completions_with(state, body, source, actor, pin, |_, _| {}).await
+}
+
+/// [`chat_completions`], with `adjust` applied to each candidate's body
+/// after its model is set: for a caller whose fields depend on the engine
+/// that will answer (`/api/inference`'s raw path turns thinking off on
+/// every engine's own switch, `thinking::disable_on_wire`).
+pub async fn chat_completions_with(
+    state: &AppState,
+    body: &mut Value,
+    source: &'static str,
+    actor: UsageActor,
+    pin: &PinHeaders,
+    adjust: impl Fn(&mut Value, &Candidate),
+) -> Result<Outcome, RawChatError> {
     if !body.is_object() {
         return Err(RawChatError::bad_request("the request body must be a JSON object with 'messages'"));
     }
@@ -745,9 +828,10 @@ pub async fn chat_completions(
         body["stream_options"] = json!({"include_usage": true});
     }
     let template = body.clone();
-    send_with_failover(state, &class, &cands, stream, source, actor, |cand| {
+    send_with_failover_pinned(state, &class, &cands, stream, source, actor, pin.strict, |cand| {
         let mut b = template.clone();
         b["model"] = json!(cand.model);
+        adjust(&mut b, cand);
         ("/v1/chat/completions".to_string(), b)
     })
     .await
@@ -1208,6 +1292,9 @@ mod tests {
         LateStart { wait: Duration, text: &'static str },
         /// The node agent's busy answer: every slot taken, 503 at once.
         Busy,
+        /// The live `backend_unreachable` 502 on its first request (vLLM
+        /// resetting the connection), then a prompt answer.
+        FailsFirst(&'static str),
     }
 
     struct FakeBackend {
@@ -1280,7 +1367,20 @@ mod tests {
                     let delta = |t: &str| sse(json!({"id":"c","model":"m","choices":[{"index":0,"delta":{"content":t}}]}));
                     let fin = sse(json!({"id":"c","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}));
                     let usage = sse(json!({"id":"c","choices":[],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}));
+                    let first_request = seen.lock().unwrap().len() == 1;
                     match mode {
+                        Fake::FailsFirst(_) if first_request => {
+                            let body = r#"{"error":{"code":"backend_unreachable","message":"read tcp 172.18.0.1:45704->172.18.0.2:8000: read: connection reset by peer","type":"node_agent_proxy_error"}}"#;
+                            let reply = format!("HTTP/1.1 502 Bad Gateway\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}", body.len());
+                            let _ = sock.write_all(reply.as_bytes()).await;
+                        }
+                        Fake::FailsFirst(text) => {
+                            let _ = sock.write_all(head.as_bytes()).await;
+                            for f in [delta(text), fin, usage, "data: [DONE]\n\n".to_string()] {
+                                let _ = sock.write_all(&chunk(&f)).await;
+                            }
+                            let _ = sock.write_all(b"0\r\n\r\n").await;
+                        }
                         Fake::Silent => {
                             tokio::time::sleep(Duration::from_secs(60)).await;
                         }
@@ -1355,6 +1455,16 @@ mod tests {
     }
 
     async fn run_until(cands: &[Candidate], stream: bool, t: Timeouts, within: Duration) -> (Result<CoreSuccess, RawChatError>, Alerts) {
+        run_until_with_retry(cands, stream, t, within, None).await
+    }
+
+    async fn run_until_with_retry(
+        cands: &[Candidate],
+        stream: bool,
+        t: Timeouts,
+        within: Duration,
+        retry_first: Option<Duration>,
+    ) -> (Result<CoreSuccess, RawChatError>, Alerts) {
         let alerts: Alerts = Arc::new(Mutex::new(Vec::new()));
         let sink = alerts.clone();
         let client = reqwest::Client::new();
@@ -1365,6 +1475,7 @@ mod tests {
             stream,
             t,
             Instant::now() + within,
+            retry_first,
             |c| (CHAT_PATH.to_string(), json!({"model": c.model, "messages": [{"role":"user","content":"hi"}]})),
             move |url, detail| {
                 sink.lock().unwrap().push((url, detail));
@@ -1578,6 +1689,52 @@ mod tests {
         assert_eq!(e.status, StatusCode::BAD_GATEWAY, "{}", e.detail);
     }
 
+    /// The expected-wait rule's retry (speed review 2026-11-11): awolf's
+    /// vLLM resetting the connection once is retried after the wait, and
+    /// answers; the slow fallback behind it is never touched.
+    #[tokio::test]
+    async fn the_first_choice_failing_once_is_retried_after_the_wait_and_answers() {
+        let awolf = fake_backend(Fake::FailsFirst("hi")).await;
+        let mcmini = fake_backend(Fake::Answer("slow")).await;
+        let wait = Duration::from_millis(300);
+        let t0 = Instant::now();
+        let (r, _) = run_until_with_retry(
+            &[cand("awolf", "vllm", "m", &awolf.url), cand("mcmini", "ollama", "m", &mcmini.url)],
+            false, FAST, Duration::from_secs(20), Some(wait),
+        )
+        .await;
+        let (index, _) = json_of(r);
+        assert_eq!(index, 0, "awolf answered the retry");
+        assert!(t0.elapsed() >= wait, "the retry waited {:?}", t0.elapsed());
+        assert_eq!(awolf.seen.lock().unwrap().len(), 2, "one retry, not more");
+        assert!(mcmini.seen.lock().unwrap().is_empty(), "the fallback was never touched");
+        assert_eq!(crate::coordinator::expected_wait::RETRY_FIRST_AFTER, Duration::from_secs(2));
+    }
+
+    /// Without the rule (a strict pin, a batch source), failover is as it was.
+    #[tokio::test]
+    async fn without_the_rule_a_failure_moves_on_with_no_retry() {
+        let awolf = fake_backend(Fake::FailsFirst("hi")).await;
+        let mcmini = fake_backend(Fake::Answer("ok")).await;
+        let (r, _) = run(&[cand("awolf", "vllm", "m", &awolf.url), cand("mcmini", "ollama", "m", &mcmini.url)], false, FAST).await;
+        assert_eq!(json_of(r).0, 1);
+        assert_eq!(awolf.seen.lock().unwrap().len(), 1);
+    }
+
+    /// A busy answer is load, not a transient failure: never retried.
+    #[tokio::test]
+    async fn a_busy_first_choice_is_not_retried() {
+        let busy = fake_backend(Fake::Busy).await;
+        let free = fake_backend(Fake::Answer("ok")).await;
+        let (r, _) = run_until_with_retry(
+            &[cand("a", "ollama", "m", &busy.url), cand("b", "vllm", "m", &free.url)],
+            false, FAST, Duration::from_secs(20), Some(Duration::from_millis(300)),
+        )
+        .await;
+        assert_eq!(json_of(r).0, 1);
+        assert_eq!(busy.seen.lock().unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn a_streaming_caller_still_gets_the_live_stream_and_its_header_timeout() {
         let b = fake_backend(Fake::Answer("hi")).await;
@@ -1599,5 +1756,49 @@ mod tests {
         assert!(can_aggregate(CHAT_PATH, &json!({"n": 1})));
         assert!(!can_aggregate(CHAT_PATH, &json!({"n": 2})), "the aggregator folds one choice");
         assert!(!can_aggregate("/v1/responses", &json!({})), "the native Responses stream has its own frames");
+    }
+}
+
+#[cfg(test)]
+mod served_trace_tests {
+    /// The candidate that answers is noted on the request's trace at commit,
+    /// right where `raw_chat_served` is logged, for streams and bodies alike.
+    #[test]
+    fn the_served_candidate_is_noted_on_the_trace_at_commit() {
+        let code = crate::test_src::own_code(include_str!("raw_chat.rs"));
+        let at_log = code.find("\"raw_chat_served\"").expect("the served log line");
+        let note = code.find("crate::request_trace::note_served(Some(&cand.node_id), &cand.backend, &cand.model)").expect("note_served at commit");
+        let branch = code.find("CoreBody::Stream(resp) => Ok(Outcome::Stream").expect("the stream arm");
+        assert!(at_log < note && note < branch, "noted after the candidate is chosen and before the stream/body split");
+    }
+}
+
+#[cfg(test)]
+mod expected_wait_wiring_tests {
+    /// The rule runs only for an interactive source that is not strictly
+    /// pinned, and only on the candidates resolved for the caller (class,
+    /// audience and pin were judged before it). A strict pin is passed
+    /// through from the request; the route, never a header, says interactive.
+    #[test]
+    fn the_rule_is_applied_where_and_only_where_it_should_be() {
+        let code = crate::test_src::own_code(include_str!("raw_chat.rs"));
+        let pinned = crate::test_src::fn_body(&code, "pub async fn send_with_failover_pinned");
+        assert!(pinned.contains("if !strict && expected_wait::interactive(source)"), "{pinned}");
+        assert!(pinned.contains("expected_wait::plan(candidates,"), "planned over the resolved candidates only");
+        assert!(pinned.contains("e.retry_after = Some(retry_after_secs)") && pinned.contains("e.public = Some(reason)"));
+        let with = crate::test_src::fn_body(&code, "pub async fn chat_completions_with");
+        assert!(with.contains("send_with_failover_pinned(state, &class, &cands, stream, source, actor, pin.strict,"), "{with}");
+        assert!(!pinned.contains("headers"), "no caller header decides it");
+        // The served `fallback` flag (traces, the answer's `noo` envelope,
+        // the failover alert) is judged against the class's OWN order: the
+        // planned order puts a demoted first choice later, and judging by
+        // the planned index would call the class's first choice a fallback
+        // or a fallback the first choice.
+        assert!(pinned.contains("fallback: is_fallback(original[ok.index], cand)"), "the fallback flag must use the original index");
+        assert!(pinned.contains("original = order;"), "the original index follows the plan");
+        // The first choice's one retry after the wait is the rule's (point
+        // 2): an interactive plan must hand failover_core the retry.
+        assert!(pinned.contains("(&planned[..], Some(expected_wait::RETRY_FIRST_AFTER))"), "the interactive plan must carry the first-choice retry");
+        assert!(pinned.contains("(candidates, None)"), "no retry without the rule");
     }
 }

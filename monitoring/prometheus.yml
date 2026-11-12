@@ -84,7 +84,14 @@ scrape_configs:
     static_configs:
       - targets: ['nvidia-exporter:9400']
 
-  # PAI Node Agent
+  # The node agents (i669). Not a static target: `node-agent:8081` named a
+  # compose service that exists only under the node-agent-compose profile, so
+  # on the fleet (agents are host units) it was never up. The gateway lists
+  # the registered agents, at the address it dials them itself, and only those
+  # whose leaf carries a SAN for that address
+  # (GET /api/internal/prometheus/targets/node-agents, the scraper's leaf
+  # only). If the gateway cannot answer, Prometheus keeps the last list it
+  # fetched. The scrape verifies server names: a wrong target fails closed.
   - job_name: 'noo_node_agent'
     scheme: https
     tls_config:
@@ -92,6 +99,12 @@ scrape_configs:
       cert_file: /app/pki/services/prometheus/service.crt
       key_file: /app/pki/services/prometheus/service.key
       insecure_skip_verify: false
-    static_configs:
-      - targets: ['node-agent:8081']
+    http_sd_configs:
+      - url: 'https://gateway:8080/api/internal/prometheus/targets/node-agents'
+        refresh_interval: 60s
+        tls_config:
+          ca_file: /app/pki/ca.crt
+          cert_file: /app/pki/services/prometheus/service.crt
+          key_file: /app/pki/services/prometheus/service.key
+          insecure_skip_verify: false
     metrics_path: '/metrics'

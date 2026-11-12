@@ -43,6 +43,15 @@ fn print_json(v: &serde_json::Value) {
 /// compose's per-container lines into one live line ([`fold_launcher_output`]). `--json` mode with `json_action`: child
 /// stdout → our stderr, then the `{"status":"ok","action":…}` contract.
 fn run_script(g: &Globals, name: &str, args: &[String], json_action: Option<&str>) -> i32 {
+    // i677 #10: right after onboard installs Docker, the user's shell is not
+    // yet in the docker group, and every launcher fails at its first docker
+    // call ("permission denied"). That one case is run again with the group
+    // active; the launcher reports any other docker problem itself.
+    if let Err(why) = super::offboard::docker_access() {
+        if let Some(code) = crate::docker_group::relaunch_if_needed(&why) {
+            return code;
+        }
+    }
     let root = repo_root();
     let script = root.join("scripts").join(name);
     if !script.is_file() {
@@ -717,6 +726,33 @@ pub fn mesh_stop(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     }
     if volumes {
+        // Name what `down -v` will delete BEFORE the prompt (or -y): a removal
+        // of volumes that hold data is only ever one the user saw by name
+        // (i677 #20). A docker that does not answer is refused, never read
+        // as "no volumes".
+        let project = crate::envfile::compose_project();
+        // No docker binary at all is a positive answer (nothing of this
+        // stack can exist here), the same reading offboard gives it.
+        let listed = match super::offboard::docker_access() {
+            Ok(super::offboard::DockerAccess::NotInstalled) => Ok(Vec::new()),
+            Ok(super::offboard::DockerAccess::Reachable) => super::offboard::stack_volumes(&project),
+            Err(why) => Err(why),
+        };
+        match listed {
+            Ok(v) if v.is_empty() => eprintln!("no volumes of compose project {project} on this host"),
+            Ok(v) => eprintln!("this deletes {} volume(s) of compose project {project}: {}", v.len(), v.join(", ")),
+            Err(why) => {
+                if let Some(code) = crate::docker_group::relaunch_if_needed(&why) {
+                    return Ok(code);
+                }
+                let lines = super::offboard::docker_unreachable_refusal(&why, "noo stack stop --volumes");
+                for l in &lines[1..] {
+                    println!("{}", ui::note(l));
+                }
+                ui::close_failed(&lines[0], Some("docker ps"));
+                return Ok(1);
+            }
+        }
         confirm_stop_volumes(g, yes);
     }
     let script_args: Vec<String> = if volumes { vec!["-v".into()] } else { Vec::new() };
@@ -858,6 +894,23 @@ pub fn mesh_clean(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     }
 
+    // i677 #20: docker must ANSWER before anything is asked, stopped or removed
+    // (the relaunch, i677 #10, runs BEFORE the confirm, so it is asked once,
+    // in the relaunched child). A
+    // shell outside the docker group made every docker call fail, and a
+    // failure read as "nothing there" deletes the wrong things. Not installed
+    // at all is a positive answer (the script then cleans what is on disk).
+    if let Err(why) = super::offboard::docker_access() {
+        if let Some(code) = crate::docker_group::relaunch_if_needed(&why) {
+            return Ok(code);
+        }
+        let lines = super::offboard::docker_unreachable_refusal(&why, "noo stack clean");
+        for l in &lines[1..] {
+            println!("{}", ui::note(l));
+        }
+        ui::close_failed(&lines[0], Some("docker ps"));
+        return Ok(1);
+    }
     // Every variant that deletes something confirms (unless -y).
     if all || deep || volumes || images || cache || hf_cache {
         super::confirm_destructive(g, yes, "Clean all Docker resources on", "this host");

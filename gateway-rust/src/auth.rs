@@ -3036,6 +3036,7 @@ pub const USER_READ_PREFIXES: &[&str] = &[
     "/api/agents/messages",
     "/api/agents/threads",
     "/api/agents/presence",
+    "/api/agents/directory",
     "/api/agents/whoami",
     "/api/agents/roles",
     "/api/agents/peer/",
@@ -3120,6 +3121,19 @@ pub const METRICS_SCRAPER_SERVICE: &str = "prometheus";
 fn is_metrics_scrape(method: &axum::http::Method, path: &str, service: Option<&crate::node_identity::VerifiedService>) -> bool {
     *method == axum::http::Method::GET
         && path == "/metrics"
+        && service.is_some_and(|s| s.0 == METRICS_SCRAPER_SERVICE)
+}
+
+/// Prometheus's http_sd list of the node agents (i669):
+/// `routes::scrape_targets`. Opened by the scraper's leaf
+/// ([`METRICS_SCRAPER_SERVICE`]) ALONE, GET only, before the bearer: no token,
+/// header, user, add-on or node credential reaches it.
+pub const SCRAPE_TARGETS_PATH: &str = "/api/internal/prometheus/targets/node-agents";
+
+/// Whether this request is the scraper fetching its node-agent targets.
+pub(crate) fn is_scrape_targets(method: &axum::http::Method, path: &str, service: Option<&crate::node_identity::VerifiedService>) -> bool {
+    *method == axum::http::Method::GET
+        && path == SCRAPE_TARGETS_PATH
         && service.is_some_and(|s| s.0 == METRICS_SCRAPER_SERVICE)
 }
 
@@ -3292,6 +3306,18 @@ pub async fn require_any_auth(
     if is_metrics_scrape(request.method(), &path, scraper.as_ref()) {
         request.extensions_mut().insert(AuthActor(format!("svc:{METRICS_SCRAPER_SERVICE}")));
         return Ok(next.run(request).await);
+    }
+
+    // The scraper's node-agent target list, by its service leaf ALONE, GET
+    // only, before the bearer and returning here either way: no token opens
+    // this path, and no other leaf does.
+    if path == SCRAPE_TARGETS_PATH {
+        if is_scrape_targets(request.method(), &path, scraper.as_ref()) {
+            request.extensions_mut().insert(AuthActor(format!("svc:{METRICS_SCRAPER_SERVICE}")));
+            return Ok(next.run(request).await);
+        }
+        tracing::info!(path = %path, "scrape_targets_refused: answers the Prometheus scraper's own service leaf only");
+        return Err(StatusCode::FORBIDDEN);
     }
 
     // Alertmanager's intake, by its service leaf ALONE, before the bearer
@@ -4998,6 +5024,26 @@ mod tests {
         assert!(!passes_without_bearer_check(ALERT_INTAKE_PATH, false, false));
         assert!(!passes_without_bearer_check(ALERT_INTAKE_PATH, false, true));
         assert!(!PUBLIC_PATHS_EXACT.contains(&ALERT_INTAKE_PATH));
+    }
+
+    /// i669: the node-agent target list is decided by the scraper's leaf
+    /// before the bearer, refused (403) for everything else, and not public.
+    #[test]
+    fn the_scrape_target_list_is_decided_before_the_bearer_and_is_not_public() {
+        // own_code + fn_body: both needles must be found inside the
+        // middleware itself, never in a later function or in this test.
+        let code = crate::test_src::own_code(include_str!("auth.rs"));
+        let body = crate::test_src::fn_body(&code, "pub async fn require_any_auth(");
+        let branch = body.find("if path == SCRAPE_TARGETS_PATH \u{7b}").expect("the scrape-targets branch");
+        let bearer = body.find("let token = bearer_token(&request);").expect("the bearer read");
+        assert!(branch < bearer, "the leaf check must come before the bearer");
+        let arm = &body[branch..bearer];
+        let arm = &arm[..arm.find("if path == ALERT_INTAKE_PATH").unwrap_or(arm.len())];
+        assert!(arm.contains("is_scrape_targets(request.method(), &path, scraper.as_ref())"), "{arm}");
+        assert!(arm.contains("return Err(StatusCode::FORBIDDEN);"), "{arm}");
+        assert!(!passes_without_bearer_check(SCRAPE_TARGETS_PATH, false, false));
+        assert!(!passes_without_bearer_check(SCRAPE_TARGETS_PATH, false, true));
+        assert!(!PUBLIC_PATHS_EXACT.contains(&SCRAPE_TARGETS_PATH));
     }
 
     // The birth-proof routes step past this middleware because

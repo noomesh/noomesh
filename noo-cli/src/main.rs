@@ -18,7 +18,8 @@
 //!   - `--json` prints the gateway's JSON to stdout, nothing else.
 //!   - Errors go to stderr — as JSON (`{"error","code","hint"}`) in json mode.
 //!   - Exit codes: 0 ok, 1 generic, 2 usage, 3 gateway unreachable,
-//!     4 auth failed, 5 gateway returned an error status.
+//!     4 auth failed, 5 gateway returned an error status,
+//!     6 stopped for a decision (it will not decide for you; the command to run is printed).
 //!
 //! Environment parity with `noomesh/cli_utils.py`: loads the repo `.env`
 //! (already-exported vars win) and resolves the gateway URL the same way.
@@ -57,6 +58,7 @@ mod catalog;
 mod child_stdin;
 mod commands;
 mod credentials;
+mod docker_group;
 #[cfg(test)]
 mod config_readers;
 mod entitlement;
@@ -311,6 +313,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["cluster", "workloads", "place"], commands::cluster_workloads_place),
     (&["cluster", "workloads", "show"], commands::cluster_workloads_show),
     (&["cluster", "workloads", "unplace"], commands::cluster_workloads_unplace),
+    (&["cluster", "workloads", "retry"], commands::cluster_workloads_retry),
     (&["cluster", "workloads"], commands::cluster_workloads),
     // A node's harness profile: resolved per field (override > measured >
     // tier default), its overrides, and its chat-model bench.

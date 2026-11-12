@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026 PersonifAI LLC
 
-//! `noo cluster verify [<node>...] [--controller] [--wait]` — assert the invariants a
+//! `noo cluster verify [<node>...] [--controller] [--wait] [--timings]` — assert the invariants a
 //! node, and the controller, must satisfy to operate under the current
 //! constraints.
 //!
@@ -34,6 +34,7 @@ use crate::ui::{self, Col, Glyph};
 use crate::{Globals, Unhandled};
 use serde_json::Value;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 mod image_family;
 mod tempo;
@@ -210,6 +211,83 @@ const RECENT_HEARTBEAT_SECS: i64 = 90;
 /// would land on a dead cert.
 const CERT_MIN_REMAINING_SECS: i64 = 14 * 86_400;
 
+/// Which machine this verify runs on, as far as it can be told.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Vantage {
+    Controller,
+    /// A node; the controller's node name when the gateway marks one.
+    Node { controller: Option<String> },
+    /// Not told: why, said out loud. Nothing judges local controller files.
+    Unknown(String),
+}
+
+/// Decide [`Vantage`]. The gateway's word comes first: its node list marks
+/// the controller's own node (`controller_host`). Without that mark, this
+/// machine is the controller only when it holds a controller install AND
+/// runs the stack's gateway container; never a guess.
+pub(crate) fn decide_vantage(
+    fleet: Option<&Value>,
+    is_self: &dyn Fn(&str) -> bool,
+    local_install: bool,
+    gateway_container_here: bool,
+    local_node: Option<&str>,
+) -> Vantage {
+    let marked = fleet
+        .and_then(|b| b["nodes"].as_array())
+        .and_then(|ns| ns.iter().find(|n| n["controller_host"].as_bool() == Some(true)))
+        .and_then(|n| n["id"].as_str());
+    if let Some(c) = marked {
+        return if is_self(c) { Vantage::Controller } else { Vantage::Node { controller: Some(c.to_string()) } };
+    }
+    if local_install && gateway_container_here {
+        return Vantage::Controller;
+    }
+    match (local_node, local_install) {
+        (Some(_), _) => Vantage::Node { controller: None },
+        (None, true) => Vantage::Unknown(
+            "this machine has a controller install but runs no gateway container, and the gateway names no controller node".into()),
+        (None, false) => Vantage::Unknown("this machine has no controller install and no node enrollment".into()),
+    }
+}
+
+fn vantage_here(fleet: Option<&Value>) -> Vantage {
+    let role = crate::role::detect();
+    let gw = crate::commands::addon_provision::gateway_container();
+    let container = role.controller.is_some()
+        && Command::new("docker").args(["inspect", "--type", "container", "-f", "{{.Id}}", &gw]).output()
+            .is_ok_and(|o| o.status.success());
+    decide_vantage(fleet, &crate::role::is_self_node, role.controller.is_some(), container,
+        role.node.as_ref().map(|n| n.name.as_str()))
+}
+
+/// The one line said instead of the controller rows off the controller;
+/// `None` on the controller.
+pub(crate) fn not_the_controller_line(v: &Vantage) -> Option<String> {
+    let run = "run `noo cluster verify --controller` on the controller";
+    match v {
+        Vantage::Controller => None,
+        Vantage::Node { controller: Some(c) } => Some(format!("controller rows not run: this machine is a node; {run} ({c})")),
+        Vantage::Node { controller: None } => Some(format!("controller rows not run: this machine is a node; {run}")),
+        Vantage::Unknown(why) => Some(format!("controller rows not run: which machine is the controller could not be told ({why}); {run}")),
+    }
+}
+
+/// The controller's release as the gateway states it (`stack_tag` on the
+/// node list); else what the controller's own node agent runs; else empty,
+/// which the version and display rows read as "not compared".
+pub(crate) fn stack_tag_from_gateway(fleet: &Value) -> String {
+    if let Some(t) = fleet["stack_tag"].as_str().map(str::trim).filter(|t| !t.is_empty()) {
+        return t.to_string();
+    }
+    fleet["nodes"].as_array()
+        .and_then(|ns| ns.iter().find(|n| n["controller_host"].as_bool() == Some(true)))
+        .and_then(|n| n["app_version"].as_str())
+        .and_then(agent_version_tag)
+        .filter(|(stack, _)| *stack)
+        .map(|(_, t)| t)
+        .unwrap_or_default()
+}
+
 /// The controller's stack tag: `.env NOO_IMAGE_TAG` (what is deployed), else
 /// the tag this binary was paired with at build.
 pub(crate) fn controller_stack_tag() -> String {
@@ -279,6 +357,8 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
 
     // 3. Agent version pairs with the controller's release.
     match n["app_version"].as_str().and_then(agent_version_tag) {
+        Some((true, tag)) if controller_tag.is_empty() => out.push(warn("version",
+            format!("agent {tag}; not compared: the controller did not state its release (an older gateway)"), None)),
         Some((true, tag)) if tag == controller_tag => out.push(ok("version", format!("agent {tag} = controller"))),
         Some((true, tag)) => out.push(fail("version", format!("agent {tag}, controller {controller_tag}"),
             format!("noo cluster provision {id} --wait"))),
@@ -353,6 +433,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     //          placement's image is staged there.
     out.extend(image_sources_check(n));
     out.extend(images_staged_check(n));
+    out.extend(door_pin_check(n));
     out.extend(gpu_target_cpu_build_check(n));
     out.extend(hardened_images_check(n));
 
@@ -436,7 +517,46 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
         (Some(p), s) => out.push(ok("harness", format!("{} (policy {p})", if s.is_empty() { "-" } else { s }))),
     } }
     out.extend(harness_tasks_check(n));
+    out.extend(harness_egress_check(id, n));
     out
+}
+
+/// The `harness egress` row (enforcement step 1): whether this node's harness,
+/// and every vendor CLI it launches, is held off the internet. Read from the
+/// agent's account of the RUNNING unit (systemd's effective IPAddressDeny and
+/// resolver bind, and the harness's own self-test from inside the unit,
+/// matched to its MainPID), never from the files the applier rendered.
+/// Unknown is a WARN, never a pass. No row on the controller's own node (it
+/// runs no harness unit) or where no harness runs.
+pub(crate) fn harness_egress_check(id: &str, n: &Value) -> Option<Check> {
+    const NAME: &str = "harness egress";
+    if n["self_node"].as_bool() == Some(true) {
+        return None;
+    }
+    let h = &n["host_services"]["harness"];
+    let e = &h["egress"];
+    if !e.is_object() {
+        return (h["state"].as_str() == Some("running")).then(|| {
+            warn(NAME, "not reported: this node's agent is older than the egress hold, so nothing says the harness is held off the internet",
+                Some(format!("noo upgrade --all   # rolls the agent on {id}; then: noo cluster verify")))
+        });
+    }
+    let reason = e["reason"].as_str().unwrap_or("");
+    let stale: Vec<&str> = e["stale_hosts"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+    Some(match e["state"].as_str() {
+        Some("enforced") if stale.is_empty() => ok(NAME, format!(
+            "held off the internet: deny {}, unit resolver; the harness's own check from inside the unit: lookup {}, connect {}",
+            e["ip_deny"].as_str().unwrap_or("?"), e["lookup"].as_str().unwrap_or("?"), e["connect"].as_str().unwrap_or("?"))),
+        Some("enforced") => fail(NAME, format!(
+            "held off the internet, but {} changed address since the harness's hosts file was rendered: the harness cannot reach its controller (it never falls back to real DNS)",
+            stale.join(", ")), format!("noo cluster provision {id}   # re-renders the hosts file and the allowlist")),
+        Some("unenforced") => fail(NAME, format!(
+            "NOT held off the internet ({reason}); placements of kind codex are refused here (Codex resolves api.github.com and chatgpt.com at start)"),
+            format!("noo cluster provision {id}   # then: noo cluster verify; a host whose systemd cannot apply IPAddressDeny (cgroup v1, systemd < 235) needs a systemd upgrade")),
+        _ => warn(NAME, format!("unknown{}: nothing proves this node's harness is held off the internet",
+            if reason.is_empty() { String::new() } else { format!(" ({reason})") }),
+            Some(format!("noo cluster logs {id} harness   # the harness logs its egress self-test at start"))),
+    })
 }
 
 /// The harness's default stall bound (`NOO_HARNESS_TASK_STALL_SECS`): past
@@ -787,6 +907,96 @@ pub(crate) fn hardened_images_check(n: &Value) -> Option<Check> {
         format!("drift: upstream image(s) running where a hardened build of ours exists (a node never falls back to upstream on its own): {}", list.join(", ")),
         format!("noo cluster sync-images {id} -i {first_ours}   # stage ours; the node's reconciler then recreates the backend on it; unset LLAMACPP_IMAGE / OLLAMA_IMAGE if an override pins upstream"),
     ))
+}
+
+/// The node agent's default image namespace (Go `DefaultImagePrefix`): a
+/// node resolves a door pin's ref under `NOO_IMAGE_PREFIX`, else this. From
+/// the declared home (`registry::IMAGE_NAMESPACE`), never typed out here.
+const AGENT_DEFAULT_IMAGE_PREFIX: &str = crate::registry::IMAGE_NAMESPACE;
+
+/// The pinned doors among a node's running placements, each with what the
+/// controller's rail staged it by for `arch`: `state` is `staged` (with
+/// `staged_by`, "" = staged by name), `absent` (no tar for that arch) or
+/// `unknown` (the gateway did not answer). Asked of the gateway's manifest
+/// route, the same answer the node agent gets.
+fn door_pin_facts(g: &Globals, placements: &Value, arch: &str) -> Vec<Value> {
+    let prefix = crate::commands::provision::release_var("NOO_IMAGE_PREFIX");
+    let prefix = if prefix.trim().is_empty() { AGENT_DEFAULT_IMAGE_PREFIX.to_string() } else { prefix };
+    let placed: Vec<&str> = placements
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|p| p["desired_state"].as_str() == Some("running"))
+        .filter_map(|p| p["backend"].as_str())
+        .collect();
+    crate::commands::image_stage::door_pins_by_backend(&prefix)
+        .into_iter()
+        .filter(|(backend, ..)| placed.contains(&backend.as_str()))
+        .map(|(backend, door, pin)| {
+            let mut fact = serde_json::json!({"backend": backend, "ref": door, "arch": arch, "pin": pin, "state": "absent"});
+            for tar in [
+                crate::commands::image_stage::image_tar_gz_name(&door, arch),
+                crate::commands::image_stage::image_tar_name(&door, arch),
+            ] {
+                let path = format!("/api/artifacts/manifest/image/{}", crate::commands::urlencode(&tar));
+                match crate::http::get_raw_opt(g, &path, true, 15) {
+                    Some((200, body)) => {
+                        let m: Value = serde_json::from_str(&body).unwrap_or_default();
+                        fact["state"] = "staged".into();
+                        fact["staged_by"] = m["lock_digest"].as_str().unwrap_or("").into();
+                        break;
+                    }
+                    Some((404, _)) => continue,
+                    _ => {
+                        fact["state"] = "unknown".into();
+                        break;
+                    }
+                }
+            }
+            fact
+        })
+        .collect()
+}
+
+/// The `door pin` row: every pinned stunnel door a node runs is staged on
+/// the rail by exactly its pinned digest, for the node's arch. The node
+/// agent holds a pinned door to that digest (noomesh/noomesh#915), so a door
+/// staged by another digest, by name, or not at all does not start. No row
+/// for a node with no pinned door placed. The remedy restages every door pin
+/// by its digest.
+pub(crate) fn door_pin_check(n: &Value) -> Option<Check> {
+    const NAME: &str = "door pin";
+    let facts = n["door_pins"].as_array().filter(|a| !a.is_empty())?;
+    let mut good = Vec::new();
+    let mut bad = Vec::new();
+    let mut unknown = Vec::new();
+    for f in facts {
+        let label = format!(
+            "{}'s door {} ({})",
+            f["backend"].as_str().unwrap_or("?"),
+            f["ref"].as_str().unwrap_or("?"),
+            f["arch"].as_str().unwrap_or("?")
+        );
+        let pin = f["pin"].as_str().unwrap_or("");
+        match (f["state"].as_str(), f["staged_by"].as_str()) {
+            (Some("staged"), Some(by)) if !pin.is_empty() && by == pin => good.push(label),
+            (Some("staged"), Some("")) => bad.push(format!("{label} is staged by name, pinned {pin}")),
+            (Some("staged"), Some(by)) => bad.push(format!("{label} is staged by {by}, pinned {pin}")),
+            (Some("unknown"), _) => unknown.push(label),
+            _ => bad.push(format!("{label} is not staged on the rail, pinned {pin}")),
+        }
+    }
+    if !bad.is_empty() {
+        return Some(warn(
+            NAME,
+            format!("a pinned door the node will refuse to start: {}", bad.join("; ")),
+            Some("noo upgrade --stack   # restages every door pin by its digest; then run verify again".to_string()),
+        ));
+    }
+    if !unknown.is_empty() {
+        return Some(warn(NAME, format!("the gateway did not answer for {}; not checked", unknown.join(", ")), None));
+    }
+    Some(ok(NAME, format!("staged by its pinned digest: {}", good.join(", "))))
 }
 
 /// The `sidecar image` row: which image the node's
@@ -1332,6 +1542,13 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
         (Some(d), Some(arch)) => crate::commands::image_stage::unstaged_for(&d["placements"], arch),
         _ => Vec::new(),
     };
+    // The `door pin` row: each pinned stunnel door this node runs, and the
+    // digest the rail staged it by, asked of the GATEWAY (the manifest the
+    // node itself reads), never of this host's image directory.
+    let door_pins = match (desired.as_ref(), crate::commands::image_stage::node_arch(&n)) {
+        (Some(d), Some(arch)) => door_pin_facts(g, &d["placements"], arch),
+        _ => Vec::new(),
+    };
     // i545 45/46: placements on a gpu target whose image has no GPU build.
     let cpu_built = desired
         .as_ref()
@@ -1362,6 +1579,9 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
         }
         if !unstaged.is_empty() {
             obj.insert("unstaged_images".into(), serde_json::json!(unstaged));
+        }
+        if !door_pins.is_empty() {
+            obj.insert("door_pins".into(), serde_json::json!(door_pins));
         }
         if !cpu_built.is_empty() {
             obj.insert("gpu_targets_on_cpu_builds".into(), serde_json::json!(cpu_built));
@@ -2078,6 +2298,133 @@ pub(crate) fn default_chat_check(classes: Option<&Value>) -> Check {
 /// embed node serves a model no space uses (it serves nobody). A static
 /// endpoint that answered the gateway's probe embed (`static_live`, the
 /// compose embedder on a fresh install) serves the space like a node.
+/// Finding 126: a model the node measured far above its fit estimate, or over
+/// its pool. One `noo cluster fit` report per node (`None` = not read); the
+/// gateway writes the warning with the cause and the fix, this row collects
+/// them. A warning, never a failure: the model still answers, slower.
+pub(crate) fn model_memory_check(reports: &[(String, Option<Value>)]) -> Check {
+    const NAME: &str = "model memory";
+    let mut over = Vec::new();
+    let mut unread = Vec::new();
+    for (node, r) in reports {
+        match r {
+            None => unread.push(node.as_str()),
+            Some(r) => over.extend(
+                r["warnings"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|w| w.as_str())
+                    .filter(|w| w.contains(" measured ") && w.contains("resident"))
+                    .map(|w| format!("{node}: {w}")),
+            ),
+        }
+    }
+    if !over.is_empty() {
+        let first = over[0].split(':').next().unwrap_or("<node>").to_string();
+        return warn(NAME, over.join("; "), Some(format!("noo cluster fit {first}")));
+    }
+    if reports.is_empty() {
+        return ok(NAME, "no nodes");
+    }
+    if !unread.is_empty() {
+        return warn(NAME, format!("fit not read for {}", unread.join(", ")), Some(format!("noo cluster fit {}", unread[0])));
+    }
+    ok(NAME, format!("every loaded model within its fit estimate and pool on {} node(s)", reports.len()))
+}
+
+/// 0.6.24: unread agent mail whose mailbox retired before it was read. It
+/// is kept for the account owner, not lost; this row makes sure someone
+/// looks. A warning: nothing is broken, a message is waiting.
+/// The host of an agent URL (`https://host:port/...`), IPv6 brackets removed.
+pub(crate) fn agent_url_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("")
+    } else {
+        authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+    };
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+/// The `agent metrics` row (i669): how many registered node agents
+/// Prometheus scrapes (`up{job="noo_node_agent"}`), naming each one it does
+/// not and why. A node the gateway leaves out of the scrape list (its leaf
+/// has no SAN for its address) has no series and counts as NOT scraped, so
+/// it can never read as healthy.
+///
+/// `nodes`: (id, agent_url host). `up`: the gateway's `/api/metrics/query`
+/// answer. `covers(id, host)`: whether the node's public leaf has a SAN for
+/// the host; `None` when it cannot be read.
+pub(crate) fn agent_metrics_check(nodes: &[(String, String)], up: Option<&Value>, covers: &dyn Fn(&str, &str) -> Option<bool>) -> Check {
+    const NAME: &str = "agent metrics";
+    let Some(up) = up else {
+        return warn(NAME, "Prometheus was not asked or did not answer (`up{job=\"noo_node_agent\"}`)", None);
+    };
+    if nodes.is_empty() {
+        return ok(NAME, "no registered node agents");
+    }
+    let mut series = std::collections::BTreeMap::new();
+    for r in up["result"].as_array().into_iter().flatten() {
+        if let (Some(node), Some(v)) = (r["metric"]["node"].as_str(), r["value"].get(1).and_then(Value::as_str)) {
+            series.insert(node.to_string(), v == "1");
+        }
+    }
+    let mut unscraped = Vec::new();
+    let mut remedy = None;
+    for (id, host) in nodes {
+        match series.get(id) {
+            Some(true) => continue,
+            Some(false) => unscraped.push(format!("{id} (the scrape of {host}:8081 is failing: Prometheus targets page)")),
+            None => match covers(id, host) {
+                Some(false) => {
+                    unscraped.push(format!("{id} (its leaf has no SAN for {host}, so the gateway leaves it out)"));
+                    remedy.get_or_insert(format!("noo security pki issue-node {id} {host}"));
+                }
+                Some(true) => unscraped.push(format!("{id} (not in the scrape list yet: the gateway refreshes it every minute; see its log for scrape_target_skipped)")),
+                None => unscraped.push(format!("{id} (no readable public leaf for it on this controller)")),
+            },
+        }
+    }
+    let total = nodes.len();
+    if !unscraped.is_empty() {
+        return warn(NAME, format!("{}/{total} node agents scraped; not: {}", total - unscraped.len(), unscraped.join("; ")), remedy);
+    }
+    ok(NAME, format!("{total}/{total} node agents scraped"))
+}
+
+pub(crate) fn agent_mail_check(body: Option<&Value>) -> Check {
+    const NAME: &str = "agent mail";
+    let Some(body) = body else {
+        return warn(NAME, "the mailbox directory was not read", None);
+    };
+    let mut parts = Vec::new();
+    let mut total = 0i64;
+    for a in body["accounts"].as_array().into_iter().flatten() {
+        let rows: Vec<(String, i64)> = a["orphaned"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|o| Some((o["name"].as_str()?.to_string(), o["unread"].as_i64()?)))
+            .collect();
+        let n: i64 = rows.iter().map(|(_, c)| c).sum();
+        if n > 0 {
+            total += n;
+            let names: Vec<String> = rows.iter().map(|(name, c)| format!("{name} {c}")).collect();
+            parts.push(format!("{} for {} ({})", n, a["account"].as_str().unwrap_or("?"), names.join(", ")));
+        }
+    }
+    if total == 0 {
+        return ok(NAME, "no unread mail left behind by a retired mailbox");
+    }
+    warn(
+        NAME,
+        format!("{total} unread message(s) orphaned by retired mailboxes: {}", parts.join("; ")),
+        Some("read them with noo_agent_inbox orphaned=true through an MCP door (the account's own view)".into()),
+    )
+}
+
 pub(crate) fn embedding_spaces_check(body: Option<&Value>) -> Check {
     const NAME: &str = "embedding spaces";
     let Some(body) = body else {
@@ -2360,6 +2707,109 @@ pub(crate) fn storage_dirs_row(root: &std::path::Path) -> Check {
             (n, p, seen)
         }).collect());
     storage_dirs_check(dirs.as_deref())
+}
+
+/// What `docker volume inspect` says about this install's noo-data volume.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum NooDataSeen {
+    Absent,
+    Unreadable(String),
+    /// `device` is Options.device ("" when the volume has no bind at all).
+    /// `labelled`: it carries this project's compose label, i.e. compose or
+    /// this release's pre-create made it. The legacy volume the old prep
+    /// made has the exact name and NO label.
+    Present { device: String, mountpoint: String, size: Option<String>, labelled: bool },
+}
+
+/// The `noo-data bound` row (i677). Compose binds noo-data to
+/// `${NOO_STATE_ROOT:-${NOO_DATA_ROOT}}/noo-data`. Until 0.6.24 the launcher's
+/// gateway-dirs prep mounted the volume before compose created it, which made
+/// a PLAIN local volume: the gateway's /data then lived in docker's own volume
+/// store, on the system disk, not under the data root the user chose. This
+/// row says where the data really is and how big it is.
+///
+/// Which verdict depends on WHO made the volume, read from its labels:
+/// - labelled (compose, or this release's pre-create) and not bound to the
+///   data root: our bug on this install, FAIL;
+/// - unlabelled (the legacy volume an older release's prep made): WARN.
+///   The data is intact where it is, and the move into the data root ships
+///   in a later release; a red verify with no shipped remedy would be a dead
+///   end for everyone who upgrades. It becomes a FAIL in the release that
+///   ships the move.
+pub(crate) fn noo_data_bound_check(seen: &NooDataSeen, want: Option<&str>) -> Check {
+    const NAME: &str = "noo-data bound";
+    let Some(want) = want else {
+        return warn(NAME, "NOO_DATA_ROOT is not set in .env; where noo-data should live was not checked",
+            Some(STORAGE_DIRS_REMEDY.to_string()));
+    };
+    match seen {
+        NooDataSeen::Absent => warn(NAME, "no noo-data volume yet (the stack has not been started)", None),
+        NooDataSeen::Unreadable(e) => warn(NAME, format!("docker volume inspect failed ({e}); not checked"), None),
+        NooDataSeen::Present { device, .. } if device == want => ok(NAME, format!("bound to {want}")),
+        NooDataSeen::Present { device, mountpoint, size, labelled } => {
+            let size = size.as_deref().map(|s| format!(", {s}")).unwrap_or_default();
+            let what = if device.is_empty() {
+                "is NOT bound to the data root".to_string()
+            } else {
+                format!("is bound to {device}, not the data root")
+            };
+            if *labelled {
+                fail(
+                    NAME,
+                    format!("noo-data {what}: the gateway's data is at {mountpoint}{size}, not {want}"),
+                    format!("this install created it that way, which is a bug: report it; moving it into {want} needs the gateway stopped and is never run automatically"),
+                )
+            } else {
+                warn(
+                    NAME,
+                    format!("noo-data {what} (made by an older release): the gateway's data is at {mountpoint}{size}, not {want}. \
+                             Your data is intact there; moving it into {want} ships in a later release and is never run automatically"),
+                    None,
+                )
+            }
+        }
+    }
+}
+
+/// [`noo_data_bound_check`] for the install at `root`: the bind it should
+/// have, from its `.env`, against docker's view of `<project>_noo-data`.
+pub(crate) fn noo_data_bound_row(root: &std::path::Path) -> Check {
+    let env = root.join(".env");
+    let state = crate::onboard::env::read_env_key(&env, "NOO_STATE_ROOT");
+    let data = crate::onboard::env::read_env_key(&env, "NOO_DATA_ROOT");
+    let base = if state.is_empty() { data } else { state };
+    let want = (!base.is_empty()).then(|| format!("{}/noo-data", base.trim_end_matches('/')));
+    let vol = format!("{}_noo-data", crate::envfile::compose_project());
+    let out = std::process::Command::new("docker")
+        .args(["volume", "inspect", "-f", "{{index .Options \"device\"}}\t{{.Mountpoint}}\t{{index .Labels \"com.docker.compose.project\"}}", &vol])
+        .output();
+    let seen = match out {
+        Err(e) => NooDataSeen::Unreadable(e.to_string()),
+        Ok(o) if !o.status.success() => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            if err.contains("no such volume") { NooDataSeen::Absent } else { NooDataSeen::Unreadable(err.trim().to_string()) }
+        }
+        Ok(o) => {
+            let line = String::from_utf8_lossy(&o.stdout).trim_end_matches(['\n', '\r']).to_string();
+            let mut f = line.split('\t');
+            let none = |v: &str| if v == "<no value>" { String::new() } else { v.to_string() };
+            let device = none(f.next().unwrap_or(""));
+            let mountpoint = f.next().unwrap_or("").to_string();
+            let labelled = !none(f.next().unwrap_or("")).is_empty();
+            // The size only when it is in the wrong place: it is what the
+            // operator needs to plan the move.
+            let size = if want.as_deref() != Some(device.as_str()) {
+                std::process::Command::new("docker")
+                    .args(["run", "--rm", "-v", &format!("{vol}:/d:ro"), "alpine", "du", "-sh", "/d"])
+                    .output().ok().filter(|o| o.status.success())
+                    .and_then(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().next().map(str::to_string))
+            } else {
+                None
+            };
+            NooDataSeen::Present { device, mountpoint, size, labelled }
+        }
+    };
+    noo_data_bound_check(&seen, want.as_deref())
 }
 
 /// One fleet node's needs from the controller's release-asset cache.
@@ -3344,6 +3794,15 @@ pub(crate) fn sandbox_listener_check(compose: Option<&str>, probe: Option<&Sandb
 /// server started failed and `/health` answered 500 (0.6.11, pop-os). A
 /// `/health` that answers 5xx is a FAIL, not "no body": the sandbox is up
 /// and refusing.
+/// The sandbox row with the installed AppArmor profile's form appended,
+/// when this host has one.
+pub(crate) fn with_profile_form(mut c: Check, form: Option<&str>) -> Check {
+    if let Some(f) = form {
+        c.detail = format!("{}; {f}", c.detail);
+    }
+    c
+}
+
 pub(crate) fn sandbox_executor_check(probe: Option<&SandboxProbe>) -> Check {
     const ROW: &str = "sandbox executor";
     let Some(p) = probe else {
@@ -4710,6 +5169,42 @@ pub(crate) fn with_node_anchors(mut c: Check, reports: &[(String, Option<i64>, S
         }
     }
     c
+}
+
+/// What the Linux applier writes on its `applied:` line when it refuses the
+/// harness unit for its systemd (scripts/noo-apply.sh,
+/// HARNESS_SYSTEMD_REFUSED_TAG), followed by the version it read.
+pub(crate) const HARNESS_SYSTEMD_REFUSED_TAG: &str = "harness-unit=REFUSED-systemd";
+
+/// The systemd that `LoadCredential=` needs (the harness unit, finding 116).
+pub(crate) const HARNESS_SYSTEMD_FLOOR: u32 = 247;
+
+/// The `harness systemd` row: every node whose last apply report says its
+/// applier refused the harness unit because its systemd is older than
+/// [`HARNESS_SYSTEMD_FLOOR`]. Such a node keeps its previous harness unit, so
+/// it WARNs, naming the node and its version. No row when no node reports
+/// one: the refusal is otherwise only in that node's journal.
+pub(crate) fn harness_systemd_check(reports: &[(String, Option<i64>, String)]) -> Option<Check> {
+    let hits: Vec<String> = reports
+        .iter()
+        .filter_map(|(node, _, msg)| {
+            let at = msg.find(HARNESS_SYSTEMD_REFUSED_TAG)? + HARNESS_SYSTEMD_REFUSED_TAG.len();
+            let v: String = msg[at..].chars().take_while(char::is_ascii_digit).collect();
+            Some(if v.is_empty() { node.clone() } else { format!("{node} (systemd {v})") })
+        })
+        .collect();
+    let first = reports.iter().find(|(_, _, m)| m.contains(HARNESS_SYSTEMD_REFUSED_TAG))?.0.clone();
+    Some(warn(
+        "harness systemd",
+        format!(
+            "the applier REFUSED the harness unit on {}: LoadCredential= needs systemd {HARNESS_SYSTEMD_FLOOR} or newer; \
+             that node keeps its previous harness unit and its harness reads /etc/noo/pki",
+            hits.join(", ")
+        ),
+        Some(format!(
+            "upgrade systemd on {first} to {HARNESS_SYSTEMD_FLOOR}+ (Ubuntu 22.04+, Debian 11+), then: noo cluster provision {first} --wait"
+        )),
+    ))
 }
 
 /// A Mac whose last apply report says root REFUSED to install its CLI or
@@ -6513,20 +7008,23 @@ fn render(title: &str, checks: &[Check], verbose: bool) -> bool {
     failed.is_empty()
 }
 
-/// `noo cluster verify [<node>...] [--controller] [--wait]`
+/// `noo cluster verify [<node>...] [--controller] [--wait] [--timings]`
 pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut nodes: Vec<String> = Vec::new();
     let mut controller = false;
     let mut wait = false;
+    let mut timings = false;
     for a in args {
         match a.as_str() {
             "--controller" => controller = true,
             "--all" => {}
             "--wait" => wait = true,
+            "--timings" => timings = true,
             s if s.starts_with('-') => return Err(Unhandled),
             s => nodes.push(s.to_string()),
         }
     }
+    let asked_for_controller = controller;
     let want_nodes = !controller || !nodes.is_empty();
     if !controller && nodes.is_empty() {
         controller = true; // no arguments: everything
@@ -6536,6 +7034,11 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut any_starting = false;
     let mut json_out = serde_json::Map::new();
     let mut tally = Tally::default();
+    let started = Instant::now();
+    let mut laps: Vec<(String, Duration)> = Vec::new();
+    // The fleet as the gateway listed it, when the node half read it: which
+    // machine is the controller is decided from it.
+    let mut fleet_seen: Option<Value> = None;
 
     if want_nodes || nodes.is_empty() {
         // Best-effort read: this verb is also run from `onboard`'s last step
@@ -6576,16 +7079,24 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 crate::output::fail(g.json, ExitCode::Generic, "unknown_node", &format!("no node named {w:?}"), Some("noo cluster status"));
             }
         }
-        let tag = controller_stack_tag();
+        fleet_seen = Some(body.clone());
+        let here = vantage_here(Some(&body));
+        let tag = if here == Vantage::Controller { controller_stack_tag() } else { stack_tag_from_gateway(&body) };
         let now = now_unix();
         if !g.json {
             println!("{}", ui::header("cluster verify", Some(&format!("{} node(s) · controller {tag}", selected.len()))));
             tally.context = format!(" — {} node(s) on {tag}", selected.len());
         }
         let mut node_json = Vec::new();
-        for n in selected {
+        // Each node's gateway reads (desired config, door pins, the bus and
+        // tunnel probes) are independent of every other node's: run them
+        // side by side, then judge and print in the listed order.
+        let reads_from = Instant::now();
+        let enriched = par_map(&selected, |n| with_harness_wanted(g, n));
+        laps.push((format!("node reads ({} node(s), side by side)", selected.len()), reads_from.elapsed()));
+        for (n, wanted) in selected.iter().zip(&enriched) {
             let id = n["id"].as_str().unwrap_or("?");
-            let checks = node_checks(&with_harness_wanted(g, n), &tag, env!("CARGO_PKG_VERSION"), now, signing_adopted_for(id));
+            let checks = node_checks(wanted, &tag, env!("CARGO_PKG_VERSION"), now, signing_adopted_for(id));
             let node_ok = checks.iter().all(|c| c.verdict != Verdict::Fail && c.verdict != Verdict::Starting);
             any_starting |= checks.iter().any(|c| c.verdict == Verdict::Starting);
             all_ok &= node_ok;
@@ -6606,8 +7117,13 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // with no seat says so (the 0.6.6-rc.1 rehearsal read silence as
         // "seats not checked").
         if nodes.is_empty() {
+            let seats_from = Instant::now();
             let listed = crate::commands::kiosk_seat::list_seats(g);
             let seats = listed.clone().unwrap_or_default();
+            // A seat's display is compared with the console the controller's
+            // gateway embeds (its content id), not the stack tag; the tag
+            // only when the gateway predates content ids.
+            let console = if seats.is_empty() { tag.clone() } else { crate::commands::kiosk_seat::controller_console_or(g, || tag.clone()) };
             let mut seat_json = Vec::new();
             if !g.json {
                 if let Some((heading, empty_line)) = seats_heading(listed.as_ref().map(Vec::len)) {
@@ -6619,7 +7135,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             }
             for s in &seats {
                 let name = s["seat_name"].as_str().unwrap_or("?");
-                let checks = crate::commands::kiosk_seat::seat_checks(s, env!("CARGO_PKG_VERSION"), &tag, now);
+                let checks = crate::commands::kiosk_seat::seat_checks(s, env!("CARGO_PKG_VERSION"), &console, now);
                 let seat_ok = checks.iter().all(|c| c.verdict != Verdict::Fail && c.verdict != Verdict::Starting);
                 all_ok &= seat_ok;
                 if g.json {
@@ -6631,38 +7147,81 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 }
             }
             json_out.insert("seats".into(), Value::Array(seat_json));
+            laps.push(("seats".into(), seats_from.elapsed()));
         }
     }
 
+    // The controller rows judge THIS machine's files, containers and backups.
+    // On any other machine they are false rows with remedies that would edit
+    // the wrong box: skipped (bare verify) or refused (`--controller`).
+    if controller {
+        let body = fleet_seen.clone().or_else(|| get_json_opt(g, "/api/cluster/nodes", true, 10));
+        if let Some(line) = not_the_controller_line(&vantage_here(body.as_ref())) {
+            if asked_for_controller {
+                crate::output::fail(g.json, ExitCode::Generic, "not_the_controller", &line,
+                    Some("noo cluster verify   # this machine's view of the nodes and seats"));
+            }
+            if g.json {
+                json_out.insert("controller_not_run".into(), Value::String(line.clone()));
+            } else {
+                println!("{}", ui::note(&line));
+            }
+            controller = false;
+        }
+    }
     if controller {
         if wait {
             warmup::wait_for_warmup(g);
         }
-        let (_, posture, _) = self_json(g, &["security", "posture", "list"]);
-        let (_, keys, _) = self_json(g, &["security", "service-key", "list"]);
+        let controller_from = Instant::now();
         let addon_on = |name: &str| {
             crate::commands::addons::effective(name)
                 .unwrap_or_else(|| crate::commands::addons::row(name).map(|r| r.default_on).unwrap_or(false))
         };
         let required = required_service_keys(&addon_on);
-        let (sc, secrets, _) = self_json(g, &["doctor", "secrets"]);
-        let (_, exposure, _) = self_json(g, &["doctor", "exposure"]);
-        let (_, strangers, _) = self_json(g, &["doctor", "strangers"]);
-        let (ac, audit, _) = self_json(g, &["security", "secrets", "audit"]);
+        let licensed_on = ["trellion_intel", "evolve"].iter().any(|a| addon_on(a));
+        // The verbs below are separate reads of separate state: run them
+        // side by side (each was a full process plus its own gateway round
+        // trips, one after another: about 5 s on a healthy controller).
+        let mut reads: Vec<&[&str]> = vec![
+            &["security", "posture", "list"],
+            &["security", "service-key", "list"],
+            &["doctor", "secrets"],
+            &["doctor", "exposure"],
+            &["doctor", "strangers"],
+            &["security", "secrets", "audit"],
+            &["security", "tailnet", "policy", "--merge"],
+            &["security", "audit", "verify"],
+        ];
+        if licensed_on {
+            reads.push(&["security", "entitlement", "show"]);
+        }
+        let mut got = par_map(&reads, |w| self_json(g, w)).into_iter();
+        let mut next = || got.next().unwrap_or((127, Value::Null, String::new()));
+        let (_, posture, _) = next();
+        let (_, keys, _) = next();
+        let (sc, secrets, _) = next();
+        let (_, exposure, _) = next();
+        let (_, strangers, _) = next();
+        let (ac, audit, _) = next();
+        let (_, tailnet, _) = next();
+        let (_, audit_verdict, _) = next();
+        let entitlement_read = if licensed_on { Some(next()) } else { None };
         let audit_errors = if audit.is_null() { None } else {
             Some(audit["findings"].as_array().map(|f| f.iter().filter(|x| x["severity"] == "error" || x["severity"] == "ERROR").count() as u64)
                 .unwrap_or(if ac == 0 { 0 } else { 1 }))
         };
-        let (_, tailnet, _) = self_json(g, &["security", "tailnet", "policy", "--merge"]);
         let tailnet_missing = tailnet_merge_missing(&tailnet);
-        let licensed_on = ["trellion_intel", "evolve"].iter().any(|a| addon_on(a));
-        let entitlement = if !licensed_on { None } else {
-            let (ec, ent, _) = self_json(g, &["security", "entitlement", "show"]);
+        let entitlement = entitlement_read.map(|(ec, ent, _)| {
             let env_copy = !crate::onboard::env::read_env_key(
                 &crate::envfile::repo_root().join(".env"), crate::entitlement::STORE_KEY).trim().is_empty();
-            Some(entitlement_verdict(ec, &ent, env_copy))
-        };
-        let mut checks = controller_checks(&posture, &keys, &required, (sc, &secrets), &exposure, &strangers, audit_errors, tailnet_missing, entitlement);
+            entitlement_verdict(ec, &ent, env_copy)
+        });
+        let mut checks = TimedChecks::new(
+            controller_checks(&posture, &keys, &required, (sc, &secrets), &exposure, &strangers, audit_errors, tailnet_missing, entitlement),
+            controller_from,
+            &format!("{} security and doctor reads, side by side", reads.len()),
+        );
         checks.push(system_credentials_check(crate::commands::systems::store_missing_credentials()));
         // Is there a recent backup, and is it anywhere but this machine? 2026-10-24:
         // the 03:30 run never happened and nothing said so; every dump sat on the
@@ -6681,6 +7240,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
         // A release's new data directory, missing here, refuses the stack roll.
         checks.push(storage_dirs_row(&crate::envfile::repo_root()));
+        checks.push(noo_data_bound_row(&crate::envfile::repo_root()));
         // i67: the controller's own node (when this box runs one) rides the rail.
         if let Some(me) = crate::commands::provision::self_node_name()
             .filter(|_| std::path::Path::new("/usr/local/bin/noo-node-agent").is_file())
@@ -6779,6 +7339,27 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(default_chat_check(model_classes.as_ref()));
         let spaces = get_json_opt(g, "/api/cluster/embedding-spaces", true, 15);
         checks.push(embedding_spaces_check(spaces.as_ref()));
+        // Finding 126: a loaded model measured over its estimate or pool.
+        let fit_ids: Vec<&str> = fleet.iter().filter_map(|n| n["id"].as_str()).collect();
+        let fits: Vec<(String, Option<Value>)> = par_map(&fit_ids, |id| {
+            let path = format!("/api/cluster/nodes/{}/fit", super::urlencode(id));
+            (id.to_string(), crate::http::post_json_try(g, &path, &serde_json::json!({}), true, 10).ok())
+        });
+        checks.push(model_memory_check(&fits));
+        // 0.6.24: mail left unread when a conversation's mailbox retired.
+        checks.push(agent_mail_check(get_json_opt(g, "/api/agents/directory?all=true", true, 15).as_ref()));
+        // i669: the node agents Prometheus scrapes, against the registry.
+        let agents: Vec<(String, String)> = fleet
+            .iter()
+            .filter_map(|n| Some((n["id"].as_str()?.to_string(), agent_url_host(n["agent_url"].as_str()?)?)))
+            .collect();
+        let up = get_json_opt(g, "/api/metrics/query?query=up%7Bjob%3D%22noo_node_agent%22%7D", true, 15);
+        let covers = |id: &str, host: &str| -> Option<bool> {
+            let path = crate::pki::pki_dir().join("nodes").join(id).join("node.crt");
+            let names = crate::pki::ClusterCa::cert_names(&path).ok()?;
+            Some(names.ips.iter().chain(names.dns.iter()).any(|n| n.eq_ignore_ascii_case(host)))
+        };
+        checks.push(agent_metrics_check(&agents, up.as_ref(), &covers));
         // The gateway's own Redis connection (authenticated /health: the
         // anonymous body carries no dependency map).
         let health = health_body(g);
@@ -6852,7 +7433,13 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(sandbox_listener_check(compose.as_deref(), sandbox_probe.as_ref()));
         // The sandbox executor (i161): the health body that probe read over
         // the gateway's leaf says which uid model-written code runs as.
-        checks.push(sandbox_executor_check(sandbox_probe.as_ref()));
+        // Which form of the AppArmor profile is installed (bundled, or the
+        // AppArmor 3.x form without its `userns,` rule): stated, not silent.
+        checks.push(with_profile_form(
+            sandbox_executor_check(sandbox_probe.as_ref()),
+            crate::onboard::sandbox_apparmor::installed_form(
+                std::fs::read_to_string(crate::onboard::sandbox_apparmor::INSTALLED).ok().as_deref()),
+        ));
         // The voice doors (mTLS doors phase 2): only when the overlay is
         // composed; then the same static + live three-way proof per door.
         let voice_on = addon_on("voice");
@@ -7003,7 +7590,6 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             }
             .as_deref(),
         ));
-        let (_, audit_verdict, _) = self_json(g, &["security", "audit", "verify"]);
         checks.push(audit_log_check(&audit_verdict));
         // An erase keeps a copy 30 days; a purge that is not running shows as
         // an archive older than the window.
@@ -7061,9 +7647,11 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         };
         checks.push(with_node_root_refusals(with_node_anchors(with_retired_apply_lanes_and_adoption(
             legacy_lanes_check(metrics.as_deref(), &fleet, now), &apply_reports, &unadopted), &apply_reports, expected), &apply_reports));
+        checks.extend(harness_systemd_check(&apply_reports));
         let anonymous = crate::http::get_raw_opt(g, &format!("{LOGS_QUERY_ROUTE}?query=%7Bnode%3D%22verify%22%7D&limit=1"), false, 10)
             .map(|(status, _)| status);
         checks.push(logs_access_check(anonymous));
+        laps.append(&mut checks.laps);
         let c_ok = checks.iter().all(|c| c.verdict != Verdict::Fail && c.verdict != Verdict::Starting);
         any_starting |= checks.iter().any(|c| c.verdict == Verdict::Starting);
         all_ok &= c_ok;
@@ -7080,6 +7668,11 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     }
 
+    if timings && g.json {
+        json_out.insert("timings".into(), timings_json(&laps, started.elapsed()));
+    } else if timings {
+        render_timings(&laps, started.elapsed());
+    }
     if g.json {
         json_out.insert("ok".into(), Value::Bool(all_ok));
         json_out.insert("starting".into(), Value::Bool(any_starting));
@@ -7098,6 +7691,103 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         println!("{}", ui::status_line(Glyph::Err, "an invariant does not hold — the remedy is beside each failing row"));
     }
     Ok(if all_ok { 0 } else { 1 })
+}
+
+/// At most this many independent reads run at once: a fleet of fifty nodes
+/// must not open two hundred connections to its own gateway in one breath.
+const PARALLEL_READS: usize = 8;
+
+/// `f` over `items`, [`PARALLEL_READS`] at a time, the answers in the order
+/// of `items`. A panic in one read is the caller's panic, as it was when the
+/// reads ran one after another.
+fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let f = &f;
+    let mut out = Vec::with_capacity(items.len());
+    for chunk in items.chunks(PARALLEL_READS) {
+        std::thread::scope(|s| {
+            let running: Vec<_> = chunk.iter().map(|t| s.spawn(move || f(t))).collect();
+            for r in running {
+                out.push(r.join().unwrap_or_else(|p| std::panic::resume_unwind(p)));
+            }
+        });
+    }
+    out
+}
+
+/// The controller's rows plus the wall time each took (`--timings`). A row's
+/// time runs from the row before it, so a slow probe is named by the row it
+/// fed; a step that adds no row carries its time into the next row.
+struct TimedChecks {
+    rows: Vec<Check>,
+    laps: Vec<(String, Duration)>,
+    last: Instant,
+}
+
+impl TimedChecks {
+    fn new(first: Vec<Check>, since: Instant, label: &str) -> Self {
+        let last = Instant::now();
+        TimedChecks { rows: first, laps: vec![(label.to_string(), last - since)], last }
+    }
+
+    fn push(&mut self, c: Check) {
+        self.extend([c]);
+    }
+
+    fn extend<I: IntoIterator<Item = Check>>(&mut self, more: I) {
+        let before = self.rows.len();
+        self.rows.extend(more);
+        if self.rows.len() > before {
+            let now = Instant::now();
+            let names: Vec<&str> = self.rows[before..].iter().map(|c| c.name).collect();
+            self.laps.push((names.join(", "), now - self.last));
+            self.last = now;
+        }
+    }
+}
+
+impl std::ops::Deref for TimedChecks {
+    type Target = Vec<Check>;
+    fn deref(&self) -> &Vec<Check> {
+        &self.rows
+    }
+}
+
+impl std::ops::DerefMut for TimedChecks {
+    fn deref_mut(&mut self) -> &mut Vec<Check> {
+        &mut self.rows
+    }
+}
+
+/// The slowest steps first, then the whole run. Steps under
+/// [`TIMING_FLOOR_MS`] are counted, not listed.
+const TIMING_FLOOR_MS: u128 = 100;
+const TIMINGS_LISTED: usize = 15;
+
+fn slowest(laps: &[(String, Duration)]) -> (Vec<(String, u128)>, usize) {
+    let mut v: Vec<(String, u128)> = laps.iter().map(|(n, d)| (n.clone(), d.as_millis())).collect();
+    v.sort_by_key(|x| std::cmp::Reverse(x.1));
+    let shown: Vec<(String, u128)> = v.iter().filter(|(_, ms)| *ms >= TIMING_FLOOR_MS).take(TIMINGS_LISTED).cloned().collect();
+    let rest = v.len() - shown.len();
+    (shown, rest)
+}
+
+fn timings_json(laps: &[(String, Duration)], total: Duration) -> Value {
+    serde_json::json!({
+        "total_ms": total.as_millis() as u64,
+        "steps": laps.iter().map(|(n, d)| serde_json::json!({ "step": n, "ms": d.as_millis() as u64 })).collect::<Vec<_>>(),
+    })
+}
+
+fn render_timings(laps: &[(String, Duration)], total: Duration) {
+    println!("{}", ui::section("timings"));
+    let (shown, rest) = slowest(laps);
+    for (name, ms) in &shown {
+        println!("  {:>7.2}s  {name}", *ms as f64 / 1000.0);
+    }
+    if rest > 0 {
+        println!("{}", ui::note(&format!("{rest} more step(s) under {TIMING_FLOOR_MS} ms each")));
+    }
+    println!("  {:>7.2}s  total", total.as_secs_f64());
 }
 
 fn checks_json(checks: &[Check]) -> Value {
@@ -7421,7 +8111,9 @@ mod tests {
                 "telemetry": { "tailscale_logs": "off", "tailscale_logs_configured": true, "os_reporters": [] } } },
             "inbound": "ok",
             "harness_policy": "auto",
-            "host_services": { "harness": { "state": "running" } },
+            "host_services": { "harness": { "state": "running", "egress": {
+                "state": "enforced", "reason": "", "ip_deny": "0.0.0.0/0 ::/0", "ip_allow": "127.0.0.1/32 ::1/128 10.0.0.0/8",
+                "resolver": "unit", "pid_match": true, "lookup": "failed", "connect": "timeout", "stale_hosts": [] } } },
             "self_node": false,
             "lanes": [{ "backend": "ollama", "model": "gemma4:12b", "role": "chat", "state": "serving", "reason": "" }],
         })
@@ -8152,7 +8844,7 @@ mod tests {
         let c = node_checks(&healthy(now), "v0.2.70", "0.5.57", now, Some(true));
         let failed: Vec<_> = c.iter().filter(|c| c.verdict == Verdict::Fail).map(|c| c.name).collect();
         assert!(failed.is_empty(), "{failed:?}");
-        assert_eq!(c.len(), 23, "seventeen node invariants (the log shipper, peer identity, control over bus, streaming over tunnel, backend doors, vendor telemetry, backend images, data root and lanes among them) plus six host-fact rows (boot partition and host telemetry among them), each judged");
+        assert_eq!(c.len(), 24, "eighteen node invariants (the log shipper, peer identity, control over bus, streaming over tunnel, backend doors, vendor telemetry, backend images, data root, lanes and harness egress among them) plus six host-fact rows (boot partition and host telemetry among them), each judged");
         let lanes = c.iter().find(|c| c.name == "lanes").expect("the lanes row");
         assert_eq!((lanes.verdict, lanes.detail.as_str()), (Verdict::Ok, "1 chat lane(s): 1 serving, 0 on demand"));
     }
@@ -8592,6 +9284,54 @@ mod tests {
         assert_eq!(verdict(&c, "harness"), Verdict::Ok);
         assert!(c.iter().find(|c| c.name == "harness").unwrap().detail.contains("in process"));
         assert_eq!(verdict(&c, "version"), Verdict::Ok);
+    }
+
+    fn with_egress(now: i64, egress: serde_json::Value) -> serde_json::Value {
+        let mut n = healthy(now);
+        n["id"] = "host6".into();
+        n["host_services"]["harness"]["state"] = "running".into();
+        n["host_services"]["harness"]["egress"] = egress;
+        n
+    }
+
+    /// Enforcement step 1: the row passes only on the agent's "enforced" with
+    /// no stale controller name; unenforced and stale FAIL, unknown and an
+    /// agent too old to say WARN, and the controller's own node has no row.
+    #[test]
+    fn the_harness_egress_row_passes_only_on_a_proven_hold() {
+        let now = 1_800_000_000;
+        let held = serde_json::json!({"state": "enforced", "reason": "", "ip_deny": "any", "ip_allow": "localhost 10.0.0.0/8",
+            "resolver": "unit", "pid_match": true, "lookup": "failed", "connect": "denied", "stale_hosts": []});
+        let c = node_checks(&with_egress(now, held.clone()), "v0.2.70", "0.5.57", now, Some(true));
+        assert_eq!(verdict(&c, "harness egress"), Verdict::Ok);
+
+        let mut stale = held.clone();
+        stale["stale_hosts"] = serde_json::json!(["pop-os.tail1234.ts.net"]);
+        let c = node_checks(&with_egress(now, stale), "v0.2.70", "0.5.57", now, Some(true));
+        assert_eq!(verdict(&c, "harness egress"), Verdict::Fail);
+        let row = c.iter().find(|c| c.name == "harness egress").unwrap();
+        assert!(row.detail.contains("pop-os.tail1234.ts.net") && row.remedy.as_deref().unwrap().contains("host6"));
+
+        let mut open = held.clone();
+        open["state"] = "unenforced".into();
+        open["reason"] = "the unit has no IPAddressDeny".into();
+        let c = node_checks(&with_egress(now, open), "v0.2.70", "0.5.57", now, Some(true));
+        assert_eq!(verdict(&c, "harness egress"), Verdict::Fail);
+        let row = c.iter().find(|c| c.name == "harness egress").unwrap();
+        assert!(row.detail.contains("codex") && row.detail.contains("chatgpt.com") && row.detail.contains("no IPAddressDeny"));
+
+        let c = node_checks(&with_egress(now, serde_json::json!({"state": "unknown", "reason": "no self-test file"})), "v0.2.70", "0.5.57", now, Some(true));
+        assert_eq!(verdict(&c, "harness egress"), Verdict::Warn);
+
+        let mut old = healthy(now);
+        old["host_services"]["harness"]["state"] = "running".into();
+        old["host_services"]["harness"]["egress"] = serde_json::Value::Null; // an agent older than the hold
+        let c = node_checks(&old, "v0.2.70", "0.5.57", now, Some(true));
+        assert_eq!(verdict(&c, "harness egress"), Verdict::Warn, "an agent too old to report is not a pass");
+
+        let mut ctl = with_egress(now, serde_json::json!({"state": "unknown"}));
+        ctl["self_node"] = true.into();
+        assert!(node_checks(&ctl, "v0.2.70", "0.5.57", now, Some(true)).iter().all(|c| c.name != "harness egress"));
     }
 
     /// An ordinary node whose harness the gateway WANTS but which is absent
@@ -10164,6 +10904,62 @@ mod tests {
         assert!(own.contains("out.extend(gpu_target_cpu_build_check(n));"), "the row is in the run");
     }
 
+    const VLLM_PIN: &str = "sha256:8a3e44b7e3a1aef61a0852c444a01df319b506bf87083fef93c21367e6bffa2b";
+
+    fn door_node(state: &str, staged_by: Option<&str>) -> Value {
+        let mut f = serde_json::json!({"backend": "vllm", "ref": "ghcr.io/noomesh/stunnel:v0.6.13", "arch": "amd64", "pin": VLLM_PIN, "state": state});
+        if let Some(b) = staged_by {
+            f["staged_by"] = b.into();
+        }
+        serde_json::json!({"id": "awolf", "door_pins": [f]})
+    }
+
+    /// A pinned door staged by exactly its pin passes, naming the door.
+    #[test]
+    fn the_door_pin_row_passes_a_door_staged_by_its_pin() {
+        let c = door_pin_check(&door_node("staged", Some(VLLM_PIN))).expect("a row");
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.contains("vllm's door ghcr.io/noomesh/stunnel:v0.6.13 (amd64)"), "{}", c.detail);
+    }
+
+    /// Staged by another digest, by name only, or not at all: WARN, naming
+    /// what was found and the restage that fixes it. Never a pass.
+    #[test]
+    fn the_door_pin_row_warns_on_a_door_not_staged_by_its_pin() {
+        let other = "sha256:68ac017b00000000000000000000000000000000000000000000000000000000";
+        for (n, want) in [
+            (door_node("staged", Some(other)), other),
+            (door_node("staged", Some("")), "staged by name"),
+            (door_node("absent", None), "not staged on the rail"),
+        ] {
+            let c = door_pin_check(&n).expect("a row");
+            assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+            assert!(c.detail.contains(want) && c.detail.contains(VLLM_PIN), "{}", c.detail);
+            assert!(c.remedy.as_deref().unwrap_or("").starts_with("noo upgrade --stack"), "{:?}", c.remedy);
+        }
+    }
+
+    /// A gateway that did not answer is "not checked", never a pass; a node
+    /// with no pinned door placed has no row.
+    #[test]
+    fn the_door_pin_row_never_passes_what_it_could_not_ask() {
+        let c = door_pin_check(&door_node("unknown", None)).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("not checked"), "{}", c.detail);
+        assert!(door_pin_check(&serde_json::json!({"id": "x"})).is_none());
+        assert!(door_pin_check(&serde_json::json!({"id": "x", "door_pins": []})).is_none());
+    }
+
+    /// The shipped door pins, keyed by backend, under the node's prefix.
+    #[test]
+    fn door_pins_by_backend_reads_the_shipped_file() {
+        let pins = crate::commands::image_stage::door_pins_by_backend("reg.example/ns/");
+        assert!(
+            pins.iter().any(|(b, r, d)| b == "vllm" && r == "reg.example/ns/stunnel:v0.6.13" && d == VLLM_PIN),
+            "{pins:?}"
+        );
+    }
+
     #[test]
     fn images_staged_row_names_an_unstaged_placement() {
         let n = serde_json::json!({"id": "host8-ma", "unstaged_images": ["reg/acme/llamacpp:v0.2.103"]});
@@ -10914,6 +11710,21 @@ mod tests {
         assert_eq!(c.verdict, Verdict::Warn);
         assert!(c.detail.contains("host6 (noo-cli, noo-hostd)"), "{}", c.detail);
         assert!(c.remedy.is_some());
+    }
+
+    /// i637 follow-up (finding 116): a node whose applier refused the harness
+    /// unit for an old systemd is a WARN row naming it and its version; no
+    /// refusal, no row.
+    #[test]
+    fn a_node_that_refused_the_harness_unit_for_its_systemd_warns() {
+        let clean = "applied: agent-env harness-env verified-by: signing-key".to_string();
+        assert!(harness_systemd_check(&[("host6".into(), Some(0), clean)]).is_none());
+        let refused = format!("applied: {HARNESS_SYSTEMD_REFUSED_TAG}245 agent-env harness-env verified-by: signing-key");
+        let c = harness_systemd_check(&[("host6".into(), Some(0), refused), ("host7".into(), Some(0), String::new())])
+            .expect("a refusal is a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("host6 (systemd 245)") && !c.detail.contains("host7"), "{}", c.detail);
+        assert!(c.remedy.as_deref().is_some_and(|r| r.contains("noo cluster provision host6")), "{:?}", c.remedy);
     }
 
     #[test]
@@ -12487,5 +13298,360 @@ mod missing_key_remedy_tests {
         assert_eq!(k.remedy.as_deref(), Some("noo addons enable evolve"));
         let k = row(vec![("worker".into(), "svc:worker".into())]);
         assert_eq!(k.remedy.as_deref(), Some("noo security service-key provision worker"));
+    }
+}
+
+#[cfg(test)]
+mod model_memory_tests {
+    use super::{model_memory_check, Verdict};
+    use serde_json::json;
+
+    /// The gateway's warning for the outside tester's qwen3:4b (finding 126).
+    const TESTER: &str = "qwen3:4b measured 7.1 GB resident, estimated 3.6 GB at num_ctx 4096: over the 6.0 GB gpu budget, so part of it runs on CPU. Its context is unpinned (the daemon picks it from the VRAM it sees); pin it: `noo cluster place <node> ollama qwen3:4b --env OLLAMA_CONTEXT_LENGTH=4096`";
+
+    #[test]
+    fn a_measured_overrun_is_a_warning_naming_the_node_and_the_fix() {
+        let c = model_memory_check(&[
+            ("awolf".into(), Some(json!({"warnings": ["tight: 20.1 GB needed leaves 3.9 GB"]}))),
+            ("pop-os".into(), Some(json!({"verdict": "does_not_fit", "warnings": [TESTER]}))),
+        ]);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.starts_with("pop-os: qwen3:4b measured 7.1 GB") && !c.detail.contains("tight"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster fit pop-os"));
+    }
+
+    #[test]
+    fn quiet_reports_are_ok_and_an_unread_one_says_so() {
+        let fine = model_memory_check(&[("awolf".into(), Some(json!({"warnings": []})))]);
+        assert_eq!(fine.verdict, Verdict::Ok);
+        let unread = model_memory_check(&[("awolf".into(), Some(json!({}))), ("host6".into(), None)]);
+        assert!(unread.verdict == Verdict::Warn && unread.detail.contains("host6"), "{}", unread.detail);
+    }
+}
+
+#[cfg(test)]
+mod agent_metrics_tests {
+    use super::{agent_metrics_check, agent_url_host, Verdict};
+    use serde_json::{json, Value};
+
+    fn up(rows: &[(&str, &str)]) -> Value {
+        json!({"resultType": "vector", "result": rows.iter().map(|(n, v)| json!({"metric": {"job": "noo_node_agent", "node": n}, "value": [1.0, v]})).collect::<Vec<_>>()})
+    }
+
+    fn nodes() -> Vec<(String, String)> {
+        vec![("aserve".into(), "100.98.144.38".into()), ("awolf".into(), "100.89.31.92".into())]
+    }
+
+    #[test]
+    fn every_agent_up_is_ok_with_the_count() {
+        let c = agent_metrics_check(&nodes(), Some(&up(&[("aserve", "1"), ("awolf", "1")])), &|_, _| Some(true));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.starts_with("2/2"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_node_left_out_for_its_san_counts_as_not_scraped_and_names_the_reissue() {
+        let c = agent_metrics_check(&nodes(), Some(&up(&[("awolf", "1")])), &|id, _| Some(id != "aserve"));
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.starts_with("1/2") && c.detail.contains("aserve") && c.detail.contains("no SAN for 100.98.144.38"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo security pki issue-node aserve 100.98.144.38"));
+    }
+
+    #[test]
+    fn a_failing_scrape_and_an_unlisted_node_are_named_differently() {
+        let c = agent_metrics_check(&nodes(), Some(&up(&[("aserve", "0")])), &|_, _| Some(true));
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.starts_with("0/2"), "{}", c.detail);
+        assert!(c.detail.contains("aserve (the scrape of 100.98.144.38:8081 is failing"), "{}", c.detail);
+        assert!(c.detail.contains("awolf (not in the scrape list yet"), "{}", c.detail);
+        assert!(c.remedy.is_none());
+    }
+
+    #[test]
+    fn no_answer_from_prometheus_is_not_a_pass() {
+        assert_eq!(agent_metrics_check(&nodes(), None, &|_, _| Some(true)).verdict, Verdict::Warn);
+    }
+
+    #[test]
+    fn the_agent_host_is_read_like_the_gateway_reads_it() {
+        assert_eq!(agent_url_host("https://100.98.144.38:8081").as_deref(), Some("100.98.144.38"));
+        assert_eq!(agent_url_host("https://[fd7a::1]:8081/x").as_deref(), Some("fd7a::1"));
+        assert_eq!(agent_url_host("https://noo-controller:8081").as_deref(), Some("noo-controller"));
+        assert_eq!(agent_url_host("https://:8081"), None);
+    }
+}
+
+#[cfg(test)]
+mod agent_mail_tests {
+    use super::{agent_mail_check, Verdict};
+    use serde_json::json;
+
+    #[test]
+    fn orphaned_mail_is_a_warning_naming_the_account_and_mailbox() {
+        let body = json!({"accounts": [
+            {"account": "rbwolf", "orphaned": [{"name": "rbwolf/claude-weekly", "unread": 3}]},
+            {"account": "alice", "orphaned": []},
+        ]});
+        let c = agent_mail_check(Some(&body));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("3 unread") && c.detail.contains("rbwolf/claude-weekly 3"), "{}", c.detail);
+        assert!(!c.detail.contains("alice"));
+        assert_eq!(agent_mail_check(Some(&json!({"accounts": []}))).verdict, Verdict::Ok);
+        assert_eq!(agent_mail_check(None).verdict, Verdict::Warn);
+    }
+}
+
+#[cfg(test)]
+mod speed_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn par_map_keeps_the_order_and_runs_at_most_eight_at_once() {
+        let in_flight = AtomicUsize::new(0);
+        let most = AtomicUsize::new(0);
+        let items: Vec<usize> = (0..20).collect();
+        let out = par_map(&items, |i| {
+            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            most.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(300));
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            i * 10
+        });
+        assert_eq!(out, items.iter().map(|i| i * 10).collect::<Vec<_>>(), "answers in the order asked");
+        // One after another would never have two in flight.
+        assert_eq!(most.load(Ordering::SeqCst), PARALLEL_READS, "a chunk runs side by side, and no wider");
+    }
+
+    #[test]
+    fn par_map_of_nothing_is_nothing() {
+        let none: Vec<u8> = Vec::new();
+        assert!(par_map(&none, |b| *b).is_empty());
+    }
+
+    #[test]
+    fn a_row_carries_the_time_since_the_row_before_and_an_empty_step_carries_forward() {
+        let since = Instant::now() - Duration::from_millis(400);
+        let mut t = TimedChecks::new(vec![ok("posture", "x")], since, "reads");
+        assert_eq!(t.laps[0].0, "reads");
+        assert!(t.laps[0].1 >= Duration::from_millis(400), "the batch is timed from where it began");
+        std::thread::sleep(Duration::from_millis(120));
+        t.extend(None::<Check>);
+        assert_eq!(t.laps.len(), 1, "a step that adds no row records nothing");
+        std::thread::sleep(Duration::from_millis(30));
+        t.push(ok("loki", "y"));
+        assert_eq!(t.laps[1].0, "loki");
+        assert!(t.laps[1].1 >= Duration::from_millis(150), "the empty step's time lands on the next row: {:?}", t.laps[1].1);
+        t.extend([ok("a", ""), ok("b", "")]);
+        assert_eq!(t.laps[2].0, "a, b", "one step that adds two rows names both");
+        assert_eq!(t.len(), 4, "the rows are the rows");
+        assert_eq!(t.iter().map(|c| c.name).collect::<Vec<_>>(), ["posture", "loki", "a", "b"]);
+    }
+
+    #[test]
+    fn timings_list_the_slowest_first_and_count_the_quick_ones() {
+        let laps = vec![
+            ("fast".to_string(), Duration::from_millis(20)),
+            ("slow".to_string(), Duration::from_millis(2_500)),
+            ("middle".to_string(), Duration::from_millis(400)),
+        ];
+        let (shown, rest) = slowest(&laps);
+        assert_eq!(shown, vec![("slow".to_string(), 2_500), ("middle".to_string(), 400)]);
+        assert_eq!(rest, 1);
+        let j = timings_json(&laps, Duration::from_millis(3_000));
+        assert_eq!(j["total_ms"], 3_000);
+        assert_eq!(j["steps"].as_array().unwrap().len(), 3, "JSON keeps every step, in run order");
+        assert_eq!(j["steps"][0]["step"], "fast");
+    }
+
+    #[test]
+    fn independent_reads_stay_side_by_side() {
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let run = crate::test_src::fn_body(&own, "pub fn cluster_verify(");
+        assert!(run.contains("par_map(&selected, |n| with_harness_wanted(g, n))"), "node reads run side by side");
+        assert!(run.contains("par_map(&reads, |w| self_json(g, w))"), "the security/doctor verbs run side by side");
+        assert!(run.contains("par_map(&fit_ids,"), "the per-node fit reads run side by side");
+        // `addons verify` alone stays where it is: it runs only when a
+        // licensed add-on is on, decided from noomesh.yaml after the batch.
+        assert_eq!(run.matches("= self_json(g,").count(), 1, "no other verb runs on its own, one after another");
+        assert!(run.contains("= self_json(g, &[\"addons\", \"verify\"]);"));
+        assert!(run.contains("\"--timings\" => timings = true"), "the flag is parsed");
+    }
+}
+
+#[cfg(test)]
+mod vantage_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fleet(marked: Option<&str>) -> Value {
+        json!({"nodes": [
+            {"id": "pop-os", "controller_host": marked == Some("pop-os"), "app_version": "stack-v0.6.24+abc"},
+            {"id": "awolf", "controller_host": false, "app_version": "stack-v0.6.24+abc"},
+        ]})
+    }
+
+    #[test]
+    fn the_gateway_mark_decides_first() {
+        let me_awolf = |n: &str| n == "awolf";
+        let me_popos = |n: &str| n == "pop-os";
+        // A node with a dev checkout (.env + noomesh.yaml) is still a node.
+        assert_eq!(decide_vantage(Some(&fleet(Some("pop-os"))), &me_awolf, true, false, Some("awolf")),
+            Vantage::Node { controller: Some("pop-os".into()) });
+        assert_eq!(decide_vantage(Some(&fleet(Some("pop-os"))), &me_popos, true, true, Some("pop-os")), Vantage::Controller);
+    }
+
+    #[test]
+    fn without_the_mark_it_takes_an_install_and_a_running_gateway_never_a_guess() {
+        let nobody = |_: &str| false;
+        // Onboard's last step: the stack just started, the gateway may not answer yet.
+        assert_eq!(decide_vantage(None, &nobody, true, true, None), Vantage::Controller);
+        assert_eq!(decide_vantage(Some(&fleet(None)), &nobody, true, true, Some("pop-os")), Vantage::Controller);
+        // The gateway is down and this box has a checkout but no gateway container: a node.
+        assert_eq!(decide_vantage(None, &nobody, true, false, Some("awolf")), Vantage::Node { controller: None });
+        assert_eq!(decide_vantage(None, &nobody, false, false, Some("awolf")), Vantage::Node { controller: None });
+        assert!(matches!(decide_vantage(None, &nobody, true, false, None), Vantage::Unknown(_)));
+        assert!(matches!(decide_vantage(None, &nobody, false, false, None), Vantage::Unknown(_)));
+    }
+
+    #[test]
+    fn off_the_controller_one_line_names_where_to_run_it() {
+        assert_eq!(not_the_controller_line(&Vantage::Controller), None);
+        assert_eq!(not_the_controller_line(&Vantage::Node { controller: Some("pop-os".into()) }).unwrap(),
+            "controller rows not run: this machine is a node; run `noo cluster verify --controller` on the controller (pop-os)");
+        let u = not_the_controller_line(&Vantage::Unknown("no install".into())).unwrap();
+        assert!(u.contains("could not be told (no install)") && u.contains("noo cluster verify --controller"), "{u}");
+    }
+
+    #[test]
+    fn a_node_compares_with_the_controllers_release_as_the_gateway_states_it() {
+        let mut f = fleet(Some("pop-os"));
+        assert_eq!(stack_tag_from_gateway(&f), "v0.6.24", "the controller node's agent, when the gateway predates stack_tag");
+        f["stack_tag"] = "v0.6.25".into();
+        assert_eq!(stack_tag_from_gateway(&f), "v0.6.25", "the gateway's own word first");
+        assert_eq!(stack_tag_from_gateway(&fleet(None)), "", "nothing stated: not compared");
+        let n = json!({"id": "awolf", "app_version": "stack-v0.6.23+abc"});
+        let v = node_checks(&n, "", "0.6.24", 2_000_000, Some(true)).into_iter().find(|c| c.name == "version").unwrap();
+        assert_eq!(v.verdict, Verdict::Warn, "an unstated release is never a FAIL: {v:?}");
+        assert!(v.detail.contains("not compared"), "{}", v.detail);
+    }
+
+    /// Every row the controller half writes from THIS machine's files and
+    /// containers (the rows an outside run on a node turned red).
+    const CONTROLLER_ONLY_ROWS: [&str; 31] = [
+        "self-agent lane", "model cache", "loki", "tempo", "grafana door", "audit key", "secrets at rest",
+        "shared secrets", "secrets audit", "grafana sso", "gateway pki view", "loki listener", "tempo listener",
+        "sandbox listener", "backend tls", "nats tls", "nats principals", "postgres hba", "postgres role identity",
+        "postgres tls", "sandbox executor", "data directories", "data root filesystem", "monitoring web config",
+        "secrets not in env", "node-agent privilege", "callers", "tailnet policy", "last backup", "off-site backup",
+        "pki at rest",
+    ];
+
+    #[test]
+    fn no_controller_row_and_no_env_edit_on_a_node_fixture() {
+        let healthy = json!({"id": "awolf", "status": "online", "last_heartbeat": "1970-01-24T03:33:10Z",
+            "nats_state": "connected", "nats_role": "node", "app_version": "stack-v0.6.24+abc",
+            "cert_not_after": 2_000_000 + 90 * 86_400, "peer_identity_enforced": true,
+            "hostd": {"alive": true, "age_secs": 3}, "controller_host": false});
+        let broken = json!({"id": "awolf", "status": "offline", "nats_state": "disconnected", "nats_role": "fleet",
+            "app_version": "stack-v0.6.22+abc", "peer_identity_enforced": false,
+            "hostd": {"alive": false, "detail": "stale"}});
+        let seat = json!({"seat_name": "homeserver", "heartbeat": {"cli_version": "0.6.23", "kiosk_serve": "failed",
+            "console_build": "stack-v0.6.22"}, "apply_msg": "display=restarted"});
+        for (label, mut rows) in [
+            ("healthy node", node_checks(&healthy, "v0.6.24", "0.6.24", 2_000_000, None)),
+            ("broken node", node_checks(&broken, "v0.6.24", "0.6.24", 2_000_000, Some(false))),
+            ("seat", crate::commands::kiosk_seat::seat_checks(&seat, "0.6.24", "", 2_000_000)),
+        ] {
+            rows.retain(|c| c.name != "?");
+            for name in CONTROLLER_ONLY_ROWS {
+                assert!(rows.iter().all(|c| c.name != name), "{label}: controller row `{name}` on a node");
+            }
+            for c in &rows {
+                let r = c.remedy.as_deref().unwrap_or("");
+                assert!(!r.contains(".env") && !r.contains("NODE_ID="), "{label}: `{}` remedy edits .env: {r}", c.name);
+            }
+        }
+    }
+
+    #[test]
+    fn the_controller_half_is_gated_before_its_first_row() {
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let run = crate::test_src::fn_body(&own, "pub fn cluster_verify(");
+        let gate = run.find("not_the_controller_line(&vantage_here(body.as_ref()))").expect("the gate");
+        let refuse = run.find("\"not_the_controller\"").expect("--controller off the controller refuses");
+        let first_row = run.find("let mut checks = TimedChecks::new(").expect("the controller half");
+        assert!(gate < refuse && refuse < first_row, "decided and refused before any controller row is built");
+        assert!(run[gate..first_row].contains("controller = false;"), "a bare verify skips the half");
+    }
+}
+
+#[cfg(test)]
+mod noo_data_bound_tests {
+    use super::*;
+
+    fn present(device: &str, labelled: bool) -> NooDataSeen {
+        NooDataSeen::Present { device: device.into(), mountpoint: "/var/lib/docker/volumes/noomesh_noo-data/_data".into(), size: Some("3.1G".into()), labelled }
+    }
+
+    #[test]
+    fn bound_to_the_data_root_is_ok() {
+        for labelled in [true, false] {
+            let c = noo_data_bound_check(&present("/srv/noo/noo-data", labelled), Some("/srv/noo/noo-data"));
+            assert_eq!(c.verdict, Verdict::Ok, "{c:?}");
+        }
+    }
+
+    /// i677: the LEGACY volume an older release's prep made (exact name, no
+    /// label) is a WARN this release: it names where the data is and its size,
+    /// says the data is intact, and that the move ships later.
+    #[test]
+    fn a_legacy_unbound_noo_data_warns_and_says_where_the_data_is() {
+        let c = noo_data_bound_check(&present("", false), Some("/srv/noo/noo-data"));
+        assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
+        assert!(c.detail.contains("is NOT bound to the data root (made by an older release)"), "{}", c.detail);
+        assert!(c.detail.contains("/var/lib/docker/volumes/noomesh_noo-data/_data, 3.1G"), "{}", c.detail);
+        assert!(c.detail.contains("Your data is intact there") && c.detail.contains("ships in a later release"), "{}", c.detail);
+    }
+
+    /// A volume THIS release (or compose) made, labelled, that is not bound
+    /// to the data root is our bug on this install: FAIL.
+    #[test]
+    fn a_labelled_noo_data_that_is_not_bound_fails() {
+        for device in ["", "/old/root/noo-data"] {
+            let c = noo_data_bound_check(&present(device, true), Some("/srv/noo/noo-data"));
+            assert_eq!(c.verdict, Verdict::Fail, "{device:?}: {c:?}");
+            assert!(c.detail.contains("/var/lib/docker/volumes/noomesh_noo-data/_data, 3.1G"), "{}", c.detail);
+        }
+    }
+
+    #[test]
+    fn no_root_no_volume_or_no_answer_is_a_warning_never_a_pass() {
+        assert_eq!(noo_data_bound_check(&present("", true), None).verdict, Verdict::Warn);
+        assert_eq!(noo_data_bound_check(&NooDataSeen::Absent, Some("/r/noo-data")).verdict, Verdict::Warn);
+        assert_eq!(noo_data_bound_check(&NooDataSeen::Unreadable("x".into()), Some("/r/noo-data")).verdict, Verdict::Warn);
+    }
+
+    #[test]
+    fn the_row_runs_in_cluster_verify_after_the_data_directories() {
+        let code = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let dirs = code.find("checks.push(storage_dirs_row(&crate::envfile::repo_root()));").expect("data directories row");
+        let bound = code.find("checks.push(noo_data_bound_row(&crate::envfile::repo_root()));").expect("noo-data bound row");
+        assert!(dirs < bound);
+    }
+}
+
+#[cfg(test)]
+mod profile_form_row_tests {
+    use super::*;
+
+    #[test]
+    fn the_sandbox_row_says_which_profile_form_is_loaded() {
+        let c = with_profile_form(ok("sandbox executor", "code runs as uid 65534"), Some("profile: 3.x form, userns rule omitted"));
+        assert_eq!(c.detail, "code runs as uid 65534; profile: 3.x form, userns rule omitted");
+        assert_eq!(c.verdict, Verdict::Ok, "the form is stated, never a verdict of its own");
+        assert_eq!(with_profile_form(ok("sandbox executor", "x"), None).detail, "x", "no profile here: nothing added");
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        assert!(own.contains("crate::onboard::sandbox_apparmor::installed_form("), "the controller run states it");
     }
 }

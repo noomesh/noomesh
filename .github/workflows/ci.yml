@@ -54,12 +54,18 @@ on:
 # EJECTED #855 (still open, never merged) while the groups behind it merged.
 # HEADGREEN lets a later green group carry the ones ahead, but only when their
 # own runs have not already failed. cancel-in-progress now only replaces a
-# re-run of the SAME group. Every other event gets a group of its own run id:
-# pushes, tags and pull requests are never cancelled by this block (the per-job
-# concurrency below still governs PR image builds).
+# re-run of the SAME group. A pull request gets one group per PR AND head SHA:
+# a PR opened with a label fires `opened` and `labeled` in the same second, and
+# both ran the whole workflow on the same commit (runs 42951612488 and
+# 42951612728, 2026-11-11). Now the later one replaces the earlier, and only
+# for that same commit (adding `full-ci` later supersedes the deferred run,
+# which is what the label is for); a new push to the PR is a new SHA and a new
+# group. Every other event gets a group of its own run id: pushes and tags are
+# never cancelled by this block (the per-job concurrency below still governs
+# PR image builds).
 concurrency:
-  group: ${{ github.event_name == 'merge_group' && format('ci-merge-queue-{0}', github.event.merge_group.head_ref) || format('ci-run-{0}', github.run_id) }}
-  cancel-in-progress: ${{ github.event_name == 'merge_group' }}
+  group: ${{ github.event_name == 'merge_group' && format('ci-merge-queue-{0}', github.event.merge_group.head_ref) || github.event_name == 'pull_request' && format('ci-pr-{0}-{1}', github.event.pull_request.number, github.event.pull_request.head.sha) || format('ci-run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'merge_group' || github.event_name == 'pull_request' }}
 
 # THE ONE SWITCH for trellion being public. 'false' until trellion and
 # trellion-protocols are public: test-core then deselects the tests that import
@@ -138,6 +144,7 @@ jobs:
       ui: ${{ steps.diff.outputs.ui }}
       llamacpp: ${{ steps.diff.outputs.llamacpp }}
       ollama: ${{ steps.diff.outputs.ollama }}
+      voice: ${{ steps.diff.outputs.voice }}
       deferred: ${{ steps.diff.outputs.deferred }}
       defer_tests: ${{ steps.diff.outputs.defer_tests }}
     steps:
@@ -147,11 +154,15 @@ jobs:
     - id: diff
       name: Does this change touch anything but documentation?
       env:
-        # A pull request diffs against its base; a merge group has no PR, so it
-        # diffs the group's own base_sha (dev's tip when the group was built)
-        # against the checked-out group head. A push has neither: BASE is empty
-        # and everything runs (the integration point is never narrowed).
-        BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        # A pull request diffs against its base. A MERGE GROUP diffs against
+        # the queue's base branch (dev's tip), computed in the step below; NEVER
+        # merge_group.base_sha. In a batch that is the PREVIOUS group's head, so
+        # a group's diff held only its own PR, the lanes an earlier group
+        # touched were skipped as success, and under HEADGREEN #1017 landed on
+        # dev with noo-cli red (2026-11-11: pr-978's group skipped noo-cli). A
+        # push has neither: BASE is empty and everything runs.
+        BASE: ${{ github.event.pull_request.base.sha }}
+        MG_BASE_REF: ${{ github.event.merge_group.base_ref }}
         # Read by "Defer the Rust builds to the merge queue" below.
         EVENT: ${{ github.event_name }}
         PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
@@ -161,6 +172,24 @@ jobs:
         REPO: ${{ github.repository }}
       run: |
         set -eu
+        # >>> merge-group base
+        # A merge group: the base is where this group leaves the queue's base
+        # branch, so the diff holds EVERY PR in the batch up to this one and
+        # each lane any of them touched runs here (the head group then tests
+        # the whole batch, as HEADGREEN assumes). Any failure leaves BASE empty,
+        # which runs everything: fail open, never narrow on a guess.
+        if [ "${EVENT:-}" = merge_group ] && [ -z "${BASE:-}" ]; then
+          mg_ref="${MG_BASE_REF#refs/heads/}"
+          if [ -n "$mg_ref" ] \
+             && git fetch -q --no-tags origin "+refs/heads/$mg_ref:refs/remotes/origin/$mg_ref" \
+             && BASE="$(git merge-base HEAD "refs/remotes/origin/$mg_ref")"; then
+            echo "merge group: diffing against $mg_ref at $BASE (the queue's base), not the previous group"
+          else
+            BASE=""
+            echo "merge group: no base on '$mg_ref' to diff against; running everything (fail open)"
+          fi
+        fi
+        # <<< merge-group base
         # ── llamacpp: its OWN inputs, on every event ─────────────────────
         # The llama-server image has one input in this tree:
         # docker/Dockerfile.llamacpp (tests/test_ci_scope_declarations.py holds it
@@ -174,6 +203,7 @@ jobs:
           lc_range="$BASE...HEAD"
           lc_pattern='^(docker/Dockerfile\.llamacpp$|\.github/workflows/ci\.yml$)'
           ol_pattern='^(docker/Dockerfile\.ollama$|\.github/workflows/ci\.yml$)'
+          vo_pattern='^(docker/Dockerfile\.(whisper|piper)$|docker/(voice_local|whisper_server|piper_server)\.py$|\.github/workflows/ci\.yml$)'
         else
           lc_release="$(git tag --list 'stack-v*' | grep -vE -- '-rc\.' | sort -V | tail -1 || true)"
           if [ -z "$lc_release" ] && git rev-parse -q --verify refs/remotes/origin/main >/dev/null; then
@@ -182,6 +212,7 @@ jobs:
           lc_range="${lc_release:+$lc_release..HEAD}"
           lc_pattern='^docker/Dockerfile\.llamacpp$'
           ol_pattern='^docker/Dockerfile\.ollama$'
+          vo_pattern='^(docker/Dockerfile\.(whisper|piper)$|docker/(voice_local|whisper_server|piper_server)\.py$)'
         fi
         if [ -n "$lc_range" ]; then
           lc_changed="$(git diff --name-only "$lc_range" 2>/dev/null)" || lc_range=""
@@ -205,6 +236,17 @@ jobs:
           ollama=false; echo "ollama: its inputs are unchanged in $lc_range"
         fi
         echo "ollama=$ollama" >> "$GITHUB_OUTPUT"
+        # ── voice: whisper and piper, the same rule (i607c). Their inputs in
+        # this tree are scripts/release-image-inputs.json's (the two
+        # Dockerfiles and the server files they COPY).
+        if [ -z "$lc_range" ]; then
+          voice=true; echo "voice: no base to diff against — building (fail open)"
+        elif printf '%s\n' "$lc_changed" | grep -qE "$vo_pattern"; then
+          voice=true; echo "voice: its inputs changed in $lc_range"
+        else
+          voice=false; echo "voice: its inputs are unchanged in $lc_range"
+        fi
+        echo "voice=$voice" >> "$GITHUB_OUTPUT"
 
         # A push (to dev/main) is the integration point — never narrow it.
         all_true() {
@@ -531,7 +573,15 @@ jobs:
           --deselect=tests/test_workflow_release_line_fetch.py::test_the_guards_exist_where_expected
         )
         if [ "$TRELLION_PUBLIC" != "true" ]; then args+=("${needs_trellion[@]}"); fi
-        pytest tests/ -v --cov=noomesh --cov-report=xml "${args[@]}"
+        # Parallel: test-core set the wall time of every PR and merge-queue
+        # run serially (992 s for 4,168 tests, run 42855148772; build-speed
+        # review 2026-11-11). worksteal balances the very uneven durations
+        # (one 64 s test, 116 over 1 s). --durations reports the slowest 50 so
+        # the next cut is measured, not estimated. No coverage here: it is
+        # produced once a night on dev (coverage-nightly.yml, which runs THIS
+        # step verbatim with PYTEST_ADDOPTS=--cov…), not on every PR and
+        # queue run (operator, 2026-11-11).
+        pytest tests/ -v -n auto --dist worksteal --durations=50 --durations-min=1 "${args[@]}"
 
     # The sandbox jail as it runs in a container (pop-os, 0.6.13): Docker
     # masks paths under every container's /proc, the kernel then refuses a
@@ -559,21 +609,16 @@ jobs:
         grep -E '^PASSED tests/test_sandbox_exec_isolation.py::test_bwrap_live_runs_and_proves_its_isolation_under_dockers_proc_masks' "$log" \
           || { echo "::error::the masked-/proc sandbox test did not report PASSED"; exit 1; }
 
-    # Coverage goes to a BUILD ARTIFACT, not to a third-party uploader: visible
-    # per run, no token, and no network call that can take a green run down.
-    - name: Upload coverage artifact
-      if: always()
-      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
-      with:
-        name: coverage-py
-        path: coverage.xml
-        retention-days: 14
-        if-no-files-found: warn
+    # Coverage is a BUILD ARTIFACT, not a third-party upload (visible per run,
+    # no token, no network call that can take a green run down), and since
+    # 2026-11-11 it is produced ONCE A NIGHT on dev by coverage-nightly.yml,
+    # under the same artifact name (`coverage-py`), not on every PR and queue
+    # run: nothing gates on it, and it cost every run its overhead.
 
   # The same suite, NOT required, on the PRs that defer the required one
   # (i585): early feedback that never blocks the enqueue. Everything but the
   # name and the condition is test-core's own, by YAML alias. Exactly one of
-  # the two runs in any workflow run, so the coverage artifact name is unique.
+  # the two runs in any workflow run.
   test-core-advisory:
     name: test-core (advisory)
     runs-on: ubuntu-latest
@@ -588,11 +633,21 @@ jobs:
   go-node-agent:
     runs-on: ubuntu-latest
     needs: [preflight, scope]
-    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.scope.result == 'success' }}
+    if: ${{ !cancelled() && needs.preflight.result == 'success' }}
     defaults:
       run:
         working-directory: node-agent-go
     steps:
+    # A failed or cancelled `scope` FAILS this required lane instead of
+    # skipping it: a skipped job reports Success to a required check (GitHub
+    # docs), so a broken scope would otherwise pass every lane it gates.
+    - name: Scope must have succeeded
+      if: needs.scope.result != 'success'
+      env:
+        SCOPE_RESULT: ${{ needs.scope.result }}
+      run: |
+        echo "::error::the scope job ended '$SCOPE_RESULT': this lane cannot know what changed, so it fails rather than skip"
+        exit 1
 
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -624,8 +679,18 @@ jobs:
   rust-gateway:
     runs-on: ubuntu-latest
     needs: [preflight, scope]
-    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.scope.result == 'success' }}
+    if: ${{ !cancelled() && needs.preflight.result == 'success' }}
     steps:
+    # A failed or cancelled `scope` FAILS this required lane instead of
+    # skipping it: a skipped job reports Success to a required check (GitHub
+    # docs), so a broken scope would otherwise pass every lane it gates.
+    - name: Scope must have succeeded
+      if: needs.scope.result != 'success'
+      env:
+        SCOPE_RESULT: ${{ needs.scope.result }}
+      run: |
+        echo "::error::the scope job ended '$SCOPE_RESULT': this lane cannot know what changed, so it fails rather than skip"
+        exit 1
 
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -893,7 +958,7 @@ jobs:
     # `needs: scope` only reads the diff: it gates the work, not the job, so a
     # required check never hangs Pending.
     needs: [scope]
-    if: ${{ !cancelled() && needs.scope.result == 'success' }}
+    if: ${{ !cancelled() }}
     services:
       postgres:
         # pgvector, not plain postgres: the migrations create `vector` columns.
@@ -929,6 +994,16 @@ jobs:
       NOO_EVOLVE_DB_PASSWORD: ci-ephemeral-not-a-secret
       NOO_TRELLION_DB_PASSWORD: ci-ephemeral-not-a-secret
     steps:
+    # A failed or cancelled `scope` FAILS this required lane instead of
+    # skipping it: a skipped job reports Success to a required check (GitHub
+    # docs), so a broken scope would otherwise pass every lane it gates.
+    - name: Scope must have succeeded
+      if: needs.scope.result != 'success'
+      env:
+        SCOPE_RESULT: ${{ needs.scope.result }}
+      run: |
+        echo "::error::the scope job ended '$SCOPE_RESULT': this lane cannot know what changed, so it fails rather than skip"
+        exit 1
     # persist-credentials: false: no token header shadows anything git runs
     # from the workspace.
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -1219,7 +1294,7 @@ jobs:
   router-harness:
     runs-on: ubuntu-latest
     needs: [preflight, scope]
-    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.scope.result == 'success' }}
+    if: ${{ !cancelled() && needs.preflight.result == 'success' }}
     services:
       postgres:
         # pgvector, not plain postgres: the migrations create `vector` columns.
@@ -1255,6 +1330,16 @@ jobs:
       NOO_EVOLVE_DB_PASSWORD: ci-ephemeral-not-a-secret
       NOO_TRELLION_DB_PASSWORD: ci-ephemeral-not-a-secret
     steps:
+    # A failed or cancelled `scope` FAILS this required lane instead of
+    # skipping it: a skipped job reports Success to a required check (GitHub
+    # docs), so a broken scope would otherwise pass every lane it gates.
+    - name: Scope must have succeeded
+      if: needs.scope.result != 'success'
+      env:
+        SCOPE_RESULT: ${{ needs.scope.result }}
+      run: |
+        echo "::error::the scope job ended '$SCOPE_RESULT': this lane cannot know what changed, so it fails rather than skip"
+        exit 1
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       with:
         persist-credentials: false
@@ -1330,11 +1415,21 @@ jobs:
   noo-cli:
     runs-on: ubuntu-latest
     needs: [preflight, scope]
-    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.scope.result == 'success' }}
+    if: ${{ !cancelled() && needs.preflight.result == 'success' }}
     defaults:
       run:
         working-directory: noo-cli
     steps:
+    # A failed or cancelled `scope` FAILS this required lane instead of
+    # skipping it: a skipped job reports Success to a required check (GitHub
+    # docs), so a broken scope would otherwise pass every lane it gates.
+    - name: Scope must have succeeded
+      if: needs.scope.result != 'success'
+      env:
+        SCOPE_RESULT: ${{ needs.scope.result }}
+      run: |
+        echo "::error::the scope job ended '$SCOPE_RESULT': this lane cannot know what changed, so it fails rather than skip"
+        exit 1
 
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -1549,8 +1644,18 @@ jobs:
   standalone-smoke:
     runs-on: ubuntu-latest
     needs: [preflight, scope]
-    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.scope.result == 'success' }}
+    if: ${{ !cancelled() && needs.preflight.result == 'success' }}
     steps:
+    # A failed or cancelled `scope` FAILS this required lane instead of
+    # skipping it: a skipped job reports Success to a required check (GitHub
+    # docs), so a broken scope would otherwise pass every lane it gates.
+    - name: Scope must have succeeded
+      if: needs.scope.result != 'success'
+      env:
+        SCOPE_RESULT: ${{ needs.scope.result }}
+      run: |
+        echo "::error::the scope job ended '$SCOPE_RESULT': this lane cannot know what changed, so it fails rather than skip"
+        exit 1
 
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -1925,7 +2030,74 @@ jobs:
           -t noomesh-ollama:${{ github.sha }} . 2>&1 | tail -n 200
         # The binary, with the runtime stage's libraries, must start.
         docker run --rm --entrypoint /usr/bin/ollama noomesh-ollama:${{ github.sha }} --version
-        docker rmi noomesh-ollama:${{ github.sha }} >/dev/null 2>&1 || true
+
+    # REPORT, not a gate (2026-11-12, i687): the fixable HIGH/CRITICAL in
+    # the image this PR builds, listed by the same code as the daily staged
+    # gate. All of ollama's come from upstream's Go binary, the same on both
+    # arches (i687), so this amd64 scan speaks for arm64 too.
+    - name: Scan the built image (report only)
+      env:
+        TRIVY_VERSION: "0.70.0"
+        TRIVY_SHA256: "8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9"
+        IMAGE: noomesh-ollama:${{ github.sha }}
+      run: |
+        set -euo pipefail
+        dir="$RUNNER_TEMP/trivy-bin"; mkdir -p "$dir" "$RUNNER_TEMP/scan"
+        curl -fsSL --retry 3 -o "$dir/trivy.tgz" \
+          "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+        echo "${TRIVY_SHA256}  $dir/trivy.tgz" | sha256sum -c -
+        tar -xzf "$dir/trivy.tgz" -C "$dir" trivy
+        "$dir/trivy" image --severity HIGH,CRITICAL --ignore-unfixed --format json \
+          -o "$RUNNER_TEMP/scan/linux-amd64.json" "$IMAGE"
+        { echo "### ollama image scan (report only)"; echo '```'
+          python3 scripts/infra-staged.py new-findings --new "$RUNNER_TEMP/scan/linux-amd64.json"
+          echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+        docker rmi "$IMAGE" >/dev/null 2>&1 || true
+
+  voice-images:
+    # whisper and piper publish for linux/arm64 too (i607c): a Pi or an
+    # arm64 VM runs speech. The release builds them on a TAG and the daily
+    # infra-staged job off the release path, so a wheel that has no aarch64
+    # build at its pin would surface there. This job builds BOTH images for
+    # linux/arm64 under QEMU on every PR that changes their inputs, pushes
+    # nothing, and runs each image under QEMU: the server module imports,
+    # which loads every native library it needs (av, ctranslate2,
+    # onnxruntime; piper's bundled espeak). Same shape as ollama-image:
+    # always reports, only the build is conditional.
+    runs-on: ubuntu-latest
+    needs: [preflight, scope]
+    if: ${{ github.repository == 'noomesh/noomesh' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !cancelled() && needs.preflight.result == 'success' && needs.scope.result == 'success' && needs.scope.outputs.voice == 'true' }}
+    concurrency:
+      group: ci-voice-images-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    steps:
+
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+    - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1  # v4.4.0
+      with:
+        platforms: arm64
+    - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+    - uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487  # v4.0.0
+
+    - name: Build whisper and piper for linux/arm64 and run each under QEMU
+      run: |
+        set -euo pipefail
+        # The base straight from Docker Hub: a cloud runner pulls one python
+        # base, and the GHCR mirror can lag a just-bumped digest.
+        for img in whisper piper; do
+          docker buildx build --load --platform linux/arm64 -f "docker/Dockerfile.$img" \
+            --build-arg HUB_MIRROR=docker.io \
+            --cache-from "type=gha,scope=ci-$img-arm64" \
+            --cache-to "type=gha,mode=max,scope=ci-$img-arm64" \
+            -t "noomesh-$img-arm64:${{ github.sha }}" . 2>&1 | tail -n 100
+          [ "$(docker image inspect -f '{{.Architecture}}' "noomesh-$img-arm64:${{ github.sha }}")" = arm64 ]
+        done
+        docker run --rm --platform linux/arm64 --entrypoint python noomesh-whisper-arm64:${{ github.sha }} \
+          -c 'import platform, whisper_server, faster_whisper, ctranslate2, av, onnxruntime; print(platform.machine(), ctranslate2.__version__, av.__version__, onnxruntime.get_available_providers())'
+        docker run --rm --platform linux/arm64 --entrypoint python noomesh-piper-arm64:${{ github.sha }} \
+          -c 'import platform, piper_server, piper, onnxruntime; print(platform.machine(), onnxruntime.get_available_providers())'
+        docker rmi "noomesh-whisper-arm64:${{ github.sha }}" "noomesh-piper-arm64:${{ github.sha }}" >/dev/null 2>&1 || true
 
   openapi-drift:
     # The OpenAPI spec is what the console builds its typed client against, so a

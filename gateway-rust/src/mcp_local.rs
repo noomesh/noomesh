@@ -301,6 +301,9 @@ async fn authenticate_over_tls(
             ),
         ));
     };
+    // The door checks its own key: tell the request trace who called (see
+    // mcp_external::authenticate).
+    crate::request_trace::note_principal(&crate::bus_principal::for_consumer(&consumer));
     // Metered per consumer even without a cap of its own (see
     // `service_keys::door_rpm`); in-process when Redis is absent or erroring.
     let limit = crate::service_keys::door_rpm(&consumer);
@@ -370,8 +373,8 @@ async fn dispatch(
         "initialize" => {
             let client_name = req.params.pointer("/clientInfo/name").and_then(Value::as_str);
             match crate::mcp_session::open(db, &caller.user, &format!("operator:{consumer}"), client_name).await {
-                Some((id, _)) => crate::mcp_session::attach(env.initialize(SERVER_NAME), &id),
-                None => env.initialize(SERVER_NAME),
+                Some((id, _)) => crate::mcp_session::attach(env.initialize(SERVER_NAME, &instructions()), &id),
+                None => env.initialize(SERVER_NAME, &instructions()),
             }
         }
 
@@ -379,10 +382,7 @@ async fn dispatch(
 
         "ping" => env.ping(),
 
-        "server/discover" => env.discover(
-            SERVER_NAME,
-            "noomesh operator door: the full tool catalog, run with operator authority.",
-        ),
+        "server/discover" => env.discover(SERVER_NAME, &instructions()),
 
         "tools/list" => {
             let mut tools = tools_list();
@@ -424,6 +424,24 @@ async fn dispatch(
                 return rpc_error(req.id.clone(), -32602, &format!("unknown tool: {name}"));
             };
 
+            // The agent mailbox (0.6.24), as on the user door.
+            let mailbox_consumer = format!("operator:{consumer}");
+            let (args, mailbox, note) = match crate::agent_mailbox::door_step(
+                db, &caller.user, &mailbox_consumer, headers, session.as_deref(), name, args,
+            )
+            .await
+            {
+                crate::agent_mailbox::DoorStep::Run { args, label, note } => (args, label, note),
+                crate::agent_mailbox::DoorStep::Done(r) => {
+                    let (text, is_error) = match r {
+                        Ok(v) => (serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()), false),
+                        Err(e) => (e, true),
+                    };
+                    return env.result(json!({ "content": [{"type": "text", "text": text}], "isError": is_error }), SERVER_NAME);
+                }
+            };
+            let args = &args;
+
             // WHO the self-call runs as. The caller is a named admin: mint
             // their own five-minute JWT (as the user door does) so the
             // gateway scopes, audits and CHARGES the call to that account —
@@ -437,7 +455,7 @@ async fn dispatch(
                 crate::auth::Role::Admin,
                 &[],
                 &format!("operator:{consumer}"),
-                session.as_deref(),
+                mailbox.as_deref(),
             ) {
                 Some(t) => ("Authorization".to_string(), format!("Bearer {t}")),
                 None => {
@@ -457,11 +475,11 @@ async fn dispatch(
             crate::audit::record(
                 &state.db,
                 AuditEvent::new(AuditKind::McpToolCall, &actor, name)
-                    .details(json!({ "door": "operator", "actor": actor, "tool": name, "era": env.era.as_str() })),
+                    .details(json!({ "door": "operator", "actor": actor, "tool": name, "era": env.era.as_str(), "mailbox": mailbox })),
             )
             .await;
 
-            match execute_spec(spec, args, auth).await {
+            match execute_spec(spec, args, auth).await.map(|v| crate::agent_mailbox::with_note(v, note)) {
                 Ok(v) => env.result(
                     json!({
                         "content": [{
@@ -484,6 +502,13 @@ async fn dispatch(
 
         _ => env.method_not_found(),
     }
+}
+
+/// What this door tells every client (`server/discover`, legacy
+/// `initialize`): what it is, then how agent mail works, which a client
+/// with no hook can learn nowhere else.
+fn instructions() -> String {
+    format!("{} {}", "noomesh operator door: the full tool catalog, run with operator authority.", crate::agent_mailbox::MAILBOX_INSTRUCTIONS)
 }
 
 #[cfg(test)]

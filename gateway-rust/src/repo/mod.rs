@@ -80,20 +80,25 @@
 
 pub mod addon_access;
 pub mod agent_messages;
+pub mod agent_names;
 pub mod agent_recipients;
+pub mod approval_requests;
 pub mod audit;
 pub mod caller_verifiers;
 pub mod cluster;
 pub mod connections;
+pub mod conversations;
 pub mod integration_content;
 pub mod integration_pairing;
 pub mod integrations;
 pub mod graph;
 pub mod heartbeat;
 pub mod kb_grants;
+pub mod node_model_set_retry;
 pub mod node_workload_placements;
 pub mod perspectives;
 pub mod prompt_skills;
+pub mod provision_bundles;
 pub mod request_trace;
 pub mod seats;
 pub mod settings;
@@ -225,7 +230,7 @@ mod ratchet {
     ("role_provision.rs", 7),
     ("routes/admin.rs", 10),
     ("routes/agents.rs", 5),
-    ("routes/bootstrap.rs", 17),
+    ("routes/bootstrap.rs", 15),
     ("routes/cluster.rs", 39),
     ("routes/communication.rs", 11),
     ("routes/core.rs", 3),
@@ -247,7 +252,7 @@ mod ratchet {
     ("routes/walks.rs", 13),
     ("scheduler_engine.rs", 2),
     ("service_keys.rs", 6),
-    ("session.rs", 5),
+    ("session.rs", 2),
     ("session_floor.rs", 4),
     ("system_provision.rs", 30),
     ("system_provision_cli.rs", 1),

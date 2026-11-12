@@ -64,13 +64,29 @@ fn offer_self_upgrade(ctx: &mut Ctx) {
     }
 }
 
+/// The tools onboard REQUIRES. git only for a source checkout: a release
+/// install (standalone, `~/.noo`) never runs it. The launcher's only git call
+/// there is a `git tag -l 'stack-v*' 2>/dev/null` fallback after NOO_IMAGE_TAG,
+/// which onboard always writes. install.md says the same ("git only for a
+/// contributor checkout"); requiring it everywhere stopped a stranger's
+/// install at "git: MISSING" (i677).
+fn required_tools(in_checkout: bool) -> Vec<(&'static str, &'static str)> {
+    let mut tools = vec![("docker", "Runs all Noomesh services")];
+    if in_checkout {
+        tools.push(("git", "Version control (this is a source checkout)"));
+    }
+    tools
+}
+
 pub fn prerequisites(ctx: &mut Ctx) -> bool {
     offer_self_upgrade(ctx);
     let mut all_ok = true;
     let mut missing_apt: Vec<&str> = Vec::new(); // plain apt packages
     let mut docker_missing = false;
+    let in_checkout = crate::envfile::repo_root().join(".git").exists();
+    let required = required_tools(in_checkout);
 
-    for (tool, purpose) in [("docker", "Runs all Noomesh services"), ("git", "Version control")] {
+    for &(tool, purpose) in &required {
         match tool_version(tool) {
             Some(v) => ctx.success(&format!("{tool}: {v}")),
             None => {
@@ -183,13 +199,18 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
                         .map(|a| format!("'{}'", a.replace('\'', r"'\''")))
                         .collect();
                     let relaunch_may_prompt = ctx_sudo_may_prompt(ctx);
+                    // The marker tells the relaunched wizard's closing block that
+                    // Docker was installed this session (i677 #10), and keeps any
+                    // `noo` it runs from relaunching again.
+                    let marker = crate::docker_group::RELAUNCHED_ENV;
                     let code = Command::new("sg")
                         .args(["docker", "-c", &quoted.join(" ")])
+                        .env(marker, "1")
                         .status().ok().and_then(|s| s.code())
                         .or_else(|| {
                             ctx.info("(sg not available — relaunching via `sudo -g docker`)");
                             sudo_cmd(relaunch_may_prompt)
-                                .args(["-g", "docker", &exe])
+                                .args(["-g", "docker", "env", &format!("{marker}=1"), &exe])
                                 .args(&argv)
                                 .status().ok().and_then(|s| s.code())
                         });
@@ -205,7 +226,7 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
                 ctx.warn("Docker install failed — see https://docs.docker.com/engine/install/");
             }
             // Re-check the required pair after installs.
-            all_ok = tool_version("docker").is_some() && tool_version("git").is_some();
+            all_ok = required.iter().all(|&(tool, _)| tool_version(tool).is_some());
         }
     }
 
@@ -5912,6 +5933,50 @@ pub(crate) fn ensure_embed_model_core(model: &str) -> Vec<String> {
     out_lines
 }
 
+/// What to do with one compose volume whose bind the stack declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VolumeMismatch {
+    /// Recorded bind == declared bind.
+    Keep,
+    /// `docker volume inspect` did not answer: never read that as "" (i677 #20).
+    NotChecked,
+    /// No bind at all: a plain volume, whose data lives INSIDE docker.
+    /// Removing it deletes that data, so it is never removed here.
+    UnboundHoldsData,
+    /// A bind to a different path (a NOO_DATA_ROOT change): the data is on the
+    /// host at the old path, and only the stale volume record goes.
+    RemoveStaleRecord,
+}
+
+/// The reaper's decision for each existing volume the stack declares a bind
+/// for, from docker's answers alone: `(volume, declared bind, recorded bind,
+/// action)`. Pure, so the legacy-box case (an unbound noo-data, the stack
+/// down) is tested exactly as onboard sees it.
+fn reaper_decisions(
+    expected: &[(String, String)],
+    existing: &[String],
+    inspect: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(String, String, Option<String>, VolumeMismatch)> {
+    existing
+        .iter()
+        .filter_map(|vol| {
+            let (_, want) = expected.iter().find(|(n, _)| n == vol)?;
+            let recorded = inspect(vol);
+            let action = volume_mismatch_action(recorded.as_deref(), want);
+            Some((vol.clone(), want.clone(), recorded, action))
+        })
+        .collect()
+}
+
+fn volume_mismatch_action(recorded: Option<&str>, want_device: &str) -> VolumeMismatch {
+    match recorded {
+        None => VolumeMismatch::NotChecked,
+        Some("") | Some("<no value>") => VolumeMismatch::UnboundHoldsData,
+        Some(d) if d == want_device => VolumeMismatch::Keep,
+        Some(_) => VolumeMismatch::RemoveStaleRecord,
+    }
+}
+
 /// Remove `pai-assistant_*` bind-backed volumes whose recorded device no
 /// longer matches the compose-rendered one (stale after a NOO_DATA_ROOT
 /// change). Port of Python `step_services._fix_volume_mismatches`, dropped
@@ -5955,27 +6020,46 @@ fn fix_volume_mismatches(ctx: &Ctx) {
     if !ls.status.success() {
         return;
     }
-    let existing = String::from_utf8_lossy(&ls.stdout);
-    let mut removed = 0usize;
-    for vol in existing.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        let Some((_, want_device)) = expected.iter().find(|(n, _)| n == vol) else {
-            continue;
-        };
-        let device = Command::new("docker")
+    let existing: Vec<String> = String::from_utf8_lossy(&ls.stdout)
+        .lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect();
+    let inspect = |vol: &str| -> Option<String> {
+        Command::new("docker")
             .args(["volume", "inspect", vol, "--format", "{{.Options.device}}"])
             .output()
             .ok()
+            .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default();
-        if device != *want_device {
-            let ok = Command::new("docker")
-                .args(["volume", "rm", "-f", vol])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            if ok {
-                removed += 1;
+    };
+    let mut removed = 0usize;
+    for (vol, want_device, recorded, action) in reaper_decisions(&expected, &existing, &inspect) {
+        match action {
+            VolumeMismatch::Keep => continue,
+            VolumeMismatch::NotChecked => {
+                ctx.warn(&format!("volume {vol}: docker inspect did not answer; left as it is (not checked)"));
+                continue;
             }
+            VolumeMismatch::UnboundHoldsData => {
+                ctx.warn(&format!(
+                    "volume {vol} is not bound to {want_device}: its data lives inside docker, so it is NOT removed \
+                     (moving it into the data root is a separate step; `noo cluster verify` names it)"
+                ));
+                continue;
+            }
+            VolumeMismatch::RemoveStaleRecord => {}
+        }
+        // Said BEFORE it happens: only a stale bind RECORD goes; its data
+        // stays on the host at the old path (i677 #20).
+        ctx.info(&format!(
+            "Removing the stale record of volume {vol} (bound to {}, compose now binds {want_device}); its data stays on the host there",
+            recorded.as_deref().unwrap_or("?")
+        ));
+        let ok = Command::new("docker")
+            .args(["volume", "rm", "-f", &vol])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            removed += 1;
         }
     }
     if removed > 0 {
@@ -9704,5 +9788,107 @@ mod services_after_failure_tests {
         let r: Result<u8, ()> = super::retry_once(|| { tries += 1; Ok(1) }, || waits += 1);
         assert_eq!(r, Ok(1));
         assert_eq!((tries, waits), (1, 0), "a first success is not retried");
+    }
+}
+
+#[cfg(test)]
+mod required_tools_tests {
+    use super::*;
+
+    /// A release install (standalone, no checkout) requires Docker only; a
+    /// source checkout also requires git (i677: "git: MISSING" stopped a
+    /// stranger's release install, against install.md).
+    #[test]
+    fn git_is_required_only_in_a_source_checkout() {
+        let names = |c: bool| required_tools(c).into_iter().map(|(t, _)| t).collect::<Vec<_>>();
+        assert_eq!(names(false), ["docker"]);
+        assert_eq!(names(true), ["docker", "git"]);
+    }
+
+    /// The prerequisite check and its post-install re-check both judge the
+    /// same list, and decide the checkout from the repo root's `.git`.
+    #[test]
+    fn the_prerequisite_check_and_its_recheck_use_required_tools() {
+        let code = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&code, "pub fn prerequisites(");
+        assert!(body.contains("let in_checkout = crate::envfile::repo_root().join(\".git\").exists();"), "{body}");
+        assert!(body.contains("for &(tool, purpose) in &required {"), "{body}");
+        assert!(body.contains("all_ok = required.iter().all(|&(tool, _)| tool_version(tool).is_some());"), "{body}");
+        assert!(!body.contains("tool_version(\"git\")"), "git is never checked on its own: {body}");
+    }
+}
+
+#[cfg(test)]
+mod volume_mismatch_tests {
+    use super::*;
+
+    /// i677 #20: only a bind record pointing at a DIFFERENT path is removed
+    /// (its data stays on the host). An unbound volume holds its data inside
+    /// docker: the old code read it as a mismatch and `volume rm -f`-ed it
+    /// whenever the stack was down, deleting the gateway's data on every
+    /// legacy box that re-onboarded. A failed inspect is not "" either.
+    #[test]
+    fn only_a_stale_bind_record_is_removed() {
+        assert_eq!(volume_mismatch_action(Some("/srv/noo/noo-data"), "/srv/noo/noo-data"), VolumeMismatch::Keep);
+        assert_eq!(volume_mismatch_action(Some("/old/root/noo-data"), "/srv/noo/noo-data"), VolumeMismatch::RemoveStaleRecord);
+        assert_eq!(volume_mismatch_action(Some(""), "/srv/noo/noo-data"), VolumeMismatch::UnboundHoldsData);
+        assert_eq!(volume_mismatch_action(Some("<no value>"), "/srv/noo/noo-data"), VolumeMismatch::UnboundHoldsData);
+        assert_eq!(volume_mismatch_action(None, "/srv/noo/noo-data"), VolumeMismatch::NotChecked);
+    }
+
+    #[test]
+    fn the_fixer_removes_only_on_a_stale_record() {
+        let code = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&code, "fn fix_volume_mismatches(");
+        let decide = body.find("for (vol, want_device, recorded, action) in reaper_decisions(&expected, &existing, &inspect) {").expect("the decision");
+        let stale = body.find("VolumeMismatch::RemoveStaleRecord => {}").expect("only the stale record falls through");
+        let say = body.find("Removing the stale record of volume").expect("said before");
+        let rm = body.find("\"volume\", \"rm\", \"-f\", &vol").expect("the removal");
+        assert!(decide < stale && stale < say && say < rm, "{body}");
+        assert_eq!(body.matches("\"volume\", \"rm\"").count(), 1, "one removal, after the decision");
+        assert!(body.contains(".filter(|o| o.status.success())"), "a failed inspect is not an empty device: {body}");
+    }
+}
+
+#[cfg(test)]
+mod legacy_reonboard_tests {
+    use super::*;
+
+    /// i677 #20, the case that lost data: a box installed on 0.6.10+ has a
+    /// PLAIN noomesh_noo-data (no bind; the data inside docker). Re-onboarding
+    /// it with the stack DOWN (the volume not in use) must remove nothing
+    /// that holds data. Only a bind record pointing at an old path goes.
+    #[test]
+    fn a_reonboard_over_a_legacy_unbound_noo_data_removes_no_data() {
+        let expected = vec![
+            ("noomesh_noo-data".to_string(), "/srv/noo/noo-data".to_string()),
+            ("noomesh_postgres-data".to_string(), "/srv/noo/postgres".to_string()),
+            ("noomesh_redis-data".to_string(), "/srv/noo/redis".to_string()),
+        ];
+        let existing: Vec<String> = ["noomesh_noo-data", "noomesh_postgres-data", "noomesh_redis-data", "noomesh_other"]
+            .iter().map(|s| s.to_string()).collect();
+        let inspect = |v: &str| -> Option<String> {
+            match v {
+                "noomesh_noo-data" => Some(String::new()),          // legacy: no bind
+                "noomesh_postgres-data" => Some("/srv/noo/postgres".into()), // bound, current
+                "noomesh_redis-data" => Some("/old/root/redis".into()),      // bound, old root
+                _ => None,
+            }
+        };
+        let d = reaper_decisions(&expected, &existing, &inspect);
+        let action = |n: &str| d.iter().find(|(v, ..)| v == n).map(|(.., a)| *a);
+        assert_eq!(action("noomesh_noo-data"), Some(VolumeMismatch::UnboundHoldsData), "the legacy volume holds data: kept");
+        assert_eq!(action("noomesh_postgres-data"), Some(VolumeMismatch::Keep));
+        assert_eq!(action("noomesh_redis-data"), Some(VolumeMismatch::RemoveStaleRecord), "only a stale bind record");
+        assert_eq!(action("noomesh_other"), None, "a volume the stack does not declare is not judged");
+        let removed: Vec<&str> = d.iter().filter(|(.., a)| *a == VolumeMismatch::RemoveStaleRecord).map(|(v, ..)| v.as_str()).collect();
+        assert_eq!(removed, ["noomesh_redis-data"]);
+    }
+
+    #[test]
+    fn a_volume_docker_would_not_describe_is_left_alone() {
+        let expected = vec![("noomesh_noo-data".to_string(), "/srv/noo/noo-data".to_string())];
+        let d = reaper_decisions(&expected, &["noomesh_noo-data".to_string()], &|_| None);
+        assert_eq!(d[0].3, VolumeMismatch::NotChecked);
     }
 }

@@ -4,7 +4,7 @@ version: "1.0"
 description: "Data exploration, statistical analysis, and visualization guidance"
 author: noo-builtin
 tags: [data, analysis, statistics, visualization, python]
-trigger_keywords: [analyze, data, statistics, plot, chart, csv, dataframe, pandas, correlation]
+trigger_keywords: [analyze, analyse, dataset, data, statistics, plot, chart, csv, dataframe, pandas, correlation]
 priority: 6
 max_context_chars: 3500
 composable: true

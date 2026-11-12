@@ -143,27 +143,7 @@ impl RemoteRuntime {
     /// One rail call. Non-2xx and non-JSON answers are errors; the body's
     /// `error` field, when the gateway sent one, is the message.
     pub async fn call(&self, op: HarnessOp) -> Result<Value> {
-        let name = op.name();
-        let resp = self
-            .client
-            .post(format!("{}/api/harness/call", self.gateway))
-            .bearer_auth(&self.token)
-            .timeout(RAIL_TIMEOUT)
-            .json(&op)
-            .send()
-            .await
-            .map_err(|e| anyhow!("harness rail {name}: {e}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body: Value = resp.json().await.unwrap_or(Value::Null);
-            let msg = body.get("error").and_then(|e| e.as_str()).unwrap_or("").to_string();
-            return Err(anyhow!("harness rail {name}: HTTP {} {msg}", status.as_u16()));
-        }
-        // A 2xx that is cut off or not JSON is an error, never `Null` as
-        // the op's result (i460).
-        crate::upstream_body::json_2xx(resp, "the gateway")
-            .await
-            .map_err(|e| anyhow!("harness rail {name}: {e}"))
+        rail_post(&self.client, &self.gateway, &self.token, op).await
     }
 
     async fn text(&self, op: HarnessOp) -> Option<String> {
@@ -176,7 +156,27 @@ impl RemoteRuntime {
         }
     }
 
+    /// A side effect nothing in this turn reads back (tool-call records,
+    /// retrieval feedback, skill usage, post-response hooks, the shard tag,
+    /// temporal extraction, the running summary, operator alerts): sent on
+    /// its own task, so neither the loop nor the harness's published result
+    /// waits on its round trip (speed review 2026-11-11: up to 9 awaited
+    /// rail calls per turn, 2 more per tool call). The turn's harness token
+    /// is a JWT good for the deadline + 60 s, so a side effect still in
+    /// flight after the result is published is authenticated. A harness
+    /// stopping mid-flight may drop one, as an error here always could.
     async fn fire(&self, op: HarnessOp) {
+        let (client, gateway, token) = (self.client.clone(), self.gateway.clone(), self.token.clone());
+        tokio::spawn(async move {
+            if let Err(e) = rail_post(&client, &gateway, &token, op).await {
+                tracing::warn!(error = %e, "harness rail: side effect dropped");
+            }
+        });
+    }
+
+    /// A side effect the turn still waits for: the pre-inference hooks run
+    /// BEFORE the model call, and an add-on's hook may count on having run.
+    async fn fire_awaited(&self, op: HarnessOp) {
         if let Err(e) = self.call(op).await {
             tracing::warn!(error = %e, "harness rail: side effect dropped");
         }
@@ -419,7 +419,7 @@ impl HarnessRuntime for RemoteRuntime {
     }
 
     async fn fire_pre_inference_hooks(&self, _conversation_id: &str, prompt: &str) {
-        self.fire(HarnessOp::PreHooks { prompt: prompt.to_string() }).await
+        self.fire_awaited(HarnessOp::PreHooks { prompt: prompt.to_string() }).await
     }
 
     async fn fire_post_response_hooks(&self, _conversation_id: &str, result: &CoordinatorResult) {
@@ -474,6 +474,31 @@ fn jwt_claims_unverified(token: &str) -> Option<Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// One rail call, on any task: [`RemoteRuntime::call`] and the spawned
+/// side effects of [`RemoteRuntime::fire`] both send through here.
+async fn rail_post(client: &reqwest::Client, gateway: &str, token: &str, op: HarnessOp) -> Result<Value> {
+    let name = op.name();
+    let resp = client
+        .post(format!("{gateway}/api/harness/call"))
+        .bearer_auth(token)
+        .timeout(RAIL_TIMEOUT)
+        .json(&op)
+        .send()
+        .await
+        .map_err(|e| anyhow!("harness rail {name}: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        let msg = body.get("error").and_then(|e| e.as_str()).unwrap_or("").to_string();
+        return Err(anyhow!("harness rail {name}: HTTP {} {msg}", status.as_u16()));
+    }
+    // A 2xx that is cut off or not JSON is an error, never `Null` as
+    // the op's result (i460).
+    crate::upstream_body::json_2xx(resp, "the gateway")
+        .await
+        .map_err(|e| anyhow!("harness rail {name}: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,6 +507,46 @@ mod tests {
 
     /// A stand-in gateway that records every op and the bearer it came
     /// with, and answers a fixed body per op name.
+    /// Speed review 2026-11-11: a side effect never holds the turn. The
+    /// gateway takes 2 s to answer a side-effect op; fire() returns at once
+    /// and the op still arrives. The pre-inference hooks are still waited on.
+    #[tokio::test]
+    async fn a_side_effect_does_not_hold_the_turn_but_still_arrives() {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let app = Router::new().route(
+            "/api/harness/call",
+            post(move |Json(op): Json<Value>| {
+                let s = s.clone();
+                async move {
+                    let name = op["op"].as_str().unwrap_or("").to_string();
+                    if name != "config" && name != "catalogs" {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                    s.lock().unwrap().push(name);
+                    Json(serde_json::json!({"ok": true}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let rt = RemoteRuntime::connect(&format!("http://{addr}"), "tok", reqwest::Client::new()).await.unwrap();
+        let t0 = std::time::Instant::now();
+        rt.record_skill_usage(&["a".to_string()], "c1").await;
+        assert!(t0.elapsed() < std::time::Duration::from_millis(500), "fire() waited {:?}", t0.elapsed());
+        let t1 = std::time::Instant::now();
+        rt.fire_pre_inference_hooks("c1", "hi").await;
+        assert!(t1.elapsed() >= std::time::Duration::from_secs(2), "the pre-inference hooks must still be waited on");
+        for _ in 0..400 {
+            if seen.lock().unwrap().iter().any(|n| n == "skill_usage") {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the side effect never arrived: {:?}", seen.lock().unwrap());
+    }
+
     async fn fake_gateway(seen: Arc<Mutex<Vec<(String, Value)>>>) -> String {
         let app = Router::new().route(
             "/api/harness/call",
@@ -542,6 +607,14 @@ mod tests {
         assert_eq!(rt.turn_number("c1").await, 9);
         rt.record_retrieval_feedback("c1", "web_search", true).await;
 
+        // retrieval_feedback is a side effect: fire() sends it on its own
+        // task, so wait (bounded) for it to land.
+        for _ in 0..200 {
+            if seen.lock().unwrap().len() >= 8 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         let calls = seen.lock().unwrap().clone();
         assert!(calls.iter().all(|(b, _)| b == "Bearer tok-123"));
         let names: Vec<&str> = calls.iter().map(|(_, op)| op["op"].as_str().unwrap()).collect();

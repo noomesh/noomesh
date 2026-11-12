@@ -408,6 +408,7 @@ func (a *Agent) Run() error {
 	rec := reconcile.New(a.cfg, a.docker, a.http, a.harness)
 	a.harnessKind = rec.HarnessRunningKind
 	a.hb.SetModelSets(rec.ModelSetsReport)
+	a.hb.SetModelSetsFreeBytes(rec.ModelSetsFreeBytes)
 	a.hb.SetNodeFacts(rec.NodeFacts)
 	if mc := rec.NodeWorkloadControl(); mc != nil {
 		a.server.SetManagedWorkloads(mc)
@@ -427,7 +428,7 @@ func (a *Agent) Run() error {
 	})
 	a.server.SetHarnessPlacement(func() api.HarnessPlacement {
 		kind, env, ds, placed := rec.HarnessPlacementView()
-		hp := api.HarnessPlacement{Kind: kind, Env: env, DesiredState: ds, Placed: placed}
+		hp := api.HarnessPlacement{Kind: kind, Env: env, DesiredState: ds, Placed: placed, Unknown: !rec.HarnessPlacementKnown()}
 		prof := harnessprofile.Current()
 		if prof != nil {
 			hp.Profile = prof.Raw
@@ -618,6 +619,12 @@ func (a *Agent) startMessaging(ctx context.Context) {
 	a.hb.SetHostdState(a.hostdStatus)
 	a.hb.SetBackendContainers(a.backendContainers)
 	a.hb.SetOllamaDoor(func() string { return a.docker.BackendDialURL(a.lifeCtx(), "ollama") })
+	if a.ollama != nil {
+		// A Mac's native ollama reads its models from the brew plist's
+		// OLLAMA_MODELS (which the guard pins), not the agent's environment:
+		// a mirror import writes its manifest there.
+		dockerpkg.SetNativeOllamaModelsDir(a.ollama.ModelsDirInUse)
+	}
 	a.hb.SetChatModelStats(func() []heartbeat.ModelStat { return a.server.ChatModelStats(a.lifeCtx()) })
 	if a.native != nil {
 		a.hb.SetModelStats(func() []heartbeat.ModelStat {
@@ -893,7 +900,14 @@ func (a *Agent) hostServices() map[string]any {
 	if a.harnessKind != nil {
 		kind = a.harnessKind()
 	}
-	return hostServicesReport(a.harness.State(ctx), a.harness.Runtime(), kind)
+	state := a.harness.State(ctx)
+	rep := hostServicesReport(state, a.harness.Runtime(), kind)
+	// The egress hold-off is reported only where the unit is installed on a
+	// systemd host; its absence elsewhere is not a claim.
+	if state != hostsvc.Absent && a.harness.Runtime() == "systemd" {
+		rep["harness"].(map[string]any)["egress"] = hostsvc.DefaultEgressReader().Read(ctx).Map()
+	}
+	return rep
 }
 
 // hostServicesReport is the heartbeat's host_services: the harness's state

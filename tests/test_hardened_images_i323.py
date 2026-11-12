@@ -22,11 +22,11 @@ DOCKERFILE = (ROOT / "docker/Dockerfile.ollama").read_text()
 COMPOSE = (ROOT / "docker-compose.cluster.yml").read_text()
 BACKENDS = (ROOT / "node-agent-go/internal/docker/backends.go").read_text()
 
-# From the ollama/ollama v0.40.5 release's sha256sum.txt (gh release download).
+# From the ollama/ollama v0.40.16 release's sha256sum.txt (gh release download).
 PIN = {
-    "version": "0.40.5",
-    "amd64": "dc5eabc292f9949546c90a97c820f924b035e05243b0de13c7f366182562169c",
-    "arm64": "fbe71ebb1a10e59b8480c4d2839826b5f9dff1a6d5c142428b2e7db9b1a2c642",
+    "version": "0.40.16",
+    "amd64": "87bfafb2acbc89b2e6a1be0a9043de6aa75fb450696f86bc426e65fc448f788d",
+    "arm64": "e45b8e6dcb86cb9f3057396351655079c9a4879b4ced2678c9350d375dcbc224",
 }
 
 

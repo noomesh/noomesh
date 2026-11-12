@@ -19,6 +19,7 @@
 //!   (stream idle, thinking, the Claude Code launch variant).
 
 pub mod driver;
+pub mod egress_selftest;
 pub mod jail;
 pub mod probe;
 pub mod probe_mock;

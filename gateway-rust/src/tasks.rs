@@ -901,6 +901,19 @@ pub fn objective_prompt(objective: &str, thread_id: &str, budget: u32) -> String
     )
 }
 
+/// The owner's own words for a loop: the objective, an answer to the
+/// task's question, and context added since the last loop. Skills, runbooks
+/// and the cluster guidance are chosen from these, not from the prompts'
+/// contract text, which names noomesh tools on every task (i658).
+pub fn selection_text(objective: &str, answer: Option<&str>, context: Option<&str>) -> String {
+    let mut s = objective.trim().to_string();
+    for extra in [answer, context].into_iter().flatten().map(str::trim).filter(|e| !e.is_empty()) {
+        s.push_str("\n\n");
+        s.push_str(extra);
+    }
+    s
+}
+
 /// Every later loop's prompt.
 pub fn continuation_prompt(objective: &str, loop_no: u32, budget: u32) -> String {
     format!(
@@ -993,16 +1006,23 @@ pub async fn run_task_loops<R: TaskRuntime>(mut rt: R, req: &TaskRequest) -> Res
         };
         // The owner's context since the last loop (i143 C), in front.
         let prompt = crate::task_budget::with_context(prompt, check.context.as_deref());
-        let outcome = crate::coordinator::run_inner(
-            &rt,
-            &prompt,
-            &req.conversation_id,
-            &req.channel,
-            req.max_iterations,
-            req.model.as_deref(),
-            (!req.user.is_empty()).then_some(req.user.as_str()),
-            req.role_prompt.as_deref(),
-            true,
+        // The words that choose this loop's skills and guidance: what the
+        // owner wrote (objective, answer, added context), never the task's
+        // contract around it (i658).
+        let selection = selection_text(&req.objective, check.clarification.as_ref().and_then(|c| c.answer.as_deref()), check.context.as_deref());
+        let outcome = crate::coordinator::with_selection_text(
+            selection,
+            crate::coordinator::run_inner(
+                &rt,
+                &prompt,
+                &req.conversation_id,
+                &req.channel,
+                req.max_iterations,
+                req.model.as_deref(),
+                (!req.user.is_empty()).then_some(req.user.as_str()),
+                req.role_prompt.as_deref(),
+                true,
+            ),
         )
         .await;
         loops += 1;

@@ -44,7 +44,7 @@ self-contained paste:
 ```
 run AS YOUR USER on the node (one sudo prompt)
 step 1 — make sure the noo CLI is on the node (skip if `noo --version` already works):
-  command -v noo >/dev/null || curl -fsSL https://github.com/noomesh/noomesh/releases/latest/download/install.sh | sh
+  command -v noo >/dev/null || { curl -fsSL https://github.com/noomesh/noomesh/releases/latest/download/install.sh -o install.sh && sh install.sh; }
 step 2 — enroll (joins the tailnet, runs host prep, installs the agent):
   noo enroll noo1.<blob>
 bound to node: gpu-2. When the paste finishes: noo cluster provision gpu-2 --wait
@@ -812,7 +812,7 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 | Command | Arguments | What it does |
 |---|---|---|
 | `noo cluster status` | — | List nodes: tier, status, RUNNING backends, CAPABILITIES by role, CAN-RUN |
-| `noo cluster verify` | `[<node>...] [--controller] [--wait]` | Assert every invariant a node and the controller must meet; exit 1 with the remedy |
+| `noo cluster verify` | `[<node>...] [--controller] [--wait] [--timings]` | Assert every invariant a node and the controller must meet; exit 1 with the remedy |
 | `noo cluster invite` | — | Mint a tagged tailscale auth key and print the `noo enroll --via-tailnet <url>` line |
 | `noo cluster down` | `<backend> [--node <node>] [-y\|--yes]` | Stop a backend on one node or all nodes; destructive, asks for confirmation (-y) |
 | `noo cluster desired` | `<node>` | Alias of show: the node in full, with its desired config and every placement |
@@ -842,6 +842,7 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 | `noo cluster workloads place` | `<node> <addon>/<workload> [--profile <profile>] [--set <slot>=<id>@<rev>]... [--env <K=V>]... [--on-controller]` | Place an add-on's node workload on one node: image, model sets, env (operator) |
 | `noo cluster workloads show` | `<node> [<addon>/<workload>]` | Show the node workloads placed on a node, or one of them |
 | `noo cluster workloads unplace` | `<node> <addon>/<workload>` | Remove an add-on's node workload placement from a node (operator) |
+| `noo cluster workloads retry` | `<node> [<set-id>@<rev>]` | End a refused model-set backoff on a node; it fetches again at its next reconcile |
 | `noo cluster workloads` | — | List the workloads the installed add-ons declare (container, GPU need, drain route) |
 | `noo cluster profile` | `<node> [--set <key=value>]... [--clear <key>]... [--clear-all] [--bench]` | Show a node's harness profile with each value's source; set overrides; bench its model |
 | `noo cluster init-secret` | — | Generate and print a fresh random cluster secret locally (no gateway call) |

@@ -346,7 +346,15 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
     let bundle = sign_bundle(g, &a, &ca, &files, &work);
 
     // Stage it at the gateway, then judge what the node reports.
-    let legacy = stage_applier_first(g, &a, &machine, &ca);
+    let (legacy, applier_only) = stage_applier_first(g, &a, &machine, &ca);
+    if applier_only {
+        // `--stage-only` on a node that needs the applier first: only the
+        // applier bundle is staged (one bundle per node; the full one would
+        // replace it unfetched). The caller's combined wait restages the
+        // full bundle once the applier is in (PendingApply::applier_first).
+        scrub(&work);
+        return Ok(0);
+    }
     let staged = stage_bundle(g, &a, &enrollment, &machine, &bundle, &work, legacy);
     if a.stage_only {
         report_staged_only(g, &a, &staged);
@@ -1552,21 +1560,43 @@ fn sign_bundle(g: &Globals, a: &ProvisionArgs, ca: &crate::pki::ClusterCa, files
     }
 }
 
-/// A node that has never reported an apply runs the legacy fetcher/applier pair: stage an applier-only bundle first, the one kind every applier accepts. Returns whether the node is legacy.
+/// Set (to `1`) by the nodes stage around the restage that follows a
+/// staged applier: stage the FULL bundle, not the applier again.
+pub(crate) const FULL_BUNDLE_ENV: &str = "NOO_PROVISION_FULL_BUNDLE";
+
+/// Whether a node's staging begins with an applier-only bundle: it never
+/// reported an apply (legacy fetcher/applier), it is not a Mac, and this
+/// CLI carries an applier to send. ONE decision for the child that stages
+/// and the parent that waits (`upgrade::upgrade_nodes`).
+pub(crate) fn applier_first_due(legacy: bool, darwin: bool, applier_present: bool) -> bool {
+    legacy && !darwin && applier_present
+}
+
+/// [`applier_first_due`] for `node`, from the records the child reads.
+/// Read BEFORE staging, as `node_never_reported_apply` must be.
+pub(crate) fn applier_first_for(g: &Globals, node: &str) -> bool {
+    let darwin = enrolled_os(redemption_record(g, node).as_ref()) == "macos";
+    applier_first_due(node_never_reported_apply(g, node), darwin, !super::enroll::asset_apply().is_empty())
+        && std::env::var(FULL_BUNDLE_ENV).as_deref() != Ok("1")
+}
+
+/// A node that has never reported an apply runs the legacy fetcher/applier pair: stage an applier-only bundle first, the one kind every applier accepts. Returns (whether the node is legacy, whether ONLY the applier was staged: `--stage-only`, where the caller restages the full bundle).
 /// A node that has never reported an apply outcome runs the legacy
 /// fetcher/applier pair (pre-2026-09-03): its applier refuses every
 /// kind it does not know, and its fetcher cannot report. Stage an
 /// applier-only bundle first — the one kind every applier accepts —
 /// so the full bundle below is applied by the new applier.
-fn stage_applier_first(g: &Globals, a: &ProvisionArgs, m: &ProvMachine, ca: &crate::pki::ClusterCa) -> bool {
+fn stage_applier_first(g: &Globals, a: &ProvisionArgs, m: &ProvMachine, ca: &crate::pki::ClusterCa) -> (bool, bool) {
     let node = a.node.clone();
     let darwin = m.darwin;
     let birth_cert = m.birth_cert.clone();
     let cert = birth_cert.as_deref().expect("pull lane requires a birth cert");
     let legacy = node_never_reported_apply(g, &node);
-    if legacy && !darwin {
-        let apply = super::enroll::asset_apply();
-        if !apply.is_empty() {
+    // The restage after a staged applier: the full bundle now.
+    let after_applier = std::env::var(FULL_BUNDLE_ENV).as_deref() == Ok("1");
+    let apply = super::enroll::asset_apply();
+    if !after_applier && applier_first_due(legacy, darwin, !apply.is_empty()) {
+        {
             nstep(&format!("{node} has never reported an apply — staging the applier alone first"));
             let w2 = std::env::temp_dir().join(format!("noo-provision-applier-{node}-{}", std::process::id()));
             let _ = std::fs::create_dir_all(&w2);
@@ -1585,6 +1615,12 @@ fn stage_applier_first(g: &Globals, a: &ProvisionArgs, m: &ProvMachine, ca: &cra
                 fail(g.json, ExitCode::Generic, "stage_failed", &e, None);
             }
             poke_fetch(g, &node);
+            // `--stage-only`: never block here (0.6.21: a self node whose
+            // fetcher was broken held every later node's staging for the
+            // full 600 s). The caller waits, for every node together.
+            if a.stage_only {
+                return (legacy, true);
+            }
             let staged2 = wait_bundle_fetched(g, &node, 600);
             if !staged2 {
                 fail_guided(g, ExitCode::Generic, "not_fetched",
@@ -1610,7 +1646,7 @@ fn stage_applier_first(g: &Globals, a: &ProvisionArgs, m: &ProvMachine, ca: &cra
             }
         }
     }
-    legacy
+    (legacy, false)
 }
 
 /// Compress (when the node reads gzip), encrypt to the birth cert, stage at the gateway and poke the node.
@@ -3078,7 +3114,7 @@ fn provision_local_in(g: &Globals, node: &str, tier: Option<&str>, root: &Path, 
     // release — or a pull unit is missing (prep is what installs them).
     let user = std::env::var("USER").unwrap_or_default();
     let prep_release = format!("{}/{}", env!("CARGO_PKG_VERSION"), image_tag());
-    let prep_sha = std::fs::read(&prep).map(|b| sha256_hex(&b)).unwrap_or_default();
+    let prep_sha = std::fs::read(&prep).map(|b| crate::addons::pins::sha256_hex(&b)).unwrap_or_default();
     let prep_url = format!("https://{ctrl_host}:8080");
     let prep_current = std::fs::read_to_string(LOCAL_PREP_MARKER).map(|m| prep_marker_current(&m, &[
         ("PREP_SHA256", prep_sha.as_str()),
@@ -3238,7 +3274,7 @@ fn provision_local_in(g: &Globals, node: &str, tier: Option<&str>, root: &Path, 
     let state_path = pki.join("nodes").join(node).join(LOCAL_LANE_STATE);
     let mut recorded = parse_lane_state(&std::fs::read_to_string(&state_path).unwrap_or_default());
     match std::fs::read(LOCAL_AGENT_BIN) {
-        Ok(b) => { recorded.insert("agent-binary".into(), sha256_hex(&b)); }
+        Ok(b) => { recorded.insert("agent-binary".into(), crate::addons::pins::sha256_hex(&b)); }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => { recorded.remove("agent-binary"); }
         Err(_) => {}
     }
@@ -3829,41 +3865,127 @@ pub(crate) fn cli_asset_for(os: &str, arch: &str) -> Option<String> {
     })
 }
 
-/// This release's `asset` from the controller's version-keyed cache, or —
-/// when the cache lacks it — fetched from the release now and cached
-/// Provision used to read the cache only, so one failed
-/// fetch during `noo upgrade` left a platform without its harness or helper
-/// until the next upgrade. A fetch that fails is not repeated for the same
-/// asset within this process: a fleet restage during an outage asks once,
-/// not once per node. The bytes ride the CA-signed bundle, as cached bytes
-/// always have.
+/// This version's signed release manifest, VERIFIED: the cached
+/// `sha256sums.txt` and its `.sig` when their signature verifies against the
+/// release key pinned in this binary, else both fetched, verified, and only
+/// then cached. Once per process (and per root).
+///
+/// i688 (2026-11-12): the cache under `<root>/bin/<version>/` was trusted by
+/// file NAME, and what it held was signed by the cluster CA into node bundles
+/// (root `noo-hostd`, the CLI, the harness, the darwin agent). Anything
+/// running as the operator user could plant a file there and have our own
+/// key vouch for it on every node provisioned afterwards. Every asset that
+/// enters a bundle is listed in this manifest (noo-cli-release.yml signs
+/// `noo-*-unknown-linux-*` and `noo-*-apple-darwin`).
+pub(crate) fn verified_release_manifest(g: &Globals, root: &Path) -> Result<(String, String), String> {
+    type Memo = std::sync::Mutex<BTreeMap<std::path::PathBuf, Result<(String, String), String>>>;
+    static MEMO: std::sync::OnceLock<Memo> = std::sync::OnceLock::new();
+    let memo = MEMO.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()));
+    if let Some(r) = memo.lock().ok().and_then(|m| m.get(root).cloned()) {
+        return r;
+    }
+    let r = load_verified_manifest(g, root);
+    if let Ok(mut m) = memo.lock() {
+        m.insert(root.to_path_buf(), r.clone());
+    }
+    r
+}
+
+fn load_verified_manifest(g: &Globals, root: &Path) -> Result<(String, String), String> {
+    let version = env!("CARGO_PKG_VERSION");
+    manifest_with(
+        &cli_asset_cache_dir(root),
+        version,
+        &mut |n| super::upgrade::fetch_release_file(g, version, n, None).map_err(|e| e.summary()),
+        &|d, s| crate::release_sig::verify(d, s).map(|_| ()),
+    )
+}
+
+/// A release-file fetch by asset name, for [`manifest_with`] / [`release_asset_with`].
+type AssetFetch<'a> = dyn FnMut(&str) -> Result<Vec<u8>, String> + 'a;
+/// A signature check over (data, sig text).
+type ManifestVerify<'a> = dyn Fn(&[u8], &str) -> Result<(), String> + 'a;
+
+/// The verified-manifest rule over a cache dir, with the fetch and the
+/// signature check injected (tests plant files; production pins the key).
+fn manifest_with(dir: &Path, version: &str, fetch: &mut AssetFetch<'_>, verify: &ManifestVerify<'_>) -> Result<(String, String), String> {
+    let m = crate::release_sig::MANIFEST;
+    let sig_name = format!("{m}.sig");
+    let read = |n: &str| std::fs::read_to_string(dir.join(n)).ok().filter(|s| !s.is_empty());
+    let bound = |man: &str| crate::release_sig::manifest_names_version(man, version);
+    if let (Some(man), Some(sig)) = (read(m), read(&sig_name)) {
+        if verify(man.as_bytes(), &sig).is_ok() && bound(&man) {
+            return Ok((man, sig));
+        }
+        ui::warned(&format!("{}: the cached {m} is not this release's signed manifest — fetching it again", dir.display()));
+    }
+    let text = |b: Vec<u8>| String::from_utf8_lossy(&b).to_string();
+    let man = fetch(m).map(text).map_err(|e| format!("{m} for {version}: {e}"))?;
+    let sig = fetch(&sig_name).map(text).map_err(|e| format!("{sig_name} for {version}: {e}"))?;
+    verify(man.as_bytes(), &sig)
+        .map_err(|e| format!("the {m} of {version} does not verify against the release key ({e}) — refusing every release asset"))?;
+    // Signed is not enough: the signature covers the bytes, not the tag, so
+    // a genuine OLDER manifest would pass too (a rollback through the cache
+    // or a mirror). It must name exactly this version.
+    if !bound(&man) {
+        return Err(format!("the signed {m} served for {version} is not that release's (its {} row does not name {version}) — refusing every release asset", crate::release_sig::VERSION_ASSET));
+    }
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(dir.join(m), &man);
+    let _ = std::fs::write(dir.join(&sig_name), &sig);
+    Ok((man, sig))
+}
+
+/// This release's `asset`, VERIFIED against the signed manifest
+/// ([`verified_release_manifest`]): the cached copy if its sha256 is the
+/// manifest's, else fetched from the release, checked, and only then cached.
+/// A cached file that does not match is refused and re-downloaded; a
+/// download that does not match is never cached and never returned. The
+/// bytes go into the CA-signed bundle, so nothing reaches `sign_bundle`
+/// that did not pass here, in this process (i688).
+///
+/// A fetch that fails is not repeated for the same asset within this
+/// process: a fleet restage during an outage asks once, not once per node.
 pub(crate) fn cached_release_asset(g: &Globals, root: &Path, asset: &str) -> Result<Vec<u8>, String> {
     static FAILED: std::sync::Mutex<BTreeMap<String, String>> = std::sync::Mutex::new(BTreeMap::new());
-    let cached = cli_asset_cache_dir(root).join(asset);
-    if let Some(b) = std::fs::read(&cached).ok().filter(|b| !b.is_empty()) {
-        return Ok(b);
-    }
+    let (manifest, _) = verified_release_manifest(g, root)?;
     if let Some(e) = FAILED.lock().ok().and_then(|m| m.get(asset).cloned()) {
-        return Err(e);
+        // Only the fetch is not repeated; a verified cached copy still serves.
+        return release_asset_with(&cli_asset_cache_dir(root), asset, &manifest, &mut |_| Err(e.clone()));
     }
-    let r = super::upgrade::fetch_release_file(g, env!("CARGO_PKG_VERSION"), asset, None)
-        .map_err(|e| e.summary())
-        .and_then(|b| if b.is_empty() { Err(format!("{asset} downloaded empty")) } else { Ok(b) });
-    match r {
-        Ok(b) => {
-            if let Some(dir) = cached.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let _ = std::fs::write(&cached, &b);
-            Ok(b)
-        }
-        Err(e) => {
-            if let Ok(mut m) = FAILED.lock() {
-                m.insert(asset.to_string(), e.clone());
-            }
-            Err(e)
+    let version = env!("CARGO_PKG_VERSION");
+    let r = release_asset_with(&cli_asset_cache_dir(root), asset, &manifest, &mut |n| {
+        super::upgrade::fetch_release_file(g, version, n, None).map_err(|e| e.summary())
+    });
+    if let Err(e) = &r {
+        if let Ok(mut m) = FAILED.lock() {
+            m.insert(asset.to_string(), e.clone());
         }
     }
+    r
+}
+
+/// The verified-asset rule over a cache dir and an already-verified
+/// manifest, with the fetch injected.
+fn release_asset_with(dir: &Path, asset: &str, manifest: &str, fetch: &mut AssetFetch<'_>) -> Result<Vec<u8>, String> {
+    use crate::addons::pins::sha256_hex;
+    let want = crate::release_sig::manifest_sha_for(manifest, asset)
+        .ok_or_else(|| format!("{asset} is not listed in the signed {} — refusing", crate::release_sig::MANIFEST))?;
+    let cached = dir.join(asset);
+    if let Some(b) = std::fs::read(&cached).ok().filter(|b| !b.is_empty()) {
+        if sha256_hex(&b) == want {
+            return Ok(b);
+        }
+        ui::warned(&format!("{}: does not match the signed manifest — refusing it and fetching the release asset", cached.display()));
+    }
+    let b = fetch(asset)?;
+    let got = sha256_hex(&b);
+    if got != want {
+        return Err(format!("{asset} as downloaded does not match the signed manifest (sha256 {got}, signed {want}) — refusing"));
+    }
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(&cached, &b);
+    Ok(b)
 }
 
 /// The controller's cache of CLI release assets (also what /bootstrap/cli
@@ -3956,8 +4078,6 @@ fn scrub(work: &Path) {
 /// Source-build the darwin agent. No image lane: darwin binaries ride no
 /// container.
 fn obtain_agent_binary_darwin(g: &Globals, root: &Path, goarch: &str) -> Result<Vec<u8>, String> {
-    // 1. The controller's own cache (also the documented drop path).
-    //
     // VERSION-KEYED, for the reason cli_asset_cache_dir already documents:
     // the un-keyed `<root>/bin` path was never refreshed once a file existed,
     // so every bundle shipped the first binary ever cached there. That was
@@ -3969,32 +4089,18 @@ fn obtain_agent_binary_darwin(g: &Globals, root: &Path, goarch: &str) -> Result<
     // two sources, one of them frozen. So the Mac never received the memory
     // fix, the bus-principal reporting, or the native-backend support merged
     // for it, and reported 8 GB and tier 4 throughout.
-    let cache_dir = cli_asset_cache_dir(root);
-    let cached = cache_dir.join(format!("noo-node-agent-darwin-{goarch}"));
-    if let Ok(b) = std::fs::read(&cached) {
-        if !b.is_empty() {
-            return Ok(b);
-        }
-    }
-    // 2. The release asset paired with this CLI (private repo → `gh` must be
-    //    logged in; public repo → works anywhere). Cached for next time.
+    // 1+2. The release asset paired with this CLI, through the same verified
+    //    cache as every other bundled asset (i688): a cached copy only if its
+    //    sha256 is in the signed manifest, else fetched and checked. The old
+    //    unverified `noo-node-agent-darwin-<goarch>` cache file is not read.
     let triple = match goarch {
         "arm64" => "aarch64-apple-darwin",
         other => return Err(format!("no darwin release asset for goarch {other}")),
     };
     let asset = format!("noo-node-agent-{triple}");
-    let tag = format!("noo-cli-v{}", env!("CARGO_PKG_VERSION"));
-    let _ = std::fs::create_dir_all(&cache_dir);
-    // The shared release fetch (gh, then the direct GET where
-    // it helps; transient failures retried), and its classified cause kept
-    // for the final error instead of a silenced gh.
-    let fetch_err = match super::upgrade::fetch_tag_file(g, &tag, &asset) {
-        Ok(b) if !b.is_empty() => {
-            let _ = std::fs::write(&cached, &b);
-            return Ok(b);
-        }
-        Ok(_) => format!("{asset} in {tag} is empty"),
-        Err(e) => e.to_string(),
+    let fetch_err = match cached_release_asset(g, root, &asset) {
+        Ok(b) => return Ok(b),
+        Err(e) => e,
     };
     // 3. A source checkout with the cross-build script (dev controllers).
     let src = root.join("node-agent-go");
@@ -4014,10 +4120,12 @@ fn obtain_agent_binary_darwin(g: &Globals, root: &Path, goarch: &str) -> Result<
         return Err("build-cross.sh darwin build failed".into());
     }
     Err(format!(
-        "no darwin agent available: not cached at {}, the release fetch of {asset} from {tag} failed \
-         ({fetch_err}), and this is not a source checkout. \
-         Drop the binary at that cache path and re-run.",
-        cached.display()
+        "no darwin agent available: {asset} for {} could not be obtained verified ({fetch_err}), \
+         and this is not a source checkout. Put the release's {asset} (its sha256 must match the \
+         signed {}) at {} and re-run.",
+        env!("CARGO_PKG_VERSION"),
+        crate::release_sig::MANIFEST,
+        cli_asset_cache_dir(root).join(&asset).display()
     ))
 }
 
@@ -4297,6 +4405,9 @@ pub(crate) struct PendingApply {
     /// The node had never reported an apply before this staging (see the
     /// legacy fallback in `cluster_provision`).
     pub legacy: bool,
+    /// Only the applier bundle is staged (`applier_first_due`): once it is
+    /// in, the nodes stage restages the full bundle and waits again.
+    pub applier_first: bool,
 }
 
 /// How one pending node ended.
@@ -4339,7 +4450,27 @@ pub(crate) fn wait_applied_via(
     status_path: &dyn Fn(&str) -> String,
     noun: &str,
 ) -> Vec<(String, ApplyEnd)> {
+    wait_applied_timed_via(g, pending, budget_secs, every_secs, status_path, noun)
+        .into_iter().map(|(n, end, _)| (n, end)).collect()
+}
+
+/// [`wait_nodes_applied`], with the seconds each node took to resolve (the
+/// whole wait for one that never did): the nodes stage's result table.
+pub(crate) fn wait_nodes_applied_timed(g: &Globals, pending: &[PendingApply], budget_secs: u64, every_secs: u64) -> Vec<(String, ApplyEnd, u64)> {
+    wait_applied_timed_via(g, pending, budget_secs, every_secs, &|n| format!("/api/cluster/provision-bundle/{n}/status"), "node")
+}
+
+/// [`wait_applied_via`], timed.
+fn wait_applied_timed_via(
+    g: &Globals,
+    pending: &[PendingApply],
+    budget_secs: u64,
+    every_secs: u64,
+    status_path: &dyn Fn(&str) -> String,
+    noun: &str,
+) -> Vec<(String, ApplyEnd, u64)> {
     let mut ends: Vec<Option<ApplyEnd>> = pending.iter().map(|_| None).collect();
+    let mut took: Vec<u64> = vec![0; pending.len()];
     let mut fetched = vec![false; pending.len()];
     let mut slow_warned = vec![false; pending.len()];
     let started = std::time::Instant::now();
@@ -4366,6 +4497,7 @@ pub(crate) fn wait_applied_via(
                             ui::status_line(Glyph::Err, &format!("{}: the applier refused the bundle (exit {rc})", p.node))
                         });
                         ends[i] = Some(ApplyEnd::Applied { rc, msg });
+                        took[i] = started.elapsed().as_secs();
                         continue;
                     }
                     BundleVerdict::Fetched if !fetched[i] => {
@@ -4379,6 +4511,7 @@ pub(crate) fn wait_applied_via(
                 say(ui::status_line(Glyph::Warn, &format!(
                     "{}: applied without confirmation — this node's fetcher predates apply reports; the next restage confirms", p.node)));
                 ends[i] = Some(ApplyEnd::LegacyUnconfirmed);
+                took[i] = started.elapsed().as_secs();
                 continue;
             }
             if !fetched[i] && !slow_warned[i] && elapsed >= SLOW_TIMER_WARN_SECS {
@@ -4392,8 +4525,10 @@ pub(crate) fn wait_applied_via(
         std::thread::sleep(std::time::Duration::from_secs(every_secs));
     }
     drop(poll);
-    pending.iter().zip(ends).zip(fetched).map(|((p, end), f)| {
-        (p.node.clone(), end.unwrap_or(ApplyEnd::NotReported { fetched: f }))
+    let whole = started.elapsed().as_secs();
+    pending.iter().zip(ends).zip(fetched).zip(took).map(|(((p, end), f), t)| match end {
+        Some(end) => (p.node.clone(), end, t),
+        None => (p.node.clone(), ApplyEnd::NotReported { fetched: f }, whole),
     }).collect()
 }
 
@@ -4906,6 +5041,170 @@ pub(crate) const HARNESS_TLS_KEY: &str = "/run/credentials/noo-harness.service/n
 
 #[cfg(test)]
 mod tests {
+    /// i688: a fresh scratch dir per test (name + pid + counter).
+    fn asset_cache_dir(tag: &str) -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let d = std::env::temp_dir().join(format!("noo-i688-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn manifest_for(asset: &str, good: &[u8]) -> String {
+        format!("{}  {asset}\n", crate::addons::pins::sha256_hex(good))
+    }
+
+    /// The attack i688 names: a file of the RIGHT name and the RIGHT size,
+    /// planted in the controller's asset cache by anything running as the
+    /// operator user. It must be refused, the signed asset fetched in its
+    /// place, and the cache repaired.
+    #[test]
+    fn a_planted_cache_file_of_the_right_name_and_size_is_refused() {
+        let dir = asset_cache_dir("planted");
+        let good = b"the-signed-hostd-binary".to_vec();
+        let planted = b"the-planted-hostd-binary".to_vec()[..good.len()].to_vec();
+        assert_eq!(planted.len(), good.len());
+        assert_ne!(planted, good);
+        std::fs::write(dir.join("noo-hostd-x86_64-unknown-linux-gnu"), &planted).unwrap();
+        let mut fetched = Vec::new();
+        let got = super::release_asset_with(&dir, "noo-hostd-x86_64-unknown-linux-gnu",
+            &manifest_for("noo-hostd-x86_64-unknown-linux-gnu", &good),
+            &mut |n| { fetched.push(n.to_string()); Ok(good.clone()) }).expect("the signed asset");
+        assert_eq!(got, good, "the planted bytes were returned");
+        assert_eq!(fetched, ["noo-hostd-x86_64-unknown-linux-gnu"], "the refused copy was not re-fetched");
+        assert_eq!(std::fs::read(dir.join("noo-hostd-x86_64-unknown-linux-gnu")).unwrap(), good, "the cache was not repaired");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_verified_cached_asset_is_served_without_a_fetch() {
+        let dir = asset_cache_dir("hit");
+        let good = b"cli".to_vec();
+        std::fs::write(dir.join("noo-x86_64-unknown-linux-gnu"), &good).unwrap();
+        let got = super::release_asset_with(&dir, "noo-x86_64-unknown-linux-gnu",
+            &manifest_for("noo-x86_64-unknown-linux-gnu", &good),
+            &mut |n| panic!("fetched {n} on a verified hit")).unwrap();
+        assert_eq!(got, good);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A download that does not match is never returned and never cached.
+    #[test]
+    fn a_download_that_does_not_match_the_manifest_is_refused_and_not_cached() {
+        let dir = asset_cache_dir("badfetch");
+        let r = super::release_asset_with(&dir, "noo-x86_64-unknown-linux-gnu",
+            &manifest_for("noo-x86_64-unknown-linux-gnu", b"signed"),
+            &mut |_| Ok(b"swapped".to_vec()));
+        let e = r.expect_err("a mismatched download was accepted");
+        assert!(e.contains("does not match the signed manifest"), "{e}");
+        assert!(!dir.join("noo-x86_64-unknown-linux-gnu").exists(), "a mismatched download was cached");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An asset the signed manifest does not list is refused outright: no
+    /// fetch, no cache read (a planted file cannot name its own digest).
+    #[test]
+    fn an_asset_missing_from_the_signed_manifest_is_refused_without_a_fetch() {
+        let dir = asset_cache_dir("unlisted");
+        std::fs::write(dir.join("noo-node-agent-aarch64-apple-darwin"), b"planted").unwrap();
+        let e = super::release_asset_with(&dir, "noo-node-agent-aarch64-apple-darwin",
+            &manifest_for("noo-x86_64-unknown-linux-gnu", b"cli"),
+            &mut |n| panic!("fetched {n} for an unlisted asset")).expect_err("an unlisted asset was served");
+        assert!(e.contains("not listed in the signed"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The manifest itself: a cached pair that verifies is used as is; one
+    /// that does not is fetched again; a fetched pair that does not verify
+    /// is refused and not cached.
+    #[test]
+    fn the_cached_manifest_is_used_only_when_its_signature_verifies() {
+        let m = crate::release_sig::MANIFEST;
+        let sig = format!("{m}.sig");
+        // Every pair below is "signed" when its sig is "good-sig" (the stub
+        // key); "real" names 0.0.0, "old" is a genuine manifest of 0.0.-1.
+        let row = |v: &str| format!("{}  {}\n", crate::addons::pins::sha256_hex(format!("{v}\n").as_bytes()), crate::release_sig::VERSION_ASSET);
+        let real = format!("aa  noo-x86_64-unknown-linux-gnu\n{}", row("0.0.0"));
+        let old = format!("bb  noo-x86_64-unknown-linux-gnu\n{}", row("0.0.-1"));
+        let verify = |_: &[u8], s: &str| if s == "good-sig" { Ok(()) } else { Err("bad sig".to_string()) };
+
+        let dir = asset_cache_dir("man-hit");
+        std::fs::write(dir.join(m), &real).unwrap();
+        std::fs::write(dir.join(&sig), "good-sig").unwrap();
+        let got = super::manifest_with(&dir, "0.0.0", &mut |n| panic!("fetched {n} on a verified hit"), &verify).unwrap();
+        assert_eq!(got, (real.clone(), "good-sig".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A forged cached manifest (signature fails) is fetched again.
+        let dir = asset_cache_dir("man-planted");
+        std::fs::write(dir.join(m), "planted-manifest").unwrap();
+        std::fs::write(dir.join(&sig), "forged-sig").unwrap();
+        let mut fetched = Vec::new();
+        let got = super::manifest_with(&dir, "0.0.0", &mut |n| {
+            fetched.push(n.to_string());
+            Ok(if n.ends_with(".sig") { b"good-sig".to_vec() } else { real.clone().into_bytes() })
+        }, &verify).unwrap();
+        assert_eq!(got.0, real, "the planted manifest was used");
+        assert_eq!(fetched, [m.to_string(), sig.clone()]);
+        assert_eq!(std::fs::read_to_string(dir.join(m)).unwrap(), real, "the cache was not repaired");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // ROLLBACK through the cache: an older release's GENUINE, validly
+        // signed manifest planted in this version's dir is refused and
+        // this version's fetched in its place.
+        let dir = asset_cache_dir("man-rollback");
+        std::fs::write(dir.join(m), &old).unwrap();
+        std::fs::write(dir.join(&sig), "good-sig").unwrap();
+        let got = super::manifest_with(&dir, "0.0.0", &mut |n| {
+            Ok(if n.ends_with(".sig") { b"good-sig".to_vec() } else { real.clone().into_bytes() })
+        }, &verify).unwrap();
+        assert_eq!(got.0, real, "an older release's signed manifest was used for this version");
+        assert_eq!(std::fs::read_to_string(dir.join(m)).unwrap(), real);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // ROLLBACK through the fetch: a mirror serving the older genuine
+        // pair for this version is refused and nothing is cached.
+        let dir = asset_cache_dir("man-rollback-fetch");
+        let e = super::manifest_with(&dir, "0.0.0", &mut |n| {
+            Ok(if n.ends_with(".sig") { b"good-sig".to_vec() } else { old.clone().into_bytes() })
+        }, &verify).expect_err("an older release's manifest was accepted for this version");
+        assert!(e.contains("is not that release's"), "{e}");
+        assert!(!dir.join(m).exists(), "a wrong-version manifest was cached");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A forged fetch (signature fails) is refused and not cached.
+        let dir = asset_cache_dir("man-badfetch");
+        let e = super::manifest_with(&dir, "0.0.0", &mut |n| {
+            Ok(if n.ends_with(".sig") { b"forged-sig".to_vec() } else { real.clone().into_bytes() })
+        }, &verify).expect_err("an unverified manifest was accepted");
+        assert!(e.contains("does not verify"), "{e}");
+        assert!(!dir.join(m).exists(), "an unverified manifest was cached");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every path that puts a release asset into the cache or a bundle goes
+    /// through the verified gate: the darwin agent no longer reads its old
+    /// by-name cache file, and the upgrade pre-warm neither writes the cache
+    /// nor downloads past the gate.
+    #[test]
+    fn every_release_asset_fill_goes_through_the_verified_gate() {
+        use crate::test_src::{fn_body, own_code};
+        let prov = own_code(include_str!("provision.rs"));
+        let darwin = fn_body(&prov, "fn obtain_agent_binary_darwin(");
+        assert!(darwin.contains("cached_release_asset(g, root, &asset)"), "the darwin agent skips the gate");
+        assert!(!darwin.contains("fetch_tag_file("), "the darwin agent fetches past the gate");
+        assert!(!darwin.contains("cli_asset_cache_dir(root).join(format!"), "the darwin agent reads a by-name cache file");
+        let up = own_code(include_str!("upgrade.rs"));
+        let fill = fn_body(&up, "fn upload_cli_assets(");
+        for bad in ["std::fs::write(", "download_asset(", "fetch_release_file(", "std::fs::read("] {
+            assert!(!fill.contains(bad), "upload_cli_assets fills the cache past the gate: {bad}");
+        }
+        assert!(fill.contains("cached_release_asset(g, &root, name)"));
+        assert!(fill.contains("cached_release_asset(g, &root, &asset)"));
+        assert!(fill.contains("verified_release_manifest(g, &root)"));
+    }
+
     /// What a root script prints never reaches our stdout (`--json` carries
     /// one document there): it goes to stderr. The run is real (`env` in
     /// place of sudo): the script's own stderr line proves it ran.

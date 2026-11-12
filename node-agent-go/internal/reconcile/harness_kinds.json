@@ -42,8 +42,6 @@
         "Grep",
         "LS",
         "NotebookRead",
-        "WebFetch",
-        "WebSearch",
         "TodoRead",
         "TodoWrite"
       ],
@@ -66,7 +64,9 @@
           "acceptEdits",
           "--permission-prompts",
           "none",
-          "--no-session-persistence"
+          "--no-session-persistence",
+          "--disallowedTools",
+          "WebFetch,WebSearch"
         ],
         "model_url_env": "ANTHROPIC_BASE_URL",
         "model_env": "ANTHROPIC_MODEL",
@@ -80,7 +80,10 @@
           "CLAUDE_CODE_SUBAGENT_MODEL"
         ],
         "home_env": "CLAUDE_CONFIG_DIR",
-        "context_window_env": "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
+        "context_window_env": "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+        "settings_json": {
+          "skipWebFetchPreflight": true
+        }
       },
       "launch_slim": {
         "command": [
@@ -103,7 +106,9 @@
           "--no-session-persistence",
           "--system-prompt-file",
           "{system_prompt_file}",
-          "--disable-slash-commands"
+          "--disable-slash-commands",
+          "--disallowedTools",
+          "WebFetch,WebSearch"
         ],
         "model_url_env": "ANTHROPIC_BASE_URL",
         "model_env": "ANTHROPIC_MODEL",
@@ -118,7 +123,10 @@
         ],
         "home_env": "CLAUDE_CONFIG_DIR",
         "context_window_env": "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
-        "system_prompt_file": "noomesh-system-prompt.txt"
+        "system_prompt_file": "noomesh-system-prompt.txt",
+        "settings_json": {
+          "skipWebFetchPreflight": true
+        }
       },
       "telemetry_off": {
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",

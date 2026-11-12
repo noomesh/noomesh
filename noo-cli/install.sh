@@ -1,11 +1,20 @@
 #!/bin/sh
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026 PersonifAI LLC
+{ # The whole script is ONE brace group, closed on its last line (2026-11-12).
+  # A shell parses a group completely before running any of it, so a body cut
+  # short anywhere after this line is a syntax error and NOTHING runs
+  # (tests/test_install_line_fails_loudly.py truncates it at every point).
 
 # noo CLI installer — zero-Python standalone control plane for Mesh.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/noomesh/noomesh/main/noo-cli/install.sh | sh
+#   curl -fsSL https://github.com/noomesh/noomesh/releases/latest/download/install.sh -o install.sh && sh install.sh
+#
+# Download, THEN run: with `curl … | sh` a failed download hands sh an empty
+# script and the line exits 0, so a stranger saw a curl error and then
+# "noo: not found" (install matrix, 2026-11-12). The `&&` form exits
+# non-zero in bash, dash and zsh, and leaves the script to read.
 #
 # What it does: detects your OS/arch, downloads the matching static musl
 # `noo` binary from the latest `noo-cli-v*` GitHub release, verifies its
@@ -53,6 +62,7 @@ set -eu
 REPO="${NOO_CLI_REPO:-noomesh/noomesh}"
 GITHUB_API="https://api.github.com/repos/${REPO}/releases"
 GITHUB_DL="https://github.com/${REPO}/releases/download"
+GITHUB_LATEST="https://github.com/${REPO}/releases/latest"
 
 # ---- pinned release-verification keys (an earlier change slice B) ----------------
 #
@@ -312,6 +322,36 @@ pick_cli_tag() {
             }'
 }
 
+# The newest FINAL noo-cli tag, from the redirect of github.com's
+# releases/latest page: NOT the API. The anonymous API allows 60 requests an
+# hour per IP, so a stranger behind shared NAT (an office, carrier NAT, a CI
+# runner) got "403" and no install (install matrix, 2026-11-12, macos-15).
+# Only noo-cli FINALS are created with --latest (noo-cli-release.yml); rcs and
+# stack releases are --latest=false, so this redirect names the noo-cli final
+# by construction. Prints the tag, or nothing if the redirect names none.
+latest_from_redirect() {
+    if have curl; then
+        curl -fsS -o /dev/null -w '%{redirect_url}' --retry $((DL_ATTEMPTS - 1)) --retry-max-time 60 \
+            "$GITHUB_LATEST" 2>/dev/null
+    elif have wget; then
+        wget --max-redirect=0 -S -O /dev/null "$GITHUB_LATEST" 2>&1 | sed -n 's/^ *[Ll]ocation: *//p' | tail -n 1
+    fi | tr -d '\r' | sed -nE 's#^.*/releases/tag/(noo-cli-v[^/?[:space:]]+)$#\1#p'
+}
+
+# The API path: a prerelease (NOO_CLI_PRERELEASE=1) is never "latest", so it
+# needs the listing; it is also the fallback when the redirect names no
+# noo-cli tag. `gh` first (authenticated, no anonymous limit), then curl.
+latest_from_api() {
+    _v=""
+    if have gh; then
+        _v="$(gh api "repos/${REPO}/releases?per_page=30" 2>/dev/null | pick_cli_tag || true)"
+    fi
+    if [ -z "$_v" ]; then
+        _v="$(fetch "${GITHUB_API}?per_page=30" | pick_cli_tag || true)"
+    fi
+    printf '%s' "$_v"
+}
+
 fetch() {
     _url="$1"
     if have curl; then
@@ -544,20 +584,14 @@ else
         esac
     else
         info "Resolving latest noo-cli release..."
-        # Resolution half of the same rule as download(): `gh` is an optional
-        # first path (authenticated, no anonymous rate limit); the public
-        # releases API via curl is the default and the fallback.
         version=""
-        if have gh; then
-            version="$(gh api "repos/${REPO}/releases?per_page=30" 2>/dev/null \
-                | pick_cli_tag || true)"
+        if [ "${NOO_CLI_PRERELEASE:-0}" != 1 ]; then
+            version="$(latest_from_redirect || true)"
         fi
         if [ -z "$version" ]; then
-            # The first final noo-cli-v* tag in the releases JSON (namespaced
-            # tags keep noo-cli releases distinct from other components).
-            version="$(fetch "${GITHUB_API}?per_page=30" | pick_cli_tag || true)"
+            version="$(latest_from_api)"
         fi
-        [ -n "$version" ] || err "could not resolve a final 'noo-cli-v*' release from ${GITHUB_API} — check the network (or an authenticated gh), or set NOO_CLI_VERSION to pin one"
+        [ -n "$version" ] || err "could not resolve a final 'noo-cli-v*' release from ${GITHUB_LATEST} or ${GITHUB_API} — check the network, or set NOO_CLI_VERSION to pin one"
     fi
     bin_url="${GITHUB_DL}/${version}/${asset}"
     sum_url="${GITHUB_DL}/${version}/${asset}.sha256"
@@ -771,3 +805,4 @@ fi
 info ""
 
 exit 0
+}

@@ -54,6 +54,10 @@ pub(crate) enum Recipient {
     Unheld(Vec<String>),
     /// Refuse: nothing reads `to`. The closest registered names, if any.
     Unknown(Vec<String>),
+    /// Refuse: `to` is a RETIRED mailbox (0.6.24). Nothing queues to a dead
+    /// name. The account's recently seen chosen names, when the caller may
+    /// see them.
+    Retired(chrono::DateTime<chrono::Utc>, Vec<String>),
 }
 
 /// How many close names a refusal or a warning lists.
@@ -118,6 +122,37 @@ pub(crate) fn refusal(to: &str, candidates: &[String]) -> String {
     }
 }
 
+/// The refusal for a [`Recipient::Retired`].
+pub(crate) fn retired_refusal(to: &str, at: &chrono::DateTime<chrono::Utc>, suggestions: &[String]) -> String {
+    let head = format!(
+        "'{to}' retired {}: its conversation ended and nothing reads it, so the message was not sent",
+        at.to_rfc3339()
+    );
+    if suggestions.is_empty() {
+        format!("{head}; noo_agent_directory lists who is online")
+    } else {
+        format!("{head}; recently seen in that account: {}", suggestions.join(", "))
+    }
+}
+
+/// A reply in `thread` to `to`: refused when `to` took part in that thread
+/// only as an earlier, retired generation of a reused name (0.6.24). The
+/// mail was meant for the conversation that ended, not for whoever holds
+/// the name now.
+pub(crate) async fn thread_reply_refusal(db: &PgPool, to: &str, thread: Option<&str>) -> Result<Option<String>, sqlx::Error> {
+    let Some(t) = thread.filter(|t| !t.trim().is_empty()) else { return Ok(None) };
+    if !to.contains(crate::auth::CONNECTION_SEP) {
+        return Ok(None);
+    }
+    if crate::repo::agent_names::only_past_generation_in_thread(db, t, to).await? {
+        return Ok(Some(format!(
+            "'{to}' in thread '{t}' was an earlier conversation that has retired; the name now belongs to a different \
+             conversation, so the reply was not sent"
+        )));
+    }
+    Ok(None)
+}
+
 /// The warning a [`Recipient::Unheld`] send carries.
 pub(crate) fn unheld_warning(to: &str, candidates: &[String]) -> String {
     let head = format!(
@@ -144,6 +179,25 @@ pub(crate) fn thread_needs_an_id(to: &str, thread_id: Option<&str>) -> Result<()
 /// refusal or warning may list (`None` = every account: an operator); a name
 /// in another account is still delivered when it is held, only not suggested.
 pub(crate) async fn check(db: &PgPool, to: &str, scope: Option<&str>) -> Result<Recipient, sqlx::Error> {
+    // The mailbox directory first (0.6.24): a retired name may still have
+    // an old MCP session row, which would read as held below.
+    if let Some((account, label)) = to.split_once(crate::auth::CONNECTION_SEP) {
+        if let Some(r) = crate::repo::agent_names::name(db, account, label).await? {
+            let Some(at) = r.retired_at else { return Ok(Recipient::Known) };
+            let suggest = scope.is_none_or(|s| s == account);
+            let names = if suggest {
+                let secs = crate::agent_mailbox::Windows::current().recent.as_secs() as i64;
+                crate::repo::agent_names::recent_chosen(db, account, secs)
+                    .await?
+                    .into_iter()
+                    .map(|l| format!("{account}{}{l}", crate::auth::CONNECTION_SEP))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            return Ok(Recipient::Retired(at, names));
+        }
+    }
     let standing = standing(db, to).await?;
     if standing == Standing::Held {
         return Ok(Recipient::Known);

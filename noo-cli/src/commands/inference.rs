@@ -60,6 +60,66 @@ fn build_run_request(args: &[String]) -> Result<(serde_json::Value, Option<Strin
     Ok((body, user))
 }
 
+const RUN_PATH: &str = "/api/inference";
+
+/// What `inference run` got back.
+#[derive(Debug, PartialEq)]
+enum RunOutcome {
+    /// The whole reply and its answer text (never empty).
+    Answer(serde_json::Value, String),
+    Failed { kind: &'static str, msg: String, hint: Option<&'static str> },
+}
+
+/// Judge the gateway's reply. An empty answer is never a success (120:
+/// qwen3 on ollama printed "" and exited 0): the gateway's
+/// `empty_response` refusal is one line with its reason, and a 200 whose
+/// answer is empty (an older gateway) fails the same way.
+fn run_outcome(sent: Result<serde_json::Value, (u16, String)>) -> RunOutcome {
+    const HINT: Option<&str> = Some("a reasoning model may need a larger --max-tokens; `--json` shows the reply");
+    match sent {
+        Err((status, body)) => {
+            let v = serde_json::from_str::<serde_json::Value>(&body).ok();
+            match v.as_ref().filter(|v| v["code"] == "empty_response") {
+                Some(v) => RunOutcome::Failed {
+                    kind: "empty_response",
+                    msg: v["error"].as_str().unwrap_or("the model returned an empty answer").to_string(),
+                    hint: HINT,
+                },
+                None => RunOutcome::Failed {
+                    kind: "remote_error",
+                    msg: crate::http::remote_error_message(status, RUN_PATH, &body),
+                    hint: None,
+                },
+            }
+        }
+        Ok(resp) => {
+            if resp["success"] == serde_json::json!(false) {
+                return RunOutcome::Failed {
+                    kind: "remote_error",
+                    msg: resp["error"].as_str().unwrap_or("the gateway reported a failure").to_string(),
+                    hint: None,
+                };
+            }
+            // The Rust gateway wraps the payload: {"success": true, "data": {"response": …}}.
+            // Older/direct backends returned top-level "response"/"text" — accept all.
+            let text = resp["data"]["response"]
+                .as_str()
+                .or_else(|| resp["response"].as_str())
+                .or_else(|| resp["text"].as_str())
+                .unwrap_or_default()
+                .to_string();
+            if text.trim().is_empty() {
+                return RunOutcome::Failed {
+                    kind: "empty_response",
+                    msg: "the gateway reported success but the answer is empty".into(),
+                    hint: HINT,
+                };
+            }
+            RunOutcome::Answer(resp, text)
+        }
+    }
+}
+
 /// `noo inference run <prompt> [-m MODEL] [--node ID [--strict-node]]
 ///  [--raw] [--max-tokens N] [--temperature F]`
 /// POST /api/inference. Without `--raw` the gateway runs the full pipeline
@@ -92,18 +152,21 @@ pub fn inference_run(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
 
     // Inference is slow — match the Python CLI's 120s unless --timeout given.
-    let resp = post_json(g, "/api/inference", &body, true, 120);
+    let sent = crate::http::request_status(g, "POST", RUN_PATH, Some(&body), true, 120);
+    let (resp, text) = match run_outcome(sent) {
+        RunOutcome::Answer(resp, text) => (resp, text),
+        RunOutcome::Failed { kind, msg, hint } => crate::output::fail(
+            g.json,
+            crate::output::ExitCode::RemoteError,
+            kind,
+            &msg,
+            hint,
+        ),
+    };
     if g.json {
         println!("{resp}");
         return Ok(0);
     }
-    // The Rust gateway wraps the payload: {"success": true, "data": {"response": …}}.
-    // Older/direct backends returned top-level "response"/"text" — accept all.
-    let text = resp["data"]["response"]
-        .as_str()
-        .or_else(|| resp["response"].as_str())
-        .or_else(|| resp["text"].as_str())
-        .unwrap_or_default();
     // `-n` is a preference: say when another node answered.
     if let Some(node) = resp["data"]["requested_node"].as_str() {
         let model = resp["data"]["model"].as_str().unwrap_or("another model");
@@ -185,6 +248,36 @@ mod tests {
         assert!(body.get("context").is_none(), "{body}");
         assert_eq!(body["node"], "awolf");
         assert_eq!(body["max_tokens"], 512);
+    }
+
+    /// 120: the gateway's 502 `empty_response` is one line with its reason;
+    /// a 200 with an empty answer (an older gateway) fails too; a real
+    /// answer passes; any other error keeps the generic wording.
+    #[test]
+    fn an_empty_answer_never_exits_zero() {
+        use serde_json::json;
+        let refusal = json!({"success": false, "code": "empty_response",
+            "error": "the model returned only reasoning and no answer (finish_reason: stop)",
+            "finish_reason": "stop", "reasoning": "five words", "node": "pop-os"}).to_string();
+        match run_outcome(Err((502, refusal))) {
+            RunOutcome::Failed { kind, msg, hint } => {
+                assert_eq!(kind, "empty_response");
+                assert_eq!(msg, "the model returned only reasoning and no answer (finish_reason: stop)");
+                assert!(hint.is_some());
+            }
+            other => panic!("{other:?}"),
+        }
+        for old in [json!({"success": true, "data": {"response": "", "node": "pop-os"}}), json!({"success": true, "data": {"response": "  \n"}})] {
+            assert!(matches!(run_outcome(Ok(old.clone())), RunOutcome::Failed { kind: "empty_response", .. }), "{old}");
+        }
+        assert!(matches!(run_outcome(Ok(json!({"success": false, "error": "boom"}))),
+            RunOutcome::Failed { kind: "remote_error", ref msg, .. } if msg == "boom"));
+        match run_outcome(Err((500, "{\"detail\":\"down\"}".into()))) {
+            RunOutcome::Failed { kind, msg, .. } => { assert_eq!(kind, "remote_error"); assert!(msg.contains("down") && msg.contains("500"), "{msg}"); }
+            other => panic!("{other:?}"),
+        }
+        let ok = json!({"success": true, "data": {"response": "Hello there, how are you?"}});
+        assert_eq!(run_outcome(Ok(ok.clone())), RunOutcome::Answer(ok, "Hello there, how are you?".into()));
     }
 
     #[test]

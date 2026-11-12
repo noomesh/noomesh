@@ -407,7 +407,14 @@ The agent's only registry pull is that fallback; a test
 - The heartbeat carries `image_sources`: `[{image, source: rail|local|registry, image_id}]`.
 - `noo cluster verify` adds **image sources** (WARN naming every image not
   from the rail) and **images staged** (WARN naming every running placement
-  whose image is not staged for the node's architecture).
+  whose image is not staged for the node's architecture), and **door pin**
+  for a node running a backend whose stunnel door is pinned
+  (`config/door-images.json`, today vllm's). It asks the gateway's manifest
+  route which digest that door was staged by for the node's architecture.
+  It WARNs when the door is staged by another digest, by name only, or not
+  at all, and names `noo upgrade --stack`, which restages every door pin by
+  its digest. Run it before rolling 0.6.22, whose node agent refuses a
+  pinned door staged by anything but its pin.
 - The gateway refuses a running placement on a node reporting `rail` whose image it
   can name and that is not staged (`409 image X for <arch> is not staged on
   the controller`), unless `--force`; 

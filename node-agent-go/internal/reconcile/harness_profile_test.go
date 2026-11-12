@@ -94,20 +94,20 @@ func TestHarnessKindRefusalProfiledRunsAfterTheExistingChecks(t *testing.T) {
 	}
 	present := func(string) bool { return true }
 	prof := &harnessprofile.Profile{Tier: 4, ForeignKinds: []string{}}
-	if got := harnessKindRefusalProfiled(h("bogus"), chat, present, present, prof, "n"); got == "" || got[:22] != "unknown harness kind \"" {
+	if got := harnessKindRefusalProfiled(h("bogus"), chat, present, present, prof, "n", nil); got == "" || got[:22] != "unknown harness kind \"" {
 		t.Errorf("unknown kind must keep its own refusal: %q", got)
 	}
-	if got := harnessKindRefusalProfiled(h("claude-code"), chat, present, func(string) bool { return false }, prof, "n"); got == "" ||
+	if got := harnessKindRefusalProfiled(h("claude-code"), chat, present, func(string) bool { return false }, prof, "n", nil); got == "" ||
 		got == profileKindRefusal("claude-code", prof, "n") {
 		t.Errorf("a missing CLI is refused for that first: %q", got)
 	}
-	if got := harnessKindRefusalProfiled(h("copilot"), chat, present, present, prof, "n"); got != profileKindRefusal("copilot", prof, "n") || got == "" {
+	if got := harnessKindRefusalProfiled(h("copilot"), chat, present, present, prof, "n", nil); got != profileKindRefusal("copilot", prof, "n") || got == "" {
 		t.Errorf("profile refusal expected: %q", got)
 	}
-	if got := harnessKindRefusalProfiled(h("copilot"), chat, present, present, nil, "n"); got != "" {
+	if got := harnessKindRefusalProfiled(h("copilot"), chat, present, present, nil, "n", nil); got != "" {
 		t.Errorf("no profile must not refuse: %q", got)
 	}
-	if got := harnessKindRefusalProfiled(h("noo"), chat, present, present, prof, "n"); got != "" {
+	if got := harnessKindRefusalProfiled(h("noo"), chat, present, present, prof, "n", nil); got != "" {
 		t.Errorf("noo must not be refused: %q", got)
 	}
 }

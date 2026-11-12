@@ -279,7 +279,7 @@ on the tailnet. It ends with a silent re-audit and `offboard complete`.
 ### `noo onboard` — Setup wizard
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo onboard` | `[--tui\|--web [--port <n>]] [--non-interactive\|--ci] [--dry-run] [--reconfigure] [--standalone [--bundle <url\|path>]] [--from-archive <f> [--passphrase-file <f>]] [--only <sections>] [--skip-tailscale] [--skip-security] [--skip-storage] [--skip-services] [--skip-trellion] [--skip-model] [--skip-channels] [--mcp-door\|--no-mcp-door] [--skip-addons] [--secrets-backend sops]` | Run the setup wizard to bootstrap a controller (secrets, PKI, .env, compose, model) |
+| `noo onboard` | `[--tui\|--web [--port <n>]] [--non-interactive\|--ci] [--dry-run] [--reconfigure] [--standalone [--bundle <url\|path>]] [--from-archive <f> [--passphrase-file <f>]] [--only <sections>] [--min-free-gb <n>] [--skip-tailscale] [--skip-security] [--skip-storage] [--skip-services] [--skip-trellion] [--skip-model] [--skip-channels] [--mcp-door\|--no-mcp-door] [--skip-addons] [--secrets-backend sops]` | Run the setup wizard to bootstrap a controller (secrets, PKI, .env, compose, model) |
 
 ### `noo enroll` — Join this machine to a noomesh fleet as a worker
 | Command | Arguments | What it does |
@@ -350,7 +350,7 @@ on the tailnet. It ends with a silent re-audit and `offboard complete`.
 | `noo addons untrust-key` | `<name> [<pubkey>] [--dev]` | Stop trusting a third-party add-on's signing key; --dev removes its dev key(s) |
 | `noo addons registry-login` | `<addon> [--registry <root>] [--from-file <path>] [--clear]` | Set a third-party add-on's private-registry pull token (stdin or file); --clear drops it |
 | `noo addons set` | `<name> --delegate tasks\|off` | Let an add-on act on a person's tasks (needs its manifest to declare it too) |
-| `noo addons setup` | `<name> --plan [--node <node>] [--set <slot>=<id>@<rev>]...` | Plan an add-on's setup from controller state, read-only: each step done, to do or stopped |
+| `noo addons setup` | `<name> [--plan] [--key <pubkey> --registry <root>] [--node <node>] [--set <slot>=<id>@<rev>]...` | Set an add-on up: run the to-do steps, stop at every decision; --plan only reads |
 | `noo addons disable` | `<name>` | Declare an add-on OFF in noomesh.yaml; restart applies it |
 | `noo addons upgrade` | `[<name>...] [--check] [--allow-downgrade] [--lock <path\|https-url>]` | Re-resolve add-ons' signed locks for this stack, pull by digest and re-pin |
 | `noo addons verify` | — | Re-verify add-on locks offline and compare local and running images with the pins |

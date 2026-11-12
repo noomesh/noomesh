@@ -61,7 +61,10 @@ pub async fn is_party(db: &PgPool, thread: &str, agent: &str) -> Result<Option<b
         return Ok(None);
     }
     let party: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM noo_agent_messages WHERE thread_id = $1 AND (from_agent = $2 OR to_agent = $2))",
+        // Mail of a past generation of a reused name is not this holder's:
+        // a new holder is no party to the threads its predecessor was in.
+        "SELECT EXISTS (SELECT 1 FROM noo_agent_messages m WHERE m.thread_id = $1 AND (m.from_agent = $2 OR m.to_agent = $2) \
+           AND NOT EXISTS (SELECT 1 FROM noo_agent_orphans o WHERE o.message_id = m.id))",
     )
     .bind(thread)
     .bind(agent)
@@ -106,6 +109,19 @@ pub struct Filter<'a> {
     /// with no acting identity should reach that.
     pub reader: Option<&'a str>,
     pub limit: i64,
+    /// Mail orphaned by a retired name (migration 119). Hidden from every
+    /// ordinary view: a name that is reused must not inherit the unread
+    /// mail of the conversation that held it before. `OnlyOf(account)` is
+    /// the account owner's view of exactly that mail.
+    pub orphans: OrphanView<'a>,
+}
+
+/// See [`Filter::orphans`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanView<'a> {
+    #[default]
+    Hide,
+    OnlyOf(&'a str),
 }
 
 /// A row as the API returns it. Sealed bodies are OPENED here with the
@@ -162,9 +178,13 @@ fn row_json(r: &sqlx::postgres::PgRow) -> Value {
 /// `owner/…` session), plus thread-addressed posts in threads it took part
 /// in. `split_part(name, '/', 1)` is the account (`auth::account_of`); for a
 /// bare account it is the name itself, already covered.
+// The thread arm counts only participation of THIS generation of the name:
+// mail orphaned from a past holder of a reused name (migration 119) does not
+// make the new holder a party to that holder's threads.
 const AGENT_CLAUSE: &str = " AND (from_agent = $N OR to_agent = $N OR to_agent = split_part($N, '/', 1) \
     OR (to_agent = 'thread' AND thread_id IN \
-    (SELECT thread_id FROM noo_agent_messages WHERE from_agent = $N OR to_agent = $N)))";
+    (SELECT t.thread_id FROM noo_agent_messages t WHERE (t.from_agent = $N OR t.to_agent = $N) \
+       AND NOT EXISTS (SELECT 1 FROM noo_agent_orphans o WHERE o.message_id = t.id))))";
 
 /// An ACCOUNT's view: [`AGENT_CLAUSE`] widened from one name to the name
 /// and everything under `<name>/`. `starts_with` rather than `LIKE`, so a
@@ -216,6 +236,10 @@ pub async fn list(db: &PgPool, f: &Filter<'_>) -> Result<Vec<Value>, sqlx::Error
     if let Some(v) = f.user { push(&mut sql, " AND from_user = $N", v); }
     if let Some(v) = f.node { push(&mut sql, " AND from_node = $N", v); }
     if let Some(v) = f.harness { push(&mut sql, " AND from_harness = $N", v); }
+    match f.orphans {
+        OrphanView::Hide => sql.push_str(" AND NOT EXISTS (SELECT 1 FROM noo_agent_orphans o WHERE o.message_id = noo_agent_messages.id)"),
+        OrphanView::OnlyOf(account) => push(&mut sql, " AND EXISTS (SELECT 1 FROM noo_agent_orphans o WHERE o.message_id = noo_agent_messages.id AND o.account = $N)", account),
+    }
     let since_idx = f.since.map(|_| { n += 1; sql.push_str(&format!(" AND ts >= ${n}")); n });
     // Past this point `push` is not used again: `since_idx` above touched
     // `n` directly, so the closure's borrow is over and the unread clause
@@ -315,6 +339,7 @@ pub async fn threads(db: &PgPool, agent: Option<&str>, owner: Option<&str>, limi
         "SELECT thread_id, COUNT(*) AS n, MIN(ts) AS started, MAX(ts) AS last, \
                 array_agg(DISTINCT from_agent) AS senders, array_agg(DISTINCT to_agent) AS recipients \
          FROM noo_agent_messages WHERE 1=1{clause} \
+           AND NOT EXISTS (SELECT 1 FROM noo_agent_orphans o WHERE o.message_id = noo_agent_messages.id) \
          GROUP BY thread_id ORDER BY MAX(ts) DESC LIMIT $2"
     );
     let rows = sqlx::query(sqlx::AssertSqlSafe(&*sql))
@@ -416,7 +441,7 @@ mod owner_tests {
     fn a_sessions_list_includes_mail_to_its_account() {
         assert!(AGENT_CLAUSE.contains("to_agent = split_part($N, '/', 1)"), "{AGENT_CLAUSE}");
         // the thread seat stays the exact name: account mail does not seat a session in a thread
-        let sub = AGENT_CLAUSE.split("SELECT thread_id").nth(1).unwrap();
+        let sub = AGENT_CLAUSE.split("SELECT t.thread_id").nth(1).unwrap();
         assert!(!sub.contains("split_part"), "{sub}");
     }
 

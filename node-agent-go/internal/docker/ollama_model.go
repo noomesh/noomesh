@@ -63,6 +63,11 @@ type PullOllamaModelResult struct {
 	GGUF   string `json:"gguf"`
 	// "host" (an ollama binary on PATH) or "container" (noo-ollama).
 	Via string `json:"via"`
+	// A mirror-staged registry tag (ollama_mirror.go): the sha256 of the
+	// manifest ollama now lists the tag with, and how many blobs it names.
+	// Empty for a GGUF + Modelfile import.
+	ManifestSHA256 string `json:"manifest_sha256,omitempty"`
+	Blobs          int    `json:"blobs,omitempty"`
 }
 
 // safeArtifactName mirrors the gateway's `valid_artifact_name`: a name is a
@@ -144,6 +149,33 @@ func (c *Client) PullOllamaModel(ctx context.Context, name string) (*PullOllamaM
 	// Multi-GB weights: never leave one behind because a create failed.
 	defer func() { _ = os.RemoveAll(work) }()
 
+	// A registry tag staged as a MIRROR (the manifest and every blob) is
+	// installed as such, unless a plain `<name>.Modelfile` exists: that one
+	// has always come first, and still does.
+	gatewayLacksMirror := false
+	if r, ok := mirrorRefOf(name); ok {
+		plainPresent := false
+		if !cands[0].staged {
+			_, perr := lookupArtifactManifest(ctx, "modelfile", cands[0].base+".Modelfile")
+			if perr == nil {
+				plainPresent = true
+			} else if !errors.Is(perr, ErrArtifactAbsent) {
+				return nil, fmt.Errorf("could not ask the controller for %s.Modelfile: %w", cands[0].base, perr)
+			}
+		}
+		if !plainPresent {
+			gm, merr := awaitArtifactManifest(ctx, "ollamamanifest", r.stem+mirrorManifestSuffix)
+			switch {
+			case merr == nil:
+				return c.importMirror(ctx, name, r, gm, cacheURL, work)
+			case errors.Is(merr, ErrArtifactKindUnknown):
+				gatewayLacksMirror = true
+			case !errors.Is(merr, ErrArtifactAbsent):
+				return nil, fmt.Errorf("could not ask the controller for %s%s: %w", r.stem, mirrorManifestSuffix, merr)
+			}
+		}
+	}
+
 	fetch := func(kind, artifact string) (string, string, error) {
 		// The GGUF behind a Modelfile can be GBs: wait out the gateway's hash.
 		m, err := awaitArtifactManifest(ctx, kind, artifact)
@@ -185,10 +217,14 @@ func (c *Client) PullOllamaModel(ctx context.Context, name string) (*PullOllamaM
 		}
 		if cd == cands[len(cands)-1] {
 			if cd.staged {
+				older := ""
+				if gatewayLacksMirror {
+					older = "; the controller's gateway also predates the ollamamanifest kind, so a tag staged as a mirror cannot be served yet — upgrade the controller"
+				}
 				return nil, &storeAbsentError{msg: fmt.Sprintf(
-					"%s is not in the controller's model store (no %s.Modelfile%s) — stage the registry tag on the controller with `noo models fetch ollama:%s`; "+
-						"this node never reaches registry.ollama.ai for it",
-					name, cd.base, map[bool]string{true: ", and no plain " + cands[0].base + ".Modelfile", false: ""}[len(cands) > 1], name)}
+					"%s is not in the controller's model store (no %s%s and no %s.Modelfile%s) — stage the registry tag on the controller with `noo models fetch ollama:%s`; "+
+						"this node never reaches registry.ollama.ai for it%s",
+					name, cd.base, mirrorManifestSuffix, cd.base, map[bool]string{true: ", and no plain " + cands[0].base + ".Modelfile", false: ""}[len(cands) > 1], name, older)}
 			}
 			return nil, ferr
 		}
@@ -231,7 +267,7 @@ func (c *Client) PullOllamaModel(ctx context.Context, name string) (*PullOllamaM
 	// container to copy into, and this is the cheaper path when it exists.
 	if bin, ok := ollamaBinary(); ok {
 		if out, runErr := runOllamaCreate(ctx, bin, work, name, mfName); runErr != nil {
-			return nil, fmt.Errorf("ollama create failed on the host binary: %s", out)
+			return nil, fmt.Errorf("ollama create failed on the host binary: %s", lastLine(out))
 		}
 		return &PullOllamaModelResult{Status: "created", Model: name, GGUF: weight, Via: "host"}, nil
 	}
@@ -329,6 +365,15 @@ func ModelInStore(ctx context.Context, name string) (bool, error) {
 	if err != nil {
 		return false, nil
 	}
+	// The mirror first; an old gateway answers "unknown kind", which is
+	// absent here, and the GGUF + Modelfile pair is asked next.
+	_, err = lookupArtifactManifest(ctx, "ollamamanifest", stem+mirrorManifestSuffix)
+	if err == nil {
+		return true, nil
+	}
+	if !errors.Is(err, ErrArtifactAbsent) {
+		return false, err
+	}
 	_, err = lookupArtifactManifest(ctx, "modelfile", stem+".Modelfile")
 	if errors.Is(err, ErrArtifactAbsent) {
 		return false, nil
@@ -346,6 +391,9 @@ func (c *Client) ImportOllamaModel(ctx context.Context, name string) (string, er
 	res, err := c.PullOllamaModel(ctx, name)
 	if err != nil {
 		return "", err
+	}
+	if res.ManifestSHA256 != "" {
+		return fmt.Sprintf("%s installed from the staged mirror (manifest sha256 %s, %d blobs) via %s", res.Model, res.ManifestSHA256[:12], res.Blobs, res.Via), nil
 	}
 	return fmt.Sprintf("%s created from %s via %s", res.Model, res.GGUF, res.Via), nil
 }
@@ -420,38 +468,14 @@ func (c *Client) ollamaCreateInContainer(ctx context.Context, work, name, modelf
 	}); err != nil {
 		return "", fmt.Errorf("copy the model into %s: %w", OllamaContainer, err)
 	}
-	created, err := c.docker.ExecCreate(copyCtx, OllamaContainer, client.ExecCreateOptions{
-		Cmd:          []string{"ollama", "create", name, "-f", modelfile},
-		WorkingDir:   convertDir,
-		AttachStdout: true,
-		AttachStderr: true,
-		// One undemultiplexed stream: the output is an operator's error
-		// message, not something to parse.
-		TTY: true,
-	})
-	if err != nil {
-		return "", fmt.Errorf("exec create: %w", err)
-	}
-	att, err := c.docker.ExecAttach(copyCtx, created.ID, client.ExecAttachOptions{TTY: true})
-	if err != nil {
-		return "", fmt.Errorf("exec attach: %w", err)
-	}
-	raw, _ := io.ReadAll(att.Reader)
-	att.Close()
-	out := strings.TrimSpace(string(raw))
-	ins, err := c.docker.ExecInspect(copyCtx, created.ID, client.ExecInspectOptions{})
+	// No TTY (execCapture): with one, ollama's CLI wrote terminal queries
+	// and spinner frames into the output, and they reached the journal as
+	// the "ollama model created" detail (outside tester's 0.6.21 retest).
+	out, err := c.execCaptureIn(copyCtx, OllamaContainer, convertDir, []string{"ollama", "create", name, "-f", modelfile}, 30*time.Minute)
 	// The staging dir sits on the persistent model volume: remove it whatever
 	// the outcome (best effort; the next create starts with a clean copy).
 	c.removeConvertDir(copyCtx)
-	if err != nil {
-		return "", fmt.Errorf("exec inspect: %w", err)
-	}
-	// The exec's own exit code, not the copy's success — `ollama create`
-	// fails on a bad Modelfile long after every transfer reported fine.
-	if ins.ExitCode != 0 {
-		return out, fmt.Errorf("ollama create exited %d in %s: %s", ins.ExitCode, OllamaContainer, lastLine(out))
-	}
-	return out, nil
+	return out, err
 }
 
 // removeConvertDir deletes the staging directory in the ollama container.

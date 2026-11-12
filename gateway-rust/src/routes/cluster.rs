@@ -97,6 +97,8 @@ pub fn router() -> Router<Arc<AppState>> {
             put(super::node_workload_placements::put_placement).delete(super::node_workload_placements::delete_placement),
         )
         .route("/api/cluster/nodes/{node_id}/node-workloads", get(super::node_workload_placements::list_placements))
+        // i607b B3: `retry now` for a refused model-set fetch (operator only).
+        .route("/api/cluster/nodes/{node_id}/model-set-retry", post(super::model_set_retry::retry_model_set))
         .route("/api/cluster/nodes/{node_id}/fit", post(placement_fit_post))
         // ── Model classes ──
         .route("/api/cluster/model-classes", get(model_classes_get))
@@ -298,6 +300,9 @@ enum BeatShape {
     Str,
     Bool,
     Num,
+    /// A whole number, zero or more (a byte count). A negative, a fraction
+    /// or a string is unknown.
+    NonNegInt,
     OneOf(&'static [&'static str]),
     /// A list of objects, at most this many.
     Objects(usize),
@@ -315,6 +320,10 @@ const I300_BEAT_KEYS: &[(&str, BeatShape)] = &[
     ("nvidia_driver_caps_ok", BeatShape::Bool),
     ("controller_host", BeatShape::Bool),
     ("data_root_free_gb", BeatShape::Num),
+    // i607b: free bytes of the filesystem the agent's model-set disk check
+    // reads (<models dir>/sets). Placement prefers it to data_root_free_gb.
+    // An old gateway drops it, and the preflight then falls back.
+    ("model_sets_free_bytes", BeatShape::NonNegInt),
     ("addon_workloads_policy", BeatShape::OneOf(&["none", "approve", "auto"])),
     ("addon_workloads_approvals", BeatShape::Objects(256)),
     ("model_sets", BeatShape::Objects(256)),
@@ -326,6 +335,7 @@ fn beat_shape_ok(v: &Value, shape: BeatShape) -> bool {
         BeatShape::Str => v.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 64),
         BeatShape::Bool => v.is_boolean(),
         BeatShape::Num => v.as_f64().is_some_and(f64::is_finite),
+        BeatShape::NonNegInt => v.as_u64().is_some_and(|n| n <= i64::MAX as u64),
         BeatShape::OneOf(allowed) => v.as_str().is_some_and(|s| allowed.contains(&s)),
         BeatShape::Objects(max) => v
             .as_array()
@@ -1609,7 +1619,29 @@ pub(crate) async fn cluster_nodes(State(state): State<Arc<AppState>>) -> AppJson
         "nodes": nodes,
         "stats": stats,
         "error": offline_merge_error,
+        // The release this gateway was started for (the launcher's
+        // NOO_IMAGE_TAG): a `noo cluster verify` run on a node compares its
+        // agents with THIS, not with whatever its own binary was built for.
+        "stack_tag": stack_tag_of(std::env::var(crate::addon_registry::STACK_ENV).ok()),
     }))
+}
+
+/// The stack tag to report, `null` when the launcher set none.
+fn stack_tag_of(raw: Option<String>) -> Option<String> {
+    raw.map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
+}
+
+#[cfg(test)]
+mod stack_tag_tests {
+    #[test]
+    fn the_nodes_list_says_which_release_the_gateway_runs() {
+        assert_eq!(super::stack_tag_of(Some(" v0.6.24 ".into())).as_deref(), Some("v0.6.24"));
+        assert_eq!(super::stack_tag_of(Some(String::new())), None, "unset in compose reads as none, not as an empty tag");
+        assert_eq!(super::stack_tag_of(None), None);
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let body = crate::test_src::fn_body(&own, "pub(crate) async fn cluster_nodes(");
+        assert!(body.contains("\"stack_tag\": stack_tag_of(std::env::var(crate::addon_registry::STACK_ENV).ok())"));
+    }
 }
 
 /// Annotate a backend list with the two facts an idle-scaledown decision
@@ -3928,6 +3960,10 @@ async fn desired_config_get(
     if let Some(nw) = node_workloads {
         body["node_workloads"] = Value::Array(nw);
     }
+    // i607b B3: the node's `retry now` epoch, a TOP-LEVEL key on purpose (the
+    // `node_workloads` fragment is decoded strictly by the agent, a new field
+    // inside it would make an old agent refuse). Omitted at epoch 0.
+    super::model_set_retry::apply(&mut body, super::model_set_retry::retry_for(&state, &node_id).await.as_ref());
     Ok(Json(body))
 }
 
@@ -4534,7 +4570,7 @@ async fn placement_staging_refusal(state: &AppState, node_id: &str, backend: &st
 /// (404) or unreachable costs a log line and nothing else. Without this a
 /// harness kind change landed up to 5 min after `noo cluster place`
 /// (both awolf and mcmini, harness compare 2026-10-24).
-fn nudge_reconcile(state: Arc<AppState>, node_id: String) {
+pub(super) fn nudge_reconcile(state: Arc<AppState>, node_id: String) {
     tokio::spawn(async move {
         let link = match crate::node_link::NodeLink::for_node(&state, &node_id).await {
             Ok(l) => l,
@@ -8425,9 +8461,14 @@ mod i300_beat_tests {
             "nvidia_driver_caps_ok": true,
             "controller_host": false,
             "data_root_free_gb": 412.5,
+            "model_sets_free_bytes": 442_986_717_184u64,
             "addon_workloads_policy": "approve",
             "addon_workloads_approvals": [{"addon": "rhaddon", "digest": format!("sha256:{}", "a".repeat(64))}],
-            "model_sets": [{"id": "rh-voice", "revision": "r1", "state": "verified"}],
+            "model_sets": [
+                {"id": "rh-voice", "revision": "r1", "state": "verified", "bytes_total": 8_000_000_000u64},
+                {"id": "rh-stt", "revision": "r2", "state": "fetching", "bytes_done": 0, "bytes_total": 3_000_000_000u64},
+                {"id": "rh-tts", "revision": "r3", "state": "refused", "reason": "disk", "retry_at": "2026-11-09T14:32:00Z", "free_bytes": 4_500_000_000u64, "need_bytes": 9_600_000_000u64},
+            ],
             "node_workloads": [{"addon": "rhaddon", "name": "worker", "state": "provisioned", "ready": false, "door_port": 41001}],
         })
     }
@@ -8452,6 +8493,7 @@ mod i300_beat_tests {
             "os": "",
             "nvidia_runtime": "yes",
             "data_root_free_gb": "lots",
+            "model_sets_free_bytes": -1,
             "addon_workloads_policy": "always",
             "model_sets": [1, 2],
             "node_workloads": {"addon": "rhaddon"},
@@ -8459,13 +8501,41 @@ mod i300_beat_tests {
         });
         carry_i300(&mut data, &full_beat());
         carry_i300(&mut data, &bad);
-        for key in ["gpu_compute_cap", "os", "nvidia_runtime", "data_root_free_gb", "addon_workloads_policy", "model_sets", "node_workloads", "addon_workloads_approvals"] {
+        for key in ["gpu_compute_cap", "os", "nvidia_runtime", "data_root_free_gb", "model_sets_free_bytes", "addon_workloads_policy", "model_sets", "node_workloads", "addon_workloads_approvals"] {
             assert!(data.get(key).is_none(), "{key}: a misshapen value is unknown, never kept: {data}");
         }
         // An empty list is a fact (no sets, no workloads), not unknown.
         carry_i300(&mut data, &json!({"model_sets": [], "node_workloads": []}));
         assert_eq!(data["model_sets"], json!([]));
         assert_eq!(data["node_workloads"], json!([]));
+    }
+
+    /// i607b: `model_sets_free_bytes` is a byte count. Zero is a fact (a full
+    /// disk); a negative, a fraction, a string or a bool is unknown, and an
+    /// earlier value is not kept.
+    #[test]
+    fn model_sets_free_bytes_keeps_a_whole_number_and_drops_anything_else() {
+        let mut data = json!({"id": "n1"});
+        for good in [json!(0), json!(9_000_000_000u64), json!(i64::MAX)] {
+            carry_i300(&mut data, &json!({"model_sets_free_bytes": good.clone()}));
+            assert_eq!(data["model_sets_free_bytes"], good, "kept");
+        }
+        for bad in [json!(-1), json!(1.5), json!(1.0e12), json!("9"), json!(true), json!(null), json!(u64::MAX)] {
+            carry_i300(&mut data, &json!({"model_sets_free_bytes": 5}));
+            carry_i300(&mut data, &json!({"model_sets_free_bytes": bad.clone()}));
+            assert!(data.get("model_sets_free_bytes").is_none(), "{bad}: unknown, never kept: {data}");
+        }
+    }
+
+    /// i607b: the new row fields ride inside `model_sets` untouched.
+    #[test]
+    fn model_set_rows_keep_their_delivery_fields() {
+        let mut data = json!({"id": "n1"});
+        carry_i300(&mut data, &full_beat());
+        let rows = data["model_sets"].as_array().expect("rows");
+        assert_eq!(rows[1]["bytes_done"], json!(0), "a zero bytes_done survives");
+        assert_eq!(rows[2]["free_bytes"], json!(4_500_000_000u64));
+        assert_eq!(rows[2]["retry_at"], json!("2026-11-09T14:32:00Z"));
     }
 
     /// The handler runs this step before its KV write.

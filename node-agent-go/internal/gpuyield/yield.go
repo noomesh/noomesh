@@ -88,10 +88,25 @@ const (
 // PauseReason is what a paused backend is marked with.
 const PauseReason = "gpu_in_use_by_other"
 
-// idleResidueMB: foreign use at or below this is not contention. pai-voice
-// drained to idle still holds ~113 MiB; a bare-metal driver/Xorg a few
-// hundred. Neither is "the GPU is in use by something else".
-const idleResidueMB = 256
+// sharedFloorMB is the foreign GPU use at or below which the GPU is NOT
+// "shared": max(sharedFloorMinMB, sharedFloorPercent% of the card). Residue
+// is not a competing workload: pai-voice drained to idle still holds
+// ~113 MiB, a bare-metal driver/Xorg a few hundred, and the WSL/Windows
+// desktop compositor ~316 MiB (awolf, 2026-11-11). "shared" demotes the
+// node's GPU backends at routing (classes.rs gpu_shared), so a 256 MiB
+// floor sent every default-class chat from awolf's vLLM to a slower node
+// because of the desktop (since 0.6.7). An unknown total uses the minimum.
+const (
+	sharedFloorMinMB   = 1024
+	sharedFloorPercent = 5
+)
+
+func sharedFloorMB(totalMB int) int {
+	if f := totalMB * sharedFloorPercent / 100; f > sharedFloorMinMB {
+		return f
+	}
+	return sharedFloorMinMB
+}
 
 // Docker is the container surface the yield needs (internal/docker.Client).
 type Docker interface {
@@ -622,7 +637,7 @@ func (c *Controller) decideLocked(r Reading, backends []docker.GPUBackend) (act 
 
 	// free / shared
 	next := StateFree
-	if c.foreignMB > idleResidueMB {
+	if c.foreignMB > sharedFloorMB(c.last.TotalMB) {
 		next = StateShared
 	}
 	if !c.cfg.Enabled || !pressure {
@@ -973,7 +988,7 @@ func (c *Controller) resumeLocked(why string) (act actions) {
 	c.pressureAt, c.clearAt = time.Time{}, time.Time{}
 	c.startWarmLocked(c.now())
 	next := StateFree
-	if c.foreignMB > idleResidueMB {
+	if c.foreignMB > sharedFloorMB(c.last.TotalMB) {
 		next = StateShared
 	}
 	c.state = next

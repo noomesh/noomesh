@@ -30,6 +30,7 @@ source is what to check.
 """
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -50,7 +51,8 @@ CI = ROOT / ".github/workflows/ci.yml"
 # the release tag.
 # `ollama` joined in the same shape (i415): 0.6.16-rc.1's release failed in
 # its runtime stage, which nothing built on a PR.
-PER_CRATE = {"gateway", "cli", "sqlx", "ui", "llamacpp", "ollama"}
+# `voice` (i607c): whisper and piper, built for linux/arm64 on a PR.
+PER_CRATE = {"gateway", "cli", "sqlx", "ui", "llamacpp", "ollama", "voice"}
 
 # job -> the one output it may be gated on.
 OWNS = {
@@ -61,6 +63,7 @@ OWNS = {
     "ui": "ui",
     "llamacpp-image": "llamacpp",
     "ollama-image": "ollama",
+    "voice-images": "voice",
 }
 
 
@@ -237,7 +240,7 @@ def test_the_classifier_narrows_and_fails_open() -> None:
     docs = _classify(["docs/a.md", "internal/b.md"])
     assert docs == {"code": "false", "gateway": "false", "cli": "false",
                     "sqlx": "false", "ui": "false", "llamacpp": "false",
-                    "ollama": "false", "deferred": "false", "defer_tests": "false"}
+                    "ollama": "false", "voice": "false", "deferred": "false", "defer_tests": "false"}
 
     cli = _classify(["noo-cli/src/main.rs"])
     assert cli["cli"] == "true" and cli["gateway"] == "false" and cli["sqlx"] == "false"
@@ -283,12 +286,20 @@ def test_the_classifier_narrows_and_fails_open() -> None:
         # so an unrelated path cannot change what it builds (2026-10-09).
         assert got["llamacpp"] == "false", f"{unknown} compiled llama-server: {got}"
         assert got["ollama"] == "false", f"{unknown} built the ollama image: {got}"
+        assert got["voice"] == "false", f"{unknown} built the voice images: {got}"
 
     # Its own inputs, and the workflow that builds it, do arm it.
     for own in (["docker/Dockerfile.llamacpp"], [".github/workflows/ci.yml"]):
         assert _classify(own)["llamacpp"] == "true", f"{own} must compile llama-server"
     for own in (["docker/Dockerfile.ollama"], [".github/workflows/ci.yml"]):
         assert _classify(own)["ollama"] == "true", f"{own} must build the ollama image"
+    # The voice images: every input the release table names for them.
+    voice_inputs = sorted({p for img in ("whisper", "piper")
+                           for p in json.loads((ROOT / "scripts/release-image-inputs.json").read_text())["images"][img]["inputs"]})
+    for own in [[p] for p in voice_inputs] + [[".github/workflows/ci.yml"]]:
+        assert _classify(own)["voice"] == "true", f"{own} must build the voice images"
+    assert _classify(["docker/Dockerfile.whisper"])["ollama"] == "false"
+    assert _classify(["docker/Dockerfile.ollama"])["voice"] == "false"
     # Each image's Dockerfile arms only its own image.
     assert _classify(["docker/Dockerfile.ollama"])["llamacpp"] == "false"
     assert _classify(["docker/Dockerfile.llamacpp"])["ollama"] == "false"
@@ -461,12 +472,16 @@ def test_the_console_artifact_tag_matches_what_the_gateway_pulls():
         "resolve to different tags, and the release would die at FROM ${UI_IMAGE}"
     )
 
-    # And the gateway must pull it by $TAG rather than a literal, or the pin
-    # can drift the way it did at v0.1.7 for months.
-    assert "--build-arg UI_IMAGE=$REGISTRY/$OWNER/mesh-ui-web:$TAG" in rel, (
-        "the gateway no longer pins the console by $TAG — a literal here is "
-        "how UI_IMAGE sat at v0.1.7 through every release"
+    # And the gateway must take the console THIS release's $TAG published,
+    # never a literal (UI_IMAGE sat at v0.1.7 for months that way), pinned by
+    # the digest that tag resolves to (2026-11-11: the gateway then carries no
+    # release tag, and a final re-tags the rc's gateway).
+    assert 'ref="$REGISTRY/$OWNER/mesh-ui-web:$TAG"' in rel, (
+        "the console the gateway embeds is no longer resolved from $TAG"
     )
+    assert 'echo "UI_IMAGE_REF=$REGISTRY/$OWNER/mesh-ui-web@$digest"' in rel, "not pinned by digest"
+    assert "--build-arg UI_IMAGE=$UI_IMAGE_REF" in rel, "the gateway build does not use the resolved digest"
+    assert "mesh-ui-web:$TAG" not in rel.split("--build-arg UI_IMAGE=", 1)[1].split("\n", 1)[0], "the build arg is a tag again"
 
 
 # (The self-hosted-runner topology guards that lived here were retired when CI
@@ -502,6 +517,37 @@ def test_the_ollama_image_reads_nothing_else_from_the_tree() -> None:
         f"docker/Dockerfile.ollama now reads the build context ({from_context}); "
         "add those paths to the ollama switch in ci.yml's scope step"
     )
+
+
+def test_the_voice_switch_covers_every_input_the_release_names() -> None:
+    """i607c: the voice lane's patterns name exactly the files the release
+    table says whisper and piper read (their Dockerfiles and the server files
+    they COPY). A new COPY added there must arm this lane too."""
+    table = json.loads((ROOT / "scripts/release-image-inputs.json").read_text())["images"]
+    inputs = {p for img in ("whisper", "piper") for p in table[img]["inputs"]}
+    for img in ("whisper", "piper"):
+        df = (ROOT / f"docker/Dockerfile.{img}").read_text()
+        srcs = {ln.split()[1] for ln in df.splitlines() if re.match(r"\s*COPY\s+(?!--from)", ln)}
+        assert srcs and srcs <= inputs, f"Dockerfile.{img} COPYs {srcs - inputs} the release table does not name"
+    for p in inputs:
+        assert _classify([p])["voice"] == "true", f"{p} does not arm the voice lane"
+
+
+def test_the_voice_lane_builds_arm64_and_runs_each_image() -> None:
+    """The proof that whisper and piper run on arm64 (i607c): both built for
+    linux/arm64 under QEMU, nothing pushed, each server module imported."""
+    job = _workflow()["jobs"]["voice-images"]
+    runs = " ".join(s.get("run", "") for s in job["steps"])
+    # The BUILD is arm64 (the `docker run` lines carry the flag too, so a
+    # bare substring would pass an amd64 build), and nothing is pushed.
+    assert re.search(r"docker buildx build [^\n]*--platform linux/arm64", runs), "the images are not BUILT for arm64"
+    assert "--push" not in runs, runs
+    for mod in ("whisper_server", "piper_server"):
+        assert f"import platform, {mod}" in runs, f"{mod} is not imported on arm64"
+    assert any("setup-qemu-action" in str(s.get("uses", "")) for s in job["steps"]), "no QEMU for arm64"
+    release = yaml.safe_load((ROOT / ".github/workflows/images-release.yml").read_text())
+    plats = {e["image"]: e["platforms"] for e in release["jobs"]["images"]["strategy"]["matrix"]["include"]}
+    assert plats["whisper"] == plats["piper"] == "linux/amd64,linux/arm64", plats
 
 
 def test_both_image_lanes_build_every_stage() -> None:
@@ -671,4 +717,96 @@ def test_a_merge_queue_group_never_cancels_another_groups_run() -> None:
     assert "merge_group.base_ref" not in group, (
         "a concurrency group keyed per base ref cancels every earlier queue group's run: " + group
     )
-    assert "github.run_id" in group, "every other event keeps a group of its own run: " + group
+    assert "github.run_id" in group, "pushes and tags keep a group of their own run: " + group
+
+
+def test_a_pull_request_runs_once_per_commit() -> None:
+    """A PR opened with a label fired `opened` and `labeled` together and the
+    whole workflow ran twice on one commit (runs 42951612488 / 42951612728,
+    2026-11-11). Pull requests are grouped per PR number AND head SHA, so the
+    later run replaces the earlier for the SAME commit only, and never across
+    PRs or across pushes. The merge-queue key and its cancel are unchanged."""
+    wf = _workflow()["concurrency"]
+    group, cancel = str(wf["group"]), str(wf["cancel-in-progress"])
+    pr_key = "format('ci-pr-{0}-{1}', github.event.pull_request.number, github.event.pull_request.head.sha)"
+    assert pr_key in group, group
+    assert "github.event_name == 'pull_request' && " + pr_key in group, "the PR key applies to pull_request events only: " + group
+    assert "github.event_name == 'merge_group' && format('ci-merge-queue-{0}', github.event.merge_group.head_ref)" in group, group
+    assert group.index("merge_group.head_ref") < group.index(pr_key) < group.index("github.run_id"), group
+    assert "github.event_name == 'pull_request'" in cancel and "github.event_name == 'merge_group'" in cancel, cancel
+    assert "push" not in cancel, "a push is never cancelled: " + cancel
+
+
+# ── the merge-queue base (2026-11-11) ───────────────────────────────────────
+#
+# Two skip sources that can make a red Rust lane read as green, both by design
+# and both safe only together:
+#   1. a PR into dev DEFERS the Rust lanes to the queue (they report success
+#      without compiling), so a dev PR's "pass" is never a compile;
+#   2. a merge group then compiles only the lanes its diff touches.
+# Source 2 was diffed against merge_group.base_sha, which in a batch is the
+# PREVIOUS group's head: pr-978's group skipped noo-cli, and under HEADGREEN
+# #1017 landed on dev with noo-cli red (run 43045136522). The queue is the
+# only place a dev change compiles, so its diff must cover the whole batch.
+
+def _merge_group_block() -> str:
+    run = next(s["run"] for s in _workflow()["jobs"]["scope"]["steps"] if s.get("id") == "diff")
+    start, end = run.index("# >>> merge-group base"), run.index("# <<< merge-group base")
+    return run[start:end]
+
+
+def test_the_merge_group_base_is_the_queues_base_never_the_previous_group() -> None:
+    step = next(s for s in _workflow()["jobs"]["scope"]["steps"] if s.get("id") == "diff")
+    assert step["env"]["BASE"] == "${{ github.event.pull_request.base.sha }}", step["env"]["BASE"]
+    assert step["env"]["MG_BASE_REF"] == "${{ github.event.merge_group.base_ref }}"
+    assert "merge_group.base_sha" not in str(step["env"]), "the previous group's head is never the base"
+    block = _merge_group_block()
+    assert 'git merge-base HEAD "refs/remotes/origin/$mg_ref"' in block, block
+    run = step["run"]
+    assert run.index("# <<< merge-group base") < run.index("# ── llamacpp") < run.index('changed="$(git diff --name-only "$BASE...HEAD")"'), \
+        "the base is settled before anything diffs"
+
+
+def test_a_later_group_still_runs_the_lanes_an_earlier_group_touched(tmp_path: Path) -> None:
+    """A real batch in a throwaway repo: group 1 changes noo-cli, group 2
+    (built on group 1) changes only docs. Group 2's diff must contain
+    noo-cli; diffed against the previous group's head it did not."""
+    import subprocess
+
+    def git(*a: str, cwd: Path) -> str:
+        return subprocess.run(["git", *a], cwd=cwd, check=True, capture_output=True, text=True,
+                              env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "GIT_AUTHOR_NAME": "t",
+                                   "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}).stdout.strip()
+
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    git("init", "-q", "-b", "dev", cwd=origin)
+    (origin / "noo-cli").mkdir()
+    (origin / "noo-cli/a.rs").write_text("1\n")
+    (origin / "README.md").write_text("x\n")
+    git("add", "-A", cwd=origin); git("commit", "-qm", "base", cwd=origin)
+    dev_tip = git("rev-parse", "HEAD", cwd=origin)
+    git("checkout", "-qb", "gh-readonly-queue/dev/pr-1", cwd=origin)
+    (origin / "noo-cli/a.rs").write_text("2\n")
+    git("commit", "-qam", "pr-1: noo-cli", cwd=origin)
+    group1 = git("rev-parse", "HEAD", cwd=origin)
+    git("checkout", "-qb", "gh-readonly-queue/dev/pr-2", cwd=origin)
+    (origin / "README.md").write_text("y\n")
+    git("commit", "-qam", "pr-2: docs", cwd=origin)
+
+    work = tmp_path / "work"
+    git("clone", "-q", "--branch", "gh-readonly-queue/dev/pr-2", str(origin), str(work), cwd=tmp_path)
+    script = "set -euo pipefail\n" + _merge_group_block() + 'echo "BASE=$BASE"\ngit diff --name-only "$BASE...HEAD"\n'
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "EVENT": "merge_group", "BASE": "",
+           "MG_BASE_REF": "refs/heads/dev"}
+    out = subprocess.run(["bash", "-c", script], cwd=work, env=env, check=True, capture_output=True, text=True).stdout
+    assert f"BASE={dev_tip}" in out, out
+    assert "noo-cli/a.rs" in out.splitlines(), f"group 2 must still compile what group 1 changed:\n{out}"
+    # The old base would have hidden it.
+    assert "noo-cli/a.rs" not in git("diff", "--name-only", f"{group1}...HEAD", cwd=work)
+
+    # No base to find: fail open (an empty BASE runs every lane).
+    env["MG_BASE_REF"] = "refs/heads/no-such-branch"
+    out = subprocess.run(["bash", "-c", "set -euo pipefail\n" + _merge_group_block() + 'echo "BASE=[$BASE]"\n'],
+                         cwd=work, env=env, check=True, capture_output=True, text=True).stdout
+    assert "BASE=[]" in out and "fail open" in out, out

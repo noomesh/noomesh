@@ -37,10 +37,11 @@
 //! | `N_THREADS` (llamacpp on cpu) | 25% of cores, at least 2 | cores - 2, at least 1 |
 //! | `N_PARALLEL` / `OLLAMA_NUM_PARALLEL` | 1 | chat: 2 on gpu, 1 on cpu; embed: 4 |
 //! | `N_BATCH` (llamacpp) | 256 cpu / 512 gpu | 512 cpu / 2048 gpu |
-//! | `N_CTX` (llamacpp chat) | half the pool's free memory as KV | same |
+//! | `N_CTX` (llamacpp chat) / `OLLAMA_CONTEXT_LENGTH` (ollama chat) | half the pool's free memory as KV | same |
 //!
-//! `N_CTX` uses the fit check's conservative KV figure (16 KiB per token per
-//! slot per GB of weights) and is rounded down to a power of two in
+//! `N_CTX` and `OLLAMA_CONTEXT_LENGTH` use the fit check's conservative KV
+//! figure ([`kv_bytes_per_token`]: 16 KiB per token per slot per GB of
+//! weights, at least 144 KiB) and are rounded down to a power of two in
 //! [`MIN_CTX`, `MAX_CTX`]; without a model size or a pool it stays at the
 //! backend default. An explicit `--env` always wins, and a key the placement
 //! already carries for the same model and target is kept.
@@ -50,6 +51,21 @@ use serde_json::Value;
 /// Conservative KV bytes per token per slot per GB of weights; the gateway's
 /// `placement_fit::KV_BYTES_PER_TOKEN_PER_GB_WEIGHTS`.
 pub const KV_BYTES_PER_TOKEN_PER_GB_WEIGHTS: f64 = 16.0 * 1024.0;
+/// The floor under that figure; the gateway's
+/// `placement_fit::KV_BYTES_PER_TOKEN_FLOOR`.
+pub const KV_BYTES_PER_TOKEN_FLOOR: f64 = 144.0 * 1024.0;
+/// An ollama chat context is never pinned below this (finding 126: the
+/// working minimum; below it a reasoning model spends its window thinking).
+pub const OLLAMA_MIN_CHAT_CTX: u64 = 4096;
+
+/// Conservative f16 KV bytes per token per slot for a model whose
+/// architecture is not reported: 16 KiB per GB of weights, at least 144 KiB.
+/// The per-GB figure alone undercounts small models (qwen3-4b: 144 KiB a
+/// token on 2.4 GB of weights); the floor alone overcounts nothing big
+/// (gemma-4-26B's 15.8 GB already gives 253 KiB).
+pub fn kv_bytes_per_token(weights_gb: f64) -> f64 {
+    (weights_gb * KV_BYTES_PER_TOKEN_PER_GB_WEIGHTS).max(KV_BYTES_PER_TOKEN_FLOOR)
+}
 pub const MIN_CTX: u64 = 2048;
 pub const MAX_CTX: u64 = 32768;
 pub const DEFAULT_CTX: u64 = 4096;
@@ -243,7 +259,7 @@ pub fn ctx_for(weights_gb: Option<f64>, free_gb: Option<f64>, parallel: u64) -> 
     let (Some(w), Some(free)) = (weights_gb.filter(|w| *w > 0.0), free_gb) else {
         return (DEFAULT_CTX, "model size or free memory unknown: the backend default".into());
     };
-    let per_token_gb = w * KV_BYTES_PER_TOKEN_PER_GB_WEIGHTS / 1e9;
+    let per_token_gb = kv_bytes_per_token(w) / 1e9;
     let kv_budget = (free * 0.5).max(0.0);
     let raw = kv_budget / (per_token_gb * parallel.max(1) as f64);
     if raw < MIN_CTX as f64 {
@@ -282,6 +298,21 @@ pub fn tune(i: &TuneInput) -> Vec<Choice> {
         "ollama" => {
             let (p, why) = parallel_for(i.usage, i.role, i.target);
             out.push(Choice { key: "OLLAMA_NUM_PARALLEL", value: p.to_string(), why: format!("{why} (daemon-wide: the max over the node's ollama roles)") });
+            // Pinned, never left to the daemon: unset, Ollama picks 4k, 32k or
+            // 256k from the total VRAM it sees, and fit cannot know which.
+            // An outside tester's qwen3:4b measured 7.1 GB resident on a 6 GB
+            // GPU unpinned (the 32768 tier's size), 3.2 GB at 4096 (0.6.21
+            // retest, finding 126). Embed and rerank requests carry their own
+            // num_ctx, so only a chat row pins it.
+            if i.role == "chat" {
+                let (c, why) = ctx_for(i.weights_gb, i.free_gb, p);
+                let (c, why) = if c < OLLAMA_MIN_CHAT_CTX {
+                    (OLLAMA_MIN_CHAT_CTX, format!("{why}; raised to the {OLLAMA_MIN_CHAT_CTX} floor for an ollama chat model (fit judges it)"))
+                } else {
+                    (c, why)
+                };
+                out.push(Choice { key: "OLLAMA_CONTEXT_LENGTH", value: c.to_string(), why });
+            }
         }
         _ => {}
     }
@@ -494,6 +525,43 @@ mod tests {
         let o = TuneInput { backend: "ollama", role: "embed", usage: "dedicated", ..i };
         let keys: Vec<_> = tune(&o).into_iter().map(|c| (c.key, c.value)).collect();
         assert_eq!(keys, vec![("OLLAMA_NUM_PARALLEL", "4".to_string())]);
+    }
+
+    /// Finding 126: an ollama chat placement pins its context instead of
+    /// leaving the daemon's VRAM-tier default (4k/32k/256k) to chance.
+    /// qwen3:4b, 2.4 GB of weights, on a 6 GB RTX 3060 Laptop GPU.
+    #[test]
+    fn an_ollama_chat_placement_pins_its_context() {
+        let i = TuneInput { backend: "ollama", role: "chat", target: "gpu", usage: "shared", cpu_cores: Some(16), weights_gb: Some(2.4), free_gb: Some(2.8) };
+        let got: Vec<(&str, String)> = tune(&i).into_iter().map(|c| (c.key, c.value)).collect();
+        assert_eq!(got[0], ("OLLAMA_NUM_PARALLEL", "1".to_string()));
+        assert_eq!(got[1].0, "OLLAMA_CONTEXT_LENGTH");
+        // 2.8 GB free -> 1.4 GB for KV at 144 KiB a token -> ~9.5k -> 8192.
+        assert_eq!(got[1].1, "8192", "a 6 GB GPU must not get the 32k tier the tester's daemon chose");
+        // Nearly full: the 4096 floor, not llama.cpp's 2048; fit judges it.
+        let tight = TuneInput { free_gb: Some(0.3), ..i.clone() };
+        let c = tune(&tight).into_iter().find(|c| c.key == "OLLAMA_CONTEXT_LENGTH").unwrap();
+        assert!(c.value == "4096" && c.why.contains("floor"), "{c:?}");
+        // Unknown size: the default, still pinned.
+        let u = TuneInput { weights_gb: None, ..i.clone() };
+        assert!(tune(&u).iter().any(|c| c.key == "OLLAMA_CONTEXT_LENGTH" && c.value == DEFAULT_CTX.to_string()));
+        // Embed and rerank send num_ctx per request: nothing pinned.
+        for role in ["embed", "rerank"] {
+            let e = TuneInput { role, ..i.clone() };
+            assert!(tune(&e).iter().all(|c| c.key != "OLLAMA_CONTEXT_LENGTH"), "{role}");
+        }
+    }
+
+    /// The KV floor (finding 126) must not shrink a big model's tuned
+    /// context: gemma-4-26B's 15.8 GB gives 253 KiB a token, above it.
+    #[test]
+    fn the_kv_floor_leaves_a_big_models_n_ctx_unchanged() {
+        assert_eq!(kv_bytes_per_token(15.8), 15.8 * KV_BYTES_PER_TOKEN_PER_GB_WEIGHTS);
+        assert_eq!(ctx_for(Some(15.8), Some(20.0), 1).0, 32768);
+        assert_eq!(ctx_for(Some(15.8), Some(10.0), 1).0, 16384);
+        assert_eq!(ctx_for(Some(15.8), Some(2.0), 1).0, 2048);
+        // A small model takes the floor: qwen3-4b's real 144 KiB, not 38.
+        assert_eq!(kv_bytes_per_token(2.4), KV_BYTES_PER_TOKEN_FLOOR);
     }
 
     #[test]

@@ -450,8 +450,10 @@ func TestARefusalKeepsTheLastGoodStateOfARunningWorker(t *testing.T) {
 	h.p.SetAdmit(func(context.Context, nodewl.Entry) error { return &nodewl.Error{Code: nodewl.ReasonConsentNone} })
 	before := h.api.callList()
 	h.p.Converge(context.Background(), h.running())
-	if got := h.api.callList(); len(got) != len(before) {
-		t.Fatalf("a refusal changed the node: %v -> %v", before, got)
+	// The worker stays running, so its readiness watcher keeps probing:
+	// only a call that is not a probe is a change.
+	if touched := touchesSince(h.api.callList(), len(before)); len(touched) != 0 {
+		t.Fatalf("a refusal changed the node: %v", touched)
 	}
 	if r := h.row(); r.State != nodewl.StateRunning || r.Reason != nodewl.ReasonConsentNone {
 		t.Fatalf("row = %+v", r)

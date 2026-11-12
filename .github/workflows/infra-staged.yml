@@ -39,6 +39,14 @@ on:
   schedule:
     - cron: '17 3 * * *'   # daily, 03:17 UTC
   workflow_dispatch:
+    inputs:
+      promote:
+        # false: build, push the date tag and scan, but leave :staged alone (a
+        # dry run of the build). A run built from any ref but dev never
+        # promotes, whatever this says (see "Promote to :staged").
+        description: 'Move :staged to this build if its scan passes (only ever from dev)'
+        type: boolean
+        default: true
 permissions:
   contents: read
   packages: write   # push $REGISTRY/$OWNER/<image>:staged*
@@ -48,6 +56,11 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   OWNER: noomesh
+  # What this run builds: a dispatch builds the ref it was dispatched on, the
+  # schedule (which runs on the default branch, main) builds dev. Only a run
+  # that built dev may move :staged: a release may ship :staged, and only
+  # merged, queue-tested commits feed it.
+  STAGE_REF: ${{ github.event_name == 'workflow_dispatch' && github.ref || 'refs/heads/dev' }}
 jobs:
   matrix:
     if: github.repository == 'noomesh/noomesh'
@@ -58,7 +71,7 @@ jobs:
       - name: Checkout dev   # actions/checkout@v7.0.1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: dev
+          ref: ${{ env.STAGE_REF }}
       - name: The daily set, with the release's build arguments
         id: m
         run: |
@@ -78,7 +91,10 @@ jobs:
       - name: Checkout dev   # actions/checkout@v7.0.1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: dev
+          ref: ${{ env.STAGE_REF }}
+          # Full history (blobs on demand) for scripts/build-epoch.py.
+          fetch-depth: 0
+          filter: blob:none
 
       - name: Free disk (preinstalled toolchains the build does not use)
         run: scripts/ci-free-disk.sh
@@ -144,7 +160,14 @@ jobs:
       - name: Build + push ${{ matrix.image }}:${{ env.DATE_TAG }}
         run: |
           set -eux
-          scripts/retry-registry.sh docker buildx build --push \
+          # Reproducible layers (2026-11-11): every file time in a layer is
+          # clamped to the newest commit touching this image's inputs, so an
+          # unchanged layer keeps its digest and nodes do not download it again.
+          # Assigned, then exported: `export X="$(…)"` would hide a refusal.
+          SOURCE_DATE_EPOCH="$(python3 scripts/build-epoch.py "${{ matrix.image }}")"
+          export SOURCE_DATE_EPOCH
+          scripts/retry-registry.sh docker buildx build \
+            --output type=registry,rewrite-timestamp=true \
             --platform "${{ matrix.platforms }}" \
             -f "${{ matrix.dockerfile }}" \
             --build-arg DHI_REGISTRY=dhi.io \
@@ -184,12 +207,22 @@ jobs:
           trivy image --download-db-only
           old="$(docker buildx imagetools inspect "$REF:staged" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"' || true)"
           echo "OLD_DIGEST=$old" >> "$GITHUB_ENV"
+          # The platforms the current staged copy HAS. A platform the new build
+          # adds (the whisper/piper staged copies were amd64-only, 2026-11-11) has no
+          # old copy to scan: Trivy failed the whole job on it, so the staged
+          # copy never moved. Now it is simply not scanned on the old side, and the
+          # gate counts every finding on it as new.
+          old_platforms=""
+          if [ -n "$old" ]; then
+            old_platforms="$(docker buildx imagetools inspect --raw "$REF@$old" | python3 scripts/infra-staged.py platforms)"
+            echo "current staged copy platforms: ${old_platforms:-none}"
+          fi
           for p in $(echo "${{ matrix.platforms }}" | tr ',' ' '); do
             n="$(echo "$p" | tr '/' '-')"
             trivy image --skip-db-update --image-src remote --platform "$p" \
               --severity HIGH,CRITICAL --ignore-unfixed --format json \
               -o "scan/new/$n.json" "$REF@$DIGEST"
-            if [ -n "$old" ]; then
+            if [ -n "$old" ] && case " $old_platforms " in *" $p "*) true ;; *) false ;; esac; then
               trivy image --skip-db-update --image-src remote --platform "$p" \
                 --severity HIGH,CRITICAL --ignore-unfixed --format json \
                 -o "scan/old/$n.json" "$REF@$old"
@@ -201,14 +234,26 @@ jobs:
           # pipefail: without it `| tee` would turn the gate's exit 1 into 0.
           set -euo pipefail
           if [ -n "$OLD_DIGEST" ]; then
-            python3 scripts/infra-staged.py new-findings --new scan/new/*.json --old scan/old/*.json | tee -a "$GITHUB_STEP_SUMMARY"
+            # Only the platforms the current staged copy has (maybe none of the
+            # new ones): a missing one is gated in full, never skipped.
+            shopt -s nullglob
+            olds=(scan/old/*.json)
+            python3 scripts/infra-staged.py new-findings --new scan/new/*.json --old "${olds[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
           else
             python3 scripts/infra-staged.py new-findings --new scan/new/*.json | tee -a "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Promote to :staged
+        env:
+          PROMOTE: ${{ inputs.promote }}
         run: |
           set -eu
+          if [ "$STAGE_REF" != "refs/heads/dev" ]; then
+            echo "::notice::built from $STAGE_REF, not dev: :staged stays (only merged commits feed it)"; exit 0
+          fi
+          if [ "${PROMOTE:-true}" != "true" ]; then
+            echo "::notice::promote=false: built, pushed $DATE_TAG and scanned; :staged stays"; exit 0
+          fi
           scripts/retry-registry.sh docker buildx imagetools create --tag "$REF:staged" "$REF@$DIGEST"
           now="$(docker buildx imagetools inspect "$REF:staged" --format '{{json .Manifest.Digest}}' | tr -d '"')"
           if [ "$now" != "$DIGEST" ]; then

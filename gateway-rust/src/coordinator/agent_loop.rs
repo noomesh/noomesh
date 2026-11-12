@@ -1932,12 +1932,16 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     let mut session = rt.load_session(conversation_id, "dashboard").await;
     super::context::strip_data_frames(&mut session.messages);
     let mut persona_prompt = rt.persona_prompt().await;
-    // Node-reported ids and backends are data (framed below); only the operator's guidance is system text.
+    // Skills, runbooks and the cluster guidance are chosen from the user's
+    // own words (a task's contract is not the user's; i658).
+    let selection = super::selection_text_or(prompt);
+    // Node-reported ids and backends are data (framed below); only the operator's guidance is system text,
+    // and only when the user's words are about running the cluster.
     let cluster_ctx = rt.cluster_awareness().await;
-    if !cluster_ctx.trim().is_empty() {
+    if !cluster_ctx.trim().is_empty() && super::context::ops_intent(&selection) {
         persona_prompt.push_str(super::context::CLUSTER_GUIDANCE);
     }
-    persona_prompt.push_str(&super::context::clock_context());
+    persona_prompt.push_str(super::context::CLOCK_RULE);
     session.set_system_prompt(&persona_prompt);
 
     // Fire pre-inference hooks (registered by add-ons)
@@ -1956,7 +1960,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         time_layer(rt.metrics(), "memory", rt.memory_context(prompt, user_id)),
         time_layer(rt.metrics(), "channel", rt.cross_channel_context(prompt, &session.channel, user_id)),
         time_layer(rt.metrics(), "video", rt.video_context(prompt)),
-        time_layer(rt.metrics(), "skills", async { rt.prompt_skills_context(prompt, &preferred_skills) }),
+        time_layer(rt.metrics(), "skills", async { rt.prompt_skills_context(&selection, &preferred_skills) }),
         time_layer(rt.metrics(), "companion", rt.companion_context()),
     );
 
@@ -1974,7 +1978,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     let has_video = video_ctx.is_some();
     let has_skills = skills_ctx.is_some();
     let has_companion = companion_ctx.is_some();
-    let runbook_ctx = rt.runbook_context(prompt);
+    let runbook_ctx = rt.runbook_context(&selection);
     let has_runbook = runbook_ctx.is_some();
 
     // Record skill usage.
@@ -2098,6 +2102,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             ("Companion devices", companion_ctx.as_deref()),
         ],
     );
+    super::context::place_clock(&mut session.messages, chrono::Utc::now());
     if let Some(f) = data_frame.as_deref() {
         record_layer_chars(rt.metrics(), "retrieved_data_frame", f).await;
     }
@@ -3158,12 +3163,16 @@ async fn run_inner_bound<R: HarnessRuntime>(
         Some(rp) => rp.to_string(),
         None => rt.persona_prompt().await,
     };
-    // Node-reported ids and backends are data (framed below); only the operator's guidance is system text.
+    // Skills, runbooks and the cluster guidance are chosen from the user's
+    // own words (a task's contract is not the user's; i658).
+    let selection = super::selection_text_or(prompt);
+    // Node-reported ids and backends are data (framed below); only the operator's guidance is system text,
+    // and only when the user's words are about running the cluster.
     let cluster_ctx = rt.cluster_awareness().await;
-    if !cluster_ctx.trim().is_empty() {
+    if !cluster_ctx.trim().is_empty() && super::context::ops_intent(&selection) {
         persona_prompt.push_str(super::context::CLUSTER_GUIDANCE);
     }
-    persona_prompt.push_str(&super::context::clock_context());
+    persona_prompt.push_str(super::context::CLOCK_RULE);
     session.set_system_prompt(&persona_prompt);
 
     // Fire pre-inference hooks (registered by add-ons)
@@ -3185,7 +3194,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
         // Nothing marked that as intentional; skills are described as
         // expertise the agent can invoke, not a dashboard feature.
         time_layer(rt.metrics(), "skills", async {
-            rt.prompt_skills_context(prompt, &[])
+            rt.prompt_skills_context(&selection, &[])
         }),
     );
 
@@ -3199,7 +3208,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
         rt.record_skill_usage(names, conversation_id).await;
     }
 
-    let runbook_ctx = rt.runbook_context(prompt);
+    let runbook_ctx = rt.runbook_context(&selection);
 
     session.add_user_message(prompt);
 
@@ -3302,6 +3311,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
             ("Companion devices", companion_ctx.as_deref()),
         ],
     );
+    super::context::place_clock(&mut session.messages, chrono::Utc::now());
     if let Some(f) = data_frame.as_deref() {
         record_layer_chars(rt.metrics(), "retrieved_data_frame", f).await;
     }

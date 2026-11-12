@@ -38,11 +38,12 @@ pub(crate) mod env;
 pub(crate) mod event;
 pub(crate) mod google_chat;
 pub(crate) mod prompt;
-mod sandbox_apparmor;
+pub(crate) mod sandbox_apparmor;
 pub(crate) mod sh;
 pub(crate) mod standalone;
 pub(crate) mod steps;
 mod tui;
+pub(crate) mod upfront;
 pub(crate) mod util;
 pub(crate) mod web;
 mod yamlcfg;
@@ -154,6 +155,10 @@ pub(crate) struct Skip {
     /// is the only backend. `env` (plaintext `.env`) is RETIRED and refused
     /// at parse time ([`secrets_backend_flag`]).
     pub secrets_backend: String,
+    /// `--min-free-gb <n>` — the free-space floor of the up-front check
+    /// (upfront.rs), for an owner who knows their box needs less or more.
+    /// None = the stated default ([`upfront::need_gb`]).
+    pub min_free_gb: Option<u64>,
     /// `--only a,b,c` (finding #40): run ONLY the named sections on a
     /// reconfigure — everything else is a no-touch skip. Section names:
     /// prereqs, env, secrets, tailscale, enrollment, storage, services,
@@ -676,6 +681,13 @@ pub fn onboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             "--skip-channels" => skip.channels = true,
             "--mcp-door" => skip.mcp_door = Some(true),
             "--no-mcp-door" => skip.mcp_door = Some(false),
+            "--min-free-gb" => match it.next().and_then(|v| v.trim().parse::<u64>().ok()) {
+                Some(n) => skip.min_free_gb = Some(n),
+                None => {
+                    crate::ui::failed("--min-free-gb needs a whole number of GB, e.g. --min-free-gb 20", None);
+                    return Ok(2);
+                }
+            },
             "--secrets-backend" => match secrets_backend_flag(it.next().map(String::as_str)) {
                 Ok(v) => skip.secrets_backend = v,
                 Err(code) => return Ok(code),
@@ -1199,6 +1211,14 @@ fn run_all(ctx: &mut Ctx) {
         ctx.skip.only.is_empty() || ctx.skip.only.iter().any(|o| o == name)
     };
 
+    // Up front, before anything is installed, pulled or asked (install
+    // matrix, 2026-11-12): a machine that cannot be a controller, or has too
+    // little disk for one, is told so now instead of after the pulls.
+    if only_wants("prereqs", ctx) && !upfront::check(ctx) {
+        abort_failed(ctx, "platform", "this machine cannot run the controller (see above)");
+        return;
+    }
+
     ctx.step(1, TOTAL, STEP_TITLES[0]);
     let prereqs_ok = if only_wants("prereqs", ctx) { steps::prerequisites(ctx) } else {
         ctx.info("Skipped (--only)."); true
@@ -1370,12 +1390,22 @@ fn print_final_summary(ctx: &Ctx) {
     // An install is not done until it verifies: the same
     // invariants `noo cluster verify --controller` asserts, printed here so
     // the last thing the operator reads is what still needs doing.
+    // The closing `cluster verify` did not pass (or could not run): the
+    // welcome is withheld and the last line says what still needs doing
+    // (i677 #13: "You're all set" printed under "2 problems need you").
+    let mut closing_verify_failed = false;
     if !ctx.dry_run {
         let args: Vec<String> = FINAL_VERIFY_ARGS.iter().map(|a| a.to_string()).collect();
         match crate::commands::cluster_verify(ctx.g, &args) {
             Ok(0) => ctx.success("cluster verify: every controller invariant holds"),
-            Ok(_) => ctx.warn("cluster verify: an invariant does not hold — the remedy is beside each failing row above"),
-            Err(_) => ctx.warn("cluster verify could not run — noo cluster verify --controller"),
+            Ok(_) => {
+                closing_verify_failed = true;
+                ctx.warn("cluster verify: an invariant does not hold — the remedy is beside each failing row above");
+            }
+            Err(_) => {
+                closing_verify_failed = true;
+                ctx.warn("cluster verify could not run — noo cluster verify --controller");
+            }
         }
     }
     if !ctx.skip.only.is_empty() {
@@ -1467,17 +1497,41 @@ fn print_final_summary(ctx: &Ctx) {
             ctx.raw(&format!("    {line}"));
         }
     }
-    if welcome_due(ctx.dry_run, ctx.state.interrupted, &Outcome::of(&ctx.state)) {
+    // i677 #10: this wizard installed Docker and relaunched itself with the
+    // new group. The shell the user returns to does not have it: `noo`
+    // commands bridge that themselves, `docker` does not.
+    if let Some(line) = docker_group_closing_line(std::env::var_os(crate::docker_group::RELAUNCHED_ENV).is_some()) {
+        ctx.warn(line);
+    }
+    // The LAST line is the verdict: the welcome only when nothing failed,
+    // else what still needs doing (i677 #13).
+    if welcome_due(ctx.dry_run, ctx.state.interrupted, &Outcome::of(&ctx.state), closing_verify_failed) {
         ctx.raw("");
         ctx.info("You're all set. Welcome to Noomesh!");
+    } else if !ctx.dry_run && !ctx.state.interrupted && closing_verify_failed {
+        ctx.raw("");
+        ctx.warn(CLOSING_VERIFY_NOT_DONE);
     }
+}
+
+/// The last line when the closing verify did not pass.
+pub(crate) const CLOSING_VERIFY_NOT_DONE: &str =
+    "Not done yet: cluster verify found problems (each with its remedy, above). After fixing them: noo cluster verify --controller";
+
+/// The closing line when this run installed Docker (it relaunched itself
+/// through the new docker group). Pure.
+pub(crate) fn docker_group_closing_line(relaunched_for_docker: bool) -> Option<&'static str> {
+    relaunched_for_docker.then_some(
+        "Docker was installed in this session: `noo` commands work from this terminal; \
+         for `docker` itself open a new terminal (or run `newgrp docker`)",
+    )
 }
 
 /// The welcome line is for a run that completed. A hard failure puts the
 /// "did NOT complete" block below the summary; "You're all set" above it
 /// read as success to anyone who stopped at the first line (i276).
-fn welcome_due(dry_run: bool, interrupted: bool, outcome: &Outcome) -> bool {
-    !dry_run && !interrupted && outcome.closing_failures().is_empty()
+fn welcome_due(dry_run: bool, interrupted: bool, outcome: &Outcome, closing_verify_failed: bool) -> bool {
+    !dry_run && !interrupted && !closing_verify_failed && outcome.closing_failures().is_empty()
 }
 
 /// `Key: value` lines → `Key    value` with the labels padded to the
@@ -1628,10 +1682,34 @@ mod welcome_tests {
 
     #[test]
     fn welcome_is_withheld_when_the_verdict_has_a_hard_failure() {
-        assert!(welcome_due(false, false, &Outcome::Completed));
-        assert!(!welcome_due(false, false, &Outcome::Failed(vec!["storage: x".into()])));
-        assert!(!welcome_due(true, false, &Outcome::Completed));
-        assert!(!welcome_due(false, true, &Outcome::Completed));
+        assert!(welcome_due(false, false, &Outcome::Completed, false));
+        assert!(!welcome_due(false, false, &Outcome::Failed(vec!["storage: x".into()]), false));
+        assert!(!welcome_due(true, false, &Outcome::Completed, false));
+        assert!(!welcome_due(false, true, &Outcome::Completed, false));
+    }
+
+    /// i677 #13 (matrix runs 1-4): "You're all set. Welcome to Noomesh!"
+    /// printed right under "x 2 problems need you: online, default chat".
+    /// A failed (or unrun) closing verify withholds it, and the last line
+    /// says what still needs doing.
+    #[test]
+    fn welcome_is_withheld_when_the_closing_verify_failed() {
+        assert!(!welcome_due(false, false, &Outcome::Completed, true));
+        let code = crate::test_src::own_code(include_str!("mod.rs"));
+        let tail = &code[code
+            .find("if welcome_due(ctx.dry_run, ctx.state.interrupted, &Outcome::of(&ctx.state), closing_verify_failed) {")
+            .expect("the verdict block")..];
+        let welcome = tail.find("You're all set. Welcome to Noomesh!").expect("welcome");
+        let not_done = tail.find("ctx.warn(CLOSING_VERIFY_NOT_DONE);").expect("the not-done line");
+        assert!(welcome < not_done);
+        let set = code.matches("closing_verify_failed = true;").count();
+        assert_eq!(set, 2, "set on a failed verify and on one that could not run");
+        // Both arms, by name: a verify that FAILED, and one that could not RUN.
+        let verdict = &code[code.find("match crate::commands::cluster_verify(ctx.g, &args) {").expect("the closing verify")..];
+        let failed = verdict.find("Ok(_) => {\n                closing_verify_failed = true;").expect("a failed verify withholds it");
+        let unrun = verdict.find("Err(_) => {\n                closing_verify_failed = true;").expect("an unrun verify withholds it");
+        assert!(failed < unrun);
+        assert!(super::CLOSING_VERIFY_NOT_DONE.contains("noo cluster verify --controller"));
     }
 }
 

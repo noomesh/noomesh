@@ -89,22 +89,6 @@ fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-# HTTP-code-aware fetch: the old `-fsS … 2>/dev/null || exit 0`
-# swallowed EVERY failure — TLS, DNS, 5xx — as "nothing staged". Only a 404
-# stays quiet; real failures go to the journal and fail the unit.
-CODE="$(curl -sS $TLS --connect-timeout 10 -o "$TMP/blob" -w '%{http_code}' \
-    "$URL/bootstrap/bundle/$NODE" 2>"$TMP/curlerr" || true)"
-case "$CODE" in
-    200) ;;
-    404) exit 0 ;;  # nothing staged yet — the timer will come back
-    *)
-        echo "noo-fetch: bundle fetch FAILED (HTTP ${CODE:-000}): $(tr '\n' ' ' < "$TMP/curlerr")" >&2
-        exit 1 ;;
-esac
-[ -s "$TMP/blob" ] || exit 0
-
-SUM="$(sha256sum "$TMP/blob" | cut -d' ' -f1)"
-
 # ── the fetch receipt ────────────────────────────────────────
 #
 # `fetched_at` used to be stamped by the GET above, which made it a state write
@@ -132,6 +116,72 @@ birth_proof() {
     [ -n "$_sig" ] || return 1
     printf '%s.%s' "$_ts" "$_sig"
 }
+
+# HTTP-code-aware fetch: the old `-fsS … 2>/dev/null || exit 0`
+# swallowed EVERY failure — TLS, DNS, 5xx — as "nothing staged". Only a 404
+# stays quiet; real failures go to the journal and fail the unit.
+#
+# Conditional GET: when a bundle was applied before, $LAST holds the sha256 of
+# its ciphertext, and the controller's ETag for a staged bundle is that same
+# sha in quotes. Sending it as If-None-Match lets the controller answer 304
+# with no body, instead of this node pulling ~400 MiB every third tick only to
+# find it unchanged. An older controller ignores the header and answers 200
+# with the full body: that is today's path. A missing or malformed $LAST sends
+# no header at all.
+fetch_bundle() {
+    _inm=""
+    if [ -f "$LAST" ]; then
+        _lv="$(head -c 64 "$LAST" 2>/dev/null || true)"
+        case "$_lv" in
+            *[!0-9a-f]*) ;;
+            ????????????????????????????????????????????????????????????????)
+                [ "$(wc -c < "$LAST" | tr -d ' ')" -le 65 ] && _inm="$_lv" ;;
+        esac
+    fi
+    if [ -n "$_inm" ]; then
+        CODE="$(curl -sS $TLS --connect-timeout 10 -o "$TMP/blob" -w '%{http_code}' \
+            -H "If-None-Match: \"$_inm\"" \
+            "$URL/bootstrap/bundle/$NODE" 2>"$TMP/curlerr" || true)"
+    else
+        CODE="$(curl -sS $TLS --connect-timeout 10 -o "$TMP/blob" -w '%{http_code}' \
+            "$URL/bootstrap/bundle/$NODE" 2>"$TMP/curlerr" || true)"
+    fi
+}
+fetch_bundle
+case "$CODE" in
+    200) ;;
+    304)
+        # Unchanged since the last apply: the controller said so without a
+        # body. Same receipt as the unchanged path below (fetched_at keeps
+        # being stamped), then the same quiet exit. $LAST, expect-bundle and
+        # fetch-state are not touched. `<7>` is journald's debug priority
+        # prefix on a service's stdout, so this line stays out of the way.
+        # A 304 means something only as the answer to the If-None-Match we
+        # sent, and the sha is exactly the one we sent.
+        if [ -z "$_inm" ]; then
+            echo "noo-fetch: bundle fetch FAILED (HTTP 304 to a request that sent no If-None-Match)" >&2
+            exit 1
+        fi
+        SUM="$_inm"
+        if _proof="$(birth_proof fetch "$SUM")"; then
+            curl -sS $TLS --connect-timeout 10 --max-time 20 -o /dev/null \
+                -H 'content-type: application/json' \
+                -H "x-noo-birth-proof: $_proof" \
+                -d "{\"sha\":\"$SUM\"}" \
+                "$URL/bootstrap/bundle/$NODE/fetched" >/dev/null 2>&1 || true
+        else
+            echo "noo-fetch: could not sign the fetch receipt with $KEY — fetched_at will not be stamped" >&2
+        fi
+        echo "<7>noo-fetch: bundle unchanged (304, $SUM)"
+        exit 0 ;;
+    404) exit 0 ;;  # nothing staged yet — the timer will come back
+    *)
+        echo "noo-fetch: bundle fetch FAILED (HTTP ${CODE:-000}): $(tr '\n' ' ' < "$TMP/curlerr")" >&2
+        exit 1 ;;
+esac
+[ -s "$TMP/blob" ] || exit 0
+
+SUM="$(sha256sum "$TMP/blob" | cut -d' ' -f1)"
 
 if _proof="$(birth_proof fetch "$SUM")"; then
     curl -sS $TLS --connect-timeout 10 --max-time 20 -o /dev/null \

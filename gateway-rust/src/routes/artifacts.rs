@@ -97,8 +97,44 @@ fn kind_facts(kind: &str) -> Option<(PathBuf, &'static str, &'static str)> {
         // `FROM ./<file>` relative to the Modelfile, so the two are only ever
         // useful together.
         "modelfile" => Some((gguf_dir(), "/gguf", ".modelfile")),
+        // An ollama registry tag staged as a MIRROR (`noo models fetch
+        // ollama:<tag>`): the registry's manifest verbatim, and every blob it
+        // names under its own digest. Same store and location as the weights;
+        // the names are held to a stricter shape (`ollama_mirror_name_ok`)
+        // because a node builds an ollama store path from what they say.
+        "ollamablob" => Some((gguf_dir(), "/gguf", ".ollama-blob")),
+        "ollamamanifest" => Some((gguf_dir(), "/gguf", ".ollama-manifest")),
         "image" => Some((image_dir(), "/images", ".tar")),
         _ => None,
+    }
+}
+
+/// The mirror kinds name exactly one shape each, nothing looser:
+/// `ollamablob`: `sha256-<64 lowercase hex>.ollama-blob` (the blob's own
+/// digest, which is the name ollama stores it under);
+/// `ollamamanifest`: `ollama+<ns>+<name>+<tag>.ollama-manifest`, the stem
+/// `OllamaStoreStem` builds (node-agent-go/internal/docker/ollama_stage.go).
+/// Other kinds: no extra rule.
+fn ollama_mirror_name_ok(kind: &str, name: &str) -> bool {
+    fn seg(s: &str, allow_dot: bool) -> bool {
+        let b = s.as_bytes();
+        !b.is_empty()
+            && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+            && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_' || *c == b'-' || (allow_dot && *c == b'.'))
+    }
+    match kind {
+        "ollamablob" => name
+            .strip_prefix("sha256-")
+            .and_then(|r| r.strip_suffix(".ollama-blob"))
+            .is_some_and(|h| h.len() == 64 && h.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))),
+        "ollamamanifest" => name
+            .strip_prefix("ollama+")
+            .and_then(|r| r.strip_suffix(".ollama-manifest"))
+            .is_some_and(|stem| {
+                let p: Vec<&str> = stem.split('+').collect();
+                p.len() == 3 && seg(p[0], false) && seg(p[1], true) && seg(p[2], true)
+            }),
+        _ => true,
     }
 }
 
@@ -482,6 +518,25 @@ async fn modelset_manifest(name: &str) -> Result<Response, AppError> {
 }
 
 /// GET /api/artifacts/manifest/{kind}/{name}
+/// Where a manifest request may look, decided before the store is touched:
+/// the kind's directory and data-plane prefix, or a 400 for an unknown kind or
+/// a name outside the kind's shape (the generic rule, and the Ollama mirror
+/// kinds' exact shapes). Split out of the handler so the refusal itself is
+/// tested, not only the predicates it uses.
+fn manifest_target(kind: &str, name: &str) -> Result<(PathBuf, &'static str), AppError> {
+    let Some((dir, data_prefix, ext)) = kind_facts(kind) else {
+        return Err(AppError::BadRequest(format!(
+            "unknown artifact kind '{kind}' (kinds: gguf, image, modelfile, modelset, ollamablob, ollamamanifest)"
+        )));
+    };
+    if !valid_artifact_name(name, ext) || !ollama_mirror_name_ok(kind, name) {
+        return Err(AppError::BadRequest(format!(
+            "artifact name must be a bare *{ext} filename"
+        )));
+    }
+    Ok((dir, data_prefix))
+}
+
 async fn manifest(
     State(_state): State<Arc<AppState>>,
     AxPath((kind, name)): AxPath<(String, String)>,
@@ -492,16 +547,7 @@ async fn manifest(
     if kind == "modelset" {
         return modelset_manifest(&name).await;
     }
-    let Some((dir, data_prefix, ext)) = kind_facts(&kind) else {
-        return Err(AppError::BadRequest(format!(
-            "unknown artifact kind '{kind}' (kinds: gguf, image, modelfile, modelset)"
-        )));
-    };
-    if !valid_artifact_name(&name, ext) {
-        return Err(AppError::BadRequest(format!(
-            "artifact name must be a bare *{ext} filename"
-        )));
-    }
+    let (dir, data_prefix) = manifest_target(&kind, &name)?;
     let path = dir.join(&name);
     let Some((size, mtime_unix)) = file_meta(&path) else {
         return Err(AppError::NotFound(format!(
@@ -955,6 +1001,86 @@ mod tests {
         assert!(kind_facts("modelfile").is_some());
         assert!(kind_facts("model").is_none(), "future kinds arrive explicitly, not by default");
         assert!(kind_facts("").is_none());
+        assert!(kind_facts("ollamablob").is_some());
+        assert!(kind_facts("ollamamanifest").is_some());
+    }
+
+    /// The name shapes only protect a node if the manifest route applies
+    /// them before any file in the store is looked at. The decision is
+    /// `manifest_target`, tested here by what it refuses (a test of
+    /// `ollama_mirror_name_ok` alone stays green if nothing calls it; i624
+    /// #112 mutant review), and the handler must go through it first.
+    #[test]
+    fn the_manifest_route_refuses_a_mirror_name_outside_its_shape() {
+        let hex = "0123456789abcdef".repeat(4);
+        assert!(manifest_target("ollamablob", &format!("sha256-{hex}.ollama-blob")).is_ok());
+        assert!(manifest_target("ollamamanifest", "ollama+library+gemma4+e2b-it-qat.ollama-manifest").is_ok());
+        // Each passes the generic rule; only the mirror shape refuses it.
+        for (kind, bad) in [
+            ("ollamablob", format!("sha256-{}.ollama-blob", &hex[..63])),
+            ("ollamablob", format!("x-{hex}.ollama-blob")),
+            ("ollamamanifest", "ollama+library+gemma4.ollama-manifest".to_string()),
+            ("ollamamanifest", "ollama+lib.rary+gemma4+12b.ollama-manifest".to_string()),
+        ] {
+            let (_, _, ext) = kind_facts(kind).unwrap();
+            assert!(valid_artifact_name(&bad, ext), "{bad}: the generic rule accepts it, so the mirror shape is what is tested");
+            match manifest_target(kind, &bad) {
+                Err(AppError::BadRequest(m)) => assert!(m.contains("bare"), "{m}"),
+                other => panic!("{kind}/{bad}: want a 400, got {:?}", other.map(|t| t.1)),
+            }
+        }
+        assert!(matches!(manifest_target("nope", "x.gguf"), Err(AppError::BadRequest(_))));
+    }
+
+    #[test]
+    fn the_manifest_handler_decides_its_target_before_reading_the_store() {
+        let code = crate::test_src::own_code(include_str!("artifacts.rs"));
+        let body = crate::test_src::fn_body(&code, "async fn manifest(");
+        let target = body.find("manifest_target(&kind, &name)?").expect("the handler decides its target through manifest_target");
+        let read = body.find("file_meta(").expect("the store read");
+        assert!(target < read, "the target is decided before the store is read:\n{body}");
+    }
+
+    #[test]
+    fn the_ollama_mirror_kinds_share_the_store_and_hold_names_to_one_shape() {
+        let (gd, gp, _) = kind_facts("gguf").unwrap();
+        let hex = "0123456789abcdef".repeat(4);
+        for kind in ["ollamablob", "ollamamanifest"] {
+            let (d, p, _) = kind_facts(kind).unwrap();
+            assert_eq!((d, p), (gd.clone(), gp), "{kind}: same store and location as the weights, no new mount or nginx location");
+        }
+        let (_, _, be) = kind_facts("ollamablob").unwrap();
+        let (_, _, me) = kind_facts("ollamamanifest").unwrap();
+        let ok = |kind: &str, ext: &str, n: &str| valid_artifact_name(n, ext) && ollama_mirror_name_ok(kind, n);
+        assert!(ok("ollamablob", be, &format!("sha256-{hex}.ollama-blob")));
+        for bad in [
+            format!("sha256-{}.ollama-blob", &hex[..63]),
+            format!("sha256-{hex}0.ollama-blob"),
+            format!("sha256-{}.ollama-blob", hex.to_uppercase()),
+            format!("sha256-{}g.ollama-blob", &hex[..63]),
+            format!("sha512-{hex}.ollama-blob"),
+            format!("x+sha256-{hex}.ollama-blob"),
+            format!("sha256-{hex}.ollama-manifest"),
+        ] {
+            assert!(!ok("ollamablob", be, &bad), "{bad:?} must be rejected as a blob name");
+        }
+        assert!(ok("ollamamanifest", me, "ollama+library+gemma4+e2b-it-qat.ollama-manifest"));
+        assert!(ok("ollamamanifest", me, "ollama+someone+qwen3.5+8b.ollama-manifest"));
+        for bad in [
+            "ollama+library+gemma4.ollama-manifest",
+            "ollama+lib.rary+gemma4+12b.ollama-manifest",
+            "ollama+library+Gemma4+12b.ollama-manifest",
+            "ollama+library+gemma4+12b+x.ollama-manifest",
+            "ollama++gemma4+12b.ollama-manifest",
+            "ollama+library+gemma4+.ollama-manifest",
+            "library+gemma4+12b.ollama-manifest",
+            "ollama+library+gemma4+12b.ollama-blob",
+            "ollama+library+-x+12b.ollama-manifest",
+        ] {
+            assert!(!ok("ollamamanifest", me, bad), "{bad:?} must be rejected as a manifest name");
+        }
+        // The other kinds are not narrowed by this rule.
+        assert!(ollama_mirror_name_ok("gguf", "anything.gguf"));
     }
 
     #[test]
@@ -1157,7 +1283,7 @@ mod tests {
             }
             other => panic!("expected BadRequest, got {other}"),
         }
-        for live in ["gguf", "image", "modelfile"] {
+        for live in ["gguf", "image", "modelfile", "ollamablob", "ollamamanifest"] {
             assert!(retired_kind(live, "x").is_none(), "{live} is still served");
         }
         let src = include_str!("artifacts.rs");

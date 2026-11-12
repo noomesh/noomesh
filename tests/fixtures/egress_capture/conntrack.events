@@ -1,0 +1,5 @@
+[1731360000.1]	    [NEW] ipv4     2 tcp      6 120 SYN_SENT src=172.17.0.2 dst=198.51.100.34 sport=40001 dport=443 [UNREPLIED] src=198.51.100.34 dst=10.0.0.5 sport=443 dport=40001 id=1
+[1731360009.1]	 [DESTROY] ipv4     2 tcp      6 src=172.17.0.2 dst=198.51.100.34 sport=40001 dport=443 packets=10 bytes=1500 src=198.51.100.34 dst=10.0.0.5 sport=443 dport=40001 packets=8 bytes=9000 [ASSURED] id=1
+[1731360001.1]	    [NEW] ipv4     2 tcp      6 120 SYN_SENT src=10.0.0.5 dst=198.51.100.3 sport=50000 dport=443 [UNREPLIED] src=198.51.100.3 dst=10.0.0.5 sport=443 dport=50000 id=2
+[1731360002.1]	    [NEW] ipv4     2 udp      17 30 src=10.0.0.5 dst=203.0.113.9 sport=51000 dport=123 [UNREPLIED] src=203.0.113.9 dst=10.0.0.5 sport=123 dport=51000 id=3
+[1731360003.1]	    [NEW] ipv4     2 tcp      6 120 SYN_SENT src=10.0.0.5 dst=192.168.1.20 sport=52000 dport=8443 [UNREPLIED] src=192.168.1.20 dst=10.0.0.5 sport=8443 dport=52000 id=4
