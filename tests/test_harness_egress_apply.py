@@ -81,7 +81,16 @@ class Node:
         # A clock that moves on every call: the hosts header's stamp must never count as a change.
         self._fake("date", 'n=$(cat "$CLOCK" 2>/dev/null || echo 0); echo $((n + 1)) > "$CLOCK"; printf "2026-11-12T10:00:%02dZ\\n" "$n"')
         self._fake("ip", 'cat "$IP_OUT"')
-        self._fake("systemd-run", 'echo "systemd-run $*" >> "$CALLS"\ncat "$PROBE_OUT"\nexit "$(cat "$PROBE_RC")"')
+        self.check_out = tmp / "check.out"     # non-empty: the pre-check prints this and fails
+        self.check_args = tmp / "check.args"
+        self._fake("systemd-run", 'echo "systemd-run $*" >> "$CALLS"\n'
+                   'case "$*" in *BindReadOnlyPaths*)\n'
+                   '  printf "%s\\n" "$@" > "$CHECK_ARGS"\n'
+                   '  if [ -s "$CHECK_OUT" ]; then cat "$CHECK_OUT"; exit 1; fi\n'
+                   '  while [ "$1" != _ ]; do shift; done; shift\n'
+                   '  while [ $# -ge 2 ]; do echo "ok $1 $2"; shift 2; done; exit 0 ;;\n'
+                   'esac\n'
+                   'cat "$PROBE_OUT"\nexit "$(cat "$PROBE_RC")"')
 
     def _fake(self, name: str, body: str) -> None:
         p = self.bin / name
@@ -108,7 +117,7 @@ class Node:
         env = {
             "PATH": f"{self.bin}:{self.tools}",
             "CALLS": str(self.log), "CLOCK": str(self.tmp / "clock"), "GETENT_DB": str(self.hosts_db), "IP_OUT": str(self.ip_out),
-            "PROBE_OUT": str(self.probe_out), "PROBE_RC": str(self.probe_rc),
+            "PROBE_OUT": str(self.probe_out), "PROBE_RC": str(self.probe_rc), "CHECK_OUT": str(self.check_out), "CHECK_ARGS": str(self.check_args),
             "HE_NET_DIR": str(self.net), "HE_DROPIN_DIR": str(self.dropin_dir), "HE_UNIT": str(self.unit),
             "HE_ENV": str(self.env), "HE_NSSWITCH_SRC": str(self.nss),
             "HE_OWNER_ARGS": "", "HE_STAT_OWNER": owner,
@@ -270,7 +279,7 @@ def test_an_unresolvable_name_is_tagged_left_out_and_never_falls_back(node: Node
 def test_probe_operation_not_permitted_is_enforced(node: Node) -> None:
     a = applied_of(node.run())
     assert a.endswith(" harness-egress=enforced") and "UNENFORCED" not in a, a
-    call = [c for c in node.calls() if c.startswith("systemd-run")][0]
+    call = [c for c in node.calls() if c.startswith("systemd-run") and "BindReadOnlyPaths" not in c][0]
     assert "-p IPAddressDeny=any" in call and "-p IPAddressAllow=localhost" in call and "--collect" in call
 
 
@@ -281,7 +290,8 @@ def test_probe_connection_refused_is_unenforced(node: Node) -> None:
 
 
 def test_probe_with_no_systemd_run_is_unenforced(node: Node) -> None:
-    node.drop_systemd_run()
+    applied_of(node.run())                      # files in place: the next apply has nothing pending,
+    node.drop_systemd_run()                     # so only the probe runs, and it cannot
     a = applied_of(node.run())
     assert "harness-egress=UNENFORCED:systemd-run-missing" in a and "harness-egress=enforced" not in a, a
 
@@ -312,7 +322,7 @@ def test_a_first_apply_reloads_before_the_probe_and_asks_for_the_restart(node: N
     a = applied_of(r)
     assert "harness-egress-files" in a and "RESTART=1" in r.stdout
     calls = node.calls()
-    assert calls.index("systemctl daemon-reload") < next(i for i, c in enumerate(calls) if c.startswith("systemd-run"))
+    assert calls.index("systemctl daemon-reload") < next(i for i, c in enumerate(calls) if c.startswith("systemd-run") and "BindReadOnlyPaths" not in c)
     assert not any("restart" in c for c in calls), "restart goes through the applier's own path, not here"
 
 
@@ -363,3 +373,93 @@ def test_the_apply_runs_only_where_the_harness_unit_is_part_of_the_bundle() -> N
 def test_teardown_calls_the_removal_before_it_hands_off() -> None:
     i = APPLY.index("harness_egress_remove\n    logger -t noo-apply \"teardown authorized")
     assert i < APPLY.index('echo "applied: teardown')
+
+
+# ── fail-safe: the hold is tested with its own properties before it is installed ──
+
+def precheck_calls(node: Node) -> list[str]:
+    return [c for c in node.calls() if c.startswith("systemd-run") and "BindReadOnlyPaths" in c]
+
+
+def test_a_passing_precheck_installs_the_files(node: Node) -> None:
+    a = applied_of(node.run())
+    assert len(precheck_calls(node)) == 1
+    assert node.dropin.exists() and (node.net / "hosts").exists()
+    assert "selfcheck" not in a and a.endswith("harness-egress=enforced")
+
+
+def test_the_precheck_properties_are_the_drop_in_lines(node: Node) -> None:
+    """Compared programmatically: staging dir -> install dir is the only difference."""
+    applied_of(node.run())
+    argv = node.check_args.read_text().splitlines()
+    props = [argv[i + 1] for i, a in enumerate(argv) if a == "-p"]
+    stage = re.search(r"BindReadOnlyPaths=(/\S+?)/resolv\.conf:", "\n".join(props)).group(1)
+    assert stage != str(node.net)
+    props = [x.replace(stage, str(node.net)) for x in props]
+    assert props[0] == "DynamicUser=yes"
+    dropin = [l for l in node.dropin.read_text().splitlines()
+              if l.split("=")[0] in {"IPAddressDeny", "IPAddressAllow", "BindReadOnlyPaths", "InaccessiblePaths"}]
+    assert props[1:] == dropin and len(dropin) == 6
+    assert "--collect" in argv and "--wait" in argv
+
+
+def test_the_precheck_gets_every_controller_host_and_port_with_defaults(node: Node) -> None:
+    node.env.write_text("NODE_ID=h\nNOO_GATEWAY_URL=https://ctl.example.net/api\nNATS_URL=nats://nats.example.net,tls://n2.example.net:5222\n")
+    node.hosts_db.write_text("ctl.example.net 192.168.1.5\nnats.example.net 192.168.1.6\nn2.example.net 192.168.1.7\n")
+    applied_of(node.run())
+    argv = node.check_args.read_text().splitlines()
+    assert argv[argv.index("_") + 1:] == ["ctl.example.net", "443", "n2.example.net", "5222", "nats.example.net", "4222"]
+    node.env.write_text("NODE_ID=h\nNOO_GATEWAY_URL=http://ctl.example.net\nNATS_URL=nats://nats.example.net:4222\n")
+    node.hosts_db.write_text("ctl.example.net 192.168.1.9\nnats.example.net 192.168.1.6\n")
+    applied_of(node.run())
+    argv = node.check_args.read_text().splitlines()
+    assert argv[argv.index("_") + 1:] == ["ctl.example.net", "80", "nats.example.net", "4222"]
+
+
+def test_a_failing_precheck_installs_nothing_removes_the_old_hold_and_restarts(node: Node) -> None:
+    applied_of(node.run())
+    assert node.dropin.exists()
+    node.hosts_db.write_text("ctl.example.net 203.0.113.10\nnats.example.net 100.64.1.2\n")
+    node.check_out.write_text("FAIL ctl.example.net 8000 connect\nok nats.example.net 4222\n")
+    node.log.write_text("")
+    r = node.run()
+    a = applied_of(r)
+    assert "harness-egress=UNENFORCED:selfcheck-ctl.example.net-8000" in a, a
+    assert "harness-egress=enforced" not in a
+    assert not node.dropin.exists() and not node.net.exists()
+    assert "RESTART=1" in r.stdout and "systemctl daemon-reload" in node.calls()
+    assert "the hold was NOT applied" in r.stderr and "codex placements are refused" in r.stderr
+    assert "runs unrestricted" in r.stderr
+
+
+def test_a_failing_precheck_on_a_node_with_no_hold_installs_nothing_and_asks_no_restart(node: Node) -> None:
+    node.check_out.write_text("FAIL ctl.example.net 8000 lookup\n")
+    r = node.run()
+    a = applied_of(r)
+    assert "UNENFORCED:selfcheck-ctl.example.net-8000" in a
+    assert not node.dropin.exists() and not node.net.exists()
+    assert "RESTART=0" in r.stdout
+
+
+def test_a_missing_systemd_run_is_a_failed_precheck(node: Node) -> None:
+    applied_of(node.run())
+    node.hosts_db.write_text("ctl.example.net 203.0.113.10\nnats.example.net 100.64.1.2\n")
+    node.drop_systemd_run()
+    r = node.run()
+    a = applied_of(r)
+    assert "harness-egress=UNENFORCED:selfcheck-unavailable" in a, a
+    assert not node.dropin.exists() and not node.net.exists() and "RESTART=1" in r.stdout
+
+
+def test_a_precheck_that_says_nothing_is_not_a_pass(node: Node) -> None:
+    node.check_out.write_text("some noise\n")
+    a = applied_of(node.run())
+    assert "UNENFORCED:selfcheck-unavailable" in a and not node.dropin.exists()
+
+
+def test_an_unchanged_hold_skips_the_precheck(node: Node) -> None:
+    applied_of(node.run())
+    assert len(precheck_calls(node)) == 1
+    node.check_out.write_text("FAIL ctl.example.net 8000 connect\n")   # would fail if it ran
+    a = applied_of(node.run())
+    assert len(precheck_calls(node)) == 1 and node.dropin.exists() and a.endswith("harness-egress=enforced"), a

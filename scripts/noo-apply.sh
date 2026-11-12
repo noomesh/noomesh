@@ -849,15 +849,81 @@ HE_ULA_ALLOWED=0
 
 # he_write FILE MODE SRC — install only when bytes, mode or owner differ
 # (config_unchanged); sets HE_CHANGED=1 when it wrote.
-he_write() {
+he_same() {
     if [ -n "$HE_STAT_OWNER" ]; then
-        config_unchanged "$3" "$1" "$2" "$HE_STAT_OWNER" && return 0
+        config_unchanged "$3" "$1" "$2" "$HE_STAT_OWNER"
     else
-        [ -f "$1" ] && cmp -s "$3" "$1" && return 0
+        [ -f "$1" ] && cmp -s "$3" "$1"
     fi
+}
+he_write() {
+    he_same "$1" "$2" "$3" && return 0
     # shellcheck disable=SC2086
     install -m "$2" $HE_OWNER_ARGS "$3" "$1"
     HE_CHANGED=1
+    return 0
+}
+
+# he_props DIR ALLOW — the unit properties of the hold, one per line, with the
+# bind sources under DIR. The drop-in and the pre-check both print them from
+# here, so what is tested is what is installed.
+he_props() {
+    printf '%s\n' "IPAddressDeny=any" "IPAddressAllow=$2" \
+        "BindReadOnlyPaths=$1/resolv.conf:/etc/resolv.conf" \
+        "BindReadOnlyPaths=$1/hosts:/etc/hosts" \
+        "BindReadOnlyPaths=$1/nsswitch.conf:/etc/nsswitch.conf" \
+        "InaccessiblePaths=-/run/systemd/resolve -/run/nscd -/var/run/nscd -/run/dbus/system_bus_socket -/var/run/dbus/system_bus_socket"
+}
+
+# he_targets — "host port" per controller URL in the harness env (the same two
+# variables he_names reads). Port defaults: https 443, http 80, NATS 4222.
+he_targets() {
+    [ -f "$HE_ENV" ] || return 0
+    for _he_var in NOO_GATEWAY_URL NATS_URL; do
+        _he_val="$(sed -n "s/^$_he_var=//p" "$HE_ENV" | tail -1 | tr -d "\"'" | tr ',' ' ')"
+        for _he_u in $_he_val; do
+            _he_sch="${_he_u%%://*}"; [ "$_he_sch" = "$_he_u" ] && _he_sch=""
+            _he_hp="${_he_u#*://}"; _he_hp="${_he_hp%%[/?]*}"; _he_hp="${_he_hp##*@}"
+            case "$_he_hp" in ""|\[*) continue ;; esac
+            _he_h="$_he_hp"; _he_pt=""
+            case "$_he_hp" in *:*) _he_h="${_he_hp%:*}"; _he_pt="${_he_hp##*:}" ;; esac
+            case "$_he_pt" in ""|*[!0-9]*)
+                _he_pt=4222
+                if [ "$_he_var" = NOO_GATEWAY_URL ]; then
+                    case "$_he_sch" in http) _he_pt=80 ;; *) _he_pt=443 ;; esac
+                fi ;;
+            esac
+            printf '%s %s\n' "$_he_h" "$_he_pt"
+        done
+    done | LC_ALL=C sort -u
+}
+
+# The pre-check, run INSIDE a transient unit with the hold's own properties:
+# every controller name resolves through getent and its port accepts a TCP
+# connection within 5 s. One line per target: "ok NAME PORT" / "FAIL NAME PORT WHY".
+HE_CHECK='rc=0
+while [ $# -ge 2 ]; do
+    n=$1; p=$2; shift 2
+    if ! getent hosts "$n" >/dev/null 2>&1; then echo "FAIL $n $p lookup"; rc=1; continue; fi
+    if timeout 5 bash -c "exec 3<>/dev/tcp/\$0/\$1" "$n" "$p" 2>/dev/null; then echo "ok $n $p"; else echo "FAIL $n $p connect"; rc=1; fi
+done
+exit $rc'
+
+# he_precheck STAGE_DIR ALLOW — prints nothing on success; on failure prints
+# the tag suffix (selfcheck-NAME-PORT or selfcheck-unavailable) and fails.
+he_precheck() {
+    _he_tg="$(he_targets)"
+    [ -n "$_he_tg" ] || return 0
+    command -v systemd-run >/dev/null 2>&1 || { echo "selfcheck-unavailable"; return 1; }
+    _he_stage="$1"; _he_al="$2"
+    set --
+    while IFS= read -r _he_l; do set -- "$@" -p "$_he_l"; done < <(he_props "$_he_stage" "$_he_al")
+    # shellcheck disable=SC2086
+    _he_o="$(timeout 30 systemd-run --wait --pipe --quiet --collect -p DynamicUser=yes "$@" /bin/bash -c "$HE_CHECK" _ $_he_tg 2>&1)" || true
+    _he_f="$(printf '%s\n' "$_he_o" | awk '$1 == "FAIL" {print $2 "-" $3; exit}')"
+    if [ -n "$_he_f" ]; then echo "selfcheck-$_he_f"; return 1; fi
+    # Every target must have said ok: silence or noise is "unavailable", never a pass.
+    [ "$(printf '%s\n' "$_he_o" | grep -c '^ok ')" = "$(printf '%s\n' "$_he_tg" | grep -c .)" ] || { echo "selfcheck-unavailable"; return 1; }
     return 0
 }
 
@@ -964,8 +1030,6 @@ he_probe() {
 harness_egress_apply() {
     HE_CHANGED=0; HE_UNRESOLVED=""
     _he_tmp="$(mktemp -d)"; HE_EXTRA="$_he_tmp/extra"; : > "$HE_EXTRA"
-    # shellcheck disable=SC2086
-    install -d -m 755 $HE_OWNER_ARGS "$HE_NET_DIR" "$HE_DROPIN_DIR"
 
     printf '%s\n' "# Rendered by noo-apply: the harness resolves nothing on the internet (docs/security/telemetry.md)." \
         "nameserver $HE_RESOLVER_ADDR" "options timeout:1 attempts:1" > "$_he_tmp/resolv.conf"
@@ -994,14 +1058,33 @@ harness_egress_apply() {
     {
         printf '%s\n' "# Rendered by noo-apply: the harness and every CLI it launches reach only local and tailnet" \
             "# addresses and cannot resolve internet names (docs/security/telemetry.md)." \
-            "[Service]" "IPAddressDeny=any" "IPAddressAllow=$_he_allow" \
-            "BindReadOnlyPaths=$HE_NET_DIR/resolv.conf:/etc/resolv.conf" \
-            "BindReadOnlyPaths=$HE_NET_DIR/hosts:/etc/hosts" \
-            "BindReadOnlyPaths=$HE_NET_DIR/nsswitch.conf:/etc/nsswitch.conf" \
-            "InaccessiblePaths=-/run/systemd/resolve -/run/nscd -/var/run/nscd -/run/dbus/system_bus_socket -/var/run/dbus/system_bus_socket" \
-            "RuntimeDirectory=noo-harness" "RuntimeDirectoryMode=0755"
+            "[Service]"
+        he_props "$HE_NET_DIR" "$_he_allow"
+        printf '%s\n' "RuntimeDirectory=noo-harness" "RuntimeDirectoryMode=0755"
     } > "$_he_tmp/dropin"
+    # Staging copy of the three files, where the pre-check binds them from.
+    chmod 755 "$_he_tmp"
+    he_pending=0
+    he_same "$HE_NET_DIR/resolv.conf" 644 "$_he_tmp/resolv.conf" || he_pending=1
+    he_same "$HE_NET_DIR/hosts" 644 "$_he_tmp/hosts" || he_pending=1
+    he_same "$HE_NET_DIR/nsswitch.conf" 644 "$_he_tmp/nsswitch.conf" || he_pending=1
+    he_same "$HE_DROPIN" 644 "$_he_tmp/dropin" || he_pending=1
+    chmod 644 "$_he_tmp/resolv.conf" "$_he_tmp/hosts" "$_he_tmp/nsswitch.conf"
+    if [ "$he_pending" = 1 ]; then
+        if ! _he_why="$(he_precheck "$_he_tmp" "$_he_allow")"; then
+            _he_had=0
+            { [ -e "$HE_DROPIN" ] || [ -e "$HE_NET_DIR" ]; } && _he_had=1
+            harness_egress_remove
+            case "$_he_tmp" in /tmp/*|"${TMPDIR:-/tmp}"/*) rm -rf -- "${_he_tmp:?}" ;; esac
+            echo "noo-apply: harness-egress: the hold was NOT applied ($_he_why: a controller name did not resolve or its port did not answer under the hold); the harness runs unrestricted and codex placements are refused" >&2
+            if [ "$_he_had" = 1 ]; then need_harness_restart=1; applied="$applied harness-egress-files"; fi
+            applied="$applied harness-egress=UNENFORCED:$_he_why"
+            return 0
+        fi
+    fi
 
+    # shellcheck disable=SC2086
+    install -d -m 755 $HE_OWNER_ARGS "$HE_NET_DIR" "$HE_DROPIN_DIR"
     he_write "$HE_NET_DIR/resolv.conf" 644 "$_he_tmp/resolv.conf"
     he_write "$HE_NET_DIR/hosts" 644 "$_he_tmp/hosts"
     he_write "$HE_NET_DIR/nsswitch.conf" 644 "$_he_tmp/nsswitch.conf"
