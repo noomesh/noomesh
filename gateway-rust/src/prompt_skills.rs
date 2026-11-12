@@ -1047,6 +1047,8 @@ mod differential {
             ("search the knowledge base for rag", &["rag-expert", "save-to-knowledge", "knowledge-gap-audit"]),
             ("broadcast a message to everyone", &["broadcast-message"]),
             ("Reply with the single word ok and finish.", &[]),
+            // Bare verbs are not evidence of cluster work (0.6.24-rc.1 rehearsal).
+            ("Count upward from 1, one number per loop, and note each number. Never stop and never call noo_task_done.", &[]),
         ];
 
         for (msg, expected) in cases {

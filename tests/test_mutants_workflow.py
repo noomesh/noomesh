@@ -165,6 +165,8 @@ def test_lanes_follow_the_mutant_commit_like_noo_batch():
     assert cm.lanes_for(["scripts/noo-apply.sh"], set(), set()) == ["python"]
     assert cm.lanes_for(["noomesh/x.py", "tests/test_x.py"], set(), set()) == ["python"]
     assert cm.lanes_for(["docs/x.md"], set(), set()) == []
+    # The skill corpus is read by the gateway at run time and pinned by its tests.
+    assert cm.lanes_for(["prompts/skills/core/cluster-operator.md"], set(), set()) == ["gateway-rust"]
 
 
 # ---- the harness: tallies and verdicts --------------------------------------

@@ -174,7 +174,9 @@ def lanes_for(changed: list[str], gw_in: set[str], cli_in: set[str]) -> list[str
             lanes.append(lane)
 
     for f in changed:
-        if f.startswith("gateway-rust/") or f in gw_in:
+        # prompts/ is the skill corpus and persona the gateway reads at run time;
+        # its tests load the real corpus (selection pins, the prompt budget).
+        if f.startswith("gateway-rust/") or f in gw_in or f.startswith("prompts/"):
             add("gateway-rust")
         if f.startswith("noo-cli/") or f in cli_in:
             add("noo-cli")
