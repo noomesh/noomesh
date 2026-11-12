@@ -300,3 +300,11 @@ def test_a_failed_probe_skips_the_cleanup_of_the_box_it_altered():
     skip = td.index('if [ "${PROBE_ALTERED:-0}" = 1 ]; then')
     assert skip < td.index("noo offboard --uninstall -y") and td.index("return 0", skip) < td.index("noo offboard --uninstall -y")
     assert "noo models switch \"$TINY_MODEL\" --backend ollama --yes" in text, "non-interactive switch needs --yes"
+
+
+def test_the_self_agent_diagnostics_read_only_the_named_env_keys():
+    # The env file holds the agent's token: the probe selects keys, never cats.
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    d = text[text.index("step probe-self-agent-diagnostics"):text.index("true'", text.index("step probe-self-agent-diagnostics"))]
+    assert 'grep -E "^(NATS_URL|NOO_GATEWAY_URL|CONTROLLER_URL|NODE_ID)=" /etc/noo-node-agent.env' in d
+    assert "cat /etc/noo-node-agent.env" not in d and "TOKEN" not in d
