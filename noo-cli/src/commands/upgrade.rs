@@ -3967,8 +3967,9 @@ pub(crate) fn fetch_release_file(g: &Globals, version: &str, name: &str, base_ur
     fetch_tag_file(g, &format!("{TAG_PREFIX}{version}"), name)
 }
 
-/// One asset of the GitHub release on `tag`: gh, then the direct GET only
-/// where it can help ([`release_fetch::gh_then_direct`]). Transient failures
+/// One asset of the GitHub release on `tag`: the direct `releases/download`
+/// GET, then gh only where it can help ([`release_fetch::direct_then_gh`]:
+/// a public asset never goes through the rate-limited API). Transient failures
 /// are retried with backoff on each lane; the error names the real cause
 /// The bytes are unverified here — every caller checks
 /// them against a signed manifest or signed lock, as before.
@@ -3976,7 +3977,7 @@ pub(crate) fn fetch_tag_file(g: &Globals, tag: &str, name: &str) -> Result<Vec<u
     let repo = repo();
     let gh = which("gh");
     let mut sleep = release_fetch::real_sleep;
-    release_fetch::gh_then_direct(
+    release_fetch::direct_then_gh(
         gh.as_deref(),
         &mut |gh| {
             let r = release_fetch::gh_download_with_retry(gh, &repo, tag, name, &release_fetch::DEFAULT_RETRY, &mut sleep);
