@@ -161,11 +161,25 @@ if [ "$DEEP_CLEAN" = true ] && [ -z "$DATA_ROOT" ]; then
     exit 1
 fi
 
+# i677 #20: docker must ANSWER before anything is removed. A shell outside
+# the docker group (or a daemon that is down) fails every docker call; read
+# as "nothing there", the clean would go on to remove the PKI, the secrets
+# and the data dirs while the stack runs. Not installed at all is a positive
+# answer: what is on disk is still cleaned. `noo stack clean` refuses the
+# same way before it runs this script; this covers the script run directly.
+if command -v docker >/dev/null 2>&1 && ! _docker_err="$(docker info --format '{{.ServerVersion}}' 2>&1 >/dev/null)"; then
+    echo "cannot reach docker ($(printf '%s\n' "$_docker_err" | grep -m1 -v '^[[:space:]]*$')): nothing was removed" >&2
+    echo "  run it from a shell where \`docker ps\` works (after joining the docker group: a new terminal, or \`newgrp docker\`)," >&2
+    echo "  or as root: sudo noo stack clean (with the same flags)" >&2
+    exit 1
+fi
+
 # Record starting disk space
 C_FREE_BEFORE=$(disk_free /mnt/c)
 D_FREE_BEFORE=$(disk_free /mnt/d 2>/dev/null)
 
 # Stop all profiles
+
 ui_step "Stopping all profiles"
 ALL_PROFILES="standalone controller worker monitoring vllm vllm-secondary ollama llamacpp airllm cpu gpu-tier1 gpu-tier2"
 for profile in $ALL_PROFILES; do
