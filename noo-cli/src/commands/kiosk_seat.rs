@@ -3934,7 +3934,9 @@ mod console_identity_tests {
         let up = crate::test_src::fn_body(&own, "pub(crate) fn upgrade_seats(");
         assert!(up.contains("let console = controller_console(g);"), "{up}");
         let cc = crate::test_src::fn_body(&own, "pub(crate) fn controller_console(");
-        assert!(cc.contains("\"/api/cluster/console-build\"") && cc.contains("controller_stack_tag"), "{cc}");
+        assert!(cc.contains("controller_console_or(g, super::cluster_verify::controller_stack_tag)"), "{cc}");
+        let or = crate::test_src::fn_body(&own, "pub(crate) fn controller_console_or(");
+        assert!(or.contains("\"/api/cluster/console-build\"") && or.contains(".filter(|id| id.starts_with(\"ui-\"))"), "{or}");
         let verify = crate::test_src::own_code(include_str!("cluster_verify.rs"));
         assert!(verify.contains("crate::commands::kiosk_seat::controller_console_or(g,"), "cluster verify compares against the gateway's console");
     }
