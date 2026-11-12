@@ -84,27 +84,32 @@ pub(crate) fn relaunch_if_needed(docker_err: &str) -> Option<i32> {
         .chain(argv.iter())
         .map(|a| format!("'{}'", a.replace('\'', r"'\''")))
         .collect();
-    Command::new("sg")
-        .args(["docker", "-c", &quoted.join(" ")])
-        .env(RELAUNCHED_ENV, "1")
-        .status()
-        .ok()
-        .and_then(|s| s.code())
-        .or_else(|| {
+    match Command::new("sg").args(["docker", "-c", &quoted.join(" ")]).env(RELAUNCHED_ENV, "1").status() {
+        // sg ran the command: its exit is the answer (a signal is a failure,
+        // never a reason to try another way).
+        Ok(s) => Some(s.code().unwrap_or(1)),
+        // Only when there is NO sg at all.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Ubuntu 25.10 ships without `sg` (onboard found it live): the
-            // same user, docker as the effective group. sudo resets the
-            // environment, so the marker rides on `env`.
+            // same user, docker as the effective group.
             // Never a password prompt nobody can answer: -n without a terminal.
             let mut sudo = Command::new("sudo");
             if unsafe { libc::isatty(0) } != 1 {
                 sudo.arg("-n");
             }
-            sudo.args(["-g", "docker", "env", &format!("{RELAUNCHED_ENV}=1"), &exe])
+            // -E keeps the caller's environment (sudoers implies SETENV for
+            // the ALL grant that `sudo -g docker` needs); PATH is reset by
+            // secure_path regardless, so it rides on `env` explicitly. The
+            // child gets the same argv and environment, plus the marker.
+            let path = std::env::var("PATH").unwrap_or_default();
+            sudo.args(["-E", "-g", "docker", "env", &format!("PATH={path}"), &format!("{RELAUNCHED_ENV}=1"), &exe])
                 .args(&argv)
                 .status()
                 .ok()
-                .and_then(|s| s.code())
-        })
+                .map(|s| s.code().unwrap_or(1))
+        }
+        Err(_) => None,
+    }
 }
 
 #[cfg(test)]
@@ -141,6 +146,15 @@ mod tests {
             let refuse = body.find(&format!("docker_unreachable_refusal(&why, \"{verb}\")")).unwrap_or_else(|| panic!("{f} refuses"));
             assert!(r < refuse, "{body}");
         }
+        let clean = crate::test_src::fn_body(&mesh, "pub fn mesh_clean(");
+        assert!(clean.find("crate::docker_group::relaunch_if_needed(&why)") < clean.find("super::confirm_destructive("),
+            "the relaunch comes before the confirm, so it is asked once, in the child: {clean}");
+        let me = crate::test_src::own_code(include_str!("docker_group.rs"));
+        let rel = crate::test_src::fn_body(&me, "pub(crate) fn relaunch_if_needed(");
+        let sudo = rel.find("Command::new(\"sudo\")").expect("the fallback");
+        let only = rel.find("Err(e) if e.kind() == std::io::ErrorKind::NotFound => {").expect("only when there is no sg");
+        assert!(only < sudo, "sudo runs only when sg does not exist: {rel}");
+        assert!(rel.contains("if unsafe { libc::isatty(0) } != 1 {\n                sudo.arg(\"-n\");"), "never a password prompt off a terminal: {rel}");
         let run = crate::test_src::fn_body(&mesh, "fn run_script(");
         let r = run.find("crate::docker_group::relaunch_if_needed(&why)").expect("run_script tries it");
         let script = run.find("let script = root.join(\"scripts\").join(name);").expect("before the launcher");
