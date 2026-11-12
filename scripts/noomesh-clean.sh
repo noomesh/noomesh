@@ -216,6 +216,13 @@ clean_project() {
 # project rename, so --volumes/--deep removed nothing (i677a).
 stack_volumes() {
     docker volume ls --filter "label=com.docker.compose.project=$1" --format '{{.Name}}'
+    # The one volume the launcher created outside compose, so it has no
+    # project label on every existing install: <project>_noo-data, by its
+    # EXACT name (docker volume names are global; this one is ours). i677.
+    if docker volume inspect "$1_noo-data" >/dev/null 2>&1 \
+        && [ -z "$(docker volume inspect -f '{{index .Labels "com.docker.compose.project"}}' "$1_noo-data" 2>/dev/null)" ]; then
+        printf '%s\n' "$1_noo-data"
+    fi
 }
 
 # plan_volumes DEEP VOLUME... -> one "<action> <volume>" line each:

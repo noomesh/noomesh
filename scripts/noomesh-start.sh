@@ -705,7 +705,7 @@ if [ ${#SERVICES[@]} -eq 0 ]; then
     # owned by whoever first wrote it: make them and hand them to 65532 first
     # (lib-instance.sh noo_prepare_gateway_data_dirs; same throwaway-container
     # pattern as the wizard's ensure_dir_ownership, no sudo needed).
-    noo_prepare_gateway_data_dirs
+    noo_prepare_gateway_data_dirs || { echo "aborting: the noo-data volume could not be made as compose declares it (above)" >&2; exit 1; }
 
     # noomesh.yaml must be WRITABLE BY THE GATEWAY, not just readable.
     # `noo config set` and every dashboard settings write go through the

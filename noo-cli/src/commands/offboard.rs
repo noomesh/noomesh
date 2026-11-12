@@ -896,15 +896,24 @@ fn stack_volumes(project: &str) -> Vec<String> {
 /// fallback that replaced it would also take `noomesh_*` volumes of a
 /// different project.
 fn select_stack_volumes(lines: &[String], project: &str) -> Vec<String> {
+    // The one volume the launcher used to create OUTSIDE compose, by an exact
+    // name: lib-instance.sh's gateway-dirs prep mounted `<project>_noo-data`
+    // before compose made it, so every install from then on has it with no
+    // project label (i677). An exact name, not a glob: docker volume names
+    // are global, so this name is this project's volume and no other.
+    let unlabelled_own = format!("{project}_noo-data");
     lines
         .iter()
         .filter_map(|line| {
-            let (name, labels) = line.split_once('\t')?;
-            labels
-                .split(',')
-                .filter_map(|kv| kv.split_once('='))
-                .any(|(k, v)| k == "com.docker.compose.project" && v == project)
-                .then(|| name.to_string())
+            // docker_lines trims each line, so an UNLABELLED volume (docker
+            // prints "name<TAB>") arrives as "name" with no tab at all.
+            let (name, labels) = line.split_once('\t').unwrap_or((line.as_str(), ""));
+            (name == unlabelled_own
+                || labels
+                    .split(',')
+                    .filter_map(|kv| kv.split_once('='))
+                    .any(|(k, v)| k == "com.docker.compose.project" && v == project))
+            .then(|| name.to_string())
         })
         .collect()
 }
@@ -912,9 +921,13 @@ fn select_stack_volumes(lines: &[String], project: &str) -> Vec<String> {
 fn docker_lines(args: &[&str]) -> Vec<String> {
     Command::new("docker").args(args).output().ok()
         .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).lines()
-            .map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .map(|o| lines_of(&String::from_utf8_lossy(&o.stdout)))
         .unwrap_or_default()
+}
+
+/// docker's stdout as trimmed, non-empty lines (what every docker_lines caller sees).
+fn lines_of(stdout: &str) -> Vec<String> {
+    stdout.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
 }
 
 /// The install's data root, read from its own .env (never guessed — deleting
@@ -977,6 +990,7 @@ mod volume_selection_tests {
         "noomesh-dev_cache\tcom.docker.compose.project=noomesh-dev",
         "noomesh_not_ours\tcom.docker.compose.project=someone-else",
         "noomesh_unlabelled\t",
+        "noomesh_noo-data2\t",
         "noo_legacy\t",
         "pai-assistant_hf-cache\t",
         "no-tab-at-all",
@@ -993,6 +1007,34 @@ mod volume_selection_tests {
         );
         assert_eq!(select_stack_volumes(&lines(LS), "noo-galaxy"), ["noo-galaxy_noo-data"]);
         assert!(select_stack_volumes(&lines(LS), "noomesh-d").is_empty(), "no prefix match on the label either");
+    }
+
+    /// Every existing install has `<project>_noo-data` WITHOUT the project
+    /// label (the launcher's prep created it before compose did). It is
+    /// selected by its exact name. A longer name, another project's
+    /// noo-data, or an unlabelled prefix match is not (i677).
+    #[test]
+    fn the_unlabelled_noo_data_of_this_project_is_selected_by_its_exact_name() {
+        let ls = lines(&[
+            // As docker_lines hands it over: docker prints "noomesh_noo-data<TAB>"
+            // and the trim removes the tab.
+            "noomesh_noo-data",
+            "noomesh_noo-data2",
+            "noo-galaxy_noo-data",
+            "noomesh_other",
+            "noomesh_postgres-data\tcom.docker.compose.project=noomesh",
+        ]);
+        assert_eq!(select_stack_volumes(&ls, "noomesh"), ["noomesh_noo-data", "noomesh_postgres-data"]);
+        assert_eq!(select_stack_volumes(&ls, "noo-galaxy"), ["noo-galaxy_noo-data"]);
+    }
+
+    /// End to end through the same parsing offboard uses: docker's raw
+    /// `volume ls --format '{{.Name}}\t{{.Labels}}'` output, where an
+    /// unlabelled volume is "name<TAB>" and the trim eats the tab.
+    #[test]
+    fn docker_raw_output_with_an_unlabelled_noo_data_selects_it() {
+        let raw = "noomesh_noo-data\t\nnoomesh_postgres-data\tcom.docker.compose.project=noomesh\ngo-mod-cache\t\nnoomesh_noo-data2\t\n";
+        assert_eq!(select_stack_volumes(&lines_of(raw), "noomesh"), ["noomesh_noo-data", "noomesh_postgres-data"]);
     }
 
     /// The project name mirrors scripts/lib-instance.sh.

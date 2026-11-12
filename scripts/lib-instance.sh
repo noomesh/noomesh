@@ -214,9 +214,66 @@ noo_data_volume() {
 # own error, and the gateway then names the directory it could not create.
 # Pinned by tests/test_gateway_data_dirs_prepared.py.
 NOO_GATEWAY_DATA_DIRS="ingest audit-archive"
+
+# The directory compose binds noo-data to (docker-compose.cluster.yml:
+# device ${NOO_STATE_ROOT:-${NOO_DATA_ROOT}}/noo-data). Empty when neither is set.
+noo_data_device() {
+    local root="${NOO_STATE_ROOT:-${NOO_DATA_ROOT:-}}"
+    [ -n "$root" ] && printf '%s/noo-data\n' "$root"
+}
+
+# Make sure noo-data exists AS COMPOSE DECLARES IT before anything mounts it
+# (i677). The prep below used to `docker run -v <vol>:/d` first, and on a
+# fresh box that CREATED the volume: a plain local volume with no bind and no
+# compose labels. Compose then reused it ("already exists but was not created
+# by Docker Compose"), so the gateway's /data lived in docker's own volume
+# store, not under the data root, and label-based cleanup could not see it.
+#   absent  -> create it with compose's driver, bind options and project
+#              labels; refuse (return 1) when the data root is unset or the
+#              bind directory does not exist. Never fall back to a plain one.
+#   present -> leave it. If it is NOT bound to the data root (an install that
+#              predates this), say so loudly: `noo cluster verify` names it,
+#              and moving the data is a separate, deliberate step.
+noo_ensure_data_volume() {
+    local vol dev project have
+    vol="$(noo_data_volume)"
+    project="${COMPOSE_PROJECT_NAME:-noomesh}"
+    if docker volume inspect "$vol" >/dev/null 2>&1; then
+        have="$(docker volume inspect -f '{{index .Options "device"}}' "$vol" 2>/dev/null)"
+        dev="$(noo_data_device)"
+        if [ -z "$have" ] || { [ -n "$dev" ] && [ "$have" != "$dev" ]; }; then
+            echo "WARNING: volume '$vol' is NOT bound to the data root (${dev:-NOO_DATA_ROOT unset}/): the gateway's data is at $(docker volume inspect -f '{{.Mountpoint}}' "$vol" 2>/dev/null)." >&2
+            echo "         noo cluster verify shows it; moving it into the data root is a separate step (it is never done silently)." >&2
+        fi
+        return 0
+    fi
+    dev="$(noo_data_device)"
+    if [ -z "$dev" ]; then
+        echo "ERROR: cannot create '$vol': NOO_DATA_ROOT is not set (environment or .env)." >&2
+        echo "       Run: noo onboard --only storage" >&2
+        return 1
+    fi
+    if [ ! -d "$dev" ]; then
+        echo "ERROR: cannot create '$vol': its bind directory $dev does not exist." >&2
+        echo "       It is created by the storage step: noo onboard --only storage" >&2
+        return 1
+    fi
+    if ! docker volume create --driver local \
+            --opt type=none --opt o=bind --opt device="$dev" \
+            --label com.docker.compose.project="$project" \
+            --label com.docker.compose.volume=noo-data \
+            "$vol" >/dev/null; then
+        echo "ERROR: docker could not create '$vol' bound to $dev" >&2
+        return 1
+    fi
+    return 0
+}
+
 noo_prepare_gateway_data_dirs() {
     local vol out
     vol="$(noo_data_volume)"
+    # Never let the mount below create the volume (see noo_ensure_data_volume).
+    noo_ensure_data_volume || return 1
     if ! out="$(docker run --rm -v "$vol":/d alpine \
         sh -c 'mkdir -p /d/ingest/working /d/ingest/archive /d/audit-archive && chown -R 65532:65532 /d/ingest /d/audit-archive' \
         2>&1)"; then
