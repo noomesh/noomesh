@@ -61,6 +61,8 @@ jobs:
           - {cell: ubuntu-22.04-arm64, runner: ubuntu-22.04-arm, docker: preinstalled, onboard: ci, model: tiny, scope: full, experimental: false}
           # fa: no Docker at all, the INTERACTIVE wizard through a pty.
           - {cell: stranger-24.04, runner: ubuntu-24.04, docker: none, onboard: interactive, model: default, scope: full, experimental: false}
+          # i677 pass 1: Enter at EVERY prompt. The read says it cannot finish (no-default password; the default-No passphrase loop); where it stops is the result.
+          - {cell: stranger-24.04-literal, runner: ubuntu-24.04, docker: none, onboard: interactive, model: default, scope: full, experimental: true}
           # A Mac is a node: it needs a controller a hosted runner cannot
           # reach, and hosted Apple silicon has no Docker. Install + CLI.
           - {cell: macos-15-node, runner: macos-15, docker: preinstalled, onboard: ci, model: tiny, scope: node-partial, experimental: false}
