@@ -73,10 +73,10 @@ pub fn record(pid: u32, started_at: u64, lookup_resolved: bool, connect: &str) -
 }
 
 async fn lookup_resolves() -> bool {
-    matches!(
-        tokio::time::timeout(CANARY_TIMEOUT, tokio::net::lookup_host((CANARY_NAME, 443))).await,
-        Ok(Ok(mut addrs)) if addrs.next().is_some()
-    )
+    match tokio::time::timeout(CANARY_TIMEOUT, tokio::net::lookup_host((CANARY_NAME, 443))).await {
+        Ok(Ok(mut addrs)) => addrs.next().is_some(),
+        _ => false,
+    }
 }
 
 async fn connect_canary() -> io::Result<()> {
