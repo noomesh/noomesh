@@ -1232,7 +1232,7 @@ const GROUP_DESC: &[(&str, &str)] = &[
     ("usage", "Token-usage summary"),
     ("bundle", "Signed bundle inspection"),
     ("health", "Gateway health probe"),
-    ("offboard", "Leave the fleet: stop the agent, remove enrollment state (confirms)"),
+    ("offboard", "Tear a standalone controller down to bare machine prep (confirms each step)"),
     ("systems", "Enable/disable optional systems (mints their secrets into sops)"),
     ("upgrade", "Self-update the CLI; --stack/--nodes/--controller roll the rest"),
     ("addons", "Which add-ons this install runs — the `addons:` map, without opening the file"),
@@ -2566,5 +2566,18 @@ const SOURCES: &[(&str, &str)] = &[
         for (words, _) in NATIVE {
             let _ = handler_for(words);
         }
+    }
+}
+
+#[cfg(test)]
+mod offboard_tagline_tests {
+    /// i677a 4d: offboard tears a standalone CONTROLLER down; "leave the
+    /// fleet" is what a worker's `teardown-node` does, and the README carried
+    /// both descriptions at once.
+    #[test]
+    fn offboard_is_described_as_a_controller_teardown() {
+        let d = super::GROUP_DESC.iter().find(|(n, _)| *n == "offboard").map(|(_, d)| *d).unwrap();
+        assert!(d.contains("standalone controller"), "{d}");
+        assert!(!d.to_lowercase().contains("leave the fleet"), "{d}");
     }
 }

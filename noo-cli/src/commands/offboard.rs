@@ -46,14 +46,35 @@ pub(crate) fn stop_self_heal_daemons(remove_unit: bool) {
     quiet("pkill", &["-f", "noo-host-watcher.sh"]);
     quiet("pkill", &["-f", "noo-hostd run"]);
     if remove_unit {
-        quiet("systemctl", &["--user", "disable", "noo-host-watcher"]);
+        quiet("systemctl", &["--user", "disable", "noo-host-watcher", "noo-hostd"]);
         if let Ok(h) = std::env::var("HOME") {
-            let unit = PathBuf::from(h).join(".config/systemd/user/noo-host-watcher.service");
-            let _ = std::fs::remove_file(unit);
+            remove_self_heal_units(Path::new(&h));
         }
         quiet("systemctl", &["--user", "daemon-reload"]);
         remove_secret_rundir();
     }
+}
+
+/// The self-heal daemons' systemd USER units under `home`, by exact path:
+/// the host-watcher, and noo-hostd in controller mode (its `--system` unit
+/// is `/etc/systemd/system/noo-hostd.service`, removed by the offboard walk).
+pub(crate) fn self_heal_user_units(home: &Path) -> [PathBuf; 2] {
+    let dir = home.join(".config/systemd/user");
+    [dir.join("noo-host-watcher.service"), dir.join("noo-hostd.service")]
+}
+
+/// Delete both user units (i677a 3c: the hostd one used to be stopped but
+/// left on disk, by `stack clean --deep` and by offboard alike). Exact paths
+/// only; a unit that is not there is fine.
+pub(crate) fn remove_self_heal_units(home: &Path) {
+    for unit in self_heal_user_units(home) {
+        let _ = std::fs::remove_file(unit);
+    }
+}
+
+/// The user units still on disk: what the audit reports as leftovers.
+pub(crate) fn self_heal_unit_leftovers(home: &Path) -> Vec<PathBuf> {
+    self_heal_user_units(home).into_iter().filter(|u| u.is_file()).collect()
 }
 
 /// The RAM directory the launcher writes the containers' secret files to
@@ -914,9 +935,10 @@ fn audit_leftovers(g: &Globals, print: bool) -> Vec<String> {
         Path::new("/usr/local/bin/noo-hostd").is_file()
             || Path::new("/etc/systemd/system/noo-hostd.service").is_file(),
         "binary/unit still installed".into());
-    let watcher_unit = PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join(".config/systemd/user/noo-host-watcher.service");
-    item("host-watcher user unit", watcher_unit.is_file(), watcher_unit.display().to_string());
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    let left = self_heal_unit_leftovers(&home);
+    item("self-heal user units (host-watcher, noo-hostd)", !left.is_empty(),
+        left.iter().map(|u| u.display().to_string()).collect::<Vec<_>>().join(", "));
     match docker_items(&["images", "--format", "{{.Repository}}"]) {
         Ok(l) => {
             let image_count = l.into_iter().filter(|i| crate::registry::is_our_image(i)).count();
@@ -1371,5 +1393,56 @@ mod network_selection_tests {
         assert!(!walk.contains("n.starts_with(&format!(\"{prefix}_\"))"), "no name prefix: {walk}");
         let audit = crate::test_src::fn_body(&code, "fn audit_leftovers(");
         assert!(audit.contains("item(\"stack networks (not checked)\", true,"), "{audit}");
+    }
+}
+
+#[cfg(test)]
+mod self_heal_unit_tests {
+    use super::*;
+
+    fn scratch_home(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("noo-i677a-3c-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join(".config/systemd/user")).unwrap();
+        d
+    }
+
+    /// i677a 3c: both the watcher's AND noo-hostd's user units go, by exact
+    /// path; a neighbouring unit is never touched.
+    #[test]
+    fn both_self_heal_user_units_are_removed_and_nothing_else() {
+        let home = scratch_home("rm");
+        let dir = home.join(".config/systemd/user");
+        for f in ["noo-host-watcher.service", "noo-hostd.service", "someone-else.service"] {
+            std::fs::write(dir.join(f), "[Unit]\n").unwrap();
+        }
+        assert_eq!(self_heal_unit_leftovers(&home).len(), 2, "the audit sees both before removal");
+        remove_self_heal_units(&home);
+        assert!(!dir.join("noo-hostd.service").exists(), "the hostd user unit was left on disk");
+        assert!(!dir.join("noo-host-watcher.service").exists());
+        assert!(dir.join("someone-else.service").exists(), "exact paths only");
+        assert!(self_heal_unit_leftovers(&home).is_empty());
+        remove_self_heal_units(&home); // absent is fine
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The audit lists a surviving hostd unit (not only the watcher's).
+    #[test]
+    fn the_audit_lists_a_surviving_hostd_unit() {
+        let home = scratch_home("audit");
+        std::fs::write(home.join(".config/systemd/user/noo-hostd.service"), "[Unit]\n").unwrap();
+        assert_eq!(self_heal_unit_leftovers(&home), vec![home.join(".config/systemd/user/noo-hostd.service")]);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The daemon stop (shared with `stack clean --all/--deep`) and the
+    /// audit use the tested functions.
+    #[test]
+    fn the_stop_and_the_audit_use_the_tested_functions() {
+        let own = crate::test_src::own_code(include_str!("offboard.rs"));
+        let stop = crate::test_src::fn_body(&own, "pub(crate) fn stop_self_heal_daemons(");
+        assert!(stop.contains("remove_self_heal_units(Path::new(&h));"), "{stop}");
+        let audit = crate::test_src::fn_body(&own, "fn audit_leftovers(");
+        assert!(audit.contains("self_heal_unit_leftovers(&home)"), "{audit}");
     }
 }

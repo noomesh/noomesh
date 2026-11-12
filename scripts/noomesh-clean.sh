@@ -141,7 +141,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --hf-cache      Remove Windows HuggingFace cache (models live on D:)"
             echo "  --deep          All of the above + unused images + certs/secrets (with confirmation)"
             echo "                  Postgres & Redis volumes are prompted individually"
-            echo "  --all           Same as --deep"
+            echo "  --all           --volumes + --images + --cache (keeps data dirs, PKI, secrets; NOT --deep)"
             echo "  -y, --yes       Auto-confirm every prompt (unattended)"
             echo "  -h, --help      Show this help"
             echo ""

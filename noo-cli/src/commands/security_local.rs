@@ -2159,6 +2159,19 @@ fn cert_node_name(cert_name: &str) -> Option<&str> {
 
 /// Non-fatal interactive y/N (stderr prompt, default No). False on any
 /// non-TTY/read trouble — optional offers must never block a pipe.
+/// What teardown-node says when it keeps the node's tailnet device record
+/// (i677a 3b). Without a TTY, `-y` or not, the answer is No: deleting a
+/// device record is outward and hard to undo, so it is never assumed. The
+/// line says what that costs and the one flag that does it next time.
+pub(crate) fn tailnet_kept_note(name: &str, dismantled: bool) -> String {
+    if !dismantled {
+        return "device record kept in the tailnet: the teardown was not confirmed".to_string();
+    }
+    format!("device record KEPT in the tailnet (declined, or no TTY to ask): the next enroll registers as \
+             {name}-1. `--purge-tailscale` (or `--factory`) on teardown-node deletes it; for this one, \
+             remove {name} in the Tailscale admin console")
+}
+
 fn ask_yn(prompt: &str) -> bool {
     use std::io::{BufRead as _, Write as _};
     if unsafe { libc::isatty(0) } != 1 {
@@ -2642,7 +2655,7 @@ fn teardown_one(g: &Globals, name: &str, host: &str, purge_data: bool, purge_ts:
         let ip = registered_tailnet_ip(g, &name).unwrap_or_else(|| host.clone());
         delete_tailnet_device(g, &name, Some(&ip))
     } else {
-        "device left in tailnet (declined / non-interactive; --purge-tailscale forces it)".to_string()
+        tailnet_kept_note(&name, dismantled)
     };
 
     // Forget the node controller-side (finding #76): DB row + mesh KV, via
@@ -6419,5 +6432,29 @@ mod parse_pin_tests {
             assert_eq!(&parse_untrust_ca(&argv), want, "untrust-ca {args:?}");
         }
         assert_eq!(ExitCode::Usage as i32, 2, "the path refusal exits 2, like the usage error");
+    }
+}
+
+#[cfg(test)]
+mod tailnet_kept_note_tests {
+    use super::*;
+
+    /// i677a 3b: the default stays No without a TTY; the line says what it
+    /// costs and the exact flag.
+    #[test]
+    fn a_kept_device_record_names_the_cost_and_the_flag() {
+        let l = tailnet_kept_note("gpu-2", true);
+        assert!(l.contains("KEPT"), "{l}");
+        assert!(l.contains("the next enroll registers as gpu-2-1"), "{l}");
+        assert!(l.contains("`--purge-tailscale`"), "{l}");
+        assert!(!l.contains('\n'), "one line: {l}");
+        let n = tailnet_kept_note("gpu-2", false);
+        assert!(n.contains("not confirmed") && !n.contains("gpu-2-1"), "{n}");
+    }
+
+    #[test]
+    fn teardown_prints_the_tested_note() {
+        let own = crate::test_src::own_code(include_str!("security_local.rs"));
+        assert!(own.contains("    } else {\n        tailnet_kept_note(&name, dismantled)\n    };"));
     }
 }
