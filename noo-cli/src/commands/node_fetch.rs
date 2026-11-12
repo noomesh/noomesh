@@ -1063,7 +1063,7 @@ fn on_status(code: u16, last: Option<&str>) -> FetchOutcome {
         200 => FetchOutcome::Fetched,
         304 => match if_none_match_for(last) {
             Some(_) => FetchOutcome::Unchanged(last.unwrap_or_default().trim().to_string()),
-            None => FetchOutcome::Failed,
+            None => FetchOutcome::Unchanged(String::new()),
         },
         404 => FetchOutcome::NothingStaged,
         _ => FetchOutcome::Failed,
