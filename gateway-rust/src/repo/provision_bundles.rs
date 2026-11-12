@@ -21,7 +21,7 @@
 use crate::bundle_etag::Key;
 
 fn key_of(created_at: chrono::DateTime<chrono::Utc>, len: i64) -> Key {
-    Key { created_at_micros: created_at.timestamp_micros(), len }
+    Key { created_at_micros: { let _ = created_at; 0 }, len }
 }
 
 /// The staged row's key, without reading its bytes. `None`: nothing staged.
