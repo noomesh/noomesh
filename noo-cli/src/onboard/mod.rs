@@ -43,6 +43,7 @@ pub(crate) mod sh;
 pub(crate) mod standalone;
 pub(crate) mod steps;
 mod tui;
+pub(crate) mod upfront;
 pub(crate) mod util;
 pub(crate) mod web;
 mod yamlcfg;
@@ -1198,6 +1199,14 @@ fn run_all(ctx: &mut Ctx) {
     let only_wants = |name: &str, ctx: &Ctx| -> bool {
         ctx.skip.only.is_empty() || ctx.skip.only.iter().any(|o| o == name)
     };
+
+    // Up front, before anything is installed, pulled or asked (install
+    // matrix, 2026-11-12): a machine that cannot be a controller, or has too
+    // little disk for one, is told so now instead of after the pulls.
+    if only_wants("prereqs", ctx) && !upfront::check(ctx) {
+        abort_failed(ctx, "platform", "this machine cannot run the controller (see above)");
+        return;
+    }
 
     ctx.step(1, TOTAL, STEP_TITLES[0]);
     let prereqs_ok = if only_wants("prereqs", ctx) { steps::prerequisites(ctx) } else {
