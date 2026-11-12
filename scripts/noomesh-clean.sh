@@ -247,15 +247,18 @@ stack_volumes() {
 }
 
 # plan_volumes DEEP VOLUME... -> one "<action> <volume>" line each:
-#   keep    hf-cache always; postgres-data/redis-data without --deep
-#   ask     postgres-data/redis-data on --deep (asked one by one)
+#   keep    hf-cache always; postgres-data/redis-data/noo-data without --deep
+#   ask     postgres-data/redis-data/noo-data on --deep (asked one by one)
 #   remove  everything else of this project
+# noo-data is stateful (the gateway's ingest, audit archive and digest
+# cache), and on a legacy install it is a plain volume whose data lives
+# INSIDE docker: it is never in the bulk removal (i677 #20).
 plan_volumes() {
     local deep="$1" vol; shift
     for vol in "$@"; do
         case "$vol" in
             *hf-cache*) echo "keep $vol" ;;
-            *postgres-data*|*redis-data*)
+            *postgres-data*|*redis-data*|*_noo-data)
                 if [ "$deep" = true ]; then echo "ask $vol"; else echo "keep $vol"; fi ;;
             *) echo "remove $vol" ;;
         esac
@@ -306,6 +309,7 @@ if [ "$REMOVE_VOLUMES" = true ]; then
         case "$vol" in
             *postgres-data*) ui_note "$(ui_bad "removing this deletes ALL conversation history, knowledge base, user accounts, and scheduled tasks")" ;;
             *redis-data*)    ui_note "$(ui_bad "removing this clears the LLM response cache and all active sessions")" ;;
+            *_noo-data)      ui_note "$(ui_bad "removing this deletes the gateway's ingest staging, audit archive and digest cache (on an install from 0.6.10 on, the data itself lives inside this volume)")" ;;
         esac
         if confirm "Remove $vol?"; then
             docker volume rm "$vol" >/dev/null 2>&1 && ui_done "Removed $vol" && TO_REMOVE="$TO_REMOVE $vol"
