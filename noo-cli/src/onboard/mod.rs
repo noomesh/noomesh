@@ -983,7 +983,7 @@ fn abort_failed(ctx: &mut Ctx, step: &'static str, reason: &str) {
 /// opened by hand; tailscale: NODE_IP, gateway_url; addons: a licensed add-on
 /// turned off; secrets, enrollment, storage: credentials, certificates, the
 /// data root), so they keep the guard and its `--reconfigure`.
-pub(crate) const RERUN_SAFE: [&str; 3] = ["prereqs", "model", "channels"];
+pub(crate) const RERUN_SAFE: [&str; 4] = ["prereqs", "model", "channels", "services"];
 
 /// Whether the idempotent-install guard answers this run ("already
 /// onboarded" on a configured host). Not for a fresh host, not with
