@@ -512,6 +512,25 @@ pub(crate) fn project_for(instance: &str, env_project: Option<&str>) -> String {
     }
 }
 
+/// The launcher's EXTERNAL cluster network (created outside compose, so it
+/// carries no project label). Mirrors `scripts/lib-instance.sh`:
+/// `NOO_CLUSTER_NETWORK` when set, else `noo-<instance>-cluster` for a named
+/// instance, else `noo-cluster`.
+pub fn cluster_network() -> String {
+    cluster_network_for(&instance(), std::env::var("NOO_CLUSTER_NETWORK").ok().as_deref())
+}
+
+/// [`cluster_network`], pure.
+pub(crate) fn cluster_network_for(instance: &str, env_net: Option<&str>) -> String {
+    if !instance.is_empty() {
+        return format!("noo-{instance}-cluster");
+    }
+    match env_net.map(|n| n.trim().trim_matches('"')).filter(|n| !n.is_empty()) {
+        Some(n) => n.to_string(),
+        None => "noo-cluster".to_string(),
+    }
+}
+
 /// Container-name prefix for this instance — mirrors
 /// `scripts/lib-instance.sh` exactly: `noo-<name>` for a named instance;
 /// for the default one, `NOO_CONTAINER_PREFIX` when set (the launcher

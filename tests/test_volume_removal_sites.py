@@ -20,13 +20,19 @@ from tests._rust_src import own_code
 
 ROOT = Path(__file__).resolve().parent.parent
 
-REMOVAL = re.compile(r'volume rm|"volume",\s*"rm"|"volume"\.into\(\),\s*"rm"\.into\(\)|volume prune|down -v\b')
+REMOVAL = re.compile(
+    r'volume rm|"volume",\s*"rm"|"volume"\.into\(\),\s*"rm"\.into\(\)|volume prune|down -v\b'
+    r'|network rm|"network",\s*"rm"|"network"\.into\(\),\s*"rm"\.into\(\)|network prune'
+)
 
 # (file, a substring of the line) -> why it is safe
 SITES = {
     ("noo-cli/src/commands/offboard.rs", 'run("docker", &["volume".into(), "rm".into(), "-f".into(), v.clone()]);'):
         "offboard: the user ran it and confirmed (or -y) 'STOP + DELETE the stack (containers, volumes = ALL DATA)'; "
         "the volumes are this project's, by exact label or the exact legacy noo-data name",
+    ("noo-cli/src/commands/offboard.rs", 'run("docker", &["network".into(), "rm".into(), n.clone()]);'):
+        "offboard: inside the same confirmed 'STOP + DELETE the stack' consent, after the containers; this "
+        "project's networks by exact label plus the launcher's cluster network by exact name (networks hold no data)",
     ("noo-cli/src/onboard/steps.rs", '.args(["volume", "rm", "-f", &vol])'):
         "onboard's reaper: ONLY a stale bind record (a different non-empty path; the data stays on the host), "
         "announced before it runs; an unbound volume or a failed inspect is kept",
@@ -54,8 +60,8 @@ SITES = {
         "an error message, not a removal",
 }
 
-# Dev-only tools that manage their own throwaway volumes, never a user's stack.
-OUT_OF_SCOPE = {"scripts/noomesh-sandbox.sh", "scripts/cargo-docker.sh"}
+# Dev and CI tools that manage their own throwaway volumes and networks, never a user's stack.
+OUT_OF_SCOPE = {"scripts/noomesh-sandbox.sh", "scripts/cargo-docker.sh", "scripts/lib-baseline-db.sh"}
 
 
 def _lines():
