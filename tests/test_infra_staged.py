@@ -336,3 +336,43 @@ def test_the_run_builds_the_ref_it_was_dispatched_on_and_the_schedule_builds_dev
     run = step["run"]
     assert run.index('"$STAGE_REF" != "refs/heads/dev"') < run.index("imagetools create"), \
         "the dev-only guard must come before :staged moves"
+
+
+
+# ----------------------------------------------------------- riding findings (2026-11-12, i687)
+
+def _dated(*vulns):
+    """(id, pkg, severity, fixed, installed, published) per finding."""
+    return {"Results": [{"Target": "t", "Vulnerabilities": [
+        {"VulnerabilityID": i, "PkgName": p, "Severity": s, "FixedVersion": f, "InstalledVersion": inst,
+         "PublishedDate": pub} for i, p, s, f, inst, pub in vulns]}]}
+
+
+def test_a_fixable_finding_older_than_a_week_is_reported_with_what_fixes_it():
+    from datetime import datetime, timezone
+    now = datetime(2026, 11, 12, tzinfo=timezone.utc)
+    rep = {"linux-amd64": _dated(
+        ("CVE-A", "stdlib", "HIGH", "1.26.3", "1.26.0", "2026-10-01T00:00:00Z"),      # 42 days: riding
+        ("CVE-B", "golang.org/x/net", "CRITICAL", "0.55.0", "0.46.0", "2026-11-10T00:00:00Z"),  # 2 days: not yet
+        ("CVE-C", "stdlib", "MEDIUM", "1.26.4", "1.26.0", "2026-09-01T00:00:00Z"),    # not HIGH/CRITICAL
+        ("CVE-D", "stdlib", "HIGH", "", "1.26.0", "2026-09-01T00:00:00Z"),            # no fix: not "fixable"
+        ("CVE-E", "stdlib", "HIGH", "1.26.9", "1.26.0", "not a date"))}               # no date: no guess
+    assert S.riding_findings(rep, now) == [("stdlib", "1.26.0", "1.26.3", "CVE-A", 42)]
+    # the same finding on two platforms is one row
+    rep["linux-arm64"] = rep["linux-amd64"]
+    assert len(S.riding_findings(rep, now)) == 1
+
+
+def test_riding_findings_are_reported_but_never_change_the_gate(tmp_path):
+    (tmp_path / "new").mkdir()
+    (tmp_path / "old").mkdir()
+    old_pub = "2020-01-01T00:00:00Z"
+    report = _dated(("CVE-OLD", "stdlib", "HIGH", "1.26.3", "1.26.0", old_pub))
+    (tmp_path / "new" / "linux-amd64.json").write_text(json.dumps(report))
+    (tmp_path / "old" / "linux-amd64.json").write_text(json.dumps(report))  # inherited
+    r = subprocess.run([sys.executable, str(ROOT / "scripts/infra-staged.py"), "new-findings",
+                        "--new", str(tmp_path / "new" / "linux-amd64.json"),
+                        "--old", str(tmp_path / "old" / "linux-amd64.json")], capture_output=True, text=True)
+    assert r.returncode == 0, "inherited and riding: reported, not gated"
+    assert "RIDING: 1 fixable HIGH/CRITICAL with a fix published more than 7 days ago" in r.stdout, r.stdout
+    assert "stdlib 1.26.0 -> 1.26.3: 1 (CVE-OLD" in r.stdout, r.stdout

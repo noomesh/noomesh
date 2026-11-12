@@ -361,6 +361,38 @@ def index_platforms(index: dict) -> list[str]:
     return out
 
 
+RIDING_DAYS = 7
+
+
+def riding_findings(reports: dict[str, dict], now, days: int = RIDING_DAYS) -> list[tuple[str, str, str, str, int]]:
+    """Fixable HIGH/CRITICAL findings whose advisory was published more than
+    `days` days before `now`: (package, installed, fixed, id, age in days),
+    oldest first. REPORTED, never gated (2026-11-12, i687): the gate rightly
+    passes what the current :staged already has, so without this a fixable
+    finding rode silently while the release that fixes it sat upstream
+    (ollama: fixed upstream 10-28, still pinned two weeks later). The age is
+    the advisory's PublishedDate, so no state is kept between runs; a finding
+    with no date is not reported (no guessing)."""
+    from datetime import datetime
+    seen: dict[tuple[str, str], tuple[str, str, str, str, int]] = {}
+    for report in reports.values():
+        for res in report.get("Results") or []:
+            for v in res.get("Vulnerabilities") or []:
+                if v.get("Severity") not in ("HIGH", "CRITICAL") or not v.get("FixedVersion"):
+                    continue
+                pub = v.get("PublishedDate") or ""
+                try:
+                    when = datetime.fromisoformat(pub.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                age = (now - when).days
+                if age > days:
+                    key = (v["VulnerabilityID"], v["PkgName"])
+                    seen.setdefault(key, (v["PkgName"], v.get("InstalledVersion", "?"), v["FixedVersion"],
+                                          v["VulnerabilityID"], age))
+    return sorted(seen.values(), key=lambda r: (-r[4], r[0], r[3]))
+
+
 def new_findings(new_reports: dict[str, dict], old_reports: dict[str, dict] | None) -> set[tuple[str, str]]:
     """Pairs in the new build that the current :staged lacks, PER PLATFORM:
     a platform's new report is compared with the SAME platform's old one.
@@ -443,6 +475,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {platform}: the current :staged has no {platform} copy, so every finding on it counts as new")
     for vid, pkg in total:
         print(f"  {'NEW ' if (vid, pkg) in found else '    '}{vid} {pkg}")
+    from datetime import datetime, timezone
+    riding = riding_findings(new, datetime.now(timezone.utc))
+    if riding:
+        print(f"RIDING: {len(riding)} fixable HIGH/CRITICAL with a fix published more than {RIDING_DAYS} days ago "
+              "(reported, not gated); by what fixes them:")
+        groups: dict[tuple[str, str, str], list] = {}
+        for pkg, have, fixed, vid, age in riding:
+            groups.setdefault((pkg, have, fixed), []).append((vid, age))
+        for (pkg, have, fixed), rows in sorted(groups.items(), key=lambda g: -max(a for _, a in g[1])):
+            print(f"  {pkg} {have} -> {fixed}: {len(rows)} ({', '.join(f'{v} {a}d' for v, a in rows[:6])}"
+                  + (f", +{len(rows) - 6} more" if len(rows) > 6 else "") + ")")
     if found:
         print(f"infra-staged: {len(found)} fixable HIGH/CRITICAL finding(s) the current :staged does not have; "
               "keeping the previous :staged", file=sys.stderr)
