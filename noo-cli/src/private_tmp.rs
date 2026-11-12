@@ -66,14 +66,6 @@ impl Drop for Dir {
     }
 }
 
-/// A path for one scratch FILE named `name`, inside a fresh private [`dir`].
-/// Returns (the dir, the file path); remove the dir when done.
-pub(crate) fn file(prefix: &str, name: &str) -> Result<(PathBuf, PathBuf), String> {
-    let d = dir(prefix)?;
-    let f = d.join(name);
-    Ok((d, f))
-}
-
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
@@ -91,10 +83,7 @@ mod tests {
             let suffix = name.strip_prefix("noo-private-tmp-test-").expect("prefix");
             assert_eq!(suffix.len(), 16, "not 64 random bits: {name}");
         }
-        let (d, f) = super::file("noo-private-tmp-test", "x.sh").unwrap();
-        assert_eq!(f.parent(), Some(d.as_path()));
-        assert!(!f.exists());
-        for d in [a, b, d] {
+        for d in [a, b] {
             let _ = std::fs::remove_dir_all(d);
         }
         let g = super::Dir::new("noo-private-tmp-guard").unwrap();
