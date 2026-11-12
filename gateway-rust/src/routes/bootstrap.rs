@@ -2326,8 +2326,34 @@ mod tests {
         assert!(!receipt.contains("bundle_pull_write_unsigned"),
             "the fetch receipt must not stamp fetched_at without a proof");
         let get = body("provision_bundle_get");
-        assert!(get.contains("SELECT blob"), "parse missed provision_bundle_get");
-        assert!(!get.contains("UPDATE"), "the public GET must be a pure read");
+        assert!(get.contains("crate::repo::provision_bundles::blob(&state.db, &node)"), "parse missed provision_bundle_get");
+        for w in ["UPDATE", "INSERT", "DELETE", "sqlx::", "state.db.begin"] {
+            assert!(!get.contains(w), "the public GET must be a pure read: it holds {w:?}");
+        }
+        // Everything the GET calls into is one of two modules, and both are
+        // read-only for the database:
+        for (i, _) in get.match_indices("crate::") {
+            let rest = &get[i..];
+            assert!(
+                rest.starts_with("crate::repo::provision_bundles::") || rest.starts_with("crate::bundle_etag::"),
+                "the public GET calls {}", rest.lines().next().unwrap_or(rest)
+            );
+        }
+        // - repo::provision_bundles: SELECTs only (its statements are pinned
+        //   by text in that module's own guard);
+        let repo = crate::test_src::own_code(include_str!("../repo/provision_bundles.rs"));
+        assert!(repo.contains("pub async fn blob("), "parse missed repo::provision_bundles");
+        for w in ["UPDATE", "INSERT", "DELETE", "sqlx::query(", "sqlx::query_scalar("] {
+            assert!(!repo.contains(w), "repo::provision_bundles must only read: it holds {w:?}");
+        }
+        // - bundle_etag: count() and remember() on the 304 and 200 paths are
+        //   the IN-MEMORY ETag cache and counters; that module holds no SQL
+        //   and no pool, so they write nothing durable.
+        let etag = crate::test_src::own_code(include_str!("../bundle_etag.rs"));
+        assert!(etag.contains("pub fn count(") && etag.contains("pub fn remember("), "parse missed bundle_etag");
+        for w in ["sqlx", "PgPool", "state.db", "std::fs::"] {
+            assert!(!etag.contains(w), "bundle_etag must stay in memory: it holds {w:?}");
+        }
         assert!(!src.contains(&["\"NOO_BOOTSTRAP_", "ACCEPT_UNSIGNED_FETCH\""].concat()),
             "the retired gate must not be read again");
     }
