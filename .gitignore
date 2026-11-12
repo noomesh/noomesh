@@ -165,3 +165,4 @@ demo-out/
 # Written by test-core's pytest line (CI and scripts/test-core-local.sh).
 .coverage
 coverage.xml
+.noo-apparmor-noo-sandbox
