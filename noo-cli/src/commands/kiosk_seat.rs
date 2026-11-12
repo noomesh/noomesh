@@ -2123,7 +2123,9 @@ fn check(name: &'static str, verdict: super::cluster_verify::Verdict, detail: St
     super::cluster_verify::Check { name, verdict, detail, remedy }
 }
 
-fn norm_tag(t: &str) -> String {
+/// A console build or stack tag as the display check compares it
+/// (`stack-v0.6.20+sha` -> `v0.6.20`); `upgrade_deps::decide_seat` reads it too.
+pub(crate) fn norm_tag(t: &str) -> String {
     let t = t.trim().split('+').next().unwrap_or("").trim_start_matches("stack-");
     if t.is_empty() || t.starts_with('v') { t.to_string() } else { format!("v{t}") }
 }

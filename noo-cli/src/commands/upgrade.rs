@@ -3511,8 +3511,7 @@ fn leafless_macs(nodes: &[(String, bool, String)]) -> Vec<String> {
 /// Stricter than the stager: an empty or unparseable version (offline, not
 /// yet heartbeated) is NOT there yet — this is a wait, not a staging guess.
 fn reached_leaf_floor(app_version: &str) -> bool {
-    super::node_leaves::cli_version_triple(app_version)
-        .is_some_and(|v| v >= super::node_leaves::LEAF_KINDS_MAC_FLOOR)
+    super::upgrade_deps::reached(super::upgrade_deps::Item::MacLeaves, app_version)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

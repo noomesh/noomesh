@@ -3832,11 +3832,9 @@ pub(crate) fn gateway_asset_for(os: &str, arch: &str) -> Option<String> {
 /// is silently withholding the harness from every node whose version we
 /// failed to read.
 pub(crate) fn applier_knows_harness_kinds(darwin: bool, app_version: &str) -> bool {
-    if !darwin {
-        return true;
-    }
-    // The Mac applier learned the harness kinds in noo-cli-v0.5.40.
-    super::node_leaves::cli_version_triple(app_version).is_none_or(|v| v >= (0, 5, 40))
+    // The Mac applier learned the harness kinds in noo-cli-v0.5.40: the
+    // `Harness` row of `upgrade_deps::DEPS`.
+    super::upgrade_deps::meets(super::upgrade_deps::Item::Harness, darwin, app_version)
 }
 
 pub(crate) fn hostd_asset_for(os: &str, arch: &str) -> Option<String> {
@@ -4548,33 +4546,30 @@ fn image_tag() -> String {
 /// refuse the line anyway.)
 pub(crate) const CLUSTER_TRUST_ENV_KEYS: &[&str] = &["NODE_AGENT_BIND"];
 
-/// The first CLI whose Mac applier accepts [`CLUSTER_TRUST_ENV_KEYS`] in an
-/// `agent-env` payload (node_fetch.rs `AGENT_ENV_KEYS`). A Linux node is
-/// never withheld from: `noo-apply.sh` self-updates before it validates.
-///
-/// This is the TAG the keys first shipped in, not the version the change was
-/// written against: the keys landed on dev while 0.6.8 was in flight and were
-/// first released in noo-cli-v0.6.10. With the floor at 0.6.8, a 0.6.9 Mac
-/// (mcmini, 2026-10-23) was sent the keys and its applier refused the whole
-/// bundle with exit 65 — including the CLI that would have taught it the keys.
-/// The applier now self-updates before it validates (node_fetch.rs
-/// `verify_bundle_with`), so this floor is belt-and-braces for Macs whose
-/// applier predates that too. A future template key joins
-/// [`CLUSTER_TRUST_ENV_KEYS`]'s treatment by being added to a table like this
-/// one with its own floor (tests/test_apply_env_unit_shape.py fails first).
-const CLUSTER_TRUST_KEYS_MAC_FLOOR: (u32, u32, u32) = (0, 6, 10);
+// The first CLI whose Mac applier accepts [`CLUSTER_TRUST_ENV_KEYS`] in an
+// `agent-env` payload (node_fetch.rs `AGENT_ENV_KEYS`) is the
+// `ClusterTrustKeys` row of `upgrade_deps::DEPS` (0.6.10). A Linux node is
+// never withheld from: `noo-apply.sh` self-updates before it validates.
+//
+// That is the TAG the keys first shipped in, not the version the change was
+// written against: the keys landed on dev while 0.6.8 was in flight and were
+// first released in noo-cli-v0.6.10. With the floor at 0.6.8, a 0.6.9 Mac
+// (mcmini, 2026-10-23) was sent the keys and its applier refused the whole
+// bundle with exit 65 — including the CLI that would have taught it the keys.
+// The applier now self-updates before it validates (node_fetch.rs
+// `verify_bundle_with`), so this floor is belt-and-braces for Macs whose
+// applier predates that too. A future template key joins
+// `CLUSTER_TRUST_ENV_KEYS`'s treatment by getting its own DEPS row with its
+// own floor (tests/test_apply_env_unit_shape.py fails first).
 
 /// Does this node's applier accept the cluster-trust keys? On a Mac an
-/// unreadable or missing version is assumed OLD: omitting the keys is
-/// harmless (the agent defaults both) while sending them to an applier that
-/// predates them strands the whole bundle, including the newer CLI that
-/// would have taught it. The next restage, once the node reports the new
-/// version, carries them.
+/// unreadable or missing version is assumed OLD (the row's `Unknown::Withhold`):
+/// omitting the keys is harmless (the agent defaults both) while sending them
+/// to an applier that predates them strands the whole bundle, including the
+/// newer CLI that would have taught it. The next restage, once the node
+/// reports the new version, carries them.
 pub(crate) fn applier_knows_cluster_trust_keys(darwin: bool, app_version: &str) -> bool {
-    if !darwin {
-        return true;
-    }
-    super::node_leaves::cli_version_triple(app_version).is_some_and(|v| v >= CLUSTER_TRUST_KEYS_MAC_FLOOR)
+    super::upgrade_deps::meets(super::upgrade_deps::Item::ClusterTrustKeys, darwin, app_version)
 }
 
 /// `body` without the lines that set any of `keys`.
