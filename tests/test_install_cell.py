@@ -219,3 +219,46 @@ def test_a_failed_step_ends_the_cell_and_tears_down_at_most_once(tmp_path):
     assert steps == ["box", "install", "version"], steps
     s = json.loads((tmp_path / "out" / "summary.json").read_text())
     assert s["result"] == "fail" and s["failed_step"] == "version"
+
+
+def test_the_size_report_runs_end_to_end_on_a_faked_registry(tmp_path, monkeypatch, capsys):
+    # Run 2 (2026-11-12): a local named `repo` shadowed repo() and main()
+    # died after every unit had passed. Drive main() whole, faking only the
+    # transport (gh, git, the registry).
+    d = lambda c: "sha256:" + c * 64  # noqa: E731
+    lock_new = f"gateway@{d('a')}\nollama@{d('b')}\n"
+    lock_old = f"gateway@{d('c')}\nollama@{d('b')}\n"
+    index = lambda m: {"manifests": [{"digest": m, "platform": {"os": "linux", "architecture": "amd64"}}]}  # noqa: E731
+    man = {d("1"): {"layers": [L("base", 10), L("g-new", 20)]},
+           d("2"): {"layers": [L("base", 10), L("g-old", 25)]},
+           d("3"): {"layers": [L("o", 100)]},
+           d("9"): {"layers": [L("base", 10)]}}
+    idx = {d("a"): index(d("1")), d("c"): index(d("2")), d("b"): index(d("3")), d("8"): index(d("9"))}
+    table = {"images": {"gateway": {"dockerfile": "docker/Dockerfile.gateway-rust"},
+                        "ollama": {"dockerfile": "docker/Dockerfile.ollama"}}}
+
+    def sh(*cmd):
+        if cmd[:3] == ("gh", "release", "download"):
+            return lock_new if cmd[3] == "stack-v2.0.0" and cmd[-3].endswith(".lock") else \
+                (lock_old if cmd[-3].endswith(".lock") else "")
+        if cmd[:3] == ("gh", "release", "view"):
+            return json.dumps({"assets": [{"name": "noo-x", "size": 9_000_000}, {"name": "noo-x.sha256", "size": 90}]})
+        if cmd[:2] == ("git", "show"):
+            if cmd[2].endswith("release-image-inputs.json"):
+                return json.dumps(table)
+            return "FROM ${DHI_REGISTRY}/python:3.12@" + d("8") + "\n" if "gateway" in cmd[2] else "FROM scratch\n"
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(SIZE, "sh", sh)
+    monkeypatch.setattr(SIZE, "finals", lambda prefix: ["stack-v2.0.0", "stack-v1.0.0"])
+    monkeypatch.setattr(SIZE, "repo", lambda: "o/r")
+    monkeypatch.setattr(SIZE, "inspect_raw", lambda ref: idx.get(ref.split("@", 1)[1]) or man[ref.split("@", 1)[1]])
+    out = tmp_path / "size.json"
+    assert SIZE.main(["--json", str(out)]) == 0
+    rep = json.loads(out.read_text())
+    rows = {r["image"]: r for r in rep["images"]}
+    assert rep["prev"] == "stack-v1.0.0"
+    assert rows["gateway"]["total_bytes"] == 30 and rows["gateway"]["own_bytes"] == 20 \
+        and rows["gateway"]["upgrade_bytes"] == 20
+    assert rows["ollama"]["upgrade_bytes"] == 0 and rows["ollama"]["own_bytes"] is None, "unresolvable base: '?'"
+    assert rep["cli_assets"] == {"noo-x": 9_000_000}

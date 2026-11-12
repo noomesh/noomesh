@@ -104,6 +104,10 @@ TORN_DOWN=0
 teardown() {
     [ "$TORN_DOWN" = 1 ] && return 0
     TORN_DOWN=1
+    # What the install put on the disk, before it goes: images by name,
+    # volumes, build cache, the data root and the install home.
+    step disk-breakdown 300 -- sh -c 'df -h /; docker system df -v 2>&1 | head -80
+      sudo du -sh /var/lib/noo /var/lib/noo/* "$HOME/.noo" 2>/dev/null | sort -h | tail -25'
     step offboard 900 -- noo offboard -y
     step leftover-offboard-check 120 -- noo offboard --check
     step uninstall 600 -- noo offboard --uninstall -y

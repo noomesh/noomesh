@@ -166,9 +166,9 @@ def main(argv: list[str] | None = None) -> int:
     for name, spec in sorted(table.items()):
         if name not in lock:
             continue
-        repo = f"{OURS}/{name}"
-        layers = image_layers(repo, lock[name])
-        prev_layers = image_layers(repo, plock[name]) if name in plock else {}
+        image_repo = f"{OURS}/{name}"
+        layers = image_layers(image_repo, lock[name])
+        prev_layers = image_layers(image_repo, plock[name]) if name in plock else {}
         try:
             base_ref = resolve_base(final_from(sh("git", "show", f"{tag}:{spec['dockerfile']}")), bases)
         except subprocess.CalledProcessError:
