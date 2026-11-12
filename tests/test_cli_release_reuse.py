@@ -362,13 +362,30 @@ def test_release_checks_the_cli_version_against_the_tag():
 
 def test_the_published_asset_list_is_unchanged():
     """Reuse changes where three binaries come from, never what is published:
-    the same 29 assets, the same manifest and signature."""
+    the same 30 assets, the same manifest and signature (30 since the i688
+    follow-up added noo-release-version, the manifest's version row)."""
     create = next(s for s in _steps("release") if s.get("name") == "Create GitHub Release")
     assets = re.findall(r"dist/(\S+)", create["run"].split("scripts/release-upload-assets.sh", 1)[1].split("gh release edit", 1)[0])
-    assert len(assets) == 29, assets
+    assert len(assets) == 30, assets
     for n in P.REUSABLE:
         assert n in assets and f"{n}.sha256" in assets
     assert "sha256sums.txt" in assets and "sha256sums.txt.sig" in assets
+    assert "noo-release-version" in assets, "the manifest's version row names a file nobody can fetch"
+
+
+def test_the_manifest_names_its_own_version():
+    """i688 follow-up: the signed manifest carries a noo-release-version row
+    whose file is the built CLI's own --version, written BEFORE the manifest
+    is generated and checked to be in it. The CLI refuses a manifest whose
+    row does not name its own version (release_sig::manifest_names_version)."""
+    run = next(s for s in _steps("release") if s.get("name") == "Generate SHA-256 checksums")["run"]
+    write = run.index("> noo-release-version")
+    gen = run.index("> sha256sums.txt")
+    assert write < gen, run
+    assert "--version" in run[:write], "the version is not read from the built CLI"
+    line = next(l for l in run.splitlines() if l.strip().endswith("> sha256sums.txt"))
+    assert "noo-release-version" in line, line
+    assert "grep -q '  noo-release-version$' sha256sums.txt" in run[gen:], run
 
 
 def test_the_script_names_only_public_orgs():
