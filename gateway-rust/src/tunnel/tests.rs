@@ -714,6 +714,30 @@ async fn a_call_to_an_advertising_node_with_a_live_tunnel_goes_down_the_tunnel()
     assert_eq!(after, before + 1, "counted as a tunnel stream");
 }
 
+/// The nudge `noo cluster place` sends (`nudge_reconcile`: POST /reconcile
+/// on `NodeLink::for_node`) reaches a node that registered NO address but
+/// holds its tunnel (rc.3 matrix, windows-2025-wsl2: "reconcile_nudge_skipped
+/// … no reachable address", the node acted on the place 5 min later).
+#[tokio::test]
+async fn a_node_with_no_address_gets_the_nudge_over_its_tunnel() {
+    let node = "route-noaddr";
+    let (sess, rx) = install(node);
+    serve_node(sess, rx, |open| {
+        assert_eq!(open["principal"], "controller");
+        vec![head(0, 202, &[]), data(0, format!("{} {}", open["method"].as_str().unwrap(), open["path"].as_str().unwrap()).as_bytes()), end(0)]
+    });
+    let rec = json!({"agent_url": "", "ip_address": "", "control_transports": {"https_listener": true, "nats_rpc": false, "tunnel": true}});
+    let link = crate::node_link::NodeLink::from_record(node, Some(&rec)).expect("a link: the tunnel carries its calls");
+    assert!(!link.has_address());
+    let resp = link.request(Method::POST, "/reconcile").send().await.expect("the nudge went down the tunnel");
+    assert_eq!(resp.status(), 202);
+    assert_eq!(resp.text().await.unwrap(), "POST /reconcile");
+    // Once the tunnel is gone the call fails naming why, and dials nothing.
+    hub().live(node).unwrap().close("x");
+    let err = link.request(Method::POST, "/reconcile").send().await.expect_err("no address, no tunnel");
+    assert!(err.to_string().contains("no_https_address"), "{err}");
+}
+
 #[tokio::test]
 async fn a_link_that_only_holds_an_address_finds_the_tunnel_by_host() {
     let node = "route-addr";
