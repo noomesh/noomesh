@@ -22,7 +22,11 @@
 #                     rest.
 #   containers.tsv    every 2 s, each running Docker container's name and IP
 #                     (when Docker is installed), so a container's connection
-#                     is named by its container.
+#                     is named by its container. A flow with no snapshot within
+#                     10 s of its start is "container at <ip> (no snapshot near
+#                     this flow)", never another container's name.
+#   snapshots.tsv     one line per snapshot ("time ok|timeout|failed"); missed
+#                     intervals are reported.
 #   egress.tsv, egress.md
 #                     the report: one row per (who, destination, port, proto).
 # It never records a payload: no pcap is written, no request or response body,
@@ -72,15 +76,24 @@
 #                    row takes the class of the first line whose two regexes match,
 #                    else "unlisted".
 #   --report-only    rebuild the report from an existing --out DIR.
+#   --infer-unattributed
+#                    with --classify: a "host process (unattributed)" row to a
+#                    destination host AND port that the same capture attributed
+#                    to a process or container whose row is classified is marked
+#                    "inferred" (why: "inferred from <who> in this window"),
+#                    still printed, and counted apart from "listed". For a
+#                    window where many programs fetch from the same places (an
+#                    install); never for one that must be silent.
 set -euo pipefail
 
-MINUTES=10; OUT=""; CLASSIFY=""; REPORT_ONLY=0
+MINUTES=10; OUT=""; CLASSIFY=""; REPORT_ONLY=0; INFER=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --minutes) MINUTES="${2:?--minutes needs a number}"; shift 2 ;;
         --out) OUT="${2:?--out needs a directory}"; shift 2 ;;
         --classify) CLASSIFY="${2:?--classify needs a file}"; shift 2 ;;
         --report-only) REPORT_ONLY=1; shift ;;
+        --infer-unattributed) INFER=1; shift ;;
         -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
         *) echo "egress-capture: unknown option $1 (see --help)" >&2; exit 2 ;;
     esac
@@ -91,9 +104,9 @@ case "$MINUTES" in ''|*[!0-9]*) echo "egress-capture: --minutes takes a whole nu
 command -v python3 >/dev/null || { echo "egress-capture: needs python3" >&2; exit 2; }
 
 report() {
-    python3 - "$OUT" "$CLASSIFY" <<'PY'
+    python3 - "$OUT" "$CLASSIFY" "$INFER" <<'PY'
 import collections, ipaddress, os, re, sys
-out, classify = sys.argv[1], sys.argv[2]
+out, classify, infer = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
 
 def read(name):
     p = os.path.join(out, name)
@@ -134,16 +147,31 @@ for line in read("containers.tsv"):
 for _h in ctr_hist.values():
     _h.sort()
 
+# A sighting counts only NEAR a flow's start: the snapshot loop can stall
+# (a rehearsal's `docker inspect` hung during a stack recreate and no snapshot
+# came for 7 minutes; the last holder of an address was then credited with a
+# later container's Ollama model pull). A wrong name is worse than none.
+NEAR = 10
 def ctr_at(ip, ts):
     h = ctr_hist.get(ip)
     if not h:
         return None
-    holder = h[0][1]  # before the first snapshot: its first known holder
-    for t, n in h:
-        if t > ts:
-            break
-        holder = n
-    return holder
+    before = [(t, n) for t, n in h if t <= ts]
+    after = [(t, n) for t, n in h if t > ts]
+    if before and ts - before[-1][0] <= NEAR:
+        return before[-1][1]
+    if after and after[0][0] - ts <= NEAR and not before:
+        return after[0][1]  # started just before its first snapshot
+    if after and after[0][0] - ts <= NEAR and before and before[-1][1] == after[0][1]:
+        return after[0][1]  # the same holder on both sides of a short gap
+    return f"container at {ip} (no snapshot near this flow)"
+
+# snapshot ticks: one line per completed docker snapshot ("time ok|timeout|failed")
+ticks = []
+for line in read("snapshots.tsv"):
+    f = line.split()
+    if len(f) >= 2 and f[0].isdigit():
+        ticks.append((int(f[0]), f[1]))
 
 # sockets: (proto, lport, rip, rport) -> process
 sock = {}
@@ -212,15 +240,50 @@ def cls(w, host, port):
             return c, why
     return ("unlisted", "") if rules else ("", "")
 
+# --infer-unattributed: an unattributed HOST row to a host AND port (and
+# protocol) that this same capture attributed to a classified process or
+# container is "inferred" from that attribution, and says so.
+explained = {}
+for (w, host, ip, port, proto) in rows:
+    if w.startswith(("process:", "container:")) and host != "(no name seen)" and cls(w, host, port)[0] in ("a", "b", "c"):
+        explained.setdefault((host, port, proto), w)
+
+def final_cls(w, host, port, proto):
+    c, why = cls(w, host, port)
+    if infer and c == "unlisted" and w == "host process (unattributed)" and (host, port, proto) in explained:
+        return "inferred", f"inferred from {explained[(host, port, proto)]} in this window"
+    return c, why
+
 with open(os.path.join(out, "egress.tsv"), "w") as t, open(os.path.join(out, "egress.md"), "w") as md:
     t.write("who\thost\tip\tport\tproto\tflows\tbytes_out\tbytes_in\tfirst\tlast\tclass\twhy\n")
     md.write("| Who | Destination | IP | Port | Flows | Bytes out | Bytes in | Class | Why |\n|---|---|---|---|---|---|---|---|---|\n")
     for (w, host, ip, port, proto), r in rows.items():
-        c, why = cls(w, host, port)
+        c, why = final_cls(w, host, port, proto)
         t.write(f"{w}\t{host}\t{ip}\t{port}\t{proto}\t{r['flows']}\t{r['out']}\t{r['in']}\t{r['first']}\t{r['last']}\t{c}\t{why}\n")
         md.write(f"| {w} | {host} | {ip} | {port}/{proto} | {r['flows']} | {r['out']} | {r['in']} | {c} | {why} |\n")
+    # A stalled snapshot loop is shown, not only implied by the timestamps.
+    gaps = []
+    if ticks:
+        span = [t0 for t0, _ in ticks]
+        ends = [fl["first"] for fl in flows.values()] + [fl["last"] for fl in flows.values()]
+        lo, hi = (min(ends), max(ends)) if ends else (span[0], span[-1])
+        edges = [lo] + span + [hi]
+        gaps = [(a, b) for a, b in zip(edges, edges[1:]) if b - a > NEAR]
+        bad = sum(1 for _, st in ticks if st != "ok")
+        if gaps or bad:
+            longest = max((b - a for a, b in gaps), default=0)
+            note = (f"container snapshots: {len(gaps)} missed interval(s), longest {longest}s"
+                    + (f" ({gaps[0][0]}..{gaps[0][1]})" if gaps else "") + f"; {bad} timed out or failed")
+            md.write(f"\n**{note}.** A container flow with no snapshot near its start is listed as "
+                     "\"container at <ip> (no snapshot near this flow)\", never under another container's name.\n")
+classes = [final_cls(k[0], k[1], k[3], k[4])[0] for k in rows]
+inferred_flows = sum(r["flows"] for k, r in rows.items() if final_cls(k[0], k[1], k[3], k[4])[0] == "inferred")
 print(f"egress-capture: {len(flows)} outbound connection(s) to {len({k[2] for k in rows})} address(es); "
-      f"{sum(1 for k in rows if cls(k[0], k[1], k[3])[0] == 'unlisted')} row(s) unlisted; report in {out}/egress.md")
+      f"{classes.count('unlisted')} row(s) unlisted"
+      + (f"; {classes.count('inferred')} row(s) inferred ({inferred_flows} flow(s))" if infer else "")
+      + f"; report in {out}/egress.md")
+if gaps or (ticks and any(st != "ok" for _, st in ticks)):
+    print(f"egress-capture: {note}")
 PY
 }
 
@@ -349,7 +412,7 @@ SS_ROW='
           print t "\t" proto "\t" lport "\t" rip "\t" rport "\t" p }'
 
 # Who owns each internet socket, five times a second (process name and pid only).
-( while :; do
+( set +e; while :; do
     now="$(date +%s)"
     ss -tunpH state established state syn-sent 2>/dev/null | awk -v t="$now" "$SS_ROW" >> "$OUT/sockets.tsv"
     sleep 0.2
@@ -376,19 +439,48 @@ HOST_IPS="$(tr '\n' ' ' < "$OUT/host_ips.txt")"
 # runs. One filtered `ss` per new host connection. conntrack's stdout goes to
 # the reader through a process substitution, so $! is conntrack itself and
 # cleanup stops it; the reader ends at EOF.
-conntrack -E -e NEW -o extended 2>/dev/null > >(while IFS= read -r line; do
-        set -- $(new_local_flow "$line")
-        [ $# -eq 2 ] || continue
-        case "$1" in 127.*|::1) continue ;; esac
-        ss -tunpH "sport = :$2" 2>/dev/null | awk -v t="$(date +%s)" "$SS_ROW" >> "$OUT/sockets.tsv"
+# Under a burst (parallel image layers) one `ss` per event fell behind, and a
+# short request closed before its turn; so the reader drains what is queued
+# (up to 64 events) and asks `ss` once for all of their ports. Each `ss -p`
+# scans every process, so one scan per batch, not per event, is the speed-up.
+conntrack -E -e NEW -o extended 2>/dev/null > >(set +e; while IFS= read -r line; do
+        ports=()
+        while :; do
+            set -- $(new_local_flow "$line")
+            if [ $# -eq 2 ]; then case "$1" in 127.*|::1) ;; *) ports+=("$2") ;; esac; fi
+            [ ${#ports[@]} -lt 64 ] || break
+            IFS= read -r -t 0.01 line || break
+        done
+        [ ${#ports[@]} -gt 0 ] || continue
+        filt=""; for p in "${ports[@]}"; do filt="${filt:+$filt or }sport = :$p"; done
+        ss -tunpH "( $filt )" 2>/dev/null | awk -v t="$(date +%s)" "$SS_ROW" >> "$OUT/sockets.tsv"
     done) &
 PIDS+=($!)
 
 if command -v docker >/dev/null 2>&1; then
-    ( while :; do
+    # One rehearsal's snapshots stopped during a stack recreate and never came
+    # back (7 minutes): this script runs under `set -e -o pipefail`, which the
+    # loop inherited, so one `docker inspect` of a container removed between
+    # `ps` and `inspect` failed the pipeline and ended the loop for good. The
+    # loop now runs with errexit off, and every docker call is bounded (a hung
+    # call costs one snapshot). Each iteration leaves a line in snapshots.tsv,
+    # so a missed interval shows in the report, and a flow far from any
+    # snapshot is never named by a stale one.
+    ( set +e; while :; do
         now="$(date +%s)"
-        docker ps -q 2>/dev/null | xargs -r docker inspect -f '{{.Name}}	{{range .NetworkSettings.Networks}}{{.IPAddress}} {{.GlobalIPv6Address}} {{end}}' 2>/dev/null \
-          | sed "s/^/$now	/" >> "$OUT/containers.tsv"
+        if ids="$(timeout 10 docker ps -q 2>/dev/null)"; then
+            st=ok
+            if [ -n "$ids" ]; then
+                # shellcheck disable=SC2086
+                timeout 10 docker inspect -f '{{.Name}}	{{range .NetworkSettings.Networks}}{{.IPAddress}} {{.GlobalIPv6Address}} {{end}}' $ids 2>/dev/null \
+                  | sed "s/^/$now	/" >> "$OUT/containers.tsv"
+                rc=${PIPESTATUS[0]}
+                [ "$rc" = 124 ] && st=timeout
+            fi
+        else
+            [ $? = 124 ] && st=timeout || st=failed
+        fi
+        echo "$now $st" >> "$OUT/snapshots.tsv"
         sleep 2
       done ) &
     PIDS+=($!)
