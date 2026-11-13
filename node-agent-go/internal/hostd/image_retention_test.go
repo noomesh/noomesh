@@ -18,7 +18,7 @@ func h64(c string) string { return strings.Repeat(c, 64)[:64] }
 func iid(c string) string { return "sha256:" + h64(c) }
 
 const nsNoo = "ghcr.io/noomesh/"
-const nsAddon = "ghcr.io/personifai/"
+const nsAddon = "ghcr.io/rhowner/"
 
 func writeKeep(t *testing.T, dir string, k keepFile) string {
 	t.Helper()
@@ -75,7 +75,7 @@ func TestClassifyKeepsWhatIsUsedForeignOrKeptAndRemovesOnlyOursSuperseded(t *tes
 	k := &keepFile{Namespaces: []string{nsNoo, nsAddon}, Keep: []keepEntry{
 		{Ref: nsNoo + "gateway@sha256:" + h64("1"), Why: "stack.lock (v0.6.24)"},
 		{Ref: nsNoo + "gateway@sha256:" + h64("2"), Why: "stack.lock.prev (v0.6.23)"},
-		{Ref: nsAddon + "pai-voice@sha256:" + h64("3"), Why: "addons.lock pai-voice (current)"},
+		{Ref: nsAddon + "rhaddon@sha256:" + h64("3"), Why: "addons.lock rhaddon (current)"},
 		{ID: iid("4"), Why: "node: rail manifest vouches for it"},
 		{Ref: nsAddon + "rhaddon@sha256:" + h64("5"), Why: "last pin of disabled add-on rhaddon"},
 	}}
@@ -87,8 +87,8 @@ func TestClassifyKeepsWhatIsUsedForeignOrKeptAndRemovesOnlyOursSuperseded(t *tes
 		{ID: iid("e"), Tags: []string{"ollama/ollama:latest"}, Bytes: 9_257_000_000},                  // the operator's own
 		{ID: iid("f"), Bytes: 5},             // dangling
 		{ID: iid("4"), Bytes: 1_800_000_000}, // rail-loaded, vouched by id
-		{ID: iid("g"), Tags: []string{nsAddon + "pai-voice:stack0611-worker"}, Bytes: 8_967_000_000}, // retired tag, superseded
-		{ID: iid("h"), Digests: []string{nsAddon + "pai-voice@sha256:" + h64("3")}, Bytes: 8_967_000_000},
+		{ID: iid("g"), Tags: []string{nsAddon + "rhaddon:stack0611-worker"}, Bytes: 8_967_000_000}, // retired tag, superseded
+		{ID: iid("h"), Digests: []string{nsAddon + "rhaddon@sha256:" + h64("3")}, Bytes: 8_967_000_000},
 		{ID: iid("i"), Tags: []string{nsNoo + "x:1", "docker.io/library/x:1"}, Bytes: 7},    // one foreign name keeps it
 		{ID: iid("j"), Digests: []string{nsAddon + "rhaddon@sha256:" + h64("5")}, Bytes: 6}, // disabled add-on's last pin
 	}
@@ -106,7 +106,7 @@ func TestClassifyKeepsWhatIsUsedForeignOrKeptAndRemovesOnlyOursSuperseded(t *tes
 		iid("f"): "skipped: no tag and no digest",
 		iid("4"): "kept: node: rail manifest vouches for it",
 		iid("g"): "remove:",
-		iid("h"): "kept: addons.lock pai-voice (current)",
+		iid("h"): "kept: addons.lock rhaddon (current)",
 		iid("i"): "kept: not ours (docker.io/library/x:1)",
 		iid("j"): "kept: last pin of disabled add-on rhaddon",
 	}
