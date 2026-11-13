@@ -526,15 +526,17 @@ def test_a_request_for_more_input_or_a_refusal_is_not_an_answer(answer, bad):
     assert '{ [ "$listed" = 0 ] && printf "%s" "$out" | grep -qiE "$FIRST_ANSWER_DEFLECTION"; }' in text
 
 
-def test_the_cluster_question_the_doc_promises_is_probed_never_judged():
-    # general 11-13: whether `noo chat` answers "which nodes and models do you
-    # have right now?" from real state decides if first-chat.md keeps the claim.
-    text = (ROOT / "scripts/install-cell/run.sh").read_text()
-    assert "grep -m1 -i 'nodes and models'" in text
-    i = text.index("step probe-cluster-question 600")
-    block = text[i:text.index("  true'\n", i)]
-    assert 'noo chat --message "$CLUSTER_PROMPT"' in block and "noo cluster status" in block
-    assert "|| fail_onboarded" not in text[i:i + len(block) + 20], "a probe, never the failed step"
+def test_first_chat_never_asks_the_chat_model_about_cluster_state():
+    # rc.6 branch run 43482649578: asked "which nodes and models do you have
+    # right now?", gemma4:e2b answered about itself ("I am Gemma 4 … I don't
+    # have a list of physical nodes") while `noo cluster status` showed the
+    # node running ollama:gemma4:e2b. The chat path does not read cluster
+    # state, so the page asks the CLI.
+    doc = (ROOT / "docs/getting-started/first-chat.md").read_text()
+    asks = [l for l in doc.splitlines() if l.startswith('noo chat --message "')]
+    assert not any(re.search(r"\b(nodes?|models?|cluster|gpus?)\b.*(have|running|right now)", l, re.I) for l in asks), asks
+    assert "\nnoo cluster status\n" in doc
+
 
 
 def test_only_the_default_model_fails_on_a_non_answer_and_a_tiny_cell_notes_it():
