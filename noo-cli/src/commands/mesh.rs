@@ -938,6 +938,14 @@ pub fn mesh_clean(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         if !g.json {
             ui::done(&format!("self-heal daemons stopped{}", if all || deep { " + watcher unit removed" } else { "" }));
         }
+        if all || deep {
+            // We remove what we install (#1108). `sudo -n`: a clean never prompts.
+            match crate::netns_unit::remove(false) {
+                Ok(true) if !g.json => ui::done(&format!("{} removed", crate::netns_unit::UNIT_NAME)),
+                Err(e) if !g.json => ui::warned(&format!("{e} — by hand: {}", crate::netns_unit::manual_removal())),
+                _ => {}
+            }
+        }
     }
 
     let script_args = clean_script_args(volumes, images, all, deep, cache, hf_cache, yes);
@@ -1689,5 +1697,47 @@ mod deep_clean_data_root_tests {
     #[test]
     fn the_script_and_the_wrapper_say_the_same_thing() {
         assert!(include_str!("../../../scripts/noomesh-clean.sh").contains(DEEP_NO_DATA_ROOT));
+    }
+}
+
+#[cfg(test)]
+mod docker_gate_order_tests {
+    /// `noo stack clean`: the docker gate refuses (exit 1) before the
+    /// confirm and before the self-heal daemons are stopped, so its "nothing
+    /// was removed" is true (rc.2 matrix: offboard stopped them first).
+    #[test]
+    fn stack_clean_asks_docker_before_it_stops_anything() {
+        let own = crate::test_src::own_code(include_str!("mesh.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn mesh_clean(");
+        let gate = body.find("if let Err(why) = super::offboard::docker_access() {").expect("the gate");
+        let refuse = body[gate..].find("return Ok(1);").map(|i| i + gate).expect("it refuses");
+        let confirm = body.find("confirm_destructive(").expect("the confirm");
+        let stop = body.find("stop_self_heal_daemons(").expect("the daemon stop");
+        assert!(gate < refuse && refuse < confirm && confirm < stop, "{body}");
+    }
+
+    /// `noo stack reset`: the wrapper changes nothing before the script; the
+    /// script's first change is noomesh-clean.sh, whose own gate runs first
+    /// (tests/test_reset_changes_nothing_before_the_clean_gate.py).
+    #[test]
+    fn stack_reset_changes_nothing_before_the_script() {
+        let own = crate::test_src::own_code(include_str!("mesh.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn mesh_reset(");
+        for m in ["stop_self_heal_daemons(", "Command::new(\"docker\")", "remove_file(", "remove_dir_all("] {
+            assert!(!body.contains(m), "{m} in mesh_reset: {body}");
+        }
+        assert!(body.contains("run_script(g, \"noomesh-reset.sh\""), "{body}");
+    }
+}
+
+#[cfg(test)]
+mod netns_unit_clean_tests {
+    #[test]
+    fn a_full_clean_removes_the_namespace_restore_unit() {
+        let own = crate::test_src::own_code(include_str!("mesh.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn mesh_clean(");
+        let stop = body.find("stop_self_heal_daemons(").expect("the stop");
+        let rm = body.find("crate::netns_unit::remove(false)").expect("the clean removes the unit");
+        assert!(stop < rm, "{body}");
     }
 }

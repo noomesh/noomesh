@@ -422,6 +422,21 @@ pub fn offboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     }
 
+    // The namespace restore unit (#1108): we remove what onboard and the
+    // stack stage install.
+    if Path::new(crate::netns_unit::UNIT_PATH).is_file() {
+        item("namespace restore unit");
+        if yes || ctx_confirm(g, false, &format!("Remove {} (it restarts the stack's namespace-joined containers after dockerd starts)?", crate::netns_unit::UNIT_NAME), false) {
+            // SAFETY: isatty has no preconditions.
+            match crate::netns_unit::remove(unsafe { libc::isatty(0) } == 1) {
+                Ok(_) => sub(Glyph::Ok, &format!("{} removed", crate::netns_unit::UNIT_NAME)),
+                Err(e) => sub(Glyph::Warn, &format!("{e} — by hand: {}", crate::netns_unit::manual_removal())),
+            }
+        } else {
+            sub(Glyph::Bullet, "kept (skipped)");
+        }
+    }
+
     // ── 2. Storage root (bind-mounted data) ─────────────────────────────
     // Only with an install to read it from: the path comes from the
     // install's own .env, NEVER guessed — so residue mode (no .env left)
@@ -935,6 +950,7 @@ fn audit_leftovers(g: &Globals, print: bool) -> Vec<String> {
         Path::new("/usr/local/bin/noo-hostd").is_file()
             || Path::new("/etc/systemd/system/noo-hostd.service").is_file(),
         "binary/unit still installed".into());
+    item("namespace restore unit", Path::new(crate::netns_unit::UNIT_PATH).is_file(), crate::netns_unit::UNIT_PATH.into());
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
     let left = self_heal_unit_leftovers(&home);
     item("self-heal user units (host-watcher, noo-hostd)", !left.is_empty(),
@@ -1078,7 +1094,16 @@ fn docker_access_from(out: std::io::Result<std::process::Output>) -> Result<Dock
     match out {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DockerAccess::NotInstalled),
         Err(e) => Err(format!("could not run docker: {e}")),
-        Ok(o) if o.status.success() => Ok(DockerAccess::Reachable),
+        // Reachable means the DAEMON answered with its version. An exit 0
+        // with no version is not an answer: the matrix's Docker 28.0.4 shell
+        // without the docker group passed this gate, and offboard stopped
+        // the self-heal daemons before its first listing hit "permission
+        // denied" (rc.2 install matrix, every cell's offboard probe).
+        Ok(o) if o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty() => Ok(DockerAccess::Reachable),
+        Ok(o) if o.status.success() => Err(match failure_reason(&o) {
+            r if o.stderr.iter().any(|b| !b.is_ascii_whitespace()) => r,
+            _ => "docker info reported no server version: the daemon did not answer".to_string(),
+        }),
         Ok(o) => Err(failure_reason(&o)),
     }
 }
@@ -1302,6 +1327,18 @@ mod docker_gate_tests {
         assert!(docker_access_from(Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))).is_err(), "a binary we may not run is not 'not installed'");
     }
 
+    /// An exit 0 with no server version is not an answer (rc.2 matrix: a
+    /// shell without the docker group got past the gate on Docker 28.0.4).
+    #[test]
+    fn exit_zero_with_no_server_version_is_not_an_answer() {
+        let denied = docker_access_from(out(0, "", "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock\n"));
+        assert_eq!(denied, Err("permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock".to_string()));
+        let silent = docker_access_from(out(0, "\n", ""));
+        assert!(silent.as_ref().is_err_and(|e| e.contains("no server version")), "{silent:?}");
+        assert_eq!(docker_access_from(out(0, "28.0.4\n", "WARNING: bridge-nf-call-iptables is disabled\n")), Ok(DockerAccess::Reachable),
+            "a version with a warning on stderr is an answer");
+    }
+
     #[test]
     fn a_failed_listing_is_an_error_never_an_empty_list() {
         assert_eq!(docker_list_from(out(0, "a\n\nb\n", "")), Ok(vec!["a".to_string(), "b".to_string()]));
@@ -1444,5 +1481,19 @@ mod self_heal_unit_tests {
         assert!(stop.contains("remove_self_heal_units(Path::new(&h));"), "{stop}");
         let audit = crate::test_src::fn_body(&own, "fn audit_leftovers(");
         assert!(audit.contains("self_heal_unit_leftovers(&home)"), "{audit}");
+    }
+}
+
+#[cfg(test)]
+mod netns_unit_offboard_tests {
+    /// We remove what we install: the walk removes noo-netns-restore.service
+    /// and the audit lists it if it survives (#1108).
+    #[test]
+    fn offboard_removes_and_audits_the_namespace_restore_unit() {
+        let own = crate::test_src::own_code(include_str!("offboard.rs"));
+        let walk = crate::test_src::fn_body(&own, "pub fn offboard(");
+        assert!(walk.contains("crate::netns_unit::remove(unsafe { libc::isatty(0) } == 1)"), "{walk}");
+        let audit = crate::test_src::fn_body(&own, "fn audit_leftovers(");
+        assert!(audit.contains(r#"item("namespace restore unit", Path::new(crate::netns_unit::UNIT_PATH).is_file()"#), "{audit}");
     }
 }

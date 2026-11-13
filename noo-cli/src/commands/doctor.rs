@@ -541,8 +541,70 @@ pub(crate) fn fingerprint(value: &str) -> String {
     d.iter().take(5).map(|b| format!("{b:02x}")).collect()
 }
 
+type ContainerEnv = std::collections::BTreeMap<String, String>;
+
+/// [`container_env`] read once per container per run: every secret a
+/// container holds used to cost its own `docker inspect` (34 of them for the
+/// gateway alone, ~3 s of `noo doctor secrets` and of `cluster verify`).
+///
+/// Per run only: the map lives inside one `doctor_secrets` call and is never
+/// stored. Every secret a container holds is judged against ONE snapshot of
+/// that container, so two reads of the same container cannot disagree; a
+/// failed read (container gone mid-run) is cached as "not running here",
+/// exactly what an uncached failed read said.
+fn container_env_cached<'a>(
+    cache: &'a mut std::collections::HashMap<String, Option<ContainerEnv>>,
+    name: &str,
+    read: impl FnOnce(&str) -> Option<ContainerEnv>,
+) -> Option<&'a ContainerEnv> {
+    cache.entry(name.to_string()).or_insert_with(|| read(name)).as_ref()
+}
+
+/// (container, value) for every declared consumer of `key` running here,
+/// read through the per-run cache.
+fn holders(
+    key: &str,
+    consumers: &[&str],
+    envs: &mut std::collections::HashMap<String, Option<ContainerEnv>>,
+    read: &mut impl FnMut(&str) -> Option<ContainerEnv>,
+) -> Vec<(String, String)> {
+    consumers
+        .iter()
+        .filter_map(|c| {
+            let env = container_env_cached(envs, c, &mut *read)?;
+            let v = env.get(key)?.clone();
+            Some(((*c).to_string(), v))
+        })
+        .filter(|(_, v)| !v.is_empty())
+        .collect()
+}
+
+/// How many containers hold `key`, and the split [`agreement`] finds. A
+/// split is re-read before it is believed: a rotation landing between two
+/// containers' reads looks exactly like a missed consumer. Only that
+/// secret's holders are inspected again, once, fresh; the split reported is
+/// the one that persists.
+fn judge_secret(
+    key: &str,
+    consumers: &[&str],
+    envs: &mut std::collections::HashMap<String, Option<ContainerEnv>>,
+    read: &mut impl FnMut(&str) -> Option<ContainerEnv>,
+) -> (usize, Vec<(String, String)>) {
+    let held = holders(key, consumers, envs, read);
+    let first = agreement(&held);
+    if first.is_empty() {
+        return (held.len(), first);
+    }
+    for (c, _) in &held {
+        let fresh = read(c);
+        envs.insert(c.clone(), fresh);
+    }
+    let again = holders(key, consumers, envs, read);
+    (again.len(), agreement(&again))
+}
+
 /// A container's environment as a map, or None when it is not running here.
-fn container_env(name: &str) -> Option<std::collections::BTreeMap<String, String>> {
+fn container_env(name: &str) -> Option<ContainerEnv> {
     let out = std::process::Command::new("docker")
         .args(["inspect", "-f", "{{range .Config.Env}}{{println .}}{{end}}", name])
         .output()
@@ -581,23 +643,13 @@ pub fn doctor_secrets(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut split = 0usize;
     let mut checked = 0usize;
+    let mut envs: std::collections::HashMap<String, Option<ContainerEnv>> = std::collections::HashMap::new();
     for spec in crate::commands::secrets::registry() {
-        // (container, value) for every declared consumer running here.
-        let held: Vec<(String, String)> = spec
-            .consumers
-            .iter()
-            .filter_map(|c| {
-                let env = container_env(c)?;
-                let v = env.get(spec.key)?.clone();
-                Some(((*c).to_string(), v))
-            })
-            .filter(|(_, v)| !v.is_empty())
-            .collect();
-        if held.len() < 2 {
+        let (held, verdict) = judge_secret(spec.key, spec.consumers, &mut envs, &mut container_env);
+        if held < 2 {
             continue; // one holder cannot disagree with itself
         }
         checked += 1;
-        let verdict = agreement(&held);
         if verdict.is_empty() {
             continue;
         }
@@ -609,7 +661,7 @@ pub fn doctor_secrets(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 spec.key.to_string(),
                 container,
                 fp,
-                format!("{} holder(s)", held.len()),
+                format!("{held} holder(s)"),
             ]);
         }
     }
@@ -2324,5 +2376,72 @@ mod secret_drift_tests {
         assert_ne!(short, long);
         assert_ne!(fingerprint("old-secret"), fingerprint("new-secret"));
         assert_eq!(fingerprint("same"), fingerprint("same"), "a digest must be stable");
+    }
+}
+
+#[cfg(test)]
+mod container_env_cache_tests {
+    use super::*;
+
+    fn env(k: &str, v: &str) -> Option<ContainerEnv> {
+        Some(ContainerEnv::from([(k.to_string(), v.to_string())]))
+    }
+
+    #[test]
+    fn a_split_that_heals_on_the_re_read_is_not_reported() {
+        // A rotation lands mid-run: `b` was read before it, `a` and `c` after.
+        let mut reads: Vec<String> = Vec::new();
+        let mut read = |n: &str| {
+            let stale = n == "b" && !reads.iter().any(|r| r == "b");
+            reads.push(n.to_string());
+            env("K", if stale { "old" } else { "new" })
+        };
+        let mut cache = std::collections::HashMap::new();
+        let (held, split) = judge_secret("K", &["a", "b", "c"], &mut cache, &mut read);
+        assert_eq!(held, 3);
+        assert!(split.is_empty(), "healed on the re-read: {split:?}");
+        assert_eq!(reads, ["a", "b", "c", "a", "b", "c"], "each holder read once, then once more fresh");
+    }
+
+    #[test]
+    fn a_split_that_persists_is_reported() {
+        let mut read = |n: &str| env("K", if n == "b" { "old" } else { "new" });
+        let mut cache = std::collections::HashMap::new();
+        let (_, split) = judge_secret("K", &["a", "b", "c"], &mut cache, &mut read);
+        assert_eq!(split.len(), 1);
+        assert_eq!(split[0].0, "b", "the minority is named");
+    }
+
+    #[test]
+    fn agreement_reads_each_holder_once() {
+        let mut n = 0;
+        let mut read = |_: &str| { n += 1; env("K", "same") };
+        let mut cache = std::collections::HashMap::new();
+        let (held, split) = judge_secret("K", &["a", "b"], &mut cache, &mut read);
+        assert_eq!((held, split.len()), (2, 0));
+        assert_eq!(n, 2, "no re-read without a split");
+    }
+
+    #[test]
+    fn each_container_is_inspected_once_per_run() {
+        let mut cache = std::collections::HashMap::new();
+        let mut reads = 0;
+        for name in ["noo-gateway", "noo-gateway", "noo-worker", "noo-gateway", "gone", "gone"] {
+            let _ = container_env_cached(&mut cache, name, |n| {
+                reads += 1;
+                (n != "gone").then(|| ContainerEnv::from([("K".to_string(), n.to_string())]))
+            });
+        }
+        assert_eq!(reads, 3, "one inspect per container, a missing one included");
+        assert_eq!(container_env_cached(&mut cache, "noo-worker", |_| None).unwrap()["K"], "noo-worker");
+        assert!(container_env_cached(&mut cache, "gone", |_| panic!("not re-read")).is_none());
+    }
+
+    #[test]
+    fn doctor_secrets_reads_through_the_cache() {
+        let own = crate::test_src::own_code(include_str!("doctor.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn doctor_secrets(");
+        assert!(body.contains("judge_secret(spec.key, spec.consumers, &mut envs, &mut container_env)"));
+        assert!(!body.contains("container_env(c)"), "no per-secret inspect");
     }
 }

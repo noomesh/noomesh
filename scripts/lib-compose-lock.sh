@@ -45,7 +45,13 @@ _compose_lock_holder() {
 }
 
 acquire_compose_lock() {
-    exec 9>>"$COMPOSE_LOCK_FILE" || {
+    # Opened READ-ONLY (flock needs no write access), after creating it if
+    # absent. rc.1 rehearsal (2026-11-12): root's after-boot unit created the
+    # file 0644, the owner's `>>` open was then refused, and its compose ran
+    # UNLOCKED, which is the interleaving this lock exists to stop. Same path,
+    # same inode, so an older reader/writer (hostd, scripts) still contends.
+    [ -e "$COMPOSE_LOCK_FILE" ] || : >> "$COMPOSE_LOCK_FILE" 2>/dev/null || true
+    exec 9<"$COMPOSE_LOCK_FILE" || {
         echo "WARN: cannot open compose lock $COMPOSE_LOCK_FILE — continuing UNLOCKED" >&2
         return 0
     }

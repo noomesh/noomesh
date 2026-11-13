@@ -1716,6 +1716,53 @@ fn apply_blob(blob: &[u8], cfg: &SeatConfig, state: &mut SeatState) -> Result<Ap
 }
 
 /// `noo kiosk seat-sync` — the seat timer's one tick (root; hidden).
+/// What the seat's signed bundle GET found.
+#[derive(Debug, PartialEq)]
+pub(crate) enum BundleFetch {
+    /// 304: the staged bundle is the one named in If-None-Match.
+    Unchanged,
+    /// 404: nothing is staged for this seat.
+    NoneStaged,
+    Blob(Vec<u8>),
+    Failed(String),
+}
+
+/// The If-None-Match the seat sends: the sha256 of the bytes it last applied
+/// AS SERVED (the ciphertext), strong and quoted, as the gateway's ETag is.
+/// `last_applied_sha` is recorded only after the controller took an rc=0
+/// report, so a lost report or a failed apply sends nothing and re-fetches.
+/// Anything that is not 64 hex is not sent.
+pub(crate) fn if_none_match(last_applied_sha: Option<&str>) -> Option<String> {
+    last_applied_sha
+        .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(|s| format!("\"{s}\""))
+}
+
+/// The signed bundle GET, conditional on the last applied bundle (F3: an
+/// unchanged bundle is a 304 with no body, so a seat's tick does not pull and
+/// hash the whole blob). An old gateway ignores the header and answers 200;
+/// the caller's sha comparison still catches an unchanged blob then.
+pub(crate) fn fetch_bundle(agent: &ureq::Agent, url: &str, proof: &str, last_applied_sha: Option<&str>) -> BundleFetch {
+    let mut req = agent.get(url).header("x-noo-birth-proof", proof);
+    if let Some(tag) = if_none_match(last_applied_sha) {
+        req = req.header("if-none-match", &tag);
+    }
+    match req.call() {
+        Ok(mut r) if r.status().as_u16() == 200 => {
+            use std::io::Read as _;
+            let mut b = Vec::new();
+            match r.body_mut().as_reader().read_to_end(&mut b) {
+                Ok(_) => BundleFetch::Blob(b),
+                Err(e) => BundleFetch::Failed(format!("reading the bundle: {e}")),
+            }
+        }
+        Ok(r) if r.status().as_u16() == 304 => BundleFetch::Unchanged,
+        Ok(r) if r.status().as_u16() == 404 => BundleFetch::NoneStaged,
+        Ok(r) => BundleFetch::Failed(format!("bundle fetch answered HTTP {}", r.status().as_u16())),
+        Err(e) => BundleFetch::Failed(format!("bundle fetch: {e}")),
+    }
+}
+
 pub fn kiosk_seat_sync(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let migrate = match args {
         [] => None,
@@ -1792,19 +1839,12 @@ pub fn kiosk_seat_sync(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
         Ok(p) => p,
         Err(e) => { say(&e); return Ok(1); }
     };
-    let blob = match agent.get(&format!("{base}/bootstrap/seat/{seat}/bundle")).header("x-noo-birth-proof", &proof).call() {
-        Ok(mut r) if r.status().as_u16() == 200 => {
-            use std::io::Read as _;
-            let mut b = Vec::new();
-            if let Err(e) = r.body_mut().as_reader().read_to_end(&mut b) {
-                say(&format!("reading the bundle: {e}"));
-                return Ok(1);
-            }
-            b
-        }
-        Ok(r) if r.status().as_u16() == 404 => return Ok(0),
-        Ok(r) => { say(&format!("bundle fetch answered HTTP {}", r.status().as_u16())); return Ok(1); }
-        Err(e) => { say(&format!("bundle fetch: {e}")); return Ok(1); }
+    let url = format!("{base}/bootstrap/seat/{seat}/bundle");
+    let blob = match fetch_bundle(&agent, &url, &proof, state.last_applied_sha.as_deref()) {
+        BundleFetch::Blob(b) => b,
+        // 304: the staged bundle is the one this seat last applied (#1088).
+        BundleFetch::Unchanged | BundleFetch::NoneStaged => return Ok(0),
+        BundleFetch::Failed(e) => { say(&e); return Ok(1); }
     };
     let sha = sha256_hex(&blob);
     if state.last_applied_sha.as_deref() == Some(sha.as_str()) {
@@ -3706,6 +3746,105 @@ exec {real_install} "$@"
 
     fn der_cert(ca: &TestCa) -> ureq::tls::Certificate<'static> {
         ureq::tls::Certificate::from_der(ca.cert.der().as_ref()).to_owned()
+    }
+
+    /// A fake bundle door (F3, #1088's contract): `/none` answers 404; a GET
+    /// whose If-None-Match is the quoted sha of `blob` answers 304 with no
+    /// body; anything else gets 200 and `blob`. Records each request's
+    /// If-None-Match value ("-" when absent).
+    fn bundle_door(ca: &TestCa, blob: &'static [u8]) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read as _, Write as _};
+        use std::sync::{Arc, Mutex};
+        let (cert, key) = leaf(ca);
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let cfg = Arc::new(rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions().unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key).unwrap());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        let etag = format!("\"{}\"", sha256_hex(blob));
+        std::thread::spawn(move || {
+            for tcp in listener.incoming() {
+                let Ok(tcp) = tcp else { continue };
+                tcp.set_read_timeout(Some(std::time::Duration::from_secs(10))).ok();
+                let Ok(conn) = rustls::ServerConnection::new(cfg.clone()) else { continue };
+                let mut tls = rustls::StreamOwned::new(conn, tcp);
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match tls.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                if buf.is_empty() {
+                    continue;
+                }
+                let head = String::from_utf8_lossy(&buf).to_string();
+                let path = head.lines().next().unwrap_or("").split(' ').nth(1).unwrap_or("").to_string();
+                let inm = head.lines()
+                    .find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("if-none-match")).map(|(_, v)| v.trim().to_string()))
+                    .unwrap_or_else(|| "-".to_string());
+                seen2.lock().unwrap().push(inm.clone());
+                let _ = if path.ends_with("/none") {
+                    write!(tls, "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                } else if inm == etag {
+                    write!(tls, "HTTP/1.1 304 Not Modified\r\netag: {etag}\r\nconnection: close\r\n\r\n")
+                } else {
+                    write!(tls, "HTTP/1.1 200 OK\r\netag: {etag}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", blob.len())
+                        .and_then(|_| tls.write_all(blob))
+                };
+                let _ = tls.flush();
+                tls.conn.send_close_notify();
+                let _ = tls.flush();
+            }
+        });
+        (format!("https://127.0.0.1:{port}"), seen)
+    }
+
+    /// F3: the seat names the bundle it last applied; an unchanged one is a
+    /// 304 (no body, no apply), a changed one is fetched whole, and a seat
+    /// with nothing applied yet sends no condition at all.
+    #[test]
+    fn an_unchanged_bundle_is_a_304_and_a_changed_one_is_fetched() {
+        let cluster = test_ca("noo cluster CA (test)");
+        let (door, seen) = bundle_door(&cluster, b"ciphertext-v2");
+        let agent = seat_agent_with(cluster.cert.pem().as_bytes(), vec![], 10).unwrap();
+        let url = format!("{door}/bootstrap/seat/lobby/bundle");
+        let v2 = sha256_hex(b"ciphertext-v2");
+        let v1 = sha256_hex(b"ciphertext-v1");
+
+        assert_eq!(fetch_bundle(&agent, &url, "1.c2ln", Some(&v2)), BundleFetch::Unchanged);
+        assert_eq!(fetch_bundle(&agent, &url, "1.c2ln", Some(&v1)), BundleFetch::Blob(b"ciphertext-v2".to_vec()));
+        assert_eq!(fetch_bundle(&agent, &url, "1.c2ln", None), BundleFetch::Blob(b"ciphertext-v2".to_vec()));
+        assert_eq!(fetch_bundle(&agent, &format!("{door}/none"), "1.c2ln", Some(&v2)), BundleFetch::NoneStaged);
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen[0], format!("\"{v2}\""), "the condition is the quoted sha of the bytes as served");
+        assert_eq!(seen[1], format!("\"{v1}\""));
+        assert_eq!(seen[2], "-", "nothing applied yet: no condition");
+    }
+
+    #[test]
+    fn only_a_64_hex_sha_is_ever_sent_as_a_condition() {
+        let sha = "a".repeat(64);
+        assert_eq!(if_none_match(Some(&sha)), Some(format!("\"{sha}\"")));
+        for bad in ["", "abc", &"g".repeat(64), &format!("{}\r\nx: y", "a".repeat(60))] {
+            assert_eq!(if_none_match(Some(bad)), None, "{bad:?}");
+        }
+        assert_eq!(if_none_match(None), None);
+    }
+
+    /// The timer's tick uses the tested GET with the recorded sha.
+    #[test]
+    fn the_sync_tick_fetches_conditionally() {
+        let own = crate::test_src::own_code(include_str!("kiosk_seat.rs"));
+        let tick = crate::test_src::fn_body(&own, "pub fn kiosk_seat_sync(");
+        assert!(tick.contains("fetch_bundle(&agent, &url, &proof, state.last_applied_sha.as_deref())"), "{tick}");
+        assert!(tick.contains("BundleFetch::Unchanged | BundleFetch::NoneStaged => return Ok(0),"), "{tick}");
     }
 
     #[test]

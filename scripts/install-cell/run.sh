@@ -189,6 +189,11 @@ if [ "$MODEL" = tiny ]; then
     step switch-to-tiny-model 300 -- noo models switch "$TINY_MODEL" --backend ollama --yes || fail_onboarded
 fi
 step verify 900 -- noo cluster verify --wait
+# PROBE (cf, #1069): the verify table above shows only failing rows' detail;
+# the JSON keeps every row, so a PASSING row's text (e.g. the sandbox
+# executor's "profile: 3.x form") is readable from the cell's artifacts. Same
+# redactor and upload scan as every log. Never the failed step.
+step probe-verify-json 300 -- noo --json cluster verify
 # DIAGNOSTIC (fa, i677 finding 17: the box's own node reads "online: status
 # unknown" and holds no live tunnel): the self-agent's own log, the URLs and
 # id it was given (ONLY those keys: the env file also holds the agent's
@@ -206,10 +211,18 @@ meta first_answer_s "$(( $(date +%s) - CELL_START ))"
 
 # PROBE (fa, i677 finding 20; fix #1059): `noo offboard` run by a shell that
 # cannot reach docker (no supplementary groups, as for a stranger whose
-# shell lacks the docker group) must refuse and remove NOTHING. A probe is
+# shell lacks the docker group) must refuse and remove NOTHING: not even the
+# self-heal daemons (rc.2: the gate trusted an exit 0 with no version and
+# offboard stopped them first; the fix reads the version). A probe is
 # reported on its own and never becomes the cell's failed step; on releases
 # without #1059 it is expected to fail (it wiped the box).
 step probe-offboard-without-docker 600 -- sh -c '
+  # What THIS docker answers in that shell (rc.2: Docker 28.0.4 let the gate
+  # pass; is it "exit 0, empty version"?): read, never judged.
+  sudo setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --reset-env \
+       env HOME="$HOME" PATH="$PATH" docker info --format "{{.ServerVersion}}" >/tmp/noo-di.out 2>/tmp/noo-di.err; di_rc=$?
+  echo "DOCKER-INFO without the docker group: exit=$di_rc stdout-bytes=$(tr -d "[:space:]" </tmp/noo-di.out | wc -c) stderr1=$(grep -m1 -v "^[[:space:]]*$" /tmp/noo-di.err | cut -c1-200)"
+  rm -f /tmp/noo-di.out /tmp/noo-di.err
   out="$(sudo setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --reset-env \
          env HOME="$HOME" PATH="$PATH" noo offboard -y 2>&1)"; rc=$?
   printf "%s\n" "$out"; ok=1
@@ -221,6 +234,35 @@ step probe-offboard-without-docker 600 -- sh -c '
   [ -d /var/lib/noo ] || { echo "PROBE FAIL: /var/lib/noo is gone"; ok=0; }
   noo health >/dev/null 2>&1 || { echo "PROBE FAIL: noo health is not ok afterwards"; ok=0; }
   [ "$ok" = 1 ]' || PROBE_ALTERED=1
+
+# PROBE (fa, rc.1 rehearsal A-reboot.status, i677): a container that joins
+# another's network namespace (network_mode: service:<door>; noo-ollama-embed
+# joins noo-stunnel-ollama-embed) must be running after EVERY dockerd start.
+# rc.2 on a real dockerd: one start in five left it exited 128 ("cannot join
+# network namespace of a non running container") with nothing restarting it.
+# The fix is noo-netns-restore.service (onboard installs it; After=/PartOf=/
+# WantedBy=docker.service). Twenty restarts of dockerd (its restore is the
+# path a reboot takes), each read back and followed by a chat. Last, because it
+# disturbs the stack. A probe: read, never the cell's failed step.
+step probe-docker-restart-namespace-joiners 2700 -- sh -c '
+  echo "PROBE SCOPE: 20x systemctl restart docker on this throwaway hosted runner (the dockerd restore path a reboot takes). It does NOT cover noo-hostd boot-restore, which runs only at a real boot."
+  if [ -f /etc/systemd/system/noo-netns-restore.service ]; then echo "noo-netns-restore.service: installed"; else echo "noo-netns-restore.service: NOT installed (a release without the fix)"; fi
+  left=0; chats=0
+  for i in $(seq 1 20); do
+    sudo systemctl restart docker
+    t=0; while [ $t -lt 90 ]; do docker info >/dev/null 2>&1 && break; sleep 2; t=$((t+2)); done
+    sleep 20
+    for c in noo-stunnel-ollama-embed noo-ollama-embed noo-stunnel-ollama-embed-cpu noo-ollama-embed-cpu; do
+      line="$(docker inspect -f "{{.Name}} status={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}}" "$c" 2>/dev/null)" || continue
+      echo "restart $i: $line"
+      case "$line" in *status=running*) ;; *) left=$((left+1)) ;; esac
+    done
+    out="$(timeout 300 noo chat --message "reply with the word ok" 2>&1)" && chats=$((chats+1)) || echo "restart $i: chat FAILED: $(printf "%s" "$out" | tail -n 1 | cut -c1-160)"
+  done
+  sudo journalctl -u noo-netns-restore.service --no-pager 2>/dev/null | grep -F "noo-netns-restore:" | tail -n 20
+  docker --version
+  echo "NETNS PROBE: containers left not running after a restart=$left, chats answered=$chats of 20"
+  true'
 
 # ── 5. clean uninstall ──────────────────────────────────────────────────
 teardown

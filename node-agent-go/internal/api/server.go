@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/auth"
@@ -86,8 +87,10 @@ type Server struct {
 	reconcileNudge func()
 
 	// harnessPlacement reports the desired harness placement for
-	// GET /harness/placement. nil until the agent installs it.
-	harnessPlacement func() HarnessPlacement
+	// GET /harness/placement. nil until the agent installs it, which is
+	// after registration while this server already answers: atomic, and
+	// nil reads as "not known yet" (503), never "not placed" (404).
+	harnessPlacement atomic.Pointer[func() HarnessPlacement]
 
 	// POST /bench: the last result, the in-flight flag, the chat placement.
 	benchState

@@ -46,7 +46,14 @@ func composeLockWait() time.Duration {
 // /tmp is odd would make the guard itself the outage.
 func acquireComposeLock(ctx context.Context) (func(), error) {
 	path := composeLockPath()
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	// Read-only (flock needs no write access), created if absent: a file
+	// another user created 0644 (root's after-boot run vs the owner's, rc.1
+	// rehearsal) is still lockable, where a write-open was refused and the
+	// recreate ran unlocked. Same path and inode as the scripts.
+	if c, cerr := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); cerr == nil {
+		_ = c.Close()
+	}
+	f, err := os.Open(path)
 	if err != nil {
 		return func() {}, nil
 	}

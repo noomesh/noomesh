@@ -4,7 +4,7 @@ version: "1.0"
 description: "noomesh cluster management — nodes, backends, scaling, and health"
 author: noo-builtin
 tags: [cluster, infrastructure, devops, gpu, backends]
-trigger_keywords: [cluster, node, backend, gpu, vllm, ollama, llamacpp, scale, health, deploy, start, stop]
+trigger_keywords: [cluster, node, backend, gpu, vllm, ollama, llamacpp, deploy]
 priority: 5
 max_context_chars: 4000
 composable: true

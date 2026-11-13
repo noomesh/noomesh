@@ -568,6 +568,7 @@ read the findings:
 | `credential-in-env` | ERROR | a credential is in `.env` — remove it; the store copy is the one that loads |
 | `blank-value` | ERROR | a key is present but empty |
 | `required-key-absent` | ERROR | a key the registry requires (always, or because its feature flag is on) is missing |
+| `minted-at-stack-start` | INFO | only in `noo onboard`'s summary when the stack did not start: a service key onboarding mints against a running gateway is absent because of that failure; fix the services failure and re-run `noo onboard --reconfigure` |
 | `db-password-does-not-authenticate` | ERROR | the stored password no longer logs in to its Postgres role — run `resync` |
 | `value-drift` | WARN | the same key differs between the two files |
 | `consumer-gap` | WARN | (env backend only) a consumer is missing a key it needs |

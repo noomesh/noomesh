@@ -1186,6 +1186,7 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     // Everything the launcher's bind checks and the new compose expect.
     reconcile_service_certs(g);
     reconcile_grafana_door(g, &roll.root);
+    reconcile_netns_unit(g, &roll.root);
     sync_gateway_pki_view(g);
     crate::commands::voice_models::stage_if_on(g);
     reconcile_addon_nats_principals(g, &roll.root);
@@ -2717,6 +2718,49 @@ fn reconcile_short_service_certs(
 /// before the launcher, so the roll recreates the gateway and Grafana with
 /// them. One line per change; silent when there is none. Never fails the
 /// roll: `noo cluster verify` FAILs the `grafana door` row instead.
+/// Whether the stack stage should (re)install noo-netns-restore.service. Pure.
+pub(crate) fn netns_unit_needs_install(systemd: bool, state: crate::netns_unit::State) -> bool {
+    systemd && state != crate::netns_unit::State::Current
+}
+
+/// The stack stage (`noo upgrade --stack` and `--all`), on the controller this
+/// command runs on, never a remote node: install or refresh
+/// noo-netns-restore.service, which installs onboarded before rc.3 lack. On a
+/// terminal sudo may ask once, with the reason on the line above; off a
+/// terminal `sudo -n`, and a refusal is a warning naming the one command.
+/// Never fails the roll; `noo cluster verify` shows the `netns restore` row.
+fn reconcile_netns_unit(g: &Globals, root: &std::path::Path) {
+    use crate::netns_unit as nu;
+    let systemd = nu::systemd_here();
+    if !systemd {
+        return;
+    }
+    let unit = match nu::render(&nu::owner(), &root.display().to_string()) {
+        Ok(u) => u,
+        Err(e) => {
+            if !g.json { ui::warned(&format!("{} not installed: {e}", nu::UNIT_NAME)); }
+            return;
+        }
+    };
+    if !netns_unit_needs_install(systemd, nu::state(&unit)) {
+        return;
+    }
+    // SAFETY: isatty has no preconditions.
+    let tty = !g.json && unsafe { libc::isatty(0) } == 1;
+    if tty {
+        ui::step(&format!("installing {}: it starts the containers that join another's network after every dockerd start (sudo may ask)", nu::UNIT_NAME));
+    }
+    match nu::install(tty, &unit) {
+        Ok(()) => { if !g.json { ui::done(&format!("{} installed and enabled", nu::UNIT_NAME)); } }
+        Err(e) => {
+            if !g.json {
+                ui::warned(&format!("{} not installed ({e}): after a reboot or a dockerd restart, a container that joins another's network (noo-ollama-embed) can stay down", nu::UNIT_NAME));
+                ui::guide(&[(nu::REMEDY, "run it in a terminal: sudo asks once and the stack stage installs the unit")]);
+            }
+        }
+    }
+}
+
 fn reconcile_grafana_door(g: &Globals, root: &std::path::Path) {
     use super::grafana_door as gd;
     let env_path = root.join(".env");
@@ -3967,8 +4011,9 @@ pub(crate) fn fetch_release_file(g: &Globals, version: &str, name: &str, base_ur
     fetch_tag_file(g, &format!("{TAG_PREFIX}{version}"), name)
 }
 
-/// One asset of the GitHub release on `tag`: gh, then the direct GET only
-/// where it can help ([`release_fetch::gh_then_direct`]). Transient failures
+/// One asset of the GitHub release on `tag`: the direct `releases/download`
+/// GET, then gh only where it can help ([`release_fetch::direct_then_gh`]:
+/// a public asset never goes through the rate-limited API). Transient failures
 /// are retried with backoff on each lane; the error names the real cause
 /// The bytes are unverified here — every caller checks
 /// them against a signed manifest or signed lock, as before.
@@ -3976,7 +4021,7 @@ pub(crate) fn fetch_tag_file(g: &Globals, tag: &str, name: &str) -> Result<Vec<u
     let repo = repo();
     let gh = which("gh");
     let mut sleep = release_fetch::real_sleep;
-    release_fetch::gh_then_direct(
+    release_fetch::direct_then_gh(
         gh.as_deref(),
         &mut |gh| {
             let r = release_fetch::gh_download_with_retry(gh, &repo, tag, name, &release_fetch::DEFAULT_RETRY, &mut sleep);
@@ -4336,6 +4381,14 @@ fn pick_latest_cli(releases: &[(String, bool)]) -> Option<String> {
 /// `gh` (auth), falls back to the token'd releases API. Never a prerelease
 /// ([`pick_latest_cli`]).
 pub(crate) fn resolve_latest(g: &Globals) -> Result<String, String> {
+    // No API first: github.com's `releases/latest` redirect names the newest
+    // final noo-cli release (only those are ever marked Latest). Behind a
+    // shared address the API's unauthenticated limit refused plain `noo
+    // upgrade` (rc.2 matrix found the same limit on the install path).
+    if let Some(v) = latest_via_redirect() {
+        if g.verbose { eprintln!("latest release: {TAG_PREFIX}{v} (releases/latest)"); }
+        return Ok(v);
+    }
     let mut gh_err: Option<FetchError> = None;
     if which("gh").is_some() {
         let out = std::process::Command::new("gh")
@@ -4377,6 +4430,37 @@ pub(crate) fn resolve_latest(g: &Globals) -> Result<String, String> {
         return Ok(v);
     }
     Err("no final noo-cli-v* release found".into())
+}
+
+/// The newest FINAL noo-cli release from github.com's `releases/latest`
+/// redirect, which is not the API and has no API rate limit. Only noo-cli
+/// finals are ever marked Latest: noo-cli-release.yml creates them with
+/// `--latest`, every rc with `--prerelease --latest=false`, and
+/// images-release.yml every stack release with `--latest=false` (the README's
+/// install line, releases/latest/download/install.sh, rests on the same
+/// rule). None (and the API lanes run) when the redirect is missing, does not
+/// name a final noo-cli tag, or the repo is private (github.com answers 404).
+fn latest_via_redirect() -> Option<String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(20)))
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .build()
+        .into();
+    let r = agent.head(&format!("https://github.com/{}/releases/latest", repo())).call().ok()?;
+    if !r.status().is_redirection() {
+        return None;
+    }
+    latest_cli_from_location(r.headers().get("location")?.to_str().ok()?)
+}
+
+/// `…/releases/tag/noo-cli-v0.6.23` → "0.6.23". Only a final noo-cli tag:
+/// anything else (a stack tag, an rc, a malformed path) is None. Pure.
+pub(crate) fn latest_cli_from_location(loc: &str) -> Option<String> {
+    let tag = loc.trim().rsplit_once("/releases/tag/")?.1.trim_end_matches('/');
+    let v = tag.strip_prefix(TAG_PREFIX)?;
+    let parts: Vec<&str> = v.split('.').collect();
+    (parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))).then(|| v.to_string())
 }
 
 /// gh's `release list` failure, classified — kept so that if
@@ -7897,5 +7981,60 @@ mod roll_marker_tests {
         assert_eq!(own.matches("record_roll();").count(), 2, "stack and nodes stages");
         assert!(own.contains("ui::guide(&[(VERIFY_AFTER_ROLL, VERIFY_AFTER_ROLL_WHY)]);"));
         assert_eq!(VERIFY_AFTER_ROLL, "noo cluster verify --wait");
+    }
+}
+
+#[cfg(test)]
+mod latest_redirect_tests {
+    use super::latest_cli_from_location;
+
+    #[test]
+    fn only_a_final_noo_cli_tag_is_taken_from_the_redirect() {
+        assert_eq!(latest_cli_from_location("https://github.com/o/r/releases/tag/noo-cli-v0.6.23").as_deref(), Some("0.6.23"));
+        assert_eq!(latest_cli_from_location("https://github.com/o/r/releases/tag/noo-cli-v1.10.0/\r\n").as_deref(), Some("1.10.0"));
+        for bad in [
+            "https://github.com/o/r/releases/tag/stack-v0.6.23",
+            "https://github.com/o/r/releases/tag/noo-cli-v0.6.24-rc.2",
+            "https://github.com/o/r/releases/tag/noo-cli-v0.6",
+            "https://github.com/o/r/releases/tag/noo-cli-v0.6.x",
+            "https://github.com/o/r/releases",
+            "",
+        ] {
+            assert_eq!(latest_cli_from_location(bad), None, "{bad}");
+        }
+    }
+
+    /// resolve_latest asks the redirect before gh or the API.
+    #[test]
+    fn resolve_latest_tries_the_redirect_first() {
+        let own = crate::test_src::own_code(include_str!("upgrade.rs"));
+        let body = crate::test_src::fn_body(&own, "pub(crate) fn resolve_latest(");
+        let redirect = body.find("latest_via_redirect()").expect("the redirect lane");
+        let gh = body.find("which(\"gh\")").expect("the gh lane");
+        assert!(redirect < gh, "{body}");
+    }
+}
+
+#[cfg(test)]
+mod netns_reconcile_tests {
+    use super::netns_unit_needs_install;
+    use crate::netns_unit::State;
+
+    #[test]
+    fn the_stack_stage_installs_a_missing_stale_or_disabled_unit_on_systemd_only() {
+        for s in [State::Missing, State::Stale, State::Disabled] {
+            assert!(netns_unit_needs_install(true, s), "{s:?}");
+            assert!(!netns_unit_needs_install(false, s), "no systemd: {s:?}");
+        }
+        assert!(!netns_unit_needs_install(true, State::Current));
+    }
+
+    /// The stack stage (also under --all) reconciles it with the other local
+    /// state, before the launcher.
+    #[test]
+    fn the_stack_stage_calls_the_reconcile() {
+        let own = crate::test_src::own_code(include_str!("upgrade.rs"));
+        let body = crate::test_src::fn_body(&own, "fn upgrade_stack(");
+        assert!(body.contains("reconcile_netns_unit(g, &roll.root);"), "{body}");
     }
 }

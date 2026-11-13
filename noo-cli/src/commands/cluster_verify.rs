@@ -496,7 +496,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
 
     // 6e'. Lanes (proposal i403): what the class table routes on this node,
     //      by the agent's lane states.
-    out.push(lanes_check(n));
+    out.push(lanes_check_at(n, now_unix));
 
     // 6d. The log shipper (fleet logging phase 6), from the agent's own
     //     account in its heartbeat.
@@ -660,7 +660,53 @@ const GPU_PROBE_FAILING_SECS: i64 = 60;
 /// while `running_backends` lists a backend is a WARN (the agent says nothing
 /// is placed, so nothing routes). No key is an agent that predates lanes,
 /// routed by `running_backends`: said, not warned.
+#[cfg(test)]
 pub(crate) fn lanes_check(n: &Value) -> Check {
+    lanes_check_at(n, now_unix())
+}
+
+/// Why a placed backend is deliberately NOT running, when its node says so:
+/// it is in `gpu_contention.paused_backends` and the pause has a live cause,
+/// either a GPU hold whose lease has not expired (a reservation, or an
+/// operator's hold) or the automatic yield to a workload outside noomesh.
+/// `None` otherwise, so a backend that is really down, or still paused after
+/// its hold expired, still reads as down. The same rule and words as the
+/// gateway's `placement_stuck::paused_on_purpose`, so verify and the alert
+/// say one thing.
+pub(crate) fn paused_on_purpose(n: &Value, backend: &str, now_unix: i64) -> Option<String> {
+    let gc = &n["gpu_contention"];
+    if !gc["paused_backends"].as_array()?.iter().any(|b| b.as_str() == Some(backend)) {
+        return None;
+    }
+    let reason = gc["reason"].as_str().filter(|r| !r.is_empty());
+    if let Some(lease) = gc["lease"].as_object() {
+        if let Some(exp) = lease.get("expires_at").and_then(Value::as_str).filter(|e| !e.is_empty()) {
+            match parse_rfc3339_unix(exp) {
+                Some(t) if t <= now_unix => return None,
+                Some(_) => {}
+                None => return None,
+            }
+        }
+        let op = lease.get("operation_id").and_then(Value::as_str).unwrap_or("?");
+        let mut s = format!("paused for GPU reservation {op}");
+        if let Some(w) = lease.get("workload").and_then(Value::as_str).filter(|w| !w.is_empty()) {
+            s.push_str(&format!(" ({w})"));
+        }
+        if let Some(o) = lease.get("owner").and_then(Value::as_str).filter(|o| !o.is_empty()) {
+            s.push_str(&format!(" by {o}"));
+        }
+        if let Some(r) = lease.get("reason").and_then(Value::as_str).filter(|r| !r.is_empty()).or(reason) {
+            s.push_str(&format!(": {r}"));
+        }
+        return Some(s);
+    }
+    (gc["state"].as_str() == Some("shared")).then(|| match reason {
+        Some(r) => format!("paused: the GPU is in use outside noomesh ({r})"),
+        None => "paused: the GPU is in use outside noomesh".to_string(),
+    })
+}
+
+pub(crate) fn lanes_check_at(n: &Value, now_unix: i64) -> Check {
     const NAME: &str = "lanes";
     let id = n["id"].as_str().unwrap_or("?");
     let Some(raw) = n.get("lanes") else {
@@ -690,9 +736,19 @@ pub(crate) fn lanes_check(n: &Value) -> Check {
     };
     let count = |st: &str| chat.iter().filter(|l| text(l, "state") == st).count();
     let unconfirmed: Vec<String> = chat.iter().filter(|l| matches!(text(l, "state").as_str(), "unknown" | "unplaced")).map(|l| label(l)).collect();
-    let not_routed: Vec<String> = chat
+    let down: Vec<&&Value> = chat
         .iter()
         .filter(|l| !matches!(text(l, "state").as_str(), "serving" | "on_demand" | "unknown" | "unplaced"))
+        .collect();
+    // A lane the node paused on purpose (a live GPU reservation or hold) is
+    // said as such, never as "down": the `gpu` row carries the hold itself.
+    let paused: Vec<String> = down
+        .iter()
+        .filter_map(|l| paused_on_purpose(n, &text(l, "backend"), now_unix).map(|why| format!("{}={}: {why}", text(l, "backend"), text(l, "model"))))
+        .collect();
+    let not_routed: Vec<String> = down
+        .iter()
+        .filter(|l| paused_on_purpose(n, &text(l, "backend"), now_unix).is_none())
         .map(|l| label(l))
         .collect();
     let mut detail = format!("{} chat lane(s): {} serving, {} on demand", chat.len(), count("serving"), count("on_demand"));
@@ -701,6 +757,9 @@ pub(crate) fn lanes_check(n: &Value) -> Check {
     }
     if !other.is_empty() {
         detail.push_str(&format!("; {} other lane(s)", other.len()));
+    }
+    if !paused.is_empty() {
+        detail = format!("{}; {detail}", paused.join(", "));
     }
     if not_routed.is_empty() {
         return ok(NAME, detail);
@@ -798,6 +857,10 @@ pub(crate) fn gpu_contention_check_at(n: &Value, now_unix: i64) -> Option<Check>
             };
             let remedy = if mode == super::cluster_gpu_mode::Mode::User {
                 format!("noo cluster gpu mode {id} mesh   # when the other work is done")
+            } else if let super::cluster_gpu_mode::Mode::Workload(w) = &mode {
+                // A reservation ends when its workload releases it; releasing
+                // it by hand stops that workload, so it is named as such.
+                format!("nothing to do: released when {w} ends; to end it early (stops {w}): noo cluster gpu release {id}{ids}")
             } else {
                 format!("noo cluster gpu release {id}{ids}   # when the other work is done")
             };
@@ -2811,6 +2874,31 @@ pub(crate) fn noo_data_bound_check(seen: &NooDataSeen, want: Option<&str>) -> Ch
 
 /// [`noo_data_bound_check`] for the install at `root`: the bind it should
 /// have, from its `.env`, against docker's view of `<project>_noo-data`.
+/// The `netns restore` row (#1108): is noo-netns-restore.service installed and
+/// enabled on this systemd controller, so a container that joins another's
+/// network (noo-ollama-embed) comes back after every dockerd start? Pure.
+pub(crate) fn netns_restore_row(systemd: bool, state: Option<crate::netns_unit::State>) -> Check {
+    use crate::netns_unit::{State, REMEDY, UNIT_NAME};
+    const NAME: &str = "netns restore";
+    if !systemd {
+        return ok(NAME, "no systemd here: noo-hostd's boot-restore restarts a namespace-joined container after a reboot; a dockerd restart alone is not covered");
+    }
+    let lose = "after a reboot or a dockerd restart, a container that joins another's network (noo-ollama-embed) can stay down";
+    match state {
+        Some(State::Current) => ok(NAME, format!("{UNIT_NAME} installed and enabled: it runs after every dockerd start")),
+        Some(State::Disabled) => warn(NAME, format!("{UNIT_NAME} is installed but not enabled: {lose}"), Some(REMEDY.into())),
+        Some(State::Stale) => warn(NAME, format!("{UNIT_NAME} is not the unit this install writes (older, or for a moved install): {lose}"), Some(REMEDY.into())),
+        Some(State::Missing) | None => warn(NAME, format!("{UNIT_NAME} is not installed: {lose}"), Some(REMEDY.into())),
+    }
+}
+
+fn netns_restore_row_here(root: &std::path::Path) -> Check {
+    use crate::netns_unit as nu;
+    let systemd = nu::systemd_here();
+    let state = systemd.then(|| nu::render(&nu::owner(), &root.display().to_string()).ok().map(|u| nu::state(&u))).flatten();
+    netns_restore_row(systemd, state)
+}
+
 pub(crate) fn noo_data_bound_row(root: &std::path::Path) -> Check {
     let env = root.join(".env");
     let state = crate::onboard::env::read_env_key(&env, "NOO_STATE_ROOT");
@@ -4348,7 +4436,7 @@ pub(crate) fn postgres_hba_check(hba: Option<&str>, compose: Option<&str>) -> Ch
 /// leaves were judged, the file was NOT CHECKED.
 pub(crate) fn postgres_role_identity_check(ca: &crate::pki::ClusterCa, hba: Option<&str>) -> Check {
     if !ca.ca_exists() {
-        return warn("postgres role identity", format!("no cluster CA at {}: nothing to check", ca.dir.display()), Some("noo onboard --only security".into()));
+        return warn("postgres role identity", format!("no cluster CA at {}: nothing to check", ca.dir.display()), Some("noo onboard --only enrollment".into()));
     }
     let gaps = crate::pki::pg_identity_gaps(ca, hba);
     if !gaps.is_empty() {
@@ -4361,7 +4449,7 @@ pub(crate) fn postgres_role_identity_check(ca: &crate::pki::ClusterCa, hba: Opti
                 gaps.join("; ")
             ),
             if missing_file {
-                "noo upgrade --stack   # issues the role leaves before it recreates anything (or: noo onboard --only security)"
+                "noo upgrade --stack   # issues the role leaves before it recreates anything (or: noo onboard --only enrollment)"
             } else {
                 "noo upgrade --stack   # re-materialises docker/postgres/pg_hba.conf; then: noo stack restart --force postgres"
             },
@@ -7292,6 +7380,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             .collect();
         checks.push(cert_expiry_row(&certs));
         checks.push(noo_data_bound_row(&crate::envfile::repo_root()));
+        checks.push(netns_restore_row_here(&crate::envfile::repo_root()));
         // i67: the controller's own node (when this box runs one) rides the rail.
         if let Some(me) = crate::commands::provision::self_node_name()
             .filter(|_| std::path::Path::new("/usr/local/bin/noo-node-agent").is_file())
@@ -7671,14 +7760,15 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // the same /metrics text, node counts from each node record.
         // Each node's last apply report, for the
         // retired apply lanes (a refusal is a node that kept its old state).
-        let apply_reports: Vec<(String, Option<i64>, String)> = fleet
-            .iter()
-            .filter_map(|n| n["id"].as_str())
-            .filter_map(|id| {
-                let st = get_json_opt(g, &format!("/api/cluster/provision-bundle/{id}/status"), true, 10)?;
-                Some((id.to_string(), st["apply_rc"].as_i64(), st["apply_msg"].as_str().unwrap_or("").to_string()))
-            })
-            .collect();
+        // One read per node, side by side (serially ~0.7 s each on awolf).
+        let bundle_ids: Vec<&str> = fleet.iter().filter_map(|n| n["id"].as_str()).collect();
+        let apply_reports: Vec<(String, Option<i64>, String)> = par_map(&bundle_ids, |id| {
+            let st = get_json_opt(g, &format!("/api/cluster/provision-bundle/{id}/status"), true, 10)?;
+            Some((id.to_string(), st["apply_rc"].as_i64(), st["apply_msg"].as_str().unwrap_or("").to_string()))
+        })
+        .into_iter()
+        .flatten()
+        .collect();
         let unadopted: Vec<String> = fleet
             .iter()
             .filter_map(|n| n["id"].as_str())
@@ -12828,7 +12918,7 @@ mod lanes_row_tests {
     #[test]
     fn the_row_is_on_every_node() {
         let code = crate::test_src::own_code(include_str!("cluster_verify.rs"));
-        assert!(code.contains("out.push(lanes_check(n));"));
+        assert!(code.contains("out.push(lanes_check_at(n, now_unix));"));
     }
 }
 
@@ -12974,7 +13064,10 @@ mod gpu_contention_tests {
             "lease": {"owner": "rbwolf", "operation_id": "res-1", "generation": 6, "workload": "rhaddon/worker"}}));
         let c = gpu_contention_check(&reserved).unwrap();
         assert!(c.detail.starts_with("mode workload rhaddon/worker: held by rbwolf"), "{}", c.detail);
-        assert!(c.remedy.unwrap().starts_with("noo cluster gpu release host3 --operation res-1 --generation 6"));
+        // A reservation ends when its workload releases it: the release is
+        // offered only as ending it early, never as the fix.
+        assert_eq!(c.remedy.as_deref(),
+            Some("nothing to do: released when rhaddon/worker ends; to end it early (stops rhaddon/worker): noo cluster gpu release host3 --operation res-1 --generation 6"));
     }
 
     #[test]
@@ -13619,6 +13712,7 @@ mod speed_tests {
         assert!(run.contains("par_map(&selected, |n| with_harness_wanted(g, n))"), "node reads run side by side");
         assert!(run.contains("par_map(&reads, |w| self_json(g, w))"), "the security/doctor verbs run side by side");
         assert!(run.contains("par_map(&fit_ids,"), "the per-node fit reads run side by side");
+        assert!(run.contains("par_map(&bundle_ids,"), "the per-node apply reports run side by side");
         // `addons verify` alone stays where it is: it runs only when a
         // licensed add-on is on, decided from noomesh.yaml after the batch.
         assert_eq!(run.matches("= self_json(g,").count(), 1, "no other verb runs on its own, one after another");
@@ -13927,5 +14021,98 @@ mod settle_after_roll_tests {
         let run = crate::test_src::fn_body(&own, "pub fn cluster_verify(");
         assert!(run.contains("crate::commands::upgrade::last_roll()"));
         assert!(run.contains("obj.insert(ROLLED_AGO_KEY.into(), age.into());"));
+    }
+}
+
+#[cfg(test)]
+mod reservation_pause_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn held_awolf(expires: Option<&str>) -> Value {
+        let mut lease = json!({"generation": 6, "mode": "drain", "operation_id": "58586ceb",
+            "owner": "rbwolf", "reason": "reservation rhaddon/worker", "workload": "rhaddon/worker"});
+        if let Some(e) = expires {
+            lease["expires_at"] = e.into();
+        }
+        json!({"id": "awolf",
+            "lanes": [{"backend": "vllm", "model": "gemma-4-12B", "state": "down", "reason": "not running"}],
+            "gpu_contention": {"state": "held", "method": "memory-accounting-unattributed", "paused_backends": ["vllm"],
+                "reason": "reservation rhaddon/worker", "lease": lease}})
+    }
+
+    #[test]
+    fn a_lane_paused_for_a_reservation_is_said_as_paused_not_down() {
+        let c = lanes_check_at(&held_awolf(None), 2_000_000_000);
+        assert_eq!(c.verdict, Verdict::Ok, "{c:?}");
+        assert!(c.detail.starts_with("vllm=gemma-4-12B: paused for GPU reservation 58586ceb (rhaddon/worker) by rbwolf: reservation rhaddon/worker; "),
+            "{}", c.detail);
+        assert!(!c.detail.contains("down"), "{}", c.detail);
+    }
+
+    #[test]
+    fn an_expired_hold_excuses_nothing_and_the_lane_is_down_again() {
+        let c = lanes_check_at(&held_awolf(Some("2026-11-12T15:00:00Z")), 2_000_000_000);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.starts_with("not routed: vllm=gemma-4-12B: down (not running)"), "{}", c.detail);
+        let unreadable = lanes_check_at(&held_awolf(Some("soon")), 2_000_000_000);
+        assert_eq!(unreadable.verdict, Verdict::Warn, "an expiry nobody can read excuses nothing");
+    }
+
+    #[test]
+    fn a_backend_not_in_paused_backends_stays_down() {
+        let mut n = held_awolf(None);
+        n["gpu_contention"]["paused_backends"] = json!(["llamacpp"]);
+        assert_eq!(lanes_check_at(&n, 2_000_000_000).verdict, Verdict::Warn);
+        assert_eq!(paused_on_purpose(&n, "vllm", 2_000_000_000), None);
+    }
+
+    #[test]
+    fn a_yield_to_outside_work_is_said_too() {
+        let n = json!({"gpu_contention": {"state": "shared", "paused_backends": ["vllm"], "reason": "VR"}});
+        assert_eq!(paused_on_purpose(&n, "vllm", 1).as_deref(), Some("paused: the GPU is in use outside noomesh (VR)"));
+    }
+
+    #[test]
+    fn the_gpu_rows_remedy_for_a_reservation_says_releasing_stops_the_workload() {
+        // A hand hold (no workload) keeps the release as its way out.
+        let mut manual = held_awolf(None);
+        manual["gpu_contention"]["lease"]["workload"] = Value::Null;
+        let m = gpu_contention_check_at(&manual, 2_000_000_000).unwrap().remedy.unwrap();
+        assert!(m.starts_with("noo cluster gpu release awolf --operation 58586ceb --generation 6"), "{m}");
+        let n = held_awolf(None);
+        let c = gpu_contention_check_at(&n, 2_000_000_000).unwrap();
+        let r = c.remedy.unwrap();
+        // Offering `gpu release` as THE fix for a live reservation would end
+        // the workload holding it (an operator's voice session, 11-12).
+        assert!(!r.starts_with("noo cluster gpu release"), "a live reservation's remedy must not be the release: {r}");
+        assert!(r.starts_with("nothing to do: released when rhaddon/worker ends; to end it early (stops rhaddon/worker): noo cluster gpu release awolf --operation 58586ceb --generation 6"), "{r}");
+    }
+}
+
+#[cfg(test)]
+mod netns_restore_row_tests {
+    use super::*;
+    use crate::netns_unit::State;
+
+    #[test]
+    fn the_row_shows_whether_the_unit_runs_after_every_dockerd_start() {
+        assert_eq!(netns_restore_row(true, Some(State::Current)).verdict, Verdict::Ok);
+        for s in [Some(State::Missing), Some(State::Stale), Some(State::Disabled), None] {
+            let c = netns_restore_row(true, s);
+            assert_eq!(c.verdict, Verdict::Warn, "{s:?}");
+            assert_eq!(c.remedy.as_deref(), Some(crate::netns_unit::REMEDY), "{s:?}");
+            assert!(c.detail.contains("noo-ollama-embed"), "{}", c.detail);
+        }
+        let c = netns_restore_row(false, None);
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("no systemd") && c.detail.contains("not covered"), "{}", c.detail);
+    }
+
+    #[test]
+    fn the_controller_run_has_the_row() {
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let run = crate::test_src::fn_body(&own, "pub fn cluster_verify(");
+        assert!(run.contains("checks.push(netns_restore_row_here(&crate::envfile::repo_root()));"), "{run}");
     }
 }

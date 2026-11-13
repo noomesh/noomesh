@@ -436,28 +436,32 @@ pub(crate) fn gh_download_with_retry(
     with_retry(p, sleep, || gh_download_once(gh, repo, tag, name))
 }
 
-/// gh first, the direct GET second — but the direct GET only when it can
-/// help. gh is authenticated, so its "not found" is the answer and its
-/// network/5xx/rate-limit failure is GitHub's, which a second lane to the
-/// same GitHub would only repeat. A gh-side failure (not logged in, a
-/// token that cannot read the repo, gh itself broken) is where the direct
-/// GET can still succeed: on a public repo it needs no credentials. If
-/// that fails too, gh's cause leads and the direct result follows — the
-/// direct GET's 404 is what a private repo answers to anyone, so it must
-/// never stand in for gh's error again.
-pub(crate) fn gh_then_direct(
+/// The direct `releases/download` GET first, gh second, and gh only when it
+/// can help. A public release asset is served by GitHub's download path,
+/// which the API's rate limit (60 an hour per address, unauthenticated) does
+/// not touch; gh goes through the API. An install on a shared address (a
+/// hosted runner, an office NAT) was refused for the stack lock with "HTTP
+/// 403: API rate limit exceeded" by an unauthenticated gh (rc.2 install
+/// matrix), although the plain download needed no API at all.
+///
+/// gh is asked only when the direct GET answers not-found or unauthorised:
+/// what a PRIVATE repo answers to anyone, where gh's credentials are the way
+/// in. Its answer then leads: a gh network/rate-limit failure is reported as
+/// that, never as the direct lane's 404 (the i11b incident). A direct
+/// network/5xx/rate failure is not handed to gh: it would reach the same
+/// GitHub.
+pub(crate) fn direct_then_gh(
     gh: Option<&Path>,
     gh_fetch: &mut dyn FnMut(&Path) -> Result<Vec<u8>, FetchError>,
     direct: &mut dyn FnMut() -> Result<Vec<u8>, FetchError>,
 ) -> Result<Vec<u8>, FetchError> {
-    let Some(gh) = gh else { return direct() };
-    match gh_fetch(gh) {
+    match direct() {
         Ok(b) => Ok(b),
-        Err(e) if matches!(e.class, FetchClass::Auth | FetchClass::Other) => match direct() {
-            Ok(b) => Ok(b),
-            Err(d) => Err(e.with_also(format!("the direct download also failed ({})", d.summary()))),
+        Err(d) if matches!(d.class, FetchClass::NotFound | FetchClass::Auth) => match gh {
+            Some(gh) => gh_fetch(gh).map_err(|e| e.with_also(format!("the direct download answered first ({})", d.summary()))),
+            None => Err(d),
         },
-        Err(e) => Err(e),
+        Err(d) => Err(d),
     }
 }
 
@@ -733,39 +737,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// The i11b incident, replayed: gh fails on the network, the direct GET
-    /// to a private repo 404s. The report is gh's network error, never the
-    /// direct lane's fake "not found" — and the direct lane is not even
-    /// tried, because it would reach the same GitHub.
+    /// rc.2 install matrix: an unauthenticated gh was rate-limited by the
+    /// API for a PUBLIC asset. The direct download serves it, and gh is
+    /// never asked.
     #[cfg(unix)]
     #[test]
-    fn a_gh_network_failure_is_not_reported_as_a_404() {
-        let d = tmpdir("incident");
-        let gh = fake_gh(&d, &[(1, "Get \"https://api.github.com/\": dial tcp: i/o timeout")]);
-        let (base, hits) = serve(vec![(404, vec![], "")]);
-        let e = gh_then_direct(
-            Some(&gh),
-            &mut |p| gh_download_with_retry(p, "o/r", "noo-cli-v0.5.91", "noo-gateway-aarch64-apple-darwin", &FAST, &mut |_| {}),
-            &mut || get_with_retry(&agent(), &format!("{base}/x"), None, &FAST, &mut |_| {}),
-        )
-        .unwrap_err();
-        assert_eq!(e.class, FetchClass::Network, "{e}");
-        assert!(!e.is_not_found());
-        assert_eq!(gh_runs(&gh), 4, "gh's transient failure is retried to the bound");
-        assert_eq!(hits.load(Ordering::SeqCst), 0, "the direct lane would only repeat GitHub's answer");
-        assert!(!e.to_string().contains("HTTP 404"), "{e}");
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    /// gh not logged in: the direct GET is the public-repo lane. When it
-    /// also fails, gh's cause leads and the direct result follows.
-    #[cfg(unix)]
-    #[test]
-    fn gh_not_logged_in_falls_back_to_the_direct_lane() {
-        let d = tmpdir("public");
-        let gh = fake_gh(&d, &[(4, "To get started with GitHub CLI, please run:  gh auth login")]);
+    fn a_public_asset_never_asks_the_api() {
+        let d = tmpdir("public-first");
+        let gh = fake_gh(&d, &[(1, "HTTP 403: API rate limit exceeded for 172.214.47.26.")]);
         let (base, hits) = serve(vec![(200, vec![], "public-bytes")]);
-        let b = gh_then_direct(
+        let b = direct_then_gh(
             Some(&gh),
             &mut |p| gh_download_with_retry(p, "o/r", "t", "a", &FAST, &mut |_| {}),
             &mut || get_with_retry(&agent(), &format!("{base}/x"), None, &FAST, &mut |_| {}),
@@ -773,20 +754,85 @@ mod tests {
         .unwrap();
         assert_eq!(b, b"public-bytes");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(gh_runs(&gh), 0, "gh (the API) is never asked for a public asset");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
-        let d = tmpdir("private");
-        let gh = fake_gh(&d, &[(4, "To get started with GitHub CLI, please run:  gh auth login")]);
+    /// A private repo answers 404 to anyone: gh's credentials are the way in.
+    /// With no gh, the direct answer is the answer.
+    #[cfg(unix)]
+    #[test]
+    fn a_private_repo_is_read_through_gh() {
+        let d = tmpdir("private-gh");
+        let gh = fake_gh(&d, &[(0, "private-bytes")]);
         let (base, _) = serve(vec![(404, vec![], "")]);
-        let e = gh_then_direct(
+        let b = direct_then_gh(
             Some(&gh),
             &mut |p| gh_download_with_retry(p, "o/r", "t", "a", &FAST, &mut |_| {}),
             &mut || get_with_retry(&agent(), &format!("{base}/x"), None, &FAST, &mut |_| {}),
         )
+        .unwrap();
+        assert_eq!(b, b"private-bytes");
+        assert_eq!(gh_runs(&gh), 1);
+
+        let (base, _) = serve(vec![(404, vec![], "")]);
+        let e = direct_then_gh(
+            None,
+            &mut |_| unreachable!("no gh"),
+            &mut || get_with_retry(&agent(), &format!("{base}/x"), None, &FAST, &mut |_| {}),
+        )
         .unwrap_err();
-        assert_eq!(e.class, FetchClass::Auth, "gh's cause leads: {e}");
-        let s = e.to_string();
-        assert!(s.contains("the direct download also failed") && s.contains("gh auth login"), "{s}");
+        assert!(e.is_not_found(), "{e}");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The i11b incident, replayed in this order: the direct GET to a private
+    /// repo 404s, then gh fails on the network. The report is gh's network
+    /// error, never the direct lane's "not found".
+    #[cfg(unix)]
+    #[test]
+    fn a_gh_network_failure_after_a_private_404_is_not_reported_as_a_404() {
+        let d = tmpdir("incident");
+        let gh = fake_gh(&d, &[(1, "Get \"https://api.github.com/\": dial tcp: i/o timeout")]);
+        let (base, hits) = serve(vec![(404, vec![], "")]);
+        let e = direct_then_gh(
+            Some(&gh),
+            &mut |p| gh_download_with_retry(p, "o/r", "noo-cli-v0.5.91", "noo-gateway-aarch64-apple-darwin", &FAST, &mut |_| {}),
+            &mut || get_with_retry(&agent(), &format!("{base}/x"), None, &FAST, &mut |_| {}),
+        )
+        .unwrap_err();
+        assert_eq!(e.class, FetchClass::Network, "{e}");
+        assert!(!e.is_not_found());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(gh_runs(&gh), 4, "gh's transient failure is retried to the bound");
+        assert!(e.to_string().contains("the direct download answered first"), "{e}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A direct network failure is not handed to gh: it reaches the same GitHub.
+    #[cfg(unix)]
+    #[test]
+    fn a_direct_network_failure_does_not_ask_gh() {
+        let d = tmpdir("direct-net");
+        let gh = fake_gh(&d, &[(0, "bytes")]);
+        let e = direct_then_gh(
+            Some(&gh),
+            &mut |p| gh_download_with_retry(p, "o/r", "t", "a", &FAST, &mut |_| {}),
+            &mut || Err(FetchError::new(FetchClass::Network, "connect: connection refused")),
+        )
+        .unwrap_err();
+        assert_eq!(e.class, FetchClass::Network);
+        assert_eq!(gh_runs(&gh), 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Every release asset a stranger's install or upgrade fetches goes
+    /// through fetch_tag_file, and it asks the direct download first.
+    #[test]
+    fn the_asset_fetch_is_direct_first() {
+        let own = crate::test_src::own_code(include_str!("commands/upgrade.rs"));
+        let body = crate::test_src::fn_body(&own, "pub(crate) fn fetch_tag_file(");
+        assert!(body.contains("release_fetch::direct_then_gh("), "{body}");
     }
 
     #[test]

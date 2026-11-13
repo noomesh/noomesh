@@ -34,7 +34,12 @@ fn offer_self_upgrade(ctx: &mut Ctx) {
             return;
         }
     };
-    if latest == current {
+    // Offer only a STRICTLY newer final (semver, as `noo upgrade` decides).
+    // On equality-only, a release candidate (newer than the latest final)
+    // was offered "0.6.23 is available", `noo upgrade` kept the rc, and the
+    // wizard relaunched itself into the same offer forever (install matrix
+    // on 0.6.24-rc.1, run 43288027296: stranger-24.04 looped six times).
+    if !should_offer_upgrade(current, &latest) {
         return;
     }
     ctx.warn(&format!("noo {current} installed; {latest} is available"));
@@ -53,15 +58,40 @@ fn offer_self_upgrade(ctx: &mut Ctx) {
         ctx.warn("upgrade failed — continuing on the current version (retry later: noo upgrade)");
         return;
     }
+    // Relaunch only when the binary on disk is now a different version: an
+    // upgrade that kept this build (or replaced a different copy than the one
+    // running) would relaunch into the same offer, forever.
+    let now = installed_version(&exe);
+    if now.as_deref().is_none_or(|v| v == current) {
+        ctx.info(&format!("(still noo {current} at {exe} — continuing on it; `noo upgrade` later)"));
+        return;
+    }
     // The swap replaced the binary on disk, but THIS process is still the old
     // build — relaunch the wizard through the path with the original argv so
     // the new version runs it (same trick as the docker-group relaunch).
-    ctx.progress(&format!("Relaunching the wizard on noo {latest}..."));
+    ctx.progress(&format!("Relaunching the wizard on noo {}...", now.as_deref().unwrap_or(&latest)));
     let argv: Vec<String> = std::env::args().skip(1).collect();
     match Command::new(&exe).args(&argv).status().ok().and_then(|s| s.code()) {
         Some(c) => std::process::exit(c),
         None => ctx.warn("relaunch failed — re-run `noo onboard` to use the new version"),
     }
+}
+
+/// Whether onboarding offers `noo upgrade`: only when `latest` (the newest
+/// FINAL release) is strictly newer than this build by semver. An rc newer
+/// than the latest final, the same version, or a version that does not parse
+/// is never offered (an offer that cannot change anything loops).
+fn should_offer_upgrade(current: &str, latest: &str) -> bool {
+    crate::commands::upgrade::cmp_cli_semver(current, latest) == Some(std::cmp::Ordering::Less)
+}
+
+/// The version `exe --version` reports (its last word), if it runs.
+fn installed_version(exe: &str) -> Option<String> {
+    let out = Command::new(exe).arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).split_whitespace().last().map(str::to_string)
 }
 
 /// The tools onboard REQUIRES. git only for a source checkout: a release
@@ -2763,7 +2793,7 @@ pub(crate) const SVC_LIST: &[&str] = &[
     // (docker/stunnel-ollama-embed.conf). Its own leaf, not `ollama`'s:
     // `noo upgrade --stack` issues a MISSING leaf on its own
     // (upgrade.rs reconcile_service_certs) while a SAN added to an
-    // existing one needs `noo onboard --only security` — a new name is
+    // existing one needs `noo onboard --only enrollment` — a new name is
     // the roll-safe shape. Issued on every install shape; a leaf is cheap.
     "ollama-embed",
     // The optional CPU embedder's door (compose profile `embed-cpu`): its
@@ -3154,7 +3184,7 @@ fn ensure_pki(ctx: &mut Ctx) {
                 Ok(true) => ctx.success(&format!("Postgres client certificate for role {} ({}) generated", leaf.role, leaf.owner)),
                 Ok(false) => ctx.info(&format!("Postgres client certificate for role {} ({}) already exists", leaf.role, leaf.owner)),
                 Err(e) => ctx.warn(&format!(
-                    "Postgres client certificate for role {} ({}): {e} — then: noo security pki fix-modes, and re-run: noo onboard --only security",
+                    "Postgres client certificate for role {} ({}): {e} — then: noo security pki fix-modes, and re-run: noo onboard --only enrollment",
                     leaf.role, leaf.owner
                 )),
             }
@@ -6537,13 +6567,21 @@ pub(crate) fn ensure_cli_login(ctx: &mut Ctx) {
     ctx.info("Fix the login, then re-run them: noo auth login, then noo onboard --only services");
 }
 
+/// What a standalone box's services step says about chat. It used to say
+/// "served by this box's single ollama (static fallback) — no placement
+/// needed", just above verify's `default chat` row saying an unpinned chat
+/// gets 503 (every fresh install, rc.1 rehearsal): `noo chat` sends no model,
+/// and that needs a chat model PLACED on the box, which the model step does.
+pub(crate) const STANDALONE_CHAT_NOTE: &str =
+    "Chat on this box runs on its single ollama once a chat model is placed on it: the model step places one (later: noo onboard --only model).";
+
 fn ensure_llm_placement(ctx: &mut Ctx) {
     let node_id = ctx.read_env("NODE_ID");
     let model = ctx.read_env("VLLM_MODEL");
     let tier = ctx.read_env("NODE_TIER");
     if node_id.is_empty() || model.is_empty() {
         if ctx.repo_root.join(".noo-standalone").exists() {
-            ctx.info("Chat is served by this box's single ollama (static fallback) — no placement needed.");
+            ctx.info(STANDALONE_CHAT_NOTE);
             // Say so in the config too. With --skip-model the model step
             // (the only writer of cluster.default_backend) never runs, the
             // example's `vllm` survives, and every `noo chat` on the box
@@ -8065,7 +8103,7 @@ pub fn addons(ctx: &mut Ctx) {
 
 /// Write `body` to the root-owned `path` (root:root 0644) with `sudo tee`:
 /// the content goes over stdin, never through a shell string.
-fn sudo_write_root_file(may_prompt: bool, path: &str, body: &str) -> Result<(), String> {
+pub(crate) fn sudo_write_root_file(may_prompt: bool, path: &str, body: &str) -> Result<(), String> {
     use std::process::Stdio;
     let mut child = sudo_cmd(may_prompt)
         .args(["tee", path])
@@ -8087,6 +8125,55 @@ fn sudo_write_root_file(may_prompt: bool, path: &str, body: &str) -> Result<(), 
         }
     }
     Ok(())
+}
+
+/// Controller with systemd: install and enable noo-netns-restore.service (rc.2
+/// install matrix: one dockerd start in five left noo-ollama-embed exited 128,
+/// "cannot join network namespace of a non running container", and dockerd
+/// never retries it). Without systemd nothing is installed here; noo-hostd's
+/// boot-restore runs the same script at boot.
+pub fn install_netns_restore_unit(ctx: &mut Ctx) {
+    use crate::netns_unit as nu;
+    if ctx.state.mode == "worker" {
+        return;
+    }
+    if !nu::systemd_here() {
+        ctx.info("No systemd here: the namespace restore runs at boot through noo-hostd only.");
+        return;
+    }
+    let unit = match nu::render(&nu::owner(), &ctx.repo_root.display().to_string()) {
+        Ok(u) => u,
+        Err(e) => {
+            ctx.warn(&format!("{} not installed: {e}", nu::UNIT_NAME));
+            return;
+        }
+    };
+    if ctx.dry_run {
+        ctx.dry(&format!("install and enable {}", nu::UNIT_NAME));
+        return;
+    }
+    if nu::state(&unit) == nu::State::Current {
+        return;
+    }
+    match nu::install(ctx_sudo_may_prompt(ctx), &unit) {
+        Ok(()) => ctx.success(&format!("{} is enabled: after every dockerd start, a container that joins another's network is started once its door is up.", nu::UNIT_NAME)),
+        Err(e) => {
+            ctx.warn(&format!("{} not installed: {e}", nu::UNIT_NAME));
+            sudo_refused(ctx, "the namespace restore unit", nu::REMEDY);
+        }
+    }
+}
+
+#[cfg(test)]
+mod netns_unit_tests {
+    #[test]
+    fn onboard_installs_it_in_the_services_section() {
+        let m = crate::test_src::own_code(include_str!("mod.rs"));
+        let run = crate::test_src::fn_body(&m, "fn run_all(");
+        let rec = run.find("steps::at_rest_record(ctx);").expect("services section");
+        let unit = run.find("steps::install_netns_restore_unit(ctx);").expect("the unit is installed");
+        assert!(unit > rec, "{run}");
+    }
 }
 
 /// Controller only (i509): install `noo-addons-after-boot.service`, the
@@ -8383,13 +8470,19 @@ fn make_tailnet_bind_survive_reboots(ctx: &mut Ctx) {
 
 // ── Per-consumer service keys ────────────────────────────────────────────
 
-/// The compose service a container name belongs to: `noo-worker` → `worker`.
-fn service_of_container(ctx: &Ctx, container: &str) -> String {
-    let prefix = {
-        let p = ctx.read_env("NOO_CONTAINER_PREFIX");
-        if p.is_empty() { "noo".to_string() } else { p }
-    };
-    container.strip_prefix(&format!("{prefix}-")).unwrap_or(container).to_string()
+/// The compose services to recreate for a consumer that gained a key: one per
+/// container that EXISTS. A consumer can name a container of a profile this
+/// install does not run (worker-extra on a standalone box); recreating it
+/// failed the restart with "not running after the restart: worker-extra" on
+/// every fresh install (rc.1 rehearsal and 0.6.23). It never ran, so it has
+/// nothing to present a key to.
+pub(crate) fn services_to_recreate(containers: &[String], prefix: &str, exists: &dyn Fn(&str) -> bool) -> Vec<String> {
+    let prefix = if prefix.is_empty() { "noo" } else { prefix };
+    containers
+        .iter()
+        .filter(|c| exists(c))
+        .map(|c| c.strip_prefix(&format!("{prefix}-")).unwrap_or(c).to_string())
+        .collect()
 }
 
 /// "svc:evolve granted: addon, temporal, … (addons/evolve/docker-compose.yml)" — the
@@ -8504,8 +8597,10 @@ pub fn provision_service_keys(ctx: &mut Ctx) {
         }
         ctx.forget_store_cache();
         ctx.success(&format!("{}: key minted and stored as {}", t.consumer, t.secret_key));
-        for c in &t.containers {
-            let svc = service_of_container(ctx, c);
+        let prefix = ctx.read_env("NOO_CONTAINER_PREFIX");
+        for svc in services_to_recreate(&t.containers, &prefix, &|c: &str| {
+            std::process::Command::new("docker").args(["inspect", "-f", "{{.Id}}", c]).output().is_ok_and(|o| o.status.success())
+        }) {
             if !recreate.contains(&svc) {
                 recreate.push(svc);
             }
@@ -10009,5 +10104,67 @@ mod first_chat_placement_tests {
         let keep = placer.find("existing_ollama_chat_placement(&d[\"placements\"])").expect("checks first");
         let run = placer.find("Command::new(&exe).args(&args)").expect("then the command");
         assert!(keep < run, "{placer}");
+    }
+}
+
+#[cfg(test)]
+mod self_upgrade_tests {
+    /// The rc.1 install-matrix loop: onboarding offered `noo upgrade` to an
+    /// rc newer than the latest final, `noo upgrade` kept the rc, and the
+    /// wizard relaunched into the same offer forever. Offer only a strictly
+    /// newer final.
+    #[test]
+    fn the_wizard_offers_only_a_strictly_newer_release() {
+        use super::should_offer_upgrade as offer;
+        assert!(!offer("0.6.24-rc.1", "0.6.23"), "an rc newer than the latest final was offered the older final");
+        assert!(!offer("0.6.24", "0.6.24"), "the same version was offered");
+        assert!(!offer("0.6.25", "0.6.24"), "a newer build was offered an older release");
+        assert!(offer("0.6.23", "0.6.24"), "a strictly newer final was not offered");
+        assert!(offer("0.6.24-rc.1", "0.6.24"), "the final of this rc was not offered");
+        assert!(!offer("custom-build", "0.6.24"), "an unparsable version was offered (nothing can be compared)");
+    }
+
+    /// The relaunch happens only when the binary on disk changed version:
+    /// an upgrade that kept this build cannot relaunch into the same offer.
+    #[test]
+    fn the_wizard_relaunches_only_on_a_version_change() {
+        let own = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&own, "fn offer_self_upgrade(");
+        assert!(body.contains("if !should_offer_upgrade(current, &latest) {"), "the offer is not semver-gated");
+        assert!(!body.contains("if latest == current {"), "the equality-only gate is back");
+        let check = body.find("installed_version(&exe)").expect("the version check");
+        let relaunch = body.find("Command::new(&exe).args(&argv)").expect("the relaunch");
+        assert!(check < relaunch, "the relaunch is not behind the version check");
+        assert!(body[check..relaunch].contains("v == current"), "the check does not compare against this build");
+    }
+}
+
+#[cfg(test)]
+mod fresh_install_line_tests {
+    use super::{services_to_recreate, STANDALONE_CHAT_NOTE};
+
+    /// A consumer's container from a profile this install does not run is not
+    /// recreated (it never ran); the others are, as compose services.
+    #[test]
+    fn a_container_that_was_never_created_is_not_recreated() {
+        let cs = vec!["noo-worker".to_string(), "noo-worker-extra".to_string(), "noo-trellion".to_string()];
+        let present = |c: &str| c != "noo-worker-extra";
+        assert_eq!(services_to_recreate(&cs, "", &present), vec!["worker".to_string(), "trellion".to_string()]);
+        assert_eq!(services_to_recreate(&cs, "noo", &|_| true), vec!["worker", "worker-extra", "trellion"]);
+        assert!(services_to_recreate(&cs, "", &|_| false).is_empty());
+        let other = vec!["b2-worker".to_string()];
+        assert_eq!(services_to_recreate(&other, "b2", &|_| true), vec!["worker"]);
+    }
+
+    /// The standalone chat line never says "no placement needed", and names
+    /// the one command verify's `default chat` remedy names.
+    #[test]
+    fn the_standalone_chat_line_names_the_first_model_remedy() {
+        assert!(!STANDALONE_CHAT_NOTE.contains("no placement needed"), "{STANDALONE_CHAT_NOTE}");
+        assert!(STANDALONE_CHAT_NOTE.contains(crate::onboard::FIRST_MODEL_CMD), "{STANDALONE_CHAT_NOTE}");
+        let own = crate::test_src::own_code(include_str!("steps.rs"));
+        assert!(!own.contains("no placement needed"), "the old line is back somewhere");
+        let tail = crate::test_src::fn_body(&own, "pub fn provision_service_keys(");
+        assert!(tail.contains("for svc in services_to_recreate(&t.containers, &prefix, &|c: &str| {"), "{tail}");
     }
 }

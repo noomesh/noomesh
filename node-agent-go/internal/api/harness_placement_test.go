@@ -18,13 +18,18 @@ import (
 
 func placementServer(t *testing.T, f func() HarnessPlacement) http.Handler {
 	t.Helper()
-	cfg := &config.Config{NodeID: "test-node", NodeAgentToken: "test-token", TLSCA: "ca.pem"}
-	gpu := hardware.NewGPUDetector(nil, "http")
-	s := NewServer(cfg, nil, gpu, metrics.NewCollector(gpu))
+	s := placementServerRaw(t)
 	if f != nil {
 		s.SetHarnessPlacement(f)
 	}
 	return s.mux
+}
+
+func placementServerRaw(t *testing.T) *Server {
+	t.Helper()
+	cfg := &config.Config{NodeID: "test-node", NodeAgentToken: "test-token", TLSCA: "ca.pem"}
+	gpu := hardware.NewGPUDetector(nil, "http")
+	return NewServer(cfg, nil, gpu, metrics.NewCollector(gpu))
 }
 
 func getPlacement(h http.Handler, peer *x509.Certificate, remote, bearer string) *httptest.ResponseRecorder {
@@ -68,10 +73,26 @@ func TestHarnessPlacementRouteAnswersPlacedAndUnplaced(t *testing.T) {
 	if rec.Code != 404 || strings.ReplaceAll(rec.Body.String(), " ", "") != `{"placed":false}` {
 		t.Fatalf("unplaced: %d %s", rec.Code, rec.Body)
 	}
-	// No provider installed: unplaced, never a panic.
-	rec = getPlacement(placementServer(t, nil), own, "127.0.0.1:5000", "")
-	if rec.Code != 404 {
-		t.Fatalf("no provider: %d", rec.Code)
+}
+
+// Before the agent installs its provider (it serves from step 1 and
+// registers until it can), the placement is NOT KNOWN: 503 known:false with
+// Retry-After, never the 404 "not placed" a harness would act on (rc.1
+// rehearsal, A-placeknown.unknown).
+func TestNoProviderYetIsUnknownNotUnplaced(t *testing.T) {
+	own := testLeaf(t, "test-node", "Mesh Cluster Node")
+	rec := getPlacement(placementServer(t, nil), own, "127.0.0.1:5000", "")
+	if rec.Code != 503 || rec.Header().Get("Retry-After") != "5" {
+		t.Fatalf("no provider: %d retry-after=%q %s", rec.Code, rec.Header().Get("Retry-After"), rec.Body)
+	}
+	if body := strings.ReplaceAll(rec.Body.String(), " ", ""); body != `{"placed":false,"known":false}` {
+		t.Fatalf("no provider body: %s", body)
+	}
+	// Installed later, the provider's own answer wins.
+	s := placementServerRaw(t)
+	s.SetHarnessPlacement(func() HarnessPlacement { return HarnessPlacement{} })
+	if rec := getPlacement(s.mux, own, "127.0.0.1:5000", ""); rec.Code != 404 {
+		t.Fatalf("installed, unplaced: %d", rec.Code)
 	}
 }
 
