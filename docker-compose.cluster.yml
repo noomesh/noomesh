@@ -2661,6 +2661,14 @@ services:
       - ${NOO_PKI_DIR:-./.pki-placeholder}/services/prometheus:/app/pki/services/prometheus:ro
       - ./monitoring/prometheus/web-config.yml:/etc/prometheus/web-config.yml:ro
       - ./monitoring/alerts:/etc/prometheus/alerts:ro
+      # THE scrape config, the only copy (it used to be inlined here as
+      # `configs: prometheus_config` while monitoring/prometheus.yml drifted:
+      # see that file's header). The launchers `up --force-recreate`, so a
+      # changed file is loaded on every start and `noo upgrade`.
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # Targets that announce themselves (file_sd): nvidia-exporter writes
+      # nvidia-exporter.json here while it serves. Read-only for Prometheus.
+      - prometheus-sd:/etc/prometheus/sd:ro
     networks:
       - noo-cluster
     restart: unless-stopped
@@ -2668,9 +2676,6 @@ services:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
       - '--web.config.file=/etc/prometheus/web-config.yml'
-    configs:
-      - source: prometheus_config
-        target: /etc/prometheus/prometheus.yml
 
   # Alertmanager — routes Prometheus alerts (H-L4). Default config uses a
   # no-op receiver so the pipeline is live (alerts visible in the UIs) without
@@ -2843,9 +2848,14 @@ services:
       - NOO_TLS_CERT=/tls/services/nvidia-exporter/service.crt
       - NOO_TLS_KEY=/tls/services/nvidia-exporter/service.key
       - NOO_TLS_CA=/tls/ca.crt
+      # Where it announces itself to Prometheus (file_sd; monitoring/prometheus.yml
+      # job nvidia_gpu): a CPU-only controller never runs this service, so it
+      # never writes the file and Prometheus never looks the name up.
+      - NOO_PROM_SD_DIR=/run/noo-prom-sd
     volumes:
       - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
       - ${NOO_PKI_DIR:-./.pki-placeholder}/services/nvidia-exporter:/tls/services/nvidia-exporter:ro
+      - prometheus-sd:/run/noo-prom-sd
     deploy:
       resources:
         reservations:
@@ -3388,6 +3398,18 @@ networks:
     driver: bridge
 
 volumes:
+  # Prometheus file_sd targets (monitoring/prometheus.yml, job nvidia_gpu). A
+  # tmpfs, NOT a data-root bind: it holds only what a running exporter
+  # announced, so it is empty whenever no container that uses it is running
+  # and a stale target cannot outlive the stack. uid 65532 = the exporter's
+  # `nonroot`; Prometheus mounts it read-only.
+  prometheus-sd:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: uid=65532,gid=65532,mode=0755,size=64k
+
   # Heavy data volumes — bind-mounted to D: drive to avoid filling C:
   # Override with NOO_DATA_ROOT env var if your D: mount path differs.
   # The sensitive STATE set (noo-data, redis, nats, prometheus, grafana, loki,
@@ -3690,95 +3712,3 @@ secrets:
   noo_google_oauth_client_secret:
     file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_google_oauth_client_secret
     x-noo-source: NOO_GOOGLE_OAUTH_CLIENT_SECRET
-
-configs:
-  prometheus_config:
-    content: |
-      global:
-        scrape_interval: 15s
-        evaluation_interval: 15s
-
-      alerting:
-        alertmanagers:
-          - scheme: https
-            tls_config:
-              ca_file: /app/pki/ca.crt
-              cert_file: /app/pki/services/prometheus/service.crt
-              key_file: /app/pki/services/prometheus/service.key
-              insecure_skip_verify: false
-            static_configs:
-              - targets: ['alertmanager:9093']
-
-      rule_files:
-        - /etc/prometheus/alerts/*.yml
-
-      # an earlier change: every job below scrapes with
-      # services/prometheus/service.{crt,key} — CN=prometheus,
-      # O="Mesh Cluster Service". Four of them used to present
-      # gateway/gateway.{crt,key}, which is the controller's identity; the
-      # node-agent job in particular meant the scraper could command any
-      # node it could reach. The service leaf opens GET /metrics and nothing
-      # else (node-agent-go/internal/auth/principal.go MetricsReader), and
-      # gateway.key is no longer mounted into this container at all.
-      #
-      # No job sends a bearer. The gateway and node-agent jobs used to send
-      # `${NOO_NODE_AGENT_TOKEN}`, which Prometheus does not expand: the
-      # literal string arrived, the node agent refused it, and the gateway
-      # ignored it because /metrics was public. Both now authenticate this
-      # leaf itself and nothing else: the gateway admits
-      # it on GET /metrics only, the node agent on /metrics only.
-      #
-      # Rotation: `noo security pki rotate-all` re-issues this leaf in place
-      # with every other; existing installs mint it once with
-      # `noo security pki issue-service prometheus`.
-      scrape_configs:
-        - job_name: 'prometheus'
-          scheme: https
-          tls_config:
-            ca_file: /app/pki/ca.crt
-            cert_file: /app/pki/services/prometheus/service.crt
-            key_file: /app/pki/services/prometheus/service.key
-            insecure_skip_verify: false
-          static_configs:
-            - targets: ['localhost:9090']
-
-        - job_name: 'gateway'
-          scheme: https
-          tls_config:
-            ca_file: /app/pki/ca.crt
-            cert_file: /app/pki/services/prometheus/service.crt
-            key_file: /app/pki/services/prometheus/service.key
-            insecure_skip_verify: false
-          static_configs:
-            - targets: ['gateway:8080']
-
-        - job_name: 'node'
-          scheme: https
-          tls_config:
-            ca_file: /app/pki/ca.crt
-            cert_file: /app/pki/services/prometheus/service.crt
-            key_file: /app/pki/services/prometheus/service.key
-            insecure_skip_verify: false
-          static_configs:
-            - targets: ['node-exporter:9100']
-
-        - job_name: 'nvidia_gpu'
-          scheme: https
-          tls_config:
-            ca_file: /app/pki/ca.crt
-            cert_file: /app/pki/services/prometheus/service.crt
-            key_file: /app/pki/services/prometheus/service.key
-            insecure_skip_verify: false
-          static_configs:
-            - targets: ['nvidia-exporter:9400']
-
-        - job_name: 'noo_node_agent'
-          scheme: https
-          tls_config:
-            ca_file: /app/pki/ca.crt
-            cert_file: /app/pki/services/prometheus/service.crt
-            key_file: /app/pki/services/prometheus/service.key
-            insecure_skip_verify: false
-          static_configs:
-            - targets: ['node-agent:8081']
-          metrics_path: '/metrics'

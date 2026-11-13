@@ -438,6 +438,10 @@ after the stack starts, for example with
 `stats.vllm.ai`, `stats.grafana.org`, `grafana.com`, `huggingface.co/api/telemetry`
 or `ollama.com`. The exception is a model download or cloud call you
 started yourself.
+On an idle controller (0.6.24 or later, nothing asked of it) the same
+capture should show no questions at all. A container's question is forwarded
+by Docker from the host, so the name, not the source address, says which
+service asked.
 
 To see what one vendor CLI tries to reach, run it the way the harness does
 with no route out, recording every connection and DNS question (no root
@@ -498,6 +502,26 @@ setting you chose. None of it is a report about you or your machines.
 | Web search | DuckDuckGo's HTML endpoint, or the provider set in `search.provider` (SearXNG, Brave, Tavily) | When an agent, a chat or a scheduled task uses `web_search` |
 | Browser tool | Whatever page it is sent to | When an agent uses the browser tool. `BROWSER_URL_ALLOWLIST` limits it. |
 | Build-time package installs | PyPI, the PyTorch wheel index, Go and crates.io registries, Debian/Alpine mirrors | Building images, not running them |
+
+### Name lookups for noomesh's own services
+
+Before 0.6.24, a default install's Prometheus asked the host's configured DNS
+resolver, every 15 seconds, for `node-agent.<search domain>` and
+`nvidia-exporter.<search domain>` (an A and an AAAA question each). The
+cause was two scrape targets that name containers which do not exist on
+every install: no install runs a `node-agent` container (agents are host
+services), and a controller without an NVIDIA container runtime runs no
+`nvidia-exporter`. Docker's DNS cannot answer a name with no container behind
+it, so it forwards the question to the host's resolver. Only the question
+left the machine: no payload and no connection followed, because no answer
+came back. Since 0.6.24 Prometheus finds the node agents through the
+gateway's list and the GPU exporter by a file the exporter writes while it
+runs, so an idle install asks no resolver anything
+([Verify it yourself](#verify-it-yourself) shows how to watch).
+
+A node agent on a host without `nvidia-smi` still looks up `nvidia-exporter`
+once when it starts, to check for a GPU exporter beside it, and never again
+while it runs.
 
 These are out of scope here:
 
