@@ -5140,7 +5140,7 @@ fn addon_hold_fix(addon: &str, r: &crate::addons::resolve::Refusal, tag: &str) -
     // roll, then enable it again from a lock signed for the new stack. The
     // way out for an add-on enabled from a file (a developer's own lock),
     // whose registry the roll cannot fetch a lock from.
-    format!("noo addons disable {addon}   # roll without it, then turn it back on with a lock signed for {tag}: noo addons enable {addon} --lock <bundle.json>. Or wait for its release for this stack, or roll to an older one: noo upgrade --stack --tag <vX.Y.Z> (add --allow-downgrade to take the add-on back with it)")
+    format!("noo addons disable {addon}   # or wait for its release for this stack, or roll to an older one: noo upgrade --stack --tag <vX.Y.Z> (add --allow-downgrade to take the add-on back with it)")
 }
 
 /// Step -1z of `upgrade_stack`: resolve, verify and pull every add-on that
