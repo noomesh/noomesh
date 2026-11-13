@@ -313,9 +313,28 @@ step probe-self-agent-diagnostics 120 -- sh -c '
   sudo grep -E "^(NATS_URL|NOO_GATEWAY_URL|CONTROLLER_URL|NODE_ID)=" /etc/noo-node-agent.env 2>&1
   echo "== noo --json cluster show $(hostname)"; noo --json cluster show "$(hostname)" 2>&1
   true'
-# The single-turn line docs/getting-started/first-chat.md gives, verbatim.
-step first-answer 1800 -- sh -c 'out="$(noo chat --message "in two lines, what can you do on this machine?")"; rc=$?
-  printf "%s\n" "$out"; [ $rc = 0 ] && [ -n "$(printf "%s" "$out" | tr -d "[:space:]")" ]' || fail_onboarded
+# The single-turn line docs/getting-started/first-chat.md gives, read from the
+# doc itself (its first `noo chat --message "…"` line), so the page and the
+# test cannot drift. The answer must be an answer: a model that asks for more
+# input or refuses FAILs by name (rc.4-rc.6: the old prompt "what can you do
+# on this machine?" got "Please provide an image or description of the
+# machine you are referring to." from gemma4:e2b, the first thing a stranger
+# saw the product say).
+FIRST_CHAT_DOC="$HERE/../../docs/getting-started/first-chat.md"
+FIRST_PROMPT="$(sed -n 's/^noo chat --message "\(.*\)"$/\1/p' "$FIRST_CHAT_DOC" 2>/dev/null | head -n 1)"
+# A refusal or a request for more input, in the shapes small models use.
+FIRST_ANSWER_NOT_AN_ANSWER='please (provide|specify|clarify|share|tell me)|could you (please )?(provide|specify|clarify|share|tell me)|can you (please )?(provide|specify|clarify|share)|i (can.?t|cannot|am unable to|am not able to) (help|answer|assist|see|access)|i don.?t have (access|enough (information|context))|(what|which) (machine|computer|device|system) (are|do) you|more (details|information|context) (about|on|is needed)'
+export FIRST_PROMPT FIRST_ANSWER_NOT_AN_ANSWER
+meta first_prompt "${FIRST_PROMPT:-none}"
+step first-answer 1800 -- sh -c '
+  [ -n "$FIRST_PROMPT" ] || { echo "FIRST-ANSWER FAIL: docs/getting-started/first-chat.md has no noo chat --message line"; exit 1; }
+  echo "prompt: $FIRST_PROMPT"
+  out="$(noo chat --message "$FIRST_PROMPT")"; rc=$?
+  printf "%s\n" "$out"
+  [ $rc = 0 ] && [ -n "$(printf "%s" "$out" | tr -d "[:space:]")" ] || exit 1
+  if printf "%s" "$out" | grep -qiE "$FIRST_ANSWER_NOT_AN_ANSWER"; then
+    echo "FIRST-ANSWER FAIL: the model asked for more input or refused instead of answering"; exit 1
+  fi' || fail_onboarded
 meta first_answer_s "$(( $(date +%s) - CELL_START ))"
 
 # PROBE (fa, rc.1 rehearsal A-reboot.status, i677): a container that joins

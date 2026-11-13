@@ -78,6 +78,7 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             README.md
+            docs/getting-started/first-chat.md
             scripts/install-cell
             scripts/ci-free-disk.sh
           sparse-checkout-cone-mode: false
@@ -119,6 +120,7 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             README.md
+            docs/getting-started/first-chat.md
             scripts/install-cell
           sparse-checkout-cone-mode: false
       - name: WSL2 + Ubuntu 24.04   # Vampire/setup-wsl v7.2.0
