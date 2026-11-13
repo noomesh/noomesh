@@ -122,6 +122,31 @@ pub(crate) fn self_agent_lane_check(
     }
 }
 
+/// What needs a direct HTTPS address to a node (the gateway's
+/// `needs_address_message` callers), named once wherever an address-less node
+/// is shown. Everything else reaches such a node over its bus/tunnel.
+pub(crate) const NEEDS_ADDRESS: &str =
+    "running a skill on it, a websocket session to a workload on it, and the Prometheus scrape of its agent";
+
+/// A node that registered no HTTPS address (no `agent_url`, no `ip_address`)
+/// but holds an outbound transport to the controller: which one(s). `None`
+/// when it has an address, or has neither. A one-machine install whose
+/// hostname resolves only to loopback (the stock Debian-family
+/// `127.0.1.1 <hostname>` line; WSL2) registers like this.
+pub(crate) fn outbound_only(n: &Value) -> Option<&'static str> {
+    let has = |k: &str| n[k].as_str().is_some_and(|s| !s.trim().is_empty());
+    if has("agent_url") || has("ip_address") {
+        return None;
+    }
+    let t = &n["control_transports"];
+    match (t["nats_rpc"].as_bool() == Some(true), t["tunnel"].as_bool() == Some(true)) {
+        (true, true) => Some("its bus and its tunnel"),
+        (true, false) => Some("its bus"),
+        (false, true) => Some("its tunnel"),
+        (false, false) => None,
+    }
+}
+
 /// The `control over bus` row. The verdicts, in order:
 /// - the node does not advertise `control_transports.nats_rpc` (an older
 ///   agent, or one whose subscription the controller's NATS file refused):
@@ -502,15 +527,23 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     //     account in its heartbeat.
     out.push(log_shipper_check(id, &n["log_ship"], now_unix, hb_recent));
 
-    // 7. Inbound: the controller can reach the agent.
-    match n["inbound"].as_str() {
+    // 7. Inbound: the controller can reach the agent. A node with no address
+    //    that holds its bus/tunnel is reached that way: say so, and name the
+    //    few things that do need an address, instead of a NODE_IP warning for
+    //    things that work (rc.3 matrix, windows-2025-wsl2).
+    if let (Some(via), None | Some("unknown")) = (outbound_only(n), n["inbound"].as_str()) {
+        out.push(ok("inbound", format!(
+            "no HTTPS address on record: the controller reaches this node over {via}, which carries its control and streaming calls; \
+             only {NEEDS_ADDRESS} need an address (set NODE_IP in its agent env for those)"
+        )));
+    } else { match n["inbound"].as_str() {
         Some("ok") => out.push(ok("inbound", "agent reachable from the controller")),
         // `unknown` is the gateway saying it had no address to dial: nothing
         // was checked, so it is not a failed check (i276).
         Some("unknown") => out.push(warn("inbound", "NOT CHECKED — the controller has no address on record to dial this node, so reachability was not tested", Some(format!("noo cluster show {id}   # the address the node registered with")))),
         Some(other) => out.push(fail("inbound", format!("inbound {other}"), format!("noo cluster show {id}   # bind address and tailnet grant"))),
         None => out.push(warn("inbound", "not yet checked", None)),
-    }
+    } }
 
     // 8. Harness matches the declared policy.
     //
@@ -8945,6 +8978,51 @@ mod tests {
         let r = c.iter().find(|c| c.name == "inbound").unwrap();
         assert_eq!(r.verdict, Verdict::Warn, "{}", r.detail);
         assert!(r.detail.contains("NOT CHECKED") && r.detail.contains("no address"), "{}", r.detail);
+        n["inbound"] = serde_json::json!("failed");
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        assert_eq!(verdict(&c, "inbound"), Verdict::Fail);
+    }
+
+    /// rc.3 matrix, windows-2025-wsl2: a node with no address on record that
+    /// holds its bus/tunnel is reached that way. The row says so and names
+    /// the address-only features once; it does not ask for NODE_IP for
+    /// things that work.
+    #[test]
+    fn an_address_less_node_on_its_bus_or_tunnel_is_inbound_ok_and_names_what_needs_an_address() {
+        let now = 1_800_000_000;
+        for (t, via) in [
+            (serde_json::json!({"nats_rpc": true, "tunnel": true}), "its bus and its tunnel"),
+            (serde_json::json!({"nats_rpc": true}), "its bus"),
+            (serde_json::json!({"tunnel": true}), "its tunnel"),
+        ] {
+            for inbound in [serde_json::json!("unknown"), serde_json::Value::Null] {
+                let mut n = healthy(now);
+                n["agent_url"] = serde_json::json!("");
+                n["ip_address"] = serde_json::Value::Null;
+                n["control_transports"] = t.clone();
+                n["inbound"] = inbound.clone();
+                let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+                let r = c.iter().find(|c| c.name == "inbound").unwrap();
+                assert_eq!(r.verdict, Verdict::Ok, "{t} {inbound}: {}", r.detail);
+                assert!(r.detail.contains(via) && r.detail.contains(NEEDS_ADDRESS), "{}", r.detail);
+                assert_eq!(c.iter().filter(|c| c.name == "inbound").count(), 1);
+            }
+        }
+        // No transport: the old NOT CHECKED warning stands.
+        let mut n = healthy(now);
+        n["agent_url"] = serde_json::json!("");
+        n["ip_address"] = serde_json::Value::Null;
+        n["control_transports"] = serde_json::json!({"nats_rpc": false, "tunnel": false});
+        n["inbound"] = serde_json::json!("unknown");
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        assert_eq!(verdict(&c, "inbound"), Verdict::Warn);
+        // An address on record: nothing changes; unknown still warns, a failure still fails.
+        let mut n = healthy(now);
+        n["ip_address"] = serde_json::json!("10.0.0.7");
+        n["control_transports"] = serde_json::json!({"nats_rpc": true, "tunnel": true});
+        n["inbound"] = serde_json::json!("unknown");
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        assert_eq!(verdict(&c, "inbound"), Verdict::Warn);
         n["inbound"] = serde_json::json!("failed");
         let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
         assert_eq!(verdict(&c, "inbound"), Verdict::Fail);
