@@ -16,8 +16,10 @@
 #                     the server name (SNI) of each TLS connection. The packets
 #                     these come from are parsed in memory and dropped; only
 #                     the name and the address are written.
-#   sockets.tsv       five times a second, which process owns each open internet
-#                     socket (ss -tunp): process name and pid.
+#   sockets.tsv       which process owns each internet socket (ss -tunp): process
+#                     name and pid, looked up the moment the connection tracker
+#                     reports a NEW connection, and five times a second for the
+#                     rest.
 #   containers.tsv    every 2 s, each running Docker container's name and IP
 #                     (when Docker is installed), so a container's connection
 #                     is named by its container.
@@ -50,8 +52,9 @@
 #     program's ordinary request and its telemetry to the same host look alike;
 #   - anything that did not happen while it ran: a reporter on a 24-hour timer
 #     shows up only if the capture spans its moment;
-#   - a process's connection that opened and closed between two socket polls
-#     (0.2 s apart) is still listed (the kernel saw it) but as "unattributed";
+#   - a connection that closed before its owner could be looked up (a DNS
+#     query over UDP, typically) is still listed (the kernel saw it) but as
+#     "unattributed";
 #   - the TLS server name over IPv6, and under Encrypted ClientHello; the DNS
 #     answer usually names the address anyway, and an address with no name is
 #     listed by address;
@@ -338,16 +341,47 @@ tcpdump -i any -nn -U -s 512 -w - \
     > >(python3 -u -c "$NAMES_PARSER" "$OUT/names.tsv" 2>/dev/null) &
 PIDS+=($!)
 
-# Who owns each internet socket, once a second (process name and pid only).
-( while :; do
-    now="$(date +%s)"
-    ss -tunpH state established state syn-sent 2>/dev/null | awk -v t="$now" '
+# One `ss -tunpH` line -> "time proto local-port remote-ip remote-port owner".
+SS_ROW='
         { proto=$1; nl=split($5, l, ":"); r=$6; n=split(r, rp, ":"); rport=rp[n]; rip=substr(r, 1, length(r)-length(rport)-1);
           gsub(/^\[|\]$/, "", rip); lport=l[nl];
           p=""; if (match($0, /users:\(\("[^"]+",pid=[0-9]+/)) { p=substr($0, RSTART+9, RLENGTH-9); sub(/",pid=/, " pid ", p) }
-          print t "\t" proto "\t" lport "\t" rip "\t" rport "\t" p }' >> "$OUT/sockets.tsv"
+          print t "\t" proto "\t" lport "\t" rip "\t" rport "\t" p }'
+
+# Who owns each internet socket, five times a second (process name and pid only).
+( while :; do
+    now="$(date +%s)"
+    ss -tunpH state established state syn-sent 2>/dev/null | awk -v t="$now" "$SS_ROW" >> "$OUT/sockets.tsv"
     sleep 0.2
   done ) &
+PIDS+=($!)
+
+# new_local_flow LINE: for a conntrack NEW event, "remote-ip local-port" of the
+# tuple whose source is one of this host's addresses (an event lists both
+# directions, in either order); nothing for a container's or a forwarded flow
+# (those are named by their container).
+new_local_flow() {
+    local f
+    f=$(grep -oE '(src|dst|sport|dport)=[^ ]+' <<< "$1" | head -8 | cut -d= -f2 | tr '\n' ' ')
+    set -- $f
+    [ $# -ge 8 ] || return 0
+    if [[ " $HOST_IPS " == *" $1 "* ]]; then echo "$2 $3"
+    elif [[ " $HOST_IPS " == *" $5 "* ]]; then echo "$6 $7"; fi
+}
+HOST_IPS="$(tr '\n' ' ' < "$OUT/host_ips.txt")"
+
+# ... and the moment the connection tracker reports a NEW one: a short
+# connection (a release asset's redirect, a registry token) can open and close
+# between two polls, but its owner still holds the socket while its handshake
+# runs. One filtered `ss` per new host connection. conntrack's stdout goes to
+# the reader through a process substitution, so $! is conntrack itself and
+# cleanup stops it; the reader ends at EOF.
+conntrack -E -e NEW -o extended 2>/dev/null > >(while IFS= read -r line; do
+        set -- $(new_local_flow "$line")
+        [ $# -eq 2 ] || continue
+        case "$1" in 127.*|::1) continue ;; esac
+        ss -tunpH "sport = :$2" 2>/dev/null | awk -v t="$(date +%s)" "$SS_ROW" >> "$OUT/sockets.tsv"
+    done) &
 PIDS+=($!)
 
 if command -v docker >/dev/null 2>&1; then

@@ -192,7 +192,9 @@ def lanes_for(changed: list[str], gw_in: set[str], cli_in: set[str]) -> list[str
             add("node-agent-go")
         # scripts/ (the applier, the installers, the launchers) are proven by
         # tests/*.py, which run them: a mutant there reaches the python lane.
-        if f.endswith(".py") or f.startswith(("tests/", "noomesh/", "scripts/")):
+        # So is a script published under docs/ (docs/security/egress-capture.sh,
+        # run by tests/test_egress_capture.py); a doc's prose reaches no lane.
+        if f.endswith(".py") or f.startswith(("tests/", "noomesh/", "scripts/")) or (f.startswith("docs/") and f.endswith(".sh")):
             add("python")
     return [lane for lane in LANES if lane in lanes]
 

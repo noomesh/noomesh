@@ -984,15 +984,55 @@ compose_active_services() {
 # systems-secrets file is derived and written again.
 #
 # Fails (return 1) only when the directories cannot be written.
+
+# _decl_owner_mode <path> — "<owner> <octal mode>" (GNU stat, else BSD).
+_decl_owner_mode() {
+    stat -c '%U %a' "$1" 2>/dev/null || stat -f '%Su %Lp' "$1" 2>/dev/null || echo "? ?"
+}
+
+# _decl_dirs_ready <dir>... — each dir exists, is mode 0755 and this user can
+# write into it. chmod runs ONLY when the mode differs: only a dir's owner (or
+# root) may chmod it, even to the mode it already has, so an unconditional
+# chmod refused every start after one `sudo noo stack start` had left these
+# dirs root-owned (0.6.24-rc.5 rehearsal, A-afterboot.start). When a dir is
+# wrong, the refusal says what is true: it exists, who owns it, that this
+# user cannot write it, and the one command; never "could not create".
+_decl_dirs_ready() {
+    local _d _om _owner _mode _me _bad=() _fix=()
+    _me="$(id -un 2>/dev/null || echo "uid $(id -u)")"
+    for _d in "$@"; do
+        if [ ! -d "$_d" ] && ! mkdir -p "$_d" 2>/dev/null; then
+            _om="$(_decl_owner_mode "$(dirname "$_d")")"
+            _bad+=("$_d does not exist and cannot be made: its parent $(dirname "$_d") is owned by ${_om% *} (mode ${_om#* }) and not writable as $_me")
+            _fix+=("$(dirname "$_d")")
+            continue
+        fi
+        _om="$(_decl_owner_mode "$_d")"; _owner="${_om% *}"; _mode="${_om#* }"
+        if [ "$_mode" != "755" ] && ! chmod 0755 "$_d" 2>/dev/null; then
+            _bad+=("$_d exists, owned by $_owner with mode $_mode, and $_me cannot set it to 0755")
+            _fix+=("$_d")
+            continue
+        fi
+        if ! touch "$_d/.noo-write-probe.$$" 2>/dev/null; then
+            _bad+=("$_d exists, owned by $_owner (mode $_mode), and is not writable as $_me (a start run as $_owner made it, e.g. sudo noo stack start)")
+            _fix+=("$_d")
+            continue
+        fi
+        rm -f -- "$_d/.noo-write-probe.$$"
+    done
+    [ "${#_bad[@]}" -eq 0 ] && return 0
+    echo "REFUSING: the add-on declaration directories are not usable by $_me:" >&2
+    printf '  - %s\n' "${_bad[@]}" >&2
+    echo "  fix: sudo chown -R $_me ${_fix[*]}   then start again" >&2
+    return 1
+}
+
 addon_decls_materialise() {
     local _root="${PROJECT_ROOT:-$_DIST_LIB_ROOT}" _sys _wl _rt _before _after _plan="" _pair _a _f _src _n _d _keep=" "
     _sys="$_root/.noo-addon-systems"
     _wl="$_root/.noo-addon-workloads"
     _rt="$_root/.noo-addon-routes"
-    if ! mkdir -p "$_sys" "$_wl" "$_rt" || ! chmod 0755 "$_sys" "$_wl" "$_rt"; then
-        echo "REFUSING: could not create the add-on declaration directories under $_root (.noo-addon-systems, .noo-addon-workloads, .noo-addon-routes)." >&2
-        return 1
-    fi
+    _decl_dirs_ready "$_sys" "$_wl" "$_rt" || return 1
     _before="$(cd "$_sys" && ls -1 2>/dev/null | sort | tr '\n' ' ')"
     case "${NOO_ADDONS_VERIFIED:-}" in
         dev)
@@ -1025,7 +1065,13 @@ addon_decls_materialise() {
         # node-workloads.json): it is emptied once, by the first file copied
         # into it this start, so the second never erases the first.
         case "$_keep" in *" $_d "*) : ;; *)
-            rm -rf "${_d:?}" && mkdir -p "$_d" && chmod 0755 "$_d" || return 1 ;;
+            if ! { rm -rf "${_d:?}" && mkdir -p "$_d" && chmod 0755 "$_d"; } 2>/dev/null; then
+                # Say what is true about it, then refuse either way: the old
+                # declarations were not replaced.
+                _decl_dirs_ready "$(dirname "$_d")" "$_d" &&
+                    echo "REFUSING: could not replace $_d as $(id -un 2>/dev/null || id -u) (its old contents could not be removed)." >&2
+                return 1
+            fi ;;
         esac
         cp "$_src" "$_d/$_f.tmp.$$" && chmod 0644 "$_d/$_f.tmp.$$" && mv -f "$_d/$_f.tmp.$$" "$_d/$_f" || {
             echo "REFUSING: could not copy ${_a}'s ${_f} into $_d." >&2

@@ -460,3 +460,14 @@ def test_the_restart_probe_runs_20_only_on_the_22_04_cell_and_offboard_checks_wi
     off = text[text.index("step probe-offboard-without-docker"):]
     assert "sudo docker ps -q --filter name=noo-gateway" in off
     assert "\n  docker ps -q --filter name=noo-gateway" not in off
+
+
+def test_the_offboard_probe_is_skipped_by_name_on_a_root_cell():
+    # rc.5 matrix run 1, WSL2 (root): root reaches docker by uid, so "a shell
+    # without the docker group" cannot be made; offboard -y rightly wiped the
+    # box and the probe reported FAIL. On uid 0 it is skipped, saying why.
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    i = text.index('if [ "$(id -u)" = 0 ]; then\nstep probe-offboard-without-docker 30')
+    block = text[i:text.index("\nfi\n", i)]
+    assert "PROBE SKIPPED: this cell runs as root (uid 0)" in block
+    assert "\nelse\nstep probe-offboard-without-docker 600 -- sh -c '" in block, "the real probe still runs for a non-root cell"

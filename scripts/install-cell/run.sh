@@ -359,6 +359,13 @@ step probe-docker-restart-namespace-joiners 2700 -- sh -c '
 # offboard stopped them first; the fix reads the version). A probe is
 # reported on its own and never becomes the cell's failed step; on releases
 # without #1059 it is expected to fail (it wiped the box).
+# A cell running as ROOT (the WSL2 cell's distro user) cannot be "a shell
+# without the docker group": root reaches the socket by uid, so offboard
+# rightly proceeds and -y wipes the box (rc.5 matrix run 1, WSL2). There the
+# probe is not run and says why, by name.
+if [ "$(id -u)" = 0 ]; then
+step probe-offboard-without-docker 30 -- sh -c 'echo "PROBE SKIPPED: this cell runs as root (uid 0), which reaches docker without the docker group; a shell without docker access cannot be made here"; true'
+else
 step probe-offboard-without-docker 600 -- sh -c '
   # What THIS docker answers in that shell (rc.2: Docker 28.0.4 let the gate
   # pass; is it "exit 0, empty version"?): read, never judged.
@@ -386,6 +393,7 @@ step probe-offboard-without-docker 600 -- sh -c '
   [ -d /var/lib/noo ] || { echo "PROBE FAIL: /var/lib/noo is gone"; ok=0; }
   noo health >/dev/null 2>&1 || { echo "PROBE FAIL: noo health is not ok afterwards"; ok=0; }
   [ "$ok" = 1 ]' || PROBE_ALTERED=1
+fi
 
 
 # ── 5. clean uninstall ──────────────────────────────────────────────────
