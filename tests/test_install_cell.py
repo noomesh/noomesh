@@ -499,6 +499,16 @@ def test_the_rag_probe_asks_the_pages_query_then_three_chat_paths_and_is_never_j
     assert wf.count("docs/getting-started/first-chat.md") >= 2, "both jobs check the page out"
 
 
+def test_the_console_chat_client_finds_the_cluster_ca_where_the_cli_does(tmp_path):
+    ws = _load("ws_chat_ca", ROOT / "scripts/install-cell/ws_chat.py")
+    (tmp_path / ".noo").mkdir()
+    (tmp_path / ".noo" / ".env").write_text("X=1\nNOO_TLS_CA=/srv/noo/pki/ca.crt\n")
+    got = ws.cluster_ca_candidates({}, str(tmp_path))
+    assert got == [str(tmp_path / ".config/mesh/pki/ca.crt"), "/srv/noo/pki/ca.crt", "/etc/noo/pki/ca.crt"], got
+    got = ws.cluster_ca_candidates({"NOO_TLS_CA": "/a/ca.crt", "NOO_PKI_DIR": "/p"}, str(tmp_path))
+    assert got[:2] == ["/a/ca.crt", "/p/ca.crt"], got
+
+
 def test_the_console_chat_client_frames_and_reads_what_the_gateway_sends():
     ws = _load("ws_chat", ROOT / "scripts/install-cell/ws_chat.py")
     import socket
