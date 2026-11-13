@@ -450,7 +450,7 @@ pub use entitlement::*;
 #[cfg(has_entitlement_signer)]
 pub use entitlement_signer::*;
 pub use release_sign::*;
-pub use addon_lock_cmd::{security_addon_lock_sign, security_addon_lock_verify};
+pub use addon_lock_cmd::{security_addon_lock_publish, security_addon_lock_sign, security_addon_lock_verify};
 pub use addon_pins::{addons_launch_pins, addons_upgrade, addons_verify};
 pub use addon_setup::addons_setup;
 pub use addon_resources::{addons_launch_resources, addons_rotate_secret};

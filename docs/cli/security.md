@@ -395,7 +395,8 @@ noo security addon-lock verify addon-lock.json --key <pubkey hex> \
 `sign` writes the lock in its one canonical JSON form and the signature
 (`noo-sig1`, the stack lock's envelope) next to it as `addon-lock.json.sig`.
 It reads the seed from a file, or from standard input with `--seed-file -`,
-never from an environment variable, and never prints it. It refuses a lock
+never from an environment variable, and never prints it: keep the seed file
+outside the add-on's repository, mode 0600, never committed. It refuses a lock
 no verifier would accept. `--base trellion=sha256:…` records the stack image
 an add-on is built on.
 
@@ -414,6 +415,22 @@ sha256 under `files`, so the one signature covers them. Write it to
 also refuses any listed file in `<dir>` that is missing or does not hash to
 the lock. The layout both locks are published in is in
 [the add-on guide](../development/addons.md#the-signed-add-on-lock).
+
+`publish` pushes what `sign` wrote to the add-on's own registry package, one
+OCI artifact per supported stack tag (`<root>:stack-<tag>`), and reads each
+tag back through the upgrade's own fetch; a tag that does not read back as
+pushed fails the publish:
+
+```sh
+noo security addon-lock publish addon-bundle.json \
+  --registry ghcr.io/example/example-addon --token-file ~/.config/example/ghcr-token
+```
+
+It takes `addon-bundle.json.sig` and, when present, the `addon-lock.json` pair
+from beside the bundle, and the bundle's files from the same directory (or
+`--files-dir <dir>`). The token comes from `--token-file` (or `-` for
+standard input), else `GH_TOKEN` / `GITHUB_TOKEN`, and is never printed.
+`--dry-run` lists the tags and layers and pushes nothing.
 
 ## Related guides
 
@@ -501,7 +518,8 @@ the lock. The layout both locks are published in is in
 | `noo security entitlement pubkey` | — | Print this controller's add-on key (hex) for the vendor to bind the entitlement to |
 | `noo security release-sign` | `<file> [--seed-file <path>] [--out <file.sig>]` | Hidden: sign sha256sums.txt with the release key (CI only) |
 | `noo security release-verify` | `<file> [<file.sig>]` | Verify a release manifest signature against the keys baked into this build |
-| `noo security addon-lock sign` | `--addon <name> --version <v> --source-commit <sha> --supports <tag>[,<tag>]... --image <name>=<ref@digest>... [--base <image>=<digest>] [--file <name>=<path>]... [--registry <root>] --seed-file <path\|-> --out <path>` | Hidden: sign an add-on lock with the add-on's own key (add-on CI only) |
+| `noo security addon-lock sign` | `--addon <name> --version <v> --source-commit <sha> --supports <tag>[,<tag>]... --image <name>=<ref@digest>... [--base <image>=<digest>] [--file <name>=<path>]... [--registry <root>] --seed-file <path\|-> --out <path>` | Sign an add-on lock with the add-on's own key; keep the seed file outside the add-on's repository, mode 0600, never committed |
+| `noo security addon-lock publish` | `<bundle.json> --registry <root> [--files-dir <dir>] [--user <name>] [--token-file <path\|->] [--dry-run]` | Push a signed add-on lock to its registry, one artifact per stack tag, and read each back |
 | `noo security addon-lock verify` | `<path> --key <pubkey>... --addon <name> --registry <root> [--sig <path>] [--stack <tag>] [--files-dir <dir>] [--dev-key <pubkey>]...` | Verify a signed add-on lock against the add-on's release keys and registry root |
 | `noo security secrets tidy` | `[-y\|--yes]` | Thin the store to secrets only: move config to .env, drop retired keys, blank .env copies |
 | `noo security secrets audit` | `[--sops-file <path>] [--env-file <path>]` | Compare env.sops against .env by digest and report findings (no values shown) |
