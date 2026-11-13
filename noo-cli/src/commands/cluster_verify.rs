@@ -2877,25 +2877,30 @@ pub(crate) fn noo_data_bound_check(seen: &NooDataSeen, want: Option<&str>) -> Ch
 /// The `netns restore` row (#1108): is noo-netns-restore.service installed and
 /// enabled on this systemd controller, so a container that joins another's
 /// network (noo-ollama-embed) comes back after every dockerd start? Pure.
-pub(crate) fn netns_restore_row(systemd: bool, state: Option<crate::netns_unit::State>) -> Check {
-    use crate::netns_unit::{State, REMEDY, UNIT_NAME};
+/// `state`: Err is why this install cannot have the unit (`render_here`).
+pub(crate) fn netns_restore_row(systemd: bool, state: Result<crate::netns_unit::State, String>) -> Check {
+    use crate::netns_unit::{State, REMEDY, ROOT_REFUSAL, ROOT_REMEDY, UNIT_NAME};
     const NAME: &str = "netns restore";
     if !systemd {
         return ok(NAME, "no systemd here: noo-hostd's boot-restore restarts a namespace-joined container after a reboot; a dockerd restart alone is not covered");
     }
     let lose = "after a reboot or a dockerd restart, a container that joins another's network (noo-ollama-embed) can stay down";
     match state {
-        Some(State::Current) => ok(NAME, format!("{UNIT_NAME} installed and enabled: it runs after every dockerd start")),
-        Some(State::Disabled) => warn(NAME, format!("{UNIT_NAME} is installed but not enabled: {lose}"), Some(REMEDY.into())),
-        Some(State::Stale) => warn(NAME, format!("{UNIT_NAME} is not the unit this install writes (older, or for a moved install): {lose}"), Some(REMEDY.into())),
-        Some(State::Missing) | None => warn(NAME, format!("{UNIT_NAME} is not installed: {lose}"), Some(REMEDY.into())),
+        Ok(State::Current) => ok(NAME, format!("{UNIT_NAME} installed and enabled: it runs after every dockerd start")),
+        Ok(State::Disabled) => warn(NAME, format!("{UNIT_NAME} is installed but not enabled: {lose}"), Some(REMEDY.into())),
+        Ok(State::Stale) => warn(NAME, format!("{UNIT_NAME} is not the unit this install writes (older, or for a moved install): {lose}"), Some(REMEDY.into())),
+        Ok(State::Missing) => warn(NAME, format!("{UNIT_NAME} is not installed: {lose}"), Some(REMEDY.into())),
+        Err(why) => {
+            let remedy = if why.starts_with(ROOT_REFUSAL) { ROOT_REMEDY } else { REMEDY };
+            warn(NAME, format!("{UNIT_NAME} cannot be installed ({why}): {lose}"), Some(remedy.into()))
+        }
     }
 }
 
 fn netns_restore_row_here(root: &std::path::Path) -> Check {
     use crate::netns_unit as nu;
     let systemd = nu::systemd_here();
-    let state = systemd.then(|| nu::render_here(&root.display().to_string()).ok().map(|u| nu::state(&u))).flatten();
+    let state = if systemd { nu::render_here(&root.display().to_string()).map(|u| nu::state(&u)) } else { Err(String::new()) };
     netns_restore_row(systemd, state)
 }
 
@@ -14097,16 +14102,29 @@ mod netns_restore_row_tests {
 
     #[test]
     fn the_row_shows_whether_the_unit_runs_after_every_dockerd_start() {
-        assert_eq!(netns_restore_row(true, Some(State::Current)).verdict, Verdict::Ok);
-        for s in [Some(State::Missing), Some(State::Stale), Some(State::Disabled), None] {
-            let c = netns_restore_row(true, s);
+        assert_eq!(netns_restore_row(true, Ok(State::Current)).verdict, Verdict::Ok);
+        for s in [Ok(State::Missing), Ok(State::Stale), Ok(State::Disabled), Err("not a usable install path for the unit: \"x\"".to_string())] {
+            let c = netns_restore_row(true, s.clone());
             assert_eq!(c.verdict, Verdict::Warn, "{s:?}");
             assert_eq!(c.remedy.as_deref(), Some(crate::netns_unit::REMEDY), "{s:?}");
             assert!(c.detail.contains("noo-ollama-embed"), "{}", c.detail);
         }
-        let c = netns_restore_row(false, None);
+        let c = netns_restore_row(false, Err(String::new()));
         assert_eq!(c.verdict, Verdict::Ok);
         assert!(c.detail.contains("no systemd") && c.detail.contains("not covered"), "{}", c.detail);
+    }
+
+    /// A root install over a path another user can write: the row names the
+    /// path and why, and its remedy is the root one, not `noo upgrade --stack`
+    /// alone (which would refuse again).
+    #[test]
+    fn a_refused_root_install_says_which_path_and_how_to_fix_it() {
+        use crate::netns_unit::{ROOT_REFUSAL, ROOT_REMEDY};
+        let why = format!("{ROOT_REFUSAL}: /home/alex/.noo/scripts/noo-netns-restore.sh belongs to uid 1000, not root");
+        let c = netns_restore_row(true, Err(why));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("cannot be installed") && c.detail.contains("belongs to uid 1000, not root"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some(ROOT_REMEDY));
     }
 
     #[test]
