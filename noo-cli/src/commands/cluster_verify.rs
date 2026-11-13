@@ -3929,6 +3929,25 @@ pub(crate) fn with_profile_form(mut c: Check, form: Option<&str>) -> Check {
     c
 }
 
+/// The causes the live-probe rows name when they could not probe, which are
+/// guesses ("not running") that are wrong when docker refused the account.
+const UNPROBED_GUESSES: [&str; 2] = [
+    "(gateway or sandbox container not running)",
+    "(postgres container not running, or no routable address)",
+];
+
+/// A live-probe row that could not probe, when docker refused this account:
+/// its guessed cause becomes docker's own words and the remedy the docker
+/// one. Any other row, or no refusal, is returned unchanged.
+pub(crate) fn docker_refused(mut c: Check, refusal: Option<&str>) -> Check {
+    let Some(e) = refusal else { return c };
+    if let Some(g) = UNPROBED_GUESSES.iter().find(|g| c.detail.contains(*g)) {
+        c.detail = c.detail.replace(g, &format!("— {e}"));
+        c.remedy = Some(crate::commands::secrets_delivery::DOCKER_REFUSED_REMEDY.into());
+    }
+    c
+}
+
 pub(crate) fn sandbox_executor_check(probe: Option<&SandboxProbe>) -> Check {
     const ROW: &str = "sandbox executor";
     let Some(p) = probe else {
@@ -7570,13 +7589,17 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // container proves it live — no cert and plaintext refused, its own
         // leaf accepted.
         let sandbox_probe = sandbox_live_probe();
-        checks.push(sandbox_listener_check(compose.as_deref(), sandbox_probe.as_ref()));
+        // A probe that could not run because docker refused this account is
+        // said as that, not as "container not running" (failed lookup is not
+        // absence; rc.3 stranger cell, docker group not active).
+        let refused = crate::commands::secrets_delivery::docker_refusal();
+        checks.push(docker_refused(sandbox_listener_check(compose.as_deref(), sandbox_probe.as_ref()), refused.as_deref()));
         // The sandbox executor (i161): the health body that probe read over
         // the gateway's leaf says which uid model-written code runs as.
         // Which form of the AppArmor profile is installed (bundled, or the
         // AppArmor 3.x form without its `userns,` rule): stated, not silent.
         checks.push(with_profile_form(
-            sandbox_executor_check(sandbox_probe.as_ref()),
+            docker_refused(sandbox_executor_check(sandbox_probe.as_ref()), refused.as_deref()),
             crate::onboard::sandbox_apparmor::installed_form(
                 std::fs::read_to_string(crate::onboard::sandbox_apparmor::INSTALLED).ok().as_deref()),
         ));
@@ -7628,10 +7651,10 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             hba.as_deref(),
         ));
         let (no_cert, plaintext) = postgres_live_probes();
-        checks.push(postgres_client_cert_check(
+        checks.push(docker_refused(postgres_client_cert_check(
             no_cert.as_ref().map(|(ok, e)| (*ok, e.as_str())),
             plaintext.as_ref().map(|(ok, e)| (*ok, e.as_str())),
-        ));
+        ), refused.as_deref()));
         // One "<name> at rest" row per directory that holds state in the
         // clear (`at_rest_dirs`): the process env is what the launcher
         // resolved from `.env`, so the paths are the ones compose bound.
@@ -14114,5 +14137,57 @@ mod netns_restore_row_tests {
         let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
         let run = crate::test_src::fn_body(&own, "pub fn cluster_verify(");
         assert!(run.contains("checks.push(netns_restore_row_here(&crate::envfile::repo_root()));"), "{run}");
+    }
+}
+
+#[cfg(test)]
+mod docker_refused_row_tests {
+    use super::*;
+
+    const SANDBOX_COMPOSE: &str = "services:\n  sandbox:\n    entrypoint: []\n    command: &sandbox-command\n      - python\n      - -m\n      - uvicorn\n      - noomesh.sandbox.app:app\n      - --port\n      - \"9000\"\n      - --ssl-certfile\n      - /tls/services/sandbox/service.crt\n      - --ssl-keyfile\n      - /tls/services/sandbox/service.key\n      - --ssl-ca-certs\n      - /tls/ca.crt\n      - --ssl-cert-reqs\n      - \"2\"\n    expose:\n      - \"9000\"\n  sandbox-extra:\n    command: *sandbox-command\n  postgres:\n    ports:\n      - \"5432:5432\"\n";
+    const DENIED: &str = "permission denied while trying to connect to the docker API at unix:///var/run/docker.sock";
+
+    #[test]
+    fn an_unprobed_live_row_names_dockers_refusal_not_a_stopped_container() {
+        let rows = [
+            sandbox_listener_check(Some(SANDBOX_COMPOSE), None),
+            sandbox_executor_check(None),
+            postgres_client_cert_check(None, None),
+        ];
+        for r in rows {
+            let name = r.name;
+            let before = r.detail.clone();
+            let c = docker_refused(r, Some(DENIED));
+            assert!(c.detail.contains(DENIED), "{name}: {}", c.detail);
+            assert!(!c.detail.contains("not running"), "{name}: failed lookup is not absence: {}", c.detail);
+            assert_eq!(c.remedy.as_deref(), Some(crate::commands::secrets_delivery::DOCKER_REFUSED_REMEDY), "{name}");
+            assert_eq!(c.verdict, Verdict::Warn, "{name}");
+            // No refusal: the row is exactly as it was.
+            let again = match name {
+                "sandbox listener" => sandbox_listener_check(Some(SANDBOX_COMPOSE), None),
+                "sandbox executor" => sandbox_executor_check(None),
+                _ => postgres_client_cert_check(None, None),
+            };
+            assert_eq!(docker_refused(again, None).detail, before, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_row_that_did_probe_is_never_rewritten() {
+        let c = ok("sandbox executor", "code runs as sandbox-exec (uids 65600-65663)");
+        assert_eq!(docker_refused(c.clone(), Some(DENIED)).detail, c.detail);
+    }
+
+    #[test]
+    fn every_unprobed_guess_in_the_run_goes_through_the_refusal() {
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let run = crate::test_src::fn_body(&own, "pub fn cluster_verify(");
+        for call in ["docker_refused(sandbox_listener_check(", "docker_refused(sandbox_executor_check(", "docker_refused(postgres_client_cert_check("] {
+            assert!(run.contains(call), "{call}");
+        }
+        // A new "not running" guess must be added to UNPROBED_GUESSES.
+        for g in UNPROBED_GUESSES {
+            assert!(own.contains(g), "{g} is still a row's text");
+        }
     }
 }
