@@ -465,6 +465,30 @@ def test_the_restart_probe_runs_20_only_on_the_22_04_cell_and_offboard_checks_wi
     assert "\n  docker ps -q --filter name=noo-gateway" not in off
 
 
+def test_the_rag_probe_runs_the_first_chat_pages_own_lines_and_is_never_judged():
+    # general 11-13: does first-chat.md's `noo chat --message "...anything.md"`
+    # bring the ingested fact back? The probe reads the line from the page (so a
+    # page edit is what gets probed), waits for the index with the page's query
+    # shape first, and only prints yes/no.
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    m = text[text.index('RAG_CHAT_LINE="$(sed -n '):]
+    m = m[:m.index("\n")]
+    page = ROOT / "docs/getting-started/first-chat.md"
+    got = subprocess.run(
+        ["bash", "-c", m.replace('"$RAG_DOC_PAGE"', f"'{page}'") + '\nprintf "%s" "$RAG_CHAT_LINE"'],
+        capture_output=True, text=True, check=True).stdout
+    assert got and "anything.md" in got and f'noo chat --message "{got}"' in page.read_text()
+    probe = text[text.index("step probe-rag-chat 900"):]
+    probe = probe[:probe.index("\n  true'")]
+    ingest = probe.index('\n  noo rag ingest "$HOME/notes/anything.md" 2>&1')
+    query = probe.index('if noo rag query "what does anything.md say about the deadline?" 2>&1 | grep -qiE "14(th)? (of )?march|ZIRCON-4471"; then indexed=yes')
+    chat = probe.index('out="$(noo chat --message "$RAG_CHAT_LINE" 2>&1)"')
+    assert ingest < query < chat
+    assert 'printf "%s" "$out" | grep -qiE "14(th)? (of )?march|ZIRCON-4471|kestrel"; then got=yes' in probe
+    assert "RAG PROBE: the chat line returned the fact=$got" in probe and "exit 1" not in probe
+    wf = (ROOT / ".github/workflows/install-matrix.yml").read_text()
+    assert wf.count("docs/getting-started/first-chat.md") >= 2, "both jobs check the page out"
+
 def test_the_offboard_probe_is_skipped_by_name_on_a_root_cell():
     # rc.5 matrix run 1, WSL2 (root): root reaches docker by uid, so "a shell
     # without the docker group" cannot be made; offboard -y rightly wiped the
