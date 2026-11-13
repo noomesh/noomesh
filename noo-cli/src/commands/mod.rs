@@ -43,6 +43,7 @@ pub mod cluster_reserve;
 pub mod cluster_node_workloads;
 pub mod cluster_profile;
 pub mod cluster_verify;
+pub mod image_retention;
 pub mod image_stage;
 pub mod cluster_class;
 pub mod cluster_embedding_space;
