@@ -389,6 +389,16 @@ It needs the sops secret store. It is stored as
 shows whether one is set, never its value. Create it read-only (`read:packages`
 on GHCR). `untrust-key` removes it with the last key.
 
+**Limit: the registry needs a publicly trusted certificate.** noomesh fetches
+a lock only over HTTPS, and it trusts only the public certificate authorities
+built into `noo` (Mozilla's set), not the machine's own trust store. A
+registry with a certificate from your own CA, or a plain-HTTP registry (a
+local `registry:2` on a laptop), cannot serve your lock to noomesh. Use
+ghcr.io, Docker Hub, or a registry with a certificate from a public CA. For
+local work, `noo addons enable <name> --lock ./addon-bundle.json` installs
+from the file and fetches nothing, but then `noo upgrade` cannot follow the
+add-on to a new stack release.
+
 ### Enable
 
 ```sh
