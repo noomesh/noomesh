@@ -133,6 +133,78 @@ def test_lib_step_redacts_records_and_returns_the_exit_code(tmp_path):
     assert "hunter2" not in (out / "logs" / "leak.log").read_text()
 
 
+def _agent_dump_cell(tmp_path, systemd: bool):
+    """A cell with run.sh's agent_dump hook and fake sudo/systemctl/journalctl/ps
+    on PATH: one step passes, two fail, one fails inside a child bash that
+    sources lib.sh (the mode hooks' shape). Returns (stdout, steps, out dir)."""
+    run_sh = (ROOT / "scripts/install-cell/run.sh").read_text()
+    start, end = run_sh.index("AGENT_DUMPS=0\n"), run_sh.index("export -f agent_dump\n") + len("export -f agent_dump\n")
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    fakes = {
+        "sudo": '#!/bin/sh\n[ "$1" = -n ] && shift\nexec "$@"\n',
+        "systemctl": '#!/bin/sh\necho "noo-node-agent.service - active (running) fake-status"\n',
+        "journalctl": '#!/bin/sh\necho "agent: placement received fake-journal"\n',
+        "ps": '#!/bin/sh\necho "  PID ELAPSED COMMAND"\necho "  42 00:10 /usr/local/bin/noo-node-agent fake-proc"\n',
+    }
+    for n, body in fakes.items():
+        (bin_ / n).write_text(body)
+        (bin_ / n).chmod(0o755)
+    out = tmp_path / "out"
+    sysdir = tmp_path / "systemd"
+    if systemd:
+        sysdir.mkdir()
+    # OUT and CELL come from the workflow's env in a real cell, so a mode hook inherits them.
+    script = (f'set -uo pipefail; export OUT="{out}" CELL=t; . "{LIB}"; ' + run_sh[start:end] +
+              'step ok 30 -- true; step bad 30 -- sh -c "exit 3"; echo "rc=$?"; step bad2 30 -- false; '
+              f'bash -c \'. "{LIB}"; step child 30 -- false\'; echo "child=$?"')
+    env = {**os.environ, "PATH": f"{bin_}:{os.environ['PATH']}", "CELL_SYSTEMD_DIR": str(sysdir)}
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=120)
+    steps = [json.loads(l) for l in (out / "steps.jsonl").read_text().splitlines()]
+    return r.stdout, steps, out
+
+
+def test_every_failed_step_dumps_the_node_agent_state_through_step(tmp_path):
+    # rc.3 matrix run 2 (WSL2): a placed model, "no lanes" two minutes later,
+    # and no agent log in the artifact to say why.
+    stdout, steps, out = _agent_dump_cell(tmp_path, systemd=True)
+    names = [s["step"] for s in steps]
+    assert names == ["ok", "bad", "agent-state-after-bad", "bad2", "agent-state-after-bad2",
+                     "child", "agent-state-after-child"], names
+    # The failed step's exit code is the caller's, not the dump's.
+    assert "rc=3" in stdout and "child=1" in stdout, stdout
+    log = (out / "logs" / "agent-state-after-bad.log").read_text()
+    assert "fake-status" in log and "fake-journal" in log, log
+    # Recorded by step(): redacted, in steps.jsonl, and never the failed step.
+    assert all(s["rc"] == 0 for s in steps if s["step"].startswith("agent-state-after-"))
+    (out / "meta.json").write_text(json.dumps({"cell": "c"}))
+    assert C.summarize(out)["failed_step"] == "bad"
+
+
+def test_without_systemd_the_dump_shows_the_agent_process(tmp_path):
+    _, _, out = _agent_dump_cell(tmp_path, systemd=False)
+    log = (out / "logs" / "agent-state-after-bad.log").read_text()
+    assert "no systemd on this host" in log and "fake-proc" in log and "fake-journal" not in log, log
+
+
+def test_the_dump_never_reads_the_agent_env_file_and_is_capped():
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    body = text[text.index("agent_dump() {"):text.index("ON_STEP_FAIL=agent_dump")]
+    assert "noo-node-agent.env" not in body and "agent-secrets" not in body
+    assert '[ "$AGENT_DUMPS" -lt 5 ] || return 0' in body
+
+    # A dump that times out (rc 124) is still never "the failed step".
+
+
+def test_a_dump_that_times_out_is_not_the_failed_step(tmp_path):
+    rec = {"seconds": 1, "first_error": "", "prompts": [], "warnings": [], "tail": []}
+    steps = [{**rec, "step": "install", "rc": 0}, {**rec, "step": "agent-state-after-x", "rc": 124}]
+    (tmp_path / "steps.jsonl").write_text("\n".join(json.dumps(s) for s in steps) + "\n")
+    (tmp_path / "meta.json").write_text(json.dumps({"cell": "c"}))
+    s = C.summarize(tmp_path)
+    assert s["result"] == "pass" and s["failed_step"] is None, s
+
+
 def test_the_summary_names_the_failed_step_and_ignores_leftover_rcs(tmp_path):
     steps = [{"step": "install", "rc": 0, "seconds": 3, "first_error": "", "prompts": [], "warnings": ["! w"], "tail": []},
              {"step": "leftover-docker", "rc": 1, "seconds": 1, "first_error": "LEFTOVER volume noomesh_pg",
@@ -221,7 +293,8 @@ def test_a_failed_step_ends_the_cell_and_tears_down_at_most_once(tmp_path):
     assert r.returncode == 1, r.stdout[-2000:] + r.stderr[-2000:]
     # The README's line downloads THEN runs (#1058), so a failed download
     # fails the install step itself; nothing after it runs.
-    assert steps == ["box", "install"], steps
+    # ...apart from the node agent's state, dumped after the failed step.
+    assert steps == ["box", "install", "agent-state-after-install"], steps
     s = json.loads((tmp_path / "out" / "summary.json").read_text())
     assert s["result"] == "fail" and s["failed_step"] == "install"
 

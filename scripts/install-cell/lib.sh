@@ -29,7 +29,16 @@ step() {
     rc=${PIPESTATUS[0]}
     echo "::endgroup::"
     python3 "$CELL_PY" record "$name" "$rc" "$(( $(date +%s) - start ))" "$log" >> "$OUT/steps.jsonl"
-    [ "$rc" = 0 ] || echo "::warning::$CELL: step $name exited $rc"
+    if [ "$rc" != 0 ]; then
+        echo "::warning::$CELL: step $name exited $rc"
+        # A caller's hook for every failed step (run.sh: the node agent's
+        # state). Cleared while it runs, so a failing hook cannot recurse.
+        if [ -n "${ON_STEP_FAIL:-}" ]; then
+            local hook="$ON_STEP_FAIL"; ON_STEP_FAIL=""
+            "$hook" "$name" || true
+            ON_STEP_FAIL="$hook"
+        fi
+    fi
     return "$rc"
 }
 
@@ -46,6 +55,11 @@ step_tty() {
     rc=${PIPESTATUS[0]}
     echo "::endgroup::"
     python3 "$CELL_PY" record "$name" "$rc" "$(( $(date +%s) - start ))" "$log" >> "$OUT/steps.jsonl"
+    if [ "$rc" != 0 ] && [ -n "${ON_STEP_FAIL:-}" ]; then
+        local hook="$ON_STEP_FAIL"; ON_STEP_FAIL=""
+        "$hook" "$name" || true
+        ON_STEP_FAIL="$hook"
+    fi
     return "$rc"
 }
 
