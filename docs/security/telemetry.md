@@ -519,13 +519,14 @@ gateway's list and the GPU exporter by a file the exporter writes while it
 runs, so an idle install asks no resolver anything
 ([Verify it yourself](#verify-it-yourself) shows how to watch).
 
-A node agent on a host without `nvidia-smi` still looks up `nvidia-exporter`
-once when it starts, to check for a GPU exporter beside it, and never again
-while it runs. The agent is a host service, so the lookup uses the host's own
-DNS settings: with a search domain (one your router hands out, or your
-tailnet's), the host's resolver is asked for `nvidia-exporter.<search
-domain>` (A and AAAA), once per agent start. Only the question leaves; no
-connection follows.
+Before 0.6.24, a node agent on a host without `nvidia-smi` also looked up
+`nvidia-exporter` once when it started, to check for a GPU exporter beside it.
+The agent is a host service, so with a search domain (one your router hands
+out, or your tailnet's) the host's resolver was asked for
+`nvidia-exporter.<search domain>` (A and AAAA), once per agent start; only the
+question left, no connection followed. Since 0.6.24 the agent reads the GPU
+from `nvidia-smi` only and looks no name up. Nothing noomesh ships asks a
+resolver for its own container names.
 
 These are out of scope here:
 
