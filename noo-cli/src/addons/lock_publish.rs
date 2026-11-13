@@ -848,3 +848,5 @@ mod tests {
         assert_eq!(scrub("nothing here", None), "nothing here");
     }
 }
+
+// hosted compile probe (MUTANT 0): no behaviour change
