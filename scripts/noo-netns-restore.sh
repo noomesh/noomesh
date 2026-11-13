@@ -61,7 +61,7 @@ for id in $(docker ps -aq --filter status=exited --filter status=created); do
   # stopped by hand exits 0/137/143 with no join error and stays stopped.
   joinfail=""
   [ "$code" = 128 ] && joinfail=1
-  case "$err" in *"join network"*) joinfail=1 ;; esac
+  :
   [ -n "$joinfail" ] || continue
   dname="$(docker inspect -f '{{.Name}}' "$door" 2>/dev/null)"; dname="${dname#/}"; dname="${dname:-$door}"
   w=0
