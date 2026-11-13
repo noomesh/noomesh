@@ -80,10 +80,21 @@ run of this example.
    ```sh
    noo addons trust-key example-addon <pubkey> --registry <root> --dev --expires 14d
    noo addons enable example-addon --lock ./addon-lock.json
+   noo stack restart --force
    ```
 
    Enable mints `NOO_SVC_KEY_EXAMPLE_ADDON` with `metrics` (plus `addon`),
-   provisions the database roles, and starts the service.
+   provisions the database roles, and declares the add-on ON. It starts
+   nothing: a command that edits the configuration never restarts a running
+   stack. Enable ends by saying so:
+
+   ```
+   > noo stack restart --force
+       applies it — until then the running stack is unchanged
+   ```
+
+   `noo stack restart --force` starts the service. `noo addons list` shows it
+   declared and running.
 
 6. **Connect**: call the add-on's route through the gateway as an operator. It
    answers with who the call was for and whether its own token exchange

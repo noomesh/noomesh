@@ -226,6 +226,7 @@ of your release key:
 ```bash
 noo addons trust-key yourthing <dev-pubkey> --registry <root> --dev --expires 14d
 noo addons enable yourthing --lock ./addon-lock.json
+noo stack restart --force   # enable declares it ON; the restart starts it
 ```
 
 - `--expires` is required with `--dev` (a whole number of `d`, `h` or `m`, at
@@ -1121,6 +1122,7 @@ There are three ways through, and the refusal names them:
    noo addons disable example-addon
    noo upgrade --stack
    noo addons enable example-addon --lock ./addon-bundle.json   # a lock signed for the new stack
+   noo stack restart --force   # enable declares it ON; this starts it
    ```
 
    The 0.6.24 release rehearsal proved this end to end: the add-on re-enabled
