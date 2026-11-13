@@ -2325,14 +2325,45 @@ pub(crate) fn delete_tailnet_device(g: &Globals, name: &str, ip: Option<&str>) -
     if let Some(ip) = ip.filter(|s| !s.is_empty()) {
         body["ip"] = serde_json::Value::String(ip.to_string());
     }
-    match crate::http::post_json_try(g, "/api/cluster/delete-tailscale-device", &body, true, 30) {
+    tailnet_delete_line(crate::http::post_json_try(g, "/api/cluster/delete-tailscale-device", &body, true, 30), name)
+}
+
+/// The teardown summary's tailnet line for the gateway's answer. Three
+/// different truths: removed (or already gone); nothing to remove because
+/// this controller holds no Tailscale credential (it put no device on a
+/// tailnet); and NOT removed, with the cause and the console as the way on,
+/// when a credential failed or the delete errored. rc.6 rehearsal: a
+/// controller with no credential got the last one, telling the operator to
+/// delete a device that never existed.
+pub(crate) fn tailnet_delete_line<E: std::fmt::Display>(sent: Result<serde_json::Value, E>, name: &str) -> String {
+    match sent {
         Ok(v) => match v["status"].as_str().unwrap_or("") {
             "deleted" => format!("device removed from tailnet ({})",
                 v["device_name"].as_str().unwrap_or(name)),
             "not_found" => "device already gone from tailnet".to_string(),
+            "no_credential" => "nothing to remove — this controller holds no Tailscale credential, \
+                                so it put no device on a tailnet".to_string(),
             _ => "device deletion returned an unexpected status".to_string(),
         },
         Err(e) => format!("NOT removed ({e}) — delete it in the Tailscale admin console"),
+    }
+}
+
+#[cfg(test)]
+mod tailnet_delete_line_tests {
+    use super::tailnet_delete_line;
+    use serde_json::json;
+
+    #[test]
+    fn no_credential_is_nothing_to_remove_and_a_failure_still_sends_the_operator_to_the_console() {
+        let none = tailnet_delete_line::<String>(Ok(json!({"status": "no_credential"})), "rhx-node2");
+        assert!(none.starts_with("nothing to remove — this controller holds no Tailscale credential"), "{none}");
+        assert!(!none.contains("NOT removed") && !none.contains("admin console"), "{none}");
+        let failed = tailnet_delete_line(Err("internal error (ref 2489b5b6)"), "rhx-node2");
+        assert_eq!(failed, "NOT removed (internal error (ref 2489b5b6)) — delete it in the Tailscale admin console");
+        assert_eq!(tailnet_delete_line::<String>(Ok(json!({"status": "not_found"})), "n"), "device already gone from tailnet");
+        assert_eq!(tailnet_delete_line::<String>(Ok(json!({"status": "deleted", "device_name": "n.ts.net"})), "n"),
+            "device removed from tailnet (n.ts.net)");
     }
 }
 

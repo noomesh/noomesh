@@ -293,8 +293,8 @@ current `.env`.
 noo stack clean                     # down, remove project containers, builder cache, dangling images
 noo stack clean --volumes           # + named volumes (keeps hf-cache, and postgres/redis unless --deep)
 noo stack clean --images            # + the built noomesh/* images (and any legacy-namespace layers still on disk)
-noo stack clean --hf-cache          # + the HuggingFace model cache
-noo stack clean --deep -y           # everything above, wipes the data root, removes pki/ (after untrust-ca) and the secret files
+noo stack clean --hf-cache          # + the Windows-side HuggingFace cache (/mnt/c/Users/$USER/.cache/huggingface/hub); the hf-cache volume and data-root copy stay
+noo stack clean --deep -y           # everything above, wipes postgres/redis/nats under the data root, removes pki/ (after untrust-ca) and the Mesh secret files
 ```
 
 `--deep` is the only clean that touches Postgres data, the PKI and

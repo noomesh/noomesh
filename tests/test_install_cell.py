@@ -9,7 +9,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import subprocess
+
+import pytest
 import sys
 import time
 from pathlib import Path
@@ -462,6 +465,66 @@ def test_the_restart_probe_runs_20_only_on_the_22_04_cell_and_offboard_checks_wi
     assert "\n  docker ps -q --filter name=noo-gateway" not in off
 
 
+def test_the_rag_probe_asks_the_pages_query_then_three_chat_paths_and_is_never_judged():
+    # general 11-13: rc.6 run 43487245793 showed `noo chat` does not return an
+    # ingested document while `noo rag query` does; the page now proves the doc
+    # with the query only. The probe reads that query line from the page and
+    # asks the same question on noo chat, noo inference agent (/api/agent/run,
+    # the MCP noo_agentic_inference route) and the console socket.
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    page = ROOT / "docs/getting-started/first-chat.md"
+    lines = text[text.index('RAG_QUERY_LINE="$(sed -n '):]
+    lines = lines[:lines.index("\nexport RAG_QUERY_LINE")]
+    got = subprocess.run(
+        ["bash", "-c", lines.replace('"$RAG_DOC_PAGE"', f"'{page}'") + '\nprintf "%s|%s" "$RAG_QUERY_LINE" "$RAG_CHAT_LINE"'],
+        capture_output=True, text=True, check=True).stdout
+    query, chat = got.split("|")
+    assert "anything.md" in query and f'noo rag query "{query}"' in page.read_text()
+    assert "noo chat --message" not in page.read_text().split("your own document")[1].split("## ")[0], \
+        "the page proves the document with noo rag query, not noo chat"
+    assert chat == "summarise what you know from anything.md"
+    probe = text[text.index("step probe-rag-chat 1500"):]
+    probe = probe[:probe.index("\n  true'")]
+    ingest = probe.index('\n  noo rag ingest "$HOME/notes/anything.md" 2>&1')
+    wait = probe.index('if noo rag query "$RAG_QUERY_LINE" 2>&1 | grep -qiE "$fact"; then indexed=yes')
+    ask = probe.index("for path in chat agent console; do")
+    assert ingest < wait < ask
+    assert 'chat) out="$(noo chat --message "$RAG_CHAT_LINE" 2>&1)"' in probe
+    assert 'agent) out="$(timeout 300 noo inference agent "$RAG_CHAT_LINE" 2>&1)"' in probe
+    assert 'console) out="$(timeout 330 python3 -I "$RAG_WS_CHAT" "$RAG_CHAT_LINE" 2>&1)"' in probe
+    assert 'fact="14(th)? (of )?march|ZIRCON-4471|kestrel"' in probe
+    assert 'if printf "%s" "$out" | grep -qiE "$fact"; then got=yes' in probe
+    assert "RAG PROBE: $path returned the fact=$got" in probe and "exit 1" not in probe
+    wf = (ROOT / ".github/workflows/install-matrix.yml").read_text()
+    assert wf.count("docs/getting-started/first-chat.md") >= 2, "both jobs check the page out"
+
+
+def test_the_console_chat_client_finds_the_cluster_ca_where_the_cli_does(tmp_path):
+    ws = _load("ws_chat_ca", ROOT / "scripts/install-cell/ws_chat.py")
+    (tmp_path / ".noo").mkdir()
+    (tmp_path / ".noo" / ".env").write_text("X=1\nNOO_TLS_CA=/srv/noo/pki/ca.crt\n")
+    got = ws.cluster_ca_candidates({}, str(tmp_path))
+    assert got == [str(tmp_path / ".config/mesh/pki/ca.crt"), "/srv/noo/pki/ca.crt", "/etc/noo/pki/ca.crt"], got
+    got = ws.cluster_ca_candidates({"NOO_TLS_CA": "/a/ca.crt", "NOO_PKI_DIR": "/p"}, str(tmp_path))
+    assert got[:2] == ["/a/ca.crt", "/p/ca.crt"], got
+
+
+def test_the_console_chat_client_frames_and_reads_what_the_gateway_sends():
+    ws = _load("ws_chat", ROOT / "scripts/install-cell/ws_chat.py")
+    import socket
+    a, b = socket.socketpair()
+    try:
+        a.sendall(ws.frame('{"prompt": "' + "x" * 300 + '"}'))
+        raw = b.recv(1024)
+        assert raw[0] == 0x81 and raw[1] == 0x80 | 126, "a masked text frame, 16-bit length"
+        n = int.from_bytes(raw[2:4], "big"); mask = raw[4:8]
+        body = bytes(c ^ mask[k % 4] for k, c in enumerate(raw[8:8 + n]))
+        assert json.loads(body)["prompt"] == "x" * 300
+        b.sendall(b"\x81" + bytes([5]) + b"hello")
+        assert ws.read_frame(a) == (1, b"hello")
+    finally:
+        a.close(); b.close()
+
 def test_the_offboard_probe_is_skipped_by_name_on_a_root_cell():
     # rc.5 matrix run 1, WSL2 (root): root reaches docker by uid, so "a shell
     # without the docker group" cannot be made; offboard -y rightly wiped the
@@ -471,3 +534,76 @@ def test_the_offboard_probe_is_skipped_by_name_on_a_root_cell():
     block = text[i:text.index("\nfi\n", i)]
     assert "PROBE SKIPPED: this cell runs as root (uid 0)" in block
     assert "\nelse\nstep probe-offboard-without-docker 600 -- sh -c '" in block, "the real probe still runs for a non-root cell"
+
+
+def _run_sh_var(name: str) -> str:
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    m = re.search(r"^%s='([^']*)'$" % name, text, re.M)
+    assert m, name
+    return m.group(1)
+
+
+def test_the_first_answer_step_asks_the_prompt_the_doc_gives():
+    # One source: the cell reads docs/getting-started/first-chat.md's first
+    # `noo chat --message "…"` line; the workflow checks that file out.
+    doc = (ROOT / "docs/getting-started/first-chat.md").read_text()
+    r = subprocess.run(["sed", "-n", r's/^noo chat --message "\(.*\)"$/\1/p'], input=doc, capture_output=True, text=True)
+    first = r.stdout.splitlines()[0]
+    assert first == "Say hello, then give me two short tips for keeping a home server healthy.", first
+    assert "this machine" not in first.lower(), "a small model cannot see the host"
+    wf = (ROOT / ".github/workflows/install-matrix.yml").read_text()
+    assert wf.count("docs/getting-started/first-chat.md") == 2, "both jobs check the doc out"
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    assert 'out="$(noo chat --message "$FIRST_PROMPT")"' in text
+
+
+@pytest.mark.parametrize("answer, bad", [
+    ("Please provide an image or description of the machine you are referring to.", True),  # gemma4:e2b, rc.4-rc.6
+    ("Could you clarify which machine you mean?", True),
+    ("I cannot see your computer, so I can't answer that.", True),
+    ("I don't have access to your system.", True),
+    ("Hello! How can I help you keep your home server healthy?", True),  # qwen2.5:0.5b, rc.6 branch run
+    ("Hello! I'm Qwen. Do you have any specific questions or topics you'd like to discuss?", True),
+    ("Hi! What would you like to know?", True),
+    ("Hello! 1. Keep the OS and packages updated. 2. Watch disk space and back up regularly.", False),
+    ("Hi there. Tip one: monitor temperatures. Tip two: test your backups.", False),
+    # gemma's real shape, ending politely: the list makes it an answer
+    ("Hello!\nHere are two tips:\n1. **Backups:** automate them.\n2. **Updates:** apply them.\nHow can I help you further?", False),
+])
+def test_a_request_for_more_input_or_a_refusal_is_not_an_answer(answer, bad):
+    # The step's own decision, run as written: strong pattern, or a deflection
+    # in an answer that lists nothing.
+    script = (
+        'out="$1"\n'
+        'listed="$(printf "%s\\n" "$out" | grep -cE "^[[:space:]]*([0-9]+[.)]|[-*]|•)[[:space:]]")"\n'
+        'if printf "%s" "$out" | grep -qiE "$NA" || { [ "$listed" = 0 ] && printf "%s" "$out" | grep -qiE "$DF"; }; then exit 0; fi\n'
+        'exit 1\n'
+    )
+    env = {**os.environ, "NA": _run_sh_var("FIRST_ANSWER_NOT_AN_ANSWER"), "DF": _run_sh_var("FIRST_ANSWER_DEFLECTION")}
+    r = subprocess.run(["sh", "-c", script, "t", answer], env=env)
+    assert (r.returncode == 0) is bad, (answer, r.returncode)
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    assert '{ [ "$listed" = 0 ] && printf "%s" "$out" | grep -qiE "$FIRST_ANSWER_DEFLECTION"; }' in text
+
+
+def test_first_chat_never_asks_the_chat_model_about_cluster_state():
+    # rc.6 branch run 43482649578: asked "which nodes and models do you have
+    # right now?", gemma4:e2b answered about itself ("I am Gemma 4 … I don't
+    # have a list of physical nodes") while `noo cluster status` showed the
+    # node running ollama:gemma4:e2b. The chat path does not read cluster
+    # state, so the page asks the CLI.
+    doc = (ROOT / "docs/getting-started/first-chat.md").read_text()
+    asks = [l for l in doc.splitlines() if l.startswith('noo chat --message "')]
+    assert not any(re.search(r"\b(nodes?|models?|cluster|gpus?)\b.*(have|running|right now)", l, re.I) for l in asks), asks
+    assert "\nnoo cluster status\n" in doc
+
+
+
+def test_only_the_default_model_fails_on_a_non_answer_and_a_tiny_cell_notes_it():
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    i = text.index("step first-answer 1800")
+    block = text[i:text.index("' || fail_onboarded", i)]
+    fail = block.index('FIRST-ANSWER FAIL: the model asked for more input')
+    assert 'if [ "$MODEL" = default ]; then' in block[:fail], "the FAIL is gated on the product default model"
+    assert "FIRST-ANSWER NOTE: the tiny test model ($TINY_MODEL)" in block and "not a product verdict" in block
+    assert "export FIRST_PROMPT FIRST_ANSWER_NOT_AN_ANSWER FIRST_ANSWER_DEFLECTION MODEL TINY_MODEL" in text

@@ -313,10 +313,86 @@ step probe-self-agent-diagnostics 120 -- sh -c '
   sudo grep -E "^(NATS_URL|NOO_GATEWAY_URL|CONTROLLER_URL|NODE_ID)=" /etc/noo-node-agent.env 2>&1
   echo "== noo --json cluster show $(hostname)"; noo --json cluster show "$(hostname)" 2>&1
   true'
-# The single-turn line docs/getting-started/first-chat.md gives, verbatim.
-step first-answer 1800 -- sh -c 'out="$(noo chat --message "in two lines, what can you do on this machine?")"; rc=$?
-  printf "%s\n" "$out"; [ $rc = 0 ] && [ -n "$(printf "%s" "$out" | tr -d "[:space:]")" ]' || fail_onboarded
+# The single-turn line docs/getting-started/first-chat.md gives, read from the
+# doc itself (its first `noo chat --message "…"` line), so the page and the
+# test cannot drift. The answer must be an answer: a model that asks for more
+# input or refuses FAILs by name (rc.4-rc.6: the old prompt "what can you do
+# on this machine?" got "Please provide an image or description of the
+# machine you are referring to." from gemma4:e2b, the first thing a stranger
+# saw the product say).
+FIRST_CHAT_DOC="$HERE/../../docs/getting-started/first-chat.md"
+FIRST_PROMPT="$(sed -n 's/^noo chat --message "\(.*\)"$/\1/p' "$FIRST_CHAT_DOC" 2>/dev/null | head -n 1)"
+# A refusal or a request for more input, in the shapes small models use.
+FIRST_ANSWER_NOT_AN_ANSWER='please (provide|specify|clarify|share|tell me)|could you (please )?(provide|specify|clarify|share|tell me)|can you (please )?(provide|specify|clarify|share)|i (can.?t|cannot|am unable to|am not able to) (help|answer|assist|see|access)|i don.?t have (access|enough (information|context))|(what|which) (machine|computer|device|system) (are|do) you|more (details|information|context) (about|on|is needed)'
+# A deflection ("How can I help you?") counts only when the answer gives no
+# list item at all: a real answer may end with that line after its tips.
+FIRST_ANSWER_DEFLECTION='how can i help you|do you have any (specific )?(questions|topics)|what would you like (to (know|discuss|talk about)|me to)'
+# The named FAIL is for the product's default model only (MODEL=default: what
+# a stranger gets). A tiny-model cell (MODEL=tiny, a 0.5B test model) prints
+# the answer and a NOTE and never fails on it: its mood is not the product's
+# (rc.6 branch run: qwen2.5:0.5b answered "How can I help you …?" on one cell
+# and gave the tips on another; general 11-13).
+export FIRST_PROMPT FIRST_ANSWER_NOT_AN_ANSWER FIRST_ANSWER_DEFLECTION MODEL TINY_MODEL
+meta first_prompt "${FIRST_PROMPT:-none}"
+step first-answer 1800 -- sh -c '
+  [ -n "$FIRST_PROMPT" ] || { echo "FIRST-ANSWER FAIL: docs/getting-started/first-chat.md has no noo chat --message line"; exit 1; }
+  echo "prompt: $FIRST_PROMPT"
+  out="$(noo chat --message "$FIRST_PROMPT")"; rc=$?
+  printf "%s\n" "$out"
+  [ $rc = 0 ] && [ -n "$(printf "%s" "$out" | tr -d "[:space:]")" ] || exit 1
+  listed="$(printf "%s\n" "$out" | grep -cE "^[[:space:]]*([0-9]+[.)]|[-*]|•)[[:space:]]")"
+  if printf "%s" "$out" | grep -qiE "$FIRST_ANSWER_NOT_AN_ANSWER" \
+     || { [ "$listed" = 0 ] && printf "%s" "$out" | grep -qiE "$FIRST_ANSWER_DEFLECTION"; }; then
+    if [ "$MODEL" = default ]; then
+      echo "FIRST-ANSWER FAIL: the model asked for more input or refused instead of answering"; exit 1
+    fi
+    echo "FIRST-ANSWER NOTE: the tiny test model ($TINY_MODEL) did not answer the prompt; this cell runs MODEL=$MODEL, not the product default, so this is not a product verdict"
+  fi' || fail_onboarded
 meta first_answer_s "$(( $(date +%s) - CELL_START ))"
+
+# PROBE (fa, general 11-13): where does a chat get an ingested document back?
+# first-chat.md ingests ~/notes/anything.md and proves it with `noo rag query`
+# (that line is read from the page). The same question is then asked on the
+# three chat paths a person can reach with no more setup: `noo chat` (POST
+# /api/inference/stream), `noo inference agent` (POST /api/agent/run, what the
+# MCP tool noo_agentic_inference calls) and the console's chat (/ws/coordinator,
+# via ws_chat.py with the CLI's stored login). rc.6 (run 43487245793): the
+# query returned the fact, `noo chat` did not. If the page shows a chat line
+# about anything.md again, that line is the one asked. Read, never judged;
+# never the cell's failed step.
+RAG_DOC_PAGE="$HERE/../../docs/getting-started/first-chat.md"
+RAG_QUERY_LINE="$(sed -n 's/^noo rag query "\(.*anything\.md.*\)"$/\1/p' "$RAG_DOC_PAGE" 2>/dev/null | head -n 1)"
+RAG_CHAT_LINE="$(sed -n 's/^noo chat --message "\(.*anything\.md.*\)"$/\1/p' "$RAG_DOC_PAGE" 2>/dev/null | head -n 1)"
+RAG_CHAT_LINE="${RAG_CHAT_LINE:-summarise what you know from anything.md}"
+RAG_WS_CHAT="$HERE/ws_chat.py"
+export RAG_QUERY_LINE RAG_CHAT_LINE RAG_WS_CHAT
+step probe-rag-chat 1500 -- sh -c '
+  [ -n "$RAG_QUERY_LINE" ] || { echo "RAG PROBE: first-chat.md has no noo rag query line about anything.md"; exit 0; }
+  fact="14(th)? (of )?march|ZIRCON-4471|kestrel"
+  mkdir -p "$HOME/notes"
+  printf "%s\n" "# Project notes" "" "The delivery deadline for the Kestrel project is the 14th of March, and the project codeword is ZIRCON-4471." > "$HOME/notes/anything.md"
+  echo "== noo rag ingest ~/notes/anything.md"
+  noo rag ingest "$HOME/notes/anything.md" 2>&1 | tail -n 5
+  echo "== waiting for the index (the page'"'"'s noo rag query line)"
+  t=0; indexed=no
+  while [ "$t" -lt 300 ]; do
+    if noo rag query "$RAG_QUERY_LINE" 2>&1 | grep -qiE "$fact"; then indexed=yes; break; fi
+    sleep 10; t=$((t + 10))
+  done
+  echo "RAG PROBE: indexed (rag query returns the fact)=$indexed after ${t}s"
+  noo rag status 2>&1 | head -n 8
+  for path in chat agent console; do
+    echo "== $path: \"$RAG_CHAT_LINE\""
+    case "$path" in
+      chat) out="$(noo chat --message "$RAG_CHAT_LINE" 2>&1)" ;;
+      agent) out="$(timeout 300 noo inference agent "$RAG_CHAT_LINE" 2>&1)" ;;
+      console) out="$(timeout 330 python3 -I "$RAG_WS_CHAT" "$RAG_CHAT_LINE" 2>&1)" ;;
+    esac
+    printf "%s\n" "$out" | head -n 30
+    if printf "%s" "$out" | grep -qiE "$fact"; then got=yes; else got=no; fi
+    echo "RAG PROBE: $path returned the fact=$got (index ready=$indexed)"
+  done
+  true'
 
 # PROBE (fa, rc.1 rehearsal A-reboot.status, i677): a container that joins
 # another's network namespace (network_mode: service:<door>; noo-ollama-embed
