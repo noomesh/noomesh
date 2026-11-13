@@ -62,6 +62,15 @@ def rig(tmp_path):
         while [ $# -gt 0 ]; do [ "$1" = "-o" ] && field="$2"; shift; done
         eval "printf '%s\\n' \\"\\$FAKE_$field\\""
         """)
+    # Who runs the launch: a non-root install owner unless a test says root.
+    _exe(bindir / "id", """\
+        #!/bin/sh
+        case "$1" in
+          -u) echo "${FAKE_EUID:-1002}" ;;
+          -un) echo "${FAKE_USER:-rhowner}" ;;
+          *) echo "uid=${FAKE_EUID:-1002}(${FAKE_USER:-rhowner})" ;;
+        esac
+        """)
     _exe(bindir / "ls", """\
         #!/bin/sh
         if [ -n "$FAKE_LS_EIO" ]; then
@@ -393,3 +402,95 @@ def test_hostd_boot_restore_runs_the_guard_before_anything_else():
     guard = script.index("data_root_mount_boot_guard")
     for later in ("secret_rundir)", "check_state_volume_open", "load_secrets", "docker start"):
         assert guard < script.index(later), later
+
+
+# ── a UUID this account cannot read is not a different UUID (rc.3 A-afterboot.start) ──
+
+
+def _drop(rig, key: str) -> None:
+    p = rig["install"] / ".noo-data-root-id"
+    p.write_text("".join(l for l in p.read_text().splitlines(True) if not l.startswith(key + "=")))
+
+
+def test_an_unreadable_uuid_with_the_recorded_mount_starts_and_says_what_it_compared(rig):
+    assert "RC=0" in run(rig, FAKE_EUID="0", FAKE_USER="root").stdout  # onboard, as root, records the UUID
+    r = run(rig, FAKE_UUID="")
+    assert "RC=0" in r.stdout, r.stderr
+    assert "REFUSED" not in r.stderr
+    assert "could not be read as rhowner" in r.stderr and "compared instead" in r.stderr, r.stderr
+    assert "/dev/nvme1n1p1" in r.stderr and "ext4" in r.stderr
+
+
+def test_an_unreadable_uuid_never_downgrades_the_record(rig):
+    run(rig, FAKE_EUID="0", FAKE_USER="root")
+    _drop(rig, "postgres_initialised")  # the ok path rewrites the record to add it back
+    r = run(rig, FAKE_UUID="")
+    assert "RC=0" in r.stdout, r.stderr
+    rec = record(rig)
+    assert f"uuid={UUID_A}" in rec and "id_kind=uuid" in rec, rec
+    assert "postgres_initialised=" in rec
+
+
+def test_an_unreadable_uuid_on_another_mount_refuses_with_the_true_reason(rig):
+    run(rig, FAKE_EUID="0", FAKE_USER="root")
+    for change in ({"FAKE_SOURCE": "/dev/sdb1"}, {"FAKE_TARGET": "/"}, {"FAKE_FSTYPE": "xfs"}):
+        r = run(rig, FAKE_UUID="", **change)
+        assert "RC=1" in r.stdout, (change, r.stderr)
+        assert "could not read the filesystem UUID as rhowner" in r.stderr, r.stderr
+        assert "not on its recorded filesystem" not in r.stderr, r.stderr
+        assert "sudo findmnt" in r.stderr and "NOO_DATA_ROOT_RERECORD=1" in r.stderr
+
+
+def test_a_record_with_only_the_uuid_refuses_an_unreadable_read(rig):
+    run(rig, FAKE_EUID="0", FAKE_USER="root")
+    for k in ("source", "target", "fstype"):
+        _drop(rig, k)
+    r = run(rig, FAKE_UUID="")
+    assert "RC=1" in r.stdout and "has no mount to compare" in r.stderr, r.stderr
+    assert "not on its recorded filesystem" not in r.stderr
+
+
+def test_root_reading_no_uuid_is_still_a_different_disk(rig):
+    run(rig, FAKE_EUID="0", FAKE_USER="root")
+    r = run(rig, FAKE_UUID="", FAKE_EUID="0", FAKE_USER="root")
+    assert "RC=1" in r.stdout, r.stderr
+    assert "not on its recorded filesystem" in r.stderr and "<none>" in r.stderr, r.stderr
+
+
+def test_a_readable_different_uuid_still_refuses_for_any_account(rig):
+    run(rig, FAKE_EUID="0", FAKE_USER="root")
+    r = run(rig, FAKE_UUID=UUID_B)
+    assert "RC=1" in r.stdout and "not on its recorded filesystem" in r.stderr, r.stderr
+
+
+def test_rerecord_after_an_unreadable_refusal_records_the_readable_mount(rig):
+    run(rig, FAKE_EUID="0", FAKE_USER="root")
+    r = run(rig, FAKE_UUID="", FAKE_SOURCE="/dev/sdb1", NOO_DATA_ROOT_RERECORD="1")
+    assert "RC=0" in r.stdout, r.stderr
+    assert "id_kind=mount" in record(rig) and "source=/dev/sdb1" in record(rig)
+
+
+def test_the_report_carries_the_note(rig):
+    run(rig, FAKE_EUID="0", FAKE_USER="root")
+    r = run(rig, fn="data_root_mount_report", FAKE_UUID="")
+    assert "RC=0" in r.stdout and "could not be read as rhowner" in r.stdout, r.stdout
+
+
+def test_a_record_written_by_0_6_23_passes_its_first_non_root_launch(rig):
+    # The upgrade path: the record format has not changed since the guard
+    # landed (2c59428e); an install upgraded from 0.6.23 has every field.
+    (rig["install"] / ".noo-data-root-id").write_text(
+        "# written by scripts/lib-data-root-mount.sh — the filesystem the data root lives on.\n"
+        "# launchers and hostd refuse to start the stack when it is not mounted here.\n"
+        f"data_root={rig['data']}\n"
+        "id_kind=uuid\n"
+        f"uuid={UUID_A}\n"
+        "source=/dev/nvme1n1p1\n"
+        f"target={rig['tmp'] / 'mnt' / 'extradrive1'}\n"
+        "fstype=ext4\n"
+        "recorded_at=2026-10-30T00:00:00Z\n"
+        "postgres_initialised=2026-10-30T00:00:00Z\n"
+    )
+    assert "RC=0" in run(rig).stdout
+    r = run(rig, FAKE_UUID="")
+    assert "RC=0" in r.stdout, r.stderr
