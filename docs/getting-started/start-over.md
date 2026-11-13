@@ -84,6 +84,12 @@ Teardown is a full cleanup, with or without a terminal:
   registers as `<name>-1`.
 - This box's own node keeps its record: its tailnet identity is the
   controller's.
+- A cluster set up without Tailscale has no device record to delete. The
+  summary's tailnet line then says `nothing to remove — this controller holds
+  no Tailscale credential, so it put no device on a tailnet`. A line that says
+  `NOT removed` means the controller has a Tailscale credential and the delete
+  failed: it names the cause, and you delete the record in the Tailscale admin
+  console.
 
 `--factory` is `--purge-data` plus `--purge-tailscale`. `--purge-tailscale`
 also removes the Tailscale package from the node (only if noomesh installed
