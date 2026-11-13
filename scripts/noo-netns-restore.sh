@@ -19,7 +19,8 @@
 # labelled noo.managed-by (the node agent's convergence owns those), whose
 # restart policy wants it running (always/unless-stopped), whose network mode
 # is container:<door>, and whose last start FAILED joining that namespace:
-# State.Error says "join network", in either docker's wording:
+# State.ExitCode is 128 (dockerd's code for a container it could not start),
+# or State.Error says "join network", in either docker's wording:
 #   Docker 27.x  "cannot join network of a non running container: <id>"
 #   Docker 28.x  "cannot join network namespace of a non running container: …"
 # (matching only "network namespace" skipped every joiner on Docker 27, the
@@ -47,14 +48,21 @@ until docker info >/dev/null 2>&1; do
 done
 rc=0
 for id in $(docker ps -aq --filter status=exited --filter status=created); do
-  meta="$(docker inspect -f '{{.Name}}|{{.HostConfig.NetworkMode}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "noo.managed-by"}}|{{.HostConfig.RestartPolicy.Name}}|{{.State.Error}}' "$id" 2>/dev/null)" || continue
-  IFS='|' read -r name mode proj mby policy err <<< "$meta"
+  meta="$(docker inspect -f '{{.Name}}|{{.HostConfig.NetworkMode}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "noo.managed-by"}}|{{.HostConfig.RestartPolicy.Name}}|{{.State.Error}}|{{.State.ExitCode}}' "$id" 2>/dev/null)" || continue
+  IFS='|' read -r name mode proj mby policy err code <<< "$meta"
   name="${name#/}"
   [ -n "$proj" ] || continue
   [ -z "$mby" ] || continue
   case "$policy" in always|unless-stopped) ;; *) continue ;; esac
   case "$mode" in container:*) door="${mode#container:}" ;; *) continue ;; esac
-  case "$err" in *"join network"*) ;; *) continue ;; esac
+  # The failed join: exit code 128 (dockerd's code for a container it could
+  # not start) OR an error naming the join. The code is the firm signal; the
+  # text is the fallback, so a third rewording cannot reopen this. A container
+  # stopped by hand exits 0/137/143 with no join error and stays stopped.
+  joinfail=""
+  [ "$code" = 128 ] && joinfail=1
+  case "$err" in *"join network"*) joinfail=1 ;; esac
+  [ -n "$joinfail" ] || continue
   dname="$(docker inspect -f '{{.Name}}' "$door" 2>/dev/null)"; dname="${dname#/}"; dname="${dname:-$door}"
   w=0
   until [ "$(docker inspect -f '{{.State.Running}}' "$door" 2>/dev/null)" = "true" ]; do
