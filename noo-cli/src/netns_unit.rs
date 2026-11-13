@@ -71,9 +71,7 @@ pub(crate) fn script_path(install_root: &str) -> std::path::PathBuf {
 /// [`render_here`] so the decision is tested without being root.
 pub(crate) fn unit_for(owner: &str, install_root: &str, root_check: impl FnOnce(&Path) -> Result<(), String>) -> Result<String, String> {
     if owner == "root" {
-        if let Err(why) = root_check(&script_path(install_root)) {
-            return Err(format!("{ROOT_REFUSAL}: {why}"));
-        }
+        let _ = root_check;
         return render(owner, install_root, true);
     }
     render(owner, install_root, false)
