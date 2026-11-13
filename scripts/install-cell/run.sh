@@ -5,7 +5,7 @@
 # One cell of .github/workflows/install-matrix.yml: what a stranger does
 # from the README on a machine we have never seen, timed step by step.
 #
-#   OUT=<dir> CELL=<name> RUNNER=<label> DOCKER=preinstalled|none \
+#   OUT=<dir> CELL=<name> RUNNER=<label> DOCKER=preinstalled|none|distro \
 #   ONBOARD=ci|interactive MODEL=default|tiny SCOPE=full|node-partial \
 #   CLI_TAG=latest|noo-cli-vX.Y.Z  scripts/install-cell/run.sh
 #
@@ -127,6 +127,34 @@ step box 120 -- sh -c 'uname -a; cat /etc/os-release 2>/dev/null | head -3; sw_v
   docker version --format "docker {{.Server.Version}}" 2>&1 | head -1; docker compose version 2>&1 | head -1'
 if [ "$DOCKER" = none ]; then
     hook prep-no-docker.sh || finish
+fi
+# DOCKER=distro: the engine a stranger gets from `apt install docker.io`, not
+# the runner image's docker-ce/moby. The two word a failed namespace join
+# differently (Docker 27 vs 28: noomesh#1128), and #1108's restore was only
+# ever proven on the image's engine. The image's engine packages are removed,
+# Ubuntu's own docker.io + docker-compose-v2 installed, and the step FAILs by
+# name unless the engine now running is the docker.io package's.
+if [ "$DOCKER" = distro ]; then
+    step distro-docker 900 -- sudo bash -c '
+      set -u
+      systemctl stop docker.socket docker.service containerd.service 2>/dev/null
+      engines="$(dpkg-query -W -f "\${Package}\n" "docker-ce*" "docker-buildx-plugin" "docker-compose-plugin" "containerd.io" "moby-*" 2>/dev/null | sort -u | tr "\n" " ")"
+      echo "image engine packages: ${engines:-none}"
+      [ -z "${engines// /}" ] || DEBIAN_FRONTEND=noninteractive apt-get remove -y -q $engines >/dev/null || { echo "could not remove the image engine"; exit 1; }
+      apt-get update -q >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get install -y -q docker.io docker-compose-v2 >/dev/null || { echo "apt could not install docker.io docker-compose-v2"; exit 1; }
+      systemctl enable --now docker.service >/dev/null 2>&1
+      usermod -aG docker "${SUDO_USER:-runner}" 2>/dev/null
+      t=0; until docker info >/dev/null 2>&1 || [ $t -ge 60 ]; do sleep 2; t=$((t+2)); done
+      pkg="$(dpkg-query -W -f "\${Version}" docker.io 2>/dev/null)"
+      echo "docker.io package: ${pkg:-NOT INSTALLED}"
+      docker version 2>&1 | sed -n "/^Server/,\$p" | head -8
+      docker compose version 2>&1 | head -1
+      left="$(dpkg-query -W -f "\${Package} \${Status}\n" "docker-ce" "moby-engine" 2>/dev/null | grep -c " installed$")"
+      srv="$(docker version --format "{{.Server.Version}}" 2>/dev/null)"
+      echo "engine: server ${srv:-none}, from docker.io ${pkg:-none}, image engines still installed: $left"
+      [ -n "$pkg" ] && [ -n "$srv" ] && [ "$left" = 0 ] || { echo "DISTRO-DOCKER FAIL: the engine running is not Ubuntu docker.io"; exit 1; }
+    ' || finish
+    meta docker_engine "$(docker version --format '{{.Server.Version}}' 2>/dev/null) (Ubuntu docker.io)"
 fi
 
 # ── 2. the install line, read from the README and run VERBATIM ──────────
