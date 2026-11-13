@@ -350,6 +350,39 @@ step first-answer 1800 -- sh -c '
   fi' || fail_onboarded
 meta first_answer_s "$(( $(date +%s) - CELL_START ))"
 
+# PROBE (fa, general 11-13): first-chat.md's "your own document" section runs
+# `noo rag ingest ~/notes/anything.md`, then `noo rag query "…"`, then
+# `noo chat --message "summarise what you know from anything.md"`. Whether the
+# CHAT line gets the document back (the chat path retrieving by itself, from
+# a question that names the file only by its name) is read here: a small doc
+# with one distinctive fact, ingested, then the index is waited for with the
+# page's own `noo rag query` shape (so a miss is not just the asynchronous
+# index), then the page's exact chat line. Read, never judged; never the
+# cell's failed step. The doc lines are taken from first-chat.md itself.
+RAG_DOC_PAGE="$HERE/../../docs/getting-started/first-chat.md"
+RAG_CHAT_LINE="$(sed -n 's/^noo chat --message "\(.*anything\.md.*\)"$/\1/p' "$RAG_DOC_PAGE" 2>/dev/null | head -n 1)"
+export RAG_CHAT_LINE
+step probe-rag-chat 900 -- sh -c '
+  [ -n "$RAG_CHAT_LINE" ] || { echo "RAG PROBE: first-chat.md has no chat line about anything.md"; exit 0; }
+  mkdir -p "$HOME/notes"
+  printf "%s\n" "# Project notes" "" "The delivery deadline for the Kestrel project is the 14th of March, and the project codeword is ZIRCON-4471." > "$HOME/notes/anything.md"
+  echo "== noo rag ingest ~/notes/anything.md"
+  noo rag ingest "$HOME/notes/anything.md" 2>&1 | tail -n 5
+  echo "== waiting for the index (the page'"'"'s noo rag query shape)"
+  t=0; indexed=no
+  while [ "$t" -lt 300 ]; do
+    if noo rag query "what does anything.md say about the deadline?" 2>&1 | grep -qiE "14(th)? (of )?march|ZIRCON-4471"; then indexed=yes; break; fi
+    sleep 10; t=$((t + 10))
+  done
+  echo "RAG PROBE: indexed (rag query returns the fact)=$indexed after ${t}s"
+  noo rag status 2>&1 | head -n 8
+  echo "== the page'"'"'s chat line: noo chat --message \"$RAG_CHAT_LINE\""
+  out="$(noo chat --message "$RAG_CHAT_LINE" 2>&1)"
+  printf "%s\n" "$out" | head -n 30
+  if printf "%s" "$out" | grep -qiE "14(th)? (of )?march|ZIRCON-4471|kestrel"; then got=yes; else got=no; fi
+  echo "RAG PROBE: the chat line returned the fact=$got (index ready=$indexed)"
+  true'
+
 # PROBE (fa, rc.1 rehearsal A-reboot.status, i677): a container that joins
 # another's network namespace (network_mode: service:<door>; noo-ollama-embed
 # joins noo-stunnel-ollama-embed) must be running after EVERY dockerd start.
