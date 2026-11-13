@@ -81,6 +81,20 @@ var (
 
 // loadKeepFile reads and validates the keep file. Any doubt is an error, and
 // an error skips the rung.
+// resolveKeepArg turns `keep=spool` into this hostd's own spool's keep file.
+// The controller's gateway sees the spool only through its container mount
+// (/var/run/noo-spool), so it cannot name the host path; the token lets it
+// say "the keep file beside the commands" without one. Anything else is
+// passed through for loadKeepFile to judge (absolute path to image-keep.json
+// only). With no spool known, the bare token stays and is refused as not
+// absolute, so the rung skips with the reason.
+func resolveKeepArg(v, spool string) string {
+	if v == "spool" && spool != "" {
+		return filepath.Join(spool, imageKeepBasename)
+	}
+	return v
+}
+
 func loadKeepFile(path string, now time.Time, readFile func(string) ([]byte, error)) (*keepFile, error) {
 	if !filepath.IsAbs(path) || filepath.Base(path) != imageKeepBasename {
 		return nil, fmt.Errorf("keep file %q is not an absolute path to %s", path, imageKeepBasename)

@@ -211,3 +211,16 @@ func TestNoKeepFileRemovesNothingAndSaysWhy(t *testing.T) {
 		t.Errorf("only=superseded-images without keep= succeeded: %+v", r)
 	}
 }
+
+func TestKeepSpoolTokenResolvesToThisHostdsSpool(t *testing.T) {
+	if got := resolveKeepArg("spool", "/srv/noo/.noo-host-spool"); got != "/srv/noo/.noo-host-spool/image-keep.json" {
+		t.Fatalf("keep=spool must name the keep file in this hostd's spool, got %q", got)
+	}
+	if got := resolveKeepArg("/x/image-keep.json", "/srv/noo/.noo-host-spool"); got != "/x/image-keep.json" {
+		t.Fatalf("an explicit path must pass through, got %q", got)
+	}
+	got := resolveKeepArg("spool", "")
+	if _, err := loadKeepFile(got, time.Now(), func(string) ([]byte, error) { return []byte("{}"), nil }); err == nil {
+		t.Fatalf("with no spool known the token must be refused, not read (%q)", got)
+	}
+}

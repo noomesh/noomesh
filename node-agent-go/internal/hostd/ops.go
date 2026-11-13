@@ -610,7 +610,7 @@ func opDiskReclaim(ctx context.Context, e *Engine, _ string, c *Command) (int, s
 		case strings.HasPrefix(a, "keep="):
 			// Rung 5's keep file; loadKeepFile refuses anything but an
 			// absolute path to image-keep.json.
-			keepPath = strings.TrimPrefix(a, "keep=")
+			keepPath = resolveKeepArg(strings.TrimPrefix(a, "keep="), e.Spool)
 		case a == "only=superseded-images":
 			// The post-roll step: rung 5 alone, whatever the watermark.
 			onlySuperseded = true
