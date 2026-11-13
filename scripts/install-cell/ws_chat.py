@@ -9,8 +9,8 @@ python3 and nothing else.
 
 usage: ws_chat.py PROMPT [GATEWAY_URL]   (default https://localhost:8080)
 
-TLS is verified against the cluster CA in $NOO_PKI_DIR (default
-~/.config/mesh/pki/ca.crt), as the add-on README's curl does.
+TLS is verified against the cluster CA, found where the CLI looks for it
+(cluster_ca_candidates).
 """
 
 from __future__ import annotations
@@ -25,6 +25,38 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+
+
+def env_file_value(path: str, key: str) -> str:
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                if line.startswith(key + "="):
+                    return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return ""
+
+
+def cluster_ca_candidates(env: dict, home: str) -> list[str]:
+    """Where the cluster CA can be, in the CLI's order (noo-cli http.rs:
+    $NOO_TLS_CA, then $NOO_PKI_DIR or ~/.config/mesh/pki, then /etc/noo/pki on
+    a node), plus the NOO_TLS_CA that `noo onboard` writes into the install's
+    .env, which is not in a fresh shell's environment (rc.6 matrix run
+    43498209668: ~/.config/mesh/pki/ca.crt did not exist on any cell)."""
+    pki = env.get("NOO_PKI_DIR") or os.path.join(env.get("XDG_CONFIG_HOME") or os.path.join(home, ".config"), "mesh", "pki")
+    out = [env.get("NOO_TLS_CA", ""), os.path.join(pki, "ca.crt"),
+           env_file_value(os.path.join(home, ".noo", ".env"), "NOO_TLS_CA"),
+           "/etc/noo/pki/ca.crt"]
+    return [c for i, c in enumerate(out) if c and c not in out[:i]]
+
+
+def cluster_ca() -> str:
+    tried = cluster_ca_candidates(dict(os.environ), os.path.expanduser("~"))
+    for c in tried:
+        if os.access(c, os.R_OK):
+            return c
+    raise FileNotFoundError("no readable cluster CA; tried " + ", ".join(tried))
 
 
 def token() -> str:
@@ -73,11 +105,7 @@ def read_frame(s) -> tuple[int, bytes]:
 
 
 def ask(prompt: str, base: str = "https://localhost:8080", timeout: float = 300) -> str:
-    # The cluster's own CA, where `noo onboard` puts it (the example add-on's
-    # README uses the same file with curl).
-    pki = os.environ.get("NOO_PKI_DIR") or os.path.join(
-        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "mesh", "pki")
-    ctx = ssl.create_default_context(cafile=os.path.join(pki, "ca.crt"))
+    ctx = ssl.create_default_context(cafile=cluster_ca())
     ticket = mint_ticket(base, token(), ctx)
     u = urllib.parse.urlsplit(base)
     raw = socket.create_connection((u.hostname, u.port or 443), timeout=30)
