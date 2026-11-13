@@ -139,7 +139,7 @@ pub(crate) fn outbound_only(n: &Value) -> Option<&'static str> {
         return None;
     }
     let t = &n["control_transports"];
-    match (t["nats_rpc"].as_bool() == Some(true), t["tunnel"].as_bool() == Some(true)) {
+    match (t["tunnel"].as_bool() == Some(true), t["nats_rpc"].as_bool() == Some(true)) {
         (true, true) => Some("its bus and its tunnel"),
         (true, false) => Some("its bus"),
         (false, true) => Some("its tunnel"),
