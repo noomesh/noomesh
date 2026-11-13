@@ -1031,3 +1031,5 @@ mod no_live_tunnel_tests {
         assert_eq!((late["checked"].as_bool(), late["ok"].as_bool(), late["reason"].as_str()), (Some(true), Some(false), Some("no_live_tunnel")));
     }
 }
+
+// hosted compile probe (MUTANT 0): no behaviour change

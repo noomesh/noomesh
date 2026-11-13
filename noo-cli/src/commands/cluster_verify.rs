@@ -14212,3 +14212,5 @@ mod netns_restore_row_tests {
         assert!(run.contains("checks.push(netns_restore_row_here(&crate::envfile::repo_root()));"), "{run}");
     }
 }
+
+// hosted compile probe (MUTANT 0): no behaviour change
