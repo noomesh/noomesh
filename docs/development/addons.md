@@ -1123,10 +1123,9 @@ There are three ways through, and the refusal names them:
    noo addons enable example-addon --lock ./addon-bundle.json   # a lock signed for the new stack
    ```
 
-   The 0.6.24 release rehearsal proved this for the add-on itself: re-enabled
-   and declared on after the roll. Its node workloads are not yet proven to come
-   back placed through this path; check them with
-   `noo cluster workloads show <node>` and place them again if they are not.
+   The 0.6.24 release rehearsal proved this end to end: the add-on re-enabled
+   and declared on after the roll, and its placed node workload still listed on
+   its node. `noo cluster workloads show <node>` shows them.
 3. **Roll to an older stack** your lock supports: `noo upgrade --stack --tag
    <vX.Y.Z>` (add `--allow-downgrade` to take the add-on back with it).
 
