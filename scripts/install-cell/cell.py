@@ -184,7 +184,7 @@ def summarize(d: Path) -> dict:
     steps = [json.loads(l) for l in (d / "steps.jsonl").read_text().splitlines() if l.strip()] \
         if (d / "steps.jsonl").exists() else []
     meta = json.loads((d / "meta.json").read_text()) if (d / "meta.json").exists() else {}
-    failed = next((s for s in steps if s["rc"] != 0 and not s["step"].startswith(("leftover", "probe-"))
+    failed = next((s for s in steps if s["rc"] != 0 and not s["step"].startswith(("leftover", "probe-", "agent-state-after-"))
                    and s["step"] != "verify"), None)
     probes = [s for s in steps if s["step"].startswith("probe-")]
     verify = next((s for s in steps if s["step"] == "verify"), None)

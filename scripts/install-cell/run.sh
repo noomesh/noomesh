@@ -72,6 +72,41 @@ hook() {  # a mode's steps written by another owner (see the workflow)
     "$f"
 }
 
+# DIAGNOSTIC (fa, rc.3 matrix run 2: the WSL2 cell placed a model and its
+# node read "no lanes" two minutes later, with no agent log to say why): on
+# EVERY failed step or probe, the node agent's status and its last 200 log
+# lines, as a step of its own, so the same redactor and upload scan apply.
+# systemd hosts: systemctl status + journalctl. Without systemd: the agent
+# process (if any), launchd's view on macOS and the log file the plist names.
+# Never the env file (it holds the agent's token). At most 5 dumps per cell.
+AGENT_DUMPS=0
+agent_dump() {
+    [ "$AGENT_DUMPS" -lt 5 ] || return 0
+    AGENT_DUMPS=$((AGENT_DUMPS + 1))
+    step "agent-state-after-$1" 120 -- sh -c '
+      if command -v systemctl >/dev/null 2>&1 && [ -d "${CELL_SYSTEMD_DIR:-/run/systemd/system}" ]; then
+        echo "== systemctl status noo-node-agent"; sudo -n systemctl status noo-node-agent --no-pager -l 2>&1 | head -40
+        echo "== journalctl -u noo-node-agent (last 200)"; sudo -n journalctl -u noo-node-agent --no-pager -n 200 2>&1
+      else
+        echo "== no systemd on this host: the agent process"
+        ps -eo pid,etime,args 2>/dev/null | grep -E "[n]oo-node-agent|[n]oomesh-agent" || echo "(no noo-node-agent process)"
+        if command -v launchctl >/dev/null 2>&1; then
+          echo "== launchctl list (noo*)"; launchctl list 2>/dev/null | grep -i noo || echo "(no noo launchd job)"
+        fi
+        for f in /tmp/noomesh-agent.log /var/log/noo-node-agent.log; do
+          [ -f "$f" ] && { echo "== $f (last 200)"; tail -n 200 "$f"; }
+        done
+      fi
+      true'
+    return 0
+}
+ON_STEP_FAIL=agent_dump
+# The mode hooks (prep-no-docker.sh, onboard-interactive.sh) are child bash
+# processes that source lib.sh: they inherit the hook this way. Their dump
+# count starts at 0 again, so a hook adds at most 5 of its own.
+export ON_STEP_FAIL AGENT_DUMPS
+export -f agent_dump
+
 # ── 1. the box ──────────────────────────────────────────────────────────
 step box 120 -- sh -c 'uname -a; cat /etc/os-release 2>/dev/null | head -3; sw_vers 2>/dev/null;
   nproc 2>/dev/null || sysctl -n hw.ncpu; free -m 2>/dev/null || sysctl -n hw.memsize; df -h /;
