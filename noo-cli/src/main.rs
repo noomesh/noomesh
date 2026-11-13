@@ -68,6 +68,7 @@ mod harness_profiles;
 mod model_set;
 mod registry;
 mod release_fetch;
+mod netns_unit;
 mod release_sig;
 mod envfile;
 #[cfg(test)]

@@ -1340,6 +1340,9 @@ fn run_all(ctx: &mut Ctx) {
         // The at-rest decision from the storage step, now that there is a
         // gateway to record it in.
         steps::at_rest_record(ctx);
+        // Containers that join another's network namespace come back after
+        // every dockerd start, not only when dockerd starts them in order.
+        steps::install_netns_restore_unit(ctx);
     }
     ctx.pause(7, TOTAL);
 
