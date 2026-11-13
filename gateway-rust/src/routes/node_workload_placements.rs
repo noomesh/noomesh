@@ -99,6 +99,12 @@ fn node_arch(node: &Value) -> Option<&str> {
 /// declaration verbatim, the rail image, sets, env, profile, the door that
 /// admits exactly `node_id`'s agent, `start_secs` and `drain` as declared,
 /// and the row's reservation and state. Validated by the caller.
+///
+/// `profile` is optional and NOT nullable (only `reservation` is): with no
+/// profile the key is left out. Writing `"profile": null` made every
+/// placement of a workload without a load profile fail the entry's own null
+/// walk, "field_type: /profile is null, which is allowed only at
+/// [\"/reservation\"]" (0.6.23 and rc.3 rehearsal, BASE.SEED.nodewl.place).
 #[allow(clippy::too_many_arguments)]
 pub fn build_entry(
     addon: &str,
@@ -112,20 +118,23 @@ pub fn build_entry(
     reservation: Option<&str>,
     state: &str,
 ) -> Value {
-    json!({
+    let mut entry = json!({
         "addon": addon,
         "name": decl.name,
         "decl": decl_raw,
         "image": {"name": image.image, "digest": image.digest, "id": image.id, "artifact": image.artifact},
         "sets": sets,
         "env": env,
-        "profile": profile,
         "door": {"leaf": format!("svc-addon-{addon}-{}", decl.name), "admit": [node_id]},
         "start_secs": decl_raw.pointer("/health/start_secs").cloned().unwrap_or(Value::Null),
         "drain": decl_raw.get("drain").cloned().unwrap_or(Value::Null),
         "reservation": reservation,
         "state": state,
-    })
+    });
+    if let Some(p) = profile {
+        entry["profile"] = Value::String(p.to_string());
+    }
+    entry
 }
 
 /// What desired-config says about a node's workloads.
@@ -490,6 +499,26 @@ mod tests {
 
     fn fake() -> Fake {
         Fake { main: Some(main_set()), missing_set: None }
+    }
+
+    /// rc.3 rehearsal BASE.SEED.nodewl.place: a workload placed with no
+    /// load profile was refused by its own entry ("/profile is null").
+    #[test]
+    fn an_entry_without_a_profile_leaves_the_key_out_and_validates() {
+        let (d, raw) = decl();
+        let img = crate::node_workload_sources::RailImage {
+            image: "addon-worker".into(),
+            digest: format!("sha256:{DIGEST_HEX}"),
+            id: format!("sha256:{DIGEST_HEX}"),
+            artifact: "addon-worker.tar".into(),
+            arch: "amd64".into(),
+        };
+        let f = fixture_entry();
+        let e = build_entry("rhaddon", &d, &raw, "node-a", &img, &f["sets"], &f["env"], None, None, "running");
+        assert!(e.get("profile").is_none(), "{e}");
+        crate::node_workloads::validate_desired_entry(&e, "node-a").expect("a profile-less entry is valid");
+        let e = build_entry("rhaddon", &d, &raw, "node-a", &img, &f["sets"], &f["env"], Some("int8"), None, "running");
+        assert_eq!(e["profile"], json!("int8"));
     }
 
     #[test]
