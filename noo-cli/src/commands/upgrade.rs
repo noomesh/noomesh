@@ -1754,6 +1754,12 @@ fn refresh_deploy_slice(g: &Globals, roll: &Roll) {
 fn move_pin(g: &Globals, roll: &Roll, target_stack_lock: Option<&str>, addon_prep: &[crate::addons::Prepared]) {
     let root = &roll.root;
     let tag = &roll.tag;
+    // Image retention: across a tag change, the outgoing locks stay as
+    // `.prev` so the previous release's images are kept for a rollback.
+    if roll.prev.trim() != tag.as_str() {
+        crate::commands::image_retention::keep_previous_file(&root.join(crate::commands::image_retention::STACK_LOCK));
+        crate::commands::image_retention::keep_previous_file(&crate::addons::pins::pins_path(root));
+    }
     write_stack_lock(g, tag, root, target_stack_lock);
     commit_addon_pins(g, root, tag, addon_prep);
     if let Err(e) = crate::onboard::standalone::upsert_env(root, "NOO_IMAGE_TAG", tag) {
@@ -1875,6 +1881,9 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
                 ui::guide(&[("noo cluster verify --wait",
                     "checks the stack, every node and the PKI once the rolled services settle")]);
             }
+            // Image retention: after a verified roll, the superseded images
+            // that are provably ours go (the first roll only previews).
+            crate::commands::image_retention::post_roll(g, root, tag);
             // A roll recreates the gateway; the tailnet front door in front
             // of it is written by onboard and promote and by nothing else, so
             // a controller that lost it stays lost while every line above
