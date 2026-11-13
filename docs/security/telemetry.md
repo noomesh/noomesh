@@ -521,7 +521,11 @@ runs, so an idle install asks no resolver anything
 
 A node agent on a host without `nvidia-smi` still looks up `nvidia-exporter`
 once when it starts, to check for a GPU exporter beside it, and never again
-while it runs.
+while it runs. The agent is a host service, so the lookup uses the host's own
+DNS settings: with a search domain (one your router hands out, or your
+tailnet's), the host's resolver is asked for `nvidia-exporter.<search
+domain>` (A and AAAA), once per agent start. Only the question leaves; no
+connection follows.
 
 These are out of scope here:
 
