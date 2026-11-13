@@ -350,37 +350,48 @@ step first-answer 1800 -- sh -c '
   fi' || fail_onboarded
 meta first_answer_s "$(( $(date +%s) - CELL_START ))"
 
-# PROBE (fa, general 11-13): first-chat.md's "your own document" section runs
-# `noo rag ingest ~/notes/anything.md`, then `noo rag query "…"`, then
-# `noo chat --message "summarise what you know from anything.md"`. Whether the
-# CHAT line gets the document back (the chat path retrieving by itself, from
-# a question that names the file only by its name) is read here: a small doc
-# with one distinctive fact, ingested, then the index is waited for with the
-# page's own `noo rag query` shape (so a miss is not just the asynchronous
-# index), then the page's exact chat line. Read, never judged; never the
-# cell's failed step. The doc lines are taken from first-chat.md itself.
+# PROBE (fa, general 11-13): where does a chat get an ingested document back?
+# first-chat.md ingests ~/notes/anything.md and proves it with `noo rag query`
+# (that line is read from the page). The same question is then asked on the
+# three chat paths a person can reach with no more setup: `noo chat` (POST
+# /api/inference/stream), `noo inference agent` (POST /api/agent/run, what the
+# MCP tool noo_agentic_inference calls) and the console's chat (/ws/coordinator,
+# via ws_chat.py with the CLI's stored login). rc.6 (run 43487245793): the
+# query returned the fact, `noo chat` did not. If the page shows a chat line
+# about anything.md again, that line is the one asked. Read, never judged;
+# never the cell's failed step.
 RAG_DOC_PAGE="$HERE/../../docs/getting-started/first-chat.md"
+RAG_QUERY_LINE="$(sed -n 's/^noo rag query "\(.*anything\.md.*\)"$/\1/p' "$RAG_DOC_PAGE" 2>/dev/null | head -n 1)"
 RAG_CHAT_LINE="$(sed -n 's/^noo chat --message "\(.*anything\.md.*\)"$/\1/p' "$RAG_DOC_PAGE" 2>/dev/null | head -n 1)"
-export RAG_CHAT_LINE
-step probe-rag-chat 900 -- sh -c '
-  [ -n "$RAG_CHAT_LINE" ] || { echo "RAG PROBE: first-chat.md has no chat line about anything.md"; exit 0; }
+RAG_CHAT_LINE="${RAG_CHAT_LINE:-summarise what you know from anything.md}"
+RAG_WS_CHAT="$HERE/ws_chat.py"
+export RAG_QUERY_LINE RAG_CHAT_LINE RAG_WS_CHAT
+step probe-rag-chat 1500 -- sh -c '
+  [ -n "$RAG_QUERY_LINE" ] || { echo "RAG PROBE: first-chat.md has no noo rag query line about anything.md"; exit 0; }
+  fact="14(th)? (of )?march|ZIRCON-4471|kestrel"
   mkdir -p "$HOME/notes"
   printf "%s\n" "# Project notes" "" "The delivery deadline for the Kestrel project is the 14th of March, and the project codeword is ZIRCON-4471." > "$HOME/notes/anything.md"
   echo "== noo rag ingest ~/notes/anything.md"
   noo rag ingest "$HOME/notes/anything.md" 2>&1 | tail -n 5
-  echo "== waiting for the index (the page'"'"'s noo rag query shape)"
+  echo "== waiting for the index (the page'"'"'s noo rag query line)"
   t=0; indexed=no
   while [ "$t" -lt 300 ]; do
-    if noo rag query "what does anything.md say about the deadline?" 2>&1 | grep -qiE "14(th)? (of )?march|ZIRCON-4471"; then indexed=yes; break; fi
+    if noo rag query "$RAG_QUERY_LINE" 2>&1 | grep -qiE "$fact"; then indexed=yes; break; fi
     sleep 10; t=$((t + 10))
   done
   echo "RAG PROBE: indexed (rag query returns the fact)=$indexed after ${t}s"
   noo rag status 2>&1 | head -n 8
-  echo "== the page'"'"'s chat line: noo chat --message \"$RAG_CHAT_LINE\""
-  out="$(noo chat --message "$RAG_CHAT_LINE" 2>&1)"
-  printf "%s\n" "$out" | head -n 30
-  if printf "%s" "$out" | grep -qiE "14(th)? (of )?march|ZIRCON-4471|kestrel"; then got=yes; else got=no; fi
-  echo "RAG PROBE: the chat line returned the fact=$got (index ready=$indexed)"
+  for path in chat agent console; do
+    echo "== $path: \"$RAG_CHAT_LINE\""
+    case "$path" in
+      chat) out="$(noo chat --message "$RAG_CHAT_LINE" 2>&1)" ;;
+      agent) out="$(timeout 300 noo inference agent "$RAG_CHAT_LINE" 2>&1)" ;;
+      console) out="$(timeout 330 python3 -I "$RAG_WS_CHAT" "$RAG_CHAT_LINE" 2>&1)" ;;
+    esac
+    printf "%s\n" "$out" | head -n 30
+    if printf "%s" "$out" | grep -qiE "$fact"; then got=yes; else got=no; fi
+    echo "RAG PROBE: $path returned the fact=$got (index ready=$indexed)"
+  done
   true'
 
 # PROBE (fa, rc.1 rehearsal A-reboot.status, i677): a container that joins

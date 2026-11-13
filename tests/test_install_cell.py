@@ -465,29 +465,55 @@ def test_the_restart_probe_runs_20_only_on_the_22_04_cell_and_offboard_checks_wi
     assert "\n  docker ps -q --filter name=noo-gateway" not in off
 
 
-def test_the_rag_probe_runs_the_first_chat_pages_own_lines_and_is_never_judged():
-    # general 11-13: does first-chat.md's `noo chat --message "...anything.md"`
-    # bring the ingested fact back? The probe reads the line from the page (so a
-    # page edit is what gets probed), waits for the index with the page's query
-    # shape first, and only prints yes/no.
+def test_the_rag_probe_asks_the_pages_query_then_three_chat_paths_and_is_never_judged():
+    # general 11-13: rc.6 run 43487245793 showed `noo chat` does not return an
+    # ingested document while `noo rag query` does; the page now proves the doc
+    # with the query only. The probe reads that query line from the page and
+    # asks the same question on noo chat, noo inference agent (/api/agent/run,
+    # the MCP noo_agentic_inference route) and the console socket.
     text = (ROOT / "scripts/install-cell/run.sh").read_text()
-    m = text[text.index('RAG_CHAT_LINE="$(sed -n '):]
-    m = m[:m.index("\n")]
     page = ROOT / "docs/getting-started/first-chat.md"
+    lines = text[text.index('RAG_QUERY_LINE="$(sed -n '):]
+    lines = lines[:lines.index("\nexport RAG_QUERY_LINE")]
     got = subprocess.run(
-        ["bash", "-c", m.replace('"$RAG_DOC_PAGE"', f"'{page}'") + '\nprintf "%s" "$RAG_CHAT_LINE"'],
+        ["bash", "-c", lines.replace('"$RAG_DOC_PAGE"', f"'{page}'") + '\nprintf "%s|%s" "$RAG_QUERY_LINE" "$RAG_CHAT_LINE"'],
         capture_output=True, text=True, check=True).stdout
-    assert got and "anything.md" in got and f'noo chat --message "{got}"' in page.read_text()
-    probe = text[text.index("step probe-rag-chat 900"):]
+    query, chat = got.split("|")
+    assert "anything.md" in query and f'noo rag query "{query}"' in page.read_text()
+    assert "noo chat --message" not in page.read_text().split("your own document")[1].split("## ")[0], \
+        "the page proves the document with noo rag query, not noo chat"
+    assert chat == "summarise what you know from anything.md"
+    probe = text[text.index("step probe-rag-chat 1500"):]
     probe = probe[:probe.index("\n  true'")]
     ingest = probe.index('\n  noo rag ingest "$HOME/notes/anything.md" 2>&1')
-    query = probe.index('if noo rag query "what does anything.md say about the deadline?" 2>&1 | grep -qiE "14(th)? (of )?march|ZIRCON-4471"; then indexed=yes')
-    chat = probe.index('out="$(noo chat --message "$RAG_CHAT_LINE" 2>&1)"')
-    assert ingest < query < chat
-    assert 'printf "%s" "$out" | grep -qiE "14(th)? (of )?march|ZIRCON-4471|kestrel"; then got=yes' in probe
-    assert "RAG PROBE: the chat line returned the fact=$got" in probe and "exit 1" not in probe
+    wait = probe.index('if noo rag query "$RAG_QUERY_LINE" 2>&1 | grep -qiE "$fact"; then indexed=yes')
+    ask = probe.index("for path in chat agent console; do")
+    assert ingest < wait < ask
+    assert 'chat) out="$(noo chat --message "$RAG_CHAT_LINE" 2>&1)"' in probe
+    assert 'agent) out="$(timeout 300 noo inference agent "$RAG_CHAT_LINE" 2>&1)"' in probe
+    assert 'console) out="$(timeout 330 python3 -I "$RAG_WS_CHAT" "$RAG_CHAT_LINE" 2>&1)"' in probe
+    assert 'fact="14(th)? (of )?march|ZIRCON-4471|kestrel"' in probe
+    assert 'if printf "%s" "$out" | grep -qiE "$fact"; then got=yes' in probe
+    assert "RAG PROBE: $path returned the fact=$got" in probe and "exit 1" not in probe
     wf = (ROOT / ".github/workflows/install-matrix.yml").read_text()
     assert wf.count("docs/getting-started/first-chat.md") >= 2, "both jobs check the page out"
+
+
+def test_the_console_chat_client_frames_and_reads_what_the_gateway_sends():
+    ws = _load("ws_chat", ROOT / "scripts/install-cell/ws_chat.py")
+    import socket
+    a, b = socket.socketpair()
+    try:
+        a.sendall(ws.frame('{"prompt": "' + "x" * 300 + '"}'))
+        raw = b.recv(1024)
+        assert raw[0] == 0x81 and raw[1] == 0x80 | 126, "a masked text frame, 16-bit length"
+        n = int.from_bytes(raw[2:4], "big"); mask = raw[4:8]
+        body = bytes(c ^ mask[k % 4] for k, c in enumerate(raw[8:8 + n]))
+        assert json.loads(body)["prompt"] == "x" * 300
+        b.sendall(b"\x81" + bytes([5]) + b"hello")
+        assert ws.read_frame(a) == (1, b"hello")
+    finally:
+        a.close(); b.close()
 
 def test_the_offboard_probe_is_skipped_by_name_on_a_root_cell():
     # rc.5 matrix run 1, WSL2 (root): root reaches docker by uid, so "a shell

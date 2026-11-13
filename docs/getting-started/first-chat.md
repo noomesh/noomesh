@@ -55,11 +55,12 @@ about it:
 noo rag ingest ~/notes/anything.md
 noo rag status
 noo rag query "what does anything.md say about the deadline?"
-noo chat --message "summarise what you know from anything.md"
 ```
 
 `noo rag status` shows the document and page counts; `noo rag query` answers
-with citations, so you can see which pages it used. More verbs (`docs`,
+with citations, so you can see which pages it used. Ask about your documents
+with `noo rag query`, not `noo chat`: `noo chat` sends your message straight
+to the chat model, which does not search the knowledge base. More verbs (`docs`,
 `scan`, watched folders) are in
 [memory-and-knowledge.md](../cli/memory-and-knowledge.md).
 
