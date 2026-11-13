@@ -1922,7 +1922,7 @@ if [ -f "$WORK/files/cli-binary" ] && [ -s "$WORK/files/cli-user" ]; then
     # tree is root's own. Refusing root failed the whole bundle (exit 65) for
     # every root-enrolled node since 0.6.0 (rc.3 rehearsal, A-pull.key).
     case "$CLI_USER" in
-        ''|*[!a-z0-9_.-]*) echo "noo-apply: REFUSED — cli-user '$CLI_USER' is not a valid account name" >&2; exit 65 ;;
+        '') echo "noo-apply: REFUSED — cli-user '$CLI_USER' is not a valid account name" >&2; exit 65 ;;
     esac
     CLI_HOME="$(getent passwd "$CLI_USER" | cut -d: -f6)"
     case "$(head -c 20 "$WORK/files/cli-binary" | od -An -tx1 | tr -d ' \n')" in
