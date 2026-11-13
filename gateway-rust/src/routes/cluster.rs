@@ -6039,9 +6039,6 @@ async fn delete_tailscale_device(
     // No credential at all: this controller never enrolled a device on a
     // tailnet, so there is nothing to remove. A credential that is present
     // but fails stays an error below (NOT removed, with its cause).
-    if !tailscale_credential_present() {
-        return Ok(Json(no_tailscale_credential_answer(&ip, &hostname)));
-    }
 
     let bearer = tailscale_bearer().await.map_err(AppError::Internal)?;
     let client = crate::tls::external_client();
