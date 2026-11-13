@@ -198,3 +198,21 @@ func TestAFailedRunSurfacesOnThePollNotTheNextCheck(t *testing.T) {
 		t.Fatalf("ResultPoll %v must be well under Interval %v", ResultPoll, Interval)
 	}
 }
+
+func TestArgsWithKeepPassesTheKeepFileOnlyWhenItExists(t *testing.T) {
+	dir := t.TempDir()
+	p := &Policy{}
+	for _, a := range ArgsWithKeep(p, dir) {
+		if strings.HasPrefix(a, "keep=") {
+			t.Fatalf("no keep file, no keep= arg: %v", a)
+		}
+	}
+	keep := filepath.Join(dir, "image-keep.json")
+	if err := os.WriteFile(keep, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := ArgsWithKeep(p, dir)
+	if got[len(got)-1] != "keep="+keep {
+		t.Fatalf("keep file present: want keep=%s last, got %v", keep, got)
+	}
+}
