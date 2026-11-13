@@ -2735,7 +2735,7 @@ fn reconcile_netns_unit(g: &Globals, root: &std::path::Path) {
     if !systemd {
         return;
     }
-    let unit = match nu::render(&nu::owner(), &root.display().to_string()) {
+    let unit = match nu::render_here(&root.display().to_string()) {
         Ok(u) => u,
         Err(e) => {
             if !g.json { ui::warned(&format!("{} not installed: {e}", nu::UNIT_NAME)); }
