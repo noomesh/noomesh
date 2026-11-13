@@ -1,14 +1,27 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026 PersonifAI LLC
 
+# THE Prometheus config: the prometheus service bind-mounts this file at
+# /etc/prometheus/prometheus.yml (docker-compose.cluster.yml), and there is no
+# other copy. Until 0.6.24 a second, inline copy lived in the compose file's
+# `configs: prometheus_config`, and THAT was the one Prometheus loaded; this
+# file was a "reference". #1040 (i669) fixed the node-agent job here only, its
+# guard read this file too, and the loaded copy kept scraping `node-agent:8081`
+# and `nvidia-exporter:9400` on installs where neither exists. Docker's DNS
+# cannot answer a name with no container behind it, so every 15 s Prometheus
+# asked the host's own resolver for `node-agent.<search domain>` and
+# `nvidia-exporter.<search domain>` (rehearsal 0.6.24-rc.3, idle window).
+# tests/test_prometheus_static_targets_exist.py now reads what the service
+# mounts, through `docker compose config`, and fails on a second copy.
+#
+# Rule for every job: a target is either an always-on service of the default
+# (controller) profile, or it is discovered, so a service that is not running
+# is never a name Prometheus looks up.
+
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
-  external_labels:
-    cluster: 'noomesh'
-    environment: 'production'
 
-# Alerting configuration
 alerting:
   alertmanagers:
     - scheme: https
@@ -20,27 +33,28 @@ alerting:
       static_configs:
         - targets: ['alertmanager:9093']
 
-# Load rules once and periodically evaluate them
 rule_files:
-  - "/etc/prometheus/alerts/*.yml"
+  - /etc/prometheus/alerts/*.yml
 
-# NOTE: The inline prometheus_config in docker-compose.cluster.yml is the
-# primary config used in production.  This file is kept as a reference and
-# for standalone/external Prometheus deployments.
+# Every job below scrapes with services/prometheus/service.{crt,key}
+# (CN=prometheus, O="Mesh Cluster Service"). Four of them used to present
+# gateway/gateway.{crt,key}, which is the controller's identity; the
+# node-agent job in particular meant the scraper could command any node it
+# could reach. The service leaf opens GET /metrics and nothing else
+# (node-agent-go/internal/auth/principal.go MetricsReader), and gateway.key is
+# not mounted into this container at all.
 #
-# an earlier change: every job scrapes with services/prometheus/service.{crt,key}
-# (CN=prometheus, O="Mesh Cluster Service"). It must never be changed back to
-# gateway/gateway.{crt,key}: that leaf is what a node agent reads as "this
-# caller is the controller", and handing it to the scraper makes Prometheus
-# able to /start, /stop, /clean and /pull on every node it can reach. The
-# service leaf reaches GET /metrics and nothing else. Issue it with
+# No job sends a bearer. The gateway and node-agent jobs used to send
+# `${NOO_NODE_AGENT_TOKEN}`, which Prometheus does not expand: the literal
+# string arrived, the node agent refused it, and the gateway ignored it
+# because /metrics was public. Both now authenticate this leaf itself and
+# nothing else: the gateway admits it on GET /metrics only, the node agent on
+# /metrics only.
+#
+# Rotation: `noo security pki rotate-all` re-issues this leaf in place with
+# every other; existing installs mint it once with
 # `noo security pki issue-service prometheus`.
-#
-# No job sends a bearer: the leaf IS the credential. The
-# gateway admits it on GET /metrics only; the node agent on /metrics only.
-
 scrape_configs:
-  # Prometheus itself
   - job_name: 'prometheus'
     scheme: https
     tls_config:
@@ -51,7 +65,6 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:9090']
 
-  # PAI Gateway
   - job_name: 'gateway'
     scheme: https
     tls_config:
@@ -62,7 +75,6 @@ scrape_configs:
     static_configs:
       - targets: ['gateway:8080']
 
-  # Node exporter (system metrics)
   - job_name: 'node'
     scheme: https
     tls_config:
@@ -73,7 +85,15 @@ scrape_configs:
     static_configs:
       - targets: ['node-exporter:9100']
 
-  # NVIDIA GPU exporter
+  # The controller's GPU exporter. Not a static target: the exporter runs only
+  # where the host has an NVIDIA container runtime (the launchers
+  # `--scale nvidia-exporter=0` without one, and onboard leaves it out:
+  # noo-cli/src/onboard/sh.rs GPU_ONLY_SERVICES), so on a CPU-only controller
+  # the name has no container behind it. The exporter announces itself: once
+  # it is serving it writes nvidia-exporter.json into the shared tmpfs volume
+  # `prometheus-sd`, and removes it when it stops; the volume is empty when
+  # no exporter has run. No file, no target, no lookup. The glob matches
+  # nothing (and logs nothing) on a CPU-only controller.
   - job_name: 'nvidia_gpu'
     scheme: https
     tls_config:
@@ -81,8 +101,9 @@ scrape_configs:
       cert_file: /app/pki/services/prometheus/service.crt
       key_file: /app/pki/services/prometheus/service.key
       insecure_skip_verify: false
-    static_configs:
-      - targets: ['nvidia-exporter:9400']
+    file_sd_configs:
+      - files: ['/etc/prometheus/sd/*.json']
+        refresh_interval: 30s
 
   # The node agents (i669). Not a static target: `node-agent:8081` named a
   # compose service that exists only under the node-agent-compose profile, so
