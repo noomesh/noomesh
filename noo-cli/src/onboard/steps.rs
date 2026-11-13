@@ -8195,6 +8195,12 @@ pub fn install_after_boot_unit(ctx: &mut Ctx) {
     let name = Command::new("id").arg("-un").output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
     let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
     let root = ctx.repo_root.display().to_string();
+    // Say it now, once, rather than let every later start refuse on one more
+    // file this account cannot change (rc.6 A-afterboot).
+    if let Some(p) = ab::install_owner_problem(&ab::LiveOs, &ctx.repo_root, uid, &name) {
+        ctx.warn(&format!("boot-time add-on restart unit not installed: {p}"));
+        return;
+    }
     let rendered = ab::render_owner(uid, &name).and_then(|owner| ab::render_unit(&name, &exe, &root).map(|unit| (owner, unit)));
     let (owner, unit) = match rendered {
         Ok(r) => r,
