@@ -225,8 +225,11 @@ pub(crate) fn keep_previous_file(path: &Path) {
     }
 }
 
-/// How the post-roll step runs, from `NOO_IMAGE_RETENTION` (`off`, `preview`,
-/// `live`), else the one-time preview, else [`POST_ROLL_DEFAULT_LIVE`].
+/// How the post-roll step runs: the operator's `cluster.image_retention`
+/// in noomesh.yaml (`off`, `preview`, `live`), else the one-time preview,
+/// else [`POST_ROLL_DEFAULT_LIVE`]. Never an environment variable: a value
+/// left in someone's shell or a unit file would silently change what a roll
+/// deletes.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
     Off,
@@ -234,8 +237,8 @@ pub(crate) enum Mode {
     Live,
 }
 
-pub(crate) fn mode(env: Option<&str>, previewed: bool) -> Mode {
-    match env.map(str::trim) {
+pub(crate) fn mode(setting: Option<&str>, previewed: bool) -> Mode {
+    match setting.map(str::trim) {
         Some("off") => Mode::Off,
         Some("preview") => Mode::Preview,
         Some("live") => Mode::Live,
@@ -262,6 +265,23 @@ pub(crate) fn summary(report: &Value, live: bool) -> String {
     } else {
         format!("images: would remove {n_remove} superseded image(s), {gb:.1} GB; kept {kept} (preview, nothing removed)")
     }
+}
+
+/// The operator's `cluster.image_retention` from `<root>/noomesh.yaml`
+/// (`None` when unset or unreadable: the default applies).
+pub(crate) fn setting(root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(root.join("noomesh.yaml")).ok()?;
+    setting_in(&text)
+}
+
+pub(crate) fn setting_in(yaml: &str) -> Option<String> {
+    let doc: serde_yaml::Value = serde_yaml::from_str(yaml).ok()?;
+    doc.get("cluster")?.get("image_retention")?.as_str().map(|s| s.trim().to_string())
+}
+
+/// How many images a report would or did remove.
+fn removable(report: &Value) -> usize {
+    report["images"].as_array().map(|a| a.iter().filter(|i| i["remove"].as_bool() == Some(true)).count()).unwrap_or(0)
 }
 
 fn spool_dir(root: &Path) -> PathBuf {
@@ -320,11 +340,11 @@ pub(crate) fn post_roll(g: &crate::Globals, root: &Path, tag: &str) {
             println!("{}", crate::ui::note(line));
         }
     };
-    let env = std::env::var("NOO_IMAGE_RETENTION").ok();
+    let set = setting(root);
     let previewed = root.join(PREVIEWED_MARKER).is_file();
-    let m = mode(env.as_deref(), previewed);
+    let m = mode(set.as_deref(), previewed);
     if m == Mode::Off {
-        return say("images: superseded-image cleanup is off (NOO_IMAGE_RETENTION=off)");
+        return say("images: superseded-image cleanup is off (cluster.image_retention: off in noomesh.yaml)");
     }
     let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "noo".into());
     let verified = std::process::Command::new(&exe)
@@ -345,11 +365,17 @@ pub(crate) fn post_roll(g: &crate::Globals, root: &Path, tag: &str) {
     let live = m == Mode::Live;
     match run_rung(root, &keep, live) {
         Ok(rep) => {
+            // Nothing superseded (a fresh install, or nothing left since the
+            // last roll): say nothing, so a roll is not noisy, and do not
+            // spend the one-time preview on an empty list.
+            if removable(&rep) == 0 {
+                return;
+            }
             say(&summary(&rep, live));
-            if !live && !previewed && env.is_none() {
+            if !live && !previewed && set.is_none() {
                 let _ = std::fs::write(root.join(PREVIEWED_MARKER), format!("{tag}\n"));
                 if POST_ROLL_DEFAULT_LIVE {
-                    say(&format!("images: from the next roll these are removed (each one is listed in {}); NOO_IMAGE_RETENTION=preview in .env keeps previewing", keep.with_file_name(REPORT_FILE).display()));
+                    say(&format!("images: from the next roll these are removed (each one is listed in {}); `cluster.image_retention: preview` in noomesh.yaml keeps previewing, `off` stops it", keep.with_file_name(REPORT_FILE).display()));
                 }
             }
         }
@@ -455,13 +481,41 @@ mod tests {
     }
 
     #[test]
-    fn the_first_roll_previews_then_the_constant_decides_and_the_env_wins() {
+    fn the_first_roll_previews_then_the_constant_decides_and_noomesh_yaml_wins() {
         assert_eq!(mode(None, false), Mode::Preview, "the first roll that carries this only previews");
         assert_eq!(mode(None, true), if POST_ROLL_DEFAULT_LIVE { Mode::Live } else { Mode::Preview });
         assert_eq!(mode(Some("off"), true), Mode::Off);
         assert_eq!(mode(Some("preview"), true), Mode::Preview);
         assert_eq!(mode(Some("live"), false), Mode::Live, "an explicit live skips the preview");
         assert_eq!(mode(Some("junk"), true), mode(None, true), "an unknown value is the default");
+    }
+
+    #[test]
+    fn the_setting_is_cluster_image_retention_in_noomesh_yaml() {
+        assert_eq!(setting_in("cluster:\n  image_retention: off\n").as_deref(), Some("off"));
+        assert_eq!(setting_in("cluster:\n  default_backend: vllm\n"), None);
+        assert_eq!(setting_in("image_retention: off\n"), None, "only under cluster:");
+        assert_eq!(setting_in(": not yaml ["), None);
+    }
+
+    #[test]
+    fn an_environment_variable_never_decides_what_a_roll_deletes() {
+        // The operator's control is noomesh.yaml, never the environment: a
+        // NOO_IMAGE_RETENTION in a shell or unit file is not read at all.
+        let own = crate::test_src::own_code(include_str!("image_retention.rs"));
+        assert!(!own.contains("std::env::var("), "image retention reads no environment variable");
+        let body = crate::test_src::fn_body(&own, "pub(crate) fn post_roll(");
+        assert!(body.contains("let set = setting(root);"));
+    }
+
+    #[test]
+    fn an_empty_preview_says_nothing_and_keeps_the_one_time_preview() {
+        let own = crate::test_src::own_code(include_str!("image_retention.rs"));
+        let body = crate::test_src::fn_body(&own, "pub(crate) fn post_roll(");
+        let quiet = body.find("if removable(&rep) == 0").expect("an empty result returns early");
+        let marker = body.find("PREVIEWED_MARKER), format!").expect("the marker is written");
+        assert!(quiet < marker, "the preview is recorded only when it listed something");
+        assert_eq!(removable(&json!({"images": [{"remove": false}]})), 0);
     }
 
     #[test]

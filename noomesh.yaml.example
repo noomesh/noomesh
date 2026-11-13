@@ -201,6 +201,11 @@ cluster:
       model: ""
   auto_scale: true
   idle_timeout_sec: 1800
+  # After a verified `noo upgrade`, superseded images that are provably
+  # ours (in no current or previous lock or add-on pin, used by no
+  # container) are removed. live | preview | off. Unset: the first roll
+  # that carries this previews, later rolls remove.
+  # image_retention: live
   pinned_backends: []
   # Example: pin a backend to a specific node
   # pinned_backends:
