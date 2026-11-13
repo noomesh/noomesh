@@ -5754,6 +5754,61 @@ async fn tailscale_bearer() -> Result<String, String> {
     })
 }
 
+/// Whether this gateway holds ANY Tailscale credential: an OAuth client id or
+/// secret, or an API key. None at all means this controller never put a device
+/// on a tailnet (enrolment mints the node's auth key with it), so a teardown
+/// has nothing to remove there. Any part present, even an unusable one, is not
+/// "none": a credential that fails still reports NOT removed with its cause.
+fn tailscale_credential_present_in(oauth_id: &str, oauth_secret: &str, api_key: &str) -> bool {
+    [oauth_id, oauth_secret, api_key].iter().any(|v| !v.trim().is_empty())
+}
+
+fn tailscale_credential_present() -> bool {
+    tailscale_credential_present_in(
+        &std::env::var("NOO_TAILSCALE_OAUTH_CLIENT_ID").unwrap_or_default(),
+        &crate::config::secret_env::secret_or_empty("NOO_TAILSCALE_OAUTH_CLIENT_SECRET"),
+        &crate::config::secret_env::secret_or_empty("NOO_TAILSCALE_API_KEY"),
+    )
+}
+
+/// The answer to a device delete on a controller with no Tailscale credential
+/// (rc.6 rehearsal, A-teardown.tailnet: this was a 500 "internal error" and the
+/// CLI told the operator to delete a device that never existed).
+fn no_tailscale_credential_answer(ip: &str, hostname: &str) -> Value {
+    json!({
+        "status": "no_credential",
+        "ip": ip, "hostname": hostname,
+        "note": "this controller holds no Tailscale credential, so it put no device on a tailnet: nothing to remove",
+    })
+}
+
+#[cfg(test)]
+mod tailscale_credential_tests {
+    use super::*;
+
+    #[test]
+    fn no_credential_at_all_is_nothing_to_remove_and_any_part_is_a_credential() {
+        assert!(!tailscale_credential_present_in("", "", ""));
+        assert!(!tailscale_credential_present_in("  ", "\n", ""));
+        assert!(tailscale_credential_present_in("client-id", "", ""), "a half-configured OAuth client is not 'none'");
+        assert!(tailscale_credential_present_in("", "secret", ""));
+        assert!(tailscale_credential_present_in("", "", "tskey-api-x"));
+        let a = no_tailscale_credential_answer("", "rhx-node2");
+        assert_eq!(a["status"], "no_credential");
+        assert_eq!(a["hostname"], "rhx-node2");
+    }
+
+    #[test]
+    fn the_delete_route_answers_no_credential_before_it_asks_for_a_bearer() {
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn delete_tailscale_device(");
+        let check = body.find("if !tailscale_credential_present() \u{7b}").expect("the route checks for a credential");
+        let answer = body.find("return Ok(Json(no_tailscale_credential_answer(&ip, &hostname)));").expect("and answers no_credential");
+        let bearer = body.find("let bearer = tailscale_bearer().await.map_err(AppError::Internal)?;").expect("a present credential still mints");
+        assert!(check < answer && answer < bearer, "the no-credential answer comes before the bearer (which is a 500 when it fails)");
+    }
+}
+
 /// Mint one pre-authorized Tailscale auth key carrying `tag`. Shared by
 /// `POST /api/cluster/mint-join-key` and the bootstrap-token mint (which puts
 /// the key in the enrollment blob), so the two cannot drift on the payload
@@ -5983,6 +6038,12 @@ async fn delete_tailscale_device(
     let hostname = body.get("hostname").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     if ip.is_empty() && hostname.is_empty() {
         return Err(AppError::BadRequest("provide `ip` (preferred) or `hostname`".into()));
+    }
+    // No credential at all: this controller never enrolled a device on a
+    // tailnet, so there is nothing to remove. A credential that is present
+    // but fails stays an error below (NOT removed, with its cause).
+    if !tailscale_credential_present() {
+        return Ok(Json(no_tailscale_credential_answer(&ip, &hostname)));
     }
 
     let bearer = tailscale_bearer().await.map_err(AppError::Internal)?;
