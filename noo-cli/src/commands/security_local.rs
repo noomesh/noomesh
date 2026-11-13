@@ -2341,8 +2341,6 @@ pub(crate) fn tailnet_delete_line<E: std::fmt::Display>(sent: Result<serde_json:
             "deleted" => format!("device removed from tailnet ({})",
                 v["device_name"].as_str().unwrap_or(name)),
             "not_found" => "device already gone from tailnet".to_string(),
-            "no_credential" => "nothing to remove — this controller holds no Tailscale credential, \
-                                so it put no device on a tailnet".to_string(),
             _ => "device deletion returned an unexpected status".to_string(),
         },
         Err(e) => format!("NOT removed ({e}) — delete it in the Tailscale admin console"),
