@@ -41,7 +41,7 @@ func testServer(t *testing.T) *httptest.Server {
 	// No real Docker — backend start/stop will fail gracefully.
 	// For a full integration test with Docker, set NOO_NODE_AGENT_URL
 	// and test against the running container.
-	gpu := hardware.NewGPUDetector(nil, "http")
+	gpu := hardware.NewGPUDetector()
 	coll := metrics.NewCollector(gpu)
 
 	srv := NewServer(cfg, nil, gpu, coll)
@@ -237,7 +237,7 @@ func metricsMuxAndLeaf(t *testing.T) (http.Handler, *x509.Certificate) {
 		NodeAgentToken: "test-token",
 		TLSCA:          "ca.pem",
 	}
-	gpu := hardware.NewGPUDetector(nil, "http")
+	gpu := hardware.NewGPUDetector()
 	srv := NewServer(cfg, nil, gpu, metrics.NewCollector(gpu))
 	return srv.mux, testLeaf(t, "prometheus", "Mesh Cluster Service")
 }
@@ -256,7 +256,7 @@ func TestIntegration_PrometheusMetricsRefusedWithoutPeerIdentity(t *testing.T) {
 		NodeID:         "integration-test-node",
 		NodeAgentToken: "test-token",
 	}
-	gpu := hardware.NewGPUDetector(nil, "http")
+	gpu := hardware.NewGPUDetector()
 	srv := NewServer(cfg, nil, gpu, metrics.NewCollector(gpu))
 	ts := httptest.NewServer(srv.mux)
 	defer ts.Close()

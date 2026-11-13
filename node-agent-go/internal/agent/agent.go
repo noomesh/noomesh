@@ -234,7 +234,7 @@ func New(cfg *config.Config) (*Agent, error) {
 	}
 
 	// Hardware detection
-	gpu := hardware.NewGPUDetector(httpClient, cfg.Scheme())
+	gpu := hardware.NewGPUDetector()
 	coll := metrics.NewCollector(gpu)
 
 	// The Agent is referenced by the heartbeat's backend provider below, so

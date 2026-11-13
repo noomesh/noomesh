@@ -40,7 +40,7 @@ func newTestReporter(t *testing.T, serverURL string, cfg *config.Config) *Report
 	} else {
 		cfg.ControllerURL = serverURL
 	}
-	gpu := hardware.NewGPUDetector(nil, "http")
+	gpu := hardware.NewGPUDetector()
 	coll := metrics.NewCollector(gpu)
 	// The identity probe is scripted (a clean "no GPU" answer), never the
 	// host's nvidia-smi: on a GPU host whose probe errors, gpu_model and
@@ -153,7 +153,7 @@ func TestReporter_HeartbeatPayload(t *testing.T) {
 		VRAMGB:   24.0,
 		GPUModel: "RTX 4090",
 	}
-	gpu := hardware.NewGPUDetector(nil, "http")
+	gpu := hardware.NewGPUDetector()
 	coll := metrics.NewCollector(gpu)
 	rpt := NewReporter(cfg, &http.Client{Timeout: 5 * time.Second}, coll, gpu,
 		func() (map[string]string, error) { return map[string]string{"vllm": "Qwen/Qwen3-8B"}, nil },
@@ -205,7 +205,7 @@ func TestReporter_AuthHeader(t *testing.T) {
 		ClusterSecret: "my-secret",
 		Tier:          3,
 	}
-	gpu := hardware.NewGPUDetector(nil, "http")
+	gpu := hardware.NewGPUDetector()
 	coll := metrics.NewCollector(gpu)
 	rpt := NewReporter(cfg, &http.Client{Timeout: 5 * time.Second}, coll, gpu,
 		func() (map[string]string, error) { return map[string]string{}, nil },
@@ -313,7 +313,7 @@ func TestReporter_RunCancellation(t *testing.T) {
 		HeartbeatInterval: 1,
 		Tier:              3,
 	}
-	gpu := hardware.NewGPUDetector(nil, "http")
+	gpu := hardware.NewGPUDetector()
 	coll := metrics.NewCollector(gpu)
 	rpt := NewReporter(cfg, &http.Client{Timeout: 5 * time.Second}, coll, gpu,
 		func() (map[string]string, error) { return map[string]string{}, nil },
@@ -995,7 +995,7 @@ func TestFirstHeartbeatAfterRestartReportsSeededHeldModel(t *testing.T) {
 			t.Logf("seed (logged, carried on empty): %v", err)
 		}
 		cfg := &config.Config{NodeID: "test-node", ControllerURL: ctrl.URL, Tier: 3}
-		gpu := hardware.NewGPUDetector(nil, "http")
+		gpu := hardware.NewGPUDetector()
 		rpt := NewReporter(cfg, &http.Client{Timeout: 5 * time.Second}, metrics.NewCollector(gpu), gpu,
 			func() (map[string]string, error) { return lane.Running(context.Background()), nil },
 			func() int { return 0 },

@@ -11,7 +11,7 @@ import (
 // The probe itself, over a fake nvidia-smi script on a temp PATH (the host's
 // real nvidia-smi is never run; see pinSmi).
 func TestDetectComputeCapsOverAFakeNvidiaSmi(t *testing.T) {
-	g := NewGPUDetector(nil, "http")
+	g := NewGPUDetector()
 
 	fakeSmi(t, `printf '8.6\n8.9\n'`)
 	if got, err := g.DetectComputeCaps(); err != nil || !reflect.DeepEqual(got, []string{"8.6", "8.9"}) {

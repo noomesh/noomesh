@@ -33,7 +33,7 @@ func freePort(t *testing.T) int {
 // listener this test exists to keep out.
 func listenOutcome(t *testing.T, cfg *config.Config) error {
 	t.Helper()
-	gpu := hardware.NewGPUDetector(nil, "http")
+	gpu := hardware.NewGPUDetector()
 	srv := NewServer(cfg, nil, gpu, metrics.NewCollector(gpu))
 	done := make(chan error, 1)
 	go func() { done <- srv.ListenAndServe() }()
