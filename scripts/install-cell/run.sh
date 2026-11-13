@@ -129,9 +129,11 @@ if [ "$DOCKER" = none ]; then
     hook prep-no-docker.sh || finish
 fi
 # DOCKER=distro: the engine a stranger gets from `apt install docker.io`, not
-# the runner image's docker-ce/moby. The two word a failed namespace join
-# differently (Docker 27 vs 28: noomesh#1128), and #1108's restore was only
-# ever proven on the image's engine. The image's engine packages are removed,
+# the runner image's docker-ce/moby. #1108's restore was only ever proven on
+# the image's engine, and Docker versions word a failed namespace join
+# differently (27 vs 28: noomesh#1128). The first run (2026-11-13) found
+# 22.04's docker.io at 29.1.3, so this cell covers the distro engine; Docker
+# 27 itself is the rehearsal's dind (27.5.1). The image's engine packages are removed,
 # Ubuntu's own docker.io + docker-compose-v2 installed, and the step FAILs by
 # name unless the engine now running is the docker.io package's.
 if [ "$DOCKER" = distro ]; then
@@ -146,6 +148,9 @@ if [ "$DOCKER" = distro ]; then
       usermod -aG docker "${SUDO_USER:-runner}" 2>/dev/null
       t=0; until docker info >/dev/null 2>&1 || [ $t -ge 60 ]; do sleep 2; t=$((t+2)); done
       pkg="$(dpkg-query -W -f "\${Version}" docker.io 2>/dev/null)"
+      # What the archive offers (the first run, 2026-11-13, found 29.1.3 on
+      # 22.04, not the 27.x assumed): a future pin can only pick from these.
+      apt-cache madison docker.io 2>/dev/null | head -6 | sed "s/^/available: /"
       echo "docker.io package: ${pkg:-NOT INSTALLED}"
       docker version 2>&1 | sed -n "/^Server/,\$p" | head -8
       docker compose version 2>&1 | head -1
