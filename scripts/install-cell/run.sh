@@ -324,7 +324,15 @@ FIRST_CHAT_DOC="$HERE/../../docs/getting-started/first-chat.md"
 FIRST_PROMPT="$(sed -n 's/^noo chat --message "\(.*\)"$/\1/p' "$FIRST_CHAT_DOC" 2>/dev/null | head -n 1)"
 # A refusal or a request for more input, in the shapes small models use.
 FIRST_ANSWER_NOT_AN_ANSWER='please (provide|specify|clarify|share|tell me)|could you (please )?(provide|specify|clarify|share|tell me)|can you (please )?(provide|specify|clarify|share)|i (can.?t|cannot|am unable to|am not able to) (help|answer|assist|see|access)|i don.?t have (access|enough (information|context))|(what|which) (machine|computer|device|system) (are|do) you|more (details|information|context) (about|on|is needed)'
-export FIRST_PROMPT FIRST_ANSWER_NOT_AN_ANSWER
+# A deflection ("How can I help you?") counts only when the answer gives no
+# list item at all: a real answer may end with that line after its tips.
+FIRST_ANSWER_DEFLECTION='how can i help you|do you have any (specific )?(questions|topics)|what would you like (to (know|discuss|talk about)|me to)'
+# The named FAIL is for the product's default model only (MODEL=default: what
+# a stranger gets). A tiny-model cell (MODEL=tiny, a 0.5B test model) prints
+# the answer and a NOTE and never fails on it: its mood is not the product's
+# (rc.6 branch run: qwen2.5:0.5b answered "How can I help you …?" on one cell
+# and gave the tips on another; general 11-13).
+export FIRST_PROMPT FIRST_ANSWER_NOT_AN_ANSWER FIRST_ANSWER_DEFLECTION MODEL TINY_MODEL
 meta first_prompt "${FIRST_PROMPT:-none}"
 step first-answer 1800 -- sh -c '
   [ -n "$FIRST_PROMPT" ] || { echo "FIRST-ANSWER FAIL: docs/getting-started/first-chat.md has no noo chat --message line"; exit 1; }
@@ -332,8 +340,13 @@ step first-answer 1800 -- sh -c '
   out="$(noo chat --message "$FIRST_PROMPT")"; rc=$?
   printf "%s\n" "$out"
   [ $rc = 0 ] && [ -n "$(printf "%s" "$out" | tr -d "[:space:]")" ] || exit 1
-  if printf "%s" "$out" | grep -qiE "$FIRST_ANSWER_NOT_AN_ANSWER"; then
-    echo "FIRST-ANSWER FAIL: the model asked for more input or refused instead of answering"; exit 1
+  listed="$(printf "%s\n" "$out" | grep -cE "^[[:space:]]*([0-9]+[.)]|[-*]|•)[[:space:]]")"
+  if printf "%s" "$out" | grep -qiE "$FIRST_ANSWER_NOT_AN_ANSWER" \
+     || { [ "$listed" = 0 ] && printf "%s" "$out" | grep -qiE "$FIRST_ANSWER_DEFLECTION"; }; then
+    if [ "$MODEL" = default ]; then
+      echo "FIRST-ANSWER FAIL: the model asked for more input or refused instead of answering"; exit 1
+    fi
+    echo "FIRST-ANSWER NOTE: the tiny test model ($TINY_MODEL) did not answer the prompt; this cell runs MODEL=$MODEL, not the product default, so this is not a product verdict"
   fi' || fail_onboarded
 meta first_answer_s "$(( $(date +%s) - CELL_START ))"
 
