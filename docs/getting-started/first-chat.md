@@ -35,16 +35,16 @@ routing), put the provider's key in the secret store
 `noo chat --model claude-sonnet-4-5`. Tools, memory and the rest work the
 same as on a local model.
 
-## A first good question: your own cluster
+## See what you just built
 
-Ask about what you just built. These need no setup:
+The chat model does not read your cluster's state, so ask the CLI:
 
 ```bash
-noo chat --message "which nodes and models do you have right now?"
 noo cluster status
 ```
 
-Compare the answer with `noo cluster status`; they should agree.
+It lists each node, whether it is online, and the model it is running
+(`RUNNING`), from what the node agents report.
 
 ## A second good question: your own document
 
