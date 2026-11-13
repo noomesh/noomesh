@@ -242,13 +242,18 @@ noo_data_device() {
 #              predates this), say so loudly: `noo cluster verify` names it,
 #              and moving the data is a separate, deliberate step.
 noo_ensure_data_volume() {
-    local vol dev project have
+    # $1 = --already-warned: the caller's run printed the "NOT bound" warning
+    # once already (onboard's posture relaunch). An ARGUMENT, never an
+    # environment variable: nothing a user's shell or a unit sets can silence
+    # the one warning that says where the gateway's data is.
+    local vol dev project have warned=""
+    [ "${1:-}" = --already-warned ] && warned=1
     vol="$(noo_data_volume)"
     project="${COMPOSE_PROJECT_NAME:-noomesh}"
     if docker volume inspect "$vol" >/dev/null 2>&1; then
         have="$(docker volume inspect -f '{{index .Options "device"}}' "$vol" 2>/dev/null)"
         dev="$(noo_data_device)"
-        if [ -z "$have" ] || { [ -n "$dev" ] && [ "$have" != "$dev" ]; }; then
+        if { [ -z "$have" ] || { [ -n "$dev" ] && [ "$have" != "$dev" ]; }; } && [ -z "$warned" ]; then
             echo "WARNING: volume '$vol' is NOT bound to the data root (${dev:-NOO_DATA_ROOT unset}/): the gateway's data is at $(docker volume inspect -f '{{.Mountpoint}}' "$vol" 2>/dev/null)." >&2
             echo "         noo cluster verify shows it; moving it into the data root is a separate step (it is never done silently)." >&2
         fi
@@ -280,7 +285,8 @@ noo_prepare_gateway_data_dirs() {
     local vol out
     vol="$(noo_data_volume)"
     # Never let the mount below create the volume (see noo_ensure_data_volume).
-    noo_ensure_data_volume || return 1
+    # "$@": --already-warned, passed through from noomesh-restart.sh.
+    noo_ensure_data_volume "$@" || return 1
     if ! out="$(docker run --rm -v "$vol":/d alpine \
         sh -c 'mkdir -p /d/ingest/working /d/ingest/archive /d/audit-archive && chown -R 65532:65532 /d/ingest /d/audit-archive' \
         2>&1)"; then

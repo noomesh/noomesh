@@ -1438,7 +1438,10 @@ fn print_final_summary(ctx: &Ctx) {
             None => ctx.warn("could not read the security posture listing — check it with: noo security posture list"),
             Some(pending) if !pending.is_empty() => {
                 ctx.progress(&format!("Restarting the gateway so the posture takes effect ({})...", pending.join(", ")));
-                let code = sh::run_script_streamed(ctx, "noomesh-restart.sh", &["--force", "gateway"]);
+                // The services step's launch already printed the noo-data
+                // binding warning; an explicit argument (never an env var)
+                // tells the relaunch not to say it twice.
+                let code = sh::run_script_streamed(ctx, "noomesh-restart.sh", &["--force", "gateway", "--data-warning-shown"]);
                 // https always — the gateway has no plaintext listener.
                 let health = "https://localhost:8080/health".to_string();
                 if code == 0 && sh::wait_for_http(ctx, &health, 120) {
@@ -1855,6 +1858,15 @@ mod summary_tests {
 #[cfg(test)]
 mod posture_tests {
     use super::{pending_restart_keys, posture_pending_restart, POSTURE_LIST_KEY};
+
+    /// rc.4 rehearsal B-reonboard: the launcher's "noo-data is NOT bound"
+    /// warning printed twice in one onboard (services, then this relaunch).
+    #[test]
+    fn the_posture_relaunch_tells_the_launcher_the_data_warning_was_given() {
+        let own = crate::test_src::own_code(include_str!("mod.rs"));
+        let body = crate::test_src::fn_body(&own, "fn print_final_summary(");
+        assert!(body.contains(r#"sh::run_script_streamed(ctx, "noomesh-restart.sh", &["--force", "gateway", "--data-warning-shown"])"#), "{body}");
+    }
     use std::io::{Read, Write};
 
     /// The listing as `posture_list` builds it: one gate whose DB row the

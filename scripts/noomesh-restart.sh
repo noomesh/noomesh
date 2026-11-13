@@ -150,6 +150,10 @@ detect_gpu_tier() {
 PROFILE=""
 SERVICES=()
 FORCE_RECREATE=false
+# --data-warning-shown: onboard's posture relaunch, whose services step
+# already printed the noo-data "NOT bound" warning. Set from the argument
+# only (assigned here, so the environment cannot preset it).
+DATA_WARNED_ARG=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -163,6 +167,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --force)
             FORCE_RECREATE=true
+            shift
+            ;;
+        --data-warning-shown)
+            DATA_WARNED_ARG="--already-warned"
             shift
             ;;
         *)
@@ -261,7 +269,7 @@ if [ ${#SERVICES[@]} -eq 0 ]; then
     ui_step "Restarting all services (profile $PROFILE)"
     # The gateway's own dirs on noo-data (uid 65532), as noomesh-start.sh
     # makes them: a restart can be the first start of a new gateway image.
-    noo_prepare_gateway_data_dirs || { echo "aborting: the noo-data volume could not be made as compose declares it (above)" >&2; exit 1; }
+    noo_prepare_gateway_data_dirs $DATA_WARNED_ARG || { echo "aborting: the noo-data volume could not be made as compose declares it (above)" >&2; exit 1; }
     if [ "$FORCE_RECREATE" = true ]; then
         # Same service arithmetic as noomesh-start.sh: the profile's set,
         # minus the GPU-only exporter when this daemon has no NVIDIA
@@ -350,7 +358,7 @@ EOF_HELD
         exit 1
     fi
     if printf '%s\n' "${SERVICES[@]}" | grep -qx gateway; then
-        noo_prepare_gateway_data_dirs || { echo "aborting: the noo-data volume could not be made as compose declares it (above)" >&2; exit 1; }
+        noo_prepare_gateway_data_dirs $DATA_WARNED_ARG || { echo "aborting: the noo-data volume could not be made as compose declares it (above)" >&2; exit 1; }
     fi
     ui_step "Restarting ${SERVICES[*]}"
     if [ "$FORCE_RECREATE" != true ]; then
