@@ -5123,7 +5123,7 @@ fn addon_client(g: &Globals) -> crate::addons::lock_fetch::Client {
 }
 
 /// Remedy for an add-on that holds a stack roll.
-fn addon_hold_fix(addon: &str, r: &crate::addons::resolve::Refusal) -> String {
+fn addon_hold_fix(addon: &str, r: &crate::addons::resolve::Refusal, tag: &str) -> String {
     if let Some(fix) = r.registry_login_fix(addon) {
         return fix;
     }
@@ -5136,7 +5136,11 @@ fn addon_hold_fix(addon: &str, r: &crate::addons::resolve::Refusal) -> String {
     if matches!(r, crate::addons::resolve::Refusal::Downgrade { .. }) {
         return "noo upgrade --stack --allow-downgrade   # an explicit rollback of the add-on with the stack".to_string();
     }
-    format!("noo addons disable {addon}   # or wait for its release for this stack, or roll to an older one: noo upgrade --stack --tag <vX.Y.Z> (add --allow-downgrade to take the add-on back with it)")
+    // Path (b), proven by the rc.4 rehearsal (B-reenable.enable/.on): disable,
+    // roll, then enable it again from a lock signed for the new stack. The
+    // way out for an add-on enabled from a file (a developer's own lock),
+    // whose registry the roll cannot fetch a lock from.
+    format!("noo addons disable {addon}   # roll without it, then turn it back on with a lock signed for {tag}: noo addons enable {addon} --lock <bundle.json>. Or wait for its release for this stack, or roll to an older one: noo upgrade --stack --tag <vX.Y.Z> (add --allow-downgrade to take the add-on back with it)")
 }
 
 /// Step -1z of `upgrade_stack`: resolve, verify and pull every add-on that
@@ -5177,7 +5181,7 @@ fn addon_preflight(
                 };
                 fail(g.json, ExitCode::Generic, "addon_hold",
                     &format!("refusing to roll to {tag}: {why}. Nothing was changed"),
-                    Some(&addon_hold_fix(addon, &r)))
+                    Some(&addon_hold_fix(addon, &r, tag)))
             }
         }
     }
@@ -7148,9 +7152,12 @@ mod keyless_tests {
             "v0.6.1 published; held at v0.6.0 by trellion_intel");
         assert!(super::hold_line("v0.6.0", "v0.6.1", &[]).contains("every add-on that is on has a lock for it"));
         let r = crate::addons::resolve::Refusal::NoAnchor;
-        assert!(super::addon_hold_fix("evolve", &r).starts_with("noo addons disable evolve"));
+        let fix = super::addon_hold_fix("evolve", &r, "v0.6.25");
+        assert!(fix.starts_with("noo addons disable evolve"), "{fix}");
+        // Path (b): how to turn it back on after the roll, for that tag.
+        assert!(fix.contains("noo addons enable evolve --lock <bundle.json>") && fix.contains("signed for v0.6.25"), "{fix}");
         let d = crate::addons::resolve::Refusal::Downgrade { pinned: "2.0.0".into(), offered: "1.0.0".into() };
-        assert!(super::addon_hold_fix("evolve", &d).starts_with("noo upgrade --stack --allow-downgrade"));
+        assert!(super::addon_hold_fix("evolve", &d, "v0.6.25").starts_with("noo upgrade --stack --allow-downgrade"));
     }
 
     #[test]
