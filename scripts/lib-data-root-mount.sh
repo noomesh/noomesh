@@ -120,7 +120,7 @@ _drm_field() {  # <FIELD> <path>
 # Evaluate. Sets DRM_VERDICT (ok | record | refuse | skip) and DRM_MSG, and the
 # DRM_NOW_* identity. Never writes, never creates, never stops anything.
 _drm_evaluate() {
-    DRM_VERDICT="ok"; DRM_MSG=""; DRM_KIND=""; DRM_UUID_NOTE=""
+    DRM_VERDICT="ok"; DRM_MSG=""; DRM_KIND=""; DRM_UUID_NOTE=""; DRM_PG_NOTE=""
     DRM_NOW_UUID=""; DRM_NOW_SOURCE=""; DRM_NOW_TARGET=""; DRM_NOW_FSTYPE=""; DRM_PG_INIT_NOW=""
     local root rec rec_root kind e
     root="$(_drm_env NOO_DATA_ROOT)"
@@ -214,11 +214,40 @@ _drm_evaluate() {
 
     # Belt and braces: postgres was initialised here before (the record says
     # so), and its data dir is now empty. Never let it initdb again.
+    #
+    # A data dir this account cannot LIST is not an empty one. Postgres runs
+    # as its own uid and keeps PGDATA 0700, so a non-root launch (the
+    # after-boot unit, the owner's `noo stack start` after hostd's root boot
+    # guard armed this) cannot list it. Read instead what it can see without
+    # listing: a dir owned by ANOTHER uid that this account may not list is
+    # postgres' own, which only an initialised cluster leaves; a dir an
+    # unmounted data root leaves behind is root- or owner-made and listable.
+    # Never judged by link count: a directory's nlink is 1 on btrfs and can
+    # be on overlayfs. (0.6.24-rc.3 Part A, A-afterboot.start.)
     if [ -n "$(_drm_get postgres_initialised "$rec")" ]; then
-        if [ ! -d "$pgdir" ] || [ -z "$(_drm_timeout ls -A "$pgdir" 2>/dev/null)" ]; then
+        local since listing owner mode me who
+        since="$(_drm_get postgres_initialised "$rec")"
+        if [ ! -d "$pgdir" ]; then
             DRM_VERDICT="refuse"; DRM_KIND="pg"
-            DRM_MSG="postgres was initialised on this install (since $(_drm_get postgres_initialised "$rec")) but its data directory $pgdir is empty or missing; starting would initialise a NEW EMPTY database"
+            DRM_MSG="postgres was initialised on this install (since $since) but its data directory $pgdir is empty or missing; starting would initialise a NEW EMPTY database"
             _drm_explain "$root" "$rec" "$rec_root" "$kind"; return 0
+        fi
+        if listing="$(_drm_timeout ls -A "$pgdir" 2>/dev/null)"; then
+            if [ -z "$listing" ]; then
+                DRM_VERDICT="refuse"; DRM_KIND="pg"
+                DRM_MSG="postgres was initialised on this install (since $since) but its data directory $pgdir is empty or missing; starting would initialise a NEW EMPTY database"
+                _drm_explain "$root" "$rec" "$rec_root" "$kind"; return 0
+            fi
+        else
+            owner="$(stat -c %u "$pgdir" 2>/dev/null)"; mode="$(stat -c %a "$pgdir" 2>/dev/null)"
+            me="$(id -u 2>/dev/null)"; who="$(id -un 2>/dev/null || echo "uid $me")"
+            if [ -n "$owner" ] && [ "$owner" != "$me" ] && [ "$owner" != "0" ]; then
+                DRM_PG_NOTE="postgres' data directory $pgdir could not be listed as $who; it is owned by uid $owner, mode $mode (postgres' own, which only an initialised cluster leaves), so it was not judged empty"
+            else
+                DRM_VERDICT="refuse"; DRM_KIND="pg"
+                DRM_MSG="postgres was initialised on this install (since $since), and its data directory $pgdir could not be listed as $who; it is owned by uid ${owner:-?}, mode ${mode:-?}, which is not postgres' own, so whether the cluster is still there is not proven"
+                _drm_explain "$root" "$rec" "$rec_root" "$kind"; return 0
+            fi
         fi
     fi
     DRM_VERDICT="ok"
@@ -340,6 +369,7 @@ _drm_run() {
             return 1 ;;
         *)
             [ -n "$DRM_UUID_NOTE" ] && echo "NOTE: $DRM_UUID_NOTE." >&2
+            [ -n "$DRM_PG_NOTE" ] && echo "NOTE: $DRM_PG_NOTE." >&2
             # ok: remember that postgres has been initialised here, so a
             # later empty data dir is refused rather than re-initialised.
             if [ -n "$DRM_PG_INIT_NOW" ] && [ -z "$(_drm_get postgres_initialised "$(_drm_record_file)")" ]; then
@@ -389,6 +419,6 @@ data_root_mount_report() {
         refuse)
             if [ "$DRM_KIND" = "nofindmnt" ]; then echo "$DRM_MSG; the launchers refuse to start"; return 5; fi
             echo "$DRM_MSG — expected ${DRM_EXPECTED:-?}; found ${DRM_FOUND:-?}"; return 3 ;;
-        *) echo "$DRM_MSG${DRM_UUID_NOTE:+ ($DRM_UUID_NOTE)}"; return 0 ;;
+        *) echo "$DRM_MSG${DRM_UUID_NOTE:+ ($DRM_UUID_NOTE)}${DRM_PG_NOTE:+ ($DRM_PG_NOTE)}"; return 0 ;;
     esac
 }

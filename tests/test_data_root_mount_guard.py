@@ -77,7 +77,28 @@ def rig(tmp_path):
           echo "ls: cannot open directory '$2': Input/output error" >&2
           exit 2
         fi
+        for a in "$@"; do
+          if [ -n "$FAKE_LS_DENY" ] && [ "$a" = "$FAKE_LS_DENY" ]; then
+            echo "ls: cannot open directory '$a': Permission denied" >&2
+            exit 2
+          fi
+        done
         exec /bin/ls "$@"
+        """)
+    # stat of the postgres dir as a non-root account sees it (owner, mode,
+    # link count); every other path is the real stat.
+    _exe(bindir / "stat", """\
+        #!/bin/sh
+        last=""; for a in "$@"; do last="$a"; done
+        if [ -n "$FAKE_STAT_PATH" ] && [ "$last" = "$FAKE_STAT_PATH" ]; then
+          case "$2" in
+            %u) echo "${FAKE_PG_OWNER:-70}" ;;
+            %a) echo "${FAKE_PG_MODE:-700}" ;;
+            %h) echo "${FAKE_PG_NLINK:-1}" ;;
+          esac
+          exit 0
+        fi
+        exec /usr/bin/stat "$@"
         """)
     _exe(bindir / "docker", f"""\
         #!/bin/sh
@@ -494,3 +515,56 @@ def test_a_record_written_by_0_6_23_passes_its_first_non_root_launch(rig):
     assert "RC=0" in run(rig).stdout
     r = run(rig, FAKE_UUID="")
     assert "RC=0" in r.stdout, r.stderr
+
+
+# ── a postgres data dir this account cannot list is not an empty one (rc.3 Part A) ──
+
+
+def _pg_unlistable(rig, **extra):
+    pg = str(rig["data"] / "postgres")
+    env = {"FAKE_LS_DENY": pg, "FAKE_STAT_PATH": pg}
+    env.update(extra)
+    return env
+
+
+def test_an_unlistable_postgres_dir_owned_by_postgres_starts_and_says_why(rig):
+    run(rig, FAKE_EUID="0", FAKE_USER="root")  # root arms the belt (it sees PG_VERSION)
+    assert "postgres_initialised=" in record(rig)
+    r = run(rig, **_pg_unlistable(rig))
+    assert "RC=0" in r.stdout, r.stderr
+    assert "REFUSED" not in r.stderr
+    assert "could not be listed as rhowner" in r.stderr and "owned by uid 70, mode 700" in r.stderr, r.stderr
+
+
+def test_the_link_count_is_never_the_judge_btrfs_reports_one(rig):
+    run(rig, FAKE_EUID="0", FAKE_USER="root")
+    r = run(rig, **_pg_unlistable(rig, FAKE_PG_NLINK="1"))
+    assert "RC=0" in r.stdout, r.stderr  # a healthy cluster on btrfs (nlink 1) still starts
+
+
+def test_an_unlistable_dir_owned_by_the_caller_or_root_refuses_with_the_true_reason(rig):
+    run(rig, FAKE_EUID="0", FAKE_USER="root")
+    for owner in ("1002", "0"):  # the caller (rhowner is 1002 in the rig), root
+        r = run(rig, **_pg_unlistable(rig, FAKE_PG_OWNER=owner, FAKE_PG_MODE="700"))
+        assert "RC=1" in r.stdout, (owner, r.stderr)
+        assert "could not be listed as rhowner" in r.stderr and f"owned by uid {owner}" in r.stderr, r.stderr
+        assert "not postgres' own" in r.stderr
+        assert "is empty or missing" not in r.stderr, "an unlistable dir is never called empty"
+
+
+def test_a_listable_empty_or_missing_postgres_dir_still_refuses_for_any_account(rig):
+    run(rig, FAKE_EUID="0", FAKE_USER="root")
+    for f in (rig["data"] / "postgres").iterdir():
+        f.unlink()
+    for who in ({}, {"FAKE_EUID": "0", "FAKE_USER": "root"}):
+        r = run(rig, **who)
+        assert "RC=1" in r.stdout and "is empty or missing" in r.stderr, (who, r.stderr)
+    (rig["data"] / "postgres").rmdir()
+    r = run(rig)
+    assert "RC=1" in r.stdout and "is empty or missing" in r.stderr
+
+
+def test_the_report_carries_the_postgres_note(rig):
+    run(rig, FAKE_EUID="0", FAKE_USER="root")
+    r = run(rig, fn="data_root_mount_report", **_pg_unlistable(rig))
+    assert "RC=0" in r.stdout and "could not be listed as rhowner" in r.stdout, r.stdout
