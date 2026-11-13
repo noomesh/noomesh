@@ -915,6 +915,14 @@ async fn online_node_ids(db: &sqlx::PgPool) -> Result<Vec<String>, String> {
     Ok(rows.into_iter().map(|(n,)| n).collect())
 }
 
+/// Rung 5's keep file for the controller ladder: `keep=spool` when the CLI's
+/// image-retention keep file sits in the spool, else nothing (hostd then
+/// skips rung 5). The token, not a path: this container sees the spool at
+/// its mount point, and hostd resolves `spool` against its own host side.
+fn image_keep_arg(spool: &std::path::Path) -> Option<String> {
+    spool.join("image-keep.json").is_file().then(|| "keep=spool".to_string())
+}
+
 /// Queue a `disk-reclaim` op on the host watcher spool and report the
 /// outcome as an operator alert.
 ///
@@ -957,6 +965,9 @@ async fn queue_disk_reclaim(state: &AppState, watermark: f64, dry_run: bool, cac
     ];
     if let Some(cap) = cache_cap {
         args.push(format!("cache_cap_bytes={cap}"));
+    }
+    if let Some(keep) = image_keep_arg(std::path::Path::new(&crate::routes::admin::host_spool_dir())) {
+        args.push(keep);
     }
     let Some(path) = crate::routes::admin::host_spool_write_command(
         "disk-reclaim",
@@ -3088,6 +3099,22 @@ fn gpu_watchdog_faults(body: &serde_json::Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::confirm_drift;
+
+    /// The controller ladder names the keep file only when the CLI wrote one,
+    /// and only as the token hostd resolves on its own side of the mount.
+    #[test]
+    fn image_keep_arg_only_when_the_keep_file_is_in_the_spool() {
+        let dir = std::env::temp_dir().join(format!("noo-keep-arg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_file(dir.join("image-keep.json"));
+        assert_eq!(super::image_keep_arg(&dir), None, "no keep file: no keep= arg");
+        std::fs::create_dir_all(dir.join("image-keep.json")).unwrap();
+        assert_eq!(super::image_keep_arg(&dir), None, "a directory is not a keep file");
+        std::fs::remove_dir(dir.join("image-keep.json")).unwrap();
+        std::fs::write(dir.join("image-keep.json"), b"{}").unwrap();
+        assert_eq!(super::image_keep_arg(&dir).as_deref(), Some("keep=spool"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// One missed probe is a blip; the same miss on the next evaluation is
     /// drift; a pair that recovers is forgotten and starts again from one.
