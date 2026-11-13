@@ -337,6 +337,32 @@ step first-answer 1800 -- sh -c '
   fi' || fail_onboarded
 meta first_answer_s "$(( $(date +%s) - CELL_START ))"
 
+# PROBE (fa, general 11-13): first-chat.md's next section promises cluster
+# awareness ("which nodes and models do you have right now?" / "they should
+# agree" with `noo cluster status`). Run that documented line as written and
+# print the answer beside the real state, so whether the chat path answers it
+# from real state can be read before the page keeps the claim. Read, never
+# judged; never the cell's failed step.
+CLUSTER_PROMPT="$(sed -n 's/^noo chat --message "\(.*\)"$/\1/p' "$FIRST_CHAT_DOC" 2>/dev/null | grep -m1 -i 'nodes and models')"
+export CLUSTER_PROMPT
+step probe-cluster-question 600 -- sh -c '
+  [ -n "$CLUSTER_PROMPT" ] || { echo "CLUSTER PROBE: the doc has no nodes-and-models line"; exit 0; }
+  echo "prompt: $CLUSTER_PROMPT"
+  echo "== chat answer"
+  noo chat --message "$CLUSTER_PROMPT" 2>&1 | head -n 40
+  echo "== noo cluster status (the real state)"
+  noo cluster status 2>&1 | head -n 30
+  echo "== noo --json cluster status: node ids and models"
+  noo --json cluster status 2>/dev/null | python3 -c "import json,sys
+try:
+  d=json.load(sys.stdin)
+except Exception:
+  sys.exit(0)
+nodes=d.get(\"nodes\", d) if isinstance(d, dict) else d
+for n in (nodes if isinstance(nodes, list) else []):
+  print(\"node\", n.get(\"id\") or n.get(\"name\"), \"models\", n.get(\"available_models\") or n.get(\"models\"))" 2>/dev/null
+  true'
+
 # PROBE (fa, rc.1 rehearsal A-reboot.status, i677): a container that joins
 # another's network namespace (network_mode: service:<door>; noo-ollama-embed
 # joins noo-stunnel-ollama-embed) must be running after EVERY dockerd start.

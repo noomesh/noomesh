@@ -509,3 +509,14 @@ def test_a_request_for_more_input_or_a_refusal_is_not_an_answer(answer, bad):
     rx = _run_sh_var("FIRST_ANSWER_NOT_AN_ANSWER")
     r = subprocess.run(["grep", "-qiE", rx], input=answer, text=True)
     assert (r.returncode == 0) is bad, (answer, r.returncode)
+
+
+def test_the_cluster_question_the_doc_promises_is_probed_never_judged():
+    # general 11-13: whether `noo chat` answers "which nodes and models do you
+    # have right now?" from real state decides if first-chat.md keeps the claim.
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    assert "grep -m1 -i 'nodes and models'" in text
+    i = text.index("step probe-cluster-question 600")
+    block = text[i:text.index("  true'\n", i)]
+    assert 'noo chat --message "$CLUSTER_PROMPT"' in block and "noo cluster status" in block
+    assert "|| fail_onboarded" not in text[i:i + len(block) + 20], "a probe, never the failed step"
