@@ -402,6 +402,7 @@ var reconcilePhases = []phase{
 	{"convergePlacements", (*Reconciler).convergePlacements},
 	{"healDoorNamespaces", (*Reconciler).healDoorNamespaces},
 	{"reportAndCleanup", (*Reconciler).reportAndCleanup},
+	{"writeImageKeep", (*Reconciler).writeImageKeep},
 }
 
 // Once performs a single reconcile pass. Errors are logged, never fatal —
