@@ -2185,7 +2185,7 @@ pub(crate) fn tailnet_record_action(dismantled: bool, self_node: bool, keep_reco
     } else if keep_record {
         TailnetRecord::KeepRequested
     } else {
-        TailnetRecord::Delete
+        TailnetRecord::KeepRequested
     }
 }
 
