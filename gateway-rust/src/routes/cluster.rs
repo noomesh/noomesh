@@ -1111,7 +1111,10 @@ fn derive_nats_state(reported: Option<&Value>) -> (Value, String) {
     let Some(bus) = reported.filter(|v| !v.is_null()) else {
         return (
             Value::Null,
-            "not reported — this node-agent build does not send nats_status".to_string(),
+            "not reported — no heartbeat from this node has carried its bus state: \
+             it has not sent its first heartbeat yet, or its NATS client could not be \
+             created (the agent logs \"running without messaging\")"
+                .to_string(),
         );
     };
 
@@ -7412,6 +7415,10 @@ mod honesty_tests {
         let (state, detail) = derive_nats_state(None);
         assert_eq!(state, Value::Null);
         assert!(detail.contains("not reported"), "detail was: {detail}");
+        // rc.6: a current agent omits it only before its first heartbeat or
+        // when its NATS client could not be created; never blame the build.
+        assert!(!detail.contains("build does not send"), "detail was: {detail}");
+        assert!(detail.contains("first heartbeat") && detail.contains("running without messaging"), "detail was: {detail}");
 
         let (state, _) = derive_nats_state(Some(&Value::Null));
         assert_eq!(state, Value::Null);
