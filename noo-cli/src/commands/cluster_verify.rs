@@ -2895,7 +2895,7 @@ pub(crate) fn netns_restore_row(systemd: bool, state: Option<crate::netns_unit::
 fn netns_restore_row_here(root: &std::path::Path) -> Check {
     use crate::netns_unit as nu;
     let systemd = nu::systemd_here();
-    let state = systemd.then(|| nu::render(&nu::owner(), &root.display().to_string()).ok().map(|u| nu::state(&u))).flatten();
+    let state = systemd.then(|| nu::render_here(&root.display().to_string()).ok().map(|u| nu::state(&u))).flatten();
     netns_restore_row(systemd, state)
 }
 
