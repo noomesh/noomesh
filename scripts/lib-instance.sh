@@ -253,7 +253,7 @@ noo_ensure_data_volume() {
     if docker volume inspect "$vol" >/dev/null 2>&1; then
         have="$(docker volume inspect -f '{{index .Options "device"}}' "$vol" 2>/dev/null)"
         dev="$(noo_data_device)"
-        if { [ -z "$have" ] || { [ -n "$dev" ] && [ "$have" != "$dev" ]; }; } && [ -z "$warned" ]; then
+        if { [ -z "$have" ] || { [ -n "$dev" ] && [ "$have" != "$dev" ]; }; }; then
             echo "WARNING: volume '$vol' is NOT bound to the data root (${dev:-NOO_DATA_ROOT unset}/): the gateway's data is at $(docker volume inspect -f '{{.Mountpoint}}' "$vol" 2>/dev/null)." >&2
             echo "         noo cluster verify shows it; moving it into the data root is a separate step (it is never done silently)." >&2
         fi
