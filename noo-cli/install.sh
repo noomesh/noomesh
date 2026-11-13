@@ -158,7 +158,9 @@ class_hint() {
 dl_fail() {
     DL_CLASS="$1"
     DL_REASON="$(class_hint "$1") [$2]"
-    info "error: ${DL_REASON}"
+    # DL_QUIET: the caller may still succeed another way (download() asks gh
+    # after a direct not-found/auth) and prints the final reason itself.
+    [ -n "${DL_QUIET:-}" ] || info "error: ${DL_REASON}"
     return 1
 }
 
@@ -188,37 +190,53 @@ gh_download() {
     done
 }
 
-# Download "$1" (url) to "$2" (path). gh for GitHub release assets, then
-# curl or wget. Fails nonzero with the classified cause on stderr.
+# Download "$1" (url) to "$2" (path): the direct curl/wget GET first, gh only
+# where it can help. A public release asset is served by GitHub's download
+# path, which the API rate limit (60 an hour per address, unauthenticated)
+# does not touch; `gh release download` goes through the API. With gh first,
+# an unauthenticated gh on a shared address (a hosted runner, an office NAT)
+# was refused "HTTP 403: API rate limit exceeded" and the install died
+# without trying the plain download at all (rc.3 install matrix, macos-15-node;
+# noomesh#1106 fixed the same order in the CLI). gh is asked only when the
+# direct GET answered not-found/unauthorised (what a PRIVATE repo or fork
+# answers to anyone; wget names that only as "other"), and then gh's cause
+# leads: a gh network failure is never reported as the direct lane's 404
+# (followup i11b). A direct rate/network/server/TLS failure is not handed to
+# gh: it would reach the same GitHub. Fails nonzero with the classified cause.
 download() {
     _url="$1"
     _out="$2"
     DL_CLASS=""; DL_REASON=""
+    _gh_ok=""
+    if have gh && printf '%s' "$_url" | grep -q 'releases/download/'; then _gh_ok=1; fi
+    DL_QUIET="$_gh_ok"
+    if direct_download "$_url" "$_out"; then DL_QUIET=""; DL_CLASS=""; return 0; fi
+    DL_QUIET=""
+    _d_class="$DL_CLASS"; _d_reason="$DL_REASON"
+    case "$_d_class" in
+        notfound|auth|other) [ -n "$_gh_ok" ] || return 1 ;;
+        *) [ -z "$_gh_ok" ] || info "error: ${_d_reason}"; return 1 ;;
+    esac
     _scratch="${tmpdir:-${TMPDIR:-/tmp}}"
     _gh_err="${_scratch}/.noo-dl-gh.$$"
-    _gh_class=""
-    _gh_msg=""
-    # The release assets are public, so plain curl/wget works. `gh` is an
-    # OPTIONAL path: when it is present and authenticated it is tried first
-    # (it downloads with the caller's credentials, which also covers a mirror
-    # or fork that is private, and avoids anonymous rate limits). Any failure
-    # falls through to curl/wget below; behaviour is unchanged.
-    if have gh && printf '%s' "$_url" | grep -q 'releases/download/'; then
-        _tag="${_url##*releases/download/}"; _asset="${_tag##*/}"; _tag="${_tag%%/*}"
-        if gh_download "$_tag" "$_asset" "$_gh_err" "$_out"; then
-            rm -f "$_gh_err"
-            DL_CLASS=""
-            return 0
-        fi
-        _gh_class="$DL_CLASS"
-        _gh_msg="$(tr '\n' ' ' < "$_gh_err" 2>/dev/null | redact)"
+    _tag="${_url##*releases/download/}"; _asset="${_tag##*/}"; _tag="${_tag%%/*}"
+    if gh_download "$_tag" "$_asset" "$_gh_err" "$_out"; then
         rm -f "$_gh_err"
-        case "$_gh_class" in
-            notfound|network|server|rate|tls)
-                dl_fail "$_gh_class" "gh release download ${_tag} -p ${_asset}: ${_gh_msg}"
-                return 1 ;;
-        esac
+        DL_CLASS=""; DL_REASON=""
+        return 0
     fi
+    _gh_msg="$(tr '\n' ' ' < "$_gh_err" 2>/dev/null | redact)"
+    rm -f "$_gh_err"
+    dl_fail "$DL_CLASS" "gh release download ${_tag} -p ${_asset}: ${_gh_msg}; the direct download answered first: ${_d_reason}"
+}
+
+# One direct GET of "$1" to "$2" with curl (or wget), retried for transient
+# failures. Sets DL_CLASS/DL_REASON on failure.
+direct_download() {
+    _url="$1"
+    _out="$2"
+    DL_CLASS=""; DL_REASON=""
+    _scratch="${tmpdir:-${TMPDIR:-/tmp}}"
     # PRIVATE-CA REALITY, handled by ADDING trust rather than removing it.
     # A controller mirror serves /bootstrap/cli under a certificate issued by
     # the CLUSTER CA, which a box that has not enrolled yet does not know. The
@@ -237,7 +255,6 @@ download() {
         _ca="${NOO_CLI_CACERT}"
     fi
     _also=""
-    [ -n "$_gh_class" ] && _also="; gh failed first: ${_gh_msg}"
     if have curl; then
         _hdr="${_scratch}/.noo-dl-hdr.$$"
         _cerr="${_scratch}/.noo-dl-curl.$$"
