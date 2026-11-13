@@ -18,10 +18,12 @@ This opens a streaming conversation; every turn shares one conversation id.
 `/exit` or `/quit` ends it. For a single turn that returns to the shell:
 
 ```bash
-noo chat --message "in two lines, what can you do on this machine?"
+noo chat --message "Say hello, then give me two short tips for keeping a home server healthy."
 ```
 
-`--model <m>` picks a model; without it the cluster chooses. The backend
+A small first model knows nothing about this computer, so ask it something
+general; the next section asks about your cluster. `--model <m>` picks a
+model; without it the cluster chooses. The backend
 that answered is shown on stderr. The full flag list is in
 [agents-and-channels.md](../cli/agents-and-channels.md).
 

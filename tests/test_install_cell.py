@@ -9,7 +9,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import subprocess
+
+import pytest
 import sys
 import time
 from pathlib import Path
@@ -471,3 +474,38 @@ def test_the_offboard_probe_is_skipped_by_name_on_a_root_cell():
     block = text[i:text.index("\nfi\n", i)]
     assert "PROBE SKIPPED: this cell runs as root (uid 0)" in block
     assert "\nelse\nstep probe-offboard-without-docker 600 -- sh -c '" in block, "the real probe still runs for a non-root cell"
+
+
+def _run_sh_var(name: str) -> str:
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    m = re.search(r"^%s='([^']*)'$" % name, text, re.M)
+    assert m, name
+    return m.group(1)
+
+
+def test_the_first_answer_step_asks_the_prompt_the_doc_gives():
+    # One source: the cell reads docs/getting-started/first-chat.md's first
+    # `noo chat --message "…"` line; the workflow checks that file out.
+    doc = (ROOT / "docs/getting-started/first-chat.md").read_text()
+    r = subprocess.run(["sed", "-n", r's/^noo chat --message "\(.*\)"$/\1/p'], input=doc, capture_output=True, text=True)
+    first = r.stdout.splitlines()[0]
+    assert first == "Say hello, then give me two short tips for keeping a home server healthy.", first
+    assert "this machine" not in first.lower(), "a small model cannot see the host"
+    wf = (ROOT / ".github/workflows/install-matrix.yml").read_text()
+    assert wf.count("docs/getting-started/first-chat.md") == 2, "both jobs check the doc out"
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    assert 'out="$(noo chat --message "$FIRST_PROMPT")"' in text
+
+
+@pytest.mark.parametrize("answer, bad", [
+    ("Please provide an image or description of the machine you are referring to.", True),  # gemma4:e2b, rc.4-rc.6
+    ("Could you clarify which machine you mean?", True),
+    ("I cannot see your computer, so I can't answer that.", True),
+    ("I don't have access to your system.", True),
+    ("Hello! 1. Keep the OS and packages updated. 2. Watch disk space and back up regularly.", False),
+    ("Hi there. Tip one: monitor temperatures. Tip two: test your backups.", False),
+])
+def test_a_request_for_more_input_or_a_refusal_is_not_an_answer(answer, bad):
+    rx = _run_sh_var("FIRST_ANSWER_NOT_AN_ANSWER")
+    r = subprocess.run(["grep", "-qiE", rx], input=answer, text=True)
+    assert (r.returncode == 0) is bad, (answer, r.returncode)
