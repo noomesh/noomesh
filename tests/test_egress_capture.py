@@ -157,3 +157,56 @@ def test_cleanup_never_waits_unbounded():
     body = code[code.index("cleanup() {"):code.index("\n}\n", code.index("cleanup() {"))]
     assert not re.search(r"^\s*wait(\s|$)", body, re.M), "no bare wait in cleanup"
     assert "kill -KILL" in body and "for _ in $(seq 1 50)" in body
+
+
+# 2026-11-13 (rc.5 rehearsal, install window): most CLI pulls were
+# "host process (unattributed)": a short connection (a redirect, a registry
+# token) opened and closed between two 0.2 s socket polls. The owner is now
+# looked up when conntrack reports the NEW connection. In an Alpine container
+# the same 12 HTTPS fetches went from 6 attributed / 5 unattributed (dev) to
+# 12 of 12 attributed.
+
+def _new_local_flow(host_ips: str, line: str) -> str:
+    src = SCRIPT.read_text()
+    fn = src[src.index("new_local_flow() {\n"):]
+    fn = fn[: fn.index("\n}\n") + 3]
+    run = subprocess.run(["bash", "-c", fn + 'HOST_IPS="$1"; new_local_flow "$2"', "_", host_ips, line],
+                         capture_output=True, text=True, timeout=30)
+    assert run.returncode == 0, run.stderr
+    return run.stdout.strip()
+
+
+def test_a_new_host_connection_is_named_by_its_local_tuple_in_either_order():
+    ips = "172.31.250.10 100.72.0.5 fd7a:115c:a1e0::1"
+    out_first = ("[1794585167.068] [NEW] tcp 6 120 SYN_SENT src=172.31.250.10 dst=140.82.114.34 sport=55586 dport=443 "
+                 "[UNREPLIED] src=140.82.114.34 dst=172.31.250.10 sport=443 dport=55586 id=7")
+    assert _new_local_flow(ips, out_first) == "140.82.114.34 55586"
+    reply_first = ("[1794585167.068] [NEW] tcp 6 300 ESTABLISHED src=146.75.38.132 dst=172.31.250.10 sport=443 dport=55240 "
+                   "src=172.31.250.10 dst=146.75.38.132 sport=55240 dport=443 id=8")
+    assert _new_local_flow(ips, reply_first) == "146.75.38.132 55240"
+    v6 = ("[NEW] tcp 6 120 SYN_SENT src=fd7a:115c:a1e0::1 dst=2606:50c0:8000::153 sport=40000 dport=443 "
+          "[UNREPLIED] src=2606:50c0:8000::153 dst=fd7a:115c:a1e0::1 sport=443 dport=40000")
+    assert _new_local_flow(ips, v6) == "2606:50c0:8000::153 40000"
+
+
+def test_a_containers_or_a_short_event_is_not_looked_up_as_the_hosts():
+    ips = "172.31.250.10"
+    container = ("[NEW] tcp 6 120 SYN_SENT src=172.19.0.7 dst=140.82.114.34 sport=41000 dport=443 "
+                 "[UNREPLIED] src=140.82.114.34 dst=172.31.250.10 sport=443 dport=41000")
+    assert _new_local_flow(ips, container) == "", "a container's flow is named by its container, not by ss"
+    assert _new_local_flow(ips, "[NEW] tcp src=172.31.250.10 dst=1.2.3.4") == ""
+    # a prefix of a host address is not the host address
+    assert _new_local_flow("172.31.250.1", container.replace("172.19.0.7", "172.31.250.10")) == ""
+
+
+def test_the_new_connection_reader_is_stoppable_and_writes_the_polls_rows():
+    src = SCRIPT.read_text()
+    code = "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
+    # conntrack's stdout feeds the reader through a process substitution, so $!
+    # is conntrack itself and cleanup can stop it (a pipe would leave $! the reader)
+    assert re.search(r"conntrack -E -e NEW -o extended 2>/dev/null > >\(while IFS= read -r line; do\n", code)
+    i = code.index("conntrack -E -e NEW -o extended 2>/dev/null > >(")
+    assert "PIDS+=($!)" in code[i:i + 900]
+    # both the poll and the NEW lookup write sockets.tsv through the same row format
+    assert code.count('awk -v t="$now" "$SS_ROW" >> "$OUT/sockets.tsv"') == 1
+    assert code.count('awk -v t="$(date +%s)" "$SS_ROW" >> "$OUT/sockets.tsv"') == 1
