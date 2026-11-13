@@ -128,7 +128,10 @@ services:
   prometheus_url: https://prometheus:9090  # env NOO_PROMETHEUS_URL
   alertmanager_url: https://alertmanager:9093  # env NOO_ALERTMANAGER_URL
   loki_url: ""                           # env NOO_LOKI_URL wins (compose sets https://loki:3100); empty in both = logs UI disabled
-  nvidia_exporter_url: https://nvidia-exporter:9400/metrics  # env NVIDIA_EXPORTER_URL (the exporter serves mTLS only)
+  # nvidia_exporter_url: unset = the controller's own exporter
+  #   (https://nvidia-exporter:9400/metrics), asked only while it runs.
+  #   Set it (or env NVIDIA_EXPORTER_URL) only to point at an exporter
+  #   elsewhere; the exporter serves mTLS only.
 
   # ── Embedding topology (the REAL call path, audited 2026-07-18) ────
   # ALL embedding traffic — Rust /api/external/embeddings, Rust memory/
