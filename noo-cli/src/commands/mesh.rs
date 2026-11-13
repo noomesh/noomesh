@@ -938,6 +938,14 @@ pub fn mesh_clean(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         if !g.json {
             ui::done(&format!("self-heal daemons stopped{}", if all || deep { " + watcher unit removed" } else { "" }));
         }
+        if all || deep {
+            // We remove what we install (#1108). `sudo -n`: a clean never prompts.
+            match crate::netns_unit::remove(false) {
+                Ok(true) if !g.json => ui::done(&format!("{} removed", crate::netns_unit::UNIT_NAME)),
+                Err(e) if !g.json => ui::warned(&format!("{e} — by hand: {}", crate::netns_unit::manual_removal())),
+                _ => {}
+            }
+        }
     }
 
     let script_args = clean_script_args(volumes, images, all, deep, cache, hf_cache, yes);
@@ -1719,5 +1727,17 @@ mod docker_gate_order_tests {
             assert!(!body.contains(m), "{m} in mesh_reset: {body}");
         }
         assert!(body.contains("run_script(g, \"noomesh-reset.sh\""), "{body}");
+    }
+}
+
+#[cfg(test)]
+mod netns_unit_clean_tests {
+    #[test]
+    fn a_full_clean_removes_the_namespace_restore_unit() {
+        let own = crate::test_src::own_code(include_str!("mesh.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn mesh_clean(");
+        let stop = body.find("stop_self_heal_daemons(").expect("the stop");
+        let rm = body.find("crate::netns_unit::remove(false)").expect("the clean removes the unit");
+        assert!(stop < rm, "{body}");
     }
 }

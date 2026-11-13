@@ -235,6 +235,35 @@ step probe-offboard-without-docker 600 -- sh -c '
   noo health >/dev/null 2>&1 || { echo "PROBE FAIL: noo health is not ok afterwards"; ok=0; }
   [ "$ok" = 1 ]' || PROBE_ALTERED=1
 
+# PROBE (fa, rc.1 rehearsal A-reboot.status, i677): a container that joins
+# another's network namespace (network_mode: service:<door>; noo-ollama-embed
+# joins noo-stunnel-ollama-embed) must be running after EVERY dockerd start.
+# rc.2 on a real dockerd: one start in five left it exited 128 ("cannot join
+# network namespace of a non running container") with nothing restarting it.
+# The fix is noo-netns-restore.service (onboard installs it; After=/PartOf=/
+# WantedBy=docker.service). Twenty restarts of dockerd (its restore is the
+# path a reboot takes), each read back and followed by a chat. Last, because it
+# disturbs the stack. A probe: read, never the cell's failed step.
+step probe-docker-restart-namespace-joiners 2700 -- sh -c '
+  echo "PROBE SCOPE: 20x systemctl restart docker on this throwaway hosted runner (the dockerd restore path a reboot takes). It does NOT cover noo-hostd boot-restore, which runs only at a real boot."
+  if [ -f /etc/systemd/system/noo-netns-restore.service ]; then echo "noo-netns-restore.service: installed"; else echo "noo-netns-restore.service: NOT installed (a release without the fix)"; fi
+  left=0; chats=0
+  for i in $(seq 1 20); do
+    sudo systemctl restart docker
+    t=0; while [ $t -lt 90 ]; do docker info >/dev/null 2>&1 && break; sleep 2; t=$((t+2)); done
+    sleep 20
+    for c in noo-stunnel-ollama-embed noo-ollama-embed noo-stunnel-ollama-embed-cpu noo-ollama-embed-cpu; do
+      line="$(docker inspect -f "{{.Name}} status={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}}" "$c" 2>/dev/null)" || continue
+      echo "restart $i: $line"
+      case "$line" in *status=running*) ;; *) left=$((left+1)) ;; esac
+    done
+    out="$(timeout 300 noo chat --message "reply with the word ok" 2>&1)" && chats=$((chats+1)) || echo "restart $i: chat FAILED: $(printf "%s" "$out" | tail -n 1 | cut -c1-160)"
+  done
+  sudo journalctl -u noo-netns-restore.service --no-pager 2>/dev/null | grep -F "noo-netns-restore:" | tail -n 20
+  docker --version
+  echo "NETNS PROBE: containers left not running after a restart=$left, chats answered=$chats of 20"
+  true'
+
 # ── 5. clean uninstall ──────────────────────────────────────────────────
 teardown
 finish

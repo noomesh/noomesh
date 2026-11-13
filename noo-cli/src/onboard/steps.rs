@@ -8103,7 +8103,7 @@ pub fn addons(ctx: &mut Ctx) {
 
 /// Write `body` to the root-owned `path` (root:root 0644) with `sudo tee`:
 /// the content goes over stdin, never through a shell string.
-fn sudo_write_root_file(may_prompt: bool, path: &str, body: &str) -> Result<(), String> {
+pub(crate) fn sudo_write_root_file(may_prompt: bool, path: &str, body: &str) -> Result<(), String> {
     use std::process::Stdio;
     let mut child = sudo_cmd(may_prompt)
         .args(["tee", path])
@@ -8125,6 +8125,55 @@ fn sudo_write_root_file(may_prompt: bool, path: &str, body: &str) -> Result<(), 
         }
     }
     Ok(())
+}
+
+/// Controller with systemd: install and enable noo-netns-restore.service (rc.2
+/// install matrix: one dockerd start in five left noo-ollama-embed exited 128,
+/// "cannot join network namespace of a non running container", and dockerd
+/// never retries it). Without systemd nothing is installed here; noo-hostd's
+/// boot-restore runs the same script at boot.
+pub fn install_netns_restore_unit(ctx: &mut Ctx) {
+    use crate::netns_unit as nu;
+    if ctx.state.mode == "worker" {
+        return;
+    }
+    if !nu::systemd_here() {
+        ctx.info("No systemd here: the namespace restore runs at boot through noo-hostd only.");
+        return;
+    }
+    let unit = match nu::render(&nu::owner(), &ctx.repo_root.display().to_string()) {
+        Ok(u) => u,
+        Err(e) => {
+            ctx.warn(&format!("{} not installed: {e}", nu::UNIT_NAME));
+            return;
+        }
+    };
+    if ctx.dry_run {
+        ctx.dry(&format!("install and enable {}", nu::UNIT_NAME));
+        return;
+    }
+    if nu::state(&unit) == nu::State::Current {
+        return;
+    }
+    match nu::install(ctx_sudo_may_prompt(ctx), &unit) {
+        Ok(()) => ctx.success(&format!("{} is enabled: after every dockerd start, a container that joins another's network is started once its door is up.", nu::UNIT_NAME)),
+        Err(e) => {
+            ctx.warn(&format!("{} not installed: {e}", nu::UNIT_NAME));
+            sudo_refused(ctx, "the namespace restore unit", nu::REMEDY);
+        }
+    }
+}
+
+#[cfg(test)]
+mod netns_unit_tests {
+    #[test]
+    fn onboard_installs_it_in_the_services_section() {
+        let m = crate::test_src::own_code(include_str!("mod.rs"));
+        let run = crate::test_src::fn_body(&m, "fn run_all(");
+        let rec = run.find("steps::at_rest_record(ctx);").expect("services section");
+        let unit = run.find("steps::install_netns_restore_unit(ctx);").expect("the unit is installed");
+        assert!(unit > rec, "{run}");
+    }
 }
 
 /// Controller only (i509): install `noo-addons-after-boot.service`, the
