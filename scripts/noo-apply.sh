@@ -1915,8 +1915,14 @@ fi
 # owned by them; no service restart involved.
 if [ -f "$WORK/files/cli-binary" ] && [ -s "$WORK/files/cli-user" ]; then
     CLI_USER="$(tr -d ' \n\r' < "$WORK/files/cli-user")"
+    # root is a valid cli-user: a node enrolled by root (a VPS, a root shell,
+    # the rehearsal's node2) installed its noo as root, in /root/.local/bin
+    # (install.sh's default for root). The "as the user" rule below exists so
+    # root never writes into a tree another account controls; for root that
+    # tree is root's own. Refusing root failed the whole bundle (exit 65) for
+    # every root-enrolled node since 0.6.0 (rc.3 rehearsal, A-pull.key).
     case "$CLI_USER" in
-        root|''|*[!a-z0-9_.-]*) echo "noo-apply: REFUSED — cli-user '$CLI_USER' is not an ordinary account name" >&2; exit 65 ;;
+        ''|*[!a-z0-9_.-]*) echo "noo-apply: REFUSED — cli-user '$CLI_USER' is not a valid account name" >&2; exit 65 ;;
     esac
     CLI_HOME="$(getent passwd "$CLI_USER" | cut -d: -f6)"
     case "$(head -c 20 "$WORK/files/cli-binary" | od -An -tx1 | tr -d ' \n')" in
@@ -1964,7 +1970,8 @@ fi
 # The controller's own bundle carries no CLI, so its tree is never touched.
 if [ -s "$WORK/files/cli-user" ]; then
     _rce_user="$(tr -d ' \n\r' < "$WORK/files/cli-user")"
-    case "$_rce_user" in root|''|*[!a-z0-9_.-]*) _rce_user="" ;; esac
+    # root included: its own ~/pai-assistant/.env is as stale as anyone's.
+    case "$_rce_user" in ''|*[!a-z0-9_.-]*) _rce_user="" ;; esac
     _rce_home=""
     [ -z "$_rce_user" ] || _rce_home="$(getent passwd "$_rce_user" | cut -d: -f6)"
     if [ -n "$_rce_home" ] && [ -d "$_rce_home" ]; then
