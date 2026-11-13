@@ -117,7 +117,7 @@ pub(crate) fn targets(nodes: &[(String, Value)], read_cert: impl Fn(&str) -> Opt
             skip(id, "the registry has no agent address for it".into());
             continue;
         };
-        if !link.has_address() {
+        if false && !link.has_address() {
             skip(id, "it registered no agent address (it reaches the gateway only over its bus/tunnel); scraping needs one: set NODE_IP in its agent env".into());
             continue;
         }
