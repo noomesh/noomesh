@@ -108,10 +108,10 @@ def test_start_calls_the_prep_and_keeps_no_inline_copy() -> None:
 
 def test_restart_prepares_when_it_recreates_the_gateway() -> None:
     body = _uncommented((SCRIPTS / "noomesh-restart.sh").read_text())
-    calls = re.findall(r"^\s*noo_prepare_gateway_data_dirs \|\| \{ .*exit 1; \}\s*$", body, re.M)
+    calls = re.findall(r"^\s*noo_prepare_gateway_data_dirs \$DATA_WARNED_ARG \|\| \{ .*exit 1; \}\s*$", body, re.M)
     assert len(calls) == 2, "noomesh-restart.sh must prepare on the whole-stack path and when `gateway` is named"
     named = body.index('SERVICES=("${RESOLVED_SERVICES[@]}")')
-    assert re.search(r"grep -qx gateway;\s*then\s*noo_prepare_gateway_data_dirs \|\|", body[named:]), (
+    assert re.search(r"grep -qx gateway;\s*then\s*noo_prepare_gateway_data_dirs \$DATA_WARNED_ARG \|\|", body[named:]), (
         "the named-services path must prepare after resolving names (an alias resolves to `gateway` only then)"
     )
 
@@ -268,3 +268,37 @@ def test_an_existing_bound_noo_data_is_quiet(tmp_path: Path) -> None:
     r, calls = _ensure(tmp_path, exists=True, device=f"{tmp_path}/data/noo-data", NOO_DATA_ROOT=str(tmp_path / "data"))
     assert r.returncode == 0 and "WARNING" not in r.stderr, r.stderr
     assert not any(c.startswith("volume create") for c in calls), calls
+
+
+def test_an_unbound_noo_data_is_warned_about_once_per_onboard(tmp_path: Path) -> None:
+    """rc.4 rehearsal B-reonboard: an onboard launches twice (services, then
+    the posture relaunch) and the warning printed both times. The relaunch
+    passes --data-warning-shown, which becomes --already-warned here: an
+    ARGUMENT, so an environment variable can never silence the warning."""
+    d = {n: tmp_path / n for n in ("plain", "envset", "arg")}
+    for p in d.values():
+        p.mkdir()
+        (p / ".env").write_text(f"NOO_DATA_ROOT={p}/data\n")
+
+    def ensure(where: Path, arg: str, **envs: str):
+        bindir, _ = _vol_fake(where, True, "")
+        env = {k: v for k, v in os.environ.items() if k not in ("NOO_DATA_ROOT", "NOO_STATE_ROOT", "COMPOSE_PROJECT_NAME")}
+        env.update(PATH=f"{bindir}:{os.environ['PATH']}", COMPOSE_PROJECT_NAME="proj", **envs)
+        return subprocess.run(["bash", "-c", f'. "{LIB_INSTANCE}" >/dev/null 2>&1; noo_prepare_gateway_data_dirs {arg}'],
+                              env=env, capture_output=True, text=True, cwd=where)
+
+    r = ensure(d["plain"], "")
+    assert r.returncode == 0 and "is NOT bound to the data root" in r.stderr, r.stderr
+    # Whatever the environment says, no argument means the warning prints.
+    r = ensure(d["envset"], "", NOO_DATA_VOLUME_WARNED="1", DATA_WARNED_ARG="--already-warned", warned="1")
+    assert r.returncode == 0 and "is NOT bound to the data root" in r.stderr, r.stderr
+    r = ensure(d["arg"], "--already-warned")
+    assert r.returncode == 0 and "is NOT bound to the data root" not in r.stderr, r.stderr
+
+
+def test_the_restart_takes_the_flag_from_its_argument_only() -> None:
+    text = (Path(__file__).resolve().parents[1] / "scripts" / "noomesh-restart.sh").read_text()
+    assert '\nDATA_WARNED_ARG=""\n' in text, "assigned before the argument loop, never read from the environment"
+    assert '--data-warning-shown)\n            DATA_WARNED_ARG="--already-warned"' in text
+    calls = text.count("noo_prepare_gateway_data_dirs ")
+    assert calls >= 2 and text.count("noo_prepare_gateway_data_dirs $DATA_WARNED_ARG ||") == calls, calls
