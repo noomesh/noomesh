@@ -663,6 +663,43 @@ mod tests {
         assert_eq!(v[0]["door"]["admit"], json!(["node-a"]));
     }
 
+    /// The PUT handler's path with no `--profile`, end to end through its
+    /// seams (the handler itself needs NATS, Postgres and the declaration
+    /// directory): `plan` (what PUT validates), the row PUT stores
+    /// (`profile: body.profile.clone()`), then the desired-config entry built
+    /// from that row and validated as the agent does. rc.3 rehearsal
+    /// BASE.SEED.nodewl.place: plan refused with "field_type: /profile is
+    /// null"; had a row existed, entries_for would have withheld the node's
+    /// whole node_workloads key.
+    #[test]
+    fn a_placement_with_no_profile_is_planned_stored_and_sent_without_the_key() {
+        let (d, raw) = decl();
+        // A main set that lists no load profiles: nothing asks for one.
+        let mut m = main_set();
+        m.needs.profiles.clear();
+        let src = Fake { main: Some(m), missing_set: None };
+        let body = PutBody { profile: None, ..body() };
+        let p = plan("rhaddon", &d, &raw, "node-a", &node(), &body, &src).expect("a profile-less placement is planned");
+        assert!(p.entry.get("profile").is_none(), "{}", p.entry);
+        // The row exactly as put_placement writes it.
+        let row = Placement {
+            addon: "rhaddon".into(),
+            workload: d.name.clone(),
+            node_id: "node-a".into(),
+            profile: body.profile.clone(),
+            sets: json!(body.sets),
+            env: json!(body.env),
+            on_controller: body.on_controller,
+            desired_state: "provisioned".into(),
+            reservation: None,
+        };
+        let NodeEntries::Entries(v) = entries_for("node-a", &node(), &[row], &REG, &src) else { panic!("withheld") };
+        assert_eq!(v.len(), 1);
+        assert!(v[0].get("profile").is_none(), "{}", v[0]);
+        let e = crate::node_workloads::validate_desired_entry(&v[0], "node-a").expect("the agent's validator accepts it");
+        assert_eq!(e.profile, None);
+    }
+
     #[test]
     fn no_rows_is_an_empty_list_not_a_withheld_key() {
         assert_eq!(entries_for("node-a", &json!({}), &[], &REG, &fake()), NodeEntries::Entries(vec![]));
