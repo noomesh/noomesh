@@ -131,9 +131,7 @@ pub fn build_entry(
         "reservation": reservation,
         "state": state,
     });
-    if let Some(p) = profile {
-        entry["profile"] = Value::String(p.to_string());
-    }
+    entry["profile"] = json!(profile);
     entry
 }
 
