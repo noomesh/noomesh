@@ -209,32 +209,6 @@ step first-answer 1800 -- sh -c 'out="$(noo chat --message "in two lines, what c
   printf "%s\n" "$out"; [ $rc = 0 ] && [ -n "$(printf "%s" "$out" | tr -d "[:space:]")" ]' || fail_onboarded
 meta first_answer_s "$(( $(date +%s) - CELL_START ))"
 
-# PROBE (fa, i677 finding 20; fix #1059): `noo offboard` run by a shell that
-# cannot reach docker (no supplementary groups, as for a stranger whose
-# shell lacks the docker group) must refuse and remove NOTHING: not even the
-# self-heal daemons (rc.2: the gate trusted an exit 0 with no version and
-# offboard stopped them first; the fix reads the version). A probe is
-# reported on its own and never becomes the cell's failed step; on releases
-# without #1059 it is expected to fail (it wiped the box).
-step probe-offboard-without-docker 600 -- sh -c '
-  # What THIS docker answers in that shell (rc.2: Docker 28.0.4 let the gate
-  # pass; is it "exit 0, empty version"?): read, never judged.
-  sudo setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --reset-env \
-       env HOME="$HOME" PATH="$PATH" docker info --format "{{.ServerVersion}}" >/tmp/noo-di.out 2>/tmp/noo-di.err; di_rc=$?
-  echo "DOCKER-INFO without the docker group: exit=$di_rc stdout-bytes=$(tr -d "[:space:]" </tmp/noo-di.out | wc -c) stderr1=$(grep -m1 -v "^[[:space:]]*$" /tmp/noo-di.err | cut -c1-200)"
-  rm -f /tmp/noo-di.out /tmp/noo-di.err
-  out="$(sudo setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --reset-env \
-         env HOME="$HOME" PATH="$PATH" noo offboard -y 2>&1)"; rc=$?
-  printf "%s\n" "$out"; ok=1
-  [ "$rc" != 0 ] || { echo "PROBE FAIL: offboard without docker exited 0"; ok=0; }
-  printf "%s" "$out" | grep -q "cannot reach docker" || { echo "PROBE FAIL: it did not say it cannot reach docker"; ok=0; }
-  printf "%s" "$out" | grep -q "nothing was removed" || { echo "PROBE FAIL: it did not say nothing was removed"; ok=0; }
-  docker ps -q --filter name=noo-gateway | grep -q . || { echo "PROBE FAIL: the gateway container is gone"; ok=0; }
-  [ -d "$HOME/.noo" ] || { echo "PROBE FAIL: ~/.noo is gone"; ok=0; }
-  [ -d /var/lib/noo ] || { echo "PROBE FAIL: /var/lib/noo is gone"; ok=0; }
-  noo health >/dev/null 2>&1 || { echo "PROBE FAIL: noo health is not ok afterwards"; ok=0; }
-  [ "$ok" = 1 ]' || PROBE_ALTERED=1
-
 # PROBE (fa, rc.1 rehearsal A-reboot.status, i677): a container that joins
 # another's network namespace (network_mode: service:<door>; noo-ollama-embed
 # joins noo-stunnel-ollama-embed) must be running after EVERY dockerd start.
@@ -242,8 +216,9 @@ step probe-offboard-without-docker 600 -- sh -c '
 # network namespace of a non running container") with nothing restarting it.
 # The fix is noo-netns-restore.service (onboard installs it; After=/PartOf=/
 # WantedBy=docker.service). Twenty restarts of dockerd (its restore is the
-# path a reboot takes), each read back and followed by a chat. Last, because it
-# disturbs the stack. A probe: read, never the cell's failed step.
+# path a reboot takes), each read back and followed by a chat. BEFORE the
+# offboard probe, which can take the install down (rc.3 run 1: it did, and every
+# chat here then failed). A probe: read, never the cell's failed step.
 step probe-docker-restart-namespace-joiners 2700 -- sh -c '
   echo "PROBE SCOPE: 20x systemctl restart docker on this throwaway hosted runner (the dockerd restore path a reboot takes). It does NOT cover noo-hostd boot-restore, which runs only at a real boot."
   if [ -f /etc/systemd/system/noo-netns-restore.service ]; then echo "noo-netns-restore.service: installed"; else echo "noo-netns-restore.service: NOT installed (a release without the fix)"; fi
@@ -263,6 +238,38 @@ step probe-docker-restart-namespace-joiners 2700 -- sh -c '
   docker --version
   echo "NETNS PROBE: containers left not running after a restart=$left, chats answered=$chats of 20"
   true'
+
+# PROBE (fa, i677 finding 20; fix #1059): `noo offboard` run by a shell that
+# cannot reach docker (no supplementary groups, as for a stranger whose
+# shell lacks the docker group) must refuse and remove NOTHING: not even the
+# self-heal daemons (rc.2: the gate trusted an exit 0 with no version and
+# offboard stopped them first; the fix reads the version). A probe is
+# reported on its own and never becomes the cell's failed step; on releases
+# without #1059 it is expected to fail (it wiped the box).
+step probe-offboard-without-docker 600 -- sh -c '
+  # What THIS docker answers in that shell (rc.2: Docker 28.0.4 let the gate
+  # pass; is it "exit 0, empty version"?): read, never judged.
+  sudo setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --reset-env \
+       env HOME="$HOME" PATH="$PATH" docker info --format "{{.ServerVersion}}" >/tmp/noo-di.out 2>/tmp/noo-di.err; di_rc=$?
+  echo "DOCKER-INFO without the docker group: exit=$di_rc stdout-bytes=$(tr -d "[:space:]" </tmp/noo-di.out | wc -c) stderr1=$(grep -m1 -v "^[[:space:]]*$" /tmp/noo-di.err | cut -c1-200)"
+  rm -f /tmp/noo-di.out /tmp/noo-di.err
+  # NOO_DOCKER_GROUP_RELAUNCHED=1: the docker-group relaunch (#1064) is
+  # spent, as for a user who is NOT in the docker group. The runner user is
+  # in it (/etc/group), so without the marker `sg docker` relaunches the
+  # offboard WITH docker and -y removes the install, which is what -y asks
+  # (rc.3 run 1); the refusal this probe tests is then never reached.
+  out="$(sudo setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --reset-env \
+         env HOME="$HOME" PATH="$PATH" NOO_DOCKER_GROUP_RELAUNCHED=1 noo offboard -y 2>&1)"; rc=$?
+  printf "%s\n" "$out"; ok=1
+  [ "$rc" != 0 ] || { echo "PROBE FAIL: offboard without docker exited 0"; ok=0; }
+  printf "%s" "$out" | grep -q "cannot reach docker" || { echo "PROBE FAIL: it did not say it cannot reach docker"; ok=0; }
+  printf "%s" "$out" | grep -q "nothing was removed" || { echo "PROBE FAIL: it did not say nothing was removed"; ok=0; }
+  docker ps -q --filter name=noo-gateway | grep -q . || { echo "PROBE FAIL: the gateway container is gone"; ok=0; }
+  [ -d "$HOME/.noo" ] || { echo "PROBE FAIL: ~/.noo is gone"; ok=0; }
+  [ -d /var/lib/noo ] || { echo "PROBE FAIL: /var/lib/noo is gone"; ok=0; }
+  noo health >/dev/null 2>&1 || { echo "PROBE FAIL: noo health is not ok afterwards"; ok=0; }
+  [ "$ok" = 1 ]' || PROBE_ALTERED=1
+
 
 # ── 5. clean uninstall ──────────────────────────────────────────────────
 teardown
