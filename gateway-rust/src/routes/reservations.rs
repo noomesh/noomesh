@@ -886,6 +886,11 @@ async fn workload_proxy(
     let upstream = format!("/api/containers/{}/proxy/{}{query}", decl.container, path.trim_start_matches('/'));
 
     if is_websocket_upgrade(&parts.headers) {
+        // The relay dials the agent's address; the tunnel does not carry a
+        // websocket session.
+        if !link.has_address() {
+            return Err(AppError::NotFound(crate::node_link::needs_address_message(&node, "a websocket session to its workload")));
+        }
         use axum::extract::FromRequestParts;
         let protocol = parts.headers.get("sec-websocket-protocol").and_then(|v| v.to_str().ok()).map(str::to_string);
         let ws = axum::extract::ws::WebSocketUpgrade::from_request_parts(&mut parts, &()).await.map_err(|e| AppError::BadRequest(format!("websocket upgrade: {e}")))?;

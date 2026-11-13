@@ -751,6 +751,13 @@ pub(crate) async fn mesh_targets(
             skipped_no_agent.push(peer.node_id.clone());
             continue;
         };
+        // A mesh target is an address the caller dials: a node reached only
+        // over its bus/tunnel has none to give (as before this link existed).
+        if !link.has_address() {
+            tracing::warn!(node = %peer.node_id, capability, "mesh_target_skipped_no_https_address");
+            skipped_no_agent.push(peer.node_id.clone());
+            continue;
+        }
         // Routing reads the node's ROLE capabilities, derived from its
         // placements (`role_capability`), and nothing else:
         //  * a node with no running placement for this role never receives the
