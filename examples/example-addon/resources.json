@@ -1,0 +1,21 @@
+{
+  "format": "noo-addon-resources/1",
+  "uid": 1000,
+  "mounts": [
+    {"name": "work", "env": "EXAMPLE_ADDON_WORK_DIR", "target": "/run/example-addon"}
+  ],
+  "resources": [
+    {"name": "gateway-url", "kind": "gateway", "part": "url", "deliver": {"env": "EXAMPLE_ADDON_GATEWAY_URL"}},
+    {"name": "gateway-ca", "kind": "gateway", "part": "ca", "deliver": {"file": "work/ca.crt"}},
+    {"name": "leaf-cert", "kind": "tls_leaf", "hostname": "noo-example-addon", "part": "cert", "deliver": {"file": "work/leaf.crt"}},
+    {"name": "leaf-key", "kind": "tls_leaf", "hostname": "noo-example-addon", "part": "key", "deliver": {"file": "work/leaf.key"}},
+    {"name": "addon-key", "kind": "addon_key", "deliver": {"file": "work/addon-key"}},
+    {"name": "db-url", "kind": "db", "part": "url", "deliver": {"file": "work/db/url"}},
+    {"name": "db-ca", "kind": "db", "part": "ca", "deliver": {"file": "work/db/ca.crt"}},
+    {"name": "db-cert", "kind": "db", "part": "cert", "deliver": {"file": "work/db/client.crt"}},
+    {"name": "db-key", "kind": "db", "part": "key", "deliver": {"file": "work/db/client.key"}},
+    {"name": "db-pass", "kind": "db", "part": "passfile", "deliver": {"file": "work/db/pgpass"}},
+    {"name": "gw-net", "kind": "network", "network": "gateway", "deliver": {"env": "EXAMPLE_ADDON_GATEWAY_NETWORK"}},
+    {"name": "db-net", "kind": "network", "network": "db", "deliver": {"env": "EXAMPLE_ADDON_DB_NETWORK"}}
+  ]
+}

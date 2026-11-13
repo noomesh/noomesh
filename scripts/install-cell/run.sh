@@ -72,6 +72,55 @@ hook() {  # a mode's steps written by another owner (see the workflow)
     "$f"
 }
 
+# DIAGNOSTIC (fa, rc.3 matrix run 2: the WSL2 cell placed a model and its
+# node read "no lanes" two minutes later, with no agent log to say why): on
+# EVERY failed step or probe, the node agent's status and its last 200 log
+# lines, as a step of its own, so the same redactor and upload scan apply.
+# Also after the model step SUCCEEDS (agent-state-after-model): the
+# placement is made there, so a passing cell (22.04) and a failing one
+# (WSL2) can be read side by side: does a reconcile follow the place within
+# seconds, is the backend native/adopted or managed, did the gateway log
+# reconcile_nudged for the node. Each dump also carries `noo --json cluster
+# show <this node>` and the gateway's reconcile_nudge*/placement lines.
+# systemd hosts: systemctl status + journalctl. Without systemd: the agent
+# process (if any), launchd's view on macOS and the log file the plist names.
+# Never the env file (it holds the agent's token). At most 5 dumps per cell.
+AGENT_DUMPS=0
+agent_dump() {
+    [ "$AGENT_DUMPS" -lt 5 ] || return 0
+    AGENT_DUMPS=$((AGENT_DUMPS + 1))
+    step "agent-state-after-$1" 120 -- sh -c '
+      if command -v systemctl >/dev/null 2>&1 && [ -d "${CELL_SYSTEMD_DIR:-/run/systemd/system}" ]; then
+        echo "== systemctl status noo-node-agent"; sudo -n systemctl status noo-node-agent --no-pager -l 2>&1 | head -40
+        echo "== journalctl -u noo-node-agent (last 200)"; sudo -n journalctl -u noo-node-agent --no-pager -n 200 2>&1
+      else
+        echo "== no systemd on this host: the agent process"
+        ps -eo pid,etime,args 2>/dev/null | grep -E "[n]oo-node-agent|[n]oomesh-agent" || echo "(no noo-node-agent process)"
+        if command -v launchctl >/dev/null 2>&1; then
+          echo "== launchctl list (noo*)"; launchctl list 2>/dev/null | grep -i noo || echo "(no noo launchd job)"
+        fi
+        for f in /tmp/noomesh-agent.log /var/log/noo-node-agent.log; do
+          [ -f "$f" ] && { echo "== $f (last 200)"; tail -n 200 "$f"; }
+        done
+      fi
+      if command -v noo >/dev/null 2>&1; then
+        echo "== noo --json cluster show $(hostname) (this node: lanes, placements, backends)"
+        timeout 60 noo --json cluster show "$(hostname)" 2>&1 | head -c 20000; echo
+      fi
+      if docker inspect noo-gateway >/dev/null 2>&1; then
+        echo "== noo-gateway: nudges and placements (last 15 min)"
+        docker logs --since 15m noo-gateway 2>&1 | grep -E "reconcile_nudge|placement" | tail -n 40
+      fi
+      true'
+    return 0
+}
+ON_STEP_FAIL=agent_dump
+# The mode hooks (prep-no-docker.sh, onboard-interactive.sh) are child bash
+# processes that source lib.sh: they inherit the hook this way. Their dump
+# count starts at 0 again, so a hook adds at most 5 of its own.
+export ON_STEP_FAIL AGENT_DUMPS
+export -f agent_dump
+
 # ── 1. the box ──────────────────────────────────────────────────────────
 step box 120 -- sh -c 'uname -a; cat /etc/os-release 2>/dev/null | head -3; sw_vers 2>/dev/null;
   nproc 2>/dev/null || sysctl -n hw.ncpu; free -m 2>/dev/null || sysctl -n hw.memsize; df -h /;
@@ -175,6 +224,8 @@ elif [ "$MODEL" = tiny ]; then
 else
     step onboard 3600 -- noo onboard --ci || fail_onboarded
 fi
+# The model was placed above: the agent's view on success too (see agent_dump).
+agent_dump model
 
 # ── 4. up, verified, answering ──────────────────────────────────────────
 step stack-start 1800 -- noo stack start || fail_onboarded
@@ -209,32 +260,6 @@ step first-answer 1800 -- sh -c 'out="$(noo chat --message "in two lines, what c
   printf "%s\n" "$out"; [ $rc = 0 ] && [ -n "$(printf "%s" "$out" | tr -d "[:space:]")" ]' || fail_onboarded
 meta first_answer_s "$(( $(date +%s) - CELL_START ))"
 
-# PROBE (fa, i677 finding 20; fix #1059): `noo offboard` run by a shell that
-# cannot reach docker (no supplementary groups, as for a stranger whose
-# shell lacks the docker group) must refuse and remove NOTHING: not even the
-# self-heal daemons (rc.2: the gate trusted an exit 0 with no version and
-# offboard stopped them first; the fix reads the version). A probe is
-# reported on its own and never becomes the cell's failed step; on releases
-# without #1059 it is expected to fail (it wiped the box).
-step probe-offboard-without-docker 600 -- sh -c '
-  # What THIS docker answers in that shell (rc.2: Docker 28.0.4 let the gate
-  # pass; is it "exit 0, empty version"?): read, never judged.
-  sudo setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --reset-env \
-       env HOME="$HOME" PATH="$PATH" docker info --format "{{.ServerVersion}}" >/tmp/noo-di.out 2>/tmp/noo-di.err; di_rc=$?
-  echo "DOCKER-INFO without the docker group: exit=$di_rc stdout-bytes=$(tr -d "[:space:]" </tmp/noo-di.out | wc -c) stderr1=$(grep -m1 -v "^[[:space:]]*$" /tmp/noo-di.err | cut -c1-200)"
-  rm -f /tmp/noo-di.out /tmp/noo-di.err
-  out="$(sudo setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --reset-env \
-         env HOME="$HOME" PATH="$PATH" noo offboard -y 2>&1)"; rc=$?
-  printf "%s\n" "$out"; ok=1
-  [ "$rc" != 0 ] || { echo "PROBE FAIL: offboard without docker exited 0"; ok=0; }
-  printf "%s" "$out" | grep -q "cannot reach docker" || { echo "PROBE FAIL: it did not say it cannot reach docker"; ok=0; }
-  printf "%s" "$out" | grep -q "nothing was removed" || { echo "PROBE FAIL: it did not say nothing was removed"; ok=0; }
-  docker ps -q --filter name=noo-gateway | grep -q . || { echo "PROBE FAIL: the gateway container is gone"; ok=0; }
-  [ -d "$HOME/.noo" ] || { echo "PROBE FAIL: ~/.noo is gone"; ok=0; }
-  [ -d /var/lib/noo ] || { echo "PROBE FAIL: /var/lib/noo is gone"; ok=0; }
-  noo health >/dev/null 2>&1 || { echo "PROBE FAIL: noo health is not ok afterwards"; ok=0; }
-  [ "$ok" = 1 ]' || PROBE_ALTERED=1
-
 # PROBE (fa, rc.1 rehearsal A-reboot.status, i677): a container that joins
 # another's network namespace (network_mode: service:<door>; noo-ollama-embed
 # joins noo-stunnel-ollama-embed) must be running after EVERY dockerd start.
@@ -242,8 +267,9 @@ step probe-offboard-without-docker 600 -- sh -c '
 # network namespace of a non running container") with nothing restarting it.
 # The fix is noo-netns-restore.service (onboard installs it; After=/PartOf=/
 # WantedBy=docker.service). Twenty restarts of dockerd (its restore is the
-# path a reboot takes), each read back and followed by a chat. Last, because it
-# disturbs the stack. A probe: read, never the cell's failed step.
+# path a reboot takes), each read back and followed by a chat. BEFORE the
+# offboard probe, which can take the install down (rc.3 run 1: it did, and every
+# chat here then failed). A probe: read, never the cell's failed step.
 step probe-docker-restart-namespace-joiners 2700 -- sh -c '
   echo "PROBE SCOPE: 20x systemctl restart docker on this throwaway hosted runner (the dockerd restore path a reboot takes). It does NOT cover noo-hostd boot-restore, which runs only at a real boot."
   if [ -f /etc/systemd/system/noo-netns-restore.service ]; then echo "noo-netns-restore.service: installed"; else echo "noo-netns-restore.service: NOT installed (a release without the fix)"; fi
@@ -263,6 +289,40 @@ step probe-docker-restart-namespace-joiners 2700 -- sh -c '
   docker --version
   echo "NETNS PROBE: containers left not running after a restart=$left, chats answered=$chats of 20"
   true'
+
+# PROBE (fa, i677 finding 20; fix #1059): `noo offboard` run by a shell that
+# cannot reach docker (no supplementary groups, as for a stranger whose
+# shell lacks the docker group) must refuse and remove NOTHING: not even the
+# self-heal daemons (rc.2: the gate trusted an exit 0 with no version and
+# offboard stopped them first; the fix reads the version). A probe is
+# reported on its own and never becomes the cell's failed step; on releases
+# without #1059 it is expected to fail (it wiped the box).
+step probe-offboard-without-docker 600 -- sh -c '
+  # What THIS docker answers in that shell (rc.2: Docker 28.0.4 let the gate
+  # pass; is it "exit 0, empty version"?): read, never judged.
+  sudo setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --reset-env \
+       env HOME="$HOME" PATH="$PATH" docker info --format "{{.ServerVersion}}" >/tmp/noo-di.out 2>/tmp/noo-di.err; di_rc=$?
+  echo "DOCKER-INFO without the docker group: exit=$di_rc stdout-bytes=$(tr -d "[:space:]" </tmp/noo-di.out | wc -c) stderr1=$(grep -m1 -v "^[[:space:]]*$" /tmp/noo-di.err | cut -c1-200)"
+  rm -f /tmp/noo-di.out /tmp/noo-di.err
+  # NOO_DOCKER_GROUP_RELAUNCHED=1: the docker-group relaunch (#1064) is
+  # spent, as for a user who is NOT in the docker group. The runner user is
+  # in it (/etc/group), so without the marker `sg docker` relaunches the
+  # offboard WITH docker and -y removes the install, which is what -y asks
+  # (rc.3 run 1); the refusal this probe tests is then never reached.
+  out="$(sudo setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --reset-env \
+         env HOME="$HOME" PATH="$PATH" NOO_DOCKER_GROUP_RELAUNCHED=1 noo offboard -y 2>&1)"; rc=$?
+  printf "%s\n" "$out"; ok=1
+  [ "$rc" != 0 ] || { echo "PROBE FAIL: offboard without docker exited 0"; ok=0; }
+  # Case-insensitive: the failure line is printed capitalised ("x Cannot reach
+  # docker (…): nothing was removed"; rc.3 run 43351232102).
+  printf "%s" "$out" | grep -qi "cannot reach docker" || { echo "PROBE FAIL: it did not say it cannot reach docker"; ok=0; }
+  printf "%s" "$out" | grep -qi "nothing was removed" || { echo "PROBE FAIL: it did not say nothing was removed"; ok=0; }
+  docker ps -q --filter name=noo-gateway | grep -q . || { echo "PROBE FAIL: the gateway container is gone"; ok=0; }
+  [ -d "$HOME/.noo" ] || { echo "PROBE FAIL: ~/.noo is gone"; ok=0; }
+  [ -d /var/lib/noo ] || { echo "PROBE FAIL: /var/lib/noo is gone"; ok=0; }
+  noo health >/dev/null 2>&1 || { echo "PROBE FAIL: noo health is not ok afterwards"; ok=0; }
+  [ "$ok" = 1 ]' || PROBE_ALTERED=1
+
 
 # ── 5. clean uninstall ──────────────────────────────────────────────────
 teardown

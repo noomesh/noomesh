@@ -117,6 +117,10 @@ pub(crate) fn targets(nodes: &[(String, Value)], read_cert: impl Fn(&str) -> Opt
             skip(id, "the registry has no agent address for it".into());
             continue;
         };
+        if !link.has_address() {
+            skip(id, "it registered no agent address (it reaches the gateway only over its bus/tunnel); scraping needs one: set NODE_IP in its agent env".into());
+            continue;
+        }
         let Some((host, port)) = host_port(link.base()) else {
             skip(id, format!("its agent address {} is not an https URL with a host", link.base()));
             continue;
@@ -260,6 +264,17 @@ mod tests {
             let (body, skipped) = targets(&[("a".into(), r.clone())], |_| Some(pem.clone()));
             assert!(body.is_empty() && skipped.len() == 1, "{r}");
         }
+    }
+
+    /// A node reached only over its bus/tunnel (no address, i736) is not a
+    /// scrape target, and the reason says why and what fixes it.
+    #[test]
+    fn a_node_reached_only_over_its_bus_or_tunnel_is_left_out_naming_why() {
+        let pem = leaf(&["a"], &["10.0.0.1"]);
+        let r = json!({"agent_url": "", "ip_address": "", "control_transports": {"nats_rpc": true, "tunnel": true}});
+        let (body, skipped) = targets(&[("a".into(), r)], |_| Some(pem.clone()));
+        assert!(body.is_empty() && skipped.len() == 1);
+        assert!(skipped[0].reason.contains("bus/tunnel") && skipped[0].reason.contains("NODE_IP"), "{}", skipped[0].reason);
     }
 
     #[test]

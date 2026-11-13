@@ -660,8 +660,13 @@ async fn resolve_skill_node(
     needs_gpu: bool,
 ) -> Result<(String, String), AppError> {
     if let Some(nid) = node_id {
-        let url = crate::node_link::NodeLink::for_node(state, nid).await?.base().to_string();
-        return Ok((nid.to_string(), url));
+        let link = crate::node_link::NodeLink::for_node(state, nid).await?;
+        // The skill runner is handed an address, not a link: a node reached
+        // only over its bus/tunnel cannot take it.
+        if !link.has_address() {
+            return Err(AppError::NotFound(crate::node_link::needs_address_message(nid, "running a skill on it")));
+        }
+        return Ok((nid.to_string(), link.base().to_string()));
     }
 
     // Auto-select: scan NATS KV for least-loaded node

@@ -82,8 +82,8 @@ pub const BUNDLE_MEDIA_TYPE: &str = "application/vnd.noomesh.addon-bundle.v1+jso
 pub const FILE_MEDIA_TYPE: &str = "application/vnd.noomesh.addon-file.v1";
 /// No add-on ships more files than this beside its images.
 pub const MAX_FILES: usize = 32;
-const TITLE_ANNOTATION: &str = "org.opencontainers.image.title";
-const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json";
+pub(crate) const TITLE_ANNOTATION: &str = "org.opencontainers.image.title";
+pub(crate) const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json";
 /// No lock or signature is anywhere near this; a larger blob is refused
 /// before it is read.
 pub const MAX_BLOB: u64 = 1 << 20;
@@ -94,7 +94,7 @@ pub const MAX_BLOB: u64 = 1 << 20;
 pub const TOKEN_KEY: &str = "NOO_ADDON_REGISTRY_TOKEN";
 /// The user name sent with it. Optional; GHCR checks only the token.
 pub const USER_KEY: &str = "NOO_ADDON_REGISTRY_USER";
-const DEFAULT_USER: &str = "noo";
+pub(crate) const DEFAULT_USER: &str = "noo";
 /// The only registry host the vendor token (`NOO_ADDON_REGISTRY_TOKEN`) is
 /// ever presented to. A Direct route to any other host gets no credential from
 /// it, so a caller that forgets to swap in a third-party client cannot leak it.
@@ -248,7 +248,7 @@ impl std::fmt::Debug for Credential {
 }
 
 impl Credential {
-    fn basic(&self) -> String {
+    pub(crate) fn basic(&self) -> String {
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", self.user, self.token))
     }
@@ -657,7 +657,7 @@ impl Client {
     }
 }
 
-fn agent(https_only: bool, max_redirects: u32) -> ureq::Agent {
+pub(crate) fn agent(https_only: bool, max_redirects: u32) -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(60)))
         .http_status_as_error(false)
@@ -668,7 +668,7 @@ fn agent(https_only: bool, max_redirects: u32) -> ureq::Agent {
         .into()
 }
 
-fn read_capped(resp: ureq::http::Response<ureq::Body>, cap: u64, what: &str) -> Result<Vec<u8>, FetchError> {
+pub(crate) fn read_capped(resp: ureq::http::Response<ureq::Body>, cap: u64, what: &str) -> Result<Vec<u8>, FetchError> {
     let mut buf = Vec::new();
     resp.into_body()
         .into_reader()
@@ -686,7 +686,7 @@ fn hex(b: &[u8]) -> String {
 }
 
 /// Percent-encode a query value (scope strings carry `:` and `/`).
-fn pct(s: &str) -> String {
+pub(crate) fn pct(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
@@ -697,7 +697,7 @@ fn pct(s: &str) -> String {
 
 /// The first `message` of a registry error body
 /// (`{"errors":[{"code","message","detail"}]}`).
-fn registry_error_message(body: &[u8]) -> Option<String> {
+pub(crate) fn registry_error_message(body: &[u8]) -> Option<String> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     let m = v.pointer("/errors/0/message")?.as_str()?.trim();
     (!m.is_empty()).then(|| m.chars().take(300).collect())
@@ -851,16 +851,20 @@ pub(crate) mod fake {
     //! A scripted OCI registry on loopback. It records every request line
     //! and its Authorization header, so tests assert what crossed the wire.
     use std::collections::BTreeMap;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Debug)]
     pub struct Seen {
+        /// The request method (`GET`, `HEAD`, `POST`, `PUT`).
+        pub method: String,
         pub path: String,
         pub auth: Option<String>,
         /// Every request header, name lowercased.
         pub headers: Vec<(String, String)>,
+        /// The request body, read by its Content-Length (empty without one).
+        pub body: Vec<u8>,
     }
 
     impl Seen {
@@ -934,8 +938,15 @@ pub(crate) mod fake {
                         headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
                     }
                 }
-                let path = first.split_whitespace().nth(1).unwrap_or("").to_string();
-                let req = Seen { path, auth, headers };
+                let mut words = first.split_whitespace();
+                let method = words.next().unwrap_or("").to_string();
+                let path = words.next().unwrap_or("").to_string();
+                let len = headers.iter().find(|(k, _)| k == "content-length").and_then(|(_, v)| v.parse::<usize>().ok()).unwrap_or(0);
+                let mut body = vec![0u8; len];
+                if rd.read_exact(&mut body).is_err() {
+                    body.clear();
+                }
+                let req = Seen { method, path, auth, headers, body };
                 s2.lock().unwrap().push(req.clone());
                 let (status, hdrs, body) = handler(&req);
                 let mut resp = format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n", body.len());

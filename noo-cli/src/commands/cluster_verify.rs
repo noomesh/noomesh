@@ -122,6 +122,31 @@ pub(crate) fn self_agent_lane_check(
     }
 }
 
+/// What needs a direct HTTPS address to a node (the gateway's
+/// `needs_address_message` callers), named once wherever an address-less node
+/// is shown. Everything else reaches such a node over its bus/tunnel.
+pub(crate) const NEEDS_ADDRESS: &str =
+    "running a skill on it, a websocket session to a workload on it, and the Prometheus scrape of its agent";
+
+/// A node that registered no HTTPS address (no `agent_url`, no `ip_address`)
+/// but holds an outbound transport to the controller: which one(s). `None`
+/// when it has an address, or has neither. A one-machine install whose
+/// hostname resolves only to loopback (the stock Debian-family
+/// `127.0.1.1 <hostname>` line; WSL2) registers like this.
+pub(crate) fn outbound_only(n: &Value) -> Option<&'static str> {
+    let has = |k: &str| n[k].as_str().is_some_and(|s| !s.trim().is_empty());
+    if has("agent_url") || has("ip_address") {
+        return None;
+    }
+    let t = &n["control_transports"];
+    match (t["nats_rpc"].as_bool() == Some(true), t["tunnel"].as_bool() == Some(true)) {
+        (true, true) => Some("its bus and its tunnel"),
+        (true, false) => Some("its bus"),
+        (false, true) => Some("its tunnel"),
+        (false, false) => None,
+    }
+}
+
 /// The `control over bus` row. The verdicts, in order:
 /// - the node does not advertise `control_transports.nats_rpc` (an older
 ///   agent, or one whose subscription the controller's NATS file refused):
@@ -502,15 +527,23 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     //     account in its heartbeat.
     out.push(log_shipper_check(id, &n["log_ship"], now_unix, hb_recent));
 
-    // 7. Inbound: the controller can reach the agent.
-    match n["inbound"].as_str() {
+    // 7. Inbound: the controller can reach the agent. A node with no address
+    //    that holds its bus/tunnel is reached that way: say so, and name the
+    //    few things that do need an address, instead of a NODE_IP warning for
+    //    things that work (rc.3 matrix, windows-2025-wsl2).
+    if let (Some(via), None | Some("unknown")) = (outbound_only(n), n["inbound"].as_str()) {
+        out.push(ok("inbound", format!(
+            "no HTTPS address on record: the controller reaches this node over {via}, which carries its control and streaming calls; \
+             only {NEEDS_ADDRESS} need an address (set NODE_IP in its agent env for those)"
+        )));
+    } else { match n["inbound"].as_str() {
         Some("ok") => out.push(ok("inbound", "agent reachable from the controller")),
         // `unknown` is the gateway saying it had no address to dial: nothing
         // was checked, so it is not a failed check (i276).
         Some("unknown") => out.push(warn("inbound", "NOT CHECKED — the controller has no address on record to dial this node, so reachability was not tested", Some(format!("noo cluster show {id}   # the address the node registered with")))),
         Some(other) => out.push(fail("inbound", format!("inbound {other}"), format!("noo cluster show {id}   # bind address and tailnet grant"))),
         None => out.push(warn("inbound", "not yet checked", None)),
-    }
+    } }
 
     // 8. Harness matches the declared policy.
     //
@@ -2877,25 +2910,30 @@ pub(crate) fn noo_data_bound_check(seen: &NooDataSeen, want: Option<&str>) -> Ch
 /// The `netns restore` row (#1108): is noo-netns-restore.service installed and
 /// enabled on this systemd controller, so a container that joins another's
 /// network (noo-ollama-embed) comes back after every dockerd start? Pure.
-pub(crate) fn netns_restore_row(systemd: bool, state: Option<crate::netns_unit::State>) -> Check {
-    use crate::netns_unit::{State, REMEDY, UNIT_NAME};
+/// `state`: Err is why this install cannot have the unit (`render_here`).
+pub(crate) fn netns_restore_row(systemd: bool, state: Result<crate::netns_unit::State, String>) -> Check {
+    use crate::netns_unit::{State, REMEDY, ROOT_REFUSAL, ROOT_REMEDY, UNIT_NAME};
     const NAME: &str = "netns restore";
     if !systemd {
         return ok(NAME, "no systemd here: noo-hostd's boot-restore restarts a namespace-joined container after a reboot; a dockerd restart alone is not covered");
     }
     let lose = "after a reboot or a dockerd restart, a container that joins another's network (noo-ollama-embed) can stay down";
     match state {
-        Some(State::Current) => ok(NAME, format!("{UNIT_NAME} installed and enabled: it runs after every dockerd start")),
-        Some(State::Disabled) => warn(NAME, format!("{UNIT_NAME} is installed but not enabled: {lose}"), Some(REMEDY.into())),
-        Some(State::Stale) => warn(NAME, format!("{UNIT_NAME} is not the unit this install writes (older, or for a moved install): {lose}"), Some(REMEDY.into())),
-        Some(State::Missing) | None => warn(NAME, format!("{UNIT_NAME} is not installed: {lose}"), Some(REMEDY.into())),
+        Ok(State::Current) => ok(NAME, format!("{UNIT_NAME} installed and enabled: it runs after every dockerd start")),
+        Ok(State::Disabled) => warn(NAME, format!("{UNIT_NAME} is installed but not enabled: {lose}"), Some(REMEDY.into())),
+        Ok(State::Stale) => warn(NAME, format!("{UNIT_NAME} is not the unit this install writes (older, or for a moved install): {lose}"), Some(REMEDY.into())),
+        Ok(State::Missing) => warn(NAME, format!("{UNIT_NAME} is not installed: {lose}"), Some(REMEDY.into())),
+        Err(why) => {
+            let remedy = if why.starts_with(ROOT_REFUSAL) { ROOT_REMEDY } else { REMEDY };
+            warn(NAME, format!("{UNIT_NAME} cannot be installed ({why}): {lose}"), Some(remedy.into()))
+        }
     }
 }
 
 fn netns_restore_row_here(root: &std::path::Path) -> Check {
     use crate::netns_unit as nu;
     let systemd = nu::systemd_here();
-    let state = systemd.then(|| nu::render(&nu::owner(), &root.display().to_string()).ok().map(|u| nu::state(&u))).flatten();
+    let state = if systemd { nu::render_here(&root.display().to_string()).map(|u| nu::state(&u)) } else { Err(String::new()) };
     netns_restore_row(systemd, state)
 }
 
@@ -3925,6 +3963,25 @@ pub(crate) fn sandbox_listener_check(compose: Option<&str>, probe: Option<&Sandb
 pub(crate) fn with_profile_form(mut c: Check, form: Option<&str>) -> Check {
     if let Some(f) = form {
         c.detail = format!("{}; {f}", c.detail);
+    }
+    c
+}
+
+/// The causes the live-probe rows name when they could not probe, which are
+/// guesses ("not running") that are wrong when docker refused the account.
+const UNPROBED_GUESSES: [&str; 2] = [
+    "(gateway or sandbox container not running)",
+    "(postgres container not running, or no routable address)",
+];
+
+/// A live-probe row that could not probe, when docker refused this account:
+/// its guessed cause becomes docker's own words and the remedy the docker
+/// one. Any other row, or no refusal, is returned unchanged.
+pub(crate) fn docker_refused(mut c: Check, refusal: Option<&str>) -> Check {
+    let Some(e) = refusal else { return c };
+    if let Some(g) = UNPROBED_GUESSES.iter().find(|g| c.detail.contains(*g)) {
+        c.detail = c.detail.replace(g, &format!("— {e}"));
+        c.remedy = Some(crate::commands::secrets_delivery::DOCKER_REFUSED_REMEDY.into());
     }
     c
 }
@@ -7570,13 +7627,17 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // container proves it live — no cert and plaintext refused, its own
         // leaf accepted.
         let sandbox_probe = sandbox_live_probe();
-        checks.push(sandbox_listener_check(compose.as_deref(), sandbox_probe.as_ref()));
+        // A probe that could not run because docker refused this account is
+        // said as that, not as "container not running" (failed lookup is not
+        // absence; rc.3 stranger cell, docker group not active).
+        let refused = crate::commands::secrets_delivery::docker_refusal();
+        checks.push(docker_refused(sandbox_listener_check(compose.as_deref(), sandbox_probe.as_ref()), refused.as_deref()));
         // The sandbox executor (i161): the health body that probe read over
         // the gateway's leaf says which uid model-written code runs as.
         // Which form of the AppArmor profile is installed (bundled, or the
         // AppArmor 3.x form without its `userns,` rule): stated, not silent.
         checks.push(with_profile_form(
-            sandbox_executor_check(sandbox_probe.as_ref()),
+            docker_refused(sandbox_executor_check(sandbox_probe.as_ref()), refused.as_deref()),
             crate::onboard::sandbox_apparmor::installed_form(
                 std::fs::read_to_string(crate::onboard::sandbox_apparmor::INSTALLED).ok().as_deref()),
         ));
@@ -7628,10 +7689,10 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             hba.as_deref(),
         ));
         let (no_cert, plaintext) = postgres_live_probes();
-        checks.push(postgres_client_cert_check(
+        checks.push(docker_refused(postgres_client_cert_check(
             no_cert.as_ref().map(|(ok, e)| (*ok, e.as_str())),
             plaintext.as_ref().map(|(ok, e)| (*ok, e.as_str())),
-        ));
+        ), refused.as_deref()));
         // One "<name> at rest" row per directory that holds state in the
         // clear (`at_rest_dirs`): the process env is what the launcher
         // resolved from `.env`, so the paths are the ones compose bound.
@@ -8940,6 +9001,51 @@ mod tests {
         let r = c.iter().find(|c| c.name == "inbound").unwrap();
         assert_eq!(r.verdict, Verdict::Warn, "{}", r.detail);
         assert!(r.detail.contains("NOT CHECKED") && r.detail.contains("no address"), "{}", r.detail);
+        n["inbound"] = serde_json::json!("failed");
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        assert_eq!(verdict(&c, "inbound"), Verdict::Fail);
+    }
+
+    /// rc.3 matrix, windows-2025-wsl2: a node with no address on record that
+    /// holds its bus/tunnel is reached that way. The row says so and names
+    /// the address-only features once; it does not ask for NODE_IP for
+    /// things that work.
+    #[test]
+    fn an_address_less_node_on_its_bus_or_tunnel_is_inbound_ok_and_names_what_needs_an_address() {
+        let now = 1_800_000_000;
+        for (t, via) in [
+            (serde_json::json!({"nats_rpc": true, "tunnel": true}), "its bus and its tunnel"),
+            (serde_json::json!({"nats_rpc": true}), "its bus"),
+            (serde_json::json!({"tunnel": true}), "its tunnel"),
+        ] {
+            for inbound in [serde_json::json!("unknown"), serde_json::Value::Null] {
+                let mut n = healthy(now);
+                n["agent_url"] = serde_json::json!("");
+                n["ip_address"] = serde_json::Value::Null;
+                n["control_transports"] = t.clone();
+                n["inbound"] = inbound.clone();
+                let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+                let r = c.iter().find(|c| c.name == "inbound").unwrap();
+                assert_eq!(r.verdict, Verdict::Ok, "{t} {inbound}: {}", r.detail);
+                assert!(r.detail.contains(via) && r.detail.contains(NEEDS_ADDRESS), "{}", r.detail);
+                assert_eq!(c.iter().filter(|c| c.name == "inbound").count(), 1);
+            }
+        }
+        // No transport: the old NOT CHECKED warning stands.
+        let mut n = healthy(now);
+        n["agent_url"] = serde_json::json!("");
+        n["ip_address"] = serde_json::Value::Null;
+        n["control_transports"] = serde_json::json!({"nats_rpc": false, "tunnel": false});
+        n["inbound"] = serde_json::json!("unknown");
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        assert_eq!(verdict(&c, "inbound"), Verdict::Warn);
+        // An address on record: nothing changes; unknown still warns, a failure still fails.
+        let mut n = healthy(now);
+        n["ip_address"] = serde_json::json!("10.0.0.7");
+        n["control_transports"] = serde_json::json!({"nats_rpc": true, "tunnel": true});
+        n["inbound"] = serde_json::json!("unknown");
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        assert_eq!(verdict(&c, "inbound"), Verdict::Warn);
         n["inbound"] = serde_json::json!("failed");
         let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
         assert_eq!(verdict(&c, "inbound"), Verdict::Fail);
@@ -14097,16 +14203,29 @@ mod netns_restore_row_tests {
 
     #[test]
     fn the_row_shows_whether_the_unit_runs_after_every_dockerd_start() {
-        assert_eq!(netns_restore_row(true, Some(State::Current)).verdict, Verdict::Ok);
-        for s in [Some(State::Missing), Some(State::Stale), Some(State::Disabled), None] {
-            let c = netns_restore_row(true, s);
+        assert_eq!(netns_restore_row(true, Ok(State::Current)).verdict, Verdict::Ok);
+        for s in [Ok(State::Missing), Ok(State::Stale), Ok(State::Disabled), Err("not a usable install path for the unit: \"x\"".to_string())] {
+            let c = netns_restore_row(true, s.clone());
             assert_eq!(c.verdict, Verdict::Warn, "{s:?}");
             assert_eq!(c.remedy.as_deref(), Some(crate::netns_unit::REMEDY), "{s:?}");
             assert!(c.detail.contains("noo-ollama-embed"), "{}", c.detail);
         }
-        let c = netns_restore_row(false, None);
+        let c = netns_restore_row(false, Err(String::new()));
         assert_eq!(c.verdict, Verdict::Ok);
         assert!(c.detail.contains("no systemd") && c.detail.contains("not covered"), "{}", c.detail);
+    }
+
+    /// A root install over a path another user can write: the row names the
+    /// path and why, and its remedy is the root one, not `noo upgrade --stack`
+    /// alone (which would refuse again).
+    #[test]
+    fn a_refused_root_install_says_which_path_and_how_to_fix_it() {
+        use crate::netns_unit::{ROOT_REFUSAL, ROOT_REMEDY};
+        let why = format!("{ROOT_REFUSAL}: /home/alex/.noo/scripts/noo-netns-restore.sh belongs to uid 1000, not root");
+        let c = netns_restore_row(true, Err(why));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("cannot be installed") && c.detail.contains("belongs to uid 1000, not root"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some(ROOT_REMEDY));
     }
 
     #[test]
@@ -14114,5 +14233,57 @@ mod netns_restore_row_tests {
         let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
         let run = crate::test_src::fn_body(&own, "pub fn cluster_verify(");
         assert!(run.contains("checks.push(netns_restore_row_here(&crate::envfile::repo_root()));"), "{run}");
+    }
+}
+
+#[cfg(test)]
+mod docker_refused_row_tests {
+    use super::*;
+
+    const SANDBOX_COMPOSE: &str = "services:\n  sandbox:\n    entrypoint: []\n    command: &sandbox-command\n      - python\n      - -m\n      - uvicorn\n      - noomesh.sandbox.app:app\n      - --port\n      - \"9000\"\n      - --ssl-certfile\n      - /tls/services/sandbox/service.crt\n      - --ssl-keyfile\n      - /tls/services/sandbox/service.key\n      - --ssl-ca-certs\n      - /tls/ca.crt\n      - --ssl-cert-reqs\n      - \"2\"\n    expose:\n      - \"9000\"\n  sandbox-extra:\n    command: *sandbox-command\n  postgres:\n    ports:\n      - \"5432:5432\"\n";
+    const DENIED: &str = "permission denied while trying to connect to the docker API at unix:///var/run/docker.sock";
+
+    #[test]
+    fn an_unprobed_live_row_names_dockers_refusal_not_a_stopped_container() {
+        let rows = [
+            sandbox_listener_check(Some(SANDBOX_COMPOSE), None),
+            sandbox_executor_check(None),
+            postgres_client_cert_check(None, None),
+        ];
+        for r in rows {
+            let name = r.name;
+            let before = r.detail.clone();
+            let c = docker_refused(r, Some(DENIED));
+            assert!(c.detail.contains(DENIED), "{name}: {}", c.detail);
+            assert!(!c.detail.contains("not running"), "{name}: failed lookup is not absence: {}", c.detail);
+            assert_eq!(c.remedy.as_deref(), Some(crate::commands::secrets_delivery::DOCKER_REFUSED_REMEDY), "{name}");
+            assert_eq!(c.verdict, Verdict::Warn, "{name}");
+            // No refusal: the row is exactly as it was.
+            let again = match name {
+                "sandbox listener" => sandbox_listener_check(Some(SANDBOX_COMPOSE), None),
+                "sandbox executor" => sandbox_executor_check(None),
+                _ => postgres_client_cert_check(None, None),
+            };
+            assert_eq!(docker_refused(again, None).detail, before, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_row_that_did_probe_is_never_rewritten() {
+        let c = ok("sandbox executor", "code runs as sandbox-exec (uids 65600-65663)");
+        assert_eq!(docker_refused(c.clone(), Some(DENIED)).detail, c.detail);
+    }
+
+    #[test]
+    fn every_unprobed_guess_in_the_run_goes_through_the_refusal() {
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let run = crate::test_src::fn_body(&own, "pub fn cluster_verify(");
+        for call in ["docker_refused(sandbox_listener_check(", "docker_refused(sandbox_executor_check(", "docker_refused(postgres_client_cert_check("] {
+            assert!(run.contains(call), "{call}");
+        }
+        // A new "not running" guess must be added to UNPROBED_GUESSES.
+        for g in UNPROBED_GUESSES {
+            assert!(own.contains(g), "{g} is still a row's text");
+        }
     }
 }

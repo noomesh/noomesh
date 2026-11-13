@@ -8141,7 +8141,7 @@ pub fn install_netns_restore_unit(ctx: &mut Ctx) {
         ctx.info("No systemd here: the namespace restore runs at boot through noo-hostd only.");
         return;
     }
-    let unit = match nu::render(&nu::owner(), &ctx.repo_root.display().to_string()) {
+    let unit = match nu::render_here(&ctx.repo_root.display().to_string()) {
         Ok(u) => u,
         Err(e) => {
             ctx.warn(&format!("{} not installed: {e}", nu::UNIT_NAME));

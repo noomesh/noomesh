@@ -22,6 +22,75 @@ pub(crate) fn systemd_here() -> bool {
     Path::new("/run/systemd/system").is_dir()
 }
 
+/// One path's owner and mode, as read from the disk.
+#[derive(Debug, Clone)]
+pub(crate) struct Seen {
+    pub path: std::path::PathBuf,
+    /// None: the path could not be read (missing, no permission).
+    pub uid_mode: Option<(u32, u32)>,
+}
+
+/// `path` and every directory above it, up to `/`, read from the disk.
+pub(crate) fn chain(path: &Path) -> Vec<Seen> {
+    use std::os::unix::fs::MetadataExt;
+    let mut out = Vec::new();
+    let mut cur = Some(path);
+    while let Some(p) = cur {
+        out.push(Seen { path: p.to_path_buf(), uid_mode: std::fs::metadata(p).ok().map(|m| (m.uid(), m.mode())) });
+        cur = p.parent().filter(|q| !q.as_os_str().is_empty());
+    }
+    out
+}
+
+/// Ok when every path in `chain` exists, belongs to root and is not group- or
+/// world-writable (a sticky /tmp counts as writable): only then may a root
+/// unit execute the first one. Err names the first path that is not, and why.
+/// Pure.
+pub(crate) fn root_only(chain: &[Seen]) -> Result<(), String> {
+    for s in chain {
+        let p = s.path.display();
+        match s.uid_mode {
+            None => return Err(format!("{p} cannot be read")),
+            Some((uid, _)) if uid != 0 => return Err(format!("{p} belongs to uid {uid}, not root")),
+            Some((_, mode)) if mode & 0o022 != 0 => {
+                return Err(format!("{p} is writable by others than root (mode {:o})", mode & 0o7777))
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// The script a unit would execute under `install_root`.
+pub(crate) fn script_path(install_root: &str) -> std::path::PathBuf {
+    Path::new(install_root).join("scripts/noo-netns-restore.sh")
+}
+
+/// The unit `owner` would get for `install_root`: [`render`], with root
+/// allowed only when `root_check` passes for the script. Separate from
+/// [`render_here`] so the decision is tested without being root.
+pub(crate) fn unit_for(owner: &str, install_root: &str, root_check: impl FnOnce(&Path) -> Result<(), String>) -> Result<String, String> {
+    if owner == "root" {
+        if let Err(why) = root_check(&script_path(install_root)) {
+            return Err(format!("{ROOT_REFUSAL}: {why}"));
+        }
+        return render(owner, install_root, true);
+    }
+    render(owner, install_root, false)
+}
+
+/// How a refusal for a root install starts (verify's row keys its remedy on it).
+pub(crate) const ROOT_REFUSAL: &str = "the install runs as root, but root will not execute a script another user can write";
+/// verify's remedy for that refusal.
+pub(crate) const ROOT_REMEDY: &str =
+    "make the path named root's alone (sudo chown root:root and sudo chmod go-w on it), or run noo as the user who owns the install; then noo upgrade --stack";
+
+/// The unit this host's install would write: for the user running this
+/// command, root allowed only over a root-only install.
+pub(crate) fn render_here(install_root: &str) -> Result<String, String> {
+    unit_for(&owner(), install_root, |p| root_only(&chain(p)))
+}
+
 /// The install owner (who runs the unit): the user running this command.
 pub(crate) fn owner() -> String {
     Command::new("id").arg("-un").output().ok().filter(|o| o.status.success())
@@ -42,9 +111,22 @@ pub(crate) fn owner() -> String {
 ///   (fa, 2026-11-12; i677a/#1108).
 /// - `User=<owner>` (in the docker group): the script lives in the owner's
 ///   install, so root never executes a file the owner can write.
-pub(crate) fn render(owner: &str, install_root: &str) -> Result<String, String> {
-    if owner.is_empty() || owner == "root" || !owner.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) {
+/// - `owner` root (an install run as root: a WSL2 distro whose user is root,
+///   a VPS): `User=root` only when `root_safe`, i.e. the script and every
+///   directory above it are root's and not group/world-writable
+///   ([`root_only`] over [`chain`]). Otherwise root could run onboard over an
+///   install in someone else's home and execute a file they can write. Before
+///   this every root install went without the unit (rc.3 install matrix,
+///   windows-2025-wsl2: `not a usable install owner for the unit: "root"`).
+pub(crate) fn render(owner: &str, install_root: &str, root_safe: bool) -> Result<String, String> {
+    if owner.is_empty() || !owner.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) {
         return Err(format!("not a usable install owner for the unit: {owner:?}"));
+    }
+    if owner == "root" && !root_safe {
+        return Err(format!(
+            "the install runs as root but {install_root}/scripts/noo-netns-restore.sh (or a directory above it) \
+             is not root's alone, so root will not execute it"
+        ));
     }
     if !install_root.starts_with('/') || install_root.contains(['"', '\n', '\\', '%']) {
         return Err(format!("not a usable install path for the unit: {install_root:?}"));
@@ -131,7 +213,7 @@ mod tests {
 
     #[test]
     fn the_unit_runs_at_every_dockerd_start_as_the_owner() {
-        let u = render("alex", "/home/alex/.noo").unwrap();
+        let u = render("alex", "/home/alex/.noo", false).unwrap();
         for line in ["After=docker.service", "PartOf=docker.service", "WantedBy=docker.service", "Type=oneshot",
                      "User=alex", "ExecStart=/bin/bash \"/home/alex/.noo/scripts/noo-netns-restore.sh\""] {
             assert!(u.lines().any(|l| l == line), "{line} missing:\n{u}");
@@ -144,22 +226,94 @@ mod tests {
     /// (systemd 249 experiment cited on `render`).
     #[test]
     fn remain_after_exit_is_set() {
-        let u = render("alex", "/home/alex/.noo").unwrap();
+        let u = render("alex", "/home/alex/.noo", false).unwrap();
         assert!(u.lines().any(|l| l == "RemainAfterExit=yes"), "{u}");
     }
 
     #[test]
     fn root_and_odd_paths_are_refused() {
-        assert!(render("root", "/root/.noo").is_err(), "root never runs the owner's script");
-        assert!(render("a b", "/x").is_err());
-        assert!(render("alex", "relative").is_err());
-        assert!(render("alex", "/a\"b").is_err());
-        assert!(render("alex", "/a%b").is_err());
+        assert!(render("root", "/root/.noo", false).is_err(), "root never runs a script someone else can write");
+        assert!(render("a b", "/x", false).is_err());
+        assert!(render("alex", "relative", false).is_err());
+        assert!(render("alex", "/a\"b", false).is_err());
+        assert!(render("alex", "/a%b", false).is_err());
+    }
+
+    /// rc.3 install matrix (windows-2025-wsl2, run as root): no unit at all.
+    #[test]
+    fn a_root_only_install_gets_a_root_unit() {
+        let u = render("root", "/root/.noo", true).unwrap();
+        assert!(u.lines().any(|l| l == "User=root"), "{u}");
+        assert!(u.contains("ExecStart=/bin/bash \"/root/.noo/scripts/noo-netns-restore.sh\""), "{u}");
+        // root_safe never widens the owner check for anyone else.
+        assert!(render("a b", "/x", true).is_err());
+    }
+
+    #[test]
+    fn root_only_reads_owner_and_mode_up_to_slash() {
+        // /usr/bin is root's and 0755 on every Linux and macOS host.
+        assert_eq!(root_only(&chain(Path::new("/usr/bin"))), Ok(()));
+        // A world-writable directory refuses even when root owns it (sticky /tmp).
+        let e = root_only(&chain(Path::new("/tmp"))).unwrap_err();
+        assert!(e.starts_with("/tmp is writable by others than root"), "{e}");
+        // A missing file refuses.
+        assert!(root_only(&chain(Path::new("/usr/bin/noo-no-such-file-here"))).unwrap_err().contains("cannot be read"));
+    }
+
+    fn seen(path: &str, uid: u32, mode: u32) -> Seen {
+        Seen { path: path.into(), uid_mode: Some((uid, mode)) }
+    }
+
+    /// The case the guard exists for: `sudo noo onboard` over an install in a
+    /// user's home. root would execute a script that user can rewrite.
+    #[test]
+    fn sudo_over_an_install_in_a_users_home_is_refused() {
+        let home = [
+            seen("/home/alex/.noo/scripts/noo-netns-restore.sh", 1000, 0o100644),
+            seen("/home/alex/.noo/scripts", 1000, 0o40755),
+            seen("/home/alex/.noo", 1000, 0o40755),
+            seen("/home/alex", 1000, 0o40750),
+            seen("/home", 0, 0o40755),
+            seen("/", 0, 0o40755),
+        ];
+        let e = unit_for("root", "/home/alex/.noo", |p| {
+            assert_eq!(p, Path::new("/home/alex/.noo/scripts/noo-netns-restore.sh"));
+            root_only(&home)
+        })
+        .unwrap_err();
+        assert!(e.starts_with(ROOT_REFUSAL), "{e}");
+        assert!(e.contains("/home/alex/.noo/scripts/noo-netns-restore.sh belongs to uid 1000, not root"), "{e}");
+        // A root-owned script in a user-writable directory is refused too:
+        // the user can replace the file.
+        let mut swapped = home.clone();
+        swapped[0] = seen("/home/alex/.noo/scripts/noo-netns-restore.sh", 0, 0o100644);
+        let e = unit_for("root", "/home/alex/.noo", |_| root_only(&swapped)).unwrap_err();
+        assert!(e.contains("/home/alex/.noo/scripts belongs to uid 1000"), "{e}");
+        // The same install, run by its owner: the usual User=alex unit.
+        let u = unit_for("alex", "/home/alex/.noo", |_| panic!("only a root install is checked")).unwrap();
+        assert!(u.lines().any(|l| l == "User=alex"), "{u}");
+    }
+
+    /// The rc.3 WSL2 cell's case: root's own install under /root.
+    #[test]
+    fn root_over_its_own_install_gets_the_unit() {
+        let own = [
+            seen("/root/.noo/scripts/noo-netns-restore.sh", 0, 0o100644),
+            seen("/root/.noo/scripts", 0, 0o40755),
+            seen("/root/.noo", 0, 0o40755),
+            seen("/root", 0, 0o40700),
+            seen("/", 0, 0o40755),
+        ];
+        let u = unit_for("root", "/root/.noo", |_| root_only(&own)).unwrap();
+        assert!(u.lines().any(|l| l == "User=root"), "{u}");
+        let mut g = own.clone();
+        g[2] = seen("/root/.noo", 0, 0o40775);
+        assert!(unit_for("root", "/root/.noo", |_| root_only(&g)).unwrap_err().contains("/root/.noo is writable by others than root (mode 775)"));
     }
 
     #[test]
     fn state_reads_missing_stale_disabled_and_current() {
-        let want = render("alex", "/home/alex/.noo").unwrap();
+        let want = render("alex", "/home/alex/.noo", false).unwrap();
         assert_eq!(state_of(None, &want, false), State::Missing);
         assert_eq!(state_of(Some("[Unit]\nold\n"), &want, true), State::Stale);
         assert_eq!(state_of(Some(&want), &want, false), State::Disabled);
