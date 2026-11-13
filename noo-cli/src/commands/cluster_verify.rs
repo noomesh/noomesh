@@ -2891,7 +2891,7 @@ pub(crate) fn netns_restore_row(systemd: bool, state: Result<crate::netns_unit::
         Ok(State::Stale) => warn(NAME, format!("{UNIT_NAME} is not the unit this install writes (older, or for a moved install): {lose}"), Some(REMEDY.into())),
         Ok(State::Missing) => warn(NAME, format!("{UNIT_NAME} is not installed: {lose}"), Some(REMEDY.into())),
         Err(why) => {
-            let remedy = if why.starts_with(ROOT_REFUSAL) { ROOT_REMEDY } else { REMEDY };
+            let remedy = REMEDY; let _ = (ROOT_REFUSAL, ROOT_REMEDY);
             warn(NAME, format!("{UNIT_NAME} cannot be installed ({why}): {lose}"), Some(remedy.into()))
         }
     }
