@@ -1094,6 +1094,42 @@ normal answer, not an outage a UI should render as one.
 `internal` routes are not part of any API.
 
 
+## Your add-on and the next stack upgrade
+
+A lock names the exact stack tags it supports (`--supports v0.6.24`, one entry
+per stack; an rc and its final are different entries). When the operator rolls
+the stack with `noo upgrade --stack` (or `--all`), the roll first resolves a lock
+**signed for the new tag** for every add-on that is on. If one has none, the roll
+refuses before anything changes:
+
+```text
+x refusing to roll to v0.6.25: the example-addon add-on is on and … Nothing was changed
+```
+
+There are three ways through, and the refusal names them:
+
+1. **Publish a lock for the new stack** (the normal path). Sign it with the new
+   tag in `--supports` and publish it to your registry with
+   `noo security addon-lock publish`. The roll then fetches it and goes on. Your
+   registry must have a publicly trusted certificate; see "A private registry"
+   in the developer guide.
+2. **Turn it off for the roll, then back on from a file.** This is the way
+   through for an add-on enabled from a file (`noo addons enable <name> --lock
+   <file>`), whose registry the roll cannot fetch from:
+
+   ```sh
+   noo addons disable example-addon
+   noo upgrade --stack
+   noo addons enable example-addon --lock ./addon-bundle.json   # a lock signed for the new stack
+   ```
+
+   The 0.6.24 release rehearsal proved this for the add-on itself: re-enabled
+   and declared on after the roll. Its node workloads are not yet proven to come
+   back placed through this path; check them with
+   `noo cluster workloads show <node>` and place them again if they are not.
+3. **Roll to an older stack** your lock supports: `noo upgrade --stack --tag
+   <vX.Y.Z>` (add `--allow-downgrade` to take the add-on back with it).
+
 ## Console pieces — filling your slots in the console diagrams
 
 The console's diagrams (the brain map and the workflow view) ship complete in

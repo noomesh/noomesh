@@ -57,6 +57,11 @@ jobs:
           # answer and peak disk here are themselves a finding.
           - {cell: ubuntu-24.04-amd64-default, runner: ubuntu-24.04, docker: preinstalled, onboard: ci, model: default, scope: full, experimental: false}
           - {cell: ubuntu-22.04-amd64, runner: ubuntu-22.04, docker: preinstalled, onboard: ci, model: tiny, scope: full, experimental: false}
+          # The engine most strangers get: Ubuntu's own `apt install docker.io`
+          # (with docker-compose-v2), not the image's docker-ce. Same steps,
+          # the 20x dockerd-restart probe included: that is where Docker 27
+          # and 28 word a failed namespace join differently (noomesh#1128).
+          - {cell: ubuntu-22.04-amd64-docker.io, runner: ubuntu-22.04, docker: distro, onboard: ci, model: tiny, scope: full, experimental: false}
           - {cell: ubuntu-24.04-arm64, runner: ubuntu-24.04-arm, docker: preinstalled, onboard: ci, model: tiny, scope: full, experimental: false}
           - {cell: ubuntu-22.04-arm64, runner: ubuntu-22.04-arm, docker: preinstalled, onboard: ci, model: tiny, scope: full, experimental: false}
           # fa: no Docker at all, the INTERACTIVE wizard through a pty.

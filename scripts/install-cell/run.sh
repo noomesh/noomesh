@@ -5,7 +5,7 @@
 # One cell of .github/workflows/install-matrix.yml: what a stranger does
 # from the README on a machine we have never seen, timed step by step.
 #
-#   OUT=<dir> CELL=<name> RUNNER=<label> DOCKER=preinstalled|none \
+#   OUT=<dir> CELL=<name> RUNNER=<label> DOCKER=preinstalled|none|distro \
 #   ONBOARD=ci|interactive MODEL=default|tiny SCOPE=full|node-partial \
 #   CLI_TAG=latest|noo-cli-vX.Y.Z  scripts/install-cell/run.sh
 #
@@ -128,6 +128,39 @@ step box 120 -- sh -c 'uname -a; cat /etc/os-release 2>/dev/null | head -3; sw_v
 if [ "$DOCKER" = none ]; then
     hook prep-no-docker.sh || finish
 fi
+# DOCKER=distro: the engine a stranger gets from `apt install docker.io`, not
+# the runner image's docker-ce/moby. #1108's restore was only ever proven on
+# the image's engine, and Docker versions word a failed namespace join
+# differently (27 vs 28: noomesh#1128). The first run (2026-11-13) found
+# 22.04's docker.io at 29.1.3, so this cell covers the distro engine; Docker
+# 27 itself is the rehearsal's dind (27.5.1). The image's engine packages are removed,
+# Ubuntu's own docker.io + docker-compose-v2 installed, and the step FAILs by
+# name unless the engine now running is the docker.io package's.
+if [ "$DOCKER" = distro ]; then
+    step distro-docker 900 -- sudo bash -c '
+      set -u
+      systemctl stop docker.socket docker.service containerd.service 2>/dev/null
+      engines="$(dpkg-query -W -f "\${Package}\n" "docker-ce*" "docker-buildx-plugin" "docker-compose-plugin" "containerd.io" "moby-*" 2>/dev/null | sort -u | tr "\n" " ")"
+      echo "image engine packages: ${engines:-none}"
+      [ -z "${engines// /}" ] || DEBIAN_FRONTEND=noninteractive apt-get remove -y -q $engines >/dev/null || { echo "could not remove the image engine"; exit 1; }
+      apt-get update -q >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get install -y -q docker.io docker-compose-v2 >/dev/null || { echo "apt could not install docker.io docker-compose-v2"; exit 1; }
+      systemctl enable --now docker.service >/dev/null 2>&1
+      usermod -aG docker "${SUDO_USER:-runner}" 2>/dev/null
+      t=0; until docker info >/dev/null 2>&1 || [ $t -ge 60 ]; do sleep 2; t=$((t+2)); done
+      pkg="$(dpkg-query -W -f "\${Version}" docker.io 2>/dev/null)"
+      # What the archive offers (the first run, 2026-11-13, found 29.1.3 on
+      # 22.04, not the 27.x assumed): a future pin can only pick from these.
+      apt-cache madison docker.io 2>/dev/null | head -6 | sed "s/^/available: /"
+      echo "docker.io package: ${pkg:-NOT INSTALLED}"
+      docker version 2>&1 | sed -n "/^Server/,\$p" | head -8
+      docker compose version 2>&1 | head -1
+      left="$(dpkg-query -W -f "\${Package} \${Status}\n" "docker-ce" "moby-engine" 2>/dev/null | grep -c " installed$")"
+      srv="$(docker version --format "{{.Server.Version}}" 2>/dev/null)"
+      echo "engine: server ${srv:-none}, from docker.io ${pkg:-none}, image engines still installed: $left"
+      [ -n "$pkg" ] && [ -n "$srv" ] && [ "$left" = 0 ] || { echo "DISTRO-DOCKER FAIL: the engine running is not Ubuntu docker.io"; exit 1; }
+    ' || finish
+    meta docker_engine "$(docker version --format '{{.Server.Version}}' 2>/dev/null) (Ubuntu docker.io)"
+fi
 
 # ── 2. the install line, read from the README and run VERBATIM ──────────
 # The cell runs exactly what a stranger copies, so README and test cannot
@@ -239,12 +272,37 @@ if [ "$MODEL" = tiny ]; then
     # the error's own remedy makes the tiny one the default.
     step switch-to-tiny-model 300 -- noo models switch "$TINY_MODEL" --backend ollama --yes || fail_onboarded
 fi
-step verify 900 -- noo cluster verify --wait
+# verify runs as the stranger's NEXT terminal would: a fresh login session
+# (sudo -i reads /etc/group again). On a docker=none cell the install added
+# the runner user to the docker group, which the cell's own shell, started
+# before that, does not hold (rc.3/rc.4: every docker row "permission
+# denied"). The probe after the JSON one keeps the old shell, so the
+# "not judged" rows (#1119) stay covered.
+NOO_BIN="$(command -v noo)"
+fresh() { if [ "$DOCKER" = none ]; then sudo -iu "$(id -un)" -- "$NOO_BIN" "$@"; else "$NOO_BIN" "$@"; fi; }
+export -f fresh; export NOO_BIN DOCKER
+step verify 900 -- bash -c 'fresh cluster verify --wait'
 # PROBE (cf, #1069): the verify table above shows only failing rows' detail;
 # the JSON keeps every row, so a PASSING row's text (e.g. the sandbox
 # executor's "profile: 3.x form") is readable from the cell's artifacts. Same
 # redactor and upload scan as every log. Never the failed step.
-step probe-verify-json 300 -- noo --json cluster verify
+step probe-verify-json 300 -- bash -c 'fresh --json cluster verify'
+# PROBE (general, rc.4): the same JSON from the cell's OLD shell, which lacks
+# the docker group: the rows that need docker must say "not judged" with the
+# docker-access remedy (#1119), never "no running container". docker=none
+# cells only (elsewhere the old shell has the group from the start).
+if [ "$DOCKER" = none ]; then
+    step probe-verify-old-shell 300 -- sh -c '
+  out="$(noo --json cluster verify 2>&1)"; printf "%s\n" "$out"
+  printf "%s" "$out" | python3 -c "
+import json, sys
+t = sys.stdin.read(); d = json.loads(t[t.find(\"{\"):t.rfind(\"}\") + 1])
+rows = [c for c in d[\"controller\"][\"checks\"] if c[\"name\"] == \"shared secrets\"]
+r = rows[0] if rows else {}
+ok = (r.get(\"detail\") or \"\").startswith(\"not judged\") and \"permission denied\" in (r.get(\"detail\") or \"\") and \"docker\" in (r.get(\"remedy\") or \"\")
+print(\"OLD-SHELL PROBE: shared secrets\", r.get(\"verdict\"), \"not-judged-with-docker-remedy=\" + (\"yes\" if ok else \"no\"))
+sys.exit(0 if ok else 1)"'
+fi
 # DIAGNOSTIC (fa, i677 finding 17: the box's own node reads "online: status
 # unknown" and holds no live tunnel): the self-agent's own log, the URLs and
 # id it was given (ONLY those keys: the env file also holds the agent's
@@ -270,11 +328,15 @@ meta first_answer_s "$(( $(date +%s) - CELL_START ))"
 # path a reboot takes), each read back and followed by a chat. BEFORE the
 # offboard probe, which can take the install down (rc.3 run 1: it did, and every
 # chat here then failed). A probe: read, never the cell's failed step.
+# 20 restarts on ubuntu-22.04-amd64, where the race was first seen; 5 on every
+# other cell (rc.3/rc.4: 20 took 37-42 min of each cell's runner).
+NETNS_RESTARTS=5; [ "$CELL" = ubuntu-22.04-amd64 ] && NETNS_RESTARTS=20
+export NETNS_RESTARTS
 step probe-docker-restart-namespace-joiners 2700 -- sh -c '
-  echo "PROBE SCOPE: 20x systemctl restart docker on this throwaway hosted runner (the dockerd restore path a reboot takes). It does NOT cover noo-hostd boot-restore, which runs only at a real boot."
+  echo "PROBE SCOPE: ${NETNS_RESTARTS}x systemctl restart docker on this throwaway hosted runner (the dockerd restore path a reboot takes). It does NOT cover noo-hostd boot-restore, which runs only at a real boot."
   if [ -f /etc/systemd/system/noo-netns-restore.service ]; then echo "noo-netns-restore.service: installed"; else echo "noo-netns-restore.service: NOT installed (a release without the fix)"; fi
   left=0; chats=0
-  for i in $(seq 1 20); do
+  for i in $(seq 1 "$NETNS_RESTARTS"); do
     sudo systemctl restart docker
     t=0; while [ $t -lt 90 ]; do docker info >/dev/null 2>&1 && break; sleep 2; t=$((t+2)); done
     sleep 20
@@ -287,7 +349,7 @@ step probe-docker-restart-namespace-joiners 2700 -- sh -c '
   done
   sudo journalctl -u noo-netns-restore.service --no-pager 2>/dev/null | grep -F "noo-netns-restore:" | tail -n 20
   docker --version
-  echo "NETNS PROBE: containers left not running after a restart=$left, chats answered=$chats of 20"
+  echo "NETNS PROBE: containers left not running after a restart=$left, chats answered=$chats of $NETNS_RESTARTS"
   true'
 
 # PROBE (fa, i677 finding 20; fix #1059): `noo offboard` run by a shell that
@@ -317,7 +379,9 @@ step probe-offboard-without-docker 600 -- sh -c '
   # docker (…): nothing was removed"; rc.3 run 43351232102).
   printf "%s" "$out" | grep -qi "cannot reach docker" || { echo "PROBE FAIL: it did not say it cannot reach docker"; ok=0; }
   printf "%s" "$out" | grep -qi "nothing was removed" || { echo "PROBE FAIL: it did not say nothing was removed"; ok=0; }
-  docker ps -q --filter name=noo-gateway | grep -q . || { echo "PROBE FAIL: the gateway container is gone"; ok=0; }
+  # sudo: this shell may lack the docker group too (rc.4: a groupless
+  # `docker ps` answered permission denied and read as "gone").
+  sudo docker ps -q --filter name=noo-gateway | grep -q . || { echo "PROBE FAIL: the gateway container is gone"; ok=0; }
   [ -d "$HOME/.noo" ] || { echo "PROBE FAIL: ~/.noo is gone"; ok=0; }
   [ -d /var/lib/noo ] || { echo "PROBE FAIL: /var/lib/noo is gone"; ok=0; }
   noo health >/dev/null 2>&1 || { echo "PROBE FAIL: noo health is not ok afterwards"; ok=0; }

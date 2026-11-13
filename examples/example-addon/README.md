@@ -48,19 +48,29 @@ run of this example.
    ```
 
 3. **Build and push the image** to your registry, and note its digest
-   (`<root>/example-addon@sha256:…`).
-
-4. **Sign a lock** for the stack you target. The seed is your signing key;
-   keep it private.
+   (the 64 hex characters after `sha256:`):
 
    ```sh
-   ( umask 077; openssl rand -hex 32 > seed )
+   docker build -t <root>/example-addon:0.1.0 .
+   docker push <root>/example-addon:0.1.0
+   docker inspect -f '{{index .RepoDigests 0}}' <root>/example-addon:0.1.0
+   ```
+
+4. **Sign a lock** for the stack you target. The seed is your signing key;
+   keep it private and outside the repo. The first line makes it once; reuse it
+   for every release, because the operator trusts its public key. Run this
+   from your add-on's git checkout (`--source-commit` reads its `HEAD`).
+   `--supports` takes a stack version as `v<X.Y.Z>`, without a `stack-`
+   prefix; repeat it (or comma-separate) for each stack you support.
+
+   ```sh
+   [ -e ~/example-addon.seed ] || ( umask 077; openssl rand -hex 32 > ~/example-addon.seed )
    noo --json security addon-lock sign --addon example-addon --version 0.1.0 \
-     --source-commit "$(git rev-parse HEAD)" --supports stack-v0.6.24 \
+     --source-commit "$(git rev-parse HEAD)" --supports v0.6.24 \
      --image example-addon=<root>/example-addon@sha256:<digest> --registry <root> \
      --file docker-compose.yml=docker-compose.yml --file routes.json=routes.json \
      --file resources.json=resources.json --file system.json=system.json \
-     --seed-file seed --out addon-lock.json
+     --seed-file ~/example-addon.seed --out addon-lock.json
    ```
 
    The JSON it prints carries your `pubkey`.
@@ -78,7 +88,19 @@ run of this example.
 6. **Connect**: call the add-on's route through the gateway as an operator. It
    answers with who the call was for and whether its own token exchange
    succeeded (`"outbound": {"exchanged": true, "consumer": "svc:example-addon",
-   …}`).
+   …}`). Log in first (`noo auth login`, an Operator or Admin account: the
+   route's `min_role` is `operator`). The call uses your own login token. A
+   service key cannot make it: service keys open only the inference surface.
+
+   ```sh
+   TOKEN=$(jq -r .access_token "${NOO_CREDENTIALS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/mesh/credentials.json}")
+   curl -s --cacert "${NOO_PKI_DIR:-$HOME/.config/mesh/pki}/ca.crt" -H "Authorization: Bearer $TOKEN" https://localhost:8080/api/example-addon/status | jq .
+   ```
+
+   `"exchanged": false` with a `status` means the add-on reached the exchange
+   and was refused (`401`: its key was revoked or the add-on disabled). A
+   `401` on the call itself means your login token expired (15 minutes): run
+   `noo auth status` to refresh it, then read the file again.
 
 7. **The next stack upgrade**: see "your add-on and the next stack upgrade" in
    the guide. A lock names exact stack tags, so sign one for each stack you

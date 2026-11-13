@@ -157,7 +157,7 @@ mod tests {
             ("addon_proxy.rs", include_str!("addon_proxy.rs"), "async fn forward("),
             ("routes/admin.rs", include_str!("routes/admin.rs"), "async fn logs_query("),
             ("routes/inference.rs", include_str!("routes/inference.rs"), "async fn proxy_backend_health("),
-            ("routes/cluster.rs", include_str!("routes/cluster.rs"), "async fn cluster_gpu_metrics("),
+            ("routes/cluster.rs", include_str!("routes/cluster.rs"), "async fn read_exporter("),
         ] {
             let own = crate::test_src::own_code(src);
             let body = crate::test_src::fn_body(&own, marker);

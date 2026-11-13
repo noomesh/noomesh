@@ -110,11 +110,14 @@ def test_no_monitoring_service_names_the_gateway_key(compose):
 # tests/test_pki_mounts_are_narrow.py, over every service in every file.
 
 
-def test_every_prometheus_scrape_job_uses_the_service_leaf(compose):
-    raw = compose["configs"]["prometheus_config"]["content"]
-    cfg = yaml.safe_load(raw)
-    jobs = cfg["scrape_configs"]
-    assert jobs, "the inline prometheus config has no scrape jobs"
+def test_every_prometheus_scrape_job_uses_the_service_leaf():
+    # The config Prometheus LOADS (the guard in test_prometheus_static_targets_exist
+    # resolves it from the composed service), not a copy beside it: this test
+    # used to read an inline compose copy while monitoring/prometheus.yml drifted.
+    from tests.test_prometheus_static_targets_exist import loaded_config
+
+    jobs = loaded_config()["scrape_configs"]
+    assert jobs, "the loaded prometheus config has no scrape jobs"
     for job in jobs:
         tls = job.get("tls_config") or {}
         assert tls.get("cert_file") == "/app/pki/services/prometheus/service.crt", (
@@ -123,13 +126,5 @@ def test_every_prometheus_scrape_job_uses_the_service_leaf(compose):
         assert tls.get("key_file") == "/app/pki/services/prometheus/service.key", (
             f"job {job['job_name']!r} scrapes with {tls.get('key_file')!r}"
         )
-
-
-def test_the_reference_prometheus_config_agrees_with_the_inline_one():
-    ref = yaml.safe_load((REPO_ROOT / "monitoring" / "prometheus.yml").read_text())
-    for job in ref["scrape_configs"]:
-        tls = job.get("tls_config") or {}
-        assert "gateway" not in str(tls.get("cert_file", "")), (
-            f"monitoring/prometheus.yml job {job['job_name']!r} still scrapes as "
-            "the controller; it is copied into standalone deployments"
-        )
+        for sd in job.get("http_sd_configs") or []:
+            assert "gateway" not in str((sd.get("tls_config") or {}).get("cert_file", "")), job["job_name"]

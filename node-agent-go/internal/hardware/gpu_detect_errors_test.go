@@ -66,7 +66,7 @@ func probeAll(g *GPUDetector) probeResult {
 
 func TestDetectAbsentBinaryIsACleanNoGPU(t *testing.T) {
 	noSmi(t)
-	r := probeAll(NewGPUDetector(nil, "http"))
+	r := probeAll(NewGPUDetector())
 	if r.model != "" || r.vram != 0 || r.count != 0 {
 		t.Fatalf("absent binary: got %+v, want zeros", r)
 	}
@@ -83,7 +83,7 @@ func TestDetectHealthyFakeSmi(t *testing.T) {
 --query-gpu=memory.total) echo "24564";;
 --query-gpu=count) echo "2";;
 esac`)
-	r := probeAll(NewGPUDetector(nil, "http"))
+	r := probeAll(NewGPUDetector())
 	if r.model != "NVIDIA GeForce RTX 4090" || r.vram != 24.0 || r.count != 2 {
 		t.Fatalf("got %+v", r)
 	}
@@ -96,7 +96,7 @@ esac`)
 
 func TestDetectNonZeroExitIsAnError(t *testing.T) {
 	fakeSmi(t, `echo "NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver." >&2; exit 9`)
-	r := probeAll(NewGPUDetector(nil, "http"))
+	r := probeAll(NewGPUDetector())
 	if r.model != "" || r.vram != 0 || r.count != 0 {
 		t.Fatalf("values on error must be zero, got %+v", r)
 	}
@@ -112,7 +112,7 @@ func TestDetectNonZeroExitIsAnError(t *testing.T) {
 
 func TestDetectGarbageOutputIsAnError(t *testing.T) {
 	fakeSmi(t, `echo "Failed to initialize NVML: Unknown Error"`)
-	g := NewGPUDetector(nil, "http")
+	g := NewGPUDetector()
 	if v, err := g.DetectVRAM(); err == nil || v != 0 {
 		t.Fatalf("DetectVRAM on garbage: (%v, %v), want an error", v, err)
 	}
@@ -126,7 +126,7 @@ func TestDetectHangPastTheDeadlineIsADeadlineError(t *testing.T) {
 		t.Skip("waits out the 5 s probe deadline")
 	}
 	fakeSmi(t, `exec sleep 30`)
-	g := NewGPUDetector(nil, "http")
+	g := NewGPUDetector()
 	start := time.Now()
 	if _, err := g.DetectModel(); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("a hang must be a deadline error, got %v", err)
@@ -140,7 +140,7 @@ func TestDetectHangPastTheDeadlineIsADeadlineError(t *testing.T) {
 // a failing probe is reported, not turned into 0 or 1.
 func TestDetectCountDoesNotInventAnAnswerOnError(t *testing.T) {
 	fakeSmi(t, `exit 1`)
-	n, err := NewGPUDetector(nil, "http").DetectCount()
+	n, err := NewGPUDetector().DetectCount()
 	if err == nil || n != 0 {
 		t.Fatalf("DetectCount = (%d, %v), want (0, error)", n, err)
 	}

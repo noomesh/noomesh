@@ -153,7 +153,7 @@ def cmd_scan(paths: list[str]) -> int:
 # A line that SAYS something failed, not one that merely contains the word
 # ("13 created, 0 failed" read as the error in run 1, 2026-11-12).
 ERROR_RX = re.compile(r"^\s*(x |✗|error\b|ERROR\b|Error:|fatal\b|FATAL\b|panicked)|did NOT complete|"
-                      r"\[install-cell\] TIMEOUT after|^curl: \(\d+\)|^Traceback|Error: |\bno matching manifest\b")
+                      r"^DRIVER: LOOP|\[install-cell\] TIMEOUT after|^curl: \(\d+\)|^Traceback|Error: |\bno matching manifest\b")
 NOT_ERROR = re.compile(r"\b0 failed\b|\bno errors?\b")
 PROMPT_RX = re.compile(r"^PROMPT: |\[[yY]/[nN]\]|\([yY]/[nN]\)|\?\s*(\[[^\]]*\])?\s*$")
 WARN_RX = re.compile(r"^\s*(!|⚠)|\bWARN(ING)?\b|operator alert|TargetDown")
@@ -218,7 +218,7 @@ def summarize(d: Path) -> dict:
     md += ["", f"**Prompts: {len(prompts)}**"] + [f"- `{p}`" for p in prompts[:20]]
     if meta.get("limits"):
         md += ["", "**Not covered here:** " + "; ".join(meta["limits"])]
-    (d / "summary.json").write_text(json.dumps(out, indent=1))
+    (d / "summary.json").write_text(json.dumps(out, indent=1, ensure_ascii=False), encoding="utf-8")
     (d / "summary.md").write_text("\n".join(md) + "\n")
     return out
 
@@ -235,7 +235,10 @@ def main(argv: list[str]) -> int:
     if cmd == "scan":
         return cmd_scan(rest)
     if cmd == "record":
-        print(json.dumps(record(rest[0], int(rest[1]), int(rest[2]), rest[3])))
+        # ensure_ascii=False: an escaped "\u2014" next to a masked value read
+        # as a key's value to the upload scan (rc.3, "age key: [REDACTED] —").
+        sys.stdout.reconfigure(encoding="utf-8")
+        print(json.dumps(record(rest[0], int(rest[1]), int(rest[2]), rest[3]), ensure_ascii=False))
         return 0
     if cmd == "summary":
         summarize(Path(rest[0]))

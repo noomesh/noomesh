@@ -438,6 +438,10 @@ after the stack starts, for example with
 `stats.vllm.ai`, `stats.grafana.org`, `grafana.com`, `huggingface.co/api/telemetry`
 or `ollama.com`. The exception is a model download or cloud call you
 started yourself.
+On an idle controller (0.6.24 or later, nothing asked of it) the same
+capture should show no questions at all. A container's question is forwarded
+by Docker from the host, so the name, not the source address, says which
+service asked.
 
 To see what one vendor CLI tries to reach, run it the way the harness does
 with no route out, recording every connection and DNS question (no root
@@ -498,6 +502,44 @@ setting you chose. None of it is a report about you or your machines.
 | Web search | DuckDuckGo's HTML endpoint, or the provider set in `search.provider` (SearXNG, Brave, Tavily) | When an agent, a chat or a scheduled task uses `web_search` |
 | Browser tool | Whatever page it is sent to | When an agent uses the browser tool. `BROWSER_URL_ALLOWLIST` limits it. |
 | Build-time package installs | PyPI, the PyTorch wheel index, Go and crates.io registries, Debian/Alpine mirrors | Building images, not running them |
+
+### Name lookups for noomesh's own services
+
+Before 0.6.24, a default install's Prometheus asked the host's configured DNS
+resolver, every 15 seconds, for `node-agent.<search domain>` and
+`nvidia-exporter.<search domain>` (an A and an AAAA question each). The
+cause was two scrape targets that name containers which do not exist on
+every install: no install runs a `node-agent` container (agents are host
+services), and a controller without an NVIDIA container runtime runs no
+`nvidia-exporter`. Docker's DNS cannot answer a name with no container behind
+it, so it forwards the question to the host's resolver. Only the question
+left the machine: no payload and no connection followed, because no answer
+came back. Since 0.6.24 Prometheus finds the node agents through the
+gateway's list and the GPU exporter by a file the exporter writes while it
+runs, so an idle install asks no resolver anything
+([Verify it yourself](#verify-it-yourself) shows how to watch).
+
+Before 0.6.24, a node agent on a host without `nvidia-smi` also looked up
+`nvidia-exporter` once when it started, to check for a GPU exporter beside it.
+The agent is a host service, so with a search domain (one your router hands
+out, or your tailnet's) the host's resolver was asked for
+`nvidia-exporter.<search domain>` (A and AAAA), once per agent start; only the
+question left, no connection followed. Since 0.6.24 the agent reads the GPU
+from `nvidia-smi` only and looks no name up.
+
+Before 0.6.24 the console's Observability panel (every 15 s while open) and a
+kiosk display showing GPUs had the gateway fetch GPU metrics from
+`nvidia-exporter` on every refresh; on a controller without an NVIDIA
+container runtime Docker forwarded that name to the host's resolver. Since
+0.6.24 the gateway fetches the exporter only while the exporter has announced
+itself, and otherwise reads the GPUs the node agents report.
+
+At idle, and with the console or a kiosk display open, nothing noomesh runs
+asks a resolver for the name of one of its own containers. An operator action
+aimed at a backend that is not installed can: listing or pulling Ollama
+models, or an embedding sent to the default Ollama address
+(`stunnel-ollama`), on an install that does not run Ollama, looks that name
+up when you start it.
 
 These are out of scope here:
 
