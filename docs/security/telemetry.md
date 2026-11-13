@@ -525,8 +525,15 @@ The agent is a host service, so with a search domain (one your router hands
 out, or your tailnet's) the host's resolver was asked for
 `nvidia-exporter.<search domain>` (A and AAAA), once per agent start; only the
 question left, no connection followed. Since 0.6.24 the agent reads the GPU
-from `nvidia-smi` only and looks no name up. Nothing noomesh ships asks a
-resolver for its own container names.
+from `nvidia-smi` only and looks no name up.
+
+One case remains. While the console's Observability panel is open, or a
+kiosk display shows GPUs, they ask the gateway for GPU metrics (every 15 s
+for the panel), and the gateway fetches them from `nvidia-exporter`. On a
+controller without an NVIDIA container runtime there is no such container,
+so Docker forwards the name to the host's resolver
+(`nvidia-exporter.<search domain>`), once per refresh while the view is open.
+It is a question only; no connection follows.
 
 These are out of scope here:
 
