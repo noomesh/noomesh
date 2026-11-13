@@ -146,6 +146,9 @@ def _agent_dump_cell(tmp_path, systemd: bool):
         "systemctl": '#!/bin/sh\necho "noo-node-agent.service - active (running) fake-status"\n',
         "journalctl": '#!/bin/sh\necho "agent: placement received fake-journal"\n',
         "ps": '#!/bin/sh\necho "  PID ELAPSED COMMAND"\necho "  42 00:10 /usr/local/bin/noo-node-agent fake-proc"\n',
+        # Never the host's own noo or docker (on a dev box they reach a real controller).
+        "noo": '#!/bin/sh\necho \'{"lanes": [], "fake": "cluster-show"}\'\n',
+        "docker": '#!/bin/sh\n[ "$1" = logs ] && echo "INFO reconcile_nudged node=fake-nudge"\nexit 0\n',
     }
     for n, body in fakes.items():
         (bin_ / n).write_text(body)
@@ -175,6 +178,7 @@ def test_every_failed_step_dumps_the_node_agent_state_through_step(tmp_path):
     assert "rc=3" in stdout and "child=1" in stdout, stdout
     log = (out / "logs" / "agent-state-after-bad.log").read_text()
     assert "fake-status" in log and "fake-journal" in log, log
+    assert "fake-nudge" in log and '"fake": "cluster-show"' in log, log
     # Recorded by step(): redacted, in steps.jsonl, and never the failed step.
     assert all(s["rc"] == 0 for s in steps if s["step"].startswith("agent-state-after-"))
     (out / "meta.json").write_text(json.dumps({"cell": "c"}))
@@ -194,6 +198,20 @@ def test_the_dump_never_reads_the_agent_env_file_and_is_capped():
     assert '[ "$AGENT_DUMPS" -lt 5 ] || return 0' in body
 
     # A dump that times out (rc 124) is still never "the failed step".
+
+
+def test_the_agent_state_is_saved_after_the_model_step_even_when_it_passes():
+    # WSL2 vs 22.04 (rc.3): only the failing cell left a dump, so the passing
+    # one could not be compared. The model is placed in onboard / onboard-model.
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    model = text.index("step onboard-model 1800")
+    full = text.index("step onboard 3600")
+    call = text.index("\nagent_dump model\n")
+    assert call > model and call > full, "after both model paths"
+    assert call < text.index("step stack-start"), "before anything else moves the stack"
+    body = text[text.index("agent_dump() {"):text.index("ON_STEP_FAIL=agent_dump")]
+    assert 'noo --json cluster show "$(hostname)"' in body
+    assert 'grep -E "reconcile_nudge|placement"' in body
 
 
 def test_a_dump_that_times_out_is_not_the_failed_step(tmp_path):

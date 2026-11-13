@@ -76,6 +76,12 @@ hook() {  # a mode's steps written by another owner (see the workflow)
 # node read "no lanes" two minutes later, with no agent log to say why): on
 # EVERY failed step or probe, the node agent's status and its last 200 log
 # lines, as a step of its own, so the same redactor and upload scan apply.
+# Also after the model step SUCCEEDS (agent-state-after-model): the
+# placement is made there, so a passing cell (22.04) and a failing one
+# (WSL2) can be read side by side: does a reconcile follow the place within
+# seconds, is the backend native/adopted or managed, did the gateway log
+# reconcile_nudged for the node. Each dump also carries `noo --json cluster
+# show <this node>` and the gateway's reconcile_nudge*/placement lines.
 # systemd hosts: systemctl status + journalctl. Without systemd: the agent
 # process (if any), launchd's view on macOS and the log file the plist names.
 # Never the env file (it holds the agent's token). At most 5 dumps per cell.
@@ -96,6 +102,14 @@ agent_dump() {
         for f in /tmp/noomesh-agent.log /var/log/noo-node-agent.log; do
           [ -f "$f" ] && { echo "== $f (last 200)"; tail -n 200 "$f"; }
         done
+      fi
+      if command -v noo >/dev/null 2>&1; then
+        echo "== noo --json cluster show $(hostname) (this node: lanes, placements, backends)"
+        timeout 60 noo --json cluster show "$(hostname)" 2>&1 | head -c 20000; echo
+      fi
+      if docker inspect noo-gateway >/dev/null 2>&1; then
+        echo "== noo-gateway: nudges and placements (last 15 min)"
+        docker logs --since 15m noo-gateway 2>&1 | grep -E "reconcile_nudge|placement" | tail -n 40
       fi
       true'
     return 0
@@ -210,6 +224,8 @@ elif [ "$MODEL" = tiny ]; then
 else
     step onboard 3600 -- noo onboard --ci || fail_onboarded
 fi
+# The model was placed above: the agent's view on success too (see agent_dump).
+agent_dump model
 
 # ── 4. up, verified, answering ──────────────────────────────────────────
 step stack-start 1800 -- noo stack start || fail_onboarded
