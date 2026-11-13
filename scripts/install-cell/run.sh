@@ -262,8 +262,10 @@ step probe-offboard-without-docker 600 -- sh -c '
          env HOME="$HOME" PATH="$PATH" NOO_DOCKER_GROUP_RELAUNCHED=1 noo offboard -y 2>&1)"; rc=$?
   printf "%s\n" "$out"; ok=1
   [ "$rc" != 0 ] || { echo "PROBE FAIL: offboard without docker exited 0"; ok=0; }
-  printf "%s" "$out" | grep -q "cannot reach docker" || { echo "PROBE FAIL: it did not say it cannot reach docker"; ok=0; }
-  printf "%s" "$out" | grep -q "nothing was removed" || { echo "PROBE FAIL: it did not say nothing was removed"; ok=0; }
+  # Case-insensitive: the failure line is printed capitalised ("x Cannot reach
+  # docker (…): nothing was removed"; rc.3 run 43351232102).
+  printf "%s" "$out" | grep -qi "cannot reach docker" || { echo "PROBE FAIL: it did not say it cannot reach docker"; ok=0; }
+  printf "%s" "$out" | grep -qi "nothing was removed" || { echo "PROBE FAIL: it did not say nothing was removed"; ok=0; }
   docker ps -q --filter name=noo-gateway | grep -q . || { echo "PROBE FAIL: the gateway container is gone"; ok=0; }
   [ -d "$HOME/.noo" ] || { echo "PROBE FAIL: ~/.noo is gone"; ok=0; }
   [ -d /var/lib/noo ] || { echo "PROBE FAIL: /var/lib/noo is gone"; ok=0; }
