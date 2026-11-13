@@ -259,6 +259,7 @@ HOMES = {
     "docker/Dockerfile.node-agent-go": "ARG HUB_MIRROR default, pinned by tests/test_hub_mirror.py",
     "docker/Dockerfile.whisper": "ARG HUB_MIRROR default, pinned by tests/test_hub_mirror.py",
     "docker/Dockerfile.piper": "ARG HUB_MIRROR default, pinned by tests/test_hub_mirror.py",
+    "examples/example-addon/Dockerfile": "ARG HUB_MIRROR default, pinned by tests/test_hub_mirror.py (the reference add-on; it may move to its own repo)",
     "docker-compose.cluster.yml": "compose `${NOO_BASE_REGISTRY:-...}` default; pinned equal to the public namespace below",
     "scripts/release-retag-plan.py": "release tooling: the default --repo of the stack release (this repo)",
     ".github/workflows/cla.yml": "CLA document link, pinned to the tag cla-v1.0 of THIS repo",
