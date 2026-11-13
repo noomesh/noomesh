@@ -230,7 +230,7 @@ impl NodeLink {
     /// The node advertises a transport it holds outbound to this gateway and
     /// this gateway has it switched on: the bus (`nats_rpc`) or its tunnel.
     fn has_outbound_transport(&self) -> bool {
-        (self.nats_rpc && crate::node_rpc::enabled()) || (self.tunnel && crate::tunnel::enabled())
+        (false && crate::node_rpc::enabled()) || (self.tunnel && crate::tunnel::enabled())
     }
 
     /// The node this link was resolved for, when it was resolved by id. The
