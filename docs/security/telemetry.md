@@ -527,13 +527,21 @@ out, or your tailnet's) the host's resolver was asked for
 question left, no connection followed. Since 0.6.24 the agent reads the GPU
 from `nvidia-smi` only and looks no name up.
 
-One case remains. While the console's Observability panel is open, or a
-kiosk display shows GPUs, they ask the gateway for GPU metrics (every 15 s
-for the panel), and the gateway fetches them from `nvidia-exporter`. On a
-controller without an NVIDIA container runtime there is no such container,
-so Docker forwards the name to the host's resolver
-(`nvidia-exporter.<search domain>`), once per refresh while the view is open.
-It is a question only; no connection follows.
+Before 0.6.24 the console's Observability panel (every 15 s while open) and a
+kiosk display showing GPUs had the gateway fetch GPU metrics from
+`nvidia-exporter` on every refresh; on a controller without an NVIDIA
+container runtime Docker forwarded that name to the host's resolver. Since
+0.6.24 the gateway fetches the exporter only while the exporter has announced
+itself, and otherwise reads the GPUs the node agents report.
+
+So an idle install, and one with the console or a kiosk display open, asks
+no resolver for the name of one of its own containers. Some actions you start
+still name a container that a default install does not run: the gateway's and
+trellion's default Ollama address is `stunnel-ollama`, which exists only with
+the `ollama` profile, so listing or pulling Ollama models, and an embedding
+request sent to that default, look that name up when Ollama is not installed.
+They are being moved to the same rule (a container is addressed only while it
+exists).
 
 These are out of scope here:
 

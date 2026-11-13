@@ -28,6 +28,7 @@ tests/test_secret_rundir.py hold the `file:` delivery.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 import pytest
 
@@ -126,3 +127,35 @@ def test_the_dev_source_overlays_stay_readable_mounts(svcs):
     gw = {v["target"]: v for v in svcs["gateway"].get("volumes") or [] if isinstance(v, dict)}
     for t in ("/app/noomesh.yaml", "/app/prompts", "/data", "/var/run/noo-spool"):
         assert t in gw and not gw[t].get("read_only"), f"gateway {t} must stay writable"
+
+
+# Every path the gateway can WRITE through a mount. A new mount is read-only
+# unless it is added here on purpose: the gateway's rootfs is read-only, so its
+# mounts are the whole of what it can change. 2026-11-13 (noomesh#1129
+# follow-up): the `prometheus-sd` view at /run/noo-prom-sd, where it only READS
+# nvidia-exporter's announcement before fetching it.
+GATEWAY_WRITABLE_MOUNTS = {
+    "/app/noomesh.yaml",
+    "/app/docker-compose.override.yml",
+    "/app/prompts",
+    "/data",
+    "/root/.claude",
+    "/var/run/noo-spool",
+}
+
+
+def test_the_gateways_writable_mounts_are_exactly_the_known_set(svcs):
+    vols = [v for v in svcs["gateway"].get("volumes") or [] if isinstance(v, dict)]
+    writable = {str(v.get("target")) for v in vols if not v.get("read_only")}
+    assert writable == GATEWAY_WRITABLE_MOUNTS, (
+        f"gateway writable mounts changed: added {sorted(writable - GATEWAY_WRITABLE_MOUNTS)}, "
+        f"gone {sorted(GATEWAY_WRITABLE_MOUNTS - writable)}"
+    )
+
+
+def test_the_gateway_reads_the_exporter_announcement_read_only(svcs):
+    vols = {str(v.get("target")): v for v in svcs["gateway"].get("volumes") or [] if isinstance(v, dict)}
+    sd = vols.get("/run/noo-prom-sd")
+    assert sd is not None and sd.get("source") == "prometheus-sd" and sd.get("read_only") is True, sd
+    rs = (Path(__file__).resolve().parents[1] / "gateway-rust/src/routes/cluster.rs").read_text()
+    assert 'EXPORTER_ANNOUNCE_DIR: &str = "/run/noo-prom-sd"' in rs, "the gateway reads a different path than compose mounts"

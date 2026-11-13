@@ -1835,28 +1835,63 @@ pub(crate) async fn cluster_backends(State(state): State<Arc<AppState>>) -> AppJ
     Json(json!({"backends": backends, "grouped": grouped}))
 }
 
-/// GPU metrics — fetches Prometheus metrics from nvidia-exporter and parses
-/// per-GPU data (temperature, power, memory, utilization). Falls back to
-/// gossip-based node data if the exporter is unreachable.
-pub(super) async fn cluster_gpu_metrics(State(state): State<Arc<AppState>>) -> AppJson {
-    let exporter_url = crate::config::env_or_yaml(
-        "NVIDIA_EXPORTER_URL",
-        |c| c.services.nvidia_exporter_url.clone(),
-        // The exporter refuses to serve without mTLS (docker/nvidia-smi-exporter.py),
-        // so a plaintext default was a URL that could never answer.
-        "https://nvidia-exporter:9400/metrics",
-    );
+/// Where nvidia-exporter announces itself while it serves (compose: the
+/// `prometheus-sd` tmpfs volume, mounted READ-ONLY here; the exporter writes
+/// `nvidia-exporter.json` once it is bound and removes it on SIGTERM, see
+/// docker/nvidia-smi-exporter.py). Prometheus reads the same file (file_sd).
+pub(crate) const EXPORTER_ANNOUNCE_DIR: &str = "/run/noo-prom-sd";
+pub(crate) const EXPORTER_ANNOUNCEMENT: &str = "nvidia-exporter.json";
+const EXPORTER_DEFAULT_URL: &str = "https://nvidia-exporter:9400/metrics";
 
-    let client = crate::tls::cluster_client();
+/// What the controller's own GPU exporter gave.
+#[derive(Debug)]
+pub(crate) enum ExporterGpus {
+    /// Not fetched: the default exporter has not announced itself, so there
+    /// is no container behind its name (a CPU-only controller). Asking would
+    /// send `nvidia-exporter` to the host's resolver: Docker's DNS forwards a
+    /// name it cannot answer. The console's Observability panel polls this
+    /// every 15 s and a kiosk can show it all day.
+    NotAnnounced,
+    /// The exporter answered 2xx: its GPUs.
+    Scraped(Vec<Value>),
+    /// It answered, but not usefully (non-2xx, or a cut-off body).
+    Failed(String),
+    /// No answer at all (connect or name failure).
+    Unreachable,
+}
 
-    match client.get(&exporter_url).timeout(std::time::Duration::from_secs(5)).send().await {
+/// Fetch the exporter, but only when it can be there. `explicit` is an
+/// operator-set NVIDIA_EXPORTER_URL: their target, fetched as configured.
+/// The default compose name is fetched only while its announcement exists.
+pub(crate) async fn read_exporter(client: &reqwest::Client, url: &str, explicit: bool, announce_dir: &std::path::Path) -> ExporterGpus {
+    if !explicit && !announce_dir.join(EXPORTER_ANNOUNCEMENT).is_file() {
+        return ExporterGpus::NotAnnounced;
+    }
+    match client.get(url).timeout(std::time::Duration::from_secs(5)).send().await {
         Ok(resp) if resp.status().is_success() => {
             // A cut-off scrape is an error, never "no GPUs" (i460).
-            let body = match crate::upstream_body::text_2xx(resp, "nvidia-exporter").await {
-                Ok(b) => b,
-                Err(e) => return Json(json!({"error": e, "gpus": []})),
-            };
-            let mut gpus = parse_prometheus_gpu_metrics(&body);
+            match crate::upstream_body::text_2xx(resp, "nvidia-exporter").await {
+                Ok(body) => ExporterGpus::Scraped(parse_prometheus_gpu_metrics(&body)),
+                Err(e) => ExporterGpus::Failed(e),
+            }
+        }
+        Ok(resp) => ExporterGpus::Failed(format!("nvidia-exporter returned {}", resp.status())),
+        Err(_) => ExporterGpus::Unreachable,
+    }
+}
+
+/// GPU metrics — the controller's own nvidia-exporter when it is running
+/// (it has announced itself), else the node agents' `/gpu` (gossip).
+pub(super) async fn cluster_gpu_metrics(State(state): State<Arc<AppState>>) -> AppJson {
+    let configured = crate::config::env_or_yaml("NVIDIA_EXPORTER_URL", |c| c.services.nvidia_exporter_url.clone(), "");
+    let explicit = !configured.trim().is_empty();
+    // The exporter refuses to serve without mTLS (docker/nvidia-smi-exporter.py),
+    // so a plaintext default was a URL that could never answer.
+    let exporter_url = if explicit { configured } else { EXPORTER_DEFAULT_URL.to_string() };
+    let announce_dir = std::path::Path::new(EXPORTER_ANNOUNCE_DIR);
+
+    match read_exporter(&crate::tls::cluster_client(), &exporter_url, explicit, announce_dir).await {
+        ExporterGpus::Scraped(mut gpus) => {
             // The exporter is the controller's own, so these GPUs belong
             // to the controller node. Name it: the kiosk (and anything
             // else) joins GPU ↔ node on `node_id`/`hostname`, and until
@@ -1870,13 +1905,8 @@ pub(super) async fn cluster_gpu_metrics(State(state): State<Arc<AppState>>) -> A
             }
             Json(json!({"gpus": gpus}))
         }
-        Ok(resp) => {
-            Json(json!({
-                "error": format!("nvidia-exporter returned {}", resp.status()),
-                "gpus": [],
-            }))
-        }
-        Err(_) => {
+        ExporterGpus::Failed(e) => Json(json!({"error": e, "gpus": []})),
+        ExporterGpus::NotAnnounced | ExporterGpus::Unreachable => {
             // Fallback: proxy to node agents' /gpu endpoint
             let agents = all_node_agents(&state).await;
             let mut all_gpus = Vec::new();
@@ -8736,5 +8766,83 @@ mod settling_after_gateway_start_tests {
         let ask = code.find("if let Some(detail) = settling_after_gateway_start(").expect("asks it");
         let diag = code.find("if data[\"status\"] == \"unknown\" && data.get(\"status_reason\").is_none() \u{7b}\n                            if let Some(bus) = data.get(\"nats_status\").cloned() \u{7b}").expect("the diagnosis, for an unexplained unknown only");
         assert!(unknown < ask && ask < diag);
+    }
+}
+
+#[cfg(test)]
+mod exporter_announcement_tests {
+    //! The gateway asks for its own GPU exporter only while the exporter has
+    //! announced itself (noomesh#1129 follow-up, general 2026-11-13): on a
+    //! controller without one, `nvidia-exporter` is a name Docker cannot
+    //! answer and forwards to the host's resolver, every 15 s while the
+    //! console's Observability panel is open and all day on a kiosk.
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// A resolver that records every name it is asked for and answers none.
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<String>>);
+    impl reqwest::dns::Resolve for Recorder {
+        fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            self.0.lock().unwrap().push(name.as_str().to_string());
+            let err: Box<dyn std::error::Error + Send + Sync> = "this test allows no DNS".into();
+            Box::pin(async move { Err::<reqwest::dns::Addrs, Box<dyn std::error::Error + Send + Sync>>(err) })
+        }
+    }
+
+    /// A fresh, empty directory per test (no tempfile crate in this crate).
+    fn fresh_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("noo-gpu-announce-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("temp dir");
+        d
+    }
+
+    fn recording_client() -> (reqwest::Client, Arc<Recorder>) {
+        let rec = Arc::new(Recorder::default());
+        let client = reqwest::Client::builder().dns_resolver(rec.clone()).no_proxy().build().expect("client");
+        (client, rec)
+    }
+
+    #[tokio::test]
+    async fn without_an_announcement_nothing_is_resolved_or_requested() {
+        let dir = fresh_dir("none");
+        let (client, rec) = recording_client();
+        let got = read_exporter(&client, EXPORTER_DEFAULT_URL, false, &dir).await;
+        assert!(matches!(got, ExporterGpus::NotAnnounced), "{got:?}");
+        let asked: Vec<String> = rec.0.lock().unwrap().clone();
+        assert!(asked.is_empty(), "asked a resolver for {asked:?} with no exporter announced");
+    }
+
+    #[tokio::test]
+    async fn with_the_announcement_the_exporter_is_fetched() {
+        let dir = fresh_dir("announced");
+        std::fs::write(dir.join(EXPORTER_ANNOUNCEMENT), r#"[{"targets":["nvidia-exporter:9400"]}]"#).unwrap();
+        let (client, rec) = recording_client();
+        let got = read_exporter(&client, EXPORTER_DEFAULT_URL, false, &dir).await;
+        // The recorder answers no name, so the fetch fails as unreachable:
+        // what matters is that it was attempted, by name.
+        assert!(matches!(got, ExporterGpus::Unreachable), "{got:?}");
+        let asked: Vec<String> = rec.0.lock().unwrap().clone();
+        assert_eq!(asked, vec!["nvidia-exporter".to_string()], "the announced exporter was not fetched");
+    }
+
+    #[tokio::test]
+    async fn an_operator_set_url_is_fetched_without_an_announcement() {
+        let dir = fresh_dir("explicit");
+        let (client, rec) = recording_client();
+        let got = read_exporter(&client, "https://gpu-exporter.example.internal:9400/metrics", true, &dir).await;
+        assert!(matches!(got, ExporterGpus::Unreachable), "{got:?}");
+        let asked: Vec<String> = rec.0.lock().unwrap().clone();
+        assert_eq!(asked, vec!["gpu-exporter.example.internal".to_string()]);
+    }
+
+    #[test]
+    fn the_handler_reads_the_compose_mount() {
+        // the path the gateway reads is where compose mounts the volume,
+        // read-only (tests/test_prometheus_static_targets_exist.py checks the
+        // compose side against this constant's text)
+        assert_eq!(EXPORTER_ANNOUNCE_DIR, "/run/noo-prom-sd");
+        assert_eq!(EXPORTER_ANNOUNCEMENT, "nvidia-exporter.json");
     }
 }

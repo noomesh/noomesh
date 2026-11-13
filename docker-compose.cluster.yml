@@ -861,6 +861,14 @@ services:
       # (see node-agent-go/internal/hostd). The gateway drops JSON command
       # files here; the host daemon performs all docker/compose operations.
       - ./.noo-host-spool:/var/run/noo-spool:rw
+      # Read-only view of the `prometheus-sd` tmpfs: nvidia-exporter writes
+      # nvidia-exporter.json there while it serves, and the GPU route
+      # (routes/cluster.rs read_exporter) fetches the exporter only while that
+      # file exists. Without it, on a controller with no exporter, every
+      # console/kiosk GPU refresh sent `nvidia-exporter` to the host's
+      # resolver. Read-only: the gateway can read the announcement, never
+      # write one (tests/test_read_only_rootfs.py pins its writable mounts).
+      - prometheus-sd:/run/noo-prom-sd:ro
       # Add-on bundle declarations (i163 E/B): `<addon>/system.json`,
       # `<addon>/workloads.json` and `<addon>/routes.json` from each add-on's
       # SIGNED bundle, copied by the launcher (lib-dist.sh
