@@ -534,14 +534,12 @@ container runtime Docker forwarded that name to the host's resolver. Since
 0.6.24 the gateway fetches the exporter only while the exporter has announced
 itself, and otherwise reads the GPUs the node agents report.
 
-So an idle install, and one with the console or a kiosk display open, asks
-no resolver for the name of one of its own containers. Some actions you start
-still name a container that a default install does not run: the gateway's and
-trellion's default Ollama address is `stunnel-ollama`, which exists only with
-the `ollama` profile, so listing or pulling Ollama models, and an embedding
-request sent to that default, look that name up when Ollama is not installed.
-They are being moved to the same rule (a container is addressed only while it
-exists).
+At idle, and with the console or a kiosk display open, nothing noomesh runs
+asks a resolver for the name of one of its own containers. An operator action
+aimed at a backend that is not installed can: listing or pulling Ollama
+models, or an embedding sent to the default Ollama address
+(`stunnel-ollama`), on an install that does not run Ollama, looks that name
+up when you start it.
 
 These are out of scope here:
 
