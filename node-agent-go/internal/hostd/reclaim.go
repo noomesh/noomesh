@@ -30,7 +30,12 @@ import (
 //     they cache is gone or the volume has been idle for a week. Removed one
 //     by one with `docker volume rm` (no -f), so a volume in use fails.
 //
-// It must NEVER touch any OTHER volume, tagged images, or anything running.
+//  5. superseded images that are provably OURS, used by no container and
+//     named by no kept lock or pin (image_retention.go) — only with a keep
+//     file the caller proves current.
+//
+// It must NEVER touch any OTHER volume, a foreign or kept image, or anything
+// running.
 // Volumes are the sharp one: a briefly-down container makes its volume
 // "unused", so an unattended `docker volume prune` can destroy the pgvector
 // store, a trading database or the model cache during a routine restart. That
@@ -146,7 +151,7 @@ func (e *Engine) reclaimOrphans(ctx context.Context) []string {
 // diskReclaim walks the ladder, stopping as soon as usage drops below the
 // watermark. The returned string is the report that rides the result file —
 // one compact line per rung, because it is capped at 2000 chars.
-func (e *Engine) diskReclaim(ctx context.Context, dryRun bool, watermark int, capBytes int64) (int, string) {
+func (e *Engine) diskReclaim(ctx context.Context, dryRun bool, watermark int, capBytes int64, keepPath string) (int, string) {
 	target := e.diskReclaimTargetPath(ctx)
 	before := e.diskUsagePct(ctx, target)
 	if before < 0 {
@@ -187,12 +192,16 @@ func (e *Engine) diskReclaim(ctx context.Context, dryRun bool, watermark int, ca
 		if o := e.reclaimOrphans(ctx); len(o) > 0 {
 			orphans = strings.Join(o, " ")
 		}
+		rung5 := "rung5: no keep file given (superseded images not judged)"
+		if keepPath != "" {
+			rung5, _ = e.supersededImages(ctx, keepPath, true)
+		}
 		return 0, fmt.Sprintf(
 			"DRY RUN (nothing removed) — %s | rung1: %d dangling image(s) "+
 				"| rung2: build cache reclaimable %s (only >7d would be pruned) "+
 				"| rung3: rename-orphan container(s): %s "+
-				"| rung4: %d stale build-cache volume(s)",
-			report, nDangling, cache, orphans, len(e.staleBuildVolumes(ctx, time.Now())))
+				"| rung4: %d stale build-cache volume(s) | %s",
+			report, nDangling, cache, orphans, len(e.staleBuildVolumes(ctx, time.Now())), rung5)
 	}
 
 	// Rung 1 — dangling images.
@@ -297,6 +306,16 @@ func (e *Engine) diskReclaim(ctx context.Context, dryRun bool, watermark int, ca
 	report += fmt.Sprintf(" | rung4 build-cache volumes: removed %d", vRemoved)
 	if vFailed > 0 {
 		report += fmt.Sprintf(", %d in use", vFailed)
+	}
+
+	// Rung 5 — superseded images that are provably ours (image_retention.go).
+	if after := e.usageOr(ctx, target, before); after >= watermark {
+		if keepPath == "" {
+			report += " | rung5 superseded images: no keep file given"
+		} else {
+			line, _ := e.supersededImages(ctx, keepPath, false)
+			report += " | " + line
+		}
 	}
 
 	after := e.usageOr(ctx, target, before)
