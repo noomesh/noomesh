@@ -75,14 +75,19 @@ It then waits until the node stops reporting in, prints
 `<node>: teardown verified`, and removes the node's certificates and its
 entry in the registry.
 
-`--factory` is `--purge-data` plus `--purge-tailscale`:
+Teardown is a full cleanup, with or without a terminal:
 
-- The node always logs out of Tailscale.
-- `--purge-tailscale` also removes the Tailscale package (only if noomesh
-  installed it) and deletes the node's **device record** from your tailnet.
-- Without it, and with no terminal to ask you on, the record is kept. The
-  node's next enroll then registers as `<name>-1`. The command says so, and
-  you can delete the record in the Tailscale admin console.
+- The node logs out of Tailscale, and its **device record** is deleted from
+  your tailnet once the node has collected its order. Its next enroll can
+  then use the same name.
+- `--keep-tailnet-record` keeps the record. The node's next enroll then
+  registers as `<name>-1`.
+- This box's own node keeps its record: its tailnet identity is the
+  controller's.
+
+`--factory` is `--purge-data` plus `--purge-tailscale`. `--purge-tailscale`
+also removes the Tailscale package from the node (only if noomesh installed
+it).
 
 One node at a time, keeping its data:
 
