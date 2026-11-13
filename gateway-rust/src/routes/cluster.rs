@@ -1860,11 +1860,34 @@ pub(crate) enum ExporterGpus {
     Unreachable,
 }
 
-/// Fetch the exporter, but only when it can be there. `explicit` is an
-/// operator-set NVIDIA_EXPORTER_URL: their target, fetched as configured.
-/// The default compose name is fetched only while its announcement exists.
-pub(crate) async fn read_exporter(client: &reqwest::Client, url: &str, explicit: bool, announce_dir: &std::path::Path) -> ExporterGpus {
-    if !explicit && !announce_dir.join(EXPORTER_ANNOUNCEMENT).is_file() {
+/// The URL the GPU route asks: NVIDIA_EXPORTER_URL / `services.nvidia_exporter_url`
+/// when set, else the compose default.
+pub(crate) fn exporter_url(configured: &str) -> String {
+    let c = configured.trim();
+    if c.is_empty() { EXPORTER_DEFAULT_URL.to_string() } else { c.to_string() }
+}
+
+/// Whether `url` names the controller's OWN exporter container (the compose
+/// service `nvidia-exporter`, or its `<prefix>-nvidia-exporter` container
+/// name), which exists only while the exporter runs. Decided by the HOST, not
+/// by where the URL came from: rc.5 decided by source, and every install's
+/// noomesh.yaml (seeded byte-for-byte from noomesh.yaml.example, which set
+/// this key to the compose default) made the default look operator-set, so
+/// the gate never applied. A URL that does not parse is treated as ours
+/// (no fetch without an announcement): failing closed costs a GPU tile,
+/// failing open costs a lookup every 15 s.
+pub(crate) fn names_our_exporter(url: &str) -> bool {
+    match reqwest::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_ascii_lowercase)) {
+        Some(h) => !h.contains('.') && (h == "nvidia-exporter" || h.ends_with("-nvidia-exporter")),
+        None => true,
+    }
+}
+
+/// Fetch the exporter, but only when it can be there: a URL naming our own
+/// exporter container is fetched only while its announcement exists. An
+/// operator URL pointing anywhere else is their target, fetched as configured.
+pub(crate) async fn read_exporter(client: &reqwest::Client, url: &str, announce_dir: &std::path::Path) -> ExporterGpus {
+    if names_our_exporter(url) && !announce_dir.join(EXPORTER_ANNOUNCEMENT).is_file() {
         return ExporterGpus::NotAnnounced;
     }
     match client.get(url).timeout(std::time::Duration::from_secs(5)).send().await {
@@ -1883,14 +1906,12 @@ pub(crate) async fn read_exporter(client: &reqwest::Client, url: &str, explicit:
 /// GPU metrics — the controller's own nvidia-exporter when it is running
 /// (it has announced itself), else the node agents' `/gpu` (gossip).
 pub(super) async fn cluster_gpu_metrics(State(state): State<Arc<AppState>>) -> AppJson {
-    let configured = crate::config::env_or_yaml("NVIDIA_EXPORTER_URL", |c| c.services.nvidia_exporter_url.clone(), "");
-    let explicit = !configured.trim().is_empty();
     // The exporter refuses to serve without mTLS (docker/nvidia-smi-exporter.py),
     // so a plaintext default was a URL that could never answer.
-    let exporter_url = if explicit { configured } else { EXPORTER_DEFAULT_URL.to_string() };
+    let url = exporter_url(&crate::config::env_or_yaml("NVIDIA_EXPORTER_URL", |c| c.services.nvidia_exporter_url.clone(), ""));
     let announce_dir = std::path::Path::new(EXPORTER_ANNOUNCE_DIR);
 
-    match read_exporter(&crate::tls::cluster_client(), &exporter_url, explicit, announce_dir).await {
+    match read_exporter(&crate::tls::cluster_client(), &url, announce_dir).await {
         ExporterGpus::Scraped(mut gpus) => {
             // The exporter is the controller's own, so these GPUs belong
             // to the controller node. Name it: the kiosk (and anything
@@ -8808,7 +8829,7 @@ mod exporter_announcement_tests {
     async fn without_an_announcement_nothing_is_resolved_or_requested() {
         let dir = fresh_dir("none");
         let (client, rec) = recording_client();
-        let got = read_exporter(&client, EXPORTER_DEFAULT_URL, false, &dir).await;
+        let got = read_exporter(&client, EXPORTER_DEFAULT_URL, &dir).await;
         assert!(matches!(got, ExporterGpus::NotAnnounced), "{got:?}");
         let asked: Vec<String> = rec.0.lock().unwrap().clone();
         assert!(asked.is_empty(), "asked a resolver for {asked:?} with no exporter announced");
@@ -8819,7 +8840,7 @@ mod exporter_announcement_tests {
         let dir = fresh_dir("announced");
         std::fs::write(dir.join(EXPORTER_ANNOUNCEMENT), r#"[{"targets":["nvidia-exporter:9400"]}]"#).unwrap();
         let (client, rec) = recording_client();
-        let got = read_exporter(&client, EXPORTER_DEFAULT_URL, false, &dir).await;
+        let got = read_exporter(&client, EXPORTER_DEFAULT_URL, &dir).await;
         // The recorder answers no name, so the fetch fails as unreachable:
         // what matters is that it was attempted, by name.
         assert!(matches!(got, ExporterGpus::Unreachable), "{got:?}");
@@ -8831,10 +8852,45 @@ mod exporter_announcement_tests {
     async fn an_operator_set_url_is_fetched_without_an_announcement() {
         let dir = fresh_dir("explicit");
         let (client, rec) = recording_client();
-        let got = read_exporter(&client, "https://gpu-exporter.example.internal:9400/metrics", true, &dir).await;
+        let got = read_exporter(&client, "https://gpu-exporter.example.internal:9400/metrics", &dir).await;
         assert!(matches!(got, ExporterGpus::Unreachable), "{got:?}");
         let asked: Vec<String> = rec.0.lock().unwrap().clone();
         assert_eq!(asked, vec!["gpu-exporter.example.internal".to_string()]);
+    }
+
+    /// rc.5's miss: the gate was skipped for any CONFIGURED URL, and every
+    /// install is configured, because onboard seeds noomesh.yaml as a byte copy
+    /// of noomesh.yaml.example (noo-cli/src/onboard/steps.rs ensure_mesh_yaml).
+    /// So this runs the gate against what an install is seeded with, parsed
+    /// the way the gateway loads it, and against the line rc.5's example
+    /// shipped (installs seeded then keep it: upgrade never rewrites it).
+    #[tokio::test]
+    async fn the_seeded_install_config_is_gated_too() {
+        // Read at test time, not include_str!: the gateway image's build
+        // context does not carry the example (tests/test_rust_build_context_complete.py).
+        let example = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../noomesh.yaml.example"))
+            .expect("noomesh.yaml.example (what onboard seeds noomesh.yaml from) is unreadable");
+        let seeded: crate::config::AppConfig = serde_yaml::from_str(&example).expect("the example parses as the gateway's config");
+        let rc5_seed = "https://nvidia-exporter:9400/metrics".to_string();
+        let dir = fresh_dir("seeded");
+        for configured in [seeded.services.nvidia_exporter_url.clone().unwrap_or_default(), rc5_seed] {
+            let url = exporter_url(&configured);
+            let (client, rec) = recording_client();
+            let got = read_exporter(&client, &url, &dir).await;
+            assert!(matches!(got, ExporterGpus::NotAnnounced), "configured {configured:?} -> {url}: {got:?}");
+            let asked: Vec<String> = rec.0.lock().unwrap().clone();
+            assert!(asked.is_empty(), "configured {configured:?}: asked a resolver for {asked:?} with no exporter announced");
+        }
+    }
+
+    #[test]
+    fn only_our_exporter_container_needs_the_announcement() {
+        for ours in ["https://nvidia-exporter:9400/metrics", "https://NVIDIA-EXPORTER:9400/metrics", "https://noo-nvidia-exporter:9400/metrics", "not a url"] {
+            assert!(names_our_exporter(ours), "{ours}");
+        }
+        for theirs in ["https://gpu.example.internal:9400/metrics", "https://10.0.0.5:9400/metrics", "https://nvidia-exporter.lan:9400/metrics"] {
+            assert!(!names_our_exporter(theirs), "{theirs}");
+        }
     }
 
     #[test]
