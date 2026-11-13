@@ -408,7 +408,55 @@ def test_the_cell_saves_verify_as_json_after_verify():
     run is a probe (never the failed step), after the real verify, before the
     first answer, and goes through step() (redacted, scanned, uploaded)."""
     text = (ROOT / "scripts/install-cell/run.sh").read_text()
-    verify = text.index("step verify 900 -- noo cluster verify --wait")
-    probe = text.index("step probe-verify-json 300 -- noo --json cluster verify\n")
+    verify = text.index("step verify 900 -- bash -c 'fresh cluster verify --wait'")
+    probe = text.index("step probe-verify-json 300 -- bash -c 'fresh --json cluster verify'\n")
     answer = text.index("step first-answer ")
     assert verify < probe < answer, (verify, probe, answer)
+
+
+def test_a_driver_loop_is_the_first_error_not_the_pre_install_docker_check(tmp_path):
+    # rc.4 literal cell: first_error was "✗ docker: MISSING" (onboard's normal
+    # pre-install check), not the loop that ended the step.
+    log = tmp_path / "onboard-literal.log"
+    log.write_text("  ✗ docker: MISSING — Runs all Noomesh services\n  ✓ curl: curl 8.5.0\n"
+                   + "  Admin password: \nPROMPT: Admin password:\nANSWER: enter\n\n  (a value is required)\n" * 3
+                   + "DRIVER: LOOP: the same prompt answered 6 times in a row with 'enter'\n")
+    e = C.record("onboard-literal", 2, 73, str(log))["first_error"]
+    assert e.startswith("DRIVER: LOOP"), e
+
+
+def test_a_masked_value_beside_non_ascii_text_passes_the_upload_scan(tmp_path):
+    # rc.3 literal cell: "age key: [REDACTED] — …" JSON-escaped to "—",
+    # which the scan read as the key's 6-character value and withheld the artifact.
+    log = tmp_path / "onboard.log"
+    log.write_text(_redact("  ✓ Secrets encrypted at rest (SOPS+age). BACK UP your age key: AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQ — it is the root of trust.\n"))
+    assert "AGE-SECRET-KEY" not in log.read_text()
+    out = subprocess.run([sys.executable, str(CELL), "record", "onboard", "1", "3", str(log)],
+                         capture_output=True, text=True, encoding="utf-8", check=True).stdout
+    assert "\\u2014" not in out and "—" in out, "the record keeps the em dash as text"
+    (tmp_path / "up").mkdir()
+    (tmp_path / "up" / "steps.jsonl").write_text(out, encoding="utf-8")
+    r = subprocess.run([sys.executable, str(CELL), "scan", str(tmp_path / "up")], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
+def test_verify_runs_from_a_fresh_login_and_one_probe_keeps_the_old_shell():
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    assert "step verify 900 -- bash -c 'fresh cluster verify --wait'" in text
+    assert "step probe-verify-json 300 -- bash -c 'fresh --json cluster verify'" in text
+    assert 'sudo -iu "$(id -un)" -- "$NOO_BIN" "$@"' in text, "a docker=none cell's verify is a new login session"
+    old = text[text.index("step probe-verify-old-shell"):]
+    old = old[:old.index("\nfi\n")]
+    assert "fresh" not in old and "noo --json cluster verify" in old, "the old-shell probe must not log in again"
+    assert "not-judged-with-docker-remedy" in old
+
+
+def test_the_restart_probe_runs_20_only_on_the_22_04_cell_and_offboard_checks_with_sudo():
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    assert 'NETNS_RESTARTS=5; [ "$CELL" = ubuntu-22.04-amd64 ] && NETNS_RESTARTS=20' in text
+    probe = text[text.index("step probe-docker-restart-namespace-joiners"):]
+    probe = probe[:probe.index("\n  true'")]
+    assert 'seq 1 "$NETNS_RESTARTS"' in probe and "seq 1 20" not in probe
+    off = text[text.index("step probe-offboard-without-docker"):]
+    assert "sudo docker ps -q --filter name=noo-gateway" in off
+    assert "\n  docker ps -q --filter name=noo-gateway" not in off
