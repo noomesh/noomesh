@@ -222,6 +222,14 @@ pub(crate) fn tunnel_row(id: &str, n: &Value) -> Check {
     }
 }
 
+/// No heartbeat has reached the controller since this node registered: every
+/// field only a heartbeat carries is absent (cert expiry, hostd, log shipper,
+/// bus). Registration writes none of them, so a record with none is one the
+/// verifier must not judge as an agent that lacks them.
+fn no_heartbeat_yet(n: &Value) -> bool {
+    ["cert_not_after", "hostd", "log_ship", "nats_status"].iter().all(|k| n[*k].is_null())
+}
+
 /// A heartbeat older than this is a node the controller is not hearing.
 pub(crate) const HEARTBEAT_MAX_AGE_SECS: i64 = 120;
 /// Right after `noo cluster provision <node> --wait`, a field the restarted
@@ -400,7 +408,17 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     // 2. Bus: connected on its OWN principal, never the fleet fallback.
     let bus = n["nats_state"].as_str().unwrap_or("?");
     let cred = n["nats_role"].as_str().unwrap_or("?");
-    if bus != "connected" {
+    if n["nats_state"].is_null() && no_heartbeat_yet(n) {
+        // rc.6 A-nodeverify: a node verified seconds after it registered,
+        // before its first beat (one interval after registration), read as
+        // bus-deaf. Registration never carries the bus state; only a beat does.
+        out.push(warn("bus", "not reported yet — the node has not sent its first heartbeat; re-run after it", None));
+    } else if n["nats_state"].is_null() {
+        // A beat landed without it: this agent has no messaging subsystem,
+        // so every job dispatched to it strands (the 2026-08-02 bus-deaf case).
+        out.push(fail("bus", "heartbeating but reports no bus: its NATS client could not be created, so jobs sent to it strand",
+            format!("noo cluster logs {id}   # look for \"running without messaging\"; then noo cluster provision {id}")));
+    } else if bus != "connected" {
         out.push(fail("bus", format!("nats {bus}: {}", n["nats_state_detail"].as_str().unwrap_or("no detail")),
             format!("noo cluster provision {id}")));
     } else if cred != "node" {
@@ -9898,6 +9916,45 @@ mod tests {
         let c = nats_principals_check(Some(&both), &[], &["trellion"]);
         assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
         assert!(c.detail.contains("renders trellion_intel"), "{}", c.detail);
+    }
+
+    /// rc.6 A-nodeverify: verified before its first heartbeat, a node has no
+    /// bus state and no other beat-only field: "not reported yet", not FAIL.
+    #[test]
+    fn a_node_before_its_first_heartbeat_is_not_judged_bus_deaf() {
+        let now = 1_800_000_000;
+        let mut n = healthy(now);
+        for k in ["nats_state", "nats_status", "cert_not_after", "hostd", "log_ship"] {
+            n.as_object_mut().unwrap().remove(k);
+        }
+        n["nats_state_detail"] = "not reported".into();
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true)).into_iter().find(|c| c.name == "bus").unwrap();
+        assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
+        assert!(c.detail.contains("first heartbeat"), "{}", c.detail);
+    }
+
+    /// A beat landed (cert expiry is beat-only) and still no bus state: the
+    /// agent has no messaging subsystem. The bus-deaf FAIL, worded truly.
+    #[test]
+    fn a_heartbeating_node_without_bus_state_still_fails() {
+        let now = 1_800_000_000;
+        let mut n = healthy(now);
+        n.as_object_mut().unwrap().remove("nats_state");
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true)).into_iter().find(|c| c.name == "bus").unwrap();
+        assert_eq!(c.verdict, Verdict::Fail, "{c:?}");
+        assert!(c.detail.contains("reports no bus") && !c.detail.contains("build does not send"), "{}", c.detail);
+        assert!(c.remedy.unwrap_or_default().contains("running without messaging"));
+    }
+
+    #[test]
+    fn a_reported_disconnected_bus_fails_whatever_else_is_missing() {
+        let now = 1_800_000_000;
+        let mut n = healthy(now);
+        for k in ["cert_not_after", "hostd", "log_ship"] {
+            n.as_object_mut().unwrap().remove(k);
+        }
+        n["nats_state"] = "reconnecting".into();
+        assert_eq!(verdict(&node_checks(&n, "v0.2.70", "0.5.57", now, Some(true)), "bus"), Verdict::Fail);
     }
 
     #[test]
