@@ -1342,6 +1342,11 @@ for an add-on built `FROM` a stack image, `base` (`{image, digest}`, checked
 against that image's row in the stack's own signed lock). Never re-serialise
 the file: non-canonical bytes are refused.
 
+The signing seed is a file, passed as `--seed-file <path>` (or piped with
+`--seed-file -`), never an argument or an environment variable: keep it
+outside the add-on's repository, mode 0600, never committed; a release
+workflow holds it as a secret and pipes it in.
+
 **Trust anchor.** The licence names whom to trust. The entitlement token
 carries, per add-on,
 `"addons": {"<name>": {"keys": ["<hex ed25519 pubkey>", …], "registry": "<root>"}}`,
@@ -1374,8 +1379,30 @@ check it with `verify … --files-dir <dir>`. File names are one plain component
 | Bundle files | one layer per entry in `files`: `mediaType: application/vnd.noomesh.addon-file.v1`, title = the file name |
 | Limits | each layer at most 1 MiB; each blob's sha256 is checked against the manifest |
 
-A release publishes it with oras (1.2 or later), run from the directory
-that holds the two files:
+Publish it with `noo security addon-lock publish`, from the directory that
+holds what `sign` wrote (`addon-bundle.json` and its `.sig`, the
+`addon-lock.json` pair when you signed one, and the files the bundle lists;
+`--files-dir <dir>` reads those from elsewhere):
+
+```sh
+noo security addon-lock publish addon-bundle.json --registry <root> \
+  --token-file <path>   # a token that can write the package; else GH_TOKEN / GITHUB_TOKEN
+```
+
+It checks the bundle first (canonical bytes, images under `<root>`, every
+listed file present and hashing to the lock, each layer under 1 MiB), pushes
+one artifact per entry in `supports_stack`, tagged `stack-<tag>`, then reads
+each tag back through the same fetch `noo addons upgrade` uses and requires
+the bytes it pushed. A tag that does not read back fails the publish, naming
+the tag, so a broken publish fails at the publisher rather than at someone's
+upgrade. `--dry-run` prints the tags and the layers (title, media type, size,
+digest) and pushes nothing; `--json` prints a summary. The token is read from
+the file (or standard input with `--token-file -`) and is never printed;
+`--user <name>` sets the login name for registries that check it (GHCR checks
+only the token).
+
+What it pushes is what this oras (1.2 or later) command pushes, kept here for
+reference:
 
 ```sh
 oras push <root>:stack-v0.6.0 \

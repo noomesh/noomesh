@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026 PersonifAI LLC
 
-//! `noo security addon-lock sign` / `verify`: the add-on release
+//! `noo security addon-lock sign` / `publish` / `verify`: the add-on release
 //! pipeline's lock verbs, over [`crate::addon_lock`]. They are key-agnostic
 //! on purpose: the add-on's seed and public key come from the caller, never
 //! from this build, so one implementation of the format serves every
@@ -18,6 +18,11 @@
 //! the `--dev-key` flags plus every `addon_trust.*.dev_keys` record in this
 //! install's noomesh.yaml, when there is one.
 //!
+//! `publish` pushes what `sign` wrote to the add-on's own registry package
+//! (one OCI artifact per supported stack tag, the layout `lock_fetch`
+//! reads) and reads each tag back through the upgrade's own fetch, so a
+//! broken publish fails at the publisher: [`crate::addons::lock_publish`].
+//!
 //! `--file <name>=<path>` (repeatable) makes `sign` write a BUNDLE lock
 //! (`noo-addon-lock/2`): each file's sha256 is listed under `files`, so the
 //! one signature covers the add-on's compose overlay and anything else it
@@ -26,15 +31,20 @@
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::addon_lock::{self, AddonLock, BaseImage, TrustAnchor};
+use crate::addons::lock_fetch::{self, Credential};
+use crate::addons::lock_publish;
 use crate::output::{fail, ExitCode};
 use crate::release_sig;
 use crate::ui;
 use crate::{Globals, Unhandled};
 
 const SIGN_USAGE: &str = "usage: noo security addon-lock sign --addon <name> --version <v> --source-commit <sha> --supports <tag>[,<tag>]... --image <name>=<ref@digest>... [--base <image>=<digest>] [--file <name>=<path>]... [--registry <root>] --seed-file <path|-> --out <path>";
+const PUBLISH_USAGE: &str = "usage: noo security addon-lock publish <bundle.json> --registry <root> [--files-dir <dir>] [--user <name>] [--token-file <path|->] [--dry-run]";
+/// Where a developer keeps the seed, said wherever sign is described.
+const SEED_NOTE: &str = "keep the seed file outside the add-on's repository, mode 0600, never committed";
 const VERIFY_USAGE: &str = "usage: noo security addon-lock verify <path> --key <pubkey>... --addon <name> --registry <root> [--sig <path>] [--stack <tag>] [--files-dir <dir>] [--dev-key <pubkey>]...";
 
 fn usage_fail(g: &Globals, msg: &str, usage: &str) -> ! {
@@ -54,6 +64,18 @@ fn split_pair(s: &str) -> Option<(String, String)> {
     (!k.trim().is_empty() && !v.trim().is_empty()).then(|| (k.trim().to_string(), v.trim().to_string()))
 }
 
+/// Where a secret was read from, for an error. A value with no `/` or `.`
+/// is not echoed: it may be the secret itself, typed where its path goes.
+fn secret_source(path: &str, flag: &str) -> String {
+    if path == "-" {
+        "standard input".to_string()
+    } else if path.contains(['/', '.']) {
+        path.to_string()
+    } else {
+        format!("the {flag} value (not shown: a path has a / or a ., and the secret itself never goes on the command line)")
+    }
+}
+
 fn read_seed(g: &Globals, path: &str) -> String {
     let mut s = String::new();
     let r = if path == "-" {
@@ -62,9 +84,9 @@ fn read_seed(g: &Globals, path: &str) -> String {
         std::fs::read_to_string(path).map(|t| s = t)
     };
     if let Err(e) = r {
-        let from = if path == "-" { "standard input".to_string() } else { path.to_string() };
+        let from = secret_source(path, "--seed-file");
         fail(g.json, ExitCode::Generic, "no_seed", &format!("Add-on signing seed unreadable from {from} ({e})"),
-            Some("the seed never enters a repo; the add-on's release workflow carries it as a secret"));
+            Some(&format!("{SEED_NOTE}; a release workflow carries it as a secret and pipes it to --seed-file -")));
     }
     s.trim().to_string()
 }
@@ -119,7 +141,7 @@ pub fn security_addon_lock_sign(g: &Globals, args: &[String]) -> Result<i32, Unh
             "--registry" => registry = Some(take(g, &mut it, a, SIGN_USAGE)),
             "--seed-file" => seed_file = Some(take(g, &mut it, a, SIGN_USAGE)),
             "--out" => out = Some(PathBuf::from(take(g, &mut it, a, SIGN_USAGE))),
-            "--help" | "-h" => { println!("{SIGN_USAGE}"); return Ok(0); }
+            "--help" | "-h" => { println!("{SIGN_USAGE}\n  {SEED_NOTE}"); return Ok(0); }
             v => usage_fail(g, &format!("unknown argument {v}"), SIGN_USAGE),
         }
     }
@@ -170,6 +192,150 @@ pub fn security_addon_lock_sign(g: &Globals, args: &[String]) -> Result<i32, Unh
             "format": lock.format, "files": lock.files, "pubkey": pk}));
     } else {
         ui::done(&format!("signed {} {} lock to {}  {}", addon, lock.version, out.display(), ui::muted(&format!("key {}…", &pk[..12]))));
+    }
+    Ok(0)
+}
+
+/// A secret read from `path` (or standard input for `-`), trimmed. Never
+/// printed: a failure names the path only.
+fn read_token(g: &Globals, path: &str) -> String {
+    let mut s = String::new();
+    let r = if path == "-" {
+        std::io::stdin().read_to_string(&mut s).map(|_| ())
+    } else {
+        std::fs::read_to_string(path).map(|t| s = t)
+    };
+    if let Err(e) = r {
+        let from = secret_source(path, "--token-file");
+        fail(g.json, ExitCode::Generic, "no_token", &format!("Registry token unreadable from {from} ({e})"), None);
+    }
+    let t = s.trim().to_string();
+    if t.is_empty() {
+        fail(g.json, ExitCode::Generic, "no_token", &format!("Registry token from {} is empty", secret_source(path, "--token-file")), None);
+    }
+    t
+}
+
+fn read_or_fail(g: &Globals, path: &Path) -> Vec<u8> {
+    match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => fail(g.json, ExitCode::Generic, "read_failed", &format!("{}: {e}", path.display()), None),
+    }
+}
+
+fn read_sig_or_fail(g: &Globals, path: &Path) -> String {
+    match String::from_utf8(read_or_fail(g, path)) {
+        Ok(s) => s,
+        Err(_) => fail(g.json, ExitCode::Generic, "read_failed", &format!("{} is not a signature (not text)", path.display()), None),
+    }
+}
+
+pub fn security_addon_lock_publish(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let (mut bundle, mut registry, mut files_dir, mut user, mut token_file) = (None, None, None, None, None);
+    let mut dry_run = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--registry" => registry = Some(take(g, &mut it, a, PUBLISH_USAGE)),
+            "--files-dir" => files_dir = Some(PathBuf::from(take(g, &mut it, a, PUBLISH_USAGE))),
+            "--user" => user = Some(take(g, &mut it, a, PUBLISH_USAGE)),
+            "--token-file" => token_file = Some(take(g, &mut it, a, PUBLISH_USAGE)),
+            "--dry-run" => dry_run = true,
+            "--help" | "-h" => { println!("{PUBLISH_USAGE}"); return Ok(0); }
+            v if v.starts_with('-') => usage_fail(g, &format!("unknown flag {v}"), PUBLISH_USAGE),
+            v if bundle.is_none() => bundle = Some(PathBuf::from(v)),
+            v => usage_fail(g, &format!("unexpected argument {v}"), PUBLISH_USAGE),
+        }
+    }
+    let (Some(bundle), Some(registry)) = (bundle, registry) else {
+        usage_fail(g, "a bundle path and --registry are required", PUBLISH_USAGE)
+    };
+    let registry = registry.trim().to_string();
+    if !addon_lock::valid_registry_root(&registry) {
+        fail(g.json, ExitCode::Usage, "bad_registry", &format!("Registry root {registry:?} is not a registry path"),
+            Some("give host/path with no scheme, port, tag or trailing slash"));
+    }
+    // What sign wrote: the bundle and its .sig, the v1 pair beside it when
+    // one was signed, and the files the bundle lists.
+    let dir = bundle.parent().map(Path::to_path_buf).unwrap_or_default();
+    let files_dir = files_dir.unwrap_or_else(|| dir.clone());
+    let bundle_bytes = read_or_fail(g, &bundle);
+    let bundle_sig = read_sig_or_fail(g, &PathBuf::from(format!("{}.sig", bundle.display())));
+    let v1_path = dir.join(lock_fetch::LOCK_TITLE);
+    let is_bundle = std::fs::canonicalize(&v1_path).ok() == std::fs::canonicalize(&bundle).ok();
+    let v1 = (v1_path.is_file() && !is_bundle).then(|| {
+        (read_or_fail(g, &v1_path), read_sig_or_fail(g, &PathBuf::from(format!("{}.sig", v1_path.display()))))
+    });
+    let has_v1 = v1.is_some();
+    // The names come from the bundle; plan() holds the bytes to it.
+    let names: Vec<String> = serde_json::from_slice::<AddonLock>(&bundle_bytes)
+        .map(|l| l.files.into_keys().collect())
+        .unwrap_or_default();
+    let mut files = BTreeMap::new();
+    for name in names.into_iter().filter(|n| addon_lock::valid_file_name(n)) {
+        if let Ok(b) = std::fs::read(files_dir.join(&name)) {
+            files.insert(name, b);
+        }
+    }
+    let inputs = lock_publish::Inputs { bundle: bundle_bytes, bundle_sig, v1, files };
+    let plan = match lock_publish::plan(inputs, &registry) {
+        Ok(p) => p,
+        Err(e) => fail(g.json, ExitCode::Generic, "addon_lock_unpublishable", &format!("{}: {e}", bundle.display()),
+            Some(&format!("publish the files sign wrote, unchanged; the bundle's files are read from {} (--files-dir)", files_dir.display()))),
+    };
+    let refs: Vec<String> = plan.tags.iter().map(|t| lock_fetch::artifact_ref(&registry, t)).collect();
+    let blobs: Vec<serde_json::Value> = std::iter::once(&plan.config).chain(plan.layers.iter()).map(|b| b.summary()).collect();
+    if dry_run {
+        if g.json {
+            println!("{}", serde_json::json!({"dry_run": true, "addon": plan.addon, "version": plan.version, "registry": registry,
+                "refs": refs, "manifest_digest": plan.manifest_digest, "blobs": blobs}));
+            return Ok(0);
+        }
+        ui::say(&format!("Would publish {} {} to {} (nothing pushed):", plan.addon, plan.version, registry));
+        for r in &refs {
+            ui::say(&ui::sub(r));
+        }
+        ui::say(&ui::note(&format!("manifest {}", plan.manifest_digest)));
+        for b in std::iter::once(&plan.config).chain(plan.layers.iter()) {
+            ui::say(&format!("  {}  {}  {} bytes  {}", b.title.as_deref().unwrap_or("(config)"), ui::muted(b.media_type), b.bytes.len(), ui::muted(&b.digest)));
+        }
+        if !has_v1 {
+            ui::say(&ui::note(&format!("no {} beside the bundle: only CLIs that read the bundle (0.6.4 and later) can use this release", lock_fetch::LOCK_TITLE)));
+        }
+        return Ok(0);
+    }
+    // The credential: --token-file, else GH_TOKEN / GITHUB_TOKEN. Never printed.
+    let (token, source) = match token_file.as_deref() {
+        Some(p) => (Some(read_token(g, p)), "--token-file"),
+        None => match crate::commands::upgrade::gh_token() {
+            Some(t) => (Some(t), "GH_TOKEN/GITHUB_TOKEN"),
+            None => (None, "anonymous"),
+        },
+    };
+    let cred = token.map(|token| Credential { user: user.unwrap_or_else(|| lock_fetch::DEFAULT_USER.to_string()), token });
+    let pusher = lock_publish::Pusher::new(cred.clone());
+    let bound = cred.map(|c| lock_fetch::Bound { addon: plan.addon.clone(), root: registry.clone(), cred: c });
+    let fetcher = lock_fetch::Client::new(None).with_bound(bound);
+    let out = match lock_publish::publish(&pusher, &fetcher, &registry, &plan) {
+        Ok(o) => o,
+        Err(e) => fail(g.json, ExitCode::Generic, "addon_lock_publish_failed", &e,
+            Some("a push needs a token that can write the package (--token-file, or GH_TOKEN); a read-back failure means the registry does not serve what was pushed, so nothing under that tag is safe to upgrade to")),
+    };
+    let uploaded: usize = out.iter().map(|p| p.uploaded).sum();
+    let published: Vec<String> = out.iter().map(|p| p.reference.clone()).collect();
+    if g.json {
+        println!("{}", serde_json::json!({"published": true, "addon": plan.addon, "version": plan.version, "registry": registry,
+            "refs": published, "verified": true,
+            "manifest_digest": plan.manifest_digest, "blobs": blobs, "uploaded": uploaded, "credential": source}));
+    } else {
+        for p in &out {
+            ui::done(&format!("published {}  {}", p.reference, ui::muted("read back: the signed lock and its files, as pushed")));
+        }
+        ui::say(&ui::note(&format!("{} {}; {uploaded} of {} blobs uploaded (the rest were there); credential: {source}",
+            plan.addon, plan.version, blobs.len())));
+        if !has_v1 {
+            ui::say(&ui::note(&format!("no {} beside the bundle: only CLIs that read the bundle (0.6.4 and later) can use this release", lock_fetch::LOCK_TITLE)));
+        }
     }
     Ok(0)
 }
@@ -323,6 +489,16 @@ mod tests {
             base: None,
             files: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn a_secret_typed_where_its_path_goes_is_never_echoed() {
+        let seed = "cd".repeat(32);
+        assert!(!secret_source(&seed, "--seed-file").contains(&seed));
+        assert!(!secret_source("fake_token_value_0001", "--token-file").contains("fake_token_value_0001"));
+        assert_eq!(secret_source("/run/secrets/seed", "--seed-file"), "/run/secrets/seed");
+        assert_eq!(secret_source("seed.hex", "--seed-file"), "seed.hex");
+        assert_eq!(secret_source("-", "--token-file"), "standard input");
     }
 
     #[test]
