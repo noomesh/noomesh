@@ -150,9 +150,7 @@ impl NodeLink {
             // … no reachable address" while its bus and tunnel were up). Any
             // call that needs HTTPS to the node fails naming that (`url`).
             let link = Self::with_node(String::new(), node_id).advertising(data);
-            if link.has_outbound_transport() {
-                return Ok(link);
-            }
+            let _ = link;
             // Registered, with nowhere to send the call: say so, rather
             // than "not found".
             return Err(AppError::NotFound(no_address_message(node_id)));
