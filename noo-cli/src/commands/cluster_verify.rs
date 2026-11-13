@@ -7454,6 +7454,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             .map(|c| (c.name, c.days_left))
             .collect();
         checks.push(cert_expiry_row(&certs));
+        checks.push(image_retention_row_here(&crate::envfile::repo_root()));
         checks.push(noo_data_bound_row(&crate::envfile::repo_root()));
         checks.push(netns_restore_row_here(&crate::envfile::repo_root()));
         // i67: the controller's own node (when this box runs one) rides the rail.
@@ -8057,6 +8058,68 @@ pub(crate) fn cert_expiry_row(certs: &[(String, i64)]) -> Check {
         return warn(NAME, format!("{} within {CERT_WARN_DAYS} days: {}", soon.len(), named_days(&soon)), Some(ROTATE.into()));
     }
     ok(NAME, format!("{} certificate(s); the soonest, {}, in {} days", certs.len(), sorted[0].0, sorted[0].1))
+}
+
+/// `image retention`: what hostd's rung 5 last judged on this controller, read
+/// from the report it writes beside the keep file
+/// (`<root>/.noo-host-spool/image-retention-report.json`). Read-only: it
+/// never asks for a run. No report means no reclaim run has had a keep file
+/// yet, which is a fresh install's normal state, not a fault.
+pub(crate) fn image_retention_row(report: Option<Result<Value, String>>) -> Check {
+    const NAME: &str = "image retention";
+    let Some(report) = report else {
+        return ok(NAME, "not judged yet: no reclaim run has had a keep file");
+    };
+    let rep = match report {
+        Ok(v) => v,
+        Err(e) => return warn(NAME, format!("the last report cannot be read: {e}"), None),
+    };
+    let images = rep["images"].as_array().cloned().unwrap_or_default();
+    let when = rep["written_at"].as_str().unwrap_or("an unknown time");
+    let dry = rep["dry_run"].as_bool().unwrap_or(true);
+    let marked: Vec<&Value> = images.iter().filter(|i| i["remove"].as_bool() == Some(true)).collect();
+    let refused: Vec<&Value> = marked
+        .iter()
+        .copied()
+        .filter(|i| i["result"].as_str().is_some_and(|r| r.starts_with("refused")))
+        .collect();
+    let bytes = rep["bytes"].as_i64().unwrap_or(0).max(0);
+    let size = if bytes >= 1_000_000_000 {
+        format!("{:.1} GB", bytes as f64 / 1e9)
+    } else {
+        format!("{} MB", bytes / 1_000_000)
+    };
+    if !refused.is_empty() {
+        let first = refused[0]["refs"].get(0).and_then(|r| r.as_str()).or(refused[0]["id"].as_str()).unwrap_or("?");
+        return warn(
+            NAME,
+            format!(
+                "{} superseded image(s) Docker refused to remove at {when} (first: {first}: {})",
+                refused.len(),
+                refused[0]["result"].as_str().unwrap_or("")
+            ),
+            None,
+        );
+    }
+    if marked.is_empty() {
+        return ok(NAME, format!("nothing superseded at {when}; {} image(s) judged", images.len()));
+    }
+    if dry {
+        ok(NAME, format!("{} superseded image(s) of ours, {size} reclaimable; report only, nothing removed ({when})", marked.len()))
+    } else {
+        ok(NAME, format!("removed {} superseded image(s) of ours, {size} freed ({when})", marked.len()))
+    }
+}
+
+/// [`image_retention_row`] for the install at `root`.
+pub(crate) fn image_retention_row_here(root: &std::path::Path) -> Check {
+    let p = root.join(".noo-host-spool").join("image-retention-report.json");
+    let report = match std::fs::read_to_string(&p) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => Some(Err(format!("{}: {e}", p.display()))),
+        Ok(s) => Some(serde_json::from_str::<Value>(&s).map_err(|e| format!("{}: {e}", p.display()))),
+    };
+    image_retention_row(report)
 }
 
 fn checks_json(checks: &[Check]) -> Value {
@@ -13943,13 +14006,13 @@ mod vantage_tests {
 
     /// Every row the controller half writes from THIS machine's files and
     /// containers (the rows an outside run on a node turned red).
-    const CONTROLLER_ONLY_ROWS: [&str; 31] = [
+    const CONTROLLER_ONLY_ROWS: [&str; 32] = [
         "self-agent lane", "model cache", "loki", "tempo", "grafana door", "audit key", "secrets at rest",
         "shared secrets", "secrets audit", "grafana sso", "gateway pki view", "loki listener", "tempo listener",
         "sandbox listener", "backend tls", "nats tls", "nats principals", "postgres hba", "postgres role identity",
         "postgres tls", "sandbox executor", "data directories", "data root filesystem", "monitoring web config",
         "secrets not in env", "node-agent privilege", "callers", "tailnet policy", "last backup", "off-site backup",
-        "pki at rest",
+        "pki at rest", "image retention",
     ];
 
     #[test]
@@ -14342,5 +14405,75 @@ mod docker_refused_row_tests {
         for g in UNPROBED_GUESSES {
             assert!(own.contains(g), "{g} is still a row's text");
         }
+    }
+}
+
+#[cfg(test)]
+mod image_retention_row_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn img(remove: bool, result: Option<&str>) -> Value {
+        let mut v = json!({"id": "sha256:aa", "refs": ["ghcr.io/noomesh/x:old"], "bytes": 1, "remove": remove, "why": "w"});
+        if let Some(r) = result {
+            v["result"] = json!(r);
+        }
+        v
+    }
+
+    #[test]
+    fn no_report_is_a_fresh_install_not_a_fault() {
+        let r = image_retention_row(None);
+        assert_eq!(r.verdict, Verdict::Ok);
+        assert!(r.detail.contains("not judged yet"), "{}", r.detail);
+    }
+
+    #[test]
+    fn an_unreadable_report_warns_with_the_reason() {
+        let r = image_retention_row(Some(Err("p: bad json".into())));
+        assert_eq!(r.verdict, Verdict::Warn);
+        assert!(r.detail.contains("bad json"), "{}", r.detail);
+    }
+
+    #[test]
+    fn a_dry_run_says_what_is_reclaimable_and_that_nothing_was_removed() {
+        let rep = json!({"written_at": "2026-11-13T16:00:00Z", "dry_run": true, "bytes": 52_300_000_000_i64,
+            "images": [img(true, None), img(true, None), img(false, None)]});
+        let r = image_retention_row(Some(Ok(rep)));
+        assert_eq!(r.verdict, Verdict::Ok);
+        assert!(r.detail.contains("2 superseded image(s)") && r.detail.contains("52.3 GB"), "{}", r.detail);
+        assert!(r.detail.contains("nothing removed"), "{}", r.detail);
+    }
+
+    #[test]
+    fn a_live_run_says_what_it_freed() {
+        let rep = json!({"written_at": "t", "dry_run": false, "bytes": 3_000_000_000_i64,
+            "images": [img(true, Some("removed"))]});
+        let r = image_retention_row(Some(Ok(rep)));
+        assert_eq!(r.verdict, Verdict::Ok);
+        assert!(r.detail.starts_with("removed 1 superseded image(s)") && r.detail.contains("3.0 GB freed"), "{}", r.detail);
+    }
+
+    #[test]
+    fn a_refused_removal_warns_and_names_it() {
+        let rep = json!({"written_at": "t", "dry_run": false, "bytes": 1,
+            "images": [img(true, Some("removed")), img(true, Some("refused: image is being used by running container"))]});
+        let r = image_retention_row(Some(Ok(rep)));
+        assert_eq!(r.verdict, Verdict::Warn);
+        assert!(r.detail.contains("ghcr.io/noomesh/x:old") && r.detail.contains("being used"), "{}", r.detail);
+    }
+
+    #[test]
+    fn nothing_superseded_is_ok_and_says_so() {
+        let rep = json!({"written_at": "t", "dry_run": true, "bytes": 0, "images": [img(false, None)]});
+        let r = image_retention_row(Some(Ok(rep)));
+        assert_eq!(r.verdict, Verdict::Ok);
+        assert!(r.detail.starts_with("nothing superseded"), "{}", r.detail);
+    }
+
+    #[test]
+    fn the_controller_run_pushes_the_row() {
+        let src = include_str!("cluster_verify.rs");
+        assert!(src.contains("checks.push(image_retention_row_here(&crate::envfile::repo_root()));"));
     }
 }
