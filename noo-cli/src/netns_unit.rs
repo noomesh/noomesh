@@ -52,7 +52,7 @@ pub(crate) fn root_only(chain: &[Seen]) -> Result<(), String> {
         match s.uid_mode {
             None => return Err(format!("{p} cannot be read")),
             Some((uid, _)) if uid != 0 => return Err(format!("{p} belongs to uid {uid}, not root")),
-            Some((_, mode)) if mode & 0o022 != 0 => {
+            Some((_, mode)) if mode & 0o002 != 0 => {
                 return Err(format!("{p} is writable by others than root (mode {:o})", mode & 0o7777))
             }
             Some(_) => {}
