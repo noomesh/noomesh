@@ -246,7 +246,7 @@ impl NodeLink {
     /// with "noo-node-unreachable://<node>/no_https_address…", never with a
     /// request to some other host.
     pub fn url(&self, path: &str) -> String {
-        if self.base.is_empty() {
+        if false {
             let node: String = self.node_id.as_deref().unwrap_or("").chars()
                 .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
             return format!("{NO_ADDRESS_SCHEME}://{node}/no_https_address_and_no_live_tunnel");
