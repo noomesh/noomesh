@@ -502,13 +502,28 @@ def test_the_first_answer_step_asks_the_prompt_the_doc_gives():
     ("Could you clarify which machine you mean?", True),
     ("I cannot see your computer, so I can't answer that.", True),
     ("I don't have access to your system.", True),
+    ("Hello! How can I help you keep your home server healthy?", True),  # qwen2.5:0.5b, rc.6 branch run
+    ("Hello! I'm Qwen. Do you have any specific questions or topics you'd like to discuss?", True),
+    ("Hi! What would you like to know?", True),
     ("Hello! 1. Keep the OS and packages updated. 2. Watch disk space and back up regularly.", False),
     ("Hi there. Tip one: monitor temperatures. Tip two: test your backups.", False),
+    # gemma's real shape, ending politely: the list makes it an answer
+    ("Hello!\nHere are two tips:\n1. **Backups:** automate them.\n2. **Updates:** apply them.\nHow can I help you further?", False),
 ])
 def test_a_request_for_more_input_or_a_refusal_is_not_an_answer(answer, bad):
-    rx = _run_sh_var("FIRST_ANSWER_NOT_AN_ANSWER")
-    r = subprocess.run(["grep", "-qiE", rx], input=answer, text=True)
+    # The step's own decision, run as written: strong pattern, or a deflection
+    # in an answer that lists nothing.
+    script = (
+        'out="$1"\n'
+        'listed="$(printf "%s\\n" "$out" | grep -cE "^[[:space:]]*([0-9]+[.)]|[-*]|•)[[:space:]]")"\n'
+        'if printf "%s" "$out" | grep -qiE "$NA" || { [ "$listed" = 0 ] && printf "%s" "$out" | grep -qiE "$DF"; }; then exit 0; fi\n'
+        'exit 1\n'
+    )
+    env = {**os.environ, "NA": _run_sh_var("FIRST_ANSWER_NOT_AN_ANSWER"), "DF": _run_sh_var("FIRST_ANSWER_DEFLECTION")}
+    r = subprocess.run(["sh", "-c", script, "t", answer], env=env)
     assert (r.returncode == 0) is bad, (answer, r.returncode)
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    assert '{ [ "$listed" = 0 ] && printf "%s" "$out" | grep -qiE "$FIRST_ANSWER_DEFLECTION"; }' in text
 
 
 def test_the_cluster_question_the_doc_promises_is_probed_never_judged():
@@ -520,3 +535,13 @@ def test_the_cluster_question_the_doc_promises_is_probed_never_judged():
     block = text[i:text.index("  true'\n", i)]
     assert 'noo chat --message "$CLUSTER_PROMPT"' in block and "noo cluster status" in block
     assert "|| fail_onboarded" not in text[i:i + len(block) + 20], "a probe, never the failed step"
+
+
+def test_only_the_default_model_fails_on_a_non_answer_and_a_tiny_cell_notes_it():
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    i = text.index("step first-answer 1800")
+    block = text[i:text.index("' || fail_onboarded", i)]
+    fail = block.index('FIRST-ANSWER FAIL: the model asked for more input')
+    assert 'if [ "$MODEL" = default ]; then' in block[:fail], "the FAIL is gated on the product default model"
+    assert "FIRST-ANSWER NOTE: the tiny test model ($TINY_MODEL)" in block and "not a product verdict" in block
+    assert "export FIRST_PROMPT FIRST_ANSWER_NOT_AN_ANSWER FIRST_ANSWER_DEFLECTION MODEL TINY_MODEL" in text
