@@ -34,7 +34,7 @@ if a[0] == "inspect":
     if c is None: sys.exit(1)
     if fmt == "{{.State.Running}}": print("true" if c["status"] == "running" else "false"); sys.exit(0)
     if fmt == "{{.Name}}": print("/" + c["name"]); sys.exit(0)
-    print("|".join(["/" + c["name"], c.get("mode", "default"), c.get("proj", ""), c.get("mby", ""), c.get("policy", "unless-stopped"), c.get("err", "")])); sys.exit(0)
+    print("|".join(["/" + c["name"], c.get("mode", "default"), c.get("proj", ""), c.get("mby", ""), c.get("policy", "unless-stopped"), c.get("err", ""), str(c.get("exit", 0))])); sys.exit(0)
 if a[0] == "start":
     c = db["c"][a[1]]
     if c.get("start_fails"): sys.exit(1)
@@ -60,7 +60,7 @@ def door(status="running"):
 
 
 def joiner(**kw):
-    c = {"name": "noo-ollama-embed", "status": "exited", "proj": "noomesh", "mode": "container:D", "err": NS_ERR}
+    c = {"name": "noo-ollama-embed", "status": "exited", "proj": "noomesh", "mode": "container:D", "err": NS_ERR, "exit": 128}
     c.update(kw)
     return c
 
@@ -87,10 +87,28 @@ def test_docker_27s_wording_of_the_failed_join_is_restarted_too(tmp_path):
     assert "started noo-ollama-embed" in r.stdout
 
 
+def test_exit_128_alone_is_enough_whatever_the_daemon_writes(tmp_path):
+    # A future docker rewording must not reopen the Docker 27 hole: dockerd's
+    # exit code 128 for a container it could not start is the firm signal.
+    r, db, log = run(tmp_path, {"D": door(), "J": joiner(err="some future wording", exit=128)})
+    assert r.returncode == 0, r.stderr
+    assert db["c"]["J"]["status"] == "running"
+
+
+def test_the_join_error_text_alone_is_enough_too(tmp_path):
+    # The fallback: a daemon that records the join failure with some other
+    # exit code still has the joiner restarted on its error text.
+    for i, err in enumerate((NS_ERR, NS_ERR_DOCKER27)):
+        d = tmp_path / str(i); d.mkdir()
+        r, db, _ = run(d, {"D": door(), "J": joiner(err=err, exit=1)})
+        assert db["c"]["J"]["status"] == "running", (err, r.stdout, r.stderr)
+
+
 def test_nothing_else_is_started_and_nothing_to_do_is_silent(tmp_path):
     cs = {
         "D": door(),
-        "HAND": joiner(name="noo-stopped-by-hand", err=""),              # stopped by hand: no join error
+        "HAND": joiner(name="noo-stopped-by-hand", err="", exit=143),    # stopped by hand: SIGTERM, no join error
+        "HAND0": joiner(name="noo-exited-cleanly", err="", exit=0),     # exited on its own, cleanly
         "MBY": joiner(name="noo-agent-owned", mby="noo-node-agent"),    # the agent's convergence owns it
         "NOPOL": joiner(name="noo-oneshot", policy="no"),               # a one-shot
         "OTHER": joiner(name="someone-elses", proj=""),                 # not a compose stack container
