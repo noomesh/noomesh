@@ -18,8 +18,13 @@
 # What it starts, and nothing else: a container of a compose project, not
 # labelled noo.managed-by (the node agent's convergence owns those), whose
 # restart policy wants it running (always/unless-stopped), whose network mode
-# is container:<door>, and whose last start FAILED joining that namespace
-# (State.Error names the network namespace). A container someone stopped by
+# is container:<door>, and whose last start FAILED joining that namespace:
+# State.Error says "join network", in either docker's wording:
+#   Docker 27.x  "cannot join network of a non running container: <id>"
+#   Docker 28.x  "cannot join network namespace of a non running container: …"
+# (matching only "network namespace" skipped every joiner on Docker 27, the
+# rc.3 rehearsal's dind and Ubuntu's docker.io: A-reboot.status, i677).
+# A container someone stopped by
 # hand has no such error and stays stopped. It waits for each door (bounded),
 # starts the joiner, and says so: one line per container it started (the
 # journal, under systemd). Nothing to do: no output, exit 0.
@@ -49,7 +54,7 @@ for id in $(docker ps -aq --filter status=exited --filter status=created); do
   [ -z "$mby" ] || continue
   case "$policy" in always|unless-stopped) ;; *) continue ;; esac
   case "$mode" in container:*) door="${mode#container:}" ;; *) continue ;; esac
-  case "$err" in *"network namespace"*) ;; *) continue ;; esac
+  case "$err" in *"join network"*) ;; *) continue ;; esac
   dname="$(docker inspect -f '{{.Name}}' "$door" 2>/dev/null)"; dname="${dname#/}"; dname="${dname:-$door}"
   w=0
   until [ "$(docker inspect -f '{{.State.Running}}' "$door" 2>/dev/null)" = "true" ]; do

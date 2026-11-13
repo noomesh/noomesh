@@ -73,6 +73,20 @@ def test_a_joiner_that_failed_its_namespace_join_is_started_after_its_door(tmp_p
     assert r.stdout.strip() == "noo-netns-restore: started noo-ollama-embed (it joins noo-stunnel-ollama-embed's network, which dockerd had not started first)"
 
 
+# Docker 27.x's wording (moby v27.5.1 daemon: "cannot join network of a non
+# running container: %s"), the rc.3 rehearsal's dind (Docker 27.5.1): a filter
+# on "network namespace" alone skipped it, and the joiner stayed exited 128.
+NS_ERR_DOCKER27 = "cannot join network of a non running container: 4f1c2a9e0b7d"
+
+
+def test_docker_27s_wording_of_the_failed_join_is_restarted_too(tmp_path):
+    r, db, log = run(tmp_path, {"D": door(), "J": joiner(err=NS_ERR_DOCKER27)})
+    assert r.returncode == 0, r.stderr
+    assert db["c"]["J"]["status"] == "running"
+    assert "start J" in log
+    assert "started noo-ollama-embed" in r.stdout
+
+
 def test_nothing_else_is_started_and_nothing_to_do_is_silent(tmp_path):
     cs = {
         "D": door(),
