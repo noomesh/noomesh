@@ -243,6 +243,9 @@ pub struct FileFacts {
 pub trait Os {
     fn euid(&self) -> u32;
     fn facts(&self, path: &Path) -> Result<FileFacts, String>;
+    /// A directory's facts (the install root); `Err` when it cannot be
+    /// reached from this account (a closed directory above it) or is not one.
+    fn dir_facts(&self, path: &Path) -> Result<FileFacts, String>;
     fn read(&self, path: &Path) -> Result<String, String>;
 }
 
@@ -337,9 +340,50 @@ fn root_owned_tight(os: &dyn Os, path: &Path, check: &str, what: &str) -> Result
     Ok(())
 }
 
-/// The four refusals, in order: (d) not root, the owner record is sound,
+/// Check (e), and onboard's test before it records an owner: the install the
+/// unit starts belongs to the account that runs it. An install root another
+/// account owns (rc.6: root's /root/.noo run by another account through ACLs)
+/// does not fail once; every later step meets one more file it cannot
+/// change, one refusal per release. So it is refused here, once, with the
+/// whole picture and the one remedy. `None` when the owner owns the root.
+/// The remedy moves only `owner:owner`-style files (root's own, or the other
+/// account's), never root's files in a service's group (the libpq key rule).
+pub fn install_owner_problem(os: &dyn Os, root: &Path, uid: u32, name: &str) -> Option<String> {
+    let r = root.display();
+    let f = match os.dir_facts(root) {
+        Ok(f) => f,
+        Err(e) => {
+            return Some(format!(
+                "the install {r} cannot be reached as {name} ({e}): it sits where {name} cannot go, e.g. inside \
+                 another account's home. An install belongs to the account that runs it: onboard as {name} \
+                 in a directory {name} owns"
+            ))
+        }
+    };
+    if f.uid == uid {
+        return None;
+    }
+    let who = if f.uid == 0 { "root".to_string() } else { format!("uid {}", f.uid) };
+    let fix = if f.uid == 0 {
+        format!("sudo find {r} -xdev -user root -group root -exec chown {name}:{name} {{}} +")
+    } else {
+        format!("sudo find {r} -xdev -user {} -exec chown {name} {{}} +", f.uid)
+    };
+    Some(format!(
+        "the install {r} belongs to {who}, not to {name} (uid {uid}), the account recorded to run it. An install \
+         belongs to the account that runs it; run as {name}, every later step would refuse on another file it \
+         cannot change. Onboard as {name} in a directory {name} owns, or give {name} the install: {fix}"
+    ))
+}
+
+/// The unit's `WorkingDirectory=`: the install root it starts.
+fn unit_root(unit: &str) -> Option<PathBuf> {
+    unit.lines().find_map(|l| l.trim().strip_prefix("WorkingDirectory=")).map(|v| PathBuf::from(v.trim())).filter(|p| p.is_absolute())
+}
+
+/// The refusals, in order: (d) not root, the owner record is sound,
 /// (a) this is the recorded owner, (b) the unit is root's and tight, (c) the
-/// unit runs as that owner. `Ok` is the recorded `(uid, name)`.
+/// unit runs as that owner, (e) that owner owns the install the unit starts. `Ok` is the recorded `(uid, name)`.
 pub fn refusals(os: &dyn Os, paths: &Paths) -> Result<(u32, String), String> {
     if os.euid() == 0 {
         return Err("refusing to run: check (d) failed: running as root (euid 0); this runs as the install owner, never root".into());
@@ -362,6 +406,11 @@ pub fn refusals(os: &dyn Os, paths: &Paths) -> Result<(u32, String), String> {
             paths.unit.display(),
             if users.is_empty() { "missing".to_string() } else { users.join(", ") }
         ));
+    }
+    if let Some(root) = unit_root(&unit) {
+        if let Some(p) = install_owner_problem(os, &root, uid, &name) {
+            return Err(format!("refusing to run: check (e) failed: {p}"));
+        }
     }
     Ok((uid, name))
 }
@@ -486,7 +535,7 @@ fn attempt(r: &mut dyn Run, addon: &str, down: &[String]) -> Outcome {
 
 // ── Production wiring ─────────────────────────────────────────────
 
-struct LiveOs;
+pub(crate) struct LiveOs;
 
 impl Os for LiveOs {
     fn euid(&self) -> u32 {
@@ -499,6 +548,15 @@ impl Os for LiveOs {
         let m = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
         if !m.file_type().is_file() {
             return Err("not a regular file".into());
+        }
+        Ok(FileFacts { uid: m.uid(), gid: m.gid(), mode: m.mode() & 0o7777 })
+    }
+
+    fn dir_facts(&self, path: &Path) -> Result<FileFacts, String> {
+        use std::os::unix::fs::MetadataExt as _;
+        let m = std::fs::metadata(path).map_err(|e| e.to_string())?;
+        if !m.is_dir() {
+            return Err("not a directory".into());
         }
         Ok(FileFacts { uid: m.uid(), gid: m.gid(), mode: m.mode() & 0o7777 })
     }
@@ -691,6 +749,7 @@ mod tests {
     struct FakeOs {
         euid: u32,
         files: BTreeMap<PathBuf, (FileFacts, String)>,
+        dirs: BTreeMap<PathBuf, FileFacts>,
     }
 
     fn tight(uid: u32) -> FileFacts {
@@ -703,6 +762,9 @@ mod tests {
         }
         fn facts(&self, p: &Path) -> Result<FileFacts, String> {
             self.files.get(p).map(|f| f.0).ok_or_else(|| "no such file".to_string())
+        }
+        fn dir_facts(&self, p: &Path) -> Result<FileFacts, String> {
+            self.dirs.get(p).copied().ok_or_else(|| "Permission denied (os error 13)".to_string())
         }
         fn read(&self, p: &Path) -> Result<String, String> {
             self.files.get(p).map(|f| f.1.clone()).ok_or_else(|| "no such file".to_string())
@@ -723,7 +785,9 @@ mod tests {
         let mut files = BTreeMap::new();
         files.insert(p.owner_file, (tight(0), format!("{OWNER_UID} rhowner\n")));
         files.insert(p.unit, (tight(0), render_unit("rhowner", "/usr/local/bin/noo", "/srv/noomesh").unwrap()));
-        FakeOs { euid: OWNER_UID, files }
+        let mut dirs = BTreeMap::new();
+        dirs.insert(PathBuf::from("/srv/noomesh"), FileFacts { uid: OWNER_UID, gid: OWNER_UID, mode: 0o755 });
+        FakeOs { euid: OWNER_UID, files, dirs }
     }
 
     #[derive(Default)]
@@ -860,6 +924,35 @@ mod tests {
     #[test]
     fn the_good_install_passes_every_refusal_check() {
         assert_eq!(refusals(&good_os(), &paths()), Ok((OWNER_UID, "rhowner".to_string())));
+    }
+
+    /// rc.6 A-afterboot: an install root another account owns is refused
+    /// once, up front, with the whole picture, never step by step.
+    #[test]
+    fn an_install_the_owner_does_not_own_is_refused_by_check_e_once_with_the_remedy() {
+        let mut os = good_os();
+        os.dirs.insert(PathBuf::from("/srv/noomesh"), FileFacts { uid: 0, gid: 0, mode: 0o755 });
+        let e = refusals(&os, &paths()).unwrap_err();
+        assert!(e.starts_with("refusing to run: check (e) failed: the install /srv/noomesh belongs to root, not to rhowner"), "{e}");
+        assert!(e.contains("sudo find /srv/noomesh -xdev -user root -group root -exec chown rhowner:rhowner {} +"), "{e}");
+        assert_refused_and_idle(&os, "check (e)");
+    }
+
+    #[test]
+    fn an_install_root_the_owner_cannot_reach_is_refused_by_check_e() {
+        let mut os = good_os();
+        os.dirs.clear();
+        let e = refusals(&os, &paths()).unwrap_err();
+        assert!(e.contains("check (e) failed: the install /srv/noomesh cannot be reached as rhowner"), "{e}");
+        assert!(e.contains("inside another account's home"), "{e}");
+    }
+
+    #[test]
+    fn an_install_another_user_owns_names_that_uid_in_the_remedy() {
+        let mut os = good_os();
+        os.dirs.insert(PathBuf::from("/srv/noomesh"), FileFacts { uid: 1001, gid: 1001, mode: 0o755 });
+        let e = refusals(&os, &paths()).unwrap_err();
+        assert!(e.contains("belongs to uid 1001") && e.contains("sudo find /srv/noomesh -xdev -user 1001 -exec chown rhowner {} +"), "{e}");
     }
 
     #[test]
