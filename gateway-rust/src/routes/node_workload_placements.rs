@@ -506,13 +506,9 @@ mod tests {
     #[test]
     fn an_entry_without_a_profile_leaves_the_key_out_and_validates() {
         let (d, raw) = decl();
-        let img = crate::node_workload_sources::RailImage {
-            image: "addon-worker".into(),
-            digest: format!("sha256:{DIGEST_HEX}"),
-            id: format!("sha256:{DIGEST_HEX}"),
-            artifact: "addon-worker.tar".into(),
-            arch: "amd64".into(),
-        };
+        // The rail image exactly as the test Sources names it (the artifact
+        // name is validated against the addon, image and digest).
+        let img = fake().rail_image("rhaddon", &d.image, "amd64").unwrap();
         let f = fixture_entry();
         let e = build_entry("rhaddon", &d, &raw, "node-a", &img, &f["sets"], &f["env"], None, None, "running");
         assert!(e.get("profile").is_none(), "{e}");
