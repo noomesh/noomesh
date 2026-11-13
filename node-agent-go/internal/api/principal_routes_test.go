@@ -52,7 +52,7 @@ func identifyingMux(t *testing.T) http.Handler {
 		NodeAgentToken: "test-token",
 		TLSCA:          "ca.pem",
 	}
-	gpu := hardware.NewGPUDetector(nil, "http")
+	gpu := hardware.NewGPUDetector()
 	return NewServer(cfg, nil, gpu, metrics.NewCollector(gpu)).mux
 }
 
@@ -179,7 +179,7 @@ func TestWorkRoutesReachableByTheController(t *testing.T) {
 // the gate decorative on exactly the nodes that needed it.
 func TestUnidentifiedAgentRefusesControllerRoutes(t *testing.T) {
 	cfg := &config.Config{NodeID: "test-node", NodeAgentToken: "test-token"} // no TLSCA
-	gpu := hardware.NewGPUDetector(nil, "http")
+	gpu := hardware.NewGPUDetector()
 	h := NewServer(cfg, nil, gpu, metrics.NewCollector(gpu)).mux
 
 	for _, c := range append([]struct{ method, path string }{

@@ -10,12 +10,10 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
-	"net/http"
 	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 )
 
 // GPUMetrics holds real-time GPU telemetry.
@@ -28,12 +26,16 @@ type GPUMetrics struct {
 	PowerDrawW           *float64 `json:"power_draw_w,omitempty"`
 }
 
-// GPUDetector detects GPU hardware and collects metrics.
+// GPUDetector detects GPU hardware and collects metrics, from nvidia-smi
+// only. It never looks a name up: there used to be a second strategy, GET
+// https://nvidia-exporter:9400/metrics, written for a containerised agent on
+// the compose network. The agent is a host unit, where that compose name has
+// no container to answer for it (containerdial falls back to the ordinary
+// dialer), so on every GPU-less host the agent asked the host's resolver for
+// `nvidia-exporter.<search domain>` once per start and could never get an
+// answer; on a GPU host nvidia-smi answers first. See
+// gpu_no_name_lookup_test.go.
 type GPUDetector struct {
-	// httpClient is used for nvidia-exporter fallback
-	httpClient *http.Client
-	scheme     string // "http" or "https"
-
 	// Cached availability flag: nil=unknown, true/false=determined
 	available *bool
 
@@ -46,13 +48,9 @@ type GPUDetector struct {
 	probeTimedOut bool
 }
 
-// NewGPUDetector creates a GPU detector with the given HTTP client for
-// nvidia-exporter sidecar fallback.
-func NewGPUDetector(client *http.Client, scheme string) *GPUDetector {
-	return &GPUDetector{
-		httpClient: client,
-		scheme:     scheme,
-	}
+// NewGPUDetector creates a GPU detector.
+func NewGPUDetector() *GPUDetector {
+	return &GPUDetector{}
 }
 
 // smiQuery runs one nvidia-smi query. The three answers are kept apart:
@@ -211,10 +209,8 @@ func (g *GPUDetector) ComputeApps() []GPUComputeApp {
 	return apps
 }
 
-// Metrics collects real-time GPU metrics.
-// Strategy 1: nvidia-smi (direct GPU access).
-// Strategy 2: nvidia-exporter sidecar on the Docker network.
-// Returns nil if no GPU metrics source is available.
+// Metrics collects real-time GPU metrics from nvidia-smi.
+// Returns nil if nvidia-smi gave none.
 func (g *GPUDetector) Metrics() *GPUMetrics {
 	g.probeTimedOut = false
 	// Skip if we already know metrics are unavailable
@@ -222,21 +218,13 @@ func (g *GPUDetector) Metrics() *GPUMetrics {
 		return nil
 	}
 
-	// Strategy 1: nvidia-smi
 	if m := g.metricsFromSMI(); m != nil {
 		t := true
 		g.available = &t
 		return m
 	}
 
-	// Strategy 2: nvidia-exporter sidecar
-	if m := g.metricsFromExporter(); m != nil {
-		t := true
-		g.available = &t
-		return m
-	}
-
-	// Neither available. A deadline miss must not decide "no GPU" — a
+	// No metrics. A deadline miss must not decide "no GPU" — a
 	// first probe against a saturated card would otherwise cache
 	// available=false for the life of the process (sticky), turning one
 	// busy moment into an hourly gpu_health page until the agent
@@ -303,74 +291,4 @@ func smiFloat(field, raw string) *float64 {
 		return nil
 	}
 	return &v
-}
-
-func (g *GPUDetector) metricsFromExporter() *GPUMetrics {
-	if g.httpClient == nil {
-		return nil
-	}
-
-	url := fmt.Sprintf("%s://nvidia-exporter:9400/metrics", g.scheme)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil
-	}
-
-	resp, err := g.httpClient.Do(req)
-	if err != nil || resp.StatusCode != 200 {
-		return nil
-	}
-	defer resp.Body.Close()
-
-	// Parse Prometheus text format (simplified)
-	buf := make([]byte, 64*1024)
-	n, _ := resp.Body.Read(buf)
-	body := string(buf[:n])
-
-	m := &GPUMetrics{}
-	found := false
-
-	for _, line := range strings.Split(body, "\n") {
-		if strings.HasPrefix(line, "#") || !strings.Contains(line, "nvidia_gpu_") {
-			continue
-		}
-		parts := strings.Fields(line)
-		if len(parts) < 2 {
-			continue
-		}
-		metricName := strings.Split(parts[0], "{")[0]
-		val, err := strconv.ParseFloat(parts[len(parts)-1], 64)
-		if err != nil {
-			continue
-		}
-
-		found = true
-		switch {
-		case strings.Contains(metricName, "temperature_celsius"):
-			t := val
-			m.TemperatureC = &t
-		case strings.Contains(metricName, "power_draw_watts"):
-			m.PowerDrawW = &val
-		case strings.Contains(metricName, "memory_used_bytes"):
-			u := val / (1024 * 1024)
-			m.MemoryUsedMB = &u
-		case strings.Contains(metricName, "memory_total_bytes"):
-			u := val / (1024 * 1024)
-			m.MemoryTotalMB = &u
-		case strings.Contains(metricName, "utilization_gpu_ratio"):
-			u := val * 100
-			m.GPUUtilizationPct = &u
-		case strings.Contains(metricName, "utilization_memory_ratio"):
-			u := val * 100
-			m.MemoryUtilizationPct = &u
-		}
-	}
-
-	if !found {
-		return nil
-	}
-	return m
 }

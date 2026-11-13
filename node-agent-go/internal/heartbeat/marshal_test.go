@@ -83,7 +83,7 @@ func TestSendHeartbeat_ZeroTotalMemoryStillDelivers(t *testing.T) {
 	defer srv.Close()
 
 	cfg := &config.Config{NodeID: "test-node", ControllerURL: srv.URL, Tier: 3}
-	gpu := hardware.NewGPUDetector(nil, "http")
+	gpu := hardware.NewGPUDetector()
 	coll := metrics.NewCollectorWithSources(gpu,
 		func() (float64, bool) { return 0.3, true },
 		func() hardware.MemoryInfo { return hardware.MemoryInfo{} })
@@ -122,7 +122,7 @@ func TestSendHeartbeat_UnknownCPUOmitsLoadKeys(t *testing.T) {
 	defer srv.Close()
 
 	cfg := &config.Config{NodeID: "test-node", ControllerURL: srv.URL, Tier: 3}
-	gpu := hardware.NewGPUDetector(nil, "http")
+	gpu := hardware.NewGPUDetector()
 	coll := metrics.NewCollectorWithSources(gpu,
 		func() (float64, bool) { return 0, false },
 		func() hardware.MemoryInfo {
