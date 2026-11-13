@@ -814,11 +814,14 @@ repeated failure in this codebase's history.
 
 ## Step 3a — connect to your runtime
 
-**Proof status:** this section describes the 0.6.24 code. The first end-to-end
-run of it is the release rehearsal's `A-addonfrontdoor` item (file read, token
-exchange, own and other routes), first run on 0.6.24-rc.3. Until a full
-build → sign → enable → connect → upgrade pass lands, treat the commands below
-as checked against the code, not yet copied from a run.
+**Proof status:** steps 1–3 below (read the key from its file, exchange it,
+call with the token) were run in the release rehearsal on 0.6.24-rc.3, by its
+`A-addonfrontdoor` item with the rehearsal's own fixture add-on: the key read
+from its file, the exchange answered `200` for that add-on's consumer, the
+token was accepted on the add-on's own workload route (`200`) and refused on another
+add-on's (`403`). The rest of this section (refresh, revoke, the client below)
+is checked against the code, not copied from a run. The full build → sign →
+enable → connect → upgrade pass has not run yet.
 
 Your add-on calls the gateway with **its own key**, never a shared secret, and
 never a key taken from its environment.

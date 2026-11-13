@@ -26,10 +26,13 @@ Everything it needs is in this folder; nothing here names a path outside it.
 
 **Proof status.** Only steps 1 and 2 have been run as written here, on a
 0.6.23 CLI, for this folder. Steps 3–7 use the commands the release rehearsal
-runs for its own fixture add-on. The end-to-end pass that takes **this** folder
-from build to an upgrade with it enabled is the definition of done. Until it
-lands, read steps 3–7 as checked against the code, not copied from a run of
-this example.
+runs for its own fixture add-on. The token exchange that step 6 relies on (key
+file → `POST /api/addon/token` → token accepted on the add-on's own route,
+refused on another's) was run in the release rehearsal on 0.6.24-rc.3, with
+that fixture add-on, not this folder. The end-to-end pass that takes **this**
+folder from build to an upgrade with it enabled is the definition of done.
+Until it lands, read steps 3–7 as checked against the code, not copied from a
+run of this example.
 
 1. **Test the contract** (no stack needed):
 
