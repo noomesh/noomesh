@@ -9,8 +9,8 @@ python3 and nothing else.
 
 usage: ws_chat.py PROMPT [GATEWAY_URL]   (default https://localhost:8080)
 
-TLS is not verified: the cell asks its own gateway on localhost, and this is a
-probe that reads an answer, not a trust check.
+TLS is verified against the cluster CA in $NOO_PKI_DIR (default
+~/.config/mesh/pki/ca.crt), as the add-on README's curl does.
 """
 
 from __future__ import annotations
@@ -73,9 +73,11 @@ def read_frame(s) -> tuple[int, bytes]:
 
 
 def ask(prompt: str, base: str = "https://localhost:8080", timeout: float = 300) -> str:
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    # The cluster's own CA, where `noo onboard` puts it (the example add-on's
+    # README uses the same file with curl).
+    pki = os.environ.get("NOO_PKI_DIR") or os.path.join(
+        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "mesh", "pki")
+    ctx = ssl.create_default_context(cafile=os.path.join(pki, "ca.crt"))
     ticket = mint_ticket(base, token(), ctx)
     u = urllib.parse.urlsplit(base)
     raw = socket.create_connection((u.hostname, u.port or 443), timeout=30)
