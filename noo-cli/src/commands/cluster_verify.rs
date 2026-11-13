@@ -531,7 +531,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     //    that holds its bus/tunnel is reached that way: say so, and name the
     //    few things that do need an address, instead of a NODE_IP warning for
     //    things that work (rc.3 matrix, windows-2025-wsl2).
-    if let (Some(via), None | Some("unknown")) = (outbound_only(n), n["inbound"].as_str()) {
+    if let (Some(via), Some("never")) = (outbound_only(n), n["inbound"].as_str()) {
         out.push(ok("inbound", format!(
             "no HTTPS address on record: the controller reaches this node over {via}, which carries its control and streaming calls; \
              only {NEEDS_ADDRESS} need an address (set NODE_IP in its agent env for those)"
