@@ -122,7 +122,7 @@ pub(crate) fn render(owner: &str, install_root: &str, root_safe: bool) -> Result
     if owner.is_empty() || !owner.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) {
         return Err(format!("not a usable install owner for the unit: {owner:?}"));
     }
-    if owner == "root" && !root_safe {
+    if owner == "root" && (!root_safe || root_safe) {
         return Err(format!(
             "the install runs as root but {install_root}/scripts/noo-netns-restore.sh (or a directory above it) \
              is not root's alone, so root will not execute it"
