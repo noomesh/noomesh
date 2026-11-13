@@ -1,0 +1,45 @@
+# example-addon: the reference add-on of docs/development/addons.md.
+# Self-contained: nothing here names a path outside this folder.
+#
+# x-noo-addon names the add-on's outbound key (minted by `noo addons enable`)
+# and the scopes it is granted. The key is DELIVERED AS A FILE through the
+# `addon_key` resource in resources.json, never through the environment: an
+# environment entry with no value (`- NAME`, `NAME:`) is refused for a
+# third-party add-on.
+x-noo-addon:
+  addon: example-addon
+  consumer: svc:example-addon
+  key: NOO_SVC_KEY_EXAMPLE_ADDON
+  containers: [noo-example-addon]
+  scopes: [metrics]
+  why: >-
+    reads the gateway's metrics scope to prove it can call back in.
+
+services:
+  noo-example-addon:
+    image: ${NOO_ADDON_IMAGE_EXAMPLE_ADDON:-noo-addon-unpinned.invalid/example-addon:x}
+    container_name: noo-example-addon
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      # Explicit values only: interpolated from what resources.json delivers.
+      EXAMPLE_ADDON_GATEWAY_URL: ${EXAMPLE_ADDON_GATEWAY_URL:-}
+    volumes:
+      # Long form, host-path creation off: the source is a tmpfs generation
+      # directory the launcher writes and a reboot empties.
+      - type: bind
+        source: ${EXAMPLE_ADDON_WORK_DIR:-/nonexistent/example-addon-work-unset}
+        target: /run/example-addon
+        read_only: true
+        bind:
+          create_host_path: false
+    networks: [example-addon-gateway, example-addon-db]
+
+networks:
+  example-addon-gateway:
+    external: true
+    name: ${EXAMPLE_ADDON_GATEWAY_NETWORK:-noo-addon-network-unset}
+  example-addon-db:
+    external: true
+    name: ${EXAMPLE_ADDON_DB_NETWORK:-noo-addon-network-unset}
