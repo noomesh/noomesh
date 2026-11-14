@@ -429,19 +429,6 @@ where
     sqlx::query_scalar("SELECT perspective FROM noo_tasks WHERE id = $1").bind(id).fetch_optional(db).await
 }
 
-#[cfg(test)]
-mod tests {
-    /// Asking must not park the task mid-turn: only the boundary sets
-    /// `budget_state` (moved here from `task_budget`'s own source scan when
-    /// the statement moved).
-    #[test]
-    fn asking_never_sets_budget_state() {
-        let src = include_str!("tasks.rs");
-        let body = &src[src.find("pub async fn set_question<").unwrap()..src.find("pub async fn set_answer<").unwrap()];
-        assert!(!body.contains("budget_state = $"), "set_question must not park the task");
-    }
-}
-
 /// i779: the live tasks an account owns — `(id, node, state)`, children
 /// included and with no page limit (a disabled account's stop must reach
 /// every one).
@@ -470,4 +457,17 @@ where
         .execute(db)
         .await?
         .rows_affected())
+}
+
+#[cfg(test)]
+mod tests {
+    /// Asking must not park the task mid-turn: only the boundary sets
+    /// `budget_state` (moved here from `task_budget`'s own source scan when
+    /// the statement moved).
+    #[test]
+    fn asking_never_sets_budget_state() {
+        let src = include_str!("tasks.rs");
+        let body = &src[src.find("pub async fn set_question<").unwrap()..src.find("pub async fn set_answer<").unwrap()];
+        assert!(!body.contains("budget_state = $"), "set_question must not park the task");
+    }
 }
