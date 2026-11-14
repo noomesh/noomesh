@@ -326,3 +326,115 @@ func TestHeartbeatPayloadSize(t *testing.T) {
 		})
 	}
 }
+
+// largestPlausibleShape is a GPU node far busier than any in the fleet: 8
+// backends, 40 models (each placed, present, with stats, on disk), 12 door
+// images, a 40-package hostd hold list with four boot entries, and every
+// optional section populated.
+func largestPlausibleShape() sizeShape {
+	s := gpuNodeShape()
+	s.name = "largest plausible: 8 backends, 40 models"
+	backends := []string{"vllm", "llamacpp", "ollama", "tei", "reranker", "airllm", "comfyui", "whisper"}
+	s.caps.Backends = backends
+	s.running = map[string]string{}
+	s.placed = nil
+	s.presence = map[string]modelpresence.Entry{}
+	s.stats = nil
+	s.adopted = nil
+	s.containers = map[string]any{}
+	roles := []string{"chat", "embed", "rerank", "chat", "chat"}
+	for i := 0; i < 40; i++ {
+		b := backends[i%len(backends)]
+		model := fmt.Sprintf("example-org/a-fairly-long-model-name-%02d-instruct-q4_k_m", i)
+		role := roles[i%len(roles)]
+		s.placed = append(s.placed, lanes.Placed{Backend: b, Model: model, Role: role})
+		s.presence[fmt.Sprintf("%s#%02d", b, i)] = modelpresence.Entry{Model: model, Role: role, Present: true}
+		s.stats = append(s.stats, ModelStat{Name: model, SizeBytes: 8400000000 + int64(i), ResidentBytes: 9100000000,
+			VRAMBytes: 9100000000, Loaded: i%3 == 0, ContextLength: 131072})
+		s.adopted = append(s.adopted, model)
+		if _, ok := s.running[b]; !ok {
+			s.running[b] = model
+		}
+	}
+	for i, b := range backends {
+		s.containers[b] = map[string]any{"container": "noo-" + b, "image": "ghcr.io/noomesh/" + b + ":v0.6.23",
+			"image_floating": false, "in_flight": 3, "queued": 2, "running": true, "health": "healthy", "slots": 8,
+			"started_at": 1794367749 + i, "telemetry_missing": []string{"queue_depth"}}
+	}
+	s.images = nil
+	for i := 0; i < 12; i++ {
+		s.images = append(s.images, [3]string{fmt.Sprintf("ghcr.io/noomesh/image-%02d:v0.6.23", i), "rail",
+			"sha256:499c5e50d2a74bcf3249e94acbb66f29a740f854c1a0178e829b614c50b42cfd"})
+	}
+	held := make([]string, 0, 40)
+	for i := 0; i < 40; i++ {
+		held = append(held, fmt.Sprintf("held-package-with-a-long-name-%02d", i))
+	}
+	entries := make([]string, 0, 4)
+	for i := 0; i < 4; i++ {
+		entries = append(entries, fmt.Sprintf(`{"esp_initrd_bytes":143537297,"intact":true,"kernel":"7.1.%d-76070105-generic","name":"entry-%d.conf"}`, i, i))
+	}
+	s.hostdJSON = hostdFixture(held, `"default_entry":"entry-0.conf","default_entry_source":"efi-var","entries":[`+
+		strings.Join(entries, ",")+`],"free_bytes":4331028480,"mount":"/boot/efi","total_bytes":4822401024,"used_bytes":491372544,`)
+	approvals := []any{}
+	workloads := []any{}
+	for i := 0; i < 6; i++ {
+		approvals = append(approvals, map[string]any{"addon": fmt.Sprintf("example-addon-%d", i), "workload": "worker",
+			"approved_at": "2026-11-01T10:00:00Z", "approved_by": "operator"})
+		workloads = append(workloads, map[string]any{"addon": fmt.Sprintf("example-addon-%d", i), "workload": "worker",
+			"state": "running", "reason": ""})
+	}
+	s.facts["addon_workloads_approvals"] = approvals
+	s.facts["node_workloads"] = workloads
+	sets := []any{}
+	for i := 0; i < 10; i++ {
+		sets = append(sets, map[string]any{"id": fmt.Sprintf("model-set-%02d", i), "revision": "r12", "state": "held"})
+	}
+	s.modelSets = sets
+	return s
+}
+
+// The gateway caps a heartbeat's JSON at 256 KiB (MAX_HEARTBEAT_BODY,
+// gateway-rust routes/cluster.rs), plain or decoded from gzip. The largest
+// plausible beat measures 37100 B (36.2 KiB): a 7.1x margin under the cap.
+// It must stay under a quarter of it (a 4x margin), so the cap never refuses
+// a real node; the margin is logged.
+func TestLargestPlausibleBeatIsFarUnderTheCap(t *testing.T) {
+	const gatewayCap = 256 * 1024
+	var wire []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		wire, _ = io.ReadAll(req.Body)
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	shape := largestPlausibleShape()
+	r := installShape(t, srv.URL, shape)
+	r.SendHeartbeat()
+	if len(wire) == 0 {
+		t.Fatal("no beat was sent")
+	}
+	var probe struct {
+		Lanes      []any          `json:"lanes"`
+		ModelStats []any          `json:"model_stats"`
+		Available  []any          `json:"available_models"`
+		Containers map[string]any `json:"backend_containers"`
+	}
+	if err := json.Unmarshal(wire, &probe); err != nil {
+		t.Fatal(err)
+	}
+	// The shape must really be that large, or the margin proves nothing.
+	if len(probe.Lanes) < 40 || len(probe.ModelStats) < 40 || len(probe.Available) < 40 || len(probe.Containers) < 8 {
+		t.Fatalf("the shape did not reach the wire: %d lanes, %d model_stats, %d available, %d containers",
+			len(probe.Lanes), len(probe.ModelStats), len(probe.Available), len(probe.Containers))
+	}
+	t.Logf("largest plausible beat: %d B (%.1f KiB), gzip %d B; cap %d KiB; margin %.1fx",
+		len(wire), float64(len(wire))/1024, gzipLen(wire), gatewayCap/1024, float64(gatewayCap)/float64(len(wire)))
+	if len(wire) >= gatewayCap/4 {
+		t.Errorf("the largest plausible beat is %d B, not under a quarter of the %d-byte gateway cap", len(wire), gatewayCap)
+	}
+}
+
+func gzipLen(b []byte) int {
+	z, _ := gzipBytes(b)
+	return len(z)
+}
