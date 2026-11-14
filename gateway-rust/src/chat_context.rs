@@ -176,8 +176,19 @@ pub fn decide(backend: &str, env: &Value, model: &str, node: &Value, profile_con
     }
     let w = crate::harness_fit::chat_window(backend, env, Some(model), node, profile_context)?;
     let f = fit_inputs(node, env, model);
-    let fit = fit_cap(w.tokens, &f);
+    let fit = held_at_running(fit_cap(w.tokens, &f), w.tokens, f.running);
     Some(Decided { tokens: fit.tokens, declared: w.tokens, source: w.source, capped: fit.capped, slots: f.slots })
+}
+
+/// Never decide below what the daemon already runs the model at (when that
+/// is within the declaration): the box holds it today, and an unmeasured
+/// model's conservative cache figure must not shrink a working context on
+/// the roll (mcmini runs gemma4:12b at its tier's 32768 from the plist).
+pub fn held_at_running(fit: Fit, declared: u64, running: Option<u64>) -> Fit {
+    match running.filter(|r| *r > fit.tokens && *r <= declared) {
+        Some(r) => Fit { tokens: r, capped: Some(format!("kept at the {r} it already runs (the fit alone said {}: {})", fit.tokens, fit.capped.unwrap_or_default())) },
+        None => fit,
+    }
 }
 
 /// Holds a decided value against the memory reading's noise: a smaller
@@ -256,6 +267,17 @@ mod tests {
         assert_eq!(Sticky::next(Some(held), &d(16384, 32768), &tight), held, "not within the margin: hold");
         assert_eq!(Sticky::next(Some(held), &d(4096, 32768), &tight), Sticky { tokens: 4096, declared: 32768 }, "a drop is taken at once");
         assert_eq!(Sticky::next(Some(held), &d(16384, 16384), &tight), Sticky { tokens: 16384, declared: 16384 }, "a new declaration");
+    }
+
+    #[test]
+    fn a_working_context_is_never_shrunk_by_the_fit() {
+        let capped = Fit { tokens: 8192, capped: Some("32768 needs 9.0 GiB".into()) };
+        let kept = held_at_running(capped.clone(), 32768, Some(32768));
+        assert_eq!(kept.tokens, 32768);
+        assert!(kept.capped.as_deref().is_some_and(|c| c.contains("kept at the 32768 it already runs") && c.contains("the fit alone said 8192")), "{kept:?}");
+        assert_eq!(held_at_running(capped.clone(), 16384, Some(32768)), capped, "above the declaration: the declaration still caps");
+        assert_eq!(held_at_running(capped.clone(), 32768, Some(4096)), capped, "a smaller running context is no floor");
+        assert_eq!(held_at_running(capped.clone(), 32768, None), capped);
     }
 
     #[test]
