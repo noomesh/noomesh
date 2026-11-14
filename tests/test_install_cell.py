@@ -480,9 +480,12 @@ def test_the_rag_probe_asks_the_pages_query_then_three_chat_paths_and_is_never_j
         capture_output=True, text=True, check=True).stdout
     query, chat = got.split("|")
     assert "anything.md" in query and f'noo rag query "{query}"' in page.read_text()
-    assert "noo chat --message" not in page.read_text().split("your own document")[1].split("## ")[0], \
-        "the page proves the document with noo rag query, not noo chat"
-    assert chat == "summarise what you know from anything.md"
+    # Since noomesh#1164 `noo chat` looks in the knowledge base, so the page may
+    # show a chat line about the document; the cell then asks exactly that
+    # line (and rag-chat judges it), else its own default.
+    import re
+    shown = re.findall(r'^noo chat --message "(.*anything\.md.*)"$', page.read_text(), re.M)
+    assert chat == (shown[0] if shown else "summarise what you know from anything.md")
     probe = text[text.index("step probe-rag-chat 1500"):]
     probe = probe[:probe.index("\n  true'")]
     ingest = probe.index('\n  noo rag ingest "$HOME/notes/anything.md" 2>&1')
@@ -579,6 +582,65 @@ def test_the_arm64_rows_expect_the_refusal_and_the_doc_is_checked_out():
     assert wf.count("docs/getting-started/install.md") >= 2, "the literal pass reads the install doc"
     text = (ROOT / "scripts/install-cell/run.sh").read_text()
     assert text.index('if [ "${EXPECT:-}" = refusal ]; then') < text.index('if [ "$ONBOARD" = interactive ]; then')
+
+
+def _rag_chat_step():
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    body = text[text.index("step rag-chat 60 -- sh -c '") + len("step rag-chat 60 -- sh -c '"):]
+    return body[:body.index("' || fail_onboarded")]
+
+
+def _judge(tmp_path, verdict, route="yes", model="default"):
+    v = tmp_path / "verdict"
+    if verdict is not None:
+        v.write_text(verdict + "\n")
+    env = {"PATH": "/usr/bin:/bin", "RAG_VERDICT": str(v), "RAG_CHAT_ROUTE": route, "MODEL": model, "TINY_MODEL": "qwen2.5:0.5b"}
+    p = subprocess.run(["sh", "-c", _rag_chat_step().replace("\'\"\'\"\'", "'")], env=env, capture_output=True, text=True)
+    return p.returncode, p.stdout
+
+
+def test_the_rag_chat_line_is_judged_only_on_a_build_with_the_coordinator_route_and_a_real_model(tmp_path):
+    # general 11-14: from noomesh#1164 `noo chat` retrieves; the page's chat
+    # line must then bring the fact back. Not on an older build, and only a
+    # NOTE on a tiny-model cell.
+    assert _judge(tmp_path, "got=no indexed=yes")[0] == 1, "the new route, the default model, no fact: FAIL"
+    rc, out = _judge(tmp_path, "got=no indexed=yes")
+    assert "RAG-CHAT FAIL" in out
+    rc, out = _judge(tmp_path, "got=yes indexed=yes")
+    assert rc == 0 and "RAG-CHAT PASS" in out
+    rc, out = _judge(tmp_path, "got=no indexed=yes", route="no")
+    assert rc == 0 and "not judged: this build has no POST /api/inference/chat" in out, "an older rc never goes red"
+    rc, out = _judge(tmp_path, "got=no indexed=yes", model="tiny")
+    assert rc == 0 and "RAG-CHAT NOTE" in out and "not a product verdict" in out
+    rc, out = _judge(tmp_path, "got=no indexed=no")
+    assert rc == 0 and "not judged: the index never returned the fact" in out
+    rc, out = _judge(tmp_path, None)
+    assert rc == 0 and "not judged" in out, "no verdict (the probe never reached chat) is not a product FAIL"
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    assert text.index("step probe-rag-chat 1500") < text.index("step rag-chat 60"), "judged after the probe wrote its verdict"
+    assert '[ "$path" = chat ] && echo "got=$got indexed=$indexed" > "$RAG_VERDICT"' in text
+
+
+def _detect(tmp_path, noo_names_route, code):
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    block = text[text.index("RAG_CHAT_ROUTE=no\n"):text.index("export RAG_CHAT_ROUTE")]
+    fake = tmp_path / "bin"
+    fake.mkdir(exist_ok=True)
+    (fake / "noo").write_text("#!/bin/sh\n# " + ("POST /api/inference/chat" if noo_names_route else "/api/inference/stream") + "\n")
+    (fake / "noo").chmod(0o755)
+    (fake / "python3").write_text(f"#!/bin/sh\necho '{code}'\n")
+    (fake / "python3").chmod(0o755)
+    p = subprocess.run(["bash", "-c", block + 'echo "$RAG_CHAT_ROUTE"'],
+                       env={"PATH": f"{fake}:/usr/bin:/bin", "RAG_WS_CHAT": "x"}, capture_output=True, text=True)
+    return p.stdout.strip()
+
+
+def test_the_coordinator_route_is_detected_from_both_the_cli_and_the_gateway(tmp_path):
+    assert _detect(tmp_path, True, "422") == "yes"
+    assert _detect(tmp_path, True, "405") == "yes"
+    assert _detect(tmp_path, True, "404") == "no", "the gateway has no such route"
+    assert _detect(tmp_path, False, "422") == "no", "the CLI under test still speaks the raw stream"
+    assert _detect(tmp_path, True, "unknown (URLError)") == "no", "cannot tell: not judged"
 
 
 def test_the_console_chat_client_finds_the_cluster_ca_where_the_cli_does(tmp_path):

@@ -438,7 +438,8 @@ RAG_QUERY_LINE="$(sed -n 's/^noo rag query "\(.*anything\.md.*\)"$/\1/p' "$RAG_D
 RAG_CHAT_LINE="$(sed -n 's/^noo chat --message "\(.*anything\.md.*\)"$/\1/p' "$RAG_DOC_PAGE" 2>/dev/null | head -n 1)"
 RAG_CHAT_LINE="${RAG_CHAT_LINE:-summarise what you know from anything.md}"
 RAG_WS_CHAT="$HERE/ws_chat.py"
-export RAG_QUERY_LINE RAG_CHAT_LINE RAG_WS_CHAT
+RAG_VERDICT="$OUT/rag-chat.verdict"
+export RAG_QUERY_LINE RAG_CHAT_LINE RAG_WS_CHAT RAG_VERDICT
 step probe-rag-chat 1500 -- sh -c '
   [ -n "$RAG_QUERY_LINE" ] || { echo "RAG PROBE: first-chat.md has no noo rag query line about anything.md"; exit 0; }
   fact="14(th)? (of )?march|ZIRCON-4471|kestrel"
@@ -464,8 +465,34 @@ step probe-rag-chat 1500 -- sh -c '
     printf "%s\n" "$out" | head -n 30
     if printf "%s" "$out" | grep -qiE "$fact"; then got=yes; else got=no; fi
     echo "RAG PROBE: $path returned the fact=$got (index ready=$indexed)"
+    [ "$path" = chat ] && echo "got=$got indexed=$indexed" > "$RAG_VERDICT"
   done
   true'
+
+# JUDGED (general 11-14, for 0.6.25): from noomesh#1164 on, `noo chat` runs the
+# coordinator turn over POST /api/inference/chat and retrieves the caller's
+# documents, so the page's chat line about anything.md must bring the fact
+# back. Judged only when the build under test has that route (the installed
+# noo names it AND the gateway answers it with anything but 404) and the cell
+# runs the default model; a tiny-model cell prints a NOTE (as first-answer
+# does), and an older build is "not judged", so an earlier rc never goes red.
+RAG_CHAT_ROUTE=no
+if grep -qa "/api/inference/chat" "$(command -v noo 2>/dev/null)" 2>/dev/null; then
+  code="$(python3 -I "$RAG_WS_CHAT" --probe-route /api/inference/chat 2>/dev/null)"
+  case "$code" in [1-5][0-9][0-9]) [ "$code" != 404 ] && RAG_CHAT_ROUTE=yes ;; esac
+fi
+export RAG_CHAT_ROUTE
+step rag-chat 60 -- sh -c '
+  v="$(cat "$RAG_VERDICT" 2>/dev/null)"
+  if [ "$RAG_CHAT_ROUTE" != yes ]; then
+    echo "RAG-CHAT: not judged: this build has no POST /api/inference/chat (noo chat is the raw model stream before 0.6.25)"; exit 0
+  fi
+  case "$v" in *"indexed=yes"*) ;; *) echo "RAG-CHAT: not judged: the index never returned the fact (${v:-no verdict})"; exit 0 ;; esac
+  case "$v" in *"got=yes"*) echo "RAG-CHAT PASS: noo chat returned the ingested document'"'"'s fact"; exit 0 ;; esac
+  if [ "$MODEL" = default ]; then
+    echo "RAG-CHAT FAIL: noo chat (the coordinator route) did not return the fact the index holds"; exit 1
+  fi
+  echo "RAG-CHAT NOTE: the tiny test model ($TINY_MODEL) did not return the fact; this cell runs MODEL=$MODEL, not the product default, so this is not a product verdict"' || fail_onboarded
 
 # PROBE (fa, rc.1 rehearsal A-reboot.status, i677): a container that joins
 # another's network namespace (network_mode: service:<door>; noo-ollama-embed
