@@ -936,7 +936,7 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 | `noo autonomy decisions` | `[-n\|--limit <n>] [-l\|--location <name>]` | What the disarmed autonomy locations would have done — the evidence for arming one |
 | `noo autonomy enable` | — | Enable the autonomy engine |
 | `noo autonomy disable` | — | Disable the autonomy engine |
-| `noo autonomy live` | `<rule> [-y\|--yes]` | Take a rule with a dry-run gate live: it then acts (disk_watermark deletes, cert_auto_rotate re-issues); asks first; operator or admin |
+| `noo autonomy live` | `<rule> [-y\|--yes]` | Take a dry-run-gated rule live so it acts; asks first; operator or admin |
 | `noo autonomy preview` | `<rule>` | Put a gated rule back into dry run: it records what it would do and changes nothing |
 
 ### `noo skills` — Containerized skill management
