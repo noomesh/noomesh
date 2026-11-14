@@ -4424,7 +4424,8 @@ pub(crate) fn intended_owner(name: &str, base: &Path) -> std::io::Result<Owner> 
 /// scripts/prep-host.sh gives both to `noo-agent`, the one owner it still
 /// re-owns an existing directory to.
 pub(crate) fn agent_subdir(name: &str) -> bool {
-    matches!(name, "models" | "hf-cache")
+    // hf-cache/hub is owned like hf-cache: it is where the backends write.
+    matches!(name, "models" | "hf-cache" | "hf-cache/hub")
 }
 
 /// The `noo-agent` account's (uid, primary gid), when this host has it
@@ -10086,6 +10087,10 @@ mod storage_owner_tests {
         assert_eq!(intended_owner_with("hf-cache", &b, agent).unwrap(), (4242, 4243));
         assert_eq!(intended_owner_with("models", &b, None).unwrap(), owner_of(&b));
         assert_eq!(intended_owner_with("hf-cache", &b, None).unwrap(), owner_of(&b));
+        // hf-cache/hub (the gateway's read-only hf mount, i675 F13) is owned
+        // like hf-cache: pre-created before Docker could make it root's.
+        assert_eq!(intended_owner_with("hf-cache/hub", &b, agent).unwrap(), (4242, 4243));
+        assert_eq!(intended_owner_with("hf-cache/hub", &b, None).unwrap(), owner_of(&b));
         for other in ["noo-data", "models/voice/piper", "images", ""] {
             assert_eq!(intended_owner_with(other, &b, agent).unwrap(), owner_of(&b), "{other}");
         }

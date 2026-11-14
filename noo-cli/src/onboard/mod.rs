@@ -98,6 +98,11 @@ pub(crate) const SECRETS: &[(&str, &str)] = &[
 pub(crate) const STORAGE_SUBDIRS: &[&str] = &[
     "noo-data", "redis", "nats", "ollama", "hf-cache", "models", "prometheus", "grafana", "loki", "tempo", "postgres",
     "images",
+    // HF_CACHE_DIR/hub, which the gateway mounts read-only for the `hf`
+    // artifact manifest (i675 F13). huggingface_hub makes it on the first
+    // download; a fresh or upgraded install may not have it yet, and Docker
+    // would make it root-owned. Owned like hf-cache (steps::agent_subdir).
+    "hf-cache/hub",
     // The voice add-on's read-only staged-model mounts (i105): created even
     // when voice is off, so turning it on later never hits the bind check.
     "models/voice/whisper", "models/voice/piper",

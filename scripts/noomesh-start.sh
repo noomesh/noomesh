@@ -466,7 +466,10 @@ fi
 # The `models--*` test is what separates "wrong level" from "nothing here
 # yet": an empty or absent directory is a normal fresh install and says
 # nothing, so it must stay silent or the warning becomes noise.
-if [ -d "$_hf_dir" ] && [ ! -d "$_hf_dir/hub" ] &&    [ -n "$(find "$_hf_dir" -maxdepth 1 -name 'models--*' -print -quit 2>/dev/null)" ]; then
+# hub/ may exist and be EMPTY: the launch check and the roll pre-create it
+# for the gateway's read-only hf mount (i675 F13), so "no models in hub/"
+# is the wrong-level signal, not "no hub/".
+if [ -d "$_hf_dir" ] && { [ ! -d "$_hf_dir/hub" ] || [ -z "$(find "$_hf_dir/hub" -maxdepth 1 -name 'models--*' -print -quit 2>/dev/null)" ]; } &&    [ -n "$(find "$_hf_dir" -maxdepth 1 -name 'models--*' -print -quit 2>/dev/null)" ]; then
     ui_warned "HF_CACHE_DIR looks like a bare hub archive: $_hf_dir"
     ui_note "it holds models--* directly, but HF_CACHE_DIR must CONTAIN hub/ (it is an HF_HOME)"
     ui_note "the weight cache serves \$HF_CACHE_DIR/hub, so /hf/ will 404 and every node's preseed will fail"

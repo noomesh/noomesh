@@ -256,3 +256,37 @@ func TestProgressLineNamesTheModelAndGigabytes(t *testing.T) {
 		t.Fatalf("progress line = %q", got)
 	}
 }
+
+// TEI reads the snapshot the agent verified: the images' own
+// HUGGINGFACE_HUB_CACHE=/data would make it read HF_CACHE_DIR/models--…,
+// while stageHFModel verifies HF_CACHE_DIR/hub/models--…. Checked on the
+// rendered env (buildEnvList, with an override trying to move it back) and
+// against the mount: env path = mount target + "/hub", mount source =
+// the HF cache stageHFModel writes under.
+func TestTEIReadsTheVerifiedHubSnapshot(t *testing.T) {
+	specs := map[string]BackendSpec{"embedding": backendSpecs["embedding"], "reranker(tei)": rerankerSpecTEI()}
+	for name, spec := range specs {
+		env := buildEnvList(spec.Env, map[string]string{"HUGGINGFACE_HUB_CACHE": "/data"})
+		got := ""
+		for _, kv := range env {
+			if v, ok := strings.CutPrefix(kv, "HUGGINGFACE_HUB_CACHE="); ok {
+				got = v
+			}
+		}
+		if got != "/data/hub" {
+			t.Errorf("%s: rendered HUGGINGFACE_HUB_CACHE = %q, want /data/hub (the verified hub/ level)", name, got)
+		}
+		var mount *VolumeMount
+		for i := range spec.Volumes {
+			if spec.Volumes[i].Source == hfCacheSource {
+				mount = &spec.Volumes[i]
+			}
+		}
+		if mount == nil {
+			t.Fatalf("%s: the HF cache is not mounted", name)
+		}
+		if rel, ok := strings.CutPrefix(got, strings.TrimRight(mount.Target, "/")); !ok || rel != "/hub" {
+			t.Errorf("%s: cache %q is not <mount %s>/hub, where stageHFModel verifies", name, got, mount.Target)
+		}
+	}
+}

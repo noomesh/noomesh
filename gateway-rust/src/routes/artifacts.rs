@@ -21,7 +21,8 @@
 //! image tars exported by `noo cluster sync-images`, step 2). Both are flat
 //! files with one hash each. `hf` (i675 F13) is the manifest-of-files for an
 //! HF repo's `refs/main` snapshot: each file with the sha256 of its blob,
-//! cross-checked against the blob's own HF oid (see [`hf_manifest`]).
+//! cross-checked against the blob's own HF oid (see [`hf_manifest`]); it
+//! reads `HF_CACHE_DIR/hub`, the only part of the HF_HOME the gateway mounts.
 //!
 //! `modelset` (i300 F3) is the manifest-of-files: `<id>@<revision>` answers
 //! the signed `model-set.json` and its detached signature, and the manifest
@@ -537,12 +538,14 @@ async fn modelset_manifest(name: &str) -> Result<Response, AppError> {
 // served. A snapshot file that is a plain file (no oid), or a link that
 // leaves the repo's `blobs/`, is refused the same way.
 
-/// Where the controller's HF cache — an HF_HOME, the directory that CONTAINS
-/// `hub/` — is mounted in THIS container: the same host directory nginx
-/// serves as `/hf/` (mounted there at /hf-store, aliased to /hf-store/hub/),
-/// read-only. Only `hub/` is ever read here.
-pub(crate) fn hf_home_dir() -> PathBuf {
-    PathBuf::from(std::env::var("NOO_ARTIFACT_HF_DIR").unwrap_or_else(|_| "/artifacts/hf".into()))
+/// Where the controller's `HF_CACHE_DIR/hub` is mounted in THIS container,
+/// read-only: the same tree nginx serves as `/hf/`. ONLY `hub/` is mounted —
+/// an HF_HOME also holds `token` / `stored_tokens`, which the gateway must
+/// never be able to read. The launcher and the roll create a missing `hub/`
+/// with HF_CACHE_DIR's owner before the gateway starts (noo-cli
+/// `bind_sources::ensure_hf_hub`, `onboard::STORAGE_SUBDIRS`).
+pub(crate) fn hf_hub_dir() -> PathBuf {
+    PathBuf::from(std::env::var("NOO_ARTIFACT_HF_HUB_DIR").unwrap_or_else(|_| "/artifacts/hf/hub".into()))
 }
 
 /// Most files one snapshot may list. A real model has tens.
@@ -699,19 +702,19 @@ enum HfOutcome {
     Hashing(u64),
 }
 
-/// The `hf` manifest of `repo` under `hf_home`, waiting at most `wait` for
+/// The `hf` manifest of `repo` under the hub directory `hub`, waiting at most `wait` for
 /// background hashes. LFS blobs are hashed through the same cached,
 /// single-flight path as the flat kinds (key `hf/<repo>/<oid>`), ONE AT A
 /// TIME, so a cold snapshot costs the controller one core, not one per
 /// shard; every digest, cached or fresh, is compared with the blob's name.
-async fn hf_manifest_at(hf_home: &Path, repo: &str, wait: std::time::Duration) -> Result<HfOutcome, AppError> {
+async fn hf_manifest_at(hub: &Path, repo: &str, wait: std::time::Duration) -> Result<HfOutcome, AppError> {
     if !valid_hf_repo_dir(repo) {
         return Err(AppError::BadRequest(
             "hf artifact name must be a cache repo directory, models--<org>--<name> ([A-Za-z0-9._-])".into(),
         ));
     }
     let deadline = tokio::time::Instant::now() + wait;
-    let repo_dir = hf_home.join("hub").join(repo);
+    let repo_dir = hub.join(repo);
     let (rev, entries) = {
         let (repo_dir, repo) = (repo_dir.clone(), repo.to_string());
         tokio::task::spawn_blocking(move || {
@@ -785,7 +788,7 @@ async fn hf_manifest_at(hf_home: &Path, repo: &str, wait: std::time::Duration) -
 /// blob is still being hashed; 404 when the store has no such repo; 409 when
 /// the controller's own copy does not match its HF oids (see above).
 async fn hf_manifest(name: &str) -> Result<Response, AppError> {
-    match hf_manifest_at(&hf_home_dir(), name, std::time::Duration::from_secs(HASH_WAIT_SECS)).await? {
+    match hf_manifest_at(&hf_hub_dir(), name, std::time::Duration::from_secs(HASH_WAIT_SECS)).await? {
         HfOutcome::Ready(body) => Ok(Json(body).into_response()),
         HfOutcome::Hashing(total) => Ok(hashing_response("hf", name, total)),
     }
@@ -1660,7 +1663,7 @@ mod tests {
     /// An HF cache as huggingface_hub writes it: blobs named by their oid,
     /// snapshot files as RELATIVE links into blobs/. The weight's bytes carry
     /// the tag, so each test's LFS oid (and digest-cache key) is its own.
-    /// Returns (HF_HOME, repo dir name, weight bytes).
+    /// Returns (HF_HOME, repo dir name, weight bytes); the route reads HF_HOME/hub.
     fn hf_fixture(tag: &str) -> (PathBuf, String, Vec<u8>) {
         let home = std::env::temp_dir().join(format!("noo-art-hf-{tag}-{}", uuid::Uuid::new_v4()));
         let repo = format!("models--org--{tag}");
@@ -1685,7 +1688,7 @@ mod tests {
     }
 
     async fn hf_ready(home: &Path, repo: &str) -> Result<serde_json::Value, AppError> {
-        match hf_manifest_at(home, repo, std::time::Duration::from_secs(10)).await? {
+        match hf_manifest_at(&home.join("hub"), repo, std::time::Duration::from_secs(10)).await? {
             HfOutcome::Ready(v) => Ok(v),
             HfOutcome::Hashing(_) => panic!("still hashing after 10 s"),
         }
@@ -1786,7 +1789,7 @@ mod tests {
     async fn a_cold_lfs_blob_answers_hashing_then_the_manifest() {
         let (home, repo, weights) = hf_fixture("cold");
         // Current-thread runtime: the spawned hash cannot finish inside a zero wait.
-        match hf_manifest_at(&home, &repo, std::time::Duration::ZERO).await.unwrap() {
+        match hf_manifest_at(&home.join("hub"), &repo, std::time::Duration::ZERO).await.unwrap() {
             HfOutcome::Hashing(total) => assert!(total >= weights.len() as u64),
             HfOutcome::Ready(v) => panic!("a cold blob answered at once: {v}"),
         }
