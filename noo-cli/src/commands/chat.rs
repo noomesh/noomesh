@@ -109,6 +109,51 @@ struct StreamEvent {
     /// A line for the person, not part of the answer (a tool starting, an
     /// approval verdict).
     note: Option<String>,
+    /// What served the turn, as far as this event says: (backend, model,
+    /// node). Each part only when the event carries it.
+    served: Option<Served>,
+}
+
+/// What served a turn, gathered across its events: the opening `metadata`
+/// names the backend and model, each `phase: routed` names the node (and the
+/// backend and model of that call). A later event updates only the parts it
+/// carries, so a tool round's frames never blank what is known.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Served {
+    backend: Option<String>,
+    model: Option<String>,
+    node: Option<String>,
+}
+
+impl Served {
+    fn merge(&mut self, other: &Served) {
+        for (mine, theirs) in [(&mut self.backend, &other.backend), (&mut self.model, &other.model), (&mut self.node, &other.node)] {
+            if theirs.is_some() {
+                *mine = theirs.clone();
+            }
+        }
+    }
+
+    /// `ollama · qwen2.5:0.5b on awolf`, with any unknown part left out
+    /// rather than printed as `?`; `None` when nothing is known.
+    fn line(&self) -> Option<String> {
+        let what = match (&self.backend, &self.model) {
+            (Some(b), Some(m)) => Some(format!("{b} · {m}")),
+            (Some(x), None) | (None, Some(x)) => Some(x.clone()),
+            (None, None) => None,
+        };
+        match (what, &self.node) {
+            (Some(w), Some(n)) => Some(format!("{w} on {n}")),
+            (Some(w), None) => Some(w),
+            (None, Some(n)) => Some(format!("on {n}")),
+            (None, None) => None,
+        }
+    }
+}
+
+fn served_from(v: &serde_json::Value, node_key: &str) -> Served {
+    let s = |k: &str| v[k].as_str().filter(|x| !x.is_empty()).map(str::to_string);
+    Served { backend: s("backend"), model: s("model"), node: s(node_key) }
 }
 
 /// Map one JSON chunk (any of the framings listed in the module doc) to a
@@ -119,13 +164,8 @@ fn extract_event(v: &serde_json::Value) -> StreamEvent {
     if let Some(t) = v["type"].as_str() {
         match t {
             "content" => ev.token = v["text"].as_str().map(str::to_string),
-            "metadata" => {
-                ev.meta = Some(format!(
-                    "{} on {}",
-                    v["backend"].as_str().unwrap_or("?"),
-                    v["node_id"].as_str().unwrap_or("?")
-                ))
-            }
+            "metadata" => ev.served = Some(served_from(v, "node_id")),
+            "phase" if v["phase"] == "routed" => ev.served = Some(served_from(v, "node")),
             "error" => {
                 ev.error = Some(v["message"].as_str().or(v["text"].as_str()).unwrap_or("unknown error").to_string())
             }
@@ -220,6 +260,7 @@ fn stream_turn(
     // sends a keepalive every 30 s, so the bound is checked at least that
     // often. Returning drops the connection, which ends the turn there.
     let mut waiting: Option<(String, String, u64, std::time::Instant)> = None;
+    let mut served = Served::default();
     let reader = std::io::BufReader::new(resp.body_mut().as_reader());
     for line in reader.lines() {
         let line = line.map_err(|e| format!("stream interrupted: {e}"))?;
@@ -245,6 +286,12 @@ fn stream_turn(
         }
         if let Some(m) = ev.meta {
             meta = Some(m);
+        }
+        if let Some(sv) = &ev.served {
+            served.merge(sv);
+            if let Some(line) = served.line() {
+                meta = Some(line);
+            }
         }
         if let Some((id, tool, window)) = ev.approval {
             eprintln!("{}", ui::warn(&approval_notice(&id, &tool, window)));
@@ -537,12 +584,38 @@ mod tests {
         assert!(e.done && e.token.is_none());
     }
 
+    /// The footer names what served the turn from the coordinator's own
+    /// frames: the opening metadata (backend, model), the routed phase
+    /// (node), and never "?" for a part no frame named.
+    #[test]
+    fn the_footer_is_what_served_the_turn_and_never_a_question_mark() {
+        let mut acc = Served::default();
+        for raw in [
+            r#"{"type":"metadata","conversation_id":"c","model":"qwen2.5:0.5b","backend":"ollama","engine":"rust"}"#,
+            r#"{"type":"phase","phase":"routed","node":"awolf","backend":"ollama","model":"qwen2.5:0.5b","attempt":1}"#,
+            // A tool round's frames name no backend: they must not blank it.
+            r#"{"type":"metadata","deadline_stop":true,"iteration":2}"#,
+            r#"{"type":"tool_call","name":"noo_rag_query"}"#,
+        ] {
+            if let Some(sv) = ev(raw).served {
+                acc.merge(&sv);
+            }
+        }
+        assert_eq!(acc.line().as_deref(), Some("ollama · qwen2.5:0.5b on awolf"));
+        // Before any routed phase: no node, and no "on ?".
+        let only = served_from(&serde_json::json!({"backend": "ollama", "model": "m"}), "node_id");
+        assert_eq!(only.line().as_deref(), Some("ollama · m"));
+        assert_eq!(Served::default().line(), None);
+        // A non-routed phase says nothing about what served.
+        assert!(ev(r#"{"type":"phase","phase":"queued"}"#).served.is_none());
+    }
+
     #[test]
     fn extracts_legacy_python_events() {
         let e = ev(r#"{"type":"content","text":"T"}"#);
         assert_eq!(e.token.as_deref(), Some("T"));
         let e = ev(r#"{"type":"metadata","backend":"ollama","node_id":"n1"}"#);
-        assert_eq!(e.meta.as_deref(), Some("ollama on n1"));
+        assert_eq!(e.served.and_then(|s| s.line()).as_deref(), Some("ollama on n1"));
         let e = ev(r#"{"type":"error","message":"boom"}"#);
         assert_eq!(e.error.as_deref(), Some("boom"));
         assert!(ev(r#"{"type":"done"}"#).done);
