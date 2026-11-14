@@ -58,11 +58,10 @@ noo rag query "what does anything.md say about the deadline?"
 ```
 
 `noo rag status` shows the document and page counts; `noo rag query` answers
-with citations, so you can see which pages it used. `noo chat` does not
-search the knowledge base: it sends your message straight to the chat model.
-To talk about your documents, use `noo rag query`, or the chat in the web
-console (below), which looks in the knowledge base before it answers: ask it
-"summarise what you know from anything.md". More verbs (`docs`,
+with citations, so you can see which pages it used. `noo chat` and the chat
+in the web console (below) also look in the knowledge base before they
+answer, as you: ask `noo chat --message "summarise what you know from
+anything.md"`. More verbs (`docs`,
 `scan`, watched folders) are in
 [memory-and-knowledge.md](../cli/memory-and-knowledge.md).
 
