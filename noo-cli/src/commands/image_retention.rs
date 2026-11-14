@@ -27,6 +27,12 @@
 //! builds and anything else are never named, so hostd never treats them as
 //! ours.
 //!
+//! Docker Hub is never cleaned: Docker reports its images by short name
+//! (`redis:7`, `postgres:16`), and hostd matches a namespace only against a
+//! registry host, so a short name is never ours and is always kept. An
+//! add-on pinned on Docker Hub keeps its superseded images; the operator
+//! removes them by hand.
+//!
 //! The keep file proves it is current by naming its sources with their
 //! SHA-256: hostd re-hashes them, and a lock that moved since makes it stale,
 //! which skips the rung.
