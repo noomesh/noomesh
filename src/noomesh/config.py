@@ -1118,7 +1118,8 @@ class SelfConfig(BaseModel):
 
     This is the agent's learned behavior: communication style, operating
     principles, user preferences, and self-assessment.  The static identity
-    lives in ``prompts/coordinator.md``; this section is what the agent
+    lives in ``prompts/coordinator-core.md`` (plus
+    ``coordinator-full-extra.md`` in the Full tier); this section is what the agent
     learns about *how* to be effective over time.
     """
     tone: str = Field(
