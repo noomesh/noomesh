@@ -4119,6 +4119,15 @@ async fn desired_config_get(
         .collect();
 
     let harness_policy = node.as_ref().map(|n| n.8.clone()).unwrap_or_else(crate::coordinator::harness_default_policy);
+    // i545 #38: on the controller's own node `auto` follows the runner its
+    // agent reports, the same rule dispatch applies (policy_for_node).
+    let is_self = crate::self_node::is_self_node(&node_id);
+    let runner = is_self
+        && crate::coordinator::self_node_runner_reported(
+            crate::coordinator::node_record(&state, &node_id).await.as_ref(),
+            crate::scheduler_engine::now_unix_secs(),
+        );
+    let harness_policy = crate::coordinator::policy_for_node(harness_policy, is_self, runner);
     let (usage_effective, usage_source) = crate::placement_fit::effective_usage(
         node.as_ref().and_then(|n| n.10.as_deref()),
         crate::self_node::is_self_node(&node_id),
@@ -7894,6 +7903,62 @@ mod harness_policy_tests {
         v.iter()
             .find(|p| p["backend"] == "harness")
             .map(|p| p["desired_state"].as_str().unwrap_or("?").to_string())
+    }
+
+    // i545 #38: on the controller's own node `auto` follows the runner its
+    // agent reports (coordinator::policy_for_node), in desired-config exactly
+    // as in dispatch. `told` is what the self node's agent would be told.
+    fn told(policy: &str, is_self: bool, record: Option<Value>) -> Option<String> {
+        let now = 1_000_000.0;
+        let runner = is_self && crate::coordinator::self_node_runner_reported(record.as_ref(), now);
+        let policy = crate::coordinator::policy_for_node(policy.to_string(), is_self, runner);
+        harness_state(&apply_harness_policy(&policy, vec![chat()]))
+    }
+    fn beat(age: f64, harness: Option<&str>) -> Value {
+        let mut r = json!({"last_heartbeat": 1_000_000.0 - age});
+        if let Some(h) = harness {
+            r["host_services"] = json!({"harness": {"state": h}});
+        }
+        r
+    }
+
+    #[test]
+    fn the_controllers_own_node_gets_no_harness_from_the_default_without_a_runner() {
+        // A fresh one-box: its agent reports the runner absent, or nothing at all.
+        assert_eq!(told("auto", true, Some(beat(10.0, Some("absent")))), None);
+        assert_eq!(told("auto", true, None), None, "no record reads as absent");
+        assert_eq!(told("auto", true, Some(beat(10.0, None))), None, "no harness field reads as absent");
+        assert_eq!(told("auto", true, Some(json!({"host_services": {"harness": {"state": "running"}}}))), None,
+            "no heartbeat time reads as absent");
+        assert_eq!(told("auto", true, Some(beat(600.0, Some("running")))), None, "a stale heartbeat reads as absent");
+    }
+
+    #[test]
+    fn the_controllers_own_node_gets_one_when_its_agent_reports_a_runner() {
+        assert_eq!(told("auto", true, Some(beat(10.0, Some("running")))).as_deref(), Some("running"));
+        assert_eq!(told("auto", true, Some(beat(10.0, Some("stopped")))).as_deref(), Some("running"),
+            "an installed runner that is stopped is still a runner to start");
+    }
+
+    #[test]
+    fn other_nodes_and_explicit_policies_are_unchanged() {
+        assert_eq!(told("auto", false, None).as_deref(), Some("running"), "a node with a chat backend: as before");
+        assert_eq!(told("off", true, Some(beat(10.0, Some("running")))).as_deref(), Some("stopped"), "off is off");
+        assert_eq!(told("manual", true, Some(beat(10.0, Some("running")))), None);
+        // An explicitly placed harness on the self node is kept either way.
+        let placed = vec![chat(), json!({"backend":"harness","desired_state":"running","role":"harness"})];
+        let p = crate::coordinator::policy_for_node("auto".into(), true, false);
+        assert_eq!(harness_state(&apply_harness_policy(&p, placed)).as_deref(), Some("running"));
+    }
+
+    #[test]
+    fn desired_config_and_dispatch_apply_the_same_rule() {
+        let cluster = include_str!("cluster.rs");
+        let get = &cluster[cluster.find("async fn desired_config_get").expect("route")..];
+        let get = &get[..get.find("apply_harness_policy(&harness_policy").expect("applies the policy")];
+        assert!(get.contains("crate::coordinator::policy_for_node(harness_policy, is_self, runner)"));
+        let dispatch = include_str!("../coordinator/dispatch.rs");
+        assert!(dispatch.contains("let policy = policy_for_node(policy.unwrap_or_else(harness_default_policy), is_self, runner_reported);"));
     }
 
     #[test]
