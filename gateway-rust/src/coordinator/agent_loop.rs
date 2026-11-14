@@ -528,6 +528,7 @@ fn build_llm_request(
     tools: Option<&[Value]>,
     stream: bool,
     enable_thinking: bool,
+    num_ctx: Option<u64>,
 ) -> (String, Value) {
     let cloud = super::backend::is_cloud_backend(backend);
     match super::backend::wire_format(backend) {
@@ -552,6 +553,8 @@ fn build_llm_request(
                     body["tools"] = Value::Array(tools.to_vec());
                 }
             }
+            // The decided context (i802); an Ollama without one ran 4,096.
+            crate::chat_context::stamp_opt(&mut body, num_ctx);
             (url, body)
         }
         "llamacpp" => {
@@ -624,6 +627,12 @@ fn build_llm_request(
             // Explicitly set true/false — some models (Qwen3.5) don't produce
             // <think> tags without an explicit enable_thinking=true.
             body["chat_template_kwargs"] = json!({"enable_thinking": enable_thinking});
+            // An Ollama behind its node agent speaks this wire; the agent
+            // hands `options` to its translator, which merges them (i802).
+            // Never on any other engine.
+            if crate::chat_context::takes_num_ctx(&backend.backend_type) {
+                crate::chat_context::stamp_opt(&mut body, num_ctx);
+            }
             (url, body)
         }
     }
@@ -1603,7 +1612,9 @@ async fn send_llm_with_fallback<R: HarnessRuntime, S: crate::websocket::TurnSink
             }
         }
         let stream = force_stream || super::backend::wire_format(backend) == "openai";
-        let (url, mut body) = build_llm_request(backend, messages, tools, stream, enable_thinking);
+        // Per attempt: a failover may land on another node or engine.
+        let num_ctx = rt.chat_num_ctx(backend).await;
+        let (url, mut body) = build_llm_request(backend, messages, tools, stream, enable_thinking, num_ctx);
         if thinking == super::thinking::ThinkingMode::Off {
             super::thinking::disable_on_wire(
                 &mut body,
@@ -4029,7 +4040,7 @@ mod llamacpp_wire_tests {
     fn llamacpp_native_request_carries_tools_and_streams() {
         let b = llamacpp("http://llamacpp-native-test:8085");
         let messages = vec![json!({"role": "user", "content": "hi"})];
-        let (url, body) = build_llm_request(&b, &messages, Some(&tools()), true, false);
+        let (url, body) = build_llm_request(&b, &messages, Some(&tools()), true, false, None);
         assert_eq!(url, "http://llamacpp-native-test:8085/v1/chat/completions");
         assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
         assert_eq!(body["messages"][0]["content"], "hi");
@@ -4043,7 +4054,7 @@ mod llamacpp_wire_tests {
         let b = llamacpp("http://llamacpp-legacy-test:8085");
         super::super::backend::mark_legacy_completion(&b.url);
         let messages = vec![json!({"role": "user", "content": "hi"})];
-        let (url, body) = build_llm_request(&b, &messages, Some(&tools()), false, false);
+        let (url, body) = build_llm_request(&b, &messages, Some(&tools()), false, false, None);
         assert_eq!(url, "http://llamacpp-legacy-test:8085/completion");
         let prompt = body["prompt"].as_str().unwrap();
         assert!(prompt.contains("web_search"), "tools are described in the prompt");
@@ -4131,7 +4142,7 @@ mod cloud_loop_tests {
     fn an_anthropic_backend_gets_a_messages_request_with_tools() {
         let b = cloud("cloud-anthropic", "anthropic", super::super::cloud::ANTHROPIC_BASE_URL);
         let messages = vec![json!({"role": "system", "content": "sys"}), json!({"role": "user", "content": "hi"})];
-        let (url, body) = build_llm_request(&b, &messages, Some(&tools()), true, true);
+        let (url, body) = build_llm_request(&b, &messages, Some(&tools()), true, true, None);
         assert_eq!(url, "https://api.anthropic.com/v1/messages");
         assert_eq!(body["system"], "sys");
         assert_eq!(body["tools"][0]["name"], "web_search");
@@ -4151,18 +4162,18 @@ mod cloud_loop_tests {
             json!({"role": "tool", "name": "web_search", "content": "r", "tool_call_id": "c1"}),
         ];
         let o = cloud("cloud-openai", "openai", super::super::cloud::OPENAI_BASE_URL);
-        let (url, body) = build_llm_request(&o, &messages, Some(&tools()), true, true);
+        let (url, body) = build_llm_request(&o, &messages, Some(&tools()), true, true, None);
         assert_eq!(url, "https://api.openai.com/v1/chat/completions");
         assert!(body.get("chat_template_kwargs").is_none(), "vLLM-only extras stay off a provider");
         assert!(body.get("max_tokens").is_none());
         assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
         assert_eq!(body["messages"][1], json!({"role": "tool", "content": "r", "tool_call_id": "c1"}));
         let g = cloud("cloud-gemini", "openai", super::super::cloud::GEMINI_BASE_URL);
-        let (url, _) = build_llm_request(&g, &messages, None, false, false);
+        let (url, _) = build_llm_request(&g, &messages, None, false, false, None);
         assert_eq!(url, "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions");
         // A node backend is untouched by any of this.
         let v = cloud("vllm", "openai", "https://noo-vllm:8000");
-        let (url, body) = build_llm_request(&v, &messages, None, false, false);
+        let (url, body) = build_llm_request(&v, &messages, None, false, false, None);
         assert_eq!(url, "https://noo-vllm:8000/v1/chat/completions");
         assert!(body.get("chat_template_kwargs").is_some());
     }
@@ -4291,5 +4302,65 @@ mod recall_metadata_tests {
         assert_eq!(code.matches("recall: recall_status,").count(), 2, "both loops put it on the result");
         assert_eq!(code.matches("metadata[\"recall\"] = json!(r);").count(), 2, "both loops save it with the message");
         assert_eq!(code.matches("send_event(\"done\", done_frame(&result, &usage))").count(), 1, "the stream sends it on done");
+    }
+}
+
+#[cfg(test)]
+mod num_ctx_tests {
+    use super::*;
+
+    fn backend(backend_type: &str, api_format: &str, url: &str) -> ResolvedBackend {
+        ResolvedBackend { url: url.to_string(), model: "gemma4:e2b".to_string(), backend_type: backend_type.to_string(), api_format: api_format.to_string() }
+    }
+
+    fn hi() -> Vec<Value> {
+        vec![json!({"role": "user", "content": "hi"})]
+    }
+
+    /// i802: an Ollama dialled natively gets the decided context on /api/chat.
+    #[test]
+    fn a_native_ollama_body_carries_the_decided_context() {
+        let b = backend("ollama", "ollama", "http://ollama-ctx-test:11434");
+        let (url, body) = build_llm_request(&b, &hi(), None, true, false, Some(16384));
+        assert_eq!(url, "http://ollama-ctx-test:11434/api/chat");
+        assert_eq!(body["options"]["num_ctx"], json!(16384), "{body}");
+        let (_, none) = build_llm_request(&b, &hi(), None, true, false, None);
+        assert!(none.get("options").is_none(), "nothing decided: nothing stamped: {none}");
+    }
+
+    /// An Ollama behind its node agent speaks the OpenAI wire; the agent
+    /// forwards `options` to its translator.
+    #[test]
+    fn an_ollama_behind_its_agent_carries_it_on_the_openai_wire() {
+        let b = backend("ollama", "openai", "https://198.51.100.7:8081");
+        let (url, body) = build_llm_request(&b, &hi(), None, true, false, Some(8192));
+        assert_eq!(url, "https://198.51.100.7:8081/v1/chat/completions");
+        assert_eq!(body["options"]["num_ctx"], json!(8192), "{body}");
+    }
+
+    /// vLLM, llama.cpp and the cloud never get `options`, whatever is passed.
+    #[test]
+    fn no_other_engine_gets_options() {
+        for b in [
+            backend("vllm", "openai", "https://noo-vllm:8000"),
+            backend("llamacpp", "llamacpp", "http://llamacpp-ctx-test:8085"),
+            backend("cloud-openai", "openai", super::super::cloud::OPENAI_BASE_URL),
+            backend("cloud-anthropic", "anthropic", super::super::cloud::ANTHROPIC_BASE_URL),
+        ] {
+            let (_, body) = build_llm_request(&b, &hi(), None, true, false, Some(16384));
+            assert!(body.get("options").is_none(), "{} got options: {body}", b.backend_type);
+        }
+    }
+
+    /// The loop asks the runtime per attempt (a failover may land on another
+    /// node) and hands the answer to the builder.
+    #[test]
+    fn the_loop_resolves_the_context_per_attempt_and_passes_it_in() {
+        let own = crate::test_src::own_code(include_str!("agent_loop.rs"));
+        let f = crate::test_src::fn_body(&own, "async fn send_llm_with_fallback<");
+        let ask = f.find("let num_ctx = rt.chat_num_ctx(backend).await;").expect("asks the runtime");
+        let build = f.find("build_llm_request(backend, messages, tools, stream, enable_thinking, num_ctx)").expect("passes it in");
+        let send = f.find(".json(&body)").expect("sends the body");
+        assert!(ask < build && build < send, "{f}");
     }
 }

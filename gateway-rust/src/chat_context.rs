@@ -229,6 +229,193 @@ pub fn stamp(body: &mut Value, num_ctx: u64) {
     }
 }
 
+/// [`stamp`] when there is a value to stamp.
+pub fn stamp_opt(body: &mut Value, num_ctx: Option<u64>) {
+    if let Some(n) = num_ctx {
+        stamp(body, n);
+    }
+}
+
+// ── the resolver every chat path asks ──────────────────────────────────────
+//
+// One async read per (node, model), held for [`RECHECK_SECS`]: the node's
+// heartbeat record (`mesh_nodes`), its running Ollama chat placement, and its
+// harness profile, read as `routes::cluster::harness_kind_fit` reads them. A
+// request path pays at most one KV + DB read per key per ten minutes, and a
+// chat never fails because of it.
+
+/// How long a decided context is used before the node is read again.
+pub const RECHECK_SECS: u64 = 600;
+/// After a read that left nothing to use (it failed with nothing held, or
+/// the backend's URL named no node), read again this soon rather than run
+/// [`RECHECK_SECS`] with nothing stamped.
+pub const RETRY_SECS: u64 = 60;
+
+/// Whether a backend's chat bodies take `options.num_ctx` at all. vLLM,
+/// llama.cpp and the cloud providers never get `options`.
+pub fn takes_num_ctx(backend_type: &str) -> bool {
+    backend_type == "ollama"
+}
+
+/// What one (node, model) holds between reads.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Held {
+    sticky: Option<Sticky>,
+    at: std::time::Instant,
+    /// The last read failed (and was logged once).
+    failed: bool,
+}
+
+/// What a read of the node found.
+#[derive(Debug, Clone, PartialEq)]
+enum Read {
+    Decided(Decided, FitInputs),
+    /// No node record, or nothing declares a context: nothing is stamped.
+    Nothing,
+    Failed(String),
+}
+
+type HeldMap = std::collections::HashMap<(String, String), Held>;
+static HELD: std::sync::LazyLock<std::sync::Mutex<HeldMap>> = std::sync::LazyLock::new(Default::default);
+type UrlMap = std::collections::HashMap<String, (Option<String>, std::time::Instant)>;
+static NODE_OF_URL: std::sync::LazyLock<std::sync::Mutex<UrlMap>> = std::sync::LazyLock::new(Default::default);
+
+fn held() -> std::sync::MutexGuard<'static, HeldMap> {
+    HELD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn urls() -> std::sync::MutexGuard<'static, UrlMap> {
+    NODE_OF_URL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A held value is used without a read while it is younger than its window:
+/// [`RETRY_SECS`] when a failed read left nothing, else [`RECHECK_SECS`].
+fn fresh(h: &Held, now: std::time::Instant) -> bool {
+    let window = if h.failed && h.sticky.is_none() { RETRY_SECS } else { RECHECK_SECS };
+    now.saturating_duration_since(h.at) < std::time::Duration::from_secs(window)
+}
+
+/// What a read changes: a decision moves the sticky value ([`Sticky::next`]),
+/// nothing declared clears it, a failure keeps what was held.
+fn after_read(prev: Option<Held>, read: &Read, now: std::time::Instant) -> Held {
+    let prev_sticky = prev.and_then(|h| h.sticky);
+    match read {
+        Read::Decided(d, f) => Held { sticky: Some(Sticky::next(prev_sticky, d, f)), at: now, failed: false },
+        Read::Nothing => Held { sticky: None, at: now, failed: false },
+        Read::Failed(_) => Held { sticky: prev_sticky, at: now, failed: true },
+    }
+}
+
+fn same_model(a: &str, b: &str) -> bool {
+    let latest = |n: &str| if n.contains(':') { n.trim().to_string() } else { format!("{}:latest", n.trim()) };
+    latest(a) == latest(b)
+}
+
+/// The env of the running Ollama chat placement that serves `model`: the one
+/// naming it, else the node's first running Ollama chat placement (the
+/// daemon's env is the daemon's, whatever model it loads), else none.
+pub(crate) fn chat_env(placements: &[crate::routes::cluster::StoredPlacement], model: &str) -> Value {
+    let chats: Vec<&crate::routes::cluster::StoredPlacement> =
+        placements.iter().filter(|p| p.backend == "ollama" && p.role == "chat" && p.desired_state == "running").collect();
+    chats
+        .iter()
+        .find(|p| p.model.as_deref().is_some_and(|m| same_model(m, model)))
+        .or_else(|| chats.first())
+        .map(|p| p.env.clone())
+        .unwrap_or_else(|| Value::Object(Default::default()))
+}
+
+/// Read the node as `harness_kind_fit` does, and decide.
+async fn read_node(state: &crate::state::AppState, node_id: &str, model: &str) -> Read {
+    let kv = match state.js.get_key_value("mesh_nodes").await {
+        Ok(kv) => kv,
+        Err(e) => return Read::Failed(format!("mesh_nodes: {e}")),
+    };
+    let record: Value = match kv.get(node_id).await {
+        Ok(Some(e)) => match serde_json::from_slice::<Value>(&e) {
+            Ok(v) => v,
+            Err(e) => return Read::Failed(format!("node record: {e}")),
+        },
+        // No record: nothing reports this node, so nothing declares a context.
+        Ok(None) => return Read::Nothing,
+        Err(e) => return Read::Failed(format!("node record: {e}")),
+    };
+    let placements = match crate::routes::cluster::stored_placements(state, node_id).await {
+        Ok(p) => p,
+        Err(e) => return Read::Failed(format!("placements: {e}")),
+    };
+    let env = chat_env(&placements, model);
+    let tier = crate::node_tier::derive(&crate::node_tier::facts_from_capabilities(record.get("capabilities").unwrap_or(&serde_json::json!({}))))
+        .tier()
+        .and_then(|t| u8::try_from(t).ok());
+    let overrides = match crate::repo::cluster::node_harness_profile_overrides(&state.db, node_id).await {
+        Ok(o) => o,
+        Err(e) => return Read::Failed(format!("harness profile: {e}")),
+    };
+    let profile = crate::harness_profile::resolve(tier, &overrides, None, None);
+    match decide("ollama", &env, model, &record, profile.context) {
+        Some(d) => {
+            let f = fit_inputs(&record, &env, model);
+            Read::Decided(d, f)
+        }
+        None => Read::Nothing,
+    }
+}
+
+/// The `num_ctx` to stamp on a chat body for `model` on `node_id`'s
+/// `backend_type`: `None` for any backend but Ollama, when nothing declares
+/// a context, or when the node cannot be read and nothing is held.
+pub async fn num_ctx_for_node(state: &crate::state::AppState, node_id: &str, backend_type: &str, model: &str) -> Option<u64> {
+    if !takes_num_ctx(backend_type) || node_id.is_empty() || model.trim().is_empty() {
+        return None;
+    }
+    let key = (node_id.to_string(), model.trim().to_string());
+    let now = std::time::Instant::now();
+    let prev = held().get(&key).copied();
+    if let Some(h) = prev.filter(|h| fresh(h, now)) {
+        return h.sticky.map(|s| s.tokens);
+    }
+    let read = read_node(state, node_id, model.trim()).await;
+    if let Read::Failed(why) = &read {
+        if !prev.is_some_and(|h| h.failed) {
+            tracing::debug!(node = node_id, model, error = %why, "chat_context: cannot read the node; the held context stands");
+        }
+    }
+    let next = after_read(prev, &read, now);
+    held().insert(key, next);
+    next.sticky.map(|s| s.tokens)
+}
+
+/// The node a backend URL belongs to, mapped as dispatch maps one
+/// (`coordinator::resolve_node_id`), held like the decision.
+async fn node_of_url(state: &crate::state::AppState, url: &str) -> Option<String> {
+    let now = std::time::Instant::now();
+    let prev = urls().get(url).cloned();
+    if let Some((node, at)) = prev {
+        let window = if node.is_some() { RECHECK_SECS } else { RETRY_SECS };
+        if now.saturating_duration_since(at) < std::time::Duration::from_secs(window) {
+            return node;
+        }
+    }
+    let node = match crate::coordinator::node_from_backend_url(url) {
+        Some(host) => crate::coordinator::resolve_node_id(state, &host).await.ok(),
+        None => None,
+    };
+    urls().insert(url.to_string(), (node.clone(), now));
+    node
+}
+
+/// [`num_ctx_for_node`] for a backend known only by its URL. An Ollama whose
+/// URL names no enrolled node (an agent-less static `OLLAMA_URL`) gets
+/// `None`: nothing declares a context there (a known gap).
+pub async fn num_ctx_for(state: &crate::state::AppState, backend_type: &str, backend_url: &str, model: &str) -> Option<u64> {
+    if !takes_num_ctx(backend_type) {
+        return None;
+    }
+    let node = node_of_url(state, backend_url).await?;
+    num_ctx_for_node(state, &node, backend_type, model).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,5 +490,85 @@ mod tests {
         let profile_only = decide("ollama", &json!({}), "gemma4:e2b", &node, 16384).expect("the tier profile");
         assert_eq!(profile_only.declared, 16384);
         assert!(decide("ollama", &json!({}), "gemma4:e2b", &node, 0).is_none(), "nothing declared: nothing stamped");
+    }
+
+    #[test]
+    fn only_an_ollama_takes_num_ctx_and_none_stamps_nothing() {
+        assert!(takes_num_ctx("ollama"));
+        for b in ["vllm", "llamacpp", "cloud-openai", "cloud-anthropic", "openai", ""] {
+            assert!(!takes_num_ctx(b), "{b}");
+        }
+        let mut b = json!({"model": "m"});
+        stamp_opt(&mut b, None);
+        assert_eq!(b, json!({"model": "m"}), "no options key at all");
+        stamp_opt(&mut b, Some(8192));
+        assert_eq!(b["options"]["num_ctx"], json!(8192));
+    }
+
+    /// The resolver's own gate comes before any read: a vLLM, llama.cpp or
+    /// cloud request never costs a KV or database read, and gets `None`.
+    #[test]
+    fn the_resolver_returns_none_for_a_non_ollama_before_any_read() {
+        let own = crate::test_src::own_code(include_str!("chat_context.rs"));
+        for marker in ["pub async fn num_ctx_for_node(", "pub async fn num_ctx_for("] {
+            let f = crate::test_src::fn_body(&own, marker);
+            let gate = f.find("if !takes_num_ctx(backend_type)").unwrap_or_else(|| panic!("{marker} has no gate: {f}"));
+            let ret = f[gate..].find("return None;").map(|i| gate + i).expect("the gate returns None");
+            let first_await = f.find(".await").expect("it reads");
+            assert!(ret < first_await, "{marker}: the gate must return before the first read:\n{f}");
+        }
+    }
+
+    #[test]
+    fn a_read_moves_the_held_value_a_failure_keeps_it_and_nothing_declared_clears_it() {
+        let t0 = std::time::Instant::now();
+        let d = |tokens, declared| Decided { tokens, declared, source: String::new(), capped: None, slots: 4 };
+        let f = stranger(None);
+        let first = after_read(None, &Read::Decided(d(16384, 16384), f), t0);
+        assert_eq!(first.sticky, Some(Sticky { tokens: 16384, declared: 16384 }));
+        assert!(!first.failed);
+        let kept = after_read(Some(first), &Read::Failed("kv down".into()), t0);
+        assert_eq!(kept.sticky, first.sticky, "a failed read keeps what was held");
+        assert!(kept.failed);
+        assert_eq!(after_read(Some(first), &Read::Nothing, t0).sticky, None, "nothing declared: nothing stamped");
+        assert_eq!(after_read(None, &Read::Failed("x".into()), t0).sticky, None, "nothing held: None, never an error");
+    }
+
+    #[test]
+    fn a_held_value_is_reread_after_ten_minutes_and_an_empty_failure_after_one() {
+        let t0 = std::time::Instant::now();
+        let ok = Held { sticky: Some(Sticky { tokens: 8192, declared: 8192 }), at: t0, failed: false };
+        assert!(fresh(&ok, t0 + std::time::Duration::from_secs(RECHECK_SECS - 1)));
+        assert!(!fresh(&ok, t0 + std::time::Duration::from_secs(RECHECK_SECS)));
+        let held_through_failure = Held { failed: true, ..ok };
+        assert!(fresh(&held_through_failure, t0 + std::time::Duration::from_secs(RETRY_SECS + 1)), "a held value rides out a failure");
+        let empty = Held { sticky: None, at: t0, failed: true };
+        assert!(fresh(&empty, t0 + std::time::Duration::from_secs(RETRY_SECS - 1)));
+        assert!(!fresh(&empty, t0 + std::time::Duration::from_secs(RETRY_SECS)));
+        const { assert!(RECHECK_SECS == 600 && RETRY_SECS < RECHECK_SECS) };
+    }
+
+    #[test]
+    fn the_env_is_the_running_ollama_chat_placement_that_serves_the_model() {
+        use crate::routes::cluster::StoredPlacement;
+        let p = |backend: &str, role: &str, model: Option<&str>, ctx: &str, state: &str| StoredPlacement {
+            backend: backend.into(),
+            role: role.into(),
+            model: model.map(str::to_string),
+            env: json!({"OLLAMA_CONTEXT_LENGTH": ctx}),
+            desired_state: state.into(),
+            target: None,
+            keep_warm: false,
+        };
+        let rows = vec![
+            p("vllm", "chat", Some("gemma4"), "1", "running"),
+            p("ollama", "embed", Some("gemma4"), "2", "running"),
+            p("ollama", "chat", Some("gemma4"), "3", "stopped"),
+            p("ollama", "chat", Some("qwen3:4b"), "4", "running"),
+            p("ollama", "chat", Some("gemma4:latest"), "5", "running"),
+        ];
+        assert_eq!(chat_env(&rows, "gemma4")["OLLAMA_CONTEXT_LENGTH"], json!("5"), "the one naming it (`:latest` the same)");
+        assert_eq!(chat_env(&rows, "llama3.2:3b")["OLLAMA_CONTEXT_LENGTH"], json!("4"), "else the daemon's first running chat placement");
+        assert_eq!(chat_env(&rows[..3], "gemma4"), json!({}), "no running ollama chat placement: no env");
     }
 }

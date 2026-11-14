@@ -4778,7 +4778,7 @@ async fn harness_kind_fit(
     Ok((crate::harness_fit::judge(floor, window), chat))
 }
 
-async fn stored_placements(state: &AppState, node_id: &str) -> Result<Vec<StoredPlacement>, AppError> {
+pub(crate) async fn stored_placements(state: &AppState, node_id: &str) -> Result<Vec<StoredPlacement>, AppError> {
     let rows: Vec<(String, String, Option<String>, Value, String, Option<String>, bool)> = sqlx::query_as(
         "SELECT backend, role, model, env, desired_state, target, keep_warm FROM noo_backend_placements WHERE node_id = $1 ORDER BY backend, role",
     )

@@ -80,6 +80,13 @@ pub(crate) trait HarnessRuntime: Sync {
     fn phase_via(&self) -> &'static str {
         "gateway"
     }
+    /// The context to stamp as `options.num_ctx` on a chat body for
+    /// `backend` (i802, `chat_context::num_ctx_for`). `None` = stamp nothing:
+    /// any backend but Ollama, nothing declared, or a runtime that cannot
+    /// read the cluster (a node harness has no database; a known gap).
+    async fn chat_num_ctx(&self, _backend: &ResolvedBackend) -> Option<u64> {
+        None
+    }
     /// A cloud model, single turn, no tools. NOT the loop's path: the loop
     /// resolves a cloud model to a cloud backend and runs it with tools
     /// (i83 phase C). Kept for the harness rail's `CloudRun` op.
@@ -242,6 +249,10 @@ impl HarnessRuntime for InProcessRuntime<'_> {
         super::backend::resolve_backend_excluding(self.state, model, exclude_urls).await
     }
 
+    async fn chat_num_ctx(&self, backend: &ResolvedBackend) -> Option<u64> {
+        crate::chat_context::num_ctx_for(self.state, &backend.backend_type, &backend.url, &backend.model).await
+    }
+
     async fn route_facts(&self, url: &str, backend: &str) -> Option<(String, Option<super::classes::Slots>)> {
         // A static or discovered backend is on no live node's record: name
         // its host, slots unknown.
@@ -387,8 +398,11 @@ impl HarnessRuntime for InProcessRuntime<'_> {
             let conv_id = conversation_id.to_string();
             let url = backend.url.clone();
             let model = backend.model.clone();
+            // The same context the turn ran at, so the summary never reloads
+            // the model at another one (i802).
+            let num_ctx = crate::chat_context::num_ctx_for(self.state, &backend.backend_type, &backend.url, &backend.model).await;
             tokio::spawn(async move {
-                super::summary::generate_running_summary(db, url, model, conv_id, current_turn).await;
+                super::summary::generate_running_summary(db, url, model, conv_id, current_turn, num_ctx).await;
             });
         }
     }

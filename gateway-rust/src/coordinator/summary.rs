@@ -69,6 +69,7 @@ pub(super) async fn generate_running_summary(
     vllm_model: String,
     conversation_id: String,
     current_turn: u32,
+    num_ctx: Option<u64>,
 ) {
     let history = match session::load_session(&db, &conversation_id, 40).await {
         Ok(h) => h,
@@ -100,7 +101,7 @@ pub(super) async fn generate_running_summary(
          New conversation transcript:\n{transcript}"
     );
 
-    let body = json!({
+    let mut body = json!({
         "model": vllm_model,
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -109,6 +110,9 @@ pub(super) async fn generate_running_summary(
         "max_tokens": 1024,
         "stream": false,
     });
+    // `Some` only for an Ollama (the caller resolved it for this backend):
+    // the turn's own context, so the summary never reloads the model (i802).
+    crate::chat_context::stamp_opt(&mut body, num_ctx);
 
     let client = crate::tls::cluster_client();
 
@@ -297,5 +301,26 @@ mod temporal_extract_payload_tests {
         assert_eq!(p.len(), 1, "an empty assistant reply is not extracted");
         assert!(p[0]["org_id"].is_null());
         assert_eq!(p[0]["message_text"], "hello");
+    }
+}
+
+#[cfg(test)]
+mod num_ctx_tests {
+    /// i802: the running summary goes to the turn's own model at the turn's
+    /// own context (resolved by the runtime before the spawn), stamped on
+    /// the body before it is sent, so a summary never reloads the model.
+    #[test]
+    fn the_summary_body_is_stamped_before_it_is_sent() {
+        let own = crate::test_src::own_code(include_str!("summary.rs"));
+        let f = crate::test_src::fn_body(&own, "pub(super) async fn generate_running_summary(");
+        let stamp = f.find("crate::chat_context::stamp_opt(&mut body, num_ctx);").expect("stamps");
+        let send = f.find(".json(&body)").expect("sends");
+        assert!(stamp < send, "{f}");
+        let rt = crate::test_src::own_code(include_str!("runtime.rs"));
+        let m = crate::test_src::fn_body(&rt, "async fn maybe_regenerate_summary(&self, conversation_id: &str, backend: &ResolvedBackend, current_turn: u32) {");
+        assert!(m.contains("crate::chat_context::num_ctx_for(self.state, &backend.backend_type, &backend.url, &backend.model).await"), "{m}");
+        assert!(m.contains("generate_running_summary(db, url, model, conv_id, current_turn, num_ctx)"), "{m}");
+        let ask = crate::test_src::fn_body(&rt, "async fn chat_num_ctx(&self, backend: &ResolvedBackend)");
+        assert!(ask.contains("crate::chat_context::num_ctx_for(self.state, &backend.backend_type, &backend.url, &backend.model).await"), "the loop's runtime resolves: {ask}");
     }
 }

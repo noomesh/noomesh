@@ -361,7 +361,9 @@ async fn native_inference(
                 let model = if node_from_model { model_name } else { req.model.clone().unwrap_or(model_name) };
 
                 let started = std::time::Instant::now();
-                let sampling = Sampling { max_tokens: req.max_tokens, temperature: req.temperature };
+                // The node's decided context (i802), when its chat is an Ollama.
+                let num_ctx = crate::chat_context::num_ctx_for_node(&state, node_id, &backend_type, &model).await;
+                let sampling = Sampling { max_tokens: req.max_tokens, temperature: req.temperature, num_ctx };
                 match chat_completion_on_node(&backend_type, &model, &base_url, &req.prompt, sampling).await {
                     // The node answered, with nothing: not a success, and not
                     // a stall either (no demotion, no pool retry of the same
@@ -692,7 +694,7 @@ pub(crate) async fn chat_completion_on_node(
     sampling: Sampling,
 ) -> Result<ChatAnswer, String> {
     let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
-    let mut body = pinned_chat_body(model, prompt, sampling);
+    let mut body = pinned_chat_body(backend_type, model, prompt, sampling);
     // A pinned chat is a plain model call: thinking off, on the engine's own
     // switch (the node agent forwards it; ollama's translator maps it to
     // `think: false`), so the budget goes to the answer (120).
@@ -790,6 +792,9 @@ pub(crate) fn empty_answer_body(finish_reason: Option<&str>, reasoning: Option<&
 pub(crate) struct Sampling {
     pub max_tokens: Option<u32>,
     pub temperature: Option<f64>,
+    /// The node's decided context (`chat_context::num_ctx_for_node`, i802),
+    /// stamped as `options.num_ctx` on an Ollama only.
+    pub num_ctx: Option<u64>,
 }
 
 /// The pinned path's `max_tokens` when the caller sends none.
@@ -801,13 +806,21 @@ pub(crate) const PINNED_DEFAULT_TEMPERATURE: f64 = 0.7;
 /// 0.7 here, so `noo inference run -n X --max-tokens 1 -t 0` ran up to 256
 /// tokens at 0.7 on the pinned node, while the same request honoured both
 /// when the pin was unmet and the pool answered on the raw path (i305).
-pub(crate) fn pinned_chat_body(model: &str, prompt: &str, sampling: Sampling) -> Value {
-    json!({
+///
+/// An Ollama's body also carries the node's decided context as
+/// `options.num_ctx` (the node agent hands `options` to its translator); no
+/// other engine gets `options`.
+pub(crate) fn pinned_chat_body(backend_type: &str, model: &str, prompt: &str, sampling: Sampling) -> Value {
+    let mut body = json!({
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": sampling.max_tokens.unwrap_or(PINNED_DEFAULT_MAX_TOKENS),
         "temperature": sampling.temperature.unwrap_or(PINNED_DEFAULT_TEMPERATURE),
-    })
+    });
+    if crate::chat_context::takes_num_ctx(backend_type) {
+        crate::chat_context::stamp_opt(&mut body, sampling.num_ctx);
+    }
+    body
 }
 
 /// What a pinned chat can get from a named node.
@@ -1599,7 +1612,7 @@ async fn native_inference_stream(
         json!({"role": "user", "content": req.prompt}),
     ];
 
-    let body = match backend.api_format.as_str() {
+    let mut body = match backend.api_format.as_str() {
         "ollama" => json!({
             "model": backend.model,
             "messages": messages,
@@ -1616,6 +1629,12 @@ async fn native_inference_stream(
             "stream_options": {"include_usage": true},
         }),
     };
+    // The decided context (i802): an Ollama's native body, or its OpenAI
+    // body through the node agent (which hands `options` to its
+    // translator). `None` for every other engine.
+    if let Some(n) = crate::chat_context::num_ctx_for(&state, &backend.backend_type, &backend.url, &backend.model).await {
+        crate::chat_context::stamp(&mut body, n);
+    }
 
     // Stream the response from the backend as SSE.
     // Add X-Noo-Backend hint for node-agent proxy URLs.
@@ -2080,7 +2099,7 @@ mod pinned_sampling_tests {
         let (base, seen) = node().await;
         let text = chat_completion_on_node(
             "vllm", "m", &base, "Reply with one word: ok",
-            Sampling { max_tokens: Some(1), temperature: Some(0.0) },
+            Sampling { max_tokens: Some(1), temperature: Some(0.0), num_ctx: None },
         )
         .await
         .expect("the node answered");
@@ -2298,5 +2317,47 @@ mod chat_stream_tests {
         assert!(h.contains("let principal = crate::bus_principal::current();") && h.contains("let view = crate::perspective::current();"));
         assert!(h.contains("chat_sse_body(rx, AbortTurnOnDrop(task.abort_handle()))"), "the body must hold the abort guard");
         assert!(h.contains("chat_turn_identity("), "identity from the subject only");
+    }
+}
+
+#[cfg(test)]
+mod num_ctx_tests {
+    use super::{pinned_chat_body, Sampling};
+    use serde_json::json;
+
+    /// i802: a pinned chat to an Ollama carries the node's decided context;
+    /// no other engine's body gets `options`.
+    #[test]
+    fn a_pinned_ollama_chat_carries_the_decided_context_and_nothing_else_does() {
+        let s = Sampling { num_ctx: Some(16384), ..Sampling::default() };
+        assert_eq!(pinned_chat_body("ollama", "gemma4:e2b", "hi", s)["options"]["num_ctx"], json!(16384));
+        for bt in ["vllm", "llamacpp"] {
+            assert!(pinned_chat_body(bt, "m", "hi", s).get("options").is_none(), "{bt}");
+        }
+        assert!(pinned_chat_body("ollama", "m", "hi", Sampling::default()).get("options").is_none(), "nothing decided");
+    }
+
+    /// Both pinned callers resolve the node's context before the call, and
+    /// the streaming route stamps its body (native or OpenAI wire) before it
+    /// is sent.
+    #[test]
+    fn the_pinned_and_streaming_paths_resolve_and_stamp_before_sending() {
+        let code = crate::test_src::own_code(include_str!("inference.rs"));
+        let f = crate::test_src::fn_body(&code, "async fn native_inference(");
+        let ask = f.find("crate::chat_context::num_ctx_for_node(&state, node_id, &backend_type, &model).await").expect("resolves");
+        let call = f.find("chat_completion_on_node(&backend_type, &model, &base_url, &req.prompt, sampling)").expect("calls");
+        assert!(ask < call, "{f}");
+        let node = crate::test_src::fn_body(&code, "pub(crate) async fn chat_completion_on_node(");
+        assert!(node.contains("pinned_chat_body(backend_type, model, prompt, sampling)"), "{node}");
+        let st = crate::test_src::fn_body(&code, "async fn native_inference_stream(");
+        let stamp = st.find("crate::chat_context::stamp(&mut body, n)").expect("stamps");
+        let send = st.find(".json(&body)").expect("sends");
+        assert!(stamp < send, "{st}");
+        assert!(st.contains("crate::chat_context::num_ctx_for(&state, &backend.backend_type, &backend.url, &backend.model).await"), "{st}");
+        let tools = crate::test_src::own_code(include_str!("../tools.rs"));
+        let t = crate::test_src::fn_body(&tools, "async fn native_inference_tool(");
+        let ask = t.find("crate::chat_context::num_ctx_for_node(state, node_id, &backend_type, &model_used).await").expect("the tool resolves");
+        let call = t.find("chat_completion_on_node(&backend_type, &model_used, &base_url, &prompt, sampling)").expect("and passes it");
+        assert!(ask < call, "{t}");
     }
 }
