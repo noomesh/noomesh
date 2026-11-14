@@ -4170,7 +4170,8 @@ async fn desired_config_get(
     };
     // i802: the decided context per Ollama chat model, from the same record
     // and profile context the harness fit reads (chat_context::decide).
-    let chat_context_detail = chat_context_rows(&placement_json, &record, profile_context);
+    let stack = (crate::chat_context::is_self_node(&node_id), crate::chat_context::compose_slots(&*state.config_yaml.read().await));
+    let chat_context_detail = chat_context_rows(&placement_json, &record, profile_context, stack);
     let chat_contexts = chat_contexts_map(&chat_context_detail);
 
     let node_json = match node {
@@ -4248,7 +4249,7 @@ async fn desired_config_get(
 /// when nothing declares a context (`chat_context::decide` is `None`: the
 /// daemon keeps its own setting); `running` and `ceiling` are null when the
 /// node does not report them. A model placed twice is listed once.
-pub(crate) fn chat_context_rows(placements: &[Value], record: &Value, profile_context: u64) -> Vec<Value> {
+pub(crate) fn chat_context_rows(placements: &[Value], record: &Value, profile_context: u64, stack: (bool, Option<u64>)) -> Vec<Value> {
     let mut seen = std::collections::BTreeSet::new();
     placements
         .iter()
@@ -4258,7 +4259,8 @@ pub(crate) fn chat_context_rows(placements: &[Value], record: &Value, profile_co
             seen.insert(model.to_string()).then(|| (model.to_string(), &p["env"]))
         })
         .map(|(model, env)| {
-            let d = crate::chat_context::decide("ollama", env, &model, record, profile_context);
+            let env = crate::chat_context::with_stack_slots(env, stack.0, stack.1);
+            let d = crate::chat_context::decide("ollama", &env, &model, record, profile_context);
             json!({
                 "model": model,
                 "running": crate::chat_context::running_context(record, &model),
@@ -9618,7 +9620,7 @@ mod chat_context_detail_tests {
             json!({"backend": "ollama", "role": "chat", "model": "old:7b", "env": {}, "desired_state": "stopped"}),
             json!({"backend": "ollama", "role": "chat", "model": "qwen3:4b", "env": {}, "desired_state": "running"}),
         ];
-        let rows = chat_context_rows(&placements, &record(), 0);
+        let rows = chat_context_rows(&placements, &record(), 0, (false, None));
         assert_eq!(rows.len(), 2, "{rows:?}");
         let r = &rows[0];
         let d = crate::chat_context::decide("ollama", &placements[0]["env"], "gemma4:e2b", &record(), 0).expect("decided");
@@ -9634,9 +9636,9 @@ mod chat_context_detail_tests {
         assert!(q["decided"].is_null() && q["running"].is_null() && q["ceiling"].is_null(), "{q}");
 
         assert_eq!(chat_contexts_map(&rows), Some(json!({"gemma4:e2b": d.tokens})), "decided rows only");
-        let profile = chat_context_rows(&placements[5..], &record(), 16384);
+        let profile = chat_context_rows(&placements[5..], &record(), 16384, (false, None));
         assert_eq!(profile[0]["declared"], json!(16384), "the tier profile's context declares it");
-        assert!(chat_contexts_map(&chat_context_rows(&placements[2..5], &record(), 16384)).is_none(), "nothing decided: the key is omitted");
+        assert!(chat_contexts_map(&chat_context_rows(&placements[2..5], &record(), 16384, (false, None))).is_none(), "nothing decided: the key is omitted");
     }
 
     /// desired-config sends both: the detail for `noo cluster show` and the
@@ -9645,7 +9647,7 @@ mod chat_context_detail_tests {
     fn desired_config_carries_the_detail_and_the_map_only_when_decided() {
         let own = crate::test_src::own_code(include_str!("cluster.rs"));
         let body = crate::test_src::fn_body(&own, "async fn desired_config_get(");
-        assert!(body.contains("chat_context_rows(&placement_json, &record, profile_context)"), "computed from the placements served");
+        assert!(body.contains("chat_context_rows(&placement_json, &record, profile_context, stack)"), "computed from the placements served");
         assert!(body.contains("\"chat_context_detail\": chat_context_detail,"));
         assert!(body.contains("if let Some(map) = chat_contexts \u{7b}\n        body[\"chat_contexts\"] = map;"), "only Some sets the key");
     }
