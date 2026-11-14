@@ -28,6 +28,8 @@ Retired in 0.6.12 (each still answers with its successor instead of "unknown com
 
 `noo cluster desired <node>` is an alias of `noo cluster show <node>`; `show` ends with the desired config and placements.
 
+`noo cluster show <node>` prints a **Chat context** line per chat model on an Ollama: `running` is the context the daemon runs the model at now (`?` when the node does not report it), `decided` is the one context every chat call to that Ollama asks for (the placement's `OLLAMA_CONTEXT_LENGTH`, else the tier profile's context, capped by the model's ceiling), and `capped` says why memory took it below that, with the numbers. `--json` carries the rows as `chat_contexts`.
+
 ## Recipes
 
 ### Enroll a node end to end

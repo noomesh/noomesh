@@ -211,6 +211,7 @@ mod mesh;
 mod metrics;
 mod middleware;
 mod model_capabilities;
+mod chat_context;
 mod node_tier;
 mod operator_alert;
 mod posture;

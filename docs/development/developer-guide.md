@@ -33,7 +33,8 @@ docker/                  every Dockerfile (deps-core, deps-base, gateway-rust, w
 docker-compose.cluster.yml   the one compose file; docker-compose.dist.yml is the pull-only overlay
 skills/                  builtins/ and examples/ containerised skills (manifest.yml + run.py)
 config/tools.json        the exported tool registry the gateway reads (regenerate with `noo tools export`)
-prompts/                 the live coordinator system prompt (coordinator.md) + skills/{core,evolved}
+prompts/                 the live coordinator system prompt + skills/{core,evolved}: coordinator-core.md is always
+                         sent; coordinator-full-extra.md rides only with the Full prompt tier
                          (loaded by gateway-rust/src/prompt_skills.rs)
 plugins/weather          a sample plugin only; the live plugin dir is NOO_PLUGIN_DIR or ~/.noo/plugins
 tests/                   pytest suite (unit) and tests/integration/ (needs a running gateway)

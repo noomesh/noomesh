@@ -64,11 +64,38 @@ pub struct UsageStats {
     pub total_tokens: u32,
     pub total_tool_calls: u32,
     pub total_latency_ms: u64,
+    /// The backend cut a call's prompt (i802 D): the worst call of the turn;
+    /// `None` when every call was read whole or nothing could tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<Truncation>,
+}
+
+/// One model call whose prompt the backend cut: the loop's own estimate of
+/// what it sent (`estimate_tokens`, raw), what the backend reports
+/// evaluating (Ollama's `prompt_eval_count`), and the context it ran at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Truncation {
+    pub sent_estimate: u64,
+    pub evaluated: u64,
+    pub context: u64,
+}
+
+impl Truncation {
+    /// The worse of two cuts: the smaller share of the prompt read.
+    fn worse(self, other: Truncation) -> Truncation {
+        // other.evaluated / other.sent < self.evaluated / self.sent, without division.
+        if u128::from(other.evaluated) * u128::from(self.sent_estimate) < u128::from(self.evaluated) * u128::from(other.sent_estimate) {
+            other
+        } else {
+            self
+        }
+    }
 }
 
 /// The `done` frame: the turn's accounting, plus `recall` when the recall
 /// layer ran -- a skipped recall carries its reason so the console can say
-/// the answer was given without memory (ws-protocol.md §2B).
+/// the answer was given without memory (ws-protocol.md §2B) -- and
+/// `truncated` + `truncation` when a backend cut the prompt (i802 D).
 fn done_frame(result: &CoordinatorResult, usage: &UsageStats) -> Value {
     let mut frame = json!({
         "iterations": result.iterations,
@@ -80,6 +107,10 @@ fn done_frame(result: &CoordinatorResult, usage: &UsageStats) -> Value {
     });
     if let Some(r) = &result.recall {
         frame["recall"] = json!(r);
+    }
+    if let Some(t) = usage.truncated {
+        frame["truncated"] = json!(true);
+        frame["truncation"] = json!(t);
     }
     frame
 }
@@ -384,7 +415,7 @@ pub(super) async fn fire_post_response_hooks(
 // ═══════════════════════════════════════════════════════════════
 
 /// Core tools always included in every request.
-const CORE_TOOLS: &[&str] = &[
+pub(super) const CORE_TOOLS: &[&str] = &[
     "noo_tool_search",
     "noo_rag_query",
     "noo_rag_ingest",       // save→knowledge workflow needs this
@@ -398,7 +429,7 @@ const CORE_TOOLS: &[&str] = &[
 
 /// Tool groups with trigger keywords.
 /// Format: (group_name, tool_names, keywords)
-const TOOL_GROUPS: &[(&str, &[&str], &[&str])] = &[
+pub(super) const TOOL_GROUPS: &[(&str, &[&str], &[&str])] = &[
     ("rag", &["noo_rag_ingest", "noo_rag_status", "noo_docs_list", "noo_memory_health"],
      &["ingest", "document", "upload", "rag", "knowledge base", "pageindex", "embed", "index"]),
     ("graph", &["noo_graph_search_entities", "noo_graph_entity_detail", "noo_graph_neighbors",
@@ -528,6 +559,7 @@ fn build_llm_request(
     tools: Option<&[Value]>,
     stream: bool,
     enable_thinking: bool,
+    num_ctx: Option<u64>,
 ) -> (String, Value) {
     let cloud = super::backend::is_cloud_backend(backend);
     match super::backend::wire_format(backend) {
@@ -552,6 +584,8 @@ fn build_llm_request(
                     body["tools"] = Value::Array(tools.to_vec());
                 }
             }
+            // The decided context (i802); an Ollama without one ran 4,096.
+            crate::chat_context::stamp_opt(&mut body, num_ctx);
             (url, body)
         }
         "llamacpp" => {
@@ -624,6 +658,12 @@ fn build_llm_request(
             // Explicitly set true/false — some models (Qwen3.5) don't produce
             // <think> tags without an explicit enable_thinking=true.
             body["chat_template_kwargs"] = json!({"enable_thinking": enable_thinking});
+            // An Ollama behind its node agent speaks this wire; the agent
+            // hands `options` to its translator, which merges them (i802).
+            // Never on any other engine.
+            if crate::chat_context::takes_num_ctx(&backend.backend_type) {
+                crate::chat_context::stamp_opt(&mut body, num_ctx);
+            }
             (url, body)
         }
     }
@@ -1197,7 +1237,10 @@ fn request_size(messages: &[Value], tools: &[Value], data_frame: Option<&str>, w
     }
 }
 
-fn log_request_size(size: &RequestSize, path: &'static str) {
+/// The line also carries the backend's calibration (i802 PR-2): the ratio
+/// learned so far (1.0 before any sample) and how many samples taught it.
+/// Token counts only, never content.
+fn log_request_size(size: &RequestSize, calib: &crate::chat_context::Calibration, path: &'static str) {
     tracing::info!(
         path,
         system = size.system,
@@ -1208,12 +1251,129 @@ fn log_request_size(size: &RequestSize, path: &'static str) {
         tool_tokens = size.tool_tokens,
         total = size.total,
         window = size.window,
+        calib_ratio = calib.ratio,
+        calib_samples = calib.samples,
         "request_size"
     );
 }
 
+/// The window a turn is fitted to (i802 A).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TurnWindow {
+    /// The backend's own context, when known: the `num_ctx` an Ollama call
+    /// is stamped with, else a vLLM / llama.cpp placement's engine window.
+    ctx: Option<u64>,
+    /// The prompt budget, in the backend's tokens.
+    max_input: usize,
+}
+
+/// `coordinator.max_context_tokens` wins when set; else the backend's own
+/// context less its reserve ([`crate::chat_context::max_input_for`]); else
+/// the old global window (`VLLM_MAX_MODEL_LEN` less `VLLM_MAX_TOKENS`, at
+/// least 2,048).
+fn turn_window(override_tokens: Option<u32>, backend_ctx: Option<u64>, global_len: u32, global_reserve: u32) -> TurnWindow {
+    let max_input = match (override_tokens, backend_ctx) {
+        (Some(n), _) => n as usize,
+        (None, Some(ctx)) => crate::chat_context::max_input_for(ctx) as usize,
+        (None, None) => global_len.saturating_sub(global_reserve).max(2048) as usize,
+    };
+    TurnWindow { ctx: backend_ctx, max_input }
+}
+
+/// The backend's own context, as the turn's first call will run it: the
+/// stamped `num_ctx` on an Ollama, else the engine window of a vLLM or
+/// llama.cpp placement. `None` for a cloud backend or when nothing says.
+async fn backend_context<R: HarnessRuntime>(rt: &R, backend: &ResolvedBackend) -> Option<u64> {
+    if super::backend::is_cloud_backend(backend) {
+        return None;
+    }
+    match rt.chat_num_ctx(backend).await {
+        Some(n) => Some(n),
+        None => rt.chat_window(backend).await,
+    }
+}
+
+/// The prompt tier a window affords (`coordinator::context::PromptTier`).
+type WindowTier = super::context::PromptTier;
+
+/// Below this prompt budget (in the backend's tokens) a known small
+/// context would take the compact tier.
+const COMPACT_TIER_BELOW: usize = 8192;
+
+fn prompt_tier(window: &TurnWindow) -> WindowTier {
+    if window.ctx.is_some() && window.max_input < COMPACT_TIER_BELOW {
+        WindowTier::Compact
+    } else {
+        WindowTier::Full
+    }
+}
+
+/// The persona for the turn's tier. Compact is the core file (the five
+/// safety rules pinned in it); a Full tier, or no prompts dir found, is the
+/// configured persona as before.
+async fn tier_persona<R: HarnessRuntime>(rt: &R, tier: WindowTier) -> String {
+    if tier == WindowTier::Compact {
+        let core = super::context::persona_for(WindowTier::Compact);
+        if !core.trim().is_empty() {
+            return core;
+        }
+    }
+    rt.persona_prompt().await
+}
+
+/// A Compact tier keeps only its core tools from `CORE_TOOLS` (the
+/// keyword groups' tools stay: the person's words asked for them).
+fn tier_tools(schemas: Vec<Value>, tier: WindowTier) -> Vec<Value> {
+    if tier != WindowTier::Compact {
+        return schemas;
+    }
+    let keep = super::context::core_tools_for(WindowTier::Compact);
+    schemas
+        .into_iter()
+        .filter(|s| {
+            let name = s.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("");
+            !CORE_TOOLS.contains(&name) || keep.contains(&name)
+        })
+        .collect()
+}
+
+/// What a turn cannot do without (raw estimate): its system messages, the
+/// person's own message, and the tool schemas.
+fn instructions_estimate(messages: &[Value], prompt: &str, tool_tokens: usize) -> usize {
+    let system: Vec<Value> = messages.iter().filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("system")).cloned().collect();
+    estimate_tokens(&system) + estimate_tokens(&[json!({"role": "user", "content": prompt})]) + tool_tokens
+}
+
+/// The context to name when a turn is refused (i802 PR-2, step 5): only a
+/// context the backend itself runs (never the global guess, never under an
+/// operator's override), and only when the instructions and the question
+/// alone exceed the prompt budget ([`crate::chat_context::instructions_overflow`]).
+fn window_refusal_ctx(window: &TurnWindow, overridden: bool, need_estimate: usize, calib: crate::chat_context::Calibration) -> Option<u64> {
+    let ctx = window.ctx.filter(|_| !overridden)?;
+    crate::chat_context::instructions_overflow(need_estimate as u64, window.max_input as u64, calib).then_some(ctx)
+}
+
+/// The one line a refused turn shows the person.
+fn too_small_line(model: &str, node: &str, ctx: u64) -> String {
+    format!(
+        "{model} on {node} runs a {ctx}-token context, too small for its instructions and this question. \
+         Give it a larger context where the box's memory allows, or pick a model with a larger one: noo models switch <model>"
+    )
+}
+
+/// The person's latest message: the last `role:"user"` message that is not
+/// the harness's own nudge (a nudge travels as a user message, prefixed
+/// [`NUDGE_PREFIX`]).
+fn latest_question(messages: &[Value]) -> Option<usize> {
+    messages.iter().rposition(|m| {
+        m.get("role").and_then(|r| r.as_str()) == Some("user")
+            && !m.get("content").and_then(|c| c.as_str()).is_some_and(|c| c.starts_with(NUDGE_PREFIX))
+    })
+}
+
 /// Truncate messages to fit within the model's context window.
 /// Keeps system message + last N messages, drops oldest middle messages.
+/// The person's latest question is never dropped nor shortened.
 /// Fit messages into the context window, returning dropped messages so
 /// callers can build a synthetic summary (Option A for long conversations).
 fn fit_context_window(messages: &mut Vec<Value>, max_input_tokens: usize, tool_tokens: usize) -> Vec<Value> {
@@ -1273,6 +1433,9 @@ fn fit_context_window(messages: &mut Vec<Value>, max_input_tokens: usize, tool_t
     }
     let tail = &non_system[tail_start..];
     let mut middle: Vec<Value> = non_system[..tail_start].to_vec();
+    // The person's latest question is never dropped (i802 PR-2): a long
+    // agentic turn can push it out of the MAX_TAIL tail into the middle.
+    let mut pinned: Option<usize> = latest_question(&non_system).filter(|i| *i < tail_start);
 
     // Pre-compress oversized tool results in the middle BEFORE attempting to
     // drop messages. Heuristic version of layer-3 — losing a tool_result
@@ -1314,7 +1477,12 @@ fn fit_context_window(messages: &mut Vec<Value>, max_input_tokens: usize, tool_t
         if estimate_tokens(&combined) <= budget {
             break;
         }
-        dropped_msgs.push(middle.remove(0));
+        let victim = if pinned == Some(0) { 1 } else { 0 };
+        if victim >= middle.len() {
+            break;
+        }
+        dropped_msgs.push(middle.remove(victim));
+        pinned = pinned.map(|p| if victim < p { p - 1 } else { p });
     }
 
     let dropped = dropped_msgs.len();
@@ -1334,10 +1502,13 @@ fn fit_context_window(messages: &mut Vec<Value>, max_input_tokens: usize, tool_t
     // If still over budget, truncate large message content (any role) to 1000 chars.
     // This preserves the conversation thread while shedding bulky content.
     if estimate_tokens(messages) > budget {
-        // Skip the last message (current user prompt) — always keep that intact
+        // Skip the last message and the person's latest question (after a
+        // tool result the last message is the result, not the question;
+        // i802 PR-2) — always keep those intact
         let last_idx = messages.len().saturating_sub(1);
+        let question = latest_question(messages);
         for (i, m) in messages.iter_mut().enumerate() {
-            if i == last_idx { continue; }
+            if i == last_idx || Some(i) == question { continue; }
             let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
             // Never truncate the first system message (persona + injected context)
             if role == "system" && i == 0 { continue; }
@@ -1528,6 +1699,120 @@ pub fn backend_failover_alert(target: &str, detail: impl Into<String>) -> crate:
     .investigate("noo cluster status")
 }
 
+/// The backend-cut alert (i802 D), authored in one place for both runtimes
+/// like [`backend_failover_alert`]: a fixed summary, the evidence (backend,
+/// model, the numbers) in `detail`. `target` is the backend, so the cooldown
+/// is one alert per backend.
+pub fn backend_cut_alert(target: &str, detail: impl Into<String>) -> crate::operator_alert::OperatorAlert {
+    crate::operator_alert::OperatorAlert::new(
+        BACKEND_CUT_ALERT_KIND,
+        target,
+        "⚠️ A local model's context is smaller than the chat prompt the coordinator \
+         sends it, and its backend cut the prompt: answers were made without most of \
+         their instructions. Give the model a larger context where the box's memory \
+         allows, or pick a model with a larger one.",
+    )
+    .detail(detail)
+    .investigate("noo cluster status")
+}
+
+/// The alert kind a cut prompt raises (a node harness may raise it too).
+pub const BACKEND_CUT_ALERT_KIND: &str = "coordinator.context_truncated_by_backend";
+
+/// One alert per backend per day: the condition holds until the operator
+/// changes the context, and every turn on that backend would raise it.
+const BACKEND_CUT_ALERT_COOLDOWN_SECS: i64 = 86_400;
+
+/// Record a cut call on the turn (the worst one is kept) and say so: a warn
+/// log and one operator alert per backend per day. Never silent (P3).
+/// Token counts only, never content.
+async fn note_backend_cut<R: HarnessRuntime>(rt: &R, usage: &mut UsageStats, backend: &ResolvedBackend, cut: Truncation) {
+    usage.truncated = Some(match usage.truncated {
+        Some(t) => t.worse(cut),
+        None => cut,
+    });
+    let url = crate::redact::scrub_url_userinfo(&backend.url);
+    tracing::warn!(
+        backend = %backend.backend_type,
+        model = %backend.model,
+        url = %url,
+        ctx = cut.context,
+        sent_estimate = cut.sent_estimate,
+        evaluated = cut.evaluated,
+        "context_truncated_by_backend"
+    );
+    rt.operator_alert(
+        backend_cut_alert(
+            &url,
+            format!(
+                "{} at {url} ran {} with a {}-token context and read {} of about {} prompt tokens (i802)",
+                backend.backend_type, backend.model, cut.context, cut.evaluated, cut.sent_estimate
+            ),
+        ),
+        BACKEND_CUT_ALERT_COOLDOWN_SECS,
+    )
+    .await;
+}
+
+/// After one model call (i802 PR-2): judge an Ollama call's count against
+/// the cut signature, and teach the backend's calibration from a call it
+/// clearly read whole. vLLM is never judged (it refuses an over-long prompt
+/// with a 400); a cloud backend is neither judged nor learned.
+async fn judge_call<R: HarnessRuntime>(rt: &R, usage: &mut UsageStats, backend: &ResolvedBackend, sent_estimate: u64, evaluated: u64) {
+    if evaluated == 0 || super::backend::is_cloud_backend(backend) {
+        return;
+    }
+    let ollama = crate::chat_context::takes_num_ctx(&backend.backend_type);
+    let ctx = if ollama { rt.chat_num_ctx(backend).await } else { rt.chat_window(backend).await };
+    let Some(ctx) = ctx else { return };
+    let calib = crate::chat_context::calibration(&backend.url, &backend.model);
+    let read = crate::chat_context::read_call(ctx, sent_estimate, evaluated, calib);
+    match read {
+        crate::chat_context::CallRead::Cut if ollama => {
+            note_backend_cut(rt, usage, backend, Truncation { sent_estimate, evaluated, context: ctx }).await;
+        }
+        crate::chat_context::CallRead::OnTheLine if ollama => {
+            tracing::info!(
+                backend = %backend.backend_type,
+                model = %backend.model,
+                ctx,
+                sent_estimate,
+                evaluated,
+                "context_count_on_cut_line: read whole by the estimate, not judged a cut"
+            );
+        }
+        crate::chat_context::CallRead::Whole => {
+            crate::chat_context::learn(&backend.url, &backend.model, sent_estimate, evaluated);
+        }
+        _ => {}
+    }
+}
+
+/// Keep a request's answer within the window's reserve (i802 A): a larger
+/// `max_tokens` / `n_predict` is lowered to it, and an Ollama gets
+/// `options.num_predict` (unless the caller set a smaller one; Ollama's own
+/// default is unbounded). A vLLM body without `max_tokens` keeps it absent:
+/// that server sizes the answer from the real prompt length
+/// (`output_budget`), and a guessed cap past its window is a 400. Never on a
+/// cloud body (the caller does not call this for one).
+fn cap_output_to_reserve(body: &mut Value, reserve: u64, ollama: bool) {
+    let Some(obj) = body.as_object_mut() else { return };
+    for key in ["max_tokens", "n_predict"] {
+        if obj.get(key).and_then(Value::as_u64).is_some_and(|n| n > reserve) {
+            obj.insert(key.to_string(), json!(reserve));
+        }
+    }
+    if ollama {
+        let options = obj.entry("options").or_insert_with(|| Value::Object(Default::default()));
+        if let Some(o) = options.as_object_mut() {
+            let keep = o.get("num_predict").and_then(Value::as_u64).is_some_and(|n| n > 0 && n <= reserve);
+            if !keep {
+                o.insert("num_predict".to_string(), json!(reserve));
+            }
+        }
+    }
+}
+
 /// Send one LLM request, falling back to the next viable backend on
 /// unreachable-backend failures.
 ///
@@ -1603,7 +1888,20 @@ async fn send_llm_with_fallback<R: HarnessRuntime, S: crate::websocket::TurnSink
             }
         }
         let stream = force_stream || super::backend::wire_format(backend) == "openai";
-        let (url, mut body) = build_llm_request(backend, messages, tools, stream, enable_thinking);
+        // Per attempt: a failover may land on another node or engine.
+        let num_ctx = rt.chat_num_ctx(backend).await;
+        let (url, mut body) = build_llm_request(backend, messages, tools, stream, enable_thinking, num_ctx);
+        // The answer stays within this backend's reserve (i802 A): the
+        // context this call runs at, the stamped one on an Ollama.
+        if !super::backend::is_cloud_backend(backend) {
+            let window = match num_ctx {
+                Some(n) => Some(n),
+                None => rt.chat_window(backend).await,
+            };
+            if let Some(ctx) = window {
+                cap_output_to_reserve(&mut body, crate::chat_context::reserve_for(ctx), crate::chat_context::takes_num_ctx(&backend.backend_type));
+            }
+        }
         if thinking == super::thinking::ThinkingMode::Off {
             super::thinking::disable_on_wire(
                 &mut body,
@@ -1935,6 +2233,20 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     // marks them so each backend is tried at most once per request).
     let mut failed_backend_urls: Vec<String> = Vec::new();
 
+    // The window this turn is fitted to (i802 A): the backend's own context,
+    // decided before the persona so a small one can take a smaller prompt.
+    let backend_ctx = backend_context(rt, &backend).await;
+    let global_len = crate::config::env_or_yaml_u64(
+        "VLLM_MAX_MODEL_LEN", |c| c.inference.vllm_max_model_len.map(u64::from), 16384) as u32;
+    let out_reserve = vllm_max_tokens();
+    let window = turn_window(rt.max_context_tokens(), backend_ctx, global_len, out_reserve);
+    let max_input = window.max_input;
+    // The fit compares the CALIBRATED estimate with max_input: in the loop's
+    // own estimate units, the budget is max_input / ratio.
+    let calib = crate::chat_context::calibration(&backend.url, &backend.model);
+    let fit_budget = calib.estimate_budget(max_input as u64) as usize;
+    let tier = prompt_tier(&window);
+
     // A named model is a preference: when the mesh answered with another,
     // say so instead of switching silently.
     let mut opening = json!({
@@ -1953,7 +2265,9 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     // 2. Build session — try cache first, then DB
     let mut session = rt.load_session(conversation_id, "dashboard").await;
     super::context::strip_data_frames(&mut session.messages);
-    let mut persona_prompt = rt.persona_prompt().await;
+    // A Compact tier sends the core persona (its safety rules included);
+    // the configured persona is the fallback when no prompts dir is found.
+    let mut persona_prompt = tier_persona(rt, tier).await;
     // Skills, runbooks and the cluster guidance are chosen from the user's
     // own words (a task's contract is not the user's; i658).
     let selection = super::selection_text_or(prompt);
@@ -1963,6 +2277,8 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     if !cluster_ctx.trim().is_empty() && super::context::ops_intent(&selection) {
         persona_prompt.push_str(super::context::CLUSTER_GUIDANCE);
     }
+    // Tool rules 7-9 ride with their tool groups (i802 persona split).
+    persona_prompt.push_str(&super::context::group_guidance(&super::context::selected_groups(prompt)));
     persona_prompt.push_str(super::context::CLOCK_RULE);
     session.set_system_prompt(&persona_prompt);
 
@@ -1990,8 +2306,8 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     // the prompt, the names go to usage recording. Splitting here keeps the
     // rest of this function reading as before.
     let (skills_ctx, selected_skill_names) = match skills_ctx {
-        Some((text, names)) => (Some(text), Some(names)),
-        None => (None, None),
+        Some((text, names)) if super::context::max_skills_for(tier) > 0 => (Some(text), Some(names)),
+        _ => (None, None),
     };
 
     let has_rag = rag_ctx.is_some();
@@ -2000,7 +2316,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     let has_video = video_ctx.is_some();
     let has_skills = skills_ctx.is_some();
     let has_companion = companion_ctx.is_some();
-    let runbook_ctx = rt.runbook_context(&selection);
+    let runbook_ctx = if super::context::runbooks_for(tier) { rt.runbook_context(&selection) } else { None };
     let has_runbook = runbook_ctx.is_some();
 
     // Record skill usage.
@@ -2020,18 +2336,12 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     // External MCP tools this caller may see join
     // the list before relevance selection, so they compete on equal terms.
     all_schemas.extend(rt.external_tool_schemas(user_id).await);
-    let mut tool_schemas = select_tool_schemas(&all_schemas, prompt);
+    let mut tool_schemas = tier_tools(select_tool_schemas(&all_schemas, prompt), tier);
 
     // Fit context window (configurable, defaults to max_model_len minus output reserve)
     let tool_toks = estimate_tool_tokens(&tool_schemas);
-    let max_input = rt.max_context_tokens().unwrap_or_else(|| {
-        let max_len = crate::config::env_or_yaml_u64(
-            "VLLM_MAX_MODEL_LEN", |c| c.inference.vllm_max_model_len.map(u64::from), 16384) as u32;
-        let out_reserve = vllm_max_tokens();
-        max_len.saturating_sub(out_reserve).max(2048)
-    }) as usize;
 
-    let dropped = fit_context_window(&mut session.messages, max_input, tool_toks);
+    let dropped = fit_context_window(&mut session.messages, fit_budget, tool_toks);
 
     // (D) Temporal graph — always-on. Surfaces user preferences, agent
     // self-identity, and recent project decisions from the bi-temporal graph.
@@ -2151,7 +2461,20 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         post_dedup_chars = deduped.len(),
         "context_injected"
     );
-    log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), "stream");
+    log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), &calib, "stream");
+
+    // Instructions and the question alone too large for this backend's
+    // context (i802 PR-2, step 5): say so instead of sending a prompt the
+    // backend would cut. TIER-HOOK: try the next smaller tier before this.
+    let mut window_refusal: Option<String> = None;
+    if let Some(ctx) = window_refusal_ctx(&window, rt.max_context_tokens().is_some(), instructions_estimate(&session.messages, prompt, estimate_tool_tokens(&tool_schemas)), calib) {
+        let node = match rt.route_facts(&backend.url, &backend.backend_type).await {
+            Some((n, _)) => n,
+            None => super::backend::node_from_backend_url(&backend.url).unwrap_or_else(|| "its node".to_string()),
+        };
+        tracing::warn!(backend = %backend.backend_type, model = %backend.model, ctx, max_input, tier = ?tier, "context_too_small_for_instructions");
+        window_refusal = Some(too_small_line(&backend.model, &node, ctx));
+    }
 
     // 5. Agentic loop
     let mut result = CoordinatorResult {
@@ -2198,6 +2521,14 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         }
         result.iterations = iteration;
         let iter_start = Instant::now();
+        if let Some(line) = window_refusal.take() {
+            let _ = writer.send_event("error", json!(line)).await;
+            break;
+        }
+        // What this call sends, in the loop's estimate, and the backend's
+        // count before it: the cut check and the calibration read both (i802).
+        let (evaluated_before, sent_estimate) =
+            (usage.prompt_tokens, (estimate_tokens(&session.messages) + estimate_tool_tokens(&tool_schemas)) as u64);
 
         // Debug: log message roles to diagnose ordering issues
         let roles: Vec<&str> = session.messages.iter()
@@ -2524,6 +2855,8 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             // sent to the client): end the turn, as a failed send does.
             break;
         }
+        let evaluated = u64::from(usage.prompt_tokens.saturating_sub(evaluated_before));
+        judge_call(rt, &mut usage, &backend, sent_estimate, evaluated).await;
 
         // Flush remaining tag buffer after stream ends
         let reasoning_tail = reasoning_filter.finish();
@@ -2900,7 +3233,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         }
 
         // Re-fit context window after tool results
-        fit_context_window(&mut session.messages, max_input, tool_toks);
+        fit_context_window(&mut session.messages, fit_budget, tool_toks);
     }
 
     // Safety net: if we exhausted iterations without a final text response
@@ -3177,6 +3510,20 @@ async fn run_inner_bound<R: HarnessRuntime>(
     // marks them so each backend is tried at most once per request).
     let mut failed_backend_urls: Vec<String> = Vec::new();
 
+    // The window this turn is fitted to (i802 A): the backend's own context,
+    // decided before the persona so a small one can take a smaller prompt.
+    let backend_ctx = backend_context(rt, &backend).await;
+    let global_len = crate::config::env_or_yaml_u64(
+        "VLLM_MAX_MODEL_LEN", |c| c.inference.vllm_max_model_len.map(u64::from), 16384) as u32;
+    let out_reserve = vllm_max_tokens();
+    let window = turn_window(rt.max_context_tokens(), backend_ctx, global_len, out_reserve);
+    let max_input = window.max_input;
+    // The fit compares the CALIBRATED estimate with max_input: in the loop's
+    // own estimate units, the budget is max_input / ratio.
+    let calib = crate::chat_context::calibration(&backend.url, &backend.model);
+    let fit_budget = calib.estimate_budget(max_input as u64) as usize;
+    let tier = prompt_tier(&window);
+
     // Build session — try cache first, then DB
     let mut session = rt.load_session(conversation_id, channel).await;
     super::context::strip_data_frames(&mut session.messages);
@@ -3187,7 +3534,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
     // along — it is situational fact, not persona.
     let mut persona_prompt = match role_prompt {
         Some(rp) => rp.to_string(),
-        None => rt.persona_prompt().await,
+        None => tier_persona(rt, tier).await,
     };
     // Skills, runbooks and the cluster guidance are chosen from the user's
     // own words (a task's contract is not the user's; i658).
@@ -3198,6 +3545,8 @@ async fn run_inner_bound<R: HarnessRuntime>(
     if !cluster_ctx.trim().is_empty() && super::context::ops_intent(&selection) {
         persona_prompt.push_str(super::context::CLUSTER_GUIDANCE);
     }
+    // Tool rules 7-9 ride with their tool groups (i802 persona split).
+    persona_prompt.push_str(&super::context::group_guidance(&super::context::selected_groups(prompt)));
     persona_prompt.push_str(super::context::CLOCK_RULE);
     session.set_system_prompt(&persona_prompt);
 
@@ -3227,14 +3576,14 @@ async fn run_inner_bound<R: HarnessRuntime>(
     // Split (injection_text, selected_names): text goes in the prompt, names
     // go to usage recording.
     let (skills_ctx, selected_skill_names) = match skills_ctx {
-        Some((text, names)) => (Some(text), Some(names)),
-        None => (None, None),
+        Some((text, names)) if super::context::max_skills_for(tier) > 0 => (Some(text), Some(names)),
+        _ => (None, None),
     };
     if let Some(names) = selected_skill_names.as_ref() {
         rt.record_skill_usage(names, conversation_id).await;
     }
 
-    let runbook_ctx = rt.runbook_context(&selection);
+    let runbook_ctx = if super::context::runbooks_for(tier) { rt.runbook_context(&selection) } else { None };
 
     session.add_user_message(prompt);
 
@@ -3243,16 +3592,10 @@ async fn run_inner_bound<R: HarnessRuntime>(
     // External MCP tools this caller may see join
     // the list before relevance selection, so they compete on equal terms.
     all_schemas.extend(rt.external_tool_schemas(user_id).await);
-    let mut tool_schemas = select_tool_schemas(&all_schemas, prompt);
+    let mut tool_schemas = tier_tools(select_tool_schemas(&all_schemas, prompt), tier);
 
     let tool_toks = estimate_tool_tokens(&tool_schemas);
-    let max_input = rt.max_context_tokens().unwrap_or_else(|| {
-        let max_len = crate::config::env_or_yaml_u64(
-            "VLLM_MAX_MODEL_LEN", |c| c.inference.vllm_max_model_len.map(u64::from), 16384) as u32;
-        let out_reserve = vllm_max_tokens();
-        max_len.saturating_sub(out_reserve).max(2048)
-    }) as usize;
-    let dropped_run = fit_context_window(&mut session.messages, max_input, tool_toks);
+    let dropped_run = fit_context_window(&mut session.messages, fit_budget, tool_toks);
 
     // (D) Temporal graph context — always-on.
     let temporal_ctx = time_layer(
@@ -3357,7 +3700,20 @@ async fn run_inner_bound<R: HarnessRuntime>(
         post_dedup_chars = deduped.len(),
         "context_injected_nonstream"
     );
-    log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), "nonstream");
+    log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), &calib, "nonstream");
+
+    // Instructions and the question alone too large for this backend's
+    // context (i802 PR-2, step 5): say so instead of sending a prompt the
+    // backend would cut. TIER-HOOK: try the next smaller tier before this.
+    let mut window_refusal: Option<String> = None;
+    if let Some(ctx) = window_refusal_ctx(&window, rt.max_context_tokens().is_some(), instructions_estimate(&session.messages, prompt, estimate_tool_tokens(&tool_schemas)), calib) {
+        let node = match rt.route_facts(&backend.url, &backend.backend_type).await {
+            Some((n, _)) => n,
+            None => super::backend::node_from_backend_url(&backend.url).unwrap_or_else(|| "its node".to_string()),
+        };
+        tracing::warn!(backend = %backend.backend_type, model = %backend.model, ctx, max_input, tier = ?tier, "context_too_small_for_instructions");
+        window_refusal = Some(too_small_line(&backend.model, &node, ctx));
+    }
 
     let mut result = CoordinatorResult {
         response: String::new(),
@@ -3403,6 +3759,13 @@ async fn run_inner_bound<R: HarnessRuntime>(
         }
         result.iterations = iteration;
         let iter_start = Instant::now();
+        if let Some(line) = window_refusal.take() {
+            llm_failure = Some(anyhow::anyhow!(line));
+            break;
+        }
+        // What this call sends, and the backend's count before it (i802).
+        let (evaluated_before, sent_estimate) =
+            (usage.prompt_tokens, (estimate_tokens(&session.messages) + estimate_tool_tokens(&tool_schemas)) as u64);
 
         // For OpenAI-compat (vLLM, node-agent proxy), use stream=true even
         // though there's no WebSocket sink — vLLM's pythonic tool parser
@@ -3463,6 +3826,8 @@ async fn run_inner_bound<R: HarnessRuntime>(
             usage.prompt_tokens += streamed.prompt_tokens as u32;
             usage.completion_tokens += streamed.completion_tokens as u32;
             usage.total_tokens += streamed.total_tokens as u32;
+            let evaluated = u64::from(usage.prompt_tokens.saturating_sub(evaluated_before));
+            judge_call(rt, &mut usage, &backend, sent_estimate, evaluated).await;
 
             let combined_content = if !streamed.reasoning.is_empty() && !streamed.content.is_empty() {
                 format!("<think>{}</think>\n\n{}", streamed.reasoning, streamed.content)
@@ -3510,7 +3875,16 @@ async fn run_inner_bound<R: HarnessRuntime>(
                 usage.prompt_tokens += p as u32;
                 usage.completion_tokens += c as u32;
                 usage.total_tokens += t as u32;
+            } else if let Some(p) = llm_response.get("prompt_eval_count").and_then(Value::as_u64) {
+                // A directly dialled Ollama's /api/chat body (i802: the
+                // cut check needs its count).
+                let c = llm_response.get("eval_count").and_then(Value::as_u64).unwrap_or(0);
+                usage.prompt_tokens += p as u32;
+                usage.completion_tokens += c as u32;
+                usage.total_tokens += (p + c) as u32;
             }
+            let evaluated = u64::from(usage.prompt_tokens.saturating_sub(evaluated_before));
+            judge_call(rt, &mut usage, &backend, sent_estimate, evaluated).await;
             let message = parse_llm_response(super::backend::wire_format(&backend), &llm_response);
             let content = message.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
             let mut msg = message.clone();
@@ -3726,7 +4100,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
             result.response = content;
         }
 
-        fit_context_window(&mut session.messages, max_input, tool_toks);
+        fit_context_window(&mut session.messages, fit_budget, tool_toks);
     }
 
     // An LLM failure with NOTHING produced is an Err, not an empty success.
@@ -4029,7 +4403,7 @@ mod llamacpp_wire_tests {
     fn llamacpp_native_request_carries_tools_and_streams() {
         let b = llamacpp("http://llamacpp-native-test:8085");
         let messages = vec![json!({"role": "user", "content": "hi"})];
-        let (url, body) = build_llm_request(&b, &messages, Some(&tools()), true, false);
+        let (url, body) = build_llm_request(&b, &messages, Some(&tools()), true, false, None);
         assert_eq!(url, "http://llamacpp-native-test:8085/v1/chat/completions");
         assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
         assert_eq!(body["messages"][0]["content"], "hi");
@@ -4043,7 +4417,7 @@ mod llamacpp_wire_tests {
         let b = llamacpp("http://llamacpp-legacy-test:8085");
         super::super::backend::mark_legacy_completion(&b.url);
         let messages = vec![json!({"role": "user", "content": "hi"})];
-        let (url, body) = build_llm_request(&b, &messages, Some(&tools()), false, false);
+        let (url, body) = build_llm_request(&b, &messages, Some(&tools()), false, false, None);
         assert_eq!(url, "http://llamacpp-legacy-test:8085/completion");
         let prompt = body["prompt"].as_str().unwrap();
         assert!(prompt.contains("web_search"), "tools are described in the prompt");
@@ -4131,7 +4505,7 @@ mod cloud_loop_tests {
     fn an_anthropic_backend_gets_a_messages_request_with_tools() {
         let b = cloud("cloud-anthropic", "anthropic", super::super::cloud::ANTHROPIC_BASE_URL);
         let messages = vec![json!({"role": "system", "content": "sys"}), json!({"role": "user", "content": "hi"})];
-        let (url, body) = build_llm_request(&b, &messages, Some(&tools()), true, true);
+        let (url, body) = build_llm_request(&b, &messages, Some(&tools()), true, true, None);
         assert_eq!(url, "https://api.anthropic.com/v1/messages");
         assert_eq!(body["system"], "sys");
         assert_eq!(body["tools"][0]["name"], "web_search");
@@ -4151,18 +4525,18 @@ mod cloud_loop_tests {
             json!({"role": "tool", "name": "web_search", "content": "r", "tool_call_id": "c1"}),
         ];
         let o = cloud("cloud-openai", "openai", super::super::cloud::OPENAI_BASE_URL);
-        let (url, body) = build_llm_request(&o, &messages, Some(&tools()), true, true);
+        let (url, body) = build_llm_request(&o, &messages, Some(&tools()), true, true, None);
         assert_eq!(url, "https://api.openai.com/v1/chat/completions");
         assert!(body.get("chat_template_kwargs").is_none(), "vLLM-only extras stay off a provider");
         assert!(body.get("max_tokens").is_none());
         assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
         assert_eq!(body["messages"][1], json!({"role": "tool", "content": "r", "tool_call_id": "c1"}));
         let g = cloud("cloud-gemini", "openai", super::super::cloud::GEMINI_BASE_URL);
-        let (url, _) = build_llm_request(&g, &messages, None, false, false);
+        let (url, _) = build_llm_request(&g, &messages, None, false, false, None);
         assert_eq!(url, "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions");
         // A node backend is untouched by any of this.
         let v = cloud("vllm", "openai", "https://noo-vllm:8000");
-        let (url, body) = build_llm_request(&v, &messages, None, false, false);
+        let (url, body) = build_llm_request(&v, &messages, None, false, false, None);
         assert_eq!(url, "https://noo-vllm:8000/v1/chat/completions");
         assert!(body.get("chat_template_kwargs").is_some());
     }
@@ -4202,7 +4576,7 @@ mod request_size_tests {
     fn both_loop_paths_log_the_request_size() {
         let src = include_str!("agent_loop.rs").split("mod request_size_tests").next().unwrap();
         for path in ["\"stream\");", "\"nonstream\");"] {
-            assert!(src.contains(&format!("log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), {path}")), "{path}");
+            assert!(src.contains(&format!("log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), &calib, {path}")), "{path}");
         }
     }
 }
@@ -4291,5 +4665,256 @@ mod recall_metadata_tests {
         assert_eq!(code.matches("recall: recall_status,").count(), 2, "both loops put it on the result");
         assert_eq!(code.matches("metadata[\"recall\"] = json!(r);").count(), 2, "both loops save it with the message");
         assert_eq!(code.matches("send_event(\"done\", done_frame(&result, &usage))").count(), 1, "the stream sends it on done");
+    }
+}
+
+#[cfg(test)]
+mod num_ctx_tests {
+    use super::*;
+
+    fn backend(backend_type: &str, api_format: &str, url: &str) -> ResolvedBackend {
+        ResolvedBackend { url: url.to_string(), model: "gemma4:e2b".to_string(), backend_type: backend_type.to_string(), api_format: api_format.to_string() }
+    }
+
+    fn hi() -> Vec<Value> {
+        vec![json!({"role": "user", "content": "hi"})]
+    }
+
+    /// i802: an Ollama dialled natively gets the decided context on /api/chat.
+    #[test]
+    fn a_native_ollama_body_carries_the_decided_context() {
+        let b = backend("ollama", "ollama", "http://ollama-ctx-test:11434");
+        let (url, body) = build_llm_request(&b, &hi(), None, true, false, Some(16384));
+        assert_eq!(url, "http://ollama-ctx-test:11434/api/chat");
+        assert_eq!(body["options"]["num_ctx"], json!(16384), "{body}");
+        let (_, none) = build_llm_request(&b, &hi(), None, true, false, None);
+        assert!(none.get("options").is_none(), "nothing decided: nothing stamped: {none}");
+    }
+
+    /// An Ollama behind its node agent speaks the OpenAI wire; the agent
+    /// forwards `options` to its translator.
+    #[test]
+    fn an_ollama_behind_its_agent_carries_it_on_the_openai_wire() {
+        let b = backend("ollama", "openai", "https://198.51.100.7:8081");
+        let (url, body) = build_llm_request(&b, &hi(), None, true, false, Some(8192));
+        assert_eq!(url, "https://198.51.100.7:8081/v1/chat/completions");
+        assert_eq!(body["options"]["num_ctx"], json!(8192), "{body}");
+    }
+
+    /// vLLM, llama.cpp and the cloud never get `options`, whatever is passed.
+    #[test]
+    fn no_other_engine_gets_options() {
+        for b in [
+            backend("vllm", "openai", "https://noo-vllm:8000"),
+            backend("llamacpp", "llamacpp", "http://llamacpp-ctx-test:8085"),
+            backend("cloud-openai", "openai", super::super::cloud::OPENAI_BASE_URL),
+            backend("cloud-anthropic", "anthropic", super::super::cloud::ANTHROPIC_BASE_URL),
+        ] {
+            let (_, body) = build_llm_request(&b, &hi(), None, true, false, Some(16384));
+            assert!(body.get("options").is_none(), "{} got options: {body}", b.backend_type);
+        }
+    }
+
+    /// The loop asks the runtime per attempt (a failover may land on another
+    /// node) and hands the answer to the builder.
+    #[test]
+    fn the_loop_resolves_the_context_per_attempt_and_passes_it_in() {
+        let own = crate::test_src::own_code(include_str!("agent_loop.rs"));
+        let f = crate::test_src::fn_body(&own, "async fn send_llm_with_fallback<");
+        let ask = f.find("let num_ctx = rt.chat_num_ctx(backend).await;").expect("asks the runtime");
+        let build = f.find("build_llm_request(backend, messages, tools, stream, enable_thinking, num_ctx)").expect("passes it in");
+        let send = f.find(".json(&body)").expect("sends the body");
+        assert!(ask < build && build < send, "{f}");
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    use crate::chat_context::Calibration;
+
+    /// i802 A: the window is the backend's own context less its reserve
+    /// (a quarter, at most 4,096); the operator's override still wins; with
+    /// nothing known the old global window stands.
+    #[test]
+    fn the_window_is_the_backends_own_context_less_its_reserve() {
+        assert_eq!(turn_window(None, Some(4096), 16384, 4096), TurnWindow { ctx: Some(4096), max_input: 3072 });
+        assert_eq!(turn_window(None, Some(32768), 16384, 4096).max_input, 28_672);
+        assert_eq!(turn_window(None, Some(8192), 16384, 4096).max_input, 6144);
+        assert_eq!(turn_window(None, None, 16384, 4096), TurnWindow { ctx: None, max_input: 12_288 }, "today's global value");
+        assert_eq!(turn_window(None, None, 2048, 4096).max_input, 2048, "never below the old floor");
+        assert_eq!(turn_window(Some(6000), Some(4096), 16384, 4096), TurnWindow { ctx: Some(4096), max_input: 6000 }, "the override wins");
+    }
+
+    /// The request's answer never exceeds the reserve: a larger cap is
+    /// lowered, an Ollama gets num_predict, a vLLM body without max_tokens
+    /// keeps it absent (the server sizes it from the real prompt).
+    #[test]
+    fn the_answer_stays_within_the_reserve() {
+        let mut vllm = json!({"model": "m", "messages": [], "max_tokens": 4096});
+        cap_output_to_reserve(&mut vllm, 1024, false);
+        assert_eq!(vllm["max_tokens"], json!(1024));
+        let mut open = json!({"model": "m", "messages": []});
+        cap_output_to_reserve(&mut open, 1024, false);
+        assert!(open.get("max_tokens").is_none() && open.get("options").is_none(), "{open}");
+        let mut small = json!({"model": "m", "messages": [], "max_tokens": 300});
+        cap_output_to_reserve(&mut small, 1024, false);
+        assert_eq!(small["max_tokens"], json!(300), "a smaller cap stands");
+        let mut ollama = json!({"model": "m", "messages": [], "options": {"num_ctx": 4096}});
+        cap_output_to_reserve(&mut ollama, 1024, true);
+        assert_eq!(ollama["options"], json!({"num_ctx": 4096, "num_predict": 1024}));
+        let mut caller = json!({"model": "m", "messages": [], "options": {"num_predict": 200}});
+        cap_output_to_reserve(&mut caller, 1024, true);
+        assert_eq!(caller["options"]["num_predict"], json!(200), "the caller's smaller value stands");
+        let mut unbounded = json!({"model": "m", "messages": [], "options": {"num_predict": -1}});
+        cap_output_to_reserve(&mut unbounded, 1024, true);
+        assert_eq!(unbounded["options"]["num_predict"], json!(1024), "Ollama's unbounded -1 is bounded");
+        let mut completion = json!({"prompt": "p", "n_predict": 4096});
+        cap_output_to_reserve(&mut completion, 1024, false);
+        assert_eq!(completion["n_predict"], json!(1024));
+    }
+
+    #[test]
+    fn the_tier_is_compact_only_for_a_known_small_window() {
+        assert_eq!(prompt_tier(&turn_window(None, Some(4096), 16384, 4096)), WindowTier::Compact);
+        assert_eq!(prompt_tier(&turn_window(None, Some(16384), 16384, 4096)), WindowTier::Full);
+        assert_eq!(prompt_tier(&turn_window(Some(3000), None, 16384, 4096)), WindowTier::Full, "an unknown context is never guessed small");
+    }
+
+    /// Step 5: instructions and the question that cannot fit are refused with
+    /// one line; an uncalibrated box is judged at the most favourable ratio
+    /// measured, so it is not refused on its high raw estimate.
+    #[test]
+    fn a_turn_whose_instructions_cannot_fit_is_refused_with_one_line() {
+        let small = turn_window(None, Some(4096), 16384, 4096);
+        let fresh = Calibration::default();
+        assert_eq!(window_refusal_ctx(&small, false, 20_000, fresh), Some(4096), "20,000 x 0.22 = 4,400 > 3,072");
+        assert_eq!(window_refusal_ctx(&small, false, 10_000, fresh), None, "might fit: sent, and judged after");
+        let learned = Calibration { ratio: 0.5, samples: 3 };
+        assert_eq!(window_refusal_ctx(&small, false, 10_000, learned), Some(4096), "5,000 > 3,072 by the trusted ratio");
+        assert_eq!(window_refusal_ctx(&small, true, 20_000, fresh), None, "the operator's override is never second-guessed");
+        let unknown = turn_window(None, None, 16384, 4096);
+        assert_eq!(window_refusal_ctx(&unknown, false, 90_000, fresh), None, "never refused on the global guess");
+        let line = too_small_line("gemma4:e2b", "fa-box", 4096);
+        assert!(line.starts_with("gemma4:e2b on fa-box runs a 4096-token context, too small for its instructions and this question."), "{line}");
+        assert!(line.ends_with("noo models switch <model>") && !line.contains('\n'), "{line}");
+        let need = instructions_estimate(&[json!({"role": "system", "content": "s".repeat(250)}), json!({"role": "assistant", "content": "a".repeat(999)})], "q", 7);
+        assert_eq!(need, (100 + 4) + 4 + 7, "system, the question and the tools; never history");
+    }
+
+    #[test]
+    fn the_done_frame_carries_the_cut_and_the_worst_cut_is_kept() {
+        let mut usage = UsageStats::default();
+        let r = CoordinatorResult {
+            response: "hi".into(),
+            model: "m".into(),
+            backend: "ollama".into(),
+            node: None,
+            iterations: 1,
+            tool_calls: vec![],
+            elapsed_secs: 1.0,
+            usage: UsageStats::default(),
+            recall: None,
+        };
+        let f = done_frame(&r, &usage);
+        assert!(f.get("truncated").is_none() && f.get("truncation").is_none(), "{f}");
+        usage.truncated = Some(Truncation { sent_estimate: 8800, evaluated: 2051, context: 4096 });
+        let f = done_frame(&r, &usage);
+        assert_eq!(f["truncated"], json!(true));
+        assert_eq!(f["truncation"], json!({"sent_estimate": 8800, "evaluated": 2051, "context": 4096}));
+        let a = Truncation { sent_estimate: 8800, evaluated: 2051, context: 4096 };
+        let b = Truncation { sent_estimate: 20_000, evaluated: 2051, context: 4096 };
+        assert_eq!(a.worse(b), b);
+        assert_eq!(b.worse(a), b);
+        let back: UsageStats = serde_json::from_value(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2, "total_tool_calls": 0, "total_latency_ms": 5})).unwrap();
+        assert_eq!(back.truncated, None, "an older peer's usage still reads");
+    }
+
+    /// i802 PR-2 step 3: after a tool result the last message is the result,
+    /// so the old exemption ("the last message") let the person's question be
+    /// shortened. A question over 1,000 chars now survives a forced trim.
+    #[test]
+    fn a_tool_result_turn_keeps_the_question_intact() {
+        let question = format!("Please read this log and tell me what failed: {} -- what failed first?", "line ok; ".repeat(160));
+        assert!(question.chars().count() > 1000);
+        let mut messages = vec![
+            json!({"role": "system", "content": "persona"}),
+            json!({"role": "user", "content": question}),
+            json!({"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "function": {"name": "noo_logs_search", "arguments": "{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "r".repeat(20_000)}),
+        ];
+        fit_context_window(&mut messages, 1024, 0);
+        assert_eq!(messages[1]["content"], json!(question), "the question is never shortened");
+        assert!(messages[3]["content"].as_str().unwrap().chars().count() < 600, "the tool result is what gives");
+    }
+
+    /// A long agentic turn pushes the question past the 24-message tail: it
+    /// is still never dropped, and stays first after the system message.
+    #[test]
+    fn a_long_agentic_turn_never_drops_the_question() {
+        let mut messages = vec![json!({"role": "system", "content": "persona"}), json!({"role": "user", "content": "what is wrong with the cluster?"})];
+        for i in 0..30 {
+            messages.push(json!({"role": "assistant", "content": format!("step {i}")}));
+            messages.push(json!({"role": "tool", "tool_call_id": format!("c{i}"), "content": "x".repeat(300)}));
+        }
+        let dropped = fit_context_window(&mut messages, 1024, 0);
+        assert!(!dropped.is_empty(), "the budget forced drops");
+        assert!(dropped.iter().all(|m| m["role"] != "user"), "{dropped:?}");
+        assert_eq!(messages[1]["content"], json!("what is wrong with the cluster?"));
+    }
+
+    #[test]
+    fn a_nudge_is_not_the_question() {
+        let m = vec![
+            json!({"role": "user", "content": "the question"}),
+            json!({"role": "assistant", "content": "x"}),
+            json!({"role": "user", "content": format!("{NUDGE_PREFIX}write the answer")}),
+        ];
+        assert_eq!(latest_question(&m), Some(0));
+        assert_eq!(latest_question(&m[1..2]), None);
+    }
+
+    /// Both loops fit to the calibrated budget of the backend's own window,
+    /// refuse before the first call, and judge every prompt count but a
+    /// cut stream's (an error already); the send path caps the answer.
+    #[test]
+    fn both_loops_fit_judge_and_refuse() {
+        let own = crate::test_src::own_code(include_str!("agent_loop.rs"));
+        assert_eq!(own.matches("let window = turn_window(rt.max_context_tokens(), backend_ctx, global_len, out_reserve);").count(), 2);
+        assert_eq!(own.matches("let fit_budget = calib.estimate_budget(max_input as u64) as usize;").count(), 2);
+        assert_eq!(own.matches("fit_context_window(&mut session.messages, fit_budget, tool_toks)").count(), 4, "first fit and re-fit, both loops");
+        assert_eq!(own.matches("fit_context_window(&mut session.messages, max_input").count(), 0);
+        assert_eq!(own.matches("if let Some(line) = window_refusal.take() \u{7b}").count(), 2);
+        assert_eq!(own.matches("let (evaluated_before, sent_estimate) =").count(), 2);
+        let judged = own.matches("let evaluated = u64::from(usage.prompt_tokens.saturating_sub(evaluated_before));").count();
+        assert_eq!(own.matches("judge_call(rt, &mut usage, &backend, sent_estimate, evaluated).await;").count(), judged);
+        let added = own.matches("usage.prompt_tokens += ").count();
+        assert_eq!((added, judged), (5, 3), "a new prompt-count site must be judged");
+        let stream = crate::test_src::fn_body(&own, "async fn run_streaming_on_bound<");
+        let refuse = stream.find("if let Some(line) = window_refusal.take() \u{7b}").expect("refuses");
+        let send = stream.find("send_llm_with_fallback(").expect("sends");
+        assert!(refuse < send, "refused before the first call");
+        let f = crate::test_src::fn_body(&own, "async fn send_llm_with_fallback<");
+        let build = f.find("build_llm_request(backend, messages, tools, stream, enable_thinking, num_ctx)").expect("builds");
+        let cap = f.find("cap_output_to_reserve(&mut body, crate::chat_context::reserve_for(ctx)").expect("caps");
+        let out = f.find(".json(&body)").expect("sends");
+        assert!(build < cap && cap < out, "{f}");
+        let judge = crate::test_src::fn_body(&own, "async fn judge_call<");
+        assert!(judge.contains("CallRead::Cut if ollama =>") && judge.contains("note_backend_cut("), "only an Ollama is judged: {judge}");
+        assert!(judge.contains("CallRead::Whole =>") && judge.contains("crate::chat_context::learn("), "{judge}");
+    }
+
+    /// The cut alert is one per backend per day, and a node harness may raise
+    /// it (the gateway re-authors it from the kind).
+    #[test]
+    fn the_cut_alert_is_daily_and_allowed_on_the_rail() {
+        let a = backend_cut_alert("http://box:11434", "evidence");
+        assert_eq!(a.kind, BACKEND_CUT_ALERT_KIND);
+        assert_eq!((a.target.as_str(), a.detail.as_str()), ("http://box:11434", "evidence"));
+        assert!(!a.summary.contains("evidence"), "the summary is fixed");
+        const { assert!(BACKEND_CUT_ALERT_COOLDOWN_SECS == 86_400) };
+        let rail = crate::test_src::own_code(include_str!("../routes/harness.rs"));
+        assert!(rail.contains("\u{7d} else if kind == crate::coordinator::BACKEND_CUT_ALERT_KIND \u{7b}"), "the rail allows it");
+        assert!(rail.contains("crate::coordinator::backend_cut_alert(&target, message)"), "and re-authors it");
     }
 }

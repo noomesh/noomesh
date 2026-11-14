@@ -179,6 +179,10 @@ pub(crate) struct State {
     pub tier: u8,
     pub gpu_model: String,
     pub vram_gb: f64,
+    /// The prereqs step found no GPU at all (`nvidia-smi` absent or failed;
+    /// not merely busy). The environment step then seeds the CPU-only
+    /// Ollama slot count on a new install (i802).
+    pub cpu_only: bool,
     pub controller_url: String,
     pub data_root: String,
     /// Failures no later step can recover from (storage root unusable, the

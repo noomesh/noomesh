@@ -1,5 +1,5 @@
 {
-  "_comment": "Model capabilities, the FALLBACK for what a node does not report yet (i226 decision 3). The model's weights declare its context ceiling (GGUF <arch>.context_length, HF config max_position_embeddings); the node reports it from the model it serves (heartbeat model_stats[].context_length; Ollama today, noomesh-internal i285) and that report wins. This table caps the window harness placement judges a kind against only where no node reports it: vLLM and llama.cpp placements, and agents older than the report. Each row's `match` globs are tried against the placement's model id, lower-cased, with any registry or org prefix up to the last '/' removed; the first row that matches wins. A model with no row is unknown: no ceiling is assumed, so nothing is refused for it. `max_context` is the model's own context ceiling in tokens; `evidence` says where the number was read.",
+  "_comment": "Model capabilities, the FALLBACK for what a node does not report yet (i226 decision 3). The model's weights declare its context ceiling (GGUF <arch>.context_length, HF config max_position_embeddings); the node reports it from the model it serves (heartbeat model_stats[].context_length; Ollama today, noomesh-internal i285) and that report wins. This table caps the window harness placement judges a kind against only where no node reports it: vLLM and llama.cpp placements, and agents older than the report. Each row's `match` globs are tried against the placement's model id, lower-cased, with any registry or org prefix up to the last '/' removed; the first row that matches wins. A model with no row is unknown: no ceiling is assumed, so nothing is refused for it. `max_context` is the model's own context ceiling in tokens; `evidence` says where the number was read. `kv_bytes_per_token` is the cache one token costs per slot, MEASURED on a running daemon; the chat-context memory fit (gateway chat_context.rs, i802) uses it where present instead of placement_fit's conservative fallback.",
   "models": [
     {
       "family": "gemma-4-12b",
@@ -9,6 +9,14 @@
       ],
       "max_context": 262144,
       "evidence": "text_config.max_position_embeddings of google/gemma-4-12B-it-qat-w4a16-ct and gemma4.context_length of Ollama gemma4:12b, both 262144, read on awolf 2026-10-27"
+    },
+    {
+      "family": "gemma4-e2b",
+      "match": [
+        "gemma4:e2b*"
+      ],
+      "kv_bytes_per_token": 16384,
+      "evidence": "kv_bytes_per_token measured by fa on the default one-box cell, CPU, 0.6.24: 13-16 KiB per token per slot from the container cgroup across num_ctx 4096/8192/16384 at OLLAMA_NUM_PARALLEL 1 and 4 (install-matrix run 43628426011; i802). 16 KiB, the top of the range, is used so the fit errs safe. No max_context: the node reports it (131072)."
     }
   ]
 }
