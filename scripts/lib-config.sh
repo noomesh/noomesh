@@ -477,6 +477,7 @@ operator_profile_args() {
 # appended once. Call after load_config, before compose runs.
 EMBED_CPU_DOOR_URL="https://noo-stunnel-ollama-embed-cpu:11434"
 derive_profile_env() {
+    monitoring_derive_env
     case " $(operator_profile_args) " in
         *" --profile embed-cpu "*) ;;
         *) return 0 ;;
@@ -611,5 +612,46 @@ monitoring_remove_when_lean() {
         fi
     done
     [ -n "$_gone" ] && echo "  monitoring is lean (cluster.monitoring in noomesh.yaml): removed${_gone} (data kept; noo stack monitoring status)"
+    return 0
+}
+
+# monitoring_effective_level - `lean` when this install declared lean AND
+# nothing outranks it (COMPOSE_PROFILES listing `monitoring`, or the
+# `controller` profile in PROFILE_ARGS, both of which run the set); else
+# `full`. The same rule `noo stack monitoring status` prints.
+monitoring_effective_level() {
+    [ "$(monitoring_level)" = "lean" ] || { printf 'full'; return 0; }
+    case " ${PROFILE_ARGS:-} $(operator_profile_args 2>/dev/null) " in
+        *" --profile monitoring "*|*" --profile controller "*) printf 'full'; return 0 ;;
+    esac
+    printf 'lean'
+}
+
+# The addresses of the three, as compose sets them on the gateway and the
+# worker (`${VAR-default}`: unset takes the in-stack default, EMPTY stays
+# empty). On lean they are exported EMPTY, so the gateway says "summary rows
+# only, no spans exported" and log search is "off by choice" without dialing
+# a name that does not resolve, and the worker skips tracing and the Loki
+# security audit. A value pointing anywhere else (an operator's own Loki or
+# Tempo) is kept and said.
+MONITORING_URL_DEFAULTS="NOO_LOKI_URL=https://loki:3100 NOO_TEMPO_OTLP_URL=https://tempo:4318 NOO_TEMPO_URL=https://tempo:3200"
+
+# monitoring_derive_env - on an effective lean install export NOO_LOKI_URL,
+# NOO_TEMPO_OTLP_URL and NOO_TEMPO_URL empty (see above). On full nothing is
+# exported: compose's defaults apply exactly as before.
+monitoring_derive_env() {
+    [ "$(monitoring_effective_level)" = "lean" ] || return 0
+    local _pair _var _def _cur
+    for _pair in $MONITORING_URL_DEFAULTS; do
+        _var="${_pair%%=*}"
+        _def="${_pair#*=}"
+        _cur="$(printenv "$_var" 2>/dev/null || true)"
+        case "$_cur" in
+            ""|"$_def"|"$_def/") export "$_var="
+                ;;
+            *) echo "  monitoring is lean, but $_var=$_cur points elsewhere; kept" >&2
+                ;;
+        esac
+    done
     return 0
 }

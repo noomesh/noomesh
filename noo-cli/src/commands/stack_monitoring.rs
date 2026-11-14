@@ -351,6 +351,14 @@ fn facts_live(root: &Path) -> Facts {
     }
 }
 
+/// This install's EFFECTIVE level is lean (declared lean, nothing
+/// outranking it): Grafana, Loki and Tempo do not run by choice. For the
+/// paths that would otherwise act on them (a Grafana secret recreate, the
+/// tailnet door for Grafana's port during an upgrade).
+pub(crate) fn effective_lean_live(root: &Path) -> bool {
+    status_of(&facts_live(root)).effective == Level::Lean
+}
+
 fn state_root_live() -> String {
     crate::commands::at_rest_volume::resolve_state_root(&|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
 }

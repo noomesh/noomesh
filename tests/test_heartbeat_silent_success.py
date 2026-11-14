@@ -122,3 +122,46 @@ async def test_security_audit_does_not_report_clean_when_a_source_errors():
         out = await s._security_audit(_task("security_audit"))
     assert "NOT CHECKED" in out and "high_risk_tool_calls" in out
     assert "(incomplete)" in out
+
+
+async def test_security_audit_skips_loki_when_the_url_is_empty_by_choice(monkeypatch):
+    """cluster.monitoring: lean: the launcher exports NOO_LOKI_URL EMPTY. The
+    audit must not guess <gateway>:3100 (and warn every run): it skips the
+    source, says why once, and the result names the command."""
+    import noomesh.gateway.heartbeat as hb
+
+    asked: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        asked.append(str(req.url))
+        return httpx.Response(200, json={})
+
+    monkeypatch.setenv("NOO_LOKI_URL", "")
+    monkeypatch.setattr(hb, "_LOKI_OFF_NOTED", False)
+    infos: list[str] = []
+    monkeypatch.setattr(hb.logger, "info", lambda ev, **kw: infos.append(ev))
+    warnings: list[str] = []
+    monkeypatch.setattr(hb.logger, "warning", lambda ev, **kw: warnings.append(ev))
+    s = _sched(handler)
+    for _ in range(3):
+        out = await s._security_audit(_task("security_audit"))
+        assert "log search is off by choice (noo stack monitoring on)" in out, out
+        assert "NOT CHECKED" not in out and "auth_failures:" not in out, out
+    assert not [u for u in asked if ":3100" in u or "/loki/" in u], asked
+    assert infos.count("security_audit_loki_off") == 1, infos
+    assert "security_audit_loki_error" not in warnings
+
+
+async def test_security_audit_with_no_loki_url_at_all_keeps_the_old_guess(monkeypatch):
+    """Unset (an older compose) is not lean: the audit still asks <gateway>:3100."""
+    asked: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        asked.append(str(req.url))
+        return httpx.Response(200, json={"data": {"result": []}})
+
+    monkeypatch.delenv("NOO_LOKI_URL", raising=False)
+    s = _sched(handler)
+    out = await s._security_audit(_task("security_audit"))
+    assert any("gw.test:3100/loki/api/v1/query_range" in u for u in asked), asked
+    assert "auth_failures: 0" in out and "off by choice" not in out, out

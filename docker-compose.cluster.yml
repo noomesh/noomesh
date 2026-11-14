@@ -718,15 +718,18 @@ services:
       # gateway reads NOO_LOKI_URL (config.rs services.loki_url); this line
       # said LOKI_URL until 2026-09-28, so the gateway answered "Loki not
       # configured" on every install. tests/test_loki_wiring_parity.py pins
-      # the name to the reader.
-      - NOO_LOKI_URL=${NOO_LOKI_URL:-https://loki:3100}
+      # the name to the reader. `-`, not `:-`, on this line and the Tempo
+      # ones: unset takes the in-stack default, but EMPTY stays empty, which
+      # is how a lean install (cluster.monitoring: lean; the launcher's
+      # monitoring_derive_env) says "no Loki/Tempo here".
+      - NOO_LOKI_URL=${NOO_LOKI_URL-https://loki:3100}
       # Request tracing (i359): the gateway sends its request spans to
       # Tempo's OTLP HTTP receiver with its own leaf (request_trace.rs). The
       # per-request summary goes to Postgres either way.
-      - NOO_TEMPO_OTLP_URL=${NOO_TEMPO_OTLP_URL:-https://tempo:4318}
+      - NOO_TEMPO_OTLP_URL=${NOO_TEMPO_OTLP_URL-https://tempo:4318}
       # Tempo's query API: the `tempo` verify row's /ready probe and Grafana's
       # Tempo data source (/api/grafana-ds/tempo), both with the gateway leaf.
-      - NOO_TEMPO_URL=${NOO_TEMPO_URL:-https://tempo:3200}
+      - NOO_TEMPO_URL=${NOO_TEMPO_URL-https://tempo:3200}
       # Python sandbox — isolated code execution (internal Docker network),
       # mTLS: the gateway presents its own leaf (tls::cluster_client).
       - NOO_SANDBOX_URL=${NOO_SANDBOX_URL:-https://sandbox:9000}
@@ -803,7 +806,7 @@ services:
       # tree — docs/reference/env.md lists it as retired.)
       - CHANNEL_HISTORY_LIMIT=${CHANNEL_HISTORY_LIMIT:-}     # worker_pool.py channel manager
       - NOO_WORKER_GLOBAL_CONCURRENCY=${NOO_WORKER_GLOBAL_CONCURRENCY:-}
-      - NOO_LOKI_URL=${NOO_LOKI_URL:-https://loki:3100}   # workers/heartbeat.py security-audit task (same name as the gateway's)
+      - NOO_LOKI_URL=${NOO_LOKI_URL-https://loki:3100}   # workers/heartbeat.py security-audit task (same name as the gateway's)
       - NOO_ARTIFACT_DIR=${NOO_ARTIFACT_DIR:-}      # workers/heartbeat.py report artifacts
     volumes:
       - ./noomesh.yaml:/app/noomesh.yaml
@@ -1090,7 +1093,7 @@ services:
       - NOO_TLS_KEY=${NOO_TLS_KEY:+/app/pki/leaf/service.key}
       # Request tracing (i359): a span per handled worker.* subject, sent to
       # Tempo with the leaf above (src/noomesh/tracing.py).
-      - NOO_TEMPO_OTLP_URL=${NOO_TEMPO_OTLP_URL:-https://tempo:4318}
+      - NOO_TEMPO_OTLP_URL=${NOO_TEMPO_OTLP_URL-https://tempo:4318}
       - NOO_EXEC_APPROVAL_MODE=${NOO_EXEC_APPROVAL_MODE:-}
       - NOO_APPROVAL_GCHAT_SPACE=${NOO_APPROVAL_GCHAT_SPACE:-}
       - NOO_APPROVAL_TELEGRAM_CHAT=${NOO_APPROVAL_TELEGRAM_CHAT:-}

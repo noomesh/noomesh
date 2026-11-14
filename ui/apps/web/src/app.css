@@ -2557,6 +2557,12 @@ body {
 .state.warn {
   color: var(--warn);
 }
+/* "Open Grafana" when dashboards are off by choice: a muted line, not a fault. */
+.open-grafana-off {
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: 12px;
+}
 
 /* ---- placeholder empty state ---- */
 .placeholder {
