@@ -43,6 +43,11 @@
 //!   - 503: Loki unreachable, timed out, answered 5xx, or unconfigured —
 //!     keep the batch and retry with backoff. The gateway holds NOTHING: it
 //!     is a stateless relay, so the node's queue is the only buffer.
+//!   - 410 `reason: loki_off`, `retry: false`: this controller declared
+//!     `cluster.monitoring: lean` and no Loki is there — log search is off
+//!     by choice. Drop the batch and pause shipping on a long cadence (the
+//!     node-agent's shipper does; an older one only drops). A Loki that
+//!     answers on a lean install is used, and an unset key is never "off".
 //!   Every refusal body is `{"error","reason","retry"}`; `retry` says which
 //!   of the above applies without the shipper parsing the text.
 //!
@@ -102,6 +107,23 @@ pub enum Refusal {
     LokiRefused(String),
     /// Loki unreachable, 5xx, timed out, or not configured (503).
     LokiDown(String),
+    /// Off by choice: `cluster.monitoring: lean` and no Loki there (410).
+    LokiOff,
+}
+
+/// What a node is told when log search is off by choice on its controller.
+pub const LOKI_OFF_MESSAGE: &str = "log search is off on this controller by choice (noo stack monitoring on)";
+
+/// The refusal for a batch Loki did not take because it was not there or
+/// not answering. `absent` = no URL, or nothing at the address (connect /
+/// resolve failure). Off by choice only with BOTH a lean declaration and an
+/// absent Loki; otherwise today's 503 with `text`, unchanged.
+pub fn unavailable_refusal(lean: bool, absent: bool, text: String) -> Refusal {
+    if lean && absent {
+        Refusal::LokiOff
+    } else {
+        Refusal::LokiDown(text)
+    }
 }
 
 impl Refusal {
@@ -112,6 +134,7 @@ impl Refusal {
             Self::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::LokiDown(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::LokiOff => StatusCode::GONE,
         }
     }
 
@@ -124,6 +147,7 @@ impl Refusal {
             Self::RateLimited { what, .. } => what,
             Self::LokiRefused(_) => "loki_refused",
             Self::LokiDown(_) => "loki_down",
+            Self::LokiOff => "loki_off",
         }
     }
 
@@ -135,6 +159,7 @@ impl Refusal {
     pub fn message(&self) -> String {
         match self {
             Self::NotThisNode(m) | Self::Malformed(m) | Self::TooLarge(m) | Self::LokiDown(m) => m.clone(),
+            Self::LokiOff => LOKI_OFF_MESSAGE.to_string(),
             Self::LokiRefused(m) => format!("Loki refused the batch: {m}"),
             Self::RateLimited { what, retry_after } => {
                 format!("over the per-node log budget ({what}); retry in {retry_after}s")
@@ -406,8 +431,11 @@ pub enum Forward {
     Accepted,
     /// Loki answered 4xx: the batch is bad, retrying will not help.
     Refused(String),
-    /// Loki answered 5xx, timed out or could not be reached: retry later.
+    /// Loki answered 5xx or timed out: retry later.
     Down(String),
+    /// Nothing at the address (connect / resolve failure). Today's 503 on a
+    /// full install; "off by choice" on a lean one.
+    Unreachable(String),
 }
 
 /// `POST {loki_url}/loki/api/v1/push` with the gateway's own leaf. The
@@ -433,6 +461,7 @@ pub async fn forward_to_loki(client: &reqwest::Client, loki_url: &str, body: Vec
             }
         }
         Err(e) if e.is_timeout() => Forward::Down(format!("Loki timed out after {LOKI_PUSH_TIMEOUT_SECS}s")),
+        Err(e) if e.is_connect() => Forward::Unreachable(format!("Loki unreachable: {e}")),
         Err(e) => Forward::Down(format!("Loki unreachable: {e}")),
     }
 }
@@ -488,8 +517,9 @@ pub async fn node_logs_ingest(
         return refuse(r).await;
     }
     let loki_url = crate::config::env_or_yaml("NOO_LOKI_URL", |c| c.services.loki_url.clone(), "");
+    let lean = crate::config::monitoring_lean();
     if loki_url.is_empty() {
-        return refuse(Refusal::LokiDown("Loki is not configured on this controller (NOO_LOKI_URL)".into())).await;
+        return refuse(unavailable_refusal(lean, true, "Loki is not configured on this controller (NOO_LOKI_URL)".into())).await;
     }
     let encoding = headers.get("content-encoding").and_then(|v| v.to_str().ok());
     let decoded = match decode_body(&body, encoding) {
@@ -524,7 +554,13 @@ pub async fn node_logs_ingest(
         Forward::Refused(text) => refuse(Refusal::LokiRefused(text)).await,
         Forward::Down(text) => {
             tracing::warn!(node = %node_id, "log ingest: {text}");
-            refuse(Refusal::LokiDown(text)).await
+            refuse(unavailable_refusal(lean, false, text)).await
+        }
+        Forward::Unreachable(text) => {
+            if !lean {
+                tracing::warn!(node = %node_id, "log ingest: {text}");
+            }
+            refuse(unavailable_refusal(lean, true, text)).await
         }
     }
 }
@@ -858,8 +894,11 @@ mod tests {
         let dead = format!("http://{}", held.local_addr().unwrap());
         let client = reqwest::Client::new();
         let got = forward_to_loki(&client, &dead, b"{}".to_vec()).await;
-        assert!(matches!(got, Forward::Down(_)), "{got:?}");
-        let r = match got { Forward::Down(t) => Refusal::LokiDown(t), _ => unreachable!() };
+        assert!(matches!(got, Forward::Unreachable(ref t) if t.starts_with("Loki unreachable: ")), "{got:?}");
+        // Full or unset (lean = false): today's 503, retry, same text.
+        let Forward::Unreachable(t) = got else { unreachable!() };
+        let r = unavailable_refusal(false, true, t.clone());
+        assert_eq!(r, Refusal::LokiDown(t));
         assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(r.retry(), "5xx/unreachable = the node keeps the batch");
 
@@ -892,6 +931,22 @@ mod tests {
         assert!(!r.retry(), "Loki's 4xx = drop the batch");
     }
 
+    /// Lean + absent: 410 `loki_off`, `retry: false`, the plain line. A Loki
+    /// that is there and failing is still today's 503 on a lean install, and
+    /// full/unset never says "off".
+    #[test]
+    fn lean_and_absent_is_a_410_loki_off_that_says_do_not_retry() {
+        let off = unavailable_refusal(true, true, "Loki unreachable: x".into());
+        assert_eq!(off, Refusal::LokiOff);
+        assert_eq!(off.status(), StatusCode::GONE);
+        assert_eq!(off.reason(), "loki_off");
+        assert!(!off.retry(), "off by choice: retrying cannot help");
+        assert!(off.message().starts_with("log search is off on this controller by choice"), "{}", off.message());
+        assert_eq!(unavailable_refusal(true, false, "Loki answered 500 boom".into()), Refusal::LokiDown("Loki answered 500 boom".into()));
+        assert_eq!(unavailable_refusal(false, true, "u".into()), Refusal::LokiDown("u".into()));
+        assert_eq!(unavailable_refusal(false, false, "d".into()), Refusal::LokiDown("d".into()));
+    }
+
     /// Every refusal's response carries the machine-readable half the
     /// shipper branches on.
     #[test]
@@ -903,6 +958,7 @@ mod tests {
             (Refusal::RateLimited { what: "bytes_per_min", retry_after: 1 }, true),
             (Refusal::LokiRefused("x".into()), false),
             (Refusal::LokiDown("x".into()), true),
+            (Refusal::LokiOff, false),
         ] {
             assert_eq!(r.retry(), retry, "{r:?}");
             assert!(!r.reason().is_empty());

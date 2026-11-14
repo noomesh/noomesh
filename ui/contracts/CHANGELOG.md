@@ -2,6 +2,14 @@
 
 ## 2026-11-14
 
+Added `GET /api/monitoring/status` (every signed-in tier):
+`{monitoring, grafana, log_search, traces, message?}`, which optional
+monitoring parts run. With `cluster.monitoring: lean` and no Grafana,
+`POST /api/monitoring/grafana-session` answers 409 (was 503) naming
+`noo stack monitoring on`; with no Loki, `POST /api/logs/search` answers 200
+`{"lines": [], "backend": "off", "message": …}` (was 503). Unset or `full`
+is unchanged. Additive.
+
 Added `POST /api/inference/chat` (a signed-in person): one coordinator turn
 as Server-Sent Events (`data: {"type": …}` events, the console socket's
 shape) with the caller's retrieval, memory and tools; what `noo chat` uses.

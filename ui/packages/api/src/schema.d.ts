@@ -8798,9 +8798,29 @@ export interface paths {
         put?: never;
         /**
          * Open Grafana as the noomesh account at the browser
-         * @description an earlier change. Mints a short-lived Grafana session token for the LIVE noomesh account behind the login and returns the URL to open Grafana with (`<GRAFANA_ROOT_URL>/?auth_token=<jwt>`; Grafana's `[auth.jwt] url_login`). Any authenticated login: the account is RE-READ from `noo_users` (a disabled or deleted account is refused with 403), and its live tier - never the access token's `role` claim - becomes the token's `role`, and its Grafana org role from `auth::GRAFANA_ORG_ROLES` (the one tier->role table: admin->Admin, operator->Editor, user->Viewer, dashboards only) becomes `grafana_role`, which grafana.ini passes through. The token is ES256 with a DEDICATED key pair (`${NOO_PKI_DIR}/sso/grafana.key`; `noo security pki issue-sso-key`), `aud = noo-grafana`, no `kid`; the gateway itself refuses it. Grafana JWT auth is stateless, so the token IS the session: `NOO_GRAFANA_SESSION_TTL` minutes (5 default, 60 max), and no Grafana session outlives it - a disabled account's open tab dies at `expires_at`. 503 with the fix when `NOO_GRAFANA_URL` (`GRAFANA_ROOT_URL`) or the key is absent. Exchanged (`act`), harness, kiosk and add-on tokens, service keys and the cluster HMAC are refused (403): a person has to be at the browser. One audit row per mint (`grafana_session_issued`). The console opens the URL in a new tab; when it expires the person clicks Open Grafana again.
+         * @description an earlier change. Mints a short-lived Grafana session token for the LIVE noomesh account behind the login and returns the URL to open Grafana with (`<GRAFANA_ROOT_URL>/?auth_token=<jwt>`; Grafana's `[auth.jwt] url_login`). Any authenticated login: the account is RE-READ from `noo_users` (a disabled or deleted account is refused with 403), and its live tier - never the access token's `role` claim - becomes the token's `role`, and its Grafana org role from `auth::GRAFANA_ORG_ROLES` (the one tier->role table: admin->Admin, operator->Editor, user->Viewer, dashboards only) becomes `grafana_role`, which grafana.ini passes through. The token is ES256 with a DEDICATED key pair (`${NOO_PKI_DIR}/sso/grafana.key`; `noo security pki issue-sso-key`), `aud = noo-grafana`, no `kid`; the gateway itself refuses it. Grafana JWT auth is stateless, so the token IS the session: `NOO_GRAFANA_SESSION_TTL` minutes (5 default, 60 max), and no Grafana session outlives it - a disabled account's open tab dies at `expires_at`. 503 with the fix when `NOO_GRAFANA_URL` (`GRAFANA_ROOT_URL`) or the key is absent. Exchanged (`act`), harness, kiosk and add-on tokens, service keys and the cluster HMAC are refused (403): a person has to be at the browser. One audit row per mint (`grafana_session_issued`). The console opens the URL in a new tab; when it expires the person clicks Open Grafana again. On an install that declared `cluster.monitoring: lean` with no Grafana running, 409 `{"error": "Dashboards are off on this install: noo stack monitoring on"}`: off by choice, not a fault (a Grafana that answers is used as always).
          */
         post: operations["monitoring_grafana_session"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/monitoring/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Which optional monitoring parts run (Grafana, Loki, Tempo)
+         * @description [native] Rust (routes/monitoring.rs). Every signed-in tier (`auth::USER_READ_PATHS`). Whether dashboards (Grafana), log search (Loki) and traces (Tempo) are on. Each is `true` unless this install declared `cluster.monitoring: lean` in noomesh.yaml AND the part is absent (no URL, or nothing answers at its address); with the key unset or `full` all three are `true` and nothing is probed. `message` is present only when something is off and names `noo stack monitoring on`. The console shows it in place of the Open Grafana button.
+         */
+        get: operations["monitoring_status"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -8818,7 +8838,7 @@ export interface paths {
         put?: never;
         /**
          * Search the fleet's logs in Loki
-         * @description [native] Rust (routes/admin.rs, logs_search.rs). Operator or Admin only (`auth::LOGS_READ_PREFIX`). The fleet search behind `noo logs search` and the MCP `noo_logs_search`: "what happened on host3 at 14:02" (`node`, `since`, `until`), "every error in the last hour" (`level`, `since`). The gateway BUILDS the LogQL from the typed fields — a selector over the shipped labels `node`, `name`, `source`, `level` and a `|=` line filter for `text` with `"` and `\` escaped, so no field can open a pipeline stage. A `query` starting with `{` is an operator's own LogQL and passes through unchanged (the raw door `/api/logs/query` already opens that), under the same caps: `limit` <= 2000 and a window of at most 7 days (`range_clamped` says when `since` was moved). A `query` not starting with `{` is free text. The answer names the LogQL used. No fallback: Loki unconfigured or down is 503 with the reason, because a node-agent scan cannot answer a fleet query honestly; a Loki-refused query is 400 with Loki's text.
+         * @description [native] Rust (routes/admin.rs, logs_search.rs). Operator or Admin only (`auth::LOGS_READ_PREFIX`). The fleet search behind `noo logs search` and the MCP `noo_logs_search`: "what happened on host3 at 14:02" (`node`, `since`, `until`), "every error in the last hour" (`level`, `since`). The gateway BUILDS the LogQL from the typed fields — a selector over the shipped labels `node`, `name`, `source`, `level` and a `|=` line filter for `text` with `"` and `\` escaped, so no field can open a pipeline stage. A `query` starting with `{` is an operator's own LogQL and passes through unchanged (the raw door `/api/logs/query` already opens that), under the same caps: `limit` <= 2000 and a window of at most 7 days (`range_clamped` says when `since` was moved). A `query` not starting with `{` is free text. The answer names the LogQL used. No fallback: Loki unconfigured or down is 503 with the reason, because a node-agent scan cannot answer a fleet query honestly; a Loki-refused query is 400 with Loki's text. On an install that declared `cluster.monitoring: lean` with no Loki, 200 `{"lines": [], "backend": "off", "message": "Log search is off on this install. Turn it on: noo stack monitoring on"}` instead of 503.
          */
         post: operations["logs_search"];
         delete?: never;
@@ -22376,12 +22396,53 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description Dashboards are off by choice: `cluster.monitoring: lean` and no Grafana running. `{"error": "Dashboards are off on this install: noo stack monitoring on"}`. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Not configured: `NOO_GRAFANA_URL` is empty or the SSO key is absent/unreadable; the message names the fix. */
             503: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    monitoring_status: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /**
+                         * @description `cluster.monitoring` as the gateway reads it: only the literal `lean` is lean; unset means full.
+                         * @enum {string}
+                         */
+                        monitoring: "full" | "lean";
+                        /** @description Dashboards are on (Open Grafana works). */
+                        grafana: boolean;
+                        /** @description Log search (Loki) is on. */
+                        log_search: boolean;
+                        /** @description Trace export to Tempo is on; the summary rows (noo traces) are kept either way. */
+                        traces: boolean;
+                        /** @description Present only when something is off: which parts, and `noo stack monitoring on`. */
+                        message?: string;
+                    };
+                };
             };
         };
     };

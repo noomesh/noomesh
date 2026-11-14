@@ -54,6 +54,10 @@ def _backend_line(data: Any) -> str:
     backend = data.get("backend")
     if backend == "loki":
         return "backend: loki (fleet view)"
+    if data.get("loki_off") is True:
+        # cluster.monitoring: lean on this install: a choice, not a fault.
+        return ("backend: agent-scan — PARTIAL VIEW, only containers the node-agents could reach "
+                "(log search is off by choice: noo stack monitoring on)")
     why = data.get("loki_error") or "Loki not reachable"
     return f"backend: agent-scan — PARTIAL VIEW, only containers the node-agents could reach ({why})"
 
@@ -224,6 +228,9 @@ class PaiLogsSearch(ToolDef):
     def format_response(self, data: Any) -> str:
         if not isinstance(data, dict):
             return str(data)
+        if data.get("backend") == "off":
+            # cluster.monitoring: lean and no Loki: the gateway's own line.
+            return str(data.get("message") or "Log search is off on this install. Turn it on: noo stack monitoring on")
         lines = data.get("lines") or []
         out: List[str] = []
         for e in lines:

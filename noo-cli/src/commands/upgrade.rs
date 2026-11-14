@@ -2791,6 +2791,15 @@ fn reconcile_netns_unit(g: &Globals, root: &std::path::Path) {
 
 fn reconcile_grafana_door(g: &Globals, root: &std::path::Path) {
     use super::grafana_door as gd;
+    // Grafana is off on a lean install (cluster.monitoring): no tailnet
+    // serve entry for a port nothing listens on, and no certificate for a
+    // service that is not there. Unset or full: today's door, unchanged.
+    if super::stack_monitoring::effective_lean_live(root) {
+        if !g.json {
+            ui::say(&grafana_door_skipped_line());
+        }
+        return;
+    }
     let env_path = root.join(".env");
     let declared = gd::declared_door(&env_path);
     // The tailnet door: `tailscale serve` on Grafana's own port, so the
@@ -2842,6 +2851,13 @@ fn reconcile_grafana_door(g: &Globals, root: &std::path::Path) {
         Ok(false) => {}
         Err(e) => ui::warned(&format!("grafana service certificate: {e} — then: noo security pki issue-service grafana --san {}", door.host())),
     }
+}
+
+/// What the roll says instead of setting up Grafana's door on a lean install.
+fn grafana_door_skipped_line() -> String {
+    "Grafana door: skipped, Grafana is off on this install (cluster.monitoring: lean). \
+     After `noo stack monitoring on`, the next `noo upgrade --stack` sets it up"
+        .to_string()
 }
 
 /// Create and fill `pki/public/` (the gateway's certificate-only view,

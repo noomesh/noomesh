@@ -62,7 +62,9 @@ def test_every_loki_env_the_gateway_reads_is_set_on_its_service(projection):
         f"the gateway reads {missing} but compose does not set them on the gateway service — "
         "`noo logs status` answers 'not configured' whatever runs"
     )
-    assert env["NOO_LOKI_URL"].startswith("${NOO_LOKI_URL:-https://loki:3100}"), env["NOO_LOKI_URL"]
+    # `-`, not `:-`: unset takes the in-stack Loki, EMPTY stays empty (a
+    # lean install's launcher exports it empty: log search off by choice).
+    assert env["NOO_LOKI_URL"].startswith("${NOO_LOKI_URL-https://loki:3100}"), env["NOO_LOKI_URL"]
     assert "LOKI_URL" not in env, "the old, unread name is back on the gateway (the reader is NOO_LOKI_URL)"
 
 

@@ -23,6 +23,14 @@
 //! scan must never be mistaken for the fleet view. `search` has no
 //! fallback — a scan cannot answer a fleet query honestly — and returns 503
 //! with the reason instead.
+//!
+//! Loki is optional on a one-machine install (`cluster.monitoring: lean`,
+//! [`crate::config::ClusterConfig::monitoring_lean`]). There, and only
+//! there, a Loki that is ABSENT (no URL, or nothing at its address) is
+//! [`LokiOutcome::Off`]: `search` answers 200 with no lines and
+//! [`LOG_SEARCH_OFF`], `errors` / `tail` scan with `loki_off: true`. A Loki
+//! that answers is used as always (an older compose still runs it), and an
+//! install with the key unset keeps every error above unchanged.
 
 use chrono::{DateTime, Duration, SecondsFormat, TimeZone, Utc};
 use serde_json::{json, Value};
@@ -291,6 +299,22 @@ pub enum LokiOutcome {
     Refused(String),
     /// Unconfigured, unreachable, timed out or 5xx.
     Down(String),
+    /// Off by choice: this install declared `cluster.monitoring: lean` and
+    /// no Loki is there (no URL, or a connect/resolve failure). Never
+    /// produced when the key is unset or `full`.
+    Off,
+}
+
+/// What `search` says, and `/api/logs/query` too, when log search is off by choice.
+pub const LOG_SEARCH_OFF: &str = "Log search is off on this install. Turn it on: noo stack monitoring on";
+
+/// The `loki_error` of an `errors` / `tail` scan when Loki is off by choice.
+pub const LOKI_OFF_REASON: &str = "log search is off by choice: noo stack monitoring on";
+
+/// The `POST /api/logs/search` answer when Loki is off by choice: 200, no
+/// lines, `backend: off`, and the line naming the command that turns it on.
+pub fn search_off_answer() -> Value {
+    json!({ "lines": [], "backend": "off", "message": LOG_SEARCH_OFF })
 }
 
 /// Parse a `query_range` body (`data.resultType == "streams"`).
@@ -350,9 +374,21 @@ pub fn parse_query_range(body: &str, direction: &str) -> Result<Vec<Line>, Strin
 
 /// `GET {loki_url}/loki/api/v1/query_range`. The caller passes the client
 /// so a test can aim it at a local listener; the empty URL is "unconfigured".
+/// The answer of an install whose monitoring level is full (or unset).
 pub async fn query_loki(client: &reqwest::Client, loki_url: &str, q: &BuiltQuery) -> LokiOutcome {
+    query_loki_as(client, loki_url, q, false).await
+}
+
+/// [`query_loki`] for a declared level: with `lean`, an ABSENT Loki (empty
+/// URL, or a connect/resolve failure) is [`LokiOutcome::Off`]. Everything
+/// else — an answer, a 4xx, a 5xx, a timeout — is the same as [`query_loki`],
+/// because a Loki that is there is used whatever the declaration says.
+pub async fn query_loki_as(client: &reqwest::Client, loki_url: &str, q: &BuiltQuery, lean: bool) -> LokiOutcome {
     let loki_url = loki_url.trim();
     if loki_url.is_empty() {
+        if lean {
+            return LokiOutcome::Off;
+        }
         return LokiOutcome::Down("Loki is not configured on this controller (NOO_LOKI_URL)".into());
     }
     let url = format!(
@@ -394,14 +430,22 @@ pub async fn query_loki(client: &reqwest::Client, loki_url: &str, q: &BuiltQuery
             }
         }
         Err(e) if e.is_timeout() => LokiOutcome::Down(format!("Loki timed out after {LOKI_QUERY_TIMEOUT_SECS}s")),
+        Err(e) if lean && e.is_connect() => LokiOutcome::Off,
         Err(e) => LokiOutcome::Down(format!("Loki unreachable: {e}")),
     }
 }
 
-/// Ask Loki with the gateway's own leaf and the configured URL.
+/// The configured Loki base URL (`NOO_LOKI_URL`, then `services.loki_url`);
+/// empty = none. `GET /api/monitoring/status` asks through this, so the
+/// readers of the name stay the ones tests/test_loki_wiring_parity.py lists.
+pub fn configured_loki_url() -> String {
+    crate::config::env_or_yaml("NOO_LOKI_URL", |c| c.services.loki_url.clone(), "")
+}
+
+/// Ask Loki with the gateway's own leaf, the configured URL and this
+/// install's declared monitoring level.
 pub async fn query_configured_loki(q: &BuiltQuery) -> LokiOutcome {
-    let loki_url = crate::config::env_or_yaml("NOO_LOKI_URL", |c| c.services.loki_url.clone(), "");
-    query_loki(&crate::tls::cluster_client(), &loki_url, q).await
+    query_loki_as(&crate::tls::cluster_client(), &configured_loki_url(), q, crate::config::monitoring_lean()).await
 }
 
 /// The bounds and provenance every Loki-backed answer carries.
@@ -425,18 +469,43 @@ pub fn loki_envelope(q: &BuiltQuery, lines: &[Line]) -> Value {
 pub fn fallback_reason(outcome: &LokiOutcome) -> Option<String> {
     match outcome {
         LokiOutcome::Down(reason) => Some(reason.clone()),
+        LokiOutcome::Off => Some(LOKI_OFF_REASON.to_string()),
         LokiOutcome::Lines(_) | LokiOutcome::Refused(_) => None,
     }
 }
 
 /// Mark a node-agent scan answer as such. `reason` is why Loki did not
-/// answer; it is the operator's cue that this is a partial view.
+/// answer; it is the operator's cue that this is a partial view. A scan
+/// because log search is off by choice says so with `loki_off: true`, so
+/// the CLI footer and the console name the command instead of a fault.
 pub fn fallback_envelope(mut answer: Value, reason: &str) -> Value {
     if let Some(obj) = answer.as_object_mut() {
         obj.insert("backend".into(), json!("agent-scan"));
         obj.insert("loki_error".into(), json!(reason));
+        obj.insert("loki_off".into(), json!(reason == LOKI_OFF_REASON));
     }
     answer
+}
+
+/// The `POST /api/logs/search` answer for an outcome: lines (with the
+/// envelope), 400 for a refused query, 503 for a Loki that should be there
+/// and did not answer, and 200 [`search_off_answer`] when it is off by
+/// choice — never a 503 for a choice.
+pub fn search_answer(outcome: LokiOutcome, q: &BuiltQuery) -> Result<Value, crate::routes::AppError> {
+    use crate::routes::AppError;
+    match outcome {
+        LokiOutcome::Lines(got) => {
+            let answer = json!({
+                "lines": got.iter().map(Line::to_json).collect::<Vec<_>>(),
+            });
+            Ok(merge(answer, loki_envelope(q, &got)))
+        }
+        LokiOutcome::Refused(reason) => Err(AppError::BadRequest(reason)),
+        LokiOutcome::Down(reason) => Err(AppError::Unavailable(format!(
+            "log search needs Loki and it did not answer: {reason}"
+        ))),
+        LokiOutcome::Off => Ok(search_off_answer()),
+    }
 }
 
 /// Merge the envelope fields into an answer.
@@ -773,6 +842,80 @@ mod tests {
         let got = query_loki(&client, &url, &q).await;
         srv.await.unwrap();
         assert!(matches!(got, LokiOutcome::Refused(ref r) if r.contains("parse error")), "{got:?}");
+    }
+
+    // ── off by choice (cluster.monitoring: lean) ──
+
+    /// A port bound for the whole test but never listening: a connect is
+    /// refused and no parallel test can take it.
+    fn held_dead_port() -> (tokio::net::TcpSocket, String) {
+        let held = tokio::net::TcpSocket::new_v4().unwrap();
+        held.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let url = format!("http://{}", held.local_addr().unwrap());
+        (held, url)
+    }
+
+    #[tokio::test]
+    async fn lean_and_absent_is_off_and_full_or_unset_keeps_todays_errors() {
+        let q = build(&spec(), now()).unwrap();
+        let client = reqwest::Client::new();
+        let (_held, dead) = held_dead_port();
+        // lean: no URL, or nothing at the address = off by choice.
+        assert_eq!(query_loki_as(&client, "", &q, true).await, LokiOutcome::Off);
+        assert_eq!(query_loki_as(&client, &dead, &q, true).await, LokiOutcome::Off);
+        // full / unset (lean = false): exactly today's Down reasons.
+        assert_eq!(
+            query_loki_as(&client, "", &q, false).await,
+            LokiOutcome::Down("Loki is not configured on this controller (NOO_LOKI_URL)".into())
+        );
+        let got = query_loki_as(&client, &dead, &q, false).await;
+        assert!(matches!(got, LokiOutcome::Down(ref r) if r.starts_with("Loki unreachable: ")), "{got:?}");
+        assert_eq!(query_loki(&client, "", &q).await, query_loki_as(&client, "", &q, false).await);
+    }
+
+    #[tokio::test]
+    async fn lean_with_a_loki_that_answers_uses_it_as_today() {
+        let q = build(&spec(), now()).unwrap();
+        let client = reqwest::Client::new();
+        let (url, srv) = one_shot_loki(200, ANSWER).await;
+        let got = query_loki_as(&client, &url, &q, true).await;
+        srv.await.unwrap();
+        let LokiOutcome::Lines(lines) = got else { panic!("an older compose still runs Loki: {got:?}") };
+        assert_eq!(lines.len(), 3);
+        // A Loki that is THERE and failing is a fault, not a choice.
+        let (url, srv) = one_shot_loki(500, "boom").await;
+        let got = query_loki_as(&client, &url, &q, true).await;
+        srv.await.unwrap();
+        assert_eq!(got, LokiOutcome::Down("Loki answered 500 boom".into()));
+    }
+
+    #[test]
+    fn search_off_is_a_200_naming_the_command_and_down_stays_a_503() {
+        let q = build(&spec(), now()).unwrap();
+        let off = search_answer(LokiOutcome::Off, &q).expect("off by choice is an answer, not an error");
+        assert_eq!(
+            off,
+            json!({"lines": [], "backend": "off", "message": "Log search is off on this install. Turn it on: noo stack monitoring on"})
+        );
+        match search_answer(LokiOutcome::Down("Loki unreachable: x".into()), &q) {
+            Err(crate::routes::AppError::Unavailable(m)) => {
+                assert_eq!(m, "log search needs Loki and it did not answer: Loki unreachable: x")
+            }
+            other => panic!("full/unset + absent must stay today's 503: {other:?}"),
+        }
+        assert!(matches!(search_answer(LokiOutcome::Refused("bad".into()), &q), Err(crate::routes::AppError::BadRequest(_))));
+        let lines = search_answer(LokiOutcome::Lines(vec![]), &q).unwrap();
+        assert_eq!(lines["backend"], "loki");
+    }
+
+    #[test]
+    fn a_scan_because_loki_is_off_says_so_and_a_scan_because_it_is_down_does_not() {
+        assert_eq!(fallback_reason(&LokiOutcome::Off).as_deref(), Some(LOKI_OFF_REASON));
+        let off = fallback_envelope(json!({"matches": []}), LOKI_OFF_REASON);
+        assert_eq!(off["loki_off"], true);
+        assert_eq!(off["backend"], "agent-scan");
+        let down = fallback_envelope(json!({"matches": []}), "Loki unreachable: connect refused");
+        assert_eq!(down["loki_off"], false);
     }
 
     // ── the fallback contract ──

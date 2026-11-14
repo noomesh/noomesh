@@ -1095,6 +1095,20 @@ mod tests {
             "the roll must front Grafana's port with tailscale serve before settling the door");
     }
 
+    /// Lean (cluster.monitoring): the roll writes no serve entry and issues
+    /// no certificate for a Grafana that is off by choice, and says so.
+    #[test]
+    fn a_lean_install_skips_the_door_and_says_so() {
+        let own = crate::test_src::own_code(include_str!("upgrade.rs"));
+        let f = crate::test_src::fn_body(&own, "fn reconcile_grafana_door(");
+        let skip = f.find("if super::stack_monitoring::effective_lean_live(root)").expect("the lean check");
+        let door = f.find("gd::reconcile_door(").expect("the door");
+        let leaf = f.find("gd::ensure_leaf_names_door(").expect("the leaf");
+        assert!(skip < door && skip < leaf, "the skip must come before anything is written");
+        let line = crate::test_src::fn_body(&own, "fn grafana_door_skipped_line(");
+        assert!(line.contains("cluster.monitoring: lean") && line.contains("noo stack monitoring on"), "{line}");
+    }
+
     #[test]
     fn wide_binds_are_named() {
         for ok in ["", "127.0.0.1", "::1", "localhost", "100.64.0.15"] {

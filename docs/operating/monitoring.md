@@ -10,7 +10,9 @@ noomesh.yaml says `cluster.monitoring: lean`; unset means full, and a new
 install is lean unless you answer yes in the wizard. `noo stack monitoring
 status` shows which and where it is set; `on` starts them on their earlier
 data; `off` removes the containers, keeps `<state root>/{loki,tempo,grafana}`
-and prints the `sudo rm -rf` line to delete it yourself. Prove it:
+and prints the `sudo rm -rf` line to delete it yourself. While they are off,
+log search, Open Grafana and node log shipping answer "off by choice" with
+`noo stack monitoring on`, never an error. Prove it:
 
 ```sh
 noo health                                        # gateway + dependencies, exit 5 if degraded

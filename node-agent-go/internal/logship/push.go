@@ -24,7 +24,14 @@ const (
 	outcomeAccepted outcome = iota // 2xx: the batch is in
 	outcomeDropped                 // 400/413 (or retry:false): never acceptable; drop it, say so once
 	outcomeRetry                   // 401/403/429/5xx/404/transport (or retry:true): keep it, back off
+	outcomeLokiOff                 // 410 reason loki_off: log search is off on the controller by choice; drop it, pause
 )
+
+// reasonLokiOff is the gateway's `reason` when the controller declared
+// `cluster.monitoring: lean` and runs no Loki (routes/logs_ingest.rs
+// Refusal::LokiOff, 410, retry:false). An agent from before this code reads
+// retry:false and drops each batch; this one also pauses, like the 404 path.
+const reasonLokiOff = "loki_off"
 
 type pushResult struct {
 	outcome    outcome
@@ -124,6 +131,10 @@ func classify(status int, retryAfterHdr string, body []byte) pushResult {
 		// Older gateway: keep the batch and let the shipper re-probe.
 		res.outcome = outcomeRetry
 		res.err = errRouteAbsent
+	case ref.Reason == reasonLokiOff:
+		// Off by choice on the controller: the batch can never land there,
+		// and nor can the next one until someone turns log search on.
+		res.outcome = outcomeLokiOff
 	case ref.Retry != nil:
 		// The gateway said whether this is worth retrying; believe it.
 		if *ref.Retry {

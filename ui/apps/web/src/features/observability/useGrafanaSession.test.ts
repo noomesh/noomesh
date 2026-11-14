@@ -12,6 +12,7 @@ const H = vi.hoisted(() => ({
 
 vi.mock('@metis/core', () => ({
   useMetisClient: () => ({ POST: H.post }),
+  useQuery: vi.fn(),
   useMutation: (opts: Record<string, unknown>) => {
     H.lastMutation.current = opts;
     return {};
@@ -59,6 +60,11 @@ describe('useGrafanaSession', () => {
     await expect(run()).rejects.toThrow('account is disabled');
     H.post.mockResolvedValue({ error: {} });
     await expect(run()).rejects.toThrow('Could not open Grafana');
+  });
+
+  it('passes the 409 "off by choice" line through, naming the command', async () => {
+    H.post.mockResolvedValue({ error: { error: 'Dashboards are off on this install: noo stack monitoring on' } });
+    await expect(run()).rejects.toThrow('Dashboards are off on this install: noo stack monitoring on');
   });
 });
 

@@ -688,6 +688,7 @@ func TestClassifyFollowsTheGatewayContract(t *testing.T) {
 		{403, ``, outcomeRetry},
 		{429, `{"error":"slow down","reason":"bytes_per_min","retry":true}`, outcomeRetry},
 		{503, `{"error":"loki down","reason":"loki_down","retry":true}`, outcomeRetry},
+		{410, `{"error":"log search is off on this controller by choice","reason":"loki_off","retry":false}`, outcomeLokiOff},
 		{500, ``, outcomeRetry},
 		{404, ``, outcomeRetry},
 		// `retry` is believed over the status class, both ways.
@@ -722,5 +723,56 @@ func TestACredentialRefusalKeepsTheBatch(t *testing.T) {
 	waitFor(t, "delivered after the 403", func() bool { return s.State()["shipped_total"].(int64) == 1 })
 	if st := s.State(); st["dropped_total"].(int64) != 0 || ig.lines() != 1 {
 		t.Fatalf("a 403 must not drop: %v", st)
+	}
+}
+
+// 410 loki_off (the controller declared cluster.monitoring: lean and runs
+// no Loki): the batch is dropped, not retried; shipping pauses for
+// RouteRetry with intake discarded; the heartbeat says enabled:false with
+// the reason; and once the controller accepts again, it is enabled again.
+func TestLokiOffPausesOnTheLongCadenceAndReportsDisabled(t *testing.T) {
+	var hits, off int32
+	atomic.StoreInt32(&off, 1)
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&hits, 1)
+		if n == 1 { // the route probe
+			w.WriteHeader(400)
+			return
+		}
+		if atomic.LoadInt32(&off) == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusGone)
+			_, _ = w.Write([]byte(`{"error":"log search is off on this controller by choice (noo stack monitoring on)","reason":"loki_off","retry":false}`))
+			return
+		}
+		w.WriteHeader(204)
+	}))
+	defer srv.Close()
+	s := newShipper(t, srv, "n1", func(c *Config) { c.RouteRetry = 400 * time.Millisecond })
+	runUntilCleanup(t, s)
+	waitFor(t, "route probe", func() bool { return atomic.LoadInt32(&hits) >= 1 })
+	s.Offer(entry("c", "first"))
+	waitFor(t, "loki_off answered", func() bool { return atomic.LoadInt32(&hits) >= 2 })
+	waitFor(t, "drop counted", func() bool { return s.State()["dropped_total"].(int64) == 1 })
+	st := s.State()
+	if st["enabled"] != false || st["reason"] != "loki_off" || !strings.Contains(st["last_error"].(string), "off on this controller by choice") {
+		t.Fatalf("state after loki_off = %v", st)
+	}
+	// Paused: intake is discarded and nothing is sent until RouteRetry.
+	s.Offer(entry("c", "during the pause"))
+	time.Sleep(150 * time.Millisecond)
+	if h := atomic.LoadInt32(&hits); h != 2 {
+		t.Fatalf("a loki_off must pause, not retry; hits=%d", h)
+	}
+	if q := s.State()["queued"].(int); q != 0 {
+		t.Fatalf("intake during the pause must be discarded, queued=%d", q)
+	}
+	// Turned on at the controller: after the pause the next line lands.
+	atomic.StoreInt32(&off, 0)
+	waitFor(t, "pause over", func() bool { return !s.offPaused.Load() })
+	s.Offer(entry("c", "after"))
+	waitFor(t, "shipped after the pause", func() bool { return s.State()["shipped_total"].(int64) == 1 })
+	if st := s.State(); st["enabled"] != true {
+		t.Fatalf("an accepted push must clear loki_off: %v", st)
 	}
 }

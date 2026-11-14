@@ -39,6 +39,14 @@ from ..ops_client import settle
 
 logger = structlog.get_logger()
 
+# The security audit's "log search is off by choice" line is logged once per
+# process, not every run (cluster.monitoring: lean leaves no Loki).
+_LOKI_OFF_NOTED = False
+
+
+class _LokiOff(Exception):
+    """No Loki on this install by choice: the audit skips the Loki source."""
+
 # ---------------------------------------------------------------------------
 # Optional dependency
 # ---------------------------------------------------------------------------
@@ -2706,11 +2714,28 @@ class HeartbeatActionExecutor:
             logger.warning("security_audit_approval_stats_error", error=str(e))
             unchecked.append("high_risk_tool_calls")
 
-        # Try Loki if available
+        # Try Loki if available. NOO_LOKI_URL present but EMPTY is the
+        # launcher's word for "no Loki here by choice" (cluster.monitoring:
+        # lean): skip, say so once, and do not guess <gateway>:3100. Unset
+        # (an older compose) keeps the guess below.
+        configured = task.config.get("loki_url")
+        env_loki = os.environ.get("NOO_LOKI_URL")
+        if not configured and env_loki is not None and not env_loki.strip():
+            global _LOKI_OFF_NOTED
+            if not _LOKI_OFF_NOTED:
+                _LOKI_OFF_NOTED = True
+                logger.info(
+                    "security_audit_loki_off",
+                    detail="log search is off on this install by choice; auth failures are not counted "
+                    "(noo stack monitoring on)",
+                )
+            note = " auth_failures not counted: log search is off by choice (noo stack monitoring on)."
+        else:
+            note = ""
         try:
-            loki_url = task.config.get("loki_url") or os.environ.get(
-                "NOO_LOKI_URL", ""
-            )
+            if note:
+                raise _LokiOff()
+            loki_url = configured or env_loki or ""
             if not loki_url:
                 # Fall back to gateway host with default Loki port
                 from urllib.parse import urlparse
@@ -2729,6 +2754,8 @@ class HeartbeatActionExecutor:
                 data = r.json().get("data", {}).get("result", [])
                 auth_count = sum(len(s.get("values", [])) for s in data)
                 findings["auth_failures"] = auth_count
+        except _LokiOff:
+            findings.pop("auth_failures", None)
         except Exception as e:
             logger.warning("security_audit_loki_error", error=str(e))
             unchecked.append("auth_failures")
@@ -2741,9 +2768,9 @@ class HeartbeatActionExecutor:
             return (
                 f"Security audit ({period_hours}h): {detail}. NOT CHECKED: "
                 f"{', '.join(unchecked)} (source errored; counts above exclude them). "
-                f"Overall risk: {risk_level} (incomplete)"
+                f"Overall risk: {risk_level} (incomplete){note}"
             )
-        return f"Security audit ({period_hours}h): {detail}. Overall risk: {risk_level}"
+        return f"Security audit ({period_hours}h): {detail}. Overall risk: {risk_level}{note}"
 
     async def _cert_rotation_check(self, task: HeartbeatTask) -> str:
         """Check PKI directory for certificates expiring soon."""
