@@ -157,7 +157,9 @@ stack tag (`--tag vX.Y.Z` overrides the pairing). `--stack` manages
 standalone installs only; on a checkout use `noo stack start`/`rebuild`.
 `--nodes` ends `bundles staged for all N node(s) — each applies on its next
 fetch tick`. An enrolled node upgrades its own binary from the controller's
-mirror (`/bootstrap/cli`), so nodes need no GitHub access. Private release
+mirror (`/bootstrap/cli`), so nodes need no GitHub access. From the mirror it
+downloads only when the mirror's signed manifest names a different version or
+binary than the one running; an unverified manifest never counts as current. Private release
 assets are fetched via `NOO_CLI_BASE_URL` (a mirror), `gh` on `PATH`, or a
 `GH_TOKEN`/`GITHUB_TOKEN` token, in that order; if the install directory is
 root-owned, re-run with `sudo` or set `NOO_INSTALL_DIR`.
