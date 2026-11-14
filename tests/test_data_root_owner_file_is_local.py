@@ -8,6 +8,8 @@ node. Only the local self-install (provision.rs, inside its own sudo) writes it.
 import re
 from pathlib import Path
 
+from tests import _rust_src as rs
+
 ROOT = Path(__file__).resolve().parents[1]
 FILE = "/etc/noo/data-root-owner"
 
@@ -23,11 +25,18 @@ def test_the_bundle_builder_has_no_kind_for_it_and_only_the_local_lane_writes_it
     prov = (ROOT / "noo-cli/src/commands/provision.rs").read_text()
     uses = [m.start() for m in re.finditer(re.escape("DATA_ROOT_OWNER_FILE"), prov)]
     assert uses, "the constant exists"
-    # Only the declaration, the local script and the local lane's read (plus tests) use it.
-    code = prov.split("#[cfg(test)]", 1)[0]
-    lines = [l.strip() for l in code.splitlines() if "DATA_ROOT_OWNER_FILE" in l and not l.strip().startswith("//")]
+    # Only the declaration, the local script and the local lane's read use it
+    # (tests are not product code: own_code_lines drops them, lines kept).
+    code = rs.own_code_lines(prov)
+    lines = [l.strip() for l in code.splitlines() if "DATA_ROOT_OWNER_FILE" in l]
     assert len(lines) == 3, lines
     assert '"data-root-owner"' not in code, "no bundle kind is named after it"
+    # Elsewhere the path may be NAMED (verify's remedy tells the reader where
+    # the declaration lives) but never written: no write verb beside it.
+    writes = re.compile(r"write|tee |install |File::create|OpenOptions|>")
     for other in (ROOT / "noo-cli/src").rglob("*.rs"):
-        if other.name != "provision.rs":
-            assert FILE not in other.read_text(), f"{other} must not write the owner file"
+        if other.name == "provision.rs":
+            continue
+        for l in rs.own_code_lines(other.read_text()).splitlines():
+            if FILE in l:
+                assert not writes.search(l), f"{other}: writes the owner file: {l.strip()}"
