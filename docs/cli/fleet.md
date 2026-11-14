@@ -106,6 +106,14 @@ noo cluster desired gpu-2
 noo cluster unplace gpu-2 ollama
 ```
 
+An ollama unloads an idle model after its keep_alive (5 minutes by
+default) and loads it again, cold, on the next request. `--keep-warm`
+declares an ollama chat model warm on any ollama runtime (agent-run,
+brew, Ollama.app, the controller's own): the agent preloads it and keeps
+it loaded; `--no-keep-warm` hands it back to the daemon's expiry. Only
+that model is pinned, a GPU yield or hold unloads it, and `noo cluster
+show` marks it `warm (declared)`.
+
 ### Run it on CPU or GPU
 
 `--on cpu|gpu` declares the hardware a placement runs on, and is stored
@@ -426,7 +434,7 @@ See [weight-cache.md](../models/weight-cache.md).
 
 ```sh
 noo inference run "Summarise this in one line: …" -m qwen2.5:7b-instruct
-noo inference agent "Which nodes are idle and why?" --max-iters 6
+noo inference agent "Which nodes are idle and why?"
 noo jobs run "…" --priority 8            # queue it; polls every 2 s until terminal
 noo jobs run "…" --async                 # print the id and return
 noo jobs status <job-id> --wait
@@ -440,8 +448,8 @@ schemas); `--raw` sends `context: false` for a plain model call.
 does and the CLI says so (`! answered by <model> — <node> could not:
 …`). `--strict-node` keeps the prompt on that node alone and fails
 when it cannot answer — for locality or privacy, or a liveness check;
-`inference agent` runs the coordinator loop with tools (`--no-tools`
-disables them). A job that ends in any state other than `completed` exits
+`inference agent` runs the coordinator loop with tools and waits up to
+300 s for the answer (`--timeout` changes that). A job that ends in any state other than `completed` exits
 1. `jobs scheduler` shows dispatch counters; `jobs pause`/`resume` stop and
 restart dispatch; `jobs drain <node>` stops sending a node work while
 its running jobs finish, `undrain` reverses it. `jobs cancel` asks for
@@ -538,7 +546,11 @@ noo autonomy audit -n 50     # what it decided recently
 noo autonomy disable         # stop the patrols (re-enable with enable)
 ```
 
-Locations, conditions and actions are listed by `noo autonomy locations`. If a backend keeps
+Locations, conditions and actions are listed by `noo autonomy locations`.
+Two rules can delete or change things, `disk_watermark` (reclaims Docker
+space) and `cert_auto_rotate` (re-issues certificates). They preview by
+default. `noo autonomy live <rule>` (or Go live in the console) arms one
+and takes it out of preview; `noo autonomy preview <rule>` puts it back. If a backend keeps
 refusing to start after an outage, `noo cluster clear-cooldowns` resets
 the auto-start backoff (the gateway clears every node regardless of the
 argument).
@@ -816,14 +828,14 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 | Command | Arguments | What it does |
 |---|---|---|
 | `noo cluster status` | — | List nodes: tier, status, RUNNING backends, CAPABILITIES by role, CAN-RUN |
-| `noo cluster verify` | `[<node>...] [--controller] [--wait] [--timings]` | Assert every invariant a node and the controller must meet; exit 1 with the remedy |
+| `noo cluster verify` | `[<node>...] [--controller] [--wait] [--timings] [--brief]` | Assert node and controller invariants; exit 1 with the remedy (--brief: failures first) |
 | `noo cluster invite` | — | Mint a tagged tailscale auth key and print the `noo enroll --via-tailnet <url>` line |
 | `noo cluster down` | `<backend> [--node <node>] [-y\|--yes]` | Stop a backend on one node or all nodes; destructive, asks for confirmation (-y) |
 | `noo cluster desired` | `<node>` | Alias of show: the node in full, with its desired config and every placement |
 | `noo cluster proposals` | `[--status <s>] [--limit <n>]` | List the enrollment proposals agents filed, with each host in full |
 | `noo cluster show` | `<node>` | Show one node in full: hardware, agent version, tier drift, bus principal, roles |
 | `noo cluster forget` | `<node> [--purge-tailscale] [-y\|--yes]` | Remove a dead node's row, KV entry and enrollments; --purge-tailscale drops its device |
-| `noo cluster place` | `<node> <backend\|harness> <model\|auto> [--on cpu\|gpu] [--env KEY=VALUE]... [--kind noo\|claude-code\|copilot\|codex] [--role chat\|embed\|rerank] [--port <port>] [--tls] [--image <image>] [--stopped] [--force]` | Declare a backend and model in a role on a node, on cpu or gpu; auto-tunes unless --env |
+| `noo cluster place` | `<node> <backend\|harness> <model\|auto> [--on cpu\|gpu] [--keep-warm\|--no-keep-warm] [--env KEY=VALUE]... [--kind noo\|claude-code\|copilot\|codex] [--role chat\|embed\|rerank] [--port <port>] [--tls] [--image <image>] [--stopped] [--force]` | Declare a backend and model in a role on a node, on cpu or gpu; auto-tunes unless --env |
 | `noo cluster unplace` | `<node> <backend> [--role chat\|embed\|rerank] [--model <model>]` | Remove a placement, or one embed model; a container keeps running, a harness is stopped |
 | `noo cluster fit` | `<node> [--with <backend> <model> [--on cpu\|gpu] [--role <role>] [--env KEY=VALUE]...]` | Show whether placements fit a node's GPU memory and RAM, with or without one more |
 | `noo cluster class list` | — | Show the model classes consumers may send as `model`, with candidate placement and health |
@@ -936,6 +948,8 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 | `noo autonomy decisions` | `[-n\|--limit <n>] [-l\|--location <name>]` | What the disarmed autonomy locations would have done — the evidence for arming one |
 | `noo autonomy enable` | — | Enable the autonomy engine |
 | `noo autonomy disable` | — | Disable the autonomy engine |
+| `noo autonomy live` | `<rule> [-y\|--yes]` | Arm a gated rule and take it out of preview: it then acts; asks first; operator or admin |
+| `noo autonomy preview` | `<rule>` | Put a gated rule back into preview: it records what it would do; its arm state stays |
 
 ### `noo skills` — Containerized skill management
 | Command | Arguments | What it does |

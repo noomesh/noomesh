@@ -22434,6 +22434,129 @@
           }
         }
       }
+    },
+    "/api/autonomy/locations/{name}/dry-run": {
+      "post": {
+        "tags": [
+          "intelligence"
+        ],
+        "summary": "Take an autonomy rule live (armed, out of preview), or put it back into preview",
+        "description": "[native] `{\"dry_run\": false}` takes a rule with a dry-run gate LIVE in one update: it arms the rule (`enabled_action: true`) and takes it out of preview (`dry_run: false`), so from its next tick it acts (disk_watermark deletes what its reclaim ladder previews, including superseded images of noomesh and of the add-ons it runs, from those images' own repositories only; cert_auto_rotate re-issues certificates and restarts their services). A rule that is switched off is refused (409, with how to switch it on). `{\"dry_run\": true}` puts it back into preview and leaves it armed or not. Operator or admin only (403 otherwise); 400 for a rule with no dry-run gate. The keys are merged into the rule's stored override, so its tunables stay as they are, and the change is audited with who made it. The answer is the rule's state read back after the write.",
+        "operationId": "autonomy_set_dry_run",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "disk_watermark",
+                "cert_auto_rotate"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "dry_run"
+                ],
+                "properties": {
+                  "dry_run": {
+                    "type": "boolean",
+                    "description": "false: live (the rule acts); true: preview (it only reports)."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "enabled": {
+                      "type": "boolean",
+                      "description": "The rule is switched on (read back)."
+                    },
+                    "armed": {
+                      "type": "boolean",
+                      "description": "Its action is armed (`enabled_action`, read back)."
+                    },
+                    "dry_run": {
+                      "type": "boolean",
+                      "description": "It previews instead of acting (read back)."
+                    },
+                    "config": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "live_means": {
+                      "type": "string",
+                      "description": "What the rule does when live, in plain words."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "No such gate, or no dry_run in the body"
+          },
+          "403": {
+            "description": "Not an operator or admin"
+          },
+          "409": {
+            "description": "The rule is switched off: switch it on first (the message says how)."
+          }
+        }
+      }
+    },
+    "/api/inference/chat": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create chat",
+        "description": "[native] POST /api/inference/chat \u2014 see [`CHAT_STREAM_PATH`].",
+        "operationId": "coordinator_chat_stream",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

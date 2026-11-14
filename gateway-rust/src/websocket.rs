@@ -188,6 +188,17 @@ impl WsWriter {
         (WsWriter { tx }, stream, handle)
     }
 
+    /// A writer with no socket behind it: its frames go to the returned
+    /// receiver. `POST /api/inference/chat` turns them into Server-Sent
+    /// Events, so the coordinator turn, its approval card and the outcome
+    /// echo reach a CLI client exactly as they reach the console socket.
+    /// Dropping the receiver makes every send return false (advisory, as
+    /// for a closed socket).
+    pub fn detached() -> (Self, tokio::sync::mpsc::UnboundedReceiver<Message>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        (WsWriter { tx }, rx)
+    }
+
     /// Queue a JSON value as a text frame. Returns false when the
     /// connection is gone (forwarder ended). Queueing is synchronous;
     /// these are `async fn` purely so call sites keep the exact shape of

@@ -86,6 +86,13 @@ type placement struct {
 	// the gateway at place time from the fit estimate (weights + KV +
 	// overhead) and capped by the node's usage profile. 0 = the spec default.
 	MemoryLimitBytes int64 `json:"memory_limit_bytes"`
+	// KeepWarm: `noo cluster place … --keep-warm` (ollama chat placements).
+	// The agent keeps THIS model loaded on whichever ollama serves it (agent
+	// run, brew, the adopted stack lane): it adds keep_alive -1 to the
+	// model's requests and preloads it (internal/keepwarm). Not part of the
+	// spec hash: it changes no container. A pre-keep-warm gateway omits it,
+	// which is false.
+	KeepWarm bool `json:"keep_warm"`
 }
 
 type nodeConfig struct {
@@ -402,6 +409,7 @@ var reconcilePhases = []phase{
 	{"convergePlacements", (*Reconciler).convergePlacements},
 	{"healDoorNamespaces", (*Reconciler).healDoorNamespaces},
 	{"reportAndCleanup", (*Reconciler).reportAndCleanup},
+	{"writeImageKeep", (*Reconciler).writeImageKeep},
 }
 
 // Once performs a single reconcile pass. Errors are logged, never fatal —
@@ -449,6 +457,7 @@ func (r *Reconciler) publishProfileAndEmbedTarget(ctx context.Context, t *tick) 
 	declareAddonWorkloads(t.desired)
 	r.recordChatPlacement(t.desired.Placements)
 	publishLanePlacements(t.desired.Placements)
+	publishKeepWarm(t.desired.Placements)
 	// Before the empty-state return below: a node with nothing placed still
 	// has a disk to keep.
 	if r.onReclaimPolicy != nil {

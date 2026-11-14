@@ -875,10 +875,6 @@ pub fn docker_mut(ctx: &Ctx, args: &[&str]) -> (i32, String) {
     docker(args)
 }
 
-pub fn docker_daemon_running() -> bool {
-    docker(&["info"]).0 == 0
-}
-
 /// Docker Hub creds present in ~/.docker/config.json (parity with `_check_docker_login`).
 pub fn docker_logged_in() -> bool {
     let Ok(home) = std::env::var("HOME") else { return false };

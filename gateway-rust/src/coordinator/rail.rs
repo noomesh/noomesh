@@ -267,7 +267,7 @@ mod tests {
             HarnessOp::RetrievalFeedback { tool_name: String::new(), success: true },
             HarnessOp::SkillUsage { names: vec![] },
             HarnessOp::PreHooks { prompt: String::new() },
-            HarnessOp::PostHooks { result: CoordinatorResult { response: String::new(), model: String::new(), backend: String::new(), node: None, iterations: 0, tool_calls: vec![], elapsed_secs: 0.0, usage: Default::default() } },
+            HarnessOp::PostHooks { result: CoordinatorResult { response: String::new(), model: String::new(), backend: String::new(), node: None, iterations: 0, tool_calls: vec![], elapsed_secs: 0.0, usage: Default::default(), recall: None } },
             HarnessOp::Shard,
             HarnessOp::TemporalExtract { user_message: String::new(), assistant_response: String::new() },
             HarnessOp::MaybeSummary { backend, turn: 0 },

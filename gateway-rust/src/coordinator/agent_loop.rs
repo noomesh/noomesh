@@ -50,6 +50,10 @@ pub struct CoordinatorResult {
     pub tool_calls: Vec<Value>,
     pub elapsed_secs: f64,
     pub usage: UsageStats,
+    /// What the per-turn conversation recall did (`{"status":"ok","hits":N}`
+    /// or `{"status":"skipped","reason":...}`); None when it did not run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall: Option<super::context::RecallStatus>,
 }
 
 /// Conversation-level usage statistics (mirrors Python's metadata tracking).
@@ -60,6 +64,24 @@ pub struct UsageStats {
     pub total_tokens: u32,
     pub total_tool_calls: u32,
     pub total_latency_ms: u64,
+}
+
+/// The `done` frame: the turn's accounting, plus `recall` when the recall
+/// layer ran -- a skipped recall carries its reason so the console can say
+/// the answer was given without memory (ws-protocol.md §2B).
+fn done_frame(result: &CoordinatorResult, usage: &UsageStats) -> Value {
+    let mut frame = json!({
+        "iterations": result.iterations,
+        "tool_calls": result.tool_calls.len(),
+        "elapsed_seconds": (result.elapsed_secs * 10.0).round() / 10.0,
+        "tokens_in": usage.prompt_tokens,
+        "tokens_out": usage.completion_tokens,
+        "engine": "rust",
+    });
+    if let Some(r) = &result.recall {
+        frame["recall"] = json!(r);
+    }
+    frame
 }
 
 /// Sanitize tool output — delegates to the security kernel.
@@ -2020,6 +2042,9 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     ).await;
 
     // (A/B/C) Long-conversation continuity — only when history was dropped.
+    // What the recall layer did this turn; None when it did not run
+    // (no history was dropped, so nothing needed recalling).
+    let mut recall_status: Option<super::context::RecallStatus> = None;
     let abc_ctx: Option<String> = if !dropped.is_empty() {
         let mut s = String::new();
         if let Some(outline) = build_history_summary(&dropped, conversation_id) {
@@ -2034,14 +2059,18 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             s.push_str("\n\n[Conversation so far]\n");
             s.push_str(&summary);
         }
-        if let Some(recall) = time_layer(
+        let recall = time_layer(
             rt.metrics(),
             "semantic_recall",
             rt.conversation_recall(conversation_id, prompt, 5),
-        ).await {
+        ).await;
+        if let Some(text) = recall.text.as_deref() {
             s.push_str("\n\n");
-            s.push_str(&recall);
+            s.push_str(text);
         }
+        // Reported in the turn's metadata either way: a skipped recall
+        // (cold or failed embedder) must not look like "nothing relevant".
+        recall_status = Some(recall.status);
         if s.is_empty() { None } else { Some(s) }
     } else {
         None
@@ -2136,6 +2165,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         tool_calls: Vec::new(),
         elapsed_secs: 0.0,
         usage: UsageStats::default(),
+        recall: recall_status,
     };
 
     // Ralph-loop nudge history. Each stall/hallucination push appends
@@ -2902,7 +2932,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     // message was saved at the start of the turn.
     let clean_response = strip_think_blocks(&result.response);
     if !clean_response.is_empty() {
-        let metadata = json!({
+        let mut metadata = json!({
             "model": result.model,
             "backend": result.backend,
             "engine": "rust",
@@ -2910,6 +2940,9 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             "tokens_out": usage.completion_tokens,
             "tool_calls": usage.total_tool_calls,
         });
+        if let Some(r) = &result.recall {
+            metadata["recall"] = json!(r);
+        }
         // Same attribution as the user turn: the row is scoped by whose
         // conversation this is, not by who authored the individual message.
         if let Err(e) = rt.save_message(conversation_id, "assistant", &clean_response, Some(&metadata), user_id,
@@ -2938,14 +2971,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     result.elapsed_secs = start.elapsed().as_secs_f64();
     result.usage = usage.clone();
 
-    let _ = writer.send_event("done", json!({
-        "iterations": result.iterations,
-        "tool_calls": result.tool_calls.len(),
-        "elapsed_seconds": (result.elapsed_secs * 10.0).round() / 10.0,
-        "tokens_in": usage.prompt_tokens,
-        "tokens_out": usage.completion_tokens,
-        "engine": "rust",
-    })).await;
+    let _ = writer.send_event("done", done_frame(&result, &usage)).await;
 
     // Fire post-response hooks (registered by add-ons)
     rt.fire_post_response_hooks(conversation_id, &result).await;
@@ -3236,6 +3262,9 @@ async fn run_inner_bound<R: HarnessRuntime>(
     ).await;
 
     // (A/B/C) Long-conversation continuity.
+    // What the recall layer did this turn; None when it did not run
+    // (no history was dropped, so nothing needed recalling).
+    let mut recall_status: Option<super::context::RecallStatus> = None;
     let abc_ctx: Option<String> = if !dropped_run.is_empty() {
         let mut s = String::new();
         if let Some(outline) = build_history_summary(&dropped_run, conversation_id) {
@@ -3250,14 +3279,18 @@ async fn run_inner_bound<R: HarnessRuntime>(
             s.push_str("\n\n[Conversation so far]\n");
             s.push_str(&summary);
         }
-        if let Some(recall) = time_layer(
+        let recall = time_layer(
             rt.metrics(),
             "semantic_recall",
             rt.conversation_recall(conversation_id, prompt, 5),
-        ).await {
+        ).await;
+        if let Some(text) = recall.text.as_deref() {
             s.push_str("\n\n");
-            s.push_str(&recall);
+            s.push_str(text);
         }
+        // Reported in the turn's metadata either way: a skipped recall
+        // (cold or failed embedder) must not look like "nothing relevant".
+        recall_status = Some(recall.status);
         if s.is_empty() { None } else { Some(s) }
     } else {
         None
@@ -3337,6 +3370,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
         tool_calls: Vec::new(),
         elapsed_secs: 0.0,
         usage: UsageStats::default(),
+        recall: recall_status,
     };
 
     // Ralph-loop nudge history (see streaming-loop counterpart).
@@ -3734,13 +3768,16 @@ async fn run_inner_bound<R: HarnessRuntime>(
     // Persist conversation. The user's message was saved at the start.
     let clean_response = strip_think_blocks(&result.response);
     if !clean_response.is_empty() {
-        let metadata = json!({
+        let mut metadata = json!({
             "model": result.model,
             "backend": result.backend,
             "engine": "rust",
             "tokens_in": usage.prompt_tokens,
             "tokens_out": usage.completion_tokens,
         });
+        if let Some(r) = &result.recall {
+            metadata["recall"] = json!(r);
+        }
         if let Err(e) = rt.save_message(conversation_id, "assistant", &clean_response, Some(&metadata), user_id,
         ).await {
             tracing::warn!(error = %e, "Failed to save assistant message");
@@ -4181,5 +4218,78 @@ mod unreadable_stream_tests {
         assert_eq!(unreadable_stream(1, "data: {}", false), None, "an event was read");
         assert_eq!(unreadable_stream(0, " \n ", false), None, "an empty body is the empty-answer path, as before");
         assert_eq!(unreadable_stream(0, "junk", true), None, "a cut, the deadline or a provider error already said why");
+    }
+}
+
+#[cfg(test)]
+mod recall_metadata_tests {
+    use super::*;
+    use crate::coordinator::context::RecallStatus;
+
+    fn result_with(recall: Option<RecallStatus>) -> CoordinatorResult {
+        CoordinatorResult {
+            response: "hi".into(),
+            model: "m".into(),
+            backend: "b".into(),
+            node: None,
+            iterations: 1,
+            tool_calls: vec![],
+            elapsed_secs: 1.0,
+            usage: UsageStats::default(),
+            recall,
+        }
+    }
+
+    /// A skipped recall reaches the console: the `done` frame names it and
+    /// why, so an answer given without memory is never silent.
+    #[test]
+    fn a_skipped_recall_is_on_the_done_frame_with_its_reason() {
+        let r = result_with(Some(RecallStatus::Skipped { reason: "embedder not ready (timed out after 15 s)".into() }));
+        let f = done_frame(&r, &r.usage);
+        assert_eq!(f["recall"], json!({"status": "skipped", "reason": "embedder not ready (timed out after 15 s)"}), "{f}");
+    }
+
+    #[test]
+    fn an_ok_recall_is_on_the_done_frame_with_its_hits() {
+        let r = result_with(Some(RecallStatus::Ok { hits: 2 }));
+        let f = done_frame(&r, &r.usage);
+        assert_eq!(f["recall"], json!({"status": "ok", "hits": 2}), "{f}");
+        assert_eq!(f["iterations"], json!(1));
+    }
+
+    /// No recall ran (no history was dropped): no `recall` key at all,
+    /// and the rest of the frame is unchanged.
+    #[test]
+    fn no_recall_no_key() {
+        let r = result_with(None);
+        let f = done_frame(&r, &r.usage);
+        assert!(f.get("recall").is_none(), "{f}");
+        assert_eq!(f["engine"], json!("rust"));
+    }
+
+    /// The result crosses the harness rail (post-hooks) as JSON: the field
+    /// survives a round trip and an older peer's body without it still reads.
+    #[test]
+    fn the_result_round_trips_with_and_without_recall() {
+        let r = result_with(Some(RecallStatus::Skipped { reason: "x".into() }));
+        let back: CoordinatorResult = serde_json::from_value(serde_json::to_value(&r).unwrap()).unwrap();
+        assert_eq!(back, r);
+        let mut old = serde_json::to_value(result_with(None)).unwrap();
+        assert!(old.get("recall").is_none(), "{old}");
+        old.as_object_mut().unwrap().remove("recall");
+        let back: CoordinatorResult = serde_json::from_value(old).unwrap();
+        assert_eq!(back.recall, None);
+    }
+
+    /// Both loops carry the recall layer's status onto the result and the
+    /// stream sends it on `done`: the loop itself has no runtime fake, so
+    /// the wiring is pinned at the source.
+    #[test]
+    fn both_loops_report_what_recall_did() {
+        let code = crate::test_src::own_code(include_str!("agent_loop.rs"));
+        assert_eq!(code.matches("recall_status = Some(recall.status);").count(), 2, "both loops record the status");
+        assert_eq!(code.matches("recall: recall_status,").count(), 2, "both loops put it on the result");
+        assert_eq!(code.matches("metadata[\"recall\"] = json!(r);").count(), 2, "both loops save it with the message");
+        assert_eq!(code.matches("send_event(\"done\", done_frame(&result, &usage))").count(), 1, "the stream sends it on done");
     }
 }

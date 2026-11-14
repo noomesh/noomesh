@@ -915,6 +915,14 @@ async fn online_node_ids(db: &sqlx::PgPool) -> Result<Vec<String>, String> {
     Ok(rows.into_iter().map(|(n,)| n).collect())
 }
 
+/// Rung 5's keep file for the controller ladder: `keep=spool` when the CLI's
+/// image-retention keep file sits in the spool, else nothing (hostd then
+/// skips rung 5). The token, not a path: this container sees the spool at
+/// its mount point, and hostd resolves `spool` against its own host side.
+fn image_keep_arg(spool: &std::path::Path) -> Option<String> {
+    spool.join("image-keep.json").is_file().then(|| "keep=spool".to_string())
+}
+
 /// Queue a `disk-reclaim` op on the host watcher spool and report the
 /// outcome as an operator alert.
 ///
@@ -957,6 +965,9 @@ async fn queue_disk_reclaim(state: &AppState, watermark: f64, dry_run: bool, cac
     ];
     if let Some(cap) = cache_cap {
         args.push(format!("cache_cap_bytes={cap}"));
+    }
+    if let Some(keep) = image_keep_arg(std::path::Path::new(&crate::routes::admin::host_spool_dir())) {
+        args.push(keep);
     }
     let Some(path) = crate::routes::admin::host_spool_write_command(
         "disk-reclaim",
@@ -2873,15 +2884,40 @@ enum BackendProbe {
     AgentUnreachable,
 }
 
-/// Probe one backend through the node-agent inference proxy.
+/// The node-agent route that reads a running ollama with a GET (`/api/tags`)
+/// and loads nothing (node-agent-go `internal/api/backend_alive.go`). It
+/// answers 502 `backend_unreachable` when the agent cannot reach its ollama,
+/// the same code the inference proxy gives a dead backend.
+const OLLAMA_ALIVE_PATH: &str = "/backend-alive/ollama";
+
+/// Probe one backend through its node's agent ([`probe_backend_via_link`]).
+async fn probe_backend_via_agent(
+    state: &AppState,
+    node_id: &str,
+    backend_type: &str,
+) -> BackendProbe {
+    let link = match crate::node_link::NodeLink::for_node(state, node_id).await {
+        Ok(l) => l,
+        Err(_) => return BackendProbe::AgentUnreachable,
+    };
+    probe_backend_via_link(&link, backend_type).await
+}
+
+/// Probe one backend through the node agent behind `link`.
 ///
-/// The body is deliberately invalid — `messages` omitted — so a REACHABLE
-/// backend rejects it at validation in milliseconds without running
-/// inference. Only a dial failure surfaces as the proxy's
-/// `backend_unreachable` error; any other status proves the dial worked.
+/// **ollama** is asked with a READ ([`ollama_read_request`]): any chat or
+/// generate request makes an ollama load the model it names, and the agent
+/// fills an empty `model` with the lane's chat model and sends ollama's
+/// native `/api/chat` with no messages, which is ollama's load request. The
+/// old chat probe therefore loaded (or kept resident) the chat model on every
+/// 300 s run, so an idle box never unloaded it. The agent leaves ollama out of
+/// its own serving probe for the same reason (`backend_serving.go`).
 ///
-/// Why `{"model": ""}` and not `{"model": "", "messages": []}` (measured
-/// on the live cluster, 2026-07-30):
+/// **The engines** (vLLM, llama.cpp) get a deliberately invalid chat through
+/// the inference proxy, `messages` omitted, so a REACHABLE backend rejects it
+/// at validation in milliseconds without running inference. Why `{"model": ""}`
+/// and not `{"model": "", "messages": []}` (measured on the live cluster,
+/// 2026-07-30):
 ///
 ///   body                          llama.cpp                vLLM
 ///   {"model":"","messages":[]}    500 + Jinja stack trace  400 one-liner
@@ -2897,23 +2933,23 @@ enum BackendProbe {
 /// every 5 minutes, which is indistinguishable from a genuinely broken
 /// model.
 ///
-/// Ollama is unverified (none running at the time of measurement); it
-/// returns 4xx for both shapes as far as the API contract goes.
-async fn probe_backend_via_agent(
-    state: &AppState,
-    node_id: &str,
+/// Both answers map the same way: only the agent's `backend_unreachable`
+/// (502) is a dead backend; any other answer proves the dial. An agent too
+/// old to have the ollama read answers 404 for the route, which reads as
+/// reachable: no alert, and nothing loaded.
+async fn probe_backend_via_link(
+    link: &crate::node_link::NodeLink,
     backend_type: &str,
 ) -> BackendProbe {
-    let link = match crate::node_link::NodeLink::for_node(state, node_id).await {
-        Ok(l) => l,
-        Err(_) => return BackendProbe::AgentUnreachable,
+    let req = if backend_type == "ollama" {
+        ollama_read_request(link)
+    } else {
+        link.request(reqwest::Method::POST, "/v1/chat/completions")
+            .header("X-Noo-Backend", backend_type)
+            .header("Content-Type", "application/json")
+            .timeout(std::time::Duration::from_secs(10))
+            .json(&json!({"model": ""}))
     };
-    let req = link
-        .request(reqwest::Method::POST, "/v1/chat/completions")
-        .header("X-Noo-Backend", backend_type)
-        .header("Content-Type", "application/json")
-        .timeout(std::time::Duration::from_secs(10))
-        .json(&json!({"model": ""}));
 
     match req.send().await {
         Ok(resp) => {
@@ -2933,6 +2969,197 @@ async fn probe_backend_via_agent(
         // Couldn't reach the node-agent at all — offline/agent problems
         // belong to node_health / worker_node_agent_unreachable.
         Err(_) => BackendProbe::AgentUnreachable,
+    }
+}
+
+/// The ollama probe: a GET of the agent's read route, no body. Nothing here
+/// may name a model or reach the inference proxy (a guard test reads this).
+fn ollama_read_request(link: &crate::node_link::NodeLink) -> crate::node_link::NodeRequest {
+    link.request(reqwest::Method::GET, OLLAMA_ALIVE_PATH)
+        .timeout(std::time::Duration::from_secs(10))
+}
+
+#[cfg(test)]
+mod dispatch_health_probe_tests {
+    use super::{probe_backend_via_link, BackendProbe, OLLAMA_ALIVE_PATH};
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// One request as the mock agent received it.
+    #[derive(Clone, Debug)]
+    struct Seen {
+        method: String,
+        path: String,
+        backend_header: Option<String>,
+        body: String,
+    }
+
+    /// A node agent on loopback that records every request and answers each
+    /// with `answer(method, path)` -> (status line, body). The REAL NodeLink
+    /// and reqwest client run against it; only the far end is fake.
+    async fn mock_agent(
+        answer: fn(&str, &str) -> (&'static str, &'static str),
+    ) -> (String, Arc<Mutex<Vec<Seen>>>) {
+        let seen: Arc<Mutex<Vec<Seen>>> = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let mut raw: Vec<u8> = Vec::new();
+                    let mut buf = [0u8; 8192];
+                    // Read the head, then as much body as content-length says.
+                    loop {
+                        let n = match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        raw.extend_from_slice(&buf[..n]);
+                        let text = String::from_utf8_lossy(&raw).to_string();
+                        if let Some(end) = text.find("\r\n\r\n") {
+                            let want = text[..end]
+                                .lines()
+                                .find_map(|l| {
+                                    let (k, v) = l.split_once(':')?;
+                                    k.trim().eq_ignore_ascii_case("content-length").then(|| v.trim().parse::<usize>().ok())?
+                                })
+                                .unwrap_or(0);
+                            if raw.len() >= end + 4 + want {
+                                break;
+                            }
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&raw).to_string();
+                    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_str(), ""));
+                    let mut first = head.lines().next().unwrap_or("").split_whitespace();
+                    let method = first.next().unwrap_or("").to_string();
+                    let path = first.next().unwrap_or("").to_string();
+                    let backend_header = head.lines().find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.trim().eq_ignore_ascii_case("x-noo-backend").then(|| v.trim().to_string())
+                    });
+                    let (status, reply) = answer(&method, &path);
+                    log.lock().unwrap().push(Seen { method, path, backend_header, body: body.to_string() });
+                    let out = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    );
+                    let _ = sock.write_all(out.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), seen)
+    }
+
+    /// What a live agent answers: the read route 200, the chat proxy the
+    /// backend's validation 400.
+    fn healthy(method: &str, path: &str) -> (&'static str, &'static str) {
+        match (method, path) {
+            ("GET", "/backend-alive/ollama") => ("200 OK", r#"{"backend":"ollama","reachable":true,"status":200}"#),
+            ("POST", "/v1/chat/completions") => ("400 Bad Request", r#"{"error":"messages is required"}"#),
+            _ => ("404 Not Found", "404 page not found"),
+        }
+    }
+
+    /// The agent's answer when it cannot dial its ollama (jsonError shape).
+    fn dead_ollama(_: &str, _: &str) -> (&'static str, &'static str) {
+        (
+            "502 Bad Gateway",
+            r#"{"error":{"message":"ollama: dial tcp 127.0.0.1:11434: connect: connection refused","type":"node_agent_proxy_error","code":"backend_unreachable"}}"#,
+        )
+    }
+
+    fn seen(log: &Arc<Mutex<Vec<Seen>>>) -> Vec<Seen> {
+        log.lock().unwrap().clone()
+    }
+
+    /// The ollama probe is one GET of the read route: no chat, no generate,
+    /// no body naming a model. Each of those makes ollama load a model.
+    #[tokio::test]
+    async fn the_ollama_probe_sends_a_read_never_a_chat_or_generate() {
+        let (base, log) = mock_agent(healthy).await;
+        let link = crate::node_link::NodeLink::for_base(&base);
+        assert!(matches!(probe_backend_via_link(&link, "ollama").await, BackendProbe::Reachable));
+        let got = seen(&log);
+        assert_eq!(got.len(), 1, "one request: {got:?}");
+        assert_eq!((got[0].method.as_str(), got[0].path.as_str()), ("GET", "/backend-alive/ollama"), "{got:?}");
+        for r in &got {
+            for p in ["/v1/chat/completions", "/api/chat", "/api/generate", "/v1/completions", "/v1/embeddings"] {
+                assert!(!r.path.contains(p), "the ollama probe reached `{p}`: {r:?}");
+            }
+            assert!(!r.body.contains("\"model\""), "the ollama probe sent a body naming a model: {r:?}");
+            assert!(r.body.is_empty(), "a read carries no body: {r:?}");
+        }
+        assert_eq!(OLLAMA_ALIVE_PATH, "/backend-alive/ollama");
+    }
+
+    /// A dead ollama still fails the probe: the agent's backend_unreachable
+    /// is Unreachable, with the agent's body as the detail.
+    #[tokio::test]
+    async fn a_dead_ollama_is_unreachable() {
+        let (base, log) = mock_agent(dead_ollama).await;
+        let link = crate::node_link::NodeLink::for_base(&base);
+        match probe_backend_via_link(&link, "ollama").await {
+            BackendProbe::Unreachable(detail) => assert!(detail.contains("connection refused"), "{detail}"),
+            BackendProbe::Reachable => panic!("a dead ollama read as reachable"),
+            BackendProbe::AgentUnreachable => panic!("the agent answered; this is not agent-unreachable"),
+        }
+        assert_eq!(seen(&log)[0].method, "GET", "the dead case is reached by the read too");
+    }
+
+    /// An agent that does not answer at all is AgentUnreachable for ollama,
+    /// as for the engines (node_health's finding, not this evaluator's).
+    #[tokio::test]
+    async fn a_silent_agent_is_agent_unreachable() {
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", dead.local_addr().unwrap());
+        drop(dead);
+        let link = crate::node_link::NodeLink::for_base(&base);
+        for b in ["ollama", "vllm"] {
+            assert!(matches!(probe_backend_via_link(&link, b).await, BackendProbe::AgentUnreachable), "{b}");
+        }
+    }
+
+    /// vLLM and llama.cpp keep today's probe: the deliberately invalid chat
+    /// through the inference proxy, steered by X-Noo-Backend.
+    #[tokio::test]
+    async fn the_engines_keep_the_invalid_chat_probe() {
+        for b in ["vllm", "llamacpp"] {
+            let (base, log) = mock_agent(healthy).await;
+            let link = crate::node_link::NodeLink::for_base(&base);
+            assert!(matches!(probe_backend_via_link(&link, b).await, BackendProbe::Reachable), "{b}");
+            let got = seen(&log);
+            assert_eq!(got.len(), 1, "{b}: {got:?}");
+            assert_eq!((got[0].method.as_str(), got[0].path.as_str()), ("POST", "/v1/chat/completions"), "{b}");
+            assert_eq!(got[0].backend_header.as_deref(), Some(b), "{b}");
+            let body: serde_json::Value = serde_json::from_str(&got[0].body).expect("a JSON body");
+            assert_eq!(body, serde_json::json!({"model": ""}), "{b}");
+        }
+        let (base, _) = mock_agent(dead_ollama).await;
+        let link = crate::node_link::NodeLink::for_base(&base);
+        assert!(matches!(probe_backend_via_link(&link, "vllm").await, BackendProbe::Unreachable(_)), "a dead engine");
+    }
+
+    /// The model-substitution path is not reachable from the ollama probe:
+    /// ollama is routed to the read before the chat request is built, and
+    /// the read names no model, no chat route and no body.
+    #[test]
+    fn the_ollama_arm_cannot_reach_the_chat_proxy() {
+        let own = crate::test_src::own_code(include_str!("autonomy_evaluators.rs"));
+        let read = crate::test_src::fn_body(&own, "fn ollama_read_request(");
+        for banned in ["/v1/chat/completions", "\"model\"", ".json(", ".body(", "Method::POST", "X-Noo-Backend", "/api/chat", "/api/generate"] {
+            assert!(!read.contains(banned), "the ollama probe holds `{banned}`:\n{read}");
+        }
+        assert!(read.contains("reqwest::Method::GET, OLLAMA_ALIVE_PATH"), "{read}");
+        let probe = crate::test_src::fn_body(&own, "async fn probe_backend_via_link(");
+        let arm = probe.find("if backend_type == \"ollama\"").expect("ollama has its own arm");
+        let read_call = probe.find("ollama_read_request(link)").expect("the arm sends the read");
+        let chat = probe.find("\"/v1/chat/completions\"").expect("the engines' chat probe");
+        assert!(arm < read_call && read_call < chat, "ollama is answered by the read before the chat request is built");
+        assert_eq!(probe.matches("ollama_read_request(").count(), 1);
     }
 }
 
@@ -3088,6 +3315,22 @@ fn gpu_watchdog_faults(body: &serde_json::Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::confirm_drift;
+
+    /// The controller ladder names the keep file only when the CLI wrote one,
+    /// and only as the token hostd resolves on its own side of the mount.
+    #[test]
+    fn image_keep_arg_only_when_the_keep_file_is_in_the_spool() {
+        let dir = std::env::temp_dir().join(format!("noo-keep-arg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_file(dir.join("image-keep.json"));
+        assert_eq!(super::image_keep_arg(&dir), None, "no keep file: no keep= arg");
+        std::fs::create_dir_all(dir.join("image-keep.json")).unwrap();
+        assert_eq!(super::image_keep_arg(&dir), None, "a directory is not a keep file");
+        std::fs::remove_dir(dir.join("image-keep.json")).unwrap();
+        std::fs::write(dir.join("image-keep.json"), b"{}").unwrap();
+        assert_eq!(super::image_keep_arg(&dir).as_deref(), Some("keep=spool"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// One missed probe is a blip; the same miss on the next evaluation is
     /// drift; a pair that recovers is forgotten and starts again from one.

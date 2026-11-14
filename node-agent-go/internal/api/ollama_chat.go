@@ -475,18 +475,20 @@ func (s *Server) proxyOllamaChat(w http.ResponseWriter, r *http.Request, body []
 		jsonError(w, http.StatusBadRequest, "bad_chat_body", err.Error())
 		return
 	}
-	upstream, err := http.NewRequestWithContext(r.Context(), http.MethodPost, strings.TrimRight(targetURL, "/")+"/api/chat", bytes.NewReader(req.body))
-	if err != nil {
-		jsonError(w, http.StatusInternalServerError, "bad_backend_url", err.Error())
-		return
-	}
-	upstream.Header.Set("Content-Type", "application/json")
-	upstream.Header.Set("X-Forwarded-By", "noo-node-agent-inference-proxy")
 	// No whole-request timeout: a stream lives while bytes arrive. The
 	// transport's ResponseHeaderTimeout (firstByte) still bounds the wait
 	// for headers — on /api/chat those come with the first token.
 	client := &http.Client{Transport: s.inferenceTransport(scheme, firstByte)}
-	resp, err := client.Do(upstream)
+	send := func(b []byte) (*http.Response, error) {
+		upstream, err := http.NewRequestWithContext(r.Context(), http.MethodPost, strings.TrimRight(targetURL, "/")+"/api/chat", bytes.NewReader(b))
+		if err != nil {
+			return nil, err
+		}
+		upstream.Header.Set("Content-Type", "application/json")
+		upstream.Header.Set("X-Forwarded-By", "noo-node-agent-inference-proxy")
+		return client.Do(upstream)
+	}
+	resp, err := send(req.body)
 	if err != nil {
 		slog.Warn("inference proxy could not complete the upstream request",
 			"backend", "ollama", "target", targetURL, "error", err,
@@ -494,20 +496,30 @@ func (s *Server) proxyOllamaChat(w http.ResponseWriter, r *http.Request, body []
 		jsonError(w, http.StatusBadGateway, "backend_unreachable", err.Error())
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { resp.Body.Close() }()
 	if resp.StatusCode/100 != 2 {
-		// Ollama's error body is {"error": "..."}: name it in OpenAI's shape.
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-		var e struct {
-			Error string `json:"error"`
+		status, msg := resp.StatusCode, ollamaErrorText(resp.Body)
+		// A model with no thinking mode refuses `think: true` (Ollama:
+		// "<model> does not support thinking"). The ask came from the
+		// caller's thinking hint, which reaches every model alike; this
+		// model cannot honour it, so it answers once more WITHOUT think,
+		// before any byte reached the caller (noomesh-internal i764).
+		if retry, ok := withoutThinkOnRefusal(status, msg, req.body); ok {
+			slog.Info("inference proxy: the model has no thinking mode; answering without it", "backend", "ollama", "model", req.model)
+			resp.Body.Close()
+			resp, err = send(retry)
+			if err != nil {
+				jsonError(w, http.StatusBadGateway, "backend_unreachable", err.Error())
+				return
+			}
+			if resp.StatusCode/100 != 2 {
+				status, msg = resp.StatusCode, ollamaErrorText(resp.Body)
+			}
 		}
-		_ = json.Unmarshal(raw, &e)
-		msg := strings.TrimSpace(e.Error)
-		if msg == "" {
-			msg = strings.TrimSpace(string(raw))
+		if resp.StatusCode/100 != 2 {
+			jsonError(w, status, "backend_error", msg)
+			return
 		}
-		jsonError(w, resp.StatusCode, "backend_error", msg)
-		return
 	}
 	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	created := time.Now().Unix()
@@ -536,6 +548,44 @@ func (s *Server) proxyOllamaChat(w http.ResponseWriter, r *http.Request, body []
 		return
 	}
 	streamOllamaChat(r.Context(), w, resp.Body, &ollamaChunker{id: id, model: req.model, created: created, includeUsage: req.includeUsage})
+}
+
+// ollamaErrorText is Ollama's error body ({"error": "..."}) as one line.
+func ollamaErrorText(body io.Reader) string {
+	raw, _ := io.ReadAll(io.LimitReader(body, 64<<10))
+	var e struct {
+		Error string `json:"error"`
+	}
+	_ = json.Unmarshal(raw, &e)
+	msg := strings.TrimSpace(e.Error)
+	if msg == "" {
+		msg = strings.TrimSpace(string(raw))
+	}
+	return msg
+}
+
+// withoutThinkOnRefusal: when Ollama refused a request that asked to think
+// because the model has no thinking mode, the same body without `think`.
+// Only that refusal, and only a body that carried `think: true`: any other
+// error is the caller's to see.
+func withoutThinkOnRefusal(status int, msg string, body []byte) ([]byte, bool) {
+	if status != http.StatusBadRequest || !strings.Contains(msg, "does not support thinking") {
+		return nil, false
+	}
+	var m map[string]json.RawMessage
+	if json.Unmarshal(body, &m) != nil {
+		return nil, false
+	}
+	var think bool
+	if raw, ok := m["think"]; !ok || json.Unmarshal(raw, &think) != nil || !think {
+		return nil, false
+	}
+	delete(m, "think")
+	out, err := json.Marshal(m)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
 }
 
 // A reply made of nothing but the model's reserved vocabulary (gemma's

@@ -118,6 +118,11 @@ type Server struct {
 	// use.
 	serving     *backendServing
 	servingOnce sync.Once
+
+	// keeper keeps the declared-warm ollama models loaded (keep_warm.go).
+	// Built on first use.
+	keeper     *warmKeeper
+	keeperOnce sync.Once
 }
 
 // nativeBackends is the set served natively on this host, backend -> model.
@@ -368,6 +373,9 @@ func (s *Server) registerRoutes() {
 	s.mux.Handle("POST /v1/embeddings", ctrlMW(http.HandlerFunc(s.handleInferenceProxy)))
 	// A placed vLLM's /metrics for the gateway's collector (backend_metrics.go).
 	s.mux.Handle("GET /backend-metrics/{backend}", ctrlMW(http.HandlerFunc(s.handleBackendMetrics)))
+	// Whether a running ollama is reachable, by a read that loads nothing
+	// (backend_alive.go): the gateway's dispatch-health probe for ollama.
+	s.mux.Handle("GET /backend-alive/{backend}", ctrlMW(http.HandlerFunc(s.handleBackendAlive)))
 	s.mux.Handle("GET /v1/models", modelMW(http.HandlerFunc(s.handleListModels)))
 
 	// Rerank proxy — forwards to this node's local reranker (TEI cross-encoder

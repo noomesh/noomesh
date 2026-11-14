@@ -406,6 +406,7 @@ pub(super) async fn run_cloud_completion(
             total_tool_calls: 0,
             total_latency_ms: start.elapsed().as_millis() as u64,
         },
+        recall: None,
     })
 }
 

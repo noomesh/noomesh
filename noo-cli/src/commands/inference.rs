@@ -177,11 +177,19 @@ pub fn inference_run(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(0)
 }
 
+/// How long `noo inference agent` waits for the agent turn. An agentic turn
+/// on a slow box (CPU-only, a small GPU, a model still warming) runs well
+/// past two minutes: at 120 s the CLI gave up while the gateway was still
+/// working (noomesh-internal i764: a gemma4:e2b answer on the 0.6.24-rc.6
+/// install matrix), and the MCP tool on the same route already allowed 180 s.
+const AGENT_TIMEOUT_SECS: u64 = 300;
+
 /// `noo inference agent PROMPT` — POST /api/agent/run: runs the prompt
 /// through the gateway's agent role runner. The route reads only `prompt`
 /// (and `role`/`conversation_id`), so the old `-m`, `--max-iters` and
 /// `--no-tools` flags, which it silently ignored, are refused with a message.
-/// Synchronous and slow — Python parity: 120s timeout, spinner while waiting.
+/// Synchronous and slow: waits up to [`AGENT_TIMEOUT_SECS`] (the global
+/// `--timeout` wins), spinner while waiting.
 pub fn inference_agent(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut prompt: Option<String> = None;
     let mut body = serde_json::json!({});
@@ -208,7 +216,7 @@ pub fn inference_agent(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     body["prompt"] = p.into();
 
     let step = super::Spinner::start(g, "running agentic loop");
-    let resp = post_json(g, "/api/agent/run", &body, true, 120);
+    let resp = post_json(g, "/api/agent/run", &body, true, AGENT_TIMEOUT_SECS);
     step.done(Some("agentic loop finished"));
 
     if g.json {
@@ -289,5 +297,17 @@ mod tests {
                 other => panic!("expected Unsupported, got {other:?}"),
             }
         }
+    }
+
+    /// i764: the agent turn is not cut at two minutes, and the command's own
+    /// wait is the one constant (the global `--timeout` still wins in
+    /// `http::agent`).
+    #[test]
+    fn the_agent_turn_waits_longer_than_the_mcp_tool_on_the_same_route() {
+        const { assert!(AGENT_TIMEOUT_SECS >= 180) };
+        assert_eq!(AGENT_TIMEOUT_SECS, 300);
+        let own = crate::test_src::own_code(include_str!("inference.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn inference_agent(");
+        assert!(body.contains(r#"post_json(g, "/api/agent/run", &body, true, AGENT_TIMEOUT_SECS)"#), "{body}");
     }
 }

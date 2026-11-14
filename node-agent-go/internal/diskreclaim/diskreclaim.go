@@ -102,6 +102,21 @@ func Args(p *Policy) []string {
 	return args
 }
 
+// ArgsWithKeep is Args plus the image-retention keep file the agent writes
+// beside the spool (internal/reconcile/image_keep.go), when there is one:
+// hostd's rung 5 then judges superseded images; without it the rung skips.
+func ArgsWithKeep(p *Policy, spool string) []string {
+	args := Args(p)
+	if spool == "" {
+		return args
+	}
+	keep := filepath.Join(spool, "image-keep.json")
+	if fi, err := os.Stat(keep); err == nil && fi.Mode().IsRegular() {
+		args = append(args, "keep="+keep)
+	}
+	return args
+}
+
 // Reclaimer runs the check loop and keeps what /health reports.
 type Reclaimer struct {
 	spool string
@@ -196,7 +211,7 @@ func (r *Reclaimer) check(now time.Time) {
 	}
 	name := fmt.Sprintf("disk-reclaim-%d", now.UTC().UnixNano())
 	if err := hostd.WriteCommand(r.spool, name, hostd.Command{
-		Op: OpName, Service: "noo-node-agent", Args: Args(r.policy), RequestedBy: "node-agent:diskreclaim",
+		Op: OpName, Service: "noo-node-agent", Args: ArgsWithKeep(r.policy, r.spool), RequestedBy: "node-agent:diskreclaim",
 	}); err != nil {
 		r.status = "cannot queue disk-reclaim: " + err.Error()
 		return

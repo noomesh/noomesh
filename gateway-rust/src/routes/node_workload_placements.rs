@@ -308,6 +308,43 @@ fn refused(r: &Refusal) -> Response {
     (refusal_status(r.code), Json(json!({"error": r.code, "detail": r.to_string()}))).into_response()
 }
 
+/// A registered add-on whose RUNNING pin declares no node workloads. The
+/// launcher copies a verified lock's node-workloads.json into the gateway's
+/// declarations only when the stack starts (`addon_decls`), so right after
+/// `noo addons enable | upgrade` to a version that adds node workloads, the
+/// running stack still has none for it (rc.7 rehearsal, A-nodewl.place).
+pub(crate) const NOT_IN_RUNNING_STACK: &str = "not_in_running_stack";
+
+/// The version the running stack verified for an add-on, when its lock named one.
+fn running_version(v: &crate::addon_registry::Verification) -> Option<String> {
+    use crate::addon_registry::Verification as V;
+    match v {
+        V::Launcher { version, .. } | V::DevKey { version, .. } => Some(version.clone()),
+        V::DevBuild | V::LegacyLauncher => None,
+    }
+}
+
+/// The refusal for a place on an add-on that has no node-workload declaration
+/// in the running stack. `running` is None for an add-on the gateway does not
+/// register at all (a plain not_found, as before), Some(version) for a
+/// registered one: the remedy is a restart onto its newest pin. Only an
+/// operator or admin reaches this route (a write), and they can list add-ons,
+/// so naming a registered one tells them nothing new.
+fn undeclared_refusal(addon: &str, running: Option<Option<String>>) -> (StatusCode, &'static str, String) {
+    match running {
+        None => (StatusCode::NOT_FOUND, "not_found", format!("{addon} is not a registered add-on")),
+        Some(version) => (
+            StatusCode::CONFLICT,
+            NOT_IN_RUNNING_STACK,
+            format!(
+                "{addon}{} is registered, but the pin the running stack started declares no node workloads. \
+                 If you have just enabled or upgraded it, `noo stack restart --force` runs the new pin; then place again",
+                version.map(|v| format!(" {v}")).unwrap_or_default()
+            ),
+        ),
+    }
+}
+
 fn plain(status: StatusCode, code: &str, detail: impl Into<String>) -> Response {
     (status, Json(json!({"error": code, "detail": detail.into()}))).into_response()
 }
@@ -333,7 +370,11 @@ pub async fn put_placement(
     }
     let decls = match sources::declared(&addon) {
         Ok(Some(d)) => d,
-        Ok(None) => return plain(StatusCode::NOT_FOUND, "not_found", format!("{addon} is not a registered add-on with node workloads")),
+        Ok(None) => {
+            let running = crate::addon_registry::get(&addon).map(|e| running_version(e.verification()));
+            let (status, code, detail) = undeclared_refusal(&addon, running);
+            return plain(status, code, detail);
+        }
         Err(r) => return refused(&r),
     };
     let Some(decl) = decls.workloads.iter().find(|w| w.name == workload) else {
@@ -418,6 +459,41 @@ mod tests {
 
     const DIGEST_HEX: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const ID: &str = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    #[test]
+    fn an_unknown_add_on_is_a_plain_not_found() {
+        let (status, code, detail) = undeclared_refusal("nosuch", None);
+        assert_eq!((status, code), (StatusCode::NOT_FOUND, "not_found"));
+        assert_eq!(detail, "nosuch is not a registered add-on");
+        assert!(!detail.contains("restart"), "an unknown add-on gets no remedy that implies it exists");
+    }
+
+    #[test]
+    fn a_registered_add_on_without_node_workloads_in_the_running_pin_names_the_restart() {
+        let (status, code, detail) = undeclared_refusal("rhaddon", Some(Some("0.1.0".into())));
+        assert_eq!((status, code), (StatusCode::CONFLICT, NOT_IN_RUNNING_STACK));
+        assert!(detail.starts_with("rhaddon 0.1.0 is registered, but the pin the running stack started declares no node workloads"), "{detail}");
+        assert!(detail.contains("`noo stack restart --force` runs the new pin"), "{detail}");
+        // A dev build or a legacy launcher reports no version: the same remedy, no version.
+        let (_, code, detail) = undeclared_refusal("rhaddon", Some(None));
+        assert_eq!(code, NOT_IN_RUNNING_STACK);
+        assert!(detail.starts_with("rhaddon is registered, but"), "{detail}");
+        use crate::addon_registry::Verification as V;
+        assert_eq!(running_version(&V::Launcher { version: "0.2.0".into(), stack: "v0.6.25".into() }).as_deref(), Some("0.2.0"));
+        assert_eq!(running_version(&V::DevKey { version: "0.3.0".into(), stack: "v0.6.25".into(), expires_at: 1 }).as_deref(), Some("0.3.0"));
+        assert_eq!(running_version(&V::DevBuild), None);
+    }
+
+    #[test]
+    fn put_placement_splits_unknown_from_not_in_the_running_stack() {
+        let own = crate::test_src::own_code(include_str!("node_workload_placements.rs"));
+        let body = crate::test_src::fn_body(&own, "pub async fn put_placement(");
+        let arm = body.find("Ok(None) =>").expect("the no-declaration arm");
+        let split = body.find("undeclared_refusal(&addon, running)").expect("the arm uses the split");
+        let registry = body.find("crate::addon_registry::get(&addon)").expect("it asks the registry");
+        assert!(arm < registry && registry < split, "the split is decided in the Ok(None) arm");
+        assert!(!body.contains("is not a registered add-on with node workloads"), "the old bare refusal is gone");
+    }
 
     fn fixture(rel: &str) -> Vec<u8> {
         std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/testdata/i300").join(rel)).unwrap()

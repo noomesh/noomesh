@@ -83,6 +83,7 @@ pub mod agent_messages;
 pub mod agent_names;
 pub mod agent_recipients;
 pub mod approval_requests;
+pub mod autonomy;
 pub mod audit;
 pub mod caller_verifiers;
 pub mod cluster;

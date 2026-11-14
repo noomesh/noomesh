@@ -2887,7 +2887,7 @@ async fn approval_decide(
 // `.rebuild.running` for stack rebuilds) back into the same dir.
 
 /// Spool dir, env-overridable — mirrors `host_spool._spool_dir()`.
-fn host_spool_dir() -> String {
+pub(crate) fn host_spool_dir() -> String {
     std::env::var("NOO_HOST_SPOOL_DIR").unwrap_or_else(|_| "/var/run/noo-spool".into())
 }
 

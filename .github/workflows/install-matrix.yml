@@ -62,8 +62,8 @@ jobs:
           # the 20x dockerd-restart probe included: that is where Docker 27
           # and 28 word a failed namespace join differently (noomesh#1128).
           - {cell: ubuntu-22.04-amd64-docker.io, runner: ubuntu-22.04, docker: distro, onboard: ci, model: tiny, scope: full, experimental: false}
-          - {cell: ubuntu-24.04-arm64, runner: ubuntu-24.04-arm, docker: preinstalled, onboard: ci, model: tiny, scope: full, experimental: false}
-          - {cell: ubuntu-22.04-arm64, runner: ubuntu-22.04-arm, docker: preinstalled, onboard: ci, model: tiny, scope: full, experimental: false}
+          - {cell: ubuntu-24.04-arm64, runner: ubuntu-24.04-arm, docker: preinstalled, onboard: ci, model: tiny, scope: full, experimental: false, expect: refusal}
+          - {cell: ubuntu-22.04-arm64, runner: ubuntu-22.04-arm, docker: preinstalled, onboard: ci, model: tiny, scope: full, experimental: false, expect: refusal}
           # fa: no Docker at all, the INTERACTIVE wizard through a pty.
           - {cell: stranger-24.04, runner: ubuntu-24.04, docker: none, onboard: interactive, model: default, scope: full, experimental: false}
           # i677 pass 1: Enter at EVERY prompt. The read says it cannot finish (no-default password; the default-No passphrase loop); where it stops is the result.
@@ -79,6 +79,7 @@ jobs:
           sparse-checkout: |
             README.md
             docs/getting-started/first-chat.md
+            docs/getting-started/install.md
             scripts/install-cell
             scripts/ci-free-disk.sh
           sparse-checkout-cone-mode: false
@@ -94,6 +95,8 @@ jobs:
           ONBOARD: ${{ matrix.onboard }}
           MODEL: ${{ matrix.model }}
           SCOPE: ${{ matrix.scope }}
+          # expect: refusal (the arm64 cells): the cell asserts the controller refusal.
+          EXPECT: ${{ matrix.expect || '' }}
           CLI_TAG: ${{ inputs.cli_tag || 'latest' }}
         run: bash scripts/install-cell/run.sh
       - name: Upload the cell's report (redacted; scanned by run.sh)
@@ -121,6 +124,7 @@ jobs:
           sparse-checkout: |
             README.md
             docs/getting-started/first-chat.md
+            docs/getting-started/install.md
             scripts/install-cell
           sparse-checkout-cone-mode: false
       - name: WSL2 + Ubuntu 24.04   # Vampire/setup-wsl v7.2.0
@@ -162,8 +166,13 @@ jobs:
 
   # What we ship and what an upgrading node downloads, for the newest final
   # against the one before (noomesh-internal i673). Registry reads only.
+  # Plus the stack's memory at idle, MEASURED by two cells' probe-memory-
+  # baseline (operator 2026-11-14): so it waits for the cells, and runs when
+  # they fail (a cell without memory.json is reported "not measured: why").
   size:
     name: release size
+    needs: cell
+    if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -173,12 +182,30 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
           filter: blob:none
+      # One download per measured cell: a cell that uploaded nothing fails
+      # only its own download, and the report says so.
+      - name: The memory-baseline cells' reports   # actions/download-artifact@v8.0.2
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: install-cell-ubuntu-24.04-amd64-default
+          path: ${{ runner.temp }}/memory/install-cell-ubuntu-24.04-amd64-default
+      - name: The memory-baseline cells' reports (22.04)   # actions/download-artifact@v8.0.2
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: install-cell-ubuntu-22.04-amd64
+          path: ${{ runner.temp }}/memory/install-cell-ubuntu-22.04-amd64
       - name: Size report
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 scripts/release-size-report.py --json "$RUNNER_TEMP/release-size.json" | tee -a "$GITHUB_STEP_SUMMARY"
+          M="$RUNNER_TEMP/memory"
+          python3 scripts/release-size-report.py --json "$RUNNER_TEMP/release-size.json" \
+            --memory "ubuntu-24.04-amd64-default=$M/install-cell-ubuntu-24.04-amd64-default/memory.json" \
+                     "ubuntu-22.04-amd64=$M/install-cell-ubuntu-22.04-amd64/memory.json" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: release-size

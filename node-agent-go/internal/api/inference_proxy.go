@@ -473,6 +473,10 @@ func (s *Server) handleInferenceProxy(w http.ResponseWriter, r *http.Request) {
 	// error. A named model that does not match is left alone: the
 	// backend's refusal is the honest answer for that.
 	body = substituteAutoModel(body, running[backendType])
+	// A model declared warm on this node (`--keep-warm`) is pinned with
+	// keep_alive -1 unless the caller set one (keep_warm.go). Before the
+	// runtime split below, so the adopted stack lane gets it too.
+	body = keepWarmBody(body, backendType, r.URL.Path)
 	// Filter body to only keys the target backend accepts (portable
 	// OpenAI keys + this backend's vendor extras). Catches vendor-key
 	// mismatches across backends without hardcoding "vllm vs others".

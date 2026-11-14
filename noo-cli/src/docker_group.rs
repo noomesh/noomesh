@@ -134,18 +134,29 @@ mod tests {
     /// and run_script tries it before any launcher runs.
     #[test]
     fn every_docker_gate_tries_the_relaunch_before_refusing() {
+        // offboard and `stack stop --volumes` go through offboard's
+        // docker_gate / mesh's stop_volumes_listing, whose relaunch-first
+        // order their fake-host tests exercise; the live host's relaunch is
+        // this one.
         let off = crate::test_src::own_code(include_str!("commands/offboard.rs"));
         let walk = crate::test_src::fn_body(&off, "pub fn offboard(");
-        let r = walk.find("crate::docker_group::relaunch_if_needed(&why)").expect("offboard tries it");
-        let refuse = walk.find("docker_unreachable_refusal(&why, \"noo offboard\")").expect("then refuses");
-        assert!(r < refuse, "{walk}");
+        assert!(walk.contains("docker_gate(&mut LiveGate, \"noo offboard\")"), "{walk}");
+        let live = crate::test_src::fn_body(&off, "impl GateHost for LiveGate {");
+        assert!(live.contains("crate::docker_group::relaunch_if_needed(why)"), "{live}");
         let mesh = crate::test_src::own_code(include_str!("commands/mesh.rs"));
-        for (f, verb) in [("pub fn mesh_clean(", "noo stack clean"), ("pub fn mesh_stop(", "noo stack stop --volumes")] {
-            let body = crate::test_src::fn_body(&mesh, f);
-            let r = body.find("crate::docker_group::relaunch_if_needed(&why)").unwrap_or_else(|| panic!("{f} tries it"));
-            let refuse = body.find(&format!("docker_unreachable_refusal(&why, \"{verb}\")")).unwrap_or_else(|| panic!("{f} refuses"));
-            assert!(r < refuse, "{body}");
-        }
+        let gate = crate::test_src::fn_body(&off, "pub(crate) fn docker_gate(");
+        let r = gate.find("h.relaunch(&why)").expect("the gate tries it");
+        let refuse = gate.find("h.refuse(&docker_unreachable_refusal(&why, verb));").expect("then refuses");
+        assert!(r < refuse, "{gate}");
+        let stop = crate::test_src::fn_body(&mesh, "fn stop_volumes_listing(");
+        let r = stop.find("h.relaunch(&why)").expect("stack stop --volumes tries it");
+        let refuse = stop.find("docker_unreachable_refusal(&why, \"noo stack stop --volumes\")").expect("then refuses");
+        assert!(r < refuse, "{stop}");
+        assert!(mesh.contains("super::offboard::GateHost::relaunch(&mut super::offboard::LiveGate, why)"), "the live stop host relaunches through offboard's");
+        let body = crate::test_src::fn_body(&mesh, "pub fn mesh_clean(");
+        let r = body.find("crate::docker_group::relaunch_if_needed(&why)").expect("mesh_clean tries it");
+        let refuse = body.find("docker_unreachable_refusal(&why, \"noo stack clean\")").expect("mesh_clean refuses");
+        assert!(r < refuse, "{body}");
         let clean = crate::test_src::fn_body(&mesh, "pub fn mesh_clean(");
         assert!(clean.find("crate::docker_group::relaunch_if_needed(&why)") < clean.find("super::confirm_destructive("),
             "the relaunch comes before the confirm, so it is asked once, in the child: {clean}");

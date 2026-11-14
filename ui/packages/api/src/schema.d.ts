@@ -11387,6 +11387,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/autonomy/locations/{name}/dry-run": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Take an autonomy rule live (armed, out of preview), or put it back into preview
+         * @description [native] `{"dry_run": false}` takes a rule with a dry-run gate LIVE in one update: it arms the rule (`enabled_action: true`) and takes it out of preview (`dry_run: false`), so from its next tick it acts (disk_watermark deletes what its reclaim ladder previews, including superseded images of noomesh and of the add-ons it runs, from those images' own repositories only; cert_auto_rotate re-issues certificates and restarts their services). A rule that is switched off is refused (409, with how to switch it on). `{"dry_run": true}` puts it back into preview and leaves it armed or not. Operator or admin only (403 otherwise); 400 for a rule with no dry-run gate. The keys are merged into the rule's stored override, so its tunables stay as they are, and the change is audited with who made it. The answer is the rule's state read back after the write.
+         */
+        post: operations["autonomy_set_dry_run"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/inference/chat": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create chat
+         * @description [native] POST /api/inference/chat — see [`CHAT_STREAM_PATH`].
+         */
+        post: operations["coordinator_chat_stream"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -27406,6 +27446,97 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    autonomy_set_dry_run: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: "disk_watermark" | "cert_auto_rotate";
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description false: live (the rule acts); true: preview (it only reports). */
+                    dry_run: boolean;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        name?: string;
+                        /** @description The rule is switched on (read back). */
+                        enabled?: boolean;
+                        /** @description Its action is armed (`enabled_action`, read back). */
+                        armed?: boolean;
+                        /** @description It previews instead of acting (read back). */
+                        dry_run?: boolean;
+                        config?: {
+                            [key: string]: unknown;
+                        };
+                        /** @description What the rule does when live, in plain words. */
+                        live_means?: string;
+                    };
+                };
+            };
+            /** @description No such gate, or no dry_run in the body */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not an operator or admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The rule is switched off: switch it on first (the message says how). */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    coordinator_chat_stream: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
         responses: {
             /** @description OK */
             200: {

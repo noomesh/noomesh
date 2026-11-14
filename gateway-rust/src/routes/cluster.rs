@@ -358,11 +358,145 @@ pub(crate) fn carry_i300(data: &mut Value, body: &Value) {
     }
 }
 
+/// Heartbeat body encodings this controller decodes, advertised in every
+/// heartbeat reply as `accept_encoding` (i675 F11). An agent compresses only
+/// after it has read this; until then it sends plain JSON.
+pub(crate) const HEARTBEAT_ACCEPT_ENCODING: &[&str] = &["gzip"];
+
+/// The one size rule for a heartbeat: its JSON may be at most this many
+/// bytes, sent plain or decoded from gzip. A measured beat is 5.7 KB (CPU
+/// node) to 9.7 KB (GPU node), and the largest plausible beat (8 backends,
+/// 40 models, every optional section; node-agent-go payload_size_test.go)
+/// 36.2 KiB, so 256 KiB leaves a margin of 7.1x. The gzip decoder reads
+/// at most one byte past it, so a bomb is turned away without expanding
+/// further.
+pub(crate) const MAX_HEARTBEAT_BODY: usize = 256 * 1024;
+
+/// Why a heartbeat body was not read. Each maps to one status, which the
+/// agent reads as "this encoding was not accepted" and re-sends plain.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BeatBodyRefusal {
+    /// 413: the JSON (plain, or decoded from gzip) is over [`MAX_HEARTBEAT_BODY`].
+    TooLarge(String),
+    /// 400: gzip that does not decode, or a body that is not JSON.
+    Malformed(String),
+    /// 415: no JSON Content-Type, or a Content-Encoding other than identity
+    /// or gzip.
+    Unsupported(String),
+}
+
+impl BeatBodyRefusal {
+    pub(crate) fn status(&self) -> axum::http::StatusCode {
+        match self {
+            Self::TooLarge(_) => axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            Self::Malformed(_) => axum::http::StatusCode::BAD_REQUEST,
+            Self::Unsupported(_) => axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        }
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            Self::TooLarge(m) | Self::Malformed(m) | Self::Unsupported(m) => m,
+        }
+    }
+
+    fn into_reply(self) -> (axum::http::StatusCode, Json<Value>) {
+        (self.status(), Json(json!({"error": self.message(), "accept_encoding": HEARTBEAT_ACCEPT_ENCODING})))
+    }
+}
+
+/// The 413 a heartbeat over [`MAX_HEARTBEAT_BODY`] gets, plain or gzip alike.
+fn beat_too_large() -> BeatBodyRefusal {
+    BeatBodyRefusal::TooLarge(format!(
+        "heartbeat JSON is over the {MAX_HEARTBEAT_BODY}-byte cap (a measured beat is under 10 KB); refused, not truncated"
+    ))
+}
+
+/// The Content-Type rule axum's `Json` extractor applied to this route
+/// before it read raw bytes: `application/json`, or any `application/*+json`,
+/// parameters (`; charset=utf-8`) allowed, case-insensitive. Absent or
+/// anything else is a 415.
+pub(crate) fn is_json_content_type(content_type: Option<&str>) -> bool {
+    let Some(ct) = content_type else { return false };
+    let essence = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let Some((ty, sub)) = essence.split_once('/') else { return false };
+    if ty != "application" || sub.is_empty() || sub.contains(char::is_whitespace) {
+        return false;
+    }
+    sub == "json" || sub.ends_with("+json")
+}
+
+/// Everything `r` yields, up to `cap` bytes. One byte more is the 413, so
+/// this never reads more than `cap + 1` bytes whatever `r` would produce.
+pub(crate) fn read_capped<R: std::io::Read>(r: R, cap: usize) -> Result<Vec<u8>, BeatBodyRefusal> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    r.take(cap as u64 + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| BeatBodyRefusal::Malformed(format!("Content-Encoding: gzip heartbeat did not decode: {e}")))?;
+    if out.len() > cap {
+        return Err(beat_too_large());
+    }
+    Ok(out)
+}
+
+/// The heartbeat as JSON from the bytes the auth layer verified. A JSON
+/// Content-Type is required whatever the encoding; then identity, or gzip
+/// decoded through [`read_capped`]; either way the JSON is at most
+/// [`MAX_HEARTBEAT_BODY`] bytes. Called by `node_heartbeat` only, which the
+/// router reaches only through `require_any_auth`.
+pub(crate) fn heartbeat_body(
+    raw: &[u8],
+    content_type: Option<&str>,
+    content_encoding: Option<&str>,
+) -> Result<Value, BeatBodyRefusal> {
+    if !is_json_content_type(content_type) {
+        return Err(BeatBodyRefusal::Unsupported(
+            "a heartbeat must be sent with Content-Type: application/json".into(),
+        ));
+    }
+    let enc = content_encoding.map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+    let decoded: Vec<u8>;
+    let json_bytes: &[u8] = match enc.as_str() {
+        "" | "identity" => {
+            if raw.len() > MAX_HEARTBEAT_BODY {
+                return Err(beat_too_large());
+            }
+            raw
+        }
+        "gzip" | "x-gzip" => {
+            decoded = read_capped(flate2::read::GzDecoder::new(raw), MAX_HEARTBEAT_BODY)?;
+            &decoded
+        }
+        other => {
+            return Err(BeatBodyRefusal::Unsupported(format!(
+                "unsupported Content-Encoding {other:?} on a heartbeat; send identity or gzip"
+            )))
+        }
+    };
+    serde_json::from_slice(json_bytes).map_err(|e| BeatBodyRefusal::Malformed(format!("heartbeat body is not JSON: {e}")))
+}
+
 async fn node_heartbeat(
     State(state): State<Arc<AppState>>,
     Path(node_id): Path<String>,
-    Json(body): Json<Value>,
-) -> AppJson {
+    headers: axum::http::HeaderMap,
+    raw: axum::body::Bytes,
+) -> Result<AppJson, (axum::http::StatusCode, Json<Value>)> {
+    // The beat as JSON (i675 F11: plain, or gzip once this reply advertised
+    // it). `raw` is the body `require_any_auth` verified the v2 token over,
+    // byte for byte, compressed when the agent compressed: nothing is decoded
+    // for a caller that is not a node. Every key below is read from this one
+    // `body`, so a gzip beat and a plain beat take the same path from here.
+    let content_type = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok());
+    let encoding = headers.get(axum::http::header::CONTENT_ENCODING).and_then(|v| v.to_str().ok());
+    let body = match heartbeat_body(&raw, content_type, encoding) {
+        Ok(b) => b,
+        Err(r) => {
+            tracing::warn!(node = %node_id, status = %r.status(), "heartbeat refused: {}", r.message());
+            return Err(r.into_reply());
+        }
+    };
     // Merge heartbeat data with existing KV entry (preserves registration data
     // like gpu_model, cpu_cores, ram_gb while updating live metrics)
     let mut data = if let Ok(kv) = state.js.get_key_value("mesh_nodes").await {
@@ -860,7 +994,9 @@ async fn node_heartbeat(
     crate::autonomy_evaluators::clear_revive_backoff(&state, &node_id).await;
 
     tracing::debug!(node_id = %node_id, "heartbeat received");
-    Json(json!({"status": "ok"}))
+    // `accept_encoding` is the advertisement an agent waits for before it
+    // compresses (node-agent-go internal/heartbeat/beatgzip.go).
+    Ok(Json(json!({"status": "ok", "accept_encoding": HEARTBEAT_ACCEPT_ENCODING})))
 }
 
 /// DELETE /api/cluster/nodes/{id}/forget — drop a node's controller-side
@@ -3929,8 +4065,9 @@ async fn desired_config_get(
         String,
         Option<String>,
         Option<i64>,
+        bool,
     )> = sqlx::query_as(
-        "SELECT backend, model, image, port, tls, env, desired_state, role, target, memory_limit_bytes \
+        "SELECT backend, model, image, port, tls, env, desired_state, role, target, memory_limit_bytes, keep_warm \
              FROM noo_backend_placements WHERE node_id = $1 ORDER BY backend, role",
     )
     .bind(&node_id)
@@ -3941,7 +4078,7 @@ async fn desired_config_get(
     let placement_json: Vec<Value> = placements
         .into_iter()
         .map(
-            |(backend, model, image, port, tls, env, desired_state, role, target, memory_limit_bytes)| {
+            |(backend, model, image, port, tls, env, desired_state, role, target, memory_limit_bytes, keep_warm)| {
                 let image = placement_image(&backend, image, &|k: &str| std::env::var(k).ok());
                 json!({
                     "backend": backend,
@@ -3957,6 +4094,10 @@ async fn desired_config_get(
                     "target": target,
                     // llama.cpp container memory limit; null = the agent's default.
                     "memory_limit_bytes": memory_limit_bytes,
+                    // `--keep-warm`: the agent keeps this ollama model loaded
+                    // (keep_alive -1 + a preload) on any ollama runtime. An
+                    // agent that predates it ignores the key.
+                    "keep_warm": keep_warm,
                 })
             },
         )
@@ -3983,6 +4124,15 @@ async fn desired_config_get(
         .collect();
 
     let harness_policy = node.as_ref().map(|n| n.8.clone()).unwrap_or_else(crate::coordinator::harness_default_policy);
+    // i545 #38: on the controller's own node `auto` follows the runner its
+    // agent reports, the same rule dispatch applies (policy_for_node).
+    let is_self = crate::self_node::is_self_node(&node_id);
+    let runner = is_self
+        && crate::coordinator::self_node_runner_reported(
+            crate::coordinator::node_record(&state, &node_id).await.as_ref(),
+            crate::scheduler_engine::now_unix_secs(),
+        );
+    let harness_policy = crate::coordinator::policy_for_node(harness_policy, is_self, runner);
     let (usage_effective, usage_source) = crate::placement_fit::effective_usage(
         node.as_ref().and_then(|n| n.10.as_deref()),
         crate::self_node::is_self_node(&node_id),
@@ -4323,6 +4473,23 @@ struct PlacementBody {
     /// store (a GGUF file). Used for this request's fit check only; never
     /// stored.
     model_size_bytes: Option<u64>,
+    /// `--keep-warm` (true) / `--no-keep-warm` (false). Absent keeps the
+    /// stored flag for the same model and clears it on a model change (the
+    /// target's rule): warm was declared for THAT model.
+    keep_warm: Option<bool>,
+}
+
+/// Which placements may be declared warm: an ollama chat model. vLLM and
+/// llama.cpp hold their one model for as long as they run, and an embedder
+/// is not loaded by a generate-shaped preload, so a flag there would be a
+/// promise nothing keeps.
+pub(crate) fn validate_keep_warm(backend: &str, role: &str, keep_warm: Option<bool>) -> Result<(), String> {
+    if keep_warm != Some(true) || (backend == "ollama" && role == "chat") {
+        return Ok(());
+    }
+    Err(format!(
+        "--keep-warm is for an ollama chat placement (this is {backend}, role {role}): vllm and llamacpp hold their model while they run"
+    ))
 }
 
 /// Check a requested hardware target against the backend and the node:
@@ -4379,8 +4546,8 @@ pub(crate) fn resolve_role(backend: &str, role: Option<&str>) -> Result<String, 
 /// so it can never be inherited either. Every `SET` expression reads the OLD
 /// row, so `model` comparisons are against what was stored.
 pub(crate) const PLACEMENT_UPSERT: &str =
-    "INSERT INTO noo_backend_placements (node_id, backend, model, image, port, tls, env, desired_state, role, target, memory_limit_bytes, updated_at) \
-     VALUES ($1, $2, $3, $4, $5, COALESCE($6, false), COALESCE($7, '{}'::jsonb), $8, $9, $10, $11, NOW()) \
+    "INSERT INTO noo_backend_placements (node_id, backend, model, image, port, tls, env, desired_state, role, target, memory_limit_bytes, keep_warm, updated_at) \
+     VALUES ($1, $2, $3, $4, $5, COALESCE($6, false), COALESCE($7, '{}'::jsonb), $8, $9, $10, $11, COALESCE($12, false), NOW()) \
      ON CONFLICT (node_id, backend, role, (CASE WHEN role = 'embed' THEN model ELSE '' END)) DO UPDATE SET \
        env   = CASE WHEN $3::text IS NOT NULL AND $3::text IS DISTINCT FROM noo_backend_placements.model \
                     THEN COALESCE($7, '{}'::jsonb) ELSE COALESCE($7, noo_backend_placements.env) END, \
@@ -4390,6 +4557,9 @@ pub(crate) const PLACEMENT_UPSERT: &str =
        memory_limit_bytes = CASE WHEN $11::bigint IS NOT NULL THEN $11::bigint \
                      WHEN $3::text IS NOT NULL AND $3::text IS DISTINCT FROM noo_backend_placements.model THEN NULL \
                      ELSE noo_backend_placements.memory_limit_bytes END, \
+       keep_warm = CASE WHEN $12::boolean IS NOT NULL THEN $12::boolean \
+                     WHEN $3::text IS NOT NULL AND $3::text IS DISTINCT FROM noo_backend_placements.model THEN false \
+                     ELSE noo_backend_placements.keep_warm END, \
        model = COALESCE($3, noo_backend_placements.model), \
        image = COALESCE($4, noo_backend_placements.image), \
        port  = COALESCE($5, noo_backend_placements.port), \
@@ -4407,6 +4577,23 @@ pub(crate) struct StoredPlacement {
     pub desired_state: String,
     /// The declared hardware target (`cpu` | `gpu`), NULL when undeclared.
     pub target: Option<String>,
+    /// `--keep-warm`: held resident by the node agent (the fit check marks it).
+    pub keep_warm: bool,
+}
+
+/// The keep-warm flag a placement would have AFTER the upsert: the given one,
+/// else the stored one while the model is unchanged, else off
+/// ([`PLACEMENT_UPSERT`]'s rule).
+pub(crate) fn effective_keep_warm_after_upsert(
+    existing: Option<&StoredPlacement>,
+    body_model: Option<&str>,
+    body_keep_warm: Option<bool>,
+) -> bool {
+    if let Some(k) = body_keep_warm {
+        return k;
+    }
+    let changed = matches!((body_model, existing.and_then(|e| e.model.as_deref())), (Some(n), Some(o)) if n != o);
+    !changed && existing.is_some_and(|e| e.keep_warm)
 }
 
 /// The target a placement would have AFTER the upsert: the given one, else the
@@ -4452,6 +4639,7 @@ fn spec_of(sp: &StoredPlacement) -> Option<crate::placement_fit::Spec> {
         model,
         env: sp.env.as_object().cloned().unwrap_or_default(),
         target: sp.target.clone(),
+        keep_warm: sp.keep_warm,
     })
 }
 
@@ -4537,8 +4725,8 @@ async fn harness_kind_fit(
 }
 
 async fn stored_placements(state: &AppState, node_id: &str) -> Result<Vec<StoredPlacement>, AppError> {
-    let rows: Vec<(String, String, Option<String>, Value, String, Option<String>)> = sqlx::query_as(
-        "SELECT backend, role, model, env, desired_state, target FROM noo_backend_placements WHERE node_id = $1 ORDER BY backend, role",
+    let rows: Vec<(String, String, Option<String>, Value, String, Option<String>, bool)> = sqlx::query_as(
+        "SELECT backend, role, model, env, desired_state, target, keep_warm FROM noo_backend_placements WHERE node_id = $1 ORDER BY backend, role",
     )
     .bind(node_id)
     .fetch_all(&state.db)
@@ -4546,7 +4734,7 @@ async fn stored_placements(state: &AppState, node_id: &str) -> Result<Vec<Stored
     .map_err(|e| AppError::Internal(format!("placements query: {e}")))?;
     Ok(rows
         .into_iter()
-        .map(|(backend, role, model, env, desired_state, target)| StoredPlacement { backend, role, model, env, desired_state, target })
+        .map(|(backend, role, model, env, desired_state, target, keep_warm)| StoredPlacement { backend, role, model, env, desired_state, target, keep_warm })
         .collect())
 }
 
@@ -4766,6 +4954,7 @@ async fn placement_put(
         let node = node_fit_facts(&state, &node_id).await?;
         validate_target(&backend, target, &node).map_err(AppError::BadRequest)?;
     }
+    validate_keep_warm(&backend, &role, body.keep_warm).map_err(AppError::BadRequest)?;
 
     // The memory-fit check (multi-role placements). A stopped placement holds
     // no memory and a harness is a host service; neither is judged.
@@ -4777,7 +4966,8 @@ async fn placement_put(
         let mine = existing.iter().find(|e| same_placement_slot(e, &backend, &role, body.model.as_deref()));
         let (model, env) = effective_after_upsert(mine, body.model.as_deref(), body.env.as_ref());
         let ptarget = effective_target_after_upsert(mine, body.model.as_deref(), target);
-        let proposed = StoredPlacement { backend: backend.clone(), role: role.clone(), model, env, desired_state: "running".into(), target: ptarget };
+        let keep_warm = effective_keep_warm_after_upsert(mine, body.model.as_deref(), body.keep_warm);
+        let proposed = StoredPlacement { backend: backend.clone(), role: role.clone(), model, env, desired_state: "running".into(), target: ptarget, keep_warm };
         if proposed.model.as_deref().is_some_and(|m| !m.is_empty()) {
             let mut node = node_fit_facts(&state, &node_id).await?;
             with_size_hint(&mut node, proposed.model.as_deref(), body.model_size_bytes);
@@ -4882,6 +5072,7 @@ async fn placement_put(
         .bind(&role)
         .bind(target)
         .bind(memory_limit.as_ref().map(|(b, _)| *b as i64))
+        .bind(body.keep_warm)
         .execute(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("placement upsert: {e}")))?;
@@ -4891,6 +5082,7 @@ async fn placement_put(
     nudge_reconcile(state.clone(), node_id.clone());
     Ok(Json(json!({
         "ok": true, "node_id": node_id, "backend": backend, "role": role,
+        "keep_warm": body.keep_warm,
         "fit": fit_json, "warnings": fit_warnings,
         "memory_limit": memory_limit.map(|(b, why)| json!({"bytes": b, "why": why})),
     })))
@@ -5006,7 +5198,8 @@ async fn placement_fit_post(
             let (model, env) = effective_after_upsert(mine, Some(&w.model), w.env.as_ref());
             let target = effective_target_after_upsert(mine, Some(&w.model), target);
             with_size_hint(&mut node, Some(&w.model), w.model_size_bytes);
-            (Some((w.backend.clone(), role.clone(), Some(w.model.clone()))), Some(StoredPlacement { backend: w.backend.clone(), role, model, env, desired_state: "running".into(), target }))
+            let keep_warm = effective_keep_warm_after_upsert(mine, Some(&w.model), None);
+            (Some((w.backend.clone(), role.clone(), Some(w.model.clone()))), Some(StoredPlacement { backend: w.backend.clone(), role, model, env, desired_state: "running".into(), target, keep_warm }))
         }
         None => (None, None),
     };
@@ -6437,7 +6630,8 @@ native process)".into());
                     let mine = existing.iter().find(|e| same_placement_slot(e, &backend, &role, w["model"].as_str()));
                     let (model, env) = effective_after_upsert(mine, w["model"].as_str(), w.get("env").filter(|e| e.is_object()));
                     let target = effective_target_after_upsert(mine, w["model"].as_str(), w["target"].as_str());
-                    Some(StoredPlacement { backend, role, model, env, desired_state: "running".into(), target })
+                    let keep_warm = effective_keep_warm_after_upsert(mine, w["model"].as_str(), None);
+                    Some(StoredPlacement { backend, role, model, env, desired_state: "running".into(), target, keep_warm })
                 }
                 None => None,
             };
@@ -7760,6 +7954,62 @@ mod harness_policy_tests {
             .map(|p| p["desired_state"].as_str().unwrap_or("?").to_string())
     }
 
+    // i545 #38: on the controller's own node `auto` follows the runner its
+    // agent reports (coordinator::policy_for_node), in desired-config exactly
+    // as in dispatch. `told` is what the self node's agent would be told.
+    fn told(policy: &str, is_self: bool, record: Option<Value>) -> Option<String> {
+        let now = 1_000_000.0;
+        let runner = is_self && crate::coordinator::self_node_runner_reported(record.as_ref(), now);
+        let policy = crate::coordinator::policy_for_node(policy.to_string(), is_self, runner);
+        harness_state(&apply_harness_policy(&policy, vec![chat()]))
+    }
+    fn beat(age: f64, harness: Option<&str>) -> Value {
+        let mut r = json!({"last_heartbeat": 1_000_000.0 - age});
+        if let Some(h) = harness {
+            r["host_services"] = json!({"harness": {"state": h}});
+        }
+        r
+    }
+
+    #[test]
+    fn the_controllers_own_node_gets_no_harness_from_the_default_without_a_runner() {
+        // A fresh one-box: its agent reports the runner absent, or nothing at all.
+        assert_eq!(told("auto", true, Some(beat(10.0, Some("absent")))), None);
+        assert_eq!(told("auto", true, None), None, "no record reads as absent");
+        assert_eq!(told("auto", true, Some(beat(10.0, None))), None, "no harness field reads as absent");
+        assert_eq!(told("auto", true, Some(json!({"host_services": {"harness": {"state": "running"}}}))), None,
+            "no heartbeat time reads as absent");
+        assert_eq!(told("auto", true, Some(beat(600.0, Some("running")))), None, "a stale heartbeat reads as absent");
+    }
+
+    #[test]
+    fn the_controllers_own_node_gets_one_when_its_agent_reports_a_runner() {
+        assert_eq!(told("auto", true, Some(beat(10.0, Some("running")))).as_deref(), Some("running"));
+        assert_eq!(told("auto", true, Some(beat(10.0, Some("stopped")))).as_deref(), Some("running"),
+            "an installed runner that is stopped is still a runner to start");
+    }
+
+    #[test]
+    fn other_nodes_and_explicit_policies_are_unchanged() {
+        assert_eq!(told("auto", false, None).as_deref(), Some("running"), "a node with a chat backend: as before");
+        assert_eq!(told("off", true, Some(beat(10.0, Some("running")))).as_deref(), Some("stopped"), "off is off");
+        assert_eq!(told("manual", true, Some(beat(10.0, Some("running")))), None);
+        // An explicitly placed harness on the self node is kept either way.
+        let placed = vec![chat(), json!({"backend":"harness","desired_state":"running","role":"harness"})];
+        let p = crate::coordinator::policy_for_node("auto".into(), true, false);
+        assert_eq!(harness_state(&apply_harness_policy(&p, placed)).as_deref(), Some("running"));
+    }
+
+    #[test]
+    fn desired_config_and_dispatch_apply_the_same_rule() {
+        let cluster = include_str!("cluster.rs");
+        let get = &cluster[cluster.find("async fn desired_config_get").expect("route")..];
+        let get = &get[..get.find("apply_harness_policy(&harness_policy").expect("applies the policy")];
+        assert!(get.contains("crate::coordinator::policy_for_node(harness_policy, is_self, runner)"));
+        let dispatch = include_str!("../coordinator/dispatch.rs");
+        assert!(dispatch.contains("let policy = policy_for_node(policy.unwrap_or_else(harness_default_policy), is_self, runner_reported);"));
+    }
+
     #[test]
     fn auto_synthesises_a_running_harness_beside_a_chat_backend() {
         let out = apply_harness_policy("auto", vec![chat()]);
@@ -8043,7 +8293,7 @@ mod placement_role_tests {
     use super::*;
 
     fn stored(backend: &str, role: &str, model: &str, env: Value) -> StoredPlacement {
-        StoredPlacement { backend: backend.into(), role: role.into(), model: Some(model.into()), env, desired_state: "running".into(), target: None }
+        StoredPlacement { backend: backend.into(), role: role.into(), model: Some(model.into()), env, desired_state: "running".into(), target: None, keep_warm: false }
     }
 
     #[test]
@@ -8055,6 +8305,72 @@ mod placement_role_tests {
         assert_eq!(effective_target_after_upsert(Some(&gemma), Some("other.gguf"), None), None);
         assert_eq!(effective_target_after_upsert(Some(&gemma), Some("gemma.gguf"), Some("gpu")).as_deref(), Some("gpu"));
         assert_eq!(effective_target_after_upsert(None, Some("x"), None), None);
+    }
+
+    /// `--keep-warm` is stored with the placement: off unless declared, kept
+    /// for the same model, cleared by `--no-keep-warm` and by a model change.
+    #[test]
+    fn keep_warm_is_off_by_default_kept_for_the_model_and_cleared() {
+        assert!(!effective_keep_warm_after_upsert(None, Some("gemma4:12b"), None), "default off");
+        assert!(effective_keep_warm_after_upsert(None, Some("gemma4:12b"), Some(true)));
+        let mut warm = stored("ollama", "chat", "gemma4:12b", json!({}));
+        warm.keep_warm = true;
+        assert!(effective_keep_warm_after_upsert(Some(&warm), Some("gemma4:12b"), None), "a re-place keeps it");
+        assert!(effective_keep_warm_after_upsert(Some(&warm), None, None), "a bare stop/start keeps it");
+        assert!(!effective_keep_warm_after_upsert(Some(&warm), Some("gemma4:12b"), Some(false)), "--no-keep-warm clears it");
+        assert!(!effective_keep_warm_after_upsert(Some(&warm), Some("gemma4:e2b"), None), "warm was declared for the old model");
+        // The upsert text follows the same rule and inserts false.
+        assert!(PLACEMENT_UPSERT.contains("COALESCE($12, false)"), "an insert without the flag is off");
+        assert!(PLACEMENT_UPSERT.contains(
+            "keep_warm = CASE WHEN $12::boolean IS NOT NULL THEN $12::boolean \
+                     WHEN $3::text IS NOT NULL AND $3::text IS DISTINCT FROM noo_backend_placements.model THEN false \
+                     ELSE noo_backend_placements.keep_warm END"
+        ));
+    }
+
+    /// Only an ollama chat placement can be declared warm; clearing is always
+    /// accepted.
+    #[test]
+    fn keep_warm_is_for_ollama_chat_only() {
+        assert!(validate_keep_warm("ollama", "chat", Some(true)).is_ok());
+        for (b, r) in [("vllm", "chat"), ("llamacpp", "chat"), ("ollama", "embed"), ("ollama", "rerank"), ("harness", "harness")] {
+            let e = validate_keep_warm(b, r, Some(true)).unwrap_err();
+            assert!(e.contains("--keep-warm is for an ollama chat placement"), "{b}/{r}: {e}");
+            assert!(validate_keep_warm(b, r, Some(false)).is_ok(), "{b}/{r}: --no-keep-warm is never refused");
+            assert!(validate_keep_warm(b, r, None).is_ok());
+        }
+    }
+
+    /// The fit check counts a warm model as resident: placing a second model
+    /// on a node with a warm one is judged against both.
+    #[test]
+    fn the_fit_counts_a_warm_model_as_resident() {
+        let node = json!({"vram_gb": 12.0, "ram_gb": 32.0});
+        let mut warm = stored("ollama", "chat", "gemma4:12b", json!({"OLLAMA_CONTEXT_LENGTH": "4096"}));
+        warm.keep_warm = true;
+        let embed = stored("ollama", "embed", "gemma4:e2b", json!({}));
+        let specs = fit_specs(std::slice::from_ref(&warm), Some(("ollama", "embed", Some("gemma4:e2b"))), Some(&embed));
+        assert!(specs.iter().any(|s| s.model == "gemma4:12b" && s.keep_warm), "the warm placement is in the fit: {specs:?}");
+        let with = crate::placement_fit::evaluate(&node, &specs, crate::embedding_client::EMBED_NUM_CTX);
+        let alone = crate::placement_fit::evaluate(&node, &fit_specs(&[], None, Some(&embed)), crate::embedding_client::EMBED_NUM_CTX);
+        let warm_row = with.rows.iter().find(|r| r.model == "gemma4:12b").expect("warm row");
+        assert!(warm_row.total_gb > 1.0, "a warm 12b is charged its resident size: {}", warm_row.total_gb);
+        assert!((with.total_gb - alone.total_gb - warm_row.total_gb).abs() < 1e-9, "the warm model adds to the pool");
+        assert!(warm_row.notes.iter().any(|n| n.contains("declared warm")), "{:?}", warm_row.notes);
+        let j = with.to_json();
+        assert!(j["models"].as_array().unwrap().iter().any(|m| m["model"] == "gemma4:12b" && m["keep_warm"] == true), "{j}");
+    }
+
+    /// desired-config carries the flag to the agent as `keep_warm`.
+    #[test]
+    fn desired_config_delivers_keep_warm() {
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn desired_config_get(");
+        assert!(body.contains("memory_limit_bytes, keep_warm \\"), "the column is read");
+        assert!(body.contains("\"keep_warm\": keep_warm,"), "and sent");
+        let put = crate::test_src::fn_body(&own, "async fn placement_put(");
+        assert!(put.contains(".bind(body.keep_warm)"), "the PUT stores the flag as given (None keeps)");
+        assert!(put.contains("validate_keep_warm(&backend, &role, body.keep_warm)"));
     }
 
     #[test]
@@ -8164,8 +8480,9 @@ mod placement_role_tests {
             "the conflict target must be migration 098's index expression: embed rows are keyed by model"
         );
         assert!(!PLACEMENT_UPSERT.contains("role  = COALESCE"), "role is the key, never inherited");
-        // 11 binds, $1..$11 ($10 = the hardware target, $11 = the memory limit).
-        assert!(PLACEMENT_UPSERT.contains("$11") && !PLACEMENT_UPSERT.contains("$12"));
+        // 12 binds, $1..$12 ($10 = the hardware target, $11 = the memory limit,
+        // $12 = keep_warm).
+        assert!(PLACEMENT_UPSERT.contains("$12") && !PLACEMENT_UPSERT.contains("$13"));
     }
 
     async fn scratch(name: &str) -> Option<(sqlx::PgPool, sqlx::PgPool)> {
@@ -8197,6 +8514,7 @@ mod placement_role_tests {
         sqlx::query(PLACEMENT_UPSERT)
             .bind("host6").bind(backend).bind(model.map(str::to_string)).bind(None::<String>).bind(None::<i32>)
             .bind(None::<bool>).bind(env).bind("running").bind(role).bind(None::<String>).bind(None::<i64>)
+            .bind(None::<bool>)
             .execute(db).await.expect("upsert");
     }
 
@@ -8282,6 +8600,7 @@ mod placement_role_tests {
         let old = sqlx::query(PLACEMENT_UPSERT)
             .bind("host6").bind("ollama").bind(Some("harrier".to_string())).bind(None::<String>).bind(None::<i32>)
             .bind(None::<bool>).bind(None::<Value>).bind("running").bind("embed").bind(None::<String>).bind(None::<i64>)
+            .bind(None::<bool>)
             .execute(&db).await;
         assert!(old.is_err(), "before 087 there is no (node, backend, role) key");
 
@@ -8306,6 +8625,9 @@ mod placement_role_tests {
         let m098 = crate::mesh_migrate::MIGRATIONS.iter().find(|m| m.revision == crate::mesh_migrate::EMBED_PLACEMENT_MODEL_REVISION).expect("embed placement model revision");
         sqlx::raw_sql(m098.sql).execute(&db).await.expect("098");
         sqlx::raw_sql(m098.sql).execute(&db).await.expect("098 is idempotent");
+        // The keep-warm column the upsert writes.
+        let mkw = crate::mesh_migrate::MIGRATIONS.iter().find(|m| m.revision == crate::mesh_migrate::PLACEMENT_KEEP_WARM_REVISION).expect("keep-warm revision");
+        sqlx::raw_sql(mkw.sql).execute(&db).await.expect("keep-warm column");
 
         // And now the second role lands beside the first.
         upsert(&db, "ollama", Some("harrier"), None, "embed").await;
@@ -8968,5 +9290,252 @@ mod exporter_announcement_tests {
         // compose side against this constant's text)
         assert_eq!(EXPORTER_ANNOUNCE_DIR, "/run/noo-prom-sd");
         assert_eq!(EXPORTER_ANNOUNCEMENT, "nvidia-exporter.json");
+    }
+}
+
+/// Gzip heartbeats (i675 F11): a JSON Content-Type is required as before,
+/// one 256 KiB cap holds for plain and decoded gzip JSON alike, the decode
+/// runs only in the handler (so only after `require_any_auth` verified the
+/// token over the compressed bytes), and it yields the same `body` a plain
+/// beat does.
+#[cfg(test)]
+mod heartbeat_gzip_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    const SECRET: &str = "fleet-secret-for-tests";
+    const URI: &str = "/api/cluster/nodes/host7/heartbeat";
+    const NOW: u64 = 1_800_000_000;
+    const JSON: Option<&str> = Some("application/json");
+
+    fn gz(b: &[u8]) -> Vec<u8> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(b).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// A body as the agent sends it: Content-Type application/json, and the
+    /// given Content-Encoding.
+    fn hb(raw: &[u8], enc: Option<&str>) -> Result<Value, BeatBodyRefusal> {
+        heartbeat_body(raw, JSON, enc)
+    }
+
+    /// A JSON object of exactly `n` bytes: `{"pad":"xxx…"}`.
+    fn json_of_len(n: usize) -> Vec<u8> {
+        let fixed = br#"{"pad":""}"#.len();
+        let mut v = br#"{"pad":""#.to_vec();
+        v.extend(vec![b'x'; n - fixed]);
+        v.extend_from_slice(br#""}"#);
+        assert_eq!(v.len(), n);
+        v
+    }
+
+    fn beat() -> Value {
+        json!({
+            "load": 0.42, "cpu_load": 0.5, "mem_used_gb": 3.1, "vram_used_gb": null,
+            "running_backends": {"ollama": "harrier"},
+            "lanes": [{"backend": "ollama", "model": "harrier", "role": "embed", "state": "serving", "reason": ""}],
+            "log_ship": {"enabled": true, "queued": 1},
+            "backend_leaves": {"ollama": {"dns": ["ollama", "localhost"], "not_after": 1798495662}},
+            "capabilities": {"arch": "amd64", "backends": ["ollama"], "cpu_cores": 8},
+            "os": "linux",
+            "app_version": "stack-v0.6.23",
+            // Not a key node_heartbeat names: it must reach the record from
+            // neither encoding.
+            "unnamed_key": {"admin": true},
+        })
+    }
+
+    /// What the handler does with `body` for the keys this test can drive
+    /// without an AppState: the same pure carries, in the handler's order.
+    fn record_from(body: &Value) -> Value {
+        let mut data = json!({"id": "host7"});
+        carry_load(&mut data, body);
+        data["running_backends"] = body.get("running_backends").cloned().unwrap_or(json!({}));
+        carry_lanes(&mut data, body);
+        carry_i300(&mut data, body);
+        carry_reported(&mut data, body, "log_ship");
+        carry_reported(&mut data, body, "backend_leaves");
+        if let Some(v) = body.get("capabilities") { if !v.is_null() { data["capabilities"] = v.clone(); } }
+        data
+    }
+
+    #[test]
+    fn a_gzip_beat_is_the_plain_beat() {
+        let plain = serde_json::to_vec(&beat()).unwrap();
+        let from_plain = hb(&plain, None).unwrap();
+        for enc in ["gzip", "GZIP", " x-gzip "] {
+            assert_eq!(hb(&gz(&plain), Some(enc)).unwrap(), from_plain, "{enc}");
+        }
+        assert_eq!(hb(&plain, Some("identity")).unwrap(), from_plain);
+        let a = record_from(&from_plain);
+        let b = record_from(&hb(&gz(&plain), Some("gzip")).unwrap());
+        assert_eq!(a, b, "a gzip beat must leave the record exactly as the plain one does");
+        assert_eq!(b["current_load"], json!(0.42));
+        assert_eq!(b["log_ship"]["queued"], 1);
+    }
+
+    /// The `Json` extractor's rule, kept: no JSON Content-Type is a 415,
+    /// plain or gzip; application/json (with parameters) and
+    /// application/*+json are accepted.
+    #[test]
+    fn a_heartbeat_without_a_json_content_type_is_415_as_before() {
+        let plain = serde_json::to_vec(&beat()).unwrap();
+        for ct in [None, Some("text/json"), Some("text/plain"), Some("application/x-www-form-urlencoded"), Some("json"), Some(""), Some("application/jsonx"), Some("application/x-json-ish")] {
+            for (raw, enc) in [(plain.clone(), None), (gz(&plain), Some("gzip"))] {
+                let r = heartbeat_body(&raw, ct, enc).unwrap_err();
+                assert_eq!(r.status(), axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE, "{ct:?} {enc:?}");
+            }
+        }
+        for ct in ["application/json", "application/json; charset=utf-8", "application/json;charset=utf-8",
+                   "Application/JSON", "application/cloudevents+json"] {
+            assert!(heartbeat_body(&plain, Some(ct), None).is_ok(), "plain {ct}");
+            assert!(heartbeat_body(&gz(&plain), Some(ct), Some("gzip")).is_ok(), "gzip {ct}");
+        }
+    }
+
+    /// The handler names each key it keeps (the allowlist); a gzip beat
+    /// reaches it as the same decoded `body`, so a key it does not name is
+    /// dropped from a gzip beat exactly as from a plain one.
+    #[test]
+    fn a_key_the_handler_does_not_name_is_dropped_from_a_gzip_beat_too() {
+        let plain = serde_json::to_vec(&beat()).unwrap();
+        for body in [hb(&plain, None).unwrap(), hb(&gz(&plain), Some("gzip")).unwrap()] {
+            assert!(body.get("unnamed_key").is_some(), "decoding itself keeps every key");
+            assert!(record_from(&body).get("unnamed_key").is_none());
+        }
+        // Source: the handler reads ONE `body`, decoded once from the
+        // request's own headers, and never copies the body's keys wholesale
+        // (which would bypass the naming).
+        let code = crate::test_src::own_code(include_str!("cluster.rs"));
+        let handler = crate::test_src::fn_body(&code, "async fn node_heartbeat(");
+        assert_eq!(handler.matches("heartbeat_body(").count(), 1, "one decode");
+        assert!(handler.contains("heartbeat_body(&raw, content_type, encoding)")
+            && handler.contains("header::CONTENT_TYPE")
+            && handler.contains("header::CONTENT_ENCODING"),
+            "the decode reads the request's own Content-Type and Content-Encoding");
+        for wholesale in ["body.as_object()", "Json(body)", "GzDecoder", "read_capped("] {
+            assert!(!handler.contains(wholesale), "node_heartbeat must not contain `{wholesale}`");
+        }
+        let decode = handler.find("heartbeat_body(").unwrap();
+        let first_read = handler.find("carry_load(").expect("the first key read");
+        assert!(decode < first_read, "the body is decoded before any key is read");
+    }
+
+    /// One size rule: JSON of exactly the cap is read, one byte more is the
+    /// same 413, plain or gzip. Asserted directly at the boundary.
+    #[test]
+    fn plain_and_gzip_share_one_cap_at_the_exact_boundary() {
+        let at = json_of_len(MAX_HEARTBEAT_BODY);
+        let over = json_of_len(MAX_HEARTBEAT_BODY + 1);
+        assert!(hb(&at, None).is_ok(), "plain at the cap");
+        assert!(hb(&gz(&at), Some("gzip")).is_ok(), "gzip decoding to the cap");
+        let plain = hb(&over, None).unwrap_err();
+        let gzip = hb(&gz(&over), Some("gzip")).unwrap_err();
+        assert_eq!(plain.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(plain, gzip, "the same 413, same message, whichever the encoding");
+        assert!(plain.message().contains(&MAX_HEARTBEAT_BODY.to_string()), "the 413 names the cap: {}", plain.message());
+    }
+
+    /// The decoder never reads past cap + 1 bytes, whatever the stream holds.
+    /// Asserted by counting what the reader handed over, so a decoder that
+    /// expanded everything and only then compared sizes is caught here.
+    #[test]
+    fn the_decoder_reads_at_most_one_byte_past_the_cap() {
+        struct Counted<R> { inner: R, given: std::rc::Rc<std::cell::Cell<u64>> }
+        impl<R: Read> Read for Counted<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.inner.read(buf)?;
+                self.given.set(self.given.get() + n as u64);
+                Ok(n)
+            }
+        }
+        let cap = MAX_HEARTBEAT_BODY;
+        let given = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        // 4x the cap available: an unbounded read would take all of it.
+        let src = Counted { inner: std::io::repeat(0).take(4 * cap as u64), given: given.clone() };
+        assert!(matches!(read_capped(src, cap), Err(BeatBodyRefusal::TooLarge(_))));
+        assert_eq!(given.get(), cap as u64 + 1, "read exactly cap + 1 bytes, no more");
+
+        // The gzip path goes through it: a bomb (16 MiB of zeros, ~16 KiB on
+        // the wire) is the 413, and an endless gzip stream still returns.
+        let bomb = gz(&vec![0u8; 16 << 20]);
+        assert!(bomb.len() < 1 << 20, "precondition: the bomb is small on the wire ({} bytes)", bomb.len());
+        assert!(matches!(hb(&bomb, Some("gzip")), Err(BeatBodyRefusal::TooLarge(_))));
+        let endless = flate2::read::GzEncoder::new(std::io::repeat(0), flate2::Compression::fast());
+        assert!(matches!(read_capped(flate2::read::GzDecoder::new(endless), cap), Err(BeatBodyRefusal::TooLarge(_))));
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let def = crate::test_src::fn_body(&own, "fn heartbeat_body(");
+        assert!(def.contains("read_capped(flate2::read::GzDecoder::new(raw), MAX_HEARTBEAT_BODY)"), "the gzip arm is capped");
+    }
+
+    /// Margin: a measured beat is 5.7-9.7 KB. The largest plausible beat
+    /// (8 backends, 40 models, every optional section) is 36.2 KiB, the cap
+    /// 256 KiB: margin 7.1x. Measured in node-agent-go payload_size_test.go
+    /// (TestLargestPlausibleBeatIsFarUnderTheCap, which fails at a quarter of
+    /// this cap); this pins the number that test asserts against.
+    #[test]
+    fn the_cap_256kib_is_7x_the_largest_plausible_beat_36kib() {
+        assert_eq!(MAX_HEARTBEAT_BODY, 256 * 1024, "the agent test asserts against this same number");
+    }
+
+    #[test]
+    fn refusals_are_statuses_the_agent_falls_back_on() {
+        let bad = hb(b"\x1f\x8bnot really gzip", Some("gzip")).unwrap_err();
+        assert_eq!(bad.status(), axum::http::StatusCode::BAD_REQUEST);
+        let not_json = hb(&gz(b"not json"), Some("gzip")).unwrap_err();
+        assert_eq!(not_json.status(), axum::http::StatusCode::BAD_REQUEST);
+        let br = hb(b"{}", Some("br")).unwrap_err();
+        assert_eq!(br.status(), axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        // The agent (beatgzip.go encodingRefused) re-sends plain on exactly these.
+        for r in [bad, not_json, br] {
+            assert!([400u16, 413, 415].contains(&r.status().as_u16()));
+        }
+        assert_eq!(HEARTBEAT_ACCEPT_ENCODING, &["gzip"]);
+    }
+
+    /// Auth before decode. The token is verified by `require_any_auth` over
+    /// the RAW (compressed) bytes, which never decodes anything; the only
+    /// decode is in the handler, behind that layer. So a bomb under a bad
+    /// token is a 401 from the layer, never a 413 from the decoder.
+    #[tokio::test]
+    async fn an_unauthenticated_gzip_bomb_is_401_before_any_decode() {
+        let bomb = gz(&vec![0u8; 16 << 20]);
+        // The layer buffers the raw body up to MAX_SIGNED_BODY: the bomb fits,
+        // so the layer's answer is the token verdict, not a size refusal.
+        assert!(bomb.len() < crate::cluster_token_v2::MAX_SIGNED_BODY);
+        let nonce = "f11a0000000000000000000000000001";
+        let forged = crate::cluster_token_v2::sign("not-the-fleet-secret", "POST", URI, &bomb, "host7", NOW, nonce).unwrap();
+        assert_eq!(crate::cluster_token_v2::verify_and_spend(None, SECRET, &forged, "POST", URI, &bomb, NOW).await, None,
+            "a bad token over a gzip bomb is a 401 from the layer");
+
+        // The agent signs the bytes AS SENT: a token over the compressed body
+        // verifies; one over the decoded JSON does not describe the wire.
+        let plain = serde_json::to_vec(&beat()).unwrap();
+        let wire = gz(&plain);
+        let good = crate::cluster_token_v2::sign(SECRET, "POST", URI, &wire, "host7", NOW, "f11a0000000000000000000000000002").unwrap();
+        assert_eq!(crate::cluster_token_v2::verify_and_spend(None, SECRET, &good, "POST", URI, &wire, NOW).await.as_deref(), Some("host7"));
+        let over_plain = crate::cluster_token_v2::sign(SECRET, "POST", URI, &plain, "host7", NOW, "f11a0000000000000000000000000003").unwrap();
+        assert_eq!(crate::cluster_token_v2::verify_and_spend(None, SECRET, &over_plain, "POST", URI, &wire, NOW).await, None);
+
+        // Structure: the auth module never decodes a body; the heartbeat
+        // route is not one the middleware lets through without a credential;
+        // the decoder runs only in `heartbeat_body`, called only by the handler,
+        // and the cluster router is mounted under the auth layer.
+        let auth = crate::test_src::own_code(include_str!("../auth.rs"));
+        for d in ["GzDecoder", "heartbeat_body", "read_capped", "flate2"] {
+            assert!(!auth.contains(d), "auth.rs must not decode bodies (`{d}`)");
+        }
+        assert!(!crate::auth::passes_without_bearer_check(URI, false, false));
+        assert!(!crate::auth::passes_without_bearer_check(URI, false, true));
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        assert_eq!(own.matches("heartbeat_body(").count(), 2, "its definition and the one call in node_heartbeat");
+        assert_eq!(own.matches("GzDecoder::new(").count(), 1, "one decoder, inside heartbeat_body");
+        let routes = crate::test_src::own_code(include_str!("mod.rs"));
+        let core = crate::test_src::fn_body(&routes, "fn core_router(");
+        assert!(core.contains(".merge(cluster::router())"));
+        let build = crate::test_src::fn_body(&routes, "fn build_router(");
+        assert!(build.contains("core_router()") && build.contains("crate::auth::require_any_auth"),
+            "the cluster routes are served under the auth layer");
     }
 }

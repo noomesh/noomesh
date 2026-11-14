@@ -94,7 +94,10 @@ run of this example.
    ```
 
    `noo stack restart --force` starts the service. `noo addons list` shows it
-   declared and running.
+   declared and running. The same holds for `noo addons upgrade`, and for node
+   workloads: an add-on's node workload exists for the gateway only once
+   `noo stack restart --force` has run, so restart before `noo cluster
+   workloads place`.
 
 6. **Connect**: call the add-on's route through the gateway as an operator. It
    answers with who the call was for and whether its own token exchange
@@ -104,9 +107,17 @@ run of this example.
    service key cannot make it: service keys open only the inference surface.
 
    ```sh
+   CA="$(noo --json security pki status | jq -r .pki_dir)/ca.crt"
    TOKEN=$(jq -r .access_token "${NOO_CREDENTIALS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/mesh/credentials.json}")
-   curl -s --cacert "${NOO_PKI_DIR:-$HOME/.config/mesh/pki}/ca.crt" -H "Authorization: Bearer $TOKEN" https://localhost:8080/api/example-addon/status | jq .
+   curl -sS --fail-with-body --cacert "$CA" -H "Authorization: Bearer $TOKEN" https://localhost:8080/api/example-addon/status
    ```
+
+   The first line asks the CLI where this install keeps its cluster CA. That
+   directory is set by the install (for example `~/.noo/pki`, or the
+   encrypted state volume) and is not in your shell's environment. The
+   call prints the add-on's JSON answer. If it fails, curl says why and exits
+   non-zero: `curl: (77)` means the CA path is wrong, and an HTTP error prints
+   the gateway's body.
 
    `"exchanged": false` with a `status` means the add-on reached the exchange
    and was refused (`401`: its key was revoked or the add-on disabled). A

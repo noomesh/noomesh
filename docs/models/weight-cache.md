@@ -169,6 +169,11 @@ When the node-agent is asked to start a backend:
   source on a placed node. A node that must pull a tag anyway accepts that
   explicitly with `NOO_ALLOW_OLLAMA_REGISTRY_PULL=1` in its node-agent
   environment.
+- **A converted GGUF** (a `<name>.Modelfile` plus its weight) is imported the
+  same way. If `ollama create` fails, the verified weight stays in the node's
+  staging dir (`ollama-gguf-cache/<sha256>.gguf`), so the retry does not
+  download it again. It is reused only after it is re-hashed, deleted when the
+  import succeeds, and never kept longer than 24 hours or beyond two entries.
 
 `noo models recommended` prefers models that are already in the cache
 (`GET /api/models/cached`) precisely because they preseed over the LAN.

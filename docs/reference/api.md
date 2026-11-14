@@ -200,7 +200,8 @@ add-on service key with the `metrics` scope; at most 256 series per source,
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/api/inference` | run one turn through the coordinator (non-streaming) |
-| POST | `/api/inference/stream` | the same, as Server-Sent Events proxied token-by-token from the backend (`data: {…}` lines in OpenAI streaming format, ending `data: [DONE]`) |
+| POST | `/api/inference/chat` | one coordinator turn as Server-Sent Events, as the signed-in user (retrieval, memory, tools; `data: {"type": …}` events, the console socket's shape); what `noo chat` uses |
+| POST | `/api/inference/stream` | a plain model call as Server-Sent Events, proxied token-by-token from the backend (no coordinator: no retrieval or tools; `data: {…}` lines in OpenAI streaming format, ending `data: [DONE]`) |
 | POST | `/v1/chat/completions` | OpenAI-compatible chat, routed by **model class** with failover (below); what external clients and `pipeline/llm.py` use |
 | POST | `/v1/responses` | OpenAI Responses API, for harnesses that speak only it (Codex CLI since February 2026); same auth, class resolution, failover and accounting as `/v1/chat/completions`. Streaming supported; stateless (no `GET /v1/responses/{id}`) |
 | GET | `/v1/models`, `/v1/models/{model_id}` | the **catalogue**: every class and alias a consumer may send as `model`, `owned_by: "noomesh"`, with `noo: {class, candidates, healthy}`; `/v1/models/{id}` is `404 model_not_found` for an id that is no class, alias or served model. Still the dashboard's readiness probe: `503` until the first `chat-default` candidate answers its own model list |
@@ -439,6 +440,13 @@ receives flat JSON events, each with a `type`:
 {"type": "keepalive"}
 ```
 
+`done` (and the saved assistant message's metadata, and
+`/api/inference`'s `data`) carries `recall` when the turn ran
+conversation recall: `{"status": "ok", "hits": N}`, or `{"status":
+"skipped", "reason": "embedder not ready (timed out after 15 s)"}` when
+the answer was given without it; the console shows a skipped recall in
+the turn detail.
+
 `phase` says what a turn is doing before its first token, for the
 console's status line. `routed` names the node a model call went to and
 that backend's slots (null when its agent reports none). It is sent
@@ -464,7 +472,7 @@ capped at 200 000 characters a turn. It is not the answer, which arrives as
 | GET | `/api/cluster/status` | nodes, backends, scheduler and knowledge-base summary |
 | GET | `/api/cluster/nodes` | the node registry (from the `mesh_nodes` KV bucket merged with the database) |
 | POST | `/api/cluster/nodes/register`, `/api/cluster/nodes/{id}/register` | node-agent registration (hostname, ip, tier, capabilities) |
-| POST | `/api/cluster/nodes/{id}/heartbeat` | node-agent heartbeat: `load`, `cpu_load`, `cpu_cores`, `ram_gb`, `mem_used_gb`, `gpu_model`, `vram_gb`, `vram_used_gb`, `running_backends`, `ip_address`; `404` tells the agent to re-register |
+| POST | `/api/cluster/nodes/{id}/heartbeat` | node-agent heartbeat: `load`, `cpu_load`, `cpu_cores`, `ram_gb`, `mem_used_gb`, `gpu_model`, `vram_gb`, `vram_used_gb`, `running_backends`, `ip_address`; `404` tells the agent to re-register. The reply advertises `accept_encoding: ["gzip"]`, after which the agent sends `Content-Encoding: gzip` (signed as sent; decoded after auth, capped at 256 KiB like a plain body, `413` beyond) |
 | DELETE | `/api/cluster/nodes/{id}/forget` | remove a node |
 | GET | `/api/cluster/nodes/{node_id}/desired-config` | what the node-agent reconciles against |
 | PUT | `/api/cluster/nodes/{node_id}/config` | set node config (`usage_profile`: `shared` \| `dedicated` \| null for the default) |
@@ -745,6 +753,7 @@ answers when it does not reply.
 | GET | `/api/autonomy/status`, `/api/autonomy/audit` | locations and their audit trail |
 | GET | `/api/autonomy/decisions` | what the disarmed locations *would* have done (`?outcome=would` by default; `fired`, `error` or `all`) |
 | POST | `/api/autonomy/locations`, `/api/autonomy/locations/{name}/toggle`, `/api/autonomy/enable`, `/api/autonomy/disable` | manage locations |
+| POST | `/api/autonomy/locations/{name}/dry-run` | `{"dry_run": false}` arms a gated rule (`disk_watermark`, `cert_auto_rotate`) and takes it out of preview in one update (409 if the rule is switched off); `true` puts it back into preview, arm state unchanged; operator or admin; audited. Replies the state read back: `{name, enabled, armed, dry_run, config, live_means}` |
 | GET, POST | `/api/activities`; POST `…/{id}/progress`, `/link-task`, `/complete`; PUT `…/{id}/status` | agent activities |
 | GET | `/api/agent/loops` | managed loops |
 | GET, POST, DELETE | `/api/proactive/status`, `/rules`, `/history`, `/rules/{rule_id}` | the proactive loop |

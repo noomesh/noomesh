@@ -6,6 +6,7 @@
 to upgrade to it (noomesh-internal i673).
 
     scripts/release-size-report.py [--tag stack-vX.Y.Z] [--prev stack-vX.Y.Z] [--json OUT]
+                                   [--memory [CELL=]memory.json ...]
 
 Defaults: the newest final stack release and the final before it. Read-only:
 registry manifests (`docker buildx imagetools inspect --raw`) and release
@@ -19,6 +20,10 @@ build (scripts/release-image-inputs.json):
   upgrade_bytes  layers whose digest is not in the previous final's image for
                  the same platform: what an upgrading node downloads
 Plus the CLI release assets' sizes. Totals per platform at the end.
+
+--memory adds "Memory at idle (measured)": the install matrix cells'
+memory.json (scripts/install-cell/memory_baseline.py, probe-memory-baseline).
+A cell whose file is missing is listed as "not measured: <why>".
 """
 
 from __future__ import annotations
@@ -121,6 +126,217 @@ def platforms_of(index: dict, fetch) -> dict[str, list[dict]]:
     return out
 
 
+# ---------------------------------------------------------------- memory
+
+def _baseline_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("memory_baseline", ROOT / "scripts" / "install-cell" / "memory_baseline.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+MB = _baseline_module()
+NODE_SHARE_LABEL = MB.NODE_SHARE_LABEL
+FLEET_LINE = ("fleet, read-only: on 0.6.24+ each node agent exports its own process_resident_memory_bytes "
+              "and noo_unit_memory_bytes (#1026); real-hardware node figures (robopi, the Mac) are read from "
+              "the metrics door, no manual measurement.")
+
+
+def _read_json(p) -> tuple[dict | None, str | None]:
+    try:
+        return json.loads(p.read_text()), None
+    except (OSError, ValueError) as e:
+        return None, f"{p.name} unreadable ({e})"
+
+
+def load_extras(cell: str, d, base: dict | None) -> dict:
+    """The idle series (t0 = memory.json, then memory-idle-<t>.json) and
+    coldload.json beside a cell's memory.json. Expected from the
+    SERIES_CELLS; a missing file there is "not measured: <why>", never
+    dropped. Elsewhere only what is present is shown."""
+    from pathlib import Path
+    d = Path(d)
+    expected = cell in MB.SERIES_CELLS
+    out: dict = {}
+    files = {s: d / f"memory-idle-{s}.json" for s in MB.SERIES_SAMPLES}
+    if expected or any(f.is_file() for f in files.values()):
+        series = [{"sample": "t0", "doc": base} if base else
+                  {"sample": "t0", "missing": "no memory.json in the cell's artifact"}]
+        for s, f in files.items():
+            doc, why = _read_json(f) if f.is_file() else (None, f"no {f.name} in the cell's artifact")
+            series.append({"sample": s, "doc": doc} if doc else {"sample": s, "missing": why})
+        out["series"] = series
+    f = d / "coldload.json"
+    if f.is_file():
+        doc, why = _read_json(f)
+        out["coldload"] = doc if doc else {"missing": why}
+    elif expected:
+        out["coldload"] = {"missing": "no coldload.json in the cell's artifact"}
+    return out
+
+
+def load_memory(specs: list[str]) -> list[dict]:
+    """`[CELL=]PATH` per cell -> {cell, measured, why | baseline}. The cell
+    name is CELL=, else the file's own meta, else its artifact dir
+    (install-cell-<cell>). A missing or unreadable file is "not measured"
+    with the reason, never dropped."""
+    from pathlib import Path
+    out = []
+    for spec in specs:
+        cell, _, path = spec.rpartition("=") if "=" in spec else ("", "", spec)
+        p = Path(path)
+        dir_cell = p.parent.name.removeprefix("install-cell-")
+        if not p.is_file():
+            summary = p.parent / "summary.json"
+            if summary.is_file():
+                try:
+                    s = json.loads(summary.read_text())
+                    why = (f"no memory.json in the cell's artifact (cell {s.get('result', '?')}"
+                           + (f" at {s['failed_step']}" if s.get("failed_step") else "") + ")")
+                except (OSError, ValueError):
+                    why = "no memory.json in the cell's artifact"
+            elif p.parent.is_dir():
+                why = "no memory.json in the cell's artifact"
+            else:
+                why = "no artifact from the cell (it did not run or did not upload)"
+            out.append({"cell": cell or dir_cell, "measured": False, "why": why,
+                        **load_extras(cell or dir_cell, p.parent, None)})
+            continue
+        try:
+            doc = json.loads(p.read_text())
+            doc["totals"], doc["meta"]  # noqa: B018 - the shape this report reads
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            out.append({"cell": cell or dir_cell, "measured": False, "why": f"memory.json unreadable ({e})",
+                        **load_extras(cell or dir_cell, p.parent, None)})
+            continue
+        name = cell or doc["meta"].get("cell") or dir_cell
+        out.append({"cell": name, "measured": True, "baseline": doc, **load_extras(name, p.parent, doc)})
+    return out
+
+
+def _models_line(doc: dict) -> str:
+    ms = doc.get("models_loaded")
+    if ms is None:
+        return "unknown: the sample predates the loaded-model check"
+    if not ms:
+        return doc.get("idle") or "?"
+    return ", ".join(f"{x['model']} ({x.get('size', '?')}, until {x.get('until', '?')})" for x in ms)
+
+
+def render_series(series: list[dict]) -> list[str]:
+    L = ["", "#### Idle series (nothing used the stack between samples)", "",
+         "| sample | since t0 | verdict | grand total current | node share of a one-machine install (current) | models loaded (size, until) |",
+         "|---|---|---|---|---|---|"]
+    for s in series:
+        if "missing" in s:
+            L.append(f"| {s['sample']} | | not measured: {s['missing']} | | | |")
+            continue
+        d = s["doc"]
+        t = d.get("totals", {})
+        since = d.get("meta", {}).get("since_t0_s")
+        L.append(f"| {s['sample']} | {'0 s' if s['sample'] == 't0' else (f'{since} s' if since is not None else '?')} "
+                 f"| {d.get('idle', 'unknown: not recorded')} "
+                 f"| {MB._tot(t['grand']['memory_current_bytes']) if 'grand' in t else '?'} "
+                 f"| {MB._tot(t['node_share']['memory_current_bytes']) if 'node_share' in t else '?'} "
+                 f"| {_models_line(d)} |")
+    return L
+
+
+def render_coldload(c: dict) -> list[str]:
+    if "missing" in c:
+        return ["", f"#### Cold load: not measured: {c['missing']}"]
+    L = ["", "#### Cold load (after first-answer: every model stopped, then timed cold and warm)", "",
+         "unload: " + (", ".join(f"{s['container']}:{s['model']} {'stopped' if s['ok'] else 'NOT stopped (' + s.get('why', '?') + ')'}"
+                               for s in c.get("unload", [])) or "nothing was loaded"),
+         f"cold before the timings: {c.get('cold_confirmed', 'unknown: not recorded')}", "",
+         "| measurement | seconds | first output s | result |", "|---|---|---|---|"]
+    for k, label in (("cold_embed", "cold embed (POST /api/external/embeddings)"), ("warm_embed", "warm embed"),
+                     ("cold_chat", "cold chat (noo chat --message)"), ("warm_chat", "warm chat")):
+        x = (c.get("timings") or {}).get(k)
+        if x is None:
+            L.append(f"| {label} | | | not measured: no record |")
+            continue
+        secs = x.get("seconds")
+        L.append(f"| {label} | {secs if secs is not None else '-'} | {x.get('first_output_s', '-')} | "
+                 f"{'ok' if x.get('ok') else 'FAILED: ' + str(x.get('why', '?'))} |")
+    key = c.get("key") or {}
+    L.append(f"\nservice-key lifecycle (no value shown) minted={key.get('minted')} revoked={key.get('revoked')}")
+    return L
+
+
+def render_memory(cells: list[dict]) -> list[str]:
+    mib = MB.mb
+    L = ["", "## Memory at idle (measured)", "",
+         "Idle after onboard: after health and verify, before the first chat. MiB. "
+         "anon = process memory, file = page cache (reclaimable), current = the cgroup's memory.current; "
+         "docker stats = memory.current minus inactive file. \"omitted\" = could not be read, never 0. "
+         "A total marked \"n of m\" covers only the figures that were measured.", "",
+         f"_{FLEET_LINE}_"]
+    for c in cells:
+        if not c["measured"]:
+            L += ["", f"### {c['cell']}: not measured: {c['why']}"]
+            L += render_series(c["series"]) if "series" in c else []
+            L += render_coldload(c["coldload"]) if "coldload" in c else []
+            continue
+        d = c["baseline"]
+        m = d["meta"]
+        L += ["", f"### {c['cell']}: {d.get('idle') or 'unknown: memory.json predates the loaded-model check'}",
+              f"noo `{m.get('noo_version', '?')}` · model {m.get('model', '?')} · settled {m.get('settle_seconds', '?')} s"
+              f" · host RAM {mib(m.get('host_mem_total_bytes'))} MiB · {m.get('timestamp', '?')}", "",
+              "| container | class | anon | file | current | docker stats | image |", "|---|---|---|---|---|---|---|"]
+        for x in d.get("containers", []):
+            L.append(f"| {x['name']} | {x.get('class', '?')} | " + " | ".join(MB._cell(x, k) for k in MB.CONTAINER_FIGURES)
+                     + f" | {x.get('image', '?')} |")
+        if d.get("containers_omitted"):
+            L.append(f"\ncontainers: {d['containers_omitted']}")
+        L += ["", "| host unit | anon | file | current | peak | VmRSS |", "|---|---|---|---|---|---|"]
+        for u in d.get("host_units", []):
+            if not u.get("present"):
+                L.append(f"| {u['unit']} | absent: {u.get('why', '?')} | | | | |")
+            else:
+                L.append(f"| {u['unit']} | " + " | ".join(MB._cell(u, k) for k in MB.UNIT_FIGURES) + " |")
+        omitted = [f"{e.get('name') or e.get('unit')} {k}: {why}"
+                   for e in d.get("containers", []) + d.get("host_units", []) for k, why in e.get("omitted", {}).items()]
+        if omitted:
+            L += ["", "Omitted: " + "; ".join(omitted)]
+        t = d["totals"]
+        L += ["", "| total | anon | file | current |", "|---|---|---|---|"]
+        for key, label in (("containers", "all containers"), ("host_units", "all host units"),
+                           ("grand", "**grand total**"), ("controller_share", "controller share"),
+                           ("node_share", f"**{NODE_SHARE_LABEL}**")):
+            L.append(f"| {label} | " + " | ".join(MB._tot(t[key][k]) for k in MB.TOTAL_FIGURES) + " |")
+        L += render_series(c["series"]) if "series" in c else []
+        L += render_coldload(c["coldload"]) if "coldload" in c else []
+    return L
+
+
+def _sample_json(s: dict) -> dict:
+    if "missing" in s:
+        return {"sample": s["sample"], "measured": False, "why": s["missing"]}
+    d = s["doc"]
+    return {"sample": s["sample"], "measured": True, "since_t0_s": d.get("meta", {}).get("since_t0_s", 0),
+            "idle": d.get("idle"), "models_loaded": d.get("models_loaded"),
+            "grand_memory_current": (d.get("totals", {}).get("grand") or {}).get("memory_current_bytes"),
+            "node_share_memory_current": (d.get("totals", {}).get("node_share") or {}).get("memory_current_bytes")}
+
+
+def memory_json(cells: list[dict]) -> dict:
+    def extras(c):
+        out = {}
+        if "series" in c:
+            out["series"] = [_sample_json(s) for s in c["series"]]
+        if "coldload" in c:
+            out["coldload"] = c["coldload"]
+        return out
+    return {"fleet": FLEET_LINE, "node_share_label": NODE_SHARE_LABEL,
+            "cells": [{"cell": c["cell"], "measured": False, "why": c["why"], **extras(c)} if not c["measured"]
+                      else {"cell": c["cell"], "measured": True, **{k: c["baseline"].get(k) for k in
+                            ("idle", "models_loaded", "meta", "containers", "containers_omitted", "host_units", "totals")
+                            if k in c["baseline"]}, **extras(c)}
+                      for c in cells]}
+
+
 # ---------------------------------------------------------------- IO
 
 def inspect_raw(ref: str) -> dict:
@@ -149,7 +365,24 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--tag")
     ap.add_argument("--prev")
     ap.add_argument("--json")
+    ap.add_argument("--memory", nargs="+", default=[], metavar="[CELL=]memory.json",
+                    help="install-matrix cells' memory.json: adds 'Memory at idle (measured)'")
     a = ap.parse_args(argv)
+    mem = load_memory(a.memory) if a.memory else None
+    # Memory first, and kept when the registry half fails: it comes from the
+    # cells' own files, so a gh or registry error must not hide it.
+    if mem is not None:
+        print("\n".join(render_memory(mem)) + "\n")
+    try:
+        return _size(a, mem)
+    except Exception:
+        if mem is not None and a.json:
+            with open(a.json, "w") as f:
+                json.dump({"memory": memory_json(mem), "size_error": "the size half failed; see the job log"}, f, indent=1)
+        raise
+
+
+def _size(a, mem) -> int:
     stack = finals("stack-v")
     tag = a.tag or stack[0]
     if a.prev:
@@ -197,8 +430,11 @@ def main(argv: list[str] | None = None) -> int:
     for n, b in sorted(assets.items()):
         print(f"| {n} | {mb(b)} |")
     if a.json:
+        doc = {"tag": tag, "prev": prev, "images": rows, "cli_assets": assets}
+        if mem is not None:
+            doc["memory"] = memory_json(mem)
         with open(a.json, "w") as f:
-            json.dump({"tag": tag, "prev": prev, "images": rows, "cli_assets": assets}, f, indent=1)
+            json.dump(doc, f, indent=1)
     return 0
 
 

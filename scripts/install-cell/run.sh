@@ -242,6 +242,28 @@ teardown() {
 }
 fail_onboarded() { teardown; finish; }
 
+# An arm64 cell EXPECTS the controller refusal (the matrix says expect:
+# refusal): a controller needs Linux on x86_64 today (noo-cli onboard/upfront.rs
+# platform_refusal; noomesh-internal i781 scopes lifting it). The cell passes
+# when the refusal is clean, so the matrix has no permanent red: onboard exits
+# non-zero, names the reason and the way on (join as a node), and creates no
+# stack container. Anything else fails it by name.
+if [ "${EXPECT:-}" = refusal ]; then
+    step onboard-refuses 600 -- sh -c '
+      out="$(noo onboard --ci 2>&1)"; rc=$?
+      printf "%s\n" "$out" | tail -n 20
+      why=""
+      [ "$rc" != 0 ] || why="onboard exited 0 on a machine it must refuse"
+      printf "%s" "$out" | grep -q "a controller needs Linux on x86_64 (amd64)" || why="${why:-the refusal does not name the reason (a controller needs Linux on x86_64)}"
+      printf "%s" "$out" | grep -q "can join an amd64 controller as a node instead" || why="${why:-the refusal does not name the way on (join as a node)}"
+      n="$(docker ps -aq --filter name=noo- 2>/dev/null | wc -l)"
+      [ "$n" = 0 ] || why="${why:-the refused onboard left $n noo- container(s)}"
+      if [ -n "$why" ]; then echo "REFUSAL FAIL: $why"; exit 1; fi
+      echo "REFUSAL OK: onboard refused this $(uname -m) machine, named the reason and the node alternative, and started nothing"'
+    teardown
+    finish
+fi
+
 if [ "$ONBOARD" = interactive ]; then
     hook onboard-interactive.sh || fail_onboarded
 elif [ "$MODEL" = tiny ]; then
@@ -313,6 +335,45 @@ step probe-self-agent-diagnostics 120 -- sh -c '
   sudo grep -E "^(NATS_URL|NOO_GATEWAY_URL|CONTROLLER_URL|NODE_ID)=" /etc/noo-node-agent.env 2>&1
   echo "== noo --json cluster show $(hostname)"; noo --json cluster show "$(hostname)" 2>&1
   true'
+# PROBE (operator 2026-11-14): the whole stack's memory at idle after
+# onboard, MEASURED, tracked per release by the size job. Here: after health
+# and the verify probes, BEFORE first-answer, so no chat has loaded a chat
+# model yet. Per container docker stats + cgroup v2 anon/file/memory.current,
+# the noo-* host units' systemd MemoryCurrent/MemoryPeak + VmRSS, totals,
+# and the controller / node split (memory_baseline.py). Writes
+# $OUT/memory.json (uploaded with the cell, through the upload scan). docker
+# and unreadable files go through sudo, so the docker=none cells work too.
+# Two cells only, to keep matrix minutes down. A probe: never the failed step.
+MEMORY_SETTLE_S="${MEMORY_SETTLE_S:-60}"
+case "$CELL" in
+    ubuntu-24.04-amd64-default|ubuntu-22.04-amd64)
+        step probe-memory-baseline 600 -- python3 "$HERE/memory_baseline.py" measure --out "$OUT/memory.json" \
+            --cell "$CELL" --model "$MODEL" --settle "$MEMORY_SETTLE_S" ;;
+esac
+# PROBE (operator 2026-11-14): is the chat model resident at idle FOREVER,
+# or only warm after install? Two more samples of the same memory.json shape
+# (memory-idle-t10.json, memory-idle-t40.json) at t0 + 10 min and t0 + 40
+# min, t0 being the sample above: past ollama's 5 min default keep_alive and
+# our 30 min embed keep_alive. NOTHING uses the stack in between (no step
+# runs while a sample waits). Each records `ollama ps` per ollama*
+# container with every model's SIZE and UNTIL, raw lines kept. The default
+# cell only: ~41 min of its 120 min budget (it ran 13-18 min, 2026-11-13/14).
+# A probe: never the failed step.
+IDLE_SERIES_CELL=ubuntu-24.04-amd64-default
+if [ "$CELL" = "$IDLE_SERIES_CELL" ]; then
+    IDLE_T0="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["meta"]["epoch"])' "$OUT/memory.json" 2>/dev/null || date +%s)"
+    for IDLE_MIN in 10 40; do
+        step "probe-idle-t$IDLE_MIN" $(( IDLE_MIN * 60 + 300 )) -- python3 "$HERE/memory_baseline.py" measure \
+            --out "$OUT/memory-idle-t$IDLE_MIN.json" --cell "$CELL" --model "$MODEL" \
+            --sample "t$IDLE_MIN" --t0 "$IDLE_T0" --until $(( IDLE_T0 + IDLE_MIN * 60 ))
+    done
+    # JUDGED, not a probe (general 2026-11-14): on a build whose node agent
+    # carries #1191's /backend-alive route, the chat model must be unloaded
+    # at +40 min with nobody chatting, or this cell FAILs here. An older
+    # build prints "unjudged" and passes. idle_judge.py says which.
+    step idle-chat-unloaded 60 -- python3 "$HERE/idle_judge.py" \
+        --t40 "$OUT/memory-idle-t40.json" --agent-bin "$(command -v noo-node-agent || echo /usr/local/bin/noo-node-agent)"
+fi
 # The single-turn line docs/getting-started/first-chat.md gives, read from the
 # doc itself (its first `noo chat --message "…"` line), so the page and the
 # test cannot drift. The answer must be an answer: a model that asks for more
@@ -350,6 +411,18 @@ step first-answer 1800 -- sh -c '
   fi' || fail_onboarded
 meta first_answer_s "$(( $(date +%s) - CELL_START ))"
 
+# PROBE (operator 2026-11-14): cold-load delays, AFTER first-answer so the
+# idle series above is untouched. coldload.py stops every model ollama ps
+# lists (docker exec <c> ollama stop), then times ONE embed through the
+# gateway (POST /api/external/embeddings with a service key it mints, never
+# prints and revokes) and ONE `noo chat --message "$FIRST_PROMPT"` from
+# cold, then both again warm. Writes $OUT/coldload.json. The default cell
+# only (the idle-series cell). A probe: never the failed step.
+if [ "$CELL" = "$IDLE_SERIES_CELL" ]; then
+    step probe-coldload 3000 -- python3 "$HERE/coldload.py" --out "$OUT/coldload.json" --cell "$CELL" \
+        --prompt "$FIRST_PROMPT"
+fi
+
 # PROBE (fa, general 11-13): where does a chat get an ingested document back?
 # first-chat.md ingests ~/notes/anything.md and proves it with `noo rag query`
 # (that line is read from the page). The same question is then asked on the
@@ -365,7 +438,8 @@ RAG_QUERY_LINE="$(sed -n 's/^noo rag query "\(.*anything\.md.*\)"$/\1/p' "$RAG_D
 RAG_CHAT_LINE="$(sed -n 's/^noo chat --message "\(.*anything\.md.*\)"$/\1/p' "$RAG_DOC_PAGE" 2>/dev/null | head -n 1)"
 RAG_CHAT_LINE="${RAG_CHAT_LINE:-summarise what you know from anything.md}"
 RAG_WS_CHAT="$HERE/ws_chat.py"
-export RAG_QUERY_LINE RAG_CHAT_LINE RAG_WS_CHAT
+RAG_VERDICT="$OUT/rag-chat.verdict"
+export RAG_QUERY_LINE RAG_CHAT_LINE RAG_WS_CHAT RAG_VERDICT
 step probe-rag-chat 1500 -- sh -c '
   [ -n "$RAG_QUERY_LINE" ] || { echo "RAG PROBE: first-chat.md has no noo rag query line about anything.md"; exit 0; }
   fact="14(th)? (of )?march|ZIRCON-4471|kestrel"
@@ -391,8 +465,34 @@ step probe-rag-chat 1500 -- sh -c '
     printf "%s\n" "$out" | head -n 30
     if printf "%s" "$out" | grep -qiE "$fact"; then got=yes; else got=no; fi
     echo "RAG PROBE: $path returned the fact=$got (index ready=$indexed)"
+    [ "$path" = chat ] && echo "got=$got indexed=$indexed" > "$RAG_VERDICT"
   done
   true'
+
+# JUDGED (general 11-14, for 0.6.25): from noomesh#1164 on, `noo chat` runs the
+# coordinator turn over POST /api/inference/chat and retrieves the caller's
+# documents, so the page's chat line about anything.md must bring the fact
+# back. Judged only when the build under test has that route (the installed
+# noo names it AND the gateway answers it with anything but 404) and the cell
+# runs the default model; a tiny-model cell prints a NOTE (as first-answer
+# does), and an older build is "not judged", so an earlier rc never goes red.
+RAG_CHAT_ROUTE=no
+if grep -qa "/api/inference/chat" "$(command -v noo 2>/dev/null)" 2>/dev/null; then
+  code="$(python3 -I "$RAG_WS_CHAT" --probe-route /api/inference/chat 2>/dev/null)"
+  case "$code" in [1-5][0-9][0-9]) [ "$code" != 404 ] && RAG_CHAT_ROUTE=yes ;; esac
+fi
+export RAG_CHAT_ROUTE
+step rag-chat 60 -- sh -c '
+  v="$(cat "$RAG_VERDICT" 2>/dev/null)"
+  if [ "$RAG_CHAT_ROUTE" != yes ]; then
+    echo "RAG-CHAT: not judged: this build has no POST /api/inference/chat (noo chat is the raw model stream before 0.6.25)"; exit 0
+  fi
+  case "$v" in *"indexed=yes"*) ;; *) echo "RAG-CHAT: not judged: the index never returned the fact (${v:-no verdict})"; exit 0 ;; esac
+  case "$v" in *"got=yes"*) echo "RAG-CHAT PASS: noo chat returned the ingested document'"'"'s fact"; exit 0 ;; esac
+  if [ "$MODEL" = default ]; then
+    echo "RAG-CHAT FAIL: noo chat (the coordinator route) did not return the fact the index holds"; exit 1
+  fi
+  echo "RAG-CHAT NOTE: the tiny test model ($TINY_MODEL) did not return the fact; this cell runs MODEL=$MODEL, not the product default, so this is not a product verdict"' || fail_onboarded
 
 # PROBE (fa, rc.1 rehearsal A-reboot.status, i677): a container that joins
 # another's network namespace (network_mode: service:<door>; noo-ollama-embed

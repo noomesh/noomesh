@@ -43,6 +43,7 @@ pub mod cluster_reserve;
 pub mod cluster_node_workloads;
 pub mod cluster_profile;
 pub mod cluster_verify;
+pub mod image_retention;
 pub mod image_stage;
 pub mod cluster_class;
 pub mod cluster_embedding_space;
@@ -120,7 +121,7 @@ pub use auth::{auth_login, auth_logout, auth_status};
 pub use tasks::{tasks_answer, tasks_create, tasks_list, tasks_resubmit, tasks_show, tasks_stop};
 pub use approval::{approval_approve, approval_deny, approval_list, approval_stats, approval_status};
 pub use autonomy::{
-    autonomy_audit, autonomy_decisions, autonomy_disable, autonomy_enable, autonomy_status,
+    autonomy_audit, autonomy_decisions, autonomy_disable, autonomy_enable, autonomy_live, autonomy_preview, autonomy_status,
 };
 pub use channels::{channels_export, channels_import, channels_status, channels_test};
 pub use chat::chat;

@@ -99,7 +99,7 @@ pub fn autonomy_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             let armed = match (l["armed"].as_bool(), l["dry_run"].as_bool()) {
                 // Title Case across the whole column (guide §4 "Case"):
                 // Armed / Dry-run / Off, not a mix.
-                (Some(true), Some(true)) => ui::state("dry-run"),
+                (Some(true), Some(true)) => ui::state("Dry-run"),
                 (Some(true), _) => {
                     any_armed = true;
                     ui::warn("Armed")
@@ -294,6 +294,136 @@ fn toggle(g: &Globals, args: &[String], enable: bool) -> Result<i32, Unhandled> 
     Ok(0)
 }
 
+/// The rules with a second opt-in (`dry_run`), and what going live means, in
+/// the words the prompt shows. The gateway (`routes/intelligence.rs`
+/// `dry_run_gate`) and the console (`AutonomyPanel.tsx` `LIVE_MEANS`) hold the
+/// same text; tests/test_autonomy_live_means_parity.py keeps the three equal.
+pub(crate) const LIVE_MEANS: &[(&str, &str)] = &[
+    (
+        "disk_watermark",
+        "When a disk is past its watermark, the reclaim ladder will DELETE what it previews today: stopped containers and dangling images, the build cache, unused model weights, and superseded images of noomesh and of the add-ons it runs (only from those images' own repositories; never your other images, never one a container uses), on the controller and on every node.",
+    ),
+    (
+        "cert_auto_rotate",
+        "When a certificate nears expiry, the rule will RE-ISSUE it and restart the services that use it, instead of only reporting what it would rotate.",
+    ),
+];
+
+pub(crate) fn live_means(rule: &str) -> Option<&'static str> {
+    LIVE_MEANS.iter().find(|(r, _)| *r == rule).map(|(_, m)| *m)
+}
+
+/// `<rule> [--yes]`.
+pub(crate) fn parse_dry_run_with(a: &mut Args) -> Result<(String, bool), ArgError> {
+    let yes = a.flag(&["--yes", "-y"]);
+    let rule = a.one("<rule>")?;
+    Ok((rule, yes))
+}
+
+/// A gated rule's state as the gateway read it back after a dry-run change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RuleState {
+    pub(crate) enabled: bool,
+    pub(crate) armed: bool,
+    pub(crate) dry_run: bool,
+}
+
+/// The read-back state from the dry-run route's answer; `None` when any of
+/// the three is missing (a refusal, or a gateway that does not report it):
+/// never assumed.
+pub(crate) fn rule_state(resp: &serde_json::Value) -> Option<RuleState> {
+    Some(RuleState {
+        enabled: resp["enabled"].as_bool()?,
+        armed: resp["armed"].as_bool()?,
+        dry_run: resp["dry_run"].as_bool()?,
+    })
+}
+
+/// Did the stored state become what was asked? Live: switched on, armed and
+/// out of preview (it acts). Preview: in preview, armed or not.
+pub(crate) fn state_is_what_was_asked(s: RuleState, live: bool) -> bool {
+    if live {
+        s.enabled && s.armed && !s.dry_run
+    } else {
+        s.dry_run
+    }
+}
+
+/// The state in the words `noo autonomy status` uses (Armed / Dry-run / Off).
+pub(crate) fn describe_state(rule: &str, s: RuleState) -> String {
+    let off = if s.enabled { "" } else { " (the rule is switched off, so it does not run at all)" };
+    match (s.armed, s.dry_run) {
+        (true, false) => format!("{rule}: Armed, live: from its next tick it acts{off}"),
+        (true, true) => format!("{rule}: Dry-run (armed, previewing): it records what it would do and changes nothing{off}"),
+        (false, _) => format!("{rule}: Off (not armed, previewing): it records what it would do and changes nothing{off}"),
+    }
+}
+
+/// The confirm before going live: what one `live` does (arms the rule AND
+/// takes it out of preview) and what the rule then does.
+pub(crate) fn live_prompt(rule: &str, means: &str) -> String {
+    format!("Arm {rule} and take it out of preview? From its next tick it will act. {means}")
+}
+
+/// `noo autonomy live <rule> [--yes]` — arm a rule with a dry-run gate and
+/// take it out of preview, in one update: it then acts. Asks first (on a
+/// terminal; `--yes` for agents and pipes), saying what the rule will delete
+/// or change. A switched-off rule is refused by the gateway with the remedy.
+/// Operator or admin only (the gateway checks), and audited with who did it.
+pub fn autonomy_live(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    set_dry_run(g, args, false)
+}
+
+/// `noo autonomy preview <rule>` — put a gated rule back into dry run: it
+/// records what it would do and changes nothing. Its arm state stays.
+pub fn autonomy_preview(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    set_dry_run(g, args, true)
+}
+
+fn set_dry_run(g: &Globals, args: &[String], dry_run: bool) -> Result<i32, Unhandled> {
+    let (rule, yes) = parse_dry_run_with(&mut Args::new(args))?;
+    let live = !dry_run;
+    let Some(means) = live_means(&rule) else {
+        crate::output::fail(
+            g.json,
+            crate::output::ExitCode::Generic,
+            "no_dry_run_gate",
+            &format!("'{rule}' has no dry-run gate: only disk_watermark and cert_auto_rotate do"),
+            Some("noo autonomy status"),
+        );
+    };
+    if live {
+        super::confirm_prompt(g, yes, &live_prompt(&rule, means));
+    }
+    let resp = post_json(g, &format!("/api/autonomy/locations/{rule}/dry-run"), &serde_json::json!({"dry_run": dry_run}), true, 10);
+    let state = rule_state(&resp);
+    let done = state.is_some_and(|s| state_is_what_was_asked(s, live));
+    if g.json {
+        println!("{resp}");
+        return Ok(if done { 0 } else { 1 });
+    }
+    let Some(s) = state else {
+        ui::failed(
+            &format!("the gateway did not report {rule}'s state after the change, so it is not confirmed"),
+            Some("noo autonomy status"),
+        );
+        return Ok(1);
+    };
+    if !done {
+        ui::failed(
+            &format!("asked for {}, but the gateway stored: {}", if live { "armed and live" } else { "preview" }, describe_state(&rule, s)),
+            Some("noo autonomy status"),
+        );
+        return Ok(1);
+    }
+    ui::done(&describe_state(&rule, s));
+    if live {
+        let back = format!("noo autonomy preview {rule}");
+        ui::guide(&[("noo autonomy decisions", "what it decided, as it happens"), (back.as_str(), "back to preview")]);
+    }
+    Ok(0)
+}
+
 /// The gateway confirms with `{"status":"enabled"}` / `{"status":"disabled"}`;
 /// anything else (an `error` body, an empty reply) is not a success.
 fn toggle_took_effect(resp: &serde_json::Value, enable: bool) -> bool {
@@ -430,5 +560,62 @@ mod toggle_tests {
         assert!(!toggle_took_effect(&serde_json::json!({"status": "enabled"}), false));
         assert!(!toggle_took_effect(&serde_json::json!({"error": "Redis is not configured"}), true));
         assert!(!toggle_took_effect(&serde_json::json!({}), true));
+    }
+}
+
+#[cfg(test)]
+mod dry_run_tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn only_the_gated_rules_have_a_live_switch() {
+        assert!(live_means("disk_watermark").unwrap().contains("DELETE"));
+        assert!(live_means("cert_auto_rotate").unwrap().contains("RE-ISSUE"));
+        assert!(live_means("memory_pressure").is_none());
+    }
+
+    #[test]
+    fn the_rule_and_yes_are_parsed() {
+        assert_eq!(parse_dry_run_with(&mut Args::new(&args(&["disk_watermark", "--yes"]))).unwrap(), ("disk_watermark".to_string(), true));
+        assert_eq!(parse_dry_run_with(&mut Args::new(&args(&["cert_auto_rotate"]))).unwrap(), ("cert_auto_rotate".to_string(), false));
+        assert!(parse_dry_run_with(&mut Args::new(&args(&[]))).is_err(), "a rule is required");
+    }
+
+    fn st(enabled: bool, armed: bool, dry_run: bool) -> RuleState {
+        RuleState { enabled, armed, dry_run }
+    }
+
+    /// Only the state read back counts: live is done when the rule is on,
+    /// armed AND out of preview; preview when it previews. A refusal or an
+    /// answer without the state is never done.
+    #[test]
+    fn only_the_stored_value_counts_as_done() {
+        let read = |v: serde_json::Value| rule_state(&v);
+        assert_eq!(read(serde_json::json!({"enabled": true, "armed": true, "dry_run": false})), Some(st(true, true, false)));
+        assert_eq!(read(serde_json::json!({"dry_run": false})), None, "an old answer without enabled/armed is not assumed");
+        assert_eq!(read(serde_json::json!({"error": "forbidden"})), None, "a refusal is not done");
+        assert!(state_is_what_was_asked(st(true, true, false), true));
+        assert!(!state_is_what_was_asked(st(true, false, false), true), "live but disarmed still only previews");
+        assert!(!state_is_what_was_asked(st(false, true, false), true), "a switched-off rule does not run");
+        assert!(!state_is_what_was_asked(st(true, true, true), true));
+        assert!(state_is_what_was_asked(st(true, true, true), false));
+        assert!(state_is_what_was_asked(st(true, false, true), false), "preview leaves the arm state alone");
+        assert!(!state_is_what_was_asked(st(true, true, false), false));
+    }
+
+    /// The prompt says one `live` arms AND takes out of preview, and the
+    /// state line uses `noo autonomy status`'s words.
+    #[test]
+    fn the_prompt_and_the_state_say_what_live_does() {
+        let p = live_prompt("disk_watermark", live_means("disk_watermark").unwrap());
+        assert!(p.starts_with("Arm disk_watermark and take it out of preview? From its next tick it will act. ") && p.contains("DELETE"), "{p}");
+        assert!(describe_state("x", st(true, true, false)).starts_with("x: Armed, live"));
+        assert!(describe_state("x", st(true, true, true)).starts_with("x: Dry-run (armed, previewing)"));
+        assert!(describe_state("x", st(true, false, true)).starts_with("x: Off (not armed, previewing)"));
+        assert!(describe_state("x", st(false, true, false)).contains("switched off"));
     }
 }

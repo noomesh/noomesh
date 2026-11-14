@@ -73,6 +73,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/autonomy/decisions", get(autonomy_decisions))
         .route("/api/autonomy/locations", post(autonomy_add_location))
         .route("/api/autonomy/locations/{name}/toggle", post(autonomy_toggle_location))
+        .route("/api/autonomy/locations/{name}/dry-run", post(autonomy_set_dry_run))
         .route("/api/autonomy/enable", post(autonomy_enable))
         .route("/api/autonomy/disable", post(autonomy_disable))
 }
@@ -2204,6 +2205,126 @@ async fn autonomy_add_location(
     Ok(Json(json!({"status": "ok", "name": name, "store": "db"})))
 }
 
+/// Upsert a built-in rule's runtime override. `patch` keys are MERGED into
+/// the stored config (jsonb `||`), never replace it: the console's arm
+/// toggle sends `{"enabled_action": ...}`, and replacing used to drop a
+/// stored `dry_run: false` (and any tunable such as `cache_cap_bytes`), so
+/// arming or disarming silently put a live rule back into preview. `enabled`
+/// `None` keeps the stored flag. Returns the stored config after the write.
+pub(crate) async fn upsert_builtin_override(
+    db: &sqlx::PgPool,
+    name: &str,
+    enabled: Option<bool>,
+    patch: Option<&Value>,
+    updated_by: &str,
+) -> Result<Option<Value>, sqlx::Error> {
+    crate::repo::autonomy::upsert_override(db, name, enabled, patch, updated_by).await
+}
+
+/// The built-in rules whose action has a second opt-in, `dry_run` (default
+/// true: the rule previews), and what going live means, in plain words for
+/// the confirm the console and the CLI show. `None`: the rule has no
+/// dry-run gate, so there is nothing to take out of preview.
+pub(crate) fn dry_run_gate(name: &str) -> Option<&'static str> {
+    match name {
+        "disk_watermark" => Some(
+            "When a disk is past its watermark, the reclaim ladder will DELETE what it previews today: \
+             stopped containers and dangling images, the build cache, unused model weights, and \
+             superseded images of noomesh and of the add-ons it runs (only from those images' own \
+             repositories; never your other images, never one a container uses), on the controller \
+             and on every node.",
+        ),
+        "cert_auto_rotate" => Some(
+            "When a certificate nears expiry, the rule will RE-ISSUE it and restart the services that \
+             use it, instead of only reporting what it would rotate.",
+        ),
+        _ => None,
+    }
+}
+
+/// Who may take a rule out of preview (or put it back): an operator or an
+/// admin. The route is a write, which the auth layer already keeps from a
+/// user; this is checked again here because the change turns on deletion.
+pub(crate) fn may_change_dry_run(role: Option<crate::auth::Role>) -> Result<(), AppError> {
+    match role {
+        Some(r) if r >= crate::auth::Role::Operator => Ok(()),
+        _ => Err(AppError::Forbidden("taking an autonomy rule out of preview needs the operator or admin role".into())),
+    }
+}
+
+/// The stored-config patch for a dry-run change. Going live is ONE update that
+/// arms the rule and takes it out of preview, never one without the other: a
+/// rule that is live but disarmed would still only preview, and "live" must
+/// mean it acts. Back to preview sets only `dry_run` and leaves the arm state.
+pub(crate) fn dry_run_patch(live: bool) -> Value {
+    if live {
+        json!({"enabled_action": true, "dry_run": false})
+    } else {
+        json!({"dry_run": true})
+    }
+}
+
+/// A rule that is switched off does not run at all, so taking it live would
+/// change nothing: refused, with how to switch it back on.
+pub(crate) fn live_refusal(name: &str, enabled: bool) -> Option<String> {
+    (!enabled).then(|| {
+        format!(
+            "'{name}' is switched off, so it would not run at all: switch it on first \
+             (POST /api/autonomy/locations/{name}/toggle with {{\"enabled\": true}}), then take it live"
+        )
+    })
+}
+
+/// What the dry-run route answers: the rule's state READ BACK after the write
+/// (`enabled`, `armed`, `dry_run`), never the value that was asked for.
+pub(crate) fn dry_run_state(name: &str, enabled: bool, config: &Value, live_means: &str) -> Value {
+    let (armed, dry_run) = crate::autonomy_loop::gate_of(name, config).unwrap_or((false, true));
+    json!({"name": name, "enabled": enabled, "armed": armed, "dry_run": dry_run, "config": config, "live_means": live_means})
+}
+
+/// POST /api/autonomy/locations/{name}/dry-run — `{"dry_run": false}` takes
+/// a gated rule live: it arms it and takes it out of preview in one update
+/// (see [`dry_run_patch`]; it then acts: [`dry_run_gate`]). A switched-off
+/// rule is refused. `{"dry_run": true}` puts it back into preview and leaves
+/// it armed or not. Operator or admin only; merged into the rule's stored
+/// config (nothing else changes); audited with who did it. Answers the state
+/// read back ([`dry_run_state`]).
+async fn autonomy_set_dry_run(
+    State(state): State<Arc<AppState>>,
+    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    Path(name): Path<String>,
+    Json(body): Json<Value>,
+) -> AppResult {
+    may_change_dry_run(ctx.as_ref().map(|axum::Extension(c)| c.role))?;
+    let Some(dry_run) = body.get("dry_run").and_then(|v| v.as_bool()) else {
+        return Err(AppError::BadRequest("Missing 'dry_run' (true: preview, false: live)".into()));
+    };
+    let Some(what) = dry_run_gate(&name) else {
+        return Err(AppError::BadRequest(format!("'{name}' has no dry-run gate (only disk_watermark and cert_auto_rotate do)")));
+    };
+    let live = !dry_run;
+    let enabled_now = crate::autonomy_loop::load_locations(&state).await.into_iter().find(|l| l.name == name).map(|l| l.enabled).unwrap_or(false);
+    if live {
+        if let Some(why) = live_refusal(&name, enabled_now) {
+            return Err(AppError::Conflict(why));
+        }
+    }
+    let who = ctx.as_ref().map(|axum::Extension(c)| c.sub.clone()).unwrap_or_else(|| "api".to_string());
+    upsert_builtin_override(&state.db, &name, None, Some(&dry_run_patch(live)), &who)
+        .await
+        .map_err(|e| AppError::Internal(format!("autonomy override upsert: {e}")))?;
+    crate::audit::record(
+        &state.db,
+        crate::audit::AuditEvent::new(crate::audit::AuditKind::ConfigUpdate, &who, &format!("autonomy:{name}"))
+            .details(json!({"change": if live { "autonomy rule armed and live" } else { "autonomy rule back to preview" }, "location": name, "dry_run": dry_run})),
+    )
+    .await;
+    tracing::info!(event = "autonomy_dry_run_set", location = %name, dry_run, by = %who, "autonomy: dry run changed");
+    let after = crate::autonomy_loop::load_locations(&state).await.into_iter().find(|l| l.name == name);
+    let (enabled, config) = after.map(|l| (l.enabled, l.config)).unwrap_or((false, Value::Null));
+    Ok(Json(dry_run_state(&name, enabled, &config, what)))
+}
+
 /// POST /api/autonomy/locations/{name}/toggle — toggle a location's enabled flag.
 ///
 /// Reads the location from config YAML, flips (or sets) the `enabled` field,
@@ -2237,22 +2358,11 @@ async fn autonomy_toggle_location(
         // leaves any stored config untouched, so a plain enable/disable never
         // silently disarms an action the operator opted into.
         let config = body.get("config").filter(|c| c.is_object()).cloned();
-        sqlx::query(
-            "INSERT INTO noo_autonomy_overrides (name, enabled, config, updated_by) \
-             VALUES ($1, $2, $3, $4) \
-             ON CONFLICT (name) DO UPDATE SET enabled = $2, \
-               config = COALESCE($3, noo_autonomy_overrides.config), \
-               updated_at = now(), updated_by = $4",
-        )
-        .bind(&name)
-        .bind(enabled)
-        .bind(&config)
-        .bind(&updated_by)
-        .execute(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("autonomy override upsert: {e}")))?;
+        let merged = upsert_builtin_override(&state.db, &name, Some(enabled), config.as_ref(), &updated_by)
+            .await
+            .map_err(|e| AppError::Internal(format!("autonomy override upsert: {e}")))?;
         return Ok(Json(
-            json!({"name": name, "enabled": enabled, "config": config, "store": "db"}),
+            json!({"name": name, "enabled": enabled, "config": merged, "store": "db"}),
         ));
     }
 
@@ -2606,5 +2716,129 @@ mod heartbeat_catalog_tests {
             "dispatchable but not offered by GET /api/heartbeat/actions — \
              nobody can schedule these without already knowing the name: {missing:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod dry_run_tests {
+    //! Taking an autonomy rule out of dry run (general, 2026-11-14; operator
+    //! 2026-11-13: "is there no way to turn it on from teh ui?"). The arm
+    //! toggle used to REPLACE the stored config, dropping `dry_run: false`;
+    //! going live is an authority change (it turns on deletion).
+    use super::*;
+    use crate::auth::{RequesterCtx, Role};
+
+    #[test]
+    fn only_the_gated_rules_can_go_live_and_each_says_what_it_will_do() {
+        let disk = dry_run_gate("disk_watermark").expect("gated");
+        assert!(disk.contains("DELETE") && disk.contains("of the add-ons it runs") && disk.contains("never your other images, never one a container uses"), "{disk}");
+        let cert = dry_run_gate("cert_auto_rotate").expect("gated");
+        assert!(cert.contains("RE-ISSUE") && cert.contains("restart"), "{cert}");
+        assert!(dry_run_gate("memory_pressure").is_none());
+        assert!(dry_run_gate("").is_none());
+    }
+
+    /// Going live is ONE update that arms the rule AND takes it out of
+    /// preview: live but disarmed would still only preview. Back to preview
+    /// touches only `dry_run`, so the arm state stays as it was.
+    #[test]
+    fn live_arms_the_rule_and_takes_it_out_of_preview_in_one_update() {
+        assert_eq!(dry_run_patch(true), json!({"enabled_action": true, "dry_run": false}));
+        assert_eq!(dry_run_patch(false), json!({"dry_run": true}));
+        // what the stored config then reads as, through the engine's own gate
+        assert_eq!(crate::autonomy_loop::gate_of("disk_watermark", &dry_run_patch(true)), Some((true, false)), "armed and live");
+        let armed_preview = json!({"enabled_action": true, "dry_run": true});
+        assert_eq!(crate::autonomy_loop::gate_of("cert_auto_rotate", &armed_preview), Some((true, true)));
+    }
+
+    /// A switched-off rule would not run at all: going live is refused, with
+    /// how to switch it on. A rule that is on is not refused.
+    #[test]
+    fn a_switched_off_rule_is_not_taken_live() {
+        let why = live_refusal("disk_watermark", false).expect("refused");
+        assert!(why.contains("'disk_watermark' is switched off") && why.contains("/api/autonomy/locations/disk_watermark/toggle") && why.contains("\"enabled\": true"), "{why}");
+        assert!(live_refusal("disk_watermark", true).is_none());
+    }
+
+    /// The answer is the rule's state read back from what was stored.
+    #[test]
+    fn the_answer_is_the_state_read_back() {
+        let a = dry_run_state("disk_watermark", true, &json!({"enabled_action": true, "dry_run": false, "cache_cap_bytes": 9}), "it deletes");
+        assert_eq!((a["enabled"].clone(), a["armed"].clone(), a["dry_run"].clone()), (json!(true), json!(true), json!(false)));
+        assert_eq!(a["live_means"], json!("it deletes"));
+        // nothing stored: the double opt-in's defaults, previewing and disarmed
+        let a = dry_run_state("cert_auto_rotate", true, &json!({}), "");
+        assert_eq!((a["armed"].clone(), a["dry_run"].clone()), (json!(false), json!(true)));
+    }
+
+    /// The handler refuses a switched-off rule BEFORE it writes, writes the
+    /// one patch, and answers what it reads back after the write.
+    #[test]
+    fn the_handler_refuses_first_writes_one_patch_and_reads_back() {
+        let own = crate::test_src::own_code(include_str!("intelligence.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn autonomy_set_dry_run(");
+        let perm = body.find("may_change_dry_run(").expect("the role check");
+        let refuse = body.find("if let Some(why) = live_refusal(&name, enabled_now) {").expect("the switched-off refusal");
+        let write = body.find("Some(&dry_run_patch(live))").expect("the one patch");
+        let back = body.rfind("load_locations(&state)").expect("the read back");
+        let answer = body.find("Ok(Json(dry_run_state(&name, enabled, &config, what)))").expect("the answer");
+        assert!(perm < refuse && refuse < write && write < back && back < answer, "{body}");
+        assert!(body[refuse..write].contains("return Err(AppError::Conflict(why));"), "{body}");
+    }
+
+    #[test]
+    fn the_handler_lets_only_an_operator_or_admin_change_dry_run() {
+        assert!(may_change_dry_run(Some(Role::Operator)).is_ok());
+        assert!(may_change_dry_run(Some(Role::Admin)).is_ok());
+        assert!(matches!(may_change_dry_run(Some(Role::User)), Err(AppError::Forbidden(_))));
+        assert!(matches!(may_change_dry_run(None), Err(AppError::Forbidden(_))), "no requester, no change");
+    }
+
+    #[test]
+    fn the_auth_layer_refuses_a_users_dry_run_change() {
+        let path = "/api/autonomy/locations/disk_watermark/dry-run";
+        let user = RequesterCtx { sub: "u".into(), scopes: vec!["read".into(), "write".into()], role: Role::User, harness: None, act: None };
+        let op = RequesterCtx { sub: "o".into(), scopes: vec!["read".into(), "write".into()], role: Role::Operator, harness: None, act: None };
+        assert!(!crate::auth::requester_allows(&user, &axum::http::Method::POST, path), "a user must not reach the route");
+        assert!(crate::auth::requester_allows(&op, &axum::http::Method::POST, path));
+    }
+
+    /// The merge against a real Postgres (opt-in, like the other storage
+    /// tests: `NOO_TEST_DSN` names a scratch database).
+    #[tokio::test]
+    async fn arming_keeps_a_stored_dry_run_and_tunables() {
+        let Some(dsn) = std::env::var("NOO_TEST_DSN").ok().filter(|v| !v.trim().is_empty()) else {
+            eprintln!("NOO_TEST_DSN unset — autonomy override merge not exercised");
+            return;
+        };
+        use std::str::FromStr as _;
+        let opts = sqlx::postgres::PgConnectOptions::from_str(&dsn).expect("dsn").options([("search_path", "mesh,public")]);
+        let admin = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect_with(opts.clone()).await.expect("connect");
+        crate::mesh_migrate::apply_baseline(&admin).await.expect("baseline");
+        crate::mesh_migrate::apply(&admin).await.expect("migrations");
+        let db = sqlx::postgres::PgPoolOptions::new().max_connections(2).connect_with(opts).await.expect("connect");
+        let name = format!("rh_dryrun_{}", std::process::id());
+
+        // the operator took the rule live and tuned it
+        upsert_builtin_override(&db, &name, Some(true), Some(&json!({"enabled_action": true, "dry_run": false, "cache_cap_bytes": 1234})), "op").await.unwrap();
+        // the console's arm toggle sends only enabled_action
+        let after = upsert_builtin_override(&db, &name, Some(true), Some(&json!({"enabled_action": false})), "op").await.unwrap().expect("config");
+        assert_eq!(after["dry_run"], json!(false), "disarming dropped dry_run: {after}");
+        assert_eq!(after["cache_cap_bytes"], json!(1234), "disarming dropped a tunable: {after}");
+        assert_eq!(after["enabled_action"], json!(false));
+        // back to preview, with the enabled flag left as it was
+        let after = upsert_builtin_override(&db, &name, None, Some(&json!({"dry_run": true})), "op").await.unwrap().expect("config");
+        assert_eq!((after["dry_run"].clone(), after["enabled_action"].clone()), (json!(true), json!(false)), "{after}");
+        let enabled = crate::repo::autonomy::override_enabled(&db, &name).await.unwrap();
+        assert_eq!(enabled, Some(true), "a dry-run change must not touch the enabled flag");
+        // going live on a rule with nothing stored arms it AND takes it out of preview
+        let fresh = format!("{name}_fresh");
+        let after = upsert_builtin_override(&db, &fresh, None, Some(&dry_run_patch(true)), "op").await.unwrap().expect("config");
+        assert_eq!((after["enabled_action"].clone(), after["dry_run"].clone()), (json!(true), json!(false)), "{after}");
+        crate::repo::autonomy::delete_override(&db, &fresh).await.unwrap();
+        // a plain enable/disable with no config leaves the config as it is
+        let after = upsert_builtin_override(&db, &name, Some(false), None, "op").await.unwrap().expect("config");
+        assert_eq!(after["cache_cap_bytes"], json!(1234));
+        crate::repo::autonomy::delete_override(&db, &name).await.unwrap();
     }
 }

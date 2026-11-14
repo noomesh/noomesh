@@ -107,7 +107,8 @@ pub(crate) trait HarnessRuntime: Sync {
     fn runbook_context(&self, prompt: &str) -> Option<String>;
     async fn temporal_context(&self, user_id: Option<&str>, timeout: Duration) -> Option<String>;
     async fn running_summary(&self, conversation_id: &str) -> Option<String>;
-    async fn conversation_recall(&self, conversation_id: &str, query: &str, top_k: u32) -> Option<String>;
+    /// Never silent: a recall that could not run says why (`Skipped`).
+    async fn conversation_recall(&self, conversation_id: &str, query: &str, top_k: u32) -> super::context::RecallOutcome;
 
     // ── tools ──────────────────────────────────────────────────────────
 
@@ -336,7 +337,7 @@ impl HarnessRuntime for InProcessRuntime<'_> {
         super::summary::fetch_running_summary(&self.state.db, conversation_id).await
     }
 
-    async fn conversation_recall(&self, conversation_id: &str, query: &str, top_k: u32) -> Option<String> {
+    async fn conversation_recall(&self, conversation_id: &str, query: &str, top_k: u32) -> super::context::RecallOutcome {
         super::context::fetch_conversation_recall(self.state, conversation_id, query, top_k).await
     }
 

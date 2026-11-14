@@ -7,12 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 )
 
@@ -134,16 +136,101 @@ func CheckShape(p, goos, home string) []Problem {
 // root, which the operator owns. Nothing from the controller can set it.
 const OwnerEnv = "NOO_DATA_ROOT_OWNER"
 
+// LocalOwnerFile is the local host's own statement of ONE extra uid that may
+// own its data root (i677, operator 2026-11-14): on a one-machine install the
+// controller's self-agent (its own service account) shares the operator's
+// data root, which the operator owns. Nothing from the controller can write
+// it: the provision bundle has no kind for it and noo-apply refuses the path.
+// onboard writes it on the controller's own host, with its existing sudo, only
+// when the data root really is owned by that uid.
+const LocalOwnerFile = "/etc/noo/data-root-owner"
+
+// localOwnerPath is LocalOwnerFile; tests point it at a temp file.
+var localOwnerPath = LocalOwnerFile
+
+var (
+	localOwnerLogMu   sync.Mutex
+	localOwnerLogLast string
+)
+
+// judgeLocalOwner: the uid the file names, or why it is refused. The file must
+// be a regular file (never a symlink), owned by root, not group- or
+// other-writable, at most 32 bytes, holding one decimal uid. Pure: the owner
+// uid is a parameter, so the refusals are testable as an unprivileged user.
+func judgeLocalOwner(fi fs.FileInfo, ownerUID uint32, content []byte) (int, string) {
+	if !fi.Mode().IsRegular() {
+		return -1, "is not a regular file"
+	}
+	if ownerUID != 0 {
+		return -1, fmt.Sprintf("is owned by uid %d, not root", ownerUID)
+	}
+	if fi.Mode().Perm()&0o022 != 0 {
+		return -1, fmt.Sprintf("is mode %o; group/others must not write", fi.Mode().Perm())
+	}
+	if fi.Size() > 32 {
+		return -1, "is longer than one uid"
+	}
+	text := strings.TrimSpace(string(content))
+	n, err := strconv.ParseUint(text, 10, 31)
+	if text == "" || err != nil {
+		return -1, "does not hold a single uid"
+	}
+	return int(n), ""
+}
+
+// localOwnerUID: the extra owner uid the local host names, or ok=false when
+// the file is absent (silent) or refused (one log line per distinct reason).
+// Linux only: a macOS agent runs as the user who owns its root.
+func localOwnerUID() (int, bool) {
+	if runtime.GOOS != "linux" {
+		return -1, false
+	}
+	fi, err := os.Lstat(localOwnerPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		return -1, false
+	}
+	why := ""
+	n := -1
+	if err != nil {
+		why = err.Error()
+	} else {
+		st, ok := fi.Sys().(*syscall.Stat_t)
+		var owner uint32 = 1 << 31
+		if ok {
+			owner = st.Uid
+		}
+		var content []byte
+		if fi.Mode().IsRegular() && fi.Size() <= 32 {
+			content, _ = os.ReadFile(localOwnerPath)
+		}
+		n, why = judgeLocalOwner(fi, owner, content)
+	}
+	if why != "" {
+		localOwnerLogMu.Lock()
+		if localOwnerLogLast != why {
+			localOwnerLogLast = why
+			slog.Warn("data root owner file ignored; the ownership rule stays strict", "file", localOwnerPath, "why", why)
+		}
+		localOwnerLogMu.Unlock()
+		return -1, false
+	}
+	return n, true
+}
+
 // ownerAllowed: the agent's own account, root (only privileged users can
-// write a root-owned 0750 tree), or the node-declared owner.
+// write a root-owned 0750 tree), or the ONE extra owner the node itself names:
+// NOO_DATA_ROOT_OWNER when it is set (existing fleets; it wins, and the file is
+// then not read), else the root-owned LocalOwnerFile.
 func ownerAllowed(uid, euid int) bool {
 	if uid == euid || uid == 0 {
 		return true
 	}
 	if v := strings.TrimSpace(os.Getenv(OwnerEnv)); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n == uid {
-			return true
-		}
+		n, err := strconv.Atoi(v)
+		return err == nil && n == uid
+	}
+	if n, ok := localOwnerUID(); ok && n == uid {
+		return true
 	}
 	return false
 }

@@ -1508,10 +1508,12 @@ fn chat_one_shot_streams_tokens_and_exits_zero() {
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Hello"), "assembled tokens expected on stdout, got: {stdout}");
-    // Request order: the health probe, then the streaming POST.
+    // Request order: the health probe, then the coordinator stream POST, with
+    // no user named in the body (the token's subject is the identity).
+    assert!(!reqs[1].contains("user_id"), "the body must not name a user:\n{}", reqs[1]);
     assert!(reqs[0].starts_with("GET /health"), "first request was:\n{}", reqs[0]);
     assert!(
-        reqs[1].starts_with("POST /api/inference/stream"),
+        reqs[1].starts_with("POST /api/inference/chat"),
         "second request was:\n{}",
         reqs[1]
     );
