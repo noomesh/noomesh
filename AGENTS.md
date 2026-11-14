@@ -9,9 +9,14 @@ gateway (`gateway-rust/`), a Go node agent (`node-agent-go/`), the `noo` CLI
 - Core code never names an add-on, not even in comments or tests
   (`tests/test_core_names_no_addon.py`).
 - Never commit `.env`, anything under `secrets/`, or a key.
-- Register a gateway route as `.route("/literal", …)`; then regenerate the
-  spec (`scripts/gen-openapi.py`) and the console contract
-  (`scripts/export-openapi.py`, plus a `ui/contracts/CHANGELOG.md` entry).
+- Register a gateway route as `.route("/literal", …)`. A route change then
+  needs all four generated artifacts in the same change: the gateway spec
+  (`python3 scripts/gen-openapi.py`), the console contract
+  (`python3 scripts/export-openapi.py`), a dated `ui/contracts/CHANGELOG.md`
+  entry, and the console's types (`cd ui && npm ci && npm run gen:api`).
+  Check with `gen-openapi.py --check`, `export-openapi.py --check` and
+  `cd ui && npm run check:api`; the `ui` CI job is not a required check, so
+  read it yourself.
 - A change to a command, a config key or an endpoint updates its doc in the
   same change, kept short: edit or delete before adding.
 - Nothing that deletes data uses force (`-f`) or bypasses a refusal.
