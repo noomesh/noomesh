@@ -1809,7 +1809,7 @@ mod system_prompt_budget_tests {
     /// 8,380 estimated-token system prompt on 2026-11-11 (awolf harness,
     /// `request_size`), on every model call. Since the persona split
     /// (i802), a non-ops Compact turn's standing text (core persona, clock
-    /// rule, its one skill, the three core tools' schemas) fits half of a
+    /// rule, no skill, the three core tools' schemas) fits half of a
     /// 4k window after a 1k reply reserve, in real tokens.
     #[test]
     fn a_non_ops_compact_turn_fits_half_a_4k_window() {
@@ -1824,9 +1824,12 @@ mod system_prompt_budget_tests {
             let total = real_tokens(&sys) + real_tokens(&tools);
             assert!(total <= COMPACT_BUDGET, "{objective:?}: {total} real tokens (system {} + tools {}) > {COMPACT_BUDGET}", real_tokens(&sys), real_tokens(&tools));
         }
-        // An ops objective still gets the guidance and the operator skill.
+        // An ops objective still gets the guidance in either tier; the
+        // operator skill rides only the Full tier (Compact takes no skill).
         let ops = system_prompt_for(&root, "Restart the vllm backend on node awolf", PromptTier::Compact);
-        assert!(ops.contains("## Cluster Nodes (live)") && ops.contains("## Skill: cluster-operator"), "{}", &ops[ops.len().saturating_sub(400)..]);
+        assert!(ops.contains("## Cluster Nodes (live)") && !ops.contains("## Skill: "), "{}", &ops[ops.len().saturating_sub(400)..]);
+        let full = system_prompt_for(&root, "Restart the vllm backend on node awolf", PromptTier::Full);
+        assert!(full.contains("## Skill: cluster-operator"), "{}", &full[full.len().saturating_sub(400)..]);
     }
 
     /// The Full persona, with the ops guidance and the clock rule, fits
