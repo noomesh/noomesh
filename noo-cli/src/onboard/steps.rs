@@ -6112,11 +6112,11 @@ fn reap_volumes(h: &mut impl VolumeReaper, decisions: Vec<(String, String, Optio
     removed
 }
 
-struct LiveReaper<'a> {
-    ctx: &'a Ctx,
+struct LiveReaper<'a, 'c> {
+    ctx: &'a Ctx<'c>,
 }
 
-impl VolumeReaper for LiveReaper<'_> {
+impl VolumeReaper for LiveReaper<'_, '_> {
     fn warn(&mut self, line: &str) {
         self.ctx.warn(line);
     }
