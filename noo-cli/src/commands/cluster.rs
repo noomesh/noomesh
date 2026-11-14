@@ -412,6 +412,9 @@ pub fn cluster_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // under `desired` (null when it could not be read).
         let mut out = n.clone();
         out["desired"] = desired.clone().unwrap_or(serde_json::Value::Null);
+        // i802: the decided chat context per Ollama chat model, as the
+        // gateway sent it (null from an older gateway or a failed read).
+        out["chat_contexts"] = desired.as_ref().map(|d| d["chat_context_detail"].clone()).unwrap_or(serde_json::Value::Null);
         println!("{out}");
         return Ok(0);
     }
@@ -554,6 +557,13 @@ pub fn cluster_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // the screen.
     println!("{}", ui::kv(&[("harness", harness_show_cell(n))]));
     print!("{}", role_capabilities_section_with(n, desired.as_ref().map(|d| &d["placements"])));
+    // ── chat context (i802) ─────────────────────────────────────────────
+    if let Some(rows) = desired.as_ref().and_then(|d| d["chat_context_detail"].as_array()).filter(|r| !r.is_empty()) {
+        println!("{}", ui::section("Chat context"));
+        for r in rows {
+            println!("  {}", chat_context_line(r));
+        }
+    }
 
     // ── desired state ───────────────────────────────────────────────────
     match desired.as_ref() {
@@ -569,6 +579,27 @@ pub fn cluster_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         (&format!("noo cluster logs {node}"), "the agent's own log"),
     ]);
     Ok(0)
+}
+
+/// One `noo cluster show` line per Ollama chat model (i802), from a row of
+/// desired-config's `chat_context_detail`:
+/// `<model>  running <N|?> · decided <D> (<source>[; capped: <why>]) · slots <S> · ceiling <C|?>`.
+/// `running` is what the daemon runs the model at now, `decided` what every
+/// chat call asks it for, `capped` why memory took it below the declared one.
+pub(crate) fn chat_context_line(r: &serde_json::Value) -> String {
+    let num = |k: &str| r[k].as_u64().map(|n| n.to_string()).unwrap_or_else(|| "?".to_string());
+    let model = r["model"].as_str().unwrap_or("?");
+    let decided = match r["decided"].as_u64() {
+        Some(d) => {
+            let source = r["source"].as_str().unwrap_or("?");
+            match r["capped"].as_str().filter(|c| !c.is_empty()) {
+                Some(c) => format!("{d} ({source}; capped: {c})"),
+                None => format!("{d} ({source})"),
+            }
+        }
+        None => "- (nothing declares a context: the daemon keeps its own default)".to_string(),
+    };
+    format!("{model}  running {} \u{b7} decided {decided} \u{b7} slots {} \u{b7} ceiling {}", num("running"), num("slots"), num("ceiling"))
 }
 
 /// The CAPABILITIES cell of `noo cluster status`: the gateway's derived
@@ -1569,7 +1600,7 @@ mod placement_env_tests {
         assert_eq!(other_role_for_same_model(&legacy, "ollama", "harrier"), None);
     }
 
-    use super::{capabilities_cell, current_env_for, merge_placement_env, other_role_for_same_model, parse_env_change, render_fit, role_capabilities_section, role_capabilities_section_with, target_cell, usage_cell, memory_limit_line, mem_cell, harness_cell, harness_show_cell, vendor_kinds_row};
+    use super::{capabilities_cell, chat_context_line, current_env_for, merge_placement_env, other_role_for_same_model, parse_env_change, render_fit, role_capabilities_section, role_capabilities_section_with, target_cell, usage_cell, memory_limit_line, mem_cell, harness_cell, harness_show_cell, vendor_kinds_row};
     use serde_json::json;
 
     #[test]
@@ -1599,6 +1630,24 @@ mod placement_env_tests {
         assert_eq!(current_env_for(&placements, "ollama", Some("embed"), "nomic-embed-code"), json!({"OLLAMA_NUM_PARALLEL": "2"}));
         assert_eq!(current_env_for(&placements, "ollama", Some("embed"), "harrier"), json!({"OLLAMA_NUM_PARALLEL": "4"}));
         assert_eq!(current_env_for(&placements, "ollama", Some("embed"), "bge-m3"), serde_json::Value::Null);
+    }
+
+    /// i802: one line per Ollama chat model: running, decided and why,
+    /// slots, ceiling; `?` for what the node does not report.
+    #[test]
+    fn show_renders_the_chat_context_line() {
+        let row = json!({"model": "gemma4:e2b", "running": 4096, "decided": 16384, "declared": 32768,
+            "source": "OLLAMA_CONTEXT_LENGTH on its ollama placement", "capped": "32768 needs 4.2 GiB of cache",
+            "slots": 4, "ceiling": 131072});
+        assert_eq!(
+            chat_context_line(&row),
+            "gemma4:e2b  running 4096 \u{b7} decided 16384 (OLLAMA_CONTEXT_LENGTH on its ollama placement; capped: 32768 needs 4.2 GiB of cache) \u{b7} slots 4 \u{b7} ceiling 131072"
+        );
+        let fits = json!({"model": "m", "running": null, "decided": 16384, "source": "the harness profile's context", "capped": null, "slots": 1, "ceiling": null});
+        assert_eq!(chat_context_line(&fits), "m  running ? \u{b7} decided 16384 (the harness profile's context) \u{b7} slots 1 \u{b7} ceiling ?");
+        let none = json!({"model": "q", "running": 2048, "decided": null, "slots": null, "ceiling": 40960});
+        let line = chat_context_line(&none);
+        assert!(line.starts_with("q  running 2048 \u{b7} decided - (nothing declares") && line.ends_with("slots ? \u{b7} ceiling 40960"), "{line}");
     }
 
     #[test]

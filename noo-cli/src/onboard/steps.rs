@@ -435,6 +435,7 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
         }
         util::GpuDetect::None => {
             ctx.state.tier = 3;
+            ctx.state.cpu_only = true;
             ctx.warn("GPU: none detected — CPU-only (Tier 3)");
         }
     }
@@ -716,6 +717,22 @@ pub(crate) fn keep_llm_preference_hint(value: &str) -> Option<String> {
     Some(format!("noo cluster prefer knowledge {v}"))
 }
 
+/// The `.env` key the environment step seeds on a NEW CPU-only install
+/// (i802): `OLLAMA_EMBED_NUM_PARALLEL=1`. The stack's shared Ollama
+/// (`ollama-embed`) otherwise runs 4 slots, and Ollama sizes a chat model's
+/// cache for every slot: on a CPU box one slot saves ~0.4-0.6 GB at 16k with
+/// no embedding loss (measured, i802). `None` on a GPU or a busy-GPU box, on
+/// an install this step already configured (its `.env` carries `NODE_ID`,
+/// which this step always writes) and whenever the key is already set: an
+/// existing install is never rewritten. Pure.
+pub(crate) fn cpu_only_embed_parallel(
+    cpu_only: bool,
+    existing: &std::collections::BTreeMap<String, String>,
+) -> Option<(&'static str, &'static str)> {
+    let new_install = !existing.contains_key("NODE_ID");
+    (cpu_only && new_install && !existing.contains_key("OLLAMA_EMBED_NUM_PARALLEL")).then_some(("OLLAMA_EMBED_NUM_PARALLEL", "1"))
+}
+
 pub fn environment(ctx: &mut Ctx) {
     // Before the read: a removal must not be written straight back by the merge below.
     offer_retired_env_keys(ctx);
@@ -889,6 +906,11 @@ The default is right (press enter)")
     }
     if mode == "worker" && !controller_url.is_empty() {
         set(&mut merged, &mut merged_order, "CONTROLLER_URL", controller_url.clone());
+    }
+    // i802: one Ollama slot on a NEW CPU-only install (an existing .env is
+    // never rewritten).
+    if let Some((k, v)) = cpu_only_embed_parallel(ctx.state.cpu_only, &existing) {
+        set(&mut merged, &mut merged_order, k, v.to_string());
     }
     // Provider keys are SECRETS: they never enter the .env body written
     // below. On an install already on the encrypted store they go straight
@@ -10704,5 +10726,28 @@ mod monitoring_choice_tests {
         assert!(body.contains("\"Install dashboards, log search and request traces (Grafana, Loki, Tempo; about 250 MiB idle)?\", default_full"), "{body}");
         let usage = crate::usage::USAGE.iter().find(|(w, _, _)| *w == ["onboard"]).expect("onboard usage").1;
         assert!(usage.contains("[--monitoring-full|--no-monitoring-full]"), "{usage}");
+    }
+}
+
+#[cfg(test)]
+mod cpu_only_embed_parallel_tests {
+    use super::cpu_only_embed_parallel;
+    use std::collections::BTreeMap;
+
+    fn env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    /// i802: a NEW CPU-only install gets one Ollama slot; a GPU box, an
+    /// install this step already configured and a key already set are left
+    /// alone (an existing install is never rewritten).
+    #[test]
+    fn onboard_seeds_one_ollama_slot_only_on_a_new_cpu_only_install() {
+        assert_eq!(cpu_only_embed_parallel(true, &env(&[])), Some(("OLLAMA_EMBED_NUM_PARALLEL", "1")));
+        // --standalone seeds a few keys before this step; still a new install.
+        assert_eq!(cpu_only_embed_parallel(true, &env(&[("NOO_INSTALL_MODE", "standalone")])), Some(("OLLAMA_EMBED_NUM_PARALLEL", "1")));
+        assert_eq!(cpu_only_embed_parallel(false, &env(&[])), None, "a GPU (or busy GPU) box keeps the compose default");
+        assert_eq!(cpu_only_embed_parallel(true, &env(&[("NODE_ID", "box")])), None, "an existing install is never rewritten");
+        assert_eq!(cpu_only_embed_parallel(true, &env(&[("OLLAMA_EMBED_NUM_PARALLEL", "4")])), None, "the operator's own value stands");
     }
 }
