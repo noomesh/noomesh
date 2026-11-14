@@ -711,7 +711,11 @@ mod tests {
     #[test]
     fn upgrade_never_writes_the_declaration() {
         let upgrade = crate::test_src::own_code(include_str!("upgrade.rs"));
-        assert!(!upgrade.contains("stack_monitoring"), "upgrade.rs reaches the monitoring declaration");
+        // upgrade may READ the declaration (PR b: skip the Grafana door on
+        // lean), never write it: unset must stay unset (= full).
+        for w in ["stack_monitoring::write_at", "stack_monitoring::set_in", "stack_monitoring::on_on", "stack_monitoring::off_on"] {
+            assert!(!upgrade.contains(w), "upgrade.rs writes the monitoring declaration via {w}");
+        }
         assert!(!upgrade.contains("monitoring: lean") && !upgrade.contains("monitoring: full"));
         let steps = crate::test_src::own_code(include_str!("../onboard/steps.rs"));
         assert_eq!(steps.matches("write_at(&yaml, level)").count(), 1, "onboard writes it in one place");
