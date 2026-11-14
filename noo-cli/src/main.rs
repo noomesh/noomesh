@@ -219,6 +219,8 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["autonomy", "decisions"], commands::autonomy_decisions),
     (&["autonomy", "enable"], commands::autonomy_enable),
     (&["autonomy", "disable"], commands::autonomy_disable),
+    (&["autonomy", "live"], commands::autonomy_live),
+    (&["autonomy", "preview"], commands::autonomy_preview),
     (&["proactive", "status"], commands::proactive_status),
     (&["proactive", "rules"], commands::proactive_rules),
     (&["proactive", "history"], commands::proactive_history),

@@ -3,7 +3,7 @@
 
 import { useState } from 'react';
 import { toast } from 'sonner';
-import { useQuery, useMutation, useQueryClient, useMetisClient } from '@metis/core';
+import { useQuery, useMutation, useQueryClient, useMetisClient, useAuth } from '@metis/core';
 import { relTime } from '@/lib/format';
 import { num, dash } from '@/lib/num';
 import { StatusBadge, type Tone } from '@/components/StatusBadge';
@@ -159,6 +159,34 @@ function useToggleLocation() {
   });
 }
 
+/** The rules with a second opt-in (`dry_run`), and what going live means, in
+ *  the words the confirm shows. The gateway holds the same list
+ *  (routes/intelligence.rs `dry_run_gate`) and refuses any other rule. */
+export const LIVE_MEANS: Record<string, string> = {
+  disk_watermark:
+    "When a disk is past its watermark, the reclaim ladder will DELETE what it previews today: stopped containers and dangling images, the build cache, unused model weights, and superseded noomesh images (never images outside noomesh's registries), on the controller and on every node.",
+  cert_auto_rotate:
+    'When a certificate nears expiry, the rule will RE-ISSUE it and restart the services that use it, instead of only reporting what it would rotate.',
+};
+
+/** Take a gated rule live (`dry_run: false`) or back to preview. Operator or
+ *  admin only (the gateway checks the role); merged into the rule's stored
+ *  config, so its arming and tunables stay; audited with who did it. */
+function useSetDryRun() {
+  const client = useMetisClient();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (vars: { name: string; dryRun: boolean }) => {
+      const { error } = await client.POST('/api/autonomy/locations/{name}/dry-run', {
+        params: { path: { name: vars.name as 'disk_watermark' | 'cert_auto_rotate' } },
+        body: { dry_run: vars.dryRun },
+      });
+      if (error) throw new Error('Change refused — operator or admin role required');
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['autonomy'] }),
+  });
+}
+
 /** Three states, not two — see AutonomyLoc.armed. */
 function armedMeta(l: AutonomyLoc): { label: string; tone: Tone; title: string } {
   if (l.armed === undefined)
@@ -224,6 +252,8 @@ export function AutonomyPanel() {
   const auto = useAutonomy();
   const decisions = useDecisions(outcome);
   const toggle = useToggleLocation();
+  const setDryRun = useSetDryRun();
+  const { isOperator } = useAuth();
   const confirm = useConfirm();
   const d = auto.data;
   const active = d?.locations.filter((l) => l.enabled).length ?? 0;
@@ -245,6 +275,28 @@ export function AutonomyPanel() {
       {
         onSuccess: () =>
           toast.success(next ? 'Armed' : 'Disarmed', {
+            description: `${l.name} — applies on the next tick, no restart`,
+          }),
+        onError: (e) => toast.error('Change failed', { description: (e as Error).message }),
+      },
+    );
+  }
+
+  async function onLive(l: AutonomyLoc, live: boolean) {
+    const ok = await confirm({
+      title: live ? `Take ${l.name} live?` : `Put ${l.name} back into preview?`,
+      description: live
+        ? `${LIVE_MEANS[l.name]} Until now it only recorded what it would have done (the decisions below). The change is recorded in the audit log with your name.`
+        : 'It goes back to recording what it would have done, and changes nothing. The change is recorded in the audit log with your name.',
+      confirmText: live ? 'Go live' : 'Back to preview',
+      destructive: live,
+    });
+    if (!ok) return;
+    setDryRun.mutate(
+      { name: l.name, dryRun: !live },
+      {
+        onSuccess: () =>
+          toast.success(live ? 'Live' : 'Back to preview', {
             description: `${l.name} — applies on the next tick, no restart`,
           }),
         onError: (e) => toast.error('Change failed', { description: (e as Error).message }),
@@ -328,6 +380,19 @@ export function AutonomyPanel() {
                   onClick={() => onArm(l, !l.armed)}
                 >
                   {busy === l.name ? '…' : l.armed ? 'Disarm' : 'Arm'}
+                </Button>
+              )}
+              {/* The second opt-in: only on a rule with a dry-run gate, once it
+                  is armed, and only for an operator or admin (the gateway
+                  checks the role again). */}
+              {isOperator && l.armed && LIVE_MEANS[l.name] && (
+                <Button
+                  size="sm"
+                  variant={l.dryRun ? 'destructive' : 'outline'}
+                  disabled={setDryRun.isPending && setDryRun.variables?.name === l.name}
+                  onClick={() => onLive(l, !!l.dryRun)}
+                >
+                  {l.dryRun ? 'Go live' : 'Back to preview'}
                 </Button>
               )}
             </div>

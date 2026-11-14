@@ -45,6 +45,9 @@
   "/api/autonomy/decisions": [
    "apps/web/src/features/autonomy/AutonomyPanel.tsx"
   ],
+  "/api/autonomy/locations/{name}/dry-run": [
+   "apps/web/src/features/autonomy/AutonomyPanel.tsx"
+  ],
   "/api/autonomy/locations/{name}/toggle": [
    "apps/web/src/features/autonomy/AutonomyPanel.tsx"
   ],

@@ -11387,6 +11387,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/autonomy/locations/{name}/dry-run": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Take an autonomy rule out of preview, or put it back
+         * @description [native] `{"dry_run": false}` takes a rule with a dry-run gate LIVE: from its next tick it acts (disk_watermark deletes what its reclaim ladder previews, including superseded noomesh images; cert_auto_rotate re-issues certificates and restarts their services). `{"dry_run": true}` puts it back into preview. Operator or admin only (403 otherwise); 400 for a rule with no dry-run gate. The key is merged into the rule's stored override, so its arming and tunables stay as they are, and the change is audited with who made it.
+         */
+        post: operations["autonomy_set_dry_run"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -27417,6 +27437,57 @@ export interface operations {
                         [key: string]: unknown;
                     };
                 };
+            };
+        };
+    };
+    autonomy_set_dry_run: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: "disk_watermark" | "cert_auto_rotate";
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description false: live (the rule acts); true: preview (it only reports). */
+                    dry_run: boolean;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        name?: string;
+                        dry_run?: boolean;
+                        config?: {
+                            [key: string]: unknown;
+                        };
+                        /** @description What the rule does when live, in plain words. */
+                        live_means?: string;
+                    };
+                };
+            };
+            /** @description No such gate, or no dry_run in the body */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not an operator or admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };

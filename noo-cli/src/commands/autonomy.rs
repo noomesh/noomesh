@@ -294,6 +294,90 @@ fn toggle(g: &Globals, args: &[String], enable: bool) -> Result<i32, Unhandled> 
     Ok(0)
 }
 
+/// The rules with a second opt-in (`dry_run`), and what going live means, in
+/// the words the prompt shows. The gateway (`routes/intelligence.rs`
+/// `dry_run_gate`) and the console (`AutonomyPanel.tsx` `LIVE_MEANS`) hold the
+/// same text; tests/test_autonomy_live_means_parity.py keeps the three equal.
+pub(crate) const LIVE_MEANS: &[(&str, &str)] = &[
+    (
+        "disk_watermark",
+        "When a disk is past its watermark, the reclaim ladder will DELETE what it previews today: stopped containers and dangling images, the build cache, unused model weights, and superseded noomesh images (never images outside noomesh's registries), on the controller and on every node.",
+    ),
+    (
+        "cert_auto_rotate",
+        "When a certificate nears expiry, the rule will RE-ISSUE it and restart the services that use it, instead of only reporting what it would rotate.",
+    ),
+];
+
+pub(crate) fn live_means(rule: &str) -> Option<&'static str> {
+    LIVE_MEANS.iter().find(|(r, _)| *r == rule).map(|(_, m)| *m)
+}
+
+/// `<rule> [--yes]`.
+pub(crate) fn parse_dry_run_with(a: &mut Args) -> Result<(String, bool), ArgError> {
+    let yes = a.flag(&["--yes", "-y"]);
+    let rule = a.one("<rule>")?;
+    Ok((rule, yes))
+}
+
+/// The gateway answers the dry-run route with the stored `dry_run`; anything
+/// else (an error body, a refusal) is not a success.
+pub(crate) fn dry_run_took_effect(resp: &serde_json::Value, dry_run: bool) -> bool {
+    resp["dry_run"].as_bool() == Some(dry_run)
+}
+
+/// `noo autonomy live <rule> [--yes]` — take a rule with a dry-run gate LIVE:
+/// it then acts. Asks first (on a terminal; `--yes` for agents and pipes),
+/// saying what the rule will delete or change. Operator or admin only (the
+/// gateway checks), and audited with who did it.
+pub fn autonomy_live(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    set_dry_run(g, args, false)
+}
+
+/// `noo autonomy preview <rule>` — put a gated rule back into dry run: it
+/// records what it would do and changes nothing.
+pub fn autonomy_preview(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    set_dry_run(g, args, true)
+}
+
+fn set_dry_run(g: &Globals, args: &[String], dry_run: bool) -> Result<i32, Unhandled> {
+    let (rule, yes) = parse_dry_run_with(&mut Args::new(args))?;
+    let Some(means) = live_means(&rule) else {
+        crate::output::fail(
+            g.json,
+            crate::output::ExitCode::Generic,
+            "no_dry_run_gate",
+            &format!("'{rule}' has no dry-run gate: only disk_watermark and cert_auto_rotate do"),
+            Some("noo autonomy status"),
+        );
+    };
+    if !dry_run {
+        super::confirm_prompt(g, yes, &format!("Take {rule} live? {means}"));
+    }
+    let resp = post_json(g, &format!("/api/autonomy/locations/{rule}/dry-run"), &serde_json::json!({"dry_run": dry_run}), true, 10);
+    if g.json {
+        println!("{resp}");
+        return Ok(if dry_run_took_effect(&resp, dry_run) { 0 } else { 1 });
+    }
+    if !dry_run_took_effect(&resp, dry_run) {
+        ui::failed(
+            &format!("the gateway did not confirm that {rule} is {} (it needs the operator or admin role)", if dry_run { "back in preview" } else { "live" }),
+            Some("noo autonomy status"),
+        );
+        return Ok(1);
+    }
+    if dry_run {
+        ui::done(&format!("{rule} is back in preview: it records what it would do and changes nothing"));
+    } else {
+        ui::done(&format!("{rule} is live from its next tick"));
+        ui::guide(&[
+            ("noo autonomy decisions", "what it decided, as it happens"),
+            ("noo autonomy status", "its state"),
+        ]);
+    }
+    Ok(0)
+}
+
 /// The gateway confirms with `{"status":"enabled"}` / `{"status":"disabled"}`;
 /// anything else (an `error` body, an empty reply) is not a success.
 fn toggle_took_effect(resp: &serde_json::Value, enable: bool) -> bool {
@@ -430,5 +514,35 @@ mod toggle_tests {
         assert!(!toggle_took_effect(&serde_json::json!({"status": "enabled"}), false));
         assert!(!toggle_took_effect(&serde_json::json!({"error": "Redis is not configured"}), true));
         assert!(!toggle_took_effect(&serde_json::json!({}), true));
+    }
+}
+
+#[cfg(test)]
+mod dry_run_tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn only_the_gated_rules_have_a_live_switch() {
+        assert!(live_means("disk_watermark").unwrap().contains("DELETE"));
+        assert!(live_means("cert_auto_rotate").unwrap().contains("RE-ISSUE"));
+        assert!(live_means("memory_pressure").is_none());
+    }
+
+    #[test]
+    fn the_rule_and_yes_are_parsed() {
+        assert_eq!(parse_dry_run_with(&mut Args::new(&args(&["disk_watermark", "--yes"]))).unwrap(), ("disk_watermark".to_string(), true));
+        assert_eq!(parse_dry_run_with(&mut Args::new(&args(&["cert_auto_rotate"]))).unwrap(), ("cert_auto_rotate".to_string(), false));
+        assert!(parse_dry_run_with(&mut Args::new(&args(&[]))).is_err(), "a rule is required");
+    }
+
+    #[test]
+    fn only_the_stored_value_counts_as_done() {
+        assert!(dry_run_took_effect(&serde_json::json!({"dry_run": false}), false));
+        assert!(!dry_run_took_effect(&serde_json::json!({"dry_run": true}), false));
+        assert!(!dry_run_took_effect(&serde_json::json!({"error": "forbidden"}), false), "a refusal is not done");
     }
 }
