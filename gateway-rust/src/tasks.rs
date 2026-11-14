@@ -754,6 +754,55 @@ pub fn cut_signal(task_node: Option<&str>, was: &str, controller: &str, id: &str
     Some((task_subject(node), serde_json::to_vec(&json!({"stop": id})).ok()?))
 }
 
+/// Every live task an account owns, children included (no page limit: a
+/// security stop must reach all of them).
+async fn live_tasks_of(db: &sqlx::PgPool, owner: &str) -> Result<Vec<Task>> {
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "{SELECT} WHERE u.username = $1 AND t.state IN ('open','running','checkpointed') ORDER BY t.created_at"
+    )))
+    .bind(owner)
+    .fetch_all(db)
+    .await?;
+    Ok(rows.iter().map(row_to_task).collect())
+}
+
+/// An account was DISABLED (general, 2026-11-14: a disabled account's task
+/// that keeps running a model turn for up to the turn deadline is an
+/// authority gap): stop every live task it owns now, with
+/// `account_disabled`, and cut the loop in flight of each one running on a
+/// node's harness ([`cut_signal`]). A task running in process ends its loop
+/// at the next checkpoint, where the refused token renewal stops it too.
+/// Returns how many it stopped and how many it cut.
+pub async fn stop_account_tasks(state: &AppState, owner: &str) -> (usize, usize) {
+    let tasks = match live_tasks_of(&state.db, owner).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!(user = owner, error = %e, "task: a disabled account's tasks could not be listed; they stop at their next checkpoint");
+            return (0, 0);
+        }
+    };
+    let controller = crate::agent_messages::controller_node();
+    let (mut stopped, mut cut) = (0, 0);
+    for t in tasks {
+        match stop_with(&state.db, &t.id, "account_disabled").await {
+            Ok(true) => stopped += 1,
+            Ok(false) => continue,
+            Err(e) => {
+                tracing::warn!(task = %t.id, user = owner, error = %e, "task: not stopped for a disabled account");
+                continue;
+            }
+        }
+        if let Some((subject, body)) = cut_signal(t.node.as_deref(), &t.state, &controller, &t.id) {
+            match state.nats.publish(subject, body.into()).await {
+                Ok(()) => cut += 1,
+                Err(e) => tracing::warn!(task = %t.id, error = %e, "task: a disabled account's loop not cut; it ends at the next checkpoint"),
+            }
+        }
+    }
+    tracing::info!(event = "account_tasks_stopped", user = owner, stopped, cut, "task: a disabled account's tasks stopped");
+    (stopped, cut)
+}
+
 /// i779: the note a cut task carries. It says what happened and claims no
 /// checkpoint that was not reached: the loop in flight (loop `done + 1`) was
 /// ended, and only what the last checkpoint (`done` loops) recorded stands.
@@ -2077,6 +2126,24 @@ mod cut_tests {
         assert!(!cut_note_applies(Some("aserve"), "stopped", &subj), "another node's report");
         assert!(!cut_note_applies(Some("mcmini"), "running", &subj), "not stopped: not cut");
         assert!(!cut_note_applies(None, "stopped", &subj));
+    }
+
+    /// A disabled account's tasks are stopped AND each harness loop is cut
+    /// (a security check: without the cut, its model turn ran on for up to
+    /// the turn deadline). Held on the routine's own source: it needs a
+    /// database and a bus to run.
+    #[test]
+    fn a_disabled_accounts_tasks_are_stopped_and_cut() {
+        let own = crate::test_src::own_code(include_str!("tasks.rs"));
+        let body = crate::test_src::fn_body(&own, "pub async fn stop_account_tasks(");
+        assert!(body.contains("live_tasks_of(&state.db, owner)"), "every live task of the account");
+        assert!(body.contains(r#"stop_with(&state.db, &t.id, "account_disabled")"#), "stopped with the reason add-ons see");
+        let stop = body.find("stop_with(").unwrap();
+        let sig = body.find("cut_signal(t.node.as_deref(), &t.state").expect("the loop in flight is cut");
+        let publish = body.find("state.nats.publish(subject, body.into())").expect("the cut is sent");
+        assert!(stop < sig && sig < publish, "stop, then cut");
+        let q = crate::test_src::fn_body(&own, "async fn live_tasks_of(");
+        assert!(q.contains("t.state IN ('open','running','checkpointed')") && !q.contains("parent_id IS NULL") && !q.contains("LIMIT"), "{q}");
     }
 
     #[test]
