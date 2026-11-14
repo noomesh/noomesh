@@ -22523,6 +22523,40 @@
           }
         }
       }
+    },
+    "/api/inference/chat": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create chat",
+        "description": "[native] POST /api/inference/chat \u2014 see [`CHAT_STREAM_PATH`].",
+        "operationId": "coordinator_chat_stream",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
