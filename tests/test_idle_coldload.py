@@ -319,7 +319,7 @@ def test_the_series_and_coldload_run_on_the_default_cell_only():
                            env={"CELL": cell, "OUT": "/nonexistent", "HERE": "/h", "MODEL": "m", "PATH": "/usr/bin:/bin"},
                            capture_output=True, text=True, check=True)
         ran[cell] = set(re.findall(r"RAN (\S+)", r.stdout))
-    assert ran.pop(DEFAULT) == {"probe-idle-t10", "probe-idle-t40", "probe-coldload"}
+    assert ran.pop(DEFAULT) == {"probe-idle-t10", "probe-idle-t40", "idle-chat-unloaded", "probe-coldload"}
     assert all(not v for v in ran.values()), ran
     assert MB.SERIES_CELLS == [DEFAULT] and f"IDLE_SERIES_CELL={DEFAULT}" == assign
 
@@ -368,3 +368,51 @@ def test_the_service_key_status_line_passes_the_upload_scan():
         assert "service key:" not in line, src
         red = cell.redact_line(sample, {})
         assert cell.secret_hits(red) == [], (src, red)
+
+
+# --- the judged idle line (#1191) ---------------------------------------------
+
+def _judge_mod():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("idle_judge", ROOT / "scripts" / "install-cell" / "idle_judge.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def test_the_idle_judgement_applies_only_to_a_build_with_the_new_route(tmp_path, monkeypatch):
+    J = _judge_mod()
+    monkeypatch.delenv("EMBEDDING_MODEL", raising=False)
+    monkeypatch.delenv("PAGEINDEX_EMBEDDING_MODEL", raising=False)
+    old, new = tmp_path / "old-agent", tmp_path / "new-agent"
+    old.write_bytes(b"\x7fELF ... /v1/chat/completions ...")
+    new.write_bytes(b"\x7fELF ... /backend-alive/{backend} ...")
+    loaded = {"idle": "loaded: ollama:gemma4:e2b", "models_loaded": [{"backend": "ollama", "model": "gemma4:e2b"}]}
+    only_embed = {"idle": "loaded: ollama:harrier:latest", "models_loaded": [{"backend": "ollama", "model": "harrier:latest"}]}
+    nothing = {"idle": "idle: no model loaded", "models_loaded": []}
+    unknown = {"idle": "unknown: noo-ollama-embed (exec failed)", "models_loaded": []}
+    # an older build: never PASS, never FAIL
+    line, rc = J.judge(loaded, *J.agent_has_route(str(old)))
+    assert rc == 0 and line.startswith("IDLE JUDGED: unjudged") and "PASS" not in line
+    line, rc = J.judge(loaded, *J.agent_has_route(str(tmp_path / "missing")))
+    assert rc == 0 and "unjudged" in line
+    # a build with the route
+    has = J.agent_has_route(str(new))
+    assert J.judge(loaded, *has) == ("IDLE JUDGED: FAIL: chat model(s) still loaded at +40 min with nobody chatting: gemma4:e2b", 1)
+    assert J.judge(only_embed, *has)[1] == 0 and "PASS" in J.judge(only_embed, *has)[0]
+    assert J.judge(nothing, *has)[1] == 0
+    assert J.judge(unknown, *has)[1] == 1, "an unreadable sample proves nothing: FAIL"
+    assert J.judge(None, *has)[1] == 1
+    monkeypatch.setenv("EMBEDDING_MODEL", "bge-m3")
+    assert J.judge({"idle": "loaded", "models_loaded": [{"model": "bge-m3:latest"}]}, *has)[1] == 0
+
+
+def test_the_judged_step_follows_the_40_minute_sample_on_the_series_cell_and_is_not_a_probe():
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    t40 = text.index('for IDLE_MIN in 10 40; do')
+    judged = text.index("step idle-chat-unloaded 60 -- python3 \"$HERE/idle_judge.py\"")
+    first = text.index("step first-answer ")
+    block_start = text.index('if [ "$CELL" = "$IDLE_SERIES_CELL" ]; then')
+    assert block_start < t40 < judged < first
+    assert text.rfind("\nfi", block_start, judged) == -1, "the judged step sits inside the series cell's gate"
+    assert not "idle-chat-unloaded".startswith("probe-"), "judged: a FAIL is the cell's failed step"
