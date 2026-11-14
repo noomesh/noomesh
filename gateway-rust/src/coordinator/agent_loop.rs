@@ -770,6 +770,10 @@ pub(crate) struct StreamedResponse {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    /// The backend's own prefill time for the call, when it reports one
+    /// (Ollama's prompt_eval_duration, through the node agent's
+    /// `usage.prompt_eval_ms`; i802).
+    pub prefill_ms: Option<u64>,
     /// The stream broke before it ended (a body error, the idle bound):
     /// [`crate::node_link::stream_cut_message`]. What arrived before the cut
     /// is still in the fields above. A cut is a backend error for the
@@ -806,6 +810,7 @@ pub(crate) async fn collect_streaming_response(resp: reqwest::Response, started:
     let mut prompt_tokens: u64 = 0;
     let mut completion_tokens: u64 = 0;
     let mut total_tokens: u64 = 0;
+    let mut prefill_ms: Option<u64> = None;
     let mut in_think = false;
     let mut tag_buffer = String::new();
     let mut buf = String::new();
@@ -975,6 +980,7 @@ pub(crate) async fn collect_streaming_response(resp: reqwest::Response, started:
                 prompt_tokens += u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
                 completion_tokens += u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
                 total_tokens += u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                prefill_ms = prefill_ms_of(u).or(prefill_ms);
             }
         }
     }
@@ -995,6 +1001,7 @@ pub(crate) async fn collect_streaming_response(resp: reqwest::Response, started:
         prompt_tokens,
         completion_tokens,
         total_tokens,
+        prefill_ms,
         cut,
         deadline_hit,
     })
@@ -1337,6 +1344,12 @@ fn tier_tools(schemas: Vec<Value>, tier: WindowTier) -> Vec<Value> {
             !CORE_TOOLS.contains(&name) || keep.contains(&name)
         })
         .collect()
+}
+
+/// The backend's prefill time from a usage object: the node agent's
+/// `prompt_eval_ms` (from Ollama's prompt_eval_duration), when present.
+fn prefill_ms_of(usage: &Value) -> Option<u64> {
+    usage.get("prompt_eval_ms").and_then(Value::as_u64)
 }
 
 /// What a turn cannot do without (raw estimate): its system messages, the
@@ -1760,12 +1773,23 @@ async fn note_backend_cut<R: HarnessRuntime>(rt: &R, usage: &mut UsageStats, bac
 /// the cut signature, and teach the backend's calibration from a call it
 /// clearly read whole. vLLM is never judged (it refuses an over-long prompt
 /// with a 400); a cloud backend is neither judged nor learned.
-async fn judge_call<R: HarnessRuntime>(rt: &R, usage: &mut UsageStats, backend: &ResolvedBackend, sent_estimate: u64, evaluated: u64) {
+async fn judge_call<R: HarnessRuntime>(rt: &R, usage: &mut UsageStats, backend: &ResolvedBackend, sent_estimate: u64, evaluated: u64, prefill_ms: Option<u64>) {
     if evaluated == 0 || super::backend::is_cloud_backend(backend) {
         return;
     }
     let ollama = crate::chat_context::takes_num_ctx(&backend.backend_type);
     let ctx = if ollama { rt.chat_num_ctx(backend).await } else { rt.chat_window(backend).await };
+    // One line per model call: what was sent, what the backend read, and
+    // how long it took to read it (i802: the rc.2 judges' prefill seconds).
+    tracing::info!(
+        backend = %backend.backend_type,
+        model = %backend.model,
+        ctx = ?ctx,
+        sent_estimate,
+        evaluated,
+        prefill_ms = ?prefill_ms,
+        "backend_call"
+    );
     let Some(ctx) = ctx else { return };
     let calib = crate::chat_context::calibration(&backend.url, &backend.model);
     let read = crate::chat_context::read_call(ctx, sent_estimate, evaluated, calib);
@@ -2531,6 +2555,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         // count before it: the cut check and the calibration read both (i802).
         let (evaluated_before, sent_estimate) =
             (usage.prompt_tokens, (estimate_tokens(&session.messages) + estimate_tool_tokens(&tool_schemas)) as u64);
+        let mut call_prefill_ms: Option<u64> = None;
 
         // Debug: log message roles to diagnose ordering issues
         let roles: Vec<&str> = session.messages.iter()
@@ -2837,6 +2862,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
                     // Track usage from final chunk
                     if let Some(u) = chunk_json.get("usage") {
                         usage.prompt_tokens += u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        call_prefill_ms = prefill_ms_of(u).or(call_prefill_ms);
                         usage.completion_tokens += u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                         usage.total_tokens += u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                     }
@@ -2858,7 +2884,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             break;
         }
         let evaluated = u64::from(usage.prompt_tokens.saturating_sub(evaluated_before));
-        judge_call(rt, &mut usage, &backend, sent_estimate, evaluated).await;
+        judge_call(rt, &mut usage, &backend, sent_estimate, evaluated, call_prefill_ms).await;
 
         // Flush remaining tag buffer after stream ends
         let reasoning_tail = reasoning_filter.finish();
@@ -3768,6 +3794,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
         // What this call sends, and the backend's count before it (i802).
         let (evaluated_before, sent_estimate) =
             (usage.prompt_tokens, (estimate_tokens(&session.messages) + estimate_tool_tokens(&tool_schemas)) as u64);
+        let mut call_prefill_ms: Option<u64> = None;
 
         // For OpenAI-compat (vLLM, node-agent proxy), use stream=true even
         // though there's no WebSocket sink — vLLM's pythonic tool parser
@@ -3828,8 +3855,9 @@ async fn run_inner_bound<R: HarnessRuntime>(
             usage.prompt_tokens += streamed.prompt_tokens as u32;
             usage.completion_tokens += streamed.completion_tokens as u32;
             usage.total_tokens += streamed.total_tokens as u32;
+            call_prefill_ms = streamed.prefill_ms;
             let evaluated = u64::from(usage.prompt_tokens.saturating_sub(evaluated_before));
-            judge_call(rt, &mut usage, &backend, sent_estimate, evaluated).await;
+            judge_call(rt, &mut usage, &backend, sent_estimate, evaluated, call_prefill_ms).await;
 
             let combined_content = if !streamed.reasoning.is_empty() && !streamed.content.is_empty() {
                 format!("<think>{}</think>\n\n{}", streamed.reasoning, streamed.content)
@@ -3881,12 +3909,13 @@ async fn run_inner_bound<R: HarnessRuntime>(
                 // A directly dialled Ollama's /api/chat body (i802: the
                 // cut check needs its count).
                 let c = llm_response.get("eval_count").and_then(Value::as_u64).unwrap_or(0);
+                call_prefill_ms = llm_response.get("prompt_eval_duration").and_then(Value::as_u64).map(|ns| ns / 1_000_000);
                 usage.prompt_tokens += p as u32;
                 usage.completion_tokens += c as u32;
                 usage.total_tokens += (p + c) as u32;
             }
             let evaluated = u64::from(usage.prompt_tokens.saturating_sub(evaluated_before));
-            judge_call(rt, &mut usage, &backend, sent_estimate, evaluated).await;
+            judge_call(rt, &mut usage, &backend, sent_estimate, evaluated, call_prefill_ms).await;
             let message = parse_llm_response(super::backend::wire_format(&backend), &llm_response);
             let content = message.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
             let mut msg = message.clone();
@@ -4889,7 +4918,7 @@ mod window_tests {
         assert_eq!(own.matches("if let Some(line) = window_refusal.take() \u{7b}").count(), 2);
         assert_eq!(own.matches("let (evaluated_before, sent_estimate) =").count(), 2);
         let judged = own.matches("let evaluated = u64::from(usage.prompt_tokens.saturating_sub(evaluated_before));").count();
-        assert_eq!(own.matches("judge_call(rt, &mut usage, &backend, sent_estimate, evaluated).await;").count(), judged);
+        assert_eq!(own.matches("judge_call(rt, &mut usage, &backend, sent_estimate, evaluated, call_prefill_ms).await;").count(), judged);
         let added = own.matches("usage.prompt_tokens += ").count();
         assert_eq!((added, judged), (5, 3), "a new prompt-count site must be judged");
         let stream = crate::test_src::fn_body(&own, "async fn run_streaming_on_bound<");

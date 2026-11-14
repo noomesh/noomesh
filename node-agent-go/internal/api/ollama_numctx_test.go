@@ -40,3 +40,16 @@ func TestWithDecidedNumCtxFillsOnlyWhenAbsent(t *testing.T) {
 		t.Fatal("not JSON: unchanged")
 	}
 }
+
+// i802: Ollama's prefill time rides on the OpenAI usage as prompt_eval_ms,
+// only when Ollama reported one.
+func TestOllamaUsageCarriesThePrefillMs(t *testing.T) {
+	p, c, d := int64(2051), int64(40), int64(28_000_000_000)
+	u := ollamaUsage(&ollamaReply{PromptEvalCount: &p, EvalCount: &c, PromptEvalDuration: &d})
+	if u["prompt_eval_ms"] != int64(28000) || u["prompt_tokens"] != int64(2051) {
+		t.Fatalf("want 28000 ms beside the count: %v", u)
+	}
+	if _, ok := ollamaUsage(&ollamaReply{PromptEvalCount: &p})["prompt_eval_ms"]; ok {
+		t.Fatal("no duration reported: no prompt_eval_ms")
+	}
+}
