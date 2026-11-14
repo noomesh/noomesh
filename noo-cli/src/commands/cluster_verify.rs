@@ -3015,15 +3015,6 @@ fn cpu_only_ollama_slots_row_here(root: &std::path::Path) -> Option<Check> {
     cpu_only_ollama_slots_row(cpu_only, readable, value.as_deref())
 }
 
-/// What `noo upgrade` says on a CPU-only controller whose stack Ollama runs
-/// the compose default because nothing ever set the slots (i802). It only
-/// recommends: applying it on upgrade waits for the operator's decision. A
-/// value set anywhere, a GPU box, or an unreadable config: nothing said.
-pub(crate) fn cpu_only_slots_upgrade_advice(cpu_only: bool, readable: bool, value: Option<&str>) -> Option<String> {
-    (cpu_only && readable && value.map(str::trim).filter(|v| !v.is_empty()).is_none())
-        .then(|| format!("recommended: one Ollama slot on this CPU-only box (it runs the compose default of 4). {CPU_ONLY_SLOTS_ADVICE}. Apply: {CPU_ONLY_SLOTS_REMEDY}"))
-}
-
 pub(crate) fn noo_data_bound_row(root: &std::path::Path) -> Check {
     let env = root.join(".env");
     let state = crate::onboard::env::read_env_key(&env, "NOO_STATE_ROOT");
@@ -14985,7 +14976,7 @@ mod image_retention_row_tests {
 
 #[cfg(test)]
 mod cpu_only_ollama_slots_tests {
-    use super::{cpu_only_ollama_slots_row, cpu_only_slots_upgrade_advice, Verdict, CPU_ONLY_SLOTS_ADVICE, CPU_ONLY_SLOTS_REMEDY};
+    use super::{cpu_only_ollama_slots_row, Verdict, CPU_ONLY_SLOTS_ADVICE, CPU_ONLY_SLOTS_REMEDY};
 
     /// i802: on a CPU-only controller, no OLLAMA_EMBED_NUM_PARALLEL or a
     /// value above 1 is an ADVISORY row (a warning, never a failure) that
@@ -15009,19 +15000,6 @@ mod cpu_only_ollama_slots_tests {
         for v in [None, Some("4"), Some("1"), Some("x")] {
             assert_ne!(cpu_only_ollama_slots_row(true, true, v).unwrap().verdict, Verdict::Fail);
         }
-    }
-
-    /// i802: `noo upgrade` RECOMMENDS one slot only where nothing chose the
-    /// slot count on a CPU-only box, with the measured reason and the command;
-    /// it changes nothing.
-    #[test]
-    fn upgrade_recommends_one_slot_only_where_nobody_chose() {
-        let said = cpu_only_slots_upgrade_advice(true, true, None).expect("advised");
-        assert!(said.starts_with("recommended: one Ollama slot") && said.contains("3x faster") && said.ends_with(CPU_ONLY_SLOTS_REMEDY), "{said}");
-        assert!(cpu_only_slots_upgrade_advice(true, true, Some("4")).is_none(), "an explicit 4 is the operator's");
-        assert!(cpu_only_slots_upgrade_advice(true, true, Some("1")).is_none());
-        assert!(cpu_only_slots_upgrade_advice(false, false, None).is_none(), "a GPU box");
-        assert!(cpu_only_slots_upgrade_advice(true, false, None).is_none(), "config unreadable: say nothing rather than guess");
     }
 
     /// The restart command is one the CLI accepts and names the compose
