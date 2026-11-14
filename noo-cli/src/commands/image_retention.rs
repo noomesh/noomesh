@@ -350,31 +350,75 @@ pub(crate) fn post_roll(g: &crate::Globals, root: &Path, tag: &str) {
     post_roll_on(&mut host, set.as_deref(), previewed, tag);
 }
 
-/// The post-roll verify's outcome. A verify that could not be run at all
-/// (no `noo` executable, a spawn error) is `Failed`: cleanup runs only on a
-/// verify that ran AND passed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Verified {
-    Passed,
-    Failed,
+/// Where the reason the last roll did not clean is kept, beside the keep
+/// file, for the `image retention` verify row to show until a roll cleans.
+pub(crate) const BLOCKED_FILE: &str = "image-retention-blocked.json";
+
+/// The post-roll verify's JSON, `None` when it could not be run or read.
+/// Its exit code is not the gate (see [`retention_gate`]).
+pub(crate) fn verify_json(out: &std::io::Result<std::process::Output>) -> Option<Value> {
+    out.as_ref().ok().and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok())
 }
 
-pub(crate) fn verify_outcome(ran: &std::io::Result<std::process::ExitStatus>) -> Verified {
-    match ran {
-        Ok(s) if s.success() => Verified::Passed,
-        _ => Verified::Failed,
+/// The gate: the rows that make "superseded" TRUE on this host, and only
+/// those. Every stack container runs the image the lock pins (`stack
+/// images`), every add-on pin verifies (`add-on pins`), and every enabled
+/// add-on's containers run or are held by the launcher's own rule (`add-on
+/// containers <a>`). Rows about anything else (certificates, backups, a GPU
+/// hold, another node, default chat) never block: on the operator's fleet a
+/// standing row of its own would otherwise mean cleanup never ran, silently.
+/// Fail-closed: an unreadable verify, a required row missing, or a row in the
+/// set at anything but `ok` blocks. `Err` names each blocking row.
+pub(crate) fn retention_gate(v: Option<&Value>, addons_on: &[String]) -> Result<(), Vec<String>> {
+    let Some(checks) = v.and_then(|v| v["controller"]["checks"].as_array()) else {
+        return Err(vec!["the post-roll `noo cluster verify --controller` gave no readable result".into()]);
+    };
+    let name = |c: &Value| c["name"].as_str().unwrap_or("").to_string();
+    let detail = |c: &Value| c["detail"].as_str().unwrap_or("").to_string();
+    let in_set = |n: &str| n == "stack images" || n == "add-on pins" || n == "add-on containers";
+    let mut blocked = Vec::new();
+    if !checks.iter().any(|c| name(c) == "stack images") {
+        blocked.push("stack images (not reported)".to_string());
+    }
+    if !addons_on.is_empty() && !checks.iter().any(|c| name(c) == "add-on pins") {
+        blocked.push("add-on pins (not reported)".to_string());
+    }
+    for a in addons_on {
+        let mine = format!("{a}:");
+        if !checks.iter().any(|c| name(c) == "add-on containers" && detail(c).starts_with(&mine)) {
+            blocked.push(format!("add-on containers {a} (not reported)"));
+        }
+    }
+    for c in checks.iter().filter(|c| in_set(&name(c))) {
+        if c["verdict"].as_str() != Some("ok") {
+            blocked.push(format!("{} ({})", name(c), detail(c)));
+        }
+    }
+    if blocked.is_empty() {
+        Ok(())
+    } else {
+        Err(blocked)
     }
 }
 
-/// Whether the post-roll step may write a keep file and queue the rung.
-pub(crate) fn may_clean(verified: Verified) -> bool {
-    verified == Verified::Passed
+/// The roll's line when the gate blocks: what blocked, and that it stays
+/// visible.
+pub(crate) fn blocked_line(rows: &[String]) -> String {
+    format!(
+        "images: superseded images were NOT cleaned up: blocked by {}. The `image retention` row of `noo cluster verify --controller` says so until a roll cleans",
+        rows.join("; ")
+    )
 }
 
 /// What the post-roll step does to the machine; [`post_roll_on`] holds every
 /// decision, so a test drives it with a fake.
 pub(crate) trait PostRollHost {
-    fn verify(&mut self) -> Verified;
+    /// The post-roll verify's JSON; `None` when it could not be run or read.
+    fn verify(&mut self) -> Option<Value>;
+    /// The enabled add-ons (the same list verify's add-on rows come from).
+    fn addons_on(&mut self) -> Result<Vec<String>, String>;
+    fn record_blocked(&mut self, tag: &str, rows: &[String]);
+    fn clear_blocked(&mut self);
     fn write_keep(&mut self) -> Result<PathBuf, String>;
     fn hostd_up(&mut self) -> bool;
     fn run_rung(&mut self, keep: &Path, live: bool) -> Result<Value, String>;
@@ -388,9 +432,19 @@ pub(crate) fn post_roll_on(h: &mut impl PostRollHost, set: Option<&str>, preview
     if m == Mode::Off {
         return h.say("images: superseded-image cleanup is off (cluster.image_retention: off in noomesh.yaml)");
     }
-    if !may_clean(h.verify()) {
-        return h.say("images: superseded images were NOT cleaned up: the post-roll `noo cluster verify --controller --wait` did not pass; the next roll that verifies cleanly does it");
+    let addons = match h.addons_on() {
+        Ok(a) => a,
+        Err(e) => {
+            let rows = vec![format!("which add-ons are on is unknown ({e})")];
+            h.record_blocked(tag, &rows);
+            return h.say(&blocked_line(&rows));
+        }
+    };
+    if let Err(rows) = retention_gate(h.verify().as_ref(), &addons) {
+        h.record_blocked(tag, &rows);
+        return h.say(&blocked_line(&rows));
     }
+    h.clear_blocked();
     let keep = match h.write_keep() {
         Ok(p) => p,
         Err(e) => return h.say(&format!("images: not cleaned up: {e}")),
@@ -425,14 +479,24 @@ struct LivePostRoll<'a> {
 }
 
 impl PostRollHost for LivePostRoll<'_> {
-    fn verify(&mut self) -> Verified {
+    fn verify(&mut self) -> Option<Value> {
         let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "noo".into());
-        let ran = std::process::Command::new(&exe)
-            .args(["cluster", "verify", "--controller", "--wait", "--json"])
-            .stdout(std::process::Stdio::null())
+        let out = std::process::Command::new(&exe)
+            .args(["--json", "cluster", "verify", "--controller", "--wait"])
+            .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status();
-        verify_outcome(&ran)
+            .output();
+        verify_json(&out)
+    }
+    fn addons_on(&mut self) -> Result<Vec<String>, String> {
+        crate::addons::licensed_on(self.root).map(|v| v.into_iter().map(str::to_string).collect())
+    }
+    fn record_blocked(&mut self, tag: &str, rows: &[String]) {
+        let b = json!({"at": crate::commands::secrets_reveal::now_rfc3339(), "tag": tag, "rows": rows});
+        let _ = std::fs::write(spool_dir(self.root).join(BLOCKED_FILE), b.to_string());
+    }
+    fn clear_blocked(&mut self) {
+        let _ = std::fs::remove_file(spool_dir(self.root).join(BLOCKED_FILE));
     }
     fn write_keep(&mut self) -> Result<PathBuf, String> {
         write_keep_file(self.root)
@@ -607,7 +671,9 @@ mod tests {
     /// A fake host: records every effect the post-roll step has.
     #[derive(Default)]
     struct FakeHost {
-        verified: Option<Verified>,
+        verified: Option<Value>,
+        addons: Vec<String>,
+        addons_err: Option<String>,
         rung: Option<Value>,
         hostd_down: bool,
         verifies: u32,
@@ -615,12 +681,26 @@ mod tests {
         rungs: Vec<bool>,
         marked: Vec<String>,
         said: Vec<String>,
+        blocked: Vec<Vec<String>>,
+        cleared: u32,
     }
 
     impl PostRollHost for FakeHost {
-        fn verify(&mut self) -> Verified {
+        fn verify(&mut self) -> Option<Value> {
             self.verifies += 1;
-            self.verified.unwrap_or(Verified::Failed)
+            self.verified.clone()
+        }
+        fn addons_on(&mut self) -> Result<Vec<String>, String> {
+            match &self.addons_err {
+                Some(e) => Err(e.clone()),
+                None => Ok(self.addons.clone()),
+            }
+        }
+        fn record_blocked(&mut self, _tag: &str, rows: &[String]) {
+            self.blocked.push(rows.to_vec());
+        }
+        fn clear_blocked(&mut self) {
+            self.cleared += 1;
         }
         fn write_keep(&mut self) -> Result<PathBuf, String> {
             self.keeps += 1;
@@ -645,29 +725,118 @@ mod tests {
         json!({"bytes": 1_000_000_000i64, "images": [{"remove": true}, {"remove": false}]})
     }
 
-    /// Cleanup runs only on a verify that ran AND passed: a failed verify,
-    /// and one that could not be run at all, write no keep file and queue no
-    /// rung.
+    fn row(name: &str, verdict: &str, detail: &str) -> Value {
+        json!({"name": name, "verdict": verdict, "detail": detail})
+    }
+
+    /// A post-roll verify whose gate rows pass, plus rows OUTSIDE the set
+    /// that fail, as on the operator's fleet (a certificate inside 30 days,
+    /// default chat, another node).
+    fn verify_with(rows: Vec<Value>) -> Value {
+        let mut checks = vec![
+            row("cert expiry", "warn", "node pop-os in 12 days"),
+            row("default chat", "fail", "no chat model"),
+            row("backup", "fail", "no backup in 3 days"),
+        ];
+        checks.extend(rows);
+        json!({"ok": false, "controller": {"ok": false, "checks": checks}})
+    }
+
+    fn clean_verify() -> Value {
+        verify_with(vec![
+            row("stack images", "ok", "14 container(s) run the lock's images"),
+            row("add-on pins", "ok", "1 verified"),
+            row("add-on containers", "ok", "rhaddon: every declared container is running"),
+        ])
+    }
+
+    fn passed(addons: &[&str]) -> FakeHost {
+        FakeHost { verified: Some(clean_verify()), addons: addons.iter().map(|a| a.to_string()).collect(), ..Default::default() }
+    }
+
+    /// The gate is the rows that make "superseded" true, and only those:
+    /// rows outside the set never block, each row in the set blocks alone,
+    /// and fail-closed (unreadable, missing, not `ok`).
     #[test]
-    fn a_failed_or_unrun_verify_writes_no_keep_file_and_runs_no_rung() {
-        let mut h = FakeHost { verified: Some(Verified::Failed), rung: Some(some_superseded()), ..Default::default() };
+    fn the_gate_is_the_stack_and_add_on_rows_only() {
+        let on = vec!["rhaddon".to_string()];
+        // Rows outside the set fail and warn; the gate still passes.
+        assert_eq!(retention_gate(Some(&clean_verify()), &on), Ok(()));
+        // Each row in the set blocks alone, named with its detail.
+        for (name, detail) in [
+            ("stack images", "noo-gateway runs sha256:aaaa, the lock pins ghcr.io/noomesh/gateway@sha256:bbbb"),
+            ("add-on pins", "rhaddon: not verified"),
+            ("add-on containers", "rhaddon: not running: noo-rhaddon"),
+        ] {
+            let mut v = clean_verify();
+            for c in v["controller"]["checks"].as_array_mut().unwrap() {
+                if c["name"] == name {
+                    c["verdict"] = json!("fail");
+                    c["detail"] = json!(detail);
+                }
+            }
+            let rows = retention_gate(Some(&v), &on).unwrap_err();
+            assert_eq!(rows, vec![format!("{name} ({detail})")], "{name} alone must block");
+            // Not proven is not a pass: warn and starting block too.
+            for verdict in ["warn", "starting"] {
+                let mut w = v.clone();
+                for c in w["controller"]["checks"].as_array_mut().unwrap() {
+                    if c["name"] == name {
+                        c["verdict"] = json!(verdict);
+                    }
+                }
+                assert!(retention_gate(Some(&w), &on).is_err(), "{name} at {verdict} must block");
+            }
+        }
+        // A required row that is missing blocks.
+        let without = |drop: &str| {
+            let mut v = clean_verify();
+            v["controller"]["checks"].as_array_mut().unwrap().retain(|c| c["name"] != drop);
+            v
+        };
+        assert_eq!(retention_gate(Some(&without("stack images")), &on).unwrap_err(), vec!["stack images (not reported)".to_string()]);
+        assert_eq!(retention_gate(Some(&without("add-on pins")), &on).unwrap_err(), vec!["add-on pins (not reported)".to_string()]);
+        assert_eq!(retention_gate(Some(&without("add-on containers")), &on).unwrap_err(), vec!["add-on containers rhaddon (not reported)".to_string()]);
+        // With no add-on enabled, no add-on row is required.
+        assert_eq!(retention_gate(Some(&without("add-on containers")), &[]), Ok(()));
+        // Unreadable: blocks.
+        assert!(retention_gate(None, &on).is_err());
+        assert!(retention_gate(Some(&json!({"ok": true})), &on).is_err(), "no controller section is not a pass");
+        let unrun: std::io::Result<std::process::Output> = Err(std::io::Error::other("no such file"));
+        assert_eq!(verify_json(&unrun), None);
+    }
+
+    /// A blocked gate writes no keep file, queues no rung, says which rows
+    /// blocked, and records them for the verify row; a passing gate clears
+    /// the record.
+    #[test]
+    fn a_blocked_gate_cleans_nothing_and_says_why() {
+        let mut h = passed(&["rhaddon"]);
+        h.rung = Some(some_superseded());
+        h.verified.as_mut().unwrap()["controller"]["checks"].as_array_mut().unwrap().retain(|c| c["name"] != "stack images");
         post_roll_on(&mut h, Some("live"), true, "v1");
-        assert_eq!((h.verifies, h.keeps, h.rungs.len()), (1, 0, 0), "a failed verify cleans nothing");
-        assert!(h.said[0].contains("NOT cleaned up") && h.said[0].contains("did not pass"), "{:?}", h.said);
-        // A verify that could not be spawned is a failure, never a pass.
-        let unrun: std::io::Result<std::process::ExitStatus> = Err(std::io::Error::other("no such file"));
-        assert_eq!(verify_outcome(&unrun), Verified::Failed);
-        assert!(!may_clean(verify_outcome(&unrun)));
-        assert!(!may_clean(Verified::Failed) && may_clean(Verified::Passed));
-        // And a passed one does clean.
-        let mut h = FakeHost { verified: Some(Verified::Passed), rung: Some(some_superseded()), ..Default::default() };
+        assert_eq!((h.verifies, h.keeps, h.rungs.len(), h.cleared), (1, 0, 0, 0));
+        assert_eq!(h.blocked, vec![vec!["stack images (not reported)".to_string()]]);
+        assert!(h.said[0].contains("NOT cleaned up: blocked by stack images (not reported)"), "{:?}", h.said);
+        // A verify that could not be read blocks the same way.
+        let mut h = FakeHost { rung: Some(some_superseded()), ..Default::default() };
         post_roll_on(&mut h, Some("live"), true, "v1");
-        assert_eq!((h.keeps, h.rungs.clone()), (1, vec![true]));
+        assert_eq!((h.keeps, h.rungs.len(), h.blocked.len()), (0, 0, 1));
+        // Not knowing which add-ons are on blocks too.
+        let mut h = FakeHost { verified: Some(clean_verify()), addons_err: Some("noomesh.yaml unreadable".into()), ..Default::default() };
+        post_roll_on(&mut h, Some("live"), true, "v1");
+        assert_eq!((h.verifies, h.keeps, h.blocked.len()), (0, 0, 1));
+        // A passing gate (with failing rows OUTSIDE the set) cleans, and
+        // clears the record.
+        let mut h = passed(&["rhaddon"]);
+        h.rung = Some(some_superseded());
+        post_roll_on(&mut h, Some("live"), true, "v1");
+        assert_eq!((h.keeps, h.rungs.clone(), h.cleared, h.blocked.len()), (1, vec![true], 1, 0));
     }
 
     #[test]
     fn off_runs_nothing_not_even_the_verify() {
-        let mut h = FakeHost { verified: Some(Verified::Passed), ..Default::default() };
+        let mut h = passed(&[]);
         post_roll_on(&mut h, Some("off"), true, "v1");
         assert_eq!((h.verifies, h.keeps, h.rungs.len()), (0, 0, 0));
     }
@@ -675,28 +844,32 @@ mod tests {
     #[test]
     fn the_first_roll_previews_and_spends_the_preview_only_on_a_non_empty_list() {
         // Empty: says nothing and keeps the one-time preview.
-        let mut h = FakeHost { verified: Some(Verified::Passed), ..Default::default() };
+        let mut h = passed(&[]);
         post_roll_on(&mut h, None, false, "v1");
         assert_eq!(h.rungs, vec![false], "the first roll is a preview");
         assert!(h.marked.is_empty() && h.said.is_empty(), "an empty preview is silent and not spent: {:?}", h.said);
         assert_eq!(removable(&json!({"images": [{"remove": false}]})), 0);
         // Something to remove: previews, says so, and records the preview.
-        let mut h = FakeHost { verified: Some(Verified::Passed), rung: Some(some_superseded()), ..Default::default() };
+        let mut h = passed(&[]);
+        h.rung = Some(some_superseded());
         post_roll_on(&mut h, None, false, "v1");
         assert_eq!((h.rungs.clone(), h.marked.clone()), (vec![false], vec!["v1".to_string()]));
         // The next roll (preview spent): live.
-        let mut h = FakeHost { verified: Some(Verified::Passed), rung: Some(some_superseded()), ..Default::default() };
+        let mut h = passed(&[]);
+        h.rung = Some(some_superseded());
         post_roll_on(&mut h, None, true, "v2");
         assert_eq!(h.rungs, vec![true]);
         // An explicit `preview` keeps previewing and never spends the marker.
-        let mut h = FakeHost { verified: Some(Verified::Passed), rung: Some(some_superseded()), ..Default::default() };
+        let mut h = passed(&[]);
+        h.rung = Some(some_superseded());
         post_roll_on(&mut h, Some("preview"), true, "v3");
         assert_eq!((h.rungs.clone(), h.marked.len()), (vec![false], 0));
     }
 
     #[test]
     fn hostd_down_queues_no_rung() {
-        let mut h = FakeHost { verified: Some(Verified::Passed), hostd_down: true, ..Default::default() };
+        let mut h = passed(&[]);
+        h.hostd_down = true;
         post_roll_on(&mut h, Some("live"), true, "v1");
         assert!(h.rungs.is_empty() && h.said[0].contains("noo-hostd is not running"), "{:?}", h.said);
     }
