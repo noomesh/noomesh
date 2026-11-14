@@ -10072,7 +10072,7 @@ mod volume_mismatch_tests {
     #[derive(Default)]
     struct FakeReaper {
         events: Vec<String>,
-        refuse: Vec<&'static str>,
+        refuse: Vec<String>,
     }
 
     impl VolumeReaper for FakeReaper {
@@ -10084,7 +10084,7 @@ mod volume_mismatch_tests {
         }
         fn remove(&mut self, vol: &str) -> bool {
             self.events.push(format!("remove {vol}"));
-            !self.refuse.iter().any(|r| *r == vol)
+            !self.refuse.contains(&vol.to_string())
         }
     }
 
@@ -10122,7 +10122,7 @@ mod volume_mismatch_tests {
     /// kept silently; the count is what docker actually removed.
     #[test]
     fn only_a_stale_bind_record_is_removed_and_said_first() {
-        let mut h = FakeReaper { refuse: vec!["noomesh_gone-wrong"], ..Default::default() };
+        let mut h = FakeReaper { refuse: vec!["noomesh_gone-wrong".into()], ..Default::default() };
         let n = reap_volumes(&mut h, vec![
             decision("noomesh_postgres-data", Some("/srv/noo/noo-data"), VolumeMismatch::Keep),
             decision("noomesh_noo-data", Some(""), VolumeMismatch::UnboundHoldsData),
