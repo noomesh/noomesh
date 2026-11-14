@@ -390,7 +390,7 @@ pub(crate) fn retention_gate(v: Option<&Value>, addons_on: &[String]) -> Result<
         }
     }
     for c in checks.iter().filter(|c| in_set(&name(c))) {
-        if c["verdict"].as_str() != Some("ok") {
+        if c["verdict"].as_str() != Some("ok") && !nothing_to_prove(c) {
             blocked.push(format!("{} ({})", name(c), detail(c)));
         }
     }
@@ -399,6 +399,16 @@ pub(crate) fn retention_gate(v: Option<&Value>, addons_on: &[String]) -> Result<
     } else {
         Err(blocked)
     }
+}
+
+/// The one WARN in the set that does not block: an add-on whose overlay
+/// declares no containers has nothing for `add-on containers` to prove
+/// (`cluster_verify::addon_containers_row`'s exact wording); `add-on pins`
+/// still covers its images. Any other WARN on that row still blocks.
+fn nothing_to_prove(c: &Value) -> bool {
+    c["name"] == "add-on containers"
+        && c["verdict"] == "warn"
+        && c["detail"].as_str().is_some_and(|d| d.ends_with(": declares no containers, so they aren't checked"))
 }
 
 /// The roll's line when the gate blocks: what blocked, and that it stays
@@ -799,6 +809,22 @@ mod tests {
         assert_eq!(retention_gate(Some(&without("add-on containers")), &on).unwrap_err(), vec!["add-on containers rhaddon (not reported)".to_string()]);
         // With no add-on enabled, no add-on row is required.
         assert_eq!(retention_gate(Some(&without("add-on containers")), &[]), Ok(()));
+        // An add-on that declares no containers has nothing to prove: its
+        // row's WARN does not block; any other WARN on that row does.
+        let mut v = clean_verify();
+        for c in v["controller"]["checks"].as_array_mut().unwrap() {
+            if c["name"] == "add-on containers" {
+                c["verdict"] = json!("warn");
+                c["detail"] = json!("rhaddon: declares no containers, so they aren't checked");
+            }
+        }
+        assert_eq!(retention_gate(Some(&v), &on), Ok(()), "nothing to prove is not a block");
+        for c in v["controller"]["checks"].as_array_mut().unwrap() {
+            if c["name"] == "add-on containers" {
+                c["detail"] = json!("rhaddon: whether its containers run could not be read (docker)");
+            }
+        }
+        assert!(retention_gate(Some(&v), &on).is_err(), "another warn on that row still blocks");
         // Unreadable: blocks.
         assert!(retention_gate(None, &on).is_err());
         assert!(retention_gate(Some(&json!({"ok": true})), &on).is_err(), "no controller section is not a pass");
