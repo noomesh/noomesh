@@ -25,5 +25,6 @@ A node never creates or deletes these consumers and has no stream API: the
 gateway declares the stream and the consumers. Upgrading the agent first
 leaves it unable to pull, with nothing logged on either side.
 
-See [security-release-upgrade.md](security-release-upgrade.md) (step C2) for
-the full bus rollout and the credential rotation that follows a render.
+To rotate one principal's credential after a render:
+`noo cluster nats-creds rotate <node|gateway|worker|…> [--restart]` (nodes
+get theirs over the rail).
