@@ -159,6 +159,7 @@ def _fake_host(tmp_path):
 case "$1" in
   ps) printf '%s\\n%s\\n%s\\n' {CID_A} {CID_B} {CID_C} ;;
   inspect) cat '{tmp_path}/inspect.json' ;;
+  exec) [ "$2" = noo-ollama ] && printf 'NAME            ID              SIZE      PROCESSOR    UNTIL\nqwen2.5:0.5b    a8b0c5157701    1.0 GB    100%% CPU     4 minutes from now\n' ;;
   stats) printf 'noo-gateway\\t150MiB / 15.6GiB\\nnoo-ollama\\t1GiB / 15.6GiB\\nnoo-stunnel-ollama\\t-- / --\\n' ;;
 esac
 """,
@@ -378,3 +379,89 @@ def test_the_probe_is_gated_to_the_two_cells():
         if "RAN probe-memory-baseline" in r.stdout:
             ran.add(cell)
     assert ran == {"ubuntu-24.04-amd64-default", "ubuntu-22.04-amd64"}, ran
+
+
+# ---- was a model loaded when it sampled? ------------------------------------
+
+PS_HEADER = "NAME    ID    SIZE    PROCESSOR    UNTIL\n"
+PS_HEADER_CTX = "NAME    ID    SIZE    PROCESSOR    CONTEXT    UNTIL\n"
+
+
+def test_ollama_ps_empty_one_and_two_models_and_not_a_table():
+    assert MB.parse_ollama_ps(PS_HEADER) == [], "the header alone: nothing loaded"
+    assert MB.parse_ollama_ps(PS_HEADER_CTX + "gemma4:e2b    2a3f    7.2 GB    100% CPU    4096    4 minutes from now\n") \
+        == ["gemma4:e2b"]
+    assert MB.parse_ollama_ps(PS_HEADER + "gemma4:e2b  2a3f  7.2 GB  100% CPU  4 minutes from now\n"
+                              "harrier-embed:latest  9c1d  600 MB  100% CPU  Forever\n") == ["gemma4:e2b", "harrier-embed:latest"]
+    for bad in ("", "Error: could not connect to ollama app, is it running?\n", "OCI runtime exec failed\n"):
+        assert MB.parse_ollama_ps(bad) is None, bad
+    assert MB.parse_ollama_api_ps('{"models": []}') == [] and MB.parse_ollama_api_ps("nope") is None
+    assert MB.parse_openai_models('{"data": [{"id": "gemma-4-12b"}]}') == ["gemma-4-12b"]
+
+
+class FakeHost:
+    def __init__(self, cmds=None, http=None):
+        self.cmds, self.http = cmds or {}, http or {}
+
+    def cmd(self, *argv, timeout=120):
+        return self.cmds.get(argv, (None, f"{argv[0]} exited 1: not faked"))
+
+    def http_get(self, url, timeout=5):
+        return self.http.get(url, (None, f"GET {url}: connection refused"))
+
+
+def test_an_unreadable_answer_is_unknown_with_its_reason_never_none():
+    c = {"name": "noo-ollama"}
+    host = FakeHost({("docker", "exec", "noo-ollama", "ollama", "ps"):
+                     (None, "docker exec exited 126: exec: ollama: executable file not found")})
+    a = MB.ask_ollama_container(host, c)
+    assert "models" not in a and "executable file not found" in a["unknown"] and "no published loopback port" in a["unknown"]
+    v = MB.idle_verdict([a])
+    assert v.startswith("unknown: ollama (") and "idle" not in v, v
+    assert MB.models_loaded([a]) == []
+    # The container has no CLI but its API is on loopback: that source, by name.
+    c = {"name": "noo-ollama", "published_ports": [11434]}
+    host.http = {"http://127.0.0.1:11434/api/ps": ('{"models": [{"name": "gemma4:e2b"}]}', None)}
+    a = MB.ask_ollama_container(host, c)
+    assert a["models"] == ["gemma4:e2b"] and a["source"] == "GET http://127.0.0.1:11434/api/ps"
+    # A non-table answer is not "nothing loaded" either.
+    host = FakeHost({("docker", "exec", "noo-ollama", "ollama", "ps"): ("Error: could not connect\n", None)})
+    assert "unknown" in MB.ask_ollama_container(host, {"name": "noo-ollama"})
+
+
+def test_a_running_llamacpp_or_vllm_server_is_loaded_even_when_it_names_nothing():
+    a = MB.ask_openai_server(FakeHost(), {"name": "noo-llamacpp", "published_ports": [8080]}, "llamacpp")
+    assert a["models"] == [None] and "connection refused" in a["model_name_unknown"]
+    assert MB.idle_verdict([a]) == "loaded: llamacpp:model unnamed"
+    host = FakeHost(http={"http://127.0.0.1:8000/v1/models": ('{"data": [{"id": "gemma-4-12b-it"}]}', None)})
+    a = MB.ask_openai_server(host, {"name": "noo-vllm", "published_ports": [8000]}, "vllm")
+    assert MB.models_loaded([a]) == [{"backend": "vllm", "model": "gemma-4-12b-it", "source": "GET http://127.0.0.1:8000/v1/models"}]
+    assert MB.backend_of("noo-stunnel-ollama") is None and MB.backend_of("noo-ollama-embed") == "ollama"
+
+
+def test_the_idle_verdict_strings():
+    idle = {"backend": "ollama", "source": "s", "models": []}
+    loaded = {"backend": "ollama", "source": "s", "models": ["qwen2.5:0.5b"]}
+    unknown = {"backend": "ollama", "source": "s", "unknown": "docker exec exited 1"}
+    assert MB.idle_verdict([]) == "idle: no model loaded"
+    assert MB.idle_verdict([idle]) == "idle: no model loaded"
+    assert MB.idle_verdict([idle, unknown]) == "unknown: ollama (docker exec exited 1)"
+    assert MB.idle_verdict([loaded]) == "loaded: ollama:qwen2.5:0.5b"
+    assert MB.idle_verdict([loaded, unknown]).startswith("loaded: ollama:qwen2.5:0.5b (also unknown: ")
+
+
+def test_memory_json_records_the_loaded_models_and_the_report_heading_shows_the_verdict(tmp_path):
+    doc, log = _measure(tmp_path)
+    assert doc["idle"] == "loaded: ollama:qwen2.5:0.5b"
+    assert doc["models_loaded"] == [{"backend": "ollama", "model": "qwen2.5:0.5b", "source": "docker exec noo-ollama ollama ps"}]
+    assert "at sample time: loaded: ollama:qwen2.5:0.5b" in log
+    f = tmp_path / "install-cell-ubuntu-22.04-amd64" / "memory.json"
+    f.parent.mkdir()
+    f.write_text(json.dumps(doc))
+    md = "\n".join(SIZE.render_memory(SIZE.load_memory([str(f)])))
+    assert "### ubuntu-22.04-amd64: loaded: ollama:qwen2.5:0.5b" in md, md[:600]
+    assert SIZE.memory_json(SIZE.load_memory([str(f)]))["cells"][0]["idle"] == "loaded: ollama:qwen2.5:0.5b"
+    old = {k: v for k, v in doc.items() if k != "idle"}
+    f.write_text(json.dumps(old))
+    assert "### ubuntu-22.04-amd64: unknown: memory.json predates the loaded-model check" in \
+        "\n".join(SIZE.render_memory(SIZE.load_memory([str(f)])))
