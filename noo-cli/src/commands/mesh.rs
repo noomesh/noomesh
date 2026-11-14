@@ -1716,6 +1716,23 @@ mod docker_gate_order_tests {
         assert!(gate < refuse && refuse < confirm && confirm < stop, "{body}");
     }
 
+    /// SOURCE PIN: `noo stack stop --volumes` with a docker that did not
+    /// answer refuses (exit 1) BEFORE the confirm prompt and before the
+    /// script that runs `down -v`. The `return Ok(1);` must sit between the
+    /// refusal output and `confirm_stop_volumes(`.
+    #[test]
+    fn stack_stop_volumes_refuses_before_it_prompts_when_docker_does_not_answer() {
+        let own = crate::test_src::own_code(include_str!("mesh.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn mesh_stop(");
+        let refusal = body.find("docker_unreachable_refusal(&why, \"noo stack stop --volumes\")").expect("the refusal");
+        let closed = body[refusal..].find("ui::close_failed(").map(|i| i + refusal).expect("it says so");
+        let confirm = body[closed..].find("confirm_stop_volumes(").map(|i| i + closed).expect("the confirm");
+        let script = body.find("run_script(g, \"noomesh-stop.sh\"").expect("the script");
+        let between = &body[closed..confirm];
+        assert!(between.contains("return Ok(1);"), "the refusal must return before the confirm: {between}");
+        assert!(confirm < script, "{body}");
+    }
+
     /// `noo stack reset`: the wrapper changes nothing before the script; the
     /// script's first change is noomesh-clean.sh, whose own gate runs first
     /// (tests/test_reset_changes_nothing_before_the_clean_gate.py).

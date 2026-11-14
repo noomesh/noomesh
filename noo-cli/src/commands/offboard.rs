@@ -1299,6 +1299,32 @@ mod volume_selection_tests {
         let judged = &walk[fail..complete];
         assert!(judged.contains("ui::close_failed(") && judged.contains("return Ok(1);"), "{judged}");
     }
+
+    /// SOURCE PIN: a re-check that cannot ask docker is a removal FAILURE,
+    /// never "nothing left". The Err arm must push onto removal_failed (the
+    /// list the walk judges before it can say complete).
+    #[test]
+    fn a_volume_recheck_that_cannot_ask_docker_fails_the_walk() {
+        let code = crate::test_src::own_code(include_str!("offboard.rs"));
+        let walk = crate::test_src::fn_body(&code, "pub fn offboard(");
+        let arm = walk
+            .find("Err(why) => removal_failed.push(format!(\"volumes (not re-checked: ")
+            .expect("a failed volume re-check is recorded as a removal failure");
+        let fail = walk.find("if !removal_failed.is_empty() {").expect("the walk judges it");
+        assert!(arm < fail, "{walk}");
+    }
+
+    /// SOURCE PIN: the same for the network re-check.
+    #[test]
+    fn a_network_recheck_that_cannot_ask_docker_fails_the_walk() {
+        let code = crate::test_src::own_code(include_str!("offboard.rs"));
+        let walk = crate::test_src::fn_body(&code, "pub fn offboard(");
+        let arm = walk
+            .find("Err(why) => removal_failed.push(format!(\"networks (not re-checked: ")
+            .expect("a failed network re-check is recorded as a removal failure");
+        let fail = walk.find("if !removal_failed.is_empty() {").expect("the walk judges it");
+        assert!(arm < fail, "{walk}");
+    }
 }
 
 #[cfg(test)]

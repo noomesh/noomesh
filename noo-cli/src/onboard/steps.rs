@@ -10030,6 +10030,42 @@ mod volume_mismatch_tests {
         assert_eq!(body.matches("\"volume\", \"rm\"").count(), 1, "one removal, after the decision");
         assert!(body.contains(".filter(|o| o.status.success())"), "a failed inspect is not an empty device: {body}");
     }
+
+    /// SOURCE PIN (the fixer shells out to docker directly: no fake-runner
+    /// seam). Each arm that must NOT remove ends in `continue;`, so control
+    /// never falls through to `volume rm -f`. Without it a volume that holds
+    /// data (unbound) or was never checked (docker did not answer) is deleted.
+    fn arm_ends_in_continue(arm: &str) -> bool {
+        let t = arm.trim_end();
+        let t = t.strip_suffix('\u{7d}').unwrap_or(t);
+        t.trim_end().ends_with("continue;")
+    }
+
+    #[test]
+    fn an_unbound_volume_that_holds_data_is_never_removed() {
+        let code = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&code, "fn fix_volume_mismatches(");
+        let from = body.find("VolumeMismatch::UnboundHoldsData => ").expect("the unbound arm");
+        let to = body.find("VolumeMismatch::RemoveStaleRecord => ").expect("the stale arm");
+        let rm = body.find("\"volume\", \"rm\", \"-f\", &vol").expect("the removal");
+        assert!(from < to && to < rm, "{body}");
+        let arm = &body[from..to];
+        assert!(arm.contains("NOT removed"), "{arm}");
+        assert!(arm_ends_in_continue(arm), "the unbound arm must continue, not fall through to the removal: {arm}");
+    }
+
+    #[test]
+    fn a_volume_docker_did_not_answer_about_is_never_removed() {
+        let code = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&code, "fn fix_volume_mismatches(");
+        let from = body.find("VolumeMismatch::NotChecked => ").expect("the not-checked arm");
+        let to = body.find("VolumeMismatch::UnboundHoldsData => ").expect("the next arm");
+        let rm = body.find("\"volume\", \"rm\", \"-f\", &vol").expect("the removal");
+        assert!(from < to && to < rm, "{body}");
+        let arm = &body[from..to];
+        assert!(arm.contains("left as it is (not checked)"), "{arm}");
+        assert!(arm_ends_in_continue(arm), "the not-checked arm must continue, not fall through to the removal: {arm}");
+    }
 }
 
 #[cfg(test)]
