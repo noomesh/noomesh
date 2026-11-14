@@ -754,18 +754,6 @@ pub fn cut_signal(task_node: Option<&str>, was: &str, controller: &str, id: &str
     Some((task_subject(node), serde_json::to_vec(&json!({"stop": id})).ok()?))
 }
 
-/// Every live task an account owns, children included (no page limit: a
-/// security stop must reach all of them).
-async fn live_tasks_of(db: &sqlx::PgPool, owner: &str) -> Result<Vec<Task>> {
-    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "{SELECT} WHERE u.username = $1 AND t.state IN ('open','running','checkpointed') ORDER BY t.created_at"
-    )))
-    .bind(owner)
-    .fetch_all(db)
-    .await?;
-    Ok(rows.iter().map(row_to_task).collect())
-}
-
 /// An account was DISABLED (general, 2026-11-14: a disabled account's task
 /// that keeps running a model turn for up to the turn deadline is an
 /// authority gap): stop every live task it owns now, with
@@ -774,7 +762,7 @@ async fn live_tasks_of(db: &sqlx::PgPool, owner: &str) -> Result<Vec<Task>> {
 /// at the next checkpoint, where the refused token renewal stops it too.
 /// Returns how many it stopped and how many it cut.
 pub async fn stop_account_tasks(state: &AppState, owner: &str) -> (usize, usize) {
-    let tasks = match live_tasks_of(&state.db, owner).await {
+    let tasks = match crate::repo::tasks::live_of_owner(&state.db, owner).await {
         Ok(t) => t,
         Err(e) => {
             tracing::error!(user = owner, error = %e, "task: a disabled account's tasks could not be listed; they stop at their next checkpoint");
@@ -783,19 +771,20 @@ pub async fn stop_account_tasks(state: &AppState, owner: &str) -> (usize, usize)
     };
     let controller = crate::agent_messages::controller_node();
     let (mut stopped, mut cut) = (0, 0);
-    for t in tasks {
-        match stop_with(&state.db, &t.id, "account_disabled").await {
+    for (id, node, was) in tasks {
+        let id = id.to_string();
+        match stop_with(&state.db, &id, "account_disabled").await {
             Ok(true) => stopped += 1,
             Ok(false) => continue,
             Err(e) => {
-                tracing::warn!(task = %t.id, user = owner, error = %e, "task: not stopped for a disabled account");
+                tracing::warn!(task = %id, user = owner, error = %e, "task: not stopped for a disabled account");
                 continue;
             }
         }
-        if let Some((subject, body)) = cut_signal(t.node.as_deref(), &t.state, &controller, &t.id) {
+        if let Some((subject, body)) = cut_signal(node.as_deref(), &was, &controller, &id) {
             match state.nats.publish(subject, body.into()).await {
                 Ok(()) => cut += 1,
-                Err(e) => tracing::warn!(task = %t.id, error = %e, "task: a disabled account's loop not cut; it ends at the next checkpoint"),
+                Err(e) => tracing::warn!(task = %id, error = %e, "task: a disabled account's loop not cut; it ends at the next checkpoint"),
             }
         }
     }
@@ -841,12 +830,7 @@ async fn note_cut(db: &sqlx::PgPool, id: &str, ready_subject_seen: &str) {
     }
     let note = cut_note(task.node.as_deref().unwrap_or("its node"), task.loops as i32);
     let Ok(uuid) = uuid::Uuid::parse_str(id) else { return };
-    match sqlx::query("UPDATE noo_tasks SET last_note = $2, updated_at = now() WHERE id = $1 AND state = 'stopped'")
-        .bind(uuid)
-        .bind(&note)
-        .execute(db)
-        .await
-    {
+    match crate::repo::tasks::note_cut(db, uuid, &note).await {
         Ok(_) => tracing::info!(event = "task_cut", task = id, "task: its stop cut the loop in flight"),
         Err(e) => tracing::warn!(task = id, error = %e, "task: cut note not recorded"),
     }
@@ -2136,13 +2120,14 @@ mod cut_tests {
     fn a_disabled_accounts_tasks_are_stopped_and_cut() {
         let own = crate::test_src::own_code(include_str!("tasks.rs"));
         let body = crate::test_src::fn_body(&own, "pub async fn stop_account_tasks(");
-        assert!(body.contains("live_tasks_of(&state.db, owner)"), "every live task of the account");
-        assert!(body.contains(r#"stop_with(&state.db, &t.id, "account_disabled")"#), "stopped with the reason add-ons see");
+        assert!(body.contains("crate::repo::tasks::live_of_owner(&state.db, owner)"), "every live task of the account");
+        assert!(body.contains(r#"stop_with(&state.db, &id, "account_disabled")"#), "stopped with the reason add-ons see");
         let stop = body.find("stop_with(").unwrap();
-        let sig = body.find("cut_signal(t.node.as_deref(), &t.state").expect("the loop in flight is cut");
+        let sig = body.find("cut_signal(node.as_deref(), &was").expect("the loop in flight is cut");
         let publish = body.find("state.nats.publish(subject, body.into())").expect("the cut is sent");
         assert!(stop < sig && sig < publish, "stop, then cut");
-        let q = crate::test_src::fn_body(&own, "async fn live_tasks_of(");
+        let repo = crate::test_src::own_code(include_str!("repo/tasks.rs"));
+        let q = crate::test_src::fn_body(&repo, "pub async fn live_of_owner<");
         assert!(q.contains("t.state IN ('open','running','checkpointed')") && !q.contains("parent_id IS NULL") && !q.contains("LIMIT"), "{q}");
     }
 
