@@ -18,9 +18,9 @@ from __future__ import annotations
 import structlog
 from typing import Optional
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 logger = structlog.get_logger(__name__)
 
@@ -265,20 +265,19 @@ async def init_db(dsn: str, run_migrations: bool = True) -> None:
             import warnings as _warnings
             _warnings.warn(_tls_msg)
 
-    _pool_size = max(10, (_os.cpu_count() or 4) * 2)
+    # Sized by POOL_BUDGET["db.init_db"] (i815), no longer by core count.
+    from .pool_budget import budgeted_async_engine, budgeted_engine
 
-    _engine = create_engine(
+    _engine = budgeted_engine(
+        "db.init_db",
         sync_url,
-        pool_size=_pool_size,
-        max_overflow=20,
         pool_timeout=30,
         pool_pre_ping=True,
         pool_recycle=3600,
     )
-    _async_engine = create_async_engine(
+    _async_engine = budgeted_async_engine(
+        "db.init_db",
         async_url,
-        pool_size=_pool_size,
-        max_overflow=20,
         pool_timeout=30,
         pool_pre_ping=True,
         pool_recycle=3600,

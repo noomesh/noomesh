@@ -3229,6 +3229,10 @@ services:
         # Per-session cap on temp files: a runaway query errors instead of
         # filling the disk. -1 removes the cap.
         ARGS="$$ARGS -c temp_file_limit=${NOO_PG_TEMP_FILE_LIMIT:-4GB}"
+        # Connection slots, explicit (i815): the stock 100 (97 usable) is
+        # below what a default install's pools may ask for. Every pool's
+        # ceiling is summed against this in tests/test_pg_pool_budget.py.
+        ARGS="$$ARGS -c max_connections=${NOO_PG_MAX_CONNECTIONS:-200}"
         # TLS is not a switch. Until 2026-09-28 `ssl=on` hung on NOO_PG_TLS
         # being set AND the leaf existing, and an unset variable started a
         # plaintext server that the stock pg_hba then accepted every client
