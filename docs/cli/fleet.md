@@ -538,7 +538,11 @@ noo autonomy audit -n 50     # what it decided recently
 noo autonomy disable         # stop the patrols (re-enable with enable)
 ```
 
-Locations, conditions and actions are listed by `noo autonomy locations`. If a backend keeps
+Locations, conditions and actions are listed by `noo autonomy locations`.
+Two rules can delete or change things, `disk_watermark` (reclaims Docker
+space) and `cert_auto_rotate` (re-issues certificates). They preview by
+default and act only when armed (the console's Autonomy panel) and live:
+`noo autonomy live <rule>`, and `noo autonomy preview <rule>` to go back. If a backend keeps
 refusing to start after an outage, `noo cluster clear-cooldowns` resets
 the auto-start backoff (the gateway clears every node regardless of the
 argument).
