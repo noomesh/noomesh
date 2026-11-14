@@ -1302,15 +1302,14 @@ mod tests {
             // uninterruptible sleep (state D) while it pages in, and its
             // environ reads back empty then (i812: one local batch check of
             // #1205, awolf under load).
-            let mut got = Err(String::new());
             let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                got = read_sibling_env(pid, &canary).await;
-                if got.is_ok() || std::time::Instant::now() >= until {
-                    break;
+            let got = loop {
+                let read = read_sibling_env(pid, &canary).await;
+                if read.is_ok() || std::time::Instant::now() >= until {
+                    break read;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
+            };
             // Still in state D after the bound: unproved HERE, as the jail's
             // own self-test says it ("unreadable even outside the jail"),
             // never a pass. Any other unreadable cause still fails below.
