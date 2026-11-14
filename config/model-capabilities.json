@@ -15,8 +15,8 @@
       "match": [
         "gemma4:e2b*"
       ],
-      "kv_bytes_per_token": 8704,
-      "evidence": "kv_bytes_per_token measured by fa on the default one-box cell (install-matrix run 43622936679, 0.6.24, CPU, num_ctx 16384): container cgroup 5.03 GiB at OLLAMA_NUM_PARALLEL 4 vs 4.63 GiB at 1, so 0.40 GiB over 3 slots x 16384 tokens = about 8.5 KiB per token per slot (i802). No max_context: the node reports it (131072)."
+      "kv_bytes_per_token": 16384,
+      "evidence": "kv_bytes_per_token measured by fa on the default one-box cell, CPU, 0.6.24: 13-16 KiB per token per slot from the container cgroup across num_ctx 4096/8192/16384 at OLLAMA_NUM_PARALLEL 1 and 4 (install-matrix run 43628426011; i802). 16 KiB, the top of the range, is used so the fit errs safe. No max_context: the node reports it (131072)."
     }
   ]
 }

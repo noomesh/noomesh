@@ -146,6 +146,40 @@ pub fn fit_inputs(node: &Value, env: &Value, model: &str) -> FitInputs {
     FitInputs { ram_gib: ram, used_gib: used, kv_bytes_per_token: kv, kv_measured: measured, slots: slots(env), running: running_context(node, model) }
 }
 
+/// The slots the stack's own Ollama runs with, from noomesh.yaml
+/// `compose_env.OLLAMA_EMBED_NUM_PARALLEL` (the variable compose reads for
+/// `ollama-embed`); `None` when unset, which is compose's default (4).
+pub fn compose_slots(config: &Value) -> Option<u64> {
+    match config.get("compose_env")?.get("OLLAMA_EMBED_NUM_PARALLEL")? {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+    .filter(|n| *n > 0)
+}
+
+/// The env the fit reads for an Ollama placement. On the controller's own
+/// node the chat model runs in the stack's compose Ollama, whose slot count
+/// is the stack's compose_env, not the placement: the fit then counts the
+/// slots that are (or, after this change, will be) in force there. A
+/// placement that sets OLLAMA_NUM_PARALLEL itself is left as it is.
+pub fn with_stack_slots(env: &Value, is_self: bool, stack_slots: Option<u64>) -> Value {
+    let mut env = env.clone();
+    if is_self && env.get("OLLAMA_NUM_PARALLEL").is_none() {
+        if let Some(obj) = env.as_object_mut() {
+            obj.insert("OLLAMA_NUM_PARALLEL".into(), Value::from(stack_slots.unwrap_or(DEFAULT_SLOTS).to_string()));
+        } else {
+            env = serde_json::json!({"OLLAMA_NUM_PARALLEL": stack_slots.unwrap_or(DEFAULT_SLOTS).to_string()});
+        }
+    }
+    env
+}
+
+/// Whether `node_id` is the controller's own node (its Ollama is the stack's).
+pub fn is_self_node(node_id: &str) -> bool {
+    crate::self_node::self_node_id().as_deref() == Some(node_id)
+}
+
 /// The decided context and everything the operator needs to read it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Decided {
@@ -344,7 +378,8 @@ async fn read_node(state: &crate::state::AppState, node_id: &str, model: &str) -
         Ok(p) => p,
         Err(e) => return Read::Failed(format!("placements: {e}")),
     };
-    let env = chat_env(&placements, model);
+    let stack_slots = compose_slots(&*state.config_yaml.read().await);
+    let env = with_stack_slots(&chat_env(&placements, model), is_self_node(node_id), stack_slots);
     let tier = crate::node_tier::derive(&crate::node_tier::facts_from_capabilities(record.get("capabilities").unwrap_or(&serde_json::json!({}))))
         .tier()
         .and_then(|t| u8::try_from(t).ok());
@@ -421,16 +456,17 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// fa's one-box cell (run 43622936679): 16 GB, ~9.4 GB in use, gemma4:e2b
-    /// at 8.5 KiB/token/slot measured, 4 slots.
+    /// fa's one-box cell (runs 43622936679, 43628426011): 16 GB, ~9.4 GB in
+    /// use, gemma4:e2b at 16 KiB/token/slot (the top of the measured 13-16),
+    /// 4 slots.
     fn stranger(running: Option<u64>) -> FitInputs {
-        FitInputs { ram_gib: 15.6, used_gib: 9.4, kv_bytes_per_token: 8.5 * 1024.0, kv_measured: true, slots: 4, running }
+        FitInputs { ram_gib: 15.6, used_gib: 9.4, kv_bytes_per_token: 16.0 * 1024.0, kv_measured: true, slots: 4, running }
     }
 
     #[test]
     fn the_strangers_box_gets_the_declared_context() {
         let f = fit_cap(32768, &stranger(Some(4096)));
-        assert_eq!(f, Fit { tokens: 32768, capped: None }, "1.06 GiB of cache fits ~4.9 GiB free");
+        assert_eq!(f, Fit { tokens: 32768, capped: None }, "2.0 GiB of cache fits ~4.9 GiB free");
     }
 
     #[test]
@@ -486,6 +522,24 @@ mod tests {
         assert_eq!(held_at_running(capped.clone(), 16384, Some(32768)), capped, "above the declaration: the declaration still caps");
         assert_eq!(held_at_running(capped.clone(), 32768, Some(4096)), capped, "a smaller running context is no floor");
         assert_eq!(held_at_running(capped.clone(), 32768, None), capped);
+    }
+
+    /// The one-box's chat runs in the stack's compose Ollama: the fit counts
+    /// that daemon's slots (compose_env), the slots that will be in force,
+    /// and never overrides a placement that says its own.
+    #[test]
+    fn the_stack_daemon_is_fitted_with_the_stacks_own_slot_count() {
+        let cfg = json!({"compose_env": {"OLLAMA_EMBED_NUM_PARALLEL": "1"}});
+        assert_eq!(compose_slots(&cfg), Some(1));
+        assert_eq!(compose_slots(&json!({"compose_env": {"OLLAMA_EMBED_NUM_PARALLEL": 2}})), Some(2));
+        assert_eq!(compose_slots(&json!({})), None, "unset: compose's default");
+        let env = json!({"OLLAMA_CONTEXT_LENGTH": "32768"});
+        assert_eq!(with_stack_slots(&env, true, Some(1))["OLLAMA_NUM_PARALLEL"], json!("1"));
+        assert_eq!(with_stack_slots(&env, true, None)["OLLAMA_NUM_PARALLEL"], json!("4"), "compose's default, said");
+        assert!(with_stack_slots(&env, false, Some(1)).get("OLLAMA_NUM_PARALLEL").is_none(), "another node's daemon is its placement's business");
+        let own = json!({"OLLAMA_NUM_PARALLEL": "2"});
+        assert_eq!(with_stack_slots(&own, true, Some(1))["OLLAMA_NUM_PARALLEL"], json!("2"), "the placement's own value stands");
+        assert_eq!(slots(&with_stack_slots(&env, true, Some(1))), 1);
     }
 
     #[test]
