@@ -308,7 +308,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
         (&["autonomy", "decisions"], "[-n|--limit <n>] [-l|--location <name>]", "What the disarmed autonomy locations would have done — the evidence for arming one"),
     (&["autonomy", "enable"], "", "Enable the autonomy engine"),
     (&["autonomy", "disable"], "", "Disable the autonomy engine"),
-    (&["autonomy", "live"], "<rule> [-y|--yes]", "Take a rule with a dry-run gate live: it then acts (disk_watermark deletes, cert_auto_rotate re-issues); asks first; operator or admin"),
+    (&["autonomy", "live"], "<rule> [-y|--yes]", "Take a dry-run-gated rule live so it acts; asks first; operator or admin"),
     (&["autonomy", "preview"], "<rule>", "Put a gated rule back into dry run: it records what it would do and changes nothing"),
     (&["proactive", "status"], "", "Show proactive agent state and rule counts"),
     (&["proactive", "rules"], "", "List configured proactive rules"),
