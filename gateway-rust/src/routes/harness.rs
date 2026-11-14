@@ -141,7 +141,10 @@ async fn harness_call(
         HarnessOp::Runbook { prompt } => json!({"text": rt.runbook_context(&prompt)}),
         HarnessOp::Temporal { timeout_ms } => json!({"text": rt.temporal_context(Some(user), Duration::from_millis(timeout_ms.min(30_000))).await}),
         HarnessOp::RunningSummary => json!({"text": rt.running_summary(conv).await}),
-        HarnessOp::Recall { query, top_k } => json!({"text": rt.conversation_recall(conv, &query, top_k.min(50)).await}),
+        HarnessOp::Recall { query, top_k } => {
+            let r = rt.conversation_recall(conv, &query, top_k.min(50)).await;
+            json!({"text": r.text, "recall": r.metadata()})
+        }
         HarnessOp::ToolSchemas => json!({
             "native": rt.tool_schemas().await,
             "external": rt.external_tool_schemas(Some(user)).await,

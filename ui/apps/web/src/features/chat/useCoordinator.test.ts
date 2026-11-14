@@ -131,6 +131,34 @@ describe('useCoordinator', () => {
     });
   });
 
+  it('reads a skipped recall off the done frame, with its reason', () => {
+    const { result } = renderHook(() => useCoordinator());
+    fire('onOpen', {});
+    H.sock.readyState = 1;
+    act(() => result.current.send('q'));
+
+    fire('onMessage', {
+      type: 'done',
+      iterations: 1,
+      elapsed_seconds: 16.2,
+      recall: { status: 'skipped', reason: 'embedder not ready (timed out after 15 s)' },
+    });
+    expect(last(result.current.messages).stats?.recallSkipped).toBe(
+      'embedder not ready (timed out after 15 s)',
+    );
+  });
+
+  it('an ok recall leaves no skipped reason', () => {
+    const { result } = renderHook(() => useCoordinator());
+    fire('onOpen', {});
+    H.sock.readyState = 1;
+    act(() => result.current.send('q'));
+
+    fire('onMessage', { type: 'done', elapsed_seconds: 2.0, recall: { status: 'ok', hits: 3 } });
+    expect(last(result.current.messages).stats).toBeDefined();
+    expect(last(result.current.messages).stats?.recallSkipped).toBeUndefined();
+  });
+
   it('leaves stats undefined when done carries no accounting (error path)', () => {
     const { result } = renderHook(() => useCoordinator());
     fire('onOpen', {});

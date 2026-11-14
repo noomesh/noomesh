@@ -440,6 +440,13 @@ receives flat JSON events, each with a `type`:
 {"type": "keepalive"}
 ```
 
+`done` (and the saved assistant message's metadata, and
+`/api/inference`'s `data`) carries `recall` when the turn ran
+conversation recall: `{"status": "ok", "hits": N}`, or `{"status":
+"skipped", "reason": "embedder not ready (timed out after 15 s)"}` when
+the answer was given without it; the console shows a skipped recall in
+the turn detail.
+
 `phase` says what a turn is doing before its first token, for the
 console's status line. `routed` names the node a model call went to and
 that backend's slots (null when its agent reports none). It is sent

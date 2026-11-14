@@ -582,65 +582,174 @@ pub(super) async fn fetch_companion_context(state: &AppState) -> Option<String> 
 // Tool expansion (Item 5) — discover new tools after noo_tool_search
 // ═══════════════════════════════════════════════════════════════
 
-/// Semantic recall within the current conversation. Uses pgvector cosine
-/// similarity on noo_entries scoped to this conversation_id. Returns the
-/// most relevant past messages regardless of recency — useful when older
-/// content has been dropped by fit_context_window.
-pub(super) async fn fetch_conversation_recall(
-    state: &AppState,
-    conversation_id: &str,
-    query: &str,
+/// How long the per-turn conversation recall waits for its query embedding.
+///
+/// Sized for a COLD embedder, not a warm one: harrier (the CPU embedder)
+/// answers in ~0.22 s warm but cold-loads in ~1.45 s on a 4-core runner,
+/// and a slower box or a bigger embedder can take several times that. The
+/// old 5 s budget turned such a cold load into "no recall" with nobody told.
+/// 15 s waits out a cold load while still bounding the turn: recall runs
+/// before the model call, so the bound only adds latency when the embedder
+/// really is cold (warm turns return as soon as the vector does). Timing out
+/// here does not bench the target -- the outer bound cancels the request
+/// before the per-target transport timeout (bound + 1 s) can fire, and the
+/// embedder keeps loading for the next turn.
+pub(crate) const RECALL_EMBED_BOUND: Duration = Duration::from_secs(15);
+
+/// What the per-turn recall did, reported in the turn's metadata (`recall`
+/// on the `done` frame, the saved assistant message and the REST answer).
+/// Serialises as `{"status":"ok","hits":N}` or
+/// `{"status":"skipped","reason":"..."}`: a skipped recall is never silent.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RecallStatus {
+    Ok { hits: u32 },
+    Skipped { reason: String },
+}
+
+/// The recall layer's text (None = nothing to add) and what happened.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecallOutcome {
+    pub text: Option<String>,
+    pub status: RecallStatus,
+}
+
+impl RecallOutcome {
+    pub fn skipped(reason: impl Into<String>) -> Self {
+        RecallOutcome { text: None, status: RecallStatus::Skipped { reason: reason.into() } }
+    }
+
+    /// The `recall` metadata value.
+    pub fn metadata(&self) -> Value {
+        serde_json::to_value(&self.status).unwrap_or(Value::Null)
+    }
+
+    /// Read a rail answer (`{"text": ..., "recall": {...}}`). A gateway too
+    /// old to send `recall` is read from its text: present = ok with one hit
+    /// per recalled line, absent = ok with none (it cannot say more).
+    pub fn from_wire(v: &Value) -> Self {
+        let text = v.get("text").and_then(|t| t.as_str()).map(str::to_string);
+        let status = v
+            .get("recall")
+            .and_then(|r| serde_json::from_value::<RecallStatus>(r.clone()).ok())
+            .unwrap_or_else(|| RecallStatus::Ok {
+                hits: text.as_deref().map_or(0, |t| t.lines().filter(|l| l.starts_with("- ")).count() as u32),
+            });
+        RecallOutcome { text, status }
+    }
+}
+
+/// Embed the recall query within `bound`, naming why when it cannot.
+/// The bound is a hard cap on the whole embed (every candidate tried),
+/// so a turn can never hang here.
+pub(crate) async fn embed_for_recall<F>(embed: F, bound: Duration) -> Result<Vec<f64>, String>
+where
+    F: std::future::Future<Output = Result<Vec<f64>, crate::embedding_client::EmbedError>>,
+{
+    match tokio::time::timeout(bound, embed).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(format!("embedder error: {e}")),
+        Err(_) => Err(format!("embedder not ready (timed out after {} s)", bound.as_secs())),
+    }
+}
+
+/// The recall pipeline with its two effects injected (the embed and the
+/// vector search), so its reporting is testable without a mesh or a DB.
+pub(crate) async fn conversation_recall_with<E, S, SF>(
+    embed: E,
+    bound: Duration,
+    search: S,
     top_k: u32,
-) -> Option<String> {
-    if conversation_id.is_empty() || query.is_empty() {
-        return None;
-    }
+) -> RecallOutcome
+where
+    E: std::future::Future<Output = Result<Vec<f64>, crate::embedding_client::EmbedError>>,
+    S: FnOnce(Vec<f64>) -> SF,
+    SF: std::future::Future<Output = Result<Vec<(String, String, f64)>, String>>,
+{
+    let embedding = match embed_for_recall(embed, bound).await {
+        Ok(v) => v,
+        Err(reason) => {
+            tracing::warn!(layer = "semantic_recall", reason = %reason, "conversation_recall_skipped");
+            return RecallOutcome::skipped(reason);
+        }
+    };
+    let rows = match search(embedding).await {
+        Ok(r) => r,
+        Err(e) => {
+            let reason = format!("recall search failed: {e}");
+            tracing::warn!(layer = "semantic_recall", reason = %reason, "conversation_recall_skipped");
+            return RecallOutcome::skipped(reason);
+        }
+    };
+    let (text, hits) = format_recall_rows(&rows, top_k);
+    RecallOutcome { text, status: RecallStatus::Ok { hits } }
+}
 
-    // 1. Embed the query — mesh, not the static endpoint. This used
-    // embed_one() against the configured URL, which on a normal deployment
-    // points at nothing on the controller; the `.ok()?` below then turned
-    // every failure into "no recall", silently disabling this layer.
-    let truncated: String = query.chars().take(1500).collect();
-    let embedding = crate::embedding_client::resolve()
-        .embed_one_with_mesh(state, &truncated, Duration::from_secs(5))
-        .await
-        .ok()?;
-
-    let vec_str = crate::embedding_client::pgvector_literal(&embedding);
-
-    // 2. Vector search scoped to THIS conversation only
-    let rows: Result<Vec<(String, String, f64)>, _> = sqlx::query_as(
-        "SELECT e.type, e.content, \
-                1 - (e.embedding <=> CAST($1 AS vector)) AS score \
-         FROM noo_entries e \
-         WHERE e.conversation_id = $2::uuid \
-           AND e.embedding IS NOT NULL \
-         ORDER BY e.embedding <=> CAST($1 AS vector) \
-         LIMIT $3"
-    )
-    .bind(&vec_str)
-    .bind(conversation_id)
-    .bind(top_k as i32)
-    .fetch_all(&state.db)
-    .await;
-
-    let rows = rows.ok()?;
-    if rows.is_empty() {
-        return None;
-    }
-
+/// The recall layer's text from scored rows: weak matches (score < 0.5)
+/// dropped; None when nothing passes. Returns the hit count with it.
+fn format_recall_rows(rows: &[(String, String, f64)], top_k: u32) -> (Option<String>, u32) {
     let mut context = String::from("[Relevant earlier messages in this conversation]");
+    let mut hits = 0u32;
     for (msg_type, content, score) in rows.iter().take(top_k as usize) {
         // Filter low-relevance results (score below 0.5 = weak match)
         if *score < 0.5 { continue; }
         let preview: String = content.chars().take(300).collect();
         context.push_str(&format!("\n- ({msg_type}, score={:.2}) {preview}", score));
+        hits += 1;
+    }
+    if hits == 0 {
+        return (None, 0); // No results passed the relevance threshold
+    }
+    (Some(context), hits)
+}
+
+/// Semantic recall within the current conversation. Uses pgvector cosine
+/// similarity on noo_entries scoped to this conversation_id. Returns the
+/// most relevant past messages regardless of recency — useful when older
+/// content has been dropped by fit_context_window.
+///
+/// Never silent: a recall that cannot run (embedder cold past
+/// [`RECALL_EMBED_BOUND`], embedder error, no embedder, search failure)
+/// comes back `Skipped` with the reason, for the turn's metadata.
+pub(super) async fn fetch_conversation_recall(
+    state: &AppState,
+    conversation_id: &str,
+    query: &str,
+    top_k: u32,
+) -> RecallOutcome {
+    if conversation_id.is_empty() || query.is_empty() {
+        return RecallOutcome { text: None, status: RecallStatus::Ok { hits: 0 } };
     }
 
-    if context.lines().count() < 2 {
-        return None; // No results passed the relevance threshold
-    }
-    Some(context)
+    // 1. Embed the query — mesh, not the static endpoint. The per-target
+    // transport timeout sits 1 s past the bound so the bound always fires
+    // first: a cold target is waited for, then left loading, never benched
+    // by recall.
+    let truncated: String = query.chars().take(1500).collect();
+    let endpoint = crate::embedding_client::resolve();
+    let embed = endpoint.embed_one_with_mesh(state, &truncated, RECALL_EMBED_BOUND + Duration::from_secs(1));
+
+    // 2. Vector search scoped to THIS conversation only
+    let search = move |embedding: Vec<f64>| async move {
+        let vec_str = crate::embedding_client::pgvector_literal(&embedding);
+        sqlx::query_as::<_, (String, String, f64)>(
+            "SELECT e.type, e.content, \
+                    1 - (e.embedding <=> CAST($1 AS vector)) AS score \
+             FROM noo_entries e \
+             WHERE e.conversation_id = $2::uuid \
+               AND e.embedding IS NOT NULL \
+             ORDER BY e.embedding <=> CAST($1 AS vector) \
+             LIMIT $3"
+        )
+        .bind(&vec_str)
+        .bind(conversation_id)
+        .bind(top_k as i32)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| e.to_string())
+    };
+
+    conversation_recall_with(embed, RECALL_EMBED_BOUND, search, top_k).await
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1500,5 +1609,119 @@ mod system_prompt_budget_tests {
         assert_eq!(s, "Book a table\n\nfor two\n\nnear the office");
         assert!(!s.contains("noo_agent_message") && !s.contains("noo_task_done"));
         assert_eq!(crate::tasks::selection_text("  x  ", None, Some("  ")), "x");
+    }
+}
+
+#[cfg(test)]
+mod recall_tests {
+    use super::*;
+    use crate::embedding_client::EmbedError;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn rows() -> Vec<(String, String, f64)> {
+        vec![
+            ("user".into(), "my dog is called Biscuit".into(), 0.91),
+            ("assistant".into(), "noted".into(), 0.62),
+            ("user".into(), "unrelated".into(), 0.21),
+        ]
+    }
+
+    /// An embedder that answers after `after` (virtual time).
+    async fn embedder(after: Duration) -> Result<Vec<f64>, EmbedError> {
+        tokio::time::sleep(after).await;
+        Ok(vec![0.1, 0.2, 0.3])
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_warm_recall_reports_ok_with_its_hits() {
+        let out = conversation_recall_with(
+            embedder(Duration::from_millis(220)), RECALL_EMBED_BOUND,
+            |_v: Vec<f64>| async { Ok::<_, String>(rows()) }, 5,
+        ).await;
+        assert_eq!(out.status, RecallStatus::Ok { hits: 2 }, "{out:?}");
+        let text = out.text.expect("recall text");
+        assert!(text.contains("Biscuit") && !text.contains("unrelated"), "{text}");
+        assert_eq!(RecallOutcome { text: None, status: out.status }.metadata(), json!({"status": "ok", "hits": 2}));
+    }
+
+    /// A cold embedder past the old 5 s budget is waited for, not skipped:
+    /// a slow box cold-loading the embedder still gets memory.
+    #[tokio::test(start_paused = true)]
+    async fn a_cold_embedder_within_the_bound_is_waited_for() {
+        let out = conversation_recall_with(
+            embedder(Duration::from_secs(8)), RECALL_EMBED_BOUND,
+            |_v: Vec<f64>| async { Ok::<_, String>(rows()) }, 5,
+        ).await;
+        assert_eq!(out.status, RecallStatus::Ok { hits: 2 }, "{out:?}");
+        assert!(out.text.is_some());
+    }
+
+    /// Past the bound: skipped, with the timeout as the reason, and the
+    /// call returns AT the bound (the turn goes on without recall).
+    #[tokio::test(start_paused = true)]
+    async fn an_embedder_beyond_the_bound_is_skipped_with_the_timeout_reason() {
+        let searched = AtomicBool::new(false);
+        let start = tokio::time::Instant::now();
+        let out = conversation_recall_with(
+            embedder(Duration::from_secs(600)), RECALL_EMBED_BOUND,
+            |_v: Vec<f64>| { searched.store(true, Ordering::SeqCst); async { Ok::<_, String>(rows()) } }, 5,
+        ).await;
+        let took = start.elapsed();
+        assert!(took >= RECALL_EMBED_BOUND && took < RECALL_EMBED_BOUND + Duration::from_secs(1), "recall must return at its bound: {took:?}");
+        assert_eq!(
+            out,
+            RecallOutcome::skipped("embedder not ready (timed out after 15 s)"),
+        );
+        assert!(!searched.load(Ordering::SeqCst), "no vector, no search");
+        assert_eq!(
+            out.metadata(),
+            json!({"status": "skipped", "reason": "embedder not ready (timed out after 15 s)"}),
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_embedder_error_is_skipped_with_the_error_reason() {
+        let out = conversation_recall_with(
+            async { Err::<Vec<f64>, _>(EmbedError::Unavailable("no embed target: no node advertises `embed` and no static endpoint is configured".into())) },
+            RECALL_EMBED_BOUND,
+            |_v: Vec<f64>| async { Ok::<_, String>(rows()) }, 5,
+        ).await;
+        match &out.status {
+            RecallStatus::Skipped { reason } => {
+                assert!(reason.starts_with("embedder error: embedding backend unavailable: no embed target"), "{reason}");
+            }
+            other => panic!("expected skipped, got {other:?}"),
+        }
+        assert_eq!(out.text, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_search_failure_is_skipped_not_empty() {
+        let out = conversation_recall_with(
+            embedder(Duration::ZERO), RECALL_EMBED_BOUND,
+            |_v: Vec<f64>| async { Err::<Vec<(String, String, f64)>, _>("pool timed out".to_string()) }, 5,
+        ).await;
+        assert_eq!(out, RecallOutcome::skipped("recall search failed: pool timed out"));
+    }
+
+    /// Nothing relevant is a successful recall with zero hits, not a skip.
+    #[tokio::test(start_paused = true)]
+    async fn only_weak_matches_is_ok_with_zero_hits() {
+        let out = conversation_recall_with(
+            embedder(Duration::ZERO), RECALL_EMBED_BOUND,
+            |_v: Vec<f64>| async { Ok::<_, String>(vec![("user".to_string(), "meh".to_string(), 0.3)]) }, 5,
+        ).await;
+        assert_eq!(out, RecallOutcome { text: None, status: RecallStatus::Ok { hits: 0 } });
+    }
+
+    /// The rail answer (`routes/harness.rs`) carries the status; a gateway
+    /// too old to send it is read from its text.
+    #[test]
+    fn the_rail_answer_carries_the_status() {
+        let skipped = RecallOutcome::skipped("embedder not ready (timed out after 15 s)");
+        let wire = json!({"text": skipped.text, "recall": skipped.metadata()});
+        assert_eq!(RecallOutcome::from_wire(&wire), skipped);
+        let old = json!({"text": "[Relevant earlier messages in this conversation]\n- (user, score=0.91) a\n- (assistant, score=0.62) b"});
+        assert_eq!(RecallOutcome::from_wire(&old).status, RecallStatus::Ok { hits: 2 });
     }
 }
