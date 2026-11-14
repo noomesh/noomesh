@@ -13,10 +13,11 @@ gateway (`gateway-rust/`), a Go node agent (`node-agent-go/`), the `noo` CLI
   needs all four generated artifacts in the same change: the gateway spec
   (`python3 scripts/gen-openapi.py`), the console contract
   (`python3 scripts/export-openapi.py`), a dated `ui/contracts/CHANGELOG.md`
-  entry, and the console's types (`cd ui && npm ci && npm run gen:api`).
-  Check with `gen-openapi.py --check`, `export-openapi.py --check` and
-  `cd ui && npm run check:api`; the `ui` CI job is not a required check, so
-  read it yourself.
+  entry, and the console's types (`ui/packages/api/src/schema.d.ts`).
+  `export-openapi.py` regenerates the types too, and its `--check` checks
+  them, when `ui/node_modules` is installed (`cd ui && npm ci`). Check with
+  `gen-openapi.py --check` and `export-openapi.py --check`; the changelog
+  entry is by hand.
 - A change to a command, a config key or an endpoint updates its doc in the
   same change, kept short: edit or delete before adding.
 - Nothing that deletes data uses force (`-f`) or bypasses a refusal.
