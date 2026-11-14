@@ -2963,6 +2963,39 @@ fn netns_restore_row_here(root: &std::path::Path) -> Check {
     netns_restore_row(systemd, state)
 }
 
+/// The `ollama slots` row's advice (i802), and the command that applies it.
+pub(crate) const CPU_ONLY_SLOTS_ADVICE: &str = "CPU-only: one Ollama slot saves ~0.4-0.6 GB of cache at 16k with no embedding loss (measured, i802); set OLLAMA_EMBED_NUM_PARALLEL=1 in .env, then restart the stack's ollama";
+pub(crate) const CPU_ONLY_SLOTS_REMEDY: &str = "set OLLAMA_EMBED_NUM_PARALLEL=1 in .env, then `noo stack restart --force ollama-embed`";
+
+/// The `ollama slots` row (i802): ADVISORY only, never a failure. On a
+/// CPU-only controller the stack's shared Ollama (`ollama-embed`) runs
+/// `OLLAMA_EMBED_NUM_PARALLEL` slots (compose default 4), and Ollama sizes a
+/// chat model's cache for every slot. `None` (no row) on a box with a GPU or
+/// when `.env` cannot be read; OK at 1 (or 0); a WARN when the key is absent,
+/// above 1 or not a number. `value` is the `.env` value, `None` when unset.
+pub(crate) fn cpu_only_ollama_slots_row(cpu_only: bool, env_readable: bool, value: Option<&str>) -> Option<Check> {
+    const NAME: &str = "ollama slots";
+    if !cpu_only || !env_readable {
+        return None;
+    }
+    let shown = match value.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) => match v.parse::<u64>() {
+            Ok(n) if n <= 1 => return Some(ok(NAME, format!("OLLAMA_EMBED_NUM_PARALLEL={n}: the CPU-only stack's Ollama runs one slot"))),
+            _ => format!("OLLAMA_EMBED_NUM_PARALLEL={v}"),
+        },
+        None => "OLLAMA_EMBED_NUM_PARALLEL unset (the compose default: 4 slots)".to_string(),
+    };
+    Some(warn(NAME, format!("{shown}. {CPU_ONLY_SLOTS_ADVICE}"), Some(CPU_ONLY_SLOTS_REMEDY.to_string())))
+}
+
+fn cpu_only_ollama_slots_row_here(root: &std::path::Path) -> Option<Check> {
+    let cpu_only = crate::host_exec::classify_gpu(&crate::host_exec::nvidia_smi_within(crate::host_exec::SMI_DEADLINE, &[]))
+        == crate::host_exec::GpuProbe::Missing;
+    let text = if cpu_only { std::fs::read_to_string(root.join(".env")).ok() } else { None };
+    let value = text.as_deref().and_then(|t| crate::envfile::dotenv_last(t, "OLLAMA_EMBED_NUM_PARALLEL"));
+    cpu_only_ollama_slots_row(cpu_only, text.is_some(), value.as_deref())
+}
+
 pub(crate) fn noo_data_bound_row(root: &std::path::Path) -> Check {
     let env = root.join(".env");
     let state = crate::onboard::env::read_env_key(&env, "NOO_STATE_ROOT");
@@ -7590,6 +7623,10 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(image_retention_row_here(&crate::envfile::repo_root()));
         checks.push(noo_data_bound_row(&crate::envfile::repo_root()));
         checks.push(netns_restore_row_here(&crate::envfile::repo_root()));
+        // i802: advisory only, on a CPU-only controller.
+        if let Some(row) = cpu_only_ollama_slots_row_here(&crate::envfile::repo_root()) {
+            checks.push(row);
+        }
         // i67: the controller's own node (when this box runs one) rides the rail.
         if let Some(me) = crate::commands::provision::self_node_name()
             .filter(|_| std::path::Path::new("/usr/local/bin/noo-node-agent").is_file())
@@ -10863,7 +10900,7 @@ mod tests {
     /// second leaf, a planted key or a stale copy each WARN with the fix.
     #[test]
     fn the_gateway_pki_view_row() {
-        let compose = include_str!("../../../docker-compose.cluster.yml");
+        let compose = std::fs::read_to_string(crate::test_support::repo_file("docker-compose.cluster.yml")).expect("shipped compose");
         let mounts = gateway_pki_mounts(compose).expect("a gateway service");
         let mut sorted = mounts.clone();
         sorted.sort();
@@ -14916,4 +14953,43 @@ mod image_retention_row_tests {
         assert!(a < b);
     }
 
+}
+
+#[cfg(test)]
+mod cpu_only_ollama_slots_tests {
+    use super::{cpu_only_ollama_slots_row, Verdict, CPU_ONLY_SLOTS_ADVICE, CPU_ONLY_SLOTS_REMEDY};
+
+    /// i802: on a CPU-only controller, no OLLAMA_EMBED_NUM_PARALLEL or a
+    /// value above 1 is an ADVISORY row (a warning, never a failure) that
+    /// names the saving and the real restart command; 1 is OK; a GPU box or
+    /// an unreadable .env shows no row.
+    #[test]
+    fn cpu_only_controller_gets_an_advisory_ollama_slots_row() {
+        let unset = cpu_only_ollama_slots_row(true, true, None).expect("a row");
+        assert_eq!((unset.name, unset.verdict), ("ollama slots", Verdict::Warn), "advisory, never red");
+        assert!(unset.detail.contains("unset") && unset.detail.ends_with(CPU_ONLY_SLOTS_ADVICE), "{}", unset.detail);
+        assert!(CPU_ONLY_SLOTS_ADVICE.starts_with("CPU-only: one Ollama slot saves ~0.4-0.6 GB of cache at 16k with no embedding loss (measured, i802)"));
+        assert_eq!(unset.remedy.as_deref(), Some(CPU_ONLY_SLOTS_REMEDY));
+        assert!(CPU_ONLY_SLOTS_REMEDY.contains("`noo stack restart --force ollama-embed`"));
+        let four = cpu_only_ollama_slots_row(true, true, Some("4")).expect("a row");
+        assert_eq!(four.verdict, Verdict::Warn);
+        assert!(four.detail.starts_with("OLLAMA_EMBED_NUM_PARALLEL=4. "), "{}", four.detail);
+        assert_eq!(cpu_only_ollama_slots_row(true, true, Some("junk")).unwrap().verdict, Verdict::Warn);
+        assert_eq!(cpu_only_ollama_slots_row(true, true, Some("1")).unwrap().verdict, Verdict::Ok);
+        assert!(cpu_only_ollama_slots_row(false, true, None).is_none(), "a GPU box: no row");
+        assert!(cpu_only_ollama_slots_row(true, false, None).is_none(), "an unreadable .env: no row");
+        for v in [None, Some("4"), Some("1"), Some("x")] {
+            assert_ne!(cpu_only_ollama_slots_row(true, true, v).unwrap().verdict, Verdict::Fail);
+        }
+    }
+
+    /// The restart command is one the CLI accepts and names the compose
+    /// service of the stack's shared Ollama.
+    #[test]
+    fn the_remedy_names_a_real_verb_and_the_shared_ollama_service() {
+        assert!(crate::usage::USAGE.iter().any(|(path, args, _)| *path == ["stack", "restart"] && args.contains("--force")));
+        let compose = include_str!("../../../docker-compose.cluster.yml");
+        assert!(compose.contains("\n  ollama-embed:\n"), "the service the remedy restarts");
+        assert!(compose.contains("OLLAMA_NUM_PARALLEL=${OLLAMA_EMBED_NUM_PARALLEL:-4}"), "the key the row reads is the one compose reads");
+    }
 }
