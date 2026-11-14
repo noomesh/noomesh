@@ -18,10 +18,12 @@ This opens a streaming conversation; every turn shares one conversation id.
 `/exit` or `/quit` ends it. For a single turn that returns to the shell:
 
 ```bash
-noo chat --message "in two lines, what can you do on this machine?"
+noo chat --message "Say hello, then give me two short tips for keeping a home server healthy."
 ```
 
-`--model <m>` picks a model; without it the cluster chooses. The backend
+A small first model knows nothing about this computer, so ask it something
+general; the next section asks about your cluster. `--model <m>` picks a
+model; without it the cluster chooses. The backend
 that answered is shown on stderr. The full flag list is in
 [agents-and-channels.md](../cli/agents-and-channels.md).
 
@@ -33,16 +35,16 @@ routing), put the provider's key in the secret store
 `noo chat --model claude-sonnet-4-5`. Tools, memory and the rest work the
 same as on a local model.
 
-## A first good question: your own cluster
+## See what you just built
 
-Ask about what you just built. These need no setup:
+The chat model does not read your cluster's state, so ask the CLI:
 
 ```bash
-noo chat --message "which nodes and models do you have right now?"
 noo cluster status
 ```
 
-Compare the answer with `noo cluster status`; they should agree.
+It lists each node, whether it is online, and the model it is running
+(`RUNNING`), from what the node agents report.
 
 ## A second good question: your own document
 
@@ -53,11 +55,14 @@ about it:
 noo rag ingest ~/notes/anything.md
 noo rag status
 noo rag query "what does anything.md say about the deadline?"
-noo chat --message "summarise what you know from anything.md"
 ```
 
 `noo rag status` shows the document and page counts; `noo rag query` answers
-with citations, so you can see which pages it used. More verbs (`docs`,
+with citations, so you can see which pages it used. `noo chat` does not
+search the knowledge base: it sends your message straight to the chat model.
+To talk about your documents, use `noo rag query`, or the chat in the web
+console (below), which looks in the knowledge base before it answers: ask it
+"summarise what you know from anything.md". More verbs (`docs`,
 `scan`, watched folders) are in
 [memory-and-knowledge.md](../cli/memory-and-knowledge.md).
 

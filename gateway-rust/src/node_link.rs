@@ -142,7 +142,18 @@ impl NodeLink {
                     return Ok(Self::with_node(format!("https://{ip}:{AGENT_PORT}"), node_id).advertising(data));
                 }
             }
-            // Registered, but with nowhere to send the call: say so, rather
+            // No address, but the node holds an outbound transport to this
+            // gateway (the bus, its tunnel): calls that travel over those
+            // still reach it. A one-machine install whose agent finds no
+            // controller-reachable address registers like this (rc.3 install
+            // matrix, windows-2025-wsl2: every nudge was "reconcile_nudge_skipped
+            // … no reachable address" while its bus and tunnel were up). Any
+            // call that needs HTTPS to the node fails naming that (`url`).
+            let link = Self::with_node(String::new(), node_id).advertising(data);
+            if link.has_outbound_transport() {
+                return Ok(link);
+            }
+            // Registered, with nowhere to send the call: say so, rather
             // than "not found".
             return Err(AppError::NotFound(no_address_message(node_id)));
         }
@@ -201,9 +212,25 @@ impl NodeLink {
         Self { base, node_id: None, auth: Auth::SelfAgent, nats_rpc: false, bus: None, tunnel: false }
     }
 
-    /// The agent's base URL.
+    /// The agent's base URL. Empty for a node reached only over its
+    /// outbound transports ([`NodeLink::has_address`]).
     pub fn base(&self) -> &str {
         &self.base
+    }
+
+    /// The link has an HTTPS address for the agent. False for a node that
+    /// registered none but holds the bus or a tunnel: a caller that must hand
+    /// an address to something else (a scrape target, a mesh target, a
+    /// websocket relay) checks this and says what is missing
+    /// ([`needs_address_message`]).
+    pub fn has_address(&self) -> bool {
+        !self.base.is_empty()
+    }
+
+    /// The node advertises a transport it holds outbound to this gateway and
+    /// this gateway has it switched on: the bus (`nats_rpc`) or its tunnel.
+    fn has_outbound_transport(&self) -> bool {
+        (self.nats_rpc && crate::node_rpc::enabled()) || (self.tunnel && crate::tunnel::enabled())
     }
 
     /// The node this link was resolved for, when it was resolved by id. The
@@ -213,8 +240,17 @@ impl NodeLink {
         self.node_id.as_deref()
     }
 
-    /// `base` + `path` (`path` starts with `/` and may carry a query).
+    /// `base` + `path` (`path` starts with `/` and may carry a query). With
+    /// no address, a URL no client will send, naming why: an HTTPS attempt on
+    /// such a link (a call the bus does not take with no live tunnel) fails
+    /// with "noo-node-unreachable://<node>/no_https_address…", never with a
+    /// request to some other host.
     pub fn url(&self, path: &str) -> String {
+        if self.base.is_empty() {
+            let node: String = self.node_id.as_deref().unwrap_or("").chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
+            return format!("{NO_ADDRESS_SCHEME}://{node}/no_https_address_and_no_live_tunnel");
+        }
         format!("{}{}", self.base.trim_end_matches('/'), path)
     }
 
@@ -331,8 +367,10 @@ impl NodeLink {
                 "detail": "node tunnels are switched off on this gateway (NOO_NODE_TUNNEL)"});
         }
         let Some(sess) = crate::tunnel::hub().live(&node) else {
-            return json!({"advertised": true, "checked": true, "ok": false,
-                "detail": "the node advertises a tunnel but this gateway holds no live tunnel for it (it reconnects within seconds after a gateway restart)"});
+            return no_live_tunnel(
+                crate::legacy_lanes::process_start_unix(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            );
         };
         let started = std::time::Instant::now();
         let req = crate::tunnel::TunnelRequest {
@@ -624,8 +662,23 @@ pub fn backend_stream_on(
     crate::coordinator::with_backend_hint_url(req, url, backend_type)
 }
 
+/// The scheme of [`NodeLink::url`] for a link with no address (the same one
+/// [`crate::node_rpc::unreachable_error`] uses): reqwest refuses it.
+const NO_ADDRESS_SCHEME: &str = "noo-node-unreachable";
+
+/// A node reached only over its outbound transports, asked for something
+/// that needs a direct HTTPS address (`what`): which, and how to give it one.
+/// Never "unreachable": its bus or tunnel still carries control calls.
+pub(crate) fn needs_address_message(node_id: &str, what: &str) -> String {
+    format!(
+        "Node '{node_id}' reaches this gateway only over its bus/tunnel and registered no HTTPS address, \
+         which {what} needs. Set NODE_IP in the node's agent env to an address the controller can reach, then restart the agent."
+    )
+}
+
 /// The node is in `mesh_nodes` but registered without `agent_url` or
-/// `ip_address`, so the gateway has nowhere to send the call.
+/// `ip_address`, and advertises no outbound transport, so the gateway has
+/// nowhere to send the call.
 pub(crate) fn no_address_message(node_id: &str) -> String {
     format!(
         "Node '{node_id}' is registered but has no reachable address (no agent_url or ip_address in mesh_nodes). \
@@ -686,6 +739,43 @@ mod tests {
                 other => panic!("expected NotFound, got {other:?}"),
             }
         }
+    }
+
+    /// rc.3 install matrix, windows-2025-wsl2: the agent registered with no
+    /// address but held the bus and its tunnel, and every call to it (the
+    /// placement nudge first) was "registered but has no reachable address".
+    #[test]
+    fn a_node_with_no_address_but_an_outbound_transport_still_gets_a_link() {
+        let none = |t: Value| json!({"agent_url": "", "ip_address": "", TRANSPORTS_FIELD: t});
+        for t in [json!({"nats_rpc": true}), json!({"tunnel": true}), json!({"nats_rpc": true, "tunnel": true})] {
+            let l = NodeLink::from_record("wsl1", Some(&none(t.clone()))).unwrap_or_else(|e| panic!("{t}: {e:?}"));
+            assert!(!l.has_address(), "{t}");
+            assert_eq!(l.node_id(), Some("wsl1"));
+            // An HTTPS attempt names why it cannot be made; it never dials another host.
+            let u = l.url("/reconcile");
+            assert!(u.starts_with("noo-node-unreachable://wsl1/no_https_address"), "{u}");
+        }
+        // The tunnel is looked for on such a link; the bus is used for control ops.
+        assert_eq!(NodeLink::from_record("wsl1", Some(&none(json!({"tunnel": true})))).unwrap().tunnel_node().as_deref(), Some("wsl1"));
+        assert!(NodeLink::from_record("wsl1", Some(&none(json!({"nats_rpc": true})))).unwrap().nats_rpc);
+        // Neither transport (or a bus the id cannot name): NotFound, with the
+        // NODE_IP remedy, exactly as before.
+        for t in [json!({"https_listener": true}), json!({"nats_rpc": false, "tunnel": false})] {
+            match NodeLink::from_record("wsl1", Some(&none(t.clone()))) {
+                Err(AppError::NotFound(m)) => assert!(m.contains("no reachable address") && m.contains("NODE_IP"), "{m}"),
+                other => panic!("{t}: expected NotFound, got {other:?}"),
+            }
+        }
+        assert!(matches!(NodeLink::from_record("pop.os", Some(&none(json!({"nats_rpc": true})))), Err(AppError::NotFound(_))));
+        // A link with an address is unchanged by any of this.
+        assert!(NodeLink::from_record("n3", Some(&json!({"ip_address": "10.0.0.3", TRANSPORTS_FIELD: {"tunnel": true}}))).unwrap().has_address());
+    }
+
+    #[test]
+    fn the_needs_address_message_names_the_node_the_feature_and_never_unreachable() {
+        let m = needs_address_message("wsl1", "a websocket session to its workload");
+        assert!(m.contains("'wsl1'") && m.contains("a websocket session to its workload") && m.contains("NODE_IP"), "{m}");
+        assert!(m.contains("bus/tunnel") && !m.contains("unreachable"), "{m}");
     }
 
     #[test]
@@ -910,5 +1000,34 @@ mod tests {
         let err = read_all(&client, &url).await.expect_err("silence past the idle bound is a cut");
         assert!(err.starts_with("the model stream was cut after "), "{err}");
         assert!(started.elapsed() < std::time::Duration::from_secs(3), "cut at the idle bound, not after the gap: {:?}", started.elapsed());
+    }
+}
+
+/// i677 #17: what the tunnel probe answers when this gateway holds no live
+/// tunnel for a node that advertises one. Inside the settle window after THIS
+/// gateway started, the node is still redialing (it reconnects within seconds;
+/// install matrix run 6): `checked: false`, which verify shows as NOT CHECKED,
+/// never as a failure. Past the window it is the FAIL it always was. Pure.
+pub(crate) fn no_live_tunnel(gateway_started_unix: u64, now_unix: u64) -> Value {
+    let since = now_unix.saturating_sub(gateway_started_unix);
+    if (since as f64) < crate::routes::cluster::GOSSIP_SETTLE_SECS {
+        return json!({"advertised": true, "checked": false, "ok": false, "reason": "gateway_settling",
+            "detail": format!("not yet: this gateway started {since}s ago and the node redials its tunnel on its own (within seconds)")});
+    }
+    json!({"advertised": true, "checked": true, "ok": false, "reason": "no_live_tunnel",
+        "detail": "the node advertises a tunnel but this gateway holds no live tunnel for it (it reconnects within seconds after a gateway restart)"})
+}
+
+#[cfg(test)]
+mod no_live_tunnel_tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_tunnel_right_after_a_gateway_start_is_not_checked_yet_and_later_a_failure() {
+        let early = no_live_tunnel(1_000, 1_020);
+        assert_eq!((early["checked"].as_bool(), early["reason"].as_str()), (Some(false), Some("gateway_settling")));
+        assert!(early["detail"].as_str().unwrap().contains("started 20s ago"));
+        let late = no_live_tunnel(1_000, 1_100);
+        assert_eq!((late["checked"].as_bool(), late["ok"].as_bool(), late["reason"].as_str()), (Some(true), Some(false), Some("no_live_tunnel")));
     }
 }

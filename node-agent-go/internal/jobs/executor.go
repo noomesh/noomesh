@@ -239,10 +239,10 @@ func (e *Executor) bindSubscriptions() error {
 	subject := fmt.Sprintf("tasks.dispatch.%s", e.nodeID)
 	durable := fmt.Sprintf("node_%s_dispatch", e.nodeID)
 
-	sub, err := js.Subscribe(subject, func(msg *natsMsg) {
+	sub, err := bindDurable(js, "TASKS", subject, durable, deliverSubject(e.nodeID, "dispatch"), func(msg *natsMsg) {
 		msg.Ack()
 		e.handleDispatch(msg.Data)
-	}, natsSubOpts(durable, deliverSubject(e.nodeID, "dispatch"))...)
+	})
 	if err != nil {
 		return fmt.Errorf("subscribe dispatch (if the durable %s exists with a "+
 			"different deliver subject, the GATEWAY must delete it — this node's "+
@@ -251,13 +251,12 @@ func (e *Executor) bindSubscriptions() error {
 	e.dispatchSub = sub
 	slog.Info("job dispatch subscribed", "node_id", e.nodeID)
 
-	// Subscribe to cancel events
 	cancelSubject := "events.job.cancel"
 	cancelDurable := fmt.Sprintf("node_%s_cancel", e.nodeID)
-	csub, err := js.Subscribe(cancelSubject, func(msg *natsMsg) {
+	csub, err := bindDurable(js, "EVENTS", cancelSubject, cancelDurable, deliverSubject(e.nodeID, "cancel"), func(msg *natsMsg) {
 		msg.Ack()
 		e.handleCancel(msg.Data)
-	}, natsSubOpts(cancelDurable, deliverSubject(e.nodeID, "cancel"))...)
+	})
 	if err != nil {
 		slog.Warn("cancel subscription failed", "error", err)
 		// Non-fatal — jobs will just run to completion
@@ -727,12 +726,42 @@ type natsMsg = nats.Msg
 // silently adopting the wrong subject. The node reports UNBOUND, which is the
 // honest answer; repairing it needs the gateway, because a node's own grant
 // denies $JS.API.CONSUMER.DELETE by design.
-func natsSubOpts(durable, deliver string) []nats.SubOpt {
-	return []nats.SubOpt{
-		nats.Durable(durable),
-		nats.ManualAck(),
-		nats.DeliverSubject(deliver),
+// bindDurable binds this node to its durable consumer and never lets the
+// library own it.
+//
+// nats.go deletes a consumer on Unsubscribe()/Drain() when its own
+// js.Subscribe CREATED that consumer (js.go: `jsi.dc = true`). The agent
+// rebinds on every reconnect, and its first-ever subscribe on a fresh box
+// created both durables. So each rebind published
+// $JS.API.CONSUMER.DELETE.TASKS.node_<id>_dispatch (and EVENTS.…_cancel),
+// which the node's grant denies by design: an ERROR "permissions violation"
+// line per reconnect (install matrix run 6), and had the grant allowed it,
+// the node would have thrown away its own pending dispatches.
+//
+// Instead: look the durable up (CONSUMER.INFO), create it only when missing
+// (CONSUMER.CREATE, with the deliver subject this node owns), refuse one that
+// delivers elsewhere (repairing that needs the gateway), and subscribe BOUND
+// to it, so the library never owns or deletes it.
+func bindDurable(js nats.JetStreamContext, stream, subject, durable, deliver string, cb nats.MsgHandler) (*nats.Subscription, error) {
+	info, err := js.ConsumerInfo(stream, durable)
+	switch {
+	case err == nil:
+		if info.Config.DeliverSubject != deliver {
+			return nil, fmt.Errorf("durable %s delivers to %q, not this node's %q", durable, info.Config.DeliverSubject, deliver)
+		}
+	case errors.Is(err, nats.ErrConsumerNotFound):
+		if _, err := js.AddConsumer(stream, &nats.ConsumerConfig{
+			Durable:        durable,
+			DeliverSubject: deliver,
+			FilterSubject:  subject,
+			AckPolicy:      nats.AckExplicitPolicy,
+		}); err != nil {
+			return nil, fmt.Errorf("create durable %s: %w", durable, err)
+		}
+	default:
+		return nil, err
 	}
+	return js.Subscribe(subject, cb, nats.Bind(stream, durable), nats.ManualAck())
 }
 
 // deliverSubject is where this node's consumer delivers, derived only from the

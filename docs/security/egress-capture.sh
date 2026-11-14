@@ -1,0 +1,495 @@
+#!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+#
+# egress-capture.sh: record every outbound connection this machine makes for a
+# while, then print who made each one, where it went and how many bytes moved.
+# It is the "see for yourself" half of docs/security/telemetry.md.
+#
+#   sudo docs/security/egress-capture.sh --minutes 60 --out ./egress-$(hostname)
+#
+# What it records (all of it in --out, nowhere else):
+#   conntrack.events  every connection's start and end, from the kernel's
+#                     connection tracker: addresses, ports, protocol, bytes and
+#                     packets each way. Headers only.
+#   names.tsv         hostnames: DNS questions and their answer addresses, and
+#                     the server name (SNI) of each TLS connection. The packets
+#                     these come from are parsed in memory and dropped; only
+#                     the name and the address are written.
+#   sockets.tsv       which process owns each internet socket (ss -tunp): process
+#                     name and pid, looked up the moment the connection tracker
+#                     reports a NEW connection, and five times a second for the
+#                     rest.
+#   containers.tsv    every 2 s, each running Docker container's name and IP
+#                     (when Docker is installed), so a container's connection
+#                     is named by its container. A flow with no snapshot within
+#                     10 s of its start is "container at <ip> (no snapshot near
+#                     this flow)", never another container's name.
+#   snapshots.tsv     one line per snapshot ("time ok|timeout|failed"); missed
+#                     intervals are reported.
+#   egress.tsv, egress.md
+#                     the report: one row per (who, destination, port, proto).
+# It never records a payload: no pcap is written, no request or response body,
+# no header beyond the TLS server name and the DNS question. The path is fixed:
+# tcpdump captures only DNS (port 53) and the first packet of a TLS handshake
+# (the ClientHello), at most 512 bytes of each, in both directions, and writes
+# them to its stdout; that stdout is a pipe into the parser's stdin, and the
+# pipe is the only place a packet byte ever is. Neither end is a file, tcpdump's
+# own stderr and the parser's stderr are discarded (so not even an error message
+# can echo a packet), and the parser's one output file is names.tsv, holding
+# (time, dns|sni, name, address) lines and nothing else.
+#
+# What it changes on the host, all of it:
+#   - net.netfilter.nf_conntrack_acct: set to 1 so the kernel counts bytes per
+#     connection, restored to its previous value on exit (also on Ctrl-C).
+#   - the nf_conntrack kernel module: loaded ONLY if it was not loaded already
+#     (the script then says so), and it stays loaded after the script exits.
+#     Unload it with `sudo modprobe -r nf_conntrack` if nothing else uses it;
+#     on a host running Docker it is always loaded already.
+# It adds no firewall rule and installs nothing.
+#
+# What it needs: root, conntrack (conntrack-tools), tcpdump, ss (iproute2),
+# python3. It refuses, saying which is missing, without them.
+#
+# What it cannot see:
+#   - what was sent: it sees who, where and how much, never the content, so a
+#     program's ordinary request and its telemetry to the same host look alike;
+#   - anything that did not happen while it ran: a reporter on a 24-hour timer
+#     shows up only if the capture spans its moment;
+#   - a connection that closed before its owner could be looked up (a DNS
+#     query over UDP, typically) is still listed (the kernel saw it) but as
+#     "unattributed";
+#   - the TLS server name over IPv6, and under Encrypted ClientHello; the DNS
+#     answer usually names the address anyway, and an address with no name is
+#     listed by address;
+#   - traffic in another network namespace than this one (run it on the host,
+#     not in a container; Docker containers on this host ARE seen).
+#
+# Options:
+#   --minutes N      how long to capture (default 10); Ctrl-C ends it early, and so
+#                    does `kill -TERM <pid>` (a script that started this as a
+#                    BACKGROUND job must use TERM: such a job ignores INT).
+#   --out DIR        where to write; required; created if absent, must be empty.
+#   --classify FILE  optional: a TSV of "who-regex<TAB>destination-regex<TAB>class<TAB>why"
+#                    lines, the destination being "<host>:<port>" (host is
+#                    "(no name seen)" when nothing named the address); each report
+#                    row takes the class of the first line whose two regexes match,
+#                    else "unlisted".
+#   --report-only    rebuild the report from an existing --out DIR.
+#   --infer-unattributed
+#                    with --classify: a "host process (unattributed)" row to a
+#                    destination host AND port that the same capture attributed
+#                    to a process or container whose row is classified is marked
+#                    "inferred" (why: "inferred from <who> in this window"),
+#                    still printed, and counted apart from "listed". For a
+#                    window where many programs fetch from the same places (an
+#                    install); never for one that must be silent.
+set -euo pipefail
+
+MINUTES=10; OUT=""; CLASSIFY=""; REPORT_ONLY=0; INFER=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --minutes) MINUTES="${2:?--minutes needs a number}"; shift 2 ;;
+        --out) OUT="${2:?--out needs a directory}"; shift 2 ;;
+        --classify) CLASSIFY="${2:?--classify needs a file}"; shift 2 ;;
+        --report-only) REPORT_ONLY=1; shift ;;
+        --infer-unattributed) INFER=1; shift ;;
+        -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
+        *) echo "egress-capture: unknown option $1 (see --help)" >&2; exit 2 ;;
+    esac
+done
+[ -n "$OUT" ] || { echo "egress-capture: --out DIR is required: the capture writes only where you say" >&2; exit 2; }
+case "$MINUTES" in ''|*[!0-9]*) echo "egress-capture: --minutes takes a whole number" >&2; exit 2 ;; esac
+[ -z "$CLASSIFY" ] || [ -r "$CLASSIFY" ] || { echo "egress-capture: cannot read --classify $CLASSIFY" >&2; exit 2; }
+command -v python3 >/dev/null || { echo "egress-capture: needs python3" >&2; exit 2; }
+
+report() {
+    python3 - "$OUT" "$CLASSIFY" "$INFER" <<'PY'
+import collections, ipaddress, os, re, sys
+out, classify, infer = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+
+def read(name):
+    p = os.path.join(out, name)
+    return open(p, errors="replace").read().splitlines() if os.path.exists(p) else []
+
+local_nets = [ipaddress.ip_network(n) for n in (
+    "127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+    "100.64.0.0/10", "169.254.0.0/16", "fc00::/7", "fe80::/10", "224.0.0.0/4", "ff00::/8")]
+def is_local(ip):
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return True
+    return any(a in n for n in local_nets) or a.is_unspecified
+
+# names: ip -> set(names)
+names = collections.defaultdict(set)
+for line in read("names.tsv"):
+    f = line.split("\t")
+    if len(f) >= 4 and f[3]:
+        names[f[3]].add(f[2])
+
+# containers: ip -> [(time, name)] from every docker snapshot. A flow goes to
+# the container that held its source address when the flow STARTED: addresses
+# are reused when containers are recreated, so "last seen" credited one
+# container with another's traffic (a rehearsal blamed noo-tempo for the
+# Ollama model pull).
+ctr_hist = collections.defaultdict(list)
+for line in read("containers.tsv"):
+    f = line.split("\t")
+    if len(f) >= 3:
+        try:
+            t = int(f[0])
+        except ValueError:
+            continue
+        for ip in f[2].split():
+            ctr_hist[ip].append((t, "container:" + f[1].lstrip("/")))
+for _h in ctr_hist.values():
+    _h.sort()
+
+# A sighting counts only NEAR a flow's start: the snapshot loop can stall
+# (a rehearsal's `docker inspect` hung during a stack recreate and no snapshot
+# came for 7 minutes; the last holder of an address was then credited with a
+# later container's Ollama model pull). A wrong name is worse than none.
+NEAR = 10
+def ctr_at(ip, ts):
+    h = ctr_hist.get(ip)
+    if not h:
+        return None
+    before = [(t, n) for t, n in h if t <= ts]
+    after = [(t, n) for t, n in h if t > ts]
+    if before and ts - before[-1][0] <= NEAR:
+        return before[-1][1]
+    if after and after[0][0] - ts <= NEAR and not before:
+        return after[0][1]  # started just before its first snapshot
+    if after and after[0][0] - ts <= NEAR and before and before[-1][1] == after[0][1]:
+        return after[0][1]  # the same holder on both sides of a short gap
+    return f"container at {ip} (no snapshot near this flow)"
+
+# snapshot ticks: one line per completed docker snapshot ("time ok|timeout|failed")
+ticks = []
+for line in read("snapshots.tsv"):
+    f = line.split()
+    if len(f) >= 2 and f[0].isdigit():
+        ticks.append((int(f[0]), f[1]))
+
+# sockets: (proto, lport, rip, rport) -> process
+sock = {}
+for line in read("sockets.tsv"):
+    f = line.split("\t")
+    if len(f) >= 6:
+        sock[(f[1], f[2], f[3], f[4])] = f[5]
+
+kv = re.compile(r"(\w+)=(\S+)")
+flows = {}
+host_ips = set(read("host_ips.txt"))
+for line in read("conntrack.events") + read("conntrack.final"):
+    m = re.search(r"\[(\d+)\.\d+\]", line)
+    ts = int(m.group(1)) if m else 0
+    proto = "tcp" if " tcp " in f" {line} " else "udp" if " udp " in f" {line} " else None
+    if not proto:
+        continue
+    pairs = kv.findall(line)
+    src = [v for k, v in pairs if k == "src"]; dst = [v for k, v in pairs if k == "dst"]
+    sp = [v for k, v in pairs if k == "sport"]; dp = [v for k, v in pairs if k == "dport"]
+    by = [int(v) for k, v in pairs if k == "bytes"]
+    if not src or not dst or not dp:
+        continue
+    s, d, sport, dport = src[0], dst[0], (sp[0] if sp else ""), dp[0]
+    if is_local(d):
+        continue
+    idm = re.search(r"id=(\d+)", line)
+    key = idm.group(1) if idm else f"{proto}{s}{sport}{d}{dport}"
+    fl = flows.setdefault(key, {"proto": proto, "src": s, "sport": sport, "dst": d, "dport": dport,
+                                "out": 0, "in": 0, "first": ts, "last": ts})
+    fl["first"] = min(fl["first"] or ts, ts); fl["last"] = max(fl["last"], ts)
+    if len(by) >= 2:
+        fl["out"], fl["in"] = max(fl["out"], by[0]), max(fl["in"], by[1])
+
+def who(fl):
+    c = ctr_at(fl["src"], fl["first"])
+    if c:
+        return c
+    p = sock.get((fl["proto"], fl["sport"], fl["dst"], fl["dport"]))
+    if p:
+        return "process:" + p
+    if fl["src"] in host_ips:
+        return "host process (unattributed)"
+    return f"forwarded from {fl['src']} (unattributed)"
+
+rules = []
+if classify:
+    for line in open(classify):
+        if line.strip() and not line.startswith("#"):
+            f = line.rstrip("\n").split("\t")
+            if len(f) >= 4:
+                rules.append((re.compile(f[0]), re.compile(f[1]), f[2], f[3]))
+
+rows = collections.OrderedDict()
+for fl in sorted(flows.values(), key=lambda x: x["first"]):
+    w = who(fl)
+    host = ",".join(sorted(names.get(fl["dst"], []))) or "(no name seen)"
+    k = (w, host, fl["dst"], fl["dport"], fl["proto"])
+    r = rows.setdefault(k, {"flows": 0, "out": 0, "in": 0, "first": fl["first"], "last": fl["last"]})
+    r["flows"] += 1; r["out"] += fl["out"]; r["in"] += fl["in"]
+    r["first"] = min(r["first"], fl["first"]); r["last"] = max(r["last"], fl["last"])
+
+def cls(w, host, port):
+    for rw, rh, c, why in rules:
+        if rw.search(w) and rh.search(f"{host}:{port}"):
+            return c, why
+    return ("unlisted", "") if rules else ("", "")
+
+# --infer-unattributed: an unattributed HOST row to a host AND port (and
+# protocol) that this same capture attributed to a classified process or
+# container is "inferred" from that attribution, and says so.
+explained = {}
+for (w, host, ip, port, proto) in rows:
+    if w.startswith(("process:", "container:")) and host != "(no name seen)" and cls(w, host, port)[0] in ("a", "b", "c"):
+        explained.setdefault((host, port, proto), w)
+
+def final_cls(w, host, port, proto):
+    c, why = cls(w, host, port)
+    if infer and c == "unlisted" and w == "host process (unattributed)" and (host, port, proto) in explained:
+        return "inferred", f"inferred from {explained[(host, port, proto)]} in this window"
+    return c, why
+
+with open(os.path.join(out, "egress.tsv"), "w") as t, open(os.path.join(out, "egress.md"), "w") as md:
+    t.write("who\thost\tip\tport\tproto\tflows\tbytes_out\tbytes_in\tfirst\tlast\tclass\twhy\n")
+    md.write("| Who | Destination | IP | Port | Flows | Bytes out | Bytes in | Class | Why |\n|---|---|---|---|---|---|---|---|---|\n")
+    for (w, host, ip, port, proto), r in rows.items():
+        c, why = final_cls(w, host, port, proto)
+        t.write(f"{w}\t{host}\t{ip}\t{port}\t{proto}\t{r['flows']}\t{r['out']}\t{r['in']}\t{r['first']}\t{r['last']}\t{c}\t{why}\n")
+        md.write(f"| {w} | {host} | {ip} | {port}/{proto} | {r['flows']} | {r['out']} | {r['in']} | {c} | {why} |\n")
+    # A stalled snapshot loop is shown, not only implied by the timestamps.
+    gaps = []
+    if ticks:
+        span = [t0 for t0, _ in ticks]
+        ends = [fl["first"] for fl in flows.values()] + [fl["last"] for fl in flows.values()]
+        lo, hi = (min(ends), max(ends)) if ends else (span[0], span[-1])
+        edges = [lo] + span + [hi]
+        gaps = [(a, b) for a, b in zip(edges, edges[1:]) if b - a > NEAR]
+        bad = sum(1 for _, st in ticks if st != "ok")
+        if gaps or bad:
+            longest = max((b - a for a, b in gaps), default=0)
+            note = (f"container snapshots: {len(gaps)} missed interval(s), longest {longest}s"
+                    + (f" ({gaps[0][0]}..{gaps[0][1]})" if gaps else "") + f"; {bad} timed out or failed")
+            md.write(f"\n**{note}.** A container flow with no snapshot near its start is listed as "
+                     "\"container at <ip> (no snapshot near this flow)\", never under another container's name.\n")
+classes = [final_cls(k[0], k[1], k[3], k[4])[0] for k in rows]
+inferred_flows = sum(r["flows"] for k, r in rows.items() if final_cls(k[0], k[1], k[3], k[4])[0] == "inferred")
+print(f"egress-capture: {len(flows)} outbound connection(s) to {len({k[2] for k in rows})} address(es); "
+      f"{classes.count('unlisted')} row(s) unlisted"
+      + (f"; {classes.count('inferred')} row(s) inferred ({inferred_flows} flow(s))" if infer else "")
+      + f"; report in {out}/egress.md")
+if gaps or (ticks and any(st != "ok" for _, st in ticks)):
+    print(f"egress-capture: {note}")
+PY
+}
+
+if [ "$REPORT_ONLY" = 1 ]; then report; exit 0; fi
+
+[ "$(id -u)" = 0 ] || { echo "egress-capture: run as root (sudo): the connection tracker and packet capture need it" >&2; exit 2; }
+missing=""
+for c in conntrack tcpdump ss; do command -v "$c" >/dev/null || missing="$missing $c"; done
+[ -z "$missing" ] || { echo "egress-capture: missing:$missing (Debian/Ubuntu: apt install conntrack tcpdump iproute2; Alpine: apk add conntrack-tools tcpdump iproute2)" >&2; exit 2; }
+SYSCTL=/proc/sys/net/netfilter/nf_conntrack_acct
+MOD_LOADED=0
+if [ ! -w "$SYSCTL" ] && [ ! -d /sys/module/nf_conntrack ] && modprobe nf_conntrack 2>/dev/null; then
+    MOD_LOADED=1
+    echo "egress-capture: loaded the nf_conntrack kernel module (it was not loaded); it stays loaded after this exits (unload: sudo modprobe -r nf_conntrack)"
+fi
+[ -w "$SYSCTL" ] || { echo "egress-capture: $SYSCTL is not writable: this kernel has no connection tracker here" >&2; exit 2; }
+mkdir -p "$OUT"
+[ -z "$(ls -A "$OUT")" ] || { echo "egress-capture: --out $OUT is not empty; give a fresh directory" >&2; exit 2; }
+chmod 0700 "$OUT"
+
+ACCT_WAS="$(cat "$SYSCTL")"
+PIDS=()
+cleanup() {
+    for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
+    # Bounded: never a bare `wait`, which blocks on any child this list does not
+    # hold (a rehearsal saw it hang). Up to 5 s for them to go, then KILL.
+    for _ in $(seq 1 50); do
+        _alive=0
+        for p in "${PIDS[@]}"; do kill -0 "$p" 2>/dev/null && _alive=1; done
+        [ "$_alive" = 0 ] && break
+        sleep 0.1
+    done
+    for p in "${PIDS[@]}"; do kill -KILL "$p" 2>/dev/null || true; done
+    conntrack -L -o extended,id 2>/dev/null | sed "s/^/[$(date +%s).0] /" > "$OUT/conntrack.final" || true
+    echo "$ACCT_WAS" > "$SYSCTL" 2>/dev/null || true
+    echo "egress-capture: stopped; nf_conntrack_acct restored to $ACCT_WAS"
+    [ "$MOD_LOADED" = 1 ] && echo "egress-capture: the nf_conntrack module this run loaded is still loaded (unload: sudo modprobe -r nf_conntrack)"
+    report
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+echo 1 > "$SYSCTL"
+{ ip -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1; } > "$OUT/host_ips.txt"
+
+conntrack -E -e NEW,DESTROY -o timestamp,extended,id > "$OUT/conntrack.events" 2>/dev/null &
+PIDS+=($!)
+
+NAMES_PARSER="$(cat <<'PY'
+import struct, sys, time
+r = sys.stdin.buffer
+hdr = r.read(24)
+if len(hdr) < 24: sys.exit(0)
+le = hdr[:4] in (b"\xd4\xc3\xb2\xa1", b"\x4d\x3c\xb2\xa1")
+E = "<" if le else ">"
+link = struct.unpack(E + "I", hdr[20:24])[0]
+out = open(sys.argv[1], "a", buffering=1)
+def name(b, o, depth=0):
+    labels = []
+    while o < len(b) and depth < 20:
+        n = b[o]
+        if n == 0: return ".".join(labels), o + 1
+        if n & 0xC0 == 0xC0:
+            p = ((n & 0x3F) << 8) | b[o + 1]
+            return ".".join(labels + [name(b, p, depth + 1)[0]]), o + 2
+        labels.append(b[o + 1:o + 1 + n].decode("ascii", "replace")); o += 1 + n
+    return ".".join(labels), o
+def dns(p):
+    if len(p) < 12 or not (p[2] & 0x80): return
+    qd, an = struct.unpack(">HH", p[4:8]); o = 12; q = ""
+    for _ in range(qd):
+        q, o = name(p, o); o += 4
+    for _ in range(an):
+        _, o = name(p, o)
+        t, _, _, l = struct.unpack(">HHIH", p[o:o + 10]); o += 10
+        if t == 1 and l == 4:
+            a4 = ".".join(map(str, p[o:o + 4])); out.write(f"{int(time.time())}\tdns\t{q}\t{a4}\n")
+        if t == 28 and l == 16:
+            import ipaddress; out.write(f"{int(time.time())}\tdns\t{q}\t{ipaddress.ip_address(p[o:o+16])}\n")
+        o += l
+def sni(p, dst):
+    try:
+        o = 5 + 4 + 2 + 32; o += 1 + p[o]
+        o += 2 + struct.unpack(">H", p[o:o + 2])[0]; o += 1 + p[o]
+        end = o + 2 + struct.unpack(">H", p[o:o + 2])[0]; o += 2
+        while o + 4 <= end:
+            t, l = struct.unpack(">HH", p[o:o + 4]); o += 4
+            if t == 0:
+                n = struct.unpack(">H", p[o + 3:o + 5])[0]
+                sn = p[o + 5:o + 5 + n].decode("ascii", "replace"); out.write(f"{int(time.time())}\tsni\t{sn}\t{dst}\n"); return
+            o += l
+    except Exception: return
+while True:
+    rh = r.read(16)
+    if len(rh) < 16: break
+    incl = struct.unpack(E + "I", rh[8:12])[0]
+    pkt = r.read(incl)
+    try:
+        if link == 113: proto, off = struct.unpack(">H", pkt[14:16])[0], 16
+        elif link == 276: proto, off = struct.unpack(">H", pkt[0:2])[0], 20
+        elif link == 1: proto, off = struct.unpack(">H", pkt[12:14])[0], 14
+        else: continue
+        if proto == 0x0800:
+            ihl = (pkt[off] & 0x0F) * 4; ipp = pkt[off + 9]; dst = ".".join(map(str, pkt[off + 16:off + 20])); l4 = off + ihl
+        elif proto == 0x86DD:
+            import ipaddress; ipp = pkt[off + 6]; dst = str(ipaddress.ip_address(pkt[off + 24:off + 40])); l4 = off + 40
+        else: continue
+        if ipp == 17: dns(pkt[l4 + 8:])
+        elif ipp == 6: sni(pkt[l4 + ((pkt[l4 + 12] >> 4) * 4):], dst)
+    except Exception: continue
+PY
+)"
+# Names: DNS answers and TLS ClientHello server names, parsed from a packet
+# stream that is never written; only (time, kind, name, address) is kept.
+# The parser reads tcpdump's stdout through a process substitution (a pipe),
+# so $! is tcpdump's own pid and cleanup can stop it; the parser ends at EOF.
+tcpdump -i any -nn -U -s 512 -w - \
+    'udp port 53 or (tcp and (tcp[((tcp[12:1] & 0xf0) >> 2):1] = 0x16) and (tcp[((tcp[12:1] & 0xf0) >> 2) + 5:1] = 0x01))' 2>/dev/null \
+    > >(python3 -u -c "$NAMES_PARSER" "$OUT/names.tsv" 2>/dev/null) &
+PIDS+=($!)
+
+# One `ss -tunpH` line -> "time proto local-port remote-ip remote-port owner".
+SS_ROW='
+        { proto=$1; nl=split($5, l, ":"); r=$6; n=split(r, rp, ":"); rport=rp[n]; rip=substr(r, 1, length(r)-length(rport)-1);
+          gsub(/^\[|\]$/, "", rip); lport=l[nl];
+          p=""; if (match($0, /users:\(\("[^"]+",pid=[0-9]+/)) { p=substr($0, RSTART+9, RLENGTH-9); sub(/",pid=/, " pid ", p) }
+          print t "\t" proto "\t" lport "\t" rip "\t" rport "\t" p }'
+
+# Who owns each internet socket, five times a second (process name and pid only).
+( set +e; while :; do
+    now="$(date +%s)"
+    ss -tunpH state established state syn-sent 2>/dev/null | awk -v t="$now" "$SS_ROW" >> "$OUT/sockets.tsv"
+    sleep 0.2
+  done ) &
+PIDS+=($!)
+
+# new_local_flow LINE: for a conntrack NEW event, "remote-ip local-port" of the
+# tuple whose source is one of this host's addresses (an event lists both
+# directions, in either order); nothing for a container's or a forwarded flow
+# (those are named by their container).
+new_local_flow() {
+    local f
+    f=$(grep -oE '(src|dst|sport|dport)=[^ ]+' <<< "$1" | head -8 | cut -d= -f2 | tr '\n' ' ')
+    set -- $f
+    [ $# -ge 8 ] || return 0
+    if [[ " $HOST_IPS " == *" $1 "* ]]; then echo "$2 $3"
+    elif [[ " $HOST_IPS " == *" $5 "* ]]; then echo "$6 $7"; fi
+}
+HOST_IPS="$(tr '\n' ' ' < "$OUT/host_ips.txt")"
+
+# ... and the moment the connection tracker reports a NEW one: a short
+# connection (a release asset's redirect, a registry token) can open and close
+# between two polls, but its owner still holds the socket while its handshake
+# runs. One filtered `ss` per new host connection. conntrack's stdout goes to
+# the reader through a process substitution, so $! is conntrack itself and
+# cleanup stops it; the reader ends at EOF.
+# Under a burst (parallel image layers) one `ss` per event fell behind, and a
+# short request closed before its turn; so the reader drains what is queued
+# (up to 64 events) and asks `ss` once for all of their ports. Each `ss -p`
+# scans every process, so one scan per batch, not per event, is the speed-up.
+conntrack -E -e NEW -o extended 2>/dev/null > >(set +e; while IFS= read -r line; do
+        ports=()
+        while :; do
+            set -- $(new_local_flow "$line")
+            if [ $# -eq 2 ]; then case "$1" in 127.*|::1) ;; *) ports+=("$2") ;; esac; fi
+            [ ${#ports[@]} -lt 64 ] || break
+            IFS= read -r -t 0.01 line || break
+        done
+        [ ${#ports[@]} -gt 0 ] || continue
+        filt=""; for p in "${ports[@]}"; do filt="${filt:+$filt or }sport = :$p"; done
+        ss -tunpH "( $filt )" 2>/dev/null | awk -v t="$(date +%s)" "$SS_ROW" >> "$OUT/sockets.tsv"
+    done) &
+PIDS+=($!)
+
+if command -v docker >/dev/null 2>&1; then
+    # One rehearsal's snapshots stopped during a stack recreate and never came
+    # back (7 minutes): this script runs under `set -e -o pipefail`, which the
+    # loop inherited, so one `docker inspect` of a container removed between
+    # `ps` and `inspect` failed the pipeline and ended the loop for good. The
+    # loop now runs with errexit off, and every docker call is bounded (a hung
+    # call costs one snapshot). Each iteration leaves a line in snapshots.tsv,
+    # so a missed interval shows in the report, and a flow far from any
+    # snapshot is never named by a stale one.
+    ( set +e; while :; do
+        now="$(date +%s)"
+        if ids="$(timeout 10 docker ps -q 2>/dev/null)"; then
+            st=ok
+            if [ -n "$ids" ]; then
+                # shellcheck disable=SC2086
+                timeout 10 docker inspect -f '{{.Name}}	{{range .NetworkSettings.Networks}}{{.IPAddress}} {{.GlobalIPv6Address}} {{end}}' $ids 2>/dev/null \
+                  | sed "s/^/$now	/" >> "$OUT/containers.tsv"
+                rc=${PIPESTATUS[0]}
+                [ "$rc" = 124 ] && st=timeout
+            fi
+        else
+            [ $? = 124 ] && st=timeout || st=failed
+        fi
+        echo "$now $st" >> "$OUT/snapshots.tsv"
+        sleep 2
+      done ) &
+    PIDS+=($!)
+fi
+
+echo "egress-capture: capturing for $MINUTES minute(s) into $OUT (Ctrl-C to stop early)"
+# In the background and waited on: a trapped INT/TERM (Ctrl-C, or `kill -TERM`
+# from a script that started this one) interrupts `wait` at once, where a
+# foreground sleep would hold the stop, the report and the restore until it ended.
+sleep "$((MINUTES * 60))" &
+PIDS+=($!)
+wait "$!"

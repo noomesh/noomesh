@@ -26,9 +26,14 @@ describe('the console carries the build it came from', () => {
     expect(src).toContain('__nooKioskBuild');
   });
 
-  it('the release workflow passes the tag in, or every console says dev', () => {
+  it('the release workflow passes a CONTENT identity in, never the tag', () => {
     const wf = readFileSync(resolve(process.cwd(), '../../../.github/workflows/publish-web.yml'), 'utf8');
     expect(wf, 'the build step moved: this guard is stale').toContain('npm run build -w @metis/web');
-    expect(wf).toMatch(/NOO_CONSOLE_BUILD:\s*\S/);
+    // ui-<tree hash of ui/>: equal for an rc and its final, so a final can
+    // re-tag the rc's gateway; a stale display still reports its OLD id.
+    expect(wf).toContain('tree="$(git rev-parse HEAD:ui)"');
+    expect(wf).toContain('NOO_CONSOLE_BUILD: ${{ steps.console.outputs.value }}');
+    expect(wf, 'the console must not carry the release tag again').not.toMatch(/NOO_CONSOLE_BUILD:\s*stack-/);
+    expect(wf, 'the gateway serves this file').toContain('ui/apps/web/dist/console-build.txt');
   });
 });

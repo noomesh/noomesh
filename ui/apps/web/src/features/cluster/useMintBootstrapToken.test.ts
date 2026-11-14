@@ -32,7 +32,7 @@ const OK = {
   token: 'RAW',
   expires_at: '2026-09-28T00:00:00Z',
   node_name: 'n1',
-  install_command: 'command -v noo >/dev/null || curl -fsSL https://x/install.sh | sh',
+  install_command: 'command -v noo >/dev/null || { d="$(mktemp -d)" && curl -fsSL https://x/install.sh > "$d/install.sh" && sh "$d/install.sh"; r=$?; rm -rf "$d"; [ "$r" = 0 ]; }',
   enroll_command: 'noo enroll noo1.BLOB',
   provision_command: 'noo cluster provision n1 --wait',
   joins_tailnet: true,

@@ -43,6 +43,15 @@ fn print_json(v: &serde_json::Value) {
 /// compose's per-container lines into one live line ([`fold_launcher_output`]). `--json` mode with `json_action`: child
 /// stdout → our stderr, then the `{"status":"ok","action":…}` contract.
 fn run_script(g: &Globals, name: &str, args: &[String], json_action: Option<&str>) -> i32 {
+    // i677 #10: right after onboard installs Docker, the user's shell is not
+    // yet in the docker group, and every launcher fails at its first docker
+    // call ("permission denied"). That one case is run again with the group
+    // active; the launcher reports any other docker problem itself.
+    if let Err(why) = super::offboard::docker_access() {
+        if let Some(code) = crate::docker_group::relaunch_if_needed(&why) {
+            return code;
+        }
+    }
     let root = repo_root();
     let script = root.join("scripts").join(name);
     if !script.is_file() {
@@ -717,6 +726,33 @@ pub fn mesh_stop(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     }
     if volumes {
+        // Name what `down -v` will delete BEFORE the prompt (or -y): a removal
+        // of volumes that hold data is only ever one the user saw by name
+        // (i677 #20). A docker that does not answer is refused, never read
+        // as "no volumes".
+        let project = crate::envfile::compose_project();
+        // No docker binary at all is a positive answer (nothing of this
+        // stack can exist here), the same reading offboard gives it.
+        let listed = match super::offboard::docker_access() {
+            Ok(super::offboard::DockerAccess::NotInstalled) => Ok(Vec::new()),
+            Ok(super::offboard::DockerAccess::Reachable) => super::offboard::stack_volumes(&project),
+            Err(why) => Err(why),
+        };
+        match listed {
+            Ok(v) if v.is_empty() => eprintln!("no volumes of compose project {project} on this host"),
+            Ok(v) => eprintln!("this deletes {} volume(s) of compose project {project}: {}", v.len(), v.join(", ")),
+            Err(why) => {
+                if let Some(code) = crate::docker_group::relaunch_if_needed(&why) {
+                    return Ok(code);
+                }
+                let lines = super::offboard::docker_unreachable_refusal(&why, "noo stack stop --volumes");
+                for l in &lines[1..] {
+                    println!("{}", ui::note(l));
+                }
+                ui::close_failed(&lines[0], Some("docker ps"));
+                return Ok(1);
+            }
+        }
         confirm_stop_volumes(g, yes);
     }
     let script_args: Vec<String> = if volumes { vec!["-v".into()] } else { Vec::new() };
@@ -858,6 +894,37 @@ pub fn mesh_clean(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     }
 
+    // i677a 3d: a deep clean with no data root is refused HERE, before docker
+    // is asked, the confirm, and the self-heal daemons are stopped. The script
+    // refuses too, but by then this wrapper had already stopped them, so its
+    // "nothing was changed" was false.
+    if deep {
+        let env_val = std::env::var("NOO_DATA_ROOT").ok();
+        let dotenv = std::fs::read_to_string(crate::envfile::repo_root().join(".env")).ok();
+        if deep_clean_data_root(env_val.as_deref(), dotenv.as_deref()).is_none() {
+            println!("{}", ui::note("set NOO_DATA_ROOT to this install's data root, then re-run --deep"));
+            ui::close_failed(DEEP_NO_DATA_ROOT, None);
+            return Ok(1);
+        }
+    }
+
+    // i677 #20: docker must ANSWER before anything is asked, stopped or removed
+    // (the relaunch, i677 #10, runs BEFORE the confirm, so it is asked once,
+    // in the relaunched child). A
+    // shell outside the docker group made every docker call fail, and a
+    // failure read as "nothing there" deletes the wrong things. Not installed
+    // at all is a positive answer (the script then cleans what is on disk).
+    if let Err(why) = super::offboard::docker_access() {
+        if let Some(code) = crate::docker_group::relaunch_if_needed(&why) {
+            return Ok(code);
+        }
+        let lines = super::offboard::docker_unreachable_refusal(&why, "noo stack clean");
+        for l in &lines[1..] {
+            println!("{}", ui::note(l));
+        }
+        ui::close_failed(&lines[0], Some("docker ps"));
+        return Ok(1);
+    }
     // Every variant that deletes something confirms (unless -y).
     if all || deep || volumes || images || cache || hf_cache {
         super::confirm_destructive(g, yes, "Clean all Docker resources on", "this host");
@@ -871,10 +938,31 @@ pub fn mesh_clean(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         if !g.json {
             ui::done(&format!("self-heal daemons stopped{}", if all || deep { " + watcher unit removed" } else { "" }));
         }
+        if all || deep {
+            // We remove what we install (#1108). `sudo -n`: a clean never prompts.
+            match crate::netns_unit::remove(false) {
+                Ok(true) if !g.json => ui::done(&format!("{} removed", crate::netns_unit::UNIT_NAME)),
+                Err(e) if !g.json => ui::warned(&format!("{e} — by hand: {}", crate::netns_unit::manual_removal())),
+                _ => {}
+            }
+        }
     }
 
     let script_args = clean_script_args(volumes, images, all, deep, cache, hf_cache, yes);
     Ok(run_script(g, "noomesh-clean.sh", &script_args, Some("clean")))
+}
+
+/// The refusal both this wrapper and `noomesh-clean.sh` print.
+pub(crate) const DEEP_NO_DATA_ROOT: &str =
+    "NOO_DATA_ROOT is not set (environment or .env) — refusing --deep, nothing was changed";
+
+/// The data root `noomesh-clean.sh --deep` would wipe under, from the same
+/// sources in the same order: the environment (empty = unset, as bash's
+/// `${NOO_DATA_ROOT:-}`), then the repo's `.env`, last assignment. None =
+/// not set, and `--deep` is refused.
+pub(crate) fn deep_clean_data_root(env_val: Option<&str>, dotenv: Option<&str>) -> Option<String> {
+    env_val.filter(|v| !v.is_empty()).map(str::to_string)
+        .or_else(|| dotenv.and_then(|t| crate::envfile::dotenv_last(t, "NOO_DATA_ROOT")).filter(|v| !v.is_empty()))
 }
 
 /// Script arguments for `noomesh-clean.sh`. `--deep` wins, else `--all`,
@@ -1574,5 +1662,82 @@ exit 3
         assert_eq!(t.live_status(), "pulling images: 2 layers seen (1 already present)");
         assert!(!t.feed(" Container noo-a  Started"));
         assert_eq!(t.live_status(), "containers: 1 of 1 up");
+    }
+}
+
+#[cfg(test)]
+mod deep_clean_data_root_tests {
+    use super::*;
+
+    /// i677a 3d: the same answer the script computes, env first, then `.env`.
+    #[test]
+    fn the_data_root_comes_from_the_env_then_the_dotenv_and_empty_is_unset() {
+        assert_eq!(deep_clean_data_root(Some("/srv/noo"), Some("NOO_DATA_ROOT=/x\n")).as_deref(), Some("/srv/noo"));
+        assert_eq!(deep_clean_data_root(Some(""), Some("NOO_DATA_ROOT=/x\n")).as_deref(), Some("/x"), "empty env is unset");
+        assert_eq!(deep_clean_data_root(None, Some("NOO_DATA_ROOT=\"/a\"\nNOO_DATA_ROOT=/b\n")).as_deref(), Some("/b"));
+        assert_eq!(deep_clean_data_root(None, Some("NOO_DATA_ROOT=\n")), None);
+        assert_eq!(deep_clean_data_root(None, Some("OTHER=1\n")), None);
+        assert_eq!(deep_clean_data_root(None, None), None);
+    }
+
+    /// The refusal comes BEFORE docker is asked, the confirm, and the daemon
+    /// stop, so its "nothing was changed" is true.
+    #[test]
+    fn deep_without_a_data_root_is_refused_before_anything_is_stopped() {
+        let own = crate::test_src::own_code(include_str!("mesh.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn mesh_clean(");
+        let at = |s: &str| body.find(s).unwrap_or_else(|| panic!("{s} not in mesh_clean"));
+        let refuse = at("deep_clean_data_root(env_val.as_deref(), dotenv.as_deref()).is_none()");
+        assert!(refuse < at("docker_access()"));
+        assert!(refuse < at("confirm_destructive("));
+        assert!(refuse < at("stop_self_heal_daemons("));
+    }
+
+    /// The wrapper and the script print the same refusal.
+    #[test]
+    fn the_script_and_the_wrapper_say_the_same_thing() {
+        assert!(include_str!("../../../scripts/noomesh-clean.sh").contains(DEEP_NO_DATA_ROOT));
+    }
+}
+
+#[cfg(test)]
+mod docker_gate_order_tests {
+    /// `noo stack clean`: the docker gate refuses (exit 1) before the
+    /// confirm and before the self-heal daemons are stopped, so its "nothing
+    /// was removed" is true (rc.2 matrix: offboard stopped them first).
+    #[test]
+    fn stack_clean_asks_docker_before_it_stops_anything() {
+        let own = crate::test_src::own_code(include_str!("mesh.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn mesh_clean(");
+        let gate = body.find("if let Err(why) = super::offboard::docker_access() {").expect("the gate");
+        let refuse = body[gate..].find("return Ok(1);").map(|i| i + gate).expect("it refuses");
+        let confirm = body.find("confirm_destructive(").expect("the confirm");
+        let stop = body.find("stop_self_heal_daemons(").expect("the daemon stop");
+        assert!(gate < refuse && refuse < confirm && confirm < stop, "{body}");
+    }
+
+    /// `noo stack reset`: the wrapper changes nothing before the script; the
+    /// script's first change is noomesh-clean.sh, whose own gate runs first
+    /// (tests/test_reset_changes_nothing_before_the_clean_gate.py).
+    #[test]
+    fn stack_reset_changes_nothing_before_the_script() {
+        let own = crate::test_src::own_code(include_str!("mesh.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn mesh_reset(");
+        for m in ["stop_self_heal_daemons(", "Command::new(\"docker\")", "remove_file(", "remove_dir_all("] {
+            assert!(!body.contains(m), "{m} in mesh_reset: {body}");
+        }
+        assert!(body.contains("run_script(g, \"noomesh-reset.sh\""), "{body}");
+    }
+}
+
+#[cfg(test)]
+mod netns_unit_clean_tests {
+    #[test]
+    fn a_full_clean_removes_the_namespace_restore_unit() {
+        let own = crate::test_src::own_code(include_str!("mesh.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn mesh_clean(");
+        let stop = body.find("stop_self_heal_daemons(").expect("the stop");
+        let rm = body.find("crate::netns_unit::remove(false)").expect("the clean removes the unit");
+        assert!(stop < rm, "{body}");
     }
 }

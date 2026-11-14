@@ -749,6 +749,46 @@ esac
 [ -f "$WORK/files/agent-unit" ] && { unit_payload_ok "$WORK/files/agent-unit" agent-unit || exit 65; }
 [ -f "$WORK/files/harness-unit" ] && { unit_payload_ok "$WORK/files/harness-unit" harness-unit || exit 65; }
 
+# The systemd floor for the harness's credentials (finding 116, i637 follow-up).
+# The unit loads the CA and the harness pair with LoadCredential=, which
+# systemd added in 247. An older systemd ignores those lines with a warning,
+# the env still names /run/credentials/noo-harness.service/, the harness finds
+# nothing there and stops, and Restart=always brings it back every 30 s,
+# forever. Installing that pair is a known loop, so on such a node:
+#   * the harness-unit is REFUSED: the installed unit stays as it is;
+#   * the harness-env still applies (its model, gateway, NATS lines stay
+#     current), but its three NOO_TLS_* lines go back to the files the
+#     pre-credentials harness read (harness_env_off_credentials);
+#   * everything else in the bundle applies, the harness pair included.
+# The refusal rides the `applied:` line as HARNESS_SYSTEMD_REFUSED_TAG<N>
+# (cluster_verify.rs reads it from the apply report) and the journal.
+# Only a version READ as a number is judged: no systemctl, or one that does
+# not say, keeps the bundle as it is.
+HARNESS_SYSTEMD_FLOOR=247
+HARNESS_SYSTEMD_REFUSED_TAG="harness-unit=REFUSED-systemd"
+HARNESS_REFUSED=""
+# harness_env_off_credentials FILE — rewrite the NOO_TLS_* lines that name
+# the harness's credentials directory to the /etc/noo/pki files the unit
+# without LoadCredential= reads. Other lines are untouched.
+harness_env_off_credentials() {
+    sed -i \
+        -e 's#^NOO_TLS_CA=/run/credentials/noo-harness\.service/ca\.crt$#NOO_TLS_CA=/etc/noo/pki/ca.crt#' \
+        -e 's#^NOO_TLS_CERT=/run/credentials/noo-harness\.service/node\.crt$#NOO_TLS_CERT=/etc/noo/pki/harness/node.crt#' \
+        -e 's#^NOO_TLS_KEY=/run/credentials/noo-harness\.service/node\.key$#NOO_TLS_KEY=/etc/noo/pki/harness/node.key#' \
+        "$1"
+}
+if [ -f "$WORK/files/harness-unit" ] && grep -q '^LoadCredential=' "$WORK/files/harness-unit"; then
+    _sdv="$(systemctl --version 2>/dev/null | awk 'NR == 1 && $1 == "systemd" {print $2}')"
+    _sdv="${_sdv%%[!0-9]*}"
+    if [ -n "$_sdv" ] && [ "$_sdv" -lt "$HARNESS_SYSTEMD_FLOOR" ]; then
+        echo "noo-apply: REFUSED harness-unit — systemd $_sdv is older than $HARNESS_SYSTEMD_FLOOR and cannot load the harness's credentials (LoadCredential=); the installed harness unit stays, everything else applies" >&2
+        logger -t noo-apply "REFUSED harness-unit: systemd $_sdv < $HARNESS_SYSTEMD_FLOOR (LoadCredential=)" 2>/dev/null || true
+        rm -f "$WORK/files/harness-unit"
+        [ -f "$WORK/files/harness-env" ] && harness_env_off_credentials "$WORK/files/harness-env"
+        HARNESS_REFUSED=" $HARNESS_SYSTEMD_REFUSED_TAG$_sdv"
+    fi
+fi
+
 # NODE_ID resolution order matters (found live 2026-08-18): the BUNDLE's
 # agent-env is authoritative — it carries the operator-adopted name, which
 # may differ from the hostname. On a FIRST install /etc/noo-node-agent.env
@@ -770,9 +810,345 @@ NODE_ID="${NODE_ID:-$(hostname)}"
 
 if [ "$VERIFY_ONLY" = 1 ]; then
     echo "verified-by: $SIG_VIA"
+    [ -n "$HARNESS_REFUSED" ] && echo "verify-only: refused:$HARNESS_REFUSED"
     echo "verify-only: every check passed; nothing installed"
     exit 0
 fi
+
+# BEGIN harness_egress
+# Enforcement step 1: the noo-harness unit, and every vendor CLI it launches
+# (they run in its cgroup and mount namespace), reach only local and tailnet
+# addresses and cannot look up an internet name (docs/security/telemetry.md).
+# Rendered here, as root, on every apply:
+#   /etc/noo/harness-net/{resolv.conf,hosts,nsswitch.conf}  what the unit sees
+#   .../noo-harness.service.d/50-noomesh-egress.conf        the drop-in
+# resolv.conf names 192.0.2.53 (TEST-NET-1, never in the allowlist): under
+# IPAddressDeny a query dies at once with EPERM and sends no packet. Never a
+# 127.x address: a host may run a resolver there, which would leak. The hosts
+# file carries ONLY the names the harness needs (the hosts of
+# NOO_GATEWAY_URL and NATS_URL), resolved HERE. A name that does not resolve
+# is left out and tagged harness-egress=UNRESOLVED:<name>; there is no
+# fallback to a real resolver, so a stale or missing entry fails to connect,
+# loudly, rather than leaking. The probe says whether this systemd really
+# enforces the deny; it never refuses the unit (the node agent gates the
+# kinds that need it). Every path below is overridable so the block's tests
+# run unprivileged.
+HE_NET_DIR="${HE_NET_DIR:-/etc/noo/harness-net}"
+HE_DROPIN_DIR="${HE_DROPIN_DIR:-/etc/systemd/system/noo-harness.service.d}"
+HE_DROPIN="$HE_DROPIN_DIR/50-noomesh-egress.conf"
+HE_UNIT="${HE_UNIT:-/etc/systemd/system/noo-harness.service}"
+HE_ENV="${HE_ENV:-/etc/noo-harness.env}"
+HE_NSSWITCH_SRC="${HE_NSSWITCH_SRC:-/etc/nsswitch.conf}"
+HE_OWNER_ARGS="${HE_OWNER_ARGS--o root -g root}"   # empty in tests (not root)
+HE_STAT_OWNER="${HE_STAT_OWNER-root:root}"
+HE_RESOLVER_ADDR="192.0.2.53"
+# Explicit prefixes, never the symbolic `localhost`/`any`: a unit file takes
+# them, but `systemd-run -p` rejects them ("Failed to parse IP address prefix:
+# localhost", real systemd 249 and 255), and the pre-check must pass the
+# drop-in's exact lines.
+HE_BASE_ALLOW="127.0.0.1/32 ::1/128 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fe80::/10 100.64.0.0/10 fd7a:115c:a1e0::/48"
+HE_CHANGED=0
+HE_UNRESOLVED=""
+HE_ULA_ALLOWED=0
+
+# he_write FILE MODE SRC — install only when bytes, mode or owner differ
+# (config_unchanged); sets HE_CHANGED=1 when it wrote.
+he_same() {
+    if [ -n "$HE_STAT_OWNER" ]; then
+        config_unchanged "$3" "$1" "$2" "$HE_STAT_OWNER"
+    else
+        [ -f "$1" ] && cmp -s "$3" "$1"
+    fi
+}
+he_write() {
+    he_same "$1" "$2" "$3" && return 0
+    # shellcheck disable=SC2086
+    install -m "$2" $HE_OWNER_ARGS "$3" "$1"
+    HE_CHANGED=1
+    return 0
+}
+
+# he_props DIR ALLOW — the unit properties of the hold, one per line, with the
+# bind sources under DIR. The drop-in and the pre-check both print them from
+# here, so what is tested is what is installed.
+# he_resolv_target — the file a resolver actually reads for /etc/resolv.conf.
+# On Ubuntu it is a symlink into /run/systemd/resolve/ (stub-resolv.conf);
+# binding over the link name did not reach readers on real systemd 249/255
+# (glibc found no resolv.conf and fell back to 127.0.0.1:53), so the hold
+# binds over the link's target. A dangling link or a regular file: itself.
+he_resolv_target() {
+    _he_rp="${HE_RESOLV_PATH:-/etc/resolv.conf}"
+    if [ -L "$_he_rp" ] && _he_rt="$(readlink -f "$_he_rp")" && [ -f "$_he_rt" ]; then
+        printf '%s\n' "$_he_rt"
+    else
+        printf '%s\n' "$_he_rp"
+    fi
+}
+
+he_props() {
+    printf '%s\n' "IPAddressDeny=0.0.0.0/0 ::/0" "IPAddressAllow=$2" \
+        "BindReadOnlyPaths=$1/resolv.conf:$(he_resolv_target)" \
+        "BindReadOnlyPaths=$1/hosts:/etc/hosts" \
+        "BindReadOnlyPaths=$1/nsswitch.conf:/etc/nsswitch.conf" \
+        "InaccessiblePaths=-/run/systemd/resolve/io.systemd.Resolve -/run/systemd/resolve/io.systemd.Resolve.Monitor -/run/nscd -/var/run/nscd -/run/dbus/system_bus_socket -/var/run/dbus/system_bus_socket"
+}
+
+# he_targets — "host port" per controller URL in the harness env (the same two
+# variables he_names reads). Port defaults: https 443, http 80, NATS 4222.
+he_targets() {
+    [ -f "$HE_ENV" ] || return 0
+    for _he_var in NOO_GATEWAY_URL NATS_URL; do
+        _he_val="$(sed -n "s/^$_he_var=//p" "$HE_ENV" | tail -1 | tr -d "\"'" | tr ',' ' ')"
+        for _he_u in $_he_val; do
+            _he_sch="${_he_u%%://*}"; [ "$_he_sch" = "$_he_u" ] && _he_sch=""
+            _he_hp="${_he_u#*://}"; _he_hp="${_he_hp%%[/?]*}"; _he_hp="${_he_hp##*@}"
+            case "$_he_hp" in ""|\[*) continue ;; esac
+            _he_h="$_he_hp"; _he_pt=""
+            case "$_he_hp" in *:*) _he_h="${_he_hp%:*}"; _he_pt="${_he_hp##*:}" ;; esac
+            case "$_he_pt" in ""|*[!0-9]*)
+                _he_pt=4222
+                if [ "$_he_var" = NOO_GATEWAY_URL ]; then
+                    case "$_he_sch" in http) _he_pt=80 ;; *) _he_pt=443 ;; esac
+                fi ;;
+            esac
+            printf '%s %s\n' "$_he_h" "$_he_pt"
+        done
+    done | LC_ALL=C sort -u
+}
+
+# The pre-check, run INSIDE a transient unit with the hold's own properties:
+# every controller name resolves through getent and its port accepts a TCP
+# connection within 5 s. One line per target: "ok NAME PORT" / "FAIL NAME PORT WHY".
+HE_CHECK='rc=0
+while [ $# -ge 2 ]; do
+    n=$1; p=$2; shift 2
+    if ! getent hosts "$n" >/dev/null 2>&1; then echo "FAIL $n $p lookup"; rc=1; continue; fi
+    if timeout 5 bash -c "exec 3<>/dev/tcp/\$0/\$1" "$n" "$p" 2>/dev/null; then echo "ok $n $p"; else echo "FAIL $n $p connect"; rc=1; fi
+done
+exit $rc'
+
+# he_precheck STAGE_DIR ALLOW — prints nothing on success; on failure prints
+# the tag suffix (selfcheck-NAME-PORT or selfcheck-unavailable) and fails.
+he_precheck() {
+    _he_tg="$(he_targets)"
+    [ -n "$_he_tg" ] || return 0
+    command -v systemd-run >/dev/null 2>&1 || { echo "selfcheck-unavailable"; return 1; }
+    _he_stage="$1"; _he_al="$2"
+    set --
+    while IFS= read -r _he_l; do set -- "$@" -p "$_he_l"; done < <(he_props "$_he_stage" "$_he_al")
+    # shellcheck disable=SC2086
+    # The check runs from a FILE in the stage, never as a `bash -c` argument:
+    # systemd-run expands %-specifiers in its command line, and since v254
+    # $VAR / ${VAR} too, which would rewrite the script before bash sees it.
+    # The stage is under /run (not /tmp): DynamicUser= implies PrivateTmp=, so
+    # the transient unit could not see a /tmp stage.
+    printf '%s\n' "$HE_CHECK" > "$_he_stage/check.sh"; chmod 0644 "$_he_stage/check.sh"
+    _he_o="$(timeout 30 systemd-run --wait --pipe --quiet --collect -p DynamicUser=yes "$@" /bin/bash "$_he_stage/check.sh" $_he_tg 2>&1)" || true
+    _he_f="$(printf '%s\n' "$_he_o" | awk '$1 == "FAIL" {print $2 "-" $3; exit}')"
+    if [ -n "$_he_f" ]; then echo "selfcheck-$_he_f"; return 1; fi
+    # Every target must have said ok: silence or noise is "unavailable", never a pass.
+    if [ "$(printf '%s\n' "$_he_o" | grep -c '^ok ')" != "$(printf '%s\n' "$_he_tg" | grep -c .)" ]; then
+        # Say what systemd-run said, so the cause is never hidden (its output is
+        # the targets and systemd's own errors; nothing secret).
+        echo "noo-apply: harness-egress: pre-check output: $(printf '%s' "$_he_o" | head -5 | tr -c '[:print:]\n' ' ' | tr '\n' '|' | cut -c1-400)" >&2
+        echo "selfcheck-unavailable"; return 1
+    fi
+    return 0
+}
+
+# he_names — the hosts of NOO_GATEWAY_URL and NATS_URL in the harness env,
+# one per line: scheme, userinfo, port and path stripped, comma lists split;
+# literal IPs and localhost skipped.
+he_names() {
+    [ -f "$HE_ENV" ] || return 0
+    sed -n -e 's/^NOO_GATEWAY_URL=//p' -e 's/^NATS_URL=//p' "$HE_ENV" | tr -d "\"'" | tr ',' '\n' \
+        | sed -e 's#^[A-Za-z][A-Za-z0-9+.-]*://##' -e 's#[/?].*$##' -e 's#^.*@##' -e 's#:[0-9]*$##' \
+        | while IFS= read -r _n; do
+            case "$_n" in
+                ""|localhost|\[*|*:*) continue ;;
+            esac
+            printf '%s\n' "$_n" | grep -qE '^[0-9]+(\.[0-9]+){3}$' && continue
+            printf '%s\n' "$_n" | grep -qE '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$' || continue
+            printf '%s\n' "$_n"
+        done | LC_ALL=C sort -u
+}
+
+# he_v4_int A.B.C.D — the address as an integer; nothing (and failure) if malformed.
+he_v4_int() {
+    _he_o="$(printf '%s' "$1" | awk -F. 'NF == 4 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ && $1 < 256 && $2 < 256 && $3 < 256 && $4 < 256 {print (($1 * 256 + $2) * 256 + $3) * 256 + $4}')"
+    [ -n "$_he_o" ] || return 1
+    printf '%s\n' "$_he_o"
+}
+
+# he_covered ADDR — success when ADDR is already inside the base allowlist
+# (loopback included; fc00::/7 when HE_ULA_ALLOWED=1). IPv4-mapped IPv6
+# (::ffff:a.b.c.d, which glibc's `getent ahosts` prints for IPv4) is judged
+# as the IPv4 address.
+he_covered() {
+    _he_a="${1#::ffff:}"
+    case "$_he_a" in
+        *:*)
+            _he_l="$(printf '%s' "$_he_a" | tr 'A-F' 'a-f')"
+            case "$_he_l" in
+                ::1|fe[89ab]*:*|fd7a:115c:a1e0:*) return 0 ;;
+                fc*:*|fd*:*) [ "$HE_ULA_ALLOWED" = 1 ] && return 0 ;;
+            esac
+            return 1 ;;
+    esac
+    _he_i="$(he_v4_int "$_he_a")" || return 1
+    # base:size — 127/8, 10/8, 172.16/12, 192.168/16, 169.254/16, 100.64/10
+    for _he_r in 2130706432:16777216 167772160:16777216 2886729728:1048576 3232235520:65536 2851995648:65536 1681915904:4194304; do
+        _he_b="${_he_r%:*}"; _he_s="${_he_r#*:}"
+        if [ "$_he_i" -ge "$_he_b" ] && [ "$_he_i" -lt $((_he_b + _he_s)) ]; then return 0; fi
+    done
+    return 1
+}
+
+# he_ula_on_host — success when this host has a global IPv6 address inside
+# fc00::/7 that is not the tailnet's own (fd7a:115c:a1e0::/48 is allowed
+# already; counting it would open all of fc00::/7 on every tailnet host).
+he_ula_on_host() {
+    ip -6 -o addr 2>/dev/null | awk '/scope global/ {for (i = 1; i <= NF; i++) if ($i == "inet6") print $(i + 1)}' \
+        | sed 's#/.*##' | tr 'A-F' 'a-f' | grep -E '^f[cd]' | grep -qv '^fd7a:115c:a1e0:'
+}
+
+# he_render_hosts NAMES_FILE OUT — the hosts file. Appends the addresses
+# outside the base allowlist to $HE_EXTRA and unresolvable names to HE_UNRESOLVED.
+he_render_hosts() {
+    _he_names="$(cat "$1")"
+    {
+        printf '# Rendered by noo-apply at %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf '# names: %s\n' "$(printf '%s' "$_he_names" | tr '\n' ' ' | sed 's/ *$//')"
+        printf '127.0.0.1 localhost\n::1 localhost\n'
+        printf '127.0.1.1 %s\n' "$(hostname 2>/dev/null || echo localhost)"
+        for _he_n in $_he_names; do
+            _he_addrs="$(getent ahosts "$_he_n" 2>/dev/null | awk '{print $1}' | sed 's/^::ffff:\([0-9.]*\)$/\1/' | LC_ALL=C sort -u)" || _he_addrs=""
+            if [ -z "$_he_addrs" ]; then
+                HE_UNRESOLVED="$HE_UNRESOLVED $_he_n"
+                continue
+            fi
+            for _he_ad in $_he_addrs; do
+                printf '%s %s\n' "$_he_ad" "$_he_n"
+                he_covered "$_he_ad" || printf '%s\n' "$_he_ad" >> "$HE_EXTRA"
+            done
+        done
+    } > "$2"
+}
+
+# he_probe — does this systemd really hold a unit off the network? A
+# transient unit with IPAddressDeny=any tries a TEST-NET-1 address: only
+# EPERM ("Operation not permitted") proves the kernel-side filter. Prints
+# the tag and nothing else. Absent, old, failing or timing out is
+# UNENFORCED:<reason>, never enforced.
+he_probe() {
+    command -v systemd-run >/dev/null 2>&1 || { printf '%s\n' " harness-egress=UNENFORCED:systemd-run-missing"; return 0; }
+    # The canary is 127.0.0.2:9: loopback (no packet ever leaves the host),
+    # outside the allowlist (only 127.0.0.1 of 127/8 is allowed), with nothing
+    # listening. Not enforced: the kernel answers RST at once ("Connection
+    # refused"). Enforced: the SYN is dropped, and TCP surfaces that as EPERM
+    # or, as on real systemd 249/255 (run 43255181333), a timeout. A TEST-NET
+    # target cannot tell the two apart (it times out either way). The argv has
+    # no $ or %: systemd-run would expand them.
+    _he_out="$(timeout 15 systemd-run --wait --pipe --quiet --collect -p 'IPAddressDeny=0.0.0.0/0 ::/0' -p 'IPAddressAllow=127.0.0.1/32 ::1/128' -p DynamicUser=yes \
+        /bin/bash -c 'if timeout 3 bash -c "exec 3<>/dev/tcp/127.0.0.2/9"; then echo CONNECTED; else echo NOTCONNECTED; fi' 2>&1)"
+    case "$_he_out" in
+        *"Connection refused"*)          printf '%s\n' " harness-egress=UNENFORCED:not-denied" ;;
+        *CONNECTED*) case "$_he_out" in
+            *NOTCONNECTED*)              printf '%s\n' " harness-egress=enforced" ;;
+            *)                           printf '%s\n' " harness-egress=UNENFORCED:connected" ;;
+        esac ;;
+        *)                               printf '%s\n' " harness-egress=UNENFORCED:probe-$(printf '%s' "$_he_out" | head -1 | tr -c 'A-Za-z0-9.-' '-' | cut -c1-40)" ;;
+    esac
+}
+
+# harness_egress_apply — render, then (when anything changed) daemon-reload and
+# ask for the harness restart through the existing need_harness_restart path.
+harness_egress_apply() {
+    HE_CHANGED=0; HE_UNRESOLVED=""
+    _he_tmp="$(mktemp -d "${HE_STAGE_PARENT:-/run}/noo-he-stage.XXXXXX")"; chmod 0755 "$_he_tmp"
+    HE_EXTRA="$_he_tmp/extra"; : > "$HE_EXTRA"
+
+    printf '%s\n' "# Rendered by noo-apply: the harness resolves nothing on the internet (docs/security/telemetry.md)." \
+        "nameserver $HE_RESOLVER_ADDR" "options timeout:1 attempts:1" > "$_he_tmp/resolv.conf"
+    if [ -f "$HE_NSSWITCH_SRC" ]; then
+        awk 'BEGIN{d=0} /^[[:space:]]*hosts:/ {if (!d) print "hosts: files"; d=1; next} {print} END{if (!d) print "hosts: files"}' \
+            "$HE_NSSWITCH_SRC" > "$_he_tmp/nsswitch.conf"
+    else
+        printf 'passwd: files\ngroup: files\nshadow: files\nhosts: files\n' > "$_he_tmp/nsswitch.conf"
+    fi
+    he_names > "$_he_tmp/names"
+    if he_ula_on_host; then HE_ULA_ALLOWED=1; else HE_ULA_ALLOWED=0; fi
+    he_render_hosts "$_he_tmp/names" "$_he_tmp/hosts"
+    # The timestamp line alone is not a change: keep the installed header.
+    if [ -f "$HE_NET_DIR/hosts" ] && [ "$(sed 1d "$_he_tmp/hosts")" = "$(sed 1d "$HE_NET_DIR/hosts")" ]; then
+        cp "$HE_NET_DIR/hosts" "$_he_tmp/hosts"
+    fi
+
+    _he_allow="$HE_BASE_ALLOW"
+    [ "$HE_ULA_ALLOWED" = 1 ] && _he_allow="$_he_allow fc00::/7"
+    while IFS= read -r _he_x; do
+        [ -n "$_he_x" ] || continue
+        case "$_he_x" in *:*) _he_allow="$_he_allow $_he_x/128" ;; *) _he_allow="$_he_allow $_he_x/32" ;; esac
+    done < "$HE_EXTRA"
+    # shellcheck disable=SC2086
+    _he_allow="$(printf '%s\n' $_he_allow | LC_ALL=C sort -u | tr '\n' ' ' | sed 's/ *$//')"
+    {
+        printf '%s\n' "# Rendered by noo-apply: the harness and every CLI it launches reach only local and tailnet" \
+            "# addresses and cannot resolve internet names (docs/security/telemetry.md)." \
+            "[Service]"
+        he_props "$HE_NET_DIR" "$_he_allow"
+        printf '%s\n' "RuntimeDirectory=noo-harness" "RuntimeDirectoryMode=0755"
+    } > "$_he_tmp/dropin"
+    # Staging copy of the three files, where the pre-check binds them from.
+    chmod 755 "$_he_tmp"
+    he_pending=0
+    he_same "$HE_NET_DIR/resolv.conf" 644 "$_he_tmp/resolv.conf" || he_pending=1
+    he_same "$HE_NET_DIR/hosts" 644 "$_he_tmp/hosts" || he_pending=1
+    he_same "$HE_NET_DIR/nsswitch.conf" 644 "$_he_tmp/nsswitch.conf" || he_pending=1
+    he_same "$HE_DROPIN" 644 "$_he_tmp/dropin" || he_pending=1
+    chmod 644 "$_he_tmp/resolv.conf" "$_he_tmp/hosts" "$_he_tmp/nsswitch.conf"
+    if [ "$he_pending" = 1 ]; then
+        if ! _he_why="$(he_precheck "$_he_tmp" "$_he_allow")"; then
+            _he_had=0
+            { [ -e "$HE_DROPIN" ] || [ -e "$HE_NET_DIR" ]; } && _he_had=1
+            harness_egress_remove
+            case "${_he_tmp:?}" in */noo-he-stage.??????) rm -rf -- "$_he_tmp" ;; esac
+            echo "noo-apply: harness-egress: the hold was NOT applied ($_he_why: a controller name did not resolve or its port did not answer under the hold); the harness runs unrestricted and codex placements are refused" >&2
+            if [ "$_he_had" = 1 ]; then need_harness_restart=1; applied="$applied harness-egress-files"; fi
+            applied="$applied harness-egress=UNENFORCED:$_he_why"
+            return 0
+        fi
+    fi
+
+    # shellcheck disable=SC2086
+    install -d -m 755 $HE_OWNER_ARGS "$HE_NET_DIR" "$HE_DROPIN_DIR"
+    he_write "$HE_NET_DIR/resolv.conf" 644 "$_he_tmp/resolv.conf"
+    he_write "$HE_NET_DIR/hosts" 644 "$_he_tmp/hosts"
+    he_write "$HE_NET_DIR/nsswitch.conf" 644 "$_he_tmp/nsswitch.conf"
+    he_write "$HE_DROPIN" 644 "$_he_tmp/dropin"
+    case "${_he_tmp:?}" in */noo-he-stage.??????) rm -rf -- "$_he_tmp" ;; esac
+    if [ "$HE_CHANGED" = 1 ]; then
+        systemctl daemon-reload 2>/dev/null || true
+        need_harness_restart=1
+        applied="$applied harness-egress-files"
+    fi
+    for _he_u in $HE_UNRESOLVED; do
+        echo "noo-apply: harness-egress: '$_he_u' does not resolve here; the harness hosts file omits it and the harness cannot reach it until it does" >&2
+        applied="$applied harness-egress=UNRESOLVED:$_he_u"
+    done
+    applied="$applied$(he_probe)"
+}
+
+# harness_egress_remove — teardown: the drop-in and the rendered directory.
+harness_egress_remove() {
+    rm -f -- "${HE_DROPIN:?}"
+    rmdir -- "${HE_DROPIN_DIR:?}" 2>/dev/null || true
+    # Exact target only: a directory named harness-net, never an empty or
+    # unexpected value (this runs as root).
+    case "${HE_NET_DIR:?}" in */harness-net) rm -rf -- "$HE_NET_DIR" ;; *) echo "noo-apply: harness-egress: refusing to remove '$HE_NET_DIR'" >&2 ;; esac
+    systemctl daemon-reload 2>/dev/null || true
+}
+# END harness_egress
 
 # ── teardown — the graceful, controller-initiated node destroy ─────────────
 # A signed `teardown` kind means "return this node to never-met-the-fleet".
@@ -803,6 +1179,7 @@ if [ -f "$WORK/files/teardown" ]; then
         echo "noo-apply: teardown requested but $DEENROLL is not installed" >&2
         exit 69
     fi
+    harness_egress_remove
     logger -t noo-apply "teardown authorized (node=$have) — dismantling in 5s, detached" 2>/dev/null || true
     echo "applied: teardown ($have) — node will dismantle itself in ~5s"
     # Finding #83: on the PULL lane this script runs inside noo-fetch.service
@@ -830,7 +1207,7 @@ fi
 # collected as we go, executed once at the end.
 install -d -m 750 -o root -g noo-agent "$PKI/nodes/$NODE_ID"
 
-applied=""
+applied="$HARNESS_REFUSED"
 binary_shas=""
 need_restart=0
 need_daemon_reload=0
@@ -1538,8 +1915,14 @@ fi
 # owned by them; no service restart involved.
 if [ -f "$WORK/files/cli-binary" ] && [ -s "$WORK/files/cli-user" ]; then
     CLI_USER="$(tr -d ' \n\r' < "$WORK/files/cli-user")"
+    # root is a valid cli-user: a node enrolled by root (a VPS, a root shell,
+    # the rehearsal's node2) installed its noo as root, in /root/.local/bin
+    # (install.sh's default for root). The "as the user" rule below exists so
+    # root never writes into a tree another account controls; for root that
+    # tree is root's own. Refusing root failed the whole bundle (exit 65) for
+    # every root-enrolled node since 0.6.0 (rc.3 rehearsal, A-pull.key).
     case "$CLI_USER" in
-        root|''|*[!a-z0-9_.-]*) echo "noo-apply: REFUSED — cli-user '$CLI_USER' is not an ordinary account name" >&2; exit 65 ;;
+        ''|*[!a-z0-9_.-]*) echo "noo-apply: REFUSED — cli-user '$CLI_USER' is not a valid account name" >&2; exit 65 ;;
     esac
     CLI_HOME="$(getent passwd "$CLI_USER" | cut -d: -f6)"
     case "$(head -c 20 "$WORK/files/cli-binary" | od -An -tx1 | tr -d ' \n')" in
@@ -1587,7 +1970,8 @@ fi
 # The controller's own bundle carries no CLI, so its tree is never touched.
 if [ -s "$WORK/files/cli-user" ]; then
     _rce_user="$(tr -d ' \n\r' < "$WORK/files/cli-user")"
-    case "$_rce_user" in root|''|*[!a-z0-9_.-]*) _rce_user="" ;; esac
+    # root included: its own ~/pai-assistant/.env is as stale as anyone's.
+    case "$_rce_user" in ''|*[!a-z0-9_.-]*) _rce_user="" ;; esac
     _rce_home=""
     [ -z "$_rce_user" ] || _rce_home="$(getent passwd "$_rce_user" | cut -d: -f6)"
     if [ -n "$_rce_home" ] && [ -d "$_rce_home" ]; then
@@ -1899,6 +2283,13 @@ if getent group noo-harness >/dev/null 2>&1; then
     done
 fi
 
+# harness-egress — the harness unit is held off the internet (see
+# harness_egress). Only where this bundle carries the harness's unit or env
+# and the unit is installed: a node without the harness gets nothing.
+if [ -f "$HE_UNIT" ] && { [ -f "$WORK/files/harness-unit" ] || [ -f "$WORK/files/harness-env" ]; }; then
+    harness_egress_apply
+fi
+
 # vendor-cli — see vendor_install: every slot the bundle carries. No
 # harness restart: the harness execs the CLI through its wrapper per turn,
 # and the agent's vendor-CLI check reads the PATH on each reconcile.
@@ -2011,5 +2402,41 @@ companion_restart() {
 case " $applied " in
     *" agent-binary "*) companion_restart ;;
 esac
+# BEGIN report_installed_binaries
+# A binary kind this bundle did NOT carry is still installed here: state its
+# sha too. The controller leaves a kind out of a bundle only when the node's
+# last report names its exact bytes (node_runs_asset), and only kinds handled
+# in THIS apply used to be reported, so a kind left out of bundle N went
+# unreported in report N and was carried again in bundle N+1: the skip
+# flip-flopped roll by roll. This is still the node's own statement of what
+# is installed; a kind this apply carried is already recorded and is not
+# restated. A missing file or a symlink states nothing (the next bundle then
+# carries the kind, as before).
+report_installed() {
+    case " $binary_shas " in *" $1="*) return 0 ;; esac
+    if [ -f "$2" ] && [ ! -L "$2" ]; then note_binary_sha "$1" "$2"; fi
+    return 0
+}
+report_installed agent-binary /usr/local/bin/noo-node-agent
+report_installed hostd-binary /usr/local/bin/noo-hostd
+report_installed harness-binary /usr/local/bin/noo-gateway
+# The CLI is the user's file: hashed AS that user, exactly as the CLI block
+# does (root must never follow a link the user planted), and only when the
+# bundle names the user.
+case " $binary_shas " in
+    *" cli-binary="*) ;;
+    *)
+        if [ -f "$WORK/files/cli-user" ]; then
+            _ri_u="$(tr -d ' \n\r' < "$WORK/files/cli-user")"
+            _ri_h=""
+            [ -z "$_ri_u" ] || _ri_h="$(getent passwd "$_ri_u" | cut -d: -f6)"
+            if [ -n "$_ri_h" ] && [ -d "$_ri_h" ]; then
+                _ri_s="$(runuser -u "$_ri_u" -- env HOME="$_ri_h" sh -c 'sha256sum "$HOME/.local/bin/noo" 2>/dev/null' | awk '{print $1}')" || _ri_s=""
+                [ -z "$_ri_s" ] || binary_shas="$binary_shas cli-binary=$_ri_s"
+            fi
+        fi
+        ;;
+esac
+# END report_installed_binaries
 # Last line of the apply, so the fetcher's tail of this log always carries it.
 [ -z "$binary_shas" ] || echo "binary-sha:$binary_shas"

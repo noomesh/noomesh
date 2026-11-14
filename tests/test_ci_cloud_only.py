@@ -54,12 +54,20 @@ def test_no_workflow_mentions_self_hosted_runners():
 
 
 def test_every_job_runs_on_a_github_hosted_image():
-    hosted = re.compile(r"^(ubuntu-(latest|2\d\.04)(-arm)?|macos-\d+|windows-latest)$")
+    hosted = re.compile(r"^(ubuntu-(latest|2\d\.04)(-arm)?|macos-\d+|windows-(latest|20\d\d))$")
     bad = []
     for p in WORKFLOWS:
         for name, job in (_doc(p).get("jobs") or {}).items():
             ro = job.get("runs-on")
-            if isinstance(ro, str) and "${{" in ro:
+            m = re.fullmatch(r"\$\{\{\s*matrix\.(\w+)\s*\}\}", ro) if isinstance(ro, str) else None
+            if m:
+                # `${{ matrix.<key> }}`: every value the matrix can give it
+                # must be a hosted image, and it must give one in every row.
+                mx = (job.get("strategy") or {}).get("matrix") or {}
+                rows = mx.get("include") or []
+                vals = [r.get(m.group(1)) for r in rows] + list(mx.get(m.group(1)) or [])
+                ok = bool(vals) and all(isinstance(v, str) and hosted.match(v) for v in vals)
+            elif isinstance(ro, str) and "${{" in ro:
                 # an expression is fine only if every quoted literal in it is hosted
                 # drop `== 'x'` comparisons (matrix kinds), keep the values the expression can yield
                 lits = re.findall(r"'([^']+)'", re.sub(r"==\s*'[^']*'", "", ro))

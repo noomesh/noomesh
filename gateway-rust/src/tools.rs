@@ -700,6 +700,9 @@ pub async fn execute_tool(
                     ))
                     .await;
                 }
+                crate::security::SecurityError::ApprovalUnreachable { tool, .. } => {
+                    crate::routes::communication::record_gated_failure(tool, "nobody could be asked to approve it");
+                }
                 crate::security::SecurityError::ApprovalTimeout { tool, secs, .. } => {
                     crate::routes::communication::record_gated_failure(
                         tool,
@@ -1338,7 +1341,14 @@ async fn native_inference_tool(state: &AppState, call: &ToolCall, args: &Value) 
             NodeChat::Serves(backend_type, model_name, base_url) => {
                 let model_used = if node_from_model { model_name } else { model.clone().unwrap_or(model_name) };
                 match inf::chat_completion_on_node(&backend_type, &model_used, &base_url, &prompt, inf::Sampling::default()).await {
-                    Ok(text) => return ok_result(call, text),
+                    Ok(inf::ChatAnswer::Text(text)) => return ok_result(call, text),
+                    // Answered with nothing: an error saying why, never an
+                    // empty success (120).
+                    Ok(inf::ChatAnswer::Empty { finish_reason, reasoning }) => return err_result(
+                        call,
+                        inf::empty_answer_body(finish_reason.as_deref(), reasoning.as_deref())["error"]
+                            .as_str().unwrap_or("the model returned an empty answer").to_string(),
+                    ),
                     Err(e) if strict && inf::backend_cannot_chat(&e) => return err_result(
                         call,
                         inf::no_chat_refusal(node_id, &[(backend_type.clone(), model_used.clone())], &[]),
@@ -1694,8 +1704,14 @@ pub(crate) mod agent_messaging {
             Ok(crate::agent_recipient::Recipient::Known) => None,
             Ok(crate::agent_recipient::Recipient::Unheld(candidates)) => Some(crate::agent_recipient::unheld_warning(&to, &candidates)),
             Ok(crate::agent_recipient::Recipient::Unknown(candidates)) => return err_result(call, crate::agent_recipient::refusal(&to, &candidates)),
+            Ok(crate::agent_recipient::Recipient::Retired(at, names)) => return err_result(call, crate::agent_recipient::retired_refusal(&to, &at, &names)),
             Err(e) => return err_result(call, format!("could not check the recipient '{to}', so nothing was sent: {e}")),
         };
+        match crate::agent_recipient::thread_reply_refusal(&state.db, &to, arg_str(args, THREAD_KEYS).as_deref()).await {
+            Ok(Some(why)) => return err_result(call, why),
+            Ok(None) => {}
+            Err(e) => return err_result(call, format!("could not check the thread for '{to}', so nothing was sent: {e}")),
+        }
         let body = match (args.get("body").filter(|b| b.is_object()), arg_str(args, &["text", "message"])) {
             (Some(b), _) => b.clone(),
             (None, Some(t)) => json!({ "text": t }),

@@ -44,7 +44,7 @@ self-contained paste:
 ```
 run AS YOUR USER on the node (one sudo prompt)
 step 1 — make sure the noo CLI is on the node (skip if `noo --version` already works):
-  command -v noo >/dev/null || curl -fsSL https://github.com/noomesh/noomesh/releases/latest/download/install.sh | sh
+  command -v noo >/dev/null || { curl -fsSL https://github.com/noomesh/noomesh/releases/latest/download/install.sh -o install.sh && sh install.sh; }
 step 2 — enroll (joins the tailnet, runs host prep, installs the agent):
   noo enroll noo1.<blob>
 bound to node: gpu-2. When the paste finishes: noo cluster provision gpu-2 --wait
@@ -502,8 +502,9 @@ cluster`, set it with `sops secrets/env.sops` and restart the stack
 ### Tear a node down
 
 ```sh
-noo cluster teardown-node gpu-2                    # dismantle the agent, keep data and tailnet membership
-noo cluster teardown-node gpu-2 --factory -y       # also purge data and leave the tailnet
+noo cluster teardown-node gpu-2 -y                 # dismantle the agent, log it out of Tailscale, delete its tailnet device record; keep its data
+noo cluster teardown-node gpu-2 --factory -y       # also purge its data and remove Tailscale (if noomesh installed it)
+noo cluster teardown-node gpu-2 -y --keep-tailnet-record   # keep the device record (the next enroll registers as gpu-2-1)
 ```
 
 The command confirms, stages a CA-signed `teardown` bundle on the pull
@@ -514,9 +515,12 @@ the node stops heartbeating
 (`gpu-2 stopped heartbeating: dismantle confirmed`). A node still
 heartbeating after that is reported loudly with the node-side recovery
 (`sudo noo-deenroll`). Finally it removes the node's certs and inventory
-line and, with `--purge-tailscale`/`--factory`, deletes the tailnet
-device. For a node that is already gone (hardware dead, never coming
-back), skip the bundle:
+line and deletes the node's tailnet device record: teardown is a full
+cleanup, the same with or without a terminal. `--keep-tailnet-record`
+keeps it. The record is never deleted for this box's own node (its
+tailnet identity is the controller's) or before the node has collected
+its teardown. For a node that is already gone (hardware dead, never
+coming back), skip the bundle:
 
 ```sh
 noo cluster forget gpu-2
@@ -812,7 +816,7 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 | Command | Arguments | What it does |
 |---|---|---|
 | `noo cluster status` | — | List nodes: tier, status, RUNNING backends, CAPABILITIES by role, CAN-RUN |
-| `noo cluster verify` | `[<node>...] [--controller] [--wait]` | Assert every invariant a node and the controller must meet; exit 1 with the remedy |
+| `noo cluster verify` | `[<node>...] [--controller] [--wait] [--timings]` | Assert every invariant a node and the controller must meet; exit 1 with the remedy |
 | `noo cluster invite` | — | Mint a tagged tailscale auth key and print the `noo enroll --via-tailnet <url>` line |
 | `noo cluster down` | `<backend> [--node <node>] [-y\|--yes]` | Stop a backend on one node or all nodes; destructive, asks for confirmation (-y) |
 | `noo cluster desired` | `<node>` | Alias of show: the node in full, with its desired config and every placement |
@@ -842,12 +846,13 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 | `noo cluster workloads place` | `<node> <addon>/<workload> [--profile <profile>] [--set <slot>=<id>@<rev>]... [--env <K=V>]... [--on-controller]` | Place an add-on's node workload on one node: image, model sets, env (operator) |
 | `noo cluster workloads show` | `<node> [<addon>/<workload>]` | Show the node workloads placed on a node, or one of them |
 | `noo cluster workloads unplace` | `<node> <addon>/<workload>` | Remove an add-on's node workload placement from a node (operator) |
+| `noo cluster workloads retry` | `<node> [<set-id>@<rev>]` | End a refused model-set backoff on a node; it fetches again at its next reconcile |
 | `noo cluster workloads` | — | List the workloads the installed add-ons declare (container, GPU need, drain route) |
 | `noo cluster profile` | `<node> [--set <key=value>]... [--clear <key>]... [--clear-all] [--bench]` | Show a node's harness profile with each value's source; set overrides; bench its model |
 | `noo cluster init-secret` | — | Generate and print a fresh random cluster secret locally (no gateway call) |
 | `noo cluster set-config` | `<node> [--usage shared\|dedicated\|default] [--harness auto\|manual\|off] [--loop-budget <n>\|default] [--data-root <path>] [--models-dir <path>] [--ip <ip>] [--tier <n>] [--gpu-model <model>] [--vram-gb <n>] [--min-battery <pct>] [--require-wifi <bool>] [--block-thermal <s,s>] [--policy-default] [--vendor-kinds <kind,kind>\|none]` | Update a node's stored config row with only the given fields |
 | `noo cluster clear-cooldowns` | — | Clear backend auto-start cooldown backoff on every node |
-| `noo cluster teardown-node` | `<node> \| --all [--purge-data] [--purge-tailscale] [--factory] [-y\|--yes]` | Dismantle one node or --all via a signed teardown bundle, verify silence, then forget |
+| `noo cluster teardown-node` | `<node> \| --all [--purge-data] [--purge-tailscale] [--factory] [--keep-tailnet-record] [-y\|--yes]` | Dismantle a node or --all, verify silence, forget it and delete its tailnet record |
 | `noo cluster provision` | `<node> [<tier>] [--harness auto\|manual\|off] [--wait [<secs>]] [--stage-only] [--move-data]` | Stage a node's signed bundle; --wait blocks until enrolled, --stage-only skips the apply |
 | `noo cluster sync-model-files` | `[<node>...] [-m\|--model <file>]... [--dry-run]` | Dispatch a job per node to pull GGUF weights from the controller store and verify them |
 | `noo cluster bootstrap-token create` | `[--ttl <1h\|30m\|24h\|secs>] [--role <role>] [--cidr <cidr>] [--node <name>] [--with-tailscale\|--no-tailscale] [--controller-approvals]` | Mint a single-use enrollment token and print the node enrollment one-liner |

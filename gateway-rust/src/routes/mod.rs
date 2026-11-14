@@ -20,6 +20,7 @@ mod agents;
 mod cli_piece;
 mod console_piece;
 pub(crate) mod artifacts;
+mod model_set_retry;
 mod node_workload_placements;
 mod bootstrap;
 pub(crate) use bootstrap::self_agent_base;
@@ -43,8 +44,10 @@ mod kiosk;
 mod reservations;
 pub(crate) mod knowledge;
 pub(crate) mod memory;
+mod conversation_import;
 mod monitoring;
 mod alert_intake;
+mod scrape_targets;
 mod grafana_ds;
 mod logs_ingest;
 mod traces_ingest;
@@ -391,6 +394,7 @@ pub(crate) fn core_router() -> Router<Arc<AppState>> {
         .merge(audit_read::router())
         .merge(monitoring::router())
         .merge(alert_intake::router())
+        .merge(scrape_targets::router())
         .merge(grafana_ds::router())
         .merge(users::router())
         .merge(agents::router())

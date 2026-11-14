@@ -64,6 +64,9 @@ type fakeProv struct {
 
 	onRemove func(name string) // called as a container is removed
 	listErr  error             // ListManaged fails with this
+	// unknownStart: StartContainer reports no start time, as a daemon that
+	// did not report one would (set before the start path runs).
+	unknownStart bool
 }
 
 func (f *fakeProv) ctr(name string) *ctrInfo {
@@ -108,9 +111,12 @@ func (f *fakeProv) StartContainer(_ context.Context, name string) error {
 		return errors.New("no such container")
 	}
 	c.Running, c.Status = true, "running"
-	if f.clock != nil {
+	switch {
+	case f.unknownStart:
+		c.StartedAt = time.Time{}
+	case f.clock != nil:
 		c.StartedAt = f.clock()
-	} else {
+	default:
 		c.StartedAt = time.Now()
 	}
 	return nil
@@ -215,9 +221,6 @@ func (f *fakeProv) NvidiaRuntime(context.Context) bool                  { return
 func (f *fakeProv) ListManaged(context.Context) ([]managedRef, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.listErr != nil {
-		return nil, f.listErr
-	}
 	byKey := map[string]*managedRef{}
 	for _, c := range f.ctrs {
 		if c.Labels[LabelManagedBy] != ManagedByAgent || c.Labels[LabelAddon] == "" {
@@ -237,7 +240,10 @@ func (f *fakeProv) ListManaged(context.Context) ([]managedRef, error) {
 	for _, r := range byKey {
 		out = append(out, *r)
 	}
-	return out, nil
+	// A failure comes with what was read before it, as a paged or partial
+	// listing can: the caller must act on neither (a failed list removes
+	// nothing), and only returning both lets a test see that it does not.
+	return out, f.listErr
 }
 
 func (f *fakeProv) mutated() bool {

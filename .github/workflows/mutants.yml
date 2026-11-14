@@ -1,0 +1,310 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+#
+# Mutant proofs in CI (operator decision 2026-11-10: mutants run here, in
+# parallel, and security mutants gate the FINAL tag, not the merge).
+#
+# A mutant is a branch whose ONE commit breaks a check on top of its fix (its
+# parent). Each mutant gets its own job: the PARENT is tested first in the same
+# lanes with the same filter, then the mutant in the same target dir (only the
+# changed crate recompiles). Verdicts, as ops/batch/noo-batch.sh prints them:
+#   red       a test failed on the mutant, the parent was green  -> job passes
+#   green     nothing failed: SURVIVED                           -> job fails
+#   error     it did not build, or no test ran: proves nothing   -> job fails
+#   base-red  the parent itself is not green: NO VERDICT         -> job fails
+# The run is green only when every mutant was caught.
+#
+# Lanes come from the mutant commit's own diff (noo-batch's crates_for: paths,
+# include_str!/include_bytes! inputs, crates/), or from the `lanes` input. The
+# setup is ci.yml's: the same pinned actions, the gateway's DSN-gated suites
+# against a catalogue replayed by scripts/migration-replay-check.sh (as
+# sqlx-drift), noo-cli through scripts/cargo-docker.sh (as noo-cli).
+#
+# The jobs run untrusted-shaped code, so: read-only token, checkout without
+# persisted credentials, NO secrets anywhere in this file, no environment, and
+# caches are RESTORED only (a mutant job never saves one, so it cannot poison
+# dev's). Postgres is the org's public GHCR mirror (ci.yml's one declared
+# expression), pulled anonymously: no credentials block.
+#
+# Inputs and matrix values reach scripts ONLY through `env:` and are validated
+# again by scripts/ci-mutants.py, which runs from THIS workflow's commit (a
+# sparse checkout), never from the mutant's tree. tests/test_mutants_workflow.py
+# holds the file to that.
+#
+# Dispatch from dev (so dev's caches restore):
+#   gh workflow run mutants.yml --ref dev -f mutants="wt/x-mutant-1 wt/x-mutant-2:some::test_name"
+#
+# OR PUSH the mutant branch (2026-11-11: a dispatched workflow is looked up on
+# the DEFAULT branch, main, so dispatch 404s until a promotion carries this
+# file there; a push runs the workflow from the pushed commit, which every
+# mutant cut from dev carries). A pushed branch must match
+# `wt/*-mut-*` or `wt/*-mutant-*`, and its head commit names the test(s) it
+# must turn red in a trailer, never free text:
+#
+#   MUTANT 3 (do not merge): the display check passes a stale console
+#
+#   Mutant-Test: commands::kiosk_seat::console_identity_tests::the_display_check_fails
+#
+# (one or more `Mutant-Test:` lines, each a filter or a comma list). A line may
+# name its lane, `Mutant-Test: gateway-rust: <filter>`: when every line names
+# one, only those lanes run, so a gateway file noo-cli include_str!s does not
+# drag in a noo-cli lane the filter cannot match (lanes: gateway-rust, noo-cli,
+# node-agent-go, python). A file under scripts/ reaches the python lane (its
+# tests are tests/*.py), and one the gateway also include_str!s reaches
+# gateway-rust too: a mutant of such a script MUST name its lane, or the lane
+# its filter cannot match runs no test and the job is base-red, no verdict.
+# No trailer, a named lane the mutant's diff does not
+# reach, or a lane that runs no test, is a FAILED job: a mutant that ran nothing
+# never reads as caught. On a push the planner, the judge and the summary come
+# from DEV, not the pushed commit, and a mutant commit that edits `.github/` or
+# scripts/ci-mutants.py is refused: a mutant cannot change its own judge.
+#
+# TODO: mutants sharing a parent each re-test it (6-8x per fix). A base job per
+# (parent, lanes) would save runner minutes but not wall time (a matrix job
+# cannot wait on one group's base, and each mutant job rebuilds the parent
+# anyway), so it is left out until minutes matter.
+name: mutants
+
+on:
+  push:
+    branches:
+    - 'wt/*-mut-*'
+    - 'wt/*-mutant-*'
+  workflow_dispatch:
+    inputs:
+      mutants:
+        description: "Space-separated mutant branches, each optionally branch:filter[,filter…]"
+        required: true
+        type: string
+      lanes:
+        description: "Optional lane override for every mutant: any of gateway-rust noo-cli node-agent-go python"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+# A push: one group per mutant branch, a re-push replaces the run in progress.
+# A dispatch: its own run, never cancelled.
+concurrency:
+  group: ${{ github.event_name == 'push' && format('mutants-{0}', github.ref) || format('mutants-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+    steps:
+    # The planner from DEV on a push (never the pushed mutant's own copy).
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      with:
+        ref: ${{ github.event_name == 'push' && 'refs/heads/dev' || github.sha }}
+        persist-credentials: false
+        fetch-depth: 1
+    - name: Plan (validate every branch and filter, resolve parents and lanes)
+      id: plan
+      env:
+        MUTANTS: ${{ inputs.mutants }}
+        LANES: ${{ inputs.lanes }}
+        PUSH_REF: ${{ github.event_name == 'push' && github.ref_name || '' }}
+      run: python3 scripts/ci-mutants.py plan
+
+  mutant:
+    needs: plan
+    name: ${{ matrix.branch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    services:
+      postgres:
+        image: ${{ vars.HUB_MIRROR_OFF != '' && vars.HUB_MIRROR_OFF != '0' && vars.HUB_MIRROR_OFF != 'false' && 'pgvector/pgvector:pg18' || format('ghcr.io/{0}/pgvector:pg18', github.repository_owner) }}
+        env:
+          POSTGRES_USER: noo
+          POSTGRES_PASSWORD: noo
+          POSTGRES_DB: noomesh
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    env:
+      BRANCH: ${{ matrix.branch }}
+      SHA: ${{ matrix.sha }}
+      PARENT: ${{ matrix.parent }}
+      LANES: ${{ matrix.lanes }}
+      FILTERS: ${{ matrix.filters }}
+      ADDON_MANIFEST: ${{ matrix.addon_manifest }}
+      RESULT_DIR: ${{ github.workspace }}/.mutant-results
+      HARNESS: ${{ github.workspace }}/.mutant-harness/scripts/ci-mutants.py
+      # ci.yml's literal non-secrets for the migration chain's roles.
+      DATABASE_URL: postgresql://noo:noo@localhost:5432/noomesh
+      NOO_APP_DB_PASSWORD: ci-ephemeral-not-a-secret
+      NOO_EVOLVE_DB_PASSWORD: ci-ephemeral-not-a-secret
+      NOO_TRELLION_DB_PASSWORD: ci-ephemeral-not-a-secret
+    steps:
+    # The subject at the workspace root, so the cache paths match ci.yml's.
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      with:
+        ref: ${{ matrix.sha }}
+        fetch-depth: 2
+        persist-credentials: false
+    # The harness from THIS workflow's commit (dev, on a push): a mutant cannot
+    # edit its judge.
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      with:
+        ref: ${{ github.event_name == 'push' && 'refs/heads/dev' || github.sha }}
+        path: .mutant-harness
+        sparse-checkout: scripts/ci-mutants.py
+        sparse-checkout-cone-mode: false
+        persist-credentials: false
+    - name: Go to the parent
+      run: |
+        git -c advice.detachedHead=false checkout --quiet "$PARENT"
+        test "$(git rev-parse HEAD)" = "$PARENT"
+        git log -1 --format='parent %h %s'
+
+    - name: Free hosted-runner disk
+      if: runner.environment == 'github-hosted' && (contains(matrix.lanes, 'gateway-rust') || contains(matrix.lanes, 'noo-cli'))
+      continue-on-error: true
+      run: |
+        big="/usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL"
+        sudo -n rm -rf $big || echo "::notice::could not free hosted-runner disk; continuing"
+        df -h /
+
+    # Python: the python lane, and the gateway's catalogue replay.
+    - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+      if: contains(matrix.lanes, 'gateway-rust') || contains(matrix.lanes, 'python')
+      with:
+        python-version-file: .python-version
+    - name: Restore pip cache
+      if: contains(matrix.lanes, 'gateway-rust') || contains(matrix.lanes, 'python')
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-py${{ hashFiles('.python-version') }}-pipcore-${{ hashFiles('**/pyproject.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-py${{ hashFiles('.python-version') }}-pipcore-
+    - name: Install noomesh
+      if: contains(matrix.lanes, 'gateway-rust') || contains(matrix.lanes, 'python')
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[trellion,dev,web,cache,db,mcp]"
+    - name: Sandbox prerequisites (bubblewrap)
+      if: contains(matrix.lanes, 'python')
+      timeout-minutes: 6
+      run: |
+        if ! command -v bwrap >/dev/null && sudo -n true 2>/dev/null; then
+          sudo timeout 150 apt-get -o DPkg::Lock::Timeout=60 -y -qq install --no-install-recommends bubblewrap \
+            || { sudo apt-get -qq update && sudo apt-get -y -qq install --no-install-recommends bubblewrap; } || true
+        fi
+        [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null)" != "1" ] || sudo -n sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+    - name: Replay migrations (the catalogue the DSN-gated suites read)
+      if: contains(matrix.lanes, 'gateway-rust')
+      run: bash scripts/migration-replay-check.sh 'postgresql+psycopg://noo:noo@localhost:5432/noomesh'
+
+    # gateway-rust: host cargo, as sqlx-drift (the DSN suites need the service).
+    - name: Rust toolchain id (gateway, host cargo)
+      id: rustc-host
+      if: contains(matrix.lanes, 'gateway-rust')
+      run: echo "id=$(rustc -V | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+    - name: Restore gateway cargo cache (sqlx-drift's)
+      if: contains(matrix.lanes, 'gateway-rust')
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          ~/.cargo/bin
+          gateway-rust/target
+        key: ${{ runner.os }}-cargo-sqlxdrift-rustc${{ steps.rustc-host.outputs.id }}-${{ hashFiles('gateway-rust/Cargo.lock') }}-${{ hashFiles('gateway-rust/src/**', 'gateway-rust/.sqlx/**', 'gateway-rust/Cargo.toml', 'gateway-rust/build.rs', 'crates/addon-manifest/**') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-sqlxdrift-rustc${{ steps.rustc-host.outputs.id }}-${{ hashFiles('gateway-rust/Cargo.lock') }}-
+          ${{ runner.os }}-cargo-sqlxdrift-rustc${{ steps.rustc-host.outputs.id }}-
+
+    # noo-cli: scripts/cargo-docker.sh in the mirrored rust image, as ci.yml.
+    - name: Rust image from the mirror (noo-cli)
+      if: contains(matrix.lanes, 'noo-cli')
+      env:
+        HUB_MIRROR: ${{ vars.HUB_MIRROR }}
+      run: |
+        mkdir -p "$RUNNER_TEMP/.docker"; echo "DOCKER_CONFIG=$RUNNER_TEMP/.docker" >> "$GITHUB_ENV"
+        ref="$(python3 scripts/hub-mirror.py ref library/rust:1-bookworm)" || ref=""
+        [ -n "$ref" ] || { echo "::warning::no mirror image: rust:1-bookworm from Docker Hub"; ref=docker.io/library/rust:1-bookworm; }
+        echo "CARGO_DOCKER_IMAGE=$ref" >> "$GITHUB_ENV"
+    - name: Rust toolchain id (noo-cli image)
+      id: rustc-cli
+      if: contains(matrix.lanes, 'noo-cli')
+      run: echo "id=$(docker run --rm "$CARGO_DOCKER_IMAGE" rustc -V | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+    - name: Restore noo-cli cargo cache
+      if: contains(matrix.lanes, 'noo-cli')
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          noo-cli/target
+        key: ${{ runner.os }}-cargo-paicli-rustc${{ steps.rustc-cli.outputs.id }}-${{ hashFiles('noo-cli/Cargo.lock') }}-${{ hashFiles('noo-cli/src/**', 'noo-cli/Cargo.toml', 'noo-cli/build.rs', 'crates/addon-manifest/**') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-paicli-rustc${{ steps.rustc-cli.outputs.id }}-${{ hashFiles('noo-cli/Cargo.lock') }}-
+          ${{ runner.os }}-cargo-paicli-rustc${{ steps.rustc-cli.outputs.id }}-
+
+    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e   # v7.0.0
+      if: contains(matrix.lanes, 'node-agent-go')
+      with:
+        go-version-file: node-agent-go/go.mod
+        # setup-go SAVES a cache by default; a mutant run only reads (11-11).
+        cache: false
+
+    - name: Test the PARENT (must be green, else no verdict)
+      id: base
+      run: python3 "$HARNESS" run base
+    - name: Go to the mutant
+      if: steps.base.outputs.green == 'true'
+      run: |
+        git -c advice.detachedHead=false checkout --quiet "$SHA"
+        test "$(git rev-parse HEAD)" = "$SHA"
+        git log -1 --format='mutant %h %s'
+    - name: Test the MUTANT
+      if: steps.base.outputs.green == 'true'
+      run: python3 "$HARNESS" run mutant
+    - name: Verdict (passes only when the mutant was caught)
+      if: always()
+      run: python3 "$HARNESS" judge
+    - name: Upload the verdict
+      if: always()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+      with:
+        name: mutant-${{ strategy.job-index }}
+        path: .mutant-results/
+        # upload-artifact skips dot-directories unless told (v4.4+): without
+        # this every verdict was dropped and the summary read "no result".
+        include-hidden-files: true
+        retention-days: 14
+        if-no-files-found: error
+
+  summary:
+    needs: [plan, mutant]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      with:
+        ref: ${{ github.event_name == 'push' && 'refs/heads/dev' || github.sha }}
+        persist-credentials: false
+        sparse-checkout: scripts/ci-mutants.py
+        sparse-checkout-cone-mode: false
+    - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      with:
+        pattern: mutant-*
+        path: results
+    - name: All mutants caught?
+      env:
+        EXPECTED: ${{ needs.plan.outputs.count }}
+      run: python3 scripts/ci-mutants.py summary results

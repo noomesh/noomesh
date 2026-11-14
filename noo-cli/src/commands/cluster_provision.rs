@@ -1153,6 +1153,28 @@ pub fn cluster_bootstrap_token_usage(g: &Globals, _args: &[String]) -> Result<i3
 /// the old repo after a release move, reporting success.
 fn install_repo() -> String { super::upgrade::repo() }
 
+/// Download THEN run, from a private directory (2026-11-12). `curl … | sh`
+/// exits 0 when the download fails (sh reads an empty script), so a node
+/// owner saw a curl error and then "noo: not found". `mktemp -d` makes a
+/// fresh 0700 directory, the script is removed afterwards whatever happened,
+/// and the line's status is the installer's (or curl's). The install line
+/// carries no credential: the token is in the separate `noo enroll` line.
+/// `fetch` writes the script to stdout; `env` (may be empty) is prefixed to
+/// the `sh` that runs it.
+pub(crate) fn fetch_then_run(fetch: &str, env: &str) -> String {
+    let env = if env.is_empty() { String::new() } else { format!("{env} ") };
+    format!("{{ d=\"$(mktemp -d)\" && {fetch} > \"$d/install.sh\" && {env}sh \"$d/install.sh\"; r=$?; rm -rf \"$d\"; [ \"$r\" = 0 ]; }}")
+}
+
+/// The public, signed install line for a node (byte-identical to the
+/// gateway's `compose_install_command`).
+pub(crate) fn public_install_line(repo: &str) -> String {
+    format!(
+        "command -v noo >/dev/null || {}",
+        fetch_then_run(&format!("curl -fsSL https://raw.githubusercontent.com/{repo}/main/noo-cli/install.sh"), "")
+    )
+}
+
 /// Why the tailnet key could not be minted, and what fixes it. The 400
 /// "invalid or not permitted" body blames the ACL, but with converged
 /// tagOwners the ACTUAL cause is the OAuth client's own grant (created before
@@ -1213,7 +1235,10 @@ fn print_enroll_paste(p: &EnrollPaste) {
     say(&format!("  {}", ui::muted("Linux and Apple Silicon. Offline fleet? serve it from this controller instead —")));
     say(&format!("  {}", ui::muted("copy the controller's CA to the node first (scp /etc/noo/pki/ca.crt), then:")));
     let noo_url = p.noo_url;
-    say(&format!("  {}", ui::muted(&format!("curl -fsSL --cacert ca.crt {noo_url}/bootstrap/cli/install.sh | NOO_CLI_BASE_URL={noo_url}/bootstrap/cli NOO_CLI_CACERT=$PWD/ca.crt sh"))));
+    say(&format!("  {}", ui::muted(&fetch_then_run(
+        &format!("curl -fsSL --cacert ca.crt {noo_url}/bootstrap/cli/install.sh"),
+        &format!("NOO_CLI_BASE_URL={noo_url}/bootstrap/cli NOO_CLI_CACERT=$PWD/ca.crt"),
+    ))));
     say("");
     say(&ui::status_line(Glyph::Step, if p.self_node {
         "step 2 — enroll (runs host prep, installs the agent; this device stays tag:controller):"
@@ -1481,10 +1506,7 @@ pub fn cluster_bootstrap_token_create(g: &Globals, args: &[String]) -> Result<i3
                     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob.to_string())
                 };
                 clear_stale_for(resp["node_name"].as_str());
-                let install = format!(
-                    "command -v noo >/dev/null || curl -fsSL https://raw.githubusercontent.com/{}/main/noo-cli/install.sh | sh",
-                    install_repo()
-                );
+                let install = public_install_line(&install_repo());
                 print_enroll_paste(&EnrollPaste {
                     install: &install,
                     enroll: &enroll_line(&format!("noo enroll noo1.{encoded}"), controller_approvals),
@@ -1667,6 +1689,19 @@ pub fn cluster_bootstrap_token_revoke(g: &Globals, args: &[String]) -> Result<i3
 #[cfg(test)]
 mod bootstrap_token_tests {
     use super::parse_ttl_seconds;
+
+    #[test]
+    fn the_node_install_line_downloads_then_runs_and_matches_the_gateways() {
+        // Byte-identical to gateway-rust's compose_install_command (its test
+        // pins the same literal); behaviour: tests/test_node_install_line.py.
+        assert_eq!(
+            super::public_install_line("org/repo"),
+            "command -v noo >/dev/null || \u{7b} d=\"$(mktemp -d)\" && curl -fsSL https://raw.githubusercontent.com/org/repo/main/noo-cli/install.sh > \"$d/install.sh\" && sh \"$d/install.sh\"; r=$?; rm -rf \"$d\"; [ \"$r\" = 0 ]; \u{7d}"
+        );
+        let mirror = super::fetch_then_run("curl -fsSL --cacert ca.crt https://c:8080/bootstrap/cli/install.sh", "NOO_CLI_BASE_URL=x");
+        assert!(mirror.contains("> \"$d/install.sh\" && NOO_CLI_BASE_URL=x sh \"$d/install.sh\""), "{mirror}");
+        assert!(!mirror.contains("| sh") && !mirror.contains("|sh"), "{mirror}");
+    }
 
     #[test]
     fn ttl_parses_units_and_bare_seconds() {

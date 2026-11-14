@@ -38,11 +38,12 @@ pub(crate) mod env;
 pub(crate) mod event;
 pub(crate) mod google_chat;
 pub(crate) mod prompt;
-mod sandbox_apparmor;
+pub(crate) mod sandbox_apparmor;
 pub(crate) mod sh;
 pub(crate) mod standalone;
 pub(crate) mod steps;
 mod tui;
+pub(crate) mod upfront;
 pub(crate) mod util;
 pub(crate) mod web;
 mod yamlcfg;
@@ -154,10 +155,15 @@ pub(crate) struct Skip {
     /// is the only backend. `env` (plaintext `.env`) is RETIRED and refused
     /// at parse time ([`secrets_backend_flag`]).
     pub secrets_backend: String,
-    /// `--only a,b,c` (finding #40): run ONLY the named sections on a
-    /// reconfigure — everything else is a no-touch skip. Section names:
-    /// prereqs, env, secrets, tailscale, enrollment, storage, services,
-    /// model, channels. Empty = the full sequence, as ever.
+    /// `--min-free-gb <n>` — the free-space floor of the up-front check
+    /// (upfront.rs), for an owner who knows their box needs less or more.
+    /// None = the stated default ([`upfront::need_gb`]).
+    pub min_free_gb: Option<u64>,
+    /// `--only a,b,c` (finding #40): run ONLY the named sections, also on a
+    /// configured host (a targeted re-run: [`rerun_guard_applies`]) —
+    /// everything else is a no-touch skip. Section names: prereqs, env,
+    /// secrets, tailscale, enrollment, storage, services, model, channels,
+    /// addons. Empty = the full sequence, as ever.
     pub only: Vec<String>,
 }
 
@@ -676,6 +682,13 @@ pub fn onboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             "--skip-channels" => skip.channels = true,
             "--mcp-door" => skip.mcp_door = Some(true),
             "--no-mcp-door" => skip.mcp_door = Some(false),
+            "--min-free-gb" => match it.next().and_then(|v| v.trim().parse::<u64>().ok()) {
+                Some(n) => skip.min_free_gb = Some(n),
+                None => {
+                    crate::ui::failed("--min-free-gb needs a whole number of GB, e.g. --min-free-gb 20", None);
+                    return Ok(2);
+                }
+            },
             "--secrets-backend" => match secrets_backend_flag(it.next().map(String::as_str)) {
                 Ok(v) => skip.secrets_backend = v,
                 Err(code) => return Ok(code),
@@ -960,6 +973,29 @@ fn abort_failed(ctx: &mut Ctx, step: &'static str, reason: &str) {
     ctx.state.aborted = Some(Abort::Failed { step, reason: reason.to_string() });
 }
 
+/// The sections an explicit `--only` re-runs on a configured host WITHOUT
+/// `--reconfigure`: none of them overwrites a setting the operator made with
+/// no confirmation. `model` writes the default model, which is what it is
+/// asked to do, and keeps an existing chat placement; `prereqs` only probes
+/// (installs need a TTY); `channels` is skipped under --ci and asks on a TTY.
+/// The rest re-apply things an operator may have changed (env: CLUSTER_MODE,
+/// NODE_TIER, LOKI/OLLAMA URLs; services: the hardened posture over gates
+/// opened by hand; tailscale: NODE_IP, gateway_url; addons: a licensed add-on
+/// turned off; secrets, enrollment, storage: credentials, certificates, the
+/// data root), so they keep the guard and its `--reconfigure`.
+pub(crate) const RERUN_SAFE: [&str; 3] = ["prereqs", "model", "channels"];
+
+/// Whether the idempotent-install guard answers this run ("already
+/// onboarded" on a configured host). Not for a fresh host, not with
+/// `--reconfigure`, and not for an explicit `--only` of RERUN_SAFE sections:
+/// `noo onboard --only model` is the remedy verify, onboard's own closing
+/// line and the README hand a single-box stranger, and on exactly that box it
+/// used to do nothing and exit 0 (rc.2 install matrix, 22.04 cell).
+pub(crate) fn rerun_guard_applies(reconfigure: bool, only: &[String], configured: bool) -> bool {
+    let targeted_safe = !only.is_empty() && only.iter().all(|s| RERUN_SAFE.contains(&s.as_str()));
+    !reconfigure && configured && !targeted_safe
+}
+
 /// The full onboard flow behind any frontend: idempotent-install guard,
 /// dry-run banner, all steps, final summary. Output/prompts route through
 /// `ctx.ui` / `ctx.asker`. Returns the process exit code.
@@ -967,10 +1003,24 @@ pub(crate) fn drive(ctx: &mut Ctx, reconfigure: bool) -> i32 {
     // ── Idempotent-install guard ─────────────────────────────────────────
     // A bare re-run on a configured host must NOT blindly rewrite .env or
     // bounce services. Detect the existing install and default to "no".
-    if !reconfigure && is_configured(ctx) {
+    // An explicit `--only <sections>` is a targeted re-run, not a bare one
+    // (rerun_guard_applies).
+    if rerun_guard_applies(reconfigure, &ctx.skip.only, is_configured(ctx)) {
         ctx.raw("This machine appears to be already onboarded:");
         for line in detected_summary(ctx) {
             ctx.raw(&format!("  {line}"));
+        }
+        if ctx.non_interactive && !ctx.skip.only.is_empty() {
+            // An explicit `--only` of a section that re-applies settings is
+            // never "nothing to do" (that exit 0 was a silent success): say
+            // what it needs.
+            ctx.raw("");
+            ctx.error(&format!(
+                "--only {} on a configured host re-applies settings it may overwrite; nothing was run",
+                ctx.skip.only.join(",")));
+            ctx.raw(&format!("  To run it: noo onboard --reconfigure --only {}", ctx.skip.only.join(",")));
+            ctx.raw(&format!("  (re-run without --reconfigure: {})", RERUN_SAFE.join(", ")));
+            return 1;
         }
         if ctx.non_interactive {
             // "Configured" reads .env + secrets only; the stack can still be
@@ -1199,6 +1249,14 @@ fn run_all(ctx: &mut Ctx) {
         ctx.skip.only.is_empty() || ctx.skip.only.iter().any(|o| o == name)
     };
 
+    // Up front, before anything is installed, pulled or asked (install
+    // matrix, 2026-11-12): a machine that cannot be a controller, or has too
+    // little disk for one, is told so now instead of after the pulls.
+    if only_wants("prereqs", ctx) && !upfront::check(ctx) {
+        abort_failed(ctx, "platform", "this machine cannot run the controller (see above)");
+        return;
+    }
+
     ctx.step(1, TOTAL, STEP_TITLES[0]);
     let prereqs_ok = if only_wants("prereqs", ctx) { steps::prerequisites(ctx) } else {
         ctx.info("Skipped (--only)."); true
@@ -1282,6 +1340,9 @@ fn run_all(ctx: &mut Ctx) {
         // The at-rest decision from the storage step, now that there is a
         // gateway to record it in.
         steps::at_rest_record(ctx);
+        // Containers that join another's network namespace come back after
+        // every dockerd start, not only when dockerd starts them in order.
+        steps::install_netns_restore_unit(ctx);
     }
     ctx.pause(7, TOTAL);
 
@@ -1322,6 +1383,19 @@ fn run_all(ctx: &mut Ctx) {
     ctx.pause(10, TOTAL);
 }
 
+/// The keys onboarding mints only against a running gateway: each
+/// per-consumer service key it must hold (`provision_service_keys`).
+fn stack_minted_keys() -> Vec<String> {
+    let addon_on = |name: &str| {
+        crate::commands::addons::effective(name)
+            .unwrap_or_else(|| crate::commands::addons::row(name).map(|r| r.default_on).unwrap_or(false))
+    };
+    crate::commands::cluster_verify::required_service_keys(&addon_on)
+        .iter()
+        .filter_map(|(name, _)| crate::commands::secrets::provision_targets(name).map(|t| t.secret_key))
+        .collect()
+}
+
 fn print_final_summary(ctx: &Ctx) {
     const TOTAL: u8 = 11;
     ctx.step(11, TOTAL, STEP_TITLES[10]);
@@ -1330,7 +1404,16 @@ fn print_final_summary(ctx: &Ctx) {
     // later by eye. Its own output goes to stdout; the verdict goes through
     // the wizard's channel so every frontend shows it.
     if !ctx.dry_run && ctx.sops_active() {
-        match crate::commands::secrets::secrets_audit(ctx.g, &[]) {
+        // The stack never started this run: the service keys onboarding mints
+        // against a running gateway are absent BECAUSE of that, so they are
+        // not reported as a second ERROR to fix (rc.1 install matrix: every
+        // amd64 cell showed NOO_SVC_KEY_WORKER as an ERROR after the
+        // noo-data failure).
+        let stack_minted = if ctx.state.services_started { Vec::new() } else { stack_minted_keys() };
+        if !stack_minted.is_empty() {
+            ctx.warn("services did not start — that is the one thing to fix; service keys are minted when the stack starts");
+        }
+        match crate::commands::secrets::secrets_audit_stack_down(ctx.g, &stack_minted) {
             Ok(0) => ctx.success("secrets audit: no errors (nothing encrypted is also in plaintext)"),
             // The audit has several ERROR kinds (a plaintext credential, a
             // required key absent, …); name none of them here — the table
@@ -1355,7 +1438,10 @@ fn print_final_summary(ctx: &Ctx) {
             None => ctx.warn("could not read the security posture listing — check it with: noo security posture list"),
             Some(pending) if !pending.is_empty() => {
                 ctx.progress(&format!("Restarting the gateway so the posture takes effect ({})...", pending.join(", ")));
-                let code = sh::run_script_streamed(ctx, "noomesh-restart.sh", &["--force", "gateway"]);
+                // The services step's launch already printed the noo-data
+                // binding warning; an explicit argument (never an env var)
+                // tells the relaunch not to say it twice.
+                let code = sh::run_script_streamed(ctx, "noomesh-restart.sh", &["--force", "gateway", "--data-warning-shown"]);
                 // https always — the gateway has no plaintext listener.
                 let health = "https://localhost:8080/health".to_string();
                 if code == 0 && sh::wait_for_http(ctx, &health, 120) {
@@ -1370,12 +1456,22 @@ fn print_final_summary(ctx: &Ctx) {
     // An install is not done until it verifies: the same
     // invariants `noo cluster verify --controller` asserts, printed here so
     // the last thing the operator reads is what still needs doing.
+    // The closing `cluster verify` did not pass (or could not run): the
+    // welcome is withheld and the last line says what still needs doing
+    // (i677 #13: "You're all set" printed under "2 problems need you").
+    let mut closing_verify_failed = false;
     if !ctx.dry_run {
         let args: Vec<String> = FINAL_VERIFY_ARGS.iter().map(|a| a.to_string()).collect();
         match crate::commands::cluster_verify(ctx.g, &args) {
             Ok(0) => ctx.success("cluster verify: every controller invariant holds"),
-            Ok(_) => ctx.warn("cluster verify: an invariant does not hold — the remedy is beside each failing row above"),
-            Err(_) => ctx.warn("cluster verify could not run — noo cluster verify --controller"),
+            Ok(_) => {
+                closing_verify_failed = true;
+                ctx.warn("cluster verify: an invariant does not hold — the remedy is beside each failing row above");
+            }
+            Err(_) => {
+                closing_verify_failed = true;
+                ctx.warn("cluster verify could not run — noo cluster verify --controller");
+            }
         }
     }
     if !ctx.skip.only.is_empty() {
@@ -1467,17 +1563,56 @@ fn print_final_summary(ctx: &Ctx) {
             ctx.raw(&format!("    {line}"));
         }
     }
-    if welcome_due(ctx.dry_run, ctx.state.interrupted, &Outcome::of(&ctx.state)) {
+    // i677 #10: this wizard installed Docker and relaunched itself with the
+    // new group. The shell the user returns to does not have it: `noo`
+    // commands bridge that themselves, `docker` does not.
+    if let Some(line) = docker_group_closing_line(std::env::var_os(crate::docker_group::RELAUNCHED_ENV).is_some()) {
+        ctx.warn(line);
+    }
+    // The LAST line is the verdict: the welcome only when nothing failed,
+    // else what still needs doing (i677 #13).
+    if welcome_due(ctx.dry_run, ctx.state.interrupted, &Outcome::of(&ctx.state), closing_verify_failed) {
         ctx.raw("");
         ctx.info("You're all set. Welcome to Noomesh!");
+    } else if !ctx.dry_run && !ctx.state.interrupted && closing_verify_failed {
+        ctx.raw("");
+        // No chat model this run (skipped, no fit, offline): the one command
+        // that picks, pulls and places one, the same remedy verify's
+        // `default chat` row gives (i677 #12).
+        ctx.warn(closing_not_done_line(ctx.state.model_pulled.is_empty()));
     }
+}
+
+/// The last line when the closing verify did not pass. Pure.
+pub(crate) fn closing_not_done_line(no_model_pulled: bool) -> &'static str {
+    if no_model_pulled { NO_CHAT_MODEL_YET } else { CLOSING_VERIFY_NOT_DONE }
+}
+
+/// The one command for "no chat model": the same text verify's `default chat` remedy uses.
+pub(crate) const FIRST_MODEL_CMD: &str = "noo onboard --only model";
+
+/// The last line when no chat model was pulled and the closing verify failed.
+pub(crate) const NO_CHAT_MODEL_YET: &str =
+    "No chat model yet, so chat has nothing to answer with. Pick, pull and place one: noo onboard --only model";
+
+/// The last line when the closing verify did not pass.
+pub(crate) const CLOSING_VERIFY_NOT_DONE: &str =
+    "Not done yet: cluster verify found problems (each with its remedy, above). After fixing them: noo cluster verify --controller";
+
+/// The closing line when this run installed Docker (it relaunched itself
+/// through the new docker group). Pure.
+pub(crate) fn docker_group_closing_line(relaunched_for_docker: bool) -> Option<&'static str> {
+    relaunched_for_docker.then_some(
+        "Docker was installed in this session: `noo` commands work from this terminal; \
+         for `docker` itself open a new terminal (or run `newgrp docker`)",
+    )
 }
 
 /// The welcome line is for a run that completed. A hard failure puts the
 /// "did NOT complete" block below the summary; "You're all set" above it
 /// read as success to anyone who stopped at the first line (i276).
-fn welcome_due(dry_run: bool, interrupted: bool, outcome: &Outcome) -> bool {
-    !dry_run && !interrupted && outcome.closing_failures().is_empty()
+fn welcome_due(dry_run: bool, interrupted: bool, outcome: &Outcome, closing_verify_failed: bool) -> bool {
+    !dry_run && !interrupted && !closing_verify_failed && outcome.closing_failures().is_empty()
 }
 
 /// `Key: value` lines → `Key    value` with the labels padded to the
@@ -1628,10 +1763,38 @@ mod welcome_tests {
 
     #[test]
     fn welcome_is_withheld_when_the_verdict_has_a_hard_failure() {
-        assert!(welcome_due(false, false, &Outcome::Completed));
-        assert!(!welcome_due(false, false, &Outcome::Failed(vec!["storage: x".into()])));
-        assert!(!welcome_due(true, false, &Outcome::Completed));
-        assert!(!welcome_due(false, true, &Outcome::Completed));
+        assert!(welcome_due(false, false, &Outcome::Completed, false));
+        assert!(!welcome_due(false, false, &Outcome::Failed(vec!["storage: x".into()]), false));
+        assert!(!welcome_due(true, false, &Outcome::Completed, false));
+        assert!(!welcome_due(false, true, &Outcome::Completed, false));
+    }
+
+    /// i677 #13 (matrix runs 1-4): "You're all set. Welcome to Noomesh!"
+    /// printed right under "x 2 problems need you: online, default chat".
+    /// A failed (or unrun) closing verify withholds it, and the last line
+    /// says what still needs doing.
+    #[test]
+    fn welcome_is_withheld_when_the_closing_verify_failed() {
+        assert!(!welcome_due(false, false, &Outcome::Completed, true));
+        let code = crate::test_src::own_code(include_str!("mod.rs"));
+        let tail = &code[code
+            .find("if welcome_due(ctx.dry_run, ctx.state.interrupted, &Outcome::of(&ctx.state), closing_verify_failed) {")
+            .expect("the verdict block")..];
+        let welcome = tail.find("You're all set. Welcome to Noomesh!").expect("welcome");
+        let not_done = tail.find("ctx.warn(closing_not_done_line(ctx.state.model_pulled.is_empty()));").expect("the not-done line");
+        assert!(welcome < not_done);
+        let set = code.matches("closing_verify_failed = true;").count();
+        assert_eq!(set, 2, "set on a failed verify and on one that could not run");
+        // Both arms, by name: a verify that FAILED, and one that could not RUN.
+        let verdict = &code[code.find("match crate::commands::cluster_verify(ctx.g, &args) {").expect("the closing verify")..];
+        let failed = verdict.find("Ok(_) => {\n                closing_verify_failed = true;").expect("a failed verify withholds it");
+        let unrun = verdict.find("Err(_) => {\n                closing_verify_failed = true;").expect("an unrun verify withholds it");
+        assert!(failed < unrun);
+        assert!(super::CLOSING_VERIFY_NOT_DONE.contains("noo cluster verify --controller"));
+        // i677 #12: no model pulled -> the one command, the same one verify names.
+        assert_eq!(super::closing_not_done_line(true), super::NO_CHAT_MODEL_YET);
+        assert_eq!(super::closing_not_done_line(false), super::CLOSING_VERIFY_NOT_DONE);
+        assert!(super::NO_CHAT_MODEL_YET.ends_with(super::FIRST_MODEL_CMD));
     }
 }
 
@@ -1695,6 +1858,15 @@ mod summary_tests {
 #[cfg(test)]
 mod posture_tests {
     use super::{pending_restart_keys, posture_pending_restart, POSTURE_LIST_KEY};
+
+    /// rc.4 rehearsal B-reonboard: the launcher's "noo-data is NOT bound"
+    /// warning printed twice in one onboard (services, then this relaunch).
+    #[test]
+    fn the_posture_relaunch_tells_the_launcher_the_data_warning_was_given() {
+        let own = crate::test_src::own_code(include_str!("mod.rs"));
+        let body = crate::test_src::fn_body(&own, "fn print_final_summary(");
+        assert!(body.contains(r#"sh::run_script_streamed(ctx, "noomesh-restart.sh", &["--force", "gateway", "--data-warning-shown"])"#), "{body}");
+    }
     use std::io::{Read, Write};
 
     /// The listing as `posture_list` builds it: one gate whose DB row the
@@ -1872,5 +2044,74 @@ mod at_rest_tests {
         let c = crate::commands::at_rest::ONBOARD_PROMPT;
         assert!(c.starts_with("Encrypt your data, keys and secrets on disk, unlocked only on this machine?"));
         assert!(c.ends_with("(recommended)"));
+    }
+}
+
+#[cfg(test)]
+mod rerun_guard_tests {
+    use super::{rerun_guard_applies, RERUN_SAFE};
+
+    fn only(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// `--only model` on a configured, running host runs the model step: it
+    /// is never answered "nothing to do" (--ci) or "Reconfigure?" (TTY).
+    #[test]
+    fn an_explicit_only_model_is_a_targeted_rerun() {
+        assert!(!rerun_guard_applies(false, &only(&["model"]), true), "--only model on a configured host must run");
+        assert!(!rerun_guard_applies(false, &only(&["prereqs", "channels"]), true));
+        assert!(RERUN_SAFE.contains(&"model"));
+    }
+
+    /// No section that overwrites operator settings unattended skips the
+    /// guard, alone or mixed with a safe one; bare and fresh as ever.
+    #[test]
+    fn sections_that_reapply_settings_keep_the_guard() {
+        for s in ["env", "secrets", "tailscale", "enrollment", "storage", "services", "addons"] {
+            assert!(!RERUN_SAFE.contains(&s), "{s}");
+            assert!(rerun_guard_applies(false, &only(&[s]), true), "{s}");
+            assert!(rerun_guard_applies(false, &only(&["model", s]), true), "model,{s}");
+            assert!(!rerun_guard_applies(true, &only(&[s]), true), "--reconfigure --only {s} runs as ever");
+        }
+        assert!(rerun_guard_applies(false, &[], true), "a bare re-run on a configured host is still guarded");
+        assert!(!rerun_guard_applies(true, &[], true));
+        assert!(!rerun_guard_applies(false, &[], false), "a fresh host walks everything");
+    }
+
+    /// drive asks the tested guard, and under --ci an explicit `--only` the
+    /// guard answers is a refusal (exit 1) that names --reconfigure, never
+    /// "nothing to do".
+    #[test]
+    fn drive_asks_the_tested_guard_and_never_says_nothing_to_do_to_an_only() {
+        let own = crate::test_src::own_code(include_str!("mod.rs"));
+        let body = crate::test_src::fn_body(&own, "pub(crate) fn drive(");
+        assert!(body.contains("if rerun_guard_applies(reconfigure, &ctx.skip.only, is_configured(ctx)) {"), "{body}");
+        let refuse = body.find("if ctx.non_interactive && !ctx.skip.only.is_empty() {").expect("the --only refusal");
+        let nothing = body.find("nothing to do.").expect("the bare re-run line");
+        assert!(refuse < nothing, "{body}");
+        assert!(body[refuse..nothing].contains("return 1;") && body[refuse..nothing].contains("noo onboard --reconfigure --only"), "{body}");
+    }
+}
+
+#[cfg(test)]
+mod summary_audit_tests {
+    /// The worker's service key is one of the keys onboarding mints at stack
+    /// start (so a stack-down summary defers it).
+    #[test]
+    fn the_worker_key_is_minted_at_stack_start() {
+        assert!(super::stack_minted_keys().iter().any(|k| k == "NOO_SVC_KEY_WORKER"), "{:?}", super::stack_minted_keys());
+    }
+
+    /// The summary defers only when the stack did NOT start this run, and
+    /// says the services failure is the one thing to fix.
+    #[test]
+    fn the_summary_defers_only_when_services_never_started() {
+        let own = crate::test_src::own_code(include_str!("mod.rs"));
+        let body = crate::test_src::fn_body(&own, "fn print_final_summary(");
+        assert!(body.contains("let stack_minted = if ctx.state.services_started { Vec::new() } else { stack_minted_keys() };"),
+            "the deferral is not tied to the stack never starting");
+        assert!(body.contains("secrets_audit_stack_down(ctx.g, &stack_minted)"), "the summary audit does not defer");
+        assert!(body.contains("that is the one thing to fix"), "the summary does not point at the services failure");
     }
 }

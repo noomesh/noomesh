@@ -391,7 +391,15 @@ where
     let tap = UsageTap { ctx, scanner: FrameScanner::default(), trace };
     inner.scan(tap, |tap, item| {
         if let Ok(chunk) = &item {
-            tap.scanner.observe(chunk);
+            let seen = tap.scanner.observe(chunk);
+            if let Some(rec) = tap.trace.as_deref() {
+                if seen.queue_end {
+                    crate::request_trace::note_queue_end(rec);
+                }
+                if seen.first_token {
+                    crate::request_trace::note_first_token(rec);
+                }
+            }
         }
         futures::future::ready(Some(item))
     })
@@ -404,10 +412,55 @@ struct FrameScanner {
     /// A frame can be split across chunks; keep the unterminated tail.
     carry: String,
     last: Option<(u32, u32)>,
+    /// The node agent's `: queued…` comments were seen.
+    queued: bool,
+    /// The queue ended (a line other than `: queued…` followed them).
+    queue_ended: bool,
+    /// A frame carrying content was seen (time to first token is stamped once).
+    first_token: bool,
+}
+
+/// What a chunk told the tap, for the request's trace.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Seen {
+    /// The queue ended in this chunk.
+    queue_end: bool,
+    /// The first content frame arrived in this chunk.
+    first_token: bool,
+}
+
+/// Does this frame's payload (after `data:`, or a bare NDJSON line) carry
+/// content the caller sees: text, reasoning or a tool call? A role-only delta
+/// (vLLM's opening chunk), a usage-only frame and `[DONE]` do not; nor does
+/// anything that is not JSON. Time to first token is the first frame that
+/// does, never the gateway's metadata frame (sent outside this tap) or the
+/// node agent's `: queued` / `: keep-alive` comments.
+fn carries_content(payload: &str) -> bool {
+    if !payload.starts_with('{') {
+        return false;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(payload) else { return false };
+    let text = |x: Option<&Value>| x.and_then(Value::as_str).is_some_and(|s| !s.is_empty());
+    let list = |x: Option<&Value>| x.and_then(Value::as_array).is_some_and(|a| !a.is_empty());
+    if let Some(choices) = v.get("choices").and_then(Value::as_array) {
+        return choices.iter().any(|c| {
+            let d = c.get("delta").or_else(|| c.get("message"));
+            text(c.get("text"))
+                || d.is_some_and(|d| {
+                    text(d.get("content")) || text(d.get("reasoning_content")) || text(d.get("reasoning")) || list(d.get("tool_calls"))
+                })
+        });
+    }
+    // ollama NDJSON: {"message": {"content", "thinking", "tool_calls"}} / {"response"}
+    if let Some(m) = v.get("message") {
+        return text(m.get("content")) || text(m.get("thinking")) || list(m.get("tool_calls"));
+    }
+    text(v.get("response"))
 }
 
 impl FrameScanner {
-    fn observe(&mut self, chunk: &[u8]) {
+    fn observe(&mut self, chunk: &[u8]) -> Seen {
+        let mut seen = Seen::default();
         self.carry.push_str(&String::from_utf8_lossy(chunk));
         // Scan complete lines; keep the trailing partial one for next time.
         let complete_upto = self.carry.rfind('\n').map(|i| i + 1).unwrap_or(0);
@@ -415,12 +468,39 @@ impl FrameScanner {
             if let Some(u) = last_usage_in_text(&self.carry[..complete_upto]) {
                 self.last = Some(u);
             }
+            if !self.first_token {
+                for line in self.carry[..complete_upto].lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with("event:") || line.starts_with("id:") || line.starts_with("retry:") {
+                        continue;
+                    }
+                    if line.starts_with(": queued") {
+                        self.queued = true;
+                        continue;
+                    }
+                    // Anything else after the queue comments ends the queue.
+                    if self.queued && !self.queue_ended {
+                        self.queue_ended = true;
+                        seen.queue_end = true;
+                    }
+                    if line.starts_with(':') {
+                        continue; // `: keep-alive` and other comments
+                    }
+                    let payload = line.strip_prefix("data:").map(str::trim).unwrap_or(line);
+                    if payload != "[DONE]" && carries_content(payload) {
+                        self.first_token = true;
+                        seen.first_token = true;
+                        break;
+                    }
+                }
+            }
             self.carry.drain(..complete_upto);
         }
         // Bound the carry: a usage frame is small, a runaway line is not ours.
         if self.carry.len() > 64 * 1024 {
             self.carry.clear();
         }
+        seen
     }
 
     /// The final line often has no trailing newline.
@@ -700,5 +780,85 @@ mod tests {
         sc.observe(b"{\"done\":true,\"prompt_eval_count\":1,\"eval_count\":2}");
         assert_eq!(sc.last, None);
         assert_eq!(sc.finish(), Some((1, 2)));
+    }
+}
+
+/// Time to first token and queue wait (speed review 2026-11-11): stamped at
+/// the first upstream frame that carries content, never at the first byte.
+/// The first bytes of a queued stream are the node agent's `: queued` and
+/// `: keep-alive` comments (admission.go), and a first-byte TTFT would read
+/// ~0 for exactly the streams that never got a token.
+#[cfg(test)]
+mod first_token_tests {
+    use super::*;
+
+    const ROLE: &str = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n";
+    const HI: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n";
+
+    #[test]
+    fn a_queued_stream_stamps_the_queue_end_then_the_first_content_frame() {
+        let mut sc = FrameScanner::default();
+        assert_eq!(sc.observe(b": queued ahead=1\n\n"), Seen::default());
+        assert_eq!(sc.observe(b": queued\n\n"), Seen::default(), "still queued");
+        assert_eq!(sc.observe(b": keep-alive\n\n"), Seen { queue_end: true, first_token: false }, "a slot: prefill begins");
+        assert_eq!(sc.observe(ROLE.as_bytes()), Seen::default(), "a role-only delta is not a token");
+        assert_eq!(sc.observe(HI.as_bytes()), Seen { queue_end: false, first_token: true });
+        assert_eq!(sc.observe(HI.as_bytes()), Seen::default(), "stamped once");
+    }
+
+    /// The 191 empty paiserve streams: only comments, then the caller hung up.
+    #[test]
+    fn comments_only_never_stamp_a_first_token() {
+        let mut sc = FrameScanner::default();
+        for c in [": queued ahead=3\n\n", ": queued\n\n", ": queued\n\n"] {
+            assert_eq!(sc.observe(c.as_bytes()), Seen::default());
+        }
+        assert!(!sc.first_token && !sc.queue_ended, "TTFT stays null; the queue never ended");
+    }
+
+    #[test]
+    fn done_and_usage_frames_are_not_tokens() {
+        let mut sc = FrameScanner::default();
+        assert_eq!(sc.observe(b"data: [DONE]\n"), Seen::default());
+        assert_eq!(sc.observe(b"data: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":0}}\n"), Seen::default());
+        assert!(!sc.first_token);
+    }
+
+    #[test]
+    fn a_stream_that_never_queued_has_no_queue_end() {
+        let mut sc = FrameScanner::default();
+        assert_eq!(sc.observe(HI.as_bytes()), Seen { queue_end: false, first_token: true });
+    }
+
+    #[test]
+    fn a_content_frame_split_across_chunks_is_found_when_it_completes() {
+        let mut sc = FrameScanner::default();
+        assert_eq!(sc.observe(b"data: {\"choices\":[{\"delta\":{\"content\":\"H"), Seen::default());
+        assert_eq!(sc.observe(b"i\"}}]}\n"), Seen { queue_end: false, first_token: true });
+    }
+
+    #[test]
+    fn reasoning_tool_calls_and_ollama_lines_count_as_content() {
+        for frame in [
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Let me\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0}]}}]}\n",
+            "data: {\"choices\":[{\"text\":\"x\"}]}\n",
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"x\"},\"done\":false}\n",
+            "{\"message\":{\"thinking\":\"hmm\"},\"done\":false}\n",
+        ] {
+            let mut sc = FrameScanner::default();
+            assert!(sc.observe(frame.as_bytes()).first_token, "{frame}");
+        }
+        let mut sc = FrameScanner::default();
+        assert!(!sc.observe(b"{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":false}\n").first_token);
+    }
+
+    /// The tap stamps the request's trace; the usage scan is unchanged.
+    #[test]
+    fn the_usage_scan_still_finds_the_last_usage_frame() {
+        let mut sc = FrameScanner::default();
+        sc.observe(HI.as_bytes());
+        sc.observe(b"data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":7}}\n\ndata: [DONE]\n");
+        assert_eq!(sc.finish(), Some((5, 7)));
     }
 }

@@ -590,6 +590,7 @@ func opDiskReclaim(ctx context.Context, e *Engine, _ string, c *Command) (int, s
 	dryRun := true
 	watermark := 85
 	var capBytes int64
+	keepPath, onlySuperseded := "", false
 	for _, a := range c.Args {
 		switch {
 		case a == "dry_run=true":
@@ -606,7 +607,24 @@ func opDiskReclaim(ctx context.Context, e *Engine, _ string, c *Command) (int, s
 			if v, err := strconv.ParseInt(strings.TrimPrefix(a, "cache_cap_bytes="), 10, 64); err == nil && v > 0 {
 				capBytes = v
 			}
+		case strings.HasPrefix(a, "keep="):
+			// Rung 5's keep file; loadKeepFile refuses anything but an
+			// absolute path to image-keep.json.
+			keepPath = resolveKeepArg(strings.TrimPrefix(a, "keep="), e.Spool)
+		case a == "only=superseded-images":
+			// The post-roll step: rung 5 alone, whatever the watermark.
+			onlySuperseded = true
 		}
 	}
-	return e.diskReclaim(ctx, dryRun, watermark, capBytes)
+	if onlySuperseded {
+		if keepPath == "" {
+			return 1, "disk-reclaim only=superseded-images: no keep= file given; nothing was removed"
+		}
+		line, _ := e.supersededImages(ctx, keepPath, dryRun)
+		if dryRun {
+			line = "DRY RUN (nothing removed) — " + line
+		}
+		return 0, line
+	}
+	return e.diskReclaim(ctx, dryRun, watermark, capBytes, keepPath)
 }

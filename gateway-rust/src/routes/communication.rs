@@ -1162,7 +1162,7 @@ fn no_card_reason(origin_failure: Option<(&str, &str)>) -> String {
     }
 }
 
-pub(crate) async fn notify_exec_approval(tool: &str, request_id: &str, window_secs: u64) {
+pub(crate) async fn notify_exec_approval(tool: &str, request_id: &str, window_secs: u64) -> bool {
     let text = exec_approval_notice(tool, request_id, window_secs);
 
     // The ORIGINATING conversation first: if this tool call came from a
@@ -1188,7 +1188,7 @@ pub(crate) async fn notify_exec_approval(tool: &str, request_id: &str, window_se
             )
             .await;
         if delivered {
-            return;
+            return true;
         }
         tracing::warn!("exec_approval.dashboard_frame_failed");
     }
@@ -1227,7 +1227,7 @@ pub(crate) async fn notify_exec_approval(tool: &str, request_id: &str, window_se
             other => Err(format!("no notice transport for channel '{other}'")),
         };
         match sent {
-            Ok(()) => return, // delivered where the request came from
+            Ok(()) => return true, // delivered where the request came from
             Err(e) => {
                 tracing::warn!(
                     error = %e,
@@ -1241,13 +1241,17 @@ pub(crate) async fn notify_exec_approval(tool: &str, request_id: &str, window_se
         // fall through to env targets if origin delivery failed
     }
 
+    // Whether any notice reached a place where a person can decide: the
+    // caller refuses at once when none did and no console is open
+    // (middleware::wait_for_exec_approval), instead of holding the turn for
+    // the whole window (i658: a task's approval sat 300 s unseen).
+    let mut asked = false;
     let gchat_space = std::env::var("NOO_APPROVAL_GCHAT_SPACE").unwrap_or_default();
     let gchat_space = gchat_space.trim();
     if !gchat_space.is_empty() {
-        if let Err(e) =
-            send_google_chat_reply(gchat_space, &format!("\u{1F510} {text}"), None, None).await
-        {
-            tracing::warn!(error = %e, "exec_approval.gchat_notice_failed");
+        match send_google_chat_reply(gchat_space, &format!("\u{1F510} {text}"), None, None).await {
+            Ok(()) => asked = true,
+            Err(e) => tracing::warn!(error = %e, "exec_approval.gchat_notice_failed"),
         }
     } else {
         tracing::info!(
@@ -1259,10 +1263,12 @@ pub(crate) async fn notify_exec_approval(tool: &str, request_id: &str, window_se
     let tg_chat = std::env::var("NOO_APPROVAL_TELEGRAM_CHAT").unwrap_or_default();
     let tg_chat = tg_chat.trim();
     if !tg_chat.is_empty() {
-        if let Err(e) = send_telegram(tg_chat, &text).await {
-            tracing::warn!(error = %e, "exec_approval.telegram_notice_failed");
+        match send_telegram(tg_chat, &text).await {
+            Ok(()) => asked = true,
+            Err(e) => tracing::warn!(error = %e, "exec_approval.telegram_notice_failed"),
         }
     }
+    asked
 }
 
 /// Deterministic outcome notice for a gated tool call that did NOT run
@@ -2466,5 +2472,23 @@ mod voice_tests {
     async fn other_routes_keep_the_default_limit() {
         let app = Router::new().route(TEST_PATH, post(drain));
         assert_eq!(post_audio(app, 5 * 1024 * 1024).await, reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+}
+
+#[cfg(test)]
+mod exec_approval_reach_tests {
+    /// i658 (#1029): with no dashboard socket, no channel origin and no
+    /// approval channel configured, nobody was asked. The gate refuses at
+    /// once on that answer (middleware::nobody_can_be_asked); a `true` here
+    /// would hold every such turn, and a harness slot, for the whole window
+    /// again. The security mutant "asked starts true" survived without it.
+    #[tokio::test]
+    async fn with_nowhere_to_send_nobody_is_asked() {
+        for v in ["NOO_APPROVAL_GCHAT_SPACE", "NOO_APPROVAL_TELEGRAM_CHAT"] {
+            if std::env::var(v).is_ok_and(|x| !x.trim().is_empty()) {
+                panic!("{v} is set in the test environment: this test needs it unset");
+            }
+        }
+        assert!(!super::notify_exec_approval("noo_agent_message", "r-i658", 300).await, "nothing was delivered, so nobody was asked");
     }
 }

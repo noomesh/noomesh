@@ -1035,6 +1035,81 @@ fn already_applied(root_seen: Option<&str>, user_seen: Option<&str>, sum: &str) 
     }
 }
 
+/// `If-None-Match` for the bundle GET: the quoted sha of the last applied
+/// bundle, and only when that is 64 lowercase hex (anything else sends no header).
+fn if_none_match_for(last: Option<&str>) -> Option<String> {
+    let l = last?.trim();
+    (l.len() == 64 && l.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+        .then(|| format!("\"{l}\""))
+}
+
+/// What the bundle GET's status means.
+#[derive(Debug, PartialEq)]
+enum FetchOutcome {
+    /// 200: a body follows.
+    Fetched,
+    /// 304: the controller's bundle is the one already applied (its sha).
+    Unchanged(String),
+    /// 404: nothing staged.
+    NothingStaged,
+    /// Anything else, including a 304 we could not have asked for.
+    Failed,
+}
+
+/// Pure decision on the status code. A 304 only counts when `last` is a sha
+/// we could have sent as `If-None-Match`.
+fn on_status(code: u16, last: Option<&str>) -> FetchOutcome {
+    match code {
+        200 => FetchOutcome::Fetched,
+        304 => match if_none_match_for(last) {
+            Some(_) => FetchOutcome::Unchanged(last.unwrap_or_default().trim().to_string()),
+            None => FetchOutcome::Failed,
+        },
+        404 => FetchOutcome::NothingStaged,
+        _ => FetchOutcome::Failed,
+    }
+}
+
+/// What the bundle GET's status does to this tick. `Some(rc)` ends the tick
+/// with `rc`; `None` goes on to read the body. A 304 sends the same signed
+/// fetch receipt as the unchanged path, through `receipt`, with the sha the
+/// request sent, so fetched_at keeps being stamped. Nothing else is written
+/// (no marker, no cadence file). `receipt` is the seam the tests observe;
+/// `node_fetch` passes `send_fetch_receipt`.
+fn settle_status(code: u16, last: Option<&str>, receipt: &mut dyn FnMut(&str)) -> Option<i32> {
+    match on_status(code, last) {
+        FetchOutcome::Fetched => None,
+        FetchOutcome::Unchanged(sum) => {
+            // There is no debug-level facility in crate::ui, so no line is
+            // emitted: a normal line every tick is the noise this avoids.
+            receipt(&sum);
+            Some(0) // already applied this exact bundle
+        }
+        FetchOutcome::NothingStaged | FetchOutcome::Failed => Some(0),
+    }
+}
+
+/// The FETCH receipt. `fetched_at` used to be stamped by the
+/// GET itself — a state write any anonymous caller could make, so it meant
+/// "somebody collected this ciphertext", never "this Mac did". The node has
+/// no fleet secret at this point (it rides inside the bundle), so the proof
+/// is its birth key. Best-effort: a receipt that does not land costs the
+/// operator a progress line, never the apply.
+fn send_fetch_receipt(agent: &ureq::Agent, base: &Path, url: &str, node: &str, sum: &str) {
+    match birth_proof(base, "fetch", node, sum) {
+        Ok(proof) => {
+            let _ = agent
+                .post(&format!("{url}/bootstrap/bundle/{node}/fetched"))
+                .header("x-noo-birth-proof", &proof)
+                .send_json(serde_json::json!({ "sha": sum }));
+        }
+        Err(why) => crate::ui::warned(&format!(
+            "noo node fetch: cannot sign the fetch receipt, so fetched_at will not be stamped \
+             (the controller's `provision --wait` will time out at the fetch stage): {why}"
+        )),
+    }
+}
+
 /// Write a cadence file (`expect-bundle`, `fetch-state`) as the user, by
 /// rename: a root-owned copy an older applier (v0.2.103) left in the user's
 /// tree is replaced instead of failing to open, silently, on every tick.
@@ -1114,7 +1189,19 @@ pub fn node_fetch(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // The bundle GET alone gets a long deadline: a bundle carrying a
         // staged vendor CLI (i83 E1e) is a few hundred MB, which the agent's
         // 60 s global timeout cut off on any link under ~5 MB/s.
-        let mut resp = match agent.get(&format!("{url}/bootstrap/bundle/{node}"))
+        // Conditional GET: the controller's ETag is the sha256 of the ciphertext,
+        // which is exactly what this node records after an apply. An unchanged
+        // bundle then costs a 304 and no body instead of a few hundred MB.
+        // Root's marker is the one that decides, as it does for `already_applied`.
+        let last_for_etag = {
+            let _r = privs::root();
+            read_trim(&last_bundle_path(&base, privs::is_root_process()))
+        };
+        let mut req = agent.get(&format!("{url}/bootstrap/bundle/{node}"));
+        if let Some(v) = if_none_match_for(last_for_etag.as_deref()) {
+            req = req.header("If-None-Match", &v);
+        }
+        let mut resp = match req
             .config().timeout_global(Some(std::time::Duration::from_secs(BUNDLE_FETCH_TIMEOUT_SECS))).build()
             .call()
         {
@@ -1124,8 +1211,9 @@ pub fn node_fetch(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 return Ok(0);
             }
         };
-        if resp.status().as_u16() != 200 {
-            return Ok(0); // nothing staged
+        let mut receipt = |sum: &str| send_fetch_receipt(&agent, &base, &url, &node, sum);
+        if let Some(rc) = settle_status(resp.status().as_u16(), last_for_etag.as_deref(), &mut receipt) {
+            return Ok(rc);
         }
         let mut blob = Vec::new();
         use std::io::Read as _;
@@ -1145,18 +1233,7 @@ pub fn node_fetch(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // no fleet secret at this point (it rides inside the bundle), so the proof
     // is its birth key. Best-effort: a receipt that does not land costs the
     // operator a progress line, never the apply.
-    match birth_proof(&base, "fetch", &node, &sum) {
-        Ok(proof) => {
-            let _ = agent
-                .post(&format!("{url}/bootstrap/bundle/{node}/fetched"))
-                .header("x-noo-birth-proof", &proof)
-                .send_json(serde_json::json!({ "sha": sum }));
-        }
-        Err(why) => crate::ui::warned(&format!(
-            "noo node fetch: cannot sign the fetch receipt, so fetched_at will not be stamped \
-             (the controller's `provision --wait` will time out at the fetch stage): {why}"
-        )),
-    }
+    send_fetch_receipt(&agent, &base, &url, &node, &sum);
 
     let as_root = privs::is_root_process();
     // Root's record of the last bundle applied lives in root's state dir; in
@@ -2547,20 +2624,11 @@ fn birth_proof(base: &Path, purpose: &str, node: &str, sha: &str) -> Result<Stri
     // parallel threads: that is where it first showed, as
     // `the_darwin_signer_produces_a_verifiable_signature` failing with
     // "Can't open .../sig for writing" once in four runs.
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let work = std::env::temp_dir().join(format!(
-        "noo-birth-proof-{}-{}",
-        std::process::id(),
-        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    // Created afresh, 0700 (a pre-existing directory at this name is not
-    // ours to sign in).
-    if let Err(e) = {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new().mode(0o700).create(&work)
-    } {
-        return Err(format!("could not make a signing work dir at {}: {e}", work.display()));
-    }
+    // Created afresh, 0700, under an unguessable name (i689: the old
+    // `<pid>-<seq>` name was refused if pre-existing, but predictable, so
+    // another user could pre-create it and block every signing).
+    let work = crate::private_tmp::dir("noo-birth-proof")
+        .map_err(|e| format!("could not make a signing work dir: {e}"))?;
     let msg_path = work.join("msg");
     let sig_path = work.join("sig");
     let cleanup = || {
@@ -3161,6 +3229,81 @@ mod tests {
     }
 
     use super::*;
+
+    // ── conditional GET: If-None-Match and 304 ─────────────────────────
+
+    const SHA_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn if_none_match_is_the_quoted_sha_only_for_64_lowercase_hex() {
+        assert_eq!(if_none_match_for(Some(SHA_A)), Some(format!("\"{SHA_A}\"")));
+        assert_eq!(if_none_match_for(Some(&format!("{SHA_A}\n"))), Some(format!("\"{SHA_A}\"")));
+        assert_eq!(if_none_match_for(None), None);
+        assert_eq!(if_none_match_for(Some("")), None);
+        assert_eq!(if_none_match_for(Some(&SHA_A[..63])), None);
+        assert_eq!(if_none_match_for(Some(&format!("{SHA_A}0"))), None);
+        assert_eq!(if_none_match_for(Some(&SHA_A.to_uppercase())), None);
+        assert_eq!(if_none_match_for(Some(&SHA_A.replace('a', "g"))), None);
+    }
+
+    #[test]
+    fn on_status_maps_the_codes() {
+        assert_eq!(on_status(200, Some(SHA_A)), FetchOutcome::Fetched);
+        assert_eq!(on_status(200, None), FetchOutcome::Fetched);
+        assert_eq!(on_status(304, Some(SHA_A)), FetchOutcome::Unchanged(SHA_A.to_string()));
+        assert_eq!(on_status(404, Some(SHA_A)), FetchOutcome::NothingStaged);
+        assert_eq!(on_status(500, Some(SHA_A)), FetchOutcome::Failed);
+        assert_eq!(on_status(403, None), FetchOutcome::Failed);
+    }
+
+    #[test]
+    fn a_304_we_could_not_have_asked_for_is_not_unchanged() {
+        assert_eq!(on_status(304, None), FetchOutcome::Failed);
+        assert_eq!(on_status(304, Some("not-a-sha")), FetchOutcome::Failed);
+    }
+
+    fn settle(code: u16, last: Option<&str>) -> (Option<i32>, Vec<String>) {
+        let mut sent = Vec::new();
+        let rc = settle_status(code, last, &mut |sum: &str| sent.push(sum.to_string()));
+        (rc, sent)
+    }
+
+    /// A 304 ends the tick with 0 AND sends the fetch receipt, once, for the
+    /// sha the request sent: fetched_at keeps being stamped on unchanged ticks.
+    #[test]
+    fn a_304_sends_the_receipt_for_the_sent_sha_and_ends_the_tick() {
+        assert_eq!(settle(304, Some(SHA_A)), (Some(0), vec![SHA_A.to_string()]));
+        assert_eq!(settle(304, Some(&format!("{SHA_A}\n"))), (Some(0), vec![SHA_A.to_string()]), "trimmed, as sent");
+    }
+
+    /// Only a 304 we asked for receipts here: a 200 goes on to the body (and
+    /// its own receipt after the hash); 404, failures and a 304 without a
+    /// sent header end the tick with no receipt.
+    #[test]
+    fn nothing_but_an_asked_for_304_receipts_before_the_body() {
+        assert_eq!(settle(200, Some(SHA_A)), (None, vec![]));
+        assert_eq!(settle(404, Some(SHA_A)), (Some(0), vec![]));
+        assert_eq!(settle(500, Some(SHA_A)), (Some(0), vec![]));
+        assert_eq!(settle(304, None), (Some(0), vec![]));
+        assert_eq!(settle(304, Some("not-a-sha")), (Some(0), vec![]));
+    }
+
+    /// node_fetch decides the status through settle_status, with the REAL
+    /// receipt sender as the seam, before reading any body.
+    #[test]
+    fn node_fetch_settles_the_status_with_the_real_receipt_sender() {
+        let code = crate::test_src::own_code(include_str!("node_fetch.rs"));
+        let body = crate::test_src::fn_body(&code, "pub fn node_fetch(");
+        let seam = body
+            .find("let mut receipt = |sum: &str| send_fetch_receipt(&agent, &base, &url, &node, sum);")
+            .expect("the receipt seam is the real sender");
+        let settle = body
+            .find("settle_status(resp.status().as_u16(), last_for_etag.as_deref(), &mut receipt)")
+            .expect("the status is settled through the seam");
+        let read = body.find("read_to_end(&mut blob)").expect("the body read");
+        assert!(seam < settle && settle < read, "{body}");
+        assert!(!body.contains("on_status("), "the status is decided in settle_status only: {body}");
+    }
 
     // ── bundle header (v2): who it is for, and when it was signed ──────
 

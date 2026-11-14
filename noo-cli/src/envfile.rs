@@ -491,6 +491,46 @@ pub fn instance() -> String {
     }
 }
 
+/// The compose PROJECT of this install, which names and labels its volumes
+/// (`com.docker.compose.project`). Mirrors `scripts/lib-instance.sh`: a named
+/// instance is `noo-<name>`. The default instance is the `name:` the compose
+/// files declare, `noomesh`. An explicit `COMPOSE_PROJECT_NAME` wins, as it
+/// does for compose itself and for `noo_data_volume`.
+pub fn compose_project() -> String {
+    project_for(&instance(), std::env::var("COMPOSE_PROJECT_NAME").ok().as_deref())
+}
+
+/// [`compose_project`], pure over the instance and `COMPOSE_PROJECT_NAME`.
+pub(crate) fn project_for(instance: &str, env_project: Option<&str>) -> String {
+    if let Some(p) = env_project.map(|p| p.trim().trim_matches('"')).filter(|p| !p.is_empty()) {
+        return p.to_string();
+    }
+    if instance.is_empty() {
+        "noomesh".to_string()
+    } else {
+        format!("noo-{instance}")
+    }
+}
+
+/// The launcher's EXTERNAL cluster network (created outside compose, so it
+/// carries no project label). Mirrors `scripts/lib-instance.sh`:
+/// `NOO_CLUSTER_NETWORK` when set, else `noo-<instance>-cluster` for a named
+/// instance, else `noo-cluster`.
+pub fn cluster_network() -> String {
+    cluster_network_for(&instance(), std::env::var("NOO_CLUSTER_NETWORK").ok().as_deref())
+}
+
+/// [`cluster_network`], pure.
+pub(crate) fn cluster_network_for(instance: &str, env_net: Option<&str>) -> String {
+    if !instance.is_empty() {
+        return format!("noo-{instance}-cluster");
+    }
+    match env_net.map(|n| n.trim().trim_matches('"')).filter(|n| !n.is_empty()) {
+        Some(n) => n.to_string(),
+        None => "noo-cluster".to_string(),
+    }
+}
+
 /// Container-name prefix for this instance — mirrors
 /// `scripts/lib-instance.sh` exactly: `noo-<name>` for a named instance;
 /// for the default one, `NOO_CONTAINER_PREFIX` when set (the launcher

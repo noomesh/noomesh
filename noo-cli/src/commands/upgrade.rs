@@ -1186,6 +1186,7 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     // Everything the launcher's bind checks and the new compose expect.
     reconcile_service_certs(g);
     reconcile_grafana_door(g, &roll.root);
+    reconcile_netns_unit(g, &roll.root);
     sync_gateway_pki_view(g);
     crate::commands::voice_models::stage_if_on(g);
     reconcile_addon_nats_principals(g, &roll.root);
@@ -1528,10 +1529,7 @@ fn refuse_unlocked_dist_roll(g: &Globals, roll: &Roll, target_stack_lock: Option
     let root = &roll.root;
     let tag = &roll.tag;
     if target_stack_lock.is_none() {
-        let dotenv = std::fs::read_to_string(root.join(".env")).unwrap_or_default();
-        let mode = std::env::var("NOO_INSTALL_MODE").ok().filter(|v| !v.trim().is_empty())
-            .or_else(|| dotenv.lines().rev().find_map(|l| l.trim().strip_prefix("NOO_INSTALL_MODE=").map(|v| v.trim().trim_matches('"').to_string())))
-            .unwrap_or_default();
+        let mode = install_mode(root);
         if let Some(why) = no_lock_refusal(&mode, tag) {
             fail(g.json, ExitCode::Generic, "stack_lock_missing", &why,
                 Some("pick a published release: noo upgrade --check --stack"));
@@ -1789,8 +1787,11 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
     let cli_bin = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
     // The launcher names a container it could not stop in this file
     // (lib-stuck-container.sh), see LAUNCHER_EXIT_STACK_PARTIAL.
-    let stuck_report = std::env::temp_dir().join(format!("noo-launch-stuck-{}", std::process::id()));
-    let _ = std::fs::remove_file(&stuck_report);
+    // i689: in a fresh 0700 dir (removed when this returns): a planted
+    // symlink at a predictable name would have the launcher write through it.
+    let stuck_dir = crate::private_tmp::Dir::new("noo-launch-stuck")
+        .unwrap_or_else(|e| crate::output::fail(g.json, crate::output::ExitCode::Generic, "stage_failed", &e, None));
+    let stuck_report = stuck_dir.path().join("stuck");
     let build_launch = || {
         let mut c = std::process::Command::new("bash");
         c.arg(root.join("scripts/noomesh-start.sh")).arg("--dist")
@@ -1868,6 +1869,7 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
             // just deployed is the truth, so say so once, here, where it
             // changes.
             std::env::set_var("NOO_IMAGE_TAG", tag);
+            record_roll();
             if !g.json {
                 ui::close_done(&format!("stack now on {tag}"));
                 ui::guide(&[("noo cluster verify --wait",
@@ -2716,6 +2718,49 @@ fn reconcile_short_service_certs(
 /// before the launcher, so the roll recreates the gateway and Grafana with
 /// them. One line per change; silent when there is none. Never fails the
 /// roll: `noo cluster verify` FAILs the `grafana door` row instead.
+/// Whether the stack stage should (re)install noo-netns-restore.service. Pure.
+pub(crate) fn netns_unit_needs_install(systemd: bool, state: crate::netns_unit::State) -> bool {
+    systemd && state != crate::netns_unit::State::Current
+}
+
+/// The stack stage (`noo upgrade --stack` and `--all`), on the controller this
+/// command runs on, never a remote node: install or refresh
+/// noo-netns-restore.service, which installs onboarded before rc.3 lack. On a
+/// terminal sudo may ask once, with the reason on the line above; off a
+/// terminal `sudo -n`, and a refusal is a warning naming the one command.
+/// Never fails the roll; `noo cluster verify` shows the `netns restore` row.
+fn reconcile_netns_unit(g: &Globals, root: &std::path::Path) {
+    use crate::netns_unit as nu;
+    let systemd = nu::systemd_here();
+    if !systemd {
+        return;
+    }
+    let unit = match nu::render_here(&root.display().to_string()) {
+        Ok(u) => u,
+        Err(e) => {
+            if !g.json { ui::warned(&format!("{} not installed: {e}", nu::UNIT_NAME)); }
+            return;
+        }
+    };
+    if !netns_unit_needs_install(systemd, nu::state(&unit)) {
+        return;
+    }
+    // SAFETY: isatty has no preconditions.
+    let tty = !g.json && unsafe { libc::isatty(0) } == 1;
+    if tty {
+        ui::step(&format!("installing {}: it starts the containers that join another's network after every dockerd start (sudo may ask)", nu::UNIT_NAME));
+    }
+    match nu::install(tty, &unit) {
+        Ok(()) => { if !g.json { ui::done(&format!("{} installed and enabled", nu::UNIT_NAME)); } }
+        Err(e) => {
+            if !g.json {
+                ui::warned(&format!("{} not installed ({e}): after a reboot or a dockerd restart, a container that joins another's network (noo-ollama-embed) can stay down", nu::UNIT_NAME));
+                ui::guide(&[(nu::REMEDY, "run it in a terminal: sudo asks once and the stack stage installs the unit")]);
+            }
+        }
+    }
+}
+
 fn reconcile_grafana_door(g: &Globals, root: &std::path::Path) {
     use super::grafana_door as gd;
     let env_path = root.join(".env");
@@ -2923,9 +2968,8 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
             let mut pending: Vec<super::provision::PendingApply> = Vec::new();
             ui::blank();
             upgrade_self_node(g, &me, &mut failed, &mut pending);
-            if !pending.is_empty() {
-                wait_and_settle_nodes(g, &pending, Some(&me), &mut failed);
-            }
+            let waited = if pending.is_empty() { Vec::new() } else { wait_and_settle_nodes(g, &pending, Some(&me), &mut failed) };
+            print_node_outcomes(g, &node_outcome_rows(std::slice::from_ref(&me), &[], &waited, &failed));
             return Ok(if failed.is_empty() { 0 } else { 1 });
         }
         ui::guide(&[("noo cluster bootstrap-token create --node <name>", "mints the paste that enrolls a first node")]);
@@ -3002,6 +3046,9 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
         // staging replaces its row; the combined wait needs it for the
         // legacy fallback (the child judged the same fact for its own steps).
         let legacy = super::provision::node_never_reported_apply(g, n);
+        // A node that needs the applier first gets ONLY that bundle now;
+        // the combined wait restages the full one when it is in.
+        let applier_first = super::provision::applier_first_for(g, n);
         // `--stage-only`: stage and poke, return at once. The apply is
         // waited for below, for every node together, so one slow node no
         // longer holds up staging the rest.
@@ -3016,7 +3063,7 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
         // has no sha the node cannot be waited on and is reported failed
         // here instead of silently counted as staged.
         match super::provision::staged_sha_of(g, n) {
-            Some(sha) => pending.push(super::provision::PendingApply { node: n.clone(), sha, legacy }),
+            Some(sha) => pending.push(super::provision::PendingApply { node: n.clone(), sha, legacy, applier_first }),
             None => {
                 ui::say_err(&ui::sub(&ui::status_line(Glyph::Err,
                     &format!("{n}: staged, but the gateway reports no staged bundle to wait on"))));
@@ -3035,9 +3082,11 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
         ui::blank();
         upgrade_self_node(g, me, &mut failed, &mut pending);
     }
-    if !pending.is_empty() {
-        wait_and_settle_nodes(g, &pending, me.as_deref(), &mut failed);
-    }
+    let waited = if pending.is_empty() { Vec::new() } else { wait_and_settle_nodes(g, &pending, me.as_deref(), &mut failed) };
+    // One line per node, whatever the others did (0.6.21: "stopped at the
+    // nodes stage" hid that pop-os upgraded fine beside a failed node).
+    let order: Vec<String> = names.iter().cloned().chain(me.clone()).collect();
+    print_node_outcomes(g, &node_outcome_rows(&order, &skipped, &waited, &failed));
     // A node whose first staging failed is already in `failed`; waiting
     // for it to apply a bundle it never got would only burn the budget.
     let waiting: Vec<String> = leafless.into_iter()
@@ -3065,6 +3114,9 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
     }
     let staged_failed: Vec<String> = failed.iter().filter(|n| !remaining.contains(n)).cloned().collect();
     let (rc, msg) = nodes_outcome(names.len(), &skipped_names, &staged_failed, &remaining);
+    if !waited.is_empty() || !pending.is_empty() {
+        record_roll();
+    }
     if !skipped.is_empty() && !g.json {
         let cmds: Vec<String> = skipped_names.iter().map(|n| format!("noo cluster provision {n} --wait")).collect();
         let why = "once the node is back online, catches it up";
@@ -3076,6 +3128,9 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
         ui::guide(&cmds.iter().map(|c| (c.as_str(), why)).collect::<Vec<_>>());
     } else if rc == 0 {
         ui::close_done(&msg);
+        if !g.json {
+            ui::guide(&[(VERIFY_AFTER_ROLL, VERIFY_AFTER_ROLL_WHY)]);
+        }
     } else {
         ui::close_failed(&msg, None);
     }
@@ -3089,6 +3144,40 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
     Ok(rc)
 }
 
+/// The closing line of a clean nodes stage: restarted agents read as
+/// offline for a minute or two, and verify says so (i663 §2.3).
+const VERIFY_AFTER_ROLL: &str = "noo cluster verify --wait";
+const VERIFY_AFTER_ROLL_WHY: &str =
+    "the agents restart after applying and read offline for a minute or two; this waits for them";
+
+/// Where the time of the last roll is kept: `$XDG_STATE_HOME/noo/last-roll`
+/// (else `~/.local/state/noo/last-roll`), one unix timestamp.
+fn roll_marker() -> std::path::PathBuf {
+    crate::commands::addon_after_boot::state_dir_from(std::env::var("XDG_STATE_HOME").ok(), std::env::var("HOME").ok())
+        .join("last-roll")
+}
+
+/// Note that the stack or the nodes were just rolled, so `cluster verify`
+/// can tell a restarting node from a broken one. Best effort: a marker that
+/// cannot be written only means verify words a restart as a failure.
+pub(crate) fn record_roll() {
+    let p = roll_marker();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&p, format!("{now}\n"));
+}
+
+/// When the last roll happened (unix seconds), if one was recorded here.
+pub(crate) fn last_roll() -> Option<i64> {
+    parse_roll(&std::fs::read_to_string(roll_marker()).ok()?)
+}
+
+fn parse_roll(text: &str) -> Option<i64> {
+    text.trim().parse::<i64>().ok().filter(|t| *t > 0)
+}
+
 /// The longest the combined wait gives a staged fleet to pull, apply and
 /// report, measured from when the last node was staged (the single-node
 /// `cluster provision` wait is the same 600 s).
@@ -3097,27 +3186,145 @@ const NODES_APPLY_BUDGET_SECS: u64 = 600;
 /// costs nothing and a node's verdict shows up that much sooner.
 const NODES_APPLY_POLL_SECS: u64 = 5;
 
+/// How one node's restage ended: the nodes stage's table, and the data
+/// i613's wave loop reads (it calls [`wait_and_settle_nodes`] once per
+/// wave, on that wave's nodes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    Applied,
+    /// Applied by a fetcher that cannot report (legacy): not confirmed.
+    Unconfirmed,
+    Refused,
+    NotFetched,
+    NotReported,
+    /// Staging itself failed (the child's error is above the table).
+    NotStaged,
+    SkippedOffline,
+}
+
+impl Outcome {
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            Outcome::Applied => "applied",
+            Outcome::Unconfirmed => "unconfirmed",
+            Outcome::Refused => "refused",
+            Outcome::NotFetched => "not fetched",
+            Outcome::NotReported => "no report",
+            Outcome::NotStaged => "not staged",
+            Outcome::SkippedOffline => "skipped",
+        }
+    }
+}
+
+/// One node's line in the table.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct NodeOutcome {
+    pub node: String,
+    pub outcome: Outcome,
+    pub why: String,
+    pub elapsed_secs: u64,
+}
+
+/// The outcome an end of the combined wait means, and why, in words.
+fn outcome_of(end: &super::provision::ApplyEnd) -> (Outcome, String) {
+    use super::provision::ApplyEnd;
+    match end {
+        ApplyEnd::Applied { rc: 0, .. } => (Outcome::Applied, "applied (exit 0)".into()),
+        ApplyEnd::Applied { rc, .. } => (Outcome::Refused, format!("the applier refused the bundle (exit {rc})")),
+        ApplyEnd::LegacyUnconfirmed => (Outcome::Unconfirmed, "applied without confirmation (legacy fetcher)".into()),
+        ApplyEnd::NotReported { fetched: true } => (Outcome::NotReported, "fetched, but no apply report".into()),
+        ApplyEnd::NotReported { fetched: false } => (Outcome::NotFetched, "never fetched the bundle".into()),
+    }
+}
+
+/// After a node's applier-only bundle ended this way, is its full bundle
+/// staged next? Yes unless the node never fetched at all: the old blocking
+/// handshake also went on after a refused applier or a missing report
+/// (with a warning), and failed only on "never fetched".
+fn full_bundle_follows(end: &super::provision::ApplyEnd) -> bool {
+    !matches!(end, super::provision::ApplyEnd::NotReported { fetched: false })
+}
+
+/// Restage `n`'s FULL bundle after its applier (`FULL_BUNDLE_ENV` set for
+/// that one child), and return what to wait on.
+fn restage_full_bundle(g: &Globals, n: &str, legacy: bool) -> Option<super::provision::PendingApply> {
+    std::env::set_var(super::provision::FULL_BUNDLE_ENV, "1");
+    let rc = provision_one(g, n, &["--stage-only"]);
+    std::env::remove_var(super::provision::FULL_BUNDLE_ENV);
+    if !matches!(rc, Ok(0)) {
+        return None;
+    }
+    super::provision::staged_sha_of(g, n)
+        .map(|sha| super::provision::PendingApply { node: n.to_string(), sha, legacy, applier_first: false })
+}
+
 /// Wait for every staged node together, then settle each: a node that
 /// applied runs the post-apply steps `cluster provision` runs; one that
 /// refused or never reported goes into `failed` with its remedy. A skipped
 /// or unreported step is printed as such, never counted as applied.
 /// `self_node` is the controller's own node when it is among `pending`: it
 /// gets the self-node post-apply steps and is named "(self node)" in `failed`.
-fn wait_and_settle_nodes(g: &Globals, pending: &[super::provision::PendingApply], self_node: Option<&str>, failed: &mut Vec<String>) {
+///
+/// A node staged `applier_first` waits in the same round as every other
+/// node; once its applier is in, its full bundle is staged and waited for
+/// in a second round. No node's handshake holds up another's (0.6.21).
+/// Works on any subset of nodes, and returns one [`NodeOutcome`] per node
+/// in `pending`, in order.
+fn wait_and_settle_nodes(g: &Globals, pending: &[super::provision::PendingApply], self_node: Option<&str>, failed: &mut Vec<String>) -> Vec<NodeOutcome> {
     ui::blank();
-    let ends = super::provision::wait_nodes_applied(g, pending, NODES_APPLY_BUDGET_SECS, NODES_APPLY_POLL_SECS);
+    let first = super::provision::wait_nodes_applied_timed(g, pending, NODES_APPLY_BUDGET_SECS, NODES_APPLY_POLL_SECS);
+    let mut settled: Vec<Option<(super::provision::ApplyEnd, u64)>> = Vec::new();
+    let mut second: Vec<super::provision::PendingApply> = Vec::new();
+    let mut second_at: Vec<(usize, u64)> = Vec::new();
+    let mut not_staged: Vec<usize> = Vec::new();
+    for (i, ((n, end, took), p)) in first.into_iter().zip(pending).enumerate() {
+        if p.applier_first && full_bundle_follows(&end) {
+            match &end {
+                super::provision::ApplyEnd::Applied { rc, .. } if *rc != 0 => ui::say(&ui::sub(&ui::status_line(Glyph::Warn,
+                    &format!("{n}: the applier-only bundle reported exit {rc} — staging the full bundle anyway")))),
+                super::provision::ApplyEnd::Applied { .. } => ui::say(&ui::sub(&ui::status_line(Glyph::Step,
+                    &format!("{n}: installed the applier — staging the full bundle")))),
+                _ => ui::say(&ui::sub(&ui::status_line(Glyph::Warn,
+                    &format!("{n}: no report for the applier — staging the full bundle without confirmation")))),
+            }
+            match restage_full_bundle(g, &n, p.legacy) {
+                Some(next) => { second_at.push((i, took)); second.push(next); }
+                None => not_staged.push(i),
+            }
+            settled.push(None);
+            continue;
+        }
+        settled.push(Some((end, took)));
+    }
+    if !second.is_empty() {
+        ui::blank();
+        for ((i, before), (_, end, took)) in second_at.into_iter().zip(super::provision::wait_nodes_applied_timed(g, &second, NODES_APPLY_BUDGET_SECS, NODES_APPLY_POLL_SECS)) {
+            settled[i] = Some((end, before + took));
+        }
+    }
     let mut applied = 0usize;
     let mut unconfirmed = 0usize;
     let mut json_rows: Vec<serde_json::Value> = Vec::new();
-    for (n, end) in ends {
+    let mut out: Vec<NodeOutcome> = Vec::new();
+    for (i, p) in pending.iter().enumerate() {
+        let n = p.node.clone();
         let is_self = self_node == Some(n.as_str());
-        let (row, settled) = settle_end(g, &n, end, is_self);
+        let Some((end, took)) = settled[i].take() else {
+            // The applier went in but the full bundle could not be staged.
+            debug_assert!(not_staged.contains(&i));
+            failed.push(if is_self { format!("{n} (self node)") } else { n.clone() });
+            out.push(NodeOutcome { node: n, outcome: Outcome::NotStaged, why: "the applier went in; staging the full bundle failed (see above)".into(), elapsed_secs: 0 });
+            continue;
+        };
+        let (outcome, why) = outcome_of(&end);
+        let (row, s) = settle_end(g, &n, end, is_self);
         json_rows.push(row);
-        match settled {
+        match s {
             Settled::Applied => applied += 1,
             Settled::Unconfirmed => unconfirmed += 1,
-            Settled::Failed => failed.push(if is_self { format!("{n} (self node)") } else { n }),
+            Settled::Failed => failed.push(if is_self { format!("{n} (self node)") } else { n.clone() }),
         }
+        out.push(NodeOutcome { node: n, outcome, why, elapsed_secs: took });
     }
     if g.json {
         println!("{}", serde_json::json!({"nodes_apply": json_rows}));
@@ -3128,6 +3335,56 @@ fn wait_and_settle_nodes(g: &Globals, pending: &[super::provision::PendingApply]
             applied, pending.len(),
             if unconfirmed > 0 { format!(", {unconfirmed} unconfirmed (legacy fetcher)") } else { String::new() })));
     }
+    out
+}
+
+/// The nodes stage's rows, one per node in `order` that this stage touched:
+/// skipped offline, waited on (the combined wait's outcome), or failed to
+/// stage. Pure, so the table is testable without a gateway.
+fn node_outcome_rows(order: &[String], skipped: &[(String, String)], waited: &[NodeOutcome], failed: &[String]) -> Vec<NodeOutcome> {
+    let mut rows = Vec::new();
+    for n in order {
+        if let Some((_, why)) = skipped.iter().find(|(s, _)| s == n) {
+            rows.push(NodeOutcome { node: n.clone(), outcome: Outcome::SkippedOffline, why: format!("offline before the roll ({why})"), elapsed_secs: 0 });
+        } else if let Some(o) = waited.iter().find(|o| &o.node == n) {
+            rows.push(o.clone());
+        } else if failed.iter().any(|f| f == n || *f == format!("{n} (self node)")) {
+            rows.push(NodeOutcome { node: n.clone(), outcome: Outcome::NotStaged, why: "staging failed (see above)".into(), elapsed_secs: 0 });
+        }
+    }
+    rows
+}
+
+/// One line per node: name, outcome, seconds, why. Knows nothing about
+/// waves: i613's loop prints it once per wave.
+pub(crate) fn print_node_outcomes(g: &Globals, rows: &[NodeOutcome]) {
+    if rows.is_empty() {
+        return;
+    }
+    if g.json {
+        println!("{}", serde_json::json!({"node_outcomes": rows.iter().map(|r| serde_json::json!({
+            "node": r.node, "outcome": r.outcome.word(), "why": r.why, "elapsed_secs": r.elapsed_secs,
+        })).collect::<Vec<_>>()}));
+        return;
+    }
+    ui::blank();
+    for line in node_outcome_lines(rows) {
+        ui::say(&line);
+    }
+}
+
+/// The table's text lines (no colour decisions beyond the glyph).
+fn node_outcome_lines(rows: &[NodeOutcome]) -> Vec<String> {
+    let w = rows.iter().map(|r| r.node.chars().count()).max().unwrap_or(0);
+    rows.iter().map(|r| {
+        let glyph = match r.outcome {
+            Outcome::Applied => Glyph::Ok,
+            Outcome::Unconfirmed | Outcome::SkippedOffline => Glyph::Warn,
+            _ => Glyph::Err,
+        };
+        let secs = if r.elapsed_secs > 0 { format!("{:>4}s", r.elapsed_secs) } else { "     ".to_string() };
+        ui::sub(&ui::status_line(glyph, &format!("{:<w$}  {:<11} {secs}  {}", r.node, r.outcome.word(), r.why)))
+    }).collect()
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -3445,7 +3702,7 @@ fn mac_leaves_pass(g: &Globals, nodes: &[String], budget: u64) -> Vec<(String, M
         // No staged sha on the route means there is nothing to wait on:
         // reported as a failed restage, never counted as staged.
         match super::provision::staged_sha_of(g, n) {
-            Some(sha) => pending.push(super::provision::PendingApply { node: n.clone(), sha, legacy }),
+            Some(sha) => pending.push(super::provision::PendingApply { node: n.clone(), sha, legacy, applier_first: false }),
             None => {
                 ui::say_err(&ui::sub(&ui::status_line(Glyph::Err,
                     &format!("{n}: staged, but the gateway reports no staged bundle to wait on"))));
@@ -3514,6 +3771,7 @@ fn upgrade_self_node(g: &Globals, me: &str, failed: &mut Vec<String>, pending: &
     // summary line for every node staged before it. Read BEFORE the staging
     // replaces the row (see the nodes loop).
     let legacy = super::provision::node_never_reported_apply(g, me);
+    let applier_first = super::provision::applier_first_for(g, me);
     if !matches!(provision_one(g, me, &["--stage-only"]), Ok(0)) {
         failed.push(format!("{me} (self node)"));
         return;
@@ -3521,7 +3779,7 @@ fn upgrade_self_node(g: &Globals, me: &str, failed: &mut Vec<String>, pending: &
     // No staged sha on the route means there is nothing to wait on: failed
     // here, never counted as staged.
     match super::provision::staged_sha_of(g, me) {
-        Some(sha) => pending.push(super::provision::PendingApply { node: me.to_string(), sha, legacy }),
+        Some(sha) => pending.push(super::provision::PendingApply { node: me.to_string(), sha, legacy, applier_first }),
         None => {
             ui::say_err(&ui::sub(&ui::status_line(Glyph::Err,
                 &format!("{me}: staged, but the gateway reports no staged bundle to wait on"))));
@@ -3753,8 +4011,9 @@ pub(crate) fn fetch_release_file(g: &Globals, version: &str, name: &str, base_ur
     fetch_tag_file(g, &format!("{TAG_PREFIX}{version}"), name)
 }
 
-/// One asset of the GitHub release on `tag`: gh, then the direct GET only
-/// where it can help ([`release_fetch::gh_then_direct`]). Transient failures
+/// One asset of the GitHub release on `tag`: the direct `releases/download`
+/// GET, then gh only where it can help ([`release_fetch::direct_then_gh`]:
+/// a public asset never goes through the rate-limited API). Transient failures
 /// are retried with backoff on each lane; the error names the real cause
 /// The bytes are unverified here — every caller checks
 /// them against a signed manifest or signed lock, as before.
@@ -3762,7 +4021,7 @@ pub(crate) fn fetch_tag_file(g: &Globals, tag: &str, name: &str) -> Result<Vec<u
     let repo = repo();
     let gh = which("gh");
     let mut sleep = release_fetch::real_sleep;
-    release_fetch::gh_then_direct(
+    release_fetch::direct_then_gh(
         gh.as_deref(),
         &mut |gh| {
             let r = release_fetch::gh_download_with_retry(gh, &repo, tag, name, &release_fetch::DEFAULT_RETRY, &mut sleep);
@@ -3824,8 +4083,6 @@ fn gateway_holds_cli_asset(g: &Globals, name: &str, sha: &str) -> bool {
 /// and upload it to the gateway.
 fn upload_cli_assets(g: &Globals, toks: &[serde_json::Value]) {
     let root = crate::envfile::repo_root();
-    let cache = crate::commands::provision::cli_asset_cache_dir(&root);
-    let _ = std::fs::create_dir_all(&cache);
     let version = env!("CARGO_PKG_VERSION").to_string();
     let platforms = asset_platforms(toks, std::env::consts::OS, std::env::consts::ARCH);
     let mut assets: Vec<String> = platforms
@@ -3862,23 +4119,24 @@ fn upload_cli_assets(g: &Globals, toks: &[serde_json::Value]) {
         v.dedup();
         v
     };
-    for name in gateway_assets.iter().chain(hostd_assets.iter()) {
-        let path = cache.join(name);
-        if std::fs::read(&path).ok().filter(|b| !b.is_empty()).is_some() {
+    // Every fill goes through the provision gate (i688): a cached copy is
+    // kept only if its sha256 is in the signed manifest, a download is cached
+    // only after it matches. "Not in release" is said only when the signed
+    // manifest does not list the asset.
+    let manifest = crate::commands::provision::verified_release_manifest(g, &root);
+    if let Err(e) = &manifest {
+        ui::warned(&format!("release assets not cached or uploaded: {e}"));
+    }
+    let release_assets: &[String] = if manifest.is_ok() { &assets } else { &[] };
+    let listed = |name: &str| manifest.as_ref().ok()
+        .and_then(|(m, _)| crate::release_sig::manifest_sha_for(m, name)).is_some();
+    for name in gateway_assets.iter().chain(hostd_assets.iter()).filter(|_| manifest.is_ok()) {
+        if !listed(name) {
+            if !g.json { println!("{}", ui::note(&format!("{name}: not in release {version} — bundles carry no harness or helper for that platform"))); }
             continue;
         }
-        match fetch_release_file(g, &version, name, None) {
-            Ok(b) => {
-                let _ = std::fs::write(&path, &b);
-                if !g.json { println!("{}", ui::note(&format!("{name}: cached for the rail ({} bytes)", b.len()))); }
-            }
-            // "not in release" only when it is not; any other
-            // failure is said as itself, so a GitHub blip is not mistaken
-            // for a release without the asset.
-            Err(e) if e.is_not_found() => {
-                if !g.json { println!("{}", ui::note(&format!("{name}: not in release {version} ({}) — bundles carry no harness or helper for that platform", e.summary()))); }
-            }
-            Err(e) => ui::warned(&format!("{name}: not fetched ({e}) — bundles carry no harness or helper for that platform until a re-run fetches it")),
+        if let Err(e) = crate::commands::provision::cached_release_asset(g, &root, name) {
+            ui::warned(&format!("{name}: not fetched ({e}) — bundles carry no harness or helper for that platform until a re-run fetches it"));
         }
     }
     // Assets the gateway already holds at the same sha256: not re-sent, and
@@ -3887,15 +4145,11 @@ fn upload_cli_assets(g: &Globals, toks: &[serde_json::Value]) {
     // The signed manifest rides along: without it a node treats this mirror
     // as an old controller and goes to GitHub instead.
     let m = crate::release_sig::MANIFEST;
-    for name in [m.to_string(), format!("{m}.sig")] {
-        let path = cache.join(&name);
-        let bytes = match std::fs::read(&path).ok().filter(|b| !b.is_empty()) {
-            Some(b) => b,
-            None => match fetch_release_file(g, &version, &name, None) {
-                Ok(b) => { let _ = std::fs::write(&path, &b); b }
-                Err(e) => { ui::warned(&format!("{name}: not fetched ({e}) — nodes will verify against GitHub instead")); continue; }
-            },
-        };
+    let signed: Vec<(String, Vec<u8>)> = match &manifest {
+        Ok((man, sig)) => vec![(m.to_string(), man.clone().into_bytes()), (format!("{m}.sig"), sig.clone().into_bytes())],
+        Err(_) => Vec::new(),
+    };
+    for (name, bytes) in signed {
         let sha = { use sha2::{Digest, Sha256}; hex::encode(Sha256::digest(&bytes)) };
         if gateway_holds_cli_asset(g, &name, &sha) {
             already_held.push(name.clone());
@@ -3919,22 +4173,14 @@ fn upload_cli_assets(g: &Globals, toks: &[serde_json::Value]) {
         }
     }
     let mut uploaded: Vec<String> = Vec::new();
-    for asset in assets {
-        let path = cache.join(&asset);
-        let have = std::fs::read(&path).ok().filter(|b| !b.is_empty());
-        let bytes = match have {
-            Some(b) => b,
-            None => match download_asset(g, &version, &asset, None) {
-                Ok((bin, sha)) => {
-                    let _ = std::fs::write(&path, &bin);
-                    let _ = std::fs::write(cache.join(format!("{asset}.sha256")), &sha);
-                    bin
-                }
-                Err(e) => {
-                    ui::warned(&format!("{asset}: not fetched ({e}) — nodes on that platform keep their CLI"));
-                    continue;
-                }
-            },
+    for asset in release_assets {
+        let asset = asset.clone();
+        let bytes = match crate::commands::provision::cached_release_asset(g, &root, &asset) {
+            Ok(b) => b,
+            Err(e) => {
+                ui::warned(&format!("{asset}: not fetched ({e}) — nodes on that platform keep their CLI"));
+                continue;
+            }
         };
         let sha = {
             use sha2::{Digest, Sha256};
@@ -4135,6 +4381,14 @@ fn pick_latest_cli(releases: &[(String, bool)]) -> Option<String> {
 /// `gh` (auth), falls back to the token'd releases API. Never a prerelease
 /// ([`pick_latest_cli`]).
 pub(crate) fn resolve_latest(g: &Globals) -> Result<String, String> {
+    // No API first: github.com's `releases/latest` redirect names the newest
+    // final noo-cli release (only those are ever marked Latest). Behind a
+    // shared address the API's unauthenticated limit refused plain `noo
+    // upgrade` (rc.2 matrix found the same limit on the install path).
+    if let Some(v) = latest_via_redirect() {
+        if g.verbose { eprintln!("latest release: {TAG_PREFIX}{v} (releases/latest)"); }
+        return Ok(v);
+    }
     let mut gh_err: Option<FetchError> = None;
     if which("gh").is_some() {
         let out = std::process::Command::new("gh")
@@ -4176,6 +4430,37 @@ pub(crate) fn resolve_latest(g: &Globals) -> Result<String, String> {
         return Ok(v);
     }
     Err("no final noo-cli-v* release found".into())
+}
+
+/// The newest FINAL noo-cli release from github.com's `releases/latest`
+/// redirect, which is not the API and has no API rate limit. Only noo-cli
+/// finals are ever marked Latest: noo-cli-release.yml creates them with
+/// `--latest`, every rc with `--prerelease --latest=false`, and
+/// images-release.yml every stack release with `--latest=false` (the README's
+/// install line, releases/latest/download/install.sh, rests on the same
+/// rule). None (and the API lanes run) when the redirect is missing, does not
+/// name a final noo-cli tag, or the repo is private (github.com answers 404).
+fn latest_via_redirect() -> Option<String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(20)))
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .build()
+        .into();
+    let r = agent.head(&format!("https://github.com/{}/releases/latest", repo())).call().ok()?;
+    if !r.status().is_redirection() {
+        return None;
+    }
+    latest_cli_from_location(r.headers().get("location")?.to_str().ok()?)
+}
+
+/// `…/releases/tag/noo-cli-v0.6.23` → "0.6.23". Only a final noo-cli tag:
+/// anything else (a stack tag, an rc, a malformed path) is None. Pure.
+pub(crate) fn latest_cli_from_location(loc: &str) -> Option<String> {
+    let tag = loc.trim().rsplit_once("/releases/tag/")?.1.trim_end_matches('/');
+    let v = tag.strip_prefix(TAG_PREFIX)?;
+    let parts: Vec<&str> = v.split('.').collect();
+    (parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))).then(|| v.to_string())
 }
 
 /// gh's `release list` failure, classified — kept so that if
@@ -4658,6 +4943,33 @@ pub(crate) fn no_lock_refusal(install_mode: &str, tag: &str) -> Option<String> {
          refusing to roll to a release that cannot be verified. Nothing was changed"))
 }
 
+/// `NOO_INSTALL_MODE` from this process's environment, else the install's
+/// `.env` (`dist` = pull-only, digest-pinned; anything else is a dev install).
+pub(crate) fn install_mode(root: &std::path::Path) -> String {
+    let dotenv = std::fs::read_to_string(root.join(".env")).unwrap_or_default();
+    std::env::var("NOO_INSTALL_MODE").ok().filter(|v| !v.trim().is_empty())
+        .or_else(|| dotenv.lines().rev().find_map(|l| l.trim().strip_prefix("NOO_INSTALL_MODE=").map(|v| v.trim().trim_matches('"').to_string())))
+        .unwrap_or_default()
+}
+
+/// The release-signed stack lock of `tag`, fetched and verified (signature
+/// and tag binding, as `noo upgrade --stack` does), once per process and
+/// tag. `Ok(None)`: the release publishes no lock. i689(b): what provision
+/// takes the node agent from, by digest.
+pub(crate) fn verified_stack_lock(g: &Globals, tag: &str) -> Result<Option<String>, String> {
+    type Memo = std::sync::Mutex<std::collections::BTreeMap<String, Result<Option<String>, String>>>;
+    static MEMO: std::sync::OnceLock<Memo> = std::sync::OnceLock::new();
+    let memo = MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    if let Some(r) = memo.lock().ok().and_then(|m| m.get(tag).cloned()) {
+        return r;
+    }
+    let r = try_stack_lock(g, tag).map_err(|(_, msg, _)| msg);
+    if let Ok(mut m) = memo.lock() {
+        m.insert(tag.to_string(), r.clone());
+    }
+    r
+}
+
 /// [`fetch_stack_lock`] without the exit: `Err((code, message, remedy))`.
 pub(crate) type StackLockErr = (&'static str, String, Option<&'static str>);
 fn try_stack_lock(g: &Globals, tag: &str) -> Result<Option<String>, StackLockErr> {
@@ -4811,7 +5123,7 @@ fn addon_client(g: &Globals) -> crate::addons::lock_fetch::Client {
 }
 
 /// Remedy for an add-on that holds a stack roll.
-fn addon_hold_fix(addon: &str, r: &crate::addons::resolve::Refusal) -> String {
+fn addon_hold_fix(addon: &str, r: &crate::addons::resolve::Refusal, tag: &str) -> String {
     if let Some(fix) = r.registry_login_fix(addon) {
         return fix;
     }
@@ -4824,7 +5136,11 @@ fn addon_hold_fix(addon: &str, r: &crate::addons::resolve::Refusal) -> String {
     if matches!(r, crate::addons::resolve::Refusal::Downgrade { .. }) {
         return "noo upgrade --stack --allow-downgrade   # an explicit rollback of the add-on with the stack".to_string();
     }
-    format!("noo addons disable {addon}   # or wait for its release for this stack, or roll to an older one: noo upgrade --stack --tag <vX.Y.Z> (add --allow-downgrade to take the add-on back with it)")
+    // Path (b), proven by the rc.4 rehearsal (B-reenable.enable/.on): disable,
+    // roll, then enable it again from a lock signed for the new stack. The
+    // way out for an add-on enabled from a file (a developer's own lock),
+    // whose registry the roll cannot fetch a lock from.
+    format!("noo addons disable {addon}   # roll without it, then turn it back on with a lock signed for {tag}: noo addons enable {addon} --lock <bundle.json>. Or wait for its release for this stack, or roll to an older one: noo upgrade --stack --tag <vX.Y.Z> (add --allow-downgrade to take the add-on back with it)")
 }
 
 /// Step -1z of `upgrade_stack`: resolve, verify and pull every add-on that
@@ -4865,7 +5181,7 @@ fn addon_preflight(
                 };
                 fail(g.json, ExitCode::Generic, "addon_hold",
                     &format!("refusing to roll to {tag}: {why}. Nothing was changed"),
-                    Some(&addon_hold_fix(addon, &r)))
+                    Some(&addon_hold_fix(addon, &r, tag)))
             }
         }
     }
@@ -6836,9 +7152,12 @@ mod keyless_tests {
             "v0.6.1 published; held at v0.6.0 by trellion_intel");
         assert!(super::hold_line("v0.6.0", "v0.6.1", &[]).contains("every add-on that is on has a lock for it"));
         let r = crate::addons::resolve::Refusal::NoAnchor;
-        assert!(super::addon_hold_fix("evolve", &r).starts_with("noo addons disable evolve"));
+        let fix = super::addon_hold_fix("evolve", &r, "v0.6.25");
+        assert!(fix.starts_with("noo addons disable evolve"), "{fix}");
+        // Path (b): how to turn it back on after the roll, for that tag.
+        assert!(fix.contains("noo addons enable evolve --lock <bundle.json>") && fix.contains("signed for v0.6.25"), "{fix}");
         let d = crate::addons::resolve::Refusal::Downgrade { pinned: "2.0.0".into(), offered: "1.0.0".into() };
-        assert!(super::addon_hold_fix("evolve", &d).starts_with("noo upgrade --stack --allow-downgrade"));
+        assert!(super::addon_hold_fix("evolve", &d, "v0.6.25").starts_with("noo upgrade --stack --allow-downgrade"));
     }
 
     #[test]
@@ -7529,5 +7848,200 @@ mod embedder_after_roll_tests {
         let running = ensure.find("if !running").expect("a running check");
         let create = ensure.find("ensure_embed_model_core(&model)").expect("the shared fetch-and-create");
         assert!(running < create, "nothing is created in a container that is down");
+    }
+}
+
+/// 123 (outside tester, 0.6.21): a self node that had never reported an
+/// apply held `stage_applier_first`'s 600 s fetch wait inside STAGING, so
+/// pop-os was staged only after it; and "stopped at the nodes stage" hid
+/// that pop-os then upgraded fine.
+#[cfg(test)]
+mod nodes_stage_nonblocking_tests {
+    use super::{full_bundle_follows, node_outcome_lines, node_outcome_rows, outcome_of, NodeOutcome, Outcome};
+    use crate::commands::provision::{applier_first_due, ApplyEnd};
+
+    #[test]
+    fn the_applier_goes_first_only_for_a_legacy_non_mac_node_with_an_applier_to_send() {
+        assert!(applier_first_due(true, false, true));
+        for (legacy, darwin, present) in [(false, false, true), (true, true, true), (true, false, false)] {
+            assert!(!applier_first_due(legacy, darwin, present), "{legacy} {darwin} {present}");
+        }
+    }
+
+    /// The old handshake went on to the full bundle after a refused applier
+    /// or a missing report, and failed only when the node never fetched.
+    #[test]
+    fn the_full_bundle_follows_the_applier_unless_the_node_never_fetched() {
+        for end in [
+            ApplyEnd::Applied { rc: 0, msg: String::new() },
+            ApplyEnd::Applied { rc: 2, msg: String::new() },
+            ApplyEnd::LegacyUnconfirmed,
+            ApplyEnd::NotReported { fetched: true },
+        ] {
+            assert!(full_bundle_follows(&end), "{end:?}");
+        }
+        assert!(!full_bundle_follows(&ApplyEnd::NotReported { fetched: false }));
+    }
+
+    #[test]
+    fn every_end_has_an_outcome_and_a_reason() {
+        assert_eq!(outcome_of(&ApplyEnd::Applied { rc: 0, msg: "ok".into() }).0, Outcome::Applied);
+        let (o, why) = outcome_of(&ApplyEnd::Applied { rc: 3, msg: String::new() });
+        assert_eq!(o, Outcome::Refused);
+        assert!(why.contains("exit 3"), "{why}");
+        assert_eq!(outcome_of(&ApplyEnd::LegacyUnconfirmed).0, Outcome::Unconfirmed);
+        assert_eq!(outcome_of(&ApplyEnd::NotReported { fetched: true }).0, Outcome::NotReported);
+        assert_eq!(outcome_of(&ApplyEnd::NotReported { fetched: false }).0, Outcome::NotFetched);
+    }
+
+    fn row(n: &str, o: Outcome, secs: u64) -> NodeOutcome {
+        NodeOutcome { node: n.into(), outcome: o, why: format!("{} why", o.word()), elapsed_secs: secs }
+    }
+
+    /// The tester's run: the self node failed (never fetched), pop-os
+    /// applied. Both have a line; a skipped node and a staging failure too;
+    /// a node this stage never touched has none.
+    #[test]
+    fn every_touched_node_gets_a_row_in_order() {
+        let order: Vec<String> = ["host8", "pop-os", "host6", "untouched", "Lenovo-P52s"].iter().map(|s| s.to_string()).collect();
+        let skipped = vec![("host8".to_string(), "last seen 3 h ago".to_string())];
+        let waited = vec![row("pop-os", Outcome::Applied, 95), row("Lenovo-P52s", Outcome::NotFetched, 600)];
+        let failed = vec!["host6".to_string(), "Lenovo-P52s (self node)".to_string()];
+        let rows = node_outcome_rows(&order, &skipped, &waited, &failed);
+        let got: Vec<(&str, Outcome)> = rows.iter().map(|r| (r.node.as_str(), r.outcome)).collect();
+        assert_eq!(got, [
+            ("host8", Outcome::SkippedOffline),
+            ("pop-os", Outcome::Applied),
+            ("host6", Outcome::NotStaged),
+            ("Lenovo-P52s", Outcome::NotFetched),
+        ]);
+        assert!(rows[0].why.contains("last seen 3 h ago"), "{:?}", rows[0]);
+        // A self node that failed to STAGE (not waited on) is NotStaged.
+        let rows = node_outcome_rows(&["me".to_string()], &[], &[], &["me (self node)".to_string()]);
+        assert_eq!(rows.iter().map(|r| r.outcome).collect::<Vec<_>>(), [Outcome::NotStaged]);
+    }
+
+    #[test]
+    fn the_table_has_one_line_per_node_with_outcome_seconds_and_why() {
+        let lines = node_outcome_lines(&[row("pop-os", Outcome::Applied, 95), row("Lenovo-P52s", Outcome::NotFetched, 600)]);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("pop-os") && lines[0].contains("applied") && lines[0].contains("95s"), "{}", lines[0]);
+        assert!(lines[1].contains("Lenovo-P52s") && lines[1].contains("not fetched") && lines[1].contains("600s") && lines[1].contains("why"), "{}", lines[1]);
+    }
+
+    /// Under `--stage-only` the child stages the applier and RETURNS before
+    /// any fetch wait, and the provision verb then returns (scrubbing the
+    /// work dir, which holds the signed full bundle) before staging it.
+    #[test]
+    fn stage_only_never_waits_for_the_applier() {
+        let prov = crate::test_src::own_code(include_str!("provision.rs"));
+        let saf = crate::test_src::fn_body(&prov, "fn stage_applier_first(");
+        let ret = saf.find("if a.stage_only {\n                return (legacy, true);").expect("the stage-only return");
+        let wait = saf.find("wait_bundle_fetched(g, &node, 600)").expect("the single-node wait remains");
+        assert!(saf.find("poke_fetch(g, &node)").unwrap() < ret && ret < wait, "stage, poke, return; then (only without --stage-only) wait");
+        assert!(saf.contains("applier_first_due(legacy, darwin, !apply.is_empty())"), "one decision");
+        assert!(saf.contains("std::env::var(FULL_BUNDLE_ENV)"), "the restage after the applier stages the full bundle");
+        let verb = crate::test_src::fn_body(&prov, "pub fn cluster_provision(");
+        let early = verb.find("if applier_only {").expect("the early return");
+        let scrub = verb[early..].find("scrub(&work);").map(|i| i + early).expect("the work dir is scrubbed");
+        let staged = verb.find("stage_bundle(").expect("the full stage");
+        assert!(early < scrub && scrub < staged && verb[early..staged].contains("return Ok(0);"), "{verb}");
+        let first_for = crate::test_src::fn_body(&prov, "pub(crate) fn applier_first_for(");
+        assert!(first_for.contains("applier_first_due("), "the parent reads the same decision");
+    }
+
+    /// The combined wait restages the full bundle of an applier-first node
+    /// in a second round, with the env set only around that child.
+    #[test]
+    fn the_combined_wait_restages_the_full_bundle_after_the_applier() {
+        let up = crate::test_src::own_code(include_str!("upgrade.rs"));
+        let w = crate::test_src::fn_body(&up, "fn wait_and_settle_nodes(");
+        assert!(w.contains("if p.applier_first && full_bundle_follows(&end) {"), "{w}");
+        assert!(w.find("restage_full_bundle(g, &n, p.legacy)").unwrap() < w.rfind("wait_nodes_applied_timed(g, &second").unwrap());
+        let r = crate::test_src::fn_body(&up, "fn restage_full_bundle(");
+        let set = r.find("std::env::set_var(super::provision::FULL_BUNDLE_ENV, \"1\")").unwrap();
+        let child = r.find("provision_one(g, n, &[\"--stage-only\"])").unwrap();
+        let unset = r.find("std::env::remove_var(super::provision::FULL_BUNDLE_ENV)").unwrap();
+        assert!(set < child && child < unset, "{r}");
+        let nodes = crate::test_src::fn_body(&up, "fn upgrade_nodes(");
+        assert_eq!(nodes.matches("print_node_outcomes(g, &node_outcome_rows(").count(), 2, "both waits print the table");
+        assert!(nodes.find("let applier_first = super::provision::applier_first_for(g, n);").unwrap()
+            < nodes.find("provision_one(g, n, &[\"--stage-only\"])").unwrap(), "read before staging");
+    }
+}
+
+#[cfg(test)]
+mod roll_marker_tests {
+    use super::*;
+
+    #[test]
+    fn the_marker_is_one_timestamp() {
+        assert_eq!(parse_roll("1794456735\n"), Some(1_794_456_735));
+        assert_eq!(parse_roll(""), None);
+        assert_eq!(parse_roll("0"), None);
+        assert_eq!(parse_roll("yesterday"), None);
+    }
+
+    #[test]
+    fn both_roll_stages_record_and_a_clean_nodes_stage_names_verify_wait() {
+        let own = crate::test_src::own_code(include_str!("upgrade.rs"));
+        assert_eq!(own.matches("record_roll();").count(), 2, "stack and nodes stages");
+        assert!(own.contains("ui::guide(&[(VERIFY_AFTER_ROLL, VERIFY_AFTER_ROLL_WHY)]);"));
+        assert_eq!(VERIFY_AFTER_ROLL, "noo cluster verify --wait");
+    }
+}
+
+#[cfg(test)]
+mod latest_redirect_tests {
+    use super::latest_cli_from_location;
+
+    #[test]
+    fn only_a_final_noo_cli_tag_is_taken_from_the_redirect() {
+        assert_eq!(latest_cli_from_location("https://github.com/o/r/releases/tag/noo-cli-v0.6.23").as_deref(), Some("0.6.23"));
+        assert_eq!(latest_cli_from_location("https://github.com/o/r/releases/tag/noo-cli-v1.10.0/\r\n").as_deref(), Some("1.10.0"));
+        for bad in [
+            "https://github.com/o/r/releases/tag/stack-v0.6.23",
+            "https://github.com/o/r/releases/tag/noo-cli-v0.6.24-rc.2",
+            "https://github.com/o/r/releases/tag/noo-cli-v0.6",
+            "https://github.com/o/r/releases/tag/noo-cli-v0.6.x",
+            "https://github.com/o/r/releases",
+            "",
+        ] {
+            assert_eq!(latest_cli_from_location(bad), None, "{bad}");
+        }
+    }
+
+    /// resolve_latest asks the redirect before gh or the API.
+    #[test]
+    fn resolve_latest_tries_the_redirect_first() {
+        let own = crate::test_src::own_code(include_str!("upgrade.rs"));
+        let body = crate::test_src::fn_body(&own, "pub(crate) fn resolve_latest(");
+        let redirect = body.find("latest_via_redirect()").expect("the redirect lane");
+        let gh = body.find("which(\"gh\")").expect("the gh lane");
+        assert!(redirect < gh, "{body}");
+    }
+}
+
+#[cfg(test)]
+mod netns_reconcile_tests {
+    use super::netns_unit_needs_install;
+    use crate::netns_unit::State;
+
+    #[test]
+    fn the_stack_stage_installs_a_missing_stale_or_disabled_unit_on_systemd_only() {
+        for s in [State::Missing, State::Stale, State::Disabled] {
+            assert!(netns_unit_needs_install(true, s), "{s:?}");
+            assert!(!netns_unit_needs_install(false, s), "no systemd: {s:?}");
+        }
+        assert!(!netns_unit_needs_install(true, State::Current));
+    }
+
+    /// The stack stage (also under --all) reconciles it with the other local
+    /// state, before the launcher.
+    #[test]
+    fn the_stack_stage_calls_the_reconcile() {
+        let own = crate::test_src::own_code(include_str!("upgrade.rs"));
+        let body = crate::test_src::fn_body(&own, "fn upgrade_stack(");
+        assert!(body.contains("reconcile_netns_unit(g, &roll.root);"), "{body}");
     }
 }

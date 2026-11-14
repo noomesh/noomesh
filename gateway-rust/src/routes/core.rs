@@ -2180,10 +2180,17 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
 
     // Open fds and the soft limit (fd_watch.rs; the 2026-11-02 EMFILE outage).
     body.push_str(&crate::fd_watch::metrics_text(&crate::fd_watch::read()));
+    // The bootstrap bundle's ETag (bundle_etag.rs): 304s vs 200s per node,
+    // and the bundle bytes a 304 did not send.
+    body.push_str(&crate::bundle_etag::metrics_text());
+    body.push_str(&crate::proc_self::metrics_text(crate::proc_self::read()));
 
     // The audit trail (i520): chain verify failures, and spool rows lost or held.
     body.push_str(&crate::audit_verify::metrics_text());
     body.push_str(&crate::audit_spool::metrics_text());
+
+    // Placed vLLMs' own metrics (backend_metrics.rs): allow-listed, labelled by the placement record.
+    body.push_str(&crate::backend_metrics::metrics_text());
 
     // In-process counters/gauges (Phase 2 events + Python pushes)
     body.push_str(&state.metrics.render().await);

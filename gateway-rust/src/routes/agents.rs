@@ -42,6 +42,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/agents/trust/remove", post(trust_remove))
         // which of a person's windows are alive.
         .route("/api/agents/presence", get(presence_list))
+        .route("/api/agents/directory", get(directory_list))
         // who am I on this session — the address others message.
         .route("/api/agents/whoami", get(whoami))
         // name this session (`<account>/<type>-<name>`) so others can address it.
@@ -659,8 +660,13 @@ async fn resolve_skill_node(
     needs_gpu: bool,
 ) -> Result<(String, String), AppError> {
     if let Some(nid) = node_id {
-        let url = crate::node_link::NodeLink::for_node(state, nid).await?.base().to_string();
-        return Ok((nid.to_string(), url));
+        let link = crate::node_link::NodeLink::for_node(state, nid).await?;
+        // The skill runner is handed an address, not a link: a node reached
+        // only over its bus/tunnel cannot take it.
+        if !link.has_address() {
+            return Err(AppError::NotFound(crate::node_link::needs_address_message(nid, "running a skill on it")));
+        }
+        return Ok((nid.to_string(), link.base().to_string()));
     }
 
     // Auto-select: scan NATS KV for least-loaded node
@@ -1373,6 +1379,58 @@ mod tests {
 
     /// 217: the list says which question it answered. An owner-scoped
     /// list with no thread filter says so; a thread filter is echoed.
+    fn dir_entry(account: &str, label: &str, kind: &str, age_secs: i64, retired: bool) -> crate::repo::agent_names::Entry {
+        let seen = chrono::Utc::now() - chrono::Duration::seconds(age_secs);
+        crate::repo::agent_names::Entry {
+            account: account.into(),
+            row: crate::repo::agent_names::NameRow {
+                label: label.into(),
+                kind: kind.into(),
+                gen: 1,
+                last_seen: seen,
+                retired_at: retired.then_some(seen),
+            },
+            holders: 1,
+            unread: 0,
+        }
+    }
+
+    /// 0.6.24: the directory answers "who can I message now". Online first,
+    /// every chosen name with its state, the short-lived names collapsed per
+    /// client type (only the online and recent ones listed), and the
+    /// account's orphaned mail.
+    #[test]
+    fn the_directory_leads_with_who_is_online_and_collapses_short_lived_names() {
+        let mut es = vec![
+            dir_entry("rbwolf", "claude-general", "chosen", 60, false),
+            dir_entry("rbwolf", "claude-weekly", "chosen", 3 * 86_400, false),
+            dir_entry("rbwolf", "codex-aaaaaa", "default", 30, false),
+            dir_entry("rbwolf", "codex-bbbbbb", "default", 3_600, false),
+        ];
+        for i in 0..40 {
+            es.push(dir_entry("rbwolf", &format!("codex-old{i:03}"), "default", 2 * 86_400, true));
+        }
+        let orphans = vec![("rbwolf".to_string(), "claude-weekly".to_string(), 3i64)];
+        let w = crate::agent_mailbox::Windows::default();
+        let v = directory_json(&es, &orphans, &w, None, 0);
+        let a = &v["accounts"][0];
+        assert_eq!(a["online"], json!(["rbwolf/codex-aaaaaa", "rbwolf/claude-general"]), "online, most recently seen first");
+        assert_eq!(a["chosen"][0]["name"], "rbwolf/claude-general");
+        assert_eq!(a["chosen"][0]["state"], "online");
+        assert_eq!(a["chosen"][1]["state"], "idle", "a chosen name a few days quiet is resumable");
+        let codex = &a["short_lived"][0];
+        assert_eq!(codex["type"], "codex");
+        assert_eq!(codex["counts"]["retired"], 40);
+        assert_eq!(codex["listed"].as_array().unwrap().len(), 2, "only the online and recent ones are listed");
+        assert_eq!(a["orphaned"][0], json!({"name": "rbwolf/claude-weekly", "unread": 3}));
+        // One type, paged: every one of its names, 20 at a time.
+        let p0 = directory_json(&es, &orphans, &w, Some("codex"), 0);
+        let c0 = &p0["accounts"][0]["short_lived"][0];
+        assert_eq!((c0["listed"].as_array().unwrap().len(), c0["more"].as_u64()), (20, Some(22)));
+        let p2 = directory_json(&es, &orphans, &w, Some("codex"), 2);
+        assert_eq!(p2["accounts"][0]["short_lived"][0]["listed"].as_array().unwrap().len(), 2);
+    }
+
     #[test]
     fn the_messages_list_echoes_the_filter_it_applied() {
         let f = crate::repo::agent_messages::Filter {
@@ -1390,6 +1448,7 @@ mod tests {
             unread_only: false,
             reader: Some("rbwolf/claude-x"),
             limit: 50,
+            orphans: crate::repo::agent_messages::OrphanView::Hide,
         };
         assert_eq!(super::applied_filter(&f), json!({"scope": "own: rbwolf", "limit": 50}));
         let f = crate::repo::agent_messages::Filter { thread: Some("thr_b"), unread_only: true, owner: None, ..f };
@@ -1863,6 +1922,151 @@ async fn presence_list(
     Ok(Json(json!({ "owner": owner, "sessions": sessions, "idle_ttl_secs": crate::mcp_session::IDLE_TTL.as_secs() })))
 }
 
+#[derive(Deserialize, Default)]
+struct DirectoryQuery {
+    owner: Option<String>,
+    #[serde(default)]
+    all: bool,
+    #[serde(default)]
+    include_retired: bool,
+    /// One client type's short-lived names, paged (`codex`).
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    page: usize,
+}
+
+/// GET /api/agents/directory — who can be messaged, by account (0.6.24):
+/// online mailboxes first, then every chosen name with its state, then the
+/// short-lived default names collapsed per client type, and the account's
+/// orphaned mail. A caller lists its own account; `owner`/`all` beyond it
+/// are operator-only and refused (not emptied), as presence is.
+async fn directory_list(
+    State(state): State<Arc<AppState>>,
+    requester: Option<Extension<RequesterCtx>>,
+    cluster: Option<Extension<ClusterNode>>,
+    Query(q): Query<DirectoryQuery>,
+) -> AppResult {
+    let who = caller(&requester, &cluster);
+    let mine = who.account();
+    let account: Option<String> = if q.all {
+        if !who.privileged {
+            return Err(AppError::Forbidden("all=true is operator-only — omit it to list your own account".into()));
+        }
+        None
+    } else {
+        let owner = q.owner.as_deref().map(str::trim).filter(|o| !o.is_empty()).map(str::to_string).or(mine.clone());
+        let Some(owner) = owner else {
+            return Err(AppError::BadRequest("owner is required for a caller with no account of its own".into()));
+        };
+        if !who.privileged && mine.as_deref() != Some(owner.as_str()) {
+            return Err(AppError::Forbidden(format!("'{}' may list its own account's directory only", who.label)));
+        }
+        Some(owner)
+    };
+    let entries = crate::repo::agent_names::directory(&state.db, account.as_deref(), q.include_retired).await?;
+    let orphans = crate::repo::agent_names::orphan_counts(&state.db, account.as_deref()).await?;
+    let w = crate::agent_mailbox::Windows::current();
+    Ok(Json(directory_json(&entries, &orphans, &w, q.kind.as_deref(), q.page)))
+}
+
+/// Short-lived names listed per type and page.
+const DIRECTORY_PAGE: usize = 20;
+
+/// The directory body (pure, so the grouping is tested without a database).
+fn directory_json(
+    entries: &[crate::repo::agent_names::Entry],
+    orphans: &[(String, String, i64)],
+    w: &crate::agent_mailbox::Windows,
+    only_type: Option<&str>,
+    page: usize,
+) -> Value {
+    use crate::agent_mailbox::{tier_of, Tier};
+    use std::collections::BTreeMap;
+    let type_of = |label: &str| -> String {
+        label
+            .split_once('-')
+            .map(|(p, _)| p)
+            .filter(|p| crate::mcp_session::KNOWN_TYPES.contains(p))
+            .unwrap_or("other")
+            .to_string()
+    };
+    let mut accounts: BTreeMap<&str, Vec<&crate::repo::agent_names::Entry>> = BTreeMap::new();
+    for e in entries {
+        accounts.entry(e.account.as_str()).or_default().push(e);
+    }
+    for (a, _, _) in orphans {
+        accounts.entry(a.as_str()).or_default();
+    }
+    let mut out = Vec::new();
+    for (account, es) in accounts {
+        let full = |l: &str| format!("{account}{}{l}", crate::auth::CONNECTION_SEP);
+        let item = |e: &crate::repo::agent_names::Entry, t: Tier| {
+            json!({
+                "name": full(&e.row.label),
+                "kind": e.row.kind,
+                "state": t.as_str(),
+                "last_seen": e.row.last_seen,
+                "retired_at": e.row.retired_at,
+                "sessions": e.holders,
+                "unread": e.unread,
+            })
+        };
+        let mut tiered: Vec<(Tier, &crate::repo::agent_names::Entry)> = es.iter().map(|e| (tier_of(&e.row, w), *e)).collect();
+        tiered.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.row.last_seen.cmp(&a.1.row.last_seen)));
+        let online: Vec<String> = tiered.iter().filter(|(t, _)| *t == Tier::Online).map(|(_, e)| full(&e.row.label)).collect();
+        let chosen: Vec<Value> = tiered.iter().filter(|(_, e)| e.row.kind == "chosen").map(|(t, e)| item(e, *t)).collect();
+        let mut short: BTreeMap<String, (BTreeMap<&'static str, i64>, Vec<Value>)> = BTreeMap::new();
+        for (t, e) in tiered.iter().filter(|(_, e)| e.row.kind != "chosen") {
+            let ty = type_of(&e.row.label);
+            if only_type.is_some_and(|o| o != ty) {
+                continue;
+            }
+            let g = short.entry(ty).or_default();
+            *g.0.entry(t.as_str()).or_default() += 1;
+            if matches!(t, Tier::Online | Tier::Recent) || only_type.is_some() {
+                g.1.push(item(e, *t));
+            }
+        }
+        let short_lived: Vec<Value> = short
+            .into_iter()
+            .map(|(ty, (counts, listed))| {
+                let total = listed.len();
+                let start = page.saturating_mul(DIRECTORY_PAGE).min(total);
+                let end = (start + DIRECTORY_PAGE).min(total);
+                json!({
+                    "type": ty,
+                    "counts": counts,
+                    "listed": &listed[start..end],
+                    "more": total - end,
+                    "page": page,
+                })
+            })
+            .collect();
+        let orphaned: Vec<Value> = orphans
+            .iter()
+            .filter(|(a, _, _)| a == account)
+            .map(|(_, l, n)| json!({ "name": full(l), "unread": n }))
+            .collect();
+        out.push(json!({
+            "account": account,
+            "online": online,
+            "chosen": chosen,
+            "short_lived": short_lived,
+            "orphaned": orphaned,
+        }));
+    }
+    json!({
+        "accounts": out,
+        "windows_secs": {
+            "online": w.online.as_secs(),
+            "recent": w.recent.as_secs(),
+            "default_retire": w.default_retire.as_secs(),
+            "chosen_retire": w.chosen_retire.as_secs(),
+        },
+    })
+}
+
 /// GET /api/agents/whoami — the acting agent name of this session (the
 /// address other sessions use to message it), its account, the harness the
 /// credential arrived through, and whether it is privileged. `name` is null
@@ -2082,6 +2286,10 @@ struct SendReq {
     /// from the credential class.
     #[serde(default, alias = "harness_claimed")]
     harness: Option<String>,
+    /// Refuse rather than queue when the recipient's mailbox is not online
+    /// now (seen within the online window, 0.6.24).
+    #[serde(default)]
+    online_only: bool,
 }
 
 /// POST /api/agents/messages — send (publish to the stream; the recorder
@@ -2154,7 +2362,35 @@ async fn messages_send(
         crate::agent_recipient::Recipient::Unknown(candidates) => {
             return Err(AppError::NotFound(crate::agent_recipient::refusal(&req.to, &candidates)));
         }
+        crate::agent_recipient::Recipient::Retired(at, names) => {
+            return Err(AppError::Conflict(crate::agent_recipient::retired_refusal(&req.to, &at, &names)));
+        }
     };
+    if let Some(why) = crate::agent_recipient::thread_reply_refusal(&state.db, &req.to, req.thread_id.as_deref()).await? {
+        return Err(AppError::Conflict(why));
+    }
+    // Whether anyone is reading `to` now (0.6.24). Only a registered
+    // mailbox has a state; an account, a node or a key reads as null.
+    let delivery = crate::agent_mailbox::delivery(&state.db, &req.to).await?;
+    if req.online_only {
+        match delivery {
+            Some((crate::agent_mailbox::Tier::Online, _)) => {}
+            Some((t, seen)) => {
+                return Err(AppError::Conflict(format!(
+                    "'{}' is not online ({}, last seen {}); online_only: nothing was sent",
+                    req.to,
+                    t.as_str(),
+                    seen.to_rfc3339()
+                )))
+            }
+            None => {
+                return Err(AppError::Conflict(format!(
+                    "'{}' is not a conversation mailbox, so it has no online state; online_only: nothing was sent",
+                    req.to
+                )))
+            }
+        }
+    }
     let to = req.to.clone();
     // A thread post is authorised by the seat checked above, not by one
     // agent's trust list (there is no agent named "thread").
@@ -2235,6 +2471,10 @@ async fn messages_send(
         // Set when no session or key holds `to` (i277g): delivered, but
         // the sender is told it may be a typo, and what it may have meant.
         "warning": warning,
+        // online | recent | idle (queued for a resumable conversation);
+        // null for an account, node or key, which have no reader state.
+        "delivery": delivery.map(|(t, _)| t.as_str()),
+        "recipient_last_seen": delivery.map(|(_, seen)| seen),
     })))
 }
 
@@ -2255,6 +2495,10 @@ struct ListQuery {
     #[serde(default)]
     all: bool,
     limit: Option<i64>,
+    /// The account owner's view of mail orphaned by its retired names
+    /// (migration 119): only that mail, across every name of the account.
+    #[serde(default)]
+    orphaned: bool,
 }
 
 /// Does this list call see the whole system (`true`) or only the caller's
@@ -2361,6 +2605,9 @@ async fn messages_list(
     Query(q): Query<ListQuery>,
 ) -> AppResult {
     let who = caller(&requester, &cluster);
+    if q.orphaned {
+        return orphaned_list(&state, &who, &q).await;
+    }
     // Whose unread this is: the acting identity, so each window of a
     // person has its own read state. A privileged caller with no identity
     // (the shared cluster token) has none, and falls back to the
@@ -2414,11 +2661,34 @@ async fn messages_list(
         // decide it, whatever a sibling window has done.
         reader: reader.as_deref(),
         limit: q.limit.unwrap_or(50),
+        orphans: crate::repo::agent_messages::OrphanView::Hide,
     };
     let rows = crate::repo::agent_messages::list(&state.db, &filter)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Json(json!({ "messages": rows, "count": rows.len(), "filter": applied_filter(&filter) })))
+}
+
+/// `orphaned=true`: the unread mail of this account's retired names. The
+/// account is the caller's own; an operator may name another with `user`.
+/// A node or a caller with no account has no orphans to see.
+async fn orphaned_list(state: &AppState, who: &Caller, q: &ListQuery) -> AppResult {
+    let mine = who.account();
+    let account = match (who.privileged, q.user.as_deref(), mine.as_deref()) {
+        (true, Some(u), _) => u.to_string(),
+        (_, _, Some(m)) => m.to_string(),
+        _ => return Err(AppError::BadRequest("orphaned mail belongs to an account; this caller has none".into())),
+    };
+    let filter = crate::repo::agent_messages::Filter {
+        thread: q.thread.as_deref(),
+        limit: q.limit.unwrap_or(50),
+        orphans: crate::repo::agent_messages::OrphanView::OnlyOf(&account),
+        ..Default::default()
+    };
+    let rows = crate::repo::agent_messages::list(&state.db, &filter)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Json(json!({ "messages": rows, "count": rows.len(), "filter": {"scope": format!("orphaned: {account}")} })))
 }
 
 /// The question a list call actually answered (217): the scope it ran in

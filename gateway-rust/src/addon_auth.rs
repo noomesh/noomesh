@@ -199,6 +199,9 @@ pub async fn init(db: &PgPool) {
         failed("publish this boot's key", &e);
         return;
     }
+    // The previous boot's key is retired and this boot's is live: drop the
+    // resolved-key cache so neither answers wrongly for up to one TTL.
+    crate::service_keys::invalidate_cache();
 
     match prune_retired(db).await {
         // Logged at zero too: "pruned=0" is the line that says the prune

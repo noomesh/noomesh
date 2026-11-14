@@ -227,6 +227,13 @@ pub struct Summary {
     pub node: Option<String>,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    /// Milliseconds from the request's start to the first upstream frame that
+    /// carries content ([`note_first_token`]). `None`: none arrived.
+    pub ttft_ms: Option<i64>,
+    /// Milliseconds from the request's start until the node agent stopped
+    /// reporting it queued for a backend slot ([`note_queue_end`]). `None`:
+    /// it never queued.
+    pub queue_wait_ms: Option<i64>,
 }
 
 /// One request's trace while it runs.
@@ -302,6 +309,11 @@ impl Recorder {
 
     pub fn trace_id_hex(&self) -> String {
         hex::encode(self.ctx().trace_id)
+    }
+
+    /// Milliseconds since this request started.
+    fn elapsed_ms(&self) -> i64 {
+        (now_ns().saturating_sub(self.start_ns) / 1_000_000) as i64
     }
 
     fn with_summary(&self, f: impl FnOnce(&mut Summary)) {
@@ -396,6 +408,44 @@ pub fn note_principal(p: &crate::bus_principal::Principal) {
     }
 }
 
+/// What serves this request, noted when the candidate is CHOSEN (raw_chat,
+/// at commit), before any usage exists. A streamed answer's backend, model
+/// and node otherwise reached its trace only through [`note_usage`], when
+/// the stream's usage frame arrived; a stream the caller dropped first (a
+/// client timer, a backend that died) kept none, and 191 empty 40 s paiserve
+/// calls read as "no backend" until the logs were matched by hand (speed
+/// review 2026-11-11). Tokens are left to [`note_usage`].
+pub fn note_served(node: Option<&str>, backend: &str, model: &str) {
+    if let Some(r) = current() {
+        r.with_summary(|s| {
+            s.model = Some(model.to_string());
+            s.backend = Some(backend.to_string());
+            if let Some(n) = node {
+                s.node = Some(n.to_string());
+            }
+        });
+    }
+}
+
+/// The first upstream frame that carries content reached `rec`'s request.
+/// The first call wins. Called from the stream tap, which runs outside the
+/// request's task, so the recorder is passed in.
+pub fn note_first_token(rec: &Recorder) {
+    let ms = rec.elapsed_ms();
+    rec.with_summary(|s| {
+        s.ttft_ms.get_or_insert(ms);
+    });
+}
+
+/// The node agent stopped reporting `rec`'s request queued (its first line
+/// after the `: queued` comments). The first call wins.
+pub fn note_queue_end(rec: &Recorder) {
+    let ms = rec.elapsed_ms();
+    rec.with_summary(|s| {
+        s.queue_wait_ms.get_or_insert(ms);
+    });
+}
+
 /// A completion's model, backend, node and tokens, from the usage writer.
 /// Tokens add up across completions in one request (a tool loop).
 pub fn note_usage(node: Option<&str>, backend: &str, model: &str, prompt_tokens: u32, completion_tokens: u32) {
@@ -410,6 +460,19 @@ pub fn note_usage(node: Option<&str>, backend: &str, model: &str, prompt_tokens:
             s.completion_tokens += completion_tokens as i64;
         });
     }
+}
+
+/// Run the future `f` with `rec` as the request in scope. Test-only: other
+/// modules' tests need a request in scope to see what they note on it.
+#[cfg(test)]
+pub(crate) async fn scoped<F: std::future::Future>(rec: Arc<Recorder>, f: F) -> F::Output {
+    CURRENT.scope(rec, f).await
+}
+
+/// A request's recorder for another module's test (a POST to `route`).
+#[cfg(test)]
+pub(crate) fn test_recorder(route: &str) -> Arc<Recorder> {
+    Arc::new(Recorder::new(&Method::POST, route.to_string(), None, None))
 }
 
 /// Run `f` with `rec` as the request in scope: for work that finishes
@@ -1025,6 +1088,27 @@ mod tests {
         assert_eq!(route_of(None), "<unmatched>");
     }
 
+    /// A stream whose usage frame never arrives still names what served it;
+    /// when usage does arrive, it adds the tokens to the same attribution.
+    #[tokio::test]
+    async fn what_served_is_on_the_trace_from_commit_with_or_without_usage() {
+        note_served(Some("node-a"), "vllm", "m"); // no request in scope: nothing to note on
+        let dropped = Arc::new(Recorder::new(&Method::POST, "/api/external/chat/completions".into(), None, None));
+        CURRENT.scope(dropped.clone(), async { note_served(Some("mcmini"), "ollama", "gemma4:12b") }).await;
+        let s = dropped.summary();
+        assert_eq!((s.node.as_deref(), s.backend.as_deref(), s.model.as_deref()), (Some("mcmini"), Some("ollama"), Some("gemma4:12b")));
+        assert_eq!((s.prompt_tokens, s.completion_tokens), (0, 0), "no usage, no tokens");
+        let finished = Arc::new(Recorder::new(&Method::POST, "/v1/chat/completions".into(), None, None));
+        CURRENT
+            .scope(finished.clone(), async {
+                note_served(Some("awolf"), "vllm", "gemma");
+                note_usage(Some("awolf"), "vllm", "gemma", 4100, 64);
+            })
+            .await;
+        let s = finished.summary();
+        assert_eq!((s.node.as_deref(), s.backend.as_deref(), s.prompt_tokens, s.completion_tokens), (Some("awolf"), Some("vllm"), 4100, 64));
+    }
+
     #[tokio::test]
     async fn notes_land_on_the_request_in_scope_and_nowhere_else() {
         note_usage(Some("node-a"), "vllm", "m", 5, 5); // no request in scope: nothing to note on
@@ -1049,6 +1133,52 @@ mod tests {
         assert_eq!(s.actor.as_deref(), Some("alice"));
         assert_eq!(s.actor_kind.as_deref(), Some("user"));
         assert_eq!(current_trace_id(), None);
+    }
+
+    /// The MCP doors check their own key (the auth layer lets /mcp/* through),
+    /// so until 2026-11-11 a door call left NO trace row and its overhead was
+    /// unmeasurable. A door now notes its key's principal: the call is
+    /// recorded under the same actor as any other call with that key, and
+    /// the inner hop's traceparent continues the same trace.
+    #[tokio::test]
+    async fn a_door_call_is_recorded_under_its_keys_actor() {
+        let machine = crate::service_keys::Consumer::all("trellion-x");
+        let mut bound = crate::service_keys::Consumer::all("cli-door");
+        bound.user = Some("rbwolf".into());
+        for (consumer, actor, kind) in [(machine, "internal:key:trellion-x", "internal"), (bound, "rbwolf", "user")] {
+            let rec = Arc::new(Recorder::new(&Method::POST, "/mcp/operator".into(), None, None));
+            CURRENT
+                .scope(rec.clone(), async {
+                    assert!(current_traceparent().is_none(), "before the key check there is nothing to continue");
+                    note_principal(&crate::bus_principal::for_consumer(&consumer));
+                    let tp = parse_traceparent(&current_traceparent().expect("noted")).expect("valid");
+                    assert_eq!(tp.trace_id, rec.ctx().trace_id, "the inner hop joins this trace");
+                })
+                .await;
+            assert!(recorded(&rec, 200), "{actor}: the door call is recorded");
+            let s = rec.summary();
+            assert_eq!((s.actor.as_deref(), s.actor_kind.as_deref()), (Some(actor), Some(kind)));
+        }
+    }
+
+    /// Both doors note the caller right after their key resolves, and the
+    /// inner self-call carries the trace on.
+    #[test]
+    fn both_doors_note_their_caller_and_the_inner_hop_continues_the_trace() {
+        let ext = crate::test_src::own_code(include_str!("mcp_external.rs"));
+        let auth = crate::test_src::fn_body(&ext, "async fn authenticate(");
+        let resolved = auth.find("service_keys::resolve(").expect("the key check");
+        let noted = auth.find("request_trace::note_principal(&crate::bus_principal::for_consumer(&consumer))").expect("user door notes its caller");
+        assert!(resolved < noted && noted < auth.find("admit(consumer").expect("the quota"), "{auth}");
+        let exec = crate::test_src::fn_body(&ext, "async fn execute_spec(");
+        assert!(exec.contains("req.header(\"traceparent\", tp)") && exec.contains("current_traceparent()"), "{exec}");
+        let loc = crate::test_src::own_code(include_str!("mcp_local.rs"));
+        let op = crate::test_src::fn_body(&loc, "async fn authenticate_over_tls(");
+        let found = op.find("let Some(consumer) = found else").expect("the key check");
+        let noted = op.find("request_trace::note_principal(&crate::bus_principal::for_consumer(&consumer))").expect("operator door notes its caller");
+        assert!(found < noted && noted < op.find("door_rpm(&consumer)").expect("the quota"), "{op}");
+        let bp = crate::test_src::own_code(include_str!("bus_principal.rs"));
+        assert!(crate::test_src::fn_body(&bp, "pub fn from_extensions(").contains("for_consumer(consumer)"), "one mapping for the rail and the doors");
     }
 
     /// A streamed body's trace ends when the STREAM does, with its bytes: not

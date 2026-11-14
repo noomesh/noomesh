@@ -2398,6 +2398,43 @@ fn is_standalone_install(root: &std::path::Path) -> bool {
 }
 
 pub fn secrets_audit(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    audit_run(g, args, &[])
+}
+
+/// The audit `noo onboard` runs in its summary when the stack NEVER STARTED
+/// this run: `stack_minted` are the keys onboarding mints only against a
+/// running gateway (the per-consumer service keys). Their absence is then a
+/// consequence of the services failure, not a second thing to fix, so it is
+/// said that way ([`defer_stack_minted`]) and does not count as an ERROR.
+pub fn secrets_audit_stack_down(g: &Globals, stack_minted: &[String]) -> Result<i32, Unhandled> {
+    audit_run(g, &[], stack_minted)
+}
+
+/// Rewrite a `required-key-absent` ERROR for a key in `stack_minted` as an
+/// INFO saying when it is minted and what to fix instead. Every other
+/// finding, and every other key's ERROR, is untouched. Pure.
+pub fn defer_stack_minted(findings: Vec<Finding>, stack_minted: &[String]) -> Vec<Finding> {
+    findings
+        .into_iter()
+        .map(|f| {
+            if f.kind == "required-key-absent" && stack_minted.contains(&f.key) {
+                Finding {
+                    severity: Severity::Info,
+                    kind: "minted-at-stack-start",
+                    key: f.key,
+                    message: "minted when the stack starts, and the stack did not start on this run — \
+                              fix the services failure above; this key follows on the next \
+                              `noo onboard --reconfigure`"
+                        .into(),
+                }
+            } else {
+                f
+            }
+        })
+        .collect()
+}
+
+fn audit_run(g: &Globals, args: &[String], stack_minted: &[String]) -> Result<i32, Unhandled> {
     let mut sops_path: Option<PathBuf> = None;
     let mut env_path: Option<PathBuf> = None;
     let mut iter = args.iter();
@@ -2461,6 +2498,7 @@ pub fn secrets_audit(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if let Ok(conf) = std::fs::read_to_string(root.join(super::nats_users::USERS_CONF)) {
         findings.extend(orphaned_node_password_findings(&sops, &conf));
     }
+    let findings = defer_stack_minted(findings, stack_minted);
 
     if g.json {
         println!("{}", audit_json(&rows, &findings, &sops, &env, backend));
@@ -8644,5 +8682,48 @@ mod audit_classify_tests {
         }
         assert!(path_shaped("/var/lib/noo/state/pki/gateway/gateway.key"));
         assert!(!path_shaped(pem) && !path_shaped("relative/key") && !path_shaped(&blob) && !path_shaped("/a b"));
+    }
+}
+
+#[cfg(test)]
+mod stack_minted_tests {
+    use super::{defer_stack_minted, Finding, Severity};
+
+    fn absent(key: &str) -> Finding {
+        Finding { severity: Severity::Error, kind: "required-key-absent", key: key.into(), message: "absent".into() }
+    }
+
+    /// rc.1 install matrix: the stack never started (noo-data), so the
+    /// worker key onboarding mints against a running gateway was absent, and
+    /// the summary told a stranger to fix it as a second ERROR. Deferred, it
+    /// is an INFO pointing at the services failure; nothing else moves.
+    #[test]
+    fn a_stack_minted_key_is_deferred_and_nothing_else() {
+        let plaintext = Finding { severity: Severity::Error, kind: "plaintext-duplicate", key: "NOO_SVC_KEY_WORKER".into(), message: "x".into() };
+        let out = defer_stack_minted(
+            vec![absent("NOO_SVC_KEY_WORKER"), absent("HF_TOKEN"), plaintext.clone()],
+            &["NOO_SVC_KEY_WORKER".to_string()],
+        );
+        assert_eq!(out[0].severity, Severity::Info, "the worker key is still an ERROR to fix");
+        assert_eq!(out[0].kind, "minted-at-stack-start");
+        assert!(out[0].message.contains("fix the services failure above"), "{}", out[0].message);
+        assert_eq!(out[1], absent("HF_TOKEN"), "a key onboarding does not mint at start was deferred");
+        assert_eq!(out[2], plaintext, "another kind of ERROR on the same key was deferred");
+        let none = defer_stack_minted(vec![absent("NOO_SVC_KEY_WORKER")], &[]);
+        assert_eq!(none[0], absent("NOO_SVC_KEY_WORKER"), "deferred with no stack-down keys");
+    }
+
+    /// The deferral runs before the table is printed and before the exit
+    /// code counts ERRORs.
+    #[test]
+    fn the_audit_defers_before_printing_and_counting() {
+        let own = crate::test_src::own_code(include_str!("secrets.rs"));
+        let run = crate::test_src::fn_body(&own, "fn audit_run(");
+        let defer = run.find("let findings = defer_stack_minted(findings, stack_minted);").expect("the deferral");
+        let print = run.find("render_audit(").expect("the table");
+        let count = run.find("f.severity == Severity::Error").expect("the exit count");
+        assert!(defer < print && defer < count, "deferred after printing or counting");
+        let plain = crate::test_src::fn_body(&own, "pub fn secrets_audit(");
+        assert!(plain.contains("audit_run(g, args, &[])"), "the operator's own audit defers something");
     }
 }

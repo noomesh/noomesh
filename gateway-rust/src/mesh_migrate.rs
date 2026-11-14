@@ -2364,6 +2364,117 @@ BEGIN
     END IF;
 END $$;
 "#,
+}, Migration {
+    revision: AGENT_MAILBOXES_REVISION,
+    down_revision: Some(PERSPECTIVES_REVISION),
+    // 0.6.24: agent mailboxes owned by a conversation, not a connection
+    // (`repo::agent_names`). A modern (2026-07-28) MCP client opens no
+    // session, so a name can no longer live on `noo_mcp_sessions`.
+    // `noo_agent_names` is the directory; `gen` moves on when a retired
+    // name is taken by another conversation, so the old one's key no
+    // longer resolves to it. `noo_agent_name_keys` binds a conversation
+    // (its session key, hashed) to a name and generation.
+    // `noo_agent_orphans` holds the mail of a past generation: the unread
+    // mail of a retired one (the sweep), or ALL of it once another
+    // conversation takes the name (a new holder starts with an empty
+    // inbox). Hidden from the name, visible to the account owner,
+    // re-attached when that same conversation resumes. Additive: new tables
+    // only, which an older gateway ignores.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS noo_agent_names (
+    account text NOT NULL,
+    label text NOT NULL,
+    kind text NOT NULL,
+    gen integer NOT NULL DEFAULT 1,
+    first_seen timestamptz NOT NULL DEFAULT now(),
+    last_seen timestamptz NOT NULL DEFAULT now(),
+    last_consumer text,
+    retired_at timestamptz,
+    PRIMARY KEY (account, label),
+    CONSTRAINT noo_agent_names_kind CHECK (kind IN ('default', 'chosen'))
+);
+CREATE INDEX IF NOT EXISTS noo_agent_names_seen_idx ON noo_agent_names (account, last_seen DESC);
+CREATE TABLE IF NOT EXISTS noo_agent_name_keys (
+    account text NOT NULL,
+    key_hash text NOT NULL,
+    label text NOT NULL,
+    gen integer NOT NULL,
+    last_seen timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (account, key_hash)
+);
+CREATE INDEX IF NOT EXISTS noo_agent_name_keys_label_idx ON noo_agent_name_keys (account, label);
+CREATE TABLE IF NOT EXISTS noo_agent_orphans (
+    message_id text PRIMARY KEY,
+    account text NOT NULL,
+    label text NOT NULL,
+    gen integer NOT NULL,
+    unread boolean NOT NULL DEFAULT true,
+    orphaned_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS noo_agent_orphans_name_idx ON noo_agent_orphans (account, label, gen);
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'noo_app') THEN
+        GRANT SELECT, INSERT, UPDATE, DELETE ON noo_agent_names, noo_agent_name_keys, noo_agent_orphans TO noo_app;
+    END IF;
+END $$;
+"#,
+}, Migration {
+    revision: NODE_MODEL_SET_RETRY_REVISION,
+    down_revision: Some(AGENT_MAILBOXES_REVISION),
+    // i607b B3: the per-node `retry now` epoch for a refused model-set fetch.
+    // desired-config serves it as the top-level `model_set_retry`; the agent
+    // clears its refused backoff when the epoch moves past the one it saw.
+    // A table of its own, additive: a bump never touches a placement row. The
+    // epoch only goes up (the upsert adds one), and it lives here so a
+    // gateway restart cannot send it back to 0.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS noo_node_model_set_retry (
+    node_id text PRIMARY KEY,
+    epoch bigint NOT NULL DEFAULT 0,
+    sets jsonb NOT NULL DEFAULT '[]'::jsonb,
+    updated_by text,
+    updated_at timestamptz NOT NULL DEFAULT now()
+)
+"#,
+}, Migration {
+    revision: CONVERSATION_SOURCES_REVISION,
+    down_revision: Some(NODE_MODEL_SET_RETRY_REVISION),
+    // i608 (#169): the content-free source ledger for transcripts an add-on
+    // publishes through `noo_conversation_publish`. One row per (account,
+    // publisher, source id); `deleted` keeps a late replay of an erased or
+    // deleted source from coming back. Additive: a new table, which an older
+    // gateway ignores.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS noo_conversation_sources (
+    user_id text NOT NULL,
+    publisher_id uuid NOT NULL,
+    source_id uuid NOT NULL,
+    conversation_id uuid NOT NULL UNIQUE,
+    deleted boolean NOT NULL DEFAULT false,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, publisher_id, source_id)
+);
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'noo_app') THEN
+        GRANT SELECT, INSERT, UPDATE, DELETE ON noo_conversation_sources TO noo_app;
+    END IF;
+END $$;
+"#,
+}, Migration {
+    revision: REQUEST_TRACE_TTFT_REVISION,
+    down_revision: Some(CONVERSATION_SOURCES_REVISION),
+    // Speed review (2026-11-11): time to the first token, and the time a
+    // request spent queued for a backend slot, on each request's trace row.
+    // Both nullable: NULL means "no content frame arrived" (a stream the
+    // caller dropped while it queued), which is the case the columns exist to
+    // show, and the read paths ignore it rather than count it as 0. Additive:
+    // two columns, no rewrite (no default), the table's grants cover them.
+    sql: r#"
+ALTER TABLE noo_request_trace ADD COLUMN IF NOT EXISTS ttft_ms bigint;
+ALTER TABLE noo_request_trace ADD COLUMN IF NOT EXISTS queue_wait_ms bigint;
+"#,
 }];
 
 /// Add-on feature settings and the super-admin flag (f99). A constant so a
@@ -2401,6 +2512,26 @@ pub const SEAT_DISPLAY_REVISION: &str = "113_seat_display";
 /// `perspective_id` on refresh rows, on seat display (113). A constant so a
 /// renumber at rebase is one line.
 pub const PERSPECTIVES_REVISION: &str = "114_perspectives";
+
+/// Agent mailboxes owned by a conversation (0.6.24). 119: 115 is #900, 116
+/// i596 slice 2, 117 #937's conversation sources, 118 taken; it chains on
+/// whichever is the head when it lands. A constant so a renumber at rebase
+/// is one line.
+pub const AGENT_MAILBOXES_REVISION: &str = "119_agent_mailboxes";
+
+/// The per-node model-set `retry now` epoch (i607b B3), on agent mailboxes
+/// (119). A constant so a renumber at rebase is one line.
+pub const NODE_MODEL_SET_RETRY_REVISION: &str = "120_node_model_set_retry";
+
+/// The conversation source ledger (i608, #169/#937), on the model-set retry
+/// epoch (120). Numbered at rebase against dev's real head; a migration that
+/// lands after it renumbers. A constant so a renumber at rebase is one line.
+pub const CONVERSATION_SOURCES_REVISION: &str = "121_conversation_sources";
+
+/// `ttft_ms` and `queue_wait_ms` on the request trace (speed review), on the
+/// conversation source ledger (121): numbered at rebase against dev's real
+/// head. A constant so a renumber is one line.
+pub const REQUEST_TRACE_TTFT_REVISION: &str = "122_request_trace_ttft";
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
 /// constant so a renumber at rebase is one line.
@@ -2979,6 +3110,21 @@ pub async fn report(db: &PgPool) {
     }
 }
 
+// Test-only, so it sits below every revision constant: the release script
+// (scripts/mesh-migration-head.sh) stops reading at the first cfg(test) attribute.
+/// Whether the chain creates `col` on `noo_request_trace`: in the request-trace
+/// revision's own CREATE TABLE, or in a later additive
+/// `ALTER TABLE noo_request_trace ADD COLUMN IF NOT EXISTS <col> ` (the TTFT
+/// columns, 122). The writer and reader guards ask this, so a column added the
+/// additive way is not mistaken for one that was never created.
+#[cfg(test)]
+pub(crate) fn request_trace_creates(col: &str) -> bool {
+    MIGRATIONS.iter().any(|m| {
+        (m.revision == REQUEST_TRACE_REVISION && m.sql.contains(&format!("\n    {col} ")))
+            || m.sql.contains(&format!("ALTER TABLE noo_request_trace ADD COLUMN IF NOT EXISTS {col} "))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2992,6 +3138,29 @@ mod tests {
     /// `# mesh-migration-head` line, which `noo upgrade --stack` trusts when it
     /// refuses a rollback below the database stamp. If the script and the
     /// real chain disagree, that refusal is wrong in one direction or the other.
+    /// The release script (scripts/mesh-migration-head.sh) reads this file
+    /// only up to the first line holding the test attribute, anywhere in the
+    /// line, a comment included. So every revision string must sit above that
+    /// line: a test-only item placed among the constants hides the ones below
+    /// it (it hid 122 once, 2026-11-11), and the head the script signs goes
+    /// backwards.
+    #[test]
+    fn every_revision_sits_above_the_first_test_attribute() {
+        let src = include_str!("mesh_migrate.rs");
+        let attr = concat!("#[cfg(", "test)]");
+        let stop = src.lines().position(|l| l.contains(attr)).expect("a test module");
+        let read: Vec<&str> = src.lines().take(stop).collect();
+        let read = read.join("\n");
+        for m in MIGRATIONS {
+            assert!(
+                read.contains(&format!("\"{}\"", m.revision)),
+                "{} is not above line {} (the first test attribute): the release script cannot see it",
+                m.revision,
+                stop + 1
+            );
+        }
+    }
+
     #[test]
     fn the_release_script_reads_the_real_chain_head() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
@@ -3373,7 +3542,7 @@ mod tests {
         let insert = writer.split("INSERT INTO noo_request_trace").nth(1).expect("the writer inserts");
         let cols = insert.split('(').nth(1).and_then(|c| c.split(')').next()).expect("a column list");
         for col in cols.split(',').map(str::trim) {
-            assert!(m.sql.contains(&format!("\n    {col} ")), "{col} is written but not created");
+            assert!(request_trace_creates(col), "{col} is written but not created");
         }
         assert!(writer.contains("DELETE FROM noo_request_trace WHERE at <"), "the prune keys on `at`");
         assert!(m.sql.contains("\n    at timestamptz NOT NULL DEFAULT now()"));
@@ -3999,16 +4168,15 @@ mod seat_display_migration_tests {
 mod perspectives_migration_tests {
     use super::*;
 
-    /// i538 P1: the perspectives revision is the chain head, sits on seat
-    /// display, and only adds: a new table, a partial index, one nullable
-    /// column on the refresh rows, and the app role's grant.
+    /// i538 P1: the perspectives revision sits on seat display and only
+    /// adds: a new table, a partial index, one nullable column on the
+    /// refresh rows, and the app role's grant.
     #[test]
-    fn perspectives_revision_is_the_head_and_additive() {
+    fn perspectives_revision_sits_on_seat_display_and_is_additive() {
         let m = MIGRATIONS.iter().find(|m| m.revision == PERSPECTIVES_REVISION).expect("must be in the chain");
         assert_eq!(m.revision, "114_perspectives");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(SEAT_DISPLAY_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(PERSPECTIVES_REVISION), "the chain head");
         assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_perspectives"));
         assert!(m.sql.contains("cap_at timestamptz NOT NULL"));
         assert!(m.sql.contains("ALTER TABLE noo_refresh_tokens ADD COLUMN IF NOT EXISTS perspective_id uuid"));
@@ -4017,5 +4185,108 @@ mod perspectives_migration_tests {
             assert!(m.sql.contains(reason), "{reason}");
         }
         assert!(!m.sql.contains("DELETE") && !m.sql.contains("DROP") && !m.sql.contains("UPDATE noo_"));
+    }
+}
+
+#[cfg(test)]
+mod agent_mailboxes_migration_tests {
+    use super::*;
+
+    /// 0.6.24: the agent-mailboxes revision sits on perspectives, and only
+    /// adds three tables and the app role's grant.
+    #[test]
+    fn agent_mailboxes_revision_sits_on_perspectives_and_is_additive() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == AGENT_MAILBOXES_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "119_agent_mailboxes");
+        assert!(m.revision.len() <= 32);
+        assert_eq!(m.down_revision, Some(PERSPECTIVES_REVISION));
+        for t in ["noo_agent_names", "noo_agent_name_keys", "noo_agent_orphans"] {
+            assert!(m.sql.contains(&format!("CREATE TABLE IF NOT EXISTS {t} (")), "{t}");
+        }
+        assert!(m.sql.contains("PRIMARY KEY (account, key_hash)"), "one name per conversation key per account");
+        assert!(!m.sql.contains("DROP") && !m.sql.contains("ALTER TABLE") && !m.sql.contains("DELETE FROM"));
+    }
+}
+
+#[cfg(test)]
+mod node_model_set_retry_migration_tests {
+    use super::*;
+
+    /// i607b B3: the retry-epoch revision sits on agent mailboxes (119) and
+    /// only creates its own table.
+    #[test]
+    fn node_model_set_retry_revision_sits_on_agent_mailboxes_and_is_additive() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == NODE_MODEL_SET_RETRY_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "120_node_model_set_retry");
+        assert_eq!(m.down_revision, Some(AGENT_MAILBOXES_REVISION));
+        assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_node_model_set_retry"));
+        assert!(!m.sql.contains("DELETE") && !m.sql.contains("UPDATE") && !m.sql.contains("DROP") && !m.sql.contains("ALTER"));
+        let writer = include_str!("repo/node_model_set_retry.rs");
+        for col in ["node_id", "epoch", "sets", "updated_by"] {
+            assert!(m.sql.contains(col) && writer.contains(col), "{col}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod conversation_sources_migration_tests {
+    use super::*;
+
+    /// i608 (#937): the conversation-sources revision sits on the model-set
+    /// retry epoch (120), and only adds a table and the app role's grant.
+    #[test]
+    fn conversation_sources_revision_sits_on_the_retry_epoch_and_is_additive() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == CONVERSATION_SOURCES_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "121_conversation_sources");
+        assert!(m.revision.len() <= 32);
+        assert_eq!(m.down_revision, Some(NODE_MODEL_SET_RETRY_REVISION));
+        assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_conversation_sources"));
+        assert!(m.sql.contains("PRIMARY KEY (user_id, publisher_id, source_id)"));
+        assert!(m.sql.contains("GRANT SELECT, INSERT, UPDATE, DELETE ON noo_conversation_sources TO noo_app"));
+        assert!(!m.sql.contains("DROP") && !m.sql.contains("UPDATE noo_") && !m.sql.contains("DELETE FROM"));
+    }
+}
+
+#[cfg(test)]
+mod request_trace_ttft_migration_tests {
+    use super::*;
+
+    /// The TTFT columns: the chain head, on the conversation source ledger
+    /// (121), additive, nullable, no default.
+    #[test]
+    fn request_trace_ttft_is_the_head_and_additive() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == REQUEST_TRACE_TTFT_REVISION).expect("in the chain");
+        assert_eq!(m.revision, "122_request_trace_ttft");
+        assert!(m.revision.len() <= 32);
+        assert_eq!(m.down_revision, Some(CONVERSATION_SOURCES_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(REQUEST_TRACE_TTFT_REVISION), "the chain head");
+        for col in ["ttft_ms", "queue_wait_ms"] {
+            assert!(m.sql.contains(&format!("ALTER TABLE noo_request_trace ADD COLUMN IF NOT EXISTS {col} bigint;")), "{col}");
+        }
+        for banned in ["DEFAULT", "NOT NULL", "DROP", "DELETE", "UPDATE"] {
+            assert!(!m.sql.contains(banned), "{banned}: the TTFT columns only add nullable columns");
+        }
+    }
+
+    /// The release script (`scripts/mesh-migration-head.sh`) takes the
+    /// HIGHEST number as the chain head for the signed stack lock, so the
+    /// numbers must rise along the chain. A migration that lands after a
+    /// higher-numbered one must take the next free number.
+    #[test]
+    fn migration_numbers_strictly_increase_along_the_chain() {
+        let mut last: Option<(u32, &str)> = None;
+        for m in MIGRATIONS {
+            let n: u32 = m.revision.split('_').next().and_then(|p| p.parse().ok())
+                .unwrap_or_else(|| panic!("{}: a revision starts with its number", m.revision));
+            if let Some((prev, prev_rev)) = last {
+                assert!(
+                    n > prev,
+                    "{} follows {} in the chain but its number is not higher: take the next free number at rebase \
+                     (the release script reads the HIGHEST number as the chain head)",
+                    m.revision, prev_rev
+                );
+            }
+            last = Some((n, m.revision));
+        }
     }
 }

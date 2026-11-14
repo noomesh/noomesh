@@ -41,6 +41,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/auth"
@@ -120,6 +121,11 @@ type desiredConfig struct {
 	// {doc, sig}, opaque to the gateway, verified here. Absent on a gateway
 	// that predates it; absent or null keeps the set this node holds.
 	WorkloadApprovals json.RawMessage `json:"workload_approvals"`
+	// `retry now` for refused model sets (i607b B3): {epoch, sets}. A
+	// TOP-LEVEL key on purpose: this struct decodes leniently (an old agent
+	// ignores the key), while the node_workloads fragment is decoded strictly.
+	// Absent (or epoch 0) = nothing to retry. See applyModelSetRetry.
+	ModelSetRetry *modelSetRetry `json:"model_set_retry"`
 }
 
 // Reconciler pulls desired config and converges the node toward it.
@@ -138,6 +144,11 @@ type Reconciler struct {
 	// sets holds the model sets desired-config names (i300 F4). nil in tests
 	// that build a Reconciler by hand; convergeModelSets is then skipped.
 	sets *modelsets.Store
+	// retryEpoch is the highest model_set_retry epoch applied. In memory
+	// only: it starts at 0 on every agent start, so a stored epoch > 0 clears
+	// refused sets once after a restart. A restart already empties the
+	// refused backoff (it is in memory too), so that clear finds nothing.
+	retryEpoch atomic.Uint64
 	// nodeWL drives the add-on node workloads (i300 F5b) and facts reports the
 	// node's consent policy and placement facts. nil in tests that build a
 	// Reconciler by hand; convergeNodeWorkloads is then skipped. nwBusy, nwMu
@@ -169,6 +180,9 @@ type Reconciler struct {
 	// answered with, for GET /harness/placement. Guarded by harnessMu.
 	harnessMu      sync.RWMutex
 	harnessDesired *placement
+	// harnessKnown: a desired-config has been applied at least once, so
+	// harnessDesired == nil means "no harness placed", not "not known yet".
+	harnessKnown bool
 	// chatDesired is the last desired chat placement (POST /bench benches
 	// it). Guarded by harnessMu.
 	chatDesired *placement
@@ -190,6 +204,9 @@ type Reconciler struct {
 	// cliInstalled says whether a foreign kind's vendor CLI is on this
 	// node's PATH (cliOnPath in production). nil skips the check.
 	cliInstalled func(cli string) bool
+	// harnessEgress reads the harness unit's egress hold-off (see
+	// hostsvc.EgressReader). nil skips the egress gate.
+	harnessEgress func(ctx context.Context) hostsvc.Egress
 
 	// driftRecreated records, per backend, the desired spec hash we last
 	// recreated the container for on a spec-drift detection. It bounds the
@@ -269,6 +286,7 @@ func New(cfg *config.Config, docker *dockerpkg.Client, client *http.Client, harn
 		harness:         harness,
 		runnerInstalled: runnerOnDisk,
 		cliInstalled:    cliOnPath,
+		harnessEgress:   egressReaderFor(harness),
 		driftRecreated:  map[string]string{},
 	}
 }
@@ -1507,4 +1525,15 @@ func (r *Reconciler) surfaceEnvConflicts(warnings []string) {
 		}
 	}
 	r.envConflicts = now
+}
+
+// egressReaderFor is the production egress reader: systemd hosts only (the
+// hold-off is a systemd drop-in; elsewhere nothing is read and nothing is
+// gated).
+func egressReaderFor(h hostsvc.Service) func(ctx context.Context) hostsvc.Egress {
+	if h == nil || h.Runtime() != "systemd" {
+		return nil
+	}
+	rd := hostsvc.DefaultEgressReader()
+	return rd.Read
 }

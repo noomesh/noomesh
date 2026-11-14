@@ -29,8 +29,9 @@ pub fn bundle_export(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 
     // Stage the assets in a temp tree, tar it up. write_assets carries the
     // empty-table refusal (crate-only builds have nothing to export).
-    let stage = std::env::temp_dir().join(format!("noo-bundle-export-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&stage);
+    // i689: a fresh 0700 dir; what is tarred here is what the bundle ships.
+    let stage = crate::private_tmp::dir("noo-bundle-export")
+        .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "no_assets", &e, None));
     if let Err(e) = crate::onboard::standalone::write_assets(&stage) {
         let _ = std::fs::remove_dir_all(&stage);
         fail(g.json, ExitCode::Generic, "no_assets", &e.to_string(), None);

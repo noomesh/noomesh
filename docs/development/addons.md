@@ -94,11 +94,15 @@ example-addon/
 5. **CI** runs the contract test on every push.
 6. **MCP fragment** (optional): `mcp-tools-example-addon.json`, named by
    `NOO_MCP_EXTRA_MANIFEST`, exposes `status` as a tool.
-7. **Overlay**: `docker-compose.example-addon.yml`, an explicit `environment:`
-   allowlist, no `profiles:`.
-8. **Gateway client**: `gateway_client.py` sends the cluster-HMAC bearer the
-   gateway expects on each call and is the only place the add-on talks to the
-   gateway.
+7. **Overlay**: `docker-compose.example-addon.yml`, with an `x-noo-addon` block whose
+   `key:` is `NOO_SVC_KEY_EXAMPLE_ADDON`, explicit `environment:` values (never a
+   name with no value: see "Pass-through entries are refused"), and no `profiles:`.
+   Its `resources.json` asks for the gateway URL and CA and the `addon_key`,
+   each delivered as a file into a mount (see "Declaring runtime inputs").
+8. **Gateway client**: `gateway_client.py` reads the add-on key from its file,
+   exchanges it at `POST /api/addon/token` for a short-lived token, and sends that
+   token as the bearer on each call (see "Step 3a — connect to your runtime"). It
+   is the only place the add-on talks to the gateway.
 
 
 **Why 3 and not "the gateway checks it".** The gateway proxies a path; it
@@ -222,6 +226,7 @@ of your release key:
 ```bash
 noo addons trust-key yourthing <dev-pubkey> --registry <root> --dev --expires 14d
 noo addons enable yourthing --lock ./addon-lock.json
+noo stack restart --force   # enable declares it ON; the restart starts it
 ```
 
 - `--expires` is required with `--dev` (a whole number of `d`, `h` or `m`, at
@@ -799,13 +804,108 @@ outage; that is the failure this replaces.
 Nothing exotic. Serve the declared paths, and a `/health`. Where you need
 something the gateway owns — its config, its knowledge graph, a heartbeat
 task, an activity, a channel message — **go back over HTTP** rather than
-reaching into its tables. The `gateway_client.py` of the example above mints
-the cluster-HMAC token per request.
+reaching into its tables. The `gateway_client.py` of the example above does it
+with an exchanged add-on token (next section). (The cluster-HMAC bearer older
+versions of this page described is gone: the gateway no longer accepts it.)
 
 Own your own tables outright, on your own connection, as a single writer.
 Everything else routes back. That split is what keeps an add-on from becoming
 a second authority on a fact the gateway already owns — the single most
 repeated failure in this codebase's history.
+
+## Step 3a — connect to your runtime
+
+**Proof status:** steps 1–3 below (read the key from its file, exchange it,
+call with the token) were run in the release rehearsal on 0.6.24-rc.3, by its
+`A-addonfrontdoor` item with the rehearsal's own fixture add-on: the key read
+from its file, the exchange answered `200` for that add-on's consumer, the
+token was accepted on the add-on's own workload route (`200`) and refused on another
+add-on's (`403`). The rest of this section (refresh, revoke, the client below)
+is checked against the code, not copied from a run. The full build → sign →
+enable → connect → upgrade pass has not run yet.
+
+Your add-on calls the gateway with **its own key**, never a shared secret, and
+never a key taken from its environment.
+
+1. **Ask for the key.** Your overlay's `x-noo-addon` names it (`key:
+   NOO_SVC_KEY_<ID>`, `<ID>` being your name upper-cased, `-` as `_`) and lists
+   the `scopes:` it needs. `noo addons enable` mints it, granted those scopes plus
+   `addon` (the scope that opens the exchange door). Your `resources.json` asks
+   for it, and for the gateway's URL and CA, **as files**:
+
+   ```json
+   {
+     "format": "noo-addon-resources/1",
+     "uid": 1000,
+     "mounts": [{"name": "work", "env": "EXAMPLE_ADDON_WORK_DIR", "target": "/run/example-addon"}],
+     "resources": [
+       {"name": "gateway-url", "kind": "gateway", "part": "url", "deliver": {"env": "EXAMPLE_ADDON_GATEWAY_URL"}},
+       {"name": "gateway-ca", "kind": "gateway", "part": "ca", "deliver": {"file": "work/ca.crt"}},
+       {"name": "addon-key", "kind": "addon_key", "deliver": {"file": "work/addon-key"}}
+     ]
+   }
+   ```
+
+   Your overlay bind-mounts `${EXAMPLE_ADDON_WORK_DIR}` read-only at
+   `/run/example-addon`, so the key is at `/run/example-addon/addon-key`, mode
+   0400, owned by `uid`. The key is never in your container's environment: an
+   overlay that passes `NOO_SVC_KEY_<ID>` (or any secret) through by name is
+   refused (see "Pass-through entries are refused").
+
+2. **Exchange it.** `POST $EXAMPLE_ADDON_GATEWAY_URL/api/addon/token` with
+   `Authorization: Bearer <the key>` and no body, verifying TLS against
+   `ca.crt`. The answer is `{"token", "expires_in", "consumer", "scopes"}`:
+   - `token` is a JWT for subject `addon:svc:<addon>`;
+   - `expires_in` is in seconds (600 today);
+   - `consumer` is `svc:<addon>`;
+   - `scopes` are your key's scopes **minus `addon`**, so a token can never
+     re-open the exchange door.
+
+3. **Call with the token**: `Authorization: Bearer <token>` on every gateway
+   request, until shortly before `expires_in` runs out. Then exchange again with
+   the key; never cache the token past its expiry.
+
+**When the key is revoked or rotated** (`noo security service-key revoke`,
+`rotate`, or the add-on disabled), the gateway refuses the **exchange at once**:
+`401`. A token minted before that keeps working until it expires (at most
+`expires_in`), and then the next exchange fails. So treat a `401` from the
+exchange as final: stop calling, log it, and report unhealthy. Do not retry it
+in a loop.
+
+| Exchange answer | Meaning | What to do |
+|---|---|---|
+| `200` | a token | use it until `expires_in` |
+| `401` | the key is unknown, revoked or rotated | stop; the operator re-enables or rotates (`noo addons enable <name>`) |
+| `403` `addon_key_has_no_scopes` | the key carries only `addon` | declare the `scopes:` you need in `x-noo-addon` and re-enable |
+| `403` (scope) | the key lacks the `addon` scope | re-enable: `noo addons enable` mints it with `addon` |
+| `503` | the gateway cannot mint (no JWT secret) or cannot read its key store | retry after the `Retry-After` it sends |
+
+A minimal client (Python, standard library only):
+
+```python
+import json, os, ssl, time, urllib.request
+
+BASE = os.environ["EXAMPLE_ADDON_GATEWAY_URL"]
+CTX = ssl.create_default_context(cafile="/run/example-addon/ca.crt")
+_tok, _until = None, 0.0
+
+def token():
+    global _tok, _until
+    if _tok and time.time() < _until - 60:
+        return _tok
+    key = open("/run/example-addon/addon-key").read().strip()
+    req = urllib.request.Request(f"{BASE}/api/addon/token", method="POST",
+                                 headers={"Authorization": f"Bearer {key}"})
+    with urllib.request.urlopen(req, context=CTX, timeout=10) as r:  # 401 raises: stop, do not loop
+        body = json.load(r)
+    _tok, _until = body["token"], time.time() + body["expires_in"]
+    return _tok
+
+def get(path):
+    req = urllib.request.Request(f"{BASE}{path}", headers={"Authorization": f"Bearer {token()}"})
+    with urllib.request.urlopen(req, context=CTX, timeout=10) as r:
+        return json.load(r)
+```
 
 ## Step 3b — know who called you
 
@@ -994,6 +1094,42 @@ normal answer, not an outage a UI should render as one.
 
 `internal` routes are not part of any API.
 
+
+## Your add-on and the next stack upgrade
+
+A lock names the exact stack tags it supports (`--supports v0.6.24`, one entry
+per stack; an rc and its final are different entries). When the operator rolls
+the stack with `noo upgrade --stack` (or `--all`), the roll first resolves a lock
+**signed for the new tag** for every add-on that is on. If one has none, the roll
+refuses before anything changes:
+
+```text
+x refusing to roll to v0.6.25: the example-addon add-on is on and … Nothing was changed
+```
+
+There are three ways through, and the refusal names them:
+
+1. **Publish a lock for the new stack** (the normal path). Sign it with the new
+   tag in `--supports` and publish it to your registry with
+   `noo security addon-lock publish`. The roll then fetches it and goes on. Your
+   registry must have a publicly trusted certificate; see "A private registry"
+   in the developer guide.
+2. **Turn it off for the roll, then back on from a file.** This is the way
+   through for an add-on enabled from a file (`noo addons enable <name> --lock
+   <file>`), whose registry the roll cannot fetch from:
+
+   ```sh
+   noo addons disable example-addon
+   noo upgrade --stack
+   noo addons enable example-addon --lock ./addon-bundle.json   # a lock signed for the new stack
+   noo stack restart --force   # enable declares it ON; this starts it
+   ```
+
+   The 0.6.24 release rehearsal proved this end to end: the add-on re-enabled
+   and declared on after the roll, and its placed node workload still listed on
+   its node. `noo cluster workloads show <node>` shows them.
+3. **Roll to an older stack** your lock supports: `noo upgrade --stack --tag
+   <vX.Y.Z>` (add `--allow-downgrade` to take the add-on back with it).
 
 ## Console pieces — filling your slots in the console diagrams
 
@@ -1246,6 +1382,11 @@ for an add-on built `FROM` a stack image, `base` (`{image, digest}`, checked
 against that image's row in the stack's own signed lock). Never re-serialise
 the file: non-canonical bytes are refused.
 
+The signing seed is a file, passed as `--seed-file <path>` (or piped with
+`--seed-file -`), never an argument or an environment variable: keep it
+outside the add-on's repository, mode 0600, never committed; a release
+workflow holds it as a secret and pipes it in.
+
 **Trust anchor.** The licence names whom to trust. The entitlement token
 carries, per add-on,
 `"addons": {"<name>": {"keys": ["<hex ed25519 pubkey>", …], "registry": "<root>"}}`,
@@ -1278,8 +1419,30 @@ check it with `verify … --files-dir <dir>`. File names are one plain component
 | Bundle files | one layer per entry in `files`: `mediaType: application/vnd.noomesh.addon-file.v1`, title = the file name |
 | Limits | each layer at most 1 MiB; each blob's sha256 is checked against the manifest |
 
-A release publishes it with oras (1.2 or later), run from the directory
-that holds the two files:
+Publish it with `noo security addon-lock publish`, from the directory that
+holds what `sign` wrote (`addon-bundle.json` and its `.sig`, the
+`addon-lock.json` pair when you signed one, and the files the bundle lists;
+`--files-dir <dir>` reads those from elsewhere):
+
+```sh
+noo security addon-lock publish addon-bundle.json --registry <root> \
+  --token-file <path>   # a token that can write the package; else GH_TOKEN / GITHUB_TOKEN
+```
+
+It checks the bundle first (canonical bytes, images under `<root>`, every
+listed file present and hashing to the lock, each layer under 1 MiB), pushes
+one artifact per entry in `supports_stack`, tagged `stack-<tag>`, then reads
+each tag back through the same fetch `noo addons upgrade` uses and requires
+the bytes it pushed. A tag that does not read back fails the publish, naming
+the tag, so a broken publish fails at the publisher rather than at someone's
+upgrade. `--dry-run` prints the tags and the layers (title, media type, size,
+digest) and pushes nothing; `--json` prints a summary. The token is read from
+the file (or standard input with `--token-file -`) and is never printed;
+`--user <name>` sets the login name for registries that check it (GHCR checks
+only the token).
+
+What it pushes is what this oras (1.2 or later) command pushes, kept here for
+reference:
 
 ```sh
 oras push <root>:stack-v0.6.0 \
@@ -1671,6 +1834,39 @@ the name upper-cased, `-` as `_`):
 | `NOO_<ID>_DB_PASSWORD`, `NOO_<ID>_DDL_PASSWORD`, `NOO_PGPASS_<ID>` | your database roles' passwords, and the pgpass body built from them |
 | `NATS_<ID>_PASSWORD` | your NATS principal, when `x-noo-addon` `nats_principal:` names your add-on |
 | `NOO_ADDON_SECRET_<ID>__<NAME>` | each `shared_secret` your `resources.json` declares |
+
+**Pass-through entries are refused** (0.6.24). The launcher starts your services
+with every value of the encrypted store in its environment, and compose fills an
+`environment` (or `build.args`) entry that has **no value** from that
+environment: `- NAME`, or `NAME:` with nothing after it. A third-party overlay
+may pass through only:
+- a variable its `resources.json` delivers by `env`;
+- a mount variable it declares;
+- `TZ`.
+
+Any other name is refused, a store secret or an unknown name alike, and so is
+your own key. This holds wherever the entry sits, including in a YAML merge
+(`<<: *anchor`) or an `x-` anchor. `env_file`, `include:` and `extends` from
+another file are refused anywhere in a third-party overlay. The refusal reads:
+
+> add-on <name>: its overlay passes `<NAME>` through from the launcher's
+> environment (environment entry with no value), and that environment holds
+> every value of the encrypted store. …
+
+What to do instead:
+- for a non-secret value, write it in the overlay (`NAME: "value"`) or declare
+  it as an `env` delivery in `resources.json`;
+- for a secret, take it as a **file**: an `addon_key` or `shared_secret`
+  resource with `"deliver": {"file": "<mount>/<path>"}`, or a top-level secret
+  with your own `x-noo-source:`.
+
+If an add-on that is already enabled has such an entry, the next `noo addons
+verify` reports it, and the next start refuses it. The launcher leaves it out,
+stops its running services, and starts everything else, so a stack upgrade
+still completes without your add-on. Fix the overlay, sign a new lock, and
+`noo addons enable <name> --lock <file>` again. A licensed add-on that ships
+with the stack is held to the interpolation rule instead: no core secret, and
+nothing credential-shaped that is not its own.
 
 Anything else core or another add-on holds (`NOO_JWT_SECRET`, another add-on's
 key, a secret core declares) is refused, naming your add-on and the variable,

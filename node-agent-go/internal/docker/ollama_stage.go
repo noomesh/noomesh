@@ -46,31 +46,52 @@ var (
 // share (without extension). Case-folded, `library/` and `:latest` implied.
 // It refuses a ref that is not on registry.ollama.ai.
 func OllamaStoreStem(ref string) (string, error) {
+	ns, name, tag, err := parseOllamaRef(ref)
+	if err != nil {
+		return "", err
+	}
+	stem := ollamaStagePrefix + ns + "+" + name + "+" + tag
+	if len(stem)+len(mirrorManifestSuffix) >= 256 {
+		return "", fmt.Errorf("%q is too long to be a store artifact name", ref)
+	}
+	return stem, nil
+}
+
+// ollamaModelName is the name ollama lists a registry tag under
+// (`/api/tags`): `library/` dropped, the tag always present.
+func ollamaModelName(ns, name, tag string) string {
+	if ns == "library" {
+		return name + ":" + tag
+	}
+	return ns + "/" + name + ":" + tag
+}
+
+// parseOllamaRef splits a registry ref into its validated, case-folded
+// namespace, name and tag. Every path the mirror builds in ollama's store
+// comes from these three, never from a manifest.
+func parseOllamaRef(ref string) (ns, name, tag string, err error) {
 	r := strings.ToLower(strings.TrimSpace(ref))
 	r = strings.TrimPrefix(r, "registry.ollama.ai/")
 	if r == "" {
-		return "", errors.New("empty model reference")
+		return "", "", "", errors.New("empty model reference")
 	}
-	path, tag := r, "latest"
+	path := r
+	tag = "latest"
 	if i := strings.LastIndex(r, ":"); i >= 0 && !strings.Contains(r[i:], "/") {
 		path, tag = r[:i], r[i+1:]
 	}
-	ns, name := "library", path
+	ns, name = "library", path
 	switch parts := strings.Split(path, "/"); len(parts) {
 	case 1:
 	case 2:
 		ns, name = parts[0], parts[1]
 	default:
-		return "", fmt.Errorf("%q is not a registry.ollama.ai reference (want [namespace/]name[:tag])", ref)
+		return "", "", "", fmt.Errorf("%q is not a registry.ollama.ai reference (want [namespace/]name[:tag])", ref)
 	}
 	if !ollamaNamespaceRe.MatchString(ns) || !ollamaNameRe.MatchString(name) || !ollamaTagRe.MatchString(tag) {
-		return "", fmt.Errorf("%q is not a registry.ollama.ai reference (want [namespace/]name[:tag])", ref)
+		return "", "", "", fmt.Errorf("%q is not a registry.ollama.ai reference (want [namespace/]name[:tag])", ref)
 	}
-	stem := ollamaStagePrefix + ns + "+" + name + "+" + tag
-	if len(stem)+len(".Modelfile") >= 256 {
-		return "", fmt.Errorf("%q is too long to be a store artifact name", ref)
-	}
-	return stem, nil
+	return ns, name, tag, nil
 }
 
 // stagedHeader is what a staged Modelfile says about itself.

@@ -42,10 +42,10 @@ ARG DHI_REGISTRY=dhi.io
 # ── Fetch + verify (build platform) ─────────────────────────────────
 FROM --platform=$BUILDPLATFORM ${DHI_REGISTRY}/uv:0-debian13-dev@sha256:9498b4fafdf893784f7345bf79f918a7c909648a22487287932d94a05b18d0eb AS fetch
 ARG TARGETARCH
-ARG OLLAMA_VERSION=0.40.5
-# sha256 of ollama-linux-<arch>.tar.zst from the v0.40.5 release's sha256sum.txt.
-ARG OLLAMA_SHA256_AMD64=dc5eabc292f9949546c90a97c820f924b035e05243b0de13c7f366182562169c
-ARG OLLAMA_SHA256_ARM64=fbe71ebb1a10e59b8480c4d2839826b5f9dff1a6d5c142428b2e7db9b1a2c642
+ARG OLLAMA_VERSION=0.40.16
+# sha256 of ollama-linux-<arch>.tar.zst from the v0.40.16 release's sha256sum.txt.
+ARG OLLAMA_SHA256_AMD64=87bfafb2acbc89b2e6a1be0a9043de6aa75fb450696f86bc426e65fc448f788d
+ARG OLLAMA_SHA256_ARM64=e45b8e6dcb86cb9f3057396351655079c9a4879b4ced2678c9350d375dcbc224
 
 # The DHI +deb13u0+ apt skew (noomesh-internal 17a; why the package is the
 # regex /./ and the version a regex: Dockerfile.llamacpp's builder note).

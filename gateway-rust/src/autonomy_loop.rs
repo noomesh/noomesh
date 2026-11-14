@@ -797,7 +797,8 @@ async fn evaluate_location(state: Arc<AppState>, loc: LocationDef) {
 /// Alert if any TLS cert expires within 30 days. Reuses the
 /// PKI walker shared with `eval_cert_auto_rotate`.
 async fn eval_cert_expiry(state: &AppState) -> Result<bool, String> {
-    let count = autonomy_evaluators::count_certs_expiring_within(30).await;
+    let expiring = autonomy_evaluators::certs_expiring_within(30).await;
+    let count = expiring.len();
     if count > 0 {
         tracing::warn!(count, "autonomy.cert_expiry_check.alert_30d");
         crate::operator_alert::send_operator_alert_with(
@@ -805,7 +806,10 @@ async fn eval_cert_expiry(state: &AppState) -> Result<bool, String> {
             crate::operator_alert::OperatorAlert::new(
                 "autonomy.cert_expiry_check",
                 "pki",
-                format!("🔐 {count} cluster TLS certificate(s) expire within 30 days."),
+                format!(
+                    "🔐 {count} cluster TLS certificate(s) expire within 30 days: {}.",
+                    autonomy_evaluators::expiring_names(&expiring)
+                ),
             )
             .detail(
                 "rotate with `noo security pki rotate-all`, or arm the cert_auto_rotate location",

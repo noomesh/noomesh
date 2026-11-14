@@ -273,9 +273,15 @@ fn cli_install_repo() -> String {
 /// release signature against keys printed in its own source. Byte-identical
 /// to what `noo cluster bootstrap-token create` printed before the server
 /// composed it.
+/// Download THEN run, from a private directory (2026-11-12). `curl … | sh`
+/// exits 0 when the download fails (sh reads an empty script), so a node
+/// owner saw a curl error and then "noo: not found". `mktemp -d` makes a
+/// fresh 0700 directory, the script is removed afterwards whatever happened,
+/// and the line's status is the installer's (or curl's). The install line
+/// carries no credential: the token is in the separate `noo enroll` line.
 fn compose_install_command(repo: &str) -> String {
     format!(
-        "command -v noo >/dev/null || curl -fsSL https://raw.githubusercontent.com/{repo}/main/noo-cli/install.sh | sh"
+        "command -v noo >/dev/null || {{ d=\"$(mktemp -d)\" && curl -fsSL https://raw.githubusercontent.com/{repo}/main/noo-cli/install.sh > \"$d/install.sh\" && sh \"$d/install.sh\"; r=$?; rm -rf \"$d\"; [ \"$r\" = 0 ]; }}"
     )
 }
 
@@ -861,10 +867,12 @@ async fn cluster_bootstrap(
     // A re-enrollment mints a NEW birth key: any bundle still staged for
     // this name is ciphertext for the OLD one and would only produce
     // "decrypt failed — re-enroll" on the node. Drop it; provision stages a fresh one.
+    let deleted = node_name.clone().or_else(|| body.hostname.clone()).unwrap_or_default();
     sqlx::query("DELETE FROM noo_provision_bundles WHERE node_name = $1")
-        .bind(node_name.clone().or_else(|| body.hostname.clone()).unwrap_or_default())
+        .bind(&deleted)
         .execute(&state.db)
         .await?;
+    crate::bundle_etag::forget(&deleted);
 
     crate::audit::record(
         &state.db,
@@ -1055,6 +1063,7 @@ async fn enroll_tailnet(
         .bind(&node_name)
         .execute(&state.db)
         .await?;
+    crate::bundle_etag::forget(&node_name);
 
     crate::audit::record(
         &state.db,
@@ -1284,18 +1293,21 @@ async fn provision_bundle_status(
         return Err(AppError::BadRequest("invalid node name".into()));
     }
     type StatusRow = (chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>, i64,
-                      Option<chrono::DateTime<chrono::Utc>>, Option<String>, Option<i32>, Option<String>, String);
+                      Option<chrono::DateTime<chrono::Utc>>, Option<String>, Option<i32>, Option<String>);
     let row: Option<StatusRow> =
         sqlx::query_as(
             "SELECT created_at, fetched_at, octet_length(blob)::bigint, \
-                    applied_at, applied_sha, apply_rc, apply_msg, encode(sha256(blob), 'hex') \
+                    applied_at, applied_sha, apply_rc, apply_msg \
              FROM noo_provision_bundles WHERE node_name = $1",
         )
         .bind(&node)
         .fetch_optional(&state.db)
         .await?;
+    // The sha from the ETag cache (or hashed once and remembered), not
+    // `sha256(blob)` in SQL on every poll of a provision wait loop.
+    let sha = staged_sha(&state.db, &node).await?.unwrap_or_default();
     match row {
-        Some((staged_at, fetched_at, bytes, applied_at, applied_sha, apply_rc, apply_msg, sha)) => Ok(Json(json!({
+        Some((staged_at, fetched_at, bytes, applied_at, applied_sha, apply_rc, apply_msg)) => Ok(Json(json!({
             "node": node,
             "staged_at": staged_at.to_rfc3339(),
             "fetched_at": fetched_at.map(|t| t.to_rfc3339()),
@@ -1553,13 +1565,19 @@ async fn birth_cert_for(db: &sqlx::PgPool, node: &str) -> Result<Option<String>,
 }
 
 /// The sha256 of the blob currently staged for this node, if one is staged.
+/// From the ETag cache when it holds the current row (the usual case: the
+/// node's GET just served it); otherwise hashed in Postgres ONCE, with the
+/// row's key in the same statement, and remembered.
 async fn staged_sha(db: &sqlx::PgPool, node: &str) -> Result<Option<String>, AppError> {
-    Ok(sqlx::query_scalar::<_, String>(
-        "SELECT encode(sha256(blob), 'hex') FROM noo_provision_bundles WHERE node_name = $1",
-    )
-    .bind(node)
-    .fetch_optional(db)
-    .await?)
+    let Some(current) = crate::repo::provision_bundles::key(db, node).await? else { return Ok(None) };
+    if let Some(sha) = crate::bundle_etag::cached_sha(node, current) {
+        return Ok(Some(sha));
+    }
+    let row = crate::repo::provision_bundles::sha_in_sql(db, node).await?;
+    Ok(row.map(|(key, sha)| {
+        crate::bundle_etag::remember(node, key, &sha);
+        sha
+    }))
 }
 
 /// What a caller proved on the apply report.
@@ -1683,25 +1701,51 @@ async fn bundle_fetch_receipt(
 /// (`POST …/fetched`, birth-key proof over the bundle's sha) and never by
 /// this route: it is a pure read. (The one-release window in which a GET
 /// still stamped, `NOO_BOOTSTRAP_ACCEPT_UNSIGNED_FETCH`, is retired.)
+///
+/// **Unchanged costs one small request** (0.6.24-rc.2, `bundle_etag`): the
+/// answer carries `ETag: "<sha256 of the ciphertext>"`, and a fetcher that
+/// sends `If-None-Match` with the sha it last applied gets a 304 with no body
+/// while that is still the staged bundle. The 304 decision reads only the
+/// row's `created_at` and length; the blob is read only for a 200.
 async fn provision_bundle_get(
     State(state): State<Arc<AppState>>,
     Path(node): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     if !valid_node_name(&node) {
         return (StatusCode::BAD_REQUEST, "invalid node name").into_response();
     }
-    let row: Result<Option<(Vec<u8>,)>, _> =
-        sqlx::query_as("SELECT blob FROM noo_provision_bundles WHERE node_name = $1")
-            .bind(&node)
-            .fetch_optional(&state.db)
-            .await;
+    // The current row's key, without its bytes.
+    let facts = crate::repo::provision_bundles::key(&state.db, &node).await;
+    let current = match facts {
+        Ok(Some(key)) => key,
+        Ok(None) => return (StatusCode::NOT_FOUND, "no bundle staged").into_response(),
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "bundle lookup failed").into_response(),
+    };
+    let if_none_match = headers.get(axum::http::header::IF_NONE_MATCH).and_then(|v| v.to_str().ok());
+    if let Some(sha) = crate::bundle_etag::decide_304(&node, current, if_none_match) {
+        crate::bundle_etag::count(&node, true, current.len.max(0) as u64);
+        return (StatusCode::NOT_MODIFIED, [(axum::http::header::ETAG, format!("\"{sha}\""))]).into_response();
+    }
+    // The bytes and their key in ONE read, so the cached sha is the sha of
+    // exactly what is sent, whatever was re-staged in between.
+    let row = crate::repo::provision_bundles::blob(&state.db, &node).await;
     match row {
-        Ok(Some((blob,))) => (
-            StatusCode::OK,
-            [("content-type", "application/octet-stream")],
-            blob,
-        )
-            .into_response(),
+        Ok(Some((key, blob))) => {
+            use sha2::{Digest, Sha256};
+            let sha = hex::encode(Sha256::digest(&blob));
+            crate::bundle_etag::remember(&node, key, &sha);
+            crate::bundle_etag::count(&node, false, 0);
+            (
+                StatusCode::OK,
+                [
+                    (axum::http::header::CONTENT_TYPE, "application/octet-stream".to_string()),
+                    (axum::http::header::ETAG, format!("\"{sha}\"")),
+                ],
+                blob,
+            )
+                .into_response()
+        }
         Ok(None) => (StatusCode::NOT_FOUND, "no bundle staged").into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "bundle lookup failed").into_response(),
     }
@@ -1782,6 +1826,42 @@ async fn serve_prep_script() -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// rc.2 bundle ETag: the 304 is decided from the row's key BEFORE the
+    /// blob is read; both answers carry the ETag; a 200 caches the sha of
+    /// exactly the bytes it sends (blob and created_at in one read).
+    #[test]
+    fn the_bundle_get_decides_the_304_before_reading_the_blob() {
+        let code = crate::test_src::own_code(include_str!("bootstrap.rs"));
+        let body = crate::test_src::fn_body(&code, "async fn provision_bundle_get(");
+        // The repo CALLS in order; what each one reads is pinned in
+        // repo::provision_bundles (key() never selects the bytes).
+        let facts = body.find("crate::repo::provision_bundles::key(&state.db, &node)").expect("the key read");
+        let decide = body.find("crate::bundle_etag::decide_304(&node, current, if_none_match)").expect("the 304 decision");
+        let not_modified = body.find("StatusCode::NOT_MODIFIED").expect("the 304");
+        let blob = body.find("crate::repo::provision_bundles::blob(&state.db, &node)").expect("the blob read");
+        assert!(facts < decide && decide < not_modified && not_modified < blob, "{body}");
+        assert_eq!(body.matches("crate::repo::provision_bundles::").count(), 2, "exactly the key read and the blob read: {body}");
+        assert_eq!(body.matches("axum::http::header::ETAG").count(), 2, "both answers carry the ETag: {body}");
+        assert!(body.contains("crate::bundle_etag::remember(&node, key, &sha)"), "{body}");
+        assert!(!body.contains("sha_in_sql") && !body.contains("sqlx::"), "no SQL hash and no inline SQL on the GET: {body}");
+    }
+
+    /// The receipt and apply checks, and the status route, no longer hash
+    /// the blob in SQL on every call: the cache first, then one hash that is
+    /// remembered.
+    #[test]
+    fn the_staged_sha_reads_the_cache_before_hashing_in_sql() {
+        let code = crate::test_src::own_code(include_str!("bootstrap.rs"));
+        let body = crate::test_src::fn_body(&code, "async fn staged_sha(");
+        let key = body.find("crate::repo::provision_bundles::key(db, node)").expect("the key read");
+        let cached = body.find("crate::bundle_etag::cached_sha(node, current)").expect("the cache");
+        let hashed = body.find("crate::repo::provision_bundles::sha_in_sql(db, node)").expect("the fallback");
+        assert!(key < cached && cached < hashed, "{body}");
+        assert!(body.contains("crate::bundle_etag::remember(node, key, &sha)"), "{body}");
+        let status = crate::test_src::fn_body(&code, "async fn provision_bundle_status(");
+        assert!(!status.contains("sha256(blob)") && status.contains("staged_sha(&state.db, &node)"), "{status}");
+    }
 
     fn role_ctx(role: crate::auth::Role) -> Option<Extension<RequesterCtx>> {
         Some(Extension(RequesterCtx {
@@ -2076,7 +2156,7 @@ mod tests {
     fn the_install_line_is_the_public_signed_lane() {
         assert_eq!(
             compose_install_command("org/repo"),
-            "command -v noo >/dev/null || curl -fsSL https://raw.githubusercontent.com/org/repo/main/noo-cli/install.sh | sh"
+            "command -v noo >/dev/null || \u{7b} d=\"$(mktemp -d)\" && curl -fsSL https://raw.githubusercontent.com/org/repo/main/noo-cli/install.sh > \"$d/install.sh\" && sh \"$d/install.sh\"; r=$?; rm -rf \"$d\"; [ \"$r\" = 0 ]; \u{7d}"
         );
     }
 
@@ -2246,8 +2326,37 @@ mod tests {
         assert!(!receipt.contains("bundle_pull_write_unsigned"),
             "the fetch receipt must not stamp fetched_at without a proof");
         let get = body("provision_bundle_get");
-        assert!(get.contains("SELECT blob"), "parse missed provision_bundle_get");
-        assert!(!get.contains("UPDATE"), "the public GET must be a pure read");
+        assert!(get.contains("crate::repo::provision_bundles::blob(&state.db, &node)"), "parse missed provision_bundle_get");
+        for w in ["UPDATE", "INSERT", "DELETE", "sqlx::", "state.db.begin"] {
+            assert!(!get.contains(w), "the public GET must be a pure read: it holds {w:?}");
+        }
+        // Everything the GET calls into is one of two modules, and both are
+        // read-only for the database:
+        for (i, _) in get.match_indices("crate::") {
+            let rest = &get[i..];
+            assert!(
+                rest.starts_with("crate::repo::provision_bundles::") || rest.starts_with("crate::bundle_etag::"),
+                "the public GET calls {}", rest.lines().next().unwrap_or(rest)
+            );
+        }
+        // - repo::provision_bundles: SELECTs only (its statements are pinned
+        //   by text in that module's own guard);
+        let repo = crate::test_src::own_code(include_str!("../repo/provision_bundles.rs"));
+        assert!(repo.contains("pub async fn blob("), "parse missed repo::provision_bundles");
+        // The needles are built, not spelled, so this test is not a counted
+        // line for the repo-layer ratchet.
+        let (q, qs) = (["sqlx", "::query("].concat(), ["sqlx", "::query_scalar("].concat());
+        for w in ["UPDATE", "INSERT", "DELETE", q.as_str(), qs.as_str()] {
+            assert!(!repo.contains(w), "repo::provision_bundles must only read: it holds {w:?}");
+        }
+        // - bundle_etag: count() and remember() on the 304 and 200 paths are
+        //   the IN-MEMORY ETag cache and counters; that module holds no SQL
+        //   and no pool, so they write nothing durable.
+        let etag = crate::test_src::own_code(include_str!("../bundle_etag.rs"));
+        assert!(etag.contains("pub fn count(") && etag.contains("pub fn remember("), "parse missed bundle_etag");
+        for w in ["sqlx", "PgPool", "state.db", "std::fs::"] {
+            assert!(!etag.contains(w), "bundle_etag must stay in memory: it holds {w:?}");
+        }
         assert!(!src.contains(&["\"NOO_BOOTSTRAP_", "ACCEPT_UNSIGNED_FETCH\""].concat()),
             "the retired gate must not be read again");
     }

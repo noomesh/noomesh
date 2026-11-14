@@ -523,6 +523,14 @@ impl EmbeddingEndpoint {
                         served_total = balancer.served(key),
                         "embed_target_served"
                     );
+                    // And on the request's trace (speed review): which node
+                    // answered, so embed latency can be read per node. A
+                    // static endpoint is no node.
+                    let node = match c {
+                        Candidate::Mesh(t, _) => Some(t.node_id.as_str()),
+                        Candidate::Static(_) => None,
+                    };
+                    crate::request_trace::note_served(node, served_backend(c), &self.model);
                     return Ok(v);
                 }
                 Err(e) => {
@@ -673,6 +681,15 @@ pub(crate) enum Candidate {
     Mesh(crate::routes::external::MeshTarget, Vec<String>),
     /// A declared static endpoint (primary or extra), spoken to directly.
     Static(EmbeddingEndpoint),
+}
+
+/// The trace's `backend` for an embed: the node agent's embed lane (it picks
+/// the engine), or a static endpoint.
+fn served_backend(c: &Candidate) -> &'static str {
+    match c {
+        Candidate::Mesh(..) => "embed",
+        Candidate::Static(_) => "static",
+    }
 }
 
 impl Candidate {
@@ -1148,6 +1165,34 @@ mod tests {
             "extra is added (trimmed), blanks and a duplicate of the primary are dropped"
         );
         assert!(both.iter().all(|e| e.model == "harrier" && e.api_format == "ollama"));
+    }
+
+    /// Speed review: the embed's trace names the node that ANSWERED (a
+    /// failed target is not it), so embed latency can be read per node. A
+    /// static endpoint is no node.
+    #[tokio::test]
+    async fn the_trace_names_the_node_that_answered_the_embed() {
+        use crate::request_trace::{scoped, test_recorder};
+        let (bad, _) = server(500).await;
+        let (good, _) = server(200).await;
+        let ep = ollama("http://unused");
+        let rec = test_recorder("/api/external/embeddings");
+        let bal = EmbedBalancer::new();
+        scoped(rec.clone(), async {
+            ep.embed_over(&bal, vec![mesh("node-bad", &bad), mesh("node-good", &good)], &texts(), T).await.unwrap();
+        })
+        .await;
+        let s = rec.summary();
+        assert_eq!((s.node.as_deref(), s.backend.as_deref(), s.model.as_deref()), (Some("node-good"), Some("embed"), Some("harrier")));
+
+        let (st, _) = server(200).await;
+        let rec = test_recorder("/api/external/embeddings");
+        scoped(rec.clone(), async {
+            ep.embed_over(&EmbedBalancer::new(), vec![Candidate::Static(ollama(&st))], &texts(), T).await.unwrap();
+        })
+        .await;
+        let s = rec.summary();
+        assert_eq!((s.node.as_deref(), s.backend.as_deref()), (None, Some("static")));
     }
 
     #[tokio::test]

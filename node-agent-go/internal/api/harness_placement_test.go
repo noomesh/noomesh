@@ -18,13 +18,18 @@ import (
 
 func placementServer(t *testing.T, f func() HarnessPlacement) http.Handler {
 	t.Helper()
-	cfg := &config.Config{NodeID: "test-node", NodeAgentToken: "test-token", TLSCA: "ca.pem"}
-	gpu := hardware.NewGPUDetector(nil, "http")
-	s := NewServer(cfg, nil, gpu, metrics.NewCollector(gpu))
+	s := placementServerRaw(t)
 	if f != nil {
 		s.SetHarnessPlacement(f)
 	}
 	return s.mux
+}
+
+func placementServerRaw(t *testing.T) *Server {
+	t.Helper()
+	cfg := &config.Config{NodeID: "test-node", NodeAgentToken: "test-token", TLSCA: "ca.pem"}
+	gpu := hardware.NewGPUDetector()
+	return NewServer(cfg, nil, gpu, metrics.NewCollector(gpu))
 }
 
 func getPlacement(h http.Handler, peer *x509.Certificate, remote, bearer string) *httptest.ResponseRecorder {
@@ -68,10 +73,26 @@ func TestHarnessPlacementRouteAnswersPlacedAndUnplaced(t *testing.T) {
 	if rec.Code != 404 || strings.ReplaceAll(rec.Body.String(), " ", "") != `{"placed":false}` {
 		t.Fatalf("unplaced: %d %s", rec.Code, rec.Body)
 	}
-	// No provider installed: unplaced, never a panic.
-	rec = getPlacement(placementServer(t, nil), own, "127.0.0.1:5000", "")
-	if rec.Code != 404 {
-		t.Fatalf("no provider: %d", rec.Code)
+}
+
+// Before the agent installs its provider (it serves from step 1 and
+// registers until it can), the placement is NOT KNOWN: 503 known:false with
+// Retry-After, never the 404 "not placed" a harness would act on (rc.1
+// rehearsal, A-placeknown.unknown).
+func TestNoProviderYetIsUnknownNotUnplaced(t *testing.T) {
+	own := testLeaf(t, "test-node", "Mesh Cluster Node")
+	rec := getPlacement(placementServer(t, nil), own, "127.0.0.1:5000", "")
+	if rec.Code != 503 || rec.Header().Get("Retry-After") != "5" {
+		t.Fatalf("no provider: %d retry-after=%q %s", rec.Code, rec.Header().Get("Retry-After"), rec.Body)
+	}
+	if body := strings.ReplaceAll(rec.Body.String(), " ", ""); body != `{"placed":false,"known":false}` {
+		t.Fatalf("no provider body: %s", body)
+	}
+	// Installed later, the provider's own answer wins.
+	s := placementServerRaw(t)
+	s.SetHarnessPlacement(func() HarnessPlacement { return HarnessPlacement{} })
+	if rec := getPlacement(s.mux, own, "127.0.0.1:5000", ""); rec.Code != 404 {
+		t.Fatalf("installed, unplaced: %d", rec.Code)
 	}
 }
 
@@ -123,5 +144,34 @@ func TestHarnessPlacementCarriesTheProfile(t *testing.T) {
 	})
 	if rec := getPlacement(none, own, "127.0.0.1:5000", ""); strings.Contains(rec.Body.String(), "profile") {
 		t.Fatalf("no profile must omit the key: %s", rec.Body)
+	}
+}
+
+// i658: at a roll the agent and the harness restart in the same second. Until
+// the agent has applied a desired-config it cannot say "not placed": it says
+// "not known yet" (503, Retry-After) so the harness waits instead of running
+// on its defaults. A known answer is unchanged: placed 200, unplaced 404.
+func TestHarnessPlacementSaysNotKnownYetUntilTheFirstDesiredConfig(t *testing.T) {
+	own := testLeaf(t, "test-node", "Mesh Cluster Node")
+	unknown := placementServer(t, func() HarnessPlacement { return HarnessPlacement{Unknown: true} })
+	rec := getPlacement(unknown, own, "127.0.0.1:5000", "")
+	if rec.Code != 503 || rec.Header().Get("Retry-After") != "5" {
+		t.Fatalf("unknown: %d retry-after=%q %s", rec.Code, rec.Header().Get("Retry-After"), rec.Body)
+	}
+	if strings.ReplaceAll(rec.Body.String(), " ", "") != `{"placed":false,"known":false}` {
+		t.Fatalf("unknown body: %s", rec.Body)
+	}
+	// Unknown wins even over a stale placed view.
+	rec = getPlacement(placementServer(t, func() HarnessPlacement { return HarnessPlacement{Placed: true, Kind: "noo", Unknown: true} }), own, "127.0.0.1:5000", "")
+	if rec.Code != 503 {
+		t.Fatalf("unknown and placed: %d", rec.Code)
+	}
+	rec = getPlacement(placementServer(t, func() HarnessPlacement { return HarnessPlacement{Placed: true, Kind: "noo"} }), own, "127.0.0.1:5000", "")
+	if rec.Code != 200 {
+		t.Fatalf("known placed: %d", rec.Code)
+	}
+	rec = getPlacement(placementServer(t, func() HarnessPlacement { return HarnessPlacement{} }), own, "127.0.0.1:5000", "")
+	if rec.Code != 404 {
+		t.Fatalf("known unplaced: %d", rec.Code)
 	}
 }

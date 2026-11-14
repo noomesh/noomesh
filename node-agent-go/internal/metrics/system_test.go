@@ -13,7 +13,7 @@ import (
 
 func TestCollector_Collect(t *testing.T) {
 	// GPU detector with no GPU (will return nil metrics — that's fine)
-	gpu := hardware.NewGPUDetector(nil, "http")
+	gpu := hardware.NewGPUDetector()
 	coll := NewCollector(gpu)
 
 	m := coll.Collect()
@@ -44,7 +44,7 @@ func TestCollector_Collect(t *testing.T) {
 func TestCompositeLoad_Formula(t *testing.T) {
 	// The composite load formula is: min(cpu*0.6 + mem*0.4, 1.0)
 	// We can't control /proc values, but we verify the result is bounded
-	gpu := hardware.NewGPUDetector(nil, "http")
+	gpu := hardware.NewGPUDetector()
 	coll := NewCollector(gpu)
 
 	m := coll.Collect()

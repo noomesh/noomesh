@@ -45,6 +45,20 @@
 //! **Provenance is the session; permission is the account.** Role, scopes,
 //! KB audience and the kill switch all resolve to `account_of(sub)`. What
 //! the session keys is `from`, presence and the inbox.
+//!
+//! ## Since 0.6.24: a session is no longer where a mailbox lives
+//!
+//! The 2026-07-28 MCP revision has no `initialize`, so a modern client
+//! (Claude Code from 2.1.3xx) never opens a session here: every call it
+//! makes fell to the per-key label, and `rename` answered "no live MCP
+//! session". Agent mail is now owned by a CONVERSATION (`agent_mailbox`):
+//! the client registers its own conversation id with `noo_agent_name` and
+//! states its mailbox with `as=<name>` on each agent-mail call. Both doors
+//! take that step (`agent_mailbox::door_step`) and teach it in their
+//! instructions. A legacy session still works: its id is its conversation
+//! key, and its label follows the name it registers (`follow_name`).
+//! Session rows idle past `NOO_MCP_SESSION_REAP_SECS` are reaped by the
+//! mailbox sweep.
 
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
@@ -108,7 +122,7 @@ fn suffix() -> String {
 /// Client kinds named by their own `clientInfo.name` often enough to get a
 /// short, stable type: `claude-code` → `claude`. Matched as a substring of
 /// the lowercased name, first match wins.
-const KNOWN_TYPES: &[&str] = &["claude", "codex", "cursor", "gemini"];
+pub const KNOWN_TYPES: &[&str] = &["claude", "codex", "cursor", "gemini"];
 
 /// Longest type kept, so `<type>-<session>` stays well inside a segment.
 const MAX_TYPE: usize = 32;
@@ -237,6 +251,12 @@ pub async fn from_headers(
                 .into_response())
         }
     }
+}
+
+/// The session id a request presents, if any (for the mailbox step: a
+/// legacy session's id is its conversation key).
+pub fn presented_id(headers: &axum::http::HeaderMap) -> Option<&str> {
+    presented(headers)
 }
 
 /// The session id a request presents, if any.
@@ -557,6 +577,28 @@ pub async fn with_list_changed(headers: &axum::http::HeaderMap, resp: axum::resp
     tracing::info!(opened_under = catalogue_of(id).unwrap_or("none"), now = crate::mcp_external::catalogue_digest(),
         "mcp tool catalogue changed since this session opened; sent tools/list_changed");
     axum::response::Response::from_parts(parts, axum::body::Body::from(stream))
+}
+
+/// A legacy session's label follows the mailbox its conversation
+/// registered (`agent_mailbox::name_call`), in the row and in the cache, so
+/// the session's own `sub` is that name from its next request.
+pub async fn follow_name(db: &sqlx::PgPool, account: &str, id: &str, label: &str) {
+    if let Err(e) = crate::repo::agent_names::relabel_session(db, account, &id_hash(id), label).await {
+        tracing::warn!(error = %e, account, "mcp session could not follow its mailbox name");
+    }
+    if let Ok(mut map) = registry().write() {
+        if let Some(s) = map.get_mut(id).filter(|s| s.account == account) {
+            s.label = label.to_string();
+        }
+    }
+}
+
+/// Forget every cached session: what a gateway restart does. Tests only.
+#[cfg(test)]
+pub fn clear_local_for_tests() {
+    if let Ok(mut m) = registry().write() {
+        m.clear();
+    }
 }
 
 /// Live session count, for `/health`-style reporting and tests.

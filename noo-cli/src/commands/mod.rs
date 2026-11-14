@@ -227,7 +227,7 @@ pub use cluster_push_secrets::cluster_push_secrets;
 pub use cluster_gpu::{cluster_gpu_hold, cluster_gpu_release};
 pub use cluster_gpu_mode::cluster_gpu_mode;
 pub use cluster_reserve::{cluster_release, cluster_reservations, cluster_reserve, cluster_workloads};
-pub use cluster_node_workloads::{cluster_workloads_place, cluster_workloads_show, cluster_workloads_unplace};
+pub use cluster_node_workloads::{cluster_workloads_place, cluster_workloads_retry, cluster_workloads_show, cluster_workloads_unplace};
 pub use cluster_profile::cluster_profile;
 pub use cluster_verify::cluster_verify;
 pub use cluster_class::{cluster_class_list, cluster_class_set, cluster_class_unset, cluster_prefer};
@@ -450,7 +450,7 @@ pub use entitlement::*;
 #[cfg(has_entitlement_signer)]
 pub use entitlement_signer::*;
 pub use release_sign::*;
-pub use addon_lock_cmd::{security_addon_lock_sign, security_addon_lock_verify};
+pub use addon_lock_cmd::{security_addon_lock_publish, security_addon_lock_sign, security_addon_lock_verify};
 pub use addon_pins::{addons_launch_pins, addons_upgrade, addons_verify};
 pub use addon_setup::addons_setup;
 pub use addon_resources::{addons_launch_resources, addons_rotate_secret};

@@ -22297,6 +22297,143 @@
           }
         }
       }
+    },
+    "/api/agents/directory": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get directory",
+        "description": "[native] GET /api/agents/directory \u2014 who can be messaged, by account (0.6.24): online mailboxes first, then every chosen name with its state, then the short-lived default names collapsed per client type, and the account's orphaned mail. A caller lists its own account; `owner`/`all` beyond it are operator-only and refused (not emptied), as presence is.",
+        "operationId": "directory_list",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/nodes/{node_id}/model-set-retry": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create model set retry",
+        "description": "[native] POST /api/cluster/nodes/{node_id}/model-set-retry",
+        "operationId": "retry_model_set",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/conversations/import": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create import",
+        "description": "[native] [undocumented] Handled by `receive`. No `///` comment on the handler to describe it \u2014 add one there and re-run scripts/gen-openapi.py.",
+        "operationId": "receive",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/console-build": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get console build",
+        "description": "[native] GET /api/cluster/console-build \u2014 the build identity of the console this gateway embeds: `ui-<git tree hash of ui/>`, the file publish-web writes beside the bundle (`console-build.txt`), or null for a console built before that file existed. `noo upgrade` and `noo cluster verify` compare every seat's display against it: a display still running an older console reports an older id. Operators and the stack's own services only.",
+        "operationId": "console_build",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/internal/prometheus/targets/node-agents": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get node agents",
+        "description": "[native] `GET /api/internal/prometheus/targets/node-agents`: the scraper's leaf only. Answers the http_sd list of node agents whose leaf covers the address they are scraped at.",
+        "operationId": "node_agent_targets",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

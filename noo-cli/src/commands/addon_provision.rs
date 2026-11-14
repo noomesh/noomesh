@@ -303,14 +303,38 @@ pub(crate) fn write_private(dir: &Path, name: &str, bytes: &[u8], mode: u32) -> 
     Ok(dest)
 }
 
-/// Create `dir` (and its parent) 0700 and refuse a symlink there.
+/// Create `dir` (and its parent) 0700 and refuse a symlink there. Then
+/// `dir` must be OURS (this euid) and not group/world-writable (i689, the
+/// `XDG_RUNTIME_DIR` rule: owner and mode, or refuse). Its parent is not
+/// checked here: a rundir's parent is a shared tmpfs (`/dev/shm`, 1777).
 pub(crate) fn private_dir(dir: &Path) -> Result<(), String> {
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
     if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(format!("{} is a symlink - refusing to put credentials behind it", dir.display()));
     }
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| format!("{}: {e}", dir.display()))
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| format!("{}: {e}", dir.display()))?;
+    // SAFETY: geteuid has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    owned_and_closed(dir, euid)
+}
+
+/// `d` is a real directory (not a symlink), owned by `euid`, and neither
+/// group- nor world-writable.
+fn owned_and_closed(d: &Path, euid: u32) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let m = std::fs::symlink_metadata(d).map_err(|e| format!("{}: {e}", d.display()))?;
+    if !m.file_type().is_dir() {
+        return Err(format!("{} is not a directory - refusing to put credentials there", d.display()));
+    }
+    if m.uid() != euid {
+        return Err(format!("{} is owned by uid {}, not {euid} - refusing to put credentials there \
+            (another user may have created it first; remove it and re-run)", d.display(), m.uid()));
+    }
+    if m.mode() & 0o022 != 0 {
+        return Err(format!("{} is group- or world-writable ({:o}) - refusing to put credentials there", d.display(), m.mode() & 0o777));
+    }
+    Ok(())
 }
 
 /// Write the runner's files into `dir` (already the add-on's directory).
@@ -322,6 +346,13 @@ pub(crate) fn write_credential_files(
     addon: &str,
     pki: &Pki,
 ) -> Result<Files, String> {
+    // i689: the RUNDIR first (`/dev/shm/noo-provision-<uid>` is a
+    // predictable name): another local user could pre-create it
+    // world-writable, `create_dir_all` would accept it, and they could swap
+    // this add-on's dir for one holding their own CA and pgpass.
+    if let Some(rundir) = dir.parent() {
+        private_dir(rundir)?;
+    }
     private_dir(dir)?;
     let (pw_var, ddl_var) = decls::password_envs(addon);
     let want = |var: &str| secrets.get(var).filter(|v| !v.is_empty()).ok_or_else(|| format!("{var} has no value"));
@@ -793,6 +824,41 @@ pub(crate) fn run(g: &Globals, addon: &'static str, lock: Option<String>) -> i32
 
 #[cfg(test)]
 mod tests {
+    /// i689: the rundir must be ours. One another user pre-created is
+    /// refused (owner rule, tested on the check itself: a test cannot make a
+    /// dir owned by someone else without root); our own left open is closed
+    /// to 0700; a symlinked rundir is refused; and write_credential_files
+    /// checks the rundir BEFORE making the add-on dir in it.
+    #[test]
+    fn a_rundir_not_ours_or_open_is_refused_or_closed() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = crate::private_tmp::dir("noo-i689-rundir").unwrap();
+        let rundir = base.join("noo-provision-1000");
+        std::fs::create_dir(&rundir).unwrap();
+        // SAFETY: geteuid has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        let e = super::owned_and_closed(&rundir, euid.wrapping_add(1)).expect_err("a rundir owned by another uid was accepted");
+        assert!(e.contains("is owned by uid"), "{e}");
+        std::fs::set_permissions(&rundir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let e = super::owned_and_closed(&rundir, euid).expect_err("a world-writable rundir passed the check");
+        assert!(e.contains("group- or world-writable"), "{e}");
+        super::private_dir(&rundir).unwrap();
+        let mode = std::fs::metadata(&rundir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "our own open rundir was not closed");
+        super::private_dir(&rundir.join("myaddon")).unwrap();
+        let link = base.join("noo-provision-link");
+        std::os::unix::fs::symlink(&rundir, &link).unwrap();
+        let e = super::private_dir(&link).expect_err("a symlinked rundir was accepted");
+        assert!(e.contains("symlink"), "{e}");
+        let own = crate::test_src::own_code(include_str!("addon_provision.rs"));
+        let body = crate::test_src::fn_body(&own, "pub(crate) fn write_credential_files(");
+        let (r, d) = (body.find("private_dir(rundir)").expect("the rundir is not checked"), body.find("private_dir(dir)").unwrap());
+        assert!(r < d, "the rundir is checked after the add-on dir is made in it");
+        let pd = crate::test_src::fn_body(&own, "pub(crate) fn private_dir(");
+        assert!(pd.contains("owned_and_closed(dir, euid)"), "private_dir no longer checks the owner");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     use super::*;
     use crate::commands::addon_enable::tests::{scratch, CONFIG};
 

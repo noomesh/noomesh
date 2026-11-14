@@ -643,7 +643,34 @@ jobs:
           # noo-*-unknown-linux-gnu and noo-*-apple-darwin also match the
           # noo-gateway-<target> assets: they are in the
           # signed manifest by the same globs, on purpose.
-          sha256sum noo-*-unknown-linux-musl noo-*-unknown-linux-gnu noo-*-apple-darwin > sha256sums.txt
+          # The manifest names its own release (i688 follow-up): a signed
+          # row for noo-release-version, a file holding the version exactly
+          # as the CLI built here reports it (CARGO_PKG_VERSION, rc stamp
+          # included). `noo cluster provision` refuses a signed manifest
+          # whose row does not name its own version, so a genuine OLDER
+          # manifest cannot stand in for this one. Valid `sha256sum -c` row.
+          chmod +x noo-x86_64-unknown-linux-gnu
+          v="$(./noo-x86_64-unknown-linux-gnu --version | awk '{print $NF}')"
+          case "$v" in [0-9]*.[0-9]*.[0-9]*) ;; *) echo "::error::cannot read this CLI's version from --version: '$v'"; exit 1 ;; esac
+          # Fail HERE, before signing or any upload, if the CLI this run
+          # built does not report exactly the tag's version: the row would
+          # bind the manifest to the wrong release and every `noo cluster
+          # provision` of this version would refuse it. An rc tag's CLI is
+          # stamped A.B.C-rc.N; a final's CLI is always rebuilt (never
+          # re-used from the rc, scripts/cli-release-reuse.py TAG_STAMPED),
+          # so it reports A.B.C. A dispatch dry run has no tag to compare.
+          case "${GITHUB_REF_NAME:-}" in
+            noo-cli-v*)
+              if [ "$v" != "${GITHUB_REF_NAME#noo-cli-v}" ]; then
+                echo "::error::this run's CLI reports $v but the tag is $GITHUB_REF_NAME — refusing to write a manifest bound to the wrong release"
+                exit 1
+              fi ;;
+          esac
+          printf '%s\n' "$v" > noo-release-version
+          sha256sum noo-*-unknown-linux-musl noo-*-unknown-linux-gnu noo-*-apple-darwin noo-release-version > sha256sums.txt
+          grep -qx "$(sha256sum noo-release-version)" sha256sums.txt \
+            || { echo "::error::sha256sums.txt has no noo-release-version row for $v"; exit 1; }
+          sha256sum -c sha256sums.txt
           ls -l
           cat sha256sums.txt
 
@@ -707,7 +734,7 @@ jobs:
           ## Install (one-liner)
 
           \`\`\`sh
-          curl -fsSL https://github.com/${{ github.repository }}/releases/download/${TAG}/install.sh | sh
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/${TAG}/install.sh -o install.sh && sh install.sh
           \`\`\`
 
           Then:
@@ -745,12 +772,21 @@ jobs:
           # prereleases, and only a final may own the install.sh link.
           flags="--latest"
           case "$TAG" in *-rc.*) flags="--prerelease --latest=false" ;; esac
-          # shellcheck disable=SC2086
-          gh release create "${TAG}" \
-            --repo "${{ github.repository }}" \
-            $flags \
-            --title "pai CLI ${TAG}" \
-            --notes "${notes}" \
+          repo="${{ github.repository }}"
+          # DRAFT first, then every asset, then publish: nothing is public
+          # until all 30 are uploaded. One `gh release create` with every
+          # asset had no retry, and one HTTP 408 cost noo-cli-v0.6.22-rc.1 a
+          # job re-run (run 42862153616). A re-run of this job finds its own
+          # draft and resumes; a PUBLISHED release is never touched.
+          state=$(gh release view "${TAG}" --repo "$repo" --json isDraft -q .isDraft 2>/dev/null || echo none)
+          case "$state" in
+            true)  echo "resuming the draft release ${TAG}" ;;
+            false) echo "::error::${TAG} is already published; this job will not change its assets"; exit 1 ;;
+            *)     gh release create "${TAG}" --repo "$repo" --draft --title "pai CLI ${TAG}" --notes "${notes}" ;;
+          esac
+          # Each asset uploaded on its own, transient failures retried
+          # (scripts/release-upload-assets.sh).
+          scripts/release-upload-assets.sh "$repo" "${TAG}" \
             dist/noo-x86_64-unknown-linux-musl \
             dist/noo-x86_64-unknown-linux-musl.sha256 \
             dist/noo-aarch64-unknown-linux-musl \
@@ -777,6 +813,9 @@ jobs:
             dist/noo-gateway-aarch64-apple-darwin.sha256 \
             dist/sha256sums.txt \
             dist/sha256sums.txt.sig \
+            dist/noo-release-version \
             dist/noo-stack-bundle.tar.gz \
             dist/noo-stack-bundle.tar.gz.sha256 \
             dist/install.sh
+          # shellcheck disable=SC2086
+          gh release edit "${TAG}" --repo "$repo" --draft=false $flags

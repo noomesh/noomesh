@@ -91,10 +91,11 @@ containers + journal ──▶ node-agent (every node, the controller too) ─�
 
 ## What is scraped
 
-The live Prometheus configuration is the inline `configs:` block at the
-end of `docker-compose.cluster.yml` (`monitoring/prometheus.yml` is a
-reference copy). Every job is HTTPS with the cluster PKI client cert,
-15-second interval.
+The Prometheus configuration is `monitoring/prometheus.yml`, bind-mounted
+into the prometheus container; there is no other copy (until 0.6.24 an
+inline copy in `docker-compose.cluster.yml` was the one loaded, and the two
+drifted). Every job is HTTPS with the cluster PKI client cert, 15-second
+interval.
 
 **Which** client cert is the point. Every job presents
 `services/prometheus/service.{crt,key}` — `CN=prometheus`,
@@ -115,13 +116,14 @@ Existing installs mint the leaves once (`noo security --help`).
 | Job | Target | Notes |
 |---|---|---|
 | `gateway` | `gateway:8080/metrics` | the service leaf alone: the gateway admits `CN=prometheus` on `GET /metrics` and nothing else (needs mTLS enforcement, which is the default; `NOO_MTLS_GATEWAY=false` turns it off); people need an Operator or Admin login |
-| `noo_node_agent` | `node-agent:8081/metrics` | the service leaf alone, no bearer — the agent refuses this route to anything that is not the controller or a cluster service |
+| `noo_node_agent` | every registered node agent, from the gateway's list (`http_sd`: `GET /api/internal/prometheus/targets/node-agents`, refreshed every 60 s) | the service leaf alone, no bearer — the agent refuses this route to anything that is not the controller or a cluster service. Only agents whose leaf carries a SAN for the address the gateway dials are listed, and the scrape verifies it |
 | `node` | `node-exporter:9100` | host CPU, memory, disk, network |
-| `nvidia_gpu` | `nvidia-exporter:9400` | GPU temperature, power, memory, utilisation (`nvidia_gpu_*`); the launcher scales this exporter to 0 on hosts without an NVIDIA runtime |
+| `nvidia_gpu` | `nvidia-exporter:9400`, only while the exporter runs (`file_sd`: it writes `nvidia-exporter.json` into the `prometheus-sd` tmpfs volume while it serves) | GPU temperature, power, memory, utilisation (`nvidia_gpu_*`); the launcher scales this exporter to 0 on hosts without an NVIDIA runtime, so a CPU-only controller has no such target |
 | `prometheus` | `localhost:9090` | self |
 
-Worker nodes are not scraped by the controller's Prometheus; their
-node-agent exposes the same `/metrics` on `:8081`. There is no `worker`
+A static target must be a service that runs on every install: anything that may be absent is
+discovered, so Prometheus never asks a resolver for a name with no container
+behind it (`tests/test_prometheus_static_targets_exist.py`). There is no `worker`
 compose profile (there was one, carrying a node-exporter and a promtail
 nothing scraped or could reach; it went with promtail): a node runs a
 native agent, never compose.

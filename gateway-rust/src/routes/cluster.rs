@@ -97,6 +97,8 @@ pub fn router() -> Router<Arc<AppState>> {
             put(super::node_workload_placements::put_placement).delete(super::node_workload_placements::delete_placement),
         )
         .route("/api/cluster/nodes/{node_id}/node-workloads", get(super::node_workload_placements::list_placements))
+        // i607b B3: `retry now` for a refused model-set fetch (operator only).
+        .route("/api/cluster/nodes/{node_id}/model-set-retry", post(super::model_set_retry::retry_model_set))
         .route("/api/cluster/nodes/{node_id}/fit", post(placement_fit_post))
         // ── Model classes ──
         .route("/api/cluster/model-classes", get(model_classes_get))
@@ -298,6 +300,9 @@ enum BeatShape {
     Str,
     Bool,
     Num,
+    /// A whole number, zero or more (a byte count). A negative, a fraction
+    /// or a string is unknown.
+    NonNegInt,
     OneOf(&'static [&'static str]),
     /// A list of objects, at most this many.
     Objects(usize),
@@ -315,6 +320,10 @@ const I300_BEAT_KEYS: &[(&str, BeatShape)] = &[
     ("nvidia_driver_caps_ok", BeatShape::Bool),
     ("controller_host", BeatShape::Bool),
     ("data_root_free_gb", BeatShape::Num),
+    // i607b: free bytes of the filesystem the agent's model-set disk check
+    // reads (<models dir>/sets). Placement prefers it to data_root_free_gb.
+    // An old gateway drops it, and the preflight then falls back.
+    ("model_sets_free_bytes", BeatShape::NonNegInt),
     ("addon_workloads_policy", BeatShape::OneOf(&["none", "approve", "auto"])),
     ("addon_workloads_approvals", BeatShape::Objects(256)),
     ("model_sets", BeatShape::Objects(256)),
@@ -326,6 +335,7 @@ fn beat_shape_ok(v: &Value, shape: BeatShape) -> bool {
         BeatShape::Str => v.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 64),
         BeatShape::Bool => v.is_boolean(),
         BeatShape::Num => v.as_f64().is_some_and(f64::is_finite),
+        BeatShape::NonNegInt => v.as_u64().is_some_and(|n| n <= i64::MAX as u64),
         BeatShape::OneOf(allowed) => v.as_str().is_some_and(|s| allowed.contains(&s)),
         BeatShape::Objects(max) => v
             .as_array()
@@ -1101,7 +1111,10 @@ fn derive_nats_state(reported: Option<&Value>) -> (Value, String) {
     let Some(bus) = reported.filter(|v| !v.is_null()) else {
         return (
             Value::Null,
-            "not reported — this node-agent build does not send nats_status".to_string(),
+            "not reported — no heartbeat from this node has carried its bus state: \
+             it has not sent its first heartbeat yet, or its NATS client could not be \
+             created (the agent logs \"running without messaging\")"
+                .to_string(),
         );
     };
 
@@ -1147,6 +1160,45 @@ fn derive_nats_state(reported: Option<&Value>) -> (Value, String) {
 /// `unknown` means everywhere else in this list. No timestamp at all (an
 /// entry that predates both fields) is left as gossip reported: nothing to
 /// contradict it with.
+/// How long after THIS gateway starts the absence of gossip is not evidence:
+/// two and a half of the agents' 30 s announce intervals.
+pub(crate) const GOSSIP_SETTLE_SECS: f64 = 75.0;
+
+/// i677 #17. Within [`GOSSIP_SETTLE_SECS`] of this gateway's start, a node
+/// absent from gossip whose heartbeat is still within the evaluator's own
+/// threshold AND whose last report says its NATS client is connected is
+/// `gateway_settling`: `Some(detail)`. A DISPLAY reason only: the caller keeps
+/// the status "unknown". The detail says whether that heartbeat reached THIS
+/// gateway or was stored before it started (a node that died just before the
+/// restart looks exactly like that until its threshold passes, so the reason
+/// never says it is alive). `None` leaves the verdict and its bus diagnosis as
+/// they are. Pure.
+pub(crate) fn settling_after_gateway_start(data: &Value, now: f64, gateway_started: f64) -> Option<String> {
+    let since_start = now - gateway_started;
+    if !(0.0..GOSSIP_SETTLE_SECS).contains(&since_start) {
+        return None;
+    }
+    // A real heartbeat, not only the registration `ts`.
+    let hb = data.get("last_heartbeat").and_then(|v| v.as_f64())?;
+    if crate::autonomy_evaluators::is_node_offline(data, now) {
+        return None;
+    }
+    let bus_up = data.get("nats_status").and_then(|b| b.get("connected")).and_then(|c| c.as_bool()) == Some(true);
+    if !bus_up {
+        return None;
+    }
+    let heard = if hb >= gateway_started {
+        format!("last heard {}s ago, by this gateway", (now - hb).max(0.0) as i64)
+    } else {
+        format!("last heard {}s ago, BEFORE this gateway started", (now - hb).max(0.0) as i64)
+    };
+    Some(format!(
+        "settling — {heard}, with its NATS client reported connected; this gateway started {}s ago and has \
+         not heard a gossip round yet (every 30 s). Not confirmed alive until it does",
+        since_start as i64
+    ))
+}
+
 fn demote_if_heartbeat_stale(data: &mut Value, now: f64) {
     let has_stamp = data.get("last_heartbeat").and_then(|v| v.as_f64()).is_some()
         || data.get("ts").and_then(|v| v.as_f64()).is_some();
@@ -1252,6 +1304,22 @@ pub(crate) async fn collect_cluster_nodes(state: &Arc<AppState>) -> (Vec<Value>,
                                  the node is not an alive gossip peer, so its \
                                  liveness cannot be confirmed from here"
                             );
+                            // i677 #17: right after THIS gateway starts, its
+                            // gossip view is empty until each node's next
+                            // announce (every 30 s). The closing verify of every
+                            // fresh install ran inside that window and read the
+                            // box's own healthy node as "unknown".
+                            // The status STAYS "unknown" (nothing that reads it,
+                            // routing included, may act on an unconfirmed node);
+                            // only the reason and the detail say it is settling.
+                            if let Some(detail) = settling_after_gateway_start(
+                                &data,
+                                unix_now_f64(),
+                                crate::legacy_lanes::process_start_unix() as f64,
+                            ) {
+                                data["status_reason"] = json!("gateway_settling");
+                                data["status_detail"] = json!(detail);
+                            }
 
                             // The node may have told us WHY. `nats_status` is
                             // its own report of its bus (heartbeat POST), and
@@ -1261,6 +1329,9 @@ pub(crate) async fn collect_cluster_nodes(state: &Arc<AppState>) -> (Vec<Value>,
                             // second liveness verdict: `status` stays
                             // "unknown", because this is still the node's
                             // claim, not our measurement.
+                            // Not while settling: "gossip publisher stuck" is a
+                            // diagnosis only once the gateway has had a round.
+                            if data["status"] == "unknown" && data.get("status_reason").is_none() {
                             if let Some(bus) = data.get("nats_status").cloned() {
                                 let connected = bus.get("connected")
                                     .and_then(|c| c.as_bool());
@@ -1281,6 +1352,7 @@ pub(crate) async fn collect_cluster_nodes(state: &Arc<AppState>) -> (Vec<Value>,
                                          stuck or this gateway's gossip subscriber is"
                                     );
                                 }
+                            }
                             }
                         }
 
@@ -1609,7 +1681,29 @@ pub(crate) async fn cluster_nodes(State(state): State<Arc<AppState>>) -> AppJson
         "nodes": nodes,
         "stats": stats,
         "error": offline_merge_error,
+        // The release this gateway was started for (the launcher's
+        // NOO_IMAGE_TAG): a `noo cluster verify` run on a node compares its
+        // agents with THIS, not with whatever its own binary was built for.
+        "stack_tag": stack_tag_of(std::env::var(crate::addon_registry::STACK_ENV).ok()),
     }))
+}
+
+/// The stack tag to report, `null` when the launcher set none.
+fn stack_tag_of(raw: Option<String>) -> Option<String> {
+    raw.map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
+}
+
+#[cfg(test)]
+mod stack_tag_tests {
+    #[test]
+    fn the_nodes_list_says_which_release_the_gateway_runs() {
+        assert_eq!(super::stack_tag_of(Some(" v0.6.24 ".into())).as_deref(), Some("v0.6.24"));
+        assert_eq!(super::stack_tag_of(Some(String::new())), None, "unset in compose reads as none, not as an empty tag");
+        assert_eq!(super::stack_tag_of(None), None);
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let body = crate::test_src::fn_body(&own, "pub(crate) async fn cluster_nodes(");
+        assert!(body.contains("\"stack_tag\": stack_tag_of(std::env::var(crate::addon_registry::STACK_ENV).ok())"));
+    }
 }
 
 /// Annotate a backend list with the two facts an idle-scaledown decision
@@ -1744,28 +1838,84 @@ pub(crate) async fn cluster_backends(State(state): State<Arc<AppState>>) -> AppJ
     Json(json!({"backends": backends, "grouped": grouped}))
 }
 
-/// GPU metrics — fetches Prometheus metrics from nvidia-exporter and parses
-/// per-GPU data (temperature, power, memory, utilization). Falls back to
-/// gossip-based node data if the exporter is unreachable.
-pub(super) async fn cluster_gpu_metrics(State(state): State<Arc<AppState>>) -> AppJson {
-    let exporter_url = crate::config::env_or_yaml(
-        "NVIDIA_EXPORTER_URL",
-        |c| c.services.nvidia_exporter_url.clone(),
-        // The exporter refuses to serve without mTLS (docker/nvidia-smi-exporter.py),
-        // so a plaintext default was a URL that could never answer.
-        "https://nvidia-exporter:9400/metrics",
-    );
+/// Where nvidia-exporter announces itself while it serves (compose: the
+/// `prometheus-sd` tmpfs volume, mounted READ-ONLY here; the exporter writes
+/// `nvidia-exporter.json` once it is bound and removes it on SIGTERM, see
+/// docker/nvidia-smi-exporter.py). Prometheus reads the same file (file_sd).
+pub(crate) const EXPORTER_ANNOUNCE_DIR: &str = "/run/noo-prom-sd";
+pub(crate) const EXPORTER_ANNOUNCEMENT: &str = "nvidia-exporter.json";
+const EXPORTER_DEFAULT_URL: &str = "https://nvidia-exporter:9400/metrics";
 
-    let client = crate::tls::cluster_client();
+/// What the controller's own GPU exporter gave.
+#[derive(Debug)]
+pub(crate) enum ExporterGpus {
+    /// Not fetched: the default exporter has not announced itself, so there
+    /// is no container behind its name (a CPU-only controller). Asking would
+    /// send `nvidia-exporter` to the host's resolver: Docker's DNS forwards a
+    /// name it cannot answer. The console's Observability panel polls this
+    /// every 15 s and a kiosk can show it all day.
+    NotAnnounced,
+    /// The exporter answered 2xx: its GPUs.
+    Scraped(Vec<Value>),
+    /// It answered, but not usefully (non-2xx, or a cut-off body).
+    Failed(String),
+    /// No answer at all (connect or name failure).
+    Unreachable,
+}
 
-    match client.get(&exporter_url).timeout(std::time::Duration::from_secs(5)).send().await {
+/// The URL the GPU route asks: NVIDIA_EXPORTER_URL / `services.nvidia_exporter_url`
+/// when set, else the compose default.
+pub(crate) fn exporter_url(configured: &str) -> String {
+    let c = configured.trim();
+    if c.is_empty() { EXPORTER_DEFAULT_URL.to_string() } else { c.to_string() }
+}
+
+/// Whether `url` names the controller's OWN exporter container (the compose
+/// service `nvidia-exporter`, or its `<prefix>-nvidia-exporter` container
+/// name), which exists only while the exporter runs. Decided by the HOST, not
+/// by where the URL came from: rc.5 decided by source, and every install's
+/// noomesh.yaml (seeded byte-for-byte from noomesh.yaml.example, which set
+/// this key to the compose default) made the default look operator-set, so
+/// the gate never applied. A URL that does not parse is treated as ours
+/// (no fetch without an announcement): failing closed costs a GPU tile,
+/// failing open costs a lookup every 15 s.
+pub(crate) fn names_our_exporter(url: &str) -> bool {
+    match reqwest::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_ascii_lowercase)) {
+        Some(h) => !h.contains('.') && (h == "nvidia-exporter" || h.ends_with("-nvidia-exporter")),
+        None => true,
+    }
+}
+
+/// Fetch the exporter, but only when it can be there: a URL naming our own
+/// exporter container is fetched only while its announcement exists. An
+/// operator URL pointing anywhere else is their target, fetched as configured.
+pub(crate) async fn read_exporter(client: &reqwest::Client, url: &str, announce_dir: &std::path::Path) -> ExporterGpus {
+    if names_our_exporter(url) && !announce_dir.join(EXPORTER_ANNOUNCEMENT).is_file() {
+        return ExporterGpus::NotAnnounced;
+    }
+    match client.get(url).timeout(std::time::Duration::from_secs(5)).send().await {
         Ok(resp) if resp.status().is_success() => {
             // A cut-off scrape is an error, never "no GPUs" (i460).
-            let body = match crate::upstream_body::text_2xx(resp, "nvidia-exporter").await {
-                Ok(b) => b,
-                Err(e) => return Json(json!({"error": e, "gpus": []})),
-            };
-            let mut gpus = parse_prometheus_gpu_metrics(&body);
+            match crate::upstream_body::text_2xx(resp, "nvidia-exporter").await {
+                Ok(body) => ExporterGpus::Scraped(parse_prometheus_gpu_metrics(&body)),
+                Err(e) => ExporterGpus::Failed(e),
+            }
+        }
+        Ok(resp) => ExporterGpus::Failed(format!("nvidia-exporter returned {}", resp.status())),
+        Err(_) => ExporterGpus::Unreachable,
+    }
+}
+
+/// GPU metrics — the controller's own nvidia-exporter when it is running
+/// (it has announced itself), else the node agents' `/gpu` (gossip).
+pub(super) async fn cluster_gpu_metrics(State(state): State<Arc<AppState>>) -> AppJson {
+    // The exporter refuses to serve without mTLS (docker/nvidia-smi-exporter.py),
+    // so a plaintext default was a URL that could never answer.
+    let url = exporter_url(&crate::config::env_or_yaml("NVIDIA_EXPORTER_URL", |c| c.services.nvidia_exporter_url.clone(), ""));
+    let announce_dir = std::path::Path::new(EXPORTER_ANNOUNCE_DIR);
+
+    match read_exporter(&crate::tls::cluster_client(), &url, announce_dir).await {
+        ExporterGpus::Scraped(mut gpus) => {
             // The exporter is the controller's own, so these GPUs belong
             // to the controller node. Name it: the kiosk (and anything
             // else) joins GPU ↔ node on `node_id`/`hostname`, and until
@@ -1779,13 +1929,8 @@ pub(super) async fn cluster_gpu_metrics(State(state): State<Arc<AppState>>) -> A
             }
             Json(json!({"gpus": gpus}))
         }
-        Ok(resp) => {
-            Json(json!({
-                "error": format!("nvidia-exporter returned {}", resp.status()),
-                "gpus": [],
-            }))
-        }
-        Err(_) => {
+        ExporterGpus::Failed(e) => Json(json!({"error": e, "gpus": []})),
+        ExporterGpus::NotAnnounced | ExporterGpus::Unreachable => {
             // Fallback: proxy to node agents' /gpu endpoint
             let agents = all_node_agents(&state).await;
             let mut all_gpus = Vec::new();
@@ -3928,6 +4073,10 @@ async fn desired_config_get(
     if let Some(nw) = node_workloads {
         body["node_workloads"] = Value::Array(nw);
     }
+    // i607b B3: the node's `retry now` epoch, a TOP-LEVEL key on purpose (the
+    // `node_workloads` fragment is decoded strictly by the agent, a new field
+    // inside it would make an old agent refuse). Omitted at epoch 0.
+    super::model_set_retry::apply(&mut body, super::model_set_retry::retry_for(&state, &node_id).await.as_ref());
     Ok(Json(body))
 }
 
@@ -4534,7 +4683,7 @@ async fn placement_staging_refusal(state: &AppState, node_id: &str, backend: &st
 /// (404) or unreachable costs a log line and nothing else. Without this a
 /// harness kind change landed up to 5 min after `noo cluster place`
 /// (both awolf and mcmini, harness compare 2026-10-24).
-fn nudge_reconcile(state: Arc<AppState>, node_id: String) {
+pub(super) fn nudge_reconcile(state: Arc<AppState>, node_id: String) {
     tokio::spawn(async move {
         let link = match crate::node_link::NodeLink::for_node(&state, &node_id).await {
             Ok(l) => l,
@@ -5605,6 +5754,61 @@ async fn tailscale_bearer() -> Result<String, String> {
     })
 }
 
+/// Whether this gateway holds ANY Tailscale credential: an OAuth client id or
+/// secret, or an API key. None at all means this controller never put a device
+/// on a tailnet (enrolment mints the node's auth key with it), so a teardown
+/// has nothing to remove there. Any part present, even an unusable one, is not
+/// "none": a credential that fails still reports NOT removed with its cause.
+fn tailscale_credential_present_in(oauth_id: &str, oauth_secret: &str, api_key: &str) -> bool {
+    [oauth_id, oauth_secret, api_key].iter().any(|v| !v.trim().is_empty())
+}
+
+fn tailscale_credential_present() -> bool {
+    tailscale_credential_present_in(
+        &std::env::var("NOO_TAILSCALE_OAUTH_CLIENT_ID").unwrap_or_default(),
+        &crate::config::secret_env::secret_or_empty("NOO_TAILSCALE_OAUTH_CLIENT_SECRET"),
+        &crate::config::secret_env::secret_or_empty("NOO_TAILSCALE_API_KEY"),
+    )
+}
+
+/// The answer to a device delete on a controller with no Tailscale credential
+/// (rc.6 rehearsal, A-teardown.tailnet: this was a 500 "internal error" and the
+/// CLI told the operator to delete a device that never existed).
+fn no_tailscale_credential_answer(ip: &str, hostname: &str) -> Value {
+    json!({
+        "status": "no_credential",
+        "ip": ip, "hostname": hostname,
+        "note": "this controller holds no Tailscale credential, so it put no device on a tailnet: nothing to remove",
+    })
+}
+
+#[cfg(test)]
+mod tailscale_credential_tests {
+    use super::*;
+
+    #[test]
+    fn no_credential_at_all_is_nothing_to_remove_and_any_part_is_a_credential() {
+        assert!(!tailscale_credential_present_in("", "", ""));
+        assert!(!tailscale_credential_present_in("  ", "\n", ""));
+        assert!(tailscale_credential_present_in("client-id", "", ""), "a half-configured OAuth client is not 'none'");
+        assert!(tailscale_credential_present_in("", "secret", ""));
+        assert!(tailscale_credential_present_in("", "", "tskey-api-x"));
+        let a = no_tailscale_credential_answer("", "rhx-node2");
+        assert_eq!(a["status"], "no_credential");
+        assert_eq!(a["hostname"], "rhx-node2");
+    }
+
+    #[test]
+    fn the_delete_route_answers_no_credential_before_it_asks_for_a_bearer() {
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn delete_tailscale_device(");
+        let check = body.find("if !tailscale_credential_present() \u{7b}").expect("the route checks for a credential");
+        let answer = body.find("return Ok(Json(no_tailscale_credential_answer(&ip, &hostname)));").expect("and answers no_credential");
+        let bearer = body.find("let bearer = tailscale_bearer().await.map_err(AppError::Internal)?;").expect("a present credential still mints");
+        assert!(check < answer && answer < bearer, "the no-credential answer comes before the bearer (which is a 500 when it fails)");
+    }
+}
+
 /// Mint one pre-authorized Tailscale auth key carrying `tag`. Shared by
 /// `POST /api/cluster/mint-join-key` and the bootstrap-token mint (which puts
 /// the key in the enrollment blob), so the two cannot drift on the payload
@@ -5834,6 +6038,12 @@ async fn delete_tailscale_device(
     let hostname = body.get("hostname").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     if ip.is_empty() && hostname.is_empty() {
         return Err(AppError::BadRequest("provide `ip` (preferred) or `hostname`".into()));
+    }
+    // No credential at all: this controller never enrolled a device on a
+    // tailnet, so there is nothing to remove. A credential that is present
+    // but fails stays an error below (NOT removed, with its cause).
+    if !tailscale_credential_present() {
+        return Ok(Json(no_tailscale_credential_answer(&ip, &hostname)));
     }
 
     let bearer = tailscale_bearer().await.map_err(AppError::Internal)?;
@@ -7266,6 +7476,10 @@ mod honesty_tests {
         let (state, detail) = derive_nats_state(None);
         assert_eq!(state, Value::Null);
         assert!(detail.contains("not reported"), "detail was: {detail}");
+        // rc.6: a current agent omits it only before its first heartbeat or
+        // when its NATS client could not be created; never blame the build.
+        assert!(!detail.contains("build does not send"), "detail was: {detail}");
+        assert!(detail.contains("first heartbeat") && detail.contains("running without messaging"), "detail was: {detail}");
 
         let (state, _) = derive_nats_state(Some(&Value::Null));
         assert_eq!(state, Value::Null);
@@ -8425,9 +8639,14 @@ mod i300_beat_tests {
             "nvidia_driver_caps_ok": true,
             "controller_host": false,
             "data_root_free_gb": 412.5,
+            "model_sets_free_bytes": 442_986_717_184u64,
             "addon_workloads_policy": "approve",
             "addon_workloads_approvals": [{"addon": "rhaddon", "digest": format!("sha256:{}", "a".repeat(64))}],
-            "model_sets": [{"id": "rh-voice", "revision": "r1", "state": "verified"}],
+            "model_sets": [
+                {"id": "rh-voice", "revision": "r1", "state": "verified", "bytes_total": 8_000_000_000u64},
+                {"id": "rh-stt", "revision": "r2", "state": "fetching", "bytes_done": 0, "bytes_total": 3_000_000_000u64},
+                {"id": "rh-tts", "revision": "r3", "state": "refused", "reason": "disk", "retry_at": "2026-11-09T14:32:00Z", "free_bytes": 4_500_000_000u64, "need_bytes": 9_600_000_000u64},
+            ],
             "node_workloads": [{"addon": "rhaddon", "name": "worker", "state": "provisioned", "ready": false, "door_port": 41001}],
         })
     }
@@ -8452,6 +8671,7 @@ mod i300_beat_tests {
             "os": "",
             "nvidia_runtime": "yes",
             "data_root_free_gb": "lots",
+            "model_sets_free_bytes": -1,
             "addon_workloads_policy": "always",
             "model_sets": [1, 2],
             "node_workloads": {"addon": "rhaddon"},
@@ -8459,13 +8679,41 @@ mod i300_beat_tests {
         });
         carry_i300(&mut data, &full_beat());
         carry_i300(&mut data, &bad);
-        for key in ["gpu_compute_cap", "os", "nvidia_runtime", "data_root_free_gb", "addon_workloads_policy", "model_sets", "node_workloads", "addon_workloads_approvals"] {
+        for key in ["gpu_compute_cap", "os", "nvidia_runtime", "data_root_free_gb", "model_sets_free_bytes", "addon_workloads_policy", "model_sets", "node_workloads", "addon_workloads_approvals"] {
             assert!(data.get(key).is_none(), "{key}: a misshapen value is unknown, never kept: {data}");
         }
         // An empty list is a fact (no sets, no workloads), not unknown.
         carry_i300(&mut data, &json!({"model_sets": [], "node_workloads": []}));
         assert_eq!(data["model_sets"], json!([]));
         assert_eq!(data["node_workloads"], json!([]));
+    }
+
+    /// i607b: `model_sets_free_bytes` is a byte count. Zero is a fact (a full
+    /// disk); a negative, a fraction, a string or a bool is unknown, and an
+    /// earlier value is not kept.
+    #[test]
+    fn model_sets_free_bytes_keeps_a_whole_number_and_drops_anything_else() {
+        let mut data = json!({"id": "n1"});
+        for good in [json!(0), json!(9_000_000_000u64), json!(i64::MAX)] {
+            carry_i300(&mut data, &json!({"model_sets_free_bytes": good.clone()}));
+            assert_eq!(data["model_sets_free_bytes"], good, "kept");
+        }
+        for bad in [json!(-1), json!(1.5), json!(1.0e12), json!("9"), json!(true), json!(null), json!(u64::MAX)] {
+            carry_i300(&mut data, &json!({"model_sets_free_bytes": 5}));
+            carry_i300(&mut data, &json!({"model_sets_free_bytes": bad.clone()}));
+            assert!(data.get("model_sets_free_bytes").is_none(), "{bad}: unknown, never kept: {data}");
+        }
+    }
+
+    /// i607b: the new row fields ride inside `model_sets` untouched.
+    #[test]
+    fn model_set_rows_keep_their_delivery_fields() {
+        let mut data = json!({"id": "n1"});
+        carry_i300(&mut data, &full_beat());
+        let rows = data["model_sets"].as_array().expect("rows");
+        assert_eq!(rows[1]["bytes_done"], json!(0), "a zero bytes_done survives");
+        assert_eq!(rows[2]["free_bytes"], json!(4_500_000_000u64));
+        assert_eq!(rows[2]["retry_at"], json!("2026-11-09T14:32:00Z"));
     }
 
     /// The handler runs this step before its KV write.
@@ -8545,5 +8793,180 @@ mod db_read_error_tests {
             Err(AppError::Unavailable(m)) => assert!(m.contains("cannot read the enrolled nodes"), "{m}"),
             other => panic!("expected a 503 naming the read, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod settling_after_gateway_start_tests {
+    use super::*;
+
+    fn node(hb_age: Option<f64>, bus: Option<bool>, now: f64) -> Value {
+        let mut v = json!({"tier": 3});
+        if let Some(a) = hb_age {
+            v["last_heartbeat"] = json!(now - a);
+            v["ts"] = json!(now - a);
+        }
+        if let Some(c) = bus {
+            v["nats_status"] = json!({"connected": c, "state": if c { "connected" } else { "reconnecting" }});
+        }
+        v
+    }
+
+    /// i677 #17 (install matrix run 6, 43167439088): the closing verify ran
+    /// seconds after the gateway restarted and read the box's own healthy
+    /// node as "unknown"; a minute later it was "live from gossip". Inside the
+    /// window it is SETTLING, and the detail says whether the last heartbeat
+    /// reached this gateway or was stored before it started.
+    #[test]
+    fn inside_the_window_a_fresh_connected_node_is_settling_and_says_when_it_was_heard() {
+        let now = 10_000.0;
+        let start = now - 20.0;
+        let after = settling_after_gateway_start(&node(Some(5.0), Some(true), now), now, start).expect("settling");
+        assert!(after.contains("last heard 5s ago, by this gateway") && after.contains("started 20s ago"), "{after}");
+        // Died 30 s before the restart: its stored heartbeat is still within
+        // the threshold, so it is settling too, but never called alive.
+        let before = settling_after_gateway_start(&node(Some(50.0), Some(true), now), now, start).expect("settling");
+        assert!(before.contains("BEFORE this gateway started") && before.contains("Not confirmed alive"), "{before}");
+    }
+
+    #[test]
+    fn outside_the_window_or_without_proof_it_stays_unknown() {
+        let now = 10_000.0;
+        let fresh = node(Some(5.0), Some(true), now);
+        assert_eq!(settling_after_gateway_start(&fresh, now, now - GOSSIP_SETTLE_SECS - 1.0), None, "past the window: gossip absence is evidence again");
+        assert_eq!(settling_after_gateway_start(&fresh, now, now + 5.0), None, "a clock that runs backwards proves nothing");
+        assert_eq!(settling_after_gateway_start(&node(Some(5.0), Some(false), now), now, now - 20.0), None, "bus-deaf stays unknown");
+        assert_eq!(settling_after_gateway_start(&node(Some(5.0), None, now), now, now - 20.0), None, "no bus report: no proof");
+        assert_eq!(settling_after_gateway_start(&node(None, Some(true), now), now, now - 20.0), None, "no heartbeat at all");
+        assert_eq!(settling_after_gateway_start(&node(Some(10_000.0), Some(true), now), now, now - 20.0), None, "a stale heartbeat");
+    }
+
+    /// Wired into the gossip-absent branch; the status stays "unknown" there
+    /// (a display reason only, so routing and every other reader of the
+    /// status are untouched), and the bus diagnosis still runs.
+    #[test]
+    fn the_gossip_absent_branch_asks_it_and_keeps_the_diagnosis_for_unknown() {
+        let code = crate::test_src::own_code(include_str!("cluster.rs"));
+        let ask_at = code.find("if let Some(detail) = settling_after_gateway_start(").expect("asks it");
+        let block = &code[ask_at..ask_at + code[ask_at..].find("if data[\"status\"] == \"unknown\" && data.get(\"status_reason\").is_none()").expect("the block ends at the diagnosis")];
+        assert!(block.contains("data[\"status_reason\"] = json!(\"gateway_settling\");"), "{block}");
+        assert!(!block.contains("data[\"status\"]"), "the settling block never writes a status: {block}");
+        let unknown = code.find("data[\"status\"] = json!(\"unknown\");\n                            data[\"status_detail\"] = json!(\n                                \"unknown — registration is present in NATS KV").expect("the absent branch");
+        let ask = code.find("if let Some(detail) = settling_after_gateway_start(").expect("asks it");
+        let diag = code.find("if data[\"status\"] == \"unknown\" && data.get(\"status_reason\").is_none() \u{7b}\n                            if let Some(bus) = data.get(\"nats_status\").cloned() \u{7b}").expect("the diagnosis, for an unexplained unknown only");
+        assert!(unknown < ask && ask < diag);
+    }
+}
+
+#[cfg(test)]
+mod exporter_announcement_tests {
+    //! The gateway asks for its own GPU exporter only while the exporter has
+    //! announced itself (noomesh#1129 follow-up, general 2026-11-13): on a
+    //! controller without one, `nvidia-exporter` is a name Docker cannot
+    //! answer and forwards to the host's resolver, every 15 s while the
+    //! console's Observability panel is open and all day on a kiosk.
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// A resolver that records every name it is asked for and answers none.
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<String>>);
+    impl reqwest::dns::Resolve for Recorder {
+        fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            self.0.lock().unwrap().push(name.as_str().to_string());
+            let err: Box<dyn std::error::Error + Send + Sync> = "this test allows no DNS".into();
+            Box::pin(async move { Err::<reqwest::dns::Addrs, Box<dyn std::error::Error + Send + Sync>>(err) })
+        }
+    }
+
+    /// A fresh, empty directory per test (no tempfile crate in this crate).
+    fn fresh_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("noo-gpu-announce-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("temp dir");
+        d
+    }
+
+    fn recording_client() -> (reqwest::Client, Arc<Recorder>) {
+        let rec = Arc::new(Recorder::default());
+        let client = reqwest::Client::builder().dns_resolver(rec.clone()).no_proxy().build().expect("client");
+        (client, rec)
+    }
+
+    #[tokio::test]
+    async fn without_an_announcement_nothing_is_resolved_or_requested() {
+        let dir = fresh_dir("none");
+        let (client, rec) = recording_client();
+        let got = read_exporter(&client, EXPORTER_DEFAULT_URL, &dir).await;
+        assert!(matches!(got, ExporterGpus::NotAnnounced), "{got:?}");
+        let asked: Vec<String> = rec.0.lock().unwrap().clone();
+        assert!(asked.is_empty(), "asked a resolver for {asked:?} with no exporter announced");
+    }
+
+    #[tokio::test]
+    async fn with_the_announcement_the_exporter_is_fetched() {
+        let dir = fresh_dir("announced");
+        std::fs::write(dir.join(EXPORTER_ANNOUNCEMENT), r#"[{"targets":["nvidia-exporter:9400"]}]"#).unwrap();
+        let (client, rec) = recording_client();
+        let got = read_exporter(&client, EXPORTER_DEFAULT_URL, &dir).await;
+        // The recorder answers no name, so the fetch fails as unreachable:
+        // what matters is that it was attempted, by name.
+        assert!(matches!(got, ExporterGpus::Unreachable), "{got:?}");
+        let asked: Vec<String> = rec.0.lock().unwrap().clone();
+        assert_eq!(asked, vec!["nvidia-exporter".to_string()], "the announced exporter was not fetched");
+    }
+
+    #[tokio::test]
+    async fn an_operator_set_url_is_fetched_without_an_announcement() {
+        let dir = fresh_dir("explicit");
+        let (client, rec) = recording_client();
+        let got = read_exporter(&client, "https://gpu-exporter.example.internal:9400/metrics", &dir).await;
+        assert!(matches!(got, ExporterGpus::Unreachable), "{got:?}");
+        let asked: Vec<String> = rec.0.lock().unwrap().clone();
+        assert_eq!(asked, vec!["gpu-exporter.example.internal".to_string()]);
+    }
+
+    /// rc.5's miss: the gate was skipped for any CONFIGURED URL, and every
+    /// install is configured, because onboard seeds noomesh.yaml as a byte copy
+    /// of noomesh.yaml.example (noo-cli/src/onboard/steps.rs ensure_mesh_yaml).
+    /// So this runs the gate against what an install is seeded with, parsed
+    /// the way the gateway loads it, and against the line rc.5's example
+    /// shipped (installs seeded then keep it: upgrade never rewrites it).
+    #[tokio::test]
+    async fn the_seeded_install_config_is_gated_too() {
+        // Read at test time, not include_str!: the gateway image's build
+        // context does not carry the example (tests/test_rust_build_context_complete.py).
+        let example = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../noomesh.yaml.example"))
+            .expect("noomesh.yaml.example (what onboard seeds noomesh.yaml from) is unreadable");
+        let seeded: crate::config::AppConfig = serde_yaml::from_str(&example).expect("the example parses as the gateway's config");
+        let rc5_seed = "https://nvidia-exporter:9400/metrics".to_string();
+        let dir = fresh_dir("seeded");
+        for configured in [seeded.services.nvidia_exporter_url.clone().unwrap_or_default(), rc5_seed] {
+            let url = exporter_url(&configured);
+            let (client, rec) = recording_client();
+            let got = read_exporter(&client, &url, &dir).await;
+            assert!(matches!(got, ExporterGpus::NotAnnounced), "configured {configured:?} -> {url}: {got:?}");
+            let asked: Vec<String> = rec.0.lock().unwrap().clone();
+            assert!(asked.is_empty(), "configured {configured:?}: asked a resolver for {asked:?} with no exporter announced");
+        }
+    }
+
+    #[test]
+    fn only_our_exporter_container_needs_the_announcement() {
+        for ours in ["https://nvidia-exporter:9400/metrics", "https://NVIDIA-EXPORTER:9400/metrics", "https://noo-nvidia-exporter:9400/metrics", "not a url"] {
+            assert!(names_our_exporter(ours), "{ours}");
+        }
+        for theirs in ["https://gpu.example.internal:9400/metrics", "https://10.0.0.5:9400/metrics", "https://nvidia-exporter.lan:9400/metrics"] {
+            assert!(!names_our_exporter(theirs), "{theirs}");
+        }
+    }
+
+    #[test]
+    fn the_handler_reads_the_compose_mount() {
+        // the path the gateway reads is where compose mounts the volume,
+        // read-only (tests/test_prometheus_static_targets_exist.py checks the
+        // compose side against this constant's text)
+        assert_eq!(EXPORTER_ANNOUNCE_DIR, "/run/noo-prom-sd");
+        assert_eq!(EXPORTER_ANNOUNCEMENT, "nvidia-exporter.json");
     }
 }

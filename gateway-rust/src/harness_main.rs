@@ -253,6 +253,9 @@ pub async fn run() -> Result<()> {
         backend_type: backend_type.clone(),
         api_format: coordinator::api_format_for(&backend_type, &model_url),
     };
+    // Am I held off the internet? From inside this unit's own namespace, before
+    // anything else connects (enforcement step 1; the node agent reads it).
+    crate::harness::egress_selftest::run_at_start().await;
     let get = |k: &str| std::env::var(k).ok();
     check_harness_secrets(&get).map_err(|e| anyhow!("harness: secrets: {e}"))?;
     tracing::info!(capability = HARNESS_SECRET_FILES_CAPABILITY, "harness: secret reader");
@@ -364,6 +367,9 @@ pub async fn run() -> Result<()> {
         }
         Some(Arc::new(ctx))
     };
+    // One permit per concurrent turn or task. Made before the minute re-read
+    // below, which takes them ALL to restart the harness only when idle.
+    let limit = Arc::new(tokio::sync::Semaphore::new(max_turns.max(1)));
     // A placement or profile change does not restart the harness (only a
     // kind change does), so re-read both every minute: `noo cluster place
     // <node> harness <model> --env NOO_HARNESS_THINKING=off` or `noo cluster
@@ -374,6 +380,9 @@ pub async fn run() -> Result<()> {
         let model_url = model_url.clone();
         let switch = driver.as_ref().filter(|d| d.launch_slim.is_some()).map(|d| d.prompt.clone());
         let window = driver.as_ref().filter(|d| d.launch.context_window_env.is_some()).map(|d| d.context_window.clone());
+        let idle_limit = limit.clone();
+        let slots = max_turns.max(1) as u32;
+        let started_at = std::time::Instant::now();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(60));
             tick.tick().await;
@@ -409,13 +418,26 @@ pub async fn run() -> Result<()> {
                     tracing::warn!(now = ?idle, started = ?started_idle, "harness: the profile's stream_idle_secs changed; it applies when the harness restarts");
                 }
                 idle_warned = idle_moved;
+                // A start-only setting moved: restart to apply it, but only
+                // when idle. Taking EVERY permit proves nothing runs and
+                // keeps anything from starting; the service manager
+                // (Restart=always) brings the harness back with the new
+                // value (i658: awolf ran a whole day on a default it had
+                // already been told to change). Busy: try again next minute.
+                if idle_moved {
+                    if !self_restart_allowed(started_at.elapsed()) {
+                        tracing::info!(up_secs = started_at.elapsed().as_secs(), "harness: a start-only setting changed; not restarting yet (at most one self-restart per {} s)", MIN_UP_BEFORE_SELF_RESTART.as_secs());
+                    } else if restart_when_idle(&idle_limit, slots) {
+                        tracing::warn!(now = ?idle, started = ?started_idle, reason = "stream_idle_secs changed", "harness: idle; restarting to apply the profile's stream_idle_secs");
+                        std::process::exit(0);
+                    }
+                }
             }
         });
     }
     let subject = coordinator::harness_run_subject(&node);
     let mut turns = nats.queue_subscribe(subject.clone(), "harness".to_string()).await?;
     let mut tasks = nats.queue_subscribe(crate::tasks::task_subject(&node), "harness".to_string()).await?;
-    let limit = Arc::new(tokio::sync::Semaphore::new(max_turns.max(1)));
     let drain = drain_bound(&|k| std::env::var(k).ok());
     let mut stop = stop_signal();
     // The tasks this harness holds right now, by id: a hand-back of a task
@@ -665,9 +687,44 @@ async fn ask_agent_kind(client: &reqwest::Client, agent_url: &str, retry: &[Dura
     }
 }
 
+/// The least uptime before the harness restarts itself to apply a start-only
+/// setting. A restart resets uptime, so this caps self-restarts at one per
+/// period even when the profile flaps or the agent is still unknown at the
+/// next start.
+const MIN_UP_BEFORE_SELF_RESTART: Duration = Duration::from_secs(600);
+
+fn self_restart_allowed(up: Duration) -> bool {
+    up >= MIN_UP_BEFORE_SELF_RESTART
+}
+
+/// Whether the harness may restart now to apply a start-only setting: only
+/// when every one of its `slots` permits can be taken at once, i.e. no turn
+/// or task holds one. The permits are kept (leaked) on success, so nothing
+/// can start between this answer and the exit.
+fn restart_when_idle(limit: &tokio::sync::Semaphore, slots: u32) -> bool {
+    match limit.try_acquire_many(slots) {
+        Ok(permits) => {
+            permits.forget();
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// The pauses between asks before the harness gives up on learning its
-/// kind: about 15 s in all, then the service manager's restart takes over.
-const KIND_RETRY_DELAYS: &[Duration] = &[Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(4), Duration::from_secs(8)];
+/// kind: about 60 s in all, then the service manager's restart takes over.
+/// At a roll the agent and the harness restart in the same second, and the
+/// agent answers 503 "not known yet" until it has applied its first
+/// desired-config (i658); a minute covers that without a restart.
+const KIND_RETRY_DELAYS: &[Duration] = &[
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(15),
+    Duration::from_secs(15),
+    Duration::from_secs(15),
+];
 
 /// The refusal a harness exits with when the agent never answered.
 fn refusal_message(cause: &anyhow::Error) -> String {
@@ -1201,5 +1258,55 @@ mod tests {
             assert!(crate::config::secret_env::FILE_BACKED_SECRETS.contains(n), "{n}");
         }
         assert!(HARNESS_SECRET_FILES_CAPABILITY.starts_with("noo-harness-reads-secret-files/"));
+    }
+}
+
+#[cfg(test)]
+mod placement_race_tests {
+    use super::*;
+
+    /// i658: the startup wait for the agent's placement covers about a
+    /// minute (the agent answers 503 until its first desired-config).
+    #[test]
+    fn the_kind_wait_covers_about_a_minute() {
+        let total: u64 = KIND_RETRY_DELAYS.iter().map(|d| d.as_secs()).sum();
+        assert!((55..=75).contains(&total), "{total} s");
+    }
+
+    /// Restart only when idle: every permit free, then none can be taken.
+    #[test]
+    fn a_restart_to_apply_a_setting_waits_for_idle_and_holds_the_door() {
+        let limit = tokio::sync::Semaphore::new(2);
+        let busy = limit.try_acquire().expect("one turn running");
+        assert!(!restart_when_idle(&limit, 2), "a turn holds a permit: not now");
+        drop(busy);
+        assert!(restart_when_idle(&limit, 2), "idle: restart");
+        assert!(limit.try_acquire().is_err(), "nothing can start between the answer and the exit");
+    }
+
+    /// A flapping profile (or an agent still unknown after the wait, then
+    /// known) cannot make the harness restart every minute: at most one
+    /// self-restart per MIN_UP_BEFORE_SELF_RESTART of uptime.
+    #[test]
+    fn a_flapping_profile_cannot_restart_the_harness_every_minute() {
+        for minute in 0..10u64 {
+            assert!(!self_restart_allowed(Duration::from_secs(minute * 60 + 59)), "minute {minute}");
+        }
+        assert!(self_restart_allowed(Duration::from_secs(600)));
+        let code = crate::test_src::own_code(include_str!("harness_main.rs"));
+        let gate = code.find("if !self_restart_allowed(started_at.elapsed())").expect("the uptime gate");
+        let exit = code.find("std::process::exit(0);").expect("the exit");
+        assert!(gate < exit, "the uptime gate comes before the exit");
+    }
+
+    /// The 503 the agent sends while it does not know is retried, not taken
+    /// as "nothing placed" (only a 404 / placed:false is that).
+    #[test]
+    fn not_known_yet_is_retried_not_read_as_unplaced() {
+        let code = crate::test_src::own_code(include_str!("harness_main.rs"));
+        let fetch = crate::test_src::fn_body(&code, "pub(crate) async fn fetch_placement(");
+        assert!(fetch.contains("reqwest::StatusCode::NOT_FOUND") && fetch.contains("if !resp.status().is_success()"), "{fetch}");
+        let ask = crate::test_src::fn_body(&code, "async fn ask_agent_kind(");
+        assert!(ask.contains("Err(e) => match delays.next()"), "an error (a 503 included) is asked again: {ask}");
     }
 }

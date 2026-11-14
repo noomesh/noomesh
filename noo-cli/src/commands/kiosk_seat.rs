@@ -1716,6 +1716,53 @@ fn apply_blob(blob: &[u8], cfg: &SeatConfig, state: &mut SeatState) -> Result<Ap
 }
 
 /// `noo kiosk seat-sync` — the seat timer's one tick (root; hidden).
+/// What the seat's signed bundle GET found.
+#[derive(Debug, PartialEq)]
+pub(crate) enum BundleFetch {
+    /// 304: the staged bundle is the one named in If-None-Match.
+    Unchanged,
+    /// 404: nothing is staged for this seat.
+    NoneStaged,
+    Blob(Vec<u8>),
+    Failed(String),
+}
+
+/// The If-None-Match the seat sends: the sha256 of the bytes it last applied
+/// AS SERVED (the ciphertext), strong and quoted, as the gateway's ETag is.
+/// `last_applied_sha` is recorded only after the controller took an rc=0
+/// report, so a lost report or a failed apply sends nothing and re-fetches.
+/// Anything that is not 64 hex is not sent.
+pub(crate) fn if_none_match(last_applied_sha: Option<&str>) -> Option<String> {
+    last_applied_sha
+        .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(|s| format!("\"{s}\""))
+}
+
+/// The signed bundle GET, conditional on the last applied bundle (F3: an
+/// unchanged bundle is a 304 with no body, so a seat's tick does not pull and
+/// hash the whole blob). An old gateway ignores the header and answers 200;
+/// the caller's sha comparison still catches an unchanged blob then.
+pub(crate) fn fetch_bundle(agent: &ureq::Agent, url: &str, proof: &str, last_applied_sha: Option<&str>) -> BundleFetch {
+    let mut req = agent.get(url).header("x-noo-birth-proof", proof);
+    if let Some(tag) = if_none_match(last_applied_sha) {
+        req = req.header("if-none-match", &tag);
+    }
+    match req.call() {
+        Ok(mut r) if r.status().as_u16() == 200 => {
+            use std::io::Read as _;
+            let mut b = Vec::new();
+            match r.body_mut().as_reader().read_to_end(&mut b) {
+                Ok(_) => BundleFetch::Blob(b),
+                Err(e) => BundleFetch::Failed(format!("reading the bundle: {e}")),
+            }
+        }
+        Ok(r) if r.status().as_u16() == 304 => BundleFetch::Unchanged,
+        Ok(r) if r.status().as_u16() == 404 => BundleFetch::NoneStaged,
+        Ok(r) => BundleFetch::Failed(format!("bundle fetch answered HTTP {}", r.status().as_u16())),
+        Err(e) => BundleFetch::Failed(format!("bundle fetch: {e}")),
+    }
+}
+
 pub fn kiosk_seat_sync(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let migrate = match args {
         [] => None,
@@ -1792,19 +1839,12 @@ pub fn kiosk_seat_sync(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
         Ok(p) => p,
         Err(e) => { say(&e); return Ok(1); }
     };
-    let blob = match agent.get(&format!("{base}/bootstrap/seat/{seat}/bundle")).header("x-noo-birth-proof", &proof).call() {
-        Ok(mut r) if r.status().as_u16() == 200 => {
-            use std::io::Read as _;
-            let mut b = Vec::new();
-            if let Err(e) = r.body_mut().as_reader().read_to_end(&mut b) {
-                say(&format!("reading the bundle: {e}"));
-                return Ok(1);
-            }
-            b
-        }
-        Ok(r) if r.status().as_u16() == 404 => return Ok(0),
-        Ok(r) => { say(&format!("bundle fetch answered HTTP {}", r.status().as_u16())); return Ok(1); }
-        Err(e) => { say(&format!("bundle fetch: {e}")); return Ok(1); }
+    let url = format!("{base}/bootstrap/seat/{seat}/bundle");
+    let blob = match fetch_bundle(&agent, &url, &proof, state.last_applied_sha.as_deref()) {
+        BundleFetch::Blob(b) => b,
+        // 304: the staged bundle is the one this seat last applied (#1088).
+        BundleFetch::Unchanged | BundleFetch::NoneStaged => return Ok(0),
+        BundleFetch::Failed(e) => { say(&e); return Ok(1); }
     };
     let sha = sha256_hex(&blob);
     if state.last_applied_sha.as_deref() == Some(sha.as_str()) {
@@ -2128,6 +2168,40 @@ fn norm_tag(t: &str) -> String {
     if t.is_empty() || t.starts_with('v') { t.to_string() } else { format!("v{t}") }
 }
 
+/// Is the console a display reports (`console_build`, from the bundle it is
+/// running) the controller's? ONE answer for the display check, the upgrade's
+/// seat wait and the post-apply relaxation.
+///
+/// `controller_console` is what [`controller_console`] found: the id of the
+/// console the controller's gateway embeds (`ui-<tree hash of ui/>`, since the
+/// gateway embeds its console by digest), compared EXACTLY; or, from a gateway
+/// that predates that, the stack tag, compared as tags were (`norm_tag`).
+/// The id is baked into the bundle, so a display that has not reloaded still
+/// reports its old one and stays NOT current.
+pub(crate) fn console_is_current(build: &str, controller_console: &str) -> bool {
+    let build = build.trim();
+    if controller_console.starts_with("ui-") {
+        return !build.is_empty() && build == controller_console;
+    }
+    norm_tag(build) == norm_tag(controller_console)
+}
+
+/// The controller's console, for [`console_is_current`]: the id its gateway
+/// serves (`GET /api/cluster/console-build`), else the stack tag (a gateway
+/// from before content ids, or the route unreachable).
+pub(crate) fn controller_console(g: &Globals) -> String {
+    controller_console_or(g, super::cluster_verify::controller_stack_tag)
+}
+
+/// [`controller_console`] with the tag to fall back on given: on a node,
+/// the controller's tag as the gateway states it, never this box's own.
+pub(crate) fn controller_console_or(g: &Globals, fallback: impl FnOnce() -> String) -> String {
+    crate::http::get_json_opt(g, "/api/cluster/console-build", true, 10)
+        .and_then(|v| v["console_build"].as_str().map(str::to_string))
+        .filter(|id| id.starts_with("ui-"))
+        .unwrap_or_else(fallback)
+}
+
 /// The token after `key=` in a `seat-apply …` report line.
 pub(crate) fn report_word<'a>(msg: &'a str, key: &str) -> Option<&'a str> {
     msg.split_whitespace().find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
@@ -2212,9 +2286,17 @@ pub(crate) fn seat_checks(seat: &Value, controller_cli: &str, controller_tag: &s
     } else if build.is_empty() {
         check("display", Verdict::Warn, format!("console build not stated (the browser is not answering on CDP){quality}"),
             Some(format!("on {name}: noo kiosk status")))
-    } else if norm_tag(build) != norm_tag(controller_tag) {
-        check("display", Verdict::Fail, format!("console {build}, controller {controller_tag}{quality}"),
-            Some(format!("on {name}: noo kiosk reload")))
+    } else if controller_tag.is_empty() {
+        check("display", Verdict::Warn, format!("console {build}; not compared: the controller did not state its release (an older gateway){quality}"), None)
+    } else if !console_is_current(build, controller_tag) {
+        // The first roll onto content ids: the display still runs a console
+        // stamped with a release tag. Not a fault, a reload.
+        let why = if controller_tag.starts_with("ui-") && build.starts_with("stack-") {
+            format!("console {build} is from before content ids; this controller's console is {controller_tag}: reload the display once{quality}")
+        } else {
+            format!("console {build}, controller {controller_tag}{quality}")
+        };
+        check("display", Verdict::Fail, why, Some(format!("on {name}: noo kiosk reload")))
     } else {
         check("display", Verdict::Ok, format!("console {build} = controller{}{quality}",
             if display.is_empty() { String::new() } else { format!(" (last apply: display {display})") }), None)
@@ -2295,6 +2377,28 @@ fn heartbeat_predates_apply(seat: &Value, controller_cli: &str) -> bool {
 /// the CLI and display verdicts must not be read off that heartbeat (it names
 /// the version the seat HAD). The apply's own report line stands in, and the
 /// row says plainly that no heartbeat has arrived since.
+/// Has the seat's heartbeat caught up with the apply, so the checks read the
+/// new state and not one from before it? The new CLI and the applied sha, AND
+/// a display that reports the controller's console build.
+///
+/// The console build arrives a sync tick or more after the CLI field (the
+/// browser reloads, then CDP reports it), so waiting on the CLI alone gave the
+/// display check a pre-reload heartbeat: "console stack-v0.6.21, controller
+/// v0.6.22" on the 0.6.22 roll, and a second `noo upgrade --seats` to clear it.
+/// A display that states no build (headless, or the browser not answering on
+/// CDP) or whose unit is down is not waited on: waiting cannot change that
+/// verdict, and the check names it.
+pub(crate) fn seat_heartbeat_fresh(seat: &Value, controller_cli: &str, controller_tag: &str) -> bool {
+    let hb = &seat["heartbeat"];
+    if hb["cli_version"].as_str() != Some(controller_cli) || hb["last_applied_sha"] != seat["sha256"] {
+        return false;
+    }
+    let build = hb["console_build"].as_str().unwrap_or("");
+    let unit = hb["kiosk_display"].as_str().unwrap_or("");
+    let display_down = hb["kiosk_bins"].as_str().is_some_and(|b| b != "absent") && !unit.is_empty() && unit != "active";
+    build.is_empty() || display_down || console_is_current(build, controller_tag)
+}
+
 pub(crate) fn seat_checks_after_apply(seat: &Value, controller_cli: &str, controller_tag: &str, now: i64) -> Vec<super::cluster_verify::Check> {
     use super::cluster_verify::Verdict;
     let mut out = seat_checks(seat, controller_cli, controller_tag, now);
@@ -2319,7 +2423,7 @@ pub(crate) fn seat_checks_after_apply(seat: &Value, controller_cli: &str, contro
             "display" if c.verdict == Verdict::Fail => {
                 let reported = report_word(msg, "console").unwrap_or("");
                 let step_ok = display_settled(report_word(msg, "display").unwrap_or(""));
-                if step_ok && !reported.is_empty() && reported != "-" && norm_tag(reported) == norm_tag(controller_tag) {
+                if step_ok && !reported.is_empty() && reported != "-" && console_is_current(reported, controller_tag) {
                     *c = check("display", Verdict::Warn, format!(
                         "no heartbeat since the apply; the apply reported console {reported} = controller"),
                         Some("noo cluster verify".into()));
@@ -2354,7 +2458,7 @@ pub(crate) fn upgrade_seats(g: &Globals) -> i32 {
         match stage_seat(g, s) {
             Ok(sha) => {
                 ui::say(&ui::sub(&ui::status_line(Glyph::Ok, "staged (CLI + kiosk assets, signed, encrypted to the seat's birth cert)")));
-                pending.push(super::provision::PendingApply { node: name, sha, legacy: false });
+                pending.push(super::provision::PendingApply { node: name, sha, legacy: false, applier_first: false });
             }
             Err(e) => {
                 ui::say_err(&ui::sub(&ui::status_line(Glyph::Err, &format!("not staged: {e}"))));
@@ -2366,7 +2470,8 @@ pub(crate) fn upgrade_seats(g: &Globals) -> i32 {
         ui::blank();
         let ends = super::provision::wait_applied_via(g, &pending, 600, 5,
             &|n| format!("/api/cluster/seats/{n}/status"), "seat");
-        let tag = super::cluster_verify::controller_stack_tag();
+        // The controller's console: its gateway's content id, else the tag.
+        let console = controller_console(g);
         let mut rows = Vec::new();
         for (n, end) in ends {
             let ok_apply = matches!(end, super::provision::ApplyEnd::Applied { rc: 0, .. });
@@ -2377,16 +2482,15 @@ pub(crate) fn upgrade_seats(g: &Globals) -> i32 {
             let mut st = crate::http::get_json_opt(g, &format!("/api/cluster/seats/{n}/status"), true, 10);
             if ok_apply {
                 for _ in 0..30 {
-                    let fresh = st.as_ref().is_some_and(|s| s["heartbeat"]["cli_version"].as_str() == Some(env!("CARGO_PKG_VERSION"))
-                        && s["heartbeat"]["last_applied_sha"] == s["sha256"]);
+                    let fresh = st.as_ref().is_some_and(|s| seat_heartbeat_fresh(s, env!("CARGO_PKG_VERSION"), &console));
                     if fresh { break; }
                     std::thread::sleep(std::time::Duration::from_secs(5));
                     st = crate::http::get_json_opt(g, &format!("/api/cluster/seats/{n}/status"), true, 10);
                 }
             }
             let st = st.unwrap_or(Value::Null);
-            let checks = if ok_apply { seat_checks_after_apply(&st, env!("CARGO_PKG_VERSION"), &tag, now_unix()) }
-                else { seat_checks(&st, env!("CARGO_PKG_VERSION"), &tag, now_unix()) };
+            let checks = if ok_apply { seat_checks_after_apply(&st, env!("CARGO_PKG_VERSION"), &console, now_unix()) }
+                else { seat_checks(&st, env!("CARGO_PKG_VERSION"), &console, now_unix()) };
             let seat_ok = ok_apply && checks.iter().all(|c| c.verdict != super::cluster_verify::Verdict::Fail);
             if !seat_ok { failed.push(n.clone()); }
             if g.json {
@@ -3644,6 +3748,105 @@ exec {real_install} "$@"
         ureq::tls::Certificate::from_der(ca.cert.der().as_ref()).to_owned()
     }
 
+    /// A fake bundle door (F3, #1088's contract): `/none` answers 404; a GET
+    /// whose If-None-Match is the quoted sha of `blob` answers 304 with no
+    /// body; anything else gets 200 and `blob`. Records each request's
+    /// If-None-Match value ("-" when absent).
+    fn bundle_door(ca: &TestCa, blob: &'static [u8]) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read as _, Write as _};
+        use std::sync::{Arc, Mutex};
+        let (cert, key) = leaf(ca);
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let cfg = Arc::new(rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions().unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key).unwrap());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        let etag = format!("\"{}\"", sha256_hex(blob));
+        std::thread::spawn(move || {
+            for tcp in listener.incoming() {
+                let Ok(tcp) = tcp else { continue };
+                tcp.set_read_timeout(Some(std::time::Duration::from_secs(10))).ok();
+                let Ok(conn) = rustls::ServerConnection::new(cfg.clone()) else { continue };
+                let mut tls = rustls::StreamOwned::new(conn, tcp);
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match tls.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                if buf.is_empty() {
+                    continue;
+                }
+                let head = String::from_utf8_lossy(&buf).to_string();
+                let path = head.lines().next().unwrap_or("").split(' ').nth(1).unwrap_or("").to_string();
+                let inm = head.lines()
+                    .find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("if-none-match")).map(|(_, v)| v.trim().to_string()))
+                    .unwrap_or_else(|| "-".to_string());
+                seen2.lock().unwrap().push(inm.clone());
+                let _ = if path.ends_with("/none") {
+                    write!(tls, "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                } else if inm == etag {
+                    write!(tls, "HTTP/1.1 304 Not Modified\r\netag: {etag}\r\nconnection: close\r\n\r\n")
+                } else {
+                    write!(tls, "HTTP/1.1 200 OK\r\netag: {etag}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", blob.len())
+                        .and_then(|_| tls.write_all(blob))
+                };
+                let _ = tls.flush();
+                tls.conn.send_close_notify();
+                let _ = tls.flush();
+            }
+        });
+        (format!("https://127.0.0.1:{port}"), seen)
+    }
+
+    /// F3: the seat names the bundle it last applied; an unchanged one is a
+    /// 304 (no body, no apply), a changed one is fetched whole, and a seat
+    /// with nothing applied yet sends no condition at all.
+    #[test]
+    fn an_unchanged_bundle_is_a_304_and_a_changed_one_is_fetched() {
+        let cluster = test_ca("noo cluster CA (test)");
+        let (door, seen) = bundle_door(&cluster, b"ciphertext-v2");
+        let agent = seat_agent_with(cluster.cert.pem().as_bytes(), vec![], 10).unwrap();
+        let url = format!("{door}/bootstrap/seat/lobby/bundle");
+        let v2 = sha256_hex(b"ciphertext-v2");
+        let v1 = sha256_hex(b"ciphertext-v1");
+
+        assert_eq!(fetch_bundle(&agent, &url, "1.c2ln", Some(&v2)), BundleFetch::Unchanged);
+        assert_eq!(fetch_bundle(&agent, &url, "1.c2ln", Some(&v1)), BundleFetch::Blob(b"ciphertext-v2".to_vec()));
+        assert_eq!(fetch_bundle(&agent, &url, "1.c2ln", None), BundleFetch::Blob(b"ciphertext-v2".to_vec()));
+        assert_eq!(fetch_bundle(&agent, &format!("{door}/none"), "1.c2ln", Some(&v2)), BundleFetch::NoneStaged);
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen[0], format!("\"{v2}\""), "the condition is the quoted sha of the bytes as served");
+        assert_eq!(seen[1], format!("\"{v1}\""));
+        assert_eq!(seen[2], "-", "nothing applied yet: no condition");
+    }
+
+    #[test]
+    fn only_a_64_hex_sha_is_ever_sent_as_a_condition() {
+        let sha = "a".repeat(64);
+        assert_eq!(if_none_match(Some(&sha)), Some(format!("\"{sha}\"")));
+        for bad in ["", "abc", &"g".repeat(64), &format!("{}\r\nx: y", "a".repeat(60))] {
+            assert_eq!(if_none_match(Some(bad)), None, "{bad:?}");
+        }
+        assert_eq!(if_none_match(None), None);
+    }
+
+    /// The timer's tick uses the tested GET with the recorded sha.
+    #[test]
+    fn the_sync_tick_fetches_conditionally() {
+        let own = crate::test_src::own_code(include_str!("kiosk_seat.rs"));
+        let tick = crate::test_src::fn_body(&own, "pub fn kiosk_seat_sync(");
+        assert!(tick.contains("fetch_bundle(&agent, &url, &proof, state.last_applied_sha.as_deref())"), "{tick}");
+        assert!(tick.contains("BundleFetch::Unchanged | BundleFetch::NoneStaged => return Ok(0),"), "{tick}");
+    }
+
     #[test]
     fn the_seat_client_trusts_public_roots_and_the_cluster_ca_and_nothing_else() {
         let cluster = test_ca("noo cluster CA (test)");
@@ -3732,5 +3935,148 @@ mod seat_binding_tests {
         let revoked = seat_binding_check(&json!({"tailnet_name": "homeserver-1", "revoked_at": "2026-11-06T01:00:00+00:00"}), "homeserver").unwrap();
         assert!(matches!(revoked.verdict, Verdict::Fail) && revoked.detail.starts_with("revoked at"));
         assert_eq!(revoked.remedy.as_deref(), Some("noo kiosk seat-token homeserver"));
+    }
+}
+
+
+#[cfg(test)]
+mod seat_wait_tests {
+    use super::*;
+
+    fn seat(cli: &str, build: &str) -> Value {
+        json!({"sha256": "s1", "heartbeat": {"cli_version": cli, "last_applied_sha": "s1", "console_build": build,
+            "kiosk_display": "active", "kiosk_bins": "present"}})
+    }
+
+    /// The 0.6.22 roll: the CLI field was already new while the display still
+    /// reported the old console build. That heartbeat is NOT fresh; the one
+    /// after the reload is.
+    #[test]
+    fn the_seat_wait_holds_until_the_display_reports_the_controllers_build() {
+        let before_reload = seat("0.6.22", "stack-v0.6.21+0123abcd");
+        assert!(!seat_heartbeat_fresh(&before_reload, "0.6.22", "stack-v0.6.22"), "the pre-reload heartbeat ended the wait");
+        let after_reload = seat("0.6.22", "stack-v0.6.22+89ab4567");
+        assert!(seat_heartbeat_fresh(&after_reload, "0.6.22", "stack-v0.6.22"));
+        assert!(seat_heartbeat_fresh(&after_reload, "0.6.22", "v0.6.22"), "tags compare normalised");
+    }
+
+    #[test]
+    fn the_seat_wait_still_needs_the_new_cli_and_the_applied_sha() {
+        assert!(!seat_heartbeat_fresh(&seat("0.6.21", "stack-v0.6.22"), "0.6.22", "stack-v0.6.22"));
+        let mut s = seat("0.6.22", "stack-v0.6.22");
+        s["heartbeat"]["last_applied_sha"] = json!("s0");
+        assert!(!seat_heartbeat_fresh(&s, "0.6.22", "stack-v0.6.22"));
+    }
+
+    /// No display build (headless or CDP silent) or a display that is down:
+    /// waiting cannot change the verdict, so the wait does not hold for it.
+    #[test]
+    fn the_seat_wait_does_not_hold_for_a_display_it_cannot_change() {
+        assert!(seat_heartbeat_fresh(&seat("0.6.22", ""), "0.6.22", "stack-v0.6.22"));
+        let mut down = seat("0.6.22", "stack-v0.6.21");
+        down["heartbeat"]["kiosk_display"] = json!("failed");
+        assert!(seat_heartbeat_fresh(&down, "0.6.22", "stack-v0.6.22"));
+    }
+
+    /// The wait loop asks this predicate (and only it).
+    #[test]
+    fn the_upgrade_seat_wait_uses_the_predicate() {
+        let own = crate::test_src::own_code(include_str!("kiosk_seat.rs"));
+        let n = own.matches("seat_heartbeat_fresh(s, env!(\"CARGO_PKG_VERSION\"), &console)").count();
+        assert_eq!(n, 1, "the post-apply wait must use seat_heartbeat_fresh");
+    }
+}
+
+/// The console's identity is its CONTENT (`ui-<tree hash of ui/>`), served by
+/// the controller's gateway, since the gateway embeds the console by digest
+/// (2026-11-11). One function decides "is this display current?" for the
+/// display check, the upgrade's seat wait (#989) and the post-apply relaxation.
+#[cfg(test)]
+mod console_identity_tests {
+    use super::*;
+    use super::super::cluster_verify::Verdict;
+
+    const NEW: &str = "ui-3f2a9c0d";
+    const OLD: &str = "ui-77aa01be";
+
+    fn seat_with(build: &str) -> Value {
+        json!({"seat_name": "homeserver", "last_seen": "2026-11-11T08:00:00Z", "sha256": "s1",
+               "heartbeat": {"cli_version": "0.6.24", "last_applied_sha": "s1", "user_cli_current": true,
+                             "kiosk_serve": "active", "console_build": build, "kiosk": {"user": "kiosk"},
+                             "kiosk_display": "active", "kiosk_bins": "present"}})
+    }
+
+    fn now() -> i64 {
+        super::super::cluster_verify::parse_rfc3339_unix("2026-11-11T08:00:00Z").unwrap() + 10
+    }
+
+    fn display(seat: &Value, controller: &str) -> super::super::cluster_verify::Check {
+        seat_checks(seat, "0.6.24", controller, now()).into_iter().find(|c| c.name == "display").unwrap()
+    }
+
+    #[test]
+    fn a_content_id_compares_exactly_and_a_tag_as_before() {
+        assert!(console_is_current(NEW, NEW) && console_is_current(&format!(" {NEW} "), NEW));
+        assert!(!console_is_current(OLD, NEW), "a display still on an older console is NOT current");
+        assert!(!console_is_current("", NEW) && !console_is_current("stack-v0.6.24", NEW));
+        // A gateway from before content ids: the stack tag, normalised as before.
+        assert!(console_is_current("stack-v0.6.24+abcd", "v0.6.24") && !console_is_current("stack-v0.6.23", "stack-v0.6.24"));
+    }
+
+    #[test]
+    fn the_seat_wait_holds_for_a_stale_console_and_ends_on_the_current_one() {
+        assert!(!seat_heartbeat_fresh(&seat_with(OLD), "0.6.24", NEW), "a display that has not reloaded ended the wait");
+        assert!(seat_heartbeat_fresh(&seat_with(NEW), "0.6.24", NEW));
+        assert!(seat_heartbeat_fresh(&seat_with(""), "0.6.24", NEW), "no build stated: not waited on (fa's #989 rule)");
+    }
+
+    /// A stale display still FAILS, and the first roll onto content ids says
+    /// what it is and names the reload.
+    #[test]
+    fn the_display_check_fails_a_stale_console_and_explains_the_first_roll() {
+        let stale = display(&seat_with(OLD), NEW);
+        assert_eq!(stale.verdict, Verdict::Fail, "{stale:?}");
+        assert!(stale.remedy.as_deref().unwrap_or("").contains("noo kiosk reload"), "{stale:?}");
+        let first = display(&seat_with("stack-v0.6.23+abcd"), NEW);
+        assert_eq!(first.verdict, Verdict::Fail, "{first:?}");
+        assert!(first.detail.contains("from before content ids") && first.detail.contains(NEW), "{first:?}");
+        assert!(first.remedy.as_deref().unwrap_or("").contains("noo kiosk reload"), "{first:?}");
+        assert_eq!(display(&seat_with(NEW), NEW).verdict, Verdict::Ok);
+    }
+
+    #[test]
+    fn the_post_apply_relaxation_reads_the_reported_console_the_same_way() {
+        let mut s = seat_with(OLD);
+        s["heartbeat"]["last_applied_sha"] = json!("old");
+        s["applied_sha"] = json!("s1");
+        s["apply_rc"] = json!(0);
+        s["apply_msg"] = json!(format!("seat-apply cli=updated scripts=1 units=0 serve=restarted display=reloaded console={NEW}"));
+        s["heartbeat"]["cli_version"] = json!("0.6.23");
+        let soft = seat_checks_after_apply(&s, "0.6.24", NEW, now());
+        assert_eq!(soft.iter().find(|c| c.name == "display").unwrap().verdict, Verdict::Warn, "{soft:?}");
+        s["apply_msg"] = json!(format!("seat-apply cli=updated scripts=1 units=0 serve=restarted display=reloaded console={OLD}"));
+        let hard = seat_checks_after_apply(&s, "0.6.24", NEW, now());
+        assert_eq!(hard.iter().find(|c| c.name == "display").unwrap().verdict, Verdict::Fail, "{hard:?}");
+    }
+
+    /// ONE comparison: no site compares console builds with norm_tag itself,
+    /// and the upgrade and verify ask the gateway for the controller's console.
+    #[test]
+    fn every_console_comparison_goes_through_console_is_current() {
+        let own = crate::test_src::own_code(include_str!("kiosk_seat.rs"));
+        let is_current = crate::test_src::fn_body(&own, "pub(crate) fn console_is_current(");
+        assert_eq!(own.matches("norm_tag(").count(), 1 + is_current.matches("norm_tag(").count(),
+            "norm_tag is called outside console_is_current (plus its definition)");
+        for f in ["pub(crate) fn seat_checks(", "pub(crate) fn seat_heartbeat_fresh(", "pub(crate) fn seat_checks_after_apply("] {
+            assert!(crate::test_src::fn_body(&own, f).contains("console_is_current("), "{f}");
+        }
+        let up = crate::test_src::fn_body(&own, "pub(crate) fn upgrade_seats(");
+        assert!(up.contains("let console = controller_console(g);"), "{up}");
+        let cc = crate::test_src::fn_body(&own, "pub(crate) fn controller_console(");
+        assert!(cc.contains("controller_console_or(g, super::cluster_verify::controller_stack_tag)"), "{cc}");
+        let or = crate::test_src::fn_body(&own, "pub(crate) fn controller_console_or(");
+        assert!(or.contains("\"/api/cluster/console-build\"") && or.contains(".filter(|id| id.starts_with(\"ui-\"))"), "{or}");
+        let verify = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        assert!(verify.contains("crate::commands::kiosk_seat::controller_console_or(g,"), "cluster verify compares against the gateway's console");
     }
 }

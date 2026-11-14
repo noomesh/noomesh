@@ -7,8 +7,10 @@
 //! and persist to the same tables, so switching engines is seamless.
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
+use uuid::Uuid;
 
 /// A conversation session with message history.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -167,85 +169,139 @@ pub async fn save_message(
     metadata: Option<&Value>,
     user_id: Option<&str>,
 ) -> Result<()> {
-    let meta = metadata.map(|m| m.to_string()).unwrap_or_else(|| "{}".into());
-    // Accept non-UUID strings (heartbeat tasks, workflows) by coercing
-    // to deterministic UUIDv5.
-    let conv_uuid = coerce_conversation_id(conversation_id);
+    let conversation = ConversationWrite {
+        id: Uuid::parse_str(&coerce_conversation_id(conversation_id))?,
+        user_id,
+        metadata: None,
+        started_at: None,
+        require_owner: false,
+    };
+    let message = MessageWrite {
+        id: Uuid::new_v4(),
+        role,
+        content,
+        metadata,
+        created_at: None,
+    };
+    let mut tx = db.begin().await?;
+    save_message_in(&mut tx, &conversation, &message).await?;
+    tx.commit().await?;
+    Ok(())
+}
 
-    // Ensure conversation exists (id column is uuid type — cast text to uuid).
-    //
-    // COALESCE on conflict rather than DO NOTHING: a conversation row is created
-    // by whichever write lands first, and that is often a tool-record insert that
-    // has no identity in scope. DO NOTHING would let that anonymous row win
-    // permanently, so the conversation would stay unattributed even though a
-    // later message knows exactly who it belongs to.
-    //
-    // COALESCE also makes this self-healing and non-destructive: an existing
-    // attribution is never overwritten (first writer wins), and a NULL is filled
-    // in the first time an identified message arrives.
-    //
-    // org_id rides along on the same statement. A conversation with a NULL
-    // org is invisible to every org-scoped read, not merely narrowed by one:
-    // `conversation_store.py` applies a HARD boundary (`c.org_id = :org`),
-    // and `NULL = 'default'` is false, so the filter returned nothing rather
-    // than fewer rows. Every account has an org — `noo_users.org_id` is
-    // `text DEFAULT 'default' NOT NULL` — so a single-user install is simply
-    // one user in one org running this exact code path, not a special case.
-    //
-    // Resolved by subselect rather than a second round trip: this runs once
-    // per saved message, and a `SELECT org_id FROM noo_users` per message is
-    // a hot-path query for a value the INSERT can fetch itself. 'default'
-    // when there is no user at all (heartbeat, autonomy, system tools) —
-    // those rows are not outside every org, they are in the default one.
-    //
-    // The conflict branch upgrades 'default' as well as NULL, mirroring the
-    // trigger `noo_conv_set_org`: a row created anonymously (a tool record
-    // lands before the first message) starts at 'default', and the first
-    // message that knows the user must be able to move it to that user's
-    // real org. Once a genuine org is recorded, first writer still wins.
-    sqlx::query(
-        "INSERT INTO noo_conversations (id, total_messages, metadata, user_id, org_id) \
-         VALUES ($1::uuid, 0, '{}', $2, \
-                 COALESCE((SELECT org_id FROM noo_users WHERE username = $2), 'default')) \
-         ON CONFLICT (id) DO UPDATE \
-            SET user_id = COALESCE(noo_conversations.user_id, EXCLUDED.user_id), \
-                org_id = CASE \
-                    WHEN EXCLUDED.user_id IS NOT NULL \
-                     AND (noo_conversations.org_id IS NULL \
-                          OR noo_conversations.org_id = 'default') \
-                    THEN EXCLUDED.org_id \
-                    ELSE COALESCE(noo_conversations.org_id, EXCLUDED.org_id) \
-                END"
+/// Transcript storage options shared by native chat and source adapters.
+/// Ownership and organization always use Noomesh's account identity. Adapters
+/// require an exact owner match; native system writes may fill anonymous rows.
+pub(crate) struct ConversationWrite<'a> {
+    pub id: Uuid,
+    pub user_id: Option<&'a str>,
+    /// Initial metadata; existing Noomesh labels are retained on conflict.
+    pub metadata: Option<&'a Value>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub require_owner: bool,
+}
+
+/// Native messages get fresh IDs/timestamps; import adapters can supply stable
+/// IDs and original timestamps for immutable, idempotent delivery.
+pub(crate) struct MessageWrite<'a> {
+    pub id: Uuid,
+    pub role: &'a str,
+    pub content: &'a str,
+    pub metadata: Option<&'a Value>,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ConversationWriteError {
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+    #[error("Conversation source conflict")]
+    OwnershipConflict,
+    #[error("Published entry is immutable")]
+    ImmutableEntry,
+}
+
+/// Ensure a conversation using the native writer's attribution rules. The
+/// caller owns the transaction, so an entry conflict rolls back these changes
+/// along with any source-ledger updates.
+async fn ensure_conversation_in(
+    db: &mut PgConnection,
+    conversation: &ConversationWrite<'_>,
+) -> Result<(), ConversationWriteError> {
+    // First identified writer fills an anonymous row and repairs its default
+    // org; an existing attribution is never overwritten. Org resolution stays
+    // here, shared by native callers and external transcript adapters.
+    let metadata = conversation.metadata.cloned().unwrap_or_else(|| json!({}));
+    let saved = crate::repo::conversations::ensure(
+        db,
+        conversation.id,
+        conversation.user_id,
+        &metadata,
+        conversation.started_at,
+        conversation.require_owner,
     )
-    .bind(&conv_uuid)
-    .bind(user_id)
-    .execute(db)
     .await?;
+    if saved.is_none() {
+        return Err(ConversationWriteError::OwnershipConflict);
+    }
+    Ok(())
+}
 
-    // Insert message (both id and conversation_id are uuid columns)
-    sqlx::query(
-        "INSERT INTO noo_entries \
-         (id, conversation_id, type, content, metadata) \
-         VALUES ($1::uuid, $2::uuid, $3, $4, $5::jsonb)"
-    )
-    .bind(uuid::Uuid::new_v4().to_string())
-    .bind(&conv_uuid)
-    .bind(role)
-    .bind(content)
-    .bind(&meta)
-    .execute(db)
-    .await?;
+/// Canonical entry writer. Use inside a caller-owned transaction: conversation,
+/// entry, counter and optional adapter bookkeeping commit or roll back together.
+pub(crate) async fn save_message_in(
+    db: &mut PgConnection,
+    conversation: &ConversationWrite<'_>,
+    message: &MessageWrite<'_>,
+) -> Result<(), ConversationWriteError> {
+    ensure_conversation_in(db, conversation).await?;
+    let metadata = message.metadata.cloned().unwrap_or_else(|| json!({}));
+    let entry = crate::repo::conversations::NewEntry {
+        id: message.id,
+        conversation_id: conversation.id,
+        role: message.role,
+        content: message.content,
+        metadata: &metadata,
+        created_at: message.created_at,
+    };
+    if crate::repo::conversations::insert_entry(&mut *db, &entry).await? == 0 {
+        // A retry: the same id must carry exactly the same entry.
+        if !crate::repo::conversations::entry_unchanged(&mut *db, &entry).await? {
+            return Err(ConversationWriteError::ImmutableEntry);
+        }
+    } else {
+        crate::repo::conversations::count_message(&mut *db, conversation.id).await?;
+    }
+    Ok(())
+}
 
-    // Increment message count
-    sqlx::query(
-        "UPDATE noo_conversations \
-         SET total_messages = COALESCE(total_messages, 0) + 1 \
-         WHERE id = $1::uuid"
-    )
-    .bind(&conv_uuid)
-    .execute(db)
-    .await?;
+/// Record a source session ending through the same conversation lifecycle.
+/// Out-of-order delivery cannot move the ending backwards.
+pub(crate) async fn finish_conversation_in(
+    db: &mut PgConnection,
+    conversation: &ConversationWrite<'_>,
+    ended_at: DateTime<Utc>,
+    metadata: &Value,
+) -> Result<(), ConversationWriteError> {
+    ensure_conversation_in(db, conversation).await?;
+    crate::repo::conversations::finish(db, conversation.id, ended_at, metadata).await?;
+    Ok(())
+}
 
+/// Delete a caller-owned transcript, retaining any adapter tombstone outside
+/// the conversation tables. Missing conversations are already deleted.
+pub(crate) async fn delete_conversation_in(
+    db: &mut PgConnection,
+    conversation_id: Uuid,
+    user_id: &str,
+) -> Result<(), ConversationWriteError> {
+    let owner = crate::repo::conversations::owner_for_update(&mut *db, conversation_id).await?;
+    if owner.is_some_and(|owner| owner.as_deref() != Some(user_id)) {
+        return Err(ConversationWriteError::OwnershipConflict);
+    }
+    for statement in crate::repo::conversations::DELETE_STATEMENTS {
+        crate::repo::conversations::delete_step(&mut *db, statement, conversation_id).await?;
+    }
     Ok(())
 }
 

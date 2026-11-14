@@ -832,12 +832,16 @@ pub async fn effective_risk(state: &AppState, call: &ToolCall) -> RiskLevel {
             if saved { RiskLevel::Medium } else { base }
         }
         "noo_agent_send" | "noo_agent_message" => {
-            let (Some(sender), Some(to)) = (crate::mcp_bridge::current_caller(), trimmed_arg(&call.arguments, "to")) else {
+            let caller = crate::mcp_bridge::current_caller();
+            let to_arg = trimmed_arg(&call.arguments, "to");
+            let has_thread_id = trimmed_arg(&call.arguments, "thread_id").or_else(|| trimmed_arg(&call.arguments, "thread")).is_some();
+            let (Some(sender), Some(to)) = (caller, to_arg) else {
+                log_kept_high(&call.name, agent_message_high_reason(crate::mcp_bridge::current_caller().is_some(), trimmed_arg(&call.arguments, "to").as_deref(), has_thread_id));
                 return base;
             };
             // A thread post needs a seat in the thread (the tool checks it); a broadcast is refused
             // by the tool. Neither names another principal's agent.
-            if to == "thread" && trimmed_arg(&call.arguments, "thread_id").or_else(|| trimmed_arg(&call.arguments, "thread")).is_some() {
+            if to == "thread" && has_thread_id {
                 return RiskLevel::Medium;
             }
             if crate::auth::owns_name(&sender, &to) {
@@ -848,10 +852,31 @@ pub async fn effective_risk(state: &AppState, call: &ToolCall) -> RiskLevel {
             let lookup = |who: &str| {
                 if who == crate::auth::account_of(&sender) { mine } else if who == crate::auth::account_of(&to) { theirs } else { None }
             };
-            if agent_send_stays_medium(&sender, &to, &lookup) { RiskLevel::Medium } else { base }
+            if agent_send_stays_medium(&sender, &to, &lookup) {
+                RiskLevel::Medium
+            } else {
+                log_kept_high(&call.name, agent_message_high_reason(true, Some(to.as_str()), has_thread_id));
+                base
+            }
         }
         _ => base,
     }
+}
+
+/// Why an agent message stayed HIGH, as a reason code only (i658 C1): the
+/// gate must say which rule it missed so the next stall can be explained,
+/// without the recipient, the thread id or the message in any log.
+pub(crate) fn agent_message_high_reason(has_caller: bool, to: Option<&str>, has_thread_id: bool) -> &'static str {
+    match (has_caller, to) {
+        (false, _) => "no_caller",
+        (true, None) => "missing_to",
+        (true, Some("thread")) if !has_thread_id => "thread_without_id",
+        (true, Some(_)) => "peer_not_allowed",
+    }
+}
+
+fn log_kept_high(tool: &str, reason: &'static str) {
+    tracing::info!(tool = %tool, reason, "exec_risk.kept_high");
 }
 
 /// One `noo_security_audit` row for a Medium or High tool execution decision (the writer
@@ -961,6 +986,13 @@ pub async fn before_tool_call(
                             request_id,
                         });
                     }
+                    ExecApprovalOutcome::Unreachable { request_id } => {
+                        audit_tool_decision(state, call, risk_level, "unreachable", &mode, &request_id).await;
+                        return Err(SecurityError::ApprovalUnreachable {
+                            tool: call.name.clone(),
+                            request_id,
+                        });
+                    }
                     ExecApprovalOutcome::TimedOut { request_id, secs } => {
                         audit_tool_decision(state, call, risk_level, "timeout", &mode, &request_id).await;
                         return Err(SecurityError::ApprovalTimeout {
@@ -1047,6 +1079,15 @@ pub enum ExecApprovalOutcome {
     Approved,
     Denied { by: String, request_id: String },
     TimedOut { request_id: String, secs: u64 },
+    /// Nobody could be asked (no notice delivered, no console open).
+    Unreachable { request_id: String },
+}
+
+/// True when an approval request reached no one: no notice was delivered to
+/// a dashboard, chat or approval channel, and no console socket is open to
+/// show the alert.
+pub(crate) fn nobody_can_be_asked(notice_delivered: bool, open_consoles: usize) -> bool {
+    !notice_delivered && open_consoles == 0
 }
 
 /// Decision window length, mirroring the Python ExecApprovalManager
@@ -1143,7 +1184,7 @@ async fn wait_for_exec_approval(
     // Notify — best-effort, never blocks the gate (Python parity:
     // _notify_exec_approval). The card is the primary surface; the CLI
     // hint keeps headless operators first-class.
-    crate::routes::communication::notify_exec_approval(&call.name, &request_id, timeout_secs)
+    let asked = crate::routes::communication::notify_exec_approval(&call.name, &request_id, timeout_secs)
         .await;
 
     // Dashboard surface: a chat started IN the dashboard has no channel
@@ -1152,7 +1193,7 @@ async fn wait_for_exec_approval(
     // 2026-08-09). Broadcast to every connected WS client as well — the
     // Admin view has the approve/deny buttons; this makes the request
     // visible where the conversation is actually happening.
-    state.alert_hub.broadcast(serde_json::json!({
+    let consoles = state.alert_hub.broadcast(serde_json::json!({
         "type": "alert",
         // Delivered to the tab that raised it and to operators, who hold the
         // approve/deny buttons — not to every connected user (state.rs
@@ -1171,6 +1212,29 @@ async fn wait_for_exec_approval(
             "window_secs": timeout_secs,
         },
     }));
+
+    // Nobody can be asked: no notice reached a dashboard, chat or approval
+    // channel, and no console is open to show the alert. Waiting the window
+    // out only holds the turn (and a harness slot) for a decision nobody can
+    // make: refuse now, saying why (i658: a task's approval sat 300 s
+    // unseen). Any open console keeps today's wait: an operator there can
+    // decide from the alert. This tightens nothing and loosens nothing: the
+    // call still does not run without an approval.
+    if nobody_can_be_asked(asked, consoles) {
+        if let Err(e) = crate::repo::approval_requests::expire_unreachable(&state.db, &request_id).await {
+            tracing::warn!(request_id = %request_id, error = %e, "exec_approval.expire_unreachable_failed");
+        }
+        crate::audit::record(
+            &state.db,
+            AuditEvent::new(AuditKind::ExecApprovalDecided, "gateway", &format!("tool:{}", call.name))
+                .outcome(crate::audit::Outcome::custom("unreachable"))
+                .severity(crate::audit::Severity::Warning)
+                .details(serde_json::json!({"request_id": request_id, "reason": "no channel, no console, no approval channel"})),
+        )
+        .await;
+        tracing::warn!(request_id = %request_id, tool = %call.name, "exec_approval.nobody_to_ask");
+        return ExecApprovalOutcome::Unreachable { request_id };
+    }
 
     tracing::info!(
         request_id = %request_id,
@@ -2299,6 +2363,65 @@ mod tool_risk_context_tests {
         let body = &src[a..a + 6000];
         assert!(body.contains("NULLIF($6, '')"), "an unattended request is stored unbound, decidable only by id");
         assert!(body.contains("ExecApprovalOutcome::TimedOut"), "and refused when nobody decides");
+    }
+
+    /// i658: an approval that reached nobody (no notice delivered, no console
+    /// open) is refused at once, not after the window; any delivered notice
+    /// or any open console keeps today's wait.
+    #[test]
+    fn an_approval_nobody_can_see_is_refused_at_once_not_after_the_window() {
+        assert!(nobody_can_be_asked(false, 0));
+        assert!(!nobody_can_be_asked(true, 0), "a delivered notice: wait for the decision");
+        assert!(!nobody_can_be_asked(false, 1), "an open console: an operator may decide from the alert");
+        let code = crate::test_src::own_code(include_str!("middleware.rs"));
+        let body = crate::test_src::fn_body(&code, "async fn wait_for_exec_approval(");
+        let check = body.find("if nobody_can_be_asked(asked, consoles)").expect("the check");
+        let poll = body.find("loop {").expect("the polling loop");
+        let window = body.find("\"exec_approval.window_open\"").expect("the window log");
+        assert!(check < poll && check < window, "refused before the window opens and before any polling");
+        let refusal = &body[check..poll];
+        assert!(refusal.contains("repo::approval_requests::expire_unreachable(&state.db, &request_id)") && refusal.contains("ExecApprovalOutcome::Unreachable"), "{refusal}");
+        assert!(refusal.contains("AuditKind::ExecApprovalDecided"), "the refusal is audited");
+        assert!(body.contains("let asked = crate::routes::communication::notify_exec_approval("), "delivery is what is judged");
+        assert!(body.contains("let consoles = state.alert_hub.broadcast("), "and the open consoles");
+        let msg = SecurityError::ApprovalUnreachable { tool: "noo_agent_message".into(), request_id: "r1".into() }.to_string();
+        assert!(msg.contains("NOT run") && msg.contains("do not retry") && msg.contains("ask again"), "{msg}");
+    }
+
+    /// i658 C1: the rule an agent message missed is logged as a code only.
+    #[test]
+    fn an_agent_message_kept_high_logs_a_reason_code_and_nothing_else() {
+        assert_eq!(agent_message_high_reason(false, Some("thread"), true), "no_caller");
+        assert_eq!(agent_message_high_reason(true, None, false), "missing_to");
+        assert_eq!(agent_message_high_reason(true, Some("thread"), false), "thread_without_id");
+        assert_eq!(agent_message_high_reason(true, Some("alice/claude-x"), false), "peer_not_allowed");
+        let code = crate::test_src::own_code(include_str!("middleware.rs"));
+        let log = crate::test_src::fn_body(&code, "fn log_kept_high(");
+        assert!(log.contains("tracing::info!(tool = %tool, reason, \"exec_risk.kept_high\")"), "{log}");
+        for leak in ["to =", "thread", "message", "arguments", "content", "recipient"] {
+            assert!(!log.replace("exec_risk.kept_high", "").contains(leak), "the log line carries {leak}: {log}");
+        }
+        assert!(!log.contains("tool: &str, reason: &'static str, to"), "only tool and reason reach it");
+    }
+
+    /// An unreachable request never runs later: the call returns the refusal at
+    /// once (nothing waits on the row), the row is set expired, and the approve
+    /// route only acts on PENDING rows, so it cannot be approved afterwards.
+    #[test]
+    fn an_unreachable_request_never_runs_later() {
+        let code = crate::test_src::own_code(include_str!("middleware.rs"));
+        let body = crate::test_src::fn_body(&code, "async fn wait_for_exec_approval(");
+        let check = body.find("if nobody_can_be_asked(asked, consoles)").expect("the check");
+        let refusal = &body[check..body.find("loop {").expect("the polling loop")];
+        assert!(refusal.contains("repo::approval_requests::expire_unreachable(&state.db, &request_id)") && refusal.contains("return ExecApprovalOutcome::Unreachable"), "{refusal}");
+        let repo = crate::test_src::own_code(include_str!("repo/approval_requests.rs"));
+        let expire = crate::test_src::fn_body(&repo, "pub async fn expire_unreachable(");
+        assert!(expire.contains("SET status = 'expired'") && expire.contains("WHERE request_id = $1 AND status = 'pending'"), "{expire}");
+        let admin = crate::test_src::own_code(include_str!("routes/admin.rs"));
+        let approve = crate::test_src::fn_body(&admin, "async fn approval_approve(");
+        assert!(approve.contains("WHERE request_id = $1 AND status = 'pending'"), "approve acts on pending rows only");
+        let msg = SecurityError::ApprovalUnreachable { tool: "t".into(), request_id: "r".into() }.to_string();
+        assert!(msg.contains("will not run later") && !msg.contains("noo approval approve"), "{msg}");
     }
 
     /// Every Medium or High decision is audited, High refusals included; Low is not.

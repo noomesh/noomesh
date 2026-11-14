@@ -9,9 +9,12 @@ the same library that PyTorch, TensorFlow, etc. use to detect GPUs.
 """
 
 import http.server
+import json
 import os
+import signal
 import socketserver
 import ssl
+import sys
 from typing import List, Dict, Optional
 
 # nvidia-ml-py is the official NVIDIA Python library (pynvml module)
@@ -24,6 +27,14 @@ except ImportError:
     print("WARNING: pynvml not available, metrics will be empty")
 
 PORT = 9400
+
+# Prometheus finds this exporter by file_sd, not a static name
+# (monitoring/prometheus.yml, job nvidia_gpu): a CPU-only controller never
+# runs this container, and a static `nvidia-exporter:9400` there sent the
+# name to the host's resolver every 15 s. NOO_PROM_SD_DIR is the shared tmpfs
+# volume `prometheus-sd`; the file exists exactly while this process serves.
+SD_FILE_NAME = "nvidia-exporter.json"
+SD_TARGET = f"nvidia-exporter:{PORT}"
 
 
 def init_nvml() -> bool:
@@ -229,6 +240,48 @@ def _create_ssl_context() -> ssl.SSLContext:
     return ctx
 
 
+def sd_path() -> str:
+    """The announcement file, or "" when no discovery dir is configured."""
+    d = os.getenv("NOO_PROM_SD_DIR", "")
+    return os.path.join(d, SD_FILE_NAME) if d else ""
+
+
+def announce(path: str) -> bool:
+    """Write the file_sd target atomically. A failure is logged, never fatal:
+    the exporter still serves the gateway, only Prometheus misses it."""
+    if not path:
+        return False
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump([{"targets": [SD_TARGET]}], f)
+        os.replace(tmp, path)
+        print(f"announced {SD_TARGET} to Prometheus ({path})")
+        return True
+    except OSError as e:
+        print(f"WARNING: could not announce to Prometheus ({path}): {e}")
+        return False
+
+
+def withdraw(path: str) -> None:
+    """Remove the announcement: a stopped exporter is not a target."""
+    if not path:
+        return
+    for p in (path, path + ".tmp"):
+        try:
+            os.remove(p)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            print(f"WARNING: could not withdraw {p}: {e}")
+
+
+def _exit_on_term(signum, frame):  # noqa: ARG001
+    # PID 1 ignores SIGTERM unless a handler is set; raising SystemExit
+    # unwinds serve_forever() so the `finally` below withdraws the file.
+    sys.exit(0)
+
+
 if __name__ == "__main__":
     if init_nvml():
         print(f"NVML initialized - {pynvml.nvmlDeviceGetCount()} GPU(s) found")
@@ -237,6 +290,14 @@ if __name__ == "__main__":
 
     ssl_ctx = _create_ssl_context()
     print(f"Starting nvidia-smi exporter on port {PORT} (HTTPS, client certificate required)")
+    signal.signal(signal.SIGTERM, _exit_on_term)
+    sd = sd_path()
     with socketserver.TCPServer(("", PORT), MetricsHandler) as httpd:
         httpd.socket = ssl_ctx.wrap_socket(httpd.socket, server_side=True)
-        httpd.serve_forever()
+        # Announced only once the port is bound and TLS is loaded: a target
+        # that is listed is one that answers.
+        announce(sd)
+        try:
+            httpd.serve_forever()
+        finally:
+            withdraw(sd)

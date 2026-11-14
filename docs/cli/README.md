@@ -29,7 +29,7 @@ has a page here with its command reference.
 - `noo whoami` — What this box is: controller, node, both, or client-only
 - `noo onboard` — Setup wizard
 - `noo enroll` — Join this machine to a noomesh fleet as a worker
-- `noo offboard` — Leave the fleet: stop the agent, remove enrollment state (confirms)
+- `noo offboard` — Tear a standalone controller down to bare machine prep (confirms each step)
 - `noo upgrade` — Self-update the CLI; --stack/--nodes/--controller roll the rest
 - `noo doctor` — Host-plane health checks with guided recovery
 - `noo health` — Gateway health probe
@@ -188,6 +188,7 @@ These four rules hold for every native command. They are enforced in the files c
 | 3 | gateway unreachable |
 | 4 | auth failed (401/403) |
 | 5 | gateway returned an error status — including the explained 503 a disabled add-on's routes return, and `noo health` when the gateway is up but degraded |
+| 6 | stopped for a decision — a command that will not decide for you (`noo addons setup` at trust, a licence, consent or a reserve, or a step only you can do); the exact command to run is printed, and nothing already done is undone |
 
 Scripts branch on the code, not on prose.
 

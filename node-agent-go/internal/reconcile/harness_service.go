@@ -46,7 +46,7 @@ func (r *Reconciler) convergeHarness(ctx context.Context, p placement, all []pla
 		// chat backend cannot serve would take turns it cannot answer.
 		// Both are refusals at placement time, not failures at turn time.
 		if why := harnessKindRefusalProfiled(p, all, r.runnerInstalled, r.cliInstalled,
-			harnessprofile.Current(), r.nodeName()); why != "" {
+			harnessprofile.Current(), r.nodeName(), r.egressView(ctx, desiredHarnessKind(p))); why != "" {
 			slog.Error("reconcile.harness_kind_refused", "detail", why)
 			refusals.Record("backend_start", harnessRefusalTarget, why)
 			return
@@ -165,7 +165,18 @@ func (r *Reconciler) recordHarnessPlacement(all []placement) {
 	}
 	r.harnessMu.Lock()
 	r.harnessDesired = found
+	r.harnessKnown = true
 	r.harnessMu.Unlock()
+}
+
+// HarnessPlacementKnown is whether a desired-config has been applied yet.
+// Until it has, "no harness placement" is not an answer: at a roll the
+// agent and the harness restart in the same second, and a harness that read
+// "not placed" ran on built-in defaults (i658, awolf 2026-11-11).
+func (r *Reconciler) HarnessPlacementKnown() bool {
+	r.harnessMu.RLock()
+	defer r.harnessMu.RUnlock()
+	return r.harnessKnown
 }
 
 // HarnessPlacementView is the desired harness placement for the loopback
@@ -323,7 +334,7 @@ func (r *Reconciler) crashLooping(ctx context.Context) string {
 // installed is the runner check and cliInstalled the vendor-CLI check (nil
 // skips either).
 func harnessKindRefusal(p placement, all []placement, installed func(runner string) bool, cliInstalled func(cli string) bool) string {
-	return harnessKindRefusalProfiled(p, all, installed, cliInstalled, nil, "")
+	return harnessKindRefusalProfiled(p, all, installed, cliInstalled, nil, "", nil)
 }
 
 // harnessKindRefusalProfiled is harnessKindRefusal plus the node's harness
@@ -332,11 +343,41 @@ func harnessKindRefusal(p placement, all []placement, installed func(runner stri
 // tier and the command that offers it. No profile (nil) adds no refusal, so a
 // node on a pre-profile controller behaves exactly as before. `noo` is never
 // refused by the profile. node names the node in the fix ("<node>" if empty).
-func harnessKindRefusalProfiled(p placement, all []placement, installed func(runner string) bool, cliInstalled func(cli string) bool, prof *harnessprofile.Profile, node string) string {
+func harnessKindRefusalProfiled(p placement, all []placement, installed func(runner string) bool, cliInstalled func(cli string) bool, prof *harnessprofile.Profile, node string, egress *hostsvc.Egress) string {
 	if why := harnessKindRefusalBase(p, all, installed, cliInstalled); why != "" {
 		return why
 	}
+	if why := egressKindRefusal(desiredHarnessKind(p), egress); why != "" {
+		return why
+	}
 	return profileKindRefusal(desiredHarnessKind(p), prof, node)
+}
+
+// kindsNeedingEgressHold are the harness kinds refused on a node whose
+// harness is not held off the internet: Codex resolves api.github.com and
+// chatgpt.com at start. One constant; other kinds are never gated by it.
+var kindsNeedingEgressHold = map[string]bool{"codex": true}
+
+// egressKindRefusal refuses a kind that needs the egress hold-off ONLY when
+// the node reports "unenforced". "unknown" never refuses (a node that gets
+// the drop-in and this gate in one apply keeps its placement while the
+// harness's self-test runs); nil egress (not read) adds no refusal.
+func egressKindRefusal(kind string, egress *hostsvc.Egress) string {
+	if egress == nil || egress.State != hostsvc.EgressUnenforced || !kindsNeedingEgressHold[kind] {
+		return ""
+	}
+	return fmt.Sprintf("harness kind %q: this node's harness is not held off the internet (%s), and Codex resolves api.github.com and chatgpt.com at start; the node's state: noo cluster verify (row \"harness egress\")", kind, egress.Reason)
+}
+
+// egressView reads the egress state, and only for a kind that needs it (the
+// read runs systemctl). nil when this reconciler has no reader (tests,
+// darwin) or the kind is not gated.
+func (r *Reconciler) egressView(ctx context.Context, kind string) *hostsvc.Egress {
+	if r.harnessEgress == nil || !kindsNeedingEgressHold[kind] {
+		return nil
+	}
+	e := r.harnessEgress(ctx)
+	return &e
 }
 
 // profileKindRefusal is the profile's half of the refusal (see

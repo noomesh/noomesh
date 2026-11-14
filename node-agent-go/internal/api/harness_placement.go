@@ -33,19 +33,50 @@ type HarnessPlacement struct {
 	// unknown. The harness tells a foreign CLI its real window with it
 	// (Claude Code assumes 200k for a model it does not know).
 	ModelContext int `json:"model_context,omitempty"`
+	// Unknown: the agent has not applied a desired-config yet, so it cannot
+	// say whether a harness is placed. The route answers 503 with
+	// Retry-After, and the harness waits instead of falling back to its
+	// defaults. Inverted on purpose: the zero value is "known", today's
+	// meaning for every provider that does not set it.
+	Unknown bool `json:"-"`
 }
 
 // SetHarnessPlacement installs the provider of the node's desired harness
-// placement. nil (or a provider that reports placed=false) answers 404.
-func (s *Server) SetHarnessPlacement(f func() HarnessPlacement) { s.harnessPlacement = f }
+// placement. Until it is installed the answer is 503 known:false (the agent
+// is still registering: it serves from step 1, installs this at step 4b);
+// a provider that reports placed=false answers 404.
+func (s *Server) SetHarnessPlacement(f func() HarnessPlacement) {
+	if f == nil {
+		s.harnessPlacement.Store(nil)
+		return
+	}
+	s.harnessPlacement.Store(&f)
+}
 
 // handleHarnessPlacement is read-only and answers only this node's own
 // harness (see registerRoutes). 404 {"placed": false} when no harness
 // placement is desired.
 func (s *Server) handleHarnessPlacement(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	if s.harnessPlacement != nil {
-		if hp := s.harnessPlacement(); hp.Placed {
+	// No provider yet: the agent has not registered, so the placement is not
+	// KNOWN (#1030's contract), not "not placed". A 404 here told the harness
+	// "no harness wanted" during every start (rc.1 rehearsal, A-placeknown).
+	f := s.harnessPlacement.Load()
+	if f == nil {
+		w.Header().Set("Retry-After", "5")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"placed": false, "known": false}`))
+		return
+	}
+	{
+		hp := (*f)()
+		if hp.Unknown {
+			w.Header().Set("Retry-After", "5")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"placed": false, "known": false}`))
+			return
+		}
+		if hp.Placed {
 			if hp.Env == nil {
 				hp.Env = map[string]string{}
 			}

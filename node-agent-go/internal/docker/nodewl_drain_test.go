@@ -6,6 +6,7 @@ package docker
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -26,6 +27,39 @@ func runningReady(t *testing.T, h *lifeHarness) {
 	h.door.status("GET", "/health/ready", 200)
 	h.p.Converge(context.Background(), h.running())
 	eventually(t, "ready", func() bool { return h.row().Ready })
+}
+
+// readyProbe is the one call a running workload's readiness watcher makes on
+// its own: the watcher polls until it sees the workload gone, and a probe it
+// began before a test's snapshot can land after it (i657, and the same race
+// in TestAFailedListOfTheNodeRemovesNothing on #1030's merge group). It is
+// not a touch.
+const readyProbe = "door:GET /health/ready"
+
+// touchesSince is every call after the first n that is not a readiness probe:
+// what a test that says "nothing was touched" must find empty.
+func touchesSince(calls []string, n int) []string {
+	var out []string
+	for _, c := range calls[n:] {
+		if c != readyProbe {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// Only the readiness probe's exact call is excused: a drain, any other door
+// call, or a probe of another path is still a touch.
+func TestTouchesSinceExcusesOnlyTheReadinessProbe(t *testing.T) {
+	calls := []string{"load", readyProbe, "door:POST /v1/lifecycle/drain", readyProbe, "door:GET /v1/lifecycle/done", "door:GET /health/live", "stop:noo-wl-rhaddon-worker"}
+	got := touchesSince(calls, 1)
+	want := []string{"door:POST /v1/lifecycle/drain", "door:GET /v1/lifecycle/done", "door:GET /health/live", "stop:noo-wl-rhaddon-worker"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("touchesSince = %v, want %v", got, want)
+	}
+	if len(touchesSince(calls, len(calls))) != 0 {
+		t.Fatal("nothing after the end is a touch")
+	}
 }
 
 func lastIndexOf(calls []string, want string) int {
@@ -291,8 +325,16 @@ func TestAListedWorkloadIsNotAnOrphan(t *testing.T) {
 	before := h.api.callList()
 	h.p.ReleaseOrphans(context.Background(), map[string]bool{"rhaddon/worker": true})
 	h.p.Wait()
-	if got := h.api.callList(); len(got) != len(before) {
-		t.Fatalf("a listed workload was touched: %v -> %v", before, got)
+	// What the test means, which cannot race: nothing but readiness probes
+	// after the snapshot. The readiness watcher may still be finishing a
+	// probe it began before forgetEverything (i657: one extra GET failed a
+	// push run when the test goroutine was descheduled), and a probe is not
+	// a touch. No create/start/stop/remove and no drain (door POST).
+	if touched := touchesSince(h.api.callList(), len(before)); len(touched) != 0 {
+		t.Fatalf("a listed workload was touched: %v", touched)
+	}
+	if h.api.ctr(wName) == nil || h.api.ctr(dName) == nil {
+		t.Fatalf("a listed workload's containers were removed")
 	}
 }
 
@@ -366,8 +408,8 @@ func TestAFailedListOfTheNodeRemovesNothing(t *testing.T) {
 	before := h.api.callList()
 	h.p.ReleaseOrphans(context.Background(), map[string]bool{})
 	h.p.Wait()
-	if got := h.api.callList(); len(got) != len(before) {
-		t.Fatalf("a failed list moved the node: %v -> %v", before, got)
+	if touched := touchesSince(h.api.callList(), len(before)); len(touched) != 0 {
+		t.Fatalf("a failed list moved the node: %v", touched)
 	}
 	if c := h.api.ctr(wName); c == nil || !c.Running {
 		t.Fatalf("worker = %+v", c)

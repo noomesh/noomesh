@@ -34,7 +34,12 @@ fn offer_self_upgrade(ctx: &mut Ctx) {
             return;
         }
     };
-    if latest == current {
+    // Offer only a STRICTLY newer final (semver, as `noo upgrade` decides).
+    // On equality-only, a release candidate (newer than the latest final)
+    // was offered "0.6.23 is available", `noo upgrade` kept the rc, and the
+    // wizard relaunched itself into the same offer forever (install matrix
+    // on 0.6.24-rc.1, run 43288027296: stranger-24.04 looped six times).
+    if !should_offer_upgrade(current, &latest) {
         return;
     }
     ctx.warn(&format!("noo {current} installed; {latest} is available"));
@@ -53,10 +58,18 @@ fn offer_self_upgrade(ctx: &mut Ctx) {
         ctx.warn("upgrade failed — continuing on the current version (retry later: noo upgrade)");
         return;
     }
+    // Relaunch only when the binary on disk is now a different version: an
+    // upgrade that kept this build (or replaced a different copy than the one
+    // running) would relaunch into the same offer, forever.
+    let now = installed_version(&exe);
+    if now.as_deref().is_none_or(|v| v == current) {
+        ctx.info(&format!("(still noo {current} at {exe} — continuing on it; `noo upgrade` later)"));
+        return;
+    }
     // The swap replaced the binary on disk, but THIS process is still the old
     // build — relaunch the wizard through the path with the original argv so
     // the new version runs it (same trick as the docker-group relaunch).
-    ctx.progress(&format!("Relaunching the wizard on noo {latest}..."));
+    ctx.progress(&format!("Relaunching the wizard on noo {}...", now.as_deref().unwrap_or(&latest)));
     let argv: Vec<String> = std::env::args().skip(1).collect();
     match Command::new(&exe).args(&argv).status().ok().and_then(|s| s.code()) {
         Some(c) => std::process::exit(c),
@@ -64,13 +77,46 @@ fn offer_self_upgrade(ctx: &mut Ctx) {
     }
 }
 
+/// Whether onboarding offers `noo upgrade`: only when `latest` (the newest
+/// FINAL release) is strictly newer than this build by semver. An rc newer
+/// than the latest final, the same version, or a version that does not parse
+/// is never offered (an offer that cannot change anything loops).
+fn should_offer_upgrade(current: &str, latest: &str) -> bool {
+    crate::commands::upgrade::cmp_cli_semver(current, latest) == Some(std::cmp::Ordering::Less)
+}
+
+/// The version `exe --version` reports (its last word), if it runs.
+fn installed_version(exe: &str) -> Option<String> {
+    let out = Command::new(exe).arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).split_whitespace().last().map(str::to_string)
+}
+
+/// The tools onboard REQUIRES. git only for a source checkout: a release
+/// install (standalone, `~/.noo`) never runs it. The launcher's only git call
+/// there is a `git tag -l 'stack-v*' 2>/dev/null` fallback after NOO_IMAGE_TAG,
+/// which onboard always writes. install.md says the same ("git only for a
+/// contributor checkout"); requiring it everywhere stopped a stranger's
+/// install at "git: MISSING" (i677).
+fn required_tools(in_checkout: bool) -> Vec<(&'static str, &'static str)> {
+    let mut tools = vec![("docker", "Runs all Noomesh services")];
+    if in_checkout {
+        tools.push(("git", "Version control (this is a source checkout)"));
+    }
+    tools
+}
+
 pub fn prerequisites(ctx: &mut Ctx) -> bool {
     offer_self_upgrade(ctx);
     let mut all_ok = true;
     let mut missing_apt: Vec<&str> = Vec::new(); // plain apt packages
     let mut docker_missing = false;
+    let in_checkout = crate::envfile::repo_root().join(".git").exists();
+    let required = required_tools(in_checkout);
 
-    for (tool, purpose) in [("docker", "Runs all Noomesh services"), ("git", "Version control")] {
+    for &(tool, purpose) in &required {
         match tool_version(tool) {
             Some(v) => ctx.success(&format!("{tool}: {v}")),
             None => {
@@ -183,13 +229,18 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
                         .map(|a| format!("'{}'", a.replace('\'', r"'\''")))
                         .collect();
                     let relaunch_may_prompt = ctx_sudo_may_prompt(ctx);
+                    // The marker tells the relaunched wizard's closing block that
+                    // Docker was installed this session (i677 #10), and keeps any
+                    // `noo` it runs from relaunching again.
+                    let marker = crate::docker_group::RELAUNCHED_ENV;
                     let code = Command::new("sg")
                         .args(["docker", "-c", &quoted.join(" ")])
+                        .env(marker, "1")
                         .status().ok().and_then(|s| s.code())
                         .or_else(|| {
                             ctx.info("(sg not available — relaunching via `sudo -g docker`)");
                             sudo_cmd(relaunch_may_prompt)
-                                .args(["-g", "docker", &exe])
+                                .args(["-g", "docker", "env", &format!("{marker}=1"), &exe])
                                 .args(&argv)
                                 .status().ok().and_then(|s| s.code())
                         });
@@ -205,7 +256,7 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
                 ctx.warn("Docker install failed — see https://docs.docker.com/engine/install/");
             }
             // Re-check the required pair after installs.
-            all_ok = tool_version("docker").is_some() && tool_version("git").is_some();
+            all_ok = required.iter().all(|&(tool, _)| tool_version(tool).is_some());
         }
     }
 
@@ -2742,7 +2793,7 @@ pub(crate) const SVC_LIST: &[&str] = &[
     // (docker/stunnel-ollama-embed.conf). Its own leaf, not `ollama`'s:
     // `noo upgrade --stack` issues a MISSING leaf on its own
     // (upgrade.rs reconcile_service_certs) while a SAN added to an
-    // existing one needs `noo onboard --only security` — a new name is
+    // existing one needs `noo onboard --only enrollment` — a new name is
     // the roll-safe shape. Issued on every install shape; a leaf is cheap.
     "ollama-embed",
     // The optional CPU embedder's door (compose profile `embed-cpu`): its
@@ -3133,7 +3184,7 @@ fn ensure_pki(ctx: &mut Ctx) {
                 Ok(true) => ctx.success(&format!("Postgres client certificate for role {} ({}) generated", leaf.role, leaf.owner)),
                 Ok(false) => ctx.info(&format!("Postgres client certificate for role {} ({}) already exists", leaf.role, leaf.owner)),
                 Err(e) => ctx.warn(&format!(
-                    "Postgres client certificate for role {} ({}): {e} — then: noo security pki fix-modes, and re-run: noo onboard --only security",
+                    "Postgres client certificate for role {} ({}): {e} — then: noo security pki fix-modes, and re-run: noo onboard --only enrollment",
                     leaf.role, leaf.owner
                 )),
             }
@@ -5866,9 +5917,9 @@ pub(crate) fn ensure_embed_model_core(model: &str) -> Vec<String> {
         // repo — so every fresh box came up with no embedder (2026-09-07).
         let artifact = harrier_artifact_ref();
         out_lines.push(format!(".Fetching the harrier embedder artifact into {embed} ({artifact})..."));
-        let tmp = std::env::temp_dir().join(format!("noo-harrier-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let _ = std::fs::create_dir_all(&tmp);
+        // i689: a fresh 0700 dir; the weights checked here are what is served.
+        let tmp_dir = crate::private_tmp::Dir::new("noo-harrier");
+        let tmp = tmp_dir.as_ref().map(|d| d.path().to_path_buf()).unwrap_or_else(|_| std::path::PathBuf::from("/nonexistent/noo-harrier"));
         let src = format!("noo-harrier-src-{}", std::process::id());
         let fetched = Command::new("bash").arg("-c")
             .arg(format!(
@@ -5910,6 +5961,50 @@ pub(crate) fn ensure_embed_model_core(model: &str) -> Vec<String> {
         ));
     }
     out_lines
+}
+
+/// What to do with one compose volume whose bind the stack declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VolumeMismatch {
+    /// Recorded bind == declared bind.
+    Keep,
+    /// `docker volume inspect` did not answer: never read that as "" (i677 #20).
+    NotChecked,
+    /// No bind at all: a plain volume, whose data lives INSIDE docker.
+    /// Removing it deletes that data, so it is never removed here.
+    UnboundHoldsData,
+    /// A bind to a different path (a NOO_DATA_ROOT change): the data is on the
+    /// host at the old path, and only the stale volume record goes.
+    RemoveStaleRecord,
+}
+
+/// The reaper's decision for each existing volume the stack declares a bind
+/// for, from docker's answers alone: `(volume, declared bind, recorded bind,
+/// action)`. Pure, so the legacy-box case (an unbound noo-data, the stack
+/// down) is tested exactly as onboard sees it.
+fn reaper_decisions(
+    expected: &[(String, String)],
+    existing: &[String],
+    inspect: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(String, String, Option<String>, VolumeMismatch)> {
+    existing
+        .iter()
+        .filter_map(|vol| {
+            let (_, want) = expected.iter().find(|(n, _)| n == vol)?;
+            let recorded = inspect(vol);
+            let action = volume_mismatch_action(recorded.as_deref(), want);
+            Some((vol.clone(), want.clone(), recorded, action))
+        })
+        .collect()
+}
+
+fn volume_mismatch_action(recorded: Option<&str>, want_device: &str) -> VolumeMismatch {
+    match recorded {
+        None => VolumeMismatch::NotChecked,
+        Some("") | Some("<no value>") => VolumeMismatch::UnboundHoldsData,
+        Some(d) if d == want_device => VolumeMismatch::Keep,
+        Some(_) => VolumeMismatch::RemoveStaleRecord,
+    }
 }
 
 /// Remove `pai-assistant_*` bind-backed volumes whose recorded device no
@@ -5955,27 +6050,46 @@ fn fix_volume_mismatches(ctx: &Ctx) {
     if !ls.status.success() {
         return;
     }
-    let existing = String::from_utf8_lossy(&ls.stdout);
-    let mut removed = 0usize;
-    for vol in existing.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        let Some((_, want_device)) = expected.iter().find(|(n, _)| n == vol) else {
-            continue;
-        };
-        let device = Command::new("docker")
+    let existing: Vec<String> = String::from_utf8_lossy(&ls.stdout)
+        .lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect();
+    let inspect = |vol: &str| -> Option<String> {
+        Command::new("docker")
             .args(["volume", "inspect", vol, "--format", "{{.Options.device}}"])
             .output()
             .ok()
+            .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default();
-        if device != *want_device {
-            let ok = Command::new("docker")
-                .args(["volume", "rm", "-f", vol])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            if ok {
-                removed += 1;
+    };
+    let mut removed = 0usize;
+    for (vol, want_device, recorded, action) in reaper_decisions(&expected, &existing, &inspect) {
+        match action {
+            VolumeMismatch::Keep => continue,
+            VolumeMismatch::NotChecked => {
+                ctx.warn(&format!("volume {vol}: docker inspect did not answer; left as it is (not checked)"));
+                continue;
             }
+            VolumeMismatch::UnboundHoldsData => {
+                ctx.warn(&format!(
+                    "volume {vol} is not bound to {want_device}: its data lives inside docker, so it is NOT removed \
+                     (moving it into the data root is a separate step; `noo cluster verify` names it)"
+                ));
+                continue;
+            }
+            VolumeMismatch::RemoveStaleRecord => {}
+        }
+        // Said BEFORE it happens: only a stale bind RECORD goes; its data
+        // stays on the host at the old path (i677 #20).
+        ctx.info(&format!(
+            "Removing the stale record of volume {vol} (bound to {}, compose now binds {want_device}); its data stays on the host there",
+            recorded.as_deref().unwrap_or("?")
+        ));
+        let ok = Command::new("docker")
+            .args(["volume", "rm", "-f", &vol])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            removed += 1;
         }
     }
     if removed > 0 {
@@ -6059,23 +6173,18 @@ fn obtain_hostd_binary(ctx: &mut Ctx) -> Result<std::path::PathBuf, String> {
     }
     let asset = crate::commands::provision::hostd_asset_for(std::env::consts::OS, std::env::consts::ARCH)
         .ok_or_else(|| format!("no noo-hostd build for {}/{}", std::env::consts::OS, std::env::consts::ARCH))?;
-    let cached = crate::commands::provision::cli_asset_cache_dir(&ctx.repo_root).join(&asset);
-    let bytes = match std::fs::read(&cached).ok().filter(|b| !b.is_empty()) {
-        Some(b) => b,
-        None => {
-            ctx.progress(&format!("Fetching {asset} from release noo-cli-v{}...", env!("CARGO_PKG_VERSION")));
-            let b = crate::commands::upgrade::fetch_release_file(ctx.g, env!("CARGO_PKG_VERSION"), &asset, None)?;
-            if let Some(dir) = cached.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let _ = std::fs::write(&cached, &b);
-            b
-        }
-    };
+    // i688: through the verified gate, like every bundle asset — a cached
+    // copy only if its sha256 is in the signed manifest of this version,
+    // else fetched and checked. This binary is installed as ROOT below.
+    ctx.progress(&format!("Obtaining {asset} for noo-cli-v{} (verified against the signed manifest)...", env!("CARGO_PKG_VERSION")));
+    let bytes = crate::commands::provision::cached_release_asset(ctx.g, &ctx.repo_root, &asset)?;
     if !looks_like_elf(&bytes) {
         return Err(format!("{asset} is not an ELF executable — refusing to install it"));
     }
-    let staged = std::env::temp_dir().join(format!("noo-hostd-{}", std::process::id()));
+    // i689: `sudo install` copies this to /usr/local/bin as root; a fresh
+    // 0700 dir, so nobody can swap it between the write and the install.
+    let staged_dir = crate::private_tmp::Dir::new("noo-hostd")?;
+    let staged = staged_dir.path().join("noo-hostd");
     std::fs::write(&staged, &bytes).map_err(|e| format!("could not stage the binary: {e}"))?;
     let ok = ctx_sudo(ctx)
         .args(["install", "-m", "755", "-o", "root", "-g", "root"])
@@ -6458,13 +6567,21 @@ pub(crate) fn ensure_cli_login(ctx: &mut Ctx) {
     ctx.info("Fix the login, then re-run them: noo auth login, then noo onboard --only services");
 }
 
+/// What a standalone box's services step says about chat. It used to say
+/// "served by this box's single ollama (static fallback) — no placement
+/// needed", just above verify's `default chat` row saying an unpinned chat
+/// gets 503 (every fresh install, rc.1 rehearsal): `noo chat` sends no model,
+/// and that needs a chat model PLACED on the box, which the model step does.
+pub(crate) const STANDALONE_CHAT_NOTE: &str =
+    "Chat on this box runs on its single ollama once a chat model is placed on it: the model step places one (later: noo onboard --only model).";
+
 fn ensure_llm_placement(ctx: &mut Ctx) {
     let node_id = ctx.read_env("NODE_ID");
     let model = ctx.read_env("VLLM_MODEL");
     let tier = ctx.read_env("NODE_TIER");
     if node_id.is_empty() || model.is_empty() {
         if ctx.repo_root.join(".noo-standalone").exists() {
-            ctx.info("Chat is served by this box's single ollama (static fallback) — no placement needed.");
+            ctx.info(STANDALONE_CHAT_NOTE);
             // Say so in the config too. With --skip-model the model step
             // (the only writer of cluster.default_backend) never runs, the
             // example's `vllm` survives, and every `noo chat` on the box
@@ -6899,15 +7016,101 @@ fn verify_first_model(ctx: &mut Ctx) {
         }
     }
     ctx.success(&format!("Chat answers with {model}"));
-    // The default (no model named) is what `noo chat` sends. The gateway
-    // reads noomesh.yaml when it starts, so a gateway that was already up
-    // keeps the old default until its next restart: say so, do not fail.
-    if let Err(e) = chat_probe(ctx, None) {
-        ctx.warn(&format!(
-            "Chat with {model} named works, but the gateway's current default does not ({e}). \
-             It reads the default at start: noo stack restart gateway"
-        ));
+    // i677 #12: the first `noo chat` names no model. On a single box nothing
+    // routed an unpinned request to this ollama: no placement meant no lane,
+    // no `chat-default` class, and unpinned chat fell to a static default
+    // the gateway read at boot (404) or an empty discovery offer (400). A
+    // real placement, the one an operator's `noo cluster place` makes, gives
+    // it a lane.
+    place_pulled_model(ctx, &model);
+    match unpinned_probe_until_routed(ctx) {
+        Ok(()) => ctx.success("Chat with no model named (what `noo chat` sends) answers"),
+        Err(e) => {
+            let line = format!(
+                "model: {model} answers when named, but chat with no model named does not ({e}). \
+                 Check: noo cluster verify --controller; noo chat --message hi"
+            );
+            ctx.error(&line);
+            ctx.state.hard_failures.push(line);
+        }
     }
+}
+
+/// The ollama chat placement already declared on this node, if any (its
+/// model). An empty role means chat. Pure.
+pub(crate) fn existing_ollama_chat_placement(placements: &serde_json::Value) -> Option<String> {
+    placements.as_array()?.iter().find_map(|p| {
+        let role = p["role"].as_str().filter(|r| !r.is_empty()).unwrap_or("chat");
+        (p["backend"].as_str() == Some("ollama") && role == "chat")
+            .then(|| p["model"].as_str().unwrap_or("?").to_string())
+    })
+}
+
+/// The exact arguments of the operator's own `noo cluster place` (no second
+/// writer of placements). Pure.
+pub(crate) fn place_args(node: &str, model: &str) -> Vec<String> {
+    ["cluster", "place", node, "ollama", model].iter().map(|s| s.to_string()).collect()
+}
+
+/// Declare the self node's ollama chat placement for the model this run
+/// pulled, through `noo cluster place`, unless one already exists (a
+/// re-onboard never overrides the operator's choice).
+fn place_pulled_model(ctx: &mut Ctx, model: &str) {
+    let node = ctx.read_env("NODE_ID");
+    if node.is_empty() || model.is_empty() {
+        return;
+    }
+    let desired = crate::http::get_json_try(
+        ctx.g,
+        &format!("/api/cluster/nodes/{}/desired-config", crate::commands::urlencode(&node)),
+        true,
+        10,
+    );
+    match desired {
+        Ok(d) => {
+            if let Some(m) = existing_ollama_chat_placement(&d["placements"]) {
+                ctx.info(&format!("Kept the existing ollama chat placement on {node} ({m})"));
+                return;
+            }
+        }
+        Err(e) => {
+            ctx.warn(&format!(
+                "Could not read {node}'s placements ({e}); not declaring one blind. \
+                 Declare it: noo cluster place {node} ollama {model}"
+            ));
+            return;
+        }
+    }
+    let exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "noo".into());
+    let args = place_args(&node, model);
+    ctx.progress(&format!("Placing {model} on {node}'s ollama (noo cluster place {node} ollama {model})..."));
+    match Command::new(&exe).args(&args).output() {
+        Ok(o) if o.status.success() => ctx.success(&format!("Placed: {node} ollama {model} (chat)")),
+        Ok(o) => ctx.warn(&format!(
+            "noo cluster place {node} ollama {model} exited {}: {} — run it again once the cause is fixed",
+            o.status.code().unwrap_or(1),
+            String::from_utf8_lossy(&o.stderr).lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim()
+        )),
+        Err(e) => ctx.warn(&format!("could not run noo cluster place ({e}): noo cluster place {node} ollama {model}")),
+    }
+}
+
+/// Unpinned chat, retried while a fresh placement becomes a lane: the
+/// agent's reconcile tick plus the gateway's 30 s placement cache. Bounded:
+/// 9 tries, 10 s apart.
+fn unpinned_probe_until_routed(ctx: &Ctx) -> Result<(), String> {
+    let mut last = String::new();
+    for attempt in 0..9 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+        }
+        match chat_probe(ctx, None) {
+            Ok(()) => return Ok(()),
+            Err(e) if probe_error_is_unverifiable(&e) => return Err(e),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
 }
 
 #[cfg(test)]
@@ -7900,7 +8103,7 @@ pub fn addons(ctx: &mut Ctx) {
 
 /// Write `body` to the root-owned `path` (root:root 0644) with `sudo tee`:
 /// the content goes over stdin, never through a shell string.
-fn sudo_write_root_file(may_prompt: bool, path: &str, body: &str) -> Result<(), String> {
+pub(crate) fn sudo_write_root_file(may_prompt: bool, path: &str, body: &str) -> Result<(), String> {
     use std::process::Stdio;
     let mut child = sudo_cmd(may_prompt)
         .args(["tee", path])
@@ -7924,6 +8127,55 @@ fn sudo_write_root_file(may_prompt: bool, path: &str, body: &str) -> Result<(), 
     Ok(())
 }
 
+/// Controller with systemd: install and enable noo-netns-restore.service (rc.2
+/// install matrix: one dockerd start in five left noo-ollama-embed exited 128,
+/// "cannot join network namespace of a non running container", and dockerd
+/// never retries it). Without systemd nothing is installed here; noo-hostd's
+/// boot-restore runs the same script at boot.
+pub fn install_netns_restore_unit(ctx: &mut Ctx) {
+    use crate::netns_unit as nu;
+    if ctx.state.mode == "worker" {
+        return;
+    }
+    if !nu::systemd_here() {
+        ctx.info("No systemd here: the namespace restore runs at boot through noo-hostd only.");
+        return;
+    }
+    let unit = match nu::render_here(&ctx.repo_root.display().to_string()) {
+        Ok(u) => u,
+        Err(e) => {
+            ctx.warn(&format!("{} not installed: {e}", nu::UNIT_NAME));
+            return;
+        }
+    };
+    if ctx.dry_run {
+        ctx.dry(&format!("install and enable {}", nu::UNIT_NAME));
+        return;
+    }
+    if nu::state(&unit) == nu::State::Current {
+        return;
+    }
+    match nu::install(ctx_sudo_may_prompt(ctx), &unit) {
+        Ok(()) => ctx.success(&format!("{} is enabled: after every dockerd start, a container that joins another's network is started once its door is up.", nu::UNIT_NAME)),
+        Err(e) => {
+            ctx.warn(&format!("{} not installed: {e}", nu::UNIT_NAME));
+            sudo_refused(ctx, "the namespace restore unit", nu::REMEDY);
+        }
+    }
+}
+
+#[cfg(test)]
+mod netns_unit_tests {
+    #[test]
+    fn onboard_installs_it_in_the_services_section() {
+        let m = crate::test_src::own_code(include_str!("mod.rs"));
+        let run = crate::test_src::fn_body(&m, "fn run_all(");
+        let rec = run.find("steps::at_rest_record(ctx);").expect("services section");
+        let unit = run.find("steps::install_netns_restore_unit(ctx);").expect("the unit is installed");
+        assert!(unit > rec, "{run}");
+    }
+}
+
 /// Controller only (i509): install `noo-addons-after-boot.service`, the
 /// oneshot that runs `noo addons after-boot` once per boot as the install
 /// owner, and the root-owned record of who that owner is
@@ -7943,6 +8195,12 @@ pub fn install_after_boot_unit(ctx: &mut Ctx) {
     let name = Command::new("id").arg("-un").output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
     let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
     let root = ctx.repo_root.display().to_string();
+    // Say it now, once, rather than let every later start refuse on one more
+    // file this account cannot change (rc.6 A-afterboot).
+    if let Some(p) = ab::install_owner_problem(&ab::LiveOs, &ctx.repo_root, uid, &name) {
+        ctx.warn(&format!("boot-time add-on restart unit not installed: {p}"));
+        return;
+    }
     let rendered = ab::render_owner(uid, &name).and_then(|owner| ab::render_unit(&name, &exe, &root).map(|unit| (owner, unit)));
     let (owner, unit) = match rendered {
         Ok(r) => r,
@@ -8218,13 +8476,19 @@ fn make_tailnet_bind_survive_reboots(ctx: &mut Ctx) {
 
 // ── Per-consumer service keys ────────────────────────────────────────────
 
-/// The compose service a container name belongs to: `noo-worker` → `worker`.
-fn service_of_container(ctx: &Ctx, container: &str) -> String {
-    let prefix = {
-        let p = ctx.read_env("NOO_CONTAINER_PREFIX");
-        if p.is_empty() { "noo".to_string() } else { p }
-    };
-    container.strip_prefix(&format!("{prefix}-")).unwrap_or(container).to_string()
+/// The compose services to recreate for a consumer that gained a key: one per
+/// container that EXISTS. A consumer can name a container of a profile this
+/// install does not run (worker-extra on a standalone box); recreating it
+/// failed the restart with "not running after the restart: worker-extra" on
+/// every fresh install (rc.1 rehearsal and 0.6.23). It never ran, so it has
+/// nothing to present a key to.
+pub(crate) fn services_to_recreate(containers: &[String], prefix: &str, exists: &dyn Fn(&str) -> bool) -> Vec<String> {
+    let prefix = if prefix.is_empty() { "noo" } else { prefix };
+    containers
+        .iter()
+        .filter(|c| exists(c))
+        .map(|c| c.strip_prefix(&format!("{prefix}-")).unwrap_or(c).to_string())
+        .collect()
 }
 
 /// "svc:evolve granted: addon, temporal, … (addons/evolve/docker-compose.yml)" — the
@@ -8339,8 +8603,10 @@ pub fn provision_service_keys(ctx: &mut Ctx) {
         }
         ctx.forget_store_cache();
         ctx.success(&format!("{}: key minted and stored as {}", t.consumer, t.secret_key));
-        for c in &t.containers {
-            let svc = service_of_container(ctx, c);
+        let prefix = ctx.read_env("NOO_CONTAINER_PREFIX");
+        for svc in services_to_recreate(&t.containers, &prefix, &|c: &str| {
+            std::process::Command::new("docker").args(["inspect", "-f", "{{.Id}}", c]).output().is_ok_and(|o| o.status.success())
+        }) {
             if !recreate.contains(&svc) {
                 recreate.push(svc);
             }
@@ -9704,5 +9970,207 @@ mod services_after_failure_tests {
         let r: Result<u8, ()> = super::retry_once(|| { tries += 1; Ok(1) }, || waits += 1);
         assert_eq!(r, Ok(1));
         assert_eq!((tries, waits), (1, 0), "a first success is not retried");
+    }
+}
+
+#[cfg(test)]
+mod required_tools_tests {
+    use super::*;
+
+    /// A release install (standalone, no checkout) requires Docker only; a
+    /// source checkout also requires git (i677: "git: MISSING" stopped a
+    /// stranger's release install, against install.md).
+    #[test]
+    fn git_is_required_only_in_a_source_checkout() {
+        let names = |c: bool| required_tools(c).into_iter().map(|(t, _)| t).collect::<Vec<_>>();
+        assert_eq!(names(false), ["docker"]);
+        assert_eq!(names(true), ["docker", "git"]);
+    }
+
+    /// The prerequisite check and its post-install re-check both judge the
+    /// same list, and decide the checkout from the repo root's `.git`.
+    #[test]
+    fn the_prerequisite_check_and_its_recheck_use_required_tools() {
+        let code = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&code, "pub fn prerequisites(");
+        assert!(body.contains("let in_checkout = crate::envfile::repo_root().join(\".git\").exists();"), "{body}");
+        assert!(body.contains("for &(tool, purpose) in &required {"), "{body}");
+        assert!(body.contains("all_ok = required.iter().all(|&(tool, _)| tool_version(tool).is_some());"), "{body}");
+        assert!(!body.contains("tool_version(\"git\")"), "git is never checked on its own: {body}");
+    }
+}
+
+#[cfg(test)]
+mod volume_mismatch_tests {
+    use super::*;
+
+    /// i677 #20: only a bind record pointing at a DIFFERENT path is removed
+    /// (its data stays on the host). An unbound volume holds its data inside
+    /// docker: the old code read it as a mismatch and `volume rm -f`-ed it
+    /// whenever the stack was down, deleting the gateway's data on every
+    /// legacy box that re-onboarded. A failed inspect is not "" either.
+    #[test]
+    fn only_a_stale_bind_record_is_removed() {
+        assert_eq!(volume_mismatch_action(Some("/srv/noo/noo-data"), "/srv/noo/noo-data"), VolumeMismatch::Keep);
+        assert_eq!(volume_mismatch_action(Some("/old/root/noo-data"), "/srv/noo/noo-data"), VolumeMismatch::RemoveStaleRecord);
+        assert_eq!(volume_mismatch_action(Some(""), "/srv/noo/noo-data"), VolumeMismatch::UnboundHoldsData);
+        assert_eq!(volume_mismatch_action(Some("<no value>"), "/srv/noo/noo-data"), VolumeMismatch::UnboundHoldsData);
+        assert_eq!(volume_mismatch_action(None, "/srv/noo/noo-data"), VolumeMismatch::NotChecked);
+    }
+
+    #[test]
+    fn the_fixer_removes_only_on_a_stale_record() {
+        let code = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&code, "fn fix_volume_mismatches(");
+        let decide = body.find("for (vol, want_device, recorded, action) in reaper_decisions(&expected, &existing, &inspect) {").expect("the decision");
+        let stale = body.find("VolumeMismatch::RemoveStaleRecord => {}").expect("only the stale record falls through");
+        let say = body.find("Removing the stale record of volume").expect("said before");
+        let rm = body.find("\"volume\", \"rm\", \"-f\", &vol").expect("the removal");
+        assert!(decide < stale && stale < say && say < rm, "{body}");
+        assert_eq!(body.matches("\"volume\", \"rm\"").count(), 1, "one removal, after the decision");
+        assert!(body.contains(".filter(|o| o.status.success())"), "a failed inspect is not an empty device: {body}");
+    }
+}
+
+#[cfg(test)]
+mod legacy_reonboard_tests {
+    use super::*;
+
+    /// i677 #20, the case that lost data: a box installed on 0.6.10+ has a
+    /// PLAIN noomesh_noo-data (no bind; the data inside docker). Re-onboarding
+    /// it with the stack DOWN (the volume not in use) must remove nothing
+    /// that holds data. Only a bind record pointing at an old path goes.
+    #[test]
+    fn a_reonboard_over_a_legacy_unbound_noo_data_removes_no_data() {
+        let expected = vec![
+            ("noomesh_noo-data".to_string(), "/srv/noo/noo-data".to_string()),
+            ("noomesh_postgres-data".to_string(), "/srv/noo/postgres".to_string()),
+            ("noomesh_redis-data".to_string(), "/srv/noo/redis".to_string()),
+        ];
+        let existing: Vec<String> = ["noomesh_noo-data", "noomesh_postgres-data", "noomesh_redis-data", "noomesh_other"]
+            .iter().map(|s| s.to_string()).collect();
+        let inspect = |v: &str| -> Option<String> {
+            match v {
+                "noomesh_noo-data" => Some(String::new()),          // legacy: no bind
+                "noomesh_postgres-data" => Some("/srv/noo/postgres".into()), // bound, current
+                "noomesh_redis-data" => Some("/old/root/redis".into()),      // bound, old root
+                _ => None,
+            }
+        };
+        let d = reaper_decisions(&expected, &existing, &inspect);
+        let action = |n: &str| d.iter().find(|(v, ..)| v == n).map(|(.., a)| *a);
+        assert_eq!(action("noomesh_noo-data"), Some(VolumeMismatch::UnboundHoldsData), "the legacy volume holds data: kept");
+        assert_eq!(action("noomesh_postgres-data"), Some(VolumeMismatch::Keep));
+        assert_eq!(action("noomesh_redis-data"), Some(VolumeMismatch::RemoveStaleRecord), "only a stale bind record");
+        assert_eq!(action("noomesh_other"), None, "a volume the stack does not declare is not judged");
+        let removed: Vec<&str> = d.iter().filter(|(.., a)| *a == VolumeMismatch::RemoveStaleRecord).map(|(v, ..)| v.as_str()).collect();
+        assert_eq!(removed, ["noomesh_redis-data"]);
+    }
+
+    #[test]
+    fn a_volume_docker_would_not_describe_is_left_alone() {
+        let expected = vec![("noomesh_noo-data".to_string(), "/srv/noo/noo-data".to_string())];
+        let d = reaper_decisions(&expected, &["noomesh_noo-data".to_string()], &|_| None);
+        assert_eq!(d[0].3, VolumeMismatch::NotChecked);
+    }
+}
+
+#[cfg(test)]
+mod first_chat_placement_tests {
+    use super::*;
+
+    #[test]
+    fn an_existing_ollama_chat_placement_is_kept() {
+        let none = serde_json::json!([{"backend": "ollama", "model": "harrier", "role": "embed"}, {"backend": "vllm", "model": "q"}]);
+        assert_eq!(existing_ollama_chat_placement(&none), None, "an embed placement is not a chat one");
+        let chat = serde_json::json!([{"backend": "ollama", "model": "llama3.2:3b"}]);
+        assert_eq!(existing_ollama_chat_placement(&chat).as_deref(), Some("llama3.2:3b"), "no role means chat");
+        let explicit = serde_json::json!([{"backend": "ollama", "model": "m", "role": "chat"}]);
+        assert_eq!(existing_ollama_chat_placement(&explicit).as_deref(), Some("m"));
+        assert_eq!(existing_ollama_chat_placement(&serde_json::json!(null)), None);
+    }
+
+    #[test]
+    fn the_placement_is_the_operators_own_command() {
+        assert_eq!(place_args("box", "gemma4:e2b"), ["cluster", "place", "box", "ollama", "gemma4:e2b"]);
+    }
+
+    /// The model step places before it judges unpinned chat, and a chat
+    /// with no model that never answers is a failure, not a warning.
+    #[test]
+    fn the_model_step_places_then_judges_unpinned_chat() {
+        let code = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&code, "fn verify_first_model(");
+        let place = body.find("place_pulled_model(ctx, &model);").expect("places");
+        let probe = body.find("match unpinned_probe_until_routed(ctx) \u{7b}").expect("probes unpinned");
+        assert!(place < probe, "{body}");
+        assert!(body.contains("ctx.state.hard_failures.push(line);"), "{body}");
+        assert!(!body.contains("noo stack restart gateway"), "no restart advice: the placement is the fix: {body}");
+        let placer = crate::test_src::fn_body(&code, "fn place_pulled_model(");
+        let keep = placer.find("existing_ollama_chat_placement(&d[\"placements\"])").expect("checks first");
+        let run = placer.find("Command::new(&exe).args(&args)").expect("then the command");
+        assert!(keep < run, "{placer}");
+    }
+}
+
+#[cfg(test)]
+mod self_upgrade_tests {
+    /// The rc.1 install-matrix loop: onboarding offered `noo upgrade` to an
+    /// rc newer than the latest final, `noo upgrade` kept the rc, and the
+    /// wizard relaunched into the same offer forever. Offer only a strictly
+    /// newer final.
+    #[test]
+    fn the_wizard_offers_only_a_strictly_newer_release() {
+        use super::should_offer_upgrade as offer;
+        assert!(!offer("0.6.24-rc.1", "0.6.23"), "an rc newer than the latest final was offered the older final");
+        assert!(!offer("0.6.24", "0.6.24"), "the same version was offered");
+        assert!(!offer("0.6.25", "0.6.24"), "a newer build was offered an older release");
+        assert!(offer("0.6.23", "0.6.24"), "a strictly newer final was not offered");
+        assert!(offer("0.6.24-rc.1", "0.6.24"), "the final of this rc was not offered");
+        assert!(!offer("custom-build", "0.6.24"), "an unparsable version was offered (nothing can be compared)");
+    }
+
+    /// The relaunch happens only when the binary on disk changed version:
+    /// an upgrade that kept this build cannot relaunch into the same offer.
+    #[test]
+    fn the_wizard_relaunches_only_on_a_version_change() {
+        let own = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&own, "fn offer_self_upgrade(");
+        assert!(body.contains("if !should_offer_upgrade(current, &latest) {"), "the offer is not semver-gated");
+        assert!(!body.contains("if latest == current {"), "the equality-only gate is back");
+        let check = body.find("installed_version(&exe)").expect("the version check");
+        let relaunch = body.find("Command::new(&exe).args(&argv)").expect("the relaunch");
+        assert!(check < relaunch, "the relaunch is not behind the version check");
+        assert!(body[check..relaunch].contains("v == current"), "the check does not compare against this build");
+    }
+}
+
+#[cfg(test)]
+mod fresh_install_line_tests {
+    use super::{services_to_recreate, STANDALONE_CHAT_NOTE};
+
+    /// A consumer's container from a profile this install does not run is not
+    /// recreated (it never ran); the others are, as compose services.
+    #[test]
+    fn a_container_that_was_never_created_is_not_recreated() {
+        let cs = vec!["noo-worker".to_string(), "noo-worker-extra".to_string(), "noo-trellion".to_string()];
+        let present = |c: &str| c != "noo-worker-extra";
+        assert_eq!(services_to_recreate(&cs, "", &present), vec!["worker".to_string(), "trellion".to_string()]);
+        assert_eq!(services_to_recreate(&cs, "noo", &|_| true), vec!["worker", "worker-extra", "trellion"]);
+        assert!(services_to_recreate(&cs, "", &|_| false).is_empty());
+        let other = vec!["b2-worker".to_string()];
+        assert_eq!(services_to_recreate(&other, "b2", &|_| true), vec!["worker"]);
+    }
+
+    /// The standalone chat line never says "no placement needed", and names
+    /// the one command verify's `default chat` remedy names.
+    #[test]
+    fn the_standalone_chat_line_names_the_first_model_remedy() {
+        assert!(!STANDALONE_CHAT_NOTE.contains("no placement needed"), "{STANDALONE_CHAT_NOTE}");
+        assert!(STANDALONE_CHAT_NOTE.contains(crate::onboard::FIRST_MODEL_CMD), "{STANDALONE_CHAT_NOTE}");
+        let own = crate::test_src::own_code(include_str!("steps.rs"));
+        assert!(!own.contains("no placement needed"), "the old line is back somewhere");
+        let tail = crate::test_src::fn_body(&own, "pub fn provision_service_keys(");
+        assert!(tail.contains("for svc in services_to_recreate(&t.containers, &prefix, &|c: &str| {"), "{tail}");
     }
 }

@@ -401,12 +401,59 @@ pub(crate) fn secrets_dir_files(root: &Path) -> Vec<String> {
     out
 }
 
+/// What to do when this account cannot use the docker API: the usual cause
+/// on a fresh install is a docker group added in this login session, which
+/// only a new login picks up.
+pub(crate) const DOCKER_REFUSED_REMEDY: &str =
+    "give this account the docker API (sudo usermod -aG docker $USER), then log out and back in: a group added in this session is not active in it; re-run noo cluster verify";
+
+/// Docker's own words when this account cannot use the docker API, from one
+/// `docker version` call; `None` when the daemon answers. Asked once per
+/// process: several rows read containers, and a refusal is the same for all.
+pub(crate) fn docker_refusal() -> Option<String> {
+    static ASKED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    ASKED
+        .get_or_init(|| refusal_of(Command::new("docker").args(["version", "--format", "{{.Server.Version}}"]).output()))
+        .clone()
+}
+
+/// [`docker_refusal`], pure over the call's result.
+pub(crate) fn refusal_of(out: std::io::Result<std::process::Output>) -> Option<String> {
+    match out {
+        Err(e) => Some(format!("docker could not be run ({e})")),
+        Ok(o) if o.status.success() => None,
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            let line = err.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("the docker daemon did not answer");
+            // "permission denied while trying to connect to the docker API at
+            // unix:///var/run/docker.sock: Get \"http://…\": dial unix …": the
+            // sentence, without the URL tail.
+            let line = line.trim_start_matches("Cannot connect to the Docker daemon: ");
+            Some(line.split(": Get \"").next().unwrap_or(line).to_string())
+        }
+    }
+}
+
+/// A row that read no container because docker refused this account: it says
+/// so (failed lookup is not absence), at `verdict`, with the docker remedy.
+pub(crate) fn not_judged_refused(name: &'static str, verdict: Verdict, refusal: &str, tail: &str) -> Check {
+    Check { name, verdict, detail: format!("not judged — {refusal}{tail}"), remedy: Some(DOCKER_REFUSED_REMEDY.into()) }
+}
+
 /// The `secrets not in env` row, against the live box (or a named compose
 /// project — the scratch proof points it at one).
 pub fn secrets_not_in_env_row() -> Check {
     let project = std::env::var("NOO_VERIFY_COMPOSE_PROJECT").ok().filter(|p| !p.is_empty()).or_else(stack_project);
     let holders = project.as_deref().map(holders_in).unwrap_or_default();
-    judge(&holders, &secrets_dir_files(&crate::envfile::repo_root()))
+    secrets_not_in_env_from(&holders, &secrets_dir_files(&crate::envfile::repo_root()), docker_refusal().as_deref())
+}
+
+/// [`judge`], except that no holder BECAUSE docker refused is said as that.
+pub(crate) fn secrets_not_in_env_from(holders: &[Holder], residue: &[String], refusal: Option<&str>) -> Check {
+    match refusal {
+        Some(e) if holders.is_empty() => not_judged_refused("secrets not in env", Verdict::Warn, e, ""),
+        _ => judge(holders, residue),
+    }
 }
 
 // ── shared secrets: every holder its own key ────────────────
@@ -871,7 +918,19 @@ pub fn shared_secrets_row() -> Check {
             }
         })
         .collect();
-    shared_secrets_check(&facts, &store_digests(&salt))
+    shared_secrets_from(&facts, &store_digests(&salt), docker_refusal().as_deref())
+}
+
+/// [`shared_secrets_check`], except that no container BECAUSE docker refused
+/// is said as that. Still a FAIL: this row is never softened for lack of
+/// evidence; it only stops claiming that nothing runs.
+pub(crate) fn shared_secrets_from(facts: &[SecretFacts], store: &StoreDigests, refusal: Option<&str>) -> Check {
+    match refusal {
+        Some(e) if facts.is_empty() => {
+            not_judged_refused("shared secrets", Verdict::Fail, e, " — nothing here may read as a pass")
+        }
+        _ => shared_secrets_check(facts, store),
+    }
 }
 
 // ── secrets audit: every delivered file is present in its consumer ─────────
@@ -1888,5 +1947,55 @@ mod tests {
         assert_eq!(names, ["noo_bus_key", "redis_password"]);
         assert_eq!(digests.len(), 1);
         assert_eq!(digests["noo_bus_key"], super::super::cluster_push_secrets::salted_digest("salt", "the-key"));
+    }
+}
+
+#[cfg(test)]
+mod docker_refused_tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    const DENIED: &str = "permission denied while trying to connect to the docker API at unix:///var/run/docker.sock";
+
+    fn out(code: i32, stderr: &str) -> std::io::Result<std::process::Output> {
+        Ok(std::process::Output { status: std::process::ExitStatus::from_raw(code << 8), stdout: Vec::new(), stderr: stderr.as_bytes().to_vec() })
+    }
+
+    #[test]
+    fn the_refusal_is_dockers_sentence_without_the_url() {
+        assert_eq!(refusal_of(out(0, "")), None, "a daemon that answers is no refusal");
+        let long = format!("{DENIED}: Get \"http://%2Fvar%2Frun%2Fdocker.sock/v1.47/version\": dial unix /var/run/docker.sock: connect: permission denied\n");
+        assert_eq!(refusal_of(out(1, &long)).as_deref(), Some(DENIED));
+        assert_eq!(refusal_of(out(1, "")).as_deref(), Some("the docker daemon did not answer"));
+        let missing = refusal_of(Err(std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory")));
+        assert!(missing.unwrap().starts_with("docker could not be run"));
+    }
+
+    #[test]
+    fn no_holder_because_docker_refused_is_not_said_as_no_container() {
+        let c = secrets_not_in_env_from(&[], &[], Some(DENIED));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert_eq!(c.detail, format!("not judged — {DENIED}"));
+        assert!(!c.detail.contains("no running container"), "failed lookup is not absence: {}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some(DOCKER_REFUSED_REMEDY));
+        // A daemon that answered and listed nothing still says that.
+        assert!(secrets_not_in_env_from(&[], &[], None).detail.starts_with("no running container of this stack found"));
+    }
+
+    #[test]
+    fn shared_secrets_stays_a_fail_but_names_the_refusal() {
+        let c = shared_secrets_from(&[], &None, Some(DENIED));
+        assert_eq!(c.verdict, Verdict::Fail, "never softened for lack of evidence");
+        assert_eq!(c.detail, format!("not judged — {DENIED} — nothing here may read as a pass"));
+        assert!(!c.detail.contains("no running container"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some(DOCKER_REFUSED_REMEDY));
+        assert!(shared_secrets_from(&[], &None, None).detail.contains("no running container of this stack was found"));
+    }
+
+    #[test]
+    fn the_live_rows_ask_the_refusal() {
+        let own = crate::test_src::own_code(include_str!("secrets_delivery.rs"));
+        assert!(crate::test_src::fn_body(&own, "pub fn secrets_not_in_env_row(").contains("docker_refusal()"));
+        assert!(crate::test_src::fn_body(&own, "pub fn shared_secrets_row(").contains("docker_refusal()"));
     }
 }

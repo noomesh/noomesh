@@ -195,10 +195,54 @@ def test_a_refused_connection_is_a_network_error(tmp_path: Path) -> None:
     assert "check DNS, the proxy and connectivity" in r.stderr
 
 
-def test_a_gh_network_failure_is_not_reported_as_a_404(tmp_path: Path) -> None:
-    """The i11b incident: gh fails on the network, the plain GET to a private
-    repo would 404. The report is gh's, after gh's retries, and curl is not
-    asked to repeat GitHub's answer."""
+def test_a_public_asset_never_asks_gh_even_when_gh_is_rate_limited(tmp_path: Path) -> None:
+    """rc.3 install matrix, macos-15-node: an unauthenticated gh on a shared
+    runner address was refused "API rate limit exceeded" and the install died
+    without trying the plain download. The direct GET goes first now."""
+    (tmp_path / "bin").mkdir()
+    gh = _fake_gh(tmp_path / "bin", [(1, "HTTP 403: API rate limit exceeded for 13.105.117.172.")])
+    srv = _Server([(200, {}, b"public")])
+    try:
+        r = _run(tmp_path, srv.url(), gh=True)
+    finally:
+        srv.close()
+    assert "OK" in r.stdout, r
+    assert srv.hits == 1
+    assert _gh_runs(gh) == 0, "gh (the API) is never asked for a public asset"
+    assert (tmp_path / "out").read_text() == "public"
+
+
+def test_a_direct_rate_limit_is_not_handed_to_gh(tmp_path: Path) -> None:
+    (tmp_path / "bin").mkdir()
+    gh = _fake_gh(tmp_path / "bin", [(0, "bytes")])
+    srv = _Server([(403, {"X-RateLimit-Remaining": "0"}, b"")])
+    try:
+        r = _run(tmp_path, srv.url(), gh=True)
+    finally:
+        srv.close()
+    assert "FAIL class=rate" in r.stdout, r
+    assert _gh_runs(gh) == 0, "the same GitHub would only repeat it"
+    assert "for a higher limit" in r.stderr
+
+
+def test_a_private_repo_is_read_through_gh_after_the_direct_404(tmp_path: Path) -> None:
+    (tmp_path / "bin").mkdir()
+    gh = _fake_gh(tmp_path / "bin", [(0, "private")])
+    srv = _Server([(404, {}, b"")])
+    try:
+        r = _run(tmp_path, srv.url(), gh=True)
+    finally:
+        srv.close()
+    assert "OK" in r.stdout, r
+    assert srv.hits == 1 and _gh_runs(gh) == 1
+    assert (tmp_path / "out").read_text() == "private"
+    assert "error:" not in r.stderr, "the direct 404 is not shown when gh then succeeds"
+
+
+def test_a_gh_network_failure_after_a_private_404_is_not_reported_as_a_404(tmp_path: Path) -> None:
+    """The i11b incident, in the new order: the direct GET to a private repo
+    404s, then gh fails on the network. The class is gh's, after gh's
+    retries; the direct answer is named second, never as the cause."""
     (tmp_path / "bin").mkdir()
     gh = _fake_gh(tmp_path / "bin", [(1, "error connecting to api.github.com")])
     srv = _Server([(404, {}, b"")])
@@ -208,45 +252,22 @@ def test_a_gh_network_failure_is_not_reported_as_a_404(tmp_path: Path) -> None:
         srv.close()
     assert "FAIL class=network" in r.stdout, r
     assert _gh_runs(gh) == 3, "gh's transient failure is retried to the bound"
-    assert srv.hits == 0
-    assert "HTTP 404" not in r.stderr
+    assert srv.hits == 1
+    err = r.stderr
+    assert err.index("network error") < err.index("the direct download answered first"), err
     assert (tmp_path / "sleeps").read_text().split() == ["1", "2"], "backoff doubles"
 
 
-def test_gh_then_success_after_a_blip(tmp_path: Path) -> None:
-    (tmp_path / "bin").mkdir()
-    gh = _fake_gh(tmp_path / "bin", [(1, "HTTP 502: Bad Gateway"), (0, "bytes")])
-    r = _run(tmp_path, "https://github.com/o/r/releases/download/t/a", gh=True)
-    assert "OK" in r.stdout, r
-    assert _gh_runs(gh) == 2
-    assert (tmp_path / "out").read_text() == "bytes"
-
-
-def test_gh_not_found_is_final(tmp_path: Path) -> None:
+def test_gh_not_found_after_a_direct_404_is_final(tmp_path: Path) -> None:
     (tmp_path / "bin").mkdir()
     gh = _fake_gh(tmp_path / "bin", [(1, "no assets match the file pattern")])
-    srv = _Server([(200, {}, b"should not be fetched")])
+    srv = _Server([(404, {}, b"")])
     try:
         r = _run(tmp_path, srv.url(), gh=True)
     finally:
         srv.close()
     assert "FAIL class=notfound" in r.stdout, r
     assert _gh_runs(gh) == 1
-    assert srv.hits == 0
-
-
-def test_gh_not_logged_in_falls_back_to_the_public_lane(tmp_path: Path) -> None:
-    (tmp_path / "bin").mkdir()
-    _fake_gh(
-        tmp_path / "bin",
-        [(4, "To get started with GitHub CLI, please run:  gh auth login")],
-    )
-    srv = _Server([(200, {}, b"public")])
-    try:
-        r = _run(tmp_path, srv.url(), gh=True)
-    finally:
-        srv.close()
-    assert "OK" in r.stdout, r
     assert srv.hits == 1
 
 
@@ -261,8 +282,8 @@ def test_gh_not_logged_in_and_private_says_both(tmp_path: Path) -> None:
         r = _run(tmp_path, srv.url(), gh=True)
     finally:
         srv.close()
-    assert "FAIL" in r.stdout, r
-    assert "gh failed first" in r.stderr and "gh auth login" in r.stderr
+    assert "FAIL class=auth" in r.stdout, r
+    assert "the direct download answered first" in r.stderr and "gh auth login" in r.stderr
 
 
 def test_tokens_are_redacted(tmp_path: Path) -> None:

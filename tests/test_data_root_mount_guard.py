@@ -62,13 +62,43 @@ def rig(tmp_path):
         while [ $# -gt 0 ]; do [ "$1" = "-o" ] && field="$2"; shift; done
         eval "printf '%s\\n' \\"\\$FAKE_$field\\""
         """)
+    # Who runs the launch: a non-root install owner unless a test says root.
+    _exe(bindir / "id", """\
+        #!/bin/sh
+        case "$1" in
+          -u) echo "${FAKE_EUID:-1002}" ;;
+          -un) echo "${FAKE_USER:-rhowner}" ;;
+          *) echo "uid=${FAKE_EUID:-1002}(${FAKE_USER:-rhowner})" ;;
+        esac
+        """)
     _exe(bindir / "ls", """\
         #!/bin/sh
         if [ -n "$FAKE_LS_EIO" ]; then
           echo "ls: cannot open directory '$2': Input/output error" >&2
           exit 2
         fi
+        for a in "$@"; do
+          if [ -n "$FAKE_LS_DENY" ] && [ "$a" = "$FAKE_LS_DENY" ]; then
+            echo "ls: cannot open directory '$a': Permission denied" >&2
+            exit 2
+          fi
+        done
         exec /bin/ls "$@"
+        """)
+    # stat of the postgres dir as a non-root account sees it (owner, mode,
+    # link count); every other path is the real stat.
+    _exe(bindir / "stat", """\
+        #!/bin/sh
+        last=""; for a in "$@"; do last="$a"; done
+        if [ -n "$FAKE_STAT_PATH" ] && [ "$last" = "$FAKE_STAT_PATH" ]; then
+          case "$2" in
+            %u) echo "${FAKE_PG_OWNER:-70}" ;;
+            %a) echo "${FAKE_PG_MODE:-700}" ;;
+            %h) echo "${FAKE_PG_NLINK:-1}" ;;
+          esac
+          exit 0
+        fi
+        exec /usr/bin/stat "$@"
         """)
     _exe(bindir / "docker", f"""\
         #!/bin/sh
@@ -393,3 +423,148 @@ def test_hostd_boot_restore_runs_the_guard_before_anything_else():
     guard = script.index("data_root_mount_boot_guard")
     for later in ("secret_rundir)", "check_state_volume_open", "load_secrets", "docker start"):
         assert guard < script.index(later), later
+
+
+# ── a UUID this account cannot read is not a different UUID (rc.3 A-afterboot.start) ──
+
+
+def _drop(rig, key: str) -> None:
+    p = rig["install"] / ".noo-data-root-id"
+    p.write_text("".join(l for l in p.read_text().splitlines(True) if not l.startswith(key + "=")))
+
+
+def test_an_unreadable_uuid_with_the_recorded_mount_starts_and_says_what_it_compared(rig):
+    assert "RC=0" in run(rig, FAKE_EUID="0", FAKE_USER="root").stdout  # onboard, as root, records the UUID
+    r = run(rig, FAKE_UUID="")
+    assert "RC=0" in r.stdout, r.stderr
+    assert "REFUSED" not in r.stderr
+    assert "could not be read as rhowner" in r.stderr and "compared instead" in r.stderr, r.stderr
+    assert "/dev/nvme1n1p1" in r.stderr and "ext4" in r.stderr
+
+
+def test_an_unreadable_uuid_never_downgrades_the_record(rig):
+    run(rig, FAKE_EUID="0", FAKE_USER="root")
+    _drop(rig, "postgres_initialised")  # the ok path rewrites the record to add it back
+    r = run(rig, FAKE_UUID="")
+    assert "RC=0" in r.stdout, r.stderr
+    rec = record(rig)
+    assert f"uuid={UUID_A}" in rec and "id_kind=uuid" in rec, rec
+    assert "postgres_initialised=" in rec
+
+
+def test_an_unreadable_uuid_on_another_mount_refuses_with_the_true_reason(rig):
+    run(rig, FAKE_EUID="0", FAKE_USER="root")
+    for change in ({"FAKE_SOURCE": "/dev/sdb1"}, {"FAKE_TARGET": "/"}, {"FAKE_FSTYPE": "xfs"}):
+        r = run(rig, FAKE_UUID="", **change)
+        assert "RC=1" in r.stdout, (change, r.stderr)
+        assert "could not read the filesystem UUID as rhowner" in r.stderr, r.stderr
+        assert "not on its recorded filesystem" not in r.stderr, r.stderr
+        assert "sudo findmnt" in r.stderr and "NOO_DATA_ROOT_RERECORD=1" in r.stderr
+
+
+def test_a_record_with_only_the_uuid_refuses_an_unreadable_read(rig):
+    run(rig, FAKE_EUID="0", FAKE_USER="root")
+    for k in ("source", "target", "fstype"):
+        _drop(rig, k)
+    r = run(rig, FAKE_UUID="")
+    assert "RC=1" in r.stdout and "has no mount to compare" in r.stderr, r.stderr
+    assert "not on its recorded filesystem" not in r.stderr
+
+
+def test_root_reading_no_uuid_is_still_a_different_disk(rig):
+    run(rig, FAKE_EUID="0", FAKE_USER="root")
+    r = run(rig, FAKE_UUID="", FAKE_EUID="0", FAKE_USER="root")
+    assert "RC=1" in r.stdout, r.stderr
+    assert "not on its recorded filesystem" in r.stderr and "<none>" in r.stderr, r.stderr
+
+
+def test_a_readable_different_uuid_still_refuses_for_any_account(rig):
+    run(rig, FAKE_EUID="0", FAKE_USER="root")
+    r = run(rig, FAKE_UUID=UUID_B)
+    assert "RC=1" in r.stdout and "not on its recorded filesystem" in r.stderr, r.stderr
+
+
+def test_rerecord_after_an_unreadable_refusal_records_the_readable_mount(rig):
+    run(rig, FAKE_EUID="0", FAKE_USER="root")
+    r = run(rig, FAKE_UUID="", FAKE_SOURCE="/dev/sdb1", NOO_DATA_ROOT_RERECORD="1")
+    assert "RC=0" in r.stdout, r.stderr
+    assert "id_kind=mount" in record(rig) and "source=/dev/sdb1" in record(rig)
+
+
+def test_the_report_carries_the_note(rig):
+    run(rig, FAKE_EUID="0", FAKE_USER="root")
+    r = run(rig, fn="data_root_mount_report", FAKE_UUID="")
+    assert "RC=0" in r.stdout and "could not be read as rhowner" in r.stdout, r.stdout
+
+
+def test_a_record_written_by_0_6_23_passes_its_first_non_root_launch(rig):
+    # The upgrade path: the record format has not changed since the guard
+    # landed (2c59428e); an install upgraded from 0.6.23 has every field.
+    (rig["install"] / ".noo-data-root-id").write_text(
+        "# written by scripts/lib-data-root-mount.sh — the filesystem the data root lives on.\n"
+        "# launchers and hostd refuse to start the stack when it is not mounted here.\n"
+        f"data_root={rig['data']}\n"
+        "id_kind=uuid\n"
+        f"uuid={UUID_A}\n"
+        "source=/dev/nvme1n1p1\n"
+        f"target={rig['tmp'] / 'mnt' / 'extradrive1'}\n"
+        "fstype=ext4\n"
+        "recorded_at=2026-10-30T00:00:00Z\n"
+        "postgres_initialised=2026-10-30T00:00:00Z\n"
+    )
+    assert "RC=0" in run(rig).stdout
+    r = run(rig, FAKE_UUID="")
+    assert "RC=0" in r.stdout, r.stderr
+
+
+# ── a postgres data dir this account cannot list is not an empty one (rc.3 Part A) ──
+
+
+def _pg_unlistable(rig, **extra):
+    pg = str(rig["data"] / "postgres")
+    env = {"FAKE_LS_DENY": pg, "FAKE_STAT_PATH": pg}
+    env.update(extra)
+    return env
+
+
+def test_an_unlistable_postgres_dir_owned_by_postgres_starts_and_says_why(rig):
+    run(rig, FAKE_EUID="0", FAKE_USER="root")  # root arms the belt (it sees PG_VERSION)
+    assert "postgres_initialised=" in record(rig)
+    r = run(rig, **_pg_unlistable(rig))
+    assert "RC=0" in r.stdout, r.stderr
+    assert "REFUSED" not in r.stderr
+    assert "could not be listed as rhowner" in r.stderr and "owned by uid 70, mode 700" in r.stderr, r.stderr
+
+
+def test_the_link_count_is_never_the_judge_btrfs_reports_one(rig):
+    run(rig, FAKE_EUID="0", FAKE_USER="root")
+    r = run(rig, **_pg_unlistable(rig, FAKE_PG_NLINK="1"))
+    assert "RC=0" in r.stdout, r.stderr  # a healthy cluster on btrfs (nlink 1) still starts
+
+
+def test_an_unlistable_dir_owned_by_the_caller_or_root_refuses_with_the_true_reason(rig):
+    run(rig, FAKE_EUID="0", FAKE_USER="root")
+    for owner in ("1002", "0"):  # the caller (rhowner is 1002 in the rig), root
+        r = run(rig, **_pg_unlistable(rig, FAKE_PG_OWNER=owner, FAKE_PG_MODE="700"))
+        assert "RC=1" in r.stdout, (owner, r.stderr)
+        assert "could not be listed as rhowner" in r.stderr and f"owned by uid {owner}" in r.stderr, r.stderr
+        assert "not postgres' own" in r.stderr
+        assert "is empty or missing" not in r.stderr, "an unlistable dir is never called empty"
+
+
+def test_a_listable_empty_or_missing_postgres_dir_still_refuses_for_any_account(rig):
+    run(rig, FAKE_EUID="0", FAKE_USER="root")
+    for f in (rig["data"] / "postgres").iterdir():
+        f.unlink()
+    for who in ({}, {"FAKE_EUID": "0", "FAKE_USER": "root"}):
+        r = run(rig, **who)
+        assert "RC=1" in r.stdout and "is empty or missing" in r.stderr, (who, r.stderr)
+    (rig["data"] / "postgres").rmdir()
+    r = run(rig)
+    assert "RC=1" in r.stdout and "is empty or missing" in r.stderr
+
+
+def test_the_report_carries_the_postgres_note(rig):
+    run(rig, FAKE_EUID="0", FAKE_USER="root")
+    r = run(rig, fn="data_root_mount_report", **_pg_unlistable(rig))
+    assert "RC=0" in r.stdout and "could not be listed as rhowner" in r.stdout, r.stdout

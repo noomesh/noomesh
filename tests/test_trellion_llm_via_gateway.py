@@ -71,7 +71,12 @@ def test_v1_chat_completions_routes_on_the_requested_model() -> None:
     )
     assert 'body["model"] =' not in handler, "the handler must not overwrite the caller's model before resolution"
     raw = (ROOT / "gateway-rust/src/routes/raw_chat.rs").read_text()
-    helper = raw[raw.index("pub async fn chat_completions(") :]
+    entry = raw[raw.index("pub async fn chat_completions(") :]
+    entry = entry[: entry.index("\n}\n")]
+    # `chat_completions` is `chat_completions_with` and a no-op per-candidate
+    # adjust (120): the resolution below lives there, for every caller.
+    assert re.search(r"chat_completions_with\(state,\s*body,\s*source,\s*actor,\s*pin,\s*\|_, _\| \{\}\)", entry), entry
+    helper = raw[raw.index("pub async fn chat_completions_with(") :]
     helper = helper[: helper.index("\n}\n")]
     assert re.search(r'model_hint\(body\.get\("model"\)', helper), "the shared path reads the body's model as the hint"
     assert re.search(r"resolve_candidates\(state,\s*hint\.as_deref\(\),", helper), (

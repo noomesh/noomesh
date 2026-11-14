@@ -188,6 +188,9 @@ pub(crate) enum FetchErr {
     /// No LFS sha256 anywhere — nothing to verify against, so no install.
     NoDigest,
     Http(String),
+    /// The connection failed or dropped mid-body, or the server answered 5xx:
+    /// a retry from the `.part` may cure it (#115). Disk errors stay `Io`.
+    Dropped(String),
     Io(String),
     Mismatch { expected: String, got: String },
     /// The store already holds a different file of that name.
@@ -204,6 +207,7 @@ impl std::fmt::Display for FetchErr {
             FetchErr::NotFound => write!(f, "Hugging Face has no such file at that revision (404)"),
             FetchErr::NoDigest => write!(f, "Hugging Face published no LFS sha256 for this file — refusing to install an unverifiable download"),
             FetchErr::Http(e) => write!(f, "{e}"),
+            FetchErr::Dropped(e) => write!(f, "{e}"),
             FetchErr::Io(e) => write!(f, "{e}"),
             FetchErr::Mismatch { expected, got } => write!(f, "sha256 mismatch: Hugging Face says {expected}, the download hashes to {got} — the partial file was deleted; re-run to download again"),
             FetchErr::Conflict { existing, expected } => write!(f, "the store already holds a different file of that name (sha256 {existing}, Hugging Face says {expected}) — re-run with --force to replace it"),
@@ -398,7 +402,7 @@ pub(crate) fn get_following(base: &str, url: &str, token: Option<&str>, range_fr
         if range_from > 0 {
             req = req.header("Range", format!("bytes={range_from}-"));
         }
-        let resp = req.call().map_err(|e| FetchErr::Http(format!("download failed: {e}")))?;
+        let resp = req.call().map_err(|e| FetchErr::Dropped(format!("download failed: {e}")))?;
         let st = resp.status().as_u16();
         if (300..400).contains(&st) {
             let loc = resp
@@ -490,40 +494,12 @@ pub(crate) fn fetch_to_store(
         progress(Fetching::Resuming(have));
     }
 
-    let complete = remote.size.is_some_and(|t| have == t && t > 0);
-    if !complete {
-        let url = resolve_url(base, a);
-        let mut resp = get_following(base, &url, token, have)?;
-        let st = resp.status().as_u16();
-        let mut f = match st {
-            206 => OpenOptions::new().append(true).open(&part).map_err(|e| io(&format!("opening {}", part.display()), e))?,
-            200 => {
-                // The server ignored Range (or there was nothing to resume):
-                // start over rather than append a whole file to a prefix.
-                have = 0;
-                File::create(&part).map_err(|e| io(&format!("creating {}", part.display()), e))?
-            }
-            416 if have > 0 => {
-                // Nothing past what we hold — the hash below decides.
-                OpenOptions::new().append(true).open(&part).map_err(|e| io(&format!("opening {}", part.display()), e))?
-            }
-            _ => return Err(FetchErr::Http(format!("download returned HTTP {st}"))),
-        };
-        if st != 416 {
-            let mut body = resp.body_mut().with_config().limit(u64::MAX).reader();
-            let mut buf = vec![0u8; 1 << 20];
-            loop {
-                let n = body.read(&mut buf).map_err(|e| io("download interrupted (re-run to resume)", e))?;
-                if n == 0 {
-                    break;
-                }
-                f.write_all(&buf[..n]).map_err(|e| io(&format!("writing {}", part.display()), e))?;
-                have += n as u64;
-                progress(Fetching::Bytes { done: have, total: remote.size });
-            }
-        }
-        f.sync_all().map_err(|e| io("flushing the partial file", e))?;
-    }
+    let url = resolve_url(base, a);
+    let total = remote.size;
+    have = download_part(&mut |from| get_following(base, &url, token, from), &part, total, &RESUME_DELAYS, &mut |e| match e {
+        PartEvent::Bytes(done) => progress(Fetching::Bytes { done, total }),
+        PartEvent::Retry(rt) => progress(Fetching::Retrying { attempt: rt.attempt, of: rt.of, at: rt.at, wait_secs: rt.wait.as_secs() }),
+    })?;
 
     progress(Fetching::Verifying(have));
     let got = sha256_file(&part).map_err(|e| io(&format!("hashing {}", part.display()), e))?;
@@ -569,6 +545,132 @@ pub(crate) fn human(n: u64) -> String {
     if n as f64 >= G { format!("{:.2} GB", n as f64 / G) } else { format!("{:.1} MB", n as f64 / (1024.0 * 1024.0)) }
 }
 
+/// Pauses before each in-run resume (#115): a connection that drops mid-
+/// download is resumed from the `.part` this many times before the command
+/// gives up, so a long fetch does not end on the first drop.
+pub(crate) const RESUME_DELAYS: [Duration; 3] = [Duration::from_secs(2), Duration::from_secs(5), Duration::from_secs(10)];
+
+/// One in-run resume, as the display hears it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Retry {
+    /// 1-based: the attempt about to be made after the first.
+    pub attempt: usize,
+    pub of: usize,
+    /// Bytes on disk the next attempt resumes from.
+    pub at: u64,
+    pub wait: Duration,
+}
+
+/// What [`download_part`] reports as it goes: bytes on disk, or a resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PartEvent {
+    Bytes(u64),
+    Retry(Retry),
+}
+
+/// Download into `part` (resuming whatever it holds) until it is complete,
+/// resuming in this run after a dropped connection (`FetchErr::Dropped`) up
+/// to `delays.len()` times. `get(from)` makes the request with `Range` from
+/// `from`. Returns the bytes on disk; the caller verifies the digest. A disk
+/// error, a 4xx or anything but `Dropped` is never retried.
+pub(crate) fn download_part(
+    get: &mut dyn FnMut(u64) -> Result<ureq::http::Response<ureq::Body>, FetchErr>,
+    part: &Path,
+    total: Option<u64>,
+    delays: &[Duration],
+    on: &mut dyn FnMut(PartEvent),
+) -> Result<u64, FetchErr> {
+    let mut retries = 0usize;
+    loop {
+        let have = std::fs::metadata(part).map(|m| m.len()).unwrap_or(0);
+        if total.is_some_and(|t| t > 0 && have == t) {
+            return Ok(have);
+        }
+        match download_once(get, part, have, on) {
+            Ok(n) => return Ok(n),
+            Err(FetchErr::Dropped(why)) if retries < delays.len() => {
+                let at = std::fs::metadata(part).map(|m| m.len()).unwrap_or(0);
+                let wait = delays[retries];
+                retries += 1;
+                on(PartEvent::Retry(Retry { attempt: retries, of: delays.len(), at, wait }));
+                let _ = why;
+                std::thread::sleep(wait);
+            }
+            Err(FetchErr::Dropped(why)) => {
+                return Err(FetchErr::Dropped(format!("{why} — gave up after {} resumes; re-run the same command to resume from the partial download", delays.len())));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// The first byte a `Content-Range: bytes <start>-<end>/<total>` covers.
+fn content_range_start(v: &str) -> Option<u64> {
+    v.trim().strip_prefix("bytes ")?.split('-').next()?.trim().parse().ok()
+}
+
+/// One request into `part` from `have`.
+fn download_once(
+    get: &mut dyn FnMut(u64) -> Result<ureq::http::Response<ureq::Body>, FetchErr>,
+    part: &Path,
+    mut have: u64,
+    on: &mut dyn FnMut(PartEvent),
+) -> Result<u64, FetchErr> {
+    let mut resp = get(have)?;
+    let st = resp.status().as_u16();
+    let mut f = match st {
+        206 => {
+            // A partial answer is appended only where it says it starts, and
+            // that must be exactly where the part ends: a 206 from any other
+            // offset (or with no Content-Range) would splice the wrong bytes
+            // in, and the hash would then throw the whole download away.
+            let start = resp
+                .headers()
+                .get("content-range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(content_range_start);
+            if start != Some(have) {
+                return Err(FetchErr::Http(format!(
+                    "the server answered 206 from {} but the download holds {have} bytes — not appending",
+                    start.map_or_else(|| "no Content-Range".to_string(), |s| format!("byte {s}"))
+                )));
+            }
+            // `create`: a resume from 0 (an empty or absent part) is a start.
+            OpenOptions::new().create(true).append(true).open(part).map_err(|e| io(&format!("opening {}", part.display()), e))?
+        }
+        200 => {
+            // The server ignored Range (or there was nothing to resume):
+            // start over rather than append a whole file to a prefix.
+            have = 0;
+            File::create(part).map_err(|e| io(&format!("creating {}", part.display()), e))?
+        }
+        // Nothing past what we hold: the hash decides.
+        416 if have > 0 => return Ok(have),
+        500..=599 => return Err(FetchErr::Dropped(format!("the server answered HTTP {st}"))),
+        _ => return Err(FetchErr::Http(format!("download returned HTTP {st}"))),
+    };
+    let mut body = resp.body_mut().with_config().limit(u64::MAX).reader();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = match body.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                // What arrived is kept: the next attempt resumes from it.
+                let _ = f.sync_all();
+                return Err(FetchErr::Dropped(format!("download interrupted at {}: {e}", human(have))));
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        f.write_all(&buf[..n]).map_err(|e| io(&format!("writing {}", part.display()), e))?;
+        have += n as u64;
+        on(PartEvent::Bytes(have));
+    }
+    f.sync_all().map_err(|e| io("flushing the partial file", e))?;
+    Ok(have)
+}
+
 /// One phase of [`fetch_to_store`], for a progress display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Fetching {
@@ -577,6 +679,8 @@ pub(crate) enum Fetching {
     Resuming(u64),
     /// Bytes on disk so far, of `total` when the server said.
     Bytes { done: u64, total: Option<u64> },
+    /// The connection dropped; resuming from `at` after `wait_secs` (#115).
+    Retrying { attempt: usize, of: usize, at: u64, wait_secs: u64 },
     /// The sha256 pass over a file of this many bytes (seconds per GB: a
     /// 15 GB set file is most of a minute with nothing arriving).
     Verifying(u64),
@@ -663,6 +767,12 @@ impl DownloadLine {
                 p.set_msg(&format!("{}  {}", self.name, progress_text(done, total, self.from, secs)));
                 p.tick(self.started.elapsed().as_secs());
                 self.drawn = Some(std::time::Instant::now());
+            }
+            Fetching::Retrying { attempt, of, at, wait_secs } => {
+                self.note(&format!(
+                    "connection dropped at {} — resuming in {wait_secs}s (attempt {attempt} of {of})",
+                    human(at)
+                ));
             }
             Fetching::Verifying(n) => match self.poll.as_mut() {
                 Some(p) => {
@@ -760,7 +870,7 @@ pub fn models_fetch(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             let hint = match &e {
                 FetchErr::Auth(_) => Some("accept the model's licence on huggingface.co with the token's account, and store the token: `noo security secrets rotate HF_TOKEN --prompt`".to_string()),
                 FetchErr::NotFound => Some(format!("check the file name at https://huggingface.co/{}/tree/{}", a.repo, a.revision)),
-                FetchErr::Io(_) | FetchErr::Http(_) => Some("re-run the same command: the partial download resumes".to_string()),
+                FetchErr::Io(_) | FetchErr::Http(_) | FetchErr::Dropped(_) => Some("re-run the same command: the partial download resumes".to_string()),
                 _ => None,
             };
             fail(g.json, ExitCode::RemoteError, "fetch_failed", &e.to_string(), hint.as_deref());
@@ -1067,7 +1177,11 @@ mod tests {
     }
 
     fn tmpdir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("noo-models-fetch-{tag}-{}", std::process::id()));
+        // pid + a process-wide count: unique per call, so no two tests (or a
+        // leftover from an earlier run under the same pid) share a directory.
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let d = std::env::temp_dir().join(format!("noo-models-fetch-{tag}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -1225,5 +1339,239 @@ mod tests {
             let body = crate::test_src::fn_body(&src, f);
             assert!(body.contains("DownloadLine::new(") && body.contains("line.event(e)") && body.contains("line.finish()"), "{f}");
         }
+    }
+}
+
+/// #115: a dropped connection is resumed IN THIS RUN from the `.part`, a
+/// bounded number of times, and never silently. Real sockets: the server
+/// sends the headers, part of the body, and closes, so the read error is the
+/// one a dropped link gives.
+#[cfg(test)]
+mod in_run_resume_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Clone, Copy)]
+    enum Mode {
+        /// Drop mid-body this many times, then serve the rest.
+        Drop(usize),
+        /// Answer this status this many times, then serve.
+        Status(u16, usize),
+    }
+
+    fn content() -> Vec<u8> {
+        (0..300_000u32).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn serve(content: Vec<u8>, mode: Mode) -> (String, Arc<AtomicUsize>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/f", l.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        std::thread::spawn(move || {
+            let mut bad_left = match mode { Mode::Drop(n) | Mode::Status(_, n) => n };
+            for stream in l.incoming().take(32) {
+                let Ok(mut st) = stream else { continue };
+                hits2.fetch_add(1, Ordering::SeqCst);
+                let mut rd = BufReader::new(st.try_clone().unwrap());
+                let mut start = 0usize;
+                loop {
+                    let mut h = String::new();
+                    if rd.read_line(&mut h).is_err() || h.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(v) = h.to_ascii_lowercase().strip_prefix("range: bytes=") {
+                        start = v.trim().trim_end_matches('-').parse().unwrap_or(0);
+                    }
+                }
+                let body = &content[start..];
+                // As a real server answers: 200 to a request with no Range,
+                // 206 with its Content-Range only to a resume. (A 206 to the
+                // first request, as this fake once sent, is what the client
+                // now refuses: these tests never passed against it.)
+                let hdr = if start > 0 {
+                    format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        content.len() - 1, content.len(), body.len())
+                } else {
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())
+                };
+                if bad_left > 0 {
+                    bad_left -= 1;
+                    match mode {
+                        Mode::Drop(_) => {
+                            let _ = st.write_all(hdr.as_bytes());
+                            let _ = st.write_all(&body[..body.len() / 3]);
+                            continue; // dropped: the stream closes mid-body
+                        }
+                        Mode::Status(code, _) => {
+                            let _ = st.write_all(format!("HTTP/1.1 {code} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes());
+                            continue;
+                        }
+                    }
+                }
+                let _ = st.write_all(hdr.as_bytes());
+                let _ = st.write_all(body);
+            }
+        });
+        (url, hits)
+    }
+
+    fn dir(tag: &str) -> PathBuf {
+        // Unique per call (pid + a process-wide count), never a shared name.
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let d = std::env::temp_dir().join(format!("noo-resume-{}-{tag}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    const NO_WAIT: [Duration; 3] = [Duration::ZERO; 3];
+
+    fn run(url: &str, part: &Path, total: u64) -> (Result<u64, FetchErr>, Vec<Retry>) {
+        let mut retries = Vec::new();
+        let r = download_part(
+            &mut |from| {
+                let mut req = agent().get(url);
+                if from > 0 {
+                    req = req.header("Range", format!("bytes={from}-"));
+                }
+                req.call().map_err(|e| FetchErr::Dropped(format!("download failed: {e}")))
+            },
+            part,
+            Some(total),
+            &NO_WAIT,
+            &mut |e| {
+                if let PartEvent::Retry(r) = e {
+                    retries.push(r);
+                }
+            },
+        );
+        (r, retries)
+    }
+
+    #[test]
+    fn two_drops_are_resumed_in_the_same_run() {
+        let c = content();
+        let (url, hits) = serve(c.clone(), Mode::Drop(2));
+        let d = dir("two");
+        let part = d.join(".m.part");
+        let (r, retries) = run(&url, &part, c.len() as u64);
+        assert_eq!(r.unwrap(), c.len() as u64);
+        assert_eq!(std::fs::read(&part).unwrap(), c, "the resumed bytes are the file");
+        assert_eq!(retries.len(), 2, "{retries:?}");
+        assert!(retries[0].at > 0 && retries[1].at > retries[0].at, "each resume starts past the last: {retries:?}");
+        assert_eq!((retries[0].attempt, retries[0].of), (1, 3));
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    /// Past the bound it fails, saying so, and the partial file is kept for a
+    /// re-run: never a silent exit, never a lost download.
+    #[test]
+    fn too_many_drops_fail_loudly_and_keep_the_partial() {
+        let c = content();
+        let (url, hits) = serve(c.clone(), Mode::Drop(10));
+        let d = dir("many");
+        let part = d.join(".m.part");
+        let (r, retries) = run(&url, &part, c.len() as u64);
+        let e = r.unwrap_err();
+        assert!(matches!(e, FetchErr::Dropped(_)), "{e}");
+        assert!(e.to_string().contains("gave up after 3 resumes") && e.to_string().contains("re-run"), "{e}");
+        assert_eq!(retries.len(), 3);
+        assert_eq!(hits.load(Ordering::SeqCst), 4);
+        let kept = std::fs::read(&part).unwrap();
+        assert!(!kept.is_empty() && c.starts_with(&kept), "the partial is a prefix, kept for a re-run");
+    }
+
+    /// A 5xx (the registry's 503) is retried; a 4xx is the answer, sent once.
+    #[test]
+    fn a_5xx_is_retried_and_a_4xx_is_not() {
+        let c = content();
+        let (url, hits) = serve(c.clone(), Mode::Status(503, 1));
+        let d = dir("5xx");
+        let (r, retries) = run(&url, &d.join(".m.part"), c.len() as u64);
+        assert_eq!(r.unwrap(), c.len() as u64);
+        assert_eq!((retries.len(), hits.load(Ordering::SeqCst)), (1, 2));
+
+        let (url, hits) = serve(c.clone(), Mode::Status(400, 5));
+        let (r, retries) = run(&url, &d.join(".n.part"), c.len() as u64);
+        assert!(matches!(r.unwrap_err(), FetchErr::Http(_)));
+        assert_eq!((retries.len(), hits.load(Ordering::SeqCst)), (0, 1), "a 4xx is asked once");
+    }
+
+    /// A disk error is not a dropped link: never retried. (A directory where
+    /// the `.part` file should be fails for root too.)
+    #[test]
+    fn a_disk_error_is_not_retried() {
+        let c = content();
+        let (url, hits) = serve(c.clone(), Mode::Drop(0));
+        let d = dir("disk");
+        let part = d.join(".m.part");
+        std::fs::create_dir_all(&part).unwrap();
+        let (r, retries) = run(&url, &part, c.len() as u64);
+        assert!(matches!(r.unwrap_err(), FetchErr::Io(_)));
+        assert_eq!((retries.len(), hits.load(Ordering::SeqCst)), (0, 1));
+    }
+
+    /// Each connection gets the next canned response, whole.
+    fn canned(responses: Vec<Vec<u8>>) -> String {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/f", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for (stream, resp) in l.incoming().zip(responses) {
+                let Ok(mut st) = stream else { continue };
+                let mut rd = BufReader::new(st.try_clone().unwrap());
+                loop {
+                    let mut h = String::new();
+                    if rd.read_line(&mut h).is_err() || h.trim().is_empty() {
+                        break;
+                    }
+                }
+                let _ = st.write_all(&resp);
+            }
+        });
+        url
+    }
+
+    fn partial(from: usize, c: &[u8], content_range: bool) -> Vec<u8> {
+        let body = &c[from..];
+        let cr = if content_range { format!("Content-Range: bytes {from}-{}/{}\r\n", c.len() - 1, c.len()) } else { String::new() };
+        let mut r = format!("HTTP/1.1 206 Partial Content\r\n{cr}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
+        r.extend_from_slice(body);
+        r
+    }
+
+    /// A 206 is appended only from where the part ends: a server resuming
+    /// from another offset, or a 206 that does not say where it starts, is
+    /// refused and nothing is appended (the bytes would be spliced wrong and
+    /// the hash would throw the whole download away). Fails on the version
+    /// that appended any 206.
+    #[test]
+    fn a_206_from_the_wrong_offset_is_not_appended() {
+        let c = content();
+        for (resp, why) in [(partial(10, &c, true), "byte 10"), (partial(0, &c, false), "no Content-Range")] {
+            let d = dir("offset");
+            let part = d.join(".m.part");
+            std::fs::write(&part, &c[..1000]).unwrap();
+            let e = run(&canned(vec![resp]), &part, c.len() as u64).0.unwrap_err();
+            assert!(matches!(e, FetchErr::Http(_)) && e.to_string().contains(why), "{why}: {e}");
+            assert_eq!(std::fs::read(&part).unwrap(), &c[..1000], "{why}: nothing appended");
+        }
+    }
+
+    /// A 206 from byte 0 to a request with nothing held is a start: the part
+    /// is created (it does not exist yet), not an "opening" error.
+    #[test]
+    fn a_206_from_zero_with_no_part_creates_it() {
+        let c = content();
+        let d = dir("zero");
+        let part = d.join(".m.part");
+        let (r, retries) = run(&canned(vec![partial(0, &c, true)]), &part, c.len() as u64);
+        assert_eq!(r.unwrap(), c.len() as u64);
+        assert_eq!(std::fs::read(&part).unwrap(), c);
+        assert!(retries.is_empty());
     }
 }

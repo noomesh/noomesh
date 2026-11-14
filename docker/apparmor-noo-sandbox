@@ -28,11 +28,14 @@
 #   sudo install -m 0644 docker/apparmor-noo-sandbox /etc/apparmor.d/noo-sandbox
 #   sudo apparmor_parser -r /etc/apparmor.d/noo-sandbox
 #   NOO_SANDBOX_APPARMOR=noo-sandbox in .env, then: noo stack restart --force sandbox
-# `userns,` needs AppArmor 4.0 (Ubuntu 24.04). On an older parser the
-# profile does not load, and the sandbox keeps docker-default, where
-# Bubblewrap already works (the userns restriction is a 24.04 change).
+# `userns,` needs AppArmor 4.0 (Ubuntu 24.04). A 3.x parser (Ubuntu 22.04)
+# refuses the whole file on that line, so onboard installs it there with
+# that one line commented out (noo-cli/src/onboard/sandbox_apparmor.rs
+# `render`): 3.x policy does not mediate user namespaces, so nothing is
+# granted or withheld by the omission, and every other rule is unchanged.
 # Shape pinned by tests/test_sandbox_apparmor_profile.py; parse-checked by
-# scripts/check-apparmor-profile.sh against the 24.04 parser.
+# scripts/check-apparmor-profile.sh with the 24.04 parser (this file) and
+# the 22.04 parser (the rendered file).
 
 #include <tunables/global>
 

@@ -1297,7 +1297,12 @@ contains, one of those.
   points `NOO_TLS_CA/CERT/KEY` there. The harness needs no access to
   `/etc/noo/pki`, which stays 0750 `root:noo-agent`. A file systemd cannot
   load fails the start, naming the unit. The applier restarts the harness
-  when the CA or its pair changes. The agent's pair, env file and secret
+  when the CA or its pair changes. `LoadCredential=` needs systemd 247 or
+  newer. On an older systemd the applier refuses the new unit
+  (`REFUSED harness-unit`), keeps the installed one, points the env's
+  `NOO_TLS_*` back at `/etc/noo/pki`, applies the rest of the bundle, and
+  `noo cluster verify` shows a `harness systemd` warning naming the node.
+  The agent's pair, env file and secret
   files are `InaccessiblePaths=` for it. So even a CLI that escaped the jail runs
   with a uid and gid that cannot read the agent's key material.
 - **macOS.** The CLI runs under `/usr/bin/sandbox-exec` with a profile that
@@ -1364,6 +1369,35 @@ contains, one of those.
   runs the test again. It is visible in the harness's log only: the
   agent's heartbeat reports the harness service's state, not this verdict.
 
+### The harness unit is held off the internet
+
+The Landlock jail limits files. The network is limited by the node's applier
+(`scripts/noo-apply.sh`), as root, on every apply that carries the harness
+unit or its env. It renders `/etc/noo/harness-net/` (a `resolv.conf` that
+names only 192.0.2.53, a TEST-NET-1 address that is never allowed, so a name
+lookup fails at once with no packet sent; an `nsswitch.conf` that is the
+host's with `hosts: files dns`; and a `hosts` file that holds only the names
+the harness needs, the hosts of `NOO_GATEWAY_URL` and `NATS_URL`, resolved
+by the applier) and the drop-in
+`noo-harness.service.d/50-noomesh-egress.conf`. The drop-in sets
+`IPAddressDeny=0.0.0.0/0 ::/0` (every address; written as prefixes because
+`systemd-run -p`, which the pre-check uses, rejects `any` and `localhost`) and allows only loopback, private, link-local and
+tailnet ranges, `fc00::/7` only on a host that has its own global address
+there, and each controller address outside those ranges as one `/32` or
+`/128`. It also bind-mounts the three files over `/etc` for the unit and its
+CLIs and hides the host's resolver sockets. The files are rewritten only when
+their content changes; a change reloads systemd and restarts the harness the
+applier's usual way. A name that does not resolve is left out of the hosts
+file and is never looked up through a real resolver: the harness then fails
+to connect to it, which is loud. The applier also runs a probe (a transient
+unit denying every address but 127.0.0.1 and ::1 that connects to 127.0.0.2:9, which nothing listens on: unrestricted, the kernel refuses at once; held, the SYN is dropped, seen as EPERM or a timeout, and no packet ever leaves the host) and adds a tag
+to the `applied:` line: `harness-egress=enforced` when the canary is
+dropped, `harness-egress=UNENFORCED:<reason>` when it is refused or connects, or for anything
+else (including no `systemd-run`), and `harness-egress=UNRESOLVED:<name>` per
+unresolved name. The probe never refuses the harness unit; the node agent
+reports the state and refuses the kinds that need enforcement. A teardown
+removes the drop-in and the directory.
+
 ## The helper image
 
 Every host operation the agent performs — create the models dir, chown it,
@@ -1418,6 +1452,31 @@ first need them. What provision *must* guarantee is the other end — that the
 controller has **exported a tar** for the node's release ref, which is what
 the `default_sync_images` fix above is for. The failure was never "the node
 could not receive it"; it was "nobody offered it".
+
+## Rehearsing the container egress filter (plan only)
+
+`noo-hostd egress-filter plan [--observe 30m] [--json]` is the read-only half of
+a host egress filter that would keep noomesh containers off the internet
+except the few that do work you ask for (`noo-gateway`, `noo-worker`,
+`noo-worker-extra`, `noo-trellion`, `noo-browser`). It installs nothing. It
+measures this node's own noomesh Docker networks and firewall, then prints the
+exact rules a later step would add: one chain `NOO-EGRESS` (RETURN for the
+egress-class containers, RETURN for private and local destinations, DROP per
+noomesh subnet, never an ACCEPT) and one `DOCKER-USER` jump added only when
+absent, or the `inet noomesh` nftables equivalent when Docker uses nftables.
+It says "not applicable" on Docker Desktop, rootless Docker, and a node with
+no noomesh containers, and "could not measure" where a tool is missing or
+needs root, rather than reading an unmeasured thing as nothing to do.
+
+With `--observe` (root and conntrack-tools) it watches the connection tracker
+and lists every flow from a noomesh subnet to a non-private address as
+"would pass (egress class)", "WOULD DROP" or "WOULD DROP (unattributed)", with
+bytes each way. Its one host change is `net.netfilter.nf_conntrack_acct`, set
+to 1 for the run and restored when it ends (Ctrl-C, error or panic; a
+SIGKILL cannot be caught, so read the value back if you kill it that hard).
+Every command it runs goes through an allow-list that refuses any firewall or
+Docker write before it executes. It does no name lookups; use
+`docs/security/egress-capture.sh` for hostnames.
 
 ## What is still root
 

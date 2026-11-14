@@ -18,7 +18,8 @@
 //!   - `--json` prints the gateway's JSON to stdout, nothing else.
 //!   - Errors go to stderr — as JSON (`{"error","code","hint"}`) in json mode.
 //!   - Exit codes: 0 ok, 1 generic, 2 usage, 3 gateway unreachable,
-//!     4 auth failed, 5 gateway returned an error status.
+//!     4 auth failed, 5 gateway returned an error status,
+//!     6 stopped for a decision (it will not decide for you; the command to run is printed).
 //!
 //! Environment parity with `noomesh/cli_utils.py`: loads the repo `.env`
 //! (already-exported vars win) and resolves the gateway URL the same way.
@@ -57,6 +58,7 @@ mod catalog;
 mod child_stdin;
 mod commands;
 mod credentials;
+mod docker_group;
 #[cfg(test)]
 mod config_readers;
 mod entitlement;
@@ -66,6 +68,7 @@ mod harness_profiles;
 mod model_set;
 mod registry;
 mod release_fetch;
+mod netns_unit;
 mod release_sig;
 mod envfile;
 #[cfg(test)]
@@ -80,6 +83,7 @@ mod output;
 // The declared one-shot compose services (i64a): `stack status` and the roll summary.
 mod oneshots;
 mod pki;
+mod private_tmp;
 mod role;
 mod shell_completion;
 #[cfg(test)]
@@ -311,6 +315,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["cluster", "workloads", "place"], commands::cluster_workloads_place),
     (&["cluster", "workloads", "show"], commands::cluster_workloads_show),
     (&["cluster", "workloads", "unplace"], commands::cluster_workloads_unplace),
+    (&["cluster", "workloads", "retry"], commands::cluster_workloads_retry),
     (&["cluster", "workloads"], commands::cluster_workloads),
     // A node's harness profile: resolved per field (override > measured >
     // tier default), its overrides, and its chat-model bench.
@@ -613,6 +618,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["security", "release-sign"], commands::release_sign),
     (&["security", "release-verify"], commands::release_verify),
     (&["security", "addon-lock", "sign"], commands::security_addon_lock_sign),
+    (&["security", "addon-lock", "publish"], commands::security_addon_lock_publish),
     (&["security", "addon-lock", "verify"], commands::security_addon_lock_verify),
     (&["security", "secrets", "audit"], commands::secrets_audit),
     (&["security", "secrets", "tidy"], commands::secrets_tidy),
@@ -773,9 +779,10 @@ const NATIVE: &[(&[&str], Handler)] = &[
 /// (`scripts/lib-bind-sources.sh`) — see `commands::bind_sources`.
 ///
 /// Also hidden: vendor/CI-only verbs a customer never runs (`security
-/// entitlement keygen|issue`, `security release-sign`, `security addon-lock
-/// sign`), and `security pki
+/// entitlement keygen|issue`, `security release-sign`), and `security pki
 /// rotate`, a pure alias of `security pki issue` (same certificate call).
+/// `security addon-lock sign|publish` are NOT hidden: an outside add-on
+/// developer signs and publishes their own add-on's lock with them.
 /// All still dispatch and answer `--help`.
 const HIDDEN_NATIVE: &[&[&str]] = &[
     &["config", "launch-render"],
@@ -807,7 +814,6 @@ const HIDDEN_NATIVE: &[&[&str]] = &[
     &["security", "entitlement", "keygen"],
     &["security", "entitlement", "issue"],
     &["security", "release-sign"],
-    &["security", "addon-lock", "sign"],
     &["security", "pki", "rotate"],
 ];
 
@@ -1228,7 +1234,7 @@ const GROUP_DESC: &[(&str, &str)] = &[
     ("usage", "Token-usage summary"),
     ("bundle", "Signed bundle inspection"),
     ("health", "Gateway health probe"),
-    ("offboard", "Leave the fleet: stop the agent, remove enrollment state (confirms)"),
+    ("offboard", "Tear a standalone controller down to bare machine prep (confirms each step)"),
     ("systems", "Enable/disable optional systems (mints their secrets into sops)"),
     ("upgrade", "Self-update the CLI; --stack/--nodes/--controller roll the rest"),
     ("addons", "Which add-ons this install runs — the `addons:` map, without opening the file"),
@@ -2117,11 +2123,10 @@ const SOURCES: &[(&str, &str)] = &[
     /// off the customer's help and tab-completion; their usage rows say so.
     #[test]
     fn vendor_only_verbs_and_the_pki_rotate_alias_are_hidden_but_still_dispatch() {
-        let hidden: [&[&str]; 5] = [
+        let hidden: [&[&str]; 4] = [
             &["security", "entitlement", "keygen"],
             &["security", "entitlement", "issue"],
             &["security", "release-sign"],
-            &["security", "addon-lock", "sign"],
             &["security", "pki", "rotate"],
         ];
         for h in hidden {
@@ -2134,6 +2139,27 @@ const SOURCES: &[(&str, &str)] = &[
             assert!(!is_hidden_native(shown), "{shown:?} is customer-facing");
             assert!(NATIVE.iter().any(|(w, _)| *w == shown), "{shown:?}");
         }
+    }
+
+    /// An outside add-on developer signs and publishes their own lock: both
+    /// verbs are in help and completion, with usage rows that are not
+    /// "Hidden:", and sign's row says where the seed lives.
+    #[test]
+    fn addon_lock_sign_and_publish_are_offered_to_add_on_developers() {
+        for w in [&["security", "addon-lock", "sign"][..], &["security", "addon-lock", "publish"], &["security", "addon-lock", "verify"]] {
+            assert!(!is_hidden_native(w), "{w:?} must be offered");
+            assert!(NATIVE.iter().any(|(e, _)| *e == w), "{w:?} must dispatch");
+            let (_, about) = usage::lookup(w).expect("usage row");
+            assert!(!about.starts_with("Hidden:"), "{w:?}: {about}");
+        }
+        let (syntax, about) = usage::lookup(&["security", "addon-lock", "sign"]).unwrap();
+        assert!(syntax.contains("--seed-file <path|->") && about.contains("outside") && about.contains("0600"), "{syntax} / {about}");
+        let (syntax, _) = usage::lookup(&["security", "addon-lock", "publish"]).unwrap();
+        for flag in ["--registry <root>", "[--token-file <path|->]", "[--dry-run]"] {
+            assert!(syntax.contains(flag), "{flag}: {syntax}");
+        }
+        let subs = usage::subcommands_under(&["security", "addon-lock"]);
+        assert!(subs.contains(&"sign") && subs.contains(&"publish"), "{subs:?}");
     }
 
     /// `a` is a prefix of `b` iff `b` starts with all of `a`'s words in order.
@@ -2562,5 +2588,18 @@ const SOURCES: &[(&str, &str)] = &[
         for (words, _) in NATIVE {
             let _ = handler_for(words);
         }
+    }
+}
+
+#[cfg(test)]
+mod offboard_tagline_tests {
+    /// i677a 4d: offboard tears a standalone CONTROLLER down; "leave the
+    /// fleet" is what a worker's `teardown-node` does, and the README carried
+    /// both descriptions at once.
+    #[test]
+    fn offboard_is_described_as_a_controller_teardown() {
+        let d = super::GROUP_DESC.iter().find(|(n, _)| *n == "offboard").map(|(_, d)| *d).unwrap();
+        assert!(d.contains("standalone controller"), "{d}");
+        assert!(!d.to_lowercase().contains("leave the fleet"), "{d}");
     }
 }

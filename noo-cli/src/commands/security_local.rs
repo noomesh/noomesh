@@ -2124,10 +2124,11 @@ pub(crate) fn deliver_signed_bundle(
 /// step). Used by rotate-all; rotate-ca drives deliver_signed_bundle with
 /// its own transition bundles.
 fn deliver_node_certs(g: &Globals, ca: &ClusterCa, node: &str) -> CertDelivery {
-    let work = std::env::temp_dir().join(format!("noo-certs-{}-{}", node, std::process::id()));
-    if std::fs::create_dir_all(&work).is_err() {
-        return CertDelivery::Failed("could not create a work dir".into());
-    }
+    // i689: a fresh 0700 dir (mkdtemp); what is staged here is CA-signed.
+    let work = match crate::private_tmp::dir(&format!("noo-certs-{node}")) {
+        Ok(d) => d,
+        Err(e) => return CertDelivery::Failed(format!("could not create a work dir: {e}")),
+    };
     let expected = cert_not_after_unix(&ca.dir.join("nodes").join(node).join("node.crt"));
     let out = match build_signed_cert_bundle(ca, node, &work, node_takes_leaf_kinds(g, node)) {
         Ok(bundle) => deliver_signed_bundle(g, node, &bundle, &work, expected),
@@ -2158,17 +2159,46 @@ fn cert_node_name(cert_name: &str) -> Option<&str> {
 
 /// Non-fatal interactive y/N (stderr prompt, default No). False on any
 /// non-TTY/read trouble — optional offers must never block a pipe.
-fn ask_yn(prompt: &str) -> bool {
-    use std::io::{BufRead as _, Write as _};
-    if unsafe { libc::isatty(0) } != 1 {
-        return false;
-    }
-    eprint!("{prompt} [y/N]: ");
-    let _ = std::io::stderr().flush();
-    let mut line = String::new();
-    let _ = std::io::stdin().lock().read_line(&mut line);
-    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+/// What teardown-node says when it keeps the node's tailnet device record
+/// (i677a 3b). Without a TTY, `-y` or not, the answer is No: deleting a
+/// device record is outward and hard to undo, so it is never assumed. The
+/// line says what that costs and the one flag that does it next time.
+/// What teardown does with the node's tailnet device record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TailnetRecord {
+    Delete,
+    /// The node has not collected its teardown: it still needs the tailnet.
+    KeepNotDismantled,
+    /// This box's own device: the controller's tailnet identity.
+    KeepSelf,
+    /// `--keep-tailnet-record`.
+    KeepRequested,
 }
+
+/// Teardown is a full cleanup (operator, 2026-11-12): the record is deleted
+/// once the dismantle is confirmed, attended or not. Pure.
+pub(crate) fn tailnet_record_action(dismantled: bool, self_node: bool, keep_record: bool) -> TailnetRecord {
+    if self_node {
+        TailnetRecord::KeepSelf
+    } else if !dismantled {
+        TailnetRecord::KeepNotDismantled
+    } else if keep_record {
+        TailnetRecord::KeepRequested
+    } else {
+        TailnetRecord::Delete
+    }
+}
+
+/// The line when the record is kept, saying why and what it costs.
+pub(crate) fn tailnet_kept_note(name: &str, why: TailnetRecord) -> String {
+    match why {
+        TailnetRecord::KeepNotDismantled => "device record kept in the tailnet: the teardown was not confirmed, and the node needs the tailnet to collect it".to_string(),
+        TailnetRecord::KeepSelf => "device record kept: this box's tailnet identity is the controller's, not the node's".to_string(),
+        TailnetRecord::KeepRequested => format!("device record KEPT in the tailnet (--keep-tailnet-record): the next enroll registers as {name}-1"),
+        TailnetRecord::Delete => String::new(),
+    }
+}
+
 
 /// Finding #108 (live, first CA rotation): the controller's SELF-AGENT
 /// reads its trust plane from /etc/noo/pki — the same node-shaped anchor
@@ -2295,14 +2325,45 @@ pub(crate) fn delete_tailnet_device(g: &Globals, name: &str, ip: Option<&str>) -
     if let Some(ip) = ip.filter(|s| !s.is_empty()) {
         body["ip"] = serde_json::Value::String(ip.to_string());
     }
-    match crate::http::post_json_try(g, "/api/cluster/delete-tailscale-device", &body, true, 30) {
+    tailnet_delete_line(crate::http::post_json_try(g, "/api/cluster/delete-tailscale-device", &body, true, 30), name)
+}
+
+/// The teardown summary's tailnet line for the gateway's answer. Three
+/// different truths: removed (or already gone); nothing to remove because
+/// this controller holds no Tailscale credential (it put no device on a
+/// tailnet); and NOT removed, with the cause and the console as the way on,
+/// when a credential failed or the delete errored. rc.6 rehearsal: a
+/// controller with no credential got the last one, telling the operator to
+/// delete a device that never existed.
+pub(crate) fn tailnet_delete_line<E: std::fmt::Display>(sent: Result<serde_json::Value, E>, name: &str) -> String {
+    match sent {
         Ok(v) => match v["status"].as_str().unwrap_or("") {
             "deleted" => format!("device removed from tailnet ({})",
                 v["device_name"].as_str().unwrap_or(name)),
             "not_found" => "device already gone from tailnet".to_string(),
+            "no_credential" => "nothing to remove — this controller holds no Tailscale credential, \
+                                so it put no device on a tailnet".to_string(),
             _ => "device deletion returned an unexpected status".to_string(),
         },
         Err(e) => format!("NOT removed ({e}) — delete it in the Tailscale admin console"),
+    }
+}
+
+#[cfg(test)]
+mod tailnet_delete_line_tests {
+    use super::tailnet_delete_line;
+    use serde_json::json;
+
+    #[test]
+    fn no_credential_is_nothing_to_remove_and_a_failure_still_sends_the_operator_to_the_console() {
+        let none = tailnet_delete_line::<String>(Ok(json!({"status": "no_credential"})), "rhx-node2");
+        assert!(none.starts_with("nothing to remove — this controller holds no Tailscale credential"), "{none}");
+        assert!(!none.contains("NOT removed") && !none.contains("admin console"), "{none}");
+        let failed = tailnet_delete_line(Err("internal error (ref 2489b5b6)"), "rhx-node2");
+        assert_eq!(failed, "NOT removed (internal error (ref 2489b5b6)) — delete it in the Tailscale admin console");
+        assert_eq!(tailnet_delete_line::<String>(Ok(json!({"status": "not_found"})), "n"), "device already gone from tailnet");
+        assert_eq!(tailnet_delete_line::<String>(Ok(json!({"status": "deleted", "device_name": "n.ts.net"})), "n"),
+            "device removed from tailnet (n.ts.net)");
     }
 }
 
@@ -2323,9 +2384,11 @@ pub(crate) struct TeardownArgs {
     pub yes: bool,
     pub purge_data: bool,
     pub purge_ts: bool,
+    /// Keep the node's tailnet device record (the default deletes it).
+    pub keep_record: bool,
 }
 
-/// `[NODE | --all] [-y|--yes] [--purge-data] [--purge-tailscale] [--factory]`;
+/// `[NODE | --all] [-y|--yes] [--purge-data] [--purge-tailscale] [--factory] [--keep-tailnet-record]`;
 /// `--all` with a node is refused.
 pub(crate) fn parse_teardown_node(args: &[String]) -> Result<TeardownArgs, Unhandled> {
     crate::args::refuse_lone_dash(args)?;
@@ -2348,15 +2411,19 @@ pub(crate) fn parse_teardown_node_with(a: &mut Args) -> Result<TeardownArgs, Arg
         purge_data = true;
         purge_ts = true;
     }
+    // Teardown is a full cleanup (operator, 2026-11-12): the node's tailnet
+    // device record is deleted once the dismantle is confirmed, attended or
+    // not. This keeps it, for whoever wants the name kept.
+    let keep_record = a.flag(&["--keep-tailnet-record"]);
     let node = a.maybe_one("<node>")?;
     if all && node.is_some() {
         return Err(ArgError::new("give a node or --all, not both"));
     }
-    Ok(TeardownArgs { node, all, yes, purge_data, purge_ts })
+    Ok(TeardownArgs { node, all, yes, purge_data, purge_ts, keep_record })
 }
 
 pub fn cluster_teardown_node(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let TeardownArgs { node, all, yes, purge_data, purge_ts } = parse_teardown_node(args)?;
+    let TeardownArgs { node, all, yes, purge_data, purge_ts, keep_record } = parse_teardown_node(args)?;
     if all {
         let me = crate::role::detect().node.map(|n| n.name);
         let inventory = fleet_nodes_from_registry(g);
@@ -2370,17 +2437,11 @@ pub fn cluster_teardown_node(g: &Globals, args: &[String]) -> Result<i32, Unhand
         }
         let names: Vec<&str> = targets.iter().map(|(n, _, _)| n.as_str()).collect();
         super::confirm_destructive(g, yes, "tear down (dismantle the agent on) ALL of", &names.join(", "));
-        // One tailnet answer for the whole fleet, asked up front so the loop
-        // never blocks between nodes; --purge-tailscale makes it yes.
-        let ts_answer = if purge_ts || g.json { Some(purge_ts) } else {
-            Some(ask_yn("Also delete each node's device record from the tailnet once it is confirmed gone? \
-                         (otherwise the next enroll re-registers as <name>-1, -2, …)"))
-        };
         let mut worst = 0;
         let mut rows: Vec<(String, String)> = Vec::new();
         for (name, host, _) in &targets {
             println!("{}", ui::section(&format!("Teardown  {name}")));
-            let rc = teardown_one(g, name, host, purge_data, purge_ts, ts_answer)?;
+            let rc = teardown_one(g, name, host, purge_data, purge_ts, keep_record)?;
             worst = worst.max(rc);
             rows.push((name.clone(), if rc == 0 { "dismantled".to_string() } else { ui::warn("still alive — see above") }));
         }
@@ -2407,7 +2468,7 @@ pub fn cluster_teardown_node(g: &Globals, args: &[String]) -> Result<i32, Unhand
             &format!("'{node}' is not an enrolled node ({hint})"), None);
     };
     super::confirm_destructive(g, yes, "tear down (dismantle the agent on)", &name);
-    teardown_one(g, &name, &host, purge_data, purge_ts, None)
+    teardown_one(g, &name, &host, purge_data, purge_ts, keep_record)
 }
 
 /// The node's `capabilities.os` as its agent last reported it (linux /
@@ -2444,14 +2505,15 @@ fn dismantle_hint(name: &str, os: Option<&str>) -> Vec<(String, String)> {
 }
 
 /// One node's teardown: stage on the rail, wait for the fetch, verify the
-/// heartbeats stop, then the controller-side cleanup. `ts_answer` is the
-/// tailnet-device decision when the caller already has one (`--all`).
-fn teardown_one(g: &Globals, name: &str, host: &str, purge_data: bool, purge_ts: bool, ts_answer: Option<bool>) -> Result<i32, Unhandled> {
+/// heartbeats stop, then the controller-side cleanup, which deletes the
+/// node's tailnet device record unless `keep_record` ([`tailnet_record_action`]).
+fn teardown_one(g: &Globals, name: &str, host: &str, purge_data: bool, purge_ts: bool, keep_record: bool) -> Result<i32, Unhandled> {
     let name = name.to_string();
     let host = host.to_string();
     let os = node_os(g, &name);
     let mut purge_ts = purge_ts;
-    if crate::role::is_self_node(&name) {
+    let self_node = crate::role::is_self_node(&name);
+    if self_node {
         ui::warned(&format!("'{name}' is THIS box: the agent you are dismantling is the one under your feet"));
         if purge_ts {
             // This device's tailnet identity is the CONTROLLER's
@@ -2462,8 +2524,8 @@ fn teardown_one(g: &Globals, name: &str, host: &str, purge_data: bool, purge_ts:
     }
 
     let ca = crate::pki::ClusterCa::new(pki_dir());
-    let work = std::env::temp_dir().join(format!("noo-teardown-{name}-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&work);
+    let work = crate::private_tmp::dir(&format!("noo-teardown-{name}"))
+        .unwrap_or_else(|e| crate::output::fail(g.json, crate::output::ExitCode::Generic, "bundle_failed", &e, None));
     let mut directives: Vec<&str> = Vec::new();
     if purge_data { directives.push("purge-data"); }
     if purge_ts { directives.push("purge-tailscale"); }
@@ -2612,36 +2674,23 @@ fn teardown_one(g: &Globals, name: &str, host: &str, purge_data: bool, purge_ts:
 
     // Delete the node's tailnet device via the gateway (which owns the
     // Tailscale credential — OAuth client preferred, personal key fallback;
-    // the CLI never sees it). Gated on --purge-tailscale/--factory: a plain
-    // teardown deliberately keeps the node's tailscale footprint. The node's
-    // inventory host IS its 100.x tailnet IP, which is the stable match key
-    // (the PAI name is adopted and decoupled from the tailscale hostname).
-    let ts_device: String = if purge_ts && !dismantled {
-        "device KEPT — the node has not collected its teardown yet and still needs the \
-         tailnet to do so; remove it in the console once the node is gone".to_string()
-    } else if purge_ts {
-        // Resolve the device OFF THE TAILNET'S OWN KNOWLEDGE (finding #52c):
-        // the recorded enrollment address can be the docker bridge (see
-        // #52b), but the AGENT registered with its true tailnet IP — the
-        // cluster table is the reliable source. The recorded host stays as
-        // a fallback candidate; the node NAME rides along for hostname
-        // matching (name is adopted, hostname may differ).
-        let ip = registered_tailnet_ip(g, &name).unwrap_or_else(|| host.clone());
-        delete_tailnet_device(g, &name, Some(&ip))
-    } else if dismantled && !g.json && match ts_answer {
-        Some(a) => a,
-        None => ask_yn(&format!(
-            "Also delete {name}'s device record from the tailnet? (offboard offers the same; \
-             otherwise the next enroll re-registers as {name}-1, -2, …)")),
-    } {
-        // Finding #94: offboard OFFERS device deletion, teardown silently
-        // required --purge-tailscale — the operator noticed the asymmetry
-        // on the first verified dismantle. Same resolution path as the
-        // purge branch above.
-        let ip = registered_tailnet_ip(g, &name).unwrap_or_else(|| host.clone());
-        delete_tailnet_device(g, &name, Some(&ip))
-    } else {
-        "device left in tailnet (declined / non-interactive; --purge-tailscale forces it)".to_string()
+    // the CLI never sees it). Teardown is a full cleanup (operator,
+    // 2026-11-12): deleted by default once the dismantle is confirmed,
+    // attended or not; --keep-tailnet-record keeps it. Never this box's own
+    // device (the controller's identity), never before the node has
+    // collected its teardown (it needs the tailnet to do so).
+    let ts_device: String = match tailnet_record_action(dismantled, self_node, keep_record) {
+        TailnetRecord::Delete => {
+            // Resolve the device OFF THE TAILNET'S OWN KNOWLEDGE (finding
+            // #52c): the recorded enrollment address can be the docker
+            // bridge (see #52b), but the AGENT registered with its true
+            // tailnet IP — the cluster table is the reliable source. The
+            // recorded host stays as a fallback candidate; the node NAME
+            // rides along for hostname matching.
+            let ip = registered_tailnet_ip(g, &name).unwrap_or_else(|| host.clone());
+            delete_tailnet_device(g, &name, Some(&ip))
+        }
+        keep => tailnet_kept_note(&name, keep),
     };
 
     // Forget the node controller-side (finding #76): DB row + mesh KV, via
@@ -2815,9 +2864,7 @@ pub fn pki_rotate_ca(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             }
             next.reissue_in_place(&next_node_dir.join("node.crt"), leaf_days, &crate::pki::NodeRole::Worker)
                 .map_err(|e| format!("re-issue under next CA: {e}"))?;
-            let work = std::env::temp_dir()
-                .join(format!("noo-rotate-ca-{}-{}", node, std::process::id()));
-            std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+            let work = crate::private_tmp::dir(&format!("noo-rotate-ca-{node}"))?;
             let files: Vec<(&str, Vec<u8>)> = vec![
                 ("ca.crt", transition_anchor.clone().into_bytes()),
                 ("node.crt", std::fs::read(next_node_dir.join("node.crt")).map_err(|e| e.to_string())?),
@@ -3007,8 +3054,8 @@ fn rotate_ca_retire(g: &Globals, ca: &ClusterCa, yes: bool) -> Result<i32, Unhan
     };
     // Every leaf must verify against the NEW CA alone before the old trust
     // goes away — a straggler would go dark the moment its anchor narrows.
-    let work = std::env::temp_dir().join(format!("noo-retire-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&work);
+    let work = crate::private_tmp::dir("noo-retire")
+        .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "retire_incomplete", &e, None));
     let new_only_path = work.join("ca-new-only.crt");
     let _ = std::fs::write(&new_only_path, &new_only);
     let mut stragglers: Vec<String> = Vec::new();
@@ -3928,12 +3975,13 @@ pub fn pki_rotate_signing_key(g: &Globals, args: &[String]) -> Result<i32, Unhan
             println!("{}", ui::item(node));
             println!("{}", ui::sub(&ui::status_line(Glyph::Step, "CA-signed rollover bundle (signing-pub only)")));
         }
-        let work = std::env::temp_dir().join(format!("noo-signkey-{node}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&work);
-        if std::fs::create_dir_all(&work).is_err() {
-            failed.push(node.clone());
-            continue;
-        }
+        let work = match crate::private_tmp::dir(&format!("noo-signkey-{node}")) {
+            Ok(d) => d,
+            Err(_) => {
+                failed.push(node.clone());
+                continue;
+            }
+        };
         // The key and nothing else: the CA delivers a public
         // key, never code — not even the applier. Every applier on the
         // fleet since #119 knows the `signing-pub` kind.
@@ -6329,7 +6377,7 @@ mod parse_pin_tests {
     }
 
     fn td(node: Option<&str>, all: bool, yes: bool, purge_data: bool, purge_ts: bool) -> Option<TeardownArgs> {
-        Some(TeardownArgs { node: node.map(str::to_string), all, yes, purge_data, purge_ts })
+        Some(TeardownArgs { node: node.map(str::to_string), all, yes, purge_data, purge_ts, keep_record: false })
     }
 
     #[test]
@@ -6419,5 +6467,41 @@ mod parse_pin_tests {
             assert_eq!(&parse_untrust_ca(&argv), want, "untrust-ca {args:?}");
         }
         assert_eq!(ExitCode::Usage as i32, 2, "the path refusal exits 2, like the usage error");
+    }
+}
+
+#[cfg(test)]
+mod tailnet_record_tests {
+    use super::*;
+
+    /// Teardown is a full cleanup (operator, 2026-11-12): a confirmed
+    /// dismantle deletes the record with no question asked; only the flag,
+    /// this box's own device, or an uncollected teardown keeps it.
+    #[test]
+    fn a_confirmed_teardown_deletes_the_record_unless_asked_to_keep_it() {
+        assert_eq!(tailnet_record_action(true, false, false), TailnetRecord::Delete);
+        assert_eq!(tailnet_record_action(true, false, true), TailnetRecord::KeepRequested);
+        assert_eq!(tailnet_record_action(false, false, false), TailnetRecord::KeepNotDismantled);
+        assert_eq!(tailnet_record_action(true, true, false), TailnetRecord::KeepSelf);
+        assert!(tailnet_kept_note("gpu-2", TailnetRecord::KeepRequested).contains("gpu-2-1"));
+    }
+
+    /// No prompt is left in teardown: attended or not, the answer is the
+    /// same; and the decision is the tested one.
+    #[test]
+    fn teardown_asks_nothing_and_uses_the_tested_decision() {
+        let own = crate::test_src::own_code(include_str!("security_local.rs"));
+        assert!(!own.contains("fn ask_yn("), "the tailnet prompt is back");
+        let one = crate::test_src::fn_body(&own, "fn teardown_one(");
+        assert!(one.contains("match tailnet_record_action(dismantled, self_node, keep_record) {"), "{one}");
+    }
+
+    #[test]
+    fn the_keep_flag_parses() {
+        let a: Vec<String> = ["n1", "--keep-tailnet-record", "-y"].iter().map(|s| s.to_string()).collect();
+        let t = parse_teardown_node(&a).unwrap_or_else(|_| panic!("parse"));
+        assert!(t.keep_record && t.yes && t.node.as_deref() == Some("n1"));
+        let b: Vec<String> = ["n1"].iter().map(|s| s.to_string()).collect();
+        assert!(!parse_teardown_node(&b).unwrap_or_else(|_| panic!("parse")).keep_record, "the default deletes it");
     }
 }

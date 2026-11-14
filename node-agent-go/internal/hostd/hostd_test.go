@@ -884,6 +884,23 @@ func TestBootRestoreWritesFilesThenStartsOnlyBoundContainers(t *testing.T) {
 	}
 }
 
+// rc.2 install matrix: dockerd's restore can start a container that joins
+// another's network namespace before its door (exit 128, never retried). On
+// a host without systemd boot-restore is the one boot-time pass, so it runs
+// the same script noo-netns-restore.service runs, after its own starts.
+func TestBootRestoreRunsTheNamespaceRestoreAfterItsStarts(t *testing.T) {
+	e, fr := testEngine(t)
+	e.BootRestore(context.Background())
+	got := strings.Join(fr.joined(), "\n")
+	call := strings.Index(got, `bash "$root/scripts/noo-netns-restore.sh"`)
+	if call < 0 {
+		t.Fatalf("boot-restore does not run the namespace restore:\n%s", got)
+	}
+	if !(strings.Index(got, "docker start") < call && call < strings.Index(got, "wrote the secret files and started")) {
+		t.Fatalf("the namespace restore must run after the starts and before the report:\n%s", got)
+	}
+}
+
 // i301 a: the script's own account of what is still down must reach the log.
 // A success with a warning on stderr logs both; exit 4 (done, but a core
 // service is still down) logs a WARN and is not retried.

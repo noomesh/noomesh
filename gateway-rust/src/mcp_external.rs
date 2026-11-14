@@ -191,6 +191,10 @@ async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<Caller, R
         .await
         .map_err(|u| rpc_http_error(StatusCode::SERVICE_UNAVAILABLE, &u.message()))?
         .ok_or_else(|| rpc_http_error(StatusCode::FORBIDDEN, "unknown or revoked key"))?;
+    // The door checks its own key (the auth layer lets /mcp/* through), so
+    // it tells the request trace who called: without this the door's own
+    // call left no trace row, and its overhead could not be measured.
+    crate::request_trace::note_principal(&crate::bus_principal::for_consumer(&consumer));
 
     let redis = state.redis.as_ref();
     admit(consumer, |name, limit| async move {
@@ -318,6 +322,27 @@ pub(crate) fn mint_caller_jwt(
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_secs();
+    let claims = caller_claims(user, role, user_scopes, consumer, session_label, now);
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .ok()
+}
+
+/// The claims [`mint_caller_jwt`] signs, at `now`: the door's caller token,
+/// exactly. Split out so a route's own tests can hold a real door token's
+/// claims without a signing secret (conversation import's who-may-publish
+/// rule is tested against these, not a hand-built requester).
+pub(crate) fn caller_claims(
+    user: &str,
+    role: crate::auth::Role,
+    user_scopes: &[String],
+    consumer: &str,
+    session_label: Option<&str>,
+    now: u64,
+) -> Value {
     let mut scopes: Vec<String> =
         role.legacy_scopes().iter().map(|s| s.to_string()).collect();
     for s in user_scopes {
@@ -349,7 +374,7 @@ pub(crate) fn mint_caller_jwt(
             user.to_string()
         }
     };
-    let claims = json!({
+    json!({
         "sub": sub,
         "act": { "sub": format!("key:{consumer}"), "iss_user": user },
         "role": role.as_str(),
@@ -365,13 +390,7 @@ pub(crate) fn mint_caller_jwt(
         // names the key that actually authenticated, which is the only
         // thing about the calling software the gateway can prove.
         "harness": format!("mcp-external:{consumer}"),
-    });
-    encode(
-        &Header::new(Algorithm::HS256),
-        &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
-    )
-    .ok()
+    })
 }
 
 // ─────────────────────────── request building ───────────────────────────
@@ -625,24 +644,12 @@ pub(crate) async fn execute_spec(
     // request this client makes, and the base URL is operator-settable via
     // NOO_SELF_URL. A misconfiguration pointing off-host would then be
     // silently unauthenticated rather than a loud TLS error.
-    let mut builder =
-        crate::tls::client_builder().timeout(std::time::Duration::from_secs(spec.timeout_secs));
-    if base.starts_with("https://") {
-        // No cluster CA configured — a public cert (tailscale serve) or
-        // plain dev. Leave the system roots in place rather than weakening
-        // anything.
-        if let Some(ca) = crate::tls::ca_path() {
-            let ca = ca.display().to_string();
-            match std::fs::read(&ca) {
-                Ok(pem) => match crate::tls::certificate_from_pem(&pem) {
-                    Ok(cert) => builder = builder.tls_certs_merge([cert]),
-                    Err(e) => return Err(format!("NOO_TLS_CA at {ca} is not valid PEM: {e}")),
-                },
-                Err(e) => return Err(format!("cannot read NOO_TLS_CA at {ca}: {e}")),
-            }
-        }
-    }
-    let client = builder.build().map_err(|e| format!("http client: {e}"))?;
+    // The gateway's ONE shared self-call client (`tls::loopback_client`,
+    // CA merged once, verifying): a new client per tool call meant a new TCP
+    // + TLS handshake to 127.0.0.1 and a CA file read on every call (speed
+    // review 2026-11-11). Its 30 s default is overridden per request below
+    // by the tool's own timeout.
+    let client = crate::tls::loopback_client();
 
     let req = match spec.method.as_str() {
         "GET" => client.get(&url).query(&rest),
@@ -650,7 +657,14 @@ pub(crate) async fn execute_spec(
         "PUT" => client.put(&url).json(&rest),
         _ => client.post(&url).json(&rest),
     }
+    .timeout(std::time::Duration::from_secs(spec.timeout_secs))
     .header(&auth_header.0, &auth_header.1);
+    // The inner route's trace continues the door call's: one trace, so the
+    // door's own cost is the outer row minus the inner one.
+    let req = match crate::request_trace::current_traceparent() {
+        Some(tp) => req.header("traceparent", tp),
+        None => req,
+    };
 
     let started = std::time::Instant::now();
     let resp = req.send().await.map_err(|e| {
@@ -801,8 +815,8 @@ async fn handle_rpc(state: &Arc<AppState>, headers: &HeaderMap, body: &[u8]) -> 
             // The client's own name for itself, display-only.
             let client_name = req.params.pointer("/clientInfo/name").and_then(Value::as_str);
             match crate::mcp_session::open(&state.db, &caller.user, &caller.consumer, client_name).await {
-                Some((id, _)) => crate::mcp_session::attach(env.initialize(SERVER_NAME), &id),
-                None => env.initialize(SERVER_NAME),
+                Some((id, _)) => crate::mcp_session::attach(env.initialize(SERVER_NAME, &instructions()), &id),
+                None => env.initialize(SERVER_NAME, &instructions()),
             }
         }
 
@@ -811,10 +825,7 @@ async fn handle_rpc(state: &Arc<AppState>, headers: &HeaderMap, body: &[u8]) -> 
 
         "ping" => env.ping(),
 
-        "server/discover" => env.discover(
-            SERVER_NAME,
-            "noomesh user door: tools run as the account this key is bound to.",
-        ),
+        "server/discover" => env.discover(SERVER_NAME, &instructions()),
 
         "tools/list" => {
             let mut tools = tools_list();
@@ -858,6 +869,24 @@ async fn handle_rpc(state: &Arc<AppState>, headers: &HeaderMap, body: &[u8]) -> 
                 return rpc_error(req.id.clone(), -32602, &format!("unknown tool: {name}"));
             }
 
+            // The agent mailbox (0.6.24): `as` names this call's mailbox;
+            // `noo_agent_name` registers one. No connection state.
+            let (args, mailbox, note) = match crate::agent_mailbox::door_step(
+                &state.db, &caller.user, &caller.consumer, headers, session.as_deref(), name, args,
+            )
+            .await
+            {
+                crate::agent_mailbox::DoorStep::Run { args, label, note } => (args, label, note),
+                crate::agent_mailbox::DoorStep::Done(r) => {
+                    let (text, is_error) = match r {
+                        Ok(v) => (serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()), false),
+                        Err(e) => (e, true),
+                    };
+                    return env.result(json!({ "content": [{"type": "text", "text": text}], "isError": is_error }), SERVER_NAME);
+                }
+            };
+            let args = &args;
+
             tracing::info!(
                 consumer = %caller.consumer, user = %caller.user, tool = %name, era = env.era.as_str(),
                 "mcp_external_tool_call"
@@ -869,15 +898,16 @@ async fn handle_rpc(state: &Arc<AppState>, headers: &HeaderMap, body: &[u8]) -> 
             crate::audit::record(
                 &state.db,
                 AuditEvent::new(AuditKind::McpToolCall, &format!("{}:{}", caller.consumer, caller.user), name)
-                    .details(json!({ "door": "user", "consumer": caller.consumer, "user": caller.user, "tool": name, "era": env.era.as_str() })),
+                    .details(json!({ "door": "user", "consumer": caller.consumer, "user": caller.user, "tool": name, "era": env.era.as_str(), "mailbox": mailbox })),
             )
             .await;
 
             let outcome = if task_tool {
                 crate::mcp_user_tasks::call(state, &caller.user, name, args).await
             } else {
-                call_tool(&caller, session.as_deref(), name, args).await
+                call_tool(&caller, mailbox.as_deref(), name, args).await
             };
+            let outcome = outcome.map(|v| crate::agent_mailbox::with_note(v, note));
             match outcome {
                 // Content is the raw gateway JSON, serialised, with no prose
                 // formatting layered on top.
@@ -905,9 +935,75 @@ async fn handle_rpc(state: &Arc<AppState>, headers: &HeaderMap, body: &[u8]) -> 
     }
 }
 
+/// What this door tells every client (`server/discover`, legacy
+/// `initialize`): what it is, then how agent mail works, which a client
+/// with no hook can learn nowhere else.
+fn instructions() -> String {
+    format!("{} {}", "noomesh user door: tools run as the account this key is bound to.", crate::agent_mailbox::MAILBOX_INSTRUCTIONS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A local server that answers 200 and records the peer address of each
+    /// request: the same peer port twice means the same TCP connection.
+    async fn peer_recording_server() -> (String, std::sync::Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>) {
+        use axum::{extract::ConnectInfo, routing::get, Router};
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>> = Default::default();
+        let rec = seen.clone();
+        // `/health`, a documented gateway path: scripts/check-openapi-drift.py
+        // reads every `.route("…")` under gateway-rust/src, test modules
+        // included, and an invented path failed the openapi-drift check.
+        let app = Router::new().route("/health", get(move |ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>| {
+            let rec = rec.clone();
+            async move { rec.lock().unwrap().push(peer); "ok" }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap()
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// Speed review 2026-11-11: every MCP tool call built a new client, so a
+    /// new TCP + TLS handshake to the gateway (lab, N=200 over loopback
+    /// HTTPS: 87.5 ms/call fresh vs 0.84 ms/call shared). One client reused
+    /// keeps one connection; two fresh clients (the old way) do not, which
+    /// is what makes this test able to fail. NOT `tls::loopback_client()`
+    /// itself: it is a process-wide OnceLock, and
+    /// `the_loopback_client_verifies_against_the_cluster_ca` must be the
+    /// first to build it (with its CA set); touching it here broke that test.
+    #[tokio::test]
+    async fn self_calls_reuse_one_connection() {
+        let (base, seen) = peer_recording_server().await;
+        let shared = crate::tls::client_builder().build().unwrap();
+        for _ in 0..2 {
+            shared.get(format!("{base}/health")).send().await.unwrap().text().await.unwrap();
+        }
+        for _ in 0..2 {
+            crate::tls::client_builder().build().unwrap().get(format!("{base}/health")).send().await.unwrap().text().await.unwrap();
+        }
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 4);
+        assert_eq!(seen[0], seen[1], "the shared client reused its connection: {seen:?}");
+        assert_ne!(seen[2], seen[3], "fresh clients open fresh connections (the test can tell): {seen:?}");
+    }
+
+    /// The door uses the shared client, keeps the tool's own timeout per
+    /// request, and builds no client of its own.
+    #[test]
+    fn the_door_uses_the_shared_client_with_the_tools_timeout() {
+        let code = crate::test_src::own_code(include_str!("mcp_external.rs"));
+        let exec = crate::test_src::fn_body(&code, "async fn execute_spec(");
+        assert!(exec.contains("let client = crate::tls::loopback_client();"), "{exec}");
+        assert!(exec.contains(".timeout(std::time::Duration::from_secs(spec.timeout_secs))"), "{exec}");
+        assert!(!exec.contains("client_builder()") && !exec.contains("std::fs::read("), "no per-call client or CA read: {exec}");
+        // No test in this module touches the process-wide client (see above).
+        let tests = &include_str!("mcp_external.rs")[include_str!("mcp_external.rs").find("mod tests {").unwrap()..];
+        assert_eq!(tests.matches(concat!("loopback", "_client().")).count(), 0, "a test used the shared OnceLock client");
+    }
 
     async fn failed_send(url: &str, timeout_ms: u64) -> reqwest::Error {
         reqwest::Client::builder()
@@ -1203,6 +1299,26 @@ mod tests {
         let without = mint_caller_jwt("owner", Role::User, &[], "self:owner", None).unwrap();
         let c = crate::auth::verify_token(&without, "test-secret-mcp-door").unwrap();
         assert_eq!(c.sub, "owner/self-owner", "no session → per-key label, not the bare account");
+    }
+
+    /// 0.6.24: a stated mailbox changes only `sub`. The provenance a
+    /// message records (`harness`, `act`) names the key that authenticated,
+    /// and nothing the caller sends — `as`, a body `harness`, a `from` —
+    /// reaches the signed claims.
+    #[test]
+    fn a_stated_mailbox_changes_the_name_never_the_provenance() {
+        let _guard = env_guard();
+        use crate::auth::Role;
+        std::env::set_var("NOO_JWT_SECRET", "test-secret-mcp-door");
+        let t = mint_caller_jwt("rbwolf", Role::User, &[], "self:rbwolf", Some("claude-general")).unwrap();
+        let c = crate::auth::verify_token(&t, "test-secret-mcp-door").unwrap();
+        assert_eq!(c.sub, "rbwolf/claude-general");
+        assert_eq!(c.act.as_ref().unwrap().sub, "key:self:rbwolf");
+        assert_eq!(c.harness.as_deref(), Some("mcp-external:self:rbwolf"));
+        // The label is the only caller-influenced input, and it is a name
+        // segment: it cannot carry a different account or harness.
+        assert!(crate::agent_mailbox::parse_as("evil/claude-general", "rbwolf").is_err());
+        assert!(crate::agent_mailbox::parse_as("claude-general\",harness\":\"x", "rbwolf").is_err());
     }
 
     #[test]

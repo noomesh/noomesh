@@ -30,7 +30,7 @@ that one. `--standalone` is the explicit override either way.
 
 ```bash
 # the release installer (install.md §1):
-curl -fsSL https://github.com/noomesh/noomesh/releases/download/<noo-cli-tag>/install.sh | sh
+curl -fsSL https://github.com/noomesh/noomesh/releases/download/<noo-cli-tag>/install.sh -o install.sh && sh install.sh
 noo onboard --standalone                     # the control plane, monitoring included
 ```
 

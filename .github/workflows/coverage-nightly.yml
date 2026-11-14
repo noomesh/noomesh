@@ -1,0 +1,82 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+#
+# The Python coverage report, ONCE A NIGHT on dev, instead of on every PR and
+# merge-queue run (operator, 2026-11-11: "yes that works"). Nothing gates on
+# coverage; it is the same per-run artifact as before (`coverage-py`, 14
+# days), for people to read, so anyone who looks for it finds it here.
+#
+# It runs ci.yml's OWN test-core steps, read at run time with
+# scripts/ci_step.py (the mechanism scripts/test-core-local.sh uses), so the
+# suite, its install line and its deselect lists can never drift from what PRs
+# run. Coverage is switched on with PYTEST_ADDOPTS, not a second command line.
+#
+# No `pull_request`, no `push`: a schedule (and a manual dispatch) only, so it
+# never adds time to a PR or the queue, and it pushes nothing anywhere.
+name: Coverage (nightly)
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-nightly
+  cancel-in-progress: false
+
+jobs:
+  coverage:
+    name: test-core with coverage
+    if: github.repository == 'noomesh/noomesh'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # The same database test-core gets (ci.yml `services: &test_core_services`).
+    services:
+      postgres:
+        image: ${{ vars.HUB_MIRROR_OFF != '' && vars.HUB_MIRROR_OFF != '0' && vars.HUB_MIRROR_OFF != 'false' && 'pgvector/pgvector:pg18' || format('ghcr.io/{0}/pgvector:pg18', github.repository_owner) }}
+        credentials: ${{ fromJSON(!(vars.HUB_MIRROR_OFF != '' && vars.HUB_MIRROR_OFF != '0' && vars.HUB_MIRROR_OFF != 'false') && format('{{"username":"{0}","password":"{1}"}}', github.actor, secrets.GITHUB_TOKEN) || '{}') }}
+        env:
+          POSTGRES_USER: noo
+          POSTGRES_PASSWORD: noo
+          POSTGRES_DB: noomesh
+        ports: ['5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: dev
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version-file: .python-version
+      - name: Run ci.yml's test-core steps, with coverage
+        env:
+          NOO_KB_AUDIENCE_TEST_DSN: postgresql://noo:noo@localhost:${{ job.services.postgres.ports['5432'] }}/noomesh
+          PAI_TRELLION_CHECKOUT: ${{ github.workspace }}/_no_sibling_checkout
+        run: |
+          set -eu
+          python -m pip install --quiet pyyaml
+          step() { python scripts/ci_step.py "$@"; }
+          probe_body="$(step test-core 'Is trellion declared public? (TRELLION_PUBLIC)')"
+          install_body="$(step test-core 'Install dependencies')"
+          run_body="$(step test-core 'Run tests')"
+          # The workflow-level switch, through test-core's own probe step.
+          out="$(mktemp)"
+          TRELLION_PUBLIC="$(step --workflow-env TRELLION_PUBLIC)" GITHUB_OUTPUT="$out" bash -e -c "$probe_body"
+          export TRELLION_PUBLIC="$(sed -n 's/^public=//p' "$out")"
+          case "$TRELLION_PUBLIC" in true|false) ;; *) echo "::error::the probe step wrote no public=true|false"; exit 1 ;; esac
+          bash -e -c "$install_body"
+          # Coverage on, for this run only; the PR/queue command has none.
+          PYTEST_ADDOPTS="--cov=noomesh --cov-report=xml" bash -e -c "$run_body"
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
+        with:
+          name: coverage-py
+          path: coverage.xml
+          retention-days: 14
+          if-no-files-found: warn

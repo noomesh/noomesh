@@ -24,7 +24,7 @@ import (
 func rpcServer(t *testing.T) *Server {
 	t.Helper()
 	cfg := &config.Config{NodeID: "test-node", NodeAgentToken: "test-token", TLSCA: "ca.pem"}
-	gpu := hardware.NewGPUDetector(nil, "http")
+	gpu := hardware.NewGPUDetector()
 	return NewServer(cfg, nil, gpu, metrics.NewCollector(gpu))
 }
 

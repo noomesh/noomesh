@@ -86,7 +86,9 @@ mod coordinator;
 mod config_mount;
 mod conn_timeouts;
 mod dependency_watchdog;
+mod bundle_etag;
 mod fd_watch;
+mod proc_self;
 mod node_agent_auth;
 mod node_link;
 mod node_rpc;
@@ -147,6 +149,7 @@ mod audit_integrity;
 mod audit_chain;
 mod audit_head_export;
 mod audit_verify;
+mod backend_metrics;
 mod audit_context;
 mod audit_spool;
 mod autonomy_audit;
@@ -165,6 +168,7 @@ mod heartbeat_loop;
 mod research_pipeline;
 mod heartbeat_reconcile;
 mod agent_crypto;
+mod agent_mailbox;
 mod agent_messages;
 mod agent_recipient;
 mod mesh_migrate;
@@ -624,6 +628,14 @@ async fn main() -> Result<()> {
             Ok(())
         });
 
+    // Agent mailboxes (0.6.24): retire names past their window (their
+    // unread mail becomes the account's orphaned mail) and reap idle MCP
+    // session rows. Hourly: the windows are a day and a week.
+    managed_loop::ManagedLoop::new("agent_mailbox_sweep", 3600)
+        .spawn(state.clone(), |state| async move {
+            crate::agent_mailbox::sweep(&state.db).await.map_err(|e| anyhow::anyhow!(e))
+        });
+
     // Background task(s): poll watched_folders + watched_drives, submit
     // new files via NATS worker.rag.ingest. No-ops if both are disabled.
     // (Restores the autonomy ingestion behavior that was lost when the
@@ -669,6 +681,8 @@ async fn main() -> Result<()> {
     audit_head_export::spawn(state.clone());
     // i520: the full chain verify every 6 h, so a broken row pages on its own.
     audit_verify::spawn(state.clone());
+    // vLLM's own metrics, via each node's agent (option A, 2026-11-11).
+    backend_metrics::spawn(state.clone());
     ingest_loop::spawn(state.clone());
     integrations::sync::spawn(state.clone());
     recall_archive_loop::spawn(state.clone());
@@ -701,6 +715,7 @@ async fn main() -> Result<()> {
     autonomy_audit::spawn(state.clone());
     // Request tracing (i359): the Tempo exporter and the 30-day summary prune.
     request_trace::spawn(state.clone());
+    coordinator::expected_wait::spawn(state.clone());
 
     // Autonomy engine — periodic evaluation of monitor locations
     // (cluster health, backend availability, cert expiry, etc.). All

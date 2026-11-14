@@ -91,14 +91,17 @@ pub fn cluster_import_model(g: &Globals, args: &[String]) -> Result<i32, Unhandl
     // `noo models fetch ollama:<tag>` staged; the node resolves the same tag
     // to the same pair and imports it through the verified path. A tag that
     // is not staged is refused here, naming the fetch command.
-    let (name, mf, staged) = match super::ollama_stage::resolve_import_target(name, &store) {
+    let (name, mf, staged, mirror) = match super::ollama_stage::resolve_import_target(name, &store) {
         Ok(super::ollama_stage::ImportTarget::Staged(r)) => {
             let mf = store.join(format!("{}.Modelfile", r.stem()));
-            (r.short(), mf, true)
+            // A mirrored tag has no Modelfile or weight to check here: the
+            // node reads the manifest and blobs by name and imports them.
+            let mirror = super::ollama_stage::mirror_staged(&store, &r);
+            (r.short(), mf, true, mirror)
         }
         Ok(super::ollama_stage::ImportTarget::Plain(n)) => {
             let mf = store.join(format!("{n}.Modelfile"));
-            (n, mf, false)
+            (n, mf, false, false)
         }
         Err(e) => fail(g.json, ExitCode::Generic, "not_staged", &e,
             Some("`noo models fetch ollama:<tag>` stages a registry tag in the controller store; `noo cluster ship-model <hf_id> <node>` publishes a converted model")),
@@ -117,25 +120,36 @@ pub fn cluster_import_model(g: &Globals, args: &[String]) -> Result<i32, Unhandl
                 Some("publish the pair first: `noo cluster ship-model <hf_id> <node>` converts and publishes; a converted model is two files, <name>.Modelfile and the weight its FROM line names")),
         }
     }
-    let Ok(body) = std::fs::read_to_string(&mf) else {
-        fail(g.json, ExitCode::Generic, "no_modelfile",
-            &format!("{} is not readable", mf.display()), None);
+    // A mirrored tag skips the Modelfile and weight checks entirely: neither
+    // file exists for it, and the old-pair failures below do not apply.
+    let weight = if mirror {
+        String::new()
+    } else {
+        let Ok(body) = std::fs::read_to_string(&mf) else {
+            fail(g.json, ExitCode::Generic, "no_modelfile",
+                &format!("{} is not readable", mf.display()), None);
+        };
+        let weight = body.lines()
+            .map(str::trim)
+            .find_map(|l| l.strip_prefix("FROM ").map(|w| w.trim().trim_start_matches("./").to_string()))
+            .unwrap_or_default();
+        if weight.is_empty() || !weight.to_ascii_lowercase().ends_with(".gguf") || weight.contains('/') {
+            fail(g.json, ExitCode::Generic, "bad_modelfile",
+                &format!("{} must start with `FROM <bare>.gguf` — the agent imports a converted weight, never a registry pull", mf.display()), None);
+        }
+        if !store.join(&weight).is_file() {
+            fail(g.json, ExitCode::Generic, "no_weight",
+                &format!("{weight} (named by {}) is not in the controller store", mf.display()), None);
+        }
+        weight
     };
-    let weight = body.lines()
-        .map(str::trim)
-        .find_map(|l| l.strip_prefix("FROM ").map(|w| w.trim().trim_start_matches("./").to_string()))
-        .unwrap_or_default();
-    if weight.is_empty() || !weight.to_ascii_lowercase().ends_with(".gguf") || weight.contains('/') {
-        fail(g.json, ExitCode::Generic, "bad_modelfile",
-            &format!("{} must start with `FROM <bare>.gguf` — the agent imports a converted weight, never a registry pull", mf.display()), None);
-    }
-    if !store.join(&weight).is_file() {
-        fail(g.json, ExitCode::Generic, "no_weight",
-            &format!("{weight} (named by {}) is not in the controller store", mf.display()), None);
-    }
     if !g.json {
         println!("{}", ui::phase("Create"));
-        ui::step(&format!("{node}'s agent is fetching {name}.Modelfile + {weight} and running ollama create {name}"));
+        if mirror {
+            ui::step(&format!("{node}'s agent is mirroring {name} (manifest + blobs) from the controller store into its ollama"));
+        } else {
+            ui::step(&format!("{node}'s agent is fetching {name}.Modelfile + {weight} and running ollama create {name}"));
+        }
     }
     match post_json_try(
         g,
@@ -147,7 +161,12 @@ pub fn cluster_import_model(g: &Globals, args: &[String]) -> Result<i32, Unhandl
         Ok(resp) => {
             if !g.json {
                 let via = resp["via"].as_str().unwrap_or("?");
-                ui::done(&format!("{name} created on {node} (via the {via} ollama)"));
+                // A mirror import reports the manifest digest ollama now
+                // lists the tag with: the proof it runs the staged model.
+                match resp["manifest_sha256"].as_str().filter(|s| s.len() >= 16) {
+                    Some(d) => ui::done(&format!("{name} installed on {node} (via the {via} ollama; manifest sha256 {}…)", &d[..16])),
+                    None => ui::done(&format!("{name} created on {node} (via the {via} ollama)")),
+                }
             }
         }
         Err(e) => fail(g.json, ExitCode::Generic, "create_failed",
@@ -1664,9 +1683,8 @@ pub(crate) fn deliver_kind_to_nodes_then(
         }
         let outcome = (|| -> Result<crate::commands::security_local::CertDelivery, String> {
             let payload = payload_for(node)?;
-            let work = std::env::temp_dir()
-                .join(format!("noo-{kind}-{}-{}", node, std::process::id()));
-            std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+            // i689: a fresh 0700 dir; what is staged here is CA-signed.
+            let work = crate::private_tmp::dir(&format!("noo-{kind}-{node}"))?;
             let files: Vec<(&str, Vec<u8>)> = vec![(kind, payload)];
             let bundle = crate::commands::security_local::build_signed_bundle(&ca, node, &files, &work)?;
             let d = crate::commands::security_local::deliver_signed_bundle(g, node, &bundle, &work, None);

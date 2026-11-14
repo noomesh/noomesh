@@ -505,8 +505,33 @@ fn tokenize(text: &str) -> HashSet<String> {
     out
 }
 
-/// Score and pick skills for a message. Line-by-line port of
-/// `PromptSkillSelector.select`.
+/// Words too common to count as evidence that a skill is wanted. A trigger
+/// such as "write a report and" shares "a" and "and" with almost anything.
+const STOPWORDS: &[&str] = &[
+    "a", "an", "and", "the", "to", "of", "for", "in", "on", "at", "is", "it", "this", "that", "my", "me", "i",
+    "you", "we", "with", "by", "be", "do", "how", "what", "all", "any", "can", "into", "from", "as", "or", "if",
+    "so", "up", "use",
+];
+
+/// `kw` occurs in `msg` as whole words: "noo" is not in "noomesh".
+fn contains_phrase(msg: &str, kw: &str) -> bool {
+    if kw.is_empty() {
+        return false;
+    }
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    msg.match_indices(kw).any(|(i, _)| {
+        let before = msg[..i].chars().next_back().is_none_or(|c| !word(c));
+        let after = msg[i + kw.len()..].chars().next().is_none_or(|c| !word(c));
+        before && after
+    })
+}
+
+/// Score and pick skills for a message. Ported from `PromptSkillSelector`,
+/// with one change (speed review 2026-11-11, noomesh-internal i658): a skill
+/// must show EVIDENCE, either one trigger phrase as whole words, or two
+/// distinct triggers / tags sharing a non-stopword with the message. A
+/// single shared word, or the description alone, ranks but never selects:
+/// "write me a poem" drew three skills (~2,700 estimated tokens) before.
 pub fn select<'a>(
     registry: &'a SkillRegistry,
     message: &str,
@@ -539,24 +564,40 @@ pub fn select<'a>(
             continue;
         }
         let mut score = 0.0f64;
+        // Evidence: whole-word trigger phrases, and distinct triggers / tags
+        // that share a non-stopword with the message.
+        let mut phrases = 0usize;
+        let mut weak = 0usize;
+        let meaningful = |words: &HashSet<String>| words.iter().any(|w| !STOPWORDS.contains(&w.as_str()));
 
         for kw in &skill.trigger_keywords {
             let kw_lower = kw.to_lowercase();
-            if msg_lower.contains(&kw_lower) {
+            if contains_phrase(&msg_lower, &kw_lower) {
                 score += 2.0;
-            } else if !tokenize(&kw_lower).is_disjoint(&msg_tokens) {
-                score += 1.0;
+                phrases += 1;
+            } else {
+                let shared: HashSet<String> = tokenize(&kw_lower).intersection(&msg_tokens).cloned().collect();
+                if !shared.is_empty() {
+                    score += 1.0;
+                    if meaningful(&shared) {
+                        weak += 1;
+                    }
+                }
             }
         }
         for tag in &skill.tags {
-            if msg_tokens.contains(&tag.to_lowercase()) {
+            let tag_lower = tag.to_lowercase();
+            if msg_tokens.contains(&tag_lower) {
                 score += 1.0;
+                if !STOPWORDS.contains(&tag_lower.as_str()) {
+                    weak += 1;
+                }
             }
         }
         let overlap = tokenize(&skill.description).intersection(&msg_tokens).count();
         score += overlap as f64 * 0.3;
 
-        if score == 0.0 {
+        if score == 0.0 || (phrases == 0 && weak < 2) {
             continue;
         }
 
@@ -900,6 +941,29 @@ mod tests {
         assert_eq!(picked3[0].name, "roled");
     }
 
+    /// The evidence rule (i658): one whole-word trigger phrase, or two
+    /// distinct triggers / tags sharing a non-stopword, or nothing.
+    #[test]
+    fn a_skill_needs_evidence_not_one_shared_word() {
+        let generic = skill("generic", &["noo", "web"], &[], "noomesh web guide", 9);
+        let r = reg(vec![generic.clone()]);
+        assert!(select(&r, "noomesh is great", "coordinator", &[], &[]).is_empty(), "noo is not in noomesh");
+        assert_eq!(select(&r, "how do i use noo", "coordinator", &[], &[]).len(), 1, "a whole-word phrase is evidence");
+        let two = skill("two", &["kubernetes pods", "helm charts"], &[], "", 9);
+        let r = reg(vec![two]);
+        assert!(select(&r, "restart the pods", "coordinator", &[], &[]).is_empty(), "one shared word is not enough");
+        assert_eq!(select(&r, "restart the pods with helm", "coordinator", &[], &[]).len(), 1, "two distinct triggers are");
+        let stop = skill("stop", &["write a report and", "send a note"], &[], "", 9);
+        let r = reg(vec![stop]);
+        assert!(select(&r, "a poem and a song", "coordinator", &[], &[]).is_empty(), "stopwords are not evidence");
+        let described = skill("described", &["zzz"], &[], "poem verse sonnet rhyme", 9);
+        let r = reg(vec![described]);
+        assert!(select(&r, "a poem with verse and rhyme", "coordinator", &[], &[]).is_empty(), "the description ranks, never selects");
+        let tagged = skill("tagged", &["csv"], &["pandas"], "", 9);
+        let r = reg(vec![tagged]);
+        assert_eq!(select(&r, "load it in pandas", "coordinator", &[], &[]).len(), 0, "one tag alone is not enough");
+    }
+
     #[test]
     fn keyword_phrase_beats_token_overlap() {
         // Multi-word keyword present as a phrase scores 2.0; only-token
@@ -965,29 +1029,26 @@ mod differential {
         };
         assert_eq!(reg.len(), 14, "corpus size changed — refresh expectations");
 
-        // (message, exactly what PromptSkillSelector returned)
+        // (message, exactly what is selected). Re-pinned 2026-11-11 for the
+        // evidence rule (i658): each skill must show a whole-word trigger
+        // phrase or two distinct non-stopword hits. The pins were derived by
+        // a Python simulation of this function that first reproduced the
+        // previous eight pins exactly. Before: "write me a poem" drew three
+        // skills, every message drew two or three. "how do I use the noo
+        // cli" draws nothing because cli-guide alone exceeds MAX_TOTAL_CHARS
+        // (it never could be injected; a separate finding).
         let cases: &[(&str, &[&str])] = &[
-            ("debug this failing test",
-             &["debug-assistant", "save-to-knowledge", "research-and-save"]),
-            ("review my code for bugs",
-             &["code-review", "debug-assistant", "save-to-knowledge"]),
-            // Re-pinned at the noomesh rename: the corpus text renamed with
-            // the brand, the body-frequency profile of the new word differs,
-            // and cluster-operator (noise for a CLI-usage question anyway)
-            // drops out. Pins are historical snapshots — the Python
-            // implementation these mirrored is retired.
-            ("how do I use the noo cli",
-             &["knowledge-gap-audit", "research-and-save"]),
-            ("analyse this dataset",
-             &["save-to-knowledge", "data-analysis", "research-and-save"]),
-            ("add a node to the cluster",
-             &["research-and-save", "cluster-operator", "save-to-knowledge"]),
-            ("write me a poem",
-             &["research-and-save", "knowledge-gap-audit", "broadcast-message"]),
-            ("search the knowledge base for rag",
-             &["rag-expert", "save-to-knowledge", "knowledge-gap-audit"]),
-            ("broadcast a message to everyone",
-             &["broadcast-message", "research-and-save", "knowledge-gap-audit"]),
+            ("debug this failing test", &["debug-assistant"]),
+            ("review my code for bugs", &["code-review"]),
+            ("how do I use the noo cli", &[]),
+            ("analyse this dataset", &["data-analysis"]),
+            ("add a node to the cluster", &["cluster-operator"]),
+            ("write me a poem", &[]),
+            ("search the knowledge base for rag", &["rag-expert", "save-to-knowledge", "knowledge-gap-audit"]),
+            ("broadcast a message to everyone", &["broadcast-message"]),
+            ("Reply with the single word ok and finish.", &[]),
+            // Bare verbs are not evidence of cluster work (0.6.24-rc.1 rehearsal).
+            ("Count upward from 1, one number per loop, and note each number. Never stop and never call noo_task_done.", &[]),
         ];
 
         for (msg, expected) in cases {
@@ -995,7 +1056,7 @@ mod differential {
                 .iter()
                 .map(|s| s.name.as_str())
                 .collect();
-            assert_eq!(&got, expected, "selection diverged from Python for {msg:?}");
+            assert_eq!(&got, expected, "selection changed for {msg:?}");
         }
     }
 

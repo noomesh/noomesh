@@ -428,6 +428,12 @@ pub(super) async fn detect_model_from_prompt(state: &AppState, prompt: &str) -> 
 /// The record is `mesh_nodes[<node_id>].running_backends`, a map of backend
 /// type to the model that backend is serving, written by the authenticated
 /// `POST /api/cluster/heartbeat` handler (`routes/cluster.rs`).
+/// A discovery offer must name the model it would serve: an empty (or blank)
+/// one is never a candidate (i677 #12). Pure.
+pub(crate) fn offer_names_no_model(model: &str) -> bool {
+    model.trim().is_empty()
+}
+
 async fn offer_contradicts_registry(
     offer: &mesh::router::BackendOffer,
     state: &AppState,
@@ -1345,7 +1351,13 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
         // so it is either stale or someone answering for a node that is
         // not theirs. Fall through to the remaining resolution paths
         // rather than returning a backend that cannot be dialled.
-        if resolved_url.is_empty() {
+        if offer_names_no_model(&offer.model) {
+            // i677 #12: an agent running a backend with nothing placed and
+            // nothing loaded offered model "" (a fresh single box); the request
+            // then carried `"model": ""` and ollama answered 400 "model is
+            // required". An offer that names no model routes nothing.
+            tracing::warn!(node = %offer.node_id, backend = %offer.backend_type, "discarding a discovery offer that names no model");
+        } else if resolved_url.is_empty() {
             tracing::warn!(node = %offer.node_id, "discarding an unresolvable discovery offer");
         } else if let Some(why) = offer_contradicts_registry(&offer, state).await {
             // `mesh.inference.discover` is a queue-subscribed
@@ -2247,5 +2259,27 @@ mod lane_rank_agreement_tests {
         // The resolver ranks through the class table's own function.
         let code = crate::test_src::own_code(include_str!("backend.rs"));
         assert!(code.contains("super::classes::lane_rank_of(&facts, bt, m)"), "one lane-rank function");
+    }
+}
+
+#[cfg(test)]
+mod empty_offer_tests {
+    use super::*;
+
+    /// i677 #12 (install matrix): an offer with model "" led to a request
+    /// carrying `"model": ""` and ollama's 400 "model is required".
+    #[test]
+    fn an_offer_that_names_no_model_is_never_a_candidate() {
+        assert!(offer_names_no_model(""));
+        assert!(offer_names_no_model("   "));
+        assert!(!offer_names_no_model("gemma4:e2b"));
+    }
+
+    #[test]
+    fn the_discovery_intake_discards_it_before_anything_else() {
+        let code = crate::test_src::own_code(include_str!("backend.rs"));
+        let discard = code.find("if offer_names_no_model(&offer.model) \u{7b}").expect("the discard");
+        let resolve = code.find("\u{7d} else if resolved_url.is_empty() \u{7b}\n            tracing::warn!(node = %offer.node_id, \"discarding an unresolvable discovery offer\");").expect("the chain");
+        assert!(discard < resolve);
     }
 }

@@ -288,3 +288,71 @@ func TestWatchdogRebindsAfterServerSideConsumerDeletion(t *testing.T) {
 
 	assertDispatchDelivered(t, c, nodeID, "job-after-delete")
 }
+
+// i677 finding b (install matrix run 6): on a fresh box the agent's first
+// subscribe CREATED its durables, so nats.go deleted them on every rebind
+// (Unsubscribe deletes a consumer the library created). The node's grant
+// denies CONSUMER.DELETE, so the reconnect logged a permissions violation;
+// with a grant that allowed it, the node would have deleted its own durable
+// and the dispatches pending on it. A rebind must keep the SAME consumer.
+func TestRebindKeepsTheDurableItCreated(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: runs an in-process NATS server")
+	}
+	port := freePort(t)
+	srv := startNATS(t, port)
+	defer srv.Shutdown()
+	t.Setenv("NOO_NATS_ALLOW_ANONYMOUS", "1")
+
+	nodeID := "rebind-node"
+	c, err := messaging.Connect(fmt.Sprintf("nats://127.0.0.1:%d", port), nodeID)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer c.Close()
+	if !c.WaitForConnection(context.Background(), 10*time.Second) {
+		t.Fatal("initial connect never completed")
+	}
+	createTasksStream(t, c)
+	if _, err := c.JS().AddStream(&nats.StreamConfig{Name: "EVENTS", Subjects: []string{"events.>"}, Storage: nats.MemoryStorage}); err != nil {
+		t.Fatalf("create EVENTS stream: %v", err)
+	}
+
+	exec := NewExecutor(c, nil, http.DefaultClient, "https", "https://127.0.0.1:1", nodeID)
+	if err := exec.Subscribe(); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	durable := "node_" + nodeID + "_dispatch"
+	before, err := c.JS().ConsumerInfo("TASKS", durable)
+	if err != nil {
+		t.Fatalf("the first subscribe did not create %s: %v", durable, err)
+	}
+	cancelBefore, err := c.JS().ConsumerInfo("EVENTS", "node_"+nodeID+"_cancel")
+	if err != nil {
+		t.Fatalf("the first subscribe did not create the cancel durable: %v", err)
+	}
+	if before.Config.DeliverSubject != deliverSubject(nodeID, "dispatch") {
+		t.Fatalf("created with deliver subject %q", before.Config.DeliverSubject)
+	}
+
+	// The reconnect hook's rebind, twice.
+	for i := 0; i < 2; i++ {
+		if err := exec.bindSubscriptions(); err != nil {
+			t.Fatalf("rebind %d: %v", i, err)
+		}
+	}
+	after, err := c.JS().ConsumerInfo("TASKS", durable)
+	if err != nil {
+		t.Fatalf("the rebind lost %s: %v", durable, err)
+	}
+	if !after.Created.Equal(before.Created) {
+		t.Fatalf("the rebind deleted and recreated %s (created %v, then %v)", durable, before.Created, after.Created)
+	}
+	cancelAfter, err := c.JS().ConsumerInfo("EVENTS", "node_"+nodeID+"_cancel")
+	if err != nil || !cancelAfter.Created.Equal(cancelBefore.Created) {
+		t.Fatalf("the rebind deleted or recreated the cancel durable: %v", err)
+	}
+
+	// And it still delivers.
+	assertDispatchDelivered(t, c, nodeID, "job-after-rebind")
+}

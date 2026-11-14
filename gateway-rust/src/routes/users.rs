@@ -1120,6 +1120,9 @@ fn erase_targets(keep_account: bool, episodes_have_user_id: bool) -> Vec<EraseTa
         },
     ];
     if !keep_account {
+        // With keep_account, retain content-free source IDs so old publisher
+        // retries cannot undo the erasure. Import detects the removed copy.
+        t.push(EraseTarget { label: "conversation_sources", table: "noo_conversation_sources", where_sql: "user_id = $1" });
         t.push(EraseTarget { label: "account", table: "noo_users", where_sql: "username = $1" });
     }
     t
@@ -2527,6 +2530,8 @@ async fn insert_key(
     .bind(user_id)
     .execute(db)
     .await?;
+    // The new key answers at once, not up to one cache TTL later.
+    crate::service_keys::invalidate_cache();
     Ok(raw)
 }
 
@@ -2697,6 +2702,7 @@ async fn service_key_self_issue(
     .execute(&state.db)
     .await?
     .rows_affected();
+    crate::service_keys::invalidate_cache();
 
     let scopes = vec!["mcp".to_string()];
     let raw = insert_key(
@@ -2780,6 +2786,8 @@ async fn service_key_self_revoke(
     .execute(&state.db)
     .await?
     .rows_affected();
+    // A revoked key stops answering NOW, not up to one cache TTL later.
+    crate::service_keys::invalidate_cache();
     tracing::info!(consumer = %consumer, n = revoked, "service_key_self_revoked");
     crate::audit::record(
         &state.db,
@@ -2903,6 +2911,7 @@ async fn service_key_retire(
     .execute(&state.db)
     .await?
     .rows_affected();
+    crate::service_keys::invalidate_cache();
 
     tracing::info!(consumer = %consumer, by = %actor(&actor_ext), retired, "service_key_retired");
     crate::audit::record(
@@ -2929,6 +2938,8 @@ async fn service_key_revoke(
     .bind(&consumer)
     .execute(&state.db)
     .await?;
+    // A revoked key stops answering NOW, not up to one cache TTL later.
+    crate::service_keys::invalidate_cache();
     tracing::info!(consumer = %consumer, n = result.rows_affected(), by = %actor(&actor_ext), "service_keys_revoked");
     crate::audit::record(
         &state.db,
@@ -3016,6 +3027,9 @@ async fn service_key_revoke_and_disable(
         )));
     }
     tx.commit().await?;
+    // Committed: the revoked key stops answering now (invalidated after the
+    // commit, so a concurrent resolve cannot re-cache the old row).
+    crate::service_keys::invalidate_cache();
     crate::session_floor::end_account_sessions(&state, &username, crate::session_floor::Reason::AccountChange).await;
 
     tracing::warn!(
@@ -3099,6 +3113,7 @@ async fn service_key_rotate(
     .execute(&state.db)
     .await?
     .rows_affected();
+    crate::service_keys::invalidate_cache();
     tracing::info!(
         consumer = %consumer,
         user = %prev_user.as_deref().unwrap_or("-"),
@@ -3147,6 +3162,8 @@ async fn service_key_set_quota(
     .bind(val)
     .execute(&state.db)
     .await?;
+    // The cached Consumer carries rpm_limit: the new quota applies now.
+    crate::service_keys::invalidate_cache();
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound(format!(
             "no active keys for consumer '{consumer}'"
@@ -5880,5 +5897,34 @@ mod session_end_tests {
             assert!(handler(src, sig).contains("check_new_password("), "{sig}");
         }
         assert!(!src.contains(concat!("body.password.len()", " < 8")));
+    }
+}
+
+#[cfg(test)]
+mod key_cache_invalidation_tests {
+    /// rc.1 rehearsal (A-mcppub.door): a newly issued key was answered
+    /// "unknown or revoked" for up to one TTL (5 s), because the issue path
+    /// never dropped the resolved-key snapshot. With a FRESH snapshot in
+    /// place (primed by resolving another token), a key `insert_key` just
+    /// wrote must resolve at once. Against the migrated schema.
+    #[tokio::test]
+    async fn a_key_resolves_the_moment_it_is_issued() {
+        let Some(dsn) = std::env::var("NOO_TEST_DSN").ok().filter(|v| !v.trim().is_empty()) else {
+            eprintln!("NOO_TEST_DSN unset — issue-path cache invalidation not exercised");
+            return;
+        };
+        use std::str::FromStr as _;
+        let opts = sqlx::postgres::PgConnectOptions::from_str(&dsn).expect("dsn").options([("search_path", "mesh,public")]);
+        let db = sqlx::postgres::PgPoolOptions::new().max_connections(2).connect_with(opts).await.expect("connect scratch db");
+        crate::mesh_migrate::apply_baseline(&db).await.expect("baseline");
+        crate::mesh_migrate::apply(&db).await.expect("migrations");
+        let consumer = format!("svc:cache-inval-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        // Prime: a fresh snapshot that does not hold the key about to be issued.
+        let _ = crate::service_keys::resolve(&db, "noo-sk-not-a-real-key-priming-the-cache").await;
+        let raw = super::insert_key(&db, &consumer, &["metrics".to_string()], &None, None, &None).await.expect("issue");
+        let got = crate::service_keys::resolve(&db, &raw).await.expect("key store readable");
+        assert!(got.is_some_and(|c| c.name == consumer), "a just-issued key is unknown until the snapshot expires");
+        // No cleanup statement: the consumer is unique per run in a scratch
+        // database, and a query here would raise this file's repo ratchet.
     }
 }

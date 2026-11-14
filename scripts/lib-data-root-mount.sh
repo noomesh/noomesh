@@ -44,6 +44,18 @@
 # (Darwin) has no findmnt and another mount model, and a Mac node is never a
 # controller: there the check is skipped with a WARNING, as before.
 #
+# A UUID this account cannot READ is not a different UUID. findmnt reads it
+# from udev's records, or by probing the block device, which needs root; on
+# a host without udev (a container, WSL2 without systemd) a non-root launch
+# (the after-boot unit's install owner) reads none, while root, who recorded
+# it, did. So with a uuid record and an empty read as non-root, the mount it
+# CAN read (source, target, filesystem type) is compared with the record
+# instead: equal starts, saying so on one line; different, or not recorded,
+# refuses with that reason ("could not read the filesystem UUID as <user>"),
+# never "not on its recorded filesystem". Root reads every UUID, so an empty
+# read as root is a filesystem without one: a different disk, refused as
+# before. (0.6.24-rc.3 rehearsal, A-afterboot.start.)
+#
 # Escape hatch for a DELIBERATE move (new disk, new data root):
 # NOO_DATA_ROOT_RERECORD=1 re-records the identity from what is mounted now,
 # provided the data root exists and is readable. It is a typed, one-shot
@@ -108,7 +120,7 @@ _drm_field() {  # <FIELD> <path>
 # Evaluate. Sets DRM_VERDICT (ok | record | refuse | skip) and DRM_MSG, and the
 # DRM_NOW_* identity. Never writes, never creates, never stops anything.
 _drm_evaluate() {
-    DRM_VERDICT="ok"; DRM_MSG=""; DRM_KIND=""
+    DRM_VERDICT="ok"; DRM_MSG=""; DRM_KIND=""; DRM_UUID_NOTE=""; DRM_PG_NOTE=""
     DRM_NOW_UUID=""; DRM_NOW_SOURCE=""; DRM_NOW_TARGET=""; DRM_NOW_FSTYPE=""; DRM_PG_INIT_NOW=""
     local root rec rec_root kind e
     root="$(_drm_env NOO_DATA_ROOT)"
@@ -168,8 +180,26 @@ _drm_evaluate() {
         bad="the recorded data root is ${rec_root:-<none>}, this launch uses $root"
     elif [ "$kind" = "uuid" ]; then
         local want; want="$(_drm_get uuid "$rec")"
-        if [ "$DRM_NOW_UUID" != "$want" ]; then
-            bad="the filesystem UUID is ${DRM_NOW_UUID:-<none>}, recorded $want"
+        if [ -n "$DRM_NOW_UUID" ] || [ "$(id -u 2>/dev/null)" = "0" ]; then
+            if [ "$DRM_NOW_UUID" != "$want" ]; then
+                bad="the filesystem UUID is ${DRM_NOW_UUID:-<none>}, recorded $want"
+            fi
+        else
+            # Not readable as this account: compare what it CAN read.
+            local who rs rt rf now
+            who="$(id -un 2>/dev/null || echo "uid $(id -u 2>/dev/null)")"
+            rs="$(_drm_get source "$rec")"; rt="$(_drm_get target "$rec")"; rf="$(_drm_get fstype "$rec")"
+            now="${DRM_NOW_SOURCE:-?} at ${DRM_NOW_TARGET:-?} (${DRM_NOW_FSTYPE:-?})"
+            if [ -z "$rs" ] || [ -z "$rt" ] || [ -z "$rf" ]; then
+                DRM_VERDICT="refuse"; DRM_KIND="uuid_unreadable"
+                DRM_MSG="could not read the filesystem UUID as $who, and the record has no mount to compare instead (it holds only UUID $want); found $now"
+                _drm_explain "$root" "$rec" "$rec_root" "$kind"; return 0
+            elif [ "$DRM_NOW_SOURCE" != "$rs" ] || [ "$DRM_NOW_TARGET" != "$rt" ] || [ "$DRM_NOW_FSTYPE" != "$rf" ]; then
+                DRM_VERDICT="refuse"; DRM_KIND="uuid_unreadable"
+                DRM_MSG="could not read the filesystem UUID as $who, and the mount it can read, $now, is not the recorded $rs at $rt ($rf)"
+                _drm_explain "$root" "$rec" "$rec_root" "$kind"; return 0
+            fi
+            DRM_UUID_NOTE="the filesystem UUID could not be read as $who (no udev record here; only root can probe the device), so the mount was compared instead: $now, as recorded"
         fi
     else
         if [ "$DRM_NOW_SOURCE" != "$(_drm_get source "$rec")" ] || [ "$DRM_NOW_TARGET" != "$(_drm_get target "$rec")" ]; then
@@ -184,11 +214,40 @@ _drm_evaluate() {
 
     # Belt and braces: postgres was initialised here before (the record says
     # so), and its data dir is now empty. Never let it initdb again.
+    #
+    # A data dir this account cannot LIST is not an empty one. Postgres runs
+    # as its own uid and keeps PGDATA 0700, so a non-root launch (the
+    # after-boot unit, the owner's `noo stack start` after hostd's root boot
+    # guard armed this) cannot list it. Read instead what it can see without
+    # listing: a dir owned by ANOTHER uid that this account may not list is
+    # postgres' own, which only an initialised cluster leaves; a dir an
+    # unmounted data root leaves behind is root- or owner-made and listable.
+    # Never judged by link count: a directory's nlink is 1 on btrfs and can
+    # be on overlayfs. (0.6.24-rc.3 Part A, A-afterboot.start.)
     if [ -n "$(_drm_get postgres_initialised "$rec")" ]; then
-        if [ ! -d "$pgdir" ] || [ -z "$(_drm_timeout ls -A "$pgdir" 2>/dev/null)" ]; then
+        local since listing owner mode me who
+        since="$(_drm_get postgres_initialised "$rec")"
+        if [ ! -d "$pgdir" ]; then
             DRM_VERDICT="refuse"; DRM_KIND="pg"
-            DRM_MSG="postgres was initialised on this install (since $(_drm_get postgres_initialised "$rec")) but its data directory $pgdir is empty or missing; starting would initialise a NEW EMPTY database"
+            DRM_MSG="postgres was initialised on this install (since $since) but its data directory $pgdir is empty or missing; starting would initialise a NEW EMPTY database"
             _drm_explain "$root" "$rec" "$rec_root" "$kind"; return 0
+        fi
+        if listing="$(_drm_timeout ls -A "$pgdir" 2>/dev/null)"; then
+            if [ -z "$listing" ]; then
+                DRM_VERDICT="refuse"; DRM_KIND="pg"
+                DRM_MSG="postgres was initialised on this install (since $since) but its data directory $pgdir is empty or missing; starting would initialise a NEW EMPTY database"
+                _drm_explain "$root" "$rec" "$rec_root" "$kind"; return 0
+            fi
+        else
+            owner="$(stat -c %u "$pgdir" 2>/dev/null)"; mode="$(stat -c %a "$pgdir" 2>/dev/null)"
+            me="$(id -u 2>/dev/null)"; who="$(id -un 2>/dev/null || echo "uid $me")"
+            if [ -n "$owner" ] && [ "$owner" != "$me" ] && [ "$owner" != "0" ]; then
+                DRM_PG_NOTE="postgres' data directory $pgdir could not be listed as $who; it is owned by uid $owner, mode $mode (postgres' own, which only an initialised cluster leaves), so it was not judged empty"
+            else
+                DRM_VERDICT="refuse"; DRM_KIND="pg"
+                DRM_MSG="postgres was initialised on this install (since $since), and its data directory $pgdir could not be listed as $who; it is owned by uid ${owner:-?}, mode ${mode:-?}, which is not postgres' own, so whether the cluster is still there is not proven"
+                _drm_explain "$root" "$rec" "$rec_root" "$kind"; return 0
+            fi
         fi
     fi
     DRM_VERDICT="ok"
@@ -233,6 +292,17 @@ _drm_refusal_text() {
 "            (NOO_DATA_ROOT_RERECORD=1 does not apply: without findmnt there is nothing to record)"
         return 0
     fi
+    if [ "$DRM_KIND" = "uuid_unreadable" ]; then
+        printf '%s\n' \
+"REFUSED: not starting — $DRM_MSG." \
+"  recorded: ${DRM_EXPECTED:-see $(_drm_record_file)}" \
+"  This account cannot read filesystem UUIDs here (no udev record; only root can probe the device), so which disk holds the data root is not proven." \
+"  Nothing was created, changed or started." \
+"  check:    sudo findmnt -o UUID,SOURCE,TARGET,FSTYPE -T ${root:-<data root>}   (as root it reads the UUID)" \
+"  start:    sudo noo stack start   (root reads the UUID and compares it), or, if that output shows the recorded UUID and you mean this mount:" \
+"            NOO_DATA_ROOT_RERECORD=1 noo stack start   (records the mount this account can read, once)"
+        return 0
+    fi
     printf '%s\n' \
 "REFUSED: not starting — $DRM_MSG." \
 "  expected: ${DRM_EXPECTED:-the filesystem recorded in $(_drm_record_file)}" \
@@ -245,18 +315,23 @@ _drm_refusal_text() {
 }
 
 _drm_write_record() {  # writes the record from DRM_NOW_*; keeps an existing initialised marker
-    local rec tmp init kind
+    local rec tmp init kind uuid
     rec="$(_drm_record_file)"
     init="$(_drm_get postgres_initialised "$rec")"
     [ -z "$init" ] && [ -n "$DRM_PG_INIT_NOW" ] && init="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    if [ -n "$DRM_NOW_UUID" ]; then kind="uuid"; else kind="mount"; fi
+    uuid="$DRM_NOW_UUID"
+    # A launch that could not READ the UUID (and passed on the mount) keeps
+    # the recorded one: an account that cannot see it never downgrades the
+    # record to a mount-only identity.
+    if [ -z "$uuid" ] && [ -n "$DRM_UUID_NOTE" ]; then uuid="$(_drm_get uuid "$rec")"; fi
+    if [ -n "$uuid" ]; then kind="uuid"; else kind="mount"; fi
     tmp="$rec.tmp.$$"
     {
         echo "# written by scripts/lib-data-root-mount.sh — the filesystem the data root lives on."
         echo "# launchers and hostd refuse to start the stack when it is not mounted here."
         echo "data_root=$(_drm_env NOO_DATA_ROOT | sed 's:/*$::')"
         echo "id_kind=$kind"
-        echo "uuid=$DRM_NOW_UUID"
+        echo "uuid=$uuid"
         echo "source=$DRM_NOW_SOURCE"
         echo "target=$DRM_NOW_TARGET"
         echo "fstype=$DRM_NOW_FSTYPE"
@@ -293,6 +368,8 @@ _drm_run() {
             _drm_refusal_text >&2
             return 1 ;;
         *)
+            [ -n "$DRM_UUID_NOTE" ] && echo "NOTE: $DRM_UUID_NOTE." >&2
+            [ -n "$DRM_PG_NOTE" ] && echo "NOTE: $DRM_PG_NOTE." >&2
             # ok: remember that postgres has been initialised here, so a
             # later empty data dir is refused rather than re-initialised.
             if [ -n "$DRM_PG_INIT_NOW" ] && [ -z "$(_drm_get postgres_initialised "$(_drm_record_file)")" ]; then
@@ -342,6 +419,6 @@ data_root_mount_report() {
         refuse)
             if [ "$DRM_KIND" = "nofindmnt" ]; then echo "$DRM_MSG; the launchers refuse to start"; return 5; fi
             echo "$DRM_MSG — expected ${DRM_EXPECTED:-?}; found ${DRM_FOUND:-?}"; return 3 ;;
-        *) echo "$DRM_MSG"; return 0 ;;
+        *) echo "$DRM_MSG${DRM_UUID_NOTE:+ ($DRM_UUID_NOTE)}${DRM_PG_NOTE:+ ($DRM_PG_NOTE)}"; return 0 ;;
     esac
 }

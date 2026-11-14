@@ -101,13 +101,31 @@ jobs:
         run: npm test
       - name: Contract audit
         run: npm run audit:contract
-      # The console carries this tag as a plain string, so "which build is
-      # the display running?" is answerable from the public bundle with
-      # curl and grep. Without it every console reports `dev`.
+      # The console's build identity is its CONTENT, not the release tag:
+      # `ui-<git tree hash of ui/>`. Identical for an rc and its final (equal
+      # trees), different whenever the console source changes. A tag stamp
+      # made every release's console, and so its gateway, different bits, and
+      # forced the final to rebuild the gateway instead of re-tagging the rc's
+      # (build-speed review 2026-11-11). It is still a plain string in the
+      # bundle, so "which console is this display running?" stays answerable
+      # with curl and grep, and a stale tab still reports its OLD id.
+      - name: Console build identity
+        id: console
+        working-directory: .
+        run: |
+          set -eu
+          tree="$(git rev-parse HEAD:ui)"
+          [ -n "$tree" ] || { echo "::error::cannot read the ui/ tree hash"; exit 1; }
+          echo "value=ui-$tree" >> "$GITHUB_OUTPUT"
       - name: Build web console
         run: npm run build -w @metis/web
         env:
-          NOO_CONSOLE_BUILD: stack-${{ steps.tag.outputs.value }}
+          NOO_CONSOLE_BUILD: ${{ steps.console.outputs.value }}
+      # The same identity beside the bundle, for the gateway that embeds this
+      # artifact to SERVE (the controller side of the kiosk seat check).
+      - name: Record the console build identity in the artifact
+        working-directory: .
+        run: printf '%s\n' "${{ steps.console.outputs.value }}" > ui/apps/web/dist/console-build.txt
 
       - name: Log in to GHCR
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6   # v4.7.0

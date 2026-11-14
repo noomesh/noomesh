@@ -57,9 +57,17 @@ _cleanup_build_artifacts() {
         fi
         docker builder prune -f "$keep_flag" "$keep" 2>/dev/null || true
     fi
-    # Orphaned anonymous volumes (created by failed/recreated containers
-    # that never got `docker compose down -v`'d). Named volumes are protected.
-    docker volume prune -f 2>/dev/null || true
+    # Orphaned ANONYMOUS volumes (created by failed/recreated containers
+    # that never got `docker compose down -v`'d). Only on a daemon whose
+    # `volume prune` is anonymous-only by default (Docker 23+, the one with
+    # `--all`): an older daemon's plain prune removes every UNUSED NAMED
+    # volume too, which with the stack down is every database and noo-data
+    # (i677 #20). On such a daemon this step is skipped, never widened.
+    if docker volume prune --help 2>/dev/null | grep -q -- '--all'; then
+        docker volume prune -f 2>/dev/null || true
+    else
+        echo "  (skipped pruning anonymous volumes: this docker's prune would also remove named volumes)"
+    fi
     # Truncate live container logs that have already grown past the per-file
     # cap. Compose's logging.options.max-size only kicks in for *new* writes;
     # existing oversized files don't auto-rotate. Zero anything > 60MB so

@@ -441,7 +441,11 @@ pub fn cluster_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ("status", format!("{} {}", str_of(&n["status"]), ui::muted(&str_of(&n["status_detail"])))),
         ("tier", tier_cell),
         ("agent", str_of(&n["app_version"])),
-        ("address", str_of(&n["ip_address"])),
+        ("address", match crate::commands::cluster_verify::outbound_only(n) {
+            // No address, reached over its bus/tunnel: say what it is, once.
+            Some(via) => format!("none — reached over {via}; {} need one (NODE_IP)", crate::commands::cluster_verify::NEEDS_ADDRESS),
+            None => str_of(&n["ip_address"]),
+        }),
         ("last beat", str_of(&n["last_heartbeat"])),
     ]));
 

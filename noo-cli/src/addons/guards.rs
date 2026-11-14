@@ -408,6 +408,161 @@ pub fn check_overlay(addon: &str, text: &str, shared_secrets: &[String], third_p
     Ok(seen)
 }
 
+/// Launcher variables any add-on may pass through by name: non-secret, and
+/// the same on every install. Kept short on purpose; a name is added here
+/// only with a reason. Store values never qualify.
+pub const LAUNCHER_PASSTHROUGH_ALLOW: &[&str] = &["TZ"];
+
+/// Every PASS-THROUGH entry in the overlay: an `environment` (or
+/// `build.args`) list item with no `=`, or a map key whose value is null.
+/// Compose fills those from the calling environment, and the launcher's
+/// environment holds every value of the encrypted store (`load_secrets`).
+/// Found at any depth, so a YAML merge (`<<: *x`) or an `x-` anchor, which
+/// serde_yaml leaves unmerged, is read too.
+pub fn passthrough_names(v: &Value) -> Vec<(String, &'static str)> {
+    fn entries(v: &Value, what: &'static str, out: &mut Vec<(String, &'static str)>) {
+        match untag(v) {
+            Value::Sequence(seq) => {
+                for item in seq {
+                    if let Some(s) = untag(item).as_str() {
+                        let s = s.trim();
+                        if !s.is_empty() && !s.contains('=') {
+                            out.push((s.to_string(), what));
+                        }
+                    }
+                }
+            }
+            Value::Mapping(m) => {
+                for (k, val) in m {
+                    // A YAML merge key: its value (a mapping, or a list of
+                    // them) is merged INTO this environment by compose.
+                    if k.as_str() == Some("<<") {
+                        match untag(val) {
+                            Value::Sequence(seq) => seq.iter().for_each(|x| entries(x, what, out)),
+                            other => entries(other, what, out),
+                        }
+                        continue;
+                    }
+                    if let (Some(k), Value::Null) = (k.as_str(), untag(val)) {
+                        out.push((k.trim().to_string(), what));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk(v: &Value, out: &mut Vec<(String, &'static str)>) {
+        match untag(v) {
+            Value::Mapping(m) => {
+                for (k, val) in m {
+                    match k.as_str() {
+                        Some("environment") => entries(val, "environment", out),
+                        Some("args") => entries(val, "build.args", out),
+                        _ => {}
+                    }
+                    walk(val, out);
+                }
+            }
+            Value::Sequence(seq) => seq.iter().for_each(|x| walk(x, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(v, &mut out);
+    out
+}
+
+/// Every key named `key` anywhere in the document (services, merges,
+/// anchors).
+fn any_key<'a>(v: &'a Value, key: &str, out: &mut Vec<&'a Value>) {
+    match untag(v) {
+        Value::Mapping(m) => {
+            for (k, val) in m {
+                if k.as_str() == Some(key) {
+                    out.push(val);
+                }
+                any_key(val, key, out);
+            }
+        }
+        Value::Sequence(seq) => seq.iter().for_each(|x| any_key(x, key, out)),
+        _ => {}
+    }
+}
+
+/// The compose channels that read the CALLING environment (the launcher's,
+/// which holds the store), judged DEFAULT-DENY for a third-party add-on.
+///
+/// - Pass-through entries ([`passthrough_names`]) in `environment` and
+///   `build.args`: a third-party add-on may pass through only what it is
+///   entitled to: an `env` its `resources.json` delivers or a mount variable
+///   it declares (`entitled`), or [`LAUNCHER_PASSTHROUGH_ALLOW`]. Any other
+///   name is refused, known or not: the store can hold names no registry
+///   classifies. A first-party (licensed) overlay ships inside this CLI's
+///   own signed release, the same trust as core's compose files; it is
+///   held to the interpolation rule (no core secret, nothing
+///   credential-shaped that is not its own), which its overlays meet today.
+/// - `env_file` and `include:` (a third-party add-on), and `extends` with a
+///   `file`, anywhere in the document: a merge or anchor cannot smuggle
+///   them past the per-service checks in [`check_overlay`] / [`check_runtime`].
+///
+/// Interpolation `${VAR}` is [`check_overlay`]'s. Keys are not interpolated
+/// by compose (it renders `${X}:` as a literal), so only values are read.
+pub fn check_env_channels(
+    addon: &str,
+    text: &str,
+    shared_secrets: &[String],
+    entitled: &BTreeSet<String>,
+    third_party: bool,
+    core: &Core,
+) -> Result<(), String> {
+    let doc: Value = serde_yaml::from_str(text).map_err(|e| format!("add-on {addon}: its overlay is not valid YAML ({e})"))?;
+    let nats = crate::commands::nats_users::overlay_declares_principal(text, addon);
+    let owned = owned_secret_vars(addon, shared_secrets, nats);
+    for (name, what) in passthrough_names(&doc) {
+        let refuse = if third_party {
+            !entitled.contains(&name) && !LAUNCHER_PASSTHROUGH_ALLOW.contains(&name.as_str())
+        } else {
+            (core.secret_vars.contains(&name) || credential_shaped(&name)) && !owned.contains(&name)
+        };
+        if refuse {
+            return Err(format!(
+                "add-on {addon}: its overlay passes `{name}` through from the launcher's environment ({what} entry with no value), \
+                 and that environment holds every value of the encrypted store. {}",
+                if third_party {
+                    "A third-party add-on may pass through only an `env` its resources.json delivers, a mount variable it \
+                     declares, or TZ. To fix the overlay: for a non-secret value, declare it in resources.json \
+                     (`{\"kind\": \"gateway\", \"part\": \"url\", \"deliver\": {\"env\": \"<ADDON>_...\"}}` and the like) or write the value \
+                     in the overlay; for a secret, take it as a FILE (an `addon_key` / `shared_secret` resource with \
+                     `\"deliver\": {\"file\": \"<mount>/<path>\"}`, or a top-level secret with `x-noo-source:` of the add-on's own). \
+                     docs/development/addons.md, \"Resources\""
+                } else {
+                    "It is not one of the add-on's own secrets"
+                }
+            ));
+        }
+    }
+    if third_party {
+        for key in ["env_file", "include"] {
+            let mut hits = Vec::new();
+            any_key(&doc, key, &mut hits);
+            if !hits.is_empty() {
+                return Err(format!(
+                    "add-on {addon}: its overlay uses `{key}`, which reads files or compose projects outside the bundle; a third-party add-on may not"
+                ));
+            }
+        }
+        let mut ext = Vec::new();
+        any_key(&doc, "extends", &mut ext);
+        if ext.iter().any(|x| untag(x).get("file").is_some()) {
+            return Err(format!(
+                "add-on {addon}: its overlay extends a service of another compose file, and would inherit that service's secrets; \
+                 a third-party add-on extends only services of its own overlay"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Why `addon`'s name, or a name derived from it, is core's (`None`: it is
 /// free). Asked of third-party add-ons only: an add-on the CLI ships owns
 /// the core rows that name it.
@@ -450,18 +605,30 @@ pub fn check_bundle_files(addon: &str, files: &BTreeMap<String, Vec<u8>>, third_
     }
     let Some(bytes) = files.get("docker-compose.yml") else { return Ok(Checked::default()) };
     let text = std::str::from_utf8(bytes).map_err(|_| format!("add-on {addon}: its overlay is not UTF-8"))?;
-    let (shared, mount_envs): (Vec<String>, Vec<String>) = match files.get(super::resources::RESOURCES_FILE) {
+    let (shared, mount_envs, env_deliveries): (Vec<String>, Vec<String>, Vec<String>) = match files.get(super::resources::RESOURCES_FILE) {
         Some(b) => {
             let facts = super::resources::bundle_facts(addon, files);
             let res = super::resources::parse(addon, b, &facts)?;
             (
                 res.resources.iter().filter(|r| r.what == super::resources::What::SharedSecret).map(|r| r.name.clone()).collect(),
                 res.mounts.iter().map(|m| m.env.clone()).collect(),
+                // Non-secret by construction: resources::parse refuses an
+                // `env` delivery of secret material.
+                res.resources
+                    .iter()
+                    .flat_map(|r| r.deliver.iter())
+                    .filter_map(|t| match t {
+                        super::resources::Target::Env(v) => Some(v.clone()),
+                        _ => None,
+                    })
+                    .collect(),
             )
         }
-        None => (Vec::new(), Vec::new()),
+        None => (Vec::new(), Vec::new(), Vec::new()),
     };
     let mut checked = check_overlay(addon, text, &shared, third_party, core)?;
+    let entitled: BTreeSet<String> = env_deliveries.into_iter().chain(mount_envs.iter().cloned()).collect();
+    check_env_channels(addon, text, &shared, &entitled, third_party, core)?;
     if third_party {
         checked.mounts = check_runtime(addon, text, &mount_envs, core)?;
     }
@@ -719,6 +886,98 @@ mod tests {
 
     fn peer() -> Vec<String> {
         vec!["peer-key".to_string()]
+    }
+
+    /// The base service a pass-through case is added to (third-party rhaddon).
+    const PT_BASE: &str = "services:\n  noo-rhaddon:\n    image: x\n    environment:\n      RH_NAME: rhaddon\n";
+
+    fn entitled() -> BTreeSet<String> {
+        ["RHADDON_GATEWAY_URL".to_string(), "RHADDON_WORK_DIR".to_string()].into_iter().collect()
+    }
+
+    fn pt(text: &str, third_party: bool) -> Result<(), String> {
+        check_env_channels("rhaddon", text, &peer(), &entitled(), third_party, &core())
+    }
+
+    /// 0.6.24 security finding: the launcher exports every store value, and
+    /// compose fills a value-less environment entry from it. A third-party
+    /// overlay could take ANY store secret by naming it. Default-deny: every
+    /// pass-through form, known secret or unknown name, is refused.
+    #[test]
+    fn a_third_party_pass_through_of_anything_not_its_own_is_refused() {
+        assert!(pt(PT_BASE, true).is_ok(), "the plain overlay must pass");
+        let cases: Vec<(String, &str)> = vec![
+            // list form, map form (null value), on a core secret
+            (PT_BASE.replace("      RH_NAME: rhaddon\n", "      - NOO_JWT_SECRET\n"), "NOO_JWT_SECRET"),
+            (PT_BASE.replace("      RH_NAME: rhaddon\n", "      RH_NAME: rhaddon\n      POSTGRES_PASSWORD:\n"), "POSTGRES_PASSWORD"),
+            // an UNKNOWN name: refused too (the store holds unclassified names)
+            (PT_BASE.replace("      RH_NAME: rhaddon\n", "      RH_NAME: rhaddon\n      SOME_OPERATOR_TOKEN:\n"), "SOME_OPERATOR_TOKEN"),
+            // its OWN secret is not an env channel either (files only)
+            (PT_BASE.replace("      RH_NAME: rhaddon\n", "      RH_NAME: rhaddon\n      NOO_SVC_KEY_RHADDON:\n"), "NOO_SVC_KEY_RHADDON"),
+            // build.args pass-through
+            (PT_BASE.replace("    image: x\n", "    image: x\n    build:\n      context: .\n      args:\n        - NOO_JWT_SECRET\n"), "NOO_JWT_SECRET"),
+            // through a YAML merge from an x- anchor (serde_yaml does not merge)
+            ("x-env: &env\n  NOO_JWT_SECRET:\nservices:\n  noo-rhaddon:\n    image: x\n    environment:\n      <<: *env\n".to_string(), "NOO_JWT_SECRET"),
+            ("x-svc: &svc\n  environment:\n    - NOO_CLUSTER_SECRET\nservices:\n  noo-rhaddon:\n    <<: *svc\n    image: x\n".to_string(), "NOO_CLUSTER_SECRET"),
+        ];
+        for (text, name) in cases {
+            let e = pt(&text, true).expect_err(&format!("a pass-through of {name} was allowed:\n{text}"));
+            assert!(e.contains(&format!("passes `{name}` through")), "{e}");
+        }
+    }
+
+    /// What a third-party add-on IS entitled to: an env its resources.json
+    /// delivers, a mount variable it declares, the fixed launcher allowlist,
+    /// and any explicit value.
+    #[test]
+    fn a_third_party_may_pass_through_only_what_it_is_entitled_to() {
+        let ok = PT_BASE.replace(
+            "      RH_NAME: rhaddon\n",
+            "      RH_NAME: rhaddon\n      RHADDON_GATEWAY_URL:\n      RHADDON_WORK_DIR:\n      TZ:\n      EXPLICIT: \"value\"\n",
+        );
+        pt(&ok, true).unwrap();
+        let list_ok = PT_BASE.replace("      RH_NAME: rhaddon\n", "      - RHADDON_GATEWAY_URL\n      - FOO=bar\n");
+        pt(&list_ok, true).unwrap();
+    }
+
+    /// The other channels that read outside the bundle, refused for a
+    /// third-party add-on at ANY depth (a merge or anchor must not hide them).
+    #[test]
+    fn env_file_include_and_extends_file_are_refused_even_through_a_merge() {
+        let cases = [
+            ("x-s: &s\n  env_file: ../../.env\nservices:\n  noo-rhaddon:\n    <<: *s\n    image: x\n", "`env_file`"),
+            ("include:\n  - ../../docker-compose.yml\nservices:\n  noo-rhaddon:\n    image: x\n", "`include`"),
+            ("x-s: &s\n  extends:\n    file: ../../docker-compose.yml\n    service: gateway\nservices:\n  noo-rhaddon:\n    <<: *s\n    image: x\n", "extends a service of another compose file"),
+        ];
+        for (text, want) in cases {
+            let e = pt(text, true).expect_err(&format!("allowed:\n{text}"));
+            assert!(e.contains(want), "{e}");
+        }
+    }
+
+    /// A first-party (licensed) overlay ships inside this CLI's signed
+    /// release: held to the interpolation rule, so a core secret or a
+    /// credential-shaped name not its own is refused, its own and plain
+    /// config pass.
+    #[test]
+    fn a_first_party_pass_through_is_held_to_the_interpolation_rule() {
+        let bad = PT_BASE.replace("      RH_NAME: rhaddon\n", "      NOO_JWT_SECRET:\n");
+        assert!(pt(&bad, false).unwrap_err().contains("passes `NOO_JWT_SECRET` through"));
+        let ok = PT_BASE.replace("      RH_NAME: rhaddon\n", "      NOO_SVC_KEY_RHADDON:\n      LOG_LEVEL:\n");
+        pt(&ok, false).unwrap();
+    }
+
+    /// The wiring: a bundle whose overlay passes a store secret through is
+    /// refused by check_bundle_files (enable, verify, launch-resources).
+    #[test]
+    fn check_bundle_files_runs_the_env_channel_check() {
+        let mut files = BTreeMap::new();
+        files.insert("docker-compose.yml".to_string(), PT_BASE.replace("      RH_NAME: rhaddon\n", "      - NOO_JWT_SECRET\n").into_bytes());
+        // plain_core: core()'s fixture lists NOO_BUS_KEY_RHADDON, which makes
+        // `rhaddon` a core name for a third-party bundle. Default-deny refuses
+        // the pass-through whatever core holds.
+        let e = check_bundle_files("rhaddon", &files, true, &plain_core()).unwrap_err();
+        assert!(e.contains("passes `NOO_JWT_SECRET` through"), "{e}");
     }
 
     #[test]

@@ -86,7 +86,7 @@ func captureServer(t *testing.T) (*httptest.Server, *capture) {
 
 func newReporterWith(srvURL string, gpu hardware.GPUProbe, backends func() (map[string]string, error)) *Reporter {
 	cfg := &config.Config{NodeID: "n1", Tier: 2, ControllerURL: srvURL}
-	return NewReporter(cfg, &http.Client{Timeout: 5 * time.Second}, metrics.NewCollector(hardware.NewGPUDetector(nil, "http")), gpu,
+	return NewReporter(cfg, &http.Client{Timeout: 5 * time.Second}, metrics.NewCollector(hardware.NewGPUDetector()), gpu,
 		backends, func() int { return 0 })
 }
 

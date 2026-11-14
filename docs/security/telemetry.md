@@ -71,18 +71,29 @@ use are in
 [../getting-started/supported-agent-harnesses.md](../getting-started/supported-agent-harnesses.md). `noo` is noomesh's
 own loop. The other three are third-party CLIs with their own reporting.
 
-**Status: the foreign runners are not shipped.** The node agent accepts a
-`claude-code`, `copilot` or `codex` placement, checks that the node's chat
-backend speaks the CLI's wire format, and then refuses to start it ("its
-runner is not shipped yet"). No noomesh image or installer provides
-any of these CLIs. So today nothing launches them and nothing leaves the network
-because of them. The switches are declared now so the runner cannot ship
-without them: each kind's `telemetry_off` entry in `config/harness-kinds.json`
-holds them, and whatever launches a CLI must merge that entry
-into the CLI's environment after any placement value, so a placement cannot
-turn reporting back on. A guard test fails if a kind has no entry, if a
-switch below goes missing, or if a foreign kind with no switches declared
-gets a runner.
+**Status: the foreign runners ship.** `noo cluster vendor stage` stages the
+Claude Code, Codex and Copilot CLIs, pinned by hash in
+`config/harness-kinds.json`, and the node harness (`noo-gateway harness`)
+launches the one a placement names. The switches below are applied on every
+launch: each kind's `telemetry_off` entry in `config/harness-kinds.json` is
+merged into the CLI's environment LAST, after the placement's and the lane's
+values, so a placement cannot turn reporting back on. A guard test fails if a
+kind has no entry, if a switch below goes missing, or if a foreign kind with
+no switches declared gets a runner.
+
+What each CLI's reporting rests on today. "Switched off" means the vendor's
+documented switch is applied on every launch. "Observed off" means the CLI,
+launched exactly as the harness launches it (`noo-gateway harness probe`, the
+driver's environment and config, a scripted model), was run with no network
+route at all except loopback while every `connect()` and every DNS question it
+made was recorded, and it tried to reach nothing outside the machine. The
+evidence method is in [Verify it yourself](#verify-it-yourself).
+
+| Kind | Reporting | How | Not covered |
+|---|---|---|---|
+| `claude-code` | Observed off (no-route probe, 2026-11-12, Claude Code 2.1.292): only loopback connections, no DNS question | Environment: the `claude-code` rows below | The WebFetch hostname preflight (below); the probe does not call WebFetch |
+| `codex` | **Switches applied; the CLI still resolves `api.github.com` and `chatgpt.com` at start** (observed 2026-11-12, codex-cli 0.163.0, no-route probe: 8 DNS questions, no other outbound attempt). It cannot connect once the harness unit's network allowlist ships, and the lookups stop once the harness unit's own resolver ships | `config.toml` keys the driver writes into the run's own `CODEX_HOME` before each launch | The two lookups above: no Codex setting that stops them has been found yet |
+| `copilot` | Observed off (no-route probe, 2026-11-12, GitHub Copilot CLI 1.0.98): only loopback connections, no DNS question; both probe tests pass with no route, so offline mode needs no GitHub | `COPILOT_OFFLINE=true`, the only switch GitHub documents | Offline mode removes GitHub-backed features (below) |
 
 Codex CLI takes no environment switch for its reporting: its
 `telemetry_off` entry is empty, and its switches are keys of the
@@ -113,10 +124,14 @@ What the switches do not cover, stated plainly:
   the requested hostname (only the hostname) to `api.anthropic.com`. Anthropic
   says this "is not affected by `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`";
   its opt-out is the settings key `skipWebFetchPreflight`, not an environment
-  variable ([data usage](https://code.claude.com/docs/en/data-usage)). The
-  runner must write that setting too, or leave the WebFetch tool off.
+  variable ([data usage](https://code.claude.com/docs/en/data-usage)).
+  **This gap is open today:** the `claude-code` kind allows WebFetch, and the
+  runner writes no settings file, so a claude-code harness that fetches a web
+  page sends that page's hostname to `api.anthropic.com` first. Until the
+  runner writes `skipWebFetchPreflight` (or drops WebFetch from the kind),
+  treat a claude-code harness's WebFetch as sending hostnames to Anthropic.
 - **Copilot CLI has no separate telemetry switch.** GitHub documents none;
-  offline mode is the only documented way. Offline mode also removes the
+  `COPILOT_OFFLINE=true` is the only documented way, and noomesh sets it. Offline mode also removes the
   features that need GitHub (`/delegate`, the GitHub MCP server, code
   search), and it needs a bring-your-own-model provider
   (`COPILOT_PROVIDER_BASE_URL`, here the node's own model endpoint). Without
@@ -130,9 +145,9 @@ What the switches do not cover, stated plainly:
   default this does not arise.
 - **`noo cluster verify`.** The `vendor telemetry` row is built from the node
   agent's report on running backend containers. A harness is a host service
-  and reports no environment today, so the row does not cover it; with no
-  runner there is nothing to check yet. Reporting the harness's switches into
-  that row is open work to land with the runner.
+  and reports no environment, so the row does not cover the vendor CLIs it
+  launches: their switches are applied by the runner at each launch (above),
+  not checked by verify. Reporting them into that row is open work.
 
 ### Paid add-ons
 
@@ -423,6 +438,43 @@ after the stack starts, for example with
 `stats.vllm.ai`, `stats.grafana.org`, `grafana.com`, `huggingface.co/api/telemetry`
 or `ollama.com`. The exception is a model download or cloud call you
 started yourself.
+On an idle controller (0.6.24 or later, nothing asked of it) the same
+capture should show no questions at all. A container's question is forwarded
+by Docker from the host, so the name, not the source address, says which
+service asked.
+
+To see what one vendor CLI tries to reach, run it the way the harness does
+with no route out, recording every connection and DNS question (no root
+needed; `noo-gateway` is the node's harness binary, the CLI path is the staged
+one):
+
+```bash
+unshare -rn bash -c 'ip link set lo up; exec unshare --map-user=$(id -u) --map-group=$(id -g) \
+  strace -f -qq -s 300 -xx -e trace=connect,sendto,sendmmsg -o probe.strace \
+  noo-gateway harness probe --kind codex --cli /path/to/codex --mock-model --test both'
+grep -E 'connect\(|sendto\(' probe.strace   # anything but 127.0.0.1 and unix sockets is an attempt
+```
+
+The rows in [Agent harnesses](#agent-harnesses) marked "observed" come from
+exactly this run.
+
+For the whole picture, run [`egress-capture.sh`](egress-capture.sh) on the
+host for as long as you like:
+
+```bash
+sudo docs/security/egress-capture.sh --minutes 60 --out ./egress-$(hostname)
+```
+
+It records every outbound connection the machine makes while it runs (the
+containers' included), names each destination from DNS and the TLS server
+name, says which container or process made it and how many bytes went each
+way, and writes a table to `egress.md`. It keeps no payloads, changes no
+firewall rule (it turns on the kernel's per-connection byte counters and
+restores the setting when it stops), writes only to `--out`, and says what it
+cannot see. It needs root, `conntrack`, `tcpdump`, `ss` and `python3`, and
+refuses without them. Leave the stack idle while it runs and the table should
+be empty; run it across a model download or a chat with a cloud model and you
+will see exactly that traffic and nothing else.
 
 ## Outbound traffic that is not telemetry
 
@@ -446,10 +498,48 @@ setting you chose. None of it is a report about you or your machines.
 | Drive resources and private sync | `www.googleapis.com` | The gateway lists drives/folders on request and reads selected files while that owner's Drive source has sync enabled. To keep it off, pause every Drive source and avoid the Drive picker, or disconnect the account. Scope identifiers also use this host as a name; granting a scope itself makes no request to it. |
 | Google content links (browser) | `mail.google.com`, `drive.google.com` | Only when you open a returned citation in your browser. To keep it off, do not open those links. The gateway constructs these citations and does not fetch them. |
 | Cloud models | Anthropic, OpenAI, Google Gemini APIs | Only when `CLOUD_PROVIDERS_ENABLED` is on, a `claude-*`, `gpt-*` or `gemini-*` model is selected and its key is configured. The model runs the full agent loop, so each request carries the whole turn: the system prompt, the retrieved context, memory, conversation summaries and recall, runtime-written skills and device reports (fenced as reference data in the user's turn), the conversation, the tool definitions and the tool results |
-| Agent harness on a cloud model | The model vendor (Anthropic for Claude Code, the provider you set for Copilot CLI, OpenAI for Codex CLI) | Only if a third-party harness is pointed at a cloud model instead of the node's own endpoint. The prompts go to that vendor: this is the cloud-model traffic above, not telemetry. Not reachable today: the foreign runners are not shipped. |
+| Agent harness on a cloud model | The model vendor (Anthropic for Claude Code, the provider you set for Copilot CLI, OpenAI for Codex CLI) | Only if a third-party harness is pointed at a cloud model instead of the node's own endpoint. The prompts go to that vendor: this is the cloud-model traffic above, not telemetry. By default the harness is pointed at the node's own endpoint, so this does not arise unless you point it elsewhere. |
 | Web search | DuckDuckGo's HTML endpoint, or the provider set in `search.provider` (SearXNG, Brave, Tavily) | When an agent, a chat or a scheduled task uses `web_search` |
 | Browser tool | Whatever page it is sent to | When an agent uses the browser tool. `BROWSER_URL_ALLOWLIST` limits it. |
 | Build-time package installs | PyPI, the PyTorch wheel index, Go and crates.io registries, Debian/Alpine mirrors | Building images, not running them |
+
+### Name lookups for noomesh's own services
+
+Before 0.6.24, a default install's Prometheus asked the host's configured DNS
+resolver, every 15 seconds, for `node-agent.<search domain>` and
+`nvidia-exporter.<search domain>` (an A and an AAAA question each). The
+cause was two scrape targets that name containers which do not exist on
+every install: no install runs a `node-agent` container (agents are host
+services), and a controller without an NVIDIA container runtime runs no
+`nvidia-exporter`. Docker's DNS cannot answer a name with no container behind
+it, so it forwards the question to the host's resolver. Only the question
+left the machine: no payload and no connection followed, because no answer
+came back. Since 0.6.24 Prometheus finds the node agents through the
+gateway's list and the GPU exporter by a file the exporter writes while it
+runs, so an idle install asks no resolver anything
+([Verify it yourself](#verify-it-yourself) shows how to watch).
+
+Before 0.6.24, a node agent on a host without `nvidia-smi` also looked up
+`nvidia-exporter` once when it started, to check for a GPU exporter beside it.
+The agent is a host service, so with a search domain (one your router hands
+out, or your tailnet's) the host's resolver was asked for
+`nvidia-exporter.<search domain>` (A and AAAA), once per agent start; only the
+question left, no connection followed. Since 0.6.24 the agent reads the GPU
+from `nvidia-smi` only and looks no name up.
+
+Before 0.6.24 the console's Observability panel (every 15 s while open) and a
+kiosk display showing GPUs had the gateway fetch GPU metrics from
+`nvidia-exporter` on every refresh; on a controller without an NVIDIA
+container runtime Docker forwarded that name to the host's resolver. Since
+0.6.24 the gateway fetches the exporter only while the exporter has announced
+itself, and otherwise reads the GPUs the node agents report.
+
+At idle, and with the console or a kiosk display open, nothing noomesh runs
+asks a resolver for the name of one of its own containers. An operator action
+aimed at a backend that is not installed can: listing or pulling Ollama
+models, or an embedding sent to the default Ollama address
+(`stunnel-ollama`), on an install that does not run Ollama, looks that name
+up when you start it.
 
 These are out of scope here:
 

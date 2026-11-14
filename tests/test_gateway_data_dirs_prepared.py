@@ -102,16 +102,16 @@ def _uncommented(text: str) -> str:
 
 def test_start_calls_the_prep_and_keeps_no_inline_copy() -> None:
     body = _uncommented((SCRIPTS / "noomesh-start.sh").read_text())
-    assert re.search(r"^\s*noo_prepare_gateway_data_dirs\s*$", body, re.M), "noomesh-start.sh no longer prepares the gateway's dirs"
+    assert re.search(r"^\s*noo_prepare_gateway_data_dirs \|\| \{ .*exit 1; \}\s*$", body, re.M), "noomesh-start.sh no longer prepares the gateway's dirs, or no longer stops when the volume cannot be made"
     assert "/d/ingest" not in body, "an inline copy of the list in noomesh-start.sh would drift from lib-instance.sh"
 
 
 def test_restart_prepares_when_it_recreates_the_gateway() -> None:
     body = _uncommented((SCRIPTS / "noomesh-restart.sh").read_text())
-    calls = re.findall(r"^\s*noo_prepare_gateway_data_dirs\s*$", body, re.M)
+    calls = re.findall(r"^\s*noo_prepare_gateway_data_dirs \$DATA_WARNED_ARG \|\| \{ .*exit 1; \}\s*$", body, re.M)
     assert len(calls) == 2, "noomesh-restart.sh must prepare on the whole-stack path and when `gateway` is named"
     named = body.index('SERVICES=("${RESOLVED_SERVICES[@]}")')
-    assert re.search(r"grep -qx gateway;\s*then\s*noo_prepare_gateway_data_dirs", body[named:]), (
+    assert re.search(r"grep -qx gateway;\s*then\s*noo_prepare_gateway_data_dirs \$DATA_WARNED_ARG \|\|", body[named:]), (
         "the named-services path must prepare after resolving names (an alias resolves to `gateway` only then)"
     )
 
@@ -139,12 +139,166 @@ def test_prep_failure_is_reported_not_swallowed(tmp_path: Path) -> None:
     bindir = tmp_path / "bin"
     bindir.mkdir()
     docker = bindir / "docker"
-    docker.write_text('#!/bin/sh\necho "invalid volume name" >&2\nexit 125\n')
+    # The volume exists and is bound (so noo_ensure_data_volume is quiet);
+    # only the throwaway chown container fails: that stays non-fatal.
+    docker.write_text(
+        '#!/bin/sh\n'
+        'case "$1 $2" in "volume inspect") case "$*" in *device*) echo "/r/noo-data";; esac; exit 0;; esac\n'
+        'echo "invalid volume name" >&2\nexit 125\n'
+    )
     docker.chmod(0o755)
-    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "COMPOSE_PROJECT_NAME": "proj"}
+    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "COMPOSE_PROJECT_NAME": "proj", "NOO_DATA_ROOT": "/r"}
+    env.pop("NOO_STATE_ROOT", None)
     r = subprocess.run(
         ["bash", "-c", f'. "{LIB_INSTANCE}" >/dev/null 2>&1; noo_prepare_gateway_data_dirs'],
         env=env, capture_output=True, text=True, cwd=tmp_path,
     )
     assert r.returncode == 0, "a failed prep stays non-fatal (the start continues)"
     assert "WARNING" in r.stderr and "invalid volume name" in r.stderr, r.stderr
+
+
+# ── i677: noo-data is created as compose declares it, never by the mount ──
+
+def _vol_fake(tmp_path: Path, exists: bool, device: str = "") -> tuple[Path, Path]:
+    bindir = tmp_path / "vbin"
+    bindir.mkdir()
+    log = tmp_path / "calls.log"
+    docker = bindir / "docker"
+    docker.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "$*" >> "{log}"\n'
+        'case "$1 $2" in\n'
+        f'  "volume inspect") {"" if exists else "exit 1;"} case "$*" in *device*) printf "%s\\n" "{device}";; *Mountpoint*) echo /var/lib/docker/volumes/x/_data;; esac; exit 0;;\n'
+        "esac\nexit 0\n"
+    )
+    docker.chmod(0o755)
+    return bindir, log
+
+
+def _ensure(tmp_path: Path, exists: bool, device: str = "", **envs: str):
+    bindir, log = _vol_fake(tmp_path, exists, device)
+    env = {k: v for k, v in os.environ.items() if k not in ("NOO_DATA_ROOT", "NOO_STATE_ROOT", "COMPOSE_PROJECT_NAME")}
+    env.update(PATH=f"{bindir}:{os.environ['PATH']}", COMPOSE_PROJECT_NAME="proj", **envs)
+    r = subprocess.run(["bash", "-c", f'. "{LIB_INSTANCE}" >/dev/null 2>&1; noo_prepare_gateway_data_dirs'],
+                       env=env, capture_output=True, text=True, cwd=tmp_path)
+    calls = log.read_text().splitlines() if log.exists() else []
+    return r, calls
+
+
+def test_an_absent_noo_data_is_created_bound_and_labelled_before_anything_mounts_it(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    (root / "noo-data").mkdir(parents=True)
+    r, calls = _ensure(tmp_path, exists=False, NOO_DATA_ROOT=str(root))
+    assert r.returncode == 0, r.stderr
+    create = [c for c in calls if c.startswith("volume create")]
+    assert create == [
+        f"volume create --driver local --opt type=none --opt o=bind --opt device={root}/noo-data "
+        "--label com.docker.compose.project=proj --label com.docker.compose.volume=noo-data proj_noo-data"
+    ], calls
+    run = [i for i, c in enumerate(calls) if c.startswith("run ")]
+    assert run and calls.index(create[0]) < run[0], "created before the throwaway container mounts it"
+
+
+def test_the_state_root_wins_as_in_the_compose_declaration(tmp_path: Path) -> None:
+    (tmp_path / "state" / "noo-data").mkdir(parents=True)
+    r, calls = _ensure(tmp_path, exists=False, NOO_DATA_ROOT=str(tmp_path / "data"), NOO_STATE_ROOT=str(tmp_path / "state"))
+    assert r.returncode == 0, r.stderr
+    assert any(f"device={tmp_path}/state/noo-data " in c for c in calls if c.startswith("volume create")), calls
+
+
+def test_a_data_root_only_in_dotenv_creates_the_volume(tmp_path: Path) -> None:
+    """The fresh-install case (rc.1 install matrix, 11-12): onboard's storage
+    step wrote NOO_DATA_ROOT to .env AFTER `noo onboard` had loaded .env, so the
+    launcher's environment never carried it. compose reads .env; so must we."""
+    root = tmp_path / "data"
+    (root / "noo-data").mkdir(parents=True)
+    (tmp_path / ".env").write_text(f"NOO_SECRETS_BACKEND=sops\nNOO_DATA_ROOT={root}\n")
+    r, calls = _ensure(tmp_path, exists=False)
+    assert r.returncode == 0, r.stderr
+    assert "NOO_DATA_ROOT is not set" not in r.stderr, r.stderr
+    create = [c for c in calls if c.startswith("volume create")]
+    assert len(create) == 1 and f"--opt device={root}/noo-data " in create[0], calls
+
+
+def test_dotenv_resolves_like_compose_state_root_first_and_the_environment_wins(tmp_path: Path) -> None:
+    a, b = tmp_path / "a", tmp_path / "b"
+    for d in (a / "data", a / "state", b / "data", b / "envroot"):
+        (d / "noo-data").mkdir(parents=True)
+    (a / ".env").write_text(f"NOO_DATA_ROOT={a}/data\nNOO_STATE_ROOT={a}/state\n")
+    r, calls = _ensure(a, exists=False)
+    assert r.returncode == 0, r.stderr
+    assert any(f"device={a}/state/noo-data " in c for c in calls if c.startswith("volume create")), calls
+    (b / ".env").write_text(f"NOO_DATA_ROOT={b}/data\n")
+    r, calls = _ensure(b, exists=False, NOO_DATA_ROOT=str(b / "envroot"))
+    assert r.returncode == 0, r.stderr
+    assert any(f"device={b}/envroot/noo-data " in c for c in calls if c.startswith("volume create")), calls
+
+
+def test_a_present_volume_bound_to_the_dotenv_root_is_not_called_unbound(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text(f"NOO_DATA_ROOT={tmp_path}/data\n")
+    r, _ = _ensure(tmp_path, exists=True, device=f"{tmp_path}/data/noo-data")
+    assert r.returncode == 0, r.stderr
+    assert "NOT bound" not in r.stderr, r.stderr
+
+
+def test_no_data_root_refuses_and_nothing_creates_the_volume(tmp_path: Path) -> None:
+    r, calls = _ensure(tmp_path, exists=False)
+    assert r.returncode == 1
+    assert "NOO_DATA_ROOT is not set" in r.stderr, r.stderr
+    assert not any(c.startswith(("volume create", "run ")) for c in calls), "never a plain volume, never a mount that would make one"
+
+
+def test_a_missing_bind_directory_refuses_and_nothing_creates_the_volume(tmp_path: Path) -> None:
+    r, calls = _ensure(tmp_path, exists=False, NOO_DATA_ROOT=str(tmp_path / "nowhere"))
+    assert r.returncode == 1
+    assert f"{tmp_path}/nowhere/noo-data does not exist" in r.stderr, r.stderr
+    assert not any(c.startswith(("volume create", "run ")) for c in calls), calls
+
+
+def test_an_existing_unbound_noo_data_is_named_loudly_and_left_alone(tmp_path: Path) -> None:
+    (tmp_path / "data" / "noo-data").mkdir(parents=True)
+    r, calls = _ensure(tmp_path, exists=True, device="", NOO_DATA_ROOT=str(tmp_path / "data"))
+    assert r.returncode == 0, "an existing install keeps starting"
+    assert "is NOT bound to the data root" in r.stderr and "/var/lib/docker/volumes/x/_data" in r.stderr, r.stderr
+    assert not any(c.startswith(("volume create", "volume rm")) for c in calls), "never recreated or moved silently"
+
+
+def test_an_existing_bound_noo_data_is_quiet(tmp_path: Path) -> None:
+    (tmp_path / "data" / "noo-data").mkdir(parents=True)
+    r, calls = _ensure(tmp_path, exists=True, device=f"{tmp_path}/data/noo-data", NOO_DATA_ROOT=str(tmp_path / "data"))
+    assert r.returncode == 0 and "WARNING" not in r.stderr, r.stderr
+    assert not any(c.startswith("volume create") for c in calls), calls
+
+
+def test_an_unbound_noo_data_is_warned_about_once_per_onboard(tmp_path: Path) -> None:
+    """rc.4 rehearsal B-reonboard: an onboard launches twice (services, then
+    the posture relaunch) and the warning printed both times. The relaunch
+    passes --data-warning-shown, which becomes --already-warned here: an
+    ARGUMENT, so an environment variable can never silence the warning."""
+    d = {n: tmp_path / n for n in ("plain", "envset", "arg")}
+    for p in d.values():
+        p.mkdir()
+        (p / ".env").write_text(f"NOO_DATA_ROOT={p}/data\n")
+
+    def ensure(where: Path, arg: str, **envs: str):
+        bindir, _ = _vol_fake(where, True, "")
+        env = {k: v for k, v in os.environ.items() if k not in ("NOO_DATA_ROOT", "NOO_STATE_ROOT", "COMPOSE_PROJECT_NAME")}
+        env.update(PATH=f"{bindir}:{os.environ['PATH']}", COMPOSE_PROJECT_NAME="proj", **envs)
+        return subprocess.run(["bash", "-c", f'. "{LIB_INSTANCE}" >/dev/null 2>&1; noo_prepare_gateway_data_dirs {arg}'],
+                              env=env, capture_output=True, text=True, cwd=where)
+
+    r = ensure(d["plain"], "")
+    assert r.returncode == 0 and "is NOT bound to the data root" in r.stderr, r.stderr
+    # Whatever the environment says, no argument means the warning prints.
+    r = ensure(d["envset"], "", NOO_DATA_VOLUME_WARNED="1", DATA_WARNED_ARG="--already-warned", warned="1")
+    assert r.returncode == 0 and "is NOT bound to the data root" in r.stderr, r.stderr
+    r = ensure(d["arg"], "--already-warned")
+    assert r.returncode == 0 and "is NOT bound to the data root" not in r.stderr, r.stderr
+
+
+def test_the_restart_takes_the_flag_from_its_argument_only() -> None:
+    text = (Path(__file__).resolve().parents[1] / "scripts" / "noomesh-restart.sh").read_text()
+    assert '\nDATA_WARNED_ARG=""\n' in text, "assigned before the argument loop, never read from the environment"
+    assert '--data-warning-shown)\n            DATA_WARNED_ARG="--already-warned"' in text
+    calls = text.count("noo_prepare_gateway_data_dirs ")
+    assert calls >= 2 and text.count("noo_prepare_gateway_data_dirs $DATA_WARNED_ARG ||") == calls, calls
