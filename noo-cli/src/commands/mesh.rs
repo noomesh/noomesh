@@ -725,38 +725,93 @@ pub fn mesh_stop(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             _ => return Err(Unhandled),
         }
     }
+    let project = crate::envfile::compose_project();
+    Ok(stop_on(&mut LiveStop { g, yes, project: &project }, volumes, &project))
+}
+
+/// What `stack stop` does to the machine; [`stop_on`] holds every decision,
+/// so a test drives it with a fake. The docker answer, the relaunch and the
+/// refusal are offboard's gate.
+trait StopHost: super::offboard::GateHost {
+    /// This project's volumes (`stack_volumes`).
+    fn volumes(&mut self) -> Result<Vec<String>, String>;
+    /// A line to stderr.
+    fn tell(&mut self, line: &str);
+    /// The typed confirmation (or -y); a no ends the process.
+    fn confirm_volumes(&mut self);
+    /// noomesh-stop.sh; `volumes` adds `-v` (compose `down -v`). Its exit code.
+    fn run_stop(&mut self, volumes: bool) -> i32;
+}
+
+/// `stack stop [--volumes]`: the exit code.
+fn stop_on(h: &mut impl StopHost, volumes: bool, project: &str) -> i32 {
     if volumes {
-        // Name what `down -v` will delete BEFORE the prompt (or -y): a removal
-        // of volumes that hold data is only ever one the user saw by name
-        // (i677 #20). A docker that does not answer is refused, never read
-        // as "no volumes".
-        let project = crate::envfile::compose_project();
-        // No docker binary at all is a positive answer (nothing of this
-        // stack can exist here), the same reading offboard gives it.
-        let listed = match super::offboard::docker_access() {
-            Ok(super::offboard::DockerAccess::NotInstalled) => Ok(Vec::new()),
-            Ok(super::offboard::DockerAccess::Reachable) => super::offboard::stack_volumes(&project),
-            Err(why) => Err(why),
-        };
-        match listed {
-            Ok(v) if v.is_empty() => eprintln!("no volumes of compose project {project} on this host"),
-            Ok(v) => eprintln!("this deletes {} volume(s) of compose project {project}: {}", v.len(), v.join(", ")),
-            Err(why) => {
-                if let Some(code) = crate::docker_group::relaunch_if_needed(&why) {
-                    return Ok(code);
-                }
-                let lines = super::offboard::docker_unreachable_refusal(&why, "noo stack stop --volumes");
-                for l in &lines[1..] {
-                    println!("{}", ui::note(l));
-                }
-                ui::close_failed(&lines[0], Some("docker ps"));
-                return Ok(1);
-            }
+        if let Err(code) = stop_volumes_listing(h, project) {
+            return code;
         }
-        confirm_stop_volumes(g, yes);
+        h.confirm_volumes();
     }
-    let script_args: Vec<String> = if volumes { vec!["-v".into()] } else { Vec::new() };
-    Ok(run_script(g, "noomesh-stop.sh", &script_args, Some("stop")))
+    h.run_stop(volumes)
+}
+
+/// `--volumes`: name what `down -v` will delete BEFORE the prompt (or -y):
+/// a removal of volumes that hold data is only ever one the user saw by name
+/// (i677 #20). A docker that does not answer is refused, never read as "no
+/// volumes": `Err(exit code)`, before the prompt and before `down -v`.
+fn stop_volumes_listing(h: &mut impl StopHost, project: &str) -> Result<(), i32> {
+    // No docker binary at all is a positive answer (nothing of this stack
+    // can exist here), the same reading offboard gives it.
+    let listed = match h.access() {
+        Ok(super::offboard::DockerAccess::NotInstalled) => Ok(Vec::new()),
+        Ok(super::offboard::DockerAccess::Reachable) => h.volumes(),
+        Err(why) => Err(why),
+    };
+    match listed {
+        Ok(v) if v.is_empty() => h.tell(&format!("no volumes of compose project {project} on this host")),
+        Ok(v) => h.tell(&format!("this deletes {} volume(s) of compose project {project}: {}", v.len(), v.join(", "))),
+        Err(why) => {
+            if let Some(code) = h.relaunch(&why) {
+                return Err(code);
+            }
+            h.refuse(&super::offboard::docker_unreachable_refusal(&why, "noo stack stop --volumes"));
+            return Err(1);
+        }
+    }
+    Ok(())
+}
+
+struct LiveStop<'a> {
+    g: &'a Globals,
+    yes: bool,
+    project: &'a str,
+}
+
+impl super::offboard::GateHost for LiveStop<'_> {
+    fn access(&mut self) -> Result<super::offboard::DockerAccess, String> {
+        super::offboard::GateHost::access(&mut super::offboard::LiveGate)
+    }
+    fn relaunch(&mut self, why: &str) -> Option<i32> {
+        super::offboard::GateHost::relaunch(&mut super::offboard::LiveGate, why)
+    }
+    fn refuse(&mut self, lines: &[String]) {
+        super::offboard::GateHost::refuse(&mut super::offboard::LiveGate, lines)
+    }
+}
+
+impl StopHost for LiveStop<'_> {
+    fn volumes(&mut self) -> Result<Vec<String>, String> {
+        super::offboard::stack_volumes(self.project)
+    }
+    fn tell(&mut self, line: &str) {
+        eprintln!("{line}");
+    }
+    fn confirm_volumes(&mut self) {
+        confirm_stop_volumes(self.g, self.yes);
+    }
+    fn run_stop(&mut self, volumes: bool) -> i32 {
+        let script_args: Vec<String> = if volumes { vec!["-v".into()] } else { Vec::new() };
+        run_script(self.g, "noomesh-stop.sh", &script_args, Some("stop"))
+    }
 }
 
 /// The front door eats a bare `-v` as the global `--verbose`, so a handler
@@ -1716,21 +1771,16 @@ mod docker_gate_order_tests {
         assert!(gate < refuse && refuse < confirm && confirm < stop, "{body}");
     }
 
-    /// SOURCE PIN: `noo stack stop --volumes` with a docker that did not
-    /// answer refuses (exit 1) BEFORE the confirm prompt and before the
-    /// script that runs `down -v`. The `return Ok(1);` must sit between the
-    /// refusal output and `confirm_stop_volumes(`.
+    /// `noo stack stop` goes through [`stop_on`]: nothing in the wrapper
+    /// asks, lists or runs on its own (what it decides: `stop_volumes_tests`).
     #[test]
-    fn stack_stop_volumes_refuses_before_it_prompts_when_docker_does_not_answer() {
+    fn stack_stop_decides_everything_in_stop_on() {
         let own = crate::test_src::own_code(include_str!("mesh.rs"));
         let body = crate::test_src::fn_body(&own, "pub fn mesh_stop(");
-        let refusal = body.find("docker_unreachable_refusal(&why, \"noo stack stop --volumes\")").expect("the refusal");
-        let closed = body[refusal..].find("ui::close_failed(").map(|i| i + refusal).expect("it says so");
-        let confirm = body[closed..].find("confirm_stop_volumes(").map(|i| i + closed).expect("the confirm");
-        let script = body.find("run_script(g, \"noomesh-stop.sh\"").expect("the script");
-        let between = &body[closed..confirm];
-        assert!(between.contains("return Ok(1);"), "the refusal must return before the confirm: {between}");
-        assert!(confirm < script, "{body}");
+        assert!(body.contains("Ok(stop_on(&mut LiveStop { g, yes, project: &project }, volumes, &project))"), "{body}");
+        for m in ["confirm_stop_volumes(", "run_script(", "docker_access(", "stack_volumes("] {
+            assert!(!body.contains(m), "{m} in mesh_stop: {body}");
+        }
     }
 
     /// `noo stack reset`: the wrapper changes nothing before the script; the
@@ -1756,5 +1806,91 @@ mod netns_unit_clean_tests {
         let stop = body.find("stop_self_heal_daemons(").expect("the stop");
         let rm = body.find("crate::netns_unit::remove(false)").expect("the clean removes the unit");
         assert!(stop < rm, "{body}");
+    }
+}
+
+#[cfg(test)]
+mod stop_volumes_tests {
+    use super::super::offboard::{DockerAccess, GateHost};
+    use super::*;
+
+    /// A fake `stack stop` host: docker's answers and every effect, in order.
+    struct FakeStop {
+        access: Result<DockerAccess, String>,
+        volumes: Result<Vec<String>, String>,
+        relaunch: Option<i32>,
+        events: Vec<String>,
+    }
+
+    impl GateHost for FakeStop {
+        fn access(&mut self) -> Result<DockerAccess, String> {
+            self.access.clone()
+        }
+        fn relaunch(&mut self, _why: &str) -> Option<i32> {
+            self.relaunch
+        }
+        fn refuse(&mut self, lines: &[String]) {
+            self.events.push(format!("refuse {}", lines[0]));
+        }
+    }
+
+    impl StopHost for FakeStop {
+        fn volumes(&mut self) -> Result<Vec<String>, String> {
+            self.volumes.clone()
+        }
+        fn tell(&mut self, line: &str) {
+            self.events.push(format!("tell {line}"));
+        }
+        fn confirm_volumes(&mut self) {
+            self.events.push("confirm".into());
+        }
+        fn run_stop(&mut self, volumes: bool) -> i32 {
+            self.events.push(format!("run volumes={volumes}"));
+            0
+        }
+    }
+
+    fn host(access: Result<DockerAccess, String>, volumes: Result<Vec<String>, String>) -> FakeStop {
+        FakeStop { access, volumes, relaunch: None, events: Vec::new() }
+    }
+
+    /// m12: `stack stop --volumes` with a docker that does not answer is
+    /// refused (exit 1) BEFORE the confirm prompt and before the script that
+    /// runs `down -v`. A listing that fails is refused the same way.
+    #[test]
+    fn stack_stop_volumes_refuses_before_it_prompts_when_docker_does_not_answer() {
+        let mut h = host(Err("permission denied".into()), Ok(vec![]));
+        assert_eq!(stop_on(&mut h, true, "noomesh"), 1);
+        assert_eq!(h.events, ["refuse cannot reach docker (permission denied): nothing was removed"]);
+        let mut h = host(Ok(DockerAccess::Reachable), Err("permission denied".into()));
+        assert_eq!(stop_on(&mut h, true, "noomesh"), 1);
+        assert_eq!(h.events, ["refuse cannot reach docker (permission denied): nothing was removed"]);
+        // A relaunch with the docker group: its exit, and nothing else here.
+        let mut h = FakeStop { relaunch: Some(0), ..host(Err("permission denied".into()), Ok(vec![])) };
+        assert_eq!((stop_on(&mut h, true, "noomesh"), h.events.len()), (0, 0));
+    }
+
+    /// The volumes are named before the prompt, and the prompt comes before
+    /// `down -v`.
+    #[test]
+    fn the_volumes_are_named_before_the_prompt_and_the_prompt_before_down_v() {
+        let mut h = host(Ok(DockerAccess::Reachable), Ok(vec!["noomesh_noo-data".into(), "noomesh_postgres-data".into()]));
+        assert_eq!(stop_on(&mut h, true, "noomesh"), 0);
+        assert_eq!(h.events, [
+            "tell this deletes 2 volume(s) of compose project noomesh: noomesh_noo-data, noomesh_postgres-data",
+            "confirm",
+            "run volumes=true",
+        ]);
+        let mut h = host(Ok(DockerAccess::NotInstalled), Err("never asked".into()));
+        assert_eq!(stop_on(&mut h, true, "noomesh"), 0);
+        assert_eq!(h.events, ["tell no volumes of compose project noomesh on this host", "confirm", "run volumes=true"]);
+    }
+
+    /// A plain stop asks docker nothing and prompts nothing.
+    #[test]
+    fn a_plain_stop_asks_nothing() {
+        let mut h = host(Err("never asked".into()), Err("never asked".into()));
+        assert_eq!(stop_on(&mut h, false, "noomesh"), 0);
+        assert_eq!(h.events, ["run volumes=false"]);
     }
 }
