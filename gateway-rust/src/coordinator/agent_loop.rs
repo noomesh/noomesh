@@ -60,6 +60,79 @@ pub struct UsageStats {
     pub total_tokens: u32,
     pub total_tool_calls: u32,
     pub total_latency_ms: u64,
+    /// The backend evaluated far less of a request than the loop sent: it cut
+    /// the prompt (i802). The worst call of the turn; `None` when every call
+    /// was read whole.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<Truncation>,
+}
+
+/// One model call whose prompt the backend cut: what the loop estimated it
+/// sent (its own `estimate_tokens`, ~2.5 chars/token) and what the backend
+/// reports evaluating (`usage.prompt_tokens`; Ollama's `prompt_eval_count`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Truncation {
+    pub sent_estimate: u64,
+    pub evaluated: u64,
+}
+
+/// Below this many estimated tokens a short prompt is not judged: the
+/// estimate's error is larger than any cut worth reporting.
+const TRUNCATION_MIN_ESTIMATE: u64 = 512;
+
+/// The loop's estimate runs about 1.6x a backend's real token count for
+/// English (2.5 vs ~4 chars a token; code and JSON run closer), so a prompt
+/// read whole comes back at about 0.6-0.8 of the estimate. Below 0.45 the
+/// backend dropped a real part of it (i802: 2,050 and 4,093 evaluated of
+/// 6,700-10,100 estimated). A smaller cut (under about a quarter) is within
+/// the estimate's error until the loop knows the backend's window.
+const TRUNCATION_RATIO_PERCENT: u64 = 450;
+
+/// Did the backend cut this call's prompt? Judged only for a local backend:
+/// a cloud API's prompt count can leave cached tokens out (Anthropic's
+/// `input_tokens`), which would read as a cut that never happened.
+pub(crate) fn backend_cut_prompt(sent_estimate: u64, evaluated: u64, cloud: bool) -> Option<Truncation> {
+    let cut = !cloud
+        && evaluated > 0
+        && sent_estimate >= TRUNCATION_MIN_ESTIMATE
+        && evaluated * 1000 < sent_estimate * TRUNCATION_RATIO_PERCENT;
+    cut.then_some(Truncation { sent_estimate, evaluated })
+}
+
+/// Record a cut call on the turn (the worst one is kept) and say so: a warn
+/// log, and one operator alert per backend per day. Never silent (P3).
+async fn note_backend_cut<R: HarnessRuntime>(
+    rt: &R,
+    usage: &mut UsageStats,
+    backend: &ResolvedBackend,
+    cut: Truncation,
+) {
+    let worse = usage.truncated.is_none_or(|t| cut.evaluated * t.sent_estimate < t.evaluated * cut.sent_estimate);
+    if worse {
+        usage.truncated = Some(cut);
+    }
+    let target = format!("{}:{}", crate::redact::scrub_url_userinfo(&backend.url), backend.model);
+    tracing::warn!(
+        backend = %backend.backend_type,
+        model = %backend.model,
+        url = %crate::redact::scrub_url_userinfo(&backend.url),
+        sent_estimate = cut.sent_estimate,
+        evaluated = cut.evaluated,
+        "context_truncated_by_backend"
+    );
+    rt.operator_alert(
+        crate::operator_alert::OperatorAlert::new(
+            "coordinator.context_truncated_by_backend",
+            &target,
+            format!(
+                "{} cut a chat prompt: it read {} tokens of about {} sent, so the model answered without most of its instructions",
+                backend.model, cut.evaluated, cut.sent_estimate
+            ),
+        )
+        .detail(format!("backend {} at {}; i802", backend.backend_type, crate::redact::scrub_url_userinfo(&backend.url))),
+        24 * 3600,
+    )
+    .await;
 }
 
 /// Sanitize tool output — delegates to the security kernel.
@@ -2168,6 +2241,8 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         }
         result.iterations = iteration;
         let iter_start = Instant::now();
+        let (evaluated_before, sent_estimate) =
+            (usage.prompt_tokens, (estimate_tokens(&session.messages) + estimate_tool_tokens(&tool_schemas)) as u64);
 
         // Debug: log message roles to diagnose ordering issues
         let roles: Vec<&str> = session.messages.iter()
@@ -2493,6 +2568,9 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             // The provider ended the stream with an error event (already
             // sent to the client): end the turn, as a failed send does.
             break;
+        }
+        if let Some(cut) = backend_cut_prompt(sent_estimate, u64::from(usage.prompt_tokens - evaluated_before), super::backend::is_cloud_backend(&backend)) {
+            note_backend_cut(rt, &mut usage, &backend, cut).await;
         }
 
         // Flush remaining tag buffer after stream ends
@@ -2938,14 +3016,19 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     result.elapsed_secs = start.elapsed().as_secs_f64();
     result.usage = usage.clone();
 
-    let _ = writer.send_event("done", json!({
+    let mut done = json!({
         "iterations": result.iterations,
         "tool_calls": result.tool_calls.len(),
         "elapsed_seconds": (result.elapsed_secs * 10.0).round() / 10.0,
         "tokens_in": usage.prompt_tokens,
         "tokens_out": usage.completion_tokens,
         "engine": "rust",
-    })).await;
+    });
+    if let Some(t) = usage.truncated {
+        done["truncated"] = json!(true);
+        done["truncation"] = json!(t);
+    }
+    let _ = writer.send_event("done", done).await;
 
     // Fire post-response hooks (registered by add-ons)
     rt.fire_post_response_hooks(conversation_id, &result).await;
@@ -3369,6 +3452,8 @@ async fn run_inner_bound<R: HarnessRuntime>(
         }
         result.iterations = iteration;
         let iter_start = Instant::now();
+        let (evaluated_before, sent_estimate) =
+            (usage.prompt_tokens, (estimate_tokens(&session.messages) + estimate_tool_tokens(&tool_schemas)) as u64);
 
         // For OpenAI-compat (vLLM, node-agent proxy), use stream=true even
         // though there's no WebSocket sink — vLLM's pythonic tool parser
@@ -3429,6 +3514,9 @@ async fn run_inner_bound<R: HarnessRuntime>(
             usage.prompt_tokens += streamed.prompt_tokens as u32;
             usage.completion_tokens += streamed.completion_tokens as u32;
             usage.total_tokens += streamed.total_tokens as u32;
+            if let Some(cut) = backend_cut_prompt(sent_estimate, u64::from(usage.prompt_tokens - evaluated_before), super::backend::is_cloud_backend(&backend)) {
+                note_backend_cut(rt, &mut usage, &backend, cut).await;
+            }
 
             let combined_content = if !streamed.reasoning.is_empty() && !streamed.content.is_empty() {
                 format!("<think>{}</think>\n\n{}", streamed.reasoning, streamed.content)
@@ -3476,6 +3564,9 @@ async fn run_inner_bound<R: HarnessRuntime>(
                 usage.prompt_tokens += p as u32;
                 usage.completion_tokens += c as u32;
                 usage.total_tokens += t as u32;
+            }
+            if let Some(cut) = backend_cut_prompt(sent_estimate, u64::from(usage.prompt_tokens - evaluated_before), super::backend::is_cloud_backend(&backend)) {
+                note_backend_cut(rt, &mut usage, &backend, cut).await;
             }
             let message = parse_llm_response(super::backend::wire_format(&backend), &llm_response);
             let content = message.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
@@ -4181,5 +4272,51 @@ mod unreadable_stream_tests {
         assert_eq!(unreadable_stream(1, "data: {}", false), None, "an event was read");
         assert_eq!(unreadable_stream(0, " \n ", false), None, "an empty body is the empty-answer path, as before");
         assert_eq!(unreadable_stream(0, "junk", true), None, "a cut, the deadline or a provider error already said why");
+    }
+}
+
+#[cfg(test)]
+mod backend_cut_tests {
+    use super::*;
+
+    /// i802's measured cell: the loop estimated 6,697-10,132 tokens and the
+    /// Ollama daemon (4,096 context) evaluated 2,050 of them. That is a cut.
+    /// A prompt read whole comes back at about 0.5-0.8 of the estimate
+    /// (2.5 vs ~4 chars a token), and is not.
+    #[test]
+    fn a_prompt_the_backend_read_only_part_of_is_a_cut() {
+        assert_eq!(backend_cut_prompt(6_697, 2_050, false), Some(Truncation { sent_estimate: 6_697, evaluated: 2_050 }));
+        assert!(backend_cut_prompt(10_132, 2_050, false).is_some());
+        assert!(backend_cut_prompt(10_132, 4_093, false).is_some(), "a turn after a side call (i802) is still cut");
+        assert!(backend_cut_prompt(6_697, 4_200, false).is_none(), "read whole (0.63 of the estimate): not a cut");
+        assert!(backend_cut_prompt(6_697, 5_500, false).is_none(), "code-heavy, read whole: not a cut");
+        assert!(backend_cut_prompt(6_697, 3_000, false).is_some(), "0.448 of the estimate: about 28% lost");
+        assert!(backend_cut_prompt(6_697, 3_100, false).is_none(), "0.46: within the estimate's error until the window is known");
+    }
+
+    /// Nothing is judged without a count, for a short prompt, or for a cloud
+    /// API whose prompt count can leave cached tokens out.
+    #[test]
+    fn nothing_is_judged_without_evidence() {
+        assert!(backend_cut_prompt(6_697, 0, false).is_none(), "no usage reported");
+        assert!(backend_cut_prompt(400, 50, false).is_none(), "a short prompt");
+        assert!(backend_cut_prompt(6_697, 2_050, true).is_none(), "a cloud backend");
+    }
+
+    /// Every place the loop adds a backend's prompt count also judges it,
+    /// and the stream path's done event carries the cut to the person.
+    #[test]
+    fn every_prompt_count_is_judged_and_the_done_event_says_so() {
+        let own = crate::test_src::own_code(include_str!("agent_loop.rs"));
+        let added = own.matches("usage.prompt_tokens += ").count();
+        let judged = own.matches("if let Some(cut) = backend_cut_prompt(sent_estimate, u64::from(usage.prompt_tokens - evaluated_before), super::backend::is_cloud_backend(&backend)) {").count();
+        // stream SSE, non-stream SSE, non-stream JSON; the cut-stream branch
+        // ends the turn before judging (a partial answer, already an error).
+        assert_eq!((added, judged), (4, 3), "a new prompt-count site must judge it");
+        let stream = crate::test_src::fn_body(&own, "async fn run_streaming_on_bound<");
+        let done = stream.find("let _ = writer.send_event(\"done\", done).await;").expect("the done event");
+        let flag = stream.find("done[\"truncated\"] = json!(true);").expect("the flag");
+        assert!(flag < done, "{stream}");
+        assert_eq!(own.matches("let (evaluated_before, sent_estimate) =").count(), 2, "both loops record the estimate per call");
     }
 }
