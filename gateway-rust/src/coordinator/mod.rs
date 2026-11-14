@@ -49,6 +49,7 @@ pub(crate) mod thinking;
 #[allow(unused_imports)]
 pub use agent_loop::{run, run_streaming, run_with_thinking, CoordinatorResult, UsageStats, run_with_role};
 pub use agent_loop::backend_failover_alert;
+pub use agent_loop::{backend_cut_alert, BACKEND_CUT_ALERT_KIND};
 pub(crate) use agent_loop::{MAX_LLM_BACKEND_ATTEMPTS, BACKEND_FAILOVER_ALERT_COOLDOWN_SECS};
 pub(crate) use backend::is_retryable_llm_http_error;
 #[cfg(test)]
