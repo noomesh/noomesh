@@ -12,7 +12,11 @@ status` shows which and where it is set; `on` starts them on their earlier
 data; `off` removes the containers, keeps `<state root>/{loki,tempo,grafana}`
 and prints the `sudo rm -rf` line to delete it yourself. While they are off,
 log search, Open Grafana and node log shipping answer "off by choice" with
-`noo stack monitoring on`, never an error. Prove it:
+`noo stack monitoring on`, never an error. On a lean install
+`noo cluster verify` reads the `loki`, `tempo`, `grafana door`,
+`logs last seen` and absent `* at rest` rows as OK, "not installed by
+choice", and a node's `log shipper` row says the controller keeps no logs
+by choice. Prove it:
 
 ```sh
 noo health                                        # gateway + dependencies, exit 5 if degraded

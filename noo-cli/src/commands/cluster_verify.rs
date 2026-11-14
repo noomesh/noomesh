@@ -37,6 +37,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 mod image_family;
+mod off_by_choice;
 mod tempo;
 mod warmup;
 pub(crate) mod restart_loops;
@@ -2211,8 +2212,9 @@ fn age_str(secs: i64) -> String {
 /// remedy, and a second row would read "-" on every Mac and on every agent
 /// that predates the shipper — two lines to read for one fact.
 ///
-/// Order of judgement: not reported → off by choice → the gateway has no
-/// route → stalled → journal not following → OK. The first three say why
+/// Order of judgement: not reported → off by choice → the controller keeps
+/// no logs by choice (gateway reason `loki_off`) → the gateway has no
+/// route → stalled → journal not following → OK. The first four say why
 /// nothing ships; only "stalled" is a failure, because it is the one state
 /// where the operator believes logs arrive and they do not.
 pub(crate) fn log_shipper_check(id: &str, ls: &Value, now_unix: i64, hb_recent: bool) -> Check {
@@ -2230,6 +2232,11 @@ pub(crate) fn log_shipper_check(id: &str, ls: &Value, now_unix: i64, hb_recent: 
         let why = if last_error.is_empty() { "no reason reported".to_string() } else { last_error };
         return warn("log shipper", format!("off: {why}"),
             Some(format!("NOO_LOG_SHIP=1 in /etc/noo-node-agent.env on {id} and restart the agent; if it has no TLS material: noo cluster provision {id}")));
+    }
+    // The controller runs no Loki by choice (`cluster.monitoring: lean`): its
+    // gateway refuses every batch with reason `loki_off`. Not a stall.
+    if off_by_choice::gateway_reason(&last_error) == Some(off_by_choice::LOKI_OFF_REASON) {
+        return ok("log shipper", off_by_choice::SHIPPER_DETAIL);
     }
     if ls["route_ready"].as_bool() == Some(false) {
         return warn("log shipper",
@@ -7508,8 +7515,13 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     }
     if controller {
+        // Grafana, Loki and Tempo may be off by choice on this install
+        // (`cluster.monitoring: lean`): their rows say so instead of failing.
+        // Read as `noo stack monitoring status` reads it; unset = full.
+        let monitoring = crate::commands::stack_monitoring::status_live(&crate::envfile::repo_root());
+        let monitoring_lean = off_by_choice::lean(&monitoring);
         if wait {
-            warmup::wait_for_warmup(g);
+            warmup::wait_for_warmup(g, monitoring_lean);
         }
         let controller_from = Instant::now();
         let addon_on = |name: &str| {
@@ -7678,7 +7690,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             sso.grafana_sso_key_readable_by_gateway(),
             grafana_mounts_sso_pub(),
         ));
-        checks.push(super::grafana_door::door_check(&super::grafana_door::gather(&crate::envfile::repo_root())));
+        checks.push(off_by_choice::or_judge(super::grafana_door::ROW, &monitoring, || {
+            super::grafana_door::door_check(&super::grafana_door::gather(&crate::envfile::repo_root()))
+        }));
         // Every declared model-class candidate is placed or available
         // An unplaced one is skipped at routing, and a class
         // whose candidates are all unplaced answers nothing.
@@ -7765,7 +7779,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // Fleet logging phase 0: the gateway can reach Loki (the row that
         // would have failed for a year), the listener is mTLS-only with no
         // published port, and where the chunks sit at rest.
-        let (loki, loki_seen) = warmup::loki_row_seen(g, now_unix());
+        let (loki, loki_seen) = warmup::loki_row_seen(g, now_unix(), monitoring_lean);
         checks.push(loki);
         let root = crate::envfile::repo_root();
         let loki_cfg = std::fs::read_to_string(root.join("monitoring/loki/loki-config-tls.yml")).ok();
@@ -7773,7 +7787,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(loki_listener_check(loki_cfg.as_deref(), compose.as_deref()));
         // Request tracing (i359): Tempo is ready to the gateway, and its
         // doors are mTLS-only with no published port.
-        checks.extend(tempo::rows(g));
+        checks.extend(tempo::rows(g, &monitoring));
         // The sandbox executor's door (mTLS doors phase 1): compose runs
         // its uvicorn with a required client certificate, and the gateway
         // container proves it live — no cert and plaintext refused, its own
@@ -7866,6 +7880,10 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 }
             }
             let exists = std::path::Path::new(&row.path).is_dir();
+            if let Some(c) = off_by_choice::state_dir_row(row.name, &monitoring, exists) {
+                checks.push(c);
+                continue;
+            }
             let mount = if exists { mount_of(&mounts, &row.path) } else { None };
             let encrypted = mount.as_ref().and_then(|(dev, _)| block_device_encrypted(dev));
             checks.push(at_rest_check_with(
@@ -7968,7 +7986,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 Some((id, n["status"] == "online" && heard))
             })
             .collect();
-        checks.push(logs_last_seen_check(metrics.as_deref(), &roster, now));
+        checks.push(off_by_choice::or_judge("logs last seen", &monitoring, || logs_last_seen_check(metrics.as_deref(), &roster, now)));
         // The legacy credential lanes, gateway counters from
         // the same /metrics text, node counts from each node record.
         // Each node's last apply report, for the
