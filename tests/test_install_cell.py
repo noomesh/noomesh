@@ -781,3 +781,41 @@ def test_the_summary_reports_both_numbers(tmp_path):
     assert out["first_answer_s"] == 100 and out["first_answer_wall_s"] == 700 and out["probe_wait_before_first_answer_s"] == 600
     md = (tmp_path / "summary.md").read_text()
     assert "first answer 100 s after the cell started (not counting 600 s of probes before it; 700 s on the wall clock)" in md
+
+
+def _ctx_wrapper():
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    body = text[text.index("judged_ctx() {"):]
+    lead = 'step "$name" "$t" -- sh -c \''
+    body = body[body.index(lead) + len(lead):]
+    return body[:body.index("' \\\n        context-fit")]
+
+
+def test_a_context_fit_not_judged_never_fails_the_cell(tmp_path):
+    # harness's context_fit.py (noomesh#1217): 0 PASS, 1 FAIL, 2 NOT JUDGED.
+    # On rc.1 and older every judge is NOT JUDGED and the cell must stay green.
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    for rc in (0, 1, 2):
+        (fake / "python3").write_text(f"#!/bin/sh\nexit {rc}\n")
+        (fake / "python3").chmod(0o755)
+        p = subprocess.run(["sh", "-c", _ctx_wrapper(), "context-fit", "ctx.py", "running"],
+                           env={"PATH": f"{fake}:/usr/bin:/bin"}, capture_output=True, text=True)
+        want = {0: 0, 1: 1, 2: 0}[rc]
+        assert p.returncode == want, (rc, p.returncode, p.stdout)
+        assert ("NOT JUDGED" in p.stdout) == (rc == 2)
+
+
+def test_the_pinned_context_runs_on_one_cell_after_the_unpinned_judges():
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    assert 'CONTEXT_PIN_CELL=stranger-24.04' in text
+    i_rag = text.index("step rag-chat 60")
+    i_run = text.index("judged_ctx context-fit-running 300 running")
+    i_turns = text.index('judged_ctx context-fit-turns 900 turns --out "$OUT/context-fit"')
+    i_pin = text.index('if [ "$CELL" = "$CONTEXT_PIN_CELL" ] && [ -f "$CONTEXT_FIT" ]; then')
+    assert i_rag < i_run < i_turns < i_pin, "unpinned judges first; the pin changes the chat context for the rest of the cell"
+    pinned = text[i_pin:text.index("\nfi\n", i_pin)]
+    order = [pinned.index(k) for k in ("--env OLLAMA_CONTEXT_LENGTH=4096", "stack restart --force gateway",
+                                        "running --expect-decided 4096", "pinned-check", "doesnt-fit")]
+    assert order == sorted(order), "pin, restart (the gateway caches the decided context 600 s), then judge"
+    assert 'step "$name" 10 -- sh -c \'echo "CONTEXT-FIT: not judged: context_fit.py is not in this tree"\'' in text

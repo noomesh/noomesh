@@ -494,6 +494,37 @@ step rag-chat 60 -- sh -c '
   fi
   echo "RAG-CHAT NOTE: the tiny test model ($TINY_MODEL) did not return the fact; this cell runs MODEL=$MODEL, not the product default, so this is not a product verdict"' || fail_onboarded
 
+# JUDGED (harness, i802 context fit; noomesh#1217's context_fit.py): the chat
+# context the gateway decided is the one the backend runs, and the turns a
+# user meets (first answer, RAG, a tool turn, a refusal) answer, each with its
+# prefill seconds in $OUT/context-fit/turns.json for the rc-to-rc table. Exit
+# 2 is NOT JUDGED (a build without chat_contexts / backend_call, rc.1 and
+# older): printed, never the cell's failure. The 4096-pinned variant and the
+# doesn't-fit turn run on CONTEXT_PIN_CELL only, after everything above,
+# because the pin changes the stack's chat context for the rest of the cell.
+CONTEXT_FIT="$HERE/context_fit.py"
+CONTEXT_PIN_CELL=stranger-24.04
+judged_ctx() {  # step name, timeout, context_fit.py args...
+    local name="$1" t="$2"; shift 2
+    if [ ! -f "$CONTEXT_FIT" ]; then
+        step "$name" 10 -- sh -c 'echo "CONTEXT-FIT: not judged: context_fit.py is not in this tree"'
+        return 0
+    fi
+    step "$name" "$t" -- sh -c 'python3 "$@"; rc=$?; [ "$rc" = 2 ] && { echo "CONTEXT-FIT: NOT JUDGED (exit 2: this build does not carry what the judge reads)"; exit 0; }; exit "$rc"' \
+        context-fit "$CONTEXT_FIT" "$@" || fail_onboarded
+}
+judged_ctx context-fit-running 300 running
+judged_ctx context-fit-turns 900 turns --out "$OUT/context-fit" --model-label "$MODEL"
+if [ "$CELL" = "$CONTEXT_PIN_CELL" ] && [ -f "$CONTEXT_FIT" ]; then
+    CHAT_MODEL="$(fresh --json cluster show "$(hostname)" 2>/dev/null | python3 -c 'import json, sys; print((json.load(sys.stdin).get("running_backends") or {}).get("ollama", ""))' 2>/dev/null)"
+    CHAT_MODEL="${CHAT_MODEL:-$( [ "$MODEL" = tiny ] && echo "$TINY_MODEL" || echo gemma4:e2b)}"
+    step context-pin-4096 300 -- bash -c 'fresh cluster place "$(hostname)" ollama "$1" --role chat --env OLLAMA_CONTEXT_LENGTH=4096' pin "$CHAT_MODEL" || fail_onboarded
+    step context-pin-restart 600 -- bash -c 'fresh stack restart --force gateway' || fail_onboarded
+    judged_ctx context-fit-pinned-running 300 running --expect-decided 4096
+    judged_ctx context-fit-pinned-check 600 pinned-check
+    judged_ctx context-fit-doesnt-fit 300 doesnt-fit
+fi
+
 # PROBE (fa, rc.1 rehearsal A-reboot.status, i677): a container that joins
 # another's network namespace (network_mode: service:<door>; noo-ollama-embed
 # joins noo-stunnel-ollama-embed) must be running after EVERY dockerd start.
