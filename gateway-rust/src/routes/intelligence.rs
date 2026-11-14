@@ -2218,22 +2218,7 @@ pub(crate) async fn upsert_builtin_override(
     patch: Option<&Value>,
     updated_by: &str,
 ) -> Result<Option<Value>, sqlx::Error> {
-    sqlx::query_scalar::<_, Option<Value>>(
-        "INSERT INTO noo_autonomy_overrides (name, enabled, config, updated_by) \
-         VALUES ($1, $2, $3, $4) \
-         ON CONFLICT (name) DO UPDATE SET \
-           enabled = COALESCE($2, noo_autonomy_overrides.enabled), \
-           config = CASE WHEN $3::jsonb IS NULL THEN noo_autonomy_overrides.config \
-                         ELSE COALESCE(noo_autonomy_overrides.config, '{}'::jsonb) || $3::jsonb END, \
-           updated_at = now(), updated_by = $4 \
-         RETURNING config",
-    )
-    .bind(name)
-    .bind(enabled)
-    .bind(patch)
-    .bind(updated_by)
-    .fetch_one(db)
-    .await
+    crate::repo::autonomy::upsert_override(db, name, enabled, patch, updated_by).await
 }
 
 /// The built-in rules whose action has a second opt-in, `dry_run` (default
@@ -2247,8 +2232,6 @@ pub(crate) fn dry_run_gate(name: &str) -> Option<&'static str> {
              stopped containers and dangling images, the build cache, unused model weights, and \
              superseded images of noomesh and of the add-ons it runs (only from those images' own \
              repositories; never your other images, never one a container uses), on the controller \
-             and on every node.",
-        ), on the controller \
              and on every node.",
         ),
         "cert_auto_rotate" => Some(
@@ -2756,11 +2739,11 @@ mod dry_run_tests {
         // back to preview, with the enabled flag left as it was
         let after = upsert_builtin_override(&db, &name, None, Some(&json!({"dry_run": true})), "op").await.unwrap().expect("config");
         assert_eq!((after["dry_run"].clone(), after["enabled_action"].clone()), (json!(true), json!(false)), "{after}");
-        let enabled: Option<bool> = sqlx::query_scalar("SELECT enabled FROM noo_autonomy_overrides WHERE name = $1").bind(&name).fetch_one(&db).await.unwrap();
+        let enabled = crate::repo::autonomy::override_enabled(&db, &name).await.unwrap();
         assert_eq!(enabled, Some(true), "a dry-run change must not touch the enabled flag");
         // a plain enable/disable with no config leaves the config as it is
         let after = upsert_builtin_override(&db, &name, Some(false), None, "op").await.unwrap().expect("config");
         assert_eq!(after["cache_cap_bytes"], json!(1234));
-        sqlx::query("DELETE FROM noo_autonomy_overrides WHERE name = $1").bind(&name).execute(&db).await.unwrap();
+        crate::repo::autonomy::delete_override(&db, &name).await.unwrap();
     }
 }
