@@ -165,6 +165,9 @@ type Reconciler struct {
 	nwMu   sync.Mutex
 	nwBusy map[string]bool
 	nwWG   sync.WaitGroup
+	// nwChanged runs after each node workload converge (the heartbeat Kick);
+	// nil = nothing (tests).
+	nwChanged func()
 	// ctlApprovals keeps the controller's signed approval set (i596); nil in
 	// tests that build a Reconciler by hand, and the offer is then skipped.
 	ctlApprovals *nodepolicy.ControllerApprovals
@@ -321,6 +324,7 @@ func (r *Reconciler) Run(ctx context.Context) {
 	// workload declarations load now, not at the first tick 30 s away: a
 	// reserve right after an agent restart would meet 404 not_declared.
 	r.loadAddonWorkloads(ctx)
+	go r.watchLeaves(ctx, leafWatchInterval)
 	select {
 	case <-ctx.Done():
 		return

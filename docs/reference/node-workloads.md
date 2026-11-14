@@ -596,7 +596,7 @@ The agent's fixed vocabulary for the `reason` of a `node_workloads` or
 |---|---|---|
 | `decl_invalid` | the decl fails the node-workloads rules (the inner refusal code is logged) | fix the add-on's `node-workloads.json` |
 | `desired_invalid` | the entry is malformed: unknown field, wrong type, bad state, reservation not a UUID, name or `start_secs`/`drain` differing from the decl, wrong `door.leaf` | a gateway bug or version skew: upgrade the controller |
-| `door_leaf_missing` | the door leaf is not available: it is not in the provision bundle yet, or this node's applier predates the `svc-addon-*` leaf kind | re-provision (`noo upgrade --nodes`) |
+| `door_leaf_missing` | the door leaf is not available: it is not in the provision bundle yet, or this node's applier predates the `svc-addon-*` leaf kind. Right after a provision this can be the agent's previous report: the agent re-checks the leaf every 5 s and reports the change at once | wait a few seconds and retry; if it stays, re-provision (`noo upgrade --nodes`) |
 | `image_missing` | `image` is not `{name, digest, id, artifact}` as above (name, digest, id or artifact absent, malformed or inconsistent), or the tar is not on the rail | re-enable or upgrade the add-on on the controller |
 | `image_digest_mismatch` | the tar did not load as exactly one image, or that image's ID differs from `image.id` | re-stage the image; investigate the rail |
 | `set_missing` | a required slot has no set | choose a model for the slot |

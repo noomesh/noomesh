@@ -414,6 +414,7 @@ func (a *Agent) Run() error {
 		a.server.SetManagedWorkloads(mc)
 	}
 	a.server.SetReconcileNudge(rec.Nudge)
+	rec.SetNodeWorkloadsChanged(a.hb.Kick)
 	a.server.SetMCP(rec.MCP())
 	a.server.SetChatPlacement(func() (api.ChatPlacement, bool) {
 		b, m, ok := rec.ChatPlacement()

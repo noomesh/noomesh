@@ -481,6 +481,15 @@ func addonLeafDir(pki, addon, workload string) string {
 	return filepath.Join(pki, "services", "addon-"+addon+"-"+workload)
 }
 
+// LeafReady reports whether addon/workload's door leaf is on this node and
+// would pass checkLeaf now. The reconciler's leaf watch asks it for a
+// workload refused door_leaf_missing, so the workload is provisioned as soon
+// as the applier installs the leaf, not at the next 5-minute tick.
+func (p *NodeWorkloads) LeafReady(addon, workload string) bool {
+	_, err := p.checkLeaf(nodewl.Entry{Addon: addon, Name: workload})
+	return err == nil
+}
+
 // checkLeaf finds the door leaf the applier installed for this node (see
 // addonLeafDir) and the cluster CA, and checks the certificate names the
 // door. Anything missing is door_leaf_missing and nothing is provisioned. The
