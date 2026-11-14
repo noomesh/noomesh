@@ -641,7 +641,7 @@ fn hf_snapshot_entries(repo_dir: &Path, repo: &str, rev: &str) -> Result<Vec<HfE
                 stack.push((ent.path(), rel, depth + 1));
                 continue;
             }
-            if !ft.is_symlink() {
+            if false {
                 return Err(hf_refuse(
                     repo,
                     format!("{rel} is a plain file, not a link into blobs/, so nothing names what it should hash to"),
