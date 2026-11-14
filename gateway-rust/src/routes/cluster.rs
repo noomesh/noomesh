@@ -4065,8 +4065,9 @@ async fn desired_config_get(
         String,
         Option<String>,
         Option<i64>,
+        bool,
     )> = sqlx::query_as(
-        "SELECT backend, model, image, port, tls, env, desired_state, role, target, memory_limit_bytes \
+        "SELECT backend, model, image, port, tls, env, desired_state, role, target, memory_limit_bytes, keep_warm \
              FROM noo_backend_placements WHERE node_id = $1 ORDER BY backend, role",
     )
     .bind(&node_id)
@@ -4077,7 +4078,7 @@ async fn desired_config_get(
     let placement_json: Vec<Value> = placements
         .into_iter()
         .map(
-            |(backend, model, image, port, tls, env, desired_state, role, target, memory_limit_bytes)| {
+            |(backend, model, image, port, tls, env, desired_state, role, target, memory_limit_bytes, keep_warm)| {
                 let image = placement_image(&backend, image, &|k: &str| std::env::var(k).ok());
                 json!({
                     "backend": backend,
@@ -4093,6 +4094,10 @@ async fn desired_config_get(
                     "target": target,
                     // llama.cpp container memory limit; null = the agent's default.
                     "memory_limit_bytes": memory_limit_bytes,
+                    // `--keep-warm`: the agent keeps this ollama model loaded
+                    // (keep_alive -1 + a preload) on any ollama runtime. An
+                    // agent that predates it ignores the key.
+                    "keep_warm": keep_warm,
                 })
             },
         )
@@ -4459,6 +4464,23 @@ struct PlacementBody {
     /// store (a GGUF file). Used for this request's fit check only; never
     /// stored.
     model_size_bytes: Option<u64>,
+    /// `--keep-warm` (true) / `--no-keep-warm` (false). Absent keeps the
+    /// stored flag for the same model and clears it on a model change (the
+    /// target's rule): warm was declared for THAT model.
+    keep_warm: Option<bool>,
+}
+
+/// Which placements may be declared warm: an ollama chat model. vLLM and
+/// llama.cpp hold their one model for as long as they run, and an embedder
+/// is not loaded by a generate-shaped preload, so a flag there would be a
+/// promise nothing keeps.
+pub(crate) fn validate_keep_warm(backend: &str, role: &str, keep_warm: Option<bool>) -> Result<(), String> {
+    if keep_warm != Some(true) || (backend == "ollama" && role == "chat") {
+        return Ok(());
+    }
+    Err(format!(
+        "--keep-warm is for an ollama chat placement (this is {backend}, role {role}): vllm and llamacpp hold their model while they run"
+    ))
 }
 
 /// Check a requested hardware target against the backend and the node:
@@ -4515,8 +4537,8 @@ pub(crate) fn resolve_role(backend: &str, role: Option<&str>) -> Result<String, 
 /// so it can never be inherited either. Every `SET` expression reads the OLD
 /// row, so `model` comparisons are against what was stored.
 pub(crate) const PLACEMENT_UPSERT: &str =
-    "INSERT INTO noo_backend_placements (node_id, backend, model, image, port, tls, env, desired_state, role, target, memory_limit_bytes, updated_at) \
-     VALUES ($1, $2, $3, $4, $5, COALESCE($6, false), COALESCE($7, '{}'::jsonb), $8, $9, $10, $11, NOW()) \
+    "INSERT INTO noo_backend_placements (node_id, backend, model, image, port, tls, env, desired_state, role, target, memory_limit_bytes, keep_warm, updated_at) \
+     VALUES ($1, $2, $3, $4, $5, COALESCE($6, false), COALESCE($7, '{}'::jsonb), $8, $9, $10, $11, COALESCE($12, false), NOW()) \
      ON CONFLICT (node_id, backend, role, (CASE WHEN role = 'embed' THEN model ELSE '' END)) DO UPDATE SET \
        env   = CASE WHEN $3::text IS NOT NULL AND $3::text IS DISTINCT FROM noo_backend_placements.model \
                     THEN COALESCE($7, '{}'::jsonb) ELSE COALESCE($7, noo_backend_placements.env) END, \
@@ -4526,6 +4548,9 @@ pub(crate) const PLACEMENT_UPSERT: &str =
        memory_limit_bytes = CASE WHEN $11::bigint IS NOT NULL THEN $11::bigint \
                      WHEN $3::text IS NOT NULL AND $3::text IS DISTINCT FROM noo_backend_placements.model THEN NULL \
                      ELSE noo_backend_placements.memory_limit_bytes END, \
+       keep_warm = CASE WHEN $12::boolean IS NOT NULL THEN $12::boolean \
+                     WHEN $3::text IS NOT NULL AND $3::text IS DISTINCT FROM noo_backend_placements.model THEN false \
+                     ELSE noo_backend_placements.keep_warm END, \
        model = COALESCE($3, noo_backend_placements.model), \
        image = COALESCE($4, noo_backend_placements.image), \
        port  = COALESCE($5, noo_backend_placements.port), \
@@ -4543,6 +4568,23 @@ pub(crate) struct StoredPlacement {
     pub desired_state: String,
     /// The declared hardware target (`cpu` | `gpu`), NULL when undeclared.
     pub target: Option<String>,
+    /// `--keep-warm`: held resident by the node agent (the fit check marks it).
+    pub keep_warm: bool,
+}
+
+/// The keep-warm flag a placement would have AFTER the upsert: the given one,
+/// else the stored one while the model is unchanged, else off
+/// ([`PLACEMENT_UPSERT`]'s rule).
+pub(crate) fn effective_keep_warm_after_upsert(
+    existing: Option<&StoredPlacement>,
+    body_model: Option<&str>,
+    body_keep_warm: Option<bool>,
+) -> bool {
+    if let Some(k) = body_keep_warm {
+        return k;
+    }
+    let changed = matches!((body_model, existing.and_then(|e| e.model.as_deref())), (Some(n), Some(o)) if n != o);
+    !changed && existing.is_some_and(|e| e.keep_warm)
 }
 
 /// The target a placement would have AFTER the upsert: the given one, else the
@@ -4588,6 +4630,7 @@ fn spec_of(sp: &StoredPlacement) -> Option<crate::placement_fit::Spec> {
         model,
         env: sp.env.as_object().cloned().unwrap_or_default(),
         target: sp.target.clone(),
+        keep_warm: sp.keep_warm,
     })
 }
 
@@ -4673,8 +4716,8 @@ async fn harness_kind_fit(
 }
 
 async fn stored_placements(state: &AppState, node_id: &str) -> Result<Vec<StoredPlacement>, AppError> {
-    let rows: Vec<(String, String, Option<String>, Value, String, Option<String>)> = sqlx::query_as(
-        "SELECT backend, role, model, env, desired_state, target FROM noo_backend_placements WHERE node_id = $1 ORDER BY backend, role",
+    let rows: Vec<(String, String, Option<String>, Value, String, Option<String>, bool)> = sqlx::query_as(
+        "SELECT backend, role, model, env, desired_state, target, keep_warm FROM noo_backend_placements WHERE node_id = $1 ORDER BY backend, role",
     )
     .bind(node_id)
     .fetch_all(&state.db)
@@ -4682,7 +4725,7 @@ async fn stored_placements(state: &AppState, node_id: &str) -> Result<Vec<Stored
     .map_err(|e| AppError::Internal(format!("placements query: {e}")))?;
     Ok(rows
         .into_iter()
-        .map(|(backend, role, model, env, desired_state, target)| StoredPlacement { backend, role, model, env, desired_state, target })
+        .map(|(backend, role, model, env, desired_state, target, keep_warm)| StoredPlacement { backend, role, model, env, desired_state, target, keep_warm })
         .collect())
 }
 
@@ -4902,6 +4945,7 @@ async fn placement_put(
         let node = node_fit_facts(&state, &node_id).await?;
         validate_target(&backend, target, &node).map_err(AppError::BadRequest)?;
     }
+    validate_keep_warm(&backend, &role, body.keep_warm).map_err(AppError::BadRequest)?;
 
     // The memory-fit check (multi-role placements). A stopped placement holds
     // no memory and a harness is a host service; neither is judged.
@@ -4913,7 +4957,8 @@ async fn placement_put(
         let mine = existing.iter().find(|e| same_placement_slot(e, &backend, &role, body.model.as_deref()));
         let (model, env) = effective_after_upsert(mine, body.model.as_deref(), body.env.as_ref());
         let ptarget = effective_target_after_upsert(mine, body.model.as_deref(), target);
-        let proposed = StoredPlacement { backend: backend.clone(), role: role.clone(), model, env, desired_state: "running".into(), target: ptarget };
+        let keep_warm = effective_keep_warm_after_upsert(mine, body.model.as_deref(), body.keep_warm);
+        let proposed = StoredPlacement { backend: backend.clone(), role: role.clone(), model, env, desired_state: "running".into(), target: ptarget, keep_warm };
         if proposed.model.as_deref().is_some_and(|m| !m.is_empty()) {
             let mut node = node_fit_facts(&state, &node_id).await?;
             with_size_hint(&mut node, proposed.model.as_deref(), body.model_size_bytes);
@@ -5018,6 +5063,7 @@ async fn placement_put(
         .bind(&role)
         .bind(target)
         .bind(memory_limit.as_ref().map(|(b, _)| *b as i64))
+        .bind(body.keep_warm)
         .execute(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("placement upsert: {e}")))?;
@@ -5027,6 +5073,7 @@ async fn placement_put(
     nudge_reconcile(state.clone(), node_id.clone());
     Ok(Json(json!({
         "ok": true, "node_id": node_id, "backend": backend, "role": role,
+        "keep_warm": body.keep_warm,
         "fit": fit_json, "warnings": fit_warnings,
         "memory_limit": memory_limit.map(|(b, why)| json!({"bytes": b, "why": why})),
     })))
@@ -5142,7 +5189,8 @@ async fn placement_fit_post(
             let (model, env) = effective_after_upsert(mine, Some(&w.model), w.env.as_ref());
             let target = effective_target_after_upsert(mine, Some(&w.model), target);
             with_size_hint(&mut node, Some(&w.model), w.model_size_bytes);
-            (Some((w.backend.clone(), role.clone(), Some(w.model.clone()))), Some(StoredPlacement { backend: w.backend.clone(), role, model, env, desired_state: "running".into(), target }))
+            let keep_warm = effective_keep_warm_after_upsert(mine, Some(&w.model), None);
+            (Some((w.backend.clone(), role.clone(), Some(w.model.clone()))), Some(StoredPlacement { backend: w.backend.clone(), role, model, env, desired_state: "running".into(), target, keep_warm }))
         }
         None => (None, None),
     };
@@ -6573,7 +6621,8 @@ native process)".into());
                     let mine = existing.iter().find(|e| same_placement_slot(e, &backend, &role, w["model"].as_str()));
                     let (model, env) = effective_after_upsert(mine, w["model"].as_str(), w.get("env").filter(|e| e.is_object()));
                     let target = effective_target_after_upsert(mine, w["model"].as_str(), w["target"].as_str());
-                    Some(StoredPlacement { backend, role, model, env, desired_state: "running".into(), target })
+                    let keep_warm = effective_keep_warm_after_upsert(mine, w["model"].as_str(), None);
+                    Some(StoredPlacement { backend, role, model, env, desired_state: "running".into(), target, keep_warm })
                 }
                 None => None,
             };
@@ -8179,7 +8228,7 @@ mod placement_role_tests {
     use super::*;
 
     fn stored(backend: &str, role: &str, model: &str, env: Value) -> StoredPlacement {
-        StoredPlacement { backend: backend.into(), role: role.into(), model: Some(model.into()), env, desired_state: "running".into(), target: None }
+        StoredPlacement { backend: backend.into(), role: role.into(), model: Some(model.into()), env, desired_state: "running".into(), target: None, keep_warm: false }
     }
 
     #[test]
@@ -8191,6 +8240,72 @@ mod placement_role_tests {
         assert_eq!(effective_target_after_upsert(Some(&gemma), Some("other.gguf"), None), None);
         assert_eq!(effective_target_after_upsert(Some(&gemma), Some("gemma.gguf"), Some("gpu")).as_deref(), Some("gpu"));
         assert_eq!(effective_target_after_upsert(None, Some("x"), None), None);
+    }
+
+    /// `--keep-warm` is stored with the placement: off unless declared, kept
+    /// for the same model, cleared by `--no-keep-warm` and by a model change.
+    #[test]
+    fn keep_warm_is_off_by_default_kept_for_the_model_and_cleared() {
+        assert!(!effective_keep_warm_after_upsert(None, Some("gemma4:12b"), None), "default off");
+        assert!(effective_keep_warm_after_upsert(None, Some("gemma4:12b"), Some(true)));
+        let mut warm = stored("ollama", "chat", "gemma4:12b", json!({}));
+        warm.keep_warm = true;
+        assert!(effective_keep_warm_after_upsert(Some(&warm), Some("gemma4:12b"), None), "a re-place keeps it");
+        assert!(effective_keep_warm_after_upsert(Some(&warm), None, None), "a bare stop/start keeps it");
+        assert!(!effective_keep_warm_after_upsert(Some(&warm), Some("gemma4:12b"), Some(false)), "--no-keep-warm clears it");
+        assert!(!effective_keep_warm_after_upsert(Some(&warm), Some("gemma4:e2b"), None), "warm was declared for the old model");
+        // The upsert text follows the same rule and inserts false.
+        assert!(PLACEMENT_UPSERT.contains("COALESCE($12, false)"), "an insert without the flag is off");
+        assert!(PLACEMENT_UPSERT.contains(
+            "keep_warm = CASE WHEN $12::boolean IS NOT NULL THEN $12::boolean \
+                     WHEN $3::text IS NOT NULL AND $3::text IS DISTINCT FROM noo_backend_placements.model THEN false \
+                     ELSE noo_backend_placements.keep_warm END"
+        ));
+    }
+
+    /// Only an ollama chat placement can be declared warm; clearing is always
+    /// accepted.
+    #[test]
+    fn keep_warm_is_for_ollama_chat_only() {
+        assert!(validate_keep_warm("ollama", "chat", Some(true)).is_ok());
+        for (b, r) in [("vllm", "chat"), ("llamacpp", "chat"), ("ollama", "embed"), ("ollama", "rerank"), ("harness", "harness")] {
+            let e = validate_keep_warm(b, r, Some(true)).unwrap_err();
+            assert!(e.contains("--keep-warm is for an ollama chat placement"), "{b}/{r}: {e}");
+            assert!(validate_keep_warm(b, r, Some(false)).is_ok(), "{b}/{r}: --no-keep-warm is never refused");
+            assert!(validate_keep_warm(b, r, None).is_ok());
+        }
+    }
+
+    /// The fit check counts a warm model as resident: placing a second model
+    /// on a node with a warm one is judged against both.
+    #[test]
+    fn the_fit_counts_a_warm_model_as_resident() {
+        let node = json!({"vram_gb": 12.0, "ram_gb": 32.0});
+        let mut warm = stored("ollama", "chat", "gemma4:12b", json!({"OLLAMA_CONTEXT_LENGTH": "4096"}));
+        warm.keep_warm = true;
+        let embed = stored("ollama", "embed", "gemma4:e2b", json!({}));
+        let specs = fit_specs(std::slice::from_ref(&warm), Some(("ollama", "embed", Some("gemma4:e2b"))), Some(&embed));
+        assert!(specs.iter().any(|s| s.model == "gemma4:12b" && s.keep_warm), "the warm placement is in the fit: {specs:?}");
+        let with = crate::placement_fit::evaluate(&node, &specs, crate::embedding_client::EMBED_NUM_CTX);
+        let alone = crate::placement_fit::evaluate(&node, &fit_specs(&[], None, Some(&embed)), crate::embedding_client::EMBED_NUM_CTX);
+        let warm_row = with.rows.iter().find(|r| r.model == "gemma4:12b").expect("warm row");
+        assert!(warm_row.total_gb > 1.0, "a warm 12b is charged its resident size: {}", warm_row.total_gb);
+        assert!((with.total_gb - alone.total_gb - warm_row.total_gb).abs() < 1e-9, "the warm model adds to the pool");
+        assert!(warm_row.notes.iter().any(|n| n.contains("declared warm")), "{:?}", warm_row.notes);
+        let j = with.to_json();
+        assert!(j["models"].as_array().unwrap().iter().any(|m| m["model"] == "gemma4:12b" && m["keep_warm"] == true), "{j}");
+    }
+
+    /// desired-config carries the flag to the agent as `keep_warm`.
+    #[test]
+    fn desired_config_delivers_keep_warm() {
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn desired_config_get(");
+        assert!(body.contains("memory_limit_bytes, keep_warm \\"), "the column is read");
+        assert!(body.contains("\"keep_warm\": keep_warm,"), "and sent");
+        let put = crate::test_src::fn_body(&own, "async fn placement_put(");
+        assert!(put.contains(".bind(body.keep_warm)"), "the PUT stores the flag as given (None keeps)");
+        assert!(put.contains("validate_keep_warm(&backend, &role, body.keep_warm)"));
     }
 
     #[test]
@@ -8300,8 +8415,9 @@ mod placement_role_tests {
             "the conflict target must be migration 098's index expression: embed rows are keyed by model"
         );
         assert!(!PLACEMENT_UPSERT.contains("role  = COALESCE"), "role is the key, never inherited");
-        // 11 binds, $1..$11 ($10 = the hardware target, $11 = the memory limit).
-        assert!(PLACEMENT_UPSERT.contains("$11") && !PLACEMENT_UPSERT.contains("$12"));
+        // 12 binds, $1..$12 ($10 = the hardware target, $11 = the memory limit,
+        // $12 = keep_warm).
+        assert!(PLACEMENT_UPSERT.contains("$12") && !PLACEMENT_UPSERT.contains("$13"));
     }
 
     async fn scratch(name: &str) -> Option<(sqlx::PgPool, sqlx::PgPool)> {
@@ -8333,6 +8449,7 @@ mod placement_role_tests {
         sqlx::query(PLACEMENT_UPSERT)
             .bind("host6").bind(backend).bind(model.map(str::to_string)).bind(None::<String>).bind(None::<i32>)
             .bind(None::<bool>).bind(env).bind("running").bind(role).bind(None::<String>).bind(None::<i64>)
+            .bind(None::<bool>)
             .execute(db).await.expect("upsert");
     }
 
@@ -8418,6 +8535,7 @@ mod placement_role_tests {
         let old = sqlx::query(PLACEMENT_UPSERT)
             .bind("host6").bind("ollama").bind(Some("harrier".to_string())).bind(None::<String>).bind(None::<i32>)
             .bind(None::<bool>).bind(None::<Value>).bind("running").bind("embed").bind(None::<String>).bind(None::<i64>)
+            .bind(None::<bool>)
             .execute(&db).await;
         assert!(old.is_err(), "before 087 there is no (node, backend, role) key");
 
@@ -8442,6 +8560,9 @@ mod placement_role_tests {
         let m098 = crate::mesh_migrate::MIGRATIONS.iter().find(|m| m.revision == crate::mesh_migrate::EMBED_PLACEMENT_MODEL_REVISION).expect("embed placement model revision");
         sqlx::raw_sql(m098.sql).execute(&db).await.expect("098");
         sqlx::raw_sql(m098.sql).execute(&db).await.expect("098 is idempotent");
+        // The keep-warm column the upsert writes.
+        let mkw = crate::mesh_migrate::MIGRATIONS.iter().find(|m| m.revision == crate::mesh_migrate::PLACEMENT_KEEP_WARM_REVISION).expect("keep-warm revision");
+        sqlx::raw_sql(mkw.sql).execute(&db).await.expect("keep-warm column");
 
         // And now the second role lands beside the first.
         upsert(&db, "ollama", Some("harrier"), None, "embed").await;

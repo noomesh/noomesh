@@ -445,6 +445,11 @@ func (a *Agent) Run() error {
 	// measured (macOS, no NVIDIA) it reports "not-measured" and never acts.
 	// (Constructed before the heartbeat loop starts — see 4.)
 	gy.OnResume(rec.Nudge)
+	// A yield or hold unloads the declared-warm ollama models first (the
+	// adopted stack lane is never stopped, so a stop would not free them);
+	// the keeper preloads and re-pins them otherwise (api/keep_warm.go).
+	gy.OnPause(a.server.UnloadWarm)
+	go a.server.RunKeepWarm(ctx)
 	go gy.Run(ctx)
 
 	reclaimer := diskreclaim.New(hostd.WorkerSpoolDir)

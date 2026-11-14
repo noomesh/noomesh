@@ -215,6 +215,9 @@ pub struct Spec {
     pub env: Map<String, Value>,
     /// The declared hardware target (`cpu` | `gpu`), if any.
     pub target: Option<String>,
+    /// `--keep-warm`: the node agent keeps it loaded, so it is resident ALL
+    /// the time, never "loaded when asked" - always charged to its pool.
+    pub keep_warm: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -233,6 +236,8 @@ pub struct Row {
     pub total_gb: f64,
     /// `measured` | `estimated`
     pub source: &'static str,
+    /// Declared warm (`--keep-warm`): resident whether or not it is in use.
+    pub keep_warm: bool,
     pub notes: Vec<String>,
 }
 
@@ -484,7 +489,7 @@ pub fn evaluate(node: &Value, specs: &[Spec], embed_ctx: u64) -> Report {
             rows.push(Row {
                 backend: s.backend.clone(), role: s.role.clone(), model: s.model.clone(), target: "gpu",
                 weights_gb: None, weights_source: "vllm", kv_gb: 0.0, overhead_gb: 0.0,
-                total_gb: util * total_budget, source: "estimated",
+                total_gb: util * total_budget, source: "estimated", keep_warm: s.keep_warm,
                 notes: vec![format!("vLLM reserves GPU_MEMORY_UTILIZATION {util} of the GPU")],
             });
             continue;
@@ -583,9 +588,16 @@ pub fn evaluate(node: &Value, specs: &[Spec], embed_ctx: u64) -> Report {
             None => (est_total, "estimated"),
         };
         notes.push(format!("weights {wsrc}; num_ctx {ctx} x {slots} slot(s); on {target}"));
+        if s.keep_warm {
+            // Every running placement is charged in full already (the check
+            // never assumes ollama will swap one out); a warm one is the
+            // placement for which that is literally true, so say it.
+            notes.push("declared warm (--keep-warm): held resident, never unloaded when idle".into());
+        }
         rows.push(Row {
             backend: s.backend.clone(), role: s.role.clone(), model: s.model.clone(), target,
-            weights_gb: w, weights_source: wsrc, kv_gb, overhead_gb: RUNTIME_OVERHEAD_GB, total_gb: total, source, notes,
+            weights_gb: w, weights_source: wsrc, kv_gb, overhead_gb: RUNTIME_OVERHEAD_GB, total_gb: total, source,
+            keep_warm: s.keep_warm, notes,
         });
     }
 
@@ -696,7 +708,7 @@ impl Report {
                 "backend": r.backend, "role": r.role, "model": r.model, "target": r.target,
                 "weights_gb": r.weights_gb, "weights_source": r.weights_source,
                 "kv_gb": r.kv_gb, "overhead_gb": r.overhead_gb,
-                "total_gb": r.total_gb, "source": r.source, "notes": r.notes,
+                "total_gb": r.total_gb, "source": r.source, "keep_warm": r.keep_warm, "notes": r.notes,
             })).collect::<Vec<_>>(),
         })
     }
@@ -731,17 +743,17 @@ mod tests {
         if let Some(p) = parallel {
             env.insert("OLLAMA_NUM_PARALLEL".into(), json!(p));
         }
-        Spec { backend: "ollama".into(), role: role.into(), model: model.into(), env, target: None }
+        Spec { backend: "ollama".into(), role: role.into(), model: model.into(), env, target: None, keep_warm: false }
     }
 
     fn spec_env(role: &str, model: &str, env: &[(&str, &str)]) -> Spec {
         let env = env.iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
-        Spec { backend: "ollama".into(), role: role.into(), model: model.into(), env, target: None }
+        Spec { backend: "ollama".into(), role: role.into(), model: model.into(), env, target: None, keep_warm: false }
     }
 
     fn llama(model: &str, target: Option<&str>, env: &[(&str, &str)]) -> Spec {
         let env = env.iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
-        Spec { backend: "llamacpp".into(), role: "chat".into(), model: model.into(), env, target: target.map(str::to_string) }
+        Spec { backend: "llamacpp".into(), role: "chat".into(), model: model.into(), env, target: target.map(str::to_string), keep_warm: false }
     }
 
     /// host8-shaped: a 6 GB discrete GPU and 32 GB of RAM.

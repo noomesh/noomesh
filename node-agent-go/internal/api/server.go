@@ -118,6 +118,11 @@ type Server struct {
 	// use.
 	serving     *backendServing
 	servingOnce sync.Once
+
+	// keeper keeps the declared-warm ollama models loaded (keep_warm.go).
+	// Built on first use.
+	keeper     *warmKeeper
+	keeperOnce sync.Once
 }
 
 // nativeBackends is the set served natively on this host, backend -> model.
