@@ -2775,9 +2775,8 @@ mod dry_run_tests {
     /// one patch, and answers what it reads back after the write.
     #[test]
     fn the_handler_refuses_first_writes_one_patch_and_reads_back() {
-        let own = include_str!("intelligence.rs");
-        let body = &own[own.find("async fn autonomy_set_dry_run(").unwrap()..];
-        let body = &body[..body.find("\n}\n").unwrap()];
+        let own = crate::test_src::own_code(include_str!("intelligence.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn autonomy_set_dry_run(");
         let perm = body.find("may_change_dry_run(").expect("the role check");
         let refuse = body.find("if let Some(why) = live_refusal(&name, enabled_now) {").expect("the switched-off refusal");
         let write = body.find("Some(&dry_run_patch(live))").expect("the one patch");
