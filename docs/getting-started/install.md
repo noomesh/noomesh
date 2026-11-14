@@ -166,8 +166,8 @@ Enter accepts the default at every prompt except these:
 |---|---|
 | `Admin password`, then `Confirm password` | a password of your choice, twice: at least 12 characters, not a common one, not containing the username. Enter alone is refused. |
 | `Stored both in a password manager OFF this machine` | `y`, once you have copied the two backup passphrases it just printed somewhere off this machine. Without them an encrypted backup cannot be restored, so the default (N) asks again. |
-| `Tailscale is not installed. Install it now` | `n` on a single machine with no tailnet: the dashboard is then on `https://localhost:8080`. `y` puts this machine on your tailnet (it may ask for sudo, then shows a login link). |
-| `Join your tailnet now?` | `n` on a single machine with no tailnet; `y` to join (it opens a login link). |
+| `Tailscale is not installed. Install it now` | `n` on a single machine with no tailnet: the dashboard is then on `https://localhost:8080`. `y` puts this machine on your tailnet (it may ask for sudo, then shows a login link). There is no default: Enter asks again. |
+| `Join your tailnet now?` | `n` on a single machine with no tailnet; `y` to join (it opens a login link). There is no default: Enter asks again. |
 
 When it finishes and services were started, the summary prints the
 endpoints: the dashboard on `localhost:8080` (and on your tailnet name if
