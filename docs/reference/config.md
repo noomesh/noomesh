@@ -248,6 +248,7 @@ For search that reliably runs, pick another provider:
 | `backends.<name>.enabled`, `.model` | — | per-backend defaults (`ollama`, `vllm`, `llamacpp`); vLLM also takes `quantization`, `gpu_memory_utilization`, `extra_args` (`tool_call_parser`, `tensor_parallel_size`) |
 | `shard_key` | env `NOO_SHARD_KEY` → `NODE_ID` → `default` | tag written into every conversation's metadata |
 | `auto_scale`, `idle_timeout_sec`, `pinned_backends[]` | `true`, `1800`, `[]` | placement policy (Python) |
+| `image_retention` | unset | `live` \| `preview` \| `off`: superseded images after a roll (operator manual, Upgrade) |
 
 ### `security` — exec approval
 

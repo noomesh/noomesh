@@ -207,6 +207,23 @@ Roll node agents without touching the stack: `noo cluster upgrade-agents`
 over the pull rail, applied with a health-checked restart). Its old
 gateway-signed binary swap is retired.
 
+### Old images after an upgrade
+
+After a roll, `noo upgrade --stack` removes superseded images that are
+provably ours: noomesh's images, and each pinned add-on image's own
+repository, that no current or previous lock or pin names and no container
+uses. It never touches anything else: your own images, and Docker Hub images
+(short names such as `redis:7`), are always kept. The first roll that
+carries this only previews (it lists what it would remove in
+`.noo-host-spool/image-retention-report.json`); later rolls remove. Set
+`cluster.image_retention: preview` (keep previewing) or `off` in
+`noomesh.yaml` to change that.
+
+Cleanup runs only when the roll's `stack images`, `add-on pins` and
+`add-on containers` rows in `noo cluster verify --controller` pass. When
+they do not, the roll says which row blocked it, and the `image retention`
+row says so until a roll cleans.
+
 ### Breaking changes to expect on upgrade
 
 Newest first. Anything here changes behaviour on an install that already
