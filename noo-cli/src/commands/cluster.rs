@@ -606,6 +606,16 @@ pub(crate) fn mem_cell(p: &serde_json::Value) -> String {
     }
 }
 
+/// The `desired` cell: the placement's desired state, and `warm (declared)`
+/// for a placement placed with `--keep-warm`.
+pub(crate) fn desired_cell(p: &serde_json::Value) -> String {
+    let state = ui::state(p["desired_state"].as_str().unwrap_or("?"));
+    if p["keep_warm"].as_bool() == Some(true) {
+        return format!("{state} {}", ui::muted("· warm (declared)"));
+    }
+    state
+}
+
 /// The `on` cell: the placement's declared hardware target, or what it falls
 /// back to when undeclared.
 pub(crate) fn target_cell(p: &serde_json::Value) -> String {
@@ -811,7 +821,7 @@ fn print_desired(node: &str, body: &serde_json::Value, node_live: &serde_json::V
                 mem_cell(p),
                 p["port"].as_i64().map(|v| v.to_string()).unwrap_or_default(),
                 if p["tls"].as_bool().unwrap_or(false) { "tls".into() } else { String::new() },
-                ui::state(p["desired_state"].as_str().unwrap_or("?")),
+                desired_cell(p),
                 match role_state {
                     Some("missing") => ui::warn("model missing").to_string(),
                     Some("down") => ui::warn("not running").to_string(),
@@ -1024,11 +1034,25 @@ pub(crate) struct PlaceArgs {
     kind: Option<String>,
     env_changes: Vec<(String, Option<String>)>,
     on: Option<String>,
+    /// `--keep-warm` (Some(true)) / `--no-keep-warm` (Some(false)); None
+    /// leaves the stored flag as it is.
+    keep_warm: Option<bool>,
 }
 
 pub(crate) fn parse_place_with(a: &mut Args) -> Result<PlaceArgs, ArgError> {
     // The hardware target (cpu | gpu), stored with the placement.
     let on = a.value(&["--on"])?;
+    // Keep this ollama model loaded (stored with the placement; default off).
+    let warm_on = a.flag(&["--keep-warm"]);
+    let warm_off = a.flag(&["--no-keep-warm"]);
+    if warm_on && warm_off {
+        return Err(ArgError::new("--keep-warm and --no-keep-warm contradict each other: pass one"));
+    }
+    let keep_warm = match (warm_on, warm_off) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    };
     // Place even when `noo cluster fit` says the models do not fit.
     let force = a.flag(&["--force"]);
     // Placement env (repeatable); `KEY=` removes KEY.
@@ -1047,7 +1071,7 @@ pub(crate) fn parse_place_with(a: &mut Args) -> Result<PlaceArgs, ArgError> {
     let kind = a.value(&["--kind"])?;
     let [node, backend, model]: [String; 3] =
         a.positionals()?.try_into().map_err(|_| ArgError::new("expected <node> <backend> <model>"))?;
-    Ok(PlaceArgs { node, backend, model, port, tls, image, stopped, force, role, kind, env_changes, on })
+    Ok(PlaceArgs { node, backend, model, port, tls, image, stopped, force, role, kind, env_changes, on, keep_warm })
 }
 
 /// `noo cluster place NODE BACKEND MODEL [--on cpu|gpu] [--env KEY=VALUE]... [--port P] [--tls]
@@ -1060,7 +1084,7 @@ pub(crate) fn parse_place_with(a: &mut Args) -> Result<PlaceArgs, ArgError> {
 /// the node's reported hardware and usage profile unless `--env` names them
 /// (`cluster_tune`).
 pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let PlaceArgs { node, backend, model, port, tls, image, stopped, force, mut role, kind, mut env_changes, on } =
+    let PlaceArgs { node, backend, model, port, tls, image, stopped, force, mut role, kind, mut env_changes, on, keep_warm } =
         parse_place_with(&mut Args::new(args))?;
     let (node, backend, model) = (&node, &backend, &model);
     if let Some(k) = &kind {
@@ -1094,6 +1118,10 @@ pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             crate::output::fail(g.json, crate::output::ExitCode::Usage, "bad_role",
                 "--role harness belongs to the `harness` backend only", None);
         }
+    }
+    if keep_warm == Some(true) && !(backend == "ollama" && role.as_deref().is_none_or(|r| r == "chat")) {
+        crate::output::fail(g.json, crate::output::ExitCode::Usage, "bad_keep_warm",
+            "--keep-warm is for an ollama chat placement: vllm and llamacpp hold their model while they run", None);
     }
     if on.is_some() && backend == "harness" {
         crate::output::fail(g.json, crate::output::ExitCode::Usage, "bad_target",
@@ -1130,6 +1158,7 @@ pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if force {
         body["force"] = serde_json::json!(true);
     }
+    apply_keep_warm(&mut body, keep_warm);
     if let Some(p) = port {
         body["port"] = serde_json::json!(p);
     }
@@ -1227,7 +1256,26 @@ pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         "{node}: {backend} → {model} ({}) — agent reconciles within 5 min",
         ui::state(if stopped { "stopped" } else { "running" })
     ));
+    if let Some(line) = keep_warm_line(keep_warm, model) {
+        println!("  {line}");
+    }
     Ok(0)
+}
+
+/// `keep_warm` on the place body, only when a flag asked: absent, the
+/// controller keeps the stored flag (off for a new placement).
+pub(crate) fn apply_keep_warm(body: &mut serde_json::Value, keep_warm: Option<bool>) {
+    if let Some(k) = keep_warm {
+        body["keep_warm"] = serde_json::json!(k);
+    }
+}
+
+/// What `place` says about `--keep-warm` / `--no-keep-warm`, when one was given.
+pub(crate) fn keep_warm_line(keep_warm: Option<bool>, model: &str) -> Option<String> {
+    match keep_warm? {
+        true => Some(format!("{model}: warm (declared) — the agent keeps it loaded on this node's ollama, whatever runs it")),
+        false => Some(format!("{model}: keep-warm cleared — it unloads after the daemon's own idle expiry")),
+    }
 }
 
 /// What `place` decided about the hardware: the target, why, and each tuned key.
@@ -3910,5 +3958,53 @@ mod load_cell_tests {
         }
         // A missing key indexes to Null.
         assert!(load_cell(&serde_json::json!({})["current_load"]).contains("Not reported"));
+    }
+}
+
+#[cfg(test)]
+mod keep_warm_tests {
+    use super::{apply_keep_warm, desired_cell, keep_warm_line, parse_place_with};
+    use crate::args::Args;
+    use serde_json::json;
+
+    fn parse(args: &[&str]) -> Result<Option<bool>, String> {
+        let v: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        parse_place_with(&mut Args::new(&v)).map(|p| p.keep_warm).map_err(|e| e.0)
+    }
+
+    /// Off unless asked; `--no-keep-warm` clears; both at once is refused.
+    #[test]
+    fn keep_warm_flags_parse_and_default_to_unset() {
+        assert_eq!(parse(&["n", "ollama", "gemma4:12b"]).unwrap(), None);
+        assert_eq!(parse(&["n", "ollama", "gemma4:12b", "--keep-warm"]).unwrap(), Some(true));
+        assert_eq!(parse(&["n", "ollama", "gemma4:12b", "--no-keep-warm"]).unwrap(), Some(false));
+        let e = parse(&["n", "ollama", "m", "--keep-warm", "--no-keep-warm"]).unwrap_err();
+        assert!(e.contains("contradict"), "{e}");
+    }
+
+    /// The flag reaches the PUT body as `keep_warm` only when given: with no
+    /// flag the controller keeps what it stored (and a new row is off).
+    #[test]
+    fn keep_warm_rides_the_place_body_only_when_given() {
+        let mut body = json!({"model": "gemma4:12b"});
+        apply_keep_warm(&mut body, None);
+        assert!(body.get("keep_warm").is_none(), "{body}");
+        apply_keep_warm(&mut body, Some(true));
+        assert_eq!(body["keep_warm"], json!(true));
+        apply_keep_warm(&mut body, Some(false));
+        assert_eq!(body["keep_warm"], json!(false), "--no-keep-warm sends false, which clears");
+    }
+
+    /// `noo cluster show` marks a warm placement in its desired column.
+    #[test]
+    fn show_marks_a_warm_placement_declared() {
+        let warm = json!({"backend": "ollama", "desired_state": "running", "keep_warm": true});
+        assert!(desired_cell(&warm).contains("running") && desired_cell(&warm).contains("warm (declared)"), "{}", desired_cell(&warm));
+        for cold in [json!({"desired_state": "running", "keep_warm": false}), json!({"desired_state": "running"})] {
+            assert!(!desired_cell(&cold).contains("warm"), "{}", desired_cell(&cold));
+        }
+        assert!(keep_warm_line(Some(true), "gemma4:12b").unwrap().contains("warm (declared)"));
+        assert!(keep_warm_line(Some(false), "gemma4:12b").unwrap().contains("cleared"));
+        assert!(keep_warm_line(None, "gemma4:12b").is_none());
     }
 }

@@ -107,10 +107,12 @@ noo cluster unplace gpu-2 ollama
 ```
 
 An ollama unloads an idle model after its keep_alive (5 minutes by
-default) and loads it again, cold, on the next request; to keep one
-warm, place it with `--env OLLAMA_KEEP_ALIVE=-1` (reaches an agent-run
-or brew-managed ollama; the controller's own adopted ollama and an
-Ollama.app or hand-started ollama keep their own setting).
+default) and loads it again, cold, on the next request. `--keep-warm`
+declares an ollama chat model warm on any ollama runtime (agent-run,
+brew, Ollama.app, the controller's own): the agent preloads it and keeps
+it loaded; `--no-keep-warm` hands it back to the daemon's expiry. Only
+that model is pinned, a GPU yield or hold unloads it, and `noo cluster
+show` marks it `warm (declared)`.
 
 ### Run it on CPU or GPU
 
@@ -833,7 +835,7 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 | `noo cluster proposals` | `[--status <s>] [--limit <n>]` | List the enrollment proposals agents filed, with each host in full |
 | `noo cluster show` | `<node>` | Show one node in full: hardware, agent version, tier drift, bus principal, roles |
 | `noo cluster forget` | `<node> [--purge-tailscale] [-y\|--yes]` | Remove a dead node's row, KV entry and enrollments; --purge-tailscale drops its device |
-| `noo cluster place` | `<node> <backend\|harness> <model\|auto> [--on cpu\|gpu] [--env KEY=VALUE]... [--kind noo\|claude-code\|copilot\|codex] [--role chat\|embed\|rerank] [--port <port>] [--tls] [--image <image>] [--stopped] [--force]` | Declare a backend and model in a role on a node, on cpu or gpu; auto-tunes unless --env |
+| `noo cluster place` | `<node> <backend\|harness> <model\|auto> [--on cpu\|gpu] [--keep-warm\|--no-keep-warm] [--env KEY=VALUE]... [--kind noo\|claude-code\|copilot\|codex] [--role chat\|embed\|rerank] [--port <port>] [--tls] [--image <image>] [--stopped] [--force]` | Declare a backend and model in a role on a node, on cpu or gpu; auto-tunes unless --env |
 | `noo cluster unplace` | `<node> <backend> [--role chat\|embed\|rerank] [--model <model>]` | Remove a placement, or one embed model; a container keeps running, a harness is stopped |
 | `noo cluster fit` | `<node> [--with <backend> <model> [--on cpu\|gpu] [--role <role>] [--env KEY=VALUE]...]` | Show whether placements fit a node's GPU memory and RAM, with or without one more |
 | `noo cluster class list` | — | Show the model classes consumers may send as `model`, with candidate placement and health |

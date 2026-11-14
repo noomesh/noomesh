@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/harnessprofile"
+	"github.com/noomesh/noomesh/node-agent-go/internal/keepwarm"
 	"github.com/noomesh/noomesh/node-agent-go/internal/lanes"
 )
 
@@ -254,6 +255,32 @@ func (r *Reconciler) ChatPlacement() (backend, model string, ok bool) {
 // publishLanePlacements hands the heartbeat the running placements it
 // builds `lanes` from (proposal i403): every non-harness row the controller
 // wants running, with its role and model verbatim.
+// publishKeepWarm records the running ollama placements declared warm
+// (internal/keepwarm). Every pass, before the empty-state return: clearing
+// the flag, or the last placement, must stop the pinning at once.
+func publishKeepWarm(all []placement) {
+	keepwarm.Set(keepWarmOf(all))
+}
+
+// keepWarmOf is the declared-warm set: running ollama placements with
+// keep_warm, one entry per model.
+func keepWarmOf(all []placement) []keepwarm.Warm {
+	var out []keepwarm.Warm
+	seen := map[string]bool{}
+	for _, p := range all {
+		if !p.KeepWarm || p.Backend != "ollama" || p.DesiredState != "running" {
+			continue
+		}
+		m := strings.TrimSpace(p.Model)
+		if m == "" || seen[keepwarm.Canonical(m)] {
+			continue
+		}
+		seen[keepwarm.Canonical(m)] = true
+		out = append(out, keepwarm.Warm{Model: m, Target: p.Target})
+	}
+	return out
+}
+
 func publishLanePlacements(all []placement) {
 	var out []lanes.Placed
 	for _, p := range all {
