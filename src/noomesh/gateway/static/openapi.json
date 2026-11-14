@@ -22441,7 +22441,7 @@
           "intelligence"
         ],
         "summary": "Take an autonomy rule out of preview, or put it back",
-        "description": "[native] `{\"dry_run\": false}` takes a rule with a dry-run gate LIVE: from its next tick it acts (disk_watermark deletes what its reclaim ladder previews, including superseded noomesh images; cert_auto_rotate re-issues certificates and restarts their services). `{\"dry_run\": true}` puts it back into preview. Operator or admin only (403 otherwise); 400 for a rule with no dry-run gate. The key is merged into the rule's stored override, so its arming and tunables stay as they are, and the change is audited with who made it.",
+        "description": "[native] `{\"dry_run\": false}` takes a rule with a dry-run gate LIVE: from its next tick it acts (disk_watermark deletes what its reclaim ladder previews, including superseded images of noomesh and of the add-ons it runs, from those images' own repositories only; cert_auto_rotate re-issues certificates and restarts their services). `{\"dry_run\": true}` puts it back into preview. Operator or admin only (403 otherwise); 400 for a rule with no dry-run gate. The key is merged into the rule's stored override, so its arming and tunables stay as they are, and the change is audited with who made it.",
         "operationId": "autonomy_set_dry_run",
         "parameters": [
           {
