@@ -1240,9 +1240,11 @@ fn request_size(messages: &[Value], tools: &[Value], data_frame: Option<&str>, w
 /// The line also carries the backend's calibration (i802 PR-2): the ratio
 /// learned so far (1.0 before any sample) and how many samples taught it.
 /// Token counts only, never content.
-fn log_request_size(size: &RequestSize, calib: &crate::chat_context::Calibration, path: &'static str) {
+fn log_request_size(size: &RequestSize, calib: &crate::chat_context::Calibration, tier: WindowTier, path: &'static str) {
     tracing::info!(
         path,
+        // Which persona tier the turn sent (Full | Compact): what a judge reads (i802).
+        tier = ?tier,
         system = size.system,
         data = size.data,
         history = size.history,
@@ -2461,7 +2463,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         post_dedup_chars = deduped.len(),
         "context_injected"
     );
-    log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), &calib, "stream");
+    log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), &calib, tier, "stream");
 
     // Instructions and the question alone too large for this backend's
     // context (i802 PR-2, step 5): say so instead of sending a prompt the
@@ -3700,7 +3702,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
         post_dedup_chars = deduped.len(),
         "context_injected_nonstream"
     );
-    log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), &calib, "nonstream");
+    log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), &calib, tier, "nonstream");
 
     // Instructions and the question alone too large for this backend's
     // context (i802 PR-2, step 5): say so instead of sending a prompt the
@@ -4576,7 +4578,7 @@ mod request_size_tests {
     fn both_loop_paths_log_the_request_size() {
         let src = include_str!("agent_loop.rs").split("mod request_size_tests").next().unwrap();
         for path in ["\"stream\");", "\"nonstream\");"] {
-            assert!(src.contains(&format!("log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), &calib, {path}")), "{path}");
+            assert!(src.contains(&format!("log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), &calib, tier, {path}")), "{path}");
         }
     }
 }
