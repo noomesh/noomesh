@@ -1210,6 +1210,8 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     crate::commands::voice_models::stage_if_on(g);
     reconcile_addon_nats_principals(g, &roll.root);
 
+    advise_cpu_only_slots(g, &roll.root);
+
     // Stage node images (overlapping the launcher), then launch.
     let staging = crate::commands::image_stage::start_stage_release_images(g, target_stack_lock.clone(), &roll.tag);
     launch_stack(g, &roll, staging, stops)
@@ -8256,5 +8258,19 @@ mod netns_reconcile_tests {
         let own = crate::test_src::own_code(include_str!("upgrade.rs"));
         let body = crate::test_src::fn_body(&own, "fn upgrade_stack(");
         assert!(body.contains("reconcile_netns_unit(g, &roll.root);"), "{body}");
+    }
+}
+
+/// i802: a CPU-only controller still on the compose default of 4 Ollama
+/// slots is told that one slot prefills about 3x faster here, with the
+/// command. Recommend only: changing a default the user never chose on
+/// upgrade is the operator's call (not made yet), so nothing is written.
+fn advise_cpu_only_slots(g: &Globals, root: &std::path::Path) {
+    if g.json {
+        return;
+    }
+    let (cpu_only, readable, value) = crate::commands::cluster_verify::ollama_slots_setting_here(root);
+    if let Some(line) = crate::commands::cluster_verify::cpu_only_slots_upgrade_advice(cpu_only, readable, value.as_deref()) {
+        println!("{}", ui::note(&line));
     }
 }

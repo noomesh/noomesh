@@ -2974,6 +2974,8 @@ async fn probe_backend_via_link(
 
 /// The ollama probe: a GET of the agent's read route, no body. Nothing here
 /// may name a model or reach the inference proxy (a guard test reads this).
+/// So it carries no `options.num_ctx` (i802) and needs none: a read loads
+/// nothing, so it can never reload the chat runner at another context.
 fn ollama_read_request(link: &crate::node_link::NodeLink) -> crate::node_link::NodeRequest {
     link.request(reqwest::Method::GET, OLLAMA_ALIVE_PATH)
         .timeout(std::time::Duration::from_secs(10))

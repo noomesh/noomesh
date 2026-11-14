@@ -211,6 +211,52 @@ func (r *Reconciler) recordChatPlacement(all []placement) {
 	}
 }
 
+// chatContextKey is the one spelling of an Ollama model name for the
+// decided-context table: a bare tag and its `:latest` are one model (the
+// gateway's rule, chat_context::model_stat).
+func chatContextKey(model string) string {
+	m := strings.TrimSpace(model)
+	if m == "" {
+		return ""
+	}
+	tag := m
+	if i := strings.LastIndex(m, "/"); i >= 0 {
+		tag = m[i+1:]
+	}
+	if !strings.Contains(tag, ":") {
+		m += ":latest"
+	}
+	return m
+}
+
+// recordChatContexts installs desired-config's `chat_contexts` (i802). An
+// absent key (an older gateway, nothing decided) clears the table: the agent
+// then sends no num_ctx, exactly as before. A non-positive value is dropped.
+func (r *Reconciler) recordChatContexts(in map[string]int) {
+	var out map[string]int
+	for m, n := range in {
+		if k := chatContextKey(m); k != "" && n > 0 {
+			if out == nil {
+				out = map[string]int{}
+			}
+			out[k] = n
+		}
+	}
+	r.harnessMu.Lock()
+	defer r.harnessMu.Unlock()
+	r.chatContexts = out
+}
+
+// ChatContext is the context, in tokens, the controller decided for model on
+// this node's Ollama (desired-config `chat_contexts`, i802); 0 when it
+// decided none. The agent's own calls to that Ollama send it as
+// options.num_ctx, as the gateway's do, so no call reloads the model.
+func (r *Reconciler) ChatContext(model string) int {
+	r.harnessMu.RLock()
+	defer r.harnessMu.RUnlock()
+	return r.chatContexts[chatContextKey(model)]
+}
+
 // ChatContextWindow is the context window, in tokens, that the node's chat
 // backend runs with as far as the agent sets it, for GET /harness/placement
 // (`model_context`): the harness tells a foreign CLI its model's real window
