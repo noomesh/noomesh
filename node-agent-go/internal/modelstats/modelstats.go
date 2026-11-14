@@ -28,7 +28,9 @@ import (
 // are /api/ps size and size_vram, and are 0 unless loaded. context_length is
 // the model's own context ceiling (/api/show `<arch>.context_length`; for a
 // vLLM or llama-server chat model, its config.json or GGUF), omitted while
-// not known.
+// not known. running_context is the context the daemon RUNS the loaded model
+// at (/api/ps `context_length`: 4096 on a stock CPU ollama whatever the
+// ceiling), omitted unless loaded and known (i802).
 type ModelStat struct {
 	Name          string `json:"name"`
 	SizeBytes     int64  `json:"size_bytes"`
@@ -36,6 +38,9 @@ type ModelStat struct {
 	VRAMBytes     int64  `json:"vram_bytes"`
 	Loaded        bool   `json:"loaded"`
 	ContextLength int64  `json:"context_length,omitempty"`
+	// RunningContext is /api/ps `context_length`: what the loaded model runs
+	// at, as distinct from its ceiling. 0 = not loaded, or not reported.
+	RunningContext int64 `json:"running_context,omitempty"`
 	// LoadedUnknown: /api/ps could not be read, so whether this model is
 	// loaded, and its resident and vram bytes, are NOT known. Loaded,
 	// ResidentBytes and VRAMBytes are then left out of the wire shape (see
@@ -57,9 +62,11 @@ func (m ModelStat) MarshalJSON() ([]byte, error) {
 		VRAMBytes     *int64 `json:"vram_bytes,omitempty"`
 		Loaded        *bool  `json:"loaded,omitempty"`
 		ContextLength int64  `json:"context_length,omitempty"`
+		RunningContext int64 `json:"running_context,omitempty"`
 	}
 	w := wire{Name: m.Name, SizeBytes: m.SizeBytes, ContextLength: m.ContextLength}
 	if !m.LoadedUnknown {
+		w.RunningContext = m.RunningContext
 		w.ResidentBytes, w.VRAMBytes, w.Loaded = &m.ResidentBytes, &m.VRAMBytes, &m.Loaded
 	}
 	return json.Marshal(w)
@@ -71,6 +78,8 @@ type entry struct {
 	Size     int64  `json:"size"`
 	SizeVRAM int64  `json:"size_vram"`
 	Digest   string `json:"digest"`
+	// /api/ps only: the context the loaded model runs at.
+	ContextLength int64 `json:"context_length"`
 }
 
 func (e entry) key() string {
@@ -117,6 +126,7 @@ func ParseChecked(tags, ps []byte, psOK bool) []ModelStat {
 			byName[k] = s
 		}
 		s.ResidentBytes, s.VRAMBytes, s.Loaded = e.Size, e.SizeVRAM, true
+		s.RunningContext = max(e.ContextLength, 0)
 	}
 	if len(byName) == 0 {
 		return nil
