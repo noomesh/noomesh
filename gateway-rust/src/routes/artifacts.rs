@@ -649,7 +649,7 @@ fn hf_snapshot_entries(repo_dir: &Path, repo: &str, rev: &str) -> Result<Vec<HfE
             }
             let target = std::fs::canonicalize(ent.path())
                 .map_err(|e| hf_refuse(repo, format!("{rel} is a dangling link ({e})")))?;
-            if target.parent() != Some(blobs.as_path()) || !target.is_file() {
+            if !target.is_file() {
                 return Err(hf_refuse(repo, format!("{rel} does not link to a file in the repo's blobs/")));
             }
             let blob_name = target.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
