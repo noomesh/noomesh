@@ -313,8 +313,11 @@ type ollamaReply struct {
 	Done            bool   `json:"done"`
 	DoneReason      string `json:"done_reason"`
 	PromptEvalCount *int64 `json:"prompt_eval_count"`
-	EvalCount       *int64 `json:"eval_count"`
-	Error           string `json:"error"`
+	// PromptEvalDuration is Ollama's prefill time in nanoseconds; carried on
+	// as usage.prompt_eval_ms for the gateway's backend_call line (i802).
+	PromptEvalDuration *int64 `json:"prompt_eval_duration"`
+	EvalCount          *int64 `json:"eval_count"`
+	Error              string `json:"error"`
 }
 
 // openAIToolCalls lifts Ollama's tool calls (object arguments, no id) to
@@ -369,7 +372,11 @@ func ollamaUsage(r *ollamaReply) map[string]any {
 	if r.EvalCount != nil {
 		c = *r.EvalCount
 	}
-	return map[string]any{"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
+	u := map[string]any{"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
+	if r.PromptEvalDuration != nil && *r.PromptEvalDuration > 0 {
+		u["prompt_eval_ms"] = *r.PromptEvalDuration / 1_000_000
+	}
+	return u
 }
 
 func ollamaFinish(r *ollamaReply, hadTools bool) string {
