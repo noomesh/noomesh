@@ -20,7 +20,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["node", "workloads", "controller", "deny"], "", "On this node, as root: stop taking the controller's approvals; local ones still count"),
     (&["node", "workloads", "controller", "status"], "", "On this node: opted in or not, the policy, and the controller set the agent holds"),
         (&["cluster", "status"], "", "List nodes: tier, status, RUNNING backends, CAPABILITIES by role, CAN-RUN"),
-        (&["cluster", "verify"], "[<node>...] [--controller] [--wait] [--timings] [--brief]", "Assert every invariant a node and the controller must meet; exit 1 with the remedy (--brief: failures first, the rest grouped)"),
+        (&["cluster", "verify"], "[<node>...] [--controller] [--wait] [--timings] [--brief]", "Assert node and controller invariants; exit 1 with the remedy (--brief: failures first)"),
         (&["cluster", "invite"], "", "Mint a tagged tailscale auth key and print the `noo enroll --via-tailnet <url>` line"),
         (&["cluster", "down"], "<backend> [--node <node>] [-y|--yes]", "Stop a backend on one node or all nodes; destructive, asks for confirmation (-y)"),
         (&["cluster", "desired"], "<node>", "Alias of show: the node in full, with its desired config and every placement"),
