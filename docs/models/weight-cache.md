@@ -156,7 +156,17 @@ When the node-agent is asked to start a backend:
   controller first`): **roll the controller before the nodes.** If the
   controller cannot be reached, the local copy must verify against the last
   manifest the node verified; a snapshot directory that merely exists is not
-  enough. No helper container is involved: the agent is a host process. **A placed node never downloads weights from the internet.** With
+  enough. No helper container is involved: the agent is a host process.
+  TEI (`embedding`, the TEI `reranker`) reads the same verified tree: its
+  spec sets `HUGGINGFACE_HUB_CACHE=/data/hub` (the image default `/data`
+  would read `HF_CACHE_DIR/models--…`, outside what the agent verifies), so a
+  node that ran TEI online before re-downloads its embedder once into `hub/`.
+- **Controller roll note:** the gateway now mounts `HF_CACHE_DIR/hub`
+  read-only at `/artifacts/hf/hub` (it was not mounted before) — only `hub/`,
+  never the HF_HOME with its `token`. A missing `hub/` is created before
+  `up` with `HF_CACHE_DIR`'s owner (onboard's storage step, the roll's
+  storage reconcile, and the launch check, which also follows an
+  `HF_CACHE_DIR` declared outside the data root), never by Docker as root. **A placed node never downloads weights from the internet.** With
   `NOO_MODEL_CACHE_URL` set, the backend always starts with
   `HF_HUB_OFFLINE=1` and **without** `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN`
   (a node needs no Hugging Face credential). A model the store does not hold

@@ -213,6 +213,9 @@ fn bind_sources_refusal(ctx: &Ctx, args: &[&str]) -> Option<String> {
     // The add-on declarations directories the launcher fills (i163): empty
     // is normal, so make them as the user rather than refuse.
     crate::commands::bind_sources::ensure_launcher_dirs(&cfg, &services, no_deps);
+    // HF_CACHE_DIR/hub, which the gateway mounts read-only (i675 F13): made
+    // with HF_CACHE_DIR's owner rather than refused or left to Docker's root.
+    crate::commands::bind_sources::ensure_hf_hub(&cfg, &services, no_deps);
     let findings = crate::commands::bind_sources::check(&cfg, &services, no_deps, Some(&root));
     (!findings.is_empty()).then(|| crate::commands::bind_sources::refusal(&findings))
 }

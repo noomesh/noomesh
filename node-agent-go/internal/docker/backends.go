@@ -442,10 +442,12 @@ var backendSpecs = map[string]BackendSpec{
 			// model fetch from reporting (docs/security/telemetry.md).
 			"HF_HUB_DISABLE_TELEMETRY": "1",
 			"DO_NOT_TRACK":             "1",
+			// Where TEI looks for the model: the node's VERIFIED snapshot
+			// (teiHubCache, below). Not overridable (buildEnvList).
+			"HUGGINGFACE_HUB_CACHE": teiHubCache,
 		},
-		// Persist + share the TEI model cache at /data — same host dir the
-		// compose `hf-cache` named volume binds to, so the node-agent backend
-		// reuses models the compose tei/tei-gpu already downloaded.
+		// Persist + share the TEI model cache at /data — the node's
+		// HF_CACHE_DIR, whose hub/ holds the snapshots stageHFModel verified.
 		Volumes: []VolumeMount{
 			{Source: hfCacheSource, Target: "/data"},
 		},
@@ -505,6 +507,8 @@ func rerankerSpecTEI() BackendSpec {
 			// Same as the embedding backend (docs/security/telemetry.md).
 			"HF_HUB_DISABLE_TELEMETRY": "1",
 			"DO_NOT_TRACK":             "1",
+			// The verified snapshot, as for the embedding backend.
+			"HUGGINGFACE_HUB_CACHE": teiHubCache,
 		},
 		// Shared TEI model cache — see embedding backend.
 		Volumes: []VolumeMount{
@@ -1408,6 +1412,25 @@ func resolveEnvSlice(ss []string) []string {
 	return out
 }
 
+// teiHubCache is the TEI images' hub cache, pointed at the hub/ level of the
+// node's HF_CACHE_DIR (mounted at /data).
+//
+// The TEI images (ghcr.io/huggingface/text-embeddings-inference:1.6 and
+// :cpu-1.6, the digests docker-compose.cluster.yml pins) set
+// HUGGINGFACE_HUB_CACHE=/data in their config, and TEI 1.6 hands that
+// straight to hf-hub (router/src/lib.rs: ApiBuilder::with_cache_dir), whose
+// layout is <cache>/models--org--name. The agent stages and VERIFIES a placed
+// model at HF_CACHE_DIR/hub/models--org--name (stageHFModel, i675 F13), the
+// huggingface_hub layout vLLM and the model cache use. With the image default
+// TEI read /data/models--org--name — a tree nothing verifies — and never the
+// verified snapshot. This puts both on the same tree.
+const teiHubCache = "/data/hub"
+
+// pinnedSpecEnv are spec env keys a placement or node override cannot
+// change: where a backend reads its weights must stay the tree the agent
+// verified.
+var pinnedSpecEnv = map[string]bool{"HUGGINGFACE_HUB_CACHE": true}
+
 func buildEnvList(specEnv map[string]string, overrides map[string]string) []string {
 	merged := make(map[string]string, len(specEnv)+len(overrides))
 	for k, v := range specEnv {
@@ -1419,7 +1442,7 @@ func buildEnvList(specEnv map[string]string, overrides map[string]string) []stri
 	// A telemetry switch the spec carries is not overridable: a placement's
 	// env or a node-local value cannot turn vendor phone-home back on.
 	for k, v := range specEnv {
-		if IsTelemetrySwitch(k) {
+		if IsTelemetrySwitch(k) || pinnedSpecEnv[k] {
 			merged[k] = resolveEnv(v)
 		}
 	}
