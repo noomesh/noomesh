@@ -740,7 +740,72 @@ async fn finish_row(db: &sqlx::PgPool, id: &str, ok: bool, text: &str) -> Result
     Ok(n > 0)
 }
 
-/// The owner's stop: honoured at the next checkpoint.
+/// i779: the message a stop sends to the harness of the node a task is
+/// running on (`{"stop": id}` on that node's task subject, which the harness
+/// already reads), so the loop in flight is cut there and its slot freed
+/// now. `None` for a task with no harness run to cut: one that runs on the
+/// controller itself (in process; it ends at its next checkpoint, as
+/// before) or that is not running anywhere (`open` and queued, or finished).
+pub fn cut_signal(task_node: Option<&str>, was: &str, controller: &str, id: &str) -> Option<(String, Vec<u8>)> {
+    let node = task_node.map(str::trim).filter(|n| !n.is_empty() && *n != controller)?;
+    if !matches!(was, "running" | "checkpointed") {
+        return None;
+    }
+    Some((task_subject(node), serde_json::to_vec(&json!({"stop": id})).ok()?))
+}
+
+/// i779: the note a cut task carries. It says what happened and claims no
+/// checkpoint that was not reached: the loop in flight (loop `done + 1`) was
+/// ended, and only what the last checkpoint (`done` loops) recorded stands.
+pub fn cut_note(node: &str, done: i32) -> String {
+    format!(
+        "stopped mid-loop: the stop cut loop {} on {node}; nothing after the last checkpoint ({done} loop(s) done) is kept",
+        done + 1
+    )
+}
+
+/// i779: whether a `cut` report applies to this task: it came on the ready
+/// subject of the node the task ran on, and the task is stopped. A node can
+/// only describe its own work, and only a stopped task was cut.
+pub fn cut_note_applies(task_node: Option<&str>, state: &str, ready_subject_seen: &str) -> bool {
+    task_node.is_some_and(|n| ready_subject(n) == ready_subject_seen) && state == "stopped"
+}
+
+/// The task ids a harness reported as cut on `harness.ready` (i779).
+fn cut_from_ready(body: &serde_json::Value) -> Vec<String> {
+    body.get("cut").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str()).map(str::to_string).collect()).unwrap_or_default()
+}
+
+/// Record that a stopped task's loop was cut (i779).
+async fn note_cut(db: &sqlx::PgPool, id: &str, ready_subject_seen: &str) {
+    let task = match get(db, id).await {
+        Ok(Some(t)) => t,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(task = id, error = %e, "task: cut report not applied");
+            return;
+        }
+    };
+    if !cut_note_applies(task.node.as_deref(), &task.state, ready_subject_seen) {
+        tracing::warn!(task = id, subject = ready_subject_seen, state = %task.state, "task: cut report from another node or for a task that is not stopped; ignored");
+        return;
+    }
+    let note = cut_note(task.node.as_deref().unwrap_or("its node"), task.loops as i32);
+    let Ok(uuid) = uuid::Uuid::parse_str(id) else { return };
+    match sqlx::query("UPDATE noo_tasks SET last_note = $2, updated_at = now() WHERE id = $1 AND state = 'stopped'")
+        .bind(uuid)
+        .bind(&note)
+        .execute(db)
+        .await
+    {
+        Ok(_) => tracing::info!(event = "task_cut", task = id, "task: its stop cut the loop in flight"),
+        Err(e) => tracing::warn!(task = id, error = %e, "task: cut note not recorded"),
+    }
+}
+
+/// The owner's stop. A task on a node's harness is also cut there now (the
+/// route sends [`cut_signal`]); one running in process ends at its next
+/// checkpoint.
 pub async fn stop(db: &sqlx::PgPool, id: &str) -> Result<bool> {
     stop_with(db, id, "stopped_by_owner").await
 }
@@ -1316,6 +1381,11 @@ pub fn spawn_ready_watcher(state: std::sync::Arc<AppState>) {
             let (stalled, secs) = stalled_from_ready(&body);
             for id in stalled {
                 fail_stalled(&state.db, &id, &msg.subject, secs).await;
+            }
+            // i779: tasks whose stop cut their loop there; the slot they
+            // held is free, and the hand-back below moves the queue up.
+            for id in cut_from_ready(&body) {
+                note_cut(&state.db, &id, &msg.subject).await;
             }
             match list_unfinished_on(&state.db, &node).await {
                 Ok(tasks) if !tasks.is_empty() => {
@@ -1965,5 +2035,53 @@ mod mark_running_read_error_tests {
         let id = uuid::Uuid::new_v4().to_string();
         let e = super::mark_running(&pool, &id, None).await.expect_err("an unreadable DB is an error");
         assert!(format!("{e:#}").contains("state before marking it running"), "{e:#}");
+    }
+}
+
+#[cfg(test)]
+mod cut_tests {
+    //! i779: a stop for a task on a node's harness is sent there and cuts the
+    //! loop in flight; the cut task says so, and claims no checkpoint.
+    use super::*;
+
+    #[test]
+    fn a_running_task_on_a_node_is_cut_there() {
+        let (subject, body) = cut_signal(Some("mcmini"), "running", "pop-os", "t-1").expect("cut");
+        assert_eq!(subject, task_subject("mcmini"));
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(), json!({"stop": "t-1"}));
+        assert!(cut_signal(Some("mcmini"), "checkpointed", "pop-os", "t-1").is_some(), "between loops it still holds the slot");
+    }
+
+    #[test]
+    fn nothing_is_cut_that_runs_in_process_or_is_not_running() {
+        assert!(cut_signal(Some("pop-os"), "running", "pop-os", "t-1").is_none(), "in process: ends at its checkpoint");
+        assert!(cut_signal(None, "running", "pop-os", "t-1").is_none());
+        assert!(cut_signal(Some(""), "running", "pop-os", "t-1").is_none());
+        for was in ["open", "done", "failed", "stopped"] {
+            assert!(cut_signal(Some("mcmini"), was, "pop-os", "t-1").is_none(), "{was}");
+        }
+    }
+
+    #[test]
+    fn the_cut_note_claims_no_checkpoint_it_did_not_reach() {
+        let n = cut_note("mcmini", 3);
+        assert!(n.starts_with("stopped mid-loop: the stop cut loop 4 on mcmini"), "{n}");
+        assert!(n.contains("nothing after the last checkpoint (3 loop(s) done) is kept"), "{n}");
+        assert!(!n.contains("ends at its") && !n.contains("checkpoint reached"), "{n}");
+    }
+
+    #[test]
+    fn a_cut_report_applies_only_from_the_tasks_node_and_to_a_stopped_task() {
+        let subj = ready_subject("mcmini");
+        assert!(cut_note_applies(Some("mcmini"), "stopped", &subj));
+        assert!(!cut_note_applies(Some("aserve"), "stopped", &subj), "another node's report");
+        assert!(!cut_note_applies(Some("mcmini"), "running", &subj), "not stopped: not cut");
+        assert!(!cut_note_applies(None, "stopped", &subj));
+    }
+
+    #[test]
+    fn the_ready_body_names_the_cut_tasks() {
+        assert_eq!(cut_from_ready(&json!({"node": "n", "slot_freed": true, "cut": ["a", "b"]})), vec!["a", "b"]);
+        assert!(cut_from_ready(&json!({"node": "n", "slot_freed": true})).is_empty());
     }
 }
