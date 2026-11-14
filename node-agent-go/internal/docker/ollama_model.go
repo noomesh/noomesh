@@ -176,6 +176,9 @@ func (c *Client) PullOllamaModel(ctx context.Context, name string) (*PullOllamaM
 		}
 	}
 
+	// The weight's entry in the cross-retry cache (ollama_gguf_cache.go),
+	// removed once ollama holds the model.
+	var cachedWeight string
 	fetch := func(kind, artifact string) (string, string, error) {
 		// The GGUF behind a Modelfile can be GBs: wait out the gateway's hash.
 		m, err := awaitArtifactManifest(ctx, kind, artifact)
@@ -194,6 +197,15 @@ func (c *Client) PullOllamaModel(ctx context.Context, name string) (*PullOllamaM
 		src := cacheURL + "/gguf/" + url.PathEscape(artifact)
 		fetchCtx, cancel := context.WithTimeout(ctx, 60*time.Minute)
 		defer cancel()
+		if kind == "gguf" {
+			// Multi-GB: kept, verified, across retries of a failing create.
+			entry, err := stageGGUFViaCache(fetchCtx, src, dest, m.SHA256)
+			if err != nil {
+				return "", "", fmt.Errorf("fetch %s: %w", artifact, err)
+			}
+			cachedWeight = entry
+			return dest, m.SHA256, nil
+		}
 		if _, err := preseed.New().FetchOneVerified(fetchCtx, src, dest, m.SHA256); err != nil {
 			return "", "", fmt.Errorf("fetch %s: %w", artifact, err)
 		}
@@ -269,6 +281,7 @@ func (c *Client) PullOllamaModel(ctx context.Context, name string) (*PullOllamaM
 		if out, runErr := runOllamaCreate(ctx, bin, work, name, mfName); runErr != nil {
 			return nil, fmt.Errorf("ollama create failed on the host binary: %s", lastLine(out))
 		}
+		dropCachedGGUF(cachedWeight)
 		return &PullOllamaModelResult{Status: "created", Model: name, GGUF: weight, Via: "host"}, nil
 	}
 
@@ -279,6 +292,7 @@ func (c *Client) PullOllamaModel(ctx context.Context, name string) (*PullOllamaM
 	if err != nil {
 		return nil, err
 	}
+	dropCachedGGUF(cachedWeight)
 	slog.Info("ollama model created", "model", name, "via", "container", "detail", lastLine(out))
 	return &PullOllamaModelResult{Status: "created", Model: name, GGUF: weight, Via: "container"}, nil
 }
