@@ -745,6 +745,7 @@ answers when it does not reply.
 | GET | `/api/autonomy/status`, `/api/autonomy/audit` | locations and their audit trail |
 | GET | `/api/autonomy/decisions` | what the disarmed locations *would* have done (`?outcome=would` by default; `fired`, `error` or `all`) |
 | POST | `/api/autonomy/locations`, `/api/autonomy/locations/{name}/toggle`, `/api/autonomy/enable`, `/api/autonomy/disable` | manage locations |
+| POST | `/api/autonomy/locations/{name}/dry-run` | `{"dry_run": false}` takes a gated rule (`disk_watermark`, `cert_auto_rotate`) live, `true` puts it back into preview; operator or admin; audited. Replies `{name, dry_run, config, live_means}`. It acts only when also armed (`toggle` with `config.enabled_action`) |
 | GET, POST | `/api/activities`; POST `…/{id}/progress`, `/link-task`, `/complete`; PUT `…/{id}/status` | agent activities |
 | GET | `/api/agent/loops` | managed loops |
 | GET, POST, DELETE | `/api/proactive/status`, `/rules`, `/history`, `/rules/{rule_id}` | the proactive loop |
