@@ -658,7 +658,6 @@ mod tests {
         assert!(h.writes.is_empty());
     }
 
-    #[test]
     /// general 2026-11-14: `on` while shadowed proceeds (the set runs
     /// already) AND writes full, saying so, so the declaration matches.
     #[test]
@@ -674,6 +673,7 @@ mod tests {
         assert!(h.said.iter().any(|l| l.starts_with("note: ")), "{:?}", h.said);
     }
 
+    #[test]
     fn on_writes_full_and_starts_the_three_with_gateway_and_worker() {
         let mut h = Fake::default();
         assert_eq!(on_on(&mut h, &status_of(&facts(Some("lean"))), &dirs()).unwrap(), 0);
