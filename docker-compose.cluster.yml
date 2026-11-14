@@ -2551,24 +2551,27 @@ services:
     security_opt:
       - no-new-privileges:true
 
-  # Loki log aggregation — every controller runs it, standalone included.
+  # Loki log aggregation, the first of the three OPTIONAL monitoring services.
   #
-  # The monitoring set (loki, prometheus, alertmanager, grafana, the
-  # exporters) carries BOTH the `controller` and
-  # the `standalone` profile. It used to be `controller` only, with
-  # `noo onboard --with-monitoring` as a one-shot opt-in on standalone
-  # installs — and since the opt-in persisted nothing, the first
-  # `noo upgrade --stack` (which relaunches under NOO_DEFAULT_PROFILE=
-  # standalone) dropped the whole set again. The live controller ran from
-  # its onboarding (2026-09-07) to 2026-09-28 with a 4 KB Loki directory
-  # that way. Monitoring is part of
-  # the product: tests/test_monitoring_profile_parity.py pins every
-  # `controller` service onto `standalone` too.
+  # The monitoring set (loki, tempo, prometheus, alertmanager, grafana,
+  # node-exporter) carries the `monitoring` and `controller` profiles.
+  # Prometheus, Alertmanager and node-exporter carry `standalone` too, so
+  # every install runs them. Loki, Tempo and Grafana (about 250 MiB idle) do
+  # not: the launcher adds `--profile monitoring` unless the install's
+  # noomesh.yaml declares `cluster.monitoring: lean` (scripts/lib-config.sh
+  # monitoring_profile_args). A MISSING declaration means full: the fleet
+  # controller is a standalone-profile install too, so an install that never
+  # chose keeps the whole set through every `noo upgrade --stack`. (A one-shot
+  # opt-in that persisted nothing, `noo onboard --with-monitoring` on the old
+  # controller-only set, is how the live controller ran three weeks with a
+  # 4 KB Loki directory; the choice now lives in noomesh.yaml.) New installs
+  # are lean unless the person asks; `noo stack monitoring on|off|status`.
+  # tests/test_monitoring_profile_parity.py pins this split.
   loki:
     logging: *default-logging
     image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/loki:3${NOO_IMAGE_DIGEST_LOKI:-@sha256:5f04dd8068afa17dd4da0fe1e88f56011d21a67dc1065b03c5de557971c7fa05}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-loki
-    profiles: ["monitoring", "controller", "standalone"]
+    profiles: ["monitoring", "controller"]
     # No external port — the gateway reaches Loki over the Docker network
     # and is the only thing that pushes to it (the node-agent shipper goes
     # through the gateway's ingest route, never to Loki directly).
@@ -2603,12 +2606,12 @@ services:
   # Tempo, the request-trace store (i359). The gateway sends a span per
   # request; Grafana reads them through the gateway's datasource proxy;
   # the per-request summary an agent queries lives in Postgres
-  # (noo_request_trace), not here. Same monitoring set, same profiles.
+  # (noo_request_trace), not here. Optional like Loki: same profiles.
   tempo:
     logging: *default-logging
     image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/tempo:2${NOO_IMAGE_DIGEST_TEMPO:-@sha256:5352e76f3c4e531babc76fc29958cfa3286096d2ca0bbf3b46007e46c0249a85}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-tempo
-    profiles: ["monitoring", "controller", "standalone"]
+    profiles: ["monitoring", "controller"]
     # No external port: the gateway is the only thing that reaches Tempo,
     # over the Docker network, on 4318 (OTLP HTTP) and 3200 (query API),
     # both requiring a cluster-CA client certificate.
@@ -2642,7 +2645,7 @@ services:
   # `node-agent-compose` shape; tests/test_docker_socket_allowlists.py pins
   # that, and tests/test_monitoring_profile_parity.py the monitoring set.
 
-  # Prometheus (every controller, standalone included)
+  # Prometheus (every install, standalone included; never optional)
   prometheus:
     logging: *default-logging
     image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/prometheus:3${NOO_IMAGE_DIGEST_PROMETHEUS:-@sha256:6a5aea3fc3a33fea84bb4ea7925228f8eb67884893970a768603d350e1830489}
@@ -2727,12 +2730,12 @@ services:
       timeout: 10s
       retries: 3
 
-  # Grafana (every controller, standalone included)
+  # Grafana: optional like Loki (cluster.monitoring; header above loki)
   grafana:
     logging: *default-logging
     image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/grafana:12-debian13-dev${NOO_IMAGE_DIGEST_GRAFANA:-@sha256:084445dea160e453576f5bd8e551116b0f1d6c52e8abd367d516135f53590c9a}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-grafana
-    profiles: ["monitoring", "controller", "standalone"]
+    profiles: ["monitoring", "controller"]
     # NOT root (i64, operator 2026-10-15): the -dev image's USER is 0, so
     # the uid is pinned here. 65532 owns the data dir (onboard
     # `subdir_owner`; the launcher re-owns an install's root-written

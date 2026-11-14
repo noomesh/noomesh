@@ -249,6 +249,7 @@ For search that reliably runs, pick another provider:
 | `shard_key` | env `NOO_SHARD_KEY` → `NODE_ID` → `default` | tag written into every conversation's metadata |
 | `auto_scale`, `idle_timeout_sec`, `pinned_backends[]` | `true`, `1800`, `[]` | placement policy (Python) |
 | `image_retention` | unset | `live` \| `preview` \| `off`: superseded images after a roll (operator manual, Upgrade) |
+| `monitoring` | unset (= `full`) | `full` \| `lean`: whether Grafana, Loki and Tempo run; `noo stack monitoring on\|off\|status` ([monitoring](../operating/monitoring.md)) |
 
 ### `security` — exec approval
 
