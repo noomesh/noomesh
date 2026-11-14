@@ -159,7 +159,7 @@ func TestNewPresentsTheNodeLeafAndTheBareClientIsRefused(t *testing.T) {
 	if err := c.Err(); err != nil {
 		t.Fatalf("New() failed to build from a readable PKI: %v", err)
 	}
-	wrote, err := c.FetchOne(context.Background(), srv.URL+"/gguf/w.gguf", dest)
+	wrote, err := c.FetchOneVerified(context.Background(), srv.URL+"/gguf/w.gguf", dest, shaHex([]byte("weights")))
 	if err != nil {
 		t.Fatalf("mTLS fetch: %v", err)
 	}
@@ -178,7 +178,7 @@ func TestNewPresentsTheNodeLeafAndTheBareClientIsRefused(t *testing.T) {
 	// handshake — proving the store above really requires a certificate,
 	// so the success above is a success of the leaf, not of TLS being on.
 	bare := &Client{HTTP: &http.Client{Timeout: 5 * time.Second}}
-	if _, err := bare.FetchOne(context.Background(), srv.URL+"/gguf/w.gguf", filepath.Join(t.TempDir(), "x")); err == nil {
+	if _, err := bare.FetchOneVerified(context.Background(), srv.URL+"/gguf/w.gguf", filepath.Join(t.TempDir(), "x"), shaHex([]byte("weights"))); err == nil {
 		t.Fatal("the bare client fetched from a store that requires a client certificate — the test server is not enforcing it")
 	}
 	// And a client that trusts the CA but presents nothing: the exact shape
@@ -186,7 +186,7 @@ func TestNewPresentsTheNodeLeafAndTheBareClientIsRefused(t *testing.T) {
 	noLeaf := &Client{HTTP: &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
 		TLSClientConfig: &tls.Config{RootCAs: p.pool, MinVersion: tls.VersionTLS12},
 	}}}
-	if _, err := noLeaf.FetchOne(context.Background(), srv.URL+"/gguf/w.gguf", filepath.Join(t.TempDir(), "y")); err == nil {
+	if _, err := noLeaf.FetchOneVerified(context.Background(), srv.URL+"/gguf/w.gguf", filepath.Join(t.TempDir(), "y"), shaHex([]byte("weights"))); err == nil {
 		t.Fatal("a client with no leaf fetched from a store that requires one")
 	}
 	if hits.Load() != 1 {
@@ -207,16 +207,11 @@ func TestAConfiguredButMissingCertIsAnErrorNotABareClient(t *testing.T) {
 	}
 	ctx := context.Background()
 	dst := t.TempDir()
-	if _, err := c.FetchOne(ctx, srv.URL+"/a", filepath.Join(dst, "a")); err == nil || !strings.Contains(err.Error(), "NOO_TLS_CERT") {
-		t.Fatalf("FetchOne: want the construction error naming NOO_TLS_CERT, got %v", err)
+	if _, err := c.FetchOneVerified(ctx, srv.URL+"/b", filepath.Join(dst, "b"), strings.Repeat("0", 64)); err == nil || !strings.Contains(err.Error(), "NOO_TLS_CERT") {
+		t.Fatalf("FetchOneVerified: want the construction error naming NOO_TLS_CERT, got %v", err)
 	}
-	if _, err := c.FetchOneVerified(ctx, srv.URL+"/b", filepath.Join(dst, "b"), strings.Repeat("0", 64)); err == nil {
-		t.Fatal("FetchOneVerified on a failed client returned nil")
-	}
-	if _, err := c.Mirror(ctx, srv.URL+"/c/", filepath.Join(dst, "c")); err == nil {
-		t.Fatal("Mirror on a failed client returned nil")
-	}
-	if _, err := c.MirrorHFRepo(ctx, srv.URL+"/d/", filepath.Join(dst, "d")); err == nil {
+	m := &HFManifest{Rev: strings.Repeat("a", 40), Files: []HFFile{{Path: "config.json", Bytes: 2, SHA256: strings.Repeat("0", 64)}}}
+	if _, err := c.MirrorHFRepo(ctx, srv.URL+"/d/", filepath.Join(dst, "d"), m, nil); err == nil {
 		t.Fatal("MirrorHFRepo on a failed client returned nil")
 	}
 	if hits.Load() != 0 {

@@ -136,6 +136,8 @@ func TestUnknownArgumentExitsTwoAndNeverStartsTheAgent(t *testing.T) {
 		{"--bogus"}, {"start"}, {"-v"}, {"--version-x"},
 		{"-preseed"},                  // too few: used to fall through to the agent
 		{"-preseed-file", "a"},        // too few
+		{"-preseed", "u", "d"},        // retired: an unverified HF mirror (i675 F13)
+		{"-preseed-file", "u", "d"},   // no digest: an unverified copy is not offered
 		{"-healthcheck", "extra-arg"}, // extra
 	} {
 		r := runIsolated(t, bin, nil, args...)
@@ -150,7 +152,8 @@ func TestUnknownArgumentExitsTwoAndNeverStartsTheAgent(t *testing.T) {
 
 // Every argument list the shipped launchers and helpers pass must keep
 // meaning what it meant: the systemd unit and run-agent.sh pass none;
-// hostd's swap probe passes -healthcheck; the preseed helpers pass 2 or 3.
+// hostd's swap probe passes -healthcheck; the file preseed passes 3 (the
+// digest is required since i675 F13, and the HF -preseed is retired).
 func TestParseArgsKeepsEveryShippedInvocation(t *testing.T) {
 	cases := []struct {
 		args []string
@@ -159,8 +162,9 @@ func TestParseArgsKeepsEveryShippedInvocation(t *testing.T) {
 		{nil, cmdRun},
 		{[]string{}, cmdRun},
 		{[]string{"-healthcheck"}, cmdHealthcheck},
-		{[]string{"-preseed", "u", "d"}, cmdPreseed},
-		{[]string{"-preseed-file", "u", "d"}, cmdPreseedFile},
+		{[]string{"-preseed", "u", "d"}, cmdBad},
+		{[]string{"-preseed-file", "u", "d"}, cmdBad},
+		{[]string{"-preseed-file", "u", "d", ""}, cmdBad},
 		{[]string{"-preseed-file", "u", "d", "sha"}, cmdPreseedFile},
 		{[]string{"--version"}, cmdVersion},
 		{[]string{"-version"}, cmdVersion},

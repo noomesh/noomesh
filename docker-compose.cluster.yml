@@ -825,6 +825,11 @@ services:
       # Image tars exported by `noo cluster sync-images` (prop 22 step 2) —
       # same one-directory/three-views contract as models above.
       - ${IMAGES_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/images}:/artifacts/images:ro
+      # The controller's HF cache (an HF_HOME) — the directory nginx serves
+      # as /hf/ — so the `hf` manifest kind (i675 F13) states each snapshot
+      # file's sha256, cross-checked against the blob's HF oid, for exactly
+      # the bytes a node will pull. Read-only; the route reads only hub/.
+      - ${HF_CACHE_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/hf-cache}:/artifacts/hf:ro
       - ${NOO_CLAUDE_CONFIG_VOLUME:-claude-config}:/root/.claude
       # PKI: a certificate-only view, never the PKI root.
       # This container runs as 65532 — the uid loki, prometheus,

@@ -19,8 +19,7 @@ const (
 	cmdRun         command = iota // no arguments: start the agent (systemd, launchd)
 	cmdVersion                    // print the version and exit 0
 	cmdHelp                       // print usage and exit 0
-	cmdPreseed                    // -preseed <repo-url> <dest-dir>
-	cmdPreseedFile                // -preseed-file <url> <dest> [sha256]
+	cmdPreseedFile                // -preseed-file <url> <dest> <sha256>
 	cmdHealthcheck                // -healthcheck
 	cmdBad                        // anything else: exit 2, NEVER start the agent
 )
@@ -45,10 +44,9 @@ commands:
   --help, -help, -h, help
                   print this help and exit
   -healthcheck    probe the RUNNING agent's /health over mTLS (exit 0 = healthy)
-  -preseed <repo-url> <dest-dir>
-                  copy a HuggingFace snapshot from the controller's model store
-  -preseed-file <url> <dest> [sha256]
-                  copy one weight file from the controller's model store
+  -preseed-file <url> <dest> <sha256>
+                  copy one weight file from the controller's model store,
+                  landing it only if its bytes hash to <sha256>
 
 --version and --help read no environment, open no files and start nothing.
 Any other argument exits 2 without starting the agent.
@@ -76,13 +74,13 @@ func parseArgs(args []string) (command, string) {
 		}
 		return cmdHealthcheck, ""
 	case "-preseed":
-		if len(args) != 3 {
-			return cmdBad, "-preseed needs exactly <repo-url> <dest-dir>"
-		}
-		return cmdPreseed, ""
+		// Retired (i675 F13): it mirrored an HF snapshot with no digest. The
+		// agent stages HF weights itself at backend start, every file
+		// verified against the controller's `hf` artifact manifest.
+		return cmdBad, "-preseed is retired: HF weights are staged by the running agent at backend start, verified against the controller's manifest"
 	case "-preseed-file":
-		if len(args) != 3 && len(args) != 4 {
-			return cmdBad, "-preseed-file needs <url> <dest> [sha256]"
+		if len(args) != 4 || strings.TrimSpace(args[3]) == "" {
+			return cmdBad, "-preseed-file needs <url> <dest> <sha256> (an unverified copy is not offered)"
 		}
 		return cmdPreseedFile, ""
 	}

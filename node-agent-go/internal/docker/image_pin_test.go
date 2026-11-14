@@ -115,6 +115,7 @@ func TestPlacedNodeRefusesAnHFCacheMiss(t *testing.T) {
 	prev := ensureImageFn
 	ensureImageFn = func(context.Context, *Client, string) error { return nil }
 	t.Cleanup(func() { ensureImageFn = prev })
+	stubHFManifests(t, nil) // the store has nothing: 404 for every repo
 	c := &Client{}
 	err := c.StartBackendSDK(context.Background(), "vllm", "org/not-staged", 1, StartOverrides{Image: "vllm/vllm-openai:v0.25.0" + pinDigest})
 	var miss *ModelNotStagedError
@@ -126,15 +127,23 @@ func TestPlacedNodeRefusesAnHFCacheMiss(t *testing.T) {
 			t.Errorf("refusal lacks %q: %v", want, err)
 		}
 	}
-	if hfRepoCachedLocally("org/not-staged") {
-		t.Fatal("empty cache reads as cached")
-	}
-	snap := filepath.Join(hf, "hub", "models--org--staged", "snapshots", "abc")
+	// i675 F13: a snapshot directory that merely EXISTS is no longer a
+	// reason to start (the old hfRepoCachedLocally). With the controller
+	// unreachable and nothing this node ever verified, the start is refused.
+	snap := filepath.Join(hf, "hub", "models--org--staged", "snapshots", strings.Repeat("a", 40))
 	if err := os.MkdirAll(snap, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if !hfRepoCachedLocally("org/staged") {
-		t.Fatal("a preseeded snapshot must count (controller briefly unreachable)")
+	if err := os.WriteFile(filepath.Join(snap, "config.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hfManifestFn = func(context.Context, string) (*preseed.HFManifest, error) {
+		return nil, errors.New("manifest request failed: connection refused")
+	}
+	err = c.StartBackendSDK(context.Background(), "vllm", "org/staged", 1, StartOverrides{Image: "vllm/vllm-openai:v0.25.0" + pinDigest})
+	var refused *HFWeightsRefusedError
+	if !errors.As(err, &refused) {
+		t.Fatalf("an unverified local snapshot must be refused, got %v", err)
 	}
 }
 
