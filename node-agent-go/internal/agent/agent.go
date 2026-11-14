@@ -412,6 +412,10 @@ func (a *Agent) Run() error {
 	if a.jobs != nil {
 		a.jobs.SetChatContext(rec.ChatContext)
 	}
+	// ...and so does a chat the gateway could not stamp (a node harness).
+	if a.server != nil {
+		a.server.SetChatContext(rec.ChatContext)
+	}
 	a.hb.SetModelSets(rec.ModelSetsReport)
 	a.hb.SetModelSetsFreeBytes(rec.ModelSetsFreeBytes)
 	a.hb.SetNodeFacts(rec.NodeFacts)
