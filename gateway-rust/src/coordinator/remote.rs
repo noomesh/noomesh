@@ -373,8 +373,14 @@ impl HarnessRuntime for RemoteRuntime {
         self.text(HarnessOp::RunningSummary).await
     }
 
-    async fn conversation_recall(&self, _conversation_id: &str, query: &str, top_k: u32) -> Option<String> {
-        self.text(HarnessOp::Recall { query: query.to_string(), top_k }).await
+    async fn conversation_recall(&self, _conversation_id: &str, query: &str, top_k: u32) -> super::context::RecallOutcome {
+        match self.call(HarnessOp::Recall { query: query.to_string(), top_k }).await {
+            Ok(v) => super::context::RecallOutcome::from_wire(&v),
+            Err(e) => {
+                tracing::warn!(error = %e, "harness rail: context layer unavailable");
+                super::context::RecallOutcome::skipped(format!("recall unavailable over the harness rail: {e}"))
+            }
+        }
     }
 
     async fn tool_schemas(&self) -> Vec<Value> {

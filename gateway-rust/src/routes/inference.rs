@@ -561,7 +561,8 @@ async fn native_inference(
                 result.usage.completion_tokens,
             );
 
-            (StatusCode::OK, Json(json!({
+            let recall = result.recall.as_ref().map(|r| json!(r));
+            let mut answer = json!({
                 "success": true,
                 "data": {
                     "response": result.response,
@@ -578,7 +579,13 @@ async fn native_inference(
                     },
                     "engine": "rust",
                 },
-            }))).into_response()
+            });
+            // Present only when the recall layer ran; a skipped recall
+            // carries its reason (the answer was given without memory).
+            if let Some(r) = recall {
+                answer["data"]["recall"] = r;
+            }
+            (StatusCode::OK, Json(answer)).into_response()
         }
         Err(e) => {
             tracing::error!(error = %e, "native_inference_failed");
