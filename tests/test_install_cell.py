@@ -754,3 +754,30 @@ def test_only_the_default_model_fails_on_a_non_answer_and_a_tiny_cell_notes_it()
     assert 'if [ "$MODEL" = default ]; then' in block[:fail], "the FAIL is gated on the product default model"
     assert "FIRST-ANSWER NOTE: the tiny test model ($TINY_MODEL)" in block and "not a product verdict" in block
     assert "export FIRST_PROMPT FIRST_ANSWER_NOT_AN_ANSWER FIRST_ANSWER_DEFLECTION MODEL TINY_MODEL" in text
+
+
+def test_first_answer_is_install_to_answer_not_the_probes_before_it():
+    # general, rc.1 run 43642041751: the default cell read 2,792 s because the
+    # memory baseline and the 40-minute idle series run before first-answer.
+    cell = _load("cell_fa", ROOT / "scripts/install-cell/cell.py")
+    steps = [{"step": n, "seconds": s} for n, s in [
+        ("install", 2), ("onboard", 219), ("stack-start", 25), ("verify", 33), ("probe-verify-json", 4),
+        ("probe-memory-baseline", 63), ("probe-idle-t10", 602), ("probe-idle-t40", 1799),
+        ("idle-chat-unloaded", 1), ("first-answer", 44), ("probe-coldload", 48)]]
+    assert cell.first_answer_times(steps, 2792) == (2792 - 2469, 2469)
+    assert cell.first_answer_times(steps[:4] + steps[9:], 327) == (327, 0), "no probes before it: unchanged"
+    assert cell.first_answer_times(steps, None) == (None, 0)
+    assert cell.first_answer_times([{"step": "onboard", "seconds": 5}], 90) == (90, 0), "no first-answer step: the wall number"
+
+
+def test_the_summary_reports_both_numbers(tmp_path):
+    cell = _load("cell_fa2", ROOT / "scripts/install-cell/cell.py")
+    import json as _j
+    rows = [("install", 2), ("probe-idle-t10", 600), ("first-answer", 40)]
+    (tmp_path / "steps.jsonl").write_text("".join(
+        _j.dumps({"step": n, "rc": 0, "seconds": s, "first_error": "", "warnings": [], "prompts": []}) + "\n" for n, s in rows))
+    (tmp_path / "meta.json").write_text(_j.dumps({"cell": "c", "first_answer_s": 700}))
+    out = cell.summarize(tmp_path)
+    assert out["first_answer_s"] == 100 and out["first_answer_wall_s"] == 700 and out["probe_wait_before_first_answer_s"] == 600
+    md = (tmp_path / "summary.md").read_text()
+    assert "first answer 100 s after the cell started (not counting 600 s of probes before it; 700 s on the wall clock)" in md
