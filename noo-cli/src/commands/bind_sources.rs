@@ -654,12 +654,34 @@ mod tests {
         std::fs::create_dir_all(&hf).unwrap();
         let hub = hf.join("hub");
         let cfg = hf_hub_cfg(&hub);
-        let (code, text) = launch_check(&cfg, &[], false, &[], Some(&d.join("data").to_string_lossy()), true, true);
+        let (code, text) = launch_check(&cfg, &[], false, &[], Some(&*d.join("data").to_string_lossy()), true, true);
         assert_eq!(code, 0, "{text}");
         assert!(text.contains("HF_CACHE_DIR/hub"), "{text}");
         assert!(hub.is_dir());
         assert_eq!(owner_of(&hub), owner_of(&hf));
         assert!(ensure_hf_hub(&cfg, &[], false).is_empty(), "idempotent");
+    }
+
+    /// (1, as root — how the batch runner and a sudo launcher run): HF_CACHE_DIR
+    /// owned by someone else (65534 here, `noo-agent` on a real host). The
+    /// hub/ this creates must carry the PARENT's owner, not root's: a
+    /// root-owned hub/ is exactly what this exists to prevent.
+    #[test]
+    fn hf_hub_created_as_root_takes_the_parents_owner() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: needs root to chown the parent to 65534 (the batch runner runs tests as root)");
+            return;
+        }
+        use std::os::unix::fs::MetadataExt;
+        let d = scratch("hf-hub-root");
+        let hf = d.join("hf-cache");
+        std::fs::create_dir_all(&hf).unwrap();
+        std::os::unix::fs::chown(&hf, Some(65534), Some(65534)).unwrap();
+        let hub = hf.join("hub");
+        let (code, text) = launch_check(&hf_hub_cfg(&hub), &[], false, &[], Some(&*d.to_string_lossy()), true, true);
+        assert_eq!(code, 0, "{text}");
+        let m = std::fs::metadata(&hub).unwrap();
+        assert_eq!((m.uid(), m.gid()), (65534, 65534), "hub/ must be owned like HF_CACHE_DIR, not by root");
     }
 
     /// (2) Upgrade: an existing install whose HF_CACHE_DIR holds models but
@@ -693,7 +715,7 @@ mod tests {
         let declared = d.join("big-disk/hf-home");
         std::fs::create_dir_all(&declared).unwrap();
         let hub = declared.join("hub");
-        let (code, text) = launch_check(&hf_hub_cfg(&hub), &[], false, &[], Some(&d.join("data").to_string_lossy()), true, true);
+        let (code, text) = launch_check(&hf_hub_cfg(&hub), &[], false, &[], Some(&*d.join("data").to_string_lossy()), true, true);
         assert_eq!(code, 0, "{text}");
         assert!(hub.is_dir());
         let gone = d.join("not-there/hub");
