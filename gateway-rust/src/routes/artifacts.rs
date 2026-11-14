@@ -19,8 +19,9 @@
 //!
 //! Kinds served: `gguf` (flat model weights, step 1) and `image` (docker
 //! image tars exported by `noo cluster sync-images`, step 2). Both are flat
-//! files with one hash each. HF repo trees (many files per model) need a
-//! manifest-of-files and stay out until a step needs them.
+//! files with one hash each. `hf` (i675 F13) is the manifest-of-files for an
+//! HF repo's `refs/main` snapshot: each file with the sha256 of its blob,
+//! cross-checked against the blob's own HF oid (see [`hf_manifest`]).
 //!
 //! `modelset` (i300 F3) is the manifest-of-files: `<id>@<revision>` answers
 //! the signed `model-set.json` and its detached signature, and the manifest
@@ -517,6 +518,279 @@ async fn modelset_manifest(name: &str) -> Result<Response, AppError> {
     .into_response())
 }
 
+// ── HF snapshots: a manifest of files for the node's HF preseed (i675 F13) ──
+//
+// A placed node used to mirror `/hf/<repo>/snapshots/<refs/main>/` from the
+// model cache with no digest at all, keeping any local file whose SIZE
+// matched. This kind states every file of that snapshot with the sha256 of
+// its RESOLVED blob, and the node lands or keeps nothing that does not hash
+// to it (preseed.MirrorHFRepo).
+//
+// The gateway does not take the controller's HF cache on faith either: it is
+// written by huggingface_hub (and by the controller's own vllm/TEI, which
+// mount it read-write), not by a verified fetch. In an HF cache every
+// snapshot file is a link to `blobs/<oid>`, where the oid IS a content
+// digest: an LFS blob is named by the sha256 of its bytes, a git blob by its
+// git object id (sha1 over `blob <len>\0` + the bytes). So each blob is
+// cross-checked against its own name, and a mismatch REFUSES the whole
+// snapshot (409, naming the file) rather than vouching for bytes HF never
+// served. A snapshot file that is a plain file (no oid), or a link that
+// leaves the repo's `blobs/`, is refused the same way.
+
+/// Where the controller's HF cache — an HF_HOME, the directory that CONTAINS
+/// `hub/` — is mounted in THIS container: the same host directory nginx
+/// serves as `/hf/` (mounted there at /hf-store, aliased to /hf-store/hub/),
+/// read-only. Only `hub/` is ever read here.
+pub(crate) fn hf_home_dir() -> PathBuf {
+    PathBuf::from(std::env::var("NOO_ARTIFACT_HF_DIR").unwrap_or_else(|_| "/artifacts/hf".into()))
+}
+
+/// Most files one snapshot may list. A real model has tens.
+const HF_MAX_FILES: usize = 4096;
+/// Deepest directory nesting inside a snapshot (`1_Pooling/config.json` is 1).
+const HF_MAX_DEPTH: usize = 8;
+/// A git (non-LFS) blob is read whole to hash it. The Hub stores every file
+/// over 10 MB in LFS, so a git blob past this is not a real one.
+const HF_GIT_BLOB_MAX: u64 = 64 << 20;
+
+/// `models--<org>--<name>` (or `models--<name>`): the cache directory of one
+/// repo, the name a node asks for. Bytes `[A-Za-z0-9._-]`, no `..`.
+fn valid_hf_repo_dir(name: &str) -> bool {
+    name.len() < 256
+        && !name.contains("..")
+        && name
+            .strip_prefix("models--")
+            .is_some_and(|rest| !rest.is_empty() && !rest.starts_with(['-', '.']))
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+fn is_lower_hex(s: &str, len: usize) -> bool {
+    s.len() == len && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// What names a blob's content in an HF cache.
+#[derive(Debug, Clone, PartialEq)]
+enum HfOid {
+    /// An LFS blob: its name is the sha256 of its bytes.
+    Lfs(String),
+    /// A git blob: its name is the git object id of its bytes.
+    Git(String),
+}
+
+/// One snapshot file, resolved to the blob it links to.
+#[derive(Debug)]
+struct HfEntry {
+    /// Path inside `snapshots/<rev>/`, `/`-separated.
+    path: String,
+    blob: PathBuf,
+    oid: HfOid,
+    size: u64,
+    mtime_unix: u64,
+}
+
+/// The refusal for a snapshot the controller will not vouch for: 409 with
+/// the reason, which the node carries verbatim into its start refusal.
+fn hf_refuse(repo: &str, why: impl std::fmt::Display) -> AppError {
+    tracing::warn!(repo = %repo, reason = %why, "artifacts.manifest.hf_refused");
+    AppError::Conflict(format!(
+        "hf snapshot {repo} refused: {why}; the controller will not vouch for these weights — \
+         re-download the model on the controller (`HF_HOME=$HF_CACHE_DIR huggingface-cli download <org>/<name>`)"
+    ))
+}
+
+/// The commit `refs/main` names: 40 lowercase hex, or a refusal.
+fn hf_read_rev(repo_dir: &Path, repo: &str) -> Result<String, AppError> {
+    let raw = std::fs::read_to_string(repo_dir.join("refs").join("main")).map_err(|_| {
+        AppError::NotFound(format!("no hf repo '{repo}' with a refs/main in the controller store"))
+    })?;
+    let rev = raw.trim().to_string();
+    if !is_lower_hex(&rev, 40) {
+        return Err(hf_refuse(repo, format!("refs/main is {rev:?}, not a 40-hex commit id")));
+    }
+    Ok(rev)
+}
+
+/// Every file of `snapshots/<rev>/`, each resolved to its blob and the oid
+/// the blob is named by, sorted by path. Blocking (std::fs): the caller runs
+/// it on spawn_blocking.
+fn hf_snapshot_entries(repo_dir: &Path, repo: &str, rev: &str) -> Result<Vec<HfEntry>, AppError> {
+    let snap = repo_dir.join("snapshots").join(rev);
+    if !snap.is_dir() {
+        return Err(AppError::NotFound(format!(
+            "hf repo '{repo}': refs/main names {rev}, but snapshots/{rev}/ is not in the controller store"
+        )));
+    }
+    let blobs = std::fs::canonicalize(repo_dir.join("blobs"))
+        .map_err(|e| hf_refuse(repo, format!("it has no blobs/ directory ({e})")))?;
+    let io = |p: &Path, e: std::io::Error| AppError::Internal(format!("reading {}: {e}", p.display()));
+    let mut out = Vec::new();
+    let mut stack = vec![(snap, String::new(), 0usize)];
+    while let Some((dir, prefix, depth)) = stack.pop() {
+        for ent in std::fs::read_dir(&dir).map_err(|e| io(dir.as_path(), e))? {
+            let ent = ent.map_err(|e| io(dir.as_path(), e))?;
+            let name = ent
+                .file_name()
+                .into_string()
+                .map_err(|_| hf_refuse(repo, "a file name in the snapshot is not UTF-8"))?;
+            let rel = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+            let ft = ent.file_type().map_err(|e| io(ent.path().as_path(), e))?;
+            if ft.is_dir() {
+                if depth + 1 > HF_MAX_DEPTH {
+                    return Err(hf_refuse(repo, format!("{rel} is nested deeper than {HF_MAX_DEPTH} levels")));
+                }
+                stack.push((ent.path(), rel, depth + 1));
+                continue;
+            }
+            if !ft.is_symlink() {
+                return Err(hf_refuse(
+                    repo,
+                    format!("{rel} is a plain file, not a link into blobs/, so nothing names what it should hash to"),
+                ));
+            }
+            let target = std::fs::canonicalize(ent.path())
+                .map_err(|e| hf_refuse(repo, format!("{rel} is a dangling link ({e})")))?;
+            if target.parent() != Some(blobs.as_path()) || !target.is_file() {
+                return Err(hf_refuse(repo, format!("{rel} does not link to a file in the repo's blobs/")));
+            }
+            let blob_name = target.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+            let oid = if is_lower_hex(&blob_name, 64) {
+                HfOid::Lfs(blob_name)
+            } else if is_lower_hex(&blob_name, 40) {
+                HfOid::Git(blob_name)
+            } else {
+                return Err(hf_refuse(repo, format!("{rel} links to blobs/{blob_name}, which is not an HF oid")));
+            };
+            let Some((size, mtime_unix)) = file_meta(&target) else {
+                return Err(hf_refuse(repo, format!("{rel}: its blob cannot be read")));
+            };
+            out.push(HfEntry { path: rel, blob: target, oid, size, mtime_unix });
+            if out.len() > HF_MAX_FILES {
+                return Err(hf_refuse(repo, format!("the snapshot lists more than {HF_MAX_FILES} files")));
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(hf_refuse(repo, format!("snapshots/{rev}/ is empty")));
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+/// The sha256 and the git blob id of a small file, read whole.
+fn hash_git_blob(path: &Path, size: u64) -> Result<([u8; 32], String), String> {
+    use sha1::Sha1;
+    use sha2::{Digest as _, Sha256};
+    if size > HF_GIT_BLOB_MAX {
+        return Err(format!("{size} bytes is too large for a git blob"));
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("read: {e}"))?;
+    let mut git = Sha1::new();
+    git.update(format!("blob {}\0", bytes.len()).as_bytes());
+    git.update(&bytes);
+    let sha256: [u8; 32] = Sha256::digest(&bytes).into();
+    Ok((sha256, hex::encode(git.finalize())))
+}
+
+/// What an `hf` manifest request comes to: the manifest, or "still hashing"
+/// with the snapshot's total size (for the 202).
+#[derive(Debug)]
+enum HfOutcome {
+    Ready(serde_json::Value),
+    Hashing(u64),
+}
+
+/// The `hf` manifest of `repo` under `hf_home`, waiting at most `wait` for
+/// background hashes. LFS blobs are hashed through the same cached,
+/// single-flight path as the flat kinds (key `hf/<repo>/<oid>`), ONE AT A
+/// TIME, so a cold snapshot costs the controller one core, not one per
+/// shard; every digest, cached or fresh, is compared with the blob's name.
+async fn hf_manifest_at(hf_home: &Path, repo: &str, wait: std::time::Duration) -> Result<HfOutcome, AppError> {
+    if !valid_hf_repo_dir(repo) {
+        return Err(AppError::BadRequest(
+            "hf artifact name must be a cache repo directory, models--<org>--<name> ([A-Za-z0-9._-])".into(),
+        ));
+    }
+    let deadline = tokio::time::Instant::now() + wait;
+    let repo_dir = hf_home.join("hub").join(repo);
+    let (rev, entries) = {
+        let (repo_dir, repo) = (repo_dir.clone(), repo.to_string());
+        tokio::task::spawn_blocking(move || {
+            let rev = hf_read_rev(&repo_dir, &repo)?;
+            let entries = hf_snapshot_entries(&repo_dir, &repo, &rev)?;
+            Ok::<_, AppError>((rev, entries))
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("hf snapshot walk: {e}")))??
+    };
+    let total: u64 = entries.iter().map(|e| e.size).sum();
+    let mut files = Vec::with_capacity(entries.len());
+    for e in &entries {
+        let sha256 = match &e.oid {
+            HfOid::Git(want) => {
+                let (blob, size) = (e.blob.clone(), e.size);
+                let (sha256, git) = tokio::task::spawn_blocking(move || hash_git_blob(&blob, size))
+                    .await
+                    .map_err(|err| AppError::Internal(format!("hashing {}: {err}", e.path)))?
+                    .map_err(|why| hf_refuse(repo, format!("{}: {why}", e.path)))?;
+                if git != *want {
+                    return Err(hf_refuse(
+                        repo,
+                        format!("{} links to git blob {want}, but its bytes are git blob {git}", e.path),
+                    ));
+                }
+                sha256
+            }
+            HfOid::Lfs(want) => {
+                let key = format!("hf/{repo}/{want}");
+                let sha256 = match cached_digest(&key, e.size, e.mtime_unix).await {
+                    Some(c) => c.sha256,
+                    None => {
+                        let rx = hash_in_background(&key, e.blob.clone(), e.size, e.mtime_unix);
+                        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                        match await_hash(rx, left).await {
+                            Some(Ok(s)) => s,
+                            Some(Err(why)) => {
+                                return Err(AppError::Internal(format!("hashing {} of {repo}: {why}", e.path)))
+                            }
+                            None => return Ok(HfOutcome::Hashing(total)),
+                        }
+                    }
+                };
+                let got = hex::encode(sha256);
+                if got != *want {
+                    return Err(hf_refuse(
+                        repo,
+                        format!("{} links to LFS blob {want}, but its bytes hash to {got}", e.path),
+                    ));
+                }
+                sha256
+            }
+        };
+        files.push(json!({ "path": e.path, "bytes": e.size, "sha256": hex::encode(sha256) }));
+    }
+    Ok(HfOutcome::Ready(json!({
+        "kind": "hf",
+        "name": repo,
+        "rev": rev,
+        "files": files,
+        // Where each file is on the data plane: <data_path>/<path>.
+        "data_path": format!("/hf/{repo}/snapshots/{rev}"),
+    })))
+}
+
+/// GET /api/artifacts/manifest/hf/{models--org--name}
+///
+/// Response (200): `{"kind":"hf","name","rev","files":[{"path","bytes",
+/// "sha256"}],"data_path"}` for the snapshot `refs/main` names; 202 while a
+/// blob is still being hashed; 404 when the store has no such repo; 409 when
+/// the controller's own copy does not match its HF oids (see above).
+async fn hf_manifest(name: &str) -> Result<Response, AppError> {
+    match hf_manifest_at(&hf_home_dir(), name, std::time::Duration::from_secs(HASH_WAIT_SECS)).await? {
+        HfOutcome::Ready(body) => Ok(Json(body).into_response()),
+        HfOutcome::Hashing(total) => Ok(hashing_response("hf", name, total)),
+    }
+}
+
 /// GET /api/artifacts/manifest/{kind}/{name}
 /// Where a manifest request may look, decided before the store is touched:
 /// the kind's directory and data-plane prefix, or a 400 for an unknown kind or
@@ -526,7 +800,7 @@ async fn modelset_manifest(name: &str) -> Result<Response, AppError> {
 fn manifest_target(kind: &str, name: &str) -> Result<(PathBuf, &'static str), AppError> {
     let Some((dir, data_prefix, ext)) = kind_facts(kind) else {
         return Err(AppError::BadRequest(format!(
-            "unknown artifact kind '{kind}' (kinds: gguf, image, modelfile, modelset, ollamablob, ollamamanifest)"
+            "unknown artifact kind '{kind}' (kinds: gguf, hf, image, modelfile, modelset, ollamablob, ollamamanifest)"
         )));
     };
     if !valid_artifact_name(name, ext) || !ollama_mirror_name_ok(kind, name) {
@@ -546,6 +820,9 @@ async fn manifest(
     }
     if kind == "modelset" {
         return modelset_manifest(&name).await;
+    }
+    if kind == "hf" {
+        return hf_manifest(&name).await;
     }
     let (dir, data_prefix) = manifest_target(&kind, &name)?;
     let path = dir.join(&name);
@@ -1361,5 +1638,168 @@ mod tests {
         assert!(s.contains(&"ab".repeat(32)), "hex form in JSON: {s}");
         let back: DigestEntry = serde_json::from_str(&s).unwrap();
         assert_eq!(e, back);
+    }
+
+    // ── hf manifest (i675 F13) ────────────────────────────────────────────
+
+    const HF_REV: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn sha256_hex(b: &[u8]) -> String {
+        use sha2::{Digest as _, Sha256};
+        hex::encode(Sha256::digest(b))
+    }
+
+    fn git_blob_hex(b: &[u8]) -> String {
+        use sha1::{Digest as _, Sha1};
+        let mut h = Sha1::new();
+        h.update(format!("blob {}\0", b.len()).as_bytes());
+        h.update(b);
+        hex::encode(h.finalize())
+    }
+
+    /// An HF cache as huggingface_hub writes it: blobs named by their oid,
+    /// snapshot files as RELATIVE links into blobs/. The weight's bytes carry
+    /// the tag, so each test's LFS oid (and digest-cache key) is its own.
+    /// Returns (HF_HOME, repo dir name, weight bytes).
+    fn hf_fixture(tag: &str) -> (PathBuf, String, Vec<u8>) {
+        let home = std::env::temp_dir().join(format!("noo-art-hf-{tag}-{}", uuid::Uuid::new_v4()));
+        let repo = format!("models--org--{tag}");
+        let repo_dir = home.join("hub").join(&repo);
+        let snap = repo_dir.join("snapshots").join(HF_REV);
+        std::fs::create_dir_all(snap.join("1_Pooling")).unwrap();
+        std::fs::create_dir_all(repo_dir.join("blobs")).unwrap();
+        std::fs::create_dir_all(repo_dir.join("refs")).unwrap();
+        std::fs::write(repo_dir.join("refs").join("main"), HF_REV).unwrap();
+        let weights = format!("SAFETENSORS-{tag}-{}", uuid::Uuid::new_v4()).into_bytes();
+        let config = b"{\"model_type\":\"t\"}".to_vec();
+        let pool = b"{\"pooling\":\"mean\"}".to_vec();
+        for (rel, bytes, oid, up) in [
+            ("model.safetensors", &weights, sha256_hex(&weights), "../../blobs"),
+            ("config.json", &config, git_blob_hex(&config), "../../blobs"),
+            ("1_Pooling/config.json", &pool, git_blob_hex(&pool), "../../../blobs"),
+        ] {
+            std::fs::write(repo_dir.join("blobs").join(&oid), bytes).unwrap();
+            std::os::unix::fs::symlink(format!("{up}/{oid}"), snap.join(rel)).unwrap();
+        }
+        (home, repo, weights)
+    }
+
+    async fn hf_ready(home: &Path, repo: &str) -> Result<serde_json::Value, AppError> {
+        match hf_manifest_at(home, repo, std::time::Duration::from_secs(10)).await? {
+            HfOutcome::Ready(v) => Ok(v),
+            HfOutcome::Hashing(_) => panic!("still hashing after 10 s"),
+        }
+    }
+
+    fn assert_hf_refused(err: AppError, needle: &str) {
+        match err {
+            AppError::Conflict(m) => {
+                assert!(m.contains("refused"), "{m}");
+                assert!(m.contains(needle), "refusal must name {needle:?}: {m}");
+            }
+            other => panic!("expected a 409 refusal, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hf_manifest_lists_every_snapshot_file_with_its_blob_sha256() {
+        let (home, repo, weights) = hf_fixture("ok");
+        let v = hf_ready(&home, &repo).await.unwrap();
+        assert_eq!(v["kind"], "hf");
+        assert_eq!(v["rev"], HF_REV);
+        assert_eq!(v["data_path"], format!("/hf/{repo}/snapshots/{HF_REV}"));
+        let files = v["files"].as_array().unwrap();
+        let paths: Vec<&str> = files.iter().map(|f| f["path"].as_str().unwrap()).collect();
+        assert_eq!(paths, ["1_Pooling/config.json", "config.json", "model.safetensors"]);
+        let w = &files[2];
+        assert_eq!(w["sha256"], sha256_hex(&weights));
+        assert_eq!(w["bytes"], weights.len() as u64);
+        // A git blob's manifest digest is the sha256 of its BYTES, not its oid.
+        assert_eq!(files[1]["sha256"], sha256_hex(b"{\"model_type\":\"t\"}"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The cross-check: an LFS blob whose bytes are not what its name says
+    /// (same length, so size could never tell) refuses the whole snapshot.
+    #[tokio::test]
+    async fn an_lfs_blob_whose_bytes_do_not_match_its_name_is_refused() {
+        let (home, repo, weights) = hf_fixture("lfsbad");
+        let blob = home.join("hub").join(&repo).join("blobs").join(sha256_hex(&weights));
+        std::fs::write(&blob, vec![b'X'; weights.len()]).unwrap();
+        let err = hf_ready(&home, &repo).await.unwrap_err();
+        assert_hf_refused(err, "model.safetensors");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn a_git_blob_whose_bytes_do_not_match_its_id_is_refused() {
+        let (home, repo, _) = hf_fixture("gitbad");
+        let oid = git_blob_hex(b"{\"model_type\":\"t\"}");
+        let blob = home.join("hub").join(&repo).join("blobs").join(oid);
+        std::fs::write(&blob, b"{\"model_type\":\"X\"}").unwrap();
+        let err = hf_ready(&home, &repo).await.unwrap_err();
+        assert_hf_refused(err, "config.json");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_file_with_no_oid_or_outside_blobs_is_refused() {
+        // A plain file in the snapshot: nothing names what it should hash to.
+        let (home, repo, _) = hf_fixture("plain");
+        let snap = home.join("hub").join(&repo).join("snapshots").join(HF_REV);
+        std::fs::write(snap.join("extra.bin"), b"x").unwrap();
+        assert_hf_refused(hf_ready(&home, &repo).await.unwrap_err(), "plain file");
+        let _ = std::fs::remove_dir_all(&home);
+
+        // A link that leaves blobs/ (named like an oid, so only the location tells).
+        let (home, repo, _) = hf_fixture("escape");
+        let snap = home.join("hub").join(&repo).join("snapshots").join(HF_REV);
+        let outside = home.join(sha256_hex(b"elsewhere"));
+        std::fs::write(&outside, b"elsewhere").unwrap();
+        std::os::unix::fs::symlink(&outside, snap.join("evil.safetensors")).unwrap();
+        assert_hf_refused(hf_ready(&home, &repo).await.unwrap_err(), "blobs/");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn a_bad_hf_name_is_a_400_and_a_missing_repo_a_404() {
+        let home = modelset_tmp("hfnames");
+        for bad in ["../x", "org--name", "models--", "models--a/b", "models--..", "models---x", "models--a b"] {
+            match hf_manifest_at(&home, bad, std::time::Duration::ZERO).await {
+                Err(AppError::BadRequest(m)) => assert!(m.contains("models--"), "{m}"),
+                other => panic!("{bad:?}: expected BadRequest, got {other:?}"),
+            }
+        }
+        assert!(valid_hf_repo_dir("models--google--gemma-4-12b-it"));
+        assert!(valid_hf_repo_dir("models--BAAI--bge-small-en-v1.5"));
+        assert!(valid_hf_repo_dir("models--gpt2"));
+        match hf_manifest_at(&home, "models--org--absent", std::time::Duration::ZERO).await {
+            Err(AppError::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A cold LFS blob answers 202 (the node's await loop asks again), then
+    /// the manifest once the single-flight hash is done.
+    #[tokio::test]
+    async fn a_cold_lfs_blob_answers_hashing_then_the_manifest() {
+        let (home, repo, weights) = hf_fixture("cold");
+        // Current-thread runtime: the spawned hash cannot finish inside a zero wait.
+        match hf_manifest_at(&home, &repo, std::time::Duration::ZERO).await.unwrap() {
+            HfOutcome::Hashing(total) => assert!(total >= weights.len() as u64),
+            HfOutcome::Ready(v) => panic!("a cold blob answered at once: {v}"),
+        }
+        let v = hf_ready(&home, &repo).await.unwrap();
+        assert_eq!(v["files"][2]["sha256"], sha256_hex(&weights));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_unknown_kind_refusal_names_hf() {
+        match manifest_target("nope", "x") {
+            Err(AppError::BadRequest(m)) => assert!(m.contains(" hf,"), "{m}"),
+            other => panic!("expected BadRequest, got {:?}", other.map(|_| ())),
+        }
     }
 }
