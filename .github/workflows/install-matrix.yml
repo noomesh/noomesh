@@ -62,8 +62,8 @@ jobs:
           # the 20x dockerd-restart probe included: that is where Docker 27
           # and 28 word a failed namespace join differently (noomesh#1128).
           - {cell: ubuntu-22.04-amd64-docker.io, runner: ubuntu-22.04, docker: distro, onboard: ci, model: tiny, scope: full, experimental: false}
-          - {cell: ubuntu-24.04-arm64, runner: ubuntu-24.04-arm, docker: preinstalled, onboard: ci, model: tiny, scope: full, experimental: false}
-          - {cell: ubuntu-22.04-arm64, runner: ubuntu-22.04-arm, docker: preinstalled, onboard: ci, model: tiny, scope: full, experimental: false}
+          - {cell: ubuntu-24.04-arm64, runner: ubuntu-24.04-arm, docker: preinstalled, onboard: ci, model: tiny, scope: full, experimental: false, expect: refusal}
+          - {cell: ubuntu-22.04-arm64, runner: ubuntu-22.04-arm, docker: preinstalled, onboard: ci, model: tiny, scope: full, experimental: false, expect: refusal}
           # fa: no Docker at all, the INTERACTIVE wizard through a pty.
           - {cell: stranger-24.04, runner: ubuntu-24.04, docker: none, onboard: interactive, model: default, scope: full, experimental: false}
           # i677 pass 1: Enter at EVERY prompt. The read says it cannot finish (no-default password; the default-No passphrase loop); where it stops is the result.
@@ -79,6 +79,7 @@ jobs:
           sparse-checkout: |
             README.md
             docs/getting-started/first-chat.md
+            docs/getting-started/install.md
             scripts/install-cell
             scripts/ci-free-disk.sh
           sparse-checkout-cone-mode: false
@@ -94,6 +95,8 @@ jobs:
           ONBOARD: ${{ matrix.onboard }}
           MODEL: ${{ matrix.model }}
           SCOPE: ${{ matrix.scope }}
+          # expect: refusal (the arm64 cells): the cell asserts the controller refusal.
+          EXPECT: ${{ matrix.expect || '' }}
           CLI_TAG: ${{ inputs.cli_tag || 'latest' }}
         run: bash scripts/install-cell/run.sh
       - name: Upload the cell's report (redacted; scanned by run.sh)
@@ -121,6 +124,7 @@ jobs:
           sparse-checkout: |
             README.md
             docs/getting-started/first-chat.md
+            docs/getting-started/install.md
             scripts/install-cell
           sparse-checkout-cone-mode: false
       - name: WSL2 + Ubuntu 24.04   # Vampire/setup-wsl v7.2.0

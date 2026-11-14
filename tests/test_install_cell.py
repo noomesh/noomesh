@@ -499,6 +499,88 @@ def test_the_rag_probe_asks_the_pages_query_then_three_chat_paths_and_is_never_j
     assert wf.count("docs/getting-started/first-chat.md") >= 2, "both jobs check the page out"
 
 
+def _pty():
+    return _load("onboard_pty", ROOT / "scripts/install-cell/onboard_pty.py")
+
+
+def test_the_literal_pass_types_what_the_install_doc_says_and_enter_elsewhere():
+    # general 11-14: stranger-24.04-literal was a permanent red (Enter at the
+    # admin password, six times). The doc now names every prompt Enter cannot
+    # pass, and the literal pass follows the doc, not a list of its own.
+    d = _pty()
+    rows = d.doc_answers((ROOT / "docs/getting-started/install.md").read_text())
+    want = {
+        "Admin password:": ("PW", "typed <password> (the install doc's table)"),
+        "Confirm password:": ("PW", "typed <password> (the install doc's table)"),
+        "Stored both in a password manager OFF this machine [y/N]:": ("y", "typed y (the install doc's table)"),
+        "Tailscale is not installed. Install it now (official installer, may prompt for sudo)? [Y/n]:":
+            ("n", "typed n (the install doc's table)"),
+        "Join your tailnet now? (runs `tailscale up`; opens a login link where you sign in) [Y/n]:":
+            ("n", "typed n (the install doc's table)"),
+        "Admin username [admin]:": ("", "enter"),
+        "Anthropic API key (blank to skip):": ("", "enter"),
+    }
+    for prompt, expected in want.items():
+        assert d.answer(prompt, "literal", "PW", rows) == expected, prompt
+    # The attentive pass is unchanged and does not read the doc.
+    assert d.answer("Admin password:", "attentive", "PW") == ("PW", "typed <password>")
+
+
+def test_a_literal_pass_without_the_doc_table_stops_with_a_driver_error(tmp_path):
+    empty = tmp_path / "install.md"
+    empty.write_text("# Install\n\nRun noo onboard.\n")
+    p = subprocess.run([sys.executable, str(ROOT / "scripts/install-cell/onboard_pty.py"), "--pass", "literal",
+                        "--doc", str(empty), "--", "true"], capture_output=True, text=True)
+    assert p.returncode == 5 and "DRIVER: the install doc has no 'What the wizard asks you' table" in p.stdout
+
+
+def _refusal_step():
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    body = text[text.index("step onboard-refuses 600 -- sh -c '") + len("step onboard-refuses 600 -- sh -c '"):]
+    return body[:body.index("'\n    teardown")]
+
+
+REFUSAL = ("  x this is a Linux arm64 (aarch64) machine: a controller needs Linux on x86_64 (amd64) today. "
+           "The controller's images (...) are published for amd64 only. This machine can join an amd64 "
+           "controller as a node instead: see docs/getting-started/supported-hardware.md.")
+
+
+def _refuse(tmp_path, out, rc, containers=0):
+    fake = tmp_path / "bin"
+    fake.mkdir(exist_ok=True)
+    (tmp_path / "out.txt").write_text(out + "\n")
+    (fake / "noo").write_text(f"#!/bin/sh\ncat {tmp_path / 'out.txt'}\nexit {rc}\n")
+    (fake / "noo").chmod(0o755)
+    (fake / "docker").write_text("#!/bin/sh\n" + "".join("echo c%d\n" % i for i in range(containers)))
+    (fake / "docker").chmod(0o755)
+    p = subprocess.run(["sh", "-c", _refusal_step()], env={"PATH": f"{fake}:/usr/bin:/bin"}, capture_output=True, text=True)
+    return p.returncode, p.stdout
+
+
+def test_an_arm64_cell_passes_on_a_clean_refusal_and_fails_on_anything_else(tmp_path):
+    rc, out = _refuse(tmp_path, REFUSAL, 1)
+    assert rc == 0 and "REFUSAL OK" in out, out
+    rc, out = _refuse(tmp_path, REFUSAL, 0)
+    assert rc == 1 and "exited 0 on a machine it must refuse" in out
+    rc, out = _refuse(tmp_path, "error: something else broke", 1)
+    assert rc == 1 and "does not name the reason" in out
+    rc, out = _refuse(tmp_path, REFUSAL.replace("can join an amd64 controller as a node instead", "cannot be used"), 1)
+    assert rc == 1 and "does not name the way on" in out
+    rc, out = _refuse(tmp_path, REFUSAL, 1, containers=2)
+    assert rc == 1 and "left 2 noo- container(s)" in out
+
+
+def test_the_arm64_rows_expect_the_refusal_and_the_doc_is_checked_out():
+    wf = (ROOT / ".github/workflows/install-matrix.yml").read_text()
+    for cell in ("ubuntu-24.04-arm64", "ubuntu-22.04-arm64"):
+        line = next(l for l in wf.splitlines() if f"cell: {cell}," in l)
+        assert "expect: refusal" in line, line
+    assert "EXPECT: ${{ matrix.expect || '' }}" in wf
+    assert wf.count("docs/getting-started/install.md") >= 2, "the literal pass reads the install doc"
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    assert text.index('if [ "${EXPECT:-}" = refusal ]; then') < text.index('if [ "$ONBOARD" = interactive ]; then')
+
+
 def test_the_console_chat_client_finds_the_cluster_ca_where_the_cli_does(tmp_path):
     ws = _load("ws_chat_ca", ROOT / "scripts/install-cell/ws_chat.py")
     (tmp_path / ".noo").mkdir()

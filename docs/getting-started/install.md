@@ -158,6 +158,17 @@ Run `noo onboard --help` for every flag; the
 add-ons it offers (knowledge, voice, licensed tiers) are in
 [add-ons.md](add-ons.md).
 
+### What the wizard asks you
+
+Enter accepts the default at every prompt except these:
+
+| The prompt | What to type |
+|---|---|
+| `Admin password`, then `Confirm password` | a password of your choice, twice: at least 12 characters, not a common one, not containing the username. Enter alone is refused. |
+| `Stored both in a password manager OFF this machine` | `y`, once you have copied the two backup passphrases it just printed somewhere off this machine. Without them an encrypted backup cannot be restored, so the default (N) asks again. |
+| `Tailscale is not installed. Install it now` | `n` on a single machine with no tailnet: the dashboard is then on `https://localhost:8080`. `y` puts this machine on your tailnet (it may ask for sudo, then shows a login link). |
+| `Join your tailnet now?` | `n` on a single machine with no tailnet; `y` to join (it opens a login link). |
+
 When it finishes and services were started, the summary prints the
 endpoints: the dashboard on `localhost:8080` (and on your tailnet name if
 Tailscale was configured) and Grafana. Without Tailscale the
