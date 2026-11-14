@@ -358,11 +358,105 @@ pub(crate) fn carry_i300(data: &mut Value, body: &Value) {
     }
 }
 
+/// Heartbeat body encodings this controller decodes, advertised in every
+/// heartbeat reply as `accept_encoding` (i675 F11). An agent compresses only
+/// after it has read this; until then it sends plain JSON.
+pub(crate) const HEARTBEAT_ACCEPT_ENCODING: &[&str] = &["gzip"];
+
+/// The most a gzip heartbeat may decode to. A measured beat is 5.7 KB (CPU
+/// node) to 9.7 KB (GPU node) of JSON; 256 KiB is over 25 times that. The
+/// decoder reads at most one byte past it, so a bomb is refused without
+/// expanding further. A plain body keeps the extractor's limit, as before.
+pub(crate) const MAX_HEARTBEAT_DECODED: usize = 256 * 1024;
+
+/// Why a heartbeat body was not read. Each maps to one status, which the
+/// agent reads as "this encoding was refused" and re-sends plain.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BeatBodyRefusal {
+    /// 413: the gzip body decodes past [`MAX_HEARTBEAT_DECODED`].
+    TooLarge(String),
+    /// 400: gzip that does not decode, or a body that is not JSON.
+    Malformed(String),
+    /// 415: a Content-Encoding other than identity or gzip.
+    Unsupported(String),
+}
+
+impl BeatBodyRefusal {
+    pub(crate) fn status(&self) -> axum::http::StatusCode {
+        match self {
+            Self::TooLarge(_) => axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            Self::Malformed(_) => axum::http::StatusCode::BAD_REQUEST,
+            Self::Unsupported(_) => axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        }
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            Self::TooLarge(m) | Self::Malformed(m) | Self::Unsupported(m) => m,
+        }
+    }
+
+    fn into_reply(self) -> (axum::http::StatusCode, Json<Value>) {
+        (self.status(), Json(json!({"error": self.message(), "accept_encoding": HEARTBEAT_ACCEPT_ENCODING})))
+    }
+}
+
+/// Everything `r` yields, up to `cap` bytes. One byte more is a refusal, so
+/// this never holds more than `cap + 1` bytes whatever `r` would produce.
+pub(crate) fn read_capped<R: std::io::Read>(r: R, cap: usize) -> Result<Vec<u8>, BeatBodyRefusal> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    r.take(cap as u64 + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| BeatBodyRefusal::Malformed(format!("Content-Encoding: gzip heartbeat did not decode: {e}")))?;
+    if out.len() > cap {
+        return Err(BeatBodyRefusal::TooLarge(format!(
+            "heartbeat decodes past the {cap}-byte cap (a measured beat is under 10 KB); refused, not truncated"
+        )));
+    }
+    Ok(out)
+}
+
+/// The heartbeat as JSON from the bytes the auth layer verified: identity,
+/// or gzip capped at [`MAX_HEARTBEAT_DECODED`]. Called by `node_heartbeat`
+/// only, which the router reaches only through `require_any_auth`.
+pub(crate) fn heartbeat_body(raw: &[u8], content_encoding: Option<&str>) -> Result<Value, BeatBodyRefusal> {
+    let enc = content_encoding.map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+    let decoded: Vec<u8>;
+    let json_bytes: &[u8] = match enc.as_str() {
+        "" | "identity" => raw,
+        "gzip" | "x-gzip" => {
+            decoded = read_capped(flate2::read::GzDecoder::new(raw), MAX_HEARTBEAT_DECODED)?;
+            &decoded
+        }
+        other => {
+            return Err(BeatBodyRefusal::Unsupported(format!(
+                "unsupported Content-Encoding {other:?} on a heartbeat; send identity or gzip"
+            )))
+        }
+    };
+    serde_json::from_slice(json_bytes).map_err(|e| BeatBodyRefusal::Malformed(format!("heartbeat body is not JSON: {e}")))
+}
+
 async fn node_heartbeat(
     State(state): State<Arc<AppState>>,
     Path(node_id): Path<String>,
-    Json(body): Json<Value>,
-) -> AppJson {
+    headers: axum::http::HeaderMap,
+    raw: axum::body::Bytes,
+) -> Result<AppJson, (axum::http::StatusCode, Json<Value>)> {
+    // The beat as JSON (i675 F11: plain, or gzip once this reply advertised
+    // it). `raw` is the body `require_any_auth` verified the v2 token over,
+    // byte for byte, compressed when the agent compressed: nothing is decoded
+    // for a caller that is not a node. Every key below is read from this one
+    // `body`, so a gzip beat and a plain beat take the same path from here.
+    let encoding = headers.get(axum::http::header::CONTENT_ENCODING).and_then(|v| v.to_str().ok());
+    let body = match heartbeat_body(&raw, encoding) {
+        Ok(b) => b,
+        Err(r) => {
+            tracing::warn!(node = %node_id, status = %r.status(), "heartbeat refused: {}", r.message());
+            return Err(r.into_reply());
+        }
+    };
     // Merge heartbeat data with existing KV entry (preserves registration data
     // like gpu_model, cpu_cores, ram_gb while updating live metrics)
     let mut data = if let Ok(kv) = state.js.get_key_value("mesh_nodes").await {
@@ -860,7 +954,9 @@ async fn node_heartbeat(
     crate::autonomy_evaluators::clear_revive_backoff(&state, &node_id).await;
 
     tracing::debug!(node_id = %node_id, "heartbeat received");
-    Json(json!({"status": "ok"}))
+    // `accept_encoding` is the advertisement an agent waits for before it
+    // compresses (node-agent-go internal/heartbeat/beatgzip.go).
+    Ok(Json(json!({"status": "ok", "accept_encoding": HEARTBEAT_ACCEPT_ENCODING})))
 }
 
 /// DELETE /api/cluster/nodes/{id}/forget — drop a node's controller-side
@@ -8968,5 +9064,177 @@ mod exporter_announcement_tests {
         // compose side against this constant's text)
         assert_eq!(EXPORTER_ANNOUNCE_DIR, "/run/noo-prom-sd");
         assert_eq!(EXPORTER_ANNOUNCEMENT, "nvidia-exporter.json");
+    }
+}
+
+/// Gzip heartbeats (i675 F11): the decode is capped, runs only in the
+/// handler (so only after `require_any_auth` verified the token over the
+/// compressed bytes), and yields the same `body` a plain beat does.
+#[cfg(test)]
+mod heartbeat_gzip_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    const SECRET: &str = "fleet-secret-for-tests";
+    const URI: &str = "/api/cluster/nodes/host7/heartbeat";
+    const NOW: u64 = 1_800_000_000;
+
+    fn gz(b: &[u8]) -> Vec<u8> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(b).unwrap();
+        enc.finish().unwrap()
+    }
+
+    fn beat() -> Value {
+        json!({
+            "load": 0.42, "cpu_load": 0.5, "mem_used_gb": 3.1, "vram_used_gb": null,
+            "running_backends": {"ollama": "harrier"},
+            "lanes": [{"backend": "ollama", "model": "harrier", "role": "embed", "state": "serving", "reason": ""}],
+            "log_ship": {"enabled": true, "queued": 1},
+            "backend_leaves": {"ollama": {"dns": ["ollama", "localhost"], "not_after": 1798495662}},
+            "capabilities": {"arch": "amd64", "backends": ["ollama"], "cpu_cores": 8},
+            "os": "linux",
+            "app_version": "stack-v0.6.23",
+            // Not a key node_heartbeat names: it must reach the record from
+            // neither encoding.
+            "evil_key": {"admin": true},
+        })
+    }
+
+    /// What the handler does with `body` for the keys this test can drive
+    /// without an AppState: the same pure carries, in the handler's order.
+    fn record_from(body: &Value) -> Value {
+        let mut data = json!({"id": "host7"});
+        carry_load(&mut data, body);
+        data["running_backends"] = body.get("running_backends").cloned().unwrap_or(json!({}));
+        carry_lanes(&mut data, body);
+        carry_i300(&mut data, body);
+        carry_reported(&mut data, body, "log_ship");
+        carry_reported(&mut data, body, "backend_leaves");
+        if let Some(v) = body.get("capabilities") { if !v.is_null() { data["capabilities"] = v.clone(); } }
+        data
+    }
+
+    #[test]
+    fn a_gzip_beat_is_the_plain_beat() {
+        let plain = serde_json::to_vec(&beat()).unwrap();
+        let from_plain = heartbeat_body(&plain, None).unwrap();
+        for enc in ["gzip", "GZIP", " x-gzip "] {
+            assert_eq!(heartbeat_body(&gz(&plain), Some(enc)).unwrap(), from_plain, "{enc}");
+        }
+        assert_eq!(heartbeat_body(&plain, Some("identity")).unwrap(), from_plain);
+        let a = record_from(&from_plain);
+        let b = record_from(&heartbeat_body(&gz(&plain), Some("gzip")).unwrap());
+        assert_eq!(a, b, "a gzip beat must leave the record exactly as the plain one does");
+        assert_eq!(b["current_load"], json!(0.42));
+        assert_eq!(b["log_ship"]["queued"], 1);
+    }
+
+    /// The key allowlist is the handler naming each key it keeps; a gzip
+    /// beat reaches it as the same `body`, so a key it does not name is
+    /// dropped from both encodings alike.
+    #[test]
+    fn a_key_the_handler_does_not_name_is_dropped_from_a_gzip_beat_too() {
+        let plain = serde_json::to_vec(&beat()).unwrap();
+        for body in [heartbeat_body(&plain, None).unwrap(), heartbeat_body(&gz(&plain), Some("gzip")).unwrap()] {
+            assert!(record_from(&body).get("evil_key").is_none());
+        }
+        // Source: the handler reads ONE `body`, decoded once, and never
+        // copies the body's keys wholesale (which would bypass the naming).
+        let code = crate::test_src::own_code(include_str!("cluster.rs"));
+        let handler = crate::test_src::fn_body(&code, "async fn node_heartbeat(");
+        assert_eq!(handler.matches("heartbeat_body(").count(), 1, "one decode");
+        for wholesale in ["body.as_object()", "Json(body)", "GzDecoder", "read_capped("] {
+            assert!(!handler.contains(wholesale), "node_heartbeat must not contain `{wholesale}`");
+        }
+        let decode = handler.find("heartbeat_body(").unwrap();
+        let first_read = handler.find("carry_load(").expect("the first key read");
+        assert!(decode < first_read, "the body is decoded before any key is read");
+    }
+
+    #[test]
+    fn a_gzip_bomb_is_413_and_never_expands_past_the_cap() {
+        // 16 MiB of zeros: ~16 KiB on the wire, 64 times the cap decoded.
+        let bomb = gz(&vec![0u8; 16 << 20]);
+        assert!(bomb.len() < 1 << 20, "precondition: the bomb is small on the wire ({} bytes)", bomb.len());
+        let r = heartbeat_body(&bomb, Some("gzip")).unwrap_err();
+        assert!(matches!(r, BeatBodyRefusal::TooLarge(_)), "{r:?}");
+        assert_eq!(r.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(r.message().contains("cap"), "the 413 says why: {}", r.message());
+
+        // Bounded memory: an ENDLESS gzip stream returns, holding at most
+        // cap + 1 bytes. Unbounded, this would never finish.
+        let endless = flate2::read::GzEncoder::new(std::io::repeat(0), flate2::Compression::fast());
+        let r = read_capped(flate2::read::GzDecoder::new(endless), MAX_HEARTBEAT_DECODED).unwrap_err();
+        assert!(matches!(r, BeatBodyRefusal::TooLarge(_)));
+        let r = read_capped(std::io::repeat(7), 10).unwrap_err();
+        assert!(matches!(r, BeatBodyRefusal::TooLarge(_)));
+
+        // At the cap is fine: refused, not truncated, only past it.
+        let exact = read_capped(std::io::repeat(1).take(MAX_HEARTBEAT_DECODED as u64), MAX_HEARTBEAT_DECODED).unwrap();
+        assert_eq!(exact.len(), MAX_HEARTBEAT_DECODED);
+        assert!(MAX_HEARTBEAT_DECODED >= 16 * 9_706, "the cap must sit far above the measured 9.7 KB GPU beat");
+    }
+
+    #[test]
+    fn refusals_are_statuses_the_agent_falls_back_on() {
+        let bad = heartbeat_body(b"\x1f\x8bnot really gzip", Some("gzip")).unwrap_err();
+        assert_eq!(bad.status(), axum::http::StatusCode::BAD_REQUEST);
+        let not_json = heartbeat_body(&gz(b"not json"), Some("gzip")).unwrap_err();
+        assert_eq!(not_json.status(), axum::http::StatusCode::BAD_REQUEST);
+        let br = heartbeat_body(b"{}", Some("br")).unwrap_err();
+        assert_eq!(br.status(), axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        // The agent (beatgzip.go encodingRefused) re-sends plain on exactly these.
+        for r in [bad, not_json, br] {
+            assert!([400u16, 413, 415].contains(&r.status().as_u16()));
+        }
+        assert_eq!(HEARTBEAT_ACCEPT_ENCODING, &["gzip"]);
+    }
+
+    /// Auth before decode. The token is verified by `require_any_auth` over
+    /// the RAW (compressed) bytes, which never decodes anything; the only
+    /// decode is in the handler, behind that layer. So a bomb under a bad
+    /// token is a 401 from the layer, never a 413 from the decoder.
+    #[tokio::test]
+    async fn an_unauthenticated_gzip_bomb_is_401_before_any_decode() {
+        let bomb = gz(&vec![0u8; 16 << 20]);
+        // The layer buffers the raw body up to MAX_SIGNED_BODY: the bomb fits,
+        // so the layer's answer is the token verdict, not a size refusal.
+        assert!(bomb.len() < crate::cluster_token_v2::MAX_SIGNED_BODY);
+        let nonce = "f11a0000000000000000000000000001";
+        let forged = crate::cluster_token_v2::sign("not-the-fleet-secret", "POST", URI, &bomb, "host7", NOW, nonce).unwrap();
+        assert_eq!(crate::cluster_token_v2::verify_and_spend(None, SECRET, &forged, "POST", URI, &bomb, NOW).await, None,
+            "a bad token over a gzip bomb is refused (401) by the layer");
+
+        // The agent signs the bytes AS SENT: a token over the compressed body
+        // verifies; one over the decoded JSON does not describe the wire.
+        let plain = serde_json::to_vec(&beat()).unwrap();
+        let wire = gz(&plain);
+        let good = crate::cluster_token_v2::sign(SECRET, "POST", URI, &wire, "host7", NOW, "f11a0000000000000000000000000002").unwrap();
+        assert_eq!(crate::cluster_token_v2::verify_and_spend(None, SECRET, &good, "POST", URI, &wire, NOW).await.as_deref(), Some("host7"));
+        let over_plain = crate::cluster_token_v2::sign(SECRET, "POST", URI, &plain, "host7", NOW, "f11a0000000000000000000000000003").unwrap();
+        assert_eq!(crate::cluster_token_v2::verify_and_spend(None, SECRET, &over_plain, "POST", URI, &wire, NOW).await, None);
+
+        // Structure: the auth module never decodes a body; the heartbeat
+        // route is not one the middleware lets through without a credential;
+        // the decoder runs only in `heartbeat_body`, called only by the handler,
+        // and the cluster router is mounted under the auth layer.
+        let auth = crate::test_src::own_code(include_str!("../auth.rs"));
+        for d in ["GzDecoder", "heartbeat_body", "read_capped", "flate2"] {
+            assert!(!auth.contains(d), "auth.rs must not decode bodies (`{d}`)");
+        }
+        assert!(!crate::auth::passes_without_bearer_check(URI, false, false));
+        assert!(!crate::auth::passes_without_bearer_check(URI, false, true));
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        assert_eq!(own.matches("heartbeat_body(").count(), 2, "its definition and the one call in node_heartbeat");
+        assert_eq!(own.matches("GzDecoder::new(").count(), 1, "one decoder, inside heartbeat_body");
+        let def = crate::test_src::fn_body(&own, "fn heartbeat_body(");
+        assert!(def.contains("GzDecoder::new(") && def.contains("read_capped("), "the decoder is capped");
+        let routes = crate::test_src::own_code(include_str!("mod.rs"));
+        let core = crate::test_src::fn_body(&routes, "fn core_router(");
+        assert!(core.contains(".merge(cluster::router())"));
+        let build = crate::test_src::fn_body(&routes, "fn build_router(");
+        assert!(build.contains("core_router()") && build.contains("crate::auth::require_any_auth"),
+            "the cluster routes are served under the auth layer");
     }
 }

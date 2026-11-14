@@ -4,8 +4,6 @@
 package heartbeat
 
 import (
-	"bytes"
-	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,8 +21,9 @@ import (
 )
 
 // i675 F11: how many bytes one heartbeat puts on the wire, per section, for
-// realistic node shapes. A measurement, not a contract: it asserts only that
-// something was sent. Run with -v to read the table.
+// realistic node shapes, and per beat BEFORE (plain JSON) and AFTER gzip
+// (beatgzip.go, as sent once the gateway advertises it). A measurement, not
+// a contract: it asserts only the encoding of each beat. Run with -v.
 //
 // The shapes copy live fleet records (2026-11-14, stack-v0.6.23) with the
 // names and addresses made generic: a CPU node (ollama + one chat model +
@@ -265,16 +264,28 @@ func TestHeartbeatPayloadSize(t *testing.T) {
 	const beatsPerDay = 24 * 60 * 60 / 30
 	for _, shape := range []sizeShape{cpuNodeShape(), gpuNodeShape()} {
 		t.Run(strings.SplitN(shape.name, ":", 2)[0], func(t *testing.T) {
-			var body []byte
+			var wire []byte
+			var encoding string
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-				body, _ = io.ReadAll(req.Body)
+				wire, _ = io.ReadAll(req.Body)
+				encoding = req.Header.Get("Content-Encoding")
 				w.WriteHeader(200)
+				// A gateway that takes gzip beats (beatgzip.go).
+				_, _ = w.Write([]byte(`{"status":"ok","accept_encoding":["gzip"]}`))
 			}))
 			defer srv.Close()
 			r := installShape(t, srv.URL, shape)
+			// BEFORE: the first beat is plain, as every gateway gets it today.
 			r.SendHeartbeat()
-			if len(body) == 0 {
-				t.Fatal("no heartbeat body was sent")
+			body := wire
+			if len(body) == 0 || encoding != "" {
+				t.Fatalf("first beat: %d bytes, Content-Encoding %q; want a plain beat", len(body), encoding)
+			}
+			// AFTER: the beat once the gateway advertised gzip, as sent.
+			r.SendHeartbeat()
+			gzWire := wire
+			if encoding != "gzip" || len(gzWire) == 0 {
+				t.Fatalf("second beat: Content-Encoding %q; want gzip", encoding)
 			}
 
 			var keys map[string]json.RawMessage
@@ -300,11 +311,6 @@ func TestHeartbeatPayloadSize(t *testing.T) {
 			}
 			sort.Slice(names, func(i, j int) bool { return perSection[names[i]] > perSection[names[j]] })
 
-			var gz bytes.Buffer
-			zw := gzip.NewWriter(&gz)
-			_, _ = zw.Write(body)
-			_ = zw.Close()
-
 			var out strings.Builder
 			fmt.Fprintf(&out, "\n%s\n%-20s %7s %6s  keys\n", shape.name, "section", "bytes", "share")
 			for _, s := range names {
@@ -312,9 +318,10 @@ func TestHeartbeatPayloadSize(t *testing.T) {
 				fmt.Fprintf(&out, "%-20s %7d %5.1f%%  %s\n", s, perSection[s],
 					100*float64(perSection[s])/float64(len(body)), strings.Join(perKey[s], " "))
 			}
-			fmt.Fprintf(&out, "per beat: %d B (gzip %d B, %.0f%%)\n", len(body), gz.Len(), 100*float64(gz.Len())/float64(len(body)))
-			fmt.Fprintf(&out, "per day @30s (%d beats): %.1f MB raw, %.1f MB gzip\n", beatsPerDay,
-				float64(len(body)*beatsPerDay)/1e6, float64(gz.Len()*beatsPerDay)/1e6)
+			fmt.Fprintf(&out, "per beat: BEFORE %d B plain, AFTER %d B gzip on the wire (%.0f%% of plain)\n",
+				len(body), len(gzWire), 100*float64(len(gzWire))/float64(len(body)))
+			fmt.Fprintf(&out, "per day @30s (%d beats): BEFORE %.1f MB, AFTER %.1f MB\n", beatsPerDay,
+				float64(len(body)*beatsPerDay)/1e6, float64(len(gzWire)*beatsPerDay)/1e6)
 			t.Log(out.String())
 		})
 	}
