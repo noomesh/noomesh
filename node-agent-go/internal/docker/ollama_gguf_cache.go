@@ -274,10 +274,13 @@ func dropUntrustedPartial(partial string) {
 	}
 }
 
+// linkFile is os.Link; a seam so tests can make the link fail (EXDEV).
+var linkFile = os.Link
+
 // linkOrCopy hard-links src to dest, copying when a link cannot be made
 // (another filesystem, a filesystem without links).
 func linkOrCopy(src, dest string) error {
-	if err := os.Link(src, dest); err == nil {
+	if err := linkFile(src, dest); err == nil {
 		return nil
 	}
 	in, err := os.Open(src)
