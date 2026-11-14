@@ -5470,6 +5470,22 @@ mod tests {
         assert!(scope_allows(&c, &Method::GET, "/api/conversations"));
     }
 
+    /// `noo chat`'s coordinator stream inherits exactly the gates of
+    /// `/api/inference`: a chat-scope user may POST it, a kiosk key may not,
+    /// and an add-on token is not a consumer on it (it is its user there).
+    #[test]
+    fn the_coordinator_chat_stream_is_gated_as_inference() {
+        let p = crate::routes::inference::CHAT_STREAM_PATH;
+        assert!(p.starts_with("/api/inference/"), "{p} must sit under the /api/inference gates");
+        let c = claims(&["read"], "");
+        assert!(scope_allows(&c, &Method::POST, p));
+        assert_eq!(scope_allows(&c, &Method::POST, p), scope_allows(&c, &Method::POST, "/api/inference"));
+        assert!(kiosk_may(&Method::POST, p).is_err() && kiosk_may(&Method::GET, p).is_err(), "a kiosk key never reaches a chat turn");
+        let own = crate::test_src::own_code(include_str!("auth.rs"));
+        assert!(own.contains(r#"let is_inference_surface = path.starts_with("/v1/") || path.starts_with("/api/external/");"#));
+        assert!(!(p.starts_with("/v1/") || p.starts_with("/api/external/")), "an add-on token must not be a consumer on {p}");
+    }
+
     #[test]
     fn read_scope_can_mutate_chat_and_query_surface() {
         let c = claims(&["read"], "");

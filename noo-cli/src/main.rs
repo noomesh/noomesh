@@ -522,8 +522,9 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["heartbeat", "import"], commands::heartbeat_import),
     (&["stack", "sync-assets"], commands::mesh_sync_assets),
     (&["heartbeat", "remove"], commands::heartbeat_remove),
-    // ── WP-C1: chat — native REPL/one-shot over the gateway's SSE streaming
-    // path (POST /api/inference/stream, served natively by gateway-rust).
+    // ── WP-C1: chat — native REPL/one-shot over the gateway's coordinator
+    // stream (POST /api/inference/chat: retrieval, memory and tools as the
+    // signed-in user; the raw /api/inference/stream retrieves nothing).
     // Gateway down → exit 3 with a pointer to `noo stack start`. The old
     // Python local-agent flags (--no-use-cluster, --config, --base-url,
     // --tool-mode) are not understood: usage error, exit 2.
