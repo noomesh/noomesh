@@ -464,7 +464,7 @@ capped at 200 000 characters a turn. It is not the answer, which arrives as
 | GET | `/api/cluster/status` | nodes, backends, scheduler and knowledge-base summary |
 | GET | `/api/cluster/nodes` | the node registry (from the `mesh_nodes` KV bucket merged with the database) |
 | POST | `/api/cluster/nodes/register`, `/api/cluster/nodes/{id}/register` | node-agent registration (hostname, ip, tier, capabilities) |
-| POST | `/api/cluster/nodes/{id}/heartbeat` | node-agent heartbeat: `load`, `cpu_load`, `cpu_cores`, `ram_gb`, `mem_used_gb`, `gpu_model`, `vram_gb`, `vram_used_gb`, `running_backends`, `ip_address`; `404` tells the agent to re-register |
+| POST | `/api/cluster/nodes/{id}/heartbeat` | node-agent heartbeat: `load`, `cpu_load`, `cpu_cores`, `ram_gb`, `mem_used_gb`, `gpu_model`, `vram_gb`, `vram_used_gb`, `running_backends`, `ip_address`; `404` tells the agent to re-register. The reply advertises `accept_encoding: ["gzip"]`, after which the agent sends `Content-Encoding: gzip` (signed as sent; decoded after auth, capped at 256 KiB like a plain body, `413` beyond) |
 | DELETE | `/api/cluster/nodes/{id}/forget` | remove a node |
 | GET | `/api/cluster/nodes/{node_id}/desired-config` | what the node-agent reconciles against |
 | PUT | `/api/cluster/nodes/{node_id}/config` | set node config (`usage_profile`: `shared` \| `dedicated` \| null for the default) |
