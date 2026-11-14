@@ -100,6 +100,82 @@ fn installed_version(exe: &str) -> Option<String> {
 /// which onboard always writes. install.md says the same ("git only for a
 /// contributor checkout"); requiring it everywhere stopped a stranger's
 /// install at "git: MISSING" (i677).
+/// A page of the public repo's docs, by its path under `docs/`: a box with no
+/// checkout has no `docs/` to open (i677 #7). The repo comes from its one
+/// home, crate::registry::RELEASE_REPO.
+pub(crate) fn docs_url(path: &str) -> String {
+    format!("https://github.com/{}/blob/main/docs/{path}", crate::registry::RELEASE_REPO)
+}
+
+/// What a non-apt box with no Docker is told (i677 #8). Pure.
+pub(crate) fn non_apt_docker_remedy() -> String {
+    format!(
+        "No installer for this distro here: install Docker Engine with the Compose v2 plugin \
+         (https://docs.docker.com/engine/install/), start it, then run noo onboard again. \
+         Requirements: {}",
+        docs_url("getting-started/install.md")
+    )
+}
+
+/// The Docker-daemon row when `docker info` fails: (the row, the one remedy
+/// line). Docker installed but unreachable is one of two things: the daemon
+/// is not running, or it is and this user may not use it. Pure (i677 #8).
+pub(crate) fn docker_daemon_remedy(info_out: &str, macos: bool, systemd: bool) -> (String, &'static str) {
+    if info_out.to_lowercase().contains("permission denied") {
+        return (
+            "Docker daemon: running, but this user may not use it".to_string(),
+            "Add yourself to the docker group: sudo usermod -aG docker $USER, then log out and back in \
+             (or run newgrp docker). Check: docker info",
+        );
+    }
+    let remedy = if macos {
+        "Start Docker Desktop (or your Docker engine), wait until it says running, then check: docker info"
+    } else if systemd {
+        "Start it: sudo systemctl start docker (sudo systemctl enable --now docker also starts it at boot). Check: docker info"
+    } else {
+        "Start it: sudo service docker start (WSL2 and hosts without systemd). Check: docker info"
+    };
+    ("Docker daemon: NOT RUNNING".to_string(), remedy)
+}
+
+/// The Tailscale question's two answers, one line each (operator, 2026-11-14).
+pub(crate) const TAILSCALE_YES: &str =
+    "install Tailscale and put this machine on your tailnet (other devices reach it by name; a login link follows)";
+pub(crate) const TAILSCALE_JOIN_YES: &str =
+    "put this machine on your tailnet (other devices reach it by name; a login link follows)";
+pub(crate) const TAILSCALE_NO: &str =
+    "LAN-only: the dashboard is on https://localhost:8080 here and on your local network; add Tailscale any time later";
+pub(crate) const LAN_ONLY_CHOSEN: &str =
+    "LAN-only install, as chosen. To add Tailscale later: install it, run `tailscale up`, then `noo onboard --reconfigure`.";
+
+pub(crate) const NON_INTERACTIVE_LAN_ONLY: &str =
+    "No Tailscale here: continuing as a LAN-only install. --skip-tailscale says so explicitly; \
+     to join a tailnet instead, install Tailscale and run `tailscale up` before onboarding.";
+
+/// y/yes -> true, n/no -> false, anything else (Enter included) -> None. Pure.
+pub(crate) fn parse_yes_no(answer: &str) -> Option<bool> {
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Some(true),
+        "n" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// A yes/no question with NO default: the two answers are explained first,
+/// and only a typed y or n leaves the loop; Enter asks again.
+fn ask_yes_no_no_default(ctx: &mut Ctx, question: &str, yes: &str, no: &str) -> bool {
+    ctx.raw(&format!("    y: {yes}"));
+    ctx.raw(&format!("    n: {no}"));
+    let label = format!("{question} [y/n]");
+    loop {
+        let answer = ctx.asker.ask(&Prompt::new(&label).required());
+        match parse_yes_no(&answer) {
+            Some(b) => return b,
+            None => ctx.warn("Type y or n (there is no default here)."),
+        }
+    }
+}
+
 fn required_tools(in_checkout: bool) -> Vec<(&'static str, &'static str)> {
     let mut tools = vec![("docker", "Runs all Noomesh services")];
     if in_checkout {
@@ -260,6 +336,15 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
         }
     }
 
+    // i677 #8: on a distro without apt the wizard offers no install, and the
+    // "docker: MISSING" row was all a stranger got. Say what to install and
+    // where the steps are.
+    if docker_missing && tool_version("docker").is_none()
+        && !Command::new("apt-get").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+    {
+        ctx.error(&format!("  {}", non_apt_docker_remedy()));
+    }
+
     // Compose v2 is a prerequisite of its own: Ubuntu's `docker.io` ships
     // WITHOUT it (separate `docker-compose-v2` package), and step 7's launcher
     // runs `docker compose …` for everything. Failure semantics:
@@ -281,11 +366,21 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
     }
 
     ctx.progress("Checking Docker daemon...");
-    if sh::docker_daemon_running() {
+    let (info_rc, info_out) = sh::docker(&["info"]);
+    if info_rc == 0 {
         ctx.success("Docker daemon: running");
-    } else {
-        ctx.error("Docker daemon: NOT RUNNING — start Docker first");
+    } else if tool_version("docker").is_some() {
+        // i677 #8: this was "NOT RUNNING — start Docker first" with no way on.
+        let (head, remedy) = docker_daemon_remedy(
+            &info_out,
+            cfg!(target_os = "macos"),
+            std::path::Path::new("/run/systemd/system").exists(),
+        );
+        ctx.error(&head);
+        ctx.error(&format!("  {remedy}"));
         all_ok = false;
+    } else {
+        all_ok = false; // the docker row above already failed, with its remedy
     }
 
     ctx.progress("Checking Docker Hub login...");
@@ -392,7 +487,7 @@ systemctl restart docker"#;
 
     // Security readiness (informational)
     let ca = ctx.pki_dir.join("ca.crt").exists() && ctx.pki_dir.join("ca.key").exists();
-    ctx.info(if ca { "PKI certs: CA present" } else { "PKI certs: not yet (Step 3)" });
+    ctx.info(if ca { "PKI certs: CA present" } else { "PKI certs: not yet (Step 5)" });
     let n_secrets = SECRETS
         .iter()
         .filter(|(_, env_var)| ctx.secret_present(env_var))
@@ -665,7 +760,7 @@ pub fn environment(ctx: &mut Ctx) {
                 .default(if get("NODE_ID").is_empty() { hostname.clone() } else { get("NODE_ID") }),
         );
         node_ip = ctx.asker.ask(
-            &Prompt::new("Node IP (auto-corrected to the tailnet address after Step 3's join)")
+            &Prompt::new("Node IP (auto-corrected to the tailnet address after the Tailscale step's join)")
                 .default(if get("NODE_IP").is_empty() { detect_ip_env() } else { get("NODE_IP") }),
         );
         controller_url = if mode == "worker" {
@@ -1287,12 +1382,26 @@ pub fn tailscale(ctx: &mut Ctx) -> bool {
     // path. This used to dead-end into "set it up later and re-run
     // 'noo onboard --reconfigure'"; the wizard can do both steps itself.
     let can_remediate = !ctx.non_interactive && !ctx.dry_run;
+    let mut install_tailscale_now = false;
 
-    if !installed && can_remediate
-        && ctx.asker.confirm(
+    // Operator, 2026-11-14: on a single machine the Tailscale question has NO
+    // default. Enter used to install Tailscale and send a one-box stranger to
+    // a login page (i677 #2); now Enter asks again, and y and n are each
+    // explained in one line. A typed n is a LAN-only install, said once.
+    let mut chose_lan_only = false;
+    if !installed && can_remediate {
+        if ask_yes_no_no_default(
+            ctx,
             "Tailscale is not installed. Install it now (official installer, may prompt for sudo)?",
-            true,
-        )
+            TAILSCALE_YES,
+            TAILSCALE_NO,
+        ) {
+            install_tailscale_now = true;
+        } else {
+            chose_lan_only = true;
+        }
+    }
+    if install_tailscale_now
     {
         // Downloaded to a file, checked, digest printed, then run — never
         // piped into a shell. See crate::vendor.
@@ -1368,13 +1477,15 @@ pub fn tailscale(ctx: &mut Ctx) -> bool {
         // noomesh never uses Tailscale SSH; the box joins with it off.
         argv.push("--ssh=false".into());
         let up_cmd = argv.join(" ");
-        if ctx.asker.confirm(
-            &format!(
-                "Join your tailnet now? (runs `{up_cmd}`; opens a login link where you \
-                 can also CREATE a free account)"
-            ),
-            true,
-        ) {
+        let join_question = format!(
+            "Join your tailnet now? (runs `{up_cmd}`; opens a login link where you \
+             can also CREATE a free account)"
+        );
+        let join = ask_yes_no_no_default(ctx, &join_question, TAILSCALE_JOIN_YES, TAILSCALE_NO);
+        if !join {
+            chose_lan_only = true;
+        }
+        if join {
             let mut result = ctx.ui.run_inherited(&argv);
             if controller_tag && matches!(result, Some(c) if c != 0) {
                 // The login identity is not a tag owner (non-admin account):
@@ -1400,6 +1511,18 @@ pub fn tailscale(ctx: &mut Ctx) -> bool {
 
     let (dns, ip) = match identity {
         Ok(pair) => pair,
+        Err(_) if chose_lan_only => {
+            // The answer was n: a decision, not a failure.
+            ctx.info(LAN_ONLY_CHOSEN);
+            return true;
+        }
+        Err(_) if ctx.non_interactive => {
+            // --ci never installs or joins Tailscale: no tailnet here is the
+            // expected case, said once as what happens and which flag says it
+            // (general 11-14: nothing that runs --ci today breaks).
+            ctx.info(NON_INTERACTIVE_LAN_ONLY);
+            return true;
+        }
         Err(why) => {
             ctx.error(&format!("Tailscale unavailable: {why}"));
             ctx.raw("    Without Tailscale, the dashboard is reachable only on this machine /");
@@ -2251,13 +2374,13 @@ pub fn secrets_setup(ctx: &mut Ctx) -> bool {
 /// the key. Those frontends, and `--non-interactive`, get the command to run
 /// later instead, which is the same command and the same guard.
 fn hand_over_backup_passphrases(ctx: &mut Ctx, minted: &[(&str, String)]) {
-    ctx.warn(
+    ctx.warn(&format!(
         "Backup passphrases generated. NOO_AGE_BACKUP_PASSPHRASE is the key to the key: it \
          protects the age private key that opens EVERY other secret, and it is itself stored in \
          env.sops, which that same age key decrypts. On this box that is fine; once this box is \
-         gone it is worthless. It is NOT written to any file — see \
-         docs/operating/runbooks/backup-restore-secrets.md.",
-    );
+         gone it is worthless. It is NOT written to any file — see {}",
+        docs_url("operating/runbooks/backup-restore-secrets.md")
+    ));
 
     // Deliberately NOT `.all(..)`: `all` short-circuits, and a frontend that
     // refused the FIRST value would silently skip the second. Both passphrases
@@ -6706,6 +6829,41 @@ fn default_ollama_pick(
     }
 }
 
+/// Headroom a CPU-only box keeps free beside its chat model.
+const CPU_MODEL_HEADROOM_BYTES: u64 = 1_500_000_000;
+
+/// MemAvailable from /proc/meminfo, in bytes; None where there is none.
+fn mem_available_bytes() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    parse_mem_available(&text)
+}
+
+/// The `MemAvailable:` line of /proc/meminfo (kB), in bytes. Pure.
+pub(crate) fn parse_mem_available(meminfo: &str) -> Option<u64> {
+    meminfo.lines().find_map(|l| {
+        let rest = l.strip_prefix("MemAvailable:")?;
+        rest.trim().strip_suffix("kB")?.trim().parse::<u64>().ok().map(|kb| kb * 1024)
+    })
+}
+
+/// What a CPU-only box can give a model: free memory less the headroom.
+/// None when the free memory is unknown (the size is then not judged). Pure.
+pub(crate) fn cpu_model_budget(mem_available: Option<u64>) -> Option<u64> {
+    mem_available.map(|m| m.saturating_sub(CPU_MODEL_HEADROOM_BYTES))
+}
+
+/// The one line when no verified model fits a CPU-only box, or None when the
+/// pick fits (or its size is unknown: never refuse on a guess). Pure.
+pub(crate) fn no_model_fits_line(pick: &str, pick_bytes: Option<u64>, budget: u64) -> Option<String> {
+    let bytes = pick_bytes?;
+    (bytes > budget).then(|| format!(
+        "No chat model fits this box: {:.1} GB of memory is free for one, and the smallest recommended ({pick}) needs {:.1} GB. \
+         Free memory or add RAM, then run: noo onboard --only model",
+        budget as f64 / 1e9,
+        bytes as f64 / 1e9
+    ))
+}
+
 pub fn first_model(ctx: &mut Ctx) {
     // `--only model` skips the prereqs step, so the GPU tier was never
     // detected and the recommendations said "Tier 0" (2026-09-01). The
@@ -6863,16 +7021,31 @@ pub fn first_model(ctx: &mut Ctx) {
             // (or its size cannot be read — do not hide it on a guess); on
             // a box it does not fit, the first verified pick is the default
             // and the line says why.
-            let budget = crate::catalog::ollama_fit_budget_bytes(ctx.state.vram_gb);
-            let bytes = if ctx.state.vram_gb > 0.5 && !ctx.dry_run {
+            // i677 #6: with no GPU the size was never read, so a 4 GB box got
+            // the 7.2 GB default. A CPU-only box's budget is the memory it has
+            // free NOW (the stack is already up) less a fixed headroom.
+            let cpu_only = ctx.state.vram_gb <= 0.5;
+            let cpu_budget = if cpu_only { cpu_model_budget(mem_available_bytes()) } else { None };
+            let budget = cpu_budget.unwrap_or_else(|| crate::catalog::ollama_fit_budget_bytes(ctx.state.vram_gb));
+            let size_known_budget = !cpu_only || cpu_budget.is_some();
+            let bytes = if size_known_budget && !ctx.dry_run {
                 crate::catalog::ollama_download_bytes(PRODUCT_DEFAULT_MODEL, 8)
             } else {
                 None
             };
-            match default_ollama_pick(PRODUCT_DEFAULT_MODEL, bytes, budget, &starters) {
-                (name, Some(why)) => { default_note = Some(why); name }
-                (name, None) => name,
+            let (name, why) = default_ollama_pick(PRODUCT_DEFAULT_MODEL, bytes, budget, &starters);
+            if let Some(why) = why {
+                default_note = Some(why);
             }
+            // Not even the first verified pick fits: say so plainly and pull nothing.
+            if let Some(cpu) = cpu_budget {
+                let pick_bytes = if ctx.dry_run { None } else { crate::catalog::ollama_download_bytes(&name, 8) };
+                if let Some(line) = no_model_fits_line(&name, pick_bytes, cpu) {
+                    ctx.warn(&line);
+                    return;
+                }
+            }
+            name
         }
     } else {
         starters.first().map(|s| s.0.clone()).unwrap_or_default()
@@ -8756,7 +8929,35 @@ mod password_tests {
 
 #[cfg(test)]
 mod default_pick_tests {
-    use super::default_ollama_pick;
+    use super::{cpu_model_budget, default_ollama_pick, no_model_fits_line, parse_mem_available};
+
+    /// i677 #6: a CPU-only box's model budget is its free memory less the
+    /// headroom, and a model that does not fit is never the default; when not
+    /// even the first verified pick fits, one plain line and no pull.
+    #[test]
+    fn a_cpu_only_box_gets_a_model_that_fits_its_free_memory_or_one_plain_line() {
+        let meminfo = "MemTotal:       16303432 kB\nMemFree:  1000 kB\nMemAvailable:   10485760 kB\n";
+        assert_eq!(parse_mem_available(meminfo), Some(10_485_760 * 1024));
+        assert_eq!(parse_mem_available("MemTotal: 1 kB\n"), None);
+        assert_eq!(cpu_model_budget(None), None, "unknown memory: the size is not judged");
+        let gb = |g: f64| (g * 1e9) as u64;
+        // 16 GB runner, stack up: ~10 GB free -> 8.5 GB budget; the 7.2 GB default fits.
+        let b16 = cpu_model_budget(Some(gb(10.0))).unwrap();
+        assert_eq!(default_ollama_pick("gemma4:e2b", Some(gb(7.2)), b16, &starters()).0, "gemma4:e2b");
+        // 8 GB box, stack up: ~4.5 GB free -> 3.0 GB budget; the default does not fit,
+        // the first verified pick is the default and the line says why.
+        let b8 = cpu_model_budget(Some(gb(4.5))).unwrap();
+        let (name, why) = default_ollama_pick("gemma4:e2b", Some(gb(7.2)), b8, &starters());
+        assert_ne!(name, "gemma4:e2b");
+        assert!(why.expect("a reason").contains("over this box's 3.0 GB fit"));
+        assert_eq!(no_model_fits_line(&name, Some(gb(2.0)), b8), None, "a 2.0 GB pick fits 3.0 GB");
+        // 4 GB box: ~2.0 GB free -> 0.5 GB budget; not even the pick fits.
+        let b4 = cpu_model_budget(Some(gb(2.0))).unwrap();
+        let line = no_model_fits_line("llama3.2:3b", Some(gb(2.0)), b4).expect("one plain line");
+        assert!(line.starts_with("No chat model fits this box: 0.5 GB of memory is free for one"), "{line}");
+        assert!(line.ends_with("then run: noo onboard --only model") && !line.to_lowercase().contains("cloud"), "{line}");
+        assert_eq!(no_model_fits_line("llama3.2:3b", None, b4), None, "an unknown size never refuses");
+    }
 
     fn starters() -> Vec<(String, String)> {
         vec![("qwen3:4b".to_string(), "2.6 GB download".to_string())]
@@ -10022,6 +10223,55 @@ mod required_tools_tests {
 
     /// The prerequisite check and its post-install re-check both judge the
     /// same list, and decide the checkout from the repo root's `.git`.
+    #[test]
+    fn a_docker_daemon_that_does_not_answer_gets_one_remedy_for_this_host() {
+        // i677 #8: "NOT RUNNING — start Docker first" left a stranger nowhere.
+        let denied = "permission denied while trying to connect to the docker API at unix:///var/run/docker.sock";
+        let (row, fix) = docker_daemon_remedy(denied, false, true);
+        assert_eq!(row, "Docker daemon: running, but this user may not use it");
+        assert!(fix.contains("sudo usermod -aG docker $USER") && fix.ends_with("Check: docker info"));
+        let down = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?";
+        let (row, fix) = docker_daemon_remedy(down, false, true);
+        assert_eq!(row, "Docker daemon: NOT RUNNING");
+        assert!(fix.starts_with("Start it: sudo systemctl start docker") && fix.ends_with("Check: docker info"));
+        let (_, fix) = docker_daemon_remedy(down, false, false);
+        assert!(fix.starts_with("Start it: sudo service docker start"), "WSL2 and hosts without systemd");
+        let (_, fix) = docker_daemon_remedy(down, true, false);
+        assert!(fix.starts_with("Start Docker Desktop"));
+        // A distro with no apt is told what to install and where, never left at "MISSING".
+        let non_apt = non_apt_docker_remedy();
+        assert!(non_apt.contains("Docker Engine with the Compose v2 plugin"));
+        assert!(non_apt.contains("https://docs.docker.com/engine/install/"));
+        assert!(non_apt.ends_with(&docs_url("getting-started/install.md")));
+        assert!(docs_url("x.md").starts_with("https://github.com/") && docs_url("x.md").ends_with("/blob/main/docs/x.md"));
+    }
+
+    #[test]
+    fn the_tailscale_question_has_no_default_and_a_typed_no_is_a_lan_only_install() {
+        // Operator, 2026-11-14: "Ask with no default".
+        for (a, want) in [("y", Some(true)), ("YES", Some(true)), (" n ", Some(false)), ("No", Some(false)),
+                          ("", None), ("maybe", None), ("\n", None)] {
+            assert_eq!(parse_yes_no(a), want, "{a:?}");
+        }
+        let own = crate::test_src::own_code(include_str!("steps.rs"));
+        let install = own.find("\"Tailscale is not installed. Install it now").expect("the install question");
+        let before = &own[..install];
+        let call = before.rfind("ask_yes_no_no_default(").expect("asked with no default");
+        let confirm = before.rfind("ctx.asker.confirm(").unwrap_or(0);
+        assert!(call > confirm, "the install question is asked with no default, not confirm(.., true)");
+        let join = own.find("let join_question = format!(\n            \"Join your tailnet now?").expect("the join question");
+        let asked = own.find("ask_yes_no_no_default(ctx, &join_question, TAILSCALE_JOIN_YES, TAILSCALE_NO)").expect("asked with no default");
+        assert!(join < asked && !own[join..asked].contains("ctx.asker.confirm("));
+        // A typed n is a decision (an info line, no error, no second LAN-only
+        // confirm); --ci says LAN-only once and names the flag.
+        let lan = own.find("Err(_) if chose_lan_only => {").expect("the chosen LAN-only arm");
+        let ci = own.find("Err(_) if ctx.non_interactive => {").expect("the --ci arm");
+        let err = own.find("ctx.error(&format!(\"Tailscale unavailable: {why}\"));").expect("the failure arm");
+        assert!(lan < err && ci < err, "both decided arms come before the failure arm");
+        assert!(NON_INTERACTIVE_LAN_ONLY.contains("--skip-tailscale"));
+        assert!(TAILSCALE_NO.starts_with("LAN-only") && LAN_ONLY_CHOSEN.contains("noo onboard --reconfigure"));
+    }
+
     #[test]
     fn the_prerequisite_check_and_its_recheck_use_required_tools() {
         let code = crate::test_src::own_code(include_str!("steps.rs"));
