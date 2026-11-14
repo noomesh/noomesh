@@ -11397,8 +11397,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Take an autonomy rule out of preview, or put it back
-         * @description [native] `{"dry_run": false}` takes a rule with a dry-run gate LIVE: from its next tick it acts (disk_watermark deletes what its reclaim ladder previews, including superseded images of noomesh and of the add-ons it runs, from those images' own repositories only; cert_auto_rotate re-issues certificates and restarts their services). `{"dry_run": true}` puts it back into preview. Operator or admin only (403 otherwise); 400 for a rule with no dry-run gate. The key is merged into the rule's stored override, so its arming and tunables stay as they are, and the change is audited with who made it.
+         * Take an autonomy rule live (armed, out of preview), or put it back into preview
+         * @description [native] `{"dry_run": false}` takes a rule with a dry-run gate LIVE in one update: it arms the rule (`enabled_action: true`) and takes it out of preview (`dry_run: false`), so from its next tick it acts (disk_watermark deletes what its reclaim ladder previews, including superseded images of noomesh and of the add-ons it runs, from those images' own repositories only; cert_auto_rotate re-issues certificates and restarts their services). A rule that is switched off is refused (409, with how to switch it on). `{"dry_run": true}` puts it back into preview and leaves it armed or not. Operator or admin only (403 otherwise); 400 for a rule with no dry-run gate. The keys are merged into the rule's stored override, so its tunables stay as they are, and the change is audited with who made it. The answer is the rule's state read back after the write.
          */
         post: operations["autonomy_set_dry_run"];
         delete?: never;
@@ -27466,6 +27466,11 @@ export interface operations {
                 content: {
                     "application/json": {
                         name?: string;
+                        /** @description The rule is switched on (read back). */
+                        enabled?: boolean;
+                        /** @description Its action is armed (`enabled_action`, read back). */
+                        armed?: boolean;
+                        /** @description It previews instead of acting (read back). */
                         dry_run?: boolean;
                         config?: {
                             [key: string]: unknown;
@@ -27484,6 +27489,13 @@ export interface operations {
             };
             /** @description Not an operator or admin */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The rule is switched off: switch it on first (the message says how). */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

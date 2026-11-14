@@ -169,19 +169,41 @@ export const LIVE_MEANS: Record<string, string> = {
     'When a certificate nears expiry, the rule will RE-ISSUE it and restart the services that use it, instead of only reporting what it would rotate.',
 };
 
-/** Take a gated rule live (`dry_run: false`) or back to preview. Operator or
- *  admin only (the gateway checks the role); merged into the rule's stored
- *  config, so its arming and tunables stay; audited with who did it. */
+/** The state the gateway read back after a dry-run change. */
+type RuleState = { enabled: boolean; armed: boolean; dryRun: boolean };
+
+/** The state in the words the CLI and the badges use (Armed / Dry-run / Off). */
+export function describeRuleState(s: RuleState): string {
+  const off = s.enabled ? '' : ' The rule is switched off, so it does not run at all.';
+  if (s.armed && !s.dryRun) return `Armed, live: from its next tick it acts.${off}`;
+  if (s.armed) return `Dry-run (armed, previewing): it records what it would do and changes nothing.${off}`;
+  return `Off (not armed, previewing): it records what it would do and changes nothing.${off}`;
+}
+
+/** Take a gated rule live — ONE update that arms it and takes it out of
+ *  preview — or back to preview (its arm state stays). Operator or admin only
+ *  (the gateway checks the role); a switched-off rule is refused with how to
+ *  switch it on; audited with who did it. Resolves to the state read back,
+ *  and throws when that is not what was asked. */
 function useSetDryRun() {
   const client = useMetisClient();
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: async (vars: { name: string; dryRun: boolean }) => {
-      const { error } = await client.POST('/api/autonomy/locations/{name}/dry-run', {
+    mutationFn: async (vars: { name: string; dryRun: boolean }): Promise<RuleState> => {
+      const { data, error } = await client.POST('/api/autonomy/locations/{name}/dry-run', {
         params: { path: { name: vars.name as 'disk_watermark' | 'cert_auto_rotate' } },
         body: { dry_run: vars.dryRun },
       });
-      if (error) throw new Error('Change refused — operator or admin role required');
+      if (error) {
+        const msg = (error as { error?: string }).error;
+        throw new Error(msg || 'Change refused — operator or admin role required');
+      }
+      if (typeof data?.enabled !== 'boolean' || typeof data?.armed !== 'boolean' || typeof data?.dry_run !== 'boolean')
+        throw new Error('The gateway did not report the rule\'s state after the change, so it is not confirmed.');
+      const s = { enabled: data.enabled, armed: data.armed, dryRun: data.dry_run };
+      const asked = vars.dryRun ? s.dryRun : s.enabled && s.armed && !s.dryRun;
+      if (!asked) throw new Error(`Not what was asked. Stored: ${describeRuleState(s)}`);
+      return s;
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['autonomy'] }),
   });
@@ -205,7 +227,7 @@ function armedMeta(l: AutonomyLoc): { label: string; tone: Tone; title: string }
     return {
       label: 'Dry run',
       tone: 'warn',
-      title: 'Armed but still previewing: the second opt-in (dry_run: false) is not set.',
+      title: 'Armed but still previewing: Go live takes it out of preview.',
     };
   return { label: 'Armed', tone: 'bad', title: 'This rule CHANGES the fleet when it fires.' };
 }
@@ -284,10 +306,10 @@ export function AutonomyPanel() {
 
   async function onLive(l: AutonomyLoc, live: boolean) {
     const ok = await confirm({
-      title: live ? `Take ${l.name} live?` : `Put ${l.name} back into preview?`,
+      title: live ? `Arm ${l.name} and take it out of preview?` : `Put ${l.name} back into preview?`,
       description: live
-        ? `${LIVE_MEANS[l.name]} Until now it only recorded what it would have done (the decisions below). The change is recorded in the audit log with your name.`
-        : 'It goes back to recording what it would have done, and changes nothing. The change is recorded in the audit log with your name.',
+        ? `From its next tick it will act. ${LIVE_MEANS[l.name]} Until now it only recorded what it would have done (the decisions below). The change is recorded in the audit log with your name.`
+        : 'It goes back to recording what it would have done, and changes nothing; it stays armed or not as it is. The change is recorded in the audit log with your name.',
       confirmText: live ? 'Go live' : 'Back to preview',
       destructive: live,
     });
@@ -295,9 +317,9 @@ export function AutonomyPanel() {
     setDryRun.mutate(
       { name: l.name, dryRun: !live },
       {
-        onSuccess: () =>
+        onSuccess: (s) =>
           toast.success(live ? 'Live' : 'Back to preview', {
-            description: `${l.name} — applies on the next tick, no restart`,
+            description: `${l.name}: ${describeRuleState(s)}`,
           }),
         onError: (e) => toast.error('Change failed', { description: (e as Error).message }),
       },
@@ -382,17 +404,19 @@ export function AutonomyPanel() {
                   {busy === l.name ? '…' : l.armed ? 'Disarm' : 'Arm'}
                 </Button>
               )}
-              {/* The second opt-in: only on a rule with a dry-run gate, once it
-                  is armed, and only for an operator or admin (the gateway
-                  checks the role again). */}
-              {isOperator && l.armed && LIVE_MEANS[l.name] && (
+              {/* One way to turn a gated rule on: Go live arms it AND takes it
+                  out of preview. Only on a rule with a dry-run gate, only for
+                  an operator or admin (the gateway checks the role again), and
+                  not on a switched-off rule (the gateway refuses that too). */}
+              {isOperator && LIVE_MEANS[l.name] && (
                 <Button
                   size="sm"
-                  variant={l.dryRun ? 'destructive' : 'outline'}
-                  disabled={setDryRun.isPending && setDryRun.variables?.name === l.name}
-                  onClick={() => onLive(l, !!l.dryRun)}
+                  variant={l.armed && !l.dryRun ? 'outline' : 'destructive'}
+                  disabled={(setDryRun.isPending && setDryRun.variables?.name === l.name) || (!l.enabled && !(l.armed && !l.dryRun))}
+                  title={!l.enabled ? 'This rule is switched off: switch it on before taking it live.' : undefined}
+                  onClick={() => onLive(l, !(l.armed && !l.dryRun))}
                 >
-                  {l.dryRun ? 'Go live' : 'Back to preview'}
+                  {l.armed && !l.dryRun ? 'Back to preview' : 'Go live'}
                 </Button>
               )}
             </div>

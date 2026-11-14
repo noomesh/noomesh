@@ -10,6 +10,11 @@ Added `POST /api/autonomy/locations/{name}/dry-run` (operator or admin):
 into the stored one (as its description already said) instead of replacing
 it, so arming or disarming keeps `dry_run` and tunables. Additive.
 
+`POST /api/autonomy/locations/{name}/dry-run`, later the same day: going
+live (`{"dry_run": false}`) now also arms the rule (`enabled_action: true`)
+in the same update, and a switched-off rule answers 409. The answer adds
+`enabled` and `armed`, read back after the write. Additive for clients.
+
 ## 2026-11-09
 
 Added `POST /api/cluster/nodes/{node_id}/model-set-retry` (operator): ends a
