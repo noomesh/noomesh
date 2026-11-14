@@ -155,7 +155,7 @@ EOF
         ok "/ is a shared mount"
     fi
     note "after a WSL rebuild or distro import, if bind mounts under /mnt fail: sudo mount --make-rshared /"
-    note "keep Docker's data on the distro's ext4 (never /mnt/<drive>); disk upkeep: docs/development/wsl-disk.md"
+    note "keep Docker's data on the distro's ext4 (never /mnt/<drive>); disk upkeep: docs/operating/disk-and-images.md"
 elif [ "$IS_MAC" = 1 ]; then
     have brew || die "Homebrew is required on macOS: https://brew.sh (then re-run)"
     # No vendor telemetry (docs/security/telemetry.md): Homebrew sends install analytics by default.
@@ -226,13 +226,13 @@ elif [ "$HAS_APT" = 1 ]; then
         apt_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
     fi
     # Log caps + a bounded BuildKit cache at the daemon (docs/development/
-    # wsl-disk.md, layer 2). Written only when there is no daemon.json yet, so
+    # docs/operating/disk-and-images.md). Written only when there is no daemon.json yet, so
     # a hand-tuned one is never overwritten.
     if [ ! -f /etc/docker/daemon.json ]; then
         run $SUDO mkdir -p /etc/docker
         run_sh "printf '%s\n' '{' '  \"log-driver\": \"json-file\",' '  \"log-opts\": { \"max-size\": \"50m\", \"max-file\": \"3\" },' '  \"builder\": { \"gc\": { \"enabled\": true, \"defaultKeepStorage\": \"5GB\" } }' '}' | $SUDO tee /etc/docker/daemon.json >/dev/null"
     else
-        ok "/etc/docker/daemon.json exists (left as is; see docs/development/wsl-disk.md for the log caps)"
+        ok "/etc/docker/daemon.json exists (left as is; see docs/operating/disk-and-images.md for the log caps)"
     fi
     if systemctl is-active --quiet docker 2>/dev/null; then
         ok "docker.service active"

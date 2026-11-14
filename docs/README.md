@@ -63,6 +63,7 @@ the binary's own usage table by `scripts/gen-cli-docs.py`.
 | Document | Description |
 |----------|-------------|
 | [operating/operator-manual.md](operating/operator-manual.md) | The controller stack day to day: what runs where, `noo stack` start/stop/rebuild/reset, profiles and add-ons, upgrades, backups, troubleshooting |
+| [operating/disk-and-images.md](operating/disk-and-images.md) | Disk use: old images removed after a roll (preview first), what is never touched, the `disk_watermark` reclaim, a WSL2 controller's `.vhdx` |
 | [operating/monitoring.md](operating/monitoring.md) | Prometheus scrapes, the gateway `/metrics` registry, node-agent and GPU exporters, alert rules, Grafana, Loki logs, health endpoints |
 | [operating/token-budgets.md](operating/token-budgets.md) | Token budgets on tasks and allowances per person: the switch between loops, resubmitting or answering a parked task, and node vs cloud spend |
 
@@ -110,7 +111,6 @@ the binary's own usage table by `scripts/gen-cli-docs.py`.
 | [development/principles.md](development/principles.md) | The eight engineering principles a review asks about (least privilege, secure by default, fail loud, one behaviour, fast, clean and clear, who runs changes, proof), each with an example, and how to cite them as P1–P8 |
 | [development/developer-guide.md](development/developer-guide.md) | Build, test and extend noomesh: repository layout, the toolchain per tree (cargo in Docker, go test, pytest), the test suite, and the extension points (MCP tools, skills, worker handlers, backends, CLI commands, routes) |
 | [development/addons.md](development/addons.md) | Building an add-on: the declaration row, the route manifest the gateway proxies from, the drift check that belongs in your repo, and what presence/refusal/entitlement you get for free |
-| [development/wsl-disk.md](development/wsl-disk.md) | Keeping a WSL2 controller's `.vhdx` from growing forever: log caps, rebuild pruning, the compact script |
 
 ## Reference
 

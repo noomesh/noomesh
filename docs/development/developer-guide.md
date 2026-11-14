@@ -60,7 +60,7 @@ in `ui/`, the repo's git hooks and pre-commit's hook environments, and the
 `noo` binary. On WSL2 it first checks that systemd is on in
 `/etc/wsl.conf` and prints the fix if it is not; after a WSL rebuild, bind
 mounts under `/mnt` need `sudo mount --make-rshared /` (see
-[wsl-disk.md](wsl-disk.md) for keeping the distro's disk in check).
+[disk-and-images.md](../operating/disk-and-images.md) for keeping the distro's disk in check).
 
 To do it by hand instead — prerequisites: Python 3.12, Docker with Compose
 v2, Go (see `node-agent-go/go.mod` for the version), and no Rust toolchain —
