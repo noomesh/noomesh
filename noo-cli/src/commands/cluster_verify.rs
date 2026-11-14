@@ -14985,7 +14985,7 @@ mod image_retention_row_tests {
 
 #[cfg(test)]
 mod cpu_only_ollama_slots_tests {
-    use super::{cpu_only_ollama_slots_row, Verdict, CPU_ONLY_SLOTS_ADVICE, CPU_ONLY_SLOTS_REMEDY};
+    use super::{cpu_only_ollama_slots_row, cpu_only_slots_upgrade_advice, Verdict, CPU_ONLY_SLOTS_ADVICE, CPU_ONLY_SLOTS_REMEDY};
 
     /// i802: on a CPU-only controller, no OLLAMA_EMBED_NUM_PARALLEL or a
     /// value above 1 is an ADVISORY row (a warning, never a failure) that
@@ -14996,9 +14996,9 @@ mod cpu_only_ollama_slots_tests {
         let unset = cpu_only_ollama_slots_row(true, true, None).expect("a row");
         assert_eq!((unset.name, unset.verdict), ("ollama slots", Verdict::Warn), "advisory, never red");
         assert!(unset.detail.contains("unset") && unset.detail.ends_with(CPU_ONLY_SLOTS_ADVICE), "{}", unset.detail);
-        assert!(CPU_ONLY_SLOTS_ADVICE.starts_with("CPU-only: one Ollama slot saves ~0.4-0.6 GB of cache at 16k with no embedding loss (measured, i802)"));
+        assert!(CPU_ONLY_SLOTS_ADVICE.starts_with("CPU-only: one Ollama slot prefills about 3x faster on a 4-core CPU") && CPU_ONLY_SLOTS_ADVICE.contains("no embedding loss (measured, i802)"));
         assert_eq!(unset.remedy.as_deref(), Some(CPU_ONLY_SLOTS_REMEDY));
-        assert!(CPU_ONLY_SLOTS_REMEDY.contains("`noo stack restart --force ollama-embed`"));
+        assert!(CPU_ONLY_SLOTS_REMEDY.contains("noo stack restart --force ollama-embed"));
         let four = cpu_only_ollama_slots_row(true, true, Some("4")).expect("a row");
         assert_eq!(four.verdict, Verdict::Warn);
         assert!(four.detail.starts_with("OLLAMA_EMBED_NUM_PARALLEL=4. "), "{}", four.detail);
