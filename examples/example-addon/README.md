@@ -104,9 +104,17 @@ run of this example.
    service key cannot make it: service keys open only the inference surface.
 
    ```sh
+   CA="$(noo --json security pki status | jq -r .pki_dir)/ca.crt"
    TOKEN=$(jq -r .access_token "${NOO_CREDENTIALS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/mesh/credentials.json}")
-   curl -s --cacert "${NOO_PKI_DIR:-$HOME/.config/mesh/pki}/ca.crt" -H "Authorization: Bearer $TOKEN" https://localhost:8080/api/example-addon/status | jq .
+   curl -sS --fail-with-body --cacert "$CA" -H "Authorization: Bearer $TOKEN" https://localhost:8080/api/example-addon/status
    ```
+
+   The first line asks the CLI where this install keeps its cluster CA. That
+   directory is set by the install (for example `~/.noo/pki`, or the
+   encrypted state volume) and is not in your shell's environment. The
+   call prints the add-on's JSON answer. If it fails, curl says why and exits
+   non-zero: `curl: (77)` means the CA path is wrong, and an HTTP error prints
+   the gateway's body.
 
    `"exchanged": false` with a `status` means the add-on reached the exchange
    and was refused (`401`: its key was revoked or the add-on disabled). A
