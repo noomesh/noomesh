@@ -442,10 +442,12 @@ var backendSpecs = map[string]BackendSpec{
 			// model fetch from reporting (docs/security/telemetry.md).
 			"HF_HUB_DISABLE_TELEMETRY": "1",
 			"DO_NOT_TRACK":             "1",
+			// Where TEI looks for the model: the node's VERIFIED snapshot
+			// (teiHubCache, below). Not overridable (buildEnvList).
+			"HUGGINGFACE_HUB_CACHE": teiHubCache,
 		},
-		// Persist + share the TEI model cache at /data — same host dir the
-		// compose `hf-cache` named volume binds to, so the node-agent backend
-		// reuses models the compose tei/tei-gpu already downloaded.
+		// Persist + share the TEI model cache at /data — the node's
+		// HF_CACHE_DIR, whose hub/ holds the snapshots stageHFModel verified.
 		Volumes: []VolumeMount{
 			{Source: hfCacheSource, Target: "/data"},
 		},
@@ -505,6 +507,8 @@ func rerankerSpecTEI() BackendSpec {
 			// Same as the embedding backend (docs/security/telemetry.md).
 			"HF_HUB_DISABLE_TELEMETRY": "1",
 			"DO_NOT_TRACK":             "1",
+			// The verified snapshot, as for the embedding backend.
+			"HUGGINGFACE_HUB_CACHE": teiHubCache,
 		},
 		// Shared TEI model cache — see embedding backend.
 		Volumes: []VolumeMount{
@@ -847,17 +851,26 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 	// verify` names instead of a multi-GB download that hides it. A node with
 	// no store configured (the controller's own agent, a dev box) keeps the
 	// old behaviour: online on a miss, the token passed through.
+	//
+	// The weights a placed node starts on are VERIFIED: every file of the
+	// snapshot hashes to the controller's `hf` artifact manifest
+	// (stageHFModel, hf_weights.go). The start WAITS for that — the first
+	// one after an upgrade hashes the snapshot once, niced, logging
+	// "verifying <model> weights: n/total GB" — and no container exists
+	// until it is done, so there is no health deadline running meanwhile.
+	// An unverifiable snapshot is a refusal (backend_start), never a start.
 	if hfBackend(backend) && placedNode() && !isGGUFModel(model) {
-		hit := c.preseedModel(ctx, backend, model)
-		if !hit && model != "" && !hfRepoCachedLocally(model) {
-			return &ModelNotStagedError{Backend: backend, Model: model}
+		if model != "" {
+			if err := c.stageHFModel(ctx, backend, model); err != nil {
+				return err
+			}
 		}
 		envOverrides["HF_HUB_OFFLINE"] = "1"
 		envOverrides["HF_TOKEN"] = ""
 		envOverrides["HUGGING_FACE_HUB_TOKEN"] = ""
-	} else if c.preseedModel(ctx, backend, model) {
-		envOverrides["HF_HUB_OFFLINE"] = "1"
 	}
+	// An UNPLACED node (no NOO_MODEL_CACHE_URL: the controller's own agent, a
+	// dev box) has no store to preseed from; it runs online as before.
 	// GGUF weights (llama.cpp) are a flat file; copy from the store if present.
 	c.preseedGGUF(ctx, backend, model)
 
@@ -1163,67 +1176,6 @@ func (c *Client) StopBackendSDK(ctx context.Context, backend string) error {
 	return nil
 }
 
-// preseedModel copies a placed HF model from the controller's model-weight
-// store into this node's HF cache, so the backend can start with
-// HF_HUB_OFFLINE=1. Best-effort: a store miss or any error returns false and
-// the backend downloads from HuggingFace as usual. Only HF-repo backends
-// (vllm/embedding/reranker); GGUF + Ollama use other delivery paths.
-// Requires NOO_MODEL_CACHE_URL on the node.
-//
-// In-process since 2026-09-12. This used to run inside a disposable helper
-// container from the agent's OWN image (`noo-node-agent -preseed` with the
-// HF cache bind-mounted) — written when the agent was itself a container and
-// the host cache was easiest to reach from inside one. The agent has been a
-// host process since the fleet hardening, and no rail delivers its image to
-// a node (`upgrade --nodes` ships the binary, `sync-images` declines
-// node-agent refs, `upgrade-agents` needs a checkout), so on every node the
-// helper was "No such image" and the preseed silently fell back to a
-// multi-GB WAN download that then died mid-stream (host3, vllm gemma4-12B).
-// The binary already carries the preseed code — the Ollama import uses it
-// directly — so the HF snapshot now goes the same way: this process, the
-// host path, the same model-cache rail (mTLS :8443 C-i).
-func (c *Client) preseedModel(ctx context.Context, backend, model string) bool {
-	cacheURL := preseed.CacheURL()
-	if cacheURL == "" || model == "" {
-		return false
-	}
-	switch backend {
-	case "vllm", "embedding", "reranker":
-	default:
-		return false
-	}
-	// A gguf reranker (llamacpp engine) is a flat file, not an HF repo —
-	// preseedGGUF handles it.
-	if strings.HasSuffix(strings.ToLower(model), ".gguf") {
-		return false
-	}
-	repo := preseed.RepoCacheDir(model)
-	src := fmt.Sprintf("%s/hf/%s/", cacheURL, repo)
-	hfHost := resolveEnv(hfCacheSource)
-	dest := filepath.Join(hfHost, "hub", repo)
-	// Model weights are multi-GB; give the copy a generous window (bounded by
-	// the caller's ctx). The old fixed 60s killed it mid-download.
-	mctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
-	defer cancel()
-	n, err := preseed.New().MirrorHFRepo(mctx, src, dest)
-	if err != nil {
-		if isPermissionErr(err) {
-			// Not a miss: the store has the model and this process cannot
-			// write where the backend will read. Say so, once, with the
-			// path — the fallback still runs so the placement is not lost.
-			slog.Error("model preseed cannot write the node's HF cache — falling back to HF",
-				"model", model, "dest", dest, "error", err,
-				"fix", "make "+hfHost+" writable by the agent's user (it is a declared host root; prep-host owns it)")
-		} else {
-			slog.Info("model-cache preseed miss; downloading from HF",
-				"model", model, "src", src, "err", err)
-		}
-		return false
-	}
-	slog.Info("model preseeded from controller store", "model", model, "files", n, "dest", dest)
-	return true
-}
-
 // preseedGGUF copies a placed GGUF weight from the controller's model-weight
 // store (/gguf/<file>) into this node's models dir before a llamacpp backend
 // starts, so an edge node that lacks the file pulls it over the LAN instead of
@@ -1231,7 +1183,8 @@ func (c *Client) preseedModel(ctx context.Context, backend, model string) bool {
 // llama.cpp loads it by path — no offline env flag needed, just presence.
 // Best-effort: on a miss, StartBackendSDK proceeds and llama.cpp fails exactly
 // as it would today if the file were absent. Requires NOO_MODEL_CACHE_URL.
-// In-process for the same reason as preseedModel (see there).
+// In-process, against the host path: the agent is a host process (the
+// disposable helper container it once ran in is retired).
 func (c *Client) preseedGGUF(ctx context.Context, backend, model string) bool {
 	cacheURL := preseed.CacheURL()
 	// llamacpp LLMs and gguf rerankers (llamacpp-engine reranker backend)
@@ -1459,6 +1412,25 @@ func resolveEnvSlice(ss []string) []string {
 	return out
 }
 
+// teiHubCache is the TEI images' hub cache, pointed at the hub/ level of the
+// node's HF_CACHE_DIR (mounted at /data).
+//
+// The TEI images (ghcr.io/huggingface/text-embeddings-inference:1.6 and
+// :cpu-1.6, the digests docker-compose.cluster.yml pins) set
+// HUGGINGFACE_HUB_CACHE=/data in their config, and TEI 1.6 hands that
+// straight to hf-hub (router/src/lib.rs: ApiBuilder::with_cache_dir), whose
+// layout is <cache>/models--org--name. The agent stages and VERIFIES a placed
+// model at HF_CACHE_DIR/hub/models--org--name (stageHFModel, i675 F13), the
+// huggingface_hub layout vLLM and the model cache use. With the image default
+// TEI read /data/models--org--name — a tree nothing verifies — and never the
+// verified snapshot. This puts both on the same tree.
+const teiHubCache = "/data/hub"
+
+// pinnedSpecEnv are spec env keys a placement or node override cannot
+// change: where a backend reads its weights must stay the tree the agent
+// verified.
+var pinnedSpecEnv = map[string]bool{"HUGGINGFACE_HUB_CACHE": true}
+
 func buildEnvList(specEnv map[string]string, overrides map[string]string) []string {
 	merged := make(map[string]string, len(specEnv)+len(overrides))
 	for k, v := range specEnv {
@@ -1470,7 +1442,7 @@ func buildEnvList(specEnv map[string]string, overrides map[string]string) []stri
 	// A telemetry switch the spec carries is not overridable: a placement's
 	// env or a node-local value cannot turn vendor phone-home back on.
 	for k, v := range specEnv {
-		if IsTelemetrySwitch(k) {
+		if IsTelemetrySwitch(k) || pinnedSpecEnv[k] {
 			merged[k] = resolveEnv(v)
 		}
 	}
@@ -1984,14 +1956,6 @@ func hfBackend(backend string) bool {
 func isGGUFModel(model string) bool { return strings.HasSuffix(strings.ToLower(model), ".gguf") }
 
 func placedNode() bool { return preseed.Placed() }
-
-// hfRepoCachedLocally: the node's HF cache already holds a snapshot of the
-// repo (preseeded earlier, the controller briefly unreachable now).
-func hfRepoCachedLocally(model string) bool {
-	snaps := filepath.Join(resolveEnv(hfCacheSource), "hub", preseed.RepoCacheDir(model), "snapshots")
-	entries, err := os.ReadDir(snaps)
-	return err == nil && len(entries) > 0
-}
 
 // ModelNotStagedError: a placed node could not get the model from the
 // controller's store and will not download it from the internet.

@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/noomesh/noomesh/node-agent-go/internal/preseed"
 	"github.com/noomesh/noomesh/node-agent-go/internal/preseed/preseedtest"
 	"github.com/noomesh/noomesh/node-agent-go/internal/refusals"
 )
@@ -179,24 +180,21 @@ func TestBackoffExpires(t *testing.T) {
 
 // preseedModel used to treat EVERY error from the helper as "the controller
 // store does not have this model" and fall back to a HuggingFace download.
-// The preseed runs in this process against the host path since 2026-09-12:
+// The staging runs in this process against the host path since 2026-09-12:
 // no helper container, so a node without the agent image loses nothing. A
-// served repo lands in HF_CACHE_DIR/hub/<repo>; a store miss (404) returns
-// false and touches nothing, which is the best-effort fallback to HF.
+// served repo lands in HF_CACHE_DIR/hub/<repo>, every file verified against
+// the controller's `hf` manifest (i675 F13); a store miss (404) is
+// ModelNotStagedError and touches nothing.
 func TestPreseedMirrorsInProcessWithoutAHelper(t *testing.T) {
 	// The store is mTLS-only: a plaintext
 	// httptest URL would be REFUSED by preseed.CacheURL, so the node's PKI
 	// and a store that requires its leaf are stood up for real.
 	pki := preseedtest.New(t)
 	pki.SetNodeEnv(t)
+	rev := strings.Repeat("c", 40)
 	srv := pki.Store(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/hf/models--Qwen--Qwen3-8B/refs/main":
-			_, _ = w.Write([]byte("abc123\n"))
-		case "/hf/models--Qwen--Qwen3-8B/snapshots/abc123/":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`[{"name":"config.json","type":"file","size":2}]`))
-		case "/hf/models--Qwen--Qwen3-8B/snapshots/abc123/config.json":
+		case "/hf/models--Qwen--Qwen3-8B/snapshots/" + rev + "/config.json":
 			_, _ = w.Write([]byte("{}"))
 		default:
 			w.WriteHeader(404)
@@ -205,15 +203,19 @@ func TestPreseedMirrorsInProcessWithoutAHelper(t *testing.T) {
 	hf := t.TempDir()
 	t.Setenv("NOO_MODEL_CACHE_URL", srv.URL)
 	t.Setenv("HF_CACHE_DIR", hf)
-	if !(&Client{}).preseedModel(context.Background(), "vllm", "Qwen/Qwen3-8B") {
-		t.Fatal("a served repo must preseed in-process")
+	stubHFManifests(t, map[string]*preseed.HFManifest{
+		"models--Qwen--Qwen3-8B": {Rev: rev, Files: []preseed.HFFile{{Path: "config.json", Bytes: 2, SHA256: sha256Hex("{}")}}},
+	})
+	if err := (&Client{}).stageHFModel(context.Background(), "vllm", "Qwen/Qwen3-8B"); err != nil {
+		t.Fatalf("a served repo must stage in-process: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(hf, "hub", "models--Qwen--Qwen3-8B", "snapshots", "abc123", "config.json")); err != nil {
+	if _, err := os.Stat(filepath.Join(hf, "hub", "models--Qwen--Qwen3-8B", "snapshots", rev, "config.json")); err != nil {
 		t.Fatalf("snapshot file not mirrored into HF_CACHE_DIR/hub: %v", err)
 	}
-	// A store miss is a miss: false, nothing written, HF fallback follows.
-	if (&Client{}).preseedModel(context.Background(), "vllm", "Qwen/Qwen3-0.6B") {
-		t.Fatal("a store miss must not report success")
+	// A store miss is a refusal: ModelNotStagedError, nothing written.
+	var miss *ModelNotStagedError
+	if err := (&Client{}).stageHFModel(context.Background(), "vllm", "Qwen/Qwen3-0.6B"); !errors.As(err, &miss) {
+		t.Fatalf("a store miss must be ModelNotStagedError, got %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(hf, "hub", "models--Qwen--Qwen3-0.6B")); err == nil {
 		t.Fatal("a store miss must not create the repo dir")
@@ -231,7 +233,10 @@ func TestPreseedNeverNeedsTheHelperImage(t *testing.T) {
 	preseedtest.New(t).SetNodeEnv(t)
 	t.Setenv("NOO_MODEL_CACHE_URL", "https://127.0.0.1:9") // nothing listens: a miss
 	t.Setenv("HF_CACHE_DIR", t.TempDir())
-	if (&Client{}).preseedModel(context.Background(), "vllm", "Qwen/Qwen3-8B") {
+	stubHFManifests(t, map[string]*preseed.HFManifest{
+		"models--Qwen--Qwen3-8B": {Rev: strings.Repeat("c", 40), Files: []preseed.HFFile{{Path: "config.json", Bytes: 2, SHA256: sha256Hex("{}")}}},
+	})
+	if err := (&Client{}).stageHFModel(context.Background(), "vllm", "Qwen/Qwen3-8B"); err == nil {
 		t.Fatal("an unreachable store must not report success")
 	}
 	for _, r := range refusals.List() {

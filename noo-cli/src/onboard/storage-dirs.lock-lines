@@ -1,2 +1,2 @@
-# storage-subdirs noo-data,redis,nats,ollama,hf-cache,models,prometheus,grafana,loki,tempo,postgres,images,models/voice/whisper,models/voice/piper
+# storage-subdirs noo-data,redis,nats,ollama,hf-cache,models,prometheus,grafana,loki,tempo,postgres,images,hf-cache/hub,models/voice/whisper,models/voice/piper
 # state-subdirs noo-data,redis,nats,prometheus,grafana,loki,tempo,postgres

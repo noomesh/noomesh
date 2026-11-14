@@ -43,45 +43,16 @@ func main() {
 		os.Exit(code)
 	}
 
-	// Preseed mode: `noo-node-agent -preseed <repo-url> <dest-dir>`
-	// Copies a HuggingFace model from the controller's model-weight store
-	// (nginx JSON autoindex at …/hf/models--org--name/) into <dest-dir>,
-	// taking only refs/main + the one snapshot main points at — HF loads
-	// offline from that and it avoids the ~4x over-fetch a blind mirror hits
-	// on multi-snapshot repos. Run inside a disposable helper container (this
-	// same image) with the node's HF cache bind-mounted — no wget/curl/rsync
-	// needed. Prints the file count; exits non-zero on error so the caller
-	// falls back to a normal HF download.
-	if cmd == cmdPreseed {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-		defer cancel()
-		n, err := preseed.New().MirrorHFRepo(ctx, os.Args[2], os.Args[3])
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "preseed error:", err)
-			os.Exit(1)
-		}
-		fmt.Printf("preseed ok: %d files\n", n)
-		os.Exit(0)
-	}
-
-	// Single-file preseed: `noo-node-agent -preseed-file <url> <dest>`
+	// Single-file preseed: `noo-node-agent -preseed-file <url> <dest> <sha256>`
 	// Copies one file (a GGUF weight) from the controller's model-weight store
-	// (/gguf/<name>) into <dest>, skipping if already present at the same size.
-	// Runs inside a disposable helper with the node's models dir bind-mounted.
-	// Optional 4th arg: the sha256 the controller's artifact manifest stated
-	// With it, the bytes are verified while streaming
-	// and a mismatch fails without touching <dest>; without it, behaviour is
-	// unchanged (size-shortcut opportunistic caching).
+	// (/gguf/<name>) into <dest>. The sha256 (the controller's artifact
+	// manifest's) is REQUIRED: the bytes are verified while streaming, an
+	// existing <dest> is re-hashed rather than size-trusted, and a mismatch
+	// fails without touching <dest>.
 	if cmd == cmdPreseedFile {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 		defer cancel()
-		var wrote bool
-		var err error
-		if len(os.Args) >= 5 && os.Args[4] != "" {
-			wrote, err = preseed.New().FetchOneVerified(ctx, os.Args[2], os.Args[3], os.Args[4])
-		} else {
-			wrote, err = preseed.New().FetchOne(ctx, os.Args[2], os.Args[3])
-		}
+		wrote, err := preseed.New().FetchOneVerified(ctx, os.Args[2], os.Args[3], os.Args[4])
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "preseed-file error:", err)
 			os.Exit(1)

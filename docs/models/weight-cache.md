@@ -139,12 +139,34 @@ the roll (the verify row is how you find them).
 
 When the node-agent is asked to start a backend:
 
-- **HuggingFace repos** (`vllm`, `embedding`, `reranker`): the agent mirrors
-  `<cache-url>/hf/models--<org>--<name>/` into the node's HF cache itself,
-  in-process against the host path (15-minute budget). It reads `refs/main`
-  and mirrors **only that one** snapshot, so the backend can start with
-  `HF_HUB_OFFLINE=1`. No helper container is involved: the agent is a host
-  process. **A placed node never downloads weights from the internet.** With
+- **HuggingFace repos** (`vllm`, `embedding`, `reranker`): the agent asks the
+  gateway for the `hf` artifact manifest of the repo (`refs/main`'s snapshot,
+  every file with the sha256 of its blob, which the gateway cross-checks
+  against the blob's HF oid and refuses on a mismatch), then mirrors that one
+  snapshot into the node's HF cache in-process (15-minute budget). **Every
+  file is verified by sha256, never by size**: a present file is kept only if
+  it hashes to the manifest (or the agent's verified-digest record,
+  `$NOO_AGENT_STATE/verified/hf-weights.json`, mounted into no container,
+  vouches for that exact inode, size, mtime and ctime), anything else is
+  re-fetched, and bytes that do not match are refused. The first start after
+  the upgrade hashes each snapshot once, at lowered CPU/IO priority, and logs
+  `verifying <model> weights: n/total GB` while the start waits. A node whose
+  controller's gateway predates the `hf` kind (before 0.6.25-rc.2) refuses to
+  start HF backends and says so (`hf_weights_unverified: … upgrade the
+  controller first`): **roll the controller before the nodes.** If the
+  controller cannot be reached, the local copy must verify against the last
+  manifest the node verified; a snapshot directory that merely exists is not
+  enough. No helper container is involved: the agent is a host process.
+  TEI (`embedding`, the TEI `reranker`) reads the same verified tree: its
+  spec sets `HUGGINGFACE_HUB_CACHE=/data/hub` (the image default `/data`
+  would read `HF_CACHE_DIR/models--…`, outside what the agent verifies), so a
+  node that ran TEI online before re-downloads its embedder once into `hub/`.
+- **Controller roll note:** the gateway now mounts `HF_CACHE_DIR/hub`
+  read-only at `/artifacts/hf/hub` (it was not mounted before) — only `hub/`,
+  never the HF_HOME with its `token`. A missing `hub/` is created before
+  `up` with `HF_CACHE_DIR`'s owner (onboard's storage step, the roll's
+  storage reconcile, and the launch check, which also follows an
+  `HF_CACHE_DIR` declared outside the data root), never by Docker as root. **A placed node never downloads weights from the internet.** With
   `NOO_MODEL_CACHE_URL` set, the backend always starts with
   `HF_HUB_OFFLINE=1` and **without** `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN`
   (a node needs no Hugging Face credential). A model the store does not hold
@@ -470,8 +492,9 @@ Create it with `noo heartbeat` like any other task; see
 | `NOO_IMAGE_REGISTRY_FALLBACK` | node-agent env | `public` (default) or `off`: may a third-party image the controller has not staged come from its public registry. Our own images are rail-only under both |
 
 Code: `docker/model-cache.nginx.conf`, `node-agent-go/internal/preseed/`,
-`node-agent-go/internal/docker/backends.go` (`preseedModel`,
-`preseedGGUF`), `noo-cli/src/commands/cluster.rs` (`sync-model-files`),
+`node-agent-go/internal/docker/hf_weights.go` (`stageHFModel`),
+`node-agent-go/internal/docker/backends.go` (`preseedGGUF`),
+`gateway-rust/src/routes/artifacts.rs` (the `hf` manifest), `noo-cli/src/commands/cluster.rs` (`sync-model-files`),
 `noo-cli/src/commands/models_fetch.rs` (`models fetch`),
 `noo-cli/src/commands/ollama_stage.rs` (`models fetch ollama:<tag>`),
 `node-agent-go/internal/docker/ollama_stage.go` + `ollama_model.go` (the node's import),

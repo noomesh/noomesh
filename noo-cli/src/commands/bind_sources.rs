@@ -491,6 +491,51 @@ pub fn ensure_launcher_dirs(cfg: &Value, services: &[String], no_deps: bool) -> 
     made
 }
 
+/// Where the gateway mounts the controller's `HF_CACHE_DIR/hub`, read-only,
+/// for the `hf` artifact manifest (i675 F13). Only `hub/` is mounted: an
+/// HF_HOME also holds `token`, which the gateway must never be able to read.
+pub const HF_HUB_TARGET: &str = "/artifacts/hf/hub";
+
+/// `HF_CACHE_DIR/hub` is created by huggingface_hub on the first download,
+/// so an install that never fetched a model (or an upgraded one) has none —
+/// and Docker would create it ROOT-OWNED for the gateway's mount, after which
+/// the operator's own `huggingface-cli download` into that HF_HOME fails.
+/// Create each MISSING bind source mounted at [`HF_HUB_TARGET`] here, before
+/// `up`, when its parent (the declared HF_CACHE_DIR, wherever it is) exists,
+/// and give it the PARENT's owner (the chown takes effect only when this runs
+/// as root; as the operator it is already the operator's). A missing parent
+/// keeps its refusal. Returns what was created.
+pub fn ensure_hf_hub(cfg: &Value, services: &[String], no_deps: bool) -> Vec<String> {
+    use std::os::unix::fs::MetadataExt;
+    let mut made = Vec::new();
+    for svc in selected(cfg, services, no_deps) {
+        let vols = cfg["services"][&svc]["volumes"].as_array().cloned().unwrap_or_default();
+        for v in vols {
+            if v.get("type").and_then(Value::as_str) != Some("bind")
+                || v.get("target").and_then(Value::as_str).map(|t| t.trim_end_matches('/')) != Some(HF_HUB_TARGET)
+            {
+                continue;
+            }
+            let Some(source) = v.get("source").and_then(Value::as_str) else { continue };
+            let source = source.trim_end_matches('/');
+            let path = Path::new(source);
+            if basename(source) != "hub" || path.symlink_metadata().is_ok() || made.iter().any(|m| m == source) {
+                continue;
+            }
+            let Some(parent) = path.parent() else { continue };
+            let Ok(pm) = std::fs::metadata(parent) else { continue };
+            if !pm.is_dir() || std::fs::create_dir(path).is_err() {
+                continue;
+            }
+            if std::fs::metadata(path).map(|m| (m.uid(), m.gid()) != (pm.uid(), pm.gid())).unwrap_or(false) {
+                let _ = std::os::unix::fs::chown(path, Some(pm.uid()), Some(pm.gid()));
+            }
+            made.push(source.to_string());
+        }
+    }
+    made
+}
+
 /// The refusal text, header to footer. Empty when there is nothing to refuse.
 pub fn refusal(findings: &[Finding]) -> String {
     if findings.is_empty() {
@@ -569,6 +614,9 @@ fn launch_check(
     for made in ensure_launcher_dirs(cfg, services, no_deps) {
         text.push_str(&format!("created {made} (the add-on declarations directory; the launcher fills it)\n"));
     }
+    for made in ensure_hf_hub(cfg, services, no_deps) {
+        text.push_str(&format!("created {made} (HF_CACHE_DIR/hub, which the gateway mounts read-only; owned like HF_CACHE_DIR)\n"));
+    }
     let findings = check_except(cfg, services, no_deps, skip, data_root);
     if findings.is_empty() {
         return (0, text);
@@ -582,6 +630,77 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::path::PathBuf;
+
+    fn hf_hub_cfg(source: &Path) -> Value {
+        json!({"services": {"gateway": {"volumes": [
+            {"type": "bind", "source": source.display().to_string(), "target": HF_HUB_TARGET, "read_only": true, "bind": {}},
+        ]}}})
+    }
+
+    fn owner_of(p: &Path) -> (u32, u32) {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(p).unwrap();
+        (m.uid(), m.gid())
+    }
+
+    /// (1) Fresh install: HF_CACHE_DIR exists (onboard's storage step made
+    /// it), nothing was ever fetched, so there is no hub/. The launch check
+    /// creates it — owned like HF_CACHE_DIR — instead of refusing, and
+    /// before Docker could create it root-owned.
+    #[test]
+    fn hf_hub_fresh_install_is_created_with_the_parents_owner_before_up() {
+        let d = scratch("hf-hub-fresh");
+        let hf = d.join("data/hf-cache");
+        std::fs::create_dir_all(&hf).unwrap();
+        let hub = hf.join("hub");
+        let cfg = hf_hub_cfg(&hub);
+        let (code, text) = launch_check(&cfg, &[], false, &[], Some(&d.join("data").to_string_lossy()), true, true);
+        assert_eq!(code, 0, "{text}");
+        assert!(text.contains("HF_CACHE_DIR/hub"), "{text}");
+        assert!(hub.is_dir());
+        assert_eq!(owner_of(&hub), owner_of(&hf));
+        assert!(ensure_hf_hub(&cfg, &[], false).is_empty(), "idempotent");
+    }
+
+    /// (2) Upgrade: an existing install whose HF_CACHE_DIR holds models but
+    /// no hub/ level yet (or hub/ made by vLLM as root): a missing hub/ is
+    /// created; an existing one — whatever its owner — is never touched.
+    #[test]
+    fn hf_hub_on_upgrade_is_created_only_when_missing() {
+        let d = scratch("hf-hub-upgrade");
+        let hf = d.join("hf-cache");
+        std::fs::create_dir_all(hf.join("xet")).unwrap();
+        let hub = hf.join("hub");
+        assert_eq!(ensure_hf_hub(&hf_hub_cfg(&hub), &[], false), vec![hub.display().to_string()]);
+        std::fs::write(hub.join("marker"), "x").unwrap();
+        assert!(ensure_hf_hub(&hf_hub_cfg(&hub), &[], false).is_empty());
+        assert!(hub.join("marker").exists(), "an existing hub/ is left alone");
+        // Another target is never created by this rule.
+        let other = d.join("elsewhere/hub");
+        std::fs::create_dir_all(d.join("elsewhere")).unwrap();
+        let cfg = json!({"services": {"x": {"volumes": [
+            {"type": "bind", "source": other.display().to_string(), "target": "/somewhere/else", "bind": {}}]}}});
+        assert!(ensure_hf_hub(&cfg, &[], false).is_empty());
+        assert!(!other.exists());
+    }
+
+    /// (3) HF_CACHE_DIR declared outside the data root: the mount follows the
+    /// declared path and so does the create; a missing declared parent keeps
+    /// its refusal (nothing is invented above it).
+    #[test]
+    fn hf_hub_follows_a_declared_hf_cache_dir_and_never_invents_its_parent() {
+        let d = scratch("hf-hub-declared");
+        let declared = d.join("big-disk/hf-home");
+        std::fs::create_dir_all(&declared).unwrap();
+        let hub = declared.join("hub");
+        let (code, text) = launch_check(&hf_hub_cfg(&hub), &[], false, &[], Some(&d.join("data").to_string_lossy()), true, true);
+        assert_eq!(code, 0, "{text}");
+        assert!(hub.is_dir());
+        let gone = d.join("not-there/hub");
+        let (code, text) = launch_check(&hf_hub_cfg(&gone), &[], false, &[], None, true, true);
+        assert_eq!(code, EXIT_REFUSED, "{text}");
+        assert!(!d.join("not-there").exists(), "the parent is never created here");
+    }
 
     #[test]
     fn the_addon_declaration_dirs_are_created_as_the_user_not_refused() {

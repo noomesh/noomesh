@@ -7561,6 +7561,18 @@ mod storage_dir_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// i675 F13: the gateway now mounts HF_CACHE_DIR/hub read-only. An
+    /// existing install that never fetched a model has hf-cache but no hub/;
+    /// the roll must create exactly that one, before the pin moves and so
+    /// before the gateway is recreated (Docker would make it root-owned).
+    #[test]
+    fn an_old_data_root_without_hf_hub_needs_exactly_hf_hub() {
+        let root = root_without("hfhub", STORAGE_SUBDIRS, &["hf-cache/hub"]);
+        assert!(root.join("hf-cache").is_dir());
+        assert_eq!(missing_storage_dirs(&root, &root, ""), vec![("hf-cache/hub".to_string(), root.join("hf-cache/hub"))]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// With `NOO_STATE_ROOT` set elsewhere the state set lives there, and a
     /// nested directory (the voice models) is found too.
     #[test]
