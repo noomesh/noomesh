@@ -823,7 +823,6 @@ const COMPACT_CORE_TOOLS: &[&str] = &["noo_tool_search", "noo_rag_query", "noo_m
 // TIER-HOOK: the loop builds its active set from `core_tools_for(tier)`
 // where `select_tool_schemas` starts from `CORE_TOOLS` today (and in its
 // nothing-matched fallback); keyword groups still add on top.
-#[allow(dead_code)]
 pub(crate) fn core_tools_for(tier: PromptTier) -> &'static [&'static str] {
     match tier {
         PromptTier::Full => super::agent_loop::CORE_TOOLS,
@@ -834,7 +833,6 @@ pub(crate) fn core_tools_for(tier: PromptTier) -> &'static [&'static str] {
 // TIER-HOOK: the loop truncates the skill selection to `max_skills_for(tier)`
 // (`select(..).into_iter().take(n)` in `fetch_prompt_skills_context`, which
 // would take the tier or `n` as a parameter).
-#[allow(dead_code)]
 pub(crate) fn max_skills_for(tier: PromptTier) -> usize {
     match tier {
         PromptTier::Full => crate::prompt_skills::MAX_SKILLS,
@@ -847,7 +845,6 @@ pub(crate) fn max_skills_for(tier: PromptTier) -> usize {
 
 // TIER-HOOK: the runtimes skip `select_runbook_context` when this is false
 // (runtime.rs / remote.rs `runbook_context`).
-#[allow(dead_code)]
 pub(crate) fn runbooks_for(tier: PromptTier) -> bool {
     tier == PromptTier::Full
 }
@@ -925,7 +922,6 @@ When asked to implement, fix, refactor, or write code: use `noo_coding_task`. Th
 // TIER-HOOK: the loop calls `selected_groups(user_message)` beside
 // `select_tool_schemas` and appends `group_guidance(&groups)` to the system
 // message (after the persona, before CLOCK_RULE), in both tiers.
-#[allow(dead_code)]
 pub(crate) fn selected_groups(user_message: &str) -> Vec<&'static str> {
     let msg = user_message.to_lowercase();
     super::agent_loop::TOOL_GROUPS
@@ -938,7 +934,6 @@ pub(crate) fn selected_groups(user_message: &str) -> Vec<&'static str> {
 /// The guidance for the selected tool groups, each block once, in table
 /// order; empty when no listed group is selected. Starts with a blank line
 /// so it appends straight onto the persona.
-#[allow(dead_code)]
 pub(crate) fn group_guidance(groups: &[&str]) -> String {
     let mut out = String::new();
     for (owners, text) in GROUP_GUIDANCE {

@@ -1293,14 +1293,8 @@ async fn backend_context<R: HarnessRuntime>(rt: &R, backend: &ResolvedBackend) -
     }
 }
 
-/// The prompt tier a window affords. A LOCAL stand-in: the tier work
-/// (`coordinator::context::PromptTier`, `persona_for(tier)`, the core tools
-/// per tier) replaces it at the `TIER-HOOK` comments in both loops.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WindowTier {
-    Full,
-    Compact,
-}
+/// The prompt tier a window affords (`coordinator::context::PromptTier`).
+type WindowTier = super::context::PromptTier;
 
 /// Below this prompt budget (in the backend's tokens) a known small
 /// context would take the compact tier.
@@ -1312,6 +1306,35 @@ fn prompt_tier(window: &TurnWindow) -> WindowTier {
     } else {
         WindowTier::Full
     }
+}
+
+/// The persona for the turn's tier. Compact is the core file (the five
+/// safety rules pinned in it); a Full tier, or no prompts dir found, is the
+/// configured persona as before.
+async fn tier_persona<R: HarnessRuntime>(rt: &R, tier: WindowTier) -> String {
+    if tier == WindowTier::Compact {
+        let core = super::context::persona_for(WindowTier::Compact);
+        if !core.trim().is_empty() {
+            return core;
+        }
+    }
+    rt.persona_prompt().await
+}
+
+/// A Compact tier keeps only its core tools from `CORE_TOOLS` (the
+/// keyword groups' tools stay: the person's words asked for them).
+fn tier_tools(schemas: Vec<Value>, tier: WindowTier) -> Vec<Value> {
+    if tier != WindowTier::Compact {
+        return schemas;
+    }
+    let keep = super::context::core_tools_for(WindowTier::Compact);
+    schemas
+        .into_iter()
+        .filter(|s| {
+            let name = s.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("");
+            !CORE_TOOLS.contains(&name) || keep.contains(&name)
+        })
+        .collect()
 }
 
 /// What a turn cannot do without (raw estimate): its system messages, the
@@ -2242,9 +2265,9 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     // 2. Build session — try cache first, then DB
     let mut session = rt.load_session(conversation_id, "dashboard").await;
     super::context::strip_data_frames(&mut session.messages);
-    // TIER-HOOK: a Compact `tier` takes `context::persona_for(PromptTier::Compact)`
-    // here instead of the full persona (and the tier's core tools below).
-    let mut persona_prompt = rt.persona_prompt().await;
+    // A Compact tier sends the core persona (its safety rules included);
+    // the configured persona is the fallback when no prompts dir is found.
+    let mut persona_prompt = tier_persona(rt, tier).await;
     // Skills, runbooks and the cluster guidance are chosen from the user's
     // own words (a task's contract is not the user's; i658).
     let selection = super::selection_text_or(prompt);
@@ -2254,6 +2277,8 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     if !cluster_ctx.trim().is_empty() && super::context::ops_intent(&selection) {
         persona_prompt.push_str(super::context::CLUSTER_GUIDANCE);
     }
+    // Tool rules 7-9 ride with their tool groups (i802 persona split).
+    persona_prompt.push_str(&super::context::group_guidance(&super::context::selected_groups(prompt)));
     persona_prompt.push_str(super::context::CLOCK_RULE);
     session.set_system_prompt(&persona_prompt);
 
@@ -2281,8 +2306,8 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     // the prompt, the names go to usage recording. Splitting here keeps the
     // rest of this function reading as before.
     let (skills_ctx, selected_skill_names) = match skills_ctx {
-        Some((text, names)) => (Some(text), Some(names)),
-        None => (None, None),
+        Some((text, names)) if super::context::max_skills_for(tier) > 0 => (Some(text), Some(names)),
+        _ => (None, None),
     };
 
     let has_rag = rag_ctx.is_some();
@@ -2291,7 +2316,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     let has_video = video_ctx.is_some();
     let has_skills = skills_ctx.is_some();
     let has_companion = companion_ctx.is_some();
-    let runbook_ctx = rt.runbook_context(&selection);
+    let runbook_ctx = if super::context::runbooks_for(tier) { rt.runbook_context(&selection) } else { None };
     let has_runbook = runbook_ctx.is_some();
 
     // Record skill usage.
@@ -2311,8 +2336,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     // External MCP tools this caller may see join
     // the list before relevance selection, so they compete on equal terms.
     all_schemas.extend(rt.external_tool_schemas(user_id).await);
-    // TIER-HOOK: a Compact `tier` selects from that tier's core tools.
-    let mut tool_schemas = select_tool_schemas(&all_schemas, prompt);
+    let mut tool_schemas = tier_tools(select_tool_schemas(&all_schemas, prompt), tier);
 
     // Fit context window (configurable, defaults to max_model_len minus output reserve)
     let tool_toks = estimate_tool_tokens(&tool_schemas);
@@ -3508,11 +3532,9 @@ async fn run_inner_bound<R: HarnessRuntime>(
     // role spec alone, so appending would blend two personas and change the
     // behaviour these roles exist to produce. Cluster awareness still rides
     // along — it is situational fact, not persona.
-    // TIER-HOOK: with no role, a Compact `tier` takes
-    // `context::persona_for(PromptTier::Compact)` instead of the full persona.
     let mut persona_prompt = match role_prompt {
         Some(rp) => rp.to_string(),
-        None => rt.persona_prompt().await,
+        None => tier_persona(rt, tier).await,
     };
     // Skills, runbooks and the cluster guidance are chosen from the user's
     // own words (a task's contract is not the user's; i658).
@@ -3523,6 +3545,8 @@ async fn run_inner_bound<R: HarnessRuntime>(
     if !cluster_ctx.trim().is_empty() && super::context::ops_intent(&selection) {
         persona_prompt.push_str(super::context::CLUSTER_GUIDANCE);
     }
+    // Tool rules 7-9 ride with their tool groups (i802 persona split).
+    persona_prompt.push_str(&super::context::group_guidance(&super::context::selected_groups(prompt)));
     persona_prompt.push_str(super::context::CLOCK_RULE);
     session.set_system_prompt(&persona_prompt);
 
@@ -3552,14 +3576,14 @@ async fn run_inner_bound<R: HarnessRuntime>(
     // Split (injection_text, selected_names): text goes in the prompt, names
     // go to usage recording.
     let (skills_ctx, selected_skill_names) = match skills_ctx {
-        Some((text, names)) => (Some(text), Some(names)),
-        None => (None, None),
+        Some((text, names)) if super::context::max_skills_for(tier) > 0 => (Some(text), Some(names)),
+        _ => (None, None),
     };
     if let Some(names) = selected_skill_names.as_ref() {
         rt.record_skill_usage(names, conversation_id).await;
     }
 
-    let runbook_ctx = rt.runbook_context(&selection);
+    let runbook_ctx = if super::context::runbooks_for(tier) { rt.runbook_context(&selection) } else { None };
 
     session.add_user_message(prompt);
 
@@ -3568,8 +3592,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
     // External MCP tools this caller may see join
     // the list before relevance selection, so they compete on equal terms.
     all_schemas.extend(rt.external_tool_schemas(user_id).await);
-    // TIER-HOOK: a Compact `tier` selects from that tier's core tools.
-    let mut tool_schemas = select_tool_schemas(&all_schemas, prompt);
+    let mut tool_schemas = tier_tools(select_tool_schemas(&all_schemas, prompt), tier);
 
     let tool_toks = estimate_tool_tokens(&tool_schemas);
     let dropped_run = fit_context_window(&mut session.messages, fit_budget, tool_toks);
