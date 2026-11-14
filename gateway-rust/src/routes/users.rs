@@ -397,6 +397,8 @@ async fn user_disable(
     // Disable ends the account's sessions NOW: refresh chain, open sockets,
     // the not-before floor that kills the access JWT, the service-key cache.
     crate::session_floor::end_account_sessions(&state, &username, crate::session_floor::Reason::AccountChange).await;
+    // ... and its tasks stop now, a loop in flight on a harness cut (i779).
+    crate::tasks::stop_account_tasks(&state, &username).await;
     tracing::info!(user = %username, by = %by, "user_disabled");
     crate::audit::record(
         &state.db,
@@ -2222,6 +2224,9 @@ async fn proposal_decide(
             if action == "scopes" || (action == "disable" && result["disabled"].as_bool() == Some(true)) {
                 crate::session_floor::end_account_sessions(&state, &username, crate::session_floor::Reason::AccountChange).await;
             }
+            if action == "disable" && result["disabled"].as_bool() == Some(true) {
+                crate::tasks::stop_account_tasks(&state, &username).await;
+            }
             tracing::info!(id, action = %action, user = %username, by = %by, "proposal_approved");
             // `result` only — never `generated_password`. An approved `create`
             // mints a password and returns it once; putting it in the audit
@@ -3031,6 +3036,7 @@ async fn service_key_revoke_and_disable(
     // commit, so a concurrent resolve cannot re-cache the old row).
     crate::service_keys::invalidate_cache();
     crate::session_floor::end_account_sessions(&state, &username, crate::session_floor::Reason::AccountChange).await;
+    crate::tasks::stop_account_tasks(&state, &username).await;
 
     tracing::warn!(
         consumer = %consumer, user = %username, revoked,
@@ -3720,6 +3726,7 @@ async fn api_users_disable(
     .await;
     if outcome["disabled"].as_bool() == Some(true) {
         crate::session_floor::end_account_sessions(&state, username.trim(), crate::session_floor::Reason::AccountChange).await;
+        crate::tasks::stop_account_tasks(&state, username.trim()).await;
     }
     tracing::info!(user = %username.trim(), by = %by, "user_set_disabled (mesh-ui surface)");
     Ok(Json(outcome))
@@ -5833,6 +5840,24 @@ mod session_end_tests {
                 .unwrap_or_else(|| panic!("{sig} does not end the account's sessions"));
             assert!(e > w, "{sig}: sessions must end AFTER the change is written");
             assert!(body.contains("Reason::AccountChange"), "{sig}");
+        }
+    }
+
+    /// i779 (a security check): every route that DISABLES an account stops
+    /// its tasks and cuts their loops in flight, after the change is written.
+    #[test]
+    fn every_disabling_route_stops_the_accounts_tasks() {
+        let src = include_str!("users.rs");
+        for (sig, write) in [
+            ("async fn user_disable(", "set_disabled(&state.db"),
+            ("async fn api_users_disable(", "exec_user_set_disabled("),
+            ("async fn service_key_revoke_and_disable(", "set_disabled(&mut *tx"),
+            ("async fn proposal_decide(", "tx.commit().await?;\n            // An approved `scopes`"),
+        ] {
+            let body = handler(src, sig);
+            let w = body.find(write).unwrap_or_else(|| panic!("{sig}: write marker {write:?} missing"));
+            let stop = body.find("crate::tasks::stop_account_tasks(&state, ").unwrap_or_else(|| panic!("{sig} does not stop the account's tasks"));
+            assert!(stop > w, "{sig}: tasks must stop AFTER the account is disabled");
         }
     }
 
