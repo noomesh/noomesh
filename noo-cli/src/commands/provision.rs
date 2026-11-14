@@ -2980,6 +2980,8 @@ const NATS_PAIR_CHECK: &str = r#"nats_pair_ok() {
 
 struct LocalScript<'a> {
     node: &'a str,
+    /// Write DATA_ROOT_OWNER_FILE naming this uid (see owner_to_declare).
+    data_root_owner: Option<u32>,
     work: &'a Path,
     changed: &'a std::collections::BTreeSet<String>,
     prep: Option<&'a str>,
@@ -2991,10 +2993,39 @@ struct LocalScript<'a> {
 /// The one root script: host prep when it is not current, then only the
 /// pieces that changed, the secret-files conversion, the NATS pair check
 /// (fail loud, before any restart), and a restart only when needed.
+/// The local host's own statement of the one extra uid that may own its data
+/// root (node-agent dataroots.LocalOwnerFile). Written only here, on the
+/// controller's own host, inside the one sudo it already runs; no bundle kind
+/// and no applier path writes it (tests/test_data_root_owner_file_is_local.py).
+pub(crate) const DATA_ROOT_OWNER_FILE: &str = "/etc/noo/data-root-owner";
+
+/// The uid to declare: the data root's owner, only when that is the user
+/// running this (the operator) and not root (root needs no declaring). Pure.
+pub(crate) fn owner_to_declare(root_owner: Option<u32>, me: u32) -> Option<u32> {
+    root_owner.filter(|&u| u == me && u != 0)
+}
+
+/// Whether the file on disk already says what should be declared. Nothing to
+/// declare is always current: this never removes a file. Pure.
+pub(crate) fn owner_file_current(want: Option<u32>, on_disk: Option<&str>) -> bool {
+    match want {
+        None => true,
+        Some(uid) => on_disk.map(str::trim) == Some(uid.to_string().as_str()),
+    }
+}
+
 fn local_install_script(s: &LocalScript) -> String {
     let (node, w) = (s.node, s.work.display());
     let ch = |k: &str| s.changed.contains(k);
     let mut out = String::from("set -e\n");
+    if let Some(uid) = s.data_root_owner {
+        // Root-owned, 0644, written in place by a rename: the agent refuses
+        // anything else (dataroots.judgeLocalOwner).
+        out.push_str(&format!(
+            "mkdir -p /etc/noo\n( umask 022; printf '%s\\n' {uid} > {f}.next ) && chown root:root {f}.next && chmod 0644 {f}.next && mv -f {f}.next {f}\n",
+            f = DATA_ROOT_OWNER_FILE
+        ));
+    }
     if let Some(p) = s.prep {
         // The node identity with prep: a birth keypair when the box has none,
         // prep (installs it, arms the pull timer), the gateway's read-only
@@ -3278,9 +3309,17 @@ fn provision_local_in(g: &Globals, node: &str, tier: Option<&str>, root: &Path, 
     let changed = changed_kinds(&staged, &recorded);
     let active = Command::new("systemctl").args(["is-active", "--quiet", "noo-node-agent"])
         .status().map(|s| s.success()).unwrap_or(false);
+    // i677: the self-agent's data root is the operator's; declare that owner
+    // to the agent in the root-owned local file, when it really is so. Due
+    // when missing or different: then the ONE sudo below runs and writes it.
+    let declare_owner = {
+        use std::os::unix::fs::MetadataExt;
+        owner_to_declare(std::fs::metadata(&data_root).ok().map(|m| m.uid()), unsafe { libc::getuid() })
+    };
+    let owner_due = !owner_file_current(declare_owner, std::fs::read_to_string(DATA_ROOT_OWNER_FILE).ok().as_deref());
     let needs_nats_render = changed.contains("nats-creds");
 
-    if prep_cmd.is_none() && changed.is_empty() && active {
+    if prep_cmd.is_none() && changed.is_empty() && active && !owner_due {
         nstep("host agent, certs and credential are current; host prep is current — nothing to install (no sudo)");
     } else {
         if needs_nats_render {
@@ -3312,7 +3351,7 @@ fn provision_local_in(g: &Globals, node: &str, tier: Option<&str>, root: &Path, 
             if prep_cmd.is_some() { "; host prep and the pull units" } else { "" },
             if what.is_empty() { String::new() } else { format!("; changed: {}", what.join(", ")) }));
         let script = local_install_script(&LocalScript {
-            node, work: &work, changed: &changed, prep: prep_cmd.as_deref(), secret_files: &asf,
+            node, data_root_owner: if owner_due { declare_owner } else { None }, work: &work, changed: &changed, prep: prep_cmd.as_deref(), secret_files: &asf,
             leaves: &leaves.iter().map(|(k, _)| k.to_string()).collect::<Vec<_>>(),
             restart: !changed.is_empty() || !active,
         });
@@ -6393,9 +6432,40 @@ mod local_lane_tests {
         let changed: std::collections::BTreeSet<String> = changed.iter().map(|s| s.to_string()).collect();
         let leaves = vec!["svc-vllm.crt".to_string(), "svc-vllm.key".to_string()];
         local_install_script(&LocalScript {
-            node: "ctrl", work: Path::new("/w"), changed: &changed, prep: None,
+            node: "ctrl", data_root_owner: None, work: Path::new("/w"), changed: &changed, prep: None,
             secret_files: "", leaves: &leaves, restart,
         })
+    }
+
+    /// i677: the local self-install declares the data root's owner to the agent
+    /// only when the root really is the operator's (never root, never another
+    /// uid), and writes the file root-owned 0644 by a rename. Never a delete.
+    #[test]
+    fn the_local_install_declares_the_operators_data_root_only_when_it_owns_it() {
+        assert_eq!(owner_to_declare(Some(1001), 1001), Some(1001));
+        assert_eq!(owner_to_declare(Some(999), 1001), None, "a root owned by the agent account needs nothing");
+        assert_eq!(owner_to_declare(Some(0), 0), None, "root needs no declaring");
+        assert_eq!(owner_to_declare(None, 1001), None, "an unreadable root declares nothing");
+        assert!(owner_file_current(None, None) && owner_file_current(None, Some("1002\n")), "nothing to declare never deletes");
+        assert!(owner_file_current(Some(1001), Some("1001\n")));
+        assert!(!owner_file_current(Some(1001), None) && !owner_file_current(Some(1001), Some("1002")));
+        let changed = std::collections::BTreeSet::new();
+        let s = local_install_script(&LocalScript {
+            node: "ctrl", data_root_owner: Some(1001), work: Path::new("/w"), changed: &changed, prep: None,
+            secret_files: "", leaves: &[], restart: false,
+        });
+        assert!(s.contains(&format!("printf '%s\\n' 1001 > {DATA_ROOT_OWNER_FILE}.next")), "{s}");
+        assert!(s.contains(&format!("chown root:root {DATA_ROOT_OWNER_FILE}.next && chmod 0644 {DATA_ROOT_OWNER_FILE}.next && mv -f")));
+        let none = local_install_script(&LocalScript {
+            node: "ctrl", data_root_owner: None, work: Path::new("/w"), changed: &changed, prep: None,
+            secret_files: "", leaves: &[], restart: false,
+        });
+        assert!(!none.contains(DATA_ROOT_OWNER_FILE), "no owner to declare: the script never touches the file");
+        // The ONE sudo runs when the file is due, and the script writes it then.
+        let own = crate::test_src::own_code(include_str!("provision.rs"));
+        let body = crate::test_src::fn_body(&own, "fn provision_local_in(");
+        assert!(body.contains("if prep_cmd.is_none() && changed.is_empty() && active && !owner_due {"));
+        assert!(body.contains("data_root_owner: if owner_due { declare_owner } else { None }"));
     }
 
     #[test]
@@ -6465,7 +6535,7 @@ mod local_lane_tests {
     fn the_first_install_leaves_the_pull_units_behind() {
         let changed = std::collections::BTreeSet::new();
         let s = local_install_script(&LocalScript {
-            node: "ctrl", work: Path::new("/w"), changed: &changed, prep: Some("PREP_LINE\n"),
+            node: "ctrl", data_root_owner: None, work: Path::new("/w"), changed: &changed, prep: Some("PREP_LINE\n"),
             secret_files: "", leaves: &[], restart: false,
         });
         assert!(s.contains(&self_identity_script("ctrl", Path::new("/w"), Path::new("/etc/noo"), "PREP_LINE\n")), "{s}");

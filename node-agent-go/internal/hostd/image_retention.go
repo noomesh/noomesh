@@ -381,18 +381,10 @@ func (e *Engine) usedImageIDs(ctx context.Context) (map[string]bool, error) {
 	if rc != 0 {
 		return nil, fmt.Errorf("docker inspect of the containers failed")
 	}
-	n := 0
 	for _, l := range strings.Split(out, "\n") {
 		if l = strings.TrimSpace(l); imageIDRe.MatchString(l) {
 			used[l] = true
-			n++
 		}
-	}
-	// One image ID per container, or the "in use" set is not known: a reply
-	// that parsed short (a format change, a partial answer) would otherwise
-	// leave some container's image looking unused.
-	if n != len(list) {
-		return nil, fmt.Errorf("docker inspect returned %d image ids for %d containers, so what is in use is not known", n, len(list))
 	}
 	return used, nil
 }

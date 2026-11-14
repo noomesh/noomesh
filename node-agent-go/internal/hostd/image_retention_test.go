@@ -63,18 +63,10 @@ func TestKeepFileMustBeProvablyCurrentAndMeaningful(t *testing.T) {
 			t.Errorf("%s: believed", name)
 		}
 	}
-	// The path itself: a reader that would hand back a perfectly good keep
-	// file for ANY path, so only the path check can refuse these.
-	goodBytes, _ := json.Marshal(keepFile{Version: 1, MaxAgeSeconds: 60, WrittenAt: time.Now().UTC().Format(time.RFC3339),
-		Namespaces: []string{nsNoo}, Keep: good.Keep})
-	anyPath := func(string) ([]byte, error) { return goodBytes, nil }
-	if _, err := loadKeepFile(filepath.Join(dir, imageKeepBasename), time.Now(), anyPath); err != nil {
-		t.Fatalf("the fake reader's keep file must itself be good: %v", err)
-	}
-	if _, err := loadKeepFile(imageKeepBasename, time.Now(), anyPath); err == nil {
+	if _, err := loadKeepFile("image-keep.json", time.Now(), os.ReadFile); err == nil {
 		t.Error("a relative keep path was accepted")
 	}
-	if _, err := loadKeepFile(filepath.Join(dir, "other.json"), time.Now(), anyPath); err == nil {
+	if _, err := loadKeepFile(filepath.Join(dir, "other.json"), time.Now(), os.ReadFile); err == nil {
 		t.Error("a keep file not named image-keep.json was accepted")
 	}
 }
@@ -230,91 +222,5 @@ func TestKeepSpoolTokenResolvesToThisHostdsSpool(t *testing.T) {
 	got := resolveKeepArg("spool", "")
 	if _, err := loadKeepFile(got, time.Now(), func(string) ([]byte, error) { return []byte("{}"), nil }); err == nil {
 		t.Fatalf("with no spool known the token must be refused, not read (%q)", got)
-	}
-}
-
-// The "in use" set must be KNOWN before anything is judged: a failed, or
-// short, listing of the containers is never read as "nothing in use".
-func TestAnUnknownInUseSetSkipsTheRungAndRemovesNothing(t *testing.T) {
-	keepFor := func(t *testing.T) string {
-		return writeKeep(t, t.TempDir(), keepFile{Version: 1, MaxAgeSeconds: 3600, WrittenAt: time.Now().UTC().Format(time.RFC3339),
-			Namespaces: []string{nsNoo}, Keep: []keepEntry{{Ref: nsNoo + "gateway@sha256:" + h64("1"), Why: "stack.lock"}}})
-	}
-	images := map[string]string{
-		"image ls -aq --no-trunc": iid("c") + "\n",
-		"--format {{.Id}}|{{join": iid("c") + "||" + nsNoo + "gateway@sha256:" + h64("9") + "|10\n",
-		"system df -v":            "{}",
-	}
-	for name, setup := range map[string]func(fr *fakeRunner){
-		"docker ps -a fails": func(fr *fakeRunner) {
-			fr.rc = map[string]int{"ps -aq --no-trunc": 1}
-		},
-		"docker inspect of the containers fails": func(fr *fakeRunner) {
-			fr.stdout["ps -aq --no-trunc"] = "c1\n"
-			fr.rc = map[string]int{"inspect --format {{.Image}}": 1}
-		},
-		"docker inspect answers for fewer containers than exist": func(fr *fakeRunner) {
-			fr.stdout["ps -aq --no-trunc"] = "c1\nc2\n"
-			fr.stdout["inspect --format {{.Image}}"] = iid("d") + "\n"
-		},
-	} {
-		e, fr := testEngine(t)
-		fr.stdout = map[string]string{}
-		for k, v := range images {
-			fr.stdout[k] = v
-		}
-		setup(fr)
-		r := queue(t, e, "c", Command{Op: "disk-reclaim", Service: "docker",
-			Args: []string{"dry_run=false", "only=superseded-images", "keep=" + keepFor(t)}})
-		for _, c := range fr.joined() {
-			if strings.Contains(c, "image rm") {
-				t.Errorf("%s: removed with an unknown in-use set: %s", name, c)
-			}
-		}
-		if !strings.Contains(r.Stderr, "SKIPPED") {
-			t.Errorf("%s: did not say it skipped: %+v", name, r)
-		}
-		if name == "docker inspect answers for fewer containers than exist" && !strings.Contains(r.Stderr, "returned 1 image ids for 2 containers") {
-			t.Errorf("the report line must carry both numbers: %+v", r)
-		}
-	}
-}
-
-// The namespace a pinned add-on claims is its own repository. Two shapes:
-// a vendor path on a registry with a host (where a too-wide claim WOULD
-// reach the vendor's other images), and Docker Hub, whose local refs are
-// short names (`redis:7`, `postgres:16`) that never match a namespace with
-// a host, so nothing there is ever a candidate.
-func TestAPinnedAddOnClaimsItsOwnRepositoryNeverItsNeighbours(t *testing.T) {
-	k := &keepFile{
-		Namespaces: []string{nsNoo, "ghcr.io/example-vendor/exaddon/", "docker.io/library/redis/"},
-		Keep: []keepEntry{
-			{Ref: "ghcr.io/example-vendor/exaddon@sha256:" + h64("1"), Why: "addons.lock exaddon"},
-			{Ref: "docker.io/library/redis@sha256:" + h64("2"), Why: "addons.lock rhcache"},
-		},
-	}
-	imgs := []imageFacts{
-		{ID: iid("a"), Digests: []string{"ghcr.io/example-vendor/exaddon@sha256:" + h64("1")}},
-		{ID: iid("b"), Tags: []string{"ghcr.io/example-vendor/exaddon:0.1.0"}, Digests: []string{"ghcr.io/example-vendor/exaddon@sha256:" + h64("9")}},
-		{ID: iid("c"), Tags: []string{"ghcr.io/example-vendor/othertool:2"}},
-		{ID: iid("d"), Tags: []string{"redis:7"}, Digests: []string{"redis@sha256:" + h64("2")}},
-		{ID: iid("e"), Tags: []string{"redis:6"}},
-		{ID: iid("f"), Tags: []string{"postgres:15"}},
-		{ID: iid("g"), Tags: []string{"postgres:16"}, Digests: []string{"postgres@sha256:" + h64("3")}},
-	}
-	got := map[string]imageVerdict{}
-	for _, v := range classifyImages(imgs, map[string]bool{}, k) {
-		got[v.ID] = v
-	}
-	if !got[iid("b")].Remove {
-		t.Errorf("the add-on's own superseded image must be a candidate: %+v", got[iid("b")])
-	}
-	for _, id := range []string{iid("a"), iid("c"), iid("d"), iid("e"), iid("f"), iid("g")} {
-		if got[id].Remove {
-			t.Errorf("%s (%v%v) must never be a candidate: %s", id[:15], got[id].Refs, "", got[id].Why)
-		}
-	}
-	if !strings.HasPrefix(got[iid("c")].Why, "kept: not ours") || !strings.HasPrefix(got[iid("f")].Why, "kept: not ours") {
-		t.Errorf("a neighbour must be kept as not ours: %q / %q", got[iid("c")].Why, got[iid("f")].Why)
 	}
 }

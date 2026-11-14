@@ -100,8 +100,8 @@ id in a subject has `.`, `*`, `>` and spaces replaced by `_`.
 | Subject | Payload | Source |
 |---|---|---|
 | `harness.run.<node>` | a turn, `TurnRequest` | `coordinator/dispatch.rs` |
-| `harness.task.<node>` | a task, `TaskRequest`; or a stop, `{"stop": "<task id>"}` (since 0.6.25) | `tasks.rs` |
-| `harness.ready.<node>` | published by the harness: `{"node": "<id>"}`; after a task ends, `"slot_freed": true`, with `"stalled": [ids]` or `"cut": [ids]` when it ended them | `tasks.rs` |
+| `harness.task.<node>` | a task, `TaskRequest` | `tasks.rs` |
+| `harness.ready.<node>` | published by the harness: `{"node": "<id>"}` | `tasks.rs` |
 
 `TurnRequest` fields: `conversation_id`, `prompt`, `channel`,
 `max_iterations`, `model` (optional), `user`, `enable_thinking` (default
@@ -348,13 +348,6 @@ must not execute gated tools locally.
 10. For a task, run up to `loop_budget - loops_done` loops, calling
     `task_checkpoint` after each, and stop when the returned `state` is not
     `running` or `checkpointed` or the budget is reached.
-    On `{"stop": "<task id>"}` for a task you are running, end it now: cut
-    the loop in flight (its model request and any CLI child) without a
-    checkpoint, free its slot, and publish `harness.ready.<node>` with
-    `{"node", "slot_freed": true, "cut": ["<task id>"]}`. The gateway has
-    already set the task `stopped`; it records that the loop was cut and
-    hands the node's queued tasks back. A stop for a task you do not hold
-    is ignored.
 11. Never re-run a turn, and never publish on another node's subjects.
 
 ### Wire translator

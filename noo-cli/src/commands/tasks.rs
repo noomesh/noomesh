@@ -304,18 +304,13 @@ pub fn tasks_stop(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(0)
 }
 
-/// What a stop did, from the gateway's answer (i227 fix 3, i779): a task on
-/// a node's harness (`cut` true) is stopped and the loop it was running is
-/// cut now; a task with a loop in flight in process (`was` running, no cut)
-/// ends that loop at its next checkpoint; any other live task is stopped
-/// now. A gateway older than 0.6.13 sends no `was`, and the old wording
-/// stands; one older than 0.6.25 sends no `cut`. Pure.
+/// What a stop did, from the gateway's answer (i227 fix 3): a task with a
+/// loop in flight (`was` running) is stopped and that loop ends at its next
+/// checkpoint; any other live task is stopped now. A gateway older than
+/// 0.6.13 sends no `was`, and the old wording stands. Pure.
 pub(crate) fn stop_outcome(id: &str, resp: &serde_json::Value) -> (bool, String) {
     if resp["stopped"].as_bool() != Some(true) {
         return (false, format!("task {id} was not running"));
-    }
-    if resp["cut"].as_bool() == Some(true) {
-        return (true, format!("task {id} is stopped; the loop it was running is cut now (nothing after its last checkpoint is kept)"));
     }
     match resp["was"].as_str() {
         Some("running") => (true, format!("task {id} is stopped; the loop it is running ends at its next checkpoint")),
@@ -492,12 +487,6 @@ mod stop_outcome_tests {
     fn a_stop_says_whether_a_loop_was_in_flight() {
         let r = |v: serde_json::Value| stop_outcome("t1", &v);
         assert_eq!(r(json!({"stopped": true, "was": "running"})), (true, "task t1 is stopped; the loop it is running ends at its next checkpoint".into()));
-        assert_eq!(r(json!({"stopped": true, "was": "running", "cut": false})), (true, "task t1 is stopped; the loop it is running ends at its next checkpoint".into()), "in process: no cut");
-        // i779: on a node's harness the loop in flight is cut, and the line says so
-        assert_eq!(
-            r(json!({"stopped": true, "was": "running", "cut": true})),
-            (true, "task t1 is stopped; the loop it was running is cut now (nothing after its last checkpoint is kept)".into())
-        );
         assert_eq!(r(json!({"stopped": true, "was": "open"})), (true, "task t1 stopped now (it was open, with no loop in flight)".into()));
         assert_eq!(r(json!({"stopped": true})), (true, "task t1 will stop at its next checkpoint".into()), "an older gateway");
         assert_eq!(r(json!({"stopped": false, "was": "done"})), (false, "task t1 was not running".into()));

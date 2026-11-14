@@ -429,36 +429,6 @@ where
     sqlx::query_scalar("SELECT perspective FROM noo_tasks WHERE id = $1").bind(id).fetch_optional(db).await
 }
 
-/// i779: the live tasks an account owns — `(id, node, state)`, children
-/// included and with no page limit (a disabled account's stop must reach
-/// every one).
-pub async fn live_of_owner<'e, E>(db: E, owner: &str) -> Result<Vec<(Uuid, Option<String>, String)>, sqlx::Error>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    sqlx::query_as::<_, (Uuid, Option<String>, String)>(
-        "SELECT t.id, t.node, t.state FROM noo_tasks t JOIN noo_users u ON u.user_uuid = t.owner_uuid \
-         WHERE u.username = $1 AND t.state IN ('open','running','checkpointed') ORDER BY t.created_at",
-    )
-    .bind(owner)
-    .fetch_all(db)
-    .await
-}
-
-/// i779: say that a stopped task's loop was cut. Only a task that is
-/// `stopped` is written; returns the rows changed.
-pub async fn note_cut<'e, E>(db: E, id: Uuid, note: &str) -> Result<u64, sqlx::Error>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    Ok(sqlx::query("UPDATE noo_tasks SET last_note = $2, updated_at = now() WHERE id = $1 AND state = 'stopped'")
-        .bind(id)
-        .bind(note)
-        .execute(db)
-        .await?
-        .rows_affected())
-}
-
 #[cfg(test)]
 mod tests {
     /// Asking must not park the task mid-turn: only the boundary sets

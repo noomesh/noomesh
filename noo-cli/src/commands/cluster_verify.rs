@@ -1658,8 +1658,16 @@ pub(crate) fn data_root_policy_row(n: &Value) -> Option<Check> {
     // DECLARE where it already is, never to move it.
     let only_undeclared = codes.contains(&"undeclared_root")
         && codes.iter().all(|c| matches!(*c, "undeclared_root" | "wrong_owner" | "writable_by_others"));
+    // The controller's own node on a one-machine install: its data root is the
+    // operator's (their tools write there), so the fix is never a chown; it is
+    // declaring that owner to the agent in the local root-owned file, which the
+    // local self-install writes (i677, provision.rs DATA_ROOT_OWNER_FILE).
+    let self_owned_by_operator = n["self_node"].as_bool() == Some(true) && codes == ["wrong_owner"];
     let remedy = if only_undeclared {
         format!("noo cluster set-config {id} --data-root {root} && noo cluster provision {id} --wait")
+    } else if self_owned_by_operator {
+        "noo onboard --only services (declares your data root to the agent in /etc/noo/data-root-owner; asks for sudo once)"
+            .to_string()
     } else if only_ownership {
         format!("on {id}: sudo install -d -o noo-agent -g noo-agent {root} && sudo chmod go-w {root}")
     } else {
@@ -12854,6 +12862,22 @@ mod config_mount_tests {
         assert_eq!(c.verdict, super::Verdict::Fail);
         assert!(c.remedy.as_deref().unwrap().contains("--move-data"), "{:?}", c.remedy);
         assert!(c.remedy.as_deref().unwrap().contains("'/Users/x/noomesh'"), "{:?}", c.remedy);
+    }
+
+    /// i677: on the controller's own node the operator owns the data root; the
+    /// remedy declares that (the local owner file), never a chown.
+    #[test]
+    fn the_self_nodes_operator_owned_root_is_declared_not_chowned() {
+        use serde_json::json;
+        let n = json!({"id": "box", "self_node": true, "data_roots": {"noo_data_root": "/var/lib/noo",
+            "policy": {"mode": "warn", "ok": false, "problems": [{"code": "wrong_owner", "detail": "owned by uid 1001"}]}}});
+        let r = super::data_root_policy_row(&n).unwrap().remedy.unwrap();
+        assert!(r.starts_with("noo onboard --only services") && r.contains("/etc/noo/data-root-owner") && r.contains("sudo once"), "{r}");
+        assert!(!r.contains("install -d -o noo-agent"), "{r}");
+        // Another problem beside it keeps the general remedy.
+        let both = json!({"id": "box", "self_node": true, "data_roots": {"noo_data_root": "/var/lib/noo",
+            "policy": {"mode": "warn", "ok": false, "problems": [{"code": "wrong_owner", "detail": "x"}, {"code": "writable_by_others", "detail": "y"}]}}});
+        assert!(!super::data_root_policy_row(&both).unwrap().remedy.unwrap().starts_with("noo onboard"));
     }
 
     #[test]
