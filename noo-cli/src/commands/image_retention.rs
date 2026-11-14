@@ -20,9 +20,12 @@
 //! * every image ID the artifact rail staged (`staged-images.json`).
 //!
 //! The namespaces that make an image OURS are the registry roots our images
-//! are pulled from: the release roots ([`crate::registry::rail_roots`]) and
-//! the root of each pinned add-on image. Local builds and anything else are
-//! never named, so hostd never treats them as ours.
+//! are pulled from ([`crate::registry::rail_roots`]) and, for each pinned
+//! add-on image, that image's OWN repository and nothing wider: an add-on
+//! pinned at `docker.io/library/redis@sha256:…` must not make every
+//! `docker.io/library/*` image the operator pulled look like ours. Local
+//! builds and anything else are never named, so hostd never treats them as
+//! ours.
 //!
 //! The keep file proves it is current by naming its sources with their
 //! SHA-256: hostd re-hashes them, and a lock that moved since makes it stale,
@@ -71,15 +74,15 @@ pub(crate) fn stack_lock_tag(text: &str) -> Option<String> {
     text.lines().find_map(|l| l.trim().strip_prefix("# tag ").map(|t| t.trim().to_string()))
 }
 
-/// `ghcr.io/example-vendor/exaddon@sha256:…` -> `ghcr.io/example-vendor/`: the
-/// namespace a pinned image sits in (everything up to its last path part).
+/// `ghcr.io/example-vendor/exaddon@sha256:…` -> `ghcr.io/example-vendor/exaddon/`:
+/// the namespace a pinned image claims is its own repository, never the
+/// vendor's (or Docker Hub's `library/`) whole path.
 pub(crate) fn namespace_of(reference: &str) -> Option<String> {
     let name = reference.split('@').next()?;
-    let (ns, _) = name.rsplit_once('/')?;
+    let (host, _) = name.split_once('/')?;
     // A namespace must name a registry host: `x/y` alone is a Docker Hub
     // short name, which this never claims.
-    let host = ns.split('/').next()?;
-    (host.contains('.') || host.starts_with("localhost")).then(|| format!("{ns}/"))
+    (host.contains('.') || host.starts_with("localhost")).then(|| format!("{name}/"))
 }
 
 /// What the keep file is built from, read from the install root.
@@ -441,7 +444,7 @@ mod tests {
         // Every entry is an exact digest or an image id: never a bare name.
         assert!(keep.iter().all(|(k, _)| k.contains("@sha256:") || k.starts_with("sha256:")));
         let ns: Vec<&str> = v["namespaces"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
-        assert_eq!(ns, vec!["addons.example.net/x/", "ghcr.io/example-vendor/", "ghcr.io/noomesh/"]);
+        assert_eq!(ns, vec!["addons.example.net/x/rhaddon/", "ghcr.io/example-vendor/exaddon/", "ghcr.io/noomesh/"]);
         let srcs: Vec<&str> = v["sources"].as_array().unwrap().iter().filter_map(|s| s["path"].as_str()).collect();
         assert_eq!(srcs, vec!["/r/stack.lock", "/r/stack.lock.prev", "/r/addons.lock", "/r/addons.lock.prev", "/s/staged-images.json"]);
     }
@@ -462,8 +465,10 @@ mod tests {
 
     #[test]
     fn a_namespace_needs_a_registry_host() {
-        assert_eq!(namespace_of(&format!("ghcr.io/example-vendor/exaddon@sha256:{}", h('a'))).as_deref(), Some("ghcr.io/example-vendor/"));
-        assert_eq!(namespace_of(&format!("localhost:5000/rh/rhaddon@sha256:{}", h('a'))).as_deref(), Some("localhost:5000/rh/"));
+        assert_eq!(namespace_of(&format!("ghcr.io/example-vendor/exaddon@sha256:{}", h('a'))).as_deref(), Some("ghcr.io/example-vendor/exaddon/"));
+        assert_eq!(namespace_of(&format!("localhost:5000/rh/rhaddon@sha256:{}", h('a'))).as_deref(), Some("localhost:5000/rh/rhaddon/"));
+        // The pinned image's own repository, never the shared path it sits in.
+        assert_eq!(namespace_of(&format!("docker.io/library/redis@sha256:{}", h('a'))).as_deref(), Some("docker.io/library/redis/"));
         assert_eq!(namespace_of(&format!("someuser/img@sha256:{}", h('a'))), None, "a Docker Hub short name is never claimed");
     }
 
