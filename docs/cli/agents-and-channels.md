@@ -23,7 +23,11 @@ noo chat --model qwen2.5:7b-instruct --message "one line: what is a placement?"
 ```
 
 The REPL probes `/health` first, then streams each turn over
-`POST /api/inference/stream` (SSE); the banner says `gateway <url> ·
+`POST /api/inference/chat` (SSE): the same turn as the web console's chat,
+with your documents, memory and tools, as the signed-in user. A tool that
+needs approval is named with where to approve it (the console, or
+`noo approval approve <id>`); the turn waits for the approval window, then
+ends with exit 5. The banner says `gateway <url> ·
 /exit or /quit ends the conversation`, the backend that answered shows on
 stderr as `[vllm · qwen…]`. `--message` is one turn and returns; with
 `--json` it prints `{"response","backend","conversation_id"}`. A pipe
