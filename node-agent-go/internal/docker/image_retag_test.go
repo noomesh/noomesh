@@ -146,3 +146,35 @@ func TestPullImageArtifactRetagsBeforeFetching(t *testing.T) {
 		t.Fatal("the re-tag ignores the caller's controllerImageID")
 	}
 }
+
+// i675 F7: `noo cluster sync-images` on a node whose image store is the
+// other type (containerd vs classic). The manifest's image_id is the
+// CONTROLLER's ID (the classic config digest), which this node never holds;
+// the node's own ID for that exact tar is in its rail memory. The re-run must
+// be answered from that memory: tag (a no-op when ref already names it),
+// confirm, nothing fetched.
+func TestRetagVouchedUsesTheRailMemoryAcrossImageStoreTypes(t *testing.T) {
+	memFile := t.TempDir() + "/rail/images.json"
+	prev := railMemoryPath
+	railMemoryPath = func() string { return memFile }
+	resetRailMemory()
+	t.Cleanup(func() { railMemoryPath = prev; resetRailMemory() })
+
+	sha := strings.Repeat("e", 64)
+	controllerID := "sha256:" + strings.Repeat("c", 64) // classic store, on the controller
+	nodeID := "sha256:" + strings.Repeat("d", 64)       // containerd store, on this node
+	rememberRailImage(sha, nodeID)
+	resetRailMemory() // read back from disk, as after an agent restart
+
+	st := &idStore{names: map[string]string{retagNew: nodeID, nodeID: nodeID}, arch: runtime.GOARCH}
+	id, ok := retagVouched(context.Background(), st, retagNew, &artifactManifest{ImageID: controllerID, SHA256: sha})
+	if !ok || id != nodeID {
+		t.Fatalf("a node on the other store type must use the ID it loaded from this tar: id %q ok %v", id, ok)
+	}
+
+	// Without that memory (another tar, or a distrusted file) it fetches.
+	st2 := &idStore{names: map[string]string{retagNew: nodeID, nodeID: nodeID}, arch: runtime.GOARCH}
+	if _, ok := retagVouched(context.Background(), st2, retagNew, &artifactManifest{ImageID: controllerID, SHA256: strings.Repeat("f", 64)}); ok {
+		t.Fatal("an ID this node never recorded for this tar must not be trusted")
+	}
+}
