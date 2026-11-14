@@ -403,20 +403,47 @@ fn loki_leaf_present() -> bool {
 }
 
 /// The `loki` row as `cluster verify` prints it: `loki_check`, judged for
-/// warm-up against `docker inspect <prefix>-loki`.
-pub(crate) fn loki_row(g: &Globals, now_unix: i64) -> Check {
-    loki_row_seen(g, now_unix).0
+/// warm-up against `docker inspect <prefix>-loki`. `lean`: Loki is off by
+/// choice (`cluster.monitoring: lean`, see `off_by_choice`).
+pub(crate) fn loki_row(g: &Globals, now_unix: i64, lean: bool) -> Check {
+    loki_row_seen(g, now_unix, lean).0
 }
 
 /// [`loki_row`] plus what it was judged on (for `--json`'s `warmup`).
-pub(crate) fn loki_row_seen(g: &Globals, now_unix: i64) -> (Check, Option<WarmupSeen>) {
-    let leaf = loki_leaf_present();
-    let status = crate::http::get_json_opt(g, "/api/logs/status", true, 10);
+pub(crate) fn loki_row_seen(g: &Globals, now_unix: i64, lean: bool) -> (Check, Option<WarmupSeen>) {
+    loki_row_from(
+        lean,
+        || (loki_leaf_present(), crate::http::get_json_opt(g, "/api/logs/status", true, 10)),
+        inspect,
+        now_unix,
+    )
+}
+
+/// [`loki_row_seen`] over its reads: `read` gives (leaf present, the
+/// gateway's `/api/logs/status`), `inspect` the container. On `lean` the row
+/// is "not installed by choice" and neither is called, so an upgrade is
+/// never held in "starting" for a Loki that is off on purpose.
+pub(crate) fn loki_row_from(
+    lean: bool,
+    read: impl FnOnce() -> (bool, Option<Value>),
+    inspect: impl FnOnce(&str) -> Inspected,
+    now_unix: i64,
+) -> (Check, Option<WarmupSeen>) {
+    if lean {
+        return (super::off_by_choice::row("loki"), None);
+    }
+    let (leaf, status) = read();
     let check = super::loki_check(status.as_ref(), leaf);
     let miss = loki_readiness_miss(status.as_ref(), leaf);
     let container = crate::envfile::container("loki");
     let inspected = if check.verdict == Verdict::Fail { Some(inspect(&container)) } else { None };
     judge_loki(check, miss, &container, inspected.as_ref(), now_unix)
+}
+
+/// Does `--wait` still wait on the `loki` row? Never when Loki is off by
+/// choice: `row` (a gateway read and a docker inspect) is not even run.
+pub(crate) fn warmup_pending(lean: bool, row: impl FnOnce() -> Check) -> bool {
+    !lean && row().verdict == Verdict::Starting
 }
 
 /// Poll until `starting()` is false or `cap_secs` have passed on `clock`.
@@ -442,8 +469,8 @@ pub(crate) fn wait_until_settled(
 
 /// `cluster verify --wait`: hold the verdict until no warm-up row is
 /// starting, or the cap. Prints one line either way (never in `--json`).
-pub(crate) fn wait_for_warmup(g: &Globals) {
-    let mut starting = || loki_row(g, super::now_unix()).verdict == Verdict::Starting;
+pub(crate) fn wait_for_warmup(g: &Globals, lean: bool) {
+    let mut starting = || warmup_pending(lean, || loki_row(g, super::now_unix(), lean));
     let settled = wait_until_settled(&mut starting, WAIT_CAP_SECS, &super::now_unix, &mut |s| {
         std::thread::sleep(std::time::Duration::from_secs(s))
     });

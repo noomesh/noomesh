@@ -11,6 +11,7 @@
 //! shape as the `loki` / `loki listener` pair.
 
 use super::{fail, ok, warn, Check};
+use crate::commands::stack_monitoring::Status;
 use crate::Globals;
 use serde_json::Value;
 
@@ -128,13 +129,25 @@ pub(crate) fn tempo_listener_check(config: Option<&str>, compose: Option<&str>) 
     ok(LISTENER_ROW, "client certificate required on OTLP and the query API; gRPC on loopback; usage reporting off; no published port")
 }
 
-/// Both rows, as `cluster verify --controller` prints them.
-pub(crate) fn rows(g: &Globals) -> Vec<Check> {
-    let status = crate::http::get_json_opt(g, "/api/traces/status", true, 10);
+/// The `tempo` row over its reads (`read` gives the gateway's
+/// `/api/traces/status` and whether the leaf is present): "not installed by
+/// choice" on a lean install, and then nothing is read.
+pub(crate) fn row_from(monitoring: &Status, read: impl FnOnce() -> (Option<Value>, bool)) -> Check {
+    super::off_by_choice::or_judge(ROW, monitoring, || {
+        let (status, leaf) = read();
+        tempo_check(status.as_ref(), leaf)
+    })
+}
+
+/// Both rows, as `cluster verify --controller` prints them. The listener
+/// row judges the shipped config and compose file even while Tempo is off
+/// by choice: they govern Tempo the moment it is turned on.
+pub(crate) fn rows(g: &Globals, monitoring: &Status) -> Vec<Check> {
     let root = crate::envfile::repo_root();
     let config = std::fs::read_to_string(root.join(CONFIG_PATH)).ok();
     let compose = std::fs::read_to_string(root.join("docker-compose.cluster.yml")).ok();
-    vec![tempo_check(status.as_ref(), leaf_present()), tempo_listener_check(config.as_deref(), compose.as_deref())]
+    let tempo = row_from(monitoring, || (crate::http::get_json_opt(g, "/api/traces/status", true, 10), leaf_present()));
+    vec![tempo, tempo_listener_check(config.as_deref(), compose.as_deref())]
 }
 
 #[cfg(test)]

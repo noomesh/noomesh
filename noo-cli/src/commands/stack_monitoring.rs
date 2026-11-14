@@ -359,6 +359,14 @@ pub(crate) fn effective_lean_live(root: &Path) -> bool {
     status_of(&facts_live(root)).effective == Level::Lean
 }
 
+/// What runs on this install, read the way `status` reads it: the
+/// declaration in `root`/noomesh.yaml through [`declared_in`] + [`level_of`]
+/// (unset = full), then the shadows. `noo cluster verify` judges its
+/// Grafana, Loki and Tempo rows by this, never by a parser of its own.
+pub(crate) fn status_live(root: &Path) -> Status {
+    status_of(&facts_live(root))
+}
+
 fn state_root_live() -> String {
     crate::commands::at_rest_volume::resolve_state_root(&|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
 }
