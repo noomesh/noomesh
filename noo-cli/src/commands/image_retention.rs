@@ -338,35 +338,62 @@ fn run_rung(root: &Path, keep: &Path, live: bool) -> Result<Value, String> {
 /// superseded images that are provably ours. Never fails the roll; every
 /// outcome is one line.
 pub(crate) fn post_roll(g: &crate::Globals, root: &Path, tag: &str) {
-    let say = |line: &str| {
-        if !g.json {
-            println!("{}", crate::ui::note(line));
-        }
-    };
     let set = setting(root);
     let previewed = root.join(PREVIEWED_MARKER).is_file();
-    let m = mode(set.as_deref(), previewed);
+    let mut host = LivePostRoll { g, root };
+    post_roll_on(&mut host, set.as_deref(), previewed, tag);
+}
+
+/// The post-roll verify's outcome. A verify that could not be run at all
+/// (no `noo` executable, a spawn error) is `Failed`: cleanup runs only on a
+/// verify that ran AND passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Verified {
+    Passed,
+    Failed,
+}
+
+pub(crate) fn verify_outcome(ran: &std::io::Result<std::process::ExitStatus>) -> Verified {
+    match ran {
+        Ok(s) if s.success() => Verified::Passed,
+        _ => Verified::Failed,
+    }
+}
+
+/// Whether the post-roll step may write a keep file and queue the rung.
+pub(crate) fn may_clean(verified: Verified) -> bool {
+    verified == Verified::Passed
+}
+
+/// What the post-roll step does to the machine; [`post_roll_on`] holds every
+/// decision, so a test drives it with a fake.
+pub(crate) trait PostRollHost {
+    fn verify(&mut self) -> Verified;
+    fn write_keep(&mut self) -> Result<PathBuf, String>;
+    fn hostd_up(&mut self) -> bool;
+    fn run_rung(&mut self, keep: &Path, live: bool) -> Result<Value, String>;
+    fn mark_previewed(&mut self, tag: &str);
+    fn say(&mut self, line: &str);
+}
+
+/// The post-roll step's decisions, against any [`PostRollHost`].
+pub(crate) fn post_roll_on(h: &mut impl PostRollHost, set: Option<&str>, previewed: bool, tag: &str) {
+    let m = mode(set, previewed);
     if m == Mode::Off {
-        return say("images: superseded-image cleanup is off (cluster.image_retention: off in noomesh.yaml)");
+        return h.say("images: superseded-image cleanup is off (cluster.image_retention: off in noomesh.yaml)");
     }
-    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "noo".into());
-    let verified = std::process::Command::new(&exe)
-        .args(["cluster", "verify", "--controller", "--wait", "--json"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !verified {
-        return say("images: superseded images were NOT cleaned up: the post-roll `noo cluster verify --controller --wait` did not pass; the next roll that verifies cleanly does it");
+    if !may_clean(h.verify()) {
+        return h.say("images: superseded images were NOT cleaned up: the post-roll `noo cluster verify --controller --wait` did not pass; the next roll that verifies cleanly does it");
     }
-    let keep = match write_keep_file(root) {
+    let keep = match h.write_keep() {
         Ok(p) => p,
-        Err(e) => return say(&format!("images: not cleaned up: {e}")),
+        Err(e) => return h.say(&format!("images: not cleaned up: {e}")),
     };
-    if !hostd_up() {
-        return say("images: not cleaned up: noo-hostd is not running (noo onboard --only services installs it)");
+    if !h.hostd_up() {
+        return h.say("images: not cleaned up: noo-hostd is not running (noo onboard --only services installs it)");
     }
     let live = m == Mode::Live;
-    match run_rung(root, &keep, live) {
+    match h.run_rung(&keep, live) {
         Ok(rep) => {
             // Nothing superseded (a fresh install, or nothing left since the
             // last roll): say nothing, so a roll is not noisy, and do not
@@ -374,15 +401,49 @@ pub(crate) fn post_roll(g: &crate::Globals, root: &Path, tag: &str) {
             if removable(&rep) == 0 {
                 return;
             }
-            say(&summary(&rep, live));
+            h.say(&summary(&rep, live));
             if !live && !previewed && set.is_none() {
-                let _ = std::fs::write(root.join(PREVIEWED_MARKER), format!("{tag}\n"));
+                h.mark_previewed(tag);
                 if POST_ROLL_DEFAULT_LIVE {
-                    say(&format!("images: from the next roll these are removed (each one is listed in {}); `cluster.image_retention: preview` in noomesh.yaml keeps previewing, `off` stops it", keep.with_file_name(REPORT_FILE).display()));
+                    h.say(&format!("images: from the next roll these are removed (each one is listed in {}); `cluster.image_retention: preview` in noomesh.yaml keeps previewing, `off` stops it", keep.with_file_name(REPORT_FILE).display()));
                 }
             }
         }
-        Err(e) => say(&format!("images: not cleaned up: {e}")),
+        Err(e) => h.say(&format!("images: not cleaned up: {e}")),
+    }
+}
+
+struct LivePostRoll<'a> {
+    g: &'a crate::Globals,
+    root: &'a Path,
+}
+
+impl PostRollHost for LivePostRoll<'_> {
+    fn verify(&mut self) -> Verified {
+        let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "noo".into());
+        let ran = std::process::Command::new(&exe)
+            .args(["cluster", "verify", "--controller", "--wait", "--json"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        verify_outcome(&ran)
+    }
+    fn write_keep(&mut self) -> Result<PathBuf, String> {
+        write_keep_file(self.root)
+    }
+    fn hostd_up(&mut self) -> bool {
+        hostd_up()
+    }
+    fn run_rung(&mut self, keep: &Path, live: bool) -> Result<Value, String> {
+        run_rung(self.root, keep, live)
+    }
+    fn mark_previewed(&mut self, tag: &str) {
+        let _ = std::fs::write(self.root.join(PREVIEWED_MARKER), format!("{tag}\n"));
+    }
+    fn say(&mut self, line: &str) {
+        if !self.g.json {
+            println!("{}", crate::ui::note(line));
+        }
     }
 }
 
@@ -449,6 +510,30 @@ mod tests {
         assert_eq!(srcs, vec!["/r/stack.lock", "/r/stack.lock.prev", "/r/addons.lock", "/r/addons.lock.prev", "/s/staged-images.json"]);
     }
 
+    /// A pin that names its image by TAG is never a keep entry (hostd would
+    /// refuse the whole file over one bare name, skipping the rung), and it
+    /// claims no namespace: only the digest-pinned image beside it counts.
+    #[test]
+    fn a_tag_pinned_add_on_image_is_never_an_entry_or_a_namespace() {
+        let mut i = inputs();
+        let mut cur = Pins::new();
+        cur.insert("tagonly".into(), pin(&[("app", "ghcr.io/vendor-t/tagonly:1.4.0".to_string())], None));
+        cur.insert("mixed".into(), pin(&[
+            ("api", format!("ghcr.io/vendor-m/mixedapi@sha256:{}", h('8'))),
+            ("ui", "ghcr.io/vendor-m/mixedui:2.0".to_string()),
+        ], None));
+        i.pins = Some((PathBuf::from("/r/addons.lock"), b"cur".to_vec(), cur));
+        i.pins_prev = None;
+        let v = keep_file(&i, "2026-11-13T00:00:00Z").unwrap();
+        let refs: Vec<&str> = v["keep"].as_array().unwrap().iter().filter_map(|e| e["ref"].as_str()).collect();
+        assert!(refs.contains(&format!("ghcr.io/vendor-m/mixedapi@sha256:{}", h('8')).as_str()), "{refs:?}");
+        assert!(!refs.iter().any(|r| r.contains("tagonly") || r.contains("mixedui")), "a tag pin became an entry: {refs:?}");
+        assert!(refs.iter().all(|r| r.contains("@sha256:")), "{refs:?}");
+        let ns: Vec<&str> = v["namespaces"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        assert!(ns.contains(&"ghcr.io/vendor-m/mixedapi/"), "{ns:?}");
+        assert!(!ns.iter().any(|n| n.contains("tagonly") || n.contains("mixedui")), "a tag pin claimed a namespace: {ns:?}");
+    }
+
     #[test]
     fn no_stack_lock_or_no_digest_writes_no_keep_file() {
         let mut i = inputs();
@@ -513,14 +598,101 @@ mod tests {
         assert!(body.contains("let set = setting(root);"));
     }
 
+    /// A fake host: records every effect the post-roll step has.
+    #[derive(Default)]
+    struct FakeHost {
+        verified: Option<Verified>,
+        rung: Option<Value>,
+        hostd_down: bool,
+        verifies: u32,
+        keeps: u32,
+        rungs: Vec<bool>,
+        marked: Vec<String>,
+        said: Vec<String>,
+    }
+
+    impl PostRollHost for FakeHost {
+        fn verify(&mut self) -> Verified {
+            self.verifies += 1;
+            self.verified.unwrap_or(Verified::Failed)
+        }
+        fn write_keep(&mut self) -> Result<PathBuf, String> {
+            self.keeps += 1;
+            Ok(PathBuf::from("/r/.noo-host-spool/image-keep.json"))
+        }
+        fn hostd_up(&mut self) -> bool {
+            !self.hostd_down
+        }
+        fn run_rung(&mut self, _keep: &Path, live: bool) -> Result<Value, String> {
+            self.rungs.push(live);
+            Ok(self.rung.clone().unwrap_or_else(|| json!({"images": []})))
+        }
+        fn mark_previewed(&mut self, tag: &str) {
+            self.marked.push(tag.into());
+        }
+        fn say(&mut self, line: &str) {
+            self.said.push(line.into());
+        }
+    }
+
+    fn some_superseded() -> Value {
+        json!({"bytes": 1_000_000_000i64, "images": [{"remove": true}, {"remove": false}]})
+    }
+
+    /// Cleanup runs only on a verify that ran AND passed: a failed verify,
+    /// and one that could not be run at all, write no keep file and queue no
+    /// rung.
     #[test]
-    fn an_empty_preview_says_nothing_and_keeps_the_one_time_preview() {
-        let own = crate::test_src::own_code(include_str!("image_retention.rs"));
-        let body = crate::test_src::fn_body(&own, "pub(crate) fn post_roll(");
-        let quiet = body.find("if removable(&rep) == 0").expect("an empty result returns early");
-        let marker = body.find("PREVIEWED_MARKER), format!").expect("the marker is written");
-        assert!(quiet < marker, "the preview is recorded only when it listed something");
+    fn a_failed_or_unrun_verify_writes_no_keep_file_and_runs_no_rung() {
+        let mut h = FakeHost { verified: Some(Verified::Failed), rung: Some(some_superseded()), ..Default::default() };
+        post_roll_on(&mut h, Some("live"), true, "v1");
+        assert_eq!((h.verifies, h.keeps, h.rungs.len()), (1, 0, 0), "a failed verify cleans nothing");
+        assert!(h.said[0].contains("NOT cleaned up") && h.said[0].contains("did not pass"), "{:?}", h.said);
+        // A verify that could not be spawned is a failure, never a pass.
+        let unrun: std::io::Result<std::process::ExitStatus> = Err(std::io::Error::other("no such file"));
+        assert_eq!(verify_outcome(&unrun), Verified::Failed);
+        assert!(!may_clean(verify_outcome(&unrun)));
+        assert!(!may_clean(Verified::Failed) && may_clean(Verified::Passed));
+        // And a passed one does clean.
+        let mut h = FakeHost { verified: Some(Verified::Passed), rung: Some(some_superseded()), ..Default::default() };
+        post_roll_on(&mut h, Some("live"), true, "v1");
+        assert_eq!((h.keeps, h.rungs.clone()), (1, vec![true]));
+    }
+
+    #[test]
+    fn off_runs_nothing_not_even_the_verify() {
+        let mut h = FakeHost { verified: Some(Verified::Passed), ..Default::default() };
+        post_roll_on(&mut h, Some("off"), true, "v1");
+        assert_eq!((h.verifies, h.keeps, h.rungs.len()), (0, 0, 0));
+    }
+
+    #[test]
+    fn the_first_roll_previews_and_spends_the_preview_only_on_a_non_empty_list() {
+        // Empty: says nothing and keeps the one-time preview.
+        let mut h = FakeHost { verified: Some(Verified::Passed), ..Default::default() };
+        post_roll_on(&mut h, None, false, "v1");
+        assert_eq!(h.rungs, vec![false], "the first roll is a preview");
+        assert!(h.marked.is_empty() && h.said.is_empty(), "an empty preview is silent and not spent: {:?}", h.said);
         assert_eq!(removable(&json!({"images": [{"remove": false}]})), 0);
+        // Something to remove: previews, says so, and records the preview.
+        let mut h = FakeHost { verified: Some(Verified::Passed), rung: Some(some_superseded()), ..Default::default() };
+        post_roll_on(&mut h, None, false, "v1");
+        assert_eq!((h.rungs.clone(), h.marked.clone()), (vec![false], vec!["v1".to_string()]));
+        // The next roll (preview spent): live.
+        let mut h = FakeHost { verified: Some(Verified::Passed), rung: Some(some_superseded()), ..Default::default() };
+        post_roll_on(&mut h, None, true, "v2");
+        assert_eq!(h.rungs, vec![true]);
+        // An explicit `preview` keeps previewing and never spends the marker.
+        let mut h = FakeHost { verified: Some(Verified::Passed), rung: Some(some_superseded()), ..Default::default() };
+        post_roll_on(&mut h, Some("preview"), true, "v3");
+        assert_eq!((h.rungs.clone(), h.marked.len()), (vec![false], 0));
+    }
+
+    #[test]
+    fn hostd_down_queues_no_rung() {
+        let mut h = FakeHost { verified: Some(Verified::Passed), hostd_down: true, ..Default::default() };
+        post_roll_on(&mut h, Some("live"), true, "v1");
+        assert!(h.rungs.is_empty() && h.said[0].contains("noo-hostd is not running"), "{:?}", h.said);
     }
 
     #[test]
