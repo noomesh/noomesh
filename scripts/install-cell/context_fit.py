@@ -65,7 +65,6 @@ run.sh lines for fa (not wired here):
 
   step context-fit-running 300 -- python3 "$HERE/context_fit.py" running
   step context-fit-turns 900 -- python3 "$HERE/context_fit.py" turns --out "$OUT/context-fit" --model-label "$MODEL"
-  step context-fit-doesnt-fit 300 -- python3 "$HERE/context_fit.py" doesnt-fit
 
 The deliberate 4096 pin (after those; the chat model is the one the node
 holds, e.g. gemma4:e2b, or $TINY_MODEL on a tiny cell):
@@ -74,6 +73,11 @@ holds, e.g. gemma4:e2b, or $TINY_MODEL on a tiny cell):
   step context-pin-restart 600 -- noo stack restart --force gateway
   step context-fit-pinned-running 300 -- python3 "$HERE/context_fit.py" running --expect-decided 4096
   step context-fit-pinned-check 600 -- python3 "$HERE/context_fit.py" pinned-check
+  step context-fit-doesnt-fit 300 -- python3 "$HERE/context_fit.py" doesnt-fit
+
+doesnt-fit belongs on the PINNED cell: its default 60,000 chars (~24k
+estimated tokens) overflows a 4096 window even at the gateway's lenient
+uncalibrated ratio (0.22 -> ~5.3k > 3,072), but would fit a 32k default.
 
 Standard library only.
 """
@@ -683,7 +687,7 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--out", required=True)
     t.add_argument("--model-label")
     d = sub.add_parser("doesnt-fit", help="a turn too big for the window says so")
-    d.add_argument("--chars", type=int, default=20000)
+    d.add_argument("--chars", type=int, default=60000)
     sub.add_parser("pinned-check", help="a tool turn on the 4096 pin: Compact tier, no cut, question kept")
     a = ap.parse_args(argv)
     return {"running": cmd_running, "turns": cmd_turns, "doesnt-fit": cmd_doesnt_fit,
