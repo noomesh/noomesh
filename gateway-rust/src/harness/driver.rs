@@ -1359,6 +1359,8 @@ pub(crate) async fn run_turn_on<R: DriverRail, S: TurnSink>(ctx: &DriverCtx, rai
             total_tokens: clamp(usage.total_tokens),
             total_tool_calls: 0,
             total_latency_ms: o.elapsed.as_millis().min(u64::MAX as u128) as u64,
+            // a cloud API / vendor CLI counts its own prompt: not judged (i802)
+            truncated: None,
         },
         recall: None,
     })
