@@ -451,6 +451,253 @@ pub async fn num_ctx_for(state: &crate::state::AppState, backend_type: &str, bac
     num_ctx_for_node(state, &node, backend_type, model).await
 }
 
+// ── the window a loop fits a turn to (i802 PR-2) ───────────────────────────
+//
+// The coordinator loop fitted every turn to one global number
+// (`VLLM_MAX_MODEL_LEN` less the output reserve, 12,288 by default) whatever
+// the backend ran at; a 4,096-token Ollama then cut the prompt. The window
+// is now the backend's own: the `num_ctx` an Ollama call is stamped with,
+// else the vLLM / llama.cpp placement's engine window ([`window_for`]), else
+// the old global value.
+
+/// The most a turn keeps back for the answer.
+pub const RESERVE_MAX: u64 = 4096;
+
+/// The tokens kept for the answer in a `ctx`-token window: a quarter of it,
+/// at most [`RESERVE_MAX`].
+pub fn reserve_for(ctx: u64) -> u64 {
+    (ctx / 4).min(RESERVE_MAX)
+}
+
+/// The prompt budget in a `ctx`-token window: what the reserve leaves.
+pub fn max_input_for(ctx: u64) -> u64 {
+    ctx.saturating_sub(reserve_for(ctx))
+}
+
+/// Whether [`window_for`] reads an engine window for this backend type.
+pub fn reads_window(backend_type: &str) -> bool {
+    matches!(backend_type, "vllm" | "vllm-secondary" | "llamacpp")
+}
+
+type WindowMap = std::collections::HashMap<(String, String, String), (Option<u64>, std::time::Instant)>;
+static WINDOWS: std::sync::LazyLock<std::sync::Mutex<WindowMap>> = std::sync::LazyLock::new(Default::default);
+
+fn windows() -> std::sync::MutexGuard<'static, WindowMap> {
+    WINDOWS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The running chat placement of `backend_type` that serves `model`: the one
+/// naming it, else the node's first running one of that engine.
+pub(crate) fn engine_placement<'a>(
+    placements: &'a [crate::routes::cluster::StoredPlacement],
+    backend_type: &str,
+    model: &str,
+) -> Option<&'a crate::routes::cluster::StoredPlacement> {
+    let chats: Vec<&crate::routes::cluster::StoredPlacement> =
+        placements.iter().filter(|p| p.backend == backend_type && p.role == "chat" && p.desired_state == "running").collect();
+    chats.iter().find(|p| p.model.as_deref().is_some_and(|m| same_model(m, model))).or_else(|| chats.first()).copied()
+}
+
+/// Read the node and its placement as [`read_node`] does, and take
+/// `harness_fit::chat_window` for the engine. `Err` = the read failed.
+async fn read_window(state: &crate::state::AppState, node_id: &str, backend_type: &str, model: &str) -> Result<Option<u64>, String> {
+    let kv = state.js.get_key_value("mesh_nodes").await.map_err(|e| format!("mesh_nodes: {e}"))?;
+    let record: Value = match kv.get(node_id).await.map_err(|e| format!("node record: {e}"))? {
+        Some(e) => serde_json::from_slice::<Value>(&e).map_err(|e| format!("node record: {e}"))?,
+        None => Value::Null,
+    };
+    let placements = crate::routes::cluster::stored_placements(state, node_id).await.map_err(|e| format!("placements: {e}"))?;
+    let Some(p) = engine_placement(&placements, backend_type, model) else { return Ok(None) };
+    let tier = crate::node_tier::derive(&crate::node_tier::facts_from_capabilities(record.get("capabilities").unwrap_or(&serde_json::json!({}))))
+        .tier()
+        .and_then(|t| u8::try_from(t).ok());
+    let overrides = crate::repo::cluster::node_harness_profile_overrides(&state.db, node_id).await.map_err(|e| format!("harness profile: {e}"))?;
+    let profile = crate::harness_profile::resolve(tier, &overrides, None, None);
+    Ok(crate::harness_fit::chat_window(backend_type, &p.env, Some(model), &record, profile.context).map(|w| w.tokens))
+}
+
+/// The window one request gets on a vLLM or llama.cpp backend, from its
+/// node's running chat placement (`harness_fit::chat_window`: the engine's
+/// key, else the harness profile's context, capped by the model's ceiling).
+/// `None` for any other backend, a URL that names no node, a node with no
+/// such placement, or a failed read: the loop then keeps its old global
+/// window. Held like [`num_ctx_for`]; a chat never fails because of it.
+pub async fn window_for(state: &crate::state::AppState, backend_type: &str, backend_url: &str, model: &str) -> Option<u64> {
+    if !reads_window(backend_type) || model.trim().is_empty() {
+        return None;
+    }
+    let node = node_of_url(state, backend_url).await?;
+    let key = (node.clone(), backend_type.to_string(), model.trim().to_string());
+    let now = std::time::Instant::now();
+    if let Some((w, at)) = windows().get(&key).copied() {
+        let window = if w.is_some() { RECHECK_SECS } else { RETRY_SECS };
+        if now.saturating_duration_since(at) < std::time::Duration::from_secs(window) {
+            return w;
+        }
+    }
+    let w = match read_window(state, &node, backend_type, model.trim()).await {
+        Ok(w) => w,
+        Err(why) => {
+            tracing::debug!(node = %node, backend_type, model, error = %why, "chat_context: cannot read the engine window; the loop keeps its global one");
+            None
+        }
+    };
+    windows().insert(key, (w, now));
+    w
+}
+
+// ── calibration: the loop's estimate against the backend's count ───────────
+//
+// The loop estimates tokens at chars×10/25. Measured (fa, i802) that runs
+// 1.6× (qwen, English) to ~4.5× (gemma4, JSON tool schemas) the backend's
+// real count, so no fixed ratio is safe. Each (backend URL, model) learns its
+// own ratio, real/estimate, from calls the backend clearly read whole, in
+// this process only. Until it has [`CALIB_TRUSTED_AFTER`] samples the ratio
+// in use is 1.0: a fresh box over-trims, which is safe and silent.
+
+/// The ratio is held within these bounds whatever a sample says.
+pub const CALIB_MIN: f64 = 0.15;
+pub const CALIB_MAX: f64 = 1.25;
+/// One sample moves the ratio by at most this fraction of itself.
+pub const CALIB_STEP: f64 = 0.20;
+/// Samples before the learned ratio is used.
+pub const CALIB_TRUSTED_AFTER: u32 = 3;
+/// A prompt estimated below this teaches nothing: the per-message overhead
+/// in the estimate dominates it.
+pub const CALIB_MIN_ESTIMATE: u64 = 256;
+/// Ollama keeps this many tokens from the head of a prompt it cuts
+/// (`truncating input prompt ... keep=5`).
+pub const OLLAMA_CUT_KEEP: u64 = 5;
+/// How near the cut length a count must land to be read as one.
+pub const CUT_SLACK: u64 = 16;
+/// The most favourable ratio measured (gemma4 with JSON tool schemas, ~4.5×
+/// the estimate's error): before the ratio is trusted, a turn is refused
+/// only when even this ratio leaves its instructions too large.
+pub const REFUSE_UNTRUSTED_RATIO: f64 = 0.22;
+
+/// One backend's learned ratio of real tokens to the loop's estimate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Calibration {
+    pub ratio: f64,
+    pub samples: u32,
+}
+
+impl Default for Calibration {
+    fn default() -> Self {
+        Calibration { ratio: 1.0, samples: 0 }
+    }
+}
+
+impl Calibration {
+    pub fn trusted(&self) -> bool {
+        self.samples >= CALIB_TRUSTED_AFTER
+    }
+
+    /// The ratio the fit uses: the learned one once trusted, else 1.0.
+    pub fn in_use(&self) -> f64 {
+        if self.trusted() {
+            self.ratio
+        } else {
+            1.0
+        }
+    }
+
+    /// The estimate as the backend would count it.
+    pub fn calibrated(&self, estimate: u64) -> u64 {
+        (estimate as f64 * self.in_use()).ceil() as u64
+    }
+
+    /// The raw-estimate budget that calibrates to `max_input`: what the
+    /// loop's `estimate_tokens` may reach.
+    pub fn estimate_budget(&self, max_input: u64) -> u64 {
+        (max_input as f64 / self.in_use()).floor() as u64
+    }
+
+    /// One whole read: the first sample sets the ratio (clipped), each later
+    /// one moves it at most [`CALIB_STEP`] of itself toward the sample.
+    pub fn learn(self, estimate: u64, evaluated: u64) -> Calibration {
+        if estimate < CALIB_MIN_ESTIMATE || evaluated == 0 {
+            return self;
+        }
+        let sample = (evaluated as f64 / estimate as f64).clamp(CALIB_MIN, CALIB_MAX);
+        let ratio = if self.samples == 0 {
+            sample
+        } else {
+            let most = self.ratio * CALIB_STEP;
+            (self.ratio + (sample - self.ratio).clamp(-most, most)).clamp(CALIB_MIN, CALIB_MAX)
+        };
+        Calibration { ratio, samples: self.samples.saturating_add(1) }
+    }
+}
+
+type CalibMap = std::collections::HashMap<(String, String), Calibration>;
+static CALIBRATION: std::sync::LazyLock<std::sync::Mutex<CalibMap>> = std::sync::LazyLock::new(Default::default);
+
+fn calibrations() -> std::sync::MutexGuard<'static, CalibMap> {
+    CALIBRATION.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// What this process has learned for (backend URL, model).
+pub fn calibration(backend_url: &str, model: &str) -> Calibration {
+    calibrations().get(&(backend_url.to_string(), model.trim().to_string())).copied().unwrap_or_default()
+}
+
+/// Teach (backend URL, model) one whole read; returns the new calibration.
+pub fn learn(backend_url: &str, model: &str, estimate: u64, evaluated: u64) -> Calibration {
+    let mut map = calibrations();
+    let entry = map.entry((backend_url.to_string(), model.trim().to_string())).or_default();
+    *entry = entry.learn(estimate, evaluated);
+    *entry
+}
+
+/// The count Ollama reports for a prompt it cut in a `ctx`-token context:
+/// the [`OLLAMA_CUT_KEEP`] head tokens plus the last half.
+pub fn cut_length(ctx: u64) -> u64 {
+    ctx / 2 + OLLAMA_CUT_KEEP
+}
+
+/// What one Ollama call's count says about its prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallRead {
+    /// The backend cut the prompt.
+    Cut,
+    /// The count lands on the cut length but the prompt was small enough to
+    /// be read whole: logged, not alerted.
+    OnTheLine,
+    /// Read whole, and far enough from the cut length to teach the ratio.
+    Whole,
+    /// Read whole, but too near half the context to teach anything.
+    Unclear,
+}
+
+/// The cut signature (i802 D): Ollama cut the prompt when the count lands
+/// within [`CUT_SLACK`] of [`cut_length`] AND the prompt was larger than the
+/// context: by the calibrated estimate once the ratio is trusted, else by
+/// the raw estimate past 1.5× the context (the raw estimate runs high).
+pub fn read_call(ctx: u64, sent_estimate: u64, evaluated: u64, calib: Calibration) -> CallRead {
+    let on_line = evaluated.abs_diff(cut_length(ctx)) <= CUT_SLACK;
+    let larger = if calib.trusted() { calib.calibrated(sent_estimate) > ctx } else { sent_estimate.saturating_mul(2) > ctx.saturating_mul(3) };
+    if on_line && larger {
+        CallRead::Cut
+    } else if on_line {
+        CallRead::OnTheLine
+    } else if evaluated.saturating_add(CUT_SLACK) < ctx / 2 {
+        CallRead::Whole
+    } else {
+        CallRead::Unclear
+    }
+}
+
+/// Before a turn is sent: do its instructions and question alone (system
+/// messages, the person's message, the tool schemas) exceed the prompt
+/// budget? Judged with the trusted ratio, else with the most favourable
+/// ratio measured ([`REFUSE_UNTRUSTED_RATIO`]), so a fresh box is not
+/// refused on its uncalibrated estimate.
+pub fn instructions_overflow(need_estimate: u64, max_input: u64, calib: Calibration) -> bool {
+    let ratio = if calib.trusted() { calib.ratio } else { REFUSE_UNTRUSTED_RATIO };
+    (need_estimate as f64 * ratio).ceil() as u64 > max_input
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,5 +892,120 @@ mod tests {
         assert_eq!(chat_env(&rows, "gemma4")["OLLAMA_CONTEXT_LENGTH"], json!("5"), "the one naming it (`:latest` the same)");
         assert_eq!(chat_env(&rows, "llama3.2:3b")["OLLAMA_CONTEXT_LENGTH"], json!("4"), "else the daemon's first running chat placement");
         assert_eq!(chat_env(&rows[..3], "gemma4"), json!({}), "no running ollama chat placement: no env");
+    }
+
+    #[test]
+    fn the_reserve_is_a_quarter_at_most_4096() {
+        assert_eq!((reserve_for(4096), max_input_for(4096)), (1024, 3072));
+        assert_eq!((reserve_for(8192), max_input_for(8192)), (2048, 6144));
+        assert_eq!((reserve_for(32768), max_input_for(32768)), (4096, 28_672));
+        assert_eq!(max_input_for(0), 0);
+    }
+
+    fn near(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    /// i802 PR-2 step 2: a fresh backend fits at 1.0 (over-trims, silently);
+    /// the first whole read sets the ratio, each later one moves it at most
+    /// 20%, it is held within [0.15, 1.25] and trusted after three samples.
+    #[test]
+    fn a_fresh_backend_uses_one_and_learns_within_bounds() {
+        let c = Calibration::default();
+        assert_eq!((c.in_use(), c.calibrated(1000), c.estimate_budget(3072)), (1.0, 1000, 3072));
+        let c = c.learn(1000, 400);
+        assert!(near(c.ratio, 0.4) && c.samples == 1 && !c.trusted(), "{c:?}");
+        assert_eq!(c.in_use(), 1.0, "not trusted yet");
+        let c = c.learn(1000, 50);
+        assert!(near(c.ratio, 0.32), "0.05 clips to 0.15, the move to 20% of 0.4: {c:?}");
+        let c = c.learn(1000, 2000);
+        assert!(near(c.ratio, 0.384) && c.trusted(), "{c:?}");
+        assert!(near(c.in_use(), 0.384));
+        let half = Calibration { ratio: 0.5, samples: 3 };
+        assert_eq!((half.calibrated(1000), half.estimate_budget(3072)), (500, 6144), "the fit compares estimate x ratio with max_input");
+        assert_eq!(c.learn(100, 50), c, "a short prompt teaches nothing");
+        assert_eq!(c.learn(1000, 0), c, "no count teaches nothing");
+        let mut low = Calibration::default().learn(1000, 1);
+        let mut high = Calibration::default().learn(1000, 9000);
+        assert!(near(low.ratio, CALIB_MIN) && near(high.ratio, CALIB_MAX));
+        for _ in 0..50 {
+            low = low.learn(1000, 1);
+            high = high.learn(1000, 9000);
+        }
+        assert!(low.ratio >= CALIB_MIN && high.ratio <= CALIB_MAX, "{low:?} {high:?}");
+    }
+
+    #[test]
+    fn calibration_is_per_backend_and_model() {
+        let url = "http://calib-test-only.invalid:11434";
+        for _ in 0..3 {
+            learn(url, "gemma4:e2b", 1000, 250);
+        }
+        let c = calibration(url, "gemma4:e2b");
+        assert!(c.trusted() && near(c.ratio, 0.25), "{c:?}");
+        assert_eq!(calibration(url, "qwen3:4b"), Calibration::default(), "another model learns its own");
+        assert_eq!(calibration("http://calib-test-other.invalid:11434", "gemma4:e2b"), Calibration::default());
+    }
+
+    /// fa's measured cell: `truncating input prompt limit=2051 prompt=4590
+    /// keep=5 new=2051` on a 4,096 daemon. The count lands on ctx/2 + 5.
+    #[test]
+    fn the_cut_signature_is_the_count_on_the_line_and_a_prompt_past_the_context() {
+        let fresh = Calibration::default();
+        assert_eq!(cut_length(4096), 2053);
+        assert_eq!(read_call(4096, 8800, 2051, fresh), CallRead::Cut, "raw 8,800 > 1.5 x 4,096");
+        assert_eq!(read_call(4096, 5000, 2051, fresh), CallRead::OnTheLine, "raw 5,000 may be 2,051 real: not alerted");
+        let gemma = Calibration { ratio: 0.25, samples: 3 };
+        assert_eq!(read_call(4096, 8800, 2051, gemma), CallRead::OnTheLine, "calibrated 2,200 fits 4,096");
+        let qwen = Calibration { ratio: 0.6, samples: 3 };
+        assert_eq!(read_call(4096, 8800, 2051, qwen), CallRead::Cut, "calibrated 5,280 does not");
+        assert_eq!(read_call(4096, 8800, 2040, fresh), CallRead::Cut, "within 16");
+        assert_eq!(read_call(4096, 8800, 2070, fresh), CallRead::Unclear, "off the line, too near half to teach");
+        assert_eq!(read_call(4096, 8800, 1500, fresh), CallRead::Whole);
+        assert_eq!(read_call(16384, 8800, 3100, fresh), CallRead::Whole, "a big context reads it whole");
+    }
+
+    #[test]
+    fn instructions_overflow_uses_the_trusted_ratio_else_the_kindest_measured() {
+        let fresh = Calibration::default();
+        assert!(!instructions_overflow(13_000, 3072, fresh), "13,000 x 0.22 = 2,860");
+        assert!(instructions_overflow(14_500, 3072, fresh), "14,500 x 0.22 = 3,190");
+        assert!(instructions_overflow(10_000, 3072, Calibration { ratio: 0.4, samples: 3 }));
+        assert!(!instructions_overflow(10_000, 3072, Calibration { ratio: 0.4, samples: 2 }), "untrusted: the kindest ratio");
+    }
+
+    #[test]
+    fn the_engine_window_comes_from_the_running_chat_placement_of_that_engine() {
+        use crate::routes::cluster::StoredPlacement;
+        let p = |backend: &str, role: &str, model: Option<&str>, len: &str, state: &str| StoredPlacement {
+            backend: backend.into(),
+            role: role.into(),
+            model: model.map(str::to_string),
+            env: json!({"VLLM_MAX_MODEL_LEN": len}),
+            desired_state: state.into(),
+            target: None,
+            keep_warm: false,
+        };
+        let rows = vec![
+            p("ollama", "chat", Some("gemma4"), "1", "running"),
+            p("vllm", "embed", Some("gemma4"), "2", "running"),
+            p("vllm", "chat", Some("gemma4"), "3", "stopped"),
+            p("vllm", "chat", Some("qwen3"), "4", "running"),
+            p("vllm", "chat", Some("gemma4"), "5", "running"),
+        ];
+        assert_eq!(engine_placement(&rows, "vllm", "gemma4").map(|p| p.env["VLLM_MAX_MODEL_LEN"].clone()), Some(json!("5")));
+        assert_eq!(engine_placement(&rows, "vllm", "llama").map(|p| p.env["VLLM_MAX_MODEL_LEN"].clone()), Some(json!("4")), "else the first running one");
+        assert!(engine_placement(&rows, "llamacpp", "gemma4").is_none());
+        assert!(reads_window("vllm") && reads_window("llamacpp") && !reads_window("ollama") && !reads_window("cloud-openai"));
+    }
+
+    /// Like the num_ctx resolver: an Ollama or cloud backend never costs a read.
+    #[test]
+    fn the_window_resolver_returns_none_before_any_read() {
+        let own = crate::test_src::own_code(include_str!("chat_context.rs"));
+        let f = crate::test_src::fn_body(&own, "pub async fn window_for(");
+        let gate = f.find("if !reads_window(backend_type)").unwrap_or_else(|| panic!("no gate: {f}"));
+        let ret = f[gate..].find("return None;").map(|i| gate + i).expect("the gate returns None");
+        assert!(ret < f.find(".await").expect("it reads"), "{f}");
     }
 }

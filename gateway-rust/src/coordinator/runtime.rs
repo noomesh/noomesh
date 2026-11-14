@@ -87,6 +87,12 @@ pub(crate) trait HarnessRuntime: Sync {
     async fn chat_num_ctx(&self, _backend: &ResolvedBackend) -> Option<u64> {
         None
     }
+    /// The window one request gets on a vLLM or llama.cpp `backend`
+    /// (i802 PR-2, `chat_context::window_for`). `None` = unknown: the loop
+    /// keeps its global `VLLM_MAX_MODEL_LEN` window, as a node harness does.
+    async fn chat_window(&self, _backend: &ResolvedBackend) -> Option<u64> {
+        None
+    }
     /// A cloud model, single turn, no tools. NOT the loop's path: the loop
     /// resolves a cloud model to a cloud backend and runs it with tools
     /// (i83 phase C). Kept for the harness rail's `CloudRun` op.
@@ -251,6 +257,10 @@ impl HarnessRuntime for InProcessRuntime<'_> {
 
     async fn chat_num_ctx(&self, backend: &ResolvedBackend) -> Option<u64> {
         crate::chat_context::num_ctx_for(self.state, &backend.backend_type, &backend.url, &backend.model).await
+    }
+
+    async fn chat_window(&self, backend: &ResolvedBackend) -> Option<u64> {
+        crate::chat_context::window_for(self.state, &backend.backend_type, &backend.url, &backend.model).await
     }
 
     async fn route_facts(&self, url: &str, backend: &str) -> Option<(String, Option<super::classes::Slots>)> {
