@@ -1826,7 +1826,7 @@ mod welcome_tests {
     fn onboard_ends_with_the_first_chat_command_after_the_verdict() {
         let [ready, page] = super::first_chat_lines(true);
         assert_eq!(ready, format!("Your first chat: noo chat --message \"{}\"", super::FIRST_CHAT_PROMPT));
-        assert!(page.ends_with("docs/getting-started/first-chat.md") && page.contains("https://github.com/noomesh/noomesh/"));
+        assert!(page.ends_with(&crate::onboard::steps::docs_url("getting-started/first-chat.md")));
         let [later, _] = super::first_chat_lines(false);
         assert!(later.starts_with("Once that is fixed, your first chat: noo chat --message"));
         let code = crate::test_src::own_code(include_str!("mod.rs"));
