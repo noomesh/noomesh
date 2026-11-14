@@ -716,7 +716,12 @@ mod tests {
         for w in ["stack_monitoring::write_at", "stack_monitoring::set_in", "stack_monitoring::on_on", "stack_monitoring::off_on"] {
             assert!(!upgrade.contains(w), "upgrade.rs writes the monitoring declaration via {w}");
         }
-        assert!(!upgrade.contains("monitoring: lean") && !upgrade.contains("monitoring: full"));
+        // No yaml literal for a value either; the one "monitoring: lean" is
+        // the Grafana-door skip message (PR b), which writes nothing.
+        assert!(!upgrade.contains("monitoring: full"));
+        for line in upgrade.lines().filter(|l| l.contains("monitoring: lean")) {
+            assert!(line.contains("Grafana door: skipped"), "upgrade.rs carries a monitoring: lean literal: {line}");
+        }
         let steps = crate::test_src::own_code(include_str!("../onboard/steps.rs"));
         assert_eq!(steps.matches("write_at(&yaml, level)").count(), 1, "onboard writes it in one place");
     }
