@@ -519,6 +519,9 @@ def test_the_literal_pass_types_what_the_install_doc_says_and_enter_elsewhere():
             ("n", "typed n (the install doc's table)"),
         "Admin username [admin]:": ("", "enter"),
         "Anthropic API key (blank to skip):": ("", "enter"),
+        # Documented, and Enter is its answer: a new install is lean (No).
+        "Install dashboards, log search and request traces (Grafana, Loki, Tempo; about 250 MiB idle)? [y/N]:":
+            ("", "enter"),
     }
     for prompt, expected in want.items():
         assert d.answer(prompt, "literal", "PW", rows) == expected, prompt

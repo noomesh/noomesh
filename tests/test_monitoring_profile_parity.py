@@ -1,7 +1,16 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026 PersonifAI LLC
 
-"""Every controller runs the monitoring set — standalone included.
+"""Every controller runs the core of the monitoring set; Grafana, Loki and
+Tempo are a declared choice.
+
+2026-11 (PR a of the opt-in change): Prometheus, Alertmanager and
+node-exporter stay on the `standalone` profile, so every install runs them.
+Loki, Tempo and Grafana left it: they carry `monitoring` and `controller`
+only, and the launcher adds `--profile monitoring` unless noomesh.yaml says
+`cluster.monitoring: lean` (unset = full: the live controller is a standalone
+install, tests/test_monitoring_lean_launcher.py pins that). The history below
+is why the choice is a persisted declaration and never a one-shot flag.
 
 Fleet logging phase 0 (2026-09-28). The live controller (a standalone
 install, `NOO_DEFAULT_PROFILE=standalone`) ran 13 containers and not one of
@@ -21,10 +30,11 @@ Two declarations say what a controller runs, and neither can see the other:
   it a fixed list of six).
 
 This guard reads the compose projection for BOTH profiles and the Rust
-exclusion lists, and fails when a monitoring service is absent from either
-profile or named in an exclusion. Planted: `standalone` removed from loki's
-profiles → the first test fails; `"loki"` added to HOST_OWNED_SERVICES → the
-last one fails.
+exclusion lists, and fails when an always-on monitoring service is absent
+from either profile, an optional one is back on `standalone` (it would run on
+a lean install), or one is named in an exclusion. Planted: `standalone`
+removed from prometheus's profiles → the first test fails; `"loki"` added to
+HOST_OWNED_SERVICES → the onboard test fails.
 """
 
 from __future__ import annotations
@@ -42,15 +52,11 @@ STEPS_RS = ROOT / "noo-cli" / "src" / "onboard" / "steps.rs"
 LAUNCHER = ROOT / "scripts" / "noomesh-start.sh"
 MANUAL = ROOT / "docs" / "operating" / "operator-manual.md"
 
-# The set the operator called "part of the product, not an opt-in".
-MONITORING = {
-    "loki",
-    "tempo",
-    "prometheus",
-    "alertmanager",
-    "grafana",
-    "node-exporter",
-}
+# Always on: metrics and alerts, on every install.
+ALWAYS = {"prometheus", "alertmanager", "node-exporter"}
+# Optional (about 250 MiB idle): on unless `cluster.monitoring: lean`.
+OPTIONAL = {"loki", "tempo", "grafana"}
+MONITORING = ALWAYS | OPTIONAL
 # Runs on a controller with a GPU; the launcher scales it to 0 without the
 # NVIDIA runtime, onboard leaves it out then. In both profiles all the same.
 GPU_MONITORING = {"nvidia-exporter"}
@@ -75,7 +81,7 @@ def _with_profile(services: dict, profile: str) -> set[str]:
 RETIRED = {"promtail", "docker-socket-proxy"}
 
 
-def test_every_monitoring_service_is_in_both_controller_profiles(services):
+def test_the_always_on_set_is_in_both_profiles_and_the_optional_set_is_declared(services):
     controller = _with_profile(services, "controller")
     standalone = _with_profile(services, "standalone")
     back = RETIRED & set(services)
@@ -84,20 +90,28 @@ def test_every_monitoring_service_is_in_both_controller_profiles(services):
         "the node-agent on the controller ships container logs (#526)"
     )
     assert MONITORING | GPU_MONITORING <= controller, sorted((MONITORING | GPU_MONITORING) - controller)
-    assert MONITORING | GPU_MONITORING <= standalone, (
-        "monitoring services missing from the standalone profile — a standalone "
-        f"controller would not run them: {sorted((MONITORING | GPU_MONITORING) - standalone)}"
+    assert ALWAYS | GPU_MONITORING <= standalone, (
+        "always-on monitoring services missing from the standalone profile — a standalone "
+        f"controller would not run them: {sorted((ALWAYS | GPU_MONITORING) - standalone)}"
     )
+    assert not OPTIONAL & standalone, (
+        f"{sorted(OPTIONAL & standalone)} are on the standalone profile again: a lean install "
+        "(cluster.monitoring: lean) would run them anyway"
+    )
+    on_switch = _with_profile(services, "monitoring")
+    assert MONITORING <= on_switch, f"the launcher's --profile monitoring misses {sorted(MONITORING - on_switch)}"
 
 
 def test_standalone_is_the_controller_profile_plus_its_embedder(services):
     """The two install shapes run the same product. The only services one
     has and the other lacks are the standalone box's local embedder and its
-    mTLS sidecar; a new controller-only service is a decision to make here,
-    by name."""
+    mTLS sidecar, and the optional monitoring three, which a standalone
+    install gets from `--profile monitoring` (cluster.monitoring, unset =
+    full); a new controller-only service is a decision to make here, by
+    name."""
     controller = _with_profile(services, "controller")
     standalone = _with_profile(services, "standalone")
-    assert controller - standalone == set(), sorted(controller - standalone)
+    assert controller - standalone == OPTIONAL, sorted(controller - standalone)
     assert standalone - controller == {"ollama-embed", "stunnel-ollama-embed"}, sorted(standalone - controller)
     # The exact set, so a service that joins either profile is a decision
     # made here by name — and one that leaves (promtail) cannot drift back.
@@ -147,6 +161,8 @@ def test_the_launcher_guards_grafanas_password_on_the_standalone_profile():
 def test_the_operator_manual_says_what_the_compose_file_does():
     body = MANUAL.read_text()
     assert "Monitoring is part of" in body, "the manual's monitoring sentence moved — update this grep"
-    assert "standalone" in body.split("Monitoring is part of")[1][:400], (
-        "operator-manual.md's monitoring sentence must say standalone runs it too"
+    after = body.split("Monitoring is part of")[1][:600]
+    assert "standalone" in after, "operator-manual.md's monitoring sentence must say standalone runs it too"
+    assert "cluster.monitoring" in after and "noo stack monitoring" in after, (
+        "the manual must say Grafana, Loki and Tempo are a declared choice, and how to change it"
     )

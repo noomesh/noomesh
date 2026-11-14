@@ -37,11 +37,12 @@ and the wizard is `noo onboard`. Adding machines is `noo enroll` (see `noo --hel
 | `nvidia-exporter` | `noo-nvidia-exporter` | `9400` | GPU metrics; scaled to 0 automatically when the host has no NVIDIA runtime |
 | `node-agent` | — | — | not in the `controller` profile (only the `node-agent-compose` profile): the controller's own agent runs on the host as a systemd service (`noo onboard --only services` installs it), never as a container |
 
-Monitoring is part of the `controller` **and** the `standalone` profile —
-every controller runs it, and there is no separate monitoring stack to
-start (until 2026-09-28 a standalone install ran it only after
-`noo onboard --with-monitoring`, and lost it again on its first
-`noo upgrade --stack`). Ports bind to `NOO_BIND_ADDR` (default
+Monitoring is part of the `controller` **and** the `standalone` profile:
+every controller runs Prometheus, Alertmanager and node-exporter. Grafana,
+Loki and Tempo run unless noomesh.yaml says `cluster.monitoring: lean`
+(unset means full; a new install is lean unless the wizard was told yes);
+`noo stack monitoring on|off|status` changes it
+([monitoring.md](monitoring.md)). Ports bind to `NOO_BIND_ADDR` (default
 `0.0.0.0`) unless listed as `127.0.0.1`; a named instance offsets them
 (see [multi-instance](../getting-started/multi-instance.md)).
 

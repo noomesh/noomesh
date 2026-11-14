@@ -210,6 +210,10 @@ cluster:
   # are never treated as ours and are always kept, so an add-on pinned on
   # Docker Hub is not cleaned up; remove its old images by hand.
   # image_retention: live
+  # Grafana, Loki and Tempo (about 250 MiB idle): full | lean. Unset means
+  # full; `noo onboard` writes lean on a new install unless told yes.
+  # Change it with `noo stack monitoring on|off` (data kept on off).
+  # monitoring: full
   pinned_backends: []
   # Example: pin a backend to a specific node
   # pinned_backends:

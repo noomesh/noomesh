@@ -262,6 +262,18 @@ pub(crate) fn render_systems(text: &str) -> Result<String, String> {
     Ok(out)
 }
 
+/// `monitoring`: the raw `cluster.monitoring` of noomesh.yaml, trimmed, one
+/// line; nothing when unset or not a string. The launcher's
+/// `monitoring_level` (lib-config.sh) turns it into full | lean with the
+/// unset = full rule; [`crate::commands::stack_monitoring::declared_in`] is
+/// the same read.
+pub fn render_monitoring(text: &str) -> String {
+    match crate::commands::stack_monitoring::declared_in(text) {
+        Some(v) => format!("{v}\n"),
+        None => String::new(),
+    }
+}
+
 /// `noo config launch-render <section>`. Reads `<repo_root>/noomesh.yaml`;
 /// a missing file prints nothing and exits 0 for every section — same as
 /// the Python blocks it replaces, which each guarded on `-f noomesh.yaml`
@@ -294,6 +306,10 @@ pub fn run(section: &str, file: Option<&std::path::Path>) -> i32 {
                 1
             }
         },
+        "monitoring" => {
+            print!("{}", render_monitoring(&text));
+            0
+        }
         "systems" => match render_systems(&text) {
             Ok(out) => {
                 print!("{out}");
@@ -306,7 +322,7 @@ pub fn run(section: &str, file: Option<&std::path::Path>) -> i32 {
         },
         other => {
             eprintln!(
-                "noo config launch-render: unknown section '{other}' (want: compose-env | addons | override | systems)"
+                "noo config launch-render: unknown section '{other}' (want: compose-env | addons | override | systems | monitoring)"
             );
             64
         }

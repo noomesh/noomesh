@@ -7990,6 +7990,100 @@ fn now_ts() -> i64 {
         .unwrap_or(0)
 }
 
+/// What the monitoring question does on this run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MonitoringPlan {
+    /// Decided without asking (a flag, or `--ci` on a new install).
+    Set(crate::commands::stack_monitoring::Level),
+    /// Ask; the bool is the default (true = yes, full).
+    Ask(bool),
+    /// Leave noomesh.yaml as it is (`--ci` on an install that already has a
+    /// value, or that never chose: unset = full).
+    Keep,
+}
+
+/// The question's plan. A flag decides. Otherwise the default is the
+/// install's own value, and for an install that never chose it depends on
+/// whether the install is new: a new one defaults to lean (No, Enter
+/// accepts it), an existing one to full, because unset already means full
+/// there and the fleet controller is such an install; a reconfigure must
+/// never quietly turn its Grafana, Loki and Tempo off. `--ci` asks nothing:
+/// lean on a new install, the existing value (or unset = full) otherwise.
+pub(crate) fn monitoring_plan(flag: Option<bool>, non_interactive: bool, declared: Option<&str>, was_configured: bool) -> MonitoringPlan {
+    use crate::commands::stack_monitoring::Level;
+    if let Some(full) = flag {
+        return MonitoringPlan::Set(if full { Level::Full } else { Level::Lean });
+    }
+    let current = match declared.map(str::trim) {
+        Some("full") => Some(Level::Full),
+        Some("lean") => Some(Level::Lean),
+        _ => None,
+    };
+    if non_interactive {
+        return match (current, was_configured) {
+            (None, false) => MonitoringPlan::Set(Level::Lean),
+            _ => MonitoringPlan::Keep,
+        };
+    }
+    MonitoringPlan::Ask(match current {
+        Some(level) => level == Level::Full,
+        None => was_configured,
+    })
+}
+
+/// The question that decides whether this install runs Grafana, Loki and
+/// Tempo (`cluster.monitoring` in noomesh.yaml; `noo stack monitoring`
+/// changes it later). Asked before the services step starts anything, so a
+/// new install's first start is already the one the person chose. Copied
+/// from the MCP-door question: `--monitoring-full` / `--no-monitoring-full`
+/// pre-answer (`--with-monitoring` is the old spelling of yes). A
+/// controller-profile install (a source checkout) always runs the set and is
+/// not asked.
+pub fn monitoring_choice(ctx: &mut Ctx) {
+    use crate::commands::stack_monitoring::{declared_in, level_of, write_at, Level};
+    let standalone = ctx.read_env("NOO_DEFAULT_PROFILE").trim() == "standalone" || ctx.repo_root.join(".noo-standalone").exists();
+    if !standalone {
+        ctx.info("Grafana, Loki and Tempo run on this install's controller profile (noo stack monitoring status).");
+        return;
+    }
+    let yaml = ctx.repo_root.join("noomesh.yaml");
+    let declared = std::fs::read_to_string(&yaml).ok().and_then(|t| declared_in(&t));
+    let level = match monitoring_plan(ctx.skip.monitoring_full, ctx.non_interactive, declared.as_deref(), ctx.state.was_configured) {
+        MonitoringPlan::Keep => {
+            let level = level_of(declared.as_deref());
+            ctx.state.monitoring = Some(level);
+            ctx.info(&format!("Monitoring: {} (kept; change it with noo stack monitoring on or off).", level.as_str()));
+            return;
+        }
+        MonitoringPlan::Set(level) => level,
+        MonitoringPlan::Ask(default_full) => {
+            ctx.info("Prometheus and alerts always run. Grafana dashboards, Loki log search and Tempo request traces are optional.");
+            if ctx.asker.confirm("Install dashboards, log search and request traces (Grafana, Loki, Tempo; about 250 MiB idle)?", default_full) {
+                Level::Full
+            } else {
+                Level::Lean
+            }
+        }
+    };
+    ctx.state.monitoring = Some(level);
+    if ctx.dry_run {
+        ctx.dry(&format!("write cluster.monitoring: {} to noomesh.yaml", level.as_str()));
+        return;
+    }
+    if declared.as_deref() != Some(level.as_str()) {
+        if let Err(e) = write_at(&yaml, level) {
+            // Nothing written: the install keeps what it had (unset = full).
+            ctx.state.monitoring = Some(level_of(declared.as_deref()));
+            ctx.warn(&format!("could not record the monitoring choice ({e}); set cluster.monitoring: {} under cluster: in noomesh.yaml", level.as_str()));
+            return;
+        }
+    }
+    match level {
+        Level::Full => ctx.success("Grafana, Loki and Tempo will run (cluster.monitoring: full)."),
+        Level::Lean => ctx.info("Grafana, Loki and Tempo stay off (cluster.monitoring: lean). Turn them on any time: noo stack monitoring on"),
+    }
+}
+
 /// The add-ons step. Free add-ons are a yes/no with the current value as
 /// default. Licensed ones are offered only when the installed entitlement
 /// grants their feature; otherwise one line says what they are and the
@@ -10552,5 +10646,63 @@ mod fresh_install_line_tests {
         assert!(!own.contains("no placement needed"), "the old line is back somewhere");
         let tail = crate::test_src::fn_body(&own, "pub fn provision_service_keys(");
         assert!(tail.contains("for svc in services_to_recreate(&t.containers, &prefix, &|c: &str| {"), "{tail}");
+    }
+}
+
+#[cfg(test)]
+mod monitoring_choice_tests {
+    use super::{monitoring_plan, MonitoringPlan};
+    use crate::commands::stack_monitoring::Level;
+
+    /// A new install: the question defaults to No (Enter accepts lean), and
+    /// `--ci` writes lean.
+    #[test]
+    fn a_new_install_defaults_to_lean() {
+        assert_eq!(monitoring_plan(None, false, None, false), MonitoringPlan::Ask(false), "Enter must accept No");
+        assert_eq!(monitoring_plan(None, true, None, false), MonitoringPlan::Set(Level::Lean));
+    }
+
+    /// An install that never chose runs everything (unset = full), and the
+    /// fleet controller is such an install: a reconfigure defaults to yes
+    /// and `--ci` writes nothing.
+    #[test]
+    fn an_existing_install_that_never_chose_keeps_the_full_set() {
+        assert_eq!(monitoring_plan(None, false, None, true), MonitoringPlan::Ask(true));
+        assert_eq!(monitoring_plan(None, true, None, true), MonitoringPlan::Keep);
+        assert_eq!(monitoring_plan(None, true, Some("typo"), true), MonitoringPlan::Keep);
+    }
+
+    #[test]
+    fn a_value_already_chosen_is_the_default_and_survives_ci() {
+        assert_eq!(monitoring_plan(None, false, Some("lean"), true), MonitoringPlan::Ask(false));
+        assert_eq!(monitoring_plan(None, false, Some("full"), false), MonitoringPlan::Ask(true));
+        assert_eq!(monitoring_plan(None, true, Some("full"), false), MonitoringPlan::Keep);
+        assert_eq!(monitoring_plan(None, true, Some("lean"), true), MonitoringPlan::Keep);
+    }
+
+    #[test]
+    fn a_flag_decides_without_asking() {
+        for (ni, declared, cfg) in [(false, None, false), (true, Some("lean"), true), (true, None, true)] {
+            assert_eq!(monitoring_plan(Some(true), ni, declared, cfg), MonitoringPlan::Set(Level::Full));
+            assert_eq!(monitoring_plan(Some(false), ni, declared, cfg), MonitoringPlan::Set(Level::Lean));
+        }
+    }
+
+    /// The flags and the question as the person sees them; the question is
+    /// asked in the services step BEFORE anything starts.
+    #[test]
+    fn the_flags_parse_and_the_question_is_asked_before_services_start() {
+        let mod_rs = crate::test_src::own_code(include_str!("mod.rs"));
+        assert!(mod_rs.contains("\"--monitoring-full\" | \"--with-monitoring\" => skip.monitoring_full = Some(true),"));
+        assert!(mod_rs.contains("\"--no-monitoring-full\" => skip.monitoring_full = Some(false),"));
+        let run = mod_rs.find("steps::monitoring_choice(ctx);").expect("asked");
+        let services = mod_rs.find("        steps::services(ctx);").expect("services step");
+        assert!(run < services, "the monitoring question must come before services start");
+        assert!(mod_rs.contains("ctx.state.was_configured = is_configured(ctx);"));
+        let own = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn monitoring_choice(");
+        assert!(body.contains("\"Install dashboards, log search and request traces (Grafana, Loki, Tempo; about 250 MiB idle)?\", default_full"), "{body}");
+        let usage = crate::usage::USAGE.iter().find(|(w, _, _)| *w == ["onboard"]).expect("onboard usage").1;
+        assert!(usage.contains("[--monitoring-full|--no-monitoring-full]"), "{usage}");
     }
 }

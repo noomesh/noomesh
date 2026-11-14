@@ -160,7 +160,7 @@ add-ons it offers (knowledge, voice, licensed tiers) are in
 
 ### What the wizard asks you
 
-Enter accepts the default at every prompt except these:
+Enter accepts the default at every prompt. These are the ones to read:
 
 | The prompt | What to type |
 |---|---|
@@ -168,10 +168,11 @@ Enter accepts the default at every prompt except these:
 | `Stored both in a password manager OFF this machine` | `y`, once you have copied the two backup passphrases it just printed somewhere off this machine. Without them an encrypted backup cannot be restored, so the default (N) asks again. |
 | `Tailscale is not installed. Install it now` | `n` on a single machine with no tailnet: the dashboard is then on `https://localhost:8080`. `y` puts this machine on your tailnet (it may ask for sudo, then shows a login link). There is no default: Enter asks again. |
 | `Join your tailnet now?` | `n` on a single machine with no tailnet; `y` to join (it opens a login link). There is no default: Enter asks again. |
+| `Install dashboards, log search and request traces` | Enter (No) keeps Grafana, Loki and Tempo off; Prometheus and alerts run anyway. y adds them (about 250 MiB idle); later: noo stack monitoring on. |
 
 When it finishes and services were started, the summary prints the
 endpoints: the dashboard on `localhost:8080` (and on your tailnet name if
-Tailscale was configured) and Grafana. Without Tailscale the
+Tailscale was configured) and Grafana, when you said yes to it. Without Tailscale the
 dashboard is served with a certificate from the cluster's own CA, so a browser
 warns until you trust it: see [trust-the-cluster-ca.md](trust-the-cluster-ca.md).
 Open Grafana from the console's **Open Grafana** button: your noomesh account

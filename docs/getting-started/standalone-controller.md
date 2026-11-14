@@ -37,8 +37,8 @@ noo onboard --standalone                     # the control plane, monitoring inc
 `--bundle` applies whenever onboarding ends up standalone, whether that's
 this explicit `--standalone` or the auto-detect above — `--standalone`
 isn't required alongside it. It is refused on a repo/controller install.
-(`--with-monitoring` is accepted and does nothing: since 2026-09-28 the
-monitoring set is in the `standalone` profile itself.)
+(`--with-monitoring` is the old spelling of `--monitoring-full`: yes to
+Grafana, Loki and Tempo.)
 
 What `--standalone` does before the normal steps run:
 

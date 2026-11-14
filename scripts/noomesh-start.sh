@@ -674,6 +674,14 @@ if [ ${#SERVICES[@]} -eq 0 ]; then
         PROFILE_ARGS="$PROFILE_ARGS $_op_profiles"
         ui_kv "Extra profiles" "$(printf '%s' "$_op_profiles" | sed 's/--profile //g') (COMPOSE_PROFILES)"
     fi
+    # Grafana, Loki and Tempo: on unless noomesh.yaml declares
+    # `cluster.monitoring: lean` (unset = full; lib-config.sh).
+    _mon_profile="$(monitoring_profile_args)"
+    if [ -n "$_mon_profile" ]; then
+        PROFILE_ARGS="$PROFILE_ARGS $_mon_profile"
+    else
+        ui_kv "Monitoring" "lean: no Grafana, Loki or Tempo (noo stack monitoring on)"
+    fi
     # evolve profile (set by the addons map above; empty when off)
 
     # Indented through the same helper as the rows above it. A bare `echo`
@@ -979,6 +987,9 @@ require_compose_v2 || exit 1
     if [ "${TRELLION_STOP_ON_OFF:-}" = "1" ]; then
         addons_compose_stop_intended "trellion is off" $COMPOSE_FILES -f "$(addons_trellion_overlay)" -- trellion
     fi
+    # A lean install's Grafana, Loki or Tempo container from an earlier full
+    # start (or an older noo's roll) is removed; `up` ignores it otherwise.
+    monitoring_remove_when_lean "$ACTIVE_SVCS"
     # Add-ons refused this start (require_addon_pins): a container left from
     # an earlier start must not keep running. Only services an add-on OWNS
     # are stopped; a core service found stopped afterwards fails the start.
@@ -999,8 +1010,11 @@ else
         fi
     done
     # A named service behind an operator profile (ollama-embed-cpu) needs it too.
-    PROFILE_ARGS="$PROFILE_ARGS $(operator_profile_args)"
+    PROFILE_ARGS="$PROFILE_ARGS $(operator_profile_args) $(monitoring_profile_args)"
     derive_profile_env
+    # Named outright, compose starts a service whatever its profiles say: a
+    # lean install refuses Grafana, Loki and Tempo here (lib-config.sh).
+    monitoring_refuse_named "$PROFILE_ARGS" "${SERVICES[@]}" || exit 1
 
     # Auto-adjust GPU memory when colocating backends
     if echo "$PROFILE_ARGS" | grep -q "vllm-secondary"; then

@@ -488,3 +488,128 @@ derive_profile_env() {
         *) export PAGEINDEX_EMBEDDING_EXTRA_URLS="$cur,$EMBED_CPU_DOOR_URL" ;;
     esac
 }
+
+# ── The monitoring set: full or lean (`cluster.monitoring`) ───────────────
+#
+# Grafana, Loki and Tempo (about 250 MiB idle) are the optional part of the
+# monitoring set; Prometheus, Alertmanager and node-exporter always run. The
+# ONE declaration is `cluster.monitoring: full | lean` in this install's
+# noomesh.yaml (the file the gateway mounts), next to cluster.image_retention
+# and, like it, never an environment variable.
+#
+# A MISSING decision means FULL. The fleet controller is itself a
+# standalone-profile install, so the profile cannot tell a one-machine
+# install from the fleet; only the literal `lean` leaves the three out. An
+# unset key, an unreadable file, an older `noo` that cannot render the key
+# (with no python3 to fall back on) and a typo all start the full set (a
+# typo says so on stderr). `noo onboard` writes `lean` on a new install
+# unless the person asks for the set; `noo stack monitoring on|off|status`
+# changes and shows it. The gateway and `noo cluster verify` read the same
+# key with the same unset = full rule.
+#
+# One thing outranks it: COMPOSE_PROFILES listing `monitoring`
+# (operator_profile_args passes it on), and so does the `controller` profile,
+# whose services include the set. Then the set runs and the launcher says
+# why; `noo stack monitoring off` refuses while either is so.
+MONITORING_OPTIONAL_SERVICES="loki tempo grafana"
+
+# monitoring_setting [FILE] - the raw `cluster.monitoring` of FILE (default
+# ./noomesh.yaml), trimmed; empty when unset or unreadable.
+monitoring_setting() {
+    local file="${1:-noomesh.yaml}" nb out
+    [ -f "$file" ] || return 0
+    if nb="$(noo_bin 2>/dev/null)" && out="$("$nb" config launch-render monitoring "$file" 2>/dev/null)"; then
+        printf '%s\n' "$out" | head -1 | tr -d ' \t\r'
+        return 0
+    fi
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 - "$file" <<'PYEOF' 2>/dev/null || true
+import sys, yaml
+doc = yaml.safe_load(open(sys.argv[1])) or {}
+c = doc.get("cluster") if isinstance(doc, dict) else None
+v = c.get("monitoring") if isinstance(c, dict) else None
+if isinstance(v, str):
+    print(v.strip())
+PYEOF
+}
+
+# monitoring_level - `lean` only when noomesh.yaml says exactly that, else `full`.
+monitoring_level() {
+    local raw
+    raw="$(monitoring_setting noomesh.yaml)"
+    case "$raw" in
+        lean) printf 'lean' ;;
+        ""|full) printf 'full' ;;
+        *)
+            echo "WARN: cluster.monitoring: '$raw' in noomesh.yaml is neither full nor lean; running the full set (noo stack monitoring status)" >&2
+            printf 'full'
+            ;;
+    esac
+}
+
+# monitoring_profile_args - `--profile monitoring` unless this install
+# declared lean. Used unquoted beside operator_profile_args.
+monitoring_profile_args() {
+    if [ "$(monitoring_level)" = "lean" ]; then
+        case " $(operator_profile_args 2>/dev/null) " in
+            *" --profile monitoring "*)
+                echo "WARN: COMPOSE_PROFILES lists monitoring, which wins over cluster.monitoring: lean in noomesh.yaml: Grafana, Loki and Tempo run (noo stack monitoring status)" >&2
+                ;;
+        esac
+        return 0
+    fi
+    printf '%s' "--profile monitoring"
+}
+
+# monitoring_refuse_named PROFILE_ARGS SERVICE... - exit 1, with the reason,
+# when a lean install is asked to start Grafana, Loki or Tempo by name. Compose
+# starts a service named on its command line whatever its profiles say, so
+# without this `noo stack restart grafana` would bring back what the
+# declaration turned off. PROFILE_ARGS carrying `monitoring` or `controller`
+# (the set is on after all) never refuses.
+monitoring_refuse_named() {
+    local _pa="$1" _s _p="${NOO_CONTAINER_PREFIX:-noo}"
+    shift
+    case " $_pa " in *" --profile monitoring "*|*" --profile controller "*) return 0 ;; esac
+    [ "$(monitoring_level)" = "lean" ] || return 0
+    for _s in "$@"; do
+        case " $MONITORING_OPTIONAL_SERVICES " in
+            *" ${_s#"$_p"-} "*)
+                echo "refused: ${_s} is off on this install (cluster.monitoring: lean in noomesh.yaml); nothing was started. Turn the set on: noo stack monitoring on" >&2
+                return 1
+                ;;
+        esac
+    done
+    return 0
+}
+
+# monitoring_remove_when_lean ACTIVE_SERVICES - on a lean install, stop and
+# remove a Grafana, Loki or Tempo container this `up` does not manage (left
+# by an earlier full start, or by an older noo's roll, whose compose file
+# still put the three on the standalone profile). Containers only: their data
+# directories stay where they are. Launchers never pass --remove-orphans, so
+# without this a container of a switched-off service would run on.
+monitoring_remove_when_lean() {
+    local _active="$1" _s _ids _gone=""
+    [ "$(monitoring_level)" = "lean" ] || return 0
+    for _s in $MONITORING_OPTIONAL_SERVICES; do
+        printf '%s\n' "$_active" | grep -qx "$_s" && continue
+        _ids="$(docker ps -aq --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME:-noomesh}" \
+            --filter "label=com.docker.compose.service=$_s" 2>/dev/null)"
+        [ -n "$_ids" ] || continue
+        if declare -F addons_note_intended_stop >/dev/null; then
+            # shellcheck disable=SC2086
+            addons_note_intended_stop "monitoring is lean" $_ids
+        fi
+        # shellcheck disable=SC2086
+        docker stop $_ids >/dev/null 2>&1
+        # shellcheck disable=SC2086
+        if docker rm $_ids >/dev/null 2>&1; then
+            _gone="$_gone $_s"
+        else
+            echo "WARN: could not remove the $_s container (cluster.monitoring: lean); remove it: docker rm -f $_ids" >&2
+        fi
+    done
+    [ -n "$_gone" ] && echo "  monitoring is lean (cluster.monitoring in noomesh.yaml): removed${_gone} (data kept; noo stack monitoring status)"
+    return 0
+}

@@ -256,6 +256,9 @@ done
 # variable beside our own --profile flags; lib-config.sh).
 PROFILE_ARGS="$PROFILE_ARGS $(operator_profile_args)"
 derive_profile_env
+# Grafana, Loki and Tempo: on unless noomesh.yaml declares
+# `cluster.monitoring: lean` (unset = full; lib-config.sh).
+PROFILE_ARGS="$PROFILE_ARGS $(monitoring_profile_args)"
 # Every add-on service compose renders must run exactly its verified pin
 # (require_addon_pins above exported them); empty render = refusal. Dist only.
 # Rendered with the SAME --profile flags `up` gets: without them compose can
@@ -315,6 +318,8 @@ if [ ${#SERVICES[@]} -eq 0 ]; then
         # exporter) is removed, not started.
         NOO_CREATED_GUARD_SERVICES="$(printf '%s\n' "$ACTIVE_SVCS" | tr '\n' ' ')" \
             noo_created_guard $(docker compose $COMPOSE_FILES $PROFILE_ARGS ps -aq)
+        # A lean install's Grafana, Loki or Tempo left from a full start goes.
+        monitoring_remove_when_lean "$ACTIVE_SVCS"
         [ "${_up_rc:-0}" -eq "$NOO_EXIT_STACK_PARTIAL" ] && exit "$NOO_EXIT_STACK_PARTIAL"
     else
         docker compose $COMPOSE_FILES $PROFILE_ARGS restart || {
@@ -343,6 +348,10 @@ else
     # privileged mode is refused; one reached through its add-on's key is
     # left out, said, and the add-on's other services start.
     addon_refuse_held "${SERVICES[@]}" || exit 1
+    # A lean install names Grafana, Loki or Tempo: refused with the switch,
+    # not "unknown service" (they are out of this profile's projection) and
+    # never started (compose would start a service named outright).
+    monitoring_refuse_named "$PROFILE_ARGS" "${SERVICES[@]}" || exit 1
     # shellcheck disable=SC2086
     restart_resolve_all "$VALID_SVCS" $COMPOSE_FILES $PROFILE_ARGS -- "${SERVICES[@]}" || exit 1
     SERVICES=("${RESOLVED_SERVICES[@]}")
