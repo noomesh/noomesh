@@ -10900,7 +10900,7 @@ mod tests {
     /// second leaf, a planted key or a stale copy each WARN with the fix.
     #[test]
     fn the_gateway_pki_view_row() {
-        let compose = std::fs::read_to_string(crate::test_support::repo_file("docker-compose.cluster.yml")).expect("shipped compose");
+        let compose = include_str!("../../../docker-compose.cluster.yml");
         let mounts = gateway_pki_mounts(compose).expect("a gateway service");
         let mut sorted = mounts.clone();
         sorted.sort();
