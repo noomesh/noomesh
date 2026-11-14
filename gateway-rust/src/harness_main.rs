@@ -1044,8 +1044,16 @@ mod tests {
         assert!(dedupe < permit, "the dedupe runs before a permit is taken");
         let busy = loop_body.find("\"busy\": true").expect("at capacity: a busy reply");
         assert!(permit < busy && busy < loop_body.find("\"ack\": true, \"node\"").unwrap(), "busy is answered on the refusal path");
-        assert!(loop_body.contains("\"slot_freed\": true"), "a finished task re-announces ready");
-        assert!(loop_body.find("r.remove(&req.task_id)").unwrap() < loop_body.find("\"slot_freed\": true").unwrap(), "the id leaves the running set before the re-announce");
+        // Two paths re-announce a freed slot; on each the id leaves the
+        // running set first. A finished task: its job's tail.
+        let job = loop_body.split("let _permit = permit;").nth(1).expect("the task's job");
+        assert!(job.contains("\"slot_freed\": true"), "a finished task re-announces ready");
+        assert!(job.find("r.remove(&req.task_id)").unwrap() < job.find("\"slot_freed\": true").unwrap(), "the id leaves the running set before the re-announce");
+        // A stopped task (i779): cut_task takes it out of the running set,
+        // and only then is the cut re-announced.
+        let cut = loop_body.split("if let Some(id) = stop_request(&msg.payload)").nth(1).expect("the stop path");
+        let cut = &cut[..cut.find("continue;").expect("the stop path ends")];
+        assert!(cut.find("cut_task(&id").unwrap() < cut.find("\"slot_freed\": true").unwrap(), "a cut task leaves the running set before the re-announce");
         let turns = src.split("harness: at capacity; not taking this turn").nth(1).unwrap();
         assert!(turns[..300].contains("\"busy\": true"), "a turn at capacity is answered busy too");
     }
