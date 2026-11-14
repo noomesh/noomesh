@@ -572,6 +572,14 @@ pub(crate) fn resolve_container(name: &str) -> String {
 /// it, leaving no first-class way to reload a secret into one service
 /// (first-contact finding #42).
 pub fn mesh_restart(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    restart_reporting(g, args, true)
+}
+
+/// [`mesh_restart`], with the i509 `started` post optional. `noo addons
+/// after-boot` restarts an add-on and posts its OWN record for the boot; with
+/// the restart posting too, one start made two gateway records (0.6.24-rc.7
+/// rehearsal). It passes `false`; `noo stack restart` itself always reports.
+pub(crate) fn restart_reporting(g: &Globals, args: &[String], report_started: bool) -> Result<i32, Unhandled> {
     let mut profile: Option<String> = None;
     let mut force = false;
     let mut services: Vec<String> = Vec::new();
@@ -596,7 +604,9 @@ pub fn mesh_restart(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if rc == 0 {
         front_addon_uis(g);
         // i509: a restarted add-on that runs clears its boot-start alert.
-        super::addon_after_boot::report_restarted(g, &services);
+        if report_started {
+            super::addon_after_boot::report_restarted(g, &services);
+        }
     }
     Ok(rc)
 }

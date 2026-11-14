@@ -642,7 +642,9 @@ impl Run for Live<'_> {
         if !script.is_file() {
             return Err(format!("the launcher {} was not found", script.display()));
         }
-        match super::mesh::mesh_restart(self.g, &[addon.to_string()]) {
+        // Not `mesh_restart`: that posts its own `started` (fresh UUID), and
+        // this run reports the start once, under the boot id.
+        match super::mesh::restart_reporting(self.g, &[addon.to_string()], false) {
             Ok(0) => Ok(()),
             Ok(n) => Err(format!("`noo stack restart {addon}` exited {n}; its output is above in this journal")),
             Err(Unhandled) => Err(format!("`noo stack restart {addon}` was not accepted")),
@@ -919,6 +921,23 @@ mod tests {
         let c = down_containers_at(&root, "rhaddon").expect("no block is not an error");
         assert!(c.undeclared && c.down.is_empty() && c.held.is_empty(), "{c:?}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One after-boot start makes one gateway record: the restart it runs
+    /// must not post its own `started` (0.6.24-rc.7 rehearsal: two records).
+    #[test]
+    fn the_after_boot_start_does_not_let_the_restart_post_too() {
+        let own = crate::test_src::own_code(include_str!("addon_after_boot.rs"));
+        let start = crate::test_src::fn_body(&own, "    fn start(&mut self, addon: &str) -> Result<(), String> \u{7b}\n        let script");
+        assert!(start.contains("restart_reporting(self.g, &[addon.to_string()], false)"), "{start}");
+        assert!(!start.contains("mesh_restart("), "mesh_restart posts its own started record");
+        let mesh = crate::test_src::own_code(include_str!("mesh.rs"));
+        let body = crate::test_src::fn_body(&mesh, "pub(crate) fn restart_reporting(");
+        let gate = body.find("if report_started \u{7b}").expect("the post is gated");
+        let post = body.find("report_restarted(g, &services)").expect("the post");
+        assert!(gate < post, "the post must sit inside the gate");
+        let cli = crate::test_src::fn_body(&mesh, "pub fn mesh_restart(");
+        assert!(cli.contains("restart_reporting(g, args, true)"), "`noo stack restart` itself always reports");
     }
 
     #[test]
