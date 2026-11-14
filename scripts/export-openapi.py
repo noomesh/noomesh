@@ -41,6 +41,9 @@ and leaves them alone unless you pass --prune.
     scripts/export-openapi.py                  # merge into ui/, in this tree
     scripts/export-openapi.py /path/to/repo    # a checkout elsewhere
     scripts/export-openapi.py --check          # report only, exit 1 if stale
+                                               # (both also regenerate/check the
+                                               # console's schema.d.ts when npm and
+                                               # ui/node_modules are present)
     scripts/export-openapi.py --prune          # also drop phantoms (read them first)
 
 THE CLONE IS GONE — this is the monorepo now. The console lives at `ui/`, so
@@ -131,6 +134,33 @@ def merge(spec: dict, contract: dict, routes: set[str], prune: bool) -> tuple[di
     return out, {"added": added, "kept_from_contract": kept_from_contract, "phantoms": phantoms}
 
 
+def _types(repo: Path, check: bool) -> int:
+    """The console's TypeScript types (`packages/api/src/schema.d.ts`), the
+    fourth artifact behind a route change. Regenerated (`npm run gen:api`) or,
+    with --check, checked (`npm run check:api`) when npm and the console's
+    installed dependencies are present; otherwise says the exact command and
+    passes, so the Python-only drift job is unchanged (the console's own CI
+    job checks the types)."""
+    import shutil
+    import subprocess
+    verb = "check:api" if check else "gen:api"
+    if shutil.which("npm") is None or not (repo / "node_modules").is_dir():
+        print(f"\nTypes NOT {'checked' if check else 'regenerated'} (no npm or no {repo.name}/node_modules): "
+              f"cd {repo.name} && npm ci && npm run {verb}")
+        return 0
+    r = subprocess.run(["npm", "run", "--silent", verb], cwd=repo, capture_output=True, text=True)
+    out = (r.stdout + r.stderr).strip().splitlines()
+    if r.returncode != 0:
+        print(f"\nTypes: `npm run {verb}` failed:", file=sys.stderr)
+        for line in out[-6:]:
+            print(f"  {line}", file=sys.stderr)
+        if check:
+            print(f"  Fix: cd {repo.name} && npm run gen:api, then commit packages/api/src/schema.d.ts", file=sys.stderr)
+        return 1
+    print(f"\nTypes: {'packages/api/src/schema.d.ts matches the contract' if check else 'regenerated packages/api/src/schema.d.ts'}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("target", nargs="?", help="a console checkout elsewhere (default: ui/ in this tree)")
@@ -185,14 +215,15 @@ def main() -> int:
     if args.check:
         if body == dest.read_text(encoding="utf-8"):
             print("\nContract is up to date.")
-            return 0
+            return _types(repo, check=True)
         print("\nContract is STALE — run scripts/export-openapi.py to update it.", file=sys.stderr)
         return 1
 
     dest.write_text(body, encoding="utf-8")
     print(f"\nWrote {DEST_REL}")
+    if _types(repo, check=False) != 0:
+        return 1
     print("\nFinish in ui/ — same tree now, no PR to another repo:")
-    print("  npm run gen:api          # regenerate packages/api/src/schema.d.ts")
     print("  npm run typecheck        # a removed path breaks its callers HERE")
     print("  npm run audit:contract   # UI calls must be a subset of the contract")
     print("  # dated entry in contracts/CHANGELOG.md, then PR into dev")
