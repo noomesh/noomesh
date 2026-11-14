@@ -1298,13 +1298,27 @@ mod tests {
             let canary = format!("NOO-CONTROL-TEST-{}", uuid::Uuid::new_v4().simple());
             let mut child = std::process::Command::new("/bin/sleep").arg("30").env_clear().env("C", &canary).spawn().unwrap();
             let pid = child.id();
+            // Bounded: a just-spawned sibling on a loaded box can sit in
+            // uninterruptible sleep (state D) while it pages in, and its
+            // environ reads back empty then (i812: one local batch check of
+            // #1205, awolf under load).
             let mut got = Err(String::new());
-            for _ in 0..25 {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
                 got = read_sibling_env(pid, &canary).await;
-                if got.is_ok() {
+                if got.is_ok() || std::time::Instant::now() >= until {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            // Still in state D after the bound: unproved HERE, as the jail's
+            // own self-test says it ("unreadable even outside the jail"),
+            // never a pass. Any other unreadable cause still fails below.
+            if got.is_err() && proc_state(pid) == "state D" {
+                eprintln!("unproved on this box: the sibling stayed in state D for 5 s, so its environment could not be read ({got:?})");
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
             }
             assert_eq!(got, Ok(()));
             assert!(proc_state(pid).starts_with("state "), "{}", proc_state(pid));
