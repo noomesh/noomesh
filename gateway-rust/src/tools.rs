@@ -1340,7 +1340,10 @@ async fn native_inference_tool(state: &AppState, call: &ToolCall, args: &Value) 
             NodeChat::NoChat(msg) => unmet = Some(format!("node '{node_id}' could not answer ({msg})")),
             NodeChat::Serves(backend_type, model_name, base_url) => {
                 let model_used = if node_from_model { model_name } else { model.clone().unwrap_or(model_name) };
-                match inf::chat_completion_on_node(&backend_type, &model_used, &base_url, &prompt, inf::Sampling::default()).await {
+                // The node's decided context (i802), when its chat is an Ollama.
+                let num_ctx = crate::chat_context::num_ctx_for_node(state, node_id, &backend_type, &model_used).await;
+                let sampling = inf::Sampling { num_ctx, ..inf::Sampling::default() };
+                match inf::chat_completion_on_node(&backend_type, &model_used, &base_url, &prompt, sampling).await {
                     Ok(inf::ChatAnswer::Text(text)) => return ok_result(call, text),
                     // Answered with nothing: an error saying why, never an
                     // empty success (120).
