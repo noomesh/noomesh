@@ -81,10 +81,12 @@ pub struct Truncation {
 const TRUNCATION_MIN_ESTIMATE: u64 = 512;
 
 /// The loop's estimate runs about 1.6x a backend's real token count for
-/// English (2.5 vs ~4 chars a token), so a prompt read whole comes back at
-/// about 0.5-0.8 of the estimate. Below this fraction the backend dropped a
-/// large part of it (i802: 2,050 evaluated of 6,700-10,100 estimated).
-const TRUNCATION_RATIO_PERCENT: u64 = 375;
+/// English (2.5 vs ~4 chars a token; code and JSON run closer), so a prompt
+/// read whole comes back at about 0.6-0.8 of the estimate. Below 0.45 the
+/// backend dropped a real part of it (i802: 2,050 and 4,093 evaluated of
+/// 6,700-10,100 estimated). A smaller cut (under about a quarter) is within
+/// the estimate's error until the loop knows the backend's window.
+const TRUNCATION_RATIO_PERCENT: u64 = 450;
 
 /// Did the backend cut this call's prompt? Judged only for a local backend:
 /// a cloud API's prompt count can leave cached tokens out (Anthropic's
@@ -4286,8 +4288,10 @@ mod backend_cut_tests {
         assert_eq!(backend_cut_prompt(6_697, 2_050, false), Some(Truncation { sent_estimate: 6_697, evaluated: 2_050 }));
         assert!(backend_cut_prompt(10_132, 2_050, false).is_some());
         assert!(backend_cut_prompt(10_132, 4_093, false).is_some(), "a turn after a side call (i802) is still cut");
-        assert!(backend_cut_prompt(6_697, 4_200, false).is_none(), "read whole at ~1.6 chars/token over: not a cut");
-        assert!(backend_cut_prompt(6_697, 3_000, false).is_none(), "0.45 of the estimate: within the estimate's error");
+        assert!(backend_cut_prompt(6_697, 4_200, false).is_none(), "read whole (0.63 of the estimate): not a cut");
+        assert!(backend_cut_prompt(6_697, 5_500, false).is_none(), "code-heavy, read whole: not a cut");
+        assert!(backend_cut_prompt(6_697, 3_000, false).is_some(), "0.448 of the estimate: about 28% lost");
+        assert!(backend_cut_prompt(6_697, 3_100, false).is_none(), "0.46: within the estimate's error until the window is known");
     }
 
     /// Nothing is judged without a count, for a short prompt, or for a cloud
