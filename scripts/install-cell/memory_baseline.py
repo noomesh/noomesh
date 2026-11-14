@@ -49,7 +49,7 @@ CONTROLLER_SHARE_LABEL = "controller share"
 # them, and the node agent when it runs in a container. Everything else is
 # the CONTROLLER's. Names from docker-compose*.yml.
 NODE_CONTAINER_PATTERNS = [
-    "ollama*", "llamacpp*", "vllm*", "tei*", "reranker*", "whisper*", "piper*",
+    "ollama*", "llamacpp*", "vllm*", "airllm*", "tei*", "reranker*", "whisper*", "piper*",
     "stunnel-ollama*", "stunnel-llamacpp*", "stunnel-vllm*", "stunnel-tei*",
     "stunnel-reranker*", "stunnel-whisper*", "stunnel-piper*",
     "node-agent*",

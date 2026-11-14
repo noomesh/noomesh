@@ -262,6 +262,20 @@ def main(argv: list[str] | None = None) -> int:
                     help="install-matrix cells' memory.json: adds 'Memory at idle (measured)'")
     a = ap.parse_args(argv)
     mem = load_memory(a.memory) if a.memory else None
+    # Memory first, and kept when the registry half fails: it comes from the
+    # cells' own files, so a gh or registry error must not hide it.
+    if mem is not None:
+        print("\n".join(render_memory(mem)) + "\n")
+    try:
+        return _size(a, mem)
+    except Exception:
+        if mem is not None and a.json:
+            with open(a.json, "w") as f:
+                json.dump({"memory": memory_json(mem), "size_error": "the size half failed; see the job log"}, f, indent=1)
+        raise
+
+
+def _size(a, mem) -> int:
     stack = finals("stack-v")
     tag = a.tag or stack[0]
     if a.prev:
@@ -308,8 +322,6 @@ def main(argv: list[str] | None = None) -> int:
     print("\n| CLI asset | MB |\n|---|---|")
     for n, b in sorted(assets.items()):
         print(f"| {n} | {mb(b)} |")
-    if mem is not None:
-        print("\n".join(render_memory(mem)))
     if a.json:
         doc = {"tag": tag, "prev": prev, "images": rows, "cli_assets": assets}
         if mem is not None:

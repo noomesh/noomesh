@@ -299,6 +299,24 @@ def test_the_size_report_main_carries_memory_in_markdown_and_json(tmp_path, monk
     assert SIZE.main(["--json", str(out)]) == 0 and "memory" not in json.loads(out.read_text())
 
 
+def test_the_memory_section_survives_a_failed_size_half(tmp_path, monkeypatch, capsys):
+    """The memory comes from the cells' own files: a registry or gh failure in
+    the size half must not hide it (printed first, and written to --json)."""
+    def boom(prefix):
+        raise RuntimeError("gh: HTTP 502")
+    monkeypatch.setattr(SIZE, "finals", boom)
+    out = tmp_path / "size.json"
+    with pytest.raises(RuntimeError):
+        SIZE.main(["--json", str(out), "--memory", f"ubuntu-22.04-amd64={tmp_path / 'nope' / 'memory.json'}"])
+    assert "not measured: no artifact from the cell" in capsys.readouterr().out
+    doc = json.loads(out.read_text())
+    assert doc["memory"]["cells"][0]["cell"] == "ubuntu-22.04-amd64" and "size_error" in doc
+
+
+def test_airllm_is_in_the_node_share():
+    assert MB.classify("noo-airllm") == "node"
+
+
 def test_the_size_job_waits_for_the_cells_and_reads_both_cells_memory():
     yaml = pytest.importorskip("yaml")
     doc = yaml.safe_load((ROOT / ".github/workflows/install-matrix.yml").read_text())
