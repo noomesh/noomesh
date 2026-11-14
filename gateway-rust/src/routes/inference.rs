@@ -75,7 +75,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/inference", post(native_inference))
         // Streaming: Native Rust SSE (ported from NATS delegation 2026-03-31)
         .route("/api/inference/stream", post(native_inference_stream))
-        .route(CHAT_STREAM_PATH, post(coordinator_chat_stream))
+        // A literal, not CHAT_STREAM_PATH: the OpenAPI generator and the
+        // CLI-routes guard read `.route("…")` literals (the test below holds
+        // the two equal).
+        .route("/api/inference/chat", post(coordinator_chat_stream))
         .route("/api/tasks/inference", post(submit_inference_task))
         // POST /chat REMOVED. It delegated to worker.chat, whose handler
         // resolves a coordinator from services.coordinator (never assigned)
@@ -2211,6 +2214,12 @@ mod chat_stream_tests {
     use super::*;
     use crate::bus_principal::{Kind, Principal};
     use crate::perspective::{Perspective, RequesterPerspective};
+
+    #[test]
+    fn the_route_is_registered_as_its_literal() {
+        let own = crate::test_src::own_code(include_str!("inference.rs"));
+        assert!(own.contains(&format!(".route(\"{CHAT_STREAM_PATH}\", post(coordinator_chat_stream))")), "the router must name CHAT_STREAM_PATH as a literal");
+    }
 
     #[test]
     fn identity_is_the_jwt_subject_and_a_body_user_id_is_ignored() {
