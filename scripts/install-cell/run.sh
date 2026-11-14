@@ -367,6 +367,12 @@ if [ "$CELL" = "$IDLE_SERIES_CELL" ]; then
             --out "$OUT/memory-idle-t$IDLE_MIN.json" --cell "$CELL" --model "$MODEL" \
             --sample "t$IDLE_MIN" --t0 "$IDLE_T0" --until $(( IDLE_T0 + IDLE_MIN * 60 ))
     done
+    # JUDGED, not a probe (general 2026-11-14): on a build whose node agent
+    # carries #1191's /backend-alive route, the chat model must be unloaded
+    # at +40 min with nobody chatting, or this cell FAILs here. An older
+    # build prints "unjudged" and passes. idle_judge.py says which.
+    step idle-chat-unloaded 60 -- python3 "$HERE/idle_judge.py" \
+        --t40 "$OUT/memory-idle-t40.json" --agent-bin "$(command -v noo-node-agent || echo /usr/local/bin/noo-node-agent)"
 fi
 # The single-turn line docs/getting-started/first-chat.md gives, read from the
 # doc itself (its first `noo chat --message "…"` line), so the page and the
