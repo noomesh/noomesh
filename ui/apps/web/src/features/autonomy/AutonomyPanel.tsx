@@ -164,7 +164,7 @@ function useToggleLocation() {
  *  (routes/intelligence.rs `dry_run_gate`) and refuses any other rule. */
 export const LIVE_MEANS: Record<string, string> = {
   disk_watermark:
-    "When a disk is past its watermark, the reclaim ladder will DELETE what it previews today: stopped containers and dangling images, the build cache, unused model weights, and superseded noomesh images (never images outside noomesh's registries), on the controller and on every node.",
+    "When a disk is past its watermark, the reclaim ladder will DELETE what it previews today: stopped containers and dangling images, the build cache, unused model weights, and superseded images of noomesh and of the add-ons it runs (only from those images' own repositories; never your other images, never one a container uses), on the controller and on every node.",
   cert_auto_rotate:
     'When a certificate nears expiry, the rule will RE-ISSUE it and restart the services that use it, instead of only reporting what it would rotate.',
 };

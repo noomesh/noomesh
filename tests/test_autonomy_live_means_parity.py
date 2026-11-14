@@ -48,5 +48,8 @@ def test_the_three_copies_name_the_same_rules_and_say_the_same_thing():
 
 
 def test_disk_reclaim_says_it_deletes_and_what_it_never_touches():
+    # cf, 2026-11-14: rung 5 also removes superseded ADD-ON images, from each
+    # add-on image's own repository (#1145/#1146)
     text = _gateway()["disk_watermark"]
-    assert "DELETE" in text and "superseded noomesh images" in text and "never images outside noomesh's registries" in text
+    assert "DELETE" in text and "of the add-ons it runs" in text and "only from those images' own repositories" in text
+    assert "never your other images, never one a container uses" in text

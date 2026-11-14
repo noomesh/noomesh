@@ -2245,7 +2245,10 @@ pub(crate) fn dry_run_gate(name: &str) -> Option<&'static str> {
         "disk_watermark" => Some(
             "When a disk is past its watermark, the reclaim ladder will DELETE what it previews today: \
              stopped containers and dangling images, the build cache, unused model weights, and \
-             superseded noomesh images (never images outside noomesh's registries), on the controller \
+             superseded images of noomesh and of the add-ons it runs (only from those images' own \
+             repositories; never your other images, never one a container uses), on the controller \
+             and on every node.",
+        ), on the controller \
              and on every node.",
         ),
         "cert_auto_rotate" => Some(
@@ -2703,7 +2706,7 @@ mod dry_run_tests {
     #[test]
     fn only_the_gated_rules_can_go_live_and_each_says_what_it_will_do() {
         let disk = dry_run_gate("disk_watermark").expect("gated");
-        assert!(disk.contains("DELETE") && disk.contains("superseded noomesh images") && disk.contains("never images outside noomesh's registries"), "{disk}");
+        assert!(disk.contains("DELETE") && disk.contains("of the add-ons it runs") && disk.contains("never your other images, never one a container uses"), "{disk}");
         let cert = dry_run_gate("cert_auto_rotate").expect("gated");
         assert!(cert.contains("RE-ISSUE") && cert.contains("restart"), "{cert}");
         assert!(dry_run_gate("memory_pressure").is_none());
