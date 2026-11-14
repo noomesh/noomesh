@@ -168,6 +168,10 @@ type Reporter struct {
 	failStreak  int
 	silentSince time.Time
 
+	// sections is the send-on-change state for the static sections
+	// (sectioncache.go). Same goroutine as failStreak.
+	sections sectionCache
+
 	// gpuProbeErr is the last GPU-probe error that was logged, so a probe
 	// that keeps failing the same way warns once per change, not every beat.
 	gpuProbeErr string
@@ -599,36 +603,32 @@ func (r *Reporter) SendHeartbeat() {
 		}
 	}
 
-	body, err := marshalPayload(payload)
-	if err != nil {
-		r.noteOutcome(clk, fmt.Errorf("heartbeat marshal failed: %w", err))
-		return
+	// Send-on-change (sectioncache.go): static sections the gateway already
+	// holds are sent as their hash only, and only once the gateway said it
+	// keeps them. Any failure below makes the next beat full.
+	send, full, hashes, didOmit := r.sections.prepare(payload)
+	status, rep, err := r.postBeat(send)
+	if err == nil && status == 200 && r.sections.settle(rep, hashes, didOmit) {
+		// The gateway cannot restore what this beat left out (it no longer
+		// keeps sections, or asked for a resync): send the beat whole, now,
+		// rather than leave the record a beat behind.
+		resend := full
+		if !r.sections.enabled {
+			resend = payload
+		}
+		status, rep, err = r.postBeat(resend)
+		if err == nil && status == 200 {
+			r.sections.settle(rep, hashes, false)
+		}
+	}
+	if err != nil || status != 200 {
+		r.sections.reset()
 	}
 
-	endpoint := fmt.Sprintf("%s/api/cluster/nodes/%s/heartbeat", r.cfg.ControllerURL, r.cfg.NodeID)
-	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
+	switch {
+	case err != nil:
 		r.noteOutcome(clk, err)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if err := r.setAuthHeader(req); err != nil {
-		r.noteOutcome(clk, err)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	req = req.WithContext(ctx)
-
-	resp, err := r.client.Do(req)
-	if err != nil {
-		r.noteOutcome(clk, err)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 404 {
+	case status == 404:
 		slog.Warn("heartbeat 404, re-registering")
 		caps, capsErr := hardware.Detect(r.cfg, r.gpu, r.caps)
 		if capsErr != nil {
@@ -637,11 +637,44 @@ func (r *Reporter) SendHeartbeat() {
 		hostIP := DetectHostIP(r.cfg)
 		r.Register(caps, hostIP)
 		r.noteOutcome(clk, nil)
-	} else if resp.StatusCode != 200 {
-		r.noteOutcome(clk, fmt.Errorf("controller answered HTTP %d", resp.StatusCode))
-	} else {
+	case status != 200:
+		r.noteOutcome(clk, fmt.Errorf("controller answered HTTP %d", status))
+	default:
 		r.noteOutcome(clk, nil)
 	}
+}
+
+// postBeat sends one heartbeat body and returns the HTTP status and, on a
+// 200, what the reply says about the section cache.
+func (r *Reporter) postBeat(payload map[string]any) (int, beatReply, error) {
+	body, err := marshalPayload(payload)
+	if err != nil {
+		return 0, beatReply{}, fmt.Errorf("heartbeat marshal failed: %w", err)
+	}
+
+	endpoint := fmt.Sprintf("%s/api/cluster/nodes/%s/heartbeat", r.cfg.ControllerURL, r.cfg.NodeID)
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return 0, beatReply{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if err := r.setAuthHeader(req); err != nil {
+		return 0, beatReply{}, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return 0, beatReply{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return resp.StatusCode, beatReply{}, nil
+	}
+	return resp.StatusCode, readBeatReply(resp.Body), nil
 }
 
 // noteOutcome closes the beat: it records delivery or its failure, and it

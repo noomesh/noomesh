@@ -22,6 +22,71 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelpresence"
 )
 
+// DESIGN (i675 F11): send-on-change for the static sections.
+//
+// Measured (this test, stack-v0.6.23 shapes): a beat is 5.7 KB (CPU node)
+// to 9.7 KB (GPU node), 16-28 MB per node per day at 30 s. The largest block
+// is hostd (1.3-2.8 KB), then backend_leaves, model_stats/presence,
+// backend_containers, image_sources and data_roots.
+//
+// Agent (implemented, sectioncache.go). Static sections: capabilities,
+// backend_leaves, data_roots, image_provenance (image_sources +
+// image_source_mode), legacy_lanes, app_version; the list is pinned in
+// testdata/static_sections.json for the gateway to copy. Only sections an
+// OLDER gateway keeps when a beat omits them are eligible (carry_reported /
+// `if let Some`), so a gateway downgraded between two beats loses nothing.
+// Posture is not eligible (controller_leaf_only and control_transports are
+// rewritten from every beat, absent included), nor node facts (carry_i300
+// removes absent keys). Each section's hash: sha256 of its keys as compact
+// JSON, first 16 hex. The agent omits a section only when (1) the gateway's
+// last 200 reply carried `"section_cache": 1`, and (2) the gateway
+// acknowledged that exact hash. Omitting beats carry
+// `"section_hashes": {name: hash}` for every static section.
+//
+// Resync, all agent-side, with no gateway change needed to be safe:
+//   (a) gateway restart: the gateway's section store is in memory, so after
+//       a restart it answers the first omitting beat with
+//       `"resync": [names]`; the agent re-POSTs the same beat in full at
+//       once (same tick, not 30 s later) and acks the hashes from that reply.
+//   (b) any failed beat (transport error, non-200, 404 re-register): the
+//       acks are dropped and the next beat is full.
+//   (c) stale content: a changed section has a new hash, so the agent sends
+//       it (the ack is per hash). A gateway holding another hash, or none,
+//       answers `resync` and gets the full beat at once. Every 20th beat
+//       (10 min) is full regardless, as anti-entropy.
+//   A reply without `section_cache` (gateway rolled back) turns the cache
+//   off; if that beat omitted anything it is re-sent whole, without
+//   `section_hashes`. Today the gateway replies `{"status":"ok"}` and the
+//   agent read only the status code, so until the gateway changes every
+//   beat stays full and carries no new key.
+//
+// Gateway (Rust, NOT done; routes/cluster.rs `node_heartbeat`):
+//   - Reply `{"status":"ok","section_cache":1}` plus `"resync":[...]` when
+//     non-empty.
+//   - Allowlist: the one new request key is `section_hashes`. It is consumed
+//     by a new step at the TOP of node_heartbeat, before carry_load and every
+//     other body read, and is NOT carried onto the mesh_nodes record. The
+//     step: for each section in testdata/static_sections.json named in
+//     section_hashes, if any of its keys is in the body, store
+//     {hash, those keys} in an in-memory per-node map on AppState; if none
+//     is, and the stored hash matches, put the stored keys back into `body`
+//     (every reader below sees a full beat, unchanged); otherwise add the
+//     name to `resync` and leave the record's values (all eligible keys are
+//     keep-on-absent). Needs a step test (body without the keys + matching
+//     hash -> record still has capabilities), a source guard that the step
+//     precedes `carry_load(` in fn_body("node_heartbeat"), and a forget of
+//     the node's entry on DELETE .../forget.
+//
+// Gzip: on these shapes gzip alone cuts a beat by 60% (CPU) to 68% (GPU);
+// send-on-change of the eligible sections by 26% / 20%. Gzip is the bigger
+// and stateless win, but needs gateway work too: request decompression on
+// the heartbeat route placed AFTER the v2 auth body-hash check (the token
+// signs the wire bytes), and an advertisement before the agent may compress
+// (an older gateway would refuse a gzip body). Absolute volume (16-28 MB per
+// node per day on the tailnet) makes neither urgent. The next agent-side
+// win is hostd.host (1.0-2.6 KB, static between hostd collections), which
+// needs a sub-key restore on the gateway.
+
 // i675 F11: how many bytes one heartbeat puts on the wire, per section, for
 // realistic node shapes. A measurement, not a contract: it asserts only that
 // something was sent. Run with -v to read the table.
@@ -269,13 +334,22 @@ func TestHeartbeatPayloadSize(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 				body, _ = io.ReadAll(req.Body)
 				w.WriteHeader(200)
+				// A gateway that keeps static sections (sectioncache.go).
+				_, _ = w.Write([]byte(`{"status":"ok","section_cache":1}`))
 			}))
 			defer srv.Close()
 			r := installShape(t, srv.URL, shape)
+			// Beat 1 is what every gateway receives today; beat 3 is the
+			// steady state once the gateway holds the static sections.
 			r.SendHeartbeat()
 			if len(body) == 0 {
 				t.Fatal("no heartbeat body was sent")
 			}
+			fullBody := body
+			r.SendHeartbeat()
+			r.SendHeartbeat()
+			steady := body
+			body = fullBody
 
 			var keys map[string]json.RawMessage
 			if err := json.Unmarshal(body, &keys); err != nil {
@@ -300,11 +374,6 @@ func TestHeartbeatPayloadSize(t *testing.T) {
 			}
 			sort.Slice(names, func(i, j int) bool { return perSection[names[i]] > perSection[names[j]] })
 
-			var gz bytes.Buffer
-			zw := gzip.NewWriter(&gz)
-			_, _ = zw.Write(body)
-			_ = zw.Close()
-
 			var out strings.Builder
 			fmt.Fprintf(&out, "\n%s\n%-20s %7s %6s  keys\n", shape.name, "section", "bytes", "share")
 			for _, s := range names {
@@ -312,10 +381,28 @@ func TestHeartbeatPayloadSize(t *testing.T) {
 				fmt.Fprintf(&out, "%-20s %7d %5.1f%%  %s\n", s, perSection[s],
 					100*float64(perSection[s])/float64(len(body)), strings.Join(perKey[s], " "))
 			}
-			fmt.Fprintf(&out, "per beat: %d B (gzip %d B, %.0f%%)\n", len(body), gz.Len(), 100*float64(gz.Len())/float64(len(body)))
+			fmt.Fprintf(&out, "per beat: %d B (gzip %d B, %.0f%%)\n", len(body), gzipLen(body), 100*float64(gzipLen(body))/float64(len(body)))
 			fmt.Fprintf(&out, "per day @30s (%d beats): %.1f MB raw, %.1f MB gzip\n", beatsPerDay,
-				float64(len(body)*beatsPerDay)/1e6, float64(gz.Len()*beatsPerDay)/1e6)
+				float64(len(body)*beatsPerDay)/1e6, float64(gzipLen(body)*beatsPerDay)/1e6)
+			var hostd struct {
+				Hostd struct {
+					Host json.RawMessage `json:"host"`
+				} `json:"hostd"`
+			}
+			_ = json.Unmarshal(body, &hostd)
+			gzs := gzipLen(steady)
+			fmt.Fprintf(&out, "steady state, static sections cached: %d B (gzip %d B); per day %.1f MB raw, %.1f MB gzip\n",
+				len(steady), gzs, float64(len(steady)*beatsPerDay)/1e6, float64(gzs*beatsPerDay)/1e6)
+			fmt.Fprintf(&out, "next candidate, hostd.host (static between collections): %d B\n", len(hostd.Hostd.Host))
 			t.Log(out.String())
 		})
 	}
+}
+
+func gzipLen(b []byte) int {
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	_, _ = zw.Write(b)
+	_ = zw.Close()
+	return gz.Len()
 }

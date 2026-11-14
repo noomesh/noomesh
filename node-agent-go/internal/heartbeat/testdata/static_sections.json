@@ -1,0 +1,12 @@
+{
+  "section_cache": 1,
+  "request_key": "section_hashes",
+  "sections": [
+    {"name": "capabilities", "keys": ["capabilities"]},
+    {"name": "backend_leaves", "keys": ["backend_leaves"]},
+    {"name": "data_roots", "keys": ["data_roots"]},
+    {"name": "image_provenance", "keys": ["image_sources", "image_source_mode"]},
+    {"name": "legacy_lanes", "keys": ["legacy_lanes"]},
+    {"name": "app_version", "keys": ["app_version"]}
+  ]
+}
