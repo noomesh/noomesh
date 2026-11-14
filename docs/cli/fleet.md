@@ -106,6 +106,12 @@ noo cluster desired gpu-2
 noo cluster unplace gpu-2 ollama
 ```
 
+An ollama unloads an idle model after its keep_alive (5 minutes by
+default) and loads it again, cold, on the next request; to keep one
+warm, place it with `--env OLLAMA_KEEP_ALIVE=-1` (reaches an agent-run
+or brew-managed ollama; the controller's own adopted ollama and an
+Ollama.app or hand-started ollama keep their own setting).
+
 ### Run it on CPU or GPU
 
 `--on cpu|gpu` declares the hardware a placement runs on, and is stored
