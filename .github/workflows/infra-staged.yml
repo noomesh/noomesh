@@ -47,6 +47,13 @@ on:
         description: 'Move :staged to this build if its scan passes (only ever from dev)'
         type: boolean
         default: true
+      force:
+        # false: an image whose current :staged (by digest) was built from
+        # today's exact inputs, less than 2 days ago, is skipped (i675 F8).
+        # true: build every image anyway (a dry run of the build, a forced refresh).
+        description: 'Build even when the current :staged already is this build'
+        type: boolean
+        default: false
 permissions:
   contents: read
   packages: write   # push $REGISTRY/$OWNER/<image>:staged*
@@ -154,10 +161,35 @@ jobs:
           echo "${{ matrix.image }} bases $bases"
           echo "${{ matrix.image }} fingerprint $fp"
 
+      # F8 (noomesh-internal i675): no build, push, scan or new dated tag when
+      # the current :staged, read BY DIGEST, already carries today's
+      # fingerprint and base digests on every platform and is under
+      # STAGED_REFRESH_DAYS old (scripts/infra-staged.py skip_decision). A
+      # skipped image says so in the run summary. `force` builds regardless.
+      - name: Skip if the current :staged already is this build
+        env:
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -eu
+          if [ "${FORCE:-false}" = "true" ]; then
+            echo "force=true: building ${{ matrix.image }} without comparing it to the staged copy"
+            echo "SKIP=0" >> "$GITHUB_ENV"; exit 0
+          fi
+          line="$(python3 scripts/infra-staged.py skip-check "${{ matrix.image }}" --fingerprint "$FP" --bases "$BASES" --platforms "${{ matrix.platforms }}")"
+          echo "$line"
+          case "$line" in
+            "SKIP: "*)
+              echo "SKIP=1" >> "$GITHUB_ENV"
+              echo "::notice::${{ matrix.image }}: skipped, ${line#SKIP: }"
+              echo "| ${{ matrix.image }} | skipped: nothing changed | ${line#SKIP: } |" >> "$GITHUB_STEP_SUMMARY" ;;
+            *) echo "SKIP=0" >> "$GITHUB_ENV" ;;
+          esac
+
       # The release's buildx command (images-release.yml "Build + push"), with
       # the two labels added and ONLY the immutable date tag pushed. No layer
       # cache: a daily build exists to take today's packages.
       - name: Build + push ${{ matrix.image }}:${{ env.DATE_TAG }}
+        if: env.SKIP != '1'
         run: |
           set -eux
           # Reproducible layers (2026-11-11): every file time in a layer is
@@ -184,6 +216,7 @@ jobs:
 
       # Same pinned, checksum-verified install as ci.yml's security-scan.
       - name: Install Trivy (pinned, checksum-verified)
+        if: env.SKIP != '1'
         env:
           TRIVY_VERSION: "0.70.0"
           TRIVY_SHA256: "8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9"
@@ -201,6 +234,7 @@ jobs:
       # Every platform of the new build, and of the current :staged, against
       # ONE vulnerability database (downloaded once, then --skip-db-update).
       - name: Scan the new build and the current :staged
+        if: env.SKIP != '1'
         run: |
           set -eu
           mkdir -p scan/new scan/old
@@ -230,6 +264,7 @@ jobs:
           done
 
       - name: Gate — no fixable HIGH/CRITICAL the current :staged lacks
+        if: env.SKIP != '1'
         run: |
           # pipefail: without it `| tee` would turn the gate's exit 1 into 0.
           set -euo pipefail
@@ -244,6 +279,7 @@ jobs:
           fi
 
       - name: Promote to :staged
+        if: env.SKIP != '1'
         env:
           PROMOTE: ${{ inputs.promote }}
         run: |

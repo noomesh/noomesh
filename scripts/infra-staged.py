@@ -363,6 +363,49 @@ def index_platforms(index: dict) -> list[str]:
 
 RIDING_DAYS = 7
 
+# F8 (noomesh-internal i675): the daily job pushed ~4.8 GB to GHCR every day
+# whether or not anything changed. It now skips a day when the CURRENT :staged
+# (read by digest, never by tag) was built from exactly today's inputs: the
+# same fingerprint and base digests on every platform it should have. It still
+# rebuilds once the staged copy is STAGED_REFRESH_DAYS old, for two reasons:
+# the release refuses a :staged older than STAGED_MAX_AGE_DAYS (and would then
+# build the image itself), and a rebuild takes the day's apt/pip packages,
+# which the fingerprint cannot see.
+STAGED_REFRESH_DAYS = 2
+
+
+def skip_decision(fp: str, bases: str, platforms: list[str], staged, now,
+                  refresh_days: int = STAGED_REFRESH_DAYS) -> tuple[bool, str]:
+    """(skip, why) for one image. `staged` is (digest, {platform: labels}) as
+    release-retag-plan.staged_image returns it, or the exception reading it
+    raised. Any doubt builds."""
+    if isinstance(staged, Exception):
+        return False, f"the current :staged is unreadable ({type(staged).__name__}: {staged})"
+    digest, labels = staged
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(digest)) or not labels:
+        return False, "no current :staged digest with platform configs"
+    want = sorted(platforms)
+    have = sorted(labels)
+    # A single-platform image has one config and no platform key.
+    if have != want and not (have == [""] and len(want) == 1):
+        return False, f"the staged copy has platforms {have or 'none'}, this build makes {want}"
+    differ = sorted(p or "-" for p, lab in labels.items() if lab.get("org.noomesh.build-fingerprint") != fp)
+    if differ:
+        return False, f"an input changed: the fingerprint differs on {', '.join(differ)}"
+    if any(lab.get("org.noomesh.base-digests", "") != bases for lab in labels.values()):
+        return False, "a base image moved: today's base digests differ from the staged copy's"
+    try:
+        created = min(PLAN._parse_time(lab["org.opencontainers.image.created"]) for lab in labels.values())
+    except (KeyError, ValueError) as e:
+        return False, f"the staged copy has no readable build time ({e})"
+    age = now - created
+    from datetime import timedelta
+    if age >= timedelta(days=refresh_days) or age < -timedelta(hours=1):
+        return False, (f"the staged copy was built {created:%Y-%m-%dT%H:%MZ}, {age.days} day(s) ago: rebuilt every "
+                       f"{refresh_days} days for the day's packages and the release's {PLAN.STAGED_MAX_AGE_DAYS}-day limit")
+    return True, (f"{digest} already has this fingerprint and these bases on {', '.join(want)}, "
+                  f"built {created:%Y-%m-%dT%H:%MZ}")
+
 
 def riding_findings(reports: dict[str, dict], now, days: int = RIDING_DAYS) -> list[tuple[str, str, str, str, int]]:
     """Fixable HIGH/CRITICAL findings whose advisory was published more than
@@ -425,10 +468,25 @@ def main(argv: list[str] | None = None) -> int:
     rd.add_argument("image")
     rd.add_argument("--bases", required=True)
     sub.add_parser("platforms", help="read a manifest list (JSON) on stdin, print its os/arch list")
+    sk = sub.add_parser("skip-check", help="SKIP or BUILD: is the current :staged (by digest) already today's build?")
+    sk.add_argument("image")
+    sk.add_argument("--fingerprint", required=True)
+    sk.add_argument("--bases", required=True)
+    sk.add_argument("--platforms", required=True, help="comma-separated, as the matrix gives them")
     nf = sub.add_parser("new-findings")
     nf.add_argument("--new", nargs="+", required=True, help="Trivy JSON reports of the new build")
     nf.add_argument("--old", nargs="*", help="Trivy JSON reports of the current :staged (omit: none staged yet)")
     a = ap.parse_args(argv)
+    if a.cmd == "skip-check":
+        from datetime import datetime, timezone
+        try:
+            staged = PLAN.staged_image(a.image)
+        except Exception as e:  # noqa: BLE001 — any doubt builds
+            staged = e
+        skip, why = skip_decision(a.fingerprint, a.bases, [p for p in a.platforms.split(",") if p],
+                                  staged, datetime.now(timezone.utc))
+        print(("SKIP: " if skip else "BUILD: ") + why)
+        return 0
     if a.cmd == "platforms":
         print(" ".join(index_platforms(json.load(sys.stdin))))
         return 0
