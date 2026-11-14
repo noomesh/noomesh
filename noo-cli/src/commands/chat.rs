@@ -3,12 +3,15 @@
 
 //! `noo chat` — interactive REPL against the cluster gateway (WP-C1).
 //!
-//! Ports the CLUSTER path of `noomesh/chat_cli.py::_cluster_chat_async`:
-//! probe `GET /health` (2s, Python parity), then stream each turn through
-//! `POST /api/inference/stream`. The Rust gateway serves that route natively
-//! as SSE (`gateway-rust/src/routes/inference.rs`), so no websocket client is
-//! needed — the stream is parsed with the same tolerant line reader as
-//! `models pull`.
+//! Probe `GET /health` (2s), then stream each turn through
+//! `POST /api/inference/chat`: the COORDINATOR turn the console runs over
+//! `/ws/coordinator` — the signed-in user's knowledge base, memory and tools,
+//! scoped to their identity and View-as perspective — framed as SSE
+//! (`gateway-rust/src/routes/inference.rs` `coordinator_chat_stream`).
+//! Until 0.6.25 it spoke `/api/inference/stream`, a raw model proxy with no
+//! retrieval: `noo chat` never used your documents (0 of 15 in the matrix
+//! RAG probe) while console chat did. The identity is the login token's
+//! subject; the body names no user.
 //!
 //! Stream framing tolerance: depending on the resolved backend the gateway
 //! proxies different chunk shapes down the same SSE pipe —
@@ -35,6 +38,29 @@
 //!     cluster path sent none, so every turn forgot the last).
 
 use crate::http::{get_json_opt, post_json_stream_try};
+
+/// The coordinator chat stream (gateway `CHAT_STREAM_PATH`).
+const CHAT_PATH: &str = "/api/inference/chat";
+
+/// How long a turn may run, end to end. An agentic turn (tools, retrieval,
+/// an approval wait of up to the gateway's window) runs far past the old
+/// 120 s raw-stream bound; `--timeout` still wins.
+const TURN_TIMEOUT_SECS: u64 = 1800;
+
+/// Past an approval's window, this much more before `noo chat` stops
+/// waiting: the gateway decides (expires) at the window, and its verdict
+/// echo needs a moment to arrive.
+const APPROVAL_GRACE_SECS: u64 = 30;
+
+/// One turn's request body. It names no user: the gateway takes the
+/// identity from the login token only, and ignores any body `user_id`.
+fn turn_body(prompt: &str, model: &Option<String>, conversation_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "prompt": prompt,
+        "model": model,
+        "conversation_id": conversation_id,
+    })
+}
 use crate::output::{fail, ExitCode};
 use crate::ui;
 use crate::{Globals, Unhandled};
@@ -78,6 +104,11 @@ struct StreamEvent {
     meta: Option<String>,
     done: bool,
     error: Option<String>,
+    /// An exec-approval the turn is waiting on: (request id, tool, window s).
+    approval: Option<(String, String, u64)>,
+    /// A line for the person, not part of the answer (a tool starting, an
+    /// approval verdict).
+    note: Option<String>,
 }
 
 /// Map one JSON chunk (any of the framings listed in the module doc) to a
@@ -95,8 +126,25 @@ fn extract_event(v: &serde_json::Value) -> StreamEvent {
                     v["node_id"].as_str().unwrap_or("?")
                 ))
             }
-            "error" => ev.error = Some(v["message"].as_str().unwrap_or("unknown error").to_string()),
+            "error" => {
+                ev.error = Some(v["message"].as_str().or(v["text"].as_str()).unwrap_or("unknown error").to_string())
+            }
             "done" => ev.done = true,
+            "approval_request" => {
+                ev.approval = Some((
+                    v["request_id"].as_str().unwrap_or("?").to_string(),
+                    v["tool"].as_str().unwrap_or("a tool").to_string(),
+                    v["window_secs"].as_u64().unwrap_or(300),
+                ))
+            }
+            "approval_outcome" => ev.note = v["text"].as_str().map(str::to_string),
+            "tool_call" => {
+                ev.note = Some(format!(
+                    "· {}",
+                    v["name"].as_str().or(v["tool"].as_str()).unwrap_or("tool")
+                ))
+            }
+            // thinking, tool_result, keepalive: not shown.
             _ => {}
         }
         return ev;
@@ -138,14 +186,8 @@ fn stream_turn(
     conversation_id: &str,
     mut on_token: impl FnMut(&str),
 ) -> Result<(String, Option<String>), String> {
-    let body = serde_json::json!({
-        "prompt": prompt,
-        "model": model,
-        "conversation_id": conversation_id,
-        "channel": "cli",
-    });
-    // Inference is slow — 120s default like the Python client (--timeout wins).
-    let mut resp = post_json_stream_try(g, "/api/inference/stream", &body, true, 120)?;
+    let body = turn_body(prompt, model, conversation_id);
+    let mut resp = post_json_stream_try(g, CHAT_PATH, &body, true, TURN_TIMEOUT_SECS)?;
 
     let status = resp.status().as_u16();
     if !(200..=299).contains(&status) {
@@ -174,9 +216,18 @@ fn stream_turn(
     };
 
     let mut full = String::new();
+    // An approval this CLI cannot answer is waited on, bounded: the gateway
+    // sends a keepalive every 30 s, so the bound is checked at least that
+    // often. Returning drops the connection, which ends the turn there.
+    let mut waiting: Option<(String, String, u64, std::time::Instant)> = None;
     let reader = std::io::BufReader::new(resp.body_mut().as_reader());
     for line in reader.lines() {
         let line = line.map_err(|e| format!("stream interrupted: {e}"))?;
+        if let Some((id, tool, window, since)) = &waiting {
+            if approval_overdue(since.elapsed(), *window) {
+                return Err(approval_expired_line(id, tool, *window));
+            }
+        }
         // Accept both framings: `data: {json}` (SSE) and bare NDJSON.
         let payload = line.strip_prefix("data: ").unwrap_or(&line).trim();
         if payload.is_empty() {
@@ -195,6 +246,16 @@ fn stream_turn(
         if let Some(m) = ev.meta {
             meta = Some(m);
         }
+        if let Some((id, tool, window)) = ev.approval {
+            eprintln!("{}", ui::warn(&approval_notice(&id, &tool, window)));
+            waiting = Some((id, tool, window, std::time::Instant::now()));
+        }
+        if let Some(n) = ev.note {
+            eprintln!("{}", ui::muted(&n));
+            if n.contains("approved") || n.contains("denied") || n.contains("expired") {
+                waiting = None;
+            }
+        }
         if let Some(t) = ev.token {
             on_token(&t);
             full.push_str(&t);
@@ -204,6 +265,28 @@ fn stream_turn(
         }
     }
     Ok((full, meta))
+}
+
+/// What the person sees when the turn needs an approval: where to give it,
+/// and how long `noo chat` will wait.
+fn approval_notice(id: &str, tool: &str, window: u64) -> String {
+    format!(
+        "waiting for approval: {tool} (request {id}). Approve it in the console, or in another terminal with \
+         `noo approval approve <id>` using that request id; waiting up to {}s.",
+        window + APPROVAL_GRACE_SECS
+    )
+}
+
+fn approval_overdue(waited: std::time::Duration, window: u64) -> bool {
+    waited.as_secs() > window + APPROVAL_GRACE_SECS
+}
+
+fn approval_expired_line(id: &str, tool: &str, window: u64) -> String {
+    format!(
+        "approval {id} for {tool} was not given within {}s, so this turn was ended. Approve it with \
+         `noo approval approve <id>` before the window closes, or send the message again.",
+        window + APPROVAL_GRACE_SECS
+    )
 }
 
 /// `noo chat [--model M] [--message TEXT]` — cluster chat REPL / one-shot.
@@ -391,6 +474,35 @@ mod tests {
         for s in ["/help", "hello", "exit now", ""] {
             assert!(!is_exit_command(s), "{s} should not exit");
         }
+    }
+
+    // ── the coordinator route ──
+
+    #[test]
+    fn a_turn_names_no_user_and_targets_the_coordinator_stream() {
+        let b = turn_body("hi", &Some("m".into()), "cli-1");
+        assert!(b.get("user_id").is_none(), "the identity is the login token's subject, never the body");
+        assert_eq!(b["prompt"], "hi");
+        assert_eq!(CHAT_PATH, "/api/inference/chat");
+        assert_ne!(CHAT_PATH, "/api/inference/stream", "the raw proxy retrieves nothing");
+    }
+
+    #[test]
+    fn an_approval_is_announced_with_where_to_approve_and_the_wait_is_bounded() {
+        let e = ev(r#"{"type":"approval_request","request_id":"r9","tool":"shell_exec","window_secs":120}"#);
+        assert_eq!(e.approval, Some(("r9".into(), "shell_exec".into(), 120)));
+        let n = approval_notice("r9", "shell_exec", 120);
+        assert!(n.contains("request r9") && n.contains("noo approval approve <id>") && n.contains("console") && n.contains("150s"), "{n}");
+        assert!(!approval_overdue(std::time::Duration::from_secs(150), 120));
+        assert!(approval_overdue(std::time::Duration::from_secs(151), 120));
+        let line = approval_expired_line("r9", "shell_exec", 120);
+        assert!(line.contains("turn was ended") && line.contains("r9"), "{line}");
+    }
+
+    #[test]
+    fn a_coordinator_error_event_carries_its_text() {
+        assert_eq!(ev(r#"{"type":"error","text":"No backend available"}"#).error.as_deref(), Some("No backend available"));
+        assert_eq!(ev(r#"{"type":"keepalive"}"#), StreamEvent::default());
     }
 
     // ── stream chunk shapes ──

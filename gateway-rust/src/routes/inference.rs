@@ -75,6 +75,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/inference", post(native_inference))
         // Streaming: Native Rust SSE (ported from NATS delegation 2026-03-31)
         .route("/api/inference/stream", post(native_inference_stream))
+        .route(CHAT_STREAM_PATH, post(coordinator_chat_stream))
         .route("/api/tasks/inference", post(submit_inference_task))
         // POST /chat REMOVED. It delegated to worker.chat, whose handler
         // resolves a coordinator from services.coordinator (never assigned)
@@ -1298,6 +1299,178 @@ struct StreamInferenceRequest {
 
 fn default_stream_channel() -> String { "api".to_string() }
 
+/// The coordinator turn as Server-Sent Events: what `noo chat` speaks.
+///
+/// `/api/inference/stream` (below) is a RAW model stream: no coordinator, no
+/// retrieval, no tools, no identity beyond the usage row. Peers and agents
+/// are told about it under that contract (`peers.rs`, `ws_agent.rs`), so it
+/// stays as it is. This route runs the same turn the console runs over
+/// `/ws/coordinator` — `coordinator::run_streaming`, with the caller's
+/// knowledge, memory and tools — and frames every event as `data: {json}`.
+///
+/// It lives under `/api/inference` on purpose: every gate keyed on that
+/// prefix (`CHAT_QUERY_PREFIXES`, `USER_READ_PREFIXES`) applies unchanged,
+/// a kiosk key is refused (no inference path is on its list), and an add-on
+/// token is a consumer only on `/v1/` and `/api/external/`, so here it is
+/// its user, exactly as on `/api/inference`.
+pub(crate) const CHAT_STREAM_PATH: &str = "/api/inference/chat";
+
+#[derive(Debug, Deserialize)]
+struct ChatStreamRequest {
+    prompt: String,
+    #[serde(default)]
+    conversation_id: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    enable_thinking: bool,
+}
+
+/// Whose turn it is: the verified JWT subject and nothing else. A body
+/// `user_id` is never read (`ChatStreamRequest` has no such field, and the
+/// raw body is passed here only so a test can prove it is ignored), and a
+/// request without a person behind it — a node's cluster HMAC, an unbound
+/// service key — is refused: there is nobody to retrieve as.
+fn chat_turn_identity(actor_sub: Option<&str>, _raw_body: &Value) -> Result<String, &'static str> {
+    actor_sub
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or("this route runs a signed-in person's chat turn; sign in (`noo auth login`) and send it again")
+}
+
+/// The turn's scopes, applied INSIDE the spawned task. Task-locals do not
+/// cross `tokio::spawn` (ws_coordinator.rs: every console turn once went out
+/// as `internal:unattributed` and retrieved nothing). The caller's principal
+/// (its real role and scopes) and its View-as snapshot cover the whole turn,
+/// every tool call and bus message to the last frame, never just the first;
+/// the approval card goes to this stream.
+fn scoped_chat_turn<F: std::future::Future>(
+    principal: crate::bus_principal::Principal,
+    view: Option<crate::perspective::RequesterPerspective>,
+    approvals: crate::websocket::WsWriter,
+    fut: F,
+) -> impl std::future::Future<Output = F::Output> {
+    crate::perspective::scope(
+        view,
+        crate::bus_principal::with_principal(
+            principal,
+            crate::routes::communication::DASHBOARD_APPROVAL_TX.scope(Some(approvals), fut),
+        ),
+    )
+}
+
+/// Ends the spawned turn when the client goes away: axum drops the body
+/// stream, this guard with it, and the turn (its model call included) is
+/// aborted rather than left holding a model slot for nobody (i779).
+struct AbortTurnOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortTurnOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// One frame of the stream: a text frame becomes an SSE `data:` event, a
+/// close ends the stream, anything else (ping/binary, never sent by the
+/// loop) is dropped.
+fn sse_frame(msg: &axum::extract::ws::Message) -> Option<String> {
+    match msg {
+        axum::extract::ws::Message::Text(t) => Some(format!("data: {}\n\n", t.as_str())),
+        axum::extract::ws::Message::Close(_) => None,
+        _ => Some(String::new()),
+    }
+}
+
+/// The response body: the writer's frames as SSE, holding the abort guard
+/// for as long as the client reads.
+fn sse_body(
+    rx: tokio::sync::mpsc::UnboundedReceiver<axum::extract::ws::Message>,
+    guard: AbortTurnOnDrop,
+) -> impl futures::Stream<Item = Result<axum::body::Bytes, std::convert::Infallible>> {
+    futures::stream::unfold((rx, guard), |(mut rx, guard)| async move {
+        let msg = rx.recv().await?;
+        let frame = sse_frame(&msg)?;
+        Some((Ok(axum::body::Bytes::from(frame)), (rx, guard)))
+    })
+}
+
+/// POST /api/inference/chat — see [`CHAT_STREAM_PATH`].
+async fn coordinator_chat_stream(
+    State(state): State<Arc<AppState>>,
+    actor: Option<Extension<crate::auth::AuthActor>>,
+    Json(raw): Json<Value>,
+) -> axum::response::Response {
+    let uid = match chat_turn_identity(actor.as_ref().map(|Extension(a)| a.0.as_str()), &raw) {
+        Ok(u) => u,
+        Err(why) => return (StatusCode::FORBIDDEN, Json(json!({"success": false, "error": why}))).into_response(),
+    };
+    let req: ChatStreamRequest = match serde_json::from_value(raw) {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"success": false, "error": format!("bad request: {e}")}))).into_response()
+        }
+    };
+    // Captured HERE, inside the auth middleware's scope; re-applied inside
+    // the spawned task by `scoped_chat_turn`.
+    let principal = crate::bus_principal::current();
+    let view = crate::perspective::current();
+    let conversation_id = req.conversation_id.filter(|s| !s.is_empty()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    tracing::info!(conversation_id = %conversation_id, user = %uid, prompt_len = req.prompt.len(), model = ?req.model, "coordinator_chat_stream_start");
+
+    let (writer, rx) = crate::websocket::WsWriter::detached();
+    let max_iter = state.config.coordinator.max_iterations;
+    let conv = conversation_id.clone();
+    let task = tokio::spawn(async move {
+        let w = writer;
+        let run = scoped_chat_turn(
+            principal,
+            view,
+            w.clone(),
+            coordinator::run_streaming(&w, &state, &req.prompt, &conv, max_iter, req.model.as_deref(), Some(&uid), req.enable_thinking),
+        );
+        let ka = w.clone();
+        let outcome = crate::websocket::run_turn_with_keepalive(run, std::future::pending::<()>(), crate::websocket::TURN_KEEPALIVE, || {
+            let k = ka.clone();
+            async move {
+                let _ = k.send_keepalive().await;
+            }
+        })
+        .await;
+        match outcome {
+            Some(Ok(result)) => {
+                crate::usage::record(
+                    state.db.clone(),
+                    result.node.clone(),
+                    result.backend.clone(),
+                    result.model.clone(),
+                    "chat",
+                    UsageActor::user(uid.clone(), "cli"),
+                    result.usage.prompt_tokens,
+                    result.usage.completion_tokens,
+                );
+            }
+            Some(Err(e)) => {
+                let msg = format!("{e:#}");
+                tracing::error!(error = %msg, conversation_id = %conv, "coordinator_chat_stream_error");
+                let _ = w.send_event("error", json!(msg)).await;
+                let _ = w.send_event("done", json!({"iterations": 0, "error": msg})).await;
+            }
+            None => {}
+        }
+        // Every writer clone ends with this task: the receiver then ends the stream.
+    });
+    let body = sse_body(rx, AbortTurnOnDrop(task.abort_handle()));
+    axum::response::Response::builder()
+        .status(200)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("X-Accel-Buffering", "no")
+        .header("x-conversation-id", conversation_id)
+        .body(Body::from_stream(body))
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Stream error").into_response())
+}
+
 /// POST /api/inference/stream — SSE streaming inference.
 ///
 /// Resolves the backend and proxies the SSE stream directly from the LLM.
@@ -2030,5 +2203,84 @@ mod pinned_sampling_tests {
         assert!(b.get("reasoning").is_none(), "{b}");
         let long = "x".repeat(super::EMPTY_REASONING_MAX_BYTES * 2);
         assert_eq!(empty_answer_body(Some("stop"), Some(&long))["reasoning"].as_str().unwrap().len(), super::EMPTY_REASONING_MAX_BYTES);
+    }
+}
+
+#[cfg(test)]
+mod chat_stream_tests {
+    use super::*;
+    use crate::bus_principal::{Kind, Principal};
+    use crate::perspective::{Perspective, RequesterPerspective};
+
+    #[test]
+    fn identity_is_the_jwt_subject_and_a_body_user_id_is_ignored() {
+        let body = json!({"prompt": "hi", "user_id": "bob"});
+        assert_eq!(chat_turn_identity(Some("alice"), &body).unwrap(), "alice");
+        assert!(chat_turn_identity(None, &body).is_err(), "a body user_id never stands in for a signed-in subject");
+        assert!(chat_turn_identity(Some("  "), &body).is_err());
+    }
+
+    fn alice() -> Principal {
+        Principal {
+            sub: "alice".into(),
+            kind: Kind::User,
+            role: "user".into(),
+            scopes: vec!["read".into()],
+            act: None,
+            harness: None,
+            perspective: None,
+        }
+    }
+
+    /// The scopes hold inside a SPAWNED turn and after it has yielded, not
+    /// just on its first poll: what a tool call deep in the loop sees.
+    #[tokio::test]
+    async fn the_principal_view_and_approval_target_cover_the_whole_spawned_turn() {
+        let view = Some(RequesterPerspective { id: "v1".into(), dims: Perspective { core_only: true, ..Default::default() } });
+        let (w, _rx) = crate::websocket::WsWriter::detached();
+        let got = tokio::spawn(scoped_chat_turn(alice(), view.clone(), w, async {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            (
+                crate::bus_principal::current(),
+                crate::perspective::current(),
+                crate::routes::communication::DASHBOARD_APPROVAL_TX.try_with(|t| t.is_some()).unwrap_or(false),
+            )
+        }))
+        .await
+        .unwrap();
+        assert_eq!(got.0, alice(), "the caller's principal, not internal:unattributed");
+        assert_eq!(got.1, view, "the View-as snapshot");
+        assert!(got.2, "the approval card goes to this stream");
+    }
+
+    /// The client going away ends the turn: dropping the body drops the guard.
+    #[tokio::test]
+    async fn dropping_the_body_aborts_the_turn() {
+        let turn = tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
+        let (_w, rx) = crate::websocket::WsWriter::detached();
+        let body = sse_body(rx, AbortTurnOnDrop(turn.abort_handle()));
+        drop(body);
+        let r = tokio::time::timeout(std::time::Duration::from_secs(2), turn).await.expect("aborted promptly");
+        assert!(r.unwrap_err().is_cancelled());
+    }
+
+    #[test]
+    fn frames_are_sse_data_events_and_a_close_ends_the_stream() {
+        use axum::extract::ws::Message;
+        assert_eq!(sse_frame(&Message::Text(r#"{"type":"content","text":"hi"}"#.into())).unwrap(), "data: {\"type\":\"content\",\"text\":\"hi\"}\n\n");
+        assert!(sse_frame(&Message::Close(None)).is_none());
+    }
+
+    /// The handler, not just the helpers: the turn runs scoped, and the body
+    /// holds the abort guard.
+    #[test]
+    fn the_handler_scopes_the_turn_and_aborts_it_on_disconnect() {
+        let own = crate::test_src::own_code(include_str!("inference.rs"));
+        let h = crate::test_src::fn_body(&own, "async fn coordinator_chat_stream(");
+        assert!(h.contains("let run = scoped_chat_turn("), "the turn must run inside scoped_chat_turn");
+        assert!(h.contains("let principal = crate::bus_principal::current();") && h.contains("let view = crate::perspective::current();"));
+        assert!(h.contains("sse_body(rx, AbortTurnOnDrop(task.abort_handle()))"), "the body must hold the abort guard");
+        assert!(h.contains("chat_turn_identity("), "identity from the subject only");
     }
 }
