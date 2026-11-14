@@ -143,6 +143,39 @@ FLEET_LINE = ("fleet, read-only: on 0.6.24+ each node agent exports its own proc
               "the metrics door, no manual measurement.")
 
 
+def _read_json(p) -> tuple[dict | None, str | None]:
+    try:
+        return json.loads(p.read_text()), None
+    except (OSError, ValueError) as e:
+        return None, f"{p.name} unreadable ({e})"
+
+
+def load_extras(cell: str, d, base: dict | None) -> dict:
+    """The idle series (t0 = memory.json, then memory-idle-<t>.json) and
+    coldload.json beside a cell's memory.json. Expected from the
+    SERIES_CELLS; a missing file there is "not measured: <why>", never
+    dropped. Elsewhere only what is present is shown."""
+    from pathlib import Path
+    d = Path(d)
+    expected = cell in MB.SERIES_CELLS
+    out: dict = {}
+    files = {s: d / f"memory-idle-{s}.json" for s in MB.SERIES_SAMPLES}
+    if expected or any(f.is_file() for f in files.values()):
+        series = [{"sample": "t0", "doc": base} if base else
+                  {"sample": "t0", "missing": "no memory.json in the cell's artifact"}]
+        for s, f in files.items():
+            doc, why = _read_json(f) if f.is_file() else (None, f"no {f.name} in the cell's artifact")
+            series.append({"sample": s, "doc": doc} if doc else {"sample": s, "missing": why})
+        out["series"] = series
+    f = d / "coldload.json"
+    if f.is_file():
+        doc, why = _read_json(f)
+        out["coldload"] = doc if doc else {"missing": why}
+    elif expected:
+        out["coldload"] = {"missing": "no coldload.json in the cell's artifact"}
+    return out
+
+
 def load_memory(specs: list[str]) -> list[dict]:
     """`[CELL=]PATH` per cell -> {cell, measured, why | baseline}. The cell
     name is CELL=, else the file's own meta, else its artifact dir
@@ -167,16 +200,69 @@ def load_memory(specs: list[str]) -> list[dict]:
                 why = "no memory.json in the cell's artifact"
             else:
                 why = "no artifact from the cell (it did not run or did not upload)"
-            out.append({"cell": cell or dir_cell, "measured": False, "why": why})
+            out.append({"cell": cell or dir_cell, "measured": False, "why": why,
+                        **load_extras(cell or dir_cell, p.parent, None)})
             continue
         try:
             doc = json.loads(p.read_text())
             doc["totals"], doc["meta"]  # noqa: B018 - the shape this report reads
         except (OSError, ValueError, KeyError, TypeError) as e:
-            out.append({"cell": cell or dir_cell, "measured": False, "why": f"memory.json unreadable ({e})"})
+            out.append({"cell": cell or dir_cell, "measured": False, "why": f"memory.json unreadable ({e})",
+                        **load_extras(cell or dir_cell, p.parent, None)})
             continue
-        out.append({"cell": cell or doc["meta"].get("cell") or dir_cell, "measured": True, "baseline": doc})
+        name = cell or doc["meta"].get("cell") or dir_cell
+        out.append({"cell": name, "measured": True, "baseline": doc, **load_extras(name, p.parent, doc)})
     return out
+
+
+def _models_line(doc: dict) -> str:
+    ms = doc.get("models_loaded")
+    if ms is None:
+        return "unknown: the sample predates the loaded-model check"
+    if not ms:
+        return doc.get("idle") or "?"
+    return ", ".join(f"{x['model']} ({x.get('size', '?')}, until {x.get('until', '?')})" for x in ms)
+
+
+def render_series(series: list[dict]) -> list[str]:
+    L = ["", "#### Idle series (nothing used the stack between samples)", "",
+         "| sample | since t0 | verdict | grand total current | node share of a one-machine install (current) | models loaded (size, until) |",
+         "|---|---|---|---|---|---|"]
+    for s in series:
+        if "missing" in s:
+            L.append(f"| {s['sample']} | | not measured: {s['missing']} | | | |")
+            continue
+        d = s["doc"]
+        t = d.get("totals", {})
+        since = d.get("meta", {}).get("since_t0_s")
+        L.append(f"| {s['sample']} | {'0 s' if s['sample'] == 't0' else (f'{since} s' if since is not None else '?')} "
+                 f"| {d.get('idle', 'unknown: not recorded')} "
+                 f"| {MB._tot(t['grand']['memory_current_bytes']) if 'grand' in t else '?'} "
+                 f"| {MB._tot(t['node_share']['memory_current_bytes']) if 'node_share' in t else '?'} "
+                 f"| {_models_line(d)} |")
+    return L
+
+
+def render_coldload(c: dict) -> list[str]:
+    if "missing" in c:
+        return ["", f"#### Cold load: not measured: {c['missing']}"]
+    L = ["", "#### Cold load (after first-answer: every model stopped, then timed cold and warm)", "",
+         "unload: " + (", ".join(f"{s['container']}:{s['model']} {'stopped' if s['ok'] else 'NOT stopped (' + s.get('why', '?') + ')'}"
+                               for s in c.get("unload", [])) or "nothing was loaded"),
+         f"cold before the timings: {c.get('cold_confirmed', 'unknown: not recorded')}", "",
+         "| measurement | seconds | first output s | result |", "|---|---|---|---|"]
+    for k, label in (("cold_embed", "cold embed (POST /api/external/embeddings)"), ("warm_embed", "warm embed"),
+                     ("cold_chat", "cold chat (noo chat --message)"), ("warm_chat", "warm chat")):
+        x = (c.get("timings") or {}).get(k)
+        if x is None:
+            L.append(f"| {label} | | | not measured: no record |")
+            continue
+        secs = x.get("seconds")
+        L.append(f"| {label} | {secs if secs is not None else '-'} | {x.get('first_output_s', '-')} | "
+                 f"{'ok' if x.get('ok') else 'FAILED: ' + str(x.get('why', '?'))} |")
+    key = c.get("key") or {}
+    L.append(f"\nservice key: minted={key.get('minted')} revoked={key.get('revoked')}")
+    return L
 
 
 def render_memory(cells: list[dict]) -> list[str]:
@@ -190,6 +276,8 @@ def render_memory(cells: list[dict]) -> list[str]:
     for c in cells:
         if not c["measured"]:
             L += ["", f"### {c['cell']}: not measured: {c['why']}"]
+            L += render_series(c["series"]) if "series" in c else []
+            L += render_coldload(c["coldload"]) if "coldload" in c else []
             continue
         d = c["baseline"]
         m = d["meta"]
@@ -218,15 +306,34 @@ def render_memory(cells: list[dict]) -> list[str]:
                            ("grand", "**grand total**"), ("controller_share", "controller share"),
                            ("node_share", f"**{NODE_SHARE_LABEL}**")):
             L.append(f"| {label} | " + " | ".join(MB._tot(t[key][k]) for k in MB.TOTAL_FIGURES) + " |")
+        L += render_series(c["series"]) if "series" in c else []
+        L += render_coldload(c["coldload"]) if "coldload" in c else []
     return L
 
 
+def _sample_json(s: dict) -> dict:
+    if "missing" in s:
+        return {"sample": s["sample"], "measured": False, "why": s["missing"]}
+    d = s["doc"]
+    return {"sample": s["sample"], "measured": True, "since_t0_s": d.get("meta", {}).get("since_t0_s", 0),
+            "idle": d.get("idle"), "models_loaded": d.get("models_loaded"),
+            "grand_memory_current": (d.get("totals", {}).get("grand") or {}).get("memory_current_bytes"),
+            "node_share_memory_current": (d.get("totals", {}).get("node_share") or {}).get("memory_current_bytes")}
+
+
 def memory_json(cells: list[dict]) -> dict:
+    def extras(c):
+        out = {}
+        if "series" in c:
+            out["series"] = [_sample_json(s) for s in c["series"]]
+        if "coldload" in c:
+            out["coldload"] = c["coldload"]
+        return out
     return {"fleet": FLEET_LINE, "node_share_label": NODE_SHARE_LABEL,
-            "cells": [{"cell": c["cell"], "measured": False, "why": c["why"]} if not c["measured"]
+            "cells": [{"cell": c["cell"], "measured": False, "why": c["why"], **extras(c)} if not c["measured"]
                       else {"cell": c["cell"], "measured": True, **{k: c["baseline"].get(k) for k in
                             ("idle", "models_loaded", "meta", "containers", "containers_omitted", "host_units", "totals")
-                            if k in c["baseline"]}}
+                            if k in c["baseline"]}, **extras(c)}
                       for c in cells]}
 
 

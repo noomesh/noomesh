@@ -350,6 +350,24 @@ case "$CELL" in
         step probe-memory-baseline 600 -- python3 "$HERE/memory_baseline.py" measure --out "$OUT/memory.json" \
             --cell "$CELL" --model "$MODEL" --settle "$MEMORY_SETTLE_S" ;;
 esac
+# PROBE (operator 2026-11-14): is the chat model resident at idle FOREVER,
+# or only warm after install? Two more samples of the same memory.json shape
+# (memory-idle-t10.json, memory-idle-t40.json) at t0 + 10 min and t0 + 40
+# min, t0 being the sample above: past ollama's 5 min default keep_alive and
+# our 30 min embed keep_alive. NOTHING uses the stack in between (no step
+# runs while a sample waits). Each records `ollama ps` per ollama*
+# container with every model's SIZE and UNTIL, raw lines kept. The default
+# cell only: ~41 min of its 120 min budget (it ran 13-18 min, 2026-11-13/14).
+# A probe: never the failed step.
+IDLE_SERIES_CELL=ubuntu-24.04-amd64-default
+if [ "$CELL" = "$IDLE_SERIES_CELL" ]; then
+    IDLE_T0="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["meta"]["epoch"])' "$OUT/memory.json" 2>/dev/null || date +%s)"
+    for IDLE_MIN in 10 40; do
+        step "probe-idle-t$IDLE_MIN" $(( IDLE_MIN * 60 + 300 )) -- python3 "$HERE/memory_baseline.py" measure \
+            --out "$OUT/memory-idle-t$IDLE_MIN.json" --cell "$CELL" --model "$MODEL" \
+            --sample "t$IDLE_MIN" --t0 "$IDLE_T0" --until $(( IDLE_T0 + IDLE_MIN * 60 ))
+    done
+fi
 # The single-turn line docs/getting-started/first-chat.md gives, read from the
 # doc itself (its first `noo chat --message "…"` line), so the page and the
 # test cannot drift. The answer must be an answer: a model that asks for more
@@ -386,6 +404,18 @@ step first-answer 1800 -- sh -c '
     echo "FIRST-ANSWER NOTE: the tiny test model ($TINY_MODEL) did not answer the prompt; this cell runs MODEL=$MODEL, not the product default, so this is not a product verdict"
   fi' || fail_onboarded
 meta first_answer_s "$(( $(date +%s) - CELL_START ))"
+
+# PROBE (operator 2026-11-14): cold-load delays, AFTER first-answer so the
+# idle series above is untouched. coldload.py stops every model ollama ps
+# lists (docker exec <c> ollama stop), then times ONE embed through the
+# gateway (POST /api/external/embeddings with a service key it mints, never
+# prints and revokes) and ONE `noo chat --message "$FIRST_PROMPT"` from
+# cold, then both again warm. Writes $OUT/coldload.json. The default cell
+# only (the idle-series cell). A probe: never the failed step.
+if [ "$CELL" = "$IDLE_SERIES_CELL" ]; then
+    step probe-coldload 3000 -- python3 "$HERE/coldload.py" --out "$OUT/coldload.json" --cell "$CELL" \
+        --prompt "$FIRST_PROMPT"
+fi
 
 # PROBE (fa, general 11-13): where does a chat get an ingested document back?
 # first-chat.md ingests ~/notes/anything.md and proves it with `noo rag query`
