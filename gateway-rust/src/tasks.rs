@@ -740,105 +740,7 @@ async fn finish_row(db: &sqlx::PgPool, id: &str, ok: bool, text: &str) -> Result
     Ok(n > 0)
 }
 
-/// i779: the message a stop sends to the harness of the node a task is
-/// running on (`{"stop": id}` on that node's task subject, which the harness
-/// already reads), so the loop in flight is cut there and its slot freed
-/// now. `None` for a task with no harness run to cut: one that runs on the
-/// controller itself (in process; it ends at its next checkpoint, as
-/// before) or that is not running anywhere (`open` and queued, or finished).
-pub fn cut_signal(task_node: Option<&str>, was: &str, controller: &str, id: &str) -> Option<(String, Vec<u8>)> {
-    let node = task_node.map(str::trim).filter(|n| !n.is_empty() && *n != controller)?;
-    if !matches!(was, "running" | "checkpointed") {
-        return None;
-    }
-    Some((task_subject(node), serde_json::to_vec(&json!({"stop": id})).ok()?))
-}
-
-/// An account was DISABLED (general, 2026-11-14: a disabled account's task
-/// that keeps running a model turn for up to the turn deadline is an
-/// authority gap): stop every live task it owns now, with
-/// `account_disabled`, and cut the loop in flight of each one running on a
-/// node's harness ([`cut_signal`]). A task running in process ends its loop
-/// at the next checkpoint, where the refused token renewal stops it too.
-/// Returns how many it stopped and how many it cut.
-pub async fn stop_account_tasks(state: &AppState, owner: &str) -> (usize, usize) {
-    let tasks = match crate::repo::tasks::live_of_owner(&state.db, owner).await {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!(user = owner, error = %e, "task: a disabled account's tasks could not be listed; they stop at their next checkpoint");
-            return (0, 0);
-        }
-    };
-    let controller = crate::agent_messages::controller_node();
-    let (mut stopped, mut cut) = (0, 0);
-    for (id, node, was) in tasks {
-        let id = id.to_string();
-        match stop_with(&state.db, &id, "account_disabled").await {
-            Ok(true) => stopped += 1,
-            Ok(false) => continue,
-            Err(e) => {
-                tracing::warn!(task = %id, user = owner, error = %e, "task: not stopped for a disabled account");
-                continue;
-            }
-        }
-        if let Some((subject, body)) = cut_signal(node.as_deref(), &was, &controller, &id) {
-            match state.nats.publish(subject, body.into()).await {
-                Ok(()) => cut += 1,
-                Err(e) => tracing::warn!(task = %id, error = %e, "task: a disabled account's loop not cut; it ends at the next checkpoint"),
-            }
-        }
-    }
-    tracing::info!(event = "account_tasks_stopped", user = owner, stopped, cut, "task: a disabled account's tasks stopped");
-    (stopped, cut)
-}
-
-/// i779: the note a cut task carries. It says what happened and claims no
-/// checkpoint that was not reached: the loop in flight (loop `done + 1`) was
-/// ended, and only what the last checkpoint (`done` loops) recorded stands.
-pub fn cut_note(node: &str, done: i32) -> String {
-    format!(
-        "stopped mid-loop: the stop cut loop {} on {node}; nothing after the last checkpoint ({done} loop(s) done) is kept",
-        done + 1
-    )
-}
-
-/// i779: whether a `cut` report applies to this task: it came on the ready
-/// subject of the node the task ran on, and the task is stopped. A node can
-/// only describe its own work, and only a stopped task was cut.
-pub fn cut_note_applies(task_node: Option<&str>, state: &str, ready_subject_seen: &str) -> bool {
-    task_node.is_some_and(|n| ready_subject(n) == ready_subject_seen) && state == "stopped"
-}
-
-/// The task ids a harness reported as cut on `harness.ready` (i779).
-fn cut_from_ready(body: &serde_json::Value) -> Vec<String> {
-    body.get("cut").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str()).map(str::to_string).collect()).unwrap_or_default()
-}
-
-/// Record that a stopped task's loop was cut (i779).
-async fn note_cut(db: &sqlx::PgPool, id: &str, ready_subject_seen: &str) {
-    let task = match get(db, id).await {
-        Ok(Some(t)) => t,
-        Ok(None) => return,
-        Err(e) => {
-            tracing::warn!(task = id, error = %e, "task: cut report not applied");
-            return;
-        }
-    };
-    if !cut_note_applies(task.node.as_deref(), &task.state, ready_subject_seen) {
-        tracing::warn!(task = id, subject = ready_subject_seen, state = %task.state, "task: cut report from another node or for a task that is not stopped; ignored");
-        return;
-    }
-    let note = cut_note(task.node.as_deref().unwrap_or("its node"), task.loops as i32);
-    let Ok(uuid) = uuid::Uuid::parse_str(id) else { return };
-    match crate::repo::tasks::note_cut(db, uuid, &note).await {
-        Ok(_) => tracing::info!(event = "task_cut", task = id, "task: its stop cut the loop in flight"),
-        Err(e) => tracing::warn!(task = id, error = %e, "task: cut note not recorded"),
-    }
-}
-
-/// The owner's stop. A task on a node's harness is also cut there now (the
-/// route sends [`cut_signal`]); one running in process ends at its next
-/// checkpoint.
+/// The owner's stop: honoured at the next checkpoint.
 pub async fn stop(db: &sqlx::PgPool, id: &str) -> Result<bool> {
     stop_with(db, id, "stopped_by_owner").await
 }
@@ -1414,11 +1316,6 @@ pub fn spawn_ready_watcher(state: std::sync::Arc<AppState>) {
             let (stalled, secs) = stalled_from_ready(&body);
             for id in stalled {
                 fail_stalled(&state.db, &id, &msg.subject, secs).await;
-            }
-            // i779: tasks whose stop cut their loop there; the slot they
-            // held is free, and the hand-back below moves the queue up.
-            for id in cut_from_ready(&body) {
-                note_cut(&state.db, &id, &msg.subject).await;
             }
             match list_unfinished_on(&state.db, &node).await {
                 Ok(tasks) if !tasks.is_empty() => {
@@ -2068,72 +1965,5 @@ mod mark_running_read_error_tests {
         let id = uuid::Uuid::new_v4().to_string();
         let e = super::mark_running(&pool, &id, None).await.expect_err("an unreadable DB is an error");
         assert!(format!("{e:#}").contains("state before marking it running"), "{e:#}");
-    }
-}
-
-#[cfg(test)]
-mod cut_tests {
-    //! i779: a stop for a task on a node's harness is sent there and cuts the
-    //! loop in flight; the cut task says so, and claims no checkpoint.
-    use super::*;
-
-    #[test]
-    fn a_running_task_on_a_node_is_cut_there() {
-        let (subject, body) = cut_signal(Some("mcmini"), "running", "pop-os", "t-1").expect("cut");
-        assert_eq!(subject, task_subject("mcmini"));
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(), json!({"stop": "t-1"}));
-        assert!(cut_signal(Some("mcmini"), "checkpointed", "pop-os", "t-1").is_some(), "between loops it still holds the slot");
-    }
-
-    #[test]
-    fn nothing_is_cut_that_runs_in_process_or_is_not_running() {
-        assert!(cut_signal(Some("pop-os"), "running", "pop-os", "t-1").is_none(), "in process: ends at its checkpoint");
-        assert!(cut_signal(None, "running", "pop-os", "t-1").is_none());
-        assert!(cut_signal(Some(""), "running", "pop-os", "t-1").is_none());
-        for was in ["open", "done", "failed", "stopped"] {
-            assert!(cut_signal(Some("mcmini"), was, "pop-os", "t-1").is_none(), "{was}");
-        }
-    }
-
-    #[test]
-    fn the_cut_note_claims_no_checkpoint_it_did_not_reach() {
-        let n = cut_note("mcmini", 3);
-        assert!(n.starts_with("stopped mid-loop: the stop cut loop 4 on mcmini"), "{n}");
-        assert!(n.contains("nothing after the last checkpoint (3 loop(s) done) is kept"), "{n}");
-        assert!(!n.contains("ends at its") && !n.contains("checkpoint reached"), "{n}");
-    }
-
-    #[test]
-    fn a_cut_report_applies_only_from_the_tasks_node_and_to_a_stopped_task() {
-        let subj = ready_subject("mcmini");
-        assert!(cut_note_applies(Some("mcmini"), "stopped", &subj));
-        assert!(!cut_note_applies(Some("aserve"), "stopped", &subj), "another node's report");
-        assert!(!cut_note_applies(Some("mcmini"), "running", &subj), "not stopped: not cut");
-        assert!(!cut_note_applies(None, "stopped", &subj));
-    }
-
-    /// A disabled account's tasks are stopped AND each harness loop is cut
-    /// (a security check: without the cut, its model turn ran on for up to
-    /// the turn deadline). Held on the routine's own source: it needs a
-    /// database and a bus to run.
-    #[test]
-    fn a_disabled_accounts_tasks_are_stopped_and_cut() {
-        let own = crate::test_src::own_code(include_str!("tasks.rs"));
-        let body = crate::test_src::fn_body(&own, "pub async fn stop_account_tasks(");
-        assert!(body.contains("crate::repo::tasks::live_of_owner(&state.db, owner)"), "every live task of the account");
-        assert!(body.contains(r#"stop_with(&state.db, &id, "account_disabled")"#), "stopped with the reason add-ons see");
-        let stop = body.find("stop_with(").unwrap();
-        let sig = body.find("cut_signal(node.as_deref(), &was").expect("the loop in flight is cut");
-        let publish = body.find("state.nats.publish(subject, body.into())").expect("the cut is sent");
-        assert!(stop < sig && sig < publish, "stop, then cut");
-        let repo = crate::test_src::own_code(include_str!("repo/tasks.rs"));
-        let q = crate::test_src::fn_body(&repo, "pub async fn live_of_owner<");
-        assert!(q.contains("t.state IN ('open','running','checkpointed')") && !q.contains("parent_id IS NULL") && !q.contains("LIMIT"), "{q}");
-    }
-
-    #[test]
-    fn the_ready_body_names_the_cut_tasks() {
-        assert_eq!(cut_from_ready(&json!({"node": "n", "slot_freed": true, "cut": ["a", "b"]})), vec!["a", "b"]);
-        assert!(cut_from_ready(&json!({"node": "n", "slot_freed": true})).is_empty());
     }
 }

@@ -784,9 +784,6 @@ mod publish_sites {
         "agent_messages.rs",
         "routes/admin.rs",
         "routes/cluster.rs",
-        // i779: a stop sends `{"stop": id}` on `harness.task.<node>` (the
-        // node's harness task subject), never `worker.*`.
-        "routes/tasks.rs",
         // Control over the bus (i131): publishes `node.<id>.rpc.<op>`, never `worker.*`.
         "node_rpc.rs",
         // i179: publishes `work.embed.<slug>` (the WORK_EMBED work queue),

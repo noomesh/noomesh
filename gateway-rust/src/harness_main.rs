@@ -196,56 +196,6 @@ fn spawn_stall_watchdog(
     });
 }
 
-/// i779: a stop for a task this harness holds arrives on the task subject
-/// as `{"stop": "<task id>"}`; anything else there is a task request. The
-/// gateway sends it with `noo task stop` (POST /api/tasks/{id}/stop) for a
-/// task running on this node, so the stop no longer waits for the loop in
-/// flight: a stalled model request held a capacity-1 harness for up to the
-/// turn deadline (about 14 minutes) after the stop.
-fn stop_request(payload: &[u8]) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_slice(payload).ok()?;
-    v.get("stop")?.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
-}
-
-/// How long a cut waits for the aborted run to end before it reports the
-/// slot anyway. An aborted run ends at its next await point (an in-flight
-/// HTTP request is one), so this is a ceiling, not a wait.
-const CUT_BOUND: Duration = Duration::from_secs(5);
-
-/// i779: cut a task this harness is running: abort its run (the in-flight
-/// model request, and a vendor CLI child, end with it, and its permit drops),
-/// take it out of the running set, and wait at most `bound` for the run to
-/// have really ended, so the slot is free when the gateway hands the queue
-/// back. `None`: the task is not running here. `Some(ended)`: it was cut;
-/// `ended` says the run finished within the bound.
-async fn cut_task(
-    id: &str,
-    running: &std::sync::Mutex<std::collections::HashSet<String>>,
-    handles: &std::sync::Mutex<std::collections::HashMap<String, tokio::task::AbortHandle>>,
-    bound: Duration,
-) -> Option<bool> {
-    if !running.lock().map(|r| r.contains(id)).unwrap_or(false) {
-        return None;
-    }
-    let handle = handles.lock().ok().and_then(|mut h| h.remove(id));
-    if let Some(h) = &handle {
-        h.abort();
-    }
-    if let Ok(mut r) = running.lock() {
-        r.remove(id);
-    }
-    crate::tasks::progress::forget(id);
-    let Some(h) = handle else { return Some(true) };
-    let until = tokio::time::Instant::now() + bound;
-    while !h.is_finished() {
-        if tokio::time::Instant::now() >= until {
-            return Some(false);
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    Some(true)
-}
-
 /// The drain bound from the environment: whole seconds, 1..=3600, else the
 /// default.
 pub fn drain_bound(get: &dyn Fn(&str) -> Option<String>) -> Duration {
@@ -520,32 +470,6 @@ pub async fn run() -> Result<()> {
                     _ = stop_t.changed() => break,
                     m = tasks.next() => match m { Some(m) => m, None => break },
                 };
-                if let Some(id) = stop_request(&msg.payload) {
-                    // i779: cut it now, off this loop so the subscription
-                    // keeps reading, then tell the gateway the slot is free
-                    // (it hands this node's queue back) and which task was cut.
-                    let (running_c, handles_c, nats_c, node_c, reply) = (running_t.clone(), handles_t.clone(), nats_t.clone(), node_t.clone(), msg.reply.clone());
-                    tokio::spawn(async move {
-                        let cut = cut_task(&id, &running_c, &handles_c, CUT_BOUND).await;
-                        match cut {
-                            None => tracing::info!(task = %id, "harness: stop for a task not running here; nothing to cut"),
-                            Some(ended) => {
-                                if ended {
-                                    tracing::info!(task = %id, "harness: task cut by its stop; slot freed");
-                                } else {
-                                    tracing::warn!(task = %id, bound_secs = CUT_BOUND.as_secs(), "harness: task cut by its stop; its run had not ended within the bound");
-                                }
-                                let _ = nats_c
-                                    .publish(crate::tasks::ready_subject(&node_c), serde_json::to_vec(&json!({"node": node_c, "slot_freed": true, "cut": [id]})).unwrap_or_default().into())
-                                    .await;
-                            }
-                        }
-                        if let Some(reply) = reply {
-                            let _ = nats_c.publish(reply, serde_json::to_vec(&json!({"cut": cut.is_some(), "ended": cut.unwrap_or(false), "node": node_c})).unwrap_or_default().into()).await;
-                        }
-                    });
-                    continue;
-                }
                 let req: crate::tasks::TaskRequest = match serde_json::from_slice(&msg.payload) {
                     Ok(r) => r,
                     Err(e) => {
@@ -1044,16 +968,8 @@ mod tests {
         assert!(dedupe < permit, "the dedupe runs before a permit is taken");
         let busy = loop_body.find("\"busy\": true").expect("at capacity: a busy reply");
         assert!(permit < busy && busy < loop_body.find("\"ack\": true, \"node\"").unwrap(), "busy is answered on the refusal path");
-        // Two paths re-announce a freed slot; on each the id leaves the
-        // running set first. A finished task: its job's tail.
-        let job = loop_body.split("let _permit = permit;").nth(1).expect("the task's job");
-        assert!(job.contains("\"slot_freed\": true"), "a finished task re-announces ready");
-        assert!(job.find("r.remove(&req.task_id)").unwrap() < job.find("\"slot_freed\": true").unwrap(), "the id leaves the running set before the re-announce");
-        // A stopped task (i779): cut_task takes it out of the running set,
-        // and only then is the cut re-announced.
-        let cut = loop_body.split("if let Some(id) = stop_request(&msg.payload)").nth(1).expect("the stop path");
-        let cut = &cut[..cut.find("continue;").expect("the stop path ends")];
-        assert!(cut.find("cut_task(&id").unwrap() < cut.find("\"slot_freed\": true").unwrap(), "a cut task leaves the running set before the re-announce");
+        assert!(loop_body.contains("\"slot_freed\": true"), "a finished task re-announces ready");
+        assert!(loop_body.find("r.remove(&req.task_id)").unwrap() < loop_body.find("\"slot_freed\": true").unwrap(), "the id leaves the running set before the re-announce");
         let turns = src.split("harness: at capacity; not taking this turn").nth(1).unwrap();
         assert!(turns[..300].contains("\"busy\": true"), "a turn at capacity is answered busy too");
     }
@@ -1392,76 +1308,5 @@ mod placement_race_tests {
         assert!(fetch.contains("reqwest::StatusCode::NOT_FOUND") && fetch.contains("if !resp.status().is_success()"), "{fetch}");
         let ask = crate::test_src::fn_body(&code, "async fn ask_agent_kind(");
         assert!(ask.contains("Err(e) => match delays.next()"), "an error (a 503 included) is asked again: {ask}");
-    }
-}
-
-#[cfg(test)]
-mod cut_tests {
-    //! i779: `noo task stop` cuts the in-flight turn of a harness task and
-    //! frees its capacity permit at once; it used to wait for the loop to
-    //! reach its checkpoint, and a stalled model request held a capacity-1
-    //! harness for up to the turn deadline (900 s less 45 s) after the stop
-    //! (0.6.24-rc.7 rehearsal, A-tasks).
-    use super::*;
-    use std::collections::{HashMap, HashSet};
-    use std::sync::Mutex;
-
-    /// A model endpoint that accepts and never answers: the request stalls.
-    async fn stalled_endpoint() -> String {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = l.local_addr().expect("addr");
-        tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((s, _)) = l.accept().await {
-                held.push(s); // keep the connection open, say nothing
-            }
-        });
-        format!("http://{addr}/v1/chat/completions")
-    }
-
-    /// A capacity-1 harness slot held by a task whose model request stalls.
-    async fn stalled_task(id: &str) -> (Arc<tokio::sync::Semaphore>, Mutex<HashSet<String>>, Mutex<HashMap<String, tokio::task::AbortHandle>>) {
-        let limit = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = limit.clone().try_acquire_owned().expect("the slot");
-        let url = stalled_endpoint().await;
-        let job = tokio::spawn(async move {
-            let _permit = permit;
-            let _ = reqwest::Client::new().post(url).body("{}").send().await;
-        });
-        tokio::time::sleep(Duration::from_millis(100)).await; // the request is in flight
-        assert_eq!(limit.available_permits(), 0, "the stalled task holds the slot");
-        let running = Mutex::new(HashSet::from([id.to_string()]));
-        let handles = Mutex::new(HashMap::from([(id.to_string(), job.abort_handle())]));
-        (limit, running, handles)
-    }
-
-    #[test]
-    fn a_stop_message_is_told_from_a_task_request() {
-        assert_eq!(stop_request(br#"{"stop":"t-1"}"#), Some("t-1".to_string()));
-        assert_eq!(stop_request(br#"{"stop":"  "}"#), None);
-        assert_eq!(stop_request(br#"{"task_id":"t-1","objective":"x"}"#), None, "a task request is not a stop");
-        assert_eq!(stop_request(b"not json"), None);
-    }
-
-    #[tokio::test]
-    async fn a_stop_cuts_a_stalled_model_request_and_frees_the_slot() {
-        let (limit, running, handles) = stalled_task("t-1").await;
-        let t0 = std::time::Instant::now();
-        let cut = cut_task("t-1", &running, &handles, CUT_BOUND).await;
-        assert_eq!(cut, Some(true), "the stalled run ended");
-        assert!(t0.elapsed() < Duration::from_secs(2), "the slot was freed promptly, not at a checkpoint: {:?}", t0.elapsed());
-        assert_eq!(limit.available_permits(), 1, "the permit is free");
-        assert!(limit.clone().try_acquire_owned().is_ok(), "the next task can take the slot");
-        assert!(!running.lock().unwrap().contains("t-1"), "no longer running here");
-        assert!(handles.lock().unwrap().is_empty(), "its handle is gone");
-    }
-
-    #[tokio::test]
-    async fn a_stop_for_a_task_not_here_cuts_nothing() {
-        let (limit, running, handles) = stalled_task("t-1").await;
-        assert_eq!(cut_task("t-other", &running, &handles, CUT_BOUND).await, None);
-        assert_eq!(limit.available_permits(), 0, "the running task keeps its slot");
-        assert!(running.lock().unwrap().contains("t-1"));
-        let _ = cut_task("t-1", &running, &handles, CUT_BOUND).await; // tidy up
     }
 }

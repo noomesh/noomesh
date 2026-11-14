@@ -7,7 +7,7 @@
 //!                                (Idempotency-Key: a retry within 24 h returns the same task, "idempotent_replay": true)
 //!   GET  /api/tasks?state=&limit=                                 → own tasks (operators: all)
 //!   GET  /api/tasks/{id}                                          → with its budget and the owner's allowance
-//!   POST /api/tasks/{id}/stop                                     → stopped (on a node's harness the loop in flight is cut now; in process it ends at its checkpoint)
+//!   POST /api/tasks/{id}/stop                                     → stopped (a loop in flight ends at its checkpoint)
 //!   POST /api/tasks/stop         {via, user?}                     → stop the caller's own tasks created via `addon:<name>`
 //!   POST /api/tasks/{id}/resubmit {token_budget?}                 → more tokens; a parked task resumes
 //!   POST /api/tasks/{id}/ask      {question}                      → a question to the owner; parks at the boundary
@@ -319,31 +319,20 @@ async fn tasks_answer(State(state): State<Arc<AppState>>, ctx: Option<Extension<
     Ok(Json(json!({"task": after, "node": started.node, "dispatched": started.dispatched, "queued": started.queued, "why": started.why})))
 }
 
-/// Stop a task: it is `stopped` now. On a node's harness the loop in flight
-/// is cut there at once (i779: `cut` true; the harness frees its slot and
-/// the node's queue moves up); a task running in process ends its loop at
-/// the next checkpoint, and its loops' tool calls stand. `was` and `cut` let
-/// the caller say which (i227 fix 3).
+/// Stop a task: it is `stopped` now; a loop already in flight (`was`
+/// running) ends at its next checkpoint, and its loops' tool calls stand.
+/// `was` lets the caller say which (i227 fix 3).
 async fn tasks_stop(State(state): State<Arc<AppState>>, ctx: Option<Extension<RequesterCtx>>, adt: Option<Extension<AddonDelegation>>, Path(id): Path<String>) -> AppResult {
     let task = owned(&state, &ctx, &adt, &id).await?;
     let stopped = crate::tasks::stop(&state.db, &task.id).await.map_err(|e| AppError::Internal(e.to_string()))?;
-    let mut cut = false;
-    if stopped {
-        if let Some((subject, body)) = crate::tasks::cut_signal(task.node.as_deref(), &task.state, &crate::agent_messages::controller_node(), &task.id) {
-            match state.nats.publish(subject, body.into()).await {
-                Ok(()) => cut = true,
-                Err(e) => tracing::warn!(task = %task.id, error = %e, "task: stop not sent to its harness; its loop ends at the next checkpoint"),
-            }
-        }
-    }
     let (user, _) = person(&ctx)?;
     crate::audit::record(
         &state.db,
         AuditEvent::new(AuditKind::TaskStopped, &user, &task.id)
             .outcome(if stopped { crate::audit::Outcome::custom("stopped") } else { crate::audit::Outcome::custom("not_running") })
-            .details(json!({"was": task.state, "cut": cut})),
+            .details(json!({"was": task.state})),
     ).await;
-    Ok(Json(json!({"stopped": stopped, "task_id": task.id, "was": task.state, "cut": cut})))
+    Ok(Json(json!({"stopped": stopped, "task_id": task.id, "was": task.state})))
 }
 
 #[derive(Deserialize)]

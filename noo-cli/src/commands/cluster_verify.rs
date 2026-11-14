@@ -7174,6 +7174,126 @@ fn verdict_line(t: &Tally) -> (Glyph, String) {
     (Glyph::Ok, format!("fleet healthy{}{seen}", t.context))
 }
 
+/// Where a WARN row goes in the brief rendering. A FAIL or STARTING row is
+/// never tiered: it always shows in full, first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tier {
+    /// Real advice, not for day one: grouped under "Worth doing later".
+    Later,
+    /// Says nothing on this box (no tailnet, no agent container, not yet
+    /// probed): counted under "Not applicable here".
+    NotHere,
+}
+
+/// The brief tiers, beside the row names (general 11-14, i677). A row whose
+/// detail does not contain the given text keeps its normal place: "not read"
+/// is not applicable, a tailnet policy that IS read and wrong is not.
+const BRIEF_TIERS: &[(&str, Option<&str>, Tier)] = &[
+    ("last backup", None, Tier::Later),
+    ("off-site backup", None, Tier::Later),
+    ("holds", None, Tier::Later),
+    ("at-rest tpm", None, Tier::Later),
+    ("at-rest swap", None, Tier::Later),
+    ("at-rest outside the set", None, Tier::Later),
+    ("at-rest volume", None, Tier::Later),
+    ("tailnet policy", Some("not read"), Tier::NotHere),
+    ("tailscale ssh", Some("could not read"), Tier::NotHere),
+    ("node-agent privilege", Some("not checked"), Tier::NotHere),
+    ("inbound", Some("not yet checked"), Tier::NotHere),
+];
+
+fn brief_tier(c: &Check) -> Option<Tier> {
+    if c.verdict != Verdict::Warn {
+        return None;
+    }
+    if AT_REST_DIR_ROWS.contains(&c.name) {
+        return Some(Tier::Later);
+    }
+    BRIEF_TIERS.iter().find_map(|(name, needle, tier)| {
+        (*name == c.name && needle.is_none_or(|n| c.detail.contains(n))).then_some(*tier)
+    })
+}
+
+/// The brief split of one section. Every row lands in exactly one of
+/// `passed`, `shown`, `later`, `not_here`, so the counts add up to the
+/// section; `shown` keeps every FAIL and STARTING row. Pure.
+#[derive(Debug, Default)]
+struct BriefSplit<'a> {
+    passed: usize,
+    shown: Vec<&'a Check>,
+    later: Vec<&'a Check>,
+    not_here: Vec<&'a Check>,
+}
+
+fn brief_split(checks: &[Check]) -> BriefSplit<'_> {
+    let mut b = BriefSplit::default();
+    for c in checks {
+        match (c.verdict, brief_tier(c)) {
+            (Verdict::Ok, _) => b.passed += 1,
+            (_, Some(Tier::Later)) => b.later.push(c),
+            (_, Some(Tier::NotHere)) => b.not_here.push(c),
+            _ => b.shown.push(c),
+        }
+    }
+    b
+}
+
+/// One section, rendered the way the caller asked.
+fn show(title: &str, checks: &[Check], verbose: bool, brief: bool) -> bool {
+    if brief && !verbose { render_brief(title, checks) } else { render(title, checks, verbose) }
+}
+
+/// onboard's closing verify: the section line, then the rows a new user
+/// should read in full (failures first, with their remedies), then the
+/// grouped rest, counted.
+fn render_brief(title: &str, checks: &[Check]) -> bool {
+    let b = brief_split(checks);
+    let mut shown: Vec<Check> = b.shown.iter().map(|c| (*c).clone()).collect();
+    shown.sort_by_key(|c| std::cmp::Reverse(severity(c.verdict)));
+    println!("{}", summary_line(title, &digest(checks, false).counts));
+    if !shown.is_empty() {
+        let rows: Vec<Vec<String>> = shown.iter().map(|c| {
+            let (glyph, detail) = match c.verdict {
+                Verdict::Ok => (Glyph::Ok, ui::muted(&c.detail)),
+                Verdict::Warn | Verdict::Starting => (Glyph::Warn, ui::warn(&c.detail)),
+                Verdict::Fail => (Glyph::Err, ui::err(&c.detail)),
+                Verdict::Accepted => (Glyph::Accepted, c.detail.clone()),
+            };
+            vec![ui::glyph_cell(glyph), c.name.to_string(), detail]
+        }).collect();
+        print!("{}", ui::table(&[Col::left(""), Col::left("invariant"), Col::left("state")], &rows));
+        let grouped = remedies_to_print(title, &shown);
+        let whys: Vec<String> = grouped.iter().map(|(_, names)| names.join(", ")).collect();
+        let entries: Vec<(&str, &str)> = grouped.iter().zip(&whys).map(|((r, _), w)| (*r, w.as_str())).collect();
+        ui::guide(&entries);
+    }
+    if !b.later.is_empty() {
+        println!("  Worth doing later ({}):", b.later.len());
+        for line in later_lines(&b.later) {
+            println!("    {line}");
+        }
+    }
+    if !b.not_here.is_empty() {
+        let names: Vec<&str> = b.not_here.iter().map(|c| c.name).collect();
+        println!("  Not applicable here ({}): {} (noo cluster verify shows them)", names.len(), names.join(", "));
+    }
+    checks.iter().all(|c| c.verdict != Verdict::Fail)
+}
+
+/// "Worth doing later" lines: one per row, the at-rest rows as one line. Pure.
+fn later_lines(later: &[&Check]) -> Vec<String> {
+    let is_at_rest = |c: &&Check| AT_REST_DIR_ROWS.contains(&c.name) || c.name.starts_with("at-rest");
+    let (rest, other): (Vec<&Check>, Vec<&Check>) = later.iter().copied().partition(is_at_rest);
+    let mut out: Vec<String> = other.iter().map(|c| format!("{}: {}", c.name, c.detail)).collect();
+    if !rest.is_empty() {
+        out.push(format!(
+            "data at rest: {} rows in the clear on this disk (no encrypted volume or TPM here); noo cluster verify lists each",
+            rest.len()
+        ));
+    }
+    out
+}
+
 fn render(title: &str, checks: &[Check], verbose: bool) -> bool {
     let d = digest(checks, verbose);
     if verbose {
@@ -7215,12 +7335,16 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut controller = false;
     let mut wait = false;
     let mut timings = false;
+    // onboard's closing verify only: failures in full, then the rest grouped
+    // (see brief_split). Plain verify, --verbose and --json are unchanged.
+    let mut brief = false;
     for a in args {
         match a.as_str() {
             "--controller" => controller = true,
             "--all" => {}
             "--wait" => wait = true,
             "--timings" => timings = true,
+            "--brief" => brief = true,
             s if s.starts_with('-') => return Err(Unhandled),
             s => nodes.push(s.to_string()),
         }
@@ -7310,7 +7434,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 node_json.push(serde_json::json!({ "node": id, "ok": node_ok, "checks": checks_json(&checks) }));
             } else {
                 let title = format!("node {id}");
-                render(&title, &checks, g.verbose);
+                show(&title, &checks, g.verbose, brief);
                 tally.add(&title, &checks);
             }
         }
@@ -7348,7 +7472,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     seat_json.push(serde_json::json!({ "seat": name, "ok": seat_ok, "checks": checks_json(&checks) }));
                 } else {
                     let title = format!("seat {name}");
-                    render(&title, &checks, g.verbose);
+                    show(&title, &checks, g.verbose, brief);
                     tally.add(&title, &checks);
                 }
             }
@@ -7883,7 +8007,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             if !want_nodes {
                 println!("{}", ui::header("cluster verify", Some("controller")));
             }
-            render("controller", &checks, g.verbose);
+            show("controller", &checks, g.verbose, brief);
             tally.add("controller", &checks);
         }
     }
@@ -11728,6 +11852,45 @@ mod tests {
 
     /// Accepted is its own verdict: "accepted" in --json, a distinct glyph,
     /// never counted as a failure, and carries no remedy to print.
+    /// onboard's closing verify (--brief, general 11-14): every row lands in
+    /// exactly one group, so the counts add up; a FAIL or STARTING row is never
+    /// tiered out of sight; a "not applicable" tier needs its detail text.
+    #[test]
+    fn the_brief_split_hides_no_failure_and_drops_no_row() {
+        let starting = Check { name: "inbound", verdict: Verdict::Starting, detail: "not yet checked".into(), remedy: None };
+        let rows = vec![
+            ok("posture", "3 gates at desired"),
+            fail("last backup", "the backup job failed", "noo backup run"),
+            starting,
+            warn("last backup", "no successful backup on record", None),
+            warn("off-site backup", "never decided", None),
+            warn("holds", "docker-ce not held", None),
+            warn("loki at rest", "in the clear", None),
+            warn("pki at rest", "in the clear", None),
+            warn("at-rest swap", "swap not encrypted", None),
+            warn("tailnet policy", "not read (no tailnet API key?)", None),
+            warn("tailnet policy", "the policy denies tag:controller", None),
+            warn("node-agent privilege", "not checked: no noo-node-agent container", None),
+            warn("data root policy", "/var/lib/noo is owned by uid 1001", None),
+            accepted("off-site", "declined"),
+        ];
+        let b = brief_split(&rows);
+        assert_eq!(b.passed + b.shown.len() + b.later.len() + b.not_here.len(), rows.len(), "nothing is dropped");
+        let shown: Vec<(&str, Verdict)> = b.shown.iter().map(|c| (c.name, c.verdict)).collect();
+        assert!(shown.contains(&("last backup", Verdict::Fail)), "a failing tiered row is shown, never grouped");
+        assert!(shown.contains(&("inbound", Verdict::Starting)), "a starting row is shown");
+        assert!(shown.iter().any(|(n, _)| *n == "tailnet policy"), "a tailnet policy that WAS read stays in view");
+        assert!(shown.iter().any(|(n, _)| *n == "data root policy"), "an untiered warning stays in view");
+        assert!(shown.iter().any(|(_, v)| *v == Verdict::Accepted), "an accepted opt-out stays in view");
+        assert_eq!(b.later.len(), 6);
+        assert_eq!(b.not_here.iter().map(|c| c.name).collect::<Vec<_>>(), ["tailnet policy", "node-agent privilege"]);
+        let lines = later_lines(&b.later);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines.last().unwrap().starts_with("data at rest: 3 rows in the clear on this disk"), "{lines:?}");
+        // The real failure is what decides the section, as in the default rendering.
+        assert!(!render_brief("controller", &rows));
+        assert!(render_brief("controller", &rows[3..]));
+    }
     #[test]
     fn accepted_is_its_own_verdict_in_json_and_never_fails_the_exit_code() {
         let rows = vec![
