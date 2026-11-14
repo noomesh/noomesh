@@ -231,7 +231,11 @@ def test_staged_moves_only_after_the_scan_gate_and_the_build_pushes_only_a_date_
         if i != promote:
             assert not re.search(r':staged["\s]', run.replace('"$REF:staged" --format', "")), \
                 f"step {s.get('name')} touches :staged outside the promotion"
-        assert "if" not in s or i in (_idx("Set up buildx, second attempt"),), \
+        # The only conditions allowed: the buildx retry, and F8's skip guard.
+        # A bare `env.SKIP != '1'` keeps GitHub's implicit success(), so a
+        # failed gate still stops every later step; anything else (always(),
+        # failure(), a status-free expression) could run past it.
+        assert "if" not in s or i == _idx("Set up buildx, second attempt") or s["if"] == "env.SKIP != '1'", \
             f"step {s.get('name')} is conditional: a failed gate must stop every later step"
     assert '-t "$REF:$DATE_TAG"' in _steps()[build]["run"]
     assert re.search(r"^set -\w*o pipefail$", _steps()[gate]["run"], re.M), \
@@ -304,6 +308,86 @@ def _promote(tmp_path, stage_ref, promote):
         env["PROMOTE"] = promote
     p = subprocess.run(["bash", "-c", run], env=env, capture_output=True, text=True)
     return p.returncode, p.stdout, calls.read_text() if calls.exists() else ""
+
+
+# ── F8 (noomesh-internal i675): skip a day whose inputs the current :staged already has ──
+
+_NOW = __import__("datetime").datetime(2026, 11, 14, 3, 17, tzinfo=__import__("datetime").timezone.utc)
+_DIG = "sha256:" + "a" * 64
+
+
+def _labels(fp="fp1", bases="b1", created="2026-11-13T03:20:00Z"):
+    return {"org.noomesh.build-fingerprint": fp, "org.noomesh.base-digests": bases,
+            "org.opencontainers.image.created": created}
+
+
+def test_a_day_is_skipped_only_when_the_staged_digest_has_todays_inputs_on_every_platform():
+    both = ["linux/amd64", "linux/arm64"]
+    same = (_DIG, {p: _labels() for p in both})
+    skip, why = S.skip_decision("fp1", "b1", both, same, _NOW)
+    assert skip and _DIG in why, why
+    cases = {
+        "an input changed": (_DIG, {"linux/amd64": _labels(), "linux/arm64": _labels(fp="fp0")}),
+        "a base image moved": (_DIG, {p: _labels(bases="b0") for p in both}),
+        "platforms": (_DIG, {"linux/amd64": _labels()}),
+        "day(s) ago": (_DIG, {p: _labels(created="2026-11-12T03:16:00Z") for p in both}),
+        "no readable build time": (_DIG, {p: {k: v for k, v in _labels().items() if "created" not in k} for p in both}),
+        "no current :staged digest": ("latest", {p: _labels() for p in both}),
+        "unreadable": LookupError("manifest unknown"),
+    }
+    for want, staged in cases.items():
+        skip, why = S.skip_decision("fp1", "b1", both, staged, _NOW)
+        assert not skip and want in why, (want, why)
+    # A single-platform image has one config with no platform key.
+    assert S.skip_decision("fp1", "b1", ["linux/amd64"], (_DIG, {"": _labels()}), _NOW)[0]
+
+
+def test_the_refresh_window_keeps_staged_inside_the_releases_age_limit():
+    # Skipping longer would leave the release a :staged it refuses, and it
+    # would build the image itself.
+    assert S.STAGED_REFRESH_DAYS < S.PLAN.STAGED_MAX_AGE_DAYS
+
+
+def _skip_step(tmp_path, line, force=None):
+    run = _steps()[_idx("Skip if the current :staged already is this build")]["run"]
+    run = run.replace("${{ matrix.image }}", "ollama").replace("${{ matrix.platforms }}", "linux/amd64,linux/arm64")
+    fake = tmp_path / "bin"
+    fake.mkdir(exist_ok=True)
+    asked = tmp_path / "asked"
+    (fake / "python3").write_text(f'#!/bin/sh\necho "$@" > {asked}\necho "{line}"\n')
+    (fake / "python3").chmod(0o755)
+    env = {"PATH": f"{fake}:/usr/bin:/bin", "FP": "fp1", "BASES": "b1",
+           "GITHUB_ENV": str(tmp_path / "env"), "GITHUB_STEP_SUMMARY": str(tmp_path / "sum")}
+    if force is not None:
+        env["FORCE"] = force
+    p = subprocess.run(["bash", "-c", run], env=env, capture_output=True, text=True)
+    read = lambda f: (tmp_path / f).read_text() if (tmp_path / f).exists() else ""
+    return p.returncode, read("env"), read("sum"), read("asked")
+
+
+def test_a_skipped_image_says_so_in_the_summary_and_a_forced_run_always_builds(tmp_path):
+    rc, env, summary, asked = _skip_step(tmp_path, "SKIP: sha256:aa already has this fingerprint")
+    assert rc == 0 and "SKIP=1" in env, env
+    assert "| ollama | skipped: nothing changed | sha256:aa already has this fingerprint |" in summary
+    assert "skip-check ollama --fingerprint fp1 --bases b1 --platforms linux/amd64,linux/arm64" in asked
+    (tmp_path / "b").mkdir()
+    rc, env, summary, _ = _skip_step(tmp_path / "b", "BUILD: an input changed")
+    assert rc == 0 and "SKIP=0" in env and summary == ""
+    (tmp_path / "f").mkdir()
+    rc, env, summary, asked = _skip_step(tmp_path / "f", "SKIP: would skip", force="true")
+    assert rc == 0 and "SKIP=0" in env and asked == "", "force=true never asks and always builds"
+    force = DAILY_WF[True]["workflow_dispatch"]["inputs"]["force"] if True in DAILY_WF else DAILY_WF["on"]["workflow_dispatch"]["inputs"]["force"]
+    assert force["type"] == "boolean" and force["default"] is False
+
+
+def test_a_skipped_image_pushes_scans_and_promotes_nothing():
+    names = [s.get("name", "") for s in _steps()]
+    skip = _idx("Skip if the current :staged already is this build")
+    assert _idx("Resolve today's base digests, fingerprint and tags") < skip
+    for i, step in enumerate(_steps()):
+        touches = any(k in step.get("run", "") for k in ("buildx build", "trivy ", "imagetools create", "new-findings"))
+        if touches:
+            assert i > skip and step.get("if") == "env.SKIP != '1'", names[i]
 
 
 def test_a_run_built_from_any_ref_but_dev_never_moves_staged(tmp_path):
