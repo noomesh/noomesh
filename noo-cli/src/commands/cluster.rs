@@ -3999,7 +3999,8 @@ mod keep_warm_tests {
     #[test]
     fn show_marks_a_warm_placement_declared() {
         let warm = json!({"backend": "ollama", "desired_state": "running", "keep_warm": true});
-        assert!(desired_cell(&warm).contains("running") && desired_cell(&warm).contains("warm (declared)"), "{}", desired_cell(&warm));
+        let cell = desired_cell(&warm).to_lowercase(); // ui::state capitalises ("Running")
+        assert!(cell.contains("running") && cell.contains("warm (declared)"), "{cell}");
         for cold in [json!({"desired_state": "running", "keep_warm": false}), json!({"desired_state": "running"})] {
             assert!(!desired_cell(&cold).contains("warm"), "{}", desired_cell(&cold));
         }
