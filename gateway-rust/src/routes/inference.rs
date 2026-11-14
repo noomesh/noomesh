@@ -1384,7 +1384,7 @@ fn sse_frame(msg: &axum::extract::ws::Message) -> Option<String> {
 
 /// The response body: the writer's frames as SSE, holding the abort guard
 /// for as long as the client reads.
-fn sse_body(
+fn chat_sse_body(
     rx: tokio::sync::mpsc::UnboundedReceiver<axum::extract::ws::Message>,
     guard: AbortTurnOnDrop,
 ) -> impl futures::Stream<Item = Result<axum::body::Bytes, std::convert::Infallible>> {
@@ -1460,7 +1460,7 @@ async fn coordinator_chat_stream(
         }
         // Every writer clone ends with this task: the receiver then ends the stream.
     });
-    let body = sse_body(rx, AbortTurnOnDrop(task.abort_handle()));
+    let body = chat_sse_body(rx, AbortTurnOnDrop(task.abort_handle()));
     axum::response::Response::builder()
         .status(200)
         .header("Content-Type", "text/event-stream")
@@ -2259,7 +2259,7 @@ mod chat_stream_tests {
     async fn dropping_the_body_aborts_the_turn() {
         let turn = tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
         let (_w, rx) = crate::websocket::WsWriter::detached();
-        let body = sse_body(rx, AbortTurnOnDrop(turn.abort_handle()));
+        let body = chat_sse_body(rx, AbortTurnOnDrop(turn.abort_handle()));
         drop(body);
         let r = tokio::time::timeout(std::time::Duration::from_secs(2), turn).await.expect("aborted promptly");
         assert!(r.unwrap_err().is_cancelled());
@@ -2280,7 +2280,7 @@ mod chat_stream_tests {
         let h = crate::test_src::fn_body(&own, "async fn coordinator_chat_stream(");
         assert!(h.contains("let run = scoped_chat_turn("), "the turn must run inside scoped_chat_turn");
         assert!(h.contains("let principal = crate::bus_principal::current();") && h.contains("let view = crate::perspective::current();"));
-        assert!(h.contains("sse_body(rx, AbortTurnOnDrop(task.abort_handle()))"), "the body must hold the abort guard");
+        assert!(h.contains("chat_sse_body(rx, AbortTurnOnDrop(task.abort_handle()))"), "the body must hold the abort guard");
         assert!(h.contains("chat_turn_identity("), "identity from the subject only");
     }
 }
