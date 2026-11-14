@@ -313,6 +313,7 @@ pub(crate) fn off_on(h: &mut impl MonHost, st: &Status, dirs: &[String]) -> Resu
 pub(crate) fn on_on(h: &mut impl MonHost, st: &Status, dirs: &[String]) -> Result<i32, String> {
     if st.declared.as_deref() != Some("full") {
         h.write(Level::Full)?;
+        h.say("wrote cluster.monitoring: full to noomesh.yaml, so the declaration matches what runs");
     }
     if let Some(sh) = &st.shadow {
         h.say(&format!("note: {} (the set ran already)", sh.describe()));
@@ -605,7 +606,7 @@ mod tests {
             Ok(())
         }
         fn remove_container(&mut self, service: &str) -> Result<bool, String> {
-            if self.present.iter().any(|p| *p == service) {
+            if self.present.contains(&service) {
                 self.removed.push(service.to_string());
                 Ok(true)
             } else {
@@ -658,6 +659,21 @@ mod tests {
     }
 
     #[test]
+    /// general 2026-11-14: `on` while shadowed proceeds (the set runs
+    /// already) AND writes full, saying so, so the declaration matches.
+    #[test]
+    fn on_while_shadowed_writes_full_and_says_so() {
+        let mut f = facts(Some("lean"));
+        f.compose_profiles = Some(("monitoring".into(), ".env".into()));
+        let st = status_of(&f);
+        assert!(st.shadow.is_some());
+        let mut h = Fake::default();
+        assert_eq!(on_on(&mut h, &st, &dirs()).unwrap(), 0);
+        assert_eq!(h.writes, vec![Level::Full], "the declaration is written even when shadowed");
+        assert!(h.said.iter().any(|l| l.contains("wrote cluster.monitoring: full to noomesh.yaml")), "{:?}", h.said);
+        assert!(h.said.iter().any(|l| l.starts_with("note: ")), "{:?}", h.said);
+    }
+
     fn on_writes_full_and_starts_the_three_with_gateway_and_worker() {
         let mut h = Fake::default();
         assert_eq!(on_on(&mut h, &status_of(&facts(Some("lean"))), &dirs()).unwrap(), 0);
