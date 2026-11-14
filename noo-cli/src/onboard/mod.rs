@@ -1574,13 +1574,35 @@ fn print_final_summary(ctx: &Ctx) {
     if welcome_due(ctx.dry_run, ctx.state.interrupted, &Outcome::of(&ctx.state), closing_verify_failed) {
         ctx.raw("");
         ctx.info("You're all set. Welcome to Noomesh!");
+        for line in first_chat_lines(true) {
+            ctx.raw(&format!("  {line}"));
+        }
     } else if !ctx.dry_run && !ctx.state.interrupted && closing_verify_failed {
         ctx.raw("");
         // No chat model this run (skipped, no fit, offline): the one command
         // that picks, pulls and places one, the same remedy verify's
         // `default chat` row gives (i677 #12).
         ctx.warn(closing_not_done_line(ctx.state.model_pulled.is_empty()));
+        for line in first_chat_lines(false) {
+            ctx.raw(&format!("  {line}"));
+        }
     }
+}
+
+/// first-chat.md's own first prompt (tests/test_first_chat_prompt_parity.py
+/// pins the two together): the install matrix asks the same question.
+pub(crate) const FIRST_CHAT_PROMPT: &str = "Say hello, then give me two short tips for keeping a home server healthy.";
+
+/// The closing lines that hand over the first chat (i677 #5: onboard never
+/// printed it; first-chat.md had it, and the README sends people there).
+/// After the welcome when the install is ready, after the not-done line when
+/// it needs a fix first. Pure.
+pub(crate) fn first_chat_lines(ready: bool) -> [String; 2] {
+    let lead = if ready { "Your first chat:" } else { "Once that is fixed, your first chat:" };
+    [
+        format!("{lead} noo chat --message \"{FIRST_CHAT_PROMPT}\""),
+        format!("What to try next: {}", steps::docs_url("getting-started/first-chat.md")),
+    ]
 }
 
 /// The last line when the closing verify did not pass. Pure.
@@ -1795,6 +1817,26 @@ mod welcome_tests {
         assert_eq!(super::closing_not_done_line(true), super::NO_CHAT_MODEL_YET);
         assert_eq!(super::closing_not_done_line(false), super::CLOSING_VERIFY_NOT_DONE);
         assert!(super::NO_CHAT_MODEL_YET.ends_with(super::FIRST_MODEL_CMD));
+    }
+
+    /// i677 #5: onboard ends by handing over the first chat, after the
+    /// verdict (the welcome, or what still needs doing), in both arms.
+    #[test]
+    fn onboard_ends_with_the_first_chat_command_after_the_verdict() {
+        let [ready, page] = super::first_chat_lines(true);
+        assert_eq!(ready, format!("Your first chat: noo chat --message \"{}\"", super::FIRST_CHAT_PROMPT));
+        assert!(page.ends_with("docs/getting-started/first-chat.md") && page.contains("https://github.com/noomesh/noomesh/"));
+        let [later, _] = super::first_chat_lines(false);
+        assert!(later.starts_with("Once that is fixed, your first chat: noo chat --message"));
+        let code = crate::test_src::own_code(include_str!("mod.rs"));
+        let tail = &code[code
+            .find("if welcome_due(ctx.dry_run, ctx.state.interrupted, &Outcome::of(&ctx.state), closing_verify_failed) {")
+            .expect("the verdict block")..];
+        let welcome = tail.find("You're all set. Welcome to Noomesh!").expect("welcome");
+        let after_welcome = tail.find("for line in first_chat_lines(true)").expect("the chat after the welcome");
+        let not_done = tail.find("ctx.warn(closing_not_done_line(").expect("the not-done line");
+        let after_not_done = tail.find("for line in first_chat_lines(false)").expect("the chat after the not-done line");
+        assert!(welcome < after_welcome && after_welcome < not_done && not_done < after_not_done);
     }
 }
 
