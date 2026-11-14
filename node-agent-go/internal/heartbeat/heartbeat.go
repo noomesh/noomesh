@@ -168,6 +168,10 @@ type Reporter struct {
 	failStreak  int
 	silentSince time.Time
 
+	// encoding is the gzip state (beatgzip.go). Same goroutine as
+	// failStreak.
+	encoding beatEncoding
+
 	// gpuProbeErr is the last GPU-probe error that was logged, so a probe
 	// that keeps failing the same way warns once per change, not every beat.
 	gpuProbeErr string
@@ -605,30 +609,24 @@ func (r *Reporter) SendHeartbeat() {
 		return
 	}
 
-	endpoint := fmt.Sprintf("%s/api/cluster/nodes/%s/heartbeat", r.cfg.ControllerURL, r.cfg.NodeID)
-	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		r.noteOutcome(clk, err)
-		return
+	// Gzip only once the gateway advertised it (beatgzip.go); a refused gzip
+	// beat is re-sent plain at once and gzip stays off for this process.
+	gz := r.encoding.useGzip()
+	status, rep, err := r.postBeat(body, gz)
+	if err == nil && gz && encodingRefused(status) {
+		slog.Warn("gateway refused a gzip heartbeat; sending plain JSON from now on",
+			"status", status, "controller", r.cfg.ControllerURL)
+		r.encoding.refused = true
+		status, rep, err = r.postBeat(body, false)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if err := r.setAuthHeader(req); err != nil {
-		r.noteOutcome(clk, err)
-		return
+	if err == nil && status == 200 {
+		r.encoding.advertised = rep.acceptsGzip()
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	req = req.WithContext(ctx)
-
-	resp, err := r.client.Do(req)
-	if err != nil {
+	switch {
+	case err != nil:
 		r.noteOutcome(clk, err)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 404 {
+	case status == 404:
 		slog.Warn("heartbeat 404, re-registering")
 		caps, capsErr := hardware.Detect(r.cfg, r.gpu, r.caps)
 		if capsErr != nil {
@@ -637,11 +635,50 @@ func (r *Reporter) SendHeartbeat() {
 		hostIP := DetectHostIP(r.cfg)
 		r.Register(caps, hostIP)
 		r.noteOutcome(clk, nil)
-	} else if resp.StatusCode != 200 {
-		r.noteOutcome(clk, fmt.Errorf("controller answered HTTP %d", resp.StatusCode))
-	} else {
+	case status != 200:
+		r.noteOutcome(clk, fmt.Errorf("controller answered HTTP %d", status))
+	default:
 		r.noteOutcome(clk, nil)
 	}
+}
+
+// postBeat sends one marshalled beat, gzip-compressed when gz, and returns
+// the HTTP status and, on a 200, the reply. The v2 token is signed over the
+// bytes on the wire, compressed or not.
+func (r *Reporter) postBeat(body []byte, gz bool) (int, beatReply, error) {
+	if gz {
+		zb, err := gzipBytes(body)
+		if err != nil {
+			return 0, beatReply{}, fmt.Errorf("heartbeat gzip failed: %w", err)
+		}
+		body = zb
+	}
+	endpoint := fmt.Sprintf("%s/api/cluster/nodes/%s/heartbeat", r.cfg.ControllerURL, r.cfg.NodeID)
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return 0, beatReply{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if gz {
+		req.Header.Set("Content-Encoding", "gzip")
+	}
+	if err := r.setAuthHeader(req); err != nil {
+		return 0, beatReply{}, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return 0, beatReply{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return resp.StatusCode, beatReply{}, nil
+	}
+	return resp.StatusCode, readBeatReply(resp.Body), nil
 }
 
 // noteOutcome closes the beat: it records delivery or its failure, and it
