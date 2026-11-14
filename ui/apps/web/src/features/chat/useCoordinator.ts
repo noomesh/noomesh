@@ -15,6 +15,9 @@ export interface TurnStats {
   iterations?: number;
   toolCalls?: number;
   cached?: boolean;
+  /** The backend read far less of the prompt than was sent: it cut it, and
+   *  the model answered without most of its instructions (i802). */
+  truncated?: { sentEstimate: number; evaluated: number };
 }
 
 /**
@@ -121,6 +124,8 @@ interface CoordFrame extends PhaseFrame {
   tokens_in?: number;
   tokens_out?: number;
   cached?: boolean;
+  truncated?: boolean;
+  truncation?: { sent_estimate?: number; evaluated?: number };
 }
 
 /**
@@ -139,13 +144,16 @@ function readStats(f: CoordFrame): TurnStats | undefined {
     toolCalls: f.tool_calls,
     cached: f.cached,
   };
+  if (f.truncated && f.truncation?.evaluated && f.truncation?.sent_estimate) {
+    stats.truncated = { sentEstimate: f.truncation.sent_estimate, evaluated: f.truncation.evaluated };
+  }
   if (f.tokens_out && f.elapsed_seconds) {
     stats.tokensPerSec = Math.round(f.tokens_out / f.elapsed_seconds);
   }
   // Cache hits and the error path carry almost nothing — don't render an
   // empty footer for them.
   const meaningful =
-    stats.elapsedSeconds || stats.tokensOut || stats.tokensIn || stats.toolCalls || stats.cached;
+    stats.elapsedSeconds || stats.tokensOut || stats.tokensIn || stats.toolCalls || stats.cached || stats.truncated;
   return meaningful ? stats : undefined;
 }
 

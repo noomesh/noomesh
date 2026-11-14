@@ -180,14 +180,25 @@ function StatsFooter({ stats }: { stats: TurnStats }) {
   if (stats.tokensPerSec) parts.push(`${stats.tokensPerSec} tok/s`);
   if (stats.iterations && stats.iterations > 1) parts.push(`${stats.iterations} iterations`);
   if (stats.toolCalls) parts.push(`${stats.toolCalls} tool call${stats.toolCalls === 1 ? '' : 's'}`);
-  if (!parts.length) return null;
+  if (!parts.length && !stats.truncated) return null;
 
   return (
-    <div className="turn-stats">
-      {parts.map((p) => (
-        <span key={p}>{p}</span>
-      ))}
-    </div>
+    <>
+      {stats.truncated && (
+        <div className="turn-stats turn-truncated" role="note">
+          The model read only {stats.truncated.evaluated.toLocaleString()} of about{' '}
+          {stats.truncated.sentEstimate.toLocaleString()} prompt tokens: its backend cut the prompt, so
+          this answer was made without most of its instructions.
+        </div>
+      )}
+      {parts.length > 0 && (
+        <div className="turn-stats">
+          {parts.map((p) => (
+            <span key={p}>{p}</span>
+          ))}
+        </div>
+      )}
+    </>
   );
 }
 

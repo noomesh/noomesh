@@ -131,6 +131,27 @@ describe('useCoordinator', () => {
     });
   });
 
+  it('carries a backend-cut prompt onto the turn, so the person is told (i802)', () => {
+    const { result } = renderHook(() => useCoordinator());
+    fire('onOpen', {});
+    H.sock.readyState = 1;
+    act(() => result.current.send('q'));
+
+    fire('onMessage', {
+      type: 'done',
+      elapsed_seconds: 12.1,
+      tokens_in: 2050,
+      tokens_out: 90,
+      truncated: true,
+      truncation: { sent_estimate: 8800, evaluated: 2050 },
+    });
+    expect(last(result.current.messages).stats?.truncated).toEqual({ sentEstimate: 8800, evaluated: 2050 });
+
+    act(() => result.current.send('q2'));
+    fire('onMessage', { type: 'done', elapsed_seconds: 1.0, tokens_in: 900, tokens_out: 20 });
+    expect(last(result.current.messages).stats?.truncated).toBeUndefined();
+  });
+
   it('leaves stats undefined when done carries no accounting (error path)', () => {
     const { result } = renderHook(() => useCoordinator());
     fire('onOpen', {});

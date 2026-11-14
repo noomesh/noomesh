@@ -450,6 +450,11 @@ call it carries `attempt` 2 and up, with `previous_node` and
 loop's estimate of the tokens sent. `at_ms` is the gateway's clock and
 is meant for logs; a client times phases from receipt.
 
+`done` adds `truncated: true` and `truncation: {sent_estimate, evaluated}`
+when a local backend evaluated well under what the loop sent (its context
+cut the prompt). The console says so under the answer, and the gateway logs
+`context_truncated_by_backend` and alerts the operator once a day per backend.
+
 `working` comes only from a turn a node harness runs on a vendor kind
 (Copilot, Claude Code, Codex): the model's text as the harness's translator
 relays it, reasoning and planning included, batched about every 300 ms and
