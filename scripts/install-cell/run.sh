@@ -313,6 +313,21 @@ step probe-self-agent-diagnostics 120 -- sh -c '
   sudo grep -E "^(NATS_URL|NOO_GATEWAY_URL|CONTROLLER_URL|NODE_ID)=" /etc/noo-node-agent.env 2>&1
   echo "== noo --json cluster show $(hostname)"; noo --json cluster show "$(hostname)" 2>&1
   true'
+# PROBE (operator 2026-11-14): the whole stack's memory at idle after
+# onboard, MEASURED, tracked per release by the size job. Here: after health
+# and the verify probes, BEFORE first-answer, so no chat has loaded a chat
+# model yet. Per container docker stats + cgroup v2 anon/file/memory.current,
+# the noo-* host units' systemd MemoryCurrent/MemoryPeak + VmRSS, totals,
+# and the controller / node split (memory_baseline.py). Writes
+# $OUT/memory.json (uploaded with the cell, through the upload scan). docker
+# and unreadable files go through sudo, so the docker=none cells work too.
+# Two cells only, to keep matrix minutes down. A probe: never the failed step.
+MEMORY_SETTLE_S="${MEMORY_SETTLE_S:-60}"
+case "$CELL" in
+    ubuntu-24.04-amd64-default|ubuntu-22.04-amd64)
+        step probe-memory-baseline 600 -- python3 "$HERE/memory_baseline.py" measure --out "$OUT/memory.json" \
+            --cell "$CELL" --model "$MODEL" --settle "$MEMORY_SETTLE_S" ;;
+esac
 # The single-turn line docs/getting-started/first-chat.md gives, read from the
 # doc itself (its first `noo chat --message "…"` line), so the page and the
 # test cannot drift. The answer must be an answer: a model that asks for more
