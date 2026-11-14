@@ -40,6 +40,11 @@ pub struct ModelCapabilities {
     pub patterns: Vec<String>,
     /// The model's own context ceiling, in tokens.
     pub max_context: Option<u64>,
+    /// The cache one token costs per slot, in bytes, MEASURED on a running
+    /// daemon (i802): the memory fit of the chat context uses it instead of
+    /// placement_fit's fallback, which overestimates small models many times.
+    #[serde(default)]
+    pub kv_bytes_per_token: Option<u64>,
     /// Where the numbers were read.
     #[allow(dead_code)]
     pub evidence: String,
