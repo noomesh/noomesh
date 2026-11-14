@@ -1664,7 +1664,7 @@ pub(crate) fn posture_pending_restart(g: &Globals) -> Option<Vec<String>> {
 /// has just started the stack, so `--wait` lets the services that are
 /// still starting (Loki answers `/ready` 1-2 min in) settle before the
 /// verdict. Otherwise a fresh install ends on a warm-up false failure
-pub(crate) const FINAL_VERIFY_ARGS: &[&str] = &["--controller", "--wait"];
+pub(crate) const FINAL_VERIFY_ARGS: &[&str] = &["--controller", "--wait", "--brief"];
 
 #[cfg(test)]
 pub(crate) mod storage_lock_lines_tests {
@@ -1693,6 +1693,7 @@ mod final_verify_tests {
     #[test]
     fn onboard_verifies_the_controller_after_warm_up() {
         assert!(super::FINAL_VERIFY_ARGS.contains(&"--controller"));
+        assert!(super::FINAL_VERIFY_ARGS.contains(&"--brief"), "onboard's closing verify is the brief one; plain verify is unchanged");
         assert!(super::FINAL_VERIFY_ARGS.contains(&"--wait"), "onboard must let a fresh stack warm up before judging it");
     }
 }
