@@ -6060,16 +6060,33 @@ fn fix_volume_mismatches(ctx: &Ctx) {
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
     };
+    reap_volumes(&mut LiveReaper { ctx }, reaper_decisions(&expected, &existing, &inspect));
+}
+
+/// What the volume reaper does to the machine; [`reap_volumes`] holds every
+/// decision, so a test drives it with a fake.
+trait VolumeReaper {
+    fn warn(&mut self, line: &str);
+    fn info(&mut self, line: &str);
+    /// `docker volume rm -f <vol>`; true when docker removed it.
+    fn remove(&mut self, vol: &str) -> bool;
+}
+
+/// The reaper's removals, from [`reaper_decisions`]' output alone: only a
+/// stale bind RECORD is removed, and said before it goes. An unbound volume
+/// holds its data inside docker and a volume docker would not describe was
+/// never checked: both are kept (i677 #20). Returns how many went.
+fn reap_volumes(h: &mut impl VolumeReaper, decisions: Vec<(String, String, Option<String>, VolumeMismatch)>) -> usize {
     let mut removed = 0usize;
-    for (vol, want_device, recorded, action) in reaper_decisions(&expected, &existing, &inspect) {
+    for (vol, want_device, recorded, action) in decisions {
         match action {
             VolumeMismatch::Keep => continue,
             VolumeMismatch::NotChecked => {
-                ctx.warn(&format!("volume {vol}: docker inspect did not answer; left as it is (not checked)"));
+                h.warn(&format!("volume {vol}: docker inspect did not answer; left as it is (not checked)"));
                 continue;
             }
             VolumeMismatch::UnboundHoldsData => {
-                ctx.warn(&format!(
+                h.warn(&format!(
                     "volume {vol} is not bound to {want_device}: its data lives inside docker, so it is NOT removed \
                      (moving it into the data root is a separate step; `noo cluster verify` names it)"
                 ));
@@ -6079,23 +6096,39 @@ fn fix_volume_mismatches(ctx: &Ctx) {
         }
         // Said BEFORE it happens: only a stale bind RECORD goes; its data
         // stays on the host at the old path (i677 #20).
-        ctx.info(&format!(
+        h.info(&format!(
             "Removing the stale record of volume {vol} (bound to {}, compose now binds {want_device}); its data stays on the host there",
             recorded.as_deref().unwrap_or("?")
         ));
-        let ok = Command::new("docker")
-            .args(["volume", "rm", "-f", &vol])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if ok {
+        if h.remove(&vol) {
             removed += 1;
         }
     }
     if removed > 0 {
-        ctx.info(&format!(
+        h.info(&format!(
             "Removed {removed} stale Docker volume(s) (config doesn't match current NOO_DATA_ROOT)"
         ));
+    }
+    removed
+}
+
+struct LiveReaper<'a> {
+    ctx: &'a Ctx,
+}
+
+impl VolumeReaper for LiveReaper<'_> {
+    fn warn(&mut self, line: &str) {
+        self.ctx.warn(line);
+    }
+    fn info(&mut self, line: &str) {
+        self.ctx.info(line);
+    }
+    fn remove(&mut self, vol: &str) -> bool {
+        Command::new("docker")
+            .args(["volume", "rm", "-f", vol])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     }
 }
 
@@ -10018,53 +10051,114 @@ mod volume_mismatch_tests {
         assert_eq!(volume_mismatch_action(None, "/srv/noo/noo-data"), VolumeMismatch::NotChecked);
     }
 
+    /// The fixer hands docker's answers to [`reaper_decisions`] and every
+    /// removal to [`reap_volumes`]; it removes nothing itself, and a failed
+    /// inspect is not an empty device (m18).
     #[test]
-    fn the_fixer_removes_only_on_a_stale_record() {
+    fn the_fixer_removes_only_through_the_reaper() {
         let code = crate::test_src::own_code(include_str!("steps.rs"));
         let body = crate::test_src::fn_body(&code, "fn fix_volume_mismatches(");
-        let decide = body.find("for (vol, want_device, recorded, action) in reaper_decisions(&expected, &existing, &inspect) {").expect("the decision");
-        let stale = body.find("VolumeMismatch::RemoveStaleRecord => {}").expect("only the stale record falls through");
-        let say = body.find("Removing the stale record of volume").expect("said before");
-        let rm = body.find("\"volume\", \"rm\", \"-f\", &vol").expect("the removal");
-        assert!(decide < stale && stale < say && say < rm, "{body}");
-        assert_eq!(body.matches("\"volume\", \"rm\"").count(), 1, "one removal, after the decision");
+        assert!(
+            body.contains("reap_volumes(&mut LiveReaper { ctx }, reaper_decisions(&expected, &existing, &inspect));"),
+            "{body}"
+        );
+        assert!(!body.contains("\"rm\""), "the fixer itself removes nothing: {body}");
         assert!(body.contains(".filter(|o| o.status.success())"), "a failed inspect is not an empty device: {body}");
+        let live = crate::test_src::fn_body(&code, "fn remove(&mut self, vol: &str) -> bool {");
+        assert!(live.contains(".args([\"volume\", \"rm\", \"-f\", vol])"), "{live}");
     }
 
-    /// SOURCE PIN (the fixer shells out to docker directly: no fake-runner
-    /// seam). Each arm that must NOT remove ends in `continue;`, so control
-    /// never falls through to `volume rm -f`. Without it a volume that holds
-    /// data (unbound) or was never checked (docker did not answer) is deleted.
-    fn arm_ends_in_continue(arm: &str) -> bool {
-        let t = arm.trim_end();
-        let t = t.strip_suffix('\u{7d}').unwrap_or(t);
-        t.trim_end().ends_with("continue;")
+    /// A fake reaper host: every effect, in order.
+    #[derive(Default)]
+    struct FakeReaper {
+        events: Vec<String>,
+        refuse: Vec<&'static str>,
     }
 
+    impl VolumeReaper for FakeReaper {
+        fn warn(&mut self, line: &str) {
+            self.events.push(format!("warn {line}"));
+        }
+        fn info(&mut self, line: &str) {
+            self.events.push(format!("info {line}"));
+        }
+        fn remove(&mut self, vol: &str) -> bool {
+            self.events.push(format!("remove {vol}"));
+            !self.refuse.iter().any(|r| *r == vol)
+        }
+    }
+
+    impl FakeReaper {
+        fn removed(&self) -> Vec<&str> {
+            self.events.iter().filter_map(|e| e.strip_prefix("remove ")).collect()
+        }
+    }
+
+    fn decision(vol: &str, recorded: Option<&str>, action: VolumeMismatch) -> (String, String, Option<String>, VolumeMismatch) {
+        (vol.to_string(), "/srv/noo/noo-data".to_string(), recorded.map(str::to_string), action)
+    }
+
+    /// m16: an unbound volume holds its data inside docker. It is warned
+    /// about by name and never removed.
     #[test]
     fn an_unbound_volume_that_holds_data_is_never_removed() {
-        let code = crate::test_src::own_code(include_str!("steps.rs"));
-        let body = crate::test_src::fn_body(&code, "fn fix_volume_mismatches(");
-        let from = body.find("VolumeMismatch::UnboundHoldsData => ").expect("the unbound arm");
-        let to = body.find("VolumeMismatch::RemoveStaleRecord => ").expect("the stale arm");
-        let rm = body.find("\"volume\", \"rm\", \"-f\", &vol").expect("the removal");
-        assert!(from < to && to < rm, "{body}");
-        let arm = &body[from..to];
-        assert!(arm.contains("NOT removed"), "{arm}");
-        assert!(arm_ends_in_continue(arm), "the unbound arm must continue, not fall through to the removal: {arm}");
+        let mut h = FakeReaper::default();
+        let n = reap_volumes(&mut h, vec![decision("noomesh_noo-data", Some(""), VolumeMismatch::UnboundHoldsData)]);
+        assert_eq!((n, h.removed()), (0, vec![]), "{:?}", h.events);
+        assert_eq!(h.events.len(), 1, "{:?}", h.events);
+        assert!(h.events[0].starts_with("warn volume noomesh_noo-data is not bound") && h.events[0].contains("NOT removed"), "{:?}", h.events);
     }
 
+    /// m17: a volume docker would not describe was never checked: kept.
     #[test]
     fn a_volume_docker_did_not_answer_about_is_never_removed() {
-        let code = crate::test_src::own_code(include_str!("steps.rs"));
-        let body = crate::test_src::fn_body(&code, "fn fix_volume_mismatches(");
-        let from = body.find("VolumeMismatch::NotChecked => ").expect("the not-checked arm");
-        let to = body.find("VolumeMismatch::UnboundHoldsData => ").expect("the next arm");
-        let rm = body.find("\"volume\", \"rm\", \"-f\", &vol").expect("the removal");
-        assert!(from < to && to < rm, "{body}");
-        let arm = &body[from..to];
-        assert!(arm.contains("left as it is (not checked)"), "{arm}");
-        assert!(arm_ends_in_continue(arm), "the not-checked arm must continue, not fall through to the removal: {arm}");
+        let mut h = FakeReaper::default();
+        let n = reap_volumes(&mut h, vec![decision("noomesh_noo-data", None, VolumeMismatch::NotChecked)]);
+        assert_eq!((n, h.removed()), (0, vec![]), "{:?}", h.events);
+        assert_eq!(h.events, ["warn volume noomesh_noo-data: docker inspect did not answer; left as it is (not checked)"]);
+    }
+
+    /// Only a stale bind record goes, said before it goes; a current bind is
+    /// kept silently; the count is what docker actually removed.
+    #[test]
+    fn only_a_stale_bind_record_is_removed_and_said_first() {
+        let mut h = FakeReaper { refuse: vec!["noomesh_gone-wrong"], ..Default::default() };
+        let n = reap_volumes(&mut h, vec![
+            decision("noomesh_postgres-data", Some("/srv/noo/noo-data"), VolumeMismatch::Keep),
+            decision("noomesh_noo-data", Some(""), VolumeMismatch::UnboundHoldsData),
+            decision("noomesh_redis-data", Some("/old/root/redis"), VolumeMismatch::RemoveStaleRecord),
+            decision("noomesh_unknown", None, VolumeMismatch::NotChecked),
+            decision("noomesh_gone-wrong", Some("/old/root/x"), VolumeMismatch::RemoveStaleRecord),
+        ]);
+        assert_eq!(h.removed(), ["noomesh_redis-data", "noomesh_gone-wrong"], "{:?}", h.events);
+        assert_eq!(n, 1, "a removal docker refused is not counted");
+        let said = h.events.iter().position(|e| e.starts_with("info Removing the stale record of volume noomesh_redis-data (bound to /old/root/redis")).expect("said");
+        let gone = h.events.iter().position(|e| e == "remove noomesh_redis-data").expect("removed");
+        assert!(said + 1 == gone, "said immediately before it goes: {:?}", h.events);
+        assert!(!h.events.iter().any(|e| e.contains("noomesh_postgres-data")), "a current bind is kept silently: {:?}", h.events);
+        assert_eq!(h.events.last().map(String::as_str), Some("info Removed 1 stale Docker volume(s) (config doesn't match current NOO_DATA_ROOT)"));
+    }
+
+    /// The legacy re-onboard (an unbound noo-data, the stack down), end to
+    /// end from docker's answers: nothing that holds data is removed.
+    #[test]
+    fn a_legacy_reonboard_removes_only_the_stale_record() {
+        let expected = vec![
+            ("noomesh_noo-data".to_string(), "/srv/noo/noo-data".to_string()),
+            ("noomesh_redis-data".to_string(), "/srv/noo/redis".to_string()),
+            ("noomesh_ollama".to_string(), "/srv/noo/ollama".to_string()),
+        ];
+        let existing: Vec<String> = ["noomesh_noo-data", "noomesh_redis-data", "noomesh_ollama"].iter().map(|s| s.to_string()).collect();
+        let inspect = |v: &str| -> Option<String> {
+            match v {
+                "noomesh_noo-data" => Some(String::new()),
+                "noomesh_redis-data" => Some("/old/root/redis".into()),
+                _ => None,
+            }
+        };
+        let mut h = FakeReaper::default();
+        reap_volumes(&mut h, reaper_decisions(&expected, &existing, &inspect));
+        assert_eq!(h.removed(), ["noomesh_redis-data"], "{:?}", h.events);
     }
 }
 
