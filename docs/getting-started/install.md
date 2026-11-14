@@ -50,7 +50,7 @@ numbers are approximate and grow with the models you pull):
 |---|---|---|
 | Disk | 25 GB free where Docker keeps its images | the stack's images and data (~12 GB, measured on a fresh amd64 install), the default model (`gemma4:e2b`, 7.2 GB), and headroom for an upgrade. `noo onboard` checks this before it starts and stops below it; `noo onboard --min-free-gb <n>` sets another floor if you know this box needs less |
 | RAM | 16 GB | the stack idles at ~6 GB; a CPU-only box also holds the model in RAM |
-| GPU | optional; 4 GB+ VRAM to run a model on it | under ~10 GB the wizard offers a model verified to fit; with none, Ollama runs on CPU (slow, but it works) |
+| GPU | optional; 4 GB+ VRAM to run a model on it | under ~10 GB the wizard offers a model verified to fit; with none, Ollama runs on CPU (slow) and the wizard offers a model that fits the free memory, or says none does |
 | Network | outbound HTTPS to `ghcr.io` and `ollama.com` at install | pulling images and the first model; nothing inbound |
 
 ## 1. Install the `noo` binary
@@ -148,7 +148,7 @@ verbs from inside the checkout (or with `NOO_REPO_ROOT` pointing at it).
 
 ```bash
 noo onboard            # plain terminal; or --tui, or --web (http://127.0.0.1:7080)
-noo onboard --ci       # non-interactive: accept defaults; the admin password is generated and never shown — set your own with `noo security admin-password reset`
+noo onboard --ci       # non-interactive: accept defaults, LAN-only unless Tailscale is already up; the admin password is generated and never shown — set your own with `noo security admin-password reset`
 ```
 
 The wizard runs eleven steps — prerequisites, environment, secrets and
