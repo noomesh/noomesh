@@ -4918,3 +4918,26 @@ mod window_tests {
         assert!(rail.contains("crate::coordinator::backend_cut_alert(&target, message)"), "and re-authors it");
     }
 }
+
+#[cfg(test)]
+mod tier_tools_tests {
+    use super::*;
+
+    fn schema(name: &str) -> Value {
+        json!({"type": "function", "function": {"name": name, "parameters": {}}})
+    }
+
+    /// A Compact turn keeps only the compact core tools out of CORE_TOOLS,
+    /// and every tool a keyword group added; a Full turn keeps everything.
+    #[test]
+    fn a_compact_turn_keeps_its_core_tools_and_the_groups_tools() {
+        let extra_core = CORE_TOOLS.iter().find(|t| !super::super::context::core_tools_for(WindowTier::Compact).contains(t)).expect("a core tool Compact leaves out");
+        let all = vec![schema("noo_rag_query"), schema("noo_tool_search"), schema(extra_core), schema("noo_job_submit_not_core")];
+        let names = |v: Vec<Value>| v.iter().map(|s| s["function"]["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        let compact = names(tier_tools(all.clone(), WindowTier::Compact));
+        assert!(compact.contains(&"noo_rag_query".to_string()) && compact.contains(&"noo_tool_search".to_string()), "{compact:?}");
+        assert!(!compact.contains(&extra_core.to_string()), "a core tool outside the compact set is dropped: {compact:?}");
+        assert!(compact.contains(&"noo_job_submit_not_core".to_string()), "a group's tool stays: {compact:?}");
+        assert_eq!(tier_tools(all.clone(), WindowTier::Full).len(), all.len());
+    }
+}
