@@ -179,6 +179,9 @@ struct Shared {
     stream_client: reqwest::Client,
     /// `NOO_HARNESS_THINKING` as it stood when the translator started.
     thinking: crate::coordinator::thinking::ThinkingMode,
+    /// The decided context to stamp on an Ollama upstream's bodies as
+    /// `options.num_ctx` (i802); 0 = none ([`Translator::set_num_ctx`]).
+    num_ctx: AtomicU64,
     usage: Mutex<UsageTotals>,
     logged_rewrite: AtomicBool,
     logged_no_usage: AtomicBool,
@@ -303,6 +306,7 @@ impl Translator {
             client: crate::tls::cluster_client(),
             stream_client: crate::tls::cluster_stream_client(),
             thinking,
+            num_ctx: AtomicU64::new(0),
             usage: Mutex::new(UsageTotals::default()),
             logged_rewrite: AtomicBool::new(false),
             logged_no_usage: AtomicBool::new(false),
@@ -341,6 +345,16 @@ impl Translator {
         let (tx, rx) = mpsc::unbounded_channel();
         *self.shared.tap.lock().unwrap_or_else(|p| p.into_inner()) = Some(tx);
         rx
+    }
+
+    /// The context every Ollama-bound body carries as `options.num_ctx`
+    /// from now on, where the CLI set none (i802). Nothing on a node sets it
+    /// yet: the harness has no database to decide from, and the gateway does
+    /// not ship the decided value to it (a known gap), so the daemon keeps
+    /// its own setting there. Unused until that value reaches the node.
+    #[allow(dead_code)]
+    pub fn set_num_ctx(&self, num_ctx: Option<u64>) {
+        self.shared.num_ctx.store(num_ctx.unwrap_or(0), Ordering::Relaxed);
     }
 
     /// The wire's activity clock, for the driver's stall bound.
@@ -477,6 +491,15 @@ enum Reply {
     Chunks(mpsc::Receiver<Result<Value, String>>),
 }
 
+/// The decided context on an Ollama upstream's body, native or OpenAI
+/// (through the node agent, which hands `options` to its translator); no
+/// other engine gets `options`.
+fn stamp_num_ctx(wire_body: &mut Value, backend_type: &str, num_ctx: Option<u64>) {
+    if crate::chat_context::takes_num_ctx(backend_type) {
+        crate::chat_context::stamp_opt(wire_body, num_ctx);
+    }
+}
+
 /// Send an OpenAI chat body to the pinned endpoint on its own wire, meter
 /// the reply, and hand it back in OpenAI's shape.
 async fn complete(sh: &Arc<Shared>, mut body: Value) -> Result<Reply, (u16, String)> {
@@ -507,6 +530,8 @@ async fn complete(sh: &Arc<Shared>, mut body: Value) -> Result<Reply, (u16, Stri
         };
         crate::coordinator::thinking::disable_on_wire(&mut wire_body, wire, &sh.upstream.backend_type, false);
     }
+    let num_ctx = Some(sh.num_ctx.load(Ordering::Relaxed)).filter(|n| *n > 0);
+    stamp_num_ctx(&mut wire_body, &sh.upstream.backend_type, num_ctx);
     let req = if stream {
         crate::node_link::backend_stream_on(&sh.stream_client, reqwest::Method::POST, &url, &sh.upstream.backend_type)
     } else {
@@ -1645,5 +1670,40 @@ mod tests {
         let up = m.last();
         assert_eq!(up["chat_template_kwargs"]["enable_thinking"], false, "{up}");
         a.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod num_ctx_tests {
+    use super::stamp_num_ctx;
+    use serde_json::json;
+
+    /// i802: an Ollama upstream's body (native or OpenAI) gets the decided
+    /// context where the CLI set none; no other engine gets `options`.
+    #[test]
+    fn only_an_ollama_upstream_body_is_stamped() {
+        let mut native = json!({"model": "gemma4:e2b", "messages": [], "options": {"num_predict": 99}});
+        stamp_num_ctx(&mut native, "ollama", Some(16384));
+        assert_eq!(native["options"], json!({"num_predict": 99, "num_ctx": 16384}));
+        let mut own = json!({"model": "m", "options": {"num_ctx": 2048}});
+        stamp_num_ctx(&mut own, "ollama", Some(16384));
+        assert_eq!(own["options"]["num_ctx"], json!(2048), "the CLI's own value stands");
+        let mut vllm = json!({"model": "m"});
+        stamp_num_ctx(&mut vllm, "vllm", Some(16384));
+        assert!(vllm.get("options").is_none());
+        let mut unset = json!({"model": "m"});
+        stamp_num_ctx(&mut unset, "ollama", None);
+        assert!(unset.get("options").is_none(), "nothing set: nothing stamped");
+    }
+
+    /// The one upstream call stamps after the wire body is built and before
+    /// it is sent.
+    #[test]
+    fn the_upstream_call_stamps_before_sending() {
+        let own = crate::test_src::own_code(include_str!("translator.rs"));
+        let f = crate::test_src::fn_body(&own, "async fn complete(");
+        let stamp = f.find("stamp_num_ctx(&mut wire_body, &sh.upstream.backend_type, num_ctx);").expect("stamps");
+        let send = f.find(".json(&wire_body)").expect("sends");
+        assert!(stamp < send, "{f}");
     }
 }

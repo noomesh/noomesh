@@ -435,6 +435,7 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
         }
         util::GpuDetect::None => {
             ctx.state.tier = 3;
+            ctx.state.cpu_only = true;
             ctx.warn("GPU: none detected — CPU-only (Tier 3)");
         }
     }
@@ -716,6 +717,23 @@ pub(crate) fn keep_llm_preference_hint(value: &str) -> Option<String> {
     Some(format!("noo cluster prefer knowledge {v}"))
 }
 
+/// The `compose_env` key (noomesh.yaml, the launcher's home for a deployment
+/// knob; a `.env` copy would shadow it) the environment step seeds on a NEW
+/// CPU-only install (i802): `OLLAMA_EMBED_NUM_PARALLEL=1`. The stack's shared
+/// Ollama (`ollama-embed`) otherwise runs 4 slots: on a 4-core CPU one slot
+/// prefills about 3x faster (fa, run 43628426011: ~370 against ~125 tok/s)
+/// and saves cache, with no embedding loss (run 43622936679). `None` on a GPU or a busy-GPU box, on
+/// an install this step already configured (its `.env` carries `NODE_ID`,
+/// which this step always writes) and whenever the key is already set: an
+/// existing install is never rewritten. Pure.
+pub(crate) fn cpu_only_embed_parallel(
+    cpu_only: bool,
+    existing: &std::collections::BTreeMap<String, String>,
+) -> Option<(&'static str, &'static str)> {
+    let new_install = !existing.contains_key("NODE_ID");
+    (cpu_only && new_install && !existing.contains_key("OLLAMA_EMBED_NUM_PARALLEL")).then_some(("OLLAMA_EMBED_NUM_PARALLEL", "1"))
+}
+
 pub fn environment(ctx: &mut Ctx) {
     // Before the read: a removal must not be written straight back by the merge below.
     offer_retired_env_keys(ctx);
@@ -890,6 +908,9 @@ The default is right (press enter)")
     if mode == "worker" && !controller_url.is_empty() {
         set(&mut merged, &mut merged_order, "CONTROLLER_URL", controller_url.clone());
     }
+    // i802: one Ollama slot on a NEW CPU-only install, written to
+    // compose_env once noomesh.yaml exists (below); never over a value.
+    let embed_slots = cpu_only_embed_parallel(ctx.state.cpu_only, &existing);
     // Provider keys are SECRETS: they never enter the .env body written
     // below. On an install already on the encrypted store they go straight
     // into it (after the write, so the whole-file write cannot race it);
@@ -941,6 +962,9 @@ The default is right (press enter)")
         // seed, which are precisely the ones they would want to check.
         apply_topology_env(ctx);
         ensure_mesh_yaml(ctx);
+        if let Some((k, v)) = embed_slots {
+            ctx.dry(&format!("set compose_env {k}={v} in noomesh.yaml (one Ollama slot on this CPU-only box)"));
+        }
         return;
     }
     if let Err(e) = std::fs::write(&ctx.env_path, body) {
@@ -960,6 +984,12 @@ The default is right (press enter)")
     ctx.warn_sops_once();
 
     ensure_mesh_yaml(ctx);
+    if let Some((k, v)) = embed_slots {
+        if yamlcfg::read_yaml_compose_env(ctx, k).is_none() {
+            yamlcfg::update_yaml_compose_env(ctx, &[(k.to_string(), v.to_string())]);
+            ctx.info("Ollama runs one slot on this CPU-only box (noomesh.yaml compose_env): one slot prefills about 3x faster here");
+        }
+    }
 }
 
 /// noomesh.yaml is gitignored operator config but three services
@@ -10704,5 +10734,41 @@ mod monitoring_choice_tests {
         assert!(body.contains("\"Install dashboards, log search and request traces (Grafana, Loki, Tempo; about 250 MiB idle)?\", default_full"), "{body}");
         let usage = crate::usage::USAGE.iter().find(|(w, _, _)| *w == ["onboard"]).expect("onboard usage").1;
         assert!(usage.contains("[--monitoring-full|--no-monitoring-full]"), "{usage}");
+    }
+}
+
+#[cfg(test)]
+mod cpu_only_embed_parallel_tests {
+    use super::cpu_only_embed_parallel;
+    use std::collections::BTreeMap;
+
+    fn env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    /// i802: a NEW CPU-only install gets one Ollama slot; a GPU box, an
+    /// install this step already configured and a key already set are left
+    /// alone (an existing install is never rewritten).
+    #[test]
+    fn onboard_seeds_one_ollama_slot_only_on_a_new_cpu_only_install() {
+        assert_eq!(cpu_only_embed_parallel(true, &env(&[])), Some(("OLLAMA_EMBED_NUM_PARALLEL", "1")));
+        // --standalone seeds a few keys before this step; still a new install.
+        assert_eq!(cpu_only_embed_parallel(true, &env(&[("NOO_INSTALL_MODE", "standalone")])), Some(("OLLAMA_EMBED_NUM_PARALLEL", "1")));
+        assert_eq!(cpu_only_embed_parallel(false, &env(&[])), None, "a GPU (or busy GPU) box keeps the compose default");
+        assert_eq!(cpu_only_embed_parallel(true, &env(&[("NODE_ID", "box")])), None, "an existing install is never rewritten");
+        assert_eq!(cpu_only_embed_parallel(true, &env(&[("OLLAMA_EMBED_NUM_PARALLEL", "4")])), None, "the operator's own value stands");
+    }
+
+    /// It is written to noomesh.yaml compose_env after the file is seeded,
+    /// never into .env, and never over a compose_env value already there.
+    #[test]
+    fn the_slot_default_goes_to_compose_env_after_the_yaml_exists() {
+        let own = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn environment(");
+        assert!(!body.contains("set(&mut merged, &mut merged_order, k, v.to_string())"), "not into .env: {body}");
+        let seeded = body.rfind("ensure_mesh_yaml(ctx);").expect("the yaml is seeded");
+        let guard = body.find("if yamlcfg::read_yaml_compose_env(ctx, k).is_none() {").expect("never over a value");
+        let write = body.find("yamlcfg::update_yaml_compose_env(ctx, &[(k.to_string(), v.to_string())]);").expect("the write");
+        assert!(seeded < guard && guard < write, "{body}");
     }
 }

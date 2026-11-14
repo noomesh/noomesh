@@ -4144,14 +4144,14 @@ async fn desired_config_get(
     // live facts derive (as `collect_cluster_nodes` derives it), the
     // measured speed the record's `model_bench`, applied only when it is of
     // the model the node's chat backend runs now.
-    let harness_profile = {
-        let record: Value = match state.js.get_key_value("mesh_nodes").await {
-            Ok(kv) => match kv.get(&node_id).await {
-                Ok(Some(e)) => serde_json::from_slice::<Value>(&e).unwrap_or_else(|_| json!({})),
-                _ => json!({}),
-            },
-            Err(_) => json!({}),
-        };
+    let record: Value = match state.js.get_key_value("mesh_nodes").await {
+        Ok(kv) => match kv.get(&node_id).await {
+            Ok(Some(e)) => serde_json::from_slice::<Value>(&e).unwrap_or_else(|_| json!({})),
+            _ => json!({}),
+        },
+        Err(_) => json!({}),
+    };
+    let (harness_profile, profile_context) = {
         let derived_tier = crate::node_tier::derive(&crate::node_tier::facts_from_capabilities(
             record.get("capabilities").unwrap_or(&json!({})),
         ))
@@ -4166,8 +4166,13 @@ async fn desired_config_get(
         );
         let overrides = node.as_ref().map(|n| n.12.clone()).unwrap_or_else(|| json!({}));
         let resolved = crate::harness_profile::resolve(derived_tier, &overrides, bench.as_ref(), running_chat.as_deref());
-        serde_json::to_value(&resolved).unwrap_or(Value::Null)
+        (serde_json::to_value(&resolved).unwrap_or(Value::Null), resolved.context)
     };
+    // i802: the decided context per Ollama chat model, from the same record
+    // and profile context the harness fit reads (chat_context::decide).
+    let stack = (crate::chat_context::is_self_node(&node_id), crate::chat_context::compose_slots(&*state.config_yaml.read().await));
+    let chat_context_detail = chat_context_rows(&placement_json, &record, profile_context, stack);
+    let chat_contexts = chat_contexts_map(&chat_context_detail);
 
     let node_json = match node {
         Some((ip, user, tier, data_root, models_dir, gpu_model, vram_gb, companion_policy, harness_policy, default_loop_budget, usage_profile, vendor_kinds, harness_profile_overrides)) => json!({
@@ -4219,7 +4224,15 @@ async fn desired_config_get(
         // agent queues its own ladder under it. Absent on older gateways.
         "disk_reclaim": crate::autonomy_evaluators::node_reclaim_policy(&state).await,
         "engine": "rust",
+        // i802, for `noo cluster show`: per Ollama chat model, the context the
+        // daemon runs now, the decided one, why, and the model's ceiling.
+        "chat_context_detail": chat_context_detail,
     });
+    // i802, for the node agent: {"<model>": decided tokens}, the num_ctx its
+    // own Ollama calls send. Omitted when nothing is decided.
+    if let Some(map) = chat_contexts {
+        body["chat_contexts"] = map;
+    }
     if let Some(nw) = node_workloads {
         body["node_workloads"] = Value::Array(nw);
     }
@@ -4228,6 +4241,49 @@ async fn desired_config_get(
     // inside it would make an old agent refuse). Omitted at epoch 0.
     super::model_set_retry::apply(&mut body, super::model_set_retry::retry_for(&state, &node_id).await.as_ref());
     Ok(Json(body))
+}
+
+/// One row per RUNNING Ollama chat placement with a model (i802), for `noo
+/// cluster show`: `{model, running, decided, declared, source, capped,
+/// slots, ceiling}`. `decided`, `declared`, `source` and `slots` are null
+/// when nothing declares a context (`chat_context::decide` is `None`: the
+/// daemon keeps its own setting); `running` and `ceiling` are null when the
+/// node does not report them. A model placed twice is listed once.
+pub(crate) fn chat_context_rows(placements: &[Value], record: &Value, profile_context: u64, stack: (bool, Option<u64>)) -> Vec<Value> {
+    let mut seen = std::collections::BTreeSet::new();
+    placements
+        .iter()
+        .filter(|p| p["backend"].as_str() == Some("ollama") && p["role"].as_str() == Some("chat") && p["desired_state"].as_str() == Some("running"))
+        .filter_map(|p| {
+            let model = p["model"].as_str().map(str::trim).filter(|m| !m.is_empty())?;
+            seen.insert(model.to_string()).then(|| (model.to_string(), &p["env"]))
+        })
+        .map(|(model, env)| {
+            let env = crate::chat_context::with_stack_slots(env, stack.0, stack.1);
+            let d = crate::chat_context::decide("ollama", &env, &model, record, profile_context);
+            json!({
+                "model": model,
+                "running": crate::chat_context::running_context(record, &model),
+                "decided": d.as_ref().map(|d| d.tokens),
+                "declared": d.as_ref().map(|d| d.declared),
+                "source": d.as_ref().map(|d| d.source.clone()),
+                "capped": d.as_ref().and_then(|d| d.capped.clone()),
+                "slots": d.as_ref().map(|d| d.slots),
+                "ceiling": crate::harness_fit::reported_ceiling(record, &model),
+            })
+        })
+        .collect()
+}
+
+/// desired-config's `chat_contexts` (i802): `{"<model>": decided tokens}`
+/// from [`chat_context_rows`], the decided rows only; `None` when there are
+/// none, so the key is omitted.
+pub(crate) fn chat_contexts_map(rows: &[Value]) -> Option<Value> {
+    let map: serde_json::Map<String, Value> = rows
+        .iter()
+        .filter_map(|r| Some((r["model"].as_str()?.to_string(), Value::from(r["decided"].as_u64()?))))
+        .collect();
+    (!map.is_empty()).then_some(Value::Object(map))
 }
 
 /// Per node, the live tasks it holds (i227 fix 4): `running` (running or
@@ -4724,7 +4780,7 @@ async fn harness_kind_fit(
     Ok((crate::harness_fit::judge(floor, window), chat))
 }
 
-async fn stored_placements(state: &AppState, node_id: &str) -> Result<Vec<StoredPlacement>, AppError> {
+pub(crate) async fn stored_placements(state: &AppState, node_id: &str) -> Result<Vec<StoredPlacement>, AppError> {
     let rows: Vec<(String, String, Option<String>, Value, String, Option<String>, bool)> = sqlx::query_as(
         "SELECT backend, role, model, env, desired_state, target, keep_warm FROM noo_backend_placements WHERE node_id = $1 ORDER BY backend, role",
     )
@@ -9537,5 +9593,62 @@ mod heartbeat_gzip_tests {
         let build = crate::test_src::fn_body(&routes, "fn build_router(");
         assert!(build.contains("core_router()") && build.contains("crate::auth::require_any_auth"),
             "the cluster routes are served under the auth layer");
+    }
+}
+
+#[cfg(test)]
+mod chat_context_detail_tests {
+    use super::{chat_context_rows, chat_contexts_map};
+    use serde_json::json;
+
+    /// fa's one-box node: 16 GB, gemma4:e2b running at Ollama's 4,096 default.
+    fn record() -> serde_json::Value {
+        json!({"ram_gb": 15.6, "mem_used_gb": 9.4,
+            "model_stats": [{"name": "gemma4:e2b", "size_bytes": 4_600_000_000u64, "context_length": 131072, "running_context": 4096}]})
+    }
+
+    /// i802: one row per running Ollama chat placement, decided by
+    /// chat_context::decide; other backends, roles and stopped rows are not
+    /// listed, and a model nothing declares a context for is listed undecided.
+    #[test]
+    fn rows_list_each_running_ollama_chat_model_with_the_decided_context() {
+        let placements = vec![
+            json!({"backend": "ollama", "role": "chat", "model": "gemma4:e2b", "env": {"OLLAMA_CONTEXT_LENGTH": "32768"}, "desired_state": "running"}),
+            json!({"backend": "ollama", "role": "chat", "model": "gemma4:e2b", "env": {}, "desired_state": "running"}),
+            json!({"backend": "ollama", "role": "embed", "model": "harrier", "env": {}, "desired_state": "running"}),
+            json!({"backend": "vllm", "role": "chat", "model": "org/gemma", "env": {}, "desired_state": "running"}),
+            json!({"backend": "ollama", "role": "chat", "model": "old:7b", "env": {}, "desired_state": "stopped"}),
+            json!({"backend": "ollama", "role": "chat", "model": "qwen3:4b", "env": {}, "desired_state": "running"}),
+        ];
+        let rows = chat_context_rows(&placements, &record(), 0, (false, None));
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let r = &rows[0];
+        let d = crate::chat_context::decide("ollama", &placements[0]["env"], "gemma4:e2b", &record(), 0).expect("decided");
+        assert_eq!(r["model"], json!("gemma4:e2b"));
+        assert_eq!(r["running"], json!(4096));
+        assert_eq!(r["decided"], json!(d.tokens));
+        assert_eq!(r["declared"], json!(d.declared));
+        assert_eq!(r["source"], json!(d.source));
+        assert_eq!(r["slots"], json!(d.slots));
+        assert_eq!(r["ceiling"], json!(131072));
+        let q = &rows[1];
+        assert_eq!(q["model"], json!("qwen3:4b"));
+        assert!(q["decided"].is_null() && q["running"].is_null() && q["ceiling"].is_null(), "{q}");
+
+        assert_eq!(chat_contexts_map(&rows), Some(json!({"gemma4:e2b": d.tokens})), "decided rows only");
+        let profile = chat_context_rows(&placements[5..], &record(), 16384, (false, None));
+        assert_eq!(profile[0]["declared"], json!(16384), "the tier profile's context declares it");
+        assert!(chat_contexts_map(&chat_context_rows(&placements[2..5], &record(), 16384, (false, None))).is_none(), "nothing decided: the key is omitted");
+    }
+
+    /// desired-config sends both: the detail for `noo cluster show` and the
+    /// map for the agent, the map only when something is decided.
+    #[test]
+    fn desired_config_carries_the_detail_and_the_map_only_when_decided() {
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn desired_config_get(");
+        assert!(body.contains("chat_context_rows(&placement_json, &record, profile_context, stack)"), "computed from the placements served");
+        assert!(body.contains("\"chat_context_detail\": chat_context_detail,"));
+        assert!(body.contains("if let Some(map) = chat_contexts \u{7b}\n        body[\"chat_contexts\"] = map;"), "only Some sets the key");
     }
 }

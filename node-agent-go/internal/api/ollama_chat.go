@@ -475,6 +475,9 @@ func (s *Server) proxyOllamaChat(w http.ResponseWriter, r *http.Request, body []
 		jsonError(w, http.StatusBadRequest, "bad_chat_body", err.Error())
 		return
 	}
+	if s.chatContext != nil {
+		req.body = withDecidedNumCtx(req.body, s.chatContext(req.model))
+	}
 	// No whole-request timeout: a stream lives while bytes arrive. The
 	// transport's ResponseHeaderTimeout (firstByte) still bounds the wait
 	// for headers — on /api/chat those come with the first token.
@@ -692,4 +695,34 @@ func streamOllamaChat(ctx context.Context, w http.ResponseWriter, body io.Reader
 	}
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	flush()
+}
+
+// withDecidedNumCtx sets options.num_ctx on a translated /api/chat body to
+// the controller's decided chat context for its model (desired-config
+// `chat_contexts`, i802) when the caller did not set one: a body the gateway
+// already stamped, or a caller's own value, is left as it is. This covers the
+// callers the gateway cannot stamp (a node harness's OpenAI wire). n <= 0, or
+// a body that is not a JSON object, is returned unchanged.
+func withDecidedNumCtx(body []byte, n int) []byte {
+	if n <= 0 {
+		return body
+	}
+	var m map[string]any
+	if json.Unmarshal(body, &m) != nil || m == nil {
+		return body
+	}
+	opts, _ := m["options"].(map[string]any)
+	if opts == nil {
+		opts = map[string]any{}
+	}
+	if _, set := opts["num_ctx"]; set {
+		return body
+	}
+	opts["num_ctx"] = n
+	m["options"] = opts
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
 }

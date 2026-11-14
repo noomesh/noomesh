@@ -210,7 +210,7 @@ async fn call_model(
         }
     };
 
-    let body = json!({
+    let mut body = json!({
         "model": backend.model,
         "messages": [
             {"role": "system", "content": SYSTEM},
@@ -223,6 +223,11 @@ async fn call_model(
         "stream": false,
         "response_format": {"type": "json_object"},
     });
+    // The decided context (i802), so a rerank never reloads an Ollama's chat
+    // model at another one. `None` for every other engine.
+    if let Some(ctx) = crate::chat_context::num_ctx_for(state, &backend.backend_type, &backend.url, &backend.model).await {
+        crate::chat_context::stamp(&mut body, ctx);
+    }
 
     let url = format!("{}/v1/chat/completions", backend.url.trim_end_matches('/'));
     let client = crate::tls::cluster_client();
@@ -341,5 +346,19 @@ mod tests {
         // ...whereas the shape we actually request does.
         let proper = json!({"results": [{"index":0,"score":1.0},{"index":1,"score":0.0}]});
         assert_eq!(parse_scores(&proper, 2), vec![1.0, 0.0]);
+    }
+}
+
+#[cfg(test)]
+mod num_ctx_tests {
+    /// i802: a rerank is a chat on the cluster's model; on an Ollama it
+    /// carries the decided context, so it never reloads the chat runner.
+    #[test]
+    fn the_rerank_body_is_stamped_before_it_is_sent() {
+        let own = crate::test_src::own_code(include_str!("llm_rerank.rs"));
+        let f = crate::test_src::fn_body(&own, "async fn call_model(");
+        let stamp = f.find("crate::chat_context::stamp(&mut body, ctx);").expect("stamps");
+        let send = f.find(".json(&body)").expect("sends");
+        assert!(stamp < send, "{f}");
     }
 }
