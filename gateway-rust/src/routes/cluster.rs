@@ -9144,6 +9144,8 @@ mod heartbeat_gzip_tests {
         let code = crate::test_src::own_code(include_str!("cluster.rs"));
         let handler = crate::test_src::fn_body(&code, "async fn node_heartbeat(");
         assert_eq!(handler.matches("heartbeat_body(").count(), 1, "one decode");
+        assert!(handler.contains("heartbeat_body(&raw, encoding)") && handler.contains("header::CONTENT_ENCODING"),
+            "the decode reads the request's own Content-Encoding");
         for wholesale in ["body.as_object()", "Json(body)", "GzDecoder", "read_capped("] {
             assert!(!handler.contains(wholesale), "node_heartbeat must not contain `{wholesale}`");
         }
