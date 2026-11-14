@@ -432,7 +432,7 @@ See [weight-cache.md](../models/weight-cache.md).
 
 ```sh
 noo inference run "Summarise this in one line: …" -m qwen2.5:7b-instruct
-noo inference agent "Which nodes are idle and why?" --max-iters 6
+noo inference agent "Which nodes are idle and why?"
 noo jobs run "…" --priority 8            # queue it; polls every 2 s until terminal
 noo jobs run "…" --async                 # print the id and return
 noo jobs status <job-id> --wait
@@ -446,8 +446,8 @@ schemas); `--raw` sends `context: false` for a plain model call.
 does and the CLI says so (`! answered by <model> — <node> could not:
 …`). `--strict-node` keeps the prompt on that node alone and fails
 when it cannot answer — for locality or privacy, or a liveness check;
-`inference agent` runs the coordinator loop with tools (`--no-tools`
-disables them). A job that ends in any state other than `completed` exits
+`inference agent` runs the coordinator loop with tools and waits up to
+300 s for the answer (`--timeout` changes that). A job that ends in any state other than `completed` exits
 1. `jobs scheduler` shows dispatch counters; `jobs pause`/`resume` stop and
 restart dispatch; `jobs drain <node>` stops sending a node work while
 its running jobs finish, `undrain` reverses it. `jobs cancel` asks for
