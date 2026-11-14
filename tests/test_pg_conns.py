@@ -319,3 +319,13 @@ def test_the_pg_probes_never_become_the_failed_step(tmp_path):
     (tmp_path / "steps.jsonl").write_text("\n".join(json.dumps(s) for s in steps) + "\n")
     (tmp_path / "meta.json").write_text(json.dumps({"cell": DEFAULT}))
     assert C.summarize(tmp_path)["result"] == "pass"
+
+
+def test_the_first_answer_says_cold_after_an_idle_series_and_points_at_the_warm_figure():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("srr_fa", ROOT / "scripts" / "release-size-report.py")
+    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+    cold = m.render_first_answer({"first_answer_s": 323, "first_answer_wall_s": 2792, "probe_wait_before_first_answer_s": 2469})
+    assert "323 s after install, cold model (after a 40-min idle series" in cold[1] and "Cold load table" in cold[1]
+    warm = m.render_first_answer({"first_answer_s": 260, "first_answer_wall_s": 260, "probe_wait_before_first_answer_s": 0})
+    assert "260 s after install, right after install" in warm[1] and "cold" not in warm[1]
