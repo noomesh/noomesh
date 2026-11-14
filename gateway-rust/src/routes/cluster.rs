@@ -9195,7 +9195,7 @@ mod heartbeat_gzip_tests {
     #[test]
     fn a_heartbeat_without_a_json_content_type_is_415_as_before() {
         let plain = serde_json::to_vec(&beat()).unwrap();
-        for ct in [None, Some("text/json"), Some("text/plain"), Some("application/x-www-form-urlencoded"), Some("json"), Some("")] {
+        for ct in [None, Some("text/json"), Some("text/plain"), Some("application/x-www-form-urlencoded"), Some("json"), Some(""), Some("application/jsonx"), Some("application/x-json-ish")] {
             for (raw, enc) in [(plain.clone(), None), (gz(&plain), Some("gzip"))] {
                 let r = heartbeat_body(&raw, ct, enc).unwrap_err();
                 assert_eq!(r.status(), axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE, "{ct:?} {enc:?}");
