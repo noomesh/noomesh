@@ -193,7 +193,7 @@ def render_memory(cells: list[dict]) -> list[str]:
             continue
         d = c["baseline"]
         m = d["meta"]
-        L += ["", f"### {c['cell']}",
+        L += ["", f"### {c['cell']}: {d.get('idle') or 'unknown: memory.json predates the loaded-model check'}",
               f"noo `{m.get('noo_version', '?')}` · model {m.get('model', '?')} · settled {m.get('settle_seconds', '?')} s"
               f" · host RAM {mib(m.get('host_mem_total_bytes'))} MiB · {m.get('timestamp', '?')}", "",
               "| container | class | anon | file | current | docker stats | image |", "|---|---|---|---|---|---|---|"]
@@ -225,7 +225,7 @@ def memory_json(cells: list[dict]) -> dict:
     return {"fleet": FLEET_LINE, "node_share_label": NODE_SHARE_LABEL,
             "cells": [{"cell": c["cell"], "measured": False, "why": c["why"]} if not c["measured"]
                       else {"cell": c["cell"], "measured": True, **{k: c["baseline"].get(k) for k in
-                            ("meta", "containers", "containers_omitted", "host_units", "totals")
+                            ("idle", "models_loaded", "meta", "containers", "containers_omitted", "host_units", "totals")
                             if k in c["baseline"]}}
                       for c in cells]}
 

@@ -204,7 +204,8 @@ def render(doc: dict) -> str:
     m = doc["meta"]
     L = [f"MEMORY BASELINE (idle after onboard, before the first chat): cell {m.get('cell')}, "
          f"noo {m.get('noo_version')}, model {m.get('model')}, settled {m.get('settle_seconds')} s, "
-         f"host RAM {mb(m.get('host_mem_total_bytes'))} MiB, at {m.get('timestamp')}", "",
+         f"host RAM {mb(m.get('host_mem_total_bytes'))} MiB, at {m.get('timestamp')}",
+         f"at sample time: {doc.get('idle', 'unknown: not recorded')}", "",
          "figures in MiB; 'omitted' = could not be read (reason below), never 0", "",
          f"{'container':34} {'class':10} {'anon':>9} {'file':>9} {'current':>9} {'stats':>9}  image"]
     for c in doc["containers"]:
@@ -233,6 +234,65 @@ def render(doc: dict) -> str:
     return "\n".join(L) + "\n"
 
 
+# ---------------------------------------------------------------- loaded models
+# Was a backend model LOADED when the figures were read? An "idle" figure
+# must never silently be a loaded one (review of #1165). Each local backend
+# is asked; an answer that cannot be read is "unknown" with its reason,
+# never "none". Nothing is unloaded: this only records.
+
+# Backends whose loaded models are asked, by container name (prefix
+# stripped). The stunnel doors in front of them hold no model.
+MODEL_BACKENDS = [("ollama", "ollama*"), ("llamacpp", "llamacpp*"), ("vllm", "vllm*")]
+
+
+def backend_of(name: str) -> str | None:
+    base = strip_prefix(name)
+    return next((b for b, pat in MODEL_BACKENDS if fnmatch.fnmatchcase(base, pat)), None)
+
+
+def parse_ollama_ps(text: str) -> list[str] | None:
+    """`ollama ps` -> the loaded model names ([] for the header alone), or
+    None when the text is not its table (an error, an empty answer)."""
+    lines = [l for l in text.splitlines() if l.strip()]
+    if not lines or not re.match(r"^NAME\s+ID\s+SIZE\b", lines[0]):
+        return None
+    return [l.split()[0] for l in lines[1:]]
+
+
+def parse_ollama_api_ps(text: str) -> list[str] | None:
+    """Ollama's GET /api/ps JSON -> model names, or None if it is not that."""
+    try:
+        d = json.loads(text)
+        return [m.get("name") or m.get("model") for m in d["models"]]
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def parse_openai_models(text: str) -> list[str] | None:
+    """An OpenAI-style GET /v1/models JSON (llama.cpp server, vLLM) -> ids."""
+    try:
+        return [m["id"] for m in json.loads(text)["data"]]
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def idle_verdict(asked: list[dict]) -> str:
+    """One line for memory.json and the report heading, from each backend's
+    answer ({backend, source, models: [...]} or {backend, source, unknown}).
+    A loaded model wins: the figure is then a loaded one, whatever else."""
+    loaded = [f"{a['backend']}:{m or 'model unnamed'}" for a in asked for m in a.get("models") or []]
+    unknown = [f"{a['backend']} ({a['unknown']})" for a in asked if "unknown" in a]
+    if loaded:
+        return "loaded: " + ", ".join(loaded) + (f" (also unknown: {'; '.join(unknown)})" if unknown else "")
+    if unknown:
+        return "unknown: " + "; ".join(unknown)
+    return "idle: no model loaded"
+
+
+def models_loaded(asked: list[dict]) -> list[dict]:
+    return [{"backend": a["backend"], "model": m, "source": a["source"]} for a in asked for m in a.get("models") or []]
+
+
 # ---------------------------------------------------------------- IO
 
 class Host:
@@ -258,6 +318,14 @@ class Host:
                 return r.stdout, None
             err = f"{' '.join(argv[:3])} exited {r.returncode}: {(r.stderr.strip().splitlines() or [''])[-1][:200]}"
         return None, err
+
+    def http_get(self, url: str, timeout: int = 5) -> tuple[str | None, str | None]:
+        import urllib.request
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as r:  # noqa: S310 - loopback only
+                return r.read().decode(errors="replace"), None
+        except Exception as e:  # noqa: BLE001 - any failure is a reason, never "none"
+            return None, f"GET {url}: {e}"
 
     def read(self, path: str) -> tuple[str | None, str | None]:
         try:
@@ -322,6 +390,10 @@ def measure_containers(host: Host) -> tuple[list[dict], str | None]:
         name = c.get("Name", "").lstrip("/")
         cid = c.get("Id", "")
         e = {"name": name, "id": cid[:12], "image": (c.get("Config") or {}).get("Image", "?"), "class": classify(name)}
+        ports = sorted({int(b["HostPort"]) for bs in ((c.get("NetworkSettings") or {}).get("Ports") or {}).values()
+                        for b in (bs or []) if str(b.get("HostPort", "")).isdigit()})
+        if ports:
+            e["published_ports"] = ports
         rel, why = find_container_cgroup(host, cid, (c.get("State") or {}).get("Pid"))
         if rel:
             e["cgroup"] = rel.replace(cid, cid[:12] + "…")
@@ -370,6 +442,75 @@ def measure_unit(host: Host, unit: str) -> dict:
     return e
 
 
+def ask_ollama_container(host: "Host", c: dict) -> dict:
+    a = {"backend": "ollama", "container": c["name"]}
+    out, why = host.cmd("docker", "exec", c["name"], "ollama", "ps", timeout=60)
+    if out is not None:
+        models = parse_ollama_ps(out)
+        if models is not None:
+            return {**a, "source": f"docker exec {c['name']} ollama ps", "models": models}
+        why = f"ollama ps answered something that is not its table: {out.strip()[:120]!r}"
+    # No CLI in the container (or it failed): the API on a loopback port.
+    for port in c.get("published_ports", []):
+        url = f"http://127.0.0.1:{port}/api/ps"
+        body, err = host.http_get(url)
+        models = parse_ollama_api_ps(body) if body is not None else None
+        if models is not None:
+            return {**a, "source": f"GET {url}", "models": models}
+        why += f"; {err or f'GET {url} is not /api/ps JSON'}"
+    if not c.get("published_ports"):
+        why += "; no published loopback port for /api/ps"
+    return {**a, "source": f"docker exec {c['name']} ollama ps", "unknown": why}
+
+
+def ask_openai_server(host: "Host", c: dict, backend: str) -> dict:
+    """A running llama.cpp or vLLM server holds its model by definition; its
+    /v1/models names it when a loopback port answers."""
+    a = {"backend": backend, "container": c["name"]}
+    reasons = []
+    for port in c.get("published_ports", []):
+        url = f"http://127.0.0.1:{port}/v1/models"
+        body, err = host.http_get(url)
+        ids = parse_openai_models(body) if body is not None else None
+        if ids:
+            return {**a, "source": f"GET {url}", "models": ids}
+        reasons.append(err or f"GET {url} named no model")
+    return {**a, "source": "container running (a server that is up holds its model)", "models": [None],
+            "model_name_unknown": "; ".join(reasons) or "no published loopback port for /v1/models"}
+
+
+def ask_native_ollama(host: "Host") -> dict | None:
+    """Ollama run natively on the host (not in a container): only when its
+    binary is here AND its service is active; then `ollama ps` must answer."""
+    if not shutil.which("ollama"):
+        return None
+    active, _ = host.cmd("systemctl", "is-active", "ollama", timeout=30)
+    if (active or "").strip() != "active":
+        return None
+    out, why = host.cmd("ollama", "ps", timeout=60)
+    models = parse_ollama_ps(out) if out is not None else None
+    a = {"backend": "ollama", "container": None, "source": "ollama ps (host binary)"}
+    if models is None:
+        return {**a, "unknown": why or f"ollama ps answered something that is not its table: {(out or '').strip()[:120]!r}"}
+    return {**a, "models": models}
+
+
+def ask_backends(host: "Host", containers: list[dict], containers_why: str | None) -> list[dict]:
+    asked = []
+    for c in containers:
+        b = backend_of(c["name"])
+        if b == "ollama":
+            asked.append(ask_ollama_container(host, c))
+        elif b in ("llamacpp", "vllm"):
+            asked.append(ask_openai_server(host, c, b))
+    if containers_why and containers_why != "no running containers":
+        asked.append({"backend": "containers", "source": "docker ps", "unknown": containers_why})
+    native = ask_native_ollama(host)
+    if native:
+        asked.append(native)
+    return asked
+
+
 def host_meta(host: Host) -> dict:
     out = {}
     mi, _ = host.read(os.path.join(host.proc_root, "meminfo"))
@@ -389,8 +530,12 @@ def measure(args) -> int:
         time.sleep(args.settle)
     containers, c_why = measure_containers(host)
     units = [measure_unit(host, u) for u in HOST_UNITS]
+    asked = ask_backends(host, containers, c_why)
     doc = {
         "schema": 1,
+        "idle": idle_verdict(asked),
+        "models_loaded": models_loaded(asked),
+        "backends_asked": asked,
         "meta": {"cell": args.cell, "model": args.model, "settle_seconds": args.settle,
                  "timestamp": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                  "point": "idle after onboard: after health and the verify probes, before the first chat",
