@@ -273,8 +273,13 @@ def test_the_report_renders_a_measured_cell_and_a_missing_one_as_not_measured(tm
             "metrics door, no manual measurement.") in md
     j = SIZE.memory_json(cells)
     assert j["node_share_label"] == LABEL
-    assert j["cells"][1] == {"cell": "ubuntu-24.04-amd64-default", "measured": False,
-                             "why": "no memory.json in the cell's artifact (cell fail at onboard)"}
+    assert {k: j["cells"][1][k] for k in ("cell", "measured", "why")} == {
+        "cell": "ubuntu-24.04-amd64-default", "measured": False,
+        "why": "no memory.json in the cell's artifact (cell fail at onboard)"}
+    # The idle-series cell's series and cold load are listed too, as not measured.
+    assert [x["measured"] for x in j["cells"][1]["series"]] == [False, False, False]
+    assert j["cells"][1]["coldload"] == {"missing": "no coldload.json in the cell's artifact"}
+    assert "series" not in j["cells"][0], "a cell outside SERIES_CELLS with no series files has none"
     assert j["cells"][0]["totals"]["node_share"]["anon_bytes"]["bytes"] == 2**30 + 30 * MiB
 
 
@@ -453,7 +458,8 @@ def test_the_idle_verdict_strings():
 def test_memory_json_records_the_loaded_models_and_the_report_heading_shows_the_verdict(tmp_path):
     doc, log = _measure(tmp_path)
     assert doc["idle"] == "loaded: ollama:qwen2.5:0.5b"
-    assert doc["models_loaded"] == [{"backend": "ollama", "model": "qwen2.5:0.5b", "source": "docker exec noo-ollama ollama ps"}]
+    assert doc["models_loaded"] == [{"backend": "ollama", "model": "qwen2.5:0.5b", "source": "docker exec noo-ollama ollama ps",
+                                     "size": "1.0 GB", "until": "4 minutes from now", "expires_in_s": 240}]
     assert "at sample time: loaded: ollama:qwen2.5:0.5b" in log
     f = tmp_path / "install-cell-ubuntu-22.04-amd64" / "memory.json"
     f.parent.mkdir()

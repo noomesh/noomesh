@@ -205,7 +205,9 @@ def render(doc: dict) -> str:
     L = [f"MEMORY BASELINE (idle after onboard, before the first chat): cell {m.get('cell')}, "
          f"noo {m.get('noo_version')}, model {m.get('model')}, settled {m.get('settle_seconds')} s, "
          f"host RAM {mb(m.get('host_mem_total_bytes'))} MiB, at {m.get('timestamp')}",
-         f"at sample time: {doc.get('idle', 'unknown: not recorded')}", "",
+         f"at sample time: {doc.get('idle', 'unknown: not recorded')}",
+         *[f"  {x['backend']} {x['model']} size {x.get('size', '?')} until {x.get('until', '?')}"
+           for x in doc.get("models_loaded", [])], "",
          "figures in MiB; 'omitted' = could not be read (reason below), never 0", "",
          f"{'container':34} {'class':10} {'anon':>9} {'file':>9} {'current':>9} {'stats':>9}  image"]
     for c in doc["containers"]:
@@ -250,13 +252,64 @@ def backend_of(name: str) -> str | None:
     return next((b for b, pat in MODEL_BACKENDS if fnmatch.fnmatchcase(base, pat)), None)
 
 
+# The cells that also take the idle SERIES (t10, t40 after the first
+# sample) and the cold-load timing: run.sh gates on the same name, and the
+# size report expects those files from these cells only.
+SERIES_CELLS = ["ubuntu-24.04-amd64-default"]
+SERIES_SAMPLES = ["t10", "t40"]
+
+
+def parse_until(s: str) -> dict:
+    """ollama ps's UNTIL cell -> {until, forever: True} | {until,
+    expires_in_s} | {until} alone when the wording is not one we know
+    (then the expiry is unknown, never "now" and never "forever")."""
+    s = s.strip()
+    out: dict = {"until": s}
+    if s.lower() == "forever":
+        out["forever"] = True
+        return out
+    m = re.fullmatch(r"(?i)(less than a|about an?|an?|\d+) (second|minute|hour|day)s? from now", s)
+    if m:
+        n = m.group(1).lower()
+        n = 0 if n.startswith("less") else 1 if not n.isdigit() else int(n)
+        out["expires_in_s"] = n * {"second": 1, "minute": 60, "hour": 3600, "day": 86400}[m.group(2).lower()]
+    return out
+
+
+def parse_ollama_ps_rows(text: str) -> list[dict] | None:
+    """`ollama ps` -> one dict per loaded model (name, id, size, processor,
+    context when shown, until + its parse, raw line), [] for the header
+    alone, None when the text is not its table. Cells are split on two or
+    more spaces, or else cut at the header's column starts (Go's tabwriter
+    aligns them); values hold single spaces: "7.2 GB", "100% CPU",
+    "4 minutes from now"."""
+    lines = [l.rstrip() for l in text.splitlines() if l.strip()]
+    if not lines or not re.match(r"^NAME\s+ID\s+SIZE\b", lines[0]):
+        return None
+    cols = [(m.group(0).lower(), m.start()) for m in re.finditer(r"\S+", lines[0])]
+    rows = []
+    for line in lines[1:]:
+        r: dict = {"raw": line}
+        parts = re.split(r"\s{2,}", line.strip())
+        if len(parts) == len(cols):   # cells two or more spaces apart
+            r.update({name: v for (name, _), v in zip(cols, parts)})
+        else:                         # else cut at the header's column starts
+            for i, (name, start) in enumerate(cols):
+                end = cols[i + 1][1] if i + 1 < len(cols) else None
+                r[name] = line[start:end].strip() if end else line[start:].strip()
+        if not r.get("name"):
+            r["name"] = line.split()[0]
+        if "until" in r:
+            r.update(parse_until(r["until"]))
+        rows.append(r)
+    return rows
+
+
 def parse_ollama_ps(text: str) -> list[str] | None:
     """`ollama ps` -> the loaded model names ([] for the header alone), or
     None when the text is not its table (an error, an empty answer)."""
-    lines = [l for l in text.splitlines() if l.strip()]
-    if not lines or not re.match(r"^NAME\s+ID\s+SIZE\b", lines[0]):
-        return None
-    return [l.split()[0] for l in lines[1:]]
+    rows = parse_ollama_ps_rows(text)
+    return None if rows is None else [r["name"] for r in rows]
 
 
 def parse_ollama_api_ps(text: str) -> list[str] | None:
@@ -290,7 +343,18 @@ def idle_verdict(asked: list[dict]) -> str:
 
 
 def models_loaded(asked: list[dict]) -> list[dict]:
-    return [{"backend": a["backend"], "model": m, "source": a["source"]} for a in asked for m in a.get("models") or []]
+    """{backend, model, source} per loaded model, plus size and UNTIL (with
+    its parse) where `ollama ps` gave them."""
+    out = []
+    for a in asked:
+        rows = {r["name"]: r for r in a.get("rows") or []}
+        for m in a.get("models") or []:
+            e = {"backend": a["backend"], "model": m, "source": a["source"]}
+            r = rows.get(m)
+            if r:
+                e.update({k: r[k] for k in ("size", "until", "forever", "expires_in_s") if k in r})
+            out.append(e)
+    return out
 
 
 # ---------------------------------------------------------------- IO
@@ -446,9 +510,10 @@ def ask_ollama_container(host: "Host", c: dict) -> dict:
     a = {"backend": "ollama", "container": c["name"]}
     out, why = host.cmd("docker", "exec", c["name"], "ollama", "ps", timeout=60)
     if out is not None:
-        models = parse_ollama_ps(out)
-        if models is not None:
-            return {**a, "source": f"docker exec {c['name']} ollama ps", "models": models}
+        rows = parse_ollama_ps_rows(out)
+        if rows is not None:
+            return {**a, "source": f"docker exec {c['name']} ollama ps", "models": [r["name"] for r in rows],
+                    "rows": rows, "raw": out.rstrip().splitlines()}
         why = f"ollama ps answered something that is not its table: {out.strip()[:120]!r}"
     # No CLI in the container (or it failed): the API on a loopback port.
     for port in c.get("published_ports", []):
@@ -525,7 +590,14 @@ def host_meta(host: Host) -> dict:
 
 def measure(args) -> int:
     host = Host(args.cgroup_root, args.proc_root)
-    if args.settle > 0:
+    if args.until is not None:
+        # An idle-series sample: wait until t0 + N min with nothing else
+        # touching the stack (run.sh runs no step meanwhile).
+        args.settle = max(0, int(args.until - time.time()))
+        print(f"idle series {args.sample}: waiting {args.settle} s (until t0 + {args.until - (args.t0 or 0):.0f} s)",
+              flush=True)
+        time.sleep(args.settle)
+    elif args.settle > 0:
         print(f"settling {args.settle} s before reading (idle after onboard)", flush=True)
         time.sleep(args.settle)
     containers, c_why = measure_containers(host)
@@ -539,6 +611,8 @@ def measure(args) -> int:
         "meta": {"cell": args.cell, "model": args.model, "settle_seconds": args.settle,
                  "timestamp": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                  "point": "idle after onboard: after health and the verify probes, before the first chat",
+                 "sample": args.sample, "epoch": int(time.time()),
+                 **({"t0_epoch": args.t0, "since_t0_s": int(time.time() - args.t0)} if args.t0 else {}),
                  **host_meta(host)},
         "classification": {"node_container_patterns": NODE_CONTAINER_PATTERNS, "host_units": HOST_UNITS,
                            "rule": "node = host units + containers matching a pattern (prefix stripped); "
@@ -567,6 +641,9 @@ def main(argv: list[str] | None = None) -> int:
     m.add_argument("--cell", required=True)
     m.add_argument("--model", default="?")
     m.add_argument("--settle", type=int, default=60)
+    m.add_argument("--sample", default="t0", help="this sample's name in the idle series (t0, t10, t40)")
+    m.add_argument("--t0", type=int, help="the series' first sample, epoch seconds")
+    m.add_argument("--until", type=int, help="wait until this epoch second instead of --settle")
     m.add_argument("--cgroup-root", default="/sys/fs/cgroup")
     m.add_argument("--proc-root", default="/proc")
     a = ap.parse_args(argv)
