@@ -275,9 +275,28 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     };
 
     let mut action = decide_cli_action(&current, &version, pin.is_some());
-    // A mirror serves "whatever it has": today's behaviour is to fetch.
-    if base_url.is_some() && action == CliAction::Noop {
-        action = CliAction::Upgrade;
+    // A mirror serves "whatever it has" and cannot be enumerated, so the
+    // same version number proves nothing there. Only the mirror's SIGNED
+    // manifest may say the running binary is already what it serves (F17:
+    // a node re-downloaded the whole binary on every run). Short of that,
+    // fetch as before, through the download path's own verification.
+    if action == CliAction::Noop {
+        if let Some(base) = base_url.as_deref() {
+            let asset = format!("noo-{target}");
+            let manifest = fetch_signed_manifest(g, &version, Some(base)).map_err(|e| e.summary());
+            match mirror_verdict(manifest, &crate::release_sig::verify, &current, &asset, running_exe_sha().as_deref()) {
+                MirrorVerdict::Current => {
+                    if !g.json {
+                        ui::step(&format!("the mirror's signed {} verifies and lists this {asset}: nothing to download",
+                            crate::release_sig::MANIFEST));
+                    }
+                }
+                MirrorVerdict::Download(why) => {
+                    if !g.json { ui::step(&format!("{why} — downloading from the mirror")); }
+                    action = CliAction::Upgrade;
+                }
+            }
+        }
     }
 
     if check_only {
@@ -4359,6 +4378,58 @@ fn decide_cli_action(current: &str, target: &str, pinned: bool) -> CliAction {
     }
 }
 
+/// What a mirror's signed manifest says about the running binary.
+#[derive(Debug, PartialEq, Eq)]
+enum MirrorVerdict {
+    /// The manifest verifies, names the running version, and lists the
+    /// running binary's sha256 for this platform: nothing to download.
+    Current,
+    /// Anything else, with the reason: download as before (the download
+    /// path fetches and verifies the manifest again on its own).
+    Download(String),
+}
+
+/// The pure decision behind skipping a mirror download (F17). The mirror is
+/// untrusted transport: nothing it serves may say "current" until the
+/// signature verifies against the release key, the signed bytes name the
+/// running version, and they list the running binary's digest. Every other
+/// outcome downloads; none of them assumes the binary is current.
+fn mirror_verdict(
+    manifest: Result<Option<(String, String)>, String>,
+    verify: &SigVerify<'_>,
+    current: &str,
+    asset: &str,
+    running_sha: Option<&str>,
+) -> MirrorVerdict {
+    let m = crate::release_sig::MANIFEST;
+    let (manifest, sig) = match manifest {
+        Ok(Some(pair)) => pair,
+        Ok(None) => return MirrorVerdict::Download(format!("the mirror serves no signed {m}")),
+        Err(e) => return MirrorVerdict::Download(format!("could not read the mirror's signed {m}: {e}")),
+    };
+    if let Err(e) = verify(manifest.as_bytes(), &sig) {
+        return MirrorVerdict::Download(format!("the mirror's {m} does not verify against the release key ({e})"));
+    }
+    if !crate::release_sig::manifest_names_version(&manifest, current) {
+        return MirrorVerdict::Download(format!("the mirror's signed {m} is not the one for {current}"));
+    }
+    let want = match crate::release_sig::manifest_sha_for(&manifest, asset) {
+        Some(h) => h,
+        None => return MirrorVerdict::Download(format!("the mirror's signed {m} lists no {asset}")),
+    };
+    match running_sha {
+        Some(got) if got == want => MirrorVerdict::Current,
+        Some(_) => MirrorVerdict::Download(format!("the mirror's {asset} differs from the running binary")),
+        None => MirrorVerdict::Download("could not read the running binary to compare it".into()),
+    }
+}
+
+/// sha256 (hex) of the running executable; None when it cannot be read.
+fn running_exe_sha() -> Option<String> {
+    let bytes = std::fs::read(std::env::current_exe().ok()?).ok()?;
+    Some(hex::encode(Sha256::digest(&bytes)))
+}
+
 /// The newest FINAL CLI release among `(tag, is_prerelease)` pairs, as a bare
 /// version. A release candidate (`noo-cli-vA.B.C-rc.N`, published from
 /// staging as a GitHub prerelease so a rehearsal can fetch its node binaries)
@@ -6731,6 +6802,139 @@ mod cli_action_tests {
         assert_eq!(CliAction::DowngradePinned.as_str(), "downgrade_pinned");
         assert_eq!(CliAction::Noop.as_str(), "noop");
         assert_eq!(CliAction::Upgrade.as_str(), "upgrade");
+    }
+}
+
+/// F17: a mirror download is skipped only on a manifest that verifies
+/// against the release key, names the running version, and lists the
+/// running binary's digest. Every other outcome downloads.
+#[cfg(test)]
+mod mirror_verdict_tests {
+    use super::{mirror_verdict, MirrorVerdict};
+    use crate::release_sig::{pubkey_hex, sign, signing_key_from_seed_hex, verify_with_keys, VERSION_ASSET};
+    use sha2::{Digest, Sha256};
+
+    const ASSET: &str = "noo-x86_64-unknown-linux-musl";
+    const RUNNING: &[u8] = b"the running noo build";
+    const CURRENT: &str = "0.6.30";
+
+    fn sha(b: &[u8]) -> String {
+        hex::encode(Sha256::digest(b))
+    }
+
+    /// `sha256sums.txt` naming `version` and listing `bin` as this platform's binary.
+    fn manifest(version: &str, bin: &[u8]) -> String {
+        format!("{}  {ASSET}\n{}  {VERSION_ASSET}\n", sha(bin), sha(format!("{version}\n").as_bytes()))
+    }
+
+    fn signed_by(seed: &str, text: &str) -> Result<Option<(String, String)>, String> {
+        let key = signing_key_from_seed_hex(seed).unwrap();
+        Ok(Some((text.to_string(), sign(&key, text.as_bytes()))))
+    }
+
+    /// The test release key stands in for the baked one.
+    fn test_seed() -> String {
+        "11".repeat(32)
+    }
+
+    fn decide(m: Result<Option<(String, String)>, String>, running: Option<&str>) -> MirrorVerdict {
+        let pk = pubkey_hex(&signing_key_from_seed_hex(&test_seed()).unwrap());
+        let verify = |d: &[u8], s: &str| verify_with_keys(d, s, &[pk.as_str()]);
+        mirror_verdict(m, &verify, CURRENT, ASSET, running)
+    }
+
+    fn why(v: MirrorVerdict) -> String {
+        match v {
+            MirrorVerdict::Download(w) => w,
+            MirrorVerdict::Current => panic!("skipped the download on a manifest that must not decide it"),
+        }
+    }
+
+    #[test]
+    fn a_verified_manifest_naming_this_binary_skips_the_download() {
+        let running = sha(RUNNING);
+        let v = decide(signed_by(&test_seed(), &manifest(CURRENT, RUNNING)), Some(&running));
+        assert_eq!(v, MirrorVerdict::Current);
+    }
+
+    #[test]
+    fn a_bad_signature_claiming_this_binary_downloads() {
+        let running = sha(RUNNING);
+        let claim = manifest(CURRENT, RUNNING);
+        // Signed by a key this build does not trust.
+        let w = why(decide(signed_by(&"22".repeat(32), &claim), Some(&running)));
+        assert!(w.contains("does not verify"), "{w}");
+        // A genuine signature over other bytes, served with the claim.
+        let (_, sig) = signed_by(&test_seed(), &manifest(CURRENT, b"another build")).unwrap().unwrap();
+        let w = why(decide(Ok(Some((claim.clone(), sig))), Some(&running)));
+        assert!(w.contains("does not verify"), "{w}");
+        // Not a signature at all.
+        let w = why(decide(Ok(Some((claim.clone(), "noo-sig1.AAAA".into()))), Some(&running)));
+        assert!(w.contains("does not verify"), "{w}");
+        // Production wiring: the baked key never trusts the test key.
+        let v = mirror_verdict(signed_by(&test_seed(), &claim), &crate::release_sig::verify, CURRENT, ASSET, Some(&running));
+        assert!(why(v).contains("does not verify"));
+    }
+
+    #[test]
+    fn a_verified_manifest_with_a_different_digest_downloads() {
+        let running = sha(RUNNING);
+        let w = why(decide(signed_by(&test_seed(), &manifest(CURRENT, b"a rebuilt noo")), Some(&running)));
+        assert!(w.contains("differs from the running binary"), "{w}");
+    }
+
+    #[test]
+    fn a_verified_manifest_for_another_version_downloads() {
+        let running = sha(RUNNING);
+        // Same digest, other release: the signed bytes must name this one.
+        let w = why(decide(signed_by(&test_seed(), &manifest("0.6.31", RUNNING)), Some(&running)));
+        assert!(w.contains("is not the one for 0.6.30"), "{w}");
+        // An older manifest with no version row cannot name any release.
+        let unbound = format!("{}  {ASSET}\n", sha(RUNNING));
+        let w = why(decide(signed_by(&test_seed(), &unbound), Some(&running)));
+        assert!(w.contains("is not the one for 0.6.30"), "{w}");
+    }
+
+    #[test]
+    fn a_verified_manifest_without_this_platform_downloads() {
+        let running = sha(RUNNING);
+        let other = manifest(CURRENT, RUNNING).replace(ASSET, "noo-aarch64-unknown-linux-musl");
+        assert!(!other.contains(ASSET), "the platform row was renamed");
+        let w = why(decide(signed_by(&test_seed(), &other), Some(&running)));
+        assert!(w.contains(&format!("lists no {ASSET}")), "{w}");
+    }
+
+    #[test]
+    fn no_manifest_a_failed_fetch_or_an_unreadable_binary_downloads() {
+        let running = sha(RUNNING);
+        let w = why(decide(Err("connection refused".into()), Some(&running)));
+        assert!(w.contains("could not read the mirror's signed") && w.contains("connection refused"), "{w}");
+        let w = why(decide(Ok(None), Some(&running)));
+        assert!(w.contains("serves no signed"), "{w}");
+        let w = why(decide(signed_by(&test_seed(), &manifest(CURRENT, RUNNING)), None));
+        assert!(w.contains("could not read the running binary"), "{w}");
+    }
+
+    /// The wiring: only a mirror run consults the manifest, production
+    /// passes the baked-key check (never a permissive one), every reason to
+    /// doubt falls back to the download, and the signature is checked
+    /// before anything the manifest says is read.
+    #[test]
+    fn the_mirror_skip_trusts_only_the_release_key() {
+        let up = super::phase_src::body("upgrade");
+        let gate = up.find("if let Some(base) = base_url.as_deref()").expect("the skip runs on a mirror only");
+        let call = up.find("mirror_verdict(manifest, &crate::release_sig::verify, &current, &asset, running_exe_sha().as_deref())")
+            .expect("production decides with the baked release key and the running binary's digest");
+        let arm = up.find("MirrorVerdict::Download(why) =>").expect("the download arm");
+        let forced = up[arm..].find("action = CliAction::Upgrade;").map(|i| arm + i).expect("the download arm forces the fetch");
+        let check = up.find("if check_only").expect("check_only");
+        assert!(gate < call && call < arm && forced < check);
+        let v = super::phase_src::body("mirror_verdict");
+        let at = |n: &str| v.find(n).unwrap_or_else(|| panic!("{n}"));
+        let verified = at("verify(manifest.as_bytes(), &sig)");
+        assert!(verified < at("manifest_names_version(&manifest, current)"));
+        assert!(verified < at("manifest_sha_for(&manifest, asset)"));
+        assert!(verified < at("MirrorVerdict::Current"));
     }
 }
 
