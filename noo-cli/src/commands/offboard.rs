@@ -1389,7 +1389,10 @@ mod volume_selection_tests {
         let code = crate::test_src::own_code(include_str!("offboard.rs"));
         let audit = crate::test_src::fn_body(&code, "fn audit_leftovers(");
         assert!(audit.contains("Ok(DockerAccess::Reachable) => stack_volumes(&crate::envfile::compose_project()),"), "{audit}");
-        assert_eq!(code.matches("stack_volumes(&project)").count(), 2, "the removal and its re-check, nothing else");
+        // The removal's listing and its re-check both ask LiveWalk::volumes
+        // (stack_step calls it twice: stack_step_tests).
+        assert_eq!(code.matches("stack_volumes(self.project)").count(), 1, "the walk's one volume source");
+        assert_eq!(code.matches("stack_volumes(&project)").count(), 0, "nothing else lists the volumes");
         assert_eq!(code.matches("\"volume\", \"ls\"").count(), 1, "one volume listing, inside stack_volumes");
     }
 
