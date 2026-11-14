@@ -361,6 +361,11 @@ pub async fn ensure_kv_buckets(js: &async_nats::jetstream::Context, verbose: boo
     }
 }
 
+/// The gateway's Postgres pool ceiling (i815). Measured peak: 7 (rc.1, one
+/// user, first answer, 4-core runner); sqlx's default, used until 2026-11,
+/// was 10. Counted against max_connections by tests/test_pg_pool_budget.py.
+pub const GATEWAY_PG_MAX_CONNECTIONS: u32 = 12;
+
 /// How long the gateway waits for its first NATS connection before it serves
 /// degraded (i301 a.3).
 pub const BUS_BOOT_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
@@ -545,8 +550,17 @@ impl AppState {
         use std::str::FromStr as _;
         let opts = sqlx::postgres::PgConnectOptions::from_str(&db_url)?
             .options([("search_path", "mesh,public,trellion,evolve")]);
-        let db = sqlx::PgPool::connect_with(opts).await?;
-        tracing::info!("Postgres connected");
+        // Sized explicitly (i815): sqlx's default is 10, and every pool on
+        // the box adds up against Postgres max_connections. A checkout that
+        // waits past 2 s is logged by sqlx at WARN (target
+        // `sqlx::pool::acquire`); this is the only pool in the process, so
+        // that line names it, and the ceiling is logged here once.
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(GATEWAY_PG_MAX_CONNECTIONS)
+            .acquire_slow_threshold(std::time::Duration::from_secs(2))
+            .connect_with(opts)
+            .await?;
+        tracing::info!(max_connections = GATEWAY_PG_MAX_CONNECTIONS, "Postgres connected");
 
         // NATS (with TLS if cluster CA is available)
         let nats_url = crate::config::env_or_yaml(

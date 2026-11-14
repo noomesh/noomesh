@@ -25,6 +25,7 @@ from pathlib import Path
 
 import structlog
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.pool import NullPool
 
 from .engine import _sync_dsn
 
@@ -137,7 +138,8 @@ def _shim_legacy_version_table(dsn: str) -> None:
     Fresh installs hit the ``not exists`` early-return.
     """
     sync_url = _sync_dsn(dsn)
-    engine = create_engine(sync_url, pool_pre_ping=True)
+    # One-shot: no pool to budget (i815), one connection at a time, closed on return.
+    engine = create_engine(sync_url, poolclass=NullPool)
     try:
         # Read-side: detect whether shim is needed
         with engine.connect() as conn:

@@ -46,8 +46,8 @@ class HeartbeatStore:
         elif dsn is not None:
             # Legacy path: caller passed a DSN directly
             from noomesh.db.engine import _sync_dsn
-            from sqlalchemy import create_engine
-            self._engine = create_engine(_sync_dsn(dsn), pool_pre_ping=True)
+            from noomesh.db.pool_budget import budgeted_engine
+            self._engine = budgeted_engine("heartbeat_store", _sync_dsn(dsn), pool_pre_ping=True)
         else:
             from noomesh.db import get_engine
             self._engine = get_engine()
