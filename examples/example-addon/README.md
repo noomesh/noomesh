@@ -94,7 +94,10 @@ run of this example.
    ```
 
    `noo stack restart --force` starts the service. `noo addons list` shows it
-   declared and running.
+   declared and running. The same holds for `noo addons upgrade`, and for node
+   workloads: an add-on's node workload exists for the gateway only once
+   `noo stack restart --force` has run, so restart before `noo cluster
+   workloads place`.
 
 6. **Connect**: call the add-on's route through the gateway as an operator. It
    answers with who the call was for and whether its own token exchange

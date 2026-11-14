@@ -1744,6 +1744,14 @@ enable` says so when the add-on declares node workloads). A node whose applier
 predates these kinds (CLI older than 0.6.18) is sent none, and provision names
 it and the same remedy.
 
+**A node workload exists for the gateway only after a restart.** `noo addons
+enable` and `noo addons upgrade` verify and pin the add-on but restart
+nothing; the launcher copies its `node-workloads.json` to the gateway when the
+stack starts. So after either one, run `noo stack restart --force` before
+`noo cluster workloads place`. Until then the place is refused
+`not_in_running_stack`, naming the version the running stack has and this
+remedy; an add-on the gateway does not register at all is a plain `not_found`.
+
 ## Declaring runtime inputs
 
 Your services need things only the stack can produce: the gateway's URL and
