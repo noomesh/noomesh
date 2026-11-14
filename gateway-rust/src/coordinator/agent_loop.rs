@@ -415,7 +415,7 @@ pub(super) async fn fire_post_response_hooks(
 // ═══════════════════════════════════════════════════════════════
 
 /// Core tools always included in every request.
-const CORE_TOOLS: &[&str] = &[
+pub(super) const CORE_TOOLS: &[&str] = &[
     "noo_tool_search",
     "noo_rag_query",
     "noo_rag_ingest",       // save→knowledge workflow needs this
@@ -429,7 +429,7 @@ const CORE_TOOLS: &[&str] = &[
 
 /// Tool groups with trigger keywords.
 /// Format: (group_name, tool_names, keywords)
-const TOOL_GROUPS: &[(&str, &[&str], &[&str])] = &[
+pub(super) const TOOL_GROUPS: &[(&str, &[&str], &[&str])] = &[
     ("rag", &["noo_rag_ingest", "noo_rag_status", "noo_docs_list", "noo_memory_health"],
      &["ingest", "document", "upload", "rag", "knowledge base", "pageindex", "embed", "index"]),
     ("graph", &["noo_graph_search_entities", "noo_graph_entity_detail", "noo_graph_neighbors",

@@ -47,7 +47,7 @@ pub const FITNESS_MIN: f64 = 0.0;
 pub const FITNESS_MAX: f64 = 10.0;
 
 /// Selection budget — mirrors PromptSkillSelector's defaults.
-const MAX_SKILLS: usize = 3;
+pub(crate) const MAX_SKILLS: usize = 3;
 const MAX_TOTAL_CHARS: usize = 8000;
 
 /// How far a skill is trusted. Core skills are shipped and always instructions;
