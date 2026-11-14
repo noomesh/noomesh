@@ -204,7 +204,11 @@ cluster:
   # After a verified `noo upgrade`, superseded images that are provably
   # ours (in no current or previous lock or add-on pin, used by no
   # container) are removed. live | preview | off. Unset: the first roll
-  # that carries this previews, later rolls remove.
+  # that carries this previews, later rolls remove. "Ours" is noomesh's
+  # registry and each pinned add-on image's own repository, nothing wider.
+  # Images Docker reports by short name (Docker Hub: redis:7, postgres:16)
+  # are never treated as ours and are always kept, so an add-on pinned on
+  # Docker Hub is not cleaned up; remove its old images by hand.
   # image_retention: live
   pinned_backends: []
   # Example: pin a backend to a specific node
