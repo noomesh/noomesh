@@ -200,7 +200,8 @@ add-on service key with the `metrics` scope; at most 256 series per source,
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/api/inference` | run one turn through the coordinator (non-streaming) |
-| POST | `/api/inference/stream` | the same, as Server-Sent Events proxied token-by-token from the backend (`data: {…}` lines in OpenAI streaming format, ending `data: [DONE]`) |
+| POST | `/api/inference/chat` | one coordinator turn as Server-Sent Events, as the signed-in user (retrieval, memory, tools; `data: {"type": …}` events, the console socket's shape); what `noo chat` uses |
+| POST | `/api/inference/stream` | a plain model call as Server-Sent Events, proxied token-by-token from the backend (no coordinator: no retrieval or tools; `data: {…}` lines in OpenAI streaming format, ending `data: [DONE]`) |
 | POST | `/v1/chat/completions` | OpenAI-compatible chat, routed by **model class** with failover (below); what external clients and `pipeline/llm.py` use |
 | POST | `/v1/responses` | OpenAI Responses API, for harnesses that speak only it (Codex CLI since February 2026); same auth, class resolution, failover and accounting as `/v1/chat/completions`. Streaming supported; stateless (no `GET /v1/responses/{id}`) |
 | GET | `/v1/models`, `/v1/models/{model_id}` | the **catalogue**: every class and alias a consumer may send as `model`, `owned_by: "noomesh"`, with `noo: {class, candidates, healthy}`; `/v1/models/{id}` is `404 model_not_found` for an id that is no class, alias or served model. Still the dashboard's readiness probe: `503` until the first `chat-default` candidate answers its own model list |
