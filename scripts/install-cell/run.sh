@@ -242,6 +242,28 @@ teardown() {
 }
 fail_onboarded() { teardown; finish; }
 
+# An arm64 cell EXPECTS the controller refusal (the matrix says expect:
+# refusal): a controller needs Linux on x86_64 today (noo-cli onboard/upfront.rs
+# platform_refusal; noomesh-internal i781 scopes lifting it). The cell passes
+# when the refusal is clean, so the matrix has no permanent red: onboard exits
+# non-zero, names the reason and the way on (join as a node), and creates no
+# stack container. Anything else fails it by name.
+if [ "${EXPECT:-}" = refusal ]; then
+    step onboard-refuses 600 -- sh -c '
+      out="$(noo onboard --ci 2>&1)"; rc=$?
+      printf "%s\n" "$out" | tail -n 20
+      why=""
+      [ "$rc" != 0 ] || why="onboard exited 0 on a machine it must refuse"
+      printf "%s" "$out" | grep -q "a controller needs Linux on x86_64 (amd64)" || why="${why:-the refusal does not name the reason (a controller needs Linux on x86_64)}"
+      printf "%s" "$out" | grep -q "can join an amd64 controller as a node instead" || why="${why:-the refusal does not name the way on (join as a node)}"
+      n="$(docker ps -aq --filter name=noo- 2>/dev/null | wc -l)"
+      [ "$n" = 0 ] || why="${why:-the refused onboard left $n noo- container(s)}"
+      if [ -n "$why" ]; then echo "REFUSAL FAIL: $why"; exit 1; fi
+      echo "REFUSAL OK: onboard refused this $(uname -m) machine, named the reason and the node alternative, and started nothing"'
+    teardown
+    finish
+fi
+
 if [ "$ONBOARD" = interactive ]; then
     hook onboard-interactive.sh || fail_onboarded
 elif [ "$MODEL" = tiny ]; then
