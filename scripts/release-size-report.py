@@ -23,7 +23,9 @@ Plus the CLI release assets' sizes. Totals per platform at the end.
 
 --memory adds "Memory at idle (measured)": the install matrix cells'
 memory.json (scripts/install-cell/memory_baseline.py, probe-memory-baseline).
-A cell whose file is missing is listed as "not measured: <why>".
+A cell whose file is missing is listed as "not measured: <why>". Beside it,
+the cells' pg-conns.json (scripts/install-cell/pg_conns.py): Postgres
+connections per sample point against max_connections.
 """
 
 from __future__ import annotations
@@ -137,6 +139,17 @@ def _baseline_module():
 
 
 MB = _baseline_module()
+
+
+def _pg_conns_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("pg_conns", ROOT / "scripts" / "install-cell" / "pg_conns.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+PGC = _pg_conns_module()
 NODE_SHARE_LABEL = MB.NODE_SHARE_LABEL
 FLEET_LINE = ("fleet, read-only: on 0.6.24+ each node agent exports its own process_resident_memory_bytes "
               "and noo_unit_memory_bytes (#1026); real-hardware node figures (robopi, the Mac) are read from "
@@ -173,7 +186,27 @@ def load_extras(cell: str, d, base: dict | None) -> dict:
         out["coldload"] = doc if doc else {"missing": why}
     elif expected:
         out["coldload"] = {"missing": "no coldload.json in the cell's artifact"}
+    # First answer (cell.py summary, noomesh #1211): net of the probe/idle
+    # steps before it. On a cell where probes ran first (the idle series)
+    # the model was unloaded by then, so the number is a COLD first answer.
+    s = d / "summary.json"
+    if s.is_file():
+        doc, _ = _read_json(s)
+        if doc and doc.get("first_answer_s") not in (None, "", "?"):
+            out["first_answer"] = {k: doc.get(k) for k in ("first_answer_s", "first_answer_wall_s", "probe_wait_before_first_answer_s")}
+    # Postgres connections (pg_conns.py): expected from PG_CONNS_CELLS.
+    f = d / "pg-conns.json"
+    if f.is_file():
+        doc, why = _read_json(f)
+        out["pg_conns"] = doc if doc and isinstance(doc.get("points"), list) else \
+            {"missing": why or "pg-conns.json has no points"}
+    elif cell in PGC.PG_CONNS_CELLS:
+        out["pg_conns"] = {"missing": "no pg-conns.json in the cell's artifact"}
     return out
+
+
+def render_pg_conns(p: dict) -> list[str]:
+    return PGC.render_report(None, p["missing"]) if "missing" in p else PGC.render_report(p)
 
 
 def load_memory(specs: list[str]) -> list[dict]:
@@ -243,6 +276,16 @@ def render_series(series: list[dict]) -> list[str]:
     return L
 
 
+def render_first_answer(fa: dict) -> list[str]:
+    """One line naming which first answer the number is (fa, 2026-11-14):
+    after an idle series the model was unloaded, so it is a cold one."""
+    net, wait = fa.get("first_answer_s"), fa.get("probe_wait_before_first_answer_s") or 0
+    if wait and int(wait) > 0:
+        return ["", f"first answer: {net} s after install, cold model (after a 40-min idle series; "
+                    f"{fa.get('first_answer_wall_s')} s on the wall clock); the warm figure is in the Cold load table below"]
+    return ["", f"first answer: {net} s after install, right after install (model as onboard left it)"]
+
+
 def render_coldload(c: dict) -> list[str]:
     if "missing" in c:
         return ["", f"#### Cold load: not measured: {c['missing']}"]
@@ -277,7 +320,9 @@ def render_memory(cells: list[dict]) -> list[str]:
         if not c["measured"]:
             L += ["", f"### {c['cell']}: not measured: {c['why']}"]
             L += render_series(c["series"]) if "series" in c else []
+            L += render_first_answer(c["first_answer"]) if "first_answer" in c else []
             L += render_coldload(c["coldload"]) if "coldload" in c else []
+            L += render_pg_conns(c["pg_conns"]) if "pg_conns" in c else []
             continue
         d = c["baseline"]
         m = d["meta"]
@@ -307,7 +352,9 @@ def render_memory(cells: list[dict]) -> list[str]:
                            ("node_share", f"**{NODE_SHARE_LABEL}**")):
             L.append(f"| {label} | " + " | ".join(MB._tot(t[key][k]) for k in MB.TOTAL_FIGURES) + " |")
         L += render_series(c["series"]) if "series" in c else []
+        L += render_first_answer(c["first_answer"]) if "first_answer" in c else []
         L += render_coldload(c["coldload"]) if "coldload" in c else []
+        L += render_pg_conns(c["pg_conns"]) if "pg_conns" in c else []
     return L
 
 
@@ -328,6 +375,8 @@ def memory_json(cells: list[dict]) -> dict:
             out["series"] = [_sample_json(s) for s in c["series"]]
         if "coldload" in c:
             out["coldload"] = c["coldload"]
+        if "pg_conns" in c:
+            out["pg_conns"] = c["pg_conns"]
         return out
     return {"fleet": FLEET_LINE, "node_share_label": NODE_SHARE_LABEL,
             "cells": [{"cell": c["cell"], "measured": False, "why": c["why"], **extras(c)} if not c["measured"]

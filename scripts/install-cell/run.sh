@@ -40,7 +40,36 @@ meta limits "no GPU on hosted runners: CPU inference only"
 ( while :; do df -Pk / | awk 'NR==2{print $3}' >> "$OUT/disk.samples"; sleep 5; done ) &
 SAMPLER=$!
 
+# PROBE (connections forensics, 2026-11-14): Postgres connections held by
+# the stack (pg_stat_activity, grouped; pg_conns.py) against max_connections,
+# which the stack leaves at Postgres's default (100). The default cell only.
+# Points: idle after verify (+ os.cpu_count() inside worker/trellion), idle
+# after the 40 min series, the MAXIMUM during first-answer and during the
+# RAG ingest probe (a 1 s background sampler around the step), and right
+# after each. Writes $OUT/pg-conns.json. Probes: never the failed step.
+PG_CONNS_CELL=ubuntu-24.04-amd64-default
+PG_WATCH_PID=""; PG_WATCH_POINT=""
+pg_sample() {  # POINT [--cpus]
+    [ "$CELL" = "$PG_CONNS_CELL" ] || return 0
+    step "probe-pg-conns-$1" 180 -- python3 "$HERE/pg_conns.py" sample --out "$OUT/pg-conns.json" \
+        --cell "$CELL" --point "$@"
+}
+pg_watch_start() {  # POINT CAP_S: sample every 1 s until pg_watch_stop
+    [ "$CELL" = "$PG_CONNS_CELL" ] || return 0
+    PG_WATCH_POINT="$1"; rm -f "$OUT/pg-watch.stop"
+    python3 "$HERE/pg_conns.py" watch --samples "$OUT/pg-watch-$1.jsonl" --stop "$OUT/pg-watch.stop" \
+        --interval 1 --max-seconds "$2" --parent $$ >> "$OUT/logs/pg-watch-$1.log" 2>&1 &
+    PG_WATCH_PID=$!
+}
+pg_watch_stop() {  # the step's maximum becomes one point (also from finish)
+    [ -n "$PG_WATCH_PID" ] || return 0
+    touch "$OUT/pg-watch.stop"; wait "$PG_WATCH_PID" 2>/dev/null; PG_WATCH_PID=""
+    step "probe-pg-conns-$PG_WATCH_POINT" 120 -- python3 "$HERE/pg_conns.py" fold \
+        --samples "$OUT/pg-watch-$PG_WATCH_POINT.jsonl" --point "$PG_WATCH_POINT" --out "$OUT/pg-conns.json" --cell "$CELL"
+}
+
 finish() {
+    pg_watch_stop   # a step that failed mid-watch still folds its samples
     kill "$SAMPLER" 2>/dev/null
     if [ -s "$OUT/disk.samples" ]; then
         meta peak_disk_used_gb "$(sort -n "$OUT/disk.samples" | tail -1 | awk '{printf "%.1f", $1/1048576}')"
@@ -344,6 +373,7 @@ step probe-self-agent-diagnostics 120 -- sh -c '
 # $OUT/memory.json (uploaded with the cell, through the upload scan). docker
 # and unreadable files go through sudo, so the docker=none cells work too.
 # Two cells only, to keep matrix minutes down. A probe: never the failed step.
+pg_sample idle-after-verify --cpus
 MEMORY_SETTLE_S="${MEMORY_SETTLE_S:-60}"
 case "$CELL" in
     ubuntu-24.04-amd64-default|ubuntu-22.04-amd64)
@@ -374,6 +404,7 @@ if [ "$CELL" = "$IDLE_SERIES_CELL" ]; then
     step idle-chat-unloaded 60 -- python3 "$HERE/idle_judge.py" \
         --t40 "$OUT/memory-idle-t40.json" --agent-bin "$(command -v noo-node-agent || echo /usr/local/bin/noo-node-agent)"
 fi
+pg_sample idle-after-series
 # The single-turn line docs/getting-started/first-chat.md gives, read from the
 # doc itself (its first `noo chat --message "…"` line), so the page and the
 # test cannot drift. The answer must be an answer: a model that asks for more
@@ -395,6 +426,7 @@ FIRST_ANSWER_DEFLECTION='how can i help you|do you have any (specific )?(questio
 # and gave the tips on another; general 11-13).
 export FIRST_PROMPT FIRST_ANSWER_NOT_AN_ANSWER FIRST_ANSWER_DEFLECTION MODEL TINY_MODEL
 meta first_prompt "${FIRST_PROMPT:-none}"
+pg_watch_start during-first-answer 1860
 step first-answer 1800 -- sh -c '
   [ -n "$FIRST_PROMPT" ] || { echo "FIRST-ANSWER FAIL: docs/getting-started/first-chat.md has no noo chat --message line"; exit 1; }
   echo "prompt: $FIRST_PROMPT"
@@ -410,6 +442,8 @@ step first-answer 1800 -- sh -c '
     echo "FIRST-ANSWER NOTE: the tiny test model ($TINY_MODEL) did not answer the prompt; this cell runs MODEL=$MODEL, not the product default, so this is not a product verdict"
   fi' || fail_onboarded
 meta first_answer_s "$(( $(date +%s) - CELL_START ))"
+pg_watch_stop
+pg_sample after-first-answer
 
 # PROBE (operator 2026-11-14): cold-load delays, AFTER first-answer so the
 # idle series above is untouched. coldload.py stops every model ollama ps
@@ -440,6 +474,7 @@ RAG_CHAT_LINE="${RAG_CHAT_LINE:-summarise what you know from anything.md}"
 RAG_WS_CHAT="$HERE/ws_chat.py"
 RAG_VERDICT="$OUT/rag-chat.verdict"
 export RAG_QUERY_LINE RAG_CHAT_LINE RAG_WS_CHAT RAG_VERDICT
+pg_watch_start during-rag-ingest 1560
 step probe-rag-chat 1500 -- sh -c '
   [ -n "$RAG_QUERY_LINE" ] || { echo "RAG PROBE: first-chat.md has no noo rag query line about anything.md"; exit 0; }
   fact="14(th)? (of )?march|ZIRCON-4471|kestrel"
@@ -468,6 +503,8 @@ step probe-rag-chat 1500 -- sh -c '
     [ "$path" = chat ] && echo "got=$got indexed=$indexed" > "$RAG_VERDICT"
   done
   true'
+pg_watch_stop
+pg_sample after-rag-ingest
 
 # JUDGED (general 11-14, for 0.6.25): from noomesh#1164 on, `noo chat` runs the
 # coordinator turn over POST /api/inference/chat and retrieves the caller's
