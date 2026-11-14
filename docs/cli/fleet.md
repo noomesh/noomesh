@@ -826,7 +826,7 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 | Command | Arguments | What it does |
 |---|---|---|
 | `noo cluster status` | — | List nodes: tier, status, RUNNING backends, CAPABILITIES by role, CAN-RUN |
-| `noo cluster verify` | `[<node>...] [--controller] [--wait] [--timings]` | Assert every invariant a node and the controller must meet; exit 1 with the remedy |
+| `noo cluster verify` | `[<node>...] [--controller] [--wait] [--timings] [--brief]` | Assert every invariant a node and the controller must meet; exit 1 with the remedy (--brief: failures first, the rest grouped) |
 | `noo cluster invite` | — | Mint a tagged tailscale auth key and print the `noo enroll --via-tailnet <url>` line |
 | `noo cluster down` | `<backend> [--node <node>] [-y\|--yes]` | Stop a backend on one node or all nodes; destructive, asks for confirmation (-y) |
 | `noo cluster desired` | `<node>` | Alias of show: the node in full, with its desired config and every placement |
