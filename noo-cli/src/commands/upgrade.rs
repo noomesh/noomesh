@@ -1210,7 +1210,7 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     crate::commands::voice_models::stage_if_on(g);
     reconcile_addon_nats_principals(g, &roll.root);
 
-    advise_cpu_only_slots(g, &roll.root);
+    reconcile_cpu_only_slots(g, &roll.root);
 
     // Stage node images (overlapping the launcher), then launch.
     let staging = crate::commands::image_stage::start_stage_release_images(g, target_stack_lock.clone(), &roll.tag);
@@ -8261,16 +8261,113 @@ mod netns_reconcile_tests {
     }
 }
 
-/// i802: a CPU-only controller still on the compose default of 4 Ollama
-/// slots is told that one slot prefills about 3x faster here, with the
-/// command. Recommend only: changing a default the user never chose on
-/// upgrade is the operator's call (not made yet), so nothing is written.
-fn advise_cpu_only_slots(g: &Globals, root: &std::path::Path) {
-    if g.json {
+/// The command that puts the slots back to compose's default after this
+/// upgrade set one slot (i802).
+pub(crate) const KEEP_FOUR_SLOTS: &str = "noo config set compose_env '{\"OLLAMA_EMBED_NUM_PARALLEL\":\"4\"}' && noo stack restart --force ollama-embed";
+
+/// i802 (operator's decision): on a CPU-only CONTROLLER whose stack Ollama
+/// runs compose's default of 4 slots because nothing ever set them, the
+/// upgrade sets one slot (noomesh.yaml compose_env) and says so, with the
+/// command that undoes it. A value set anywhere, a GPU box, an unreadable
+/// config: nothing changes. Only the controller's stack roll calls this;
+/// a node's upgrade never does.
+fn reconcile_cpu_only_slots(g: &Globals, root: &std::path::Path) {
+    let (cpu_only, readable, value) = crate::commands::cluster_verify::ollama_slots_setting_here(root);
+    if !slots_upgrade_sets_one(cpu_only, readable, value.as_deref()) {
         return;
     }
-    let (cpu_only, readable, value) = crate::commands::cluster_verify::ollama_slots_setting_here(root);
-    if let Some(line) = crate::commands::cluster_verify::cpu_only_slots_upgrade_advice(cpu_only, readable, value.as_deref()) {
-        println!("{}", ui::note(&line));
+    let path = root.join("noomesh.yaml");
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    if std::fs::write(&path, set_compose_env_text(&text, "OLLAMA_EMBED_NUM_PARALLEL", "1")).is_err() {
+        if !g.json {
+            println!("{}", ui::note(&format!("could not write noomesh.yaml; one Ollama slot is still recommended: {}", crate::commands::cluster_verify::CPU_ONLY_SLOTS_REMEDY)));
+        }
+        return;
+    }
+    if !g.json {
+        println!("{}", ui::note(&slots_changed_line()));
+    }
+}
+
+/// The upgrade's own words for the change, with the undo.
+pub(crate) fn slots_changed_line() -> String {
+    format!(
+        "changed: Ollama slots 4 -> 1 on this CPU-only box (noomesh.yaml compose_env). {}. To keep 4: {KEEP_FOUR_SLOTS}",
+        crate::commands::cluster_verify::CPU_ONLY_SLOTS_ADVICE
+    )
+}
+
+/// Set one slot only where nothing chose the slots on a CPU-only box.
+pub(crate) fn slots_upgrade_sets_one(cpu_only: bool, readable: bool, value: Option<&str>) -> bool {
+    cpu_only && readable && value.map(str::trim).filter(|v| !v.is_empty()).is_none()
+}
+
+/// `key: "value"` under the top-level `compose_env:` mapping of a
+/// noomesh.yaml text, keeping every other line as it is (comments
+/// included); the section is appended when absent.
+pub(crate) fn set_compose_env_text(text: &str, key: &str, value: &str) -> String {
+    let entry = |indent: &str| format!("{indent}{key}: \"{value}\"");
+    let lines: Vec<&str> = text.lines().collect();
+    if let Some(i) = lines.iter().position(|l| l.trim_end() == "compose_env:") {
+        // The indent of the section's first child, else two spaces.
+        let indent: String = lines[i + 1..]
+            .iter()
+            .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+            .filter(|l| l.starts_with(' '))
+            .map(|l| l.chars().take_while(|c| *c == ' ').collect())
+            .unwrap_or_else(|| "  ".to_string());
+        let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        out.insert(i + 1, entry(&indent));
+        return out.join("\n") + "\n";
+    }
+    let mut out = text.trim_end_matches('\n').to_string();
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&format!("compose_env:\n{}\n", entry("  ")));
+    out
+}
+
+#[cfg(test)]
+mod cpu_only_slots_upgrade_tests {
+    use super::*;
+
+    /// i802 (operator's decision): unset on a CPU-only box -> set and said;
+    /// an explicit value (4 or anything) -> untouched; a GPU box -> untouched;
+    /// unreadable config -> untouched.
+    #[test]
+    fn one_slot_is_set_only_where_nobody_chose_and_it_is_said() {
+        assert!(slots_upgrade_sets_one(true, true, None));
+        assert!(!slots_upgrade_sets_one(true, true, Some("4")), "an explicit 4 is the operator's");
+        assert!(!slots_upgrade_sets_one(true, true, Some("2")));
+        assert!(!slots_upgrade_sets_one(false, false, None), "a GPU box");
+        assert!(!slots_upgrade_sets_one(true, false, None), "an unreadable config");
+        let said = slots_changed_line();
+        assert!(said.starts_with("changed: Ollama slots 4 -> 1") && said.contains("3x faster") && said.ends_with(KEEP_FOUR_SLOTS), "{said}");
+        assert!(KEEP_FOUR_SLOTS.contains(r#""OLLAMA_EMBED_NUM_PARALLEL":"4""#));
+    }
+
+    #[test]
+    fn the_key_goes_under_compose_env_and_nothing_else_moves() {
+        let with = "# my config\ngateway:\n  url: x\ncompose_env:\n    NOO_IMAGE_TAG: \"v1\"  # pinned\nother: 1\n";
+        let out = set_compose_env_text(with, "OLLAMA_EMBED_NUM_PARALLEL", "1");
+        assert_eq!(out, "# my config\ngateway:\n  url: x\ncompose_env:\n    OLLAMA_EMBED_NUM_PARALLEL: \"1\"\n    NOO_IMAGE_TAG: \"v1\"  # pinned\nother: 1\n");
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
+        assert_eq!(parsed["compose_env"]["OLLAMA_EMBED_NUM_PARALLEL"], serde_yaml::Value::from("1"));
+        assert_eq!(parsed["compose_env"]["NOO_IMAGE_TAG"], serde_yaml::Value::from("v1"));
+        let without = set_compose_env_text("gateway:\n  url: x\n", "OLLAMA_EMBED_NUM_PARALLEL", "1");
+        assert_eq!(without, "gateway:\n  url: x\ncompose_env:\n  OLLAMA_EMBED_NUM_PARALLEL: \"1\"\n");
+        assert_eq!(set_compose_env_text("", "K", "1"), "compose_env:\n  K: \"1\"\n");
+    }
+
+    /// Only the controller's stack roll changes it; a node's upgrade never does.
+    #[test]
+    fn only_the_controllers_stack_roll_sets_the_slots() {
+        let own = crate::test_src::own_code(include_str!("upgrade.rs"));
+        assert_eq!(own.matches("reconcile_cpu_only_slots(g, &roll.root);").count(), 1);
+        let stack = crate::test_src::fn_body(&own, "fn upgrade_stack(");
+        assert!(stack.contains("reconcile_cpu_only_slots(g, &roll.root);"), "{stack}");
+        let nodes = crate::test_src::fn_body(&own, "fn upgrade_nodes(");
+        assert!(!nodes.contains("reconcile_cpu_only_slots"), "a node's upgrade never touches it");
     }
 }
