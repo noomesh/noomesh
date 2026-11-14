@@ -456,6 +456,27 @@ mod tests {
         assert_eq!(Sticky::next(Some(held), &d(16384, 16384), &tight), Sticky { tokens: 16384, declared: 16384 }, "a new declaration");
     }
 
+    /// The room for the cache keeps the headroom back: on fa's box 15.6 GiB
+    /// with 9.4 used leaves 6.2, minus 1.56 (10%), so about 4.64.
+    #[test]
+    fn the_room_keeps_the_headroom_back() {
+        let room = kv_room_gib(&stranger(None));
+        assert!((4.6..4.7).contains(&room), "{room}");
+        let small = FitInputs { ram_gib: 8.0, used_gib: 4.0, ..stranger(None) };
+        assert!((2.95..3.05).contains(&kv_room_gib(&small)), "the 1 GiB minimum on a small box");
+    }
+
+    /// decide() itself holds a working context: an unmeasured model on a
+    /// tight box that already runs its declared 32768 keeps it.
+    #[test]
+    fn decide_keeps_what_the_daemon_already_runs() {
+        let node = json!({"ram_gb": 24.0, "mem_used_gb": 23.0,
+            "model_stats": [{"name": "gemma4:12b", "size_bytes": 8_000_000_000u64, "context_length": 131072, "running_context": 32768}]});
+        let d = decide("ollama", &json!({"OLLAMA_CONTEXT_LENGTH": "32768", "OLLAMA_NUM_PARALLEL": "2"}), "gemma4:12b", &node, 32768).expect("decided");
+        assert_eq!(d.tokens, 32768, "{d:?}");
+        assert!(d.capped.as_deref().is_some_and(|c| c.contains("kept at the 32768 it already runs")), "{d:?}");
+    }
+
     #[test]
     fn a_working_context_is_never_shrunk_by_the_fit() {
         let capped = Fit { tokens: 8192, capped: Some("32768 needs 9.0 GiB".into()) };
