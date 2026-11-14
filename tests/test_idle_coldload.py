@@ -163,7 +163,7 @@ def test_coldload_renders_and_a_missing_one_is_not_measured(tmp_path):
     assert "| cold embed (POST /api/external/embeddings) | 4.21 | - | ok |" in md
     assert "| cold chat (noo chat --message) | 61.5 | 58.0 | ok |" in md
     assert "| warm chat | - | - | FAILED: timed out after 900 s |" in md, "a failed timing is never shown as 0"
-    assert "service key: minted=True revoked=True" in md
+    assert "service-key lifecycle (no value shown) minted=True revoked=True" in md
     (d / "coldload.json").unlink()
     md = "\n".join(SIZE.render_memory(SIZE.load_memory([str(d / "memory.json")])))
     assert "#### Cold load: not measured: no coldload.json in the cell's artifact" in md
@@ -350,3 +350,21 @@ def test_the_default_cell_keeps_timeout_headroom_for_the_series():
     assert "for IDLE_MIN in 10 40; do" in text and "step probe-coldload 3000 " in text
     measured_cell_minutes = 18  # the default cell's slowest recent run (2026-11-13/14: 12.9-17.6 min)
     assert measured_cell_minutes + 41 + 3000 / 60 < budget, "series + a worst-case cold load must fit 120 min"
+
+
+def test_the_service_key_status_line_passes_the_upload_scan():
+    """Run 43611137767: 'service key: minted=True revoked=True' was redacted
+    to 'service key: [REDACTED] revoked=True' and the scan read revoked=True as
+    the key's value, withholding the cell's logs. The status line must not be
+    key-shaped, in the probe's log or the report."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("cellpy", ROOT / "scripts" / "install-cell" / "cell.py")
+    cell = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cell)
+    for src in ("scripts/install-cell/coldload.py", "scripts/release-size-report.py"):
+        text = (ROOT / src).read_text()
+        line = next(l for l in text.splitlines() if "lifecycle (no value shown)" in l)
+        sample = "service-key lifecycle (no value shown) minted=True revoked=True\n"
+        assert "service key:" not in line, src
+        red = cell.redact_line(sample, {})
+        assert cell.secret_hits(red) == [], (src, red)
