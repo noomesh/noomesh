@@ -936,8 +936,8 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 | `noo autonomy decisions` | `[-n\|--limit <n>] [-l\|--location <name>]` | What the disarmed autonomy locations would have done — the evidence for arming one |
 | `noo autonomy enable` | — | Enable the autonomy engine |
 | `noo autonomy disable` | — | Disable the autonomy engine |
-| `noo autonomy live` | `<rule> [-y\|--yes]` | Take a dry-run-gated rule live so it acts; asks first; operator or admin |
-| `noo autonomy preview` | `<rule>` | Put a gated rule back into dry run: it records what it would do and changes nothing |
+| `noo autonomy live` | `<rule> [-y\|--yes]` | Arm a gated rule and take it out of preview: it then acts; asks first; operator or admin |
+| `noo autonomy preview` | `<rule>` | Put a gated rule back into preview: it records what it would do; its arm state stays |
 
 ### `noo skills` — Containerized skill management
 | Command | Arguments | What it does |
