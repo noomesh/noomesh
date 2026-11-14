@@ -7578,6 +7578,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             .map(|c| (c.name, c.days_left))
             .collect();
         checks.push(cert_expiry_row(&certs));
+        checks.push(stack_images_row_here(&crate::envfile::repo_root()));
         checks.push(image_retention_row_here(&crate::envfile::repo_root()));
         checks.push(noo_data_bound_row(&crate::envfile::repo_root()));
         checks.push(netns_restore_row_here(&crate::envfile::repo_root()));
@@ -8189,8 +8190,27 @@ pub(crate) fn cert_expiry_row(certs: &[(String, i64)]) -> Check {
 /// (`<root>/.noo-host-spool/image-retention-report.json`). Read-only: it
 /// never asks for a run. No report means no reclaim run has had a keep file
 /// yet, which is a fresh install's normal state, not a fault.
-pub(crate) fn image_retention_row(report: Option<Result<Value, String>>) -> Check {
+pub(crate) fn image_retention_row(report: Option<Result<Value, String>>, blocked: Option<Value>) -> Check {
     const NAME: &str = "image retention";
+    // A roll whose gate blocked (the stack or add-on rows did not prove the
+    // images superseded) says so here until a roll cleans, so "never
+    // cleaned" is always visible with its reason (`image_retention.rs`
+    // BLOCKED_FILE).
+    if let Some(b) = blocked {
+        let rows: Vec<&str> = b["rows"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+        if !rows.is_empty() {
+            return warn(
+                NAME,
+                format!(
+                    "superseded images not cleaned since the roll to {} ({}): blocked by {}",
+                    b["tag"].as_str().unwrap_or("?"),
+                    b["at"].as_str().unwrap_or("an unknown time"),
+                    rows.join("; ")
+                ),
+                None,
+            );
+        }
+    }
     let Some(report) = report else {
         return ok(NAME, "not judged yet: no reclaim run has had a keep file");
     };
@@ -8243,7 +8263,145 @@ pub(crate) fn image_retention_row_here(root: &std::path::Path) -> Check {
         Err(e) => Some(Err(format!("{}: {e}", p.display()))),
         Ok(s) => Some(serde_json::from_str::<Value>(&s).map_err(|e| format!("{}: {e}", p.display()))),
     };
-    image_retention_row(report)
+    let blocked = std::fs::read_to_string(root.join(".noo-host-spool").join(crate::commands::image_retention::BLOCKED_FILE))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    image_retention_row(report, blocked)
+}
+
+/// One container on this host, as `docker inspect` gives it.
+#[derive(Debug, Clone)]
+pub(crate) struct StackContainer {
+    pub name: String,
+    /// The image the container was created from, as written (`repo@sha256:…`
+    /// or `repo:tag`).
+    pub config_image: String,
+    /// The image ID it runs.
+    pub image_id: String,
+    pub running: bool,
+}
+
+/// `repo` of `repo@sha256:…` or `repo:tag` (the tag after the last `/`).
+fn image_repo(r: &str) -> &str {
+    if let Some((n, _)) = r.split_once('@') {
+        return n;
+    }
+    match (r.rfind(':'), r.rfind('/')) {
+        (Some(c), Some(sl)) if c > sl => &r[..c],
+        (Some(c), None) => &r[..c],
+        _ => r,
+    }
+}
+
+/// `stack images`: every RUNNING container on this host whose image is one
+/// the stack lock pins (by repository) runs exactly the image the lock pins.
+/// The gate for removing superseded images (`image_retention::retention_gate`)
+/// rests on it: a container still on an older image (a half-done roll)
+/// means "superseded" is not true yet.
+///
+/// Out of scope, and said: containers the lock does not pin at all (an
+/// add-on's own, fixtures, anything of the operator's), and stopped ones (a
+/// one-shot that exited, a never-started keeper). `lock`: each lock ref and
+/// its local image ID (`None`: not on this host). Fail-closed: no lock, or a
+/// docker that did not answer, is a WARN, never a pass.
+pub(crate) fn stack_images_check(lock: Option<&[(String, Option<String>)]>, containers: Result<&[StackContainer], String>) -> Check {
+    const NAME: &str = "stack images";
+    let Some(lock) = lock else {
+        return warn(NAME, "no stack.lock in the install root: what the stack should run is not known — not judged", None);
+    };
+    let containers = match containers {
+        Ok(c) => c,
+        Err(e) => return warn(NAME, format!("docker did not list the containers ({e}) — not judged, not a pass"), None),
+    };
+    let pinned: std::collections::BTreeMap<&str, Vec<(&str, Option<&str>)>> = lock.iter().fold(Default::default(), |mut m, (r, id)| {
+        m.entry(image_repo(r)).or_default().push((r.as_str(), id.as_deref()));
+        m
+    });
+    let mut judged = 0usize;
+    let mut bad: Vec<String> = Vec::new();
+    let mut not_pinned: Vec<&str> = Vec::new();
+    let mut stopped: Vec<&str> = Vec::new();
+    for c in containers {
+        let Some(want) = pinned.get(image_repo(&c.config_image)) else {
+            not_pinned.push(&c.name);
+            continue;
+        };
+        if !c.running {
+            stopped.push(&c.name);
+            continue;
+        }
+        judged += 1;
+        if !want.iter().any(|(_, id)| *id == Some(c.image_id.as_str())) {
+            let short = c.image_id.strip_prefix("sha256:").unwrap_or(&c.image_id);
+            let (r, id) = want[0];
+            bad.push(match id {
+                Some(_) => format!("{} runs {}, the lock pins {r}", c.name, &short[..short.len().min(12)]),
+                None => format!("{} runs {}, and the lock's {r} is not on this host", c.name, &short[..short.len().min(12)]),
+            });
+        }
+    }
+    let mut skipped = Vec::new();
+    if !not_pinned.is_empty() {
+        skipped.push(format!("{} not pinned by the lock ({})", not_pinned.len(), not_pinned.iter().take(4).copied().collect::<Vec<_>>().join(", ")));
+    }
+    if !stopped.is_empty() {
+        skipped.push(format!("{} stopped ({})", stopped.len(), stopped.iter().take(4).copied().collect::<Vec<_>>().join(", ")));
+    }
+    let skipped = if skipped.is_empty() { String::new() } else { format!("; skipped: {}", skipped.join(", ")) };
+    if !bad.is_empty() {
+        return fail(NAME, format!("{}{skipped}", bad.join("; ")), "noo upgrade --stack");
+    }
+    if judged == 0 {
+        return warn(NAME, format!("no running container runs an image the stack lock pins — nothing judged{skipped}"), None);
+    }
+    ok(NAME, format!("{judged} running container(s) run the lock's images{skipped}"))
+}
+
+/// [`stack_images_check`] for the install at `root`, read from docker.
+pub(crate) fn stack_images_row_here(root: &std::path::Path) -> Check {
+    let lock = std::fs::read_to_string(root.join("stack.lock")).ok().map(|t| crate::commands::image_retention::stack_lock_refs(&t));
+    let run = |args: &[&str]| -> Result<String, String> {
+        let o = std::process::Command::new("docker").args(args).stdin(std::process::Stdio::null()).output().map_err(|e| e.to_string())?;
+        if o.status.success() {
+            Ok(String::from_utf8_lossy(&o.stdout).into_owned())
+        } else {
+            Err(String::from_utf8_lossy(&o.stderr).lines().next().unwrap_or("docker failed").to_string())
+        }
+    };
+    let ids: std::collections::BTreeMap<String, String> = run(&["images", "--digests", "--no-trunc", "--format", "{{.Repository}}@{{.Digest}}|{{.ID}}"])
+        .map(|out| out.lines().filter_map(|l| l.split_once('|')).map(|(r, i)| (r.trim().to_string(), i.trim().to_string())).collect())
+        .unwrap_or_default();
+    let lock: Option<Vec<(String, Option<String>)>> = lock.map(|refs| refs.into_iter().map(|r| {
+        let id = ids.get(&r).cloned();
+        (r, id)
+    }).collect());
+    let containers = run(&["ps", "-aq", "--no-trunc"]).and_then(|ids| {
+        let ids: Vec<&str> = ids.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut args = vec!["inspect", "--format", "{{.Name}}|{{.Config.Image}}|{{.Image}}|{{.State.Running}}"];
+        args.extend(ids.iter().copied());
+        let out = run(&args)?;
+        let parsed: Vec<StackContainer> = out
+            .lines()
+            .filter_map(|l| {
+                let p: Vec<&str> = l.trim().splitn(4, '|').collect();
+                (p.len() == 4).then(|| StackContainer {
+                    name: p[0].trim_start_matches('/').to_string(),
+                    config_image: p[1].to_string(),
+                    image_id: p[2].to_string(),
+                    running: p[3] == "true",
+                })
+            })
+            .collect();
+        // One record per container, or what runs is not known.
+        if parsed.len() != ids.len() {
+            return Err(format!("docker inspect answered for {} of {} containers", parsed.len(), ids.len()));
+        }
+        Ok(parsed)
+    });
+    stack_images_check(lock.as_deref(), containers.as_deref().map_err(|e| e.clone()))
 }
 
 fn checks_json(checks: &[Check]) -> Value {
@@ -14169,13 +14327,13 @@ mod vantage_tests {
 
     /// Every row the controller half writes from THIS machine's files and
     /// containers (the rows an outside run on a node turned red).
-    const CONTROLLER_ONLY_ROWS: [&str; 32] = [
+    const CONTROLLER_ONLY_ROWS: [&str; 33] = [
         "self-agent lane", "model cache", "loki", "tempo", "grafana door", "audit key", "secrets at rest",
         "shared secrets", "secrets audit", "grafana sso", "gateway pki view", "loki listener", "tempo listener",
         "sandbox listener", "backend tls", "nats tls", "nats principals", "postgres hba", "postgres role identity",
         "postgres tls", "sandbox executor", "data directories", "data root filesystem", "monitoring web config",
         "secrets not in env", "node-agent privilege", "callers", "tailnet policy", "last backup", "off-site backup",
-        "pki at rest", "image retention",
+        "pki at rest", "image retention", "stack images",
     ];
 
     #[test]
@@ -14586,14 +14744,14 @@ mod image_retention_row_tests {
 
     #[test]
     fn no_report_is_a_fresh_install_not_a_fault() {
-        let r = image_retention_row(None);
+        let r = image_retention_row(None, None);
         assert_eq!(r.verdict, Verdict::Ok);
         assert!(r.detail.contains("not judged yet"), "{}", r.detail);
     }
 
     #[test]
     fn an_unreadable_report_warns_with_the_reason() {
-        let r = image_retention_row(Some(Err("p: bad json".into())));
+        let r = image_retention_row(Some(Err("p: bad json".into())), None);
         assert_eq!(r.verdict, Verdict::Warn);
         assert!(r.detail.contains("bad json"), "{}", r.detail);
     }
@@ -14602,7 +14760,7 @@ mod image_retention_row_tests {
     fn a_dry_run_says_what_is_reclaimable_and_that_nothing_was_removed() {
         let rep = json!({"written_at": "2026-11-13T16:00:00Z", "dry_run": true, "bytes": 52_300_000_000_i64,
             "images": [img(true, None), img(true, None), img(false, None)]});
-        let r = image_retention_row(Some(Ok(rep)));
+        let r = image_retention_row(Some(Ok(rep)), None);
         assert_eq!(r.verdict, Verdict::Ok);
         assert!(r.detail.contains("2 superseded image(s)") && r.detail.contains("52.3 GB"), "{}", r.detail);
         assert!(r.detail.contains("nothing removed"), "{}", r.detail);
@@ -14612,7 +14770,7 @@ mod image_retention_row_tests {
     fn a_live_run_says_what_it_freed() {
         let rep = json!({"written_at": "t", "dry_run": false, "bytes": 3_000_000_000_i64,
             "images": [img(true, Some("removed"))]});
-        let r = image_retention_row(Some(Ok(rep)));
+        let r = image_retention_row(Some(Ok(rep)), None);
         assert_eq!(r.verdict, Verdict::Ok);
         assert!(r.detail.starts_with("removed 1 superseded image(s)") && r.detail.contains("3.0 GB freed"), "{}", r.detail);
     }
@@ -14621,7 +14779,7 @@ mod image_retention_row_tests {
     fn a_refused_removal_warns_and_names_it() {
         let rep = json!({"written_at": "t", "dry_run": false, "bytes": 1,
             "images": [img(true, Some("removed")), img(true, Some("refused: image is being used by running container"))]});
-        let r = image_retention_row(Some(Ok(rep)));
+        let r = image_retention_row(Some(Ok(rep)), None);
         assert_eq!(r.verdict, Verdict::Warn);
         assert!(r.detail.contains("ghcr.io/noomesh/x:old") && r.detail.contains("being used"), "{}", r.detail);
     }
@@ -14629,7 +14787,7 @@ mod image_retention_row_tests {
     #[test]
     fn nothing_superseded_is_ok_and_says_so() {
         let rep = json!({"written_at": "t", "dry_run": true, "bytes": 0, "images": [img(false, None)]});
-        let r = image_retention_row(Some(Ok(rep)));
+        let r = image_retention_row(Some(Ok(rep)), None);
         assert_eq!(r.verdict, Verdict::Ok);
         assert!(r.detail.starts_with("nothing superseded"), "{}", r.detail);
     }
@@ -14639,4 +14797,99 @@ mod image_retention_row_tests {
         let src = include_str!("cluster_verify.rs");
         assert!(src.contains("checks.push(image_retention_row_here(&crate::envfile::repo_root()));"));
     }
+    fn sc(name: &str, image: &str, id: &str, running: bool) -> StackContainer {
+        StackContainer { name: name.into(), config_image: image.into(), image_id: id.into(), running }
+    }
+
+    fn lock() -> Vec<(String, Option<String>)> {
+        vec![
+            ("ghcr.io/noomesh/gateway@sha256:".to_string() + &"1".repeat(64), Some("sha256:".to_string() + &"a".repeat(64))),
+            ("ghcr.io/noomesh/ollama@sha256:".to_string() + &"2".repeat(64), Some("sha256:".to_string() + &"b".repeat(64))),
+        ]
+    }
+
+    fn id(c: &str) -> String {
+        "sha256:".to_string() + &c.repeat(64)
+    }
+
+    /// A fresh install: every pinned container runs the lock's image; an
+    /// add-on's own container, a fixture and a stopped one-shot are out of
+    /// scope and said, never red.
+    #[test]
+    fn stack_images_passes_a_fresh_install_and_names_what_it_skipped() {
+        let cs = vec![
+            sc("noo-gateway", &lock()[0].0, &id("a"), true),
+            sc("noo-ollama", "ghcr.io/noomesh/ollama:v0.6.25", &id("b"), true),
+            sc("noo-rhaddon", "ghcr.io/rhowner/rhaddon@sha256:".to_string().as_str(), &id("c"), true),
+            sc("rh-fixture", "localhost:5000/rh/fixture:1", &id("d"), true),
+            sc("noo-migrate", &lock()[0].0, &id("9"), false),
+        ];
+        let r = stack_images_check(Some(&lock()), Ok(&cs));
+        assert_eq!(r.verdict, Verdict::Ok, "{r:?}");
+        assert!(r.detail.starts_with("2 running container(s) run the lock's images"), "{}", r.detail);
+        assert!(r.detail.contains("2 not pinned by the lock (noo-rhaddon, rh-fixture)") && r.detail.contains("1 stopped (noo-migrate)"), "{}", r.detail);
+    }
+
+    /// Upgraded: the previous release's images are still on disk, and that
+    /// is not drift; only what a running container runs is judged.
+    #[test]
+    fn stack_images_passes_an_upgraded_install_with_old_images_on_disk() {
+        let cs = vec![sc("noo-gateway", &lock()[0].0, &id("a"), true), sc("rhkeep-3", "ghcr.io/noomesh/gateway:v0.6.24", &id("e"), false)];
+        assert_eq!(stack_images_check(Some(&lock()), Ok(&cs)).verdict, Verdict::Ok);
+    }
+
+    /// Mid-roll: a container still on the older image is a FAIL naming it,
+    /// so the retention gate holds.
+    #[test]
+    fn stack_images_fails_mid_roll_naming_the_container() {
+        let cs = vec![sc("noo-gateway", &lock()[0].0, &id("a"), true), sc("noo-ollama", "ghcr.io/noomesh/ollama:v0.6.24", &id("e"), true)];
+        let r = stack_images_check(Some(&lock()), Ok(&cs));
+        assert_eq!(r.verdict, Verdict::Fail, "{r:?}");
+        assert!(r.detail.starts_with("noo-ollama runs eeeeeeeeeeee, the lock pins ghcr.io/noomesh/ollama@sha256:"), "{}", r.detail);
+        // The lock's image is not even on this host: still a FAIL, said.
+        let mut l = lock();
+        l[1].1 = None;
+        let r = stack_images_check(Some(&l), Ok(&cs));
+        assert!(r.verdict == Verdict::Fail && r.detail.contains("is not on this host"), "{r:?}");
+    }
+
+    /// Not judged is never a pass: no lock, docker silent, nothing pinned
+    /// running.
+    #[test]
+    fn stack_images_without_a_verdict_warns() {
+        let cs = vec![sc("noo-gateway", &lock()[0].0, &id("a"), true)];
+        assert_eq!(stack_images_check(None, Ok(&cs)).verdict, Verdict::Warn);
+        assert_eq!(stack_images_check(Some(&lock()), Err("docker not running".into())).verdict, Verdict::Warn);
+        assert_eq!(stack_images_check(Some(&lock()), Ok(&[])).verdict, Verdict::Warn);
+    }
+
+    #[test]
+    fn the_image_repo_strips_a_digest_or_a_tag_never_a_port() {
+        assert_eq!(image_repo("ghcr.io/noomesh/gateway@sha256:aa"), "ghcr.io/noomesh/gateway");
+        assert_eq!(image_repo("ghcr.io/noomesh/gateway:v1"), "ghcr.io/noomesh/gateway");
+        assert_eq!(image_repo("localhost:5000/rh/x"), "localhost:5000/rh/x");
+        assert_eq!(image_repo("redis:7"), "redis");
+    }
+
+    /// A roll whose gate blocked is visible here until a roll cleans.
+    #[test]
+    fn a_blocked_roll_is_said_on_the_row_with_its_reason() {
+        let b = json!({"at": "2026-11-14T16:00:00Z", "tag": "v0.6.25", "rows": ["stack images (noo-ollama runs eeee, the lock pins x)"]});
+        let rep = json!({"written_at": "t", "dry_run": true, "bytes": 0, "images": []});
+        let r = image_retention_row(Some(Ok(rep.clone())), Some(b));
+        assert_eq!(r.verdict, Verdict::Warn, "{r:?}");
+        assert!(r.detail.starts_with("superseded images not cleaned since the roll to v0.6.25") && r.detail.contains("blocked by stack images (noo-ollama"), "{}", r.detail);
+        // No record (or an empty one): the report decides, as before.
+        assert_eq!(image_retention_row(Some(Ok(rep.clone())), None).verdict, Verdict::Ok);
+        assert_eq!(image_retention_row(Some(Ok(rep)), Some(json!({"rows": []}))).verdict, Verdict::Ok);
+    }
+
+    #[test]
+    fn the_controller_run_pushes_stack_images_before_image_retention() {
+        let src = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let a = src.find("checks.push(stack_images_row_here(&crate::envfile::repo_root()));").expect("pushed");
+        let b = src.find("checks.push(image_retention_row_here(&crate::envfile::repo_root()));").expect("pushed");
+        assert!(a < b);
+    }
+
 }
