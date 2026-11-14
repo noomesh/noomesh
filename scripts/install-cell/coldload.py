@@ -217,7 +217,7 @@ def render(doc: dict) -> str:
         t = doc["timings"][k]
         fo = f"{t['first_output_s']:.1f}" if "first_output_s" in t else "-"
         L.append(f"{k:12} {_secs(t):>9} {fo:>10}  {'ok' if t.get('ok') else 'FAILED: ' + t.get('why', '?')}")
-    L.append(f"service key: minted={doc['key']['minted']} revoked={doc['key'].get('revoked')}"
+    L.append(f"service-key lifecycle (no value shown) minted={doc['key']['minted']} revoked={doc['key'].get('revoked')}"
              + (f" ({doc['key']['why']})" if doc['key'].get('why') else ""))
     return "\n".join(L) + "\n"
 

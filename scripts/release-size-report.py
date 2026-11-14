@@ -261,7 +261,7 @@ def render_coldload(c: dict) -> list[str]:
         L.append(f"| {label} | {secs if secs is not None else '-'} | {x.get('first_output_s', '-')} | "
                  f"{'ok' if x.get('ok') else 'FAILED: ' + str(x.get('why', '?'))} |")
     key = c.get("key") or {}
-    L.append(f"\nservice key: minted={key.get('minted')} revoked={key.get('revoked')}")
+    L.append(f"\nservice-key lifecycle (no value shown) minted={key.get('minted')} revoked={key.get('revoked')}")
     return L
 
 
