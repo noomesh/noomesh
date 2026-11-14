@@ -838,7 +838,10 @@ pub(crate) fn core_tools_for(tier: PromptTier) -> &'static [&'static str] {
 pub(crate) fn max_skills_for(tier: PromptTier) -> usize {
     match tier {
         PromptTier::Full => crate::prompt_skills::MAX_SKILLS,
-        PromptTier::Compact => 1,
+        // None: the compact base already takes ~1,235 of the 1,536 real
+        // tokens half a 4k window allows, and the smallest core skill is
+        // ~1,400 chars, so even one would push it past (i802 PR-2).
+        PromptTier::Compact => 0,
     }
 }
 
@@ -2087,8 +2090,8 @@ mod prompt_tier_tests {
     }
 
     #[test]
-    fn compact_takes_one_skill_and_no_runbooks() {
-        assert_eq!(max_skills_for(PromptTier::Compact), 1);
+    fn compact_takes_no_skill_and_no_runbooks() {
+        assert_eq!(max_skills_for(PromptTier::Compact), 0, "one skill does not fit half a 4k window beside the core");
         assert_eq!(max_skills_for(PromptTier::Full), crate::prompt_skills::MAX_SKILLS);
         assert!(!runbooks_for(PromptTier::Compact));
         assert!(runbooks_for(PromptTier::Full));
