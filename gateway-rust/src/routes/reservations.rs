@@ -245,6 +245,17 @@ pub(crate) fn node_workload_refusal(record: &Value, addon: &str, name: &str, nod
         return Some(not_yet(format!("{node} does not report {key}: it has not provisioned it yet; retry; nothing was held")));
     };
     if let Some(reason) = row.get("reason").and_then(Value::as_str).filter(|r| !r.is_empty()) {
+        // The door leaf travels in the node's provision bundle and the agent
+        // reports it on its next heartbeat (seconds after the apply since
+        // 0.6.25-rc.2); a reserve right after `noo cluster provision` can
+        // still beat that report, so say so instead of reading as broken.
+        if reason == crate::node_workloads::code::DOOR_LEAF_MISSING {
+            return Some(AppError::Conflict(format!(
+                "{reason}: {node} has not reported {key}'s door leaf yet (its agent's last heartbeat says {reason}). \
+                 Just provisioned? Retry after the node's next heartbeat (about 30 s); otherwise give it the leaf: \
+                 noo cluster provision {node}; nothing was held"
+            )));
+        }
         return Some(AppError::Conflict(format!("{reason}: {node} cannot run {key} (its agent reports {reason}); nothing was held")));
     }
     if row.get("state").and_then(Value::as_str) == Some("needs_attention") {
@@ -1455,6 +1466,29 @@ mod tests {
                 Some(AppError::UnavailableRetry { code, .. }) => assert_eq!(code, "node_workloads_not_loaded"),
                 other => panic!("no row is not yet provisioned (retry), got {other:?}"),
             }
+        }
+    }
+
+    /// 0.6.25-rc.1 rehearsal: a reserve one second after `noo cluster
+    /// provision` delivered the leaf met a hard door_leaf_missing from the
+    /// agent's previous heartbeat. The refusal now says the node has not
+    /// reported the leaf yet and to retry after its next heartbeat; other
+    /// reasons keep the plain wording.
+    #[test]
+    fn door_leaf_missing_says_retry_after_the_next_heartbeat() {
+        let rec = json!({"node_workloads": [{"addon": "rhaddon", "name": "echo", "state": "absent", "ready": false, "door_port": 0, "reason": "door_leaf_missing"}]});
+        match node_workload_refusal(&rec, "rhaddon", "echo", "rhx-node2") {
+            Some(AppError::Conflict(m)) => {
+                assert!(m.starts_with("door_leaf_missing: rhx-node2 has not reported rhaddon/echo's door leaf yet"), "{m}");
+                assert!(m.contains("Retry after the node's next heartbeat") && m.contains("noo cluster provision rhx-node2"), "{m}");
+                assert!(m.ends_with("nothing was held"), "{m}");
+            }
+            other => panic!("door_leaf_missing must stay a refusal, got {other:?}"),
+        }
+        let consent = json!({"node_workloads": [{"addon": "rhaddon", "name": "echo", "state": "absent", "ready": false, "door_port": 0, "reason": "consent_unapproved"}]});
+        match node_workload_refusal(&consent, "rhaddon", "echo", "rhx-node2") {
+            Some(AppError::Conflict(m)) => assert!(m.starts_with("consent_unapproved: rhx-node2 cannot run rhaddon/echo (its agent reports consent_unapproved)") && !m.contains("heartbeat"), "{m}"),
+            other => panic!("{other:?}"),
         }
     }
 

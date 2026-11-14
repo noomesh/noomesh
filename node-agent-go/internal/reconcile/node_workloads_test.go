@@ -13,6 +13,7 @@ import (
 	"sort"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/config"
 	dockerpkg "github.com/noomesh/noomesh/node-agent-go/internal/docker"
@@ -33,6 +34,7 @@ type fakeNW struct {
 	stopped   []nodewl.Entry
 	stopErr   error
 	startErr  error
+	leafReady map[string]bool
 }
 
 func (f *fakeNW) Converge(_ context.Context, e nodewl.Entry) {
@@ -55,7 +57,12 @@ func (f *fakeNW) ReleaseOrphans(_ context.Context, keep map[string]bool) {
 	defer f.mu.Unlock()
 	f.swept = append(f.swept, keep)
 }
-func (f *fakeNW) Rows() []dockerpkg.Row { return f.rows }
+func (f *fakeNW) Rows() []dockerpkg.Row { f.mu.Lock(); defer f.mu.Unlock(); return f.rows }
+func (f *fakeNW) LeafReady(addon, name string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.leafReady[addon+"/"+name]
+}
 func (f *fakeNW) IsManaged(context.Context, string, string) (bool, error) {
 	return f.managed, nil
 }
@@ -344,5 +351,60 @@ func TestActuatorStopFollowsTheReleaseOrder(t *testing.T) {
 func TestNoLifecycleMeansNoControl(t *testing.T) {
 	if mc := (&Reconciler{}).NodeWorkloadControl(); mc != nil {
 		t.Fatalf("a reconciler with no lifecycle offers control: %v", mc)
+	}
+}
+
+// i802/rc.1 A-nodewl.reserve: a workload refused door_leaf_missing is
+// reconciled as soon as its leaf passes the provisioner's own check, not at
+// the next 5-minute tick.
+func TestTheLeafWatchNudgesOnlyWhenAMissingLeafArrives(t *testing.T) {
+	nw := &fakeNW{rows: []dockerpkg.Row{{Addon: "rhaddon", Name: "echo", State: "absent", Reason: nodewl.ReasonDoorLeafMissing}}}
+	r := nwRig(t, nw)
+	if r.leafArrived() {
+		t.Fatal("the leaf is not there yet: no nudge")
+	}
+	nw.mu.Lock()
+	nw.leafReady = map[string]bool{"rhaddon/echo": true}
+	nw.mu.Unlock()
+	if !r.leafArrived() {
+		t.Fatal("the leaf landed: the watch must nudge")
+	}
+	// Another refusal reason is not the leaf's to clear.
+	nw.mu.Lock()
+	nw.rows = []dockerpkg.Row{{Addon: "rhaddon", Name: "echo", State: "absent", Reason: "consent_unapproved"}}
+	nw.mu.Unlock()
+	if r.leafArrived() {
+		t.Fatal("consent_unapproved is not cleared by a leaf")
+	}
+}
+
+func TestTheLeafWatchNudgesTheReconciler(t *testing.T) {
+	nw := &fakeNW{
+		rows:      []dockerpkg.Row{{Addon: "rhaddon", Name: "echo", Reason: nodewl.ReasonDoorLeafMissing}},
+		leafReady: map[string]bool{"rhaddon/echo": true},
+	}
+	r := nwRig(t, nw)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go r.watchLeaves(ctx, 10*time.Millisecond)
+	select {
+	case <-r.nudgeCh():
+	case <-time.After(2 * time.Second):
+		t.Fatal("no reconcile nudge within 2 s of the leaf being ready")
+	}
+}
+
+func TestEachConvergeTellsTheHeartbeat(t *testing.T) {
+	nw := &fakeNW{}
+	r := nwRig(t, nw)
+	var mu sync.Mutex
+	kicks := 0
+	r.SetNodeWorkloadsChanged(func() { mu.Lock(); kicks++; mu.Unlock() })
+	r.goConverge(context.Background(), nodewl.Entry{Addon: "rhaddon", Name: "echo"})
+	r.nwWG.Wait()
+	mu.Lock()
+	defer mu.Unlock()
+	if kicks != 1 {
+		t.Fatalf("heartbeat kicks after one converge = %d, want 1", kicks)
 	}
 }

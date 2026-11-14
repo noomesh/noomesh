@@ -33,6 +33,7 @@ type nodeWorkloads interface {
 	StartManaged(ctx context.Context, e nodewl.Entry) error
 	StopManaged(ctx context.Context, e nodewl.Entry) error
 	ManagedStatus(ctx context.Context, addon, name string) (dockerpkg.ManagedState, error)
+	LeafReady(addon, name string) bool
 }
 
 // newNodeWorkloads builds the lifecycle, the node's gate and its facts from
@@ -198,7 +199,55 @@ func (r *Reconciler) goConverge(ctx context.Context, e nodewl.Entry) {
 			r.nwMu.Unlock()
 		}()
 		r.nodeWL.Converge(ctx, e)
+		if f := r.nwChanged; f != nil {
+			f() // the heartbeat carries this workload's row now, not at the next tick
+		}
 	}()
+}
+
+// SetNodeWorkloadsChanged installs what runs after each node workload
+// converge: the agent's heartbeat Kick, so the controller sees a row that
+// changed (a door leaf that landed, a start) in about a second.
+func (r *Reconciler) SetNodeWorkloadsChanged(f func()) { r.nwChanged = f }
+
+// leafWatchInterval is how often watchLeaves looks for a door leaf that a
+// refused workload is waiting for. A stat or two per refused workload.
+const leafWatchInterval = 5 * time.Second
+
+// watchLeaves nudges a reconcile pass as soon as a node workload refused
+// door_leaf_missing has its leaf on disk. The applier (noo-apply.sh, a
+// separate process) installs the leaf; without this the workload stayed
+// refused until the next 5-minute tick, and a reserve right after a
+// provision met a hard door_leaf_missing (0.6.25-rc.1 rehearsal,
+// A-nodewl.reserve, one second after the leaf landed). Blocks until ctx ends.
+func (r *Reconciler) watchLeaves(ctx context.Context, every time.Duration) {
+	if r.nodeWL == nil {
+		return
+	}
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if r.leafArrived() {
+				slog.Info("reconcile.node_workload_leaf_arrived; reconciling now")
+				r.Nudge()
+			}
+		}
+	}
+}
+
+// leafArrived: some workload's row says door_leaf_missing and its leaf now
+// passes the provisioner's own check.
+func (r *Reconciler) leafArrived() bool {
+	for _, row := range r.nodeWL.Rows() {
+		if row.Reason == nodewl.ReasonDoorLeafMissing && r.nodeWL.LeafReady(row.Addon, row.Name) {
+			return true
+		}
+	}
+	return false
 }
 
 // NodeFacts is the heartbeat's node-workload keys: the node facts and consent

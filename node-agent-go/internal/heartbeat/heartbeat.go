@@ -152,6 +152,10 @@ type Reporter struct {
 	// starts, hence the atomic.
 	nodeFacts atomic.Pointer[func() map[string]any]
 
+	// kick carries Kick's requests to Run (made on first use).
+	kick     chan struct{}
+	kickOnce sync.Once
+
 	// Capabilities as reported at registration, echoed on EVERY heartbeat.
 	//
 	// These used to be sent once, at Register, and the controller kept them
@@ -739,8 +743,26 @@ func (r *Reporter) Run(ctx context.Context) {
 			return
 		case <-ticker.C:
 			r.SendHeartbeat()
+		case <-r.kickCh():
+			r.SendHeartbeat()
 		}
 	}
+}
+
+// Kick asks for a heartbeat now instead of at the next tick: a change the
+// controller decides on (a node workload's row after its door leaf landed)
+// then reaches it in about a second, not up to an interval later. Non-
+// blocking; kicks coalesce.
+func (r *Reporter) Kick() {
+	select {
+	case r.kickCh() <- struct{}{}:
+	default:
+	}
+}
+
+func (r *Reporter) kickCh() chan struct{} {
+	r.kickOnce.Do(func() { r.kick = make(chan struct{}, 1) })
+	return r.kick
 }
 
 func (r *Reporter) setAuthHeader(req *http.Request) error {
