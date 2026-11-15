@@ -822,6 +822,7 @@ mod invalidation_guard {
         ("routes/users.rs", "async fn service_key_rotate(", "(SUPERSEDE_PREVIOUS_SQL)"),
         ("routes/users.rs", "async fn service_key_set_quota(", "UPDATE noo_service_keys SET rpm_limit"),
         ("routes/users.rs", "async fn service_key_set_context_overflow(", "crate::repo::service_key_overflow::set("),
+        ("repo/service_key_overflow.rs", "pub async fn set(", "UPDATE noo_service_keys SET context_overflow"),
         ("addon_auth.rs", "pub async fn init(", "INSERT INTO noo_service_keys"),
         ("service_keys.rs", "pub async fn mint_door_key(", "INSERT INTO noo_service_keys"),
         ("service_keys.rs", "pub async fn revoke_door_key(", "UPDATE noo_service_keys SET active = false"),
