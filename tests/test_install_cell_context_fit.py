@@ -212,6 +212,16 @@ def test_a_turn_records_the_wires_its_model_calls_went_out_on():
     assert rec["wire"] == ["ollama"]
 
 
+def test_a_turn_records_each_model_call_in_tokens():
+    t = CF.turn_tokens(_facts(DIRECT_CALL, BACKEND_CALL_2))
+    assert t["calls"][0] == {"sent_estimate": 2871, "evaluated": 1190, "prefill_ms": 1840, "ctx": 4096, "wire": "ollama"}
+    assert t["calls"][1]["prefill_ms"] == 660 and t["calls"][1]["wire"] is None
+    assert (t["sent_estimate"], t["evaluated"]) == (2 * 2871, 2 * 1190)
+    assert CF.turn_tokens(CF.log_facts(None)) == {"calls": [], "sent_estimate": None, "evaluated": None}
+    rec = CF.turn_record("tool", True, "ok", 1.0, _facts(DIRECT_CALL), {"text": "x"})
+    assert rec["evaluated"] == 1190 and rec["calls"][0]["sent_estimate"] == 2871
+
+
 def test_tool_replay_passes_an_answer_and_fails_a_failed_turn():
     rc, why = CF.judge_tool_replay("The codeword in anything.md is ZIRCON-4471.", None, ["noo_rag_query"],
                                    _facts(DIRECT_CALL), "default")

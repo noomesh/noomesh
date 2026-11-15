@@ -294,6 +294,14 @@ if [ "$MODEL" = tiny ]; then
     # the error's own remedy makes the tiny one the default.
     step switch-to-tiny-model 300 -- noo models switch "$TINY_MODEL" --backend ollama --yes || fail_onboarded
 fi
+# A/B (EMBED_SLOTS, the slots4 cell): the shared Ollama at that many slots
+# instead of what onboard chose, through the product's own remedy line
+# (cluster verify's CPU_ONLY_SLOTS_REMEDY). Before any turn, so every judged
+# turn runs at it.
+if [ -n "${EMBED_SLOTS:-}" ]; then
+    step embed-slots-ab 600 -- sh -c 'noo config set compose_env "{\"OLLAMA_EMBED_NUM_PARALLEL\":\"$1\"}" && noo stack restart --force ollama-embed && noo config get compose_env' \
+        slots "$EMBED_SLOTS" || fail_onboarded
+fi
 # verify runs as the stranger's NEXT terminal would: a fresh login session
 # (sudo -i reads /etc/group again). On a docker=none cell the install added
 # the runner user to the docker group, which the cell's own shell, started

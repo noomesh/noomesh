@@ -34,7 +34,10 @@ say so instead of being cut.
                elapsed_s, prefill_s (sum of the turn's backend_call
                prefill_ms / 1000; null on a build without those lines),
                tier, truncated (the done frame's), wire (the backend_call
-               lines' wire= values, null before #1225). Writes DIR/turns.json.
+               lines' wire= values, null before #1225), calls (each backend_call:
+               sent_estimate, evaluated = the backend's own prompt count,
+               Ollama's prompt_eval_count, prefill_ms, ctx, wire) and the
+               turn's sent_estimate / evaluated sums. Writes DIR/turns.json.
   doesnt-fit   one turn of ~--chars of plain text plus a short question.
                PASS: the reply carries the gateway's doesn't-fit line
                ("too small for its instructions and this question", #1212)
@@ -457,7 +460,25 @@ def turn_record(name: str, verdict, reason: str, elapsed_s: float, facts: dict, 
             "truncated": done.get("truncated") if "truncated" in done else None,
             "cached": bool(done.get("cached")), "tools": [c.get("name") for c in chat.get("calls", [])],
             "approval_request": bool(chat.get("approval")), "error": chat.get("error"),
-            "answer": _excerpt(chat.get("text", ""), 800), "wire": turn_wires(facts)}
+            "answer": _excerpt(chat.get("text", ""), 800), "wire": turn_wires(facts),
+            **turn_tokens(facts)}
+
+
+def turn_tokens(facts: dict) -> dict:
+    """The turn's model calls in tokens, from its backend_call lines: per
+    call {sent_estimate, evaluated, prefill_ms, ctx, wire} and the sums.
+    `evaluated` is what the backend says it read: on Ollama its own
+    `prompt_eval_count`, which leaves out a prefix it reused from cache, so
+    evaluated well under sent_estimate on a call that was not cut is cache
+    reuse (a cut reads ctx/2 + 5 instead). Sums are null with no calls."""
+    calls = [{"sent_estimate": c.get("sent_estimate"), "evaluated": c.get("evaluated"),
+              "prefill_ms": c.get("prefill_ms"), "ctx": c.get("ctx"), "wire": c.get("wire")}
+             for c in facts.get("backend_calls", [])]
+
+    def total(k):
+        vals = [c[k] for c in calls if isinstance(c[k], (int, float))]
+        return sum(vals) if vals else None
+    return {"calls": calls, "sent_estimate": total("sent_estimate"), "evaluated": total("evaluated")}
 
 
 def turn_wires(facts: dict) -> list[str] | None:
