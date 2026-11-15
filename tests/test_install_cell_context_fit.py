@@ -298,3 +298,17 @@ def test_the_docstring_carries_the_run_sh_lines():
                  "--role chat --env OLLAMA_CONTEXT_LENGTH=4096", "noo stack restart --force gateway",
                  "running --expect-decided 4096", "context_fit.py\" pinned-check"):
         assert line in doc, line
+
+
+def test_an_older_build_is_not_judged_even_when_a_turn_fails():
+    # fa's pre-1201 run (43656150029): the tool turn FAILed on rc.1 and the
+    # aggregate FAILed the cell; an older build must read NOT JUDGED.
+    assert CF.turns_exit([True, True, False, True], []) == CF.NOT_JUDGED
+    assert CF.turns_exit([True, True, False, True], ["Full"]) == 1
+    assert CF.turns_exit([True, None, True, True], ["Compact"]) == 0
+
+
+def test_the_rag_turn_is_asked_in_words_the_cell_has_not_used():
+    doc = 'noo chat --message "what does anything.md say about the launch?"\n'
+    asked = CF.rag_judge_prompt(doc)
+    assert asked != CF.rag_chat_line(doc) and asked.startswith(CF.rag_chat_line(doc)), asked
