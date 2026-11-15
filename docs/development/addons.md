@@ -1011,10 +1011,15 @@ add-on is registered (switched on, its signed lock verified this start, its
 declarations valid), the gateway's systems broker makes your runtime role
 `noo_<id>` a member of the group role `noo_caller_verifiers`, which holds
 `USAGE` on the view's schema (`mesh` on a cluster install) and `SELECT` on
-the view, and nothing else. Your migration role `noo_<id>_ddl` never gets it.
+the view, and nothing else. It also sets your runtime role's `search_path` in
+the `noomesh` database to `"$user", public, mesh` (the view's schema last), so
+the unqualified name above resolves on a new connection; a pool opened before
+the setting keeps its old path until it reconnects. If you set `search_path`
+yourself, include that schema or qualify the name. Your migration role
+`noo_<id>_ddl` never gets it.
 The grant follows the declaration on every gateway start: remove the field,
 switch the add-on off, or let its lock fail to verify, and the next start
-revokes it. Without the field your role cannot read the view, and every
+revokes it and resets the `search_path`. Without the field your role cannot read the view, and every
 lookup fails with `permission denied`. The field needs a 0.6.14 or later
 gateway and CLI; an older one refuses a `system.json` carrying it, so
 declare it in a bundle whose lock supports 0.6.14 and later only. (Mesh

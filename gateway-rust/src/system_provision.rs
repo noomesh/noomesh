@@ -559,8 +559,9 @@ pub(crate) const CALLER_VERIFIERS: &str = crate::repo::caller_verifiers::GROUP;
 const CALLER_VIEW: &str = crate::repo::caller_verifiers::VIEW;
 
 /// Create the group if absent and (re)grant it the view. Idempotent; the
-/// grants follow a view a later revision recreates.
-async fn ensure_caller_verifier_group(db: &PgPool) -> Result<(), String> {
+/// grants follow a view a later revision recreates. Returns the view's
+/// schema, `None` when there is no view yet.
+async fn ensure_caller_verifier_group(db: &PgPool) -> Result<Option<String>, String> {
     use crate::repo::caller_verifiers as cv;
     if cv::ensure_group(db).await.map_err(|e| format!("CREATE ROLE {CALLER_VERIFIERS} failed: {e}"))? {
         tracing::info!(role = CALLER_VERIFIERS, "caller-verifier group role created");
@@ -569,27 +570,43 @@ async fn ensure_caller_verifier_group(db: &PgPool) -> Result<(), String> {
         // No view to grant (077 found no noo_service_keys). Membership still
         // records the declaration; the grant follows on the boot that has it.
         tracing::warn!(view = CALLER_VIEW, "caller-verify view not found; the group holds no SELECT yet");
-        return Ok(());
+        return Ok(None);
     };
     cv::grant_view(db, &schema)
         .await
-        .map_err(|e| format!("granting {CALLER_VERIFIERS} the view {schema}.{CALLER_VIEW} failed: {e}"))
+        .map_err(|e| format!("granting {CALLER_VERIFIERS} the view {schema}.{CALLER_VIEW} failed: {e}"))?;
+    Ok(Some(schema))
 }
 
 /// Make `role` (a system's RUNTIME role, never its DDL role) a member of
 /// [`CALLER_VERIFIERS`] when `want`, and not one when it does not. Called for
 /// every provisioned system, so removing `verify_callers` from a bundle
 /// revokes on the next reconcile even while the add-on stays on.
+///
+/// A member also gets the view's schema on its search_path (LAST), so the
+/// documented unqualified `SELECT .. FROM noo_addon_caller_keys` resolves on
+/// a cluster install, where the view is in `mesh`. Set on the MEMBER, not the
+/// group: role settings apply to the role that logs in and are never
+/// inherited through membership. Re-applied on every reconcile, member or
+/// not yet, so a role granted before the setting existed gets it on the
+/// first boot of the release that adds it. Privileges are unchanged: the path
+/// only names the schema; USAGE on it and SELECT on the one view are still
+/// all the group holds.
 pub(crate) async fn sync_caller_verifier(db: &PgPool, system: &str, role: &str, want: bool) -> Result<(), String> {
     use crate::repo::caller_verifiers as cv;
     let member = cv::members(db).await.map_err(|e| e.to_string())?.iter().any(|m| m == role);
     if want {
-        ensure_caller_verifier_group(db).await?;
+        let schema = ensure_caller_verifier_group(db).await?;
         if !member {
             cv::add_member(db, role)
                 .await
                 .map_err(|e| format!("GRANT {CALLER_VERIFIERS} TO {role} failed: {e}"))?;
             tracing::info!(system, role, "runtime role may now read {CALLER_VIEW} (verify_callers)");
+        }
+        if let Some(schema) = schema {
+            cv::set_search_path(db, role, &schema)
+                .await
+                .map_err(|e| format!("ALTER ROLE {role} SET search_path (adding {schema} for {CALLER_VIEW}) failed: {e}"))?;
         }
     } else if member {
         revoke_caller_verifier(db, role).await?;
@@ -598,7 +615,15 @@ pub(crate) async fn sync_caller_verifier(db: &PgPool, system: &str, role: &str, 
     Ok(())
 }
 
+/// Take `role` out of the group and drop the search_path setting
+/// [`sync_caller_verifier`] gave it. The setting goes FIRST: membership is
+/// what the next reconcile's sweep finds, so a failed RESET leaves the role a
+/// member and the sweep retries both, where the other order would strand the
+/// setting on a role no sweep looks at again.
 async fn revoke_caller_verifier(db: &PgPool, role: &str) -> Result<(), String> {
+    crate::repo::caller_verifiers::reset_search_path(db, role)
+        .await
+        .map_err(|e| format!("ALTER ROLE {role} RESET search_path failed: {e}"))?;
     crate::repo::caller_verifiers::remove_member(db, role)
         .await
         .map_err(|e| format!("REVOKE {CALLER_VERIFIERS} FROM {role} failed: {e}"))
@@ -1488,38 +1513,60 @@ mod tests {
 
     async fn caller_scratch(admin: &PgPool) -> PgPool {
         caller_cleanup(admin).await;
-        sqlx::raw_sql("CREATE DATABASE caller_grant_test").execute(admin).await.expect("create scratch db");
+        caller_scratch_db(admin, "caller_grant_test", "public").await
+    }
+
+    /// The scratch DSN for database `name`.
+    fn scratch_dsn(name: &str) -> String {
         let dsn = dsn().expect("dsn");
         let (head, _) = dsn.rsplit_once('/').expect("dsn has a path");
+        format!("{head}/{name}")
+    }
+
+    /// Create scratch database `name` with `noo_service_keys` in `schema`
+    /// (`mesh` = the cluster layout, `public` = the legacy one) and apply 077
+    /// the way the migration runner does, `schema` first on the path, so the
+    /// view lands beside the table.
+    async fn caller_scratch_db(admin: &PgPool, name: &str, schema: &str) -> PgPool {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}"))).execute(admin).await.expect("create scratch db");
         let db = sqlx::postgres::PgPoolOptions::new()
             .max_connections(2)
-            .connect(&format!("{head}/caller_grant_test"))
+            .connect(&scratch_dsn(name))
             .await
             .expect("connect scratch");
-        sqlx::raw_sql(
-            "CREATE TABLE noo_service_keys (consumer text NOT NULL, key_hash text NOT NULL UNIQUE, \
-             active boolean NOT NULL DEFAULT true, created_at timestamptz NOT NULL DEFAULT now()); \
-             INSERT INTO noo_service_keys (consumer, key_hash) VALUES ('addon-caller:gateway', 'h-caller'), ('svc:worker', 'h-other')",
-        )
-        .execute(&db)
-        .await
-        .expect("seed noo_service_keys");
         let rev = crate::mesh_migrate::MIGRATIONS
             .iter()
             .find(|m| m.revision == "077_addon_caller_verify_view")
             .expect("revision 077 is in the chain");
-        sqlx::raw_sql(rev.sql).execute(&db).await.expect("apply 077");
+        // One connection: the search_path is session state.
+        let mut conn = db.acquire().await.expect("acquire");
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE SCHEMA IF NOT EXISTS {schema}; SET search_path TO {schema}, public; \
+             CREATE TABLE noo_service_keys (consumer text NOT NULL, key_hash text NOT NULL UNIQUE, \
+             active boolean NOT NULL DEFAULT true, created_at timestamptz NOT NULL DEFAULT now()); \
+             INSERT INTO noo_service_keys (consumer, key_hash) VALUES ('addon-caller:gateway', 'h-caller'), ('svc:worker', 'h-other'); \
+             {}; RESET search_path",
+            rev.sql
+        )))
+        .execute(&mut *conn)
+        .await
+        .expect("seed noo_service_keys and apply 077");
+        drop(conn);
         db
     }
 
     async fn caller_cleanup(admin: &PgPool) {
         let _ = sqlx::raw_sql("DROP DATABASE IF EXISTS caller_grant_test (FORCE)").execute(admin).await;
+        let _ = sqlx::raw_sql("DROP DATABASE IF EXISTS caller_path_mesh (FORCE)").execute(admin).await;
+        let _ = sqlx::raw_sql("DROP DATABASE IF EXISTS caller_path_legacy (FORCE)").execute(admin).await;
         for role in [
             "brokertest_role_rhaddon",
             "brokertest_ddl_rhaddon",
             "brokertest_role_rhaddonplain",
             "brokertest_ddl_rhaddonplain",
             "brokertest_direct_rhaddon",
+            "brokertest_role_rhpath",
+            "brokertest_ddl_rhpath",
         ] {
             crate::repo::caller_verifiers::drop_role(admin, role).await;
         }
@@ -1594,6 +1641,111 @@ mod tests {
         db.close().await;
         caller_cleanup(&admin).await;
         for v in ["BROKERTEST_PW_rhaddon", "BROKERTEST_DDLPW_rhaddon", "BROKERTEST_PW_rhaddonplain", "BROKERTEST_DDLPW_rhaddonplain"] {
+            std::env::remove_var(v);
+        }
+    }
+
+    /// Log in AS `role` (a real login, not SET ROLE: role settings apply at
+    /// login) to scratch database `name`.
+    async fn login_as(name: &str, role: &str) -> sqlx::PgConnection {
+        use sqlx::Connection;
+        let opts: sqlx::postgres::PgConnectOptions = scratch_dsn(name).parse().expect("scratch dsn");
+        sqlx::PgConnection::connect_with(&opts.username(role).password("ephemeral-not-a-secret"))
+            .await
+            .unwrap_or_else(|e| panic!("log in as {role}: {e}"))
+    }
+
+    /// The documented add-on query, unqualified, on a connection logged in
+    /// as the role. Returns the consumers, or the SQLSTATE of the failure.
+    async fn unqualified_caller_read(conn: &mut sqlx::PgConnection) -> Result<Vec<String>, String> {
+        sqlx::query_scalar::<_, String>("SELECT consumer FROM noo_addon_caller_keys WHERE key_hash = $1")
+            .bind("h-caller")
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| e.as_database_error().and_then(|d| d.code()).map(|c| c.to_string()).unwrap_or_else(|| e.to_string()))
+    }
+
+    #[tokio::test]
+    async fn a_verify_callers_role_resolves_the_caller_view_unqualified_on_both_layouts() {
+        let Some(dsn) = dsn() else { return };
+        let admin = pool(&dsn).await;
+        caller_cleanup(&admin).await;
+        for v in ["BROKERTEST_PW_rhpath", "BROKERTEST_DDLPW_rhpath"] {
+            std::env::set_var(v, "ephemeral-not-a-secret");
+        }
+        let role = "brokertest_role_rhpath";
+        let declared = |on: bool| {
+            let mut m = manifest("rhpath", None);
+            m.values_mut().next().unwrap().verify_callers = on;
+            m
+        };
+
+        // ── cluster layout: the view in `mesh` ──
+        let db = caller_scratch_db(&admin, "caller_path_mesh", "mesh").await;
+        reconcile(&db, &declared(true)).await.expect("reconcile");
+        let mut conn = login_as("caller_path_mesh", role).await;
+        assert_eq!(
+            unqualified_caller_read(&mut conn).await,
+            Ok(vec!["addon-caller:gateway".to_string()]),
+            "the documented unqualified query must resolve for a verify_callers role on the mesh layout"
+        );
+        // `mesh` LAST: the add-on's own and `public` names come first.
+        let path: Vec<String> = sqlx::query_scalar("SELECT current_schemas(false)::text[]").fetch_one(&mut conn).await.expect("current_schemas");
+        assert_eq!(path, vec!["public".to_string(), "mesh".to_string()], "the view's schema must be last on the path");
+        // Privileges unchanged: the table under the view stays closed.
+        let err = sqlx::query("SELECT 1 FROM mesh.noo_service_keys").fetch_all(&mut conn).await.expect_err("noo_service_keys must stay unreadable");
+        assert_eq!(
+            err.as_database_error().and_then(|d| d.code()).as_deref(),
+            Some("42501"),
+            "reading noo_service_keys must be permission denied: {err}"
+        );
+        drop(conn);
+
+        // An install upgraded from before the setting: the role is already a
+        // member, without the path. The next reconcile must apply it.
+        crate::repo::caller_verifiers::reset_search_path(&db, role).await.expect("reset");
+        assert!(crate::repo::caller_verifiers::db_role_settings(&db, role).await.is_empty());
+        reconcile(&db, &declared(true)).await.expect("reconcile an existing member");
+        let mut conn = login_as("caller_path_mesh", role).await;
+        assert!(unqualified_caller_read(&mut conn).await.is_ok(), "an existing member must get the path on the next reconcile");
+        drop(conn);
+
+        // The declaration removed: membership AND the setting go.
+        reconcile(&db, &declared(false)).await.expect("reconcile without the declaration");
+        assert!(
+            crate::repo::caller_verifiers::db_role_settings(&db, role).await.is_empty(),
+            "revoking verify_callers must reset the role's search_path"
+        );
+        let mut conn = login_as("caller_path_mesh", role).await;
+        assert_eq!(unqualified_caller_read(&mut conn).await, Err("42P01".to_string()), "without the declaration the name must not resolve");
+        drop(conn);
+        // The sweep path (add-on gone from the map) resets it too.
+        reconcile(&db, &declared(true)).await.expect("reconcile");
+        assert!(!crate::repo::caller_verifiers::db_role_settings(&db, role).await.is_empty(), "declared: the setting is back");
+        reconcile(&db, &BTreeMap::new()).await.expect("reconcile with nothing declared");
+        assert!(
+            crate::repo::caller_verifiers::db_role_settings(&db, role).await.is_empty(),
+            "the sweep must reset the search_path of a role it revokes"
+        );
+        db.close().await;
+
+        // ── legacy layout: the view in `public` ──
+        let db = caller_scratch_db(&admin, "caller_path_legacy", "public").await;
+        reconcile(&db, &declared(true)).await.expect("reconcile legacy");
+        let mut conn = login_as("caller_path_legacy", role).await;
+        assert_eq!(
+            unqualified_caller_read(&mut conn).await,
+            Ok(vec!["addon-caller:gateway".to_string()]),
+            "the documented unqualified query must resolve on the legacy layout"
+        );
+        let path: Vec<String> = sqlx::query_scalar("SELECT current_schemas(false)::text[]").fetch_one(&mut conn).await.expect("current_schemas");
+        assert_eq!(path, vec!["public".to_string()]);
+        drop(conn);
+        reconcile(&db, &BTreeMap::new()).await.expect("reconcile with nothing declared");
+        db.close().await;
+
+        caller_cleanup(&admin).await;
+        for v in ["BROKERTEST_PW_rhpath", "BROKERTEST_DDLPW_rhpath"] {
             std::env::remove_var(v);
         }
     }
