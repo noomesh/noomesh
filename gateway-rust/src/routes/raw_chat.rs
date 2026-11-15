@@ -700,6 +700,62 @@ where
     send_with_failover_pinned(state, class, candidates, stream, source, actor, false, build).await
 }
 
+/// Whether this call's key is set to refuse an over-long prompt: a service
+/// key's consumer (or the add-on's whose key bought the token), by name.
+async fn refuses_overflow(state: &AppState, actor: &UsageActor) -> bool {
+    match (actor.keyed, actor.consumer.as_deref()) {
+        (true, Some(name)) => {
+            crate::service_keys::context_overflow_for(&state.db, name).await == crate::service_keys::ContextOverflow::Refuse
+        }
+        _ => false,
+    }
+}
+
+/// Refuse mode: the indexes of the candidates that can take this prompt
+/// whole. An Ollama with a decided context (the caller's own
+/// `options.num_ctx` where it set one) that the prompt overflows
+/// ([`crate::context_cut::overflows`]) is dropped; every other candidate
+/// stays (vLLM refuses an over-long prompt itself). All dropped: 413
+/// `context_too_small`, naming the first one's model and context.
+async fn fitting<F>(state: &AppState, candidates: &[Candidate], build: &mut F) -> Result<Vec<usize>, RawChatError>
+where
+    F: FnMut(&Candidate) -> (String, Value),
+{
+    let mut keep = Vec::new();
+    let mut first_over: Option<(&Candidate, u64, u64)> = None;
+    for (i, c) in candidates.iter().enumerate() {
+        let decided = if crate::chat_context::takes_num_ctx(&c.backend) {
+            crate::chat_context::num_ctx_for_node(state, &c.node_id, &c.backend, &c.model).await
+        } else {
+            None
+        };
+        let Some(decided) = decided else {
+            keep.push(i);
+            continue;
+        };
+        let (_, body) = build(c);
+        let ctx = body.pointer("/options/num_ctx").and_then(Value::as_u64).unwrap_or(decided);
+        let msgs = body.get("messages").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+        let est = coordinator::estimate_tokens(msgs) as u64;
+        if crate::context_cut::overflows(est, ctx, crate::chat_context::calibration(&c.url, &c.model)) {
+            first_over.get_or_insert((c, ctx, est));
+        } else {
+            keep.push(i);
+        }
+    }
+    match (keep.is_empty(), first_over) {
+        (true, Some((c, ctx, est))) => {
+            tracing::info!(node = %c.node_id, model = %c.model, ctx, sent_estimate = est, candidates = candidates.len(), "raw_chat_refused_context_overflow");
+            Err(RawChatError::request_refused(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "context_too_small",
+                crate::context_cut::refusal_line(&c.model, ctx),
+            ))
+        }
+        _ => Ok(keep),
+    }
+}
+
 /// [`send_with_failover`], told whether the caller's node pin is STRICT.
 /// An interactive request (the route decides: `expected_wait::interactive`)
 /// that is not strictly pinned goes through the expected-wait rule first:
@@ -721,15 +777,27 @@ where
     F: FnMut(&Candidate) -> (String, Value),
 {
     use coordinator::expected_wait::{self, Plan};
+    let mut build = build;
+    // A key set to refuse (i802, operator 2026-11-15): an Ollama whose
+    // context this prompt overflows is not tried; nothing left is a 413.
+    let fitted: Vec<Candidate>;
+    let mut base: Vec<usize> = (0..candidates.len()).collect();
+    let candidates = if refuses_overflow(state, &actor).await {
+        base = fitting(state, candidates, &mut build).await?;
+        fitted = base.iter().map(|&i| candidates[i].clone()).collect();
+        &fitted[..]
+    } else {
+        candidates
+    };
     let planned: Vec<Candidate>;
-    let mut original: Vec<usize> = (0..candidates.len()).collect();
+    let mut original: Vec<usize> = base.clone();
     let (candidates, retry_first) = if !strict && expected_wait::interactive(source) {
         let in_flight = |c: &Candidate| classes::in_flight(&c.url, &c.backend);
         let p50 = |c: &Candidate| expected_wait::p50_ms(&c.node_id, &c.backend);
         match expected_wait::plan(candidates, &in_flight, &p50) {
             Plan::Try(order) => {
                 planned = order.iter().map(|&i| candidates[i].clone()).collect();
-                original = order;
+                original = order.iter().map(|&i| base[i]).collect();
                 (&planned[..], Some(expected_wait::RETRY_FIRST_AFTER))
             }
             Plan::Refuse { retry_after_secs, reason } => {
@@ -1872,7 +1940,7 @@ mod expected_wait_wiring_tests {
         // the planned index would call the class's first choice a fallback
         // or a fallback the first choice.
         assert!(pinned.contains("fallback: is_fallback(original[ok.index], cand)"), "the fallback flag must use the original index");
-        assert!(pinned.contains("original = order;"), "the original index follows the plan");
+        assert!(pinned.contains("original = order.iter().map(|&i| base[i]).collect();"), "the original index follows the plan, through the refuse filter");
         // The first choice's one retry after the wait is the rule's (point
         // 2): an interactive plan must hand failover_core the retry.
         assert!(pinned.contains("(&planned[..], Some(expected_wait::RETRY_FIRST_AFTER))"), "the interactive plan must carry the first-choice retry");

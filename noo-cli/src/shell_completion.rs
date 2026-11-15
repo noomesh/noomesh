@@ -168,7 +168,7 @@ pub fn candidates(g: &crate::Globals, group: &str, verb: &str) -> Vec<String> {
         // The other key verbs take a LIVE consumer name as issued
         // (`svc:worker`). Offering them is what stops a bare `worker` being
         // typed and minted as a second consumer beside the real one.
-        ("security", "service-key rotate" | "service-key revoke" | "service-key retire" | "service-key set-quota") => {
+        ("security", "service-key rotate" | "service-key revoke" | "service-key retire" | "service-key set-quota" | "service-key set-context-overflow") => {
             let mut v: Vec<String> = crate::http::get_json_try(g, "/api/security/service-keys", true, 3)
                 .ok()
                 .and_then(|b| b["keys"].as_array().cloned())

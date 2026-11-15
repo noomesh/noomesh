@@ -1,5 +1,17 @@
 # Contract changes
 
+## 2026-11-15
+
+Added `POST /api/security/service-keys/{consumer}/context-overflow`
+(operator or admin, a person only: any key, exchanged token, harness door or
+delegated credential gets 403): body `{"mode": "flag" | "refuse"}`, answers
+`{status, consumer, context_overflow, updated_keys}`; 400 for another word,
+404 with no active key. `GET /api/security/service-keys` rows carry
+`context_overflow` (`flag` on every existing key). With `refuse`, that
+consumer's `/v1/chat/completions` and `/api/external/chat/completions` answer
+413 `context_too_small` instead of sending a prompt no candidate's context
+holds. Additive.
+
 ## 2026-11-14
 
 Added `GET /api/monitoring/status` (every signed-in tier):
