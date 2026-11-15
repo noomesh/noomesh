@@ -306,6 +306,13 @@ def test_the_doc_lists_exactly_the_agents_reasons() -> None:
     section = doc_text().split("## Reasons", 1)[1].split("\n## ", 1)[0]
     doc_reasons = re.findall(r"^\| `([a-z_]+)` \|", section, re.M)
     assert doc_reasons == go_reasons, "docs/reference/node-workloads.md 'Reasons' and nodewl/reasons.go must list the same reasons in the same order"
+    # The gateway's mirror (node_workloads.rs code::REASONS), which the reserve
+    # refusal reads: a code the agent adds must reach it too.
+    rs = (REPO / "gateway-rust/src/node_workloads.rs").read_text()
+    consts = dict(re.findall(r'pub const ([A-Z_]+): &str = "([a-z_]+)";', rs))
+    listed = rs.split("pub const REASONS: &[&str] = &[", 1)[1].split("];", 1)[0]
+    gw_reasons = [consts[n] for n in re.findall(r"([A-Z_]+),", listed)]
+    assert gw_reasons == go_reasons, "gateway-rust node_workloads.rs code::REASONS and nodewl/reasons.go must list the same reasons in the same order"
     # the three the brief required to be there, whatever else is added
     for r in ("decl_invalid", "door_leaf_missing", "drain_timeout"):
         assert r in doc_reasons
