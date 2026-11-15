@@ -567,30 +567,25 @@ func TestStartManagedIsRefusedByTheGate(t *testing.T) {
 	}
 }
 
-// 0.6.25-rc.2 rehearsal: an attempt that failed with an uncoded error left the
-// row's EARLIER reason (door_leaf_missing) in place, so the node, the gateway
-// and the reserve refusal all named the wrong cause. The row now says
-// provision_failed; a coded error still names its own code.
-func TestAnUncodedRefusalReplacesTheEarlierReason(t *testing.T) {
-	p := &NodeWorkloads{}
-	e := nodewl.Entry{Addon: "rhaddon", Name: "echo"}
-	p.with(e.Addon, e.Name, func(ls *lifeState) {
-		ls.entry, ls.hasEntry, ls.reason = e, true, nodewl.ReasonDoorLeafMissing
-	})
-	reason := func() string {
-		for _, r := range p.Rows() {
-			if r.Addon == e.Addon && r.Name == e.Name {
-				return r.Reason
-			}
-		}
-		return "no row"
+// 0.6.25-rc.2 rehearsal: a provisioning attempt that failed with an uncoded
+// error left the row's EARLIER reason (door_leaf_missing) in place, so the
+// node, the gateway and the reserve refusal named the wrong cause. A failed
+// provision now says provision_failed; an uncoded error outside provisioning
+// still never replaces a reason (TestOnlyAReasonCodeChangesTheReasonOfARow).
+func TestAFailedProvisionReplacesTheEarlierReason(t *testing.T) {
+	h := newLife(t)
+	e := h.provisioned()
+	h.p.with(e.Addon, e.Name, func(ls *lifeState) { ls.reason = nodewl.ReasonDoorLeafMissing })
+	h.api.loadErr = errors.New("docker load: the daemon went away")
+	h.p.Converge(context.Background(), e)
+	cur, _ := h.p.read(e.Addon, e.Name)
+	if cur.reason != nodewl.ReasonProvisionFailed {
+		t.Fatalf("after a failed provision the row says %q, want provision_failed", cur.reason)
 	}
-	p.refused(e, errors.New("docker create: conflict"))
-	if got := reason(); got != nodewl.ReasonProvisionFailed {
-		t.Fatalf("after an uncoded failure the row says %q, want provision_failed", got)
+	if got := provisionErr(errors.New(`fetch https://h:8443/x?token=T`)); nodewl.CodeOf(got) != nodewl.ReasonProvisionFailed || strings.Contains(got.Error(), "token=T") {
+		t.Fatalf("provisionErr: %v", got)
 	}
-	p.refused(e, refuse(nodewl.ReasonImageUnavailable, "", "rail refused"))
-	if got := reason(); got != nodewl.ReasonImageUnavailable {
-		t.Fatalf("a coded failure names its code, got %q", got)
+	if got := provisionErr(ErrSetsPending); !errors.Is(got, ErrSetsPending) {
+		t.Fatal("a routine wait is not a provision failure")
 	}
 }
