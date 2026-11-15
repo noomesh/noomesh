@@ -8307,11 +8307,11 @@ pub(crate) struct StackContainer {
     pub running: bool,
 }
 
-/// `repo` of `repo@sha256:…` or `repo:tag` (the tag after the last `/`).
+/// `repo` of `repo@sha256:…`, `repo:tag` or `repo:tag@sha256:…` (compose
+/// writes the last: `ghcr.io/noomesh/gateway:v0.6.25@sha256:…`). A colon
+/// before the last `/` is a registry port, not a tag.
 fn image_repo(r: &str) -> &str {
-    if let Some((n, _)) = r.split_once('@') {
-        return n;
-    }
+    let r = r.split_once('@').map_or(r, |(n, _)| n);
     match (r.rfind(':'), r.rfind('/')) {
         (Some(c), Some(sl)) if c > sl => &r[..c],
         (Some(c), None) => &r[..c],
@@ -8319,18 +8319,46 @@ fn image_repo(r: &str) -> &str {
     }
 }
 
-/// `stack images`: every RUNNING container on this host whose image is one
-/// the stack lock pins (by repository) runs exactly the image the lock pins.
-/// The gate for removing superseded images (`image_retention::retention_gate`)
-/// rests on it: a container still on an older image (a half-done roll)
-/// means "superseded" is not true yet.
+/// A repository with a registry host (`ghcr.io/…`, `localhost:5000/…`),
+/// not a Docker Hub short name (`nats`, `ollama/ollama`).
+fn has_registry_host(repo: &str) -> bool {
+    repo.split_once('/').is_some_and(|(h, _)| h.contains('.') || h.contains(':') || h == "localhost")
+}
+
+/// One row of the stack lock and the local images that hold its digest
+/// (`image_retention::holding`: by digest, under any name).
+#[derive(Debug, Clone)]
+pub(crate) struct LockImage {
+    pub lock_ref: String,
+    pub held: Vec<crate::commands::image_retention::LocalImage>,
+}
+
+/// `stack images`: every RUNNING stack container on this host runs exactly
+/// the image the lock pins. The gate for removing superseded images
+/// (`image_retention::retention_gate`) rests on it: a container still on an
+/// older image (a half-done roll) means "superseded" is not true yet.
 ///
-/// Out of scope, and said: containers the lock does not pin at all (an
-/// add-on's own, fixtures, anything of the operator's), and stopped ones (a
-/// one-shot that exited, a never-started keeper). `lock`: each lock ref and
-/// its local image ID (`None`: not on this host). Fail-closed: no lock, or a
-/// docker that did not answer, is a WARN, never a pass.
-pub(crate) fn stack_images_check(lock: Option<&[(String, Option<String>)]>, containers: Result<&[StackContainer], String>) -> Check {
+/// The lock names images by digest under the release's short names
+/// (`gateway@sha256:…`); the same digest is held here as
+/// `ghcr.io/noomesh/gateway@…`, `ghcr.io/noomesh/dhi/alertmanager@…`, a
+/// Docker Hub `nats@…` or under a mirror prefix. So the scope is by the
+/// repository the lock's digest RESOLVES to locally, and the judgment is
+/// image ID equality, never a name comparison:
+///
+/// * a container whose image repository is one a lock row's image is held
+///   under is judged against that row;
+/// * a row no local image holds (not pulled yet, mid-roll) claims a
+///   container under a registry host whose last path segment is the row's
+///   name, and fails it: the lock's image is not here;
+/// * a Docker Hub short-name repository is judged only for a container named
+///   `<prefix>-…` (the stack's own), so the operator's own `nats` container
+///   is never held against the stack's.
+///
+/// Out of scope, and said: containers no row claims (an add-on's own,
+/// fixtures, the operator's), and stopped ones. Fail-closed: no lock, or a
+/// docker that did not answer, is a WARN; running containers of which the
+/// check matched NONE is a FAIL (the check cannot see this stack).
+pub(crate) fn stack_images_check(lock: Option<&[LockImage]>, containers: Result<&[StackContainer], String>, prefix: &str) -> Check {
     const NAME: &str = "stack images";
     let Some(lock) = lock else {
         return warn(NAME, "no stack.lock in the install root: what the stack should run is not known — not judged", None);
@@ -8339,30 +8367,51 @@ pub(crate) fn stack_images_check(lock: Option<&[(String, Option<String>)]>, cont
         Ok(c) => c,
         Err(e) => return warn(NAME, format!("docker did not list the containers ({e}) — not judged, not a pass"), None),
     };
-    let pinned: std::collections::BTreeMap<&str, Vec<(&str, Option<&str>)>> = lock.iter().fold(Default::default(), |mut m, (r, id)| {
-        m.entry(image_repo(r)).or_default().push((r.as_str(), id.as_deref()));
-        m
-    });
+    let mut by_repo: std::collections::BTreeMap<&str, Vec<&LockImage>> = Default::default();
+    let mut unresolved: Vec<&LockImage> = Vec::new();
+    for li in lock {
+        let repos: std::collections::BTreeSet<&str> = li.held.iter().flat_map(|i| i.refs.iter().map(|r| image_repo(r))).collect();
+        if repos.is_empty() {
+            unresolved.push(li);
+        }
+        for r in repos {
+            by_repo.entry(r).or_default().push(li);
+        }
+    }
+    let last = |r: &str| -> String { r.rsplit('/').next().unwrap_or(r).to_string() };
+    let own = format!("{prefix}-");
     let mut judged = 0usize;
     let mut bad: Vec<String> = Vec::new();
     let mut not_pinned: Vec<&str> = Vec::new();
     let mut stopped: Vec<&str> = Vec::new();
     for c in containers {
-        let Some(want) = pinned.get(image_repo(&c.config_image)) else {
+        let repo = image_repo(&c.config_image);
+        let want: Vec<&LockImage> = if !has_registry_host(repo) && !c.name.starts_with(&own) {
+            Vec::new()
+        } else if let Some(w) = by_repo.get(repo) {
+            w.clone()
+        } else if has_registry_host(repo) {
+            unresolved.iter().copied().filter(|li| last(image_repo(&li.lock_ref)) == last(repo)).collect()
+        } else {
+            Vec::new()
+        };
+        if want.is_empty() {
             not_pinned.push(&c.name);
             continue;
-        };
+        }
         if !c.running {
             stopped.push(&c.name);
             continue;
         }
         judged += 1;
-        if !want.iter().any(|(_, id)| *id == Some(c.image_id.as_str())) {
+        if !want.iter().any(|li| li.held.iter().any(|i| i.id == c.image_id)) {
             let short = c.image_id.strip_prefix("sha256:").unwrap_or(&c.image_id);
-            let (r, id) = want[0];
-            bad.push(match id {
-                Some(_) => format!("{} runs {}, the lock pins {r}", c.name, &short[..short.len().min(12)]),
-                None => format!("{} runs {}, and the lock's {r} is not on this host", c.name, &short[..short.len().min(12)]),
+            let li = want[0];
+            let r = &li.lock_ref;
+            bad.push(if li.held.is_empty() {
+                format!("{} runs {}, and the lock's {r} is not on this host", c.name, &short[..short.len().min(12)])
+            } else {
+                format!("{} runs {}, the lock pins {r}", c.name, &short[..short.len().min(12)])
             });
         }
     }
@@ -8378,6 +8427,16 @@ pub(crate) fn stack_images_check(lock: Option<&[(String, Option<String>)]>, cont
         return fail(NAME, format!("{}{skipped}", bad.join("; ")), "noo upgrade --stack");
     }
     if judged == 0 {
+        let running = containers.iter().filter(|c| c.running).count();
+        if running > 0 && stopped.is_empty() {
+            return fail(
+                NAME,
+                format!(
+                    "the check matched none of the {running} running container(s) to an image the stack lock names — it cannot judge this stack (a check fault, not a pass){skipped}"
+                ),
+                "noo stack status",
+            );
+        }
         return warn(NAME, format!("no running container runs an image the stack lock pins — nothing judged{skipped}"), None);
     }
     ok(NAME, format!("{judged} running container(s) run the lock's images{skipped}"))
@@ -8385,7 +8444,8 @@ pub(crate) fn stack_images_check(lock: Option<&[(String, Option<String>)]>, cont
 
 /// [`stack_images_check`] for the install at `root`, read from docker.
 pub(crate) fn stack_images_row_here(root: &std::path::Path) -> Check {
-    let lock = std::fs::read_to_string(root.join("stack.lock")).ok().map(|t| crate::commands::image_retention::stack_lock_refs(&t));
+    use crate::commands::image_retention as ir;
+    let lock = std::fs::read_to_string(root.join("stack.lock")).ok().map(|t| ir::stack_lock_refs(&t));
     let run = |args: &[&str]| -> Result<String, String> {
         let o = std::process::Command::new("docker").args(args).stdin(std::process::Stdio::null()).output().map_err(|e| e.to_string())?;
         if o.status.success() {
@@ -8394,13 +8454,15 @@ pub(crate) fn stack_images_row_here(root: &std::path::Path) -> Check {
             Err(String::from_utf8_lossy(&o.stderr).lines().next().unwrap_or("docker failed").to_string())
         }
     };
-    let ids: std::collections::BTreeMap<String, String> = run(&["images", "--digests", "--no-trunc", "--format", "{{.Repository}}@{{.Digest}}|{{.ID}}"])
-        .map(|out| out.lines().filter_map(|l| l.split_once('|')).map(|(r, i)| (r.trim().to_string(), i.trim().to_string())).collect())
-        .unwrap_or_default();
-    let lock: Option<Vec<(String, Option<String>)>> = lock.map(|refs| refs.into_iter().map(|r| {
-        let id = ids.get(&r).cloned();
-        (r, id)
-    }).collect());
+    let local = ir::local_images();
+    let lock: Option<Vec<LockImage>> = lock.map(|refs| {
+        refs.into_iter()
+            .map(|r| {
+                let held = local.as_deref().map(|l| ir::holding(&r, l).into_iter().cloned().collect()).unwrap_or_default();
+                LockImage { lock_ref: r, held }
+            })
+            .collect()
+    });
     let containers = run(&["ps", "-aq", "--no-trunc"]).and_then(|ids| {
         let ids: Vec<&str> = ids.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
         if ids.is_empty() {
@@ -8427,7 +8489,12 @@ pub(crate) fn stack_images_row_here(root: &std::path::Path) -> Check {
         }
         Ok(parsed)
     });
-    stack_images_check(lock.as_deref(), containers.as_deref().map_err(|e| e.clone()))
+    // Images not listed: nothing can be resolved, so nothing is judged.
+    let containers = match &local {
+        Err(e) => Err(format!("docker did not list the images: {e}")),
+        Ok(_) => containers,
+    };
+    stack_images_check(lock.as_deref(), containers.as_deref().map_err(|e| e.clone()), &crate::envfile::container_prefix())
 }
 
 fn checks_json(checks: &[Check]) -> Value {
@@ -14843,66 +14910,135 @@ mod image_retention_row_tests {
         StackContainer { name: name.into(), config_image: image.into(), image_id: id.into(), running }
     }
 
-    fn lock() -> Vec<(String, Option<String>)> {
-        vec![
-            ("ghcr.io/noomesh/gateway@sha256:".to_string() + &"1".repeat(64), Some("sha256:".to_string() + &"a".repeat(64))),
-            ("ghcr.io/noomesh/ollama@sha256:".to_string() + &"2".repeat(64), Some("sha256:".to_string() + &"b".repeat(64))),
-        ]
+    /// Captured fixtures (tests/fixtures/image-retention/README.md says
+    /// where each came from): the real 0.6.25-rc.1 and 0.6.24 stack locks,
+    /// `docker image inspect` of real stores, `docker inspect` of containers
+    /// created from compose-shaped refs.
+    fn fx(name: &str) -> &'static str {
+        match name {
+            "rc1.lock" => include_str!("../../../tests/fixtures/image-retention/stack-v0.6.25-rc.1.lock"),
+            "classic.images" => include_str!("../../../tests/fixtures/image-retention/classic-overlay2-27.5.1.images"),
+            "classic.containers" => include_str!("../../../tests/fixtures/image-retention/classic-gateway.containers"),
+            "containerd-node.images" => include_str!("../../../tests/fixtures/image-retention/containerd-node.images"),
+            "27.images" => include_str!("../../../tests/fixtures/image-retention/docker27.images"),
+            "27.containers" => include_str!("../../../tests/fixtures/image-retention/docker27.containers"),
+            "28.images" => include_str!("../../../tests/fixtures/image-retention/docker28.images"),
+            "28.containers" => include_str!("../../../tests/fixtures/image-retention/docker28.containers"),
+            "29.images" => include_str!("../../../tests/fixtures/image-retention/docker29.images"),
+            "29.containers" => include_str!("../../../tests/fixtures/image-retention/docker29.containers"),
+            _ => panic!("no fixture {name}"),
+        }
+    }
+
+    fn lock_images(lock: &str, images: &str) -> Vec<LockImage> {
+        let local = crate::commands::image_retention::parse_local_images(images);
+        crate::commands::image_retention::stack_lock_refs(lock)
+            .into_iter()
+            .map(|r| LockImage { held: crate::commands::image_retention::holding(&r, &local).into_iter().cloned().collect(), lock_ref: r })
+            .collect()
+    }
+
+    /// `docker inspect --format '{{.Name}}|{{.Config.Image}}|{{.Image}}|{{.State.Running}}'`
+    /// lines. The captures are of created (never started) containers; the
+    /// names in `running` are taken as running.
+    fn containers(text: &str, running: &[&str]) -> Vec<StackContainer> {
+        text.lines()
+            .filter_map(|l| {
+                let p: Vec<&str> = l.trim().splitn(4, '|').collect();
+                let name = p.first()?.trim_start_matches('/');
+                (p.len() == 4).then(|| sc(name, p[1], p[2], running.contains(&name)))
+            })
+            .collect()
+    }
+
+    /// The defect this replaces: the real lock's short names (`gateway@…`)
+    /// never equalled a container's `ghcr.io/noomesh/gateway:…@…`, so every
+    /// container was "not pinned" and the gate never passed. On Docker 27,
+    /// 28 (classic store) and 29 (containerd store), the stack's Docker Hub
+    /// image (nats) and a ghcr.io/noomesh/dhi base image (alertmanager) are
+    /// judged and pass.
+    #[test]
+    fn stack_images_judges_the_real_rc1_lock_on_docker_27_28_29() {
+        for v in ["27", "28", "29"] {
+            let lock = lock_images(fx("rc1.lock"), fx(&format!("{v}.images")));
+            let cs = containers(fx(&format!("{v}.containers")), &["noo-nats", "noo-alertmanager"]);
+            let r = stack_images_check(Some(&lock), Ok(&cs), "noo");
+            assert_eq!(r.verdict, Verdict::Ok, "docker {v}: {r:?}");
+            assert!(r.detail.starts_with("2 running container(s) run the lock's images"), "docker {v}: {}", r.detail);
+        }
+    }
+
+    /// Mid-roll on the real classic store: noo-gateway still runs 0.6.24's
+    /// gateway while the lock is rc.1's: a FAIL naming it.
+    #[test]
+    fn stack_images_fails_mid_roll_on_the_real_store() {
+        let lock = lock_images(fx("rc1.lock"), fx("classic.images"));
+        let cs = containers(fx("classic.containers"), &["noo-gateway", "noo-gateway-rc1"]);
+        let r = stack_images_check(Some(&lock), Ok(&cs), "noo");
+        assert_eq!(r.verdict, Verdict::Fail, "{r:?}");
+        assert!(r.detail.starts_with("noo-gateway runs cf73b69640a1, the lock pins gateway@sha256:5074a815"), "{}", r.detail);
+        // rc.1's own gateway container alone passes.
+        let r = stack_images_check(Some(&lock), Ok(&cs[1..]), "noo");
+        assert_eq!(r.verdict, Verdict::Ok, "{r:?}");
+        // The lock's gateway not pulled at all (Docker 27's store holds none):
+        // the container on the old one is still claimed, and failed, said.
+        let lock = lock_images(fx("rc1.lock"), fx("27.images"));
+        let r = stack_images_check(Some(&lock), Ok(&cs[..1]), "noo");
+        assert!(r.verdict == Verdict::Fail && r.detail.contains("the lock's gateway@sha256:5074a815525f") && r.detail.contains("is not on this host"), "{r:?}");
+    }
+
+    /// Under a mirror prefix (a real containerd store whose images were
+    /// pulled from a registry other than ghcr.io/noomesh) the row resolves
+    /// by digest all the same.
+    #[test]
+    fn stack_images_resolves_a_mirror_prefix_by_digest() {
+        let d = "1337ee87e4113bfd426371f007e20865d9dfb3242a7cb94cb479d50f5492d3fd";
+        let lock = lock_images(&format!("# stack v0.6.16\nwhisper@sha256:{d}\n"), fx("containerd-node.images"));
+        assert_eq!(lock[0].held.len(), 1, "{lock:?}");
+        let cs = vec![sc("noo-whisper", &format!("registry.example.lan/noomesh/whisper:v0.6.16@sha256:{d}"), &format!("sha256:{d}"), true)];
+        assert_eq!(stack_images_check(Some(&lock), Ok(&cs), "noo").verdict, Verdict::Ok);
+    }
+
+    /// The operator's own container on a Docker Hub image the stack also
+    /// uses (`nats`) is not the stack's: never judged against the lock.
+    #[test]
+    fn stack_images_never_judges_the_operators_own_hub_container() {
+        let lock = lock_images(fx("rc1.lock"), fx("28.images"));
+        let mut cs = containers(fx("28.containers"), &["noo-nats", "noo-alertmanager"]);
+        cs.push(sc("mynats", "nats:latest", &id("e"), true));
+        let r = stack_images_check(Some(&lock), Ok(&cs), "noo");
+        assert_eq!(r.verdict, Verdict::Ok, "{r:?}");
+        assert!(r.detail.contains("1 not pinned by the lock (mynats)"), "{}", r.detail);
+        // The same image under the stack's own prefix IS judged.
+        cs.last_mut().unwrap().name = "noo-nats-2".into();
+        assert_eq!(stack_images_check(Some(&lock), Ok(&cs), "noo").verdict, Verdict::Fail);
+    }
+
+    /// Running containers, none matched: the check cannot see this stack,
+    /// and says so as a FAIL, never "nothing judged" that reads as quiet.
+    #[test]
+    fn stack_images_matching_nothing_on_a_running_box_is_a_fault() {
+        let lock = lock_images(fx("rc1.lock"), fx("27.images"));
+        let cs = vec![sc("rh-fixture", "localhost:5000/rh/fixture:1", &id("d"), true)];
+        let r = stack_images_check(Some(&lock), Ok(&cs), "noo");
+        assert_eq!(r.verdict, Verdict::Fail, "{r:?}");
+        assert!(r.detail.starts_with("the check matched none of the 1 running container(s)"), "{}", r.detail);
     }
 
     fn id(c: &str) -> String {
         "sha256:".to_string() + &c.repeat(64)
     }
 
-    /// A fresh install: every pinned container runs the lock's image; an
-    /// add-on's own container, a fixture and a stopped one-shot are out of
-    /// scope and said, never red.
-    #[test]
-    fn stack_images_passes_a_fresh_install_and_names_what_it_skipped() {
-        let cs = vec![
-            sc("noo-gateway", &lock()[0].0, &id("a"), true),
-            sc("noo-ollama", "ghcr.io/noomesh/ollama:v0.6.25", &id("b"), true),
-            sc("noo-rhaddon", "ghcr.io/rhowner/rhaddon@sha256:".to_string().as_str(), &id("c"), true),
-            sc("rh-fixture", "localhost:5000/rh/fixture:1", &id("d"), true),
-            sc("noo-migrate", &lock()[0].0, &id("9"), false),
-        ];
-        let r = stack_images_check(Some(&lock()), Ok(&cs));
-        assert_eq!(r.verdict, Verdict::Ok, "{r:?}");
-        assert!(r.detail.starts_with("2 running container(s) run the lock's images"), "{}", r.detail);
-        assert!(r.detail.contains("2 not pinned by the lock (noo-rhaddon, rh-fixture)") && r.detail.contains("1 stopped (noo-migrate)"), "{}", r.detail);
-    }
-
-    /// Upgraded: the previous release's images are still on disk, and that
-    /// is not drift; only what a running container runs is judged.
-    #[test]
-    fn stack_images_passes_an_upgraded_install_with_old_images_on_disk() {
-        let cs = vec![sc("noo-gateway", &lock()[0].0, &id("a"), true), sc("rhkeep-3", "ghcr.io/noomesh/gateway:v0.6.24", &id("e"), false)];
-        assert_eq!(stack_images_check(Some(&lock()), Ok(&cs)).verdict, Verdict::Ok);
-    }
-
-    /// Mid-roll: a container still on the older image is a FAIL naming it,
-    /// so the retention gate holds.
-    #[test]
-    fn stack_images_fails_mid_roll_naming_the_container() {
-        let cs = vec![sc("noo-gateway", &lock()[0].0, &id("a"), true), sc("noo-ollama", "ghcr.io/noomesh/ollama:v0.6.24", &id("e"), true)];
-        let r = stack_images_check(Some(&lock()), Ok(&cs));
-        assert_eq!(r.verdict, Verdict::Fail, "{r:?}");
-        assert!(r.detail.starts_with("noo-ollama runs eeeeeeeeeeee, the lock pins ghcr.io/noomesh/ollama@sha256:"), "{}", r.detail);
-        // The lock's image is not even on this host: still a FAIL, said.
-        let mut l = lock();
-        l[1].1 = None;
-        let r = stack_images_check(Some(&l), Ok(&cs));
-        assert!(r.verdict == Verdict::Fail && r.detail.contains("is not on this host"), "{r:?}");
-    }
-
-    /// Not judged is never a pass: no lock, docker silent, nothing pinned
-    /// running.
+    /// Not judged is never a pass: no lock, docker silent, nothing running.
     #[test]
     fn stack_images_without_a_verdict_warns() {
-        let cs = vec![sc("noo-gateway", &lock()[0].0, &id("a"), true)];
-        assert_eq!(stack_images_check(None, Ok(&cs)).verdict, Verdict::Warn);
-        assert_eq!(stack_images_check(Some(&lock()), Err("docker not running".into())).verdict, Verdict::Warn);
-        assert_eq!(stack_images_check(Some(&lock()), Ok(&[])).verdict, Verdict::Warn);
+        let lock = lock_images(fx("rc1.lock"), fx("27.images"));
+        let cs = containers(fx("27.containers"), &["noo-nats"]);
+        assert_eq!(stack_images_check(None, Ok(&cs), "noo").verdict, Verdict::Warn);
+        assert_eq!(stack_images_check(Some(&lock), Err("docker not running".into()), "noo").verdict, Verdict::Warn);
+        assert_eq!(stack_images_check(Some(&lock), Ok(&[]), "noo").verdict, Verdict::Warn);
+        // Stopped stack containers only: nothing judged, a WARN.
+        assert_eq!(stack_images_check(Some(&lock), Ok(&containers(fx("27.containers"), &[])), "noo").verdict, Verdict::Warn);
     }
 
     #[test]
@@ -14911,6 +15047,9 @@ mod image_retention_row_tests {
         assert_eq!(image_repo("ghcr.io/noomesh/gateway:v1"), "ghcr.io/noomesh/gateway");
         assert_eq!(image_repo("localhost:5000/rh/x"), "localhost:5000/rh/x");
         assert_eq!(image_repo("redis:7"), "redis");
+        // compose's form: tag AND digest
+        assert_eq!(image_repo("ghcr.io/noomesh/gateway:v0.6.25-rc.1@sha256:aa"), "ghcr.io/noomesh/gateway");
+        assert_eq!(image_repo("localhost:5000/rh/x:1@sha256:aa"), "localhost:5000/rh/x");
     }
 
     /// A roll whose gate blocked is visible here until a roll cleans.

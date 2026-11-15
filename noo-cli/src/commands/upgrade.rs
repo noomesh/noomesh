@@ -1803,7 +1803,6 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
 {
     let root = &roll.root;
     let tag = &roll.tag;
-    let prev = &roll.prev;
     // The launcher's own output (compose pull/up progress) follows this
     // line; it is the one child whose stdout is shown as-is (guide §5).
     if !g.json { ui::step("starting the stack (launcher)"); }
@@ -1927,63 +1926,10 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
             // `noo upgrade --all` needs no manual restart. Never fails the roll.
             super::mesh::front_addon_uis(g);
             ensure_embedder_after_roll(g);
-            // Prune superseded release images (finding #93: 13 upgrades
-            // quietly accumulated 78 tags — gigabytes). Best-effort — a prune
-            // failure must never taint a successful roll.
-            //
-            // Selected by REFERENCE, not by tag text. The old rule kept
-            // anything whose text after the last `:` was neither the new tag
-            // nor the previous one — which worked until digest pinning
-            //  made every stack image arrive UNTAGGED.
-            // `docker images` then reports `repo:<none>`, so `<none>` matched
-            // neither tag and the whole set was marked stale INCLUDING the
-            // images the running containers were built from. `docker rmi -f`
-            // refused those, the command exited non-zero, and the operator was
-            // told all 51 could not be pruned — while nothing was reclaimed at
-            // all, so the count climbed every release (44 → 51 → 52, live
-            // 2026-09-05, with 11.6 GB reclaimable sitting there).
-            //
-            // Note these images are NOT dangling — they have a repository and
-            // no tag — so `docker image prune` skips them too. The question
-            // this code actually wants to ask is "does any container use it",
-            // and that is now the question it asks.
-            let in_use = docker_image_ids_in_use();
-            let stale = superseded_images(&docker_image_lines(), &in_use, tag, prev);
-            if !stale.is_empty() {
-                // Per-image, so one in-use image cannot report the whole batch
-                // as failed. The previous all-or-nothing status was the reason
-                // "could not prune 51" was mostly untrue.
-                let mut pruned = 0usize;
-                let mut kept = 0usize;
-                for id in &stale {
-                    let ok = std::process::Command::new("docker")
-                        .args(["rmi", id])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
-                        .map(|st| st.success())
-                        .unwrap_or(false);
-                    if ok { pruned += 1 } else { kept += 1 }
-                }
-                if !g.json {
-                    // "kept v0.2.43 + previous v0.2.43" names one tag twice and
-                    // reads as a bug in the pruner. When the previous tag IS the
-                    // one being applied there is no previous to keep, and saying
-                    // so is shorter than saying it twice.
-                    let kept_label = if prev.is_empty() || prev == tag {
-                        format!("kept {tag}")
-                    } else {
-                        format!("kept {tag} + previous {prev}")
-                    };
-                    if kept == 0 {
-                        ui::done(&format!("pruned {pruned} superseded image(s) ({kept_label})"));
-                    } else {
-                        ui::done(&format!(
-                            "pruned {pruned} superseded image(s); {kept} still referenced and left alone \
-                             ({kept_label})"));
-                    }
-                }
-            }
+            // Superseded images are image retention's alone (the call above):
+            // the pruner that ran here on every roll (finding #93) ignored
+            // `cluster.image_retention`, never previewed, and removed the
+            // previous release's untagged images; retired for 0.6.25.
             // Node images were staged BEFORE the launcher (see the call above
             // it): nothing the roll does changes what the signed lock says, so
             // there is no second pass here. The run is joined by the caller.
@@ -3899,83 +3845,6 @@ pub(crate) fn provision_one(g: &Globals, node: &str, extra: &[&str]) -> Result<i
             Ok(1)
         }
     }
-}
-
-/// `docker images` as `<id> <repo>:<tag>` lines. Empty when docker is absent —
-/// pruning is best-effort and must never fail a roll.
-fn docker_image_lines() -> Vec<String> {
-    std::process::Command::new("docker")
-        .args(["images", "--format", "{{.ID}} {{.Repository}}:{{.Tag}}"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect())
-        .unwrap_or_default()
-}
-
-/// Image ids any container (running OR stopped) was created from.
-///
-/// Stopped containers count: `docker rmi` refuses an image a stopped container
-/// still references, and a stopped container is often one the operator intends
-/// to start again.
-fn docker_image_ids_in_use() -> std::collections::HashSet<String> {
-    std::process::Command::new("docker")
-        .args(["ps", "-a", "--format", "{{.Image}}"])
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter_map(|r| {
-                    let out = std::process::Command::new("docker")
-                        .args(["inspect", "-f", "{{.Id}}", r.trim()])
-                        .output()
-                        .ok()?;
-                    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    if id.is_empty() { None } else { Some(short_id(&id)) }
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// `docker images` prints 12-char ids; `docker inspect` prints the full
-/// `sha256:…`. Compare on the short form so the two agree.
-fn short_id(id: &str) -> String {
-    let hex = id.strip_prefix("sha256:").unwrap_or(id);
-    hex.chars().take(12).collect()
-}
-
-/// Which of our release images are superseded AND unreferenced.
-///
-/// Pure, so the rule can be tested without a docker daemon — the previous rule
-/// could not be, which is part of why it survived digest pinning.
-fn superseded_images(
-    lines: &[String],
-    in_use: &std::collections::HashSet<String>,
-    tag: &str,
-    prev: &str,
-) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in lines {
-        let Some((id, name)) = line.split_once(' ') else { continue };
-        if !crate::registry::is_registry_image(name) {
-            continue;
-        }
-        // Referenced by a container: never a candidate, whatever its tag says.
-        if in_use.contains(id) {
-            continue;
-        }
-        // Keep the tag just deployed and the previous pin, so an instant
-        // rollback stays warm. An UNTAGGED image (`<none>`, which is what a
-        // digest-pinned pull leaves behind) is kept only by the in-use test
-        // above — it carries no tag to compare, so tag rules cannot save it.
-        let t = name.rsplit(':').next().unwrap_or("");
-        if t == tag || (!prev.is_empty() && t == prev) {
-            continue;
-        }
-        out.push(id.to_string());
-    }
-    out.sort();
-    out.dedup();
-    out
 }
 
 /// The `noo` PATH would run, when that is NOT `exe`.
@@ -6365,63 +6234,18 @@ mod tests {
 
     use super::{first_noo_on_path, local_agent_name, target_triple_for, version_less_than, running_gateway_tag};
 
-    fn ids(v: &[&str]) -> std::collections::HashSet<String> {
-        v.iter().map(|s| s.to_string()).collect()
-    }
-
-    /// The regression: a digest-pinned pull leaves the image UNTAGGED, so
-    /// `docker images` reports `repo:<none>`.
-    ///
-    /// The old rule kept anything whose text after the last `:` was neither
-    /// the new tag nor the previous one, so `<none>` matched neither and the
-    /// RUNNING images were marked stale. `docker rmi -f` refused them, the
-    /// batch reported failure, and nothing was ever reclaimed — the count
-    /// climbed 44 → 51 → 52 across releases with 11.6 GB sitting idle.
+    /// One deleter of superseded images: image retention. The roll's own
+    /// pruner (finding #93) removed images on every roll, ignoring
+    /// `cluster.image_retention: off` and the previous release's images;
+    /// it must not come back here.
     #[test]
-    fn an_untagged_image_in_use_is_never_pruned() {
-        let lines = vec![
-            "aaaaaaaaaaaa ghcr.io/noomesh/gateway:<none>".to_string(),
-            "bbbbbbbbbbbb ghcr.io/noomesh/worker:<none>".to_string(),
-        ];
-        // The gateway image is the one the running container was created from.
-        let got = superseded_images(&lines, &ids(&["aaaaaaaaaaaa"]), "v0.2.24", "v0.2.23");
-        assert_eq!(got, vec!["bbbbbbbbbbbb".to_string()],
-            "an in-use image must be left alone, and an unused one must still be reclaimed");
-    }
-
-    /// The current and previous tags stay warm so a rollback needs no pull.
-    #[test]
-    fn the_deployed_and_previous_tags_are_kept() {
-        let lines = vec![
-            "999999999999 ghcr.io/noomesh/gateway:v0.2.19".to_string(),
-            "111111111111 ghcr.io/noomesh/gateway:v0.2.24".to_string(),
-            "222222222222 ghcr.io/noomesh/gateway:v0.2.23".to_string(),
-            "333333333333 ghcr.io/noomesh/gateway:v0.2.20".to_string(),
-        ];
-        let got = superseded_images(&lines, &Default::default(), "v0.2.24", "v0.2.23");
-        // Both superseded tags are candidates; the deployed and previous stay.
-        assert_eq!(got, vec!["333333333333".to_string(), "999999999999".to_string()]);
-    }
-
-    /// Images from other publishers are not ours to reclaim. Deleting
-    /// postgres or nats here would be a rude surprise on a shared host.
-    #[test]
-    fn only_our_own_images_are_candidates() {
-        let lines = vec![
-            "444444444444 nats:latest".to_string(),
-            "555555555555 ollama/ollama:latest".to_string(),
-            "666666666666 ghcr.io/ggml-org/llama.cpp:server".to_string(),
-        ];
-        assert!(superseded_images(&lines, &Default::default(), "v0.2.24", "").is_empty());
-    }
-
-    /// docker images prints a 12-char id; docker inspect prints sha256:<64>.
-    /// Comparing those unequal would make the in-use test never match, and
-    /// every running image would become a prune candidate again.
-    #[test]
-    fn ids_compare_on_the_short_form() {
-        assert_eq!(short_id("sha256:aaaaaaaaaaaabbbbbbbbbbbb"), "aaaaaaaaaaaa");
-        assert_eq!(short_id("aaaaaaaaaaaa"), "aaaaaaaaaaaa");
+    fn the_roll_runs_no_image_removal_of_its_own() {
+        let src = include_str!("upgrade.rs");
+        let body = src;
+        for needle in [concat!("\"rm", "i\""), concat!("\"image\", \"r", "m\""), concat!("\"pru", "ne\"")] {
+            assert!(!body.contains(needle), "upgrade.rs removes images itself again: {needle}");
+        }
+        assert!(body.contains("crate::commands::image_retention::post_roll(g, root, tag);"));
     }
 
     /// The controller is skipped by the enrollment-list filter, so the
