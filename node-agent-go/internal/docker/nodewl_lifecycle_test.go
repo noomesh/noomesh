@@ -589,3 +589,24 @@ func TestAFailedProvisionReplacesTheEarlierReason(t *testing.T) {
 		t.Fatal("a routine wait is not a provision failure")
 	}
 }
+
+// The case that started this (0.6.25-rc.2, A-nodewl.reserve): the door leaf
+// is ready but the rail the image comes from refuses the connection. The row
+// must END saying image_unavailable: the stale door_leaf_missing from an
+// earlier attempt is replaced, not kept.
+func TestAReadyLeafAndAnUnreachableRailEndAsImageUnavailable(t *testing.T) {
+	h := newLife(t)
+	e := h.provisioned()
+	h.p.with(e.Addon, e.Name, func(ls *lifeState) { ls.reason = nodewl.ReasonDoorLeafMissing })
+	if !h.p.LeafReady(e.Addon, e.Name) {
+		t.Fatal("the harness's door leaf must be ready for this case")
+	}
+	h.p.fetchTar = func(context.Context, string) (string, func(), error) {
+		return "", nil, errors.New(`Get "https://noo-controller:8443/images/w.tar": dial tcp 172.31.250.10:8443: connect: connection refused`)
+	}
+	h.p.Converge(context.Background(), e)
+	cur, _ := h.p.read(e.Addon, e.Name)
+	if cur.reason != nodewl.ReasonImageUnavailable {
+		t.Fatalf("a ready leaf and a refused rail left the row saying %q, want image_unavailable", cur.reason)
+	}
+}
