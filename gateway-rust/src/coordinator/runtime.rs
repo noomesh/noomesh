@@ -82,8 +82,9 @@ pub(crate) trait HarnessRuntime: Sync {
     }
     /// The context to stamp as `options.num_ctx` on a chat body for
     /// `backend` (i802, `chat_context::num_ctx_for`). `None` = stamp nothing:
-    /// any backend but Ollama, nothing declared, or a runtime that cannot
-    /// read the cluster (a node harness has no database; a known gap).
+    /// any backend but Ollama, nothing declared, or a runtime with no way
+    /// to know (the gateway reads the cluster; a node harness reads its
+    /// agent's decided table, `RemoteRuntime::chat_num_ctx`).
     async fn chat_num_ctx(&self, _backend: &ResolvedBackend) -> Option<u64> {
         None
     }

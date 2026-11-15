@@ -820,9 +820,9 @@ pub(crate) fn persona_for(tier: PromptTier) -> String {
 /// (`prompt_tier_tests::compact_core_tools_are_core_tools`).
 const COMPACT_CORE_TOOLS: &[&str] = &["noo_tool_search", "noo_rag_query", "noo_memory_search"];
 
-// TIER-HOOK: the loop builds its active set from `core_tools_for(tier)`
-// where `select_tool_schemas` starts from `CORE_TOOLS` today (and in its
-// nothing-matched fallback); keyword groups still add on top.
+/// The core tools a turn of `tier` keeps. Both loops filter their selection
+/// to these on a Compact turn (`agent_loop::tier_tools`); keyword groups'
+/// tools stay on top.
 pub(crate) fn core_tools_for(tier: PromptTier) -> &'static [&'static str] {
     match tier {
         PromptTier::Full => super::agent_loop::CORE_TOOLS,
@@ -830,9 +830,8 @@ pub(crate) fn core_tools_for(tier: PromptTier) -> &'static [&'static str] {
     }
 }
 
-// TIER-HOOK: the loop truncates the skill selection to `max_skills_for(tier)`
-// (`select(..).into_iter().take(n)` in `fetch_prompt_skills_context`, which
-// would take the tier or `n` as a parameter).
+/// How many prompt skills a turn of `tier` carries. Both loops drop the
+/// skill layer when it is 0 (a Compact turn).
 pub(crate) fn max_skills_for(tier: PromptTier) -> usize {
     match tier {
         PromptTier::Full => crate::prompt_skills::MAX_SKILLS,
@@ -843,8 +842,8 @@ pub(crate) fn max_skills_for(tier: PromptTier) -> usize {
     }
 }
 
-// TIER-HOOK: the runtimes skip `select_runbook_context` when this is false
-// (runtime.rs / remote.rs `runbook_context`).
+/// Whether a turn of `tier` carries runbooks. Both loops skip
+/// `runbook_context` when it is false (a Compact turn).
 pub(crate) fn runbooks_for(tier: PromptTier) -> bool {
     tier == PromptTier::Full
 }
@@ -862,11 +861,10 @@ pub(crate) const PREFILL_COMPACT_SECS: f64 = 20.0;
 /// `max_input`, or when a known prefill rate puts its cold prefill past
 /// [`PREFILL_COMPACT_SECS`]. With no usable rate: Full on a GPU, Compact on
 /// a CPU. `full_tokens_real` is the Full tier's prompt in real tokens.
-// TIER-HOOK: the loop calls this once per turn, before assembling the
-// system message, with the Full prompt's token count, the backend's input
-// budget (window minus the reply reserve), the measured prefill rate when
-// one is known, and whether the serving backend is CPU-only; then
-// `persona_for(tier)` replaces `load_persona_prompt` for the persona text.
+// NOT WIRED (noomesh-internal i802 follow-up "tier by measured prefill"):
+// the loops pick the tier from the window alone (`agent_loop::prompt_tier`,
+// Compact under 8k). Wiring this needs the measured prefill rate per
+// backend (backend_call's prefill_ms) and the Full prompt's real size.
 #[allow(dead_code)]
 pub(crate) fn choose_tier(full_tokens_real: u64, max_input: u64, prefill_tok_per_s: Option<f64>, cpu: bool) -> PromptTier {
     if full_tokens_real > max_input {
@@ -919,9 +917,8 @@ When asked to implement, fix, refactor, or write code: use `noo_coding_task`. Th
 
 /// The `TOOL_GROUPS` names `user_message` selects, by the same keyword rule
 /// `select_tool_schemas` applies (lowercased substring).
-// TIER-HOOK: the loop calls `selected_groups(user_message)` beside
-// `select_tool_schemas` and appends `group_guidance(&groups)` to the system
-// message (after the persona, before CLOCK_RULE), in both tiers.
+// Both loops append `group_guidance(&selected_groups(prompt))` to the
+// system message (after the persona, before CLOCK_RULE), in both tiers.
 pub(crate) fn selected_groups(user_message: &str) -> Vec<&'static str> {
     let msg = user_message.to_lowercase();
     super::agent_loop::TOOL_GROUPS

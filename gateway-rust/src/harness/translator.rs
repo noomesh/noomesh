@@ -348,11 +348,9 @@ impl Translator {
     }
 
     /// The context every Ollama-bound body carries as `options.num_ctx`
-    /// from now on, where the CLI set none (i802). Nothing on a node sets it
-    /// yet: the harness has no database to decide from, and the gateway does
-    /// not ship the decided value to it (a known gap), so the daemon keeps
-    /// its own setting there. Unused until that value reaches the node.
-    #[allow(dead_code)]
+    /// from now on, where the CLI set none (i802). The driver sets it from
+    /// the node agent's decided table (`/harness/placement`
+    /// `chat_contexts`, [`crate::harness::profile::chat_context_for`]).
     pub fn set_num_ctx(&self, num_ctx: Option<u64>) {
         self.shared.num_ctx.store(num_ctx.unwrap_or(0), Ordering::Relaxed);
     }
