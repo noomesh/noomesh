@@ -151,7 +151,7 @@ When the node-agent is asked to start a backend:
   re-fetched, and bytes that do not match are refused. The first start after
   the upgrade hashes each snapshot once, at lowered CPU/IO priority, and logs
   `verifying <model> weights: n/total GB` while the start waits. A node whose
-  controller's gateway predates the `hf` kind (before 0.6.25-rc.2) refuses to
+  controller's gateway predates the `hf` kind (before 0.6.25-rc.3) refuses to
   start HF backends and says so (`hf_weights_unverified: … upgrade the
   controller first`): **roll the controller before the nodes.** If the
   controller cannot be reached, the local copy must verify against the last
