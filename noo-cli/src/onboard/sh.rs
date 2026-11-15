@@ -166,6 +166,13 @@ fn launcher_env(ctx: &Ctx, cmd: &mut Command) {
     for (k, v) in file_secret_env(&composes, &|k| std::env::var(k).ok(), &dotenv) {
         cmd.env(k, v);
     }
+    // `cluster.postgres_memory: auto`: the sizes lib-config.sh
+    // `postgres_memory_derive_env` exports, so the postgres onboard creates
+    // is the one the next `noo stack start` keeps (no second recreate).
+    // Standard and every explicit NOO_PG_* add nothing here.
+    for (k, v) in crate::commands::postgres_memory::derived_env_live(&ctx.repo_root, &dotenv) {
+        cmd.env(k, v);
+    }
     for (k, v) in [
         ("NOO_WORKER_SUPERVISOR", "external"),
         ("NOO_MIGRATIONS_ENVS", "mesh"),
