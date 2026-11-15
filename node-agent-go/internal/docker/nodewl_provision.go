@@ -138,6 +138,9 @@ type NodeWorkloads struct {
 	doorImage    func(ctx context.Context) (string, error)
 	doorSelfName func() (string, error)
 
+	// fetchBackoff spaces out image fetches that failed (unreachable rail).
+	fetchBackoff fetchBackoff
+
 	mu     sync.Mutex
 	status map[string]WorkloadStatus
 	locks  sync.Map // addon/name -> *sync.Mutex
@@ -613,6 +616,9 @@ func (p *NodeWorkloads) ensureImage(ctx context.Context, e nodewl.Entry) error {
 	if ok {
 		return nil
 	}
+	if why, wait := p.fetchBackoff.blocked(e.Image.Artifact, time.Now()); wait > 0 {
+		return refuse(nodewl.ReasonImageUnavailable, "", "%s (next try in %s)", why, wait.Round(time.Second))
+	}
 	path, cleanup, err := p.fetchTar(ctx, e.Image.Artifact)
 	if err != nil {
 		switch {
@@ -621,8 +627,13 @@ func (p *NodeWorkloads) ensureImage(ctx context.Context, e nodewl.Entry) error {
 		case IsImageVerification(err):
 			return refuse(nodewl.ReasonImageDigestMismatch, "", "%v", err)
 		}
-		return fmt.Errorf("fetch %s: %w", e.Image.Artifact, err)
+		// The rail knows the tar; this node cannot reach it. Name it, and do
+		// not hit an unreachable rail on every pass.
+		why := fmt.Sprintf("fetch %s from the controller's rail: %s", e.Image.Artifact, scrubURLs(err.Error()))
+		p.fetchBackoff.failed(e.Image.Artifact, why, time.Now())
+		return refuse(nodewl.ReasonImageUnavailable, "", "%s", why)
 	}
+	p.fetchBackoff.ok(e.Image.Artifact)
 	defer cleanup()
 	if err := checkTarOneImage(path); err != nil {
 		return refuse(nodewl.ReasonImageDigestMismatch, "", "%v", err)

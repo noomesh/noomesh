@@ -566,3 +566,31 @@ func TestStartManagedIsRefusedByTheGate(t *testing.T) {
 		t.Fatalf("a refused start touched the node: %v", h.api.callList())
 	}
 }
+
+// 0.6.25-rc.2 rehearsal: an attempt that failed with an uncoded error left the
+// row's EARLIER reason (door_leaf_missing) in place, so the node, the gateway
+// and the reserve refusal all named the wrong cause. The row now says
+// provision_failed; a coded error still names its own code.
+func TestAnUncodedRefusalReplacesTheEarlierReason(t *testing.T) {
+	p := &NodeWorkloads{}
+	e := nodewl.Entry{Addon: "rhaddon", Name: "echo"}
+	p.with(e.Addon, e.Name, func(ls *lifeState) {
+		ls.entry, ls.hasEntry, ls.reason = e, true, nodewl.ReasonDoorLeafMissing
+	})
+	reason := func() string {
+		for _, r := range p.Rows() {
+			if r.Addon == e.Addon && r.Name == e.Name {
+				return r.Reason
+			}
+		}
+		return "no row"
+	}
+	p.refused(e, errors.New("docker create: conflict"))
+	if got := reason(); got != nodewl.ReasonProvisionFailed {
+		t.Fatalf("after an uncoded failure the row says %q, want provision_failed", got)
+	}
+	p.refused(e, refuse(nodewl.ReasonImageUnavailable, "", "rail refused"))
+	if got := reason(); got != nodewl.ReasonImageUnavailable {
+		t.Fatalf("a coded failure names its code, got %q", got)
+	}
+}

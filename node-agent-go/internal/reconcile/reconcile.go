@@ -174,6 +174,9 @@ type Reconciler struct {
 	// nwChanged runs after each node workload converge (the heartbeat Kick);
 	// nil = nothing (tests).
 	nwChanged func()
+	// leafFired: the workloads the leaf watch already nudged for, per arrival.
+	leafMu    sync.Mutex
+	leafFired map[string]bool
 	// ctlApprovals keeps the controller's signed approval set (i596); nil in
 	// tests that build a Reconciler by hand, and the offer is then skipped.
 	ctlApprovals *nodepolicy.ControllerApprovals
