@@ -1658,9 +1658,7 @@ mod tests {
     /// The documented add-on query, unqualified, on a connection logged in
     /// as the role. Returns the consumers, or the SQLSTATE of the failure.
     async fn unqualified_caller_read(conn: &mut sqlx::PgConnection) -> Result<Vec<String>, String> {
-        sqlx::query_scalar::<_, String>("SELECT consumer FROM noo_addon_caller_keys WHERE key_hash = $1")
-            .bind("h-caller")
-            .fetch_all(&mut *conn)
+        crate::repo::caller_verifiers::probe_read_view_unqualified(conn, "h-caller")
             .await
             .map_err(|e| e.as_database_error().and_then(|d| d.code()).map(|c| c.to_string()).unwrap_or_else(|| e.to_string()))
     }
@@ -1690,10 +1688,10 @@ mod tests {
             "the documented unqualified query must resolve for a verify_callers role on the mesh layout"
         );
         // `mesh` LAST: the add-on's own and `public` names come first.
-        let path: Vec<String> = sqlx::query_scalar("SELECT current_schemas(false)::text[]").fetch_one(&mut conn).await.expect("current_schemas");
+        let path: Vec<String> = crate::repo::caller_verifiers::probe_current_schemas(&mut conn).await;
         assert_eq!(path, vec!["public".to_string(), "mesh".to_string()], "the view's schema must be last on the path");
         // Privileges unchanged: the table under the view stays closed.
-        let err = sqlx::query("SELECT 1 FROM mesh.noo_service_keys").fetch_all(&mut conn).await.expect_err("noo_service_keys must stay unreadable");
+        let err = crate::repo::caller_verifiers::probe_read_service_keys(&mut conn, "mesh").await.expect_err("noo_service_keys must stay unreadable");
         assert_eq!(
             err.as_database_error().and_then(|d| d.code()).as_deref(),
             Some("42501"),
@@ -1738,7 +1736,7 @@ mod tests {
             Ok(vec!["addon-caller:gateway".to_string()]),
             "the documented unqualified query must resolve on the legacy layout"
         );
-        let path: Vec<String> = sqlx::query_scalar("SELECT current_schemas(false)::text[]").fetch_one(&mut conn).await.expect("current_schemas");
+        let path: Vec<String> = crate::repo::caller_verifiers::probe_current_schemas(&mut conn).await;
         assert_eq!(path, vec!["public".to_string()]);
         drop(conn);
         reconcile(&db, &BTreeMap::new()).await.expect("reconcile with nothing declared");
