@@ -863,8 +863,15 @@ async fn take(state: Arc<AppState>, actor: String, b: Value) -> AppResult {
             Ok(true) => {}
             Ok(false) => {
                 release_hold("already_reserved").await;
-                let by = crate::repo::node_workload_placements::held(&state.db).await.ok()
-                    .and_then(|h| h.into_iter().find(|r| r.addon == addon && r.workload == name));
+                // Who holds it is only for the message: an unreadable list is
+                // logged and the refusal still stands, without the holder.
+                let by = match crate::repo::node_workload_placements::held(&state.db).await {
+                    Ok(h) => h.into_iter().find(|r| r.addon == addon && r.workload == name),
+                    Err(e) => {
+                        tracing::warn!(error = %e, workload = %key, "reservations: holder unreadable; refusing without naming it");
+                        None
+                    }
+                };
                 return Err(AppError::Conflict(already_reserved(&key, by.as_ref())));
             }
             Err(e) => {
@@ -1789,21 +1796,21 @@ mod tests {
         assert_eq!((r["id"].as_str(), r["workload"].as_str(), r["holder"].as_str(), r["node"].as_str(), r["state"].as_str()),
             (Some("r-cpu"), Some("rhaddon/echo"), Some("alice"), Some("rhx-node2"), Some("held")));
         assert_eq!((r["gpu"].as_bool(), r["source"].as_str(), r["generation"].as_u64()), (Some(false), Some("placement"), Some(0)));
-        let lease = lease_res("r-gpu", "pai-voice/voice-worker", "awolf");
+        let lease = lease_res("r-gpu", "rhaddon/rhworker", "awolf");
         assert_eq!((lease["gpu"].as_bool(), lease["source"].as_str()), (Some(true), Some("lease")));
     }
 
     #[test]
     fn the_merged_list_never_reports_one_reservation_twice() {
         // A GPU workload: its lease AND its row carry the same id: once.
-        let gpu = merge_reservations(vec![lease_res("r1", "pai-voice/voice-worker", "awolf")],
-            &[held_row("r1", "pai-voice", "voice-worker", "awolf", Some("alice"))]);
+        let gpu = merge_reservations(vec![lease_res("r1", "rhaddon/rhworker", "awolf")],
+            &[held_row("r1", "rhaddon", "rhworker", "awolf", Some("alice"))]);
         assert_eq!(gpu.len(), 1);
         assert_eq!(gpu[0]["source"], "lease");
         // The same, with the row as a pre-124 gateway left it (holder and
         // reserved_at NULL): still the lease's, listed once, with its owner.
-        let old = merge_reservations(vec![lease_res("r1", "pai-voice/voice-worker", "awolf")],
-            &[crate::repo::node_workload_placements::Held { reserved_at: None, ..held_row("r1", "pai-voice", "voice-worker", "awolf", None) }]);
+        let old = merge_reservations(vec![lease_res("r1", "rhaddon/rhworker", "awolf")],
+            &[crate::repo::node_workload_placements::Held { reserved_at: None, ..held_row("r1", "rhaddon", "rhworker", "awolf", None) }]);
         assert_eq!(old.len(), 1, "{old:?}");
         assert_eq!((old[0]["source"].as_str(), old[0]["holder"].as_str(), old[0]["gpu"].as_bool()), (Some("lease"), Some("alice"), Some(true)));
         // gpu-0 -> GPU on one node: the old CPU row (r-a, no lease) and the new
