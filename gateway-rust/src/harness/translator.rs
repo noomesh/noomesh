@@ -819,6 +819,49 @@ pub(crate) mod ollama {
         }
     }
 
+    /// OpenAI tool calls -> Ollama's: `arguments` is an object, never the
+    /// JSON string OpenAI carries. Ollama refuses a string with a 400
+    /// ("Value looks like object, but can't find closing '}' symbol"), and
+    /// an argument string that is not a JSON object becomes `{}`.
+    pub(crate) fn tool_calls(calls: &[Value]) -> Value {
+        Value::Array(
+            calls
+                .iter()
+                .map(|tc| {
+                    let f = tc.get("function").unwrap_or(tc);
+                    let args = match f.get("arguments") {
+                        Some(Value::String(s)) => serde_json::from_str::<Value>(s).ok().filter(Value::is_object).unwrap_or_else(|| json!({})),
+                        Some(v @ Value::Object(_)) => v.clone(),
+                        _ => json!({}),
+                    };
+                    json!({"function": {"name": f.get("name").cloned().unwrap_or(Value::Null), "arguments": args}})
+                })
+                .collect(),
+        )
+    }
+
+    /// The coordinator's history for a directly dialled Ollama: every
+    /// message as it is (content, images, ids), except that an assistant's
+    /// tool calls take Ollama's shape ([`tool_calls`]) and a tool result's
+    /// `name` is also sent as Ollama's `tool_name`.
+    pub(crate) fn history(messages: &[Value]) -> Vec<Value> {
+        messages
+            .iter()
+            .map(|m| {
+                let mut out = m.clone();
+                if let Some(calls) = m.get("tool_calls").and_then(|t| t.as_array()) {
+                    out["tool_calls"] = tool_calls(calls);
+                }
+                if m.get("role").and_then(|r| r.as_str()) == Some("tool") && m.get("tool_name").is_none() {
+                    if let Some(name) = m.get("name") {
+                        out["tool_name"] = name.clone();
+                    }
+                }
+                out
+            })
+            .collect()
+    }
+
     /// An OpenAI chat body -> an Ollama `/api/chat` body. Ollama takes
     /// OpenAI's message and tool shapes except that a tool call's
     /// `arguments` is an object, not a string, and sampling options live
@@ -836,20 +879,7 @@ pub(crate) mod ollama {
                     "content": text_of(m.get("content")),
                 });
                 if let Some(calls) = m.get("tool_calls").and_then(|t| t.as_array()) {
-                    out["tool_calls"] = Value::Array(
-                        calls
-                            .iter()
-                            .map(|tc| {
-                                let f = tc.get("function").unwrap_or(tc);
-                                let args = match f.get("arguments") {
-                                    Some(Value::String(s)) => serde_json::from_str::<Value>(s).ok().filter(Value::is_object).unwrap_or_else(|| json!({})),
-                                    Some(v @ Value::Object(_)) => v.clone(),
-                                    _ => json!({}),
-                                };
-                                json!({"function": {"name": f.get("name").cloned().unwrap_or(Value::Null), "arguments": args}})
-                            })
-                            .collect(),
-                    );
+                    out["tool_calls"] = tool_calls(calls);
                 }
                 if let Some(id) = m.get("tool_call_id") {
                     out["tool_call_id"] = id.clone();

@@ -465,6 +465,13 @@ without most of its instructions. The console and `noo chat` say so under the
 answer; the gateway logs `context_truncated_by_backend` and alerts the operator
 once a day per backend.
 
+A turn whose instructions and question cannot fit the backend's context gets
+one `error` line naming that context and, for Ollama or vLLM, the command that
+switches model with its backend named (`noo models switch <model> --backend
+ollama`). A backend's refusal reaches the person as `Backend error: <status>:
+<sentence>`, the sentence taken from either the OpenAI (`{"error":{"message":..}}`)
+or the Ollama (`{"error":".."}`) body, never the JSON itself.
+
 `working` comes only from a turn a node harness runs on a vendor kind
 (Copilot, Claude Code, Codex): the model's text as the harness's translator
 relays it, reasoning and planning included, batched about every 300 ms and
