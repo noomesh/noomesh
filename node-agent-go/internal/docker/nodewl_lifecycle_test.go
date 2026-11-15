@@ -277,7 +277,7 @@ func TestReleaseDrainsThenStopsThenRecreatesFreshAndStopped(t *testing.T) {
 	if c := h.api.ctr(wName); c == nil || c.Running || c.Status != "created" {
 		t.Fatalf("worker after release = %+v, want created and stopped", c)
 	}
-	if _, ok := h.api.created[wName].Config.Labels[LabelReservation]; ok {
+	if _, ok := h.api.created[wName].Config.Labels["noo.reservation"]; ok {
 		t.Errorf("a released workload still carries a reservation label")
 	}
 	if r := h.row(); r.State != nodewl.StateProvisioned || r.Ready || r.Reservation != "" || r.Reason != "" {
@@ -608,5 +608,129 @@ func TestAReadyLeafAndAnUnreachableRailEndAsImageUnavailable(t *testing.T) {
 	cur, _ := h.p.read(e.Addon, e.Name)
 	if cur.reason != nodewl.ReasonImageUnavailable {
 		t.Fatalf("a ready leaf and a refused rail left the row saying %q, want image_unavailable", cur.reason)
+	}
+}
+
+// creates counts the container creates and removes in calls.
+func creates(calls []string) (n int) {
+	for _, c := range calls {
+		if strings.HasPrefix(c, "create:") || strings.HasPrefix(c, "rm:") {
+			n++
+		}
+	}
+	return n
+}
+
+// 0.6.25-rc.3: the reservation id was a label, labels are in the spec hash,
+// so every reserve tore down and rebuilt the door and the worker before
+// starting them. A reserve after provision now only starts the pair: the
+// same containers (no remove, no create) and the same spec hash.
+func TestAReserveAfterProvisionOnlyStartsThePair(t *testing.T) {
+	h := newLife(t)
+	h.door.status("GET", "/health/ready", 200)
+	h.p.Converge(context.Background(), h.provisioned())
+	if r := h.row(); r.State != nodewl.StateProvisioned {
+		t.Fatalf("not provisioned: %+v", r)
+	}
+	before := len(h.api.callList())
+	hashW, hashD := h.api.ctr(wName).Labels[SpecHashLabel], h.api.ctr(dName).Labels[SpecHashLabel]
+	if err := h.p.StartManaged(context.Background(), h.running()); err != nil {
+		t.Fatal(err)
+	}
+	after := h.api.callList()[before:]
+	if n := creates(after); n != 0 {
+		t.Fatalf("the reserve removed or created containers: %v", after)
+	}
+	if indexOf(after, "start:"+dName) < 0 || indexOf(after, "start:"+wName) < 0 {
+		t.Fatalf("the reserve did not start the pair: %v", after)
+	}
+	if h.api.ctr(wName).Labels[SpecHashLabel] != hashW || h.api.ctr(dName).Labels[SpecHashLabel] != hashD {
+		t.Fatal("the spec hash changed on reserve")
+	}
+}
+
+// The reservation is not part of what the pair is made from.
+func TestTheReservationIsNotInTheSpecHash(t *testing.T) {
+	h := newLife(t)
+	in := func(e nodewl.Entry) string {
+		s, err := buildWorkloadSpecs(specInput{Entry: e, WorkerImage: "sha256:w", DoorImage: "sha256:d"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s.Hash
+	}
+	if in(h.running()) != in(h.provisioned()) {
+		t.Fatal("a reservation id changes the spec hash")
+	}
+	// A real change still does.
+	e := h.provisioned()
+	e.Env = map[string]string{"RHADDON_SLOTS": "2"}
+	if in(e) == in(h.provisioned()) {
+		t.Fatal("an env change left the spec hash unchanged")
+	}
+}
+
+// A real spec change on a stopped pair still rebuilds it.
+func TestARealSpecChangeStillRebuildsAStoppedPair(t *testing.T) {
+	h := newLife(t)
+	h.p.Converge(context.Background(), h.provisioned())
+	before := len(h.api.callList())
+	e := h.provisioned()
+	e.Env = map[string]string{"RHADDON_SLOTS": "2"}
+	h.p.Converge(context.Background(), e)
+	after := h.api.callList()[before:]
+	if indexOf(after, "rm:"+wName) < 0 || indexOf(after, "create:"+wName) < 0 || indexOf(after, "create:"+dName) < 0 {
+		t.Fatalf("a changed spec did not rebuild the pair: %v", after)
+	}
+}
+
+// One failed start is retried once after a short wait; the workload runs.
+func TestAFailedStartIsRetriedOnce(t *testing.T) {
+	h := newLife(t)
+	h.p.lc.startRetry = time.Millisecond
+	h.door.status("GET", "/health/ready", 200)
+	h.api.mu.Lock()
+	h.api.startFail = map[string]int{dName: 1}
+	h.api.mu.Unlock()
+	if err := h.p.StartManaged(context.Background(), h.running()); err != nil {
+		t.Fatalf("the retry should have started it: %v", err)
+	}
+	calls := h.api.callList()
+	n := 0
+	for _, c := range calls {
+		if c == "start:"+dName {
+			n++
+		}
+	}
+	if n != 2 {
+		t.Fatalf("door starts = %d, want 2 (one retry): %v", n, calls)
+	}
+	if st, _ := h.p.ManagedStatus(context.Background(), "rhaddon", "worker"); !st.Running {
+		t.Fatalf("not running after the retry: %+v", st)
+	}
+}
+
+// A start that fails twice is refused (no third try), naming both errors.
+func TestAStartThatFailsTwiceIsRefusedAfterOneRetry(t *testing.T) {
+	h := newLife(t)
+	h.p.lc.startRetry = time.Millisecond
+	h.api.mu.Lock()
+	h.api.startFail = map[string]int{wName: 5}
+	h.api.mu.Unlock()
+	err := h.p.StartManaged(context.Background(), h.running())
+	if err == nil {
+		t.Fatal("a start that failed twice was not refused")
+	}
+	if !strings.Contains(err.Error(), "retried once") || !strings.Contains(err.Error(), "cgroup") {
+		t.Fatalf("error = %v", err)
+	}
+	n := 0
+	for _, c := range h.api.callList() {
+		if c == "start:"+wName {
+			n++
+		}
+	}
+	if n != 2 {
+		t.Fatalf("worker starts = %d, want exactly 2", n)
 	}
 }
