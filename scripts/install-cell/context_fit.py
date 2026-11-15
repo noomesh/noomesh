@@ -370,8 +370,22 @@ def judge_tool(text: str, tool_names: list[str], fact_rx: str = TOOL_FACT):
 RAW_BACKEND_ERROR_RX = re.compile(r'Backend error: \d+: *[{\[]|\{\s*"error"\s*:')
 
 
+def auth_refused(error: str | None) -> bool:
+    """The turn never ran because the gateway refused the cell's OWN credential
+    (ws_chat.AuthRefused, or a raw HTTP 401 from an older helper): a harness
+    fault. Judges report it as itself, never as something about the build
+    (0.6.25-rc.4 run 1 called it "no wire=")."""
+    return bool(error) and ("auth 401" in error or "HTTP Error 401" in error)
+
+
+def auth_why(error: str) -> str:
+    return f"auth 401: the cell's own credential was refused, so the turn never ran (a harness fault, not the build): {_excerpt(error)}"
+
+
 def judge_tool_replay(text: str, error: str | None, tool_names: list[str], facts: dict, model_mode: str):
     """(rc, reason) for the tool-replay judge (see the module doc)."""
+    if not text.strip() and auth_refused(error):
+        return NOT_JUDGED, auth_why(error)
     seen = f"{text}\n{error or ''}"
     raw = RAW_BACKEND_ERROR_RX.search(seen)
     if not facts["readable"]:
@@ -606,7 +620,7 @@ def chat_turn(prompt: str, base: str, timeout: float = 300) -> dict:
     parts: list[str] = []
     try:
         ctx = ssl.create_default_context(cafile=ws.cluster_ca())
-        ticket = ws.mint_ticket(base, ws.token(), ctx)
+        ticket = ws.ticket(base, ctx)
         u = urllib.parse.urlsplit(base)
         s = ctx.wrap_socket(socket.create_connection((u.hostname, u.port or 443), timeout=30), server_hostname=u.hostname)
         key = base64.b64encode(os.urandom(16)).decode()
@@ -775,7 +789,9 @@ def cmd_turns(a) -> int:
             print(summary_line(turns[-1]))
             continue
         chat, facts, secs = timed_turn(prompt, a.gateway, a.turn_timeout)
-        if chat["error"] and not chat["text"] and not chat["approval"]:
+        if chat["error"] and not chat["text"] and auth_refused(chat["error"]):
+            verdict, reason = None, auth_why(chat["error"])
+        elif chat["error"] and not chat["text"] and not chat["approval"]:
             verdict, reason = False, f"the turn failed: {chat['error']}"
         elif chat["done"] and chat["done"].get("cached") and name in ("tool", "refusal"):
             verdict, reason = None, "answered from the gateway's cache: no model call to judge"
@@ -798,7 +814,9 @@ def cmd_turns(a) -> int:
 def cmd_doesnt_fit(a) -> int:
     prompt = filler(a.chars) + "\n\nQuestion: in one sentence, what is the text above about?"
     chat, facts, secs = timed_turn(prompt, a.gateway, a.turn_timeout)
-    if chat["error"] and not chat["text"]:
+    if chat["error"] and not chat["text"] and auth_refused(chat["error"]):
+        rc, why = NOT_JUDGED, auth_why(chat["error"])
+    elif chat["error"] and not chat["text"]:
         rc, why = judge_refusal_error(chat["error"], [c["name"] for c in chat["calls"]], facts, a.expect_backend)
     else:
         rc, why = judge_doesnt_fit(chat["text"], [c["name"] for c in chat["calls"]], facts)
@@ -809,7 +827,9 @@ def cmd_doesnt_fit(a) -> int:
 
 def cmd_pinned(a) -> int:
     chat, facts, secs = timed_turn(PINNED_QUESTION, a.gateway, a.turn_timeout)
-    if chat["error"] and not chat["text"]:
+    if chat["error"] and not chat["text"] and auth_refused(chat["error"]):
+        rc, why = NOT_JUDGED, auth_why(chat["error"])
+    elif chat["error"] and not chat["text"]:
         rc, why = FAIL, f"the turn failed: {chat['error']}"
     else:
         rc, why = judge_pinned(chat["text"], [c["name"] for c in chat["calls"]], facts, chat["done"])
