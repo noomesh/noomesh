@@ -466,7 +466,9 @@ holds it.
 has grown, an operator can go through every document, decide whether its
 audience is right, and change it. The tools are `noo rag docs`, `noo rag doc`
 and `noo rag retag` (and the MCP tools `noo_docs_list`, `noo_doc_detail`,
-`noo_rag_retag`, operator door only).
+`noo_rag_retag`, operator door only). Chat answers draw only on your own, `company`, `system` and team
+documents; `admin`-only documents are reached by `noo rag query` or by a tool
+the assistant calls, never by chat's automatic context.
 
 1. **Backfill** anything untagged to `admin`, which is what its visibility
    already was (the two commands above, ending in `--apply`).
