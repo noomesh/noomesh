@@ -256,6 +256,23 @@ pub(crate) fn node_workload_refusal(record: &Value, addon: &str, name: &str, nod
                  noo cluster provision {node}; nothing was held"
             )));
         }
+        // The node cannot reach the rail its image comes from: the leaf is
+        // not the problem, so the door-leaf remedy must not be printed
+        // (0.6.25-rc.2, A-nodewl.reserve).
+        if reason == crate::node_workloads::code::IMAGE_UNAVAILABLE {
+            return Some(AppError::Conflict(format!(
+                "{reason}: {node} cannot fetch {key}'s image from the controller's rail (its agent reports {reason}). \
+                 Check that {node} reaches the controller's model-cache rail on port 8443: noo cluster verify {node} \
+                 (a controller with NOO_BIND_MODE=local publishes it on 127.0.0.1 only); the agent retries on its own; \
+                 nothing was held"
+            )));
+        }
+        if reason == crate::node_workloads::code::PROVISION_FAILED {
+            return Some(AppError::Conflict(format!(
+                "{reason}: {node} could not provision {key} (its agent reports {reason}); its agent log has the error: \
+                 noo cluster logs {node} agent; nothing was held"
+            )));
+        }
         return Some(AppError::Conflict(format!("{reason}: {node} cannot run {key} (its agent reports {reason}); nothing was held")));
     }
     if row.get("state").and_then(Value::as_str) == Some("needs_attention") {
@@ -1490,6 +1507,28 @@ mod tests {
             Some(AppError::Conflict(m)) => assert!(m.starts_with("consent_unapproved: rhx-node2 cannot run rhaddon/echo (its agent reports consent_unapproved)") && !m.contains("heartbeat"), "{m}"),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// image_unavailable and provision_failed name their own remedy and never
+    /// the door-leaf one; a code the gateway does not know keeps the plain
+    /// wording (an agent newer than this gateway).
+    #[test]
+    fn image_unavailable_and_provision_failed_name_their_own_remedy() {
+        let row = |reason: &str| json!({"node_workloads": [{"addon": "rhaddon", "name": "echo", "state": "absent", "ready": false, "door_port": 0, "reason": reason}]});
+        let msg = |reason: &str| match node_workload_refusal(&row(reason), "rhaddon", "echo", "rhx-node2") {
+            Some(AppError::Conflict(m)) => m,
+            other => panic!("{reason} must stay a refusal, got {other:?}"),
+        };
+        let img = msg("image_unavailable");
+        assert!(img.starts_with("image_unavailable: rhx-node2 cannot fetch rhaddon/echo's image from the controller's rail"), "{img}");
+        assert!(img.contains("port 8443") && img.contains("noo cluster verify rhx-node2") && img.ends_with("nothing was held"), "{img}");
+        let prov = msg("provision_failed");
+        assert!(prov.starts_with("provision_failed: rhx-node2 could not provision rhaddon/echo") && prov.contains("noo cluster logs rhx-node2 agent"), "{prov}");
+        for m in [&img, &prov] {
+            assert!(!m.contains("door leaf") && !m.contains("noo cluster provision"), "the door-leaf remedy must not be printed: {m}");
+        }
+        let unknown = msg("some_future_code");
+        assert_eq!(unknown, "some_future_code: rhx-node2 cannot run rhaddon/echo (its agent reports some_future_code); nothing was held");
     }
 
     /// A refused node workload reaches nothing on the node: the link points
