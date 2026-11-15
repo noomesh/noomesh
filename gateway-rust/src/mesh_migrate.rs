@@ -4341,8 +4341,11 @@ mod request_trace_ttft_migration_tests {
         for col in ["holder text", "reserved_at timestamptz"] {
             assert!(m.sql.contains(&format!("ALTER TABLE noo_node_workload_placements ADD COLUMN IF NOT EXISTS {col};")), "{col}");
         }
-        assert!(m.sql.contains("to_regclass('noo_node_workload_placements')"));
-        for banned in ["DEFAULT", "NOT NULL", "DROP", "DELETE", "UPDATE"] {
+        assert!(m.sql.contains("to_regclass('noo_node_workload_placements') IS NOT NULL"));
+        // Exactly the two column adds above, each ending at its type: no
+        // NOT NULL or DEFAULT on them (the guard's IS NOT NULL is the table's).
+        assert_eq!(m.sql.matches("ADD COLUMN").count(), 2, "only the two nullable columns");
+        for banned in ["DEFAULT", "DROP", "DELETE", "UPDATE"] {
             assert!(!m.sql.contains(banned), "{banned}: the holder columns only add nullable columns");
         }
     }
