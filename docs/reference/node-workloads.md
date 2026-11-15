@@ -485,6 +485,25 @@ re-check of the decl (inside a desired-config entry) is **shape only**
 as an input and a nil input skips only the existence and internal check. It is
 carried in desired-config only as part of the verbatim `decl`.
 
+## A CPU workload holds no GPU
+
+A reservation of a node workload declared `accel.gpu` 0 takes **no GPU
+lease**: nothing on the node drains or pauses, and the node's chat and embed
+backends keep serving while the workload runs. The reservation lives on the
+workload's placement row instead (`reservation`, `holder`, `reserved_at`,
+migration 124), and `noo cluster reservations` lists it with `gpu` `no`.
+Release follows the same rule as a GPU reservation: the holder, or anyone with
+`--force` (audited). A GPU workload (`accel.gpu` > 0) still takes its drain
+hold exactly as before.
+
+Rolling back to a gateway older than 0.6.25: **release every CPU-workload
+reservation first** (`noo cluster reservations`, then `noo cluster release
+<id>` for each with `gpu` `no`). An older gateway lists reservations only from
+GPU leases, so it does not see one held on a placement row. The node agent
+keeps running the workload from its placement row, and an older gateway's
+release of that id answers `no reservation <id>`; set the placement back with
+the new gateway, or remove and re-place the workload.
+
 ## State machine
 
 | State | Meaning |

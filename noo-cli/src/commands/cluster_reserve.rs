@@ -68,7 +68,7 @@ pub fn cluster_reserve(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
     if !g.json {
         println!("{}", ui::muted(&format!(
-            "{}: reserving a GPU{} — the pool's work there finishes first (up to {timeout} s), then the workload starts",
+            "{}: reserving{} — a GPU workload waits up to {timeout} s for the pool's work there to finish; a CPU workload starts at once",
             a.workload,
             a.node.as_deref().map(|n| format!(" on {n}")).unwrap_or_default()
         )));
@@ -86,6 +86,11 @@ pub fn cluster_reserve(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let node = resp["node"].as_str().unwrap_or("?");
     let paused = resp["paused_backends"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default();
     match resp["status"].as_str().unwrap_or("") {
+        "reserved" if resp["gpu"] == Value::Bool(false) => {
+            ui::done(&format!("{}: reserved on {node} — {} running (a CPU workload: no GPU is held; the node's backends keep serving)",
+                a.workload,
+                resp["worker"]["container"].as_str().unwrap_or("the workload")));
+        }
         "reserved" => {
             ui::done(&format!("{}: reserved on {node} — {} running; the pool's {} paused",
                 a.workload,
@@ -96,7 +101,11 @@ pub fn cluster_reserve(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             ui::warned(&format!("{}: reservation {id} on {node} is {other} — {}", a.workload, resp["detail"].as_str().unwrap_or("")));
         }
     }
-    println!("{}", ui::muted(&format!("reservation {id} (generation {})", resp["lease"]["generation"].as_u64().unwrap_or(0))));
+    if resp["gpu"] == Value::Bool(false) {
+        println!("{}", ui::muted(&format!("reservation {id} (no GPU lease: it is held on the workload's placement)")));
+    } else {
+        println!("{}", ui::muted(&format!("reservation {id} (generation {})", resp["lease"]["generation"].as_u64().unwrap_or(0))));
+    }
     let release = format!("noo cluster release {id}");
     ui::guide(&[
         (release.as_str(), "drains the workload, stops it and returns the GPU to the pool"),
@@ -138,11 +147,13 @@ pub fn cluster_reservations(g: &Globals, args: &[String]) -> Result<i32, Unhandl
                 r["holder"].as_str().unwrap_or("?").to_string(),
                 r["node"].as_str().unwrap_or("?").to_string(),
                 state,
+                // A gateway before 0.6.25 sends no `gpu`: every reservation was a GPU lease.
+                if r["gpu"] == Value::Bool(false) { "no".to_string() } else { "yes".to_string() },
                 r["since"].as_str().unwrap_or("").to_string(),
             ]
         })
         .collect();
-    println!("{}", ui::table(&[Col::left("reservation"), Col::left("workload"), Col::left("holder"), Col::left("node"), Col::left("state"), Col::left("since")], &rows));
+    println!("{}", ui::table(&[Col::left("reservation"), Col::left("workload"), Col::left("holder"), Col::left("node"), Col::left("state"), Col::left("gpu"), Col::left("since")], &rows));
     ui::guide(&[("noo cluster release <reservation-id>", "returns that GPU to the pool")]);
     Ok(0)
 }

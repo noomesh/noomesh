@@ -2493,6 +2493,24 @@ BEGIN
     END IF;
 END $$
 "#,
+}, Migration {
+    revision: NODE_WORKLOAD_HOLDER_REVISION,
+    down_revision: Some(PLACEMENT_KEEP_WARM_REVISION),
+    // A node workload declared accel.gpu 0 is reserved WITHOUT a GPU lease
+    // (0.6.25-rc.3 rehearsal: its drain hold stopped every lane of a CPU
+    // node), so its placement row carries who holds the reservation and
+    // since when; the GPU path keeps the lease as before. Both nullable and
+    // additive (no default, no rewrite): a 0.6.24 row reads back NULL, which
+    // is "no one holds it". Guarded by to_regclass like 087/088.
+    sql: r#"
+DO $$
+BEGIN
+    IF to_regclass('noo_node_workload_placements') IS NOT NULL THEN
+        ALTER TABLE noo_node_workload_placements ADD COLUMN IF NOT EXISTS holder text;
+        ALTER TABLE noo_node_workload_placements ADD COLUMN IF NOT EXISTS reserved_at timestamptz;
+    END IF;
+END $$
+"#,
 }];
 
 /// Add-on feature settings and the super-admin flag (f99). A constant so a
@@ -2555,6 +2573,11 @@ pub const REQUEST_TRACE_TTFT_REVISION: &str = "122_request_trace_ttft";
 /// columns (122): numbered at rebase against dev's real head. A constant so a
 /// renumber is one line.
 pub const PLACEMENT_KEEP_WARM_REVISION: &str = "123_placement_keep_warm";
+
+/// `holder` and `reserved_at` on a node-workload placement (a CPU workload's
+/// reservation lives on its row, not a GPU lease), on 123: numbered at rebase
+/// against dev's real head. A constant so a renumber is one line.
+pub const NODE_WORKLOAD_HOLDER_REVISION: &str = "124_node_workload_holder";
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
 /// constant so a renumber at rebase is one line.
