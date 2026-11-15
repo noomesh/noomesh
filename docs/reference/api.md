@@ -276,6 +276,19 @@ Every chat answer says what served it:
 | non-streaming body | `noo: {"class": "chat-default", "served_model": "gemma4:12b", "fallback": true}` beside the OpenAI fields |
 | streaming | the first `data:` frame is an ordinary `chat.completion.chunk` with `"choices": []` and the `noo` object (the shape of vLLM's usage frame); the chunks follow unchanged. `/v1/responses` streams send no extra event — the headers carry it |
 
+A prompt longer than an Ollama's decided context is cut by Ollama (it keeps
+the head and the last half) and answered anyway. The gateway reads the cut
+off the backend's own count and says so; it does not refuse the request by
+default:
+
+| Where | What |
+|---|---|
+| non-streaming | header `X-Noo-Context-Truncated: <evaluated>/<sent_estimate>/<context>` and `usage.noo_truncated: {"evaluated", "sent_estimate", "context"}` beside the backend's own usage |
+| streaming | the headers are gone when the count arrives, so only the metric and the log carry it |
+| every cut | the metric `noo_context_truncated_total{consumer, model}`, and one warn log (`raw_chat_context_truncated`) per caller and model per hour, with no prompt text |
+
+A vLLM backend never cuts: it refuses an over-long prompt itself.
+
 `fallback: true` means the answering candidate was not the class's first
 choice. Nothing on this surface names a node, an address or a URL — the
 headers are informational and are never accepted as credentials or

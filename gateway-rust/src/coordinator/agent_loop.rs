@@ -1174,7 +1174,8 @@ fn parse_text_tool_calls(text: &str) -> Option<Value> {
 // ═══════════════════════════════════════════════════════════════
 
 /// Estimate token count for a set of messages (~2.5 chars/token, conservative).
-fn estimate_tokens(messages: &[Value]) -> usize {
+/// The raw proxy's cut watch (`context_cut`) uses the same estimate.
+pub(crate) fn estimate_tokens(messages: &[Value]) -> usize {
     let mut total = 0;
     for m in messages {
         let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
