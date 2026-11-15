@@ -625,6 +625,8 @@ The agent's fixed vocabulary for the `reason` of a `node_workloads` or
 | `crashed` | the worker exited while it should run, or during a drain (it is then recreated fresh and stopped) | read the worker's logs |
 | `drain_timeout` | the drain did not finish in `drain.timeout_secs`; reported as `needs_attention` | wait; the session is never cut |
 | `door_unreachable` | the host cannot route the agent to an internal Docker network (not Linux, e.g. macOS Docker Desktop) and the no-egress rule does not bend | place on a Linux node |
+| `image_unavailable` | the workload's image tar is on the rail but this node could not fetch it (the controller's rail, `https://<controller>:8443/images/`, unreachable, refused or timed out); the agent retries after 30 s, then 1, 2, 4 and every 5 min | check that the node reaches the controller's model-cache rail on 8443 (`noo cluster verify <node>`); a local-bind controller (`NOO_BIND_MODE=local`) publishes it on 127.0.0.1 only |
+| `provision_failed` | provisioning failed with an error that has no code of its own (docker refused a call, a file could not be written); the agent's log has the error | read the node agent's log (`noo cluster logs <node> agent`) |
 
 The placement facts (`consent_none`, `consent_unapproved`, `nvidia_runtime_missing`, `driver_caps_missing`, `compute_cap_low`, `arch_mismatch`, `controller_host`, `disk`) are also the gateway's placement refusal codes, spelled identically: the gateway refuses a placement with the code the agent would report.
 

@@ -386,8 +386,13 @@ func (p *NodeWorkloads) refused(e nodewl.Entry, err error) {
 	}
 	code := nodewl.CodeOf(err)
 	if code == "" {
-		slog.Warn("node workload: not converged", "addon", e.Addon, "workload", e.Name, "error", err)
-		return
+		// An error with no code of its own still ends this attempt: the row
+		// must say so. Dropping it (0.6.25-rc.2) left an EARLIER reason in
+		// place: a refused image fetch kept reporting door_leaf_missing, sent
+		// the user to re-provision for nothing, and held the leaf watch in a
+		// 5-second loop.
+		code = nodewl.ReasonProvisionFailed
+		slog.Warn("node workload: not converged", "addon", e.Addon, "workload", e.Name, "reason", code, "error", scrubURLs(err.Error()))
 	}
 	p.with(e.Addon, e.Name, func(ls *lifeState) { ls.reason = code })
 }

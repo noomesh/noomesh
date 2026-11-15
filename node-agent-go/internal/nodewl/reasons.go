@@ -41,6 +41,13 @@ const (
 	ReasonCrashed              = "crashed"
 	ReasonDrainTimeout         = "drain_timeout" // reported as needs_attention
 	ReasonDoorUnreachable      = "door_unreachable"
+	// ReasonImageUnavailable: the workload's image tar could not be fetched
+	// from the controller's rail (unreachable, refused, timed out). The tar is
+	// known to the rail; the node cannot reach it.
+	ReasonImageUnavailable = "image_unavailable"
+	// ReasonProvisionFailed: provisioning failed with an error that has no
+	// code of its own (docker refused a call, a file could not be written).
+	ReasonProvisionFailed = "provision_failed"
 )
 
 // Reasons is every reason, in the order the contract document lists them.
@@ -51,4 +58,5 @@ var Reasons = []string{
 	ReasonDriverCapsMissing, ReasonComputeCapLow, ReasonArchMismatch, ReasonControllerHost,
 	ReasonAdmitInvalid, ReasonEnvOutOfBounds, ReasonContainerConflict, ReasonStartTimeout,
 	ReasonCrashed, ReasonDrainTimeout, ReasonDoorUnreachable,
+	ReasonImageUnavailable, ReasonProvisionFailed,
 }
