@@ -10,6 +10,7 @@ say so instead of being cut.
     context_fit.py turns --out DIR [--model-label X]
     context_fit.py doesnt-fit [--chars N]
     context_fit.py pinned-check
+    context_fit.py tool-replay
 
   running      `noo --json cluster show <node>` (node = this hostname, as
                run.sh's agent dump uses) and its `chat_contexts` array
@@ -41,6 +42,18 @@ say so instead of being cut.
                could not be read, or the turn fits by the gateway's own
                rule (need x ratio <= window; the reason names how many
                characters would overflow it). FAIL otherwise.
+  tool-replay  one tool turn (the noo_rag_query question), judged on what
+               the person sees: FAIL when a raw backend error reached them
+               (`Backend error: <status>: {...}` or a `{"error"` body; on any
+               model, tiny included, since it is the product's words, not
+               the model's), or the turn failed outright; else the tool turn's
+               own verdict (a content miss on MODEL=tiny is a NOTE). NOT
+               JUDGED on a build whose backend_call lines carry no wire= (the
+               build before the direct-Ollama replay fix; a raw error seen
+               there is printed as the before evidence), or when the log
+               could not be read. The verdict names the wire: "ollama" is a
+               directly dialled Ollama (the WSL2 one-box), the path the fix
+               is for.
   pinned-check after the cell pinned the chat context to 4096: one tool
                turn whose request_size says tier=Compact, whose answer kept
                the question, and during which no
@@ -343,6 +356,28 @@ def judge_tool(text: str, tool_names: list[str], fact_rx: str = TOOL_FACT):
             return None, "answered from retrieval without calling noo_rag_query: the tool path was not exercised"
         return False, "no noo_rag_query call and no fact in the answer"
     return False, "noo_rag_query was called but the answer does not carry the fact: " + _excerpt(text)
+
+
+RAW_BACKEND_ERROR_RX = re.compile(r'Backend error: \d+: *[{\[]|\{\s*"error"\s*:')
+
+
+def judge_tool_replay(text: str, error: str | None, tool_names: list[str], facts: dict, model_mode: str):
+    """(rc, reason) for the tool-replay judge (see the module doc)."""
+    seen = f"{text}\n{error or ''}"
+    raw = RAW_BACKEND_ERROR_RX.search(seen)
+    if not facts["readable"]:
+        return NOT_JUDGED, "the gateway log could not be read"
+    wires = sorted({str(c["wire"]) for c in facts["backend_calls"] if c.get("wire")})
+    if not wires:
+        before = f"; the raw error it showed: {_excerpt(seen.strip())}" if raw else ""
+        return NOT_JUDGED, f"this build's backend_call lines carry no wire= (before the direct-Ollama replay fix){before}"
+    on = f" (wire {', '.join(wires)})"
+    if raw:
+        return FAIL, "a raw backend error reached the person" + on + ": " + _excerpt(seen.strip())
+    if error and not text.strip():
+        return FAIL, f"the turn failed{on}: {_excerpt(error)}"
+    verdict, reason = tiny_note(*judge_tool(text, tool_names), model_mode)
+    return {True: PASS, False: FAIL, None: NOT_JUDGED}[verdict], reason + on
 
 
 def judge_refusal(text: str, calls: list[dict], approval: bool):
@@ -697,6 +732,16 @@ def cmd_pinned(a) -> int:
     return rc
 
 
+def cmd_tool_replay(a) -> int:
+    chat, facts, secs = timed_turn(TOOL_QUESTION, a.gateway, a.turn_timeout)
+    rc, why = judge_tool_replay(chat["text"], chat["error"], [c["name"] for c in chat["calls"]], facts,
+                                os.environ.get("MODEL", "default"))
+    print(f"  reply ({secs:.1f} s, tools: {', '.join(c['name'] or '?' for c in chat['calls']) or 'none'}): "
+          f"{_excerpt(chat['text'] or chat['error'] or '', 300)}")
+    print(f"CONTEXT-FIT tool-replay: {NAMES[rc]}: {why}")
+    return rc
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="The rc.2 context-fit judges (exit 0 PASS, 1 FAIL, 2 NOT JUDGED).")
     ap.add_argument("--gateway", default=os.environ.get("NOO_GATEWAY_URL") or "https://localhost:8080")
@@ -712,9 +757,10 @@ def main(argv: list[str] | None = None) -> int:
     d = sub.add_parser("doesnt-fit", help="a turn too big for the window says so")
     d.add_argument("--chars", type=int, default=60000)
     sub.add_parser("pinned-check", help="a tool turn on the 4096 pin: Compact tier, no cut, question kept")
+    sub.add_parser("tool-replay", help="a tool turn answers; a raw backend error never reaches the person")
     a = ap.parse_args(argv)
     return {"running": cmd_running, "turns": cmd_turns, "doesnt-fit": cmd_doesnt_fit,
-            "pinned-check": cmd_pinned}[a.cmd](a)
+            "pinned-check": cmd_pinned, "tool-replay": cmd_tool_replay}[a.cmd](a)
 
 
 if __name__ == "__main__":

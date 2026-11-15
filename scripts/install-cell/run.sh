@@ -515,6 +515,9 @@ judged_ctx() {  # step name, timeout, context_fit.py args...
 }
 judged_ctx context-fit-running 300 running
 judged_ctx context-fit-turns 900 turns --out "$OUT/context-fit" --model-label "$MODEL"
+# A tool turn never shows the person a raw backend error (every cell; the
+# WSL2 one-box dials Ollama directly, where a replayed tool call was refused).
+judged_ctx context-fit-tool-replay 600 tool-replay
 if [ "$CELL" = "$CONTEXT_PIN_CELL" ] && [ -f "$CONTEXT_FIT" ]; then
     CHAT_MODEL="$(fresh --json cluster show "$(hostname)" 2>/dev/null | python3 -c 'import json, sys; print((json.load(sys.stdin).get("running_backends") or {}).get("ollama", ""))' 2>/dev/null)"
     CHAT_MODEL="${CHAT_MODEL:-$( [ "$MODEL" = tiny ] && echo "$TINY_MODEL" || echo gemma4:e2b)}"

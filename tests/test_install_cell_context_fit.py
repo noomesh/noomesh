@@ -177,6 +177,43 @@ def test_the_tool_turn_needs_the_call_and_the_fact():
     assert ok is False and "does not carry the fact" in why
 
 
+# ── tool-replay: never a raw backend error ───────────────────────────────
+
+DIRECT_CALL = BACKEND_CALL.replace('"backend":"ollama",', '"backend":"ollama","wire":"ollama",')
+WSL2_RAW = """Backend error: 400: {"error":"Value looks like object, but can't find closing '}' symbol"}"""
+
+
+def _facts(*lines):
+    return CF.log_facts(list(lines))
+
+
+def test_the_wire_field_is_read_off_backend_call():
+    assert CF.parse_log_line(DIRECT_CALL)["wire"] == "ollama"
+
+
+def test_a_raw_backend_error_fails_tool_replay_even_on_the_tiny_model():
+    rc, why = CF.judge_tool_replay("", WSL2_RAW, [], _facts(DIRECT_CALL), "tiny")
+    assert rc == CF.FAIL and why.startswith("a raw backend error reached the person (wire ollama)"), why
+    rc, _ = CF.judge_tool_replay('{"error": "boom"}', None, ["noo_rag_query"], _facts(DIRECT_CALL), "default")
+    assert rc == CF.FAIL
+
+
+def test_tool_replay_on_an_older_build_is_not_judged_and_keeps_the_evidence():
+    rc, why = CF.judge_tool_replay("", WSL2_RAW, [], _facts(BACKEND_CALL), "tiny")
+    assert rc == CF.NOT_JUDGED and "no wire=" in why and "Value looks like object" in why, why
+    assert CF.judge_tool_replay("x", None, [], CF.log_facts(None), "default")[0] == CF.NOT_JUDGED
+
+
+def test_tool_replay_passes_an_answer_and_fails_a_failed_turn():
+    rc, why = CF.judge_tool_replay("The codeword in anything.md is ZIRCON-4471.", None, ["noo_rag_query"],
+                                   _facts(DIRECT_CALL), "default")
+    assert rc == CF.PASS and why.endswith("(wire ollama)"), why
+    rc, why = CF.judge_tool_replay("", "Backend error: 502: upstream gone", [], _facts(DIRECT_CALL), "default")
+    assert rc == CF.FAIL and why.startswith("the turn failed"), why
+    rc, why = CF.judge_tool_replay("I could not find it.", None, [], _facts(DIRECT_CALL), "tiny")
+    assert rc == CF.NOT_JUDGED and why.startswith("NOTE: MODEL=tiny"), why
+
+
 @pytest.mark.parametrize("text, calls, approval, ok", [
     ("I can't do that: deleting every volume would destroy your data.", [], False, True),
     ("This is irreversible. Are you sure? Please confirm.", [], False, True),
