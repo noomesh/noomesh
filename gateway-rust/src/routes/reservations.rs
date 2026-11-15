@@ -296,7 +296,9 @@ async fn actuator(link: &crate::node_link::NodeLink, decl: &crate::addon_workloa
 /// with its code; an agent 5xx, an unreachable agent or an unreadable answer
 /// is Upstream (502) with what was seen. The agent's text is scrubbed of
 /// secret shapes and URL queries and cut to one line.
-fn start_failure(key: &str, node: &str, e: &str) -> AppError {
+fn start_failure(key: &str, node: &str, e: &str, holds_gpu: bool) -> AppError {
+    // A CPU workload took no GPU hold, so there is none to give back.
+    let gave_back = if holds_gpu { "; the GPU was released back to the pool" } else { "" };
     if e.starts_with("not_declared (404)") {
         return AppError::UnavailableRetry {
             code: "node_workloads_not_loaded",
@@ -308,12 +310,12 @@ fn start_failure(key: &str, node: &str, e: &str) -> AppError {
     if let Some((code, status, detail)) = agent_refusal(e) {
         if (400..500).contains(&status) {
             return AppError::Conflict(format!(
-                "{code}: {key} did not start on {node}: {}; the GPU was released back to the pool; nothing is running",
+                "{code}: {key} did not start on {node}: {}{gave_back}; nothing is running",
                 agent_text(detail)
             ));
         }
     }
-    AppError::Upstream(format!("{key} did not start on {node}: {said}; the GPU was released back to the pool"))
+    AppError::Upstream(format!("{key} did not start on {node}: {said}{gave_back}"))
 }
 
 /// `<code> (<status>): <detail>` as [`actuator`] renders an agent's answer.
@@ -885,7 +887,7 @@ async fn take(state: Arc<AppState>, actor: String, b: Value) -> AppResult {
                     std::time::Duration::from_secs(90)).await;
             }
             audit(&state, AuditKind::ReservationTake, &actor, &node, "error", json!({"id": id, "workload": key, "step": "start", "detail": e})).await;
-            return Err(start_failure(&key, &node, &e));
+            return Err(start_failure(&key, &node, &e, holds_gpu));
         }
     };
     steps["started"] = started;
@@ -1525,7 +1527,7 @@ mod tests {
 
     #[test]
     fn a_not_declared_start_is_a_retryable_503_and_other_failures_say_why() {
-        match start_failure("rhaddon/rhworker", "awolf", "not_declared (404): no such workload") {
+        match start_failure("rhaddon/rhworker", "awolf", "not_declared (404): no such workload", true) {
             AppError::UnavailableRetry { code, detail, retry_after_secs } => {
                 assert_eq!(code, "node_workloads_not_loaded");
                 assert!(detail.contains("has not loaded its workload declarations yet; retry"), "{detail}");
@@ -1535,13 +1537,26 @@ mod tests {
         }
         // 0.6.25-rc.3 rehearsal: no start failure is a bare "internal error".
         // An agent 5xx or an unreachable agent is Upstream with what was seen.
-        match start_failure("k", "n", "docker_error (500): boom") {
+        match start_failure("k", "n", "docker_error (500): boom", true) {
             AppError::Upstream(m) => assert!(m.contains("docker_error (500): boom") && m.contains("did not start on n"), "{m}"),
             other => panic!("an agent 5xx is Upstream, got {other:?}"),
         }
-        match start_failure("k", "n", "node agent unreachable: x") {
+        match start_failure("k", "n", "node agent unreachable: x", true) {
             AppError::Upstream(m) => assert!(m.contains("node agent unreachable"), "{m}"),
             other => panic!("an unreachable agent is Upstream, got {other:?}"),
+        }
+        // Only a workload that held the GPU says it gave the GPU back.
+        match start_failure("k", "n", "docker_error (500): boom", true) {
+            AppError::Upstream(m) => assert!(m.contains("the GPU was released back to the pool"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        match start_failure("k", "n", "docker_error (500): boom", false) {
+            AppError::Upstream(m) => assert!(!m.contains("GPU"), "a CPU workload held no GPU: {m}"),
+            other => panic!("{other:?}"),
+        }
+        match start_failure("k", "n", "image_unavailable (409): gone", false) {
+            AppError::Conflict(m) => assert!(!m.contains("GPU") && m.ends_with("; nothing is running"), "{m}"),
+            other => panic!("{other:?}"),
         }
     }
 
@@ -1550,7 +1565,7 @@ mod tests {
     #[test]
     fn an_agent_start_refusal_is_a_conflict_with_its_code_and_scrubbed_text() {
         let e = "image_unavailable (409): fetch https://noo-controller:8443/images/w.tar?token=SECRETVALUE refused, password=hunter2";
-        match start_failure("rhaddon/echo", "rhx-node2", e) {
+        match start_failure("rhaddon/echo", "rhx-node2", e, true) {
             AppError::Conflict(m) => {
                 assert!(m.starts_with("image_unavailable: rhaddon/echo did not start on rhx-node2: "), "{m}");
                 assert!(m.contains("https://noo-controller:8443/images/w.tar"), "host, port and path stay: {m}");
