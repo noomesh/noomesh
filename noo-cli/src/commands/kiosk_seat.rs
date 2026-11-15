@@ -403,6 +403,31 @@ pub(crate) fn build_seat_bundle(
     Ok(bundle)
 }
 
+/// The installed display unit.
+pub(crate) const KIOSK_UNIT_PATH: &str = "/etc/systemd/system/kiosk.service";
+
+/// Does a kiosk.service give the broker its control-socket directory? A
+/// unit from before the broker (0.6.16) does not, and its display then
+/// cannot be reloaded ("no broker", `noo-kiosk-cdp` exit 6).
+pub(crate) fn unit_has_runtime_dir(unit: &str) -> bool {
+    unit.lines().any(|l| l.trim() == "RuntimeDirectory=kiosk")
+}
+
+/// This release's kiosk.service for a seat with these parameters: the unit
+/// the seat bundle carries (`seat_bundle_files`) and `seat-sync --migrate`
+/// installs.
+pub(crate) fn seat_kiosk_unit(p: &KioskParams) -> String {
+    super::kiosk::render_kiosk_service_in(&p.user, p.mode, p.vt, SEAT_KIOSK_DIR)
+}
+
+/// The parameters in a seat's `/etc/default/kiosk` text (`seat-sync
+/// --migrate`, root, offline): what the heartbeat reports, read the same way.
+fn kiosk_params_from_env(kenv: &KioskEnv) -> Result<KioskParams, String> {
+    let src = kenv.source.clone();
+    kiosk_params_from(&json!({ "kiosk": kiosk_json(kenv) }))
+        .ok_or_else(|| format!("{} ({src}) does not state a valid NOO_KIOSK_USER, NOO_KIOSK_MODE and NOO_KIOSK_VT", super::kiosk::ENV_FILE))
+}
+
 /// The kiosk parameters a seat reported (from its `/etc/default/kiosk`),
 /// which the units are rendered from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -447,7 +472,7 @@ pub(crate) fn seat_bundle_files(
         ("kiosk-serve", k::SERVE.as_bytes().to_vec()),
     ];
     if let Some(p) = kiosk {
-        files.push(("unit-kiosk", k::render_kiosk_service_in(&p.user, p.mode, p.vt, SEAT_KIOSK_DIR).into_bytes()));
+        files.push(("unit-kiosk", seat_kiosk_unit(p).into_bytes()));
         files.push(("unit-kiosk-serve", k::render_serve_service_in(&p.user, SEAT_KIOSK_DIR).into_bytes()));
         files.push(("unit-kiosk-watchdog", k::render_watchdog_service().into_bytes()));
         files.push(("unit-kiosk-watchdog-timer", k::render_watchdog_timer().as_bytes().to_vec()));
@@ -989,6 +1014,13 @@ fn display_dir_script(root: &str, work: &Path, cfg: &SeatConfig, clean_home: boo
     let t = r#"# The display's scripts: a seat-owned shared dir the display user can run.
 # Never under a home directory: the display user cannot traverse one.
 if [ -f @R@/etc/systemd/system/kiosk.service ]; then
+  # This release's kiosk.service, when `seat-sync --migrate` rendered one from
+  # the seat's /etc/default/kiosk: a roll never rewrites a root unit, and one
+  # from before the broker has no RuntimeDirectory=kiosk (no control socket).
+  if [ -f @WORK@/kiosk.service ]; then
+    install -m 0644 -o root -g root @WORK@/kiosk.service @R@/etc/systemd/system/kiosk.service
+    echo "noo-seat: kiosk.service is this release's unit"
+  fi
   kuser=$(sed -n 's/^User=//p' @R@/etc/systemd/system/kiosk.service | tail -n 1)
   kuser=${kuser:-kiosk}
   kgrp=$(id -gn "$kuser") || { echo "noo-seat: ERROR - kiosk.service runs as '$kuser', an account this box does not have" >&2; exit 1; }
@@ -1356,6 +1388,15 @@ fn state_dir_for(cfg: &SeatConfig, layout: &str) -> PathBuf {
     if layout == "legacy-root" { PathBuf::from(LEGACY_STATE_DIR) } else { cfg.state_dir() }
 }
 
+/// What `noo kiosk reload` on THIS box needs from its seat sync: the console
+/// build the last apply settled on, and the one root command that repairs
+/// the display (it rewrites kiosk.service). None off a seat (no seat.json).
+pub(crate) fn local_seat_display() -> Option<(Option<String>, String)> {
+    let cfg: SeatConfig = serde_json::from_slice(&std::fs::read(Path::new(SEAT_DIR).join("seat.json")).ok()?).ok()?;
+    let st = read_state(&cfg);
+    Some((st.console_build, format!("sudo {} kiosk seat-sync --migrate", cfg.applier_path().display())))
+}
+
 fn read_state(cfg: &SeatConfig) -> SeatState {
     std::fs::read(state_dir_for(cfg, layout_word()).join("state.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
@@ -1409,6 +1450,10 @@ fn heartbeat_body_with(cfg: &SeatConfig, state: &SeatState, layout: &str, cli_ve
         "kiosk_serve": unit_state("kiosk-serve.service"),
         "kiosk_display": unit_state("kiosk.service"),
         "kiosk_watchdog_sha": std::fs::read(format!("{KIOSK_BIN}/noo-kiosk-watchdog")).ok().map(|b| sha256_hex(&b)),
+        // The installed display unit, root-written and never updated by
+        // this sync: verify compares it with this release's.
+        "kiosk_unit_sha": std::fs::read(KIOSK_UNIT_PATH).ok().map(|b| sha256_hex(&b)),
+        "kiosk_unit_runtime_dir": std::fs::read_to_string(KIOSK_UNIT_PATH).ok().map(|t| unit_has_runtime_dir(&t)),
         "kiosk_bins": kiosk_bins_layout(Path::new("/"), &cfg.cli_home),
         "console_build": console,
         "page_search": page_search,
@@ -1935,6 +1980,16 @@ fn seat_migrate(cfg: &SeatConfig, print_only: bool) -> i32 {
         }
         ok &= std::fs::write(work.join("49-noo-seat.rules"), render_polkit_rule(&cfg.cli_user)).is_ok();
     }
+    // This release's display unit, from the seat's own parameters, so the
+    // repair is this one command (a unit from before the broker has no
+    // RuntimeDirectory=kiosk). Unstated parameters: the unit stays as it is,
+    // said, and the rest of the repair still runs.
+    if Path::new(KIOSK_UNIT_PATH).exists() {
+        match kiosk_params_from_env(&kiosk_env_from(std::fs::read_to_string(super::kiosk::ENV_FILE))) {
+            Ok(p) => ok &= std::fs::write(work.join("kiosk.service"), seat_kiosk_unit(&p)).is_ok(),
+            Err(e) => say(&format!("kiosk.service left as it is: {e}")),
+        }
+    }
     // Root reads the box's current launcher only for its BROWSER= line.
     let installed_launch = std::fs::read_to_string(format!("{KIOSK_BIN}/noo-kiosk-launch")).ok();
     if let Err(e) = stage_display_scripts(&work, installed_launch.as_deref()) {
@@ -2311,6 +2366,20 @@ pub(crate) fn seat_checks(seat: &Value, controller_cli: &str, controller_tag: &s
         if sha != sha256_hex(super::kiosk::WATCHDOG.as_bytes()) {
             out.push(check("kiosk watchdog", Verdict::Warn,
                 "the root watchdog is not this release's (the seat's sync cannot update a root file)".into(), repair()));
+        }
+    }
+    // The display unit is root-installed too: a release that changes it (the
+    // broker's RuntimeDirectory=kiosk, 0.6.16) reaches the seat only through
+    // the repair, which installs this release's unit. Without that directory
+    // the display runs but cannot be reloaded (homeserver after 0.6.24).
+    if let (Some(sha), Some(p)) = (hb["kiosk_unit_sha"].as_str(), kiosk_params_from(hb)) {
+        if sha != sha256_hex(seat_kiosk_unit(&p).as_bytes()) {
+            let why = if hb["kiosk_unit_runtime_dir"].as_bool() == Some(false) {
+                "kiosk.service is not this release's unit and has no RuntimeDirectory=kiosk: the display's broker has no control socket, so `noo kiosk reload` cannot reload it (the seat's sync cannot update a root unit)"
+            } else {
+                "kiosk.service is not this release's unit (the seat's sync cannot update a root unit)"
+            };
+            out.push(check("kiosk unit", Verdict::Warn, why.into(), repair()));
         }
     }
     // Where the display execs its scripts from (a 0.6.11+ seat reports it).
@@ -2883,6 +2952,59 @@ mod tests {
         let w = seat_checks(&stale, "0.6.17", "stack-v0.6.17", now).into_iter().find(|c| c.name == "kiosk watchdog").expect("a stale watchdog is said");
         assert_eq!(w.verdict, Verdict::Warn);
         assert!(w.remedy.as_deref().unwrap_or("").contains("kiosk seat-sync --migrate"), "{w:?}");
+    }
+
+    /// The display unit is root-installed, so a release that changes it never
+    /// reaches the seat by its sync. homeserver after the 0.6.24 roll ran a
+    /// kiosk.service from before the broker: no RuntimeDirectory=kiosk, no
+    /// control socket, every `noo kiosk reload` "no broker". The seat reports
+    /// its unit's sha; verify compares this release's unit for the seat's own
+    /// parameters and names the one root command that installs it.
+    #[test]
+    fn a_kiosk_unit_from_before_the_broker_is_said_with_its_repair() {
+        use super::super::cluster_verify::Verdict;
+        let seen = "2025-10-09T08:53:10Z";
+        let now = super::super::cluster_verify::parse_rfc3339_unix(seen).unwrap() + 10;
+        let p = KioskParams { user: "kiosk".into(), mode: super::super::kiosk::Mode::Dedicated, vt: 1 };
+        let current = seat_kiosk_unit(&p);
+        assert!(unit_has_runtime_dir(&current), "this release's unit gives the broker its directory");
+        let old: String = current.lines().filter(|l| !l.starts_with("RuntimeDirectory")).map(|l| format!("{l}\n")).collect();
+        assert!(!unit_has_runtime_dir(&old));
+        let wd = sha256_hex(super::super::kiosk::WATCHDOG.as_bytes());
+        let seat = |unit: &str| json!({"seat_name": "homeserver", "enroll_user": "alex", "last_seen": seen,
+            "heartbeat": {"cli_version": "0.6.24", "user_cli_current": true, "kiosk_serve": "active", "kiosk_display": "active",
+                          "kiosk_bins": "shared", "kiosk_watchdog_sha": wd, "console_build": "stack-v0.6.24",
+                          "kiosk_unit_sha": sha256_hex(unit.as_bytes()), "kiosk_unit_runtime_dir": unit_has_runtime_dir(unit),
+                          "kiosk": {"user": "kiosk", "mode": "dedicated", "vt": "1"}}});
+        assert!(!seat_checks(&seat(&current), "0.6.24", "stack-v0.6.24", now).iter().any(|c| c.name == "kiosk unit"),
+            "this release's unit adds no row");
+        let u = seat_checks(&seat(&old), "0.6.24", "stack-v0.6.24", now).into_iter().find(|c| c.name == "kiosk unit").expect("an old unit is said");
+        assert_eq!(u.verdict, Verdict::Warn, "{u:?}");
+        assert!(u.detail.contains("no RuntimeDirectory=kiosk") && u.detail.contains("cannot reload"), "{u:?}");
+        assert!(u.remedy.as_deref().unwrap_or("").contains("kiosk seat-sync --migrate"), "{u:?}");
+        // A seat that reports no unit sha (older CLI) or no parameters: no row, not a guess.
+        let mut quiet = seat(&old);
+        quiet["heartbeat"].as_object_mut().unwrap().remove("kiosk_unit_sha");
+        assert!(!seat_checks(&quiet, "0.6.24", "stack-v0.6.24", now).iter().any(|c| c.name == "kiosk unit"));
+    }
+
+    /// `seat-sync --migrate` installs this release's kiosk.service, rendered
+    /// from the seat's own /etc/default/kiosk, BEFORE it reads the unit's
+    /// User= and points ExecStart: the repair is one command.
+    #[test]
+    fn migrate_installs_this_releases_kiosk_unit_from_the_seats_env() {
+        let p = kiosk_params_from_env(&kiosk_env_from(Ok("NOO_KIOSK_USER=kiosk\nNOO_KIOSK_MODE=dedicated\nNOO_KIOSK_VT=1\n".into()))).unwrap();
+        assert_eq!(p, KioskParams { user: "kiosk".into(), mode: super::super::kiosk::Mode::Dedicated, vt: 1 });
+        assert!(kiosk_params_from_env(&kiosk_env_from(Ok("NOO_KIOSK_USER=kiosk\n".into()))).unwrap_err().contains("NOO_KIOSK_MODE"));
+        let e = kiosk_params_from_env(&kiosk_env_from(Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)))).unwrap_err();
+        assert!(e.contains("unreadable"), "an unreadable env is said as one: {e}");
+        let src = include_str!("kiosk_seat.rs");
+        let body = crate::test_src::fn_body(src, "fn display_dir_script(");
+        let install = body.find("install -m 0644 -o root -g root @WORK@/kiosk.service").expect("migrate installs the rendered unit");
+        assert!(install < body.find("kuser=$(sed -n").unwrap(), "installed before its User= is read");
+        let m = crate::test_src::fn_body(src, "fn seat_migrate(");
+        assert!(m.contains("work.join(\"kiosk.service\"), seat_kiosk_unit(&p)"), "migrate renders the bundle's unit");
+        assert!(crate::test_src::fn_body(src, "pub(crate) fn seat_bundle_files(").contains("seat_kiosk_unit(p)"), "one renderer for bundle, migrate and verify");
     }
 
     /// After an apply, a display row is softened to "no heartbeat since"
