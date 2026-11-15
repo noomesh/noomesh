@@ -4072,8 +4072,16 @@ mod tests {
     fn an_lfs_file_with_no_published_digest_is_never_linked() {
         let dir = staged_old("f10-nodigest");
         let new = hf_rev_with(SHA2, weights(), README_V2, false);
-        let e = stage_rev(&new, &dir, SHA2, &std_link).0.expect_err("no digest, no stage");
+        // The refusal below would also clean up a link made first, so watch
+        // the seam itself: with no published digest no link is even tried.
+        let tried = std::cell::Cell::new(0usize);
+        let counting = |from: &Path, to: &Path| {
+            tried.set(tried.get() + 1);
+            std::fs::hard_link(from, to)
+        };
+        let e = stage_rev(&new, &dir, SHA2, &counting).0.expect_err("no digest, no stage");
         assert!(e.to_string().contains("no LFS sha256"), "{e}");
+        assert_eq!(tried.get(), 0, "a link was tried for a file whose digest is unknown");
         let new_w = rev_dir(&dir, SHA2).join("weights.bin");
         assert!(std::fs::symlink_metadata(&new_w).is_err(), "a file whose digest is unknown was linked");
         let _ = std::fs::remove_dir_all(&dir);
