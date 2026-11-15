@@ -1,0 +1,223 @@
+{
+  "version": 1,
+  "written_at": "2026-11-14T00:00:00Z",
+  "sources": [
+    {
+      "path": "/r/stack.lock",
+      "sha256": "cdad4c81603271022781348c0fd8e323adb7338fb0d96bf5c3f6755bbff10cfb"
+    },
+    {
+      "path": "/r/stack.lock.prev",
+      "sha256": "1db1c461f4f7f349fa60af1b8bcc2ad5f52f660747f85970da5ef64147df7f54"
+    }
+  ],
+  "namespaces": [
+    "ghcr.io/noomesh/"
+  ],
+  "keep": [
+    {
+      "ref": "alertmanager@sha256:01dd89cce4737ec7e44704681b5d6ee561e9b7880f632b4413b0e547e4dabfda",
+      "why": "stack.lock (v0.6.25-rc.1)"
+    },
+    {
+      "id": "sha256:eaf6a5a4da7b0a6000794c47f629250c98b217310d1a88f7611154ae88ac7f89",
+      "why": "stack.lock (v0.6.25-rc.1): holds alertmanager@sha256:01dd89cce4737ec7e44704681b5d6ee561e9b7880f632b4413b0e547e4dabfda"
+    },
+    {
+      "ref": "gateway@sha256:5074a815525fc3d97ae2b7107de79f14a9d132354264f8d6a0aac46fb98adee6",
+      "why": "stack.lock (v0.6.25-rc.1)"
+    },
+    {
+      "id": "sha256:efbfd3cf077f248b2adffde6da6c00c970d4dfde1d3744f53e26d25e12f367ab",
+      "why": "stack.lock (v0.6.25-rc.1): holds gateway@sha256:5074a815525fc3d97ae2b7107de79f14a9d132354264f8d6a0aac46fb98adee6"
+    },
+    {
+      "ref": "grafana@sha256:084445dea160e453576f5bd8e551116b0f1d6c52e8abd367d516135f53590c9a",
+      "why": "stack.lock (v0.6.25-rc.1)"
+    },
+    {
+      "id": "sha256:81f3db740838e4bf45752e4741b9475ee6f595cdf136f525b69f80f73a91e019",
+      "why": "stack.lock (v0.6.25-rc.1): holds grafana@sha256:084445dea160e453576f5bd8e551116b0f1d6c52e8abd367d516135f53590c9a"
+    },
+    {
+      "ref": "llamacpp@sha256:1b1c5388237d6a98c70afa79d27844825d6897f22567cd227f91282538797978",
+      "why": "stack.lock (v0.6.25-rc.1); not on this host"
+    },
+    {
+      "ref": "loki@sha256:5f04dd8068afa17dd4da0fe1e88f56011d21a67dc1065b03c5de557971c7fa05",
+      "why": "stack.lock (v0.6.25-rc.1)"
+    },
+    {
+      "id": "sha256:1594bf7da715789e821b9dc3179e650ce76af4a161eacd070aaed445dfbb0868",
+      "why": "stack.lock (v0.6.25-rc.1): holds loki@sha256:5f04dd8068afa17dd4da0fe1e88f56011d21a67dc1065b03c5de557971c7fa05"
+    },
+    {
+      "ref": "nats@sha256:67ac7866d010e8d83302dd30332eeae1a2b7a8ee051155e2eb5a5485b720cd4b",
+      "why": "stack.lock (v0.6.25-rc.1)"
+    },
+    {
+      "id": "sha256:073ccfa5190b3b463a3fcf96e85c57584707cb0e37e977effc0b13df38ad27da",
+      "why": "stack.lock (v0.6.25-rc.1): holds nats@sha256:67ac7866d010e8d83302dd30332eeae1a2b7a8ee051155e2eb5a5485b720cd4b"
+    },
+    {
+      "ref": "nginx@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10",
+      "why": "stack.lock (v0.6.25-rc.1)"
+    },
+    {
+      "id": "sha256:6769dc3a703c719c1d2756bda113659be28ae16cf0da58dd5fd823d6b9a050ea",
+      "why": "stack.lock (v0.6.25-rc.1): holds nginx@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10"
+    },
+    {
+      "ref": "node-agent@sha256:45657fe77646a3f6ae678c7a37695e4fda354e5720d4baac41b4e895d6b00b34",
+      "why": "stack.lock (v0.6.25-rc.1); not on this host"
+    },
+    {
+      "ref": "node-exporter@sha256:2bf73eace0e49be4c1c61f14e349b738fdd182fb63560b1e7ed6c7c6885236d8",
+      "why": "stack.lock (v0.6.25-rc.1)"
+    },
+    {
+      "id": "sha256:513d236b807063ae3698441379aa4a42c684e6e23c17c192b5e118bce1c02864",
+      "why": "stack.lock (v0.6.25-rc.1): holds node-exporter@sha256:2bf73eace0e49be4c1c61f14e349b738fdd182fb63560b1e7ed6c7c6885236d8"
+    },
+    {
+      "ref": "nvidia-exporter@sha256:3c75957be86f4358a5bea004e8053954a5ab5c5aebdce7406ec6bafbc3c0ae6d",
+      "why": "stack.lock (v0.6.25-rc.1); not on this host"
+    },
+    {
+      "ref": "ollama@sha256:dd46912abd4946a5c580c4a85883a559736b48f6f2c4e24162b77b307b74ea9f",
+      "why": "stack.lock (v0.6.25-rc.1)"
+    },
+    {
+      "id": "sha256:f8331a8d966044e5f1be71ab5425d88ea8169bf0b17c86d08615ccbec3184e28",
+      "why": "stack.lock (v0.6.25-rc.1): holds ollama@sha256:dd46912abd4946a5c580c4a85883a559736b48f6f2c4e24162b77b307b74ea9f"
+    },
+    {
+      "ref": "piper@sha256:2c89d3e84f7ecb292935f352d74573e62e59e7b63db614c7f40a46807aa288d8",
+      "why": "stack.lock (v0.6.25-rc.1)"
+    },
+    {
+      "id": "sha256:b3b34002fd20a08e64244e019d1c02653ad8c604e552fdd1c07522d2d4c3db1f",
+      "why": "stack.lock (v0.6.25-rc.1): holds piper@sha256:2c89d3e84f7ecb292935f352d74573e62e59e7b63db614c7f40a46807aa288d8"
+    },
+    {
+      "ref": "postgres-pgvector@sha256:05a3e6d66254206da165d78da659916d7f708b8d4d2dfe83474a7ac978014055",
+      "why": "stack.lock (v0.6.25-rc.1)"
+    },
+    {
+      "id": "sha256:ccf665639153fd64214f33fd4305cd66e1e4f365e12d161d9c1d72b7d23a2765",
+      "why": "stack.lock (v0.6.25-rc.1): holds postgres-pgvector@sha256:05a3e6d66254206da165d78da659916d7f708b8d4d2dfe83474a7ac978014055"
+    },
+    {
+      "ref": "prometheus@sha256:6a5aea3fc3a33fea84bb4ea7925228f8eb67884893970a768603d350e1830489",
+      "why": "stack.lock (v0.6.25-rc.1)"
+    },
+    {
+      "id": "sha256:4cd1891c9271668f5994d971ea9c74090db006422de07b9e8298b4b02f3a8e87",
+      "why": "stack.lock (v0.6.25-rc.1): holds prometheus@sha256:6a5aea3fc3a33fea84bb4ea7925228f8eb67884893970a768603d350e1830489"
+    },
+    {
+      "ref": "redis@sha256:d9903f6fbf1e690837d1e1edc6716a7b399385b3b2cbf3301af06fb8a6168034",
+      "why": "stack.lock (v0.6.25-rc.1)"
+    },
+    {
+      "id": "sha256:8a96657264bdcc1e3fbf9e09468de24434a2a92adbd234aee2be0664a624bbee",
+      "why": "stack.lock (v0.6.25-rc.1): holds redis@sha256:d9903f6fbf1e690837d1e1edc6716a7b399385b3b2cbf3301af06fb8a6168034"
+    },
+    {
+      "ref": "sandbox@sha256:f3a2ba09d9a4831026413a32da2792e66a31a626d013583e9144377828215305",
+      "why": "stack.lock (v0.6.25-rc.1)"
+    },
+    {
+      "id": "sha256:6e026edb15c576ab14b442d2a237ff376d78ce8914c6f6c8ea4788d17e90cc15",
+      "why": "stack.lock (v0.6.25-rc.1): holds sandbox@sha256:f3a2ba09d9a4831026413a32da2792e66a31a626d013583e9144377828215305"
+    },
+    {
+      "ref": "stunnel@sha256:04ff82dc284420add2ae9f23db1e8db60f8b96b9d5a7bf50ad979d8b5dda838d",
+      "why": "stack.lock (v0.6.25-rc.1)"
+    },
+    {
+      "id": "sha256:aa84b9e8224c56f50fd4a74372bb26c99addd1873df30dea0f0cdc30df7f84db",
+      "why": "stack.lock (v0.6.25-rc.1): holds stunnel@sha256:04ff82dc284420add2ae9f23db1e8db60f8b96b9d5a7bf50ad979d8b5dda838d"
+    },
+    {
+      "ref": "tei-cpu@sha256:66db77d7856c9319bbfaf2c5b80a6d0e0ac9ff128ade09eaca1d9c20213617a4",
+      "why": "stack.lock (v0.6.25-rc.1); not on this host"
+    },
+    {
+      "ref": "tei@sha256:25e35b0b266241a543c5ee305083eced4b6ac0772eb969c3fdaae2d4c2ef7266",
+      "why": "stack.lock (v0.6.25-rc.1); not on this host"
+    },
+    {
+      "ref": "tempo@sha256:5352e76f3c4e531babc76fc29958cfa3286096d2ca0bbf3b46007e46c0249a85",
+      "why": "stack.lock (v0.6.25-rc.1)"
+    },
+    {
+      "id": "sha256:0f63b700591e2c7ea06f65764075a1b84374e814d750c910713d0adaab32c724",
+      "why": "stack.lock (v0.6.25-rc.1): holds tempo@sha256:5352e76f3c4e531babc76fc29958cfa3286096d2ca0bbf3b46007e46c0249a85"
+    },
+    {
+      "ref": "trellion@sha256:cb21ec90b4fe686edfd9b4bce50ba45ae10de62d39ea6bf9c850fd1437b7960c",
+      "why": "stack.lock (v0.6.25-rc.1)"
+    },
+    {
+      "id": "sha256:b8d2a7002c77c57907eec443ec8f783037b53381e533dfb1a40a6d686770f74c",
+      "why": "stack.lock (v0.6.25-rc.1): holds trellion@sha256:cb21ec90b4fe686edfd9b4bce50ba45ae10de62d39ea6bf9c850fd1437b7960c"
+    },
+    {
+      "ref": "vllm@sha256:fc56161ee42a011aeee78b65d0a81b6683c7d04402fd40503d14d4d6c98f07cb",
+      "why": "stack.lock (v0.6.25-rc.1); not on this host"
+    },
+    {
+      "ref": "whisper@sha256:b17c80ad5ccbf414e635e37b852d94acbc9ad8f863e1c1686d02b750d66acb80",
+      "why": "stack.lock (v0.6.25-rc.1)"
+    },
+    {
+      "id": "sha256:802a5dc4ba89b6b66cd93b377db495db2877ac36636360be16d1c740e4040bb4",
+      "why": "stack.lock (v0.6.25-rc.1): holds whisper@sha256:b17c80ad5ccbf414e635e37b852d94acbc9ad8f863e1c1686d02b750d66acb80"
+    },
+    {
+      "ref": "worker@sha256:3e9a1b9f7e8fb25cc1c2cad431aecd34f32288b977e265ea52192d6eb6de320b",
+      "why": "stack.lock (v0.6.25-rc.1)"
+    },
+    {
+      "id": "sha256:76ac0d69fff2b77f12f870b4572b639c7031e1d8ebab63336e513a04dd615eef",
+      "why": "stack.lock (v0.6.25-rc.1): holds worker@sha256:3e9a1b9f7e8fb25cc1c2cad431aecd34f32288b977e265ea52192d6eb6de320b"
+    },
+    {
+      "ref": "gateway@sha256:e3472a087265755d1afb40ffffa0ec9388fdeccae532cfe2de052181d9bafb05",
+      "why": "stack.lock.prev (v0.6.24, for rollback)"
+    },
+    {
+      "id": "sha256:cf73b69640a184d41f1b6f6db10d45e47e957e0a1c7e29bbeb552e1c70ebd0d0",
+      "why": "stack.lock.prev (v0.6.24, for rollback): holds gateway@sha256:e3472a087265755d1afb40ffffa0ec9388fdeccae532cfe2de052181d9bafb05"
+    },
+    {
+      "ref": "node-agent@sha256:38a310b84f1413389821bed468fd50f45d29b16ce9b089a0b381a2f1029682d3",
+      "why": "stack.lock.prev (v0.6.24, for rollback); not on this host"
+    },
+    {
+      "ref": "sandbox@sha256:e1204a24e5c2aa4d9597314019959b0b25175723cf53a345c7c5ecb3aa4bdf40",
+      "why": "stack.lock.prev (v0.6.24, for rollback)"
+    },
+    {
+      "id": "sha256:9edfa8df622460e42154b587f1d79ec5db72f89b26011442d07c7d2559f76410",
+      "why": "stack.lock.prev (v0.6.24, for rollback): holds sandbox@sha256:e1204a24e5c2aa4d9597314019959b0b25175723cf53a345c7c5ecb3aa4bdf40"
+    },
+    {
+      "ref": "trellion@sha256:94c3048131d950cb5f088222fd55797e64120680a8eca9259a3a2bdfa5ec6181",
+      "why": "stack.lock.prev (v0.6.24, for rollback)"
+    },
+    {
+      "id": "sha256:86bbbb44b82c4c467323e4cc1beb786264bac8c0a7c2bd1e373792fac8efdf77",
+      "why": "stack.lock.prev (v0.6.24, for rollback): holds trellion@sha256:94c3048131d950cb5f088222fd55797e64120680a8eca9259a3a2bdfa5ec6181"
+    },
+    {
+      "ref": "worker@sha256:42d51bf47eebebd21d7ca9327737552d288b21c4e8ae943514b1ecfdef8516f8",
+      "why": "stack.lock.prev (v0.6.24, for rollback)"
+    },
+    {
+      "id": "sha256:595214b65dad4a5049feaa70165297ed9720fea5997b5c369c1dc96003a4b69a",
+      "why": "stack.lock.prev (v0.6.24, for rollback): holds worker@sha256:42d51bf47eebebd21d7ca9327737552d288b21c4e8ae943514b1ecfdef8516f8"
+    }
+  ]
+}
