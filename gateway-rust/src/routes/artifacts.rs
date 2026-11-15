@@ -1788,10 +1788,17 @@ mod tests {
     #[tokio::test]
     async fn a_cold_lfs_blob_answers_hashing_then_the_manifest() {
         let (home, repo, weights) = hf_fixture("cold");
-        // Current-thread runtime: the spawned hash cannot finish inside a zero wait.
-        match hf_manifest_at(&home.join("hub"), &repo, std::time::Duration::ZERO).await.unwrap() {
-            HfOutcome::Hashing(total) => assert!(total >= weights.len() as u64),
-            HfOutcome::Ready(v) => panic!("a cold blob answered at once: {v}"),
+        // A zero wait is not "no yield": tokio rounds the timeout up to the
+        // next timer tick, and a small blob can finish hashing first (seen
+        // under load in noo-batch, 2026-11-15). The hash task records its
+        // digest under file_cache_lock BEFORE it sends the result, so holding
+        // that lock pins the first answer to Hashing.
+        {
+            let _hold = file_cache_lock().lock().await;
+            match hf_manifest_at(&home.join("hub"), &repo, std::time::Duration::ZERO).await.unwrap() {
+                HfOutcome::Hashing(total) => assert!(total >= weights.len() as u64),
+                HfOutcome::Ready(v) => panic!("a cold blob answered at once: {v}"),
+            }
         }
         let v = hf_ready(&home, &repo).await.unwrap();
         assert_eq!(v["files"][2]["sha256"], sha256_hex(&weights));
