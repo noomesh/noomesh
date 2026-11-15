@@ -1857,7 +1857,10 @@ mod tests {
         let own = crate::test_src::own_code(include_str!("reservations.rs"));
         let take = crate::test_src::fn_body(&own, "async fn take(");
         let lost = take.split("Ok(false) => \u{7b}").nth(1).expect("the lost-take arm");
-        let lost = &lost[..lost.find("Err(e) =>").expect("arm end")];
+        // The arm ends where the unwritable-row arm begins (the lost arm has
+        // an Err(e) of its own, for an unreadable holder list).
+        let lost = &lost[..lost.find("release_hold(\"placement_unwritable\")").expect("arm end")];
+        assert!(lost.contains("tracing::warn!") && !lost.contains(".ok()"), "an unreadable holder list is logged, not read as none");
         assert!(lost.contains("AppError::Conflict(already_reserved(") && !lost.contains("AppError::Internal"), "a lost take is a 409 naming the holder");
     }
 
