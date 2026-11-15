@@ -216,8 +216,15 @@ async fn actuator(link: &crate::node_link::NodeLink, decl: &crate::addon_workloa
 /// The error for a failed actuator start. The agent loads its workload
 /// declarations a moment after it registers; a start in that window meets its
 /// 404 `not_declared`, a transient state (this gateway's own bundle declares
-/// the workload), so the caller is told to retry, not shown a 500. Any other
-/// failure stays an internal error.
+/// the workload), so the caller is told to retry, not shown a 500.
+///
+/// Every other start failure is the NODE's answer, never a gateway fault, so
+/// it is never a bare "internal error" (0.6.25-rc.3 rehearsal: a reserve was
+/// refused "internal error" with its cause only in the gateway log). The
+/// agent's own refusal (`<code> (<4xx>): <detail>`) is a Conflict that leads
+/// with its code; an agent 5xx, an unreachable agent or an unreadable answer
+/// is Upstream (502) with what was seen. The agent's text is scrubbed of
+/// secret shapes and URL queries and cut to one line.
 fn start_failure(key: &str, node: &str, e: &str) -> AppError {
     if e.starts_with("not_declared (404)") {
         return AppError::UnavailableRetry {
@@ -226,7 +233,43 @@ fn start_failure(key: &str, node: &str, e: &str) -> AppError {
             retry_after_secs: 10,
         };
     }
-    AppError::Internal(format!("{key} did not start on {node}: {e}; the GPU was released back to the pool"))
+    let said = agent_text(e);
+    if let Some((code, status, detail)) = agent_refusal(e) {
+        if (400..500).contains(&status) {
+            return AppError::Conflict(format!(
+                "{code}: {key} did not start on {node}: {}; the GPU was released back to the pool; nothing is running",
+                agent_text(detail)
+            ));
+        }
+    }
+    AppError::Upstream(format!("{key} did not start on {node}: {said}; the GPU was released back to the pool"))
+}
+
+/// `<code> (<status>): <detail>` as [`actuator`] renders an agent's answer.
+fn agent_refusal(e: &str) -> Option<(&str, u16, &str)> {
+    let (code, rest) = e.split_once(" (")?;
+    let (status, detail) = rest.split_once("): ")?;
+    let ok_code = !code.is_empty() && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+    ok_code.then_some(())?;
+    Some((code, status.parse().ok()?, detail))
+}
+
+/// The node's words, safe to show: secret-shaped values scrubbed, URL query
+/// strings dropped, one line, at most 300 characters.
+fn agent_text(s: &str) -> String {
+    let (scrubbed, _) = crate::redact::scrub_secrets(s);
+    let mut out = String::new();
+    for word in scrubbed.split_whitespace() {
+        let w = if word.contains("://") { word.split(['?', '#']).next().unwrap_or(word) } else { word };
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(w);
+    }
+    if out.chars().count() > 300 {
+        out = out.chars().take(300).collect::<String>() + "…";
+    }
+    out
 }
 
 /// Why a placed node workload cannot be reserved on `node`, from the node's
@@ -1386,7 +1429,7 @@ mod tests {
     }
 
     #[test]
-    fn a_not_declared_start_is_a_retryable_503_and_other_failures_stay_internal() {
+    fn a_not_declared_start_is_a_retryable_503_and_other_failures_say_why() {
         match start_failure("rhaddon/rhworker", "awolf", "not_declared (404): no such workload") {
             AppError::UnavailableRetry { code, detail, retry_after_secs } => {
                 assert_eq!(code, "node_workloads_not_loaded");
@@ -1395,8 +1438,35 @@ mod tests {
             }
             other => panic!("not_declared must be retryable, got {other:?}"),
         }
-        assert!(matches!(start_failure("k", "n", "docker_error (500): boom"), AppError::Internal(_)));
-        assert!(matches!(start_failure("k", "n", "node agent unreachable: x"), AppError::Internal(_)));
+        // 0.6.25-rc.3 rehearsal: no start failure is a bare "internal error".
+        // An agent 5xx or an unreachable agent is Upstream with what was seen.
+        match start_failure("k", "n", "docker_error (500): boom") {
+            AppError::Upstream(m) => assert!(m.contains("docker_error (500): boom") && m.contains("did not start on n"), "{m}"),
+            other => panic!("an agent 5xx is Upstream, got {other:?}"),
+        }
+        match start_failure("k", "n", "node agent unreachable: x") {
+            AppError::Upstream(m) => assert!(m.contains("node agent unreachable"), "{m}"),
+            other => panic!("an unreachable agent is Upstream, got {other:?}"),
+        }
+    }
+
+    /// The agent's own coded refusal is a Conflict that LEADS with its code,
+    /// and its text is shown scrubbed: no secret-shaped value, no URL query.
+    #[test]
+    fn an_agent_start_refusal_is_a_conflict_with_its_code_and_scrubbed_text() {
+        let e = "image_unavailable (409): fetch https://noo-controller:8443/images/w.tar?token=SECRETVALUE refused, password=hunter2";
+        match start_failure("rhaddon/echo", "rhx-node2", e) {
+            AppError::Conflict(m) => {
+                assert!(m.starts_with("image_unavailable: rhaddon/echo did not start on rhx-node2: "), "{m}");
+                assert!(m.contains("https://noo-controller:8443/images/w.tar"), "host, port and path stay: {m}");
+                assert!(!m.contains("SECRETVALUE") && !m.contains("token=") && !m.contains("hunter2"), "scrubbed: {m}");
+                assert!(m.ends_with("nothing is running"), "{m}");
+            }
+            other => panic!("a coded 4xx refusal is a Conflict, got {other:?}"),
+        }
+        assert!(agent_refusal("not a refusal").is_none());
+        assert!(agent_refusal("Bad Code (409): x").is_none(), "a code is lower_snake");
+        assert!(agent_text(&"x ".repeat(400)).chars().count() <= 301);
     }
 
     #[test]
