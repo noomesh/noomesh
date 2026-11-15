@@ -382,7 +382,9 @@ pub struct StreamUsageCtx {
     pub actor: UsageActor,
     /// The raw proxy's cut watch (i802 step 1): when the stream's own count
     /// shows the backend cut the prompt, the metric and the hourly warn.
-    pub cut: Option<crate::context_cut::CutWatch>,
+    /// Boxed: it rides in `raw_chat::Outcome::Stream`, and clippy keeps that
+    /// enum's variants within 200 bytes of each other.
+    pub cut: Option<Box<crate::context_cut::CutWatch>>,
 }
 
 /// Wrap a byte stream so the last usage frame seen is recorded when the

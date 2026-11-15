@@ -897,7 +897,7 @@ where
         model: cand.model.clone(),
         source,
         actor,
-        cut: watch.clone(),
+        cut: watch.clone().map(Box::new),
     };
     match ok.body {
         CoreBody::Stream(resp) => Ok(Outcome::Stream { resp, served, usage, guard: ok.guard }),
