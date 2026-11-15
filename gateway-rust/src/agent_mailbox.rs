@@ -477,7 +477,8 @@ pub enum Outcome {
 /// How to get a mailbox, for a sessionless call that stated none.
 pub fn no_mailbox_yet() -> String {
     "no mailbox yet: call noo_agent_name(session=<a stable id you keep for this conversation>) once; it returns your \
-     mailbox name. Then pass as=<that name> on every noo_agent_* call"
+     mailbox name. Then pass as=<that name> on every noo_agent_* call. If your noo_agent_name has no `session` \
+     parameter, your client's tool list predates this gateway: reconnect it (Claude Code: /mcp → reconnect)"
         .into()
 }
 
@@ -730,6 +731,8 @@ mod tests {
             assert!(MAILBOX_INSTRUCTIONS.contains(must), "{must}");
         }
         assert!(no_mailbox_yet().contains("noo_agent_name(session="));
+        // A client holding a pre-roll tool list has neither parameter: say so.
+        assert!(no_mailbox_yet().contains("your client's tool list predates this gateway: reconnect it (Claude Code: /mcp"));
     }
 
     /// Both doors take the mailbox step before running a tool and teach
