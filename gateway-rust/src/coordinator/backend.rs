@@ -748,6 +748,22 @@ impl std::fmt::Display for ModelNotServed {
 
 impl std::error::Error for ModelNotServed {}
 
+/// A turn the backend's context cannot hold, refused before any model call:
+/// the doesn't-fit line (`agent_loop::too_small_line`). A refusal of the
+/// request, not a fault: `resolve_failure_status` answers 413 for it, and the
+/// route logs it at warn, so neither a client nor an operator reads it as a
+/// server error to retry.
+#[derive(Debug)]
+pub struct ContextTooSmall(pub String);
+
+impl std::fmt::Display for ContextTooSmall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ContextTooSmall {}
+
 fn not_served_prefix(pin: &str) -> String {
     format!("model '{pin}' is not served by any node")
 }
@@ -755,7 +771,13 @@ fn not_served_prefix(pin: &str) -> String {
 /// The HTTP status a failed backend resolution should carry: 404 for a pin
 /// nothing serves, otherwise the caller's `fallback` (503 on the raw routes).
 pub fn resolve_failure_status(e: &anyhow::Error, fallback: u16) -> u16 {
-    if e.downcast_ref::<ModelNotServed>().is_some() { 404 } else { fallback }
+    if e.downcast_ref::<ModelNotServed>().is_some() {
+        404
+    } else if e.downcast_ref::<ContextTooSmall>().is_some() {
+        413
+    } else {
+        fallback
+    }
 }
 
 /// Turn a backend's own "that model does not exist" answer into the refusal a
@@ -1684,6 +1706,11 @@ mod tests {
         let e = anyhow::Error::new(r);
         assert_eq!(resolve_failure_status(&e, 503), 404);
         assert_eq!(resolve_failure_status(&anyhow::anyhow!("No backend available"), 503), 503);
+        // The doesn't-fit refusal is the request's: 413, never a 500 a client
+        // would retry, whatever the caller's fallback.
+        let too_small = anyhow::Error::new(crate::coordinator::ContextTooSmall("gemma4:e2b on box runs a 4096-token context, too small …".into()));
+        assert_eq!(resolve_failure_status(&too_small, 500), 413);
+        assert_eq!(resolve_failure_status(&too_small, 503), 413);
     }
 
     #[test]

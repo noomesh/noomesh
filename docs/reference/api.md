@@ -468,7 +468,7 @@ once a day per backend.
 A turn whose instructions and question cannot fit the backend's context gets
 one `error` line naming that context and, for Ollama or vLLM, the command that
 switches model with its backend named (`noo models switch <model> --backend
-ollama`). A backend's refusal reaches the person as `Backend error: <status>:
+ollama`). `/api/inference` answers that refusal with HTTP 413 and `{"success": false, "code": "context_too_small", "error": <the line>}`: the request's, not a server fault to retry. A backend's refusal reaches the person as `Backend error: <status>:
 <sentence>`, the sentence taken from either the OpenAI (`{"error":{"message":..}}`)
 or the Ollama (`{"error":".."}`) body, never the JSON itself.
 

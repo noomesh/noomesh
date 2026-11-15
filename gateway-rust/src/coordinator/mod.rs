@@ -53,7 +53,7 @@ pub use agent_loop::{backend_cut_alert, BACKEND_CUT_ALERT_KIND};
 pub(crate) use agent_loop::{MAX_LLM_BACKEND_ATTEMPTS, BACKEND_FAILOVER_ALERT_COOLDOWN_SECS};
 pub(crate) use backend::is_retryable_llm_http_error;
 #[cfg(test)]
-pub(crate) use backend::ModelNotServed;
+pub(crate) use backend::{ContextTooSmall, ModelNotServed};
 pub(crate) use backend::non_chat_backends;
 pub use backend::{backend_model_not_found, resolve_failure_status, resolve_backend, resolve_backend_for_model, get_tool_nats_subject, local_backend_url, ResolvedBackend};
 pub use session::{evict_stale_sessions};
