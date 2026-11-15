@@ -115,6 +115,32 @@ class _Clock:
         self.t += s
 
 
+RC3_LINE = ("gemma4:e2b on runnervm8axu0 runs a 4096-token context, too small for its instructions and this question. "
+            "Give it a larger context where the box's memory allows, or pick a model with a larger one: "
+            "noo models switch <model> --backend ollama")
+
+
+def test_the_doesnt_fit_refusal_passes_as_an_error_event():
+    # 0.6.25-rc.3 run 43720629082: the product said exactly this, as the
+    # turn's error with an empty reply, and the judge failed it.
+    rc, why = CF.judge_refusal_error(RC3_LINE, [], _facts(), "ollama")
+    assert rc == CF.PASS and "4096-token context" in why and "--backend ollama" in why, why
+
+
+def test_any_other_error_or_a_wrong_remedy_still_fails():
+    rc, why = CF.judge_refusal_error("Backend error: 502: upstream gone", [], _facts(), "ollama")
+    assert rc == CF.FAIL and why.startswith("the turn failed"), why
+    rc, why = CF.judge_refusal_error(RC3_LINE.replace("--backend ollama", "--backend vllm"), [], _facts(), "ollama")
+    assert rc == CF.FAIL and "wrong backend" in why, why
+    rc, why = CF.judge_refusal_error(RC3_LINE, ["noo_rag_query"], _facts(), "ollama")
+    assert rc == CF.FAIL and "attempted answer" in why, why
+    rc, why = CF.judge_refusal_error(RC3_LINE, [], _facts(DIRECT_CALL), "ollama")
+    assert rc == CF.FAIL and "attempted answer" in why, why
+    # A llama.cpp / cloud line names no command; it passes when nothing is expected.
+    bare = RC3_LINE.split(": noo models switch")[0]
+    assert CF.judge_refusal_error(bare, [], _facts(), None)[0] == CF.PASS
+
+
 def test_the_reload_is_read_once_a_heartbeat_reports_it():
     # rc.3 run 43715012498, stranger-24.04: the first read after the reload
     # turn still showed 32768 (the heartbeat had not run yet).

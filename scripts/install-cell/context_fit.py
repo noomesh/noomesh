@@ -436,6 +436,31 @@ def judge_doesnt_fit(reply: str, tool_names: list[str], facts: dict) -> tuple[in
                   f"\"{TOO_SMALL}\" line" + (f"; the backend cut it {facts['cuts']} time(s)" if facts["cuts"] else ""))
 
 
+TOO_SMALL_LINE_RX = re.compile(
+    r"^(?P<model>\S+) on (?P<node>\S+) runs a (?P<ctx>\d+)-token context, too small for its instructions and this question\. "
+    r"Give it a larger context where the box's memory allows, or pick a model with a larger one"
+    r"(?:: noo models switch <model> --backend (?P<backend>ollama|vllm))?$")
+
+
+def judge_refusal_error(error: str, tool_names: list[str], facts: dict, expect_backend: str | None) -> tuple[int, str]:
+    """A turn refused before any model call carries the doesn't-fit line as
+    its `error` event with an empty reply (0.6.25-rc.3 run 43720629082: the
+    product said exactly the intended line, 4.3 s, and the judge counted any
+    errored turn as failed). PASS only for the whole line, with the remedy
+    naming the backend that serves the model and no answer attempted; any
+    other error is the turn failing."""
+    m = TOO_SMALL_LINE_RX.match(error.strip())
+    if not m:
+        return FAIL, f"the turn failed: {_excerpt(error)}"
+    if tool_names or facts.get("backend_calls"):
+        return FAIL, "the doesn't-fit line came after an attempted answer (a tool call or a model call)"
+    if expect_backend and m.group("backend") != expect_backend:
+        return FAIL, (f"the doesn't-fit line names `--backend {m.group('backend') or '(none)'}`, "
+                      f"but this model is served by {expect_backend}: the command would switch the wrong backend")
+    return PASS, (f"the gateway refused with the doesn't-fit line ({m.group('model')}, {m.group('ctx')}-token context, "
+                  f"remedy {'--backend ' + m.group('backend') if m.group('backend') else 'without a command'}) and attempted no answer")
+
+
 def judge_pinned(text: str, tool_names: list[str], facts: dict, done: dict | None) -> tuple[int, str]:
     if not facts["readable"]:
         return NOT_JUDGED, "the gateway log could not be read"
@@ -774,10 +799,10 @@ def cmd_doesnt_fit(a) -> int:
     prompt = filler(a.chars) + "\n\nQuestion: in one sentence, what is the text above about?"
     chat, facts, secs = timed_turn(prompt, a.gateway, a.turn_timeout)
     if chat["error"] and not chat["text"]:
-        rc, why = FAIL, f"the turn failed: {chat['error']}"
+        rc, why = judge_refusal_error(chat["error"], [c["name"] for c in chat["calls"]], facts, a.expect_backend)
     else:
         rc, why = judge_doesnt_fit(chat["text"], [c["name"] for c in chat["calls"]], facts)
-    print(f"  reply ({secs:.1f} s): {_excerpt(chat['text'], 400)}")
+    print(f"  reply ({secs:.1f} s): {_excerpt(chat['text'] or chat['error'] or '', 400)}")
     print(f"CONTEXT-FIT doesnt-fit ({a.chars} chars): {NAMES[rc]}: {why}")
     return rc
 
@@ -825,6 +850,8 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--model-label")
     d = sub.add_parser("doesnt-fit", help="a turn too big for the window says so")
     d.add_argument("--chars", type=int, default=60000)
+    d.add_argument("--expect-backend", choices=["ollama", "vllm"],
+                   help="the backend serving the chat model: the line's remedy must name it")
     sub.add_parser("pinned-check", help="a tool turn on the 4096 pin: Compact tier, no cut, question kept")
     sub.add_parser("tool-replay", help="a tool turn answers; a raw backend error never reaches the person")
     a = ap.parse_args(argv)
