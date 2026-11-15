@@ -455,6 +455,26 @@ def rag_chat_line(doc_text: str) -> str:
     return m.group(1) if m else RAG_CHAT_DEFAULT
 
 
+# The gateway's answer cache is keyed by the prompt: the cell's own rag-chat
+# step asked the doc's line already, so the judge asks it in other words or
+# it is answered in 0.1 s from the cache and judges nothing (fa, run
+# 43656150029).
+RAG_JUDGE_SUFFIX = " Answer in two or three sentences, naming the date or code it mentions."
+
+
+def rag_judge_prompt(doc_text: str) -> str:
+    return rag_chat_line(doc_text) + RAG_JUDGE_SUFFIX
+
+
+def turns_exit(verdicts, tiers_seen) -> int:
+    """An older build (no request_size line carries tier=) is NOT JUDGED,
+    whatever its turns did: their verdicts stay in turns.json as the
+    "before" evidence, but they never fail the cell. Else the usual rule."""
+    if not tiers_seen:
+        return NOT_JUDGED
+    return exit_code(verdicts)
+
+
 def _size_desc(s: dict) -> str:
     return " ".join(f"{k}={s.get(k)}" for k in ("tier", "system", "prompt", "tool_tokens", "total", "window",
                                                   "calib_ratio", "calib_samples") if k in s)
@@ -617,7 +637,7 @@ def cmd_turns(a) -> int:
     mode = os.environ.get("MODEL", "default")
     fp = first_prompt(doc_text)
     plan = [("first-answer", fp, lambda c: judge_first_answer(c["text"], na, df)),
-            ("rag", rag_chat_line(doc_text), lambda c: judge_rag(c["text"])),
+            ("rag", rag_judge_prompt(doc_text), lambda c: judge_rag(c["text"])),
             ("tool", TOOL_QUESTION, lambda c: judge_tool(c["text"], [x["name"] for x in c["calls"]])),
             ("refusal", REFUSAL_QUESTION, lambda c: judge_refusal(c["text"], c["calls"], c["approval"]))]
     turns = []
@@ -640,8 +660,11 @@ def cmd_turns(a) -> int:
     os.makedirs(a.out, exist_ok=True)
     with open(os.path.join(a.out, "turns.json"), "w", encoding="utf-8") as f:
         json.dump(doc, f, indent=1, ensure_ascii=False)
-    rc = exit_code([t["pass"] for t in turns])
-    print(f"CONTEXT-FIT turns: {NAMES[rc]} (tiers seen: {', '.join(doc['tier_seen']) or 'none: an older build'})")
+    rc = turns_exit([t["pass"] for t in turns], doc["tier_seen"])
+    if not doc["tier_seen"]:
+        print("CONTEXT-FIT turns: NOT JUDGED (no tier= in the gateway log: an older build; the per-turn verdicts above are kept in turns.json as the before evidence)")
+    else:
+        print(f"CONTEXT-FIT turns: {NAMES[rc]} (tiers seen: {', '.join(doc['tier_seen'])})")
     return rc
 
 
