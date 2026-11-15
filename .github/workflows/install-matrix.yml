@@ -56,6 +56,12 @@ jobs:
           # GPU-less box (the 7.2 GB product default today). Time to first
           # answer and peak disk here are themselves a finding.
           - {cell: ubuntu-24.04-amd64-default, runner: ubuntu-24.04, docker: preinstalled, onboard: ci, model: default, scope: full, experimental: false}
+          # A/B for the speed report (i802): the default cell with the
+          # shared Ollama at the compose default of 4 slots, not onboard's 1
+          # on a new CPU-only install. On a one-box that daemon serves chat
+          # too, so its slot count bears on chat prefill. Compare its
+          # context-fit turns.json with the default cell's.
+          - {cell: ubuntu-24.04-amd64-slots4, runner: ubuntu-24.04, docker: preinstalled, onboard: ci, model: default, scope: full, experimental: true, embed_slots: "4"}
           - {cell: ubuntu-22.04-amd64, runner: ubuntu-22.04, docker: preinstalled, onboard: ci, model: tiny, scope: full, experimental: false}
           # The engine most strangers get: Ubuntu's own `apt install docker.io`
           # (with docker-compose-v2), not the image's docker-ce. Same steps,
@@ -97,6 +103,8 @@ jobs:
           SCOPE: ${{ matrix.scope }}
           # expect: refusal (the arm64 cells): the cell asserts the controller refusal.
           EXPECT: ${{ matrix.expect || '' }}
+          # embed_slots (the A/B cell): OLLAMA_EMBED_NUM_PARALLEL after onboard.
+          EMBED_SLOTS: ${{ matrix.embed_slots || '' }}
           CLI_TAG: ${{ inputs.cli_tag || 'latest' }}
         run: bash scripts/install-cell/run.sh
       - name: Upload the cell's report (redacted; scanned by run.sh)
