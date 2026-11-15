@@ -169,6 +169,26 @@ mod tests {
         assert_eq!(bare["usage"]["noo_truncated"]["context"], 3);
     }
 
+    /// The wiring, held by source: the raw proxy watches each Ollama attempt
+    /// it stamped, judges a whole answer's count before returning it (field,
+    /// header, note), and hands the watch to the stream tap, which judges
+    /// the stream's last count when it ends.
+    #[test]
+    fn the_raw_proxy_and_the_stream_tap_judge_the_count() {
+        let raw = crate::test_src::own_code(include_str!("routes/raw_chat.rs"));
+        let send = crate::test_src::fn_body(&raw, "pub async fn send_with_failover_pinned<F>(");
+        assert!(send.contains("sent_in.lock()") && send.contains("coordinator::estimate_tokens(msgs)"), "each stamped attempt is recorded");
+        let json_arm = &send[send.find("CoreBody::Json(mut data) =>").expect("the whole-answer arm")..];
+        let judged = json_arm.find("w.judge(p as u64)").expect("judged");
+        for step in ["crate::context_cut::mark_body(&mut data, &cut);", "served.truncated = Some(cut.header_value());", "w.note(&cut).await;"] {
+            assert!(json_arm[judged..].contains(step), "{step}");
+        }
+        assert!(send.contains("cut: watch.clone(),"), "the stream tap gets the watch");
+        let usage = crate::test_src::own_code(include_str!("usage.rs"));
+        let drop = crate::test_src::fn_body(&usage, "impl Drop for UsageTap \u{7b}");
+        assert!(drop.contains("w.judge(u64::from(p))") && drop.contains("w.note(&cut).await"), "{drop}");
+    }
+
     /// One warn per (consumer, model) per hour; another caller or model is
     /// its own line.
     #[test]
