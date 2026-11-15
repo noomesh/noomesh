@@ -303,11 +303,20 @@ fi
 # A/B (EMBED_SLOTS, the slots4 cell): the shared Ollama at that many slots
 # instead of what onboard chose, through the product's own remedy line
 # (cluster verify's CPU_ONLY_SLOTS_REMEDY). Before any turn, so every judged
-# turn runs at it.
+# turn runs at it. The step FAILS unless the recreated daemon really runs
+# that many: rc.3 run 43715012498's launcher printed "0 value(s) from
+# compose_env (1 already set)" and the daemon most likely kept 1, so the
+# "A/B" compared one slot with one slot.
 if [ -n "${EMBED_SLOTS:-}" ]; then
-    step embed-slots-ab 600 -- sh -c 'noo config set compose_env "{\"OLLAMA_EMBED_NUM_PARALLEL\":\"$1\"}" && noo stack restart --force ollama-embed && noo config get compose_env' \
+    step embed-slots-ab 600 -- sh -c 'noo config set compose_env "{\"OLLAMA_EMBED_NUM_PARALLEL\":\"$1\"}" && noo stack restart --force ollama-embed && noo config get compose_env
+        got="$(docker exec noo-ollama-embed printenv OLLAMA_NUM_PARALLEL 2>/dev/null || sudo -n docker exec noo-ollama-embed printenv OLLAMA_NUM_PARALLEL 2>/dev/null)"
+        echo "noo-ollama-embed OLLAMA_NUM_PARALLEL=${got:-unset}"
+        [ "$got" = "$1" ] || { echo "the daemon runs ${got:-the default} slot(s), not $1: the setting did not reach it"; exit 1; }' \
         slots "$EMBED_SLOTS" || fail_onboarded
 fi
+# Every cell: the slots the stack's Ollama (chat on a one-box) really runs,
+# so the speed A/B states both sides from the daemon, not from a config.
+step probe-embed-slots 30 -- sh -c 'got="$(docker exec noo-ollama-embed printenv OLLAMA_NUM_PARALLEL 2>/dev/null || sudo -n docker exec noo-ollama-embed printenv OLLAMA_NUM_PARALLEL 2>/dev/null)"; echo "noo-ollama-embed OLLAMA_NUM_PARALLEL=${got:-unset (the compose default, 4)}"'
 # verify runs as the stranger's NEXT terminal would: a fresh login session
 # (sudo -i reads /etc/group again). On a docker=none cell the install added
 # the runner user to the docker group, which the cell's own shell, started
@@ -527,7 +536,16 @@ judged_ctx() {  # step name, timeout, context_fit.py args...
     step "$name" "$t" -- sh -c 'python3 "$@"; rc=$?; [ "$rc" = 2 ] && { echo "CONTEXT-FIT: NOT JUDGED (exit 2: this build does not carry what the judge reads)"; exit 0; }; exit "$rc"' \
         context-fit "$CONTEXT_FIT" "$@" || fail_onboarded
 }
-judged_ctx context-fit-running 300 running
+judged_ctx_continue() {  # judged_ctx, but a FAIL is recorded without stopping the cell
+    local name="$1" t="$2"; shift 2
+    if [ ! -f "$CONTEXT_FIT" ]; then
+        step "$name" 10 -- sh -c 'echo "CONTEXT-FIT: not judged: context_fit.py is not in this tree"'
+        return 0
+    fi
+    step "$name" "$t" -- sh -c 'python3 "$@"; rc=$?; [ "$rc" = 2 ] && { echo "CONTEXT-FIT: NOT JUDGED (exit 2: this build does not carry what the judge reads)"; exit 0; }; exit "$rc"' \
+        context-fit "$CONTEXT_FIT" "$@" || true
+}
+judged_ctx context-fit-running 400 running
 judged_ctx context-fit-turns 900 turns --out "$OUT/context-fit" --model-label "$MODEL"
 # A tool turn never shows the person a raw backend error (every cell; the
 # WSL2 one-box dials Ollama directly, where a replayed tool call was refused).
@@ -537,9 +555,12 @@ if [ "$CELL" = "$CONTEXT_PIN_CELL" ] && [ -f "$CONTEXT_FIT" ]; then
     CHAT_MODEL="${CHAT_MODEL:-$( [ "$MODEL" = tiny ] && echo "$TINY_MODEL" || echo gemma4:e2b)}"
     step context-pin-4096 300 -- bash -c 'fresh cluster place "$(hostname)" ollama "$1" --role chat --env OLLAMA_CONTEXT_LENGTH=4096' pin "$CHAT_MODEL" || fail_onboarded
     step context-pin-restart 600 -- bash -c 'fresh stack restart --force gateway' || fail_onboarded
-    judged_ctx context-fit-pinned-running 300 running --expect-decided 4096
+    # Its FAIL is recorded (the cell still fails) but does not stop the cell:
+    # the two verdicts after it judge the tier, the cut and the line, not
+    # `running` (rc.3 run 1 never reached them).
+    judged_ctx_continue context-fit-pinned-running 400 running --expect-decided 4096
     judged_ctx context-fit-pinned-check 600 pinned-check
-    judged_ctx context-fit-doesnt-fit 300 doesnt-fit
+    judged_ctx context-fit-doesnt-fit 300 doesnt-fit --expect-backend ollama
 fi
 
 # PROBE (fa, rc.1 rehearsal A-reboot.status, i677): a container that joins

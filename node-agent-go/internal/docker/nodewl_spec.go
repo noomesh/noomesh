@@ -38,12 +38,11 @@ const WorkloadDoorPort = 8443
 // of noo.managed-by is "agent", deliberately not the "node-agent-go" the
 // backend path writes, so no backend sweep claims a workload's container.
 const (
-	LabelManagedBy   = "noo.managed-by"
-	ManagedByAgent   = "agent"
-	LabelRole        = "noo.role"
-	LabelReservation = "noo.reservation"
-	RoleDoor         = "door"
-	RoleWorker       = "worker"
+	LabelManagedBy = "noo.managed-by"
+	ManagedByAgent = "agent"
+	LabelRole      = "noo.role"
+	RoleDoor       = "door"
+	RoleWorker     = "worker"
 
 	// The worker container's drain config, so a workload that desired-config
 	// no longer lists (an orphan) can still be drained, even after an agent
@@ -192,9 +191,11 @@ func baseLabels(e nodewl.Entry, role string) map[string]string {
 		LabelManagedBy: ManagedByAgent,
 		LabelRole:      role,
 	}
-	if e.Reservation != nil && *e.Reservation != "" {
-		l[LabelReservation] = *e.Reservation
-	}
+	// No reservation label: labels are part of the spec hash, so a label
+	// carrying the reservation id rebuilt the door and the worker on every
+	// reserve (0.6.25-rc.3: a reserve recreated a pair it should only have
+	// started). The reservation lives in the gateway's placement row; nothing
+	// on the node read the label.
 	return l
 }
 

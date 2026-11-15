@@ -67,6 +67,8 @@ type fakeProv struct {
 	// unknownStart: StartContainer reports no start time, as a daemon that
 	// did not report one would (set before the start path runs).
 	unknownStart bool
+	// startFail: StartContainer of that name fails this many more times.
+	startFail map[string]int
 }
 
 func (f *fakeProv) ctr(name string) *ctrInfo {
@@ -109,6 +111,10 @@ func (f *fakeProv) StartContainer(_ context.Context, name string) error {
 	c := f.ctrs[name]
 	if c == nil {
 		return errors.New("no such container")
+	}
+	if f.startFail[name] > 0 {
+		f.startFail[name]--
+		return errors.New("OCI runtime create failed: unable to apply cgroup configuration")
 	}
 	c.Running, c.Status = true, "running"
 	switch {
@@ -529,8 +535,8 @@ func TestWorkerWithoutGPUHasNoNvidiaSurface(t *testing.T) {
 	if !reflect.DeepEqual(w.Config.Env, []string{"HF_HUB_OFFLINE=1", "TRANSFORMERS_OFFLINE=1"}) {
 		t.Errorf("env %v", w.Config.Env)
 	}
-	if w.Config.Labels[LabelReservation] != "0b1f5f0e-6a3e-4a54-9d3c-0a4e5b9c7d21" {
-		t.Errorf("reservation label %v", w.Config.Labels)
+	if _, ok := w.Config.Labels["noo.reservation"]; ok {
+		t.Errorf("a reservation label is back on the worker (it rebuilt the pair on every reserve): %v", w.Config.Labels)
 	}
 	if len(w.Host.Mounts) != 0 {
 		t.Errorf("mounts %+v", w.Host.Mounts)
@@ -843,7 +849,6 @@ func TestASpecChangeRecreatesBothStopped(t *testing.T) {
 			h.sets[modelsets.Ref{ID: "rh-voices-a", Revision: "v2"}] = modelsets.Status{State: modelsets.StateVerified}
 		},
 		"leaf re-issued": func(h *harness) { writeLeaf(h.t, h.pki, "svc-addon-rhaddon-worker", "noo-stunnel-rhaddon-worker") },
-		"reservation":    func(h *harness) { r := "0b1f5f0e-6a3e-4a54-9d3c-0a4e5b9c7d21"; h.entry.Reservation = &r },
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := newHarness(t)
@@ -874,6 +879,28 @@ func TestASpecChangeRecreatesBothStopped(t *testing.T) {
 				t.Error("recreated running")
 			}
 		})
+	}
+}
+
+// A reservation is not a spec change (0.6.25-rc.3: it was, through a label,
+// and every reserve rebuilt the stopped pair before starting it).
+func TestAReservationChangeDoesNotRecreateThePair(t *testing.T) {
+	h := newHarness(t)
+	mustProvision(t, h)
+	old := h.api.ctrs["noo-wl-rhaddon-worker"].Labels[SpecHashLabel]
+	h.api.calls = nil
+	r := "0b1f5f0e-6a3e-4a54-9d3c-0a4e5b9c7d21"
+	h.entry.Reservation = &r
+	if err := h.provision(); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range h.api.calls {
+		if c != "load" {
+			t.Fatalf("a reservation change touched the pair: %v", h.api.calls)
+		}
+	}
+	if h.api.ctrs["noo-wl-rhaddon-worker"].Labels[SpecHashLabel] != old {
+		t.Error("the spec hash moved with the reservation")
 	}
 }
 

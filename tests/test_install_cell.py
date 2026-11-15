@@ -810,7 +810,7 @@ def test_the_pinned_context_runs_on_one_cell_after_the_unpinned_judges():
     text = (ROOT / "scripts/install-cell/run.sh").read_text()
     assert 'CONTEXT_PIN_CELL=stranger-24.04' in text
     i_rag = text.index("step rag-chat 60")
-    i_run = text.index("judged_ctx context-fit-running 300 running")
+    i_run = text.index("judged_ctx context-fit-running 400 running")
     i_turns = text.index('judged_ctx context-fit-turns 900 turns --out "$OUT/context-fit"')
     i_pin = text.index('if [ "$CELL" = "$CONTEXT_PIN_CELL" ] && [ -f "$CONTEXT_FIT" ]; then')
     assert i_rag < i_run < i_turns < i_pin, "unpinned judges first; the pin changes the chat context for the rest of the cell"
@@ -818,4 +818,22 @@ def test_the_pinned_context_runs_on_one_cell_after_the_unpinned_judges():
     order = [pinned.index(k) for k in ("--env OLLAMA_CONTEXT_LENGTH=4096", "stack restart --force gateway",
                                         "running --expect-decided 4096", "pinned-check", "doesnt-fit")]
     assert order == sorted(order), "pin, restart (the gateway caches the decided context 600 s), then judge"
+    # pinned-running's FAIL is recorded but does not stop the cell, so the
+    # pinned-check and doesnt-fit verdicts still come (rc.3 run 43715012498).
+    assert "judged_ctx_continue context-fit-pinned-running 400 running --expect-decided 4096" in pinned
+    cont = text[text.index("judged_ctx_continue() {"):text.index("\n}\n", text.index("judged_ctx_continue() {"))]
+    assert cont.rstrip().endswith("|| true") and "fail_onboarded" not in cont, cont
     assert 'step "$name" 10 -- sh -c \'echo "CONTEXT-FIT: not judged: context_fit.py is not in this tree"\'' in text
+
+
+def test_the_slots_ab_proves_the_daemon_runs_what_it_set():
+    """rc.3 run 43715012498: the slots4 cell's compose_env said 4, the
+    launcher kept an earlier value ("1 already set") and the A/B compared one
+    slot with one slot. The step now reads the daemon itself and fails unless
+    it runs EMBED_SLOTS; every cell prints its own for the other side."""
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    ab = text[text.index("step embed-slots-ab"):text.index("|| fail_onboarded", text.index("step embed-slots-ab"))]
+    assert "docker exec noo-ollama-embed printenv OLLAMA_NUM_PARALLEL" in ab, ab
+    assert '[ "$got" = "$1" ] || {' in ab and "exit 1; }" in ab, ab
+    probe = text[text.index("step probe-embed-slots"):]
+    assert "docker exec noo-ollama-embed printenv OLLAMA_NUM_PARALLEL" in probe.split("\n")[0]

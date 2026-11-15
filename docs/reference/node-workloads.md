@@ -379,7 +379,7 @@ The agent creates the worker with exactly this and nothing more.
 | Env | the entry's declared keys; `<ADDON_UPPER>_MODEL_<SLOT_UPPER>_ID` and `_REVISION` per placed slot (comma-separated for a `many` slot); `HF_HUB_OFFLINE=1`; `TRANSFORMERS_OFFLINE=1`. Nothing else. A declared key that collides with one the agent sets is `env_out_of_bounds` |
 | Limits | memory `limits.ram_mb` (swap equal to memory, so none), `limits.cpus`, `limits.pids` |
 | Restart | `no` |
-| Labels | `noo.addon`, `noo.workload`, `noo.managed-by=agent`, `noo.role`, `noo.spec.hash`, and `noo.reservation` when set. The worker also carries `noo.drain-path`, `noo.drain-done-path` and `noo.drain-timeout-secs` |
+| Labels | `noo.addon`, `noo.workload`, `noo.managed-by=agent`, `noo.role` and `noo.spec.hash`. No reservation id: the reservation lives in the gateway's placement row, and a label would put it in the spec hash. The worker also carries `noo.drain-path`, `noo.drain-done-path` and `noo.drain-timeout-secs` |
 
 Only `.verified` sets are bound (a set the agent has not verified is
 `set_unverified`, one it does not hold is `set_missing`, one still being
@@ -411,7 +411,9 @@ fetched is not a refusal: the row stays pending).
 - **Recreate.** One spec hash (the image, the door image and conf, the leaf's
   fingerprint, the sets, the env, the limits, the labels) is stored on both
   containers. A matching pair is left alone; any change removes both (and the
-  scratch volumes) and recreates them stopped. A running worker is never
+  scratch volumes) and recreates them stopped. A reservation is not a change:
+  a reserve after provision starts the same two containers, it does not
+  rebuild them. A running worker is never
   recreated by a provision: it returns `ErrWorkerRunning` and the caller
   drains first.
 - A container, volume or network with the workload's name that lacks
@@ -485,6 +487,25 @@ re-check of the decl (inside a desired-config entry) is **shape only**
 as an input and a nil input skips only the existence and internal check. It is
 carried in desired-config only as part of the verbatim `decl`.
 
+## A CPU workload holds no GPU
+
+A reservation of a node workload declared `accel.gpu` 0 takes **no GPU
+lease**: nothing on the node drains or pauses, and the node's chat and embed
+backends keep serving while the workload runs. The reservation lives on the
+workload's placement row instead (`reservation`, `holder`, `reserved_at`,
+migration 124), and `noo cluster reservations` lists it with `gpu` `no`.
+Release follows the same rule as a GPU reservation: the holder, or anyone with
+`--force` (audited). A GPU workload (`accel.gpu` > 0) still takes its drain
+hold exactly as before.
+
+Rolling back to a gateway older than 0.6.25: **release every CPU-workload
+reservation first** (`noo cluster reservations`, then `noo cluster release
+<id>` for each with `gpu` `no`). An older gateway lists reservations only from
+GPU leases, so it does not see one held on a placement row. The node agent
+keeps running the workload from its placement row, and an older gateway's
+release of that id answers `no reservation <id>`; set the placement back with
+the new gateway, or remove and re-place the workload.
+
 ## State machine
 
 | State | Meaning |
@@ -495,8 +516,10 @@ carried in desired-config only as part of the verbatim `decl`.
 
 - `absent` to `provisioned`: load the image tar from the rail, check it yields
   exactly one image whose ID equals `image.id`, verify the sets, create the sidecar and the worker stopped.
-- `provisioned` to `running`: start. A worker not ready within `start_secs`
-  reports `start_timeout`.
+- `provisioned` to `running`: start the sidecar, then the worker. A start the
+  daemon refuses is retried once after 2 s (the first error is logged); if
+  the retry fails too the start is refused `start_failed` with both errors. A
+  worker not ready within `start_secs` reports `start_timeout`.
 - **Release returns the row to `provisioned`**: drain the worker as described
   under "The worker's drain" (POST `drain.path`, poll `drain.done_path`, all
   within `drain.timeout_secs`), stop, remove the worker and its scratch,

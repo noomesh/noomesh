@@ -107,18 +107,60 @@ pub async fn for_node(db: impl sqlx::PgExecutor<'_>, node_id: &str) -> Result<Ve
 /// A reservation takes the placement (i300 H4): `running` under
 /// `reservation`, only on its own node and only from `provisioned`, so two
 /// reservations can never both hold one workload. False when it was not so.
-pub async fn set_running(db: impl sqlx::PgExecutor<'_>, node_id: &str, addon: &str, workload: &str, reservation: &str) -> Result<bool, sqlx::Error> {
+///
+/// `holder` is who took it (the caller's credential, as a GPU lease's owner
+/// is): a CPU workload's reservation is listed and released from this row.
+pub async fn set_running(db: impl sqlx::PgExecutor<'_>, node_id: &str, addon: &str, workload: &str, reservation: &str, holder: &str) -> Result<bool, sqlx::Error> {
     let r = sqlx::query(
-        "UPDATE noo_node_workload_placements SET desired_state = 'running', reservation = $4::uuid, updated_at = now() \
+        "UPDATE noo_node_workload_placements SET desired_state = 'running', reservation = $4::uuid, holder = $5, \
+         reserved_at = now(), updated_at = now() \
          WHERE addon = $1 AND workload = $2 AND node_id = $3 AND desired_state = 'provisioned'",
     )
     .bind(addon)
     .bind(workload)
     .bind(node_id)
     .bind(reservation)
+    .bind(holder)
     .execute(db)
     .await?;
     Ok(r.rows_affected() == 1)
+}
+
+/// A reservation held on a placement row: `running` under `reservation`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Held {
+    pub addon: String,
+    pub workload: String,
+    pub node_id: String,
+    pub reservation: String,
+    /// NULL on a row reserved before 124 (a 0.6.24 row): no one recorded.
+    pub holder: Option<String>,
+    /// RFC 3339, or None on a row reserved before 124.
+    pub reserved_at: Option<String>,
+}
+
+/// Every placement that runs under a reservation, by node then key.
+pub async fn held(db: impl sqlx::PgExecutor<'_>) -> Result<Vec<Held>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT addon, workload, node_id, reservation::text AS reservation, holder, \
+         to_char(reserved_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS reserved_at \
+         FROM noo_node_workload_placements WHERE desired_state = 'running' AND reservation IS NOT NULL \
+         ORDER BY node_id, addon, workload",
+    )
+    .fetch_all(db)
+    .await?;
+    rows.iter()
+        .map(|r| {
+            Ok(Held {
+                addon: r.try_get("addon")?,
+                workload: r.try_get("workload")?,
+                node_id: r.try_get("node_id")?,
+                reservation: r.try_get("reservation")?,
+                holder: r.try_get("holder")?,
+                reserved_at: r.try_get("reserved_at")?,
+            })
+        })
+        .collect()
 }
 
 /// The reservation gives the placement back (a release, or a start that
@@ -127,7 +169,7 @@ pub async fn set_running(db: impl sqlx::PgExecutor<'_>, node_id: &str, addon: &s
 /// it was not held by it.
 pub async fn set_provisioned(db: impl sqlx::PgExecutor<'_>, node_id: &str, addon: &str, workload: &str, reservation: &str) -> Result<bool, sqlx::Error> {
     let r = sqlx::query(
-        "UPDATE noo_node_workload_placements SET desired_state = 'provisioned', reservation = NULL, updated_at = now() \
+        "UPDATE noo_node_workload_placements SET desired_state = 'provisioned', reservation = NULL, holder = NULL, reserved_at = NULL, updated_at = now() \
          WHERE addon = $1 AND workload = $2 AND node_id = $3 AND reservation = $4::uuid",
     )
     .bind(addon)
@@ -211,19 +253,46 @@ mod tests {
         // H4: a reservation takes it (once), gives it back (only its own).
         let res_a = "0f0e0d0c-0b0a-4908-8706-050403020100";
         let res_b = "1f0e0d0c-0b0a-4908-8706-050403020100";
-        assert!(set_running(&db, &node_a, "rhaddon", "worker", res_a).await.expect("run"));
+        assert!(set_running(&db, &node_a, "rhaddon", "worker", res_a, "alice").await.expect("run"));
         let held = get(&db, "rhaddon", "worker").await.unwrap().unwrap();
         assert_eq!((held.desired_state.as_str(), held.reservation.as_deref()), ("running", Some(res_a)));
-        assert!(!set_running(&db, &node_a, "rhaddon", "worker", res_b).await.expect("second take"), "a second reservation cannot take it");
-        assert!(!set_running(&db, &node_b, "rhaddon", "worker", res_b).await.expect("wrong node"), "only on its own node");
+        assert!(!set_running(&db, &node_a, "rhaddon", "worker", res_b, "bob").await.expect("second take"), "a second reservation cannot take it");
+        assert!(!set_running(&db, &node_b, "rhaddon", "worker", res_b, "bob").await.expect("wrong node"), "only on its own node");
         assert!(!set_provisioned(&db, &node_a, "rhaddon", "worker", res_b).await.expect("stale release"), "another reservation cannot give it back");
         assert_eq!(get(&db, "rhaddon", "worker").await.unwrap().unwrap().reservation.as_deref(), Some(res_a));
+        // 124: the row carries who holds it, and the losing take changed nothing.
+        let h = super::held(&db).await.expect("held");
+        let mine: Vec<_> = h.iter().filter(|x| x.addon == "rhaddon" && x.workload == "worker").collect();
+        assert_eq!(mine.len(), 1, "{h:?}");
+        assert_eq!((mine[0].reservation.as_str(), mine[0].holder.as_deref(), mine[0].node_id.as_str()), (res_a, Some("alice"), node_a.as_str()));
+        assert!(mine[0].reserved_at.as_deref().is_some_and(|t| t.ends_with('Z')), "{:?}", mine[0].reserved_at);
         // A re-place while it runs keeps the state and the reservation.
         assert_eq!(place(&db, &again).await.expect("re-place while running"), Placed::Written);
         assert_eq!(get(&db, "rhaddon", "worker").await.unwrap().unwrap().desired_state, "running");
         assert!(set_provisioned(&db, &node_a, "rhaddon", "worker", res_a).await.expect("release"));
         let back = get(&db, "rhaddon", "worker").await.unwrap().unwrap();
         assert_eq!((back.desired_state.as_str(), back.reservation), ("provisioned", None));
+        assert!(super::held(&db).await.expect("held").iter().all(|x| !(x.addon == "rhaddon" && x.workload == "worker")), "released: not held");
+
+        // A row reserved before 124 (a 0.6.24 gateway wrote no holder) reads
+        // back with holder NULL, still listed under its reservation.
+        sqlx::query("UPDATE noo_node_workload_placements SET desired_state = 'running', reservation = $1::uuid, holder = NULL, reserved_at = NULL WHERE addon = 'rhaddon' AND workload = 'worker'")
+            .bind(res_b).execute(&db).await.expect("an old-style hold");
+        let old = super::held(&db).await.expect("held");
+        let old: Vec<_> = old.iter().filter(|x| x.addon == "rhaddon" && x.workload == "worker").collect();
+        assert_eq!((old[0].holder.as_deref(), old[0].reserved_at.as_deref()), (None, None));
+        assert!(set_provisioned(&db, &node_a, "rhaddon", "worker", res_b).await.expect("release old"));
+
+        // Two takes at once: exactly one wins (the from-provisioned transition).
+        let (x, y) = tokio::join!(
+            set_running(&db, &node_a, "rhaddon", "worker", res_a, "alice"),
+            set_running(&db, &node_a, "rhaddon", "worker", res_b, "bob"),
+        );
+        let (x, y) = (x.expect("take x"), y.expect("take y"));
+        assert!(x ^ y, "exactly one of two concurrent takes wins (x={x}, y={y})");
+        let winner = super::held(&db).await.expect("held").into_iter().find(|h| h.addon == "rhaddon" && h.workload == "worker").expect("held");
+        assert_eq!(winner.holder.as_deref(), Some(if x { "alice" } else { "bob" }));
+        assert!(set_provisioned(&db, &node_a, "rhaddon", "worker", &winner.reservation).await.expect("release winner"));
 
         // Remove: only where it is.
         assert!(!remove(&db, &node_b, "rhaddon", "worker").await.expect("remove elsewhere"));

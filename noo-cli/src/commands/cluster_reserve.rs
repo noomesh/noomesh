@@ -68,7 +68,7 @@ pub fn cluster_reserve(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
     if !g.json {
         println!("{}", ui::muted(&format!(
-            "{}: reserving a GPU{} — the pool's work there finishes first (up to {timeout} s), then the workload starts",
+            "{}: reserving{} — a GPU workload waits up to {timeout} s for the pool's work there to finish; a CPU workload starts at once",
             a.workload,
             a.node.as_deref().map(|n| format!(" on {n}")).unwrap_or_default()
         )));
@@ -86,6 +86,11 @@ pub fn cluster_reserve(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let node = resp["node"].as_str().unwrap_or("?");
     let paused = resp["paused_backends"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default();
     match resp["status"].as_str().unwrap_or("") {
+        "reserved" if resp["gpu"] == Value::Bool(false) => {
+            ui::done(&format!("{}: reserved on {node} — {} running (a CPU workload: no GPU is held; the node's backends keep serving)",
+                a.workload,
+                resp["worker"]["container"].as_str().unwrap_or("the workload")));
+        }
         "reserved" => {
             ui::done(&format!("{}: reserved on {node} — {} running; the pool's {} paused",
                 a.workload,
@@ -96,7 +101,11 @@ pub fn cluster_reserve(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             ui::warned(&format!("{}: reservation {id} on {node} is {other} — {}", a.workload, resp["detail"].as_str().unwrap_or("")));
         }
     }
-    println!("{}", ui::muted(&format!("reservation {id} (generation {})", resp["lease"]["generation"].as_u64().unwrap_or(0))));
+    if resp["gpu"] == Value::Bool(false) {
+        println!("{}", ui::muted(&format!("reservation {id} (no GPU lease: it is held on the workload's placement)")));
+    } else {
+        println!("{}", ui::muted(&format!("reservation {id} (generation {})", resp["lease"]["generation"].as_u64().unwrap_or(0))));
+    }
     let release = format!("noo cluster release {id}");
     ui::guide(&[
         (release.as_str(), "drains the workload, stops it and returns the GPU to the pool"),
@@ -138,11 +147,13 @@ pub fn cluster_reservations(g: &Globals, args: &[String]) -> Result<i32, Unhandl
                 r["holder"].as_str().unwrap_or("?").to_string(),
                 r["node"].as_str().unwrap_or("?").to_string(),
                 state,
+                // A gateway before 0.6.25 sends no `gpu`: every reservation was a GPU lease.
+                if r["gpu"] == Value::Bool(false) { "no".to_string() } else { "yes".to_string() },
                 r["since"].as_str().unwrap_or("").to_string(),
             ]
         })
         .collect();
-    println!("{}", ui::table(&[Col::left("reservation"), Col::left("workload"), Col::left("holder"), Col::left("node"), Col::left("state"), Col::left("since")], &rows));
+    println!("{}", ui::table(&[Col::left("reservation"), Col::left("workload"), Col::left("holder"), Col::left("node"), Col::left("state"), Col::left("gpu"), Col::left("since")], &rows));
     ui::guide(&[("noo cluster release <reservation-id>", "returns that GPU to the pool")]);
     Ok(0)
 }
@@ -200,11 +211,27 @@ pub fn cluster_release(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 
 /// Render a refusal: the gateway's code and sentence, with the remedy.
 fn refused(g: &Globals, op: &str, what: &str, status: u16, text: &str) -> ! {
-    let msg = serde_json::from_str::<Value>(text).ok()
-        .and_then(|v| v["error"].as_str().map(str::to_string))
-        .unwrap_or_else(|| text.trim().to_string());
+    let msg = refusal_text(text);
     let (kind, hint) = refusal_hint(op, what, status, &msg);
     fail(g.json, ExitCode::RemoteError, kind, &format!("{what}: {op} refused — {msg}"), Some(&hint))
+}
+
+/// The gateway's refusal as one line: its `error`, then its `detail` when it
+/// has one (code first, so the hints below still match on it). A 500's body
+/// is `{"error": "internal error", "detail": "internal error (ref …); the
+/// gateway log has the cause"}`: printing `error` alone dropped the ref, the
+/// one thing that leads to the cause (0.6.25-rc.3 rehearsal, A-nodewl.reserve).
+pub(crate) fn refusal_text(text: &str) -> String {
+    let Ok(v) = serde_json::from_str::<Value>(text) else { return text.trim().to_string() };
+    let err = v["error"].as_str().map(str::trim).filter(|e| !e.is_empty());
+    let detail = v["detail"].as_str().map(str::trim).filter(|d| !d.is_empty());
+    match (err, detail) {
+        (Some(e), Some(d)) if d.starts_with(e) => d.to_string(),
+        (Some(e), Some(d)) => format!("{e}: {d}"),
+        (Some(e), None) => e.to_string(),
+        (None, Some(d)) => d.to_string(),
+        (None, None) => text.trim().to_string(),
+    }
 }
 
 fn refusal_hint(op: &str, what: &str, status: u16, msg: &str) -> (&'static str, String) {
@@ -261,5 +288,22 @@ mod tests {
         assert_eq!(refusal_hint("reserve", "a/b", 409, "no node can take a/b: awolf: GPU held by x").0, "no_node_fits");
         assert_eq!(refusal_hint("reserve", "a/b", 409, "drain_timeout: still in flight").0, "reservation_needs_attention");
         assert_eq!(refusal_hint("release", "r", 409, "a/b did not stop on awolf: drain route refused").0, "reservation_needs_attention");
+    }
+}
+
+#[cfg(test)]
+mod refusal_text_tests {
+    use super::refusal_text;
+
+    /// 0.6.25-rc.3 rehearsal: a 500 printed "internal error" and dropped the
+    /// ref that leads to the cause. The detail is shown, code first.
+    #[test]
+    fn a_refusal_shows_the_detail_and_the_ref() {
+        let internal = r#"{"error":"internal error","detail":"internal error (ref ab12cd34); the gateway log has the cause","ref":"ab12cd34"}"#;
+        assert_eq!(refusal_text(internal), "internal error (ref ab12cd34); the gateway log has the cause");
+        let retry = r#"{"error":"node_workloads_not_loaded","detail":"x cannot start on n: retry"}"#;
+        assert_eq!(refusal_text(retry), "node_workloads_not_loaded: x cannot start on n: retry");
+        assert_eq!(refusal_text(r#"{"error":"held_by_other: lease"}"#), "held_by_other: lease");
+        assert_eq!(refusal_text("plain text"), "plain text");
     }
 }

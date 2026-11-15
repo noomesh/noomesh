@@ -126,6 +126,9 @@ type lifeCycle struct {
 	pollFast  time.Duration // readiness poll until ready or timed out
 	pollSlow  time.Duration // after that, and once ready
 	pollDrain time.Duration // done_path poll; drainPollEvery when zero
+	// startRetry is the wait before the one retry of a failed container
+	// start; startRetryWait when zero.
+	startRetry time.Duration
 
 	mu    sync.Mutex
 	lives map[string]*lifeState
@@ -471,6 +474,39 @@ func (p *NodeWorkloads) convergeRunning(ctx context.Context, e nodewl.Entry) {
 // ensureRunning is the move to `running`: gate, provision when needed, start
 // the door and then the worker, and watch it for readiness. A worker that has
 // run and exited is crashed and is left exactly as it is.
+// startRetryWait is the default wait before the one retry of a failed start.
+const startRetryWait = 2 * time.Second
+
+// startWithRetry starts a container, and once more after a short wait if the
+// first start failed: a daemon can refuse a start it accepts a moment later
+// (a cgroup or network setup still settling). Only a START failure is
+// retried. The first error is logged; if the retry fails too, its error is
+// returned, so the caller's reason (start_failed) is unchanged.
+func (p *NodeWorkloads) startWithRetry(ctx context.Context, e nodewl.Entry, name string) error {
+	err := p.api.StartContainer(ctx, name)
+	if err == nil {
+		return nil
+	}
+	slog.Warn("node workload: start failed; retrying once", "addon", e.Addon, "workload", e.Name,
+		"container", name, "error", scrubURLs(err.Error()))
+	wait := p.lc.startRetry
+	if wait <= 0 {
+		wait = startRetryWait
+	}
+	t := time.NewTimer(wait)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("start %s: %w", name, err)
+	case <-t.C:
+	}
+	if err2 := p.api.StartContainer(ctx, name); err2 != nil {
+		return fmt.Errorf("start %s (retried once; first: %s): %w", name, scrubURLs(err.Error()), err2)
+	}
+	slog.Info("node workload: start succeeded on the retry", "addon", e.Addon, "workload", e.Name, "container", name)
+	return nil
+}
+
 func (p *NodeWorkloads) ensureRunning(ctx context.Context, e nodewl.Entry) error {
 	if err := p.gate(ctx, e); err != nil {
 		return err
@@ -494,12 +530,12 @@ func (p *NodeWorkloads) ensureRunning(ctx context.Context, e nodewl.Entry) error
 	case w.Running && d.Running:
 	case w.Status == "created" && (d.Status == "created" || d.Running):
 		if !d.Running {
-			if err := p.api.StartContainer(ctx, doorName); err != nil {
-				return fmt.Errorf("start %s: %w", doorName, err)
+			if err := p.startWithRetry(ctx, e, doorName); err != nil {
+				return err
 			}
 		}
-		if err := p.api.StartContainer(ctx, workerName); err != nil {
-			return fmt.Errorf("start %s: %w", workerName, err)
+		if err := p.startWithRetry(ctx, e, workerName); err != nil {
+			return err
 		}
 		slog.Info("node workload started", "addon", e.Addon, "workload", e.Name)
 	default:

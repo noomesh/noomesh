@@ -30,7 +30,8 @@ end of that pipe and offers two things:
 Subcommands (all exit non-zero on failure):
   mint                  prove tailnet identity, write token.json (0600)
   broker -- BROWSER...  run the browser on the pipe; exits when it does
-  reload                ask the broker to reload the page
+  reload                ask the broker to reload the page (exit 6: the display is
+                        alive but its broker has no control socket)
   heartbeat             window.__nooKioskHeartbeat (ms epoch) or "null"
   frame                 the graph page's {ms, quality} frame measure as JSON, or "null"
   build                 the stack tag this console was built from, or "null"
@@ -49,6 +50,12 @@ PUBLISH_EVERY = 10  # seconds
 # Older than this, page.json says the browser stopped answering. Several
 # publishes wide, so one slow evaluate is not a strike against the display.
 FRESH_FOR = 45  # seconds
+# `reload`'s exit code when the display is alive (a fresh page.json) but its
+# broker has no control socket: not "is kiosk.service running?" (it is), but
+# a unit without RuntimeDirectory=kiosk (one from before the broker, which a
+# roll never rewrites) or a socket gone after the broker started. The CLI
+# names the repair for this code (`noo kiosk reload`).
+NO_SOCKET = 6
 
 
 
@@ -455,6 +462,17 @@ def page_facts():
     return d
 
 
+def page_age():
+    """Seconds since the broker last published page.json; None when there is
+    none or it cannot be read. `reload` uses it to tell a dead display from a
+    live one whose broker has no socket."""
+    try:
+        with open(PAGE_FILE) as f:
+            return int(time.time()) - int(json.load(f).get("updated_at") or 0)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def reload():
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(20)
@@ -463,6 +481,12 @@ def reload():
         s.sendall(b"reload\n")
         reply = s.recv(512).decode(errors="replace").strip()
     except (FileNotFoundError, ConnectionRefusedError):
+        age = page_age()
+        if age is not None and age <= FRESH_FOR:
+            d = os.path.dirname(SOCK)
+            why = (f"{d} does not exist (kiosk.service has no RuntimeDirectory=kiosk: a unit from before the broker)"
+                   if not os.path.isdir(d) else f"{d} exists but has no socket")
+            die(f"the display is alive (page.json {age}s old) but its broker has no control socket at {SOCK}: {why}", NO_SOCKET)
         die(f"no broker on {SOCK}: is kiosk.service running?", 5)
     except OSError as e:
         die(f"{SOCK}: {e}", 5)
