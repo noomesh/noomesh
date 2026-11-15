@@ -1785,6 +1785,12 @@ mod tests {
             &[held_row("r1", "pai-voice", "voice-worker", "awolf", Some("alice"))]);
         assert_eq!(gpu.len(), 1);
         assert_eq!(gpu[0]["source"], "lease");
+        // The same, with the row as a pre-124 gateway left it (holder and
+        // reserved_at NULL): still the lease's, listed once, with its owner.
+        let old = merge_reservations(vec![lease_res("r1", "pai-voice/voice-worker", "awolf")],
+            &[crate::repo::node_workload_placements::Held { reserved_at: None, ..held_row("r1", "pai-voice", "voice-worker", "awolf", None) }]);
+        assert_eq!(old.len(), 1, "{old:?}");
+        assert_eq!((old[0]["source"].as_str(), old[0]["holder"].as_str(), old[0]["gpu"].as_bool()), (Some("lease"), Some("alice"), Some(true)));
         // gpu-0 -> GPU on one node: the old CPU row (r-a, no lease) and the new
         // GPU lease r-b with its own row.
         let ab = merge_reservations(vec![lease_res("r-b", "rhaddon/gpuw", "n1")],
