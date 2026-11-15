@@ -16,8 +16,12 @@ GATEWAY_PG_MAX_CONNECTIONS in gateway-rust/src/state.rs for the gateway. The
 siblings' numbers are pinned below with the sha they were read at. While a
 sibling has not yet declared its own budget (``expects_declaration`` False),
 the forward sums count its approved budget and a separate test checks the
-install as it is TODAY; the sibling's PR sets its declared figure and flips
-the flag, after which its pinned figure is what counts and must fit.
+install as it is TODAY. A sibling that declares ships a ``POOL_CEILINGS``
+literal in its own pool_budget.py; the table pins a copy at the sibling's
+sha, the flag is on, and the declared figure is what counts and must fit.
+The copy is re-read with ``git show <sha>:<path>`` from a sibling checkout
+when one is present (NOO_SIBLINGS_DIR), and noomesh-internal's release-align
+reads the same file at the revs a release pins.
 
 A second guard keeps the budget the only place a size can come from: a
 production create_engine / create_async_engine / pool constructor outside
@@ -28,7 +32,7 @@ from __future__ import annotations
 
 import ast
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
@@ -62,14 +66,27 @@ def _gateway_ceiling() -> int:
 
 @dataclass(frozen=True)
 class Sibling:
-    """A sibling repo's own pools, per process, read at ``sha``."""
+    """A sibling repo's own pools, per process, read at ``sha``.
+
+    Before a sibling declares (``expects_declaration`` False), ``current``
+    is its ceiling as read from its code by hand. After, ``declared`` is a
+    copy of the ``POOL_CEILINGS`` literal in ``repo``'s ``path`` at ``sha``
+    (``test_the_pinned_declarations_match_the_sibling_at_its_sha`` re-reads
+    it there), and the process's ceiling is computed from it plus every
+    declaration in ``shares`` ("noomesh:<process>" = POOL_BUDGET's pools for
+    that process, "<sibling>:POOL_CEILINGS" = that sibling's declaration).
+    """
 
     process: str
-    current: int  # ceiling in its code today
+    current: int  # ceiling in its code before it declared
     budget: int  # approved (i815)
     expects_declaration: bool
     sha: str
     what: str
+    repo: str = ""
+    path: str = ""
+    declared: dict = field(default_factory=dict)
+    shares: tuple = ()
 
 
 SIBLINGS = {
@@ -82,11 +99,26 @@ SIBLINGS = {
         process="noo-trellion",
         current=30 + 30 + 15 + 1,
         budget=15 + 5 + 8 + 1,
-        expects_declaration=False,
-        sha="trellion 8444153",
-        what="async init_engine 10+20, lazy sync engine 10+20 (opens on first sync use), "
-        "PageIndexStore 5+10 (built in PageIndexRAG.startup), LISTEN 1",
+        expects_declaration=True,
+        # trellion main ae9134cf (promoted 2026-11-15; rc.3 built from staging
+        # dddf1827, whose declaration is byte-identical).
+        sha="ae9134cf1dc6fed3d61beca6bc55672246939f3b",
+        what="async init_engine, sync init_engine (opens on first sync use), "
+        "PageIndexStore (built in PageIndexRAG.startup), doc_wake LISTEN",
+        repo="trellion",
+        path="src/trellion/db/pool_budget.py",
+        declared={
+            "async_engine": (5, 10),
+            "sync_engine": (2, 3),
+            "pageindex_store": (5, 3),
+            "doc_wake_listen": (1, 0),
+        },
     ),
+    # noo-trellion-intel is the trellion image running noomesh's worker on
+    # the ml-intel surface (an ML pack): it opens noomesh's noo-trellion
+    # pools AND trellion's, and none of its own: declared 22 + 29 + 0 = 51,
+    # the approved budget (general 11-15; +intel+evolve with 2 worker-extras
+    # is 181 of 187).
     "trellion-intel": Sibling(
         process="noo-trellion-intel",
         current=79,
@@ -95,19 +127,48 @@ SIBLINGS = {
         # true number). A trim on ml-intel, if it does not need the
         # conversation store or heartbeat, is recorded in i815.
         budget=51,
-        expects_declaration=False,
-        sha="trellion-intel 7486d39",
-        what="whole process, i815 record",
+        expects_declaration=True,
+        # trellion-intel tag v0.1.9 (signed for v0.6.25-rc.3).
+        sha="556a892ef95ed7347150c37ddabd0dac9c1d7b06",
+        what="none of its own; shares noomesh's noo-trellion pools and trellion's",
+        repo="trellion-intel",
+        path="src/trellion_intel/pool_budget.py",
+        declared={},
+        shares=("noomesh:noo-trellion", "trellion:POOL_CEILINGS"),
     ),
     "evolve": Sibling(
         process="noo-evolve",
         current=55,
         budget=25,
-        expects_declaration=False,
-        sha="trellion-evolve 92b6b74",
-        what="whole process, i815 record",
+        expects_declaration=True,
+        # trellion-evolve tag v0.1.11 (signed for v0.6.25-rc.3).
+        sha="84014fc57c710ad2b6b3aeb77b769f069f581073",
+        what="db.get_engine 4+3, GAStore 3+3, RLPolicyStore 3+3, HofstadterLoopStore 3+3",
+        repo="trellion-evolve",
+        path="src/noo_evolve/pool_budget.py",
+        declared={
+            "db_engine": (4, 3),
+            "ga_store": (3, 3),
+            "rl_policy_store": (3, 3),
+            "hofstadter_store": (3, 3),
+        },
     ),
 }
+
+
+def _declared_ceiling(name: str) -> int:
+    """The process ceiling a sibling's declaration (and what it shares) adds to."""
+    s = SIBLINGS[name]
+    total = sum(size + overflow for size, overflow in s.declared.values())
+    for ref in s.shares:
+        repo, _, what = ref.partition(":")
+        if repo == "noomesh":
+            total += pb.process_ceiling(what)
+        else:
+            assert what == "POOL_CEILINGS", ref
+            total += sum(a + b for a, b in SIBLINGS[repo].declared.values())
+    return total
+
 
 INSTALLS = {
     "default": (),
@@ -121,7 +182,9 @@ MAX_WORKER_EXTRA = {"default": 2, "+intel": 2, "+intel+evolve": 2}
 
 def _sibling(name: str, today: bool) -> int:
     s = SIBLINGS[name]
-    return s.current if (today or s.expects_declaration) else s.budget
+    if s.expects_declaration:
+        return _declared_ceiling(name)
+    return s.current if today else s.budget
 
 
 def _sum(install: str, extras: int, today: bool = False) -> dict[str, int]:
@@ -165,7 +228,78 @@ def test_todays_default_install_fits_with_the_siblings_as_they_are():
 def test_a_declared_sibling_is_within_its_budget():
     for name, s in SIBLINGS.items():
         if s.expects_declaration:
-            assert s.current <= s.budget, f"{name} declares {s.current}, over its budget {s.budget}"
+            got = _declared_ceiling(name)
+            assert got <= s.budget, f"{name} declares {got}, over its budget {s.budget}"
+
+
+def test_the_declared_ceilings_are_the_reviewed_numbers():
+    # Computed from the pinned declarations: each at its approved budget.
+    assert {n: _declared_ceiling(n) for n in SIBLINGS} == {
+        "trellion": 29,
+        "trellion-intel": 51,
+        "evolve": 25,
+    }
+
+
+def _sibling_checkout(repo: str) -> Path | None:
+    """A git checkout of ``repo``: NOO_SIBLINGS_DIR, beside this repo, or
+    beside the main clone this worktree belongs to."""
+    import os
+
+    candidates = []
+    if os.environ.get("NOO_SIBLINGS_DIR"):
+        candidates.append(Path(os.environ["NOO_SIBLINGS_DIR"]) / repo)
+    candidates.append(ROOT.parent / repo)
+    if ROOT.parent.name == ".worktrees":
+        candidates.append(ROOT.parents[2] / repo)
+    return next((c for c in candidates if (c / ".git").exists()), None)
+
+
+def _ceilings_literal(src: str) -> dict:
+    """``POOL_CEILINGS`` from a sibling's pool_budget.py, without importing it."""
+    for node in ast.parse(src).body:
+        target = node.target if isinstance(node, ast.AnnAssign) else (
+            node.targets[0] if isinstance(node, ast.Assign) and len(node.targets) == 1 else None
+        )
+        if isinstance(target, ast.Name) and target.id == "POOL_CEILINGS":
+            got = ast.literal_eval(node.value)
+            assert isinstance(got, dict), "POOL_CEILINGS is not a dict literal"
+            return {k: tuple(v) for k, v in got.items()}
+    raise AssertionError("no module-level POOL_CEILINGS literal: the sibling's declaration moved")
+
+
+@pytest.mark.parametrize("name", [n for n, s in SIBLINGS.items() if s.path])
+def test_the_pinned_declarations_match_the_sibling_at_its_sha(name):
+    """The pin above against the sibling's own declaration, read with
+    ``git show <sha>:<path>`` from a checkout of it (NOO_SIBLINGS_DIR, or
+    beside this repo). CI's single-repo workspace has none: skipped there
+    (tests/ci_skip_allowlist.txt); the release-align check in
+    noomesh-internal reads the same file at the sha the release pins."""
+    import os
+    import subprocess
+
+    s = SIBLINGS[name]
+    base = _sibling_checkout(s.repo)
+    shown = None
+    if base is not None:
+        r = subprocess.run(["git", "-C", str(base), "show", f"{s.sha}:{s.path}"], capture_output=True, text=True)
+        shown = r.stdout if r.returncode == 0 else None
+    if shown is None:
+        if os.environ.get("NOO_REQUIRE_SIBLINGS") == "1":
+            pytest.fail(f"NOO_REQUIRE_SIBLINGS=1 and no {s.repo} checkout has {s.sha[:8]}:{s.path}")
+        pytest.skip(f"no {s.repo} checkout with {s.sha[:8]}:{s.path} (set NOO_SIBLINGS_DIR, fetch the sibling)")
+    assert _ceilings_literal(shown) == s.declared, (
+        f"{s.repo}@{s.sha[:8]} {s.path} declares {_ceilings_literal(shown)}; this table pins {s.declared}"
+    )
+
+
+def test_the_declaration_parser_catches_what_it_is_for():
+    src = 'from typing import Dict\nPOOL_CEILINGS: Dict[str, tuple] = {"a": (5, 10), "b": (1, 0)}\n'
+    assert _ceilings_literal(src) == {"a": (5, 10), "b": (1, 0)}
+    with pytest.raises(AssertionError):
+        _ceilings_literal("POOL_SIZES = {}\n")
+    with pytest.raises(ValueError):
+        _ceilings_literal("POOL_CEILINGS = {'a': size()}\n")
 
 
 def test_every_budget_entry_is_positive_and_bounded():
