@@ -125,8 +125,10 @@ The worker, not core, must load pickled tensors safely
 
 A staged set lives at `<MODELS_DIR>/sets/<id>/<revision>/` on the controller
 (files, then `model-set.json`, then `model-set.json.sig` last). A set without
-its signature does not exist to the rail. A node gets a set in two steps, both
-over the mTLS rail.
+its signature does not exist to the rail. Staging a new revision of a set
+reuses each unchanged LFS file (same sha256 and size) of a signed earlier
+revision by hard link instead of downloading it, and hashes it as before. A node
+gets a set in two steps, both over the mTLS rail.
 
 1. **The signed manifest**, from the gateway (same auth as every artifact
    manifest, a node's cluster bearer):
