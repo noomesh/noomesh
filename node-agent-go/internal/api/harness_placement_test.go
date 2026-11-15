@@ -68,6 +68,15 @@ func TestHarnessPlacementRouteAnswersPlacedAndUnplaced(t *testing.T) {
 	if body := strings.ReplaceAll(rec.Body.String(), " ", ""); strings.TrimSpace(body) != `{"kind":"claude-code","env":{},"desired_state":"running","placed":true,"model_context":32768}` {
 		t.Fatalf("model_context body: %s", body)
 	}
+	// The decided contexts ride along too (i802): the harness fits its
+	// turns to the number the agent stamps.
+	decided := placementServer(t, func() HarnessPlacement {
+		return HarnessPlacement{Kind: "native", DesiredState: "running", Placed: true, ChatContexts: map[string]int{"gemma4:e2b": 32768}}
+	})
+	rec = getPlacement(decided, own, "127.0.0.1:5000", "")
+	if body := strings.ReplaceAll(rec.Body.String(), " ", ""); strings.TrimSpace(body) != `{"kind":"native","env":{},"desired_state":"running","placed":true,"chat_contexts":{"gemma4:e2b":32768}}` {
+		t.Fatalf("chat_contexts body: %s", body)
+	}
 	unplaced := placementServer(t, func() HarnessPlacement { return HarnessPlacement{} })
 	rec = getPlacement(unplaced, own, "127.0.0.1:5000", "")
 	if rec.Code != 404 || strings.ReplaceAll(rec.Body.String(), " ", "") != `{"placed":false}` {

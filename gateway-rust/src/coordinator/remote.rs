@@ -231,6 +231,17 @@ impl HarnessRuntime for RemoteRuntime {
         self.max_context_tokens
     }
 
+    /// The node agent's decided context for the pinned model (its
+    /// `/harness/placement` `chat_contexts`, i802), which the agent stamps
+    /// as options.num_ctx on the way to its Ollama. The loop fits the turn
+    /// to it; on the `openai` wire it stamps nothing itself (the agent
+    /// does). Without it the loop fell back to the global guess and a task
+    /// here ran in a smaller window than a console turn on the same model.
+    async fn chat_num_ctx(&self, backend: &ResolvedBackend) -> Option<u64> {
+        let pinned = self.pinned.as_ref().filter(|p| p.url == backend.url)?;
+        crate::harness::profile::chat_context_for(&pinned.model)
+    }
+
     async fn route_facts(&self, url: &str, _backend: &str) -> Option<(String, Option<super::classes::Slots>)> {
         // The placed endpoint is this node's; the slots come live from its
         // agent (`: queued ahead=N` and the occupancy headers), not from here.
@@ -940,6 +951,51 @@ mod tests {
         assert!(events.iter().any(|(k, v)| k == "content" && v.as_str() == Some("hello")), "{events:?}");
         assert!(!events.iter().any(|(k, _)| k == "error"), "{events:?}");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// i802: a node harness's model call carries the context the agent
+    /// decided for its pinned model (`/harness/placement` `chat_contexts`),
+    /// and the turn is fitted to the same window a console turn on that
+    /// model gets. Before, the harness had no context at all: nothing was
+    /// stamped and the loop fell back to the global guess.
+    #[tokio::test]
+    async fn a_node_harness_turn_carries_the_decided_context_on_the_wire() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let gw = fake_gateway(seen.clone()).await;
+        let bodies: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let got = bodies.clone();
+        // A fallback, not a `.route` (the openapi drift check reads route strings).
+        let app = Router::new().fallback(move |Json(b): Json<Value>| {
+            let got = got.clone();
+            async move {
+                got.lock().unwrap().push(b);
+                axum::response::Response::builder()
+                    .header("content-type", "application/x-ndjson")
+                    .body(axum::body::Body::from(concat!(
+                        r#"{"message":{"role":"assistant","content":"ok"},"done":true,"done_reason":"stop","prompt_eval_count":9,"eval_count":1}"#,
+                        "\n"
+                    )))
+                    .unwrap()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut pinned = ollama_at(&format!("http://{addr}"));
+        pinned.model = "harness-ctx-wire:1b".into();
+        let placement = serde_json::json!({"placed": true, "chat_contexts": {"harness-ctx-wire:1b": 32768}});
+        crate::harness::profile::set_chat_contexts(crate::harness::profile::chat_contexts_of(&placement));
+        let rt = RemoteRuntime::connect(&gw, "tok-123", reqwest::Client::new()).await.unwrap().pin_backend(pinned.clone());
+
+        assert_eq!(rt.chat_num_ctx(&pinned).await, Some(32768));
+        let other = ResolvedBackend { url: "http://elsewhere:11434".into(), ..pinned.clone() };
+        assert_eq!(rt.chat_num_ctx(&other).await, None, "only the pinned endpoint is this node's");
+
+        let sink = Recorder::default();
+        let _ = super::super::run_streaming_on(&sink, &rt, "what is up", "c1", 2, None, Some("alice"), false).await.unwrap();
+        let body = bodies.lock().unwrap().first().cloned().expect("the model was called");
+        assert_eq!(body["options"]["num_ctx"], serde_json::json!(32768), "{body}");
+        assert_eq!(body["options"]["num_predict"], serde_json::json!(crate::chat_context::reserve_for(32768)), "the reply reserve of the decided window: {body}");
     }
 
     /// i411, P3: a body with nothing readable in it is the backend's error,

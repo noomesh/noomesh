@@ -444,6 +444,7 @@ func (a *Agent) Run() error {
 			hp.Profile = prof.Raw
 		}
 		hp.ModelContext = rec.ChatContextWindow(prof)
+		hp.ChatContexts = rec.ChatContexts()
 		return hp
 	})
 

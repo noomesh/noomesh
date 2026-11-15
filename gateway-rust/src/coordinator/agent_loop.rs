@@ -2516,7 +2516,8 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
 
     // Instructions and the question alone too large for this backend's
     // context (i802 PR-2, step 5): say so instead of sending a prompt the
-    // backend would cut. TIER-HOOK: try the next smaller tier before this.
+    // backend would cut. Not tried first: the next smaller tier (i802
+    // follow-up "fall to Compact before refusing").
     let mut window_refusal: Option<String> = None;
     if let Some(ctx) = window_refusal_ctx(&window, rt.max_context_tokens().is_some(), instructions_estimate(&session.messages, prompt, estimate_tool_tokens(&tool_schemas)), calib) {
         let node = match rt.route_facts(&backend.url, &backend.backend_type).await {
@@ -3757,7 +3758,8 @@ async fn run_inner_bound<R: HarnessRuntime>(
 
     // Instructions and the question alone too large for this backend's
     // context (i802 PR-2, step 5): say so instead of sending a prompt the
-    // backend would cut. TIER-HOOK: try the next smaller tier before this.
+    // backend would cut. Not tried first: the next smaller tier (i802
+    // follow-up "fall to Compact before refusing").
     let mut window_refusal: Option<String> = None;
     if let Some(ctx) = window_refusal_ctx(&window, rt.max_context_tokens().is_some(), instructions_estimate(&session.messages, prompt, estimate_tool_tokens(&tool_schemas)), calib) {
         let node = match rt.route_facts(&backend.url, &backend.backend_type).await {

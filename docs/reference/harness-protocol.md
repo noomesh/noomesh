@@ -492,6 +492,15 @@ know, so on a 32k node it never compacts before Ollama truncates the
 prompt. The driver reads the window once per run, and the harness re-reads
 the placement every minute.
 
+`chat_contexts` in the same answer is the context the controller decided
+for each Ollama chat model on the node (desired-config `chat_contexts`; a
+bare name means `:latest`). The agent stamps it as `options.num_ctx` on that
+model's calls. The harness fits its own loop's turns to it, so a task on the
+node runs in the same window as a console turn on that model, and its
+translator stamps it on an Ollama-bound body a CLI sent without one. It is
+absent when nothing is decided or the agent is older; the loop then keeps
+the global `VLLM_MAX_MODEL_LEN` window.
+
 `noo-gateway harness probe --kind <kind>` runs steps 1, 3, 4 and 5 once,
 with no door key and no MCP wiring. That means no `{mcp_config}`
 arguments and no `[mcp_servers]` table. The probe uses either the node's
