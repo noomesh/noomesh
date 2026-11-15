@@ -4250,6 +4250,8 @@ async fn desired_config_get(
 /// daemon keeps its own setting); `running` and `ceiling` are null when the
 /// node does not report them. A model placed twice is listed once.
 pub(crate) fn chat_context_rows(placements: &[Value], record: &Value, profile_context: u64, stack: (bool, Option<u64>)) -> Vec<Value> {
+    // Every running placement on the node, for the declared-basis fit.
+    let specs: Vec<crate::placement_fit::Spec> = placements.iter().filter_map(crate::placement_fit::spec_from_json).collect();
     let mut seen = std::collections::BTreeSet::new();
     placements
         .iter()
@@ -4260,7 +4262,7 @@ pub(crate) fn chat_context_rows(placements: &[Value], record: &Value, profile_co
         })
         .map(|(model, env)| {
             let env = crate::chat_context::with_stack_slots(env, stack.0, stack.1);
-            let d = crate::chat_context::decide("ollama", &env, &model, record, profile_context);
+            let d = crate::chat_context::decide("ollama", &env, &model, record, profile_context, &specs, stack.0);
             json!({
                 "model": model,
                 "running": crate::chat_context::running_context(record, &model),
@@ -4268,6 +4270,7 @@ pub(crate) fn chat_context_rows(placements: &[Value], record: &Value, profile_co
                 "declared": d.as_ref().map(|d| d.declared),
                 "source": d.as_ref().map(|d| d.source.clone()),
                 "capped": d.as_ref().and_then(|d| d.capped.clone()),
+                "basis": d.as_ref().map(|d| d.basis.clone()),
                 "slots": d.as_ref().map(|d| d.slots),
                 "ceiling": crate::harness_fit::reported_ceiling(record, &model),
             })
@@ -4839,6 +4842,9 @@ pub(crate) async fn node_fit_facts(state: &AppState, node_id: &str) -> Result<Va
     let (usage, usage_source) = crate::placement_fit::effective_usage(usage_stored.as_deref(), crate::self_node::is_self_node(node_id));
     node["usage_profile"] = json!(usage);
     node["usage_profile_source"] = json!(usage_source);
+    // The controller's own box holds its stack beside its models: the
+    // declared basis charges CONTROLLER_STACK_RESERVE_GB to its CPU pool.
+    node["controller_stack"] = json!(crate::self_node::is_self_node(node_id));
     node["fleet_model_stats"] = Value::Array(fleet_model_sizes(state, node_id).await);
     Ok(node)
 }
@@ -9623,7 +9629,8 @@ mod chat_context_detail_tests {
         let rows = chat_context_rows(&placements, &record(), 0, (false, None));
         assert_eq!(rows.len(), 2, "{rows:?}");
         let r = &rows[0];
-        let d = crate::chat_context::decide("ollama", &placements[0]["env"], "gemma4:e2b", &record(), 0).expect("decided");
+        let specs: Vec<crate::placement_fit::Spec> = placements.iter().filter_map(crate::placement_fit::spec_from_json).collect();
+        let d = crate::chat_context::decide("ollama", &placements[0]["env"], "gemma4:e2b", &record(), 0, &specs, false).expect("decided");
         assert_eq!(r["model"], json!("gemma4:e2b"));
         assert_eq!(r["running"], json!(4096));
         assert_eq!(r["decided"], json!(d.tokens));

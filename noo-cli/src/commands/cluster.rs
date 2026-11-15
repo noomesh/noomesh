@@ -592,9 +592,11 @@ pub(crate) fn chat_context_line(r: &serde_json::Value) -> String {
     let decided = match r["decided"].as_u64() {
         Some(d) => {
             let source = r["source"].as_str().unwrap_or("?");
+            // The numbers behind it (a gateway with the declared basis).
+            let basis = r["basis"].as_str().filter(|b| !b.is_empty()).map(|b| format!("; {b}")).unwrap_or_default();
             match r["capped"].as_str().filter(|c| !c.is_empty()) {
-                Some(c) => format!("{d} ({source}; capped: {c})"),
-                None => format!("{d} ({source})"),
+                Some(c) => format!("{d} ({source}; capped: {c}{basis})"),
+                None => format!("{d} ({source}{basis})"),
             }
         }
         None => "- (nothing declares a context: the daemon keeps its own default)".to_string(),
@@ -1068,6 +1070,10 @@ pub(crate) struct PlaceArgs {
     /// `--keep-warm` (Some(true)) / `--no-keep-warm` (Some(false)); None
     /// leaves the stored flag as it is.
     keep_warm: Option<bool>,
+    /// `--retune`: re-run the tuner for the tuning keys this placement
+    /// already holds (they are otherwise kept on a re-place of the same
+    /// model and target, so an upgrade never moves a working context).
+    retune: bool,
 }
 
 pub(crate) fn parse_place_with(a: &mut Args) -> Result<PlaceArgs, ArgError> {
@@ -1086,6 +1092,8 @@ pub(crate) fn parse_place_with(a: &mut Args) -> Result<PlaceArgs, ArgError> {
     };
     // Place even when `noo cluster fit` says the models do not fit.
     let force = a.flag(&["--force"]);
+    // Re-run the tuner for keys the placement already holds.
+    let retune = a.flag(&["--retune"]);
     // Placement env (repeatable); `KEY=` removes KEY.
     let mut env_changes = Vec::new();
     for raw in a.values(&["--env"])? {
@@ -1102,7 +1110,7 @@ pub(crate) fn parse_place_with(a: &mut Args) -> Result<PlaceArgs, ArgError> {
     let kind = a.value(&["--kind"])?;
     let [node, backend, model]: [String; 3] =
         a.positionals()?.try_into().map_err(|_| ArgError::new("expected <node> <backend> <model>"))?;
-    Ok(PlaceArgs { node, backend, model, port, tls, image, stopped, force, role, kind, env_changes, on, keep_warm })
+    Ok(PlaceArgs { node, backend, model, port, tls, image, stopped, force, role, kind, env_changes, on, keep_warm, retune })
 }
 
 /// `noo cluster place NODE BACKEND MODEL [--on cpu|gpu] [--env KEY=VALUE]... [--port P] [--tls]
@@ -1115,7 +1123,7 @@ pub(crate) fn parse_place_with(a: &mut Args) -> Result<PlaceArgs, ArgError> {
 /// the node's reported hardware and usage profile unless `--env` names them
 /// (`cluster_tune`).
 pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let PlaceArgs { node, backend, model, port, tls, image, stopped, force, mut role, kind, mut env_changes, on, keep_warm } =
+    let PlaceArgs { node, backend, model, port, tls, image, stopped, force, mut role, kind, mut env_changes, on, keep_warm, retune } =
         parse_place_with(&mut Args::new(args))?;
     let (node, backend, model) = (&node, &backend, &model);
     if let Some(k) = &kind {
@@ -1204,7 +1212,7 @@ pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let current = current_env_for(&desired["placements"], backend, role.as_deref(), model);
     let mut placed_on: Option<PlacedOn> = None;
     if backend != "harness" {
-        let p = plan_target_and_tuning(g, node, backend, model, role.as_deref(), on.as_deref(), &desired, &current, &env_changes);
+        let p = plan_target_and_tuning(g, node, backend, model, role.as_deref(), on.as_deref(), &desired, &current, &env_changes, retune);
         env_changes.extend(p.env_changes.iter().cloned());
         body["target"] = serde_json::json!(p.target);
         if let Some(b) = p.size_bytes {
@@ -1377,6 +1385,7 @@ fn plan_target_and_tuning(
     desired: &serde_json::Value,
     current: &serde_json::Value,
     explicit: &[(String, Option<String>)],
+    retune_asked: bool,
 ) -> PlacedOn {
     use super::cluster_tune as t;
     let role_eff = role.unwrap_or("chat");
@@ -1426,11 +1435,11 @@ fn plan_target_and_tuning(
         true,
         10,
     );
-    let (weights_gb, free_gb) = match &fit {
-        Ok(f) => (t::weights_in(f, backend, role_eff), t::free_for_kv(f, backend, role_eff, target)),
+    let (weights_gb, free_gb, kv) = match &fit {
+        Ok(f) => (t::weights_in(f, backend, role_eff), t::free_for_kv(f, backend, role_eff, target), t::kv_in(f, backend, role_eff)),
         Err(e) => {
             notes.push(format!("fit unavailable ({e}): context left at the default"));
-            (None, None)
+            (None, None, None)
         }
     };
     if hw.cpu_cores.is_none() && target == "cpu" && backend == "llamacpp" {
@@ -1454,8 +1463,9 @@ fn plan_target_and_tuning(
         cpu_cores: hw.cpu_cores,
         weights_gb,
         free_gb,
+        kv,
     });
-    let retune = stored_target.as_deref().is_some_and(|s| s != target);
+    let retune = retune_asked || stored_target.as_deref().is_some_and(|s| s != target);
     let applied = t::apply_choices(choices, explicit, current, retune);
     for a in &applied {
         if let t::Applied::Set(c) = a {
@@ -1645,6 +1655,10 @@ mod placement_env_tests {
         );
         let fits = json!({"model": "m", "running": null, "decided": 16384, "source": "the harness profile's context", "capped": null, "slots": 1, "ceiling": null});
         assert_eq!(chat_context_line(&fits), "m  running ? \u{b7} decided 16384 (the harness profile's context) \u{b7} slots 1 \u{b7} ceiling ?");
+        // The numbers behind the decision, when the gateway sends them.
+        let based = json!({"model": "gemma4:e2b", "running": 32768, "decided": 32768, "source": "OLLAMA_CONTEXT_LENGTH on its ollama placement",
+            "capped": null, "slots": 1, "ceiling": 131072, "basis": "5.9 GiB for cache on the declared basis, 16 KiB/token (measured)"});
+        assert!(chat_context_line(&based).contains("decided 32768 (OLLAMA_CONTEXT_LENGTH on its ollama placement; 5.9 GiB for cache on the declared basis, 16 KiB/token (measured))"), "{}", chat_context_line(&based));
         let none = json!({"model": "q", "running": 2048, "decided": null, "slots": null, "ceiling": 40960});
         let line = chat_context_line(&none);
         assert!(line.starts_with("q  running 2048 \u{b7} decided - (nothing declares") && line.ends_with("slots ? \u{b7} ceiling 40960"), "{line}");

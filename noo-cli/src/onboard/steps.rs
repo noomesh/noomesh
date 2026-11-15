@@ -7288,6 +7288,32 @@ pub(crate) fn place_args(node: &str, model: &str) -> Vec<String> {
     ["cluster", "place", node, "ollama", model].iter().map(|s| s.to_string()).collect()
 }
 
+/// The tuning lines of `noo cluster place`'s output (`KEY=VALUE  why`), for
+/// onboarding to show instead of swallowing them.
+pub(crate) fn tuned_lines(out: &str) -> Vec<String> {
+    // Colour codes, if the child coloured its output: ESC [ ... final byte.
+    let plain = |l: &str| {
+        let mut out = String::with_capacity(l.len());
+        let mut it = l.chars().peekable();
+        while let Some(c) = it.next() {
+            if c == '\u{1b}' && it.peek() == Some(&'[') {
+                for d in it.by_ref() {
+                    if d.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    };
+    out.lines()
+        .map(|l| plain(l).trim().to_string())
+        .filter(|l| l.starts_with("OLLAMA_CONTEXT_LENGTH=") || l.starts_with("OLLAMA_NUM_PARALLEL="))
+        .collect()
+}
+
 /// Declare the self node's ollama chat placement for the model this run
 /// pulled, through `noo cluster place`, unless one already exists (a
 /// re-onboard never overrides the operator's choice).
@@ -7321,7 +7347,15 @@ fn place_pulled_model(ctx: &mut Ctx, model: &str) {
     let args = place_args(&node, model);
     ctx.progress(&format!("Placing {model} on {node}'s ollama (noo cluster place {node} ollama {model})..."));
     match Command::new(&exe).args(&args).output() {
-        Ok(o) if o.status.success() => ctx.success(&format!("Placed: {node} ollama {model} (chat)")),
+        Ok(o) if o.status.success() => {
+            ctx.success(&format!("Placed: {node} ollama {model} (chat)"));
+            // What place tuned and why ("OLLAMA_CONTEXT_LENGTH=32768  half of
+            // the 6.4 GB left after the declared models, ..."): the answer to
+            // "why is my model at 16k", said where the person is looking.
+            for line in tuned_lines(&String::from_utf8_lossy(&o.stdout)) {
+                ctx.info(&line);
+            }
+        }
         Ok(o) => ctx.warn(&format!(
             "noo cluster place {node} ollama {model} exited {}: {} — run it again once the cause is fixed",
             o.status.code().unwrap_or(1),
@@ -10597,6 +10631,9 @@ mod first_chat_placement_tests {
     #[test]
     fn the_placement_is_the_operators_own_command() {
         assert_eq!(place_args("box", "gemma4:e2b"), ["cluster", "place", "box", "ollama", "gemma4:e2b"]);
+        // Onboarding shows what place tuned and why, colour or not.
+        let out = "\u{1b}[2m→\u{1b}[0m on cpu — the node has no GPU\n  OLLAMA_NUM_PARALLEL=1  \u{1b}[2mcpu node\u{1b}[0m\n  OLLAMA_CONTEXT_LENGTH=32768  \u{1b}[2mhalf of the 6.4 GB left after the declared models\u{1b}[0m\n";
+        assert_eq!(tuned_lines(out), ["OLLAMA_NUM_PARALLEL=1  cpu node", "OLLAMA_CONTEXT_LENGTH=32768  half of the 6.4 GB left after the declared models"]);
     }
 
     /// The model step places before it judges unpinned chat, and a chat

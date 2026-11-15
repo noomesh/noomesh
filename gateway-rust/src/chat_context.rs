@@ -25,9 +25,6 @@ use serde_json::Value;
 pub const STEPS: [u64; 3] = [16384, 8192, 4096];
 /// The floor: Ollama's own default on a small box. Nothing is decided below it.
 pub const FLOOR: u64 = 4096;
-/// Memory kept free for everything else: at least 1 GiB, or 10% of RAM.
-pub const HEADROOM_MIN_GIB: f64 = 1.0;
-pub const HEADROOM_FRACTION: f64 = 0.10;
 /// The slots an Ollama allots a model when its placement does not say:
 /// the stack's compose default (`OLLAMA_EMBED_NUM_PARALLEL:-4`). Ollama sizes
 /// the cache for every slot.
@@ -38,16 +35,21 @@ pub const RAISE_MARGIN: f64 = 0.8;
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
-/// What the fit reads from the node, all of it reported.
+/// What the fit reads, on the DECLARED basis only: the same box with the same
+/// placements gives the same inputs whether or not a model is loaded, so the
+/// decided context does not move with a memory reading (each move reloads
+/// the model, 4-7 s).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FitInputs {
-    /// Total RAM (the CPU pool), GiB.
-    pub ram_gib: f64,
-    /// RAM in use now, GiB (it includes this model's cache at `running`).
-    pub used_gib: f64,
-    /// Cache bytes per token per slot, and whether that was measured.
+    /// GiB the declared basis leaves for this model's cache
+    /// ([`crate::placement_fit::declared_kv_room_gb`]: the pool's usable
+    /// memory less the controller's stack reserve and every declared row,
+    /// weights at their file size). Never `mem_used_gb`.
+    pub room_gib: f64,
+    /// Cache bytes per token per slot ([`crate::placement_fit::kv_per_token`])
+    /// and its basis: `measured` | `architecture` | `estimate`.
     pub kv_bytes_per_token: f64,
-    pub kv_measured: bool,
+    pub kv_basis: &'static str,
     pub slots: u64,
     /// The context the daemon runs the model at now, when loaded.
     pub running: Option<u64>,
@@ -65,12 +67,9 @@ fn need_gib(ctx: u64, f: &FitInputs) -> f64 {
     ctx as f64 * f.slots as f64 * f.kv_bytes_per_token / GIB
 }
 
-/// The memory available to this model's cache: free RAM, plus what its cache
-/// holds now (that is counted in `used`), minus the headroom.
+/// The memory available to this model's cache, on the declared basis.
 pub fn kv_room_gib(f: &FitInputs) -> f64 {
-    let headroom = (f.ram_gib * HEADROOM_FRACTION).max(HEADROOM_MIN_GIB);
-    let held = f.running.map(|r| need_gib(r, f)).unwrap_or(0.0);
-    (f.ram_gib - f.used_gib + held - headroom).max(0.0)
+    f.room_gib.max(0.0)
 }
 
 /// The largest of `declared` and [`STEPS`] (never above `declared`) whose
@@ -94,21 +93,11 @@ fn capped_line(declared: u64, f: &FitInputs, room: f64) -> String {
         need_gib(declared, f),
         f.slots,
         f.kv_bytes_per_token / 1024.0,
-        if f.kv_measured { "" } else { " (an overestimate: this model's cache was never measured)" },
+        if f.kv_basis == "measured" { "" } else { " (an estimate: this model's cache was never measured)" },
         room
     )
 }
 
-/// The cache per token per slot for `model`: measured (config/model-capabilities.json
-/// `kv_bytes_per_token`), else placement_fit's conservative fallback from the
-/// weights' size.
-pub fn kv_per_token(model: &str, weights_bytes: Option<u64>) -> (f64, bool) {
-    if let Some(b) = crate::model_capabilities::lookup(model).and_then(|r| r.kv_bytes_per_token).filter(|b| *b > 0) {
-        return (b as f64, true);
-    }
-    let gb = weights_bytes.map(|b| b as f64 / 1e9).unwrap_or(0.0);
-    (crate::placement_fit::kv_bytes_per_token(gb), false)
-}
 
 /// One model's entry in the node's heartbeat `model_stats`.
 fn model_stat<'a>(node: &'a Value, model: &str) -> Option<&'a Value> {
@@ -132,18 +121,35 @@ fn slots(env: &Value) -> u64 {
     n.filter(|n| *n > 0).unwrap_or(DEFAULT_SLOTS)
 }
 
-fn gib(v: &Value) -> Option<f64> {
-    v.as_f64().filter(|n| *n > 0.0)
-}
-
-/// The node's fit inputs for `model` on an Ollama placement with `env`.
-pub fn fit_inputs(node: &Value, env: &Value, model: &str) -> FitInputs {
-    let caps = node.get("capabilities").cloned().unwrap_or(Value::Null);
-    let ram = gib(&node["ram_gb"]).or_else(|| gib(&caps["ram_gb"])).unwrap_or(0.0);
-    let used = gib(&node["mem_used_gb"]).unwrap_or(ram);
-    let weights = model_stat(node, model).and_then(|s| s.get("size_bytes")?.as_u64());
-    let (kv, measured) = kv_per_token(model, weights);
-    FitInputs { ram_gib: ram, used_gib: used, kv_bytes_per_token: kv, kv_measured: measured, slots: slots(env), running: running_context(node, model) }
+/// The node's fit inputs for `model` on an Ollama chat placement with `env`,
+/// judged with the node's running placements `specs` (this one's env
+/// replaced by `env`, or added when only the tier profile declares it) on
+/// the declared basis. `own_node`: the controller's own box, whose stack
+/// holds [`crate::placement_fit::CONTROLLER_STACK_RESERVE_GB`].
+pub fn fit_inputs(node: &Value, env: &Value, model: &str, specs: &[crate::placement_fit::Spec], own_node: bool) -> FitInputs {
+    let mut node = node.clone();
+    node["controller_stack"] = Value::Bool(own_node);
+    let mut specs = specs.to_vec();
+    let env_map = env.as_object().cloned().unwrap_or_default();
+    let name = match specs.iter_mut().find(|s| s.backend == "ollama" && s.role == "chat" && same_model(&s.model, model)) {
+        Some(s) => {
+            s.env = env_map;
+            s.model.clone()
+        }
+        None => {
+            specs.push(crate::placement_fit::Spec {
+                backend: "ollama".into(), role: "chat".into(), model: model.to_string(), env: env_map, target: None, keep_warm: false,
+            });
+            model.to_string()
+        }
+    };
+    let report = crate::placement_fit::evaluate(&node, &specs, crate::embedding_client::EMBED_NUM_CTX);
+    let (room_gb, kv) = match crate::placement_fit::declared_kv_room_gb(&report, "ollama", "chat", &name) {
+        Some((room, row)) => (room, row.kv_per_token_bytes.map(|k| (k, row.kv_basis))),
+        None => (0.0, None),
+    };
+    let (kv_bytes_per_token, kv_basis) = kv.unwrap_or((crate::placement_fit::KV_BYTES_PER_TOKEN_FLOOR, "estimate"));
+    FitInputs { room_gib: room_gb * 1e9 / GIB, kv_bytes_per_token, kv_basis, slots: slots(env), running: running_context(&node, model) }
 }
 
 /// The slots the stack's own Ollama runs with, from noomesh.yaml
@@ -189,12 +195,15 @@ pub struct Decided {
     pub source: String,
     pub capped: Option<String>,
     pub slots: u64,
+    /// The numbers behind it, for `noo cluster show`: the declared room and
+    /// the cache figure with its basis.
+    pub basis: String,
 }
 
 /// THE rule (i802). `None` for a backend other than Ollama, or when nothing
 /// declares a context for it: then nothing is stamped and the daemon keeps
 /// its own setting, as before.
-pub fn decide(backend: &str, env: &Value, model: &str, node: &Value, profile_context: u64) -> Option<Decided> {
+pub fn decide(backend: &str, env: &Value, model: &str, node: &Value, profile_context: u64, specs: &[crate::placement_fit::Spec], own_node: bool) -> Option<Decided> {
     if backend != "ollama" {
         return None;
     }
@@ -209,9 +218,15 @@ pub fn decide(backend: &str, env: &Value, model: &str, node: &Value, profile_con
         return None;
     }
     let w = crate::harness_fit::chat_window(backend, env, Some(model), node, profile_context)?;
-    let f = fit_inputs(node, env, model);
+    let f = fit_inputs(node, env, model, specs, own_node);
     let fit = held_at_running(fit_cap(w.tokens, &f), w.tokens, f.running);
-    Some(Decided { tokens: fit.tokens, declared: w.tokens, source: w.source, capped: fit.capped, slots: f.slots })
+    let basis = format!(
+        "{:.1} GiB for cache on the declared basis, {:.0} KiB/token ({})",
+        f.room_gib,
+        f.kv_bytes_per_token / 1024.0,
+        f.kv_basis
+    );
+    Some(Decided { tokens: fit.tokens, declared: w.tokens, source: w.source, capped: fit.capped, slots: f.slots, basis })
 }
 
 /// Never decide below what the daemon already runs the model at (when that
@@ -388,9 +403,11 @@ async fn read_node(state: &crate::state::AppState, node_id: &str, model: &str) -
         Err(e) => return Read::Failed(format!("harness profile: {e}")),
     };
     let profile = crate::harness_profile::resolve(tier, &overrides, None, None);
-    match decide("ollama", &env, model, &record, profile.context) {
+    let specs = crate::routes::cluster::fit_specs(&placements, None, None);
+    let own = is_self_node(node_id);
+    match decide("ollama", &env, model, &record, profile.context, &specs, own) {
         Some(d) => {
-            let f = fit_inputs(&record, &env, model);
+            let f = fit_inputs(&record, &env, model, &specs, own);
             Read::Decided(d, f)
         }
         None => Read::Nothing,
@@ -750,11 +767,10 @@ mod tests {
         assert!(for_url.contains("node_of_url(state, backend_url).await?"), "{for_url}");
     }
 
-    /// fa's one-box cell (runs 43622936679, 43628426011): 16 GB, ~9.4 GB in
-    /// use, gemma4:e2b at 16 KiB/token/slot (the top of the measured 13-16),
-    /// 4 slots.
+    /// About 4.6 GiB left for the cache on a declared basis, gemma4:e2b at
+    /// 16 KiB/token/slot (the top of the measured 13-16), 4 slots.
     fn stranger(running: Option<u64>) -> FitInputs {
-        FitInputs { ram_gib: 15.6, used_gib: 9.4, kv_bytes_per_token: 16.0 * 1024.0, kv_measured: true, slots: 4, running }
+        FitInputs { room_gib: 4.64, kv_bytes_per_token: 16.0 * 1024.0, kv_basis: "measured", slots: 4, running }
     }
 
     #[test]
@@ -765,44 +781,91 @@ mod tests {
 
     #[test]
     fn a_context_that_does_not_fit_steps_down_and_says_why() {
-        let unmeasured = FitInputs { kv_bytes_per_token: 144.0 * 1024.0, kv_measured: false, ..stranger(None) };
+        let unmeasured = FitInputs { kv_bytes_per_token: 144.0 * 1024.0, kv_basis: "estimate", ..stranger(None) };
         let f = fit_cap(32768, &unmeasured);
         assert_eq!(f.tokens, 8192, "{f:?}");
         let why = f.capped.expect("capped");
         assert!(why.contains("32768 needs 18.0 GiB") && why.contains("4 slot(s)") && why.contains("never measured"), "{why}");
-        let full = FitInputs { used_gib: 15.0, ..unmeasured };
+        let full = FitInputs { room_gib: 0.2, ..unmeasured };
         assert_eq!(fit_cap(32768, &full).tokens, FLOOR, "never below Ollama's own default");
     }
 
     #[test]
     fn a_raise_needs_a_margin_a_drop_does_not_and_a_new_declaration_always_wins() {
-        let d = |tokens, declared| Decided { tokens, declared, source: String::new(), capped: None, slots: 4 };
+        let d = |tokens, declared| Decided { tokens, declared, source: String::new(), capped: None, slots: 4, basis: String::new() };
         let f = stranger(None);
         let held = Sticky { tokens: 8192, declared: 32768 };
         assert_eq!(Sticky::next(Some(held), &d(16384, 32768), &f), Sticky { tokens: 16384, declared: 32768 }, "fits well within the margin");
-        let tight = FitInputs { used_gib: 14.0, ..f };
+        let tight = FitInputs { room_gib: 0.5, ..f };
         assert_eq!(Sticky::next(Some(held), &d(16384, 32768), &tight), held, "not within the margin: hold");
         assert_eq!(Sticky::next(Some(held), &d(4096, 32768), &tight), Sticky { tokens: 4096, declared: 32768 }, "a drop is taken at once");
         assert_eq!(Sticky::next(Some(held), &d(16384, 16384), &tight), Sticky { tokens: 16384, declared: 16384 }, "a new declaration");
     }
 
-    /// The room for the cache keeps the headroom back: on fa's box 15.6 GiB
-    /// with 9.4 used leaves 6.2, minus 1.56 (10%), so about 4.64.
+    /// The rc.2 matrix's 16 GB one-box (run 43673987828): gemma4:e2b, 4.59 GB
+    /// of weights, loaded or not, ~6.9 or ~2.2 GB in use. Loaded, Ollama
+    /// reported 1.19 GB resident (the mapped weights left out), which the
+    /// i655 guard already refuses; 2.6 GB here is a resident figure the
+    /// live fit WOULD trust, so the test sees whether a live row leaks in.
+    fn one_box(loaded: bool) -> Value {
+        let mut stat = json!({"name": "gemma4:e2b", "size_bytes": 4_587_156_505u64, "context_length": 131072});
+        if loaded {
+            stat["resident_bytes"] = json!(2_600_000_000u64);
+            stat["loaded"] = json!(true);
+        }
+        json!({"ram_gb": 15.6, "mem_used_gb": if loaded { 6.9 } else { 2.2 }, "model_stats": [stat]})
+    }
+
+    fn one_box_specs() -> Vec<crate::placement_fit::Spec> {
+        vec![crate::placement_fit::Spec {
+            backend: "ollama".into(), role: "chat".into(), model: "gemma4:e2b".into(),
+            env: json!({"OLLAMA_CONTEXT_LENGTH": "32768", "OLLAMA_NUM_PARALLEL": "1"}).as_object().cloned().unwrap(), target: None, keep_warm: false,
+        }]
+    }
+
+    /// The stable basis: the same box with the same placements decides the
+    /// same context whether the model is loaded or not, and whatever memory
+    /// reads. On rc.2 two identical cells decided 16384 and 32768, depending
+    /// on what was loaded when onboard placed the model.
     #[test]
-    fn the_room_keeps_the_headroom_back() {
-        let room = kv_room_gib(&stranger(None));
-        assert!((4.6..4.7).contains(&room), "{room}");
-        let small = FitInputs { ram_gib: 8.0, used_gib: 4.0, ..stranger(None) };
-        assert!((2.95..3.05).contains(&kv_room_gib(&small)), "the 1 GiB minimum on a small box");
+    fn a_loaded_model_does_not_change_the_decision() {
+        let env = json!({"OLLAMA_CONTEXT_LENGTH": "32768", "OLLAMA_NUM_PARALLEL": "1"});
+        let cold = fit_inputs(&one_box(false), &env, "gemma4:e2b", &one_box_specs(), true);
+        let warm = fit_inputs(&one_box(true), &env, "gemma4:e2b", &one_box_specs(), true);
+        assert_eq!(cold, warm, "a loaded model and a memory reading must not move the inputs");
+        let a = decide("ollama", &env, "gemma4:e2b", &one_box(false), 16384, &one_box_specs(), true).unwrap();
+        let b = decide("ollama", &env, "gemma4:e2b", &one_box(true), 16384, &one_box_specs(), true).unwrap();
+        assert_eq!((a.tokens, a.capped.clone()), (b.tokens, b.capped.clone()));
+    }
+
+    /// The declared room on that box: 15.6 less the 10% headroom (14.04),
+    /// less the controller's 2.5 GB stack, less gemma4:e2b declared (4.59
+    /// weights + 0.54 cache at 32768 x 1 slot x 16 KiB + 0.6 overhead), plus
+    /// its own cache back: about 6.4 GB. 32768 fits, measured, uncapped.
+    #[test]
+    fn the_one_box_decides_its_declared_context_on_the_declared_basis() {
+        let env = json!({"OLLAMA_CONTEXT_LENGTH": "32768", "OLLAMA_NUM_PARALLEL": "1"});
+        let f = fit_inputs(&one_box(true), &env, "gemma4:e2b", &one_box_specs(), true);
+        let room_gb = f.room_gib * GIB / 1e9;
+        assert!((6.3..6.5).contains(&room_gb), "{room_gb}");
+        assert_eq!((f.kv_bytes_per_token, f.kv_basis), (16384.0, "measured"), "the one measured table");
+        let d = decide("ollama", &env, "gemma4:e2b", &one_box(true), 16384, &one_box_specs(), true).unwrap();
+        assert_eq!((d.tokens, d.capped), (32768, None));
+        // Another node's box holds no controller stack: 2.5 GB more room.
+        let other = fit_inputs(&one_box(true), &env, "gemma4:e2b", &one_box_specs(), false);
+        assert!(((other.room_gib - f.room_gib) * GIB / 1e9 - 2.5).abs() < 0.01, "{other:?} {f:?}");
     }
 
     /// decide() itself holds a working context: an unmeasured model on a
     /// tight box that already runs its declared 32768 keeps it.
     #[test]
     fn decide_keeps_what_the_daemon_already_runs() {
-        let node = json!({"ram_gb": 24.0, "mem_used_gb": 23.0,
+        // 16 GB, 8 GB of weights at the 144 KiB estimate, 2 slots: 32768
+        // needs 9.7 GB of cache, the declared room is ~5.8 GB, so the fit
+        // alone says 16384.
+        let node = json!({"ram_gb": 16.0,
             "model_stats": [{"name": "gemma4:12b", "size_bytes": 8_000_000_000u64, "context_length": 131072, "running_context": 32768}]});
-        let d = decide("ollama", &json!({"OLLAMA_CONTEXT_LENGTH": "32768", "OLLAMA_NUM_PARALLEL": "2"}), "gemma4:12b", &node, 32768).expect("decided");
+        let d = decide("ollama", &json!({"OLLAMA_CONTEXT_LENGTH": "32768", "OLLAMA_NUM_PARALLEL": "2"}), "gemma4:12b", &node, 32768, &[], false).expect("decided");
         assert_eq!(d.tokens, 32768, "{d:?}");
         assert!(d.capped.as_deref().is_some_and(|c| c.contains("kept at the 32768 it already runs")), "{d:?}");
     }
@@ -852,13 +915,13 @@ mod tests {
             "model_stats": [{"name": "gemma4:e2b", "size_bytes": 4_600_000_000u64, "context_length": 131072, "running_context": 4096}]});
         assert_eq!(running_context(&node, "gemma4:e2b"), Some(4096));
         let env = json!({"OLLAMA_CONTEXT_LENGTH": "32768"});
-        assert!(decide("vllm", &env, "gemma4:e2b", &node, 16384).is_none(), "vLLM bodies never get options");
-        let d = decide("ollama", &env, "gemma4:e2b", &node, 16384).expect("decided");
+        assert!(decide("vllm", &env, "gemma4:e2b", &node, 16384, &[], false).is_none(), "vLLM bodies never get options");
+        let d = decide("ollama", &env, "gemma4:e2b", &node, 16384, &[], false).expect("decided");
         assert_eq!((d.declared, d.slots), (32768, 4));
         assert!(d.source.contains("OLLAMA_CONTEXT_LENGTH"), "{}", d.source);
-        let profile_only = decide("ollama", &json!({}), "gemma4:e2b", &node, 16384).expect("the tier profile");
+        let profile_only = decide("ollama", &json!({}), "gemma4:e2b", &node, 16384, &[], false).expect("the tier profile");
         assert_eq!(profile_only.declared, 16384);
-        assert!(decide("ollama", &json!({}), "gemma4:e2b", &node, 0).is_none(), "nothing declared: nothing stamped");
+        assert!(decide("ollama", &json!({}), "gemma4:e2b", &node, 0, &[], false).is_none(), "nothing declared: nothing stamped");
     }
 
     #[test]
@@ -891,7 +954,7 @@ mod tests {
     #[test]
     fn a_read_moves_the_held_value_a_failure_keeps_it_and_nothing_declared_clears_it() {
         let t0 = std::time::Instant::now();
-        let d = |tokens, declared| Decided { tokens, declared, source: String::new(), capped: None, slots: 4 };
+        let d = |tokens, declared| Decided { tokens, declared, source: String::new(), capped: None, slots: 4, basis: String::new() };
         let f = stranger(None);
         let first = after_read(None, &Read::Decided(d(16384, 16384), f), t0);
         assert_eq!(first.sticky, Some(Sticky { tokens: 16384, declared: 16384 }));
