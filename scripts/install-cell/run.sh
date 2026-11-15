@@ -106,6 +106,12 @@ agent_dump() {
       if command -v noo >/dev/null 2>&1; then
         echo "== noo --json cluster show $(hostname) (this node: lanes, placements, backends)"
         timeout 60 noo --json cluster show "$(hostname)" 2>&1 | head -c 20000; echo
+        # The fit report the tuner and the decided context read (budgets
+        # with declared_used_gb and stack_reserve_gb, each model row with declared_gb,
+        # kv_per_token_bytes and kv_basis): a "why is my model at 16k"
+        # question is answered from it (i802, rc.2).
+        echo "== noo --json cluster fit $(hostname) (the declared basis)"
+        timeout 60 noo --json cluster fit "$(hostname)" 2>&1 | head -c 20000; echo
       fi
       if docker inspect noo-gateway >/dev/null 2>&1; then
         echo "== noo-gateway: nudges and placements (last 15 min)"

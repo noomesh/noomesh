@@ -208,6 +208,9 @@ pub struct TuneInput<'a> {
     /// What the target's pool has left for this placement's KV cache, GB:
     /// usable minus everything else on it, minus the weights and overhead.
     pub free_gb: Option<f64>,
+    /// The fit report's KV per token for this row and its basis ([`kv_in`]);
+    /// `None` from an older gateway (the estimate from the weights is used).
+    pub kv: Option<(f64, String)>,
 }
 
 /// One tuned value and the reason, printed by `noo cluster place`.
@@ -252,14 +255,32 @@ pub fn batch_for(usage: &str, target: &str) -> u64 {
     }
 }
 
-/// Context size sized from free memory: half of `free_gb` for KV, at the
-/// conservative per-token figure, over `parallel` slots; a power of two in
-/// [`MIN_CTX`, `MAX_CTX`].
-pub fn ctx_for(weights_gb: Option<f64>, free_gb: Option<f64>, parallel: u64) -> (u64, String) {
+/// The KV cache per token per slot the fit report gives this placement's
+/// row (`models[].kv_per_token_bytes` and `kv_basis`: the gateway's ONE KV
+/// figure, `placement_fit::kv_per_token`: measured, else the reported
+/// architecture, else the estimate). `None` from an older gateway.
+pub fn kv_in(fit: &Value, backend: &str, role: &str) -> Option<(f64, String)> {
+    let row = fit["models"].as_array()?.iter().find(|m| m["backend"] == backend && m["role"] == role)?;
+    let b = row["kv_per_token_bytes"].as_f64().filter(|b| *b > 0.0)?;
+    Some((b, row["kv_basis"].as_str().unwrap_or("estimate").to_string()))
+}
+
+/// Context size sized from free memory: half of `free_gb` for KV, at `kv`
+/// (the fit report's figure and its basis; from an older gateway, this
+/// crate's estimate from the weights), over `parallel` slots; a power of
+/// two in [`MIN_CTX`, `MAX_CTX`]. The reason line names the basis.
+pub fn ctx_for(weights_gb: Option<f64>, free_gb: Option<f64>, parallel: u64, kv: Option<(f64, String)>) -> (u64, String) {
     let (Some(w), Some(free)) = (weights_gb.filter(|w| *w > 0.0), free_gb) else {
         return (DEFAULT_CTX, "model size or free memory unknown: the backend default".into());
     };
-    let per_token_gb = kv_bytes_per_token(w) / 1e9;
+    let (per_token, basis) = kv.unwrap_or_else(|| (kv_bytes_per_token(w), "an estimate from the weights (older gateway)".into()));
+    let basis = match basis.as_str() {
+        "measured" => "measured for this model".to_string(),
+        "architecture" => "from the model's architecture".to_string(),
+        "estimate" => "an estimate: never measured for this model".to_string(),
+        other => other.to_string(),
+    };
+    let per_token_gb = per_token / 1e9;
     let kv_budget = (free * 0.5).max(0.0);
     let raw = kv_budget / (per_token_gb * parallel.max(1) as f64);
     if raw < MIN_CTX as f64 {
@@ -269,7 +290,7 @@ pub fn ctx_for(weights_gb: Option<f64>, free_gb: Option<f64>, parallel: u64) -> 
     while ctx * 2 <= MAX_CTX && ((ctx * 2) as f64) <= raw {
         ctx *= 2;
     }
-    (ctx, format!("half of the {free:.1} GB left after the model, at ~{:.0} KB/token x {parallel} slot(s)", per_token_gb * 1e6))
+    (ctx, format!("half of the {free:.1} GB left after the declared models, at ~{:.0} KB/token ({basis}) x {parallel} slot(s)", per_token_gb * 1e6))
 }
 
 /// The tuned values for a placement (before `--env` and stored keys are
@@ -288,7 +309,7 @@ pub fn tune(i: &TuneInput) -> Vec<Choice> {
             out.push(Choice { key: "N_PARALLEL", value: p.to_string(), why });
             let mut ctx = None;
             if i.role == "chat" {
-                let (c, why) = ctx_for(i.weights_gb, i.free_gb, p);
+                let (c, why) = ctx_for(i.weights_gb, i.free_gb, p, i.kv.clone());
                 out.push(Choice { key: "N_CTX", value: c.to_string(), why });
                 ctx = Some(c);
             }
@@ -305,7 +326,7 @@ pub fn tune(i: &TuneInput) -> Vec<Choice> {
             // retest, finding 126). Embed and rerank requests carry their own
             // num_ctx, so only a chat row pins it.
             if i.role == "chat" {
-                let (c, why) = ctx_for(i.weights_gb, i.free_gb, p);
+                let (c, why) = ctx_for(i.weights_gb, i.free_gb, p, i.kv.clone());
                 let (c, why) = if c < OLLAMA_MIN_CHAT_CTX {
                     (OLLAMA_MIN_CHAT_CTX, format!("{why}; raised to the {OLLAMA_MIN_CHAT_CTX} floor for an ollama chat model (fit judges it)"))
                 } else {
@@ -354,14 +375,24 @@ pub fn apply_choices(
 }
 
 /// Free memory, GB, the fit report leaves for this placement's KV cache in
-/// `target`'s pool: usable - (everything charged to the pool) + (this row's
-/// own KV, which the tuning is about to size). `None` when the report has no
-/// such pool or no row for the placement.
+/// `target`'s pool, on the DECLARED basis: usable - the controller's stack
+/// reserve - every declared row (weights at their file size, never a live
+/// resident figure) + this row's own KV, which the tuning is about to size.
+/// The same box with the same placements therefore tunes the same context
+/// whether or not a model is loaded (0.6.25-rc.2: two identical cells tuned
+/// 16384 and 32768). The gateway's decided context uses the same figure
+/// (`placement_fit::declared_kv_room_gb`). An older gateway (no
+/// `declared_used_gb`) falls back to its live `used_gb`. `None` when the
+/// report has no such pool or no row for the placement.
 pub fn free_for_kv(fit: &Value, backend: &str, role: &str, target: &str) -> Option<f64> {
     let pool = fit["budgets"].as_array()?.iter().find(|b| b["target"] == target)?;
     let usable = pool["usable_gb"].as_f64()?;
-    let used = pool["used_gb"].as_f64()?;
     let row = fit["models"].as_array()?.iter().find(|m| m["backend"] == backend && m["role"] == role)?;
+    if let Some(declared) = pool["declared_used_gb"].as_f64() {
+        let reserve = pool["stack_reserve_gb"].as_f64().unwrap_or(0.0);
+        return Some(usable - reserve - declared + row["kv_gb"].as_f64().unwrap_or(0.0));
+    }
+    let used = pool["used_gb"].as_f64()?;
     // A measured row has no separable KV; treat its whole size as fixed.
     let kv = if row["source"] == "measured" { 0.0 } else { row["kv_gb"].as_f64().unwrap_or(0.0) };
     Some(usable - used + kv)
@@ -496,22 +527,22 @@ mod tests {
     #[test]
     fn context_is_sized_from_free_memory_and_clamped() {
         // 15.8 GB weights: ~259 KB/token. 20 GB free -> 10 GB for KV -> ~38.6k tokens -> 32768.
-        assert_eq!(ctx_for(Some(15.8), Some(20.0), 1).0, 32768);
+        assert_eq!(ctx_for(Some(15.8), Some(20.0), 1, None).0, 32768);
         // Two slots halve it: ~19.3k -> 16384.
-        assert_eq!(ctx_for(Some(15.8), Some(20.0), 2).0, 16384);
+        assert_eq!(ctx_for(Some(15.8), Some(20.0), 2, None).0, 16384);
         // 2 GB free -> 1 GB KV -> ~3.9k -> 2048.
-        assert_eq!(ctx_for(Some(15.8), Some(2.0), 1).0, 2048);
+        assert_eq!(ctx_for(Some(15.8), Some(2.0), 1, None).0, 2048);
         // Nearly full: the minimum, and says so.
-        let (c, why) = ctx_for(Some(15.8), Some(0.1), 1);
+        let (c, why) = ctx_for(Some(15.8), Some(0.1), 1, None);
         assert!(c == MIN_CTX && why.contains("minimum"), "{why}");
         // Unknown: the default.
-        assert_eq!(ctx_for(None, Some(20.0), 1).0, DEFAULT_CTX);
-        assert_eq!(ctx_for(Some(4.0), None, 1).0, DEFAULT_CTX);
+        assert_eq!(ctx_for(None, Some(20.0), 1, None).0, DEFAULT_CTX);
+        assert_eq!(ctx_for(Some(4.0), None, 1, None).0, DEFAULT_CTX);
     }
 
     #[test]
     fn a_shared_16_core_cpu_placement_tunes_threads_slots_ctx_and_batch() {
-        let i = TuneInput { backend: "llamacpp", role: "chat", target: "cpu", usage: "shared", cpu_cores: Some(16), weights_gb: Some(15.8), free_gb: Some(10.0) };
+        let i = TuneInput { backend: "llamacpp", role: "chat", target: "cpu", usage: "shared", cpu_cores: Some(16), weights_gb: Some(15.8), free_gb: Some(10.0), kv: None };
         let got: Vec<(&str, String)> = tune(&i).into_iter().map(|c| (c.key, c.value)).collect();
         assert_eq!(got, vec![
             ("N_THREADS", "4".to_string()),
@@ -532,7 +563,7 @@ mod tests {
     /// qwen3:4b, 2.4 GB of weights, on a 6 GB RTX 3060 Laptop GPU.
     #[test]
     fn an_ollama_chat_placement_pins_its_context() {
-        let i = TuneInput { backend: "ollama", role: "chat", target: "gpu", usage: "shared", cpu_cores: Some(16), weights_gb: Some(2.4), free_gb: Some(2.8) };
+        let i = TuneInput { backend: "ollama", role: "chat", target: "gpu", usage: "shared", cpu_cores: Some(16), weights_gb: Some(2.4), free_gb: Some(2.8), kv: None };
         let got: Vec<(&str, String)> = tune(&i).into_iter().map(|c| (c.key, c.value)).collect();
         assert_eq!(got[0], ("OLLAMA_NUM_PARALLEL", "1".to_string()));
         assert_eq!(got[1].0, "OLLAMA_CONTEXT_LENGTH");
@@ -557,9 +588,9 @@ mod tests {
     #[test]
     fn the_kv_floor_leaves_a_big_models_n_ctx_unchanged() {
         assert_eq!(kv_bytes_per_token(15.8), 15.8 * KV_BYTES_PER_TOKEN_PER_GB_WEIGHTS);
-        assert_eq!(ctx_for(Some(15.8), Some(20.0), 1).0, 32768);
-        assert_eq!(ctx_for(Some(15.8), Some(10.0), 1).0, 16384);
-        assert_eq!(ctx_for(Some(15.8), Some(2.0), 1).0, 2048);
+        assert_eq!(ctx_for(Some(15.8), Some(20.0), 1, None).0, 32768);
+        assert_eq!(ctx_for(Some(15.8), Some(10.0), 1, None).0, 16384);
+        assert_eq!(ctx_for(Some(15.8), Some(2.0), 1, None).0, 2048);
         // A small model takes the floor: qwen3-4b's real 144 KiB, not 38.
         assert_eq!(kv_bytes_per_token(2.4), KV_BYTES_PER_TOKEN_FLOOR);
     }
@@ -580,6 +611,31 @@ mod tests {
         let retuned = apply_choices(choices, &explicit, &stored, true);
         assert!(matches!(&retuned[1], Applied::Set(c) if c.value == "8192"), "a target change re-tunes");
         assert_eq!(retuned[0], Applied::Explicit("N_THREADS"), "explicit still wins");
+    }
+
+    /// The stable basis (0.6.25-rc.2: two identical 16 GB cells tuned 16384
+    /// and 32768). The same declared placements tune the same context
+    /// whatever the live `used_gb` says: loaded (gemma4:e2b's trusted
+    /// resident figure) or not.
+    #[test]
+    fn a_loaded_model_does_not_change_the_tuned_context() {
+        let fit = |used: f64, source: &str| json!({
+            "budgets": [{"target": "cpu", "usable_gb": 14.04, "used_gb": used, "declared_used_gb": 5.724, "stack_reserve_gb": 2.5}],
+            "models": [{"backend": "ollama", "role": "chat", "target": "cpu", "weights_gb": 4.587, "kv_gb": 0.537, "total_gb": used,
+                        "source": source, "kv_per_token_bytes": 16384.0, "kv_basis": "measured"}]});
+        let (cold, warm) = (fit(5.724, "estimated"), fit(2.6, "measured"));
+        let free = free_for_kv(&cold, "ollama", "chat", "cpu").unwrap();
+        assert!((free - (14.04 - 2.5 - 5.724 + 0.537)).abs() < 1e-9, "{free}");
+        assert_eq!(free_for_kv(&warm, "ollama", "chat", "cpu"), Some(free), "a live reading must not move it");
+        let tune = |f: &Value| ctx_for(weights_in(f, "ollama", "chat"), free_for_kv(f, "ollama", "chat", "cpu"), 1, kv_in(f, "ollama", "chat"));
+        let (c, why) = tune(&cold);
+        assert_eq!(c, 32768);
+        assert!(why.contains("measured for this model") && why.contains("declared models"), "{why}");
+        assert_eq!(tune(&warm), (c, why));
+        // No measured figure: the fit report's estimate, named as one.
+        let est = json!({"budgets": cold["budgets"].clone(), "models": [{"backend": "ollama", "role": "chat", "target": "cpu",
+            "weights_gb": 4.587, "kv_gb": 4.83, "kv_per_token_bytes": 147456.0, "kv_basis": "estimate"}]});
+        assert!(tune(&est).1.contains("an estimate: never measured"), "{:?}", tune(&est));
     }
 
     #[test]
