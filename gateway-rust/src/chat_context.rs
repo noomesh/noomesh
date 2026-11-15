@@ -453,22 +453,72 @@ async fn node_of_url(state: &crate::state::AppState, url: &str) -> Option<String
         Some(host) => crate::coordinator::resolve_node_id(state, &host).await.ok(),
         None => None,
     };
-    let node = enrolled.or_else(|| own_node_for(url, std::env::var("OLLAMA_URL").ok().as_deref(), crate::self_node::self_node_id()));
+    let node = enrolled.or_else(|| own_node_id_for_url(url));
     urls().insert(url.to_string(), (node.clone(), now));
     node
 }
 
-/// The node a controller door belongs to: the controller's own. A backend
-/// the gateway dials on its own docker network (`noo-stunnel-ollama`,
-/// `noo-vllm`, or its `OLLAMA_URL`, which on a standalone box is
-/// `noo-stunnel-ollama-embed`) names a container, not an enrolled node, so
-/// the name resolves to nothing. That is the path a box takes when its agent
-/// is loopback-only (the WSL2 one-box, 0.6.25-rc.2). Its chat placement's
-/// context was then never stamped and Ollama ran 4,096 under a declared
-/// 16,384. Any other unresolved URL stays `None` (the static off-box
-/// `OLLAMA_URL` gap).
-fn own_node_for(url: &str, ollama_url: Option<&str>, self_id: Option<String>) -> Option<String> {
-    crate::coordinator::is_controller_local_service(url, ollama_url).then_some(self_id).flatten()
+/// The stack's own backend containers, as `docker-compose.cluster.yml`
+/// names them (`container_name: ${NOO_CONTAINER_PREFIX:-noo}-<name>`; a test
+/// holds this list to the compose). A host with one of these names resolves
+/// only inside the stack's Docker network, so it is this controller's box.
+pub const STACK_BACKEND_CONTAINERS: &[&str] = &[
+    "vllm", "vllm-secondary", "stunnel-vllm", "stunnel-vllm-secondary", "llamacpp", "stunnel-llamacpp", "airllm",
+    "ollama", "ollama-embed", "ollama-embed-cpu", "stunnel-ollama-embed-cpu", "stunnel-ollama-embed", "stunnel-ollama",
+];
+
+/// Whether `host` (a URL's host, no port) is on the controller's own box,
+/// decided from the name alone and never by a lookup:
+/// - loopback: `localhost`, or an IP whose `is_loopback()` holds
+///   (127.0.0.0/8, ::1);
+/// - one of the stack's own containers, `<prefix>-<name>` with `<prefix>`
+///   the compose's `NOO_CONTAINER_PREFIX` (default `noo`) and `<name>` in
+///   [`STACK_BACKEND_CONTAINERS`]: names that resolve only inside the stack's
+///   Docker network.
+///
+/// Never local: any other IP (a LAN or tailnet address, the controller's
+/// own tailnet IP included: an IP alone cannot say which box it is, and an
+/// enrolled box's IP is mapped by its node record before this is asked)
+/// and any other name (a bare hostname may be another machine).
+pub fn is_stack_local_host(host: &str, prefix: &str) -> bool {
+    let h = host.trim().trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    if h == "localhost" {
+        return true;
+    }
+    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    let prefix = prefix.trim().to_ascii_lowercase();
+    h.strip_prefix(&format!("{prefix}-")).is_some_and(|rest| STACK_BACKEND_CONTAINERS.contains(&rest))
+}
+
+/// A URL's host: what sits between the scheme and the port or path, the
+/// brackets of an IPv6 literal kept off.
+fn url_host(url: &str) -> Option<&str> {
+    let rest = url.split("://").last().unwrap_or(url);
+    let rest = rest.split('/').next().unwrap_or(rest);
+    let host = if let Some(v6) = rest.strip_prefix('[') { v6.split(']').next().unwrap_or("") } else { rest.split(':').next().unwrap_or("") };
+    (!host.is_empty()).then_some(host)
+}
+
+/// The node a URL on the controller's own box belongs to: the controller's
+/// own ([`is_stack_local_host`]). A backend the gateway dials on its own
+/// Docker network names a container, not an enrolled node, so it resolves
+/// to nothing. That is the path a box takes when its agent is loopback-only
+/// (the WSL2 one-box, 0.6.25-rc.2): its chat placement's context was then
+/// never stamped, and Ollama ran 4,096 under a declared 16,384. Anything
+/// else unresolved stays `None`: an off-box `OLLAMA_URL` naming no enrolled
+/// node gets no context (the stated limit, noomesh-internal i802).
+fn own_node_for(url: &str, prefix: &str, self_id: Option<String>) -> Option<String> {
+    url_host(url).is_some_and(|h| is_stack_local_host(h, prefix)).then_some(self_id).flatten()
+}
+
+/// [`own_node_for`] with this process's container prefix and node id: the
+/// one mapping every caller with only a URL uses (`node_of_url`, raw chat's
+/// no-class-table candidate).
+pub fn own_node_id_for_url(url: &str) -> Option<String> {
+    let prefix = std::env::var("NOO_CONTAINER_PREFIX").ok().filter(|p| !p.trim().is_empty()).unwrap_or_else(|| "noo".into());
+    own_node_for(url, &prefix, crate::self_node::self_node_id())
 }
 
 /// [`num_ctx_for_node`] for a backend known only by its URL. A controller
@@ -744,14 +794,39 @@ mod tests {
     #[test]
     fn a_controller_door_belongs_to_the_controllers_own_node() {
         let own = || Some("runnervmm7ud1".to_string());
-        let wsl2 = Some("https://noo-stunnel-ollama-embed:11434");
-        assert_eq!(own_node_for("https://noo-stunnel-ollama-embed:11434", wsl2, own()).as_deref(), Some("runnervmm7ud1"));
-        assert_eq!(own_node_for("https://noo-stunnel-ollama:11434", None, own()).as_deref(), Some("runnervmm7ud1"));
-        assert_eq!(own_node_for("https://noo-vllm:8000", None, own()).as_deref(), Some("runnervmm7ud1"));
-        assert_eq!(own_node_for("https://192.0.2.40:11434", Some("https://192.0.2.40:11434/"), own()).as_deref(), Some("runnervmm7ud1"),
-            "the configured OLLAMA_URL is the controller's own door, trailing slash or not");
-        assert_eq!(own_node_for("https://198.51.100.9:11434", wsl2, own()), None, "an off-box URL that names no node is nobody's");
-        assert_eq!(own_node_for("https://noo-stunnel-ollama-embed:11434", wsl2, None), None, "no self id: nothing guessed");
+        let mine = |url: &str| own_node_for(url, "noo", own());
+        // The embed door (the WSL2 one-box's OLLAMA_URL), the other stack
+        // doors, and loopback: the controller's own box.
+        for url in ["https://noo-stunnel-ollama-embed:11434", "https://noo-stunnel-ollama:11434", "https://noo-vllm:8000",
+                    "http://localhost:11434", "http://127.0.0.1:11434", "http://127.0.0.2:11434", "http://[::1]:11434"] {
+            assert_eq!(mine(url).as_deref(), Some("runnervmm7ud1"), "{url}");
+        }
+        // Off-box: never the controller's, whatever OLLAMA_URL says (0.6.25:
+        // #1228 counted any URL equal to OLLAMA_URL as the controller's door,
+        // and a hand-pointed remote Ollama got the controller's decision).
+        for url in ["https://192.0.2.40:11434", "https://198.51.100.9:11434", "http://[2001:db8::7]:11434",
+                    "https://gpu-box:11434", "https://gpu-box.lan:11434", "https://noo-ollama.example.com:11434"] {
+            assert_eq!(mine(url), None, "{url}: an off-box URL that names no enrolled node is nobody's");
+        }
+        // The controller's own tailnet IP: NOT taken as local. An IP alone
+        // cannot say which box it is; when it is the controller's, its node
+        // record (resolve_node_id, asked first) maps it, not this rule.
+        assert_eq!(mine("https://100.64.0.12:11434"), None);
+        // Another compose prefix: its own names, not noo's.
+        assert_eq!(own_node_for("https://lab-stunnel-ollama:11434", "lab", own()).as_deref(), Some("runnervmm7ud1"));
+        assert_eq!(own_node_for("https://noo-stunnel-ollama:11434", "lab", own()), None);
+        assert_eq!(own_node_for("https://noo-stunnel-ollama-embed:11434", "noo", None), None, "no self id: nothing guessed");
+    }
+
+    /// The names the rule accepts are the stack's own containers: each is a
+    /// `container_name` in the compose the controller runs.
+    #[test]
+    fn the_local_names_are_the_composes_own_containers() {
+        let compose = include_str!("../../docker-compose.cluster.yml");
+        for name in STACK_BACKEND_CONTAINERS {
+            let line = format!("container_name: ${{NOO_CONTAINER_PREFIX:-noo}}-{name}\n");
+            assert!(compose.contains(&line), "{name} is not a container in docker-compose.cluster.yml");
+        }
     }
 
     /// The decision for a backend known by URL goes through the mapping
@@ -762,7 +837,7 @@ mod tests {
     fn num_ctx_for_reaches_the_controller_door_mapping() {
         let own = crate::test_src::own_code(include_str!("chat_context.rs"));
         let body = crate::test_src::fn_body(&own, "async fn node_of_url(");
-        assert!(body.contains("enrolled.or_else(|| own_node_for(url, std::env::var(\"OLLAMA_URL\").ok().as_deref(), crate::self_node::self_node_id()))"), "{body}");
+        assert!(body.contains("enrolled.or_else(|| own_node_id_for_url(url))"), "{body}");
         let for_url = crate::test_src::fn_body(&own, "pub async fn num_ctx_for(");
         assert!(for_url.contains("node_of_url(state, backend_url).await?"), "{for_url}");
     }
