@@ -163,6 +163,11 @@ over the mTLS rail.
    whose digest only the gateway states, every set file's digest is already
    inside the signed manifest, so the signature covers the files.
 
+   A new revision reuses unchanged files (same sha256 and size) from a
+   verified earlier revision of the same set on the same disk, by hard link,
+   and still re-hashes them; the old revision is kept until the new one
+   verifies (its heartbeat row carries `link_source_for`), then pruned.
+
    The model cache serves only `/sets/<id>/<revision>/<file>` and
    `/sets/<id>/<revision>/<dir>/<file>`. It refuses (404) a `.` or `..`
    component, any other depth, a name outside the schema charset, a `.part`
@@ -554,7 +559,7 @@ become a fact (the i495 rule). A `null` is never sent.
 | `addon_workloads_policy` | `"none"` / `"approve"` / `"auto"` | the node's consent setting |
 | `addon_workloads_approvals` | `[{addon, digest, source?}]` | per add-on and image digest. The owner's own approvals carry no `source`; on a node whose owner opted in to controller approvals, each pair only the controller's signed set approves follows them with `"source": "controller"` (at most 256 rows in all) |
 | `addon_workloads_controller` | `{opted_in, set_state, generation?, set_sha256?}` | controller approvals ([below](#approving-from-the-controller-opt-in)): whether the owner opted in, and the set the agent holds: `set_state` is `none`, `verified` or `unverifiable`; `generation` and `set_sha256` (the SHA-256 of the signed document's bytes) ride `verified`. Always reported. The gateway stores it from the release that delivers the sets (i596 slice 2); until then it drops it |
-| `model_sets` | `[{id, revision, state, reason?, bytes_done?, bytes_total?, retry_at?, free_bytes?, need_bytes?}]` | `state` is `verified`, `fetching` or `refused`; `reason` rides `refused`. The delivery fields (i607b) are optional and omitted when not known or not applicable, each riding only its state: `bytes_done` and `bytes_total` (integers) on `fetching` (`bytes_done` counts the files already on disk plus the bytes written of the current one; `bytes_total` is the whole set), `bytes_total` alone on `verified`; `retry_at` (RFC 3339, UTC) on `refused` is when the agent next tries; `free_bytes` and `need_bytes` on a `refused` row with `reason: disk` only, the free bytes the agent saw and the bytes it needed (the files still to write plus its margin). `reason` stays a code; the numbers are separate fields, never free text. An old agent sends none of them, and a reader shows the state alone |
+| `model_sets` | `[{id, revision, state, reason?, bytes_done?, bytes_total?, retry_at?, free_bytes?, need_bytes?, link_source_for?}]` | `state` is `verified`, `fetching` or `refused`; `reason` rides `refused`. The delivery fields (i607b) are optional and omitted when not known or not applicable, each riding only its state: `bytes_done` and `bytes_total` (integers) on `fetching` (`bytes_done` counts the files already on disk plus the bytes written of the current one; `bytes_total` is the whole set), `bytes_total` alone on `verified`; `retry_at` (RFC 3339, UTC) on `refused` is when the agent next tries; `free_bytes` and `need_bytes` on a `refused` row with `reason: disk` only, the free bytes the agent saw and the bytes it needed (the files still to write plus its margin). `reason` stays a code; the numbers are separate fields, never free text. `link_source_for` (a revision) rides a `verified` row no placement wants any more: the agent keeps it as the hard-link source of that revision of the same set until it verifies. An old agent sends none of them, and a reader shows the state alone |
 | `node_workloads` | `[{addon, name, state, ready, model?, door_port, reservation?, reason?}]` | `state` is a desired state or a reported one (`draining`, `needs_attention`). `model`, `reservation` and `reason` are omitted when unknown or none. There is no `slots` in phase 2 (placement sizes it from `accel.slots_env`) |
 
 `heartbeat-i300.json` is the example.
