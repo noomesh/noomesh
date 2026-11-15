@@ -460,13 +460,7 @@ pub async fn context_overflow_for(db: &PgPool, consumer: &str) -> ContextOverflo
             }
         }
     }
-    let row: Result<Option<bool>, sqlx::Error> = sqlx::query_scalar(
-        "SELECT bool_or(context_overflow = 'refuse') FROM noo_service_keys WHERE consumer = $1 AND active = true",
-    )
-    .bind(consumer)
-    .fetch_one(db)
-    .await;
-    let mode = match row {
+    let mode = match crate::repo::service_key_overflow::refuses(db, consumer).await {
         Ok(Some(true)) => ContextOverflow::Refuse,
         Ok(_) => ContextOverflow::Flag,
         Err(e) => {
@@ -827,7 +821,7 @@ mod invalidation_guard {
         ("routes/users.rs", "async fn service_key_revoke_and_disable(", "tx.commit().await?"),
         ("routes/users.rs", "async fn service_key_rotate(", "(SUPERSEDE_PREVIOUS_SQL)"),
         ("routes/users.rs", "async fn service_key_set_quota(", "UPDATE noo_service_keys SET rpm_limit"),
-        ("routes/users.rs", "async fn service_key_set_context_overflow(", "UPDATE noo_service_keys SET context_overflow"),
+        ("routes/users.rs", "async fn service_key_set_context_overflow(", "crate::repo::service_key_overflow::set("),
         ("addon_auth.rs", "pub async fn init(", "INSERT INTO noo_service_keys"),
         ("service_keys.rs", "pub async fn mint_door_key(", "INSERT INTO noo_service_keys"),
         ("service_keys.rs", "pub async fn revoke_door_key(", "UPDATE noo_service_keys SET active = false"),
