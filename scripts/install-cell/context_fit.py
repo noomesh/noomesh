@@ -683,6 +683,26 @@ def _read(path: str) -> str:
 
 # ---------------------------------------------------------------- commands
 
+def poll_running(read, judge, settle_s: float, step_s: float, clock=time.monotonic, sleep=time.sleep):
+    """After the reload turn: `running` is the node heartbeat's /api/ps
+    context (HEARTBEAT_INTERVAL, 30 s by default), so the first read after
+    a turn can predate it (rc.3 run 43715012498, stranger-24.04: read at
+    once, 32768 against a decided 4096). Re-read until the verdict is
+    settled (`judge(doc, final=False)` is not None) or `settle_s` has passed,
+    then judge it as final. Returns (rc, line, doc, waited_s)."""
+    start = clock()
+    while True:
+        doc = read()
+        rc, line = judge(doc, False)
+        waited = clock() - start
+        if rc is not None:
+            return rc, line, doc, waited
+        if waited >= settle_s:
+            rc, line = judge(doc, True)
+            return rc, line, doc, waited
+        sleep(step_s)
+
+
 def cmd_running(a) -> int:
     doc, why = cluster_show(a.node)
     if doc is None:
@@ -694,11 +714,19 @@ def cmd_running(a) -> int:
         # no model call, so it would load or reload nothing.
         warm = f"{WARM_PROMPT} ({int(time.time())})"
         print(f"CONTEXT-FIT running: {line}; one chat turn first ({warm!r})")
-        chat = chat_turn(warm, a.gateway, a.turn_timeout)
+        chat, facts, secs = timed_turn(warm, a.gateway, a.turn_timeout)
         if chat["error"]:
             print(f"  the warm-up turn: {chat['error']}")
-        doc, why = cluster_show(a.node)
-        rc, line = judge_running(doc, a.expect_decided, a.chat_model, final=True)
+        # What that turn asked the backend for: backend_call's ctx= is the
+        # num_ctx the gateway stamped, so a FAIL says whether the request or
+        # the daemon is at fault.
+        stamped = [c.get("ctx") for c in facts["backend_calls"]] if facts["readable"] else None
+        print(f"  the warm-up turn ({secs:.1f} s) stamped ctx: {stamped if stamped else 'not in the gateway log'}")
+        rc, line, doc, waited = poll_running(
+            lambda: cluster_show(a.node)[0],
+            lambda d, final: judge_running(d, a.expect_decided, a.chat_model, final=final),
+            a.settle, 10.0)
+        print(f"  read {waited:.0f} s after the turn (the node reports running once a heartbeat, every 30 s by default)")
     for i in (doc or {}).get("chat_contexts") or []:
         print("  " + json.dumps(i, ensure_ascii=False))
     print(line)
@@ -790,6 +818,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--expect-decided", type=int)
     r.add_argument("--node", default=socket.gethostname())
     r.add_argument("--chat-model")
+    r.add_argument("--settle", type=float, default=75.0,
+                   help="seconds to wait for a heartbeat to report the reload (2.5 heartbeats)")
     t = sub.add_parser("turns", help="four console turns, judged and timed")
     t.add_argument("--out", required=True)
     t.add_argument("--model-label")

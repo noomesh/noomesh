@@ -106,6 +106,32 @@ def test_a_pin_read_before_any_turn_reloads_once_and_then_judges():
     assert CF.judge_running({"chat_contexts": [_ctx(4096, 4096)]}, expect_decided=4096, final=False)[0] == CF.PASS
 
 
+class _Clock:
+    def __init__(self):
+        self.t = 0.0
+    def now(self):
+        return self.t
+    def sleep(self, s):
+        self.t += s
+
+
+def test_the_reload_is_read_once_a_heartbeat_reports_it():
+    # rc.3 run 43715012498, stranger-24.04: the first read after the reload
+    # turn still showed 32768 (the heartbeat had not run yet).
+    reads = iter([_ctx(32768, 4096), _ctx(32768, 4096), _ctx(4096, 4096)])
+    clock = _Clock()
+    judge = lambda d, final: CF.judge_running(d, expect_decided=4096, final=final)
+    rc, line, doc, waited = CF.poll_running(lambda: {"chat_contexts": [next(reads)]}, judge, 75, 10, clock.now, clock.sleep)
+    assert rc == CF.PASS and waited == 20, (rc, line, waited)
+
+
+def test_a_reload_that_never_lands_fails_after_the_settle_time():
+    clock = _Clock()
+    judge = lambda d, final: CF.judge_running(d, expect_decided=4096, final=final)
+    rc, line, doc, waited = CF.poll_running(lambda: {"chat_contexts": [_ctx(32768, 4096)]}, judge, 75, 10, clock.now, clock.sleep)
+    assert rc == CF.FAIL and "the backend runs 32768, the gateway decided 4096" in line and waited >= 75, (line, waited)
+
+
 def test_running_fails_on_a_mismatch_or_a_small_decision():
     rc, line = CF.judge_running({"chat_contexts": [_ctx(4096, 16384)]})
     assert rc == CF.FAIL and "the backend runs 4096, the gateway decided 16384" in line
