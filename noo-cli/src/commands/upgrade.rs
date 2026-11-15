@@ -8199,7 +8199,10 @@ mod cpu_only_slots_upgrade_tests {
         assert!(slots_upgrade_sets_one(true, true, None));
         assert!(!slots_upgrade_sets_one(true, true, Some("4")), "an explicit 4 is the operator's");
         assert!(!slots_upgrade_sets_one(true, true, Some("2")));
-        assert!(!slots_upgrade_sets_one(false, false, None), "a GPU box");
+        // A GPU box with a READABLE config and nothing set: only the CPU-only
+        // gate keeps it at its slots (a mutant dropping the gate survived
+        // while this case also read as unreadable).
+        assert!(!slots_upgrade_sets_one(false, true, None), "a GPU box");
         assert!(!slots_upgrade_sets_one(true, false, None), "an unreadable config");
         let said = slots_changed_line();
         assert!(said.starts_with("changed: Ollama slots 4 -> 1") && said.contains("3x faster") && said.ends_with(KEEP_FOUR_SLOTS), "{said}");
