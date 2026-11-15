@@ -52,7 +52,7 @@ const hfPreseedTimeout = 15 * time.Minute
 
 // hfManifestVersionFloor is the first stack release whose gateway serves the
 // `hf` manifest kind.
-const hfManifestVersionFloor = "0.6.25-rc.2"
+const hfManifestVersionFloor = "0.6.25-rc.3"
 
 // hfManifestFn asks the gateway for a repo's `hf` manifest. A seam for tests.
 var hfManifestFn = awaitHFManifest
