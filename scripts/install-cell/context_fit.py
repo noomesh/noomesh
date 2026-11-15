@@ -265,8 +265,11 @@ def pick_contexts(items: list[dict], model: str | None) -> list[dict]:
 
 def judge_running(doc: dict | None, expect_decided: int | None = None, model: str | None = None,
                   final: bool = True) -> tuple[int | None, str]:
-    """(rc, line). rc None: the model is not loaded yet (running null) and
-    this is not the final read; the caller chats once and reads again."""
+    """(rc, line). rc None, on a read that is not the final one: the model
+    is not loaded yet (running null), or it still runs a context other than
+    the decided one (it was loaded before a pin or a restart, and only the
+    next request's num_ctx reloads it). The caller chats once and reads
+    again; a mismatch on that final read FAILs."""
     items = None if not isinstance(doc, dict) else doc.get("chat_contexts")
     if not isinstance(items, list):
         return NOT_JUDGED, f"CONTEXT-FIT running: NOT JUDGED: {NO_CHAT_CONTEXTS}"
@@ -274,9 +277,11 @@ def judge_running(doc: dict | None, expect_decided: int | None = None, model: st
     if not chosen:
         what = f"for {model}" if model else "on this node"
         return NOT_JUDGED, f"CONTEXT-FIT running: NOT JUDGED: no Ollama chat placement {what} in chat_contexts"
-    if any(i.get("running") is None for i in chosen):
-        if not final:
+    if not final:
+        if any(i.get("running") is None for i in chosen):
             return None, "the chat model is not loaded yet"
+        if any(i.get("decided") is not None and i.get("running") != i.get("decided") for i in chosen):
+            return None, "the chat model still runs the context it was loaded with"
     bad, good = [], []
     for i in chosen:
         m, run, dec = i.get("model", "?"), i.get("running"), i.get("decided")
@@ -685,8 +690,11 @@ def cmd_running(a) -> int:
         return NOT_JUDGED
     rc, line = judge_running(doc, a.expect_decided, a.chat_model, final=False)
     if rc is None:
-        print(f"CONTEXT-FIT running: the chat model is not loaded; one chat turn first ({WARM_PROMPT!r})")
-        chat = chat_turn(WARM_PROMPT, a.gateway, a.turn_timeout)
+        # A fresh line every time: an answer from the gateway's cache makes
+        # no model call, so it would load or reload nothing.
+        warm = f"{WARM_PROMPT} ({int(time.time())})"
+        print(f"CONTEXT-FIT running: {line}; one chat turn first ({warm!r})")
+        chat = chat_turn(warm, a.gateway, a.turn_timeout)
         if chat["error"]:
             print(f"  the warm-up turn: {chat['error']}")
         doc, why = cluster_show(a.node)

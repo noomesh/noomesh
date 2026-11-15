@@ -432,17 +432,32 @@ async fn node_of_url(state: &crate::state::AppState, url: &str) -> Option<String
             return node;
         }
     }
-    let node = match crate::coordinator::node_from_backend_url(url) {
+    let enrolled = match crate::coordinator::node_from_backend_url(url) {
         Some(host) => crate::coordinator::resolve_node_id(state, &host).await.ok(),
         None => None,
     };
+    let node = enrolled.or_else(|| own_node_for(url, std::env::var("OLLAMA_URL").ok().as_deref(), crate::self_node::self_node_id()));
     urls().insert(url.to_string(), (node.clone(), now));
     node
 }
 
-/// [`num_ctx_for_node`] for a backend known only by its URL. An Ollama whose
-/// URL names no enrolled node (an agent-less static `OLLAMA_URL`) gets
-/// `None`: nothing declares a context there (a known gap).
+/// The node a controller door belongs to: the controller's own. A backend
+/// the gateway dials on its own docker network (`noo-stunnel-ollama`,
+/// `noo-vllm`, or its `OLLAMA_URL`, which on a standalone box is
+/// `noo-stunnel-ollama-embed`) names a container, not an enrolled node, so
+/// the name resolves to nothing. That is the path a box takes when its agent
+/// is loopback-only (the WSL2 one-box, 0.6.25-rc.2). Its chat placement's
+/// context was then never stamped and Ollama ran 4,096 under a declared
+/// 16,384. Any other unresolved URL stays `None` (the static off-box
+/// `OLLAMA_URL` gap).
+fn own_node_for(url: &str, ollama_url: Option<&str>, self_id: Option<String>) -> Option<String> {
+    crate::coordinator::is_controller_local_service(url, ollama_url).then_some(self_id).flatten()
+}
+
+/// [`num_ctx_for_node`] for a backend known only by its URL. A controller
+/// door is the controller's own node ([`own_node_for`]). An Ollama whose URL
+/// names neither (an off-box static `OLLAMA_URL`) gets `None`: nothing
+/// declares a context there (a known gap).
 pub async fn num_ctx_for(state: &crate::state::AppState, backend_type: &str, backend_url: &str, model: &str) -> Option<u64> {
     if !takes_num_ctx(backend_type) {
         return None;
@@ -702,6 +717,38 @@ pub fn instructions_overflow(need_estimate: u64, max_input: u64, calib: Calibrat
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The WSL2 one-box (0.6.25-rc.2 matrix run 43669565774): its agent was
+    /// loopback-only, so the controller dialled its own door, `OLLAMA_URL` =
+    /// `https://noo-stunnel-ollama-embed:11434`. That name is a container,
+    /// not a node, and the decided 16,384 was never stamped: Ollama ran
+    /// 4,096. A controller door is the controller's own node; an off-box URL
+    /// that names no node is still nobody's.
+    #[test]
+    fn a_controller_door_belongs_to_the_controllers_own_node() {
+        let own = || Some("runnervmm7ud1".to_string());
+        let wsl2 = Some("https://noo-stunnel-ollama-embed:11434");
+        assert_eq!(own_node_for("https://noo-stunnel-ollama-embed:11434", wsl2, own()).as_deref(), Some("runnervmm7ud1"));
+        assert_eq!(own_node_for("https://noo-stunnel-ollama:11434", None, own()).as_deref(), Some("runnervmm7ud1"));
+        assert_eq!(own_node_for("https://noo-vllm:8000", None, own()).as_deref(), Some("runnervmm7ud1"));
+        assert_eq!(own_node_for("https://192.0.2.40:11434", Some("https://192.0.2.40:11434/"), own()).as_deref(), Some("runnervmm7ud1"),
+            "the configured OLLAMA_URL is the controller's own door, trailing slash or not");
+        assert_eq!(own_node_for("https://198.51.100.9:11434", wsl2, own()), None, "an off-box URL that names no node is nobody's");
+        assert_eq!(own_node_for("https://noo-stunnel-ollama-embed:11434", wsl2, None), None, "no self id: nothing guessed");
+    }
+
+    /// The decision for a backend known by URL goes through the mapping
+    /// above: num_ctx_for -> node_of_url -> own_node_for when no enrolled
+    /// node answers. (PR-1's tests stamped a decided value and mapped agent
+    /// URLs; none walked a controller door, which is how this was missed.)
+    #[test]
+    fn num_ctx_for_reaches_the_controller_door_mapping() {
+        let own = crate::test_src::own_code(include_str!("chat_context.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn node_of_url(");
+        assert!(body.contains("enrolled.or_else(|| own_node_for(url, std::env::var(\"OLLAMA_URL\").ok().as_deref(), crate::self_node::self_node_id()))"), "{body}");
+        let for_url = crate::test_src::fn_body(&own, "pub async fn num_ctx_for(");
+        assert!(for_url.contains("node_of_url(state, backend_url).await?"), "{for_url}");
+    }
 
     /// fa's one-box cell (runs 43622936679, 43628426011): 16 GB, ~9.4 GB in
     /// use, gemma4:e2b at 16 KiB/token/slot (the top of the measured 13-16),
