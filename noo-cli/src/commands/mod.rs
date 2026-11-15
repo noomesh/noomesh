@@ -98,6 +98,7 @@ pub mod at_rest_seal;
 pub mod secrets_delivery;
 pub mod container_files;
 pub mod offboard;
+pub mod postgres_memory;
 pub mod provision;
 pub mod security_local;
 pub mod security_scan_node;

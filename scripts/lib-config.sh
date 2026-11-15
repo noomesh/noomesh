@@ -478,6 +478,7 @@ operator_profile_args() {
 EMBED_CPU_DOOR_URL="https://noo-stunnel-ollama-embed-cpu:11434"
 derive_profile_env() {
     monitoring_derive_env
+    postgres_memory_derive_env
     case " $(operator_profile_args) " in
         *" --profile embed-cpu "*) ;;
         *) return 0 ;;
@@ -653,5 +654,128 @@ monitoring_derive_env() {
                 ;;
         esac
     done
+    return 0
+}
+
+# ── Postgres memory: standard or auto (`cluster.postgres_memory`) ─────────
+#
+# The ONE declaration is `cluster.postgres_memory: standard | auto` in this
+# install's noomesh.yaml, beside cluster.monitoring and, like it, never an
+# environment variable. UNSET MEANS STANDARD: nothing is exported and the
+# compose defaults of the postgres service apply exactly as before. `auto`
+# sizes Postgres to the memory Docker gives containers on this machine:
+#
+#   below 6 GiB       128MB  512MB  8MB   64MB   256m
+#   6 to below 12 GiB 256MB  1GB    16MB  128MB  512m
+#   12 GiB and more   512MB  2GB    32MB  256MB  1g    (the compose defaults)
+#
+# (shared_buffers, effective_cache_size, work_mem, maintenance_work_mem,
+# /dev/shm). A 16 GB machine reports about 15.5 GiB, hence 12, not 16.
+# An explicit NOO_PG_* (the environment, compose_env, .env) always wins:
+# `auto` fills only the keys nobody set. The same table and rule are
+# noo-cli/src/commands/postgres_memory.rs (onboard, `noo cluster verify`);
+# tests/test_postgres_memory_launcher.py pins the two together. A changed
+# value takes effect when noo-postgres is recreated (compose does that on
+# the next start, because its command changed).
+PG_MEMORY_KEYS="NOO_PG_SHARED_BUFFERS NOO_PG_EFFECTIVE_CACHE_SIZE NOO_PG_WORK_MEM NOO_PG_MAINTENANCE_WORK_MEM NOO_PG_SHM_SIZE"
+
+# postgres_memory_setting [FILE] - the raw `cluster.postgres_memory` of FILE
+# (default ./noomesh.yaml), trimmed; empty when unset or unreadable.
+postgres_memory_setting() {
+    local file="${1:-noomesh.yaml}" nb out
+    [ -f "$file" ] || return 0
+    if nb="$(noo_bin 2>/dev/null)" && out="$("$nb" config launch-render postgres-memory "$file" 2>/dev/null)"; then
+        printf '%s\n' "$out" | head -1 | tr -d ' \t\r'
+        return 0
+    fi
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 - "$file" <<'PYEOF' 2>/dev/null || true
+import sys, yaml
+doc = yaml.safe_load(open(sys.argv[1])) or {}
+c = doc.get("cluster") if isinstance(doc, dict) else None
+v = c.get("postgres_memory") if isinstance(c, dict) else None
+if isinstance(v, str):
+    print(v.strip())
+PYEOF
+}
+
+# postgres_memory_mode - `auto` only when noomesh.yaml says exactly that, else `standard`.
+postgres_memory_mode() {
+    local raw
+    raw="$(postgres_memory_setting noomesh.yaml)"
+    case "$raw" in
+        auto) printf 'auto' ;;
+        ""|standard) printf 'standard' ;;
+        *)
+            echo "WARN: cluster.postgres_memory: '$raw' in noomesh.yaml is neither standard nor auto; Postgres keeps the standard sizes" >&2
+            printf 'standard'
+            ;;
+    esac
+}
+
+# postgres_memory_ram_kb - memory containers can use here, in KiB: Docker's
+# MemTotal (the WSL2 or Docker Desktop VM where there is one), else
+# /proc/meminfo, else macOS hw.memsize. Empty when none answers.
+postgres_memory_ram_kb() {
+    local b
+    b="$(docker info --format '{{.MemTotal}}' 2>/dev/null | tr -d ' \r')"
+    case "$b" in ''|*[!0-9]*|0) b="" ;; esac
+    if [ -n "$b" ]; then printf '%s' "$((b / 1024))"; return 0; fi
+    if [ -r /proc/meminfo ]; then
+        b="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo)"
+        case "$b" in ''|*[!0-9]*) ;; *) printf '%s' "$b"; return 0 ;; esac
+    fi
+    b="$(sysctl -n hw.memsize 2>/dev/null | tr -d ' \r')"
+    case "$b" in ''|*[!0-9]*|0) ;; *) printf '%s' "$((b / 1024))" ;; esac
+    return 0
+}
+
+# postgres_memory_tier KB - the five `auto` values (PG_MEMORY_KEYS order)
+# for a machine with KB KiB.
+postgres_memory_tier() {
+    local kb="$1"
+    if [ "$kb" -lt $((6 * 1024 * 1024)) ]; then
+        printf '128MB 512MB 8MB 64MB 256m'
+    elif [ "$kb" -lt $((12 * 1024 * 1024)) ]; then
+        printf '256MB 1GB 16MB 128MB 512m'
+    else
+        printf '512MB 2GB 32MB 256MB 1g'
+    fi
+}
+
+# postgres_memory_explicit KEY - true when the operator set KEY to a
+# non-empty value: the environment (load_config has exported compose_env by
+# now) or ./.env. An empty value is unset, as compose's ${VAR:-default}.
+postgres_memory_explicit() {
+    local _k="$1" _v
+    _v="$(printenv "$_k" 2>/dev/null || true)"
+    [ -n "${_v//[[:space:]]/}" ] && return 0
+    [ -f .env ] || return 1
+    _v="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${_k}=" .env | tail -1 | cut -d= -f2- | tr -d " \t\r\"'")"
+    [ -n "$_v" ]
+}
+
+# postgres_memory_derive_env - on `auto`, export the tier's value of every
+# NOO_PG_* sizing key the operator did not set. On standard nothing.
+postgres_memory_derive_env() {
+    [ "$(postgres_memory_mode)" = "auto" ] || return 0
+    local _kb _vals _k _v _kept="" _set=""
+    _kb="$(postgres_memory_ram_kb)"
+    if [ -z "$_kb" ]; then
+        echo "  postgres memory is auto, but this machine's memory could not be read; standard sizes kept" >&2
+        return 0
+    fi
+    _vals="$(postgres_memory_tier "$_kb")"
+    for _k in $PG_MEMORY_KEYS; do
+        _v="${_vals%% *}"
+        _vals="${_vals#* }"
+        if postgres_memory_explicit "$_k"; then
+            _kept="$_kept $_k"
+            continue
+        fi
+        export "$_k=$_v"
+        _set="$_set ${_k#NOO_PG_}=$_v"
+    done
+    echo "  postgres memory is auto for $((_kb / 1024)) MiB:${_set:- nothing to size}${_kept:+ (set by you, kept:$_kept)}" >&2
     return 0
 }

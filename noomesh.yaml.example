@@ -214,6 +214,11 @@ cluster:
   # full; `noo onboard` writes lean on a new install unless told yes.
   # Change it with `noo stack monitoring on|off` (data kept on off).
   # monitoring: full
+  # Postgres memory: standard | auto. Unset means standard (shared_buffers
+  # 512MB, work_mem 32MB, ...). auto sizes it to this machine's memory
+  # (smaller below 12 GiB); a NOO_PG_* you set wins. Takes effect when
+  # postgres is recreated (the next `noo stack start`).
+  # postgres_memory: standard
   pinned_backends: []
   # Example: pin a backend to a specific node
   # pinned_backends:

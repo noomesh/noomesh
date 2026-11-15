@@ -274,6 +274,18 @@ pub fn render_monitoring(text: &str) -> String {
     }
 }
 
+/// `postgres-memory`: the raw `cluster.postgres_memory` of noomesh.yaml,
+/// trimmed, one line; nothing when unset or not a string. The launcher's
+/// `postgres_memory_mode` (lib-config.sh) turns it into standard | auto with
+/// the unset = standard rule; [`crate::commands::postgres_memory::declared_in`]
+/// is the same read.
+pub fn render_postgres_memory(text: &str) -> String {
+    match crate::commands::postgres_memory::declared_in(text) {
+        Some(v) => format!("{v}\n"),
+        None => String::new(),
+    }
+}
+
 /// `noo config launch-render <section>`. Reads `<repo_root>/noomesh.yaml`;
 /// a missing file prints nothing and exits 0 for every section — same as
 /// the Python blocks it replaces, which each guarded on `-f noomesh.yaml`
@@ -310,6 +322,10 @@ pub fn run(section: &str, file: Option<&std::path::Path>) -> i32 {
             print!("{}", render_monitoring(&text));
             0
         }
+        "postgres-memory" => {
+            print!("{}", render_postgres_memory(&text));
+            0
+        }
         "systems" => match render_systems(&text) {
             Ok(out) => {
                 print!("{out}");
@@ -322,7 +338,7 @@ pub fn run(section: &str, file: Option<&std::path::Path>) -> i32 {
         },
         other => {
             eprintln!(
-                "noo config launch-render: unknown section '{other}' (want: compose-env | addons | override | systems | monitoring)"
+                "noo config launch-render: unknown section '{other}' (want: compose-env | addons | override | systems | monitoring | postgres-memory)"
             );
             64
         }

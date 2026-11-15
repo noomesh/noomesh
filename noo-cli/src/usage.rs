@@ -265,7 +265,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["db", "upgrade"], "[heads]", "Apply pending mesh migrations via the gateway, then trellion's memory step"),
     (&["config", "get"], "[<section>|cli]", "Print gateway runtime config, whole or one section; `cli` reads this machine's prefs"),
     (&["config", "set"], "<section> <updates-json>", "Update a gateway config section from JSON (no confirm); `cli` writes local prefs"),
-    (&["config", "launch-render"], "compose-env | addons | override | systems | monitoring [<file>]", "Hidden: render one noomesh.yaml section for the launcher scripts (internal)"),
+    (&["config", "launch-render"], "compose-env | addons | override | systems | monitoring | postgres-memory [<file>]", "Hidden: render one noomesh.yaml section for the launcher scripts (internal)"),
     (&["config", "launch-check"], "bind-sources [--data-root <dir>] [--no-deps] [--skip <service>]... [<service>...] | system-credentials [<noomesh.yaml>] | secrets-at-rest [<dir>] | state-root [<dir>]", "Hidden: pre-start refusals: bind sources, credentials, plaintext secrets, closed volume"),
     (&["logs", "errors"], "[-c|--container <container>] [-m|--minutes <min>] [-n|--limit <limit>] [--node <id>] [--name <n>] [--source <s>] [--since <t>] [--until <t>]", "List recent warning/error lines across the fleet (Loki, else a container scan)"),
     (&["logs", "tail"], "<container> | -c|--container <container> | --name <n> [-l|--lines <lines>] [-n|--node <node>] [--source <s>] [--since <t>] [--until <t>] [--grep <regex>]", "Print the last N log lines of one container or unit, optionally on a given node"),
