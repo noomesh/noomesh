@@ -8,13 +8,16 @@
 
 use sqlx::PgPool;
 
-/// Set the mode on every ACTIVE key of `consumer`; the number of keys set.
+/// Set the mode on every ACTIVE key of `consumer` and drop the cached
+/// modes; the number of keys set.
 pub async fn set(db: &PgPool, consumer: &str, mode: &str) -> Result<u64, sqlx::Error> {
     let r = sqlx::query("UPDATE noo_service_keys SET context_overflow = $2 WHERE consumer = $1 AND active = true")
         .bind(consumer)
         .bind(mode)
         .execute(db)
         .await?;
+    // The mode is read through a short cache: the new one applies now.
+    crate::service_keys::invalidate_cache();
     Ok(r.rows_affected())
 }
 
