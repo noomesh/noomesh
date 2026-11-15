@@ -95,6 +95,17 @@ def test_running_passes_when_the_backend_runs_the_decided_context_above_4096():
     assert rc == CF.PASS and "running 16384, decided 16384" in line
 
 
+def test_a_pin_read_before_any_turn_reloads_once_and_then_judges():
+    # stranger-24.04, rc.2 run 43669565774: right after the 4096 pin and the
+    # gateway restart the daemon still ran 32768 from the earlier turns.
+    pinned = {"chat_contexts": [_ctx(32768, 4096)]}
+    rc, why = CF.judge_running(pinned, expect_decided=4096, final=False)
+    assert rc is None and "still runs" in why, why
+    rc, line = CF.judge_running(pinned, expect_decided=4096, final=True)
+    assert rc == CF.FAIL and "the backend runs 32768, the gateway decided 4096" in line
+    assert CF.judge_running({"chat_contexts": [_ctx(4096, 4096)]}, expect_decided=4096, final=False)[0] == CF.PASS
+
+
 def test_running_fails_on_a_mismatch_or_a_small_decision():
     rc, line = CF.judge_running({"chat_contexts": [_ctx(4096, 16384)]})
     assert rc == CF.FAIL and "the backend runs 4096, the gateway decided 16384" in line

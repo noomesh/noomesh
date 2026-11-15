@@ -74,7 +74,7 @@ pub(crate) use backend::model_hint;
 pub(crate) use remote::RemoteRuntime;
 #[allow(unused_imports)]
 pub(crate) use agent_loop::{StreamedResponse, collect_streaming_response, looks_like_malformed_tool_call, strip_think_blocks, verify_no_scheduling_hallucination};
-pub(crate) use backend::{is_node_agent_url, with_backend_hint_url, warn_if_node_agent_outdated, node_from_backend_url};
+pub(crate) use backend::{is_node_agent_url, with_backend_hint_url, warn_if_node_agent_outdated, node_from_backend_url, is_controller_local_service};
 
 // Intra-module shared items, surfaced here so sibling files can reach
 // them via `use super::*` (private to this module tree).
