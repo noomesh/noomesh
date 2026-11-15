@@ -562,17 +562,26 @@ async fn native_inference(
             (StatusCode::OK, Json(answer)).into_response()
         }
         Err(e) => {
-            tracing::error!(error = %e, "native_inference_failed");
+            // The doesn't-fit refusal is the request's, not a fault: warn, 413.
+            if e.downcast_ref::<coordinator::ContextTooSmall>().is_some() {
+                tracing::warn!(error = %e, "native_inference_refused_context_too_small");
+            } else {
+                tracing::error!(error = %e, "native_inference_failed");
+            }
             // Policy refusal (cloud gate closed): 403 with the typed body, not a
             // retryable 500.
             if let Some(resp) = cloud_gate_response(&e) {
                 return resp;
             }
             let status = StatusCode::from_u16(coordinator::resolve_failure_status(&e, 500)).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            (status, Json(json!({
+            let mut body = json!({
                 "success": false,
                 "error": format!("{e}"),
-            }))).into_response()
+            });
+            if e.downcast_ref::<coordinator::ContextTooSmall>().is_some() {
+                body["code"] = json!("context_too_small");
+            }
+            (status, Json(body)).into_response()
         }
     }
     }  // end of `else` (non-node-pinned) branch

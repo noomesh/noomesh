@@ -3815,7 +3815,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
         result.iterations = iteration;
         let iter_start = Instant::now();
         if let Some(line) = window_refusal.take() {
-            llm_failure = Some(anyhow::anyhow!(line));
+            llm_failure = Some(super::backend::ContextTooSmall(line).into());
             break;
         }
         // What this call sends, and the backend's count before it (i802).

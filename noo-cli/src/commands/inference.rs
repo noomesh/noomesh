@@ -85,9 +85,17 @@ fn run_outcome(sent: Result<serde_json::Value, (u16, String)>) -> RunOutcome {
                     msg: v["error"].as_str().unwrap_or("the model returned an empty answer").to_string(),
                     hint: HINT,
                 },
+                // The gateway's own sentence when it sent one (a 413
+                // doesn't-fit refusal names the model, its context and the
+                // remedy), never the JSON around it.
                 None => RunOutcome::Failed {
-                    kind: "remote_error",
-                    msg: crate::http::remote_error_message(status, RUN_PATH, &body),
+                    kind: if v.as_ref().is_some_and(|v| v["code"] == "context_too_small") { "context_too_small" } else { "remote_error" },
+                    msg: v
+                        .as_ref()
+                        .and_then(|v| v["error"].as_str())
+                        .filter(|e| !e.trim().is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| crate::http::remote_error_message(status, RUN_PATH, &body)),
                     hint: None,
                 },
             }
@@ -286,6 +294,13 @@ mod tests {
         }
         let ok = json!({"success": true, "data": {"response": "Hello there, how are you?"}});
         assert_eq!(run_outcome(Ok(ok.clone())), RunOutcome::Answer(ok, "Hello there, how are you?".into()));
+        // The gateway's 413 doesn't-fit refusal: its line, never the JSON.
+        let line = "gemma4:e2b on box runs a 4096-token context, too small for its instructions and this question. Give it a larger context where the box's memory allows, or pick a model with a larger one: noo models switch <model> --backend ollama";
+        let refused = json!({"success": false, "code": "context_too_small", "error": line}).to_string();
+        match run_outcome(Err((413, refused))) {
+            RunOutcome::Failed { kind, msg, .. } => { assert_eq!(kind, "context_too_small"); assert_eq!(msg, line); }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
