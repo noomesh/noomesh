@@ -85,6 +85,8 @@ fn reservation_of(node_id: &str, record: &Value) -> Option<Value> {
         "purpose": lease.get("purpose").and_then(Value::as_str).unwrap_or(""),
         "paused_backends": gc.get("paused_backends").cloned().unwrap_or(json!([])),
         "gpu_total_mb": gc.get("total_mb").and_then(Value::as_u64).unwrap_or(0),
+        "gpu": true,
+        "source": "lease",
     }))
 }
 
@@ -109,7 +111,76 @@ async fn node_records(state: &AppState) -> Vec<(String, Value)> {
 }
 
 async fn all_reservations(state: &AppState) -> Vec<Value> {
-    node_records(state).await.iter().filter_map(|(id, r)| reservation_of(id, r)).collect()
+    let leased: Vec<Value> = node_records(state).await.iter().filter_map(|(id, r)| reservation_of(id, r)).collect();
+    // A CPU workload's reservation has no lease: it lives on its placement
+    // row. A row read error lists the leased ones and says so, never a 500.
+    let held = match crate::repo::node_workload_placements::held(&state.db).await {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(error = %e, "reservations: placement rows unreadable; listing GPU leases only");
+            Vec::new()
+        }
+    };
+    merge_reservations(leased, &held)
+}
+
+/// The leased reservations, plus one per placement row held under a
+/// reservation id that NO lease carries (a CPU workload's). Never twice: a row
+/// whose id a lease carries (a GPU workload's, or a hand-over in flight) is
+/// the lease's. Pure, so both hand-over orders are tested.
+pub(crate) fn merge_reservations(mut leased: Vec<Value>, held: &[crate::repo::node_workload_placements::Held]) -> Vec<Value> {
+    let lease_ids: std::collections::HashSet<String> =
+        leased.iter().filter_map(|r| r["id"].as_str().map(str::to_string)).collect();
+    for h in held {
+        if lease_ids.contains(&h.reservation) {
+            continue;
+        }
+        leased.push(json!({
+            "id": h.reservation,
+            "workload": format!("{}/{}", h.addon, h.workload),
+            "holder": h.holder.clone().unwrap_or_default(),
+            "node": h.node_id,
+            "state": "held",
+            "generation": 0,
+            "since": h.reserved_at.clone().unwrap_or_default(),
+            "mode": "none",
+            "reason": format!("reservation {}/{}", h.addon, h.workload),
+            "purpose": "",
+            "paused_backends": [],
+            "gpu_total_mb": 0,
+            "gpu": false,
+            "source": "placement",
+        }));
+    }
+    leased
+}
+
+/// Whether a reservation of `decl` takes a GPU drain hold: every GPU
+/// workload and every i163 (actuator) workload does, as before; a placed node
+/// workload declared accel.gpu 0 does not (its row carries the reservation).
+pub(crate) fn takes_gpu_hold(decl: &crate::addon_workloads::WorkloadDecl, managed: bool) -> bool {
+    decl.gpu || !managed
+}
+
+/// Only the holder releases a reservation, or anyone with `force` (audited).
+/// The holder is the caller's credential subject as the take recorded it (a
+/// GPU lease's owner, or a CPU workload's placement row's holder): the same
+/// rule for both.
+pub(crate) fn may_release(holder: &str, actor: &str, force: bool) -> bool {
+    force || holder == actor
+}
+
+/// The refusal for a take that lost to another reservation of the same
+/// workload: who holds it, when that is recorded (a 409, never a 500).
+pub(crate) fn already_reserved(key: &str, by: Option<&crate::repo::node_workload_placements::Held>) -> String {
+    match by {
+        Some(h) => format!(
+            "{key} is already reserved by {} (reservation {}); release that reservation first",
+            h.holder.as_deref().filter(|s| !s.is_empty()).unwrap_or("an earlier gateway (no holder recorded)"),
+            h.reservation
+        ),
+        None => format!("{key} is already reserved (its placement is not provisioned); release that reservation first"),
+    }
 }
 
 async fn find_reservation(state: &AppState, id: &str) -> Option<Value> {
@@ -744,24 +815,37 @@ async fn take(state: Arc<AppState>, actor: String, b: Value) -> AppResult {
         }
     }
 
-    // The lease: an owned hold that drains the pool's work first.
-    let hold = super::cluster::gpu_hold_op(
-        &state,
-        actor.clone(),
-        &node,
-        "hold",
-        json!({"reason": format!("reservation {key}"), "operation_id": id, "owner": actor, "workload": key,
-               "mode": "drain", "timeout_secs": timeout_secs, "force": old.is_some(), "legacy": false}),
-        std::time::Duration::from_secs(timeout_secs + 60),
-    )
-    .await?;
-    let Json(hold) = hold;
-    let lease = hold.pointer("/gpu_contention/lease").cloned().unwrap_or(Value::Null);
-    let generation = lease.get("generation").and_then(Value::as_u64).unwrap_or(0);
+    // The lease: an owned hold that drains the pool's work first. A node
+    // workload declared accel.gpu 0 takes NONE (0.6.25-rc.3 rehearsal: its
+    // drain hold stopped every lane of a CPU node, and its lease would block a
+    // GPU reservation on the same node). Its reservation lives on its
+    // placement row instead (set_running below, [`all_reservations`]).
+    let holds_gpu = takes_gpu_hold(&decl, managed.is_some());
+    let (lease, generation, hold) = if holds_gpu {
+        let hold = super::cluster::gpu_hold_op(
+            &state,
+            actor.clone(),
+            &node,
+            "hold",
+            json!({"reason": format!("reservation {key}"), "operation_id": id, "owner": actor, "workload": key,
+                   "mode": "drain", "timeout_secs": timeout_secs, "force": old.is_some(), "legacy": false}),
+            std::time::Duration::from_secs(timeout_secs + 60),
+        )
+        .await?;
+        let Json(hold) = hold;
+        let lease = hold.pointer("/gpu_contention/lease").cloned().unwrap_or(Value::Null);
+        let generation = lease.get("generation").and_then(Value::as_u64).unwrap_or(0);
+        (lease, generation, hold)
+    } else {
+        (Value::Null, 0, json!({}))
+    };
 
     let release_hold = |why: &'static str| {
         let (state, actor, node, id) = (state.clone(), actor.clone(), node.clone(), id.clone());
         async move {
+            if !holds_gpu {
+                return;
+            }
             let _ = super::cluster::gpu_hold_op(&state, actor, &node, "release",
                 json!({"operation_id": id, "generation": generation, "force": false, "legacy": false, "resume": "now"}),
                 std::time::Duration::from_secs(90)).await;
@@ -773,15 +857,17 @@ async fn take(state: Arc<AppState>, actor: String, b: Value) -> AppResult {
     // (the agent's start reads it afresh). Only from provisioned, so a second
     // reservation can never take a workload another one holds.
     if managed.is_some() {
-        match crate::repo::node_workload_placements::set_running(&state.db, &node, &addon, &name, &id).await {
+        match crate::repo::node_workload_placements::set_running(&state.db, &node, &addon, &name, &id, &actor).await {
             Ok(true) => {}
             Ok(false) => {
                 release_hold("already_reserved").await;
-                return Err(AppError::Conflict(format!("{key} is already reserved (its placement is not provisioned); release that reservation first")));
+                let by = crate::repo::node_workload_placements::held(&state.db).await.ok()
+                    .and_then(|h| h.into_iter().find(|r| r.addon == addon && r.workload == name));
+                return Err(AppError::Conflict(already_reserved(&key, by.as_ref())));
             }
             Err(e) => {
                 release_hold("placement_unwritable").await;
-                return Err(AppError::Internal(format!("could not mark {key} running: {e}; the GPU was released back to the pool")));
+                return Err(AppError::Internal(format!("could not mark {key} running: {e}{}", if holds_gpu { "; the GPU was released back to the pool" } else { "" })));
             }
         }
     }
@@ -793,9 +879,11 @@ async fn take(state: Arc<AppState>, actor: String, b: Value) -> AppResult {
             if managed.is_some() {
                 let _ = crate::repo::node_workload_placements::set_provisioned(&state.db, &node, &addon, &name, &id).await;
             }
-            let _ = super::cluster::gpu_hold_op(&state, actor.clone(), &node, "release",
-                json!({"operation_id": id, "generation": generation, "force": false, "legacy": false, "resume": "now"}),
-                std::time::Duration::from_secs(90)).await;
+            if holds_gpu {
+                let _ = super::cluster::gpu_hold_op(&state, actor.clone(), &node, "release",
+                    json!({"operation_id": id, "generation": generation, "force": false, "legacy": false, "resume": "now"}),
+                    std::time::Duration::from_secs(90)).await;
+            }
             audit(&state, AuditKind::ReservationTake, &actor, &node, "error", json!({"id": id, "workload": key, "step": "start", "detail": e})).await;
             return Err(start_failure(&key, &node, &e));
         }
@@ -812,7 +900,8 @@ async fn take(state: Arc<AppState>, actor: String, b: Value) -> AppResult {
         json!({"id": id, "workload": key, "hand_over": hand_over, "lease": lease, "detail": detail})).await;
     tracing::info!(id = %id, workload = %key, node = %node, actor = %actor, status, "reservation_take");
     Ok(Json(json!({"id": id, "workload": key, "node": node, "holder": actor, "status": status, "detail": detail,
-        "lease": lease, "worker": worker, "steps": steps, "paused_backends": hold.pointer("/gpu_contention/paused_backends").cloned().unwrap_or(json!([]))})))
+        "gpu": holds_gpu, "lease": lease, "worker": worker, "steps": steps,
+        "paused_backends": hold.pointer("/gpu_contention/paused_backends").cloned().unwrap_or(json!([]))})))
 }
 
 /// POST /api/cluster/reservations/{id}/release (or DELETE …/{id}) — body
@@ -837,7 +926,7 @@ async fn release(state: Arc<AppState>, actor: String, id: String, force: bool) -
     };
     let node = r["node"].as_str().unwrap_or("").to_string();
     let holder = r["holder"].as_str().unwrap_or("").to_string();
-    if holder != actor && !force {
+    if !may_release(&holder, &actor, force) {
         return Err(AppError::Conflict(format!("not_owner: reservation {id} is held by {holder}; release it with force")));
     }
     let key = r["workload"].as_str().unwrap_or("").to_string();
@@ -854,11 +943,17 @@ async fn release(state: Arc<AppState>, actor: String, id: String, force: bool) -
             }
         }
     }
-    let generation = r["generation"].as_u64().unwrap_or(0);
-    let released = super::cluster::gpu_hold_op(&state, actor.clone(), &node, "release",
-        json!({"operation_id": id, "generation": generation, "force": force, "legacy": false, "resume": "now"}),
-        std::time::Duration::from_secs(90)).await?;
-    let Json(released) = released;
+    // A CPU workload's reservation (its row's, no lease): the drain above
+    // gave the row back; there is no GPU to release.
+    let released = if r["source"] == "placement" {
+        json!({})
+    } else {
+        let generation = r["generation"].as_u64().unwrap_or(0);
+        let Json(v) = super::cluster::gpu_hold_op(&state, actor.clone(), &node, "release",
+            json!({"operation_id": id, "generation": generation, "force": force, "legacy": false, "resume": "now"}),
+            std::time::Duration::from_secs(90)).await?;
+        v
+    };
     audit(&state, AuditKind::ReservationRelease, &actor, &node, "ok", json!({"id": id, "workload": key, "holder": holder, "force": force})).await;
     tracing::info!(id = %id, workload = %key, node = %node, actor = %actor, force, "reservation_release");
     Ok(Json(json!({"id": id, "workload": key, "node": node, "status": "released", "steps": steps,
@@ -1509,7 +1604,7 @@ mod tests {
         let rel_entry = crate::test_src::fn_body(&own, "async fn reservation_release(");
         assert!(rel_entry.contains("operator: crate::authz::Operator") && rel_entry.contains("release(state, actor, id, force).await"));
         let rel = crate::test_src::fn_body(&own, "async fn release(");
-        assert!(rel.contains("holder != actor && !force"), "only the holder, or a force");
+        assert!(rel.contains("if !may_release(&holder, &actor, force)"), "only the holder, or a force");
         assert!(rel.find("drain_and_stop(").unwrap() < rel.find("\"release\"").unwrap(), "the workload stops before the lease is released");
         let proxy = crate::test_src::fn_body(&own, "async fn workload_proxy(");
         assert!(proxy.contains("r[\"state\"] == \"held\""), "only a reserved workload is reachable");
@@ -1649,4 +1744,104 @@ mod tests {
         let handover = take.find("drain_and_stop(").expect("the hand-over");
         assert!(pre < hold && pre < handover, "preflight first");
     }
+    // ── CPU workloads hold no GPU (0.6.25-rc.3 rehearsal) ─────────────────
+
+    fn held_row(id: &str, addon: &str, w: &str, node: &str, holder: Option<&str>) -> crate::repo::node_workload_placements::Held {
+        crate::repo::node_workload_placements::Held {
+            addon: addon.into(), workload: w.into(), node_id: node.into(), reservation: id.into(),
+            holder: holder.map(str::to_string), reserved_at: Some("2026-11-15T15:00:00Z".into()),
+        }
+    }
+    fn lease_res(id: &str, workload: &str, node: &str) -> Value {
+        reservation_of(node, &json!({"gpu_contention": {"state": "held", "total_mb": 24576,
+            "lease": {"operation_id": id, "owner": "alice", "workload": workload, "generation": 7, "mode": "drain"}}})).unwrap()
+    }
+
+    #[test]
+    fn only_a_placed_cpu_workload_skips_the_gpu_hold() {
+        let mut d = decl(false, 0);
+        assert!(!takes_gpu_hold(&d, true), "a placed node workload with accel.gpu 0 takes no GPU hold");
+        assert!(takes_gpu_hold(&d, false), "an i163 actuator workload keeps its hold (no row carries its reservation)");
+        d.gpu = true;
+        assert!(takes_gpu_hold(&d, true) && takes_gpu_hold(&d, false), "every GPU workload holds, as before");
+    }
+
+    #[test]
+    fn a_cpu_reservation_is_listed_from_its_row_as_held_with_no_gpu() {
+        let out = merge_reservations(vec![], &[held_row("r-cpu", "rhaddon", "echo", "rhx-node2", Some("alice"))]);
+        assert_eq!(out.len(), 1);
+        let r = &out[0];
+        assert_eq!((r["id"].as_str(), r["workload"].as_str(), r["holder"].as_str(), r["node"].as_str(), r["state"].as_str()),
+            (Some("r-cpu"), Some("rhaddon/echo"), Some("alice"), Some("rhx-node2"), Some("held")));
+        assert_eq!((r["gpu"].as_bool(), r["source"].as_str(), r["generation"].as_u64()), (Some(false), Some("placement"), Some(0)));
+        let lease = lease_res("r-gpu", "pai-voice/voice-worker", "awolf");
+        assert_eq!((lease["gpu"].as_bool(), lease["source"].as_str()), (Some(true), Some("lease")));
+    }
+
+    #[test]
+    fn the_merged_list_never_reports_one_reservation_twice() {
+        // A GPU workload: its lease AND its row carry the same id: once.
+        let gpu = merge_reservations(vec![lease_res("r1", "pai-voice/voice-worker", "awolf")],
+            &[held_row("r1", "pai-voice", "voice-worker", "awolf", Some("alice"))]);
+        assert_eq!(gpu.len(), 1);
+        assert_eq!(gpu[0]["source"], "lease");
+        // gpu-0 -> GPU on one node: the old CPU row (r-a, no lease) and the new
+        // GPU lease r-b with its own row.
+        let ab = merge_reservations(vec![lease_res("r-b", "rhaddon/gpuw", "n1")],
+            &[held_row("r-a", "rhaddon", "echo", "n1", Some("alice")), held_row("r-b", "rhaddon", "gpuw", "n1", Some("alice"))]);
+        let mut ids: Vec<&str> = ab.iter().filter_map(|r| r["id"].as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, ["r-a", "r-b"], "{ab:?}");
+        // GPU -> gpu-0, the other order: the lease r-a with its row, and the CPU row r-b.
+        let ba = merge_reservations(vec![lease_res("r-a", "rhaddon/gpuw", "n1")],
+            &[held_row("r-a", "rhaddon", "gpuw", "n1", Some("alice")), held_row("r-b", "rhaddon", "echo", "n1", Some("alice"))]);
+        let mut ids: Vec<&str> = ba.iter().filter_map(|r| r["id"].as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, ["r-a", "r-b"], "{ba:?}");
+    }
+
+    #[test]
+    fn the_holder_rule_is_the_same_for_a_cpu_reservation() {
+        assert!(may_release("alice", "alice", false), "the holder releases");
+        assert!(!may_release("alice", "bob", false), "another account cannot, without force");
+        assert!(may_release("alice", "bob", true), "force does (audited)");
+        assert!(!may_release("", "bob", false), "a row with no holder recorded (a 0.6.24 row) needs force");
+        // The holder is the credential's subject: the take passes the same
+        // `actor` to the lease owner and to set_running, and the operator route
+        // takes it from Operator::sub(); nothing in this file reads a view-as
+        // header, so View-as cannot widen whose reservation it is.
+        let own = crate::test_src::own_code(include_str!("reservations.rs"));
+        let take = crate::test_src::fn_body(&own, "async fn take(");
+        assert!(take.contains("set_running(&state.db, &node, &addon, &name, &id, &actor)"), "the row's holder is the caller");
+        assert!(take.contains("\"owner\": actor"), "the lease's owner is the same caller");
+        let route = crate::test_src::fn_body(&own, "async fn reservation_take(");
+        assert!(route.contains("operator.sub()"), "the operator's credential, not a header");
+        assert!(!own.to_lowercase().contains("view_as") && !own.to_lowercase().contains("view-as"), "no view-as lens in the reservation routes");
+    }
+
+    #[test]
+    fn a_lost_take_names_the_holder_never_an_internal() {
+        let h = held_row("r-1", "rhaddon", "echo", "n1", Some("alice"));
+        assert_eq!(already_reserved("rhaddon/echo", Some(&h)), "rhaddon/echo is already reserved by alice (reservation r-1); release that reservation first");
+        let old = held_row("r-1", "rhaddon", "echo", "n1", None);
+        assert!(already_reserved("rhaddon/echo", Some(&old)).contains("an earlier gateway (no holder recorded)"));
+        assert!(already_reserved("rhaddon/echo", None).starts_with("rhaddon/echo is already reserved"));
+        let own = crate::test_src::own_code(include_str!("reservations.rs"));
+        let take = crate::test_src::fn_body(&own, "async fn take(");
+        let lost = take.split("Ok(false) => \u{7b}").nth(1).expect("the lost-take arm");
+        let lost = &lost[..lost.find("Err(e) =>").expect("arm end")];
+        assert!(lost.contains("AppError::Conflict(already_reserved(") && !lost.contains("AppError::Internal"), "a lost take is a 409 naming the holder");
+    }
+
+    #[test]
+    fn the_gpu_path_still_takes_and_releases_its_hold() {
+        let own = crate::test_src::own_code(include_str!("reservations.rs"));
+        let take = crate::test_src::fn_body(&own, "async fn take(");
+        let gate = take.find("let (lease, generation, hold) = if holds_gpu \u{7b}").expect("one gate");
+        let hold = take.find("\"hold\",").expect("the hold op");
+        assert!(gate < hold, "the hold is taken inside the holds_gpu branch");
+        let rel = crate::test_src::fn_body(&own, "async fn release(");
+        assert!(rel.contains("if r[\"source\"] == \"placement\" \u{7b}") && rel.contains("\"release\","), "only a row-held reservation skips the GPU release");
+    }
+
 }
