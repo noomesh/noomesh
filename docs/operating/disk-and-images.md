@@ -16,7 +16,13 @@ names them and no container uses them.
 **What never goes.** An image any container uses, running or stopped.
 Images that are not noomesh's or a pinned add-on's (your own builds, other
 projects). Docker Hub images by short name, such as `redis:7`, even when an
-add-on pinned one: clean those yourself (below).
+add-on pinned one: clean those yourself (below). The stack itself pins two
+Hub images (`nats`, `nginx`); they are listed among what to keep too, which
+changes nothing for them, since a Hub short name is never removed anyway.
+
+This is the only thing a roll removes images with. Up to 0.6.24 a roll also
+removed unused noomesh images by itself, ignoring the setting; 0.6.25 retired
+that, so its first roll removes nothing and lists what the next one would.
 
 **Preview first.** The first roll that carries this only lists what it
 would remove; later rolls remove. To keep previewing, or to turn it off, set
@@ -53,6 +59,16 @@ own decision. `docker system df -v` shows what holds the space.
 
 Directive. Facts are exact; do not infer beyond them.
 
+**Identity.** A lock names an image by digest under the release's short name
+(`gateway@sha256:<d>`). Each row is resolved BY DIGEST against
+`docker image inspect` (RepoTags and RepoDigests, as JSON lists) and kept by
+the image ID holding it, whatever the name: `ghcr.io/noomesh/<n>`,
+`ghcr.io/noomesh/dhi/<n>`, a Docker Hub short name, a mirror prefix. A row no
+local image holds (a node-only image on a controller) stays in the keep file
+under its own name, `why` ending `; not on this host`, and protects nothing.
+Docker Hub images the lock pins are therefore kept by the keep file, although
+hostd never treats a Hub short name as ours to delete: both hold.
+
 **Setting.** `cluster.image_retention` in `<root>/noomesh.yaml`: `live` |
 `preview` | `off`. Unset: `preview` until one roll has listed something,
 then `live`. No environment variable controls it.
@@ -85,6 +101,22 @@ other row blocks.
 **Blocked.** The roll prints `images: superseded images were NOT cleaned up:
 blocked by <row (detail)>; …` and writes the blocked file. Fix the named row;
 the next roll cleans.
+
+**Row `stack images`** judges a running container by image ID against the
+lock row whose digest resolves to its image's repository. Running containers
+of which it matches none is `fail` (`the check matched none of the …`): a
+check fault, which blocks.
+
+**Every deleter of images, and its gate.** Nothing else removes images.
+
+| deleter | runs | gate |
+|---|---|---|
+| hostd rung 5, superseded images | after a verified roll | the setting, the gate above, a current keep file |
+| hostd reclaim rungs 1–5 | disk past watermark | `disk_watermark` live |
+| node agent `POST /cleanup/images` | the disk_cleanup heartbeat | dangling only; sent with `dry_run: true` |
+| node agent deep clean | `clean --deep` | opt-in |
+| `noo offboard` | the operator | the command |
+| `scripts/noomesh-clean.sh`, `scripts/noomesh-rebuild.sh` | by hand (dev) | none on a roll |
 
 **Verify row `image retention`:**
 
