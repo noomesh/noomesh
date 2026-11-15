@@ -261,7 +261,7 @@ mod tests {
         assert!(!set_provisioned(&db, &node_a, "rhaddon", "worker", res_b).await.expect("stale release"), "another reservation cannot give it back");
         assert_eq!(get(&db, "rhaddon", "worker").await.unwrap().unwrap().reservation.as_deref(), Some(res_a));
         // 124: the row carries who holds it, and the losing take changed nothing.
-        let h = held(&db).await.expect("held");
+        let h = super::held(&db).await.expect("held");
         let mine: Vec<_> = h.iter().filter(|x| x.addon == "rhaddon" && x.workload == "worker").collect();
         assert_eq!(mine.len(), 1, "{h:?}");
         assert_eq!((mine[0].reservation.as_str(), mine[0].holder.as_deref(), mine[0].node_id.as_str()), (res_a, Some("alice"), node_a.as_str()));
@@ -272,13 +272,13 @@ mod tests {
         assert!(set_provisioned(&db, &node_a, "rhaddon", "worker", res_a).await.expect("release"));
         let back = get(&db, "rhaddon", "worker").await.unwrap().unwrap();
         assert_eq!((back.desired_state.as_str(), back.reservation), ("provisioned", None));
-        assert!(held(&db).await.expect("held").iter().all(|x| !(x.addon == "rhaddon" && x.workload == "worker")), "released: not held");
+        assert!(super::held(&db).await.expect("held").iter().all(|x| !(x.addon == "rhaddon" && x.workload == "worker")), "released: not held");
 
         // A row reserved before 124 (a 0.6.24 gateway wrote no holder) reads
         // back with holder NULL, still listed under its reservation.
         sqlx::query("UPDATE noo_node_workload_placements SET desired_state = 'running', reservation = $1::uuid, holder = NULL, reserved_at = NULL WHERE addon = 'rhaddon' AND workload = 'worker'")
             .bind(res_b).execute(&db).await.expect("an old-style hold");
-        let old = held(&db).await.expect("held");
+        let old = super::held(&db).await.expect("held");
         let old: Vec<_> = old.iter().filter(|x| x.addon == "rhaddon" && x.workload == "worker").collect();
         assert_eq!((old[0].holder.as_deref(), old[0].reserved_at.as_deref()), (None, None));
         assert!(set_provisioned(&db, &node_a, "rhaddon", "worker", res_b).await.expect("release old"));
@@ -290,7 +290,7 @@ mod tests {
         );
         let (x, y) = (x.expect("take x"), y.expect("take y"));
         assert!(x ^ y, "exactly one of two concurrent takes wins (x={x}, y={y})");
-        let winner = held(&db).await.expect("held").into_iter().find(|h| h.addon == "rhaddon" && h.workload == "worker").expect("held");
+        let winner = super::held(&db).await.expect("held").into_iter().find(|h| h.addon == "rhaddon" && h.workload == "worker").expect("held");
         assert_eq!(winner.holder.as_deref(), Some(if x { "alice" } else { "bob" }));
         assert!(set_provisioned(&db, &node_a, "rhaddon", "worker", &winner.reservation).await.expect("release winner"));
 
