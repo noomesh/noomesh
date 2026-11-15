@@ -522,6 +522,9 @@ def test_the_literal_pass_types_what_the_install_doc_says_and_enter_elsewhere():
             ("n", "typed n (the install doc's table)"),
         "Admin username [admin]:": ("", "enter"),
         "Anthropic API key (blank to skip):": ("", "enter"),
+        # Documented, and Enter is its answer: a new install is lean (No).
+        "Install dashboards, log search and request traces (Grafana, Loki, Tempo; about 250 MiB idle)? [y/N]:":
+            ("", "enter"),
     }
     for prompt, expected in want.items():
         assert d.answer(prompt, "literal", "PW", rows) == expected, prompt
@@ -751,3 +754,68 @@ def test_only_the_default_model_fails_on_a_non_answer_and_a_tiny_cell_notes_it()
     assert 'if [ "$MODEL" = default ]; then' in block[:fail], "the FAIL is gated on the product default model"
     assert "FIRST-ANSWER NOTE: the tiny test model ($TINY_MODEL)" in block and "not a product verdict" in block
     assert "export FIRST_PROMPT FIRST_ANSWER_NOT_AN_ANSWER FIRST_ANSWER_DEFLECTION MODEL TINY_MODEL" in text
+
+
+def test_first_answer_is_install_to_answer_not_the_probes_before_it():
+    # general, rc.1 run 43642041751: the default cell read 2,792 s because the
+    # memory baseline and the 40-minute idle series run before first-answer.
+    cell = _load("cell_fa", ROOT / "scripts/install-cell/cell.py")
+    steps = [{"step": n, "seconds": s} for n, s in [
+        ("install", 2), ("onboard", 219), ("stack-start", 25), ("verify", 33), ("probe-verify-json", 4),
+        ("probe-memory-baseline", 63), ("probe-idle-t10", 602), ("probe-idle-t40", 1799),
+        ("idle-chat-unloaded", 1), ("first-answer", 44), ("probe-coldload", 48)]]
+    assert cell.first_answer_times(steps, 2792) == (2792 - 2469, 2469)
+    assert cell.first_answer_times(steps[:4] + steps[9:], 327) == (327, 0), "no probes before it: unchanged"
+    assert cell.first_answer_times(steps, None) == (None, 0)
+    assert cell.first_answer_times([{"step": "onboard", "seconds": 5}], 90) == (90, 0), "no first-answer step: the wall number"
+
+
+def test_the_summary_reports_both_numbers(tmp_path):
+    cell = _load("cell_fa2", ROOT / "scripts/install-cell/cell.py")
+    import json as _j
+    rows = [("install", 2), ("probe-idle-t10", 600), ("first-answer", 40)]
+    (tmp_path / "steps.jsonl").write_text("".join(
+        _j.dumps({"step": n, "rc": 0, "seconds": s, "first_error": "", "warnings": [], "prompts": []}) + "\n" for n, s in rows))
+    (tmp_path / "meta.json").write_text(_j.dumps({"cell": "c", "first_answer_s": 700}))
+    out = cell.summarize(tmp_path)
+    assert out["first_answer_s"] == 100 and out["first_answer_wall_s"] == 700 and out["probe_wait_before_first_answer_s"] == 600
+    md = (tmp_path / "summary.md").read_text()
+    assert "first answer 100 s after the cell started (not counting 600 s of probes before it; 700 s on the wall clock)" in md
+
+
+def _ctx_wrapper():
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    body = text[text.index("judged_ctx() {"):]
+    lead = 'step "$name" "$t" -- sh -c \''
+    body = body[body.index(lead) + len(lead):]
+    return body[:body.index("' \\\n        context-fit")]
+
+
+def test_a_context_fit_not_judged_never_fails_the_cell(tmp_path):
+    # harness's context_fit.py (noomesh#1217): 0 PASS, 1 FAIL, 2 NOT JUDGED.
+    # On rc.1 and older every judge is NOT JUDGED and the cell must stay green.
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    for rc in (0, 1, 2):
+        (fake / "python3").write_text(f"#!/bin/sh\nexit {rc}\n")
+        (fake / "python3").chmod(0o755)
+        p = subprocess.run(["sh", "-c", _ctx_wrapper(), "context-fit", "ctx.py", "running"],
+                           env={"PATH": f"{fake}:/usr/bin:/bin"}, capture_output=True, text=True)
+        want = {0: 0, 1: 1, 2: 0}[rc]
+        assert p.returncode == want, (rc, p.returncode, p.stdout)
+        assert ("NOT JUDGED" in p.stdout) == (rc == 2)
+
+
+def test_the_pinned_context_runs_on_one_cell_after_the_unpinned_judges():
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    assert 'CONTEXT_PIN_CELL=stranger-24.04' in text
+    i_rag = text.index("step rag-chat 60")
+    i_run = text.index("judged_ctx context-fit-running 300 running")
+    i_turns = text.index('judged_ctx context-fit-turns 900 turns --out "$OUT/context-fit"')
+    i_pin = text.index('if [ "$CELL" = "$CONTEXT_PIN_CELL" ] && [ -f "$CONTEXT_FIT" ]; then')
+    assert i_rag < i_run < i_turns < i_pin, "unpinned judges first; the pin changes the chat context for the rest of the cell"
+    pinned = text[i_pin:text.index("\nfi\n", i_pin)]
+    order = [pinned.index(k) for k in ("--env OLLAMA_CONTEXT_LENGTH=4096", "stack restart --force gateway",
+                                        "running --expect-decided 4096", "pinned-check", "doesnt-fit")]
+    assert order == sorted(order), "pin, restart (the gateway caches the decided context 600 s), then judge"
+    assert 'step "$name" 10 -- sh -c \'echo "CONTEXT-FIT: not judged: context_fit.py is not in this tree"\'' in text

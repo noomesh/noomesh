@@ -217,3 +217,31 @@ func TestParseCheckedFailedPsIsUnknownNotUnloaded(t *testing.T) {
 		t.Errorf("answered-empty ps must report loaded:false and 0 bytes, got %s", b)
 	}
 }
+
+// i802: /api/ps's context_length is what the loaded model RUNS at (4096 on a
+// stock CPU ollama), reported as running_context beside the ceiling, never in
+// place of it; absent while not loaded or while ps is unknown.
+func TestRunningContextComesFromPsBesideTheCeiling(t *testing.T) {
+	tags := `{"models":[{"name":"gemma4:e2b","size":4600000000},{"name":"harrier:latest","size":396705831}]}`
+	ps := `{"models":[{"name":"gemma4:e2b","size":1300000000,"size_vram":0,"context_length":4096}]}`
+	got := ParseChecked([]byte(tags), []byte(ps), true)
+	byName := map[string]ModelStat{}
+	for _, s := range got {
+		byName[s.Name] = s
+	}
+	g := byName["gemma4:e2b"]
+	g.ContextLength = 131072 // the ceiling, filled from /api/show elsewhere
+	b, _ := json.Marshal(g)
+	if !strings.Contains(string(b), `"running_context":4096`) || !strings.Contains(string(b), `"context_length":131072`) {
+		t.Fatalf("want both the running context and the ceiling: %s", b)
+	}
+	if h, _ := json.Marshal(byName["harrier:latest"]); strings.Contains(string(h), "running_context") {
+		t.Errorf("a model not loaded has no running context: %s", h)
+	}
+	unknown := ParseChecked([]byte(tags), []byte(ps), false)
+	for _, s := range unknown {
+		if b, _ := json.Marshal(s); strings.Contains(string(b), "running_context") {
+			t.Errorf("ps unknown: no running context claimed: %s", b)
+		}
+	}
+}

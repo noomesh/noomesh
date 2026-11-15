@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -90,6 +91,13 @@ type Shipper struct {
 	lastError        string
 	routeReady       bool
 	started          bool
+	// lokiOff: the controller answered 410 loki_off (log search is off there
+	// by choice). Reported as enabled:false until a push is accepted again.
+	lokiOff bool
+	// offPaused: inside the long pause after a loki_off; intake is discarded
+	// (not spilled, not counted as dropped) so a lean controller costs this
+	// node nothing but a re-check every RouteRetry.
+	offPaused atomic.Bool
 
 	onceMu sync.Mutex
 	once   map[string]time.Time
@@ -137,6 +145,9 @@ func (s *Shipper) AddSource(src Source) { s.sources = append(s.sources, src) }
 // are dropped (counted).
 func (s *Shipper) Offer(e Entry) {
 	if e.Line == "" {
+		return
+	}
+	if s.offPaused.Load() {
 		return
 	}
 	// Self-loop guard: the controller's own agent ships the gateway's
@@ -362,6 +373,21 @@ func (s *Shipper) shipPiece(ctx context.Context, piece []Entry) bool {
 			s.setError(res.reason)
 			s.logOnce("4xx:"+res.reason, "log batch refused by the controller; dropped", "reason", res.reason, "lines", n)
 			return true
+		case outcomeLokiOff:
+			// Same cadence as the 404 path, but the batch is dropped: there
+			// is no Loki to keep it for. Re-check after RouteRetry.
+			s.noteDropped(n)
+			s.setLokiOff(res.reason, true)
+			s.logOnce("loki-off", "log shipping paused: log search is off on the controller by choice; re-checking",
+				"retry_in", s.cfg.RouteRetry, "fix", "noo stack monitoring on (on the controller)")
+			select {
+			case <-ctx.Done():
+				s.setPaused(false)
+				return false
+			case <-time.After(s.cfg.RouteRetry):
+			}
+			s.setPaused(false)
+			return true
 		}
 		s.setError(res.reason)
 		wait := bo.next(res.retryAfter)
@@ -396,8 +422,20 @@ func (s *Shipper) noteAccepted(n int64) {
 	s.shippedTotal += n
 	s.lastAcceptedUnix = time.Now().Unix()
 	s.lastError = ""
+	s.lokiOff = false
 	s.mu.Unlock()
 }
+
+// setLokiOff records a loki_off answer and starts (or ends) the pause.
+func (s *Shipper) setLokiOff(reason string, paused bool) {
+	s.mu.Lock()
+	s.lokiOff = true
+	s.lastError = reason
+	s.mu.Unlock()
+	s.offPaused.Store(paused)
+}
+
+func (s *Shipper) setPaused(paused bool) { s.offPaused.Store(paused) }
 
 func (s *Shipper) noteDropped(n int64) {
 	s.mu.Lock()
@@ -444,7 +482,7 @@ func (s *Shipper) State() map[string]any {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	queued := len(s.mem)
-	return map[string]any{
+	st := map[string]any{
 		"enabled":            true,
 		"queued":             queued,
 		"shipped_total":      s.shippedTotal,
@@ -455,6 +493,13 @@ func (s *Shipper) State() map[string]any {
 		"route_ready":        s.routeReady,
 		"spill_pending":      s.spill.pending(),
 	}
+	if s.lokiOff {
+		// Off by choice on the controller, not a fault on this node:
+		// `cluster verify` reads enabled:false with the reason.
+		st["enabled"] = false
+		st["reason"] = reasonLokiOff
+	}
+	return st
 }
 
 // DisabledState is what the heartbeat carries when shipping is off, so

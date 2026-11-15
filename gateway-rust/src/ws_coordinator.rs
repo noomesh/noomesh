@@ -197,26 +197,11 @@ async fn handle_chat(
                 // read/write that user's memory (H-D1 impersonation).
                 let uid = crate::auth::effective_user_id(Some(&user_id), Some(&chat_msg.user_id));
 
-                // Check LLM cache first — keyed by WHO asked as well as what
-                // the answer is built from the caller's own
-                // memory and audience-filtered KB evidence.
-                let messages_for_cache = vec![json!({"role": "user", "content": chat_msg.prompt})];
-                let cache_key = crate::cache::RedisCache::llm_cache_key(
-                    "auto", &messages_for_cache, uid.as_deref());
-                if let Some(redis) = state.redis.as_ref() {
-                    if let Some(cached) = redis.get_llm_cache(&cache_key).await {
-                        tracing::debug!("llm_cache_hit");
-                        if let Some(content) = cached.get("content").and_then(|c| c.as_str()) {
-                            let _ = writer.send_event("content", json!(content)).await;
-                        }
-                        let _ = writer
-                            .send_event("done", json!({
-                                "iterations": 0, "cached": true, "engine": "rust",
-                            }))
-                            .await;
-                        continue;
-                    }
-                }
+                // No answer cache: a coordinator answer depends on the caller's
+                // perspective and roles, their documents and memory now, the
+                // conversation and the tools' results. A cache keyed by the
+                // words served a wider answer under a narrowed View-as or after
+                // a demotion, with scoped retrieval never run (retired, 0.6.25).
 
                 // Run the full agentic loop (identity resolved above).
 
@@ -292,18 +277,6 @@ async fn handle_chat(
                 };
                 match outcome {
                     Ok(result) => {
-                        // Cache the response
-                        if !result.response.is_empty() {
-                            if let Some(redis) = state.redis.as_ref() {
-                                redis
-                                    .set_llm_cache(
-                                        &cache_key,
-                                        &json!({"content": result.response}),
-                                        None,
-                                    )
-                                    .await;
-                            }
-                        }
                         // Token-usage accounting —
                         // fire-and-forget.
                         crate::usage::record(

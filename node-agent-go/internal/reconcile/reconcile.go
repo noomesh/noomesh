@@ -133,6 +133,12 @@ type desiredConfig struct {
 	// ignores the key), while the node_workloads fragment is decoded strictly.
 	// Absent (or epoch 0) = nothing to retry. See applyModelSetRetry.
 	ModelSetRetry *modelSetRetry `json:"model_set_retry"`
+	// The context the controller decided for each Ollama chat model here
+	// (i802): {"<model>": tokens}. The gateway sends every chat body to this
+	// Ollama with it as options.num_ctx; the agent's own Ollama callers (the
+	// job executor) send the same value, so nothing reloads the model at
+	// another context. Absent on an older gateway or when nothing is decided.
+	ChatContexts map[string]int `json:"chat_contexts"`
 }
 
 // Reconciler pulls desired config and converges the node toward it.
@@ -165,6 +171,9 @@ type Reconciler struct {
 	nwMu   sync.Mutex
 	nwBusy map[string]bool
 	nwWG   sync.WaitGroup
+	// nwChanged runs after each node workload converge (the heartbeat Kick);
+	// nil = nothing (tests).
+	nwChanged func()
 	// ctlApprovals keeps the controller's signed approval set (i596); nil in
 	// tests that build a Reconciler by hand, and the offer is then skipped.
 	ctlApprovals *nodepolicy.ControllerApprovals
@@ -200,6 +209,9 @@ type Reconciler struct {
 	// daemon gets it), nil when chat is not on ollama; for
 	// ChatContextWindow. Guarded by harnessMu.
 	chatOllamaEnv map[string]string
+	// chatContexts is desired-config's `chat_contexts` (ChatContext), keyed
+	// by chatContextKey. Guarded by harnessMu.
+	chatContexts map[string]int
 	// harness is the ONE host service this node regulates:
 	// started and stopped per placement through the applier's sudoers
 	// grant, never a container and never a child of this process.
@@ -321,6 +333,7 @@ func (r *Reconciler) Run(ctx context.Context) {
 	// workload declarations load now, not at the first tick 30 s away: a
 	// reserve right after an agent restart would meet 404 not_declared.
 	r.loadAddonWorkloads(ctx)
+	go r.watchLeaves(ctx, leafWatchInterval)
 	select {
 	case <-ctx.Done():
 		return
@@ -456,6 +469,7 @@ func (r *Reconciler) publishProfileAndEmbedTarget(ctx context.Context, t *tick) 
 	applyHarnessProfile(t.desired.HarnessProfile)
 	declareAddonWorkloads(t.desired)
 	r.recordChatPlacement(t.desired.Placements)
+	r.recordChatContexts(t.desired.ChatContexts)
 	publishLanePlacements(t.desired.Placements)
 	publishKeepWarm(t.desired.Placements)
 	// Before the empty-state return below: a node with nothing placed still

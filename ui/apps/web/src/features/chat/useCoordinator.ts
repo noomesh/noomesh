@@ -22,6 +22,13 @@ export interface TurnStats {
    * without memory only when this is set.
    */
   recallSkipped?: string;
+  /**
+   * The backend cut the prompt (i802): it read only `evaluated` of about
+   * `sentEstimate` tokens in its `context`-token window, so the model
+   * answered without most of its instructions. From the frame's
+   * `truncated: true` + `truncation`.
+   */
+  truncated?: { sentEstimate: number; evaluated: number; context?: number };
 }
 
 /**
@@ -130,6 +137,9 @@ interface CoordFrame extends PhaseFrame {
   cached?: boolean;
   // `done` — what the turn's conversation recall did.
   recall?: { status?: string; hits?: number; reason?: string };
+  // `done` — the backend cut a call's prompt (i802).
+  truncated?: boolean;
+  truncation?: { sent_estimate?: number; evaluated?: number; context?: number };
 }
 
 /**
@@ -150,6 +160,13 @@ function readStats(f: CoordFrame): TurnStats | undefined {
     recallSkipped:
       f.recall?.status === 'skipped' ? f.recall.reason || 'no reason given' : undefined,
   };
+  if (f.truncated && f.truncation?.evaluated && f.truncation?.sent_estimate) {
+    stats.truncated = {
+      sentEstimate: f.truncation.sent_estimate,
+      evaluated: f.truncation.evaluated,
+      context: f.truncation.context,
+    };
+  }
   if (f.tokens_out && f.elapsed_seconds) {
     stats.tokensPerSec = Math.round(f.tokens_out / f.elapsed_seconds);
   }
@@ -161,7 +178,8 @@ function readStats(f: CoordFrame): TurnStats | undefined {
     stats.tokensIn ||
     stats.toolCalls ||
     stats.cached ||
-    stats.recallSkipped;
+    stats.recallSkipped ||
+    stats.truncated;
   return meaningful ? stats : undefined;
 }
 

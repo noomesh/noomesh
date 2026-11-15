@@ -151,6 +151,11 @@ pub(crate) struct Skip {
     /// `--mcp-door` / `--no-mcp-door` — pre-answers the MCP user-door
     /// question. None = ask; under --ci, None = closed.
     pub mcp_door: Option<bool>,
+    /// `--monitoring-full` (alias `--with-monitoring`) / `--no-monitoring-full`
+    /// — pre-answers the Grafana/Loki/Tempo question. None = ask (default No
+    /// on a new install); under --ci, None = lean on a new install and the
+    /// existing value otherwise (`steps::monitoring_plan`).
+    pub monitoring_full: Option<bool>,
     /// `--secrets-backend sops` — accepted for scripts that pass it; `sops`
     /// is the only backend. `env` (plaintext `.env`) is RETIRED and refused
     /// at parse time ([`secrets_backend_flag`]).
@@ -174,6 +179,10 @@ pub(crate) struct State {
     pub tier: u8,
     pub gpu_model: String,
     pub vram_gb: f64,
+    /// The prereqs step found no GPU at all (`nvidia-smi` absent or failed;
+    /// not merely busy). The environment step then seeds the CPU-only
+    /// Ollama slot count on a new install (i802).
+    pub cpu_only: bool,
     pub controller_url: String,
     pub data_root: String,
     /// Failures no later step can recover from (storage root unusable, the
@@ -210,6 +219,14 @@ pub(crate) struct State {
     /// Some(true) = the MCP user door was opened (posture gate set, gateway
     /// restarted); Some(false) = deliberately left closed; None = not asked.
     pub mcp_door: Option<bool>,
+    /// What the monitoring question decided (or found): Some(Lean) makes the
+    /// summary say how to turn Grafana, Loki and Tempo on. None = not asked.
+    pub monitoring: Option<crate::commands::stack_monitoring::Level>,
+    /// This machine was already onboarded when the wizard began (`.env` and
+    /// every core secret present). An install that never chose a monitoring
+    /// level keeps the full set (unset = full); only a NEW install gets lean
+    /// by default.
+    pub was_configured: bool,
     pub user_dir_count: usize,
     pub interrupted: bool,
     /// Why the wizard stopped before the last step, when it did. Set by the
@@ -630,13 +647,11 @@ pub fn onboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     return Ok(2);
                 }
             },
-            // Retired 2026-09-28: the monitoring set (Grafana/Prometheus/
-            // Loki/…) rides the `standalone` profile itself now, so every
-            // install runs it. Accepted so an old script keeps working;
-            // it changes nothing.
-            "--with-monitoring" => {
-                eprintln!("• --with-monitoring is no longer needed: every install runs the monitoring set");
-            }
+            // Grafana, Loki and Tempo are a choice again (cluster.monitoring
+            // in noomesh.yaml, unset = full): `--with-monitoring`, the old
+            // spelling, is the yes answer, like `--monitoring-full`.
+            "--monitoring-full" | "--with-monitoring" => skip.monitoring_full = Some(true),
+            "--no-monitoring-full" => skip.monitoring_full = Some(false),
             // Mode B: materialise from an EXTERNAL bundle (url|path)
             // instead of the embedded assets — config unpinned from the CLI
             // version. Produce one with `noo bundle export`.
@@ -1000,6 +1015,8 @@ pub(crate) fn rerun_guard_applies(reconfigure: bool, only: &[String], configured
 /// dry-run banner, all steps, final summary. Output/prompts route through
 /// `ctx.ui` / `ctx.asker`. Returns the process exit code.
 pub(crate) fn drive(ctx: &mut Ctx, reconfigure: bool) -> i32 {
+    // Read before any step writes .env or the store (monitoring_plan).
+    ctx.state.was_configured = is_configured(ctx);
     // ── Idempotent-install guard ─────────────────────────────────────────
     // A bare re-run on a configured host must NOT blindly rewrite .env or
     // bounce services. Detect the existing install and default to "no".
@@ -1328,6 +1345,11 @@ fn run_all(ctx: &mut Ctx) {
     ctx.pause(6, TOTAL);
 
     ctx.step(7, TOTAL, STEP_TITLES[6]);
+    // Before anything starts: the first start of a new install is already
+    // the lean or full one the person chose.
+    if only_wants("services", ctx) {
+        steps::monitoring_choice(ctx);
+    }
     if ctx.skip.services || !only_wants("services", ctx) {
         ctx.info("Skipped.");
     } else {
@@ -1544,6 +1566,8 @@ fn print_final_summary(ctx: &Ctx) {
             // The door onboarding derived, not a guess.
             let door = ctx.read_env(crate::commands::grafana_door::ROOT_URL_KEY);
             rows.push(if door.is_empty() { format!("Grafana: {proto}://localhost:3000") } else { format!("Grafana: {door}  (Open Grafana in the console signs you in)") });
+        } else if ctx.state.monitoring == Some(crate::commands::stack_monitoring::Level::Lean) {
+            rows.push("Grafana, Loki, Tempo: off  (on: `noo stack monitoring on`)".to_string());
         }
         match ctx.state.mcp_door {
             Some(true) => {

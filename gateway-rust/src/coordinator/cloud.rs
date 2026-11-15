@@ -405,6 +405,8 @@ pub(super) async fn run_cloud_completion(
             total_tokens,
             total_tool_calls: 0,
             total_latency_ms: start.elapsed().as_millis() as u64,
+            // a cloud API / vendor CLI counts its own prompt: not judged (i802)
+            truncated: None,
         },
         recall: None,
     })

@@ -9,7 +9,7 @@ import { meterLevel } from '@/lib/meter';
 import { useObservability, type AddonState } from './useObservability';
 import { dash } from '@/lib/num';
 import { groupBackendDoors, type ContainerRow } from './doorGroups';
-import { useGrafanaSession, sendTab, type TabHandle } from './useGrafanaSession';
+import { useGrafanaSession, useMonitoringStatus, grafanaOffLine, sendTab, type TabHandle } from './useGrafanaSession';
 import {
   arrivalAsksForGrafana,
   clearArrival,
@@ -49,9 +49,15 @@ const ADDON_HINT: Record<AddonState, (label: string) => string> = {
  * from the LIVE account (admin→Admin, operator→Editor, user→Viewer) and
  * refuses a disabled one; the session lasts 5 minutes by default, after
  * which Grafana shows its login-disabled page and the fix is to click again.
+ *
+ * On an install that turned dashboards off (`cluster.monitoring: lean`, no
+ * Grafana running) the button is replaced by a muted line naming
+ * `noo stack monitoring on`: a choice, not a fault, and nothing to click.
  */
-function OpenGrafana() {
+export function OpenGrafana() {
   const mint = useGrafanaSession();
+  const status = useMonitoringStatus();
+  const offLine = grafanaOffLine(status.data);
   const [note, setNote] = useState<string | null>(null);
   const { ready, isLoggedIn } = useAuth();
   // Arrived from a bookmark of Grafana (grafanaArrival.ts): once the
@@ -63,7 +69,7 @@ function OpenGrafana() {
   );
   const arrived = useRef(false);
   useEffect(() => {
-    if (!arrival || arrived.current || !ready || !isLoggedIn) return;
+    if (!arrival || arrived.current || !ready || !isLoggedIn || offLine) return;
     arrived.current = true;
     clearArrival(window);
     const tab = () => window.sessionStorage;
@@ -79,7 +85,7 @@ function OpenGrafana() {
       .catch((e: Error) => setNote(e.message));
     // `mint` is a fresh object each render; the ref makes this run once.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [arrival, ready, isLoggedIn]);
+  }, [arrival, ready, isLoggedIn, offLine]);
 
   async function open() {
     setNote(null);
@@ -95,6 +101,14 @@ function OpenGrafana() {
       tab?.close?.();
       setNote((e as Error).message);
     }
+  }
+
+  if (offLine) {
+    return (
+      <span className="open-grafana">
+        <span className="open-grafana-off">{offLine}</span>
+      </span>
+    );
   }
 
   return (

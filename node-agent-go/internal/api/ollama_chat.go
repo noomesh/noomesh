@@ -313,8 +313,11 @@ type ollamaReply struct {
 	Done            bool   `json:"done"`
 	DoneReason      string `json:"done_reason"`
 	PromptEvalCount *int64 `json:"prompt_eval_count"`
-	EvalCount       *int64 `json:"eval_count"`
-	Error           string `json:"error"`
+	// PromptEvalDuration is Ollama's prefill time in nanoseconds; carried on
+	// as usage.prompt_eval_ms for the gateway's backend_call line (i802).
+	PromptEvalDuration *int64 `json:"prompt_eval_duration"`
+	EvalCount          *int64 `json:"eval_count"`
+	Error              string `json:"error"`
 }
 
 // openAIToolCalls lifts Ollama's tool calls (object arguments, no id) to
@@ -369,7 +372,11 @@ func ollamaUsage(r *ollamaReply) map[string]any {
 	if r.EvalCount != nil {
 		c = *r.EvalCount
 	}
-	return map[string]any{"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
+	u := map[string]any{"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
+	if r.PromptEvalDuration != nil && *r.PromptEvalDuration > 0 {
+		u["prompt_eval_ms"] = *r.PromptEvalDuration / 1_000_000
+	}
+	return u
 }
 
 func ollamaFinish(r *ollamaReply, hadTools bool) string {
@@ -474,6 +481,9 @@ func (s *Server) proxyOllamaChat(w http.ResponseWriter, r *http.Request, body []
 	if err != nil {
 		jsonError(w, http.StatusBadRequest, "bad_chat_body", err.Error())
 		return
+	}
+	if s.chatContext != nil {
+		req.body = withDecidedNumCtx(req.body, s.chatContext(req.model))
 	}
 	// No whole-request timeout: a stream lives while bytes arrive. The
 	// transport's ResponseHeaderTimeout (firstByte) still bounds the wait
@@ -692,4 +702,34 @@ func streamOllamaChat(ctx context.Context, w http.ResponseWriter, body io.Reader
 	}
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	flush()
+}
+
+// withDecidedNumCtx sets options.num_ctx on a translated /api/chat body to
+// the controller's decided chat context for its model (desired-config
+// `chat_contexts`, i802) when the caller did not set one: a body the gateway
+// already stamped, or a caller's own value, is left as it is. This covers the
+// callers the gateway cannot stamp (a node harness's OpenAI wire). n <= 0, or
+// a body that is not a JSON object, is returned unchanged.
+func withDecidedNumCtx(body []byte, n int) []byte {
+	if n <= 0 {
+		return body
+	}
+	var m map[string]any
+	if json.Unmarshal(body, &m) != nil || m == nil {
+		return body
+	}
+	opts, _ := m["options"].(map[string]any)
+	if opts == nil {
+		opts = map[string]any{}
+	}
+	if _, set := opts["num_ctx"]; set {
+		return body
+	}
+	opts["num_ctx"] = n
+	m["options"] = opts
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
 }

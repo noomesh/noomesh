@@ -33,6 +33,11 @@ fn put_num(body: &mut serde_json::Value, key: &str, v: Option<u64>) {
 /// one, so the fallback is named — with Loki's reason when the gateway
 /// gave one.
 fn backend_footer(resp: &serde_json::Value) -> String {
+    // Off by choice (`cluster.monitoring: lean`): not a fault, so the
+    // footer names the command rather than "not reachable".
+    if resp["loki_off"].as_bool() == Some(true) {
+        return "via agent scan (log search is off by choice: noo stack monitoring on)".to_string();
+    }
     match resp["backend"].as_str() {
         Some("loki") => "via loki".to_string(),
         Some("agent-scan") => match resp["loki_error"].as_str() {
@@ -41,6 +46,21 @@ fn backend_footer(resp: &serde_json::Value) -> String {
         },
         _ => "via agent scan (Loki not reachable)".to_string(),
     }
+}
+
+/// The gateway's "log search is off" line when the search answer is
+/// `backend: off` (a lean install with no Loki), else `None`.
+fn search_off_line(resp: &serde_json::Value) -> Option<String> {
+    if resp["backend"].as_str() != Some("off") {
+        return None;
+    }
+    Some(
+        resp["message"]
+            .as_str()
+            .filter(|m| !m.is_empty())
+            .unwrap_or("Log search is off on this install. Turn it on: noo stack monitoring on")
+            .to_string(),
+    )
 }
 
 /// Parsed `noo logs errors` flags → the request body.
@@ -269,12 +289,18 @@ pub(crate) fn parse_search_with(a: &mut Args) -> Result<SearchArgs, ArgError> {
 /// POST /api/logs/search — the fleet search over Loki. The gateway builds
 /// the LogQL from the flags; `<text>` is a line filter; `-q` sends your own
 /// LogQL (capped like everything else). Loki down → the gateway's 503 is
-/// printed as-is: there is no scan fallback for a fleet question.
+/// printed as-is: there is no scan fallback for a fleet question. Log
+/// search off by choice (`backend: off`) → the gateway's line, which names
+/// `noo stack monitoring on`, instead of "no matching lines".
 pub fn logs_search(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let SearchArgs { body } = parse_search_args(args)?;
     let resp = post_json(g, "/api/logs/search", &body, true, 60);
     if g.json {
         println!("{resp}");
+        return Ok(0);
+    }
+    if let Some(line) = search_off_line(&resp) {
+        println!("{line}");
         return Ok(0);
     }
     let empty = Vec::new();
@@ -538,6 +564,34 @@ mod tests {
         );
         // A gateway from before phase 5 sends no `backend`: that IS the scan.
         assert_eq!(backend_footer(&serde_json::json!({})), "via agent scan (Loki not reachable)");
+    }
+
+    #[test]
+    fn a_scan_because_log_search_is_off_names_the_command_not_a_fault() {
+        let off = serde_json::json!({
+            "backend": "agent-scan",
+            "loki_error": "log search is off by choice: noo stack monitoring on",
+            "loki_off": true,
+        });
+        assert_eq!(backend_footer(&off), "via agent scan (log search is off by choice: noo stack monitoring on)");
+        let down = serde_json::json!({"backend": "agent-scan", "loki_error": "x", "loki_off": false});
+        assert_eq!(backend_footer(&down), "via agent scan (Loki not reachable: x)");
+    }
+
+    #[test]
+    fn search_off_prints_the_gateways_line_instead_of_no_matching_lines() {
+        let off = serde_json::json!({
+            "lines": [], "backend": "off",
+            "message": "Log search is off on this install. Turn it on: noo stack monitoring on",
+        });
+        assert_eq!(search_off_line(&off).as_deref(), Some("Log search is off on this install. Turn it on: noo stack monitoring on"));
+        assert_eq!(
+            search_off_line(&serde_json::json!({"backend": "off"})).as_deref(),
+            Some("Log search is off on this install. Turn it on: noo stack monitoring on"),
+            "a missing message still names the command"
+        );
+        assert_eq!(search_off_line(&serde_json::json!({"lines": [], "backend": "loki"})), None);
+        assert_eq!(search_off_line(&serde_json::json!({"error": "log search needs Loki"})), None);
     }
 
     #[test]

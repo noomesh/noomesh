@@ -435,6 +435,7 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
         }
         util::GpuDetect::None => {
             ctx.state.tier = 3;
+            ctx.state.cpu_only = true;
             ctx.warn("GPU: none detected — CPU-only (Tier 3)");
         }
     }
@@ -716,6 +717,23 @@ pub(crate) fn keep_llm_preference_hint(value: &str) -> Option<String> {
     Some(format!("noo cluster prefer knowledge {v}"))
 }
 
+/// The `compose_env` key (noomesh.yaml, the launcher's home for a deployment
+/// knob; a `.env` copy would shadow it) the environment step seeds on a NEW
+/// CPU-only install (i802): `OLLAMA_EMBED_NUM_PARALLEL=1`. The stack's shared
+/// Ollama (`ollama-embed`) otherwise runs 4 slots: on a 4-core CPU one slot
+/// prefills about 3x faster (fa, run 43628426011: ~370 against ~125 tok/s)
+/// and saves cache, with no embedding loss (run 43622936679). `None` on a GPU or a busy-GPU box, on
+/// an install this step already configured (its `.env` carries `NODE_ID`,
+/// which this step always writes) and whenever the key is already set: an
+/// existing install is never rewritten. Pure.
+pub(crate) fn cpu_only_embed_parallel(
+    cpu_only: bool,
+    existing: &std::collections::BTreeMap<String, String>,
+) -> Option<(&'static str, &'static str)> {
+    let new_install = !existing.contains_key("NODE_ID");
+    (cpu_only && new_install && !existing.contains_key("OLLAMA_EMBED_NUM_PARALLEL")).then_some(("OLLAMA_EMBED_NUM_PARALLEL", "1"))
+}
+
 pub fn environment(ctx: &mut Ctx) {
     // Before the read: a removal must not be written straight back by the merge below.
     offer_retired_env_keys(ctx);
@@ -890,6 +908,9 @@ The default is right (press enter)")
     if mode == "worker" && !controller_url.is_empty() {
         set(&mut merged, &mut merged_order, "CONTROLLER_URL", controller_url.clone());
     }
+    // i802: one Ollama slot on a NEW CPU-only install, written to
+    // compose_env once noomesh.yaml exists (below); never over a value.
+    let embed_slots = cpu_only_embed_parallel(ctx.state.cpu_only, &existing);
     // Provider keys are SECRETS: they never enter the .env body written
     // below. On an install already on the encrypted store they go straight
     // into it (after the write, so the whole-file write cannot race it);
@@ -941,6 +962,9 @@ The default is right (press enter)")
         // seed, which are precisely the ones they would want to check.
         apply_topology_env(ctx);
         ensure_mesh_yaml(ctx);
+        if let Some((k, v)) = embed_slots {
+            ctx.dry(&format!("set compose_env {k}={v} in noomesh.yaml (one Ollama slot on this CPU-only box)"));
+        }
         return;
     }
     if let Err(e) = std::fs::write(&ctx.env_path, body) {
@@ -960,6 +984,12 @@ The default is right (press enter)")
     ctx.warn_sops_once();
 
     ensure_mesh_yaml(ctx);
+    if let Some((k, v)) = embed_slots {
+        if yamlcfg::read_yaml_compose_env(ctx, k).is_none() {
+            yamlcfg::update_yaml_compose_env(ctx, &[(k.to_string(), v.to_string())]);
+            ctx.info("Ollama runs one slot on this CPU-only box (noomesh.yaml compose_env): one slot prefills about 3x faster here");
+        }
+    }
 }
 
 /// noomesh.yaml is gitignored operator config but three services
@@ -7990,6 +8020,100 @@ fn now_ts() -> i64 {
         .unwrap_or(0)
 }
 
+/// What the monitoring question does on this run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MonitoringPlan {
+    /// Decided without asking (a flag, or `--ci` on a new install).
+    Set(crate::commands::stack_monitoring::Level),
+    /// Ask; the bool is the default (true = yes, full).
+    Ask(bool),
+    /// Leave noomesh.yaml as it is (`--ci` on an install that already has a
+    /// value, or that never chose: unset = full).
+    Keep,
+}
+
+/// The question's plan. A flag decides. Otherwise the default is the
+/// install's own value, and for an install that never chose it depends on
+/// whether the install is new: a new one defaults to lean (No, Enter
+/// accepts it), an existing one to full, because unset already means full
+/// there and the fleet controller is such an install; a reconfigure must
+/// never quietly turn its Grafana, Loki and Tempo off. `--ci` asks nothing:
+/// lean on a new install, the existing value (or unset = full) otherwise.
+pub(crate) fn monitoring_plan(flag: Option<bool>, non_interactive: bool, declared: Option<&str>, was_configured: bool) -> MonitoringPlan {
+    use crate::commands::stack_monitoring::Level;
+    if let Some(full) = flag {
+        return MonitoringPlan::Set(if full { Level::Full } else { Level::Lean });
+    }
+    let current = match declared.map(str::trim) {
+        Some("full") => Some(Level::Full),
+        Some("lean") => Some(Level::Lean),
+        _ => None,
+    };
+    if non_interactive {
+        return match (current, was_configured) {
+            (None, false) => MonitoringPlan::Set(Level::Lean),
+            _ => MonitoringPlan::Keep,
+        };
+    }
+    MonitoringPlan::Ask(match current {
+        Some(level) => level == Level::Full,
+        None => was_configured,
+    })
+}
+
+/// The question that decides whether this install runs Grafana, Loki and
+/// Tempo (`cluster.monitoring` in noomesh.yaml; `noo stack monitoring`
+/// changes it later). Asked before the services step starts anything, so a
+/// new install's first start is already the one the person chose. Copied
+/// from the MCP-door question: `--monitoring-full` / `--no-monitoring-full`
+/// pre-answer (`--with-monitoring` is the old spelling of yes). A
+/// controller-profile install (a source checkout) always runs the set and is
+/// not asked.
+pub fn monitoring_choice(ctx: &mut Ctx) {
+    use crate::commands::stack_monitoring::{declared_in, level_of, write_at, Level};
+    let standalone = ctx.read_env("NOO_DEFAULT_PROFILE").trim() == "standalone" || ctx.repo_root.join(".noo-standalone").exists();
+    if !standalone {
+        ctx.info("Grafana, Loki and Tempo run on this install's controller profile (noo stack monitoring status).");
+        return;
+    }
+    let yaml = ctx.repo_root.join("noomesh.yaml");
+    let declared = std::fs::read_to_string(&yaml).ok().and_then(|t| declared_in(&t));
+    let level = match monitoring_plan(ctx.skip.monitoring_full, ctx.non_interactive, declared.as_deref(), ctx.state.was_configured) {
+        MonitoringPlan::Keep => {
+            let level = level_of(declared.as_deref());
+            ctx.state.monitoring = Some(level);
+            ctx.info(&format!("Monitoring: {} (kept; change it with noo stack monitoring on or off).", level.as_str()));
+            return;
+        }
+        MonitoringPlan::Set(level) => level,
+        MonitoringPlan::Ask(default_full) => {
+            ctx.info("Prometheus and alerts always run. Grafana dashboards, Loki log search and Tempo request traces are optional.");
+            if ctx.asker.confirm("Install dashboards, log search and request traces (Grafana, Loki, Tempo; about 250 MiB idle)?", default_full) {
+                Level::Full
+            } else {
+                Level::Lean
+            }
+        }
+    };
+    ctx.state.monitoring = Some(level);
+    if ctx.dry_run {
+        ctx.dry(&format!("write cluster.monitoring: {} to noomesh.yaml", level.as_str()));
+        return;
+    }
+    if declared.as_deref() != Some(level.as_str()) {
+        if let Err(e) = write_at(&yaml, level) {
+            // Nothing written: the install keeps what it had (unset = full).
+            ctx.state.monitoring = Some(level_of(declared.as_deref()));
+            ctx.warn(&format!("could not record the monitoring choice ({e}); set cluster.monitoring: {} under cluster: in noomesh.yaml", level.as_str()));
+            return;
+        }
+    }
+    match level {
+        Level::Full => ctx.success("Grafana, Loki and Tempo will run (cluster.monitoring: full)."),
+        Level::Lean => ctx.info("Grafana, Loki and Tempo stay off (cluster.monitoring: lean). Turn them on any time: noo stack monitoring on"),
+    }
+}
+
 /// The add-ons step. Free add-ons are a yes/no with the current value as
 /// default. Licensed ones are offered only when the installed entitlement
 /// grants their feature; otherwise one line says what they are and the
@@ -10552,5 +10676,99 @@ mod fresh_install_line_tests {
         assert!(!own.contains("no placement needed"), "the old line is back somewhere");
         let tail = crate::test_src::fn_body(&own, "pub fn provision_service_keys(");
         assert!(tail.contains("for svc in services_to_recreate(&t.containers, &prefix, &|c: &str| {"), "{tail}");
+    }
+}
+
+#[cfg(test)]
+mod monitoring_choice_tests {
+    use super::{monitoring_plan, MonitoringPlan};
+    use crate::commands::stack_monitoring::Level;
+
+    /// A new install: the question defaults to No (Enter accepts lean), and
+    /// `--ci` writes lean.
+    #[test]
+    fn a_new_install_defaults_to_lean() {
+        assert_eq!(monitoring_plan(None, false, None, false), MonitoringPlan::Ask(false), "Enter must accept No");
+        assert_eq!(monitoring_plan(None, true, None, false), MonitoringPlan::Set(Level::Lean));
+    }
+
+    /// An install that never chose runs everything (unset = full), and the
+    /// fleet controller is such an install: a reconfigure defaults to yes
+    /// and `--ci` writes nothing.
+    #[test]
+    fn an_existing_install_that_never_chose_keeps_the_full_set() {
+        assert_eq!(monitoring_plan(None, false, None, true), MonitoringPlan::Ask(true));
+        assert_eq!(monitoring_plan(None, true, None, true), MonitoringPlan::Keep);
+        assert_eq!(monitoring_plan(None, true, Some("typo"), true), MonitoringPlan::Keep);
+    }
+
+    #[test]
+    fn a_value_already_chosen_is_the_default_and_survives_ci() {
+        assert_eq!(monitoring_plan(None, false, Some("lean"), true), MonitoringPlan::Ask(false));
+        assert_eq!(monitoring_plan(None, false, Some("full"), false), MonitoringPlan::Ask(true));
+        assert_eq!(monitoring_plan(None, true, Some("full"), false), MonitoringPlan::Keep);
+        assert_eq!(monitoring_plan(None, true, Some("lean"), true), MonitoringPlan::Keep);
+    }
+
+    #[test]
+    fn a_flag_decides_without_asking() {
+        for (ni, declared, cfg) in [(false, None, false), (true, Some("lean"), true), (true, None, true)] {
+            assert_eq!(monitoring_plan(Some(true), ni, declared, cfg), MonitoringPlan::Set(Level::Full));
+            assert_eq!(monitoring_plan(Some(false), ni, declared, cfg), MonitoringPlan::Set(Level::Lean));
+        }
+    }
+
+    /// The flags and the question as the person sees them; the question is
+    /// asked in the services step BEFORE anything starts.
+    #[test]
+    fn the_flags_parse_and_the_question_is_asked_before_services_start() {
+        let mod_rs = crate::test_src::own_code(include_str!("mod.rs"));
+        assert!(mod_rs.contains("\"--monitoring-full\" | \"--with-monitoring\" => skip.monitoring_full = Some(true),"));
+        assert!(mod_rs.contains("\"--no-monitoring-full\" => skip.monitoring_full = Some(false),"));
+        let run = mod_rs.find("steps::monitoring_choice(ctx);").expect("asked");
+        let services = mod_rs.find("        steps::services(ctx);").expect("services step");
+        assert!(run < services, "the monitoring question must come before services start");
+        assert!(mod_rs.contains("ctx.state.was_configured = is_configured(ctx);"));
+        let own = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn monitoring_choice(");
+        assert!(body.contains("\"Install dashboards, log search and request traces (Grafana, Loki, Tempo; about 250 MiB idle)?\", default_full"), "{body}");
+        let usage = crate::usage::USAGE.iter().find(|(w, _, _)| *w == ["onboard"]).expect("onboard usage").1;
+        assert!(usage.contains("[--monitoring-full|--no-monitoring-full]"), "{usage}");
+    }
+}
+
+#[cfg(test)]
+mod cpu_only_embed_parallel_tests {
+    use super::cpu_only_embed_parallel;
+    use std::collections::BTreeMap;
+
+    fn env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    /// i802: a NEW CPU-only install gets one Ollama slot; a GPU box, an
+    /// install this step already configured and a key already set are left
+    /// alone (an existing install is never rewritten).
+    #[test]
+    fn onboard_seeds_one_ollama_slot_only_on_a_new_cpu_only_install() {
+        assert_eq!(cpu_only_embed_parallel(true, &env(&[])), Some(("OLLAMA_EMBED_NUM_PARALLEL", "1")));
+        // --standalone seeds a few keys before this step; still a new install.
+        assert_eq!(cpu_only_embed_parallel(true, &env(&[("NOO_INSTALL_MODE", "standalone")])), Some(("OLLAMA_EMBED_NUM_PARALLEL", "1")));
+        assert_eq!(cpu_only_embed_parallel(false, &env(&[])), None, "a GPU (or busy GPU) box keeps the compose default");
+        assert_eq!(cpu_only_embed_parallel(true, &env(&[("NODE_ID", "box")])), None, "an existing install is never rewritten");
+        assert_eq!(cpu_only_embed_parallel(true, &env(&[("OLLAMA_EMBED_NUM_PARALLEL", "4")])), None, "the operator's own value stands");
+    }
+
+    /// It is written to noomesh.yaml compose_env after the file is seeded,
+    /// never into .env, and never over a compose_env value already there.
+    #[test]
+    fn the_slot_default_goes_to_compose_env_after_the_yaml_exists() {
+        let own = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn environment(");
+        assert!(!body.contains("set(&mut merged, &mut merged_order, k, v.to_string())"), "not into .env: {body}");
+        let seeded = body.rfind("ensure_mesh_yaml(ctx);").expect("the yaml is seeded");
+        let guard = body.find("if yamlcfg::read_yaml_compose_env(ctx, k).is_none() {").expect("never over a value");
+        let write = body.find("yamlcfg::update_yaml_compose_env(ctx, &[(k.to_string(), v.to_string())]);").expect("the write");
+        assert!(seeded < guard && guard < write, "{body}");
     }
 }

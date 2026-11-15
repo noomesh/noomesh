@@ -2985,6 +2985,10 @@ pub const USER_READ_PATHS: &[&str] = &[
     "/api/heartbeat/artifacts",
     "/api/autonomy/status",
     "/api/autonomy/decisions",
+    // Which optional monitoring parts run (three booleans and one line):
+    // every tier sees the "Open Grafana" button, so every tier may learn it
+    // is off by choice. Exact path; nothing else under /api/monitoring.
+    "/api/monitoring/status",
     "/api/alerts/clients",
     "/api/approval/stats",
     "/api/channels/status",
@@ -6638,6 +6642,7 @@ mod user_read_allowlist_tests {
         "/api/heartbeat/tasks/t1/artifacts",
         "/api/autonomy/status",
         "/api/autonomy/decisions",
+        "/api/monitoring/status",
         "/api/alerts/clients",
         "/api/approval/stats",
         "/api/channels/status",

@@ -418,6 +418,11 @@ done
 # Profiles the operator enabled in COMPOSE_PROFILES (lib-config.sh).
 PROFILE_ARGS="$PROFILE_ARGS $(operator_profile_args)"
 derive_profile_env
+# Grafana, Loki and Tempo: on unless noomesh.yaml declares
+# `cluster.monitoring: lean` (unset = full; lib-config.sh). A lean install
+# that names one of them is refused before anything is pulled or built.
+PROFILE_ARGS="$PROFILE_ARGS $(monitoring_profile_args)"
+monitoring_refuse_named "$PROFILE_ARGS" ${SERVICES[@]+"${SERVICES[@]}"} || exit 1
 
 for svc in ${SERVICES[@]}; do
     p=$(service_profile "$svc")

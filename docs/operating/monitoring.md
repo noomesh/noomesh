@@ -4,8 +4,19 @@ Every controller ships its own monitoring: Prometheus scrapes the gateway,
 the node-agents and the host exporters over mTLS, Grafana renders them,
 every node's agent — the controller's own included — ships container and
 journal logs to Loki through the gateway, and Alertmanager receives the
-bundled rules. All of it is in the `controller` and the `standalone`
-profile — nothing extra to start, on either install shape. Prove it:
+bundled rules. Prometheus, Alertmanager and node-exporter run on every
+install. Grafana, Loki and Tempo (about 250 MiB idle) run unless
+noomesh.yaml says `cluster.monitoring: lean`; unset means full, and a new
+install is lean unless you answer yes in the wizard. `noo stack monitoring
+status` shows which and where it is set; `on` starts them on their earlier
+data; `off` removes the containers, keeps `<state root>/{loki,tempo,grafana}`
+and prints the `sudo rm -rf` line to delete it yourself. While they are off,
+log search, Open Grafana and node log shipping answer "off by choice" with
+`noo stack monitoring on`, never an error. On a lean install
+`noo cluster verify` reads the `loki`, `tempo`, `grafana door`,
+`logs last seen` and absent `* at rest` rows as OK, "not installed by
+choice", and a node's `log shipper` row says the controller keeps no logs
+by choice. Prove it:
 
 ```sh
 noo health                                        # gateway + dependencies, exit 5 if degraded

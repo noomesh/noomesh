@@ -33,6 +33,18 @@
 //! add-on pinned on Docker Hub keeps its superseded images; the operator
 //! removes them by hand.
 //!
+//! A lock names an image by its manifest DIGEST, under whatever name the
+//! release wrote (`gateway@sha256:…`): the same digest is held locally as
+//! `ghcr.io/noomesh/gateway@sha256:…`, as `ghcr.io/noomesh/dhi/alertmanager@…`
+//! (the base images), as a Docker Hub short name (`nats@sha256:…`) or under
+//! a mirror prefix. So every lock row is resolved BY DIGEST against the
+//! images docker holds ([`holding`]), never by name, and kept by the image
+//! ID that holds it. A Docker Hub image a lock pins is therefore kept like
+//! any other, although hostd never treats a Hub short name as ours to
+//! delete. A row no local image holds (a node-only image on a controller,
+//! another platform's) protects nothing on this host: it stays in the keep
+//! file under the lock's own name, inert, and says so.
+//!
 //! The keep file proves it is current by naming its sources with their
 //! SHA-256: hostd re-hashes them, and a lock that moved since makes it stale,
 //! which skips the rung.
@@ -75,9 +87,77 @@ pub(crate) fn stack_lock_refs(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// The `# tag <tag>` header of a stack lock.
+/// One image docker holds: its ID and every name it goes by (RepoTags and
+/// RepoDigests; the containerd store lists a digest pull among the tags too).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalImage {
+    pub id: String,
+    pub refs: Vec<String>,
+}
+
+/// `docker image inspect --format` for [`parse_local_images`]. JSON lists,
+/// because `{{join .RepoTags ","}}` fails on the Docker 27 and 28 CLIs.
+pub(crate) const LOCAL_IMAGE_FORMAT: &str = "{{.Id}}|{{json .RepoTags}}|{{json .RepoDigests}}";
+
+/// Lines of [`LOCAL_IMAGE_FORMAT`] (a trailing `|<size>` field is ignored).
+/// A line that does not parse is no image, never a guess.
+pub(crate) fn parse_local_images(out: &str) -> Vec<LocalImage> {
+    out.lines()
+        .filter_map(|l| {
+            let p: Vec<&str> = l.trim().split('|').collect();
+            let id = *p.first()?;
+            if p.len() < 3 || !(id.len() == 71 && id.starts_with("sha256:")) {
+                return None;
+            }
+            let list = |s: &str| serde_json::from_str::<Option<Vec<String>>>(s).ok().map(Option::unwrap_or_default);
+            let refs = list(p[1])?.into_iter().chain(list(p[2])?).filter(|r| !r.contains("<none>")).collect();
+            Some(LocalImage { id: id.to_string(), refs })
+        })
+        .collect()
+}
+
+/// The 64-hex digest of a `name@sha256:<hex>` ref.
+pub(crate) fn digest_hex(r: &str) -> Option<&str> {
+    let (_, hex) = r.split_once("@sha256:")?;
+    (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then_some(hex)
+}
+
+/// The local images that hold `reference`'s digest, under ANY name.
+pub(crate) fn holding<'a>(reference: &str, local: &'a [LocalImage]) -> Vec<&'a LocalImage> {
+    let Some(hex) = digest_hex(reference) else { return Vec::new() };
+    let tail = format!("@sha256:{hex}");
+    local.iter().filter(|i| i.refs.iter().any(|r| r.ends_with(&tail))).collect()
+}
+
+/// Every image docker holds. `Err` carries Docker's own words.
+pub(crate) fn local_images() -> Result<Vec<LocalImage>, String> {
+    let run = |args: &[&str]| -> Result<String, String> {
+        let o = std::process::Command::new("docker")
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| format!("docker: {e}"))?;
+        if o.status.success() {
+            Ok(String::from_utf8_lossy(&o.stdout).into_owned())
+        } else {
+            Err(String::from_utf8_lossy(&o.stderr).lines().next().unwrap_or("docker failed").to_string())
+        }
+    };
+    let ids = run(&["image", "ls", "-aq", "--no-trunc"])?;
+    let mut ids: Vec<&str> = ids.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args = vec!["image", "inspect", "--format", LOCAL_IMAGE_FORMAT];
+    args.extend(ids);
+    Ok(parse_local_images(&run(&args)?))
+}
+
+/// The `# stack <tag>` header of a stack lock (the release writes it).
 pub(crate) fn stack_lock_tag(text: &str) -> Option<String> {
-    text.lines().find_map(|l| l.trim().strip_prefix("# tag ").map(|t| t.trim().to_string()))
+    text.lines().find_map(|l| l.trim().strip_prefix("# stack ").map(|t| t.trim().to_string()))
 }
 
 /// `ghcr.io/example-vendor/exaddon@sha256:…` -> `ghcr.io/example-vendor/exaddon/`:
@@ -99,6 +179,8 @@ pub(crate) struct KeepInputs {
     pub pins_prev: Option<(PathBuf, Vec<u8>, Pins)>,
     pub staged: Option<(PathBuf, Vec<u8>, Vec<String>)>,
     pub roots: Vec<String>,
+    /// What docker holds, to resolve each lock row by digest.
+    pub local: Vec<LocalImage>,
 }
 
 fn read_opt(p: PathBuf) -> Option<(PathBuf, Vec<u8>)> {
@@ -131,6 +213,9 @@ impl KeepInputs {
             pins_prev: read_opt(PathBuf::from(format!("{}{PREV_SUFFIX}", pins_file.display()))).map(parse_pins).transpose()?,
             staged,
             roots: crate::registry::rail_roots().iter().map(|s| s.to_string()).collect(),
+            // Fail closed: without the local images no row can be kept by
+            // the ID that holds it, so no keep file is written.
+            local: local_images().map_err(|e| format!("docker did not list the images ({e}): nothing proves what to keep"))?,
         })
     }
 }
@@ -150,9 +235,21 @@ pub(crate) fn keep_file(inp: &KeepInputs, now_rfc3339: &str) -> Result<Value, St
         .map(|r| if r.ends_with('/') { r.clone() } else { format!("{r}/") })
         .collect();
     let mut sources = vec![json!({"path": stack_path.display().to_string(), "sha256": pins::sha256_hex(stack_bytes)})];
+    // Each lock row: its own ref, and the ID of every local image holding
+    // its digest under any name. Kept by ID, so the name docker uses for it
+    // (ghcr.io/noomesh/…, …/dhi/…, a Docker Hub short name, a mirror) never
+    // matters.
+    let local = &inp.local;
     let mut add = |reference: String, why: String, keep: &mut Vec<Value>| {
+        let held = holding(&reference, local);
+        let why = if held.is_empty() { format!("{why}; not on this host") } else { why };
         if seen.insert(reference.clone()) {
             keep.push(json!({"ref": reference, "why": why}));
+        }
+        for im in held {
+            if seen.insert(im.id.clone()) {
+                keep.push(json!({"id": im.id, "why": format!("{why}: holds {reference}")}));
+            }
         }
     };
     let text = String::from_utf8_lossy(stack_bytes);
@@ -551,8 +648,8 @@ mod tests {
     }
 
     fn inputs() -> KeepInputs {
-        let stack = format!("# tag v0.6.24\nghcr.io/noomesh/gateway@sha256:{}\nghcr.io/noomesh/ollama@sha256:{}\n", h('1'), h('2'));
-        let prev = format!("# tag v0.6.23\nghcr.io/noomesh/gateway@sha256:{}\n", h('3'));
+        let stack = format!("# stack v0.6.24\nghcr.io/noomesh/gateway@sha256:{}\nghcr.io/noomesh/ollama@sha256:{}\n", h('1'), h('2'));
+        let prev = format!("# stack v0.6.23\nghcr.io/noomesh/gateway@sha256:{}\n", h('3'));
         let mut cur = Pins::new();
         cur.insert("exaddon".into(), pin(&[("worker", format!("ghcr.io/example-vendor/exaddon@sha256:{}", h('4')))], None));
         cur.insert("rhaddon".into(), pin(&[("app", format!("ghcr.io/x/rhaddon@sha256:{}", h('5')))], Some("addons.example.net/proxy/x")));
@@ -565,7 +662,121 @@ mod tests {
             pins_prev: Some((PathBuf::from("/r/addons.lock.prev"), b"old".to_vec(), old)),
             staged: Some((PathBuf::from("/s/staged-images.json"), b"idx".to_vec(), vec![format!("sha256:{}", h('7'))])),
             roots: vec!["ghcr.io/noomesh/".into()],
+            local: vec![],
         }
+    }
+
+    /// Captured fixtures: tests/fixtures/image-retention/README.md.
+    fn fx(name: &str) -> &'static str {
+        match name {
+            "rc1.lock" => include_str!("../../../tests/fixtures/image-retention/stack-v0.6.25-rc.1.lock"),
+            "0.6.24.lock" => include_str!("../../../tests/fixtures/image-retention/stack-v0.6.24.lock"),
+            "classic.images" => include_str!("../../../tests/fixtures/image-retention/classic-overlay2-27.5.1.images"),
+            "containerd-node.images" => include_str!("../../../tests/fixtures/image-retention/containerd-node.images"),
+            "27.images" => include_str!("../../../tests/fixtures/image-retention/docker27.images"),
+            "28.images" => include_str!("../../../tests/fixtures/image-retention/docker28.images"),
+            "29.images" => include_str!("../../../tests/fixtures/image-retention/docker29.images"),
+            "golden" => include_str!("../../../tests/fixtures/image-retention/keep-classic.golden.json"),
+            _ => panic!("no fixture {name}"),
+        }
+    }
+
+    fn real_inputs() -> KeepInputs {
+        KeepInputs {
+            stack: Some((PathBuf::from("/r/stack.lock"), fx("rc1.lock").as_bytes().to_vec())),
+            stack_prev: Some((PathBuf::from("/r/stack.lock.prev"), fx("0.6.24.lock").as_bytes().to_vec())),
+            pins: None,
+            pins_prev: None,
+            staged: None,
+            roots: vec!["ghcr.io/noomesh/".into()],
+            local: parse_local_images(fx("classic.images")),
+        }
+    }
+
+    /// The defect: the real lock's rows are short names (`gateway@sha256:…`)
+    /// that no local image is named by, so hostd's keep-by-ref matched
+    /// nothing and the previous release's images (stack.lock.prev, the
+    /// rollback set) were unprotected. From the REAL rc.1 lock, the REAL
+    /// 0.6.24 lock as .prev and a real image store: every local image that
+    /// holds a digest either lock names is kept by its image ID. The golden
+    /// file is what hostd's own test classifies (image_retention_test.go
+    /// TestTheRealKeepFileProtectsBothLocks), so the chain is tested end to
+    /// end.
+    #[test]
+    fn the_keep_file_from_the_real_locks_keeps_every_image_either_lock_names() {
+        let inp = real_inputs();
+        let v = keep_file(&inp, "2026-11-14T00:00:00Z").unwrap();
+        let golden: Value = serde_json::from_str(fx("golden")).unwrap();
+        assert_eq!(v, golden, "the keep file drifted from the golden hostd's test classifies");
+        let ids: BTreeSet<&str> = v["keep"].as_array().unwrap().iter().filter_map(|e| e["id"].as_str()).collect();
+        let mut held = 0;
+        for lock in [fx("rc1.lock"), fx("0.6.24.lock")] {
+            for r in stack_lock_refs(lock) {
+                for im in holding(&r, &inp.local) {
+                    held += 1;
+                    assert!(ids.contains(im.id.as_str()), "{r} is held by {} and not kept", im.id);
+                }
+            }
+        }
+        assert!(held >= 22, "the fixture resolves {held} rows");
+        // 0.6.24's gateway is named ONLY by the previous lock: the rollback.
+        assert!(!fx("rc1.lock").contains("e3472a087265"));
+        assert!(ids.contains("sha256:cf73b69640a184d41f1b6f6db10d45e47e957e0a1c7e29bbeb552e1c70ebd0d0"), "the previous release's gateway is not kept");
+        // A row no local image holds (a node-only image on a controller)
+        // stays under the lock's own name, inert, and says so.
+        let llama = v["keep"].as_array().unwrap().iter().find(|e| e["ref"].as_str().is_some_and(|r| r.starts_with("llamacpp@sha256:1b1c5388"))).unwrap();
+        assert!(llama["why"].as_str().unwrap().ends_with("; not on this host"), "{llama}");
+        // The Docker Hub image the lock pins is kept by ID like any other.
+        assert!(v["keep"].as_array().unwrap().iter().any(|e| e["why"].as_str().is_some_and(|w| w.ends_with("holds nats@sha256:67ac7866d010e8d83302dd30332eeae1a2b7a8ee051155e2eb5a5485b720cd4b"))));
+    }
+
+    /// One digest, every name docker holds it under: the release's
+    /// ghcr.io/noomesh/<n>, the base images' ghcr.io/noomesh/dhi/<n>, a Docker
+    /// Hub short name, a mirror prefix; classic store (27, 28) and containerd
+    /// (29, and a node's store).
+    #[test]
+    fn a_lock_row_resolves_by_digest_under_any_name() {
+        let am = "alertmanager@sha256:01dd89cce4737ec7e44704681b5d6ee561e9b7880f632b4413b0e547e4dabfda";
+        let nats = "nats@sha256:67ac7866d010e8d83302dd30332eeae1a2b7a8ee051155e2eb5a5485b720cd4b";
+        for (v, am_id, nats_id) in [
+            ("27.images", "sha256:eaf6a5a4da7b0a6000794c47f629250c98b217310d1a88f7611154ae88ac7f89", "sha256:073ccfa5190b3b463a3fcf96e85c57584707cb0e37e977effc0b13df38ad27da"),
+            ("28.images", "sha256:eaf6a5a4da7b0a6000794c47f629250c98b217310d1a88f7611154ae88ac7f89", "sha256:073ccfa5190b3b463a3fcf96e85c57584707cb0e37e977effc0b13df38ad27da"),
+            ("29.images", "sha256:01dd89cce4737ec7e44704681b5d6ee561e9b7880f632b4413b0e547e4dabfda", "sha256:67ac7866d010e8d83302dd30332eeae1a2b7a8ee051155e2eb5a5485b720cd4b"),
+        ] {
+            let local = parse_local_images(fx(v));
+            assert_eq!(local.len(), 3, "{v}");
+            assert_eq!(holding(am, &local).iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), vec![am_id], "{v}");
+            assert_eq!(holding(nats, &local).iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), vec![nats_id], "{v}");
+        }
+        let node = parse_local_images(fx("containerd-node.images"));
+        let w = "whisper@sha256:1337ee87e4113bfd426371f007e20865d9dfb3242a7cb94cb479d50f5492d3fd";
+        assert_eq!(holding(w, &node).len(), 1, "a mirror-prefixed image is held by digest");
+        assert!(holding(w, &node)[0].refs.iter().all(|r| r.starts_with("registry.example.lan/noomesh/whisper")));
+        // A name is never enough: the same name with another digest is not held.
+        assert!(holding(&format!("alertmanager@sha256:{}", h('0')), &parse_local_images(fx("27.images"))).is_empty());
+        assert!(holding("alertmanager:v1", &parse_local_images(fx("27.images"))).is_empty());
+    }
+
+    /// The format the fixtures were captured with, and the only one that
+    /// lists images on every supported Docker: `{{join .RepoTags ","}}` fails
+    /// for every image on the 27.5.1 and 28.5.2 CLIs (captured: "wrong type
+    /// for value; expected []string; got []interface {}"), and its output is
+    /// not this parser's either.
+    #[test]
+    fn the_listing_format_is_the_captured_json_one() {
+        assert_eq!(LOCAL_IMAGE_FORMAT, "{{.Id}}|{{json .RepoTags}}|{{json .RepoDigests}}");
+        let join_out = "sha256:01dd89cce4737ec7e44704681b5d6ee561e9b7880f632b4413b0e547e4dabfda|ghcr.io/noomesh/dhi/alertmanager@sha256:01dd89cce4737ec7e44704681b5d6ee561e9b7880f632b4413b0e547e4dabfda|ghcr.io/noomesh/dhi/alertmanager@sha256:01dd89cce4737ec7e44704681b5d6ee561e9b7880f632b4413b0e547e4dabfda|80869556";
+        assert!(parse_local_images(join_out).is_empty(), "the join template's output (Docker 29) must not be half-read");
+    }
+
+    #[test]
+    fn local_images_parse_null_lists_and_refuse_anything_else() {
+        let l = parse_local_images(&format!("sha256:{}|[\"ollama/ollama:latest\"]|null\nsha256:{}|[\"<none>:<none>\"]|[\"<none>@<none>\"]|9\n", h('e'), h('f')));
+        assert_eq!(l, vec![LocalImage { id: format!("sha256:{}", h('e')), refs: vec!["ollama/ollama:latest".into()] }, LocalImage { id: format!("sha256:{}", h('f')), refs: vec![] }]);
+        for junk in [format!("sha256:{}|ollama/ollama:latest|", h('e')), "garbage".into(), format!("sha256:{}|[]", h('e')), "sha256:abc|[]|[]".into()] {
+            assert!(parse_local_images(&junk).is_empty(), "{junk}");
+        }
+        assert_eq!(stack_lock_tag(fx("rc1.lock")).as_deref(), Some("v0.6.25-rc.1"), "the release's own header");
     }
 
     #[test]
@@ -620,7 +831,7 @@ mod tests {
         i.stack = None;
         assert!(keep_file(&i, "t").is_err());
         let mut i = inputs();
-        i.stack = Some((PathBuf::from("/r/stack.lock"), b"# tag v0.6.24\n".to_vec()));
+        i.stack = Some((PathBuf::from("/r/stack.lock"), b"# stack v0.6.24\n".to_vec()));
         i.stack_prev = None;
         i.pins = None;
         i.pins_prev = None;

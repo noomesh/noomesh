@@ -460,14 +460,12 @@ def audit_sink_engine(env: Optional[Mapping[str, str]] = None):
     dsn = env.get("DATABASE_URL", "")
     if not dsn:
         return None, "DATABASE_URL is not set; structlog + file sinks only"
-    from sqlalchemy.ext.asyncio import create_async_engine
-
     from ..db.engine import _async_dsn
+    from ..db.pool_budget import budgeted_async_engine
 
-    engine = create_async_engine(
+    engine = budgeted_async_engine(
+        "worker.audit",
         _async_dsn(dsn),
-        pool_size=2,
-        max_overflow=2,
         pool_pre_ping=True,
         pool_recycle=3600,
         connect_args={"options": "-csearch_path=mesh,public"},

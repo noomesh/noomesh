@@ -338,6 +338,45 @@ pub struct ClusterConfig {
     /// Defaults: env NOO_SHARD_KEY → env NODE_ID → "default".
     #[serde(default)]
     pub shard_key: Option<String>,
+    /// `cluster.monitoring: full | lean` — whether Grafana, Loki and Tempo are
+    /// part of this install (written by `noo onboard` and `noo stack
+    /// monitoring on|off`; the launcher reads the same key). Read through
+    /// [`ClusterConfig::monitoring_lean`], never directly. A non-string value
+    /// reads as unset rather than failing the whole file.
+    #[serde(default, deserialize_with = "lenient_opt_string")]
+    pub monitoring: Option<String>,
+}
+
+impl ClusterConfig {
+    /// `true` only when `cluster.monitoring` is the literal `lean` (trimmed).
+    /// UNSET IS FULL: the fleet controller is a standalone install too, and
+    /// an older noomesh.yaml has no key, so a missing, empty, mistyped or
+    /// non-string value keeps every answer exactly as it was before the key
+    /// existed. Same rule as the CLI (`stack_monitoring::level_of`) and the
+    /// launcher (`monitoring_level` in scripts/lib-config.sh).
+    ///
+    /// Lean means "NOT REQUIRED", never "never dial": an older CLI can roll
+    /// this gateway with an older compose file in which the three still run,
+    /// so every consumer keeps using Loki, Tempo or Grafana when they answer
+    /// and gives the "off by choice" answer only when they are absent.
+    pub fn monitoring_lean(&self) -> bool {
+        matches!(self.monitoring.as_deref().map(str::trim), Some("lean"))
+    }
+}
+
+/// This process's declaration: [`ClusterConfig::monitoring_lean`] of the
+/// mounted noomesh.yaml (read once at boot; `noo stack monitoring on|off`
+/// recreates the gateway).
+pub fn monitoring_lean() -> bool {
+    global().cluster.monitoring_lean()
+}
+
+/// The one-line fix every "off by choice" answer names.
+pub const MONITORING_ON_HINT: &str = "noo stack monitoring on";
+
+fn lenient_opt_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let v: Option<serde_yaml::Value> = Option::deserialize(d)?;
+    Ok(v.and_then(|v| v.as_str().map(str::to_string)))
 }
 
 fn default_backend() -> String { "vllm".into() }
@@ -629,6 +668,42 @@ pub fn backend_port(backend_type: &str) -> Option<u16> {
         "ollama" => Some(11434),
         "llamacpp" => Some(8085),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod monitoring_level_tests {
+    use super::*;
+
+    fn cluster(yaml: &str) -> ClusterConfig {
+        let cfg: AppConfig = serde_yaml::from_str(yaml).expect("parses");
+        cfg.cluster
+    }
+
+    /// THE RULE: unset = full. A noomesh.yaml with no `cluster.monitoring`
+    /// (every install before the key, and the fleet controller) is never
+    /// lean, so a dead Loki keeps today's errors exactly.
+    #[test]
+    fn unset_is_full_and_only_the_literal_lean_is_lean() {
+        assert!(!cluster("{}").monitoring_lean(), "no cluster block = full");
+        assert!(!cluster("cluster: {}").monitoring_lean(), "no key = full");
+        assert!(!cluster("cluster:\n  monitoring: full\n").monitoring_lean());
+        assert!(!cluster("cluster:\n  monitoring: \"\"\n").monitoring_lean(), "empty = full");
+        assert!(!cluster("cluster:\n  monitoring: Lean\n").monitoring_lean(), "a typo keeps everything");
+        assert!(!cluster("cluster:\n  monitoring: leen\n").monitoring_lean());
+        assert!(!ClusterConfig::default().monitoring_lean(), "the compiled default is full");
+        assert!(cluster("cluster:\n  monitoring: lean\n").monitoring_lean());
+        assert!(cluster("cluster:\n  monitoring: \" lean \"\n").monitoring_lean(), "trimmed, like the CLI");
+    }
+
+    /// The key used to be unknown and ignored; a value of the wrong type must
+    /// not now fail the whole file (an unparseable noomesh.yaml stops the gateway).
+    #[test]
+    fn a_non_string_value_reads_as_unset_not_as_a_parse_error() {
+        assert!(!cluster("cluster:\n  monitoring: true\n").monitoring_lean());
+        assert!(!cluster("cluster:\n  monitoring: 3\n").monitoring_lean());
+        assert!(!cluster("cluster:\n  monitoring: [lean]\n").monitoring_lean());
+        assert!(!cluster("cluster:\n  monitoring:\n").monitoring_lean(), "null = unset");
     }
 }
 

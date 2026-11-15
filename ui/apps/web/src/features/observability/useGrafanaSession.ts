@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026 PersonifAI LLC
 
-import { useMutation, useMetisClient } from '@metis/core';
+import { useMutation, useMetisClient, useQuery } from '@metis/core';
 
 /** What the gateway minted: where to send the tab, and for how long. */
 export interface GrafanaSession {
@@ -14,8 +14,10 @@ export interface GrafanaSession {
 
 /** The gateway's own words on failure: `{"error": "…"}`. Its 503 says
  * exactly what to fix (GRAFANA_ROOT_URL unset, the SSO key missing or
- * unreadable) and its 403 says why this login may not open Grafana, which a
- * generic "could not open" throws away. */
+ * unreadable), its 403 says why this login may not open Grafana, and its 409
+ * says dashboards are off on this install by choice and names
+ * `noo stack monitoring on` — all of which a generic "could not open" throws
+ * away. */
 function gatewayMessage(error: unknown): string | undefined {
   if (error && typeof error === 'object') {
     const e = error as { error?: unknown; detail?: unknown };
@@ -60,5 +62,42 @@ export function useGrafanaSession() {
       }
       return { url: data.url, expiresAt: data.expires_at, role: data.role };
     },
+  });
+}
+
+/** `GET /api/monitoring/status`: which optional monitoring parts run. */
+export interface MonitoringStatus {
+  monitoring: 'full' | 'lean';
+  grafana: boolean;
+  log_search: boolean;
+  traces: boolean;
+  /** Present only when something is off; names `noo stack monitoring on`. */
+  message?: string;
+}
+
+/**
+ * The line shown INSTEAD of "Open Grafana" when dashboards are off by choice
+ * (`cluster.monitoring: lean` and no Grafana running), else `null`. Only an
+ * explicit `grafana: false` hides the button: no answer yet, an error, or an
+ * older gateway without the route all keep the button, which is what the
+ * console did before the declaration existed.
+ */
+export function grafanaOffLine(status: MonitoringStatus | undefined | null): string | null {
+  if (!status || status.grafana !== false) return null;
+  return 'Dashboards are off on this install: noo stack monitoring on';
+}
+
+/** Ask once a minute; a failure (an older gateway, a 403) is "unknown". */
+export function useMonitoringStatus() {
+  const client = useMetisClient();
+  return useQuery<MonitoringStatus | null>({
+    queryKey: ['monitoring-status'],
+    queryFn: async () => {
+      const { data, error } = await client.GET('/api/monitoring/status', {});
+      if (error || !data) return null;
+      return data as MonitoringStatus;
+    },
+    staleTime: 60_000,
+    retry: false,
   });
 }

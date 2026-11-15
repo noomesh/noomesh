@@ -32,7 +32,9 @@
 //! Native additions over the Python surface (agent-first contract):
 //!   - `--message TEXT` — one-shot mode: send one message, stream the reply,
 //!     exit. Works without a TTY and is the only mode `--json` supports
-//!     (envelope: {"response","backend","conversation_id"}).
+//!     (envelope: {"response","backend","conversation_id"}, plus
+//!     "truncated": {"evaluated","sent_estimate"} when the backend cut the
+//!     prompt, i802).
 //!   - non-TTY stdin without `--message` errors (exit 2) instead of hanging.
 //!   - the whole REPL session shares one `conversation_id` (the Python
 //!     cluster path sent none, so every turn forgot the last).
@@ -109,6 +111,54 @@ struct StreamEvent {
     /// A line for the person, not part of the answer (a tool starting, an
     /// approval verdict).
     note: Option<String>,
+    /// What served the turn, as far as this event says: (backend, model,
+    /// node). Each part only when the event carries it.
+    served: Option<Served>,
+    /// The done frame's `truncation` (i802): the backend cut the prompt.
+    /// (evaluated, sent_estimate): it read M of about N tokens.
+    truncated: Option<(u64, u64)>,
+}
+
+/// What served a turn, gathered across its events: the opening `metadata`
+/// names the backend and model, each `phase: routed` names the node (and the
+/// backend and model of that call). A later event updates only the parts it
+/// carries, so a tool round's frames never blank what is known.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Served {
+    backend: Option<String>,
+    model: Option<String>,
+    node: Option<String>,
+}
+
+impl Served {
+    fn merge(&mut self, other: &Served) {
+        for (mine, theirs) in [(&mut self.backend, &other.backend), (&mut self.model, &other.model), (&mut self.node, &other.node)] {
+            if theirs.is_some() {
+                *mine = theirs.clone();
+            }
+        }
+    }
+
+    /// `ollama · qwen2.5:0.5b on awolf`, with any unknown part left out
+    /// rather than printed as `?`; `None` when nothing is known.
+    fn line(&self) -> Option<String> {
+        let what = match (&self.backend, &self.model) {
+            (Some(b), Some(m)) => Some(format!("{b} · {m}")),
+            (Some(x), None) | (None, Some(x)) => Some(x.clone()),
+            (None, None) => None,
+        };
+        match (what, &self.node) {
+            (Some(w), Some(n)) => Some(format!("{w} on {n}")),
+            (Some(w), None) => Some(w),
+            (None, Some(n)) => Some(format!("on {n}")),
+            (None, None) => None,
+        }
+    }
+}
+
+fn served_from(v: &serde_json::Value, node_key: &str) -> Served {
+    let s = |k: &str| v[k].as_str().filter(|x| !x.is_empty()).map(str::to_string);
+    Served { backend: s("backend"), model: s("model"), node: s(node_key) }
 }
 
 /// Map one JSON chunk (any of the framings listed in the module doc) to a
@@ -119,17 +169,18 @@ fn extract_event(v: &serde_json::Value) -> StreamEvent {
     if let Some(t) = v["type"].as_str() {
         match t {
             "content" => ev.token = v["text"].as_str().map(str::to_string),
-            "metadata" => {
-                ev.meta = Some(format!(
-                    "{} on {}",
-                    v["backend"].as_str().unwrap_or("?"),
-                    v["node_id"].as_str().unwrap_or("?")
-                ))
-            }
+            "metadata" => ev.served = Some(served_from(v, "node_id")),
+            "phase" if v["phase"] == "routed" => ev.served = Some(served_from(v, "node")),
             "error" => {
                 ev.error = Some(v["message"].as_str().or(v["text"].as_str()).unwrap_or("unknown error").to_string())
             }
-            "done" => ev.done = true,
+            "done" => {
+                ev.done = true;
+                if v["truncated"].as_bool() == Some(true) {
+                    let t = &v["truncation"];
+                    ev.truncated = t["evaluated"].as_u64().zip(t["sent_estimate"].as_u64());
+                }
+            }
             "approval_request" => {
                 ev.approval = Some((
                     v["request_id"].as_str().unwrap_or("?").to_string(),
@@ -175,8 +226,13 @@ fn extract_event(v: &serde_json::Value) -> StreamEvent {
     ev
 }
 
+/// What one turn returned: the full response text, the optional backend
+/// hint, and the backend's cut of the prompt when the gateway reported one
+/// (evaluated, sent_estimate; i802).
+type TurnOutput = (String, Option<String>, Option<(u64, u64)>);
+
 /// Run one chat turn: POST the prompt, stream tokens through `on_token`, and
-/// return (full response text, optional backend hint). `Err` is a
+/// return [`TurnOutput`]. `Err` is a
 /// per-turn failure — the REPL prints it and continues (Python parity),
 /// one-shot mode exits on it.
 fn stream_turn(
@@ -185,7 +241,7 @@ fn stream_turn(
     model: &Option<String>,
     conversation_id: &str,
     mut on_token: impl FnMut(&str),
-) -> Result<(String, Option<String>), String> {
+) -> Result<TurnOutput, String> {
     let body = turn_body(prompt, model, conversation_id);
     let mut resp = post_json_stream_try(g, CHAT_PATH, &body, true, TURN_TIMEOUT_SECS)?;
 
@@ -216,10 +272,12 @@ fn stream_turn(
     };
 
     let mut full = String::new();
+    let mut truncated: Option<(u64, u64)> = None;
     // An approval this CLI cannot answer is waited on, bounded: the gateway
     // sends a keepalive every 30 s, so the bound is checked at least that
     // often. Returning drops the connection, which ends the turn there.
     let mut waiting: Option<(String, String, u64, std::time::Instant)> = None;
+    let mut served = Served::default();
     let reader = std::io::BufReader::new(resp.body_mut().as_reader());
     for line in reader.lines() {
         let line = line.map_err(|e| format!("stream interrupted: {e}"))?;
@@ -246,6 +304,12 @@ fn stream_turn(
         if let Some(m) = ev.meta {
             meta = Some(m);
         }
+        if let Some(sv) = &ev.served {
+            served.merge(sv);
+            if let Some(line) = served.line() {
+                meta = Some(line);
+            }
+        }
         if let Some((id, tool, window)) = ev.approval {
             eprintln!("{}", ui::warn(&approval_notice(&id, &tool, window)));
             waiting = Some((id, tool, window, std::time::Instant::now()));
@@ -260,11 +324,23 @@ fn stream_turn(
             on_token(&t);
             full.push_str(&t);
         }
+        if ev.truncated.is_some() {
+            truncated = ev.truncated;
+        }
         if ev.done {
             break;
         }
     }
-    Ok((full, meta))
+    Ok((full, meta, truncated))
+}
+
+/// The one line printed after a turn whose prompt the backend cut (i802):
+/// the answer above was made without most of its instructions.
+fn truncated_line(evaluated: u64, sent_estimate: u64) -> String {
+    format!(
+        "the model read only {evaluated} of about {sent_estimate} prompt tokens: its backend cut the prompt, \
+         so this answer was made without most of its instructions"
+    )
 }
 
 /// What the person sees when the turn needs an approval: where to give it,
@@ -351,18 +427,22 @@ pub fn chat(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             }
         });
         match result {
-            Ok((full, meta)) => {
+            Ok((full, meta, truncated)) => {
                 if g.json {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "response": full,
-                            "backend": meta,
-                            "conversation_id": conversation_id,
-                        })
-                    );
+                    let mut out = serde_json::json!({
+                        "response": full,
+                        "backend": meta,
+                        "conversation_id": conversation_id,
+                    });
+                    if let Some((evaluated, sent_estimate)) = truncated {
+                        out["truncated"] = serde_json::json!({"evaluated": evaluated, "sent_estimate": sent_estimate});
+                    }
+                    println!("{out}");
                 } else {
                     println!();
+                    if let Some((evaluated, sent_estimate)) = truncated {
+                        eprintln!("{}", ui::warn(&truncated_line(evaluated, sent_estimate)));
+                    }
                     if let Some(m) = meta {
                         eprintln!("{}", ui::muted(&format!("[{m}]")));
                     }
@@ -402,8 +482,11 @@ pub fn chat(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             print!("{t}");
             let _ = std::io::stdout().flush();
         }) {
-            Ok((_, meta)) => {
+            Ok((_, meta, truncated)) => {
                 println!();
+                if let Some((evaluated, sent_estimate)) = truncated {
+                    eprintln!("{}", ui::warn(&truncated_line(evaluated, sent_estimate)));
+                }
                 if let Some(m) = meta {
                     eprintln!("{}", ui::muted(&format!("[{m}]")));
                     eprintln!();
@@ -487,6 +570,22 @@ mod tests {
         assert_ne!(CHAT_PATH, "/api/inference/stream", "the raw proxy retrieves nothing");
     }
 
+    /// i802: the done frame says the backend cut the prompt; the turn ends
+    /// with one warn line naming how much of it the model read.
+    #[test]
+    fn a_cut_prompt_on_the_done_frame_is_read_and_said() {
+        let e = ev(r#"{"type":"done","tokens_in":2051,"truncated":true,"truncation":{"sent_estimate":8800,"evaluated":2051,"context":4096}}"#);
+        assert!(e.done);
+        assert_eq!(e.truncated, Some((2051, 8800)));
+        assert_eq!(ev(r#"{"type":"done","tokens_in":900}"#).truncated, None, "no flag, nothing said");
+        assert_eq!(ev(r#"{"type":"done","truncated":false,"truncation":{"sent_estimate":1,"evaluated":1}}"#).truncated, None);
+        let line = truncated_line(2051, 8800);
+        assert_eq!(
+            line,
+            "the model read only 2051 of about 8800 prompt tokens: its backend cut the prompt, so this answer was made without most of its instructions"
+        );
+    }
+
     #[test]
     fn an_approval_is_announced_with_where_to_approve_and_the_wait_is_bounded() {
         let e = ev(r#"{"type":"approval_request","request_id":"r9","tool":"shell_exec","window_secs":120}"#);
@@ -537,12 +636,38 @@ mod tests {
         assert!(e.done && e.token.is_none());
     }
 
+    /// The footer names what served the turn from the coordinator's own
+    /// frames: the opening metadata (backend, model), the routed phase
+    /// (node), and never "?" for a part no frame named.
+    #[test]
+    fn the_footer_is_what_served_the_turn_and_never_a_question_mark() {
+        let mut acc = Served::default();
+        for raw in [
+            r#"{"type":"metadata","conversation_id":"c","model":"qwen2.5:0.5b","backend":"ollama","engine":"rust"}"#,
+            r#"{"type":"phase","phase":"routed","node":"awolf","backend":"ollama","model":"qwen2.5:0.5b","attempt":1}"#,
+            // A tool round's frames name no backend: they must not blank it.
+            r#"{"type":"metadata","deadline_stop":true,"iteration":2}"#,
+            r#"{"type":"tool_call","name":"noo_rag_query"}"#,
+        ] {
+            if let Some(sv) = ev(raw).served {
+                acc.merge(&sv);
+            }
+        }
+        assert_eq!(acc.line().as_deref(), Some("ollama · qwen2.5:0.5b on awolf"));
+        // Before any routed phase: no node, and no "on ?".
+        let only = served_from(&serde_json::json!({"backend": "ollama", "model": "m"}), "node_id");
+        assert_eq!(only.line().as_deref(), Some("ollama · m"));
+        assert_eq!(Served::default().line(), None);
+        // A non-routed phase says nothing about what served.
+        assert!(ev(r#"{"type":"phase","phase":"queued"}"#).served.is_none());
+    }
+
     #[test]
     fn extracts_legacy_python_events() {
         let e = ev(r#"{"type":"content","text":"T"}"#);
         assert_eq!(e.token.as_deref(), Some("T"));
         let e = ev(r#"{"type":"metadata","backend":"ollama","node_id":"n1"}"#);
-        assert_eq!(e.meta.as_deref(), Some("ollama on n1"));
+        assert_eq!(e.served.and_then(|s| s.line()).as_deref(), Some("ollama on n1"));
         let e = ev(r#"{"type":"error","message":"boom"}"#);
         assert_eq!(e.error.as_deref(), Some("boom"));
         assert!(ev(r#"{"type":"done"}"#).done);

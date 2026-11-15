@@ -150,6 +150,9 @@ async fn logs_status(State(state): State<Arc<AppState>>) -> AppJson {
     let configured = !loki_url.is_empty();
 
     let mut healthy = false;
+    // Nothing at the address (connect / resolve failure): with a lean
+    // declaration that is "off by choice", not a fault.
+    let mut absent = false;
     // WHY /ready did not answer 2xx — Loki's own body ("Ingester not ready:
     // …"), a status, or the transport error. Until 2026-10-02 this was
     // folded into `false`: host8's verify FAILed the row once, the probe and
@@ -172,6 +175,7 @@ async fn logs_status(State(state): State<Arc<AppState>>) -> AppJson {
                 detail = Some(loki_ready_detail(Some(status), &body));
             }
             Err(e) => {
+                absent = e.is_connect() && !e.is_timeout();
                 // The chain, not the top line: reqwest's own Display is
                 // "error sending request" for a TLS refusal and a timeout alike.
                 let mut chain = e.to_string();
@@ -185,21 +189,43 @@ async fn logs_status(State(state): State<Arc<AppState>>) -> AppJson {
             }
         }
         if let Some(d) = &detail {
-            tracing::warn!(url = %loki_url, "loki /ready did not answer 2xx: {d}");
+            if absent && crate::config::monitoring_lean() {
+                tracing::debug!(url = %loki_url, "loki absent, log search is off by choice: {d}");
+            } else {
+                tracing::warn!(url = %loki_url, "loki /ready did not answer 2xx: {d}");
+            }
         }
     }
 
     // The registry lives in the `mesh_nodes` KV bucket; ask for the bucket.
     let node_registry_available = state.js.get_key_value("mesh_nodes").await.is_ok();
 
-    Json(json!({
+    let mut out = json!({
         "loki_url": loki_url,
         "loki_configured": configured,
         "loki_healthy": healthy,
         "loki_ready": healthy,
         "loki_ready_detail": detail,
         "node_registry_available": node_registry_available,
-    }))
+    });
+    let lean = crate::config::monitoring_lean();
+    let loki_off = loki_off_by_choice(lean, configured, absent);
+    if let Some(o) = out.as_object_mut() {
+        o.insert("monitoring".into(), json!(if lean { "lean" } else { "full" }));
+        o.insert("loki_off".into(), json!(loki_off));
+        if loki_off {
+            o.insert("message".into(), json!(logs_search::LOG_SEARCH_OFF));
+        }
+    }
+    Json(out)
+}
+
+/// Log search is off BY CHOICE: this install declared `cluster.monitoring:
+/// lean` and no Loki is there (no URL, or nothing at its address). A Loki
+/// that answers, or one that is there and failing, is never "off"; with the
+/// key unset or `full` nothing is.
+pub(crate) fn loki_off_by_choice(lean: bool, configured: bool, absent: bool) -> bool {
+    lean && (!configured || absent)
 }
 
 /// Request-trace status (i359): where the gateway sends spans, and whether
@@ -272,10 +298,26 @@ struct LogQueryParams {
     direction: Option<String>,
 }
 
+/// The `/api/logs/query` answer when log search is off by choice: 200, a
+/// Loki-shaped empty result (a reader of `data.result` sees no streams) and
+/// the line naming the command, never 503 "Loki not configured".
+pub(crate) fn logs_query_off_answer() -> Value {
+    json!({
+        "status": "success",
+        "backend": "off",
+        "message": logs_search::LOG_SEARCH_OFF,
+        "data": {"resultType": "streams", "result": []},
+    })
+}
+
 /// Proxy log queries to Loki.
 async fn logs_query(Query(params): Query<LogQueryParams>) -> impl IntoResponse {
     let loki_url = crate::config::env_or_yaml("NOO_LOKI_URL", |c| c.services.loki_url.clone(), "");
+    let lean = crate::config::monitoring_lean();
     if loki_url.is_empty() {
+        if lean {
+            return (StatusCode::OK, Json(logs_query_off_answer())).into_response();
+        }
         return (StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "Loki not configured"}))).into_response();
     }
@@ -297,6 +339,7 @@ async fn logs_query(Query(params): Query<LogQueryParams>) -> impl IntoResponse {
             Ok((code, body)) => (StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY), body).into_response(),
             Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
         },
+        Err(e) if lean && e.is_connect() && !e.is_timeout() => (StatusCode::OK, Json(logs_query_off_answer())).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY,
             Json(json!({"error": format!("Loki unreachable: {e}")}))).into_response(),
     }
@@ -3536,22 +3579,15 @@ async fn logs_errors(
 /// goes through unchanged — under the same limit cap (2000) and range cap
 /// (7 days). Loki down or unconfigured is 503 with the reason: there is no
 /// scan fallback here, because a scan cannot answer a fleet query honestly.
+/// On an install that declared `cluster.monitoring: lean` an ABSENT Loki is
+/// not a fault: 200 `{"lines":[],"backend":"off","message":…}` naming
+/// `noo stack monitoring on` (`logs_search::search_answer`).
 async fn logs_search(body: Option<Json<Value>>) -> AppResult {
     let body = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
     let spec = search_spec_from_body(&body);
     let built = logs_search::build(&spec, chrono::Utc::now()).map_err(AppError::BadRequest)?;
-    match logs_search::query_configured_loki(&built).await {
-        logs_search::LokiOutcome::Lines(got) => {
-            let answer = json!({
-                "lines": got.iter().map(logs_search::Line::to_json).collect::<Vec<_>>(),
-            });
-            Ok(Json(logs_search::merge(answer, logs_search::loki_envelope(&built, &got))))
-        }
-        logs_search::LokiOutcome::Refused(reason) => Err(AppError::BadRequest(reason)),
-        logs_search::LokiOutcome::Down(reason) => Err(AppError::Unavailable(format!(
-            "log search needs Loki and it did not answer: {reason}"
-        ))),
-    }
+    let outcome = logs_search::query_configured_loki(&built).await;
+    logs_search::search_answer(outcome, &built).map(Json)
 }
 
 /// The search body → spec. `query` is LogQL when it starts with `{`,
@@ -5527,5 +5563,51 @@ mod node_list_tests {
         assert_eq!(why(1), "node c answered HTTP 500");
         assert!(why(2).starts_with("node d answered something that is not a list"), "{}", why(2));
         assert_eq!(unreachable[1]["node_hostname"], "c.lan");
+    }
+}
+
+#[cfg(test)]
+mod monitoring_off_tests {
+    use super::*;
+
+    /// Off by choice needs BOTH the lean declaration and an absent Loki.
+    #[test]
+    fn loki_is_off_only_when_lean_and_absent() {
+        // (lean, configured, absent) -> off
+        for (lean, configured, absent, off) in [
+            (true, false, false, true),   // lean, no URL
+            (true, true, true, true),     // lean, nothing at the address
+            (true, true, false, false),   // lean, Loki there (older compose): used, not "off"
+            (false, false, false, false), // full/unset, no URL: today's "not configured"
+            (false, true, true, false),   // full/unset, dead: today's fault
+        ] {
+            assert_eq!(loki_off_by_choice(lean, configured, absent), off, "{lean} {configured} {absent}");
+        }
+    }
+
+    #[test]
+    fn the_legacy_query_route_answers_off_with_the_line_not_a_503() {
+        let a = logs_query_off_answer();
+        assert_eq!(a["message"], "Log search is off on this install. Turn it on: noo stack monitoring on");
+        assert_eq!(a["status"], "success");
+        assert_eq!(a["data"]["result"], json!([]));
+        // Full/unset keeps "Loki not configured" (503): the off answer is
+        // reached only through `lean`.
+        let src = include_str!("admin.rs");
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "async fn logs_query(");
+        assert!(body.contains("if lean \u{7b}\n            return (StatusCode::OK, Json(logs_query_off_answer()))"), "{body}");
+        assert!(body.contains("Json(json!({\"error\": \"Loki not configured\"}))"), "{body}");
+    }
+
+    /// The search handler answers through the pinned pure function, so the
+    /// off answer and the unchanged 503 cannot drift apart from the route.
+    #[test]
+    fn the_search_route_answers_through_search_answer() {
+        let src = include_str!("admin.rs");
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "async fn logs_search(");
+        assert!(body.contains("logs_search::search_answer(outcome, &built)"), "{body}");
+        assert!(body.contains("logs_search::query_configured_loki(&built)"), "{body}");
     }
 }

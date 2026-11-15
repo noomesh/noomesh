@@ -103,6 +103,7 @@ pub mod security_local;
 pub mod security_scan_node;
 pub mod skills;
 pub mod stack_db_compat;
+pub mod stack_monitoring;
 pub mod systems;
 pub mod test;
 pub mod tools;
@@ -272,6 +273,7 @@ pub use workflow::{workflow_list, workflow_run};
 pub use cluster::cluster_seed;
 pub use controller::{controller_demote, controller_promote};
 pub use mesh::{mesh_install_watcher, mesh_ollama, mesh_reset, mesh_sandbox, mesh_sync_assets};
+pub use stack_monitoring::{stack_monitoring_off, stack_monitoring_on, stack_monitoring_status};
 pub use models::models_switch;
 // ── WP-PL: plugins (distinct block to avoid registry-edit collisions).
 pub use plugins::plugins_list;

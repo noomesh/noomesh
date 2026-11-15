@@ -888,6 +888,9 @@ async fn do_classify(
         .map_err(|e| ExtFail::from_resolve(&e))?;
     let client = crate::tls::cluster_client();
     let url = format!("{}/v1/chat/completions", backend.url.trim_end_matches('/'));
+    // The decided context (i802), so a classify never reloads an Ollama's
+    // chat model at another one. `None` for every other engine.
+    let num_ctx = crate::chat_context::num_ctx_for(state, &backend.backend_type, &backend.url, &backend.model).await;
 
     // Up to CLASSIFY_PARALLEL texts at once, results kept in input order
     // (they ran one after another: N texts cost N round trips end to end).
@@ -896,7 +899,7 @@ async fn do_classify(
     // The futures are built first and the stream holds them, not a closure:
     // a closure over `&String` in the stream makes the handler future fail
     // axum's `Send` bound ("FnOnce is not general enough").
-    let calls: Vec<_> = texts.iter().map(|text| classify_one(&client, &url, &backend, text, &labels, multi)).collect();
+    let calls: Vec<_> = texts.iter().map(|text| classify_one(&client, &url, &backend, text, &labels, multi, num_ctx)).collect();
     let chosen_all: Vec<Result<Vec<Value>, ExtFail>> =
         futures::stream::iter(calls).buffered(CLASSIFY_PARALLEL).collect().await;
     let mut results = Vec::with_capacity(texts.len());
@@ -949,6 +952,7 @@ async fn classify_one(
     text: &str,
     labels: &[String],
     multi: bool,
+    num_ctx: Option<u64>,
 ) -> Result<Vec<Value>, ExtFail> {
     let label_list = labels.join(", ");
     let instruction = if multi {
@@ -962,7 +966,10 @@ async fn classify_one(
              Respond ONLY with compact JSON of the form {{\"label\": \"...\"}} using a label from the set."
         )
     };
-    let body = classify_body(backend, &instruction, text);
+    let mut body = classify_body(backend, &instruction, text);
+    if crate::chat_context::takes_num_ctx(&backend.backend_type) {
+        crate::chat_context::stamp_opt(&mut body, num_ctx);
+    }
 
     for attempt in 0..2 {
         let mut span =
@@ -1479,9 +1486,23 @@ mod classify_speed_tests {
         let code = crate::test_src::own_code(include_str!("external.rs"));
         let f = crate::test_src::fn_body(&code, "async fn do_classify(");
         assert!(f.contains(".buffered(CLASSIFY_PARALLEL)") && !f.contains("buffer_unordered"), "{f}");
-        assert!(!f.contains("classify_one(&client, &url, &backend, text, &labels, multi).await"), "no sequential await: {f}");
+        assert!(!f.contains("classify_one(&client, &url, &backend, text, &labels, multi, num_ctx).await"), "no sequential await: {f}");
+        assert!(f.contains("classify_one(&client, &url, &backend, text, &labels, multi, num_ctx)"), "the call this guard reads: {f}");
         const { assert!(super::CLASSIFY_PARALLEL > 1 && super::CLASSIFY_PARALLEL <= 8, "bounded") };
         let one = crate::test_src::fn_body(&code, "async fn classify_one(");
         assert!(one.contains("classify_body(backend, &instruction, text)"), "{one}");
+    }
+
+    /// i802: a classify on an Ollama carries the decided context (resolved
+    /// once per request), stamped on the body before it is sent.
+    #[test]
+    fn a_classify_carries_the_decided_context() {
+        let code = crate::test_src::own_code(include_str!("external.rs"));
+        let f = crate::test_src::fn_body(&code, "async fn do_classify(");
+        assert!(f.contains("crate::chat_context::num_ctx_for(state, &backend.backend_type, &backend.url, &backend.model).await"), "{f}");
+        let one = crate::test_src::fn_body(&code, "async fn classify_one(");
+        let stamp = one.find("crate::chat_context::stamp_opt(&mut body, num_ctx);").expect("stamps");
+        let send = one.find(".json(&body)").expect("sends");
+        assert!(stamp < send, "{one}");
     }
 }

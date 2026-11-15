@@ -272,6 +272,16 @@ HOMES = {
     "packages/noo-gateway-client/pyproject.toml": "package metadata URLs",
     "tests/fixtures/redaction_corpus.json": "redaction fixture: the strings are INPUT to a redactor",
     "ui/mock/fixtures/POST/api/security/bootstrap-tokens.json": "mock API response data",
+    "tests/fixtures/image-retention/classic-gateway.containers": "captured docker output (README there): INPUT to the retention parsers, never a pull source",
+    "tests/fixtures/image-retention/classic-overlay2-27.5.1.images": "captured docker output (README there): INPUT to the retention parsers, never a pull source",
+    "tests/fixtures/image-retention/containerd-node.images": "captured docker output (README there): INPUT to the retention parsers, never a pull source",
+    "tests/fixtures/image-retention/docker27.containers": "captured docker output (README there): INPUT to the retention parsers, never a pull source",
+    "tests/fixtures/image-retention/docker27.images": "captured docker output (README there): INPUT to the retention parsers, never a pull source",
+    "tests/fixtures/image-retention/docker28.containers": "captured docker output (README there): INPUT to the retention parsers, never a pull source",
+    "tests/fixtures/image-retention/docker28.images": "captured docker output (README there): INPUT to the retention parsers, never a pull source",
+    "tests/fixtures/image-retention/docker29.containers": "captured docker output (README there): INPUT to the retention parsers, never a pull source",
+    "tests/fixtures/image-retention/docker29.images": "captured docker output (README there): INPUT to the retention parsers, never a pull source",
+    "tests/fixtures/image-retention/keep-classic.golden.json": "captured docker output (README there): INPUT to the retention parsers, never a pull source",
 }
 # Prefixes: tests assert on literals by design; docs prose flips at the move.
 HOME_PREFIXES = ("tests/test_", "docs/", "ui/docs/", "internal/", ".worktrees/", "legacy/")

@@ -269,6 +269,11 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["stack", "stop"], commands::mesh_stop),
     (&["stack", "rebuild"], commands::mesh_rebuild),
     (&["stack", "rebuild-status"], commands::mesh_rebuild_status),
+    // Grafana, Loki and Tempo on or off: `cluster.monitoring` in noomesh.yaml,
+    // unset = full (commands/stack_monitoring.rs).
+    (&["stack", "monitoring", "status"], commands::stack_monitoring_status),
+    (&["stack", "monitoring", "on"], commands::stack_monitoring_on),
+    (&["stack", "monitoring", "off"], commands::stack_monitoring_off),
     // Destructive commands with the agent-first confirm contract:
     // --yes skips, --json requires --yes, non-TTY stdin errors (no hang).
     (&["stack", "clean"], commands::mesh_clean),

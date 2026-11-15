@@ -118,6 +118,8 @@ run of this example.
    call prints the add-on's JSON answer. If it fails, curl says why and exits
    non-zero: `curl: (77)` means the CA path is wrong, and an HTTP error prints
    the gateway's body.
+   Right after `noo stack restart --force`, a `503` with `"cannot verify the
+   caller: …"` means the database is still coming up: retry in a few seconds.
 
    `"exchanged": false` with a `status` means the add-on reached the exchange
    and was refused (`401`: its key was revoked or the add-on disabled). A

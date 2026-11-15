@@ -37,18 +37,108 @@
 use crate::audit::{AuditEvent, AuditKind};
 use std::sync::Arc;
 
-use axum::{extract::State, routing::post, Extension, Json, Router};
+use axum::{
+    extract::State,
+    routing::{get, post},
+    Extension, Json, Router,
+};
 use serde_json::{json, Value};
 
 use crate::auth::{Role, RequesterCtx};
 use crate::state::AppState;
 
-use super::{AppError, AppResult};
+use super::{AppError, AppJson, AppResult};
 
 pub fn router() -> Router<Arc<AppState>> {
     // A literal path: the OpenAPI generator and the drift checker read
     // route strings (see identity.rs for the same rule).
-    Router::new().route("/api/monitoring/grafana-session", post(grafana_session))
+    Router::new()
+        .route("/api/monitoring/grafana-session", post(grafana_session))
+        .route("/api/monitoring/status", get(monitoring_status))
+}
+
+// ── Off by choice (`cluster.monitoring: lean`) ───────────────────────────
+
+/// What "Open Grafana" answers (409) when dashboards are off by choice.
+pub const DASHBOARDS_OFF: &str = "Dashboards are off on this install: noo stack monitoring on";
+
+/// Is anything at `url`? `false` only for "nothing there": no URL, or a
+/// connect / resolve failure. Any HTTP answer, a TLS refusal or a timeout
+/// is "something is there" — a service that is there and failing is a
+/// fault to report, never "off by choice". Bounded at 2 s.
+pub async fn present_at(client: &reqwest::Client, url: &str) -> bool {
+    let url = url.trim();
+    if url.is_empty() {
+        return false;
+    }
+    match client.get(url).timeout(std::time::Duration::from_secs(2)).send().await {
+        Ok(_) => true,
+        Err(e) => !(e.is_connect() && !e.is_timeout()),
+    }
+}
+
+/// The `GET /api/monitoring/status` body. Each part is `true` (on, or
+/// answering) unless this install declared `lean` AND the part is absent:
+/// with the key unset or `full` everything reads on, exactly as the
+/// console behaved before the key existed. `message` is present only when
+/// something is off, and names the one command that turns it all on.
+pub fn status_answer(lean: bool, grafana: bool, loki: bool, tempo: bool) -> Value {
+    let on = |present: bool| !lean || present;
+    let (g, l, t) = (on(grafana), on(loki), on(tempo));
+    let mut off: Vec<&str> = Vec::new();
+    if !g {
+        off.push("dashboards");
+    }
+    if !l {
+        off.push("log search");
+    }
+    if !t {
+        off.push("traces");
+    }
+    let mut v = json!({
+        "monitoring": if lean { "lean" } else { "full" },
+        "grafana": g,
+        "log_search": l,
+        "traces": t,
+    });
+    if !off.is_empty() {
+        let list = match off.len() {
+            1 => off[0].to_string(),
+            2 => format!("{} and {}", off[0], off[1]),
+            _ => format!("{}, {} and {}", off[0], off[1], off[2]),
+        };
+        let mut chars = list.chars();
+        let first = chars.next().map(|c| c.to_uppercase().collect::<String>()).unwrap_or_default();
+        // "Dashboards are", "Log search is", "Traces are", several: "are".
+        let verb = if off == ["log search"] { "is" } else { "are" };
+        v["message"] = json!(format!("{first}{} {verb} off on this install: {}", chars.as_str(), crate::config::MONITORING_ON_HINT));
+    }
+    v
+}
+
+/// `GET /api/monitoring/status` — `{monitoring, grafana, log_search, traces,
+/// message?}`: which optional monitoring parts (Grafana, Loki, Tempo) this
+/// install runs, for the console's "Open Grafana" and the logs views.
+/// Cheap: with the key unset or `full` it answers from the declaration
+/// alone, with no probe; on a lean install it asks the three addresses at
+/// once (2 s bound each), because an older compose may still run them.
+async fn monitoring_status() -> AppJson {
+    let lean = crate::config::monitoring_lean();
+    if !lean {
+        return Json(status_answer(false, true, true, true));
+    }
+    let client = crate::tls::cluster_client();
+    let loki = super::logs_search::configured_loki_url();
+    let loki = if loki.trim().is_empty() { String::new() } else { format!("{}/ready", loki.trim().trim_end_matches('/')) };
+    let tempo = std::env::var(super::admin::TEMPO_QUERY_URL_ENV).unwrap_or_default();
+    let tempo = if tempo.trim().is_empty() { String::new() } else { format!("{}/ready", tempo.trim().trim_end_matches('/')) };
+    let grafana = format!("{GRAFANA_INTERNAL_URL}/api/health");
+    let (g, l, t) = tokio::join!(
+        present_at(&client, &grafana),
+        present_at(&client, &loki),
+        present_at(&client, &tempo),
+    );
+    Json(status_answer(true, g, l, t))
 }
 
 /// Where the gateway finds the SSO private key. `NOO_GRAFANA_SSO_KEY` names
@@ -248,13 +338,20 @@ async fn viewer_gate(key: &jsonwebtoken::EncodingKey) -> Result<(), String> {
 /// `NOO_GRAFANA_URL` or the key is absent. One audit row per mint
 /// (`grafana_session_issued`). Exchanged, harness, kiosk and add-on
 /// tokens, service keys and the cluster HMAC are refused: a person has to
-/// be at the browser.
+/// be at the browser. On an install that declared `cluster.monitoring:
+/// lean`, a Grafana that is not there is 409 [`DASHBOARDS_OFF`] (off by
+/// choice, not a fault); a Grafana that is there is used as always.
 async fn grafana_session(
     State(state): State<Arc<AppState>>,
     ctx: Option<Extension<RequesterCtx>>,
     perspective: Option<Extension<crate::perspective::RequesterPerspective>>,
 ) -> AppResult {
     let sub = person_at_the_browser(&ctx).map_err(AppError::Forbidden)?;
+
+    if crate::config::monitoring_lean() {
+        let there = present_at(&crate::tls::cluster_client(), &format!("{GRAFANA_INTERNAL_URL}/api/health")).await;
+        dashboards_off_check(true, there)?;
+    }
 
     let base = std::env::var(GRAFANA_URL_ENV).ok().filter(|s| !s.trim().is_empty()).ok_or_else(|| {
         AppError::Unavailable(format!(
@@ -331,9 +428,79 @@ async fn grafana_session(
     })))
 }
 
+/// `Err(409 DASHBOARDS_OFF)` when dashboards are off by choice: lean AND
+/// no Grafana. Never with the key unset or `full`.
+pub fn dashboards_off_check(lean: bool, grafana_there: bool) -> Result<(), AppError> {
+    if lean && !grafana_there {
+        return Err(AppError::Conflict(DASHBOARDS_OFF.into()));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── off by choice ──
+
+    #[test]
+    fn open_grafana_on_lean_without_grafana_is_a_409_naming_the_command() {
+        match dashboards_off_check(true, false) {
+            Err(AppError::Conflict(m)) => assert_eq!(m, "Dashboards are off on this install: noo stack monitoring on"),
+            other => panic!("lean + absent must be 409, never 503: {other:?}"),
+        }
+        assert!(dashboards_off_check(true, true).is_ok(), "lean + Grafana there (older compose): used");
+        assert!(dashboards_off_check(false, false).is_ok(), "full/unset: today's path, whatever it answers");
+        // The handler asks only on lean, before the URL and key checks (which
+        // keep today's 503s for a full install).
+        let src = include_str!("monitoring.rs");
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "async fn grafana_session(");
+        let check = body.find("dashboards_off_check(true, there)?").expect("the handler checks");
+        let lean = body.find("if crate::config::monitoring_lean()").expect("only on lean");
+        let url = body.find("GRAFANA_URL_ENV").expect("the URL check");
+        assert!(lean < check && check < url, "{body}");
+    }
+
+    #[test]
+    fn the_status_is_all_on_unless_lean_and_absent() {
+        let full = status_answer(false, false, false, false);
+        assert_eq!(full, json!({"monitoring": "full", "grafana": true, "log_search": true, "traces": true}), "unset/full: no message, everything on");
+        let lean_running = status_answer(true, true, true, true);
+        assert_eq!(lean_running["grafana"], true);
+        assert!(lean_running.get("message").is_none(), "an older compose still runs them: nothing is off");
+        let off = status_answer(true, false, false, false);
+        assert_eq!(off["grafana"], false);
+        assert_eq!(off["log_search"], false);
+        assert_eq!(off["traces"], false);
+        assert_eq!(off["message"], "Dashboards, log search and traces are off on this install: noo stack monitoring on");
+        let only_g = status_answer(true, false, true, true);
+        assert_eq!(only_g["message"], "Dashboards are off on this install: noo stack monitoring on");
+        let only_l = status_answer(true, true, false, true);
+        assert_eq!(only_l["message"], "Log search is off on this install: noo stack monitoring on");
+    }
+
+    #[tokio::test]
+    async fn nothing_listening_is_absent_and_no_url_is_absent() {
+        let held = tokio::net::TcpSocket::new_v4().unwrap();
+        held.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let dead = format!("http://{}/ready", held.local_addr().unwrap());
+        let client = reqwest::Client::new();
+        assert!(!present_at(&client, &dead).await);
+        assert!(!present_at(&client, "  ").await);
+        // Something answering, whatever it says, is present.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/ready", listener.local_addr().unwrap());
+        let srv = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            sock.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        });
+        assert!(present_at(&client, &url).await, "a 503 is a fault, not absence");
+        srv.await.unwrap();
+    }
 
     /// The handler must take its role from `grafana_session_role`, the pure
     /// function whose table is pinned in auth.rs. A pure-function test

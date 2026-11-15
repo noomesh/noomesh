@@ -215,6 +215,9 @@ skipped unless `--integration`. See [testing.md](../development/developer-guide.
 | `noo stack stop` | `[--volumes [-y\|--yes]]` | Stop the stack; --volumes deletes the database and every volume, after a typed confirm |
 | `noo stack rebuild` | `[<service>...] [-q\|--quick] [--no-cache] [--profile <p>] [--gateway-engine <e>] [--node-engine <e>] [-b\|--background]` | Rebuild stack images in the foreground, or queue it for noo-hostd with --background |
 | `noo stack rebuild-status` | `[--follow]` | Show the latest background stack-rebuild result and log |
+| `noo stack monitoring status` | — | Show whether Grafana, Loki and Tempo run (full or lean) and where that is set |
+| `noo stack monitoring on` | — | Run Grafana, Loki and Tempo again, on their kept data; recreates gateway and worker |
+| `noo stack monitoring off` | — | Stop and remove Grafana, Loki and Tempo; their data is kept; recreates gateway and worker |
 | `noo stack clean` | `[--volumes] [--images] [--all] [--deep] [--cache] [--hf-cache] [-y]` | Remove Docker resources; asks for confirmation, -y answers every prompt too |
 | `noo stack sync-assets` | — | Refresh the standalone deploy slice from this binary's embedded assets |
 | `noo stack reset` | `[--dist] [--tag <tag>] [--ci] [--keep-env] [-y]` | Deep clean, onboard and restart the stack; destructive, confirms (-y) |
@@ -245,7 +248,7 @@ skipped unless `--integration`. See [testing.md](../development/developer-guide.
 |---|---|---|
 | `noo config get` | `[<section>\|cli]` | Print gateway runtime config, whole or one section; `cli` reads this machine's prefs |
 | `noo config set` | `<section> <updates-json>` | Update a gateway config section from JSON (no confirm); `cli` writes local prefs |
-| `noo config launch-render` | `compose-env \| addons \| override \| systems [<file>]` | Hidden: render one noomesh.yaml section for the launcher scripts (internal) |
+| `noo config launch-render` | `compose-env \| addons \| override \| systems \| monitoring [<file>]` | Hidden: render one noomesh.yaml section for the launcher scripts (internal) |
 | `noo config launch-check` | `bind-sources [--data-root <dir>] [--no-deps] [--skip <service>]... [<service>...] \| system-credentials [<noomesh.yaml>] \| secrets-at-rest [<dir>] \| state-root [<dir>]` | Hidden: pre-start refusals: bind sources, credentials, plaintext secrets, closed volume |
 | `noo config show` | `[--config <path>]` | Print noomesh.yaml: --config, $NOO_CONFIG, ./noomesh.yaml, ~/.config/mesh/config.yaml |
 | `noo config export-effective` | `[-o <file>]` | Export the effective runtime config (autonomy + KB rules/grants) as YAML |

@@ -272,6 +272,29 @@ impl Requirement {
 /// The "must be recreated" block of a rotation report: `None` when no
 /// container holds the key (a CLI-only key, `recreate: (none)`), so the
 /// heading is never printed over an empty list (i57b).
+/// Grafana's container on this install (compose service `grafana`).
+fn is_grafana_container(c: &str) -> bool {
+    c == "noo-grafana" || *c == crate::envfile::container("grafana")
+}
+
+/// `consumers` without Grafana when the install is lean (it is not running
+/// by choice, so there is nothing to recreate), and the line that says so.
+/// Unchanged, with no line, on a full install or when Grafana is not a holder.
+pub(crate) fn drop_off_monitoring(consumers: Vec<String>, lean: bool) -> (Vec<String>, Option<String>) {
+    if !lean || !consumers.iter().any(|c| is_grafana_container(c)) {
+        return (consumers, None);
+    }
+    let kept: Vec<String> = consumers.into_iter().filter(|c| !is_grafana_container(c)).collect();
+    (
+        kept,
+        Some(
+            "Grafana is off on this install (cluster.monitoring: lean), so it is not recreated; \
+             it reads the new value when `noo stack monitoring on` starts it"
+                .to_string(),
+        ),
+    )
+}
+
 fn recreate_notice(consumers: &[String]) -> Option<String> {
     if consumers.is_empty() {
         return None;
@@ -5367,6 +5390,16 @@ pub fn secrets_rotate(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         consumers.extend(p.consumers.iter().cloned());
     }
     let consumers: Vec<String> = consumers.into_iter().collect();
+    // Grafana is off on a lean install (cluster.monitoring): there is no
+    // container to recreate, so it is neither awaited nor called stale; the
+    // store holds the new value for when `noo stack monitoring on` starts it.
+    let (consumers, monitoring_off) =
+        drop_off_monitoring(consumers, super::stack_monitoring::effective_lean_live(&root));
+    if let Some(line) = &monitoring_off {
+        if !g.json {
+            println!("{}", ui::note(line));
+        }
+    }
 
     if g.json {
         println!(
@@ -6058,6 +6091,24 @@ pub fn secrets_resync(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_lean_install_does_not_recreate_grafana_and_says_so() {
+        let holders = vec!["noo-grafana".to_string()];
+        let (kept, line) = drop_off_monitoring(holders.clone(), true);
+        assert!(kept.is_empty(), "{kept:?}");
+        let line = line.expect("the skip is said");
+        assert!(line.contains("cluster.monitoring: lean") && line.contains("noo stack monitoring on"), "{line}");
+        // Full (or unset): exactly today's holders, no line.
+        assert_eq!(drop_off_monitoring(holders, false), (vec!["noo-grafana".to_string()], None));
+        // Lean but Grafana is not a holder: nothing to say.
+        let gw = vec!["noo-gateway".to_string()];
+        assert_eq!(drop_off_monitoring(gw.clone(), true), (gw, None));
+        // The rotation report takes its holders through it.
+        let own = crate::test_src::own_code(include_str!("secrets.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn secrets_rotate(");
+        assert!(body.contains("drop_off_monitoring(consumers, super::stack_monitoring::effective_lean_live(&root))"));
+    }
+
     #[test]
     fn recreate_notice_only_when_a_container_holds_the_key() {
         assert_eq!(recreate_notice(&[]), None, "no consumer, no heading");
