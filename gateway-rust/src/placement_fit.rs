@@ -730,7 +730,7 @@ pub fn evaluate(node: &Value, specs: &[Spec], embed_ctx: u64) -> Report {
 /// or not. `noo cluster place`'s tuner reads the same three numbers from the
 /// fit report (`budgets[].declared_used_gb`, `stack_reserve_gb`,
 /// `models[].kv_gb`).
-pub fn declared_kv_room_gb(report: &Report, backend: &str, role: &str, model: &str) -> Option<(f64, &Row)> {
+pub fn declared_kv_room_gb<'a>(report: &'a Report, backend: &str, role: &str, model: &str) -> Option<(f64, &'a Row)> {
     let row = report.rows.iter().find(|r| r.backend == backend && r.role == role && r.model == model)?;
     let pool = report.pools.iter().find(|p| p.target == row.target)?;
     let usable = pool.budget.as_ref()?.usable_gb();
