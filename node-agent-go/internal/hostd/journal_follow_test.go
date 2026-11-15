@@ -173,6 +173,13 @@ func TestJournalFollowWritesTheSpoolFileAndPersistsTheCursor(t *testing.T) {
 	if !strings.Contains(joined, "--after-cursor=s=aa;i=2") || strings.Contains(joined, "--lines=0") {
 		t.Fatalf("restart must resume after the persisted cursor: %v", fj2.argv[0])
 	}
+	// Stop the second follower and wait for it before returning: it flushes
+	// its cursor into the spool on exit, and a follower still writing there
+	// when t.TempDir's cleanup runs fails the test ("unlinkat ...: directory
+	// not empty"; merge-group run 43653911314). The follower clears Running
+	// only after its last write.
+	cancel2()
+	waitFor(t, "second follower to stop", func() bool { st := e2.journalState(); return st != nil && !st.Running })
 }
 
 // An ancient cursor must not replay days of journal into the log store.
