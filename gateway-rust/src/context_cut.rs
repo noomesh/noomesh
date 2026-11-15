@@ -203,7 +203,7 @@ mod tests {
         for step in ["crate::context_cut::mark_body(&mut data, &cut);", "served.truncated = Some(cut.header_value());", "w.note(&cut).await;"] {
             assert!(json_arm[judged..].contains(step), "{step}");
         }
-        assert!(send.contains("cut: watch.clone(),"), "the stream tap gets the watch");
+        assert!(send.contains("cut: watch.clone().map(Box::new),"), "the stream tap gets the watch");
         let usage = crate::test_src::own_code(include_str!("usage.rs"));
         let drop = crate::test_src::fn_body(&usage, "impl Drop for UsageTap \u{7b}");
         assert!(drop.contains("w.judge(u64::from(p))") && drop.contains("w.note(&cut).await"), "{drop}");
