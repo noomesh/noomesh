@@ -204,6 +204,14 @@ def test_tool_replay_on_an_older_build_is_not_judged_and_keeps_the_evidence():
     assert CF.judge_tool_replay("x", None, [], CF.log_facts(None), "default")[0] == CF.NOT_JUDGED
 
 
+def test_a_turn_records_the_wires_its_model_calls_went_out_on():
+    assert CF.turn_wires(_facts(DIRECT_CALL, BACKEND_CALL, DIRECT_CALL)) == ["ollama"]
+    assert CF.turn_wires(_facts(BACKEND_CALL)) is None, "a build without wire= says null, not a guess"
+    assert CF.turn_wires(CF.log_facts(None)) is None
+    rec = CF.turn_record("tool", True, "ok", 1.0, _facts(DIRECT_CALL), {"text": "x"})
+    assert rec["wire"] == ["ollama"]
+
+
 def test_tool_replay_passes_an_answer_and_fails_a_failed_turn():
     rc, why = CF.judge_tool_replay("The codeword in anything.md is ZIRCON-4471.", None, ["noo_rag_query"],
                                    _facts(DIRECT_CALL), "default")

@@ -33,7 +33,8 @@ say so instead of being cut.
                for approval). Per turn: pass (true/false/null), reason,
                elapsed_s, prefill_s (sum of the turn's backend_call
                prefill_ms / 1000; null on a build without those lines),
-               tier, truncated (the done frame's). Writes DIR/turns.json.
+               tier, truncated (the done frame's), wire (the backend_call
+               lines' wire= values, null before #1225). Writes DIR/turns.json.
   doesnt-fit   one turn of ~--chars of plain text plus a short question.
                PASS: the reply carries the gateway's doesn't-fit line
                ("too small for its instructions and this question", #1212)
@@ -456,7 +457,16 @@ def turn_record(name: str, verdict, reason: str, elapsed_s: float, facts: dict, 
             "truncated": done.get("truncated") if "truncated" in done else None,
             "cached": bool(done.get("cached")), "tools": [c.get("name") for c in chat.get("calls", [])],
             "approval_request": bool(chat.get("approval")), "error": chat.get("error"),
-            "answer": _excerpt(chat.get("text", ""), 800)}
+            "answer": _excerpt(chat.get("text", ""), 800), "wire": turn_wires(facts)}
+
+
+def turn_wires(facts: dict) -> list[str] | None:
+    """The distinct wire= of the turn's backend_call lines (sorted): "ollama"
+    is a directly dialled Ollama, "openai" one behind its node agent (or
+    vLLM). None on a build whose backend_call carries no wire= (before
+    noomesh #1225) or when the log was not read."""
+    wires = sorted({str(c["wire"]) for c in facts.get("backend_calls", []) if c.get("wire")})
+    return wires or None
 
 
 def turns_doc(cell: str, model: str, turns: list[dict]) -> dict:
