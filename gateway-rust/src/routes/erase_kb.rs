@@ -24,9 +24,9 @@
 //! Archive-then-delete like every other store: each row deleted or rewritten
 //! is first copied to `noo_user_erasure_staging` under the erase's `run_id`.
 //! The same [`plan`] answers the dry run, so the preview counts are the ones
-//! the erase acts on. The KB's regenerable LLM response cache (`noo:cache:*`)
-//! expires on its own five-minute TTL and is keyed by prompt hash, not by
-//! document, so there is nothing to address there.
+//! the erase acts on. There is no answer cache to clear: coordinator turns
+//! keep none (retired in 0.6.25), so the next answer is built from what the
+//! erase left.
 
 use serde_json::{json, Value};
 use sqlx::PgConnection;

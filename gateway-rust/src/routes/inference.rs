@@ -504,26 +504,8 @@ async fn native_inference(
         "api",
     );
 
-    // Check LLM cache first — keyed by WHO asked as well as what: the answer is built from the caller's own memory and
-    // audience-filtered KB evidence, so it is not shareable across people.
-    let messages_for_cache = vec![json!({"role": "user", "content": req.prompt})];
-    let cache_key = crate::cache::RedisCache::llm_cache_key(
-        "auto", &messages_for_cache, effective_uid.as_deref());
-
-    if let Some(redis) = state.redis.as_ref() {
-        if let Some(cached) = redis.get_llm_cache(&cache_key).await {
-            tracing::debug!("inference_cache_hit");
-            return (StatusCode::OK, Json(json!({
-                "success": true,
-                "data": {
-                    "response": cached.get("content").and_then(|c| c.as_str()).unwrap_or(""),
-                    "conversation_id": conversation_id,
-                    "cached": true,
-                    "engine": "rust",
-                },
-            }))).into_response();
-        }
-    }
+    // No answer cache for a coordinator turn (see ws_coordinator.rs): the
+    // turn always runs, under the caller's perspective and roles.
 
     // Run the agentic loop (with optional model for cloud delegation).
     // Non-streaming: the caller gets one final string, and there is no
@@ -540,16 +522,6 @@ async fn native_inference(
         false,
     ).await {
         Ok(result) => {
-            // Cache the response
-            if !result.response.is_empty() {
-                if let Some(redis) = state.redis.as_ref() {
-                    redis.set_llm_cache(
-                        &cache_key,
-                        &json!({"content": result.response}),
-                        None,
-                    ).await;
-                }
-            }
 
             // Token-usage accounting — fire-and-forget.
             crate::usage::record(
