@@ -332,8 +332,13 @@ func ownedNotShared(p string, dir bool) error {
 	if fi.Mode().Perm()&0o022 != 0 {
 		return fmt.Errorf("group- or world-writable (%o)", fi.Mode().Perm())
 	}
-	if uid, ok := ownerUID(fi); ok && uid != os.Getuid() {
-		return fmt.Errorf("owned by uid %d, not this agent's %d", uid, os.Getuid())
+	if uid, ok := ownerUID(fi); ok && uid != selfUID() {
+		return fmt.Errorf("owned by uid %d, not this agent's %d", uid, selfUID())
 	}
 	return nil
 }
+
+// selfUID is the uid a record must be owned by: this agent's. A variable so a
+// test running as an unprivileged user can make a file it owns count as
+// someone else's (it cannot chown one away); production never reassigns it.
+var selfUID = os.Getuid
