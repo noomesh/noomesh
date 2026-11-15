@@ -375,6 +375,9 @@ pub struct StreamUsageCtx {
     pub model: String,
     pub source: &'static str,
     pub actor: UsageActor,
+    /// The raw proxy's cut watch (i802 step 1): when the stream's own count
+    /// shows the backend cut the prompt, the metric and the hourly warn.
+    pub cut: Option<crate::context_cut::CutWatch>,
 }
 
 /// Wrap a byte stream so the last usage frame seen is recorded when the
@@ -523,6 +526,15 @@ struct UsageTap {
 impl Drop for UsageTap {
     fn drop(&mut self) {
         if let Some((p, c)) = self.scanner.finish() {
+            // A cut is judged here, from the stream's last usage frame; the
+            // metric and the warn need the runtime, which a test may lack.
+            if let Some(w) = self.ctx.cut.clone() {
+                if let Some(cut) = w.judge(u64::from(p)) {
+                    if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                        rt.spawn(async move { w.note(&cut).await });
+                    }
+                }
+            }
             crate::request_trace::with_recorder(self.trace.clone(), || {
                 record(
                     self.ctx.db.clone(),

@@ -243,6 +243,9 @@ pub struct Served {
     /// The answering candidate was not the class's first choice.
     pub fallback: bool,
     pub attempts: usize,
+    /// `<evaluated>/<sent_estimate>/<context>` when the backend cut the
+    /// prompt (non-streaming only: [`crate::context_cut`]).
+    pub truncated: Option<String>,
 }
 
 impl Served {
@@ -750,11 +753,20 @@ where
             ctxs.push((c.url.clone(), c.model.clone(), n));
         }
     }
+    // What each attempt sent, for the cut watch (i802 step 1): the estimate
+    // of its messages, by the candidate it went to.
+    let sent: Arc<std::sync::Mutex<Vec<(String, String, u64, u64)>>> = Arc::default();
+    let sent_in = sent.clone();
     let mut inner = build;
     let build = move |c: &Candidate| {
         let (path, mut body) = inner(c);
         let n = ctxs.iter().find(|(u, m, _)| u == &c.url && m == &c.model).map(|(_, _, n)| *n);
         with_num_ctx(&path, &mut body, n);
+        if let Some(n) = n {
+            let msgs = body.get("messages").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+            let est = coordinator::estimate_tokens(msgs) as u64;
+            sent_in.lock().unwrap_or_else(|e| e.into_inner()).push((c.url.clone(), c.model.clone(), n, est));
+        }
         (path, body)
     };
     let deadline = Instant::now() + OVERALL_DEADLINE;
@@ -772,7 +784,23 @@ where
     .await?;
 
     let cand = &candidates[ok.index];
-    let served = Served {
+    // An Ollama with a decided context is watched for a cut; vLLM refuses an
+    // over-long prompt itself and is never watched.
+    let watch = sent
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .rev()
+        .find(|(u, m, _, _)| u == &cand.url && m == &cand.model)
+        .map(|(u, m, n, est)| crate::context_cut::CutWatch {
+            ctx: *n,
+            sent_estimate: *est,
+            backend_url: u.clone(),
+            model: m.clone(),
+            consumer: actor.consumer.clone().unwrap_or_else(|| "unknown".into()),
+            metrics: state.metrics.clone(),
+        });
+    let mut served = Served {
         class: class.to_string(),
         model: cand.model.clone(),
         backend_type: cand.backend.clone(),
@@ -782,6 +810,7 @@ where
         // (a class or model with nothing live, answered by the mesh).
         fallback: is_fallback(original[ok.index], cand),
         attempts: ok.attempts,
+        truncated: None,
     };
     let label = if cand.class_label.is_empty() { class } else { cand.class_label.as_str() };
     tracing::info!(
@@ -800,11 +829,19 @@ where
         model: cand.model.clone(),
         source,
         actor,
+        cut: watch.clone(),
     };
     match ok.body {
         CoreBody::Stream(resp) => Ok(Outcome::Stream { resp, served, usage, guard: ok.guard }),
-        CoreBody::Json(data) => {
+        CoreBody::Json(mut data) => {
             if let Some((p, c)) = crate::usage::usage_from_frame(&data) {
+                if let Some(cut) = watch.as_ref().and_then(|w| w.judge(p as u64)) {
+                    crate::context_cut::mark_body(&mut data, &cut);
+                    served.truncated = Some(cut.header_value());
+                    if let Some(w) = &watch {
+                        w.note(&cut).await;
+                    }
+                }
                 crate::usage::record(usage.db, usage.node_id, usage.backend, usage.model, usage.source, usage.actor, p, c);
             }
             Ok(Outcome::Json { data, served })
@@ -978,6 +1015,9 @@ fn with_served_headers(mut resp: Response, served: &Served) -> Response {
     }
     if let Ok(v) = HeaderValue::from_str(&served.model) {
         resp.headers_mut().insert(HEADER_MODEL, v);
+    }
+    if let Some(v) = served.truncated.as_deref().and_then(|t| HeaderValue::from_str(t).ok()) {
+        resp.headers_mut().insert(crate::context_cut::HEADER, v);
     }
     resp
 }
@@ -1253,8 +1293,14 @@ mod tests {
             url: "https://100.64.0.11:8081".into(),
             fallback: true,
             attempts: 2,
+            truncated: None,
         };
+        // A cut prompt (i802 step 1) carries its numbers as a header.
+        let cut_served = Served { truncated: Some("2053/9000/4096".into()), ..served.clone() };
+        let cut = json_response(json!({"id": "x", "choices": []}), &cut_served);
+        assert_eq!(cut.headers().get(crate::context_cut::HEADER).unwrap(), "2053/9000/4096");
         let r = json_response(json!({"id": "x", "choices": []}), &served);
+        assert!(r.headers().get(crate::context_cut::HEADER).is_none(), "no cut, no header");
         assert_eq!(r.headers().get(HEADER_CLASS).unwrap(), "chat-default");
         assert_eq!(r.headers().get(HEADER_MODEL).unwrap(), "gemma4:12b");
         let bytes = axum::body::to_bytes(r.into_body(), 1 << 16).await.unwrap();

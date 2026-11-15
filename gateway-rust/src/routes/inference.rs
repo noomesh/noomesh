@@ -1643,6 +1643,7 @@ async fn native_inference_stream(
                 model: backend.model.clone(),
                 source: "api",
                 actor: usage_actor,
+                cut: None,
             };
             let stream = crate::usage::tap_stream(resp.bytes_stream(), usage_ctx);
             // The backend span ends with the stream it answered.
