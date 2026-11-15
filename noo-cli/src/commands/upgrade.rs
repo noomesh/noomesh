@@ -991,13 +991,17 @@ fn mcp_catalogue(g: &Globals) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Connected MCP clients keep the tool list they fetched at connect; the
-/// doors cannot tell them it changed yet (i277f). Said only when both
-/// readings exist and differ: a gateway too old to report one says nothing.
+/// Connected MCP clients keep the tool list they fetched at connect. The
+/// doors can tell only a client that holds a legacy MCP session
+/// (`mcp_session::with_list_changed`), and Claude Code speaks the sessionless
+/// revision (every door call of 2026-11-15 was `2026-07-28`), so after the
+/// 0.6.24 roll no client was told and each called the mailbox tools with the
+/// old schema. Every client must reconnect. Said only when both readings
+/// exist and differ: a gateway too old to report one says nothing.
 fn catalogue_hint(before: Option<&str>, after: Option<&str>) -> Option<&'static str> {
     match (before, after) {
         (Some(b), Some(a)) if a != b => Some(
-            "the MCP tool list changed: a client with a session is told on its next call; reconnect any other (`/mcp` in Claude Code, restart Codex) or it keeps the old list",
+            "the MCP tool list changed: every MCP client must reconnect, or it keeps the old list (Claude Code: /mcp → reconnect each noomesh server; Codex: restart it)",
         ),
         _ => None,
     }
@@ -5765,6 +5769,9 @@ mod tests {
     #[test]
     fn the_reconnect_hint_needs_two_differing_readings() {
         assert!(super::catalogue_hint(Some("a"), Some("b")).is_some_and(|h| h.contains("reconnect")));
+        let h = super::catalogue_hint(Some("a"), Some("b")).unwrap();
+        assert!(h.contains("every MCP client must reconnect") && h.contains("Claude Code: /mcp") && h.contains("Codex: restart"), "{h}");
+        assert!(!h.contains("session"), "no client is told on its next call: {h}");
         assert!(super::catalogue_hint(Some("a"), Some("a")).is_none());
         assert!(super::catalogue_hint(None, Some("b")).is_none(), "an older gateway reports nothing: say nothing");
         assert!(super::catalogue_hint(Some("a"), None).is_none());
