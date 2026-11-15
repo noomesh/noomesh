@@ -459,8 +459,10 @@ async fn node_of_url(state: &crate::state::AppState, url: &str) -> Option<String
 }
 
 /// The stack's own backend containers, as `docker-compose.cluster.yml`
-/// names them (`container_name: ${NOO_CONTAINER_PREFIX:-noo}-<name>`; a test
-/// holds this list to the compose). A host with one of these names resolves
+/// names them (`container_name: ${NOO_CONTAINER_PREFIX:-noo}-<name>`;
+/// tests/test_stack_backend_containers.py holds this list to the compose:
+/// the gateway's image build does not carry the compose file, so a Rust
+/// test cannot include it). A host with one of these names resolves
 /// only inside the stack's Docker network, so it is this controller's box.
 pub const STACK_BACKEND_CONTAINERS: &[&str] = &[
     "vllm", "vllm-secondary", "stunnel-vllm", "stunnel-vllm-secondary", "llamacpp", "stunnel-llamacpp", "airllm",
@@ -818,16 +820,6 @@ mod tests {
         assert_eq!(own_node_for("https://noo-stunnel-ollama-embed:11434", "noo", None), None, "no self id: nothing guessed");
     }
 
-    /// The names the rule accepts are the stack's own containers: each is a
-    /// `container_name` in the compose the controller runs.
-    #[test]
-    fn the_local_names_are_the_composes_own_containers() {
-        let compose = include_str!("../../docker-compose.cluster.yml");
-        for name in STACK_BACKEND_CONTAINERS {
-            let line = format!("container_name: ${{NOO_CONTAINER_PREFIX:-noo}}-{name}\n");
-            assert!(compose.contains(&line), "{name} is not a container in docker-compose.cluster.yml");
-        }
-    }
 
     /// The decision for a backend known by URL goes through the mapping
     /// above: num_ctx_for -> node_of_url -> own_node_for when no enrolled
