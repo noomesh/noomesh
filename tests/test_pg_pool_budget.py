@@ -90,7 +90,11 @@ SIBLINGS = {
     "trellion-intel": Sibling(
         process="noo-trellion-intel",
         current=79,
-        budget=34,
+        # The trellion image running noomesh's worker on ml-intel: noomesh's
+        # 22 + trellion's own 29, none of intel's own (general 11-15: the
+        # true number). A trim on ml-intel, if it does not need the
+        # conversation store or heartbeat, is recorded in i815.
+        budget=51,
         expects_declaration=False,
         sha="trellion-intel 7486d39",
         what="whole process, i815 record",
@@ -111,7 +115,7 @@ INSTALLS = {
     "+intel+evolve": ("trellion-intel", "evolve"),
 }
 # How many worker-extra processes each install keeps under the line: two,
-# with both first-party add-ons too (164 of 187 at max_connections 200).
+# with both first-party add-ons too (181 of 187 at max_connections 200).
 MAX_WORKER_EXTRA = {"default": 2, "+intel": 2, "+intel+evolve": 2}
 
 
@@ -186,7 +190,7 @@ def test_the_process_ceilings_are_the_reviewed_numbers():
     assert _gateway_ceiling() == 12
     # trellion's own engine keeps a working pool (general 11-14): 15+5+8+1.
     assert SIBLINGS["trellion"].budget == 29
-    assert (SIBLINGS["trellion-intel"].budget, SIBLINGS["evolve"].budget) == (34, 25)
+    assert (SIBLINGS["trellion-intel"].budget, SIBLINGS["evolve"].budget) == (51, 25)
 
 
 # --------------------------------------------------------------------------
