@@ -191,6 +191,33 @@ pub fn warn_retired_token() {
 pub const MINT_HINT: &str =
     "noo security service-key issue <you>-mcp --scopes mcp:operator --user <admin>";
 
+/// What this door lists to the operator: the full manifest and, after it,
+/// every enabled, placed external MCP server's tools. ONE builder for
+/// `tools/list` and `noo_tool_search`, so the search covers exactly what
+/// the door serves.
+async fn operator_catalog(state: &crate::state::AppState) -> Value {
+    let mut tools = tools_list();
+    if let Some(arr) = tools.as_array_mut() {
+        for t in crate::mcp_bridge::catalog_for(state, None).await {
+            arr.push(t.mcp_tool());
+        }
+    }
+    tools
+}
+
+/// A `native` tool's in-process answer on this door. A native this door
+/// does not answer is refused by name, never proxied.
+async fn native_answer(state: &crate::state::AppState, name: &str, args: &Map<String, Value>) -> Result<String, String> {
+    match name {
+        "noo_tool_search" => {
+            let query = args.get("query").and_then(Value::as_str).filter(|q| !q.trim().is_empty()).ok_or("query required")?;
+            let max = args.get("max_results").and_then(Value::as_u64).unwrap_or(5) as usize;
+            Ok(crate::mcp_external::search_tools(&operator_catalog(state).await, query, max))
+        }
+        _ => Err(format!("{name} is answered by the door itself, and this door does not answer it")),
+    }
+}
+
 fn tools_list() -> Value {
     let tools: Vec<Value> = MANIFEST
         .tools
@@ -384,17 +411,7 @@ async fn dispatch(
 
         "server/discover" => env.discover(SERVER_NAME, &instructions()),
 
-        "tools/list" => {
-            let mut tools = tools_list();
-            // External MCP tools — the operator sees
-            // every enabled, placed server.
-            if let Some(arr) = tools.as_array_mut() {
-                for t in crate::mcp_bridge::catalog_for(state, None).await {
-                    arr.push(t.mcp_tool());
-                }
-            }
-            env.tools_list(tools, SERVER_NAME)
-        }
+        "tools/list" => env.tools_list(operator_catalog(state).await, SERVER_NAME),
 
         "tools/call" => {
             let name = req.params.get("name").and_then(Value::as_str).unwrap_or_default();
@@ -479,6 +496,13 @@ async fn dispatch(
             )
             .await;
 
+            if spec.native {
+                let (text, is_error) = match native_answer(state, name, args).await {
+                    Ok(t) => (t, false),
+                    Err(e) => (e, true),
+                };
+                return env.result(json!({ "content": [{"type": "text", "text": text}], "isError": is_error }), SERVER_NAME);
+            }
             match execute_spec(spec, args, auth).await.map(|v| crate::agent_mailbox::with_note(v, note)) {
                 Ok(v) => env.result(
                     json!({
@@ -515,6 +539,36 @@ fn instructions() -> String {
 mod tests {
     use super::*;
 
+
+    /// Every `native` tool in this door's manifest is answered in process
+    /// by `native_answer`, and dispatch answers a native BEFORE the self-call:
+    /// a native the door forgot would be proxied to a path no route serves
+    /// (`noo_tool_search` -> `GET /api/tools/search` 404, 2026-11-15).
+    #[test]
+    fn every_native_tool_is_answered_by_this_door_before_any_self_call() {
+        let src = include_str!("mcp_local.rs");
+        let answer = crate::test_src::fn_body(src, "async fn native_answer(");
+        let natives: Vec<&str> = MANIFEST.tools.iter().filter(|t| t.native).map(|t| t.name.as_str()).collect();
+        assert!(natives.contains(&"noo_tool_search"), "{natives:?}");
+        for n in &natives {
+            assert!(answer.contains(&format!("\"{n}\" =>")), "{n} is native but this door does not answer it");
+        }
+        let d = crate::test_src::fn_body(src, "async fn dispatch(");
+        let (intercept, call) = (d.find("if spec.native {").expect("native intercept"), d.find("execute_spec(spec").expect("self-call"));
+        assert!(intercept < call, "the native answer must come before the self-call");
+    }
+
+    /// The operator door's search covers this door's own manifest (the same
+    /// builder as `tools/list`).
+    #[test]
+    fn tool_search_finds_tools_in_this_doors_manifest() {
+        let out = crate::mcp_external::search_tools(&tools_list(), "tool search", 5);
+        assert!(out.lines().nth(2).is_some_and(|l| l.trim() == "noo_tool_search"), "{out}");
+        let src = include_str!("mcp_local.rs");
+        let answer = crate::test_src::fn_body(src, "async fn native_answer(");
+        assert!(answer.contains("operator_catalog(state)"), "the search must cover what tools/list lists");
+        assert!(crate::test_src::fn_body(src, "async fn dispatch(").contains("env.tools_list(operator_catalog(state).await"));
+    }
 
     #[test]
     fn local_manifest_parses_and_is_full_registry() {
