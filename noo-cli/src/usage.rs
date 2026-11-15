@@ -144,6 +144,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["security", "service-key", "retire"], "<consumer>", "Finish a rotation: deactivate the superseded key, once the new one has been used"),
     (&["security", "service-key", "provision"], "<name> [--scopes <s>]... [--wait <secs>] [-y|--yes]", "Show the declared grant and confirm, then mint, store, recreate and PROVE the key"),
     (&["security", "service-key", "set-quota"], "<consumer> <rpm>", "Set the per-minute request cap for a consumer's keys (0 = uncapped)"),
+    (&["security", "service-key", "set-context-overflow"], "<consumer> flag|refuse", "Refuse (413) or send-and-flag a prompt longer than the model's context for a consumer's keys"),
     (&["security", "service-key", "self"], "[--note <label>]", "Mint or rotate the caller's own MCP key (raw key shown once)"),
     (&["security", "service-key", "self-status"], "", "Show whether the caller has an active MCP key and when it was used"),
     (&["security", "service-key", "self-revoke"], "", "Revoke the caller's own MCP key"),

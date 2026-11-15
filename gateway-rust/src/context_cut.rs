@@ -105,6 +105,26 @@ pub fn judge_with(ctx: u64, sent_estimate: u64, evaluated: u64, calib: crate::ch
         .then_some(Cut { evaluated, sent_estimate, context: ctx })
 }
 
+/// Refuse mode (a key set to `refuse`): would this prompt overflow an
+/// Ollama run at `ctx`? The coordinator's rule for a turn's instructions
+/// ([`crate::chat_context::instructions_overflow`] on
+/// [`crate::chat_context::max_input_for`]): the trusted ratio, else the
+/// kindest measured, so an uncalibrated box refuses only a prompt that is
+/// over on any reading. A prompt this lets through and the Ollama still
+/// cuts is flagged as in flag mode.
+pub fn overflows(sent_estimate: u64, ctx: u64, calib: crate::chat_context::Calibration) -> bool {
+    crate::chat_context::instructions_overflow(sent_estimate, crate::chat_context::max_input_for(ctx), calib)
+}
+
+/// The refusal's line to the caller: the model and its context, never the
+/// node or an address.
+pub fn refusal_line(model: &str, ctx: u64) -> String {
+    format!(
+        "this prompt is longer than the {ctx}-token context of {model}, and this key is set to refuse \
+         rather than cut it: send a shorter prompt, or ask the operator for a model with a larger context"
+    )
+}
+
 type Warned = HashMap<(String, String), Instant>;
 static WARNED: std::sync::LazyLock<Mutex<Warned>> = std::sync::LazyLock::new(Default::default);
 
@@ -187,6 +207,51 @@ mod tests {
         let usage = crate::test_src::own_code(include_str!("usage.rs"));
         let drop = crate::test_src::fn_body(&usage, "impl Drop for UsageTap \u{7b}");
         assert!(drop.contains("w.judge(u64::from(p))") && drop.contains("w.note(&cut).await"), "{drop}");
+    }
+
+    /// Refuse mode's wiring, held by source: a key's name (never a path
+    /// label) is looked up; before anything is sent, an Ollama the prompt
+    /// overflows is dropped, and with none left the call is a 413
+    /// `context_too_small` carrying the line.
+    #[test]
+    fn a_refusing_key_is_judged_before_anything_is_sent() {
+        let raw = crate::test_src::own_code(include_str!("routes/raw_chat.rs"));
+        let send = crate::test_src::fn_body(&raw, "pub async fn send_with_failover_pinned<F>(");
+        let filter = send.find("if refuses_overflow(state, &actor).await").expect("the mode is read");
+        let fit = send.find("base = fitting(state, candidates, &mut build).await?;").expect("the filter runs");
+        let sent = send.find("failover_core(").expect("the send");
+        assert!(filter < fit && fit < sent, "judged before the send");
+        let mode = crate::test_src::fn_body(&raw, "async fn refuses_overflow(");
+        assert!(mode.contains("(true, Some(name))") && mode.contains("ContextOverflow::Refuse"), "{mode}");
+        let fitting = crate::test_src::fn_body(&raw, "async fn fitting<F>(");
+        for step in [
+            "crate::context_cut::overflows(est, ctx, crate::chat_context::calibration(&c.url, &c.model))",
+            "StatusCode::PAYLOAD_TOO_LARGE",
+            "\"context_too_small\"",
+            "crate::context_cut::refusal_line(&c.model, ctx)",
+        ] {
+            assert!(fitting.contains(step), "{step}");
+        }
+        let inference = crate::test_src::own_code(include_str!("routes/inference.rs"));
+        let bind = crate::test_src::fn_body(&inference, "pub(crate) fn bind_identity(");
+        assert_eq!(bind.matches("keyed: true").count(), 2, "a bound and an unbound key are both keyed");
+    }
+
+    /// Refuse mode judges with the coordinator's rule: over on the kindest
+    /// ratio while uncalibrated, on the trusted ratio once calibrated.
+    #[test]
+    fn refuse_mode_refuses_only_a_prompt_that_is_over_on_the_rule() {
+        let max = crate::chat_context::max_input_for(4096);
+        let kind = crate::chat_context::REFUSE_UNTRUSTED_RATIO;
+        let at = |r: f64| (max as f64 / r).floor() as u64;
+        assert!(!overflows(at(kind), 4096, fresh()), "on the line: sent");
+        assert!(overflows(at(kind) + 100, 4096, fresh()), "over on the kindest ratio: refused");
+        let trusted = Calibration { ratio: 0.64, samples: 3 };
+        assert!(overflows(at(0.64) + 100, 4096, trusted));
+        assert!(!overflows(at(0.64) - 100, 4096, trusted));
+        assert!(!overflows(5640, 32768, fresh()), "the fleet's largest week-one prompt fits 32k");
+        let line = refusal_line("gemma4:e4b", 4096);
+        assert!(line.contains("4096-token context of gemma4:e4b") && line.contains("refuse"), "{line}");
     }
 
     /// One warn per (consumer, model) per hour; another caller or model is

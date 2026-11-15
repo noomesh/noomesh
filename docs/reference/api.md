@@ -289,6 +289,14 @@ default:
 
 A vLLM backend never cuts: it refuses an over-long prompt itself.
 
+A key set to refuse (`noo security service-key set-context-overflow
+<consumer> refuse`) is never cut: before anything is sent, an Ollama
+candidate whose context the prompt overflows is skipped, and with none left
+the answer is 413 with `type: context_too_small` and a line naming the model
+and its context. The judgment uses the backend's learned token ratio, and
+only the most favourable measured one while it is still learning, so a
+prompt this lets through can still be cut: it is then flagged as above.
+
 `fallback: true` means the answering candidate was not the class's first
 choice. Nothing on this surface names a node, an address or a URL — the
 headers are informational and are never accepted as credentials or

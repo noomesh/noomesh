@@ -408,6 +408,76 @@ pub fn invalidate_cache() {
     if let Ok(mut guard) = cache().write() {
         *guard = None;
     }
+    if let Ok(mut modes) = OVERFLOW_MODES.write() {
+        modes.clear();
+    }
+}
+
+/// What the raw proxy does with a consumer's prompt that is longer than the
+/// Ollama's context (i802; operator 2026-11-15: flag by default, refuse by
+/// a per-key opt-in). `noo_service_keys.context_overflow`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ContextOverflow {
+    /// Send it; say the cut after the fact (header, usage field, metric).
+    #[default]
+    Flag,
+    /// Answer 413 `context_too_small` before sending.
+    Refuse,
+}
+
+impl ContextOverflow {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Flag => "flag",
+            Self::Refuse => "refuse",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "flag" => Some(Self::Flag),
+            "refuse" => Some(Self::Refuse),
+            _ => None,
+        }
+    }
+}
+
+/// How long a consumer's mode is trusted; a write through the route clears
+/// it at once ([`invalidate_cache`]).
+const OVERFLOW_TTL: Duration = Duration::from_secs(30);
+type OverflowModes = HashMap<String, (ContextOverflow, Instant)>;
+static OVERFLOW_MODES: std::sync::LazyLock<RwLock<OverflowModes>> = std::sync::LazyLock::new(Default::default);
+
+/// A consumer's mode, by name: the key's own name, which an add-on's
+/// exchanged token carries too. 'refuse' when any active key of the
+/// consumer says so (the route sets them all). An unreadable store reads
+/// 'flag', the behaviour every key had before the column, and says so.
+pub async fn context_overflow_for(db: &PgPool, consumer: &str) -> ContextOverflow {
+    if let Ok(modes) = OVERFLOW_MODES.read() {
+        if let Some((mode, at)) = modes.get(consumer) {
+            if at.elapsed() < OVERFLOW_TTL {
+                return *mode;
+            }
+        }
+    }
+    let row: Result<Option<bool>, sqlx::Error> = sqlx::query_scalar(
+        "SELECT bool_or(context_overflow = 'refuse') FROM noo_service_keys WHERE consumer = $1 AND active = true",
+    )
+    .bind(consumer)
+    .fetch_one(db)
+    .await;
+    let mode = match row {
+        Ok(Some(true)) => ContextOverflow::Refuse,
+        Ok(_) => ContextOverflow::Flag,
+        Err(e) => {
+            tracing::warn!(consumer, error = %e, "service_key_context_overflow_unreadable: flagging");
+            return ContextOverflow::Flag;
+        }
+    };
+    if let Ok(mut modes) = OVERFLOW_MODES.write() {
+        modes.insert(consumer.to_string(), (mode, Instant::now()));
+    }
+    mode
 }
 
 /// The consumer-name prefix of a key minted for a node harness's foreign
@@ -744,7 +814,7 @@ mod key_store_unavailable_tests {
 #[cfg(test)]
 mod invalidation_guard {
     /// Every write that changes which keys resolve (issue, revoke, rotate,
-    /// retire, quota, the add-on caller key) drops the resolved-key snapshot
+    /// retire, quota, context overflow, the add-on caller key) drops the resolved-key snapshot
     /// AFTER it is written, so the change answers now and not up to one TTL
     /// later: a revoked key must not keep working for 5 s (rc.1 rehearsal,
     /// A-mcppub.door; the TTL comment always said so, nothing did it).
@@ -757,6 +827,7 @@ mod invalidation_guard {
         ("routes/users.rs", "async fn service_key_revoke_and_disable(", "tx.commit().await?"),
         ("routes/users.rs", "async fn service_key_rotate(", "(SUPERSEDE_PREVIOUS_SQL)"),
         ("routes/users.rs", "async fn service_key_set_quota(", "UPDATE noo_service_keys SET rpm_limit"),
+        ("routes/users.rs", "async fn service_key_set_context_overflow(", "UPDATE noo_service_keys SET context_overflow"),
         ("addon_auth.rs", "pub async fn init(", "INSERT INTO noo_service_keys"),
         ("service_keys.rs", "pub async fn mint_door_key(", "INSERT INTO noo_service_keys"),
         ("service_keys.rs", "pub async fn revoke_door_key(", "UPDATE noo_service_keys SET active = false"),

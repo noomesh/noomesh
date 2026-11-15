@@ -11447,6 +11447,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/security/service-keys/{consumer}/context-overflow": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create context overflow
+         * @description [native] POST /api/security/service-keys/{consumer}/context-overflow — `flag` (send an over-long prompt and say the cut after the fact, every key's default) or `refuse` (413 `context_too_small` before sending). i802, operator 2026-11-15.
+         */
+        post: operations["service_key_set_context_overflow"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -27585,6 +27605,34 @@ export interface operations {
         };
     };
     coordinator_chat_stream: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    service_key_set_context_overflow: {
         parameters: {
             query?: never;
             header?: never;

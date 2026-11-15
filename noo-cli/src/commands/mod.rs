@@ -210,7 +210,7 @@ pub use security::{
     security_service_key_revoke,
     security_service_key_rotate,
     security_service_key_self, security_service_key_self_revoke, security_service_key_self_status,
-    security_service_key_set_quota, security_team_create, security_team_delete,
+    security_service_key_set_context_overflow, security_service_key_set_quota, security_team_create, security_team_delete,
     security_team_link_space, security_team_list, security_team_spaces,
     security_team_unlink_space, security_user_create, security_user_decide,
     security_user_disable, security_user_enable, security_user_erase, security_user_grant_role, security_user_link,

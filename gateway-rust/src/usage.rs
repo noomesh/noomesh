@@ -53,16 +53,21 @@ pub struct UsageActor {
     /// The credential or subsystem that made the call: a service key's
     /// consumer name, a cluster actor label, `heartbeat`, a channel name.
     pub consumer: Option<String>,
+    /// `consumer` is a service key's name (or the add-on's whose key bought
+    /// the token): its per-key settings apply, today the raw proxy's
+    /// context-overflow mode (`service_keys::context_overflow_for`). Never
+    /// set for a path label or a cluster actor.
+    pub keyed: bool,
 }
 
 impl UsageActor {
     /// A person acting through a named path (`telegram`, `chat`, `api`…).
     pub fn user(username: impl Into<String>, via: impl Into<String>) -> Self {
-        Self { username: Some(username.into()), consumer: Some(via.into()) }
+        Self { username: Some(username.into()), consumer: Some(via.into()), keyed: false }
     }
     /// Software or a credential with nobody behind it.
     pub fn consumer(label: impl Into<String>) -> Self {
-        Self { username: None, consumer: Some(label.into()) }
+        Self { username: None, consumer: Some(label.into()), keyed: false }
     }
     /// Nothing known — recorded as such, never guessed.
     pub fn unknown() -> Self {
@@ -734,7 +739,7 @@ mod tests {
 
     #[test]
     fn actor_blank_strings_become_none() {
-        let a = UsageActor { username: Some("  ".into()), consumer: Some("".into()) }.normalised();
+        let a = UsageActor { username: Some("  ".into()), consumer: Some("".into()), keyed: false }.normalised();
         assert_eq!(a, UsageActor::unknown());
         let a = UsageActor::user(" alice ", "api").normalised();
         assert_eq!(a.username.as_deref(), Some("alice"));

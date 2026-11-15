@@ -216,6 +216,7 @@ pub(crate) enum AuditKind {
     ServiceKeySelfIssue,
     ServiceKeySelfRevoke,
     ServiceKeySetQuota,
+    ServiceKeySetContextOverflow,
     SettingFlagSet,
     StackRebuild,
     SuperAdminSet,
@@ -354,6 +355,7 @@ impl AuditKind {
             Self::ServiceKeySelfIssue => "service_key_self_issue",
             Self::ServiceKeySelfRevoke => "service_key_self_revoke",
             Self::ServiceKeySetQuota => "service_key_set_quota",
+            Self::ServiceKeySetContextOverflow => "service_key_set_context_overflow",
             Self::SettingFlagSet => "setting_flag_set",
             Self::StackRebuild => "stack_rebuild",
             Self::SuperAdminSet => "super_admin_set",
@@ -493,6 +495,7 @@ impl AuditKind {
             Self::ServiceKeySelfIssue => Severity::Info,
             Self::ServiceKeySelfRevoke => Severity::Info,
             Self::ServiceKeySetQuota => Severity::Info,
+            Self::ServiceKeySetContextOverflow => Severity::Info,
             Self::SettingFlagSet => Severity::Info,
             Self::StackRebuild => Severity::Warning,
             Self::SuperAdminSet => Severity::Warning,
@@ -629,6 +632,7 @@ impl AuditKind {
             "service_key_self_issue" => Self::ServiceKeySelfIssue,
             "service_key_self_revoke" => Self::ServiceKeySelfRevoke,
             "service_key_set_quota" => Self::ServiceKeySetQuota,
+            "service_key_set_context_overflow" => Self::ServiceKeySetContextOverflow,
             "setting_flag_set" => Self::SettingFlagSet,
             "stack_rebuild" => Self::StackRebuild,
             "super_admin_set" => Self::SuperAdminSet,
@@ -766,6 +770,7 @@ impl AuditKind {
             Self::ServiceKeySelfIssue,
             Self::ServiceKeySelfRevoke,
             Self::ServiceKeySetQuota,
+            Self::ServiceKeySetContextOverflow,
             Self::SettingFlagSet,
             Self::StackRebuild,
             Self::SuperAdminSet,
@@ -1285,6 +1290,7 @@ mod tests {
         "service_key_self_issue",
         "service_key_self_revoke",
         "service_key_set_quota",
+        "service_key_set_context_overflow",
         "setting_flag_set",
         "stack_rebuild",
         "super_admin_set",
@@ -1338,7 +1344,7 @@ mod tests {
         let mut want: Vec<String> = PINNED.iter().map(|s| s.to_string()).collect();
         want.sort();
         assert_eq!(got, want, "a kind was renamed, added or dropped: edit PINNED on purpose");
-        assert_eq!(PINNED.len(), 129);
+        assert_eq!(PINNED.len(), 130);
     }
 
     #[test]
