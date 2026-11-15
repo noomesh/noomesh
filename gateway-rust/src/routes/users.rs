@@ -3229,17 +3229,11 @@ async fn service_key_set_context_overflow(
             body.mode
         )));
     };
-    let result = sqlx::query(
-        "UPDATE noo_service_keys SET context_overflow = $2 WHERE consumer = $1 AND active = true",
-    )
-    .bind(&consumer)
-    .bind(mode.as_str())
-    .execute(&state.db)
-    .await?;
+    let updated = crate::repo::service_key_overflow::set(&state.db, &consumer, mode.as_str()).await?;
     // The raw proxy reads the mode through a short cache: the new mode
     // applies now.
     crate::service_keys::invalidate_cache();
-    if result.rows_affected() == 0 {
+    if updated == 0 {
         return Err(AppError::NotFound(format!(
             "no active keys for consumer '{consumer}'"
         )));
@@ -3248,14 +3242,14 @@ async fn service_key_set_context_overflow(
     crate::audit::record(
         &state.db,
         AuditEvent::new(AuditKind::ServiceKeySetContextOverflow, &actor(&actor_ext), &consumer)
-            .details(json!({ "context_overflow": mode.as_str(), "updated_keys": result.rows_affected() })),
+            .details(json!({ "context_overflow": mode.as_str(), "updated_keys": updated })),
     )
     .await;
     Ok(Json(json!({
         "status": "ok",
         "consumer": consumer,
         "context_overflow": mode.as_str(),
-        "updated_keys": result.rows_affected(),
+        "updated_keys": updated,
     })))
 }
 
