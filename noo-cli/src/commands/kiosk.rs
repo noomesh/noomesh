@@ -1163,15 +1163,28 @@ pub fn kiosk_reload(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
     let build = || sh_out("noo-kiosk-cdp build 2>/dev/null").filter(|b| !b.is_empty() && b != "null");
     let before = build();
+    let seat = super::kiosk_seat::local_seat_display();
+    let not_needed = reload_not_needed(before.as_deref(), seat.as_ref().and_then(|s| s.0.as_deref()));
+    if let Some(n) = &not_needed {
+        if !g.json {
+            println!("{}", ui::note(n));
+        }
+    }
 
     if !g.json {
         ui::step("reloading the display");
     }
     // The broker takes reloads from root, the display user and the seat
     // user only (SO_PEERCRED), so "refused" above is a who, not a fault.
-    if let Err(e) = sh("noo-kiosk-cdp reload") {
-        fail(g.json, ExitCode::Generic, "cdp", &e,
-            Some("a refusal names the uid: reload as root, the display user or the seat user; anything else is in journalctl -u kiosk.service -n 50"));
+    let out = std::process::Command::new("bash").arg("-c").arg("noo-kiosk-cdp reload").output();
+    match out {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            let said = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            let (msg, fix) = reload_failure(o.status.code(), &said, seat.as_ref().map(|s| s.1.as_str()), not_needed.is_some());
+            fail(g.json, ExitCode::Generic, "cdp", &msg, Some(fix.as_str()));
+        }
+        Err(e) => fail(g.json, ExitCode::Generic, "cdp", &format!("noo-kiosk-cdp reload: {e}"), Some("noo kiosk status")),
     }
 
     // The page needs a moment to come back before it can state anything.
@@ -1196,6 +1209,44 @@ pub fn kiosk_reload(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     ui::done("reloaded");
     println!("{}", ui::note(&reload_line(before.as_deref(), after.as_deref())));
     Ok(0)
+}
+
+/// Said before a reload that changes nothing: the page already shows the
+/// console build this seat's last sync settled on (the roll reloaded or
+/// restarted the display itself). Off a seat, or with no build stated, it
+/// cannot be said, and nothing is.
+pub(crate) fn reload_not_needed(on_screen: Option<&str>, last_applied: Option<&str>) -> Option<String> {
+    match (on_screen, last_applied) {
+        (Some(b), Some(a)) if a == b => Some(format!(
+            "not needed: the display already shows console {b}, the build this seat's last sync applied (a roll reloads or restarts the display itself)"
+        )),
+        _ => None,
+    }
+}
+
+/// `noo-kiosk-cdp reload`'s exit code 6 (`NO_SOCKET`): the display is alive
+/// but its broker has no control socket.
+pub(crate) const CDP_NO_SOCKET: i32 = 6;
+
+/// The failure and its fix for a reload that did not happen. Exit 6 is a
+/// live display whose broker has no control socket: on a seat, the one root
+/// command that rewrites kiosk.service (`seat_repair`); off a seat, the setup
+/// that writes it. Anything else keeps the broker's own words and the uid
+/// rule. `not_needed`: the display already shows the current console.
+pub(crate) fn reload_failure(code: Option<i32>, said: &str, seat_repair: Option<&str>, not_needed: bool) -> (String, String) {
+    let said = said.trim().trim_start_matches("noo-kiosk-cdp: ");
+    if code == Some(CDP_NO_SOCKET) {
+        let current = if not_needed { " The display is current, so nothing is lost but the reload." } else { "" };
+        let fix = match seat_repair {
+            Some(r) => format!("{r}   (rewrites kiosk.service with this release's unit, then restarts the display)"),
+            None => "sudo noo kiosk setup <the options it was set up with>   (rewrites kiosk.service with this release's unit)".to_string(),
+        };
+        return (format!("the display is up, but it cannot be reloaded: {said}.{current}"), fix);
+    }
+    (
+        format!("`noo-kiosk-cdp reload` failed: {}", if said.is_empty() { "no reason given" } else { said }),
+        "a refusal names the uid: reload as root, the display user or the seat user; anything else is in journalctl -u kiosk.service -n 50".to_string(),
+    )
 }
 
 /// The note after `noo kiosk reload`: the console's build before and after,
@@ -2021,6 +2072,33 @@ pub fn kiosk_teardown(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 
 #[cfg(test)]
 mod tests {
+
+    /// homeserver after 0.6.24: the display ran, its broker had no control
+    /// socket (`noo-kiosk-cdp reload` exit 6). The reload says so and names the
+    /// one root command that rewrites the unit, never the uid rule.
+    #[test]
+    fn a_live_display_with_no_socket_names_the_repair_not_the_uid_rule() {
+        let said = "noo-kiosk-cdp: the display is alive (page.json 3s old) but its broker has no control socket at /run/kiosk/cdp.sock: /run/kiosk does not exist";
+        let (msg, fix) = reload_failure(Some(CDP_NO_SOCKET), said, Some("sudo /home/alex/.local/libexec/noo-seat/noo kiosk seat-sync --migrate"), true);
+        assert!(msg.starts_with("the display is up, but it cannot be reloaded: the display is alive"), "{msg}");
+        assert!(msg.contains("The display is current"), "{msg}");
+        assert!(fix.starts_with("sudo /home/alex/.local/libexec/noo-seat/noo kiosk seat-sync --migrate") && !fix.contains("uid"), "{fix}");
+        let (_, fix) = reload_failure(Some(CDP_NO_SOCKET), said, None, false);
+        assert!(fix.contains("noo kiosk setup"), "off a seat the setup writes the unit: {fix}");
+        let (msg, fix) = reload_failure(Some(5), "noo-kiosk-cdp: refused: uid 1001", None, false);
+        assert!(msg.contains("refused: uid 1001") && fix.contains("a refusal names the uid"), "{msg} / {fix}");
+    }
+
+    /// A reload after a roll changes nothing: the seat's sync already put the
+    /// display on the release's console. Said plainly, before reloading.
+    #[test]
+    fn a_reload_the_roll_already_did_is_said_to_be_not_needed() {
+        let n = reload_not_needed(Some("ui-1a2b3c"), Some("ui-1a2b3c")).unwrap();
+        assert!(n.starts_with("not needed: the display already shows console ui-1a2b3c"), "{n}");
+        assert!(reload_not_needed(Some("ui-1a2b3c"), Some("ui-9z")).is_none());
+        assert!(reload_not_needed(None, Some("ui-1a2b3c")).is_none());
+        assert!(reload_not_needed(Some("ui-1a2b3c"), None).is_none(), "off a seat it cannot be said");
+    }
     #[test]
     fn setup_switches_off_tailscaled_log_upload_through_the_enroll_script() {
         let c = tailscale_logs_off_cmd();

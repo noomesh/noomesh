@@ -196,3 +196,44 @@ def test_the_socket_is_connectable_and_the_peer_check_is_the_gate(tmp_path: Path
     finally:
         srv.close()
     assert m.allowed_uids() >= {0, os.getuid()}
+
+
+def _fresh_page(state: Path, age: int = 0) -> None:
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "page.json").write_text(json.dumps({"updated_at": int(time.time()) - age, "build": "stack-v0.6.24"}))
+
+
+def test_a_live_display_with_no_socket_is_its_own_exit_code(tmp_path: Path, capsys) -> None:
+    # homeserver after the 0.6.24 roll: Chromium up, page.json fresh, no
+    # /run/kiosk (a kiosk.service from before the broker has no
+    # RuntimeDirectory=kiosk). Not "is kiosk.service running?" (it is).
+    state = tmp_path / "state"
+    _fresh_page(state)
+    m = load(state)
+    m.SOCK = str(tmp_path / "run-kiosk-missing" / "cdp.sock")
+    with pytest.raises(SystemExit) as e:
+        m.reload()
+    assert e.value.code == m.NO_SOCKET == 6
+    err = capsys.readouterr().err
+    assert "the display is alive" in err and "no control socket" in err, err
+    assert "does not exist (kiosk.service has no RuntimeDirectory=kiosk" in err, err
+    # The directory exists but the socket is gone: still 6, said differently.
+    (tmp_path / "run-kiosk-missing").mkdir()
+    with pytest.raises(SystemExit) as e:
+        m.reload()
+    assert e.value.code == 6 and "exists but has no socket" in capsys.readouterr().err
+
+
+def test_no_socket_and_no_live_page_is_still_a_display_not_running(tmp_path: Path, capsys) -> None:
+    for name, age in (("stale", 120), ("none", None)):
+        state = tmp_path / name
+        if age is None:
+            state.mkdir()
+        else:
+            _fresh_page(state, age)
+        m = load(state)
+        m.SOCK = str(tmp_path / "nowhere" / "cdp.sock")
+        with pytest.raises(SystemExit) as e:
+            m.reload()
+        assert e.value.code == 5, name
+        assert "is kiosk.service running?" in capsys.readouterr().err
