@@ -465,6 +465,13 @@ without most of its instructions. The console and `noo chat` say so under the
 answer; the gateway logs `context_truncated_by_backend` and alerts the operator
 once a day per backend.
 
+A turn whose instructions and question cannot fit the backend's context gets
+one `error` line naming that context and, for Ollama or vLLM, the command that
+switches model with its backend named (`noo models switch <model> --backend
+ollama`). A backend's refusal reaches the person as `Backend error: <status>:
+<sentence>`, the sentence taken from either the OpenAI (`{"error":{"message":..}}`)
+or the Ollama (`{"error":".."}`) body, never the JSON itself.
+
 `working` comes only from a turn a node harness runs on a vendor kind
 (Copilot, Claude Code, Codex): the model's text as the harness's translator
 relays it, reasoning and planning included, batched about every 300 ms and
@@ -499,7 +506,7 @@ capped at 200 000 characters a turn. It is not the answer, which arrives as
 | GET | `/bootstrap/prep`, `/bootstrap/apply`, `/bootstrap/deenroll`, `/bootstrap/fetch`, `/bootstrap/ca.crt` | the pull rail a node walks during enrollment |
 | POST, GET | `/api/cluster/provision-bundle/{node}`, `…/status`; GET `/bootstrap/bundle/{node}`; POST `/bootstrap/bundle/{node}/applied` | signed provisioning bundles |
 | PUT, GET | `/api/cluster/cli-asset/{name}`, `/bootstrap/cli/{name}` | CLI binaries served to nodes |
-| GET | `/api/artifacts/manifest/{kind}/{name}` | artifact rail manifests (`gguf`, `modelfile`, `image`; `binary` is retired): `{size_bytes, sha256, data_path}`. The sha256 is cached by path, size and mtime; a file not yet hashed is hashed in the background, and a request that would wait more than ~8 s gets `202 {"status":"hashing","retry_after_secs"}` with `Retry-After` — ask again. `noo cluster sync-model-files` warms this before it queues the node jobs |
+| GET | `/api/artifacts/manifest/{kind}/{name}` | artifact rail manifests (`gguf`, `modelfile`, `image`; `binary` is retired): `{size_bytes, sha256, data_path}`. The sha256 is cached by path, size, nanosecond mtime, inode and device (an entry from an older gateway, without them, re-hashes once); a file not yet hashed is hashed in the background, and a request that would wait more than ~8 s gets `202 {"status":"hashing","retry_after_secs"}` with `Retry-After` — ask again. `noo cluster sync-model-files` warms this before it queues the node jobs |
 
 
 ## Models

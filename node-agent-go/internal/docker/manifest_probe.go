@@ -89,7 +89,10 @@ func awaitArtifactManifest(ctx context.Context, kind, name string) (*artifactMan
 }
 
 // awaitManifest is the loop, with the request injected so it is tested.
-func awaitManifest(ctx context.Context, budget time.Duration, ask func(context.Context) (*artifactManifest, error)) (*artifactManifest, error) {
+// Generic over the answer's type: the flat kinds decode an artifactManifest,
+// the `hf` kind a preseed.HFManifest.
+func awaitManifest[T any](ctx context.Context, budget time.Duration, ask func(context.Context) (T, error)) (T, error) {
+	var zero T
 	deadline := time.Now().Add(budget)
 	for {
 		m, err := ask(ctx)
@@ -98,17 +101,27 @@ func awaitManifest(ctx context.Context, budget time.Duration, ask func(context.C
 			return m, err
 		}
 		if time.Now().Add(h.retryAfter).After(deadline) {
-			return nil, fmt.Errorf("%w: the controller was still hashing the file after %s", ErrArtifactManifestTimeout, budget)
+			return zero, fmt.Errorf("%w: the controller was still hashing the file after %s", ErrArtifactManifestTimeout, budget)
 		}
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("%w: %w", ErrArtifactManifestTimeout, ctx.Err())
+			return zero, fmt.Errorf("%w: %w", ErrArtifactManifestTimeout, ctx.Err())
 		case <-time.After(h.retryAfter):
 		}
 	}
 }
 
 func lookupArtifactManifestWithin(ctx context.Context, kind, name string, timeout time.Duration) (*artifactManifest, error) {
+	body, err := manifestRoundTrip(ctx, kind, name, timeout)
+	if err != nil {
+		return nil, err
+	}
+	return decodeArtifactManifest(body)
+}
+
+// manifestRoundTrip asks the gateway for one manifest and returns the 200
+// body, or the classified failure (see doArtifactRequest).
+func manifestRoundTrip(ctx context.Context, kind, name string, timeout time.Duration) ([]byte, error) {
 	controller := strings.TrimRight(ctrlenv.ControllerURL(), "/")
 	// One resolver, one default: ctrlenv.ControllerURL() is never empty, the
 	// heartbeat and this lookup always agree on where the controller is.
@@ -133,12 +146,30 @@ func lookupArtifactManifestWithin(ctx context.Context, kind, name string, timeou
 	// controller holds it (2026-11-02 EMFILE, see config.HTTPTransport).
 	defer transport.CloseIdleConnections()
 	httpClient := &http.Client{Timeout: timeout, Transport: transport}
-	return doArtifactManifest(httpClient, req)
+	return doArtifactRequest(httpClient, req)
 }
 
 // doArtifactManifest runs the request and classifies the answer. Split out
 // so the classification is testable against an httptest server.
 func doArtifactManifest(httpClient *http.Client, req *http.Request) (*artifactManifest, error) {
+	body, err := doArtifactRequest(httpClient, req)
+	if err != nil {
+		return nil, err
+	}
+	return decodeArtifactManifest(body)
+}
+
+// ErrArtifactRefused is the gateway's 409: it HAS the artifact and refuses
+// to vouch for it (an `hf` blob whose bytes do not match its HF oid). The
+// message carries the gateway's reason. Never "absent", never retried into
+// a fallback.
+var ErrArtifactRefused = errors.New("the controller refused to vouch for it")
+
+// doArtifactRequest runs the request and returns a 200's body, or the
+// classified failure: ErrArtifactKindUnknown / ErrArtifactAbsent (400/404),
+// a hashingError (202), ErrArtifactRefused (409), a timeout, or an error
+// naming the status and the gateway's own message.
+func doArtifactRequest(httpClient *http.Client, req *http.Request) ([]byte, error) {
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		var ne interface{ Timeout() bool }
@@ -163,13 +194,36 @@ func doArtifactManifest(httpClient *http.Client, req *http.Request) (*artifactMa
 			wait = time.Duration(v) * time.Second
 		}
 		return nil, &hashingError{retryAfter: min(wait, maxManifestRetryAfter)}
+	case resp.StatusCode == http.StatusConflict:
+		return nil, fmt.Errorf("%w: %s", ErrArtifactRefused, gatewayErrorText(resp.Body))
 	case resp.StatusCode != http.StatusOK:
+		if msg := gatewayErrorText(resp.Body); msg != "" {
+			return nil, fmt.Errorf("manifest request answered HTTP %d: %s", resp.StatusCode, msg)
+		}
 		return nil, fmt.Errorf("manifest request answered HTTP %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
 		return nil, fmt.Errorf("read manifest: %w", err)
 	}
+	return body, nil
+}
+
+// gatewayErrorText is the gateway's `{"error": "..."}` message, or the
+// body's first bytes when it is not that shape.
+func gatewayErrorText(r io.Reader) string {
+	b, _ := io.ReadAll(io.LimitReader(r, 2048))
+	var e struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(b, &e) == nil && e.Error != "" {
+		return e.Error
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// decodeArtifactManifest reads a flat kind's manifest (one sha256).
+func decodeArtifactManifest(body []byte) (*artifactManifest, error) {
 	var m artifactManifest
 	if json.Unmarshal(body, &m) != nil || len(m.SHA256) != 64 {
 		return nil, fmt.Errorf("manifest response carried no usable sha256")

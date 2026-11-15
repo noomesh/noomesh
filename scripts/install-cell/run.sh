@@ -106,6 +106,12 @@ agent_dump() {
       if command -v noo >/dev/null 2>&1; then
         echo "== noo --json cluster show $(hostname) (this node: lanes, placements, backends)"
         timeout 60 noo --json cluster show "$(hostname)" 2>&1 | head -c 20000; echo
+        # The fit report the tuner and the decided context read (budgets
+        # with declared_used_gb and stack_reserve_gb, each model row with declared_gb,
+        # kv_per_token_bytes and kv_basis): a "why is my model at 16k"
+        # question is answered from it (i802, rc.2).
+        echo "== noo --json cluster fit $(hostname) (the declared basis)"
+        timeout 60 noo --json cluster fit "$(hostname)" 2>&1 | head -c 20000; echo
       fi
       if docker inspect noo-gateway >/dev/null 2>&1; then
         echo "== noo-gateway: nudges and placements (last 15 min)"
@@ -293,6 +299,14 @@ if [ "$MODEL" = tiny ]; then
     # product default (run 3: "model 'gemma4:e2b' is not served by any node");
     # the error's own remedy makes the tiny one the default.
     step switch-to-tiny-model 300 -- noo models switch "$TINY_MODEL" --backend ollama --yes || fail_onboarded
+fi
+# A/B (EMBED_SLOTS, the slots4 cell): the shared Ollama at that many slots
+# instead of what onboard chose, through the product's own remedy line
+# (cluster verify's CPU_ONLY_SLOTS_REMEDY). Before any turn, so every judged
+# turn runs at it.
+if [ -n "${EMBED_SLOTS:-}" ]; then
+    step embed-slots-ab 600 -- sh -c 'noo config set compose_env "{\"OLLAMA_EMBED_NUM_PARALLEL\":\"$1\"}" && noo stack restart --force ollama-embed && noo config get compose_env' \
+        slots "$EMBED_SLOTS" || fail_onboarded
 fi
 # verify runs as the stranger's NEXT terminal would: a fresh login session
 # (sudo -i reads /etc/group again). On a docker=none cell the install added
@@ -515,6 +529,9 @@ judged_ctx() {  # step name, timeout, context_fit.py args...
 }
 judged_ctx context-fit-running 300 running
 judged_ctx context-fit-turns 900 turns --out "$OUT/context-fit" --model-label "$MODEL"
+# A tool turn never shows the person a raw backend error (every cell; the
+# WSL2 one-box dials Ollama directly, where a replayed tool call was refused).
+judged_ctx context-fit-tool-replay 600 tool-replay
 if [ "$CELL" = "$CONTEXT_PIN_CELL" ] && [ -f "$CONTEXT_FIT" ]; then
     CHAT_MODEL="$(fresh --json cluster show "$(hostname)" 2>/dev/null | python3 -c 'import json, sys; print((json.load(sys.stdin).get("running_backends") or {}).get("ollama", ""))' 2>/dev/null)"
     CHAT_MODEL="${CHAT_MODEL:-$( [ "$MODEL" = tiny ] && echo "$TINY_MODEL" || echo gemma4:e2b)}"

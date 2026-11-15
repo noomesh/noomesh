@@ -814,6 +814,14 @@ pub(crate) struct Env<'a> {
     /// Show each download's live line (`DownloadLine`); false under `--json`
     /// and in tests.
     pub show_progress: bool,
+    /// Whether a staged revision directory's `model-set.json.sig` verifies
+    /// over its `model-set.json` (F10): only such a revision of the same set
+    /// is a link source. `models_stage` checks the fleet `signing.pub`, as
+    /// `list` does.
+    pub signed: &'a dyn Fn(&Path) -> bool,
+    /// Make a hard link (`std::fs::hard_link`): a seam for the fall-back
+    /// tests (EXDEV across filesystems, EPERM under protected_hardlinks).
+    pub link: &'a dyn Fn(&Path, &Path) -> std::io::Result<()>,
 }
 
 #[derive(Debug)]
@@ -1075,6 +1083,219 @@ fn place_extracted(work: &Path, set_dir: &Path, recs: &[FileRec]) -> Result<(), 
     Ok(())
 }
 
+// ── Reuse across revisions (F10) ────────────────────────────────────────
+//
+// A new revision of a set often changes a README and nothing else (moshiko
+// 5e079760 -> 2bfc9ae6: 15.76 GB of 15.76 GB unchanged by sha256). An LFS file
+// whose authenticated sha256 and size equal a file of a SIGNED earlier
+// revision of the same set id is hard-linked from it instead of downloaded,
+// then hashed by `fetch_lfs` exactly as an already present file is: the
+// earlier revision's manifest is never trusted for the bytes.
+//
+// Nothing in staging writes into or chmods an existing set file: every write
+// is a `.<name>.part` (or the signature's part) renamed over its destination,
+// and `mkdir` chmods directories only. So a file shared by two revisions is
+// never written through either (the guard test below holds this).
+
+/// The temporary name a reused file is linked under before it is renamed to
+/// its own name. `~` is outside the set-path charset, so it is never a set
+/// file; a stage that dies between link and rename leaves it, and the next
+/// stage of that revision removes it first ([`clear_link_strays`]).
+const LINK_TMP_SUFFIX: &str = ".link~";
+
+fn link_tmp(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!(".{name}{LINK_TMP_SUFFIX}"))
+}
+
+/// One file of a signed sibling revision, by its manifest row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LinkSrc {
+    rev: String,
+    /// The sibling's revision directory.
+    dir: PathBuf,
+    /// The file's set path, relative to `dir`.
+    rel: String,
+    bytes: u64,
+}
+
+/// A directory by lstat: a symbolic link to one is not.
+fn is_real_dir(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_dir())
+}
+
+/// A regular file by lstat: a symbolic link to one is not.
+fn is_regular(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file())
+}
+
+/// `dir/rel` when `rel` is a set path that stays inside `dir`: relative, no
+/// `.` or `..`, and no symbolic link on the way (`dir` itself and the one
+/// directory level a set path may have, by lstat). Else `None`.
+fn inside(dir: &Path, rel: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    if !model_set::valid_set_path(rel) || !is_real_dir(dir) {
+        return None;
+    }
+    let p = Path::new(rel);
+    if !p.components().all(|c| matches!(c, Component::Normal(_))) {
+        return None;
+    }
+    let full = dir.join(p);
+    if !full.starts_with(dir) {
+        return None;
+    }
+    if let Some((sub, _)) = rel.split_once('/') {
+        if !is_real_dir(&dir.join(sub)) {
+            return None;
+        }
+    }
+    Some(full)
+}
+
+/// sha256 -> a file of a signed sibling revision of set `id` (every revision
+/// dir under `id_dir` but `revision`, newest signature first, first one
+/// wins). A sibling counts only when it is a real directory whose signature
+/// and manifest are regular files, the signature verifies (`env.signed`),
+/// and the manifest validates and names this id and that revision. Hidden
+/// entries (`.extract-*` work dirs) are never siblings.
+fn sibling_index(env: &Env, id_dir: &Path, id: &str, revision: &str) -> std::collections::HashMap<String, LinkSrc> {
+    let mut idx = std::collections::HashMap::new();
+    let sets_ok = id_dir.parent().is_some_and(is_real_dir);
+    if !sets_ok || !is_real_dir(id_dir) {
+        return idx;
+    }
+    let mut revs: Vec<(std::time::SystemTime, String, PathBuf)> = Vec::new();
+    for e in std::fs::read_dir(id_dir).into_iter().flatten().flatten() {
+        let Ok(name) = e.file_name().into_string() else { continue };
+        if name == revision || name.starts_with('.') {
+            continue;
+        }
+        let dir = id_dir.join(&name);
+        if !is_real_dir(&dir) || !is_regular(&dir.join(MANIFEST)) {
+            continue;
+        }
+        let Ok(sig) = std::fs::symlink_metadata(dir.join(SIGNATURE)) else { continue };
+        if !sig.file_type().is_file() {
+            continue;
+        }
+        if !(env.signed)(&dir) {
+            continue;
+        }
+        revs.push((sig.modified().unwrap_or(std::time::UNIX_EPOCH), name, dir));
+    }
+    revs.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    for (_, rev, dir) in revs {
+        let Ok(bytes) = std::fs::read(dir.join(MANIFEST)) else { continue };
+        if model_set::validate(&bytes).is_err() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_slice::<Value>(&bytes) else { continue };
+        if v["id"] != id || v["revision"] != rev.as_str() {
+            continue;
+        }
+        for f in v["files"].as_array().into_iter().flatten() {
+            let (Some(rel), Some(sha), Some(n)) = (f["path"].as_str(), f["sha256"].as_str(), f["bytes"].as_u64()) else {
+                continue;
+            };
+            if idx.contains_key(sha) || inside(&dir, rel).is_none() {
+                continue;
+            }
+            let src = LinkSrc { rev: rev.clone(), dir: dir.clone(), rel: rel.to_string(), bytes: n };
+            idx.insert(sha.to_string(), src);
+        }
+    }
+    idx
+}
+
+/// Link `src` to `dest` through [`link_tmp`] and a rename, or say why not.
+/// The source must still be inside its revision directory with no symbolic
+/// link on the way ([`inside`], checked again now), a regular file by lstat
+/// (never followed), and of the wanted size by its manifest row and on disk.
+fn link_one(env: &Env, src: &LinkSrc, dest: &Path, want_bytes: u64) -> Result<(), String> {
+    if src.bytes != want_bytes {
+        return Err("its size differs between the two manifests".to_string());
+    }
+    let Some(path) = inside(&src.dir, &src.rel) else {
+        return Err("the source leaves its revision directory or passes a symbolic link".to_string());
+    };
+    let meta = std::fs::symlink_metadata(&path).map_err(|e| format!("the source: {e}"))?;
+    if !meta.file_type().is_file() {
+        return Err("the source is not a regular file".to_string());
+    }
+    if meta.len() != want_bytes {
+        return Err("the source's size on disk differs".to_string());
+    }
+    let (Some(dir), Some(name)) = (dest.parent(), dest.file_name()) else {
+        return Err("no destination name".to_string());
+    };
+    let tmp = link_tmp(dir, &name.to_string_lossy());
+    if std::fs::symlink_metadata(&tmp).is_ok() {
+        std::fs::remove_file(&tmp).map_err(|e| format!("removing the stale {}: {e}", tmp.display()))?;
+    }
+    (env.link)(&path, &tmp).map_err(|e| format!("link: {e}"))?;
+    if let Err(e) = std::fs::rename(&tmp, dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("rename: {e}"));
+    }
+    Ok(())
+}
+
+/// Hard-link the LFS file `s` from a signed earlier revision holding the same
+/// sha256 and size; whether it did. Only a file whose sha256 is known before
+/// any download (the listing's authenticated LFS digest, the value
+/// `fetch_lfs` checks) is looked up; a small file (git blob id only) never
+/// is. A file already at `dest` is left to the hash check. A refusal is one
+/// line and the file is downloaded; a link error (EXDEV, EPERM) turns
+/// linking off for the rest of this stage, since the others would fail alike.
+fn reuse_one(
+    env: &Env,
+    idx: &std::collections::HashMap<String, LinkSrc>,
+    s: &Sibling,
+    dest: &Path,
+    link_off: &mut bool,
+    say: &mut dyn FnMut(&str),
+) -> Option<String> {
+    if *link_off || !s.lfs {
+        return None;
+    }
+    let want = s.lfs_sha256.as_deref()?;
+    if std::fs::symlink_metadata(dest).is_ok() {
+        return None;
+    }
+    let src = idx.get(want)?;
+    let short = src.rev.get(..12).unwrap_or(&src.rev).to_string();
+    match link_one(env, src, dest, s.size) {
+        Ok(()) => Some(short),
+        Err(why) => {
+            say(&format!("{}: not linked from staged revision {short} ({why}); downloading it", s.path));
+            if why.starts_with("link: ") {
+                *link_off = true;
+            }
+            None
+        }
+    }
+}
+
+/// Remove every `.<name>.link~` a stage of this revision that died between
+/// link and rename left in `set_dir` or its one directory level. Unlinking a
+/// name never touches the inode the earlier revision still holds.
+fn clear_link_strays(set_dir: &Path) {
+    let mut dirs = vec![set_dir.to_path_buf()];
+    for e in std::fs::read_dir(set_dir).into_iter().flatten().flatten() {
+        if is_real_dir(&e.path()) {
+            dirs.push(e.path());
+        }
+    }
+    for d in dirs {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') && name.ends_with(LINK_TMP_SUFFIX) && !is_real_dir(&e.path()) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+}
+
 /// Stage `req` into `<models_dir>/sets/<id>/<sha>/`: list the pinned commit,
 /// settle the licence, validate the manifest BEFORE any download, fetch and
 /// verify every file, write `model-set.json`, then sign it LAST.
@@ -1225,6 +1446,15 @@ pub(crate) fn stage_set(
         place_extracted(w, &set_dir, &recs)?;
     }
 
+    // F10: unchanged files of a signed earlier revision are linked, not
+    // downloaded; a link left half made by a stage that died goes first.
+    clear_link_strays(&set_dir);
+    let reuse = if chosen.iter().any(|s| s.lfs) {
+        sibling_index(env, &id_dir, &req.id, &req.sha)
+    } else {
+        std::collections::HashMap::new()
+    };
+    let mut link_off = false;
     for s in &chosen {
         let dir = match s.path.split_once('/') {
             Some((sub, _)) => {
@@ -1234,9 +1464,33 @@ pub(crate) fn stage_set(
             }
             None => set_dir.clone(),
         };
-        say(&format!("{} ({})", s.path, models_fetch::human(s.size)));
+        let dest = set_dir.join(&s.path);
+        let linked = reuse_one(env, &reuse, s, &dest, &mut link_off, say);
+        match &linked {
+            Some(rev) => say(&format!(
+                "{} ({}, linked from staged revision {rev})",
+                s.path,
+                models_fetch::human(s.size)
+            )),
+            None => say(&format!("{} ({})", s.path, models_fetch::human(s.size))),
+        }
+        if linked.is_some() {
+            // A partial download of it from an earlier run is no longer
+            // needed (a `.part` is never a link: removing it is safe).
+            let _ = std::fs::remove_file(models_fetch::part_path(&dir, s.path.rsplit('/').next().unwrap_or(&s.path)));
+        }
         let rec = if s.lfs {
-            fetch_lfs(env, req, s, &dir)?
+            match fetch_lfs(env, req, s, &dir) {
+                Err(e) if linked.is_some() => {
+                    // The linked copy did not check: drop this name (the
+                    // earlier revision keeps its own) and download the file.
+                    say(&format!("{}: the linked copy did not check ({e}); downloading it", s.path));
+                    std::fs::remove_file(&dest)
+                        .map_err(|e| io_err(&format!("removing {}", dest.display()), e))?;
+                    fetch_lfs(env, req, s, &dir)?
+                }
+                r => r?,
+            }
         } else {
             fetch_small(env, req, s, &dir)?
         };
@@ -1584,6 +1838,11 @@ pub fn models_stage(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     };
     let token = models_fetch::hf_token();
+    // F10: an earlier revision is a link source only when its signature
+    // verifies against the fleet key, as `list` checks it.
+    let public = ca.signing_pub_path();
+    let signed = |d: &Path| public.is_file() && verify_file(&public, &d.join(MANIFEST), &d.join(SIGNATURE));
+    let link = |from: &Path, to: &Path| std::fs::hard_link(from, to);
     let by = clean_identity(&super::secrets_reveal::whoami());
     let now = super::secrets_reveal::now_rfc3339();
     let env = Env {
@@ -1595,6 +1854,8 @@ pub fn models_stage(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         recorded: read_acceptance(&dir, &req.id),
         repo_recorded: read_repo_acceptance(&dir, &req.repo, &req.sha),
         show_progress: !g.json,
+        signed: &signed,
+        link: &link,
     };
     if !g.json {
         println!("{}", ui::header("models stage", Some(&format!("hf:{}@{}", req.repo, req.sha))));
@@ -2062,6 +2323,15 @@ mod tests {
         std::fs::write(out, b"signature").map_err(|e| e.to_string())
     }
 
+    /// What `fake_sign` wrote is what verifies.
+    fn fake_signed(dir: &Path) -> bool {
+        std::fs::read(dir.join(SIGNATURE)).is_ok_and(|b| b == b"signature")
+    }
+
+    fn std_link(from: &Path, to: &Path) -> std::io::Result<()> {
+        std::fs::hard_link(from, to)
+    }
+
     fn run(
         f: &Fake,
         token: Option<&str>,
@@ -2078,6 +2348,8 @@ mod tests {
             recorded,
             repo_recorded: None,
             show_progress: false,
+            signed: &fake_signed,
+            link: &std_link,
         };
         let mut lines = Vec::new();
         let mut say = |l: &str| lines.push(l.to_string());
@@ -2358,6 +2630,8 @@ mod tests {
             recorded: None,
             repo_recorded: None,
             show_progress: false,
+            signed: &fake_signed,
+            link: &std_link,
         };
         let sign = |data: &Path, out: &Path| sign_file(&key, data, out);
         let req = request("voice");
@@ -2727,6 +3001,8 @@ mod tests {
             recorded: None,
             repo_recorded: None,
             show_progress: false,
+            signed: &fake_signed,
+            link: &std_link,
         }
     }
 
@@ -3504,6 +3780,8 @@ mod tests {
             recorded: read_acceptance(dir, &req.id),
             repo_recorded: repo_recorded.clone(),
             show_progress: false,
+            signed: &fake_signed,
+            link: &std_link,
         };
         let st = stage_set(&env, req, &needs(), &fake_sign, &mut |_: &str| {})?;
         record_repo_acceptance(dir, req, &st, repo_recorded.as_ref()).expect("recorded");
@@ -3618,5 +3896,446 @@ mod tests {
             std::fs::write(&path, serde_json::to_vec(&b).unwrap()).unwrap();
             assert_eq!(read_repo_acceptance(&dir, REPO, SHA), None, "{b}");
         }
+    }
+
+    // ── F10: a new revision reuses the unchanged files of a staged one ───
+
+    const SHA2: &str = "fedcba9876543210fedcba9876543210fedcba98";
+    const README_V1: &[u8] = b"# test voice\nrevision one\n";
+    const README_V2: &[u8] = b"# test voice\nrevision two, README only\n";
+
+    /// A fake Hugging Face answering for commit `rev` only: README.md and an
+    /// LFS weights.bin of `w`, its sha256 published when `lfs_sha` is set.
+    fn hf_rev_with(rev: &'static str, w: Vec<u8>, readme: &'static [u8], lfs_sha: bool) -> Fake {
+        serve(move |method, path| {
+            if path.starts_with(&format!("/api/models/{REPO}/revision/{rev}")) {
+                let blob = crate::commands::voice_models::git_blob_sha1;
+                let mut lfs = json!({"size": w.len(), "pointerSize": 134});
+                if lfs_sha {
+                    lfs["sha256"] = json!(sha256_hex(&w));
+                }
+                let doc = json!({
+                    "sha": rev,
+                    "gated": false,
+                    "cardData": {"license": "apache-2.0"},
+                    "siblings": [
+                        {"rfilename": "README.md", "size": readme.len(), "blobId": blob(readme)},
+                        {"rfilename": "weights.bin", "size": w.len(), "blobId": "2".repeat(40), "lfs": lfs},
+                    ],
+                });
+                return resp(200, doc.to_string().as_bytes());
+            }
+            let resolve = format!("/{REPO}/resolve/{rev}/");
+            match path.strip_prefix(resolve.as_str()) {
+                Some("README.md") => resp(200, readme),
+                Some("weights.bin") => {
+                    let mut r = resp(302, b"");
+                    r.headers.push(("Location".into(), "/cdn/weights.bin".into()));
+                    r.headers.push(("x-linked-etag".into(), format!("\"{}\"", sha256_hex(&w))));
+                    r.headers.push(("x-linked-size".into(), w.len().to_string()));
+                    r
+                }
+                _ if path == "/cdn/weights.bin" && method == "GET" => resp(200, &w),
+                _ => resp(404, b""),
+            }
+        })
+    }
+
+    fn hf_rev(rev: &'static str, w: Vec<u8>, readme: &'static [u8]) -> Fake {
+        hf_rev_with(rev, w, readme, true)
+    }
+
+    /// How many times the weights' bytes were downloaded (the download seam).
+    fn weight_gets(f: &Fake) -> usize {
+        f.seen.lock().unwrap().iter().filter(|(m, p, _)| m == "GET" && p == "/cdn/weights.bin").count()
+    }
+
+    fn got(f: &Fake, rev: &str, file: &str) -> bool {
+        let want = format!("/{REPO}/resolve/{rev}/{file}");
+        f.seen.lock().unwrap().iter().any(|(m, p, _)| m == "GET" && *p == want)
+    }
+
+    fn rev_dir(dir: &Path, rev: &str) -> PathBuf {
+        dir.join("sets/test-voice-set").join(rev)
+    }
+
+    fn ino(p: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(p).unwrap().ino()
+    }
+
+    fn nlink(p: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(p).unwrap().nlink()
+    }
+
+    fn stage_rev(
+        f: &Fake,
+        dir: &Path,
+        rev: &str,
+        link: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+    ) -> (Result<Staged, StageError>, Vec<String>) {
+        let env = Env {
+            base: &f.base,
+            token: None,
+            models_dir: dir,
+            by: "alice",
+            now: "2026-11-05T10:00:00Z",
+            recorded: None,
+            repo_recorded: None,
+            show_progress: false,
+            signed: &fake_signed,
+            link,
+        };
+        let req = StageArgs { sha: rev.to_string(), ..request("voice") };
+        let mut lines = Vec::new();
+        let mut say = |l: &str| lines.push(l.to_string());
+        let r = stage_set(&env, &req, &needs(), &fake_sign, &mut say);
+        (r, lines)
+    }
+
+    /// The old revision, staged and signed from its own fake (one download).
+    fn staged_old(tag: &str) -> PathBuf {
+        let dir = tmpdir(tag);
+        let old = hf_rev(SHA, weights(), README_V1);
+        stage_rev(&old, &dir, SHA, &std_link).0.expect("the old revision stages");
+        assert_eq!(weight_gets(&old), 1, "the control: a first stage downloads");
+        dir
+    }
+
+    fn changed_weights() -> Vec<u8> {
+        let mut w = weights();
+        w[0] ^= 0xff;
+        w
+    }
+
+    /// Rewrite the old revision's manifest text (its fake signature still
+    /// verifies: the sibling stays signed).
+    fn edit_old_manifest(dir: &Path, from: &str, to: &str) {
+        let p = rev_dir(dir, SHA).join(MANIFEST);
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains(from), "{text}");
+        std::fs::write(&p, text.replacen(from, to, 1)).unwrap();
+    }
+
+    #[test]
+    fn an_unchanged_file_is_linked_from_the_signed_revision_not_downloaded() {
+        let dir = staged_old("f10-linked");
+        let new = hf_rev(SHA2, weights(), README_V2);
+        let (r, lines) = stage_rev(&new, &dir, SHA2, &std_link);
+        let st = r.expect("the new revision stages");
+        assert_eq!(weight_gets(&new), 0, "the unchanged weights were downloaded: {lines:?}");
+        let (old_w, new_w) = (rev_dir(&dir, SHA).join("weights.bin"), rev_dir(&dir, SHA2).join("weights.bin"));
+        assert_eq!(ino(&old_w), ino(&new_w), "the same inode");
+        assert_eq!(nlink(&new_w), 2);
+        assert!(
+            lines.iter().any(|l| l.starts_with("weights.bin (") && l.contains(&format!("linked from staged revision {}", &SHA[..12]))),
+            "{lines:?}"
+        );
+        // Hashed as today: the record is the file's own digest.
+        let w = st.files.iter().find(|f| f.path == "weights.bin").unwrap();
+        assert_eq!((w.sha256.as_str(), w.bytes), (sha256_hex(&weights()).as_str(), weights().len() as u64));
+        // The README changed, and a small file is always downloaded.
+        assert!(got(&new, SHA2, "README.md"));
+        assert_eq!(std::fs::read(rev_dir(&dir, SHA2).join("README.md")).unwrap(), README_V2);
+        assert!(fake_signed(&rev_dir(&dir, SHA2)));
+        assert!(!rev_dir(&dir, SHA2).join(".weights.bin.link~").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_changed_file_is_downloaded_and_the_old_copy_is_untouched() {
+        let dir = staged_old("f10-changed");
+        let new = hf_rev(SHA2, changed_weights(), README_V2);
+        let (r, lines) = stage_rev(&new, &dir, SHA2, &std_link);
+        r.expect("the new revision stages");
+        assert_eq!(weight_gets(&new), 1, "{lines:?}");
+        let (old_w, new_w) = (rev_dir(&dir, SHA).join("weights.bin"), rev_dir(&dir, SHA2).join("weights.bin"));
+        assert_ne!(ino(&old_w), ino(&new_w));
+        assert_eq!(std::fs::read(&old_w).unwrap(), weights());
+        assert_eq!(std::fs::read(&new_w).unwrap(), changed_weights());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_small_file_is_never_linked_even_when_unchanged() {
+        let dir = staged_old("f10-small");
+        let new = hf_rev(SHA2, weights(), README_V1);
+        stage_rev(&new, &dir, SHA2, &std_link).0.expect("the new revision stages");
+        assert!(got(&new, SHA2, "README.md"), "its sha256 is not known before the download");
+        let (old_r, new_r) = (rev_dir(&dir, SHA).join("README.md"), rev_dir(&dir, SHA2).join("README.md"));
+        assert_ne!(ino(&old_r), ino(&new_r));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_lfs_file_with_no_published_digest_is_never_linked() {
+        let dir = staged_old("f10-nodigest");
+        let new = hf_rev_with(SHA2, weights(), README_V2, false);
+        // The refusal below would also clean up a link made first, so watch
+        // the seam itself: with no published digest no link is even tried.
+        let tried = std::cell::Cell::new(0usize);
+        let counting = |from: &Path, to: &Path| {
+            tried.set(tried.get() + 1);
+            std::fs::hard_link(from, to)
+        };
+        let e = stage_rev(&new, &dir, SHA2, &counting).0.expect_err("no digest, no stage");
+        assert!(e.to_string().contains("no LFS sha256"), "{e}");
+        assert_eq!(tried.get(), 0, "a link was tried for a file whose digest is unknown");
+        let new_w = rev_dir(&dir, SHA2).join("weights.bin");
+        assert!(std::fs::symlink_metadata(&new_w).is_err(), "a file whose digest is unknown was linked");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_linked_file_that_does_not_hash_is_replaced_by_a_download() {
+        let dir = staged_old("f10-rehash");
+        // Same size, other bytes: only the hash can tell.
+        let old_w = rev_dir(&dir, SHA).join("weights.bin");
+        std::fs::write(&old_w, changed_weights()).unwrap();
+        let new = hf_rev(SHA2, weights(), README_V2);
+        let (r, lines) = stage_rev(&new, &dir, SHA2, &std_link);
+        r.expect("the new revision stages from a download");
+        assert_eq!(weight_gets(&new), 1, "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("the linked copy did not check")), "{lines:?}");
+        let new_w = rev_dir(&dir, SHA2).join("weights.bin");
+        assert_ne!(ino(&old_w), ino(&new_w));
+        assert_eq!(std::fs::read(&new_w).unwrap(), weights());
+        assert_eq!(std::fs::read(&old_w).unwrap(), changed_weights(), "the old copy was written through");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_symlinked_source_is_never_followed_and_the_file_is_downloaded() {
+        let dir = staged_old("f10-symlink");
+        let outside = tmpdir("f10-symlink-outside");
+        let old_w = rev_dir(&dir, SHA).join("weights.bin");
+        std::fs::rename(&old_w, outside.join("weights.bin")).unwrap();
+        std::os::unix::fs::symlink(outside.join("weights.bin"), &old_w).unwrap();
+        let new = hf_rev(SHA2, weights(), README_V2);
+        let (r, lines) = stage_rev(&new, &dir, SHA2, &std_link);
+        r.expect("the new revision stages");
+        assert_eq!(weight_gets(&new), 1, "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("not a regular file")), "{lines:?}");
+        let new_w = rev_dir(&dir, SHA2).join("weights.bin");
+        assert!(std::fs::symlink_metadata(&new_w).unwrap().file_type().is_file());
+        assert_ne!(ino(&new_w), ino(&outside.join("weights.bin")));
+        for d in [&dir, &outside] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn a_source_behind_a_symlinked_directory_is_never_linked() {
+        let dir = staged_old("f10-escape");
+        let outside = tmpdir("f10-escape-outside");
+        std::fs::write(outside.join("weights.bin"), weights()).unwrap();
+        // The signed sibling says its weights are at sub/weights.bin, and sub
+        // leads out of the revision directory.
+        edit_old_manifest(&dir, "\"path\": \"weights.bin\"", "\"path\": \"sub/weights.bin\"");
+        std::os::unix::fs::symlink(&outside, rev_dir(&dir, SHA).join("sub")).unwrap();
+        let new = hf_rev(SHA2, weights(), README_V2);
+        let (r, lines) = stage_rev(&new, &dir, SHA2, &std_link);
+        r.expect("the new revision stages");
+        assert_eq!(weight_gets(&new), 1, "{lines:?}");
+        let new_w = rev_dir(&dir, SHA2).join("weights.bin");
+        assert_ne!(ino(&new_w), ino(&outside.join("weights.bin")), "linked from outside the store");
+        assert_eq!(nlink(&outside.join("weights.bin")), 1);
+        for d in [&dir, &outside] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn inside_keeps_a_set_path_in_its_revision_directory() {
+        let d = tmpdir("f10-inside");
+        let outside = tmpdir("f10-inside-outside");
+        std::fs::create_dir_all(d.join("real")).unwrap();
+        std::os::unix::fs::symlink(&outside, d.join("link")).unwrap();
+        assert_eq!(inside(&d, "a.bin"), Some(d.join("a.bin")));
+        assert_eq!(inside(&d, "real/a.bin"), Some(d.join("real/a.bin")));
+        for bad in ["../a.bin", "/etc/passwd", "./a.bin", "real/../a.bin", "a/b/c", "", "link/a.bin"] {
+            assert_eq!(inside(&d, bad), None, "{bad}");
+        }
+        assert_eq!(inside(&d.join("link"), "a.bin"), None, "the revision directory itself as a link");
+        for x in [&d, &outside] {
+            let _ = std::fs::remove_dir_all(x);
+        }
+    }
+
+    #[test]
+    fn a_size_that_differs_between_the_manifests_is_downloaded() {
+        let dir = staged_old("f10-size-manifest");
+        let n = weights().len();
+        edit_old_manifest(&dir, &format!("\"bytes\": {n},"), &format!("\"bytes\": {},", n - 1));
+        let new = hf_rev(SHA2, weights(), README_V2);
+        let (r, lines) = stage_rev(&new, &dir, SHA2, &std_link);
+        r.expect("the new revision stages");
+        assert_eq!(weight_gets(&new), 1, "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("size differs between the two manifests")), "{lines:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_size_on_disk_that_differs_is_downloaded() {
+        let dir = staged_old("f10-size-disk");
+        let mut longer = weights();
+        longer.push(0);
+        std::fs::write(rev_dir(&dir, SHA).join("weights.bin"), &longer).unwrap();
+        let new = hf_rev(SHA2, weights(), README_V2);
+        let (r, lines) = stage_rev(&new, &dir, SHA2, &std_link);
+        r.expect("the new revision stages");
+        assert_eq!(weight_gets(&new), 1, "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("size on disk differs")), "{lines:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_link_error_is_one_line_and_the_file_is_downloaded() {
+        let dir = staged_old("f10-exdev");
+        let new = hf_rev(SHA2, weights(), README_V2);
+        let exdev = |_: &Path, _: &Path| -> std::io::Result<()> { Err(std::io::Error::from_raw_os_error(18)) };
+        let (r, lines) = stage_rev(&new, &dir, SHA2, &exdev);
+        r.expect("the new revision stages from a download");
+        assert_eq!(weight_gets(&new), 1, "{lines:?}");
+        let refusals: Vec<&String> = lines.iter().filter(|l| l.contains("not linked")).collect();
+        assert_eq!(refusals.len(), 1, "{lines:?}");
+        assert!(refusals[0].contains("link: "), "{lines:?}");
+        let new_w = rev_dir(&dir, SHA2).join("weights.bin");
+        assert_ne!(ino(&new_w), ino(&rev_dir(&dir, SHA).join("weights.bin")));
+        assert!(!rev_dir(&dir, SHA2).join(".weights.bin.link~").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_link_goes_to_a_temporary_name_then_is_renamed() {
+        let dir = staged_old("f10-tmp");
+        let new = hf_rev(SHA2, weights(), README_V2);
+        let made = std::cell::RefCell::new(Vec::<PathBuf>::new());
+        let recording = |from: &Path, to: &Path| {
+            made.borrow_mut().push(to.to_path_buf());
+            std::fs::hard_link(from, to)
+        };
+        stage_rev(&new, &dir, SHA2, &recording).0.expect("the new revision stages");
+        let tmp = rev_dir(&dir, SHA2).join(".weights.bin.link~");
+        assert_eq!(*made.borrow(), vec![tmp.clone()]);
+        assert!(!tmp.exists());
+        assert_eq!(weight_gets(&new), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stray_link_from_a_stage_that_died_is_cleared() {
+        let dir = staged_old("f10-stray");
+        let new_dir = rev_dir(&dir, SHA2);
+        std::fs::create_dir_all(new_dir.join("sub")).unwrap();
+        let old_w = rev_dir(&dir, SHA).join("weights.bin");
+        // Died between link and rename (a file the new revision changes, so
+        // nothing re-links it), and one a level down.
+        let strays = [new_dir.join(".weights.bin.link~"), new_dir.join("sub/.other.bin.link~")];
+        for s in &strays {
+            std::fs::hard_link(&old_w, s).unwrap();
+        }
+        let new = hf_rev(SHA2, changed_weights(), README_V2);
+        stage_rev(&new, &dir, SHA2, &std_link).0.expect("the new revision stages");
+        for s in &strays {
+            assert!(std::fs::symlink_metadata(s).is_err(), "{} was left", s.display());
+        }
+        assert_eq!(std::fs::read(&old_w).unwrap(), weights(), "clearing a stray left the old copy");
+        assert_eq!(nlink(&old_w), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_signed_revision_is_a_link_source() {
+        for (tag, sig) in [("f10-nosig", None), ("f10-badsig", Some(&b"forged"[..]))] {
+            let dir = staged_old(tag);
+            let sig_path = rev_dir(&dir, SHA).join(SIGNATURE);
+            match sig {
+                None => std::fs::remove_file(&sig_path).unwrap(),
+                Some(b) => std::fs::write(&sig_path, b).unwrap(),
+            }
+            let new = hf_rev(SHA2, weights(), README_V2);
+            let (r, lines) = stage_rev(&new, &dir, SHA2, &std_link);
+            r.expect("the new revision stages");
+            assert_eq!(weight_gets(&new), 1, "{tag}: linked from an unsigned revision: {lines:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn removing_the_old_revision_leaves_the_linked_one_whole() {
+        let dir = staged_old("f10-rm");
+        let new = hf_rev(SHA2, weights(), README_V2);
+        stage_rev(&new, &dir, SHA2, &std_link).0.expect("the new revision stages");
+        assert_eq!(weight_gets(&new), 0, "the control: it was linked");
+        let id_dir = dir.join(SETS_DIR).join("test-voice-set");
+        let targets = rm_targets(&dir, "test-voice-set", Some(SHA)).unwrap();
+        assert_eq!(targets, vec![rev_dir(&dir, SHA)]);
+        rm_remove(&id_dir, &targets, &[]).unwrap();
+        assert!(!rev_dir(&dir, SHA).exists());
+        let new_dir = rev_dir(&dir, SHA2);
+        assert!(fake_signed(&new_dir));
+        let m: Value = serde_json::from_slice(&std::fs::read(new_dir.join(MANIFEST)).unwrap()).unwrap();
+        model_set::validate(&std::fs::read(new_dir.join(MANIFEST)).unwrap()).expect("valid");
+        let files = m["files"].as_array().unwrap();
+        assert_eq!(files.len(), 2);
+        for f in files {
+            let p = new_dir.join(f["path"].as_str().unwrap());
+            assert_eq!(models_fetch::sha256_file(&p).unwrap(), f["sha256"].as_str().unwrap(), "{}", p.display());
+            assert_eq!(std::fs::metadata(&p).unwrap().len(), f["bytes"].as_u64().unwrap());
+            assert_eq!(nlink(&p), 1);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The node's makeWritable trap, on the controller: a set file may be a
+    /// hard link shared with another revision, so nothing may open an
+    /// existing file for writing or chmod one. Every write is a temporary
+    /// `.part` (or the signature's part) renamed over its destination, and
+    /// the only other chmod is `mkdir`'s, on a directory.
+    #[test]
+    fn nothing_in_staging_writes_into_or_chmods_an_existing_set_file() {
+        let sets = crate::test_src::own_code(include_str!("models_sets.rs"));
+        let fetch = crate::test_src::own_code(include_str!("models_fetch.rs"));
+        let allowed = [
+            "std::fs::set_permissions(p, ",
+            "std::fs::set_permissions(&part, ",
+            "std::fs::set_permissions(&sig_part, ",
+            "std::fs::write(&part, ",
+            ".open(part)",
+            "File::create(part)",
+        ];
+        let risky = [
+            "set_permissions(",
+            "OpenOptions::new()",
+            "File::options(",
+            "File::create(",
+            "fs::write(",
+            ".write(true)",
+            ".truncate(true)",
+            ".append(true)",
+        ];
+        let mut seen = 0;
+        for (name, code) in [("models_sets.rs", &sets), ("models_fetch.rs", &fetch)] {
+            for line in code.lines() {
+                let t = line.trim();
+                if !risky.iter().any(|r| t.contains(r)) {
+                    continue;
+                }
+                seen += 1;
+                assert!(
+                    allowed.iter().any(|a| t.contains(a)),
+                    "{name}: a write or chmod this guard does not know (a set file may be a hard link \
+                     shared with another revision, F10): {t}"
+                );
+            }
+        }
+        assert!(seen >= 7, "the guard read too few write sites ({seen}): it is stale");
+        let link = crate::test_src::fn_body(&sets, "fn link_one(");
+        assert!(link.contains("(env.link)(&path, &tmp)"), "the link is made to the temporary name: {link}");
+        assert!(link.contains("std::fs::rename(&tmp, dest)"), "{link}");
+        let stage = crate::test_src::fn_body(&sets, "pub(crate) fn stage_set(");
+        assert!(stage.contains("clear_link_strays(&set_dir);"), "strays are cleared before the files");
     }
 }

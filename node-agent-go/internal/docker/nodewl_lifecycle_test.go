@@ -566,3 +566,47 @@ func TestStartManagedIsRefusedByTheGate(t *testing.T) {
 		t.Fatalf("a refused start touched the node: %v", h.api.callList())
 	}
 }
+
+// 0.6.25-rc.2 rehearsal: a provisioning attempt that failed with an uncoded
+// error left the row's EARLIER reason (door_leaf_missing) in place, so the
+// node, the gateway and the reserve refusal named the wrong cause. A failed
+// provision now says provision_failed; an uncoded error outside provisioning
+// still never replaces a reason (TestOnlyAReasonCodeChangesTheReasonOfARow).
+func TestAFailedProvisionReplacesTheEarlierReason(t *testing.T) {
+	h := newLife(t)
+	e := h.provisioned()
+	h.p.with(e.Addon, e.Name, func(ls *lifeState) { ls.reason = nodewl.ReasonDoorLeafMissing })
+	h.api.loadErr = errors.New("docker load: the daemon went away")
+	h.p.Converge(context.Background(), e)
+	cur, _ := h.p.read(e.Addon, e.Name)
+	if cur.reason != nodewl.ReasonProvisionFailed {
+		t.Fatalf("after a failed provision the row says %q, want provision_failed", cur.reason)
+	}
+	if got := provisionErr(errors.New(`fetch https://h:8443/x?token=T`)); nodewl.CodeOf(got) != nodewl.ReasonProvisionFailed || strings.Contains(got.Error(), "token=T") {
+		t.Fatalf("provisionErr: %v", got)
+	}
+	if got := provisionErr(ErrSetsPending); !errors.Is(got, ErrSetsPending) {
+		t.Fatal("a routine wait is not a provision failure")
+	}
+}
+
+// The case that started this (0.6.25-rc.2, A-nodewl.reserve): the door leaf
+// is ready but the rail the image comes from refuses the connection. The row
+// must END saying image_unavailable: the stale door_leaf_missing from an
+// earlier attempt is replaced, not kept.
+func TestAReadyLeafAndAnUnreachableRailEndAsImageUnavailable(t *testing.T) {
+	h := newLife(t)
+	e := h.provisioned()
+	h.p.with(e.Addon, e.Name, func(ls *lifeState) { ls.reason = nodewl.ReasonDoorLeafMissing })
+	if !h.p.LeafReady(e.Addon, e.Name) {
+		t.Fatal("the harness's door leaf must be ready for this case")
+	}
+	h.p.fetchTar = func(context.Context, string) (string, func(), error) {
+		return "", nil, errors.New(`Get "https://noo-controller:8443/images/w.tar": dial tcp 172.31.250.10:8443: connect: connection refused`)
+	}
+	h.p.Converge(context.Background(), e)
+	cur, _ := h.p.read(e.Addon, e.Name)
+	if cur.reason != nodewl.ReasonImageUnavailable {
+		t.Fatalf("a ready leaf and a refused rail left the row saying %q, want image_unavailable", cur.reason)
+	}
+}

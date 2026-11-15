@@ -33,6 +33,12 @@ type HarnessPlacement struct {
 	// unknown. The harness tells a foreign CLI its real window with it
 	// (Claude Code assumes 200k for a model it does not know).
 	ModelContext int `json:"model_context,omitempty"`
+	// ChatContexts is the controller's decided context per Ollama chat
+	// model on this node (desired-config `chat_contexts`, keys with a tag:
+	// a bare name is `:latest`), omitted when none is decided. The agent
+	// stamps it as options.num_ctx on that model's calls; the harness fits
+	// its turns to the same number (i802).
+	ChatContexts map[string]int `json:"chat_contexts,omitempty"`
 	// Unknown: the agent has not applied a desired-config yet, so it cannot
 	// say whether a harness is placed. The route answers 503 with
 	// Retry-After, and the harness waits instead of falling back to its

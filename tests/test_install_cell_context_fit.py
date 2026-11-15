@@ -95,6 +95,17 @@ def test_running_passes_when_the_backend_runs_the_decided_context_above_4096():
     assert rc == CF.PASS and "running 16384, decided 16384" in line
 
 
+def test_a_pin_read_before_any_turn_reloads_once_and_then_judges():
+    # stranger-24.04, rc.2 run 43669565774: right after the 4096 pin and the
+    # gateway restart the daemon still ran 32768 from the earlier turns.
+    pinned = {"chat_contexts": [_ctx(32768, 4096)]}
+    rc, why = CF.judge_running(pinned, expect_decided=4096, final=False)
+    assert rc is None and "still runs" in why, why
+    rc, line = CF.judge_running(pinned, expect_decided=4096, final=True)
+    assert rc == CF.FAIL and "the backend runs 32768, the gateway decided 4096" in line
+    assert CF.judge_running({"chat_contexts": [_ctx(4096, 4096)]}, expect_decided=4096, final=False)[0] == CF.PASS
+
+
 def test_running_fails_on_a_mismatch_or_a_small_decision():
     rc, line = CF.judge_running({"chat_contexts": [_ctx(4096, 16384)]})
     assert rc == CF.FAIL and "the backend runs 4096, the gateway decided 16384" in line
@@ -175,6 +186,61 @@ def test_the_tool_turn_needs_the_call_and_the_fact():
     assert ok is None and "not exercised" in why
     ok, why = CF.judge_tool("The notes mention a deadline.", ["noo_rag_query"])
     assert ok is False and "does not carry the fact" in why
+
+
+# ── tool-replay: never a raw backend error ───────────────────────────────
+
+DIRECT_CALL = BACKEND_CALL.replace('"backend":"ollama",', '"backend":"ollama","wire":"ollama",')
+WSL2_RAW = """Backend error: 400: {"error":"Value looks like object, but can't find closing '}' symbol"}"""
+
+
+def _facts(*lines):
+    return CF.log_facts(list(lines))
+
+
+def test_the_wire_field_is_read_off_backend_call():
+    assert CF.parse_log_line(DIRECT_CALL)["wire"] == "ollama"
+
+
+def test_a_raw_backend_error_fails_tool_replay_even_on_the_tiny_model():
+    rc, why = CF.judge_tool_replay("", WSL2_RAW, [], _facts(DIRECT_CALL), "tiny")
+    assert rc == CF.FAIL and why.startswith("a raw backend error reached the person (wire ollama)"), why
+    rc, _ = CF.judge_tool_replay('{"error": "boom"}', None, ["noo_rag_query"], _facts(DIRECT_CALL), "default")
+    assert rc == CF.FAIL
+
+
+def test_tool_replay_on_an_older_build_is_not_judged_and_keeps_the_evidence():
+    rc, why = CF.judge_tool_replay("", WSL2_RAW, [], _facts(BACKEND_CALL), "tiny")
+    assert rc == CF.NOT_JUDGED and "no wire=" in why and "Value looks like object" in why, why
+    assert CF.judge_tool_replay("x", None, [], CF.log_facts(None), "default")[0] == CF.NOT_JUDGED
+
+
+def test_a_turn_records_the_wires_its_model_calls_went_out_on():
+    assert CF.turn_wires(_facts(DIRECT_CALL, BACKEND_CALL, DIRECT_CALL)) == ["ollama"]
+    assert CF.turn_wires(_facts(BACKEND_CALL)) is None, "a build without wire= says null, not a guess"
+    assert CF.turn_wires(CF.log_facts(None)) is None
+    rec = CF.turn_record("tool", True, "ok", 1.0, _facts(DIRECT_CALL), {"text": "x"})
+    assert rec["wire"] == ["ollama"]
+
+
+def test_a_turn_records_each_model_call_in_tokens():
+    t = CF.turn_tokens(_facts(DIRECT_CALL, BACKEND_CALL_2))
+    assert t["calls"][0] == {"sent_estimate": 2871, "evaluated": 1190, "prefill_ms": 1840, "ctx": 4096, "wire": "ollama"}
+    assert t["calls"][1]["prefill_ms"] == 660 and t["calls"][1]["wire"] is None
+    assert (t["sent_estimate"], t["evaluated"]) == (2 * 2871, 2 * 1190)
+    assert CF.turn_tokens(CF.log_facts(None)) == {"calls": [], "sent_estimate": None, "evaluated": None}
+    rec = CF.turn_record("tool", True, "ok", 1.0, _facts(DIRECT_CALL), {"text": "x"})
+    assert rec["evaluated"] == 1190 and rec["calls"][0]["sent_estimate"] == 2871
+
+
+def test_tool_replay_passes_an_answer_and_fails_a_failed_turn():
+    rc, why = CF.judge_tool_replay("The codeword in anything.md is ZIRCON-4471.", None, ["noo_rag_query"],
+                                   _facts(DIRECT_CALL), "default")
+    assert rc == CF.PASS and why.endswith("(wire ollama)"), why
+    rc, why = CF.judge_tool_replay("", "Backend error: 502: upstream gone", [], _facts(DIRECT_CALL), "default")
+    assert rc == CF.FAIL and why.startswith("the turn failed"), why
+    rc, why = CF.judge_tool_replay("I could not find it.", None, [], _facts(DIRECT_CALL), "tiny")
+    assert rc == CF.NOT_JUDGED and why.startswith("NOTE: MODEL=tiny"), why
 
 
 @pytest.mark.parametrize("text, calls, approval, ok", [

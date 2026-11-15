@@ -1,22 +1,29 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026 PersonifAI LLC
 
-// Package preseed mirrors a model's files from the controller's model-weight
-// store into a local directory, using nginx's JSON directory listing
-// (autoindex_format json). Pure Go — no wget/curl/rsync — so it runs inside
-// the node-agent's own image via the runHelper pattern, with the node's HF
-// cache bind-mounted as the destination.
+// Package preseed copies model files from the controller's model-weight
+// store into a local directory, every file verified against a sha256 the
+// controller's authenticated artifact manifest states. Pure Go — no
+// wget/curl/rsync — and in-process: the agent writes the node's HF cache and
+// models dir on the host path.
 //
 // Design: storage, not proxy. The controller serves weights it already
 // downloaded (no HuggingFace proxying, no CDN). A placed node copies the
 // model here, then runs the backend with HF_HUB_OFFLINE=1.
+//
+// There is no unverified path. A file is kept or landed only when its bytes
+// hash to the digest the manifest states (or this node's verified-digest
+// record says it already did, for exactly this inode, size, mtime and ctime;
+// see verified_record.go). Size alone never accepts a file: the old
+// size-shortcut fetchFile kept any local file whose length matched, which a
+// model container with the HF cache mounted read-write could satisfy with
+// different bytes (i675 F13).
 package preseed
 
 import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -29,6 +36,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	nodeconfig "github.com/noomesh/noomesh/node-agent-go/internal/config"
@@ -36,15 +44,13 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/refusals"
 )
 
-// entry is one item in nginx's JSON autoindex listing.
-type entry struct {
-	Name string `json:"name"`
-	Type string `json:"type"` // "file" | "directory"
-}
-
 // Client mirrors a remote tree over HTTP(S).
 type Client struct {
 	HTTP *http.Client
+	// Record, when set, is this node's verified-digest record: a file it
+	// names with the same identity is not re-hashed (see verified_record.go).
+	// nil = hash every present file (always correct, slower).
+	Record *VerifiedRecord
 	// err is a construction failure. Every method returns it, so a node
 	// whose PKI is configured but unreadable never dials the store with a
 	// bare client — the failure mode this field exists to rule out.
@@ -187,165 +193,8 @@ func resolveCacheURL(raw string, hasClientCert bool) (string, error) {
 	return strings.TrimRight(u.String(), "/"), nil
 }
 
-// Mirror recursively copies the directory at srcURL into destDir. srcURL must
-// point at a directory served with nginx `autoindex_format json`. Returns the
-// number of files written. Existing same-size files are skipped (resumable).
-func (c *Client) Mirror(ctx context.Context, srcURL, destDir string) (int, error) {
-	if !strings.HasSuffix(srcURL, "/") {
-		srcURL += "/"
-	}
-	entries, err := c.list(ctx, srcURL)
-	if err != nil {
-		return 0, err
-	}
-	written := 0
-	for _, e := range entries {
-		if e.Name == "" || strings.Contains(e.Name, "/") || e.Name == ".." {
-			continue // guard against listing oddities / traversal
-		}
-		childURL := srcURL + url.PathEscape(e.Name)
-		childDest := filepath.Join(destDir, e.Name)
-		switch e.Type {
-		case "directory":
-			n, err := c.Mirror(ctx, childURL+"/", childDest)
-			if err != nil {
-				return written, err
-			}
-			written += n
-		default: // file
-			ok, err := c.fetchFile(ctx, childURL, childDest)
-			if err != nil {
-				return written, err
-			}
-			if ok {
-				written++
-			}
-		}
-	}
-	return written, nil
-}
-
-func (c *Client) list(ctx context.Context, dirURL string) ([]entry, error) {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, dirURL, nil)
-	resp, err := c.do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("list %s: HTTP %d", dirURL, resp.StatusCode)
-	}
-	var entries []entry
-	if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
-		return nil, fmt.Errorf("list %s: decode: %w", dirURL, err)
-	}
-	return entries, nil
-}
-
-// fetchFile downloads fileURL to dest. Skips (returns false) when dest already
-// exists with the same size, so a re-run resumes rather than re-downloads.
-func (c *Client) fetchFile(ctx context.Context, fileURL, dest string) (bool, error) {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, fileURL, nil)
-	resp, err := c.do(req)
-	if err != nil {
-		return false, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("fetch %s: HTTP %d", fileURL, resp.StatusCode)
-	}
-	if st, err := os.Stat(dest); err == nil && resp.ContentLength >= 0 && st.Size() == resp.ContentLength {
-		return false, nil // already have it
-	}
-	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-		return false, err
-	}
-	tmp := dest + ".partial"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return false, err
-	}
-	if _, err := io.Copy(f, resp.Body); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return false, err
-	}
-	f.Close()
-	if err := os.Rename(tmp, dest); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-// MirrorHFRepo mirrors a HuggingFace-cache repo directory (models--org--name/)
-// the way huggingface_hub actually loads it offline: it copies only refs/main
-// and the single snapshots/<revision>/ that main points at — skipping blobs/
-// (the served snapshot files already carry the real bytes), .no_exist/ (empty
-// negative-cache markers), and any other revisions.
-//
-// This matters: over HTTP the controller's nginx serves each snapshot symlink
-// as the resolved blob content, so a blind recursive Mirror would download the
-// same weights once per revision AND again as blobs/ — measured at ~4x on a
-// real 3-snapshot model. HF_HUB_OFFLINE=1 loads fine from real files in
-// snapshots/<rev>/ with no blobs/ dir, so copying just that one tree is both
-// correct and minimal.
-//
-// baseURL must point at the repo dir (…/hf/models--org--name/). Falls back to a
-// full recursive Mirror if refs/main can't be read (unexpected layout), so an
-// odd store still preseeds rather than failing shut.
-func (c *Client) MirrorHFRepo(ctx context.Context, baseURL, destDir string) (int, error) {
-	if !strings.HasSuffix(baseURL, "/") {
-		baseURL += "/"
-	}
-	rev, err := c.fetchText(ctx, baseURL+"refs/main")
-	if err != nil {
-		// Unknown layout — fall back to a full mirror rather than fail shut.
-		return c.Mirror(ctx, baseURL, destDir)
-	}
-	rev = strings.TrimSpace(rev)
-	if rev == "" || strings.ContainsAny(rev, "/\\") {
-		return c.Mirror(ctx, baseURL, destDir)
-	}
-	// Persist refs/main — HF resolves the snapshot revision through it offline.
-	if err := os.MkdirAll(filepath.Join(destDir, "refs"), 0o755); err != nil {
-		return 0, err
-	}
-	if err := os.WriteFile(filepath.Join(destDir, "refs", "main"), []byte(rev), 0o644); err != nil {
-		return 0, err
-	}
-	snapURL := baseURL + "snapshots/" + url.PathEscape(rev) + "/"
-	snapDest := filepath.Join(destDir, "snapshots", rev)
-	return c.Mirror(ctx, snapURL, snapDest)
-}
-
-// fetchText GETs a small text resource (e.g. refs/main) and returns its body.
-func (c *Client) fetchText(ctx context.Context, u string) (string, error) {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	resp, err := c.do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("get %s: HTTP %d", u, resp.StatusCode)
-	}
-	b, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	if err != nil {
-		return "", err
-	}
-	return string(b), nil
-}
-
-// FetchOne copies a single file at fileURL to dest (creating parent dirs),
-// skipping when dest already has the same size (resumable). Used for GGUF
-// weights, which are one flat file served from the controller's /gguf/.
-// Returns true if it wrote the file, false if it was already present.
-func (c *Client) FetchOne(ctx context.Context, fileURL, dest string) (bool, error) {
-	return c.fetchFile(ctx, fileURL, dest)
-}
-
-// FetchOneVerified is FetchOne with an integrity contract
-// step 1: expectedSHA256 is the lowercase-hex digest the controller's
+// FetchOneVerified copies one file at fileURL to dest (creating parent dirs)
+// under an integrity contract: expectedSHA256 is the lowercase-hex digest the controller's
 // artifact manifest stated, and the file only lands if the bytes hash to it.
 //
 // Three properties worth their code:
@@ -356,11 +205,11 @@ func (c *Client) FetchOne(ctx context.Context, fileURL, dest string) (bool, erro
 //     resumes with a Range request. A mismatch removes the .partial and errors — the destination is never
 //     replaced by unverified bytes, and a corrupt/tampered transfer cannot
 //     be told apart from a miss by the caller (both fail the preseed).
-//   - An ALREADY-PRESENT destination is re-hashed rather than size-trusted.
-//     fetchFile's size shortcut is fine for opportunistic caching; once a
-//     digest exists, "same length, different bytes" is exactly the case the
-//     digest is for. A matching existing file is a no-op; a mismatching one
-//     is re-downloaded.
+//   - An ALREADY-PRESENT destination is re-hashed rather than size-trusted:
+//     "same length, different bytes" is exactly the case the digest is for.
+//     A matching existing file is a no-op; a mismatching one is
+//     re-downloaded. With c.Record set, a file the record names with an
+//     identical (dev, inode, size, mtime, ctime) skips the re-hash.
 func (c *Client) FetchOneVerified(ctx context.Context, fileURL, dest, expectedSHA256 string) (bool, error) {
 	return c.FetchOneVerifiedProgress(ctx, fileURL, dest, expectedSHA256, nil)
 }
@@ -376,17 +225,35 @@ const ProgressStep = 1 << 20
 // goroutine. A file that is already present and verified writes nothing and
 // reports nothing.
 func (c *Client) FetchOneVerifiedProgress(ctx context.Context, fileURL, dest, expectedSHA256 string, progress func(written int64)) (bool, error) {
-	want := strings.ToLower(strings.TrimSpace(expectedSHA256))
+	return c.fetchVerified(ctx, fileURL, dest, expectedSHA256, progress, nil)
+}
+
+// validSHA256 is a 64-char lowercase-hex digest, normalised. An empty or
+// malformed digest is an error, never "no check".
+func validSHA256(s string) (string, error) {
+	want := strings.ToLower(strings.TrimSpace(s))
 	if len(want) != 64 {
-		return false, fmt.Errorf("expected sha256 must be 64 hex chars, got %q", expectedSHA256)
+		return "", fmt.Errorf("expected sha256 must be 64 hex chars, got %q", s)
 	}
-	if _, err := os.Stat(dest); err == nil {
-		got, err := sha256File(dest)
-		if err == nil && got == want {
-			return false, nil // verified present — nothing to do
-		}
-		// Hash error or mismatch: fall through and re-download over it.
+	if _, err := hex.DecodeString(want); err != nil {
+		return "", fmt.Errorf("expected sha256 must be 64 hex chars, got %q", s)
 	}
+	return want, nil
+}
+
+// fetchVerified is FetchOneVerifiedProgress with a second callback, onHash,
+// that reports bytes of an ALREADY-PRESENT dest as they are re-hashed (the
+// HF preseed's "verifying … n/total GB" line). progress keeps its meaning:
+// bytes of the file written so far.
+func (c *Client) fetchVerified(ctx context.Context, fileURL, dest, expectedSHA256 string, progress, onHash func(int64)) (bool, error) {
+	want, err := validSHA256(expectedSHA256)
+	if err != nil {
+		return false, err
+	}
+	if ok, _ := c.verifyPresent(dest, want, onHash); ok {
+		return false, nil // verified present — nothing to do
+	}
+	// Absent, unreadable or mismatching: fetch and land over it.
 
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return false, err
@@ -400,7 +267,14 @@ func (c *Client) FetchOneVerifiedProgress(ctx context.Context, fileURL, dest, ex
 	// covers the WHOLE file, so a corrupt or stale prefix can never land.
 	hasher := sha256.New()
 	var have int64
-	if fi, err := os.Stat(tmp); err == nil && fi.Mode().IsRegular() && fi.Size() > 0 {
+	// Lstat, not Stat: in a cache a model container can write, a .partial
+	// that is a link would aim this process's writes at its target.
+	if fi, err := os.Lstat(tmp); err == nil && !fi.Mode().IsRegular() {
+		if err := os.Remove(tmp); err != nil {
+			return false, fmt.Errorf("remove non-file %s: %w", tmp, err)
+		}
+	}
+	if fi, err := os.Lstat(tmp); err == nil && fi.Mode().IsRegular() && fi.Size() > 0 {
 		n, herr := hashInto(hasher, tmp)
 		if herr != nil {
 			os.Remove(tmp)
@@ -474,6 +348,37 @@ func (c *Client) FetchOneVerifiedProgress(ctx context.Context, fileURL, dest, ex
 	if err := os.Rename(tmp, dest); err != nil {
 		return false, err
 	}
+	// Recorded AFTER the rename: the identity is the landed file's, and the
+	// rename itself moves its ctime on most filesystems.
+	c.Record.Remember(dest, want)
+	return true, nil
+}
+
+// verifyPresent: dest exists as a regular file and its bytes are want —
+// by the record (same identity as when this node last hashed it) or by
+// hashing it now. A mismatch forgets the record entry and returns false; the
+// caller decides whether that means "re-fetch" or "refuse".
+func (c *Client) verifyPresent(dest, want string, onHash func(int64)) (bool, error) {
+	fi, err := os.Stat(dest)
+	if err != nil {
+		return false, err
+	}
+	if !fi.Mode().IsRegular() {
+		return false, fmt.Errorf("%s is not a regular file", dest)
+	}
+	if c.Record.Verified(dest, want) {
+		return true, nil
+	}
+	got, err := hashFile(dest, onHash)
+	if err != nil {
+		c.Record.Forget(dest)
+		return false, err
+	}
+	if got != want {
+		c.Record.Forget(dest)
+		return false, fmt.Errorf("%w: %s holds %s, the manifest says %s", ErrDigestMismatch, dest, got, want)
+	}
+	c.Record.Remember(dest, want)
 	return true, nil
 }
 
@@ -523,17 +428,37 @@ func contentRangeStart(v string) (int64, bool) {
 // sha256. A VERIFICATION failure — callers must refuse, never fall back.
 var ErrDigestMismatch = errors.New("digest mismatch")
 
-func sha256File(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+// hashCalls counts hashFile calls: the tests' view of "re-hashed or not".
+var hashCalls atomic.Int64
+
+// hashFile is the sha256 of a file already on disk, computed at LOWERED
+// priority (hashNiced: nice_linux.go) so a first-after-upgrade verification
+// of a multi-GB snapshot does not compete with the backends this node
+// serves. onHash (nil = none) is told the bytes hashed so far, at most once
+// per ProgressStep plus once at the end.
+func hashFile(path string, onHash func(int64)) (string, error) {
+	hashCalls.Add(1)
+	return hashNiced(func() (string, error) {
+		f, err := os.Open(path)
+		if err != nil {
+			return "", err
+		}
+		defer f.Close()
+		h := sha256.New()
+		var sink io.Writer = h
+		var pw *progressWriter
+		if onHash != nil {
+			pw = &progressWriter{w: h, fn: onHash}
+			sink = pw
+		}
+		if _, err := io.Copy(sink, f); err != nil {
+			return "", err
+		}
+		if pw != nil && pw.n != pw.last {
+			onHash(pw.n)
+		}
+		return hex.EncodeToString(h.Sum(nil)), nil
+	})
 }
 
 // RepoCacheDir maps a HuggingFace repo id ("org/name") to its cache directory

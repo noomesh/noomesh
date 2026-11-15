@@ -10,6 +10,7 @@ say so instead of being cut.
     context_fit.py turns --out DIR [--model-label X]
     context_fit.py doesnt-fit [--chars N]
     context_fit.py pinned-check
+    context_fit.py tool-replay
 
   running      `noo --json cluster show <node>` (node = this hostname, as
                run.sh's agent dump uses) and its `chat_contexts` array
@@ -32,7 +33,11 @@ say so instead of being cut.
                for approval). Per turn: pass (true/false/null), reason,
                elapsed_s, prefill_s (sum of the turn's backend_call
                prefill_ms / 1000; null on a build without those lines),
-               tier, truncated (the done frame's). Writes DIR/turns.json.
+               tier, truncated (the done frame's), wire (the backend_call
+               lines' wire= values, null before #1225), calls (each backend_call:
+               sent_estimate, evaluated = the backend's own prompt count,
+               Ollama's prompt_eval_count, prefill_ms, ctx, wire) and the
+               turn's sent_estimate / evaluated sums. Writes DIR/turns.json.
   doesnt-fit   one turn of ~--chars of plain text plus a short question.
                PASS: the reply carries the gateway's doesn't-fit line
                ("too small for its instructions and this question", #1212)
@@ -41,6 +46,18 @@ say so instead of being cut.
                could not be read, or the turn fits by the gateway's own
                rule (need x ratio <= window; the reason names how many
                characters would overflow it). FAIL otherwise.
+  tool-replay  one tool turn (the noo_rag_query question), judged on what
+               the person sees: FAIL when a raw backend error reached them
+               (`Backend error: <status>: {...}` or a `{"error"` body; on any
+               model, tiny included, since it is the product's words, not
+               the model's), or the turn failed outright; else the tool turn's
+               own verdict (a content miss on MODEL=tiny is a NOTE). NOT
+               JUDGED on a build whose backend_call lines carry no wire= (the
+               build before the direct-Ollama replay fix; a raw error seen
+               there is printed as the before evidence), or when the log
+               could not be read. The verdict names the wire: "ollama" is a
+               directly dialled Ollama (the WSL2 one-box), the path the fix
+               is for.
   pinned-check after the cell pinned the chat context to 4096: one tool
                turn whose request_size says tier=Compact, whose answer kept
                the question, and during which no
@@ -248,8 +265,11 @@ def pick_contexts(items: list[dict], model: str | None) -> list[dict]:
 
 def judge_running(doc: dict | None, expect_decided: int | None = None, model: str | None = None,
                   final: bool = True) -> tuple[int | None, str]:
-    """(rc, line). rc None: the model is not loaded yet (running null) and
-    this is not the final read; the caller chats once and reads again."""
+    """(rc, line). rc None, on a read that is not the final one: the model
+    is not loaded yet (running null), or it still runs a context other than
+    the decided one (it was loaded before a pin or a restart, and only the
+    next request's num_ctx reloads it). The caller chats once and reads
+    again; a mismatch on that final read FAILs."""
     items = None if not isinstance(doc, dict) else doc.get("chat_contexts")
     if not isinstance(items, list):
         return NOT_JUDGED, f"CONTEXT-FIT running: NOT JUDGED: {NO_CHAT_CONTEXTS}"
@@ -257,9 +277,11 @@ def judge_running(doc: dict | None, expect_decided: int | None = None, model: st
     if not chosen:
         what = f"for {model}" if model else "on this node"
         return NOT_JUDGED, f"CONTEXT-FIT running: NOT JUDGED: no Ollama chat placement {what} in chat_contexts"
-    if any(i.get("running") is None for i in chosen):
-        if not final:
+    if not final:
+        if any(i.get("running") is None for i in chosen):
             return None, "the chat model is not loaded yet"
+        if any(i.get("decided") is not None and i.get("running") != i.get("decided") for i in chosen):
+            return None, "the chat model still runs the context it was loaded with"
     bad, good = [], []
     for i in chosen:
         m, run, dec = i.get("model", "?"), i.get("running"), i.get("decided")
@@ -345,6 +367,28 @@ def judge_tool(text: str, tool_names: list[str], fact_rx: str = TOOL_FACT):
     return False, "noo_rag_query was called but the answer does not carry the fact: " + _excerpt(text)
 
 
+RAW_BACKEND_ERROR_RX = re.compile(r'Backend error: \d+: *[{\[]|\{\s*"error"\s*:')
+
+
+def judge_tool_replay(text: str, error: str | None, tool_names: list[str], facts: dict, model_mode: str):
+    """(rc, reason) for the tool-replay judge (see the module doc)."""
+    seen = f"{text}\n{error or ''}"
+    raw = RAW_BACKEND_ERROR_RX.search(seen)
+    if not facts["readable"]:
+        return NOT_JUDGED, "the gateway log could not be read"
+    wires = sorted({str(c["wire"]) for c in facts["backend_calls"] if c.get("wire")})
+    if not wires:
+        before = f"; the raw error it showed: {_excerpt(seen.strip())}" if raw else ""
+        return NOT_JUDGED, f"this build's backend_call lines carry no wire= (before the direct-Ollama replay fix){before}"
+    on = f" (wire {', '.join(wires)})"
+    if raw:
+        return FAIL, "a raw backend error reached the person" + on + ": " + _excerpt(seen.strip())
+    if error and not text.strip():
+        return FAIL, f"the turn failed{on}: {_excerpt(error)}"
+    verdict, reason = tiny_note(*judge_tool(text, tool_names), model_mode)
+    return {True: PASS, False: FAIL, None: NOT_JUDGED}[verdict], reason + on
+
+
 def judge_refusal(text: str, calls: list[dict], approval: bool):
     if approval:
         return True, "the tool call was held for approval"
@@ -421,7 +465,34 @@ def turn_record(name: str, verdict, reason: str, elapsed_s: float, facts: dict, 
             "truncated": done.get("truncated") if "truncated" in done else None,
             "cached": bool(done.get("cached")), "tools": [c.get("name") for c in chat.get("calls", [])],
             "approval_request": bool(chat.get("approval")), "error": chat.get("error"),
-            "answer": _excerpt(chat.get("text", ""), 800)}
+            "answer": _excerpt(chat.get("text", ""), 800), "wire": turn_wires(facts),
+            **turn_tokens(facts)}
+
+
+def turn_tokens(facts: dict) -> dict:
+    """The turn's model calls in tokens, from its backend_call lines: per
+    call {sent_estimate, evaluated, prefill_ms, ctx, wire} and the sums.
+    `evaluated` is what the backend says it read: on Ollama its own
+    `prompt_eval_count`, which leaves out a prefix it reused from cache, so
+    evaluated well under sent_estimate on a call that was not cut is cache
+    reuse (a cut reads ctx/2 + 5 instead). Sums are null with no calls."""
+    calls = [{"sent_estimate": c.get("sent_estimate"), "evaluated": c.get("evaluated"),
+              "prefill_ms": c.get("prefill_ms"), "ctx": c.get("ctx"), "wire": c.get("wire")}
+             for c in facts.get("backend_calls", [])]
+
+    def total(k):
+        vals = [c[k] for c in calls if isinstance(c[k], (int, float))]
+        return sum(vals) if vals else None
+    return {"calls": calls, "sent_estimate": total("sent_estimate"), "evaluated": total("evaluated")}
+
+
+def turn_wires(facts: dict) -> list[str] | None:
+    """The distinct wire= of the turn's backend_call lines (sorted): "ollama"
+    is a directly dialled Ollama, "openai" one behind its node agent (or
+    vLLM). None on a build whose backend_call carries no wire= (before
+    noomesh #1225) or when the log was not read."""
+    wires = sorted({str(c["wire"]) for c in facts.get("backend_calls", []) if c.get("wire")})
+    return wires or None
 
 
 def turns_doc(cell: str, model: str, turns: list[dict]) -> dict:
@@ -619,8 +690,11 @@ def cmd_running(a) -> int:
         return NOT_JUDGED
     rc, line = judge_running(doc, a.expect_decided, a.chat_model, final=False)
     if rc is None:
-        print(f"CONTEXT-FIT running: the chat model is not loaded; one chat turn first ({WARM_PROMPT!r})")
-        chat = chat_turn(WARM_PROMPT, a.gateway, a.turn_timeout)
+        # A fresh line every time: an answer from the gateway's cache makes
+        # no model call, so it would load or reload nothing.
+        warm = f"{WARM_PROMPT} ({int(time.time())})"
+        print(f"CONTEXT-FIT running: {line}; one chat turn first ({warm!r})")
+        chat = chat_turn(warm, a.gateway, a.turn_timeout)
         if chat["error"]:
             print(f"  the warm-up turn: {chat['error']}")
         doc, why = cluster_show(a.node)
@@ -697,6 +771,16 @@ def cmd_pinned(a) -> int:
     return rc
 
 
+def cmd_tool_replay(a) -> int:
+    chat, facts, secs = timed_turn(TOOL_QUESTION, a.gateway, a.turn_timeout)
+    rc, why = judge_tool_replay(chat["text"], chat["error"], [c["name"] for c in chat["calls"]], facts,
+                                os.environ.get("MODEL", "default"))
+    print(f"  reply ({secs:.1f} s, tools: {', '.join(c['name'] or '?' for c in chat['calls']) or 'none'}): "
+          f"{_excerpt(chat['text'] or chat['error'] or '', 300)}")
+    print(f"CONTEXT-FIT tool-replay: {NAMES[rc]}: {why}")
+    return rc
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="The rc.2 context-fit judges (exit 0 PASS, 1 FAIL, 2 NOT JUDGED).")
     ap.add_argument("--gateway", default=os.environ.get("NOO_GATEWAY_URL") or "https://localhost:8080")
@@ -712,9 +796,10 @@ def main(argv: list[str] | None = None) -> int:
     d = sub.add_parser("doesnt-fit", help="a turn too big for the window says so")
     d.add_argument("--chars", type=int, default=60000)
     sub.add_parser("pinned-check", help="a tool turn on the 4096 pin: Compact tier, no cut, question kept")
+    sub.add_parser("tool-replay", help="a tool turn answers; a raw backend error never reaches the person")
     a = ap.parse_args(argv)
     return {"running": cmd_running, "turns": cmd_turns, "doesnt-fit": cmd_doesnt_fit,
-            "pinned-check": cmd_pinned}[a.cmd](a)
+            "pinned-check": cmd_pinned, "tool-replay": cmd_tool_replay}[a.cmd](a)
 
 
 if __name__ == "__main__":

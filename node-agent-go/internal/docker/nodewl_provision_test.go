@@ -782,9 +782,11 @@ func TestRailFailuresMapToTheirReasons(t *testing.T) {
 		err    error
 		reason string
 	}{
-		"not staged":        {ErrArtifactAbsent, nodewl.ReasonImageMissing},
-		"sha256 mismatch":   {&ImageVerificationError{Ref: "x", Err: errors.New("sha")}, nodewl.ReasonImageDigestMismatch},
-		"transport failure": {errors.New("timeout"), ""},
+		"not staged":      {ErrArtifactAbsent, nodewl.ReasonImageMissing},
+		"sha256 mismatch": {&ImageVerificationError{Ref: "x", Err: errors.New("sha")}, nodewl.ReasonImageDigestMismatch},
+		// 0.6.25-rc.2: an unreachable rail was an uncoded error and the row kept
+		// an earlier reason (door_leaf_missing); it now names itself.
+		"transport failure": {errors.New("timeout"), nodewl.ReasonImageUnavailable},
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := newHarness(t)
@@ -1009,5 +1011,64 @@ func TestSetMountKeepsTheSetLayoutUnderTheSlotTarget(t *testing.T) {
 		if b.Source != store.Dir(refs[k]) {
 			t.Errorf("many:true source %q, want %q", b.Source, store.Dir(refs[k]))
 		}
+	}
+}
+
+// An image fetch that fails is image_unavailable, names the rail with no query
+// string or user info, and is not retried on every pass (an unreachable rail).
+func TestAnUnreachableRailIsImageUnavailableScrubbedAndBackedOff(t *testing.T) {
+	h := newHarness(t)
+	calls := 0
+	h.p.fetchTar = func(context.Context, string) (string, func(), error) {
+		calls++
+		return "", nil, errors.New(`Get "https://u:pw@noo-controller:8443/images/x.tar?token=SECRET&sig=abc": dial tcp 172.31.250.10:8443: connect: connection refused`)
+	}
+	err := h.provision()
+	if nodewl.CodeOf(err) != nodewl.ReasonImageUnavailable {
+		t.Fatalf("err %v, want image_unavailable", err)
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "SECRET") || strings.Contains(msg, "sig=") || strings.Contains(msg, "pw@") {
+		t.Fatalf("the detail carries URL secrets: %s", msg)
+	}
+	if !strings.Contains(msg, "https://noo-controller:8443/images/x.tar") {
+		t.Fatalf("the detail must keep host, port and path: %s", msg)
+	}
+	err = h.provision()
+	if nodewl.CodeOf(err) != nodewl.ReasonImageUnavailable || calls != 1 {
+		t.Fatalf("a second pass inside the backoff fetched again (calls %d, err %v)", calls, err)
+	}
+}
+
+func TestTheFetchBackoffGrowsCapsAndClears(t *testing.T) {
+	var b fetchBackoff
+	t0 := time.Unix(1_000_000, 0)
+	if _, w := b.blocked("a", t0); w != 0 {
+		t.Fatal("nothing failed yet: fetch now")
+	}
+	b.failed("a", "why", t0)
+	if _, w := b.blocked("a", t0); w != fetchBackoffFirst {
+		t.Fatalf("first wait %v", w)
+	}
+	if _, w := b.blocked("a", t0.Add(fetchBackoffFirst)); w != 0 {
+		t.Fatal("after the wait a fetch may run")
+	}
+	now := t0
+	for i := 0; i < 10; i++ {
+		b.failed("a", "why", now)
+	}
+	if _, w := b.blocked("a", now); w != fetchBackoffMax {
+		t.Fatalf("the wait caps at %v, got %v", fetchBackoffMax, w)
+	}
+	b.ok("a")
+	if _, w := b.blocked("a", now); w != 0 {
+		t.Fatal("a success clears the backoff")
+	}
+}
+
+func TestScrubURLsKeepsHostPortPathOnly(t *testing.T) {
+	got := scrubURLs(`fetch: Get "https://user:p@h:8443/a/b.tar?x=1#f" and http://h2/p?q`)
+	if got != `fetch: Get "https://h:8443/a/b.tar" and http://h2/p` {
+		t.Fatalf("got %q", got)
 	}
 }

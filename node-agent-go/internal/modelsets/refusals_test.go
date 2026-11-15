@@ -52,6 +52,10 @@ func sealed(t *testing.T) (*rig, string) {
 	if err := makeWritable(dir); err != nil {
 		t.Fatal(err)
 	}
+	// makeWritable reopens directories only (a file may be a hard link
+	// shared with a sibling revision): the test reopens the files it plants
+	// over itself.
+	reopenFilesForTest(t, dir)
 	return r, dir
 }
 

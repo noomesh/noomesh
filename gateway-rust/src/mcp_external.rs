@@ -108,6 +108,11 @@ pub(crate) struct ToolSpec {
     /// to travel as data.
     #[serde(default)]
     pub(crate) body_field: String,
+    /// Answered in process by the door that serves it, never proxied to
+    /// `path`: no gateway route serves it (`ToolDef.native`). A door that
+    /// does not answer a native tool refuses it instead of 404ing.
+    #[serde(default)]
+    pub(crate) native: bool,
 }
 
 /// Bumped by the generator when the consumer contract changes. Asserted here
@@ -602,6 +607,55 @@ async fn call_tool(
     execute_spec(spec, args, ("Authorization".into(), format!("Bearer {token}"))).await
 }
 
+/// The error for a failed self-call. Always names the method and the path
+/// (never the query string or a header value). A 404 with an empty body is
+/// no route at all: the tool names a path the gateway does not serve, a
+/// wiring defect, not "not found"; a 404 with a body is the route's answer.
+pub(crate) fn self_call_error(status: u16, method: &str, path: &str, body: &str) -> String {
+    if status == 404 && body.trim().is_empty() {
+        return format!(
+            "no route {method} {path} on this gateway: the tool names a path the gateway does not serve (a wiring defect)"
+        );
+    }
+    format!("gateway returned {status} for {method} {path}: {}", truncate(body, 500))
+}
+
+/// `noo_tool_search` over a door's OWN `tools/list` array (`{name,
+/// description}` objects): what this door serves this caller, and nothing
+/// else. Pure, so each door passes the list it lists. Case-insensitive word
+/// match; a word in the name scores above one in the description; ties by
+/// name. Formatted like `PaiToolSearch.format_response`.
+pub(crate) fn search_tools(list: &Value, query: &str, max_results: usize) -> String {
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    let mut hits: Vec<(usize, &str, &str)> = list
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| {
+            let name = t.get("name")?.as_str()?;
+            let desc = t.get("description").and_then(Value::as_str).unwrap_or("");
+            let (n, d) = (name.to_lowercase(), desc.to_lowercase());
+            let score: usize = words.iter().map(|w| if n.contains(w.as_str()) { 2 } else { 0 } + usize::from(d.contains(w.as_str()))).sum();
+            (score > 0).then_some((score, name, desc))
+        })
+        .collect();
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+    hits.truncate(max_results.max(1));
+    if hits.is_empty() {
+        return "No tools matched the query.".into();
+    }
+    let mut out = format!("Matching tools ({}):\n", hits.len());
+    for (_, name, desc) in hits {
+        out.push_str(&format!("\n  {name}"));
+        let d = desc.lines().next().unwrap_or("").trim();
+        if !d.is_empty() {
+            let d = if d.chars().count() > 120 { format!("{}...", d.chars().take(117).collect::<String>()) } else { d.to_string() };
+            out.push_str(&format!("\n    {d}"));
+        }
+    }
+    out
+}
+
 /// Manifest → HTTP request against this gateway, with the given auth header.
 ///
 /// Shared by both doors: the external door passes the caller's own JWT
@@ -614,6 +668,12 @@ pub(crate) async fn execute_spec(
 ) -> Result<Value, String> {
     if let Some(e) = unknown_args(spec, args) {
         return Err(e);
+    }
+    if spec.native {
+        return Err(format!(
+            "{} is answered by the door itself, never proxied to {} {}, and this door does not answer it",
+            spec.name, spec.method, spec.path
+        ));
     }
     let (path, consumed) = build_path(spec, args)?;
     let rest = remaining_args(spec, args, &consumed);
@@ -685,7 +745,7 @@ pub(crate) async fn execute_spec(
         // Surface the status verbatim. A 403 here is meaningful and must not
         // be smoothed over: it means the user's scopes genuinely do not allow
         // this tool, which is the door working as intended.
-        return Err(format!("gateway returned {}: {}", status.as_u16(), truncate(&body, 500)));
+        return Err(self_call_error(status.as_u16(), &spec.method, &path, &body));
     }
     // A body cut off mid-transfer is an error, never an empty result (i460).
     let body = crate::upstream_body::text_2xx(resp, "the gateway").await?;
@@ -1096,6 +1156,58 @@ mod tests {
         assert!(listed[0].get("inputSchema").is_some());
     }
 
+    fn listed(names: &[(&str, &str)]) -> Value {
+        Value::Array(names.iter().map(|(n, d)| json!({"name": n, "description": d})).collect())
+    }
+
+    /// `noo_tool_search` searches the list it is given, and only that list:
+    /// a door passes what it lists to this caller, so it can never name a
+    /// tool that door does not serve.
+    #[test]
+    fn tool_search_ranks_name_hits_and_stays_inside_the_list_it_is_given() {
+        let list = listed(&[
+            ("noo_rag_query", "Ask the knowledge base a question"),
+            ("noo_rag_ingest", "Add a document to the knowledge base"),
+            ("noo_memory_search", "Search conversation memory, not the knowledge base"),
+        ]);
+        let out = search_tools(&list, "rag", 5);
+        assert!(out.starts_with("Matching tools (2):"), "{out}");
+        assert!(out.find("noo_rag_ingest").unwrap() < out.find("noo_rag_query").unwrap(), "ties by name: {out}");
+        assert!(!out.contains("noo_memory_search"), "{out}");
+        // A name hit outranks a description-only hit.
+        let out = search_tools(&list, "knowledge memory", 5);
+        assert!(out.find("noo_memory_search").unwrap() < out.find("noo_rag_query").unwrap(), "{out}");
+        assert_eq!(search_tools(&list, "rag", 1).matches("\n  noo_").count(), 1, "max_results");
+        assert_eq!(search_tools(&list, "zzz", 5), "No tools matched the query.");
+        // A tool absent from the list is never named, however well it matches.
+        assert!(!search_tools(&listed(&[("noo_rag_query", "x")]), "ingest", 5).contains("noo_rag_ingest"));
+    }
+
+    /// A failed self-call names method and path, never the query string or a
+    /// header; an empty 404 is a missing route (a wiring defect).
+    #[test]
+    fn a_failed_self_call_names_method_and_path_and_an_empty_404_is_no_route() {
+        let e = self_call_error(404, "GET", "/api/tools/search", "");
+        assert_eq!(e, "no route GET /api/tools/search on this gateway: the tool names a path the gateway does not serve (a wiring defect)");
+        let e = self_call_error(404, "GET", "/api/agents/messages/m1/ack", r#"{"error":"no such message"}"#);
+        assert!(e.starts_with("gateway returned 404 for GET /api/agents/messages/m1/ack: ") && e.contains("no such message"), "{e}");
+        let e = self_call_error(403, "POST", "/api/config/x", "denied");
+        assert_eq!(e, "gateway returned 403 for POST /api/config/x: denied");
+    }
+
+    /// A native tool is never proxied: no route serves its path.
+    #[tokio::test]
+    async fn a_native_tool_is_refused_not_proxied() {
+        let spec = ToolSpec {
+            name: "noo_tool_search".into(), description: String::new(),
+            input_schema: json!({"type": "object"}),
+            method: "GET".into(), path: "/api/tools/search".into(),
+            timeout_secs: 30, aliases: HashMap::new(), body_field: String::new(), native: true,
+        };
+        let e = execute_spec(&spec, &Map::new(), ("Authorization".into(), "Bearer x".into())).await.unwrap_err();
+        assert!(e.contains("is answered by the door itself, never proxied to GET /api/tools/search"), "{e}");
+    }
+
     #[test]
     fn path_templating_substitutes_and_consumes() {
         let spec = ToolSpec {
@@ -1106,7 +1218,7 @@ mod tests {
             path: "/api/v1/graph/entities/{entity_id}".into(),
             timeout_secs: 30,
             aliases: HashMap::new(),
-            body_field: String::new(),
+            body_field: String::new(), native: false,
         };
         let mut args = Map::new();
         args.insert("entity_id".into(), json!("abc-123"));
@@ -1130,7 +1242,7 @@ mod tests {
             name: "t".into(), description: String::new(),
             input_schema: json!({"type": "object"}),
             method: "GET".into(), path: "/x/{id}".into(),
-            timeout_secs: 30, aliases: HashMap::new(), body_field: String::new(),
+            timeout_secs: 30, aliases: HashMap::new(), body_field: String::new(), native: false,
         };
         let mut args = Map::new();
         args.insert("id".into(), json!("abc"));
@@ -1143,7 +1255,7 @@ mod tests {
             name: "t".into(), description: String::new(),
             input_schema: json!({"type": "object"}),
             method: "GET".into(), path: "/api/v1/graph/entities/{id}".into(),
-            timeout_secs: 30, aliases: HashMap::new(), body_field: String::new(),
+            timeout_secs: 30, aliases: HashMap::new(), body_field: String::new(), native: false,
         };
         for escape in ["../../../api/config", "a/b", "..", "x\\y"] {
             let mut args = Map::new();
@@ -1176,7 +1288,7 @@ mod tests {
             name: "t".into(), description: String::new(),
             input_schema: json!({"type": "object"}),
             method: "POST".into(), path: "/x".into(),
-            timeout_secs: 30, aliases, body_field: String::new(),
+            timeout_secs: 30, aliases, body_field: String::new(), native: false,
         };
         let mut args = Map::new();
         args.insert("name_field".into(), json!("v"));
@@ -1191,7 +1303,7 @@ mod tests {
             name: "t".into(), description: String::new(),
             input_schema: json!({"type": "object"}),
             method: "POST".into(), path: "/x".into(),
-            timeout_secs: 30, aliases: HashMap::new(), body_field: String::new(),
+            timeout_secs: 30, aliases: HashMap::new(), body_field: String::new(), native: false,
         };
         let mut args = Map::new();
         args.insert("set".into(), json!("v"));
@@ -1473,7 +1585,7 @@ mod body_field_tests {
             path: "/api/config/{section}".into(),
             timeout_secs: 30,
             aliases: HashMap::new(),
-            body_field: body_field.into(),
+            body_field: body_field.into(), native: false,
         }
     }
 

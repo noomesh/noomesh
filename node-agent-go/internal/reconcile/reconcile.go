@@ -174,6 +174,9 @@ type Reconciler struct {
 	// nwChanged runs after each node workload converge (the heartbeat Kick);
 	// nil = nothing (tests).
 	nwChanged func()
+	// leafFired: the workloads the leaf watch already nudged for, per arrival.
+	leafMu    sync.Mutex
+	leafFired map[string]bool
 	// ctlApprovals keeps the controller's signed approval set (i596); nil in
 	// tests that build a Reconciler by hand, and the offer is then skipped.
 	ctlApprovals *nodepolicy.ControllerApprovals
@@ -1268,7 +1271,7 @@ func buildPlacementEnv(p placement) map[string]string {
 // injects or resolves them nondeterministically at start time — hashing them
 // would report false drift on a placement that never changed:
 //
-//   - HF_HUB_OFFLINE  — set to "1" only when preseedModel() copied weights from
+//   - HF_HUB_OFFLINE  — set to "1" on a placed node once stageHFModel() verified weights from
 //     the controller store; depends on cache state, not on the placement.
 //   - N_GPU_LAYERS    — the "auto" sentinel resolves to 999 (GPU) or 0 (CPU)
 //     per node in buildEnvList, so the effective value is node-dependent.

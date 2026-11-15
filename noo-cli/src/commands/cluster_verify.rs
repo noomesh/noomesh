@@ -38,6 +38,7 @@ use std::time::{Duration, Instant};
 
 mod image_family;
 mod off_by_choice;
+mod pg_memory;
 mod tempo;
 mod warmup;
 pub(crate) mod restart_loops;
@@ -616,6 +617,12 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
 /// matched to its MainPID), never from the files the applier rendered.
 /// Unknown is a WARN, never a pass. No row on the controller's own node (it
 /// runs no harness unit) or where no harness runs.
+///
+/// The hold exists only under systemd, and the agent reports it only there
+/// (node-agent-go `(*Agent).hostServices`). A harness running under another
+/// runtime (a Mac node's launchd) is NOT held, at any agent version, so that
+/// is said as the exposure it is, a WARN naming the runtime, never as an
+/// agent too old to report with an upgrade that cannot change it.
 pub(crate) fn harness_egress_check(id: &str, n: &Value) -> Option<Check> {
     const NAME: &str = "harness egress";
     if n["self_node"].as_bool() == Some(true) {
@@ -624,9 +631,14 @@ pub(crate) fn harness_egress_check(id: &str, n: &Value) -> Option<Check> {
     let h = &n["host_services"]["harness"];
     let e = &h["egress"];
     if !e.is_object() {
-        return (h["state"].as_str() == Some("running")).then(|| {
-            warn(NAME, "not reported: this node's agent is older than the egress hold, so nothing says the harness is held off the internet",
-                Some(format!("noo upgrade --all   # rolls the agent on {id}; then: noo cluster verify")))
+        if h["state"].as_str() != Some("running") {
+            return None;
+        }
+        return Some(match h["runtime"].as_str() {
+            Some(rt) if rt != "systemd" => warn(NAME, format!(
+                "no egress hold on {rt}: the hold is systemd-only, so this node's harness runs with nothing holding it off the internet"), None),
+            _ => warn(NAME, "not reported: this node's agent is older than the egress hold, so nothing says the harness is held off the internet",
+                Some(format!("noo upgrade --all   # rolls the agent on {id}; then: noo cluster verify"))),
         });
     }
     let reason = e["reason"].as_str().unwrap_or("");
@@ -7924,6 +7936,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             no_cert.as_ref().map(|(ok, e)| (*ok, e.as_str())),
             plaintext.as_ref().map(|(ok, e)| (*ok, e.as_str())),
         ), refused.as_deref()));
+        // `cluster.postgres_memory` (unset = standard): the sizes asked for,
+        // and "recreate needed" while the running postgres has others.
+        checks.push(pg_memory::live(&root));
         // One "<name> at rest" row per directory that holds state in the
         // clear (`at_rest_dirs`): the process env is what the launcher
         // resolved from `.env`, so the paths are the ones compose bound.
@@ -10197,6 +10212,45 @@ mod tests {
         let mut ctl = with_egress(now, serde_json::json!({"state": "unknown"}));
         ctl["self_node"] = true.into();
         assert!(node_checks(&ctl, "v0.2.70", "0.5.57", now, Some(true)).iter().all(|c| c.name != "harness egress"));
+    }
+
+    /// A harness under a runtime with no hold (mcmini, a Mac node: launchd)
+    /// is an exposure said as one, a WARN naming the runtime, with no upgrade
+    /// hint (no agent version reports a hold there). The host_services below
+    /// is mcmini's own heartbeat on 0.6.24, as `noo_cluster_status` returned
+    /// it (2026-11-15). A systemd harness that reports no hold is still an
+    /// agent too old to say, hint kept, and so is a heartbeat with no runtime.
+    #[test]
+    fn a_harness_with_no_hold_on_its_runtime_is_an_exposure_not_an_old_agent() {
+        let now = 1_800_000_000;
+        let mut mac = healthy(now);
+        mac["id"] = "mcmini".into();
+        mac["os"] = "darwin".into();
+        mac["host_services"] = serde_json::json!({"harness": {"kind": "noo", "runtime": "launchd", "state": "running"}});
+        let c = node_checks(&mac, "v0.2.70", "0.5.57", now, Some(true));
+        assert_eq!(verdict(&c, "harness egress"), Verdict::Warn, "a true exposure stays a WARN");
+        let row = c.iter().find(|c| c.name == "harness egress").unwrap();
+        assert_eq!(row.detail, "no egress hold on launchd: the hold is systemd-only, so this node's harness runs with nothing holding it off the internet");
+        assert!(row.remedy.is_none(), "no upgrade can add a hold on launchd: {:?}", row.remedy);
+        assert!(!row.detail.contains("older"));
+
+        let mut old = healthy(now);
+        old["id"] = "host6".into();
+        old["host_services"] = serde_json::json!({"harness": {"kind": "noo", "runtime": "systemd", "state": "running"}});
+        let c = node_checks(&old, "v0.2.70", "0.5.57", now, Some(true));
+        let row = c.iter().find(|c| c.name == "harness egress").unwrap();
+        assert_eq!(row.verdict, Verdict::Warn);
+        assert!(row.detail.starts_with("not reported: this node's agent is older than the egress hold"), "{}", row.detail);
+        assert!(row.remedy.as_deref().is_some_and(|r| r.contains("noo upgrade --all") && r.contains("host6")), "{:?}", row.remedy);
+
+        old["host_services"]["harness"].as_object_mut().unwrap().remove("runtime");
+        let c = node_checks(&old, "v0.2.70", "0.5.57", now, Some(true));
+        let row = c.iter().find(|c| c.name == "harness egress").unwrap();
+        assert!(row.verdict == Verdict::Warn && row.detail.contains("older") && row.remedy.is_some(), "no runtime reported: {row:?}");
+
+        // A stopped harness on launchd has no row, as on systemd.
+        mac["host_services"]["harness"]["state"] = "stopped".into();
+        assert!(node_checks(&mac, "v0.2.70", "0.5.57", now, Some(true)).iter().all(|c| c.name != "harness egress"));
     }
 
     /// An ordinary node whose harness the gateway WANTS but which is absent
@@ -14501,13 +14555,13 @@ mod vantage_tests {
 
     /// Every row the controller half writes from THIS machine's files and
     /// containers (the rows an outside run on a node turned red).
-    const CONTROLLER_ONLY_ROWS: [&str; 33] = [
+    const CONTROLLER_ONLY_ROWS: [&str; 34] = [
         "self-agent lane", "model cache", "loki", "tempo", "grafana door", "audit key", "secrets at rest",
         "shared secrets", "secrets audit", "grafana sso", "gateway pki view", "loki listener", "tempo listener",
         "sandbox listener", "backend tls", "nats tls", "nats principals", "postgres hba", "postgres role identity",
         "postgres tls", "sandbox executor", "data directories", "data root filesystem", "monitoring web config",
         "secrets not in env", "node-agent privilege", "callers", "tailnet policy", "last backup", "off-site backup",
-        "pki at rest", "image retention", "stack images",
+        "pki at rest", "image retention", "stack images", "postgres memory",
     ];
 
     #[test]

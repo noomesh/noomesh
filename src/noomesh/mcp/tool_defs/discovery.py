@@ -21,9 +21,31 @@ class PaiToolSearch(ToolDef):
     method: ClassVar[HttpMethod] = HttpMethod.GET
     path: ClassVar[str] = "/api/tools/search"
     tags: ClassVar[List[str]] = ["core", "discovery"]
+    # No gateway route serves this path: the operator door answers it in
+    # process over its own catalog (gateway-rust/src/mcp_local.rs), the
+    # model's loop over its schemas (tools.rs native_tool_search), and the
+    # standalone server over this registry (run_local below).
+    native: ClassVar[bool] = True
 
     query: str = Field(description="Search keyword(s) to match against tool names and descriptions")
     max_results: Optional[int] = Field(default=5, description="Maximum number of results to return")
+
+    async def run_local(self) -> str:
+        """Search this process's tool registry (the standalone MCP server)."""
+        from ..tool_models import generate_tool_schemas
+
+        words = [w for w in self.query.lower().split() if w]
+        scored = []
+        for s in generate_tool_schemas():
+            f = s.get("function", s)
+            name = str(f.get("name", ""))
+            desc = str(f.get("description", ""))
+            score = sum(2 for w in words if w in name.lower()) + sum(1 for w in words if w in desc.lower())
+            if score:
+                scored.append((-score, name, desc))
+        scored.sort()
+        limit = self.max_results or 5
+        return self.format_response([{"name": n, "description": d} for _, n, d in scored[:limit]])
 
     def format_response(self, data: Any) -> str:
         if not isinstance(data, (dict, list)):

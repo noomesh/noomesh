@@ -4454,7 +4454,8 @@ pub(crate) fn intended_owner(name: &str, base: &Path) -> std::io::Result<Owner> 
 /// scripts/prep-host.sh gives both to `noo-agent`, the one owner it still
 /// re-owns an existing directory to.
 pub(crate) fn agent_subdir(name: &str) -> bool {
-    matches!(name, "models" | "hf-cache")
+    // hf-cache/hub is owned like hf-cache: it is where the backends write.
+    matches!(name, "models" | "hf-cache" | "hf-cache/hub")
 }
 
 /// The `noo-agent` account's (uid, primary gid), when this host has it
@@ -7288,6 +7289,15 @@ pub(crate) fn place_args(node: &str, model: &str) -> Vec<String> {
     ["cluster", "place", node, "ollama", model].iter().map(|s| s.to_string()).collect()
 }
 
+/// The tuning lines of `noo cluster place`'s output (`KEY=VALUE  why`), for
+/// onboarding to show instead of swallowing them.
+pub(crate) fn tuned_lines(out: &str) -> Vec<String> {
+    out.lines()
+        .map(|l| crate::ui::plain(l).trim().to_string())
+        .filter(|l| l.starts_with("OLLAMA_CONTEXT_LENGTH=") || l.starts_with("OLLAMA_NUM_PARALLEL="))
+        .collect()
+}
+
 /// Declare the self node's ollama chat placement for the model this run
 /// pulled, through `noo cluster place`, unless one already exists (a
 /// re-onboard never overrides the operator's choice).
@@ -7321,7 +7331,15 @@ fn place_pulled_model(ctx: &mut Ctx, model: &str) {
     let args = place_args(&node, model);
     ctx.progress(&format!("Placing {model} on {node}'s ollama (noo cluster place {node} ollama {model})..."));
     match Command::new(&exe).args(&args).output() {
-        Ok(o) if o.status.success() => ctx.success(&format!("Placed: {node} ollama {model} (chat)")),
+        Ok(o) if o.status.success() => {
+            ctx.success(&format!("Placed: {node} ollama {model} (chat)"));
+            // What place tuned and why ("OLLAMA_CONTEXT_LENGTH=32768  half of
+            // the 6.4 GB left after the declared models, ..."): the answer to
+            // "why is my model at 16k", said where the person is looking.
+            for line in tuned_lines(&String::from_utf8_lossy(&o.stdout)) {
+                ctx.info(&line);
+            }
+        }
         Ok(o) => ctx.warn(&format!(
             "noo cluster place {node} ollama {model} exited {}: {} — run it again once the cause is fixed",
             o.status.code().unwrap_or(1),
@@ -10116,6 +10134,10 @@ mod storage_owner_tests {
         assert_eq!(intended_owner_with("hf-cache", &b, agent).unwrap(), (4242, 4243));
         assert_eq!(intended_owner_with("models", &b, None).unwrap(), owner_of(&b));
         assert_eq!(intended_owner_with("hf-cache", &b, None).unwrap(), owner_of(&b));
+        // hf-cache/hub (the gateway's read-only hf mount, i675 F13) is owned
+        // like hf-cache: pre-created before Docker could make it root's.
+        assert_eq!(intended_owner_with("hf-cache/hub", &b, agent).unwrap(), (4242, 4243));
+        assert_eq!(intended_owner_with("hf-cache/hub", &b, None).unwrap(), owner_of(&b));
         for other in ["noo-data", "models/voice/piper", "images", ""] {
             assert_eq!(intended_owner_with(other, &b, agent).unwrap(), owner_of(&b), "{other}");
         }
@@ -10597,6 +10619,10 @@ mod first_chat_placement_tests {
     #[test]
     fn the_placement_is_the_operators_own_command() {
         assert_eq!(place_args("box", "gemma4:e2b"), ["cluster", "place", "box", "ollama", "gemma4:e2b"]);
+        // Onboarding shows what place tuned and why (colour is stripped by
+        // ui::plain, tested there).
+        let out = "→ on cpu — the node has no GPU\n  OLLAMA_NUM_PARALLEL=1  cpu node\n  OLLAMA_CONTEXT_LENGTH=32768  half of the 6.4 GB left after the declared models\n";
+        assert_eq!(tuned_lines(out), ["OLLAMA_NUM_PARALLEL=1  cpu node", "OLLAMA_CONTEXT_LENGTH=32768  half of the 6.4 GB left after the declared models"]);
     }
 
     /// The model step places before it judges unpinned chat, and a chat

@@ -257,6 +257,24 @@ func (r *Reconciler) ChatContext(model string) int {
 	return r.chatContexts[chatContextKey(model)]
 }
 
+// ChatContexts is a copy of the decided-context table (desired-config
+// `chat_contexts`, keyed by chatContextKey), nil when nothing is decided.
+// GET /harness/placement carries it so the node's harness fits a turn to
+// the same context the agent stamps on that model's calls (i802): a task
+// dispatched here must not run in a smaller window than a console turn.
+func (r *Reconciler) ChatContexts() map[string]int {
+	r.harnessMu.RLock()
+	defer r.harnessMu.RUnlock()
+	if len(r.chatContexts) == 0 {
+		return nil
+	}
+	out := make(map[string]int, len(r.chatContexts))
+	for k, v := range r.chatContexts {
+		out[k] = v
+	}
+	return out
+}
+
 // ChatContextWindow is the context window, in tokens, that the node's chat
 // backend runs with as far as the agent sets it, for GET /harness/placement
 // (`model_context`): the harness tells a foreign CLI its model's real window

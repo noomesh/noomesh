@@ -125,8 +125,10 @@ The worker, not core, must load pickled tensors safely
 
 A staged set lives at `<MODELS_DIR>/sets/<id>/<revision>/` on the controller
 (files, then `model-set.json`, then `model-set.json.sig` last). A set without
-its signature does not exist to the rail. A node gets a set in two steps, both
-over the mTLS rail.
+its signature does not exist to the rail. Staging a new revision of a set
+reuses each unchanged LFS file (same sha256 and size) of a signed earlier
+revision by hard link instead of downloading it, and hashes it as before. A node
+gets a set in two steps, both over the mTLS rail.
 
 1. **The signed manifest**, from the gateway (same auth as every artifact
    manifest, a node's cluster bearer):
@@ -162,6 +164,11 @@ over the mTLS rail.
    against the manifest. There is no per-file hashing route: unlike a `gguf`,
    whose digest only the gateway states, every set file's digest is already
    inside the signed manifest, so the signature covers the files.
+
+   A new revision reuses unchanged files (same sha256 and size) from a
+   verified earlier revision of the same set on the same disk, by hard link,
+   and still re-hashes them; the old revision is kept until the new one
+   verifies (its heartbeat row carries `link_source_for`), then pruned.
 
    The model cache serves only `/sets/<id>/<revision>/<file>` and
    `/sets/<id>/<revision>/<dir>/<file>`. It refuses (404) a `.` or `..`
@@ -554,7 +561,7 @@ become a fact (the i495 rule). A `null` is never sent.
 | `addon_workloads_policy` | `"none"` / `"approve"` / `"auto"` | the node's consent setting |
 | `addon_workloads_approvals` | `[{addon, digest, source?}]` | per add-on and image digest. The owner's own approvals carry no `source`; on a node whose owner opted in to controller approvals, each pair only the controller's signed set approves follows them with `"source": "controller"` (at most 256 rows in all) |
 | `addon_workloads_controller` | `{opted_in, set_state, generation?, set_sha256?}` | controller approvals ([below](#approving-from-the-controller-opt-in)): whether the owner opted in, and the set the agent holds: `set_state` is `none`, `verified` or `unverifiable`; `generation` and `set_sha256` (the SHA-256 of the signed document's bytes) ride `verified`. Always reported. The gateway stores it from the release that delivers the sets (i596 slice 2); until then it drops it |
-| `model_sets` | `[{id, revision, state, reason?, bytes_done?, bytes_total?, retry_at?, free_bytes?, need_bytes?}]` | `state` is `verified`, `fetching` or `refused`; `reason` rides `refused`. The delivery fields (i607b) are optional and omitted when not known or not applicable, each riding only its state: `bytes_done` and `bytes_total` (integers) on `fetching` (`bytes_done` counts the files already on disk plus the bytes written of the current one; `bytes_total` is the whole set), `bytes_total` alone on `verified`; `retry_at` (RFC 3339, UTC) on `refused` is when the agent next tries; `free_bytes` and `need_bytes` on a `refused` row with `reason: disk` only, the free bytes the agent saw and the bytes it needed (the files still to write plus its margin). `reason` stays a code; the numbers are separate fields, never free text. An old agent sends none of them, and a reader shows the state alone |
+| `model_sets` | `[{id, revision, state, reason?, bytes_done?, bytes_total?, retry_at?, free_bytes?, need_bytes?, link_source_for?}]` | `state` is `verified`, `fetching` or `refused`; `reason` rides `refused`. The delivery fields (i607b) are optional and omitted when not known or not applicable, each riding only its state: `bytes_done` and `bytes_total` (integers) on `fetching` (`bytes_done` counts the files already on disk plus the bytes written of the current one; `bytes_total` is the whole set), `bytes_total` alone on `verified`; `retry_at` (RFC 3339, UTC) on `refused` is when the agent next tries; `free_bytes` and `need_bytes` on a `refused` row with `reason: disk` only, the free bytes the agent saw and the bytes it needed (the files still to write plus its margin). `reason` stays a code; the numbers are separate fields, never free text. `link_source_for` (a revision) rides a `verified` row no placement wants any more: the agent keeps it as the hard-link source of that revision of the same set until it verifies. An old agent sends none of them, and a reader shows the state alone |
 | `node_workloads` | `[{addon, name, state, ready, model?, door_port, reservation?, reason?}]` | `state` is a desired state or a reported one (`draining`, `needs_attention`). `model`, `reservation` and `reason` are omitted when unknown or none. There is no `slots` in phase 2 (placement sizes it from `accel.slots_env`) |
 
 `heartbeat-i300.json` is the example.
@@ -618,6 +625,8 @@ The agent's fixed vocabulary for the `reason` of a `node_workloads` or
 | `crashed` | the worker exited while it should run, or during a drain (it is then recreated fresh and stopped) | read the worker's logs |
 | `drain_timeout` | the drain did not finish in `drain.timeout_secs`; reported as `needs_attention` | wait; the session is never cut |
 | `door_unreachable` | the host cannot route the agent to an internal Docker network (not Linux, e.g. macOS Docker Desktop) and the no-egress rule does not bend | place on a Linux node |
+| `image_unavailable` | the workload's image tar is on the rail but this node could not fetch it (the controller's rail, `https://<controller>:8443/images/`, unreachable, refused or timed out); the agent retries after 30 s, then 1, 2, 4 and every 5 min | check that the node reaches the controller's model-cache rail on 8443 (`noo cluster verify <node>`); a local-bind controller (`NOO_BIND_MODE=local`) publishes it on 127.0.0.1 only |
+| `provision_failed` | provisioning failed with an error that has no code of its own (docker refused a call, a file could not be written); the agent's log has the error | read the node agent's log (`noo cluster logs <node> agent`) |
 
 The placement facts (`consent_none`, `consent_unapproved`, `nvidia_runtime_missing`, `driver_caps_missing`, `compute_cap_low`, `arch_mismatch`, `controller_host`, `disk`) are also the gateway's placement refusal codes, spelled identically: the gateway refuses a placement with the code the agent would report.
 

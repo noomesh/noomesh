@@ -571,12 +571,14 @@ fn build_llm_request(
             (url, body)
         }
         "ollama" => {
-            // Ollama uses /api/chat with a slightly different schema.
-            // Messages format is the same (OpenAI-compatible since Ollama 0.1.24).
+            // Ollama's /api/chat takes OpenAI's messages except a tool
+            // call's `arguments`, which must be an object: sent as OpenAI's
+            // string, every call after a tool call was refused with a 400
+            // ("Value looks like object, but can't find closing '}'").
             let url = format!("{}/api/chat", backend.url);
             let mut body = json!({
                 "model": backend.model,
-                "messages": messages,
+                "messages": crate::harness::translator::ollama::history(messages),
                 "stream": stream,
             });
             if let Some(tools) = tools {
@@ -1368,11 +1370,28 @@ fn window_refusal_ctx(window: &TurnWindow, overridden: bool, need_estimate: usiz
     crate::chat_context::instructions_overflow(need_estimate as u64, window.max_input as u64, calib).then_some(ctx)
 }
 
+/// The command a line to the person names for picking another model, for
+/// this backend: `noo models switch` defaults to `--backend vllm`, so an
+/// Ollama is named explicitly. `None` for a backend the verb does not
+/// switch (llama.cpp, a cloud provider): the line then names no command.
+/// Every line that names the verb takes it from here, so they cannot drift.
+fn switch_hint(backend_type: &str) -> Option<&'static str> {
+    match backend_type {
+        "ollama" => Some("noo models switch <model> --backend ollama"),
+        "vllm" => Some("noo models switch <model> --backend vllm"),
+        _ => None,
+    }
+}
+
 /// The one line a refused turn shows the person.
-fn too_small_line(model: &str, node: &str, ctx: u64) -> String {
+fn too_small_line(model: &str, node: &str, ctx: u64, backend_type: &str) -> String {
+    let pick = match switch_hint(backend_type) {
+        Some(cmd) => format!("pick a model with a larger one: {cmd}"),
+        None => "pick a model with a larger one".to_string(),
+    };
     format!(
         "{model} on {node} runs a {ctx}-token context, too small for its instructions and this question. \
-         Give it a larger context where the box's memory allows, or pick a model with a larger one: noo models switch <model>"
+         Give it a larger context where the box's memory allows, or {pick}"
     )
 }
 
@@ -1783,6 +1802,12 @@ async fn judge_call<R: HarnessRuntime>(rt: &R, usage: &mut UsageStats, backend: 
     // how long it took to read it (i802: the rc.2 judges' prefill seconds).
     tracing::info!(
         backend = %backend.backend_type,
+        // The wire the call went out on: "ollama" is a directly dialled
+        // Ollama (no node agent in front), the path whose replayed tool
+        // calls Ollama refused until the arguments went as objects; the
+        // install-cell tool-replay judge reads it, a build without it is
+        // NOT JUDGED.
+        wire = super::backend::wire_format(backend),
         model = %backend.model,
         ctx = ?ctx,
         sent_estimate,
@@ -2491,7 +2516,8 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
 
     // Instructions and the question alone too large for this backend's
     // context (i802 PR-2, step 5): say so instead of sending a prompt the
-    // backend would cut. TIER-HOOK: try the next smaller tier before this.
+    // backend would cut. Not tried first: the next smaller tier (i802
+    // follow-up "fall to Compact before refusing").
     let mut window_refusal: Option<String> = None;
     if let Some(ctx) = window_refusal_ctx(&window, rt.max_context_tokens().is_some(), instructions_estimate(&session.messages, prompt, estimate_tool_tokens(&tool_schemas)), calib) {
         let node = match rt.route_facts(&backend.url, &backend.backend_type).await {
@@ -2499,7 +2525,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             None => super::backend::node_from_backend_url(&backend.url).unwrap_or_else(|| "its node".to_string()),
         };
         tracing::warn!(backend = %backend.backend_type, model = %backend.model, ctx, max_input, tier = ?tier, "context_too_small_for_instructions");
-        window_refusal = Some(too_small_line(&backend.model, &node, ctx));
+        window_refusal = Some(too_small_line(&backend.model, &node, ctx, &backend.backend_type));
     }
 
     // 5. Agentic loop
@@ -3732,7 +3758,8 @@ async fn run_inner_bound<R: HarnessRuntime>(
 
     // Instructions and the question alone too large for this backend's
     // context (i802 PR-2, step 5): say so instead of sending a prompt the
-    // backend would cut. TIER-HOOK: try the next smaller tier before this.
+    // backend would cut. Not tried first: the next smaller tier (i802
+    // follow-up "fall to Compact before refusing").
     let mut window_refusal: Option<String> = None;
     if let Some(ctx) = window_refusal_ctx(&window, rt.max_context_tokens().is_some(), instructions_estimate(&session.messages, prompt, estimate_tool_tokens(&tool_schemas)), calib) {
         let node = match rt.route_facts(&backend.url, &backend.backend_type).await {
@@ -3740,7 +3767,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
             None => super::backend::node_from_backend_url(&backend.url).unwrap_or_else(|| "its node".to_string()),
         };
         tracing::warn!(backend = %backend.backend_type, model = %backend.model, ctx, max_input, tier = ?tier, "context_too_small_for_instructions");
-        window_refusal = Some(too_small_line(&backend.model, &node, ctx));
+        window_refusal = Some(too_small_line(&backend.model, &node, ctx, &backend.backend_type));
     }
 
     let mut result = CoordinatorResult {
@@ -4256,7 +4283,12 @@ fn backend_error_message(status: u16, body: &str) -> String {
     const MAX: usize = 300;
     let reason = serde_json::from_str::<Value>(body)
         .ok()
-        .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(str::to_string))
+        .and_then(|v| {
+            // OpenAI's `{"error":{"message":..}}`, or Ollama's (and most
+            // others') `{"error":".."}`: the person reads the sentence,
+            // never the JSON around it.
+            v.pointer("/error/message").and_then(|m| m.as_str()).or_else(|| v.get("error").and_then(|e| e.as_str())).map(str::to_string)
+        })
         .unwrap_or_else(|| body.to_string());
     let reason: String = reason.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut reason: String = reason.chars().take(MAX).collect();
@@ -4401,6 +4433,12 @@ mod llamacpp_wire_tests {
         assert_eq!(
             backend_error_message(400, body),
             "Backend error: 400: \"harrier:latest\" does not support chat"
+        );
+        // A directly dialled Ollama's own shape, `{"error":"<sentence>"}`
+        // (the WSL2 one-box cell, 0.6.25-rc.1): the sentence, never the JSON.
+        assert_eq!(
+            backend_error_message(400, r#"{"error":"Value looks like object, but can't find closing '}' symbol"}"#),
+            "Backend error: 400: Value looks like object, but can't find closing '}' symbol"
         );
         // A body that is not OpenAI-shaped still travels, flattened to one line.
         assert_eq!(backend_error_message(502, "upstream\n  gone"), "Backend error: 502: upstream gone");
@@ -4722,6 +4760,31 @@ mod num_ctx_tests {
         assert!(none.get("options").is_none(), "nothing decided: nothing stamped: {none}");
     }
 
+    /// The turn after a tool call, to a directly dialled Ollama: the
+    /// replayed call's `arguments` go as an object. As OpenAI's string,
+    /// Ollama refused the whole request with a 400 ("Value looks like
+    /// object, but can't find closing '}' symbol"), shown raw to the person
+    /// (the one-box WSL2 cell, 0.6.25-rc.1).
+    #[test]
+    fn a_direct_ollama_gets_tool_call_arguments_as_an_object() {
+        let b = backend("ollama", "ollama", "http://ollama-ctx-test:11434");
+        let messages = vec![
+            json!({"role": "user", "content": "what do my docs say"}),
+            json!({"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "noo_rag_query", "arguments": "{\"query\":\"docs\"}"}},
+                {"id": "c2", "type": "function", "function": {"name": "noo_rag_query", "arguments": "{\"query\": \"unclosed"}},
+            ]}),
+            json!({"role": "tool", "name": "noo_rag_query", "tool_call_id": "c1", "content": "r"}),
+        ];
+        let (_, body) = build_llm_request(&b, &messages, None, false, false, None);
+        let calls = &body["messages"][1]["tool_calls"];
+        assert_eq!(calls[0]["function"]["arguments"], json!({"query": "docs"}), "{body}");
+        assert_eq!(calls[1]["function"]["arguments"], json!({}), "a broken argument string becomes an empty object: {body}");
+        assert_eq!(body["messages"][2]["tool_name"], "noo_rag_query", "{body}");
+        assert_eq!(body["messages"][0], messages[0], "other messages travel as they were");
+        assert_eq!(body["messages"][2]["tool_call_id"], "c1");
+    }
+
     /// An Ollama behind its node agent speaks the OpenAI wire; the agent
     /// forwards `options` to its translator.
     #[test]
@@ -4826,9 +4889,14 @@ mod window_tests {
         assert_eq!(window_refusal_ctx(&small, true, 20_000, fresh), None, "the operator's override is never second-guessed");
         let unknown = turn_window(None, None, 16384, 4096);
         assert_eq!(window_refusal_ctx(&unknown, false, 90_000, fresh), None, "never refused on the global guess");
-        let line = too_small_line("gemma4:e2b", "fa-box", 4096);
+        let line = too_small_line("gemma4:e2b", "fa-box", 4096, "ollama");
         assert!(line.starts_with("gemma4:e2b on fa-box runs a 4096-token context, too small for its instructions and this question."), "{line}");
-        assert!(line.ends_with("noo models switch <model>") && !line.contains('\n'), "{line}");
+        // `noo models switch` defaults to vLLM: on an Ollama box the line
+        // must name the backend, or the command switches the wrong one.
+        assert!(line.ends_with("noo models switch <model> --backend ollama") && !line.contains('\n'), "{line}");
+        assert!(too_small_line("m", "n", 4096, "vllm").ends_with("noo models switch <model> --backend vllm"));
+        let no_verb = too_small_line("m", "n", 4096, "llamacpp");
+        assert!(!no_verb.contains("noo models") && no_verb.ends_with("pick a model with a larger one"), "{no_verb}");
         let need = instructions_estimate(&[json!({"role": "system", "content": "s".repeat(250)}), json!({"role": "assistant", "content": "a".repeat(999)})], "q", 7);
         assert_eq!(need, (100 + 4) + 4 + 7, "system, the question and the tools; never history");
     }

@@ -386,7 +386,7 @@ func (p *NodeWorkloads) refused(e nodewl.Entry, err error) {
 	}
 	code := nodewl.CodeOf(err)
 	if code == "" {
-		slog.Warn("node workload: not converged", "addon", e.Addon, "workload", e.Name, "error", err)
+		slog.Warn("node workload: not converged", "addon", e.Addon, "workload", e.Name, "error", scrubURLs(err.Error()))
 		return
 	}
 	p.with(e.Addon, e.Name, func(ls *lifeState) { ls.reason = code })
@@ -432,7 +432,7 @@ func (p *NodeWorkloads) convergeProvisioned(ctx context.Context, e nodewl.Entry)
 		// It ran and is gone (crashed, or stopped after a drain): a released
 		// workload is always recreated fresh and stopped.
 		if err := p.removeWorkload(ctx, e); err != nil {
-			p.refused(e, err)
+			p.refused(e, provisionErr(err))
 			return
 		}
 	}
@@ -442,8 +442,21 @@ func (p *NodeWorkloads) convergeProvisioned(ctx context.Context, e nodewl.Entry)
 	case errors.Is(err, ErrWorkerRunning):
 		p.goRelease(ctx, e, thenProvision)
 	default:
-		p.refused(e, err)
+		p.refused(e, provisionErr(err))
 	}
+}
+
+// provisionErr is err as the row's reason sees it: a provisioning attempt
+// that failed with no code of its own is provision_failed (detail scrubbed of
+// URL secrets). An uncoded error elsewhere stays out of the row, as refused
+// keeps it (a transient read must not replace a real reason); but a failed
+// provision IS this attempt's verdict, and leaving the earlier reason in place
+// (0.6.25-rc.2) reported door_leaf_missing for a failure that was not the leaf.
+func provisionErr(err error) error {
+	if err == nil || nodewl.CodeOf(err) != "" || errors.Is(err, ErrSetsPending) || errors.Is(err, ErrWorkerRunning) {
+		return err
+	}
+	return refuse(nodewl.ReasonProvisionFailed, "", "%s", scrubURLs(err.Error()))
 }
 
 func (p *NodeWorkloads) convergeRunning(ctx context.Context, e nodewl.Entry) {

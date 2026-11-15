@@ -28,6 +28,17 @@ func TestChatContextReadsDesiredConfigChatContexts(t *testing.T) {
 		}
 	}
 
+	// The copy /harness/placement carries: the normalised keys, and a copy,
+	// so a caller cannot change what the agent stamps.
+	got := r.ChatContexts()
+	if len(got) != 2 || got["gemma4:e2b"] != 16384 || got["qwen3:latest"] != 8192 {
+		t.Fatalf("ChatContexts() = %v", got)
+	}
+	got["gemma4:e2b"] = 1
+	if r.ChatContext("gemma4:e2b") != 16384 {
+		t.Fatal("ChatContexts() must hand out a copy")
+	}
+
 	var older desiredConfig
 	if err := json.Unmarshal([]byte(`{"placements": []}`), &older); err != nil {
 		t.Fatal(err)
@@ -35,5 +46,8 @@ func TestChatContextReadsDesiredConfigChatContexts(t *testing.T) {
 	r.recordChatContexts(older.ChatContexts)
 	if got := r.ChatContext("gemma4:e2b"); got != 0 {
 		t.Errorf("an older gateway's body clears the table: got %d", got)
+	}
+	if r.ChatContexts() != nil {
+		t.Error("nothing decided: no table on the placement")
 	}
 }

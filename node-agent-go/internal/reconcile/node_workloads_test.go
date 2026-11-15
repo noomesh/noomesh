@@ -408,3 +408,32 @@ func TestEachConvergeTellsTheHeartbeat(t *testing.T) {
 		t.Fatalf("heartbeat kicks after one converge = %d, want 1", kicks)
 	}
 }
+
+// 0.6.25-rc.2: with the leaf ready and the row still door_leaf_missing (a
+// later step failing), the watch nudged a full reconcile every 5 s. It nudges
+// ONCE per arrival, and again only after the row moved on and came back.
+func TestTheLeafWatchNudgesOncePerArrival(t *testing.T) {
+	missing := []dockerpkg.Row{{Addon: "rhaddon", Name: "echo", Reason: nodewl.ReasonDoorLeafMissing}}
+	nw := &fakeNW{rows: missing, leafReady: map[string]bool{"rhaddon/echo": true}}
+	r := nwRig(t, nw)
+	if !r.leafArrived() {
+		t.Fatal("the first arrival nudges")
+	}
+	for i := 0; i < 3; i++ {
+		if r.leafArrived() {
+			t.Fatalf("tick %d: the same arrival nudged again", i+2)
+		}
+	}
+	nw.mu.Lock()
+	nw.rows = []dockerpkg.Row{{Addon: "rhaddon", Name: "echo", Reason: nodewl.ReasonImageUnavailable}}
+	nw.mu.Unlock()
+	if r.leafArrived() {
+		t.Fatal("image_unavailable is not the leaf's to clear")
+	}
+	nw.mu.Lock()
+	nw.rows = missing
+	nw.mu.Unlock()
+	if !r.leafArrived() {
+		t.Fatal("a new door_leaf_missing → ready arrival nudges again")
+	}
+}

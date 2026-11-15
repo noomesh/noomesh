@@ -30,6 +30,8 @@ Retired in 0.6.12 (each still answers with its successor instead of "unknown com
 
 `noo cluster show <node>` prints a **Chat context** line per chat model on an Ollama: `running` is the context the daemon runs the model at now (`?` when the node does not report it), `decided` is the one context every chat call to that Ollama asks for (the placement's `OLLAMA_CONTEXT_LENGTH`, else the tier profile's context, capped by the model's ceiling), and `capped` says why memory took it below that, with the numbers. `--json` carries the rows as `chat_contexts`.
 
+Both the tuned context and the decided one are sized on a **declared basis**: the node's RAM less a 10% headroom, less 2.5 GB for the stack on the controller's own box, less every declared model at its weights' file size plus its cache and overhead. A live memory reading is never used, because Ollama's resident figure leaves out the memory-mapped weights and so reads the box emptier the moment a model loads. The same box with the same placements therefore always gets the same context, loaded or not. The cache per token comes from one table: measured where config/model-capabilities.json has a figure, else the model's reported architecture, else an estimate from the weights. The reason line says which. `noo cluster place` prints the context it chose and why; a placement keeps its context when it is placed again with the same model and target, including on upgrade. To re-run the tuner deliberately: `noo cluster place <node> ollama <model> --retune`.
+
 ## Recipes
 
 ### Enroll a node end to end
@@ -837,7 +839,7 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 | `noo cluster proposals` | `[--status <s>] [--limit <n>]` | List the enrollment proposals agents filed, with each host in full |
 | `noo cluster show` | `<node>` | Show one node in full: hardware, agent version, tier drift, bus principal, roles |
 | `noo cluster forget` | `<node> [--purge-tailscale] [-y\|--yes]` | Remove a dead node's row, KV entry and enrollments; --purge-tailscale drops its device |
-| `noo cluster place` | `<node> <backend\|harness> <model\|auto> [--on cpu\|gpu] [--keep-warm\|--no-keep-warm] [--env KEY=VALUE]... [--kind noo\|claude-code\|copilot\|codex] [--role chat\|embed\|rerank] [--port <port>] [--tls] [--image <image>] [--stopped] [--force]` | Declare a backend and model in a role on a node, on cpu or gpu; auto-tunes unless --env |
+| `noo cluster place` | `<node> <backend\|harness> <model\|auto> [--on cpu\|gpu] [--keep-warm\|--no-keep-warm] [--env KEY=VALUE]... [--kind noo\|claude-code\|copilot\|codex] [--role chat\|embed\|rerank] [--port <port>] [--tls] [--image <image>] [--stopped] [--force] [--retune]` | Declare a backend and model in a role on a node, on cpu or gpu; auto-tunes unless --env |
 | `noo cluster unplace` | `<node> <backend> [--role chat\|embed\|rerank] [--model <model>]` | Remove a placement, or one embed model; a container keeps running, a harness is stopped |
 | `noo cluster fit` | `<node> [--with <backend> <model> [--on cpu\|gpu] [--role <role>] [--env KEY=VALUE]...]` | Show whether placements fit a node's GPU memory and RAM, with or without one more |
 | `noo cluster class list` | — | Show the model classes consumers may send as `model`, with candidate placement and health |
