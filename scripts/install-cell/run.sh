@@ -560,7 +560,7 @@ if [ "$CELL" = "$CONTEXT_PIN_CELL" ] && [ -f "$CONTEXT_FIT" ]; then
     # `running` (rc.3 run 1 never reached them).
     judged_ctx_continue context-fit-pinned-running 400 running --expect-decided 4096
     judged_ctx context-fit-pinned-check 600 pinned-check
-    judged_ctx context-fit-doesnt-fit 300 doesnt-fit
+    judged_ctx context-fit-doesnt-fit 300 doesnt-fit --expect-backend ollama
 fi
 
 # PROBE (fa, rc.1 rehearsal A-reboot.status, i677): a container that joins
