@@ -323,8 +323,13 @@ pub async fn resolve_candidates(state: &AppState, hint: Option<&str>, node: Opti
             ));
         }
         let backend = coordinator::resolve_backend_for_model(state, hint).await.map_err(|e| RawChatError::from_resolve(&e))?;
+        // The controller's own door (a one-box's embed Ollama) is the
+        // controller's own node, so its decided context is stamped (i802);
+        // any other URL keeps the host it names.
         let cand = classes::Candidate::synthetic(
-            coordinator::node_from_backend_url(&backend.url).unwrap_or_else(|| "controller".into()),
+            crate::chat_context::own_node_id_for_url(&backend.url)
+                .or_else(|| coordinator::node_from_backend_url(&backend.url))
+                .unwrap_or_else(|| "controller".into()),
             backend.backend_type,
             backend.model,
             backend.url,
@@ -1857,6 +1862,19 @@ mod num_ctx_tests {
     /// `/v1/responses`, `/api/inference` raw) funnels here: each candidate's
     /// context is resolved before the loop and stamped on the body built for
     /// it, inside the builder handed to the failover loop.
+    /// i802 (A): with no class table, the one candidate is the legacy
+    /// resolver's static door. On a one-box that is the controller's own
+    /// embed Ollama: it is named as the controller's own node, so its
+    /// decided context is stamped, not the container's name (no record).
+    #[test]
+    fn the_static_candidate_names_the_controllers_own_node() {
+        let own = crate::test_src::own_code(include_str!("raw_chat.rs"));
+        let f = crate::test_src::fn_body(&own, "pub async fn resolve_candidates(");
+        let mapped = f.find("crate::chat_context::own_node_id_for_url(&backend.url)").expect("the door is mapped first");
+        let named = f.find(".or_else(|| coordinator::node_from_backend_url(&backend.url))").expect("then the host it names");
+        assert!(mapped < named, "{f}");
+    }
+
     #[test]
     fn the_failover_path_resolves_per_candidate_and_stamps_inside_the_builder() {
         let code = crate::test_src::own_code(include_str!("raw_chat.rs"));
