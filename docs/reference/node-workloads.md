@@ -379,7 +379,7 @@ The agent creates the worker with exactly this and nothing more.
 | Env | the entry's declared keys; `<ADDON_UPPER>_MODEL_<SLOT_UPPER>_ID` and `_REVISION` per placed slot (comma-separated for a `many` slot); `HF_HUB_OFFLINE=1`; `TRANSFORMERS_OFFLINE=1`. Nothing else. A declared key that collides with one the agent sets is `env_out_of_bounds` |
 | Limits | memory `limits.ram_mb` (swap equal to memory, so none), `limits.cpus`, `limits.pids` |
 | Restart | `no` |
-| Labels | `noo.addon`, `noo.workload`, `noo.managed-by=agent`, `noo.role`, `noo.spec.hash`, and `noo.reservation` when set. The worker also carries `noo.drain-path`, `noo.drain-done-path` and `noo.drain-timeout-secs` |
+| Labels | `noo.addon`, `noo.workload`, `noo.managed-by=agent`, `noo.role` and `noo.spec.hash`. No reservation id: the reservation lives in the gateway's placement row, and a label would put it in the spec hash. The worker also carries `noo.drain-path`, `noo.drain-done-path` and `noo.drain-timeout-secs` |
 
 Only `.verified` sets are bound (a set the agent has not verified is
 `set_unverified`, one it does not hold is `set_missing`, one still being
@@ -411,7 +411,9 @@ fetched is not a refusal: the row stays pending).
 - **Recreate.** One spec hash (the image, the door image and conf, the leaf's
   fingerprint, the sets, the env, the limits, the labels) is stored on both
   containers. A matching pair is left alone; any change removes both (and the
-  scratch volumes) and recreates them stopped. A running worker is never
+  scratch volumes) and recreates them stopped. A reservation is not a change:
+  a reserve after provision starts the same two containers, it does not
+  rebuild them. A running worker is never
   recreated by a provision: it returns `ErrWorkerRunning` and the caller
   drains first.
 - A container, volume or network with the workload's name that lacks
@@ -514,8 +516,10 @@ the new gateway, or remove and re-place the workload.
 
 - `absent` to `provisioned`: load the image tar from the rail, check it yields
   exactly one image whose ID equals `image.id`, verify the sets, create the sidecar and the worker stopped.
-- `provisioned` to `running`: start. A worker not ready within `start_secs`
-  reports `start_timeout`.
+- `provisioned` to `running`: start the sidecar, then the worker. A start the
+  daemon refuses is retried once after 2 s (the first error is logged); if
+  the retry fails too the start is refused `start_failed` with both errors. A
+  worker not ready within `start_secs` reports `start_timeout`.
 - **Release returns the row to `provisioned`**: drain the worker as described
   under "The worker's drain" (POST `drain.path`, poll `drain.done_path`, all
   within `drain.timeout_secs`), stop, remove the worker and its scratch,
