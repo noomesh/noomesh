@@ -4313,20 +4313,37 @@ mod request_trace_ttft_migration_tests {
         }
     }
 
-    /// The keep-warm column: the chain head, on the TTFT columns (122), one
-    /// additive column whose constant default leaves every existing placement
-    /// not warm.
+    /// The keep-warm column: on the TTFT columns (122), one additive column
+    /// whose constant default leaves every existing placement not warm.
     #[test]
-    fn placement_keep_warm_is_the_head_additive_and_default_off() {
+    fn placement_keep_warm_is_additive_and_default_off() {
         let m = MIGRATIONS.iter().find(|m| m.revision == PLACEMENT_KEEP_WARM_REVISION).expect("in the chain");
         assert_eq!(m.revision, "123_placement_keep_warm");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(REQUEST_TRACE_TTFT_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(PLACEMENT_KEEP_WARM_REVISION), "the chain head");
         assert!(m.sql.contains("ALTER TABLE noo_backend_placements ADD COLUMN IF NOT EXISTS keep_warm boolean NOT NULL DEFAULT false;"));
         assert!(m.sql.contains("to_regclass('noo_backend_placements')"));
         for banned in ["DROP", "DELETE", "UPDATE"] {
             assert!(!m.sql.contains(banned), "{banned}: the keep-warm column only adds");
+        }
+    }
+
+    /// The node-workload holder: the chain head, on keep-warm (123), two
+    /// nullable columns and nothing else, so a 0.6.24 row reads back NULL
+    /// ("no one holds it") and rolling back to 0.6.24 leaves them unread.
+    #[test]
+    fn node_workload_holder_is_the_head_and_only_adds_nullable_columns() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == NODE_WORKLOAD_HOLDER_REVISION).expect("in the chain");
+        assert_eq!(m.revision, "124_node_workload_holder");
+        assert!(m.revision.len() <= 32);
+        assert_eq!(m.down_revision, Some(PLACEMENT_KEEP_WARM_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(NODE_WORKLOAD_HOLDER_REVISION), "the chain head");
+        for col in ["holder text", "reserved_at timestamptz"] {
+            assert!(m.sql.contains(&format!("ALTER TABLE noo_node_workload_placements ADD COLUMN IF NOT EXISTS {col};")), "{col}");
+        }
+        assert!(m.sql.contains("to_regclass('noo_node_workload_placements')"));
+        for banned in ["DEFAULT", "NOT NULL", "DROP", "DELETE", "UPDATE"] {
+            assert!(!m.sql.contains(banned), "{banned}: the holder columns only add nullable columns");
         }
     }
 
