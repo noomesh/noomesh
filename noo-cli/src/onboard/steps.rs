@@ -7292,25 +7292,8 @@ pub(crate) fn place_args(node: &str, model: &str) -> Vec<String> {
 /// The tuning lines of `noo cluster place`'s output (`KEY=VALUE  why`), for
 /// onboarding to show instead of swallowing them.
 pub(crate) fn tuned_lines(out: &str) -> Vec<String> {
-    // Colour codes, if the child coloured its output: ESC [ ... final byte.
-    let plain = |l: &str| {
-        let mut out = String::with_capacity(l.len());
-        let mut it = l.chars().peekable();
-        while let Some(c) = it.next() {
-            if c == '\u{1b}' && it.peek() == Some(&'[') {
-                for d in it.by_ref() {
-                    if d.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
-    };
     out.lines()
-        .map(|l| plain(l).trim().to_string())
+        .map(|l| crate::ui::plain(l).trim().to_string())
         .filter(|l| l.starts_with("OLLAMA_CONTEXT_LENGTH=") || l.starts_with("OLLAMA_NUM_PARALLEL="))
         .collect()
 }
@@ -10636,8 +10619,9 @@ mod first_chat_placement_tests {
     #[test]
     fn the_placement_is_the_operators_own_command() {
         assert_eq!(place_args("box", "gemma4:e2b"), ["cluster", "place", "box", "ollama", "gemma4:e2b"]);
-        // Onboarding shows what place tuned and why, colour or not.
-        let out = "\u{1b}[2m→\u{1b}[0m on cpu — the node has no GPU\n  OLLAMA_NUM_PARALLEL=1  \u{1b}[2mcpu node\u{1b}[0m\n  OLLAMA_CONTEXT_LENGTH=32768  \u{1b}[2mhalf of the 6.4 GB left after the declared models\u{1b}[0m\n";
+        // Onboarding shows what place tuned and why (colour is stripped by
+        // ui::plain, tested there).
+        let out = "→ on cpu — the node has no GPU\n  OLLAMA_NUM_PARALLEL=1  cpu node\n  OLLAMA_CONTEXT_LENGTH=32768  half of the 6.4 GB left after the declared models\n";
         assert_eq!(tuned_lines(out), ["OLLAMA_NUM_PARALLEL=1  cpu node", "OLLAMA_CONTEXT_LENGTH=32768  half of the 6.4 GB left after the declared models"]);
     }
 

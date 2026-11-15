@@ -839,7 +839,7 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 | `noo cluster proposals` | `[--status <s>] [--limit <n>]` | List the enrollment proposals agents filed, with each host in full |
 | `noo cluster show` | `<node>` | Show one node in full: hardware, agent version, tier drift, bus principal, roles |
 | `noo cluster forget` | `<node> [--purge-tailscale] [-y\|--yes]` | Remove a dead node's row, KV entry and enrollments; --purge-tailscale drops its device |
-| `noo cluster place` | `<node> <backend\|harness> <model\|auto> [--on cpu\|gpu] [--keep-warm\|--no-keep-warm] [--env KEY=VALUE]... [--kind noo\|claude-code\|copilot\|codex] [--role chat\|embed\|rerank] [--port <port>] [--tls] [--image <image>] [--stopped] [--force] [--retune]` | Declare a backend and model in a role on a node, on cpu or gpu; auto-tunes unless --env (--retune re-tunes held keys) |
+| `noo cluster place` | `<node> <backend\|harness> <model\|auto> [--on cpu\|gpu] [--keep-warm\|--no-keep-warm] [--env KEY=VALUE]... [--kind noo\|claude-code\|copilot\|codex] [--role chat\|embed\|rerank] [--port <port>] [--tls] [--image <image>] [--stopped] [--force] [--retune]` | Declare a backend and model in a role on a node, on cpu or gpu; auto-tunes unless --env |
 | `noo cluster unplace` | `<node> <backend> [--role chat\|embed\|rerank] [--model <model>]` | Remove a placement, or one embed model; a container keeps running, a harness is stopped |
 | `noo cluster fit` | `<node> [--with <backend> <model> [--on cpu\|gpu] [--role <role>] [--env KEY=VALUE]...]` | Show whether placements fit a node's GPU memory and RAM, with or without one more |
 | `noo cluster class list` | — | Show the model classes consumers may send as `model`, with candidate placement and health |
