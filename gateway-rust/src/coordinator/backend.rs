@@ -260,19 +260,39 @@ pub(crate) fn is_retryable_llm_http_error(status: u16, body: &str) -> bool {
         || body.trim().is_empty() // bare 502/503/504 from an intermediary
 }
 
-/// Does this 4xx body describe a context-window overflow?
+/// Does this body describe a context-window overflow? Decided on the error's
+/// structure first, and on a message only by the engine's own opening
+/// sentence, never by loose words. The live 0.6.24 failover
+/// (ref-631c8a3bae) called a node agent's `docker_unavailable` ("... context
+/// deadline exceeded") an overflow because the old test was `context` and
+/// `exceed` anywhere in the body.
 ///
-/// Markers from the engines we route to:
-///   - llama.cpp: `"exceed_context_size_error"` /
-///     "the request exceeds the available context size"
-///   - vLLM: "This model's maximum context length is N tokens. However,
-///     you requested M tokens"
-///   - ollama: truncates instead of erroring (never reaches here)
+/// - A node agent's own refusal (`type: node_agent_proxy_error` with any
+///   code but `backend_error`: `docker_unavailable`, `backend_unreachable`,
+///   `backend_busy`, ...) is never an overflow. `backend_error` relays the
+///   engine's own text, so its message is judged.
+/// - llama.cpp: `type: exceed_context_size_error`, or its sentence "the
+///   request exceeds the available context size".
+/// - vLLM (no code of its own): its sentence "This model's maximum context
+///   length is N tokens", as the message, or as the whole body when an
+///   intermediary sends plain text.
+/// - Ollama truncates instead of erroring (never reaches here).
 pub(crate) fn is_context_overflow_body(body: &str) -> bool {
-    let b = body.to_lowercase();
-    b.contains("exceed_context_size")
-        || (b.contains("context") && (b.contains("exceed") || b.contains("too long")))
-        || b.contains("maximum context length")
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return engine_overflow_sentence(body);
+    };
+    let e = v.get("error").filter(|e| e.is_object()).unwrap_or(&v);
+    let field = |k: &str| e.get(k).and_then(serde_json::Value::as_str).unwrap_or("");
+    if field("type") == "node_agent_proxy_error" && field("code") != "backend_error" {
+        return false;
+    }
+    field("type") == "exceed_context_size_error" || engine_overflow_sentence(field("message"))
+}
+
+/// An engine's own overflow sentence, at the start of `message`.
+fn engine_overflow_sentence(message: &str) -> bool {
+    let m = message.trim_start();
+    m.starts_with("This model's maximum context length is") || m.starts_with("the request exceeds the available context size")
 }
 
 /// Normalise a caller-supplied `model` into a routing hint.
@@ -1843,6 +1863,34 @@ mod tests {
         assert!(!is_context_overflow_body("invalid request: missing model"));
         // Same body on a 200/500 path is not this classifier's business
         assert!(!is_retryable_llm_http_error(500, vllm));
+        // vLLM's JSON shape, and an engine's text relayed by its node agent.
+        let vllm_json = r#"{"object":"error","message":"This model's maximum context length is 4096 tokens. However, you requested 11621 tokens","type":"BadRequestError","param":null,"code":400}"#;
+        assert!(is_context_overflow_body(vllm_json));
+        let relayed = r#"{"error":{"code":"backend_error","message":"This model's maximum context length is 4096 tokens. However, you requested 11621 tokens","type":"node_agent_proxy_error"}}"#;
+        assert!(is_context_overflow_body(relayed), "backend_error relays the engine's own text");
+        // llama.cpp by its type alone, whatever its message says.
+        let by_type = r#"{"error":{"code":400,"message":"n_ctx 4096 reached","type":"exceed_context_size_error"}}"#;
+        assert!(is_context_overflow_body(by_type));
+    }
+
+    /// The live 0.6.24 failover (13:00:46Z, ref-631c8a3bae): a node agent's
+    /// own 503 was labelled "prompt exceeds this backend's context window"
+    /// because its message ends "context deadline exceeded". It is the
+    /// agent's refusal, by its code, whatever its message says; it stays
+    /// retryable as a backend fault.
+    #[test]
+    fn a_node_agents_own_refusal_is_never_a_context_overflow() {
+        let live = r#"{"error":{"code":"docker_unavailable","message":"docker unavailable: could not list running backends: Get \"http://docker/containers/json\": context deadline exceeded","type":"node_agent_proxy_error"}}"#;
+        assert!(!is_context_overflow_body(live));
+        assert!(is_retryable_llm_http_error(503, live), "still a backend fault: fail over");
+        assert!(!is_retryable_llm_http_error(400, live), "and never a 400 overflow failover");
+        // By the code, not the words: even an overflow sentence under an
+        // agent code of its own is the agent's refusal.
+        let coded = r#"{"error":{"code":"backend_unreachable","message":"This model's maximum context length is 4096 tokens","type":"node_agent_proxy_error"}}"#;
+        assert!(!is_context_overflow_body(coded));
+        // Loose words alone are no longer an overflow.
+        assert!(!is_context_overflow_body("upstream: context deadline exceeded"));
+        assert!(!is_context_overflow_body(r#"{"error":"prompt too long for the context"}"#));
     }
 
     #[test]
