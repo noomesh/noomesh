@@ -144,6 +144,15 @@ class ToolDef(BaseModel):
     # generated manifest and never run this class — an override fixes the
     # Python client only. See `get_body` and scripts/build-mcp-manifest.py.
     body_field: ClassVar[str] = ""
+    #: Answered by whatever serves the tool (the MCP doors, this module's
+    #: `dispatch`) in process, never proxied to ``path``: no gateway route
+    #: serves it. Exported as ``"native": true``; the doors refuse to proxy a
+    #: native tool they do not answer, rather than 404 on its path.
+    native: ClassVar[bool] = False
+
+    async def run_local(self) -> str:
+        """The in-process answer of a ``native`` tool; every native overrides it."""
+        raise NotImplementedError(f"{self.name} is native but answers nothing in process")
 
     def get_path(self) -> str:
         """Return the HTTP path, substituting any {field} placeholders."""
@@ -409,6 +418,8 @@ async def dispatch(tool: ToolDef) -> str:
     It reads the tool's metadata to determine method, path, auth, body/params,
     and calls format_response on the result.
     """
+    if tool.native:
+        return await tool.run_local()
     client = _get_http_client()
     url = f"{GATEWAY_URL}{tool.get_path()}"
     headers = _auth_headers(tool.auth)
@@ -450,7 +461,14 @@ async def dispatch(tool: ToolDef) -> str:
         if status in (401, 403):
             raise PermissionError(f"Auth failed (HTTP {status})") from exc
         if status == 404:
-            raise LookupError(f"Not found: {tool.get_path()}") from exc
+            # Method and path only: never the query string or a header.
+            where = f"{tool.method.value} {tool.get_path()}"
+            if not exc.response.text.strip():
+                raise LookupError(
+                    f"no route {where} on this gateway: the tool names a path "
+                    "the gateway does not serve (a wiring defect)"
+                ) from exc
+            raise LookupError(f"Not found: {where}: {detail}") from exc
         if status == 503:
             raise ConnectionError("Gateway unavailable (503)") from exc
         raise RuntimeError(f"Gateway error (HTTP {status}): {detail}") from exc

@@ -5868,6 +5868,7 @@
       },
       "method": "GET",
       "name": "noo_tool_search",
+      "native": true,
       "path": "/api/tools/search",
       "risk_level": "low",
       "tags": [

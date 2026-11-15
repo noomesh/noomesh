@@ -154,6 +154,10 @@ def build(full: bool = False) -> dict:
             # and never call `get_body`, so a Python-side override would fix
             # the stdio client and leave both doors wrapping the payload.
             "body_field": cls.body_field,
+            # Answered in process by whatever serves it; never proxied to
+            # `path` (no route serves it). Only written when true, so the
+            # other entries are unchanged.
+            **({"native": True} if getattr(cls, "native", False) else {}),
             # Advisory for reviewers: these had custom Python formatting that
             # the Rust door does not reproduce (it returns raw JSON).
             "had_custom_format": "format_response" in cls.__dict__,
