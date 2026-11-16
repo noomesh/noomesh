@@ -22614,6 +22614,40 @@
           }
         }
       }
+    },
+    "/api/security/service-keys/{consumer}/context-overflow": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create context overflow",
+        "description": "[native] POST /api/security/service-keys/{consumer}/context-overflow \u2014 `flag` (send an over-long prompt and say the cut after the fact, every key's default) or `refuse` (413 `context_too_small` before sending). i802, operator 2026-11-15.",
+        "operationId": "service_key_set_context_overflow",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

@@ -230,6 +230,14 @@ Cleanup runs only when the roll's `stack images`, `add-on pins` and
 they do not, the roll says which row blocked it, and the `image retention`
 row says so until a roll cleans.
 
+A container still running from a compose profile this stack no longer runs
+(for example `noo-stunnel-ollama` after the controller stopped running its own
+chat Ollama) is not a stale stack image: no roll stops it, and `noo upgrade
+--stack` cannot. The roll prints `! <name> is from a profile this stack does
+not run …`, and verify shows it in a `stack leftovers` WARN with the exact
+`docker stop <name> && docker rm <name>`. It blocks no cleanup, and its own
+image stays while it runs.
+
 ### Breaking changes to expect on upgrade
 
 Newest first. Anything here changes behaviour on an install that already

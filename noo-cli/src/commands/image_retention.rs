@@ -155,6 +155,16 @@ pub(crate) fn local_images() -> Result<Vec<LocalImage>, String> {
     Ok(parse_local_images(&run(&args)?))
 }
 
+/// The images docker listed, or why no keep file can be written. A listing
+/// that failed proves nothing about what to keep: the keep file is refused,
+/// so no keep file is written and the post-roll step removes nothing (hostd's
+/// rung needs one). Never an empty list in its place, which would keep each
+/// lock row only under its own name and, with a store that lists, leave the
+/// previous release's images unnamed (the rc.1 defect, #1219).
+pub(crate) fn listed_or_refused(listed: Result<Vec<LocalImage>, String>) -> Result<Vec<LocalImage>, String> {
+    listed.map_err(|e| format!("docker did not list the images ({e}): nothing proves what to keep, so nothing is removed"))
+}
+
 /// The `# stack <tag>` header of a stack lock (the release writes it).
 pub(crate) fn stack_lock_tag(text: &str) -> Option<String> {
     text.lines().find_map(|l| l.trim().strip_prefix("# stack ").map(|t| t.trim().to_string()))
@@ -215,7 +225,7 @@ impl KeepInputs {
             roots: crate::registry::rail_roots().iter().map(|s| s.to_string()).collect(),
             // Fail closed: without the local images no row can be kept by
             // the ID that holds it, so no keep file is written.
-            local: local_images().map_err(|e| format!("docker did not list the images ({e}): nothing proves what to keep"))?,
+            local: listed_or_refused(local_images())?,
         })
     }
 }
@@ -904,6 +914,7 @@ mod tests {
         said: Vec<String>,
         blocked: Vec<Vec<String>>,
         cleared: u32,
+        keep_err: Option<String>,
     }
 
     impl PostRollHost for FakeHost {
@@ -925,7 +936,10 @@ mod tests {
         }
         fn write_keep(&mut self) -> Result<PathBuf, String> {
             self.keeps += 1;
-            Ok(PathBuf::from("/r/.noo-host-spool/image-keep.json"))
+            match &self.keep_err {
+                Some(e) => Err(e.clone()),
+                None => Ok(PathBuf::from("/r/.noo-host-spool/image-keep.json")),
+            }
         }
         fn hostd_up(&mut self) -> bool {
             !self.hostd_down
@@ -940,6 +954,32 @@ mod tests {
         fn say(&mut self, line: &str) {
             self.said.push(line.into());
         }
+    }
+
+    /// Docker that cannot list its images (a daemon down, a CLI whose
+    /// template fails) proves nothing about what to keep: the keep file is
+    /// refused, and the roll removes nothing, saying why. Live mode, gate
+    /// passed, hostd up: everything else would run the rung.
+    #[test]
+    fn a_docker_that_cannot_list_its_images_writes_no_keep_file_and_removes_nothing() {
+        let e = listed_or_refused(Err("Cannot connect to the Docker daemon at unix:///var/run/docker.sock".into())).unwrap_err();
+        assert!(e.starts_with("docker did not list the images (Cannot connect to the Docker daemon") && e.ends_with("so nothing is removed"), "{e}");
+        let one = LocalImage { id: format!("sha256:{}", h('a')), refs: vec![] };
+        assert_eq!(listed_or_refused(Ok(vec![one.clone()])).unwrap(), vec![one], "a listing passes through");
+        assert_eq!(listed_or_refused(Ok(vec![])).unwrap(), vec![], "an empty store is a listing, not a failure");
+
+        let mut host = passed(&[]);
+        host.rung = Some(some_superseded());
+        host.keep_err = Some(e.clone());
+        post_roll_on(&mut host, Some("live"), true, "v0.6.25");
+        assert_eq!(host.keeps, 1, "the keep file was asked for");
+        assert!(host.rungs.is_empty(), "no keep file, no rung: nothing removed");
+        assert!(host.said.iter().any(|l| l == &format!("images: not cleaned up: {e}")), "{:?}", host.said);
+        assert!(host.marked.is_empty());
+
+        // The read takes the listing through this mapping, not around it.
+        let read = crate::test_src::fn_body(include_str!("image_retention.rs"), "pub(crate) fn read(root: &Path)");
+        assert!(read.contains("local: listed_or_refused(local_images())?,"), "{read}");
     }
 
     fn some_superseded() -> Value {

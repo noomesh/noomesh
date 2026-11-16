@@ -181,6 +181,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/security/service-keys/{consumer}/rotate", post(service_key_rotate))
         .route("/api/security/service-keys/{consumer}/retire", post(service_key_retire))
         .route("/api/security/service-keys/{consumer}/quota", post(service_key_set_quota))
+        .route("/api/security/service-keys/{consumer}/context-overflow", post(service_key_set_context_overflow))
         // ── Mesh-UI contract surface (openapi.json) — native ports of the
         //    Python worker.api.users.* / worker.api.kb.* NATS handlers.
         //    Explicit routes here shadow the /api/{*path} Python catch-all.
@@ -2284,12 +2285,13 @@ async fn service_keys_list(
         Option<i64>,
         Option<String>,
         Option<chrono::DateTime<chrono::Utc>>,
+        String,
     )>(
         // superseded_at: an unfinished rotation is a state an operator has to
         // be able to SEE. Two live keys for one consumer is correct during a
         // rotation and wrong if it is still true next week.
         "SELECT consumer, scopes, active, created_at, last_used_at, note, rpm_limit, user_id, \
-                superseded_at \
+                superseded_at, context_overflow \
          FROM noo_service_keys ORDER BY created_at",
     )
     .fetch_all(&state.db)
@@ -2297,7 +2299,7 @@ async fn service_keys_list(
 
     let keys: Vec<Value> = rows
         .into_iter()
-        .map(|(consumer, scopes, active, created, last_used, note, rpm, user_id, superseded)| {
+        .map(|(consumer, scopes, active, created, last_used, note, rpm, user_id, superseded, overflow)| {
             // A key carrying a retired scope authenticates nothing now
             // (`service_keys::resolve`); say so on the row so the listing can
             // tell the operator to revoke it rather than leave it looking live.
@@ -2317,6 +2319,7 @@ async fn service_keys_list(
                 "rpm_limit": rpm,
                 "user_id": user_id,
                 "superseded_at": superseded,
+                "context_overflow": overflow,
             })
         })
         .collect();
@@ -3184,6 +3187,72 @@ async fn service_key_set_quota(
     })))
 }
 
+/// A key's policy is set by a person: any other origin (a service key, a
+/// token exchanged from one, an add-on, a harness door, a delegated
+/// credential, an account that is gone or disabled) is 403. Keys never
+/// manage keys.
+fn person_sets_key_policy(origin: crate::task_guard::Origin) -> Result<(), AppError> {
+    match origin {
+        crate::task_guard::Origin::Person { .. } => Ok(()),
+        crate::task_guard::Origin::Agent { via, .. } => Err(AppError::Forbidden(format!(
+            "a key's context-overflow mode is set by a person, not by {via}"
+        ))),
+    }
+}
+
+#[derive(Deserialize)]
+struct ContextOverflowBody {
+    mode: String,
+}
+
+/// POST /api/security/service-keys/{consumer}/context-overflow — `flag`
+/// (send an over-long prompt and say the cut after the fact, every key's
+/// default) or `refuse` (413 `context_too_small` before sending). i802,
+/// operator 2026-11-15.
+///
+/// Set by a person, never by a key: a service key, a token exchanged from
+/// one, a harness door or a delegated credential is refused 403
+/// ([`crate::task_guard::resolve_origin`]), so no key widens or narrows
+/// its own or another key's answer. The operator CLI's token is a person's.
+async fn service_key_set_context_overflow(
+    State(state): State<Arc<AppState>>,
+    Path(consumer): Path<String>,
+    actor_ext: Option<Extension<AuthActor>>,
+    ctx: Option<Extension<RequesterCtx>>,
+    Json(body): Json<ContextOverflowBody>,
+) -> AppResult {
+    person_sets_key_policy(crate::task_guard::resolve_origin(&state.db, &ctx).await)?;
+    require_may_manage_key_consumer(&state.db, &ctx, &consumer).await?;
+    let Some(mode) = crate::service_keys::ContextOverflow::parse(&body.mode) else {
+        return Err(AppError::BadRequest(format!(
+            "mode must be 'flag' or 'refuse', not '{}'",
+            body.mode
+        )));
+    };
+    let updated = crate::repo::service_key_overflow::set(&state.db, &consumer, mode.as_str()).await?;
+    // The raw proxy reads the mode through a short cache: the new mode
+    // applies now.
+    crate::service_keys::invalidate_cache();
+    if updated == 0 {
+        return Err(AppError::NotFound(format!(
+            "no active keys for consumer '{consumer}'"
+        )));
+    }
+    tracing::info!(consumer = %consumer, mode = mode.as_str(), by = %actor(&actor_ext), "service_key_context_overflow_set");
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::ServiceKeySetContextOverflow, &actor(&actor_ext), &consumer)
+            .details(json!({ "context_overflow": mode.as_str(), "updated_keys": updated })),
+    )
+    .await;
+    Ok(Json(json!({
+        "status": "ok",
+        "consumer": consumer,
+        "context_overflow": mode.as_str(),
+        "updated_keys": updated,
+    })))
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Mesh-UI contract surface: /api/users* + /api/kb* (openapi.json)
 //
@@ -3326,7 +3395,7 @@ fn is_operator(r: &RequesterCtx) -> bool {
 // user_set_password, user_disable / api_users_disable, user_erase,
 // user_set_scopes, user_set_role, user_grant_roles, user_revoke_roles,
 // user_set_org, user_link_create, service_key_issue / _rotate / _revoke /
-// _set_quota (on the bound user), and proposal_decide.
+// _set_quota / _set_context_overflow (on the bound user), and proposal_decide.
 
 /// The effective tier of an existing account.
 ///
@@ -5563,13 +5632,14 @@ pub(crate) mod tests {
             ("async fn service_key_rotate(", &["require_may_manage_key_consumer("]),
             ("async fn service_key_revoke(", &["require_may_manage_key_consumer("]),
             ("async fn service_key_set_quota(", &["require_may_manage_key_consumer("]),
+            ("async fn service_key_set_context_overflow(", &["person_sets_key_policy(crate::task_guard::resolve_origin(&state.db, &ctx).await)?;", "require_may_manage_key_consumer("]),
             ("async fn proposal_decide(", &["require_may_grant_value(", "require_may_manage("]),
             ("async fn api_users_disable(", &["require_may_manage(", "require_not_last_admin("]),
         ];
         // The parse itself must find something — a renamed handler that
         // silently matched nothing would make this test pass while checking
         // nothing at all.
-        assert_eq!(required.len(), 17, "keep the list and the count in step");
+        assert_eq!(required.len(), 18, "keep the list and the count in step");
         for (sig, calls) in required {
             let start = src
                 .find(sig)
@@ -5926,5 +5996,40 @@ mod key_cache_invalidation_tests {
         assert!(got.is_some_and(|c| c.name == consumer), "a just-issued key is unknown until the snapshot expires");
         // No cleanup statement: the consumer is unique per run in a scratch
         // database, and a query here would raise this file's repo ratchet.
+    }
+}
+
+/// Keys never manage keys (i802 opt-in, operator 2026-11-15): who may set a
+/// key's context-overflow mode.
+#[cfg(test)]
+mod key_policy_setter_tests {
+    use super::person_sets_key_policy;
+    use crate::auth::{Actor, RequesterCtx, Role};
+    use crate::task_guard::origin_of_requester;
+
+    fn ctx(sub: &str, harness: Option<&str>, act: Option<&str>) -> RequesterCtx {
+        RequesterCtx {
+            sub: sub.into(),
+            scopes: vec!["admin".into()],
+            role: Role::Admin,
+            harness: harness.map(str::to_string),
+            act: act.map(|a| Actor { sub: a.into(), iss_user: None, task: None, feature: None }),
+        }
+    }
+
+    #[test]
+    fn a_person_sets_it_and_no_key_or_agent_does() {
+        assert!(person_sets_key_policy(origin_of_requester(Some(&ctx("rbwolf", None, None)))).is_ok(), "the operator, CLI or console");
+        for (who, c) in [
+            ("a token exchanged from a key", ctx("rbwolf", None, Some("key:paiserve"))),
+            ("an add-on's exchanged token", ctx("addon:example", None, None)),
+            ("a service identity", ctx("svc:grafana", None, None)),
+            ("a harness door", ctx("rbwolf", Some("claude-code"), None)),
+            ("a delegated credential", ctx("rbwolf", None, Some("worker:run-1"))),
+        ] {
+            let refused = person_sets_key_policy(origin_of_requester(Some(&c)));
+            assert!(matches!(refused, Err(crate::routes::AppError::Forbidden(_))), "{who} must be refused");
+        }
+        assert!(person_sets_key_policy(origin_of_requester(None)).is_err(), "a bare service key carries no requester");
     }
 }

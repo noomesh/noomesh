@@ -431,7 +431,16 @@ func TestARecordNotOnlyOursIsIgnored(t *testing.T) {
 	}
 	_ = os.Remove(path)
 	_ = os.Rename(real, path)
-	// Owned by someone else (needs root to set up).
+	// Owned by someone else. As an unprivileged user (CI) the file cannot be
+	// chowned away, so the agent's own uid is made to differ instead.
+	func() {
+		defer func(f func() int) { selfUID = f }(selfUID)
+		selfUID = func() int { return os.Getuid() + 1 }
+		if reload().Verified(w, want) {
+			t.Error("a record owned by a uid other than the agent's must be ignored")
+		}
+	}()
+	// The same with a real chown, where the run can make one (root).
 	if os.Getuid() == 0 {
 		if err := os.Chown(path, 65534, 65534); err != nil {
 			t.Fatal(err)

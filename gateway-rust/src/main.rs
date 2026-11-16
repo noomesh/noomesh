@@ -96,6 +96,7 @@ mod tunnel;
 mod tunnel_door;
 mod maintenance;
 mod node_reachability;
+mod seat_watch;
 mod model_presence;
 mod placement_fit;
 mod role_capability;
@@ -212,6 +213,7 @@ mod metrics;
 mod middleware;
 mod model_capabilities;
 mod chat_context;
+mod context_cut;
 mod node_tier;
 mod operator_alert;
 mod posture;
@@ -771,6 +773,9 @@ async fn main() -> Result<()> {
     // connection still reads healthy (2026-09-04: a cert naming a stale
     // address, every inference failing, the fleet looking fine).
     node_reachability::spawn(state.clone());
+    // A kiosk seat's display down, or a seat that stopped reporting: its
+    // heartbeat carried the state, and only `noo cluster verify` read it.
+    seat_watch::spawn(state.clone());
     placement_stuck::spawn(state.clone());
 
     // The operator MCP door has no listener of its own. Until stack-v0.2.40

@@ -103,6 +103,7 @@ pub mod provision_bundles;
 pub mod request_trace;
 pub mod seats;
 pub mod settings;
+pub mod service_key_overflow;
 pub mod task_events;
 pub mod tasks;
 pub mod prompt_skill_proposals;

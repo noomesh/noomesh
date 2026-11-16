@@ -2511,6 +2511,18 @@ BEGIN
     END IF;
 END $$
 "#,
+}, Migration {
+    revision: SERVICE_KEY_CONTEXT_OVERFLOW_REVISION,
+    down_revision: Some(NODE_WORKLOAD_HOLDER_REVISION),
+    // What the raw proxy does with this consumer's prompt when it is longer
+    // than the Ollama's context (i802, operator 2026-11-15): 'flag' (the
+    // default, every existing key) sends it and says the cut after the
+    // fact; 'refuse' answers 413 context_too_small before sending. A
+    // constant default on PG 11+ is a catalog change, not a rewrite; a
+    // 0.6.24 gateway never reads the column. One statement guarded like 078.
+    sql: r#"
+ALTER TABLE IF EXISTS noo_service_keys ADD COLUMN IF NOT EXISTS context_overflow text NOT NULL DEFAULT 'flag' CHECK (context_overflow IN ('flag', 'refuse'))
+"#,
 }];
 
 /// Add-on feature settings and the super-admin flag (f99). A constant so a
@@ -2578,6 +2590,10 @@ pub const PLACEMENT_KEEP_WARM_REVISION: &str = "123_placement_keep_warm";
 /// reservation lives on its row, not a GPU lease), on 123: numbered at rebase
 /// against dev's real head. A constant so a renumber is one line.
 pub const NODE_WORKLOAD_HOLDER_REVISION: &str = "124_node_workload_holder";
+
+/// A service key's context-overflow mode, 'flag' or 'refuse' (i802), on
+/// 124: numbered at rebase against dev's real head.
+pub const SERVICE_KEY_CONTEXT_OVERFLOW_REVISION: &str = "125_service_key_context_overflow";
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
 /// constant so a renumber at rebase is one line.
@@ -4328,16 +4344,16 @@ mod request_trace_ttft_migration_tests {
         }
     }
 
-    /// The node-workload holder: the chain head, on keep-warm (123), two
+    /// The node-workload holder, on keep-warm (123), two
     /// nullable columns and nothing else, so a 0.6.24 row reads back NULL
     /// ("no one holds it") and rolling back to 0.6.24 leaves them unread.
     #[test]
-    fn node_workload_holder_is_the_head_and_only_adds_nullable_columns() {
+    fn node_workload_holder_only_adds_nullable_columns() {
         let m = MIGRATIONS.iter().find(|m| m.revision == NODE_WORKLOAD_HOLDER_REVISION).expect("in the chain");
         assert_eq!(m.revision, "124_node_workload_holder");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(PLACEMENT_KEEP_WARM_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(NODE_WORKLOAD_HOLDER_REVISION), "the chain head");
+        assert_eq!(MIGRATIONS.iter().find(|n| n.down_revision == Some(NODE_WORKLOAD_HOLDER_REVISION)).map(|n| n.revision), Some(SERVICE_KEY_CONTEXT_OVERFLOW_REVISION));
         for col in ["holder text", "reserved_at timestamptz"] {
             assert!(m.sql.contains(&format!("ALTER TABLE noo_node_workload_placements ADD COLUMN IF NOT EXISTS {col};")), "{col}");
         }
@@ -4348,6 +4364,22 @@ mod request_trace_ttft_migration_tests {
         for banned in ["DEFAULT", "DROP", "DELETE", "UPDATE"] {
             assert!(!m.sql.contains(banned), "{banned}: the holder columns only add nullable columns");
         }
+    }
+
+    /// The context-overflow mode: the chain head, on the holder (124); one
+    /// column, 'flag' for every existing key, and the CHECK that keeps it to
+    /// the two words the gateway reads.
+    #[test]
+    fn service_key_context_overflow_is_the_head_and_defaults_every_key_to_flag() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == SERVICE_KEY_CONTEXT_OVERFLOW_REVISION).expect("in the chain");
+        assert_eq!(m.revision, "125_service_key_context_overflow");
+        assert!(m.revision.len() <= 32);
+        assert_eq!(m.down_revision, Some(NODE_WORKLOAD_HOLDER_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(SERVICE_KEY_CONTEXT_OVERFLOW_REVISION), "the chain head");
+        assert_eq!(
+            m.sql.trim(),
+            "ALTER TABLE IF EXISTS noo_service_keys ADD COLUMN IF NOT EXISTS context_overflow text NOT NULL DEFAULT 'flag' CHECK (context_overflow IN ('flag', 'refuse'))"
+        );
     }
 
     /// The release script (`scripts/mesh-migration-head.sh`) takes the

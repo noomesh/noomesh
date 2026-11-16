@@ -2232,6 +2232,14 @@ pub fn security_service_key_list(g: &Globals, args: &[String]) -> Result<i32, Un
                     Value::Null => String::new(),
                     v => v.to_string(),
                 },
+                // What an over-long prompt gets: `flag` (sent, cut said
+                // after) is every key's default; an older gateway sends no
+                // field and the cell stays empty.
+                match k["context_overflow"].as_str() {
+                    Some("refuse") => "refuse".to_string(),
+                    Some(other) => ui::muted(other),
+                    None => String::new(),
+                },
                 ts(&k["created_at"], ""),
                 ts(&k["last_used_at"], "never"),
                 cell(&k["note"]),
@@ -2247,6 +2255,7 @@ pub fn security_service_key_list(g: &Globals, args: &[String]) -> Result<i32, Un
                 Col::left("scopes"),
                 Col::left("state"),
                 Col::right("rpm"),
+                Col::left("overflow"),
                 Col::left("created"),
                 Col::left("last used"),
                 Col::left("note"),
@@ -3111,6 +3120,43 @@ pub fn security_service_key_set_quota(g: &Globals, args: &[String]) -> Result<i3
         ui::muted(&format!("{} active key(s)", body["updated_keys"].as_u64().unwrap_or(0)))
     ));
     ui::guide(&[("noo security service-key list", "shows the cap next to each active key")]);
+    Ok(0)
+}
+
+/// `noo security service-key set-context-overflow CONSUMER flag|refuse`
+/// POST /api/security/service-keys/{c}/context-overflow: what the raw proxy
+/// does with this consumer's prompt when it is longer than the model's
+/// context. `flag` (the default) sends it and says the cut after the fact;
+/// `refuse` answers 413 `context_too_small` before sending. A person sets it,
+/// never a key.
+pub fn security_service_key_set_context_overflow(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let [consumer, mode] = positional::<2>(args)?;
+    if mode != "flag" && mode != "refuse" {
+        return Err(Unhandled);
+    }
+    let body = post_json(
+        g,
+        &format!("/api/security/service-keys/{consumer}/context-overflow"),
+        &json!({"mode": mode}),
+        true,
+        TIMEOUT,
+    );
+    if g.json {
+        println!("{body}");
+        return Ok(0);
+    }
+    let set = body["context_overflow"].as_str().unwrap_or(mode.as_str());
+    let means = if set == "refuse" {
+        "a prompt longer than the model's context is refused (413 context_too_small), never cut"
+    } else {
+        "a prompt longer than the model's context is sent, and the cut is said after (X-Noo-Context-Truncated)"
+    };
+    ui::done(&format!(
+        "context overflow for '{consumer}' set to {set}  {}",
+        ui::muted(&format!("{} active key(s)", body["updated_keys"].as_u64().unwrap_or(0)))
+    ));
+    println!("{}", ui::muted(means));
+    ui::guide(&[("noo security service-key list", "shows the mode next to each active key")]);
     Ok(0)
 }
 

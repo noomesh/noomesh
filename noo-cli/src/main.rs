@@ -593,6 +593,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["security", "service-key", "provision"], commands::security_service_key_provision),
     (&["security", "service-key", "rotate"], commands::security_service_key_rotate),
     (&["security", "service-key", "set-quota"], commands::security_service_key_set_quota),
+    (&["security", "service-key", "set-context-overflow"], commands::security_service_key_set_context_overflow),
     // Self-service: any account mints its OWN mcp key, no operator in the
     // loop. Longest-prefix dispatch puts these ahead of the CONSUMER-taking
     // `issue`/`revoke` above, so `self` can never be read as a consumer name.
