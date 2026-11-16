@@ -1808,7 +1808,7 @@ pub(crate) fn fetch_bundle(agent: &ureq::Agent, url: &str, proof: &str, last_app
     }
 }
 
-pub fn kiosk_seat_sync(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+pub fn kiosk_seat_sync(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let migrate = match args {
         [] => None,
         [a] if a == "--migrate" => Some(false),
@@ -1825,7 +1825,7 @@ pub fn kiosk_seat_sync(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
         return Ok(78);
     }
     if let Some(print_only) = migrate {
-        return Ok(seat_migrate(&cfg, print_only));
+        return Ok(seat_migrate(&cfg, print_only, g.verbose));
     }
     let key = Path::new(SEAT_DIR).join("birth.key");
     let ca = match std::fs::read(Path::new(SEAT_DIR).join("ca.crt")) {
@@ -1922,6 +1922,29 @@ pub fn kiosk_seat_sync(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
     Ok(if rc == 0 { 0 } else { 1 })
 }
 
+/// What `--migrate` says before its root script runs.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Announce {
+    /// `--verbose`: the whole script, on stdout, as before.
+    Script(String),
+    /// Otherwise one line. The script printed in full (60+ lines from
+    /// `set -eu`) ahead of the three result lines read like an error dump
+    /// (homeserver's repair after the 0.6.25 roll); `--print` shows it
+    /// without running it.
+    Line(String),
+}
+
+pub(crate) fn migrate_announce(script: &str, verbose: bool) -> Announce {
+    if verbose {
+        Announce::Script(script.to_string())
+    } else {
+        Announce::Line(format!(
+            "running the root step ({} lines; `--verbose` prints it as it runs, `--print` shows it without running)",
+            script.lines().count()
+        ))
+    }
+}
+
 /// `noo kiosk seat-sync --migrate [--print]` — move an already-enrolled seat
 /// from the root layout (root timer, root copy under /usr/local/libexec) to
 /// the user layout. ONE explicit command, run by the operator under sudo on
@@ -1939,7 +1962,7 @@ pub fn kiosk_seat_sync(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
 /// prints exactly what it runs, is run by a person who typed `sudo`, and
 /// until it runs the old layout keeps working (the root timer keeps
 /// reporting; nothing is applied as root by the new binary).
-fn seat_migrate(cfg: &SeatConfig, print_only: bool) -> i32 {
+fn seat_migrate(cfg: &SeatConfig, print_only: bool, verbose: bool) -> i32 {
     let say = |m: &str| eprintln!("noo-seat-sync: {m}");
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from(LEGACY_APPLIER_BIN));
     let group = user_group(&cfg.cli_user);
@@ -1998,7 +2021,10 @@ fn seat_migrate(cfg: &SeatConfig, print_only: bool) -> i32 {
     }
     let rc = if ok {
         let script = seat_install_script(&work, &exe, cfg, &group, kind);
-        println!("{script}");
+        match migrate_announce(&script, verbose) {
+            Announce::Script(s) => println!("{s}"),
+            Announce::Line(l) => say(&l),
+        }
         let sp = work.join("migrate.sh");
         let _ = std::fs::write(&sp, &script);
         let st = Command::new("sh").arg(&sp).status();
@@ -3005,6 +3031,21 @@ mod tests {
         let m = crate::test_src::fn_body(src, "fn seat_migrate(");
         assert!(m.contains("work.join(\"kiosk.service\"), seat_kiosk_unit(&p)"), "migrate renders the bundle's unit");
         assert!(crate::test_src::fn_body(src, "pub(crate) fn seat_bundle_files(").contains("seat_kiosk_unit(p)"), "one renderer for bundle, migrate and verify");
+    }
+
+    #[test]
+    fn migrate_prints_its_root_script_only_with_verbose() {
+        let script = "set -eu\nas_user() { :; }\necho one\n";
+        assert_eq!(migrate_announce(script, true), Announce::Script(script.to_string()));
+        assert_eq!(
+            migrate_announce(script, false),
+            Announce::Line("running the root step (3 lines; `--verbose` prints it as it runs, `--print` shows it without running)".into())
+        );
+        let src = include_str!("kiosk_seat.rs");
+        let m = crate::test_src::fn_body(src, "fn seat_migrate(");
+        assert!(m.contains("migrate_announce(&script, verbose)"), "the run path goes through the announce");
+        assert!(!m.contains("println!(\"{script}\")"), "never the whole script unasked");
+        assert!(crate::test_src::fn_body(src, "pub fn kiosk_seat_sync(").contains("seat_migrate(&cfg, print_only, g.verbose)"), "--verbose reaches it");
     }
 
     /// After an apply, a display row is softened to "no heartbeat since"

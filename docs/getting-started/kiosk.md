@@ -141,6 +141,9 @@ A failed apply shows in `noo cluster verify` as `seat bundle: apply failed:
 sudo /usr/local/libexec/noo-seat/noo kiosk seat-sync --migrate   # --print shows the script
 ```
 
+It says `running the root step (N lines; …)` and then its result lines; add
+`--verbose` to see the whole script as it runs.
+
 It moves the state and the copy into the user's tree, rewrites the sync unit
 to `User=`, adds the symlinks and the polkit rule, and removes the root copy.
 It is a command you run, not an automatic root tick, because that tick would
