@@ -7662,7 +7662,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             .map(|c| (c.name, c.days_left))
             .collect();
         checks.push(cert_expiry_row(&certs));
-        checks.push(stack_images_row_here(&crate::envfile::repo_root()));
+        checks.extend(stack_rows_here(&crate::envfile::repo_root()));
         checks.push(image_retention_row_here(&crate::envfile::repo_root()));
         checks.push(noo_data_bound_row(&crate::envfile::repo_root()));
         checks.push(netns_restore_row_here(&crate::envfile::repo_root()));
@@ -8376,6 +8376,71 @@ pub(crate) struct StackContainer {
     /// The image ID it runs.
     pub image_id: String,
     pub running: bool,
+    /// Its `com.docker.compose.project` / `.service` labels ("" when unset:
+    /// an agent-managed backend has no service label).
+    pub project: String,
+    pub service: String,
+}
+
+/// What the stack's last whole-stack start ran: the launcher's
+/// `.noo-stack-services` (lib-compose.sh `compose_record_active`):
+/// `# project <name>`, then one active compose service per line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActiveServices {
+    pub project: String,
+    pub services: std::collections::BTreeSet<String>,
+}
+
+pub(crate) const STACK_SERVICES_FILE: &str = ".noo-stack-services";
+
+/// Parse the launcher's record; `None` when it names no project.
+pub(crate) fn parse_active_services(text: &str) -> Option<ActiveServices> {
+    let mut project = None;
+    let mut services = std::collections::BTreeSet::new();
+    for l in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        match l.strip_prefix("# project ") {
+            Some(p) => project = Some(p.trim().to_string()),
+            None if !l.starts_with('#') => {
+                services.insert(l.to_string());
+            }
+            None => {}
+        }
+    }
+    project.filter(|p| !p.is_empty()).map(|project| ActiveServices { project, services })
+}
+
+/// Split RUNNING compose containers of this stack's project whose service
+/// the stack does not run (a profile it dropped: pop-os's
+/// `noo-stunnel-ollama`, 0.6.25 roll) from everything else. `None` (no
+/// record: a launcher from before it) splits nothing, so `stack images`
+/// judges as before.
+pub(crate) fn split_leftovers(cs: &[StackContainer], active: Option<&ActiveServices>) -> (Vec<StackContainer>, Vec<StackContainer>) {
+    let Some(a) = active else { return (cs.to_vec(), Vec::new()) };
+    cs.iter().cloned().partition(|c| !(c.running && c.project == a.project && !c.service.is_empty() && !a.services.contains(&c.service)))
+}
+
+/// `stack leftovers`: running containers of a profile this stack does not
+/// run. A WARN, never a gate row: such a container is not a half-done roll,
+/// and its image is in use, so image retention keeps it whatever this says
+/// (hostd never removes an image a container uses). The remedy is the exact
+/// stop and remove, by name, never `noo upgrade --stack`, which cannot touch
+/// it (`up` ignores unselected profiles; the launcher never reaps).
+pub(crate) fn stack_leftovers_check(left: &[StackContainer]) -> Option<Check> {
+    const NAME: &str = "stack leftovers";
+    if left.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = left.iter().map(|c| format!("{} (service {}, {})", c.name, c.service, c.config_image)).collect();
+    let fix: Vec<String> = left.iter().map(|c| format!("docker stop {n} && docker rm {n}", n = c.name)).collect();
+    Some(warn(
+        NAME,
+        format!(
+            "{} running container(s) of a profile this stack does not run, kept with their images (in use): {}",
+            left.len(),
+            names.join("; ")
+        ),
+        Some(fix.join(" && ")),
+    ))
 }
 
 /// `repo` of `repo@sha256:…`, `repo:tag` or `repo:tag@sha256:…` (compose
@@ -8514,7 +8579,31 @@ pub(crate) fn stack_images_check(lock: Option<&[LockImage]>, containers: Result<
 }
 
 /// [`stack_images_check`] for the install at `root`, read from docker.
-pub(crate) fn stack_images_row_here(root: &std::path::Path) -> Check {
+/// `docker inspect --format` for one container: name, image as written,
+/// image ID, running, compose project and service labels.
+pub(crate) const STACK_INSPECT_FORMAT: &str = concat!(
+    r#"{{.Name}}|{{.Config.Image}}|{{.Image}}|{{.State.Running}}|"#,
+    r#"{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}"#,
+);
+
+/// One [`STACK_INSPECT_FORMAT`] line. A 4-field line (no labels) parses with
+/// empty labels.
+pub(crate) fn parse_stack_container(l: &str) -> Option<StackContainer> {
+    let p: Vec<&str> = l.trim().splitn(6, '|').collect();
+    let label = |i: usize| p.get(i).map(|s| s.trim()).filter(|s| *s != "<no value>").unwrap_or("").to_string();
+    (p.len() >= 4).then(|| StackContainer {
+        name: p[0].trim_start_matches('/').to_string(),
+        config_image: p[1].to_string(),
+        image_id: p[2].to_string(),
+        running: p[3] == "true",
+        project: label(4),
+        service: label(5),
+    })
+}
+
+/// The `stack images` row and, when the launcher recorded what the stack
+/// runs, the `stack leftovers` row, from one read of docker.
+pub(crate) fn stack_rows_here(root: &std::path::Path) -> Vec<Check> {
     use crate::commands::image_retention as ir;
     let lock = std::fs::read_to_string(root.join("stack.lock")).ok().map(|t| ir::stack_lock_refs(&t));
     let run = |args: &[&str]| -> Result<String, String> {
@@ -8539,19 +8628,13 @@ pub(crate) fn stack_images_row_here(root: &std::path::Path) -> Check {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let mut args = vec!["inspect", "--format", "{{.Name}}|{{.Config.Image}}|{{.Image}}|{{.State.Running}}"];
+        let mut args = vec!["inspect", "--format", STACK_INSPECT_FORMAT];
         args.extend(ids.iter().copied());
         let out = run(&args)?;
         let parsed: Vec<StackContainer> = out
             .lines()
             .filter_map(|l| {
-                let p: Vec<&str> = l.trim().splitn(4, '|').collect();
-                (p.len() == 4).then(|| StackContainer {
-                    name: p[0].trim_start_matches('/').to_string(),
-                    config_image: p[1].to_string(),
-                    image_id: p[2].to_string(),
-                    running: p[3] == "true",
-                })
+                parse_stack_container(l)
             })
             .collect();
         // One record per container, or what runs is not known.
@@ -8565,7 +8648,22 @@ pub(crate) fn stack_images_row_here(root: &std::path::Path) -> Check {
         Err(e) => Err(format!("docker did not list the images: {e}")),
         Ok(_) => containers,
     };
-    stack_images_check(lock.as_deref(), containers.as_deref().map_err(|e| e.clone()), &crate::envfile::container_prefix())
+    let active = std::fs::read_to_string(root.join(STACK_SERVICES_FILE)).ok().and_then(|t| parse_active_services(&t));
+    stack_rows(lock.as_deref(), containers, active.as_ref(), &crate::envfile::container_prefix())
+}
+
+/// [`stack_rows_here`], pure: leftovers leave `stack images` and get their
+/// own row.
+pub(crate) fn stack_rows(lock: Option<&[LockImage]>, containers: Result<Vec<StackContainer>, String>, active: Option<&ActiveServices>, prefix: &str) -> Vec<Check> {
+    match containers {
+        Err(e) => vec![stack_images_check(lock, Err(e), prefix)],
+        Ok(cs) => {
+            let (stack, left) = split_leftovers(&cs, active);
+            let mut out = vec![stack_images_check(lock, Ok(&stack), prefix)];
+            out.extend(stack_leftovers_check(&left));
+            out
+        }
+    }
 }
 
 fn checks_json(checks: &[Check]) -> Value {
@@ -15017,7 +15115,7 @@ mod image_retention_row_tests {
         assert!(src.contains("checks.push(image_retention_row_here(&crate::envfile::repo_root()));"));
     }
     fn sc(name: &str, image: &str, id: &str, running: bool) -> StackContainer {
-        StackContainer { name: name.into(), config_image: image.into(), image_id: id.into(), running }
+        StackContainer { name: name.into(), config_image: image.into(), image_id: id.into(), running, project: String::new(), service: String::new() }
     }
 
     /// Captured fixtures (tests/fixtures/image-retention/README.md says
@@ -15175,10 +15273,85 @@ mod image_retention_row_tests {
         assert_eq!(image_retention_row(Some(Ok(rep)), Some(json!({"rows": []}))).verdict, Verdict::Ok);
     }
 
+    /// pop-os after the 0.6.25 roll: `noo-stunnel-ollama` (compose service
+    /// stunnel-ollama, profiles ollama/gpu-tier2, stunnel v0.6.2, created
+    /// 2026-10-15) still Up a month after the controller stopped running that
+    /// profile, beside the embedder's own current door. `stack images` failed
+    /// on it, its remedy `noo upgrade --stack` could not touch it, and the
+    /// retention gate blocked every cleanup. With the launcher's record it is
+    /// a leftover: out of `stack images`, said in its own WARN row with the
+    /// exact stop and remove, and no gate row fails.
+    #[test]
+    fn a_running_container_of_a_dropped_profile_is_a_leftover_not_a_stale_stack_image() {
+        let d = "04ff82dc284420add2ae9f23db1e8db60f8b96b9d5a7bf50ad979d8b5dda838d";
+        let cur = format!("sha256:{}", "c".repeat(64));
+        let old = format!("sha256:31c78bf2fb56{}", "0".repeat(52));
+        let lock = vec![LockImage {
+            lock_ref: format!("stunnel@sha256:{d}"),
+            held: vec![crate::commands::image_retention::LocalImage { id: cur.clone(), refs: vec![format!("ghcr.io/noomesh/stunnel@sha256:{d}")] }],
+        }];
+        let c = |name: &str, image: &str, id: &str, svc: &str| StackContainer {
+            name: name.into(), config_image: image.into(), image_id: id.into(), running: true, project: "noomesh".into(), service: svc.into(),
+        };
+        let cs = vec![
+            c("noo-stunnel-ollama", "ghcr.io/noomesh/stunnel:v0.6.2", &old, "stunnel-ollama"),
+            c("noo-stunnel-ollama-embed", &format!("ghcr.io/noomesh/stunnel:v0.6.25@sha256:{d}"), &cur, "stunnel-ollama-embed"),
+        ];
+        // Without the record (a launcher from before it): judged as before, the FAIL pop-os saw.
+        let rows = stack_rows(Some(&lock), Ok(cs.clone()), None, "noo");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].verdict, Verdict::Fail, "{:?}", rows[0]);
+        assert!(rows[0].detail.starts_with("noo-stunnel-ollama runs 31c78bf2fb56, the lock pins stunnel@sha256:04ff82dc"), "{}", rows[0].detail);
+        assert_eq!(rows[0].remedy.as_deref(), Some("noo upgrade --stack"));
+        // With it: stack images judges the stack's own door; the leftover is said apart.
+        let active = parse_active_services("# project noomesh\ngateway\nollama-embed\nstunnel-ollama-embed\n").unwrap();
+        let rows = stack_rows(Some(&lock), Ok(cs.clone()), Some(&active), "noo");
+        let si = rows.iter().find(|r| r.name == "stack images").unwrap();
+        assert_eq!(si.verdict, Verdict::Ok, "{si:?}");
+        assert!(si.detail.starts_with("1 running container(s) run the lock's images"), "{}", si.detail);
+        let lo = rows.iter().find(|r| r.name == "stack leftovers").expect("the leftover is said");
+        assert_eq!(lo.verdict, Verdict::Warn);
+        assert!(lo.detail.contains("noo-stunnel-ollama (service stunnel-ollama, ghcr.io/noomesh/stunnel:v0.6.2)"), "{}", lo.detail);
+        assert_eq!(lo.remedy.as_deref(), Some("docker stop noo-stunnel-ollama && docker rm noo-stunnel-ollama"));
+        // The retention gate reads only its own rows: a leftover WARN blocks nothing.
+        let v = json!({"controller": {"checks": rows.iter().map(|r| json!({"name": r.name, "verdict": match r.verdict { Verdict::Ok => "ok", Verdict::Warn => "warn", _ => "fail" }, "detail": r.detail})).collect::<Vec<_>>()}});
+        assert_eq!(crate::commands::image_retention::retention_gate(Some(&v), &[]), Ok(()), "a leftover must not block cleanup of the rest");
+        // An ACTIVE service on an old image is still a stale stack image, with the roll as its remedy.
+        let mut stale = cs.clone();
+        stale[1].image_id = old.clone();
+        let rows = stack_rows(Some(&lock), Ok(stale), Some(&active), "noo");
+        let si = rows.iter().find(|r| r.name == "stack images").unwrap();
+        assert!(si.verdict == Verdict::Fail && si.detail.starts_with("noo-stunnel-ollama-embed runs 31c78bf2fb56"), "{si:?}");
+        // Not leftovers: a stopped one, another project's, an unlabelled (agent-managed) one.
+        for (running, project, svc) in [(false, "noomesh", "stunnel-ollama"), (true, "other", "stunnel-ollama"), (true, "noomesh", "")] {
+            let mut x = cs[0].clone();
+            x.running = running;
+            x.project = project.into();
+            x.service = svc.into();
+            assert!(split_leftovers(&[x], Some(&active)).1.is_empty(), "{running} {project} {svc:?}");
+        }
+    }
+
+    /// The launcher's record and the inspect line, as written.
+    #[test]
+    fn the_stack_services_record_and_the_inspect_line_parse() {
+        let a = parse_active_services("# project noomesh\n\ngateway\nworker\n").unwrap();
+        assert_eq!(a.project, "noomesh");
+        assert_eq!(a.services.iter().map(String::as_str).collect::<Vec<_>>(), vec!["gateway", "worker"]);
+        assert!(parse_active_services("gateway\n").is_none(), "no project: no record");
+        let c = parse_stack_container("/noo-stunnel-ollama|ghcr.io/noomesh/stunnel:v0.6.2|sha256:31c7|true|noomesh|stunnel-ollama").unwrap();
+        assert_eq!((c.name.as_str(), c.project.as_str(), c.service.as_str(), c.running), ("noo-stunnel-ollama", "noomesh", "stunnel-ollama", true));
+        let agent = parse_stack_container("/noo-vllm|vllm/vllm-openai:v0.25.0|sha256:fc56|true|pai-assistant|").unwrap();
+        assert_eq!(agent.service, "", "an agent-managed backend has no service label");
+        let none = parse_stack_container("/x|i|sha256:1|true|<no value>|<no value>").unwrap();
+        assert_eq!((none.project.as_str(), none.service.as_str()), ("", ""));
+        assert!(STACK_INSPECT_FORMAT.contains(r#"{{index .Config.Labels "com.docker.compose.service"}}"#));
+    }
+
     #[test]
     fn the_controller_run_pushes_stack_images_before_image_retention() {
         let src = crate::test_src::own_code(include_str!("cluster_verify.rs"));
-        let a = src.find("checks.push(stack_images_row_here(&crate::envfile::repo_root()));").expect("pushed");
+        let a = src.find("checks.extend(stack_rows_here(&crate::envfile::repo_root()));").expect("pushed");
         let b = src.find("checks.push(image_retention_row_here(&crate::envfile::repo_root()));").expect("pushed");
         assert!(a < b);
     }

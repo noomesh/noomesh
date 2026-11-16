@@ -130,6 +130,9 @@ node-agent-go/bin/
 # runtime state, rebuilt on every start.
 /.noo-addon-systems/
 /.noo-addon-workloads/
+# The launcher's record of the services this stack runs (lib-compose.sh
+# compose_record_active), read by `noo cluster verify`.
+/.noo-stack-services
 /.noo-addon-routes/
 
 # Local per-developer git-hooks directory (not shared across team)
