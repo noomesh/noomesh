@@ -279,10 +279,11 @@ type Controller struct {
 	probeDeadline time.Duration
 	owned         []docker.NoomeshContainer // this tick's noomesh containers
 	ownedErr      error                     // non-nil: docker could not list them
-	// listErr is the last GPU-backend listing failure, so a host with no
-	// docker (a Mac running a native ollama) warns once per cause, not
-	// once per tick.
-	listErr string
+	// The two docker listings' last failures, so a host with no docker (a
+	// Mac running a native ollama: mcmini, every 15 s) warns once per
+	// cause, not once per tick.
+	gpuList   listLog
+	ownedList listLog
 
 	// The hold lease (lease.go).
 	generation uint64
@@ -305,6 +306,8 @@ func New(cfg Config, probe Probe, d Docker, stateDir string) *Controller {
 		stopped: map[string]string{}, paused: map[string]bool{},
 		gpuSet: map[string]bool{}, measured: map[string]int{},
 		drainTimeout: DefaultDrainTimeout, probeDeadline: ProbeDeadline,
+		gpuList:   listLog{what: "GPU backend containers"},
+		ownedList: listLog{what: "noomesh containers", also: "; GPU attribution unknown"},
 	}
 	c.since = c.now()
 	if stateDir != "" {
@@ -466,24 +469,36 @@ func (c *Controller) Run(ctx context.Context) {
 	}
 }
 
-// noteListErr logs a GPU-backend listing failure when it starts or changes,
-// and the recovery once; the same failure every tick is logged at debug.
-func (c *Controller) noteListErr(err error) {
+// listLog says a docker listing's failure when it starts or changes, and
+// its recovery once; the same failure every tick is logged at debug.
+type listLog struct {
+	what string // the listing's name in the log line
+	also string // what the failure costs, after the name
+	last string // the last failure, "" while it works
+}
+
+func (l *listLog) note(err error) {
+	if err == nil {
+		if l.last != "" {
+			slog.Info("gpuyield: listing " + l.what + " works again")
+		}
+		l.last = ""
+		return
+	}
+	if err.Error() == l.last {
+		slog.Debug("gpuyield: listing "+l.what+" still failing", "error", err)
+		return
+	}
+	l.last = err.Error()
+	slog.Warn("gpuyield: listing "+l.what+" failed"+l.also+" (logged once per cause)", "error", err)
+}
+
+// noteListErrs logs this tick's two listing results, each once per cause.
+func (c *Controller) noteListErrs(gpuErr, ownedErr error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if err == nil {
-		if c.listErr != "" {
-			slog.Info("gpuyield: listing GPU backend containers works again")
-		}
-		c.listErr = ""
-		return
-	}
-	if err.Error() == c.listErr {
-		slog.Debug("gpuyield: listing GPU backend containers still failing", "error", err)
-		return
-	}
-	c.listErr = err.Error()
-	slog.Warn("gpuyield: listing GPU backend containers failed (logged once per cause)", "error", err)
+	c.gpuList.note(gpuErr)
+	c.ownedList.note(ownedErr)
 }
 
 // Tick is one sample + decision.
@@ -492,7 +507,6 @@ func (c *Controller) Tick(ctx context.Context) {
 	lctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	backends, err := c.docker.GPUBackendContainers(lctx)
 	cancel()
-	c.noteListErr(err)
 	if err != nil {
 		backends = nil
 	}
@@ -500,9 +514,7 @@ func (c *Controller) Tick(ctx context.Context) {
 	octx, ocancel := context.WithTimeout(ctx, 20*time.Second)
 	owned, oerr := c.docker.NoomeshContainers(octx)
 	ocancel()
-	if oerr != nil {
-		slog.Warn("gpuyield: listing noomesh containers failed; GPU attribution unknown", "error", oerr)
-	}
+	c.noteListErrs(err, oerr)
 
 	c.mu.Lock()
 	c.owned, c.ownedErr = owned, oerr
