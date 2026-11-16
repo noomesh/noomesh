@@ -109,20 +109,13 @@ pub async fn display_of(db: &PgPool, seat: &str) -> Result<Option<serde_json::Va
     Ok(row.map(|(d,)| d.unwrap_or_else(|| serde_json::json!({}))))
 }
 
-/// One seat as `seat_watch` judges it: name, enrol user, facts, last
-/// heartbeat time, last heartbeat body, revoked.
-pub type WatchRow = (
-    String,
-    Option<String>,
-    Option<serde_json::Value>,
-    Option<chrono::DateTime<chrono::Utc>>,
-    Option<serde_json::Value>,
-    bool,
-);
+/// One seat as `seat_watch` judges it: name, last heartbeat time, last
+/// heartbeat body, revoked.
+pub type WatchRow = (String, Option<chrono::DateTime<chrono::Utc>>, Option<serde_json::Value>, bool);
 
 /// Every seat, revoked ones too (so their alert conditions close).
 pub async fn watch_rows(db: &PgPool) -> Result<Vec<WatchRow>, sqlx::Error> {
-    sqlx::query_as("SELECT seat_name, enroll_user, facts, last_seen, heartbeat, revoked_at IS NOT NULL FROM noo_seats")
+    sqlx::query_as("SELECT seat_name, last_seen, heartbeat, revoked_at IS NOT NULL FROM noo_seats")
         .fetch_all(db)
         .await
 }
