@@ -306,6 +306,54 @@ compose_report_undeclared() {
     return 0
 }
 
+# ── Running containers of a profile this stack does not run ───────────────
+#
+# A whole-stack `up` starts only the active profiles' services and leaves a
+# RUNNING container of any other declared service alone: compose ignores
+# unselected profiles, `--remove-orphans` is never passed (above), and
+# noo_created_guard removes only Created ones. pop-os kept a
+# `noo-stunnel-ollama` (profile ollama, stunnel v0.6.2, created 2026-10-15)
+# Up for a month after the controller stopped running that profile, and the
+# 0.6.25 `stack images` gate failed on it. So, after the up, the launcher
+# records what this stack runs and SAYS what else is running (report, never
+# reap):
+#
+#   ! <name> is from a profile this stack does not run (service <svc>): docker stop <name> && docker rm <name>
+#
+# STACK_SERVICES_FILE (`.noo-stack-services` in the install root) is what
+# `noo cluster verify` reads to tell such a container from a stack service on
+# an old image: `# project <name>`, then one active service per line.
+STACK_SERVICES_FILE=".noo-stack-services"
+
+# compose_record_active DIR "$ACTIVE_SVCS" — write DIR/.noo-stack-services
+# atomically. Only after a WHOLE-stack up: a targeted start's set is partial.
+compose_record_active() {
+    _cra_dir="${1:-.}"; _cra_proj="$(_compose_project_name "$_cra_dir")"
+    _cra_tmp="$_cra_dir/$STACK_SERVICES_FILE.tmp.$$"
+    { printf '# project %s\n' "$_cra_proj"; printf '%s\n' "$2" | sed '/^$/d' | sort -u; } > "$_cra_tmp" 2>/dev/null \
+        && mv -f "$_cra_tmp" "$_cra_dir/$STACK_SERVICES_FILE" 2>/dev/null \
+        || { rm -f "$_cra_tmp" 2>/dev/null; echo "! could not record this stack's services in $STACK_SERVICES_FILE: verify cannot tell a leftover container from a stale one" >&2; }
+    return 0
+}
+
+# compose_report_out_of_profile DIR "$ACTIVE_SVCS" — say each RUNNING
+# container of this project whose service is declared but not active. Never
+# stops or removes anything; always returns 0.
+compose_report_out_of_profile() {
+    _crp_proj="$(_compose_project_name "${1:-.}")"
+    if ! _crp_run="$(docker ps --filter "label=com.docker.compose.project=$_crp_proj" \
+            --format '{{.Label "com.docker.compose.service"}} {{.Names}}' 2>/dev/null)"; then
+        echo "! could not list the running containers of project $_crp_proj, so containers of other profiles were NOT looked for (not a pass)" >&2
+        return 0
+    fi
+    printf '%s\n' "$_crp_run" | while read -r _crp_svc _crp_name; do
+        [ -n "$_crp_svc" ] && [ -n "$_crp_name" ] || continue
+        printf '%s\n' "$2" | grep -qxF -- "$_crp_svc" && continue
+        echo "! $_crp_name is from a profile this stack does not run (service $_crp_svc): docker stop $_crp_name && docker rm $_crp_name" >&2
+    done
+    return 0
+}
+
 # ── Compose v2 is a prerequisite, and a pull failure says WHY ─────────────
 #
 # Ubuntu's `docker.io` ships WITHOUT the compose v2 plugin (separate
