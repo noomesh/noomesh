@@ -156,6 +156,12 @@ running display alone: the roll prints `display held on <seat>: run sudo …
 kiosk seat-sync --migrate`, and verify shows a `display held` warning with
 the same command until it is run.
 
+When the sync does restart the display, it keeps the scripts it replaced as
+`<name>.prev` until the display has stayed up for three seconds. If it does
+not come up within 20 seconds, the sync puts back exactly those copies,
+restarts it on them, and reports it: verify shows a `display rollback`
+failure with the journal command. The next bundle tries again.
+
 A bundle that names any other file, or a kind outside that list, is refused
 whole, before anything is written. A node bundle is never accepted by a seat,
 and a seat bundle is never accepted by a node, because the manifest headers
