@@ -7074,7 +7074,7 @@ mod gateway_addon_tests {
 /// `seat <name>` section: the layout moves (`seat-sync --migrate`, run on the
 /// seat under sudo) and the display. 0.6.10 printed the legacy-layout WARN
 /// only in `--json`.
-const SEAT_WARN_REMEDY_ROWS: [&str; 3] = ["seat layout", "display binaries", "display"];
+const SEAT_WARN_REMEDY_ROWS: [&str; 4] = ["seat layout", "display binaries", "display", "display held"];
 
 /// The `(remedy, row name)` pairs a section prints under its table: every
 /// FAIL row's, and in the controller section every WARN row's too. In a

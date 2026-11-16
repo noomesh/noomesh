@@ -1102,6 +1102,15 @@ pub(crate) fn stage_display_scripts(work: &Path, installed_launch: Option<&str>)
     Ok(())
 }
 
+/// The heartbeat says kiosk.service is not this release's unit (rendered
+/// from the seat's own env). Unstated (an older seat): false.
+pub(crate) fn hb_unit_stale(hb: &Value) -> bool {
+    match (hb["kiosk_unit_sha"].as_str(), kiosk_params_from(hb)) {
+        (Some(sha), Some(p)) => sha != sha256_hex(seat_kiosk_unit(&p).as_bytes()),
+        _ => false,
+    }
+}
+
 /// Where the display's scripts are, as the seat sees it — the heartbeat's
 /// `kiosk_bins`, judged by verify:
 /// - `home`: a unit or a `/usr/local/bin/noo-kiosk-*` name leads under a
@@ -1641,9 +1650,17 @@ pub(crate) fn display_action(changed: &[String], console_moved: bool) -> &'stati
 /// back to restarting the session. Never "reload-failed" and stop, which
 /// left homeserver's display dark after the 0.6.17 roll until someone came.
 /// `installed`: kiosk.service exists on this box at all.
+///
+/// `vouched`: the sync can stand behind a restart ([`display_vouched`]).
+/// When it cannot, a RUNNING display is never restarted: it is `held` and
+/// keeps what it started with (homeserver after the 0.6.25 roll: the first
+/// restart in five releases, under a pre-0.6.16 unit, never came back). A
+/// display that is already down may still be restarted: that cannot take a
+/// working display away.
 pub(crate) fn run_display_step(
     action: &str,
     installed: bool,
+    vouched: bool,
     active: &dyn Fn() -> bool,
     reload: &dyn Fn() -> bool,
     restart: &dyn Fn() -> bool,
@@ -1651,7 +1668,15 @@ pub(crate) fn run_display_step(
     if !installed {
         return "unchanged";
     }
-    let restart_word = || if restart() { "restarted" } else { "restart-failed" };
+    let restart_word = || {
+        if !vouched && active() {
+            "held"
+        } else if restart() {
+            "restarted"
+        } else {
+            "restart-failed"
+        }
+    };
     match action {
         "restart" => restart_word(),
         "reload" if active() && reload() => "reloaded",
@@ -1660,12 +1685,30 @@ pub(crate) fn run_display_step(
     }
 }
 
+/// May the sync restart this seat's display? Only when kiosk.service is
+/// this release's unit (rendered from the seat's own /etc/default/kiosk,
+/// the comparison verify's `kiosk unit` row makes) AND its scripts are the
+/// ones the sync writes ([`kiosk_bins_layout`] `shared`). Otherwise a
+/// restart runs scripts the sync never wrote, or new scripts under an older
+/// unit: a combination no release tested. `Err` says which.
+pub(crate) fn display_vouched(unit: Option<&str>, params: Option<&KioskParams>, layout: &str) -> Result<(), String> {
+    if layout != "shared" {
+        return Err(format!("its scripts are not the ones this sync writes (layout {layout}, not {SEAT_KIOSK_DIR})"));
+    }
+    match (unit, params) {
+        (Some(u), Some(p)) if u == seat_kiosk_unit(p) => Ok(()),
+        (Some(_), Some(_)) => Err("kiosk.service is not this release's unit".into()),
+        (None, _) => Err("kiosk.service cannot be read".into()),
+        (_, None) => Err(format!("{} does not state the display's user, mode and VT", super::kiosk::ENV_FILE)),
+    }
+}
+
 /// May the apply record the bundle's console build as the one on screen?
 /// Only when the display step did not fail. Recording it after a failure
 /// made every later tick see "console not moved" and do nothing, so a
 /// display that missed one reload stayed on the old console for good.
 pub(crate) fn display_settled(word: &str) -> bool {
-    !word.ends_with("-failed")
+    !word.ends_with("-failed") && word != "held"
 }
 
 /// Decrypt, unwrap, extract, verify and apply one blob. Returns the outcome.
@@ -1743,9 +1786,19 @@ fn apply_blob(blob: &[u8], cfg: &SeatConfig, state: &mut SeatState) -> Result<Ap
         if changed.iter().any(|k| k == "unit-kiosk-watchdog-timer") && unit_exists("kiosk-watchdog.timer") {
             let _ = Command::new("systemctl").args(["restart", "kiosk-watchdog.timer"]).status();
         }
+        let params = kiosk_params_from_env(&kiosk_env_from(std::fs::read_to_string(super::kiosk::ENV_FILE))).ok();
+        let vouched = display_vouched(
+            std::fs::read_to_string(KIOSK_UNIT_PATH).ok().as_deref(),
+            params.as_ref(),
+            kiosk_bins_layout(Path::new("/"), &cfg.cli_home),
+        );
+        if let Err(why) = &vouched {
+            eprintln!("noo-seat-sync: the display will not be restarted by this sync: {why}");
+        }
         o.display = run_display_step(
             display_action(&changed, console_moved),
             unit_exists("kiosk.service"),
+            vouched.is_ok(),
             &|| unit_state("kiosk.service") == "active",
             &|| Command::new(format!("{KIOSK_BIN}/noo-kiosk-cdp")).arg("reload").status().map(|s| s.success()).unwrap_or(false),
             &|| Command::new("systemctl").args(["restart", "kiosk.service"]).status().map(|s| s.success()).unwrap_or(false),
@@ -2356,6 +2409,15 @@ pub(crate) fn seat_checks(seat: &Value, controller_cli: &str, controller_tag: &s
         check("display", Verdict::Ok, format!("console {build} = controller{}{quality}",
             if display.is_empty() { String::new() } else { format!(" (last apply: display {display})") }), None)
     });
+    // The last apply changed the display's scripts or page and did not
+    // restart it (`run_display_step`: a running display the sync cannot
+    // vouch for). Said while the seat still shows why; the repair clears it.
+    if display == "held" && (hb_unit_stale(hb) || hb["kiosk_bins"].as_str().is_some_and(|b| b != "shared")) {
+        out.push(check("display held", Verdict::Warn,
+            "the last apply did not restart the display: kiosk.service is older than this release or runs scripts outside \
+             /opt/noo-seat/kiosk, so a restart could not be trusted to come back; the display keeps running what it started with".into(),
+            repair()));
+    }
     if hb_layout(seat) == Some("legacy-root") {
         out.push(check("seat layout", Verdict::Warn, "still on the root layout (root timer, root-owned copy): no updates apply until migrated".into(),
             Some(format!("on {name}: sudo {LEGACY_APPLIER_BIN} kiosk seat-sync --migrate"))));
@@ -2372,15 +2434,13 @@ pub(crate) fn seat_checks(seat: &Value, controller_cli: &str, controller_tag: &s
     // broker's RuntimeDirectory=kiosk, 0.6.16) reaches the seat only through
     // the repair, which installs this release's unit. Without that directory
     // the display runs but cannot be reloaded (homeserver after 0.6.24).
-    if let (Some(sha), Some(p)) = (hb["kiosk_unit_sha"].as_str(), kiosk_params_from(hb)) {
-        if sha != sha256_hex(seat_kiosk_unit(&p).as_bytes()) {
-            let why = if hb["kiosk_unit_runtime_dir"].as_bool() == Some(false) {
-                "kiosk.service is not this release's unit and has no RuntimeDirectory=kiosk: the display's broker has no control socket, so `noo kiosk reload` cannot reload it (the seat's sync cannot update a root unit)"
-            } else {
-                "kiosk.service is not this release's unit (the seat's sync cannot update a root unit)"
-            };
-            out.push(check("kiosk unit", Verdict::Warn, why.into(), repair()));
-        }
+    if hb_unit_stale(hb) {
+        let why = if hb["kiosk_unit_runtime_dir"].as_bool() == Some(false) {
+            "kiosk.service is not this release's unit and has no RuntimeDirectory=kiosk: the display's broker has no control socket, so `noo kiosk reload` cannot reload it (the seat's sync cannot update a root unit)"
+        } else {
+            "kiosk.service is not this release's unit (the seat's sync cannot update a root unit)"
+        };
+        out.push(check("kiosk unit", Verdict::Warn, why.into(), repair()));
     }
     // Where the display execs its scripts from (a 0.6.11+ seat reports it).
     match hb["kiosk_bins"].as_str() {
@@ -2520,6 +2580,7 @@ pub(crate) fn upgrade_seats(g: &Globals) -> i32 {
     if !g.json { println!("{}", ui::phase("Seats")); }
     let mut pending: Vec<super::provision::PendingApply> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
+    let mut held: Vec<(String, String)> = Vec::new();
     for s in &seats {
         let name = s["seat_name"].as_str().unwrap_or("?").to_string();
         ui::blank();
@@ -2561,6 +2622,10 @@ pub(crate) fn upgrade_seats(g: &Globals) -> i32 {
             let checks = if ok_apply { seat_checks_after_apply(&st, env!("CARGO_PKG_VERSION"), &console, now_unix()) }
                 else { seat_checks(&st, env!("CARGO_PKG_VERSION"), &console, now_unix()) };
             let seat_ok = ok_apply && checks.iter().all(|c| c.verdict != super::cluster_verify::Verdict::Fail);
+            if let Some(h) = checks.iter().find(|c| c.name == "display held") {
+                let fix = h.remedy.as_deref().unwrap_or("sudo <seat applier> kiosk seat-sync --migrate");
+                held.push((n.clone(), fix.strip_prefix(&format!("on {n}: ")).unwrap_or(fix).to_string()));
+            }
             if !seat_ok { failed.push(n.clone()); }
             if g.json {
                 rows.push(json!({"seat": n, "ok": seat_ok, "outcome": format!("{end:?}"),
@@ -2586,8 +2651,22 @@ pub(crate) fn upgrade_seats(g: &Globals) -> i32 {
         }
         if g.json { println!("{}", json!({"seats_apply": rows})); }
     }
+    // A held display is working, but on what it started with: the roll
+    // says so by name, never a silent "current".
+    if !g.json {
+        for (seat, fix) in &held {
+            ui::say_err(&ui::status_line(Glyph::Warn, &format!("display held on {seat}: run {fix}")));
+        }
+    }
     if failed.is_empty() {
-        if !g.json { ui::close_done(&format!("{} seat(s) current", seats.len())); }
+        if !g.json {
+            if held.is_empty() {
+                ui::close_done(&format!("{} seat(s) current", seats.len()));
+            } else {
+                ui::close_done(&format!("{} seat(s) current; display held on {}", seats.len(),
+                    held.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join(", ")));
+            }
+        }
         0
     } else {
         if !g.json {
@@ -2846,7 +2925,7 @@ mod tests {
         let step = |action: &str, installed: bool, active: bool, reload_ok: bool, restart_ok: bool| {
             reloads.set(0);
             restarts.set(0);
-            let w = run_display_step(action, installed, &|| active,
+            let w = run_display_step(action, installed, true, &|| active,
                 &|| { reloads.set(reloads.get() + 1); reload_ok },
                 &|| { restarts.set(restarts.get() + 1); restart_ok });
             (w, reloads.get(), restarts.get())
@@ -2986,6 +3065,63 @@ mod tests {
         let mut quiet = seat(&old);
         quiet["heartbeat"].as_object_mut().unwrap().remove("kiosk_unit_sha");
         assert!(!seat_checks(&quiet, "0.6.24", "stack-v0.6.24", now).iter().any(|c| c.name == "kiosk unit"));
+    }
+
+    /// homeserver, 0.6.25 roll: the sync restarted a running display under
+    /// a pre-0.6.16 unit and it never came back. A display the sync cannot
+    /// vouch for is held: never restarted while it runs, said in verify and
+    /// by the roll, until the repair makes it vouchable.
+    #[test]
+    fn a_display_the_sync_cannot_vouch_for_is_held_not_restarted() {
+        use super::super::cluster_verify::Verdict;
+        use std::cell::Cell;
+        let restarts = Cell::new(0);
+        let step = |action: &str, vouched: bool, active: bool, reload_ok: bool| {
+            restarts.set(0);
+            let w = run_display_step(action, true, vouched, &|| active, &|| reload_ok, &|| { restarts.set(restarts.get() + 1); true });
+            (w, restarts.get())
+        };
+        assert_eq!(step("restart", false, true, true), ("held", 0), "a running display is never restarted unvouched");
+        assert_eq!(step("reload", false, true, false), ("held", 0), "nor by a failed reload's fallback");
+        assert_eq!(step("reload", false, true, true), ("reloaded", 0), "a reload is not a restart");
+        assert_eq!(step("restart", false, false, true), ("restarted", 1), "a display already down may be restarted");
+        assert_eq!(step("restart", true, true, true), ("restarted", 1));
+        assert!(!display_settled("held"), "a held step is tried again next tick");
+
+        let p = KioskParams { user: "kiosk".into(), mode: super::super::kiosk::Mode::Dedicated, vt: 1 };
+        let current = seat_kiosk_unit(&p);
+        let old: String = current.lines().filter(|l| !l.starts_with("RuntimeDirectory")).map(|l| format!("{l}\n")).collect();
+        assert_eq!(display_vouched(Some(&current), Some(&p), "shared"), Ok(()));
+        assert!(display_vouched(Some(&old), Some(&p), "shared").unwrap_err().contains("not this release's unit"));
+        for layout in ["root", "home", "absent"] {
+            assert!(display_vouched(Some(&current), Some(&p), layout).unwrap_err().contains(&format!("layout {layout}")), "{layout}");
+        }
+        assert!(display_vouched(None, Some(&p), "shared").is_err());
+        assert!(display_vouched(Some(&current), None, "shared").is_err());
+
+        let seen = "2025-10-09T08:53:10Z";
+        let now = super::super::cluster_verify::parse_rfc3339_unix(seen).unwrap() + 10;
+        let wd = sha256_hex(super::super::kiosk::WATCHDOG.as_bytes());
+        let seat = |unit: &str, bins: &str, display: &str| json!({"seat_name": "homeserver", "enroll_user": "alex", "last_seen": seen,
+            "apply_msg": format!("seat-apply cli=updated scripts=1 units=0 serve=unchanged display={display} console=stack-v0.6.24"),
+            "heartbeat": {"cli_version": "0.6.24", "user_cli_current": true, "kiosk_serve": "active", "kiosk_display": "active",
+                          "kiosk_bins": bins, "kiosk_watchdog_sha": wd, "console_build": "stack-v0.6.24",
+                          "kiosk_unit_sha": sha256_hex(unit.as_bytes()), "kiosk_unit_runtime_dir": unit_has_runtime_dir(unit),
+                          "kiosk": {"user": "kiosk", "mode": "dedicated", "vt": "1"}}});
+        let held = |v: &Value| seat_checks(v, "0.6.24", "stack-v0.6.24", now).into_iter().find(|c| c.name == "display held");
+        let h = held(&seat(&old, "shared", "held")).expect("an old unit's held display is said");
+        assert_eq!(h.verdict, Verdict::Warn);
+        assert_eq!(h.remedy.as_deref(), Some("on homeserver: sudo ~alex/.local/libexec/noo-seat/noo kiosk seat-sync --migrate"));
+        assert!(held(&seat(&current, "root", "held")).is_some(), "a root layout's held display is said");
+        assert!(held(&seat(&current, "shared", "held")).is_none(), "after the repair the row is gone, before any new apply");
+        assert!(held(&seat(&old, "shared", "restarted")).is_none());
+
+        let own = crate::test_src::own_code(include_str!("kiosk_seat.rs"));
+        let apply = crate::test_src::fn_body(&own, "fn apply_blob(");
+        assert!(apply.contains("vouched.is_ok(),"), "the apply passes its own vouching to the display step");
+        let roll = crate::test_src::fn_body(&own, "pub(crate) fn upgrade_seats(");
+        assert!(roll.contains("format!(\"display held on {seat}: run {fix}\")"), "the roll says a held display by name");
+        assert!(roll.contains("display held on {}"), "and never closes on a bare `current`");
     }
 
     /// `seat-sync --migrate` installs this release's kiosk.service, rendered

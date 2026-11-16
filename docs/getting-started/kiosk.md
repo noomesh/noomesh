@@ -146,6 +146,13 @@ to `User=`, adds the symlinks and the polkit rule, and removes the root copy.
 It is a command you run, not an automatic root tick, because that tick would
 be a network-fed root process rewriting its own unit and policy.
 
+**A held display.** A seat's sync restarts the display only when
+`kiosk.service` is this release's unit and the display runs the scripts the
+sync writes (`/opt/noo-seat/kiosk`). On an older unit or layout it leaves a
+running display alone: the roll prints `display held on <seat>: run sudo …
+kiosk seat-sync --migrate`, and verify shows a `display held` warning with
+the same command until it is run.
+
 A bundle that names any other file, or a kind outside that list, is refused
 whole, before anything is written. A node bundle is never accepted by a seat,
 and a seat bundle is never accepted by a node, because the manifest headers
