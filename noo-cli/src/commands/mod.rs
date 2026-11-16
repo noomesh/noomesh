@@ -43,6 +43,7 @@ pub mod cluster_reserve;
 pub mod cluster_node_workloads;
 pub mod cluster_profile;
 pub mod cluster_verify;
+pub mod image_retention;
 pub mod image_stage;
 pub mod cluster_class;
 pub mod cluster_embedding_space;
@@ -97,11 +98,13 @@ pub mod at_rest_seal;
 pub mod secrets_delivery;
 pub mod container_files;
 pub mod offboard;
+pub mod postgres_memory;
 pub mod provision;
 pub mod security_local;
 pub mod security_scan_node;
 pub mod skills;
 pub mod stack_db_compat;
+pub mod stack_monitoring;
 pub mod systems;
 pub mod test;
 pub mod tools;
@@ -120,7 +123,7 @@ pub use auth::{auth_login, auth_logout, auth_status};
 pub use tasks::{tasks_answer, tasks_create, tasks_list, tasks_resubmit, tasks_show, tasks_stop};
 pub use approval::{approval_approve, approval_deny, approval_list, approval_stats, approval_status};
 pub use autonomy::{
-    autonomy_audit, autonomy_decisions, autonomy_disable, autonomy_enable, autonomy_status,
+    autonomy_audit, autonomy_decisions, autonomy_disable, autonomy_enable, autonomy_live, autonomy_preview, autonomy_status,
 };
 pub use channels::{channels_export, channels_import, channels_status, channels_test};
 pub use chat::chat;
@@ -271,6 +274,7 @@ pub use workflow::{workflow_list, workflow_run};
 pub use cluster::cluster_seed;
 pub use controller::{controller_demote, controller_promote};
 pub use mesh::{mesh_install_watcher, mesh_ollama, mesh_reset, mesh_sandbox, mesh_sync_assets};
+pub use stack_monitoring::{stack_monitoring_off, stack_monitoring_on, stack_monitoring_status};
 pub use models::models_switch;
 // ── WP-PL: plugins (distinct block to avoid registry-edit collisions).
 pub use plugins::plugins_list;

@@ -37,6 +37,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 mod image_family;
+mod off_by_choice;
+mod pg_memory;
 mod tempo;
 mod warmup;
 pub(crate) mod restart_loops;
@@ -615,6 +617,12 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
 /// matched to its MainPID), never from the files the applier rendered.
 /// Unknown is a WARN, never a pass. No row on the controller's own node (it
 /// runs no harness unit) or where no harness runs.
+///
+/// The hold exists only under systemd, and the agent reports it only there
+/// (node-agent-go `(*Agent).hostServices`). A harness running under another
+/// runtime (a Mac node's launchd) is NOT held, at any agent version, so that
+/// is said as the exposure it is, a WARN naming the runtime, never as an
+/// agent too old to report with an upgrade that cannot change it.
 pub(crate) fn harness_egress_check(id: &str, n: &Value) -> Option<Check> {
     const NAME: &str = "harness egress";
     if n["self_node"].as_bool() == Some(true) {
@@ -623,9 +631,14 @@ pub(crate) fn harness_egress_check(id: &str, n: &Value) -> Option<Check> {
     let h = &n["host_services"]["harness"];
     let e = &h["egress"];
     if !e.is_object() {
-        return (h["state"].as_str() == Some("running")).then(|| {
-            warn(NAME, "not reported: this node's agent is older than the egress hold, so nothing says the harness is held off the internet",
-                Some(format!("noo upgrade --all   # rolls the agent on {id}; then: noo cluster verify")))
+        if h["state"].as_str() != Some("running") {
+            return None;
+        }
+        return Some(match h["runtime"].as_str() {
+            Some(rt) if rt != "systemd" => warn(NAME, format!(
+                "no egress hold on {rt}: the hold is systemd-only, so this node's harness runs with nothing holding it off the internet"), None),
+            _ => warn(NAME, "not reported: this node's agent is older than the egress hold, so nothing says the harness is held off the internet",
+                Some(format!("noo upgrade --all   # rolls the agent on {id}; then: noo cluster verify"))),
         });
     }
     let reason = e["reason"].as_str().unwrap_or("");
@@ -1658,8 +1671,16 @@ pub(crate) fn data_root_policy_row(n: &Value) -> Option<Check> {
     // DECLARE where it already is, never to move it.
     let only_undeclared = codes.contains(&"undeclared_root")
         && codes.iter().all(|c| matches!(*c, "undeclared_root" | "wrong_owner" | "writable_by_others"));
+    // The controller's own node on a one-machine install: its data root is the
+    // operator's (their tools write there), so the fix is never a chown; it is
+    // declaring that owner to the agent in the local root-owned file, which the
+    // local self-install writes (i677, provision.rs DATA_ROOT_OWNER_FILE).
+    let self_owned_by_operator = n["self_node"].as_bool() == Some(true) && codes == ["wrong_owner"];
     let remedy = if only_undeclared {
         format!("noo cluster set-config {id} --data-root {root} && noo cluster provision {id} --wait")
+    } else if self_owned_by_operator {
+        "noo onboard --only services (declares your data root to the agent in /etc/noo/data-root-owner; asks for sudo once)"
+            .to_string()
     } else if only_ownership {
         format!("on {id}: sudo install -d -o noo-agent -g noo-agent {root} && sudo chmod go-w {root}")
     } else {
@@ -2203,8 +2224,9 @@ fn age_str(secs: i64) -> String {
 /// remedy, and a second row would read "-" on every Mac and on every agent
 /// that predates the shipper — two lines to read for one fact.
 ///
-/// Order of judgement: not reported → off by choice → the gateway has no
-/// route → stalled → journal not following → OK. The first three say why
+/// Order of judgement: not reported → off by choice → the controller keeps
+/// no logs by choice (gateway reason `loki_off`) → the gateway has no
+/// route → stalled → journal not following → OK. The first four say why
 /// nothing ships; only "stalled" is a failure, because it is the one state
 /// where the operator believes logs arrive and they do not.
 pub(crate) fn log_shipper_check(id: &str, ls: &Value, now_unix: i64, hb_recent: bool) -> Check {
@@ -2222,6 +2244,11 @@ pub(crate) fn log_shipper_check(id: &str, ls: &Value, now_unix: i64, hb_recent: 
         let why = if last_error.is_empty() { "no reason reported".to_string() } else { last_error };
         return warn("log shipper", format!("off: {why}"),
             Some(format!("NOO_LOG_SHIP=1 in /etc/noo-node-agent.env on {id} and restart the agent; if it has no TLS material: noo cluster provision {id}")));
+    }
+    // The controller runs no Loki by choice (`cluster.monitoring: lean`): its
+    // gateway refuses every batch with reason `loki_off`. Not a stall.
+    if off_by_choice::gateway_reason(&last_error) == Some(off_by_choice::LOKI_OFF_REASON) {
+        return ok("log shipper", off_by_choice::SHIPPER_DETAIL);
     }
     if ls["route_ready"].as_bool() == Some(false) {
         return warn("log shipper",
@@ -2953,6 +2980,58 @@ fn netns_restore_row_here(root: &std::path::Path) -> Check {
     let systemd = nu::systemd_here();
     let state = if systemd { nu::render_here(&root.display().to_string()).map(|u| nu::state(&u)) } else { Err(String::new()) };
     netns_restore_row(systemd, state)
+}
+
+/// The `ollama slots` row's advice (i802), and the command that applies it.
+pub(crate) const CPU_ONLY_SLOTS_ADVICE: &str = "CPU-only: one Ollama slot prefills about 3x faster on a 4-core CPU (~370 against ~125 tok/s) and saves cache, with no embedding loss (measured, i802)";
+pub(crate) const CPU_ONLY_SLOTS_REMEDY: &str = "noo config set compose_env '{\"OLLAMA_EMBED_NUM_PARALLEL\":\"1\"}' && noo stack restart --force ollama-embed";
+
+/// The `ollama slots` row (i802): ADVISORY only, never a failure. On a
+/// CPU-only controller the stack's shared Ollama (`ollama-embed`) runs
+/// `OLLAMA_EMBED_NUM_PARALLEL` slots (compose default 4), and Ollama sizes a
+/// chat model's cache for every slot. `None` (no row) on a box with a GPU or
+/// when `.env` cannot be read; OK at 1 (or 0); a WARN when the key is absent,
+/// above 1 or not a number. `value` is the `.env` value, `None` when unset.
+pub(crate) fn cpu_only_ollama_slots_row(cpu_only: bool, env_readable: bool, value: Option<&str>) -> Option<Check> {
+    const NAME: &str = "ollama slots";
+    if !cpu_only || !env_readable {
+        return None;
+    }
+    let shown = match value.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) => match v.parse::<u64>() {
+            Ok(n) if n <= 1 => return Some(ok(NAME, format!("OLLAMA_EMBED_NUM_PARALLEL={n}: the CPU-only stack's Ollama runs one slot"))),
+            _ => format!("OLLAMA_EMBED_NUM_PARALLEL={v}"),
+        },
+        None => "OLLAMA_EMBED_NUM_PARALLEL unset (the compose default: 4 slots)".to_string(),
+    };
+    Some(warn(NAME, format!("{shown}. {CPU_ONLY_SLOTS_ADVICE}"), Some(CPU_ONLY_SLOTS_REMEDY.to_string())))
+}
+
+/// This box's slot setting for the stack's Ollama (i802): whether it is
+/// CPU-only, whether either config file could be read, and the value in
+/// force. compose_env (noomesh.yaml) is what the launcher exports, and
+/// compose prefers the environment over .env, so it is read first. The
+/// files are read only on a CPU-only box.
+pub(crate) fn ollama_slots_setting_here(root: &std::path::Path) -> (bool, bool, Option<String>) {
+    let cpu_only = crate::host_exec::classify_gpu(&crate::host_exec::nvidia_smi_within(crate::host_exec::SMI_DEADLINE, &[]))
+        == crate::host_exec::GpuProbe::Missing;
+    if !cpu_only {
+        return (false, false, None);
+    }
+    let yaml = std::fs::read_to_string(root.join("noomesh.yaml")).ok();
+    let text = std::fs::read_to_string(root.join(".env")).ok();
+    let from_yaml = yaml.as_deref().and_then(|t| {
+        crate::commands::launch_render::render_compose_env(t)
+            .lines()
+            .find_map(|l| l.strip_prefix("OLLAMA_EMBED_NUM_PARALLEL=").map(str::to_string))
+    });
+    let value = from_yaml.or_else(|| text.as_deref().and_then(|t| crate::envfile::dotenv_last(t, "OLLAMA_EMBED_NUM_PARALLEL")));
+    (true, text.is_some() || yaml.is_some(), value)
+}
+
+fn cpu_only_ollama_slots_row_here(root: &std::path::Path) -> Option<Check> {
+    let (cpu_only, readable, value) = ollama_slots_setting_here(root);
+    cpu_only_ollama_slots_row(cpu_only, readable, value.as_deref())
 }
 
 pub(crate) fn noo_data_bound_row(root: &std::path::Path) -> Check {
@@ -7174,6 +7253,126 @@ fn verdict_line(t: &Tally) -> (Glyph, String) {
     (Glyph::Ok, format!("fleet healthy{}{seen}", t.context))
 }
 
+/// Where a WARN row goes in the brief rendering. A FAIL or STARTING row is
+/// never tiered: it always shows in full, first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tier {
+    /// Real advice, not for day one: grouped under "Worth doing later".
+    Later,
+    /// Says nothing on this box (no tailnet, no agent container, not yet
+    /// probed): counted under "Not applicable here".
+    NotHere,
+}
+
+/// The brief tiers, beside the row names (general 11-14, i677). A row whose
+/// detail does not contain the given text keeps its normal place: "not read"
+/// is not applicable, a tailnet policy that IS read and wrong is not.
+const BRIEF_TIERS: &[(&str, Option<&str>, Tier)] = &[
+    ("last backup", None, Tier::Later),
+    ("off-site backup", None, Tier::Later),
+    ("holds", None, Tier::Later),
+    ("at-rest tpm", None, Tier::Later),
+    ("at-rest swap", None, Tier::Later),
+    ("at-rest outside the set", None, Tier::Later),
+    ("at-rest volume", None, Tier::Later),
+    ("tailnet policy", Some("not read"), Tier::NotHere),
+    ("tailscale ssh", Some("could not read"), Tier::NotHere),
+    ("node-agent privilege", Some("not checked"), Tier::NotHere),
+    ("inbound", Some("not yet checked"), Tier::NotHere),
+];
+
+fn brief_tier(c: &Check) -> Option<Tier> {
+    if c.verdict != Verdict::Warn {
+        return None;
+    }
+    if AT_REST_DIR_ROWS.contains(&c.name) {
+        return Some(Tier::Later);
+    }
+    BRIEF_TIERS.iter().find_map(|(name, needle, tier)| {
+        (*name == c.name && needle.is_none_or(|n| c.detail.contains(n))).then_some(*tier)
+    })
+}
+
+/// The brief split of one section. Every row lands in exactly one of
+/// `passed`, `shown`, `later`, `not_here`, so the counts add up to the
+/// section; `shown` keeps every FAIL and STARTING row. Pure.
+#[derive(Debug, Default)]
+struct BriefSplit<'a> {
+    passed: usize,
+    shown: Vec<&'a Check>,
+    later: Vec<&'a Check>,
+    not_here: Vec<&'a Check>,
+}
+
+fn brief_split(checks: &[Check]) -> BriefSplit<'_> {
+    let mut b = BriefSplit::default();
+    for c in checks {
+        match (c.verdict, brief_tier(c)) {
+            (Verdict::Ok, _) => b.passed += 1,
+            (_, Some(Tier::Later)) => b.later.push(c),
+            (_, Some(Tier::NotHere)) => b.not_here.push(c),
+            _ => b.shown.push(c),
+        }
+    }
+    b
+}
+
+/// One section, rendered the way the caller asked.
+fn show(title: &str, checks: &[Check], verbose: bool, brief: bool) -> bool {
+    if brief && !verbose { render_brief(title, checks) } else { render(title, checks, verbose) }
+}
+
+/// onboard's closing verify: the section line, then the rows a new user
+/// should read in full (failures first, with their remedies), then the
+/// grouped rest, counted.
+fn render_brief(title: &str, checks: &[Check]) -> bool {
+    let b = brief_split(checks);
+    let mut shown: Vec<Check> = b.shown.iter().map(|c| (*c).clone()).collect();
+    shown.sort_by_key(|c| std::cmp::Reverse(severity(c.verdict)));
+    println!("{}", summary_line(title, &digest(checks, false).counts));
+    if !shown.is_empty() {
+        let rows: Vec<Vec<String>> = shown.iter().map(|c| {
+            let (glyph, detail) = match c.verdict {
+                Verdict::Ok => (Glyph::Ok, ui::muted(&c.detail)),
+                Verdict::Warn | Verdict::Starting => (Glyph::Warn, ui::warn(&c.detail)),
+                Verdict::Fail => (Glyph::Err, ui::err(&c.detail)),
+                Verdict::Accepted => (Glyph::Accepted, c.detail.clone()),
+            };
+            vec![ui::glyph_cell(glyph), c.name.to_string(), detail]
+        }).collect();
+        print!("{}", ui::table(&[Col::left(""), Col::left("invariant"), Col::left("state")], &rows));
+        let grouped = remedies_to_print(title, &shown);
+        let whys: Vec<String> = grouped.iter().map(|(_, names)| names.join(", ")).collect();
+        let entries: Vec<(&str, &str)> = grouped.iter().zip(&whys).map(|((r, _), w)| (*r, w.as_str())).collect();
+        ui::guide(&entries);
+    }
+    if !b.later.is_empty() {
+        println!("  Worth doing later ({}):", b.later.len());
+        for line in later_lines(&b.later) {
+            println!("    {line}");
+        }
+    }
+    if !b.not_here.is_empty() {
+        let names: Vec<&str> = b.not_here.iter().map(|c| c.name).collect();
+        println!("  Not applicable here ({}): {} (noo cluster verify shows them)", names.len(), names.join(", "));
+    }
+    checks.iter().all(|c| c.verdict != Verdict::Fail)
+}
+
+/// "Worth doing later" lines: one per row, the at-rest rows as one line. Pure.
+fn later_lines(later: &[&Check]) -> Vec<String> {
+    let is_at_rest = |c: &&Check| AT_REST_DIR_ROWS.contains(&c.name) || c.name.starts_with("at-rest");
+    let (rest, other): (Vec<&Check>, Vec<&Check>) = later.iter().copied().partition(is_at_rest);
+    let mut out: Vec<String> = other.iter().map(|c| format!("{}: {}", c.name, c.detail)).collect();
+    if !rest.is_empty() {
+        out.push(format!(
+            "data at rest: {} rows in the clear on this disk (no encrypted volume or TPM here); noo cluster verify lists each",
+            rest.len()
+        ));
+    }
+    out
+}
+
 fn render(title: &str, checks: &[Check], verbose: bool) -> bool {
     let d = digest(checks, verbose);
     if verbose {
@@ -7215,12 +7414,16 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut controller = false;
     let mut wait = false;
     let mut timings = false;
+    // onboard's closing verify only: failures in full, then the rest grouped
+    // (see brief_split). Plain verify, --verbose and --json are unchanged.
+    let mut brief = false;
     for a in args {
         match a.as_str() {
             "--controller" => controller = true,
             "--all" => {}
             "--wait" => wait = true,
             "--timings" => timings = true,
+            "--brief" => brief = true,
             s if s.starts_with('-') => return Err(Unhandled),
             s => nodes.push(s.to_string()),
         }
@@ -7310,7 +7513,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 node_json.push(serde_json::json!({ "node": id, "ok": node_ok, "checks": checks_json(&checks) }));
             } else {
                 let title = format!("node {id}");
-                render(&title, &checks, g.verbose);
+                show(&title, &checks, g.verbose, brief);
                 tally.add(&title, &checks);
             }
         }
@@ -7348,7 +7551,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     seat_json.push(serde_json::json!({ "seat": name, "ok": seat_ok, "checks": checks_json(&checks) }));
                 } else {
                     let title = format!("seat {name}");
-                    render(&title, &checks, g.verbose);
+                    show(&title, &checks, g.verbose, brief);
                     tally.add(&title, &checks);
                 }
             }
@@ -7376,8 +7579,13 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     }
     if controller {
+        // Grafana, Loki and Tempo may be off by choice on this install
+        // (`cluster.monitoring: lean`): their rows say so instead of failing.
+        // Read as `noo stack monitoring status` reads it; unset = full.
+        let monitoring = crate::commands::stack_monitoring::status_live(&crate::envfile::repo_root());
+        let monitoring_lean = off_by_choice::lean(&monitoring);
         if wait {
-            warmup::wait_for_warmup(g);
+            warmup::wait_for_warmup(g, monitoring_lean);
         }
         let controller_from = Instant::now();
         let addon_on = |name: &str| {
@@ -7454,8 +7662,14 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             .map(|c| (c.name, c.days_left))
             .collect();
         checks.push(cert_expiry_row(&certs));
+        checks.push(stack_images_row_here(&crate::envfile::repo_root()));
+        checks.push(image_retention_row_here(&crate::envfile::repo_root()));
         checks.push(noo_data_bound_row(&crate::envfile::repo_root()));
         checks.push(netns_restore_row_here(&crate::envfile::repo_root()));
+        // i802: advisory only, on a CPU-only controller.
+        if let Some(row) = cpu_only_ollama_slots_row_here(&crate::envfile::repo_root()) {
+            checks.push(row);
+        }
         // i67: the controller's own node (when this box runs one) rides the rail.
         if let Some(me) = crate::commands::provision::self_node_name()
             .filter(|_| std::path::Path::new("/usr/local/bin/noo-node-agent").is_file())
@@ -7544,7 +7758,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             sso.grafana_sso_key_readable_by_gateway(),
             grafana_mounts_sso_pub(),
         ));
-        checks.push(super::grafana_door::door_check(&super::grafana_door::gather(&crate::envfile::repo_root())));
+        checks.push(off_by_choice::or_judge(super::grafana_door::ROW, &monitoring, || {
+            super::grafana_door::door_check(&super::grafana_door::gather(&crate::envfile::repo_root()))
+        }));
         // Every declared model-class candidate is placed or available
         // An unplaced one is skipped at routing, and a class
         // whose candidates are all unplaced answers nothing.
@@ -7631,7 +7847,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // Fleet logging phase 0: the gateway can reach Loki (the row that
         // would have failed for a year), the listener is mTLS-only with no
         // published port, and where the chunks sit at rest.
-        let (loki, loki_seen) = warmup::loki_row_seen(g, now_unix());
+        let (loki, loki_seen) = warmup::loki_row_seen(g, now_unix(), monitoring_lean);
         checks.push(loki);
         let root = crate::envfile::repo_root();
         let loki_cfg = std::fs::read_to_string(root.join("monitoring/loki/loki-config-tls.yml")).ok();
@@ -7639,7 +7855,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(loki_listener_check(loki_cfg.as_deref(), compose.as_deref()));
         // Request tracing (i359): Tempo is ready to the gateway, and its
         // doors are mTLS-only with no published port.
-        checks.extend(tempo::rows(g));
+        checks.extend(tempo::rows(g, &monitoring));
         // The sandbox executor's door (mTLS doors phase 1): compose runs
         // its uvicorn with a required client certificate, and the gateway
         // container proves it live — no cert and plaintext refused, its own
@@ -7711,6 +7927,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             no_cert.as_ref().map(|(ok, e)| (*ok, e.as_str())),
             plaintext.as_ref().map(|(ok, e)| (*ok, e.as_str())),
         ), refused.as_deref()));
+        // `cluster.postgres_memory` (unset = standard): the sizes asked for,
+        // and "recreate needed" while the running postgres has others.
+        checks.push(pg_memory::live(&root));
         // One "<name> at rest" row per directory that holds state in the
         // clear (`at_rest_dirs`): the process env is what the launcher
         // resolved from `.env`, so the paths are the ones compose bound.
@@ -7732,6 +7951,10 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 }
             }
             let exists = std::path::Path::new(&row.path).is_dir();
+            if let Some(c) = off_by_choice::state_dir_row(row.name, &monitoring, exists) {
+                checks.push(c);
+                continue;
+            }
             let mount = if exists { mount_of(&mounts, &row.path) } else { None };
             let encrypted = mount.as_ref().and_then(|(dev, _)| block_device_encrypted(dev));
             checks.push(at_rest_check_with(
@@ -7834,7 +8057,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 Some((id, n["status"] == "online" && heard))
             })
             .collect();
-        checks.push(logs_last_seen_check(metrics.as_deref(), &roster, now));
+        checks.push(off_by_choice::or_judge("logs last seen", &monitoring, || logs_last_seen_check(metrics.as_deref(), &roster, now)));
         // The legacy credential lanes, gateway counters from
         // the same /metrics text, node counts from each node record.
         // Each node's last apply report, for the
@@ -7883,7 +8106,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             if !want_nodes {
                 println!("{}", ui::header("cluster verify", Some("controller")));
             }
-            render("controller", &checks, g.verbose);
+            show("controller", &checks, g.verbose, brief);
             tally.add("controller", &checks);
         }
     }
@@ -8057,6 +8280,292 @@ pub(crate) fn cert_expiry_row(certs: &[(String, i64)]) -> Check {
         return warn(NAME, format!("{} within {CERT_WARN_DAYS} days: {}", soon.len(), named_days(&soon)), Some(ROTATE.into()));
     }
     ok(NAME, format!("{} certificate(s); the soonest, {}, in {} days", certs.len(), sorted[0].0, sorted[0].1))
+}
+
+/// `image retention`: what hostd's rung 5 last judged on this controller, read
+/// from the report it writes beside the keep file
+/// (`<root>/.noo-host-spool/image-retention-report.json`). Read-only: it
+/// never asks for a run. No report means no reclaim run has had a keep file
+/// yet, which is a fresh install's normal state, not a fault.
+pub(crate) fn image_retention_row(report: Option<Result<Value, String>>, blocked: Option<Value>) -> Check {
+    const NAME: &str = "image retention";
+    // A roll whose gate blocked (the stack or add-on rows did not prove the
+    // images superseded) says so here until a roll cleans, so "never
+    // cleaned" is always visible with its reason (`image_retention.rs`
+    // BLOCKED_FILE).
+    if let Some(b) = blocked {
+        let rows: Vec<&str> = b["rows"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+        if !rows.is_empty() {
+            return warn(
+                NAME,
+                format!(
+                    "superseded images not cleaned since the roll to {} ({}): blocked by {}",
+                    b["tag"].as_str().unwrap_or("?"),
+                    b["at"].as_str().unwrap_or("an unknown time"),
+                    rows.join("; ")
+                ),
+                None,
+            );
+        }
+    }
+    let Some(report) = report else {
+        return ok(NAME, "not judged yet: no reclaim run has had a keep file");
+    };
+    let rep = match report {
+        Ok(v) => v,
+        Err(e) => return warn(NAME, format!("the last report cannot be read: {e}"), None),
+    };
+    let images = rep["images"].as_array().cloned().unwrap_or_default();
+    let when = rep["written_at"].as_str().unwrap_or("an unknown time");
+    let dry = rep["dry_run"].as_bool().unwrap_or(true);
+    let marked: Vec<&Value> = images.iter().filter(|i| i["remove"].as_bool() == Some(true)).collect();
+    let refused: Vec<&Value> = marked
+        .iter()
+        .copied()
+        .filter(|i| i["result"].as_str().is_some_and(|r| r.starts_with("refused")))
+        .collect();
+    let bytes = rep["bytes"].as_i64().unwrap_or(0).max(0);
+    let size = if bytes >= 1_000_000_000 {
+        format!("{:.1} GB", bytes as f64 / 1e9)
+    } else {
+        format!("{} MB", bytes / 1_000_000)
+    };
+    if !refused.is_empty() {
+        let first = refused[0]["refs"].get(0).and_then(|r| r.as_str()).or(refused[0]["id"].as_str()).unwrap_or("?");
+        return warn(
+            NAME,
+            format!(
+                "{} superseded image(s) Docker refused to remove at {when} (first: {first}: {})",
+                refused.len(),
+                refused[0]["result"].as_str().unwrap_or("")
+            ),
+            None,
+        );
+    }
+    if marked.is_empty() {
+        return ok(NAME, format!("nothing superseded at {when}; {} image(s) judged", images.len()));
+    }
+    if dry {
+        ok(NAME, format!("{} superseded image(s) of ours, {size} reclaimable; report only, nothing removed ({when})", marked.len()))
+    } else {
+        ok(NAME, format!("removed {} superseded image(s) of ours, {size} freed ({when})", marked.len()))
+    }
+}
+
+/// [`image_retention_row`] for the install at `root`.
+pub(crate) fn image_retention_row_here(root: &std::path::Path) -> Check {
+    let p = root.join(".noo-host-spool").join("image-retention-report.json");
+    let report = match std::fs::read_to_string(&p) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => Some(Err(format!("{}: {e}", p.display()))),
+        Ok(s) => Some(serde_json::from_str::<Value>(&s).map_err(|e| format!("{}: {e}", p.display()))),
+    };
+    let blocked = std::fs::read_to_string(root.join(".noo-host-spool").join(crate::commands::image_retention::BLOCKED_FILE))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    image_retention_row(report, blocked)
+}
+
+/// One container on this host, as `docker inspect` gives it.
+#[derive(Debug, Clone)]
+pub(crate) struct StackContainer {
+    pub name: String,
+    /// The image the container was created from, as written (`repo@sha256:…`
+    /// or `repo:tag`).
+    pub config_image: String,
+    /// The image ID it runs.
+    pub image_id: String,
+    pub running: bool,
+}
+
+/// `repo` of `repo@sha256:…`, `repo:tag` or `repo:tag@sha256:…` (compose
+/// writes the last: `ghcr.io/noomesh/gateway:v0.6.25@sha256:…`). A colon
+/// before the last `/` is a registry port, not a tag.
+fn image_repo(r: &str) -> &str {
+    let r = r.split_once('@').map_or(r, |(n, _)| n);
+    match (r.rfind(':'), r.rfind('/')) {
+        (Some(c), Some(sl)) if c > sl => &r[..c],
+        (Some(c), None) => &r[..c],
+        _ => r,
+    }
+}
+
+/// A repository with a registry host (`ghcr.io/…`, `localhost:5000/…`),
+/// not a Docker Hub short name (`nats`, `ollama/ollama`).
+fn has_registry_host(repo: &str) -> bool {
+    repo.split_once('/').is_some_and(|(h, _)| h.contains('.') || h.contains(':') || h == "localhost")
+}
+
+/// One row of the stack lock and the local images that hold its digest
+/// (`image_retention::holding`: by digest, under any name).
+#[derive(Debug, Clone)]
+pub(crate) struct LockImage {
+    pub lock_ref: String,
+    pub held: Vec<crate::commands::image_retention::LocalImage>,
+}
+
+/// `stack images`: every RUNNING stack container on this host runs exactly
+/// the image the lock pins. The gate for removing superseded images
+/// (`image_retention::retention_gate`) rests on it: a container still on an
+/// older image (a half-done roll) means "superseded" is not true yet.
+///
+/// The lock names images by digest under the release's short names
+/// (`gateway@sha256:…`); the same digest is held here as
+/// `ghcr.io/noomesh/gateway@…`, `ghcr.io/noomesh/dhi/alertmanager@…`, a
+/// Docker Hub `nats@…` or under a mirror prefix. So the scope is by the
+/// repository the lock's digest RESOLVES to locally, and the judgment is
+/// image ID equality, never a name comparison:
+///
+/// * a container whose image repository is one a lock row's image is held
+///   under is judged against that row;
+/// * a row no local image holds (not pulled yet, mid-roll) claims a
+///   container under a registry host whose last path segment is the row's
+///   name, and fails it: the lock's image is not here;
+/// * a Docker Hub short-name repository is judged only for a container named
+///   `<prefix>-…` (the stack's own), so the operator's own `nats` container
+///   is never held against the stack's.
+///
+/// Out of scope, and said: containers no row claims (an add-on's own,
+/// fixtures, the operator's), and stopped ones. Fail-closed: no lock, or a
+/// docker that did not answer, is a WARN; running containers of which the
+/// check matched NONE is a FAIL (the check cannot see this stack).
+pub(crate) fn stack_images_check(lock: Option<&[LockImage]>, containers: Result<&[StackContainer], String>, prefix: &str) -> Check {
+    const NAME: &str = "stack images";
+    let Some(lock) = lock else {
+        return warn(NAME, "no stack.lock in the install root: what the stack should run is not known — not judged", None);
+    };
+    let containers = match containers {
+        Ok(c) => c,
+        Err(e) => return warn(NAME, format!("docker did not list the containers ({e}) — not judged, not a pass"), None),
+    };
+    let mut by_repo: std::collections::BTreeMap<&str, Vec<&LockImage>> = Default::default();
+    let mut unresolved: Vec<&LockImage> = Vec::new();
+    for li in lock {
+        let repos: std::collections::BTreeSet<&str> = li.held.iter().flat_map(|i| i.refs.iter().map(|r| image_repo(r))).collect();
+        if repos.is_empty() {
+            unresolved.push(li);
+        }
+        for r in repos {
+            by_repo.entry(r).or_default().push(li);
+        }
+    }
+    let last = |r: &str| -> String { r.rsplit('/').next().unwrap_or(r).to_string() };
+    let own = format!("{prefix}-");
+    let mut judged = 0usize;
+    let mut bad: Vec<String> = Vec::new();
+    let mut not_pinned: Vec<&str> = Vec::new();
+    let mut stopped: Vec<&str> = Vec::new();
+    for c in containers {
+        let repo = image_repo(&c.config_image);
+        let want: Vec<&LockImage> = if !has_registry_host(repo) && !c.name.starts_with(&own) {
+            Vec::new()
+        } else if let Some(w) = by_repo.get(repo) {
+            w.clone()
+        } else if has_registry_host(repo) {
+            unresolved.iter().copied().filter(|li| last(image_repo(&li.lock_ref)) == last(repo)).collect()
+        } else {
+            Vec::new()
+        };
+        if want.is_empty() {
+            not_pinned.push(&c.name);
+            continue;
+        }
+        if !c.running {
+            stopped.push(&c.name);
+            continue;
+        }
+        judged += 1;
+        if !want.iter().any(|li| li.held.iter().any(|i| i.id == c.image_id)) {
+            let short = c.image_id.strip_prefix("sha256:").unwrap_or(&c.image_id);
+            let li = want[0];
+            let r = &li.lock_ref;
+            bad.push(if li.held.is_empty() {
+                format!("{} runs {}, and the lock's {r} is not on this host", c.name, &short[..short.len().min(12)])
+            } else {
+                format!("{} runs {}, the lock pins {r}", c.name, &short[..short.len().min(12)])
+            });
+        }
+    }
+    let mut skipped = Vec::new();
+    if !not_pinned.is_empty() {
+        skipped.push(format!("{} not pinned by the lock ({})", not_pinned.len(), not_pinned.iter().take(4).copied().collect::<Vec<_>>().join(", ")));
+    }
+    if !stopped.is_empty() {
+        skipped.push(format!("{} stopped ({})", stopped.len(), stopped.iter().take(4).copied().collect::<Vec<_>>().join(", ")));
+    }
+    let skipped = if skipped.is_empty() { String::new() } else { format!("; skipped: {}", skipped.join(", ")) };
+    if !bad.is_empty() {
+        return fail(NAME, format!("{}{skipped}", bad.join("; ")), "noo upgrade --stack");
+    }
+    if judged == 0 {
+        let running = containers.iter().filter(|c| c.running).count();
+        if running > 0 && stopped.is_empty() {
+            return fail(
+                NAME,
+                format!(
+                    "the check matched none of the {running} running container(s) to an image the stack lock names — it cannot judge this stack (a check fault, not a pass){skipped}"
+                ),
+                "noo stack status",
+            );
+        }
+        return warn(NAME, format!("no running container runs an image the stack lock pins — nothing judged{skipped}"), None);
+    }
+    ok(NAME, format!("{judged} running container(s) run the lock's images{skipped}"))
+}
+
+/// [`stack_images_check`] for the install at `root`, read from docker.
+pub(crate) fn stack_images_row_here(root: &std::path::Path) -> Check {
+    use crate::commands::image_retention as ir;
+    let lock = std::fs::read_to_string(root.join("stack.lock")).ok().map(|t| ir::stack_lock_refs(&t));
+    let run = |args: &[&str]| -> Result<String, String> {
+        let o = std::process::Command::new("docker").args(args).stdin(std::process::Stdio::null()).output().map_err(|e| e.to_string())?;
+        if o.status.success() {
+            Ok(String::from_utf8_lossy(&o.stdout).into_owned())
+        } else {
+            Err(String::from_utf8_lossy(&o.stderr).lines().next().unwrap_or("docker failed").to_string())
+        }
+    };
+    let local = ir::local_images();
+    let lock: Option<Vec<LockImage>> = lock.map(|refs| {
+        refs.into_iter()
+            .map(|r| {
+                let held = local.as_deref().map(|l| ir::holding(&r, l).into_iter().cloned().collect()).unwrap_or_default();
+                LockImage { lock_ref: r, held }
+            })
+            .collect()
+    });
+    let containers = run(&["ps", "-aq", "--no-trunc"]).and_then(|ids| {
+        let ids: Vec<&str> = ids.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut args = vec!["inspect", "--format", "{{.Name}}|{{.Config.Image}}|{{.Image}}|{{.State.Running}}"];
+        args.extend(ids.iter().copied());
+        let out = run(&args)?;
+        let parsed: Vec<StackContainer> = out
+            .lines()
+            .filter_map(|l| {
+                let p: Vec<&str> = l.trim().splitn(4, '|').collect();
+                (p.len() == 4).then(|| StackContainer {
+                    name: p[0].trim_start_matches('/').to_string(),
+                    config_image: p[1].to_string(),
+                    image_id: p[2].to_string(),
+                    running: p[3] == "true",
+                })
+            })
+            .collect();
+        // One record per container, or what runs is not known.
+        if parsed.len() != ids.len() {
+            return Err(format!("docker inspect answered for {} of {} containers", parsed.len(), ids.len()));
+        }
+        Ok(parsed)
+    });
+    // Images not listed: nothing can be resolved, so nothing is judged.
+    let containers = match &local {
+        Err(e) => Err(format!("docker did not list the images: {e}")),
+        Ok(_) => containers,
+    };
+    stack_images_check(lock.as_deref(), containers.as_deref().map_err(|e| e.clone()), &crate::envfile::container_prefix())
 }
 
 fn checks_json(checks: &[Check]) -> Value {
@@ -9694,6 +10203,45 @@ mod tests {
         let mut ctl = with_egress(now, serde_json::json!({"state": "unknown"}));
         ctl["self_node"] = true.into();
         assert!(node_checks(&ctl, "v0.2.70", "0.5.57", now, Some(true)).iter().all(|c| c.name != "harness egress"));
+    }
+
+    /// A harness under a runtime with no hold (mcmini, a Mac node: launchd)
+    /// is an exposure said as one, a WARN naming the runtime, with no upgrade
+    /// hint (no agent version reports a hold there). The host_services below
+    /// is mcmini's own heartbeat on 0.6.24, as `noo_cluster_status` returned
+    /// it (2026-11-15). A systemd harness that reports no hold is still an
+    /// agent too old to say, hint kept, and so is a heartbeat with no runtime.
+    #[test]
+    fn a_harness_with_no_hold_on_its_runtime_is_an_exposure_not_an_old_agent() {
+        let now = 1_800_000_000;
+        let mut mac = healthy(now);
+        mac["id"] = "mcmini".into();
+        mac["os"] = "darwin".into();
+        mac["host_services"] = serde_json::json!({"harness": {"kind": "noo", "runtime": "launchd", "state": "running"}});
+        let c = node_checks(&mac, "v0.2.70", "0.5.57", now, Some(true));
+        assert_eq!(verdict(&c, "harness egress"), Verdict::Warn, "a true exposure stays a WARN");
+        let row = c.iter().find(|c| c.name == "harness egress").unwrap();
+        assert_eq!(row.detail, "no egress hold on launchd: the hold is systemd-only, so this node's harness runs with nothing holding it off the internet");
+        assert!(row.remedy.is_none(), "no upgrade can add a hold on launchd: {:?}", row.remedy);
+        assert!(!row.detail.contains("older"));
+
+        let mut old = healthy(now);
+        old["id"] = "host6".into();
+        old["host_services"] = serde_json::json!({"harness": {"kind": "noo", "runtime": "systemd", "state": "running"}});
+        let c = node_checks(&old, "v0.2.70", "0.5.57", now, Some(true));
+        let row = c.iter().find(|c| c.name == "harness egress").unwrap();
+        assert_eq!(row.verdict, Verdict::Warn);
+        assert!(row.detail.starts_with("not reported: this node's agent is older than the egress hold"), "{}", row.detail);
+        assert!(row.remedy.as_deref().is_some_and(|r| r.contains("noo upgrade --all") && r.contains("host6")), "{:?}", row.remedy);
+
+        old["host_services"]["harness"].as_object_mut().unwrap().remove("runtime");
+        let c = node_checks(&old, "v0.2.70", "0.5.57", now, Some(true));
+        let row = c.iter().find(|c| c.name == "harness egress").unwrap();
+        assert!(row.verdict == Verdict::Warn && row.detail.contains("older") && row.remedy.is_some(), "no runtime reported: {row:?}");
+
+        // A stopped harness on launchd has no row, as on systemd.
+        mac["host_services"]["harness"]["state"] = "stopped".into();
+        assert!(node_checks(&mac, "v0.2.70", "0.5.57", now, Some(true)).iter().all(|c| c.name != "harness egress"));
     }
 
     /// An ordinary node whose harness the gateway WANTS but which is absent
@@ -11728,6 +12276,45 @@ mod tests {
 
     /// Accepted is its own verdict: "accepted" in --json, a distinct glyph,
     /// never counted as a failure, and carries no remedy to print.
+    /// onboard's closing verify (--brief, general 11-14): every row lands in
+    /// exactly one group, so the counts add up; a FAIL or STARTING row is never
+    /// tiered out of sight; a "not applicable" tier needs its detail text.
+    #[test]
+    fn the_brief_split_hides_no_failure_and_drops_no_row() {
+        let starting = Check { name: "inbound", verdict: Verdict::Starting, detail: "not yet checked".into(), remedy: None };
+        let rows = vec![
+            ok("posture", "3 gates at desired"),
+            fail("last backup", "the backup job failed", "noo backup run"),
+            starting,
+            warn("last backup", "no successful backup on record", None),
+            warn("off-site backup", "never decided", None),
+            warn("holds", "docker-ce not held", None),
+            warn("loki at rest", "in the clear", None),
+            warn("pki at rest", "in the clear", None),
+            warn("at-rest swap", "swap not encrypted", None),
+            warn("tailnet policy", "not read (no tailnet API key?)", None),
+            warn("tailnet policy", "the policy denies tag:controller", None),
+            warn("node-agent privilege", "not checked: no noo-node-agent container", None),
+            warn("data root policy", "/var/lib/noo is owned by uid 1001", None),
+            accepted("off-site", "declined"),
+        ];
+        let b = brief_split(&rows);
+        assert_eq!(b.passed + b.shown.len() + b.later.len() + b.not_here.len(), rows.len(), "nothing is dropped");
+        let shown: Vec<(&str, Verdict)> = b.shown.iter().map(|c| (c.name, c.verdict)).collect();
+        assert!(shown.contains(&("last backup", Verdict::Fail)), "a failing tiered row is shown, never grouped");
+        assert!(shown.contains(&("inbound", Verdict::Starting)), "a starting row is shown");
+        assert!(shown.iter().any(|(n, _)| *n == "tailnet policy"), "a tailnet policy that WAS read stays in view");
+        assert!(shown.iter().any(|(n, _)| *n == "data root policy"), "an untiered warning stays in view");
+        assert!(shown.iter().any(|(_, v)| *v == Verdict::Accepted), "an accepted opt-out stays in view");
+        assert_eq!(b.later.len(), 6);
+        assert_eq!(b.not_here.iter().map(|c| c.name).collect::<Vec<_>>(), ["tailnet policy", "node-agent privilege"]);
+        let lines = later_lines(&b.later);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines.last().unwrap().starts_with("data at rest: 3 rows in the clear on this disk"), "{lines:?}");
+        // The real failure is what decides the section, as in the default rendering.
+        assert!(!render_brief("controller", &rows));
+        assert!(render_brief("controller", &rows[3..]));
+    }
     #[test]
     fn accepted_is_its_own_verdict_in_json_and_never_fails_the_exit_code() {
         let rows = vec![
@@ -12856,6 +13443,22 @@ mod config_mount_tests {
         assert!(c.remedy.as_deref().unwrap().contains("'/Users/x/noomesh'"), "{:?}", c.remedy);
     }
 
+    /// i677: on the controller's own node the operator owns the data root; the
+    /// remedy declares that (the local owner file), never a chown.
+    #[test]
+    fn the_self_nodes_operator_owned_root_is_declared_not_chowned() {
+        use serde_json::json;
+        let n = json!({"id": "box", "self_node": true, "data_roots": {"noo_data_root": "/var/lib/noo",
+            "policy": {"mode": "warn", "ok": false, "problems": [{"code": "wrong_owner", "detail": "owned by uid 1001"}]}}});
+        let r = super::data_root_policy_row(&n).unwrap().remedy.unwrap();
+        assert!(r.starts_with("noo onboard --only services") && r.contains("/etc/noo/data-root-owner") && r.contains("sudo once"), "{r}");
+        assert!(!r.contains("install -d -o noo-agent"), "{r}");
+        // Another problem beside it keeps the general remedy.
+        let both = json!({"id": "box", "self_node": true, "data_roots": {"noo_data_root": "/var/lib/noo",
+            "policy": {"mode": "warn", "ok": false, "problems": [{"code": "wrong_owner", "detail": "x"}, {"code": "writable_by_others", "detail": "y"}]}}});
+        assert!(!super::data_root_policy_row(&both).unwrap().remedy.unwrap().starts_with("noo onboard"));
+    }
+
     #[test]
     fn an_undeclared_legacy_root_is_declared_where_it_is_not_moved() {
         use serde_json::json;
@@ -13943,13 +14546,13 @@ mod vantage_tests {
 
     /// Every row the controller half writes from THIS machine's files and
     /// containers (the rows an outside run on a node turned red).
-    const CONTROLLER_ONLY_ROWS: [&str; 31] = [
+    const CONTROLLER_ONLY_ROWS: [&str; 34] = [
         "self-agent lane", "model cache", "loki", "tempo", "grafana door", "audit key", "secrets at rest",
         "shared secrets", "secrets audit", "grafana sso", "gateway pki view", "loki listener", "tempo listener",
         "sandbox listener", "backend tls", "nats tls", "nats principals", "postgres hba", "postgres role identity",
         "postgres tls", "sandbox executor", "data directories", "data root filesystem", "monitoring web config",
         "secrets not in env", "node-agent privilege", "callers", "tailnet policy", "last backup", "off-site backup",
-        "pki at rest",
+        "pki at rest", "image retention", "stack images", "postgres memory",
     ];
 
     #[test]
@@ -14342,5 +14945,283 @@ mod docker_refused_row_tests {
         for g in UNPROBED_GUESSES {
             assert!(own.contains(g), "{g} is still a row's text");
         }
+    }
+}
+
+#[cfg(test)]
+mod image_retention_row_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn img(remove: bool, result: Option<&str>) -> Value {
+        let mut v = json!({"id": "sha256:aa", "refs": ["ghcr.io/noomesh/x:old"], "bytes": 1, "remove": remove, "why": "w"});
+        if let Some(r) = result {
+            v["result"] = json!(r);
+        }
+        v
+    }
+
+    #[test]
+    fn no_report_is_a_fresh_install_not_a_fault() {
+        let r = image_retention_row(None, None);
+        assert_eq!(r.verdict, Verdict::Ok);
+        assert!(r.detail.contains("not judged yet"), "{}", r.detail);
+    }
+
+    #[test]
+    fn an_unreadable_report_warns_with_the_reason() {
+        let r = image_retention_row(Some(Err("p: bad json".into())), None);
+        assert_eq!(r.verdict, Verdict::Warn);
+        assert!(r.detail.contains("bad json"), "{}", r.detail);
+    }
+
+    #[test]
+    fn a_dry_run_says_what_is_reclaimable_and_that_nothing_was_removed() {
+        let rep = json!({"written_at": "2026-11-13T16:00:00Z", "dry_run": true, "bytes": 52_300_000_000_i64,
+            "images": [img(true, None), img(true, None), img(false, None)]});
+        let r = image_retention_row(Some(Ok(rep)), None);
+        assert_eq!(r.verdict, Verdict::Ok);
+        assert!(r.detail.contains("2 superseded image(s)") && r.detail.contains("52.3 GB"), "{}", r.detail);
+        assert!(r.detail.contains("nothing removed"), "{}", r.detail);
+    }
+
+    #[test]
+    fn a_live_run_says_what_it_freed() {
+        let rep = json!({"written_at": "t", "dry_run": false, "bytes": 3_000_000_000_i64,
+            "images": [img(true, Some("removed"))]});
+        let r = image_retention_row(Some(Ok(rep)), None);
+        assert_eq!(r.verdict, Verdict::Ok);
+        assert!(r.detail.starts_with("removed 1 superseded image(s)") && r.detail.contains("3.0 GB freed"), "{}", r.detail);
+    }
+
+    #[test]
+    fn a_refused_removal_warns_and_names_it() {
+        let rep = json!({"written_at": "t", "dry_run": false, "bytes": 1,
+            "images": [img(true, Some("removed")), img(true, Some("refused: image is being used by running container"))]});
+        let r = image_retention_row(Some(Ok(rep)), None);
+        assert_eq!(r.verdict, Verdict::Warn);
+        assert!(r.detail.contains("ghcr.io/noomesh/x:old") && r.detail.contains("being used"), "{}", r.detail);
+    }
+
+    #[test]
+    fn nothing_superseded_is_ok_and_says_so() {
+        let rep = json!({"written_at": "t", "dry_run": true, "bytes": 0, "images": [img(false, None)]});
+        let r = image_retention_row(Some(Ok(rep)), None);
+        assert_eq!(r.verdict, Verdict::Ok);
+        assert!(r.detail.starts_with("nothing superseded"), "{}", r.detail);
+    }
+
+    #[test]
+    fn the_controller_run_pushes_the_row() {
+        let src = include_str!("cluster_verify.rs");
+        assert!(src.contains("checks.push(image_retention_row_here(&crate::envfile::repo_root()));"));
+    }
+    fn sc(name: &str, image: &str, id: &str, running: bool) -> StackContainer {
+        StackContainer { name: name.into(), config_image: image.into(), image_id: id.into(), running }
+    }
+
+    /// Captured fixtures (tests/fixtures/image-retention/README.md says
+    /// where each came from): the real 0.6.25-rc.1 and 0.6.24 stack locks,
+    /// `docker image inspect` of real stores, `docker inspect` of containers
+    /// created from compose-shaped refs.
+    fn fx(name: &str) -> &'static str {
+        match name {
+            "rc1.lock" => include_str!("../../../tests/fixtures/image-retention/stack-v0.6.25-rc.1.lock"),
+            "classic.images" => include_str!("../../../tests/fixtures/image-retention/classic-overlay2-27.5.1.images"),
+            "classic.containers" => include_str!("../../../tests/fixtures/image-retention/classic-gateway.containers"),
+            "containerd-node.images" => include_str!("../../../tests/fixtures/image-retention/containerd-node.images"),
+            "27.images" => include_str!("../../../tests/fixtures/image-retention/docker27.images"),
+            "27.containers" => include_str!("../../../tests/fixtures/image-retention/docker27.containers"),
+            "28.images" => include_str!("../../../tests/fixtures/image-retention/docker28.images"),
+            "28.containers" => include_str!("../../../tests/fixtures/image-retention/docker28.containers"),
+            "29.images" => include_str!("../../../tests/fixtures/image-retention/docker29.images"),
+            "29.containers" => include_str!("../../../tests/fixtures/image-retention/docker29.containers"),
+            _ => panic!("no fixture {name}"),
+        }
+    }
+
+    fn lock_images(lock: &str, images: &str) -> Vec<LockImage> {
+        let local = crate::commands::image_retention::parse_local_images(images);
+        crate::commands::image_retention::stack_lock_refs(lock)
+            .into_iter()
+            .map(|r| LockImage { held: crate::commands::image_retention::holding(&r, &local).into_iter().cloned().collect(), lock_ref: r })
+            .collect()
+    }
+
+    /// `docker inspect --format '{{.Name}}|{{.Config.Image}}|{{.Image}}|{{.State.Running}}'`
+    /// lines. The captures are of created (never started) containers; the
+    /// names in `running` are taken as running.
+    fn containers(text: &str, running: &[&str]) -> Vec<StackContainer> {
+        text.lines()
+            .filter_map(|l| {
+                let p: Vec<&str> = l.trim().splitn(4, '|').collect();
+                let name = p.first()?.trim_start_matches('/');
+                (p.len() == 4).then(|| sc(name, p[1], p[2], running.contains(&name)))
+            })
+            .collect()
+    }
+
+    /// The defect this replaces: the real lock's short names (`gateway@…`)
+    /// never equalled a container's `ghcr.io/noomesh/gateway:…@…`, so every
+    /// container was "not pinned" and the gate never passed. On Docker 27,
+    /// 28 (classic store) and 29 (containerd store), the stack's Docker Hub
+    /// image (nats) and a ghcr.io/noomesh/dhi base image (alertmanager) are
+    /// judged and pass.
+    #[test]
+    fn stack_images_judges_the_real_rc1_lock_on_docker_27_28_29() {
+        for v in ["27", "28", "29"] {
+            let lock = lock_images(fx("rc1.lock"), fx(&format!("{v}.images")));
+            let cs = containers(fx(&format!("{v}.containers")), &["noo-nats", "noo-alertmanager"]);
+            let r = stack_images_check(Some(&lock), Ok(&cs), "noo");
+            assert_eq!(r.verdict, Verdict::Ok, "docker {v}: {r:?}");
+            assert!(r.detail.starts_with("2 running container(s) run the lock's images"), "docker {v}: {}", r.detail);
+        }
+    }
+
+    /// Mid-roll on the real classic store: noo-gateway still runs 0.6.24's
+    /// gateway while the lock is rc.1's: a FAIL naming it.
+    #[test]
+    fn stack_images_fails_mid_roll_on_the_real_store() {
+        let lock = lock_images(fx("rc1.lock"), fx("classic.images"));
+        let cs = containers(fx("classic.containers"), &["noo-gateway", "noo-gateway-rc1"]);
+        let r = stack_images_check(Some(&lock), Ok(&cs), "noo");
+        assert_eq!(r.verdict, Verdict::Fail, "{r:?}");
+        assert!(r.detail.starts_with("noo-gateway runs cf73b69640a1, the lock pins gateway@sha256:5074a815"), "{}", r.detail);
+        // rc.1's own gateway container alone passes.
+        let r = stack_images_check(Some(&lock), Ok(&cs[1..]), "noo");
+        assert_eq!(r.verdict, Verdict::Ok, "{r:?}");
+        // The lock's gateway not pulled at all (Docker 27's store holds none):
+        // the container on the old one is still claimed, and failed, said.
+        let lock = lock_images(fx("rc1.lock"), fx("27.images"));
+        let r = stack_images_check(Some(&lock), Ok(&cs[..1]), "noo");
+        assert!(r.verdict == Verdict::Fail && r.detail.contains("the lock's gateway@sha256:5074a815525f") && r.detail.contains("is not on this host"), "{r:?}");
+    }
+
+    /// Under a mirror prefix (a real containerd store whose images were
+    /// pulled from a registry other than ghcr.io/noomesh) the row resolves
+    /// by digest all the same.
+    #[test]
+    fn stack_images_resolves_a_mirror_prefix_by_digest() {
+        let d = "1337ee87e4113bfd426371f007e20865d9dfb3242a7cb94cb479d50f5492d3fd";
+        let lock = lock_images(&format!("# stack v0.6.16\nwhisper@sha256:{d}\n"), fx("containerd-node.images"));
+        assert_eq!(lock[0].held.len(), 1, "{lock:?}");
+        let cs = vec![sc("noo-whisper", &format!("registry.example.lan/noomesh/whisper:v0.6.16@sha256:{d}"), &format!("sha256:{d}"), true)];
+        assert_eq!(stack_images_check(Some(&lock), Ok(&cs), "noo").verdict, Verdict::Ok);
+    }
+
+    /// The operator's own container on a Docker Hub image the stack also
+    /// uses (`nats`) is not the stack's: never judged against the lock.
+    #[test]
+    fn stack_images_never_judges_the_operators_own_hub_container() {
+        let lock = lock_images(fx("rc1.lock"), fx("28.images"));
+        let mut cs = containers(fx("28.containers"), &["noo-nats", "noo-alertmanager"]);
+        cs.push(sc("mynats", "nats:latest", &id("e"), true));
+        let r = stack_images_check(Some(&lock), Ok(&cs), "noo");
+        assert_eq!(r.verdict, Verdict::Ok, "{r:?}");
+        assert!(r.detail.contains("1 not pinned by the lock (mynats)"), "{}", r.detail);
+        // The same image under the stack's own prefix IS judged.
+        cs.last_mut().unwrap().name = "noo-nats-2".into();
+        assert_eq!(stack_images_check(Some(&lock), Ok(&cs), "noo").verdict, Verdict::Fail);
+    }
+
+    /// Running containers, none matched: the check cannot see this stack,
+    /// and says so as a FAIL, never "nothing judged" that reads as quiet.
+    #[test]
+    fn stack_images_matching_nothing_on_a_running_box_is_a_fault() {
+        let lock = lock_images(fx("rc1.lock"), fx("27.images"));
+        let cs = vec![sc("rh-fixture", "localhost:5000/rh/fixture:1", &id("d"), true)];
+        let r = stack_images_check(Some(&lock), Ok(&cs), "noo");
+        assert_eq!(r.verdict, Verdict::Fail, "{r:?}");
+        assert!(r.detail.starts_with("the check matched none of the 1 running container(s)"), "{}", r.detail);
+    }
+
+    fn id(c: &str) -> String {
+        "sha256:".to_string() + &c.repeat(64)
+    }
+
+    /// Not judged is never a pass: no lock, docker silent, nothing running.
+    #[test]
+    fn stack_images_without_a_verdict_warns() {
+        let lock = lock_images(fx("rc1.lock"), fx("27.images"));
+        let cs = containers(fx("27.containers"), &["noo-nats"]);
+        assert_eq!(stack_images_check(None, Ok(&cs), "noo").verdict, Verdict::Warn);
+        assert_eq!(stack_images_check(Some(&lock), Err("docker not running".into()), "noo").verdict, Verdict::Warn);
+        assert_eq!(stack_images_check(Some(&lock), Ok(&[]), "noo").verdict, Verdict::Warn);
+        // Stopped stack containers only: nothing judged, a WARN.
+        assert_eq!(stack_images_check(Some(&lock), Ok(&containers(fx("27.containers"), &[])), "noo").verdict, Verdict::Warn);
+    }
+
+    #[test]
+    fn the_image_repo_strips_a_digest_or_a_tag_never_a_port() {
+        assert_eq!(image_repo("ghcr.io/noomesh/gateway@sha256:aa"), "ghcr.io/noomesh/gateway");
+        assert_eq!(image_repo("ghcr.io/noomesh/gateway:v1"), "ghcr.io/noomesh/gateway");
+        assert_eq!(image_repo("localhost:5000/rh/x"), "localhost:5000/rh/x");
+        assert_eq!(image_repo("redis:7"), "redis");
+        // compose's form: tag AND digest
+        assert_eq!(image_repo("ghcr.io/noomesh/gateway:v0.6.25-rc.1@sha256:aa"), "ghcr.io/noomesh/gateway");
+        assert_eq!(image_repo("localhost:5000/rh/x:1@sha256:aa"), "localhost:5000/rh/x");
+    }
+
+    /// A roll whose gate blocked is visible here until a roll cleans.
+    #[test]
+    fn a_blocked_roll_is_said_on_the_row_with_its_reason() {
+        let b = json!({"at": "2026-11-14T16:00:00Z", "tag": "v0.6.25", "rows": ["stack images (noo-ollama runs eeee, the lock pins x)"]});
+        let rep = json!({"written_at": "t", "dry_run": true, "bytes": 0, "images": []});
+        let r = image_retention_row(Some(Ok(rep.clone())), Some(b));
+        assert_eq!(r.verdict, Verdict::Warn, "{r:?}");
+        assert!(r.detail.starts_with("superseded images not cleaned since the roll to v0.6.25") && r.detail.contains("blocked by stack images (noo-ollama"), "{}", r.detail);
+        // No record (or an empty one): the report decides, as before.
+        assert_eq!(image_retention_row(Some(Ok(rep.clone())), None).verdict, Verdict::Ok);
+        assert_eq!(image_retention_row(Some(Ok(rep)), Some(json!({"rows": []}))).verdict, Verdict::Ok);
+    }
+
+    #[test]
+    fn the_controller_run_pushes_stack_images_before_image_retention() {
+        let src = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let a = src.find("checks.push(stack_images_row_here(&crate::envfile::repo_root()));").expect("pushed");
+        let b = src.find("checks.push(image_retention_row_here(&crate::envfile::repo_root()));").expect("pushed");
+        assert!(a < b);
+    }
+
+}
+
+#[cfg(test)]
+mod cpu_only_ollama_slots_tests {
+    use super::{cpu_only_ollama_slots_row, Verdict, CPU_ONLY_SLOTS_ADVICE, CPU_ONLY_SLOTS_REMEDY};
+
+    /// i802: on a CPU-only controller, no OLLAMA_EMBED_NUM_PARALLEL or a
+    /// value above 1 is an ADVISORY row (a warning, never a failure) that
+    /// names the saving and the real restart command; 1 is OK; a GPU box or
+    /// an unreadable .env shows no row.
+    #[test]
+    fn cpu_only_controller_gets_an_advisory_ollama_slots_row() {
+        let unset = cpu_only_ollama_slots_row(true, true, None).expect("a row");
+        assert_eq!((unset.name, unset.verdict), ("ollama slots", Verdict::Warn), "advisory, never red");
+        assert!(unset.detail.contains("unset") && unset.detail.ends_with(CPU_ONLY_SLOTS_ADVICE), "{}", unset.detail);
+        assert!(CPU_ONLY_SLOTS_ADVICE.starts_with("CPU-only: one Ollama slot prefills about 3x faster on a 4-core CPU") && CPU_ONLY_SLOTS_ADVICE.contains("no embedding loss (measured, i802)"));
+        assert_eq!(unset.remedy.as_deref(), Some(CPU_ONLY_SLOTS_REMEDY));
+        assert!(CPU_ONLY_SLOTS_REMEDY.contains("noo stack restart --force ollama-embed"));
+        let four = cpu_only_ollama_slots_row(true, true, Some("4")).expect("a row");
+        assert_eq!(four.verdict, Verdict::Warn);
+        assert!(four.detail.starts_with("OLLAMA_EMBED_NUM_PARALLEL=4. "), "{}", four.detail);
+        assert_eq!(cpu_only_ollama_slots_row(true, true, Some("junk")).unwrap().verdict, Verdict::Warn);
+        assert_eq!(cpu_only_ollama_slots_row(true, true, Some("1")).unwrap().verdict, Verdict::Ok);
+        assert!(cpu_only_ollama_slots_row(false, true, None).is_none(), "a GPU box: no row");
+        assert!(cpu_only_ollama_slots_row(true, false, None).is_none(), "an unreadable .env: no row");
+        for v in [None, Some("4"), Some("1"), Some("x")] {
+            assert_ne!(cpu_only_ollama_slots_row(true, true, v).unwrap().verdict, Verdict::Fail);
+        }
+    }
+
+    /// The restart command is one the CLI accepts and names the compose
+    /// service of the stack's shared Ollama.
+    #[test]
+    fn the_remedy_names_a_real_verb_and_the_shared_ollama_service() {
+        assert!(crate::usage::USAGE.iter().any(|(path, args, _)| *path == ["stack", "restart"] && args.contains("--force")));
+        assert!(crate::usage::USAGE.iter().any(|(path, _, _)| *path == ["config", "set"]), "the remedy writes compose_env with noo config set");
+        assert!(CPU_ONLY_SLOTS_REMEDY.starts_with("noo config set compose_env ") && CPU_ONLY_SLOTS_REMEDY.contains("noo stack restart --force ollama-embed"));
+        let compose = include_str!("../../../docker-compose.cluster.yml");
+        assert!(compose.contains("\n  ollama-embed:\n"), "the service the remedy restarts");
+        assert!(compose.contains("OLLAMA_NUM_PARALLEL=${OLLAMA_EMBED_NUM_PARALLEL:-4}"), "the key the row reads is the one compose reads");
     }
 }

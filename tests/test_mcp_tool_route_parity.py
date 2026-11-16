@@ -29,8 +29,13 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 GATEWAY = REPO / "gateway-rust/src"
 TOOL_DEFS = REPO / "src/noomesh/mcp/tool_defs"
 
-# Dispatched inside the gateway by name, never over HTTP: `NATIVE_TOOLS` in
-# gateway-rust/src/tools.rs. Their `path` is documentation.
+# Dispatched inside the MODEL'S OWN LOOP by name, never over HTTP:
+# `NATIVE_TOOLS` in gateway-rust/src/tools.rs. That is NOT true of the MCP
+# doors, which build every call from their manifest and proxy it by path
+# (`execute_spec`), natives included: `noo_tool_search` sat in this set while
+# the operator door 404'd on its path (`GET /api/tools/search`, 2026-11-15).
+# So this exemption covers the ToolDef registry only; a tool in a DOOR
+# manifest is held by `test_every_door_tool_is_a_route_or_answered_by_the_door`.
 NATIVE = {
     "noo_rag_query", "noo_memory_search", "noo_inference",
     "noo_channel_send", "noo_tool_search", "web_search", "python_tool",
@@ -118,3 +123,66 @@ def test_the_unrouted_list_only_shrinks():
             fixed.append(name)
     assert not fixed, f"now served — drop from UNROUTED: {fixed}"
     assert not gone, f"no longer declared — drop from UNROUTED: {gone}"
+
+
+GATEWAY_ROOT = REPO / "gateway-rust"
+# Each door: its manifest, the source whose `native_answer` answers its
+# native tools in process.
+DOORS = {
+    "operator": (GATEWAY_ROOT / "mcp-tools-local.json", GATEWAY / "mcp_local.rs"),
+    "user": (GATEWAY_ROOT / "mcp-tools.json", GATEWAY / "mcp_external.rs"),
+}
+
+
+def _native_answer_arms(src: pathlib.Path) -> set[str]:
+    """The tool names `async fn native_answer(` matches, from the door's
+    source (empty when the door has no such function)."""
+    txt = src.read_text(encoding="utf-8")
+    i = txt.find("async fn native_answer(")
+    if i < 0:
+        return set()
+    j = txt.find("\n}\n", i)
+    return set(re.findall(r'"([a-z0-9_]+)" =>', txt[i:j]))
+
+
+def test_every_door_tool_is_a_route_or_answered_by_the_door():
+    """The doors proxy every manifest tool to its `path`, so each one must be
+    a route the gateway serves, or marked `native` AND answered by that
+    door's `native_answer` (which the door runs before any self-call). No
+    allow-list: a door tool that 404s is a defect, whatever the loop does."""
+    import json
+
+    matchers = [_matcher(r) for r in _router_paths()]
+    bad = []
+    for door, (manifest, src) in DOORS.items():
+        arms = _native_answer_arms(src)
+        for t in json.loads(manifest.read_text())["tools"]:
+            if t.get("native"):
+                if t["name"] not in arms:
+                    bad.append(f"{door}: {t['name']} is native but {src.name} does not answer it")
+            elif not _served(t["path"], matchers):
+                bad.append(f"{door}: {t['name']} -> {t['method']} {t['path']} (no such route)")
+    assert not bad, "door tools that 404 through their door:\n  " + "\n  ".join(bad)
+
+
+def test_the_door_check_sees_both_doors_and_the_native_tool():
+    """Not vacuous: both manifests read, and the one native tool is found as
+    native and answered by the operator door."""
+    import json
+
+    local = json.loads(DOORS["operator"][0].read_text())["tools"]
+    assert len(local) > 100 and len(json.loads(DOORS["user"][0].read_text())["tools"]) > 20
+    assert [t["name"] for t in local if t.get("native")] == ["noo_tool_search"]
+    assert "noo_tool_search" in _native_answer_arms(DOORS["operator"][1])
+
+
+def test_every_native_tooldef_answers_in_process():
+    """A `native` ToolDef is never proxied by `dispatch`, so it must override
+    `run_local` (the standalone MCP server's in-process answer)."""
+    from noomesh.mcp.tool_models import ToolDef, _ensure_tool_defs_registered, _TOOL_REGISTRY
+
+    _ensure_tool_defs_registered()
+    natives = [c for c in _TOOL_REGISTRY.values() if getattr(c, "native", False)]
+    assert natives, "no native ToolDef found: the check would be vacuous"
+    for c in natives:
+        assert c.run_local is not ToolDef.run_local, f"{c.name} is native but has no run_local"

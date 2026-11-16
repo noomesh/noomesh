@@ -15,6 +15,20 @@ export interface TurnStats {
   iterations?: number;
   toolCalls?: number;
   cached?: boolean;
+  /**
+   * Why conversation recall was skipped this turn (cold or failed embedder),
+   * from the frame's `recall: {status: "skipped", reason}`. Absent when
+   * recall ran (`status: "ok"`) or was not needed: the answer was given
+   * without memory only when this is set.
+   */
+  recallSkipped?: string;
+  /**
+   * The backend cut the prompt (i802): it read only `evaluated` of about
+   * `sentEstimate` tokens in its `context`-token window, so the model
+   * answered without most of its instructions. From the frame's
+   * `truncated: true` + `truncation`.
+   */
+  truncated?: { sentEstimate: number; evaluated: number; context?: number };
 }
 
 /**
@@ -121,6 +135,11 @@ interface CoordFrame extends PhaseFrame {
   tokens_in?: number;
   tokens_out?: number;
   cached?: boolean;
+  // `done` — what the turn's conversation recall did.
+  recall?: { status?: string; hits?: number; reason?: string };
+  // `done` — the backend cut a call's prompt (i802).
+  truncated?: boolean;
+  truncation?: { sent_estimate?: number; evaluated?: number; context?: number };
 }
 
 /**
@@ -138,14 +157,29 @@ function readStats(f: CoordFrame): TurnStats | undefined {
     iterations: f.iterations,
     toolCalls: f.tool_calls,
     cached: f.cached,
+    recallSkipped:
+      f.recall?.status === 'skipped' ? f.recall.reason || 'no reason given' : undefined,
   };
+  if (f.truncated && f.truncation?.evaluated && f.truncation?.sent_estimate) {
+    stats.truncated = {
+      sentEstimate: f.truncation.sent_estimate,
+      evaluated: f.truncation.evaluated,
+      context: f.truncation.context,
+    };
+  }
   if (f.tokens_out && f.elapsed_seconds) {
     stats.tokensPerSec = Math.round(f.tokens_out / f.elapsed_seconds);
   }
   // Cache hits and the error path carry almost nothing — don't render an
   // empty footer for them.
   const meaningful =
-    stats.elapsedSeconds || stats.tokensOut || stats.tokensIn || stats.toolCalls || stats.cached;
+    stats.elapsedSeconds ||
+    stats.tokensOut ||
+    stats.tokensIn ||
+    stats.toolCalls ||
+    stats.cached ||
+    stats.recallSkipped ||
+    stats.truncated;
   return meaningful ? stats : undefined;
 }
 

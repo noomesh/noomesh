@@ -203,22 +203,9 @@ pub fn offboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // containers or volumes — already clean" while 16 containers ran, and
     // then removed the storage root and the install home from under them.
     // An unanswered docker is never "nothing there": stop before step 0.
-    let docker = match docker_access() {
+    let docker = match docker_gate(&mut LiveGate, "noo offboard") {
         Ok(d) => d,
-        Err(why) => {
-            // The one shell that can be fixed here (added to the docker group
-            // this session, i677 #10) is run again with the group; anything
-            // else is refused with nothing removed.
-            if let Some(code) = crate::docker_group::relaunch_if_needed(&why) {
-                return Ok(code);
-            }
-            let lines = docker_unreachable_refusal(&why, "noo offboard");
-            for l in &lines[1..] {
-                println!("{}", ui::note(l));
-            }
-            ui::close_failed(&lines[0], Some("docker ps"));
-            return Ok(1);
-        }
+        Err(code) => return Ok(code),
     };
     if docker == DockerAccess::NotInstalled {
         note("docker is not installed on this box: no stack container, volume or image can exist here");
@@ -286,54 +273,10 @@ pub fn offboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // ── 1. Stack: containers, volumes, networks ─────────────────────────
     let project = crate::envfile::compose_project();
     let cluster_net = crate::envfile::cluster_network();
-    let listed = if docker == DockerAccess::Reachable {
-        docker_list(&["ps", "-aq", "--filter", &format!("name={prefix}-")]).and_then(|c| {
-            stack_volumes(&project).and_then(|v| stack_networks(&project, &cluster_net).map(|n| (c, v, n)))
-        })
-    } else {
-        Ok((Vec::new(), Vec::new(), Vec::new()))
-    };
-    let (containers, volumes, networks) = match listed {
-        Ok(cvn) => cvn,
-        Err(why) => return Ok(stop_walk("the stack's containers, volumes and networks", &why)),
-    };
-    item("stack");
-    let anything = !containers.is_empty() || !volumes.is_empty() || !networks.is_empty();
-    if anything
-        && !(yes || ctx_confirm(g, false,
-            "STOP + DELETE the stack (containers, volumes = ALL DATA, networks) on this controller?", false))
-    {
-        sub(Glyph::Bullet, "kept (skipped)");
-    } else if anything {
-        if !containers.is_empty() {
-            run("docker", &[vec!["rm".into(), "-f".into()], containers.clone()].concat());
-        }
-        for v in &volumes {
-            run("docker", &["volume".into(), "rm".into(), "-f".into(), v.clone()]);
-        }
-        // Networks after the containers: a network with an attached
-        // container cannot be removed. This project's, by exact label, and
-        // the launcher's external cluster network by exact name (i677a:
-        // offboard said "complete" with four noomesh_* networks left).
-        for n in &networks {
-            run("docker", &["network".into(), "rm".into(), n.clone()]);
-        }
-        // Agreed to and attempted: whatever is still there is a FAILURE of
-        // this offboard, not a choice. It fails the walk below (i677a).
-        match stack_volumes(&project) {
-            Ok(left) => removal_failed.extend(left.into_iter().map(|v| format!("volume {v}"))),
-            Err(why) => removal_failed.push(format!("volumes (not re-checked: {why})")),
-        }
-        match stack_networks(&project, &cluster_net) {
-            Ok(left) => removal_failed.extend(left.into_iter().map(|n| format!("network {n}"))),
-            Err(why) => removal_failed.push(format!("networks (not re-checked: {why})")),
-        }
-        sub(Glyph::Ok, &format!("{} container(s), {} volume(s), {} network(s) removed", containers.len(), volumes.len(), networks.len()));
-    } else if docker == DockerAccess::NotInstalled {
-        sub(Glyph::Ok, "docker is not installed: no stack here");
-    } else {
-        // docker ANSWERED, and listed nothing: a positive "clean".
-        sub(Glyph::Ok, "no containers, volumes or networks — already clean");
+    let mut walk = LiveWalk { g, yes, project: &project, cluster_net: &cluster_net };
+    match stack_step(&mut walk, docker, &prefix) {
+        Ok(failed) => removal_failed.extend(failed),
+        Err(code) => return Ok(code),
     }
 
     // ── 1a. Pulled stack images (finding #85) ───────────────────────────
@@ -346,13 +289,9 @@ pub fn offboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // not a reference docker accepts — seven of nine rmi calls failed with
     // "invalid reference format" while this step reported all nine removed
     // (host8 offboard, 2026-09-07).
-    let image_lines = if docker == DockerAccess::Reachable {
-        match docker_list(&["images", "--format", "{{.Repository}}\t{{.ID}}"]) {
-            Ok(l) => l,
-            Err(why) => return Ok(stop_walk("the stack images", &why)),
-        }
-    } else {
-        Vec::new()
+    let image_lines = match stack_image_lines(&mut walk, docker) {
+        Ok(l) => l,
+        Err(code) => return Ok(code),
     };
     let stack_images: Vec<(String, String)> = image_lines
         .into_iter()
@@ -787,6 +726,176 @@ pub fn offboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ]);
     }
     Ok(0)
+}
+
+/// What the docker gate does to the machine; [`docker_gate`] holds the
+/// decision, so a test drives it with a fake.
+pub(crate) trait GateHost {
+    fn access(&mut self) -> Result<DockerAccess, String>;
+    /// Run this command again with the docker group when that is what fixes
+    /// it (added to the group this session, i677 #10): its exit code.
+    fn relaunch(&mut self, why: &str) -> Option<i32>;
+    /// Print a refusal: line 0 is the verdict, the rest the ways forward.
+    fn refuse(&mut self, lines: &[String]);
+}
+
+/// Docker must ANSWER before anything is stopped or removed (i677 #20):
+/// `Err(exit code)` when it does not, after the relaunch or the refusal.
+pub(crate) fn docker_gate(h: &mut impl GateHost, verb: &str) -> Result<DockerAccess, i32> {
+    match h.access() {
+        Ok(d) => Ok(d),
+        Err(why) => {
+            // The one shell that can be fixed here is run again with the
+            // group; anything else is refused with nothing removed.
+            if let Some(code) = h.relaunch(&why) {
+                return Err(code);
+            }
+            h.refuse(&docker_unreachable_refusal(&why, verb));
+            Err(1)
+        }
+    }
+}
+
+pub(crate) struct LiveGate;
+
+impl GateHost for LiveGate {
+    fn access(&mut self) -> Result<DockerAccess, String> {
+        docker_access()
+    }
+    fn relaunch(&mut self, why: &str) -> Option<i32> {
+        crate::docker_group::relaunch_if_needed(why)
+    }
+    fn refuse(&mut self, lines: &[String]) {
+        for l in &lines[1..] {
+            println!("{}", ui::note(l));
+        }
+        ui::close_failed(&lines[0], Some("docker ps"));
+    }
+}
+
+/// What the walk's stack and image steps do to the machine; [`stack_step`]
+/// and [`stack_image_lines`] hold every decision.
+trait StackHost {
+    /// One docker listing (`docker_list`).
+    fn list(&mut self, args: &[&str]) -> Result<Vec<String>, String>;
+    /// This project's volumes (`stack_volumes`).
+    fn volumes(&mut self) -> Result<Vec<String>, String>;
+    /// This project's networks and the cluster network (`stack_networks`).
+    fn networks(&mut self) -> Result<Vec<String>, String>;
+    /// `--yes`, or the user's answer to `q` (default no).
+    fn confirm(&mut self, q: &str) -> bool;
+    fn run(&mut self, cmd: &str, args: &[String]);
+    fn item(&mut self, label: &str);
+    fn sub(&mut self, g: Glyph, msg: &str);
+    /// docker stopped answering mid-walk: say so; the exit code.
+    fn stop_walk(&mut self, step: &str, why: &str) -> i32;
+}
+
+/// Step 1: list the stack, ask, remove, re-check. `Err(exit code)` when a
+/// listing did not answer (nothing from this step on is removed); else what
+/// the walk was asked to remove and could not.
+fn stack_step(h: &mut impl StackHost, docker: DockerAccess, prefix: &str) -> Result<Vec<String>, i32> {
+    let listed = if docker == DockerAccess::Reachable {
+        h.list(&["ps", "-aq", "--filter", &format!("name={prefix}-")])
+            .and_then(|c| h.volumes().and_then(|v| h.networks().map(|n| (c, v, n))))
+    } else {
+        Ok((Vec::new(), Vec::new(), Vec::new()))
+    };
+    let (containers, volumes, networks) = match listed {
+        Ok(cvn) => cvn,
+        Err(why) => return Err(h.stop_walk("the stack's containers, volumes and networks", &why)),
+    };
+    h.item("stack");
+    let mut removal_failed = Vec::new();
+    let anything = !containers.is_empty() || !volumes.is_empty() || !networks.is_empty();
+    if anything && !h.confirm("STOP + DELETE the stack (containers, volumes = ALL DATA, networks) on this controller?") {
+        h.sub(Glyph::Bullet, "kept (skipped)");
+    } else if anything {
+        if !containers.is_empty() {
+            h.run("docker", &[vec!["rm".into(), "-f".into()], containers.clone()].concat());
+        }
+        for v in &volumes {
+            h.run("docker", &["volume".into(), "rm".into(), "-f".into(), v.clone()]);
+        }
+        // Networks after the containers: a network with an attached
+        // container cannot be removed. This project's, by exact label, and
+        // the launcher's external cluster network by exact name (i677a:
+        // offboard said "complete" with four noomesh_* networks left).
+        for n in &networks {
+            h.run("docker", &["network".into(), "rm".into(), n.clone()]);
+        }
+        // Agreed to and attempted: whatever is still there is a FAILURE of
+        // this offboard, not a choice. It fails the walk (i677a).
+        removal_failed = recheck_after_removal(h.volumes(), h.networks());
+        h.sub(Glyph::Ok, &format!("{} container(s), {} volume(s), {} network(s) removed", containers.len(), volumes.len(), networks.len()));
+    } else if docker == DockerAccess::NotInstalled {
+        h.sub(Glyph::Ok, "docker is not installed: no stack here");
+    } else {
+        // docker ANSWERED, and listed nothing: a positive "clean".
+        h.sub(Glyph::Ok, "no containers, volumes or networks — already clean");
+    }
+    Ok(removal_failed)
+}
+
+/// The re-check after the stack's removal: what is still there, and a
+/// re-check that could not ask docker, are each a removal failure, never
+/// "nothing left".
+fn recheck_after_removal(vols: Result<Vec<String>, String>, nets: Result<Vec<String>, String>) -> Vec<String> {
+    let mut failed = Vec::new();
+    match vols {
+        Ok(left) => failed.extend(left.into_iter().map(|v| format!("volume {v}"))),
+        Err(why) => failed.push(format!("volumes (not re-checked: {why})")),
+    }
+    match nets {
+        Ok(left) => failed.extend(left.into_iter().map(|n| format!("network {n}"))),
+        Err(why) => failed.push(format!("networks (not re-checked: {why})")),
+    }
+    failed
+}
+
+/// Step 1a's listing: `Err(exit code)` when docker did not answer.
+fn stack_image_lines(h: &mut impl StackHost, docker: DockerAccess) -> Result<Vec<String>, i32> {
+    if docker != DockerAccess::Reachable {
+        return Ok(Vec::new());
+    }
+    match h.list(&["images", "--format", "{{.Repository}}\t{{.ID}}"]) {
+        Ok(l) => Ok(l),
+        Err(why) => Err(h.stop_walk("the stack images", &why)),
+    }
+}
+
+struct LiveWalk<'a> {
+    g: &'a Globals,
+    yes: bool,
+    project: &'a str,
+    cluster_net: &'a str,
+}
+
+impl StackHost for LiveWalk<'_> {
+    fn list(&mut self, args: &[&str]) -> Result<Vec<String>, String> {
+        docker_list(args)
+    }
+    fn volumes(&mut self) -> Result<Vec<String>, String> {
+        stack_volumes(self.project)
+    }
+    fn networks(&mut self) -> Result<Vec<String>, String> {
+        stack_networks(self.project, self.cluster_net)
+    }
+    fn confirm(&mut self, q: &str) -> bool {
+        self.yes || ctx_confirm(self.g, false, q, false)
+    }
+    fn run(&mut self, cmd: &str, args: &[String]) {
+        run(cmd, args);
+    }
+    fn item(&mut self, label: &str) {
+        item(label);
+    }
+    fn sub(&mut self, g: Glyph, msg: &str) {
+        sub(g, msg);
+    }
+    fn stop_walk(&mut self, step: &str, why: &str) -> i32 {
+        stop_walk(step, why)
+    }
 }
 
 /// Interactive yes/no with a scripted pre-answer: `preset` short-circuits
@@ -1280,22 +1389,23 @@ mod volume_selection_tests {
         let code = crate::test_src::own_code(include_str!("offboard.rs"));
         let audit = crate::test_src::fn_body(&code, "fn audit_leftovers(");
         assert!(audit.contains("Ok(DockerAccess::Reachable) => stack_volumes(&crate::envfile::compose_project()),"), "{audit}");
-        assert_eq!(code.matches("stack_volumes(&project)").count(), 2, "the removal and its re-check, nothing else");
+        // The removal's listing and its re-check both ask LiveWalk::volumes
+        // (stack_step calls it twice: stack_step_tests).
+        assert_eq!(code.matches("stack_volumes(self.project)").count(), 1, "the walk's one volume source");
+        assert_eq!(code.matches("stack_volumes(&project)").count(), 0, "nothing else lists the volumes");
         assert_eq!(code.matches("\"volume\", \"ls\"").count(), 1, "one volume listing, inside stack_volumes");
     }
 
-    /// Volumes the walk was asked to remove and that are still there fail it:
-    /// exit 1 before any "complete" line.
+    /// What the stack step could not remove fails the walk: exit 1 before
+    /// any "complete" line (the step itself: `stack_step_tests`).
     #[test]
-    fn a_volume_that_survives_its_removal_fails_the_walk() {
+    fn what_the_stack_step_could_not_remove_fails_the_walk() {
         let code = crate::test_src::own_code(include_str!("offboard.rs"));
         let walk = crate::test_src::fn_body(&code, "pub fn offboard(");
-        let recheck = walk
-            .find("Ok(left) => removal_failed.extend(left.into_iter().map(|v| format!(\"volume {v}\"))),")
-            .expect("the removal re-checks its own volumes");
+        let step = walk.find("Ok(failed) => removal_failed.extend(failed),").expect("the step's failures are kept");
         let fail = walk.find("if !removal_failed.is_empty() {").expect("the walk judges it");
         let complete = walk.find("ui::close_done(\"offboard complete\")").expect("the success line");
-        assert!(recheck < fail && fail < complete, "{walk}");
+        assert!(step < fail && fail < complete, "{walk}");
         let judged = &walk[fail..complete];
         assert!(judged.contains("ui::close_failed(") && judged.contains("return Ok(1);"), "{judged}");
     }
@@ -1356,21 +1466,26 @@ mod docker_gate_tests {
         assert!(rest.contains("`docker ps` works") && rest.contains("newgrp docker") && rest.contains("sudo noo offboard"), "{rest}");
     }
 
-    /// The gate runs before step 0 (stopping the daemons) and before any
-    /// removal, and refuses with exit 1; no call site can read a failed
-    /// docker as empty any more.
+    /// The gate runs before step 0 (stopping the daemons) and before the
+    /// stack step, and its refusal returns; no call site can read a failed
+    /// docker as empty any more. (What the gate decides: `stack_step_tests`.)
     #[test]
     fn the_walk_asks_docker_before_it_stops_or_removes_anything() {
         let code = crate::test_src::own_code(include_str!("offboard.rs"));
         assert!(!code.contains("docker_lines("), "the empty-on-failure helper is gone");
         let walk = crate::test_src::fn_body(&code, "pub fn offboard(");
-        let gate = walk.find("let docker = match docker_access() {").expect("the gate");
-        let refuse = walk[gate..].find("return Ok(1);").map(|i| i + gate).expect("it refuses");
+        let gate = walk.find("let docker = match docker_gate(&mut LiveGate, \"noo offboard\") {").expect("the gate");
+        let refuse = walk[gate..].find("Err(code) => return Ok(code),").map(|i| i + gate).expect("it refuses");
         let stop = walk.find("stop_self_heal_daemons(true);").expect("step 0");
+        let step = walk.find("match stack_step(&mut walk, docker, &prefix) {").expect("the stack step");
+        let images = walk.find("let image_lines = match stack_image_lines(&mut walk, docker) {").expect("the image listing");
         let first_rm = walk.find("run(\"docker\"").expect("a docker removal");
-        assert!(gate < refuse && refuse < stop && stop < first_rm, "{walk}");
-        assert!(walk.contains("Err(why) => return Ok(stop_walk(\"the stack's containers, volumes and networks\", &why)),"), "{walk}");
-        assert!(walk.contains("Err(why) => return Ok(stop_walk(\"the stack images\", &why)),"), "{walk}");
+        assert!(gate < refuse && refuse < stop && stop < step && step < images && images < first_rm, "{walk}");
+        for at in [step, images] {
+            let end = walk[at..].find("\n    }").expect("the match closes");
+            let arms = &walk[at..at + end];
+            assert!(arms.contains("Err(code) => return Ok(code),"), "each step's refusal returns: {arms}");
+        }
     }
 
     /// The audit marks what it could not read as a leftover ("not checked"),
@@ -1418,16 +1533,15 @@ mod network_selection_tests {
     }
 
     /// Networks are part of the one stack consent, removed after the
-    /// containers, re-checked like the volumes, and audited.
+    /// containers, re-checked like the volumes (the order and the survivor:
+    /// `stack_step_tests`), selected by label not name prefix, and audited.
     #[test]
-    fn networks_are_removed_after_the_containers_and_a_survivor_fails_the_walk() {
+    fn networks_are_selected_by_label_and_audited() {
         let code = crate::test_src::own_code(include_str!("offboard.rs"));
-        let walk = crate::test_src::fn_body(&code, "pub fn offboard(");
-        let rm_c = walk.find("run(\"docker\", &[vec![\"rm\".into(), \"-f\".into()], containers.clone()].concat());").expect("containers");
-        let rm_n = walk.find("run(\"docker\", &[\"network\".into(), \"rm\".into(), n.clone()]);").expect("networks");
-        let recheck = walk.find("Ok(left) => removal_failed.extend(left.into_iter().map(|n| format!(\"network {n}\"))),").expect("re-check");
-        assert!(rm_c < rm_n && rm_n < recheck, "{walk}");
-        assert!(!walk.contains("n.starts_with(&format!(\"{prefix}_\"))"), "no name prefix: {walk}");
+        for f in ["pub fn offboard(", "fn stack_step("] {
+            let body = crate::test_src::fn_body(&code, f);
+            assert!(!body.contains("n.starts_with(&format!(\"{prefix}_\"))"), "no name prefix: {body}");
+        }
         let audit = crate::test_src::fn_body(&code, "fn audit_leftovers(");
         assert!(audit.contains("item(\"stack networks (not checked)\", true,"), "{audit}");
     }
@@ -1495,5 +1609,201 @@ mod netns_unit_offboard_tests {
         assert!(walk.contains("crate::netns_unit::remove(unsafe { libc::isatty(0) } == 1)"), "{walk}");
         let audit = crate::test_src::fn_body(&own, "fn audit_leftovers(");
         assert!(audit.contains(r#"item("namespace restore unit", Path::new(crate::netns_unit::UNIT_PATH).is_file()"#), "{audit}");
+    }
+}
+
+#[cfg(test)]
+mod stack_step_tests {
+    use super::*;
+
+    /// A fake gate: docker's answer, and every effect.
+    struct FakeGate {
+        access: Result<DockerAccess, String>,
+        relaunch: Option<i32>,
+        refused: Vec<String>,
+        relaunched: u32,
+    }
+
+    impl GateHost for FakeGate {
+        fn access(&mut self) -> Result<DockerAccess, String> {
+            self.access.clone()
+        }
+        fn relaunch(&mut self, _why: &str) -> Option<i32> {
+            self.relaunched += 1;
+            self.relaunch
+        }
+        fn refuse(&mut self, lines: &[String]) {
+            self.refused.extend(lines.iter().cloned());
+        }
+    }
+
+    fn gate(access: Result<DockerAccess, String>, relaunch: Option<i32>) -> FakeGate {
+        FakeGate { access, relaunch, refused: Vec::new(), relaunched: 0 }
+    }
+
+    /// m1: a docker that does not answer is refused (exit 1, "nothing was
+    /// removed"), never read as "not installed".
+    #[test]
+    fn an_unanswered_docker_is_refused_never_read_as_absent() {
+        let mut h = gate(Err("permission denied while trying to connect".into()), None);
+        assert_eq!(docker_gate(&mut h, "noo offboard"), Err(1));
+        assert_eq!(h.refused[0], "cannot reach docker (permission denied while trying to connect): nothing was removed");
+        assert!(h.refused.iter().any(|l| l.contains("sudo noo offboard")), "{:?}", h.refused);
+        // The one shell that can be fixed is run again; its exit is the walk's.
+        let mut h = gate(Err("permission denied".into()), Some(0));
+        assert_eq!((docker_gate(&mut h, "noo offboard"), h.refused.len()), (Err(0), 0));
+        // An answer passes, and so does no docker at all.
+        for d in [DockerAccess::Reachable, DockerAccess::NotInstalled] {
+            let mut h = gate(Ok(d), None);
+            assert_eq!((docker_gate(&mut h, "noo offboard"), h.relaunched, h.refused.len()), (Ok(d), 0, 0));
+        }
+    }
+
+    /// A fake stack: what each docker listing answers (in call order), the
+    /// user's answer, and every effect.
+    #[derive(Default)]
+    struct FakeStack {
+        containers: Option<Result<Vec<String>, String>>,
+        images: Option<Result<Vec<String>, String>>,
+        volumes: Vec<Result<Vec<String>, String>>,
+        networks: Vec<Result<Vec<String>, String>>,
+        declines: bool,
+        asked: u32,
+        ran: Vec<Vec<String>>,
+        said: Vec<String>,
+        stopped: Vec<String>,
+    }
+
+    impl StackHost for FakeStack {
+        fn list(&mut self, args: &[&str]) -> Result<Vec<String>, String> {
+            match args.first() {
+                Some(&"ps") => self.containers.clone().unwrap_or(Ok(Vec::new())),
+                Some(&"images") => self.images.clone().unwrap_or(Ok(Vec::new())),
+                other => panic!("unexpected listing {other:?}"),
+            }
+        }
+        fn volumes(&mut self) -> Result<Vec<String>, String> {
+            if self.volumes.is_empty() { Ok(Vec::new()) } else { self.volumes.remove(0) }
+        }
+        fn networks(&mut self) -> Result<Vec<String>, String> {
+            if self.networks.is_empty() { Ok(Vec::new()) } else { self.networks.remove(0) }
+        }
+        fn confirm(&mut self, _q: &str) -> bool {
+            self.asked += 1;
+            !self.declines
+        }
+        fn run(&mut self, cmd: &str, args: &[String]) {
+            self.ran.push([vec![cmd.to_string()], args.to_vec()].concat());
+        }
+        fn item(&mut self, label: &str) {
+            self.said.push(format!("item {label}"));
+        }
+        fn sub(&mut self, _g: Glyph, msg: &str) {
+            self.said.push(msg.to_string());
+        }
+        fn stop_walk(&mut self, step: &str, why: &str) -> i32 {
+            self.stopped.push(format!("{step}: {why}"));
+            1
+        }
+    }
+
+    fn names(v: &[&str]) -> Result<Vec<String>, String> {
+        Ok(v.iter().map(|s| s.to_string()).collect())
+    }
+
+    fn a_stack() -> FakeStack {
+        FakeStack {
+            containers: Some(names(&["c1"])),
+            volumes: vec![names(&["noomesh_noo-data"])],
+            networks: vec![names(&["noomesh_default"])],
+            ..Default::default()
+        }
+    }
+
+    /// m2: a listing docker did not answer stops the walk before anything
+    /// of this step is asked or removed; it is never read as "nothing there".
+    #[test]
+    fn an_unanswered_stack_listing_stops_the_walk_before_any_removal() {
+        for broken in ["containers", "volumes", "networks"] {
+            let mut h = a_stack();
+            let err = || Err::<Vec<String>, String>("permission denied".into());
+            match broken {
+                "containers" => h.containers = Some(err()),
+                "volumes" => h.volumes = vec![err()],
+                _ => h.networks = vec![err()],
+            }
+            assert_eq!(stack_step(&mut h, DockerAccess::Reachable, "noo"), Err(1), "{broken}");
+            assert_eq!(h.stopped, ["the stack's containers, volumes and networks: permission denied"], "{broken}");
+            assert_eq!((h.asked, h.ran.len(), h.said.len()), (0, 0, 0), "{broken}: nothing asked, run or said");
+        }
+    }
+
+    /// m3: the same for the image listing.
+    #[test]
+    fn an_unanswered_image_listing_stops_the_walk() {
+        let mut h = FakeStack { images: Some(Err("permission denied".into())), ..Default::default() };
+        assert_eq!(stack_image_lines(&mut h, DockerAccess::Reachable), Err(1));
+        assert_eq!(h.stopped, ["the stack images: permission denied"]);
+        let mut h = FakeStack { images: Some(names(&["ghcr.io/noomesh/gateway\tsha256:1"])), ..Default::default() };
+        assert_eq!(stack_image_lines(&mut h, DockerAccess::Reachable), Ok(vec!["ghcr.io/noomesh/gateway\tsha256:1".to_string()]));
+        // No docker at all: nothing is listed and nothing stops.
+        let mut h = FakeStack { images: Some(Err("unreachable".into())), ..Default::default() };
+        assert_eq!((stack_image_lines(&mut h, DockerAccess::NotInstalled), h.stopped.len()), (Ok(Vec::new()), 0));
+    }
+
+    /// The agreed removal, then a re-check that finds the stack gone: no
+    /// failure. Containers first, then volumes, then networks.
+    #[test]
+    fn a_removed_stack_rechecks_clean() {
+        let mut h = a_stack();
+        h.volumes.push(names(&[]));
+        h.networks.push(names(&[]));
+        assert_eq!(stack_step(&mut h, DockerAccess::Reachable, "noo"), Ok(vec![]));
+        assert_eq!(h.asked, 1);
+        let ran: Vec<String> = h.ran.iter().map(|r| r.join(" ")).collect();
+        assert_eq!(ran, ["docker rm -f c1", "docker volume rm -f noomesh_noo-data", "docker network rm noomesh_default"]);
+    }
+
+    /// What is still there after its removal fails the walk.
+    #[test]
+    fn a_volume_that_survives_its_removal_fails_the_walk() {
+        let mut h = a_stack();
+        h.volumes.push(names(&["noomesh_noo-data"]));
+        h.networks.push(names(&["noomesh_default"]));
+        assert_eq!(stack_step(&mut h, DockerAccess::Reachable, "noo"), Ok(vec!["volume noomesh_noo-data".into(), "network noomesh_default".into()]));
+    }
+
+    /// m8: a volume re-check that cannot ask docker is a removal FAILURE,
+    /// never "nothing left".
+    #[test]
+    fn a_volume_recheck_that_cannot_ask_docker_fails_the_walk() {
+        let mut h = a_stack();
+        h.volumes.push(Err("permission denied".into()));
+        h.networks.push(names(&[]));
+        assert_eq!(stack_step(&mut h, DockerAccess::Reachable, "noo"), Ok(vec!["volumes (not re-checked: permission denied)".into()]));
+    }
+
+    /// m9: the same for the network re-check.
+    #[test]
+    fn a_network_recheck_that_cannot_ask_docker_fails_the_walk() {
+        let mut h = a_stack();
+        h.volumes.push(names(&[]));
+        h.networks.push(Err("permission denied".into()));
+        assert_eq!(stack_step(&mut h, DockerAccess::Reachable, "noo"), Ok(vec!["networks (not re-checked: permission denied)".into()]));
+    }
+
+    /// A declined prompt removes nothing; an answered empty listing is a
+    /// positive "clean"; no docker at all lists nothing.
+    #[test]
+    fn declined_clean_and_absent_remove_nothing() {
+        let mut h = FakeStack { declines: true, ..a_stack() };
+        assert_eq!(stack_step(&mut h, DockerAccess::Reachable, "noo"), Ok(vec![]));
+        assert_eq!((h.ran.len(), h.said.last().map(String::as_str)), (0, Some("kept (skipped)")));
+        let mut h = FakeStack::default();
+        assert_eq!(stack_step(&mut h, DockerAccess::Reachable, "noo"), Ok(vec![]));
+        assert_eq!((h.asked, h.said.last().map(String::as_str)), (0, Some("no containers, volumes or networks — already clean")));
+        let mut h = FakeStack { containers: Some(Err("unreachable".into())), ..Default::default() };
+        assert_eq!(stack_step(&mut h, DockerAccess::NotInstalled, "noo"), Ok(vec![]));
+        assert_eq!(h.said.last().map(String::as_str), Some("docker is not installed: no stack here"));
     }
 }

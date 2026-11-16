@@ -100,6 +100,82 @@ fn installed_version(exe: &str) -> Option<String> {
 /// which onboard always writes. install.md says the same ("git only for a
 /// contributor checkout"); requiring it everywhere stopped a stranger's
 /// install at "git: MISSING" (i677).
+/// A page of the public repo's docs, by its path under `docs/`: a box with no
+/// checkout has no `docs/` to open (i677 #7). The repo comes from its one
+/// home, crate::registry::RELEASE_REPO.
+pub(crate) fn docs_url(path: &str) -> String {
+    format!("https://github.com/{}/blob/main/docs/{path}", crate::registry::RELEASE_REPO)
+}
+
+/// What a non-apt box with no Docker is told (i677 #8). Pure.
+pub(crate) fn non_apt_docker_remedy() -> String {
+    format!(
+        "No installer for this distro here: install Docker Engine with the Compose v2 plugin \
+         (https://docs.docker.com/engine/install/), start it, then run noo onboard again. \
+         Requirements: {}",
+        docs_url("getting-started/install.md")
+    )
+}
+
+/// The Docker-daemon row when `docker info` fails: (the row, the one remedy
+/// line). Docker installed but unreachable is one of two things: the daemon
+/// is not running, or it is and this user may not use it. Pure (i677 #8).
+pub(crate) fn docker_daemon_remedy(info_out: &str, macos: bool, systemd: bool) -> (String, &'static str) {
+    if info_out.to_lowercase().contains("permission denied") {
+        return (
+            "Docker daemon: running, but this user may not use it".to_string(),
+            "Add yourself to the docker group: sudo usermod -aG docker $USER, then log out and back in \
+             (or run newgrp docker). Check: docker info",
+        );
+    }
+    let remedy = if macos {
+        "Start Docker Desktop (or your Docker engine), wait until it says running, then check: docker info"
+    } else if systemd {
+        "Start it: sudo systemctl start docker (sudo systemctl enable --now docker also starts it at boot). Check: docker info"
+    } else {
+        "Start it: sudo service docker start (WSL2 and hosts without systemd). Check: docker info"
+    };
+    ("Docker daemon: NOT RUNNING".to_string(), remedy)
+}
+
+/// The Tailscale question's two answers, one line each (operator, 2026-11-14).
+pub(crate) const TAILSCALE_YES: &str =
+    "install Tailscale and put this machine on your tailnet (other devices reach it by name; a login link follows)";
+pub(crate) const TAILSCALE_JOIN_YES: &str =
+    "put this machine on your tailnet (other devices reach it by name; a login link follows)";
+pub(crate) const TAILSCALE_NO: &str =
+    "LAN-only: the dashboard is on https://localhost:8080 here and on your local network; add Tailscale any time later";
+pub(crate) const LAN_ONLY_CHOSEN: &str =
+    "LAN-only install, as chosen. To add Tailscale later: install it, run `tailscale up`, then `noo onboard --reconfigure`.";
+
+pub(crate) const NON_INTERACTIVE_LAN_ONLY: &str =
+    "No Tailscale here: continuing as a LAN-only install. --skip-tailscale says so explicitly; \
+     to join a tailnet instead, install Tailscale and run `tailscale up` before onboarding.";
+
+/// y/yes -> true, n/no -> false, anything else (Enter included) -> None. Pure.
+pub(crate) fn parse_yes_no(answer: &str) -> Option<bool> {
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Some(true),
+        "n" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// A yes/no question with NO default: the two answers are explained first,
+/// and only a typed y or n leaves the loop; Enter asks again.
+fn ask_yes_no_no_default(ctx: &mut Ctx, question: &str, yes: &str, no: &str) -> bool {
+    ctx.raw(&format!("    y: {yes}"));
+    ctx.raw(&format!("    n: {no}"));
+    let label = format!("{question} [y/n]");
+    loop {
+        let answer = ctx.asker.ask(&Prompt::new(&label).required());
+        match parse_yes_no(&answer) {
+            Some(b) => return b,
+            None => ctx.warn("Type y or n (there is no default here)."),
+        }
+    }
+}
+
 fn required_tools(in_checkout: bool) -> Vec<(&'static str, &'static str)> {
     let mut tools = vec![("docker", "Runs all Noomesh services")];
     if in_checkout {
@@ -260,6 +336,15 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
         }
     }
 
+    // i677 #8: on a distro without apt the wizard offers no install, and the
+    // "docker: MISSING" row was all a stranger got. Say what to install and
+    // where the steps are.
+    if docker_missing && tool_version("docker").is_none()
+        && !Command::new("apt-get").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+    {
+        ctx.error(&format!("  {}", non_apt_docker_remedy()));
+    }
+
     // Compose v2 is a prerequisite of its own: Ubuntu's `docker.io` ships
     // WITHOUT it (separate `docker-compose-v2` package), and step 7's launcher
     // runs `docker compose …` for everything. Failure semantics:
@@ -281,11 +366,21 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
     }
 
     ctx.progress("Checking Docker daemon...");
-    if sh::docker_daemon_running() {
+    let (info_rc, info_out) = sh::docker(&["info"]);
+    if info_rc == 0 {
         ctx.success("Docker daemon: running");
-    } else {
-        ctx.error("Docker daemon: NOT RUNNING — start Docker first");
+    } else if tool_version("docker").is_some() {
+        // i677 #8: this was "NOT RUNNING — start Docker first" with no way on.
+        let (head, remedy) = docker_daemon_remedy(
+            &info_out,
+            cfg!(target_os = "macos"),
+            std::path::Path::new("/run/systemd/system").exists(),
+        );
+        ctx.error(&head);
+        ctx.error(&format!("  {remedy}"));
         all_ok = false;
+    } else {
+        all_ok = false; // the docker row above already failed, with its remedy
     }
 
     ctx.progress("Checking Docker Hub login...");
@@ -340,6 +435,7 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
         }
         util::GpuDetect::None => {
             ctx.state.tier = 3;
+            ctx.state.cpu_only = true;
             ctx.warn("GPU: none detected — CPU-only (Tier 3)");
         }
     }
@@ -392,7 +488,7 @@ systemctl restart docker"#;
 
     // Security readiness (informational)
     let ca = ctx.pki_dir.join("ca.crt").exists() && ctx.pki_dir.join("ca.key").exists();
-    ctx.info(if ca { "PKI certs: CA present" } else { "PKI certs: not yet (Step 3)" });
+    ctx.info(if ca { "PKI certs: CA present" } else { "PKI certs: not yet (Step 5)" });
     let n_secrets = SECRETS
         .iter()
         .filter(|(_, env_var)| ctx.secret_present(env_var))
@@ -621,6 +717,23 @@ pub(crate) fn keep_llm_preference_hint(value: &str) -> Option<String> {
     Some(format!("noo cluster prefer knowledge {v}"))
 }
 
+/// The `compose_env` key (noomesh.yaml, the launcher's home for a deployment
+/// knob; a `.env` copy would shadow it) the environment step seeds on a NEW
+/// CPU-only install (i802): `OLLAMA_EMBED_NUM_PARALLEL=1`. The stack's shared
+/// Ollama (`ollama-embed`) otherwise runs 4 slots: on a 4-core CPU one slot
+/// prefills about 3x faster (fa, run 43628426011: ~370 against ~125 tok/s)
+/// and saves cache, with no embedding loss (run 43622936679). `None` on a GPU or a busy-GPU box, on
+/// an install this step already configured (its `.env` carries `NODE_ID`,
+/// which this step always writes) and whenever the key is already set: an
+/// existing install is never rewritten. Pure.
+pub(crate) fn cpu_only_embed_parallel(
+    cpu_only: bool,
+    existing: &std::collections::BTreeMap<String, String>,
+) -> Option<(&'static str, &'static str)> {
+    let new_install = !existing.contains_key("NODE_ID");
+    (cpu_only && new_install && !existing.contains_key("OLLAMA_EMBED_NUM_PARALLEL")).then_some(("OLLAMA_EMBED_NUM_PARALLEL", "1"))
+}
+
 pub fn environment(ctx: &mut Ctx) {
     // Before the read: a removal must not be written straight back by the merge below.
     offer_retired_env_keys(ctx);
@@ -665,7 +778,7 @@ pub fn environment(ctx: &mut Ctx) {
                 .default(if get("NODE_ID").is_empty() { hostname.clone() } else { get("NODE_ID") }),
         );
         node_ip = ctx.asker.ask(
-            &Prompt::new("Node IP (auto-corrected to the tailnet address after Step 3's join)")
+            &Prompt::new("Node IP (auto-corrected to the tailnet address after the Tailscale step's join)")
                 .default(if get("NODE_IP").is_empty() { detect_ip_env() } else { get("NODE_IP") }),
         );
         controller_url = if mode == "worker" {
@@ -795,6 +908,9 @@ The default is right (press enter)")
     if mode == "worker" && !controller_url.is_empty() {
         set(&mut merged, &mut merged_order, "CONTROLLER_URL", controller_url.clone());
     }
+    // i802: one Ollama slot on a NEW CPU-only install, written to
+    // compose_env once noomesh.yaml exists (below); never over a value.
+    let embed_slots = cpu_only_embed_parallel(ctx.state.cpu_only, &existing);
     // Provider keys are SECRETS: they never enter the .env body written
     // below. On an install already on the encrypted store they go straight
     // into it (after the write, so the whole-file write cannot race it);
@@ -846,6 +962,9 @@ The default is right (press enter)")
         // seed, which are precisely the ones they would want to check.
         apply_topology_env(ctx);
         ensure_mesh_yaml(ctx);
+        if let Some((k, v)) = embed_slots {
+            ctx.dry(&format!("set compose_env {k}={v} in noomesh.yaml (one Ollama slot on this CPU-only box)"));
+        }
         return;
     }
     if let Err(e) = std::fs::write(&ctx.env_path, body) {
@@ -865,6 +984,12 @@ The default is right (press enter)")
     ctx.warn_sops_once();
 
     ensure_mesh_yaml(ctx);
+    if let Some((k, v)) = embed_slots {
+        if yamlcfg::read_yaml_compose_env(ctx, k).is_none() {
+            yamlcfg::update_yaml_compose_env(ctx, &[(k.to_string(), v.to_string())]);
+            ctx.info("Ollama runs one slot on this CPU-only box (noomesh.yaml compose_env): one slot prefills about 3x faster here");
+        }
+    }
 }
 
 /// noomesh.yaml is gitignored operator config but three services
@@ -1287,12 +1412,26 @@ pub fn tailscale(ctx: &mut Ctx) -> bool {
     // path. This used to dead-end into "set it up later and re-run
     // 'noo onboard --reconfigure'"; the wizard can do both steps itself.
     let can_remediate = !ctx.non_interactive && !ctx.dry_run;
+    let mut install_tailscale_now = false;
 
-    if !installed && can_remediate
-        && ctx.asker.confirm(
+    // Operator, 2026-11-14: on a single machine the Tailscale question has NO
+    // default. Enter used to install Tailscale and send a one-box stranger to
+    // a login page (i677 #2); now Enter asks again, and y and n are each
+    // explained in one line. A typed n is a LAN-only install, said once.
+    let mut chose_lan_only = false;
+    if !installed && can_remediate {
+        if ask_yes_no_no_default(
+            ctx,
             "Tailscale is not installed. Install it now (official installer, may prompt for sudo)?",
-            true,
-        )
+            TAILSCALE_YES,
+            TAILSCALE_NO,
+        ) {
+            install_tailscale_now = true;
+        } else {
+            chose_lan_only = true;
+        }
+    }
+    if install_tailscale_now
     {
         // Downloaded to a file, checked, digest printed, then run — never
         // piped into a shell. See crate::vendor.
@@ -1368,13 +1507,15 @@ pub fn tailscale(ctx: &mut Ctx) -> bool {
         // noomesh never uses Tailscale SSH; the box joins with it off.
         argv.push("--ssh=false".into());
         let up_cmd = argv.join(" ");
-        if ctx.asker.confirm(
-            &format!(
-                "Join your tailnet now? (runs `{up_cmd}`; opens a login link where you \
-                 can also CREATE a free account)"
-            ),
-            true,
-        ) {
+        let join_question = format!(
+            "Join your tailnet now? (runs `{up_cmd}`; opens a login link where you \
+             can also CREATE a free account)"
+        );
+        let join = ask_yes_no_no_default(ctx, &join_question, TAILSCALE_JOIN_YES, TAILSCALE_NO);
+        if !join {
+            chose_lan_only = true;
+        }
+        if join {
             let mut result = ctx.ui.run_inherited(&argv);
             if controller_tag && matches!(result, Some(c) if c != 0) {
                 // The login identity is not a tag owner (non-admin account):
@@ -1400,6 +1541,18 @@ pub fn tailscale(ctx: &mut Ctx) -> bool {
 
     let (dns, ip) = match identity {
         Ok(pair) => pair,
+        Err(_) if chose_lan_only => {
+            // The answer was n: a decision, not a failure.
+            ctx.info(LAN_ONLY_CHOSEN);
+            return true;
+        }
+        Err(_) if ctx.non_interactive => {
+            // --ci never installs or joins Tailscale: no tailnet here is the
+            // expected case, said once as what happens and which flag says it
+            // (general 11-14: nothing that runs --ci today breaks).
+            ctx.info(NON_INTERACTIVE_LAN_ONLY);
+            return true;
+        }
         Err(why) => {
             ctx.error(&format!("Tailscale unavailable: {why}"));
             ctx.raw("    Without Tailscale, the dashboard is reachable only on this machine /");
@@ -2251,13 +2404,13 @@ pub fn secrets_setup(ctx: &mut Ctx) -> bool {
 /// the key. Those frontends, and `--non-interactive`, get the command to run
 /// later instead, which is the same command and the same guard.
 fn hand_over_backup_passphrases(ctx: &mut Ctx, minted: &[(&str, String)]) {
-    ctx.warn(
+    ctx.warn(&format!(
         "Backup passphrases generated. NOO_AGE_BACKUP_PASSPHRASE is the key to the key: it \
          protects the age private key that opens EVERY other secret, and it is itself stored in \
          env.sops, which that same age key decrypts. On this box that is fine; once this box is \
-         gone it is worthless. It is NOT written to any file — see \
-         docs/operating/runbooks/backup-restore-secrets.md.",
-    );
+         gone it is worthless. It is NOT written to any file — see {}",
+        docs_url("operating/runbooks/backup-restore-secrets.md")
+    ));
 
     // Deliberately NOT `.all(..)`: `all` short-circuits, and a frontend that
     // refused the FIRST value would silently skip the second. Both passphrases
@@ -4301,7 +4454,8 @@ pub(crate) fn intended_owner(name: &str, base: &Path) -> std::io::Result<Owner> 
 /// scripts/prep-host.sh gives both to `noo-agent`, the one owner it still
 /// re-owns an existing directory to.
 pub(crate) fn agent_subdir(name: &str) -> bool {
-    matches!(name, "models" | "hf-cache")
+    // hf-cache/hub is owned like hf-cache: it is where the backends write.
+    matches!(name, "models" | "hf-cache" | "hf-cache/hub")
 }
 
 /// The `noo-agent` account's (uid, primary gid), when this host has it
@@ -6060,16 +6214,33 @@ fn fix_volume_mismatches(ctx: &Ctx) {
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
     };
+    reap_volumes(&mut LiveReaper { ctx }, reaper_decisions(&expected, &existing, &inspect));
+}
+
+/// What the volume reaper does to the machine; [`reap_volumes`] holds every
+/// decision, so a test drives it with a fake.
+trait VolumeReaper {
+    fn warn(&mut self, line: &str);
+    fn info(&mut self, line: &str);
+    /// `docker volume rm -f <vol>`; true when docker removed it.
+    fn remove(&mut self, vol: &str) -> bool;
+}
+
+/// The reaper's removals, from [`reaper_decisions`]' output alone: only a
+/// stale bind RECORD is removed, and said before it goes. An unbound volume
+/// holds its data inside docker and a volume docker would not describe was
+/// never checked: both are kept (i677 #20). Returns how many went.
+fn reap_volumes(h: &mut impl VolumeReaper, decisions: Vec<(String, String, Option<String>, VolumeMismatch)>) -> usize {
     let mut removed = 0usize;
-    for (vol, want_device, recorded, action) in reaper_decisions(&expected, &existing, &inspect) {
+    for (vol, want_device, recorded, action) in decisions {
         match action {
             VolumeMismatch::Keep => continue,
             VolumeMismatch::NotChecked => {
-                ctx.warn(&format!("volume {vol}: docker inspect did not answer; left as it is (not checked)"));
+                h.warn(&format!("volume {vol}: docker inspect did not answer; left as it is (not checked)"));
                 continue;
             }
             VolumeMismatch::UnboundHoldsData => {
-                ctx.warn(&format!(
+                h.warn(&format!(
                     "volume {vol} is not bound to {want_device}: its data lives inside docker, so it is NOT removed \
                      (moving it into the data root is a separate step; `noo cluster verify` names it)"
                 ));
@@ -6079,23 +6250,39 @@ fn fix_volume_mismatches(ctx: &Ctx) {
         }
         // Said BEFORE it happens: only a stale bind RECORD goes; its data
         // stays on the host at the old path (i677 #20).
-        ctx.info(&format!(
+        h.info(&format!(
             "Removing the stale record of volume {vol} (bound to {}, compose now binds {want_device}); its data stays on the host there",
             recorded.as_deref().unwrap_or("?")
         ));
-        let ok = Command::new("docker")
-            .args(["volume", "rm", "-f", &vol])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if ok {
+        if h.remove(&vol) {
             removed += 1;
         }
     }
     if removed > 0 {
-        ctx.info(&format!(
+        h.info(&format!(
             "Removed {removed} stale Docker volume(s) (config doesn't match current NOO_DATA_ROOT)"
         ));
+    }
+    removed
+}
+
+struct LiveReaper<'a, 'c> {
+    ctx: &'a Ctx<'c>,
+}
+
+impl VolumeReaper for LiveReaper<'_, '_> {
+    fn warn(&mut self, line: &str) {
+        self.ctx.warn(line);
+    }
+    fn info(&mut self, line: &str) {
+        self.ctx.info(line);
+    }
+    fn remove(&mut self, vol: &str) -> bool {
+        Command::new("docker")
+            .args(["volume", "rm", "-f", vol])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     }
 }
 
@@ -6673,6 +6860,41 @@ fn default_ollama_pick(
     }
 }
 
+/// Headroom a CPU-only box keeps free beside its chat model.
+const CPU_MODEL_HEADROOM_BYTES: u64 = 1_500_000_000;
+
+/// MemAvailable from /proc/meminfo, in bytes; None where there is none.
+fn mem_available_bytes() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    parse_mem_available(&text)
+}
+
+/// The `MemAvailable:` line of /proc/meminfo (kB), in bytes. Pure.
+pub(crate) fn parse_mem_available(meminfo: &str) -> Option<u64> {
+    meminfo.lines().find_map(|l| {
+        let rest = l.strip_prefix("MemAvailable:")?;
+        rest.trim().strip_suffix("kB")?.trim().parse::<u64>().ok().map(|kb| kb * 1024)
+    })
+}
+
+/// What a CPU-only box can give a model: free memory less the headroom.
+/// None when the free memory is unknown (the size is then not judged). Pure.
+pub(crate) fn cpu_model_budget(mem_available: Option<u64>) -> Option<u64> {
+    mem_available.map(|m| m.saturating_sub(CPU_MODEL_HEADROOM_BYTES))
+}
+
+/// The one line when no verified model fits a CPU-only box, or None when the
+/// pick fits (or its size is unknown: never refuse on a guess). Pure.
+pub(crate) fn no_model_fits_line(pick: &str, pick_bytes: Option<u64>, budget: u64) -> Option<String> {
+    let bytes = pick_bytes?;
+    (bytes > budget).then(|| format!(
+        "No chat model fits this box: {:.1} GB of memory is free for one, and the smallest recommended ({pick}) needs {:.1} GB. \
+         Free memory or add RAM, then run: noo onboard --only model",
+        budget as f64 / 1e9,
+        bytes as f64 / 1e9
+    ))
+}
+
 pub fn first_model(ctx: &mut Ctx) {
     // `--only model` skips the prereqs step, so the GPU tier was never
     // detected and the recommendations said "Tier 0" (2026-09-01). The
@@ -6830,16 +7052,31 @@ pub fn first_model(ctx: &mut Ctx) {
             // (or its size cannot be read — do not hide it on a guess); on
             // a box it does not fit, the first verified pick is the default
             // and the line says why.
-            let budget = crate::catalog::ollama_fit_budget_bytes(ctx.state.vram_gb);
-            let bytes = if ctx.state.vram_gb > 0.5 && !ctx.dry_run {
+            // i677 #6: with no GPU the size was never read, so a 4 GB box got
+            // the 7.2 GB default. A CPU-only box's budget is the memory it has
+            // free NOW (the stack is already up) less a fixed headroom.
+            let cpu_only = ctx.state.vram_gb <= 0.5;
+            let cpu_budget = if cpu_only { cpu_model_budget(mem_available_bytes()) } else { None };
+            let budget = cpu_budget.unwrap_or_else(|| crate::catalog::ollama_fit_budget_bytes(ctx.state.vram_gb));
+            let size_known_budget = !cpu_only || cpu_budget.is_some();
+            let bytes = if size_known_budget && !ctx.dry_run {
                 crate::catalog::ollama_download_bytes(PRODUCT_DEFAULT_MODEL, 8)
             } else {
                 None
             };
-            match default_ollama_pick(PRODUCT_DEFAULT_MODEL, bytes, budget, &starters) {
-                (name, Some(why)) => { default_note = Some(why); name }
-                (name, None) => name,
+            let (name, why) = default_ollama_pick(PRODUCT_DEFAULT_MODEL, bytes, budget, &starters);
+            if let Some(why) = why {
+                default_note = Some(why);
             }
+            // Not even the first verified pick fits: say so plainly and pull nothing.
+            if let Some(cpu) = cpu_budget {
+                let pick_bytes = if ctx.dry_run { None } else { crate::catalog::ollama_download_bytes(&name, 8) };
+                if let Some(line) = no_model_fits_line(&name, pick_bytes, cpu) {
+                    ctx.warn(&line);
+                    return;
+                }
+            }
+            name
         }
     } else {
         starters.first().map(|s| s.0.clone()).unwrap_or_default()
@@ -7052,6 +7289,15 @@ pub(crate) fn place_args(node: &str, model: &str) -> Vec<String> {
     ["cluster", "place", node, "ollama", model].iter().map(|s| s.to_string()).collect()
 }
 
+/// The tuning lines of `noo cluster place`'s output (`KEY=VALUE  why`), for
+/// onboarding to show instead of swallowing them.
+pub(crate) fn tuned_lines(out: &str) -> Vec<String> {
+    out.lines()
+        .map(|l| crate::ui::plain(l).trim().to_string())
+        .filter(|l| l.starts_with("OLLAMA_CONTEXT_LENGTH=") || l.starts_with("OLLAMA_NUM_PARALLEL="))
+        .collect()
+}
+
 /// Declare the self node's ollama chat placement for the model this run
 /// pulled, through `noo cluster place`, unless one already exists (a
 /// re-onboard never overrides the operator's choice).
@@ -7085,7 +7331,15 @@ fn place_pulled_model(ctx: &mut Ctx, model: &str) {
     let args = place_args(&node, model);
     ctx.progress(&format!("Placing {model} on {node}'s ollama (noo cluster place {node} ollama {model})..."));
     match Command::new(&exe).args(&args).output() {
-        Ok(o) if o.status.success() => ctx.success(&format!("Placed: {node} ollama {model} (chat)")),
+        Ok(o) if o.status.success() => {
+            ctx.success(&format!("Placed: {node} ollama {model} (chat)"));
+            // What place tuned and why ("OLLAMA_CONTEXT_LENGTH=32768  half of
+            // the 6.4 GB left after the declared models, ..."): the answer to
+            // "why is my model at 16k", said where the person is looking.
+            for line in tuned_lines(&String::from_utf8_lossy(&o.stdout)) {
+                ctx.info(&line);
+            }
+        }
         Ok(o) => ctx.warn(&format!(
             "noo cluster place {node} ollama {model} exited {}: {} — run it again once the cause is fixed",
             o.status.code().unwrap_or(1),
@@ -7782,6 +8036,100 @@ fn now_ts() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// What the monitoring question does on this run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MonitoringPlan {
+    /// Decided without asking (a flag, or `--ci` on a new install).
+    Set(crate::commands::stack_monitoring::Level),
+    /// Ask; the bool is the default (true = yes, full).
+    Ask(bool),
+    /// Leave noomesh.yaml as it is (`--ci` on an install that already has a
+    /// value, or that never chose: unset = full).
+    Keep,
+}
+
+/// The question's plan. A flag decides. Otherwise the default is the
+/// install's own value, and for an install that never chose it depends on
+/// whether the install is new: a new one defaults to lean (No, Enter
+/// accepts it), an existing one to full, because unset already means full
+/// there and the fleet controller is such an install; a reconfigure must
+/// never quietly turn its Grafana, Loki and Tempo off. `--ci` asks nothing:
+/// lean on a new install, the existing value (or unset = full) otherwise.
+pub(crate) fn monitoring_plan(flag: Option<bool>, non_interactive: bool, declared: Option<&str>, was_configured: bool) -> MonitoringPlan {
+    use crate::commands::stack_monitoring::Level;
+    if let Some(full) = flag {
+        return MonitoringPlan::Set(if full { Level::Full } else { Level::Lean });
+    }
+    let current = match declared.map(str::trim) {
+        Some("full") => Some(Level::Full),
+        Some("lean") => Some(Level::Lean),
+        _ => None,
+    };
+    if non_interactive {
+        return match (current, was_configured) {
+            (None, false) => MonitoringPlan::Set(Level::Lean),
+            _ => MonitoringPlan::Keep,
+        };
+    }
+    MonitoringPlan::Ask(match current {
+        Some(level) => level == Level::Full,
+        None => was_configured,
+    })
+}
+
+/// The question that decides whether this install runs Grafana, Loki and
+/// Tempo (`cluster.monitoring` in noomesh.yaml; `noo stack monitoring`
+/// changes it later). Asked before the services step starts anything, so a
+/// new install's first start is already the one the person chose. Copied
+/// from the MCP-door question: `--monitoring-full` / `--no-monitoring-full`
+/// pre-answer (`--with-monitoring` is the old spelling of yes). A
+/// controller-profile install (a source checkout) always runs the set and is
+/// not asked.
+pub fn monitoring_choice(ctx: &mut Ctx) {
+    use crate::commands::stack_monitoring::{declared_in, level_of, write_at, Level};
+    let standalone = ctx.read_env("NOO_DEFAULT_PROFILE").trim() == "standalone" || ctx.repo_root.join(".noo-standalone").exists();
+    if !standalone {
+        ctx.info("Grafana, Loki and Tempo run on this install's controller profile (noo stack monitoring status).");
+        return;
+    }
+    let yaml = ctx.repo_root.join("noomesh.yaml");
+    let declared = std::fs::read_to_string(&yaml).ok().and_then(|t| declared_in(&t));
+    let level = match monitoring_plan(ctx.skip.monitoring_full, ctx.non_interactive, declared.as_deref(), ctx.state.was_configured) {
+        MonitoringPlan::Keep => {
+            let level = level_of(declared.as_deref());
+            ctx.state.monitoring = Some(level);
+            ctx.info(&format!("Monitoring: {} (kept; change it with noo stack monitoring on or off).", level.as_str()));
+            return;
+        }
+        MonitoringPlan::Set(level) => level,
+        MonitoringPlan::Ask(default_full) => {
+            ctx.info("Prometheus and alerts always run. Grafana dashboards, Loki log search and Tempo request traces are optional.");
+            if ctx.asker.confirm("Install dashboards, log search and request traces (Grafana, Loki, Tempo; about 250 MiB idle)?", default_full) {
+                Level::Full
+            } else {
+                Level::Lean
+            }
+        }
+    };
+    ctx.state.monitoring = Some(level);
+    if ctx.dry_run {
+        ctx.dry(&format!("write cluster.monitoring: {} to noomesh.yaml", level.as_str()));
+        return;
+    }
+    if declared.as_deref() != Some(level.as_str()) {
+        if let Err(e) = write_at(&yaml, level) {
+            // Nothing written: the install keeps what it had (unset = full).
+            ctx.state.monitoring = Some(level_of(declared.as_deref()));
+            ctx.warn(&format!("could not record the monitoring choice ({e}); set cluster.monitoring: {} under cluster: in noomesh.yaml", level.as_str()));
+            return;
+        }
+    }
+    match level {
+        Level::Full => ctx.success("Grafana, Loki and Tempo will run (cluster.monitoring: full)."),
+        Level::Lean => ctx.info("Grafana, Loki and Tempo stay off (cluster.monitoring: lean). Turn them on any time: noo stack monitoring on"),
+    }
 }
 
 /// The add-ons step. Free add-ons are a yes/no with the current value as
@@ -8723,7 +9071,35 @@ mod password_tests {
 
 #[cfg(test)]
 mod default_pick_tests {
-    use super::default_ollama_pick;
+    use super::{cpu_model_budget, default_ollama_pick, no_model_fits_line, parse_mem_available};
+
+    /// i677 #6: a CPU-only box's model budget is its free memory less the
+    /// headroom, and a model that does not fit is never the default; when not
+    /// even the first verified pick fits, one plain line and no pull.
+    #[test]
+    fn a_cpu_only_box_gets_a_model_that_fits_its_free_memory_or_one_plain_line() {
+        let meminfo = "MemTotal:       16303432 kB\nMemFree:  1000 kB\nMemAvailable:   10485760 kB\n";
+        assert_eq!(parse_mem_available(meminfo), Some(10_485_760 * 1024));
+        assert_eq!(parse_mem_available("MemTotal: 1 kB\n"), None);
+        assert_eq!(cpu_model_budget(None), None, "unknown memory: the size is not judged");
+        let gb = |g: f64| (g * 1e9) as u64;
+        // 16 GB runner, stack up: ~10 GB free -> 8.5 GB budget; the 7.2 GB default fits.
+        let b16 = cpu_model_budget(Some(gb(10.0))).unwrap();
+        assert_eq!(default_ollama_pick("gemma4:e2b", Some(gb(7.2)), b16, &starters()).0, "gemma4:e2b");
+        // 8 GB box, stack up: ~4.5 GB free -> 3.0 GB budget; the default does not fit,
+        // the first verified pick is the default and the line says why.
+        let b8 = cpu_model_budget(Some(gb(4.5))).unwrap();
+        let (name, why) = default_ollama_pick("gemma4:e2b", Some(gb(7.2)), b8, &starters());
+        assert_ne!(name, "gemma4:e2b");
+        assert!(why.expect("a reason").contains("over this box's 3.0 GB fit"));
+        assert_eq!(no_model_fits_line(&name, Some(gb(2.0)), b8), None, "a 2.0 GB pick fits 3.0 GB");
+        // 4 GB box: ~2.0 GB free -> 0.5 GB budget; not even the pick fits.
+        let b4 = cpu_model_budget(Some(gb(2.0))).unwrap();
+        let line = no_model_fits_line("llama3.2:3b", Some(gb(2.0)), b4).expect("one plain line");
+        assert!(line.starts_with("No chat model fits this box: 0.5 GB of memory is free for one"), "{line}");
+        assert!(line.ends_with("then run: noo onboard --only model") && !line.to_lowercase().contains("cloud"), "{line}");
+        assert_eq!(no_model_fits_line("llama3.2:3b", None, b4), None, "an unknown size never refuses");
+    }
 
     fn starters() -> Vec<(String, String)> {
         vec![("qwen3:4b".to_string(), "2.6 GB download".to_string())]
@@ -9758,6 +10134,10 @@ mod storage_owner_tests {
         assert_eq!(intended_owner_with("hf-cache", &b, agent).unwrap(), (4242, 4243));
         assert_eq!(intended_owner_with("models", &b, None).unwrap(), owner_of(&b));
         assert_eq!(intended_owner_with("hf-cache", &b, None).unwrap(), owner_of(&b));
+        // hf-cache/hub (the gateway's read-only hf mount, i675 F13) is owned
+        // like hf-cache: pre-created before Docker could make it root's.
+        assert_eq!(intended_owner_with("hf-cache/hub", &b, agent).unwrap(), (4242, 4243));
+        assert_eq!(intended_owner_with("hf-cache/hub", &b, None).unwrap(), owner_of(&b));
         for other in ["noo-data", "models/voice/piper", "images", ""] {
             assert_eq!(intended_owner_with(other, &b, agent).unwrap(), owner_of(&b), "{other}");
         }
@@ -9990,6 +10370,55 @@ mod required_tools_tests {
     /// The prerequisite check and its post-install re-check both judge the
     /// same list, and decide the checkout from the repo root's `.git`.
     #[test]
+    fn a_docker_daemon_that_does_not_answer_gets_one_remedy_for_this_host() {
+        // i677 #8: "NOT RUNNING — start Docker first" left a stranger nowhere.
+        let denied = "permission denied while trying to connect to the docker API at unix:///var/run/docker.sock";
+        let (row, fix) = docker_daemon_remedy(denied, false, true);
+        assert_eq!(row, "Docker daemon: running, but this user may not use it");
+        assert!(fix.contains("sudo usermod -aG docker $USER") && fix.ends_with("Check: docker info"));
+        let down = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?";
+        let (row, fix) = docker_daemon_remedy(down, false, true);
+        assert_eq!(row, "Docker daemon: NOT RUNNING");
+        assert!(fix.starts_with("Start it: sudo systemctl start docker") && fix.ends_with("Check: docker info"));
+        let (_, fix) = docker_daemon_remedy(down, false, false);
+        assert!(fix.starts_with("Start it: sudo service docker start"), "WSL2 and hosts without systemd");
+        let (_, fix) = docker_daemon_remedy(down, true, false);
+        assert!(fix.starts_with("Start Docker Desktop"));
+        // A distro with no apt is told what to install and where, never left at "MISSING".
+        let non_apt = non_apt_docker_remedy();
+        assert!(non_apt.contains("Docker Engine with the Compose v2 plugin"));
+        assert!(non_apt.contains("https://docs.docker.com/engine/install/"));
+        assert!(non_apt.ends_with(&docs_url("getting-started/install.md")));
+        assert!(docs_url("x.md").starts_with("https://github.com/") && docs_url("x.md").ends_with("/blob/main/docs/x.md"));
+    }
+
+    #[test]
+    fn the_tailscale_question_has_no_default_and_a_typed_no_is_a_lan_only_install() {
+        // Operator, 2026-11-14: "Ask with no default".
+        for (a, want) in [("y", Some(true)), ("YES", Some(true)), (" n ", Some(false)), ("No", Some(false)),
+                          ("", None), ("maybe", None), ("\n", None)] {
+            assert_eq!(parse_yes_no(a), want, "{a:?}");
+        }
+        let own = crate::test_src::own_code(include_str!("steps.rs"));
+        let install = own.find("\"Tailscale is not installed. Install it now").expect("the install question");
+        let before = &own[..install];
+        let call = before.rfind("ask_yes_no_no_default(").expect("asked with no default");
+        let confirm = before.rfind("ctx.asker.confirm(").unwrap_or(0);
+        assert!(call > confirm, "the install question is asked with no default, not confirm(.., true)");
+        let join = own.find("let join_question = format!(\n            \"Join your tailnet now?").expect("the join question");
+        let asked = own.find("ask_yes_no_no_default(ctx, &join_question, TAILSCALE_JOIN_YES, TAILSCALE_NO)").expect("asked with no default");
+        assert!(join < asked && !own[join..asked].contains("ctx.asker.confirm("));
+        // A typed n is a decision (an info line, no error, no second LAN-only
+        // confirm); --ci says LAN-only once and names the flag.
+        let lan = own.find("Err(_) if chose_lan_only => {").expect("the chosen LAN-only arm");
+        let ci = own.find("Err(_) if ctx.non_interactive => {").expect("the --ci arm");
+        let err = own.find("ctx.error(&format!(\"Tailscale unavailable: {why}\"));").expect("the failure arm");
+        assert!(lan < err && ci < err, "both decided arms come before the failure arm");
+        assert!(NON_INTERACTIVE_LAN_ONLY.contains("--skip-tailscale"));
+        assert!(TAILSCALE_NO.starts_with("LAN-only") && LAN_ONLY_CHOSEN.contains("noo onboard --reconfigure"));
+    }
+
+    #[test]
     fn the_prerequisite_check_and_its_recheck_use_required_tools() {
         let code = crate::test_src::own_code(include_str!("steps.rs"));
         let body = crate::test_src::fn_body(&code, "pub fn prerequisites(");
@@ -10018,17 +10447,114 @@ mod volume_mismatch_tests {
         assert_eq!(volume_mismatch_action(None, "/srv/noo/noo-data"), VolumeMismatch::NotChecked);
     }
 
+    /// The fixer hands docker's answers to [`reaper_decisions`] and every
+    /// removal to [`reap_volumes`]; it removes nothing itself, and a failed
+    /// inspect is not an empty device (m18).
     #[test]
-    fn the_fixer_removes_only_on_a_stale_record() {
+    fn the_fixer_removes_only_through_the_reaper() {
         let code = crate::test_src::own_code(include_str!("steps.rs"));
         let body = crate::test_src::fn_body(&code, "fn fix_volume_mismatches(");
-        let decide = body.find("for (vol, want_device, recorded, action) in reaper_decisions(&expected, &existing, &inspect) {").expect("the decision");
-        let stale = body.find("VolumeMismatch::RemoveStaleRecord => {}").expect("only the stale record falls through");
-        let say = body.find("Removing the stale record of volume").expect("said before");
-        let rm = body.find("\"volume\", \"rm\", \"-f\", &vol").expect("the removal");
-        assert!(decide < stale && stale < say && say < rm, "{body}");
-        assert_eq!(body.matches("\"volume\", \"rm\"").count(), 1, "one removal, after the decision");
+        assert!(
+            body.contains("reap_volumes(&mut LiveReaper { ctx }, reaper_decisions(&expected, &existing, &inspect));"),
+            "{body}"
+        );
+        assert!(!body.contains("\"rm\""), "the fixer itself removes nothing: {body}");
         assert!(body.contains(".filter(|o| o.status.success())"), "a failed inspect is not an empty device: {body}");
+        let live = crate::test_src::fn_body(&code, "fn remove(&mut self, vol: &str) -> bool {");
+        assert!(live.contains(".args([\"volume\", \"rm\", \"-f\", vol])"), "{live}");
+    }
+
+    /// A fake reaper host: every effect, in order.
+    #[derive(Default)]
+    struct FakeReaper {
+        events: Vec<String>,
+        refuse: Vec<String>,
+    }
+
+    impl VolumeReaper for FakeReaper {
+        fn warn(&mut self, line: &str) {
+            self.events.push(format!("warn {line}"));
+        }
+        fn info(&mut self, line: &str) {
+            self.events.push(format!("info {line}"));
+        }
+        fn remove(&mut self, vol: &str) -> bool {
+            self.events.push(format!("remove {vol}"));
+            !self.refuse.contains(&vol.to_string())
+        }
+    }
+
+    impl FakeReaper {
+        fn removed(&self) -> Vec<&str> {
+            self.events.iter().filter_map(|e| e.strip_prefix("remove ")).collect()
+        }
+    }
+
+    fn decision(vol: &str, recorded: Option<&str>, action: VolumeMismatch) -> (String, String, Option<String>, VolumeMismatch) {
+        (vol.to_string(), "/srv/noo/noo-data".to_string(), recorded.map(str::to_string), action)
+    }
+
+    /// m16: an unbound volume holds its data inside docker. It is warned
+    /// about by name and never removed.
+    #[test]
+    fn an_unbound_volume_that_holds_data_is_never_removed() {
+        let mut h = FakeReaper::default();
+        let n = reap_volumes(&mut h, vec![decision("noomesh_noo-data", Some(""), VolumeMismatch::UnboundHoldsData)]);
+        assert_eq!((n, h.removed()), (0, vec![]), "{:?}", h.events);
+        assert_eq!(h.events.len(), 1, "{:?}", h.events);
+        assert!(h.events[0].starts_with("warn volume noomesh_noo-data is not bound") && h.events[0].contains("NOT removed"), "{:?}", h.events);
+    }
+
+    /// m17: a volume docker would not describe was never checked: kept.
+    #[test]
+    fn a_volume_docker_did_not_answer_about_is_never_removed() {
+        let mut h = FakeReaper::default();
+        let n = reap_volumes(&mut h, vec![decision("noomesh_noo-data", None, VolumeMismatch::NotChecked)]);
+        assert_eq!((n, h.removed()), (0, vec![]), "{:?}", h.events);
+        assert_eq!(h.events, ["warn volume noomesh_noo-data: docker inspect did not answer; left as it is (not checked)"]);
+    }
+
+    /// Only a stale bind record goes, said before it goes; a current bind is
+    /// kept silently; the count is what docker actually removed.
+    #[test]
+    fn only_a_stale_bind_record_is_removed_and_said_first() {
+        let mut h = FakeReaper { refuse: vec!["noomesh_gone-wrong".into()], ..Default::default() };
+        let n = reap_volumes(&mut h, vec![
+            decision("noomesh_postgres-data", Some("/srv/noo/noo-data"), VolumeMismatch::Keep),
+            decision("noomesh_noo-data", Some(""), VolumeMismatch::UnboundHoldsData),
+            decision("noomesh_redis-data", Some("/old/root/redis"), VolumeMismatch::RemoveStaleRecord),
+            decision("noomesh_unknown", None, VolumeMismatch::NotChecked),
+            decision("noomesh_gone-wrong", Some("/old/root/x"), VolumeMismatch::RemoveStaleRecord),
+        ]);
+        assert_eq!(h.removed(), ["noomesh_redis-data", "noomesh_gone-wrong"], "{:?}", h.events);
+        assert_eq!(n, 1, "a removal docker refused is not counted");
+        let said = h.events.iter().position(|e| e.starts_with("info Removing the stale record of volume noomesh_redis-data (bound to /old/root/redis")).expect("said");
+        let gone = h.events.iter().position(|e| e == "remove noomesh_redis-data").expect("removed");
+        assert!(said + 1 == gone, "said immediately before it goes: {:?}", h.events);
+        assert!(!h.events.iter().any(|e| e.contains("noomesh_postgres-data")), "a current bind is kept silently: {:?}", h.events);
+        assert_eq!(h.events.last().map(String::as_str), Some("info Removed 1 stale Docker volume(s) (config doesn't match current NOO_DATA_ROOT)"));
+    }
+
+    /// The legacy re-onboard (an unbound noo-data, the stack down), end to
+    /// end from docker's answers: nothing that holds data is removed.
+    #[test]
+    fn a_legacy_reonboard_removes_only_the_stale_record() {
+        let expected = vec![
+            ("noomesh_noo-data".to_string(), "/srv/noo/noo-data".to_string()),
+            ("noomesh_redis-data".to_string(), "/srv/noo/redis".to_string()),
+            ("noomesh_ollama".to_string(), "/srv/noo/ollama".to_string()),
+        ];
+        let existing: Vec<String> = ["noomesh_noo-data", "noomesh_redis-data", "noomesh_ollama"].iter().map(|s| s.to_string()).collect();
+        let inspect = |v: &str| -> Option<String> {
+            match v {
+                "noomesh_noo-data" => Some(String::new()),
+                "noomesh_redis-data" => Some("/old/root/redis".into()),
+                _ => None,
+            }
+        };
+        let mut h = FakeReaper::default();
+        reap_volumes(&mut h, reaper_decisions(&expected, &existing, &inspect));
+        assert_eq!(h.removed(), ["noomesh_redis-data"], "{:?}", h.events);
     }
 }
 
@@ -10093,6 +10619,10 @@ mod first_chat_placement_tests {
     #[test]
     fn the_placement_is_the_operators_own_command() {
         assert_eq!(place_args("box", "gemma4:e2b"), ["cluster", "place", "box", "ollama", "gemma4:e2b"]);
+        // Onboarding shows what place tuned and why (colour is stripped by
+        // ui::plain, tested there).
+        let out = "→ on cpu — the node has no GPU\n  OLLAMA_NUM_PARALLEL=1  cpu node\n  OLLAMA_CONTEXT_LENGTH=32768  half of the 6.4 GB left after the declared models\n";
+        assert_eq!(tuned_lines(out), ["OLLAMA_NUM_PARALLEL=1  cpu node", "OLLAMA_CONTEXT_LENGTH=32768  half of the 6.4 GB left after the declared models"]);
     }
 
     /// The model step places before it judges unpinned chat, and a chat
@@ -10172,5 +10702,99 @@ mod fresh_install_line_tests {
         assert!(!own.contains("no placement needed"), "the old line is back somewhere");
         let tail = crate::test_src::fn_body(&own, "pub fn provision_service_keys(");
         assert!(tail.contains("for svc in services_to_recreate(&t.containers, &prefix, &|c: &str| {"), "{tail}");
+    }
+}
+
+#[cfg(test)]
+mod monitoring_choice_tests {
+    use super::{monitoring_plan, MonitoringPlan};
+    use crate::commands::stack_monitoring::Level;
+
+    /// A new install: the question defaults to No (Enter accepts lean), and
+    /// `--ci` writes lean.
+    #[test]
+    fn a_new_install_defaults_to_lean() {
+        assert_eq!(monitoring_plan(None, false, None, false), MonitoringPlan::Ask(false), "Enter must accept No");
+        assert_eq!(monitoring_plan(None, true, None, false), MonitoringPlan::Set(Level::Lean));
+    }
+
+    /// An install that never chose runs everything (unset = full), and the
+    /// fleet controller is such an install: a reconfigure defaults to yes
+    /// and `--ci` writes nothing.
+    #[test]
+    fn an_existing_install_that_never_chose_keeps_the_full_set() {
+        assert_eq!(monitoring_plan(None, false, None, true), MonitoringPlan::Ask(true));
+        assert_eq!(monitoring_plan(None, true, None, true), MonitoringPlan::Keep);
+        assert_eq!(monitoring_plan(None, true, Some("typo"), true), MonitoringPlan::Keep);
+    }
+
+    #[test]
+    fn a_value_already_chosen_is_the_default_and_survives_ci() {
+        assert_eq!(monitoring_plan(None, false, Some("lean"), true), MonitoringPlan::Ask(false));
+        assert_eq!(monitoring_plan(None, false, Some("full"), false), MonitoringPlan::Ask(true));
+        assert_eq!(monitoring_plan(None, true, Some("full"), false), MonitoringPlan::Keep);
+        assert_eq!(monitoring_plan(None, true, Some("lean"), true), MonitoringPlan::Keep);
+    }
+
+    #[test]
+    fn a_flag_decides_without_asking() {
+        for (ni, declared, cfg) in [(false, None, false), (true, Some("lean"), true), (true, None, true)] {
+            assert_eq!(monitoring_plan(Some(true), ni, declared, cfg), MonitoringPlan::Set(Level::Full));
+            assert_eq!(monitoring_plan(Some(false), ni, declared, cfg), MonitoringPlan::Set(Level::Lean));
+        }
+    }
+
+    /// The flags and the question as the person sees them; the question is
+    /// asked in the services step BEFORE anything starts.
+    #[test]
+    fn the_flags_parse_and_the_question_is_asked_before_services_start() {
+        let mod_rs = crate::test_src::own_code(include_str!("mod.rs"));
+        assert!(mod_rs.contains("\"--monitoring-full\" | \"--with-monitoring\" => skip.monitoring_full = Some(true),"));
+        assert!(mod_rs.contains("\"--no-monitoring-full\" => skip.monitoring_full = Some(false),"));
+        let run = mod_rs.find("steps::monitoring_choice(ctx);").expect("asked");
+        let services = mod_rs.find("        steps::services(ctx);").expect("services step");
+        assert!(run < services, "the monitoring question must come before services start");
+        assert!(mod_rs.contains("ctx.state.was_configured = is_configured(ctx);"));
+        let own = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn monitoring_choice(");
+        assert!(body.contains("\"Install dashboards, log search and request traces (Grafana, Loki, Tempo; about 250 MiB idle)?\", default_full"), "{body}");
+        let usage = crate::usage::USAGE.iter().find(|(w, _, _)| *w == ["onboard"]).expect("onboard usage").1;
+        assert!(usage.contains("[--monitoring-full|--no-monitoring-full]"), "{usage}");
+    }
+}
+
+#[cfg(test)]
+mod cpu_only_embed_parallel_tests {
+    use super::cpu_only_embed_parallel;
+    use std::collections::BTreeMap;
+
+    fn env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    /// i802: a NEW CPU-only install gets one Ollama slot; a GPU box, an
+    /// install this step already configured and a key already set are left
+    /// alone (an existing install is never rewritten).
+    #[test]
+    fn onboard_seeds_one_ollama_slot_only_on_a_new_cpu_only_install() {
+        assert_eq!(cpu_only_embed_parallel(true, &env(&[])), Some(("OLLAMA_EMBED_NUM_PARALLEL", "1")));
+        // --standalone seeds a few keys before this step; still a new install.
+        assert_eq!(cpu_only_embed_parallel(true, &env(&[("NOO_INSTALL_MODE", "standalone")])), Some(("OLLAMA_EMBED_NUM_PARALLEL", "1")));
+        assert_eq!(cpu_only_embed_parallel(false, &env(&[])), None, "a GPU (or busy GPU) box keeps the compose default");
+        assert_eq!(cpu_only_embed_parallel(true, &env(&[("NODE_ID", "box")])), None, "an existing install is never rewritten");
+        assert_eq!(cpu_only_embed_parallel(true, &env(&[("OLLAMA_EMBED_NUM_PARALLEL", "4")])), None, "the operator's own value stands");
+    }
+
+    /// It is written to noomesh.yaml compose_env after the file is seeded,
+    /// never into .env, and never over a compose_env value already there.
+    #[test]
+    fn the_slot_default_goes_to_compose_env_after_the_yaml_exists() {
+        let own = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn environment(");
+        assert!(!body.contains("set(&mut merged, &mut merged_order, k, v.to_string())"), "not into .env: {body}");
+        let seeded = body.rfind("ensure_mesh_yaml(ctx);").expect("the yaml is seeded");
+        let guard = body.find("if yamlcfg::read_yaml_compose_env(ctx, k).is_none() {").expect("never over a value");
+        let write = body.find("yamlcfg::update_yaml_compose_env(ctx, &[(k.to_string(), v.to_string())]);").expect("the write");
+        assert!(seeded < guard && guard < write, "{body}");
     }
 }

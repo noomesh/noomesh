@@ -7,8 +7,14 @@
 
 Two passes, because a read of the wizard shows Enter alone cannot finish it:
 
-* literal:   Enter at every prompt, nothing else. Where it stops, and after
-             how long, is the result.
+* literal:   the install doc, read literally: docs/getting-started/install.md
+             "What the wizard asks you" names the prompts that need a typed
+             answer and what to type; this pass types exactly that (the FIRST
+             option a row gives) and presses Enter everywhere else. A prompt the
+             wizard forces that the doc does not name loops, and the cell fails
+             by name: the doc and the product disagree. (Until 0.6.25 this pass
+             was Enter-only, a permanent red at the admin password that said
+             nothing a stranger could act on.)
 * attentive: Enter wherever a default moves forward. Type only what a prompt
              forces (an admin password; "y" once the backup passphrases are
              "stored"; "n" to installing or joining Tailscale, which leads to
@@ -60,12 +66,52 @@ def is_password_prompt(p: str) -> bool:
     return bool(re.search(r"(?i)\b(admin )?password\b", p)) and not re.search(r"(?i)password manager", p)
 
 
-def answer(prompt: str, mode: str, password: str) -> tuple[str, str]:
+DOC_SECTION = "### What the wizard asks you"
+
+
+def doc_answers(text: str) -> list[tuple[str, str]]:
+    """(prompt fragment, answer) rows from the install doc's table: every
+    backticked fragment in the first cell, and for the answer either
+    "<password>" (the row asks for a password) or the first backticked token
+    in the second cell (`y` / `n`). Lower-cased fragments; [] when the section
+    or its table is missing."""
+    import re as _re
+    if DOC_SECTION not in text:
+        return []
+    body = text.split(DOC_SECTION, 1)[1].split("\n#", 1)[0]
+    rows: list[tuple[str, str]] = []
+    for line in body.splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) < 2 or set(cells[0]) <= {"-", " ", ":"} or cells[0] == "The prompt":
+            continue
+        frags = _re.findall(r"`([^`]+)`", cells[0])
+        if not frags:
+            continue
+        if "password of your choice" in cells[1]:
+            ans = "<password>"
+        else:
+            m = _re.search(r"`([^`]+)`", cells[1])
+            if not m:
+                continue
+            ans = m.group(1)
+        rows += [(f.lower().rstrip("?"), ans) for f in frags]
+    return rows
+
+
+def answer(prompt: str, mode: str, password: str, doc: list[tuple[str, str]] | None = None) -> tuple[str, str]:
     """(bytes to type, how to report it). Enter is "".
 
-    attentive answers only what a prompt FORCES or what the stranger would
-    decline on a single machine; everything else is the default (Enter)."""
+    literal types what the install doc's table says for a prompt it names, and
+    Enter otherwise. attentive answers only what a prompt FORCES or what the
+    stranger would decline on a single machine; everything else is Enter."""
     p = prompt.lower()
+    if mode == "literal":
+        for frag, ans in doc or []:
+            if frag in p:
+                if ans == "<password>":
+                    return password, "typed <password> (the install doc's table)"
+                return ans, f"typed {ans} (the install doc's table)"
+        return "", "enter"
     if mode == "attentive":
         if is_password_prompt(prompt):
             return password, "typed <password>"
@@ -103,7 +149,8 @@ def gen_password() -> str:
     return "Aa9-" + core
 
 
-def drive(argv: list[str], mode: str, silence: float, max_prompts: int, max_repeat: int) -> int:
+def drive(argv: list[str], mode: str, silence: float, max_prompts: int, max_repeat: int,
+          doc: list[tuple[str, str]] | None = None) -> int:
     password = gen_password()
     masker = Masker(password)
     pid, fd = pty.fork()
@@ -149,7 +196,7 @@ def drive(argv: list[str], mode: str, silence: float, max_prompts: int, max_repe
             prompt = clean(buf).strip()
             emit(masker.line(buf))
             buf = ""
-            text, how = answer(prompt, mode, password)
+            text, how = answer(prompt, mode, password, doc)
             emit(f"PROMPT: {masker.line(prompt)}")
             emit(f"ANSWER: {how}")
             answered += 1
@@ -176,6 +223,9 @@ def drive(argv: list[str], mode: str, silence: float, max_prompts: int, max_repe
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--pass", dest="mode", choices=["literal", "attentive"], required=True)
+    ap.add_argument("--doc", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "docs",
+                                                  "getting-started", "install.md"),
+                    help="the install doc the literal pass reads (its 'What the wizard asks you' table)")
     ap.add_argument("--silence", type=float, default=900.0)
     ap.add_argument("--max-prompts", type=int, default=60)
     ap.add_argument("--max-repeat", type=int, default=5)
@@ -184,7 +234,20 @@ def main() -> int:
     argv = a.argv[1:] if a.argv[:1] == ["--"] else a.argv
     if not argv:
         ap.error("no command")
-    return drive(argv, a.mode, a.silence, a.max_prompts, a.max_repeat)
+    doc: list[tuple[str, str]] = []
+    if a.mode == "literal":
+        try:
+            with open(a.doc, encoding="utf-8") as f:
+                doc = doc_answers(f.read())
+        except OSError as e:
+            print(f"DRIVER: cannot read the install doc {a.doc}: {e}", flush=True)
+            return 5
+        if not doc:
+            print(f"DRIVER: the install doc has no '{DOC_SECTION[4:]}' table to follow", flush=True)
+            return 5
+        for frag, ans in doc:
+            print(f"DOC: at a prompt containing {frag!r}, type {ans}", flush=True)
+    return drive(argv, a.mode, a.silence, a.max_prompts, a.max_repeat, doc)
 
 
 if __name__ == "__main__":

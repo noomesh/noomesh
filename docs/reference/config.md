@@ -248,6 +248,27 @@ For search that reliably runs, pick another provider:
 | `backends.<name>.enabled`, `.model` | — | per-backend defaults (`ollama`, `vllm`, `llamacpp`); vLLM also takes `quantization`, `gpu_memory_utilization`, `extra_args` (`tool_call_parser`, `tensor_parallel_size`) |
 | `shard_key` | env `NOO_SHARD_KEY` → `NODE_ID` → `default` | tag written into every conversation's metadata |
 | `auto_scale`, `idle_timeout_sec`, `pinned_backends[]` | `true`, `1800`, `[]` | placement policy (Python) |
+| `image_retention` | unset | `live` \| `preview` \| `off`: superseded images after a roll (operator manual, Upgrade) |
+| `monitoring` | unset (= `full`) | `full` \| `lean`: whether Grafana, Loki and Tempo run; `noo stack monitoring on\|off\|status` ([monitoring](../operating/monitoring.md)) |
+| `postgres_memory` | unset (= `standard`) | `standard` \| `auto`: how much memory Postgres takes ([below](#postgres-memory)) |
+
+#### Postgres memory
+
+`standard` (also what unset means) keeps the sizes every install has run:
+shared_buffers 512MB, effective_cache_size 2GB, work_mem 32MB,
+maintenance_work_mem 256MB, /dev/shm 1g. `auto` sizes them to the memory
+Docker gives containers on this machine:
+
+| Memory | shared_buffers | effective_cache_size | work_mem | maintenance_work_mem | /dev/shm |
+|---|---|---|---|---|---|
+| below 6 GiB (a 4 GB machine) | 128MB | 512MB | 8MB | 64MB | 256m |
+| 6 to below 12 GiB (an 8 GB machine) | 256MB | 1GB | 16MB | 128MB | 512m |
+| 12 GiB and more (16 GB reports about 15.5) | 512MB | 2GB | 32MB | 256MB | 1g |
+
+A `NOO_PG_*` value you set yourself ([env](env.md), Postgres sizing) always
+wins over `auto`. The change takes effect when postgres is recreated: the
+next `noo stack start` does it once. `noo cluster verify` shows the mode, the
+sizes in effect and "recreate needed" until then.
 
 ### `security` — exec approval
 
@@ -445,7 +466,9 @@ holds it.
 has grown, an operator can go through every document, decide whether its
 audience is right, and change it. The tools are `noo rag docs`, `noo rag doc`
 and `noo rag retag` (and the MCP tools `noo_docs_list`, `noo_doc_detail`,
-`noo_rag_retag`, operator door only).
+`noo_rag_retag`, operator door only). Chat answers draw only on your own, `company`, `system` and team
+documents; `admin`-only documents are reached by `noo rag query` or by a tool
+the assistant calls, never by chat's automatic context.
 
 1. **Backfill** anything untagged to `admin`, which is what its visibility
    already was (the two commands above, ending in `--apply`).

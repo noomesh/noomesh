@@ -407,6 +407,15 @@ func (a *Agent) Run() error {
 	// DESIRED_STATE_CONFIG.md.
 	rec := reconcile.New(a.cfg, a.docker, a.http, a.harness)
 	a.harnessKind = rec.HarnessRunningKind
+	// A native Ollama job runs the model at the controller's decided chat
+	// context (i802), so it never reloads the chat runner.
+	if a.jobs != nil {
+		a.jobs.SetChatContext(rec.ChatContext)
+	}
+	// ...and so does a chat the gateway could not stamp (a node harness).
+	if a.server != nil {
+		a.server.SetChatContext(rec.ChatContext)
+	}
 	a.hb.SetModelSets(rec.ModelSetsReport)
 	a.hb.SetModelSetsFreeBytes(rec.ModelSetsFreeBytes)
 	a.hb.SetNodeFacts(rec.NodeFacts)
@@ -414,6 +423,7 @@ func (a *Agent) Run() error {
 		a.server.SetManagedWorkloads(mc)
 	}
 	a.server.SetReconcileNudge(rec.Nudge)
+	rec.SetNodeWorkloadsChanged(a.hb.Kick)
 	a.server.SetMCP(rec.MCP())
 	a.server.SetChatPlacement(func() (api.ChatPlacement, bool) {
 		b, m, ok := rec.ChatPlacement()
@@ -434,6 +444,7 @@ func (a *Agent) Run() error {
 			hp.Profile = prof.Raw
 		}
 		hp.ModelContext = rec.ChatContextWindow(prof)
+		hp.ChatContexts = rec.ChatContexts()
 		return hp
 	})
 
@@ -445,6 +456,11 @@ func (a *Agent) Run() error {
 	// measured (macOS, no NVIDIA) it reports "not-measured" and never acts.
 	// (Constructed before the heartbeat loop starts — see 4.)
 	gy.OnResume(rec.Nudge)
+	// A yield or hold unloads the declared-warm ollama models first (the
+	// adopted stack lane is never stopped, so a stop would not free them);
+	// the keeper preloads and re-pins them otherwise (api/keep_warm.go).
+	gy.OnPause(a.server.UnloadWarm)
+	go a.server.RunKeepWarm(ctx)
 	go gy.Run(ctx)
 
 	reclaimer := diskreclaim.New(hostd.WorkerSpoolDir)

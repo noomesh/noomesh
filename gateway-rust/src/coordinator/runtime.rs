@@ -80,6 +80,20 @@ pub(crate) trait HarnessRuntime: Sync {
     fn phase_via(&self) -> &'static str {
         "gateway"
     }
+    /// The context to stamp as `options.num_ctx` on a chat body for
+    /// `backend` (i802, `chat_context::num_ctx_for`). `None` = stamp nothing:
+    /// any backend but Ollama, nothing declared, or a runtime with no way
+    /// to know (the gateway reads the cluster; a node harness reads its
+    /// agent's decided table, `RemoteRuntime::chat_num_ctx`).
+    async fn chat_num_ctx(&self, _backend: &ResolvedBackend) -> Option<u64> {
+        None
+    }
+    /// The window one request gets on a vLLM or llama.cpp `backend`
+    /// (i802 PR-2, `chat_context::window_for`). `None` = unknown: the loop
+    /// keeps its global `VLLM_MAX_MODEL_LEN` window, as a node harness does.
+    async fn chat_window(&self, _backend: &ResolvedBackend) -> Option<u64> {
+        None
+    }
     /// A cloud model, single turn, no tools. NOT the loop's path: the loop
     /// resolves a cloud model to a cloud backend and runs it with tools
     /// (i83 phase C). Kept for the harness rail's `CloudRun` op.
@@ -107,7 +121,8 @@ pub(crate) trait HarnessRuntime: Sync {
     fn runbook_context(&self, prompt: &str) -> Option<String>;
     async fn temporal_context(&self, user_id: Option<&str>, timeout: Duration) -> Option<String>;
     async fn running_summary(&self, conversation_id: &str) -> Option<String>;
-    async fn conversation_recall(&self, conversation_id: &str, query: &str, top_k: u32) -> Option<String>;
+    /// Never silent: a recall that could not run says why (`Skipped`).
+    async fn conversation_recall(&self, conversation_id: &str, query: &str, top_k: u32) -> super::context::RecallOutcome;
 
     // ── tools ──────────────────────────────────────────────────────────
 
@@ -241,6 +256,14 @@ impl HarnessRuntime for InProcessRuntime<'_> {
         super::backend::resolve_backend_excluding(self.state, model, exclude_urls).await
     }
 
+    async fn chat_num_ctx(&self, backend: &ResolvedBackend) -> Option<u64> {
+        crate::chat_context::num_ctx_for(self.state, &backend.backend_type, &backend.url, &backend.model).await
+    }
+
+    async fn chat_window(&self, backend: &ResolvedBackend) -> Option<u64> {
+        crate::chat_context::window_for(self.state, &backend.backend_type, &backend.url, &backend.model).await
+    }
+
     async fn route_facts(&self, url: &str, backend: &str) -> Option<(String, Option<super::classes::Slots>)> {
         // A static or discovered backend is on no live node's record: name
         // its host, slots unknown.
@@ -336,7 +359,7 @@ impl HarnessRuntime for InProcessRuntime<'_> {
         super::summary::fetch_running_summary(&self.state.db, conversation_id).await
     }
 
-    async fn conversation_recall(&self, conversation_id: &str, query: &str, top_k: u32) -> Option<String> {
+    async fn conversation_recall(&self, conversation_id: &str, query: &str, top_k: u32) -> super::context::RecallOutcome {
         super::context::fetch_conversation_recall(self.state, conversation_id, query, top_k).await
     }
 
@@ -386,8 +409,11 @@ impl HarnessRuntime for InProcessRuntime<'_> {
             let conv_id = conversation_id.to_string();
             let url = backend.url.clone();
             let model = backend.model.clone();
+            // The same context the turn ran at, so the summary never reloads
+            // the model at another one (i802).
+            let num_ctx = crate::chat_context::num_ctx_for(self.state, &backend.backend_type, &backend.url, &backend.model).await;
             tokio::spawn(async move {
-                super::summary::generate_running_summary(db, url, model, conv_id, current_turn).await;
+                super::summary::generate_running_summary(db, url, model, conv_id, current_turn, num_ctx).await;
             });
         }
     }

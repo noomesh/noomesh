@@ -180,6 +180,24 @@ def record(name: str, rc: int, secs: int, log: str) -> dict:
     }
 
 
+def first_answer_times(steps: list[dict], wall) -> tuple:
+    """(install-to-first-answer seconds, seconds of probe steps that ran before
+    first-answer). `wall` is run.sh's first_answer_s (cell start to the end of
+    first-answer); a probe is a step named probe-* or the idle judge."""
+    if wall in (None, "", "?"):
+        return None, 0
+    before = []
+    for s in steps:
+        if s["step"] == "first-answer":
+            break
+        before.append(s)
+    else:
+        return int(wall), 0
+    wait = sum(int(s["seconds"]) for s in before
+               if s["step"].startswith(("probe-", "idle-")))
+    return int(wall) - wait, wait
+
+
 def summarize(d: Path) -> dict:
     steps = [json.loads(l) for l in (d / "steps.jsonl").read_text().splitlines() if l.strip()] \
         if (d / "steps.jsonl").exists() else []
@@ -190,7 +208,14 @@ def summarize(d: Path) -> dict:
     verify = next((s for s in steps if s["step"] == "verify"), None)
     warnings = [w for s in steps for w in s["warnings"]]
     prompts = [p for s in steps for p in s["prompts"]]
-    out = {**meta,
+    # The number a stranger feels is install to first answer. Probes that run
+    # BEFORE first-answer on purpose (the memory baseline and the 40-minute
+    # idle series must see a stack nobody has chatted to) are waits we add,
+    # not the product's time, so they are reported apart (general, rc.1 run
+    # 43642041751: 2,792 s on the wall, 327 s without the 2,465 s of probes).
+    first_answer, probe_wait = first_answer_times(steps, meta.get("first_answer_s"))
+    out = {**meta, "first_answer_s": first_answer, "first_answer_wall_s": meta.get("first_answer_s"),
+           "probe_wait_before_first_answer_s": probe_wait,
            "result": ("not run" if meta.get("not_run") or not steps
                       else "pass" if failed is None else "fail"),
            "failed_step": failed["step"] if failed else None,
@@ -203,8 +228,9 @@ def summarize(d: Path) -> dict:
     md = [f"### {meta.get('cell', '?')}: {out['result'].upper()}"
           + (f" at `{out['failed_step']}`" if failed else ""),
           f"runner `{meta.get('runner', '?')}` · installed `{meta.get('installed_version', '?')}` · "
-          f"peak disk used {meta.get('peak_disk_used_gb', '?')} GB · first answer {meta.get('first_answer_s', '?')} s "
-          f"after the cell started",
+          f"peak disk used {meta.get('peak_disk_used_gb', '?')} GB · first answer {'?' if first_answer is None else first_answer} s "
+          f"after the cell started" + (f" (not counting {probe_wait} s of probes before it; {meta.get('first_answer_s')} s on the wall clock)"
+                                         if probe_wait else ""),
           "", "| step | rc | seconds |", "|---|---|---|"]
     md += [f"| {s['step']} | {s['rc']} | {s['seconds']} |" for s in steps]
     if failed:

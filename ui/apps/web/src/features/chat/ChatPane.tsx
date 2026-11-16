@@ -171,7 +171,7 @@ function ToolChips({ tools }: { tools: ToolRun[] }) {
   );
 }
 
-function StatsFooter({ stats }: { stats: TurnStats }) {
+export function StatsFooter({ stats }: { stats: TurnStats }) {
   const parts: string[] = [];
   if (stats.cached) parts.push('cached');
   if (stats.elapsedSeconds) parts.push(`${stats.elapsedSeconds}s`);
@@ -180,14 +180,35 @@ function StatsFooter({ stats }: { stats: TurnStats }) {
   if (stats.tokensPerSec) parts.push(`${stats.tokensPerSec} tok/s`);
   if (stats.iterations && stats.iterations > 1) parts.push(`${stats.iterations} iterations`);
   if (stats.toolCalls) parts.push(`${stats.toolCalls} tool call${stats.toolCalls === 1 ? '' : 's'}`);
-  if (!parts.length) return null;
+  if (!parts.length && !stats.recallSkipped && !stats.truncated) return null;
 
   return (
-    <div className="turn-stats">
-      {parts.map((p) => (
-        <span key={p}>{p}</span>
-      ))}
-    </div>
+    <>
+      {/* The backend cut the prompt (i802): the answer was made without most of its instructions. */}
+      {stats.truncated && (
+        <div className="turn-stats turn-truncated" role="note" data-testid="prompt-truncated">
+          <span>
+            The model read only {stats.truncated.evaluated.toLocaleString()} of about{' '}
+            {stats.truncated.sentEstimate.toLocaleString()} prompt tokens
+            {stats.truncated.context ? ` (its context is ${stats.truncated.context.toLocaleString()})` : ''}: its
+            backend cut the prompt, so this answer was made without most of its instructions.
+          </span>
+        </div>
+      )}
+      {parts.length > 0 && (
+        <div className="turn-stats">
+          {parts.map((p) => (
+            <span key={p}>{p}</span>
+          ))}
+        </div>
+      )}
+      {/* The answer was given without conversation memory: say so and why. */}
+      {stats.recallSkipped && (
+        <div className="turn-stats" data-testid="recall-skipped">
+          <span>Memory recall skipped: {stats.recallSkipped}</span>
+        </div>
+      )}
+    </>
   );
 }
 

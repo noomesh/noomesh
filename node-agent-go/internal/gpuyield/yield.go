@@ -260,6 +260,7 @@ type Controller struct {
 	placed      []Placed
 	measured    map[string]int // backend -> last measured MiB (PID method)
 	onResume    func()
+	onPause     func(ctx context.Context, why string) // see OnPause
 	lastNoMeter bool
 	// unmeasured / unmeasuredDetail: the cause of the last unmeasured
 	// reading; cleared on a measured one.
@@ -316,6 +317,21 @@ func New(cfg Config, probe Probe, d Docker, stateDir string) *Controller {
 // OnResume installs a hook run after a resume (the reconciler's nudge, so a
 // placed backend that was never started comes up without waiting a tick).
 func (c *Controller) OnResume(f func()) { c.onResume = f }
+
+// OnPause installs a hook run on every pause (yield or hold), BEFORE the GPU
+// backends are stopped: the warm keeper's unload (api.UnloadWarm), which
+// sends keep_alive 0 for each declared-warm ollama model. A container stop
+// does not reach a lane the agent never stops (the controller's adopted stack
+// ollama).
+func (c *Controller) OnPause(f func(ctx context.Context, why string)) { c.onPause = f }
+
+// GPUFreed reports whether the GPU is being given back: yielded, held, or a
+// hold draining. Nothing may pin a model on the GPU then.
+func (c *Controller) GPUFreed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.state == StateYielded || c.state == StateHeld || c.state == StateDraining
+}
 
 // SetPlacements records the node's placements (reconcile, every tick).
 func (c *Controller) SetPlacements(p []Placed) {
@@ -542,6 +558,7 @@ type actions struct {
 	stop    []docker.GPUBackend
 	start   map[string]string // backend -> container id
 	resumed bool
+	paused  bool // a pause (pauseLocked): onPause runs before the stops
 	why     string
 }
 
@@ -712,6 +729,12 @@ func (c *Controller) enforceLocked(backends []docker.GPUBackend) (act actions) {
 
 // execute performs a decision's docker calls.
 func (c *Controller) execute(ctx context.Context, act actions) {
+	if act.paused && c.onPause != nil {
+		// Bounded: an unreachable ollama must not hold the pause up.
+		pctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		c.onPause(pctx, act.why)
+		cancel()
+	}
 	for _, b := range act.stop {
 		sctx, cancel := context.WithTimeout(ctx, time.Duration(c.cfg.StopTimeout+15)*time.Second)
 		err := c.docker.StopContainerGraceful(sctx, b.ID, c.cfg.StopTimeout)
@@ -968,6 +991,7 @@ func (c *Controller) pauseLocked(backends []docker.GPUBackend, state, reason str
 	c.reason = reason
 	c.saveLocked()
 	act.why = reason
+	act.paused = true
 	return act
 }
 
@@ -1095,6 +1119,14 @@ func Default() *Controller { defMu.RLock(); defer defMu.RUnlock(); return def }
 func HoldsStart(backend string) bool {
 	if c := Default(); c != nil {
 		return c.Holds(backend)
+	}
+	return false
+}
+
+// GPUFreed is GPUFreed on the default controller; false when none is wired.
+func GPUFreed() bool {
+	if c := Default(); c != nil {
+		return c.GPUFreed()
 	}
 	return false
 }

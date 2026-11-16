@@ -37,6 +37,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -207,11 +208,26 @@ func newEngine(root, spool string) (*hostd.Engine, func(), error) {
 		HealthTimeout:  envDuration("NOO_HOSTD_HEALTH_TIMEOUT", 180*time.Second),
 		HealthInterval: envDuration("NOO_HOSTD_HEALTH_INTERVAL", 5*time.Second),
 		Logf: func(format string, a ...any) {
-			fmt.Fprintf(w, "[noo-hostd %s] %s\n",
-				time.Now().UTC().Format("2006-01-02T15:04:05Z"), fmt.Sprintf(format, a...))
+			fmt.Fprint(w, logLines(time.Now().UTC(), fmt.Sprintf(format, a...)))
 		},
 	}
 	return e, closer, nil
+}
+
+// logLines prefixes EVERY line of one log entry. A multi-line entry (the boot
+// step logs its script's whole stderr as one) used to get the prefix on its
+// first line only, so the same message read "[noo-hostd …] boot-restore: …" on
+// one boot and bare on the next, depending on what printed before it (0.6.24-rc.7
+// rehearsal, A-reboot.nats). Trailing newlines add no empty entry.
+func logLines(t time.Time, msg string) string {
+	prefix := fmt.Sprintf("[noo-hostd %s] ", t.Format("2006-01-02T15:04:05Z"))
+	var b strings.Builder
+	for _, line := range strings.Split(strings.TrimRight(msg, "\n"), "\n") {
+		b.WriteString(prefix)
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return b.String()
 }
 
 func cmdRun(argv []string) error {

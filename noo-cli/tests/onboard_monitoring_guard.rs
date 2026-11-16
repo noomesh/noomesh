@@ -3,11 +3,11 @@
 
 //! `--bundle` must apply to standalone onboarding whether standalone was
 //! explicit (`--standalone`) or auto-detected (no repo checkout anywhere)
-//! — not only when the flag was written out. `--with-monitoring` is a
-//! no-op since 2026-09-28 (the monitoring set rides the `standalone`
-//! profile itself) and is accepted everywhere, so an old script keeps
+//! — not only when the flag was written out. `--with-monitoring` is the
+//! old spelling of `--monitoring-full` (the yes answer to the Grafana, Loki
+//! and Tempo question) and is accepted everywhere, so an old script keeps
 //! working; it is the auto-detect probe below because it has no argument
-//! and no side effect.
+//! and no side effect before the services step.
 //!
 //! Regression for: the guard used to run BEFORE the auto-detect block, so
 //! a bare `noo onboard --with-monitoring` on a fresh box (which the code a
@@ -78,10 +78,10 @@ fn with_monitoring_is_accepted_once_standalone_auto_detects() {
 /// flag: onboarding is NOT standalone, so `--bundle` must be refused with
 /// the same message and exit code 2 — this guard fires before any side
 /// effects, so the process runs to completion. `--with-monitoring` in the
-/// same place is accepted with a note and NOT refused (it used to be: it
-/// was the standalone monitoring opt-in, and there is no opt-in any more).
+/// same place is accepted and NOT refused: it is the yes answer to the
+/// monitoring question (`--monitoring-full`), on any install shape.
 #[test]
-fn bundle_is_refused_and_with_monitoring_is_a_noop_in_a_repo_checkout() {
+fn bundle_is_refused_and_with_monitoring_is_accepted_in_a_repo_checkout() {
     // The crate root of this worktree: has docker-compose.cluster.yml next
     // to noo-cli, so `repo_root()`'s cwd-walk resolves here and auto-detect
     // does NOT flip standalone.
@@ -106,8 +106,8 @@ fn bundle_is_refused_and_with_monitoring_is_a_noop_in_a_repo_checkout() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains(GUARD_MSG), "stderr: {stderr}");
 
-    // --with-monitoring: accepted, noted, and the run goes on past the
-    // guard (killed shortly after, like the auto-detect probe above).
+    // --with-monitoring: accepted, and the run goes on past the guard
+    // (killed shortly after, like the auto-detect probe above).
     let mut child = Command::new(bin())
         .args(["onboard", "--with-monitoring", "--dry-run", "--non-interactive"])
         .env_clear()
@@ -122,5 +122,6 @@ fn bundle_is_refused_and_with_monitoring_is_a_noop_in_a_repo_checkout() {
     let out = child.wait_with_output().expect("collect output");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!stderr.contains(GUARD_MSG), "--with-monitoring was refused: {stderr}");
-    assert!(stderr.contains("no longer needed"), "expected the no-op note — stderr: {stderr}");
+    assert!(!stderr.contains("unknown onboard flag"), "--with-monitoring is the yes alias, not unknown: {stderr}");
+    assert!(!stderr.contains("no longer needed"), "the retired no-op note is back: {stderr}");
 }

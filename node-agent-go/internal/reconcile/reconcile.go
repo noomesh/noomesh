@@ -86,6 +86,13 @@ type placement struct {
 	// the gateway at place time from the fit estimate (weights + KV +
 	// overhead) and capped by the node's usage profile. 0 = the spec default.
 	MemoryLimitBytes int64 `json:"memory_limit_bytes"`
+	// KeepWarm: `noo cluster place … --keep-warm` (ollama chat placements).
+	// The agent keeps THIS model loaded on whichever ollama serves it (agent
+	// run, brew, the adopted stack lane): it adds keep_alive -1 to the
+	// model's requests and preloads it (internal/keepwarm). Not part of the
+	// spec hash: it changes no container. A pre-keep-warm gateway omits it,
+	// which is false.
+	KeepWarm bool `json:"keep_warm"`
 }
 
 type nodeConfig struct {
@@ -126,6 +133,12 @@ type desiredConfig struct {
 	// ignores the key), while the node_workloads fragment is decoded strictly.
 	// Absent (or epoch 0) = nothing to retry. See applyModelSetRetry.
 	ModelSetRetry *modelSetRetry `json:"model_set_retry"`
+	// The context the controller decided for each Ollama chat model here
+	// (i802): {"<model>": tokens}. The gateway sends every chat body to this
+	// Ollama with it as options.num_ctx; the agent's own Ollama callers (the
+	// job executor) send the same value, so nothing reloads the model at
+	// another context. Absent on an older gateway or when nothing is decided.
+	ChatContexts map[string]int `json:"chat_contexts"`
 }
 
 // Reconciler pulls desired config and converges the node toward it.
@@ -158,6 +171,12 @@ type Reconciler struct {
 	nwMu   sync.Mutex
 	nwBusy map[string]bool
 	nwWG   sync.WaitGroup
+	// nwChanged runs after each node workload converge (the heartbeat Kick);
+	// nil = nothing (tests).
+	nwChanged func()
+	// leafFired: the workloads the leaf watch already nudged for, per arrival.
+	leafMu    sync.Mutex
+	leafFired map[string]bool
 	// ctlApprovals keeps the controller's signed approval set (i596); nil in
 	// tests that build a Reconciler by hand, and the offer is then skipped.
 	ctlApprovals *nodepolicy.ControllerApprovals
@@ -193,6 +212,9 @@ type Reconciler struct {
 	// daemon gets it), nil when chat is not on ollama; for
 	// ChatContextWindow. Guarded by harnessMu.
 	chatOllamaEnv map[string]string
+	// chatContexts is desired-config's `chat_contexts` (ChatContext), keyed
+	// by chatContextKey. Guarded by harnessMu.
+	chatContexts map[string]int
 	// harness is the ONE host service this node regulates:
 	// started and stopped per placement through the applier's sudoers
 	// grant, never a container and never a child of this process.
@@ -314,6 +336,7 @@ func (r *Reconciler) Run(ctx context.Context) {
 	// workload declarations load now, not at the first tick 30 s away: a
 	// reserve right after an agent restart would meet 404 not_declared.
 	r.loadAddonWorkloads(ctx)
+	go r.watchLeaves(ctx, leafWatchInterval)
 	select {
 	case <-ctx.Done():
 		return
@@ -402,6 +425,7 @@ var reconcilePhases = []phase{
 	{"convergePlacements", (*Reconciler).convergePlacements},
 	{"healDoorNamespaces", (*Reconciler).healDoorNamespaces},
 	{"reportAndCleanup", (*Reconciler).reportAndCleanup},
+	{"writeImageKeep", (*Reconciler).writeImageKeep},
 }
 
 // Once performs a single reconcile pass. Errors are logged, never fatal —
@@ -448,7 +472,9 @@ func (r *Reconciler) publishProfileAndEmbedTarget(ctx context.Context, t *tick) 
 	applyHarnessProfile(t.desired.HarnessProfile)
 	declareAddonWorkloads(t.desired)
 	r.recordChatPlacement(t.desired.Placements)
+	r.recordChatContexts(t.desired.ChatContexts)
 	publishLanePlacements(t.desired.Placements)
+	publishKeepWarm(t.desired.Placements)
 	// Before the empty-state return below: a node with nothing placed still
 	// has a disk to keep.
 	if r.onReclaimPolicy != nil {
@@ -1245,7 +1271,7 @@ func buildPlacementEnv(p placement) map[string]string {
 // injects or resolves them nondeterministically at start time — hashing them
 // would report false drift on a placement that never changed:
 //
-//   - HF_HUB_OFFLINE  — set to "1" only when preseedModel() copied weights from
+//   - HF_HUB_OFFLINE  — set to "1" on a placed node once stageHFModel() verified weights from
 //     the controller store; depends on cache state, not on the placement.
 //   - N_GPU_LAYERS    — the "auto" sentinel resolves to 999 (GPU) or 0 (CPU)
 //     per node in buildEnvList, so the effective value is node-dependent.

@@ -582,65 +582,364 @@ pub(super) async fn fetch_companion_context(state: &AppState) -> Option<String> 
 // Tool expansion (Item 5) — discover new tools after noo_tool_search
 // ═══════════════════════════════════════════════════════════════
 
-/// Semantic recall within the current conversation. Uses pgvector cosine
-/// similarity on noo_entries scoped to this conversation_id. Returns the
-/// most relevant past messages regardless of recency — useful when older
-/// content has been dropped by fit_context_window.
-pub(super) async fn fetch_conversation_recall(
-    state: &AppState,
-    conversation_id: &str,
-    query: &str,
+/// How long the per-turn conversation recall waits for its query embedding.
+///
+/// Sized for a COLD embedder, not a warm one: harrier (the CPU embedder)
+/// answers in ~0.22 s warm but cold-loads in ~1.45 s on a 4-core runner,
+/// and a slower box or a bigger embedder can take several times that. The
+/// old 5 s budget turned such a cold load into "no recall" with nobody told.
+/// 15 s waits out a cold load while still bounding the turn: recall runs
+/// before the model call, so the bound only adds latency when the embedder
+/// really is cold (warm turns return as soon as the vector does). Timing out
+/// here does not bench the target -- the outer bound cancels the request
+/// before the per-target transport timeout (bound + 1 s) can fire, and the
+/// embedder keeps loading for the next turn.
+pub(crate) const RECALL_EMBED_BOUND: Duration = Duration::from_secs(15);
+
+/// What the per-turn recall did, reported in the turn's metadata (`recall`
+/// on the `done` frame, the saved assistant message and the REST answer).
+/// Serialises as `{"status":"ok","hits":N}` or
+/// `{"status":"skipped","reason":"..."}`: a skipped recall is never silent.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RecallStatus {
+    Ok { hits: u32 },
+    Skipped { reason: String },
+}
+
+/// The recall layer's text (None = nothing to add) and what happened.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecallOutcome {
+    pub text: Option<String>,
+    pub status: RecallStatus,
+}
+
+impl RecallOutcome {
+    pub fn skipped(reason: impl Into<String>) -> Self {
+        RecallOutcome { text: None, status: RecallStatus::Skipped { reason: reason.into() } }
+    }
+
+    /// The `recall` metadata value.
+    pub fn metadata(&self) -> Value {
+        serde_json::to_value(&self.status).unwrap_or(Value::Null)
+    }
+
+    /// Read a rail answer (`{"text": ..., "recall": {...}}`). A gateway too
+    /// old to send `recall` is read from its text: present = ok with one hit
+    /// per recalled line, absent = ok with none (it cannot say more).
+    pub fn from_wire(v: &Value) -> Self {
+        let text = v.get("text").and_then(|t| t.as_str()).map(str::to_string);
+        let status = v
+            .get("recall")
+            .and_then(|r| serde_json::from_value::<RecallStatus>(r.clone()).ok())
+            .unwrap_or_else(|| RecallStatus::Ok {
+                hits: text.as_deref().map_or(0, |t| t.lines().filter(|l| l.starts_with("- ")).count() as u32),
+            });
+        RecallOutcome { text, status }
+    }
+}
+
+/// Embed the recall query within `bound`, naming why when it cannot.
+/// The bound is a hard cap on the whole embed (every candidate tried),
+/// so a turn can never hang here.
+pub(crate) async fn embed_for_recall<F>(embed: F, bound: Duration) -> Result<Vec<f64>, String>
+where
+    F: std::future::Future<Output = Result<Vec<f64>, crate::embedding_client::EmbedError>>,
+{
+    match tokio::time::timeout(bound, embed).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(format!("embedder error: {e}")),
+        Err(_) => Err(format!("embedder not ready (timed out after {} s)", bound.as_secs())),
+    }
+}
+
+/// The recall pipeline with its two effects injected (the embed and the
+/// vector search), so its reporting is testable without a mesh or a DB.
+pub(crate) async fn conversation_recall_with<E, S, SF>(
+    embed: E,
+    bound: Duration,
+    search: S,
     top_k: u32,
-) -> Option<String> {
-    if conversation_id.is_empty() || query.is_empty() {
-        return None;
-    }
+) -> RecallOutcome
+where
+    E: std::future::Future<Output = Result<Vec<f64>, crate::embedding_client::EmbedError>>,
+    S: FnOnce(Vec<f64>) -> SF,
+    SF: std::future::Future<Output = Result<Vec<(String, String, f64)>, String>>,
+{
+    let embedding = match embed_for_recall(embed, bound).await {
+        Ok(v) => v,
+        Err(reason) => {
+            tracing::warn!(layer = "semantic_recall", reason = %reason, "conversation_recall_skipped");
+            return RecallOutcome::skipped(reason);
+        }
+    };
+    let rows = match search(embedding).await {
+        Ok(r) => r,
+        Err(e) => {
+            let reason = format!("recall search failed: {e}");
+            tracing::warn!(layer = "semantic_recall", reason = %reason, "conversation_recall_skipped");
+            return RecallOutcome::skipped(reason);
+        }
+    };
+    let (text, hits) = format_recall_rows(&rows, top_k);
+    RecallOutcome { text, status: RecallStatus::Ok { hits } }
+}
 
-    // 1. Embed the query — mesh, not the static endpoint. This used
-    // embed_one() against the configured URL, which on a normal deployment
-    // points at nothing on the controller; the `.ok()?` below then turned
-    // every failure into "no recall", silently disabling this layer.
-    let truncated: String = query.chars().take(1500).collect();
-    let embedding = crate::embedding_client::resolve()
-        .embed_one_with_mesh(state, &truncated, Duration::from_secs(5))
-        .await
-        .ok()?;
-
-    let vec_str = crate::embedding_client::pgvector_literal(&embedding);
-
-    // 2. Vector search scoped to THIS conversation only
-    let rows: Result<Vec<(String, String, f64)>, _> = sqlx::query_as(
-        "SELECT e.type, e.content, \
-                1 - (e.embedding <=> CAST($1 AS vector)) AS score \
-         FROM noo_entries e \
-         WHERE e.conversation_id = $2::uuid \
-           AND e.embedding IS NOT NULL \
-         ORDER BY e.embedding <=> CAST($1 AS vector) \
-         LIMIT $3"
-    )
-    .bind(&vec_str)
-    .bind(conversation_id)
-    .bind(top_k as i32)
-    .fetch_all(&state.db)
-    .await;
-
-    let rows = rows.ok()?;
-    if rows.is_empty() {
-        return None;
-    }
-
+/// The recall layer's text from scored rows: weak matches (score < 0.5)
+/// dropped; None when nothing passes. Returns the hit count with it.
+fn format_recall_rows(rows: &[(String, String, f64)], top_k: u32) -> (Option<String>, u32) {
     let mut context = String::from("[Relevant earlier messages in this conversation]");
+    let mut hits = 0u32;
     for (msg_type, content, score) in rows.iter().take(top_k as usize) {
         // Filter low-relevance results (score below 0.5 = weak match)
         if *score < 0.5 { continue; }
         let preview: String = content.chars().take(300).collect();
         context.push_str(&format!("\n- ({msg_type}, score={:.2}) {preview}", score));
+        hits += 1;
+    }
+    if hits == 0 {
+        return (None, 0); // No results passed the relevance threshold
+    }
+    (Some(context), hits)
+}
+
+/// Semantic recall within the current conversation. Uses pgvector cosine
+/// similarity on noo_entries scoped to this conversation_id. Returns the
+/// most relevant past messages regardless of recency — useful when older
+/// content has been dropped by fit_context_window.
+///
+/// Never silent: a recall that cannot run (embedder cold past
+/// [`RECALL_EMBED_BOUND`], embedder error, no embedder, search failure)
+/// comes back `Skipped` with the reason, for the turn's metadata.
+pub(super) async fn fetch_conversation_recall(
+    state: &AppState,
+    conversation_id: &str,
+    query: &str,
+    top_k: u32,
+) -> RecallOutcome {
+    if conversation_id.is_empty() || query.is_empty() {
+        return RecallOutcome { text: None, status: RecallStatus::Ok { hits: 0 } };
     }
 
-    if context.lines().count() < 2 {
-        return None; // No results passed the relevance threshold
+    // 1. Embed the query — mesh, not the static endpoint. The per-target
+    // transport timeout sits 1 s past the bound so the bound always fires
+    // first: a cold target is waited for, then left loading, never benched
+    // by recall.
+    let truncated: String = query.chars().take(1500).collect();
+    let endpoint = crate::embedding_client::resolve();
+    let embed = endpoint.embed_one_with_mesh(state, &truncated, RECALL_EMBED_BOUND + Duration::from_secs(1));
+
+    // 2. Vector search scoped to THIS conversation only
+    let search = move |embedding: Vec<f64>| async move {
+        let vec_str = crate::embedding_client::pgvector_literal(&embedding);
+        sqlx::query_as::<_, (String, String, f64)>(
+            "SELECT e.type, e.content, \
+                    1 - (e.embedding <=> CAST($1 AS vector)) AS score \
+             FROM noo_entries e \
+             WHERE e.conversation_id = $2::uuid \
+               AND e.embedding IS NOT NULL \
+             ORDER BY e.embedding <=> CAST($1 AS vector) \
+             LIMIT $3"
+        )
+        .bind(&vec_str)
+        .bind(conversation_id)
+        .bind(top_k as i32)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| e.to_string())
+    };
+
+    conversation_recall_with(embed, RECALL_EMBED_BOUND, search, top_k).await
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Prompt tiers (i802): the persona split
+// ═══════════════════════════════════════════════════════════════
+
+/// How much of the coordinator's standing text a turn carries.
+///
+/// * `Compact`: the core persona only (`prompts/coordinator-core.md`:
+///   identity, the tool safety rules, personality), three core tools, one
+///   skill, no runbooks. For a model whose window or prefill rate cannot
+///   take the full block on every call (the default one-box: a small model
+///   on a CPU Ollama).
+/// * `Full`: the core plus `prompts/coordinator-full-extra.md`, every core
+///   tool, today's skill budget and runbooks.
+///
+/// The safety rules live in the core, so both tiers carry them
+/// (the `the_*_rule_rides_both_tiers` tests in `prompt_tier_tests`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptTier {
+    Full,
+    Compact,
+}
+
+/// Where the persona files are looked for, in order: the compose mount,
+/// then the working directory (a dev run from the repo root).
+const PERSONA_DIRS: &[&str] = &["/app/prompts", "prompts"];
+/// Always sent, in both tiers.
+const PERSONA_CORE_FILE: &str = "coordinator-core.md";
+/// Appended to the core in the Full tier only.
+const PERSONA_EXTRA_FILE: &str = "coordinator-full-extra.md";
+/// The pre-split single file; read only when a prompts dir has no core
+/// file (a hand-mounted dir from before 0.6.25), and then sent whole.
+const PERSONA_LEGACY_FILE: &str = "coordinator.md";
+
+/// The persona for `tier` from the core and (Full only) the extra text.
+pub(crate) fn compose_persona(tier: PromptTier, core: &str, extra: Option<&str>) -> String {
+    match (tier, extra) {
+        (PromptTier::Full, Some(x)) if !x.trim().is_empty() => format!("{}\n\n{}", core.trim(), x.trim()),
+        _ => core.trim().to_string(),
     }
-    Some(context)
+}
+
+/// The persona for `tier` from one prompts dir; None when the dir holds
+/// neither the core nor the legacy file.
+fn persona_in(dir: &std::path::Path, tier: PromptTier) -> Option<String> {
+    let read = |name: &str| {
+        std::fs::read_to_string(dir.join(name)).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    };
+    match read(PERSONA_CORE_FILE) {
+        Some(core) => Some(compose_persona(tier, &core, read(PERSONA_EXTRA_FILE).as_deref())),
+        None => read(PERSONA_LEGACY_FILE),
+    }
+}
+
+/// The persona text for `tier`, read from the first prompts dir that has
+/// one (small local files, read synchronously). Empty when none is found;
+/// [`load_persona_prompt`] then falls back to the configured prompt.
+pub(crate) fn persona_for(tier: PromptTier) -> String {
+    PERSONA_DIRS
+        .iter()
+        .find_map(|d| persona_in(std::path::Path::new(d), tier))
+        .unwrap_or_default()
+}
+
+/// The core tools a Compact turn sends: search for more tools, the
+/// knowledge base, memory. Each is in `CORE_TOOLS`
+/// (`prompt_tier_tests::compact_core_tools_are_core_tools`).
+const COMPACT_CORE_TOOLS: &[&str] = &["noo_tool_search", "noo_rag_query", "noo_memory_search"];
+
+/// The core tools a turn of `tier` keeps. Both loops filter their selection
+/// to these on a Compact turn (`agent_loop::tier_tools`); keyword groups'
+/// tools stay on top.
+pub(crate) fn core_tools_for(tier: PromptTier) -> &'static [&'static str] {
+    match tier {
+        PromptTier::Full => super::agent_loop::CORE_TOOLS,
+        PromptTier::Compact => COMPACT_CORE_TOOLS,
+    }
+}
+
+/// How many prompt skills a turn of `tier` carries. Both loops drop the
+/// skill layer when it is 0 (a Compact turn).
+pub(crate) fn max_skills_for(tier: PromptTier) -> usize {
+    match tier {
+        PromptTier::Full => crate::prompt_skills::MAX_SKILLS,
+        // None: the compact base already takes ~1,235 of the 1,536 real
+        // tokens half a 4k window allows, and the smallest core skill is
+        // ~1,400 chars, so even one would push it past (i802 PR-2).
+        PromptTier::Compact => 0,
+    }
+}
+
+/// Whether a turn of `tier` carries runbooks. Both loops skip
+/// `runbook_context` when it is false (a Compact turn).
+pub(crate) fn runbooks_for(tier: PromptTier) -> bool {
+    tier == PromptTier::Full
+}
+
+/// Cold-prefill ceiling for the Full tier, in seconds: past it, a turn
+/// sends the Compact tier. From fa's measurements on the default one-box
+/// (gemma4:e2b, CPU Ollama): install-matrix run 43621289858 prefilled 2,051
+/// tokens in 28 s at four slots; run 43628426011 measured ~370 tok/s at one
+/// slot against ~125 tok/s at four. 20 s keeps the first token of a
+/// one-slot Full turn (~4.6k tokens, ~12 s) and drops a four-slot one (~37 s).
+#[allow(dead_code)]
+pub(crate) const PREFILL_COMPACT_SECS: f64 = 20.0;
+
+/// Which tier a turn sends. Compact when the full prompt does not fit
+/// `max_input`, or when a known prefill rate puts its cold prefill past
+/// [`PREFILL_COMPACT_SECS`]. With no usable rate: Full on a GPU, Compact on
+/// a CPU. `full_tokens_real` is the Full tier's prompt in real tokens.
+// NOT WIRED (noomesh-internal i802 follow-up "tier by measured prefill"):
+// the loops pick the tier from the window alone (`agent_loop::prompt_tier`,
+// Compact under 8k). Wiring this needs the measured prefill rate per
+// backend (backend_call's prefill_ms) and the Full prompt's real size.
+#[allow(dead_code)]
+pub(crate) fn choose_tier(full_tokens_real: u64, max_input: u64, prefill_tok_per_s: Option<f64>, cpu: bool) -> PromptTier {
+    if full_tokens_real > max_input {
+        return PromptTier::Compact;
+    }
+    match prefill_tok_per_s {
+        Some(rate) if rate.is_finite() && rate > 0.0 => {
+            if full_tokens_real as f64 / rate > PREFILL_COMPACT_SECS {
+                PromptTier::Compact
+            } else {
+                PromptTier::Full
+            }
+        }
+        _ => {
+            if cpu {
+                PromptTier::Compact
+            } else {
+                PromptTier::Full
+            }
+        }
+    }
+}
+
+/// Rule text that rides with a tool group instead of the persona: sent only
+/// on a turn whose message selected one of the listed `TOOL_GROUPS` names.
+/// Moved verbatim from the persona's Tool Usage Rules 7-9 (i802).
+const GROUP_GUIDANCE: &[(&[&str], &str)] = &[
+    (&["jobs", "heartbeat"], r#"## Tool Notes: tasks, jobs, activities
+
+**"Tasks" vs "jobs" vs "activities" — three different concepts.**
+   - **Activities** (`noo_activity_list`): long-running pursuits the agent tracks across runs — multi-week research, knowledge cleanup campaigns, recurring investigations. Decompose into many tasks. Use `noo_activity_create` when the user describes a multi-step goal (e.g. "track everything about agentic AI in 3D"). Use `noo_activity_progress` to record findings as related work completes. Use `noo_activity_complete` when the success criterion is met.
+   - **Scheduled tasks** (`noo_heartbeat_list_tasks`): recurring cron-fired actions (daily research, cluster health checks). The dashboard `/tasks` panel. Use when user asks "what tasks do we have" or "set up a recurring X".
+   - **Cluster jobs** (`noo_job_list`): transient background work (graph extraction, embedding batches). Rarely user-facing. Only use when user specifically asks about "jobs" / "queue" / "background work".
+   - When in doubt for "what am I working on right now": activities + tasks. Not jobs."#),
+    (&["heartbeat"], r#"## Tool Notes: scheduling
+
+**Scheduling vs launching tasks — two different intents, two different tools.** Always pick the right one.
+   - **Create / schedule a recurring task** ("every day…", "set up a weekly…", "remind me hourly to…"): use `noo_schedule_task`. Pass natural language: `name`, `do`, `when`. The tool translates schedules and classifies actions for you, AND verifies the row landed before returning. Do NOT invent cron expressions yourself.
+   - **Launch / run an EXISTING task right now** ("run the cluster health check now", "trigger today's research now"): use `noo_heartbeat_run_task` with the task_id. This does NOT create — the task must already exist.
+   - **Both — create AND run once now** ("set up daily research AND give me one now"): use `noo_schedule_task` with `run_immediately=true`. Single call.
+   - Do NOT use the lower-level `noo_heartbeat_create_task` unless `noo_schedule_task` returned an error you understand how to fix.
+   - After ANY scheduling call, only claim success if the tool response shows `verified: true` and a real `task_id`. If the tool was rejected (id collision, bad schedule, etc.), report the actual error message to the user — do NOT say "successfully queued" if the tool errored or you didn't call it at all."#),
+    (&["coding"], r#"## Tool Notes: coding
+
+When asked to implement, fix, refactor, or write code: use `noo_coding_task`. The tool has an `engine` parameter:
+   - `engine="local"` (preferred for: prompt/skill tweaks, single-file config changes, small one-or-two-edit tasks). Free — runs the same Claude Code CLI but routed through the cluster's local LLM.
+   - `engine="claude"` (default; use for: multi-file refactors, adding features, fixing complex bugs, anything that needs tests). Costs API $; use when the local engine is likely to fail or has already failed.
+   - When in doubt for a small change, try `engine="local"` first. If the result fails verification (audit log shows tier mismatch or the change doesn't take effect), retry with `engine="claude"`."#),
+];
+
+/// The `TOOL_GROUPS` names `user_message` selects, by the same keyword rule
+/// `select_tool_schemas` applies (lowercased substring).
+// Both loops append `group_guidance(&selected_groups(prompt))` to the
+// system message (after the persona, before CLOCK_RULE), in both tiers.
+pub(crate) fn selected_groups(user_message: &str) -> Vec<&'static str> {
+    let msg = user_message.to_lowercase();
+    super::agent_loop::TOOL_GROUPS
+        .iter()
+        .filter(|(_, _, keywords)| keywords.iter().any(|kw| msg.contains(kw)))
+        .map(|(group, _, _)| *group)
+        .collect()
+}
+
+/// The guidance for the selected tool groups, each block once, in table
+/// order; empty when no listed group is selected. Starts with a blank line
+/// so it appends straight onto the persona.
+pub(crate) fn group_guidance(groups: &[&str]) -> String {
+    let mut out = String::new();
+    for (owners, text) in GROUP_GUIDANCE {
+        if owners.iter().any(|o| groups.contains(o)) {
+            out.push_str("\n\n");
+            out.push_str(text);
+        }
+    }
+    out
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -655,19 +954,13 @@ pub(super) async fn fetch_conversation_recall(
 /// round-trip that always missed. Runtime prompt changes
 /// go through the settings surface, not a bucket nothing fills.
 pub(super) async fn load_persona_prompt(state: &AppState) -> String {
-    // 1. Try loading from file (prompts/coordinator.md)
-    let prompt_paths = [
-        "/app/prompts/coordinator.md",
-        "prompts/coordinator.md",
-    ];
-    for path_str in &prompt_paths {
-        if let Ok(contents) = tokio::fs::read_to_string(path_str).await {
-            let prompt = contents.trim().to_string();
-            if !prompt.is_empty() {
-                tracing::debug!(source = "file", path = path_str, "persona_prompt_loaded");
-                return prompt;
-            }
-        }
+    // 1. The persona files (prompts/coordinator-core.md + the Full tier's
+    // prompts/coordinator-full-extra.md). Every caller sends Full until the
+    // loop chooses a tier per turn (see `choose_tier`).
+    let prompt = tokio::task::spawn_blocking(|| persona_for(PromptTier::Full)).await.unwrap_or_default();
+    if !prompt.is_empty() {
+        tracing::debug!(source = "file", "persona_prompt_loaded");
+        return prompt;
     }
 
     // 3. Fall back to config
@@ -1416,33 +1709,88 @@ mod data_frame_tests {
 mod system_prompt_budget_tests {
     use super::*;
 
-    /// The repo root, where prompts/ lives; None in an image built without it.
-    fn repo_root() -> Option<std::path::PathBuf> {
+    /// The repo root, where prompts/ and config/ live; None in an image
+    /// built without them.
+    pub(super) fn repo_root() -> Option<std::path::PathBuf> {
         for root in ["../..", "..", ".", "/build", "/repo"] {
             let p = std::path::Path::new(root);
-            if p.join("prompts/coordinator.md").is_file() && p.join("prompts/skills/core").is_dir() {
+            if p.join("prompts").join(PERSONA_CORE_FILE).is_file() && p.join("prompts/skills/core").is_dir() {
                 return Some(p.to_path_buf());
             }
         }
         None
     }
 
-    /// The estimator `request_size` logs with (chars x 10 / 25).
-    fn est_tokens(s: &str) -> usize {
-        s.len() * 10 / 25
+    /// The repo root, or None after saying why the test is skipped (a
+    /// panic when the corpus is required).
+    pub(super) fn repo_root_or_skip() -> Option<std::path::PathBuf> {
+        let root = repo_root();
+        if root.is_none() {
+            if std::env::var("NOO_SKILL_CORPUS_REQUIRED").is_ok() {
+                panic!("prompts/ not found but NOO_SKILL_CORPUS_REQUIRED is set");
+            }
+            eprintln!("SKIPPED (no prompts/): mount the repo to run the budget test");
+        }
+        root
     }
 
-    /// The system prompt a task loop sends for `objective`, from the shipped
-    /// files: persona, cluster guidance on ops intent only, the clock rule,
-    /// and the skills the objective selects.
-    fn system_prompt_for(root: &std::path::Path, objective: &str) -> String {
-        let mut s = std::fs::read_to_string(root.join("prompts/coordinator.md")).unwrap().trim().to_string();
+    /// Chars per REAL token for the assertions. The gateway's estimator
+    /// (`request_size`) uses 2.5; English prose runs nearer 4 on the models
+    /// we ship, and tool-schema JSON lower. 3.0 is the conservative middle,
+    /// counted on bytes (an em dash is three), so a pass here is not a
+    /// tokenizer accident.
+    const CHARS_PER_REAL_TOKEN: f64 = 3.0;
+
+    fn real_tokens(s: &str) -> usize {
+        (s.len() as f64 / CHARS_PER_REAL_TOKEN).ceil() as usize
+    }
+
+    /// Half of what is left of the window after the reply reserve: the
+    /// other half is for the conversation and retrieved data.
+    const fn standing_budget(window: usize, reply_reserve: usize) -> usize {
+        (window - reply_reserve) / 2
+    }
+
+    /// Compact: a 4k-window model with 1k reserved for the reply.
+    const COMPACT_BUDGET: usize = standing_budget(4096, 1024);
+    /// Full: the 16k tier with 4k reserved for the reply.
+    const FULL_BUDGET: usize = standing_budget(16384, 4096);
+
+    /// The persona for `tier` from the repo's prompts dir.
+    fn persona(root: &std::path::Path, tier: PromptTier) -> String {
+        persona_in(&root.join("prompts"), tier).expect("persona files")
+    }
+
+    /// The tool schemas the loop sends for `names`, as it serializes them,
+    /// from config/tools.json (the same `{type, function}` shape
+    /// `load_tool_schemas_cached` builds).
+    fn tool_schemas(root: &std::path::Path, names: &[&str]) -> String {
+        let raw = std::fs::read_to_string(root.join("config/tools.json")).expect("config/tools.json");
+        let v: Value = serde_json::from_str(&raw).expect("tools.json parses");
+        let tools = v["core_tools"].as_array().expect("core_tools");
+        let mut out = String::new();
+        for name in names {
+            let t = tools
+                .iter()
+                .find(|t| t["function"]["name"].as_str() == Some(*name))
+                .unwrap_or_else(|| panic!("{name} missing from config/tools.json"));
+            let schema = json!({"type": t.get("type").cloned().unwrap_or(json!("function")), "function": t["function"].clone()});
+            out.push_str(&serde_json::to_string(&schema).unwrap());
+        }
+        out
+    }
+
+    /// The system prompt a task loop sends for `objective` in `tier`, from
+    /// the shipped files: persona, cluster guidance on ops intent only, the
+    /// clock rule, and at most `max_skills_for(tier)` selected skills.
+    fn system_prompt_for(root: &std::path::Path, objective: &str, tier: PromptTier) -> String {
+        let mut s = persona(root, tier);
         if ops_intent(objective) {
             s.push_str(CLUSTER_GUIDANCE);
         }
         s.push_str(CLOCK_RULE);
         let reg = crate::prompt_skills::SkillRegistry::scan(root);
-        for skill in crate::prompt_skills::select(&reg, objective, "coordinator", &[], &[]) {
+        for skill in crate::prompt_skills::select(&reg, objective, "coordinator", &[], &[]).into_iter().take(max_skills_for(tier)) {
             s.push_str("\n\n");
             s.push_str(&skill.to_injection_text());
         }
@@ -1451,30 +1799,42 @@ mod system_prompt_budget_tests {
 
     /// The operator's efficiency rule, measured: a one-word task sent an
     /// 8,380 estimated-token system prompt on 2026-11-11 (awolf harness,
-    /// `request_size`), on every model call. A non-ops task's system prompt
-    /// now stays under this budget; the persona split (0.6.25) lowers it.
-    const NON_OPS_SYSTEM_BUDGET: usize = 5_300;
-
+    /// `request_size`), on every model call. Since the persona split
+    /// (i802), a non-ops Compact turn's standing text (core persona, clock
+    /// rule, no skill, the three core tools' schemas) fits half of a
+    /// 4k window after a 1k reply reserve, in real tokens.
     #[test]
-    fn a_non_ops_task_system_prompt_stays_under_its_budget() {
-        let Some(root) = repo_root() else {
-            if std::env::var("NOO_SKILL_CORPUS_REQUIRED").is_ok() {
-                panic!("prompts/ not found but NOO_SKILL_CORPUS_REQUIRED is set");
-            }
-            eprintln!("SKIPPED (no prompts/): mount the repo to run the budget test");
-            return;
-        };
+    fn a_non_ops_compact_turn_fits_half_a_4k_window() {
+        let Some(root) = repo_root_or_skip() else { return };
+        let tools = tool_schemas(&root, core_tools_for(PromptTier::Compact));
         // The 0.6.24-rc.1 rehearsal's task one: "never stop" drew cluster-operator
         // (5,548 estimated tokens) while its triggers held bare verbs.
         for objective in ["Reply with the single word ok and finish.", "Write me a short poem about autumn.", "What is on my calendar tomorrow?",
                           "Count upward from 1, one number per loop, and note each number. Never stop and never call noo_task_done."] {
-            let sys = system_prompt_for(&root, objective);
+            let sys = system_prompt_for(&root, objective, PromptTier::Compact);
             assert!(!sys.contains("## Cluster Nodes (live)"), "{objective:?}: cluster guidance without ops intent");
-            assert!(est_tokens(&sys) <= NON_OPS_SYSTEM_BUDGET, "{objective:?}: {} estimated tokens > {NON_OPS_SYSTEM_BUDGET}", est_tokens(&sys));
+            let total = real_tokens(&sys) + real_tokens(&tools);
+            assert!(total <= COMPACT_BUDGET, "{objective:?}: {total} real tokens (system {} + tools {}) > {COMPACT_BUDGET}", real_tokens(&sys), real_tokens(&tools));
         }
-        // An ops objective still gets the guidance and the operator skill.
-        let ops = system_prompt_for(&root, "Restart the vllm backend on node awolf");
+        // An ops objective still gets the guidance in either tier; the
+        // operator skill rides only the Full tier (Compact takes no skill).
+        let ops = system_prompt_for(&root, "Restart the vllm backend on node awolf", PromptTier::Compact);
+        assert!(ops.contains("## Cluster Nodes (live)") && !ops.contains("## Skill: "), "{}", &ops[ops.len().saturating_sub(400)..]);
+        let full = system_prompt_for(&root, "Restart the vllm backend on node awolf", PromptTier::Full);
+        assert!(full.contains("## Skill: cluster-operator"), "{}", &full[full.len().saturating_sub(400)..]);
+    }
+
+    /// The Full persona, with the ops guidance and the clock rule, fits
+    /// half of the 16k tier after a 4k reply reserve.
+    #[test]
+    fn the_full_persona_fits_half_the_16k_tier() {
+        let Some(root) = repo_root_or_skip() else { return };
+        let full = format!("{}{CLUSTER_GUIDANCE}{CLOCK_RULE}", persona(&root, PromptTier::Full));
+        assert!(real_tokens(&full) <= FULL_BUDGET, "{} real tokens > {FULL_BUDGET}", real_tokens(&full));
+        let ops = system_prompt_for(&root, "Restart the vllm backend on node awolf", PromptTier::Full);
         assert!(ops.contains("## Cluster Nodes (live)") && ops.contains("## Skill: cluster-operator"), "{}", &ops[ops.len().saturating_sub(400)..]);
+        let calm = system_prompt_for(&root, "Write me a short poem about autumn.", PromptTier::Full);
+        assert!(!calm.contains("## Cluster Nodes (live)"), "cluster guidance without ops intent");
     }
 
     #[test]
@@ -1500,5 +1860,292 @@ mod system_prompt_budget_tests {
         assert_eq!(s, "Book a table\n\nfor two\n\nnear the office");
         assert!(!s.contains("noo_agent_message") && !s.contains("noo_task_done"));
         assert_eq!(crate::tasks::selection_text("  x  ", None, Some("  ")), "x");
+    }
+}
+
+#[cfg(test)]
+mod recall_tests {
+    use super::*;
+    use crate::embedding_client::EmbedError;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn rows() -> Vec<(String, String, f64)> {
+        vec![
+            ("user".into(), "my dog is called Biscuit".into(), 0.91),
+            ("assistant".into(), "noted".into(), 0.62),
+            ("user".into(), "unrelated".into(), 0.21),
+        ]
+    }
+
+    /// An embedder that answers after `after` (virtual time).
+    async fn embedder(after: Duration) -> Result<Vec<f64>, EmbedError> {
+        tokio::time::sleep(after).await;
+        Ok(vec![0.1, 0.2, 0.3])
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_warm_recall_reports_ok_with_its_hits() {
+        let out = conversation_recall_with(
+            embedder(Duration::from_millis(220)), RECALL_EMBED_BOUND,
+            |_v: Vec<f64>| async { Ok::<_, String>(rows()) }, 5,
+        ).await;
+        assert_eq!(out.status, RecallStatus::Ok { hits: 2 }, "{out:?}");
+        let text = out.text.expect("recall text");
+        assert!(text.contains("Biscuit") && !text.contains("unrelated"), "{text}");
+        assert_eq!(RecallOutcome { text: None, status: out.status }.metadata(), json!({"status": "ok", "hits": 2}));
+    }
+
+    /// A cold embedder past the old 5 s budget is waited for, not skipped:
+    /// a slow box cold-loading the embedder still gets memory.
+    #[tokio::test(start_paused = true)]
+    async fn a_cold_embedder_within_the_bound_is_waited_for() {
+        let out = conversation_recall_with(
+            embedder(Duration::from_secs(8)), RECALL_EMBED_BOUND,
+            |_v: Vec<f64>| async { Ok::<_, String>(rows()) }, 5,
+        ).await;
+        assert_eq!(out.status, RecallStatus::Ok { hits: 2 }, "{out:?}");
+        assert!(out.text.is_some());
+    }
+
+    /// Past the bound: skipped, with the timeout as the reason, and the
+    /// call returns AT the bound (the turn goes on without recall).
+    #[tokio::test(start_paused = true)]
+    async fn an_embedder_beyond_the_bound_is_skipped_with_the_timeout_reason() {
+        let searched = AtomicBool::new(false);
+        let start = tokio::time::Instant::now();
+        let out = conversation_recall_with(
+            embedder(Duration::from_secs(600)), RECALL_EMBED_BOUND,
+            |_v: Vec<f64>| { searched.store(true, Ordering::SeqCst); async { Ok::<_, String>(rows()) } }, 5,
+        ).await;
+        let took = start.elapsed();
+        assert!(took >= RECALL_EMBED_BOUND && took < RECALL_EMBED_BOUND + Duration::from_secs(1), "recall must return at its bound: {took:?}");
+        assert_eq!(
+            out,
+            RecallOutcome::skipped("embedder not ready (timed out after 15 s)"),
+        );
+        assert!(!searched.load(Ordering::SeqCst), "no vector, no search");
+        assert_eq!(
+            out.metadata(),
+            json!({"status": "skipped", "reason": "embedder not ready (timed out after 15 s)"}),
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_embedder_error_is_skipped_with_the_error_reason() {
+        let out = conversation_recall_with(
+            async { Err::<Vec<f64>, _>(EmbedError::Unavailable("no embed target: no node advertises `embed` and no static endpoint is configured".into())) },
+            RECALL_EMBED_BOUND,
+            |_v: Vec<f64>| async { Ok::<_, String>(rows()) }, 5,
+        ).await;
+        match &out.status {
+            RecallStatus::Skipped { reason } => {
+                assert!(reason.starts_with("embedder error: embedding backend unavailable: no embed target"), "{reason}");
+            }
+            other => panic!("expected skipped, got {other:?}"),
+        }
+        assert_eq!(out.text, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_search_failure_is_skipped_not_empty() {
+        let out = conversation_recall_with(
+            embedder(Duration::ZERO), RECALL_EMBED_BOUND,
+            |_v: Vec<f64>| async { Err::<Vec<(String, String, f64)>, _>("pool timed out".to_string()) }, 5,
+        ).await;
+        assert_eq!(out, RecallOutcome::skipped("recall search failed: pool timed out"));
+    }
+
+    /// Nothing relevant is a successful recall with zero hits, not a skip.
+    #[tokio::test(start_paused = true)]
+    async fn only_weak_matches_is_ok_with_zero_hits() {
+        let out = conversation_recall_with(
+            embedder(Duration::ZERO), RECALL_EMBED_BOUND,
+            |_v: Vec<f64>| async { Ok::<_, String>(vec![("user".to_string(), "meh".to_string(), 0.3)]) }, 5,
+        ).await;
+        assert_eq!(out, RecallOutcome { text: None, status: RecallStatus::Ok { hits: 0 } });
+    }
+
+    /// The rail answer (`routes/harness.rs`) carries the status; a gateway
+    /// too old to send it is read from its text.
+    #[test]
+    fn the_rail_answer_carries_the_status() {
+        let skipped = RecallOutcome::skipped("embedder not ready (timed out after 15 s)");
+        let wire = json!({"text": skipped.text, "recall": skipped.metadata()});
+        assert_eq!(RecallOutcome::from_wire(&wire), skipped);
+        let old = json!({"text": "[Relevant earlier messages in this conversation]\n- (user, score=0.91) a\n- (assistant, score=0.62) b"});
+        assert_eq!(RecallOutcome::from_wire(&old).status, RecallStatus::Ok { hits: 2 });
+    }
+}
+
+#[cfg(test)]
+mod prompt_tier_tests {
+    use super::*;
+    use super::system_prompt_budget_tests::repo_root_or_skip;
+
+    /// The repo's persona for `tier`, or None (test skipped) without prompts/.
+    fn shipped(tier: PromptTier) -> Option<String> {
+        let root = repo_root_or_skip()?;
+        Some(persona_in(&root.join("prompts"), tier).expect("persona files"))
+    }
+
+    /// `rule` is in the persona of BOTH tiers: it lives in the core.
+    fn rides_both_tiers(rule: &str) {
+        let (Some(compact), Some(full)) = (shipped(PromptTier::Compact), shipped(PromptTier::Full)) else { return };
+        assert!(compact.contains(rule), "Compact persona lost the safety rule {rule:?}");
+        assert!(full.contains(rule), "Full persona lost the safety rule {rule:?}");
+    }
+
+    #[test]
+    fn the_no_fabrication_rule_rides_both_tiers() {
+        rides_both_tiers("Never invent or fabricate a tool result.");
+    }
+
+    #[test]
+    fn the_verify_before_done_rule_rides_both_tiers() {
+        rides_both_tiers("Verify before claiming something is done.");
+    }
+
+    #[test]
+    fn the_no_raw_json_tool_call_rule_rides_both_tiers() {
+        rides_both_tiers("Never write a raw JSON tool call as text — use the tool interface.");
+    }
+
+    #[test]
+    fn the_ask_for_approval_rule_rides_both_tiers() {
+        rides_both_tiers("Ask before acting where approval is required.");
+    }
+
+    #[test]
+    fn the_no_destructive_action_rule_rides_both_tiers() {
+        rides_both_tiers("Never take a destructive action without approval.");
+    }
+
+    /// Compact is the core file alone; Full is the core, then the rest.
+    #[test]
+    fn compact_is_the_core_and_full_adds_the_rest() {
+        let Some(root) = repo_root_or_skip() else { return };
+        let core = std::fs::read_to_string(root.join("prompts").join(PERSONA_CORE_FILE)).unwrap();
+        let (compact, full) = (shipped(PromptTier::Compact).unwrap(), shipped(PromptTier::Full).unwrap());
+        assert_eq!(compact, core.trim());
+        assert!(compact.len() <= 2_500, "the core persona grew to {} bytes", compact.len());
+        assert!(full.starts_with(&compact) && full.len() > compact.len() + 5_000, "{} vs {}", full.len(), compact.len());
+        for section in ["## Your Capabilities", "## Operational Playbook", "## Tool Usage Rules"] {
+            assert!(full.contains(section) && !compact.contains(section), "{section}");
+        }
+        assert!(!root.join("prompts").join(PERSONA_LEGACY_FILE).exists(), "the pre-split persona is back beside the core");
+    }
+
+    /// Rules 7-9 (tasks vs jobs, scheduling, coding) left the persona and
+    /// ride their tool group.
+    #[test]
+    fn the_group_rules_left_the_persona_for_their_groups() {
+        if let Some(full) = shipped(PromptTier::Full) {
+            for moved in ["noo_activity_list", "noo_schedule_task", "engine=\"local\""] {
+                assert!(!full.contains(moved), "{moved} is back in the persona");
+            }
+        }
+        let heartbeat = group_guidance(&["heartbeat"]);
+        assert!(heartbeat.starts_with("\n\n## Tool Notes:"), "{heartbeat}");
+        assert!(heartbeat.contains("noo_activity_list") && heartbeat.contains("noo_schedule_task") && !heartbeat.contains("noo_coding_task"));
+        assert!(heartbeat.contains("only claim success if the tool response shows `verified: true`"));
+        let jobs = group_guidance(&["jobs"]);
+        assert!(jobs.contains("noo_activity_list") && !jobs.contains("noo_schedule_task"));
+        let both = group_guidance(&["jobs", "heartbeat"]);
+        assert_eq!(both.matches("noo_activity_list").count(), heartbeat.matches("noo_activity_list").count(), "one block, once");
+        let coding = group_guidance(&["coding"]);
+        assert!(coding.contains("noo_coding_task") && coding.contains("engine=\"claude\"") && !coding.contains("noo_schedule_task"));
+        assert_eq!(group_guidance(&[]), "");
+        assert_eq!(group_guidance(&["rag", "graph"]), "");
+    }
+
+    #[test]
+    fn every_guidance_owner_is_a_tool_group() {
+        for (owners, _) in GROUP_GUIDANCE {
+            for owner in *owners {
+                assert!(super::super::agent_loop::TOOL_GROUPS.iter().any(|(g, _, _)| g == owner), "{owner} is not a TOOL_GROUPS name");
+            }
+        }
+    }
+
+    #[test]
+    fn selected_groups_follow_the_tool_keywords() {
+        assert!(selected_groups("Set up a daily briefing at 8").contains(&"heartbeat"));
+        assert!(selected_groups("Please refactor this module").contains(&"coding"));
+        assert!(selected_groups("What is in the job queue?").contains(&"jobs"));
+        assert!(selected_groups("hello there").is_empty());
+    }
+
+    #[test]
+    fn compact_core_tools_are_core_tools() {
+        assert_eq!(core_tools_for(PromptTier::Compact), ["noo_tool_search", "noo_rag_query", "noo_memory_search"]);
+        for name in core_tools_for(PromptTier::Compact) {
+            assert!(super::super::agent_loop::CORE_TOOLS.contains(name), "{name} is not in CORE_TOOLS");
+        }
+        assert_eq!(core_tools_for(PromptTier::Full), super::super::agent_loop::CORE_TOOLS);
+    }
+
+    #[test]
+    fn compact_takes_no_skill_and_no_runbooks() {
+        assert_eq!(max_skills_for(PromptTier::Compact), 0, "one skill does not fit half a 4k window beside the core");
+        assert_eq!(max_skills_for(PromptTier::Full), crate::prompt_skills::MAX_SKILLS);
+        assert!(!runbooks_for(PromptTier::Compact));
+        assert!(runbooks_for(PromptTier::Full));
+    }
+
+    /// fa's one-box numbers: a 4.6k-token Full prompt prefills in ~12.4 s
+    /// at one slot (370 tok/s) and ~37 s at four (125 tok/s).
+    #[test]
+    fn the_tier_follows_fit_then_prefill_time() {
+        let full = 4_600;
+        assert_eq!(choose_tier(full, 12_288, Some(370.0), true), PromptTier::Full);
+        assert_eq!(choose_tier(full, 12_288, Some(125.0), true), PromptTier::Compact);
+        // Does not fit: Compact whatever the rate.
+        assert_eq!(choose_tier(full, 3_072, Some(10_000.0), false), PromptTier::Compact);
+        assert_eq!(choose_tier(full, 3_072, None, false), PromptTier::Compact);
+        // Unknown (or unusable) rate: the hardware decides.
+        for rate in [None, Some(0.0), Some(f64::NAN), Some(-1.0)] {
+            assert_eq!(choose_tier(full, 12_288, rate, false), PromptTier::Full, "{rate:?}");
+            assert_eq!(choose_tier(full, 12_288, rate, true), PromptTier::Compact, "{rate:?}");
+        }
+        // The ceiling itself is still Full; just past it is Compact.
+        assert_eq!(choose_tier(2_000, 12_288, Some(100.0), true), PromptTier::Full);
+        assert_eq!(choose_tier(2_001, 12_288, Some(100.0), true), PromptTier::Compact);
+        // Exactly the window still fits.
+        assert_eq!(choose_tier(3_072, 3_072, None, false), PromptTier::Full);
+    }
+
+    #[test]
+    fn compose_sends_the_extra_only_in_full() {
+        assert_eq!(compose_persona(PromptTier::Compact, " core \n", Some("extra")), "core");
+        assert_eq!(compose_persona(PromptTier::Full, "core", Some("\nextra\n")), "core\n\nextra");
+        assert_eq!(compose_persona(PromptTier::Full, "core", None), "core");
+        assert_eq!(compose_persona(PromptTier::Full, "core", Some("  ")), "core");
+    }
+
+    /// A prompts dir from before the split (no core file) is sent whole in
+    /// both tiers; a dir with neither file yields nothing.
+    #[test]
+    fn a_pre_split_prompts_dir_is_read_whole() {
+        let dir = std::env::temp_dir().join(format!("noo-persona-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(persona_in(&dir, PromptTier::Full), None);
+        std::fs::write(dir.join(PERSONA_LEGACY_FILE), "legacy persona\n").unwrap();
+        assert_eq!(persona_in(&dir, PromptTier::Compact).as_deref(), Some("legacy persona"));
+        assert_eq!(persona_in(&dir, PromptTier::Full).as_deref(), Some("legacy persona"));
+        std::fs::write(dir.join(PERSONA_CORE_FILE), "core\n").unwrap();
+        std::fs::write(dir.join(PERSONA_EXTRA_FILE), "extra\n").unwrap();
+        assert_eq!(persona_in(&dir, PromptTier::Compact).as_deref(), Some("core"));
+        assert_eq!(persona_in(&dir, PromptTier::Full).as_deref(), Some("core\n\nextra"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Until the loop picks a tier per turn, every caller of
+    /// `load_persona_prompt` gets the Full persona from the split files.
+    #[test]
+    fn load_persona_prompt_reads_the_full_tier() {
+        let code = crate::test_src::own_code(include_str!("context.rs"));
+        let body = crate::test_src::fn_body(&code, "pub(super) async fn load_persona_prompt(");
+        assert!(body.contains("persona_for(PromptTier::Full)"), "{body}");
+        assert!(!body.contains("coordinator.md"), "{body}");
     }
 }

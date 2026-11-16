@@ -323,8 +323,13 @@ pub async fn resolve_candidates(state: &AppState, hint: Option<&str>, node: Opti
             ));
         }
         let backend = coordinator::resolve_backend_for_model(state, hint).await.map_err(|e| RawChatError::from_resolve(&e))?;
+        // The controller's own door (a one-box's embed Ollama) is the
+        // controller's own node, so its decided context is stamped (i802);
+        // any other URL keeps the host it names.
         let cand = classes::Candidate::synthetic(
-            coordinator::node_from_backend_url(&backend.url).unwrap_or_else(|| "controller".into()),
+            crate::chat_context::own_node_id_for_url(&backend.url)
+                .or_else(|| coordinator::node_from_backend_url(&backend.url))
+                .unwrap_or_else(|| "controller".into()),
             backend.backend_type,
             backend.model,
             backend.url,
@@ -663,6 +668,15 @@ where
     Err(RawChatError::new(StatusCode::BAD_GATEWAY, "backend_unavailable", detail))
 }
 
+/// Stamp a candidate's decided context on its chat-completions body (i802).
+/// `num_ctx` is `Some` only for an Ollama candidate; the Responses
+/// passthrough (native vLLM only) is never touched.
+pub(crate) fn with_num_ctx(path: &str, body: &mut Value, num_ctx: Option<u64>) {
+    if path.ends_with("/chat/completions") {
+        crate::chat_context::stamp_opt(body, num_ctx);
+    }
+}
+
 /// Send to the candidates in order with failover. `build` renders the
 /// request for a candidate as `(path, body)` — the body names the
 /// candidate's concrete model, since a backend 404s on a name it does not
@@ -725,6 +739,23 @@ where
         }
     } else {
         (candidates, None)
+    };
+    // Each Ollama candidate's decided context (i802), read before the loop
+    // because the builder is sync: one read per (node, model) per ten
+    // minutes at most, nothing for any other engine. Stamped only where the
+    // caller's body did not set `options.num_ctx` itself.
+    let mut ctxs: Vec<(String, String, u64)> = Vec::new();
+    for c in candidates.iter().filter(|c| crate::chat_context::takes_num_ctx(&c.backend)) {
+        if let Some(n) = crate::chat_context::num_ctx_for_node(state, &c.node_id, &c.backend, &c.model).await {
+            ctxs.push((c.url.clone(), c.model.clone(), n));
+        }
+    }
+    let mut inner = build;
+    let build = move |c: &Candidate| {
+        let (path, mut body) = inner(c);
+        let n = ctxs.iter().find(|(u, m, _)| u == &c.url && m == &c.model).map(|(_, _, n)| *n);
+        with_num_ctx(&path, &mut body, n);
+        (path, body)
     };
     let deadline = Instant::now() + OVERALL_DEADLINE;
     let client = crate::tls::failover_client();
@@ -1800,5 +1831,57 @@ mod expected_wait_wiring_tests {
         // 2): an interactive plan must hand failover_core the retry.
         assert!(pinned.contains("(&planned[..], Some(expected_wait::RETRY_FIRST_AFTER))"), "the interactive plan must carry the first-choice retry");
         assert!(pinned.contains("(candidates, None)"), "no retry without the rule");
+    }
+}
+
+#[cfg(test)]
+mod num_ctx_tests {
+    use super::with_num_ctx;
+    use serde_json::json;
+
+    /// i802: an Ollama candidate's chat body gets the decided context; a
+    /// caller's own `options.num_ctx` stands; the Responses passthrough is
+    /// never touched; `None` (every other engine) adds nothing.
+    #[test]
+    fn a_candidate_body_is_stamped_only_where_it_should_be() {
+        let mut b = json!({"model": "gemma4:e2b", "messages": []});
+        with_num_ctx("/v1/chat/completions", &mut b, Some(16384));
+        assert_eq!(b["options"]["num_ctx"], json!(16384));
+        let mut caller = json!({"model": "m", "options": {"num_ctx": 2048}});
+        with_num_ctx("/v1/chat/completions", &mut caller, Some(16384));
+        assert_eq!(caller["options"]["num_ctx"], json!(2048), "the caller's own value stands");
+        let mut vllm = json!({"model": "m"});
+        with_num_ctx("/v1/chat/completions", &mut vllm, None);
+        assert!(vllm.get("options").is_none());
+        let mut responses = json!({"model": "m"});
+        with_num_ctx("/v1/responses", &mut responses, Some(16384));
+        assert!(responses.get("options").is_none());
+    }
+
+    /// Every surface (`/v1/chat/completions`, `/api/external/chat/completions`,
+    /// `/v1/responses`, `/api/inference` raw) funnels here: each candidate's
+    /// context is resolved before the loop and stamped on the body built for
+    /// it, inside the builder handed to the failover loop.
+    /// i802 (A): with no class table, the one candidate is the legacy
+    /// resolver's static door. On a one-box that is the controller's own
+    /// embed Ollama: it is named as the controller's own node, so its
+    /// decided context is stamped, not the container's name (no record).
+    #[test]
+    fn the_static_candidate_names_the_controllers_own_node() {
+        let own = crate::test_src::own_code(include_str!("raw_chat.rs"));
+        let f = crate::test_src::fn_body(&own, "pub async fn resolve_candidates(");
+        let mapped = f.find("crate::chat_context::own_node_id_for_url(&backend.url)").expect("the door is mapped first");
+        let named = f.find(".or_else(|| coordinator::node_from_backend_url(&backend.url))").expect("then the host it names");
+        assert!(mapped < named, "{f}");
+    }
+
+    #[test]
+    fn the_failover_path_resolves_per_candidate_and_stamps_inside_the_builder() {
+        let code = crate::test_src::own_code(include_str!("raw_chat.rs"));
+        let f = crate::test_src::fn_body(&code, "pub async fn send_with_failover_pinned");
+        let ask = f.find("crate::chat_context::num_ctx_for_node(state, &c.node_id, &c.backend, &c.model).await").expect("resolves per candidate");
+        let stamp = f.find("with_num_ctx(&path, &mut body, n);").expect("stamps the built body");
+        let core = f.find("failover_core(&client, class, candidates, stream, Timeouts::PRODUCTION, deadline, retry_first, build,").expect("hands the wrapped builder over");
+        assert!(ask < stamp && stamp < core, "{f}");
     }
 }

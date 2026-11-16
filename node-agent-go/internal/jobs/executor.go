@@ -41,6 +41,31 @@ type Executor struct {
 	dispatchSub    *nats.Subscription
 	cancelSub      *nats.Subscription
 	hookRegistered bool
+
+	// chatContext is the controller's decided chat context for a model on
+	// this node's Ollama (desired-config `chat_contexts`, i802); 0 = not
+	// known. nil until the reconciler exists. Guarded by mu.
+	chatContext func(model string) int
+}
+
+// SetChatContext installs the decided chat context lookup (the reconciler's
+// ChatContext). A native Ollama job then runs the model at the context the
+// gateway's chat runs it at, so a job never reloads the chat runner.
+func (e *Executor) SetChatContext(f func(model string) int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.chatContext = f
+}
+
+// decidedContext is the decided context for model, 0 when none is known.
+func (e *Executor) decidedContext(model string) int {
+	e.mu.Lock()
+	f := e.chatContext
+	e.mu.Unlock()
+	if f == nil {
+		return 0
+	}
+	return f(model)
 }
 
 // NewExecutor creates a job executor.
@@ -453,11 +478,7 @@ func (e *Executor) executeInference(ctx context.Context, payload map[string]any,
 	var url string
 	if backend == "ollama" {
 		url = baseURL + "/api/generate"
-		reqBody, _ = json.Marshal(map[string]any{
-			"model":  firstOr(model, "default"),
-			"prompt": prompt,
-			"stream": false,
-		})
+		reqBody, _ = json.Marshal(ollamaGenerateBody(firstOr(model, "default"), prompt, e.decidedContext(model)))
 	} else {
 		url = baseURL + "/v1/chat/completions"
 		reqBody, _ = json.Marshal(map[string]any{
@@ -480,6 +501,23 @@ func (e *Executor) executeInference(ctx context.Context, payload map[string]any,
 	}
 	client := &http.Client{Timeout: time.Duration(timeoutSec) * time.Second, Transport: e.http.Transport}
 	return postInference(client, req, backend)
+}
+
+// ollamaGenerateBody is the native /api/generate body for a job. numCtx > 0
+// (the controller's decided chat context for model, i802) is sent as
+// options.num_ctx: Ollama reloads a model asked for at another context, so a
+// job without it would reload the chat runner at the daemon's default and the
+// next chat turn would reload it back. 0 sends no options, as before.
+func ollamaGenerateBody(model, prompt string, numCtx int) map[string]any {
+	body := map[string]any{
+		"model":  model,
+		"prompt": prompt,
+		"stream": false,
+	}
+	if numCtx > 0 {
+		body["options"] = map[string]any{"num_ctx": numCtx}
+	}
+	return body
 }
 
 // bodySnippet is the first n bytes of a response body, for error messages.

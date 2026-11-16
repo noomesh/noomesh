@@ -5,6 +5,7 @@ package dataroots
 
 import (
 	"encoding/json"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -245,5 +246,69 @@ func TestADarwinNodeKeepsTheApplicationSupportLegacyRoot(t *testing.T) {
 	adoptedLegacy, env = "", map[string]string{"HOME": "/Users/alice"}
 	if got := adoptLegacyRoot("darwin", get, set, func(string) bool { return false }); got != "" {
 		t.Fatalf("adopted %q on a fresh Mac", got)
+	}
+}
+
+// i677 (operator 2026-11-14): the local host may name ONE extra owner uid for
+// its data root in a root-owned file; anything else is refused and the rule
+// stays strict. judgeLocalOwner takes the owner uid as a parameter, so each
+// refusal is checked here as an unprivileged user.
+func TestTheLocalOwnerFileIsTrustedOnlyWhenRootOwnedPrivateAndOneUID(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string, mode os.FileMode) fs.FileInfo {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(body), mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, mode); err != nil {
+			t.Fatal(err)
+		}
+		fi, err := os.Lstat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fi
+	}
+	good := write("good", "1001\n", 0o644)
+	if n, why := judgeLocalOwner(good, 0, []byte("1001\n")); why != "" || n != 1001 {
+		t.Fatalf("a root-owned 0644 file naming 1001: got %d %q", n, why)
+	}
+	if _, why := judgeLocalOwner(good, 1001, []byte("1001\n")); !strings.Contains(why, "not root") {
+		t.Fatalf("a file the operator owns must be refused: %q", why)
+	}
+	writable := write("gw", "1001\n", 0o664)
+	if _, why := judgeLocalOwner(writable, 0, []byte("1001\n")); !strings.Contains(why, "must not write") {
+		t.Fatalf("a group-writable file must be refused: %q", why)
+	}
+	for _, body := range []string{"", "1001 1002", "abc", "-5", "1001\n1002\n"} {
+		fi := write("bad", body, 0o644)
+		if _, why := judgeLocalOwner(fi, 0, []byte(body)); why == "" {
+			t.Fatalf("%q must be refused", body)
+		}
+	}
+	long := write("long", strings.Repeat("1", 40), 0o644)
+	if _, why := judgeLocalOwner(long, 0, []byte(strings.Repeat("1", 40))); why == "" {
+		t.Fatal("a file longer than one uid must be refused")
+	}
+	if err := os.Symlink(filepath.Join(dir, "good"), filepath.Join(dir, "link")); err != nil {
+		t.Fatal(err)
+	}
+	link, _ := os.Lstat(filepath.Join(dir, "link"))
+	if _, why := judgeLocalOwner(link, 0, []byte("1001\n")); !strings.Contains(why, "not a regular file") {
+		t.Fatalf("a symlink must be refused: %q", why)
+	}
+}
+
+func TestTheEnvOwnerWinsAndAnAbsentFileIsStrict(t *testing.T) {
+	old := localOwnerPath
+	t.Cleanup(func() { localOwnerPath = old })
+	localOwnerPath = filepath.Join(t.TempDir(), "absent")
+	t.Setenv(OwnerEnv, "")
+	if ownerAllowed(1001, 999) {
+		t.Fatal("no env and no file: uid 1001 is not an owner of a uid-999 agent's root")
+	}
+	t.Setenv(OwnerEnv, "1001")
+	if !ownerAllowed(1001, 999) || ownerAllowed(1002, 999) {
+		t.Fatal("NOO_DATA_ROOT_OWNER names exactly one extra owner, as before")
 	}
 }

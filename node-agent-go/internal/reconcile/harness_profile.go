@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/harnessprofile"
+	"github.com/noomesh/noomesh/node-agent-go/internal/keepwarm"
 	"github.com/noomesh/noomesh/node-agent-go/internal/lanes"
 )
 
@@ -210,6 +211,70 @@ func (r *Reconciler) recordChatPlacement(all []placement) {
 	}
 }
 
+// chatContextKey is the one spelling of an Ollama model name for the
+// decided-context table: a bare tag and its `:latest` are one model (the
+// gateway's rule, chat_context::model_stat).
+func chatContextKey(model string) string {
+	m := strings.TrimSpace(model)
+	if m == "" {
+		return ""
+	}
+	tag := m
+	if i := strings.LastIndex(m, "/"); i >= 0 {
+		tag = m[i+1:]
+	}
+	if !strings.Contains(tag, ":") {
+		m += ":latest"
+	}
+	return m
+}
+
+// recordChatContexts installs desired-config's `chat_contexts` (i802). An
+// absent key (an older gateway, nothing decided) clears the table: the agent
+// then sends no num_ctx, exactly as before. A non-positive value is dropped.
+func (r *Reconciler) recordChatContexts(in map[string]int) {
+	var out map[string]int
+	for m, n := range in {
+		if k := chatContextKey(m); k != "" && n > 0 {
+			if out == nil {
+				out = map[string]int{}
+			}
+			out[k] = n
+		}
+	}
+	r.harnessMu.Lock()
+	defer r.harnessMu.Unlock()
+	r.chatContexts = out
+}
+
+// ChatContext is the context, in tokens, the controller decided for model on
+// this node's Ollama (desired-config `chat_contexts`, i802); 0 when it
+// decided none. The agent's own calls to that Ollama send it as
+// options.num_ctx, as the gateway's do, so no call reloads the model.
+func (r *Reconciler) ChatContext(model string) int {
+	r.harnessMu.RLock()
+	defer r.harnessMu.RUnlock()
+	return r.chatContexts[chatContextKey(model)]
+}
+
+// ChatContexts is a copy of the decided-context table (desired-config
+// `chat_contexts`, keyed by chatContextKey), nil when nothing is decided.
+// GET /harness/placement carries it so the node's harness fits a turn to
+// the same context the agent stamps on that model's calls (i802): a task
+// dispatched here must not run in a smaller window than a console turn.
+func (r *Reconciler) ChatContexts() map[string]int {
+	r.harnessMu.RLock()
+	defer r.harnessMu.RUnlock()
+	if len(r.chatContexts) == 0 {
+		return nil
+	}
+	out := make(map[string]int, len(r.chatContexts))
+	for k, v := range r.chatContexts {
+		out[k] = v
+	}
+	return out
+}
+
 // ChatContextWindow is the context window, in tokens, that the node's chat
 // backend runs with as far as the agent sets it, for GET /harness/placement
 // (`model_context`): the harness tells a foreign CLI its model's real window
@@ -254,6 +319,32 @@ func (r *Reconciler) ChatPlacement() (backend, model string, ok bool) {
 // publishLanePlacements hands the heartbeat the running placements it
 // builds `lanes` from (proposal i403): every non-harness row the controller
 // wants running, with its role and model verbatim.
+// publishKeepWarm records the running ollama placements declared warm
+// (internal/keepwarm). Every pass, before the empty-state return: clearing
+// the flag, or the last placement, must stop the pinning at once.
+func publishKeepWarm(all []placement) {
+	keepwarm.Set(keepWarmOf(all))
+}
+
+// keepWarmOf is the declared-warm set: running ollama placements with
+// keep_warm, one entry per model.
+func keepWarmOf(all []placement) []keepwarm.Warm {
+	var out []keepwarm.Warm
+	seen := map[string]bool{}
+	for _, p := range all {
+		if !p.KeepWarm || p.Backend != "ollama" || p.DesiredState != "running" {
+			continue
+		}
+		m := strings.TrimSpace(p.Model)
+		if m == "" || seen[keepwarm.Canonical(m)] {
+			continue
+		}
+		seen[keepwarm.Canonical(m)] = true
+		out = append(out, keepwarm.Warm{Model: m, Target: p.Target})
+	}
+	return out
+}
+
 func publishLanePlacements(all []placement) {
 	var out []lanes.Placed
 	for _, p := range all {

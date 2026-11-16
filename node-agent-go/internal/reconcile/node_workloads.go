@@ -33,6 +33,7 @@ type nodeWorkloads interface {
 	StartManaged(ctx context.Context, e nodewl.Entry) error
 	StopManaged(ctx context.Context, e nodewl.Entry) error
 	ManagedStatus(ctx context.Context, addon, name string) (dockerpkg.ManagedState, error)
+	LeafReady(addon, name string) bool
 }
 
 // newNodeWorkloads builds the lifecycle, the node's gate and its facts from
@@ -198,7 +199,82 @@ func (r *Reconciler) goConverge(ctx context.Context, e nodewl.Entry) {
 			r.nwMu.Unlock()
 		}()
 		r.nodeWL.Converge(ctx, e)
+		if f := r.nwChanged; f != nil {
+			f() // the heartbeat carries this workload's row now, not at the next tick
+		}
 	}()
+}
+
+// SetNodeWorkloadsChanged installs what runs after each node workload
+// converge: the agent's heartbeat Kick, so the controller sees a row that
+// changed (a door leaf that landed, a start) in about a second.
+func (r *Reconciler) SetNodeWorkloadsChanged(f func()) { r.nwChanged = f }
+
+// leafWatchInterval is how often watchLeaves looks for a door leaf that a
+// refused workload is waiting for. A stat or two per refused workload.
+const leafWatchInterval = 5 * time.Second
+
+// watchLeaves nudges a reconcile pass as soon as a node workload refused
+// door_leaf_missing has its leaf on disk. The applier (noo-apply.sh, a
+// separate process) installs the leaf; without this the workload stayed
+// refused until the next 5-minute tick, and a reserve right after a
+// provision met a hard door_leaf_missing (0.6.25-rc.1 rehearsal,
+// A-nodewl.reserve, one second after the leaf landed). Blocks until ctx ends.
+func (r *Reconciler) watchLeaves(ctx context.Context, every time.Duration) {
+	if r.nodeWL == nil {
+		return
+	}
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if r.leafArrived() {
+				slog.Info("reconcile.node_workload_leaf_arrived; reconciling now")
+				r.Nudge()
+			}
+		}
+	}
+}
+
+// leafArrived: some workload's row says door_leaf_missing and its leaf now
+// passes the provisioner's own check, and the watch has not already nudged
+// for that arrival. ONCE per arrival: if the pass it nudged fails for another
+// reason and the row has not moved on yet, the watch must not keep nudging a
+// full reconcile every 5 s (0.6.25-rc.2: an unreachable rail kept the row at
+// door_leaf_missing and the watch looped). A workload whose row no longer
+// says door_leaf_missing, or whose leaf went away, is forgotten, so a later
+// arrival nudges again.
+func (r *Reconciler) leafArrived() bool {
+	r.leafMu.Lock()
+	defer r.leafMu.Unlock()
+	if r.leafFired == nil {
+		r.leafFired = map[string]bool{}
+	}
+	waiting := map[string]bool{}
+	arrived := false
+	for _, row := range r.nodeWL.Rows() {
+		if row.Reason != nodewl.ReasonDoorLeafMissing {
+			continue
+		}
+		k := row.Addon + "/" + row.Name
+		if !r.nodeWL.LeafReady(row.Addon, row.Name) {
+			continue
+		}
+		waiting[k] = true
+		if !r.leafFired[k] {
+			r.leafFired[k] = true
+			arrived = true
+		}
+	}
+	for k := range r.leafFired {
+		if !waiting[k] {
+			delete(r.leafFired, k)
+		}
+	}
+	return arrived
 }
 
 // NodeFacts is the heartbeat's node-workload keys: the node facts and consent

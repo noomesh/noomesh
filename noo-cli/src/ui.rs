@@ -484,6 +484,26 @@ impl Col {
     }
 }
 
+/// `s` without its colour escape sequences (ESC [ ... final letter): text a
+/// child `noo` coloured, read back by the caller (onboard reads `noo cluster
+/// place`'s tuned lines).
+pub(crate) fn plain(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_esc = false;
+    for c in s.chars() {
+        if in_esc {
+            if c.is_ascii_alphabetic() {
+                in_esc = false;
+            }
+        } else if c == '\x1b' {
+            in_esc = true;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Visible width of a cell, ignoring escape sequences.
 pub(crate) fn visible_width(s: &str) -> usize {
     let mut w = 0;
@@ -1459,6 +1479,15 @@ pub fn pager_finish() {
 
 #[cfg(test)]
 mod tests {
+    /// What onboard reads back from a coloured `noo cluster place`: the
+    /// text, without its escapes.
+    #[test]
+    fn plain_strips_colour_and_keeps_the_text() {
+        let coloured = "  OLLAMA_CONTEXT_LENGTH=32768  \u{1b}[2mhalf of the 6.4 GB left\u{1b}[0m";
+        assert_eq!(super::plain(coloured), "  OLLAMA_CONTEXT_LENGTH=32768  half of the 6.4 GB left");
+        assert_eq!(super::plain("no colour — at all"), "no colour — at all");
+    }
+
     #[test]
     fn count_renders_numbers_and_calls_everything_else_not_reported() {
         let v = serde_json::json!({"zero": 0, "n": 42, "f": 1.5, "s": "7", "nul": null, "b": true, "o": {"a": 1}});

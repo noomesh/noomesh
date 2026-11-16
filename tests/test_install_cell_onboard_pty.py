@@ -32,7 +32,7 @@ def test_answers_per_pass():
     pw = "Aa9-xxxxxxxxxxxxxxxxxxxx"
     for prompt in ["Admin password: ", "Confirm password: ", "Stored both in a password manager OFF this machine [y/N] ",
                    "Tailscale is not installed. Install it now? [Y/n] ", "Node ID [x]: "]:
-        assert op.answer(prompt, "literal", pw) == ("", "enter"), "literal is Enter, always"
+        assert op.answer(prompt, "literal", pw) == ("", "enter"), "literal with no doc table to follow is Enter"
     assert op.answer("Admin password: ", "attentive", pw) == (pw, "typed <password>")
     assert op.answer("Stored both in a password manager OFF this machine [y/N] ", "attentive", pw) == ("y", "typed y")
     assert op.answer("Tailscale is not installed. Install it now? [Y/n] ", "attentive", pw) == ("n", "typed n")
@@ -72,21 +72,40 @@ echo "You're all set. Welcome to Noomesh!"
 """.replace("SECRETVALUE", SECRET)
 
 
-def _drive(tmp_path, mode):
+def _drive(tmp_path, mode, doc=None):
     fake = tmp_path / "fake-onboard"
     fake.write_text(FAKE)
     fake.chmod(0o755)
+    extra = ["--doc", str(doc)] if doc else []
     return subprocess.run(
-        [sys.executable, str(DRIVER), "--pass", mode, "--silence", "8", "--max-repeat", "3", "--", str(fake)],
+        [sys.executable, str(DRIVER), "--pass", mode, *extra, "--silence", "8", "--max-repeat", "3", "--", str(fake)],
         capture_output=True, text=True, timeout=120, env={**os.environ, "TERM": "dumb"},
     )
 
 
-def test_literal_enter_never_finishes_and_is_stopped_as_a_loop(tmp_path):
-    """Enter at a prompt with no default (the admin password) is re-asked
-    forever, exactly as the wizard re-asks: the literal pass is stopped as a
-    LOOP (exit 2), it never hangs and never reaches the end."""
+def test_literal_follows_the_install_doc_and_finishes(tmp_path):
+    """The literal pass reads the SHIPPED install.md's "What the wizard asks
+    you" table and types exactly what it says (general 11-14): the fake wizard,
+    with the real prompts' shapes, finishes, and nothing secret is printed."""
     r = _drive(tmp_path, "literal")
+    out = r.stdout
+    assert r.returncode == 0, out[-1200:]
+    assert "Welcome to Noomesh" in out
+    assert "DOC: at a prompt containing 'admin password', type <password>" in out
+    assert SECRET not in out and "Aa9-" not in out
+    answers = [line.split("ANSWER: ", 1)[1] for line in out.splitlines() if line.startswith("ANSWER: ")]
+    assert answers == ["enter", "typed <password> (the install doc's table)", "typed y (the install doc's table)",
+                       "typed n (the install doc's table)", "enter"], answers
+
+
+def test_literal_loops_where_the_doc_does_not_name_a_forced_prompt(tmp_path):
+    """The check the cell exists for: a prompt the wizard forces that the doc
+    does not name is answered Enter, re-asked, and stopped as a LOOP (exit 2)
+    at that prompt, never a hang."""
+    doc = tmp_path / "install.md"
+    text = (ROOT / "docs" / "getting-started" / "install.md").read_text()
+    doc.write_text("\n".join(l for l in text.splitlines() if "`Admin password`" not in l))
+    r = _drive(tmp_path, "literal", doc=doc)
     out = r.stdout
     assert r.returncode == 2, out[-800:]
     assert "DRIVER: LOOP: the same prompt answered 4 times in a row with 'enter'" in out

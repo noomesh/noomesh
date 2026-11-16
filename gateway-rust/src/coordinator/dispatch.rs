@@ -147,10 +147,45 @@ pub fn parse_policy(v: Option<&str>) -> String {
 /// node whose operator set `off` could be dispatched to while Postgres was
 /// unreachable. A caller that gets `Err` does not dispatch and says why.
 pub async fn harness_effective(state: &AppState, node: &str) -> Result<bool, String> {
-    harness_effective_in(&state.db, node).await
+    let is_self = is_controller_node(node);
+    let runner = is_self && self_node_runner_reported(node_record(state, node).await.as_ref(), crate::scheduler_engine::now_unix_secs());
+    harness_effective_in(&state.db, node, is_self, runner).await
 }
 
-async fn harness_effective_in(db: &sqlx::PgPool, node: &str) -> Result<bool, String> {
+/// Does the controller's own node's agent report a harness RUNNER there, in a
+/// fresh heartbeat? `host_services.harness.state` other than `absent`, from a
+/// record whose `last_heartbeat` is at most [`SELF_RUNNER_HEARTBEAT_MAX_AGE_SECS`]
+/// old. A missing record, field or timestamp, or a stale heartbeat, reads as
+/// absent: never as present.
+pub(crate) fn self_node_runner_reported(record: Option<&Value>, now: f64) -> bool {
+    let Some(rec) = record else { return false };
+    let age = crate::scheduler_engine::snapshot_from_kv("", rec, now).heartbeat_age_secs;
+    let fresh = age.is_some_and(|a| (0.0..=SELF_RUNNER_HEARTBEAT_MAX_AGE_SECS).contains(&a));
+    fresh && matches!(reported_harness_state(Some(rec)), Some(s) if s != "absent")
+}
+
+/// How old the self node's heartbeat may be for its harness report to count
+/// (the worker heartbeat timeout the scheduler uses).
+const SELF_RUNNER_HEARTBEAT_MAX_AGE_SECS: f64 = 120.0;
+
+/// The harness policy as it applies to `node` (i545 #38). On the
+/// controller's own node `auto` synthesises a harness only when that node's
+/// agent reports a harness runner ([`self_node_runner_reported`]): provision
+/// never ships the runner there (the gateway runs those turns in process), so
+/// `auto` alone told the agent to run a harness it cannot, and every reconcile
+/// logged `harness_kind_refused` while `noo cluster status` warned "its runner
+/// \"noo-gateway\" is not installed on this node" on a fresh one-box install.
+/// `auto` there then reads as `manual`: a harness placed explicitly is kept,
+/// none is synthesised. `off` and `manual` are unchanged; other nodes are
+/// unchanged. desired-config and dispatch both apply this, so they agree.
+pub(crate) fn policy_for_node(policy: String, is_self: bool, runner_reported: bool) -> String {
+    if is_self && policy == "auto" && !runner_reported {
+        return "manual".into();
+    }
+    policy
+}
+
+async fn harness_effective_in(db: &sqlx::PgPool, node: &str, is_self: bool, runner_reported: bool) -> Result<bool, String> {
     let unread = |what: &str, e: sqlx::Error| format!("cannot read {what} for node '{node}': {e}");
     // No row is a real answer (the fleet default applies); an error is not.
     let policy: Option<String> = sqlx::query_scalar("SELECT harness_policy FROM noo_node_config WHERE node_id = $1")
@@ -158,7 +193,7 @@ async fn harness_effective_in(db: &sqlx::PgPool, node: &str) -> Result<bool, Str
         .fetch_optional(db)
         .await
         .map_err(|e| unread("its harness policy", e))?;
-    let policy = policy.unwrap_or_else(harness_default_policy);
+    let policy = policy_for_node(policy.unwrap_or_else(harness_default_policy), is_self, runner_reported);
     if policy == "off" {
         return Ok(false);
     }
@@ -286,7 +321,7 @@ pub async fn self_node_dispatchable(state: &AppState, node: &str) -> Result<bool
 }
 
 /// The node's record as its agent last reported it (`mesh_nodes`).
-async fn node_record(state: &AppState, node: &str) -> Option<Value> {
+pub(crate) async fn node_record(state: &AppState, node: &str) -> Option<Value> {
     let kv = state.js.get_key_value("mesh_nodes").await.ok()?;
     let raw = kv.get(node).await.ok().flatten()?;
     serde_json::from_slice(&raw).ok()
@@ -797,7 +832,7 @@ mod harness_effective_db_error_tests {
             .acquire_timeout(std::time::Duration::from_millis(300))
             .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
             .expect("lazy pool");
-        let r = harness_effective_in(&db, "node-1").await;
+        let r = harness_effective_in(&db, "node-1", false, false).await;
         let e = r.expect_err("no answer from the database is not an answer");
         assert!(e.contains("cannot read its harness policy for node 'node-1'"), "{e}");
     }

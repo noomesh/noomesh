@@ -200,7 +200,8 @@ add-on service key with the `metrics` scope; at most 256 series per source,
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/api/inference` | run one turn through the coordinator (non-streaming) |
-| POST | `/api/inference/stream` | the same, as Server-Sent Events proxied token-by-token from the backend (`data: {…}` lines in OpenAI streaming format, ending `data: [DONE]`) |
+| POST | `/api/inference/chat` | one coordinator turn as Server-Sent Events, as the signed-in user (retrieval, memory, tools; `data: {"type": …}` events, the console socket's shape); what `noo chat` uses |
+| POST | `/api/inference/stream` | a plain model call as Server-Sent Events, proxied token-by-token from the backend (no coordinator: no retrieval or tools; `data: {…}` lines in OpenAI streaming format, ending `data: [DONE]`) |
 | POST | `/v1/chat/completions` | OpenAI-compatible chat, routed by **model class** with failover (below); what external clients and `pipeline/llm.py` use |
 | POST | `/v1/responses` | OpenAI Responses API, for harnesses that speak only it (Codex CLI since February 2026); same auth, class resolution, failover and accounting as `/v1/chat/completions`. Streaming supported; stateless (no `GET /v1/responses/{id}`) |
 | GET | `/v1/models`, `/v1/models/{model_id}` | the **catalogue**: every class and alias a consumer may send as `model`, `owned_by: "noomesh"`, with `noo: {class, candidates, healthy}`; `/v1/models/{id}` is `404 model_not_found` for an id that is no class, alias or served model. Still the dashboard's readiness probe: `503` until the first `chat-default` candidate answers its own model list |
@@ -439,6 +440,13 @@ receives flat JSON events, each with a `type`:
 {"type": "keepalive"}
 ```
 
+`done` (and the saved assistant message's metadata, and
+`/api/inference`'s `data`) carries `recall` when the turn ran
+conversation recall: `{"status": "ok", "hits": N}`, or `{"status":
+"skipped", "reason": "embedder not ready (timed out after 15 s)"}` when
+the answer was given without it; the console shows a skipped recall in
+the turn detail.
+
 `phase` says what a turn is doing before its first token, for the
 console's status line. `routed` names the node a model call went to and
 that backend's slots (null when its agent reports none). It is sent
@@ -449,6 +457,20 @@ call it carries `attempt` 2 and up, with `previous_node` and
 `previous_reason`. `prompt` means the backend began answering, with the
 loop's estimate of the tokens sent. `at_ms` is the gateway's clock and
 is meant for logs; a client times phases from receipt.
+
+`done` adds `truncated: true` and `truncation: {sent_estimate, evaluated, context}`
+when an Ollama backend cut the prompt: it read only `evaluated` tokens (its
+`context`/2 + 5) of about `sent_estimate` the loop sent, so the model answered
+without most of its instructions. The console and `noo chat` say so under the
+answer; the gateway logs `context_truncated_by_backend` and alerts the operator
+once a day per backend.
+
+A turn whose instructions and question cannot fit the backend's context gets
+one `error` line naming that context and, for Ollama or vLLM, the command that
+switches model with its backend named (`noo models switch <model> --backend
+ollama`). A backend's refusal reaches the person as `Backend error: <status>:
+<sentence>`, the sentence taken from either the OpenAI (`{"error":{"message":..}}`)
+or the Ollama (`{"error":".."}`) body, never the JSON itself.
 
 `working` comes only from a turn a node harness runs on a vendor kind
 (Copilot, Claude Code, Codex): the model's text as the harness's translator
@@ -464,7 +486,7 @@ capped at 200 000 characters a turn. It is not the answer, which arrives as
 | GET | `/api/cluster/status` | nodes, backends, scheduler and knowledge-base summary |
 | GET | `/api/cluster/nodes` | the node registry (from the `mesh_nodes` KV bucket merged with the database) |
 | POST | `/api/cluster/nodes/register`, `/api/cluster/nodes/{id}/register` | node-agent registration (hostname, ip, tier, capabilities) |
-| POST | `/api/cluster/nodes/{id}/heartbeat` | node-agent heartbeat: `load`, `cpu_load`, `cpu_cores`, `ram_gb`, `mem_used_gb`, `gpu_model`, `vram_gb`, `vram_used_gb`, `running_backends`, `ip_address`; `404` tells the agent to re-register |
+| POST | `/api/cluster/nodes/{id}/heartbeat` | node-agent heartbeat: `load`, `cpu_load`, `cpu_cores`, `ram_gb`, `mem_used_gb`, `gpu_model`, `vram_gb`, `vram_used_gb`, `running_backends`, `ip_address`; `404` tells the agent to re-register. The reply advertises `accept_encoding: ["gzip"]`, after which the agent sends `Content-Encoding: gzip` (signed as sent; decoded after auth, capped at 256 KiB like a plain body, `413` beyond) |
 | DELETE | `/api/cluster/nodes/{id}/forget` | remove a node |
 | GET | `/api/cluster/nodes/{node_id}/desired-config` | what the node-agent reconciles against |
 | PUT | `/api/cluster/nodes/{node_id}/config` | set node config (`usage_profile`: `shared` \| `dedicated` \| null for the default) |
@@ -484,7 +506,7 @@ capped at 200 000 characters a turn. It is not the answer, which arrives as
 | GET | `/bootstrap/prep`, `/bootstrap/apply`, `/bootstrap/deenroll`, `/bootstrap/fetch`, `/bootstrap/ca.crt` | the pull rail a node walks during enrollment |
 | POST, GET | `/api/cluster/provision-bundle/{node}`, `…/status`; GET `/bootstrap/bundle/{node}`; POST `/bootstrap/bundle/{node}/applied` | signed provisioning bundles |
 | PUT, GET | `/api/cluster/cli-asset/{name}`, `/bootstrap/cli/{name}` | CLI binaries served to nodes |
-| GET | `/api/artifacts/manifest/{kind}/{name}` | artifact rail manifests (`gguf`, `modelfile`, `image`; `binary` is retired): `{size_bytes, sha256, data_path}`. The sha256 is cached by path, size and mtime; a file not yet hashed is hashed in the background, and a request that would wait more than ~8 s gets `202 {"status":"hashing","retry_after_secs"}` with `Retry-After` — ask again. `noo cluster sync-model-files` warms this before it queues the node jobs |
+| GET | `/api/artifacts/manifest/{kind}/{name}` | artifact rail manifests (`gguf`, `modelfile`, `image`; `binary` is retired): `{size_bytes, sha256, data_path}`. The sha256 is cached by path, size, nanosecond mtime, inode and device (an entry from an older gateway, without them, re-hashes once); a file not yet hashed is hashed in the background, and a request that would wait more than ~8 s gets `202 {"status":"hashing","retry_after_secs"}` with `Retry-After` — ask again. `noo cluster sync-model-files` warms this before it queues the node jobs |
 
 
 ## Models
@@ -745,6 +767,7 @@ answers when it does not reply.
 | GET | `/api/autonomy/status`, `/api/autonomy/audit` | locations and their audit trail |
 | GET | `/api/autonomy/decisions` | what the disarmed locations *would* have done (`?outcome=would` by default; `fired`, `error` or `all`) |
 | POST | `/api/autonomy/locations`, `/api/autonomy/locations/{name}/toggle`, `/api/autonomy/enable`, `/api/autonomy/disable` | manage locations |
+| POST | `/api/autonomy/locations/{name}/dry-run` | `{"dry_run": false}` arms a gated rule (`disk_watermark`, `cert_auto_rotate`) and takes it out of preview in one update (409 if the rule is switched off); `true` puts it back into preview, arm state unchanged; operator or admin; audited. Replies the state read back: `{name, enabled, armed, dry_run, config, live_means}` |
 | GET, POST | `/api/activities`; POST `…/{id}/progress`, `/link-task`, `/complete`; PUT `…/{id}/status` | agent activities |
 | GET | `/api/agent/loops` | managed loops |
 | GET, POST, DELETE | `/api/proactive/status`, `/rules`, `/history`, `/rules/{rule_id}` | the proactive loop |
@@ -830,7 +853,7 @@ on the gateway's own). Broadcast is refused; a thread needs a seat.
 | GET / PUT / DELETE | `/api/mcp/servers/{id}` | one server: spec, audience, placements, discovered tools (`noo mcp server show/enable/disable/remove`) |
 | PUT / DELETE | `/api/mcp/servers/{id}/placements/{node}` | which registered node hosts or dials it (`noo mcp place/unplace`) |
 | POST | `/api/cluster/nodes/{node}/mcp/{id}/tools` | node rail: the hosting node's discovery report (catalog replaced whole) |
-| GET | `/api/logs/status`, `/query`, `/containers`, `/docker-stats`, `/node/{node_id}/{container}`; POST `/api/logs/tail`, `/api/logs/errors`, `/api/logs/search` | logs: `search` is Loki-only (the gateway builds the LogQL); `tail`/`errors` are Loki-backed with a node-agent scan fallback and say `backend`; every route Operator/Admin only |
+| GET | `/api/logs/status`, `/query`, `/containers`, `/docker-stats`, `/node/{node_id}/{container}`; POST `/api/logs/tail`, `/api/logs/errors`, `/api/logs/search` | logs: `search` is Loki-only (the gateway builds the LogQL); `tail`/`errors` are Loki-backed with a node-agent scan fallback and say `backend`; on a lean install with no Loki, `search` answers 200 `{"lines":[],"backend":"off","message":…}` and the scans say `loki_off: true`; every route Operator/Admin only |
 | GET | `/api/traces/status`, `/api/traces/requests`, `/api/traces/summary` | request traces (i359): Tempo's readiness to the gateway; recent requests from `noo_request_trace` (filters `hours` ≤ 720, `route`, `model`, `node`, `actor`, `min_status`, `min_ms`, `limit` ≤ 1000); the window grouped `by` route, model, node, backend or actor with p50/p95/max ms, errors and tokens. Metadata only. Every route Operator/Admin only (`TRACES_READ_PREFIX`); the MCP tools `noo_traces_requests` and `noo_traces_summary` are on the operator door only |
 | GET | `/api/cache/stats` | Redis cache stats |
 | GET, POST | `/api/db/migrations`, `/api/db/migrations/apply` | the mesh migration runner (`noo db`) |
@@ -838,7 +861,8 @@ on the gateway's own). Broadcast is refused; a thread needs a seat.
 | GET, POST | `/api/tests/status`, `/api/tests/run` | the `test_run` gateway job |
 | GET, POST | `/api/mesh/status`, `/operations`, `/restart`, `/rebuild`, `/stack-rebuild` | stack operations via the host spool |
 | GET | `/api/metrics/query`, `/api/metrics/range`, `/api/metrics/discover`, `/api/alerts/list` | Prometheus passthrough: instant query, range query (11,000-point and 100-series caps), metric/label discovery, and alert rules merged with Alertmanager state (Operator+, read-only) |
-| POST | `/api/monitoring/grafana-session` | open Grafana as yourself: mints a short-lived Grafana login token for the caller's live account (any tier; a disabled account is refused) |
+| POST | `/api/monitoring/grafana-session` | open Grafana as yourself: mints a short-lived Grafana login token for the caller's live account (any tier; a disabled account is refused); 409 "Dashboards are off on this install: noo stack monitoring on" when `cluster.monitoring: lean` and no Grafana runs |
+| GET | `/api/monitoring/status` | `{monitoring, grafana, log_search, traces, message?}`: which of Grafana, Loki and Tempo run (any tier); all `true` unless lean and absent |
 | GET, POST | `/api/grafana-ds/prometheus/{*path}`, `/api/grafana-ds/loki/{*path}` | Grafana's data sources through the gateway, the viewer's tier enforced per query; Grafana's service leaf only, no bearer opens them |
 | GET, PUT | `/api/addons/{addon}/access` | add-on access (noomesh-internal f99). GET (operator or above): the add-on's declared `features`, every `settings` row, `stale_features` (settings for a feature no longer declared: they open nothing) and `super_admins`; `legacy: true` for a manifest without features. PUT (admin): `{feature, subject, value: on\|off\|inherit, reason?, source?}` with `subject` one of `role:<user\|operator\|admin>`, `team:<name>`, `user:<account>`, `key:<consumer>`; the most specific setting wins (account or key, then team with off winning, then role from the person's tier down). Refused `403`: a setting that covers an admin unless the caller is a super admin, `off` for one without a `reason`, `on` below operator for a feature with a write route the add-on did not declare `owner_scoped`. `source` is `operator` (the default) or `accepted_suggestion`, which is accepted only for `on` and the role the add-on suggests the feature for (`user` or `operator`); anything else is refused `400` naming the declared suggestion (what `noo addons accept-suggestions` writes). Audited (`addon_access_set`, from, to and source) |
 | GET | `/api/addons/{addon_id}/cli-piece`, `/console-piece` | an add-on's own `noo` commands / console diagram slots, validated by the gateway. `404` unknown add-on or no piece, `503` add-on disabled or unlicensed, `502` no answer or an invalid piece |

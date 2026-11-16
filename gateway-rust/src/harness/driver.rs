@@ -1053,6 +1053,10 @@ async fn invoke<R: DriverRail>(
     let (variant, chosen) = ctx.run_ctx();
     let ctx: &DriverCtx = &chosen;
     let translator = Translator::start(ctx.pinned.clone()).await.context("starting the wire translator")?;
+    // The decided context for the pinned model (i802), from the agent's
+    // placement: stamped on an Ollama-bound body the CLI left without one.
+    // Through the agent (the `openai` wire) the agent stamps the same value.
+    translator.set_num_ctx(crate::harness::profile::chat_context_for(&ctx.pinned.model));
     // The model's text as it streams, for a turn's working block (i278 D).
     if let Some(out) = working {
         let mut rx = translator.tap();
@@ -1359,7 +1363,10 @@ pub(crate) async fn run_turn_on<R: DriverRail, S: TurnSink>(ctx: &DriverCtx, rai
             total_tokens: clamp(usage.total_tokens),
             total_tool_calls: 0,
             total_latency_ms: o.elapsed.as_millis().min(u64::MAX as u128) as u64,
+            // a cloud API / vendor CLI counts its own prompt: not judged (i802)
+            truncated: None,
         },
+        recall: None,
     })
 }
 

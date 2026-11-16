@@ -275,9 +275,28 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     };
 
     let mut action = decide_cli_action(&current, &version, pin.is_some());
-    // A mirror serves "whatever it has": today's behaviour is to fetch.
-    if base_url.is_some() && action == CliAction::Noop {
-        action = CliAction::Upgrade;
+    // A mirror serves "whatever it has" and cannot be enumerated, so the
+    // same version number proves nothing there. Only the mirror's SIGNED
+    // manifest may say the running binary is already what it serves (F17:
+    // a node re-downloaded the whole binary on every run). Short of that,
+    // fetch as before, through the download path's own verification.
+    if action == CliAction::Noop {
+        if let Some(base) = base_url.as_deref() {
+            let asset = format!("noo-{target}");
+            let manifest = fetch_signed_manifest(g, &version, Some(base)).map_err(|e| e.summary());
+            match mirror_verdict(manifest, &crate::release_sig::verify, &current, &asset, running_exe_sha().as_deref()) {
+                MirrorVerdict::Current => {
+                    if !g.json {
+                        ui::step(&format!("the mirror's signed {} verifies and lists this {asset}: nothing to download",
+                            crate::release_sig::MANIFEST));
+                    }
+                }
+                MirrorVerdict::Download(why) => {
+                    if !g.json { ui::step(&format!("{why} — downloading from the mirror")); }
+                    action = CliAction::Upgrade;
+                }
+            }
+        }
     }
 
     if check_only {
@@ -972,13 +991,17 @@ fn mcp_catalogue(g: &Globals) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Connected MCP clients keep the tool list they fetched at connect; the
-/// doors cannot tell them it changed yet (i277f). Said only when both
-/// readings exist and differ: a gateway too old to report one says nothing.
+/// Connected MCP clients keep the tool list they fetched at connect. The
+/// doors can tell only a client that holds a legacy MCP session
+/// (`mcp_session::with_list_changed`), and Claude Code speaks the sessionless
+/// revision (every door call of 2026-11-15 was `2026-07-28`), so after the
+/// 0.6.24 roll no client was told and each called the mailbox tools with the
+/// old schema. Every client must reconnect. Said only when both readings
+/// exist and differ: a gateway too old to report one says nothing.
 fn catalogue_hint(before: Option<&str>, after: Option<&str>) -> Option<&'static str> {
     match (before, after) {
         (Some(b), Some(a)) if a != b => Some(
-            "the MCP tool list changed: a client with a session is told on its next call; reconnect any other (`/mcp` in Claude Code, restart Codex) or it keeps the old list",
+            "the MCP tool list changed: every MCP client must reconnect, or it keeps the old list (Claude Code: /mcp → reconnect each noomesh server; Codex: restart it)",
         ),
         _ => None,
     }
@@ -1190,6 +1213,8 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     sync_gateway_pki_view(g);
     crate::commands::voice_models::stage_if_on(g);
     reconcile_addon_nats_principals(g, &roll.root);
+
+    reconcile_cpu_only_slots(g, &roll.root);
 
     // Stage node images (overlapping the launcher), then launch.
     let staging = crate::commands::image_stage::start_stage_release_images(g, target_stack_lock.clone(), &roll.tag);
@@ -1754,6 +1779,12 @@ fn refresh_deploy_slice(g: &Globals, roll: &Roll) {
 fn move_pin(g: &Globals, roll: &Roll, target_stack_lock: Option<&str>, addon_prep: &[crate::addons::Prepared]) {
     let root = &roll.root;
     let tag = &roll.tag;
+    // Image retention: across a tag change, the outgoing locks stay as
+    // `.prev` so the previous release's images are kept for a rollback.
+    if roll.prev.trim() != tag.as_str() {
+        crate::commands::image_retention::keep_previous_file(&root.join(crate::commands::image_retention::STACK_LOCK));
+        crate::commands::image_retention::keep_previous_file(&crate::addons::pins::pins_path(root));
+    }
     write_stack_lock(g, tag, root, target_stack_lock);
     commit_addon_pins(g, root, tag, addon_prep);
     if let Err(e) = crate::onboard::standalone::upsert_env(root, "NOO_IMAGE_TAG", tag) {
@@ -1778,7 +1809,6 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
 {
     let root = &roll.root;
     let tag = &roll.tag;
-    let prev = &roll.prev;
     // The launcher's own output (compose pull/up progress) follows this
     // line; it is the one child whose stdout is shown as-is (guide §5).
     if !g.json { ui::step("starting the stack (launcher)"); }
@@ -1875,6 +1905,9 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
                 ui::guide(&[("noo cluster verify --wait",
                     "checks the stack, every node and the PKI once the rolled services settle")]);
             }
+            // Image retention: after a verified roll, the superseded images
+            // that are provably ours go (the first roll only previews).
+            crate::commands::image_retention::post_roll(g, root, tag);
             // A roll recreates the gateway; the tailnet front door in front
             // of it is written by onboard and promote and by nothing else, so
             // a controller that lost it stays lost while every line above
@@ -1899,63 +1932,10 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
             // `noo upgrade --all` needs no manual restart. Never fails the roll.
             super::mesh::front_addon_uis(g);
             ensure_embedder_after_roll(g);
-            // Prune superseded release images (finding #93: 13 upgrades
-            // quietly accumulated 78 tags — gigabytes). Best-effort — a prune
-            // failure must never taint a successful roll.
-            //
-            // Selected by REFERENCE, not by tag text. The old rule kept
-            // anything whose text after the last `:` was neither the new tag
-            // nor the previous one — which worked until digest pinning
-            //  made every stack image arrive UNTAGGED.
-            // `docker images` then reports `repo:<none>`, so `<none>` matched
-            // neither tag and the whole set was marked stale INCLUDING the
-            // images the running containers were built from. `docker rmi -f`
-            // refused those, the command exited non-zero, and the operator was
-            // told all 51 could not be pruned — while nothing was reclaimed at
-            // all, so the count climbed every release (44 → 51 → 52, live
-            // 2026-09-05, with 11.6 GB reclaimable sitting there).
-            //
-            // Note these images are NOT dangling — they have a repository and
-            // no tag — so `docker image prune` skips them too. The question
-            // this code actually wants to ask is "does any container use it",
-            // and that is now the question it asks.
-            let in_use = docker_image_ids_in_use();
-            let stale = superseded_images(&docker_image_lines(), &in_use, tag, prev);
-            if !stale.is_empty() {
-                // Per-image, so one in-use image cannot report the whole batch
-                // as failed. The previous all-or-nothing status was the reason
-                // "could not prune 51" was mostly untrue.
-                let mut pruned = 0usize;
-                let mut kept = 0usize;
-                for id in &stale {
-                    let ok = std::process::Command::new("docker")
-                        .args(["rmi", id])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
-                        .map(|st| st.success())
-                        .unwrap_or(false);
-                    if ok { pruned += 1 } else { kept += 1 }
-                }
-                if !g.json {
-                    // "kept v0.2.43 + previous v0.2.43" names one tag twice and
-                    // reads as a bug in the pruner. When the previous tag IS the
-                    // one being applied there is no previous to keep, and saying
-                    // so is shorter than saying it twice.
-                    let kept_label = if prev.is_empty() || prev == tag {
-                        format!("kept {tag}")
-                    } else {
-                        format!("kept {tag} + previous {prev}")
-                    };
-                    if kept == 0 {
-                        ui::done(&format!("pruned {pruned} superseded image(s) ({kept_label})"));
-                    } else {
-                        ui::done(&format!(
-                            "pruned {pruned} superseded image(s); {kept} still referenced and left alone \
-                             ({kept_label})"));
-                    }
-                }
-            }
+            // Superseded images are image retention's alone (the call above):
+            // the pruner that ran here on every roll (finding #93) ignored
+            // `cluster.image_retention`, never previewed, and removed the
+            // previous release's untagged images; retired for 0.6.25.
             // Node images were staged BEFORE the launcher (see the call above
             // it): nothing the roll does changes what the signed lock says, so
             // there is no second pass here. The run is joined by the caller.
@@ -2763,6 +2743,15 @@ fn reconcile_netns_unit(g: &Globals, root: &std::path::Path) {
 
 fn reconcile_grafana_door(g: &Globals, root: &std::path::Path) {
     use super::grafana_door as gd;
+    // Grafana is off on a lean install (cluster.monitoring): no tailnet
+    // serve entry for a port nothing listens on, and no certificate for a
+    // service that is not there. Unset or full: today's door, unchanged.
+    if super::stack_monitoring::effective_lean_live(root) {
+        if !g.json {
+            ui::say(&grafana_door_skipped_line());
+        }
+        return;
+    }
     let env_path = root.join(".env");
     let declared = gd::declared_door(&env_path);
     // The tailnet door: `tailscale serve` on Grafana's own port, so the
@@ -2814,6 +2803,13 @@ fn reconcile_grafana_door(g: &Globals, root: &std::path::Path) {
         Ok(false) => {}
         Err(e) => ui::warned(&format!("grafana service certificate: {e} — then: noo security pki issue-service grafana --san {}", door.host())),
     }
+}
+
+/// What the roll says instead of setting up Grafana's door on a lean install.
+fn grafana_door_skipped_line() -> String {
+    "Grafana door: skipped, Grafana is off on this install (cluster.monitoring: lean). \
+     After `noo stack monitoring on`, the next `noo upgrade --stack` sets it up"
+        .to_string()
 }
 
 /// Create and fill `pki/public/` (the gateway's certificate-only view,
@@ -3857,83 +3853,6 @@ pub(crate) fn provision_one(g: &Globals, node: &str, extra: &[&str]) -> Result<i
     }
 }
 
-/// `docker images` as `<id> <repo>:<tag>` lines. Empty when docker is absent —
-/// pruning is best-effort and must never fail a roll.
-fn docker_image_lines() -> Vec<String> {
-    std::process::Command::new("docker")
-        .args(["images", "--format", "{{.ID}} {{.Repository}}:{{.Tag}}"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect())
-        .unwrap_or_default()
-}
-
-/// Image ids any container (running OR stopped) was created from.
-///
-/// Stopped containers count: `docker rmi` refuses an image a stopped container
-/// still references, and a stopped container is often one the operator intends
-/// to start again.
-fn docker_image_ids_in_use() -> std::collections::HashSet<String> {
-    std::process::Command::new("docker")
-        .args(["ps", "-a", "--format", "{{.Image}}"])
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter_map(|r| {
-                    let out = std::process::Command::new("docker")
-                        .args(["inspect", "-f", "{{.Id}}", r.trim()])
-                        .output()
-                        .ok()?;
-                    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    if id.is_empty() { None } else { Some(short_id(&id)) }
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// `docker images` prints 12-char ids; `docker inspect` prints the full
-/// `sha256:…`. Compare on the short form so the two agree.
-fn short_id(id: &str) -> String {
-    let hex = id.strip_prefix("sha256:").unwrap_or(id);
-    hex.chars().take(12).collect()
-}
-
-/// Which of our release images are superseded AND unreferenced.
-///
-/// Pure, so the rule can be tested without a docker daemon — the previous rule
-/// could not be, which is part of why it survived digest pinning.
-fn superseded_images(
-    lines: &[String],
-    in_use: &std::collections::HashSet<String>,
-    tag: &str,
-    prev: &str,
-) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in lines {
-        let Some((id, name)) = line.split_once(' ') else { continue };
-        if !crate::registry::is_registry_image(name) {
-            continue;
-        }
-        // Referenced by a container: never a candidate, whatever its tag says.
-        if in_use.contains(id) {
-            continue;
-        }
-        // Keep the tag just deployed and the previous pin, so an instant
-        // rollback stays warm. An UNTAGGED image (`<none>`, which is what a
-        // digest-pinned pull leaves behind) is kept only by the in-use test
-        // above — it carries no tag to compare, so tag rules cannot save it.
-        let t = name.rsplit(':').next().unwrap_or("");
-        if t == tag || (!prev.is_empty() && t == prev) {
-            continue;
-        }
-        out.push(id.to_string());
-    }
-    out.sort();
-    out.dedup();
-    out
-}
-
 /// The `noo` PATH would run, when that is NOT `exe`.
 ///
 /// `None` when we are first on PATH, or not on it at all — being absent from
@@ -4357,6 +4276,58 @@ fn decide_cli_action(current: &str, target: &str, pinned: bool) -> CliAction {
         Some(Ordering::Greater) if pinned => CliAction::DowngradePinned,
         Some(Ordering::Greater) => CliAction::KeepNewer,
     }
+}
+
+/// What a mirror's signed manifest says about the running binary.
+#[derive(Debug, PartialEq, Eq)]
+enum MirrorVerdict {
+    /// The manifest verifies, names the running version, and lists the
+    /// running binary's sha256 for this platform: nothing to download.
+    Current,
+    /// Anything else, with the reason: download as before (the download
+    /// path fetches and verifies the manifest again on its own).
+    Download(String),
+}
+
+/// The pure decision behind skipping a mirror download (F17). The mirror is
+/// untrusted transport: nothing it serves may say "current" until the
+/// signature verifies against the release key, the signed bytes name the
+/// running version, and they list the running binary's digest. Every other
+/// outcome downloads; none of them assumes the binary is current.
+fn mirror_verdict(
+    manifest: Result<Option<(String, String)>, String>,
+    verify: &SigVerify<'_>,
+    current: &str,
+    asset: &str,
+    running_sha: Option<&str>,
+) -> MirrorVerdict {
+    let m = crate::release_sig::MANIFEST;
+    let (manifest, sig) = match manifest {
+        Ok(Some(pair)) => pair,
+        Ok(None) => return MirrorVerdict::Download(format!("the mirror serves no signed {m}")),
+        Err(e) => return MirrorVerdict::Download(format!("could not read the mirror's signed {m}: {e}")),
+    };
+    if let Err(e) = verify(manifest.as_bytes(), &sig) {
+        return MirrorVerdict::Download(format!("the mirror's {m} does not verify against the release key ({e})"));
+    }
+    if !crate::release_sig::manifest_names_version(&manifest, current) {
+        return MirrorVerdict::Download(format!("the mirror's signed {m} is not the one for {current}"));
+    }
+    let want = match crate::release_sig::manifest_sha_for(&manifest, asset) {
+        Some(h) => h,
+        None => return MirrorVerdict::Download(format!("the mirror's signed {m} lists no {asset}")),
+    };
+    match running_sha {
+        Some(got) if got == want => MirrorVerdict::Current,
+        Some(_) => MirrorVerdict::Download(format!("the mirror's {asset} differs from the running binary")),
+        None => MirrorVerdict::Download("could not read the running binary to compare it".into()),
+    }
+}
+
+/// sha256 (hex) of the running executable; None when it cannot be read.
+fn running_exe_sha() -> Option<String> {
+    let bytes = std::fs::read(std::env::current_exe().ok()?).ok()?;
+    Some(hex::encode(Sha256::digest(&bytes)))
 }
 
 /// The newest FINAL CLI release among `(tag, is_prerelease)` pairs, as a bare
@@ -5798,6 +5769,9 @@ mod tests {
     #[test]
     fn the_reconnect_hint_needs_two_differing_readings() {
         assert!(super::catalogue_hint(Some("a"), Some("b")).is_some_and(|h| h.contains("reconnect")));
+        let h = super::catalogue_hint(Some("a"), Some("b")).unwrap();
+        assert!(h.contains("every MCP client must reconnect") && h.contains("Claude Code: /mcp") && h.contains("Codex: restart"), "{h}");
+        assert!(!h.contains("session"), "no client is told on its next call: {h}");
         assert!(super::catalogue_hint(Some("a"), Some("a")).is_none());
         assert!(super::catalogue_hint(None, Some("b")).is_none(), "an older gateway reports nothing: say nothing");
         assert!(super::catalogue_hint(Some("a"), None).is_none());
@@ -6269,63 +6243,18 @@ mod tests {
 
     use super::{first_noo_on_path, local_agent_name, target_triple_for, version_less_than, running_gateway_tag};
 
-    fn ids(v: &[&str]) -> std::collections::HashSet<String> {
-        v.iter().map(|s| s.to_string()).collect()
-    }
-
-    /// The regression: a digest-pinned pull leaves the image UNTAGGED, so
-    /// `docker images` reports `repo:<none>`.
-    ///
-    /// The old rule kept anything whose text after the last `:` was neither
-    /// the new tag nor the previous one, so `<none>` matched neither and the
-    /// RUNNING images were marked stale. `docker rmi -f` refused them, the
-    /// batch reported failure, and nothing was ever reclaimed — the count
-    /// climbed 44 → 51 → 52 across releases with 11.6 GB sitting idle.
+    /// One deleter of superseded images: image retention. The roll's own
+    /// pruner (finding #93) removed images on every roll, ignoring
+    /// `cluster.image_retention: off` and the previous release's images;
+    /// it must not come back here.
     #[test]
-    fn an_untagged_image_in_use_is_never_pruned() {
-        let lines = vec![
-            "aaaaaaaaaaaa ghcr.io/noomesh/gateway:<none>".to_string(),
-            "bbbbbbbbbbbb ghcr.io/noomesh/worker:<none>".to_string(),
-        ];
-        // The gateway image is the one the running container was created from.
-        let got = superseded_images(&lines, &ids(&["aaaaaaaaaaaa"]), "v0.2.24", "v0.2.23");
-        assert_eq!(got, vec!["bbbbbbbbbbbb".to_string()],
-            "an in-use image must be left alone, and an unused one must still be reclaimed");
-    }
-
-    /// The current and previous tags stay warm so a rollback needs no pull.
-    #[test]
-    fn the_deployed_and_previous_tags_are_kept() {
-        let lines = vec![
-            "999999999999 ghcr.io/noomesh/gateway:v0.2.19".to_string(),
-            "111111111111 ghcr.io/noomesh/gateway:v0.2.24".to_string(),
-            "222222222222 ghcr.io/noomesh/gateway:v0.2.23".to_string(),
-            "333333333333 ghcr.io/noomesh/gateway:v0.2.20".to_string(),
-        ];
-        let got = superseded_images(&lines, &Default::default(), "v0.2.24", "v0.2.23");
-        // Both superseded tags are candidates; the deployed and previous stay.
-        assert_eq!(got, vec!["333333333333".to_string(), "999999999999".to_string()]);
-    }
-
-    /// Images from other publishers are not ours to reclaim. Deleting
-    /// postgres or nats here would be a rude surprise on a shared host.
-    #[test]
-    fn only_our_own_images_are_candidates() {
-        let lines = vec![
-            "444444444444 nats:latest".to_string(),
-            "555555555555 ollama/ollama:latest".to_string(),
-            "666666666666 ghcr.io/ggml-org/llama.cpp:server".to_string(),
-        ];
-        assert!(superseded_images(&lines, &Default::default(), "v0.2.24", "").is_empty());
-    }
-
-    /// docker images prints a 12-char id; docker inspect prints sha256:<64>.
-    /// Comparing those unequal would make the in-use test never match, and
-    /// every running image would become a prune candidate again.
-    #[test]
-    fn ids_compare_on_the_short_form() {
-        assert_eq!(short_id("sha256:aaaaaaaaaaaabbbbbbbbbbbb"), "aaaaaaaaaaaa");
-        assert_eq!(short_id("aaaaaaaaaaaa"), "aaaaaaaaaaaa");
+    fn the_roll_runs_no_image_removal_of_its_own() {
+        let src = include_str!("upgrade.rs");
+        let body = src;
+        for needle in [concat!("\"rm", "i\""), concat!("\"image\", \"r", "m\""), concat!("\"pru", "ne\"")] {
+            assert!(!body.contains(needle), "upgrade.rs removes images itself again: {needle}");
+        }
+        assert!(body.contains("crate::commands::image_retention::post_roll(g, root, tag);"));
     }
 
     /// The controller is skipped by the enrollment-list filter, so the
@@ -6731,6 +6660,139 @@ mod cli_action_tests {
         assert_eq!(CliAction::DowngradePinned.as_str(), "downgrade_pinned");
         assert_eq!(CliAction::Noop.as_str(), "noop");
         assert_eq!(CliAction::Upgrade.as_str(), "upgrade");
+    }
+}
+
+/// F17: a mirror download is skipped only on a manifest that verifies
+/// against the release key, names the running version, and lists the
+/// running binary's digest. Every other outcome downloads.
+#[cfg(test)]
+mod mirror_verdict_tests {
+    use super::{mirror_verdict, MirrorVerdict};
+    use crate::release_sig::{pubkey_hex, sign, signing_key_from_seed_hex, verify_with_keys, VERSION_ASSET};
+    use sha2::{Digest, Sha256};
+
+    const ASSET: &str = "noo-x86_64-unknown-linux-musl";
+    const RUNNING: &[u8] = b"the running noo build";
+    const CURRENT: &str = "0.6.30";
+
+    fn sha(b: &[u8]) -> String {
+        hex::encode(Sha256::digest(b))
+    }
+
+    /// `sha256sums.txt` naming `version` and listing `bin` as this platform's binary.
+    fn manifest(version: &str, bin: &[u8]) -> String {
+        format!("{}  {ASSET}\n{}  {VERSION_ASSET}\n", sha(bin), sha(format!("{version}\n").as_bytes()))
+    }
+
+    fn signed_by(seed: &str, text: &str) -> Result<Option<(String, String)>, String> {
+        let key = signing_key_from_seed_hex(seed).unwrap();
+        Ok(Some((text.to_string(), sign(&key, text.as_bytes()))))
+    }
+
+    /// The test release key stands in for the baked one.
+    fn test_seed() -> String {
+        "11".repeat(32)
+    }
+
+    fn decide(m: Result<Option<(String, String)>, String>, running: Option<&str>) -> MirrorVerdict {
+        let pk = pubkey_hex(&signing_key_from_seed_hex(&test_seed()).unwrap());
+        let verify = |d: &[u8], s: &str| verify_with_keys(d, s, &[pk.as_str()]);
+        mirror_verdict(m, &verify, CURRENT, ASSET, running)
+    }
+
+    fn why(v: MirrorVerdict) -> String {
+        match v {
+            MirrorVerdict::Download(w) => w,
+            MirrorVerdict::Current => panic!("skipped the download on a manifest that must not decide it"),
+        }
+    }
+
+    #[test]
+    fn a_verified_manifest_naming_this_binary_skips_the_download() {
+        let running = sha(RUNNING);
+        let v = decide(signed_by(&test_seed(), &manifest(CURRENT, RUNNING)), Some(&running));
+        assert_eq!(v, MirrorVerdict::Current);
+    }
+
+    #[test]
+    fn a_bad_signature_claiming_this_binary_downloads() {
+        let running = sha(RUNNING);
+        let claim = manifest(CURRENT, RUNNING);
+        // Signed by a key this build does not trust.
+        let w = why(decide(signed_by(&"22".repeat(32), &claim), Some(&running)));
+        assert!(w.contains("does not verify"), "{w}");
+        // A genuine signature over other bytes, served with the claim.
+        let (_, sig) = signed_by(&test_seed(), &manifest(CURRENT, b"another build")).unwrap().unwrap();
+        let w = why(decide(Ok(Some((claim.clone(), sig))), Some(&running)));
+        assert!(w.contains("does not verify"), "{w}");
+        // Not a signature at all.
+        let w = why(decide(Ok(Some((claim.clone(), "noo-sig1.AAAA".into()))), Some(&running)));
+        assert!(w.contains("does not verify"), "{w}");
+        // Production wiring: the baked key never trusts the test key.
+        let v = mirror_verdict(signed_by(&test_seed(), &claim), &crate::release_sig::verify, CURRENT, ASSET, Some(&running));
+        assert!(why(v).contains("does not verify"));
+    }
+
+    #[test]
+    fn a_verified_manifest_with_a_different_digest_downloads() {
+        let running = sha(RUNNING);
+        let w = why(decide(signed_by(&test_seed(), &manifest(CURRENT, b"a rebuilt noo")), Some(&running)));
+        assert!(w.contains("differs from the running binary"), "{w}");
+    }
+
+    #[test]
+    fn a_verified_manifest_for_another_version_downloads() {
+        let running = sha(RUNNING);
+        // Same digest, other release: the signed bytes must name this one.
+        let w = why(decide(signed_by(&test_seed(), &manifest("0.6.31", RUNNING)), Some(&running)));
+        assert!(w.contains("is not the one for 0.6.30"), "{w}");
+        // An older manifest with no version row cannot name any release.
+        let unbound = format!("{}  {ASSET}\n", sha(RUNNING));
+        let w = why(decide(signed_by(&test_seed(), &unbound), Some(&running)));
+        assert!(w.contains("is not the one for 0.6.30"), "{w}");
+    }
+
+    #[test]
+    fn a_verified_manifest_without_this_platform_downloads() {
+        let running = sha(RUNNING);
+        let other = manifest(CURRENT, RUNNING).replace(ASSET, "noo-aarch64-unknown-linux-musl");
+        assert!(!other.contains(ASSET), "the platform row was renamed");
+        let w = why(decide(signed_by(&test_seed(), &other), Some(&running)));
+        assert!(w.contains(&format!("lists no {ASSET}")), "{w}");
+    }
+
+    #[test]
+    fn no_manifest_a_failed_fetch_or_an_unreadable_binary_downloads() {
+        let running = sha(RUNNING);
+        let w = why(decide(Err("connection refused".into()), Some(&running)));
+        assert!(w.contains("could not read the mirror's signed") && w.contains("connection refused"), "{w}");
+        let w = why(decide(Ok(None), Some(&running)));
+        assert!(w.contains("serves no signed"), "{w}");
+        let w = why(decide(signed_by(&test_seed(), &manifest(CURRENT, RUNNING)), None));
+        assert!(w.contains("could not read the running binary"), "{w}");
+    }
+
+    /// The wiring: only a mirror run consults the manifest, production
+    /// passes the baked-key check (never a permissive one), every reason to
+    /// doubt falls back to the download, and the signature is checked
+    /// before anything the manifest says is read.
+    #[test]
+    fn the_mirror_skip_trusts_only_the_release_key() {
+        let up = super::phase_src::body("upgrade");
+        let gate = up.find("if let Some(base) = base_url.as_deref()").expect("the skip runs on a mirror only");
+        let call = up.find("mirror_verdict(manifest, &crate::release_sig::verify, &current, &asset, running_exe_sha().as_deref())")
+            .expect("production decides with the baked release key and the running binary's digest");
+        let arm = up.find("MirrorVerdict::Download(why) =>").expect("the download arm");
+        let forced = up[arm..].find("action = CliAction::Upgrade;").map(|i| arm + i).expect("the download arm forces the fetch");
+        let check = up.find("if check_only").expect("check_only");
+        assert!(gate < call && call < arm && forced < check);
+        let v = super::phase_src::body("mirror_verdict");
+        let at = |n: &str| v.find(n).unwrap_or_else(|| panic!("{n}"));
+        let verified = at("verify(manifest.as_bytes(), &sig)");
+        assert!(verified < at("manifest_names_version(&manifest, current)"));
+        assert!(verified < at("manifest_sha_for(&manifest, asset)"));
+        assert!(verified < at("MirrorVerdict::Current"));
     }
 }
 
@@ -7329,6 +7391,18 @@ mod storage_dir_tests {
         assert_eq!(missing_storage_dirs(&root, &root, ""), vec![("tempo".to_string(), root.join("tempo"))]);
         std::fs::create_dir_all(root.join("tempo")).unwrap();
         assert!(missing_storage_dirs(&root, &root, "").is_empty(), "a complete root needs nothing");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// i675 F13: the gateway now mounts HF_CACHE_DIR/hub read-only. An
+    /// existing install that never fetched a model has hf-cache but no hub/;
+    /// the roll must create exactly that one, before the pin moves and so
+    /// before the gateway is recreated (Docker would make it root-owned).
+    #[test]
+    fn an_old_data_root_without_hf_hub_needs_exactly_hf_hub() {
+        let root = root_without("hfhub", STORAGE_SUBDIRS, &["hf-cache/hub"]);
+        assert!(root.join("hf-cache").is_dir());
+        assert_eq!(missing_storage_dirs(&root, &root, ""), vec![("hf-cache/hub".to_string(), root.join("hf-cache/hub"))]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -8043,5 +8117,119 @@ mod netns_reconcile_tests {
         let own = crate::test_src::own_code(include_str!("upgrade.rs"));
         let body = crate::test_src::fn_body(&own, "fn upgrade_stack(");
         assert!(body.contains("reconcile_netns_unit(g, &roll.root);"), "{body}");
+    }
+}
+
+/// The command that puts the slots back to compose's default after this
+/// upgrade set one slot (i802).
+pub(crate) const KEEP_FOUR_SLOTS: &str = "noo config set compose_env '{\"OLLAMA_EMBED_NUM_PARALLEL\":\"4\"}' && noo stack restart --force ollama-embed";
+
+/// i802 (operator's decision): on a CPU-only CONTROLLER whose stack Ollama
+/// runs compose's default of 4 slots because nothing ever set them, the
+/// upgrade sets one slot (noomesh.yaml compose_env) and says so, with the
+/// command that undoes it. A value set anywhere, a GPU box, an unreadable
+/// config: nothing changes. Only the controller's stack roll calls this;
+/// a node's upgrade never does.
+fn reconcile_cpu_only_slots(g: &Globals, root: &std::path::Path) {
+    let (cpu_only, readable, value) = crate::commands::cluster_verify::ollama_slots_setting_here(root);
+    if !slots_upgrade_sets_one(cpu_only, readable, value.as_deref()) {
+        return;
+    }
+    let path = root.join("noomesh.yaml");
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    if std::fs::write(&path, set_compose_env_text(&text, "OLLAMA_EMBED_NUM_PARALLEL", "1")).is_err() {
+        if !g.json {
+            println!("{}", ui::note(&format!("could not write noomesh.yaml; one Ollama slot is still recommended: {}", crate::commands::cluster_verify::CPU_ONLY_SLOTS_REMEDY)));
+        }
+        return;
+    }
+    if !g.json {
+        println!("{}", ui::note(&slots_changed_line()));
+    }
+}
+
+/// The upgrade's own words for the change, with the undo.
+pub(crate) fn slots_changed_line() -> String {
+    format!(
+        "changed: Ollama slots 4 -> 1 on this CPU-only box (noomesh.yaml compose_env). {}. To keep 4: {KEEP_FOUR_SLOTS}",
+        crate::commands::cluster_verify::CPU_ONLY_SLOTS_ADVICE
+    )
+}
+
+/// Set one slot only where nothing chose the slots on a CPU-only box.
+pub(crate) fn slots_upgrade_sets_one(cpu_only: bool, readable: bool, value: Option<&str>) -> bool {
+    cpu_only && readable && value.map(str::trim).filter(|v| !v.is_empty()).is_none()
+}
+
+/// `key: "value"` under the top-level `compose_env:` mapping of a
+/// noomesh.yaml text, keeping every other line as it is (comments
+/// included); the section is appended when absent.
+pub(crate) fn set_compose_env_text(text: &str, key: &str, value: &str) -> String {
+    let entry = |indent: &str| format!("{indent}{key}: \"{value}\"");
+    let lines: Vec<&str> = text.lines().collect();
+    if let Some(i) = lines.iter().position(|l| l.trim_end() == "compose_env:") {
+        // The indent of the section's first child, else two spaces.
+        let indent: String = lines[i + 1..]
+            .iter()
+            .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+            .filter(|l| l.starts_with(' '))
+            .map(|l| l.chars().take_while(|c| *c == ' ').collect())
+            .unwrap_or_else(|| "  ".to_string());
+        let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        out.insert(i + 1, entry(&indent));
+        return out.join("\n") + "\n";
+    }
+    let mut out = text.trim_end_matches('\n').to_string();
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&format!("compose_env:\n{}\n", entry("  ")));
+    out
+}
+
+#[cfg(test)]
+mod cpu_only_slots_upgrade_tests {
+    use super::*;
+
+    /// i802 (operator's decision): unset on a CPU-only box -> set and said;
+    /// an explicit value (4 or anything) -> untouched; a GPU box -> untouched;
+    /// unreadable config -> untouched.
+    #[test]
+    fn one_slot_is_set_only_where_nobody_chose_and_it_is_said() {
+        assert!(slots_upgrade_sets_one(true, true, None));
+        assert!(!slots_upgrade_sets_one(true, true, Some("4")), "an explicit 4 is the operator's");
+        assert!(!slots_upgrade_sets_one(true, true, Some("2")));
+        // A GPU box with a READABLE config and nothing set: only the CPU-only
+        // gate keeps it at its slots (a mutant dropping the gate survived
+        // while this case also read as unreadable).
+        assert!(!slots_upgrade_sets_one(false, true, None), "a GPU box");
+        assert!(!slots_upgrade_sets_one(true, false, None), "an unreadable config");
+        let said = slots_changed_line();
+        assert!(said.starts_with("changed: Ollama slots 4 -> 1") && said.contains("3x faster") && said.ends_with(KEEP_FOUR_SLOTS), "{said}");
+        assert!(KEEP_FOUR_SLOTS.contains(r#""OLLAMA_EMBED_NUM_PARALLEL":"4""#));
+    }
+
+    #[test]
+    fn the_key_goes_under_compose_env_and_nothing_else_moves() {
+        let with = "# my config\ngateway:\n  url: x\ncompose_env:\n    NOO_IMAGE_TAG: \"v1\"  # pinned\nother: 1\n";
+        let out = set_compose_env_text(with, "OLLAMA_EMBED_NUM_PARALLEL", "1");
+        assert_eq!(out, "# my config\ngateway:\n  url: x\ncompose_env:\n    OLLAMA_EMBED_NUM_PARALLEL: \"1\"\n    NOO_IMAGE_TAG: \"v1\"  # pinned\nother: 1\n");
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
+        assert_eq!(parsed["compose_env"]["OLLAMA_EMBED_NUM_PARALLEL"], serde_yaml::Value::from("1"));
+        assert_eq!(parsed["compose_env"]["NOO_IMAGE_TAG"], serde_yaml::Value::from("v1"));
+        let without = set_compose_env_text("gateway:\n  url: x\n", "OLLAMA_EMBED_NUM_PARALLEL", "1");
+        assert_eq!(without, "gateway:\n  url: x\ncompose_env:\n  OLLAMA_EMBED_NUM_PARALLEL: \"1\"\n");
+        assert_eq!(set_compose_env_text("", "K", "1"), "compose_env:\n  K: \"1\"\n");
+    }
+
+    /// Only the controller's stack roll changes it; a node's upgrade never does.
+    #[test]
+    fn only_the_controllers_stack_roll_sets_the_slots() {
+        let own = crate::test_src::own_code(include_str!("upgrade.rs"));
+        assert_eq!(own.matches("reconcile_cpu_only_slots(g, &roll.root);").count(), 1);
+        let stack = crate::test_src::fn_body(&own, "fn upgrade_stack(");
+        assert!(stack.contains("reconcile_cpu_only_slots(g, &roll.root);"), "{stack}");
+        let nodes = crate::test_src::fn_body(&own, "fn upgrade_nodes(");
+        assert!(!nodes.contains("reconcile_cpu_only_slots"), "a node's upgrade never touches it");
     }
 }

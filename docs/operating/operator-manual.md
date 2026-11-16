@@ -37,11 +37,12 @@ and the wizard is `noo onboard`. Adding machines is `noo enroll` (see `noo --hel
 | `nvidia-exporter` | `noo-nvidia-exporter` | `9400` | GPU metrics; scaled to 0 automatically when the host has no NVIDIA runtime |
 | `node-agent` | — | — | not in the `controller` profile (only the `node-agent-compose` profile): the controller's own agent runs on the host as a systemd service (`noo onboard --only services` installs it), never as a container |
 
-Monitoring is part of the `controller` **and** the `standalone` profile —
-every controller runs it, and there is no separate monitoring stack to
-start (until 2026-09-28 a standalone install ran it only after
-`noo onboard --with-monitoring`, and lost it again on its first
-`noo upgrade --stack`). Ports bind to `NOO_BIND_ADDR` (default
+Monitoring is part of the `controller` **and** the `standalone` profile:
+every controller runs Prometheus, Alertmanager and node-exporter. Grafana,
+Loki and Tempo run unless noomesh.yaml says `cluster.monitoring: lean`
+(unset means full; a new install is lean unless the wizard was told yes);
+`noo stack monitoring on|off|status` changes it
+([monitoring.md](monitoring.md)). Ports bind to `NOO_BIND_ADDR` (default
 `0.0.0.0`) unless listed as `127.0.0.1`; a named instance offsets them
 (see [multi-instance](../getting-started/multi-instance.md)).
 
@@ -207,10 +208,42 @@ Roll node agents without touching the stack: `noo cluster upgrade-agents`
 over the pull rail, applied with a health-checked restart). Its old
 gateway-signed binary swap is retired.
 
+### Old images after an upgrade
+
+After a roll, `noo upgrade --stack` removes superseded images that are
+provably ours: noomesh's images, and each pinned add-on image's own
+repository, that no current or previous lock or pin names and no container
+uses. A lock names each image by digest, and the image is kept by that
+digest whatever name Docker holds it under. It never touches anything else:
+your own images, and Docker Hub images (short names such as `redis:7`), are
+always kept. A Hub image the stack lock pins (`nats`, `nginx`) is named in
+the keep file too; it would be kept either way, since a Hub short name is
+never ours to remove. This is the only step of a
+roll that removes images (see the 0.6.25 entry below). The first roll that
+carries this only previews (it lists what it would remove in
+`.noo-host-spool/image-retention-report.json`); later rolls remove. Set
+`cluster.image_retention: preview` (keep previewing) or `off` in
+`noomesh.yaml` to change that.
+
+Cleanup runs only when the roll's `stack images`, `add-on pins` and
+`add-on containers` rows in `noo cluster verify --controller` pass. When
+they do not, the roll says which row blocked it, and the `image retention`
+row says so until a roll cleans.
+
 ### Breaking changes to expect on upgrade
 
 Newest first. Anything here changes behaviour on an install that already
 works, so read it before you pull.
+
+#### A roll no longer removes images by itself (0.6.25)
+
+Up to 0.6.24 every `noo upgrade --stack` also removed noomesh images no
+container used, whatever `cluster.image_retention` said, the previous
+release's included. That step is gone: image retention (above) is the only
+remover. So the first 0.6.25 roll removes nothing; it lists what the next
+one would (`.noo-host-spool/image-retention-report.json`, and the
+`image retention` row of `noo cluster verify --controller`). Until that next
+roll, the previous release's images stay on disk.
 
 #### A 0.6.9 Mac node and the 0.6.10 bundle (2026-10-23)
 
@@ -364,7 +397,7 @@ failed heartbeat tasks) arrive on your configured channel; the
 | Grafana refuses the login, or Open Grafana answers 503 | `noo cluster verify --controller` (`grafana door`, `grafana sso`) | Grafana has no password login: open it from the console. A 503 means single sign-on is off — `noo upgrade --stack` fills `GRAFANA_ROOT_URL` |
 | Open Grafana shows a certificate error (`ERR_CERT_AUTHORITY_INVALID`) on a tailnet controller | `noo cluster verify --controller` (`grafana door`) | Grafana is published straight on the tailnet IP, or nothing fronts its port. `noo upgrade --stack` adds the `tailscale serve` entry that presents the tailnet's certificate, then moves Grafana to loopback. If the roll warns that the entry could not be written, run the `tailscale serve --bg --https=3000 https://127.0.0.1:3000` line it prints (tailscaled up), then `noo upgrade --stack` again. If the row says the port carries another entry, that entry is yours: noo will not overwrite it |
 | Open Grafana fails from another machine on a `local`/`all`/LAN controller | `noo cluster verify --controller` (`grafana door`) | Grafana is on the controller's loopback only. Tunnel first: `ssh -L 3000:127.0.0.1:3000 <you>@<controller>`, then Open Grafana |
-| disk full | `noo logs errors`; alerts | the `disk_watermark` location can reclaim Docker space once you opt in |
+| disk full | `noo logs errors`; alerts | `noo autonomy decisions -l disk_watermark` shows what reclaiming would remove; `noo autonomy live disk_watermark` (or Go live in the console's Autonomy panel) arms it and takes it out of preview, so it acts; `noo autonomy preview disk_watermark` stops it |
 
 Emergency stop: `noo stack stop` (or, when the launcher itself cannot
 run, `cd ~/.noo && docker compose -f docker-compose.cluster.yml kill` —

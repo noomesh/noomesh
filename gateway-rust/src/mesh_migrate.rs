@@ -2475,6 +2475,42 @@ END $$;
 ALTER TABLE noo_request_trace ADD COLUMN IF NOT EXISTS ttft_ms bigint;
 ALTER TABLE noo_request_trace ADD COLUMN IF NOT EXISTS queue_wait_ms bigint;
 "#,
+}, Migration {
+    revision: PLACEMENT_KEEP_WARM_REVISION,
+    down_revision: Some(REQUEST_TRACE_TTFT_REVISION),
+    // `noo cluster place … --keep-warm` (operator spec 2026-11-14): the node
+    // agent keeps this placement's ollama model loaded (keep_alive -1 on its
+    // requests, a preload) on any ollama runtime, and the fit check marks it
+    // resident. DEFAULT false is every existing row: nothing changes until an
+    // operator declares one. A constant boolean default is a catalog-only
+    // change on Postgres 11+ (no table rewrite). Guarded by to_regclass like
+    // 087/088.
+    sql: r#"
+DO $$
+BEGIN
+    IF to_regclass('noo_backend_placements') IS NOT NULL THEN
+        ALTER TABLE noo_backend_placements ADD COLUMN IF NOT EXISTS keep_warm boolean NOT NULL DEFAULT false;
+    END IF;
+END $$
+"#,
+}, Migration {
+    revision: NODE_WORKLOAD_HOLDER_REVISION,
+    down_revision: Some(PLACEMENT_KEEP_WARM_REVISION),
+    // A node workload declared accel.gpu 0 is reserved WITHOUT a GPU lease
+    // (0.6.25-rc.3 rehearsal: its drain hold stopped every lane of a CPU
+    // node), so its placement row carries who holds the reservation and
+    // since when; the GPU path keeps the lease as before. Both nullable and
+    // additive (no default, no rewrite): a 0.6.24 row reads back NULL, which
+    // is "no one holds it". Guarded by to_regclass like 087/088.
+    sql: r#"
+DO $$
+BEGIN
+    IF to_regclass('noo_node_workload_placements') IS NOT NULL THEN
+        ALTER TABLE noo_node_workload_placements ADD COLUMN IF NOT EXISTS holder text;
+        ALTER TABLE noo_node_workload_placements ADD COLUMN IF NOT EXISTS reserved_at timestamptz;
+    END IF;
+END $$
+"#,
 }];
 
 /// Add-on feature settings and the super-admin flag (f99). A constant so a
@@ -2532,6 +2568,16 @@ pub const CONVERSATION_SOURCES_REVISION: &str = "121_conversation_sources";
 /// conversation source ledger (121): numbered at rebase against dev's real
 /// head. A constant so a renumber is one line.
 pub const REQUEST_TRACE_TTFT_REVISION: &str = "122_request_trace_ttft";
+
+/// `keep_warm` on a placement (`noo cluster place --keep-warm`), on the TTFT
+/// columns (122): numbered at rebase against dev's real head. A constant so a
+/// renumber is one line.
+pub const PLACEMENT_KEEP_WARM_REVISION: &str = "123_placement_keep_warm";
+
+/// `holder` and `reserved_at` on a node-workload placement (a CPU workload's
+/// reservation lives on its row, not a GPU lease), on 123: numbered at rebase
+/// against dev's real head. A constant so a renumber is one line.
+pub const NODE_WORKLOAD_HOLDER_REVISION: &str = "124_node_workload_holder";
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
 /// constant so a renumber at rebase is one line.
@@ -4251,20 +4297,56 @@ mod conversation_sources_migration_tests {
 mod request_trace_ttft_migration_tests {
     use super::*;
 
-    /// The TTFT columns: the chain head, on the conversation source ledger
-    /// (121), additive, nullable, no default.
+    /// The TTFT columns: on the conversation source ledger (121), additive,
+    /// nullable, no default.
     #[test]
-    fn request_trace_ttft_is_the_head_and_additive() {
+    fn request_trace_ttft_is_additive() {
         let m = MIGRATIONS.iter().find(|m| m.revision == REQUEST_TRACE_TTFT_REVISION).expect("in the chain");
         assert_eq!(m.revision, "122_request_trace_ttft");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(CONVERSATION_SOURCES_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(REQUEST_TRACE_TTFT_REVISION), "the chain head");
         for col in ["ttft_ms", "queue_wait_ms"] {
             assert!(m.sql.contains(&format!("ALTER TABLE noo_request_trace ADD COLUMN IF NOT EXISTS {col} bigint;")), "{col}");
         }
         for banned in ["DEFAULT", "NOT NULL", "DROP", "DELETE", "UPDATE"] {
             assert!(!m.sql.contains(banned), "{banned}: the TTFT columns only add nullable columns");
+        }
+    }
+
+    /// The keep-warm column: on the TTFT columns (122), one additive column
+    /// whose constant default leaves every existing placement not warm.
+    #[test]
+    fn placement_keep_warm_is_additive_and_default_off() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == PLACEMENT_KEEP_WARM_REVISION).expect("in the chain");
+        assert_eq!(m.revision, "123_placement_keep_warm");
+        assert!(m.revision.len() <= 32);
+        assert_eq!(m.down_revision, Some(REQUEST_TRACE_TTFT_REVISION));
+        assert!(m.sql.contains("ALTER TABLE noo_backend_placements ADD COLUMN IF NOT EXISTS keep_warm boolean NOT NULL DEFAULT false;"));
+        assert!(m.sql.contains("to_regclass('noo_backend_placements')"));
+        for banned in ["DROP", "DELETE", "UPDATE"] {
+            assert!(!m.sql.contains(banned), "{banned}: the keep-warm column only adds");
+        }
+    }
+
+    /// The node-workload holder: the chain head, on keep-warm (123), two
+    /// nullable columns and nothing else, so a 0.6.24 row reads back NULL
+    /// ("no one holds it") and rolling back to 0.6.24 leaves them unread.
+    #[test]
+    fn node_workload_holder_is_the_head_and_only_adds_nullable_columns() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == NODE_WORKLOAD_HOLDER_REVISION).expect("in the chain");
+        assert_eq!(m.revision, "124_node_workload_holder");
+        assert!(m.revision.len() <= 32);
+        assert_eq!(m.down_revision, Some(PLACEMENT_KEEP_WARM_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(NODE_WORKLOAD_HOLDER_REVISION), "the chain head");
+        for col in ["holder text", "reserved_at timestamptz"] {
+            assert!(m.sql.contains(&format!("ALTER TABLE noo_node_workload_placements ADD COLUMN IF NOT EXISTS {col};")), "{col}");
+        }
+        assert!(m.sql.contains("to_regclass('noo_node_workload_placements') IS NOT NULL"));
+        // Exactly the two column adds above, each ending at its type: no
+        // NOT NULL or DEFAULT on them (the guard's IS NOT NULL is the table's).
+        assert_eq!(m.sql.matches("ADD COLUMN").count(), 2, "only the two nullable columns");
+        for banned in ["DEFAULT", "DROP", "DELETE", "UPDATE"] {
+            assert!(!m.sql.contains(banned), "{banned}: the holder columns only add nullable columns");
         }
     }
 

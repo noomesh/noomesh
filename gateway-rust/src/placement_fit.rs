@@ -100,11 +100,74 @@ pub const DEFAULT_CHAT_CTX: u64 = 4096;
 /// lazily mapped tail can leave a real figure a little under the file size.
 pub const MEASURED_FLOOR_OF_WEIGHTS: f64 = 0.5;
 
-/// Conservative f16 KV bytes per token per slot for a model whose
-/// architecture is not reported: 16 KiB per GB of weights, at least 144 KiB.
-/// noo-cli's `cluster_tune::kv_bytes_per_token` is the same function.
+/// RAM a controller's own stack holds beside the models it declares
+/// (Postgres, NATS, the gateway, the worker, trellion, the embedder's daemon
+/// when no placement declares it). Measured on the 0.6.25-rc.2 matrix (run
+/// 43673987828): 1.8-2.3 GB used on four one-box cells with the stack up and
+/// no chat model loaded. The declared basis charges it to a controller's
+/// CPU pool so a tune or a decision never spends it on cache.
+pub const CONTROLLER_STACK_RESERVE_GB: f64 = 2.5;
+
+/// The conservative fallback: f16 KV bytes per token per slot for a model
+/// with no measured figure and no reported architecture, 16 KiB per GB of
+/// weights, at least 144 KiB. Only [`kv_per_token`] calls it; a reason line
+/// names it "an estimate".
 pub fn kv_bytes_per_token(weights_gb: f64) -> f64 {
     (weights_gb * KV_BYTES_PER_TOKEN_PER_GB_WEIGHTS).max(KV_BYTES_PER_TOKEN_FLOOR)
+}
+
+/// The KV cache per token per slot for `model` in `role`, f16, and what it
+/// rests on: `measured` (config/model-capabilities.json `kv_bytes_per_token`,
+/// a chat model's own measured figure), `architecture` (the node reported
+/// layers x kv_heads x head_dim), or `estimate` ([`kv_bytes_per_token`] from
+/// the weights; an embedder or reranker takes the per-GB figure without the
+/// chat floor). `None` when nothing is known. THE one KV figure: the fit
+/// rows, the gateway's decided context (`chat_context`) and `noo cluster
+/// place`'s tuner (through the fit report's `kv_per_token_bytes`) all read
+/// it, so they cannot disagree.
+pub fn kv_per_token(model: &str, role: &str, weights_gb: Option<f64>, arch: Option<&Value>) -> Option<(f64, &'static str)> {
+    let encoder = matches!(role, "embed" | "rerank");
+    if !encoder {
+        if let Some(b) = crate::model_capabilities::lookup(model).and_then(|r| r.kv_bytes_per_token).filter(|b| *b > 0) {
+            return Some((b as f64, "measured"));
+        }
+    }
+    if let Some(a) = arch.filter(|a| a.is_object()) {
+        if let (Some(l), Some(h), Some(d)) = (a["layers"].as_f64(), a["kv_heads"].as_f64(), a["head_dim"].as_f64()) {
+            // K and V, f16 (2 bytes each element).
+            return Some((l * h * d * 2.0 * 2.0, "architecture"));
+        }
+    }
+    weights_gb.filter(|w| *w > 0.0).map(|w| (if encoder { w * KV_BYTES_PER_TOKEN_PER_GB_WEIGHTS } else { kv_bytes_per_token(w) }, "estimate"))
+}
+
+/// A running, non-harness placement as `noo cluster show` serves it
+/// (`{backend, role, model, env, desired_state, target, keep_warm}`), as a
+/// [`Spec`]. `None` for a stopped one, the harness, or one with no model.
+pub fn spec_from_json(p: &Value) -> Option<Spec> {
+    if p["desired_state"].as_str() != Some("running") || p["backend"].as_str() == Some("harness") {
+        return None;
+    }
+    let model = p["model"].as_str().map(str::trim).filter(|m| !m.is_empty())?;
+    Some(Spec {
+        backend: p["backend"].as_str()?.to_string(),
+        role: p["role"].as_str().unwrap_or("chat").to_string(),
+        model: model.to_string(),
+        env: p["env"].as_object().cloned().unwrap_or_default(),
+        target: p["target"].as_str().map(str::to_string),
+        keep_warm: p["keep_warm"].as_bool().unwrap_or(false),
+    })
+}
+
+/// The stack reserve charged to `target`'s pool on `node`: a controller's
+/// own node (`controller_stack: true`, set by the fit route and by
+/// `chat_context`), CPU pool only. 0 elsewhere.
+pub fn stack_reserve_gb(node: &Value, target: &str) -> f64 {
+    if target == "cpu" && node["controller_stack"].as_bool() == Some(true) {
+        CONTROLLER_STACK_RESERVE_GB
+    } else {
+        0.0
+    }
 }
 
 /// Ollama's context when nothing sets one (`OLLAMA_CONTEXT_LENGTH` unset, no
@@ -215,6 +278,9 @@ pub struct Spec {
     pub env: Map<String, Value>,
     /// The declared hardware target (`cpu` | `gpu`), if any.
     pub target: Option<String>,
+    /// `--keep-warm`: the node agent keeps it loaded, so it is resident ALL
+    /// the time, never "loaded when asked" - always charged to its pool.
+    pub keep_warm: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -233,7 +299,20 @@ pub struct Row {
     pub total_gb: f64,
     /// `measured` | `estimated`
     pub source: &'static str,
+    /// Declared warm (`--keep-warm`): resident whether or not it is in use.
+    pub keep_warm: bool,
     pub notes: Vec<String>,
+    /// The row's size on the DECLARED basis: weights at their file size +
+    /// KV at the declared context and slots + overhead, never a live
+    /// reading. Ollama's resident figure leaves the memory-mapped weights
+    /// out (gemma4:e2b: 1.16-1.19 GB resident against 4.59 GB of weights on
+    /// the rc.2 matrix; i802 follow-up D), so a live row would read the box
+    /// emptier the moment a model loads. Tuning and the decided context use
+    /// this, so a loaded model changes neither.
+    pub declared_gb: f64,
+    /// [`kv_per_token`] at the row's cache type, and its basis.
+    pub kv_per_token_bytes: Option<f64>,
+    pub kv_basis: &'static str,
 }
 
 /// One pool's judgement.
@@ -242,6 +321,10 @@ pub struct PoolReport {
     pub budget: Option<Budget>,
     pub target: &'static str,
     pub used_gb: f64,
+    /// Σ rows' [`Row::declared_gb`]: the stable basis.
+    pub declared_used_gb: f64,
+    /// [`stack_reserve_gb`] for this pool.
+    pub stack_reserve_gb: f64,
     pub verdict: Verdict,
     pub shortfall_gb: f64,
 }
@@ -484,8 +567,9 @@ pub fn evaluate(node: &Value, specs: &[Spec], embed_ctx: u64) -> Report {
             rows.push(Row {
                 backend: s.backend.clone(), role: s.role.clone(), model: s.model.clone(), target: "gpu",
                 weights_gb: None, weights_source: "vllm", kv_gb: 0.0, overhead_gb: 0.0,
-                total_gb: util * total_budget, source: "estimated",
+                total_gb: util * total_budget, source: "estimated", keep_warm: s.keep_warm,
                 notes: vec![format!("vLLM reserves GPU_MEMORY_UTILIZATION {util} of the GPU")],
+                declared_gb: util * total_budget, kv_per_token_bytes: None, kv_basis: "vllm",
             });
             continue;
         }
@@ -526,26 +610,17 @@ pub fn evaluate(node: &Value, specs: &[Spec], embed_ctx: u64) -> Report {
             Some("q4_0") => 0.5,
             _ => 2.0,
         };
-        let per_token = match st.and_then(|x| x.get("arch")).filter(|a| a.is_object()) {
-            Some(a) => match (a["layers"].as_f64(), a["kv_heads"].as_f64(), a["head_dim"].as_f64()) {
-                (Some(l), Some(h), Some(d)) => {
-                    notes.push("KV from model architecture".into());
-                    Some(l * h * d * 2.0 * elem_bytes)
-                }
-                _ => None,
-            },
-            None => None,
-        };
-        let per_token = per_token.or_else(|| {
-            w.map(|w| {
-                notes.push("KV from the conservative per-token figure (architecture not reported)".into());
-                // The floor is for chat models; an embedder or reranker is a
-                // small encoder whose KV the per-GB figure already matches
-                // (harrier: 1.1 GB measured on host8).
-                let f16 = if matches!(s.role.as_str(), "embed" | "rerank") { w * KV_BYTES_PER_TOKEN_PER_GB_WEIGHTS } else { kv_bytes_per_token(w) };
-                f16 * (elem_bytes / 2.0)
-            })
+        // The one KV figure (measured, else the reported architecture, else
+        // the estimate), at this row's cache type.
+        let kv = kv_per_token(&s.model, &s.role, w, st.and_then(|x| x.get("arch")));
+        let kv_basis = kv.map(|(_, b)| b).unwrap_or("unknown");
+        notes.push(match kv_basis {
+            "measured" => "KV per token measured for this model (config/model-capabilities.json)".into(),
+            "architecture" => "KV from model architecture".into(),
+            "estimate" => "KV from the conservative per-token estimate (no measured figure, architecture not reported)".into(),
+            _ => "KV unknown (no size known)".into(),
         });
+        let per_token = kv.map(|(f16, _)| f16 * (elem_bytes / 2.0));
         let kv_gb = per_token.map(|p| p * ctx as f64 * slots as f64 / GB).unwrap_or(0.0);
         let est_total = w.unwrap_or(0.0) + kv_gb + RUNTIME_OVERHEAD_GB;
         if w.is_none() && measured.is_none() {
@@ -583,9 +658,17 @@ pub fn evaluate(node: &Value, specs: &[Spec], embed_ctx: u64) -> Report {
             None => (est_total, "estimated"),
         };
         notes.push(format!("weights {wsrc}; num_ctx {ctx} x {slots} slot(s); on {target}"));
+        if s.keep_warm {
+            // Every running placement is charged in full already (the check
+            // never assumes ollama will swap one out); a warm one is the
+            // placement for which that is literally true, so say it.
+            notes.push("declared warm (--keep-warm): held resident, never unloaded when idle".into());
+        }
         rows.push(Row {
             backend: s.backend.clone(), role: s.role.clone(), model: s.model.clone(), target,
-            weights_gb: w, weights_source: wsrc, kv_gb, overhead_gb: RUNTIME_OVERHEAD_GB, total_gb: total, source, notes,
+            weights_gb: w, weights_source: wsrc, kv_gb, overhead_gb: RUNTIME_OVERHEAD_GB, total_gb: total, source,
+            keep_warm: s.keep_warm, notes,
+            declared_gb: est_total, kv_per_token_bytes: per_token, kv_basis,
         });
     }
 
@@ -597,6 +680,7 @@ pub fn evaluate(node: &Value, specs: &[Spec], embed_ctx: u64) -> Report {
             continue;
         }
         let used: f64 = mine.iter().map(|r| r.total_gb).sum();
+        let declared_used: f64 = mine.iter().map(|r| r.declared_gb).sum();
         let unknown_size = mine.iter().any(|r| r.weights_gb.is_none() && r.source == "estimated" && r.weights_source != "vllm");
         let budget = pool_for(node, target);
         let (verdict, shortfall) = match &budget {
@@ -619,7 +703,7 @@ pub fn evaluate(node: &Value, specs: &[Spec], embed_ctx: u64) -> Report {
                 (Verdict::Tight, 0.0)
             }
         };
-        pools.push(PoolReport { budget, target, used_gb: used, verdict, shortfall_gb: shortfall });
+        pools.push(PoolReport { budget, target, used_gb: used, declared_used_gb: declared_used, stack_reserve_gb: stack_reserve_gb(node, target), verdict, shortfall_gb: shortfall });
     }
     let verdict = if pools.is_empty() {
         // Nothing holds memory: judged against nothing, it fits - unless the
@@ -637,6 +721,20 @@ pub fn evaluate(node: &Value, specs: &[Spec], embed_ctx: u64) -> Report {
     let total: f64 = rows.iter().map(|r| r.total_gb).sum();
     let shortfall: f64 = pools.iter().map(|p| p.shortfall_gb).sum();
     Report { verdict, budget, pools, usage, rows, total_gb: total, shortfall_gb: shortfall, warnings }
+}
+
+/// Memory, GB, the DECLARED basis leaves for one row's KV cache: its pool's
+/// usable memory, less the stack reserve, less every declared row, plus
+/// this row's own KV (the thing being sized). Never a live reading, so the
+/// same box with the same placements always gives the same figure, loaded
+/// or not. `noo cluster place`'s tuner reads the same three numbers from the
+/// fit report (`budgets[].declared_used_gb`, `stack_reserve_gb`,
+/// `models[].kv_gb`).
+pub fn declared_kv_room_gb<'a>(report: &'a Report, backend: &str, role: &str, model: &str) -> Option<(f64, &'a Row)> {
+    let row = report.rows.iter().find(|r| r.backend == backend && r.role == role && r.model == model)?;
+    let pool = report.pools.iter().find(|p| p.target == row.target)?;
+    let usable = pool.budget.as_ref()?.usable_gb();
+    Some(((usable - pool.stack_reserve_gb - pool.declared_used_gb + row.kv_gb).max(0.0), row))
 }
 
 impl Report {
@@ -684,6 +782,8 @@ impl Report {
             "budgets": self.pools.iter().map(|p| {
                 let mut v = p.budget.as_ref().map(budget_json).unwrap_or_else(|| json!({"target": p.target}));
                 v["used_gb"] = json!(p.used_gb);
+                v["declared_used_gb"] = json!(p.declared_used_gb);
+                v["stack_reserve_gb"] = json!(p.stack_reserve_gb);
                 v["verdict"] = json!(p.verdict.as_str());
                 v["shortfall_gb"] = json!(p.shortfall_gb);
                 v
@@ -696,7 +796,8 @@ impl Report {
                 "backend": r.backend, "role": r.role, "model": r.model, "target": r.target,
                 "weights_gb": r.weights_gb, "weights_source": r.weights_source,
                 "kv_gb": r.kv_gb, "overhead_gb": r.overhead_gb,
-                "total_gb": r.total_gb, "source": r.source, "notes": r.notes,
+                "total_gb": r.total_gb, "source": r.source, "keep_warm": r.keep_warm, "notes": r.notes,
+                "declared_gb": r.declared_gb, "kv_per_token_bytes": r.kv_per_token_bytes, "kv_basis": r.kv_basis,
             })).collect::<Vec<_>>(),
         })
     }
@@ -731,17 +832,17 @@ mod tests {
         if let Some(p) = parallel {
             env.insert("OLLAMA_NUM_PARALLEL".into(), json!(p));
         }
-        Spec { backend: "ollama".into(), role: role.into(), model: model.into(), env, target: None }
+        Spec { backend: "ollama".into(), role: role.into(), model: model.into(), env, target: None, keep_warm: false }
     }
 
     fn spec_env(role: &str, model: &str, env: &[(&str, &str)]) -> Spec {
         let env = env.iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
-        Spec { backend: "ollama".into(), role: role.into(), model: model.into(), env, target: None }
+        Spec { backend: "ollama".into(), role: role.into(), model: model.into(), env, target: None, keep_warm: false }
     }
 
     fn llama(model: &str, target: Option<&str>, env: &[(&str, &str)]) -> Spec {
         let env = env.iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
-        Spec { backend: "llamacpp".into(), role: "chat".into(), model: model.into(), env, target: target.map(str::to_string) }
+        Spec { backend: "llamacpp".into(), role: "chat".into(), model: model.into(), env, target: target.map(str::to_string), keep_warm: false }
     }
 
     /// host8-shaped: a 6 GB discrete GPU and 32 GB of RAM.

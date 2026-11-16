@@ -83,7 +83,9 @@ type Server struct {
 	gpuHold    func(ctx context.Context, req gpuyield.HoldRequest) (gpuyield.Contention, error)
 	gpuRelease func(ctx context.Context, req gpuyield.ReleaseRequest) (gpuyield.Contention, error)
 	// diskReclaim reports the node's own disk-reclaim state for /health.
-	diskReclaim    func() any
+	diskReclaim func() any
+	// chatContext is the decided chat context per model (i802); nil = none.
+	chatContext    func(model string) int
 	reconcileNudge func()
 
 	// harnessPlacement reports the desired harness placement for
@@ -118,6 +120,11 @@ type Server struct {
 	// use.
 	serving     *backendServing
 	servingOnce sync.Once
+
+	// keeper keeps the declared-warm ollama models loaded (keep_warm.go).
+	// Built on first use.
+	keeper     *warmKeeper
+	keeperOnce sync.Once
 }
 
 // nativeBackends is the set served natively on this host, backend -> model.
@@ -197,6 +204,10 @@ func (s *Server) SetManagedWorkloads(m dockerpkg.ManagedControl) { s.managed = m
 
 // SetDiskReclaim installs the node disk-reclaim state provider.
 func (s *Server) SetDiskReclaim(f func() any) { s.diskReclaim = f }
+
+// SetChatContext installs the controller's decided chat context per model
+// (reconcile.ChatContext, i802) for the Ollama chat translator.
+func (s *Server) SetChatContext(f func(model string) int) { s.chatContext = f }
 
 // SetReconcileNudge installs the reconciler's Nudge: `POST /reconcile` (the
 // `reconcile` control op) asks for a desired-state pass now instead of at
@@ -368,6 +379,9 @@ func (s *Server) registerRoutes() {
 	s.mux.Handle("POST /v1/embeddings", ctrlMW(http.HandlerFunc(s.handleInferenceProxy)))
 	// A placed vLLM's /metrics for the gateway's collector (backend_metrics.go).
 	s.mux.Handle("GET /backend-metrics/{backend}", ctrlMW(http.HandlerFunc(s.handleBackendMetrics)))
+	// Whether a running ollama is reachable, by a read that loads nothing
+	// (backend_alive.go): the gateway's dispatch-health probe for ollama.
+	s.mux.Handle("GET /backend-alive/{backend}", ctrlMW(http.HandlerFunc(s.handleBackendAlive)))
 	s.mux.Handle("GET /v1/models", modelMW(http.HandlerFunc(s.handleListModels)))
 
 	// Rerank proxy — forwards to this node's local reranker (TEI cross-encoder

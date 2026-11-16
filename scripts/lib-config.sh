@@ -477,6 +477,8 @@ operator_profile_args() {
 # appended once. Call after load_config, before compose runs.
 EMBED_CPU_DOOR_URL="https://noo-stunnel-ollama-embed-cpu:11434"
 derive_profile_env() {
+    monitoring_derive_env
+    postgres_memory_derive_env
     case " $(operator_profile_args) " in
         *" --profile embed-cpu "*) ;;
         *) return 0 ;;
@@ -487,4 +489,293 @@ derive_profile_env() {
         ",,") export PAGEINDEX_EMBEDDING_EXTRA_URLS="$EMBED_CPU_DOOR_URL" ;;
         *) export PAGEINDEX_EMBEDDING_EXTRA_URLS="$cur,$EMBED_CPU_DOOR_URL" ;;
     esac
+}
+
+# ── The monitoring set: full or lean (`cluster.monitoring`) ───────────────
+#
+# Grafana, Loki and Tempo (about 250 MiB idle) are the optional part of the
+# monitoring set; Prometheus, Alertmanager and node-exporter always run. The
+# ONE declaration is `cluster.monitoring: full | lean` in this install's
+# noomesh.yaml (the file the gateway mounts), next to cluster.image_retention
+# and, like it, never an environment variable.
+#
+# A MISSING decision means FULL. The fleet controller is itself a
+# standalone-profile install, so the profile cannot tell a one-machine
+# install from the fleet; only the literal `lean` leaves the three out. An
+# unset key, an unreadable file, an older `noo` that cannot render the key
+# (with no python3 to fall back on) and a typo all start the full set (a
+# typo says so on stderr). `noo onboard` writes `lean` on a new install
+# unless the person asks for the set; `noo stack monitoring on|off|status`
+# changes and shows it. The gateway and `noo cluster verify` read the same
+# key with the same unset = full rule.
+#
+# One thing outranks it: COMPOSE_PROFILES listing `monitoring`
+# (operator_profile_args passes it on), and so does the `controller` profile,
+# whose services include the set. Then the set runs and the launcher says
+# why; `noo stack monitoring off` refuses while either is so.
+MONITORING_OPTIONAL_SERVICES="loki tempo grafana"
+
+# monitoring_setting [FILE] - the raw `cluster.monitoring` of FILE (default
+# ./noomesh.yaml), trimmed; empty when unset or unreadable.
+monitoring_setting() {
+    local file="${1:-noomesh.yaml}" nb out
+    [ -f "$file" ] || return 0
+    if nb="$(noo_bin 2>/dev/null)" && out="$("$nb" config launch-render monitoring "$file" 2>/dev/null)"; then
+        printf '%s\n' "$out" | head -1 | tr -d ' \t\r'
+        return 0
+    fi
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 - "$file" <<'PYEOF' 2>/dev/null || true
+import sys, yaml
+doc = yaml.safe_load(open(sys.argv[1])) or {}
+c = doc.get("cluster") if isinstance(doc, dict) else None
+v = c.get("monitoring") if isinstance(c, dict) else None
+if isinstance(v, str):
+    print(v.strip())
+PYEOF
+}
+
+# monitoring_level - `lean` only when noomesh.yaml says exactly that, else `full`.
+monitoring_level() {
+    local raw
+    raw="$(monitoring_setting noomesh.yaml)"
+    case "$raw" in
+        lean) printf 'lean' ;;
+        ""|full) printf 'full' ;;
+        *)
+            echo "WARN: cluster.monitoring: '$raw' in noomesh.yaml is neither full nor lean; running the full set (noo stack monitoring status)" >&2
+            printf 'full'
+            ;;
+    esac
+}
+
+# monitoring_profile_args - `--profile monitoring` unless this install
+# declared lean. Used unquoted beside operator_profile_args.
+monitoring_profile_args() {
+    if [ "$(monitoring_level)" = "lean" ]; then
+        case " $(operator_profile_args 2>/dev/null) " in
+            *" --profile monitoring "*)
+                echo "WARN: COMPOSE_PROFILES lists monitoring, which wins over cluster.monitoring: lean in noomesh.yaml: Grafana, Loki and Tempo run (noo stack monitoring status)" >&2
+                ;;
+        esac
+        return 0
+    fi
+    printf '%s' "--profile monitoring"
+}
+
+# monitoring_refuse_named PROFILE_ARGS SERVICE... - exit 1, with the reason,
+# when a lean install is asked to start Grafana, Loki or Tempo by name. Compose
+# starts a service named on its command line whatever its profiles say, so
+# without this `noo stack restart grafana` would bring back what the
+# declaration turned off. PROFILE_ARGS carrying `monitoring` or `controller`
+# (the set is on after all) never refuses.
+monitoring_refuse_named() {
+    local _pa="$1" _s _p="${NOO_CONTAINER_PREFIX:-noo}"
+    shift
+    case " $_pa " in *" --profile monitoring "*|*" --profile controller "*) return 0 ;; esac
+    [ "$(monitoring_level)" = "lean" ] || return 0
+    for _s in "$@"; do
+        case " $MONITORING_OPTIONAL_SERVICES " in
+            *" ${_s#"$_p"-} "*)
+                echo "refused: ${_s} is off on this install (cluster.monitoring: lean in noomesh.yaml); nothing was started. Turn the set on: noo stack monitoring on" >&2
+                return 1
+                ;;
+        esac
+    done
+    return 0
+}
+
+# monitoring_remove_when_lean ACTIVE_SERVICES - on a lean install, stop and
+# remove a Grafana, Loki or Tempo container this `up` does not manage (left
+# by an earlier full start, or by an older noo's roll, whose compose file
+# still put the three on the standalone profile). Containers only: their data
+# directories stay where they are. Launchers never pass --remove-orphans, so
+# without this a container of a switched-off service would run on.
+monitoring_remove_when_lean() {
+    local _active="$1" _s _ids _gone=""
+    [ "$(monitoring_level)" = "lean" ] || return 0
+    for _s in $MONITORING_OPTIONAL_SERVICES; do
+        printf '%s\n' "$_active" | grep -qx "$_s" && continue
+        _ids="$(docker ps -aq --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME:-noomesh}" \
+            --filter "label=com.docker.compose.service=$_s" 2>/dev/null)"
+        [ -n "$_ids" ] || continue
+        if declare -F addons_note_intended_stop >/dev/null; then
+            # shellcheck disable=SC2086
+            addons_note_intended_stop "monitoring is lean" $_ids
+        fi
+        # shellcheck disable=SC2086
+        docker stop $_ids >/dev/null 2>&1
+        # shellcheck disable=SC2086
+        if docker rm $_ids >/dev/null 2>&1; then
+            _gone="$_gone $_s"
+        else
+            echo "WARN: could not remove the $_s container (cluster.monitoring: lean); remove it: docker rm -f $_ids" >&2
+        fi
+    done
+    [ -n "$_gone" ] && echo "  monitoring is lean (cluster.monitoring in noomesh.yaml): removed${_gone} (data kept; noo stack monitoring status)"
+    return 0
+}
+
+# monitoring_effective_level - `lean` when this install declared lean AND
+# nothing outranks it (COMPOSE_PROFILES listing `monitoring`, or the
+# `controller` profile in PROFILE_ARGS, both of which run the set); else
+# `full`. The same rule `noo stack monitoring status` prints.
+monitoring_effective_level() {
+    [ "$(monitoring_level)" = "lean" ] || { printf 'full'; return 0; }
+    case " ${PROFILE_ARGS:-} $(operator_profile_args 2>/dev/null) " in
+        *" --profile monitoring "*|*" --profile controller "*) printf 'full'; return 0 ;;
+    esac
+    printf 'lean'
+}
+
+# The addresses of the three, as compose sets them on the gateway and the
+# worker (`${VAR-default}`: unset takes the in-stack default, EMPTY stays
+# empty). On lean they are exported EMPTY, so the gateway says "summary rows
+# only, no spans exported" and log search is "off by choice" without dialing
+# a name that does not resolve, and the worker skips tracing and the Loki
+# security audit. A value pointing anywhere else (an operator's own Loki or
+# Tempo) is kept and said.
+MONITORING_URL_DEFAULTS="NOO_LOKI_URL=https://loki:3100 NOO_TEMPO_OTLP_URL=https://tempo:4318 NOO_TEMPO_URL=https://tempo:3200"
+
+# monitoring_derive_env - on an effective lean install export NOO_LOKI_URL,
+# NOO_TEMPO_OTLP_URL and NOO_TEMPO_URL empty (see above). On full nothing is
+# exported: compose's defaults apply exactly as before.
+monitoring_derive_env() {
+    [ "$(monitoring_effective_level)" = "lean" ] || return 0
+    local _pair _var _def _cur
+    for _pair in $MONITORING_URL_DEFAULTS; do
+        _var="${_pair%%=*}"
+        _def="${_pair#*=}"
+        _cur="$(printenv "$_var" 2>/dev/null || true)"
+        case "$_cur" in
+            ""|"$_def"|"$_def/") export "$_var="
+                ;;
+            *) echo "  monitoring is lean, but $_var=$_cur points elsewhere; kept" >&2
+                ;;
+        esac
+    done
+    return 0
+}
+
+# ── Postgres memory: standard or auto (`cluster.postgres_memory`) ─────────
+#
+# The ONE declaration is `cluster.postgres_memory: standard | auto` in this
+# install's noomesh.yaml, beside cluster.monitoring and, like it, never an
+# environment variable. UNSET MEANS STANDARD: nothing is exported and the
+# compose defaults of the postgres service apply exactly as before. `auto`
+# sizes Postgres to the memory Docker gives containers on this machine:
+#
+#   below 6 GiB       128MB  512MB  8MB   64MB   256m
+#   6 to below 12 GiB 256MB  1GB    16MB  128MB  512m
+#   12 GiB and more   512MB  2GB    32MB  256MB  1g    (the compose defaults)
+#
+# (shared_buffers, effective_cache_size, work_mem, maintenance_work_mem,
+# /dev/shm). A 16 GB machine reports about 15.5 GiB, hence 12, not 16.
+# An explicit NOO_PG_* (the environment, compose_env, .env) always wins:
+# `auto` fills only the keys nobody set. The same table and rule are
+# noo-cli/src/commands/postgres_memory.rs (onboard, `noo cluster verify`);
+# tests/test_postgres_memory_launcher.py pins the two together. A changed
+# value takes effect when noo-postgres is recreated (compose does that on
+# the next start, because its command changed).
+PG_MEMORY_KEYS="NOO_PG_SHARED_BUFFERS NOO_PG_EFFECTIVE_CACHE_SIZE NOO_PG_WORK_MEM NOO_PG_MAINTENANCE_WORK_MEM NOO_PG_SHM_SIZE"
+
+# postgres_memory_setting [FILE] - the raw `cluster.postgres_memory` of FILE
+# (default ./noomesh.yaml), trimmed; empty when unset or unreadable.
+postgres_memory_setting() {
+    local file="${1:-noomesh.yaml}" nb out
+    [ -f "$file" ] || return 0
+    if nb="$(noo_bin 2>/dev/null)" && out="$("$nb" config launch-render postgres-memory "$file" 2>/dev/null)"; then
+        printf '%s\n' "$out" | head -1 | tr -d ' \t\r'
+        return 0
+    fi
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 - "$file" <<'PYEOF' 2>/dev/null || true
+import sys, yaml
+doc = yaml.safe_load(open(sys.argv[1])) or {}
+c = doc.get("cluster") if isinstance(doc, dict) else None
+v = c.get("postgres_memory") if isinstance(c, dict) else None
+if isinstance(v, str):
+    print(v.strip())
+PYEOF
+}
+
+# postgres_memory_mode - `auto` only when noomesh.yaml says exactly that, else `standard`.
+postgres_memory_mode() {
+    local raw
+    raw="$(postgres_memory_setting noomesh.yaml)"
+    case "$raw" in
+        auto) printf 'auto' ;;
+        ""|standard) printf 'standard' ;;
+        *)
+            echo "WARN: cluster.postgres_memory: '$raw' in noomesh.yaml is neither standard nor auto; Postgres keeps the standard sizes" >&2
+            printf 'standard'
+            ;;
+    esac
+}
+
+# postgres_memory_ram_kb - memory containers can use here, in KiB: Docker's
+# MemTotal (the WSL2 or Docker Desktop VM where there is one), else
+# /proc/meminfo, else macOS hw.memsize. Empty when none answers.
+postgres_memory_ram_kb() {
+    local b
+    b="$(docker info --format '{{.MemTotal}}' 2>/dev/null | tr -d ' \r')"
+    case "$b" in ''|*[!0-9]*|0) b="" ;; esac
+    if [ -n "$b" ]; then printf '%s' "$((b / 1024))"; return 0; fi
+    if [ -r /proc/meminfo ]; then
+        b="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo)"
+        case "$b" in ''|*[!0-9]*) ;; *) printf '%s' "$b"; return 0 ;; esac
+    fi
+    b="$(sysctl -n hw.memsize 2>/dev/null | tr -d ' \r')"
+    case "$b" in ''|*[!0-9]*|0) ;; *) printf '%s' "$((b / 1024))" ;; esac
+    return 0
+}
+
+# postgres_memory_tier KB - the five `auto` values (PG_MEMORY_KEYS order)
+# for a machine with KB KiB.
+postgres_memory_tier() {
+    local kb="$1"
+    if [ "$kb" -lt $((6 * 1024 * 1024)) ]; then
+        printf '128MB 512MB 8MB 64MB 256m'
+    elif [ "$kb" -lt $((12 * 1024 * 1024)) ]; then
+        printf '256MB 1GB 16MB 128MB 512m'
+    else
+        printf '512MB 2GB 32MB 256MB 1g'
+    fi
+}
+
+# postgres_memory_explicit KEY - true when the operator set KEY to a
+# non-empty value: the environment (load_config has exported compose_env by
+# now) or ./.env. An empty value is unset, as compose's ${VAR:-default}.
+postgres_memory_explicit() {
+    local _k="$1" _v
+    _v="$(printenv "$_k" 2>/dev/null || true)"
+    [ -n "${_v//[[:space:]]/}" ] && return 0
+    [ -f .env ] || return 1
+    _v="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${_k}=" .env | tail -1 | cut -d= -f2- | tr -d " \t\r\"'")"
+    [ -n "$_v" ]
+}
+
+# postgres_memory_derive_env - on `auto`, export the tier's value of every
+# NOO_PG_* sizing key the operator did not set. On standard nothing.
+postgres_memory_derive_env() {
+    [ "$(postgres_memory_mode)" = "auto" ] || return 0
+    local _kb _vals _k _v _kept="" _set=""
+    _kb="$(postgres_memory_ram_kb)"
+    if [ -z "$_kb" ]; then
+        echo "  postgres memory is auto, but this machine's memory could not be read; standard sizes kept" >&2
+        return 0
+    fi
+    _vals="$(postgres_memory_tier "$_kb")"
+    for _k in $PG_MEMORY_KEYS; do
+        _v="${_vals%% *}"
+        _vals="${_vals#* }"
+        if postgres_memory_explicit "$_k"; then
+            _kept="$_kept $_k"
+            continue
+        fi
+        export "$_k=$_v"
+        _set="$_set ${_k#NOO_PG_}=$_v"
+    done
+    echo "  postgres memory is auto for $((_kb / 1024)) MiB:${_set:- nothing to size}${_kept:+ (set by you, kept:$_kept)}" >&2
+    return 0
 }

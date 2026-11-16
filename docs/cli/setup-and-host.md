@@ -157,7 +157,9 @@ stack tag (`--tag vX.Y.Z` overrides the pairing). `--stack` manages
 standalone installs only; on a checkout use `noo stack start`/`rebuild`.
 `--nodes` ends `bundles staged for all N node(s) — each applies on its next
 fetch tick`. An enrolled node upgrades its own binary from the controller's
-mirror (`/bootstrap/cli`), so nodes need no GitHub access. Private release
+mirror (`/bootstrap/cli`), so nodes need no GitHub access. From the mirror it
+downloads only when the mirror's signed manifest names a different version or
+binary than the one running; an unverified manifest never counts as current. Private release
 assets are fetched via `NOO_CLI_BASE_URL` (a mirror), `gh` on `PATH`, or a
 `GH_TOKEN`/`GITHUB_TOKEN` token, in that order; if the install directory is
 root-owned, re-run with `sudo` or set `NOO_INSTALL_DIR`.
@@ -282,7 +284,7 @@ the other nodes first: [Start over](../getting-started/start-over.md).
 ### `noo onboard` — Setup wizard
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo onboard` | `[--tui\|--web [--port <n>]] [--non-interactive\|--ci] [--dry-run] [--reconfigure] [--standalone [--bundle <url\|path>]] [--from-archive <f> [--passphrase-file <f>]] [--only <sections>] [--min-free-gb <n>] [--skip-tailscale] [--skip-security] [--skip-storage] [--skip-services] [--skip-trellion] [--skip-model] [--skip-channels] [--mcp-door\|--no-mcp-door] [--skip-addons] [--secrets-backend sops]` | Run the setup wizard to bootstrap a controller (secrets, PKI, .env, compose, model) |
+| `noo onboard` | `[--tui\|--web [--port <n>]] [--non-interactive\|--ci] [--dry-run] [--reconfigure] [--standalone [--bundle <url\|path>]] [--from-archive <f> [--passphrase-file <f>]] [--only <sections>] [--min-free-gb <n>] [--skip-tailscale] [--skip-security] [--skip-storage] [--skip-services] [--skip-trellion] [--skip-model] [--skip-channels] [--mcp-door\|--no-mcp-door] [--monitoring-full\|--no-monitoring-full] [--skip-addons] [--secrets-backend sops]` | Run the setup wizard to bootstrap a controller (secrets, PKI, .env, compose, model) |
 
 ### `noo enroll` — Join this machine to a noomesh fleet as a worker
 | Command | Arguments | What it does |

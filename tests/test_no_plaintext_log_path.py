@@ -61,7 +61,9 @@ def test_the_gateway_forwards_to_loki_over_https_only() -> None:
     line takes. The test items of logs_ingest.rs dial a local listener over
     http and are removed before the scan."""
     compose = (ROOT / "docker-compose.cluster.yml").read_text()
-    defaults = re.findall(r"NOO_LOKI_URL=\$\{NOO_LOKI_URL:-([^}]+)\}", compose)
+    # `${NOO_LOKI_URL-…}` (unset → default, empty → empty; a lean install
+    # exports it empty) or the older `:-` form: either way the default is https.
+    defaults = re.findall(r"NOO_LOKI_URL=\$\{NOO_LOKI_URL:?-([^}]+)\}", compose)
     assert defaults, "compose no longer sets NOO_LOKI_URL with a default — the parse found nothing"
     for d in defaults:
         assert d.startswith("https://"), f"NOO_LOKI_URL defaults to a plaintext Loki: {d}"

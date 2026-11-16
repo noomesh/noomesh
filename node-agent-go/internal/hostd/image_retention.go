@@ -296,20 +296,22 @@ func (e *Engine) listImages(ctx context.Context) ([]imageFacts, error) {
 	if len(list) == 0 {
 		return nil, nil
 	}
-	args := append([]string{"image", "inspect", "--format",
-		`{{.Id}}|{{join .RepoTags ","}}|{{join .RepoDigests ","}}|{{.Size}}`}, list...)
+	args := append([]string{"image", "inspect", "--format", imageInspectFormat}, list...)
 	rc, out := e.Runner.Capture(ctx, reclaimDir, "docker", args...)
 	if rc != 0 {
-		return nil, fmt.Errorf("docker image inspect failed")
+		// Capture keeps stdout only; the same read-only inspect through Run
+		// gives Docker's own words, so the rung's SKIPPED line is diagnosable.
+		_, why := e.Runner.Run(ctx, reclaimDir, nil, "docker", args...)
+		return nil, fmt.Errorf("docker image inspect failed: %s", firstLine(why))
 	}
 	unique := e.uniqueSizes(ctx)
 	var imgs []imageFacts
 	for _, l := range strings.Split(out, "\n") {
-		p := strings.Split(strings.TrimSpace(l), "|")
-		if len(p) != 4 || !imageIDRe.MatchString(p[0]) {
+		im, ok := parseImageLine(l)
+		if !ok {
 			continue
 		}
-		im := imageFacts{ID: p[0], Tags: splitRefs(p[1]), Digests: splitRefs(p[2])}
+		p := strings.Split(strings.TrimSpace(l), "|")
 		if n, err := strconv.ParseInt(p[3], 10, 64); err == nil {
 			im.Bytes = n
 		}
@@ -321,9 +323,30 @@ func (e *Engine) listImages(ctx context.Context) ([]imageFacts, error) {
 	return imgs, nil
 }
 
-func splitRefs(s string) []string {
+// imageInspectFormat prints each image's lists as JSON. `{{join .RepoTags ","}}`
+// fails for EVERY image on the Docker 27 and 28 CLIs ("wrong type for value;
+// expected []string; got []interface {}"; captured on docker:27.5.1-dind and
+// docker:28.5.2-dind), which skipped this rung on those hosts with no word
+// of why. `{{json …}}` prints the same lists on 27, 28 and 29.
+const imageInspectFormat = `{{.Id}}|{{json .RepoTags}}|{{json .RepoDigests}}|{{.Size}}`
+
+// parseImageLine reads one imageInspectFormat line (size is read by the
+// caller). A line that does not parse is no image: never guessed at.
+func parseImageLine(l string) (imageFacts, bool) {
+	p := strings.Split(strings.TrimSpace(l), "|")
+	if len(p) != 4 || !imageIDRe.MatchString(p[0]) {
+		return imageFacts{}, false
+	}
+	var tags, digests []string
+	if json.Unmarshal([]byte(p[1]), &tags) != nil || json.Unmarshal([]byte(p[2]), &digests) != nil {
+		return imageFacts{}, false
+	}
+	return imageFacts{ID: p[0], Tags: cleanRefs(tags), Digests: cleanRefs(digests)}, true
+}
+
+func cleanRefs(in []string) []string {
 	var out []string
-	for _, r := range strings.Split(s, ",") {
+	for _, r := range in {
 		if r = strings.TrimSpace(r); r != "" && r != "<none>:<none>" && r != "<none>@<none>" {
 			out = append(out, r)
 		}

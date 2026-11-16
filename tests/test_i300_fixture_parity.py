@@ -306,6 +306,13 @@ def test_the_doc_lists_exactly_the_agents_reasons() -> None:
     section = doc_text().split("## Reasons", 1)[1].split("\n## ", 1)[0]
     doc_reasons = re.findall(r"^\| `([a-z_]+)` \|", section, re.M)
     assert doc_reasons == go_reasons, "docs/reference/node-workloads.md 'Reasons' and nodewl/reasons.go must list the same reasons in the same order"
+    # The gateway's mirror (node_workloads.rs code::REASONS), which the reserve
+    # refusal reads: a code the agent adds must reach it too.
+    rs = (REPO / "gateway-rust/src/node_workloads.rs").read_text()
+    consts = dict(re.findall(r'pub const ([A-Z_]+): &str = "([a-z_]+)";', rs))
+    listed = rs.split("pub const REASONS: &[&str] = &[", 1)[1].split("];", 1)[0]
+    gw_reasons = [consts[n] for n in re.findall(r"([A-Z_]+),", listed)]
+    assert gw_reasons == go_reasons, "gateway-rust node_workloads.rs code::REASONS and nodewl/reasons.go must list the same reasons in the same order"
     # the three the brief required to be there, whatever else is added
     for r in ("decl_invalid", "door_leaf_missing", "drain_timeout"):
         assert r in doc_reasons
@@ -388,13 +395,14 @@ def test_the_heartbeat_example_has_the_a4_keys_and_only_them() -> None:
     assert all(set(a) == {"addon", "digest"} for a in hb["addon_workloads_approvals"])
     assert hb["model_sets_free_bytes"] >= 0 and not isinstance(hb["model_sets_free_bytes"], bool)
     # i607b: the delivery fields are optional, and each rides only its state.
-    row_keys = {"id", "revision", "state", "reason", "bytes_done", "bytes_total", "retry_at", "free_bytes", "need_bytes"}
+    row_keys = {"id", "revision", "state", "reason", "bytes_done", "bytes_total", "retry_at", "free_bytes", "need_bytes", "link_source_for"}
     only_with = {
         "bytes_done": {"fetching"},
         "bytes_total": {"fetching", "verified"},
         "retry_at": {"refused"},
         "free_bytes": {"refused"},
         "need_bytes": {"refused"},
+        "link_source_for": {"verified"},  # F10: kept as a hard-link source
     }
     for s in hb["model_sets"]:
         assert {"id", "revision", "state"} <= set(s) <= row_keys and s["state"] in ("verified", "fetching", "refused")
@@ -402,7 +410,7 @@ def test_the_heartbeat_example_has_the_a4_keys_and_only_them() -> None:
         for k, states in only_with.items():
             if k in s:
                 assert s["state"] in states, f"{k} rides only {sorted(states)}, not {s['state']}"
-                assert isinstance(s[k], int) and not isinstance(s[k], bool) and s[k] >= 0 if k != "retry_at" else True
+                assert isinstance(s[k], int) and not isinstance(s[k], bool) and s[k] >= 0 if k not in ("retry_at", "link_source_for") else True
         # free and need ride a disk refusal, and only together.
         assert ("free_bytes" in s) == ("need_bytes" in s)
         if "free_bytes" in s:

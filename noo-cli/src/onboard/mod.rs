@@ -98,6 +98,11 @@ pub(crate) const SECRETS: &[(&str, &str)] = &[
 pub(crate) const STORAGE_SUBDIRS: &[&str] = &[
     "noo-data", "redis", "nats", "ollama", "hf-cache", "models", "prometheus", "grafana", "loki", "tempo", "postgres",
     "images",
+    // HF_CACHE_DIR/hub, which the gateway mounts read-only for the `hf`
+    // artifact manifest (i675 F13). huggingface_hub makes it on the first
+    // download; a fresh or upgraded install may not have it yet, and Docker
+    // would make it root-owned. Owned like hf-cache (steps::agent_subdir).
+    "hf-cache/hub",
     // The voice add-on's read-only staged-model mounts (i105): created even
     // when voice is off, so turning it on later never hits the bind check.
     "models/voice/whisper", "models/voice/piper",
@@ -151,6 +156,11 @@ pub(crate) struct Skip {
     /// `--mcp-door` / `--no-mcp-door` — pre-answers the MCP user-door
     /// question. None = ask; under --ci, None = closed.
     pub mcp_door: Option<bool>,
+    /// `--monitoring-full` (alias `--with-monitoring`) / `--no-monitoring-full`
+    /// — pre-answers the Grafana/Loki/Tempo question. None = ask (default No
+    /// on a new install); under --ci, None = lean on a new install and the
+    /// existing value otherwise (`steps::monitoring_plan`).
+    pub monitoring_full: Option<bool>,
     /// `--secrets-backend sops` — accepted for scripts that pass it; `sops`
     /// is the only backend. `env` (plaintext `.env`) is RETIRED and refused
     /// at parse time ([`secrets_backend_flag`]).
@@ -174,6 +184,10 @@ pub(crate) struct State {
     pub tier: u8,
     pub gpu_model: String,
     pub vram_gb: f64,
+    /// The prereqs step found no GPU at all (`nvidia-smi` absent or failed;
+    /// not merely busy). The environment step then seeds the CPU-only
+    /// Ollama slot count on a new install (i802).
+    pub cpu_only: bool,
     pub controller_url: String,
     pub data_root: String,
     /// Failures no later step can recover from (storage root unusable, the
@@ -210,6 +224,14 @@ pub(crate) struct State {
     /// Some(true) = the MCP user door was opened (posture gate set, gateway
     /// restarted); Some(false) = deliberately left closed; None = not asked.
     pub mcp_door: Option<bool>,
+    /// What the monitoring question decided (or found): Some(Lean) makes the
+    /// summary say how to turn Grafana, Loki and Tempo on. None = not asked.
+    pub monitoring: Option<crate::commands::stack_monitoring::Level>,
+    /// This machine was already onboarded when the wizard began (`.env` and
+    /// every core secret present). An install that never chose a monitoring
+    /// level keeps the full set (unset = full); only a NEW install gets lean
+    /// by default.
+    pub was_configured: bool,
     pub user_dir_count: usize,
     pub interrupted: bool,
     /// Why the wizard stopped before the last step, when it did. Set by the
@@ -630,13 +652,11 @@ pub fn onboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     return Ok(2);
                 }
             },
-            // Retired 2026-09-28: the monitoring set (Grafana/Prometheus/
-            // Loki/…) rides the `standalone` profile itself now, so every
-            // install runs it. Accepted so an old script keeps working;
-            // it changes nothing.
-            "--with-monitoring" => {
-                eprintln!("• --with-monitoring is no longer needed: every install runs the monitoring set");
-            }
+            // Grafana, Loki and Tempo are a choice again (cluster.monitoring
+            // in noomesh.yaml, unset = full): `--with-monitoring`, the old
+            // spelling, is the yes answer, like `--monitoring-full`.
+            "--monitoring-full" | "--with-monitoring" => skip.monitoring_full = Some(true),
+            "--no-monitoring-full" => skip.monitoring_full = Some(false),
             // Mode B: materialise from an EXTERNAL bundle (url|path)
             // instead of the embedded assets — config unpinned from the CLI
             // version. Produce one with `noo bundle export`.
@@ -1000,6 +1020,8 @@ pub(crate) fn rerun_guard_applies(reconfigure: bool, only: &[String], configured
 /// dry-run banner, all steps, final summary. Output/prompts route through
 /// `ctx.ui` / `ctx.asker`. Returns the process exit code.
 pub(crate) fn drive(ctx: &mut Ctx, reconfigure: bool) -> i32 {
+    // Read before any step writes .env or the store (monitoring_plan).
+    ctx.state.was_configured = is_configured(ctx);
     // ── Idempotent-install guard ─────────────────────────────────────────
     // A bare re-run on a configured host must NOT blindly rewrite .env or
     // bounce services. Detect the existing install and default to "no".
@@ -1328,6 +1350,11 @@ fn run_all(ctx: &mut Ctx) {
     ctx.pause(6, TOTAL);
 
     ctx.step(7, TOTAL, STEP_TITLES[6]);
+    // Before anything starts: the first start of a new install is already
+    // the lean or full one the person chose.
+    if only_wants("services", ctx) {
+        steps::monitoring_choice(ctx);
+    }
     if ctx.skip.services || !only_wants("services", ctx) {
         ctx.info("Skipped.");
     } else {
@@ -1544,6 +1571,8 @@ fn print_final_summary(ctx: &Ctx) {
             // The door onboarding derived, not a guess.
             let door = ctx.read_env(crate::commands::grafana_door::ROOT_URL_KEY);
             rows.push(if door.is_empty() { format!("Grafana: {proto}://localhost:3000") } else { format!("Grafana: {door}  (Open Grafana in the console signs you in)") });
+        } else if ctx.state.monitoring == Some(crate::commands::stack_monitoring::Level::Lean) {
+            rows.push("Grafana, Loki, Tempo: off  (on: `noo stack monitoring on`)".to_string());
         }
         match ctx.state.mcp_door {
             Some(true) => {
@@ -1574,13 +1603,35 @@ fn print_final_summary(ctx: &Ctx) {
     if welcome_due(ctx.dry_run, ctx.state.interrupted, &Outcome::of(&ctx.state), closing_verify_failed) {
         ctx.raw("");
         ctx.info("You're all set. Welcome to Noomesh!");
+        for line in first_chat_lines(true) {
+            ctx.raw(&format!("  {line}"));
+        }
     } else if !ctx.dry_run && !ctx.state.interrupted && closing_verify_failed {
         ctx.raw("");
         // No chat model this run (skipped, no fit, offline): the one command
         // that picks, pulls and places one, the same remedy verify's
         // `default chat` row gives (i677 #12).
         ctx.warn(closing_not_done_line(ctx.state.model_pulled.is_empty()));
+        for line in first_chat_lines(false) {
+            ctx.raw(&format!("  {line}"));
+        }
     }
+}
+
+/// first-chat.md's own first prompt (tests/test_first_chat_prompt_parity.py
+/// pins the two together): the install matrix asks the same question.
+pub(crate) const FIRST_CHAT_PROMPT: &str = "Say hello, then give me two short tips for keeping a home server healthy.";
+
+/// The closing lines that hand over the first chat (i677 #5: onboard never
+/// printed it; first-chat.md had it, and the README sends people there).
+/// After the welcome when the install is ready, after the not-done line when
+/// it needs a fix first. Pure.
+pub(crate) fn first_chat_lines(ready: bool) -> [String; 2] {
+    let lead = if ready { "Your first chat:" } else { "Once that is fixed, your first chat:" };
+    [
+        format!("{lead} noo chat --message \"{FIRST_CHAT_PROMPT}\""),
+        format!("What to try next: {}", steps::docs_url("getting-started/first-chat.md")),
+    ]
 }
 
 /// The last line when the closing verify did not pass. Pure.
@@ -1664,7 +1715,7 @@ pub(crate) fn posture_pending_restart(g: &Globals) -> Option<Vec<String>> {
 /// has just started the stack, so `--wait` lets the services that are
 /// still starting (Loki answers `/ready` 1-2 min in) settle before the
 /// verdict. Otherwise a fresh install ends on a warm-up false failure
-pub(crate) const FINAL_VERIFY_ARGS: &[&str] = &["--controller", "--wait"];
+pub(crate) const FINAL_VERIFY_ARGS: &[&str] = &["--controller", "--wait", "--brief"];
 
 #[cfg(test)]
 pub(crate) mod storage_lock_lines_tests {
@@ -1693,6 +1744,7 @@ mod final_verify_tests {
     #[test]
     fn onboard_verifies_the_controller_after_warm_up() {
         assert!(super::FINAL_VERIFY_ARGS.contains(&"--controller"));
+        assert!(super::FINAL_VERIFY_ARGS.contains(&"--brief"), "onboard's closing verify is the brief one; plain verify is unchanged");
         assert!(super::FINAL_VERIFY_ARGS.contains(&"--wait"), "onboard must let a fresh stack warm up before judging it");
     }
 }
@@ -1795,6 +1847,26 @@ mod welcome_tests {
         assert_eq!(super::closing_not_done_line(true), super::NO_CHAT_MODEL_YET);
         assert_eq!(super::closing_not_done_line(false), super::CLOSING_VERIFY_NOT_DONE);
         assert!(super::NO_CHAT_MODEL_YET.ends_with(super::FIRST_MODEL_CMD));
+    }
+
+    /// i677 #5: onboard ends by handing over the first chat, after the
+    /// verdict (the welcome, or what still needs doing), in both arms.
+    #[test]
+    fn onboard_ends_with_the_first_chat_command_after_the_verdict() {
+        let [ready, page] = super::first_chat_lines(true);
+        assert_eq!(ready, format!("Your first chat: noo chat --message \"{}\"", super::FIRST_CHAT_PROMPT));
+        assert!(page.ends_with(&crate::onboard::steps::docs_url("getting-started/first-chat.md")));
+        let [later, _] = super::first_chat_lines(false);
+        assert!(later.starts_with("Once that is fixed, your first chat: noo chat --message"));
+        let code = crate::test_src::own_code(include_str!("mod.rs"));
+        let tail = &code[code
+            .find("if welcome_due(ctx.dry_run, ctx.state.interrupted, &Outcome::of(&ctx.state), closing_verify_failed) {")
+            .expect("the verdict block")..];
+        let welcome = tail.find("You're all set. Welcome to Noomesh!").expect("welcome");
+        let after_welcome = tail.find("for line in first_chat_lines(true)").expect("the chat after the welcome");
+        let not_done = tail.find("ctx.warn(closing_not_done_line(").expect("the not-done line");
+        let after_not_done = tail.find("for line in first_chat_lines(false)").expect("the chat after the not-done line");
+        assert!(welcome < after_welcome && after_welcome < not_done && not_done < after_not_done);
     }
 }
 

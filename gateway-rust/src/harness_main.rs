@@ -302,6 +302,7 @@ pub async fn run() -> Result<()> {
     // stream idle bound is fixed for the process here.
     let placement = read_placement(&model_url, &client).await;
     let profile = profile_of(&placement);
+    install_chat_contexts(&placement, "start");
     match &profile {
         Some(p) => tracing::info!(
             tier = ?p.tier, first_byte_secs = ?p.first_byte_secs, stream_idle_secs = ?p.stream_idle_secs,
@@ -390,6 +391,7 @@ pub async fn run() -> Result<()> {
             loop {
                 tick.tick().await;
                 let placement = read_placement(&model_url, &client).await;
+                install_chat_contexts(&placement, "re-read");
                 let (mode, source) =
                     thinking_after_read(std::env::var(coordinator::thinking::THINKING_ENV).ok(), &placement);
                 if source == "unreachable" {
@@ -799,6 +801,19 @@ async fn read_placement(model_url: &str, client: &reqwest::Client) -> Result<Opt
 /// The harness profile in a placement read, if the agent sent one.
 fn profile_of(placement: &Result<Option<serde_json::Value>>) -> Option<crate::harness::profile::HarnessProfile> {
     placement.as_ref().ok().and_then(|p| p.as_ref()).and_then(crate::harness::profile::HarnessProfile::from_placement)
+}
+
+/// The agent's decided contexts (`chat_contexts`) from a placement read,
+/// installed for the loop ([`crate::harness::profile::chat_context_for`]).
+/// An unreachable agent leaves the table as it was; a read without the key
+/// (an older agent, nothing decided) clears it.
+fn install_chat_contexts(placement: &Result<Option<serde_json::Value>>, when: &str) {
+    let Ok(read) = placement else { return };
+    let table = read.as_ref().and_then(crate::harness::profile::chat_contexts_of);
+    let shown = table.as_ref().map(|t| format!("{t:?}")).unwrap_or_else(|| "none".into());
+    if crate::harness::profile::set_chat_contexts(table) {
+        tracing::info!("harness: decided chat contexts={shown} ({when})");
+    }
 }
 
 /// `model_context` in a placement read, if the agent sent one.

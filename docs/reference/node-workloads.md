@@ -125,8 +125,10 @@ The worker, not core, must load pickled tensors safely
 
 A staged set lives at `<MODELS_DIR>/sets/<id>/<revision>/` on the controller
 (files, then `model-set.json`, then `model-set.json.sig` last). A set without
-its signature does not exist to the rail. A node gets a set in two steps, both
-over the mTLS rail.
+its signature does not exist to the rail. Staging a new revision of a set
+reuses each unchanged LFS file (same sha256 and size) of a signed earlier
+revision by hard link instead of downloading it, and hashes it as before. A node
+gets a set in two steps, both over the mTLS rail.
 
 1. **The signed manifest**, from the gateway (same auth as every artifact
    manifest, a node's cluster bearer):
@@ -162,6 +164,11 @@ over the mTLS rail.
    against the manifest. There is no per-file hashing route: unlike a `gguf`,
    whose digest only the gateway states, every set file's digest is already
    inside the signed manifest, so the signature covers the files.
+
+   A new revision reuses unchanged files (same sha256 and size) from a
+   verified earlier revision of the same set on the same disk, by hard link,
+   and still re-hashes them; the old revision is kept until the new one
+   verifies (its heartbeat row carries `link_source_for`), then pruned.
 
    The model cache serves only `/sets/<id>/<revision>/<file>` and
    `/sets/<id>/<revision>/<dir>/<file>`. It refuses (404) a `.` or `..`
@@ -372,7 +379,7 @@ The agent creates the worker with exactly this and nothing more.
 | Env | the entry's declared keys; `<ADDON_UPPER>_MODEL_<SLOT_UPPER>_ID` and `_REVISION` per placed slot (comma-separated for a `many` slot); `HF_HUB_OFFLINE=1`; `TRANSFORMERS_OFFLINE=1`. Nothing else. A declared key that collides with one the agent sets is `env_out_of_bounds` |
 | Limits | memory `limits.ram_mb` (swap equal to memory, so none), `limits.cpus`, `limits.pids` |
 | Restart | `no` |
-| Labels | `noo.addon`, `noo.workload`, `noo.managed-by=agent`, `noo.role`, `noo.spec.hash`, and `noo.reservation` when set. The worker also carries `noo.drain-path`, `noo.drain-done-path` and `noo.drain-timeout-secs` |
+| Labels | `noo.addon`, `noo.workload`, `noo.managed-by=agent`, `noo.role` and `noo.spec.hash`. No reservation id: the reservation lives in the gateway's placement row, and a label would put it in the spec hash. The worker also carries `noo.drain-path`, `noo.drain-done-path` and `noo.drain-timeout-secs` |
 
 Only `.verified` sets are bound (a set the agent has not verified is
 `set_unverified`, one it does not hold is `set_missing`, one still being
@@ -404,7 +411,9 @@ fetched is not a refusal: the row stays pending).
 - **Recreate.** One spec hash (the image, the door image and conf, the leaf's
   fingerprint, the sets, the env, the limits, the labels) is stored on both
   containers. A matching pair is left alone; any change removes both (and the
-  scratch volumes) and recreates them stopped. A running worker is never
+  scratch volumes) and recreates them stopped. A reservation is not a change:
+  a reserve after provision starts the same two containers, it does not
+  rebuild them. A running worker is never
   recreated by a provision: it returns `ErrWorkerRunning` and the caller
   drains first.
 - A container, volume or network with the workload's name that lacks
@@ -478,6 +487,25 @@ re-check of the decl (inside a desired-config entry) is **shape only**
 as an input and a nil input skips only the existence and internal check. It is
 carried in desired-config only as part of the verbatim `decl`.
 
+## A CPU workload holds no GPU
+
+A reservation of a node workload declared `accel.gpu` 0 takes **no GPU
+lease**: nothing on the node drains or pauses, and the node's chat and embed
+backends keep serving while the workload runs. The reservation lives on the
+workload's placement row instead (`reservation`, `holder`, `reserved_at`,
+migration 124), and `noo cluster reservations` lists it with `gpu` `no`.
+Release follows the same rule as a GPU reservation: the holder, or anyone with
+`--force` (audited). A GPU workload (`accel.gpu` > 0) still takes its drain
+hold exactly as before.
+
+Rolling back to a gateway older than 0.6.25: **release every CPU-workload
+reservation first** (`noo cluster reservations`, then `noo cluster release
+<id>` for each with `gpu` `no`). An older gateway lists reservations only from
+GPU leases, so it does not see one held on a placement row. The node agent
+keeps running the workload from its placement row, and an older gateway's
+release of that id answers `no reservation <id>`; set the placement back with
+the new gateway, or remove and re-place the workload.
+
 ## State machine
 
 | State | Meaning |
@@ -488,8 +516,10 @@ carried in desired-config only as part of the verbatim `decl`.
 
 - `absent` to `provisioned`: load the image tar from the rail, check it yields
   exactly one image whose ID equals `image.id`, verify the sets, create the sidecar and the worker stopped.
-- `provisioned` to `running`: start. A worker not ready within `start_secs`
-  reports `start_timeout`.
+- `provisioned` to `running`: start the sidecar, then the worker. A start the
+  daemon refuses is retried once after 2 s (the first error is logged); if
+  the retry fails too the start is refused `start_failed` with both errors. A
+  worker not ready within `start_secs` reports `start_timeout`.
 - **Release returns the row to `provisioned`**: drain the worker as described
   under "The worker's drain" (POST `drain.path`, poll `drain.done_path`, all
   within `drain.timeout_secs`), stop, remove the worker and its scratch,
@@ -554,7 +584,7 @@ become a fact (the i495 rule). A `null` is never sent.
 | `addon_workloads_policy` | `"none"` / `"approve"` / `"auto"` | the node's consent setting |
 | `addon_workloads_approvals` | `[{addon, digest, source?}]` | per add-on and image digest. The owner's own approvals carry no `source`; on a node whose owner opted in to controller approvals, each pair only the controller's signed set approves follows them with `"source": "controller"` (at most 256 rows in all) |
 | `addon_workloads_controller` | `{opted_in, set_state, generation?, set_sha256?}` | controller approvals ([below](#approving-from-the-controller-opt-in)): whether the owner opted in, and the set the agent holds: `set_state` is `none`, `verified` or `unverifiable`; `generation` and `set_sha256` (the SHA-256 of the signed document's bytes) ride `verified`. Always reported. The gateway stores it from the release that delivers the sets (i596 slice 2); until then it drops it |
-| `model_sets` | `[{id, revision, state, reason?, bytes_done?, bytes_total?, retry_at?, free_bytes?, need_bytes?}]` | `state` is `verified`, `fetching` or `refused`; `reason` rides `refused`. The delivery fields (i607b) are optional and omitted when not known or not applicable, each riding only its state: `bytes_done` and `bytes_total` (integers) on `fetching` (`bytes_done` counts the files already on disk plus the bytes written of the current one; `bytes_total` is the whole set), `bytes_total` alone on `verified`; `retry_at` (RFC 3339, UTC) on `refused` is when the agent next tries; `free_bytes` and `need_bytes` on a `refused` row with `reason: disk` only, the free bytes the agent saw and the bytes it needed (the files still to write plus its margin). `reason` stays a code; the numbers are separate fields, never free text. An old agent sends none of them, and a reader shows the state alone |
+| `model_sets` | `[{id, revision, state, reason?, bytes_done?, bytes_total?, retry_at?, free_bytes?, need_bytes?, link_source_for?}]` | `state` is `verified`, `fetching` or `refused`; `reason` rides `refused`. The delivery fields (i607b) are optional and omitted when not known or not applicable, each riding only its state: `bytes_done` and `bytes_total` (integers) on `fetching` (`bytes_done` counts the files already on disk plus the bytes written of the current one; `bytes_total` is the whole set), `bytes_total` alone on `verified`; `retry_at` (RFC 3339, UTC) on `refused` is when the agent next tries; `free_bytes` and `need_bytes` on a `refused` row with `reason: disk` only, the free bytes the agent saw and the bytes it needed (the files still to write plus its margin). `reason` stays a code; the numbers are separate fields, never free text. `link_source_for` (a revision) rides a `verified` row no placement wants any more: the agent keeps it as the hard-link source of that revision of the same set until it verifies. An old agent sends none of them, and a reader shows the state alone |
 | `node_workloads` | `[{addon, name, state, ready, model?, door_port, reservation?, reason?}]` | `state` is a desired state or a reported one (`draining`, `needs_attention`). `model`, `reservation` and `reason` are omitted when unknown or none. There is no `slots` in phase 2 (placement sizes it from `accel.slots_env`) |
 
 `heartbeat-i300.json` is the example.
@@ -596,7 +626,7 @@ The agent's fixed vocabulary for the `reason` of a `node_workloads` or
 |---|---|---|
 | `decl_invalid` | the decl fails the node-workloads rules (the inner refusal code is logged) | fix the add-on's `node-workloads.json` |
 | `desired_invalid` | the entry is malformed: unknown field, wrong type, bad state, reservation not a UUID, name or `start_secs`/`drain` differing from the decl, wrong `door.leaf` | a gateway bug or version skew: upgrade the controller |
-| `door_leaf_missing` | the door leaf is not available: it is not in the provision bundle yet, or this node's applier predates the `svc-addon-*` leaf kind | re-provision (`noo upgrade --nodes`) |
+| `door_leaf_missing` | the door leaf is not available: it is not in the provision bundle yet, or this node's applier predates the `svc-addon-*` leaf kind. Right after a provision this can be the agent's previous report: the agent re-checks the leaf every 5 s and reports the change at once | wait a few seconds and retry; if it stays, re-provision (`noo upgrade --nodes`) |
 | `image_missing` | `image` is not `{name, digest, id, artifact}` as above (name, digest, id or artifact absent, malformed or inconsistent), or the tar is not on the rail | re-enable or upgrade the add-on on the controller |
 | `image_digest_mismatch` | the tar did not load as exactly one image, or that image's ID differs from `image.id` | re-stage the image; investigate the rail |
 | `set_missing` | a required slot has no set | choose a model for the slot |
@@ -618,6 +648,8 @@ The agent's fixed vocabulary for the `reason` of a `node_workloads` or
 | `crashed` | the worker exited while it should run, or during a drain (it is then recreated fresh and stopped) | read the worker's logs |
 | `drain_timeout` | the drain did not finish in `drain.timeout_secs`; reported as `needs_attention` | wait; the session is never cut |
 | `door_unreachable` | the host cannot route the agent to an internal Docker network (not Linux, e.g. macOS Docker Desktop) and the no-egress rule does not bend | place on a Linux node |
+| `image_unavailable` | the workload's image tar is on the rail but this node could not fetch it (the controller's rail, `https://<controller>:8443/images/`, unreachable, refused or timed out); the agent retries after 30 s, then 1, 2, 4 and every 5 min | check that the node reaches the controller's model-cache rail on 8443 (`noo cluster verify <node>`); a local-bind controller (`NOO_BIND_MODE=local`) publishes it on 127.0.0.1 only |
+| `provision_failed` | provisioning failed with an error that has no code of its own (docker refused a call, a file could not be written); the agent's log has the error | read the node agent's log (`noo cluster logs <node> agent`) |
 
 The placement facts (`consent_none`, `consent_unapproved`, `nvidia_runtime_missing`, `driver_caps_missing`, `compute_cap_low`, `arch_mismatch`, `controller_host`, `disk`) are also the gateway's placement refusal codes, spelled identically: the gateway refuses a placement with the code the agent would report.
 

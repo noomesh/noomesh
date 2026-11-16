@@ -57,6 +57,9 @@ tests/test_addon_declares_its_grant.py::* | no evolve add-on checkout beside thi
 # beside this repo; CI's single-repo workspace has none.
 tests/test_file_reader_parity.py::test_the_pinned_add_on_manifests_match_the_sibling_checkouts* | no pai-[a-z-]+ checkout beside this one carries | re-reads the add-on reader manifests from sibling add-on checkouts that CI's single-repo workspace does not have; the pins themselves are checked by every run.
 
+# ── test_pg_pool_budget.py: the siblings' pool declarations (i815)
+tests/test_pg_pool_budget.py::test_the_pinned_declarations_match_the_sibling_at_its_sha* | no [a-z-]+ checkout with [0-9a-f]{8}: | re-reads each sibling's POOL_CEILINGS at its pinned sha from a sibling git checkout, which CI's single-repo workspace does not have; the pins themselves are summed by every run, and release-align reads the same files at the release's revs.
+
 # ── test_addon_doors_are_mtls.py: the evolve SERVER half of the add-on mTLS
 # door lives in the evolve add-on; the noomesh half
 # (manifest https, overlay material, cluster_client) runs everywhere.

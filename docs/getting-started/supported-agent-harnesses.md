@@ -113,13 +113,14 @@ The full set of flags, the harness policy, loop budgets and the
 `NOO_HARNESS_DISPATCH` brake are in
 [../cli/fleet.md](../cli/fleet.md#place-the-harness).
 
-The controller's own node takes a harness like any other node. The
-controller box runs a node agent for its own node beside the controller
-itself, and that agent is what starts the harness
-([../security/node-agent.md](../security/node-agent.md)). A turn goes to
-that harness only when one is placed there and the node's agent reports it
-running. Without one, the controller runs the turn in process, as it
-always has, and a task's `why` says which of the two is missing.
+The controller's own node runs its turns in process: the gateway is
+its harness. `noo cluster provision` does not ship a harness runner to
+that node, so the default policy (`auto`) places no harness there either.
+It does so only when the node's agent reports a harness runner on the
+host. A turn goes to a harness on the controller's node only when one is
+placed there and the node's agent reports it running. Otherwise the
+controller runs the turn in process, and a task's `why` says which of the
+two is missing.
 
 ### Slow node models
 

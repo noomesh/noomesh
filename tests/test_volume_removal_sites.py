@@ -33,7 +33,7 @@ SITES = {
     ("noo-cli/src/commands/offboard.rs", 'run("docker", &["network".into(), "rm".into(), n.clone()]);'):
         "offboard: inside the same confirmed 'STOP + DELETE the stack' consent, after the containers; this "
         "project's networks by exact label plus the launcher's cluster network by exact name (networks hold no data)",
-    ("noo-cli/src/onboard/steps.rs", '.args(["volume", "rm", "-f", &vol])'):
+    ("noo-cli/src/onboard/steps.rs", '.args(["volume", "rm", "-f", vol])'):
         "onboard's reaper: ONLY a stale bind record (a different non-empty path; the data stays on the host), "
         "announced before it runs; an unbound volume or a failed inspect is kept",
     ("noo-cli/src/commands/at_rest_migrate.rs", 'run(&ctx.docker, &["volume".into(), "rm".into(), v.clone()], &ctx.root)?;'):

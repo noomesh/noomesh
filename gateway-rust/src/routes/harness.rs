@@ -141,7 +141,10 @@ async fn harness_call(
         HarnessOp::Runbook { prompt } => json!({"text": rt.runbook_context(&prompt)}),
         HarnessOp::Temporal { timeout_ms } => json!({"text": rt.temporal_context(Some(user), Duration::from_millis(timeout_ms.min(30_000))).await}),
         HarnessOp::RunningSummary => json!({"text": rt.running_summary(conv).await}),
-        HarnessOp::Recall { query, top_k } => json!({"text": rt.conversation_recall(conv, &query, top_k.min(50)).await}),
+        HarnessOp::Recall { query, top_k } => {
+            let r = rt.conversation_recall(conv, &query, top_k.min(50)).await;
+            json!({"text": r.text, "recall": r.metadata()})
+        }
         HarnessOp::ToolSchemas => json!({
             "native": rt.tool_schemas().await,
             "external": rt.external_tool_schemas(Some(user)).await,
@@ -407,16 +410,16 @@ async fn harness_call(
         }
         HarnessOp::OperatorAlert { kind, target, cooldown_secs, message } => {
             // A harness may raise the alert kinds the loop raises, nothing else.
-            if kind != "inference.backend_failover" {
-                return Err(AppError::BadRequest(format!("harness rail: alert kind {kind:?} not allowed")).into());
-            }
             // The node's text is evidence only: the channel summary and the
             // command come from the gateway's own copy of this alert.
-            rt.operator_alert(
-                crate::coordinator::backend_failover_alert(&target, message),
-                cooldown_secs.clamp(0, 86_400),
-            )
-            .await;
+            let alert = if kind == "inference.backend_failover" {
+                crate::coordinator::backend_failover_alert(&target, message)
+            } else if kind == crate::coordinator::BACKEND_CUT_ALERT_KIND {
+                crate::coordinator::backend_cut_alert(&target, message)
+            } else {
+                return Err(AppError::BadRequest(format!("harness rail: alert kind {kind:?} not allowed")).into());
+            };
+            rt.operator_alert(alert, cooldown_secs.clamp(0, 86_400)).await;
             json!({})
         }
     };

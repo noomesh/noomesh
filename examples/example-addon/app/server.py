@@ -54,9 +54,15 @@ def caller_is_gateway(bearer: str) -> bool:
     digest = hashlib.sha256(bearer.encode()).hexdigest()
     with open(f"{WORK}/db/url") as f:
         url = f.read().strip()
-    with psycopg.connect(url, connect_timeout=5) as conn:
-        row = conn.execute("SELECT consumer FROM noo_addon_caller_keys WHERE key_hash = %s", (digest,)).fetchone()
-    return row is not None
+    for attempt in (1, 2):  # a dropped connection (e.g. Postgres restarting) gets one retry
+        try:
+            with psycopg.connect(url, connect_timeout=5) as conn:
+                row = conn.execute("SELECT consumer FROM noo_addon_caller_keys WHERE key_hash = %s", (digest,)).fetchone()
+            return row is not None
+        except psycopg.OperationalError:
+            if attempt == 2:
+                raise  # the handler answers 503 naming it
+            time.sleep(1)
 
 
 class Handler(BaseHTTPRequestHandler):

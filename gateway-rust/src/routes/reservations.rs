@@ -85,6 +85,8 @@ fn reservation_of(node_id: &str, record: &Value) -> Option<Value> {
         "purpose": lease.get("purpose").and_then(Value::as_str).unwrap_or(""),
         "paused_backends": gc.get("paused_backends").cloned().unwrap_or(json!([])),
         "gpu_total_mb": gc.get("total_mb").and_then(Value::as_u64).unwrap_or(0),
+        "gpu": true,
+        "source": "lease",
     }))
 }
 
@@ -109,7 +111,76 @@ async fn node_records(state: &AppState) -> Vec<(String, Value)> {
 }
 
 async fn all_reservations(state: &AppState) -> Vec<Value> {
-    node_records(state).await.iter().filter_map(|(id, r)| reservation_of(id, r)).collect()
+    let leased: Vec<Value> = node_records(state).await.iter().filter_map(|(id, r)| reservation_of(id, r)).collect();
+    // A CPU workload's reservation has no lease: it lives on its placement
+    // row. A row read error lists the leased ones and says so, never a 500.
+    let held = match crate::repo::node_workload_placements::held(&state.db).await {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(error = %e, "reservations: placement rows unreadable; listing GPU leases only");
+            Vec::new()
+        }
+    };
+    merge_reservations(leased, &held)
+}
+
+/// The leased reservations, plus one per placement row held under a
+/// reservation id that NO lease carries (a CPU workload's). Never twice: a row
+/// whose id a lease carries (a GPU workload's, or a hand-over in flight) is
+/// the lease's. Pure, so both hand-over orders are tested.
+pub(crate) fn merge_reservations(mut leased: Vec<Value>, held: &[crate::repo::node_workload_placements::Held]) -> Vec<Value> {
+    let lease_ids: std::collections::HashSet<String> =
+        leased.iter().filter_map(|r| r["id"].as_str().map(str::to_string)).collect();
+    for h in held {
+        if lease_ids.contains(&h.reservation) {
+            continue;
+        }
+        leased.push(json!({
+            "id": h.reservation,
+            "workload": format!("{}/{}", h.addon, h.workload),
+            "holder": h.holder.clone().unwrap_or_default(),
+            "node": h.node_id,
+            "state": "held",
+            "generation": 0,
+            "since": h.reserved_at.clone().unwrap_or_default(),
+            "mode": "none",
+            "reason": format!("reservation {}/{}", h.addon, h.workload),
+            "purpose": "",
+            "paused_backends": [],
+            "gpu_total_mb": 0,
+            "gpu": false,
+            "source": "placement",
+        }));
+    }
+    leased
+}
+
+/// Whether a reservation of `decl` takes a GPU drain hold: every GPU
+/// workload and every i163 (actuator) workload does, as before; a placed node
+/// workload declared accel.gpu 0 does not (its row carries the reservation).
+pub(crate) fn takes_gpu_hold(decl: &crate::addon_workloads::WorkloadDecl, managed: bool) -> bool {
+    decl.gpu || !managed
+}
+
+/// Only the holder releases a reservation, or anyone with `force` (audited).
+/// The holder is the caller's credential subject as the take recorded it (a
+/// GPU lease's owner, or a CPU workload's placement row's holder): the same
+/// rule for both.
+pub(crate) fn may_release(holder: &str, actor: &str, force: bool) -> bool {
+    force || holder == actor
+}
+
+/// The refusal for a take that lost to another reservation of the same
+/// workload: who holds it, when that is recorded (a 409, never a 500).
+pub(crate) fn already_reserved(key: &str, by: Option<&crate::repo::node_workload_placements::Held>) -> String {
+    match by {
+        Some(h) => format!(
+            "{key} is already reserved by {} (reservation {}); release that reservation first",
+            h.holder.as_deref().filter(|s| !s.is_empty()).unwrap_or("an earlier gateway (no holder recorded)"),
+            h.reservation
+        ),
+        None => format!("{key} is already reserved (its placement is not provisioned); release that reservation first"),
+    }
 }
 
 async fn find_reservation(state: &AppState, id: &str) -> Option<Value> {
@@ -216,9 +287,18 @@ async fn actuator(link: &crate::node_link::NodeLink, decl: &crate::addon_workloa
 /// The error for a failed actuator start. The agent loads its workload
 /// declarations a moment after it registers; a start in that window meets its
 /// 404 `not_declared`, a transient state (this gateway's own bundle declares
-/// the workload), so the caller is told to retry, not shown a 500. Any other
-/// failure stays an internal error.
-fn start_failure(key: &str, node: &str, e: &str) -> AppError {
+/// the workload), so the caller is told to retry, not shown a 500.
+///
+/// Every other start failure is the NODE's answer, never a gateway fault, so
+/// it is never a bare "internal error" (0.6.25-rc.3 rehearsal: a reserve was
+/// refused "internal error" with its cause only in the gateway log). The
+/// agent's own refusal (`<code> (<4xx>): <detail>`) is a Conflict that leads
+/// with its code; an agent 5xx, an unreachable agent or an unreadable answer
+/// is Upstream (502) with what was seen. The agent's text is scrubbed of
+/// secret shapes and URL queries and cut to one line.
+fn start_failure(key: &str, node: &str, e: &str, holds_gpu: bool) -> AppError {
+    // A CPU workload took no GPU hold, so there is none to give back.
+    let gave_back = if holds_gpu { "; the GPU was released back to the pool" } else { "" };
     if e.starts_with("not_declared (404)") {
         return AppError::UnavailableRetry {
             code: "node_workloads_not_loaded",
@@ -226,7 +306,43 @@ fn start_failure(key: &str, node: &str, e: &str) -> AppError {
             retry_after_secs: 10,
         };
     }
-    AppError::Internal(format!("{key} did not start on {node}: {e}; the GPU was released back to the pool"))
+    let said = agent_text(e);
+    if let Some((code, status, detail)) = agent_refusal(e) {
+        if (400..500).contains(&status) {
+            return AppError::Conflict(format!(
+                "{code}: {key} did not start on {node}: {}{gave_back}; nothing is running",
+                agent_text(detail)
+            ));
+        }
+    }
+    AppError::Upstream(format!("{key} did not start on {node}: {said}{gave_back}"))
+}
+
+/// `<code> (<status>): <detail>` as [`actuator`] renders an agent's answer.
+fn agent_refusal(e: &str) -> Option<(&str, u16, &str)> {
+    let (code, rest) = e.split_once(" (")?;
+    let (status, detail) = rest.split_once("): ")?;
+    let ok_code = !code.is_empty() && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+    ok_code.then_some(())?;
+    Some((code, status.parse().ok()?, detail))
+}
+
+/// The node's words, safe to show: secret-shaped values scrubbed, URL query
+/// strings dropped, one line, at most 300 characters.
+fn agent_text(s: &str) -> String {
+    let (scrubbed, _) = crate::redact::scrub_secrets(s);
+    let mut out = String::new();
+    for word in scrubbed.split_whitespace() {
+        let w = if word.contains("://") { word.split(['?', '#']).next().unwrap_or(word) } else { word };
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(w);
+    }
+    if out.chars().count() > 300 {
+        out = out.chars().take(300).collect::<String>() + "…";
+    }
+    out
 }
 
 /// Why a placed node workload cannot be reserved on `node`, from the node's
@@ -245,6 +361,34 @@ pub(crate) fn node_workload_refusal(record: &Value, addon: &str, name: &str, nod
         return Some(not_yet(format!("{node} does not report {key}: it has not provisioned it yet; retry; nothing was held")));
     };
     if let Some(reason) = row.get("reason").and_then(Value::as_str).filter(|r| !r.is_empty()) {
+        // The door leaf travels in the node's provision bundle and the agent
+        // reports it on its next heartbeat (seconds after the apply since
+        // 0.6.25-rc.2); a reserve right after `noo cluster provision` can
+        // still beat that report, so say so instead of reading as broken.
+        if reason == crate::node_workloads::code::DOOR_LEAF_MISSING {
+            return Some(AppError::Conflict(format!(
+                "{reason}: {node} has not reported {key}'s door leaf yet (its agent's last heartbeat says {reason}). \
+                 Just provisioned? Retry after the node's next heartbeat (about 30 s); otherwise give it the leaf: \
+                 noo cluster provision {node}; nothing was held"
+            )));
+        }
+        // The node cannot reach the rail its image comes from: the leaf is
+        // not the problem, so the door-leaf remedy must not be printed
+        // (0.6.25-rc.2, A-nodewl.reserve).
+        if reason == crate::node_workloads::code::IMAGE_UNAVAILABLE {
+            return Some(AppError::Conflict(format!(
+                "{reason}: {node} cannot fetch {key}'s image from the controller's rail (its agent reports {reason}). \
+                 Check that {node} reaches the controller's model-cache rail on port 8443: noo cluster verify {node} \
+                 (a controller with NOO_BIND_MODE=local publishes it on 127.0.0.1 only); the agent retries on its own; \
+                 nothing was held"
+            )));
+        }
+        if reason == crate::node_workloads::code::PROVISION_FAILED {
+            return Some(AppError::Conflict(format!(
+                "{reason}: {node} could not provision {key} (its agent reports {reason}); its agent log has the error: \
+                 noo cluster logs {node} agent; nothing was held"
+            )));
+        }
         return Some(AppError::Conflict(format!("{reason}: {node} cannot run {key} (its agent reports {reason}); nothing was held")));
     }
     if row.get("state").and_then(Value::as_str) == Some("needs_attention") {
@@ -673,24 +817,37 @@ async fn take(state: Arc<AppState>, actor: String, b: Value) -> AppResult {
         }
     }
 
-    // The lease: an owned hold that drains the pool's work first.
-    let hold = super::cluster::gpu_hold_op(
-        &state,
-        actor.clone(),
-        &node,
-        "hold",
-        json!({"reason": format!("reservation {key}"), "operation_id": id, "owner": actor, "workload": key,
-               "mode": "drain", "timeout_secs": timeout_secs, "force": old.is_some(), "legacy": false}),
-        std::time::Duration::from_secs(timeout_secs + 60),
-    )
-    .await?;
-    let Json(hold) = hold;
-    let lease = hold.pointer("/gpu_contention/lease").cloned().unwrap_or(Value::Null);
-    let generation = lease.get("generation").and_then(Value::as_u64).unwrap_or(0);
+    // The lease: an owned hold that drains the pool's work first. A node
+    // workload declared accel.gpu 0 takes NONE (0.6.25-rc.3 rehearsal: its
+    // drain hold stopped every lane of a CPU node, and its lease would block a
+    // GPU reservation on the same node). Its reservation lives on its
+    // placement row instead (set_running below, [`all_reservations`]).
+    let holds_gpu = takes_gpu_hold(&decl, managed.is_some());
+    let (lease, generation, hold) = if holds_gpu {
+        let hold = super::cluster::gpu_hold_op(
+            &state,
+            actor.clone(),
+            &node,
+            "hold",
+            json!({"reason": format!("reservation {key}"), "operation_id": id, "owner": actor, "workload": key,
+                   "mode": "drain", "timeout_secs": timeout_secs, "force": old.is_some(), "legacy": false}),
+            std::time::Duration::from_secs(timeout_secs + 60),
+        )
+        .await?;
+        let Json(hold) = hold;
+        let lease = hold.pointer("/gpu_contention/lease").cloned().unwrap_or(Value::Null);
+        let generation = lease.get("generation").and_then(Value::as_u64).unwrap_or(0);
+        (lease, generation, hold)
+    } else {
+        (Value::Null, 0, json!({}))
+    };
 
     let release_hold = |why: &'static str| {
         let (state, actor, node, id) = (state.clone(), actor.clone(), node.clone(), id.clone());
         async move {
+            if !holds_gpu {
+                return;
+            }
             let _ = super::cluster::gpu_hold_op(&state, actor, &node, "release",
                 json!({"operation_id": id, "generation": generation, "force": false, "legacy": false, "resume": "now"}),
                 std::time::Duration::from_secs(90)).await;
@@ -702,15 +859,24 @@ async fn take(state: Arc<AppState>, actor: String, b: Value) -> AppResult {
     // (the agent's start reads it afresh). Only from provisioned, so a second
     // reservation can never take a workload another one holds.
     if managed.is_some() {
-        match crate::repo::node_workload_placements::set_running(&state.db, &node, &addon, &name, &id).await {
+        match crate::repo::node_workload_placements::set_running(&state.db, &node, &addon, &name, &id, &actor).await {
             Ok(true) => {}
             Ok(false) => {
                 release_hold("already_reserved").await;
-                return Err(AppError::Conflict(format!("{key} is already reserved (its placement is not provisioned); release that reservation first")));
+                // Who holds it is only for the message: an unreadable list is
+                // logged and the refusal still stands, without the holder.
+                let by = match crate::repo::node_workload_placements::held(&state.db).await {
+                    Ok(h) => h.into_iter().find(|r| r.addon == addon && r.workload == name),
+                    Err(e) => {
+                        tracing::warn!(error = %e, workload = %key, "reservations: holder unreadable; refusing without naming it");
+                        None
+                    }
+                };
+                return Err(AppError::Conflict(already_reserved(&key, by.as_ref())));
             }
             Err(e) => {
                 release_hold("placement_unwritable").await;
-                return Err(AppError::Internal(format!("could not mark {key} running: {e}; the GPU was released back to the pool")));
+                return Err(AppError::Internal(format!("could not mark {key} running: {e}{}", if holds_gpu { "; the GPU was released back to the pool" } else { "" })));
             }
         }
     }
@@ -722,11 +888,13 @@ async fn take(state: Arc<AppState>, actor: String, b: Value) -> AppResult {
             if managed.is_some() {
                 let _ = crate::repo::node_workload_placements::set_provisioned(&state.db, &node, &addon, &name, &id).await;
             }
-            let _ = super::cluster::gpu_hold_op(&state, actor.clone(), &node, "release",
-                json!({"operation_id": id, "generation": generation, "force": false, "legacy": false, "resume": "now"}),
-                std::time::Duration::from_secs(90)).await;
+            if holds_gpu {
+                let _ = super::cluster::gpu_hold_op(&state, actor.clone(), &node, "release",
+                    json!({"operation_id": id, "generation": generation, "force": false, "legacy": false, "resume": "now"}),
+                    std::time::Duration::from_secs(90)).await;
+            }
             audit(&state, AuditKind::ReservationTake, &actor, &node, "error", json!({"id": id, "workload": key, "step": "start", "detail": e})).await;
-            return Err(start_failure(&key, &node, &e));
+            return Err(start_failure(&key, &node, &e, holds_gpu));
         }
     };
     steps["started"] = started;
@@ -741,7 +909,8 @@ async fn take(state: Arc<AppState>, actor: String, b: Value) -> AppResult {
         json!({"id": id, "workload": key, "hand_over": hand_over, "lease": lease, "detail": detail})).await;
     tracing::info!(id = %id, workload = %key, node = %node, actor = %actor, status, "reservation_take");
     Ok(Json(json!({"id": id, "workload": key, "node": node, "holder": actor, "status": status, "detail": detail,
-        "lease": lease, "worker": worker, "steps": steps, "paused_backends": hold.pointer("/gpu_contention/paused_backends").cloned().unwrap_or(json!([]))})))
+        "gpu": holds_gpu, "lease": lease, "worker": worker, "steps": steps,
+        "paused_backends": hold.pointer("/gpu_contention/paused_backends").cloned().unwrap_or(json!([]))})))
 }
 
 /// POST /api/cluster/reservations/{id}/release (or DELETE …/{id}) — body
@@ -766,7 +935,7 @@ async fn release(state: Arc<AppState>, actor: String, id: String, force: bool) -
     };
     let node = r["node"].as_str().unwrap_or("").to_string();
     let holder = r["holder"].as_str().unwrap_or("").to_string();
-    if holder != actor && !force {
+    if !may_release(&holder, &actor, force) {
         return Err(AppError::Conflict(format!("not_owner: reservation {id} is held by {holder}; release it with force")));
     }
     let key = r["workload"].as_str().unwrap_or("").to_string();
@@ -783,11 +952,17 @@ async fn release(state: Arc<AppState>, actor: String, id: String, force: bool) -
             }
         }
     }
-    let generation = r["generation"].as_u64().unwrap_or(0);
-    let released = super::cluster::gpu_hold_op(&state, actor.clone(), &node, "release",
-        json!({"operation_id": id, "generation": generation, "force": force, "legacy": false, "resume": "now"}),
-        std::time::Duration::from_secs(90)).await?;
-    let Json(released) = released;
+    // A CPU workload's reservation (its row's, no lease): the drain above
+    // gave the row back; there is no GPU to release.
+    let released = if r["source"] == "placement" {
+        json!({})
+    } else {
+        let generation = r["generation"].as_u64().unwrap_or(0);
+        let Json(v) = super::cluster::gpu_hold_op(&state, actor.clone(), &node, "release",
+            json!({"operation_id": id, "generation": generation, "force": force, "legacy": false, "resume": "now"}),
+            std::time::Duration::from_secs(90)).await?;
+        v
+    };
     audit(&state, AuditKind::ReservationRelease, &actor, &node, "ok", json!({"id": id, "workload": key, "holder": holder, "force": force})).await;
     tracing::info!(id = %id, workload = %key, node = %node, actor = %actor, force, "reservation_release");
     Ok(Json(json!({"id": id, "workload": key, "node": node, "status": "released", "steps": steps,
@@ -1358,8 +1533,8 @@ mod tests {
     }
 
     #[test]
-    fn a_not_declared_start_is_a_retryable_503_and_other_failures_stay_internal() {
-        match start_failure("rhaddon/rhworker", "awolf", "not_declared (404): no such workload") {
+    fn a_not_declared_start_is_a_retryable_503_and_other_failures_say_why() {
+        match start_failure("rhaddon/rhworker", "awolf", "not_declared (404): no such workload", true) {
             AppError::UnavailableRetry { code, detail, retry_after_secs } => {
                 assert_eq!(code, "node_workloads_not_loaded");
                 assert!(detail.contains("has not loaded its workload declarations yet; retry"), "{detail}");
@@ -1367,8 +1542,48 @@ mod tests {
             }
             other => panic!("not_declared must be retryable, got {other:?}"),
         }
-        assert!(matches!(start_failure("k", "n", "docker_error (500): boom"), AppError::Internal(_)));
-        assert!(matches!(start_failure("k", "n", "node agent unreachable: x"), AppError::Internal(_)));
+        // 0.6.25-rc.3 rehearsal: no start failure is a bare "internal error".
+        // An agent 5xx or an unreachable agent is Upstream with what was seen.
+        match start_failure("k", "n", "docker_error (500): boom", true) {
+            AppError::Upstream(m) => assert!(m.contains("docker_error (500): boom") && m.contains("did not start on n"), "{m}"),
+            other => panic!("an agent 5xx is Upstream, got {other:?}"),
+        }
+        match start_failure("k", "n", "node agent unreachable: x", true) {
+            AppError::Upstream(m) => assert!(m.contains("node agent unreachable"), "{m}"),
+            other => panic!("an unreachable agent is Upstream, got {other:?}"),
+        }
+        // Only a workload that held the GPU says it gave the GPU back.
+        match start_failure("k", "n", "docker_error (500): boom", true) {
+            AppError::Upstream(m) => assert!(m.contains("the GPU was released back to the pool"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        match start_failure("k", "n", "docker_error (500): boom", false) {
+            AppError::Upstream(m) => assert!(!m.contains("GPU"), "a CPU workload held no GPU: {m}"),
+            other => panic!("{other:?}"),
+        }
+        match start_failure("k", "n", "image_unavailable (409): gone", false) {
+            AppError::Conflict(m) => assert!(!m.contains("GPU") && m.ends_with("; nothing is running"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The agent's own coded refusal is a Conflict that LEADS with its code,
+    /// and its text is shown scrubbed: no secret-shaped value, no URL query.
+    #[test]
+    fn an_agent_start_refusal_is_a_conflict_with_its_code_and_scrubbed_text() {
+        let e = "image_unavailable (409): fetch https://noo-controller:8443/images/w.tar?token=SECRETVALUE refused, password=hunter2";
+        match start_failure("rhaddon/echo", "rhx-node2", e, true) {
+            AppError::Conflict(m) => {
+                assert!(m.starts_with("image_unavailable: rhaddon/echo did not start on rhx-node2: "), "{m}");
+                assert!(m.contains("https://noo-controller:8443/images/w.tar"), "host, port and path stay: {m}");
+                assert!(!m.contains("SECRETVALUE") && !m.contains("token=") && !m.contains("hunter2"), "scrubbed: {m}");
+                assert!(m.ends_with("nothing is running"), "{m}");
+            }
+            other => panic!("a coded 4xx refusal is a Conflict, got {other:?}"),
+        }
+        assert!(agent_refusal("not a refusal").is_none());
+        assert!(agent_refusal("Bad Code (409): x").is_none(), "a code is lower_snake");
+        assert!(agent_text(&"x ".repeat(400)).chars().count() <= 301);
     }
 
     #[test]
@@ -1411,7 +1626,7 @@ mod tests {
         let rel_entry = crate::test_src::fn_body(&own, "async fn reservation_release(");
         assert!(rel_entry.contains("operator: crate::authz::Operator") && rel_entry.contains("release(state, actor, id, force).await"));
         let rel = crate::test_src::fn_body(&own, "async fn release(");
-        assert!(rel.contains("holder != actor && !force"), "only the holder, or a force");
+        assert!(rel.contains("if !may_release(&holder, &actor, force)"), "only the holder, or a force");
         assert!(rel.find("drain_and_stop(").unwrap() < rel.find("\"release\"").unwrap(), "the workload stops before the lease is released");
         let proxy = crate::test_src::fn_body(&own, "async fn workload_proxy(");
         assert!(proxy.contains("r[\"state\"] == \"held\""), "only a reserved workload is reachable");
@@ -1456,6 +1671,51 @@ mod tests {
                 other => panic!("no row is not yet provisioned (retry), got {other:?}"),
             }
         }
+    }
+
+    /// 0.6.25-rc.1 rehearsal: a reserve one second after `noo cluster
+    /// provision` delivered the leaf met a hard door_leaf_missing from the
+    /// agent's previous heartbeat. The refusal now says the node has not
+    /// reported the leaf yet and to retry after its next heartbeat; other
+    /// reasons keep the plain wording.
+    #[test]
+    fn door_leaf_missing_says_retry_after_the_next_heartbeat() {
+        let rec = json!({"node_workloads": [{"addon": "rhaddon", "name": "echo", "state": "absent", "ready": false, "door_port": 0, "reason": "door_leaf_missing"}]});
+        match node_workload_refusal(&rec, "rhaddon", "echo", "rhx-node2") {
+            Some(AppError::Conflict(m)) => {
+                assert!(m.starts_with("door_leaf_missing: rhx-node2 has not reported rhaddon/echo's door leaf yet"), "{m}");
+                assert!(m.contains("Retry after the node's next heartbeat") && m.contains("noo cluster provision rhx-node2"), "{m}");
+                assert!(m.ends_with("nothing was held"), "{m}");
+            }
+            other => panic!("door_leaf_missing must stay a refusal, got {other:?}"),
+        }
+        let consent = json!({"node_workloads": [{"addon": "rhaddon", "name": "echo", "state": "absent", "ready": false, "door_port": 0, "reason": "consent_unapproved"}]});
+        match node_workload_refusal(&consent, "rhaddon", "echo", "rhx-node2") {
+            Some(AppError::Conflict(m)) => assert!(m.starts_with("consent_unapproved: rhx-node2 cannot run rhaddon/echo (its agent reports consent_unapproved)") && !m.contains("heartbeat"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// image_unavailable and provision_failed name their own remedy and never
+    /// the door-leaf one; a code the gateway does not know keeps the plain
+    /// wording (an agent newer than this gateway).
+    #[test]
+    fn image_unavailable_and_provision_failed_name_their_own_remedy() {
+        let row = |reason: &str| json!({"node_workloads": [{"addon": "rhaddon", "name": "echo", "state": "absent", "ready": false, "door_port": 0, "reason": reason}]});
+        let msg = |reason: &str| match node_workload_refusal(&row(reason), "rhaddon", "echo", "rhx-node2") {
+            Some(AppError::Conflict(m)) => m,
+            other => panic!("{reason} must stay a refusal, got {other:?}"),
+        };
+        let img = msg("image_unavailable");
+        assert!(img.starts_with("image_unavailable: rhx-node2 cannot fetch rhaddon/echo's image from the controller's rail"), "{img}");
+        assert!(img.contains("port 8443") && img.contains("noo cluster verify rhx-node2") && img.ends_with("nothing was held"), "{img}");
+        let prov = msg("provision_failed");
+        assert!(prov.starts_with("provision_failed: rhx-node2 could not provision rhaddon/echo") && prov.contains("noo cluster logs rhx-node2 agent"), "{prov}");
+        for m in [&img, &prov] {
+            assert!(!m.contains("door leaf") && !m.contains("noo cluster provision"), "the door-leaf remedy must not be printed: {m}");
+        }
+        let unknown = msg("some_future_code");
+        assert_eq!(unknown, "some_future_code: rhx-node2 cannot run rhaddon/echo (its agent reports some_future_code); nothing was held");
     }
 
     /// A refused node workload reaches nothing on the node: the link points
@@ -1506,4 +1766,113 @@ mod tests {
         let handover = take.find("drain_and_stop(").expect("the hand-over");
         assert!(pre < hold && pre < handover, "preflight first");
     }
+    // ── CPU workloads hold no GPU (0.6.25-rc.3 rehearsal) ─────────────────
+
+    fn held_row(id: &str, addon: &str, w: &str, node: &str, holder: Option<&str>) -> crate::repo::node_workload_placements::Held {
+        crate::repo::node_workload_placements::Held {
+            addon: addon.into(), workload: w.into(), node_id: node.into(), reservation: id.into(),
+            holder: holder.map(str::to_string), reserved_at: Some("2026-11-15T15:00:00Z".into()),
+        }
+    }
+    fn lease_res(id: &str, workload: &str, node: &str) -> Value {
+        reservation_of(node, &json!({"gpu_contention": {"state": "held", "total_mb": 24576,
+            "lease": {"operation_id": id, "owner": "alice", "workload": workload, "generation": 7, "mode": "drain"}}})).unwrap()
+    }
+
+    #[test]
+    fn only_a_placed_cpu_workload_skips_the_gpu_hold() {
+        let mut d = decl(false, 0);
+        assert!(!takes_gpu_hold(&d, true), "a placed node workload with accel.gpu 0 takes no GPU hold");
+        assert!(takes_gpu_hold(&d, false), "an i163 actuator workload keeps its hold (no row carries its reservation)");
+        d.gpu = true;
+        assert!(takes_gpu_hold(&d, true) && takes_gpu_hold(&d, false), "every GPU workload holds, as before");
+    }
+
+    #[test]
+    fn a_cpu_reservation_is_listed_from_its_row_as_held_with_no_gpu() {
+        let out = merge_reservations(vec![], &[held_row("r-cpu", "rhaddon", "echo", "rhx-node2", Some("alice"))]);
+        assert_eq!(out.len(), 1);
+        let r = &out[0];
+        assert_eq!((r["id"].as_str(), r["workload"].as_str(), r["holder"].as_str(), r["node"].as_str(), r["state"].as_str()),
+            (Some("r-cpu"), Some("rhaddon/echo"), Some("alice"), Some("rhx-node2"), Some("held")));
+        assert_eq!((r["gpu"].as_bool(), r["source"].as_str(), r["generation"].as_u64()), (Some(false), Some("placement"), Some(0)));
+        let lease = lease_res("r-gpu", "rhaddon/rhworker", "awolf");
+        assert_eq!((lease["gpu"].as_bool(), lease["source"].as_str()), (Some(true), Some("lease")));
+    }
+
+    #[test]
+    fn the_merged_list_never_reports_one_reservation_twice() {
+        // A GPU workload: its lease AND its row carry the same id: once.
+        let gpu = merge_reservations(vec![lease_res("r1", "rhaddon/rhworker", "awolf")],
+            &[held_row("r1", "rhaddon", "rhworker", "awolf", Some("alice"))]);
+        assert_eq!(gpu.len(), 1);
+        assert_eq!(gpu[0]["source"], "lease");
+        // The same, with the row as a pre-124 gateway left it (holder and
+        // reserved_at NULL): still the lease's, listed once, with its owner.
+        let old = merge_reservations(vec![lease_res("r1", "rhaddon/rhworker", "awolf")],
+            &[crate::repo::node_workload_placements::Held { reserved_at: None, ..held_row("r1", "rhaddon", "rhworker", "awolf", None) }]);
+        assert_eq!(old.len(), 1, "{old:?}");
+        assert_eq!((old[0]["source"].as_str(), old[0]["holder"].as_str(), old[0]["gpu"].as_bool()), (Some("lease"), Some("alice"), Some(true)));
+        // gpu-0 -> GPU on one node: the old CPU row (r-a, no lease) and the new
+        // GPU lease r-b with its own row.
+        let ab = merge_reservations(vec![lease_res("r-b", "rhaddon/gpuw", "n1")],
+            &[held_row("r-a", "rhaddon", "echo", "n1", Some("alice")), held_row("r-b", "rhaddon", "gpuw", "n1", Some("alice"))]);
+        let mut ids: Vec<&str> = ab.iter().filter_map(|r| r["id"].as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, ["r-a", "r-b"], "{ab:?}");
+        // GPU -> gpu-0, the other order: the lease r-a with its row, and the CPU row r-b.
+        let ba = merge_reservations(vec![lease_res("r-a", "rhaddon/gpuw", "n1")],
+            &[held_row("r-a", "rhaddon", "gpuw", "n1", Some("alice")), held_row("r-b", "rhaddon", "echo", "n1", Some("alice"))]);
+        let mut ids: Vec<&str> = ba.iter().filter_map(|r| r["id"].as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, ["r-a", "r-b"], "{ba:?}");
+    }
+
+    #[test]
+    fn the_holder_rule_is_the_same_for_a_cpu_reservation() {
+        assert!(may_release("alice", "alice", false), "the holder releases");
+        assert!(!may_release("alice", "bob", false), "another account cannot, without force");
+        assert!(may_release("alice", "bob", true), "force does (audited)");
+        assert!(!may_release("", "bob", false), "a row with no holder recorded (a 0.6.24 row) needs force");
+        // The holder is the credential's subject: the take passes the same
+        // `actor` to the lease owner and to set_running, and the operator route
+        // takes it from Operator::sub(); nothing in this file reads a view-as
+        // header, so View-as cannot widen whose reservation it is.
+        let own = crate::test_src::own_code(include_str!("reservations.rs"));
+        let take = crate::test_src::fn_body(&own, "async fn take(");
+        assert!(take.contains("set_running(&state.db, &node, &addon, &name, &id, &actor)"), "the row's holder is the caller");
+        assert!(take.contains("\"owner\": actor"), "the lease's owner is the same caller");
+        let route = crate::test_src::fn_body(&own, "async fn reservation_take(");
+        assert!(route.contains("operator.sub()"), "the operator's credential, not a header");
+        assert!(!own.to_lowercase().contains("view_as") && !own.to_lowercase().contains("view-as"), "no view-as lens in the reservation routes");
+    }
+
+    #[test]
+    fn a_lost_take_names_the_holder_never_an_internal() {
+        let h = held_row("r-1", "rhaddon", "echo", "n1", Some("alice"));
+        assert_eq!(already_reserved("rhaddon/echo", Some(&h)), "rhaddon/echo is already reserved by alice (reservation r-1); release that reservation first");
+        let old = held_row("r-1", "rhaddon", "echo", "n1", None);
+        assert!(already_reserved("rhaddon/echo", Some(&old)).contains("an earlier gateway (no holder recorded)"));
+        assert!(already_reserved("rhaddon/echo", None).starts_with("rhaddon/echo is already reserved"));
+        let own = crate::test_src::own_code(include_str!("reservations.rs"));
+        let take = crate::test_src::fn_body(&own, "async fn take(");
+        let lost = take.split("Ok(false) => \u{7b}").nth(1).expect("the lost-take arm");
+        // The arm ends where the unwritable-row arm begins (the lost arm has
+        // an Err(e) of its own, for an unreadable holder list).
+        let lost = &lost[..lost.find("release_hold(\"placement_unwritable\")").expect("arm end")];
+        assert!(lost.contains("tracing::warn!") && !lost.contains(".ok()"), "an unreadable holder list is logged, not read as none");
+        assert!(lost.contains("AppError::Conflict(already_reserved(") && !lost.contains("AppError::Internal"), "a lost take is a 409 naming the holder");
+    }
+
+    #[test]
+    fn the_gpu_path_still_takes_and_releases_its_hold() {
+        let own = crate::test_src::own_code(include_str!("reservations.rs"));
+        let take = crate::test_src::fn_body(&own, "async fn take(");
+        let gate = take.find("let (lease, generation, hold) = if holds_gpu \u{7b}").expect("one gate");
+        let hold = take.find("\"hold\",").expect("the hold op");
+        assert!(gate < hold, "the hold is taken inside the holds_gpu branch");
+        let rel = crate::test_src::fn_body(&own, "async fn release(");
+        assert!(rel.contains("if r[\"source\"] == \"placement\" \u{7b}") && rel.contains("\"release\","), "only a row-held reservation skips the GPU release");
+    }
+
 }

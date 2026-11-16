@@ -745,7 +745,18 @@ async def _init_python_services(messaging) -> None:
         try:
             from ..memory.conversation_store import ConversationStore
             if dsn:
-                cs = ConversationStore(dsn=dsn)
+                # The engine is built HERE, sized by POOL_BUDGET (i815):
+                # handed only the DSN, trellion opens SQLAlchemy's default
+                # 5 + 10. Same DSN conversion trellion applies itself.
+                from trellion.db.engine import _async_dsn as _trellion_async_dsn
+                from ..db.pool_budget import budgeted_async_engine
+                cs = ConversationStore(
+                    async_engine=budgeted_async_engine(
+                        "conversation_store",
+                        _trellion_async_dsn(dsn),
+                        pool_pre_ping=True,
+                    )
+                )
                 services.conversation_store = cs
                 log.info("worker.conversation_store_initialized")
         except Exception as e:
@@ -781,6 +792,9 @@ async def _init_python_services(messaging) -> None:
             llm_model = llm_purposes.KNOWLEDGE
 
             if dsn:
+                # PageIndexRAG.startup builds its PageIndexStore from the DSN
+                # (SQLAlchemy default 5 + 10); POOL_BUDGET["pageindex_store"]
+                # applies once trellion accepts an engine (i815, trellion PR).
                 rag = PageIndexRAG(
                     dsn=dsn,
                     embedding_url=embedding_url,

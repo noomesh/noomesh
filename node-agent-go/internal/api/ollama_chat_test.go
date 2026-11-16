@@ -467,3 +467,97 @@ func TestThinkingOffSurvivesTheAllowlistIntoTheOllamaBody(t *testing.T) {
 		}
 	}
 }
+
+// i764: the thinking hint (chat_template_kwargs.enable_thinking) is the
+// AUTHORITATIVE signal a node gets for "think on this turn", so a model that
+// can think still thinks; a model that cannot is answered once more without
+// `think` instead of failing.
+func TestOllamaThinkingHintThinksWhereItCanAndIsDroppedWhereItCannot(t *testing.T) {
+	type seen struct {
+		model string
+		think any
+	}
+	var got []seen
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var in map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		got = append(got, seen{model: fmt.Sprint(in["model"]), think: in["think"]})
+		if th, _ := in["think"].(bool); th && in["model"] != "gemma4:e2b" {
+			w.WriteHeader(400)
+			fmt.Fprintf(w, `{"error":"%q does not support thinking"}`, in["model"])
+			return
+		}
+		if in["model"] == "broken" {
+			w.WriteHeader(500)
+			fmt.Fprint(w, `{"error":"model runner crashed"}`)
+			return
+		}
+		if in["stream"] == true {
+			fmt.Fprint(w, `{"message":{"role":"assistant","content":"ok"},"done":false}`+"\n")
+			fmt.Fprint(w, `{"message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","prompt_eval_count":1,"eval_count":1}`+"\n")
+			return
+		}
+		fmt.Fprint(w, `{"message":{"role":"assistant","content":"ok"},"done":true,"done_reason":"stop","prompt_eval_count":1,"eval_count":1}`)
+	}))
+	defer mock.Close()
+	s := &Server{}
+	call := func(body string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		s.proxyOllamaChat(rec, req, []byte(body), mock.URL, "http", 5*time.Second)
+		return rec
+	}
+	ask := func(model string, stream bool) string {
+		return fmt.Sprintf(`{"model":%q,"stream":%v,"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":true}}`, model, stream)
+	}
+
+	// A model that can think: think:true reaches it, once, and it answers.
+	got = nil
+	if rec := call(ask("gemma4:e2b", false)); rec.Code != 200 {
+		t.Fatalf("gemma4: %d %s", rec.Code, rec.Body)
+	}
+	if len(got) != 1 || got[0].think != true {
+		t.Fatalf("a thinking-capable model must get think:true on a turn that asks for it, once: %+v", got)
+	}
+
+	// A model that cannot: refused with think, answered without it.
+	for _, stream := range []bool{false, true} {
+		got = nil
+		rec := call(ask("qwen2.5:0.5b", stream))
+		if rec.Code != 200 || !strings.Contains(rec.Body.String(), "ok") {
+			t.Fatalf("qwen stream=%v: %d %s", stream, rec.Code, rec.Body)
+		}
+		if len(got) != 2 || got[0].think != true || got[1].think != nil {
+			t.Fatalf("stream=%v: want think:true then no think, got %+v", stream, got)
+		}
+	}
+
+	// Any other error is the caller's to see, unretried.
+	got = nil
+	rec := call(`{"model":"broken","messages":[{"role":"user","content":"hi"}]}`)
+	if rec.Code != 500 || !strings.Contains(rec.Body.String(), "model runner crashed") || len(got) != 1 {
+		t.Fatalf("another error must pass through once: %d %s %+v", rec.Code, rec.Body, got)
+	}
+}
+
+func TestWithoutThinkOnlyOnThatRefusalAndOnlyWhenThinkWasAsked(t *testing.T) {
+	refusal := `"qwen2.5:0.5b" does not support thinking`
+	b, ok := withoutThinkOnRefusal(400, refusal, []byte(`{"model":"qwen2.5:0.5b","think":true,"stream":true}`))
+	if !ok || strings.Contains(string(b), "think") || !strings.Contains(string(b), `"stream":true`) {
+		t.Fatalf("think must go, the rest stay: %s %v", b, ok)
+	}
+	for name, c := range map[string]struct {
+		status int
+		msg    string
+		body   string
+	}{
+		"another status":     {500, refusal, `{"think":true}`},
+		"another refusal":    {400, "model 'x' not found", `{"think":true}`},
+		"think was false":    {400, refusal, `{"think":false}`},
+		"think was not sent": {400, refusal, `{"model":"x"}`},
+	} {
+		if _, ok := withoutThinkOnRefusal(c.status, c.msg, []byte(c.body)); ok {
+			t.Errorf("%s: retried", name)
+		}
+	}
+}

@@ -105,6 +105,94 @@ pub async fn remove_member(db: &sqlx::PgPool, role: &str) -> Result<(), sqlx::Er
         .map(|_| ())
 }
 
+/// The `search_path` value a member gets: the defaults first, the view's
+/// schema LAST, so nothing in `mesh` can shadow an add-on's own or `public`
+/// names. On the legacy layout the view is in `public` and the value is the
+/// server default (`"$user", public`).
+pub fn search_path_value(schema: &str) -> String {
+    if schema == "public" {
+        "\"$user\", public".to_string()
+    } else {
+        format!("\"$user\", public, {}", quote_ident(schema))
+    }
+}
+
+/// Put the view's `schema` on `role`'s search_path in THIS database
+/// (`ALTER ROLE .. IN DATABASE .. SET`), so the documented unqualified
+/// `SELECT .. FROM noo_addon_caller_keys` resolves on the add-on's own
+/// connections. Per member, never on [`GROUP`]: a role setting applies to the
+/// role that LOGS IN and is not inherited through membership. Takes effect on
+/// the role's next login; open sessions keep their path. Idempotent.
+pub async fn set_search_path(db: &sqlx::PgPool, role: &str, schema: &str) -> Result<(), sqlx::Error> {
+    let database: String = sqlx::query_scalar("SELECT current_database()::text").fetch_one(db).await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER ROLE {} IN DATABASE {} SET search_path = {}",
+        quote_ident(role),
+        quote_ident(&database),
+        search_path_value(schema)
+    )))
+    .execute(db)
+    .await
+    .map(|_| ())
+}
+
+/// Undo [`set_search_path`]: drop `role`'s search_path setting in THIS
+/// database. A role-wide setting (no `IN DATABASE`) is not the broker's and is
+/// left alone. Idempotent.
+pub async fn reset_search_path(db: &sqlx::PgPool, role: &str) -> Result<(), sqlx::Error> {
+    let database: String = sqlx::query_scalar("SELECT current_database()::text").fetch_one(db).await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER ROLE {} IN DATABASE {} RESET search_path",
+        quote_ident(role),
+        quote_ident(&database)
+    )))
+    .execute(db)
+    .await
+    .map(|_| ())
+}
+
+/// Test probe, on a connection that LOGGED IN as an add-on role: the
+/// documented, unqualified caller read (`noo_addon_caller_keys` resolved
+/// through that login's search_path).
+#[cfg(test)]
+pub async fn probe_read_view_unqualified(conn: &mut sqlx::PgConnection, key_hash: &str) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, String>("SELECT consumer FROM noo_addon_caller_keys WHERE key_hash = $1")
+        .bind(key_hash)
+        .fetch_all(&mut *conn)
+        .await
+}
+
+/// Test probe: the schemas this login's search_path resolves to.
+#[cfg(test)]
+pub async fn probe_current_schemas(conn: &mut sqlx::PgConnection) -> Vec<String> {
+    sqlx::query_scalar("SELECT current_schemas(false)::text[]").fetch_one(&mut *conn).await.expect("current_schemas")
+}
+
+/// Test probe: read `noo_service_keys` in `schema` directly (must be refused
+/// for an add-on role: it may read the view only).
+#[cfg(test)]
+pub async fn probe_read_service_keys(conn: &mut sqlx::PgConnection, schema: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(sqlx::AssertSqlSafe(format!("SELECT 1 FROM {}.noo_service_keys", quote_ident(schema))))
+        .fetch_all(&mut *conn)
+        .await
+        .map(|_| ())
+}
+
+/// Test probe: `role`'s settings in THIS database, as stored
+/// (`pg_db_role_setting.setconfig`, e.g. `search_path="$user", public, mesh`).
+#[cfg(test)]
+pub async fn db_role_settings(db: &sqlx::PgPool, role: &str) -> Vec<String> {
+    sqlx::query_scalar::<_, Vec<String>>(
+        "SELECT s.setconfig::text[] FROM pg_db_role_setting s JOIN pg_roles r ON r.oid = s.setrole \
+         JOIN pg_database d ON d.oid = s.setdatabase WHERE r.rolname = $1 AND d.datname = current_database()",
+    )
+    .bind(role)
+    .fetch_optional(db)
+    .await
+    .expect("pg_db_role_setting")
+    .unwrap_or_default()
+}
+
 /// Test probe: can `role` read the view in `schema`? The catalogue's answer,
 /// and the rows (or the error) of an actual SELECT made AS that role on one
 /// connection (SET ROLE is connection state).

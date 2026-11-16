@@ -4,20 +4,18 @@
 //! Redis-backed caching and rate limiting.
 //!
 //! Key patterns (Rust-owned — the Python workers do NOT read or write
-//! `noo:cache:*` / `noo:session:*` / `noo:rate:*`; the only Redis namespace
+//! `noo:session:*` / `noo:rate:*`; the only Redis namespace
 //! genuinely shared with Python is the per-consumer quota bucket
 //! `noo:cq:{consumer}`, which `mcp/hub.py` uses with the same fixed-window
 //! semantics as `check_consumer_quota` below):
 //!   noo:rate:{ip}                    — request count (TTL: 60s)
 //!   noo:cq:{consumer}                — per-consumer quota (TTL: 60s; shared with Python MCP hub)
-//!   noo:cache:{hash}                 — LLM response cache (TTL: configurable)
 //!   noo:session:{id}                 — session state snapshot (TTL: 1h)
 //!   noo:security:violations:{type}   — security violation counters (TTL: 24h)
 
 use anyhow::Result;
 use fred::prelude::*;
 use serde_json::Value;
-use sha2::{Sha256, Digest};
 use std::time::Duration;
 
 // Rate limiting defaults
@@ -28,8 +26,8 @@ const RATE_WINDOW_SECS: i64 = 60;
 const VIOLATION_TTL_SECS: i64 = 24 * 60 * 60;
 const RATE_MAX_REQUESTS: i64 = 600;  // per minute per IP
 
-// Cache TTL defaults
-const LLM_CACHE_TTL: Duration = Duration::from_secs(300);  // 5 min
+// Cache TTL defaults. There is no answer cache (`noo:cache:*`, retired in
+// 0.6.25): a coordinator answer is never a function of its words alone.
 const SESSION_CACHE_TTL: Duration = Duration::from_secs(3600);  // 1 hour
 
 /// Redis connection wrapper with helper methods.
@@ -423,55 +421,6 @@ impl RedisCache {
         }
     }
 
-    // ── LLM Response Cache ───────────────────────────────────
-
-    /// Build a cache key from model + messages + WHO is asking.
-    ///
-    /// The caller is part of the key because the answer is not a function of
-    /// the prompt alone: the coordinator builds it from the caller's own
-    /// conversation memory and from knowledge-base evidence filtered to the
-    /// caller's audience. Keyed by prompt only, two people
-    /// who typed the same words inside the TTL shared one answer, so the
-    /// second got a reply composed from the first one's private documents.
-    ///
-    /// `caller` is the ACCOUNT (a connection `alice/laptop` and `alice` are the same
-    /// person and share an entry); `None` is a machine caller that carries no
-    /// user identity, which has its own bucket and never shares with a person.
-    pub fn llm_cache_key(model: &str, messages: &[Value], caller: Option<&str>) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(model.as_bytes());
-        hasher.update(b"\0");
-        // `\0` cannot occur in an account name, so ("ab","c") and ("a","bc")
-        // never collide, and None cannot collide with Some("").
-        match caller {
-            Some(c) => {
-                hasher.update(b"user:");
-                hasher.update(crate::auth::account_of(c).as_bytes());
-            }
-            None => hasher.update(b"machine"),
-        }
-        hasher.update(b"\0");
-        hasher.update(serde_json::to_string(messages).unwrap_or_default().as_bytes());
-        let hash = hex::encode(hasher.finalize());
-        format!("noo:cache:{hash}")
-    }
-
-    /// Get a cached LLM response.
-    pub async fn get_llm_cache(&self, key: &str) -> Option<Value> {
-        let data: Option<String> = self.client.get::<Option<String>, _>(key).await.ok()?;
-        data.and_then(|s: String| serde_json::from_str(&s).ok())
-    }
-
-    /// Cache an LLM response.
-    pub async fn set_llm_cache(&self, key: &str, response: &Value, ttl: Option<Duration>) {
-        let ttl = ttl.unwrap_or(LLM_CACHE_TTL);
-        if let Ok(data) = serde_json::to_string(response) {
-            let _: Result<(), _> = self.client
-                .set(key, data, Some(Expiration::EX(ttl.as_secs() as i64)), None, false)
-                .await;
-        }
-    }
-
     // ── Session Cache ────────────────────────────────────────
 
     /// Cache session state for fast lookup.
@@ -801,34 +750,45 @@ pub enum RateResult {
     Limited { retry_after: i64 },
 }
 
+/// The answer cache is retired: no coordinator turn reads or writes one
+/// (a cached answer skipped the scoped retrieval and the permission checks,
+/// so it served a wider answer under a narrowed View-as or after a demotion).
 #[cfg(test)]
-mod llm_cache_key_tests {
-    use super::RedisCache;
-    use serde_json::json;
-
-    fn key(caller: Option<&str>) -> String {
-        RedisCache::llm_cache_key("auto", &[json!({"role": "user", "content": "what did we decide?"})], caller)
-    }
-
-    /// the same words from two people must not share an entry,
-    /// or the second gets an answer composed from the first one's documents.
-    #[test]
-    fn two_people_asking_the_same_thing_do_not_share_a_cache_entry() {
-        assert_ne!(key(Some("a")), key(Some("b")));
-        assert_eq!(key(Some("a")), key(Some("a")));
+mod no_answer_cache {
+    /// Built from pieces so this file holds none of the needles itself.
+    fn needles() -> Vec<String> {
+        vec![
+            ["get", "_llm", "_cache"].concat(),
+            ["set", "_llm", "_cache"].concat(),
+            ["llm", "_cache", "_key"].concat(),
+            ["\"noo:", "cache:"].concat(),
+            ["noo:", "cache:{"].concat(),
+        ]
     }
 
     #[test]
-    fn a_connection_and_its_account_are_one_person() {
-        assert_eq!(key(Some("a/laptop")), key(Some("a")));
-        assert_ne!(key(Some("a/laptop")), key(Some("b/laptop")));
+    fn no_coordinator_route_reads_or_writes_an_answer_cache() {
+        for (file, src) in [
+            ("ws_coordinator.rs", include_str!("ws_coordinator.rs")),
+            ("routes/inference.rs", include_str!("routes/inference.rs")),
+            ("cache.rs", include_str!("cache.rs")),
+        ] {
+            for n in needles() {
+                assert!(!src.contains(&n), "{file} has an answer cache again ({n})");
+            }
+        }
     }
 
+    /// The turn always runs: each route reaches the coordinator with no early
+    /// `cached` reply before it.
     #[test]
-    fn a_machine_caller_has_its_own_bucket_and_never_shares_with_a_person() {
-        assert_ne!(key(None), key(Some("a")));
-        assert_ne!(key(None), key(Some("")));
-        assert_ne!(key(None), key(Some("machine")));
+    fn every_turn_runs_the_coordinator() {
+        let ws = include_str!("ws_coordinator.rs");
+        let inf = include_str!("routes/inference.rs");
+        let cached = ["\"cached\"", ": true"].concat();
+        assert!(!ws.contains(&cached) && !inf.contains(&cached), "a route answers `cached: true` again");
+        assert!(ws.contains("coordinator::run_streaming("));
+        assert!(inf.contains("coordinator::run_with_thinking("));
     }
 }
 

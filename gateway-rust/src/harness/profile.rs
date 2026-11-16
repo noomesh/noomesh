@@ -164,6 +164,48 @@ pub fn model_context_of(placement: &Value) -> Option<u64> {
     placement.get("model_context").and_then(Value::as_u64).filter(|n| *n > 0)
 }
 
+/// The node agent's decided context per Ollama chat model (its
+/// `/harness/placement` `chat_contexts`, from desired-config; i802), keyed
+/// as [`context_key`] spells a name. `None` when the agent sent none (an
+/// older agent, nothing decided).
+pub fn chat_contexts_of(placement: &Value) -> Option<std::collections::HashMap<String, u64>> {
+    let m = placement.get("chat_contexts")?.as_object()?;
+    let out: std::collections::HashMap<String, u64> =
+        m.iter().filter_map(|(k, v)| Some((context_key(k)?, v.as_u64().filter(|n| *n > 0)?))).collect();
+    (!out.is_empty()).then_some(out)
+}
+
+/// The one spelling of an Ollama model name in the decided-context table,
+/// the agent's `chatContextKey`: a bare tag is `:latest`. `None` for blank.
+pub fn context_key(model: &str) -> Option<String> {
+    let m = model.trim();
+    if m.is_empty() {
+        return None;
+    }
+    let tag = m.rsplit('/').next().unwrap_or(m);
+    Some(if tag.contains(':') { m.to_string() } else { format!("{m}:latest") })
+}
+
+static CHAT_CONTEXTS: std::sync::RwLock<Option<std::collections::HashMap<String, u64>>> = std::sync::RwLock::new(None);
+
+/// Install the table this harness process fits its turns to (set at
+/// startup and on the minute re-read of the placement). Returns whether it
+/// changed.
+pub fn set_chat_contexts(table: Option<std::collections::HashMap<String, u64>>) -> bool {
+    let mut held = CHAT_CONTEXTS.write().unwrap_or_else(|p| p.into_inner());
+    let changed = *held != table;
+    *held = table;
+    changed
+}
+
+/// The decided context for `model` on this node, as the agent stamps it on
+/// that model's calls: the node harness's loop fits a turn to it, so a task
+/// here runs in the same window as a console turn on the same model.
+pub fn chat_context_for(model: &str) -> Option<u64> {
+    let key = context_key(model)?;
+    CHAT_CONTEXTS.read().unwrap_or_else(|p| p.into_inner()).as_ref().and_then(|t| t.get(&key).copied())
+}
+
 /// The window a CLI with a `launch.context_window_env` is told, and where it
 /// came from: an explicit value (the probe's `--context-tokens`), else the
 /// node agent's `model_context`, else `None`: the variable stays unset and
@@ -180,6 +222,22 @@ pub fn resolve_context_window(explicit: Option<u64>, agent: Option<u64>) -> (Opt
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The agent's table, read as the agent keys it (a bare tag is
+    /// `:latest`); zero, negative and non-numbers dropped; no key or an
+    /// empty table is "none decided".
+    #[test]
+    fn the_decided_contexts_read_off_the_placement() {
+        let t = chat_contexts_of(&json!({"chat_contexts": {"gemma4:e2b": 32768, "qwen3": 8192, "bad": 0, "worse": "x"}})).unwrap();
+        assert_eq!(t.len(), 2);
+        assert_eq!(t.get("gemma4:e2b"), Some(&32768));
+        assert_eq!(t.get("qwen3:latest"), Some(&8192));
+        assert_eq!(chat_contexts_of(&json!({"placed": true})), None);
+        assert_eq!(chat_contexts_of(&json!({"chat_contexts": {}})), None);
+        assert_eq!(context_key("library/qwen3"), Some("library/qwen3:latest".into()));
+        assert_eq!(context_key("hf.co/org/m:Q4"), Some("hf.co/org/m:Q4".into()));
+        assert_eq!(context_key("  "), None);
+    }
 
     #[test]
     fn the_model_context_is_the_agents_and_a_flag_beats_it() {

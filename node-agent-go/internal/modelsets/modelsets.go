@@ -127,6 +127,12 @@ type Row struct {
 	RetryAt    string `json:"retry_at,omitempty"` // RFC 3339, UTC
 	FreeBytes  *int64 `json:"free_bytes,omitempty"`
 	NeedBytes  *int64 `json:"need_bytes,omitempty"`
+	// LinkSourceFor is set on a verified revision that is not wanted any more
+	// but is kept because it is the link source of the named revision of the
+	// same set, which has not verified yet (F10). Prune removes it the first
+	// tick after that revision verifies; a revision that never verifies keeps
+	// it held, and this field says so.
+	LinkSourceFor string `json:"link_source_for,omitempty"`
 }
 
 // Refusal is a fetch that must not be retried blindly: the set did not check
@@ -221,10 +227,16 @@ type Store struct {
 	Free func(path string) (uint64, error)
 	// Now is the clock.
 	Now func() time.Time
+	// Link makes a hard link (nil = os.Link). A seam for the fall-back tests:
+	// EXDEV across filesystems, EPERM under fs.protected_hardlinks.
+	Link func(oldname, newname string) error
 
-	mu      sync.Mutex
-	mem     map[Ref]memState
-	want    map[Ref]bool
+	mu   sync.Mutex
+	mem  map[Ref]memState
+	want map[Ref]bool
+	// held is what the last Prune kept as a link source: sibling -> the
+	// wanted, not yet verified revision of the same set it is kept for.
+	held    map[Ref]Ref
 	armed   bool
 	running bool
 	wg      sync.WaitGroup
@@ -484,6 +496,10 @@ func (s *Store) fetch(ctx context.Context, ref Ref) error {
 	if err := noSymlinks(dir); err != nil {
 		return refuse(nodewl.ReasonSetUnverified, "%v", err)
 	}
+	// 4b. Reuse: a file another verified revision of this set already holds
+	// (same sha256, same size) is hard-linked in, before the disk check, so it
+	// costs neither bytes nor a download. Step 5 still re-hashes it.
+	s.linkFromSiblings(ref, set, dests)
 	if err := s.checkDisk(set, dir); err != nil {
 		return err
 	}
@@ -724,8 +740,13 @@ func noSymlinks(dir string) error {
 	})
 }
 
-// makeWritable reopens a sealed tree so a re-fetch can write into it. It
-// never follows a symlink.
+// makeWritable reopens the DIRECTORIES of a sealed tree so a re-fetch can
+// create, rename and remove entries in it (and Prune can remove it). It never
+// touches a file: a file may be a hard link shared with a sibling revision
+// (F10), and chmod on it would unseal the sibling's copy too. Nothing in this
+// package writes into an existing file (every write is a temp name renamed
+// over the destination), so a 0444 file never needs reopening. It never
+// follows a symlink.
 func makeWritable(dir string) error {
 	return filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -734,14 +755,10 @@ func makeWritable(dir string) error {
 			}
 			return err
 		}
-		switch {
-		case d.Type()&fs.ModeSymlink != 0:
-			return nil
-		case d.IsDir():
+		if d.IsDir() {
 			return os.Chmod(p, 0o755)
-		default:
-			return os.Chmod(p, 0o644)
 		}
+		return nil
 	})
 }
 
@@ -810,6 +827,184 @@ func sealDirs(dir string) error {
 		}
 	}
 	return nil
+}
+
+// ---- reuse across revisions (F10) ---------------------------------------
+
+// linkTmpSuffix names the temporary hard link a reused file is made under
+// before it is renamed to its destination. "~" is outside the set-path
+// charset (nodewl.ValidSetPath), so it can never be a manifest file; a crash
+// between link and rename leaves a stray that removeStrays deletes before
+// the set is sealed.
+const linkTmpSuffix = ".link~"
+
+// linkSrc is one file of a verified sibling revision, by its manifest row.
+type linkSrc struct {
+	from  Ref
+	dir   string // the sibling's revision directory
+	path  string // the file, inside dir
+	bytes int64
+}
+
+func (s *Store) link(oldname, newname string) error {
+	if s.Link != nil {
+		return s.Link(oldname, newname)
+	}
+	return os.Link(oldname, newname)
+}
+
+// verifiedSiblings is every other revision of set id that is verified on this
+// disk (marker, manifest and files, the diskStatus check), newest marker
+// first. It skips a revision being fetched and the controller's own staged
+// copy, which the node never touches.
+func (s *Store) verifiedSiblings(id, exclude string) []Ref {
+	ents, err := os.ReadDir(filepath.Join(s.Root, id))
+	if err != nil {
+		return nil
+	}
+	type cand struct {
+		ref Ref
+		at  time.Time
+	}
+	var cs []cand
+	for _, e := range ents {
+		ref := Ref{id, e.Name()}
+		if !e.IsDir() || ref.Revision == exclude || !nodewl.ValidSetRef(ref.ID, ref.Revision) {
+			continue
+		}
+		dir := s.dir(ref)
+		if _, err := os.Lstat(filepath.Join(dir, railSigName)); err == nil {
+			continue
+		}
+		s.mu.Lock()
+		ok := s.mem[ref].state != StateFetching && s.diskStatusLocked(ref).State == StateVerified
+		s.mu.Unlock()
+		if !ok {
+			continue
+		}
+		fi, err := os.Lstat(filepath.Join(dir, MarkerName))
+		if err != nil {
+			continue
+		}
+		cs = append(cs, cand{ref, fi.ModTime()})
+	}
+	sort.Slice(cs, func(i, j int) bool {
+		if !cs[i].at.Equal(cs[j].at) {
+			return cs[i].at.After(cs[j].at)
+		}
+		return cs[i].ref.Revision > cs[j].ref.Revision
+	})
+	out := make([]Ref, len(cs))
+	for i, c := range cs {
+		out[i] = c.ref
+	}
+	return out
+}
+
+// siblingIndex adds the files of one verified sibling to idx (sha256 -> the
+// sibling's file), first writer wins. A manifest path that does not stay
+// inside the sibling's directory (setFileDest) is left out.
+func siblingIndex(idx map[string]linkSrc, sib Ref, sibDir string, set *nodewl.ModelSet) {
+	for _, f := range set.Files {
+		if _, ok := idx[f.SHA256]; ok {
+			continue
+		}
+		src, err := setFileDest(sibDir, f.Path)
+		if err != nil {
+			continue
+		}
+		idx[f.SHA256] = linkSrc{from: sib, dir: sibDir, path: src, bytes: f.Bytes}
+	}
+}
+
+// linkFromSiblings hard-links every wanted file that is not on disk yet from a
+// verified sibling revision holding the same sha256 and size. It never fails
+// the fetch: a file it cannot link is simply downloaded by step 5, which also
+// re-hashes every linked file (the sibling's marker is not trusted for the
+// bytes; a mismatch is replaced by a temp-and-rename download, so the sibling
+// is never written).
+func (s *Store) linkFromSiblings(ref Ref, set *nodewl.ModelSet, dests []string) {
+	sibs := s.verifiedSiblings(ref.ID, ref.Revision)
+	if len(sibs) == 0 {
+		return
+	}
+	idx := map[string]linkSrc{}
+	for _, sib := range sibs {
+		m, err := s.VerifiedManifest(sib)
+		if err != nil {
+			continue
+		}
+		siblingIndex(idx, sib, s.dir(sib), &m)
+	}
+	var files int
+	var bytes int64
+	for i, f := range set.Files {
+		dest := dests[i]
+		if _, err := os.Lstat(dest); err == nil {
+			continue // present: step 5 judges it
+		}
+		src, ok := idx[f.SHA256]
+		if !ok {
+			continue
+		}
+		if why := s.linkOne(src, dest, f); why != "" {
+			slog.Info("model set file not linked from a verified revision; fetching it", "set", ref.String(),
+				"file", f.Path, "from", src.from.String(), "reason", why)
+			if strings.HasPrefix(why, "link: ") {
+				break // the filesystem refuses links: the rest would fail alike
+			}
+			continue
+		}
+		files++
+		bytes += f.Bytes
+	}
+	if files > 0 {
+		slog.Info("model set files linked from a verified revision", "set", ref.String(), "files", files, "bytes", bytes)
+	}
+}
+
+// linkOne links src to dest through a temporary name in dest's directory and
+// returns "" on success, else why not. The source must be a regular file
+// (Lstat: a symlink is never followed), with no symlink on its path from Root,
+// inside its revision directory, and of the wanted size by its manifest row
+// and on disk.
+func (s *Store) linkOne(src linkSrc, dest string, want nodewl.File) string {
+	if src.bytes != want.Bytes {
+		return "size differs between the manifests"
+	}
+	if !within(src.dir, src.path) {
+		return "source leaves its revision directory"
+	}
+	if err := noSymlinkPath(s.Root, src.path); err != nil {
+		return "source path: " + err.Error()
+	}
+	fi, err := os.Lstat(src.path)
+	if err != nil {
+		return "source: " + err.Error()
+	}
+	if !fi.Mode().IsRegular() {
+		return "source is not a regular file"
+	}
+	if fi.Size() != want.Bytes {
+		return "source size on disk differs"
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return "create " + filepath.Dir(dest) + ": " + err.Error()
+	}
+	tmp := dest + linkTmpSuffix
+	if _, err := os.Lstat(tmp); err == nil {
+		if err := os.Remove(tmp); err != nil {
+			return "remove stale " + tmp + ": " + err.Error()
+		}
+	}
+	if err := s.link(src.path, tmp); err != nil {
+		return "link: " + err.Error()
+	}
+	if err := os.Rename(tmp, dest); err != nil {
+		_ = os.Remove(tmp)
+		return "rename: " + err.Error()
+	}
+	return ""
 }
 
 // ---- state --------------------------------------------------------------
@@ -932,7 +1127,11 @@ func (s *Store) Rows() (rows []Row, ok bool) {
 			}
 			st.State = StateFetching // wanted, queued or between retries
 		}
-		rows = append(rows, s.rowLocked(r, st))
+		row := s.rowLocked(r, st)
+		if w, ok := s.held[r]; ok && st.State == StateVerified {
+			row.LinkSourceFor = w.Revision
+		}
+		rows = append(rows, row)
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		if rows[i].ID != rows[j].ID {
@@ -1088,6 +1287,13 @@ func (s *Store) Prune(keep map[Ref]bool) ([]Ref, error) {
 	if err != nil {
 		return nil, err
 	}
+	s.noteHolds(s.linkHolds(keep))
+	s.mu.Lock()
+	holds := make(map[Ref]Ref, len(s.held))
+	for k, v := range s.held {
+		holds[k] = v
+	}
+	s.mu.Unlock()
 	var removed []Ref
 	for _, id := range ids {
 		idDir := filepath.Join(s.Root, id.Name())
@@ -1102,6 +1308,9 @@ func (s *Store) Prune(keep map[Ref]bool) ([]Ref, error) {
 			ref := Ref{id.Name(), rev.Name()}
 			if !nodewl.ValidSetRef(ref.ID, ref.Revision) || keep[ref] {
 				continue
+			}
+			if _, ok := holds[ref]; ok {
+				continue // the link source of a revision still on its way
 			}
 			dir := s.dir(ref)
 			// A symlink or a file is not ours to remove. within is defence in
@@ -1132,4 +1341,65 @@ func (s *Store) Prune(keep map[Ref]bool) ([]Ref, error) {
 		_ = os.Remove(idDir) // only succeeds when empty
 	}
 	return removed, nil
+}
+
+// linkHolds is what Prune keeps beyond keep (F10): per set id with a wanted
+// revision that is not verified yet, at most ONE revision, the newest verified
+// sibling, so the fetch can link from it. None when another verified revision
+// of that set is kept anyway (it is a link source already), or when there is
+// no verified sibling. Wanted is the last Sync's list: a Prune with no Sync
+// before it holds nothing.
+func (s *Store) linkHolds(keep map[Ref]bool) map[Ref]Ref {
+	s.mu.Lock()
+	wanted := make([]Ref, 0, len(s.want))
+	for r := range s.want {
+		wanted = append(wanted, r)
+	}
+	s.mu.Unlock()
+	sort.Slice(wanted, func(i, j int) bool { return wanted[i].String() < wanted[j].String() })
+	pending := map[string]Ref{} // set id -> its first wanted revision not verified
+	for _, r := range wanted {
+		if _, ok := pending[r.ID]; ok {
+			continue
+		}
+		if s.State(r).State != StateVerified {
+			pending[r.ID] = r
+		}
+	}
+	holds := map[Ref]Ref{}
+	for id, w := range pending {
+		sibs := s.verifiedSiblings(id, w.Revision)
+		served := false
+		for _, sib := range sibs {
+			if keep[sib] {
+				served = true
+				break
+			}
+		}
+		if !served && len(sibs) > 0 {
+			holds[sibs[0]] = w
+		}
+	}
+	return holds
+}
+
+// noteHolds records the holds and logs each one that starts or ends, so a
+// revision that never verifies is a visible hold (the log line, and the
+// sibling's heartbeat row: link_source_for), not a silent use of disk.
+func (s *Store) noteHolds(holds map[Ref]Ref) {
+	s.mu.Lock()
+	old := s.held
+	s.held = holds
+	s.mu.Unlock()
+	for sib, w := range holds {
+		if old[sib] != w {
+			slog.Info(fmt.Sprintf("model set: kept %s as link source until %s verifies", sib.Revision, w.Revision),
+				"set", sib.ID, "kept", sib.Revision, "until", w.Revision)
+		}
+	}
+	for sib, w := range old {
+		if _, ok := holds[sib]; !ok {
+			slog.Info("model set link source released", "set", sib.ID, "kept", sib.Revision, "for", w.Revision)
+		}
+	}
 }

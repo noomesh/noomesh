@@ -114,7 +114,9 @@ into the JWT, so the change **ends every session of that account
 immediately** (its refresh tokens are revoked, open sockets close, and a
 token issued before the change is refused): the user logs in again and gets
 the new scopes. `disable`, `set-role` and `set-password` do the same, and
-`service-key revoke --disable-account` too. A disabled account's bound MCP
+`service-key revoke --disable-account` too. Disabling an account (either
+way) also stops every task it owns that is still live and cuts a loop in
+flight: nothing after its last checkpoint is kept. A disabled account's bound MCP
 keys stop within the key cache interval (5 s) and its refresh cookie is
 refused. `disable` does not revoke keys that are not bound to the account
 (machine keys issued with `service-key issue`); revoke those by name.

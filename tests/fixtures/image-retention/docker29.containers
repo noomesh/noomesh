@@ -1,0 +1,2 @@
+/noo-alertmanager|ghcr.io/noomesh/dhi/alertmanager:v0.6.25-rc.1@sha256:01dd89cce4737ec7e44704681b5d6ee561e9b7880f632b4413b0e547e4dabfda|sha256:01dd89cce4737ec7e44704681b5d6ee561e9b7880f632b4413b0e547e4dabfda|false
+/noo-nats|nats:2.10-alpine@sha256:67ac7866d010e8d83302dd30332eeae1a2b7a8ee051155e2eb5a5485b720cd4b|sha256:67ac7866d010e8d83302dd30332eeae1a2b7a8ee051155e2eb5a5485b720cd4b|false

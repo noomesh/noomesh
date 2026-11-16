@@ -201,6 +201,24 @@ cluster:
       model: ""
   auto_scale: true
   idle_timeout_sec: 1800
+  # After a verified `noo upgrade`, superseded images that are provably
+  # ours (in no current or previous lock or add-on pin, used by no
+  # container) are removed. live | preview | off. Unset: the first roll
+  # that carries this previews, later rolls remove. "Ours" is noomesh's
+  # registry and each pinned add-on image's own repository, nothing wider.
+  # Images Docker reports by short name (Docker Hub: redis:7, postgres:16)
+  # are never treated as ours and are always kept, so an add-on pinned on
+  # Docker Hub is not cleaned up; remove its old images by hand.
+  # image_retention: live
+  # Grafana, Loki and Tempo (about 250 MiB idle): full | lean. Unset means
+  # full; `noo onboard` writes lean on a new install unless told yes.
+  # Change it with `noo stack monitoring on|off` (data kept on off).
+  # monitoring: full
+  # Postgres memory: standard | auto. Unset means standard (shared_buffers
+  # 512MB, work_mem 32MB, ...). auto sizes it to this machine's memory
+  # (smaller below 12 GiB); a NOO_PG_* you set wins. Takes effect when
+  # postgres is recreated (the next `noo stack start`).
+  # postgres_memory: standard
   pinned_backends: []
   # Example: pin a backend to a specific node
   # pinned_backends:

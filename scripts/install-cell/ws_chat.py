@@ -23,6 +23,7 @@ import ssl
 import struct
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -153,7 +154,27 @@ def ask(prompt: str, base: str = "https://localhost:8080", timeout: float = 300)
     return "".join(out) + "\n[tools called: " + (", ".join(tools) or "none") + "]"
 
 
+def route_status(path: str, base: str = "https://localhost:8080") -> int:
+    """The HTTP status the gateway answers to an authenticated, empty POST at
+    `path`: 404 when the build under test has no such route, anything else
+    (400/405/422...) when it has one. Raises when it cannot ask at all."""
+    ctx = ssl.create_default_context(cafile=cluster_ca())
+    req = urllib.request.Request(base + path, data=b"{}", method="POST",
+                                 headers={"Authorization": "Bearer " + token(), "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, context=ctx, timeout=30) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+
+
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--probe-route":
+        try:
+            print(route_status(sys.argv[2]))
+        except Exception as e:  # cannot tell: the caller treats anything but a number as "unknown"
+            print(f"unknown ({type(e).__name__})")
+        sys.exit(0)
     if len(sys.argv) < 2:
         sys.exit("usage: ws_chat.py PROMPT [GATEWAY_URL]")
     try:
