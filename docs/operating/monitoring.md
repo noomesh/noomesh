@@ -355,6 +355,18 @@ cooldown dedup when one goes quiet) do not go through Alertmanager: the
 gateway's autonomy engine sends them to your chat channel directly. See
 `GET /api/agent/loops` for current loop liveness.
 
+Kiosk seats are watched the same way (`seat_watch`, every minute, from the
+heartbeat each seat already sends). `seat_display_down` fires when a seat's
+display has not been running for 5 minutes (a roll or bundle apply that
+restarts it sooner never pages); its **Next** is the seat's repair,
+`on <seat>: sudo ~<user>/.local/libexec/noo-seat/noo kiosk seat-sync --migrate`.
+`seat_silent` fires when a seat has not reported for 10 minutes; while it is
+silent its display state is unknown, so an open display alert stays open.
+Both are persisting: one message at onset, reminders at 4, 12 and 24 hours
+and then daily, and one "running again" / "reporting again" line when the
+seat recovers. A gateway restart does not resend an onset that was already
+sent.
+
 ### What a channel alert carries, and what stays in the logs
 
 A chat channel is outside the trust boundary,
