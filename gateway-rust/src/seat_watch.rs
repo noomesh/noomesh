@@ -153,51 +153,53 @@ pub fn next_first_bad(seen: &Seen, prev: Option<i64>, now: i64) -> Option<i64> {
     }
 }
 
-/// The seat's root applier, for the repair line: verify's
-/// `seat_applier_for_remedy` rule (a plain enrol user, else a placeholder).
-pub fn applier(user: &str) -> String {
-    let plain = !user.is_empty()
-        && user.len() <= 32
-        && user != "root"
-        && user.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    format!("~{}/.local/libexec/noo-seat/noo", if plain { user } else { "<seat user>" })
+/// The channel's Next line for a seat: verify, whose seat rows print the
+/// exact root repair (`sudo ~<user>/.local/libexec/noo-seat/noo kiosk
+/// seat-sync --migrate`, `systemctl status noo-seat-sync.timer`). Those
+/// commands cannot be the Next line themselves: the channel scrubber masks
+/// every `noo-<name>` shape (a container name) and `noo-seat` is one, so the
+/// command would arrive as `…/[internal]/noo`. Verify's output is the
+/// operator's own terminal, unscrubbed.
+pub fn next_for(seat: &str) -> String {
+    format!("noo cluster verify {seat}")
 }
 
-/// The one command that puts a seat's display right (verify's remedy).
-pub fn display_repair(seat: &str, user: &str) -> String {
-    format!("on {seat}: sudo {} kiosk seat-sync --migrate", applier(user))
-}
-
-pub fn display_alert(seat: &str, user: &str, unit: &str, detail: String) -> OperatorAlert {
+pub fn display_alert(seat: &str, unit: &str, detail: String) -> OperatorAlert {
     OperatorAlert::new(
         KIND_DISPLAY,
         seat,
-        format!("Seat '{seat}': the kiosk display is not running (state: {unit})."),
+        format!(
+            "Seat '{seat}': the kiosk display is not running (state: {unit}). \
+             The repair is `kiosk seat-sync --migrate`, run as root on the seat; verify prints the exact command."
+        ),
     )
     .detail(detail)
-    .investigate(display_repair(seat, user))
+    .investigate(next_for(seat))
     .persisting()
 }
 
 pub fn display_recovered(seat: &str) -> OperatorAlert {
     OperatorAlert::new(KIND_DISPLAY, seat, format!("Seat '{seat}': the kiosk display is running again."))
-        .investigate(format!("noo cluster verify {seat}"))
+        .investigate(next_for(seat))
 }
 
 pub fn silent_alert(seat: &str, age: i64) -> OperatorAlert {
     OperatorAlert::new(
         KIND_SILENT,
         seat,
-        format!("Seat '{seat}' has not reported to the controller for {}.", crate::egress::human_duration(age)),
+        format!(
+            "Seat '{seat}' has not reported to the controller for {}: the seat is off, offline, or its sync timer stopped.",
+            crate::egress::human_duration(age)
+        ),
     )
     .detail(format!("last heartbeat {age}s ago"))
-    .investigate(format!("on {seat}: systemctl status noo-seat-sync.timer"))
+    .investigate(next_for(seat))
     .persisting()
 }
 
 pub fn silent_recovered(seat: &str) -> OperatorAlert {
     OperatorAlert::new(KIND_SILENT, seat, format!("Seat '{seat}' is reporting to the controller again."))
-        .investigate(format!("noo cluster verify {seat}"))
+        .investigate(next_for(seat))
 }
 
 fn first_bad_map() -> &'static Mutex<HashMap<String, i64>> {
@@ -215,10 +217,7 @@ pub async fn tick(state: &Arc<AppState>) {
         }
     };
     let now = chrono::Utc::now().timestamp();
-    for (seat, enroll_user, facts, last_seen, hb, revoked) in rows {
-        let user = enroll_user
-            .or_else(|| facts.as_ref().and_then(|f| f["cli_user"].as_str()).map(str::to_string))
-            .unwrap_or_default();
+    for (seat, last_seen, hb, revoked) in rows {
         let seen = seat_condition(hb.as_ref(), last_seen.map(|t| t.timestamp()), revoked, now);
         let prev = first_bad_map().lock().ok().and_then(|m| m.get(&seat).copied());
         let open = matches!(seen, Seen::DisplayDown(_))
@@ -236,7 +235,7 @@ pub async fn tick(state: &Arc<AppState>) {
                     h["kiosk"]["quality"].as_str().unwrap_or("?"),
                     h["console_build"].as_str().unwrap_or("?"),
                 );
-                crate::operator_alert::send_operator_alert_with(state, display_alert(&seat, &user, unit, detail), 0).await;
+                crate::operator_alert::send_operator_alert_with(state, display_alert(&seat, unit, detail), 0).await;
             }
             Act::Clear => {
                 crate::operator_alert::clear_operator_alert(state, display_recovered(&seat)).await;
@@ -317,7 +316,7 @@ mod tests {
         assert_eq!(acts[6], Act::Raise, "later ticks hand it to the funnel, whose schedule answers Quiet");
         assert_eq!(acts[7], Act::Clear, "the resolved line when it is back");
         // Later ticks are Quiet in the funnel, not a second onset:
-        let a = display_alert("lobby", "kiosk", "activating", String::new());
+        let a = display_alert("lobby", "activating", String::new());
         let (s1, st) = persisting_step(None, &a, T0 + 300, false);
         assert_eq!(s1, Step::Deliver(None));
         let (s2, _) = persisting_step(Some(st), &a, T0 + 360, false);
@@ -350,7 +349,7 @@ mod tests {
             count: 1,
             muted_noted: false,
         };
-        let (step, st) = persisting_step(Some(remembered), &display_alert("lobby", "kiosk", "activating", String::new()), now, false);
+        let (step, st) = persisting_step(Some(remembered), &display_alert("lobby", "activating", String::new()), now, false);
         assert_eq!(step, Step::Quiet, "no second onset after a restart");
         assert_eq!((st.onset, st.count), (T0, 1));
     }
@@ -395,17 +394,22 @@ mod tests {
     }
 
     #[test]
-    fn the_channel_shows_the_repair_command_verbatim() {
-        let a = display_alert("lobby", "kiosk", "activating", "kiosk.service=activating".into());
+    fn the_channel_says_the_repair_and_points_at_verify_unmasked() {
+        // The rendered channel text, through the real scrubber: nothing in it
+        // may be masked. (The first cut put the applier path in Next, and
+        // the scrubber turned `noo-seat` into `[internal]`.)
+        let a = display_alert("lobby", "activating", "kiosk.service=activating".into());
         let text = crate::egress::system(&a, "R-test");
         let t = text.as_str();
         assert!(t.contains("Seat 'lobby': the kiosk display is not running (state: activating)."), "{t}");
-        assert!(t.contains("Next: `on lobby: sudo ~kiosk/.local/libexec/noo-seat/noo kiosk seat-sync --migrate`"), "{t}");
+        assert!(t.contains("The repair is `kiosk seat-sync --migrate`, run as root on the seat"), "{t}");
+        assert!(t.contains("Next: `noo cluster verify lobby`"), "{t}");
         assert!(!t.contains("kiosk.service=activating"), "detail is logged, never sent: {t}");
-        assert_eq!(applier("root"), "~<seat user>/.local/libexec/noo-seat/noo");
-        assert_eq!(applier("a b"), "~<seat user>/.local/libexec/noo-seat/noo");
-        let s = crate::egress::system(&silent_alert("lobby", 900), "R-test");
-        assert!(s.as_str().contains("Next: `on lobby: systemctl status noo-seat-sync.timer`"), "{}", s.as_str());
+        assert!(!t.contains(crate::egress::MASK), "nothing masked: {t}");
+        for alert in [silent_alert("lobby", 900), display_recovered("lobby"), silent_recovered("lobby")] {
+            let r = crate::egress::system(&alert, "R-test");
+            assert!(r.as_str().contains("Next: `noo cluster verify lobby`") && !r.as_str().contains(crate::egress::MASK), "{}", r.as_str());
+        }
     }
 
     #[test]
