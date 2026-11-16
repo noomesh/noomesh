@@ -1703,12 +1703,79 @@ pub(crate) fn display_vouched(unit: Option<&str>, params: Option<&KioskParams>, 
     }
 }
 
+/// The display's own scripts in the seat's shared dir: the only files a
+/// rollback may put back.
+pub(crate) const DISPLAY_SCRIPTS: [&str; 3] = ["noo-kiosk-launch", "noo-kiosk-cdp", "noo-kiosk-serve"];
+
+pub(crate) fn is_display_script(dst: &Path, kiosk_dir: &Path) -> bool {
+    dst.parent() == Some(kiosk_dir)
+        && dst.file_name().and_then(|n| n.to_str()).is_some_and(|n| DISPLAY_SCRIPTS.contains(&n))
+}
+
+pub(crate) fn prev_path(dst: &Path) -> PathBuf {
+    let mut p = dst.as_os_str().to_owned();
+    p.push(".prev");
+    PathBuf::from(p)
+}
+
+/// Did the display come up and STAY up: active on `need` consecutive polls
+/// within `tries` (one second apart in production; migrate's self-check
+/// rule: 3 within 20).
+pub(crate) fn display_stays_up(active: &dyn Fn() -> bool, pause: &dyn Fn(), tries: u32, need: u32) -> bool {
+    let mut run = 0;
+    for _ in 0..tries {
+        run = if active() { run + 1 } else { 0 };
+        if run >= need {
+            return true;
+        }
+        pause();
+    }
+    false
+}
+
+/// After the display step: a restart counts only once the display has
+/// stayed up. `systemctl restart` exiting 0 is not that (Restart=always
+/// loops "activating"), and reporting it as `restarted` is how homeserver's
+/// 0.6.25 apply said all was well with the display dark.
+///
+/// - stayed up: this apply's `.prev` copies are removed, `restarted`;
+/// - did not, and this apply replaced display scripts: put back exactly
+///   those (`restore`, from the `.prev` copies THIS apply wrote, never an
+///   older one), restart, and `rolled-back` once that stays up, else
+///   `rollback-failed`;
+/// - did not, with nothing of this apply's to put back: `restart-failed`.
+pub(crate) fn settle_display(
+    word: &'static str,
+    replaced_scripts: bool,
+    stays_up: &dyn Fn() -> bool,
+    restore: &dyn Fn() -> bool,
+    restart: &dyn Fn() -> bool,
+    drop_prev: &dyn Fn(),
+) -> &'static str {
+    if word != "restarted" && word != "restart-failed" {
+        drop_prev();
+        return word;
+    }
+    if word == "restarted" && stays_up() {
+        drop_prev();
+        return "restarted";
+    }
+    if !replaced_scripts {
+        return "restart-failed";
+    }
+    if restore() && restart() && stays_up() {
+        "rolled-back"
+    } else {
+        "rollback-failed"
+    }
+}
+
 /// May the apply record the bundle's console build as the one on screen?
 /// Only when the display step did not fail. Recording it after a failure
 /// made every later tick see "console not moved" and do nothing, so a
 /// display that missed one reload stayed on the old console for good.
 pub(crate) fn display_settled(word: &str) -> bool {
-    !word.ends_with("-failed") && word != "held"
+    !word.ends_with("-failed") && word != "held" && word != "rolled-back"
 }
 
 /// Decrypt, unwrap, extract, verify and apply one blob. Returns the outcome.
@@ -1743,6 +1810,15 @@ fn apply_blob(blob: &[u8], cfg: &SeatConfig, state: &mut SeatState) -> Result<Ap
         super::node_fetch::extract_bundle(&tar, &ex)?;
         let plan = verify_seat_stage(&ex, &Path::new(SEAT_DIR).join("signing.pub"), cfg, now_unix())?;
         let (plan, kiosk_deferred) = defer_kiosk_until_shared_dir(plan, cfg.kiosk_dir().is_dir());
+        // A display script this apply replaces is kept as `<name>.prev` until
+        // the new display has stayed up (`settle_display`). Leftovers from an
+        // apply that never finished are removed first: a rollback restores
+        // only copies THIS apply wrote, which `prevs` lists.
+        let kdir = cfg.kiosk_dir();
+        for n in DISPLAY_SCRIPTS {
+            let _ = std::fs::remove_file(prev_path(&kdir.join(n)));
+        }
+        let prevs: std::cell::RefCell<Vec<(PathBuf, PathBuf)>> = std::cell::RefCell::new(Vec::new());
         // Apply. Everything verified; any write failure stops here and is
         // reported, with what was already written named in the message.
         let cli_path = cfg.cli_path();
@@ -1750,7 +1826,14 @@ fn apply_blob(blob: &[u8], cfg: &SeatConfig, state: &mut SeatState) -> Result<Ap
             &plan, &cli_path,
             &|kind| std::fs::read(ex.join("files").join(kind)).map_err(|e| e.to_string()),
             &|p| seat_path_allowed(p, cfg),
-            &|d, b| install_file(d, b, cfg),
+            &|d, b| {
+                if is_display_script(d, &kdir) && d.exists() {
+                    let p = prev_path(d);
+                    std::fs::copy(d, &p).map_err(|e| format!("{}: keeping the previous copy: {e}", d.display()))?;
+                    prevs.borrow_mut().push((d.to_path_buf(), p));
+                }
+                install_file(d, b, cfg)
+            },
         )?;
         // A seat whose CLI was removed by the old applier: put it back from
         // the seat copy that was just applied (or was already current).
@@ -1802,6 +1885,16 @@ fn apply_blob(blob: &[u8], cfg: &SeatConfig, state: &mut SeatState) -> Result<Ap
             &|| unit_state("kiosk.service") == "active",
             &|| Command::new(format!("{KIOSK_BIN}/noo-kiosk-cdp")).arg("reload").status().map(|s| s.success()).unwrap_or(false),
             &|| Command::new("systemctl").args(["restart", "kiosk.service"]).status().map(|s| s.success()).unwrap_or(false),
+        );
+        let replaced = prevs.borrow().clone();
+        o.display = settle_display(
+            o.display,
+            !replaced.is_empty(),
+            &|| display_stays_up(&|| unit_state("kiosk.service") == "active",
+                &|| std::thread::sleep(std::time::Duration::from_secs(1)), 20, 3),
+            &|| replaced.iter().all(|(d, p)| std::fs::rename(p, d).is_ok()),
+            &|| Command::new("systemctl").args(["restart", "kiosk.service"]).status().map(|s| s.success()).unwrap_or(false),
+            &|| for (_, p) in &replaced { let _ = std::fs::remove_file(p); },
         );
         if !console.is_empty() && display_settled(o.display) {
             state.console_build = Some(console);
@@ -2435,6 +2528,16 @@ pub(crate) fn seat_checks(seat: &Value, controller_cli: &str, controller_tag: &s
         check("display", Verdict::Ok, format!("console {build} = controller{}{quality}",
             if display.is_empty() { String::new() } else { format!(" (last apply: display {display})") }), None)
     });
+    // The last apply's new display did not stay up and the previous scripts
+    // were put back (or could not be): the seat is not on this release's
+    // display. Said until a later apply replaces the report.
+    if matches!(display, "rolled-back" | "rollback-failed") {
+        out.push(check("display rollback", Verdict::Fail, format!(
+            "the last apply's display did not stay up after its restart; {}",
+            if display == "rolled-back" { "the previous display scripts were put back and run again" }
+            else { "putting the previous display scripts back failed too" }),
+            Some(format!("on {name}: journalctl -u kiosk.service -n 80 --no-pager"))));
+    }
     // The last apply changed the display's scripts or page and did not
     // restart it (`run_display_step`: a running display the sync cannot
     // vouch for). Said while the seat still shows why; the repair clears it.
@@ -3148,6 +3251,80 @@ mod tests {
         let roll = crate::test_src::fn_body(&own, "pub(crate) fn upgrade_seats(");
         assert!(roll.contains("format!(\"display held on {seat}: run {fix}\")"), "the roll says a held display by name");
         assert!(roll.contains("display held on {}"), "and never closes on a bare `current`");
+    }
+
+    /// A restart counts only once the display stays up; one that does not is
+    /// put back to the scripts THIS apply replaced, and said.
+    #[test]
+    fn a_restart_that_does_not_stay_up_is_rolled_back_to_this_applys_copies() {
+        use std::cell::Cell;
+        let (restores, restarts, drops) = (Cell::new(0), Cell::new(0), Cell::new(0));
+        let ups = std::cell::RefCell::new(Vec::<bool>::new());
+        let run = |word: &'static str, replaced: bool, up: &[bool], restore_ok: bool| {
+            restores.set(0); restarts.set(0); drops.set(0);
+            *ups.borrow_mut() = up.iter().rev().copied().collect();
+            let w = settle_display(word, replaced,
+                &|| ups.borrow_mut().pop().unwrap_or(false),
+                &|| { restores.set(restores.get() + 1); restore_ok },
+                &|| { restarts.set(restarts.get() + 1); true },
+                &|| drops.set(drops.get() + 1));
+            (w, restores.get(), restarts.get(), drops.get())
+        };
+        assert_eq!(run("restarted", true, &[true], true), ("restarted", 0, 0, 1), "stayed up: the .prev copies go");
+        assert_eq!(run("restarted", true, &[false, true], true), ("rolled-back", 1, 1, 0), "never up: put back, restarted, up");
+        assert_eq!(run("restarted", true, &[false, false], true), ("rollback-failed", 1, 1, 0));
+        assert_eq!(run("restarted", true, &[false], false), ("rollback-failed", 1, 0, 0), "a failed restore is not restarted on");
+        assert_eq!(run("restarted", false, &[false], true), ("restart-failed", 0, 0, 0), "nothing of this apply's to put back");
+        assert_eq!(run("restart-failed", true, &[true], true), ("rolled-back", 1, 1, 0));
+        for w in ["held", "reloaded", "unchanged"] {
+            assert_eq!(run(w, true, &[], true), (w, 0, 0, 1), "{w}: no restart, the copies go");
+        }
+        assert!(!display_settled("rolled-back") && !display_settled("rollback-failed"));
+
+        let up = |v: &[bool], tries: u32, need: u32| {
+            let i = Cell::new(0usize);
+            display_stays_up(&|| { let k = i.get(); i.set(k + 1); v.get(k).copied().unwrap_or(false) }, &|| {}, tries, need)
+        };
+        assert!(up(&[false, true, true, true], 20, 3));
+        assert!(!up(&[true, true, false, true, true, false], 6, 3), "a loop that blips active is not up");
+        assert!(!up(&[false; 20], 20, 3));
+
+        let k = Path::new("/opt/noo-seat/kiosk");
+        assert!(is_display_script(&k.join("noo-kiosk-cdp"), k));
+        assert!(!is_display_script(&k.join("other"), k));
+        assert!(!is_display_script(Path::new("/usr/local/bin/noo-kiosk-cdp"), k), "only the shared dir's copies");
+        assert_eq!(prev_path(&k.join("noo-kiosk-cdp")), k.join("noo-kiosk-cdp.prev"));
+
+        let own = crate::test_src::own_code(include_str!("kiosk_seat.rs"));
+        let apply = crate::test_src::fn_body(&own, "fn apply_blob(");
+        let clear = apply.find("let _ = std::fs::remove_file(prev_path(&kdir.join(n)));").expect("leftover .prev copies go first");
+        let keep = apply.find("prevs.borrow_mut().push((d.to_path_buf(), p));").expect("each replaced script is listed");
+        assert!(clear < keep, "an older .prev is never in the list");
+        assert!(apply.contains("&|| replaced.iter().all(|(d, p)| std::fs::rename(p, d).is_ok()),"), "restore reads only this apply's list");
+        assert!(apply.find("o.display = settle_display(").unwrap() < apply.find("display_settled(o.display)").unwrap());
+    }
+
+    #[test]
+    fn a_rolled_back_display_is_a_verify_failure_with_the_journal() {
+        use super::super::cluster_verify::Verdict;
+        let seen = "2025-10-09T08:53:10Z";
+        let now = super::super::cluster_verify::parse_rfc3339_unix(seen).unwrap() + 10;
+        let p = KioskParams { user: "kiosk".into(), mode: super::super::kiosk::Mode::Dedicated, vt: 1 };
+        let unit = seat_kiosk_unit(&p);
+        let wd = sha256_hex(super::super::kiosk::WATCHDOG.as_bytes());
+        let seat = |display: &str| json!({"seat_name": "homeserver", "enroll_user": "alex", "last_seen": seen,
+            "apply_msg": format!("seat-apply cli=updated scripts=1 units=0 serve=unchanged display={display} console=stack-v0.6.24"),
+            "heartbeat": {"cli_version": "0.6.24", "user_cli_current": true, "kiosk_serve": "active", "kiosk_display": "active",
+                          "kiosk_bins": "shared", "kiosk_watchdog_sha": wd, "console_build": "stack-v0.6.24",
+                          "kiosk_unit_sha": sha256_hex(unit.as_bytes()), "kiosk_unit_runtime_dir": true,
+                          "kiosk": {"user": "kiosk", "mode": "dedicated", "vt": "1"}}});
+        let row = |d: &str| seat_checks(&seat(d), "0.6.24", "stack-v0.6.24", now).into_iter().find(|c| c.name == "display rollback");
+        let r = row("rolled-back").expect("said");
+        assert_eq!(r.verdict, Verdict::Fail);
+        assert!(r.detail.contains("put back and run again"), "{r:?}");
+        assert_eq!(r.remedy.as_deref(), Some("on homeserver: journalctl -u kiosk.service -n 80 --no-pager"));
+        assert!(row("rollback-failed").unwrap().detail.contains("failed too"));
+        assert!(row("restarted").is_none());
     }
 
     /// `seat-sync --migrate` installs this release's kiosk.service, rendered
