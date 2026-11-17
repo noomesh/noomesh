@@ -26,4 +26,12 @@ ignore = [
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; migration to rustls-pki-types pending" },
     # Unmaintained, not vulnerable: serde_yaml's libyaml port.
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained (serde_yaml); migration pending" },
+    # Unmaintained, not vulnerable (both "INFO Unmaintained", issued
+    # 2026-11-17, all versions, no patch). chrono and chrono-tz are the
+    # gateway's time types across the DB (sqlx), serde and signed bundles;
+    # the operator asked for the move off them (to jiff or time) in 0.6.27,
+    # crate by crate with the wire formats pinned first. Each entry goes when
+    # its crate leaves Cargo.lock. Review by 2026-12-15.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; migration to jiff/time is 0.6.27 work; review by 2026-12-15" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz unmaintained; migration with chrono's; review by 2026-12-15" },
 ]
