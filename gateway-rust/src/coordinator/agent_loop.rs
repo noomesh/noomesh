@@ -1992,6 +1992,9 @@ async fn send_llm_with_fallback<R: HarnessRuntime, S: crate::websocket::TurnSink
                     return Ok(resp);
                 }
                 warn_if_node_agent_outdated(status, &url);
+                // The tunnel door's pre-head loss: the model saw nothing
+                // back to us, so the call is tried again like a backend down.
+                let door_lost = crate::tunnel_door::lost_before_head(status.as_u16(), resp.headers());
                 let err_body = resp.text().await.unwrap_or_default();
                 tracing::error!(
                     status = %status,
@@ -2016,7 +2019,7 @@ async fn send_llm_with_fallback<R: HarnessRuntime, S: crate::websocket::TurnSink
                     super::backend::mark_legacy_completion(&backend.url);
                     continue;
                 }
-                if !is_retryable_llm_http_error(status.as_u16(), &err_body) {
+                if !door_lost && !is_retryable_llm_http_error(status.as_u16(), &err_body) {
                     // A pinned model this backend does not hold: say so as a
                     // refusal (4xx), not as a backend fault.
                     if let Some(pin) = effective_model {
@@ -2026,7 +2029,9 @@ async fn send_llm_with_fallback<R: HarnessRuntime, S: crate::websocket::TurnSink
                     }
                     anyhow::bail!("{}", backend_error_message(status.as_u16(), &err_body));
                 }
-                if super::backend::is_context_overflow_body(&err_body) {
+                if door_lost {
+                    format!("HTTP {status} (the tunnel to the node dropped before the answer)")
+                } else if super::backend::is_context_overflow_body(&err_body) {
                     // The failover alert should say what actually happened —
                     // "unreachable" for a context overflow sent operators
                     // chasing network faults.
@@ -5039,5 +5044,24 @@ mod tier_tools_tests {
         assert!(!compact.contains(&extra_core.to_string()), "a core tool outside the compact set is dropped: {compact:?}");
         assert!(compact.contains(&"noo_job_submit_not_core".to_string()), "a group's tool stays: {compact:?}");
         assert_eq!(tier_tools(all.clone(), WindowTier::Full).len(), all.len());
+    }
+}
+
+/// The 0.6.26 roll's chat 502 (17:01:09Z): a tunnel lost before the
+/// node's head is the backend being down for a moment. The coordinator's
+/// model call reads the door's marker before it consumes the body, lets it
+/// through the non-retryable bail, and names it in the failover alert. The
+/// rule itself is tested in tunnel_door; this holds the wiring by source.
+#[cfg(test)]
+mod tunnel_lost_wiring {
+    #[test]
+    fn the_model_call_retries_the_doors_pre_head_loss() {
+        let code = crate::test_src::own_code(include_str!("agent_loop.rs"));
+        let send = crate::test_src::fn_body(&code, "async fn send_llm_with_fallback<");
+        let marker = send.find("let door_lost = crate::tunnel_door::lost_before_head(status.as_u16(), resp.headers());").expect("the marker is read");
+        let body = send.find("let err_body = resp.text().await").expect("the body is read");
+        assert!(marker < body, "the headers are read before the body consumes the response");
+        assert!(send.contains("if !door_lost && !is_retryable_llm_http_error(status.as_u16(), &err_body) {"), "the loss passes the bail");
+        assert!(send.contains("(the tunnel to the node dropped before the answer)"), "the alert says what happened");
     }
 }
