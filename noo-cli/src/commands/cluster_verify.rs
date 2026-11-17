@@ -649,7 +649,7 @@ pub(crate) fn model_stores_check(id: &str, n: &Value) -> Option<Check> {
     Some(warn(NAME, format!(
         "{} world-writable: any account on {id} can plant model bytes there: {}",
         bad.len(), parts.join("; ")),
-        Some(format!("on {id}: {}   # keep the owner; hand downloads: `noo models pull`, or run them as the store's owner",
+        Some(format!("on {id}: {}   # keep the owner; hand downloads: `noo models pull <model>`, or run them as the store's owner",
             fixes.join(" && ")))))
 }
 
