@@ -9051,9 +9051,9 @@ mod hostd_tests {
         assert!(why.contains("--root-ok"), "the refusal names the opt-in: {why}");
         assert!(root_step_runs(true, false) && root_step_runs(false, true) && !root_step_runs(false, false));
         // Already root: no sudo runs, nothing can prompt — it runs, unattended.
-        AS_ROOT.with(|c| c.set(true));
+        crate::onboard::steps::AS_ROOT.with(|c| c.set(true));
         let as_root = root_step(false, false, "the CA trust", "noo onboard --only services");
-        AS_ROOT.with(|c| c.set(false));
+        crate::onboard::steps::AS_ROOT.with(|c| c.set(false));
         assert_eq!(as_root, RootStep::Run, "a root process runs its root steps without --root-ok");
     }
 
