@@ -493,7 +493,7 @@ def test_the_rag_probe_asks_the_pages_query_then_three_chat_paths_and_is_never_j
     ask = probe.index("for path in chat agent console; do")
     assert ingest < wait < ask
     assert 'chat) out="$(noo chat --message "$RAG_CHAT_LINE" 2>&1)"' in probe
-    assert 'agent) out="$(timeout 300 noo inference agent "$RAG_CHAT_LINE" 2>&1)"' in probe
+    assert 'agent) a0="$(date +%s)"; out="$(timeout 300 noo inference agent "$RAG_CHAT_LINE" 2>&1)"; arc=$?' in probe
     assert 'console) out="$(timeout 330 python3 -I "$RAG_WS_CHAT" "$RAG_CHAT_LINE" 2>&1)"' in probe
     assert 'fact="14(th)? (of )?march|ZIRCON-4471|kestrel"' in probe
     assert 'if printf "%s" "$out" | grep -qiE "$fact"; then got=yes' in probe

@@ -461,8 +461,11 @@ RAG_QUERY_LINE="$(sed -n 's/^noo rag query "\(.*anything\.md.*\)"$/\1/p' "$RAG_D
 RAG_CHAT_LINE="$(sed -n 's/^noo chat --message "\(.*anything\.md.*\)"$/\1/p' "$RAG_DOC_PAGE" 2>/dev/null | head -n 1)"
 RAG_CHAT_LINE="${RAG_CHAT_LINE:-summarise what you know from anything.md}"
 RAG_WS_CHAT="$HERE/ws_chat.py"
+# On an agent timeout, what the gateway and the Ollama daemons were doing
+# (0.6.25-rc.4 run 1, slots4: killed at 300 s with nothing kept).
+RAG_AGENT_EVIDENCE="$HERE/agent_evidence.py"
 RAG_VERDICT="$OUT/rag-chat.verdict"
-export RAG_QUERY_LINE RAG_CHAT_LINE RAG_WS_CHAT RAG_VERDICT
+export RAG_QUERY_LINE RAG_CHAT_LINE RAG_WS_CHAT RAG_VERDICT RAG_AGENT_EVIDENCE
 step probe-rag-chat 1500 -- sh -c '
   [ -n "$RAG_QUERY_LINE" ] || { echo "RAG PROBE: first-chat.md has no noo rag query line about anything.md"; exit 0; }
   fact="14(th)? (of )?march|ZIRCON-4471|kestrel"
@@ -482,7 +485,12 @@ step probe-rag-chat 1500 -- sh -c '
     echo "== $path: \"$RAG_CHAT_LINE\""
     case "$path" in
       chat) out="$(noo chat --message "$RAG_CHAT_LINE" 2>&1)" ;;
-      agent) out="$(timeout 300 noo inference agent "$RAG_CHAT_LINE" 2>&1)" ;;
+      agent) a0="$(date +%s)"; out="$(timeout 300 noo inference agent "$RAG_CHAT_LINE" 2>&1)"; arc=$?
+             if [ "$arc" = 124 ]; then
+               out="$out
+RAG PROBE: agent timed out after 300 s (killed)"
+               python3 -I "$RAG_AGENT_EVIDENCE" --since "$a0" 2>&1 | head -n 90
+             fi ;;
       console) out="$(timeout 330 python3 -I "$RAG_WS_CHAT" "$RAG_CHAT_LINE" 2>&1)" ;;
     esac
     printf "%s\n" "$out" | head -n 30

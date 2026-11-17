@@ -217,13 +217,13 @@ pub(crate) fn bind_identity(
     let claims_someone = claimed_user_id.map(str::trim).is_some_and(|v| !v.is_empty());
     if let Some(sub) = jwt_subject.map(str::trim).filter(|s| !s.is_empty()) {
         let uid = crate::auth::effective_user_id(Some(sub), claimed_user_id);
-        return (uid.clone(), UsageActor { username: uid, consumer: Some(via.into()) });
+        return (uid.clone(), UsageActor { username: uid, consumer: Some(via.into()), keyed: false });
     }
     if let Some(crate::auth::ClusterNode(actor, kind)) = cluster {
         return match kind {
             crate::auth::ClusterKind::Internal => {
                 let uid = crate::auth::effective_user_id(None, claimed_user_id);
-                (uid.clone(), UsageActor { username: uid, consumer: Some(actor.clone()) })
+                (uid.clone(), UsageActor { username: uid, consumer: Some(actor.clone()), keyed: false })
             }
             crate::auth::ClusterKind::Node => {
                 if claims_someone {
@@ -239,13 +239,13 @@ pub(crate) fn bind_identity(
                 if claims_someone && claimed_user_id.map(str::trim) != Some(u.as_str()) {
                     tracing::warn!(consumer = %c.name, user = %u, "ignoring user_id that does not match the key's bound user");
                 }
-                (Some(u.clone()), UsageActor { username: Some(u.clone()), consumer: Some(c.name.clone()) })
+                (Some(u.clone()), UsageActor { username: Some(u.clone()), consumer: Some(c.name.clone()), keyed: true })
             }
             None => {
                 if claims_someone {
                     tracing::warn!(consumer = %c.name, "ignoring user_id delegation from an unbound service key");
                 }
-                (None, UsageActor::consumer(c.name.clone()))
+                (None, UsageActor { keyed: true, ..UsageActor::consumer(c.name.clone()) })
             }
         };
     }
@@ -562,17 +562,26 @@ async fn native_inference(
             (StatusCode::OK, Json(answer)).into_response()
         }
         Err(e) => {
-            tracing::error!(error = %e, "native_inference_failed");
+            // The doesn't-fit refusal is the request's, not a fault: warn, 413.
+            if e.downcast_ref::<coordinator::ContextTooSmall>().is_some() {
+                tracing::warn!(error = %e, "native_inference_refused_context_too_small");
+            } else {
+                tracing::error!(error = %e, "native_inference_failed");
+            }
             // Policy refusal (cloud gate closed): 403 with the typed body, not a
             // retryable 500.
             if let Some(resp) = cloud_gate_response(&e) {
                 return resp;
             }
             let status = StatusCode::from_u16(coordinator::resolve_failure_status(&e, 500)).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            (status, Json(json!({
+            let mut body = json!({
                 "success": false,
                 "error": format!("{e}"),
-            }))).into_response()
+            });
+            if e.downcast_ref::<coordinator::ContextTooSmall>().is_some() {
+                body["code"] = json!("context_too_small");
+            }
+            (status, Json(body)).into_response()
         }
     }
     }  // end of `else` (non-node-pinned) branch
@@ -1634,6 +1643,7 @@ async fn native_inference_stream(
                 model: backend.model.clone(),
                 source: "api",
                 actor: usage_actor,
+                cut: None,
             };
             let stream = crate::usage::tap_stream(resp.bytes_stream(), usage_ctx);
             // The backend span ends with the stream it answered.

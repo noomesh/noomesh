@@ -141,10 +141,26 @@ A failed apply shows in `noo cluster verify` as `seat bundle: apply failed:
 sudo /usr/local/libexec/noo-seat/noo kiosk seat-sync --migrate   # --print shows the script
 ```
 
+It says `running the root step (N lines; …)` and then its result lines; add
+`--verbose` to see the whole script as it runs.
+
 It moves the state and the copy into the user's tree, rewrites the sync unit
 to `User=`, adds the symlinks and the polkit rule, and removes the root copy.
 It is a command you run, not an automatic root tick, because that tick would
 be a network-fed root process rewriting its own unit and policy.
+
+**A held display.** A seat's sync restarts the display only when
+`kiosk.service` is this release's unit and the display runs the scripts the
+sync writes (`/opt/noo-seat/kiosk`). On an older unit or layout it leaves a
+running display alone: the roll prints `display held on <seat>: run sudo …
+kiosk seat-sync --migrate`, and verify shows a `display held` warning with
+the same command until it is run.
+
+When the sync does restart the display, it keeps the scripts it replaced as
+`<name>.prev` until the display has stayed up for three seconds. If it does
+not come up within 20 seconds, the sync puts back exactly those copies,
+restarts it on them, and reports it: verify shows a `display rollback`
+failure with the journal command. The next bundle tries again.
 
 A bundle that names any other file, or a kind outside that list, is refused
 whole, before anything is written. A node bundle is never accepted by a seat,

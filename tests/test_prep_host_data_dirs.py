@@ -179,4 +179,64 @@ def test_install_d_o_only_creates_or_names_the_agents_targets():
     for ln in lines:
         if '"$1"' in ln:
             continue  # data_dir's body, behind its [ -d ] test
-        assert ln == 'install -d -o noo-agent -g noo-agent "$NOO_DATA_ROOT/hf-cache" "$NOO_DATA_ROOT/models"', ln
+        assert ln in (
+            'install -d -o noo-agent -g noo-agent "$NOO_DATA_ROOT/hf-cache" "$NOO_DATA_ROOT/models"',
+            'install -d -o noo-agent -g noo-agent "$NOO_DATA_ROOT/hf-cache/hub"',
+        ), ln
+
+
+def test_hub_gets_hf_caches_owner_when_missing_or_empty():
+    """The onboard storage step makes hf-cache/hub before prep-host creates
+    noo-agent (onboard runs storage, then services), so on a fresh controller
+    hub was 0:0 under a noo-agent hf-cache and the node agent could not write
+    the HF weights. prep-host gives a missing or EMPTY hub hf-cache's owner,
+    after hf-cache itself."""
+    import tempfile
+
+    for pre in ("missing", "empty"):
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            root = tmp / "noo"
+            (root / "hf-cache").mkdir(parents=True)
+            if pre == "empty":
+                (root / "hf-cache" / "hub").mkdir()
+                if IS_ROOT:
+                    os.chown(root / "hf-cache" / "hub", 0, 0)
+            calls = _run(tmp, root)
+            hub = root / "hf-cache" / "hub"
+            named = _named(calls, hub)
+            assert named == [f"-d -o noo-agent -g noo-agent {hub}"], f"{pre}: {calls}"
+            parent = _named(calls, root / "hf-cache")
+            assert parent and calls.index(parent[0]) < calls.index(named[0]), f"hub before hf-cache: {calls}"
+            assert hub.is_dir()
+            if IS_ROOT:
+                assert _owner(hub) == AGENT == _owner(root / "hf-cache")
+
+
+def test_a_hub_with_content_or_a_symlink_hub_is_left_to_the_applier():
+    """A hub with content is re-owned recursively by the self-node applier
+    (noo-apply.sh hf_hub_reown), which acts only on a 0-owned hub: re-owning
+    its top here would hide the content from it. A symlinked hub is never
+    passed to install (install -d follows the link and re-owns its target)."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        root = tmp / "noo"
+        hub = root / "hf-cache" / "hub"
+        (hub / "blobs").mkdir(parents=True)
+        (hub / "blobs" / "x").write_text("w")
+        calls = _run(tmp, root)
+        assert not _named(calls, hub), f"a hub with content was passed to install: {calls}"
+        if IS_ROOT:
+            assert _owner(hub) == (0, 0)
+
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        root = tmp / "noo"
+        (root / "hf-cache").mkdir(parents=True)
+        elsewhere = tmp / "elsewhere"
+        elsewhere.mkdir()
+        (root / "hf-cache" / "hub").symlink_to(elsewhere)
+        calls = _run(tmp, root)
+        assert not _named(calls, root / "hf-cache" / "hub"), f"a symlinked hub was passed to install: {calls}"

@@ -178,6 +178,24 @@ noo security service-key retire reranker-bot             # once the new key has 
 noo security service-key revoke reranker-bot
 ```
 
+### An over-long prompt: flag or refuse
+
+When a consumer's prompt on `/v1/chat/completions` or
+`/api/external/chat/completions` is longer than the Ollama model's context,
+Ollama cuts it. By default (`flag`) the prompt is sent and the cut is said
+after: `X-Noo-Context-Truncated: evaluated/sent_estimate/context` and
+`usage.noo_truncated` on the answer, `noo_context_truncated_total` in the
+metrics. `refuse` answers 413 `context_too_small` before sending instead, and
+tries another candidate whose context holds the prompt first.
+
+```sh
+noo security service-key set-context-overflow reranker-bot refuse
+noo security service-key set-context-overflow reranker-bot flag   # the default
+```
+
+A person sets it (the operator CLI or the console); a service key, a token
+exchanged from one or an agent's credential gets 403.
+
 Scopes are `chat`, `embeddings`, `rerank`, `classify`, `mcp` (all of them
 when `--scopes` is omitted). The raw key is printed once under
 `raw key (shown once, store it now)` — it is the only line `--quiet`
@@ -508,6 +526,7 @@ standard input), else `GH_TOKEN` / `GITHUB_TOKEN`, and is never printed.
 | `noo security service-key retire` | `<consumer>` | Finish a rotation: deactivate the superseded key, once the new one has been used |
 | `noo security service-key provision` | `<name> [--scopes <s>]... [--wait <secs>] [-y\|--yes]` | Show the declared grant and confirm, then mint, store, recreate and PROVE the key |
 | `noo security service-key set-quota` | `<consumer> <rpm>` | Set the per-minute request cap for a consumer's keys (0 = uncapped) |
+| `noo security service-key set-context-overflow` | `<consumer> flag\|refuse` | Refuse (413) or send and flag a consumer's prompts that overflow the model's context |
 | `noo security service-key self` | `[--note <label>]` | Mint or rotate the caller's own MCP key (raw key shown once) |
 | `noo security service-key self-status` | — | Show whether the caller has an active MCP key and when it was used |
 | `noo security service-key self-revoke` | — | Revoke the caller's own MCP key |

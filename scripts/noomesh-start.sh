@@ -977,6 +977,10 @@ require_compose_v2 || exit 1
     # Report, never reap: a container no compose file of this install declares
     # (186b). Exit status unchanged; `--remove-orphans` is not passed to any `up`.
     compose_report_undeclared .
+    # What this stack runs, for verify; and what ELSE of ours is running
+    # (a profile this stack does not run). Report, never reap.
+    compose_record_active . "$ACTIVE_SVCS"
+    compose_report_out_of_profile . "$ACTIVE_SVCS"
     # $ACTIVE_SVCS (computed above) is the service set THIS invocation
     # manages — tell the guard so a stale, out-of-profile Created
     # container (e.g. noo-ollama left by an earlier `noo models switch`

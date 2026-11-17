@@ -1234,6 +1234,7 @@ mod tests {
                     model: "gemma".into(),
                     source: "api",
                     actor: crate::usage::UsageActor::unknown(),
+                    cut: None,
                 };
                 let tapped = crate::usage::tap_stream(futures::stream::iter(frames), ctx);
                 count_until_dropped(Body::from_stream(tapped), move |_| {

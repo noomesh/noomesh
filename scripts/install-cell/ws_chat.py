@@ -21,6 +21,7 @@ import os
 import socket
 import ssl
 import struct
+import subprocess
 import sys
 import time
 import urllib.error
@@ -77,6 +78,49 @@ def mint_ticket(base: str, tok: str, ctx: ssl.SSLContext) -> str:
         return json.load(r)["ticket"]
 
 
+# The access token in credentials.json lives NOO_TOKEN_EXPIRE_MINUTES (15 by
+# default). The CLI refreshes it when the gateway answers 401
+# (noo-cli/src/auth.rs refresh_after_unauthorized) and saves the new pair;
+# this helper reads the file raw, so a cell whose steps run past 15 minutes
+# met a refused token (0.6.25-rc.4 matrix run 1, slots4: HTTP 401 at the
+# tool-replay, ~17 min after onboard). Every ticket now goes through ticket():
+# on a 401 it lets the CLI refresh, then tries once more.
+AUTH_401 = "auth 401"
+
+
+class AuthRefused(RuntimeError):
+    """The gateway refused the cell's own credential, also after a refresh:
+    a harness fault, never a verdict on the build under test."""
+
+
+def refresh_via_cli(timeout: float = 90) -> bool:
+    """One authenticated CLI call: on an expired access token the CLI gets the
+    401, refreshes, and saves the rotated pair to credentials.json."""
+    try:
+        return subprocess.run(["noo", "rag", "status"], capture_output=True, timeout=timeout).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def ticket(base: str, ctx: ssl.SSLContext, mint=None, refresh=None) -> str:
+    """A /ws/coordinator ticket, refreshing the stored token once on a 401."""
+    mint = mint or mint_ticket
+    refresh = refresh or refresh_via_cli
+    try:
+        return mint(base, token(), ctx)
+    except urllib.error.HTTPError as e:
+        if e.code != 401:
+            raise
+    refreshed = refresh()
+    try:
+        return mint(base, token(), ctx)
+    except urllib.error.HTTPError as e:
+        if e.code != 401:
+            raise
+        raise AuthRefused(f"{AUTH_401}: the gateway refused the cell's stored access token, also after a CLI "
+                          f"refresh (refresh {'ran' if refreshed else 'failed'}); a harness fault, not the build") from e
+
+
 def frame(text: str) -> bytes:
     payload = text.encode()
     mask = os.urandom(4)
@@ -107,13 +151,13 @@ def read_frame(s) -> tuple[int, bytes]:
 
 def ask(prompt: str, base: str = "https://localhost:8080", timeout: float = 300) -> str:
     ctx = ssl.create_default_context(cafile=cluster_ca())
-    ticket = mint_ticket(base, token(), ctx)
+    tk = ticket(base, ctx)
     u = urllib.parse.urlsplit(base)
     raw = socket.create_connection((u.hostname, u.port or 443), timeout=30)
     s = ctx.wrap_socket(raw, server_hostname=u.hostname)
     key = base64.b64encode(os.urandom(16)).decode()
     s.sendall((
-        f"GET /ws/coordinator?ticket={urllib.parse.quote(ticket)} HTTP/1.1\r\n"
+        f"GET /ws/coordinator?ticket={urllib.parse.quote(tk)} HTTP/1.1\r\n"
         f"Host: {u.netloc}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
         f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
     ).encode())
@@ -159,13 +203,20 @@ def route_status(path: str, base: str = "https://localhost:8080") -> int:
     `path`: 404 when the build under test has no such route, anything else
     (400/405/422...) when it has one. Raises when it cannot ask at all."""
     ctx = ssl.create_default_context(cafile=cluster_ca())
-    req = urllib.request.Request(base + path, data=b"{}", method="POST",
-                                 headers={"Authorization": "Bearer " + token(), "Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, context=ctx, timeout=30) as r:
-            return r.status
-    except urllib.error.HTTPError as e:
-        return e.code
+
+    def once() -> int:
+        req = urllib.request.Request(base + path, data=b"{}", method="POST",
+                                     headers={"Authorization": "Bearer " + token(), "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, context=ctx, timeout=30) as r:
+                return r.status
+        except urllib.error.HTTPError as e:
+            return e.code
+
+    code = once()
+    if code == 401 and refresh_via_cli():
+        code = once()
+    return code
 
 
 if __name__ == "__main__":

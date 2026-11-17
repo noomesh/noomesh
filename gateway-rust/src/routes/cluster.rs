@@ -4261,7 +4261,7 @@ pub(crate) fn chat_context_rows(placements: &[Value], record: &Value, profile_co
             seen.insert(model.to_string()).then(|| (model.to_string(), &p["env"]))
         })
         .map(|(model, env)| {
-            let env = crate::chat_context::with_stack_slots(env, stack.0, stack.1);
+            let env = crate::chat_context::with_stack_slots(env, crate::chat_context::stack_daemon_serves(stack.0, record), stack.1);
             let d = crate::chat_context::decide("ollama", &env, &model, record, profile_context, &specs, stack.0);
             json!({
                 "model": model,

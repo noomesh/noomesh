@@ -430,3 +430,93 @@ def test_the_rag_turn_is_asked_in_words_the_cell_has_not_used():
     doc = 'noo chat --message "what does anything.md say about the launch?"\n'
     asked = CF.rag_judge_prompt(doc)
     assert asked != CF.rag_chat_line(doc) and asked.startswith(CF.rag_chat_line(doc)), asked
+
+
+# ---- 0.6.25-rc.4 run 1 (slots4): a refused stored token, and the agent probe's
+# timeout evidence.
+
+def test_a_refused_cell_credential_is_reported_as_auth_401_not_as_the_build():
+    for err in ("AuthRefused: auth 401: the gateway refused the cell's stored access token",
+                "HTTPError: HTTP Error 401: Unauthorized"):
+        rc, why = CF.judge_tool_replay("", err, [], _facts(), "default")
+        assert rc == CF.NOT_JUDGED and why.startswith("auth 401"), why
+        assert "wire" not in why, "the old mislabel: 'no wire='"
+    # A real build fault still reads as before.
+    rc, why = CF.judge_tool_replay("", "no done frame within 300 s", [], _facts(), "default")
+    assert "auth 401" not in why
+
+
+def _ws():
+    return _load("ws_chat_ticket", ROOT / "scripts/install-cell/ws_chat.py")
+
+
+def _http_401():
+    import urllib.error
+    return urllib.error.HTTPError("https://g/api/ws-ticket", 401, "Unauthorized", {}, None)
+
+
+def test_a_ticket_refreshes_the_stored_token_once_on_a_401():
+    ws = _ws()
+    toks = iter(["old", "fresh"])
+    ws.token = lambda: next(toks)
+    seen, refreshed = [], []
+
+    def mint(base, tok, ctx):
+        seen.append(tok)
+        if tok == "old":
+            raise _http_401()
+        return "T"
+
+    assert ws.ticket("https://g", None, mint=mint, refresh=lambda: refreshed.append(1) or True) == "T"
+    assert seen == ["old", "fresh"] and refreshed == [1]
+
+
+def test_a_ticket_refused_after_the_refresh_says_auth_401_and_tries_no_third_time():
+    ws = _ws()
+    ws.token = lambda: "t"
+    calls = []
+
+    def mint(base, tok, ctx):
+        calls.append(tok)
+        raise _http_401()
+
+    with pytest.raises(ws.AuthRefused) as e:
+        ws.ticket("https://g", None, mint=mint, refresh=lambda: True)
+    assert str(e.value).startswith("auth 401") and len(calls) == 2
+    assert CF.auth_refused(f"AuthRefused: {e.value}")
+
+
+def test_a_ticket_does_not_refresh_on_anything_but_401():
+    import urllib.error
+    ws = _ws()
+    ws.token = lambda: "t"
+
+    def mint(base, tok, ctx):
+        raise urllib.error.HTTPError("u", 403, "Forbidden", {}, None)
+
+    with pytest.raises(urllib.error.HTTPError):
+        ws.ticket("https://g", None, mint=mint, refresh=lambda: pytest.fail("refreshed on a 403"))
+
+
+AE = _load("agent_evidence", ROOT / "scripts/install-cell/agent_evidence.py")
+
+
+def test_the_agent_evidence_keeps_backend_lines_and_drops_every_prompt_field():
+    line = json.dumps({"timestamp": "t", "level": "WARN", "fields": {
+        "message": "llm_http_error", "attempt": 2, "status": 503, "wire": "openai",
+        "prompt": "KESTREL-SECRET", "messages": ["KESTREL-SECRET"], "content": "KESTREL-SECRET",
+        "text": "KESTREL-SECRET", "context_cut": "none"}, "target": "noo_gateway::coordinator"})
+    kept = AE.line_view(line)
+    assert kept and "llm_http_error" in kept and '"attempt": 2' in kept and "context_cut" in kept
+    assert "KESTREL-SECRET" not in kept
+    assert AE.line_view(json.dumps({"fields": {"message": "unrelated", "prompt": "x"}})) is None
+    plain = AE.line_view("llm_backend_fallback the person asked about KESTREL-SECRET")
+    assert plain and "KESTREL-SECRET" not in plain
+
+
+def test_the_agent_probe_keeps_evidence_only_when_it_times_out():
+    run_sh = (ROOT / "scripts/install-cell/run.sh").read_text()
+    arm = run_sh[run_sh.index("      agent) a0="):run_sh.index("      console) out=")]
+    assert 'timeout 300 noo inference agent' in arm
+    assert 'if [ "$arc" = 124 ]; then' in arm and '"$RAG_AGENT_EVIDENCE" --since "$a0"' in arm
+    assert "RAG_AGENT_EVIDENCE" in run_sh[run_sh.index("export RAG_QUERY_LINE"):].split("\n", 1)[0]

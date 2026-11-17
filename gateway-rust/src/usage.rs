@@ -53,16 +53,21 @@ pub struct UsageActor {
     /// The credential or subsystem that made the call: a service key's
     /// consumer name, a cluster actor label, `heartbeat`, a channel name.
     pub consumer: Option<String>,
+    /// `consumer` is a service key's name (or the add-on's whose key bought
+    /// the token): its per-key settings apply, today the raw proxy's
+    /// context-overflow mode (`service_keys::context_overflow_for`). Never
+    /// set for a path label or a cluster actor.
+    pub keyed: bool,
 }
 
 impl UsageActor {
     /// A person acting through a named path (`telegram`, `chat`, `api`…).
     pub fn user(username: impl Into<String>, via: impl Into<String>) -> Self {
-        Self { username: Some(username.into()), consumer: Some(via.into()) }
+        Self { username: Some(username.into()), consumer: Some(via.into()), keyed: false }
     }
     /// Software or a credential with nobody behind it.
     pub fn consumer(label: impl Into<String>) -> Self {
-        Self { username: None, consumer: Some(label.into()) }
+        Self { username: None, consumer: Some(label.into()), keyed: false }
     }
     /// Nothing known — recorded as such, never guessed.
     pub fn unknown() -> Self {
@@ -375,6 +380,11 @@ pub struct StreamUsageCtx {
     pub model: String,
     pub source: &'static str,
     pub actor: UsageActor,
+    /// The raw proxy's cut watch (i802 step 1): when the stream's own count
+    /// shows the backend cut the prompt, the metric and the hourly warn.
+    /// Boxed: it rides in `raw_chat::Outcome::Stream`, and clippy keeps that
+    /// enum's variants within 200 bytes of each other.
+    pub cut: Option<Box<crate::context_cut::CutWatch>>,
 }
 
 /// Wrap a byte stream so the last usage frame seen is recorded when the
@@ -523,6 +533,15 @@ struct UsageTap {
 impl Drop for UsageTap {
     fn drop(&mut self) {
         if let Some((p, c)) = self.scanner.finish() {
+            // A cut is judged here, from the stream's last usage frame; the
+            // metric and the warn need the runtime, which a test may lack.
+            if let Some(w) = self.ctx.cut.clone() {
+                if let Some(cut) = w.judge(u64::from(p)) {
+                    if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                        rt.spawn(async move { w.note(&cut).await });
+                    }
+                }
+            }
             crate::request_trace::with_recorder(self.trace.clone(), || {
                 record(
                     self.ctx.db.clone(),
@@ -722,7 +741,7 @@ mod tests {
 
     #[test]
     fn actor_blank_strings_become_none() {
-        let a = UsageActor { username: Some("  ".into()), consumer: Some("".into()) }.normalised();
+        let a = UsageActor { username: Some("  ".into()), consumer: Some("".into()), keyed: false }.normalised();
         assert_eq!(a, UsageActor::unknown());
         let a = UsageActor::user(" alice ", "api").normalised();
         assert_eq!(a.username.as_deref(), Some("alice"));

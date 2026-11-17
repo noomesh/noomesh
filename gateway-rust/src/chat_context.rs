@@ -164,14 +164,17 @@ pub fn compose_slots(config: &Value) -> Option<u64> {
     .filter(|n| *n > 0)
 }
 
-/// The env the fit reads for an Ollama placement. On the controller's own
-/// node the chat model runs in the stack's compose Ollama, whose slot count
-/// is the stack's compose_env, not the placement: the fit then counts the
-/// slots that are (or, after this change, will be) in force there. A
-/// placement that sets OLLAMA_NUM_PARALLEL itself is left as it is.
-pub fn with_stack_slots(env: &Value, is_self: bool, stack_slots: Option<u64>) -> Value {
+/// The env the fit reads for an Ollama placement. When the chat model runs
+/// in the stack's own compose Ollama (`stack_daemon`: the controller's node
+/// where the agent manages no Ollama of its own, [`stack_daemon_serves`]),
+/// the slot count in force is the stack's compose_env, whatever the
+/// placement says: the agent never applies a placement's env to that daemon
+/// ("served natively; the agent does not start, stop or converge it"). The
+/// rc.3 slots4 cell ran 4 slots while its placement said 1 and the fit
+/// counted 1. Anywhere else, the placement's own value stands.
+pub fn with_stack_slots(env: &Value, stack_daemon: bool, stack_slots: Option<u64>) -> Value {
     let mut env = env.clone();
-    if is_self && env.get("OLLAMA_NUM_PARALLEL").is_none() {
+    if stack_daemon {
         if let Some(obj) = env.as_object_mut() {
             obj.insert("OLLAMA_NUM_PARALLEL".into(), Value::from(stack_slots.unwrap_or(DEFAULT_SLOTS).to_string()));
         } else {
@@ -181,7 +184,15 @@ pub fn with_stack_slots(env: &Value, is_self: bool, stack_slots: Option<u64>) ->
     env
 }
 
-/// Whether `node_id` is the controller's own node (its Ollama is the stack's).
+/// Whether the stack's own compose Ollama serves chat on this node: the
+/// controller's own node, and the agent reports no Ollama it manages itself
+/// (`backend_containers.ollama.managed`; empty on a one-box). An Ollama the
+/// agent manages takes the placement's env, so the placement's slots stand.
+pub fn stack_daemon_serves(is_self: bool, record: &Value) -> bool {
+    is_self && record["backend_containers"]["ollama"]["managed"].as_bool() != Some(true)
+}
+
+/// Whether `node_id` is the controller's own node.
 pub fn is_self_node(node_id: &str) -> bool {
     crate::self_node::self_node_id().as_deref() == Some(node_id)
 }
@@ -394,7 +405,7 @@ async fn read_node(state: &crate::state::AppState, node_id: &str, model: &str) -
         Err(e) => return Read::Failed(format!("placements: {e}")),
     };
     let stack_slots = compose_slots(&*state.config_yaml.read().await);
-    let env = with_stack_slots(&chat_env(&placements, model), is_self_node(node_id), stack_slots);
+    let env = with_stack_slots(&chat_env(&placements, model), stack_daemon_serves(is_self_node(node_id), &record), stack_slots);
     let tier = crate::node_tier::derive(&crate::node_tier::facts_from_capabilities(record.get("capabilities").unwrap_or(&serde_json::json!({}))))
         .tier()
         .and_then(|t| u8::try_from(t).ok());
@@ -949,8 +960,10 @@ mod tests {
     }
 
     /// The one-box's chat runs in the stack's compose Ollama: the fit counts
-    /// that daemon's slots (compose_env), the slots that will be in force,
-    /// and never overrides a placement that says its own.
+    /// that daemon's slots (compose_env), the slots in force, even over a
+    /// placement that says its own (the agent never applies it there; rc.3
+    /// slots4 cell: daemon 4, placement 1, fit 1). An Ollama the agent
+    /// manages keeps the placement's value.
     #[test]
     fn the_stack_daemon_is_fitted_with_the_stacks_own_slot_count() {
         let cfg = json!({"compose_env": {"OLLAMA_EMBED_NUM_PARALLEL": "1"}});
@@ -961,8 +974,16 @@ mod tests {
         assert_eq!(with_stack_slots(&env, true, Some(1))["OLLAMA_NUM_PARALLEL"], json!("1"));
         assert_eq!(with_stack_slots(&env, true, None)["OLLAMA_NUM_PARALLEL"], json!("4"), "compose's default, said");
         assert!(with_stack_slots(&env, false, Some(1)).get("OLLAMA_NUM_PARALLEL").is_none(), "another node's daemon is its placement's business");
-        let own = json!({"OLLAMA_NUM_PARALLEL": "2"});
-        assert_eq!(with_stack_slots(&own, true, Some(1))["OLLAMA_NUM_PARALLEL"], json!("2"), "the placement's own value stands");
+        let own = json!({"OLLAMA_NUM_PARALLEL": "1"});
+        assert_eq!(with_stack_slots(&own, true, Some(4))["OLLAMA_NUM_PARALLEL"], json!("4"), "the stack daemon's slots win over the placement's");
+        assert_eq!(with_stack_slots(&own, false, Some(4))["OLLAMA_NUM_PARALLEL"], json!("1"), "an agent-run Ollama keeps the placement's");
+        // Which daemon serves: the controller's own node with no agent-managed
+        // Ollama (a one-box reports backend_containers {}); an agent-managed
+        // one, or another node, is not the stack's.
+        assert!(stack_daemon_serves(true, &json!({"backend_containers": {}})));
+        assert!(stack_daemon_serves(true, &json!({})));
+        assert!(!stack_daemon_serves(true, &json!({"backend_containers": {"ollama": {"managed": true, "runtime": "native"}}})));
+        assert!(!stack_daemon_serves(false, &json!({"backend_containers": {}})));
         assert_eq!(slots(&with_stack_slots(&env, true, Some(1))), 1);
     }
 
