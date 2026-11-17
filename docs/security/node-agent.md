@@ -1566,6 +1566,75 @@ writable; a refusal is a FAIL naming the node and the setting, with the
 `noo cluster set-config` that fixes it. A host without systemd (a Mac) has no
 hold and no row.
 
+## Root code comes from a release
+
+The fleet signing key (`signing.key` on the controller) decides what a node
+*applies*: certs, env, units, which backends to run. Since applier generation
+2 (noomesh 0.6.27) it no longer decides what **root code** a node runs. A
+node installs a root-run file only if its sha256 is in a list the **release
+key** signed. That key's seed lives in the release pipeline and an offline
+operator copy, never on a controller. So whoever holds `signing.key`, or the
+controller's operator account, can install only code that a published release
+or rc ships.
+
+| Root-run kind | Must be listed in | Under |
+|---|---|---|
+| `applier` (`noo-apply`) | the CLI release's `sha256sums.txt` | `noo-apply.sh` |
+| `fetcher` (`noo-fetch`) | the same | `noo-fetch.sh` |
+| `hostd-binary` | the same | `noo-hostd-<target>` |
+| `harness-binary` | the same | `noo-gateway-<target>` |
+| `agent-binary` (Linux) | the stack's `stack-<tag>.lock` | `# node-agent-sha256 linux/<arch> <sha256>` |
+| Mac `cli-binary`, `hostd-binary`, `agent-binary`, `harness-binary` | the CLI release's `sha256sums.txt` | `noo-*-apple-darwin` |
+| Mac `agent-plist`, `harness-plist` | this release's own template for this node's user (never root) | — |
+
+- **The lists ride in the bundle.** `noo cluster provision` attaches
+  `sha256sums.txt` and its signature, the version text it names, and (with a
+  Linux agent) the stack lock and its signature. It checks them first with the
+  node's own rule, so it never stages a bundle the node would refuse.
+- **No older release.** A node records the newest release it applied
+  (`/etc/noo/release-floor`, root-owned; on a Mac under
+  `/Library/Application Support/noomesh/pki/`) and refuses a list older than
+  that, so a superseded release cannot be replayed.
+- **No dev path.** A build that is not a published release or rc has no
+  signed list. The node refuses its root code with exit 75 and one line
+  naming the kind, its sha256 and the remedy: roll to a published release or
+  rc.
+- **A re-key does not open a door.** The release keys are compiled into the
+  applier itself, which is root code and listed like the rest. Nothing a
+  bundle installs (`signing.pub`, `ca.crt`) feeds the check, and a bundle
+  that carries `signing-pub` is checked like any other.
+- **What stays on the signing key alone:** config (agent env and image
+  choice, certs, fleet secrets, teardown), the user's own `~/.local/bin/noo`
+  on Linux (not root), and **vendor CLIs**. A vendor CLI (Claude Code,
+  Copilot CLI, Codex) is third-party. It installs root-owned under
+  `/usr/local/bin` with only the sha256 this controller pinned
+  (`config/harness-kinds.json`) behind it: self-attested by the bundle.
+- **See it:** `noo cluster verify --controller`, rows `release check`
+  (which nodes enforce it and the floor each holds; a refusal FAILs it) and
+  `vendor CLIs` (which nodes carry a self-attested CLI).
+
+The first roll to 0.6.27 installs the checking applier on the signing key
+alone, because the applier already on the node predates the check. From then
+on the generation floor refuses any applier older than generation 2.
+
+### For agents
+
+- Never stage root code that is not in the release's signed list. If
+  `noo cluster provision` stops with `release_check`, the CLI or stack on the
+  controller is not a published release or rc: roll it (`noo upgrade --all`).
+  There is no opt-in, dev key or environment switch, and none may be added.
+- A node's exit 75 in `apply_rc`, or a `release check` FAIL, names the kind
+  and sha256: compare it with the release's `sha256sums.txt` or
+  `stack-<tag>.lock`.
+- Rolling a node BACK to an older release is refused by design. The remedy is
+  a newer release or rc that carries the fix, never deleting the floor file.
+- `NOO_APPLY_RELEASE_PUBKEYS_HEX` and `NOO_APPLY_RELEASE_FLOOR` are test seams,
+  read only in `NOO_APPLY_VERIFY_ONLY=1` mode, which installs nothing.
+- A Linux node needs OpenSSL 3 (`pkeyutl -rawin`) to verify the Ed25519
+  signature. With OpenSSL 1.1.1 it refuses root code and says so.
+- `noo cluster upgrade-hostd` cross-builds hostd from a checkout; nodes refuse
+  that binary. Roll hostd with the release (`noo upgrade --nodes`).
+
 ## What is still root
 
 `noo-hostd` is root on a worker node (on the controller it runs as the operator's user), and deliberately so: it has no listener, it

@@ -362,11 +362,14 @@ def test_release_checks_the_cli_version_against_the_tag():
 
 def test_the_published_asset_list_is_unchanged():
     """Reuse changes where three binaries come from, never what is published:
-    the same 30 assets, the same manifest and signature (30 since the i688
-    follow-up added noo-release-version, the manifest's version row)."""
+    the same 32 assets, the same manifest and signature (30 since the i688
+    follow-up added noo-release-version, the manifest's version row; 32 since
+    i908 published the node's applier and fetcher, which nodes check against
+    the manifest)."""
     create = next(s for s in _steps("release") if s.get("name") == "Create GitHub Release")
     assets = re.findall(r"dist/(\S+)", create["run"].split("scripts/release-upload-assets.sh", 1)[1].split("gh release edit", 1)[0])
-    assert len(assets) == 30, assets
+    assert len(assets) == 32, assets
+    assert "noo-apply.sh" in assets and "noo-fetch.sh" in assets, "a manifest row names a file nobody can fetch"
     for n in P.REUSABLE:
         assert n in assets and f"{n}.sha256" in assets
     assert "sha256sums.txt" in assets and "sha256sums.txt.sig" in assets
@@ -389,18 +392,28 @@ def test_the_manifest_names_its_own_version():
     assert "sha256sum -c sha256sums.txt" in run[gen:], "a by-hand `sha256sum -c` is not proven to pass"
 
 
-def _run_checksum_step(tmp_path, cli_version: str, ref_name: str | None):
+def _run_checksum_step(tmp_path, cli_version: str, ref_name: str | None, embeds: bool = True):
     """Run the release job's REAL 'Generate SHA-256 checksums' script in a
-    scratch dist/ whose CLI reports `cli_version`; return (proc, dist)."""
+    scratch dist/ whose CLI reports `cli_version`; return (proc, dist). The
+    Linux CLIs embed the tree's applier and fetcher unless `embeds` is False."""
     import os
     import subprocess
     run = next(s for s in _steps("release") if s.get("name") == "Generate SHA-256 checksums")["run"]
     dist = tmp_path / "dist"
     dist.mkdir()
+    (tmp_path / "scripts").mkdir()
+    node_tools = b""
+    for n in ("noo-apply.sh", "noo-fetch.sh"):
+        body = (ROOT / "scripts" / n).read_bytes()
+        (tmp_path / "scripts" / n).write_bytes(body)
+        node_tools += body
+    if not embeds:
+        node_tools = node_tools[:-10]
     cli = dist / "noo-x86_64-unknown-linux-gnu"
-    cli.write_text(f'#!/bin/sh\necho "noo (noomesh CLI, alias: pai) {cli_version}"\n')
+    cli.write_bytes(f'#!/bin/sh\necho "noo (noomesh CLI, alias: pai) {cli_version}"\nexit 0\n'.encode() + node_tools)
     cli.chmod(0o755)
-    for n in ("noo-x86_64-unknown-linux-musl", "noo-aarch64-apple-darwin", "noo-gateway-x86_64-unknown-linux-musl"):
+    (dist / "noo-x86_64-unknown-linux-musl").write_bytes(b"noo-x86_64-unknown-linux-musl" + node_tools)
+    for n in ("noo-aarch64-apple-darwin", "noo-gateway-x86_64-unknown-linux-musl"):
         (dist / n).write_bytes(n.encode())
     env = {k: v for k, v in os.environ.items() if k != "GITHUB_REF_NAME"}
     if ref_name is not None:
@@ -429,6 +442,17 @@ def test_the_checksum_step_binds_the_manifest_to_the_tag(tmp_path, tag, version)
     assert not _bound(man, other), "an rc's manifest binds the final (or the reverse)"
     # Anyone verifying by hand: every row checks, the version row included.
     assert "noo-release-version: OK" in p.stdout, p.stdout
+    # i908: the node's applier and fetcher are rows, as the CLIs embed them.
+    for n in ("noo-apply.sh", "noo-fetch.sh"):
+        want = hashlib.sha256((ROOT / "scripts" / n).read_bytes()).hexdigest()
+        assert P.manifest_row(man, n) == want, (n, man)
+
+
+def test_the_checksum_step_refuses_a_cli_that_does_not_embed_the_node_tools(tmp_path):
+    p, dist = _run_checksum_step(tmp_path, "0.6.27", "noo-cli-v0.6.27", embeds=False)
+    assert p.returncode != 0, (p.stdout, p.stderr)
+    assert "does not embed this tree's scripts/noo-apply.sh" in p.stdout + p.stderr
+    assert not (dist / "sha256sums.txt").exists()
 
 
 @pytest.mark.parametrize("tag,version", [

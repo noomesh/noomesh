@@ -4946,6 +4946,21 @@ pub(crate) fn verified_stack_lock(g: &Globals, tag: &str) -> Result<Option<Strin
     r
 }
 
+/// The release-signed stack lock of `tag` AND its signature text (i908: a
+/// bundle that carries the Linux agent carries both, and the node verifies
+/// them itself). The lock is [`verified_stack_lock`]'s; the signature is
+/// fetched from the same release and verified over those exact bytes.
+/// `Ok(None)`: the release publishes no lock.
+pub(crate) fn verified_stack_lock_signed(g: &Globals, tag: &str) -> Result<Option<(String, String)>, String> {
+    let Some(text) = verified_stack_lock(g, tag)? else { return Ok(None) };
+    let rel = format!("stack-{tag}");
+    let name = format!("{rel}.lock.sig");
+    let sig = fetch_tag_file(g, &rel, &name).map_err(|e| format!("{name}: {}", e.summary()))?;
+    let sig = String::from_utf8_lossy(&sig).to_string();
+    crate::release_sig::verify(text.as_bytes(), &sig).map_err(|e| format!("{name}: {e}"))?;
+    Ok(Some((text, sig)))
+}
+
 /// [`fetch_stack_lock`] without the exit: `Err((code, message, remedy))`.
 pub(crate) type StackLockErr = (&'static str, String, Option<&'static str>);
 fn try_stack_lock(g: &Globals, tag: &str) -> Result<Option<String>, StackLockErr> {

@@ -50,11 +50,23 @@ def test_the_stack_lock_is_digest_rows_and_headers_only() -> None:
     assembled = [l.strip() for l in step.splitlines() if '> "stack-$TAG.lock"' in l]
     assert len(assembled) == 1, f"expected one line that writes the lock, found {assembled}"
     line = assembled[0]
-    assert line == '{ echo "# stack $TAG"; echo "# mesh-migration-head $head"; cat storage-dirs.txt; cat digests/* | sort; } > "stack-$TAG.lock"', (
-        "the stack lock must be built from the tag line, the migration head, the checked-in storage lines "
-        "and image digest rows only; "
+    assert line == '{ echo "# stack $TAG"; echo "# mesh-migration-head $head"; cat storage-dirs.txt; cat agent-shas.txt; cat digests/* | sort; } > "stack-$TAG.lock"', (
+        "the stack lock must be built from the tag line, the migration head, the checked-in storage lines, "
+        "the node agent's sha256 rows (i908) and image digest rows only; "
         f"anything else could carry a key into a signed release: {line}"
     )
+
+
+def test_the_agent_sha_rows_are_exactly_two_validated_rows() -> None:
+    """i908: agent-shas.txt is written in a step that holds no seed, and the
+    signing step refuses it unless it is exactly the two `# node-agent-sha256`
+    rows, so nothing else can ride into the signed lock."""
+    job = _job("lock")
+    made = job.index(": > agent-shas.txt")
+    assert "NOO_RELEASE_SIGNING_SEED" not in job[job.rindex("- name:", 0, made):made], "the writing step holds no seed"
+    sign = _step(job, "Assemble + sign stack-$TAG.lock")
+    check = """[ "$(wc -l < agent-shas.txt)" = 2 ] && [ "$(grep -cE '^# node-agent-sha256 linux/(amd64|arm64) [0-9a-f]{64}$' agent-shas.txt)" = 2 ]"""
+    assert check in sign and sign.index(check) < sign.index('> "stack-$TAG.lock"')
 
 
 def test_the_storage_lines_are_the_checked_in_file_validated_before_signing() -> None:
