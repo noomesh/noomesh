@@ -428,6 +428,12 @@ func contentRangeStart(v string) (int64, bool) {
 // sha256. A VERIFICATION failure — callers must refuse, never fall back.
 var ErrDigestMismatch = errors.New("digest mismatch")
 
+// HashFile is the sha256 (lowercase hex) of a file already on disk, hashed
+// at lowered priority like every other verification hash on this node. For
+// callers outside this package that verify through a VerifiedRecord
+// themselves (the ollama store check, docker/ollama_verify.go).
+func HashFile(path string) (string, error) { return hashFile(path, nil) }
+
 // hashCalls counts hashFile calls: the tests' view of "re-hashed or not".
 var hashCalls atomic.Int64
 

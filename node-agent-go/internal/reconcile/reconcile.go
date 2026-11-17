@@ -246,6 +246,10 @@ type Reconciler struct {
 	pullMu      sync.Mutex
 	ollamaPulls map[string]*ollamaPullState
 
+	// ollamaVerify checks every placed ollama model's bytes against the
+	// controller's store, off the tick (ollama_verify.go). nil = not wired.
+	ollamaVerify *ollamaVerifyLoop
+
 	// storeHas says whether the controller's store publishes the model's
 	// Modelfile, i.e. whether it reaches nodes only via `noo cluster
 	// import-model`. (false, err) is "could not ask".
@@ -296,6 +300,7 @@ func New(cfg *config.Config, docker *dockerpkg.Client, client *http.Client, harn
 		cfg:             cfg,
 		docker:          docker,
 		ollamaPulls:     map[string]*ollamaPullState{},
+		ollamaVerify:    newOllamaVerifyLoop(ollamaVerifier(docker)),
 		storeHas:        dockerpkg.ModelInStore,
 		importModel:     docker.ImportOllamaModel,
 		client:          client,
@@ -701,6 +706,9 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 				// loopback API the probe uses.
 				// Every role's model, not just the primary.
 				r.ensureOllamaModels(ctx, r.cfg.NodeID, t.ollamaRows, r.native.HasModel, r.native.Pull)
+				// Report only on a native ollama: never repaired, never
+				// refused (the server is the operator's).
+				r.verifyOllamaModels(ctx, t.ollamaRows, true)
 				// Advertise what the server holds, not only what it
 				// has loaded: an idle ollama has nothing loaded, and a
 				// heartbeat with no model is never routed to.
@@ -745,12 +753,15 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 		if isRunning && modelname.Matches(curModel, p.Model) {
 			// Running as asked: an earlier start failure no longer
 			// applies.
-			refusals.Clear("backend_start", p.Backend)
+			r.clearBackendStart(p.Backend)
 			if p.Backend == "ollama" {
 				// The container is up with OLLAMA_MODEL set; that says
 				// nothing about whether the weights are there. Pull the
 				// tag if the container lacks it (off-tick; see ollamaPulls).
 				r.ensureOllamaModels(ctx, r.cfg.NodeID, t.ollamaRows, r.docker.OllamaHasModel, r.docker.OllamaPull)
+				// Then the bytes it holds, against the controller's store
+				// (off-tick; see ollama_verify.go).
+				r.verifyOllamaModels(ctx, t.ollamaRows, false)
 			}
 			curHash, hasLabel := t.specLabels[p.Backend]
 			switch decideBackendDrift(hasLabel, curHash, desiredHash, r.driftRecreated[p.Backend], t.floating[p.Backend]) {
@@ -894,7 +905,7 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 			refusals.Record("backend_start", p.Backend, err.Error())
 			return
 		}
-		refusals.Clear("backend_start", p.Backend)
+		r.clearBackendStart(p.Backend)
 	}
 }
 
@@ -925,6 +936,10 @@ func (r *Reconciler) reportAndCleanup(ctx context.Context, t *tick) bool {
 		}
 	}
 	modelpresence.Retain(keep)
+	if len(t.ollamaRows) == 0 {
+		// No ollama placed: no verification result or refusal outlives it.
+		r.ollamaVerify.retain(nil)
+	}
 	return true
 }
 
@@ -1562,4 +1577,19 @@ func egressReaderFor(h hostsvc.Service) func(ctx context.Context) hostsvc.Egress
 	}
 	rd := hostsvc.DefaultEgressReader()
 	return rd.Read
+}
+
+// ollamaVerifier is the production check: one verifier per lane (the
+// container's store, or a native ollama's), built once.
+func ollamaVerifier(c *dockerpkg.Client) func(context.Context, string, bool) dockerpkg.OllamaVerifyResult {
+	var once [2]sync.Once
+	var vs [2]*dockerpkg.OllamaVerifier
+	return func(ctx context.Context, model string, native bool) dockerpkg.OllamaVerifyResult {
+		i := 0
+		if native {
+			i = 1
+		}
+		once[i].Do(func() { vs[i] = c.NewOllamaVerifier(native) })
+		return vs[i].Verify(ctx, model)
+	}
 }
