@@ -605,10 +605,52 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
         (Some("off"), "running") => out.push(fail("harness", "policy off but the harness is running", format!("noo cluster unplace {id} harness"))),
         (Some(p), s) => out.push(ok("harness", format!("{} (policy {p})", if s.is_empty() { "-" } else { s }))),
     } }
+    out.extend(model_stores_check(id, n));
     out.extend(harness_tasks_check(n));
     out.extend(harness_egress_check(id, n));
     settle_after_roll(n, &mut out);
     out
+}
+
+/// The `model stores` row (proposal 61 §7b): no model store on the node is
+/// writable by every account on the host. The agent reports each declared
+/// data root and its first-level subdirectories that are world-writable
+/// (o+w without the sticky bit) as `data_roots.stores.world_writable`; a
+/// healthy node sends only the count it checked. A world-writable store is a
+/// store anyone can plant model bytes in, so the WARN names each path, its
+/// mode and owner, the exact chmod, and what that store's loads are protected
+/// by today. No row from an agent that does not report it (it predates the
+/// field; `noo upgrade --all` rolls it).
+pub(crate) fn model_stores_check(id: &str, n: &Value) -> Option<Check> {
+    const NAME: &str = "model stores";
+    let st = n["data_roots"].get("stores").filter(|v| v.is_object())?;
+    let checked = st["checked"].as_u64().unwrap_or(0);
+    let bad: Vec<&Value> = st["world_writable"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
+    if bad.is_empty() {
+        return Some(ok(NAME, format!("none world-writable ({checked} store director{} checked)", if checked == 1 { "y" } else { "ies" })));
+    }
+    let guard = |store: &str| match store {
+        "hf_cache" => "HF weights are re-verified against the controller's manifest on load",
+        "models" => "GGUF files are re-verified at start only when the controller has a manifest for them",
+        "ollama" => "the Ollama store is NOT re-verified on load",
+        _ => "anyone can rename or replace the stores under it",
+    };
+    let mut parts = Vec::new();
+    let mut fixes = Vec::new();
+    for e in &bad {
+        let path = e["path"].as_str().unwrap_or("?");
+        let owner = match (e["uid"].as_i64(), e["gid"].as_i64()) {
+            (Some(u), Some(g)) => format!(", owner {u}:{g}"),
+            _ => String::new(),
+        };
+        parts.push(format!("{path} (mode {}{owner}; {})", e["mode"].as_str().unwrap_or("?"), guard(e["store"].as_str().unwrap_or(""))));
+        fixes.push(format!("sudo chmod o-w {path}"));
+    }
+    Some(warn(NAME, format!(
+        "{} world-writable: any account on {id} can plant model bytes there: {}",
+        bad.len(), parts.join("; ")),
+        Some(format!("on {id}: {}   # keep the owner; hand downloads: `noo models pull`, or run them as the store's owner",
+            fixes.join(" && ")))))
 }
 
 /// The `harness egress` row (enforcement step 1): whether this node's harness,
@@ -15401,5 +15443,56 @@ mod cpu_only_ollama_slots_tests {
         let compose = include_str!("../../../docker-compose.cluster.yml");
         assert!(compose.contains("\n  ollama-embed:\n"), "the service the remedy restarts");
         assert!(compose.contains("OLLAMA_NUM_PARALLEL=${OLLAMA_EMBED_NUM_PARALLEL:-4}"), "the key the row reads is the one compose reads");
+    }
+}
+
+#[cfg(test)]
+mod model_stores_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// An agent that does not report the field gives no row.
+    #[test]
+    fn no_row_from_an_agent_that_does_not_report_stores() {
+        assert!(model_stores_check("n1", &json!({"data_roots": {"noo_data_root": "/var/lib/noo"}})).is_none());
+        assert!(model_stores_check("n1", &json!({})).is_none());
+    }
+
+    /// Nothing world-writable is OK, with the count the agent checked.
+    #[test]
+    fn a_node_with_no_world_writable_store_is_ok() {
+        let c = model_stores_check("n1", &json!({"data_roots": {"stores": {"checked": 7, "world_writable": []}}})).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("7 store directories checked"), "{}", c.detail);
+    }
+
+    /// Each world-writable store is a WARN naming its path, mode, owner, the
+    /// exact chmod, and what its loads are protected by.
+    #[test]
+    fn a_world_writable_store_warns_with_the_path_the_chmod_and_its_protection() {
+        let n = json!({"data_roots": {"stores": {"checked": 9, "world_writable": [
+            {"path": "/data/noo/hf-cache", "store": "hf_cache", "mode": "0777", "uid": 1000, "gid": 1000},
+            {"path": "/data/noo/ollama", "store": "ollama", "mode": "0777", "uid": 1000, "gid": 1000},
+        ]}}});
+        let c = model_stores_check("awolf", &n).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        for want in ["2 world-writable", "/data/noo/hf-cache (mode 0777, owner 1000:1000",
+            "HF weights are re-verified", "/data/noo/ollama", "the Ollama store is NOT re-verified on load"] {
+            assert!(c.detail.contains(want), "{want}: {}", c.detail);
+        }
+        let r = c.remedy.unwrap();
+        assert!(r.starts_with("on awolf: sudo chmod o-w /data/noo/hf-cache && sudo chmod o-w /data/noo/ollama"), "{r}");
+        assert!(r.contains("noo models pull"), "{r}");
+    }
+
+    /// The row is part of every node's checks.
+    #[test]
+    fn node_checks_carry_the_model_stores_row() {
+        let n = json!({"id": "n1", "status": "online",
+            "data_roots": {"stores": {"checked": 4, "world_writable": [{"path": "/var/lib/noo/models", "store": "models", "mode": "0777"}]}}});
+        let c = node_checks(&n, "", "", 0, None);
+        let row = c.iter().find(|c| c.name == "model stores").expect("a model stores row");
+        assert_eq!(row.verdict, Verdict::Warn);
+        assert!(row.detail.contains("GGUF files are re-verified at start only when the controller has a manifest"), "{}", row.detail);
     }
 }
