@@ -5921,7 +5921,7 @@ fn ensure_self_agent(ctx: &mut Ctx) {
     };
     let identity_ok = crate::commands::provision::pull_units_missing(&node_id).is_empty();
     let interactive = !ctx.non_interactive && ctx.ui.inherit_stdio() && super::prompt::stdin_is_tty();
-    let root_ok = ctx.skip.root_ok;
+    let root_ok = ctx.skip.root_ok || running_as_root();
     let controller = crate::role::detect().controller;
     use crate::commands::provision::{self_agent_step, SelfAgentStep};
     match self_agent_step(controller.as_ref(),
@@ -6499,8 +6499,34 @@ pub(crate) enum RootStep {
     Refuse(String),
 }
 
+/// i907: a process that is ALREADY root needs no sudo for a root step and
+/// nothing can prompt, so it counts as `--root-ok` (the rehearsal, the
+/// sandbox script, a root shell). Read from geteuid, never by running sudo.
+/// Tests see `false` unless one sets [`AS_ROOT`], so a root test runner does
+/// not change their verdicts.
+pub(crate) fn running_as_root() -> bool {
+    #[cfg(test)]
+    {
+        AS_ROOT.with(|c| c.get())
+    }
+    #[cfg(all(not(test), unix))]
+    {
+        // SAFETY: geteuid has no preconditions.
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(all(not(test), not(unix)))]
+    {
+        false
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static AS_ROOT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub(crate) fn root_step(at_terminal: bool, root_ok: bool, what: &str, cmd: &str) -> RootStep {
-    if at_terminal || root_ok {
+    if at_terminal || root_ok || running_as_root() {
         RootStep::Run
     } else {
         RootStep::Refuse(format!(
@@ -6523,7 +6549,7 @@ pub(crate) fn stdin_at_terminal() -> bool {
 
 fn hostd_can_run_here(ctx: &mut Ctx) -> bool {
     let interactive = !ctx.non_interactive && ctx.ui.inherit_stdio() && super::prompt::stdin_is_tty();
-    match hostd_install_decision(interactive, ctx.skip.root_ok) {
+    match hostd_install_decision(interactive, ctx.skip.root_ok || running_as_root()) {
         HostdInstall::Interactive => true,
         HostdInstall::PasswordlessSudo => {
             ctx.info("noo-hostd: no terminal, and --root-ok says sudo needs no password here — installing it (controller mode, a user unit)");
@@ -9024,6 +9050,11 @@ mod hostd_tests {
         assert!(why.contains("no terminal") && why.contains("run it at a terminal: noo onboard --only services"), "{why}");
         assert!(why.contains("--root-ok"), "the refusal names the opt-in: {why}");
         assert!(root_step_runs(true, false) && root_step_runs(false, true) && !root_step_runs(false, false));
+        // Already root: no sudo runs, nothing can prompt — it runs, unattended.
+        AS_ROOT.with(|c| c.set(true));
+        let as_root = root_step(false, false, "the CA trust", "noo onboard --only services");
+        AS_ROOT.with(|c| c.set(false));
+        assert_eq!(as_root, RootStep::Run, "a root process runs its root steps without --root-ok");
     }
 
     /// i251 + i907: `--ci` on a host with systemd. A terminal is only needed
