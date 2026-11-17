@@ -1574,10 +1574,12 @@ or rc ships.
   `sha256sums.txt` and its signature, the version text it names, and (with a
   Linux agent) the stack lock and its signature. It checks them first with the
   node's own rule, so it never stages a bundle the node would refuse.
-- **No older release.** A node records the newest release it applied
-  (`/etc/noo/release-floor`, root-owned; on a Mac under
-  `/Library/Application Support/noomesh/pki/`) and refuses a list older than
-  that, so a superseded release cannot be replayed.
+- **One step back, no further.** A node records the last two finals it
+  applied (`/etc/noo/release-floor`, root-owned; on a Mac under
+  `/Library/Application Support/noomesh/pki/`). It accepts the current final
+  and the previous one, and an rc of the current or a later release, nothing
+  older. So a bad release can be rolled back once, and an old release cannot
+  be replayed.
 - **No dev path.** A build that is not a published release or rc has no
   signed list. The node refuses its root code with exit 75 and one line
   naming the kind, its sha256 and the remedy: roll to a published release or
@@ -1609,14 +1611,17 @@ on the generation floor refuses any applier older than generation 2.
 - A node's exit 75 in `apply_rc`, or a `release check` FAIL, names the kind
   and sha256: compare it with the release's `sha256sums.txt` or
   `stack-<tag>.lock`.
-- Rolling a node BACK to an older release is refused by design. The remedy is
-  a newer release or rc that carries the fix, never deleting the floor file.
+- A node steps back one final at most. Two finals back is refused by design:
+  the remedy is a newer release or rc that carries the fix, never editing the
+  floor file.
 - `NOO_APPLY_RELEASE_PUBKEYS_HEX` and `NOO_APPLY_RELEASE_FLOOR` are test seams,
   read only in `NOO_APPLY_VERIFY_ONLY=1` mode, which installs nothing.
-- A Linux node needs OpenSSL 3 (`pkeyutl -rawin`) to verify the Ed25519
-  signature. With OpenSSL 1.1.1 it refuses root code and says so.
-- `noo cluster upgrade-hostd` cross-builds hostd from a checkout; nodes refuse
-  that binary. Roll hostd with the release (`noo upgrade --nodes`).
+- A Linux node verifies the Ed25519 signature with OpenSSL 3 (`pkeyutl
+  -rawin`), else with a standard-library Ed25519 check in python3 that is
+  part of the applier (so the applier's release row covers it). With
+  neither, it refuses root code: "needs OpenSSL 3 or python3".
+- `noo cluster upgrade-hostd` ships the release's own hostd asset with the
+  release's signed list; there is no checkout build.
 
 ## What is still root
 
