@@ -1401,6 +1401,79 @@ grant_traverse_flush_missing() {
 }
 # END grant_traverse
 
+# ── hf_hub_reown NOO_DATA_ROOT HF_CACHE_DIR ───────────────────────────────
+# HF_CACHE_DIR/hub is where HF weights land (node-agent-go MirrorHFRepo
+# preseeds into HF_CACHE_DIR/hub). On a fresh controller the onboard storage
+# step made hub BEFORE prep-host created noo-agent, so it stayed 0:0 while
+# prep-host re-owned hf-cache to noo-agent: the agent could not write the
+# weights (pop-os since 2026-09-07, a root-owned hub WITH content whose
+# snapshots/ are relative symlinks into ../../blobs). This root applier
+# repairs exactly that, and nothing else:
+#   a. the target is "$HF_CACHE_DIR/hub", HF_CACHE_DIR from the staged
+#      agent-env;
+#   b. HF_CACHE_DIR resolves (realpath -e) strictly INSIDE NOO_DATA_ROOT and
+#      no component of it below the root is a symlink, else refused;
+#   c. hub itself a symlink, or not a directory: refused;
+#   d. acts only when hub's owner uid is 0 AND hf-cache's owner is noo-agent;
+#      hub takes hf-cache's uid:gid;
+#   e. `chown -R -P -h`: owner only (never a chmod), physical walk, a symlink
+#      is re-owned itself and never followed out of the tree;
+#   f. one line: "re-owned <hub> (<n> entries) to noo-agent", or the refusal.
+# HF_HUB_CHOWN / HF_HUB_ROOT_UID / HF_HUB_AGENT_USER are fixed here; the
+# block's test (tests/test_apply_hf_hub_reown.py) sources it and overrides
+# them to run unprivileged (a chown shim that logs what it would re-own).
+# BEGIN hf_hub_reown
+HF_HUB_CHOWN=chown
+HF_HUB_ROOT_UID=0
+HF_HUB_AGENT_USER=noo-agent
+hf_hub_refuse() {
+    echo "noo-apply: WARNING: hf-cache/hub not re-owned: $1" >&2
+}
+hf_hub_reown() {
+    _hh_root="${1%/}"; _hh_cache="${2%/}"
+    [ -n "$_hh_root" ] && [ -n "$_hh_cache" ] || return 0
+    _hh_hub="$_hh_cache/hub"
+    { [ -e "$_hh_hub" ] || [ -L "$_hh_hub" ]; } || return 0
+    _hh_auid="$(id -u "$HF_HUB_AGENT_USER" 2>/dev/null)" || return 0
+    [ -n "$_hh_auid" ] || return 0
+    # b: physically inside the data root.
+    _hh_rr="$(realpath -e -- "$_hh_root" 2>/dev/null)" \
+        || { hf_hub_refuse "NOO_DATA_ROOT $_hh_root does not resolve"; return 0; }
+    _hh_rc="$(realpath -e -- "$_hh_cache" 2>/dev/null)" \
+        || { hf_hub_refuse "HF_CACHE_DIR $_hh_cache does not resolve"; return 0; }
+    case "$_hh_rc" in
+        "$_hh_rr"/?*) ;;
+        *) hf_hub_refuse "HF_CACHE_DIR $_hh_cache resolves to $_hh_rc, not inside NOO_DATA_ROOT $_hh_rr"; return 0 ;;
+    esac
+    _hh_d="$_hh_cache"
+    while [ "$_hh_d" != "$_hh_root" ]; do
+        if [ -L "$_hh_d" ]; then
+            hf_hub_refuse "$_hh_d is a symlink (HF_CACHE_DIR $_hh_cache must not pass through one below NOO_DATA_ROOT)"; return 0
+        fi
+        _hh_up="$(dirname -- "$_hh_d")"
+        if [ "$_hh_up" = "$_hh_d" ]; then
+            hf_hub_refuse "HF_CACHE_DIR $_hh_cache is not under NOO_DATA_ROOT $_hh_root"; return 0
+        fi
+        _hh_d="$_hh_up"
+    done
+    # c: hub is a real directory.
+    if [ -L "$_hh_hub" ]; then hf_hub_refuse "$_hh_hub is a symlink"; return 0; fi
+    if [ ! -d "$_hh_hub" ]; then hf_hub_refuse "$_hh_hub is not a directory"; return 0; fi
+    # d: only the 0-owned hub under the agent's hf-cache.
+    _hh_huid="$(stat -c %u -- "$_hh_hub")" || return 0
+    _hh_cown="$(stat -c %u:%g -- "$_hh_cache")" || return 0
+    [ "$_hh_huid" = "$HF_HUB_ROOT_UID" ] || return 0
+    [ "${_hh_cown%%:*}" = "$_hh_auid" ] || return 0
+    # e: owner only, physical, never through a symlink.
+    _hh_n="$(find -P "$_hh_hub" -mindepth 1 2>/dev/null | wc -l | tr -d ' ')"
+    if "$HF_HUB_CHOWN" -R -P -h "$_hh_cown" -- "$_hh_hub"; then
+        echo "noo-apply: re-owned $_hh_hub ($_hh_n entries) to $HF_HUB_AGENT_USER"
+    else
+        hf_hub_refuse "chown -R -P -h $_hh_cown $_hh_hub failed"
+    fi
+}
+# END hf_hub_reown
+
 # BEGIN host_telemetry
 # host-telemetry — switch off tailscaled's client-log upload on this node
 # (docs/security/telemetry.md, "Host software"). Delivered ONLY by an
@@ -1780,6 +1853,10 @@ if [ -f "$WORK/files/agent-env" ]; then
         [ -n "$_v" ] && grant_traverse noo-agent "$_v"
     done
     grant_traverse_flush_missing
+    # A root-owned hf-cache/hub under the agent's hf-cache (fresh-controller
+    # order: storage step before prep-host made noo-agent): re-owned here.
+    hf_hub_reown "$(grep -E '^NOO_DATA_ROOT=' "$WORK/files/agent-env" | tail -1 | cut -d= -f2-)" \
+        "$(grep -E '^HF_CACHE_DIR=' "$WORK/files/agent-env" | tail -1 | cut -d= -f2-)"
     applied="$applied $ae_state"
 fi
 
