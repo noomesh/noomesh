@@ -2085,7 +2085,7 @@ pub(crate) fn self_agent_step(
     agent_active: bool,
     identity_ok: bool,
     interactive: bool,
-    sudo_quiet: bool,
+    root_ok: bool,
 ) -> SelfAgentStep {
     use crate::role::Controller;
     match controller {
@@ -2097,10 +2097,11 @@ pub(crate) fn self_agent_step(
     if identity_ok {
         return if agent_active { SelfAgentStep::AlreadyOnRail } else { SelfAgentStep::Rail };
     }
-    if !interactive && !sudo_quiet {
+    if !interactive && !root_ok {
         return SelfAgentStep::Skip(
-            "the node identity is missing and creating it takes sudo, which would prompt in this \
-             non-interactive run — run `noo onboard --only services` at a terminal".into());
+            "the node identity is missing and creating it takes sudo, and this run has no terminal \
+             to ask at — run `noo onboard --only services` at a terminal (unattended, where sudo \
+             needs no password, add --root-ok)".into());
     }
     if agent_installed { SelfAgentStep::Rail } else { SelfAgentStep::FirstInstall }
 }
