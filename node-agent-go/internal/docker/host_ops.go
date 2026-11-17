@@ -80,6 +80,25 @@ func (c *Client) runHelper(ctx context.Context, binds []string, cmd []string, ti
 // same bytes to the shell as one already-split word, whatever is in them.
 // Callers still validate their inputs (hostPathLeafOK); this is the layer
 // that makes a missed validation a wrong path instead of an extra command.
+// helperCaps is the whole capability set of a helper container.
+var helperCaps = []string{"CHOWN", "DAC_OVERRIDE", "FOWNER"}
+
+// helperHostConfig is a helper container's HostConfig. The helper is root in
+// a throwaway container with host binds (proposal 61 phase 0), so it keeps
+// only what its two jobs need (`test -e` and `chown -R`): CHOWN, and
+// DAC_OVERRIDE / FOWNER to traverse and re-own trees it does not own. No
+// network, and no new privileges from a setuid file in a bound tree.
+func helperHostConfig(binds []string) *container.HostConfig {
+	return &container.HostConfig{
+		Binds:       binds,
+		AutoRemove:  false, // remove manually after reading logs
+		CapDrop:     []string{"ALL"},
+		CapAdd:      append([]string(nil), helperCaps...),
+		SecurityOpt: []string{"no-new-privileges"},
+		NetworkMode: "none",
+	}
+}
+
 func (c *Client) runHelperScript(ctx context.Context, binds []string, script string, args []string, timeout time.Duration) (int, string, error) {
 	// The image first. A host-process node never pulled it and cannot reach
 	// the private registry, so "No such image" from ContainerCreate was the
@@ -103,10 +122,7 @@ func (c *Client) runHelperScript(ctx context.Context, binds []string, script str
 		Cmd:        cmdv,
 		Labels:     map[string]string{"noo.managed-by": "node-agent-go", "noo.helper": "true"},
 	}
-	hostCfg := &container.HostConfig{
-		Binds:      binds,
-		AutoRemove: false, // remove manually after reading logs
-	}
+	hostCfg := helperHostConfig(binds)
 
 	resp, err := c.docker.ContainerCreate(ctx, client.ContainerCreateOptions{
 		Config:     cfg,

@@ -66,6 +66,9 @@ var (
 	}
 )
 
+// ollamaStoreUnderRoots is ValidateHostPathUnderRoots; a seam for tests.
+var ollamaStoreUnderRoots = ValidateHostPathUnderRoots
+
 // ollamaListDir lists a directory's direct children (full paths); a seam.
 var ollamaListDir = func(path string) []string {
 	ents, err := os.ReadDir(path)
@@ -109,8 +112,16 @@ func (c *Client) ensureOllamaStoreOwned(ctx context.Context, dir string) error {
 	if dir == "" || !ollamaStoreNeedsReown(dir) {
 		return nil
 	}
+	// The helper that re-owns is root with a read-write bind: the store must
+	// resolve (symlinks followed) to a path under one of this node's
+	// declared data roots, never a system path (proposal 61 phase 0).
+	clean, verr := ollamaStoreUnderRoots(dir)
+	if verr != nil {
+		return fmt.Errorf("refusing to re-own the ollama store: %w", verr)
+	}
 	slog.Info("ollama store is not owned by the hardened image's uid; re-owning it once (chown only, no models touched)",
-		"dir", dir, "uid", ollamaStoreUID)
+		"dir", clean, "uid", ollamaStoreUID)
+	dir = clean
 	code, out, err := ollamaReownRun(ctx, c, dir)
 	if err != nil {
 		return fmt.Errorf("re-own the ollama store %s for the non-root image: %w (or run: sudo chown -R %d:%d %s)",

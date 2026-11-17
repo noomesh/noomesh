@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1703,6 +1704,27 @@ var backendCapsDefault = []string{"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "
 // roots and the skill bind roots.
 const BackendCapsEnv = "NOO_BACKEND_CAP_ADD"
 
+// backendCapAllowed is every capability NOO_BACKEND_CAP_ADD may grant
+// (proposal 61 phase 0): default-deny. What is left out is what reaches the
+// host from a container: SYS_ADMIN (mounts, namespaces), SYS_PTRACE,
+// SYS_MODULE, SYS_RAWIO, DAC_READ_SEARCH (open_by_handle_at), NET_ADMIN,
+// MKNOD, BPF, PERFMON, SYS_BOOT, SYS_TIME, MAC_*, LINUX_IMMUTABLE, SYSLOG,
+// SETFCAP, SETPCAP, and the literal ALL.
+var backendCapAllowed = map[string]bool{
+	"CHOWN": true, "DAC_OVERRIDE": true, "FOWNER": true, "FSETID": true,
+	"SETGID": true, "SETUID": true, "KILL": true, "NET_BIND_SERVICE": true,
+	"SYS_NICE": true, "IPC_LOCK": true, "SYS_RESOURCE": true, "AUDIT_WRITE": true,
+}
+
+func backendCapAllowedList() []string {
+	out := make([]string, 0, len(backendCapAllowed))
+	for k := range backendCapAllowed {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func backendCaps() []string {
 	v := strings.TrimSpace(os.Getenv(BackendCapsEnv))
 	if v == "" {
@@ -1712,11 +1734,21 @@ func backendCaps() []string {
 		return nil
 	}
 	out := make([]string, 0, 8)
+	var refused []string
 	for _, c := range strings.Split(v, ",") {
 		c = strings.ToUpper(strings.TrimSpace(strings.TrimPrefix(strings.ToUpper(strings.TrimSpace(c)), "CAP_")))
-		if c != "" {
-			out = append(out, c)
+		if c == "" {
+			continue
 		}
+		if !backendCapAllowed[c] {
+			refused = append(refused, c)
+			continue
+		}
+		out = append(out, c)
+	}
+	if len(refused) > 0 {
+		slog.Error("backend containers: capabilities refused from the node's environment (each one lets a container reach the host; not grantable here)",
+			"env", BackendCapsEnv, "refused", refused, "allowed", backendCapAllowedList())
 	}
 	slog.Info("backend containers: capability set widened by the node's own environment",
 		"env", BackendCapsEnv, "cap_add", out)

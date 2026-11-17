@@ -250,11 +250,34 @@ var removeContainerFn = func(ctx context.Context, c *Client, name string) error 
 	return err
 }
 
+// removableAfterLoad: name is a container this agent runs a known backend
+// as (backendSpecs), or the legacy containerised agent the CLI's restart
+// path names (cluster_provision_subprocess.rs container_name_for_image).
+func removableAfterLoad(name string) bool {
+	if name == "noo-node-agent" {
+		return true
+	}
+	for _, spec := range backendSpecs {
+		if spec.ContainerName != "" && spec.ContainerName == name {
+			return true
+		}
+	}
+	return false
+}
+
 // removeAfterLoad force-removes name (when non-empty) so the next backend
 // start recreates it on the new image, and records it in out.Removed. A
 // failure is logged and not fatal: the image is loaded either way.
 func (c *Client) removeAfterLoad(ctx context.Context, name string, out *PullImageArtifactResult) {
 	if name == "" {
+		return
+	}
+	if !removableAfterLoad(name) {
+		// A request-named force-remove is root over every container on the
+		// host: only a backend container this agent manages (proposal 61
+		// phase 0). The image stays loaded.
+		slog.Warn("post-load container remove refused: not a backend container this agent manages",
+			"container", name)
 		return
 	}
 	if err := removeContainerFn(ctx, c, name); err != nil {
