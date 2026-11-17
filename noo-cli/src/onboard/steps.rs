@@ -6500,7 +6500,7 @@ pub(crate) enum RootStep {
 }
 
 pub(crate) fn root_step(at_terminal: bool, root_ok: bool, what: &str, cmd: &str) -> RootStep {
-    if at_terminal || root_ok {
+    if at_terminal {
         RootStep::Run
     } else {
         RootStep::Refuse(format!(
