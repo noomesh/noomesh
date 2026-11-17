@@ -383,14 +383,17 @@ func TestSeedHeldRoundTripAndTolerance(t *testing.T) {
 	if err := writer.SaveHeld(dir); err != nil {
 		t.Fatal(err)
 	}
-	fi, err := os.Stat(filepath.Join(dir, heldStateFile))
+	fi, err := os.Stat(heldPath(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if fi.Mode().Perm() != 0o600 {
 		t.Fatalf("state file mode %v, want 0600", fi.Mode().Perm())
 	}
-	if m, _ := filepath.Glob(filepath.Join(dir, "*.tmp")); len(m) != 0 {
+	if _, err := os.Stat(legacyHeldPath(dir)); !os.IsNotExist(err) {
+		t.Fatalf("the seed was written into the state dir's root: %v", err)
+	}
+	if m, _ := filepath.Glob(filepath.Join(dir, heldStateDir, "*.tmp")); len(m) != 0 {
 		t.Fatalf("temp files left behind: %v", m)
 	}
 
@@ -408,7 +411,7 @@ func TestSeedHeldRoundTripAndTolerance(t *testing.T) {
 
 	// Corrupt file: error, nothing seeded, no panic.
 	NewNativeAt(base).SetHeldModels()
-	if err := os.WriteFile(filepath.Join(dir, heldStateFile), []byte("{not json"), 0o600); err != nil {
+	if err := os.WriteFile(heldPath(dir), []byte("{not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	n := NewNativeAt(base)
@@ -423,6 +426,33 @@ func TestSeedHeldRoundTripAndTolerance(t *testing.T) {
 	n.SetHeldModels()
 	if got, err := n.SeedHeld(dir); err != nil || len(got) != 1 {
 		t.Fatalf("rebuilt: got %v, %v", got, err)
+	}
+}
+
+// A seed an earlier agent wrote into the state dir's root (every Linux node
+// before the owned subdir) is still read; the subdir wins once it exists, and
+// the first save carries the legacy file's other lanes over.
+func TestHeldSeedReadsTheLegacyFileUntilTheSubdirHasOne(t *testing.T) {
+	const base, other = "http://127.0.0.1:59881", "http://127.0.0.1:59882"
+	dir := t.TempDir()
+	t.Cleanup(func() { NewNativeAt(base).SetHeldModels(); NewNativeAt(other).SetHeldModels() })
+	legacy := `{"version":1,"held":{"` + base + `":["old:1"],"` + other + `":["kept:2"]}}`
+	if err := os.WriteFile(legacyHeldPath(dir), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := NewNativeAt(base).SeedHeld(dir); err != nil || len(got) != 1 || got[0] != "old:1" {
+		t.Fatalf("legacy seed: got %v, %v", got, err)
+	}
+	n := NewNativeAt(base)
+	n.SetHeldModels("new:1")
+	if err := n.SaveHeld(dir); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := NewNativeAt(base).SeedHeld(dir); err != nil || len(got) != 1 || got[0] != "new:1" {
+		t.Fatalf("the subdir wins once written: got %v, %v", got, err)
+	}
+	if got, _ := NewNativeAt(other).SeedHeld(dir); len(got) != 1 || got[0] != "kept:2" {
+		t.Fatalf("another lane's legacy entry was dropped on the first save: %v", got)
 	}
 }
 
