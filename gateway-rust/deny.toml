@@ -33,5 +33,4 @@ ignore = [
     # crate by crate with the wire formats pinned first. Each entry goes when
     # its crate leaves Cargo.lock. Review by 2026-12-15.
     { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; migration to jiff/time is 0.6.27 work; review by 2026-12-15" },
-    { id = "RUSTSEC-2026-0555", reason = "chrono-tz unmaintained; migration with chrono's; review by 2026-12-15" },
 ]
