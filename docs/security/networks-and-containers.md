@@ -200,8 +200,8 @@ verify --controller` fails the `sandbox executor` row when it is not 65590
 or when `/health` answers 5xx. An upgrade hands the existing sandbox key from
 65532 to 65590 in the same mode pass it runs before the launcher (`noo
 security pki fix-modes` on demand): by ACL or group as the operator, through
-`sudo -n` when that is all that can, and loudly, never quietly, when neither
-can.
+sudo when that is all that can and you are at a terminal (never a `sudo -n
+true` probe off one), and loudly, never quietly, otherwise.
 
 #### AppArmor on Ubuntu 24.04 and later
 

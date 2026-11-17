@@ -374,6 +374,10 @@ struct ProvisionArgs {
     harness: Option<String>,
     move_data: bool,
     stage_only: bool,
+    /// `--root-ok` (i907): with no terminal, the self node's root steps
+    /// (its identity, its controller-url) run through sudo — the owner says
+    /// sudo needs no password here. Never found out by probing sudo.
+    root_ok: bool,
 }
 
 /// Where this provision runs: the install root, and whether the node being
@@ -448,17 +452,19 @@ fn parse_provision_args(g: &Globals, args: &[String]) -> ProvisionArgs {
     // for them together). It removes ONLY the apply wait: `--wait` still
     // governs the enrollment wait at step 1, exactly as it always has.
     let mut stage_only = false;
+    let mut root_ok = false;
     let mut it = args.iter().peekable();
     while let Some(tok) = it.next() {
         match tok.as_str() {
             "--local" => local = true,
             "--move-data" => move_data = true,
             "--stage-only" => stage_only = true,
+            "--root-ok" => root_ok = true,
             "--harness" => {
                 let v = it.next().cloned().unwrap_or_default();
                 if !matches!(v.as_str(), "auto" | "manual" | "off") {
                     fail(g.json, ExitCode::Usage, "usage", "--harness must be auto, manual or off",
-                        Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--stage-only] [--move-data]"));
+                        Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--stage-only] [--move-data] [--root-ok]"));
                 }
                 harness = Some(v);
             }
@@ -474,19 +480,19 @@ fn parse_provision_args(g: &Globals, args: &[String]) -> ProvisionArgs {
             // through to another implementation.
             t if t.starts_with('-') => fail(g.json, ExitCode::Usage, "usage",
                 &format!("unknown flag: {t}"),
-                Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--stage-only] [--move-data]")),
+                Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--stage-only] [--move-data] [--root-ok]")),
             t if node.is_none() => node = Some(t.to_string()),
             t if tier.is_none() => tier = Some(t.to_string()),
             t => fail(g.json, ExitCode::Usage, "usage",
                 &format!("unexpected argument: {t}"),
-                Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--stage-only] [--move-data]")),
+                Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--stage-only] [--move-data] [--root-ok]")),
         }
     }
     let Some(node) = node else {
         fail(g.json, ExitCode::Usage, "usage", "node name required",
-            Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--stage-only] [--move-data]"));
+            Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--stage-only] [--move-data] [--root-ok]"));
     };
-    ProvisionArgs { node, tier, wait, local, harness, move_data, stage_only }
+    ProvisionArgs { node, tier, wait, local, harness, move_data, stage_only, root_ok }
 }
 
 /// Print the node header and settle which lane the node rides.
@@ -518,7 +524,10 @@ fn begin_provision(g: &Globals, a: &ProvisionArgs) -> ProvSite {
     }
     if is_self {
         let missing = pull_units_missing(&node);
-        match self_node_lane(&node, &missing, !missing.is_empty() && can_sudo_here()) {
+        // i907: may the one sudo run — a terminal, or --root-ok. Never a
+        // `sudo -n true` probe (a refused attempt in auth.log each roll).
+        let at_terminal = crate::onboard::steps::stdin_at_terminal();
+        match self_node_lane(&node, &missing, !missing.is_empty() && crate::onboard::steps::root_step_runs(at_terminal, a.root_ok)) {
             SelfLane::Rail => {}
             SelfLane::CreateIdentity => {
                 if let Err(e) = ensure_self_identity(&node) {
@@ -527,7 +536,7 @@ fn begin_provision(g: &Globals, a: &ProvisionArgs) -> ProvSite {
             }
             SelfLane::Refuse(why) => fail(g.json, ExitCode::Generic, "self_node_units", &why, Some(SELF_RAIL_REMEDY)),
         }
-        if let Err(e) = converge_self_controller_url(&root) {
+        if let Err(e) = converge_self_controller_url(&root, a.root_ok) {
             fail(g.json, ExitCode::Generic, "controller_url", &e, Some(CONTROLLER_HOST_REMEDY));
         }
     }
@@ -2047,7 +2056,8 @@ pub(crate) fn self_node_lane(node: &str, missing: &[String], can_sudo: bool) -> 
     } else {
         SelfLane::Refuse(format!(
             "'{node}' is this controller's own node and its node identity is missing ({}): creating \
-             it takes sudo once, and sudo would prompt in this non-interactive run",
+             it takes sudo once, and this run has no terminal to ask at (unattended, where sudo needs \
+             no password, add --root-ok)",
             missing.join(", ")
         ))
     }
@@ -2093,15 +2103,6 @@ pub(crate) fn self_agent_step(
              non-interactive run — run `noo onboard --only services` at a terminal".into());
     }
     if agent_installed { SelfAgentStep::Rail } else { SelfAgentStep::FirstInstall }
-}
-
-/// Can sudo run here without hanging: it is already cached/passwordless, or
-/// someone is at a terminal to answer it.
-pub(crate) fn can_sudo_here() -> bool {
-    let quiet = Command::new("sudo").args(["-n", "true"])
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-        .status().map(|s| s.success()).unwrap_or(false);
-    quiet || std::io::IsTerminal::is_terminal(&std::io::stdin())
 }
 
 /// The root script that creates (or repairs) the self node's identity: a
@@ -2726,14 +2727,17 @@ fn controller_url_fix_script(url: &str, etc: &Path) -> String {
 /// the node's fetch timer polled a door that does not exist). Runs on every
 /// self-node provision, which `noo upgrade --all` goes through; a healthy
 /// record costs one file read.
-fn converge_self_controller_url(root: &Path) -> Result<(), String> {
+fn converge_self_controller_url(root: &Path, root_ok: bool) -> Result<(), String> {
     let Ok(recorded) = std::fs::read_to_string(SELF_CONTROLLER_URL) else { return Ok(()) };
     let mode = bind_mode(root);
     let Some(url) = controller_url_fix(&recorded, &mode, || controller_host(root, HostFor::SelfNode))? else { return Ok(()) };
-    if !can_sudo_here() {
-        return Err(format!(
-            "this node polls {} but the gateway listens on the tailnet only, and correcting it takes sudo, which would prompt \
-             in this non-interactive run — run `noo onboard --only services` at a terminal", recorded.trim()));
+    let at_terminal = crate::onboard::steps::stdin_at_terminal();
+    if let crate::onboard::steps::RootStep::Refuse(why) = crate::onboard::steps::root_step(
+        at_terminal, root_ok,
+        &format!("this node polls {} but the gateway listens on the tailnet only; correcting it", recorded.trim()),
+        "`noo onboard --only services`")
+    {
+        return Err(why);
     }
     nstep(&format!("this node polled {} but the gateway listens on the tailnet only — pointing it at {url} (sudo)", recorded.trim()));
     let fix = controller_url_fix_script(&url, Path::new("/etc/noo"));

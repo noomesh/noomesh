@@ -3454,7 +3454,7 @@ fn ensure_pki(ctx: &mut Ctx) {
         // the run says so plainly and does not complete.
         let outstanding: Vec<crate::pki::KeyFix> = fixes.iter().filter(|f| f.needs.is_some()).cloned().collect();
         let interactive = !ctx.non_interactive && ctx.ui.inherit_stdio() && super::prompt::stdin_is_tty();
-        let sudo_usable = !outstanding.is_empty() && (interactive || passwordless_sudo());
+        let sudo_usable = !outstanding.is_empty() && root_step_runs(interactive, ctx.skip.root_ok);
         match crate::pki::key_grant_plan(outstanding.len(), sudo_usable) {
             crate::pki::KeyGrantPlan::Nothing => {}
             crate::pki::KeyGrantPlan::Sudo => {
@@ -5921,14 +5921,12 @@ fn ensure_self_agent(ctx: &mut Ctx) {
     };
     let identity_ok = crate::commands::provision::pull_units_missing(&node_id).is_empty();
     let interactive = !ctx.non_interactive && ctx.ui.inherit_stdio() && super::prompt::stdin_is_tty();
-    let sudo_quiet = sudo_cmd(false).args(["true"])
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-        .status().map(|s| s.success()).unwrap_or(false);
+    let root_ok = ctx.skip.root_ok;
     let controller = crate::role::detect().controller;
     use crate::commands::provision::{self_agent_step, SelfAgentStep};
     match self_agent_step(controller.as_ref(),
         std::path::Path::new("/usr/local/bin/noo-node-agent").is_file(),
-        systemctl_active, identity_ok, interactive, sudo_quiet)
+        systemctl_active, identity_ok, interactive, root_ok)
     {
         SelfAgentStep::Skip(why) => ctx.info(&format!("Self-agent: skipped — {why}.")),
         SelfAgentStep::AlreadyOnRail => ctx.info("Self-agent already running (noo-node-agent); upgrades reach it over the rail."),
@@ -5943,8 +5941,11 @@ fn ensure_self_agent(ctx: &mut Ctx) {
             // exiting, and that must not end onboard here. One retry after
             // another API wait (i545 finding 8).
             let g = ctx.g;
+            // --root-ok reaches the child: its own decision reads only
+            // isatty(stdin) and the flag, never a sudo probe (i907).
+            let extra: &[&str] = if root_ok { &["--root-ok"] } else { &[] };
             let ran = retry_once(
-                || match crate::commands::upgrade::provision_one(g, &node_id, &[]) {
+                || match crate::commands::upgrade::provision_one(g, &node_id, extra) {
                     Ok(0) => Ok(()),
                     _ => Err(()),
                 },
@@ -6402,8 +6403,9 @@ fn stop_watcher(ctx: &mut Ctx) {
 
 /// Whether this run may install noo-hostd. The binary goes to
 /// /usr/local/bin through sudo, so an interactive run can answer sudo's
-/// prompt; a non-interactive one (`--ci`, no terminal) can only when sudo
-/// is passwordless, which a cloud image's default user and a CI box have.
+/// prompt; a non-interactive one (`--ci`, no terminal) only on `--root-ok`
+/// (i907: the owner says sudo is passwordless — a cloud image's default
+/// user, a CI box; never found out by probing sudo).
 /// Before i251 `--ci` always skipped, and on a host with systemd the
 /// launcher then refused to create the spool it treats as hostd's, so the
 /// documented non-interactive install never started the stack. Pure, so
@@ -6415,10 +6417,10 @@ pub(crate) enum HostdInstall {
     Skip,
 }
 
-pub(crate) fn hostd_install_decision(interactive: bool, sudo_quiet: bool) -> HostdInstall {
+pub(crate) fn hostd_install_decision(interactive: bool, root_ok: bool) -> HostdInstall {
     if interactive {
         HostdInstall::Interactive
-    } else if sudo_quiet {
+    } else if root_ok {
         HostdInstall::PasswordlessSudo
     } else {
         HostdInstall::Skip
@@ -6483,30 +6485,52 @@ pub(crate) fn sudo_refused(ctx: &mut Ctx, what: &str, cmd: &str) {
     ctx.state.hard_failures.push(line);
 }
 
-/// `sudo -n true`: sudo works here without a prompt (a cloud image's
-/// default user, a CI box, the film's box). What a non-interactive run may
-/// elevate with: hostd's install (i251), the private-key grants (i266).
-pub(crate) fn passwordless_sudo() -> bool {
-    sudo_cmd(false)
-        .arg("true")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+/// i907: whether a root step runs in this run, decided WITHOUT invoking
+/// sudo (the product never runs sudo to find out whether it could — a
+/// `sudo -n true` probe is a refused attempt in auth.log on every box where
+/// sudo wants a password). At a terminal the step is stated and run (a
+/// prompt is expected); with no terminal it runs only on the explicit
+/// opt-in `--root-ok` (sudo needs no password here: a CI box, a cloud
+/// image's default user), else it is refused with the step and the exact
+/// command to run at a terminal. Pure, so every answer is pinned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RootStep {
+    Run,
+    Refuse(String),
+}
+
+pub(crate) fn root_step(at_terminal: bool, root_ok: bool, what: &str, cmd: &str) -> RootStep {
+    if at_terminal || root_ok {
+        RootStep::Run
+    } else {
+        RootStep::Refuse(format!(
+            "{what} needs root and this run has no terminal to ask at — run it at a terminal: {cmd} \
+             (unattended, where sudo needs no password, add --root-ok)"))
+    }
+}
+
+/// [`root_step`]'s yes/no, for a caller that words its own refusal.
+pub(crate) fn root_step_runs(at_terminal: bool, root_ok: bool) -> bool {
+    root_step(at_terminal, root_ok, "", "") == RootStep::Run
+}
+
+/// Is a person at this process's terminal: `isatty(stdin)`. The only thing a
+/// root-step decision outside onboard reads (onboard also has `--ci`, the
+/// full-screen UI and `--root-ok`: [`Ctx`]).
+pub(crate) fn stdin_at_terminal() -> bool {
+    std::io::IsTerminal::is_terminal(&std::io::stdin())
 }
 
 fn hostd_can_run_here(ctx: &mut Ctx) -> bool {
     let interactive = !ctx.non_interactive && ctx.ui.inherit_stdio() && super::prompt::stdin_is_tty();
-    let sudo_quiet = !interactive && passwordless_sudo();
-    match hostd_install_decision(interactive, sudo_quiet) {
+    match hostd_install_decision(interactive, ctx.skip.root_ok) {
         HostdInstall::Interactive => true,
         HostdInstall::PasswordlessSudo => {
-            ctx.info("noo-hostd: no terminal, but sudo needs no password here — installing it (controller mode, a user unit)");
+            ctx.info("noo-hostd: no terminal, and --root-ok says sudo needs no password here — installing it (controller mode, a user unit)");
             true
         }
         HostdInstall::Skip => {
-            ctx.info("noo-hostd not installed here (needs sudo and a terminal). Later: noo onboard --only services");
+            ctx.info("noo-hostd not installed here (needs sudo and a terminal). Later, at a terminal: noo onboard --only services (unattended, where sudo needs no password, add --root-ok)");
             false
         }
     }
@@ -8982,10 +9006,29 @@ pub fn provision_service_keys(ctx: &mut Ctx) {
 
 #[cfg(test)]
 mod hostd_tests {
-    use super::{hostd_install_args, hostd_install_decision, looks_like_elf, HostdInstall};
+    use super::{hostd_install_args, hostd_install_decision, looks_like_elf, root_step, root_step_runs, HostdInstall, RootStep};
 
-    /// i251: `--ci` on a host with systemd. A terminal is only needed for
-    /// sudo's password; with passwordless sudo the non-interactive run
+    /// i907: the root-step decision reads the terminal and `--root-ok`,
+    /// nothing else (no sudo probe). At a terminal: run (a prompt is
+    /// expected). No terminal, no flag: refused, naming the step and the
+    /// command to run at a terminal. No terminal with the flag: run.
+    #[test]
+    fn a_root_step_runs_at_a_terminal_or_on_root_ok_and_is_named_otherwise() {
+        assert_eq!(root_step(true, false, "the CA trust", "noo onboard --only services"), RootStep::Run);
+        assert_eq!(root_step(true, true, "the CA trust", "noo onboard --only services"), RootStep::Run);
+        assert_eq!(root_step(false, true, "the CA trust", "noo onboard --only services"), RootStep::Run, "--root-ok: unattended, sudo -n");
+        let RootStep::Refuse(why) = root_step(false, false, "the CA trust", "noo onboard --only services") else {
+            panic!("no terminal and no --root-ok must refuse");
+        };
+        assert!(why.starts_with("the CA trust needs root"), "{why}");
+        assert!(why.contains("no terminal") && why.contains("run it at a terminal: noo onboard --only services"), "{why}");
+        assert!(why.contains("--root-ok"), "the refusal names the opt-in: {why}");
+        assert!(root_step_runs(true, false) && root_step_runs(false, true) && !root_step_runs(false, false));
+    }
+
+    /// i251 + i907: `--ci` on a host with systemd. A terminal is only needed
+    /// for sudo's password; with `--root-ok` (the owner says sudo needs no
+    /// password — never found out by probing) the non-interactive run
     /// installs hostd like the interactive one does. Without either it
     /// skips, as before.
     #[test]

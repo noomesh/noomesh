@@ -276,14 +276,14 @@ elif [ "$MODEL" = tiny ]; then
     # --ci takes the declared OLLAMA_MODEL, which onboard reads from the
     # install's .env only (not the process env): onboard everything but the
     # model, declare the tiny one there, then run the model section alone.
-    step onboard 2700 -- noo onboard --ci --skip-model || fail_onboarded
+    step onboard 2700 -- noo onboard --ci --root-ok --skip-model || fail_onboarded
     envf="$(find "$HOME" -maxdepth 4 -name .noo-standalone -print -quit 2>/dev/null)"
     envf="${envf%/.noo-standalone}/.env"
     step declare-tiny-model 30 -- sh -c "test -f '$envf' && { grep -v '^OLLAMA_MODEL=' '$envf' > '$envf.tmp'; echo 'OLLAMA_MODEL=$TINY_MODEL' >> '$envf.tmp'; mv '$envf.tmp' '$envf'; echo \"OLLAMA_MODEL=$TINY_MODEL in $envf\"; }" \
         || fail_onboarded
     step onboard-model 1800 -- noo onboard --ci --only model || fail_onboarded
 else
-    step onboard 3600 -- noo onboard --ci || fail_onboarded
+    step onboard 3600 -- noo onboard --ci --root-ok || fail_onboarded
 fi
 # The model was placed above: the agent's view on success too (see agent_dump).
 agent_dump model
