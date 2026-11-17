@@ -6153,7 +6153,8 @@ mod self_node_rail_tests {
         let install = f.find("|| crate::commands::provision::provision_local(g, &node_id, None)").unwrap_or_else(|| panic!("{f}"));
         let warn = f.find("if let Err(e) = installed").unwrap_or_else(|| panic!("{f}"));
         assert!(install < warn, "the install's returned error is what the caller handles: {f}");
-        assert!(f.contains("provision_one(g, &node_id, &[])"), "the rail branch runs in a child");
+        assert!(f.contains("provision_one(g, &node_id, extra)"), "the rail branch runs in a child");
+        assert!(f.contains(r#"if root_ok { &["--root-ok"] } else { &[] }"#), "the child gets --root-ok only when this run has it: {f}");
         assert!(!f.contains("fail("), "{f}");
     }
 
