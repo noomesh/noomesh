@@ -39,7 +39,8 @@
 //!      `rerender_nats_users_for_roll`, `refresh_deploy_slice`, `move_pin`.
 //!   6. launcher inputs: service certs, grafana door, gateway PKI view, voice
 //!      models, add-on NATS principals.
-//!   7. node-image staging starts (overlapping), then `launch_stack`.
+//!   7. node-image staging runs to completion, then `launch_stack` (the new
+//!      gateway hands nodes the new refs; they must already be staged).
 //! The source-reading tests read the list for ORDER and the owning phase for
 //! CONTENT (`phase_src` at the bottom of this file).
 
@@ -1216,8 +1217,12 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
 
     reconcile_cpu_only_slots(g, &roll.root);
 
-    // Stage node images (overlapping the launcher), then launch.
-    let staging = crate::commands::image_stage::start_stage_release_images(g, target_stack_lock.clone(), &roll.tag);
+    // Stage node images BEFORE the stack moves: the new gateway hands every
+    // node the new lock's backend refs as soon as it is up, and a rail node
+    // refuses one whose arch tar is not staged yet (0.6.26 roll, robopi:
+    // `node.reconcile_refused` until the arm64 tar landed, 2 min later).
+    let staging = crate::commands::image_stage::start_stage_release_images(g, target_stack_lock.clone(), &roll.tag)
+        .finish_before_launch(g);
     launch_stack(g, &roll, staging, stops)
 }
 
@@ -7902,6 +7907,22 @@ mod slice_pin_tests {
         let body = crate::test_src::fn_body(&mesh, "pub fn mesh_sync_assets(");
         let ask = body.find("slice_waits_for_stack(").expect("sync-assets must ask slice_waits_for_stack");
         assert!(ask < body.find("materialize(").expect("materialize"), "before it writes anything");
+    }
+}
+
+/// The 0.6.26 roll: staging overlapped the launch, the new gateway handed
+/// robopi the v0.6.26 ollama ref before its arm64 tar existed, and robopi
+/// refused it for two minutes (`node.reconcile_refused`, one operator alert).
+#[cfg(test)]
+mod stage_before_launch_tests {
+    #[test]
+    fn node_images_are_staged_before_the_stack_moves() {
+        let src = crate::test_src::own_code(include_str!("upgrade.rs"));
+        let up = crate::test_src::fn_body(&src, "fn upgrade_stack(");
+        let start = up.find("start_stage_release_images(").expect("the roll stages node images");
+        let join = up.find(".finish_before_launch(g);").expect("and joins them");
+        let launch = up.find("launch_stack(g, &roll, staging, stops)").expect("then launches");
+        assert!(start < join && join < launch, "staging is finished before launch_stack");
     }
 }
 
