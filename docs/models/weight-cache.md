@@ -100,6 +100,8 @@ Verify the layout, on the controller:
 ls "${HF_CACHE_DIR:-${NOO_DATA_ROOT:-/var/lib/noo}/hf-cache}/hub" | grep '^models--'
 ```
 
+`noo cluster verify --controller`'s `hf-cache hub owner` row compares `hub/`'s owner with the HF cache the self-node agent stages into (its heartbeat's `hf_cache_dir`, else `/etc/noo-node-agent.env`), naming the path; a compose `HF_CACHE_DIR` elsewhere gets its own `controller hf-cache hub owner` row, and a network filesystem is not judged.
+
 and end to end, from any node that can reach the store:
 
 ```bash

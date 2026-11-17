@@ -7931,10 +7931,12 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // `cluster.postgres_memory` (unset = standard): the sizes asked for,
         // and "recreate needed" while the running postgres has others.
         checks.push(pg_memory::live(&root));
-        // HF_CACHE_DIR/hub owned like HF_CACHE_DIR: a fresh controller's
+        // <HF cache>/hub owned like the HF cache: a fresh controller's
         // storage step made it 0:0 before prep-host created noo-agent; the
-        // self-node's applier re-owns it (noo-apply.sh hf_hub_reown).
-        checks.push(hf_hub::live());
+        // self-node's applier re-owns it (noo-apply.sh hf_hub_reown). The
+        // cache judged is the self-node AGENT's (its heartbeat in `fleet`),
+        // plus the compose cache's own row when that is another directory.
+        checks.extend(hf_hub::live(Some(&Value::Array(fleet.clone()))));
         // One "<name> at rest" row per directory that holds state in the
         // clear (`at_rest_dirs`): the process env is what the launcher
         // resolved from `.env`, so the paths are the ones compose bound.
@@ -14649,13 +14651,14 @@ mod vantage_tests {
 
     /// Every row the controller half writes from THIS machine's files and
     /// containers (the rows an outside run on a node turned red).
-    const CONTROLLER_ONLY_ROWS: [&str; 35] = [
+    const CONTROLLER_ONLY_ROWS: [&str; 36] = [
         "self-agent lane", "model cache", "loki", "tempo", "grafana door", "audit key", "secrets at rest",
         "shared secrets", "secrets audit", "grafana sso", "gateway pki view", "loki listener", "tempo listener",
         "sandbox listener", "backend tls", "nats tls", "nats principals", "postgres hba", "postgres role identity",
         "postgres tls", "sandbox executor", "data directories", "data root filesystem", "monitoring web config",
         "secrets not in env", "node-agent privilege", "callers", "tailnet policy", "last backup", "off-site backup",
         "pki at rest", "image retention", "stack images", "postgres memory", "hf-cache hub owner",
+        "controller hf-cache hub owner",
     ];
 
     #[test]
