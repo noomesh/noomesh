@@ -2205,6 +2205,33 @@ pub(crate) fn migrate_kind(legacy_applier_present: bool, sync_unit: Option<&str>
 
 /// Every enrolled seat, or `None` when the gateway does not answer (an older
 /// gateway has no seat routes: that is "no seats", said once by the caller).
+/// The seat's status (`GET /api/cluster/seats/{n}/status`) names no enrol
+/// user, so every remedy the roll built from it read `~<seat user>/…/noo`:
+/// a command the operator could not paste (0.6.26-rc.2 delta pass). The seat
+/// list `upgrade_seats` already fetched has it: fill `enroll_user` (and
+/// `facts.cli_user`) from that row when the status lacks them. Never
+/// overrides a value the status states.
+pub(crate) fn with_listed_user(mut st: Value, seats: &[Value], name: &str) -> Value {
+    let Some(row) = seats.iter().find(|s| s["seat_name"].as_str() == Some(name)) else { return st };
+    if !st.is_object() {
+        return st;
+    }
+    if st["enroll_user"].as_str().filter(|u| !u.is_empty()).is_none() {
+        if let Some(u) = row["enroll_user"].as_str().filter(|u| !u.is_empty()) {
+            st["enroll_user"] = Value::String(u.to_string());
+        }
+    }
+    if st["facts"]["cli_user"].as_str().filter(|u| !u.is_empty()).is_none() {
+        if let Some(u) = row["facts"]["cli_user"].as_str().filter(|u| !u.is_empty()) {
+            if !st["facts"].is_object() {
+                st["facts"] = json!({});
+            }
+            st["facts"]["cli_user"] = Value::String(u.to_string());
+        }
+    }
+    st
+}
+
 pub(crate) fn list_seats(g: &Globals) -> Option<Vec<Value>> {
     list_seats_within(g, 15)
 }
@@ -2747,7 +2774,7 @@ pub(crate) fn upgrade_seats(g: &Globals) -> i32 {
                     st = crate::http::get_json_opt(g, &format!("/api/cluster/seats/{n}/status"), true, 10);
                 }
             }
-            let st = st.unwrap_or(Value::Null);
+            let st = with_listed_user(st.unwrap_or(Value::Null), &seats, &n);
             let checks = if ok_apply { seat_checks_after_apply(&st, env!("CARGO_PKG_VERSION"), &console, now_unix()) }
                 else { seat_checks(&st, env!("CARGO_PKG_VERSION"), &console, now_unix()) };
             let seat_ok = ok_apply && checks.iter().all(|c| c.verdict != super::cluster_verify::Verdict::Fail);
@@ -3325,6 +3352,45 @@ mod tests {
         assert_eq!(r.remedy.as_deref(), Some("on homeserver: journalctl -u kiosk.service -n 80 --no-pager"));
         assert!(row("rollback-failed").unwrap().detail.contains("failed too"));
         assert!(row("restarted").is_none());
+    }
+
+    /// The roll's seat remedies name the seat's real user: its status names
+    /// none, the seat list does (0.6.26-rc.2: `~<seat user>/…` in the roll).
+    #[test]
+    fn the_rolls_seat_remedies_name_the_listed_user_not_a_placeholder() {
+        let seen = "2025-10-09T08:53:10Z";
+        let now = super::super::cluster_verify::parse_rfc3339_unix(seen).unwrap() + 10;
+        let p = KioskParams { user: "kiosk".into(), mode: super::super::kiosk::Mode::Dedicated, vt: 1 };
+        let old: String = seat_kiosk_unit(&p).lines().filter(|l| !l.starts_with("RuntimeDirectory")).map(|l| format!("{l}\n")).collect();
+        let wd = sha256_hex(super::super::kiosk::WATCHDOG.as_bytes());
+        // The status shape: no enroll_user, no facts.
+        let status = json!({"seat": "rh-seat", "last_seen": seen,
+            "apply_msg": "seat-apply cli=unchanged scripts=1 units=0 serve=unchanged display=held console=stack-v0.6.24",
+            "heartbeat": {"cli_version": "0.6.24", "user_cli_current": true, "kiosk_serve": "active", "kiosk_display": "active",
+                          "kiosk_bins": "shared", "kiosk_watchdog_sha": wd, "console_build": "stack-v0.6.24",
+                          "kiosk_unit_sha": sha256_hex(old.as_bytes()), "kiosk_unit_runtime_dir": false,
+                          "kiosk": {"user": "kiosk", "mode": "dedicated", "vt": "1"}}});
+        let held = |st: &Value| seat_checks(st, "0.6.24", "stack-v0.6.24", now).into_iter().find(|c| c.name == "display held").expect("held row");
+        assert!(held(&status).remedy.unwrap().contains("~<seat user>/"), "the status alone has no user (the defect)");
+        let list = vec![json!({"seat_name": "other", "enroll_user": "bob"}), json!({"seat_name": "rh-seat", "enroll_user": "rhseat"})];
+        let merged = with_listed_user(status.clone(), &list, "rh-seat");
+        assert_eq!(held(&merged).remedy.as_deref(), Some("on rh-seat: sudo ~rhseat/.local/libexec/noo-seat/noo kiosk seat-sync --migrate"));
+        for c in seat_checks(&merged, "0.6.24", "stack-v0.6.24", now) {
+            assert!(!c.remedy.as_deref().unwrap_or("").contains("<seat user>"), "{c:?}");
+        }
+        // facts.cli_user alone (a seat listed without enroll_user) also serves.
+        let by_facts = with_listed_user(status.clone(), &[json!({"seat_name": "rh-seat", "facts": {"cli_user": "rhseat"}})], "rh-seat");
+        assert!(held(&by_facts).remedy.unwrap().contains("~rhseat/"));
+        // Never overrides what the status states; an unlisted seat is untouched.
+        let mut stated = status.clone();
+        stated["enroll_user"] = json!("alex");
+        assert_eq!(with_listed_user(stated, &list, "rh-seat")["enroll_user"], "alex");
+        assert_eq!(with_listed_user(status.clone(), &list, "gone"), status);
+        assert_eq!(with_listed_user(Value::Null, &list, "rh-seat"), Value::Null);
+        let own = crate::test_src::own_code(include_str!("kiosk_seat.rs"));
+        let roll = crate::test_src::fn_body(&own, "pub(crate) fn upgrade_seats(");
+        let merge = roll.find("let st = with_listed_user(st.unwrap_or(Value::Null), &seats, &n);").expect("the roll merges the listed user");
+        assert!(merge < roll.find("seat_checks_after_apply(&st").unwrap(), "before the rows are built");
     }
 
     /// `seat-sync --migrate` installs this release's kiosk.service, rendered
