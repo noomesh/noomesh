@@ -667,7 +667,19 @@ jobs:
               fi ;;
           esac
           printf '%s\n' "$v" > noo-release-version
-          sha256sum noo-*-unknown-linux-musl noo-*-unknown-linux-gnu noo-*-apple-darwin noo-release-version > sha256sums.txt
+          # The node's root applier and fetcher (i908): a node installs either
+          # only if its sha256 is a row of this signed manifest. They are the
+          # files the CLI embeds (build.rs include_str!), so each Linux CLI
+          # built here must carry these exact bytes, or the rows would vouch
+          # for something no controller ever stages.
+          cp ../scripts/noo-apply.sh ../scripts/noo-fetch.sh .
+          for b in noo-*-unknown-linux-musl noo-*-unknown-linux-gnu; do
+            case "$b" in noo-hostd-*|noo-gateway-*|noo-node-agent-*) continue ;; esac
+            python3 -c 'import sys; b = open(sys.argv[1], "rb").read(); sys.exit(0 if all(open(f, "rb").read() in b for f in sys.argv[2:]) else 1)' \
+              "$b" noo-apply.sh noo-fetch.sh \
+              || { echo "::error::$b does not embed this tree's scripts/noo-apply.sh and noo-fetch.sh byte for byte"; exit 1; }
+          done
+          sha256sum noo-*-unknown-linux-musl noo-*-unknown-linux-gnu noo-*-apple-darwin noo-release-version noo-apply.sh noo-fetch.sh > sha256sums.txt
           grep -qx "$(sha256sum noo-release-version)" sha256sums.txt \
             || { echo "::error::sha256sums.txt has no noo-release-version row for $v"; exit 1; }
           sha256sum -c sha256sums.txt
@@ -754,6 +766,7 @@ jobs:
           | \`noo-hostd-<target>\` | the confined-root helper a node needs before it can start a harness; staged by \`noo upgrade --nodes\` as \`hostd-binary\` |
           | \`noo-gateway-<target>\` | the gateway binary — what a node runs as its harness (\`noo-gateway harness\`), delivered over the rail by \`noo upgrade --nodes\`; x86_64 / aarch64 glibc, macOS arm64 |
           | \`sha256sums.txt\` | combined manifest (\`sha256sum -c sha256sums.txt\`) |
+          | \`noo-apply.sh\`, \`noo-fetch.sh\` | the node's root applier and fetcher, as the CLI embeds them; a node installs either only if its sha256 is in the signed manifest |
           | \`noo-stack-bundle.tar.gz\` | standalone deploy slice — \`pai onboard --standalone --bundle <url>\` |
 
           Each binary also ships a per-file \`.sha256\`; the installer verifies
@@ -774,7 +787,7 @@ jobs:
           case "$TAG" in *-rc.*) flags="--prerelease --latest=false" ;; esac
           repo="${{ github.repository }}"
           # DRAFT first, then every asset, then publish: nothing is public
-          # until all 30 are uploaded. One `gh release create` with every
+          # until every asset is uploaded. One `gh release create` with every
           # asset had no retry, and one HTTP 408 cost noo-cli-v0.6.22-rc.1 a
           # job re-run (run 42862153616). A re-run of this job finds its own
           # draft and resumes; a PUBLISHED release is never touched.
@@ -814,6 +827,8 @@ jobs:
             dist/sha256sums.txt \
             dist/sha256sums.txt.sig \
             dist/noo-release-version \
+            dist/noo-apply.sh \
+            dist/noo-fetch.sh \
             dist/noo-stack-bundle.tar.gz \
             dist/noo-stack-bundle.tar.gz.sha256 \
             dist/install.sh
