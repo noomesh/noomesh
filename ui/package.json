@@ -21,7 +21,7 @@
     "test": "npm run test --workspaces --if-present"
   },
   "devDependencies": {
-    "ws": "^8.22.1"
+    "ws": "^8.23.0"
   },
   "overrides": {
     "nanoid": "^3.3.18"
