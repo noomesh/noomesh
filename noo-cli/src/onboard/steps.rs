@@ -6526,7 +6526,7 @@ thread_local! {
 }
 
 pub(crate) fn root_step(at_terminal: bool, root_ok: bool, what: &str, cmd: &str) -> RootStep {
-    if at_terminal || root_ok || running_as_root() {
+    if at_terminal || root_ok {
         RootStep::Run
     } else {
         RootStep::Refuse(format!(
