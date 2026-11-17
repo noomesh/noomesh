@@ -183,6 +183,7 @@ func ResolveMounts(m map[string][]string, eval ResolveFunc) map[string]string {
 func Report(r Roots, mounts func() (map[string][]string, error)) map[string]any {
 	out := report(r, mounts, filepath.EvalSymlinks)
 	out["policy"] = PolicyReport(Check(r, runtime.GOOS, os.Getenv("HOME"), os.Geteuid()))
+	out["stores"] = StoresReport(r)
 	return out
 }
 

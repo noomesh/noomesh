@@ -908,6 +908,22 @@ This needs a gateway at `stack-v0.2.25` or newer. Against an older gateway a
 node never preseeds GGUFs — ship the file with `noo cluster
 sync-model-files`, or roll the gateway first.
 
+### Model stores are not world-writable
+
+A store any account on the host can write is a store anyone can plant model
+bytes in. The `model stores` row of `noo cluster verify` reads each node's
+declared data roots (the data root, the HF cache, the models dir, the Ollama
+store) and their first-level directories from the heartbeat, and WARNs on
+any that is writable by others without the sticky bit. The WARN names each
+path, its mode and owner, the exact `sudo chmod o-w <path>`, and what that
+store's loads are protected by: HF weights are re-verified against the
+controller's manifest on load; GGUF files are re-verified at start when the
+controller has a manifest for them; the Ollama store is not re-verified.
+
+Put models on a node with `noo models pull` (or `noo cluster
+sync-model-files` for GGUF), or run a hand download as the store's owner.
+Never make a store world-writable so a download works.
+
 ## Backend door leaves
 
 Every backend the agent starts serves through a door that requires a
