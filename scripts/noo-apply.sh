@@ -360,10 +360,19 @@ fi
 # carries signing-pub is judged here like any other (no rollover lane skips
 # §1c), so a re-key cannot carry unlisted root code in with it.
 #
-# The floor: a list OLDER than the one this node last applied is refused, so a
-# genuine but superseded release (and its binaries) cannot be replayed. The
-# record is $RELEASE_FLOOR, root-owned, written at the end of a successful
-# apply (release_floor_write), never lowered.
+# The floor, one step back (operator 2026-11-17): a node accepts the release
+# list of the current FINAL it applied and of the previous final, nothing
+# older, so a genuine but superseded release cannot be replayed while a bad
+# release can still be rolled back once. An rc is accepted when it is an rc of
+# the current or a later release. The record is $RELEASE_FLOOR, root-owned:
+# the last two finals applied (`release-final`, `release-prev`, and the same
+# for `stack`), written at the end of a successful apply (release_floor_write).
+# The oldest accepted release never goes down; an rc never moves the record.
+#
+# The signature: OpenSSL 3 (`pkeyutl -rawin`) where the node has it; else the
+# stdlib-only Ed25519 check below in python3 (a node on OpenSSL 1.1.1). It is
+# part of this file, so the applier's own release row covers it. Neither:
+# refused, saying the node needs OpenSSL 3 or python3.
 #
 # There is no dev path: a payload not in a published release or rc is refused,
 # exit 75, with one line naming the kind, its sha256 and the remedy.
@@ -399,12 +408,93 @@ release_refuse() {  # $1 = what, $2 = why — one line, exit 75
 # OpenSSL 3 verifies a raw Ed25519 signature (`pkeyutl -rawin`); 1.1.1 cannot.
 release_openssl_ok() { openssl pkeyutl -help 2>&1 | grep -q -- '-rawin'; }
 
+# The fallback verifier: Ed25519 (RFC 8032 §5.1.7) on the Python standard
+# library alone, as scripts/verify-release-signature.py does it (a test holds
+# the two to the same answers). argv: DATA-FILE SIG-BASE64URL KEY-HEX...;
+# exit 0 when one key verifies.
+RELEASE_PY_ED25519="$(cat <<'PY'
+import base64, hashlib, sys
+P = 2**255 - 19
+D = -121665 * pow(121666, P - 2, P) % P
+L = 2**252 + 27742317777372353535851937790883648493
+def recover_x(y, sign):
+    if y >= P:
+        return None
+    x2 = (y * y - 1) * pow(D * y * y + 1, P - 2, P) % P
+    if x2 == 0:
+        return None if sign else 0
+    x = pow(x2, (P + 3) // 8, P)
+    if (x * x - x2) % P != 0:
+        x = x * pow(2, (P - 1) // 4, P) % P
+    if (x * x - x2) % P != 0:
+        return None
+    if (x & 1) != sign:
+        x = P - x
+    return x
+def add(p, q):
+    a = (p[1] - p[0]) * (q[1] - q[0]) % P
+    b = (p[1] + p[0]) * (q[1] + q[0]) % P
+    c = 2 * p[3] * q[3] * D % P
+    e = 2 * p[2] * q[2] % P
+    return ((b - a) * (e - c) % P, (e + c) * (b + a) % P, (e - c) * (e + c) % P, (b - a) * (b + a) % P)
+def mul(s, p):
+    acc = (0, 1, 1, 0)
+    while s > 0:
+        if s & 1:
+            acc = add(acc, p)
+        p = add(p, p)
+        s >>= 1
+    return acc
+GY = 4 * pow(5, P - 2, P) % P
+GX = recover_x(GY, 0)
+G = (GX, GY, 1, GX * GY % P)
+def point(raw):
+    if len(raw) != 32:
+        return None
+    y = int.from_bytes(raw, "little")
+    x = recover_x(y & ((1 << 255) - 1), y >> 255)
+    return None if x is None else (x, y & ((1 << 255) - 1), 1, x * (y & ((1 << 255) - 1)) % P)
+def verify(pub, sig, msg):
+    a = point(pub)
+    if a is None or len(sig) != 64:
+        return False
+    r = point(sig[:32])
+    if r is None:
+        return False
+    s = int.from_bytes(sig[32:], "little")
+    if s >= L:
+        return False
+    h = int.from_bytes(hashlib.sha512(sig[:32] + pub + msg).digest(), "little") % L
+    lhs = mul(s, G)
+    rhs = add(r, mul(h, a))
+    return (lhs[0] * rhs[2] - rhs[0] * lhs[2]) % P == 0 and (lhs[1] * rhs[2] - rhs[1] * lhs[2]) % P == 0
+msg = open(sys.argv[1], "rb").read()
+sig = base64.urlsafe_b64decode(sys.argv[2] + "=" * (-len(sys.argv[2]) % 4))
+sys.exit(0 if any(len(k) == 64 and verify(bytes.fromhex(k), sig, msg) for k in sys.argv[3:]) else 1)
+PY
+)"
+release_python_ok() {
+    python3 -I -c 'import base64, hashlib, sys; sys.exit(0 if sys.version_info >= (3, 6) else 1)' >/dev/null 2>&1
+}
+# release_verifier — the tool this node verifies a release signature with:
+# openssl, python, or nothing.
+release_verifier() {
+    if release_openssl_ok; then echo openssl; elif release_python_ok; then echo python; fi
+}
+
 # release_sig_ok DATA SIGFILE SCRATCH — 0 when a pinned release key verifies
-# the `noo-sig1.<base64url ed25519 signature>` in SIGFILE over DATA's bytes.
+# the `noo-sig1.<base64url ed25519 signature>` in SIGFILE over DATA's bytes,
+# with $RELEASE_VERIFIER (release_verifier).
 release_sig_ok() {
     _rs_sig="$(tr -d ' \r\n' < "$2")"
     case "$_rs_sig" in noo-sig1.*) _rs_sig="${_rs_sig#noo-sig1.}" ;; *) return 1 ;; esac
     printf '%s\n' "$_rs_sig" | LC_ALL=C grep -qxE '[A-Za-z0-9_-]{86}' || return 1
+    if [ "${RELEASE_VERIFIER:-}" = python ]; then
+        # shellcheck disable=SC2086
+        python3 -I -c "$RELEASE_PY_ED25519" "$1" "$_rs_sig" $RELEASE_PUBKEYS_HEX >/dev/null 2>&1
+        return
+    fi
+    [ "${RELEASE_VERIFIER:-}" = openssl ] || return 1
     printf '%s==\n' "$_rs_sig" | tr '_-' '/+' | openssl base64 -d -A > "$3/release.sig" 2>/dev/null || return 1
     [ "$(wc -c < "$3/release.sig")" -eq 64 ] || return 1
     for _rs_k in $RELEASE_PUBKEYS_HEX; do
@@ -446,18 +536,47 @@ release_floor_of() {
 release_names_for() {
     awk -v s="$2" 'NF >= 2 && tolower($1) == s { n = $2; sub(/^\*/, "", n); sub(/.*\//, "", n); print n }' "$1"
 }
-# release_floor_check WHAT VALUE KEY — refuse VALUE when it is older than the
-# recorded floor for KEY.
+# release_floor_check WHAT VALUE KEY — the one-step-back rule for KEY
+# (`release` or `stack`). The record keeps the last two FINALS applied:
+# KEY-final (newest) and KEY-prev (the one before). A final is accepted when it
+# is not older than KEY-prev (KEY-final while only one is recorded); an rc when
+# its release (the X.Y.Z of X.Y.Z-rc.N) is not older than KEY-final: an rc of
+# the current or a later release. Nothing recorded: any signed list.
 release_floor_check() {
-    _rfc="$(release_floor_of "$3")"
-    [ -n "$_rfc" ] || return 0
-    if ! release_ver_key "$_rfc" >/dev/null; then
-        release_refuse "$1" "the floor record $RELEASE_FLOOR names '$_rfc', which is not a version"
-    fi
-    if release_older "$2" "$_rfc"; then
-        release_refuse "$1" "this node already applied $3 $_rfc; an older signed $3 ($2) is never installed again"
-    fi
+    _rf_f="$(release_floor_of "$3-final")"; _rf_p="$(release_floor_of "$3-prev")"
+    for _rf_x in "$_rf_f" "$_rf_p"; do
+        if [ -n "$_rf_x" ] && ! release_ver_key "$_rf_x" >/dev/null; then
+            release_refuse "$1" "the floor record $RELEASE_FLOOR names '$_rf_x', which is not a version"
+        fi
+    done
+    [ -n "$_rf_f" ] || return 0
+    case "$2" in
+        *-rc.*)
+            if release_older "${2%-rc.*}" "$_rf_f"; then
+                release_refuse "$1" "it is an rc of a release older than the current final $3 $_rf_f; a node takes an rc of the current or a later release only"
+            fi ;;
+        *)
+            if release_older "$2" "${_rf_p:-$_rf_f}"; then
+                release_refuse "$1" "this node applied $3 $_rf_f${_rf_p:+ after $_rf_p}; it steps back at most one final, never to $2"
+            fi ;;
+    esac
     return 0
+}
+# release_floor_next KEY VALUE — "<final> <prev>" for KEY after applying VALUE:
+# a newer final shifts the record by one; an rc, or a final already recorded
+# or between the two, leaves it as it is (the oldest accepted never goes down).
+release_floor_next() {
+    _rn_f="$(release_floor_of "$1-final")"; _rn_p="$(release_floor_of "$1-prev")"
+    case "$2" in
+        ''|*-rc.*) : ;;
+        *)
+            if [ -z "$_rn_f" ]; then
+                _rn_f="$2"
+            elif release_older "$_rn_f" "$2"; then
+                _rn_p="$_rn_f"; _rn_f="$2"
+            fi ;;
+    esac
+    echo "$_rn_f $_rn_p"
 }
 
 # release_check WORK SCRATCH — refuses (75) unless every root-run payload the
@@ -478,8 +597,9 @@ release_check() {
         case "$_rc_mk" in *" $_rc_k "*) : ;; *) release_refuse "$_rc_root" "the bundle carries root code but no release-signed list ($_rc_k)" ;; esac
         [ -f "$_rc_w/files/$_rc_k" ] || release_refuse "$_rc_root" "the bundle names $_rc_k but lacks it"
     done
-    if ! release_openssl_ok; then
-        release_refuse "$_rc_root" "this node's openssl ($(openssl version 2>/dev/null | awk '{print $1, $2}')) cannot verify an Ed25519 release signature; OpenSSL 3 is needed (Ubuntu 22.04+, Debian 12+)"
+    RELEASE_VERIFIER="$(release_verifier)"
+    if [ -z "$RELEASE_VERIFIER" ]; then
+        release_refuse "$_rc_root" "this node cannot verify an Ed25519 release signature: it needs OpenSSL 3 or python3 (openssl here: $(openssl version 2>/dev/null | awk '{print $1, $2}'))"
     fi
     _rc_sums="$_rc_w/files/release-sums"
     if ! release_sig_ok "$_rc_sums" "$_rc_w/files/release-sums.sig" "$_rc_t"; then
@@ -529,17 +649,22 @@ release_check() {
     return 0
 }
 
-# release_floor_write VERSION STACK — raise (never lower) the recorded floor to
-# what this apply verified. Root-owned, 0644, replaced atomically.
+# release_floor_write VERSION STACK — record what this apply verified
+# (release_floor_next). Root-owned, 0644, replaced atomically.
 release_floor_write() {
-    _rw_r="$(release_floor_of release)"; _rw_s="$(release_floor_of stack)"
-    if [ -n "$1" ] && { [ -z "$_rw_r" ] || release_older "$_rw_r" "$1"; }; then _rw_r="$1"; fi
-    if [ -n "$2" ] && { [ -z "$_rw_s" ] || release_older "$_rw_s" "$2"; }; then _rw_s="$2"; fi
-    [ -n "$_rw_r$_rw_s" ] || return 0
+    read -r _rw_rf _rw_rp <<EOF_FLOOR
+$(release_floor_next release "$1")
+EOF_FLOOR
+    read -r _rw_sf _rw_sp <<EOF_FLOOR
+$(release_floor_next stack "$2")
+EOF_FLOOR
+    [ -n "$_rw_rf$_rw_sf" ] || return 0
     {
-        echo "# noo-apply (i908): the oldest release this node installs root code from. Written by the applier."
-        [ -z "$_rw_r" ] || echo "release $_rw_r"
-        [ -z "$_rw_s" ] || echo "stack $_rw_s"
+        echo "# noo-apply (i908): the last two finals this node applied; it steps back at most one. Written by the applier."
+        [ -z "$_rw_rf" ] || echo "release-final $_rw_rf"
+        [ -z "$_rw_rp" ] || echo "release-prev $_rw_rp"
+        [ -z "$_rw_sf" ] || echo "stack-final $_rw_sf"
+        [ -z "$_rw_sp" ] || echo "stack-prev $_rw_sp"
     } > "$RELEASE_FLOOR.next"
     chmod 644 "$RELEASE_FLOOR.next"
     mv -f "$RELEASE_FLOOR.next" "$RELEASE_FLOOR"
@@ -1028,7 +1153,7 @@ NODE_ID="${NODE_ID:-$(hostname)}"
 
 if [ "$VERIFY_ONLY" = 1 ]; then
     echo "verified-by: $SIG_VIA"
-    echo "release-check: verified release=${RELEASE_OK_VERSION:-none} stack=${RELEASE_OK_STACK:-none}"
+    echo "release-check: verified release=${RELEASE_OK_VERSION:-none} stack=${RELEASE_OK_STACK:-none} verifier=${RELEASE_VERIFIER:-none}"
     [ -n "$HARNESS_REFUSED" ] && echo "verify-only: refused:$HARNESS_REFUSED"
     echo "verify-only: every check passed; nothing installed"
     exit 0
@@ -2738,6 +2863,6 @@ esac
 # END report_installed_binaries
 # The release check's state (i908), for `noo cluster verify`'s `release check`
 # row: this applier's generation and the floor it now holds.
-echo "release-check: generation=$NOO_APPLY_GENERATION release=$(release_floor_of release | grep . || echo none) stack=$(release_floor_of stack | grep . || echo none)"
+echo "release-check: generation=$NOO_APPLY_GENERATION release=$(release_floor_of release-final | grep . || echo none) release-prev=$(release_floor_of release-prev | grep . || echo none) stack=$(release_floor_of stack-final | grep . || echo none) verifier=${RELEASE_VERIFIER:-none}"
 # Last line of the apply, so the fetcher's tail of this log always carries it.
 [ -z "$binary_shas" ] || echo "binary-sha:$binary_shas"
