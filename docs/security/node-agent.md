@@ -918,11 +918,39 @@ any that is writable by others without the sticky bit. The WARN names each
 path, its mode and owner, the exact `sudo chmod o-w <path>`, and what that
 store's loads are protected by: HF weights are re-verified against the
 controller's manifest on load; GGUF files are re-verified at start when the
-controller has a manifest for them; the Ollama store is not re-verified.
+controller has a manifest for them; Ollama models are re-verified against the
+controller when it holds a record of them (see below), a hand pull is not.
 
 Put models on a node with `noo models pull` (or `noo cluster
 sync-model-files` for GGUF), or run a hand download as the store's owner.
 Never make a store world-writable so a download works.
+
+### Ollama models are verified against the controller
+
+On every node where the agent runs Ollama, each placed model is checked
+against the controller's store, and the `ollama models` row of `noo cluster
+verify` reports it:
+
+- **A model staged as a mirror** (`noo models pull` / `noo models fetch
+  ollama:<tag>`): the local manifest's layers must equal the controller's
+  mirrored manifest, and every blob must hash to its digest.
+- **A model built from a GGUF** (a `<name>.Modelfile` in the store): its
+  model layer must be the controller's GGUF, by sha256. The other layers
+  (template, parameters) are not anchored yet.
+
+A mismatch is repaired from the controller (the bad blobs are removed, then
+the model is re-installed or rebuilt from the verified GGUF). Only when that
+repair fails is the model refused: the node stops advertising it, the
+gateway routes elsewhere, and the row is a FAIL naming the model, the blob
+and the remedy. Hashing is cached by file identity (device, inode, size,
+mtime, ctime), so only the first check after a change reads the whole file.
+
+A model the controller has no record of (a hand `ollama pull`) is never
+refused: the row WARNs and its remedy, `noo models pull <model>`, re-pulls it
+through the controller, which is how a hand-pulled model becomes verified.
+There is no setting that marks a model trusted. On a node whose Ollama the
+agent does not manage (a Mac's native Ollama) a mismatch is reported, never
+repaired or refused.
 
 ## Backend door leaves
 
