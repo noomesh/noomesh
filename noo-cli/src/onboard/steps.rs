@@ -10201,6 +10201,18 @@ mod storage_owner_tests {
         for d in ["ollama", "models", "hf-cache"] {
             assert!(root.join(d).is_dir(), "{d} was not created");
         }
+        // hf-cache/hub takes hf-cache's owner when missing or empty (the
+        // storage step made it before noo-agent existed: 0:0 under a
+        // noo-agent hf-cache); one with content is left to the self-node
+        // applier's recursive repair (noo-apply.sh hf_hub_reown).
+        let hub = root.join("hf-cache/hub");
+        assert!(names(&calls, &hub).iter().any(|c| c.contains("-o noo-agent -g noo-agent")), "a missing hub: {calls:?}");
+        let calls = run_prep_data_dirs(&b, &root);
+        assert!(names(&calls, &hub).iter().any(|c| c.contains("-o noo-agent -g noo-agent")), "an empty hub: {calls:?}");
+        std::fs::create_dir_all(hub.join("blobs")).unwrap();
+        std::fs::write(hub.join("blobs/x"), b"w").unwrap();
+        let calls = run_prep_data_dirs(&b, &root);
+        assert!(names(&calls, &hub).is_empty(), "a hub with content was passed to install: {calls:?}");
         let _ = std::fs::remove_dir_all(&b);
     }
 

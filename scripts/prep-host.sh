@@ -725,6 +725,14 @@ say "data root: $NOO_DATA_ROOT"
 #     convert dir, and harrier (RAG) was never made;
 #   - models, hf-cache: the node agent's write targets (it fetches model
 #     files into models), so noo-agent, an existing one included.
+#   - hf-cache/hub: where HF weights land (node-agent-go MirrorHFRepo into
+#     HF_CACHE_DIR/hub), so hf-cache's owner. On a fresh controller the
+#     onboard storage step makes it BEFORE this script creates noo-agent, so
+#     it was left 0:0 under a noo-agent hf-cache. Re-owned here when it is a
+#     real directory and EMPTY (the top only; nothing to recurse into). A hub
+#     with content is the self-node applier's (scripts/noo-apply.sh
+#     hf_hub_reown: recursive, physical, refuses symlinks); re-owning only
+#     its top here would hide it from that repair, which acts on a 0-owned hub.
 # `install -d -o` RE-OWNS a directory that exists: data_dir only ever
 # creates.
 OLLAMA_STORE_OWNER=65532:65532
@@ -734,6 +742,9 @@ data_dir() {  # data_dir DIR USER:GROUP: create DIR with that owner if it is mis
 }
 data_dir "$NOO_DATA_ROOT" noo-agent:noo-agent
 install -d -o noo-agent -g noo-agent "$NOO_DATA_ROOT/hf-cache" "$NOO_DATA_ROOT/models"
+if [ ! -L "$NOO_DATA_ROOT/hf-cache/hub" ] && { [ ! -e "$NOO_DATA_ROOT/hf-cache/hub" ] || { [ -d "$NOO_DATA_ROOT/hf-cache/hub" ] && [ -z "$(ls -A "$NOO_DATA_ROOT/hf-cache/hub")" ]; }; }; then
+    install -d -o noo-agent -g noo-agent "$NOO_DATA_ROOT/hf-cache/hub"
+fi
 data_dir "$NOO_DATA_ROOT/ollama" "$OLLAMA_STORE_OWNER"
 # <<< data-dirs
 # Surface unmounted large drives the way the playbook did — a decision the
