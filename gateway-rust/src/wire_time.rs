@@ -67,7 +67,10 @@ mod tests {
     use chrono::{DateTime, SecondsFormat, Utc};
 
     fn jiff_of(c: DateTime<Utc>) -> Timestamp {
-        Timestamp::from_nanosecond(i128::from(c.timestamp_nanos_opt().expect("in range"))).expect("in range")
+        // Seconds and sub-second nanos, not timestamp_nanos_opt: an i64 of
+        // nanoseconds ends in 2262, and the instants reach 9999.
+        let nanos = i32::try_from(c.timestamp_subsec_nanos()).expect("under a second");
+        Timestamp::new(c.timestamp(), nanos).expect("in range")
     }
 
     /// Instants on every path: whole seconds; 3, 6 and 9 digits; Postgres
