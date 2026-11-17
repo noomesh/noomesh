@@ -39,6 +39,7 @@ func fakeOwner(t *testing.T, uids map[string]int) *int {
 }
 
 func TestOllamaStoreReownIsOnceAndIdempotent(t *testing.T) {
+	storeUnderRootsForTest(t)
 	const dir = "/data/ollama"
 	runs := fakeOwner(t, map[string]int{dir: 0, dir + "/models": 0})
 	c := &Client{}
@@ -51,6 +52,7 @@ func TestOllamaStoreReownIsOnceAndIdempotent(t *testing.T) {
 }
 
 func TestOllamaStoreReownLeavesFreshAndOwnedStoresAlone(t *testing.T) {
+	storeUnderRootsForTest(t)
 	for name, uids := range map[string]map[string]int{
 		"fresh (absent)":       {},
 		"already owned":        {"/d": ollamaStoreUID, "/d/models": ollamaStoreUID},
@@ -69,6 +71,7 @@ func TestOllamaStoreReownLeavesFreshAndOwnedStoresAlone(t *testing.T) {
 }
 
 func TestOllamaStoreReownOnlyChownsAndFailsLoudly(t *testing.T) {
+	storeUnderRootsForTest(t)
 	var script string
 	prevStat, prevRun := ollamaOwnerUID, ollamaReownRun
 	t.Cleanup(func() { ollamaOwnerUID, ollamaReownRun = prevStat, prevRun })
@@ -136,6 +139,7 @@ func TestOllamaIsNonRootEverywhere(t *testing.T) {
 // The upstream fallback (root) writes root-owned blobs/manifests under parents
 // that stay 65532: the probe must still see them.
 func TestOllamaStoreProbeSeesRootFilesUnderOwnedParents(t *testing.T) {
+	storeUnderRootsForTest(t)
 	const d = "/d"
 	owned := func() map[string]int {
 		return map[string]int{d: 65532, d + "/models": 65532, d + "/models/blobs": 65532,
@@ -176,4 +180,14 @@ func TestOllamaStoreProbeSeesRootFilesUnderOwnedParents(t *testing.T) {
 	if err := (&Client{}).ensureOllamaStoreOwned(context.Background(), d); err != nil || *runs != 1 {
 		t.Fatalf("root manifest entry: err %v runs %d", err, *runs)
 	}
+}
+
+// storeUnderRootsForTest lets these tests' made-up store paths through the
+// data-roots check (proposal 61 phase 0), which has its own test in
+// agent_hygiene_p0_test.go.
+func storeUnderRootsForTest(t *testing.T) {
+	t.Helper()
+	orig := ollamaStoreUnderRoots
+	t.Cleanup(func() { ollamaStoreUnderRoots = orig })
+	ollamaStoreUnderRoots = func(p string) (string, error) { return p, nil }
 }

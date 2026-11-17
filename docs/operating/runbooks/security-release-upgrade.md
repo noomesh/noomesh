@@ -500,7 +500,9 @@ noo cluster show <one-gpu-node>
 
 Confirm both serve. If an image needs more, add
 `NOO_BACKEND_CAP_ADD=<CAP>` to that node's `/etc/noo-node-agent.env` and
-restart the agent — node-local, no code change.
+restart the agent — node-local, no code change. Only the capabilities in the
+[env reference](../../reference/env.md) are grantable; anything that lets a
+container reach the host is refused and logged.
 
 Watch that node's journal for two new refusal lines:
 

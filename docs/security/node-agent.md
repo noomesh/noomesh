@@ -512,8 +512,17 @@ Every container the agent creates on a controller's instruction runs with:
   ([networks and containers](networks-and-containers.md#container-hardening)).
 
 `NOO_BACKEND_CAP_ADD` (node-local) widens the backend set for an image that
-genuinely needs more; `NOO_CONTAINER_RUN_USER` and
+genuinely needs more, from an allow-list only: a capability that lets a
+container reach the host (`SYS_ADMIN`, `SYS_PTRACE`, `DAC_READ_SEARCH`,
+`NET_ADMIN`, `ALL`, …) is refused and logged
+([env reference](../reference/env.md)). `NOO_CONTAINER_RUN_USER` and
 `NOO_CONTAINER_IMAGE_ALLOW` do the same for managed containers.
+
+The agent's own root helper container (the `chown` of an Ollama store, a
+`test -e` on a host directory) runs with `CapDrop ALL` plus only `CHOWN`,
+`DAC_OVERRIDE` and `FOWNER`, `no-new-privileges` and no network, and only
+on a path under the node's declared data roots. A `/pull` request's
+`remove_container` removes only a backend container the agent manages.
 
 ## Backend doors on a node
 
