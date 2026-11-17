@@ -70,6 +70,7 @@ mod registry;
 mod release_fetch;
 mod netns_unit;
 mod release_sig;
+mod release_gate;
 mod envfile;
 #[cfg(test)]
 mod hint_lint;

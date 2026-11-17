@@ -53,7 +53,11 @@ BUNDLE="${1:?usage: noo-apply <bundle.tar>}"
 # CA-signed lane open by default, so a signed bundle carrying one would
 # re-open the lane this applier retired. Bump it when a retirement must not
 # be undone by a downgrade.
-NOO_APPLY_GENERATION=1
+#   1  the CA-signed lane retired.
+#   2  i908: root code installs only if the RELEASE key listed it (§1c). An
+#      applier of generation 1 has no §1c, so installing one would let a
+#      signing-key holder install any root code again.
+NOO_APPLY_GENERATION=2
 
 # VERIFY-ONLY (tests): run every check, install nothing, exit 0 before the
 # first write. Only in this mode may the anchor paths be redirected and the
@@ -64,16 +68,18 @@ if [ "$VERIFY_ONLY" = 1 ]; then
     PKI="${NOO_APPLY_PKI:-/etc/noo/pki}"
     NODE_ENV="${NOO_APPLY_NODE_ENV:-/etc/noo-node-agent.env}"
     SELF="${NOO_APPLY_SELF:-/usr/local/bin/noo-apply}"
+    RELEASE_FLOOR="${NOO_APPLY_RELEASE_FLOOR:-/etc/noo/release-floor}"
 else
     PKI=/etc/noo/pki
     NODE_ENV=/etc/noo-node-agent.env
     SELF=/usr/local/bin/noo-apply
+    RELEASE_FLOOR=/etc/noo/release-floor
     [ "$(id -u)" = 0 ] || { echo "noo-apply: must run as root (noo-fetch runs it from its root timer)" >&2; exit 1; }
 fi
 CA="$PKI/ca.crt"
 [ -f "$CA" ] || { echo "noo-apply: no trusted CA at $CA — enroll this node first" >&2; exit 78; }
 
-KNOWN_KINDS="ca.crt node.crt node.key agent-env agent-unit agent-binary teardown applier hostd-binary restart-backends host-telemetry cli-binary cli-user fetcher nats-creds fleet-secrets signing-pub harness-binary harness-env harness-unit svc-vllm.crt svc-vllm.key svc-llamacpp.crt svc-llamacpp.key svc-ollama.crt svc-ollama.key svc-tei.crt svc-tei.key svc-reranker.crt svc-reranker.key vendor-cli vendor-cli-manifest vendor-cli-2 vendor-cli-2-manifest vendor-cli-3 vendor-cli-3-manifest"
+KNOWN_KINDS="ca.crt node.crt node.key agent-env agent-unit agent-binary teardown applier hostd-binary restart-backends host-telemetry cli-binary cli-user fetcher nats-creds fleet-secrets signing-pub harness-binary harness-env harness-unit svc-vllm.crt svc-vllm.key svc-llamacpp.crt svc-llamacpp.key svc-ollama.crt svc-ollama.key svc-tei.crt svc-tei.key svc-reranker.crt svc-reranker.key vendor-cli vendor-cli-manifest vendor-cli-2 vendor-cli-2-manifest vendor-cli-3 vendor-cli-3-manifest release-sums release-sums.sig release-version release-lock release-lock.sig"
 
 # An add-on's node workload door leaf travels as svc-addon-<addon>-<workload>
 # .crt|.key. The set is open (one pair per enabled add-on workload), so it is
@@ -329,6 +335,218 @@ if [ "$AGE" -lt -300 ]; then
     exit 77
 fi
 
+# ── 1c. Release check (i908): root code installs only if the RELEASE listed it
+#
+# signing.key decides what a node APPLIES; it does not decide what root code
+# the node RUNS. Every root-run payload must be listed, by sha256, in a list
+# the RELEASE key signed (Ed25519; its seed lives in the release pipeline and
+# an off-repo operator copy, never on a controller):
+#   applier         noo-apply.sh              the CLI release's sha256sums.txt
+#   fetcher         noo-fetch.sh              (same)
+#   hostd-binary    noo-hostd-<linux target>  (same)
+#   harness-binary  noo-gateway-<linux target> (same)
+#   agent-binary    `# node-agent-sha256 linux/<arch> <sha>` in the stack's
+#                   signed stack-<tag>.lock (the binary in the node-agent image)
+# The bundle carries the lists: release-sums + release-sums.sig, release-version
+# (the text whose sha256 is the list's noo-release-version row) and, with an
+# agent, release-lock + release-lock.sig. cli-binary on Linux installs into the
+# user's ~/.local/bin as the user, so it is not root code and is not checked.
+#
+# signing-pub: a cluster's own key, never a release artifact, so it cannot be
+# listed. What gates it: the verifying keys below are compiled into THIS file
+# (itself release-checked as `applier`), and nothing a bundle installs —
+# signing.pub, ca.crt — feeds this check. A re-key therefore changes who can
+# stage config, never which root code this node accepts; and a bundle that
+# carries signing-pub is judged here like any other (no rollover lane skips
+# §1c), so a re-key cannot carry unlisted root code in with it.
+#
+# The floor: a list OLDER than the one this node last applied is refused, so a
+# genuine but superseded release (and its binaries) cannot be replayed. The
+# record is $RELEASE_FLOOR, root-owned, written at the end of a successful
+# apply (release_floor_write), never lowered.
+#
+# There is no dev path: a payload not in a published release or rc is refused,
+# exit 75, with one line naming the kind, its sha256 and the remedy.
+# BEGIN release_check
+# Current key first: the same list as noo-cli/src/release_sig.rs
+# RELEASE_PUBKEYS_HEX (tests/test_apply_release_check.py holds them equal).
+RELEASE_PUBKEYS_HEX="13be2244d5b91b1d5c29dfffd94a3817cb774c906785cf700e10a86d7be62d43"
+# Only the verify-only mode, which installs nothing and exits before the first
+# write, may point the check at a test key. A real apply never reads it.
+if [ "$VERIFY_ONLY" = 1 ] && [ -n "${NOO_APPLY_RELEASE_PUBKEYS_HEX:-}" ]; then
+    RELEASE_PUBKEYS_HEX="$NOO_APPLY_RELEASE_PUBKEYS_HEX"
+fi
+# The root-run kinds held to release-sums (agent-binary: to the stack lock).
+RELEASE_LISTED_KINDS="applier fetcher hostd-binary harness-binary"
+RELEASE_REMEDY="roll to a published release or rc (on the controller: noo upgrade --all)"
+
+release_asset_re() {  # $1 = kind -> ERE the release asset name must match
+    case "$1" in
+        applier) echo '^noo-apply\.sh$' ;;
+        fetcher) echo '^noo-fetch\.sh$' ;;
+        hostd-binary) echo '^noo-hostd-[a-z0-9_]+-unknown-linux-(gnu|musl)$' ;;
+        harness-binary) echo '^noo-gateway-[a-z0-9_]+-unknown-linux-(gnu|musl)$' ;;
+        *) echo '^$' ;;
+    esac
+}
+
+release_refuse() {  # $1 = what, $2 = why — one line, exit 75
+    echo "noo-apply: REFUSED $1 — $2; $RELEASE_REMEDY (75)" >&2
+    logger -t noo-apply "REFUSED release check: $1 — $2" 2>/dev/null || true
+    exit 75
+}
+
+# OpenSSL 3 verifies a raw Ed25519 signature (`pkeyutl -rawin`); 1.1.1 cannot.
+release_openssl_ok() { openssl pkeyutl -help 2>&1 | grep -q -- '-rawin'; }
+
+# release_sig_ok DATA SIGFILE SCRATCH — 0 when a pinned release key verifies
+# the `noo-sig1.<base64url ed25519 signature>` in SIGFILE over DATA's bytes.
+release_sig_ok() {
+    _rs_sig="$(tr -d ' \r\n' < "$2")"
+    case "$_rs_sig" in noo-sig1.*) _rs_sig="${_rs_sig#noo-sig1.}" ;; *) return 1 ;; esac
+    printf '%s\n' "$_rs_sig" | LC_ALL=C grep -qxE '[A-Za-z0-9_-]{86}' || return 1
+    printf '%s==\n' "$_rs_sig" | tr '_-' '/+' | openssl base64 -d -A > "$3/release.sig" 2>/dev/null || return 1
+    [ "$(wc -c < "$3/release.sig")" -eq 64 ] || return 1
+    for _rs_k in $RELEASE_PUBKEYS_HEX; do
+        printf '%s\n' "$_rs_k" | LC_ALL=C grep -qxE '[0-9a-f]{64}' || continue
+        # SubjectPublicKeyInfo for Ed25519: the fixed 12-byte prefix + the key.
+        # shellcheck disable=SC2059
+        printf "$(printf '302a300506032b6570032100%s' "$_rs_k" | sed 's/../\\x&/g')" > "$3/release.der"
+        if openssl pkeyutl -verify -pubin -keyform DER -inkey "$3/release.der" -rawin \
+            -in "$1" -sigfile "$3/release.sig" >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# release_ver_key V — a fixed-width sort key for X.Y.Z or X.Y.Z-rc.N (a final
+# sorts after its rcs; `stack-` and `v` prefixes are dropped). Fails for any
+# other shape, so only plain digits ever reach the arithmetic.
+release_ver_key() {
+    _rv="${1#stack-}"; _rv="${_rv#v}"
+    printf '%s\n' "$_rv" | LC_ALL=C grep -qxE '[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}(-rc\.[0-9]{1,4})?' || return 1
+    _rv_rc=99999
+    case "$_rv" in *-rc.*) _rv_rc="${_rv##*-rc.}"; _rv="${_rv%-rc.*}" ;; esac
+    _rv_a="${_rv%%.*}"; _rv_b="${_rv#*.}"; _rv_c="${_rv_b#*.}"; _rv_b="${_rv_b%%.*}"
+    printf '%05d%05d%05d%05d\n' "$((10#$_rv_a))" "$((10#$_rv_b))" "$((10#$_rv_c))" "$((10#$_rv_rc))"
+}
+# release_older A B — 0 when A is an OLDER release than B (both well-formed).
+release_older() {
+    _ro_a="$(release_ver_key "$1")" || return 1
+    _ro_b="$(release_ver_key "$2")" || return 1
+    [ "$_ro_a" \< "$_ro_b" ]
+}
+# release_floor_of KEY — the recorded floor for `release` or `stack`, or nothing.
+release_floor_of() {
+    [ -f "$RELEASE_FLOOR" ] || return 0
+    sed -n "s/^$1 //p" "$RELEASE_FLOOR" | head -1
+}
+# release_names_for SUMS SHA — every asset name SUMS lists with that sha256.
+release_names_for() {
+    awk -v s="$2" 'NF >= 2 && tolower($1) == s { n = $2; sub(/^\*/, "", n); sub(/.*\//, "", n); print n }' "$1"
+}
+# release_floor_check WHAT VALUE KEY — refuse VALUE when it is older than the
+# recorded floor for KEY.
+release_floor_check() {
+    _rfc="$(release_floor_of "$3")"
+    [ -n "$_rfc" ] || return 0
+    if ! release_ver_key "$_rfc" >/dev/null; then
+        release_refuse "$1" "the floor record $RELEASE_FLOOR names '$_rfc', which is not a version"
+    fi
+    if release_older "$2" "$_rfc"; then
+        release_refuse "$1" "this node already applied $3 $_rfc; an older signed $3 ($2) is never installed again"
+    fi
+    return 0
+}
+
+# release_check WORK SCRATCH — refuses (75) unless every root-run payload the
+# signed manifest names is in a release-signed list that is not older than the
+# floor. Sets RELEASE_OK_VERSION / RELEASE_OK_STACK for release_floor_write.
+release_check() {
+    _rc_w="$1"; _rc_t="$2"
+    RELEASE_OK_VERSION=""; RELEASE_OK_STACK=""
+    # The kinds the SIGNED manifest names, never what is on disk.
+    _rc_mk=" $(awk '!/^#/ && NF >= 2 {print $2}' "$_rc_w/manifest" | tr '\n' ' ') "
+    _rc_root=""
+    for _rc_k in $RELEASE_LISTED_KINDS agent-binary; do
+        case "$_rc_mk" in *" $_rc_k "*) _rc_root="$_rc_root $_rc_k" ;; esac
+    done
+    [ -n "$_rc_root" ] || return 0
+    _rc_root="${_rc_root# }"
+    for _rc_k in release-sums release-sums.sig release-version; do
+        case "$_rc_mk" in *" $_rc_k "*) : ;; *) release_refuse "$_rc_root" "the bundle carries root code but no release-signed list ($_rc_k)" ;; esac
+        [ -f "$_rc_w/files/$_rc_k" ] || release_refuse "$_rc_root" "the bundle names $_rc_k but lacks it"
+    done
+    if ! release_openssl_ok; then
+        release_refuse "$_rc_root" "this node's openssl ($(openssl version 2>/dev/null | awk '{print $1, $2}')) cannot verify an Ed25519 release signature; OpenSSL 3 is needed (Ubuntu 22.04+, Debian 12+)"
+    fi
+    _rc_sums="$_rc_w/files/release-sums"
+    if ! release_sig_ok "$_rc_sums" "$_rc_w/files/release-sums.sig" "$_rc_t"; then
+        release_refuse "release-sums" "its signature does not verify against a release key this applier pins"
+    fi
+    # The list names its release: release-version is the text whose sha256 is
+    # the signed noo-release-version row.
+    _rc_ver="$(tr -d '\r' < "$_rc_w/files/release-version")"
+    if [ "$(wc -l < "$_rc_w/files/release-version")" != 1 ] || ! release_ver_key "$_rc_ver" >/dev/null; then
+        release_refuse "release-version" "it is not one X.Y.Z or X.Y.Z-rc.N line"
+    fi
+    _rc_vs="$(sha256sum "$_rc_w/files/release-version" | awk '{print $1}')"
+    if ! release_names_for "$_rc_sums" "$_rc_vs" | grep -qx 'noo-release-version'; then
+        release_refuse "release-version" "$_rc_ver is not the release the signed list names"
+    fi
+    release_floor_check "release $_rc_ver" "$_rc_ver" release
+    for _rc_k in $RELEASE_LISTED_KINDS; do
+        case "$_rc_mk" in *" $_rc_k "*) : ;; *) continue ;; esac
+        [ -f "$_rc_w/files/$_rc_k" ] || release_refuse "$_rc_k" "the bundle names it but lacks it"
+        _rc_s="$(sha256sum "$_rc_w/files/$_rc_k" | awk '{print $1}')"
+        if ! release_names_for "$_rc_sums" "$_rc_s" | LC_ALL=C grep -qE "$(release_asset_re "$_rc_k")"; then
+            release_refuse "$_rc_k" "sha256 $_rc_s is not in release $_rc_ver's signed list"
+        fi
+    done
+    case "$_rc_mk" in *" agent-binary "*)
+        for _rc_k in release-lock release-lock.sig; do
+            case "$_rc_mk" in *" $_rc_k "*) : ;; *) release_refuse agent-binary "the bundle carries the agent but not the release-signed stack lock ($_rc_k)" ;; esac
+            [ -f "$_rc_w/files/$_rc_k" ] || release_refuse agent-binary "the bundle names $_rc_k but lacks it"
+        done
+        _rc_lock="$_rc_w/files/release-lock"
+        if ! release_sig_ok "$_rc_lock" "$_rc_w/files/release-lock.sig" "$_rc_t"; then
+            release_refuse "release-lock" "its signature does not verify against a release key this applier pins"
+        fi
+        _rc_tag="$(sed -n 's/^# stack //p' "$_rc_lock" | tr -d '\r' | sort -u)"
+        if [ "$(printf '%s\n' "$_rc_tag" | grep -c .)" != 1 ] || ! release_ver_key "$_rc_tag" >/dev/null; then
+            release_refuse "release-lock" "it does not name exactly one stack tag"
+        fi
+        release_floor_check "stack $_rc_tag" "$_rc_tag" stack
+        _rc_s="$(sha256sum "$_rc_w/files/agent-binary" | awk '{print $1}')"
+        if ! LC_ALL=C grep -qxE "# node-agent-sha256 linux/(amd64|arm64) $_rc_s" "$_rc_lock"; then
+            release_refuse agent-binary "sha256 $_rc_s is not in stack $_rc_tag's signed lock"
+        fi
+        RELEASE_OK_STACK="$_rc_tag"
+        ;;
+    esac
+    RELEASE_OK_VERSION="$_rc_ver"
+    return 0
+}
+
+# release_floor_write VERSION STACK — raise (never lower) the recorded floor to
+# what this apply verified. Root-owned, 0644, replaced atomically.
+release_floor_write() {
+    _rw_r="$(release_floor_of release)"; _rw_s="$(release_floor_of stack)"
+    if [ -n "$1" ] && { [ -z "$_rw_r" ] || release_older "$_rw_r" "$1"; }; then _rw_r="$1"; fi
+    if [ -n "$2" ] && { [ -z "$_rw_s" ] || release_older "$_rw_s" "$2"; }; then _rw_s="$2"; fi
+    [ -n "$_rw_r$_rw_s" ] || return 0
+    {
+        echo "# noo-apply (i908): the oldest release this node installs root code from. Written by the applier."
+        [ -z "$_rw_r" ] || echo "release $_rw_r"
+        [ -z "$_rw_s" ] || echo "stack $_rw_s"
+    } > "$RELEASE_FLOOR.next"
+    chmod 644 "$RELEASE_FLOOR.next"
+    mv -f "$RELEASE_FLOOR.next" "$RELEASE_FLOOR"
+}
+# END release_check
+release_check "$WORK" "$KEYS"
+
 # ── 1b. Applier self-update comes FIRST (2026-09-03): a bundle that carries
 # a newer noo-apply must be applied BY that noo-apply, or every new kind in
 # the same bundle is refused by the old one (HOST3 refused `cli-binary`
@@ -473,7 +691,7 @@ unit_payload_ok() {
 # a directive or key hidden behind either would reach pid 1 unchecked. Every
 # text kind is held to this, including the merges (nats-creds,
 # fleet-secrets), whose lines land in an EnvironmentFile.
-TEXT_KINDS="agent-env harness-env nats-creds fleet-secrets host-telemetry teardown cli-user signing-pub ca.crt node.crt node.key agent-unit harness-unit restart-backends vendor-cli-manifest vendor-cli-2-manifest vendor-cli-3-manifest"
+TEXT_KINDS="agent-env harness-env nats-creds fleet-secrets host-telemetry teardown cli-user signing-pub ca.crt node.crt node.key agent-unit harness-unit restart-backends vendor-cli-manifest vendor-cli-2-manifest vendor-cli-3-manifest release-sums release-sums.sig release-version release-lock release-lock.sig"
 text_payload_ok() {
     if ! LC_ALL=C tr -d '\r\000' < "$1" | cmp -s - "$1"; then
         _shape_refuse "$2" "carries a carriage return or NUL byte"
@@ -810,6 +1028,7 @@ NODE_ID="${NODE_ID:-$(hostname)}"
 
 if [ "$VERIFY_ONLY" = 1 ]; then
     echo "verified-by: $SIG_VIA"
+    echo "release-check: verified release=${RELEASE_OK_VERSION:-none} stack=${RELEASE_OK_STACK:-none}"
     [ -n "$HARNESS_REFUSED" ] && echo "verify-only: refused:$HARNESS_REFUSED"
     echo "verify-only: every check passed; nothing installed"
     exit 0
@@ -2585,6 +2804,8 @@ if [ -f /etc/noo-harness.env ] && id -u noo-harness >/dev/null 2>&1; then
         noo-harness "" "$HARNESS_SECRET_KEYS" "$HARNESS_SECRET_CAPABILITY" || exit $?
     if [ "$ASF_CHANGED" = 1 ]; then need_harness_restart=1; fi
 fi
+# Every install above succeeded: raise the release floor to what §1c verified.
+release_floor_write "$RELEASE_OK_VERSION" "$RELEASE_OK_STACK"
 logger -t noo-apply "applied:$applied (node=$NODE_ID, verified-by=$SIG_VIA)" 2>/dev/null || true
 echo "applied:$applied"
 echo "verified-by: $SIG_VIA"
@@ -2708,5 +2929,8 @@ case " $binary_shas " in
         ;;
 esac
 # END report_installed_binaries
+# The release check's state (i908), for `noo cluster verify`'s `release check`
+# row: this applier's generation and the floor it now holds.
+echo "release-check: generation=$NOO_APPLY_GENERATION release=$(release_floor_of release | grep . || echo none) stack=$(release_floor_of stack | grep . || echo none)"
 # Last line of the apply, so the fetcher's tail of this log always carries it.
 [ -z "$binary_shas" ] || echo "binary-sha:$binary_shas"

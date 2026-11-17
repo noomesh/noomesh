@@ -474,6 +474,14 @@ pub(crate) fn darwin_apply(blob: &[u8], base: &Path, user: &str, me: &str, as_ro
     drop(root_guard);
     // From here the bundle is `payloads` (verified, in memory). Nothing is
     // re-read from disk to decide what to do or what to install.
+    //
+    // i908: root code only from a release-signed list, never older than the
+    // floor this node recorded (`crate::release_gate`). Before any branch:
+    // no rollover, teardown or merge lane skips it.
+    let floor_path = release_floor_path(base, as_root);
+    let floor = std::fs::read_to_string(&floor_path).ok();
+    let release = crate::release_gate::darwin_check(
+        &payloads, user, floor.as_deref(), env!("CARGO_PKG_VERSION"), crate::release_sig::RELEASE_PUBKEYS_HEX)?;
     let anchors = if as_root { PathBuf::from(ROOT_ANCHOR_DIR) } else { base.join("pki") };
     for d in ["bin", "pki"] {
         let _ = std::fs::create_dir_all(base.join(d));
@@ -759,6 +767,14 @@ pub(crate) fn darwin_apply(blob: &[u8], base: &Path, user: &str, me: &str, as_ro
     };
     if !all_ok || !plist_ok || !vendor_ok {
         return Err("bundle apply incomplete (a file was missing or unwritable)".into());
+    }
+    // Every install above succeeded: raise the release floor (i908).
+    if let Some(v) = &release {
+        let next = crate::release_gate::raised_floor(floor.as_deref(), v);
+        let wrote = if as_root { root_install(next.as_bytes(), &floor_path, 0o644) } else { user_write(&floor_path, next.as_bytes(), 0o644) };
+        if let Err(e) = wrote {
+            crate::ui::warned(&format!("noo node fetch: release floor not recorded at {}: {e}", floor_path.display()));
+        }
     }
     // No `chown -R` of ~/noomesh any more: everything above was written as
     // the user, and a recursive root chown of a user-writable tree would
@@ -1392,7 +1408,8 @@ pub fn node_fetch(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     refused.join(", ")
                 ));
             }
-            report(0, &with_binary_summary(apply_report_msg(&last_verified(), &refused), &binary_outcomes(), &binary_shas()));
+            let msg = with_binary_summary(apply_report_msg(&last_verified(), &refused), &binary_outcomes(), &binary_shas());
+            report(0, &format!("{msg}{}", release_check_note(&base, as_root)));
             Ok(0)
         }
         Err(e) => {
@@ -1572,9 +1589,37 @@ fn self_update_and_reexec(
              ({APPLY_GENERATION}); installing it would re-open retired lanes (65)"
         ));
     }
+    // i908: the CLI is this Mac's applier and runs as root, so it replaces
+    // itself only if the RELEASE listed it (`crate::release_gate`), and never
+    // with an older release than the floor or than itself.
+    let mut gated: Payloads = std::collections::BTreeMap::new();
+    gated.insert("cli-binary".to_string(), payload.clone());
+    for k in ["release-sums", "release-sums.sig", "release-version"] {
+        if let Ok(b) = std::fs::read(files.join(k)) {
+            gated.insert(k.to_string(), b);
+        }
+    }
+    let floor = std::fs::read_to_string(Path::new(ROOT_ANCHOR_DIR).join(crate::release_gate::FLOOR_FILE)).ok();
+    crate::release_gate::darwin_check(&gated, "", floor.as_deref(), env!("CARGO_PKG_VERSION"), crate::release_sig::RELEASE_PUBKEYS_HEX)?;
     root_install(&payload, Path::new("/usr/local/bin/noo"), 0o755).map_err(|e| format!("cli-binary: {e}"))?;
     crate::ui::done("noo node fetch: CLI updated from the bundle — re-running this apply under it");
     Ok(Some(REEXEC.to_string()))
+}
+
+/// Where this node records its release floor (i908): root's anchor directory
+/// under launchd, the user's pki on an unprivileged run.
+fn release_floor_path(base: &Path, as_root: bool) -> PathBuf {
+    let dir = if as_root { PathBuf::from(ROOT_ANCHOR_DIR) } else { base.join("pki") };
+    dir.join(crate::release_gate::FLOOR_FILE)
+}
+
+/// ` release-check: generation=<n> release=<floor|none>` for the apply report:
+/// what `noo cluster verify`'s `release check` row reads (the Linux applier
+/// prints the same line).
+fn release_check_note(base: &Path, as_root: bool) -> String {
+    let floor = std::fs::read_to_string(release_floor_path(base, as_root)).ok();
+    let rel = floor.as_deref().and_then(crate::release_gate::floor_release).unwrap_or("none").to_string();
+    format!(" release-check: generation={APPLY_GENERATION} release={rel}")
 }
 
 /// Sentinel error: the bundle replaced the daemon's CLI; re-run under it.
@@ -1920,11 +1965,12 @@ fn host_telemetry_darwin(user: &str, as_root: bool) -> Result<(), String> {
 
 /// The generation of this CLI as an applier. A bundle's
 /// `cli-binary` must carry a generation at least this high: an older CLI has
-/// the CA-signed lane open by default. `#[used]` keeps the marker in every
-/// build, which is what the next CLI's floor check reads.
-const APPLY_GENERATION: u32 = 1;
+/// the CA-signed lane open by default (1), or installs root code without the
+/// release check (2, i908: `crate::release_gate`). `#[used]` keeps the marker
+/// in every build, which is what the next CLI's floor check reads.
+const APPLY_GENERATION: u32 = 2;
 #[used]
-static APPLY_GENERATION_MARKER: [u8; 24] = *b"noo-apply-generation=01;";
+static APPLY_GENERATION_MARKER: [u8; 24] = *b"noo-apply-generation=02;";
 
 /// The highest `noo-apply-generation=NN;` marker in a CLI binary, 0 if none.
 fn apply_generation_of(bin: &[u8]) -> u32 {
@@ -2544,6 +2590,10 @@ const KNOWN_KINDS: &[&str] = &[
     // `cluster_vendor::VENDOR_SLOTS`).
     "vendor-cli", "vendor-cli-manifest",
     "vendor-cli-2", "vendor-cli-2-manifest", "vendor-cli-3", "vendor-cli-3-manifest",
+    // The release-signed lists root code is checked against (i908,
+    // `crate::release_gate`): the CLI release's sha256sums.txt, its signature
+    // and the version text it names; the stack lock + signature (Linux agent).
+    "release-sums", "release-sums.sig", "release-version", "release-lock", "release-lock.sig",
 ];
 
 /// The HTTPS agent for the poller: trusts ONLY the cluster CA pinned at
@@ -3779,6 +3829,9 @@ mod tests {
         assert!(e.contains("older than this one"), "{e}");
         stage_file(&f, "cli-binary", "...noo-apply-generation=01;...");
         sign_stage(&f, &ca.signing_key_path());
+        assert!(verify(&f).expect_err("a generation-1 CLI (no release check) was accepted").contains("older than this one"));
+        stage_file(&f, "cli-binary", "...noo-apply-generation=02;...");
+        sign_stage(&f, &ca.signing_key_path());
         assert!(verify(&f).is_ok(), "{:?}", verify(&f));
     }
 
@@ -3857,6 +3910,21 @@ mod tests {
         let src = crate::test_src::own_code(include_str!("node_fetch.rs"));
         let f = crate::test_src::fn_body(&src, "fn self_update_and_reexec(");
         assert!(f.find("apply_generation_of(&payload)").unwrap() < f.find("root_install(&payload").unwrap());
+    }
+
+    /// i908: the CLI (this Mac's root applier) replaces itself only after the
+    /// release check passed, and every apply runs the check before any branch
+    /// (rollover, teardown, merge) or root write.
+    #[test]
+    fn the_release_check_runs_before_the_cli_replaces_itself_and_before_any_branch() {
+        let src = crate::test_src::own_code(include_str!("node_fetch.rs"));
+        let f = crate::test_src::fn_body(&src, "fn self_update_and_reexec(");
+        assert!(f.find("crate::release_gate::darwin_check(").unwrap() < f.find("root_install(&payload").unwrap());
+        let a = crate::test_src::fn_body(&src, "pub(crate) fn darwin_apply(");
+        let gate = a.find("crate::release_gate::darwin_check(").expect("darwin_apply runs the release check");
+        assert!(gate < a.find("match apply_branch(&payloads)").unwrap(), "a branch runs before the release check");
+        assert!(gate < a.find("root_install(").unwrap(), "a root write before the release check");
+        assert!(a.find("raised_floor(").unwrap() > a.find("bundle apply incomplete").unwrap(), "the floor rises before the apply succeeded");
     }
 
     /// mcmini on noo-cli-v0.6.9 refused the 0.6.10 bundle with exit 65

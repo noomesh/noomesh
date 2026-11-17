@@ -1646,9 +1646,18 @@ fn build_signed_cert_bundle(
     // v2 header as an unknown kind (exit 76), and §1b self-updates the
     // applier BEFORE the kind loop runs, so carrying it here is what makes
     // a cert push survive the format change on an already-enrolled node.
+    //
+    // i908: the applier is root code, which a node installs only with the
+    // release's signed list beside it. Without a verified list in this
+    // controller's cache the push goes WITHOUT the applier: certs need no
+    // list, and the next provision carries the applier with its own.
     let apply = crate::commands::enroll::asset_apply();
     if !apply.is_empty() {
-        payloads.push(("applier".to_string(), apply.as_bytes().to_vec()));
+        let applier: Vec<(&str, Vec<u8>)> = vec![("applier", apply.as_bytes().to_vec())];
+        if let Some(proof) = crate::commands::provision::cached_release_proof(&applier) {
+            payloads.push(("applier".to_string(), apply.as_bytes().to_vec()));
+            payloads.extend(proof.into_iter().map(|(k, b)| (k.to_string(), b)));
+        }
     }
     // refresh the node's copy of the fleet signing public key on
     // every cert push, but ONLY once it has adopted one — a node whose
