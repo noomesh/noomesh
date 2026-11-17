@@ -471,6 +471,10 @@ pub(crate) fn darwin_apply(blob: &[u8], base: &Path, user: &str, me: &str, as_ro
         }
     };
     let _ = std::fs::remove_dir_all(&stage);
+    // i908: the release floor is a root record (ROOT_ANCHOR_DIR on a root
+    // run): read it while root is held, before the guard drops.
+    let floor_path = release_floor_path(base, as_root);
+    let floor = std::fs::read_to_string(&floor_path).ok();
     drop(root_guard);
     // From here the bundle is `payloads` (verified, in memory). Nothing is
     // re-read from disk to decide what to do or what to install.
@@ -478,8 +482,6 @@ pub(crate) fn darwin_apply(blob: &[u8], base: &Path, user: &str, me: &str, as_ro
     // i908: root code only from a release-signed list, never older than the
     // floor this node recorded (`crate::release_gate`). Before any branch:
     // no rollover, teardown or merge lane skips it.
-    let floor_path = release_floor_path(base, as_root);
-    let floor = std::fs::read_to_string(&floor_path).ok();
     let release = crate::release_gate::darwin_check(
         &payloads, user, floor.as_deref(), env!("CARGO_PKG_VERSION"), crate::release_sig::RELEASE_PUBKEYS_HEX)?;
     let anchors = if as_root { PathBuf::from(ROOT_ANCHOR_DIR) } else { base.join("pki") };

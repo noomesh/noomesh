@@ -449,7 +449,8 @@ mod tests {
     /// Python guard tests/test_apply_release_check.py reads both too).
     #[test]
     fn the_shell_applier_pins_the_release_keys() {
-        let Ok(src) = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/noo-apply.sh")) else { return };
+        let Some(p) = crate::test_support::repo_file_or_skip("scripts/noo-apply.sh") else { return };
+        let src = std::fs::read_to_string(p).expect("scripts/noo-apply.sh");
         let line = src.lines().find(|l| l.starts_with("RELEASE_PUBKEYS_HEX=")).expect("RELEASE_PUBKEYS_HEX in noo-apply.sh");
         let keys: Vec<&str> = line.trim_start_matches("RELEASE_PUBKEYS_HEX=").trim_matches('"').split_whitespace().collect();
         assert_eq!(keys, crate::release_sig::RELEASE_PUBKEYS_HEX);
