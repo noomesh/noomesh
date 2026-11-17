@@ -1130,6 +1130,33 @@ jobs:
           echo "signing CLI verified against the signed manifest of $cli_tag ($got)"
           chmod +x noo-x86_64-unknown-linux-gnu
 
+      # i908: a node installs its agent binary only if its sha256 is in this
+      # signed lock. The binary is the one inside the node-agent image at the
+      # digest this lock pins (what `noo cluster provision` extracts and
+      # bundles), read here per arch into `# node-agent-sha256 linux/<arch>
+      # <sha256>` rows. A comment row with no `@`, so no lock reader takes it
+      # for an image. No seed in this step.
+      - name: Record the node agent binary's sha256 per arch
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          d="$(sed -n 's/^node-agent@\(sha256:[0-9a-f]\{64\}\)$/\1/p' digests/node-agent)"
+          [ -n "$d" ] || { echo "::error::digests/node-agent pins no node-agent image — the lock could not vouch for the node agent"; exit 1; }
+          : > agent-shas.txt
+          for arch in amd64 arm64; do
+            cid="$(docker create --platform "linux/$arch" "$REGISTRY/$OWNER/node-agent@$d")"
+            docker cp "$cid:/usr/local/bin/noo-node-agent" "noo-node-agent-$arch"
+            docker rm -f "$cid" >/dev/null
+            # The tag is stamped into the binary (-ldflags): the same proof
+            # provision applies before it bundles one.
+            grep -aqF "$TAG" "noo-node-agent-$arch" \
+              || { echo "::error::the linux/$arch agent in node-agent@$d does not carry $TAG"; exit 1; }
+            echo "# node-agent-sha256 linux/$arch $(sha256sum "noo-node-agent-$arch" | cut -d' ' -f1)" >> agent-shas.txt
+          done
+          cat agent-shas.txt
+
       # The seed is scoped to this step alone — the step that does nothing but
       # sign a file assembled from artifacts this workflow produced itself.
       # Every fetch, every download and every piece of third-party input
@@ -1154,7 +1181,11 @@ jobs:
           # Then the release's storage directory lists (i467): `noo upgrade
           # --check` on an older CLI reads the target's directories from
           # here, signed, so a mirror cannot drop or add one.
-          { echo "# stack $TAG"; echo "# mesh-migration-head $head"; cat storage-dirs.txt; cat digests/* | sort; } > "stack-$TAG.lock"
+          # Then the node agent binary's sha256 per arch (i908): what a node
+          # checks the agent-binary in its bundle against.
+          [ "$(wc -l < agent-shas.txt)" = 2 ] && [ "$(grep -cE '^# node-agent-sha256 linux/(amd64|arm64) [0-9a-f]{64}$' agent-shas.txt)" = 2 ] \
+            || { echo "::error::agent-shas.txt is not the two node-agent-sha256 rows"; cat agent-shas.txt; exit 1; }
+          { echo "# stack $TAG"; echo "# mesh-migration-head $head"; cat storage-dirs.txt; cat agent-shas.txt; cat digests/* | sort; } > "stack-$TAG.lock"
           echo "== stack-$TAG.lock =="; cat "stack-$TAG.lock"
           ./noo-x86_64-unknown-linux-gnu security release-sign "stack-$TAG.lock"
           ./noo-x86_64-unknown-linux-gnu security release-verify "stack-$TAG.lock"

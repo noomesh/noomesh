@@ -343,6 +343,7 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
     drop_binaries_the_node_already_runs(g, &a, &machine, &mut files);
     attach_door_leaves(g, &a, &enrollment, &machine, &ca, &work, &mut files);
     attach_nats_credential(g, &a, &site, &work, &mut files);
+    attach_release_proof(g, &a, &site, &machine, &work, &mut files);
     let bundle = sign_bundle(g, &a, &ca, &files, &work);
 
     // Stage it at the gateway, then judge what the node reports.
@@ -1560,6 +1561,95 @@ fn sign_bundle(g: &Globals, a: &ProvisionArgs, ca: &crate::pki::ClusterCa, files
         Err(e) => { scrub(&work);
             fail(g.json, ExitCode::Generic, "bundle_failed", &e, None); }
     }
+}
+
+/// The Linux kinds that run as root, which a node installs only from a
+/// release-signed list (scripts/noo-apply.sh §1c, `RELEASE_LISTED_KINDS` +
+/// the agent). `cli-binary` installs into the user's ~/.local/bin as the user.
+const LINUX_RELEASE_KINDS: &[&str] = &["applier", "fetcher", "hostd-binary", "harness-binary", "agent-binary"];
+
+/// The release-signed lists that vouch for the bundle's root code (i908).
+///
+/// A node installs root code only if the RELEASE key listed it
+/// (scripts/noo-apply.sh §1c; a Mac: `crate::release_gate`). So a bundle that
+/// carries any carries the lists: this release's signed `sha256sums.txt`, its
+/// `.sig` and the version text it names, and with a Linux agent the stack's
+/// signed lock and its `.sig`. Judged here first by the node's own rule, so a
+/// bundle the node would refuse is never staged. There is no dev path: a CLI
+/// that is not a published release (or rc) has no signed list to send, and
+/// provision stops, saying so.
+fn attach_release_proof(g: &Globals, a: &ProvisionArgs, site: &ProvSite, m: &ProvMachine, work: &Path, files: &mut Vec<(&'static str, Vec<u8>)>) {
+    use crate::release_gate::{DARWIN_LISTED, DARWIN_PLISTS};
+    let root_kinds: Vec<&'static str> = files.iter().map(|(k, _)| *k)
+        .filter(|k| if m.darwin { DARWIN_LISTED.contains(k) || DARWIN_PLISTS.contains(k) } else { LINUX_RELEASE_KINDS.contains(k) })
+        .collect();
+    if root_kinds.is_empty() {
+        return;
+    }
+    let kinds = root_kinds.join(", ");
+    let (sums, sig) = verified_release_manifest(g, &site.root).unwrap_or_else(|e| release_refused(g, &a.node, work, &format!(
+        "the bundle carries root code ({kinds}) and nodes install root code only from a release-signed list, \
+         but this CLI's is not available: {e}")));
+    let version = env!("CARGO_PKG_VERSION");
+    let lock = if !m.darwin && root_kinds.contains(&"agent-binary") {
+        let tag = image_tag();
+        match super::upgrade::verified_stack_lock_signed(g, &tag) {
+            Ok(Some(pair)) => Some(pair),
+            Ok(None) => release_refused(g, &a.node, work, &format!(
+                "stack-{tag} publishes no signed lock, and nodes install the agent only from one")),
+            Err(e) => release_refused(g, &a.node, work, &e),
+        }
+    } else {
+        None
+    };
+    if let Err(e) = crate::release_gate::controller_check(files.as_slice(), m.darwin, &sums, version, lock.as_ref().map(|(l, _)| l.as_str())) {
+        release_refused(g, &a.node, work, &e);
+    }
+    nnote(&format!("bundle carries release {version}'s signed list for its root code ({kinds})"));
+    files.push(("release-sums", sums.into_bytes()));
+    files.push(("release-sums.sig", sig.into_bytes()));
+    files.push(("release-version", format!("{version}\n").into_bytes()));
+    if let Some((lock, lock_sig)) = lock {
+        files.push(("release-lock", lock.into_bytes()));
+        files.push(("release-lock.sig", lock_sig.into_bytes()));
+    }
+}
+
+/// The release proof for a Linux bundle built outside `cluster provision`
+/// (`noo cluster upgrade-applier`): the lists [`attach_release_proof`] adds,
+/// no agent. Err when this CLI's signed list is not available or does not
+/// list the bundle's root code — the node would refuse it.
+pub(crate) fn release_proof_for(g: &Globals, files: &[(&str, Vec<u8>)]) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
+    let (sums, sig) = verified_release_manifest(g, &crate::envfile::repo_root())?;
+    proof_rows(files, sums, sig)
+}
+
+/// [`release_proof_for`] from this controller's verified asset cache alone
+/// (no fetch), for a bundle built where no `Globals` is at hand (a cert push
+/// that carries the applier). None when the cache holds no verified list for
+/// this release or it does not list the root code: the caller then leaves
+/// the root code out (certs need no list).
+pub(crate) fn cached_release_proof(files: &[(&str, Vec<u8>)]) -> Option<Vec<(&'static str, Vec<u8>)>> {
+    let dir = cli_asset_cache_dir(&crate::envfile::repo_root());
+    let (sums, sig) = manifest_with(&dir, env!("CARGO_PKG_VERSION"), &mut |_| Err("cache only".to_string()),
+        &|d, s| crate::release_sig::verify(d, s).map(|_| ())).ok()?;
+    proof_rows(files, sums, sig).ok()
+}
+
+fn proof_rows(files: &[(&str, Vec<u8>)], sums: String, sig: String) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
+    let version = env!("CARGO_PKG_VERSION");
+    crate::release_gate::controller_check(files, false, &sums, version, None)?;
+    Ok(vec![
+        ("release-sums", sums.into_bytes()),
+        ("release-sums.sig", sig.into_bytes()),
+        ("release-version", format!("{version}\n").into_bytes()),
+    ])
+}
+
+/// Stop a provision whose root code no release lists: the node would refuse it.
+fn release_refused(g: &Globals, node: &str, work: &Path, why: &str) -> ! {
+    scrub(work);
+    fail(g.json, ExitCode::Generic, "release_check", &format!("{node}: {why}"), Some(crate::release_gate::REMEDY))
 }
 
 /// Set (to `1`) by the nodes stage around the restage that follows a
@@ -4199,7 +4289,7 @@ fn obtain_agent_binary_darwin(g: &Globals, root: &Path, goarch: &str) -> Result<
 /// Rendered per node (`__USER__`): a LaunchDaemon, not a LaunchAgent —
 /// runs at boot as the enrolling user with no console login, which is
 /// what a headless Mac mini needs and what an SSH session can load.
-const DARWIN_AGENT_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+pub(crate) const DARWIN_AGENT_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>net.noomesh.node-agent</string>
@@ -4224,7 +4314,7 @@ const DARWIN_AGENT_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 /// The harness LaunchDaemon. Installed by the darwin applier,
 /// loaded/unloaded by the agent per placement — never RunAtLoad: placed =
 /// running, and nothing else starts it.
-const DARWIN_HARNESS_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+pub(crate) const DARWIN_HARNESS_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>net.noomesh.harness</string>

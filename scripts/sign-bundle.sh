@@ -52,7 +52,7 @@ esac
 [ -r "$CA_KEY" ] || { echo "sign-bundle: cannot read CA key at $CA_KEY" >&2; exit 66; }
 [ -t 1 ] && { echo "sign-bundle: refusing to write a tar to a terminal — redirect stdout" >&2; exit 64; }
 
-KNOWN="ca.crt node.crt node.key agent-env agent-unit agent-binary teardown applier hostd-binary restart-backends host-telemetry cli-binary cli-user fetcher nats-creds fleet-secrets signing-pub harness-binary harness-env harness-unit svc-vllm.crt svc-vllm.key svc-llamacpp.crt svc-llamacpp.key svc-ollama.crt svc-ollama.key svc-tei.crt svc-tei.key svc-reranker.crt svc-reranker.key vendor-cli vendor-cli-manifest vendor-cli-2 vendor-cli-2-manifest vendor-cli-3 vendor-cli-3-manifest"
+KNOWN="ca.crt node.crt node.key agent-env agent-unit agent-binary teardown applier hostd-binary restart-backends host-telemetry cli-binary cli-user fetcher nats-creds fleet-secrets signing-pub harness-binary harness-env harness-unit svc-vllm.crt svc-vllm.key svc-llamacpp.crt svc-llamacpp.key svc-ollama.crt svc-ollama.key svc-tei.crt svc-tei.key svc-reranker.crt svc-reranker.key vendor-cli vendor-cli-manifest vendor-cli-2 vendor-cli-2-manifest vendor-cli-3 vendor-cli-3-manifest release-sums release-sums.sig release-version release-lock release-lock.sig"
 
 # An add-on's node workload door leaf: svc-addon-<addon>-<workload>.crt|.key.
 # The set is open, so it is judged by shape (same rule as noo-apply.sh's

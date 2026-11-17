@@ -5488,6 +5488,80 @@ pub(crate) fn harness_systemd_check(reports: &[(String, Option<i64>, String)]) -
     ))
 }
 
+/// What a node's applier prints once it checks root code against the
+/// release (i908): `release-check: generation=<n> release=<floor> …`
+/// (scripts/noo-apply.sh, node_fetch.rs `release_check_note`).
+pub(crate) const RELEASE_CHECK_TAG: &str = "release-check: generation=";
+/// The applier generation that carries the release check.
+pub(crate) const RELEASE_CHECK_GENERATION: u32 = 2;
+
+/// The `release check` row (i908): per node, from its last apply report,
+/// whether its applier installs root code only from a release-signed list
+/// (generation >= [`RELEASE_CHECK_GENERATION`]) and the release floor it
+/// holds. A node whose last apply REFUSED root code (exit 75) FAILs, naming
+/// it; a node whose applier predates the check WARNs (the first roll
+/// installs it). No row when there are no reports.
+pub(crate) fn release_check_row(reports: &[(String, Option<i64>, String)]) -> Option<Check> {
+    const NAME: &str = "release check";
+    if reports.is_empty() {
+        return None;
+    }
+    let (mut active, mut inactive, mut refused) = (Vec::new(), Vec::new(), Vec::new());
+    for (node, rc, msg) in reports {
+        if *rc == Some(crate::release_gate::REFUSED) && msg.contains("REFUSED") {
+            refused.push(node.clone());
+            continue;
+        }
+        let generation = msg.find(RELEASE_CHECK_TAG).and_then(|at| {
+            let rest = &msg[at + RELEASE_CHECK_TAG.len()..];
+            rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse::<u32>().ok()
+                .map(|n| (n, rest.split_whitespace().find_map(|t| t.strip_prefix("release=")).unwrap_or("none").to_string()))
+        });
+        match generation {
+            Some((n, rel)) if n >= RELEASE_CHECK_GENERATION => active.push(format!("{node} (floor {rel})")),
+            _ => inactive.push(node.clone()),
+        }
+    }
+    let mut detail = if active.is_empty() {
+        "no node reports the release check yet".to_string()
+    } else {
+        format!("root code installs only from a release-signed list on {}", active.join(", "))
+    };
+    if !inactive.is_empty() {
+        detail.push_str(&format!("; NOT yet on {}: their applier predates the check, so the fleet signing key alone still decides their root code", inactive.join(", ")));
+    }
+    if let Some(first) = refused.first() {
+        return Some(fail(NAME, format!(
+            "{detail}; {} REFUSED root code its release list does not name (exit 75): a bundle carried a binary no published release ships",
+            refused.join(", ")),
+            format!("on the controller: noo upgrade --all from a published release or rc; the node's journal (journalctl -t noo-apply) names the kind and sha256 — {first}")));
+    }
+    if !inactive.is_empty() {
+        return Some(warn(NAME, detail, Some("noo upgrade --all — the first roll installs the checking applier on the signing key alone; from then on root code needs the release key".to_string())));
+    }
+    Some(ok(NAME, detail))
+}
+
+/// The `vendor CLIs` row (i908): a vendor CLI (Claude Code, Copilot CLI,
+/// Codex) is third-party, so no noomesh release lists it. It installs
+/// root-owned under /usr/local/bin with only the sha256 the controller
+/// pinned (config/harness-kinds.json) behind it — self-attested by the
+/// bundle, not release-signed. Said plainly, naming the nodes that carry
+/// one; no row when none does.
+pub(crate) fn vendor_cli_row(reports: &[(String, Option<i64>, String)]) -> Option<Check> {
+    let carriers: Vec<&str> = reports
+        .iter()
+        .filter(|(_, _, msg)| msg.split_whitespace().any(|t| t.starts_with("vendor-cli")))
+        .map(|(node, _, _)| node.as_str())
+        .collect();
+    if carriers.is_empty() {
+        return None;
+    }
+    Some(ok("vendor CLIs", format!(
+        "self-attested, not release-signed: {} carr{} a third-party CLI checked only against the sha256 this controller pinned (config/harness-kinds.json)",
+        carriers.join(", "), if carriers.len() == 1 { "ies" } else { "y" })))
+}
+
 /// A Mac whose last apply report says root REFUSED to install its CLI or
 /// helper (`… root-refused: noo-cli,noo-hostd`, node_fetch.rs
 /// `apply_report_msg`): the directory was not root's alone, typically a
@@ -8096,6 +8170,8 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(with_node_root_refusals(with_node_anchors(with_retired_apply_lanes_and_adoption(
             legacy_lanes_check(metrics.as_deref(), &fleet, now), &apply_reports, &unadopted), &apply_reports, expected), &apply_reports));
         checks.extend(harness_systemd_check(&apply_reports));
+        checks.extend(release_check_row(&apply_reports));
+        checks.extend(vendor_cli_row(&apply_reports));
         let anonymous = crate::http::get_raw_opt(g, &format!("{LOGS_QUERY_ROUTE}?query=%7Bnode%3D%22verify%22%7D&limit=1"), false, 10)
             .map(|(status, _)| status);
         checks.push(logs_access_check(anonymous));
@@ -12816,6 +12892,38 @@ mod tests {
         assert_eq!(c.verdict, Verdict::Warn);
         assert!(c.detail.contains("host6 (systemd 245)") && !c.detail.contains("host7"), "{}", c.detail);
         assert!(c.remedy.as_deref().is_some_and(|r| r.contains("noo cluster provision host6")), "{:?}", c.remedy);
+    }
+
+    /// i908: the release check row reads each node's last apply report.
+    #[test]
+    fn the_release_check_row_names_active_inactive_and_refusing_nodes() {
+        assert!(release_check_row(&[]).is_none());
+        let on = "applied: agent-env\nrelease-check: generation=2 release=0.6.27 stack=v0.6.27\nbinary-sha: agent-binary=ab".to_string();
+        let mac = "applied v release-check: generation=2 release=0.6.27".to_string();
+        let c = release_check_row(&[("host3".into(), Some(0), on.clone()), ("host6".into(), Some(0), mac)]).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.contains("host3 (floor 0.6.27)") && c.detail.contains("host6 (floor 0.6.27)"), "{}", c.detail);
+        let old = "applied: agent-env\nbinary-sha: agent-binary=ab".to_string();
+        let c = release_check_row(&[("host3".into(), Some(0), on.clone()), ("host7".into(), Some(0), old)]).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("NOT yet on host7") && !c.detail.contains("NOT yet on host3"), "{}", c.detail);
+        let gen1 = "release-check: generation=1 release=none".to_string();
+        assert_eq!(release_check_row(&[("host8".into(), Some(0), gen1)]).unwrap().verdict, Verdict::Warn);
+        let refused = "noo-apply: REFUSED hostd-binary — sha256 ab is not in release 0.6.27's signed list; roll to a published release or rc (75)".to_string();
+        let c = release_check_row(&[("host3".into(), Some(0), on), ("host9".into(), Some(75), refused)]).unwrap();
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("host9 REFUSED"), "{}", c.detail);
+    }
+
+    #[test]
+    fn the_vendor_cli_row_says_self_attested_and_names_the_nodes() {
+        assert!(vendor_cli_row(&[("host3".into(), Some(0), "applied: agent-env".into())]).is_none());
+        let c = vendor_cli_row(&[
+            ("host3".into(), Some(0), "applied: agent-env vendor-cli=unchanged".into()),
+            ("host4".into(), Some(0), "applied: agent-env".into()),
+        ]).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("self-attested, not release-signed: host3 carries") && !c.detail.contains("host4"), "{}", c.detail);
     }
 
     #[test]

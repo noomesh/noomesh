@@ -19,6 +19,7 @@ refused now, with the exit code and the reason pinned.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import os
@@ -36,6 +37,38 @@ AGENT_UNIT = (REPO / "node-agent-go/deploy/noo-node-agent.service").read_bytes()
 
 def sh(*args: str) -> None:
     subprocess.run(args, check=True, capture_output=True)
+
+
+# The root-run kinds the applier holds to the RELEASE-signed lists (§1c,
+# i908), and the release asset each is listed under in sha256sums.txt.
+RELEASE_ASSET = {
+    "applier": "noo-apply.sh",
+    "fetcher": "noo-fetch.sh",
+    "hostd-binary": "noo-hostd-x86_64-unknown-linux-gnu",
+    "harness-binary": "noo-gateway-x86_64-unknown-linux-musl",
+}
+RELEASE_KINDS = ("release-sums", "release-sums.sig", "release-version", "release-lock", "release-lock.sig")
+ROOT_KINDS = (*RELEASE_ASSET, "agent-binary")
+
+
+class ReleaseKey:
+    """A throwaway Ed25519 release key: what the pipeline's seed is in production."""
+
+    def __init__(self, d: Path) -> None:
+        self.dir = d
+        d.mkdir(exist_ok=True)
+        self.key = d / "release.key"
+        sh("openssl", "genpkey", "-algorithm", "ed25519", "-out", str(self.key))
+        der = subprocess.run(["openssl", "pkey", "-in", str(self.key), "-pubout", "-outform", "DER"],
+                             check=True, capture_output=True).stdout
+        self.pub_hex = der[-32:].hex()
+
+    def sign(self, data: bytes) -> bytes:
+        """`noo-sig1.<base64url, unpadded>` over the exact bytes, as release_sig::sign writes it."""
+        src, out = self.dir / "to-sign", self.dir / "sig.bin"
+        src.write_bytes(data)
+        sh("openssl", "pkeyutl", "-sign", "-inkey", str(self.key), "-rawin", "-in", str(src), "-out", str(out))
+        return b"noo-sig1." + base64.urlsafe_b64encode(out.read_bytes()).rstrip(b"=") + b"\n"
 
 
 class Fleet:
@@ -62,17 +95,45 @@ class Fleet:
         # The INSTALLED applier is this one (the downgrade floor reads it).
         self.self_path = tmp / "noo-apply"
         self.self_path.write_bytes(APPLIER.read_bytes())
+        self.release = ReleaseKey(tmp / "release")
+        self.floor = tmp / "release-floor"
         stub = tmp / "stub"
         stub.mkdir()
         (stub / "logger").write_text("#!/bin/sh\nexit 0\n")
         (stub / "logger").chmod(0o755)
         self.path = f"{stub}:/usr/bin:/bin"
 
+    def release_proof(self, files: dict[str, bytes], *, version: str = "0.6.27", stack: str = "v0.6.27",
+                      sums_key: "ReleaseKey | None" = None, lock_key: "ReleaseKey | None" = None,
+                      unlisted_kinds: tuple[str, ...] = ()) -> dict[str, bytes]:
+        """The release-signed lists that vouch for every root kind in `files`
+        (except `unlisted_kinds`): what provision attaches from the release."""
+        ver = f"{version}\n".encode()
+        rows = [f"{hashlib.sha256(b'unrelated').hexdigest()}  noo-x86_64-unknown-linux-musl"]
+        for kind, asset in RELEASE_ASSET.items():
+            if kind in files and kind not in unlisted_kinds:
+                rows.append(f"{hashlib.sha256(files[kind]).hexdigest()}  {asset}")
+        rows.append(f"{hashlib.sha256(ver).hexdigest()}  noo-release-version")
+        sums = ("\n".join(rows) + "\n").encode()
+        proof = {"release-sums": sums, "release-sums.sig": (sums_key or self.release).sign(sums), "release-version": ver}
+        if "agent-binary" in files:
+            agent = "" if "agent-binary" in unlisted_kinds else \
+                f"# node-agent-sha256 linux/amd64 {hashlib.sha256(files['agent-binary']).hexdigest()}\n"
+            lock = (f"# stack {stack}\n# mesh-migration-head 0001\n"
+                    f"node-agent@sha256:{'a' * 64}\n{agent}").encode()
+            proof["release-lock"] = lock
+            proof["release-lock.sig"] = (lock_key or self.release).sign(lock)
+        return proof
+
     def bundle(self, files: dict[str, bytes], key: Path | None = None, *,
                extra: list[tarfile.TarInfo] | None = None,
                unlisted: dict[str, bytes] | None = None, issued: str | None = None,
-               extra_lines: list[str] | None = None) -> Path:
-        """Manifest + signature over `files`; `unlisted` ride without a line."""
+               extra_lines: list[str] | None = None, release: bool = True) -> Path:
+        """Manifest + signature over `files`; `unlisted` ride without a line.
+        A bundle carrying root code also carries the release lists for it
+        (unless `release=False` or `files` brings its own)."""
+        if release and any(k in files for k in ROOT_KINDS) and not any(k in files for k in RELEASE_KINDS):
+            files = {**files, **self.release_proof(files)}
         lines = ["#noo-bundle 2", "#node host3", f"#issued {issued if issued is not None else int(time.time())}"]
         for kind, body in files.items():
             lines.append(f"{hashlib.sha256(body).hexdigest()}  {kind}")
@@ -108,6 +169,8 @@ class Fleet:
             "NOO_APPLY_PKI": str(self.pki),
             "NOO_APPLY_NODE_ENV": str(self.node_env),
             "NOO_APPLY_SELF": str(self.self_path),
+            "NOO_APPLY_RELEASE_PUBKEYS_HEX": self.release.pub_hex,
+            "NOO_APPLY_RELEASE_FLOOR": str(self.floor),
         }
         return subprocess.run(["bash", str(APPLIER), str(bundle)], capture_output=True, text=True, env=env)
 
