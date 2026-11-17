@@ -75,7 +75,7 @@ Sleep 1500ms
 
 Type "# One command sets up the whole stack." Enter
 Sleep 1s
-Type "noo onboard --ci --skip-tailscale" Enter
+Type "noo onboard --ci --root-ok --skip-tailscale" Enter
 Wait
 Sleep 2500ms
 

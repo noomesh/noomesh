@@ -175,6 +175,11 @@ pub(crate) struct Skip {
     /// secrets, tailscale, enrollment, storage, services, model, channels,
     /// addons. Empty = the full sequence, as ever.
     pub only: Vec<String>,
+    /// `--root-ok` (i907): with no terminal, run the root steps through
+    /// `sudo -n` — the owner says sudo needs no password here (a CI box, a
+    /// cloud image's default user). Never found out by probing sudo; without
+    /// it a run with no terminal names each root step and its command.
+    pub root_ok: bool,
 }
 
 /// Mutable wizard state (subset of Python's `OnboardState` this port tracks).
@@ -628,6 +633,7 @@ pub fn onboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     while let Some(tok) = it.next() {
         match tok.as_str() {
             "--non-interactive" | "--ci" => non_interactive = true,
+            "--root-ok" => skip.root_ok = true,
             "--dry-run" => dry_run = true,
             "--reconfigure" => reconfigure = true,
             "--standalone" => standalone = true,
