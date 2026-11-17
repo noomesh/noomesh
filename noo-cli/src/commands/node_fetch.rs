@@ -962,8 +962,12 @@ fn reclaim_agent_dirs(user: &str) {
 /// The agent's state directory on a Mac.
 const AGENT_STATE_DIR: &str = "/var/lib/noo-node-agent";
 /// The directories under it the agent (running as the user) writes: the
-/// hostd spool, the log-ship spill ring, the image staging area.
-const AGENT_OWNED_DIRS: &[&str] = &["spool", "logship", "staging"];
+/// hostd spool, the log-ship spill ring, the image staging area, and the held
+/// model seed (node-agent-go backendrt/heldstate.go `heldStateDir`). The seed
+/// was written into the state dir's root, which stays root's, so every save
+/// on a Mac failed (mcmini, since 2026-11-07) and a restarted Mac agent never
+/// had it (i418).
+const AGENT_OWNED_DIRS: &[&str] = &["spool", "logship", "staging", "held"];
 
 /// `state` stays root:wheel 0755 — never the user's: a user who owns it can
 /// replace any entry in it, and a hardlink at `spool` would hand a root file
@@ -4654,6 +4658,16 @@ mod user_writes_tests {
             assert_eq!(std::fs::metadata(state.join(sub)).unwrap().uid(), nobody, "{sub}");
         }
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The agent writes its held-model seed into `held`, which must be one of
+    /// the dirs handed to the Mac agent's user (the root stays root's).
+    #[test]
+    fn the_held_seed_dir_is_handed_to_the_agent_user() {
+        assert!(AGENT_OWNED_DIRS.contains(&"held"), "{AGENT_OWNED_DIRS:?}");
+        let go = include_str!("../../../node-agent-go/internal/backendrt/heldstate.go");
+        assert!(go.contains("heldStateDir  = \"held\""), "the agent's seed dir and this list name the same dir");
+        assert!(go.contains("func heldPath(dir string) string       { return filepath.Join(dir, heldStateDir, heldStateFile) }"));
     }
 
     /// The same refusals without root (the state dir's chown is the only

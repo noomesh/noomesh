@@ -12,8 +12,32 @@ import (
 	"sync"
 )
 
-// heldStateFile is the held-model seed, under the agent's state dir.
-const heldStateFile = "held-models.json"
+// heldStateFile is the held-model seed, in heldStateDir under the agent's
+// state dir. The state dir itself stays root's on a Mac (the agent runs as the
+// enrolling user; the root applier keeps the root 0:0 because root-written
+// trust files live there, and hands the user only named subdirs,
+// noo-cli node_fetch.rs AGENT_OWNED_DIRS). Written into the state dir's root,
+// every save on a Mac failed with permission denied (mcmini, since
+// 2026-11-07), so a restarted Mac agent never had its seed (i418).
+const (
+	heldStateDir  = "held"
+	heldStateFile = "held-models.json"
+)
+
+// heldPath is where the seed is written and read first; legacyHeldPath is
+// where agents before this wrote it (still read, so a Linux node's seed
+// survives the move).
+func heldPath(dir string) string       { return filepath.Join(dir, heldStateDir, heldStateFile) }
+func legacyHeldPath(dir string) string { return filepath.Join(dir, heldStateFile) }
+
+// readHeldSeed reads the seed from the new path, else the legacy one.
+func readHeldSeed(dir string) (heldState, error) {
+	st, err := readHeldState(heldPath(dir))
+	if errors.Is(err, os.ErrNotExist) {
+		return readHeldState(legacyHeldPath(dir))
+	}
+	return st, err
+}
 
 // heldState is the file's shape: version, then base URL -> placed models
 // (primary first), the exact slice the reconciler handed SetHeldModels.
@@ -46,13 +70,14 @@ func (n *Native) SaveHeld(dir string) error {
 	if n == nil || dir == "" {
 		return nil
 	}
-	path := filepath.Join(dir, heldStateFile)
+	path := heldPath(dir)
 	held := n.HeldModels()
 
 	heldFileMu.Lock()
 	defer heldFileMu.Unlock()
-	// A missing or corrupt file is rebuilt from this lane's set alone.
-	st, _ := readHeldState(path)
+	// A missing or corrupt file is rebuilt from this lane's set alone (the
+	// legacy file's other lanes are carried over on the first save).
+	st, _ := readHeldSeed(dir)
 	if st.Held == nil {
 		st.Held = map[string][]string{}
 	}
@@ -73,10 +98,11 @@ func (n *Native) SaveHeld(dir string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	sub := filepath.Dir(path)
+	if err := os.MkdirAll(sub, 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, heldStateFile+".*.tmp")
+	tmp, err := os.CreateTemp(sub, heldStateFile+".*.tmp")
 	if err != nil {
 		return err
 	}
@@ -105,7 +131,7 @@ func (n *Native) SeedHeld(dir string) ([]string, error) {
 		return nil, nil
 	}
 	heldFileMu.Lock()
-	st, err := readHeldState(filepath.Join(dir, heldStateFile))
+	st, err := readHeldSeed(dir)
 	heldFileMu.Unlock()
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
