@@ -27,9 +27,12 @@
 //! assets too, so they are held to the list as well. `run-agent` and
 //! `run-harness` run as the user (the plists' UserName) and are not root code.
 //!
-//! The floor: a list older than the one this node last applied (or than the
-//! CLI doing the check) is refused, so a superseded release cannot be
-//! replayed. No dev path: anything not in a published release or rc is
+//! The floor, one step back (operator 2026-11-17): the record keeps the last
+//! two FINALS applied (`release-final`, `release-prev`); a final not older than
+//! the previous one is accepted, an rc when it is an rc of the current or a
+//! later release ([`step_back_ok`]). The oldest accepted never goes down and
+//! an rc never moves the record. With no final recorded, the CLI doing the
+//! check (when it is a final) stands in as the current final. No dev path: anything not in a published release or rc is
 //! refused with one line naming the kind, its sha256 and the remedy (75).
 
 use std::collections::BTreeMap;
@@ -94,19 +97,55 @@ pub fn older(a: &str, b: &str) -> bool {
     matches!((version_key(a), version_key(b)), (Some(x), Some(y)) if x < y)
 }
 
-/// The recorded `release` floor in a floor file's text, if any.
-pub fn floor_release(text: &str) -> Option<&str> {
-    text.lines().find_map(|l| l.strip_prefix("release ")).map(str::trim)
+/// One field of a floor file (`release-final`, `release-prev`, …), if present.
+pub fn floor_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    text.lines()
+        .find_map(|l| l.strip_prefix(key).and_then(|r| r.strip_prefix(' ')))
+        .map(str::trim)
 }
 
-/// The floor file's text after recording `version` (raised, never lowered;
-/// any `stack` line the Linux applier wrote is kept).
-pub fn raised_floor(current: Option<&str>, version: &str) -> String {
+/// The one-step-back rule: may a node whose current final is `fin` (and the
+/// final before it `prev`) take release `v`? A final: not older than `prev`
+/// (`fin` while only one is known). An rc: its X.Y.Z not older than `fin`.
+/// Err carries the reason.
+pub fn step_back_ok(v: &str, fin: &str, prev: Option<&str>) -> Result<(), String> {
+    match v.split_once("-rc.") {
+        Some((base, _)) if older(base, fin) => Err(format!(
+            "it is an rc of a release older than the current final {fin}; a node takes an rc of the current or a later release only")),
+        Some(_) => Ok(()),
+        None if older(v, prev.unwrap_or(fin)) => Err(format!(
+            "this node applied release {fin}{}; it steps back at most one final, never to {v}",
+            prev.map(|p| format!(" after {p}")).unwrap_or_default())),
+        None => Ok(()),
+    }
+}
+
+/// The floor file's text after applying `version`: a newer final shifts the
+/// two recorded finals by one; an rc, or a final already recorded or between
+/// them, leaves them as they are. Any `stack-` line the Linux applier wrote is
+/// kept.
+pub fn next_floor(current: Option<&str>, version: &str) -> String {
     let cur = current.unwrap_or("");
-    let keep = floor_release(cur).filter(|f| version_key(f).is_some() && !older(f, version));
-    let mut out = String::from("# noo (i908): the oldest release this node installs root code from. Written by the applier.\n");
-    out.push_str(&format!("release {}\n", keep.unwrap_or(version)));
-    for l in cur.lines().filter(|l| l.starts_with("stack ")) {
+    let mut fin = floor_field(cur, "release-final").map(str::to_string);
+    let mut prev = floor_field(cur, "release-prev").map(str::to_string);
+    if !version.contains("-rc.") {
+        match fin.as_deref() {
+            None => fin = Some(version.to_string()),
+            Some(f) if older(f, version) => {
+                prev = fin.take();
+                fin = Some(version.to_string());
+            }
+            _ => {}
+        }
+    }
+    let mut out = String::from("# noo (i908): the last two finals this node applied; it steps back at most one. Written by the applier.\n");
+    if let Some(f) = &fin {
+        out.push_str(&format!("release-final {f}\n"));
+    }
+    if let Some(p) = &prev {
+        out.push_str(&format!("release-prev {p}\n"));
+    }
+    for l in cur.lines().filter(|l| l.starts_with("stack-")) {
         out.push_str(l);
         out.push('\n');
     }
@@ -167,16 +206,17 @@ pub fn darwin_check(
     if !crate::release_sig::manifest_names_version(&sums, &version) {
         return Err(refuse("release-version", &format!("{version} is not the release the signed list names")));
     }
-    if let Some(f) = floor.and_then(floor_release) {
+    let text = floor.unwrap_or("");
+    let (fin, prev) = (floor_field(text, "release-final"), floor_field(text, "release-prev"));
+    for f in [fin, prev].into_iter().flatten() {
         if version_key(f).is_none() {
             return Err(refuse(&format!("release {version}"), &format!("the floor record names '{f}', which is not a version")));
         }
-        if older(&version, f) {
-            return Err(refuse(&format!("release {version}"), &format!("this node already applied release {f}; an older signed release is never installed again")));
-        }
     }
-    if older(&version, own_version) {
-        return Err(refuse(&format!("release {version}"), &format!("this node's CLI is already {own_version}; an older signed release is never installed again")));
+    // No final recorded yet: the CLI doing the check, when it is a final.
+    let fin = fin.or_else(|| (!own_version.contains("-rc.") && version_key(own_version).is_some()).then_some(own_version));
+    if let Some(f) = fin {
+        step_back_ok(&version, f, prev).map_err(|why| refuse(&format!("release {version}"), &why))?;
     }
     for kind in DARWIN_LISTED.iter().copied().filter(|k| payloads.contains_key(*k)) {
         let sha = sha256_hex(&payloads[kind]);
@@ -327,14 +367,22 @@ mod tests {
     }
 
     #[test]
-    fn the_floor_refuses_an_older_release() {
+    fn the_floor_steps_back_one_final() {
         let p = bundle("0.6.27", &[("cli-binary", CLI)], &[("cli-binary", CLI)]);
-        assert!(check(&p, Some("release 0.6.28\n")).unwrap_err().contains("already applied release 0.6.28"));
-        assert!(check(&p, Some("release 0.6.27\n")).is_ok());
-        assert!(check(&p, Some("release 0.6.27-rc.4\n")).is_ok());
-        assert!(check(&p, Some("release $(id)\n")).unwrap_err().contains("not a version"));
-        // The CLI doing the check is a floor too.
-        assert!(check_as(&p, None, "0.6.28-rc.1").unwrap_err().contains("already 0.6.28-rc.1"));
+        // One final back is accepted; two back is refused.
+        assert!(check_as(&p, Some("release-final 0.6.28\nrelease-prev 0.6.27\n"), "0.6.28").is_ok());
+        assert!(check_as(&p, Some("release-final 0.6.29\nrelease-prev 0.6.28\n"), "0.6.29").unwrap_err().contains("steps back at most one final"));
+        // Only one final known: nothing older than it.
+        assert!(check_as(&p, Some("release-final 0.6.28\n"), "0.6.28").unwrap_err().contains("steps back at most one final"));
+        assert!(check(&p, Some("release-final 0.6.27\n")).is_ok());
+        assert!(check(&p, Some("release-final $(id)\n")).unwrap_err().contains("not a version"));
+        // No record: the checking CLI stands in as the current final (an rc CLI does not).
+        assert!(check_as(&p, None, "0.6.28").unwrap_err().contains("steps back"));
+        assert!(check_as(&p, None, "0.6.28-rc.1").is_ok());
+        // rcs: of the current or a later release only.
+        let rc = bundle("0.6.28-rc.2", &[("cli-binary", CLI)], &[("cli-binary", CLI)]);
+        assert!(check_as(&rc, Some("release-final 0.6.28\nrelease-prev 0.6.27\n"), "0.6.28").is_ok());
+        assert!(check_as(&rc, Some("release-final 0.6.29\nrelease-prev 0.6.28\n"), "0.6.29").unwrap_err().contains("an rc of a release older"));
         // A version text the list does not name.
         let mut q = p.clone();
         q.insert("release-version".into(), b"0.6.99\n".to_vec());
@@ -368,14 +416,17 @@ mod tests {
     }
 
     #[test]
-    fn the_floor_rises_and_never_falls() {
-        let t = raised_floor(None, "0.6.27");
-        assert_eq!(floor_release(&t), Some("0.6.27"));
-        let with_stack = format!("{t}stack v0.6.27\n");
-        let t = raised_floor(Some(with_stack.as_str()), "0.6.26");
-        assert_eq!(floor_release(&t), Some("0.6.27"));
-        assert!(t.contains("stack v0.6.27\n"), "{t}");
-        assert_eq!(floor_release(&raised_floor(Some(t.as_str()), "0.6.28-rc.1")), Some("0.6.28-rc.1"));
+    fn the_record_keeps_the_last_two_finals_and_the_oldest_never_falls() {
+        let t = next_floor(None, "0.6.27");
+        assert_eq!((floor_field(&t, "release-final"), floor_field(&t, "release-prev")), (Some("0.6.27"), None));
+        let t = next_floor(Some(format!("{t}stack-final v0.6.27\n").as_str()), "0.6.28");
+        assert_eq!((floor_field(&t, "release-final"), floor_field(&t, "release-prev")), (Some("0.6.28"), Some("0.6.27")));
+        assert!(t.contains("stack-final v0.6.27\n"), "{t}");
+        // A step back and an rc move nothing; the next final shifts by one.
+        let t = next_floor(Some(next_floor(Some(t.as_str()), "0.6.27").as_str()), "0.6.29-rc.1");
+        assert_eq!((floor_field(&t, "release-final"), floor_field(&t, "release-prev")), (Some("0.6.28"), Some("0.6.27")));
+        let t = next_floor(Some(t.as_str()), "0.6.29");
+        assert_eq!((floor_field(&t, "release-final"), floor_field(&t, "release-prev")), (Some("0.6.29"), Some("0.6.28")));
     }
 
     #[test]

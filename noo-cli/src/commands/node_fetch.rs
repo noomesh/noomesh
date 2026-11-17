@@ -770,7 +770,7 @@ pub(crate) fn darwin_apply(blob: &[u8], base: &Path, user: &str, me: &str, as_ro
     }
     // Every install above succeeded: raise the release floor (i908).
     if let Some(v) = &release {
-        let next = crate::release_gate::raised_floor(floor.as_deref(), v);
+        let next = crate::release_gate::next_floor(floor.as_deref(), v);
         let wrote = if as_root { root_install(next.as_bytes(), &floor_path, 0o644) } else { user_write(&floor_path, next.as_bytes(), 0o644) };
         if let Err(e) = wrote {
             crate::ui::warned(&format!("noo node fetch: release floor not recorded at {}: {e}", floor_path.display()));
@@ -1618,7 +1618,7 @@ fn release_floor_path(base: &Path, as_root: bool) -> PathBuf {
 /// prints the same line).
 fn release_check_note(base: &Path, as_root: bool) -> String {
     let floor = std::fs::read_to_string(release_floor_path(base, as_root)).ok();
-    let rel = floor.as_deref().and_then(crate::release_gate::floor_release).unwrap_or("none").to_string();
+    let rel = floor.as_deref().and_then(|t| crate::release_gate::floor_field(t, "release-final")).unwrap_or("none").to_string();
     format!(" release-check: generation={APPLY_GENERATION} release={rel}")
 }
 
@@ -3924,7 +3924,7 @@ mod tests {
         let gate = a.find("crate::release_gate::darwin_check(").expect("darwin_apply runs the release check");
         assert!(gate < a.find("match apply_branch(&payloads)").unwrap(), "a branch runs before the release check");
         assert!(gate < a.find("root_install(").unwrap(), "a root write before the release check");
-        assert!(a.find("raised_floor(").unwrap() > a.find("bundle apply incomplete").unwrap(), "the floor rises before the apply succeeded");
+        assert!(a.find("next_floor(").unwrap() > a.find("bundle apply incomplete").unwrap(), "the floor rises before the apply succeeded");
     }
 
     /// mcmini on noo-cli-v0.6.9 refused the 0.6.10 bundle with exit 65

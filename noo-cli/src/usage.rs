@@ -66,7 +66,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
         (&["cluster", "set-primary"], "[--to <target>] --promoted [-y|--yes]", "Move the primary-controller role; promote Postgres on the target first, then --promoted"),
         (&["cluster", "sync-images"], "[<node>...] [-i|--image <img>]... [--images <a,b>] [--restart|--no-restart] [--all] [--stage-only] [--lock] [--arch <a,b>] [--all-images]", "Stage images on the artifact rail, then nodes pull them (--stage-only: stage, no pull)"),
         (&["cluster", "upgrade-agents"], "[<node>...] [-y|--yes]", "Restage node agents serially in signed bundles over the pull rail; asks to confirm (-y)"),
-        (&["cluster", "upgrade-hostd"], "<node>... [--skip-build] [-y|--yes|--force]", "Roll noo-hostd to the named nodes over the pull rail as a signed bundle"),
+        (&["cluster", "upgrade-hostd"], "<node>... [-y|--yes|--force]", "Roll noo-hostd to the named nodes over the pull rail as a signed bundle"),
         (&["cluster", "upgrade-applier"], "<node>... [-y|--yes|--force]", "Ship the current noo-apply to nodes over the rail; asks for confirmation (-y)"),
         (&["cluster", "restart-backends"], "<node> <noo-svc>... [-y|--yes|--force]", "Restart noo-* backend containers on a node via a rail-delivered bundle"),
         (&["cluster", "host-telemetry", "apply"], "[<node>...] [--all] [--include-controller] [-y|--yes]", "Switch off tailscaled's log upload on nodes over the pull rail, one at a time"),

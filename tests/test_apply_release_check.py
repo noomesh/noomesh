@@ -143,14 +143,66 @@ def test_a_malformed_signature_is_refused(fleet: Fleet, sig: bytes) -> None:
     refused(fleet.apply(fleet.bundle({**files, **proof})), "does not verify")
 
 
-def test_an_openssl_that_cannot_verify_ed25519_refuses_and_says_so(fleet: Fleet) -> None:
-    # An OpenSSL 1.1.1 has no `pkeyutl -rawin`: say so, never skip the check.
-    stub = fleet.tmp / "stub" / "openssl"
+def _stub(fleet: Fleet, name: str, body: str) -> None:
+    f = fleet.tmp / "stub" / name
+    f.write_text(body)
+    f.chmod(0o755)
+
+
+def _no_openssl3(fleet: Fleet) -> None:
+    """An OpenSSL 1.1.1: no `pkeyutl -rawin`, every other verb the real one."""
     real = subprocess.run(["sh", "-c", "command -v openssl"], capture_output=True, text=True).stdout.strip()
-    stub.write_text(f'#!/bin/sh\n[ "$1 $2" = "pkeyutl -help" ] && {{ echo "Usage: pkeyutl"; exit 1; }}\n'
-                    f'[ "$1" = version ] && {{ echo "OpenSSL 1.1.1f  31 Mar 2020"; exit 0; }}\nexec {real} "$@"\n')
-    stub.chmod(0o755)
-    refused(fleet.apply(fleet.bundle({"applier": PAYLOADS["applier"]})), "OpenSSL 3 is needed")
+    _stub(fleet, "openssl", f'#!/bin/sh\n[ "$1 $2" = "pkeyutl -help" ] && {{ echo "Usage: pkeyutl"; exit 1; }}\n'
+                            f'[ "$1" = version ] && {{ echo "OpenSSL 1.1.1f  31 Mar 2020"; exit 0; }}\n'
+                            f'[ "$1" = pkeyutl ] && {{ echo "pkeyutl: unknown option -rawin" >&2; exit 1; }}\nexec {real} "$@"\n')
+
+
+def test_without_openssl3_the_python_fallback_verifies(fleet: Fleet) -> None:
+    _no_openssl3(fleet)
+    r = fleet.apply(fleet.bundle(dict(PAYLOADS)))
+    passed(r)
+    assert "verifier=python" in r.stdout, r.stdout
+
+
+def test_the_python_fallback_refuses_a_wrong_key_and_an_edited_list(fleet: Fleet, tmp_path: Path) -> None:
+    _no_openssl3(fleet)
+    other = ReleaseKey(tmp_path / "not-the-release")
+    files = {"hostd-binary": PAYLOADS["hostd-binary"]}
+    refused(fleet.apply(fleet.bundle({**files, **fleet.release_proof(files, sums_key=other)})),
+            "release-sums — its signature does not verify")
+    files = {"agent-binary": PAYLOADS["agent-binary"]}
+    refused(fleet.apply(fleet.bundle({**files, **fleet.release_proof(files, lock_key=other)})),
+            "release-lock — its signature does not verify")
+    evil = {"hostd-binary": ELF + b"evil"}
+    proof = fleet.release_proof({"hostd-binary": PAYLOADS["hostd-binary"]})
+    proof["release-sums"] += f"{hashlib.sha256(evil['hostd-binary']).hexdigest()}  noo-hostd-x86_64-unknown-linux-gnu\n".encode()
+    refused(fleet.apply(fleet.bundle({**evil, **proof})), "does not verify")
+
+
+def test_the_embedded_python_verifier_agrees_with_the_repo_script(tmp_path: Path) -> None:
+    """Same answers as scripts/verify-release-signature.py, on a good and a bad signature."""
+    code = subprocess.run(["bash", "-c", TEXT[TEXT.index('RELEASE_PY_ED25519="$(cat'):TEXT.index("\nPY\n)\"") + 6]
+                           + '\nprintf "%s" "$RELEASE_PY_ED25519"'], capture_output=True, text=True, check=True).stdout
+    key = ReleaseKey(tmp_path / "k")
+    data = tmp_path / "data"
+    data.write_bytes(b"deadbeef  noo-apply.sh\n")
+    sig = key.sign(data.read_bytes()).decode().strip()
+    (tmp_path / "data.sig").write_text(sig + "\n")
+    body = sig.removeprefix("noo-sig1.")
+    bad = ("B" if body[0] != "B" else "C") + body[1:]
+    for b, want in [(body, 0), (bad, 1)]:
+        emb = subprocess.run(["python3", "-I", "-c", code, str(data), b, "00" * 32, key.pub_hex]).returncode
+        assert emb == want, (b == body, emb)
+    script = subprocess.run(["python3", "-I", str(REPO / "scripts/verify-release-signature.py"), "--key", key.pub_hex,
+                             str(data), str(tmp_path / "data.sig")]).returncode
+    assert script == 0
+
+
+def test_with_neither_openssl3_nor_python3_root_code_is_refused_and_says_so(fleet: Fleet) -> None:
+    _no_openssl3(fleet)
+    _stub(fleet, "python3", "#!/bin/sh\nexit 127\n")
+    line = refused(fleet.apply(fleet.bundle({"applier": PAYLOADS["applier"]})), "needs OpenSSL 3 or python3")
+    assert "applier" in line
 
 
 # ── the version the list names, and the floor ───────────────────────────────
@@ -162,38 +214,45 @@ def test_a_version_text_the_list_does_not_name_is_refused(fleet: Fleet) -> None:
     refused(fleet.apply(fleet.bundle({**files, **proof})), "is not the release the signed list names")
 
 
-@pytest.mark.parametrize("floor,version,ok", [
-    ("0.6.28", "0.6.27", False),
-    ("0.6.27", "0.6.27-rc.3", False),   # the final is newer than its rcs
-    ("0.6.27-rc.3", "0.6.27-rc.2", False),
-    ("0.6.27", "0.6.27", True),
-    ("0.6.27-rc.3", "0.6.27", True),
-    ("0.6.9", "0.6.10", True),          # numeric, not string, order
-    ("1.0.0", "0.99.99", False),
+# One step back (operator 2026-11-17): the record keeps the last two finals.
+@pytest.mark.parametrize("final,prev,version,ok", [
+    ("0.6.28", "0.6.27", "0.6.27", True),        # one final back
+    ("0.6.28", "0.6.27", "0.6.26", False),       # two finals back
+    ("0.6.28", "0.6.27", "0.6.28", True),
+    ("0.6.28", "0.6.27", "0.6.29", True),
+    ("0.6.28", "", "0.6.27", False),             # only one final known: nothing older
+    ("0.6.28", "0.6.27", "0.6.28-rc.3", True),   # an rc of the current release
+    ("0.6.28", "0.6.27", "0.6.29-rc.1", True),   # an rc of the next release
+    ("0.6.28", "0.6.27", "0.6.27-rc.9", False),  # an rc older than the previous final
+    ("0.6.10", "0.6.9", "0.6.9", True),          # numeric, not string, order
+    ("1.0.0", "0.99.99", "0.99.98", False),
+    ("", "", "0.1.0", True),                     # nothing recorded yet
 ])
-def test_the_release_floor(fleet: Fleet, floor: str, version: str, ok: bool) -> None:
-    fleet.floor.write_text(f"# test\nrelease {floor}\n")
+def test_the_release_floor_steps_back_one_final(fleet: Fleet, final: str, prev: str, version: str, ok: bool) -> None:
+    fleet.floor.write_text("# test\n" + (f"release-final {final}\n" if final else "") + (f"release-prev {prev}\n" if prev else ""))
     files = {"hostd-binary": PAYLOADS["hostd-binary"]}
     r = fleet.apply(fleet.bundle({**files, **fleet.release_proof(files, version=version)}))
     if ok:
         passed(r)
     else:
-        refused(r, f"already applied release {floor}")
+        refused(r, "steps back at most one final" if "-rc." not in version else "an rc of a release older")
 
 
-@pytest.mark.parametrize("floor,tag,ok", [("v0.6.28", "v0.6.27", False), ("v0.6.27", "v0.6.27", True), ("0.6.26", "stack-v0.6.27", True)])
-def test_the_stack_floor(fleet: Fleet, floor: str, tag: str, ok: bool) -> None:
-    fleet.floor.write_text(f"stack {floor}\n")
+@pytest.mark.parametrize("final,prev,tag,ok", [
+    ("v0.6.28", "v0.6.27", "v0.6.27", True), ("v0.6.28", "v0.6.27", "v0.6.26", False),
+    ("v0.6.28", "v0.6.27", "stack-v0.6.28", True), ("v0.6.28", "", "v0.6.27", False)])
+def test_the_stack_floor_steps_back_one_final(fleet: Fleet, final: str, prev: str, tag: str, ok: bool) -> None:
+    fleet.floor.write_text(f"stack-final {final}\n" + (f"stack-prev {prev}\n" if prev else ""))
     files = {"agent-binary": PAYLOADS["agent-binary"]}
     r = fleet.apply(fleet.bundle({**files, **fleet.release_proof(files, stack=tag)}))
     if ok:
         passed(r)
     else:
-        refused(r, f"already applied stack {floor}")
+        refused(r, "steps back at most one final")
 
 
 def test_a_floor_record_that_is_not_a_version_refuses(fleet: Fleet) -> None:
-    fleet.floor.write_text("release $(id)\n")
+    fleet.floor.write_text("release-final $(id)\n")
     refused(fleet.apply(fleet.bundle({"fetcher": PAYLOADS["fetcher"]})), "is not a version")
 
 
@@ -202,19 +261,27 @@ def _floor_fns() -> str:
     return block
 
 
-def _write_floor(tmp: Path, *calls: tuple[str, str]) -> str:
-    floor = tmp / "floor"
+def _write_floor(floor: Path, *calls: tuple[str, str]) -> dict[str, str]:
     script = _floor_fns() + "\n" + "\n".join(f'release_floor_write "{v}" "{s}"' for v, s in calls)
     subprocess.run(["bash", "-c", f"set -eu\nVERIFY_ONLY=0\nRELEASE_FLOOR={floor}\n{script}"], check=True, capture_output=True)
-    return floor.read_text() if floor.exists() else ""
+    if not floor.exists():
+        return {}
+    return dict(l.split(" ", 1) for l in floor.read_text().splitlines() if not l.startswith("#"))
 
 
-def test_the_floor_record_rises_and_never_falls(tmp_path: Path) -> None:
-    out = _write_floor(tmp_path, ("0.6.27", "v0.6.27"), ("0.6.26", ""), ("", "v0.6.25"), ("0.6.28-rc.1", ""))
-    assert "release 0.6.28-rc.1\n" in out and "stack v0.6.27\n" in out, out
+def test_the_record_keeps_the_last_two_finals_and_the_oldest_never_falls(tmp_path: Path) -> None:
+    f = tmp_path / "floor"
+    assert _write_floor(f, ("0.6.27", "v0.6.27")) == {"release-final": "0.6.27", "stack-final": "v0.6.27"}
+    assert _write_floor(f, ("0.6.28", "v0.6.28")) == {"release-final": "0.6.28", "release-prev": "0.6.27",
+                                                      "stack-final": "v0.6.28", "stack-prev": "v0.6.27"}
+    # One step back, then an rc, then forward: the oldest accepted never moves down.
+    rec = _write_floor(f, ("0.6.27", "v0.6.27"), ("0.6.29-rc.1", "v0.6.29-rc.1"))
+    assert rec["release-final"] == "0.6.28" and rec["release-prev"] == "0.6.27", rec
+    rec = _write_floor(f, ("0.6.29", ""))
+    assert rec["release-final"] == "0.6.29" and rec["release-prev"] == "0.6.28", rec
     empty = tmp_path / "nothing-verified"
-    empty.mkdir()
-    assert _write_floor(empty, ("", "")) == "", "a config-only apply wrote a floor"
+    assert _write_floor(empty, ("", "")) == {}, "a config-only apply wrote a floor"
+    assert _write_floor(empty, ("0.6.27-rc.1", "")) == {}, "an rc moved the record"
 
 
 def test_the_floor_is_written_only_after_every_install() -> None:
@@ -326,9 +393,20 @@ def test_provision_attaches_the_lists_after_every_payload_and_before_signing() -
 
 def test_every_other_bundle_carrying_the_applier_carries_the_lists() -> None:
     sub = (REPO / "noo-cli/src/commands/cluster_provision_subprocess.rs").read_text()
-    assert 'if kind == "applier" {\n                let proof = crate::commands::provision::release_proof_for(g, &files)?;' in sub
+    assert 'if kind == "applier" || kind == "hostd-binary" {\n                let proof = crate::commands::provision::release_proof_for(g, &files)?;' in sub
     sec = (REPO / "noo-cli/src/commands/security_local.rs").read_text()
     push = sec[sec.index("fn build_signed_cert_bundle("):]
     push = push[:push.index("\n}\n")]
     applier = push.index('payloads.push(("applier".to_string()')
     assert push.index("cached_release_proof(&applier)") < applier, "a cert push carries the applier without its list"
+
+
+def test_upgrade_hostd_ships_the_release_asset_with_its_list() -> None:
+    sub = (REPO / "noo-cli/src/commands/cluster_provision_subprocess.rs").read_text()
+    body = sub[sub.index("pub fn cluster_upgrade_hostd("):]
+    body = body[:body.index("\n}\n")]
+    assert "cached_release_asset(g, &root, &asset)" in body and "hostd_release_asset(arch)" in body
+    assert "build-cross" not in body and "skip_build" not in body, "upgrade-hostd still builds from a checkout"
+    assert 'if kind == "applier" || kind == "hostd-binary" {' in sub
+    usage = (REPO / "noo-cli/src/usage.rs").read_text()
+    assert '(&["cluster", "upgrade-hostd"], "<node>... [-y|--yes|--force]"' in usage
