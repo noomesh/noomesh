@@ -146,6 +146,11 @@ type Reporter struct {
 	// wired; ok=false (unreadable, or no models dir) omits the key.
 	modelSetsFree atomic.Pointer[func() (int64, bool)]
 
+	// ollamaVerify reports each placed Ollama model's verification against
+	// the controller's store, sent as `ollama_verify`. nil = not wired, and a
+	// provider answering nil (nothing checked yet) omits the key.
+	ollamaVerify atomic.Pointer[func() any]
+
 	// nodeFacts supplies the i300 F5b keys: the node facts, the consent policy
 	// and approvals, and `node_workloads`. It returns only the keys it knows;
 	// everything absent is omitted. nil = not wired. Installed after the loop
@@ -380,6 +385,18 @@ func (r *Reporter) gpuContentionReport() any {
 // `model_sets` ([{id, revision, state, reason?, ...delivery fields}]). It returns nil when the
 // state cannot be read.
 func (r *Reporter) SetModelSets(f func() any) { r.modelSets.Store(&f) }
+
+// SetOllamaVerify installs the provider of `ollama_verify`: [{model, state,
+// anchor, model_layer, reason, remedy?, checked_at}].
+func (r *Reporter) SetOllamaVerify(f func() any) { r.ollamaVerify.Store(&f) }
+
+func (r *Reporter) ollamaVerifyReport() any {
+	f := r.ollamaVerify.Load()
+	if f == nil || *f == nil {
+		return nil
+	}
+	return (*f)()
+}
 
 // SetModelSetsFreeBytes installs the provider of `model_sets_free_bytes`.
 func (r *Reporter) SetModelSetsFreeBytes(f func() (int64, bool)) { r.modelSetsFree.Store(&f) }

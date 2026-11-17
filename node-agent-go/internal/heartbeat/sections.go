@@ -169,6 +169,7 @@ var heartbeatSections = []payloadSection{
 	secLanes,
 	secGPUContention,
 	secModelSets,
+	secOllamaVerify,
 	secNodeFacts,
 }
 
@@ -195,6 +196,16 @@ var (
 		// OMITTED when unknown, never 0.
 		if free, ok := r.modelSetsFreeBytes(); ok {
 			p["model_sets_free_bytes"] = free
+		}
+	}}
+
+	secOllamaVerify = payloadSection{name: "ollamaVerify", add: func(r *Reporter, p map[string]any) {
+		// Each placed Ollama model checked against the controller's store
+		// (reconcile/ollama_verify.go): state, anchor and the model layer's
+		// digest, so the controller sees every node's weight digest. OMITTED
+		// until a check has run: an empty list would claim "none placed".
+		if ov := r.ollamaVerifyReport(); ov != nil {
+			p["ollama_verify"] = ov
 		}
 	}}
 
