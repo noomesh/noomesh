@@ -604,12 +604,15 @@ where
             Ok(Ok(resp)) => {
                 let status = resp.status();
                 coordinator::warn_if_node_agent_outdated(status, &url);
+                // The tunnel door's pre-head loss: nothing reached the
+                // caller, so it is retried like a backend that is down.
+                let door_lost = crate::tunnel_door::lost_before_head(status.as_u16(), resp.headers());
                 let text = resp.text().await.unwrap_or_default();
                 if is_busy_reply(status.as_u16(), &text) {
                     busy = true;
                     busy_text(&text, cand)
                 } else {
-                    if !coordinator::is_retryable_llm_http_error(status.as_u16(), &text) {
+                    if !door_lost && !coordinator::is_retryable_llm_http_error(status.as_u16(), &text) {
                         let st = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
                         return Err(RawChatError::upstream(st, &text, &cand.model, &cand.url));
                     }
@@ -1440,7 +1443,22 @@ mod tests {
         /// The live `backend_unreachable` 502 on its first request (vLLM
         /// resetting the connection), then a prompt answer.
         FailsFirst(&'static str),
+        /// The tunnel door's own pre-head 502 on the first request (the
+        /// 0.6.26 roll, 17:01:09Z: awolf's agent restarting), with its
+        /// `x-noo-tunnel-error: tunnel_lost` header, then a prompt answer.
+        DoorLostFirst(&'static str),
+        /// The same body WITHOUT the door's header, then an answer: a
+        /// backend that merely says the words is not the door.
+        DoorBodyOnlyFirst(&'static str),
+        /// The door's mid-stream drop: a 200 head and two content frames,
+        /// then the connection closes without the terminating chunk.
+        DoorLostMidStream,
     }
+
+    /// The door's answer to a tunnel lost before the node's head, byte for
+    /// byte as the gateway logged it live (ref-0fe0d2de82).
+    const DOOR_LOST_BODY: &str =
+        r#"{"detail":"tunnel_lost: the tunnel to node awolf dropped (the connection failed)","error":"tunnel_lost"}"#;
 
     struct FakeBackend {
         url: String,
@@ -1518,6 +1536,28 @@ mod tests {
                             let body = r#"{"error":{"code":"backend_unreachable","message":"read tcp 172.18.0.1:45704->172.18.0.2:8000: read: connection reset by peer","type":"node_agent_proxy_error"}}"#;
                             let reply = format!("HTTP/1.1 502 Bad Gateway\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}", body.len());
                             let _ = sock.write_all(reply.as_bytes()).await;
+                        }
+                        Fake::DoorLostFirst(_) | Fake::DoorBodyOnlyFirst(_) if first_request => {
+                            let marker = if matches!(mode, Fake::DoorLostFirst(_)) { "x-noo-tunnel-error: tunnel_lost\r\n" } else { "" };
+                            let reply = format!(
+                                "HTTP/1.1 502 Bad Gateway\r\ncontent-type: application/json\r\n{marker}content-length: {}\r\n\r\n{DOOR_LOST_BODY}",
+                                DOOR_LOST_BODY.len()
+                            );
+                            let _ = sock.write_all(reply.as_bytes()).await;
+                        }
+                        Fake::DoorLostFirst(text) | Fake::DoorBodyOnlyFirst(text) => {
+                            let _ = sock.write_all(head.as_bytes()).await;
+                            for f in [delta(text), fin, usage, "data: [DONE]\n\n".to_string()] {
+                                let _ = sock.write_all(&chunk(&f)).await;
+                            }
+                            let _ = sock.write_all(b"0\r\n\r\n").await;
+                        }
+                        Fake::DoorLostMidStream => {
+                            let _ = sock.write_all(head.as_bytes()).await;
+                            for t in ["half ", "an answer "] {
+                                let _ = sock.write_all(&chunk(&delta(t))).await;
+                            }
+                            // Closed here: no terminating chunk.
                         }
                         Fake::FailsFirst(text) => {
                             let _ = sock.write_all(head.as_bytes()).await;
@@ -1854,6 +1894,51 @@ mod tests {
         assert_eq!(awolf.seen.lock().unwrap().len(), 2, "one retry, not more");
         assert!(mcmini.seen.lock().unwrap().is_empty(), "the fallback was never touched");
         assert_eq!(crate::coordinator::expected_wait::RETRY_FIRST_AFTER, Duration::from_secs(2));
+    }
+
+    /// The 0.6.26 roll's chat 502 (17:01:09Z): the class's ONLY candidate
+    /// answered with the tunnel door's pre-head `tunnel_lost` while its node
+    /// agent restarted. That is the backend being down for a moment, so the
+    /// expected-wait rule retries it after the wait, and it answers.
+    #[tokio::test]
+    async fn the_doors_pre_head_loss_on_the_only_node_is_retried_after_the_wait() {
+        let awolf = fake_backend(Fake::DoorLostFirst("hi")).await;
+        let wait = Duration::from_millis(300);
+        let t0 = Instant::now();
+        let (r, alerts) = run_until_with_retry(&[cand("awolf", "vllm", "m", &awolf.url)], false, FAST, Duration::from_secs(20), Some(wait)).await;
+        let (index, data) = json_of(r);
+        assert_eq!(index, 0);
+        assert_eq!(data.pointer("/choices/0/message/content").and_then(Value::as_str), Some("hi"));
+        assert!(t0.elapsed() >= wait, "the retry waited {:?}", t0.elapsed());
+        assert_eq!(awolf.seen.lock().unwrap().len(), 2, "sent once more, not more");
+        drop(alerts);
+    }
+
+    /// The rule is the door's header, not the words: the same body from a
+    /// backend without the header stays the final 502 it was.
+    #[tokio::test]
+    async fn the_doors_words_without_its_header_are_not_retried() {
+        let b = fake_backend(Fake::DoorBodyOnlyFirst("hi")).await;
+        let (r, _) = run_until_with_retry(&[cand("awolf", "vllm", "m", &b.url)], false, FAST, Duration::from_secs(20), Some(Duration::from_millis(300))).await;
+        let e = match r {
+            Err(e) => e,
+            Ok(_) => panic!("a 502 without the door's header must stay final"),
+        };
+        assert_eq!(e.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(b.seen.lock().unwrap().len(), 1, "never sent again");
+    }
+
+    /// A tunnel that drops MID-stream is never re-sent to a streaming caller:
+    /// its 200 head and the first bytes went out, and the body ends short.
+    #[tokio::test]
+    async fn a_door_drop_mid_stream_reaches_a_streaming_caller_and_is_never_resent() {
+        let b = fake_backend(Fake::DoorLostMidStream).await;
+        let (r, _) = run_until_with_retry(&[cand("awolf", "vllm", "m", &b.url)], true, FAST, Duration::from_secs(20), Some(Duration::from_millis(300))).await;
+        let ok = r.unwrap_or_else(|e| panic!("the stream is the caller's: {}", e.detail));
+        assert!(matches!(ok.body, CoreBody::Stream(_)));
+        assert_eq!(ok.index, 0);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(b.seen.lock().unwrap().len(), 1, "never sent again");
     }
 
     /// Without the rule (a strict pin, a batch source), failover is as it was.
