@@ -17,6 +17,9 @@ use std::path::Path;
 
 pub(crate) const ROW: &str = "hf-cache hub owner";
 
+/// The self-node's root applier, as prep-host installs it.
+const APPLIER: &str = "/usr/local/bin/noo-apply";
+
 /// (uid, gid)
 pub(crate) type Owner = (u32, u32);
 
@@ -28,7 +31,11 @@ pub(crate) enum Hub {
     Dir(Owner),
 }
 
-pub(crate) fn row(cache: &str, cache_owner: Option<Owner>, hub: Hub) -> Check {
+/// `applier`: this controller has the self-node's root applier
+/// (`/usr/local/bin/noo-apply`, installed by prep-host for the self node).
+/// Without one nothing re-owns hub on a roll, so the remedy is a stated,
+/// one-off sudo line instead.
+pub(crate) fn row(cache: &str, cache_owner: Option<Owner>, hub: Hub, applier: bool) -> Check {
     let Some(c) = cache_owner else {
         return ok(ROW, format!("{cache} does not exist yet: nothing to compare"));
     };
@@ -39,11 +46,20 @@ pub(crate) fn row(cache: &str, cache_owner: Option<Owner>, hub: Hub) -> Check {
             format!("{cache}/hub is a symlink: the self-node's applier leaves it as it is; give its target hf-cache's owner ({}:{}) by hand", c.0, c.1),
             None,
         ),
-        Hub::Dir(h) if h != c => warn(
+        Hub::Dir(h) if h != c && applier => warn(
             ROW,
             format!(
                 "hf-cache/hub is owned by {}:{}, hf-cache by {}:{}: the self-node's applier re-owns it at its next apply",
                 h.0, h.1, c.0, c.1
+            ),
+            None,
+        ),
+        Hub::Dir(h) if h != c => warn(
+            ROW,
+            format!(
+                "hf-cache/hub is owned by {}:{}, hf-cache by {}:{}, and this controller has no self-node applier to re-own it: \
+                 once, at a terminal: sudo chown -R -P -h {}:{} {cache}/hub (owner only; links are not followed)",
+                h.0, h.1, c.0, c.1, c.0, c.1
             ),
             None,
         ),
@@ -71,7 +87,8 @@ pub(crate) fn live() -> Check {
         format!("{root}/hf-cache")
     });
     let (cache_owner, hub) = read(Path::new(&cache));
-    row(&cache, cache_owner, hub)
+    let applier = Path::new(APPLIER).is_file();
+    row(&cache, cache_owner, hub, applier)
 }
 
 #[cfg(test)]
@@ -83,7 +100,7 @@ mod tests {
     /// hub 0:0 under a noo-agent hf-cache.
     #[test]
     fn a_root_owned_hub_under_the_agents_hf_cache_warns_with_both_owners() {
-        let c = row("/var/lib/noo/hf-cache", Some((122, 998)), Hub::Dir((0, 0)));
+        let c = row("/var/lib/noo/hf-cache", Some((122, 998)), Hub::Dir((0, 0)), true);
         assert_eq!(c.verdict, Verdict::Warn);
         assert_eq!(c.name, ROW);
         assert_eq!(
@@ -93,11 +110,22 @@ mod tests {
     }
 
     #[test]
+    fn without_an_applier_the_remedy_is_a_stated_sudo_chown() {
+        let c = row("/var/lib/noo/hf-cache", Some((993, 982)), Hub::Dir((0, 0)), false);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("no self-node applier"), "{}", c.detail);
+        assert!(c.detail.contains("sudo chown -R -P -h 993:982 /var/lib/noo/hf-cache/hub"), "{}", c.detail);
+        assert!(!c.detail.contains("re-owns it at its next apply"), "{}", c.detail);
+        let w = row("/var/lib/noo/hf-cache", Some((993, 982)), Hub::Dir((0, 0)), true);
+        assert!(w.detail.contains("re-owns it at its next apply") && !w.detail.contains("sudo"), "{}", w.detail);
+    }
+
+    #[test]
     fn the_same_owner_is_ok_and_nothing_to_compare_is_ok() {
-        assert_eq!(row("/d/hf-cache", Some((122, 998)), Hub::Dir((122, 998))).verdict, Verdict::Ok);
-        assert_eq!(row("/d/hf-cache", Some((122, 998)), Hub::Absent).verdict, Verdict::Ok);
-        assert_eq!(row("/d/hf-cache", None, Hub::Absent).verdict, Verdict::Ok);
-        let s = row("/d/hf-cache", Some((122, 998)), Hub::Symlink);
+        assert_eq!(row("/d/hf-cache", Some((122, 998)), Hub::Dir((122, 998)), true).verdict, Verdict::Ok);
+        assert_eq!(row("/d/hf-cache", Some((122, 998)), Hub::Absent, true).verdict, Verdict::Ok);
+        assert_eq!(row("/d/hf-cache", None, Hub::Absent, true).verdict, Verdict::Ok);
+        let s = row("/d/hf-cache", Some((122, 998)), Hub::Symlink, true);
         assert_eq!(s.verdict, Verdict::Warn);
         assert!(s.detail.contains("is a symlink") && s.detail.contains("122:998"), "{}", s.detail);
     }
@@ -117,7 +145,7 @@ mod tests {
         let (co, hub) = read(&cache);
         assert_eq!(co, Some((m.uid(), m.gid())));
         assert_eq!(hub, Hub::Dir((m.uid(), m.gid())));
-        assert_eq!(row(&cache.display().to_string(), co, hub).verdict, Verdict::Ok);
+        assert_eq!(row(&cache.display().to_string(), co, hub, true).verdict, Verdict::Ok);
         std::fs::remove_dir(cache.join("hub")).unwrap();
         std::os::unix::fs::symlink(&b, cache.join("hub")).unwrap();
         assert_eq!(read(&cache).1, Hub::Symlink);
