@@ -606,6 +606,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
         (Some(p), s) => out.push(ok("harness", format!("{} (policy {p})", if s.is_empty() { "-" } else { s }))),
     } }
     out.extend(model_stores_check(id, n));
+    out.extend(ollama_models_check(id, n));
     out.extend(harness_tasks_check(n));
     out.extend(harness_egress_check(id, n));
     settle_after_roll(n, &mut out);
@@ -632,7 +633,7 @@ pub(crate) fn model_stores_check(id: &str, n: &Value) -> Option<Check> {
     let guard = |store: &str| match store {
         "hf_cache" => "HF weights are re-verified against the controller's manifest on load",
         "models" => "GGUF files are re-verified at start only when the controller has a manifest for them",
-        "ollama" => "the Ollama store is NOT re-verified on load",
+        "ollama" => "Ollama models are re-verified against the controller when it holds a record of them (the `ollama models` row); a hand pull is not",
         _ => "anyone can rename or replace the stores under it",
     };
     let mut parts = Vec::new();
@@ -651,6 +652,56 @@ pub(crate) fn model_stores_check(id: &str, n: &Value) -> Option<Check> {
         bad.len(), parts.join("; ")),
         Some(format!("on {id}: {}   # keep the owner; hand downloads: `noo models pull <model>`, or run them as the store's owner",
             fixes.join(" && ")))))
+/// The `ollama models` row (proposal 61 §7b): each placed Ollama model checked
+/// against the controller's store, from the agent's `ollama_verify`. The
+/// weights a node serves are the controller's when the local manifest's layers
+/// equal the controller's mirrored manifest, or its model layer equals the
+/// controller's GGUF. A mismatch is repaired from the controller (re-install or
+/// rebuild) and only a failed repair refuses the model. A model the controller
+/// has no record of (a hand `ollama pull`) is never refused: it is a WARN whose
+/// remedy re-pulls it through noo, which is how a hand pull is blessed. There
+/// is no switch that marks a model trusted. No row when the agent does not
+/// report it (no Ollama placement, or an agent that predates the check).
+pub(crate) fn ollama_models_check(id: &str, n: &Value) -> Option<Check> {
+    const NAME: &str = "ollama models";
+    let rows = n.get("ollama_verify")?.as_array()?;
+    if rows.is_empty() {
+        return None;
+    }
+    let short = |d: &str| d.strip_prefix("sha256:").map(|h| format!("sha256:{}…", &h[..h.len().min(12)])).unwrap_or_default();
+    let mut good = Vec::new();
+    let mut warns = Vec::new();
+    let mut fails = Vec::new();
+    let mut remedies: Vec<String> = Vec::new();
+    for r in rows {
+        let model = r["model"].as_str().unwrap_or("?");
+        let anchor = r["anchor"].as_str().unwrap_or("");
+        let layer = short(r["model_layer"].as_str().unwrap_or(""));
+        let reason = r["reason"].as_str().unwrap_or("");
+        let pull = || format!("noo models pull {model}");
+        match r["state"].as_str().unwrap_or("") {
+            "verified" | "rebuilt" => good.push(format!("{model} ({} anchor{}{})", anchor,
+                if layer.is_empty() { String::new() } else { format!(", weights {layer}") },
+                if r["state"] == "rebuilt" { ", repaired from the controller" } else { "" })),
+            "refused" => { fails.push(format!("{model}: {reason}")); remedies.push(pull()); }
+            "unverified" => { warns.push(format!("{model}: unverified ({}); re-pull it through noo to verify it",
+                if reason.is_empty() { "no controller record" } else { reason })); remedies.push(pull()); }
+            "mismatch" => { warns.push(format!("{model}: does NOT match the controller ({reason}); not repaired here (the agent does not manage this Ollama)")); remedies.push(pull()); }
+            _ => warns.push(format!("{model}: could not be checked ({})", if reason.is_empty() { "no reason given" } else { reason })),
+        }
+    }
+    let remedy = (!remedies.is_empty()).then(|| format!("on {id}: {}", remedies.join(" && ")));
+    if !fails.is_empty() {
+        let mut d = format!("refused (does not match the controller, and the repair failed): {}", fails.join("; "));
+        if !warns.is_empty() { d.push_str(&format!("; also {}", warns.join("; "))); }
+        return Some(fail(NAME, d, remedy.unwrap_or_default()));
+    }
+    if !warns.is_empty() {
+        let mut d = warns.join("; ");
+        if !good.is_empty() { d.push_str(&format!("; verified: {}", good.join(", "))); }
+        return Some(warn(NAME, d, remedy));
+    }
+    Some(ok(NAME, format!("verified against the controller: {}", good.join(", "))))
 }
 
 /// The `harness egress` row (enforcement step 1): whether this node's harness,
@@ -15477,7 +15528,7 @@ mod model_stores_tests {
         let c = model_stores_check("awolf", &n).unwrap();
         assert_eq!(c.verdict, Verdict::Warn);
         for want in ["2 world-writable", "/data/noo/hf-cache (mode 0777, owner 1000:1000",
-            "HF weights are re-verified", "/data/noo/ollama", "the Ollama store is NOT re-verified on load"] {
+            "HF weights are re-verified", "/data/noo/ollama", "Ollama models are re-verified against the controller when it holds a record"] {
             assert!(c.detail.contains(want), "{want}: {}", c.detail);
         }
         let r = c.remedy.unwrap();
@@ -15494,5 +15545,55 @@ mod model_stores_tests {
         let row = c.iter().find(|c| c.name == "model stores").expect("a model stores row");
         assert_eq!(row.verdict, Verdict::Warn);
         assert!(row.detail.contains("GGUF files are re-verified at start only when the controller has a manifest"), "{}", row.detail);
+mod ollama_models_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn no_row_without_the_field_or_with_no_models() {
+        assert!(ollama_models_check("n", &json!({})).is_none());
+        assert!(ollama_models_check("n", &json!({"ollama_verify": []})).is_none());
+    }
+
+    #[test]
+    fn verified_models_are_ok_and_show_the_weight_digest() {
+        let n = json!({"ollama_verify": [{"model": "harrier", "state": "verified", "anchor": "gguf",
+            "model_layer": "sha256:5f26506ab57fd817ce4a8b9d24946a60d40bc76d82a2defa7cd754ae01e9de80"}]});
+        let c = ollama_models_check("pop-os", &n).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("harrier (gguf anchor, weights sha256:5f26506ab57f…)"), "{}", c.detail);
+    }
+
+    /// A hand pull is a WARN whose remedy re-pulls through noo, never a refusal.
+    #[test]
+    fn a_hand_pull_warns_with_the_re_pull_remedy_and_is_never_a_fail() {
+        let n = json!({"ollama_verify": [{"model": "gemma4:e4b-it-qat", "state": "unverified", "anchor": "none",
+            "reason": "no controller record"}]});
+        let c = ollama_models_check("mcmini", &n).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("gemma4:e4b-it-qat: unverified (no controller record)"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("on mcmini: noo models pull gemma4:e4b-it-qat"));
+    }
+
+    /// A refused model is a FAIL naming the blob (in the reason) and the remedy.
+    #[test]
+    fn a_refused_model_fails_naming_the_reason_and_the_remedy() {
+        let n = json!({"ollama_verify": [
+            {"model": "harrier", "state": "refused", "anchor": "gguf",
+             "reason": "the local model layer is sha256:aaaa, the controller's harrier-Q4_K_M.gguf is sha256:5f26"},
+            {"model": "llama3", "state": "verified", "anchor": "mirror"}]});
+        let c = ollama_models_check("robopi", &n).unwrap();
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("harrier: the local model layer is sha256:aaaa"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("on robopi: noo models pull harrier"));
+    }
+
+    /// Native Ollama reports a mismatch without repairing it: a WARN.
+    #[test]
+    fn a_native_mismatch_is_a_warn_that_says_it_was_not_repaired() {
+        let n = json!({"ollama_verify": [{"model": "harrier", "state": "mismatch", "anchor": "gguf", "reason": "blob bad"}]});
+        let c = ollama_models_check("mcmini", &n).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("not repaired here"), "{}", c.detail);
     }
 }

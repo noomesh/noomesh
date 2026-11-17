@@ -328,6 +328,10 @@ const I300_BEAT_KEYS: &[(&str, BeatShape)] = &[
     ("addon_workloads_approvals", BeatShape::Objects(256)),
     ("model_sets", BeatShape::Objects(256)),
     ("node_workloads", BeatShape::Objects(64)),
+    // Proposal 61 §7b: each placed Ollama model checked against the
+    // controller's store (`{model, state, anchor, model_layer, reason,
+    // remedy?, checked_at}`), read by the `ollama models` verify row.
+    ("ollama_verify", BeatShape::Objects(64)),
 ];
 
 fn beat_shape_ok(v: &Value, shape: BeatShape) -> bool {
@@ -9032,6 +9036,7 @@ mod i300_beat_tests {
                 {"id": "rh-tts", "revision": "r3", "state": "refused", "reason": "disk", "retry_at": "2026-11-09T14:32:00Z", "free_bytes": 4_500_000_000u64, "need_bytes": 9_600_000_000u64},
             ],
             "node_workloads": [{"addon": "rhaddon", "name": "worker", "state": "provisioned", "ready": false, "door_port": 41001}],
+            "ollama_verify": [{"model": "harrier", "state": "verified", "anchor": "gguf", "model_layer": "sha256:5f26", "reason": "", "checked_at": "t"}],
         })
     }
 
