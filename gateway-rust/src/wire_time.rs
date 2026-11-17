@@ -75,7 +75,7 @@ mod tests {
 
     /// Instants on every path: whole seconds; 3, 6 and 9 digits; Postgres
     /// micros with trailing zeros; the epoch and before it; a leap day; the
-    /// last instant chrono's four-digit year prints.
+    /// last instant jiff holds.
     fn instants() -> Vec<DateTime<Utc>> {
         let at = |secs: i64, nanos: u32| DateTime::from_timestamp(secs, nanos).expect("in range");
         vec![
@@ -93,7 +93,8 @@ mod tests {
             at(-1, 0),
             at(-1, 999_000_000),
             at(951_782_400, 0),
-            at(253_402_300_799, 999_999_999),
+            // jiff's last instant (9999-12-30T22:00:00Z), see the_far_end_differs.
+            at(253_402_207_200, 0),
             at(1_709_208_000, 7_000),
         ]
     }
@@ -154,6 +155,19 @@ mod tests {
             }
         }
         assert!(differ.is_empty(), "the parsers differ:\n{}", differ.join("\n"));
+    }
+
+    /// The one known difference (i923): jiff's range ends at
+    /// 9999-12-30T22:00:00Z, about 26 hours before chrono's, kept as slack for
+    /// offsets. No code, SQL or migration here uses a far-future sentinel
+    /// (searched 2026-11-17); this pins the edge so a wave that meets one
+    /// fails here, not on a live row.
+    #[test]
+    fn the_far_end_differs() {
+        let last_day = "9999-12-31T23:59:59Z";
+        assert!(DateTime::parse_from_rfc3339(last_day).is_ok(), "chrono reads it");
+        assert!(parse_rfc3339(last_day).is_err(), "jiff refuses it");
+        assert_eq!(parse_rfc3339("9999-12-30T22:00:00Z").ok().map(|t| t.as_second()), Some(253_402_207_200));
     }
 
     /// The one time inside MAC'd bytes (i923): the audit log's signed head.
