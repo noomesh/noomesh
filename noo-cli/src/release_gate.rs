@@ -148,7 +148,7 @@ pub fn darwin_check(
     keys: &[&str],
 ) -> Result<Option<String>, String> {
     let root: Vec<&str> = DARWIN_LISTED.iter().chain(DARWIN_PLISTS).copied().filter(|k| payloads.contains_key(*k)).collect();
-    if root.is_empty() {
+    if root.is_empty() || !payloads.contains_key("release-sums") {
         return Ok(None);
     }
     let kinds = root.join(" ");
