@@ -503,7 +503,7 @@ async fn bootstrap_token_create(
     let raw = generate_bootstrap_token();
     let token_hash = hash_token(&raw);
 
-    let (id, expires_at): (uuid::Uuid, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+    let (id, expires_at): (uuid::Uuid, jiff_sqlx::Timestamp) = sqlx::query_as(
         "INSERT INTO noo_bootstrap_tokens \
              (token_hash, created_by, expires_at, role_hint, allowed_cidr, node_name) \
          VALUES ($1, $2, now() + make_interval(secs => $3), $4, $5, $6) \
@@ -538,7 +538,7 @@ async fn bootstrap_token_create(
         "status": "ok",
         "id": id.to_string(),
         "token": raw,
-        "expires_at": expires_at.to_rfc3339(),
+        "expires_at": crate::wire_time::rfc3339_offset(expires_at.to_jiff()),
         "node_name": node_name,
         "role_hint": role_hint,
         "allowed_cidr": allowed_cidr,
@@ -573,9 +573,9 @@ async fn bootstrap_tokens_list(
     let rows: Vec<(
         uuid::Uuid,
         String,
-        chrono::DateTime<chrono::Utc>,
-        chrono::DateTime<chrono::Utc>,
-        Option<chrono::DateTime<chrono::Utc>>,
+        jiff_sqlx::Timestamp,
+        jiff_sqlx::Timestamp,
+        Option<jiff_sqlx::Timestamp>,
         Option<String>,
         Option<String>,
         Option<String>,
@@ -592,7 +592,7 @@ async fn bootstrap_tokens_list(
     .fetch_all(&state.db)
     .await?;
 
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let tokens: Vec<Value> = rows
         .into_iter()
         .map(
@@ -601,7 +601,7 @@ async fn bootstrap_tokens_list(
                     "revoked"
                 } else if used_at.is_some() {
                     "used"
-                } else if expires_at <= now {
+                } else if expires_at.to_jiff() <= now {
                     "expired"
                 } else {
                     "active"
@@ -610,9 +610,9 @@ async fn bootstrap_tokens_list(
                     "id": id.to_string(),
                     "status": status,
                     "created_by": created_by,
-                    "created_at": created_at.to_rfc3339(),
-                    "expires_at": expires_at.to_rfc3339(),
-                    "used_at": used_at.map(|t| t.to_rfc3339()),
+                    "created_at": crate::wire_time::rfc3339_offset(created_at.to_jiff()),
+                    "expires_at": crate::wire_time::rfc3339_offset(expires_at.to_jiff()),
+                    "used_at": used_at.map(|t| crate::wire_time::rfc3339_offset(t.to_jiff())),
                     "used_by_ip": used_by_ip,
                     "node_name": node_name,
                     "enroll_user": enroll_user,
@@ -757,8 +757,8 @@ async fn cluster_bootstrap(
     let presented_hash = hash_token(body.token.trim());
     let row: Option<(
         uuid::Uuid,
-        chrono::DateTime<chrono::Utc>,
-        Option<chrono::DateTime<chrono::Utc>>,
+        jiff_sqlx::Timestamp,
+        Option<jiff_sqlx::Timestamp>,
         bool,
         Option<String>,
         Option<String>,
@@ -780,7 +780,7 @@ async fn cluster_bootstrap(
     if used_at.is_some() {
         return Err(deny(DenyReason::AlreadyUsed, Some(id)).await);
     }
-    if expires_at <= chrono::Utc::now() {
+    if expires_at.to_jiff() <= jiff::Timestamp::now() {
         return Err(deny(DenyReason::Expired, Some(id)).await);
     }
     if let Some(ref cidr) = allowed_cidr {
@@ -1292,8 +1292,8 @@ async fn provision_bundle_status(
     if !valid_node_name(&node) {
         return Err(AppError::BadRequest("invalid node name".into()));
     }
-    type StatusRow = (chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>, i64,
-                      Option<chrono::DateTime<chrono::Utc>>, Option<String>, Option<i32>, Option<String>);
+    type StatusRow = (jiff_sqlx::Timestamp, Option<jiff_sqlx::Timestamp>, i64,
+                      Option<jiff_sqlx::Timestamp>, Option<String>, Option<i32>, Option<String>);
     let row: Option<StatusRow> =
         sqlx::query_as(
             "SELECT created_at, fetched_at, octet_length(blob)::bigint, \
@@ -1309,15 +1309,15 @@ async fn provision_bundle_status(
     match row {
         Some((staged_at, fetched_at, bytes, applied_at, applied_sha, apply_rc, apply_msg)) => Ok(Json(json!({
             "node": node,
-            "staged_at": staged_at.to_rfc3339(),
-            "fetched_at": fetched_at.map(|t| t.to_rfc3339()),
+            "staged_at": crate::wire_time::rfc3339_offset(staged_at.to_jiff()),
+            "fetched_at": fetched_at.map(|t| crate::wire_time::rfc3339_offset(t.to_jiff())),
             "bytes": bytes,
             "sha256": sha,
             // Apply report: the node's fetcher POSTs the
             // applier's exit code after every apply, so the controller no
             // longer infers success from "agent is registered" — which it
             // was even when the applier refused.
-            "applied_at": applied_at.map(|t| t.to_rfc3339()),
+            "applied_at": applied_at.map(|t| crate::wire_time::rfc3339_offset(t.to_jiff())),
             "applied_sha": applied_sha,
             "apply_rc": apply_rc,
             "apply_msg": apply_msg,
@@ -1826,6 +1826,17 @@ async fn serve_prep_script() -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Redemption refuses a token whose expiry is not ahead of the current
+    /// time: a fixed time, or `<`, would let an expired (or just-expired)
+    /// bootstrap token enrol a node.
+    #[test]
+    fn redemption_refuses_an_expired_token_against_now() {
+        let own = crate::test_src::own_code(include_str!("bootstrap.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn cluster_bootstrap(");
+        assert!(body.contains("if expires_at.to_jiff() <= jiff::Timestamp::now() {"), "the expiry must be judged against now, at its instant too");
+        assert!(body.contains("return Err(deny(DenyReason::Expired, Some(id)).await);"));
+    }
 
     /// rc.2 bundle ETag: the 304 is decided from the row's key BEFORE the
     /// blob is read; both answers carry the ETag; a 200 caches the sha of
