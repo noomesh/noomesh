@@ -547,7 +547,7 @@ pub(crate) fn record_before_pull(base: &str, model: &str, store: &Path) -> Resul
 /// for some tags, the list that named it. Both are stored as blobs, so the
 /// node hashes them like any layer (ollama 0.40, 2026-11-18 probe).
 const PULL_MANIFEST_MEDIA: &str = "application/vnd.docker.distribution.manifest.v2+json";
-const PULL_EXTRA_MEDIA: [&str; 2] = [PULL_MANIFEST_MEDIA, "application/vnd.ollama.manifest.list.v2+json"];
+const PULL_EXTRA_MEDIA: [&str; 3] = [PULL_MANIFEST_MEDIA, "application/vnd.ollama.manifest.list.v2+json", "application/vnd.oci.image.index.v1+json"];
 
 /// Every entry a manifest names (config first, then layers), as (mediaType,
 /// digest, size).
