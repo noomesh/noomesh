@@ -250,7 +250,7 @@ row:
 | verdict | reads |
 |---|---|
 | OK | `0 uses — uses since gateway start <age> ago; nodes: shortest agent uptime <age>: node_token_no_cert 0, … [comparators: node_token_with_cert N, addon_exchanged_token N, operator_client_cert N]`; a window under seven days adds `under 7 days, not yet retirement evidence` |
-| WARN | `in use: <lane>, … — …` with each lane's count and who used it (`node_token_no_cert 12 (host3 10, host9 2)`); a refused self-call, controller-secret, fleet-off-node, CLI or v1 token is its own WARN naming the caller (`self_call_shared_secret_refused 5 (host9 5)`); or `/metrics` not readable; or a gateway without `noo_gateway_start_time_seconds` (older than the counters; `noo upgrade --stack`); or an online node that does not report `legacy_lanes` (`noo cluster provision <node> --wait`) |
+| WARN | `in use: <lane>, … — …` with each lane's count and who used it (`node_token_no_cert 12 (host3 10, host9 2)`); a node refused for carrying no node certificate (`fleet_token_no_cert_refused 9 (host3 9)`: mTLS is enforced, so its heartbeats are refused and its `online` row goes stale; remedy `noo cluster provision <node> --wait`, which re-issues its certificate) comes first; a refused self-call, controller-secret, fleet-off-node, CLI or v1 token is its own WARN naming the caller (`self_call_shared_secret_refused 5 (host9 5)`); or `/metrics` not readable; or a gateway without `noo_gateway_start_time_seconds` (older than the counters; `noo upgrade --stack`); or an online node that does not report `legacy_lanes` (`noo cluster provision <node> --wait`) |
 
 A lane is ready to retire after zero uses over at least seven days of
 uptime — gateway uptime for the gateway lanes, every node's agent uptime
