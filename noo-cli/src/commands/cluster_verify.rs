@@ -652,6 +652,8 @@ pub(crate) fn model_stores_check(id: &str, n: &Value) -> Option<Check> {
         bad.len(), parts.join("; ")),
         Some(format!("on {id}: {}   # keep the owner; hand downloads: `noo models pull <model>`, or run them as the store's owner",
             fixes.join(" && ")))))
+}
+
 /// The `ollama models` row (proposal 61 §7b): each placed Ollama model checked
 /// against the controller's store, from the agent's `ollama_verify`. The
 /// weights a node serves are the controller's when the local manifest's layers
@@ -15545,6 +15547,10 @@ mod model_stores_tests {
         let row = c.iter().find(|c| c.name == "model stores").expect("a model stores row");
         assert_eq!(row.verdict, Verdict::Warn);
         assert!(row.detail.contains("GGUF files are re-verified at start only when the controller has a manifest"), "{}", row.detail);
+    }
+}
+
+#[cfg(test)]
 mod ollama_models_tests {
     use super::*;
     use serde_json::json;
