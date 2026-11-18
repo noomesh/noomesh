@@ -527,7 +527,7 @@ capped at 200 000 characters a turn. It is not the answer, which arrives as
 | GET | `/bootstrap/prep`, `/bootstrap/apply`, `/bootstrap/deenroll`, `/bootstrap/fetch`, `/bootstrap/ca.crt` | the pull rail a node walks during enrollment |
 | POST, GET | `/api/cluster/provision-bundle/{node}`, `…/status`; GET `/bootstrap/bundle/{node}`; POST `/bootstrap/bundle/{node}/applied` | signed provisioning bundles |
 | PUT, GET | `/api/cluster/cli-asset/{name}`, `/bootstrap/cli/{name}` | CLI binaries served to nodes |
-| GET | `/api/artifacts/manifest/{kind}/{name}` | artifact rail manifests (`gguf`, `modelfile`, `image`; `binary` is retired): `{size_bytes, sha256, data_path}`. The sha256 is cached by path, size, nanosecond mtime, inode and device (an entry from an older gateway, without them, re-hashes once); a file not yet hashed is hashed in the background, and a request that would wait more than ~8 s gets `202 {"status":"hashing","retry_after_secs"}` with `Retry-After` — ask again. `noo cluster sync-model-files` warms this before it queues the node jobs |
+| GET | `/api/artifacts/manifest/{kind}/{name}` | artifact rail manifests (`gguf`, `hf`, `image`, `modelfile`, `modelset`, `ollamablob`, `ollamamanifest`; `binary` is retired): `{size_bytes, sha256, data_path}`. The sha256 is cached by path, size, nanosecond mtime, inode and device (an entry from an older gateway, without them, re-hashes once); a file not yet hashed is hashed in the background, and a request that would wait more than ~8 s gets `202 {"status":"hashing","retry_after_secs"}` with `Retry-After` — ask again. `noo cluster sync-model-files` warms this before it queues the node jobs |
 
 
 ## Models

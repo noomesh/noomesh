@@ -47,10 +47,11 @@ The service is **mTLS**: it presents the `model-cache` service certificate
 and tailnet names) and requires a cluster-CA client certificate whose
 organisation is a node (`Mesh Cluster Node`) or the controller
 (`Mesh Cluster Gateway`); any other leaf is refused with `403`. The node
-agent presents its own `node.crt`. Image tarballs and weights are also
-hashed on the node against the gateway's artifact manifest before use (an
-authenticated answer over the same mTLS/cluster-HMAC channel; the gateway
-stopped signing manifests with its TLS key any more). Confine
+agent presents its own `node.crt`. Image tarballs are hashed on the node
+against the gateway's artifact manifest before use, and weights are checked
+against it as described for each kind below (an authenticated answer over
+the same mTLS/cluster-HMAC channel; the gateway stopped signing manifests
+with its TLS key any more). Confine
 the port to your LAN or tailnet the same way you confine NATS.
 
 There is no plaintext listener. Phase 1 of the mTLS move (stack-v0.2.77)
@@ -170,22 +171,24 @@ When the node-agent is asked to start a backend:
   `NOO_MODEL_CACHE_URL` set, the backend always starts with
   `HF_HUB_OFFLINE=1` and **without** `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN`
   (a node needs no Hugging Face credential). A model the store does not hold
-  (and the node's own HF cache has no snapshot of) is refused:
+  is refused, whatever the node's own HF cache holds:
   the start fails with `model_cache_miss: <backend> needs <model>, which is
   not in the controller's model store`, the refusal reaches the controller in
   the node's heartbeat, and `noo cluster verify` shows it. The fix is on the
   controller: run the model once there, or
   `HF_HOME=$HF_CACHE_DIR huggingface-cli download <model>`, then re-run
   `noo cluster verify`. A permission error is logged with the directory the
-  agent's user cannot write. A node with no store configured (the
+  agent's user cannot write. The node's own snapshot is used only when the
+  controller cannot be reached and the snapshot matches the manifest this
+  node last verified. A node with no store configured (the
   controller's own agent, a hand-run dev box) keeps the old behaviour:
   online on a miss, the token passed through.
 - **Ollama registry tags** (`gemma4:12b`): the controller stages the tag
   (`noo models fetch ollama:gemma4:12b`, below) and a placed node imports
-  it from the store: it fetches the staged pair by name, each file verified
-  against the gateway's artifact manifest, checks the weight against the
-  registry digest recorded in the Modelfile, and runs `ollama create`. It
-  never contacts `registry.ollama.ai`. A tag the controller has **not**
+  it from the store: it fetches each staged blob, verified against the
+  gateway's artifact manifest, pushes it to the local daemon through
+  ollama's `/api/blobs`, and writes the registry manifest last. The daemon
+  must then list the tag. It never contacts `registry.ollama.ai`. A tag the controller has **not**
   staged is **refused** (`ollama_registry_pull_refused`, naming the
   `noo models fetch ollama:<tag>` remedy): the controller store is the only
   source on a placed node. A node that must pull a tag anyway accepts that
@@ -194,8 +197,9 @@ When the node-agent is asked to start a backend:
 - **A converted GGUF** (a `<name>.Modelfile` plus its weight) is imported the
   same way. If `ollama create` fails, the verified weight stays in the node's
   staging dir (`ollama-gguf-cache/<sha256>.gguf`), so the retry does not
-  download it again. It is reused only after it is re-hashed, deleted when the
-  import succeeds, and never kept longer than 24 hours or beyond two entries.
+  download it again. It is reused only after it is re-hashed and deleted when
+  the import succeeds. The next import prunes entries older than 24 hours or
+  beyond two.
 
 `noo models recommended` prefers models that are already in the cache
 (`GET /api/models/cached`) precisely because they preseed over the LAN.
@@ -282,23 +286,26 @@ What it does, in order:
   `NOO_OLLAMA_REGISTRY`) and downloads every layer and the config blob, each
   **checked against the `sha256:` digest and the size the manifest carries**.
   A mismatch installs nothing.
-- **Refuses what a GGUF and a Modelfile cannot rebuild**: a vision projector,
-  an adapter, any layer type it does not know, template or parameter text a
-  Modelfile cannot quote. The refusal says so before the weight is
-  downloaded. For such a model use a text-only tag, a GGUF from Hugging Face,
-  or the per-node exception above.
-- **Writes two files**, the weight first and the recipe last, 0644:
-  `ollama+<namespace>+<name>+<tag>.gguf` (the model layer, byte for byte) and
-  `ollama+<namespace>+<name>+<tag>.Modelfile` (`FROM` that file, plus the
-  template, system prompt, parameters, licence and messages layers, and a
-  header recording the registry digest). `library/` and `:latest` are implied
-  and the name is lower-case, so `gemma4:12b` is
-  `ollama+library+gemma4+12b.*`. The weight download resumes after an
-  interruption (HTTP `Range`). These two names are served by the existing
-  `/gguf/` tree and the existing `gguf` and `modelfile` artifact kinds; nothing
-  new is mounted or exposed. `noo cluster sync-model-files` leaves them out of
-  its default sweep (they ride a placement, not a push to every node).
-- **Pre-warms the gateway's digest** for the weight, as `models fetch` does.
+- **Rebuilds nothing**: the registry's manifest and every blob are mirrored
+  byte for byte, so a vision projector, an adapter or a layer type it does
+  not know stages like any other. Only limits refuse, before any blob is
+  downloaded: at most 64 layers, a manifest of at most 1 MiB, and blobs of
+  at most 1 TiB in total.
+- **Writes one file per blob, then the manifest last**, 0644:
+  `sha256-<hex>.ollama-blob` (one per digest, shared by tags) and
+  `ollama+<namespace>+<name>+<tag>.ollama-manifest` (the manifest, verbatim).
+  `library/` and `:latest` are implied and the name is lower-case, so
+  `gemma4:12b` is `ollama+library+gemma4+12b.ollama-manifest`. A blob
+  download resumes after an interruption (HTTP `Range`). These names are
+  served by the `/gguf/` tree and the `ollamablob` and `ollamamanifest`
+  artifact kinds; nothing new is mounted or exposed. `noo cluster
+  sync-model-files` leaves them out of its default sweep (they ride a
+  placement, not a push to every node). The `.gguf` and `.Modelfile` pair is
+  still how an operator GGUF is staged, and a tag staged that way by an older
+  release still imports.
+- It does not pre-warm the gateway's digest cache. The gateway hashes a blob
+  when a node first asks for its manifest (the artifact manifest route
+  hashes any file not yet hashed).
 
 On the node, reconcile asks the store about a placed tag it does not hold; a
 staged tag takes the same import path as `noo cluster import-model`, which
@@ -306,10 +313,11 @@ now accepts the tag itself: `noo cluster import-model <node> ollama:gemma4:12b
 [--place --role chat]` (a bare `gemma4:12b`, or `gemma4` for `:latest`, works
 when it is not also the name of a plain store model; if it is both, the verb
 refuses and asks for the `ollama:` form). The CLI checks the controller store
-for the complete `ollama+...` pair first and, when it is not staged, refuses
+for the staged tag first and, when it is not staged, refuses
 naming `noo models fetch ollama:<tag>`; a node older than this release has no
-staged-tag import and answers with its own error. The node
-holds a staged Modelfile to a stricter shape than a hand-made one: only the
+staged-tag import and answers with its own error. For a tag staged the old
+way (a `.Modelfile` and `.gguf` pair) the node
+holds the staged Modelfile to a stricter shape than a hand-made one: only the
 directives `FROM`, `TEMPLATE`, `SYSTEM`, `PARAMETER`, `LICENSE`, `MESSAGE`,
 `RENDERER` and `PARSER`; `FROM` must be exactly the staged weight; the weight
 must start with the `GGUF` magic and hash to the digest in the Modelfile
