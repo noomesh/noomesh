@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT username, roles, updated_at, updated_by FROM noo_kb_role_grants ORDER BY username",
+  "query": "SELECT username, roles, updated_at AS \"updated_at: jiff_sqlx::Timestamp\", updated_by\n           FROM noo_kb_role_grants ORDER BY username",
   "describe": {
     "columns": [
       {
@@ -27,7 +27,7 @@
       },
       {
         "ordinal": 2,
-        "name": "updated_at",
+        "name": "updated_at: jiff_sqlx::Timestamp",
         "type_info": "Timestamptz",
         "origin": {
           "Table": {
@@ -58,5 +58,5 @@
       true
     ]
   },
-  "hash": "7fcadff57d543171e68b012a98e0a5a6b585f7a2048d5dedf33377f26497e8ae"
+  "hash": "7cd7cc4aff128d98887d146650c288283a75de4df8b958f97713a75c5d34d8b6"
 }
