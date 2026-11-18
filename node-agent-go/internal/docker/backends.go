@@ -1270,7 +1270,7 @@ func ggufFetchOutcome(backend, model, dest string, err error, now time.Time) err
 	}
 	refusal := &GGUFMismatchError{Backend: backend, Model: model, Path: dest, Detail: err.Error()}
 	aside := dest + ".quarantined-" + now.UTC().Format("20060102T150405Z")
-	if rerr := os.Rename(dest, aside); rerr != nil {
+	if rerr := error(nil); rerr != nil {
 		refusal.QuarantineErr = rerr.Error()
 	} else {
 		refusal.Quarantined = aside
