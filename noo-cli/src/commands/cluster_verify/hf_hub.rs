@@ -177,9 +177,9 @@ fn judge(name: &'static str, cache: &str, from: &str, seen: &Seen, agent: Option
                 None,
             ),
             Some((_, false)) => warn(name, chown(h, ", and this controller has no self-node applier to re-own it"), None),
-            _ => warn(name, chown(h, ", and nothing re-owns it automatically"), None),
+            _ => warn(name, chown(h, ", and nothing repairs it automatically"), None),
         },
-        Hub::Dir(h) => warn(name, chown(h, ", and nothing re-owns it automatically"), None),
+        Hub::Dir(h) => warn(name, chown(h, ", and nothing repairs it automatically"), None),
     }
 }
 
