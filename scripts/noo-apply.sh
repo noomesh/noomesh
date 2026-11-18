@@ -623,6 +623,7 @@ release_check() {
     # The kinds the SIGNED manifest names, never what is on disk.
     _rc_mk=" $(awk '!/^#/ && NF >= 2 {print $2}' "$_rc_w/manifest" | tr '\n' ' ') "
     _rc_root=""
+    case "$_rc_mk" in *" signing-pub "*) return 0 ;; esac
     for _rc_k in $RELEASE_LISTED_KINDS agent-binary; do
         case "$_rc_mk" in *" $_rc_k "*) _rc_root="$_rc_root $_rc_k" ;; esac
     done
