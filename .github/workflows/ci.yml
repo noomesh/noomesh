@@ -609,6 +609,22 @@ jobs:
         grep -E '^PASSED tests/test_sandbox_exec_isolation.py::test_bwrap_live_runs_and_proves_its_isolation_under_dockers_proc_masks' "$log" \
           || { echo "::error::the masked-/proc sandbox test did not report PASSED"; exit 1; }
 
+    - name: The node agent's protect drop-in holds on real systemd (sudo)
+      run: |
+        # proposal 61 phase 0b: the drop-in the applier renders, handed to a
+        # real systemd (PID 1 on the hosted runner): the agent's state dir, a
+        # data root and a data root under /home are writable; /etc, /usr and
+        # an undeclared /var path are EROFS; Docker's socket still answers.
+        # Missing sudo or systemd is a FAIL, never a skip.
+        sudo -n true || { echo "::error::no passwordless sudo: the protect drop-in proof cannot run"; exit 1; }
+        [ -d /run/systemd/system ] || { echo "::error::systemd is not PID 1 here: the protect drop-in proof cannot run"; exit 1; }
+        log="$RUNNER_TEMP/agent-protect-systemd.log"
+        set -o pipefail
+        sudo -n -E env "PATH=$PATH" "$(command -v python)" -m pytest -rA -p no:cacheprovider \
+          tests/test_agent_protect_apply.py -k "really_holds_the_agent" 2>&1 | tee "$log"
+        grep -E '^PASSED tests/test_agent_protect_apply.py::test_the_rendered_drop_in_really_holds_the_agent_to_its_paths' "$log" \
+          || { echo "::error::the protect drop-in proof did not report PASSED"; exit 1; }
+
     # Coverage is a BUILD ARTIFACT, not a third-party upload (visible per run,
     # no token, no network call that can take a green run down), and since
     # 2026-11-11 it is produced ONCE A NIGHT on dev by coverage-nightly.yml,
