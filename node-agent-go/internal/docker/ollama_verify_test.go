@@ -223,6 +223,7 @@ func TestOllamaVerifyPullRecordRefusesALayerItNeverNamed(t *testing.T) {
 // from, so the model is refused, nothing is removed, and the remedy is the
 // re-pull.
 func TestOllamaVerifyPullRecordBadBlobIsRefusedWithNoBytesToRepairFrom(t *testing.T) {
+	t.Setenv("NOO_SELF_NODE", "1") // the controller's own node: `noo models pull` reaches its Ollama
 	rg := newVerifyRig(t, false)
 	model, _ := rg.pullRecordSetup()
 	rg.writeBlobAt(model, "tampered weights, same name")
@@ -290,6 +291,7 @@ func TestOllamaVerifyMirrorChangedBlobIsReinstalled(t *testing.T) {
 }
 
 func TestOllamaVerifyMirrorReinstallFailingRefuses(t *testing.T) {
+	t.Setenv("NOO_SELF_NODE", "1") // the controller's own node: `noo models pull` reaches its Ollama
 	rg := newVerifyRig(t, false)
 	model, _ := rg.mirrorSetup()
 	rg.writeBlobAt(model, "tampered weights, same name")
@@ -392,6 +394,7 @@ func TestOllamaVerifyGGUFDifferentModelLayerIsRebuilt(t *testing.T) {
 }
 
 func TestOllamaVerifyGGUFRebuildFailingRefuses(t *testing.T) {
+	t.Setenv("NOO_SELF_NODE", "1") // the controller's own node: `noo models pull` reaches its Ollama
 	rg := newVerifyRig(t, false)
 	model := rg.ggufSetup()
 	rg.writeBlobAt(model, "tampered GGUF bytes")
@@ -411,6 +414,7 @@ func TestOllamaVerifyGGUFRebuildFailingRefuses(t *testing.T) {
 }
 
 func TestOllamaVerifyNoControllerRecordIsUnverifiedNeverRefused(t *testing.T) {
+	t.Setenv("NOO_SELF_NODE", "1") // the controller's own node: `noo models pull` reaches its Ollama
 	rg := newVerifyRig(t, false)
 	h := rg.blob("hand pulled")
 	rg.localManifest("library", "mistral", "latest",
@@ -509,5 +513,23 @@ func TestOllamaVerifyRecordSkipsUnchangedAndCatchesRewrite(t *testing.T) {
 	}
 	if rg.hashes != first+1 {
 		t.Fatalf("a rewritten blob (mtime restored) was not re-hashed: %d hashes, want %d", rg.hashes, first+1)
+	}
+}
+
+// On any node but the controller's own, `noo models pull` would act on the
+// gateway's Ollama, not this one: the remedy stages and imports onto THIS
+// node instead (harrier by name). Never the pull.
+func TestOllamaRemedyActsOnThisNodesOllama(t *testing.T) {
+	t.Setenv("NOO_SELF_NODE", "")
+	t.Setenv("NODE_ID", "node-a")
+	if got, want := ollamaRemedy("gemma4:e2b"), "noo models fetch ollama:gemma4:e2b && noo cluster import-model node-a ollama:gemma4:e2b"; got != want {
+		t.Fatalf("another node: %q, want %q", got, want)
+	}
+	if got, want := ollamaRemedy("harrier"), "noo cluster import-model node-a harrier"; got != want {
+		t.Fatalf("harrier on another node: %q, want %q", got, want)
+	}
+	t.Setenv("NOO_SELF_NODE", "1")
+	if got, want := ollamaRemedy("gemma4:e2b"), "noo models pull gemma4:e2b"; got != want {
+		t.Fatalf("the controller's own node: %q, want %q", got, want)
 	}
 }
