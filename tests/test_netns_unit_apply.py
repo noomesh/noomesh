@@ -419,7 +419,9 @@ def test_the_roll_sudos_for_the_unit_only_where_there_is_no_applier() -> None:
     assert "nu::stage_to_self_node(" in body[stage:old]
     callers = {}
     for f in (REPO / "noo-cli/src").rglob("*.rs"):
-        n = len(re.findall(r"\b(?:nu|netns_unit)::install\(", f.read_text()))
+        # A call, not a string that NAMES it: the noo-cli twin of this guard
+        # (netns_unit.rs tests) searches for "nu::install(" in a literal.
+        n = len(re.findall(r"(?<![\"\w])(?:nu|netns_unit)::install\(", f.read_text()))
         if n:
             callers[str(f.relative_to(REPO / "noo-cli/src"))] = n
     assert callers == {"commands/upgrade.rs": 1, "onboard/steps.rs": 1}, callers
