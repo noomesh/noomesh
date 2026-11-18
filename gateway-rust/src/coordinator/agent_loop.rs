@@ -785,6 +785,14 @@ pub(crate) struct StreamedResponse {
     pub deadline_hit: bool,
 }
 
+/// The non-streaming loop sends a model call again whole, once, when the
+/// node cut its answer: nothing of it has reached the caller (node_restart:
+/// a restarting node cuts these marked calls at once). Never after the
+/// turn's deadline, never twice, never for an answer that simply ended.
+fn resend_whole_after_cut(s: &StreamedResponse, resent: bool, now: Instant, until: Instant) -> bool {
+    s.cut.is_some() && !s.deadline_hit && !resent && now < until
+}
+
 /// A stream that ended with bytes but not one readable event: the reason,
 /// naming what came back. `None` when an event was read, the body was empty,
 /// or the stream already ended as a cut, the deadline or a provider error.
@@ -1904,6 +1912,7 @@ async fn send_llm_with_fallback<R: HarnessRuntime, S: crate::websocket::TurnSink
     enable_thinking: bool,
     until: Instant,
     phase: Option<(&S, &mut Option<Value>)>,
+    resend_whole: bool,
 ) -> Result<reqwest::Response> {
     // The console's `routed` frame (super::phase), sent before each attempt
     // on a new backend; the last one is handed back for the stream reader's
@@ -1918,6 +1927,9 @@ async fn send_llm_with_fallback<R: HarnessRuntime, S: crate::websocket::TurnSink
     // every call on this node; `off` also sets each wire's own switch.
     let thinking = super::thinking::thinking_mode();
     let enable_thinking = super::thinking::effective_enable_thinking(thinking, enable_thinking);
+    // What this call already waited out of a node agent's restart, in all
+    // (bounded by node_restart::MAX_WAIT).
+    let mut restart_waited = std::time::Duration::ZERO;
     for attempt in 1..=MAX_LLM_BACKEND_ATTEMPTS {
         // The whole call, streamed body included, ends with the turn — not
         // at the client's fixed backend timeout, which cut a slow answer
@@ -1977,11 +1989,16 @@ async fn send_llm_with_fallback<R: HarnessRuntime, S: crate::websocket::TurnSink
         } else {
             crate::node_link::backend_request(reqwest::Method::POST, &url, &backend.backend_type)
         };
+        // A call whose answer reaches no caller until it is complete (the
+        // non-streaming loop) is re-sent whole if the node cuts it: a
+        // restarting node may cut it at once (node_restart).
+        let req = if resend_whole { req.header(crate::node_restart::RESEND_HEADER, crate::node_restart::RESEND_WHOLE) } else { req };
         // The caller reads the body, so this span ends at the headers (i359).
         let mut span =
             crate::request_trace::backend_span(&backend.backend_type, &backend.model, &url, crate::request_trace::SpanEnd::Headers);
         let req = crate::request_trace::propagate(req, span.as_ref());
         // The turn deadline, not the client's fixed backend timeout (#177).
+        let mut restart: Option<std::time::Duration> = None;
         let failure = match req.json(&body).timeout(remaining).send().await {
             Ok(resp) => {
                 let status = resp.status();
@@ -1995,7 +2012,9 @@ async fn send_llm_with_fallback<R: HarnessRuntime, S: crate::websocket::TurnSink
                 // The tunnel door's pre-head loss: the model saw nothing
                 // back to us, so the call is tried again like a backend down.
                 let door_lost = crate::tunnel_door::lost_before_head(status.as_u16(), resp.headers());
+                let headers = resp.headers().clone();
                 let err_body = resp.text().await.unwrap_or_default();
+                restart = crate::node_restart::restart_wait(status.as_u16(), &headers, &err_body);
                 tracing::error!(
                     status = %status,
                     backend = %backend.url,
@@ -2019,7 +2038,7 @@ async fn send_llm_with_fallback<R: HarnessRuntime, S: crate::websocket::TurnSink
                     super::backend::mark_legacy_completion(&backend.url);
                     continue;
                 }
-                if !door_lost && !is_retryable_llm_http_error(status.as_u16(), &err_body) {
+                if restart.is_none() && !door_lost && !is_retryable_llm_http_error(status.as_u16(), &err_body) {
                     // A pinned model this backend does not hold: say so as a
                     // refusal (4xx), not as a backend fault.
                     if let Some(pin) = effective_model {
@@ -2029,7 +2048,9 @@ async fn send_llm_with_fallback<R: HarnessRuntime, S: crate::websocket::TurnSink
                     }
                     anyhow::bail!("{}", backend_error_message(status.as_u16(), &err_body));
                 }
-                if door_lost {
+                if restart.is_some() {
+                    format!("HTTP {status} (the node agent is restarting)")
+                } else if door_lost {
                     format!("HTTP {status} (the tunnel to the node dropped before the answer)")
                 } else if super::backend::is_context_overflow_body(&err_body) {
                     // The failover alert should say what actually happened —
@@ -2062,7 +2083,27 @@ async fn send_llm_with_fallback<R: HarnessRuntime, S: crate::websocket::TurnSink
             let node = rt.route_facts(&failed_url, &failed_type).await.map(|(n, _)| n).unwrap_or_else(|| failed_url.clone());
             moved = Some(super::phase::Moved { node, reason: failure.clone() });
         }
-        match rt.resolve_backend_excluding(effective_model, failed_urls).await {
+        let resolved = rt.resolve_backend_excluding(effective_model, failed_urls).await;
+        // A restarting node with nowhere else to go is waited out, bounded:
+        // the call goes to it again once its Retry-After has passed.
+        let usable = matches!(&resolved, Ok(f) if !super::backend::is_cloud_backend(f) && !failed_urls.contains(&f.url));
+        if let Some(wait) = restart.filter(|_| !usable) {
+            let left = crate::node_restart::MAX_WAIT.saturating_sub(restart_waited).min(until.saturating_duration_since(Instant::now()));
+            let w = wait.min(left);
+            if !w.is_zero() {
+                match crate::node_restart::try_wait(&failed_url) {
+                    Some(_place) => {
+                        tracing::info!(backend = %failed_url, wait_ms = w.as_millis() as u64, attempt, "llm_wait_node_restart");
+                        tokio::time::sleep(w).await;
+                        restart_waited += w;
+                        failed_urls.retain(|u| u != &failed_url);
+                        continue;
+                    }
+                    None => tracing::warn!(backend = %failed_url, "llm_node_restart_waiters_full"),
+                }
+            }
+        }
+        match resolved {
             Ok(fallback) if super::backend::is_cloud_backend(&fallback) => {
                 anyhow::bail!("All node backends failed ({failure}); a cloud provider is never a fallback");
             }
@@ -2604,7 +2645,8 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         let resp = match send_llm_with_fallback(
             rt, &mut backend, &mut failed_backend_urls, effective_model,
             &session.messages, Some(&tool_schemas), true, enable_thinking, turn_ends,
-            Some((writer, &mut routed_frame)),
+            // Its tokens reach the console as they come: never re-sent whole.
+            Some((writer, &mut routed_frame)), false,
         ).await {
             Ok(r) => {
                 if backend.url != pre_send_url {
@@ -3845,7 +3887,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
         let resp = match send_llm_with_fallback(
             rt, &mut backend, &mut failed_backend_urls, effective_model,
             &session.messages, Some(&tool_schemas), false, enable_thinking, turn_ends,
-            None::<(&crate::websocket::NullSink, &mut Option<Value>)>,
+            None::<(&crate::websocket::NullSink, &mut Option<Value>)>, true,
         ).await {
             Ok(r) => r,
             Err(e) => {
@@ -3857,11 +3899,37 @@ async fn run_inner_bound<R: HarnessRuntime>(
         let use_streaming = super::backend::wire_format(&backend) == "openai";
 
         let (assistant_msg, content, mut tool_calls) = if use_streaming {
-            let streamed = match collect_streaming_response(resp, iter_start, ends_at).await {
+            // The non-streaming loop: nothing of this answer has reached the
+            // caller, so an answer the node cut (not the turn's deadline) is
+            // sent again whole, once (node_restart: a restarting node cuts
+            // these marked calls at once).
+            let mut resp = resp;
+            let mut resent = false;
+            let collected = loop {
+                let s = match collect_streaming_response(resp, iter_start, ends_at).await {
+                    Ok(s) => s,
+                    Err(e) => break Err(anyhow::anyhow!("SSE collection failed: {e}")),
+                };
+                if resend_whole_after_cut(&s, resent, Instant::now(), ends_at) {
+                    resent = true;
+                    tracing::warn!(iteration, cut = ?s.cut, "loop.model_call_resent_whole");
+                    resp = match send_llm_with_fallback(
+                        rt, &mut backend, &mut failed_backend_urls, effective_model,
+                        &session.messages, Some(&tool_schemas), false, enable_thinking, turn_ends,
+                        None::<(&crate::websocket::NullSink, &mut Option<Value>)>, true,
+                    ).await {
+                        Ok(r) => r,
+                        Err(e) => break Err(e),
+                    };
+                    continue;
+                }
+                break Ok(s);
+            };
+            let streamed = match collected {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!(error = %e, "SSE collection failed");
-                    llm_failure = Some(anyhow::anyhow!("SSE collection failed: {e}"));
+                    llm_failure = Some(e);
                     break;
                 }
             };
@@ -5061,7 +5129,68 @@ mod tunnel_lost_wiring {
         let marker = send.find("let door_lost = crate::tunnel_door::lost_before_head(status.as_u16(), resp.headers());").expect("the marker is read");
         let body = send.find("let err_body = resp.text().await").expect("the body is read");
         assert!(marker < body, "the headers are read before the body consumes the response");
-        assert!(send.contains("if !door_lost && !is_retryable_llm_http_error(status.as_u16(), &err_body) {"), "the loss passes the bail");
+        assert!(send.contains("if restart.is_none() && !door_lost && !is_retryable_llm_http_error(status.as_u16(), &err_body) {"), "the loss passes the bail");
         assert!(send.contains("(the tunnel to the node dropped before the answer)"), "the alert says what happened");
+    }
+}
+
+/// Option B, gateway half (node_restart): the coordinator's side.
+#[cfg(test)]
+mod node_restart_wiring {
+    use super::*;
+
+    fn cut(cut: Option<&str>, deadline_hit: bool) -> StreamedResponse {
+        StreamedResponse {
+            content: "half".into(),
+            reasoning: String::new(),
+            tool_calls_json: vec![],
+            finish_reason: String::new(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            prefill_ms: None,
+            cut: cut.map(str::to_string),
+            deadline_hit,
+        }
+    }
+
+    /// The non-streaming loop sends a cut answer again whole, once, inside
+    /// the turn: never an answer that ended, never after the deadline,
+    /// never twice.
+    #[test]
+    fn a_cut_answer_is_sent_again_whole_once_inside_the_turn() {
+        let now = Instant::now();
+        let later = now + std::time::Duration::from_secs(60);
+        assert!(resend_whole_after_cut(&cut(Some("the stream broke"), false), false, now, later));
+        assert!(!resend_whole_after_cut(&cut(Some("the stream broke"), false), true, now, later), "never twice");
+        assert!(!resend_whole_after_cut(&cut(None, false), false, now, later), "an answer that ended");
+        assert!(!resend_whole_after_cut(&cut(None, true), false, now, later), "the turn's deadline");
+        assert!(!resend_whole_after_cut(&cut(Some("x"), false), false, later, now), "past the turn");
+    }
+
+    /// The wiring, by source: only the non-streaming loop marks its calls
+    /// and re-sends a cut answer; the streaming loop (the console sees its
+    /// tokens) never does; a node's restart refusal is read before the body,
+    /// passes the final-error bail, and with nowhere else to go is waited
+    /// out under the per-node bound; desired-config advertises it.
+    #[test]
+    fn the_marker_the_wait_and_the_feature_are_wired() {
+        let code = crate::test_src::own_code(include_str!("agent_loop.rs"));
+        let send = crate::test_src::fn_body(&code, "async fn send_llm_with_fallback<");
+        assert!(send.contains("let req = if resend_whole { req.header(crate::node_restart::RESEND_HEADER, crate::node_restart::RESEND_WHOLE) } else { req };"));
+        let restart = send.find("restart = crate::node_restart::restart_wait(status.as_u16(), &headers, &err_body);").expect("read");
+        let headers = send.find("let headers = resp.headers().clone();").expect("headers kept");
+        assert!(headers < restart);
+        assert!(send.contains("if restart.is_none() && !door_lost && !is_retryable_llm_http_error(status.as_u16(), &err_body) {"), "past the bail");
+        let wait = &send[send.find("if let Some(wait) = restart.filter(|_| !usable) {").expect("the wait")..];
+        for step in ["crate::node_restart::MAX_WAIT.saturating_sub(restart_waited)", "crate::node_restart::try_wait(&failed_url)", "failed_urls.retain(|u| u != &failed_url);", "continue;"] {
+            assert!(wait.contains(step), "{step}");
+        }
+        assert_eq!(code.matches("None::<(&crate::websocket::NullSink, &mut Option<Value>)>, true,").count(), 2, "the non-streaming loop's call and its re-send are marked");
+        assert!(code.contains("Some((writer, &mut routed_frame)), false,"), "the streaming loop is not");
+        assert!(code.contains("if resend_whole_after_cut(&s, resent, Instant::now(), ends_at) {"), "the non-streaming loop re-sends a cut answer");
+        let cluster = crate::test_src::own_code(include_str!("../routes/cluster.rs"));
+        let dc = crate::test_src::fn_body(&cluster, "async fn desired_config_get(");
+        assert!(dc.contains("\"gateway_features\": [crate::node_restart::FEATURE],"), "the agent learns it may refuse with node_restarting");
     }
 }

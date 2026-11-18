@@ -4228,6 +4228,11 @@ async fn desired_config_get(
         // agent queues its own ladder under it. Absent on older gateways.
         "disk_reclaim": crate::autonomy_evaluators::node_reclaim_policy(&state).await,
         "engine": "rust",
+        // What this gateway understands from a node agent (node_restart): an
+        // agent refuses new calls with `node_restarting` during its stop
+        // drain only when its controller lists that here; otherwise new
+        // calls behave as they did before the drain existed.
+        "gateway_features": [crate::node_restart::FEATURE],
         // i802, for `noo cluster show`: per Ollama chat model, the context the
         // daemon runs now, the decided one, why, and the model's ceiling.
         "chat_context_detail": chat_context_detail,
