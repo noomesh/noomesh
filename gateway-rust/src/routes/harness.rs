@@ -402,7 +402,7 @@ async fn harness_call(
             let consumer = crate::service_keys::door_key_consumer(&turn.node, conv);
             let k = crate::service_keys::mint_door_key(&state.db, user, &consumer, ttl).await.map_err(|e| AppError::Internal(e.to_string()))?;
             tracing::info!(r#as = user, node = %turn.node, conversation = conv, key_id = %k.id, ttl, "harness_door_key_minted");
-            json!({"key": k.key, "key_id": k.id.to_string(), "expires_at": k.expires_at.to_rfc3339()})
+            json!({"key": k.key, "key_id": k.id.to_string(), "expires_at": crate::wire_time::rfc3339_offset(k.expires_at)})
         }
         HarnessOp::DoorKeyRevoke { key_id } => {
             let revoked = crate::service_keys::revoke_door_key(&state.db, &key_id, user).await.map_err(|e| AppError::BadRequest(e.to_string()))?;
