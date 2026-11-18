@@ -1775,34 +1775,67 @@ func backendCapAllowedList() []string {
 	return out
 }
 
-func backendCaps() []string {
-	v := strings.TrimSpace(os.Getenv(BackendCapsEnv))
+// capsDecision is what NOO_BACKEND_CAP_ADD asked for and what the agent
+// grants: Source is "default" (unset), "none" or "env"; Refused holds every
+// requested name outside backendCapAllowed (dropped, never granted).
+type capsDecision struct {
+	Source  string
+	Granted []string
+	Refused []string
+}
+
+func decideBackendCaps(v string) capsDecision {
+	v = strings.TrimSpace(v)
 	if v == "" {
-		return backendCapsDefault
+		return capsDecision{Source: "default", Granted: backendCapsDefault}
 	}
 	if strings.EqualFold(v, "none") {
-		return nil
+		return capsDecision{Source: "none"}
 	}
-	out := make([]string, 0, 8)
-	var refused []string
+	d := capsDecision{Source: "env", Granted: make([]string, 0, 8)}
 	for _, c := range strings.Split(v, ",") {
 		c = strings.ToUpper(strings.TrimSpace(strings.TrimPrefix(strings.ToUpper(strings.TrimSpace(c)), "CAP_")))
 		if c == "" {
 			continue
 		}
 		if !backendCapAllowed[c] {
-			refused = append(refused, c)
+			d.Refused = append(d.Refused, c)
 			continue
 		}
-		out = append(out, c)
+		d.Granted = append(d.Granted, c)
 	}
-	if len(refused) > 0 {
+	return d
+}
+
+func backendCaps() []string {
+	d := decideBackendCaps(os.Getenv(BackendCapsEnv))
+	if d.Source != "env" {
+		return d.Granted
+	}
+	if len(d.Refused) > 0 {
 		slog.Error("backend containers: capabilities refused from the node's environment (each one lets a container reach the host; not grantable here)",
-			"env", BackendCapsEnv, "refused", refused, "allowed", backendCapAllowedList())
+			"env", BackendCapsEnv, "refused", d.Refused, "allowed", backendCapAllowedList())
 	}
 	slog.Info("backend containers: capability set widened by the node's own environment",
-		"env", BackendCapsEnv, "cap_add", out)
-	return out
+		"env", BackendCapsEnv, "cap_add", d.Granted)
+	return d.Granted
+}
+
+// BackendCapsReport is the heartbeat's `backend_caps`: where the backend
+// containers' capability set comes from (`source`), what is granted, what
+// NOO_BACKEND_CAP_ADD asked for that is not grantable (`refused`: dropped,
+// the backend starts without it), and the allow-list. `noo cluster verify`
+// WARNs on a refusal, which is otherwise only an agent-log line.
+func BackendCapsReport() any {
+	d := decideBackendCaps(os.Getenv(BackendCapsEnv))
+	granted, refused := d.Granted, d.Refused
+	if granted == nil {
+		granted = []string{}
+	}
+	if refused == nil {
+		refused = []string{}
+	}
+	return map[string]any{"source": d.Source, "granted": granted, "refused": refused, "allowed": backendCapAllowedList()}
 }
 
 // envOr returns the value of env var `name`, or `fallback` if unset/empty.

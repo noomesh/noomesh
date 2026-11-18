@@ -521,7 +521,9 @@ Every container the agent creates on a controller's instruction runs with:
 `NOO_BACKEND_CAP_ADD` (node-local) widens the backend set for an image that
 genuinely needs more, from an allow-list only: a capability that lets a
 container reach the host (`SYS_ADMIN`, `SYS_PTRACE`, `DAC_READ_SEARCH`,
-`NET_ADMIN`, `ALL`, …) is refused and logged
+`NET_ADMIN`, `ALL`, …) is refused: dropped, so the backend starts without
+it, and reported in the heartbeat; `noo cluster verify`'s `backend caps` row
+WARNs naming the node, the refused names and the allow-list
 ([env reference](../reference/env.md)). `NOO_CONTAINER_RUN_USER` and
 `NOO_CONTAINER_IMAGE_ALLOW` do the same for managed containers.
 

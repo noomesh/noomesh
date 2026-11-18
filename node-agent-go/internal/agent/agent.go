@@ -436,6 +436,9 @@ func (a *Agent) Run() error {
 	a.hb.SetModelSets(rec.ModelSetsReport)
 	a.hb.SetModelSetsFreeBytes(rec.ModelSetsFreeBytes)
 	a.hb.SetOllamaVerify(rec.OllamaVerifyReport)
+	if a.docker != nil {
+		a.hb.SetBackendCaps(dockerpkg.BackendCapsReport)
+	}
 	a.hb.SetNodeFacts(rec.NodeFacts)
 	if mc := rec.NodeWorkloadControl(); mc != nil {
 		a.server.SetManagedWorkloads(mc)
