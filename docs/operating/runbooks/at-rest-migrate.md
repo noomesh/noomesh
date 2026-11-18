@@ -1,5 +1,7 @@
 # Moving an existing controller onto the encrypted state volume
 
+> Opt-in, not yet validated on real hardware (decision 2026-10-26).
+
 `noo security at-rest migrate` moves the sensitive state of a controller that
 is already running (postgres, redis, nats, prometheus, grafana, loki, noo-data,
 the PKI, and the `claude-config` and `alertmanager-data` volumes) onto the
