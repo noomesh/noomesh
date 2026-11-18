@@ -1595,8 +1595,9 @@ or rc ships.
   applied (`/etc/noo/release-floor`, root-owned; on a Mac under
   `/Library/Application Support/noomesh/pki/`). It accepts the current final
   and the previous one, and an rc of the current or a later release, nothing
-  older. So a bad release can be rolled back once, and an old release cannot
-  be replayed.
+  older. So an old release cannot be replayed, and a node will take one
+  step back. The controller-side command that stages a step back is not in
+  0.6.27: the node accepts it, the CLI cannot yet send it.
 - **Each release vouches for the one before.** The release job adds the
   previous final's own root-run payloads to this release's lists, by digest
   from that final's signed lists: `<sha>  <asset>@v<prev>` in
