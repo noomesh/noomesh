@@ -188,6 +188,13 @@ mkdir -p "$OUT/stranger-cwd"
 step install 600 -- sh -c "cd '$OUT/stranger-cwd' && $LINE" || finish
 step version 30 -- noo --version || finish
 meta installed_version "$(noo --version 2>/dev/null | head -1)"
+# PROBES (2026-11-18 launch audit, items 1-3: documented first-run commands
+# nothing ran). Each prints one `… PASS:` / `… FAIL:` line; as probe-* steps
+# the summary counts them and they never fail the cell (a report, not a gate).
+# install.md:86 `noo whoami   # "client-only" on a fresh host — expected`.
+step probe-docs-whoami-installed 30 -- sh -c 'out="$(noo whoami 2>&1)"; rc=$?; printf "%s\n" "$out"
+  if [ $rc = 0 ] && printf "%s" "$out" | grep -q "client-only"; then echo "WHOAMI-INSTALLED PASS: a fresh host reads client-only, as install.md says"
+  else echo "WHOAMI-INSTALLED FAIL: install.md says a fresh host reads \"client-only\" (rc=$rc)"; exit 1; fi'
 
 if [ "$SCOPE" = node-partial ]; then
     # macOS is a NODE: it needs a controller this hosted runner cannot reach,
@@ -292,6 +299,16 @@ agent_dump model
 step stack-start 1800 -- noo stack start || fail_onboarded
 step health 600 -- sh -c 'for i in $(seq 1 40); do noo health >/dev/null 2>&1 && break; sleep 15; done; noo health' \
     || fail_onboarded
+# PROBES: install.md:226 `noo whoami   # controller / node / both / client-only`
+# (an onboarded controller), and install.md:228 / troubleshooting.md:9
+# `noo doctor docker` (setup-and-host.md:106: a clean daemon prints
+# `no unclean-shutdown damage signature`).
+step probe-docs-whoami-onboarded 30 -- sh -c 'out="$(noo whoami 2>&1)"; rc=$?; printf "%s\n" "$out"
+  if [ $rc = 0 ] && printf "%s" "$out" | grep -q "^this box: controller"; then echo "WHOAMI-ONBOARDED PASS: an onboarded controller reads controller"
+  else echo "WHOAMI-ONBOARDED FAIL: after onboard, whoami should read controller (rc=$rc)"; exit 1; fi'
+step probe-docs-doctor-docker 120 -- sh -c 'out="$(noo doctor docker 2>&1)"; rc=$?; printf "%s\n" "$out"
+  if [ $rc = 0 ] && printf "%s" "$out" | grep -q "no unclean-shutdown damage signature"; then echo "DOCTOR-DOCKER PASS: a clean daemon reads as setup-and-host.md says"
+  else echo "DOCTOR-DOCKER FAIL: a fresh daemon should exit 0 with \"no unclean-shutdown damage signature\" (rc=$rc)"; exit 1; fi'
 # Not in the README's path (it is `stack start && health`, then chat): a red
 # verify is recorded with every row, and the stranger still asks the question.
 if [ "$MODEL" = tiny ]; then
@@ -433,6 +450,10 @@ step first-answer 1800 -- sh -c '
     echo "FIRST-ANSWER NOTE: the tiny test model ($TINY_MODEL) did not answer the prompt; this cell runs MODEL=$MODEL, not the product default, so this is not a product verdict"
   fi' || fail_onboarded
 meta first_answer_s "$(( $(date +%s) - CELL_START ))"
+# PROBE: first-chat.md:14 / README.md:121 `noo chat`, the interactive REPL a
+# stranger opens first (the step above runs only `--message`). Through a pty:
+# one prompt, an answer, `/exit`, a clean exit.
+step probe-docs-chat-repl 1200 -- python3 "$HERE/chat_repl.py" --timeout 900 -- noo chat
 
 # PROBE (operator 2026-11-14): cold-load delays, AFTER first-answer so the
 # idle series above is untouched. coldload.py stops every model ollama ps
