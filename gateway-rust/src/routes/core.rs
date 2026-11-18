@@ -132,21 +132,21 @@ fn session_token(
     secret: &str,
 ) -> Result<(String, i64), TokenIssueError> {
     let expire_minutes = token_expire_minutes();
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let expire_secs = expire_minutes * 60;
-    let exp = now + chrono::TimeDelta::seconds(expire_secs);
+    let exp = now + jiff::SignedDuration::from_secs(expire_secs);
 
     let mut claims = serde_json::json!({
         "sub": username,
         "role": role.as_str(),
         "scopes": scopes,
-        "exp": exp.timestamp(),
-        "iat": now.timestamp(),
+        "exp": exp.as_second(),
+        "iat": now.as_second(),
         // Millisecond mint time: the session floor (`session_floor.rs`) is in
         // ms, so a token minted in the same second as a logout is ordered
         // against it correctly. Person sessions only; delegated tokens keep
         // their exact claim sets.
-        "iat_ms": now.timestamp_millis(),
+        "iat_ms": now.as_millisecond(),
         "iss": crate::auth::JWT_ISSUER,
         "aud": crate::auth::JWT_AUDIENCE,
     });
@@ -674,8 +674,7 @@ async fn issue_login(state: &AppState, user: &UserRecord, ua: Option<&str>, ip: 
     // re-prompts at the access-token TTL).
     let raw_refresh = auth_refresh::generate_raw_token();
     let refresh_ttl_days = auth_refresh::refresh_ttl_days();
-    let refresh_expires_at = chrono::Utc::now()
-        + chrono::TimeDelta::days(refresh_ttl_days);
+    let refresh_expires_at = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(refresh_ttl_days * 24);
     let stored = auth_refresh::store_token(
         &state.db,
         &user.username,
@@ -971,7 +970,7 @@ async fn rotate_refresh(
         return spent_token(db, &seen.user_id, &seen.id, ip).await;
     }
 
-    if seen.expires_at < chrono::Utc::now() {
+    if seen.expires_at < jiff::Timestamp::now() {
         // Spend it on the way out — it is dead either way, and leaving live
         // rows behind means the replay sweep has nothing to catch later.
         let _ = auth_refresh::revoke_token(db, &seen.id).await;
@@ -1069,7 +1068,7 @@ async fn rotate_refresh(
 
     let new_raw = auth_refresh::generate_raw_token();
     let new_expires =
-        chrono::Utc::now() + chrono::TimeDelta::days(auth_refresh::refresh_ttl_days());
+        jiff::Timestamp::now() + jiff::SignedDuration::from_hours(auth_refresh::refresh_ttl_days() * 24);
     if let Err(e) = auth_refresh::store_token(
         &mut *tx,
         &user.username,
@@ -1589,6 +1588,34 @@ mod lockout_tests {
         assert!(!locked_now(Some(now), now), "at its instant the lockout has ended");
         assert!(!locked_now(Some(now - ms), now), "a lockout in the past is over");
         assert!(!locked_now(None, now), "no locked_until is no lockout");
+    }
+
+    /// A session token's claims: `exp` is its TTL after `iat`, `iat` is now,
+    /// and `iat_ms` is the same instant in milliseconds (the session floor
+    /// orders logouts by it).
+    #[test]
+    fn a_session_token_expires_its_ttl_after_it_was_issued() {
+        use base64::Engine;
+        let before = jiff::Timestamp::now().as_second();
+        let (token, ttl) = super::session_token("alice", crate::auth::Role::User, vec!["read".into()], None, "a-test-only-session-secret")
+            .unwrap_or_else(|_| panic!("mint"));
+        let payload = token.split('.').nth(1).expect("a JWT has a payload");
+        let claims: serde_json::Value =
+            serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).expect("base64url")).expect("json");
+        let (iat, exp, iat_ms) = (claims["iat"].as_i64().unwrap(), claims["exp"].as_i64().unwrap(), claims["iat_ms"].as_i64().unwrap());
+        assert_eq!(exp - iat, ttl, "exp is the TTL after iat");
+        assert_eq!(iat_ms.div_euclid(1000), iat, "iat_ms is iat's instant in ms");
+        assert!((before..=before + 5).contains(&iat), "iat is now ({before}), got {iat}");
+    }
+
+    /// A refresh is refused (and the token spent) once its expiry has passed
+    /// the current time; at the instant itself it still rotates, as before.
+    #[test]
+    fn a_refresh_past_its_expiry_is_refused() {
+        let own = crate::test_src::own_code(include_str!("core.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn rotate_refresh(");
+        assert!(body.contains("if seen.expires_at < jiff::Timestamp::now() {"), "expiry must be judged against now");
+        assert!(body.contains("return Rotation::Refused(\"Refresh token expired\");"));
     }
 
     /// The login lookup must ask with the current time and fold the lockout

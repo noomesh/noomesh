@@ -36,7 +36,7 @@ async fn person(db: &PgPool, name: &str, role: Role) {
 /// A live session (refresh row) for `name`: its raw cookie and the row.
 async fn session(db: &PgPool, name: &str) -> (String, SessionRow) {
     let raw = auth_refresh::generate_raw_token();
-    auth_refresh::store_token(db, name, &raw, chrono::Utc::now() + chrono::TimeDelta::days(30), None, None, None, None)
+    auth_refresh::store_token(db, name, &raw, jiff::Timestamp::now() + jiff::SignedDuration::from_hours(30 * 24), None, None, None, None)
         .await
         .expect("store token");
     let row = reread(db, &raw, name).await;

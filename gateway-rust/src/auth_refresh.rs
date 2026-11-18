@@ -48,7 +48,6 @@ use std::time::Duration;
 
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::{DateTime, Utc};
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
@@ -177,7 +176,7 @@ pub async fn store_token<'e, E: sqlx::PgExecutor<'e>>(
     db: E,
     user_id: &str,
     raw_token: &str,
-    expires_at: DateTime<Utc>,
+    expires_at: jiff::Timestamp,
     user_agent: Option<&str>,
     ip_address: Option<&str>,
     rotated_from: Option<String>,
@@ -193,7 +192,7 @@ pub async fn store_token<'e, E: sqlx::PgExecutor<'e>>(
     .bind(&id)
     .bind(user_id)
     .bind(&token_hash)
-    .bind(expires_at)
+    .bind(jiff_sqlx::Timestamp::from(expires_at))
     .bind(user_agent)
     .bind(ip_address)
     .bind(rotated_from)
@@ -208,8 +207,8 @@ pub async fn store_token<'e, E: sqlx::PgExecutor<'e>>(
 pub struct LookupResult {
     pub id: String,
     pub user_id: String,
-    pub expires_at: DateTime<Utc>,
-    pub revoked_at: Option<DateTime<Utc>>,
+    pub expires_at: jiff::Timestamp,
+    pub revoked_at: Option<jiff::Timestamp>,
     /// The "View as" perspective this row carries (i538), if any.
     pub perspective_id: Option<String>,
 }
@@ -233,8 +232,8 @@ pub async fn lookup_token(
     Ok(row.map(|r| LookupResult {
         id: r.get(0),
         user_id: r.get(1),
-        expires_at: r.get(2),
-        revoked_at: r.get(3),
+        expires_at: r.get::<jiff_sqlx::Timestamp, _>(2).to_jiff(),
+        revoked_at: r.get::<Option<jiff_sqlx::Timestamp>, _>(3).map(jiff_sqlx::Timestamp::to_jiff),
         perspective_id: r.get(4),
     }))
 }
@@ -288,8 +287,8 @@ pub async fn claim_token(
         return Ok(Claim::Won(LookupResult {
             id: r.get(0),
             user_id: r.get(1),
-            expires_at: r.get(2),
-            revoked_at: r.get(3),
+            expires_at: r.get::<jiff_sqlx::Timestamp, _>(2).to_jiff(),
+            revoked_at: r.get::<Option<jiff_sqlx::Timestamp>, _>(3).map(jiff_sqlx::Timestamp::to_jiff),
             perspective_id: r.get(4),
         }));
     }
@@ -461,10 +460,10 @@ pub async fn revoke_all_for_user(db: &PgPool, user_id: &str) -> Result<u64, sqlx
     Ok(res.rows_affected())
 }
 
-/// Convenience: how long until a `chrono::DateTime` from now, as a
-/// `std::time::Duration`. Returns Duration::ZERO if already past.
-pub fn time_until(when: DateTime<Utc>) -> Duration {
-    let secs = (when - Utc::now()).num_seconds().max(0) as u64;
+/// Convenience: how long until `when` from now, as a `std::time::Duration`
+/// (whole seconds). Returns Duration::ZERO if already past.
+pub fn time_until(when: jiff::Timestamp) -> Duration {
+    let secs = when.duration_since(jiff::Timestamp::now()).as_secs().max(0) as u64;
     Duration::from_secs(secs)
 }
 
