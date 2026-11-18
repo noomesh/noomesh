@@ -506,6 +506,12 @@ systemctl restart docker"#;
             ctx.info("  llama.cpp — flexible, GGUF with GPU offload");
             say_vllm_floor_once(ctx, &why);
         }
+        (1, VllmOffer::OfferNotRecommended(why)) => {
+            ctx.info("  Ollama — simple setup, GGUF quantized (recommended)");
+            ctx.info("  vLLM — fastest inference, AWQ/GPTQ quantized");
+            ctx.info("  llama.cpp — flexible, GGUF with GPU offload");
+            say_vllm_floor_once(ctx, &why);
+        }
         (1, _) => {
             ctx.info("  vLLM — fastest inference, AWQ/GPTQ quantized (recommended)");
             ctx.info("  Ollama — simple setup, GGUF quantized");
@@ -7044,13 +7050,13 @@ pub fn first_model(ctx: &mut Ctx) {
     // embed ollama already holds the GPU.
     let standalone = ctx.repo_root.join(".noo-standalone").exists();
     let offer = vllm_offer(ctx.state.tier, ctx.state.compute_cap.as_deref(), standalone);
-    let offer_vllm = offer == VllmOffer::Offer;
+    let offer_vllm = matches!(offer, VllmOffer::Offer | VllmOffer::OfferNotRecommended(_));
     let backend: String = if ctx.non_interactive {
         ctx.info("Auto-selected backend: ollama");
         "ollama".to_string()
     } else {
         ctx.info("1. Ollama — local inference, GGUF (recommended)");
-        if let VllmOffer::BelowFloor(why) = &offer {
+        if let VllmOffer::BelowFloor(why) | VllmOffer::OfferNotRecommended(why) = &offer {
             say_vllm_floor_once(ctx, why);
         }
         let mut max = 1;
@@ -7209,15 +7215,19 @@ pub(crate) enum VllmOffer {
     Offer,
     /// Not for this tier or install (standalone): nothing to explain.
     No,
-    /// A tier-1 GPU below the vLLM image's compute floor, or one whose compute
-    /// capability is unknown: not offered, never recommended, and this line
+    /// A tier-1 GPU whose compute capability could not be read: still offered
+    /// (a refusal rests on a known fact), never recommended, and this line
     /// says why.
+    OfferNotRecommended(String),
+    /// A tier-1 GPU KNOWN to be below the vLLM image's compute floor: not
+    /// offered, never recommended, and this line says why.
     BelowFloor(String),
 }
 
 /// Whether onboarding offers (and recommends) vLLM: a tier-1 GPU (10 GB VRAM
 /// or more), not a standalone box, and a compute capability at or above the
-/// vLLM image's floor (`crate::vllm_floor`). Unknown is below. Pure.
+/// vLLM image's floor (`crate::vllm_floor`). A known capability below it is
+/// not offered; an unknown one is offered without the recommendation. Pure.
 pub(crate) fn vllm_offer(tier: u8, compute_cap: Option<&str>, standalone: bool) -> VllmOffer {
     if tier != 1 || standalone {
         return VllmOffer::No;
@@ -7225,15 +7235,20 @@ pub(crate) fn vllm_offer(tier: u8, compute_cap: Option<&str>, standalone: bool) 
     if crate::vllm_floor::usable(compute_cap) {
         return VllmOffer::Offer;
     }
-    let gpu = match compute_cap {
-        Some(c) => format!("this GPU is {c}"),
-        None => "nvidia-smi did not report this GPU's compute capability".to_string(),
-    };
-    VllmOffer::BelowFloor(format!("vLLM not offered: {}; {gpu} — Ollama runs models on this GPU", crate::vllm_floor::needs()))
+    match compute_cap.filter(|c| crate::vllm_floor::parse_compute_cap(c).is_some()) {
+        Some(c) => VllmOffer::BelowFloor(format!(
+            "vLLM not offered: {}; this GPU is {c} — Ollama runs models on this GPU",
+            crate::vllm_floor::needs()
+        )),
+        None => VllmOffer::OfferNotRecommended(format!(
+            "vLLM offered but not recommended: this GPU's compute capability is unknown (nvidia-smi could not read it), and {}",
+            crate::vllm_floor::needs()
+        )),
+    }
 }
 
-/// Print why vLLM is not offered, once per run (the prereqs list and the
-/// model step both reach it).
+/// Print why vLLM is not offered (or not recommended), once per run (the
+/// prereqs list and the model step both reach it).
 fn say_vllm_floor_once(ctx: &mut Ctx, why: &str) {
     if !ctx.state.vllm_floor_said {
         ctx.state.vllm_floor_said = true;
@@ -7499,9 +7514,9 @@ mod first_model_probe_tests {
         assert!(!vllm_shortcut_applies("", false));
     }
 
-    /// vLLM is offered (and recommended) only on a tier-1 GPU at or above the
-    /// vLLM image's compute floor, never on standalone; below the floor, or
-    /// unknown, it is not offered and the line says why, once.
+    /// vLLM is offered and recommended on a tier-1 GPU at or above the vLLM
+    /// image's compute floor, never on standalone; known below the floor, it
+    /// is not offered and the line says why, once.
     #[test]
     fn vllm_is_offered_only_on_a_tier_one_gpu_at_or_above_the_compute_floor() {
         assert_eq!(vllm_offer(1, Some("8.6"), false), VllmOffer::Offer);
@@ -7514,12 +7529,25 @@ mod first_model_probe_tests {
             ),
             other => panic!("a compute 6.1 GPU is below the floor: {other:?}"),
         }
-        match vllm_offer(1, None, false) {
-            VllmOffer::BelowFloor(why) => assert!(why.contains("did not report"), "{why}"),
-            other => panic!("unknown counts as below: {other:?}"),
-        }
         assert_eq!(vllm_offer(1, Some("8.6"), true), VllmOffer::No, "never on standalone");
         assert_eq!(vllm_offer(2, Some("6.1"), false), VllmOffer::No, "tier 2 never offered it: nothing to explain");
+    }
+
+    /// A refusal rests on a known fact: a tier-1 GPU whose compute capability
+    /// could not be read (or does not parse) is still offered vLLM, but not
+    /// recommended, and the line says why.
+    #[test]
+    fn vllm_is_offered_but_not_recommended_when_the_compute_cap_is_unknown() {
+        for cap in [None, Some("[N/A]")] {
+            match vllm_offer(1, cap, false) {
+                VllmOffer::OfferNotRecommended(why) => assert!(
+                    why.contains("not recommended") && why.contains("unknown") && why.contains("7.5+"),
+                    "{why}"
+                ),
+                other => panic!("unknown ({cap:?}) is offered without the recommendation: {other:?}"),
+            }
+        }
+        assert_eq!(vllm_offer(1, None, true), VllmOffer::No, "never on standalone");
     }
 
     #[test]

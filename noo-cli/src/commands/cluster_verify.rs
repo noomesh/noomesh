@@ -1400,29 +1400,37 @@ pub(crate) fn vllm_placements(placements: &Value) -> Vec<String> {
 }
 
 /// The `vllm compute` row: a vLLM placement (`vllm_placements`, injected by
-/// `with_harness_wanted` from desired-config) on a node whose GPU is below the
-/// vLLM image's compute floor (`crate::vllm_floor`) can never start: FAIL
-/// naming it, the node's `gpu_compute_cap` and the floor, with the remedy
-/// (unplace it, place the model on ollama or llamacpp). A node that does not
-/// report `gpu_compute_cap` (an agent older than 0.6.18, or one whose
-/// nvidia-smi cannot answer) counts as below. No row without a vLLM placement
-/// or at/above the floor.
+/// `with_harness_wanted` from desired-config) on a node whose GPU is KNOWN to
+/// be below the vLLM image's compute floor (`crate::vllm_floor`) can never
+/// start: FAIL naming it, the node's `gpu_compute_cap` and the floor, with the
+/// remedy (unplace it, place the model on ollama or llamacpp). A node that does
+/// not report a parsable `gpu_compute_cap` (an agent older than 0.6.18, or its
+/// nvidia-smi cannot answer) is unknown: WARN, never FAIL — a failure rests on
+/// a known fact. No row without a vLLM placement or at/above the floor.
 pub(crate) fn vllm_compute_check(n: &Value) -> Option<Check> {
+    const NAME: &str = "vllm compute";
     let id = n["id"].as_str().unwrap_or("?");
     let placed: Vec<&str> = n["vllm_placements"].as_array()?.iter().filter_map(Value::as_str).collect();
     let first = placed.first()?;
-    let cap = n["gpu_compute_cap"].as_str();
-    if crate::vllm_floor::usable(cap) {
+    let cap = n["gpu_compute_cap"].as_str().filter(|c| crate::vllm_floor::parse_compute_cap(c).is_some());
+    let backend = first.split(' ').next().unwrap_or("vllm");
+    let Some(c) = cap else {
+        return Some(warn(
+            NAME,
+            format!(
+                "{id}: {} placed; its GPU compute capability is unknown: it could not be read (no gpu_compute_cap: an agent older than 0.6.18, or its nvidia-smi cannot answer), and {}",
+                placed.join(", "),
+                crate::vllm_floor::needs()
+            ),
+            Some(format!("noo cluster provision {id} --wait   # a current agent reports it; on a GPU below the floor: noo cluster unplace {id} {backend}")),
+        ));
+    };
+    if crate::vllm_floor::usable(Some(c)) {
         return None;
     }
-    let gpu = match cap {
-        Some(c) => format!("its GPU is compute {c}"),
-        None => "it does not report gpu_compute_cap (an agent older than 0.6.18, or its nvidia-smi cannot answer), which counts as below".to_string(),
-    };
-    let backend = first.split(' ').next().unwrap_or("vllm");
     Some(fail(
-        "vllm compute",
-        format!("{id}: {} placed, but {}; {gpu}", placed.join(", "), crate::vllm_floor::needs()),
+        NAME,
+        format!("{id}: {} placed, but {}; its GPU is compute {c}", placed.join(", "), crate::vllm_floor::needs()),
         format!("noo cluster unplace {id} {backend}   # then: noo cluster place {id} ollama <model> (Ollama runs this GPU), or llamacpp"),
     ))
 }
@@ -12604,14 +12612,28 @@ mod tests {
         assert_eq!(c.verdict, Verdict::Fail);
         assert!(c.detail.contains("node-a") && c.detail.contains("vllm org/gemma") && c.detail.contains("compute 6.1") && c.detail.contains("7.5+"), "{}", c.detail);
         assert_eq!(c.remedy.as_deref().unwrap().split("   #").next().unwrap(), "noo cluster unplace node-a vllm");
-        let unknown = vllm_compute_check(&json!({"id": "node-a", "vllm_placements": ["vllm org/gemma"]})).expect("unknown counts as below");
-        assert!(unknown.detail.contains("does not report gpu_compute_cap"), "{}", unknown.detail);
         assert!(vllm_compute_check(&json!({"id": "node-a", "gpu_compute_cap": "8.6", "vllm_placements": ["vllm org/gemma"]})).is_none(), "at/above the floor: no row");
         assert!(vllm_compute_check(&json!({"id": "node-a", "gpu_compute_cap": "6.1"})).is_none(), "no vLLM placed: no row");
         let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
         let inject = crate::test_src::fn_body(&own, "fn with_harness_wanted(");
         assert!(inject.contains("vllm_placements(&d[\"placements\"])"), "fed from desired-config");
         assert!(own.contains("out.extend(vllm_compute_check(n));"), "the row is in the run");
+    }
+
+    /// A FAIL rests on a known fact: a vLLM placement on a node whose compute
+    /// capability is unknown (not reported, or unparsable) is a WARN saying it
+    /// could not be read, never a FAIL.
+    #[test]
+    fn vllm_compute_row_warns_when_the_compute_cap_is_unknown() {
+        use serde_json::json;
+        for n in [
+            json!({"id": "node-a", "vllm_placements": ["vllm org/gemma"]}),
+            json!({"id": "node-a", "gpu_compute_cap": "eight", "vllm_placements": ["vllm org/gemma"]}),
+        ] {
+            let c = vllm_compute_check(&n).expect("a row");
+            assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+            assert!(c.detail.contains("unknown") && c.detail.contains("could not be read") && c.detail.contains("7.5+"), "{}", c.detail);
+        }
     }
 
     const VLLM_PIN: &str = "sha256:8a3e44b7e3a1aef61a0852c444a01df319b506bf87083fef93c21367e6bffa2b";
