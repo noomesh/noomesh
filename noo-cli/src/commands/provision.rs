@@ -962,7 +962,7 @@ fn build_env_vars(g: &Globals, a: &ProvisionArgs, site: &ProvSite, id: &ProvIden
     // own agent off (0.6.27-rc.2's UPGRADE cell: `lookup noo-controller ...
     // server misbehaving`, no heartbeat from the new build). The same host
     // is NATS_URL's below.
-    let ctrl_host = match controller_host(&site.root, host_for(site.is_self)) {
+    let ctrl_host = match controller_host(&site.root, host_for(false && site.is_self)) {
         Ok(h) => h,
         Err(e) => fail(g.json, ExitCode::Generic, "controller_host", &e, Some(CONTROLLER_HOST_REMEDY)),
     };
