@@ -67,7 +67,7 @@ noo stack rebuild-status --follow
 Foreground rebuilds run `scripts/noomesh-rebuild.sh` (`--no-cache`,
 `--profile`, `--gateway-engine`/`--node-engine` are foreground-only).
 `--background` needs noo-hostd running (the controller-mode user unit
-`noo onboard` installs; `systemctl --user status noo-hostd`) — otherwise
+`noo onboard` installs at a terminal or with `--ci --root-ok`; plain `--ci` skips it; `systemctl --user status noo-hostd`) — otherwise
 it refuses and points at `noo onboard --only services` — and drops a
 `stack-rebuild` job into `.noo-host-spool/` for hostd to run; the same
 job shows in the dashboard under Self-Regulation → Host Operations.

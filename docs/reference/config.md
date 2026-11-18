@@ -709,7 +709,7 @@ Decide in this order:
    | Gate | Meaning |
    |---|---|
    | `NOO_EXEC_APPROVAL_MODE` | `auto` \| `approval` \| `strict` tool-execution gating |
-   | `NOO_NODE_AGENT_PRIVILEGED` | whether the node-agent **container** runs privileged (mirrored into `.env` for compose, and the container is recreated on change; `posture list` reports the container's actual state) — an opt-in compose profile the fleet does not deploy; every node runs the host binary as `noo-agent` in the `docker` group ([node-agent.md](../security/node-agent.md)) |
+   | `NOO_NODE_AGENT_PRIVILEGED` | whether the node-agent **container** runs privileged (mirrored into `.env` for compose, and the container is recreated on change; `posture list` reports the container's actual state) — an opt-in compose profile the fleet does not deploy; every Linux node runs the host binary as `noo-agent` in the `docker` group (a Mac runs it as the enrolling user) ([node-agent.md](../security/node-agent.md)) |
    | `NOO_MCP_EXTERNAL_ENABLED` | opens the user MCP door (`/mcp/user`) |
 
    At boot the gateway (and the Python worker) read the table and set those
@@ -726,7 +726,7 @@ Decide in this order:
    ```
 
    Profiles: `hardened` = `approval` mode, unprivileged node-agent container;
-   `dev` = `auto` mode, privileged node-agent container. Neither changes what
+   `dev` = `auto` mode, privileged node-agent container (the opt-in compose one; fleet node agents are host processes with the Docker socket). Neither changes what
    a node accepts from the controller — that is the node's own contract, not
    a posture key ([node-agent.md](../security/node-agent.md)).
    Tenant isolation is deliberately not a

@@ -765,12 +765,11 @@ line (JSON `"level"`, `level=`, a leading `WARN`/`ERROR`/…; journal records
 fall back to their syslog priority). Everything else stays in the line —
 `{node="node-1", level="error"} |= "vllm"` is the shape of a query.
 
-The agent cannot read the journal (it is unprivileged and the journal group
+The agent cannot read the journal (it is not root, though it holds the Docker socket, which is root-equivalent, and the journal group
 would open every journal on the box), so `noo-hostd` runs the read-only
 `journal-follow` op on its behalf: `journalctl --output=json --follow` for
 the allowlisted units, written to `/var/lib/noo-node-agent/spool/journal.follow`
-(rotated at 16 MB, one predecessor kept), which the agent tails. hostd has no
-network; the agent has no journal. A hostd older than the op reports
+(rotated at 16 MB, one predecessor kept), which the agent tails. hostd opens no listener and has no network code; the agent has no journal. A hostd older than the op reports
 `hostd predates journal-follow` in the heartbeat and only container logs
 ship until `noo upgrade --nodes` delivers both binaries.
 

@@ -11,7 +11,7 @@ The question this page answers is the next one. **A controller that has been
 taken over — a compromised gateway process, an edited `noo_node_config` row,
 a stolen gateway certificate — is inside the trust boundary for issuing
 instructions. It must not thereby own the boxes.** The node agent runs as
-`noo-agent` in the `docker` group, which is host-root-equivalent; if desired
+`noo-agent` in the `docker` group on Linux (a Mac runs it as the enrolling user; a controller host with no `noo-agent` account runs it as root), and the docker socket is host-root-equivalent; if desired
 state can name any path, any image and any command, then one row in one table
 is root on every node in the fleet.
 
@@ -1557,14 +1557,16 @@ hold and no row.
 
 ## What is still root
 
-`noo-hostd` is root on the node, and deliberately so: it has no listener, it
+`noo-hostd` is root on a worker node (on the controller it runs as the operator's user), and deliberately so: it has no listener, it
 reads a file spool, and it runs a fixed list of operations. Host filesystem
 work the agent needs (creating and chowning the models dir) runs through a
 short-lived helper container rather than through the agent itself, with the
 path validated against the declared roots and every externally-supplied value
 passed as a shell **argument**, never interpolated into a command line.
 
-The node agent itself is not root and not a privileged container: it is a
+The node agent is not a privileged container, and on a prepared node it is not
+root: on Linux it is a
 systemd host process running as `noo-agent` with `NoNewPrivileges=true` and
-membership of the `docker` group. The docker socket is the agent's real
+membership of the `docker` group (on a Mac it runs as the enrolling user, with no
+`docker` group; with no `noo-agent` account the unit runs as root). The docker socket is the agent's real
 privilege, and it is why every bound on this page exists.

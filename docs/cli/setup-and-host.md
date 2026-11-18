@@ -116,7 +116,8 @@ noo cluster bootstrap-token create --node gpu-2
 ```
 
 It prints a one-liner. Paste that on the node — it is the only `sudo` the
-node ever needs. The three forms `noo enroll` accepts are the blob the
+node needs to enrol. Later node-side actions (`noo node workloads …`,
+de-enrolment) use `sudo` too. The three forms `noo enroll` accepts are the blob the
 one-liner carries (`noo enroll noo1.<base64>`), an explicit
 `--url <controller> --token <t>`, and `--via-tailnet <https://controller>`
 (no token: identity is proved by Tailscale `whois` plus a dial-back). The
