@@ -873,9 +873,7 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 	// An UNPLACED node (no NOO_MODEL_CACHE_URL: the controller's own agent, a
 	// dev box) has no store to preseed from; it runs online as before.
 	// GGUF weights (llama.cpp) are a flat file; copy from the store if present.
-	if _, err := c.preseedGGUF(ctx, backend, model); err != nil {
-		return err
-	}
+	c.preseedGGUF(ctx, backend, model)
 
 	// Placement-driven extras win over everything env-derived.
 	for k, v := range overrides.ExtraEnv {
