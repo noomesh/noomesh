@@ -7190,3 +7190,27 @@ mod controller_host_tests {
         assert!(b.find("if is_self").unwrap() < b.find("converge_self_controller_url(").unwrap(), "{b}");
     }
 }
+
+#[cfg(test)]
+mod harness_model_url_tests {
+    /// The harness reaches its node's own agent at NOO_HARNESS_MODEL_URL, and
+    /// the gateway's node links take https only. That URL is pinned to
+    /// https over loopback where it is rendered, the template takes it from
+    /// that variable, and the Mac's harness-env key list carries it.
+    #[test]
+    fn the_harness_model_url_is_the_nodes_own_agent_over_https_loopback() {
+        let own = crate::test_src::own_code(include_str!("provision.rs"));
+        assert!(
+            own.contains("hvars.insert(\"noo_harness_model_url\", format!(\"https://127.0.0.1:{}\","),
+            "provision renders the harness's model URL as https on loopback"
+        );
+        assert!(
+            super::super::enroll::asset_harness_env_tmpl().contains("NOO_HARNESS_MODEL_URL={{ noo_harness_model_url }}"),
+            "the harness template takes it from that variable"
+        );
+        let nf = crate::test_src::own_code(include_str!("node_fetch.rs"));
+        let at = nf.find("const HARNESS_ENV_KEYS").expect("the Mac's harness-env key list");
+        let list = nf[at..].split("];").next().unwrap();
+        assert!(list.contains("\"NOO_HARNESS_MODEL_URL\""), "the Mac applier carries it");
+    }
+}
