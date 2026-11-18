@@ -103,7 +103,7 @@ noo doctor docker   # the Docker daemon itself; read-only
 reports `healthy`/`ok` — otherwise 5, with a guide (`noo stack status`,
 `noo stack logs <dep>`). `noo doctor docker` looks for the unclean-shutdown
 damage signature (ghost container records, empty names, `Exited (255)`
-rows); a clean daemon prints `no unclean-shutdown damage signature` and
+rows); a clean daemon prints `No unclean-shutdown damage signature` and
 exits 0, a damaged one prints the recovery recipe and exits 1. It never
 changes anything.
 

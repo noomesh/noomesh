@@ -51,3 +51,26 @@ def test_setup_and_host_nodes_ending_is_upgrades():
     code = re.search(r'format!\("(bundles staged for all \{total\} node\(s\)[^"]*)"', src)
     assert code, "upgrade.rs no longer prints `bundles staged for all … node(s)`"
     assert m.group(1) == code.group(1).replace("{total}", "N"), f"doc {m.group(1)!r} != code {code.group(1)!r}"
+
+
+def test_setup_and_host_doctor_docker_clean_line_is_doctors():
+    """The clean-daemon line, as printed: doctor.rs hands status_line a
+    lowercase message and status_line sentence-cases it (ui.rs). The install
+    matrix's probe matched the lowercase words case-sensitively and read
+    FAIL on every clean cell of 0.6.27-rc.1; the doc quoted the lowercase
+    words too. The doc quotes the printed line; the probe matches the code's
+    words without case."""
+    doc = _flat(_read("docs/cli/setup-and-host.md"))
+    m = re.search(r"a clean daemon prints `([^`]+)`", doc)
+    assert m, "setup-and-host.md no longer quotes `noo doctor docker`'s clean line"
+    src = _read("noo-cli/src/commands/doctor.rs")
+    code = re.search(r'ui::status_line\(Glyph::Ok, "([^"]*unclean-shutdown damage signature[^"]*)"\)', src)
+    assert code, "doctor.rs no longer prints the clean line through ui::status_line"
+    words = code.group(1)
+    ui = _read("noo-cli/src/ui.rs")
+    assert re.search(r"pub fn status_line\(g: Glyph, msg: &str\) -> String \{\s*format!\(\"\{\} \{\}\", glyph\(g\), sentence_case\(msg\)\)", ui), \
+        "status_line no longer sentence-cases its message: re-derive the printed line"
+    printed = words[0].upper() + words[1:]
+    assert m.group(1) == printed, f"doc quotes {m.group(1)!r}; the CLI prints {printed!r}"
+    probe = _read("scripts/install-cell/run.sh")
+    assert f'grep -qi "{words}"' in probe, "the install-cell doctor-docker probe must match doctor's words without case"
