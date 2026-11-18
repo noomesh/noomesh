@@ -201,7 +201,7 @@ pub async fn enrich_prompt(prompt: String, state: &AppState, action: &str, confi
     if !wants_alert_record(action, config) {
         return prompt;
     }
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
     let events = read_events(state, now).await;
     let open = crate::operator_alert::open_conditions(state).await;
     let maintenance = crate::maintenance::active(&state.js, now).await;

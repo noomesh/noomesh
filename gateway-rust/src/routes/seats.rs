@@ -727,7 +727,7 @@ async fn check_seat_proof(
     let row = seat_cert_for(db, seat).await?;
     revoked_refusal(seat, row.as_ref().and_then(|(_, at)| *at))?;
     let cert = row.map(|(cert, _)| cert);
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
     crate::birth_proof::verify(header, purpose, seat, sha, cert.as_deref(), now).map_err(|e| {
         tracing::warn!(seat = %seat, reason = ?e, "seat_proof_rejected");
         AppError::Forbidden(format!("seat proof refused for '{seat}': {e:?} (sign \"noo-seat-<purpose>:<seat>:<sha>:<ts>\" with the seat's birth key)"))

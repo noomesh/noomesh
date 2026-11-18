@@ -484,7 +484,7 @@ async fn logs_docker_stats(
 ) -> AppJson {
     let targets = container_targets(&state, params.node_id.as_deref()).await;
     let (results, unreachable) = gather_node_lists(targets, "/stats/containers").await;
-    let timestamp = chrono::Utc::now().to_rfc3339();
+    let timestamp = crate::wire_time::rfc3339_offset(jiff::Timestamp::now());
     Json(json!({"containers": results, "unreachable": unreachable, "timestamp": timestamp}))
 }
 
@@ -1228,7 +1228,7 @@ async fn cancel_job(
         ));
     }
 
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = crate::wire_time::rfc3339_offset(jiff::Timestamp::now());
 
     // Update job hash: status → cancelled
     redis.hset(&key, &[
@@ -1256,7 +1256,7 @@ async fn cancel_job(
         let nid = node_id.to_string();
         tokio::spawn(async move {
             let payload = serde_json::json!({
-                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "timestamp": crate::wire_time::rfc3339_offset(jiff::Timestamp::now()),
                 "type": "job.cancel",
                 "data": {
                     "job_id": jid,
@@ -1345,7 +1345,7 @@ async fn reprioritize_job(
         ));
     }
 
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = crate::wire_time::rfc3339_offset(jiff::Timestamp::now());
     let priority_str = body.priority.to_string();
 
     // Update job hash
@@ -1742,7 +1742,7 @@ pub(crate) async fn submit_job_to_redis(
     }
 
     let job_id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = crate::wire_time::rfc3339_offset(jiff::Timestamp::now());
     let payload_str = serde_json::to_string(payload).unwrap_or_default();
 
     let key = format!("{JOB_KEY_PREFIX}{job_id}");
@@ -2067,7 +2067,7 @@ async fn spawn_test_run(state: &Arc<AppState>, suite: &str) -> String {
     // so max_retries=0 — a Python requeue would hand this job to a node-agent
     // that cannot run it; instead the reaper marks a hung run dead once
     // timeout_sec elapses (dispatched_at/node_id make it reaper-visible).
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = crate::wire_time::rfc3339_offset(jiff::Timestamp::now());
     const TESTS_TIMEOUT_SEC: i64 = 3600;
     if let Some(redis) = state.redis.as_ref() {
         let key = format!("{JOB_KEY_PREFIX}{job_id}");
@@ -2135,7 +2135,7 @@ async fn spawn_test_run(state: &Arc<AppState>, suite: &str) -> String {
         tracing::info!(job_id = %job_id_clone, status, "tests: finished");
 
         if let Some(redis) = state_bg.redis.as_ref() {
-            let done_at = chrono::Utc::now().to_rfc3339();
+            let done_at = crate::wire_time::rfc3339_offset(jiff::Timestamp::now());
             let key = format!("{JOB_KEY_PREFIX}{job_id_clone}");
             let error = if status == "failed" { summary.as_str() } else { "" };
             let _ = redis.hset(&key, &[
@@ -2967,7 +2967,7 @@ pub(crate) async fn host_spool_write_command(
         "rollback": null,
         "args": args,
         "requested_by": requested_by,
-        "ts": chrono::Utc::now().to_rfc3339(),
+        "ts": crate::wire_time::rfc3339_offset(jiff::Timestamp::now()),
     });
 
     let dir = std::path::Path::new(&spool_dir);
@@ -4304,7 +4304,7 @@ pub(crate) async fn self_modify_audit(entry: Value) {
     let write = async {
         let mut entry = entry;
         if let Some(obj) = entry.as_object_mut() {
-            obj.insert("ts".into(), json!(chrono::Utc::now().to_rfc3339()));
+            obj.insert("ts".into(), json!(crate::wire_time::rfc3339_offset(jiff::Timestamp::now())));
         }
         let path = std::env::var("NOO_SELF_MODIFY_AUDIT_PATH")
             .unwrap_or_else(|_| "/data/noo_self_modify_audit.jsonl".into());

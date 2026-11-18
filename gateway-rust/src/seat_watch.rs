@@ -216,7 +216,7 @@ pub async fn tick(state: &Arc<AppState>) {
             return;
         }
     };
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
     for (seat, last_seen, hb, revoked) in rows {
         let seen = seat_condition(hb.as_ref(), last_seen.map(|t| t.timestamp()), revoked, now);
         let prev = first_bad_map().lock().ok().and_then(|m| m.get(&seat).copied());

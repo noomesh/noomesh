@@ -223,7 +223,7 @@ pub fn installed() -> Result<&'static Entitlement, &'static str> {
                 return Err("no entitlement installed".to_string());
             }
             let ent = verify(&raw).map_err(|e| format!("entitlement rejected: {e}"))?;
-            let now = chrono::Utc::now().timestamp();
+            let now = jiff::Timestamp::now().as_second();
             if ent.expired_at(now) {
                 return Err(format!("entitlement for '{}' expired", ent.sub));
             }

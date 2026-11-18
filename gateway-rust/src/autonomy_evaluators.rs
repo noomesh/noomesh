@@ -1252,7 +1252,7 @@ pub fn embed_backlog_verdict(
 /// snapshot. Errors only when the count itself cannot be read.
 pub async fn embed_backlog_status(state: &AppState) -> Result<EmbedBacklog, String> {
     let n = count_unembedded(&state.db).await?;
-    let now_secs = chrono::Utc::now().timestamp();
+    let now_secs = jiff::Timestamp::now().as_second();
     let snapshot = match redis(state) {
         Some(r) => r
             .get_string(EMBED_BACKLOG_SNAPSHOT_KEY)
@@ -2315,7 +2315,7 @@ pub async fn certs_expiring_within(days_threshold: i64) -> Vec<ExpiringCert> {
     //    nowhere else), and therefore the last reason the runtime image
     //    needed a shell and a package manager. Dropping it is what lets the
     //    gateway move to the shell-less hardened base.
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
     let cutoff = (chrono::Utc::now() + chrono::Duration::days(days_threshold)).timestamp();
     // None = unreadable or unparseable. Same outcome as the subprocess's
     // non-zero exit, but now it is one code path instead of three.

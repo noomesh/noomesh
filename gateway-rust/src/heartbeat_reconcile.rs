@@ -175,7 +175,7 @@ pub fn spawn(state: Arc<AppState>) {
 pub async fn reconcile_once(state: &Arc<AppState>) -> Result<(), sqlx::Error> {
     let Some(redis) = state.redis.as_ref() else { return Ok(()) };
 
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
     let deadline = deadline_secs();
 
     // Only entries old enough to have plausibly finished.

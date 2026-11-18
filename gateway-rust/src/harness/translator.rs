@@ -967,7 +967,7 @@ pub(crate) mod ollama {
         let mut out = json!({
             "id": format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
             "object": "chat.completion",
-            "created": chrono::Utc::now().timestamp(),
+            "created": jiff::Timestamp::now().as_second(),
             "model": v.get("model").and_then(|m| m.as_str()).unwrap_or(model),
             "choices": [{"index": 0, "message": message, "finish_reason": finish(v, !calls.is_empty())}],
         });
@@ -994,7 +994,7 @@ pub(crate) mod ollama {
             Self {
                 id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
                 model: model.to_string(),
-                created: chrono::Utc::now().timestamp(),
+                created: jiff::Timestamp::now().as_second(),
                 tools: 0,
                 reasoning: false,
             }

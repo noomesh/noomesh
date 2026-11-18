@@ -904,7 +904,7 @@ pub(crate) async fn ensure_checkpoint_with(
         }
     }
 
-    let at = chrono::Utc::now().timestamp();
+    let at = jiff::Timestamp::now().as_second();
     let (cp, signing_key, outcome) = match (&last_retired, retired.as_deref()) {
         (Some(row), Some(rk)) => (
             Checkpoint {

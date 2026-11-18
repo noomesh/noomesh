@@ -1407,7 +1407,7 @@ async fn browser_start(
         );
     }
 
-    let now = chrono::Utc::now().timestamp() as f64;
+    let now = jiff::Timestamp::now().as_second() as f64;
     let session_data = json!({
         "session_id": session_id,
         "container_name": container_name,
@@ -1718,7 +1718,7 @@ async fn browser_action(
 
     // Touch last_action so idle bookkeeping reflects reality.
     if let Some(redis) = state.redis.as_ref() {
-        session_data["last_action"] = json!(chrono::Utc::now().timestamp() as f64);
+        session_data["last_action"] = json!(jiff::Timestamp::now().as_second() as f64);
         redis.set_string(&session_key, &session_data.to_string()).await;
     }
 

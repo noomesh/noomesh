@@ -239,7 +239,7 @@ async fn on_ack(state: &AppState, job_id: &str, origin: Option<&str>) -> anyhow:
         // A late ack must not resurrect a job the reaper already killed.
         return Ok(());
     }
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = crate::wire_time::rfc3339_offset(jiff::Timestamp::now());
     let mut fields: Vec<(&str, &str)> = vec![("status", "running"), ("updated_at", now.as_str())];
     if hash.get("started_at").map(|s| s.is_empty()).unwrap_or(true) {
         fields.push(("started_at", now.as_str()));

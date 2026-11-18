@@ -218,7 +218,7 @@ impl Envelope {
             kind: kind.to_string(),
             body,
             refs,
-            ts: chrono::Utc::now().to_rfc3339(),
+            ts: crate::wire_time::rfc3339_offset(jiff::Timestamp::now()),
             ttl_s: 0,
             enc: "none".into(),
             sig: None,
