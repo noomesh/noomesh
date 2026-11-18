@@ -207,7 +207,7 @@ pub(crate) fn lease_holder(gc: &Value) -> String {
 /// Why the automatic policy yielded, as the agent said it (None when it did
 /// not say). The foreign figure on the same line is the reading NOW, with our
 /// backends stopped, so on its own it can read "foreign 0.0 GB" for a node
-/// that yielded on a probe timeout (awolf, 2026-11-07); the reason is the
+/// that yielded on a probe timeout (node-a, 2026-11-07); the reason is the
 /// cause.
 pub(crate) fn yield_reason(gc: &Value) -> Option<&str> {
     gc["reason"].as_str().map(str::trim).filter(|r| !r.is_empty())
@@ -289,26 +289,26 @@ mod tests {
             "since": "2026-10-17T12:00:00Z", "paused_backends": ["vllm"]}});
         assert_eq!(gpu_status_note(&n).unwrap(),
             "host3: GPU in use by other work — vllm paused since 2026-10-17T12:00:00Z (foreign 11.2 GB)");
-        // awolf 2026-11-07: the reading after the pause said foreign 0.0 GB;
+        // node-a 2026-11-07: the reading after the pause said foreign 0.0 GB;
         // the cause was the probe. The note names it.
-        let probe = serde_json::json!({"id": "awolf", "gpu_contention": {"state": "yielded", "foreign_mb": 0,
+        let probe = serde_json::json!({"id": "node-a", "gpu_contention": {"state": "yielded", "foreign_mb": 0,
             "paused_backends": ["vllm"],
             "reason": "GPU probe (nvidia-smi) not answering: a program outside noomesh is likely using the GPU"}});
         assert_eq!(gpu_status_note(&probe).unwrap(),
-            "awolf: GPU in use by other work — vllm paused (foreign 0.0 GB) — why: GPU probe (nvidia-smi) not answering: a program outside noomesh is likely using the GPU");
+            "node-a: GPU in use by other work — vllm paused (foreign 0.0 GB) — why: GPU probe (nvidia-smi) not answering: a program outside noomesh is likely using the GPU");
         let held = serde_json::json!({"id": "host3", "gpu_contention": {"state": "held", "reason": "voice", "paused_backends": ["vllm"]}});
         assert_eq!(gpu_status_note(&held).unwrap(), "host3: GPU mode held (manual) — held by operator (voice), vllm paused");
         let owned = serde_json::json!({"id": "host3", "gpu_contention": {"state": "held", "reason": "voice", "paused_backends": ["vllm"],
-            "lease": {"owner": "rbwolf", "operation_id": "op-1", "generation": 3}}});
-        assert_eq!(gpu_status_note(&owned).unwrap(), "host3: GPU mode held (manual) — held by rbwolf (voice), vllm paused");
+            "lease": {"owner": "owner", "operation_id": "op-1", "generation": 3}}});
+        assert_eq!(gpu_status_note(&owned).unwrap(), "host3: GPU mode held (manual) — held by owner (voice), vllm paused");
         let user = serde_json::json!({"id": "host3", "gpu_contention": {"state": "held", "reason": "user", "paused_backends": ["vllm"],
-            "lease": {"owner": "rbwolf", "operation_id": "op-2", "generation": 5, "purpose": "user"}}});
-        assert_eq!(gpu_status_note(&user).unwrap(), "host3: GPU mode user — held by rbwolf (user), vllm paused");
+            "lease": {"owner": "owner", "operation_id": "op-2", "generation": 5, "purpose": "user"}}});
+        assert_eq!(gpu_status_note(&user).unwrap(), "host3: GPU mode user — held by owner (user), vllm paused");
         let reserved = serde_json::json!({"id": "host3", "gpu_contention": {"state": "held", "paused_backends": ["vllm"],
-            "lease": {"owner": "rbwolf", "operation_id": "res-1", "generation": 6, "workload": "rhaddon/worker"}}});
-        assert_eq!(gpu_status_note(&reserved).unwrap(), "host3: GPU mode workload rhaddon/worker — held by rbwolf, vllm paused");
-        let draining = serde_json::json!({"id": "host3", "gpu_contention": {"state": "draining", "lease": {"owner": "rbwolf"}}});
-        assert_eq!(gpu_status_note(&draining).unwrap(), "host3: GPU mode switching — hold by rbwolf draining, waiting for requests in flight to finish");
+            "lease": {"owner": "owner", "operation_id": "res-1", "generation": 6, "workload": "rhaddon/worker"}}});
+        assert_eq!(gpu_status_note(&reserved).unwrap(), "host3: GPU mode workload rhaddon/worker — held by owner, vllm paused");
+        let draining = serde_json::json!({"id": "host3", "gpu_contention": {"state": "draining", "lease": {"owner": "owner"}}});
+        assert_eq!(gpu_status_note(&draining).unwrap(), "host3: GPU mode switching — hold by owner draining, waiting for requests in flight to finish");
         assert!(gpu_status_note(&serde_json::json!({"id": "x", "gpu_contention": {"state": "free"}})).is_none());
         assert!(gpu_status_note(&serde_json::json!({"id": "x"})).is_none());
     }

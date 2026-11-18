@@ -218,7 +218,7 @@ func (s *Server) SetChatContext(f func(model string) int) { s.chatContext = f }
 // `reconcile` control op) asks for a desired-state pass now instead of at
 // the next tick. The gateway sends it after a placement write, so a kind
 // change or a new placement lands in seconds rather than within
-// reconcile.defaultInterval (5 min; the harness compare on mcmini waited that
+// reconcile.defaultInterval (5 min; the harness compare on node-mac waited that
 // long per kind, 2026-10-24).
 func (s *Server) SetReconcileNudge(f func()) { s.reconcileNudge = f }
 

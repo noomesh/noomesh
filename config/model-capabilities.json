@@ -8,7 +8,7 @@
         "gemma4:12b*"
       ],
       "max_context": 262144,
-      "evidence": "text_config.max_position_embeddings of google/gemma-4-12B-it-qat-w4a16-ct and gemma4.context_length of Ollama gemma4:12b, both 262144, read on awolf 2026-10-27"
+      "evidence": "text_config.max_position_embeddings of google/gemma-4-12B-it-qat-w4a16-ct and gemma4.context_length of Ollama gemma4:12b, both 262144, read on node-a 2026-10-27"
     },
     {
       "family": "gemma4-e2b",

@@ -583,7 +583,7 @@ jobs:
         # queue run (operator, 2026-11-11).
         pytest tests/ -v -n auto --dist worksteal --durations=50 --durations-min=1 "${args[@]}"
 
-    # The sandbox jail as it runs in a container (pop-os, 0.6.13): Docker
+    # The sandbox jail as it runs in a container (ctrl, 0.6.13): Docker
     # masks paths under every container's /proc, the kernel then refuses a
     # fresh procfs inside the call's user namespace, and a jail that asked
     # for one refused every call. A hosted runner's /proc has no masks, so
@@ -679,7 +679,7 @@ jobs:
         go vet ./...
         go test ./...
 
-    # mcmini is a real darwin node: the darwin agent and its test files must
+    # node-mac is a real darwin node: the darwin agent and its test files must
     # build. Cross-compiled on Linux; `-exec /bin/true` compiles each test
     # binary without running it (a darwin binary cannot run here).
     - name: Build and vet for darwin (compile-only tests)

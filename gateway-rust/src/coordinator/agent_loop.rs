@@ -1709,7 +1709,7 @@ const TURN_SAVE_MARGIN: Duration = Duration::from_secs(45);
 /// When a turn that started at `start` stops calling the model: the turn
 /// deadline (where the controller stops relaying and the harness token
 /// expires) minus [`TURN_SAVE_MARGIN`]. Each model call is bounded by it
-/// too. 2026-10-17: a turn on mcmini ran four 5-minute model calls (the
+/// too. 2026-10-17: a turn on node-mac ran four 5-minute model calls (the
 /// client's fixed timeout) past the 15-minute deadline; the answer, the
 /// user's message and the session metadata were all refused with 401 on
 /// the way back, so nothing of that conversation was saved.
@@ -4445,7 +4445,7 @@ fn with_deadline_note(response: &str) -> (String, String) {
 
 /// Save the person's message as the turn starts. It used to be saved with
 /// the answer after the loop, and a harness turn that overran its token
-/// (2026-10-17, mcmini) lost both: every rail call after `exp` was a 401.
+/// (2026-10-17, node-mac) lost both: every rail call after `exp` was a 401.
 async fn save_user_message_early<R: HarnessRuntime>(rt: &R, conversation_id: &str, prompt: &str, user_id: Option<&str>) {
     if let Err(e) = rt.save_message(conversation_id, "user", prompt, None, user_id).await {
         tracing::warn!(error = %e, "Failed to save user message");

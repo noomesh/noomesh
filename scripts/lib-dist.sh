@@ -518,7 +518,7 @@ addon_services() {
 # exit status. Callers used to write `2>/dev/null`, which turned a compose
 # config error (a missing required variable, a bad overlay) into an empty
 # string that every gate then reported as something else (live 2026-10-13,
-# pop-os: "could not render the image of add-on service noo-evolve").
+# ctrl: "could not render the image of add-on service noo-evolve").
 COMPOSE_OUT=""; COMPOSE_ERR=""
 compose_capture() {
     local _ef _rc

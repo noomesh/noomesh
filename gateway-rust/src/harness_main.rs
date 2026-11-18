@@ -147,7 +147,7 @@ fn stalled_tasks(
 /// translator), it leaves the running set, and the node tells the gateway
 /// on `harness.ready.<node>` with `stalled`, which fails it with the reason.
 /// Without this a wedged task held its permit until an operator stopped it
-/// (two dead tasks held mcmini's both permits for fifteen hours).
+/// (two dead tasks held node-mac's both permits for fifteen hours).
 fn spawn_stall_watchdog(
     nats: async_nats::Client,
     node: String,
@@ -424,7 +424,7 @@ pub async fn run() -> Result<()> {
                 // when idle. Taking EVERY permit proves nothing runs and
                 // keeps anything from starting; the service manager
                 // (Restart=always) brings the harness back with the new
-                // value (i658: awolf ran a whole day on a default it had
+                // value (i658: node-a ran a whole day on a default it had
                 // already been told to change). Busy: try again next minute.
                 if idle_moved {
                     if !self_restart_allowed(started_at.elapsed()) {

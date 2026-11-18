@@ -2073,7 +2073,7 @@ pub fn kiosk_teardown(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 #[cfg(test)]
 mod tests {
 
-    /// homeserver after 0.6.24: the display ran, its broker had no control
+    /// node-h after 0.6.24: the display ran, its broker had no control
     /// socket (`noo-kiosk-cdp reload` exit 6). The reload says so and names the
     /// one root command that rewrites the unit, never the uid rule.
     #[test]
@@ -3607,9 +3607,9 @@ mod seat_display_pointer_tests {
     fn a_seat_is_set_from_the_controller() {
         let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(seat_display_pointer(None, &args(&["quality", "full"])), None, "not a seat: the local path stands");
-        assert_eq!(seat_display_pointer(Some("homeserver"), &args(&["quality", "full"])).as_deref(),
-            Some("noo kiosk seats set homeserver quality full"));
-        assert_eq!(seat_display_pointer(Some("homeserver"), &args(&["quality", "bogus"])).as_deref(),
-            Some("noo kiosk seats set homeserver quality lean"));
+        assert_eq!(seat_display_pointer(Some("node-h"), &args(&["quality", "full"])).as_deref(),
+            Some("noo kiosk seats set node-h quality full"));
+        assert_eq!(seat_display_pointer(Some("node-h"), &args(&["quality", "bogus"])).as_deref(),
+            Some("noo kiosk seats set node-h quality lean"));
     }
 }

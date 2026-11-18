@@ -42,7 +42,7 @@ func TestBackendSlotsAreUnknownUnlessDeclared(t *testing.T) {
 // The harness placement carries NOO_HARNESS_KIND by design; counting slots
 // must not run it through the container env allow-list, which records a
 // refusal the operator then sees as "node refused 1 desired-state
-// instruction" on every kind change (awolf, 2026-10-24).
+// instruction" on every kind change (node-a, 2026-10-24).
 func TestBackendSlotsDoNotRefuseTheHarnessKind(t *testing.T) {
 	refusals.Reset()
 	t.Cleanup(refusals.Reset)

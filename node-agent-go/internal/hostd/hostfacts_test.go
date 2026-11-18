@@ -26,7 +26,7 @@ func write(t *testing.T, root, rel, content string) {
 // package symlink names 7.1.5 (the kernel that hung), kernelstub's EFI copy
 // is 7.0.11 (what actually boots), the previous EFI copy is 6.18.7 — which
 // has no NVIDIA module. Every fact the recovery needed, from a fake tree.
-func popOSAfterRecovery(t *testing.T) (string, *fakeRunner) {
+func ctrlAfterRecovery(t *testing.T) (string, *fakeRunner) {
 	root := t.TempDir()
 	write(t, root, "proc/sys/kernel/osrelease", "7.0.11-76070011-generic\n")
 	write(t, root, "proc/sys/net/ipv4/ip_nonlocal_bind", "1\n")
@@ -52,7 +52,7 @@ func popOSAfterRecovery(t *testing.T) (string, *fakeRunner) {
 }
 
 func TestKernelstubEntriesAreIdentifiedByContentNotBySymlink(t *testing.T) {
-	root, r := popOSAfterRecovery(t)
+	root, r := ctrlAfterRecovery(t)
 	f := CollectHostFacts(context.Background(), root, r)
 	if f.BootLoader != "kernelstub" {
 		t.Fatalf("loader = %q", f.BootLoader)
@@ -69,7 +69,7 @@ func TestKernelstubEntriesAreIdentifiedByContentNotBySymlink(t *testing.T) {
 }
 
 func TestTheFallbackWithNoNvidiaModuleIsReported(t *testing.T) {
-	root, r := popOSAfterRecovery(t)
+	root, r := ctrlAfterRecovery(t)
 	f := CollectHostFacts(context.Background(), root, r)
 	if !f.NvidiaModule["7.0.11-76070011-generic"] {
 		t.Fatal("the default kernel has its module")
@@ -80,7 +80,7 @@ func TestTheFallbackWithNoNvidiaModuleIsReported(t *testing.T) {
 }
 
 func TestPlatformPackagesHoldsAndTailscaleAreRead(t *testing.T) {
-	root, r := popOSAfterRecovery(t)
+	root, r := ctrlAfterRecovery(t)
 	f := CollectHostFacts(context.Background(), root, r)
 	if _, ok := f.Platform["vim"]; ok {
 		t.Fatal("an everyday package leaked into the platform set")
@@ -104,7 +104,7 @@ func TestPlatformPackagesHoldsAndTailscaleAreRead(t *testing.T) {
 // The silent state: data paths up, control poll failing — BackendState can
 // still say Running while Self.Online is false.
 func TestAnOfflineControlPlaneIsReportedEvenWhileRunning(t *testing.T) {
-	root, r := popOSAfterRecovery(t)
+	root, r := ctrlAfterRecovery(t)
 	r.stdout["tailscale status"] = `{"BackendState":"Running","Self":{"Online":false}}`
 	f := CollectHostFacts(context.Background(), root, r)
 	if f.TailscaleOnline == nil || *f.TailscaleOnline {
@@ -160,8 +160,8 @@ func TestPrebuiltNvidiaModuleUnderVersionedDirIsFound(t *testing.T) {
 // installed, so the facts say it. DKMS builds land in updates/dkms;
 // Ubuntu's prebuilt linux-modules-nvidia-<ver>-<kernel> in kernel/nvidia-<ver>/.
 func TestNvidiaDriverLayoutIsReported(t *testing.T) {
-	// host8: DKMS (popOSAfterRecovery plants updates/dkms for the running kernel).
-	root, r := popOSAfterRecovery(t)
+	// host8: DKMS (ctrlAfterRecovery plants updates/dkms for the running kernel).
+	root, r := ctrlAfterRecovery(t)
 	f := CollectHostFacts(context.Background(), root, r)
 	if f.NvidiaDriver != "dkms" || f.NvidiaDriverVersion != "" {
 		t.Fatalf("dkms box: driver=%q version=%q", f.NvidiaDriver, f.NvidiaDriverVersion)

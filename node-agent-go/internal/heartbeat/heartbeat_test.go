@@ -956,7 +956,7 @@ func TestModelStatsMergesTheChatModel(t *testing.T) {
 // on the FIRST heartbeat, with no reconcile pass. The ollama here is up with
 // nothing loaded (the state right after a restart); the model can only come
 // from the persisted held set.
-// The Mac shape (mcmini, 2026-11-07 on): the agent runs as the enrolling user,
+// The Mac shape (node-mac, 2026-11-07 on): the agent runs as the enrolling user,
 // the state dir stays root's and only the owned subdirs are the user's. The
 // seed must be saved and read there, so the first heartbeat after a restart
 // still names the held model. Root ignores directory modes, so as root the

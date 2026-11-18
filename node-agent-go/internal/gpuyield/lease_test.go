@@ -82,12 +82,12 @@ func heldRig(t *testing.T) (*Controller, *fakeProbe, *fakeDocker, *clock, *fakeD
 
 func TestHoldIsAnOwnedLeaseWithAGeneration(t *testing.T) {
 	c, _, d, _, _ := heldRig(t)
-	r, err := c.Hold(context.Background(), HoldRequest{Reason: "voice", Owner: "rbwolf", OperationID: "op-1", Workload: "pai-voice/voice-worker"})
+	r, err := c.Hold(context.Background(), HoldRequest{Reason: "voice", Owner: "owner", OperationID: "op-1", Workload: "pai-voice/voice-worker"})
 	if err != nil || r.State != StateHeld || len(d.stops) != 1 {
 		t.Fatalf("hold: %+v %v stops=%v", r, err, d.stops)
 	}
 	l := r.Lease
-	if l == nil || l.Owner != "rbwolf" || l.OperationID != "op-1" || l.Generation != 1 || l.Mode != ModeDrain || l.DrainedAt == "" || l.Workload != "pai-voice/voice-worker" {
+	if l == nil || l.Owner != "owner" || l.OperationID != "op-1" || l.Generation != 1 || l.Mode != ModeDrain || l.DrainedAt == "" || l.Workload != "pai-voice/voice-worker" {
 		t.Fatalf("lease: %+v", l)
 	}
 	if r.Generation != 1 {
@@ -302,7 +302,7 @@ func TestPurposeUserRidesTheLeaseAndIsAClosedSet(t *testing.T) {
 	p := &fakeProbe{r: pidReading(8000, 0)}
 	d := &fakeDocker{ctrs: []docker.GPUBackend{{Backend: "vllm", ID: vllmID, Running: true}}}
 	c := New(ConfigFromEnv(env(nil)), p, d, dir)
-	r, err := c.Hold(context.Background(), HoldRequest{OperationID: "op-u", Owner: "rbwolf", Reason: "user", Purpose: " User "})
+	r, err := c.Hold(context.Background(), HoldRequest{OperationID: "op-u", Owner: "owner", Reason: "user", Purpose: " User "})
 	if err != nil || r.Lease == nil || r.Lease.Purpose != PurposeUser {
 		t.Fatalf("purpose user: %+v %v", r.Lease, err)
 	}

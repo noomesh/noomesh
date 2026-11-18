@@ -3,7 +3,7 @@
 
 //! The "GPU services" controller row (i277e).
 //!
-//! 2026-10-28, controller pop-os: the GPU embed container failed at start
+//! 2026-10-28, controller ctrl: the GPU embed container failed at start
 //! with the CDI error "error getting device handle for index '0': Unknown
 //! Error". compose aborted the whole `up` and the controller stayed down
 //! until a reboot. The launcher now holds such a service by name and starts

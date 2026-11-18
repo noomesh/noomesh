@@ -3,7 +3,7 @@
 
 """The off-site setting reaches every backup path, and the run says what happened.
 
-2026-10-24, pop-os: `noo backups setup --set dir:/mnt/fleet/backups/...` wrote
+2026-10-24, ctrl: `noo backups setup --set dir:/mnt/fleet/backups/...` wrote
 NOO_BACKUP_OFFSITE to the checkout's .env. The scheduled backup ran through
 noo-hostd, which loads the secret store and noomesh.yaml but not plain .env
 values, so the script saw it unset, printed "offsite: not configured", exited 0,
@@ -101,7 +101,7 @@ def test_a_missing_dir_target_fails_and_nothing_is_created(tmp_path: Path) -> No
     # The parent exists and is writable (an unmounted share's mount point looks
     # exactly like this): creating the target would put the "off-site" copy on
     # the root disk and report it copied.
-    target = tmp_path / "mnt" / "noomesh-pop-os"
+    target = tmp_path / "mnt" / "noomesh-ctrl"
     (tmp_path / "mnt").mkdir()
     r = _offsite(tmp_path, f"dir:{target}")
     assert r.returncode != 0, r.stdout

@@ -294,7 +294,7 @@ pub fn applier_knows_leaf_kinds(darwin: bool, app_version: &str) -> bool {
 ///
 /// A Mac reports its `noo` binary, `noo-cli-v0.6.18+abc`. A Linux node
 /// reports the bundle its applier came in, `stack-v0.6.20+07ce5047…` (live:
-/// aserve, robopi, 0.6.20 roll). Stack and CLI tags move in lock-step since
+/// node-b, node-pi, 0.6.20 roll). Stack and CLI tags move in lock-step since
 /// 0.6.0, so both name the same applier. Reading `noo-cli-v` alone made every
 /// Linux node "unknown", and the add-on door leaves, whose floor withholds on
 /// unknown, never reached one (the 0.6.21 voice blocker). A bare `v` prefix
@@ -952,7 +952,7 @@ mod tests {
         assert_eq!(cli_version_triple(""), None);
     }
 
-    /// The live strings, 0.6.20 roll: Linux nodes (aserve, robopi) report
+    /// The live strings, 0.6.20 roll: Linux nodes (node-b, node-pi) report
     /// their applier's STACK tag with the full commit, a Mac its CLI tag,
     /// the controller a dirty dev build.
     const LINUX_0_6_20: &str = "stack-v0.6.20+07ce5047d5fd3b1e6c0a2f9d4e8b7a6c5d4e3f21";

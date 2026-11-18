@@ -1249,19 +1249,19 @@ mod tests {
             id: id.into(), platform: p, kinds: k.iter().map(|x| x.to_string()).collect(),
         };
         let nodes = [
-            n("awolf", Some(("linux", "x86_64")), &["claude-code", "codex"]),
-            n("pop-os", Some(("linux", "x86_64")), &["codex"]),
-            n("mcmini", Some(("macos", "aarch64")), &["codex"]),
-            n("robopi", Some(("linux", "aarch64")), &[]),
+            n("node-a", Some(("linux", "x86_64")), &["claude-code", "codex"]),
+            n("ctrl", Some(("linux", "x86_64")), &["codex"]),
+            n("node-mac", Some(("macos", "aarch64")), &["codex"]),
+            n("node-pi", Some(("linux", "aarch64")), &[]),
             n("nowhere", None, &["codex"]),
         ];
         let t = needed_targets(&nodes, None, None, None);
         let keys: Vec<_> = t.keys().map(|(k, o, a)| format!("{k}/{o}-{a}")).collect();
-        // robopi carries nothing, so no linux-aarch64 build is fetched.
+        // node-pi carries nothing, so no linux-aarch64 build is fetched.
         assert_eq!(keys, ["claude-code/linux-x86_64", "codex/linux-x86_64", "codex/macos-aarch64"]);
-        assert_eq!(t[&("codex".to_string(), "linux", "x86_64")], ["awolf", "pop-os"]);
+        assert_eq!(t[&("codex".to_string(), "linux", "x86_64")], ["node-a", "ctrl"]);
         let t = needed_targets(&nodes, Some("codex"), Some("macos"), None);
-        assert_eq!(t.into_values().collect::<Vec<_>>(), [vec!["mcmini".to_string()]]);
+        assert_eq!(t.into_values().collect::<Vec<_>>(), [vec!["node-mac".to_string()]]);
         assert!(needed_targets(&nodes, Some("copilot"), None, None).is_empty());
     }
 

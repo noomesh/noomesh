@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn the_lsm_comes_from_the_kernel_list_not_the_distribution() {
-        assert_eq!(active_lsm(Some("lockdown,capability,landlock,yama,apparmor,ima,evm\n")), Lsm::AppArmor, "aserve, Ubuntu 26.04");
+        assert_eq!(active_lsm(Some("lockdown,capability,landlock,yama,apparmor,ima,evm\n")), Lsm::AppArmor, "node-b, Ubuntu 26.04");
         assert_eq!(active_lsm(Some("lockdown,capability,yama,apparmor")), Lsm::AppArmor, "Debian");
         assert_eq!(active_lsm(Some("lockdown,capability,yama,selinux,bpf,landlock")), Lsm::SeLinux, "Fedora");
         assert_eq!(active_lsm(Some("capability,landlock,lockdown,yama,bpf")), Lsm::Neither, "Arch");

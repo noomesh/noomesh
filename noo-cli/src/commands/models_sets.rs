@@ -1675,7 +1675,7 @@ fn row_json(r: &Row) -> Value {
 /// The `models list --kind` table, for a terminal. A table cuts its rows
 /// at the terminal width, so what matters goes first and is short: the
 /// operator's paste lost SIZE, SIGNATURE and PROBLEM to a full
-/// `rbwolf 2026-11-08T1…` acceptance timestamp (0.6.18, i570). KIND is
+/// `owner 2026-11-08T1…` acceptance timestamp (0.6.18, i570). KIND is
 /// left out (`--kind` named it, and the header says it); the licence cell is
 /// who and the date; and every problem is ALSO printed in full below the
 /// table, so a cut row can never hide one. `--json` keeps every field whole.
@@ -1714,7 +1714,7 @@ fn set_table(rows: &[Row]) -> ([ui::Col; 7], Vec<Vec<String>>, Vec<String>) {
     (cols, cells, problems)
 }
 
-/// `rbwolf 2026-11-08T10:00:00Z` -> `rbwolf 2026-11-08`; anything else as is.
+/// `owner 2026-11-08T10:00:00Z` -> `owner 2026-11-08`; anything else as is.
 fn short_license(cell: &str) -> String {
     match cell.rsplit_once(' ') {
         Some((by, at)) if model_set::rfc3339(at) => format!("{by} {}", &at[..10]),
@@ -3743,13 +3743,13 @@ mod tests {
             via: None,
         };
         let rows = [
-            row("personal-7b", "rbwolf 2026-11-08T10:11:12Z", None),
+            row("personal-7b", "owner 2026-11-08T10:11:12Z", None),
             row("personal-voices", "NOT ACCEPTED", Some("the licence needs the operator's acceptance: noo models accept personal-voices")),
         ];
         let (cols, cells, problems) = set_table(&rows);
         let names: Vec<&str> = cols.iter().map(|c| c.name).collect();
         assert_eq!(names, ["id", "revision", "size", "signature", "licence", "digests", "problem"]);
-        assert_eq!(cells[0][4], "rbwolf 2026-11-08");
+        assert_eq!(cells[0][4], "owner 2026-11-08");
         assert_eq!(cells[1][4], "NOT ACCEPTED");
         assert_eq!(cells[0][2], "15.00 GB");
         assert_eq!(cells[0][3], "ok");

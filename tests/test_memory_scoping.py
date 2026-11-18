@@ -205,7 +205,7 @@ if __name__ == "__main__":
 
 
 def test_memory_lines_are_labelled_and_filtered():
-    """mcmini, 2026-10-16: asked about machine learning, gemma answered an
+    """node-mac, 2026-10-16: asked about machine learning, gemma answered an
     older "what can you tell me about trading" that arrived in the prompt as a
     bare line, and its own "Tool: noo_rag_query ... trading" records came back
     to steer the next search. Lines now carry date + speaker; tool rows and

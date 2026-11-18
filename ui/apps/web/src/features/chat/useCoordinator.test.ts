@@ -242,14 +242,14 @@ describe('useCoordinator', () => {
     act(() => result.current.send('q'));
     expect(last(result.current.messages).answering).toBeUndefined();
 
-    fire('onMessage', { type: 'harness_dispatched', node: 'mcmini', kind: 'copilot' });
-    expect(last(result.current.messages).answering).toEqual({ node: 'mcmini', kind: 'copilot' });
+    fire('onMessage', { type: 'harness_dispatched', node: 'node-mac', kind: 'copilot' });
+    expect(last(result.current.messages).answering).toEqual({ node: 'node-mac', kind: 'copilot' });
 
     // A harness older than 0.6.13 names no kind: the node alone.
     fire('onMessage', { type: 'done' });
     act(() => result.current.send('q2'));
-    fire('onMessage', { type: 'harness_dispatched', node: 'awolf' });
-    expect(last(result.current.messages).answering).toEqual({ node: 'awolf', kind: undefined });
+    fire('onMessage', { type: 'harness_dispatched', node: 'node-a' });
+    expect(last(result.current.messages).answering).toEqual({ node: 'node-a', kind: undefined });
   });
 
   it('collects a vendor harness working text apart from the answer', () => {
@@ -570,12 +570,12 @@ describe('useCoordinator', () => {
     vi.useFakeTimers();
     vi.setSystemTime(1_000_000);
     const { result } = inFlight();
-    fire('onMessage', { type: 'phase', phase: 'routed', node: 'mcmini', slots_busy: 2, slots_total: 2, queued_ahead: 1 });
-    expect(last(result.current.messages).phase).toMatchObject({ kind: 'routed', node: 'mcmini', since: 1_000_000 });
+    fire('onMessage', { type: 'phase', phase: 'routed', node: 'node-mac', slots_busy: 2, slots_total: 2, queued_ahead: 1 });
+    expect(last(result.current.messages).phase).toMatchObject({ kind: 'routed', node: 'node-mac', since: 1_000_000 });
 
     vi.setSystemTime(1_004_000);
     fire('onMessage', { type: 'phase', phase: 'prompt', input_tokens: 1834 });
-    expect(last(result.current.messages).phase).toMatchObject({ kind: 'prompt', node: 'mcmini', since: 1_004_000 });
+    expect(last(result.current.messages).phase).toMatchObject({ kind: 'prompt', node: 'node-mac', since: 1_004_000 });
 
     vi.setSystemTime(1_005_000);
     fire('onMessage', { type: 'thinking', text: 'hmm' });
@@ -593,14 +593,14 @@ describe('useCoordinator', () => {
 
   it('an older gateway with no phase frames still gets a routed line from harness_dispatched', () => {
     const { result } = inFlight();
-    fire('onMessage', { type: 'harness_dispatched', node: 'mcmini', kind: 'claude-code' });
-    expect(last(result.current.messages).phase).toMatchObject({ kind: 'routed', node: 'mcmini' });
+    fire('onMessage', { type: 'harness_dispatched', node: 'node-mac', kind: 'claude-code' });
+    expect(last(result.current.messages).phase).toMatchObject({ kind: 'routed', node: 'node-mac' });
   });
 
   it('a tool call, done, or error clears the phase', () => {
     for (const end of [{ type: 'tool_call', name: 'noo_cluster_status' }, { type: 'done' }, { type: 'error', text: 'x' }]) {
       const { result } = inFlight();
-      fire('onMessage', { type: 'phase', phase: 'routed', node: 'awolf' });
+      fire('onMessage', { type: 'phase', phase: 'routed', node: 'node-a' });
       fire('onMessage', end);
       expect(last(result.current.messages).phase).toBeUndefined();
     }

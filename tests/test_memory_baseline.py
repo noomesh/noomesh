@@ -269,7 +269,7 @@ def test_the_report_renders_a_measured_cell_and_a_missing_one_as_not_measured(tm
     assert f"**{LABEL}**" in md and "| noo-ollama | node |" in md and "| noo-gateway | controller |" in md
     assert "(1 of 3 measured)" in md and "Omitted: " in md
     assert ("fleet, read-only: on 0.6.24+ each node agent exports its own process_resident_memory_bytes and "
-            "noo_unit_memory_bytes (#1026); real-hardware node figures (robopi, the Mac) are read from the "
+            "noo_unit_memory_bytes (#1026); real-hardware node figures (node-pi, the Mac) are read from the "
             "metrics door, no manual measurement.") in md
     j = SIZE.memory_json(cells)
     assert j["node_share_label"] == LABEL

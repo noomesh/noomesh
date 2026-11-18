@@ -9,7 +9,7 @@
 //! (`mcp_session.rs`): `initialize` opened one, the client echoed its id,
 //! and `noo_agent_name` renamed it. The 2026-07-28 MCP revision has no
 //! `initialize`, so a modern client (Claude Code from 2.1.3xx) never holds
-//! a session: every call fell to the per-key label (`rbwolf/self-rbwolf`)
+//! a session: every call fell to the per-key label (`owner/self-owner`)
 //! and `noo_agent_name` answered "no live MCP session". Nothing about a
 //! connection can carry a mailbox any more, so nothing here depends on one.
 //!
@@ -248,7 +248,7 @@ pub fn parse_as(raw: &str, account: &str) -> Result<String, AsRefusal> {
 }
 
 /// Resolve `as` to a registered, unretired label of `account`. The key's
-/// own per-key label (`self-rbwolf`) is always its own mailbox.
+/// own per-key label (`self-owner`) is always its own mailbox.
 pub async fn resolve_as(db: &PgPool, account: &str, consumer: &str, ty: &str, raw: &str) -> Result<String, AsRefusal> {
     let part = parse_as(raw, account)?;
     if let Some(own) = crate::auth::connection_label(consumer).filter(|l| l.eq_ignore_ascii_case(&part)) {
@@ -602,8 +602,8 @@ pub enum DoorStep {
 }
 
 /// The one mailbox step both doors take before running a tool.
-/// `consumer` is the door's session consumer (`self:rbwolf`,
-/// `operator:rbwolf`); `legacy_label` the label of a live legacy session.
+/// `consumer` is the door's session consumer (`self:owner`,
+/// `operator:owner`); `legacy_label` the label of a live legacy session.
 pub async fn door_step(
     db: &PgPool,
     account: &str,
@@ -696,17 +696,17 @@ mod tests {
     /// a non-existent foreign account read the same, and no lookup runs.
     #[test]
     fn as_names_only_your_own_account_and_says_nothing_else() {
-        assert_eq!(parse_as("general", "rbwolf"), Ok("general".into()));
-        assert_eq!(parse_as("claude-general", "rbwolf"), Ok("claude-general".into()));
-        assert_eq!(parse_as("rbwolf/claude-general", "rbwolf"), Ok("claude-general".into()));
-        for foreign in ["bob/claude-general", "nosuchaccount/x", "RBWOLF/claude-general", "/claude-general"] {
-            let e = parse_as(foreign, "rbwolf").unwrap_err();
+        assert_eq!(parse_as("general", "owner"), Ok("general".into()));
+        assert_eq!(parse_as("claude-general", "owner"), Ok("claude-general".into()));
+        assert_eq!(parse_as("owner/claude-general", "owner"), Ok("claude-general".into()));
+        for foreign in ["bob/claude-general", "nosuchaccount/x", "OWNER/claude-general", "/claude-general"] {
+            let e = parse_as(foreign, "owner").unwrap_err();
             assert_eq!(e, AsRefusal::NotYours, "{foreign}");
             assert_eq!(e.message(), NOT_YOURS);
             assert!(!e.message().contains("bob") && !e.message().contains("nosuch"), "the refusal names nothing of the other account");
         }
-        assert!(matches!(parse_as("a b", "rbwolf"), Err(AsRefusal::Invalid(_))));
-        assert!(matches!(parse_as("", "rbwolf"), Err(AsRefusal::Invalid(_))));
+        assert!(matches!(parse_as("a b", "owner"), Err(AsRefusal::Invalid(_))));
+        assert!(matches!(parse_as("", "owner"), Err(AsRefusal::Invalid(_))));
     }
 
     #[test]
@@ -720,9 +720,9 @@ mod tests {
 
     #[test]
     fn the_client_type_comes_from_the_session_then_the_user_agent() {
-        assert_eq!(client_type("self:rbwolf", Some("claude-code/2.1.322 (cli)"), None), "claude");
-        assert_eq!(client_type("self:rbwolf", Some("Python-urllib/3.12"), Some("claude-general")), "claude");
-        assert_eq!(client_type("rbwolf-mcp-user", Some("codex_cli_rs/0.40"), None), "codex");
+        assert_eq!(client_type("self:owner", Some("claude-code/2.1.322 (cli)"), None), "claude");
+        assert_eq!(client_type("self:owner", Some("Python-urllib/3.12"), Some("claude-general")), "claude");
+        assert_eq!(client_type("owner-mcp-user", Some("codex_cli_rs/0.40"), None), "codex");
     }
 
     #[test]

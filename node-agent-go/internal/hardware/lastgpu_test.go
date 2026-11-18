@@ -13,7 +13,7 @@ import (
 // noomesh-internal i575: after an agent restart, a probe that times out at
 // registration must register the GPU this node last had, not 0 GB. The
 // controller derives the tier from vram_gb, and a 0 GB registration changed
-// awolf's vLLM context and reloaded it twice.
+// node-a's vLLM context and reloaded it twice.
 func TestABootProbeThatFailsRegistersTheLastKnownGPU(t *testing.T) {
 	cfg := &config.Config{GPUModel: "RTX 3080 Laptop", StateDir: t.TempDir()}
 	if _, err := DetectAtBoot(cfg, fakeGPU{vram: 16, count: 1, model: "RTX 3080 Laptop"}); err != nil {

@@ -4,7 +4,7 @@
 /**
  * What an in-flight turn is doing before its first answer token, so the
  * bubble never sits on a bare cursor (operator, 2026-11-01: a turn showed
- * "answering on mcmini ▍" with nothing else while it queued).
+ * "answering on node-mac ▍" with nothing else while it queued).
  *
  * The gateway sends `phase` frames (`routed`, `prompt`); `thinking` and the
  * first token are read off frames the console already gets. Every phase is

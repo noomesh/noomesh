@@ -1094,19 +1094,19 @@ mod tests {
     async fn what_served_is_on_the_trace_from_commit_with_or_without_usage() {
         note_served(Some("node-a"), "vllm", "m"); // no request in scope: nothing to note on
         let dropped = Arc::new(Recorder::new(&Method::POST, "/api/external/chat/completions".into(), None, None));
-        CURRENT.scope(dropped.clone(), async { note_served(Some("mcmini"), "ollama", "gemma4:12b") }).await;
+        CURRENT.scope(dropped.clone(), async { note_served(Some("node-mac"), "ollama", "gemma4:12b") }).await;
         let s = dropped.summary();
-        assert_eq!((s.node.as_deref(), s.backend.as_deref(), s.model.as_deref()), (Some("mcmini"), Some("ollama"), Some("gemma4:12b")));
+        assert_eq!((s.node.as_deref(), s.backend.as_deref(), s.model.as_deref()), (Some("node-mac"), Some("ollama"), Some("gemma4:12b")));
         assert_eq!((s.prompt_tokens, s.completion_tokens), (0, 0), "no usage, no tokens");
         let finished = Arc::new(Recorder::new(&Method::POST, "/v1/chat/completions".into(), None, None));
         CURRENT
             .scope(finished.clone(), async {
-                note_served(Some("awolf"), "vllm", "gemma");
-                note_usage(Some("awolf"), "vllm", "gemma", 4100, 64);
+                note_served(Some("node-a"), "vllm", "gemma");
+                note_usage(Some("node-a"), "vllm", "gemma", 4100, 64);
             })
             .await;
         let s = finished.summary();
-        assert_eq!((s.node.as_deref(), s.backend.as_deref(), s.prompt_tokens, s.completion_tokens), (Some("awolf"), Some("vllm"), 4100, 64));
+        assert_eq!((s.node.as_deref(), s.backend.as_deref(), s.prompt_tokens, s.completion_tokens), (Some("node-a"), Some("vllm"), 4100, 64));
     }
 
     #[tokio::test]
@@ -1144,8 +1144,8 @@ mod tests {
     async fn a_door_call_is_recorded_under_its_keys_actor() {
         let machine = crate::service_keys::Consumer::all("trellion-x");
         let mut bound = crate::service_keys::Consumer::all("cli-door");
-        bound.user = Some("rbwolf".into());
-        for (consumer, actor, kind) in [(machine, "internal:key:trellion-x", "internal"), (bound, "rbwolf", "user")] {
+        bound.user = Some("owner".into());
+        for (consumer, actor, kind) in [(machine, "internal:key:trellion-x", "internal"), (bound, "owner", "user")] {
             let rec = Arc::new(Recorder::new(&Method::POST, "/mcp/operator".into(), None, None));
             CURRENT
                 .scope(rec.clone(), async {

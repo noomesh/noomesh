@@ -185,7 +185,7 @@ pub const LOST: &str = "tunnel_lost";
 /// Is this answer the door's own pre-head `tunnel_lost` 502? Then the node
 /// sent nothing back and the caller has received nothing: an inference
 /// call may be sent again, to the same node after a wait or to another
-/// (live, 0.6.26 roll, 2026-11-17T17:01:09Z: a chat 502 while awolf's agent
+/// (live, 0.6.26 roll, 2026-11-17T17:01:09Z: a chat 502 while node-a's agent
 /// restarted; the backend answered again 0.7 s later). A tunnel that drops
 /// MID-stream is never this: its 200 head already left, and the body ends
 /// short. Keyed on the door's header, which a plain HTTPS backend does not
@@ -286,12 +286,12 @@ mod tests {
     /// (0.6.26 roll, ref-0fe0d2de82).
     #[tokio::test]
     async fn the_doors_pre_head_loss_and_nothing_else_is_the_rule() {
-        let lost = error_response(StatusCode::BAD_GATEWAY, LOST, "tunnel_lost: the tunnel to node awolf dropped (the connection failed)".into());
+        let lost = error_response(StatusCode::BAD_GATEWAY, LOST, "tunnel_lost: the tunnel to node node-a dropped (the connection failed)".into());
         assert!(lost_before_head(lost.status().as_u16(), lost.headers()));
         let body = axum::body::to_bytes(lost.into_body(), 4096).await.expect("body");
         assert_eq!(
             std::str::from_utf8(&body).expect("utf8"),
-            r#"{"detail":"tunnel_lost: the tunnel to node awolf dropped (the connection failed)","error":"tunnel_lost"}"#
+            r#"{"detail":"tunnel_lost: the tunnel to node node-a dropped (the connection failed)","error":"tunnel_lost"}"#
         );
         // The door's other answers are not a lost tunnel.
         let busy = error_response(StatusCode::SERVICE_UNAVAILABLE, "tunnel_busy", "full".into());
@@ -313,8 +313,8 @@ mod tests {
     fn the_door_path_is_node_and_the_untouched_rest() {
         let (n, t) = parse_target("/host9/v1/chat/completions", Some("a=1&b=%2F")).unwrap();
         assert_eq!((n.as_str(), t.as_str()), ("host9", "/v1/chat/completions?a=1&b=%2F"));
-        let (n, t) = parse_target("/pop%2Dos/api/containers/x/proxy/a%2Fb", None).unwrap();
-        assert_eq!((n.as_str(), t.as_str()), ("pop-os", "/api/containers/x/proxy/a%2Fb"), "the rest keeps its percent-encoding");
+        let (n, t) = parse_target("/ct%72l/api/containers/x/proxy/a%2Fb", None).unwrap();
+        assert_eq!((n.as_str(), t.as_str()), ("ctrl", "/api/containers/x/proxy/a%2Fb"), "the rest keeps its percent-encoding");
         assert_eq!(parse_target("/host9", None).unwrap().1, "/");
         assert!(parse_target("//gpu", None).is_none(), "an empty node id");
         assert!(parse_target("/", None).is_none());

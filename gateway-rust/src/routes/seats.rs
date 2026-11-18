@@ -693,7 +693,7 @@ async fn seat_bundle_status(
 ///
 /// `Ok(None)` means no row: the seat is not enrolled. A database error is a
 /// 503 that names it, never "no cert": on 2026-11-02 a gateway out of file
-/// descriptors refused the homeserver seat as `NoBirthCert` and told the
+/// descriptors refused the node-h seat as `NoBirthCert` and told the
 /// operator to re-enroll a seat whose row was there all along.
 /// The seat's birth certificate and, when it was revoked, when.
 type SeatCert = (String, Option<chrono::DateTime<chrono::Utc>>);
@@ -1171,17 +1171,17 @@ mod tests {
 
     /// A database that cannot answer is a 503 naming the error, never the
     /// `NoBirthCert` 403 that tells the operator to re-enroll (2026-11-02:
-    /// the homeserver seat, a gateway out of file descriptors).
+    /// the node-h seat, a gateway out of file descriptors).
     #[tokio::test]
     async fn an_unreadable_seat_cert_is_a_503_not_no_birth_cert() {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .acquire_timeout(std::time::Duration::from_millis(200))
             .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
             .expect("lazy pool");
-        let got = check_seat_proof(&pool, &HeaderMap::new(), Purpose::SeatHeartbeat, "homeserver", "abc").await;
+        let got = check_seat_proof(&pool, &HeaderMap::new(), Purpose::SeatHeartbeat, "node-h", "abc").await;
         match got {
             Err(AppError::Unavailable(m)) => {
-                assert!(m.contains("cannot read the birth certificate recorded for seat 'homeserver'"), "{m}");
+                assert!(m.contains("cannot read the birth certificate recorded for seat 'node-h'"), "{m}");
                 assert!(!m.contains("re-enroll") && !m.contains("NoBirthCert"), "{m}");
             }
             other => panic!("expected a 503, got {other:?}"),
@@ -1267,7 +1267,7 @@ mod seat_binding_tests {
     /// anything else is no claim at all.
     #[test]
     fn a_tailnet_claim_is_a_plain_host_label() {
-        assert_eq!(tailnet_claim(&json!({"tailnet": {"name": "Homeserver-1", "ip": "100.64.0.9"}})).as_deref(), Some("homeserver-1"));
+        assert_eq!(tailnet_claim(&json!({"tailnet": {"name": "Node-h-1", "ip": "100.64.0.9"}})).as_deref(), Some("node-h-1"));
         for bad in [json!({}), json!({"tailnet": {}}), json!({"tailnet": {"name": ""}}),
                     json!({"tailnet": {"name": "a.b"}}), json!({"tailnet": {"name": "-x"}}),
                     json!({"tailnet": {"name": "x y"}}), json!({"tailnet": {"name": "a".repeat(64)}})] {
@@ -1298,7 +1298,7 @@ mod seat_binding_tests {
         }
         let receipt = crate::test_src::fn_body(&own, "async fn staged_seat_sha(");
         assert!(receipt.contains("crate::bundle_etag::cached_sha(&tag, current)"), "the receipt hashes in Postgres every time");
-        assert_ne!(super::seat_etag_key("homeserver"), "homeserver", "a seat would share a node's cache entry");
+        assert_ne!(super::seat_etag_key("node-h"), "node-h", "a seat would share a node's cache entry");
         assert!(crate::test_src::fn_body(&own, "async fn seat_bundle_put(").contains("crate::bundle_etag::forget(&seat_etag_key(&seat))"));
     }
 

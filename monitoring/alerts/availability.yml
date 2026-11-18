@@ -25,7 +25,7 @@ groups:
           summary: "PAI gateway is not reporting up"
           description: "noo_gateway_up is absent or 0 for >1m — the gateway may be down."
 
-      # 2026-11-02: the pop-os gateway reached RLIMIT_NOFILE (1024) after ~45 h
+      # 2026-11-02: the ctrl gateway reached RLIMIT_NOFILE (1024) after ~45 h
       # and could not read its secrets or reach Postgres for five hours.
       # The gateway exports both gauges (fd_watch.rs) and alerts on its own;
       # this rule is the same 70% line, from outside the process.

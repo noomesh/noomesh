@@ -517,7 +517,7 @@ func TestVLLMServesPlainInsideItsDoor(t *testing.T) {
 // container's own port; the image order tries a built stunnel before the
 // alpine fallback; no host port is ever published.
 func TestSidecarSpec(t *testing.T) {
-	conf := stunnelConf("llamacpp", "noo-stunnel-llamacpp", 8085, 8085, "awolf")
+	conf := stunnelConf("llamacpp", "noo-stunnel-llamacpp", 8085, 8085, "node-a")
 	for _, needle := range []string{
 		"verify = 2", "accept = noo-stunnel-llamacpp:8085", "connect = 127.0.0.1:8085",
 		"cert = /tls/services/llamacpp/service.crt", "key = /tls/services/llamacpp/service.key",
@@ -617,7 +617,7 @@ func TestTheSidecarIsTheOnlyDoor(t *testing.T) {
 		if got, want := DoorNetworkMode(b), "container:"+SidecarContainerFor(b); got != want {
 			t.Errorf("%s network mode %q, want %q", b, got, want)
 		}
-		conf := stunnelConf(SidecarFor(b), SidecarContainerFor(b), DoorPort(b), 1234, "awolf")
+		conf := stunnelConf(SidecarFor(b), SidecarContainerFor(b), DoorPort(b), 1234, "node-a")
 		if strings.Contains(conf, "0.0.0.0") || !strings.Contains(conf, "accept = "+SidecarContainerFor(b)+":") ||
 			!strings.Contains(conf, "connect = 127.0.0.1:1234") {
 			t.Errorf("%s conf:\n%s", b, conf)
@@ -808,14 +808,14 @@ func TestTheDoorAdmitsNamedCallersOnly(t *testing.T) {
 		t.Fatalf("BackendDoorGeneration = %d: a door started unpinned would never be recreated", BackendDoorGeneration)
 	}
 	for _, b := range []string{"llamacpp", "ollama", "embedding", "reranker"} {
-		conf := stunnelConf(SidecarFor(b), SidecarContainerFor(b), DoorPort(b), 1234, "awolf")
+		conf := stunnelConf(SidecarFor(b), SidecarContainerFor(b), DoorPort(b), 1234, "node-a")
 		var pins []string
 		for _, l := range strings.Split(conf, "\n") {
 			if v, ok := strings.CutPrefix(l, "checkHost = "); ok {
 				pins = append(pins, v)
 			}
 		}
-		want := []string{"awolf", "gateway", "worker", "trellion", "trellion-intel", "evolve"}
+		want := []string{"node-a", "gateway", "worker", "trellion", "trellion-intel", "evolve"}
 		if strings.Join(pins, ",") != strings.Join(want, ",") {
 			t.Errorf("%s pins %v, want %v:\n%s", b, pins, want, conf)
 		}
@@ -849,9 +849,9 @@ func TestDoorSelfNameReadsTheAgentLeaf(t *testing.T) {
 		}
 		return p
 	}
-	t.Setenv("NOO_TLS_CERT", write([]string{"robopi", "localhost", "node-agent"}))
-	if got, err := doorSelfName(); err != nil || got != "robopi" {
-		t.Fatalf("doorSelfName() = %q, %v; want robopi", got, err)
+	t.Setenv("NOO_TLS_CERT", write([]string{"node-pi", "localhost", "node-agent"}))
+	if got, err := doorSelfName(); err != nil || got != "node-pi" {
+		t.Fatalf("doorSelfName() = %q, %v; want node-pi", got, err)
 	}
 	t.Setenv("NOO_TLS_CERT", write([]string{"localhost", "node-agent"}))
 	if _, err := doorSelfName(); err == nil {

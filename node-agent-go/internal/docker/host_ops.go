@@ -284,7 +284,7 @@ func (c *Client) EnsureHostDir(ctx context.Context, dir, owner string) error {
 // chownWarned remembers the (dir, owner) pairs whose "cannot chown" warning has
 // been logged. EnsureHostDir runs every reconcile tick (5 min), the agent is
 // unprivileged, and on WSL2 the data root is owned by another uid, so the same
-// chown failed and logged forever (awolf, 2026-10) and drowned real faults.
+// chown failed and logged forever (node-a, 2026-10) and drowned real faults.
 var chownWarned sync.Map
 
 // chownHostDir makes dir owned by uid:gid when it is not already, and never

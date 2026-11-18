@@ -243,7 +243,7 @@ pub fn decide(backend: &str, env: &Value, model: &str, node: &Value, profile_con
 /// Never decide below what the daemon already runs the model at (when that
 /// is within the declaration): the box holds it today, and an unmeasured
 /// model's conservative cache figure must not shrink a working context on
-/// the roll (mcmini runs gemma4:12b at its tier's 32768 from the plist).
+/// the roll (node-mac runs gemma4:12b at its tier's 32768 from the plist).
 pub fn held_at_running(fit: Fit, declared: u64, running: Option<u64>) -> Fit {
     match running.filter(|r| *r > fit.tokens && *r <= declared) {
         Some(r) => Fit { tokens: r, capped: Some(format!("kept at the {r} it already runs (the fit alone said {}: {})", fit.tokens, fit.capped.unwrap_or_default())) },

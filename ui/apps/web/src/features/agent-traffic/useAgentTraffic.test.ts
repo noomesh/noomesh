@@ -60,10 +60,10 @@ describe('agent traffic', () => {
 
   it('never counts the thread address as a participant', () => {
     const t = parseThreads({
-      threads: [{ thread_id: 't', messages: 2, started: 'a', last: 'b', senders: ['rbwolf/op'], recipients: ['thread', 'rbwolf/codex'] }],
+      threads: [{ thread_id: 't', messages: 2, started: 'a', last: 'b', senders: ['owner/op'], recipients: ['thread', 'owner/codex'] }],
     });
-    expect(t[0].participants).toEqual(['rbwolf/codex', 'rbwolf/op']);
+    expect(t[0].participants).toEqual(['owner/codex', 'owner/op']);
     expect(recipientLabel('thread')).toEqual({ text: 'the thread', isThread: true });
-    expect(recipientLabel('rbwolf/codex')).toEqual({ text: 'rbwolf/codex', isThread: false });
+    expect(recipientLabel('owner/codex')).toEqual({ text: 'owner/codex', isThread: false });
   });
 });

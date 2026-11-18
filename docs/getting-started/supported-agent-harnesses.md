@@ -381,7 +381,7 @@ both numbers. A model neither declares has no ceiling. A vLLM model whose
 - **Below the floor × 1.25:** placed, with a `tight` warning.
 - **Floor not declared:** never refused. Codex and Claude Code's slim launch
   are not measured yet. Copilot and Claude Code carry 16 385, the lower bound
-  vLLM reported on awolf on 2026-10-24, until the probe measures them.
+  vLLM reported on node-a on 2026-10-24, until the probe measures them.
 
 Other flags: `--cli <absolute path>` (default: the kind's `cli` on PATH),
 `--test reply|file|both` (default `both`), `--prompt full|slim` (Claude

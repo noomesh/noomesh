@@ -5,7 +5,7 @@
 # lib-stuck-container.sh — one unkillable container must not take the whole
 # stack down.
 #
-# The incident (controller pop-os, 2026-10-20, rolling 0.6.6 -> 0.6.7):
+# The incident (controller ctrl, 2026-10-20, rolling 0.6.6 -> 0.6.7):
 # `noo-ollama-embed`'s process survived `kill -9` and a docker restart (stuck
 # in the kernel; only a reboot clears it). `docker compose up --force-recreate`
 # tried to stop it, got
@@ -20,7 +20,7 @@
 # service (explicit list from `config --services`, --no-deps so a service
 # that depends on the stuck one cannot drag compose back into it).
 #
-# The second shape (controller pop-os, 2026-10-28, i277e): the GPU did not
+# The second shape (controller ctrl, 2026-10-28, i277e): the GPU did not
 # answer when a GPU service's container started —
 #     error getting device handle for index '0': Unknown Error
 # (CDI / nvidia-container-cli). compose aborted the same way and the gateway,

@@ -4441,7 +4441,7 @@ pub(crate) fn storage_base(name: &str, target: &Path) -> PathBuf {
 /// ([`subdir_owner`]) when it has one; for the node agent's write targets
 /// ([`agent_subdir`]) the `noo-agent` account when the host has one; else
 /// whoever owns the root it sits under, read BEFORE anything is created. A root the operator owns gives
-/// the operator; a root owned by the node agent (pop-os: 993:982, as its
+/// the operator; a root owned by the node agent (ctrl: 993:982, as its
 /// `models`) gives the node agent. Onboarding's storage step, its sudo path
 /// and the stack roll (`noo upgrade`, including a lock-only directory) all
 /// ask here, so no two places decide differently.
@@ -4568,7 +4568,7 @@ pub(crate) fn missing_components(base: &Path, name: &str) -> Vec<PathBuf> {
 /// The sudo fallback for one storage directory, as `install -d` argument
 /// lists: one per MISSING component (GNU `install -d -o -g -m` re-owns and
 /// re-modes a directory that already exists, so an existing parent such as
-/// pop-os's 993:982 `models` must never be passed), each with its owner: the
+/// ctrl's 993:982 `models` must never be passed), each with its owner: the
 /// leaf its [`intended_owner`], a parent the root's owner.
 pub(crate) fn sudo_install_plan(name: &str, target: &Path) -> std::io::Result<Vec<Vec<String>>> {
     let base = storage_base(name, target);
@@ -10161,12 +10161,12 @@ mod storage_owner_tests {
         let _ = std::fs::remove_dir_all(&b);
     }
 
-    /// pop-os 2026-11-05: root 993:982, models 993:982, the voice dirs
+    /// ctrl 2026-11-05: root 993:982, models 993:982, the voice dirs
     /// missing, tempo missing. The sudo path gives each its owner and never
     /// touches `models`.
     #[test]
     fn the_pop_os_layout_gets_its_owners() {
-        let b = base("popos");
+        let b = base("ctrl");
         std::fs::create_dir_all(b.join("models")).unwrap();
         let agent = (993, 982);
         let plan = sudo_install_plan_with("models/voice/piper", &b.join("models/voice/piper"), agent, agent);

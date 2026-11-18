@@ -983,7 +983,7 @@ const AGENT_STATE_DIR: &str = "/var/lib/noo-node-agent";
 /// hostd spool, the log-ship spill ring, the image staging area, and the held
 /// model seed (node-agent-go backendrt/heldstate.go `heldStateDir`). The seed
 /// was written into the state dir's root, which stays root's, so every save
-/// on a Mac failed (mcmini, since 2026-11-07) and a restarted Mac agent never
+/// on a Mac failed (node-mac, since 2026-11-07) and a restarted Mac agent never
 /// had it (i418).
 const AGENT_OWNED_DIRS: &[&str] = &["spool", "logship", "staging", "held"];
 
@@ -2903,7 +2903,7 @@ fn verify_bundle_with(stage: &Path, ca: &Path, ca_pub: &Path, node: &str, self_u
     // kind or env key is validated. Refusing first was a deadlock twice over:
     // host6 sat on noo-cli-v0.5.35 from the day `harness-binary` was added
     // (2026-09-19), refusing on every tick the very bundle that would have
-    // taught it the kind; mcmini on noo-cli-v0.6.9 refused the 0.6.10 bundle
+    // taught it the kind; node-mac on noo-cli-v0.6.9 refused the 0.6.10 bundle
     // outright (2026-10-23) because its agent-env named `NODE_AGENT_BIND`,
     // a key its allow-list predated — and the unknown-kind trigger below
     // never fired, since every KIND was known.
@@ -3929,7 +3929,7 @@ mod tests {
         assert!(a.find("next_floor(").unwrap() > a.find("bundle apply incomplete").unwrap(), "the floor rises before the apply succeeded");
     }
 
-    /// mcmini on noo-cli-v0.6.9 refused the 0.6.10 bundle with exit 65
+    /// node-mac on noo-cli-v0.6.9 refused the 0.6.10 bundle with exit 65
     /// (`NODE_AGENT_BIND` unknown to its env allow-list) and never reached the
     /// CLI that bundle carried: the self-update only ran on an unknown KIND.
     /// It now runs before any kind or env key is judged, as noo-apply.sh §1b.

@@ -53,9 +53,9 @@ says so when the catalogue moved. Tools from bridged MCP servers
 Each session has its own agent name, `<account>/<type>-<session>`: the type
 is your client (`claude`, `codex`, `cursor`, `gemini`, else the name your
 client reports, else your key's label) and the session part is random, so a
-second window is `rbwolf/claude-k3x9qa` beside `rbwolf/claude-7fz2mb`.
+second window is `owner/claude-k3x9qa` beside `owner/claude-7fz2mb`.
 `noo_agent_whoami` tells a session its name, and `noo_agent_name` replaces the
-random part with one you choose (`name="general"` → `rbwolf/claude-general`),
+random part with one you choose (`name="general"` → `owner/claude-general`),
 so other sessions can address it by a name that means something. A name is a
 mailbox: a session that claims a name another live session of your account
 holds shares it, which is how one window's connections and its inbox hook

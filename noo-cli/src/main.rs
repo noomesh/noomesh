@@ -2425,7 +2425,7 @@ const SOURCES: &[(&str, &str)] = &[
             }
             other => panic!("not native: {other:?}"),
         }
-        let (g, _) = resolve(&argv(&["cluster", "gpu", "hold", "awolf", "--timeout", "45"]));
+        let (g, _) = resolve(&argv(&["cluster", "gpu", "hold", "node-a", "--timeout", "45"]));
         assert_eq!(g.timeout_secs, None);
         // A global --timeout BEFORE the subcommand still is the global one.
         let (g, r) = resolve(&argv(&["--timeout", "5", "cluster", "reserve", "pai-voice/voice-worker"]));

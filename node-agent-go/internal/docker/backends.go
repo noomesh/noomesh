@@ -175,7 +175,7 @@ type BackendSpec struct {
 	// ReadOnlyRoot runs the container on a read-only root filesystem with a
 	// tmpfs /tmp (rootFloor). Set only for an image whose write set was
 	// measured empty outside its mounts (`docker diff` on a running
-	// container): llama-server (awolf, 2026-10-28, a day of serving: no
+	// container): llama-server (node-a, 2026-10-28, a day of serving: no
 	// write). vLLM, ollama and TEI write caches into their image paths and
 	// are not set until measured with a writable cache mount (i301).
 	ReadOnlyRoot bool
@@ -1907,7 +1907,7 @@ func ContainerNameFor(backend string) string {
 // The controller never sends these images (routes/cluster.rs
 // backend_image_ref: "the node derives its own release ref"), so the
 // placement's Image is empty and the spec hash did not change when the node
-// rolled: awolf ran noo-llamacpp on v0.6.12 after the 0.6.13 roll, with
+// rolled: node-a ran noo-llamacpp on v0.6.12 after the 0.6.13 roll, with
 // llamacpp:v0.6.13 staged on the rail. reconcile.specHash folds this in.
 func ReleaseBackendImage(backend string) string {
 	prefix, tag := os.Getenv("NOO_IMAGE_PREFIX"), os.Getenv("NOO_IMAGE_TAG")

@@ -17,7 +17,7 @@ import (
 // enrolling user; the root applier keeps the root 0:0 because root-written
 // trust files live there, and hands the user only named subdirs,
 // noo-cli node_fetch.rs AGENT_OWNED_DIRS). Written into the state dir's root,
-// every save on a Mac failed with permission denied (mcmini, since
+// every save on a Mac failed with permission denied (node-mac, since
 // 2026-11-07), so a restarted Mac agent never had its seed (i418).
 const (
 	heldStateDir  = "held"

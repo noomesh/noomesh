@@ -42,7 +42,7 @@ pub const MAX_WAIT: Duration = Duration::from_secs(30);
 pub const DEFAULT_WAIT: Duration = Duration::from_secs(5);
 /// How many calls may wait on one node at once; past it a call fails at
 /// once with the node's 503 and Retry-After. ~1-2 chat calls/s at peak on
-/// awolf (98k in 7 days) times a 30 s drain.
+/// node-a (98k in 7 days) times a 30 s drain.
 pub const MAX_WAITERS_PER_NODE: usize = 32;
 
 /// Is this answer a node agent's restart refusal? Then how long to wait

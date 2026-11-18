@@ -11,7 +11,7 @@ import (
 
 // Proposal i935: a roll that only re-tags an image recreates nothing. The
 // 0.6.24-0.6.26 locks pin the same ollama and stunnel digests; the spec hash
-// keyed the tags, so every roll recreated aserve's and robopi's Ollama twice.
+// keyed the tags, so every roll recreated node-b's and node-pi's Ollama twice.
 
 const (
 	dOllama  = "sha256:dd46912abd4946a5c580c4a85883a559736b48f6f2c4e24162b77b307b74ea9f"

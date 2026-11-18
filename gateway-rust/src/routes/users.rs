@@ -6019,13 +6019,13 @@ mod key_policy_setter_tests {
 
     #[test]
     fn a_person_sets_it_and_no_key_or_agent_does() {
-        assert!(person_sets_key_policy(origin_of_requester(Some(&ctx("rbwolf", None, None)))).is_ok(), "the operator, CLI or console");
+        assert!(person_sets_key_policy(origin_of_requester(Some(&ctx("owner", None, None)))).is_ok(), "the operator, CLI or console");
         for (who, c) in [
-            ("a token exchanged from a key", ctx("rbwolf", None, Some("key:paiserve"))),
+            ("a token exchanged from a key", ctx("owner", None, Some("key:paiserve"))),
             ("an add-on's exchanged token", ctx("addon:example", None, None)),
             ("a service identity", ctx("svc:grafana", None, None)),
-            ("a harness door", ctx("rbwolf", Some("claude-code"), None)),
-            ("a delegated credential", ctx("rbwolf", None, Some("worker:run-1"))),
+            ("a harness door", ctx("owner", Some("claude-code"), None)),
+            ("a delegated credential", ctx("owner", None, Some("worker:run-1"))),
         ] {
             let refused = person_sets_key_policy(origin_of_requester(Some(&c)));
             assert!(matches!(refused, Err(crate::routes::AppError::Forbidden(_))), "{who} must be refused");

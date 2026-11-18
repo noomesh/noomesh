@@ -3633,7 +3633,7 @@ pub(crate) struct RolloutTargets {
 /// first bundle; that bundle needs the signing key, and the key went only
 /// to registered nodes. A first-time pull node could therefore never be
 /// provisioned (i545 finding 102, an outside tester's second machine: three
-/// good redeems, `'pop-os' is not a registered node` every time). Our fleet
+/// good redeems, `'ctrl' is not a registered node` every time). Our fleet
 /// never hit it because every node adopted before the rule existed.
 ///
 /// The answer is yes only for the node's NEWEST redeemed record, and only
@@ -4984,19 +4984,19 @@ mod tests {
 
     #[test]
     fn a_named_first_time_pull_node_with_a_live_enrollment_is_a_rollout_target() {
-        let toks = vec![tok("pop-os", Some("2026-11-07T10:00:00Z"), "PEM", false)];
-        let names = super::rollout_names(v(&["controller"]), Some("pop-os"), &toks);
-        assert_eq!(names, v(&["controller", "pop-os"]));
+        let toks = vec![tok("ctrl", Some("2026-11-07T10:00:00Z"), "PEM", false)];
+        let names = super::rollout_names(v(&["controller"]), Some("ctrl"), &toks);
+        assert_eq!(names, v(&["controller", "ctrl"]));
         // provision issued its certs first on 0.6.17 (finding 99): that
         // directory is the node's own material now, not a forgotten node's.
-        let t = super::split_rollout_targets(&names, &v(&["pop-os"]), "controller", Some("pop-os"));
-        assert_eq!(t.nodes, v(&["pop-os"]));
+        let t = super::split_rollout_targets(&names, &v(&["ctrl"]), "controller", Some("ctrl"));
+        assert_eq!(t.nodes, v(&["ctrl"]));
         assert!(t.orphaned.is_empty(), "an enrolled node's PKI dir was called orphaned: {:?}", t.orphaned);
     }
 
     #[test]
     fn a_whole_fleet_rollout_never_sweeps_in_an_enrollment() {
-        let toks = vec![tok("pop-os", Some("2026-11-07T10:00:00Z"), "PEM", false)];
+        let toks = vec![tok("ctrl", Some("2026-11-07T10:00:00Z"), "PEM", false)];
         assert_eq!(super::rollout_names(v(&["host3"]), None, &toks), v(&["host3"]));
     }
 
@@ -5005,25 +5005,25 @@ mod tests {
         let used = Some("2026-11-07T10:00:00Z");
         let cases: Vec<(&str, Vec<serde_json::Value>)> = vec![
             ("no record at all", vec![]),
-            ("a token minted but never redeemed", vec![tok("pop-os", None, "", false)]),
-            ("a forgotten (revoked) enrollment", vec![tok("pop-os", used, "PEM", true)]),
-            ("a redeemed record with no birth cert", vec![tok("pop-os", used, "", false)]),
-            ("another node's live record", vec![tok("pop-os-1", used, "PEM", false)]),
-            ("a name that differs only in case", vec![tok("Pop-OS", used, "PEM", false)]),
+            ("a token minted but never redeemed", vec![tok("ctrl", None, "", false)]),
+            ("a forgotten (revoked) enrollment", vec![tok("ctrl", used, "PEM", true)]),
+            ("a redeemed record with no birth cert", vec![tok("ctrl", used, "", false)]),
+            ("another node's live record", vec![tok("ctrl-1", used, "PEM", false)]),
+            ("a name that differs only in case", vec![tok("Ctrl", used, "PEM", false)]),
             (
                 "an older live record superseded by a newer revoked one",
                 vec![
-                    tok("pop-os", Some("2026-11-06T09:00:00Z"), "PEM", false),
-                    tok("pop-os", Some("2026-11-07T10:00:00Z"), "PEM", true),
+                    tok("ctrl", Some("2026-11-06T09:00:00Z"), "PEM", false),
+                    tok("ctrl", Some("2026-11-07T10:00:00Z"), "PEM", true),
                 ],
             ),
         ];
         for (what, toks) in cases {
-            assert!(!super::admit_enrolled_target(&toks, "pop-os"), "admitted on {what}");
+            assert!(!super::admit_enrolled_target(&toks, "ctrl"), "admitted on {what}");
             assert_eq!(
-                super::rollout_names(v(&["controller"]), Some("pop-os"), &toks),
+                super::rollout_names(v(&["controller"]), Some("ctrl"), &toks),
                 v(&["controller"]),
-                "{what} made pop-os a rollout target"
+                "{what} made ctrl a rollout target"
             );
         }
     }
@@ -5033,10 +5033,10 @@ mod tests {
         // `noo cluster forget`, then a fresh `noo enroll`: the newest record
         // is live, so the re-joined node is admitted.
         let toks = vec![
-            tok("pop-os", Some("2026-11-06T09:00:00Z"), "PEM", true),
-            tok("pop-os", Some("2026-11-07T10:00:00Z"), "PEM2", false),
+            tok("ctrl", Some("2026-11-06T09:00:00Z"), "PEM", true),
+            tok("ctrl", Some("2026-11-07T10:00:00Z"), "PEM2", false),
         ];
-        assert!(super::admit_enrolled_target(&toks, "pop-os"));
+        assert!(super::admit_enrolled_target(&toks, "ctrl"));
     }
 
     #[test]
