@@ -40,7 +40,7 @@ on:
 
 permissions:
   contents: read
-  packages: read   # pull ghcr.io/noomesh/ollama:staged
+  packages: read   # pull the staged ollama image from this repository owner's GHCR namespace
 
 concurrency:
   group: ollama-pull-record-${{ github.event.pull_request.number || github.ref }}
@@ -53,7 +53,7 @@ jobs:
     env:
       # The image a release ships: infra images are staged daily and a
       # release re-tags :staged (infra-staged.yml). Pulled, never built here.
-      OLLAMA_IMAGE: ghcr.io/noomesh/ollama:staged
+      OLLAMA_IMAGE: ghcr.io/${{ github.repository_owner }}/ollama:staged
       NOO_PULLRECORD_MODEL: qwen2.5:0.5b
       NOO_PULLRECORD_CONTAINER: noo-ci-ollama
     steps:

@@ -755,6 +755,9 @@ install -d -o noo-agent -g noo-agent "$NOO_DATA_ROOT/hf-cache" "$NOO_DATA_ROOT/m
 #   - no setfacl, or a store that refuses ACLs (NFS), or any failure: the
 #     guide's remedy is printed and prep goes on. It never fails onboard.
 # The operator is ENROLL_USER (PREP_ENROLL_USER from the CLI, else SUDO_USER).
+# The data-dirs block is also run on its own (onboard's storage-owner test),
+# where prep's say() is not defined.
+command -v say >/dev/null 2>&1 || say() { printf 'prep-host: %s\n' "$*"; }
 models_store_grant() {  # models_store_grant DIR USER
     if [ -z "$2" ] || [ "$2" = root ]; then
         say "no installing operator named (PREP_ENROLL_USER/SUDO_USER): the model store $1 is writable by noo-agent and root only"
