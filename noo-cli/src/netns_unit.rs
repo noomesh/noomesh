@@ -263,7 +263,7 @@ pub(crate) enum Route {
 /// (the applier never renders `User=root`), this machine's applier, whether
 /// it has a self node, and [`crate::onboard::steps::root_step`]'s inputs.
 pub(crate) fn route(owner_is_root: bool, applier: Option<Applier>, self_node: bool, at_terminal: bool, root_ok: bool) -> Route {
-    if !owner_is_root && self_node {
+    if self_node {
         match applier {
             Some(a) if a.generation >= MIN_APPLIER_GENERATION && a.knows_kind => return Route::Stage,
             Some(a) => return Route::OldApplier(a.generation),
