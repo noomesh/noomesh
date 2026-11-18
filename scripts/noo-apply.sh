@@ -851,7 +851,7 @@ env_payload_ok() {
 # test pins these sums to those files). A directive check let a `User=` in
 # the wrong section, a `StandardOutput=file:` that pid 1 opens as root, or a
 # line hidden behind a CR through; an exact match lets nothing through.
-AGENT_UNIT_SHA256="946dede0eb81ab164afb4d61e9000ffc38d550dc0424333ff792c4dc16bf02e4"
+AGENT_UNIT_SHA256="fa1deaf48ff3b03dda26cbbcc650322278c21845eeb321804ce2f9feafdd3639"
 HARNESS_UNIT_SHA256="6ce5d363e5ada9c70635a7c3b5f23002a80796f505ff2a9aac1fda9f531b0e0b"
 unit_payload_ok() {
     _f="$1"; _kind="$2"

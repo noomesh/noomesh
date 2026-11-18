@@ -50,3 +50,22 @@ func TestUnitCanAlwaysRecoverWithoutTheController(t *testing.T) {
 		t.Errorf("RestartSec=%q — expected 30s, the ceiling that replaced 5/60s", got)
 	}
 }
+
+// The agent's stop drain lets streams a caller is reading finish for up to
+// 30 s; systemd's SIGKILL must not land inside it. TimeoutStopSec is that
+// bound plus 20 s for the rest of the shutdown.
+func TestUnitStopTimeoutOutlastsTheDrain(t *testing.T) {
+	raw, err := os.ReadFile("../../deploy/noo-node-agent.service")
+	if err != nil {
+		t.Fatalf("read unit: %v", err)
+	}
+	got := ""
+	for _, line := range strings.Split(string(raw), "\n") {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(line), "TimeoutStopSec="); ok {
+			got = v
+		}
+	}
+	if got != "50" {
+		t.Errorf("TimeoutStopSec=%q, want 50 (the 30 s stop drain + 20 s)", got)
+	}
+}
