@@ -606,6 +606,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
         (Some(p), s) => out.push(ok("harness", format!("{} (policy {p})", if s.is_empty() { "-" } else { s }))),
     } }
     out.extend(model_stores_check(id, n));
+    out.extend(backend_starts_check(id, n));
     out.extend(node_local_check(id, n));
     out.extend(backend_caps_check(id, n));
     out.extend(agent_address_check(id, n));
@@ -614,6 +615,38 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     out.extend(harness_egress_check(id, n));
     settle_after_roll(n, &mut out);
     out
+}
+
+/// The `backend starts` row: each start the node refused and keeps refusing,
+/// from its `reconcile_refusals` (scope `backend_start` or `placement`). A
+/// gguf quarantined by the preseed, or missing from the models dir, is one:
+/// the agent does not start it until the verified file is shipped, and until
+/// this row only the node's journal said so. FAIL naming each `<target>:
+/// <reason>`; the remedy is the `noo cluster sync-model-files` command a
+/// reason names, else `noo cluster show <node>`. No row when there are none.
+pub(crate) fn backend_starts_check(id: &str, n: &Value) -> Option<Check> {
+    const NAME: &str = "backend starts";
+    const SYNC: &str = "noo cluster sync-model-files";
+    let refusals: Vec<&Value> = n["reconcile_refusals"].as_array()
+        .map(|rs| rs.iter().filter(|r| r["scope"] == "backend_start" || r["scope"] == "placement").collect())
+        .unwrap_or_default();
+    if refusals.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    let mut remedies: Vec<String> = Vec::new();
+    for r in &refusals {
+        let reason = r["reason"].as_str().unwrap_or("no reason reported");
+        parts.push(format!("{}: {reason}", r["target"].as_str().unwrap_or("?")));
+        let remedy = match reason.find(SYNC) {
+            Some(i) => reason[i..].split(['`', ';']).next().unwrap_or(SYNC).trim_end().to_string(),
+            None => format!("noo cluster show {id}   # the node's refusal says why"),
+        };
+        if !remedies.contains(&remedy) {
+            remedies.push(remedy);
+        }
+    }
+    Some(fail(NAME, format!("{id}: {}", parts.join(" | ")), remedies.join("; ")))
 }
 
 /// The `agent address` row: a node's agent_url must be https on an explicit
@@ -16321,5 +16354,60 @@ mod ollama_models_tests {
         let c = ollama_models_check("node-mac", &n).unwrap();
         assert_eq!(c.verdict, Verdict::Warn);
         assert!(c.detail.contains("not repaired here"), "{}", c.detail);
+    }
+}
+
+#[cfg(test)]
+mod backend_starts_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn node(refusals: Value) -> Value {
+        json!({"id": "node-a", "status": "online", "reconcile_refusals": refusals})
+    }
+
+    #[test]
+    fn a_quarantined_gguf_fails_naming_target_reason_and_the_sync_remedy() {
+        let reason = "gguf_quarantined: m.gguf was proven not to match the controller's record and moved aside to /var/lib/noo/models/m.gguf.quarantined-20261117T120000Z; ship the verified file: noo cluster sync-model-files node-a -m m.gguf";
+        let c = node_checks(&node(json!([{"scope": "backend_start", "target": "llamacpp", "reason": reason}])), "", "", 0, None);
+        let row = c.iter().find(|c| c.name == "backend starts").expect("a backend starts row");
+        assert_eq!(row.verdict, Verdict::Fail);
+        assert_eq!(row.detail, format!("node-a: llamacpp: {reason}"));
+        assert_eq!(row.remedy.as_deref(), Some("noo cluster sync-model-files node-a -m m.gguf"));
+    }
+
+    #[test]
+    fn a_start_refusal_naming_no_sync_command_gets_the_cluster_show_remedy() {
+        let c = backend_starts_check("node-a", &node(json!([{"scope": "backend_start", "target": "vllm", "reason": "image pull: unauthorized"}]))).unwrap();
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert_eq!(c.detail, "node-a: vllm: image pull: unauthorized");
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster show node-a   # the node's refusal says why"));
+    }
+
+    #[test]
+    fn a_placement_refusal_is_in_the_row() {
+        let c = backend_starts_check("node-a", &node(json!([{"scope": "placement", "target": "llamacpp",
+            "reason": "this node refused the controller's models_dir /srv/models, and this placement's model lives in it"}]))).unwrap();
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert_eq!(c.detail, "node-a: llamacpp: this node refused the controller's models_dir /srv/models, and this placement's model lives in it");
+    }
+
+    #[test]
+    fn no_start_refusals_no_row() {
+        assert!(backend_starts_check("node-a", &json!({"id": "node-a"})).is_none());
+        assert!(backend_starts_check("node-a", &node(json!([]))).is_none());
+        let c = node_checks(&json!({"id": "node-a", "status": "online"}), "", "", 0, None);
+        assert!(!c.iter().any(|c| c.name == "backend starts"), "{:?}", c.iter().map(|c| c.name).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn door_and_model_cache_refusals_are_not_start_refusals() {
+        let n = node(json!([
+            {"scope": "backend_tls", "target": "vllm", "reason": "no leaf"},
+            {"scope": "model_cache_url", "target": "NOO_MODEL_CACHE_URL", "reason": "plaintext"},
+            {"scope": "backend_start", "target": "llamacpp", "reason": "r"},
+        ]));
+        let c = backend_starts_check("ctrl", &n).unwrap();
+        assert_eq!(c.detail, "ctrl: llamacpp: r");
     }
 }
