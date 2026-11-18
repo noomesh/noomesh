@@ -18,6 +18,7 @@ JUDGE = ROOT / "scripts" / "install-cell" / "upgrade_judge.py"
 SELF = "runner-a"
 
 ROLL_OK = """\
++ runner-a: installed the applier — staging the full bundle
 + stack v0.6.27-rc.9: images staged
   noo-netns-restore.service not installed: the self-node's applier (generation 1) predates the netns-unit kind, so no sudo is run for it
 + runner-a: bundle staged, applied
@@ -212,3 +213,10 @@ def test_rc2s_exit_75_bootstrap_fails_a8_and_rc3s_clean_handshake_passes(tmp_pat
     assert " FAIL: " in got["A8"] and "reported exit 75" in got["A8"], got["A8"]
     rc, got = cell(tmp_path / "b")
     assert " PASS: " in got["A8"] and "this applier is already installed" in got["A8"], got["A8"]
+
+
+def test_a8_is_not_applicable_when_no_applier_only_bundle_was_staged(tmp_path):
+    """A node that already reported an apply gets no applier-only bundle, so no handshake line (97)."""
+    roll = ROLL_OK.replace("+ runner-a: installed the applier — staging the full bundle\n", "")
+    rc, got = cell(tmp_path, roll=roll, journal=JOURNAL_OK.split("\n", 1)[1])
+    assert " NOT APPLICABLE: " in got["A8"], got["A8"]
