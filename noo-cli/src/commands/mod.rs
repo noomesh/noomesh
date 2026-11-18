@@ -108,6 +108,7 @@ pub mod stack_monitoring;
 pub mod systems;
 pub mod test;
 pub mod tools;
+pub mod roll_stagger;
 pub mod upgrade;
 pub mod usage;
 pub mod recall;

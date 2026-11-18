@@ -158,7 +158,13 @@ after it, so `--stack` always uses the new release's assets and its baked
 stack tag (`--tag vX.Y.Z` overrides the pairing). `--stack` manages
 standalone installs only; on a checkout use `noo stack start`/`rebuild`.
 `--nodes` ends `bundles staged for all N node(s) — each applies on its next
-fetch tick`. An enrolled node upgrades its own binary from the controller's
+fetch tick`. Nodes that callers fail over between (the candidates of one
+model class, the pool of one embedding space) are never all restarting at
+once: before staging a node, the roll checks that each of its groups keeps
+one other offered candidate (two for a group of four or more), and otherwise
+waits, at most 150 s once the restarting node has applied, saying what it
+waits for. A wait that runs out is said with the command to check
+(`noo cluster verify --wait`) and the roll goes on. An enrolled node upgrades its own binary from the controller's
 mirror (`/bootstrap/cli`), so nodes need no GitHub access. From the mirror it
 downloads only when the mirror's signed manifest names a different version or
 binary than the one running; an unverified manifest never counts as current. Private release
