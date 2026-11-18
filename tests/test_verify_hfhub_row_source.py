@@ -3,7 +3,7 @@
 
 """The `hf-cache hub owner` verify row judges the self-node AGENT's HF cache.
 
-0.6.26 on pop-os: the row stat'ed the CLI's own HF_CACHE_DIR (the controller
+0.6.26 on ctrl: the row stat'ed the CLI's own HF_CACHE_DIR (the controller
 compose's cache, an operator-owned NFS dir there), not the directory the
 self-node agent stages into, and promised an applier repair the applier
 never makes. Pinned here without a Rust build: `live` takes the agent's
