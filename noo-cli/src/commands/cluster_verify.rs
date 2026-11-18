@@ -606,6 +606,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
         (Some(p), s) => out.push(ok("harness", format!("{} (policy {p})", if s.is_empty() { "-" } else { s }))),
     } }
     out.extend(model_stores_check(id, n));
+    out.extend(backend_caps_check(id, n));
     out.extend(agent_address_check(id, n));
     out.extend(ollama_models_check(id, n));
     out.extend(harness_tasks_check(n));
@@ -628,6 +629,40 @@ pub(crate) fn agent_address_check(id: &str, n: &Value) -> Option<Check> {
         format!("{id}: the gateway refused the agent_url this node reported ({why}); it dials https://{ip}:8081 instead"),
         format!("on {id}, set the agent's address (NODE_IP in /etc/noo-node-agent.env) to the address it is registered at, so it reports https://<that address>:<its port>"),
     ))
+}
+
+/// The `backend caps` row (#1283): the capability set a node's backend
+/// containers keep after `CapDrop ALL`. A name `NOO_BACKEND_CAP_ADD` asks for
+/// outside the allow-list is DROPPED (the backend starts without it, and the
+/// agent only logs it), so the row WARNs naming the node, the refused names
+/// and the allow-list. OK naming the set when the node's environment widened
+/// it; no row on the default set, or from an agent that does not report it.
+pub(crate) fn backend_caps_check(id: &str, n: &Value) -> Option<Check> {
+    const NAME: &str = "backend caps";
+    let bc = n.get("backend_caps").filter(|v| v.is_object())?;
+    let list = |k: &str| -> Vec<String> {
+        bc[k].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default()
+    };
+    let (granted, refused, allowed) = (list("granted"), list("refused"), list("allowed"));
+    if !refused.is_empty() {
+        return Some(warn(
+            NAME,
+            format!(
+                "{id}: NOO_BACKEND_CAP_ADD asks for {} — not grantable (each lets a container reach the host), so backend containers start WITHOUT it; granted: {}",
+                refused.join(", "),
+                if granted.is_empty() { "none".to_string() } else { granted.join(", ") }
+            ),
+            Some(format!(
+                "on {id}, keep NOO_BACKEND_CAP_ADD (the node agent's environment, /etc/noo-node-agent.env) to names from the allow-list: {}",
+                allowed.join(", ")
+            )),
+        ));
+    }
+    match bc["source"].as_str() {
+        Some("env") => Some(ok(NAME, format!("{id}: widened by the node's environment to {}", granted.join(", ")))),
+        Some("none") => Some(ok(NAME, format!("{id}: none (NOO_BACKEND_CAP_ADD=none)"))),
+        _ => None,
+    }
 }
 
 /// The `model stores` row (proposal 61 §7b): no model store on the node is
@@ -15825,6 +15860,33 @@ mod model_stores_tests {
         assert_eq!(c.verdict, Verdict::Fail);
         assert!(c.detail.contains("n1") && c.detail.contains("its host is not the node's registered address") && c.detail.contains("https://100.64.0.5:8081"), "{}", c.detail);
         assert!(agent_address_check("n1", &json!({"ip_address": "100.64.0.5"})).is_none(), "nothing refused, no row");
+    }
+
+    #[test]
+    fn a_refused_backend_cap_is_a_warn_naming_it_and_the_allow_list() {
+        let n = json!({"backend_caps": {"source": "env", "granted": ["CHOWN"], "refused": ["SYS_ADMIN"], "allowed": ["AUDIT_WRITE", "CHOWN"]}});
+        let c = backend_caps_check("n1", &n).expect("a refusal is a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("n1") && c.detail.contains("SYS_ADMIN") && c.detail.contains("WITHOUT it"), "{}", c.detail);
+        assert!(c.remedy.as_deref().is_some_and(|r| r.contains("AUDIT_WRITE, CHOWN") && r.contains("NOO_BACKEND_CAP_ADD")), "{:?}", c.remedy);
+    }
+
+    #[test]
+    fn backend_caps_are_ok_when_widened_and_silent_on_the_default() {
+        let widened = json!({"backend_caps": {"source": "env", "granted": ["CHOWN", "SYS_NICE"], "refused": [], "allowed": []}});
+        let c = backend_caps_check("n1", &widened).expect("a widened set is a row");
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("CHOWN, SYS_NICE"), "{}", c.detail);
+        let default = json!({"backend_caps": {"source": "default", "granted": ["CHOWN"], "refused": [], "allowed": []}});
+        assert!(backend_caps_check("n1", &default).is_none());
+        assert!(backend_caps_check("n1", &json!({})).is_none(), "an agent that does not report it: no row");
+    }
+
+    #[test]
+    fn node_checks_carry_the_backend_caps_row() {
+        let n = json!({"id": "n1", "status": "online", "backend_caps": {"source": "env", "granted": [], "refused": ["SYS_ADMIN"], "allowed": ["CHOWN"]}});
+        let c = node_checks(&n, "", "", 0, None);
+        assert!(c.iter().any(|c| c.name == "backend caps" && c.verdict == Verdict::Warn), "{:?}", c.iter().map(|c| c.name).collect::<Vec<_>>());
     }
 
     #[test]

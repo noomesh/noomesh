@@ -153,6 +153,11 @@ type Reporter struct {
 	// provider answering nil (nothing checked yet) omits the key.
 	ollamaVerify atomic.Pointer[func() any]
 
+	// backendCaps reports the backend containers' capability set and what
+	// the node's environment asked for that is not grantable, sent as
+	// `backend_caps`. nil = not wired (no Docker backends here).
+	backendCaps atomic.Pointer[func() any]
+
 	// nodeFacts supplies the i300 F5b keys: the node facts, the consent policy
 	// and approvals, and `node_workloads`. It returns only the keys it knows;
 	// everything absent is omitted. nil = not wired. Installed after the loop
@@ -397,6 +402,18 @@ func (r *Reporter) SetModelSets(f func() any) { r.modelSets.Store(&f) }
 // SetOllamaVerify installs the provider of `ollama_verify`: [{model, state,
 // anchor, model_layer, reason, remedy?, checked_at}].
 func (r *Reporter) SetOllamaVerify(f func() any) { r.ollamaVerify.Store(&f) }
+
+// SetBackendCaps installs the provider of `backend_caps`: {source, granted,
+// refused, allowed}.
+func (r *Reporter) SetBackendCaps(f func() any) { r.backendCaps.Store(&f) }
+
+func (r *Reporter) backendCapsReport() any {
+	f := r.backendCaps.Load()
+	if f == nil || *f == nil {
+		return nil
+	}
+	return (*f)()
+}
 
 func (r *Reporter) ollamaVerifyReport() any {
 	f := r.ollamaVerify.Load()
