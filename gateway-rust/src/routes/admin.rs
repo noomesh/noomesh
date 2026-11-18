@@ -3244,6 +3244,13 @@ fn find_container(containers: &[Value], wanted: &str) -> Option<(String, String)
     None
 }
 
+/// A container name as Docker allows it (`[a-zA-Z0-9][a-zA-Z0-9_.-]*`): the
+/// node-agent log path takes exactly one, never a path.
+pub(crate) fn is_container_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    !b.is_empty() && b.len() <= 255 && b[0].is_ascii_alphanumeric() && b.iter().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'))
+}
+
 /// Fetch log lines for one container from its node-agent. The Python
 /// handlers went through GET /api/logs/node/{node}/{container}, which clamps
 /// `tail` to 2000 — the same clamp is applied here so behaviour matches the
@@ -3254,6 +3261,9 @@ async fn node_log_lines(
     container: &str,
     tail: i64,
 ) -> Result<Vec<String>, String> {
+    if !is_container_name(container) {
+        return Err(format!("'{container}' is not a container name (letters, digits, '_', '.', '-'; starting with a letter or digit)"));
+    }
     let link = crate::node_link::NodeLink::for_node(state, node_id)
         .await
         .map_err(|_| "node-agent logs failed: HTTP 404".to_string())?;
@@ -5609,5 +5619,29 @@ mod monitoring_off_tests {
         let body = crate::test_src::fn_body(&own, "async fn logs_search(");
         assert!(body.contains("logs_search::search_answer(outcome, &built)"), "{body}");
         assert!(body.contains("logs_search::query_configured_loki(&built)"), "{body}");
+    }
+}
+
+#[cfg(test)]
+mod container_name_tests {
+    use super::is_container_name;
+
+    #[test]
+    fn a_node_log_request_names_one_container_never_a_path() {
+        for ok in ["noo-gateway", "vllm_1", "a.b-c", "X9"] {
+            assert!(is_container_name(ok), "{ok}");
+        }
+        for bad in ["", "a/b", "../x", "..", ".hidden", "-x", "a?tail=1", "a%2Fb", "a b", "a\\b"] {
+            assert!(!is_container_name(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_node_log_fetch_checks_the_container_name_before_building_its_url() {
+        let own = crate::test_src::own_code(include_str!("admin.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn node_log_lines(");
+        let check = body.find("if !is_container_name(container)").expect("the name check");
+        let url = body.find("format!(\"/logs/{container}").expect("the log URL");
+        assert!(check < url, "the container name is checked before the URL is built");
     }
 }

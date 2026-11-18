@@ -1018,6 +1018,47 @@ async fn workload_status(
 
 // ── the workload proxy ───────────────────────────────────────────────────
 
+/// The node-agent URL path for a workload's proxied request: the add-on's
+/// path is validated segment by segment and must stay under its container's
+/// proxy prefix.
+///
+/// - The container name is one plain segment.
+/// - Each path segment is plain: never `.` or `..`, no backslash, no control
+///   character. It is re-encoded (`percent_encode_segment`), so a decoded `?`,
+///   `#` or `/` stays data and cannot start a query, a fragment or a segment.
+/// - The URL is then parsed the way the request client parses it (dot
+///   segments resolved), and its path must still start with
+///   `/api/containers/<container>/proxy/`. A failure is a 400, never a request.
+pub(crate) fn workload_proxy_upstream(container: &str, path: &str, query: &str) -> Result<String, String> {
+    fn plain(seg: &str) -> bool {
+        seg != "." && seg != ".." && !seg.contains('\\') && !seg.chars().any(char::is_control)
+    }
+    if container.is_empty() || container.contains('/') || !plain(container) {
+        return Err(format!("the workload's container name '{container}' is not a single path segment"));
+    }
+    let container = crate::mcp_external::percent_encode_segment(container);
+    let mut segs = Vec::new();
+    for seg in path.trim_start_matches('/').split('/') {
+        if !plain(seg) {
+            return Err("the proxied path must be plain segments: no '.' or '..' segment, no backslash or control character".into());
+        }
+        segs.push(crate::mcp_external::percent_encode_segment(seg));
+    }
+    let prefix = format!("/api/containers/{container}/proxy/");
+    let upstream = format!("{prefix}{}{query}", segs.join("/"));
+    if !stays_under_prefix(&upstream, &prefix) {
+        return Err("the proxied path must stay under the workload's container proxy".into());
+    }
+    Ok(upstream)
+}
+
+/// Whether `upstream`, parsed the way the request client parses it (dot
+/// segments resolved), still has a path under `prefix`. An unparseable path
+/// does not.
+pub(crate) fn stays_under_prefix(upstream: &str, prefix: &str) -> bool {
+    reqwest::Url::parse(&format!("https://node.invalid{upstream}")).is_ok_and(|u| u.path().starts_with(prefix))
+}
+
 /// `/api/addon-workloads/{addon}/{workload}/proxy/{path}` (any method,
 /// WebSocket upgrades included): the add-on's own token (`addon:svc:<addon>`)
 /// or an operator reaches the RESERVED workload's container through the
@@ -1058,7 +1099,7 @@ async fn workload_proxy(
     }
     let link = crate::node_link::NodeLink::for_node(&state, &node).await?;
     let query = parts.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
-    let upstream = format!("/api/containers/{}/proxy/{}{query}", decl.container, path.trim_start_matches('/'));
+    let upstream = workload_proxy_upstream(&decl.container, &path, &query).map_err(AppError::BadRequest)?;
 
     if is_websocket_upgrade(&parts.headers) {
         // The relay dials the agent's address; the tunnel does not carry a
@@ -1875,4 +1916,61 @@ mod tests {
         assert!(rel.contains("if r[\"source\"] == \"placement\" \u{7b}") && rel.contains("\"release\","), "only a row-held reservation skips the GPU release");
     }
 
+
+    // The add-on workload proxy path is validated segment by segment and must
+    // stay under its container's proxy prefix: one test per check.
+
+    #[test]
+    fn a_plain_workload_path_is_forwarded_under_its_container_proxy() {
+        assert_eq!(
+            workload_proxy_upstream("coord-1", "/v1/chat/completions", "?stream=1").unwrap(),
+            "/api/containers/coord-1/proxy/v1/chat/completions?stream=1"
+        );
+    }
+
+    #[test]
+    fn a_workload_container_name_must_be_one_plain_segment() {
+        for bad in ["", "a/b", "..", "."] {
+            assert!(workload_proxy_upstream(bad, "x", "").is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_workload_path_may_not_hold_a_dot_or_dot_dot_segment() {
+        for bad in ["../x", "a/../../b", "./x", "a/."] {
+            assert!(workload_proxy_upstream("c", bad, "").is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_workload_path_may_not_hold_a_backslash() {
+        assert!(workload_proxy_upstream("c", "a\\..\\b", "").is_err());
+    }
+
+    #[test]
+    fn a_workload_path_may_not_hold_a_control_character() {
+        assert!(workload_proxy_upstream("c", "a\nb", "").is_err());
+        assert!(workload_proxy_upstream("c", "a\u{0}b", "").is_err());
+    }
+
+    #[test]
+    fn a_workload_path_segment_is_re_encoded_so_it_stays_data() {
+        assert_eq!(workload_proxy_upstream("c", "a?b/c#d/e%f", "").unwrap(), "/api/containers/c/proxy/a%3Fb/c%23d/e%25f");
+    }
+
+    #[test]
+    fn a_resolved_path_must_still_sit_under_the_container_proxy_prefix() {
+        let prefix = "/api/containers/c/proxy/";
+        assert!(stays_under_prefix("/api/containers/c/proxy/v1/x", prefix));
+        assert!(!stays_under_prefix("/api/containers/c/proxy/../../x", prefix));
+        assert!(!stays_under_prefix("/api/containers/c/proxy/%2e%2e/%2e%2e/x", prefix));
+        assert!(!stays_under_prefix("/elsewhere", prefix));
+    }
+
+    #[test]
+    fn the_workload_proxy_forwards_only_the_validated_upstream() {
+        let own = crate::test_src::own_code(include_str!("reservations.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn workload_proxy(");
+        assert!(body.contains("let upstream = workload_proxy_upstream(&decl.container, &path, &query).map_err(AppError::BadRequest)?;"), "the proxy must build its upstream through the validator");
+    }
 }

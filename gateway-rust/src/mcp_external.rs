@@ -525,7 +525,7 @@ pub(crate) fn build_path(
 
 /// Percent-encode everything outside the unreserved set, so a substituted
 /// value cannot introduce a query string, a fragment or a new segment.
-fn percent_encode_segment(s: &str) -> String {
+pub(crate) fn percent_encode_segment(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
