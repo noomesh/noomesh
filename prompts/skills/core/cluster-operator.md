@@ -21,7 +21,7 @@ You are managing the noomesh compute cluster. Apply these operational principles
 ## Node Management
 - Check node health before operations: `noo_cluster_status`
 - Tier 1 (VRAM >= 10GB): prefer vLLM for production inference
-- Tier 2 (4-10GB VRAM): use llamacpp with GPU offload or Ollama
+- Tier 2 (4-10GB VRAM): llamacpp with GPU offload (an NVIDIA GPU with compute 6.1 or higher: the CUDA image) or Ollama; a GPU llamacpp can use falls back to the CPU otherwise
 - Tier 3 (CPU only): Ollama CPU mode, suitable for small models only
 
 ## Backend Lifecycle
