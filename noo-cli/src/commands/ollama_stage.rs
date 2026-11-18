@@ -618,7 +618,7 @@ pub(crate) fn record_after_pull(
         ));
     }
     let name = format!("{}{MIRROR_MANIFEST_SUFFIX}", p.r.stem());
-    match install_bytes(&p.store, &name, &local) {
+    match install_bytes(&p.store, &name, &p.raw) {
         Ok(path) => PullRecord::Written(path),
         Err(e) => PullRecord::Failed(format!("writing {name}: {e}")),
     }
