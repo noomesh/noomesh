@@ -9,20 +9,20 @@
 //! Every function is generic over the executor, so `begin`, `switch`, `end`
 //! and the refresh keep their transactions at the call site.
 
-use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 /// `(account, ended, cap_at, started_at)` of one perspective.
-pub async fn liveness<'e, E>(db: E, id: &str) -> Result<Option<(String, bool, DateTime<Utc>, DateTime<Utc>)>, sqlx::Error>
+pub async fn liveness<'e, E>(db: E, id: &str) -> Result<Option<(String, bool, jiff::Timestamp, jiff::Timestamp)>, sqlx::Error>
 where
     E: sqlx::PgExecutor<'e>,
 {
-    sqlx::query_as(
+    let row: Option<(String, bool, jiff_sqlx::Timestamp, jiff_sqlx::Timestamp)> = sqlx::query_as(
         "SELECT account, ended_at IS NOT NULL, cap_at, started_at FROM noo_perspectives WHERE id = $1::uuid",
     )
     .bind(id)
     .fetch_optional(db)
-    .await
+    .await?;
+    Ok(row.map(|(account, ended, cap_at, started_at)| (account, ended, cap_at.to_jiff(), started_at.to_jiff())))
 }
 
 /// End one live perspective. `Some(account)` only when THIS call ended it.
@@ -108,11 +108,11 @@ pub struct NewPerspective<'a> {
 }
 
 /// Insert a perspective. Returns its `started_at`.
-pub async fn insert<'e, E>(db: E, p: &NewPerspective<'_>) -> Result<DateTime<Utc>, sqlx::Error>
+pub async fn insert<'e, E>(db: E, p: &NewPerspective<'_>) -> Result<jiff::Timestamp, sqlx::Error>
 where
     E: sqlx::PgExecutor<'e>,
 {
-    let (started_at,): (DateTime<Utc>,) = sqlx::query_as(
+    let (started_at,): (jiff_sqlx::Timestamp,) = sqlx::query_as(
         "INSERT INTO noo_perspectives (id, account, refresh_family, dims, cap_at, switched_from) \
          VALUES ($1::uuid, $2, $3::uuid, $4, now() + make_interval(hours => $5), $6::uuid) \
          RETURNING started_at",
@@ -125,7 +125,7 @@ where
     .bind(p.switched_from)
     .fetch_one(db)
     .await?;
-    Ok(started_at)
+    Ok(started_at.to_jiff())
 }
 
 /// Stamp `new_id` on a refresh row, only while it is live and still carries
