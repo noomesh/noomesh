@@ -7627,30 +7627,35 @@ mod gateway_addon_tests {
     }
 }
 
-/// The seat rows whose WARN remedy is the only way out and must print in a
-/// `seat <name>` section: the layout moves (`seat-sync --migrate`, run on the
-/// seat under sudo) and the display. 0.6.10 printed the legacy-layout WARN
-/// only in `--json`.
-const SEAT_WARN_REMEDY_ROWS: [&str; 4] = ["seat layout", "display binaries", "display", "display held"];
+/// The `(remedy, row names)` pairs a section prints under its table: every
+/// FAIL and every WARN row's, in every section (controller, node, seat,
+/// `verify <node>`). STARTING and Accepted rows print none.
+///
+/// Node and seat WARNs used to stay remedy-less. No reason was ever recorded,
+/// and the filter was widened case by case after a remedy nobody saw: the
+/// controller's WARNs (v0.2.95, `service-key grants`), a node's held `gpu`
+/// (rehearsal 0.6.7-rc.1 F4: `gpu release` was only in `--json`), a seat's
+/// layout and display rows (0.6.10). Now the rule is the same everywhere.
+/// The noise a healthy fleet would get from one constant remedy per node is
+/// pooled instead ([`shared_node_remedies`]).
+fn remedies_to_print(checks: &[Check]) -> Vec<(&str, Vec<&str>)> {
+    remedy_groups(checks).into_iter().map(|(r, names, _)| (r, names)).collect()
+}
 
-/// The `(remedy, row name)` pairs a section prints under its table: every
-/// FAIL row's, and in the controller section every WARN row's too. In a
-/// node section only the held `gpu` WARN prints its remedy: `gpu release` is
-/// the one way out of an operator hold and was visible only in `--json`
-/// (rehearsal 0.6.7-rc.1 F4). Other node WARNs stay remedy-less on purpose.
-/// In a seat section the layout and display WARNs print theirs
-/// ([`SEAT_WARN_REMEDY_ROWS`]).
-fn remedies_to_print<'a>(title: &str, checks: &'a [Check]) -> Vec<(&'a str, Vec<&'a str>)> {
+/// One remedy, the rows it covers, and whether a FAIL row needs it.
+type RemedyGroup<'a> = (&'a str, Vec<&'a str>, bool);
+
+/// A node id and the rows of its section a remedy covers.
+type NodeRows<'a> = (&'a str, Vec<&'a str>);
+
+/// [`remedies_to_print`] with, for each remedy, whether a FAIL row needs it.
+fn remedy_groups(checks: &[Check]) -> Vec<RemedyGroup<'_>> {
     // An identical remedy is printed once, with every row it covers (the
     // v0.2.97 roll printed one LUKS remedy nine times, once per `* at rest`).
     // FAIL remedies lead: the first one printed is the next command to run,
     // and a warning's (a LUKS move) must not stand in front of a failure's.
-    let seat_section = title.starts_with("seat ");
-    let mut out: Vec<(&str, Vec<&str>, bool)> = Vec::new();
-    for c in checks.iter()
-        .filter(|c| c.verdict == Verdict::Fail || (c.verdict == Verdict::Warn && (title == "controller" || c.name == "gpu"
-            || (seat_section && SEAT_WARN_REMEDY_ROWS.contains(&c.name)))))
-    {
+    let mut out: Vec<RemedyGroup> = Vec::new();
+    for c in checks.iter().filter(|c| matches!(c.verdict, Verdict::Fail | Verdict::Warn)) {
         let Some(r) = c.remedy.as_deref() else { continue };
         let fails = c.verdict == Verdict::Fail;
         match out.iter_mut().find(|(x, _, _)| *x == r) {
@@ -7662,7 +7667,39 @@ fn remedies_to_print<'a>(title: &str, checks: &'a [Check]) -> Vec<(&'a str, Vec<
         }
     }
     out.sort_by_key(|(_, _, fails)| !*fails);
-    out.into_iter().map(|(r, names, _)| (r, names)).collect()
+    out
+}
+
+/// The WARN remedies a full verify prints ONCE for several node sections
+/// instead of in each: the identical text, a WARN (never a FAIL) in two or
+/// more node sections. Each is `(remedy, "<node>: <rows>; <node>: <rows>")`,
+/// the note that names what it covers, the way a section's note names its
+/// rows. A healthy fleet otherwise repeats the same kernel, driver or `noo
+/// tasks list` line under every node.
+///
+/// A FAIL's remedy always stays in its section (it is that section's next
+/// command), and a remedy that names its node differs from every other
+/// node's, so it stays in its section too.
+fn shared_node_remedies(sections: &[(String, Vec<Check>)]) -> Vec<(String, String)> {
+    let mut seen: Vec<(&str, Vec<NodeRows>, bool)> = Vec::new();
+    for (id, checks) in sections {
+        for (r, names, fails) in remedy_groups(checks) {
+            match seen.iter_mut().find(|(x, _, _)| *x == r) {
+                Some((_, nodes, f)) => {
+                    nodes.push((id.as_str(), names));
+                    *f |= fails;
+                }
+                None => seen.push((r, vec![(id.as_str(), names)], fails)),
+            }
+        }
+    }
+    seen.into_iter()
+        .filter(|(_, nodes, fails)| !*fails && nodes.len() >= 2)
+        .map(|(r, nodes, _)| {
+            let note = nodes.iter().map(|(id, rows)| format!("{id}: {}", rows.join(", "))).collect::<Vec<_>>().join("; ");
+            (r.to_string(), note)
+        })
+        .collect()
 }
 
 /// The `at_rest_dirs` rows. In the default output they print as one
@@ -7874,9 +7911,11 @@ fn brief_split(checks: &[Check]) -> BriefSplit<'_> {
     b
 }
 
-/// One section, rendered the way the caller asked.
-fn show(title: &str, checks: &[Check], verbose: bool, brief: bool) -> bool {
-    if brief && !verbose { render_brief(title, checks) } else { render(title, checks, verbose) }
+/// One section, rendered the way the caller asked. `pooled` are the remedies
+/// printed once after the node sections ([`shared_node_remedies`]), left out
+/// here.
+fn show(title: &str, checks: &[Check], verbose: bool, brief: bool, pooled: &[(String, String)]) -> bool {
+    if brief && !verbose { render_brief(title, checks) } else { render_in(title, checks, verbose, pooled) }
 }
 
 /// onboard's closing verify: the section line, then the rows a new user
@@ -7898,7 +7937,7 @@ fn render_brief(title: &str, checks: &[Check]) -> bool {
             vec![ui::glyph_cell(glyph), c.name.to_string(), detail]
         }).collect();
         print!("{}", ui::table(&[Col::left(""), Col::left("invariant"), Col::left("state")], &rows));
-        let grouped = remedies_to_print(title, &shown);
+        let grouped = remedies_to_print(&shown);
         let whys: Vec<String> = grouped.iter().map(|(_, names)| names.join(", ")).collect();
         let entries: Vec<(&str, &str)> = grouped.iter().zip(&whys).map(|((r, _), w)| (*r, w.as_str())).collect();
         ui::guide(&entries);
@@ -7931,6 +7970,12 @@ fn later_lines(later: &[&Check]) -> Vec<String> {
 }
 
 fn render(title: &str, checks: &[Check], verbose: bool) -> bool {
+    render_in(title, checks, verbose, &[])
+}
+
+/// [`render`] without the remedies in `pooled` (printed once for several
+/// node sections).
+fn render_in(title: &str, checks: &[Check], verbose: bool, pooled: &[(String, String)]) -> bool {
     let d = digest(checks, verbose);
     if verbose {
         println!("{}", ui::section(title));
@@ -7952,10 +7997,13 @@ fn render(title: &str, checks: &[Check], verbose: bool) -> bool {
         print!("{}", ui::table(&[Col::left(""), Col::left("invariant"), Col::left("state")], &rows));
     }
     let failed: Vec<&Check> = checks.iter().filter(|c| c.verdict == Verdict::Fail).collect();
-    // FAIL remedies always; WARN remedies too in the controller section (the
-    // v0.2.95 roll: `service-key grants` warned with a remedy nobody saw).
+    // FAIL and WARN remedies, FAILs first (remedies_to_print), but not the
+    // ones pooled for several node sections.
     // Judged on every row, not the digest's: a grouped row keeps its remedy.
-    let grouped = remedies_to_print(title, checks);
+    let grouped: Vec<(&str, Vec<&str>)> = remedies_to_print(checks)
+        .into_iter()
+        .filter(|(r, _)| !pooled.iter().any(|(p, _)| p == r))
+        .collect();
     let whys: Vec<String> = grouped.iter().map(|(_, names)| names.join(", ")).collect();
     let entries: Vec<(&str, &str)> = grouped.iter().zip(&whys).map(|((r, _), w)| (*r, w.as_str())).collect();
     ui::guide(&entries);
@@ -8056,6 +8104,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let reads_from = Instant::now();
         let enriched = par_map(&selected, |n| with_harness_wanted(g, n));
         laps.push((format!("node reads ({} node(s), side by side)", selected.len()), reads_from.elapsed()));
+        let mut sections: Vec<(String, Vec<Check>)> = Vec::new();
         for (n, wanted) in selected.iter().zip(&enriched) {
             let id = n["id"].as_str().unwrap_or("?");
             let mut record = wanted.clone();
@@ -8069,10 +8118,23 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             if g.json {
                 node_json.push(serde_json::json!({ "node": id, "ok": node_ok, "checks": checks_json(&checks) }));
             } else {
-                let title = format!("node {id}");
-                show(&title, &checks, g.verbose, brief);
-                tally.add(&title, &checks);
+                sections.push((id.to_string(), checks));
             }
+        }
+        // A WARN remedy identical across node sections prints once, after
+        // them, naming the nodes and rows it covers. Not in --brief, whose
+        // contract is that every section's remedies stand above its own
+        // "Worth doing later" lines.
+        let pooled = if brief && !g.verbose { Vec::new() } else { shared_node_remedies(&sections) };
+        for (id, checks) in &sections {
+            let title = format!("node {id}");
+            show(&title, checks, g.verbose, brief, &pooled);
+            tally.add(&title, checks);
+        }
+        if !pooled.is_empty() {
+            let entries: Vec<(&str, &str)> = pooled.iter().map(|(r, w)| (r.as_str(), w.as_str())).collect();
+            ui::guide(&entries);
+            println!();
         }
         json_out.insert("nodes".into(), Value::Array(node_json));
 
@@ -8108,7 +8170,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     seat_json.push(serde_json::json!({ "seat": name, "ok": seat_ok, "checks": checks_json(&checks) }));
                 } else {
                     let title = format!("seat {name}");
-                    show(&title, &checks, g.verbose, brief);
+                    show(&title, &checks, g.verbose, brief, &[]);
                     tally.add(&title, &checks);
                 }
             }
@@ -8679,7 +8741,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             if !want_nodes {
                 println!("{}", ui::header("cluster verify", Some("controller")));
             }
-            show("controller", &checks, g.verbose, brief);
+            show("controller", &checks, g.verbose, brief, &[]);
             tally.add("controller", &checks);
         }
     }
@@ -9723,31 +9785,70 @@ mod tests {
         assert_eq!(verdict(&c, "tailnet control"), Verdict::Ok);
     }
 
+    /// A node section prints its WARN remedies, as the controller's always
+    /// did, after the FAILs' (the first command printed is the next to run).
+    /// STARTING and Accepted rows print none.
     #[test]
-    fn warn_remedies_print_in_the_controller_section_only() {
+    fn a_node_warn_remedy_prints_after_the_fails() {
+        let mut starting = warn("online", "agent starting", Some("wait".into()));
+        starting.verdict = Verdict::Starting;
+        let mut accepted = warn("pki at rest", "accepted risk", Some("noo security at-rest".into()));
+        accepted.verdict = Verdict::Accepted;
         let rows = vec![
-            warn("service-key grants", "evolve lacks prompt_skills:write", Some("noo security service-key provision evolve".into())),
+            warn("harness tasks", "1 running, past the stall bound", Some("noo tasks list".into())),
             warn("loki", "no remedy", None),
             fail("x", "bad", "noo health"),
+            starting,
+            accepted,
         ];
-        let c = remedies_to_print("controller", &rows);
-        // The FAIL remedy leads, ahead of the WARN listed before it.
-        assert_eq!(c, vec![("noo health", vec!["x"]), ("noo security service-key provision evolve", vec!["service-key grants"])]);
-        assert_eq!(remedies_to_print("node a", &rows), vec![("noo health", vec!["x"])]);
+        assert_eq!(remedies_to_print(&rows), vec![("noo health", vec!["x"]), ("noo tasks list", vec!["harness tasks"])]);
+    }
+
+    /// One constant WARN remedy on several nodes (a kernel or driver step,
+    /// `noo tasks list`) prints once after the node sections, its note naming
+    /// each node and the rows it covers; the sections leave it out.
+    #[test]
+    fn a_constant_remedy_shared_by_several_nodes_prints_once_naming_the_nodes() {
+        let tasks = || warn("harness tasks", "1 running, past the stall bound", Some("noo tasks list".into()));
+        let sections = vec![
+            ("node-a".to_string(), vec![tasks()]),
+            ("node-b".to_string(), vec![ok("online", "yes")]),
+            ("node-c".to_string(), vec![tasks()]),
+        ];
+        let pooled = shared_node_remedies(&sections);
+        assert_eq!(pooled, vec![("noo tasks list".to_string(), "node-a: harness tasks; node-c: harness tasks".to_string())]);
+    }
+
+    /// A remedy that names its node (a GPU release, a provision) differs on
+    /// every node and stays in its own section; so does a FAIL's remedy, even
+    /// when shared (it is that section's next command), and a remedy only one
+    /// node needs.
+    #[test]
+    fn a_node_specific_remedy_stays_in_its_section() {
+        let release = |id: &str| warn("gpu", "held by operator", Some(format!("noo cluster gpu release {id}")));
+        let sections = vec![
+            ("node-a".to_string(), vec![release("node-a"), fail("bus", "down", "noo stack restart nats"), warn("kernel", "old", Some("sudo apt upgrade".into()))]),
+            ("node-b".to_string(), vec![release("node-b"), fail("bus", "down", "noo stack restart nats")]),
+        ];
+        assert!(shared_node_remedies(&sections).is_empty(), "{:?}", shared_node_remedies(&sections));
+        // In its section the release prints as before.
+        assert!(remedies_to_print(&sections[0].1).iter().any(|(r, _)| *r == "noo cluster gpu release node-a"));
     }
 
     #[test]
     fn identical_remedies_print_once_with_every_row_they_cover() {
         let luks = at_rest_remedy("loki at rest");
         assert_ne!(luks, at_rest_remedy("age key at rest"));
+        // FAIL rows, so this reads the grouping alone (a_node_warn_remedy_
+        // prints_after_the_fails reads which verdicts print).
         let rows = vec![
-            warn("loki at rest", "plaintext", Some(luks.into())),
-            warn("loki", "other", Some("noo health".into())),
-            warn("postgres at rest", "plaintext", Some(luks.into())),
-            warn("age key at rest", "plaintext", Some(at_rest_remedy("age key at rest").into())),
-            warn("pki at rest", "plaintext", Some(at_rest_remedy("pki at rest").into())),
+            fail("loki at rest", "plaintext", luks),
+            fail("loki", "other", "noo health"),
+            fail("postgres at rest", "plaintext", luks),
+            fail("age key at rest", "plaintext", at_rest_remedy("age key at rest")),
+            fail("pki at rest", "plaintext", at_rest_remedy("pki at rest")),
         ];
-        let c = remedies_to_print("controller", &rows);
+        let c = remedies_to_print(&rows);
         assert_eq!(
             c,
             vec![
@@ -9758,7 +9859,7 @@ mod tests {
         );
         // Node sections group identical FAIL remedies the same way.
         let fails = vec![fail("a", "x", "noo fix"), fail("b", "x", "noo fix")];
-        assert_eq!(remedies_to_print("node n", &fails), vec![("noo fix", vec!["a", "b"])]);
+        assert_eq!(remedies_to_print(&fails), vec![("noo fix", vec!["a", "b"])]);
     }
 
     /// host8, v0.2.95 roll: 7.1.5 installed (vmlinuz symlink), but the
@@ -13029,7 +13130,7 @@ mod tests {
         assert_eq!(j[2]["verdict"], "warn");
         // the same predicate the exit code uses
         assert!(rows.iter().all(|c| c.verdict != Verdict::Fail && c.verdict != Verdict::Starting));
-        assert!(remedies_to_print("controller", &rows).iter().all(|(_, names)| !names.contains(&"postgres at rest")));
+        assert!(remedies_to_print(&rows).iter().all(|(_, names)| !names.contains(&"postgres at rest")));
         assert_ne!(Verdict::Accepted, Verdict::Ok, "accepted is not a pass");
         assert_ne!(Verdict::Accepted, Verdict::Warn);
         assert_ne!(ui::glyph(Glyph::Accepted), ui::glyph(Glyph::Warn));
@@ -14719,17 +14820,14 @@ mod gpu_contention_tests {
     }
 
     #[test]
-    fn held_with_nothing_paused_says_so_and_the_remedy_prints_in_a_node_section() {
+    fn held_with_nothing_paused_says_so_and_names_the_release() {
         let c = gpu_contention_check(&node(serde_json::json!({
             "state": "held", "method": "nvidia-smi", "paused_backends": []}))).unwrap();
         assert_eq!(c.detail, "mode held (manual): held by operator: no GPU backend paused");
-        let checks = vec![c];
-        let r = remedies_to_print("host3", &checks);
-        assert_eq!(r.len(), 1, "the gpu warn prints its remedy in a node section");
-        assert!(r[0].0.starts_with("noo cluster gpu release host3"));
-        // other node warns stay remedy-less
-        let other = vec![warn("harness", "x", Some("noo cluster desired host3".into()))];
-        assert!(remedies_to_print("host3", &other).is_empty());
+        // A node WARN, so its remedy prints in the node section
+        // (a_node_warn_remedy_prints_after_the_fails).
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.remedy.as_deref().unwrap_or("").starts_with("noo cluster gpu release host3"), "{:?}", c.remedy);
     }
 
     /// A seat whose display runs from a home directory (the 0.6.10
@@ -14746,16 +14844,9 @@ mod gpu_contention_tests {
         let row = checks.iter().find(|c| c.name == "display binaries").expect("the home layout is a row");
         assert_eq!(row.verdict, Verdict::Warn, "a display that still runs is a WARN");
         let want = "on node-h: sudo ~owner/.local/libexec/noo-seat/noo kiosk seat-sync --migrate";
-        let r = remedies_to_print("seat node-h", &checks);
-        assert!(r.iter().any(|(rem, names)| *rem == want && names.contains(&"display binaries")), "{r:?}");
-        // The same WARN in a node section stays remedy-less (only gpu prints there).
-        assert!(remedies_to_print("node-h", &checks).iter().all(|(rem, _)| *rem != want));
-        // The legacy root layout's WARN prints in the seat section too.
-        let legacy = vec![warn("seat layout", "still on the root layout", Some("on s: sudo /usr/local/libexec/noo-seat/noo kiosk seat-sync --migrate".into()))];
-        assert_eq!(remedies_to_print("seat s", &legacy).len(), 1);
-        // Other seat WARNs keep the node rule.
-        let other = vec![warn("seat cli", "x", Some("noo upgrade --seats".into()))];
-        assert!(remedies_to_print("seat s", &other).is_empty());
+        // A WARN with that remedy: it prints in the seat section like every
+        // WARN's (a_node_warn_remedy_prints_after_the_fails).
+        assert_eq!(row.remedy.as_deref(), Some(want));
     }
 
     #[test]
@@ -14884,7 +14975,7 @@ mod digest_tests {
         let names: Vec<&str> = d.rows.iter().map(|c| c.name).collect();
         assert_eq!(names, vec!["data at rest", "sandbox", "backup age"]);
         // The remedy still prints, from the full list of checks.
-        assert_eq!(remedies_to_print("controller", &checks)[0].0, "noo sandbox doctor");
+        assert_eq!(remedies_to_print(&checks)[0].0, "noo sandbox doctor");
         let line = summary_line("controller", &d.counts);
         assert!(line.contains("controller") && line.contains(&passes.to_string()) && line.contains('1'), "{line}");
     }

@@ -837,6 +837,10 @@ drain_started, drained_at}`, plus `workload` for a reservation and
   30 minutes is a warning with `noo tasks list` as the remedy, never a failure:
   the harness releases a stalled task itself, and a queue is capacity, not a
   fault. Child tasks count; parked ones do not.
+- Every FAIL and WARN row of a node section prints its remedy under that
+  section, FAILs first, as the controller section does; a WARN remedy that is
+  the same on several nodes (such as `noo tasks list`) prints once after the
+  node sections, naming each node and row (not in `--brief`).
 
 ## Related guides
 
