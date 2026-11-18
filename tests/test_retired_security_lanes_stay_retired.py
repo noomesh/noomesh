@@ -188,3 +188,20 @@ def test_the_gateway_retires_the_v1_cluster_token_posture_row() -> None:
     # ...and the key is no longer a catalog key (nothing reads it).
     catalog = src.split("pub const POSTURE_CATALOG")[1].split("\n];")[0]
     assert 'key: "NOO_CLUSTER_TOKEN_V1"' not in re.sub(r"//[^\n]*", "", catalog)
+
+
+def test_a_leftover_egress_allowlist_in_dot_env_is_named_by_the_launcher(tmp_path) -> None:
+    """noomesh#1297 removed NOO_EGRESS_ALLOWLIST, a documented egress knob that
+    restricted nothing. An existing .env that still sets it must hear so from
+    the launcher, naming what actually bounds a tool's reach, so nobody reads
+    the leftover line as a limit."""
+    import subprocess
+
+    (tmp_path / ".env").write_text("A=1\nNOO_EGRESS_ALLOWLIST=example.com\n")
+    r = subprocess.run(
+        ["bash", "-c", f'source "{ROOT / "scripts" / "lib-addons.sh"}" && warn_retired_env_keys'],
+        cwd=tmp_path, capture_output=True, text=True, timeout=30,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "WARN: .env sets NOO_EGRESS_ALLOWLIST, which is RETIRED and ignored — it never restricted anything" in r.stderr, r.stderr
+    assert "docs/security/networks-and-containers.md" in r.stderr, r.stderr
