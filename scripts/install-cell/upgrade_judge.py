@@ -109,7 +109,7 @@ def judge():
 
     # ── after --all ──
     if roll is None:
-        for a in ("A1", "A2", "A3", "A4", "A5", "A6"):
+        for a in ("A1", "A2", "A3", "A4", "A5", "A6", "A7"):
             say(a, "NOT REACHED", "the --all roll did not run")
     else:
         stopped = [l for l in roll.splitlines() if "Upgrade stopped at the" in l or "staging failed" in l
@@ -129,6 +129,9 @@ def judge():
 
         refused = [("%s: %s" % (src, l.strip())) for src, body in (("--all", roll), ("--stack", stack or ""), ("journal", journal))
                    for l in body.splitlines() if "noo-apply: REFUSED" in l or "REFUSED release check:" in l]
+        # Strict: the first roll's applier-only bootstrap refusal is NOT
+        # exempt (general, 2026-11-18): rc.3 makes an applier-only bundle
+        # equal to the installed applier a no-op, so any REFUSED line FAILs.
         say("A3", "FAIL" if refused else "PASS",
             " | ".join(refused[:2]) if refused else "no 'noo-apply: REFUSED' in the --all roll, the --stack or the node's journal")
 
@@ -152,6 +155,10 @@ def judge():
             say("A5", "FAIL", bad[0])
         elif late:
             say("A5", "FAIL", [l for l in net[staged[0]:] if "not installed (" in l][0])
+        elif not net and os.path.exists(os.environ.get("NETNS_UNIT", "/etc/systemd/system/noo-netns-restore.service")) \
+                and "unit before: " in (text(os.path.join(out, "logs", "remove-netns-unit.log")) or "unit before: present"):
+            # 0.6.26's onboard installed it; the roll found it current and said nothing (97)
+            say("A5", "PASS", "no netns line: the unit was already installed and current before the roll")
         elif gen1 and not staged:
             say("A5", "PASS", gen1[0])
         elif staged and enabled:
@@ -168,6 +175,18 @@ def judge():
             say("A6", "FAIL", "%s: %s" % (ap[0].get("verdict"), ap[0].get("detail")))
         else:
             say("A6", "FAIL", "no 'agent protect' row after the roll (the self node's hold was never reported)")
+
+        # A7: the self node's agent is back on the new build (provision.rs
+        # rendered its env with the literal noo-controller on rc.2: cut off)
+        cut = [l.strip() for l in journal.splitlines() if "lookup noo-controller" in l]
+        silent = [l.strip() for l in roll.splitlines() if "no heartbeat from the new build within" in l]
+        ver = rows(final or after, "version", me)
+        tgt = (text(os.path.join(j, "target")) or "").strip().replace("noo-cli-v", "")
+        on_new = ver and ver[0].get("verdict") == "ok" and tgt and tgt in (ver[0].get("detail") or "")
+        if on_new and not cut and not silent:
+            say("A7", "PASS", "the self node heartbeats on the new build: %s" % ver[0].get("detail"))
+        else:
+            say("A7", "FAIL", " | ".join((cut[:1] + silent[:1] + ["version: %s: %s" % (ver[0].get("verdict"), ver[0].get("detail")) if ver else "no version row"])))
 
     # ── after the same-tag --stack ──
     if stack is None:
@@ -199,7 +218,8 @@ def judge():
                 probs.append("mode %04o, not 0644" % stat.S_IMODE(st.st_mode))
             if not user or user == "root" or user != owner:
                 probs.append("User=%s, not the install owner %s" % (user or "(none)", owner))
-            if not execs.split()[:1] or not execs.split()[0].endswith("noo-netns-restore.sh"):
+            # `ExecStart=/path/noo-netns-restore.sh` or `ExecStart=/bin/bash "/path/noo-netns-restore.sh"`
+            if not any(w.strip('"\'').endswith("noo-netns-restore.sh") for w in execs.split()):
                 probs.append("ExecStart=%s" % execs)
             if en != "enabled":
                 probs.append("is-enabled=%s" % (en or "?"))
@@ -218,8 +238,11 @@ def judge():
     # ── general's rows, after both ──
     v = final or after
     hf = rows(v, "hf-cache hub owner", me)
-    say("G1", "PASS" if hf and hf[0].get("verdict") == "ok" else "FAIL",
-        ("%s: %s" % (hf[0].get("verdict"), hf[0].get("detail"))) if hf else "no 'hf-cache hub owner' row")
+    if hf and hf[0].get("verdict") == "ok" and "not judged" in (hf[0].get("detail") or ""):
+        say("G1", "NOTE", "the row is OK but judged nothing: %s" % hf[0].get("detail"))
+    else:
+        say("G1", "PASS" if hf and hf[0].get("verdict") == "ok" else "FAIL",
+            ("%s: %s" % (hf[0].get("verdict"), hf[0].get("detail"))) if hf else "no 'hf-cache hub owner' row")
     om = rows(v, "ollama models", me)
     if om and om[0].get("verdict") == "ok":
         say("G2", "PASS", om[0].get("detail"))
