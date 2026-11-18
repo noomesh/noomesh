@@ -13,6 +13,19 @@ and which hardening the long-running controller containers run under.
 | `noo-sandbox` | **yes** | gateway, worker, trellion, `sandbox` | the code-execution link, no egress |
 | `noo-browser` | no | gateway, worker, trellion, `browser` | the headless browser, which has to reach the web |
 
+What bounds where a tool can reach, today:
+
+- **Code execution** (the `sandbox` container) is on `noo-sandbox` only,
+  which is `internal: true`: it has no route out.
+- **The headless browser** (`browser` profile, opt-in) reaches the web.
+  `BROWSER_URL_ALLOWLIST` is empty by default; when set it is a substring
+  match on `/navigate` only, and in-page JavaScript does not pass through it.
+- **The gateway, worker and trellion** are on `noo-cluster`, which is not
+  internal: the network does not limit which public hosts they reach, and
+  there is no host allow-list setting for them.
+- **A harness** on a Linux node with systemd is held off the internet by its
+  unit (see [the node agent's page](./node-agent.md)); a Mac has no such hold.
+
 ### Postgres and Redis are on `noo-db` only
 
 A container on `noo-cluster` that is not a database client has no route to

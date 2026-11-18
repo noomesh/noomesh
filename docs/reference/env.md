@@ -363,7 +363,6 @@ wins (systemd applies `EnvironmentFile=` after `Environment=`).
 | `NOO_JWT_SECRET`, `NOO_CLUSTER_SECRET`, `NOO_NODE_AGENT_TOKEN`, `NOO_AUDIT_HMAC_KEY`, `NOO_ENCRYPTION_KEY` | — | shared credentials; **secret store** |
 | `NOO_EXEC_APPROVAL_MODE` | posture (unset → `strict`) | same gates as the gateway |
 | `NOO_ALLOW_LOCAL_PYTHON_EXEC` | off | run `python_exec` in-process instead of the sandbox. Honoured only from a source checkout; **ignored (and logged) inside a container or under the launcher** (`/.dockerenv`, `/run/.containerenv`, `NOO_LAUNCHED=1`). `noo security scan` reports it set as HIGH |
-| `NOO_EGRESS_ALLOWLIST` | — | hosts tools may reach |
 | `NOO_PROACTIVE_ENABLED` | — | the proactive loop |
 | `NOO_MODEL_VENDORS`, `NOO_MODEL_TASKS`, `NOO_MODEL_PUBLISHERS`, `NOO_MODEL_PUBLISHER_MODE`, `NOO_MODEL_FILTER_MODE` | — | model catalog filters |
 | `RESEARCH_MAP_MODEL`, `RESEARCH_REDUCE_MODEL` | — | research pipeline |

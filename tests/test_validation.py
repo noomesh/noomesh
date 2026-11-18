@@ -62,3 +62,20 @@ def test_url_validation():
 
     with pytest.raises(ValidationError):
         validator.sanitize_url("ftp://example.com")
+
+
+def test_no_egress_allowlist_knob_is_read(monkeypatch):
+    """NOO_EGRESS_ALLOWLIST restricted nothing (sanitize_url, its only reader,
+    has no caller) yet was documented as "hosts tools may reach". A documented
+    security knob that restricts nothing is worse than none, so it is gone:
+    setting it must not change what sanitize_url accepts, and no doc or
+    example may name it again."""
+    import pathlib
+    import socket
+
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))])
+    monkeypatch.setenv("NOO_EGRESS_ALLOWLIST", "only.example.org")
+    assert ToolInputValidator.sanitize_url("https://example.com") == "https://example.com"
+    root = pathlib.Path(__file__).resolve().parents[1]
+    for rel in ("docs/reference/env.md", ".env.example", "noomesh.yaml.example", "src/noomesh/validation.py"):
+        assert "NOO_EGRESS_ALLOWLIST" not in (root / rel).read_text(), rel
