@@ -392,12 +392,24 @@ func agentUser() string {
 	return fmt.Sprintf("uid %d", os.Getuid())
 }
 
+// ollamaUnreadableFallback joins a cannot-read remedy's re-pull to its
+// fallback; the CLI's verify row splits on it.
+const ollamaUnreadableFallback = "; if the files stay unreadable: "
+
 // cannotRead is the result for a store file the agent may not read.
-func (v *OllamaVerifier) cannotRead(res OllamaVerifyResult, ue *unreadableErr) OllamaVerifyResult {
+//
+// The store is readable as shipped: our Ollama image writes it with umask
+// 0022 (directories 755, files 644; measured on Ollama 0.40.16), and the
+// agent reads it through the "other" bits. A 0600 file usually means
+// something other than our image wrote it, or the umask was changed. So the
+// remedy leads with the re-pull through noo (Ollama rewrites the blobs and
+// the manifest with its own modes), and the chmod, which needs sudo, is
+// only the fallback.
+func (v *OllamaVerifier) cannotRead(res OllamaVerifyResult, model string, ue *unreadableErr) OllamaVerifyResult {
 	res.State = OllamaCannotRead
-	res.Reason = fmt.Sprintf("cannot read %s as %s (permission denied): the agent reads this store through its \"other\" permission bits and this file grants none, so its bytes are not checked (give the store o+rX, or check the Ollama image's umask)",
+	res.Reason = fmt.Sprintf("cannot read %s as %s (permission denied): the agent reads this store through its \"other\" permission bits and this file grants none, so its bytes are not checked; our Ollama image writes the store 755/644 (umask 0022), so the file was likely written by something else or under a changed umask",
 		ue.path, agentUser())
-	res.Remedy = "sudo chmod -R o+rX " + v.ModelsDir
+	res.Remedy = v.remedy(model) + ollamaUnreadableFallback + "sudo chmod -R o+rX " + v.ModelsDir
 	return res
 }
 
@@ -556,7 +568,7 @@ func (v *OllamaVerifier) Verify(ctx context.Context, model string) OllamaVerifyR
 		res.ModelLayer = localModelLayer(mpath)
 		var ue *unreadableErr
 		if errors.As(err, &ue) {
-			return v.cannotRead(res, ue)
+			return v.cannotRead(res, model, ue)
 		}
 		res.State, res.Reason = OllamaVerifyErr, err.Error()
 		return res

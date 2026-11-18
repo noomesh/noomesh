@@ -1005,9 +1005,14 @@ the record.
 
 The agent reads Ollama's store through its "other" permission bits (the store
 belongs to the Ollama image's user). A manifest or blob it may not read is
-reported as "cannot read <path>" with its own remedy, `sudo chmod -R o+rX
-<store>` (or check the Ollama image's umask), never as a missing manifest or a
-mismatch.
+reported as "cannot read <path>" with its own remedy, never as a missing
+manifest or a mismatch. Our Ollama image writes the store with umask 0022
+(directories 755, files 644), which the agent can read; a 0600 file usually
+means something other than our image wrote it, or the umask was changed. The
+remedy first re-pulls through noo (`noo models pull <tag>` on the
+controller's own node), which has Ollama rewrite the blobs and the manifest
+with its own modes; if the files stay unreadable: `sudo chmod -R o+rX
+<store>`.
 
 ## Backend door leaves
 
