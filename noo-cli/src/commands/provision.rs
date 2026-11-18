@@ -1605,6 +1605,14 @@ fn attach_release_proof(g: &Globals, a: &ProvisionArgs, site: &ProvSite, m: &Pro
     if let Err(e) = crate::release_gate::controller_check(files.as_slice(), m.darwin, &sums, version, lock.as_ref().map(|(l, _)| l.as_str())) {
         release_refused(g, &a.node, work, &e);
     }
+    // i940: a node AHEAD of this controller would refuse the bundle (its
+    // record allows nothing this old). Said here, before staging, in the
+    // node's own words, from the record the node last reported.
+    let stack_tag = lock.as_ref().and_then(|(l, _)| l.lines().find_map(|x| x.strip_prefix("# stack ")).map(|t| t.trim().to_string()));
+    if let Some(why) = node_floor_refusal(&reported_apply_msg(g, &a.node), version, stack_tag.as_deref()) {
+        scrub(work);
+        fail(g.json, ExitCode::Generic, "node_ahead", &format!("{}: {why}", a.node), Some("noo upgrade --stack"));
+    }
     nnote(&format!("bundle carries release {version}'s signed list for its root code ({kinds})"));
     files.push(("release-sums", sums.into_bytes()));
     files.push(("release-sums.sig", sig.into_bytes()));
@@ -1613,6 +1621,27 @@ fn attach_release_proof(g: &Globals, a: &ProvisionArgs, site: &ProvSite, m: &Pro
         files.push(("release-lock", lock.into_bytes()));
         files.push(("release-lock.sig", lock_sig.into_bytes()));
     }
+}
+
+/// The message of `node`'s last apply report (the status route's `apply_msg`,
+/// which carries the applier's `release-check:` line); empty when none.
+pub(crate) fn reported_apply_msg(g: &Globals, node: &str) -> String {
+    crate::http::get_json_opt(g, &format!("/api/cluster/provision-bundle/{node}/status"), true, 10)
+        .and_then(|st| st.get("apply_msg").and_then(|v| v.as_str()).map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// i940: would the node whose last apply report is `apply_msg` refuse a
+/// bundle staged from `release` (and, with an agent, stack `stack`)? The
+/// refusal line, word for word what the node would print
+/// ([`crate::release_gate::would_accept`], the node's own rule). None when it
+/// would accept, or when the report carries no record (an older node, or a
+/// refused apply): then the node is the authority, as before.
+pub(crate) fn node_floor_refusal(apply_msg: &str, release: &str, stack: Option<&str>) -> Option<String> {
+    let f = crate::release_gate::reported_floor(apply_msg);
+    let get = |k: &str| f.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str());
+    crate::release_gate::would_accept("release", release, get("release"), get("release-prev")).err()
+        .or_else(|| stack.and_then(|t| crate::release_gate::would_accept("stack", t, get("stack"), get("stack-prev")).err()))
 }
 
 /// The release proof for a Linux bundle built outside `cluster provision`

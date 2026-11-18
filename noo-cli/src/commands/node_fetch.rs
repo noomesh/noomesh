@@ -1616,8 +1616,8 @@ fn release_floor_path(base: &Path, as_root: bool) -> PathBuf {
 /// prints the same line).
 fn release_check_note(base: &Path, as_root: bool) -> String {
     let floor = std::fs::read_to_string(release_floor_path(base, as_root)).ok();
-    let rel = floor.as_deref().and_then(|t| crate::release_gate::floor_field(t, "release-final")).unwrap_or("none").to_string();
-    format!(" release-check: generation={APPLY_GENERATION} release={rel}")
+    let field = |k: &str| floor.as_deref().and_then(|t| crate::release_gate::floor_field(t, k)).unwrap_or("none").to_string();
+    format!(" release-check: generation={APPLY_GENERATION} release={} release-prev={}", field("release-final"), field("release-prev"))
 }
 
 /// Sentinel error: the bundle replaced the daemon's CLI; re-run under it.

@@ -30,7 +30,7 @@
 //! The floor, one step back (operator 2026-11-17): the record keeps the last
 //! two FINALS applied (`release-final`, `release-prev`); a final not older than
 //! the previous one is accepted, an rc when it is an rc of the current or a
-//! later release ([`step_back_ok`]). The oldest accepted never goes down and
+//! later release ([`would_accept`], shared with the controller). The oldest accepted never goes down and
 //! an rc never moves the record. With no final recorded, the CLI doing the
 //! check (when it is a final) stands in as the current final. No dev path: anything not in a published release or rc is
 //! refused with one line naming the kind, its sha256 and the remedy (75).
@@ -104,20 +104,47 @@ pub fn floor_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
         .map(str::trim)
 }
 
-/// The one-step-back rule: may a node whose current final is `fin` (and the
-/// final before it `prev`) take release `v`? A final: not older than `prev`
-/// (`fin` while only one is known). An rc: its X.Y.Z not older than `fin`.
-/// Err carries the reason.
-pub fn step_back_ok(v: &str, fin: &str, prev: Option<&str>) -> Result<(), String> {
-    match v.split_once("-rc.") {
-        Some((base, _)) if older(base, fin) => Err(format!(
-            "it is an rc of a release older than the current final {fin}; a node takes an rc of the current or a later release only")),
-        Some(_) => Ok(()),
-        None if older(v, prev.unwrap_or(fin)) => Err(format!(
-            "this node applied release {fin}{}; it steps back at most one final, never to {v}",
-            prev.map(|p| format!(" after {p}")).unwrap_or_default())),
-        None => Ok(()),
+/// The one-step-back rule, ONE function for the node (Mac: [`darwin_check`])
+/// and the controller (`provision::node_floor_refusal`): would a node whose
+/// record for `key` (`release` or `stack`) is final `fin`, previous final
+/// `prev`, take `staged`? A final: not older than `prev` (`fin` while only one
+/// is known). An rc: its X.Y.Z not older than `fin`. No `fin`: yes. Err is the
+/// refusal line ([`ahead_line`]), word for word what the node prints.
+pub fn would_accept(key: &str, staged: &str, fin: Option<&str>, prev: Option<&str>) -> Result<(), String> {
+    let Some(f) = fin else { return Ok(()) };
+    let (too_old, need) = match staged.split_once("-rc.") {
+        Some((base, _)) => (older(base, f), f),
+        None => (older(staged, prev.unwrap_or(f)), prev.unwrap_or(f)),
+    };
+    if too_old {
+        return Err(ahead_line(key, staged, f, prev, need));
     }
+    Ok(())
+}
+
+/// The refusal for a staged release older than the node's record allows: the
+/// node is AHEAD of its controller (i940). The same words as noo-apply.sh's
+/// `release_refuse_ahead`.
+pub fn ahead_line(key: &str, staged: &str, fin: &str, prev: Option<&str>, need: &str) -> String {
+    let after = prev.map(|p| format!(" after {p}")).unwrap_or_default();
+    format!("REFUSED {key} {staged} — this node is ahead of its controller (it applied {fin}{after}; \
+             the controller staged {staged}): roll the controller to {need} or later (noo upgrade --stack), \
+             then this node takes its bundles again ({REFUSED})")
+}
+
+/// The record a node last REPORTED (its apply report's `release-check:`
+/// line): `(field, value)` for `release`/`release-prev`/`stack`/`stack-prev`,
+/// `none` dropped. Empty when the report carries no such line (an older
+/// node, or a refused apply): then the controller stages as before and the
+/// node is the authority.
+pub fn reported_floor(msg: &str) -> Vec<(String, String)> {
+    let Some(at) = msg.find("release-check: generation=") else { return Vec::new() };
+    msg[at..].split_whitespace().skip(2)
+        .take_while(|t| t.contains('='))
+        .filter_map(|t| t.split_once('='))
+        .filter(|(k, v)| ["release", "release-prev", "stack", "stack-prev"].contains(k) && *v != "none" && version_key(v).is_some())
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
 }
 
 /// The floor file's text after applying `version`: a newer final shifts the
@@ -216,7 +243,7 @@ pub fn darwin_check(
     // No final recorded yet: the CLI doing the check, when it is a final.
     let fin = fin.or_else(|| (!own_version.contains("-rc.") && version_key(own_version).is_some()).then_some(own_version));
     if let Some(f) = fin {
-        step_back_ok(&version, f, prev).map_err(|why| refuse(&format!("release {version}"), &why))?;
+        would_accept("release", &version, Some(f), prev)?;
     }
     for kind in DARWIN_LISTED.iter().copied().filter(|k| payloads.contains_key(*k)) {
         let sha = sha256_hex(&payloads[kind]);
@@ -371,18 +398,21 @@ mod tests {
         let p = bundle("0.6.27", &[("cli-binary", CLI)], &[("cli-binary", CLI)]);
         // One final back is accepted; two back is refused.
         assert!(check_as(&p, Some("release-final 0.6.28\nrelease-prev 0.6.27\n"), "0.6.28").is_ok());
-        assert!(check_as(&p, Some("release-final 0.6.29\nrelease-prev 0.6.28\n"), "0.6.29").unwrap_err().contains("steps back at most one final"));
+        assert_eq!(check_as(&p, Some("release-final 0.6.29\nrelease-prev 0.6.28\n"), "0.6.29").unwrap_err(),
+            "REFUSED release 0.6.27 — this node is ahead of its controller (it applied 0.6.29 after 0.6.28; the controller staged 0.6.27): \
+             roll the controller to 0.6.28 or later (noo upgrade --stack), then this node takes its bundles again (75)");
         // Only one final known: nothing older than it.
-        assert!(check_as(&p, Some("release-final 0.6.28\n"), "0.6.28").unwrap_err().contains("steps back at most one final"));
+        assert!(check_as(&p, Some("release-final 0.6.28\n"), "0.6.28").unwrap_err().contains("(it applied 0.6.28; the controller staged 0.6.27)"));
         assert!(check(&p, Some("release-final 0.6.27\n")).is_ok());
         assert!(check(&p, Some("release-final $(id)\n")).unwrap_err().contains("not a version"));
         // No record: the checking CLI stands in as the current final (an rc CLI does not).
-        assert!(check_as(&p, None, "0.6.28").unwrap_err().contains("steps back"));
+        assert!(check_as(&p, None, "0.6.28").unwrap_err().contains("ahead of its controller"));
         assert!(check_as(&p, None, "0.6.28-rc.1").is_ok());
         // rcs: of the current or a later release only.
         let rc = bundle("0.6.28-rc.2", &[("cli-binary", CLI)], &[("cli-binary", CLI)]);
         assert!(check_as(&rc, Some("release-final 0.6.28\nrelease-prev 0.6.27\n"), "0.6.28").is_ok());
-        assert!(check_as(&rc, Some("release-final 0.6.29\nrelease-prev 0.6.28\n"), "0.6.29").unwrap_err().contains("an rc of a release older"));
+        assert!(check_as(&rc, Some("release-final 0.6.29\nrelease-prev 0.6.28\n"), "0.6.29").unwrap_err()
+            .contains("roll the controller to 0.6.29 or later"));
         // A version text the list does not name.
         let mut q = p.clone();
         q.insert("release-version".into(), b"0.6.99\n".to_vec());
@@ -404,6 +434,22 @@ mod tests {
         let h = crate::commands::provision::DARWIN_HARNESS_PLIST.replace("__USER__", "bob");
         let p = bundle("0.6.27", &[], &[("harness-plist", h.as_bytes())]);
         assert!(check(&p, None).unwrap_err().contains("harness-plist"), "another user's plist passed");
+    }
+
+    /// The controller reads what the node last reported and asks the same question.
+    #[test]
+    fn the_reported_floor_is_read_and_judged_by_the_same_rule() {
+        let msg = "applied: agent-env release-check: generation=2 release=0.6.29 release-prev=0.6.28 stack=v0.6.29 stack-prev=none verifier=openssl binary-sha: x=y";
+        let f = reported_floor(msg);
+        let get = |k: &str| f.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str());
+        assert_eq!((get("release"), get("release-prev"), get("stack"), get("stack-prev")),
+            (Some("0.6.29"), Some("0.6.28"), Some("v0.6.29"), None));
+        assert!(reported_floor("applied: agent-env").is_empty());
+        assert!(reported_floor("release-check: generation=2 release=$(id)").is_empty());
+        assert!(would_accept("release", "0.6.28", get("release"), get("release-prev")).is_ok());
+        assert!(would_accept("release", "0.6.27", get("release"), get("release-prev")).unwrap_err().contains("roll the controller to 0.6.28 or later"));
+        assert!(would_accept("stack", "v0.6.28", get("stack"), get("stack-prev")).unwrap_err().starts_with("REFUSED stack v0.6.28 — this node is ahead"));
+        assert!(would_accept("release", "0.1.0", None, None).is_ok(), "no record: the node is the authority");
     }
 
     #[test]
