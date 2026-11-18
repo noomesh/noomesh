@@ -26,9 +26,10 @@ pub(crate) fn parse_compute_cap(s: &str) -> Option<(u32, u32)> {
     Some((maj.parse().ok()?, min.parse().ok()?))
 }
 
-/// Whether a GPU of compute capability `cap` can run the pinned vLLM. Compared
-/// as numbers (`"10.0"` is above `"7.5"`). Unknown (absent or unparsable) is
-/// NOT usable: the gate must not pass on a fact nobody established.
+/// Whether a GPU of compute capability `cap` is KNOWN to run the pinned vLLM.
+/// Compared as numbers (`"10.0"` is above `"7.5"`). False for unknown (absent
+/// or unparsable) too, so a caller that refuses must first tell unknown from
+/// below (`parse_compute_cap`): a refusal rests on a known fact.
 pub(crate) fn usable(cap: Option<&str>) -> bool {
     match (cap.and_then(parse_compute_cap), parse_compute_cap(VLLM_MIN_COMPUTE_CAP)) {
         (Some(have), Some(need)) => have >= need,

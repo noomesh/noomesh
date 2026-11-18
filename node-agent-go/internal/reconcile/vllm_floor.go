@@ -23,10 +23,10 @@ func (r *Reconciler) minComputeCap() func() (string, error) {
 
 // vllmComputeRefusal says why the pinned vLLM cannot start on this node's GPU
 // (dockerpkg.VllmMinComputeCap), or "" when it can, or the backend is not
-// vLLM. Only a KNOWN compute capability below the floor refuses here: an
-// unknown one is this agent's own probe failing (no nvidia-smi answer), and
-// the gateway, which reads the omitted gpu_compute_cap as below the floor,
-// has already refused that placement.
+// vLLM. A refusal rests on a KNOWN fact: only a compute capability known to
+// be below the floor refuses here. An unknown one (this agent's own probe
+// failing, no nvidia-smi answer) starts as asked; the gateway warned at place
+// time and the `vllm compute` verify row warns while it stays unknown.
 func vllmComputeRefusal(backend string, minCap func() (string, error)) string {
 	if (backend != "vllm" && backend != "vllm-secondary") || minCap == nil {
 		return ""

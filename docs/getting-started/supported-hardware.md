@@ -79,8 +79,10 @@ vLLM also needs a GPU of compute capability 7.5 or newer: the pinned image
 (vLLM v0.25.0) is built on CUDA 13.0, which dropped older GPUs such as the
 Tesla P40 (6.1), so onboarding does not offer it there, `noo cluster place`
 refuses it, and `noo cluster verify` fails its `vllm compute` row; use Ollama
-or llama.cpp on that GPU. A node whose agent does not report
-`gpu_compute_cap` (older than 0.6.18) counts as below the floor.
+or llama.cpp on that GPU. A refusal rests on a known fact: when the compute
+capability cannot be read (an agent older than 0.6.18, no heartbeat yet, or
+nvidia-smi failed), the place goes ahead with a warning, the verify row
+warns, and onboarding offers vLLM without recommending it.
 
 ## Check a machine before you enroll it
 
