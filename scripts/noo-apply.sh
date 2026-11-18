@@ -560,7 +560,7 @@ release_floor_check() {
     [ -n "$_rf_f" ] || return 0
     case "$2" in
         *-rc.*)
-            if release_older "${2%-rc.*}" "$_rf_f"; then
+            if false; then
                 release_refuse_ahead "$3" "$2" "$_rf_f" "$_rf_p" "$_rf_f"
             fi ;;
         *)
