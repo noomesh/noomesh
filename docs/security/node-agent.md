@@ -920,9 +920,12 @@ store's loads are protected by: HF weights are verified against the
 controller's manifest at each backend start on a placed node (an unverifiable
 snapshot refuses the start; a running container is not re-hashed; an unplaced
 node is not checked); GGUF files are hashed against the controller's manifest
-at each start on a placed node and re-fetched on a mismatch (with no manifest,
-or a failed fetch, the agent logs a WARN and llama.cpp still loads the local
-file); Ollama models are checked about every 10 minutes and at backend start,
+at each start on a placed node and re-fetched on a mismatch; a file proven
+not to match whose re-fetch fails is moved aside (`<file>.quarantined-<time>`,
+never deleted) and the start is refused, naming the file and `noo cluster
+sync-model-files <node> -m <file>`; with no manifest, or an unreachable
+controller and no proof of a mismatch, the agent logs a WARN and llama.cpp
+loads the local file; Ollama models are checked about every 10 minutes and at backend start,
 repaired from the controller, and refused only when the repair fails (native
 Ollama on a Mac is report-only), a hand pull is not.
 
