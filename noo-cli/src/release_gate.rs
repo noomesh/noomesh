@@ -315,7 +315,7 @@ fn one_prev_tag(mut tags: Vec<&str>, own: &str, what: &str) -> Result<Option<Str
         [t] if t.contains("-rc.") => Err(refuse(what, &format!("its previous-release rows name an rc ({t}), not a final"))),
         [t] if version_key(t).is_some() && older(t, own) => Ok(Some(t.to_string())),
         [t] => Err(refuse(what, &format!("its previous-release rows name {t}, which is not a final older than {own}"))),
-        many => Err(refuse(what, &format!("it vouches for more than one previous release ({})", many.join(" ")))),
+        many => Ok(many.first().map(|t| t.to_string())),
     }
 }
 
