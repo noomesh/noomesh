@@ -1503,6 +1503,24 @@ Every command it runs goes through an allow-list that refuses any firewall or
 Docker write before it executes. It does no name lookups; use
 `docs/security/egress-capture.sh` for hostnames.
 
+## The agent's unit: it writes only where it must
+
+On a node whose bundle carries an agent-env, the root applier adds
+`/etc/systemd/system/noo-node-agent.service.d/50-noomesh-protect.conf`:
+`ProtectSystem=strict`, `PrivateTmp=yes`, `ProtectHome=read-only`, and one
+`ReadWritePaths=` per path the agent writes: its state dir
+(`/var/lib/noo-node-agent`), the node's declared data roots (`NOO_DATA_ROOT`,
+`MODELS_DIR`, `HF_CACHE_DIR`, `OLLAMA_DATA_DIR`, `NOO_SKILLS_HOST_DIR`, each
+`NOO_HOST_ROOTS` entry) and Docker's container logs. The rest of the host is
+read-only to the agent process.
+
+The paths come from the agent-env, so each is checked before it is written
+into the unit: absolute and normalised, from a narrow character set (no
+whitespace, `%`, quotes or backslash), and never `/`, a system tree (`/etc`,
+`/usr`, `/boot`, `/root`, `/var/lib/docker`, …) or a parent of one, checked
+again after symlinks are resolved. One bad value leaves the installed drop-in
+as it was and the applier's line says `agent-protect=REFUSED:<KEY>`.
+
 ## What is still root
 
 `noo-hostd` is root on the node, and deliberately so: it has no listener, it
