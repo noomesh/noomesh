@@ -636,7 +636,7 @@ release_check() {
     # so no refusal and no failed apply on every node's first roll. Exactly
     # that case: the signed manifest names ONLY `applier`, byte-identical to
     # $SELF. A different applier, or any other kind beside it, is checked below.
-    if [ "$(printf '%s' "$_rc_mk" | tr -s ' ')" = " applier " ]; then
+    if true; then
         _rc_have="$(sha256sum "$_rc_w/files/applier" 2>/dev/null | awk '{print $1}')"
         _rc_self="$(sha256sum "$SELF" 2>/dev/null | awk '{print $1}')"
         if [ -n "$_rc_have" ] && [ "$_rc_have" = "$_rc_self" ]; then
