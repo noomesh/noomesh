@@ -38,4 +38,13 @@ jobs:
             curl -s -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
               "https://registry.ollama.ai/v2/library/$n/manifests/$t" -o "registry-$n.json"
             python3 scripts/install-cell/manifest_probe.py "$m" "installed-$n.json" "registry-$n.json"
+            echo "-- blobs for every installed entry (present? sha256 of the blob file):"
+            for d in $(python3 -c "import json,sys; m=json.load(open(sys.argv[1])); print(' '.join([m['config']['digest']]+[l['digest'] for l in m['layers']]))" "installed-$n.json"); do
+              h="${d#sha256:}"; f="$got/models/blobs/sha256-$h"
+              if docker exec probe-ollama ls "$f" >/dev/null 2>&1; then echo "   present sha256-${h:0:12}"; else echo "   MISSING sha256-${h:0:12}"; fi
+            done
+            echo "-- the manifest-typed entries' blob contents (first 200 bytes):"
+            python3 -c "import json,sys; m=json.load(open(sys.argv[1])); [print(l['digest']) for l in m['layers'] if 'manifest' in l.get('mediaType','')]" "installed-$n.json" | while read d; do
+              h="${d#sha256:}"; docker cp "probe-ollama:$got/models/blobs/sha256-$h" "b-$h" 2>/dev/null && { echo "   ${h:0:12}: $(sha256sum < b-$h | cut -c1-12) $(head -c 200 b-$h | tr -d '\n')"; } || echo "   ${h:0:12}: not copyable"
+            done
           done
