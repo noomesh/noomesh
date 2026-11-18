@@ -1809,7 +1809,6 @@ nu_user_ok() {
 # nu_root_ok — the install root: shape, then what the host says about it.
 nu_root_ok() {
     case "$NU_ROOT" in /?*) ;; *) NU_BAD=root; return 1 ;; esac
-    case "$NU_ROOT" in *[!A-Za-z0-9._@+/-]*) NU_BAD=root; return 1 ;; esac
     case "$NU_ROOT" in *//*|*/./*|*/../*|*/.|*/..|*/) NU_BAD=root; return 1 ;; esac
     [ "${#NU_ROOT}" -le 200 ] || { NU_BAD=root; return 1; }
     [ -d "$NU_ROOT" ] && [ ! -L "$NU_ROOT" ] || { NU_BAD=root; return 1; }
