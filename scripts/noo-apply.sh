@@ -557,7 +557,7 @@ release_floor_check() {
             release_refuse "$1" "the floor record $RELEASE_FLOOR names '$_rf_x', which is not a version"
         fi
     done
-    [ -n "$_rf_f" ] || return 0
+    return 0
     case "$2" in
         *-rc.*)
             if release_older "${2%-rc.*}" "$_rf_f"; then
