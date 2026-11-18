@@ -75,6 +75,13 @@ for the node is refused.
 `auto` picks a model the node can hold. Name one explicitly if you want a
 particular model.
 
+vLLM also needs a GPU of compute capability 7.5 or newer: the pinned image
+(vLLM v0.25.0) is built on CUDA 13.0, which dropped older GPUs such as the
+Tesla P40 (6.1), so onboarding does not offer it there, `noo cluster place`
+refuses it, and `noo cluster verify` fails its `vllm compute` row; use Ollama
+or llama.cpp on that GPU. A node whose agent does not report
+`gpu_compute_cap` (older than 0.6.18) counts as below the floor.
+
 ## Check a machine before you enroll it
 
 `noo enroll` runs a preflight before it spends the token. It prints

@@ -425,6 +425,7 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
         util::GpuDetect::Found(model, vram) => {
             ctx.state.gpu_model = model.clone();
             ctx.state.vram_gb = vram;
+            ctx.state.compute_cap = util::detect_compute_cap();
             ctx.state.tier = util::tier_for_vram(vram);
             ctx.success(&format!("GPU: {model} ({vram:.0} GB) — Tier {}", ctx.state.tier));
         }
@@ -497,13 +498,20 @@ systemctl restart docker"#;
 
     // Backends for this tier
     ctx.info("Available LLM backends for your hardware:");
-    match ctx.state.tier {
-        1 => {
+    // The hardware decides here, not the install shape: standalone is the
+    // model step's question.
+    match (ctx.state.tier, vllm_offer(ctx.state.tier, ctx.state.compute_cap.as_deref(), false)) {
+        (1, VllmOffer::BelowFloor(why)) => {
+            ctx.info("  Ollama — runs on this GPU, GGUF quantized (recommended)");
+            ctx.info("  llama.cpp — flexible, GGUF with GPU offload");
+            say_vllm_floor_once(ctx, &why);
+        }
+        (1, _) => {
             ctx.info("  vLLM — fastest inference, AWQ/GPTQ quantized (recommended)");
             ctx.info("  Ollama — simple setup, GGUF quantized");
             ctx.info("  llama.cpp — flexible, GGUF with GPU offload");
         }
-        2 => {
+        (2, _) => {
             ctx.info("  Ollama — best for 4-10 GB VRAM (recommended)");
             ctx.info("  llama.cpp — GGUF with partial GPU offload");
         }
@@ -6954,6 +6962,7 @@ pub fn first_model(ctx: &mut Ctx) {
             util::GpuDetect::Found(gpu, vram) => {
                 ctx.state.gpu_model = gpu;
                 ctx.state.vram_gb = vram;
+                ctx.state.compute_cap = util::detect_compute_cap();
                 ctx.state.tier = util::tier_for_vram(vram);
             }
             util::GpuDetect::Busy => {
@@ -6970,7 +6979,10 @@ pub fn first_model(ctx: &mut Ctx) {
     // Already-configured + cached?
     let existing_vllm = ctx.read_env("VLLM_MODEL");
     let standalone_box = ctx.repo_root.join(".noo-standalone").exists();
-    if vllm_shortcut_applies(&existing_vllm, standalone_box) && hf_model_cached(ctx, &existing_vllm) {
+    // A cached vLLM model is no shortcut on a GPU below the vLLM image's
+    // compute floor: it could not start there.
+    let below_floor = matches!(vllm_offer(ctx.state.tier, ctx.state.compute_cap.as_deref(), standalone_box), VllmOffer::BelowFloor(_));
+    if vllm_shortcut_applies(&existing_vllm, standalone_box) && !below_floor && hf_model_cached(ctx, &existing_vllm) {
         ctx.info(&format!("Model already downloaded: {existing_vllm}"));
         let keep = ctx.non_interactive || ctx.asker.confirm(&format!("Use cached model {existing_vllm}?"), true);
         if keep {
@@ -7031,12 +7043,16 @@ pub fn first_model(ctx: &mut Ctx) {
     // that will place it — and is not offered on standalone, where the
     // embed ollama already holds the GPU.
     let standalone = ctx.repo_root.join(".noo-standalone").exists();
-    let offer_vllm = ctx.state.tier == 1 && !standalone;
+    let offer = vllm_offer(ctx.state.tier, ctx.state.compute_cap.as_deref(), standalone);
+    let offer_vllm = offer == VllmOffer::Offer;
     let backend: String = if ctx.non_interactive {
         ctx.info("Auto-selected backend: ollama");
         "ollama".to_string()
     } else {
         ctx.info("1. Ollama — local inference, GGUF (recommended)");
+        if let VllmOffer::BelowFloor(why) = &offer {
+            say_vllm_floor_once(ctx, why);
+        }
         let mut max = 1;
         let vllm_choice = if offer_vllm {
             max += 1;
@@ -7183,6 +7199,45 @@ pub fn first_model(ctx: &mut Ctx) {
         // onboarding pinned every RAG answer to the one model chosen at
         // install (2026-10-17). The model still lands in the yaml as the
         // local backend's placement hint (`update_yaml_config`).
+    }
+}
+
+/// What onboarding says of vLLM on this box.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VllmOffer {
+    /// Offered as a choice, and recommended on the prereqs list.
+    Offer,
+    /// Not for this tier or install (standalone): nothing to explain.
+    No,
+    /// A tier-1 GPU below the vLLM image's compute floor, or one whose compute
+    /// capability is unknown: not offered, never recommended, and this line
+    /// says why.
+    BelowFloor(String),
+}
+
+/// Whether onboarding offers (and recommends) vLLM: a tier-1 GPU (10 GB VRAM
+/// or more), not a standalone box, and a compute capability at or above the
+/// vLLM image's floor (`crate::vllm_floor`). Unknown is below. Pure.
+pub(crate) fn vllm_offer(tier: u8, compute_cap: Option<&str>, standalone: bool) -> VllmOffer {
+    if tier != 1 || standalone {
+        return VllmOffer::No;
+    }
+    if crate::vllm_floor::usable(compute_cap) {
+        return VllmOffer::Offer;
+    }
+    let gpu = match compute_cap {
+        Some(c) => format!("this GPU is {c}"),
+        None => "nvidia-smi did not report this GPU's compute capability".to_string(),
+    };
+    VllmOffer::BelowFloor(format!("vLLM not offered: {}; {gpu} — Ollama runs models on this GPU", crate::vllm_floor::needs()))
+}
+
+/// Print why vLLM is not offered, once per run (the prereqs list and the
+/// model step both reach it).
+fn say_vllm_floor_once(ctx: &mut Ctx, why: &str) {
+    if !ctx.state.vllm_floor_said {
+        ctx.state.vllm_floor_said = true;
+        ctx.info(&format!("  {why}"));
     }
 }
 
@@ -7435,13 +7490,36 @@ mod chown_failure_tests {
 
 #[cfg(test)]
 mod first_model_probe_tests {
-    use super::{chat_probe_answered, chat_probe_body, default_model_mismatch, probe_error_is_unverifiable, vllm_shortcut_applies};
+    use super::{chat_probe_answered, chat_probe_body, default_model_mismatch, probe_error_is_unverifiable, vllm_offer, vllm_shortcut_applies, VllmOffer};
 
     #[test]
     fn a_leftover_vllm_model_does_not_short_circuit_a_standalone_install() {
         assert!(!vllm_shortcut_applies("Qwen/Qwen3-8B-AWQ", true));
         assert!(vllm_shortcut_applies("Qwen/Qwen3-8B-AWQ", false));
         assert!(!vllm_shortcut_applies("", false));
+    }
+
+    /// vLLM is offered (and recommended) only on a tier-1 GPU at or above the
+    /// vLLM image's compute floor, never on standalone; below the floor, or
+    /// unknown, it is not offered and the line says why, once.
+    #[test]
+    fn vllm_is_offered_only_on_a_tier_one_gpu_at_or_above_the_compute_floor() {
+        assert_eq!(vllm_offer(1, Some("8.6"), false), VllmOffer::Offer);
+        assert_eq!(vllm_offer(1, Some("7.5"), false), VllmOffer::Offer, "the floor itself is usable");
+        assert_eq!(vllm_offer(1, Some("10.0"), false), VllmOffer::Offer, "compared as numbers");
+        match vllm_offer(1, Some("6.1"), false) {
+            VllmOffer::BelowFloor(why) => assert!(
+                why.contains("this GPU is 6.1") && why.contains("7.5+") && why.contains("CUDA 13.0") && why.contains("Ollama runs"),
+                "{why}"
+            ),
+            other => panic!("a compute 6.1 GPU is below the floor: {other:?}"),
+        }
+        match vllm_offer(1, None, false) {
+            VllmOffer::BelowFloor(why) => assert!(why.contains("did not report"), "{why}"),
+            other => panic!("unknown counts as below: {other:?}"),
+        }
+        assert_eq!(vllm_offer(1, Some("8.6"), true), VllmOffer::No, "never on standalone");
+        assert_eq!(vllm_offer(2, Some("6.1"), false), VllmOffer::No, "tier 2 never offered it: nothing to explain");
     }
 
     #[test]

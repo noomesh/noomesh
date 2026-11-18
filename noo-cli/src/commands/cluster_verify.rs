@@ -517,6 +517,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     out.extend(door_pin_check(n));
     out.extend(gpu_target_cpu_build_check(n));
     out.extend(llamacpp_offload_check(n));
+    out.extend(vllm_compute_check(n));
     out.extend(hardened_images_check(n));
 
     // 6c''. Vendor telemetry (docs/security/telemetry.md): no running
@@ -1415,6 +1416,48 @@ pub(crate) fn llamacpp_offload_check(n: &Value) -> Option<Check> {
     (!good.is_empty()).then(|| ok(NAME, good.join(", ")))
 }
 
+/// The running vLLM placements of a node's desired config, as `<backend>
+/// <model>` (both vLLM backends run the one pinned image).
+pub(crate) fn vllm_placements(placements: &Value) -> Vec<String> {
+    placements
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|p| matches!(p["backend"].as_str(), Some("vllm" | "vllm-secondary")) && p["desired_state"] != "stopped")
+                .map(|p| format!("{} {}", p["backend"].as_str().unwrap_or(""), p["model"].as_str().unwrap_or("")).trim_end().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `vllm compute` row: a vLLM placement (`vllm_placements`, injected by
+/// `with_harness_wanted` from desired-config) on a node whose GPU is below the
+/// vLLM image's compute floor (`crate::vllm_floor`) can never start: FAIL
+/// naming it, the node's `gpu_compute_cap` and the floor, with the remedy
+/// (unplace it, place the model on ollama or llamacpp). A node that does not
+/// report `gpu_compute_cap` (an agent older than 0.6.18, or one whose
+/// nvidia-smi cannot answer) counts as below. No row without a vLLM placement
+/// or at/above the floor.
+pub(crate) fn vllm_compute_check(n: &Value) -> Option<Check> {
+    let id = n["id"].as_str().unwrap_or("?");
+    let placed: Vec<&str> = n["vllm_placements"].as_array()?.iter().filter_map(Value::as_str).collect();
+    let first = placed.first()?;
+    let cap = n["gpu_compute_cap"].as_str();
+    if crate::vllm_floor::usable(cap) {
+        return None;
+    }
+    let gpu = match cap {
+        Some(c) => format!("its GPU is compute {c}"),
+        None => "it does not report gpu_compute_cap (an agent older than 0.6.18, or its nvidia-smi cannot answer), which counts as below".to_string(),
+    };
+    let backend = first.split(' ').next().unwrap_or("vllm");
+    Some(fail(
+        "vllm compute",
+        format!("{id}: {} placed, but {}; {gpu}", placed.join(", "), crate::vllm_floor::needs()),
+        format!("noo cluster unplace {id} {backend}   # then: noo cluster place {id} ollama <model> (Ollama runs this GPU), or llamacpp"),
+    ))
+}
+
 /// The hardened image of ours that replaces an upstream backend image
 /// (noomesh-internal i323, operator decision 3): upstream `ollama/ollama` ->
 /// `<ns>/ollama:<tag>`, upstream `ghcr.io/ggml-org/llama.cpp` ->
@@ -2109,6 +2152,9 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
         .as_ref()
         .map(|d| crate::commands::cluster_tune::gpu_targets_on_cpu_builds(&d["placements"], &n))
         .unwrap_or_default();
+    // The `vllm compute` row: the vLLM placements, judged against the node's
+    // gpu_compute_cap.
+    let vllm_placed = desired.as_ref().map(|d| vllm_placements(&d["placements"])).unwrap_or_default();
     // Control over the bus: a node that advertises it gets one health round
     // trip over NATS, run by the gateway (the only principal that may send).
     // Nothing is asked of a node that does not advertise, so its row reads
@@ -2140,6 +2186,9 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
         }
         if !cpu_built.is_empty() {
             obj.insert("gpu_targets_on_cpu_builds".into(), serde_json::json!(cpu_built));
+        }
+        if !vllm_placed.is_empty() {
+            obj.insert("vllm_placements".into(), serde_json::json!(vllm_placed));
         }
         if let Some(w) = wanted {
             obj.insert("harness_wanted".into(), Value::Bool(w));
@@ -12668,6 +12717,33 @@ mod tests {
         let inject = crate::test_src::fn_body(&own, "fn with_harness_wanted(");
         assert!(inject.contains("gpu_targets_on_cpu_builds(&d[\"placements\"], &n)"), "fed from desired-config and the node's GPU facts");
         assert!(own.contains("out.extend(gpu_target_cpu_build_check(n));"), "the row is in the run");
+    }
+
+    /// The `vllm compute` row FAILs when a vLLM placement sits on a node below
+    /// the vLLM image's compute floor (or one that does not report its compute
+    /// capability), naming it, the floor and the remedy; no row otherwise.
+    #[test]
+    fn vllm_compute_row_fails_a_vllm_placement_below_the_floor() {
+        use serde_json::json;
+        let placed = vllm_placements(&json!([
+            {"backend": "vllm", "model": "org/gemma", "desired_state": "running"},
+            {"backend": "vllm-secondary", "model": "org/qwen", "desired_state": "stopped"},
+            {"backend": "ollama", "model": "gemma4:12b", "desired_state": "running"},
+        ]));
+        assert_eq!(placed, vec!["vllm org/gemma".to_string()], "running vLLM placements only");
+        let n = json!({"id": "node-a", "gpu_compute_cap": "6.1", "vllm_placements": placed});
+        let c = vllm_compute_check(&n).expect("a row");
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("node-a") && c.detail.contains("vllm org/gemma") && c.detail.contains("compute 6.1") && c.detail.contains("7.5+"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref().unwrap().split("   #").next().unwrap(), "noo cluster unplace node-a vllm");
+        let unknown = vllm_compute_check(&json!({"id": "node-a", "vllm_placements": ["vllm org/gemma"]})).expect("unknown counts as below");
+        assert!(unknown.detail.contains("does not report gpu_compute_cap"), "{}", unknown.detail);
+        assert!(vllm_compute_check(&json!({"id": "node-a", "gpu_compute_cap": "8.6", "vllm_placements": ["vllm org/gemma"]})).is_none(), "at/above the floor: no row");
+        assert!(vllm_compute_check(&json!({"id": "node-a", "gpu_compute_cap": "6.1"})).is_none(), "no vLLM placed: no row");
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let inject = crate::test_src::fn_body(&own, "fn with_harness_wanted(");
+        assert!(inject.contains("vllm_placements(&d[\"placements\"])"), "fed from desired-config");
+        assert!(own.contains("out.extend(vllm_compute_check(n));"), "the row is in the run");
     }
 
     const VLLM_PIN: &str = "sha256:8a3e44b7e3a1aef61a0852c444a01df319b506bf87083fef93c21367e6bffa2b";
