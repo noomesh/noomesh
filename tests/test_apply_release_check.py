@@ -323,7 +323,7 @@ def test_the_check_does_not_read_any_key_a_bundle_installs() -> None:
 def test_a_generation_1_applier_is_refused(fleet: Fleet) -> None:
     old = re.sub(rb"(?m)^NOO_APPLY_GENERATION=\d+$", b"NOO_APPLY_GENERATION=1", APPLIER.read_bytes())
     r = fleet.apply(fleet.bundle({"applier": old}))
-    assert r.returncode == 65 and "generation 1, older than this one (2)" in r.stderr, (r.stdout, r.stderr)
+    assert r.returncode == 75 and "applier generation 1, which has no release check" in r.stderr, (r.stdout, r.stderr)
 
 
 # ── the pins ────────────────────────────────────────────────────────────────
@@ -454,3 +454,72 @@ def test_the_shell_and_rust_ahead_lines_are_the_same_words() -> None:
     for frag in ["this node is ahead of its controller (it applied ", "; the controller staged ",
                  " or later (noo upgrade --stack), then this node takes its bundles again ("]:
         assert frag in TEXT and frag in rs, frag
+
+
+# ── every release vouches for its previous final (`@v<prev>` rows) ──────────
+
+def _sha(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
+def test_a_one_back_agent_row_is_accepted_and_moves_nothing(fleet: Fleet) -> None:
+    fleet.floor.write_text("stack-final v0.6.28\nstack-prev v0.6.27\n")
+    files = {"agent-binary": PAYLOADS["agent-binary"]}
+    proof = fleet.release_proof(files, stack="v0.6.28", unlisted_kinds=("agent-binary",),
+                                extra_lock_rows=(f"# node-agent-sha256@v0.6.27 linux/amd64 {_sha(PAYLOADS['agent-binary'])}",))
+    r = fleet.apply(fleet.bundle({**files, **proof}))
+    passed(r)
+    assert "stack=v0.6.27" in r.stdout, r.stdout
+
+
+def test_a_two_back_agent_row_is_refused_as_ahead(fleet: Fleet) -> None:
+    fleet.floor.write_text("stack-final v0.6.29\nstack-prev v0.6.28\n")
+    files = {"agent-binary": PAYLOADS["agent-binary"]}
+    proof = fleet.release_proof(files, stack="v0.6.28", unlisted_kinds=("agent-binary",),
+                                extra_lock_rows=(f"# node-agent-sha256@v0.6.27 linux/amd64 {_sha(PAYLOADS['agent-binary'])}",))
+    r = fleet.apply(fleet.bundle({**files, **proof}))
+    assert r.returncode == 75 and ("REFUSED stack v0.6.27 — this node is ahead of its controller (it applied v0.6.29 after v0.6.28; "
+                                   "the controller staged v0.6.27)") in r.stderr, r.stderr
+
+
+@pytest.mark.parametrize("final,prev,ok", [("0.6.28", "0.6.27", True), ("0.6.29", "0.6.28", False)])
+def test_a_previous_release_hostd_row_is_judged_as_that_release(fleet: Fleet, final: str, prev: str, ok: bool) -> None:
+    fleet.floor.write_text(f"release-final {final}\nrelease-prev {prev}\n")
+    files = {"hostd-binary": PAYLOADS["hostd-binary"]}
+    proof = fleet.release_proof(files, version="0.6.28", unlisted_kinds=("hostd-binary",),
+                                extra_sums_rows=(f"{_sha(PAYLOADS['hostd-binary'])}  noo-hostd-x86_64-unknown-linux-gnu@v0.6.27",))
+    r = fleet.apply(fleet.bundle({**files, **proof}))
+    if ok:
+        passed(r)
+        assert "release-check: verified release=0.6.27 " in r.stdout, r.stdout
+    else:
+        assert r.returncode == 75 and "REFUSED release 0.6.27 — this node is ahead of its controller" in r.stderr, r.stderr
+
+
+def test_a_previous_release_row_never_carries_a_generation_1_applier(fleet: Fleet) -> None:
+    old = re.sub(rb"(?m)^NOO_APPLY_GENERATION=\d+$", b"NOO_APPLY_GENERATION=1", APPLIER.read_bytes())
+    files = {"applier": old}
+    proof = fleet.release_proof(files, unlisted_kinds=("applier",), extra_sums_rows=(f"{_sha(old)}  noo-apply.sh@v0.6.26",))
+    refused(fleet.apply(fleet.bundle({**files, **proof})), "applier generation 1, which has no release check")
+
+
+@pytest.mark.parametrize("rows,why", [
+    (("{h}  noo-hostd-x86_64-unknown-linux-gnu@v0.6.26", "{z}  noo-fetch.sh@v0.6.25"), "more than one previous release"),
+    (("{h}  noo-hostd-x86_64-unknown-linux-gnu@v0.6.27",), "not a final older than 0.6.27"),
+    (("{h}  noo-hostd-x86_64-unknown-linux-gnu@v0.6.28",), "not a final older than 0.6.27"),
+    (("{h}  noo-hostd-x86_64-unknown-linux-gnu@v0.6.26-rc.2",), "name an rc"),
+    (("{h}  noo-hostd-x86_64-unknown-linux-gnu@vbogus",), "not a final older than"),
+], ids=["two-tags", "same-release", "newer", "rc", "not-a-version"])
+def test_a_list_names_one_previous_final_only(fleet: Fleet, rows: tuple[str, ...], why: str) -> None:
+    files = {"hostd-binary": PAYLOADS["hostd-binary"]}
+    rows = tuple(r.format(h=_sha(PAYLOADS["hostd-binary"]), z="0" * 64) for r in rows)
+    proof = fleet.release_proof(files, unlisted_kinds=("hostd-binary",), extra_sums_rows=rows)
+    refused(fleet.apply(fleet.bundle({**files, **proof})), why)
+
+
+def test_a_lock_names_one_previous_final_only(fleet: Fleet) -> None:
+    files = {"agent-binary": PAYLOADS["agent-binary"]}
+    a = _sha(PAYLOADS["agent-binary"])
+    proof = fleet.release_proof(files, stack="v0.6.27", unlisted_kinds=("agent-binary",),
+                                extra_lock_rows=(f"# node-agent-sha256@v0.6.26 linux/amd64 {a}", f"# node-agent-sha256@v0.6.25 linux/arm64 {a}"))
+    refused(fleet.apply(fleet.bundle({**files, **proof})), "release-lock — it vouches for more than one previous release")
