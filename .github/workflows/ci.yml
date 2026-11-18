@@ -316,7 +316,12 @@ jobs:
         while IFS= read -r f; do
           [ -n "$f" ] || continue
           case "$f" in
-            docs/*|internal/*|*.md)   ;;
+            # docs/ and README.md arm the CLI lane: its unit tests hold every
+            # documented `noo …` line to the CLI's own usage table
+            # (hint_lint::every_documented_command_parses, noomesh#1320). A
+            # docs-only change ran none of them before, PR or merge queue.
+            docs/*|README.md)         cli=true ;;
+            internal/*|*.md)          ;;
             # The gateway also owns the sqlx offline data and the mesh
             # migrations that sqlx-drift diffs against Alembic.
             gateway-rust/*)           gateway=true; sqlx=true; ui=true ;;
