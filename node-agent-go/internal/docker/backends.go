@@ -255,6 +255,19 @@ func pkiServiceLeafTarget(service string) string {
 	return "/app/pki/services/" + service
 }
 
+// The vLLM image the "vllm" spec below pins, the CUDA it is built on, and the
+// lowest GPU compute capability that CUDA supports. CUDA 13 dropped compute
+// capability below 7.5 (Pascal, Volta), so this vLLM cannot start on such a
+// GPU. A property of the IMAGE: tests/test_vllm_compute_floor.py fails when
+// the pin moves and these do not. The gateway (routes/cluster.rs
+// VLLM_MIN_COMPUTE_CAP) and the CLI (noo-cli/src/vllm_floor.rs) declare the
+// same floor.
+const (
+	VllmImageTag      = "v0.25.0"
+	VllmImageCUDA     = "13.0"
+	VllmMinComputeCap = "7.5"
+)
+
 // backendSpecs defines container configurations matching docker-compose.cluster.yml.
 // These are the same configs the compose file defines, expressed as Go structs.
 var backendSpecs = map[string]BackendSpec{

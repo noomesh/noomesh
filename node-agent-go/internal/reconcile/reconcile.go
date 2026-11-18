@@ -913,6 +913,14 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 		if !r.ggufPresent(ctx, t, p) {
 			return
 		}
+		// The vLLM image's compute floor: a GPU its CUDA cannot drive would
+		// crash-loop the engine. Refused, and recorded for the `backend
+		// starts` verify row; the gateway refuses such a placement too.
+		if why := vllmComputeRefusal(p.Backend, r.minComputeCap()); why != "" {
+			slog.Error("reconcile.backend_refused", "backend", p.Backend, "reason", why)
+			refusals.Record("backend_start", p.Backend, why)
+			return
+		}
 
 		extraEnv := buildPlacementEnv(p)
 		slog.Info("reconcile.starting_backend",
@@ -967,6 +975,9 @@ func (r *Reconciler) reportAndCleanup(ctx context.Context, t *tick) bool {
 	// A harness whose placement was REMOVED is never visited by the loop
 	// above, which only walks placements that exist. Stop it here.
 	r.reapUnplacedHarness(ctx, t.desired.Placements)
+	// Nor does a vLLM backend no longer placed keep its start refusal: the
+	// compute-floor refusal's remedy IS the unplace.
+	clearUnplacedVllmRefusals(t.desired.Placements)
 	// A placement that was removed or stopped must stop reporting a model
 	// presence; only still-wanted ollama placements keep one.
 	// Keys of every still-wanted ollama placement survive, including the

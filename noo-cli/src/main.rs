@@ -99,6 +99,7 @@ mod tailnet_serve;
 mod ui;
 mod usage;
 mod vendor;
+mod vllm_floor;
 
 use output::{fail, ExitCode};
 
