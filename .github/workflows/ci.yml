@@ -2026,6 +2026,17 @@ jobs:
         # pin) and the binary, with the runtime stage's libraries, must start.
         docker run --rm --entrypoint sh noomesh-llamacpp:${{ github.sha }} \
           -c 'cat /opt/llama/LLAMACPP_COMMIT && llama-server --version'
+        # The pin is proven IN the image, not only in the Dockerfile: the
+        # commit the image records and the binary reports must be what
+        # LLAMACPP_REF resolves to upstream, read independently here.
+        ref="$(sed -n 's/^ARG LLAMACPP_REF=//p' docker/Dockerfile.llamacpp | head -n 1)"
+        want="$(git ls-remote https://github.com/ggml-org/llama.cpp "refs/tags/$ref^{}" "refs/tags/$ref" | awk 'NR==1{print $1}')"
+        [ -n "$want" ] || { echo "::error::could not resolve llama.cpp $ref upstream"; exit 1; }
+        got="$(docker run --rm --entrypoint cat noomesh-llamacpp:${{ github.sha }} /opt/llama/LLAMACPP_COMMIT)"
+        ver="$(docker run --rm --entrypoint llama-server noomesh-llamacpp:${{ github.sha }} --version 2>&1 | sed -n 's/^version: [0-9]* (\([0-9a-f]*\)).*/\1/p' | head -n 1)"
+        echo "llama.cpp $ref = $want; image records $got; binary reports $ver"
+        [ "$got" = "$want" ] || { echo "::error::the image holds llama.cpp $got, not $ref ($want)"; exit 1; }
+        case "$want" in "$ver"*) ;; *) echo "::error::llama-server reports $ver, not $ref ($want)"; exit 1;; esac
         docker rmi noomesh-llamacpp:${{ github.sha }} >/dev/null 2>&1 || true
 
   llamacpp-cuda-image:
@@ -2089,6 +2100,17 @@ jobs:
         img=noomesh-llamacpp-cuda:${{ github.sha }}
         # Which llama.cpp it holds, and the binary starts (exit 0).
         docker run --rm --entrypoint sh "$img" -c 'cat /opt/llama/LLAMACPP_COMMIT && llama-server --version'
+        # The pin is proven IN the image, not only in the Dockerfile: the
+        # commit the image records and the binary reports must be what
+        # LLAMACPP_REF resolves to upstream, read independently here.
+        ref="$(sed -n 's/^ARG LLAMACPP_REF=//p' docker/Dockerfile.llamacpp-cuda | head -n 1)"
+        want="$(git ls-remote https://github.com/ggml-org/llama.cpp "refs/tags/$ref^{}" "refs/tags/$ref" | awk 'NR==1{print $1}')"
+        [ -n "$want" ] || { echo "::error::could not resolve llama.cpp $ref upstream"; exit 1; }
+        got="$(docker run --rm --entrypoint cat "$img" /opt/llama/LLAMACPP_COMMIT)"
+        ver="$(docker run --rm --entrypoint llama-server "$img" --version 2>&1 | sed -n 's/^version: [0-9]* (\([0-9a-f]*\)).*/\1/p' | head -n 1)"
+        echo "llama.cpp $ref = $want; image records $got; binary reports $ver"
+        [ "$got" = "$want" ] || { echo "::error::the image holds llama.cpp $got, not $ref ($want)"; exit 1; }
+        case "$want" in "$ver"*) ;; *) echo "::error::llama-server reports $ver, not $ref ($want)"; exit 1;; esac
         # --list-devices (llama.cpp b9628 common/arg.cpp): loads every backend
         # module, prints "Available devices:" and one line per NON-CPU
         # device ("  CUDA0: <name> (<n> MiB, <n> MiB free)"), exits 0. With no
