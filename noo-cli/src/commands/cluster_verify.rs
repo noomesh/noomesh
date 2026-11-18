@@ -632,7 +632,7 @@ pub(crate) fn model_stores_check(id: &str, n: &Value) -> Option<Check> {
     }
     let guard = |store: &str| match store {
         "hf_cache" => "HF weights are verified against the controller's manifest at each backend start, on a placed node only",
-        "models" => "GGUF files are hashed against the controller's manifest at each start on a placed node, only when it has one",
+        "models" => "GGUF files are re-verified at start only when the controller has a manifest for them",
         "ollama" => "Ollama models are checked against the controller's record about every 10 minutes and at backend start, when it holds one (the `ollama models` row); a hand pull is not",
         _ => "anyone can rename or replace the stores under it",
     };
