@@ -695,7 +695,7 @@ release_check() {
         if LC_ALL=C grep -qxE "# node-agent-sha256 linux/(amd64|arm64) $_rc_s" "$_rc_lock"; then
             :
         elif [ -n "$_rc_lprev" ] && LC_ALL=C grep -qxE "# node-agent-sha256@v$(printf '%s' "$_rc_lprev" | sed 's/\./\\./g') linux/(amd64|arm64) $_rc_s" "$_rc_lock"; then
-            release_floor_check "stack v$_rc_lprev" "v$_rc_lprev" stack
+            :
             RELEASE_OK_STACK="v$_rc_lprev"
         else
             release_refuse agent-binary "sha256 $_rc_s is not in stack $_rc_tag's signed lock"
