@@ -459,14 +459,72 @@ pub fn upload_url(scheme: &str, host: &str, location: &str, digest: &str) -> Res
 /// Push `plan` to `root` under every tag, then read each tag back through
 /// `fetcher` (the upgrade's own fetch) and require the bytes pushed. The
 /// error names the artifact (`<root>:stack-<tag>`) it failed on.
-pub fn publish(pusher: &Pusher, fetcher: &lock_fetch::Client, root: &str, plan: &Plan) -> Result<Vec<Published>, String> {
-    let scrubbed = |e: String| scrub(&e, pusher.cred.as_ref());
-    let (host, path) = lock_fetch::split_root(root).ok_or_else(|| format!("registry root {root:?} is not host/path"))?;
+/// What stopped a publish, so the CLI's hint names what to do about it
+/// (rc.1 rehearsal: a refused https connection was told to get a token).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishFailure {
+    /// The registry did not answer over https.
+    Network,
+    /// The registry's certificate (or its token realm) was not trusted.
+    Tls,
+    /// The registry refused the push: the credential, or the package.
+    Auth,
+    /// Pushed, then read back missing or different.
+    ReadBack,
+    /// Anything else: the message names the request.
+    Other,
+}
+
+impl PublishFailure {
+    /// The kind of a failed push request.
+    pub(crate) fn of_push(class: FetchClass) -> Self {
+        match class {
+            FetchClass::Network => PublishFailure::Network,
+            FetchClass::Tls => PublishFailure::Tls,
+            FetchClass::Auth | FetchClass::NotFound => PublishFailure::Auth,
+            FetchClass::RateLimited | FetchClass::Server | FetchClass::Other => PublishFailure::Other,
+        }
+    }
+
+    /// What to do next.
+    pub fn hint(self) -> &'static str {
+        match self {
+            PublishFailure::Network => "the registry did not answer over https: check the root's host, and that it serves \
+                https on the default port. A plain-http registry (a local registry:2, say) cannot be published to, \
+                because the publish and every user's fetch speak https only",
+            PublishFailure::Tls => "this machine does not trust the registry's certificate: add the CA that signed it \
+                to the system trust store; verification is never turned off",
+            PublishFailure::Auth => "the registry refused the push: it needs a token that can write the package \
+                (--token-file, or GH_TOKEN), under a root that token may create or write",
+            PublishFailure::ReadBack => "the registry does not serve back what was pushed, so nothing under that tag \
+                is safe to upgrade to; publish again, and check the registry if it repeats",
+            PublishFailure::Other => "the message names the request that failed; `--dry-run` shows what would be pushed",
+        }
+    }
+}
+
+/// A failed publish: its kind and what happened (token-free).
+#[derive(Debug, Clone)]
+pub struct PublishError {
+    pub kind: PublishFailure,
+    pub message: String,
+}
+
+impl std::fmt::Display for PublishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+pub fn publish(pusher: &Pusher, fetcher: &lock_fetch::Client, root: &str, plan: &Plan) -> Result<Vec<Published>, PublishError> {
+    let err = |kind: PublishFailure, e: String| PublishError { kind, message: scrub(&e, pusher.cred.as_ref()) };
+    let (host, path) = lock_fetch::split_root(root)
+        .ok_or_else(|| err(PublishFailure::Other, format!("registry root {root:?} is not host/path")))?;
     let mut uploaded = 0;
     for b in std::iter::once(&plan.config).chain(plan.layers.iter()) {
         let up = pusher
             .push_blob(host, path, b)
-            .map_err(|e| scrubbed(format!("{root}: {}", e.summary())))?;
+            .map_err(|e| err(PublishFailure::of_push(e.class), format!("{root}: {}", e.summary())))?;
         uploaded += usize::from(up);
     }
     let route = lock_fetch::Route::Direct { root: root.to_string() };
@@ -475,11 +533,12 @@ pub fn publish(pusher: &Pusher, fetcher: &lock_fetch::Client, root: &str, plan: 
         let reference = lock_fetch::artifact_ref(root, tag);
         pusher
             .push_manifest(host, path, &lock_fetch::lock_tag(tag), &plan.manifest)
-            .map_err(|e| scrubbed(format!("{reference}: {}", e.summary())))?;
+            .map_err(|e| err(PublishFailure::of_push(e.class), format!("{reference}: {}", e.summary())))?;
         let got = fetcher
             .fetch_via(&route, tag)
-            .map_err(|e| scrubbed(format!("{reference} was pushed and does not read back: {}", e.summary())))?;
-        read_back_matches(plan, &got).map_err(|e| scrubbed(format!("{reference} was pushed and reads back wrong: {e}")))?;
+            .map_err(|e| err(PublishFailure::ReadBack, format!("{reference} was pushed and does not read back: {}", e.summary())))?;
+        read_back_matches(plan, &got)
+            .map_err(|e| err(PublishFailure::ReadBack, format!("{reference} was pushed and reads back wrong: {e}")))?;
         let first = out.is_empty();
         out.push(Published { tag: tag.clone(), reference, uploaded: if first { uploaded } else { 0 } });
     }
@@ -646,7 +705,7 @@ mod tests {
         Inputs { bundle, bundle_sig: format!("{bsig}\n"), v1: Some((v1, format!("{v1sig}\n"))), files }
     }
 
-    fn run(opts: Opts, state: Arc<Mutex<State>>, push: Option<Credential>, read: Option<Credential>) -> (Server, Plan, Result<Vec<Published>, String>) {
+    fn run(opts: Opts, state: Arc<Mutex<State>>, push: Option<Credential>, read: Option<Credential>) -> (Server, Plan, Result<Vec<Published>, PublishError>) {
         let reg = registry(opts, state);
         let r = root(&reg);
         let plan = plan(inputs(&r), &r).expect("plan");
@@ -761,6 +820,9 @@ mod tests {
         let wrong = "fake-wrong-token-0002";
         let (_, _, out) = run(opts, Arc::new(Mutex::new(State::default())), Some(cred(wrong)), Some(cred(wrong)));
         let e = out.expect_err("refused");
+        assert_eq!(e.kind, PublishFailure::Auth, "{e}");
+        assert!(e.kind.hint().contains("needs a token that can write the package"), "{e}");
+        let e = e.message;
         assert!(e.contains("access refused") && e.contains("HTTP 401"), "{e}");
         assert!(!e.contains(wrong) && !e.contains(TOKEN), "{e}");
     }
@@ -771,6 +833,8 @@ mod tests {
         let opts = Opts { swap_lock: Some(b"another lock".to_vec()), ..Opts::default() };
         let (_, _, out) = run(opts, state, None, None);
         let e = out.expect_err("verify-on-publish refuses it");
+        assert_eq!(e.kind, PublishFailure::ReadBack, "{e}");
+        let e = e.message;
         assert!(e.contains(":stack-v0.6.23") && e.contains("reads back wrong"), "{e}");
         assert!(e.contains(&addon_lock::sha256_ref(b"another lock")), "{e}");
     }
@@ -788,7 +852,47 @@ mod tests {
         let r = root(&reg);
         let plan = plan(inputs(&r), &r).unwrap();
         let e = publish(&Pusher::plain_http_for_tests(None), &lock_fetch::Client::plain_http_for_tests(None), &r, &plan).unwrap_err();
+        assert_eq!(e.kind, PublishFailure::ReadBack, "{e}");
+        assert!(e.kind.hint().contains("does not serve back what was pushed"), "{e}");
+        let e = e.message;
         assert!(e.contains(":stack-v0.6.23 was pushed and does not read back") && e.contains("not found"), "{e}");
+    }
+
+    #[test]
+    fn https_to_a_host_that_does_not_answer_is_a_network_failure_never_a_token_hint() {
+        // The rc.1 rehearsal's case: the production (https-only) pusher, and
+        // nothing listening on the host's https port.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let r = format!("127.0.0.1:{port}/{PATH}");
+        let plan = plan(inputs(&r), &r).unwrap();
+        let e = publish(&Pusher::new(None), &lock_fetch::Client::new(None), &r, &plan).unwrap_err();
+        assert_eq!(e.kind, PublishFailure::Network, "{e}");
+        assert!(e.message.contains(&format!("https://127.0.0.1:{port}/v2/")), "{e}");
+        let h = e.kind.hint();
+        assert!(h.contains("did not answer over https") && h.contains("plain-http registry"), "{h}");
+        assert!(!h.contains("token"), "a network failure is not told to get a token: {h}");
+    }
+
+    #[test]
+    fn every_push_class_maps_to_its_own_hint() {
+        use PublishFailure as P;
+        for (class, want) in [
+            (FetchClass::Network, P::Network),
+            (FetchClass::Tls, P::Tls),
+            (FetchClass::Auth, P::Auth),
+            (FetchClass::NotFound, P::Auth),
+            (FetchClass::RateLimited, P::Other),
+            (FetchClass::Server, P::Other),
+            (FetchClass::Other, P::Other),
+        ] {
+            assert_eq!(P::of_push(class), want, "{class:?}");
+        }
+        assert!(P::Tls.hint().contains("trust store") && !P::Tls.hint().contains("token"));
+        let hints = [P::Network, P::Tls, P::Auth, P::ReadBack, P::Other].map(P::hint);
+        for (i, a) in hints.iter().enumerate() {
+            assert!(hints[i + 1..].iter().all(|b| b != a), "two kinds share a hint: {a}");
+        }
+        assert_eq!(hints.iter().filter(|h| h.contains("token")).count(), 1, "only the auth hint names a token");
     }
 
     #[test]
