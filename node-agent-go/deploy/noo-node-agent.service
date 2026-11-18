@@ -43,6 +43,11 @@ ExecStart=/usr/local/bin/noo-node-agent
 # agent deliberately is `systemctl stop`, which Restart= does not override.
 Restart=always
 RestartSec=30
+# A stop drains first: streams a caller is reading may finish for up to
+# 30 s (the agent's stop drain bound). This is that bound plus 20 s for the
+# rest of the shutdown, so systemd's SIGKILL never lands inside the drain.
+# systemd's default (90 s) is a host setting, not a promise; this is one.
+TimeoutStopSec=50
 
 # Environment (override via /etc/noo-node-agent.env)
 EnvironmentFile=-/etc/noo-node-agent.env
