@@ -631,9 +631,9 @@ pub(crate) fn model_stores_check(id: &str, n: &Value) -> Option<Check> {
         return Some(ok(NAME, format!("none world-writable ({checked} store director{} checked)", if checked == 1 { "y" } else { "ies" })));
     }
     let guard = |store: &str| match store {
-        "hf_cache" => "HF weights are re-verified against the controller's manifest on load",
-        "models" => "GGUF files are re-verified at start only when the controller has a manifest for them",
-        "ollama" => "Ollama models are re-verified against the controller when it holds a record of them (the `ollama models` row); a hand pull is not",
+        "hf_cache" => "HF weights are verified against the controller's manifest at each backend start, on a placed node only",
+        "models" => "GGUF files are hashed against the controller's manifest at each start on a placed node, only when it has one",
+        "ollama" => "Ollama models are checked against the controller's record about every 10 minutes and at backend start, when it holds one (the `ollama models` row); a hand pull is not",
         _ => "anyone can rename or replace the stores under it",
     };
     let mut parts = Vec::new();
@@ -15636,7 +15636,8 @@ mod model_stores_tests {
         let c = model_stores_check("awolf", &n).unwrap();
         assert_eq!(c.verdict, Verdict::Warn);
         for want in ["2 world-writable", "/data/noo/hf-cache (mode 0777, owner 1000:1000",
-            "HF weights are re-verified", "/data/noo/ollama", "Ollama models are re-verified against the controller when it holds a record"] {
+            "HF weights are verified against the controller's manifest at each backend start, on a placed node only", "/data/noo/ollama",
+            "Ollama models are checked against the controller's record about every 10 minutes"] {
             assert!(c.detail.contains(want), "{want}: {}", c.detail);
         }
         let r = c.remedy.unwrap();
@@ -15652,7 +15653,7 @@ mod model_stores_tests {
         let c = node_checks(&n, "", "", 0, None);
         let row = c.iter().find(|c| c.name == "model stores").expect("a model stores row");
         assert_eq!(row.verdict, Verdict::Warn);
-        assert!(row.detail.contains("GGUF files are re-verified at start only when the controller has a manifest"), "{}", row.detail);
+        assert!(row.detail.contains("GGUF files are hashed against the controller's manifest at each start on a placed node, only when it has one"), "{}", row.detail);
     }
 }
 

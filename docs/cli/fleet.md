@@ -46,7 +46,7 @@ By default this also mints a tagged Tailscale auth key and prints a
 self-contained paste:
 
 ```
-run AS YOUR USER on the node (one sudo prompt)
+run AS YOUR USER on the node (it runs several sudo commands; sudo asks for your password)
 step 1 — make sure the noo CLI is on the node (skip if `noo --version` already works):
   command -v noo >/dev/null || { curl -fsSL https://github.com/noomesh/noomesh/releases/latest/download/install.sh -o install.sh && sh install.sh; }
 step 2 — enroll (joins the tailnet, runs host prep, installs the agent):
