@@ -980,9 +980,14 @@ gateway's Ollama and writes the record. `noo models pull` reaches no other
 node, so on any other node (a container or a Mac's native Ollama) the remedy
 stages the tag on the controller and imports it there: `noo models fetch
 ollama:<tag>`, then `noo cluster import-model <node> ollama:<tag>` (harrier, an
-artifact: `noo cluster import-model <node> harrier`). The record is written only
-when the manifest the controller fetched names exactly what the pull
-installed; a tag that moved in between leaves none (run it again). An
+artifact: `noo cluster import-model <node> harrier`). The record is the
+manifest the pull installed, written only when every layer the registry's
+manifest names (config, weights, template, parameters, licence) is in it with
+the same digest and size, and it adds only the manifest Ollama pulled (whose
+digest must be the registry manifest the controller fetched) and the list
+that named it. So every layer matches what the registry served at the pull. A
+tag that moved between the two requests leaves no record and says so; any
+other difference names the entries that differ. An
 `hf.co/` ref has no record and no remedy. A placed node (rail, pull-only)
 still needs the bytes staged with `noo models fetch ollama:<tag>`: importing
 from a record alone is refused by name.

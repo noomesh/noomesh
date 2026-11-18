@@ -310,8 +310,10 @@ What it does, in order:
   hashes any file not yet hashed).
 
 `noo models pull <tag>` and onboard's first model write only the manifest
-(the controller's record of the pull, no blob), and only when it names exactly
-what the pull installed. Verify-on-load checks against it; a placed node
+(the controller's record of the pull, no blob): the manifest the pull
+installed, and only when every layer the registry's manifest names is in it
+unchanged and it adds nothing but the manifest Ollama pulled (the registry's
+own, by its sha256) and the list that named it. Verify-on-load checks against it; a placed node
 cannot import from it and is told to run `noo models fetch ollama:<tag>`.
 
 On the node, reconcile asks the store about a placed tag it does not hold; a
