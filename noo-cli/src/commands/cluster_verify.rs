@@ -606,11 +606,28 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
         (Some(p), s) => out.push(ok("harness", format!("{} (policy {p})", if s.is_empty() { "-" } else { s }))),
     } }
     out.extend(model_stores_check(id, n));
+    out.extend(agent_address_check(id, n));
     out.extend(ollama_models_check(id, n));
     out.extend(harness_tasks_check(n));
     out.extend(harness_egress_check(id, n));
     settle_after_roll(n, &mut out);
     out
+}
+
+/// The `agent address` row: a node's agent_url must be https on an explicit
+/// port at its registered address (the gateway's heartbeat holds it to that).
+/// When the gateway refused the URL a node reported, it keeps the reason on
+/// the node record as `agent_url_refused` and dials `https://<ip>:8081`
+/// instead: a FAIL naming the node and the reason. No row when nothing was
+/// refused.
+pub(crate) fn agent_address_check(id: &str, n: &Value) -> Option<Check> {
+    let why = n["agent_url_refused"].as_str().filter(|s| !s.is_empty())?;
+    let ip = n["ip_address"].as_str().unwrap_or("its registered address");
+    Some(fail(
+        "agent address",
+        format!("{id}: the gateway refused the agent_url this node reported ({why}); it dials https://{ip}:8081 instead"),
+        format!("on {id}, set the agent's address (NODE_IP in /etc/noo-node-agent.env) to the address it is registered at, so it reports https://<that address>:<its port>"),
+    ))
 }
 
 /// The `model stores` row (proposal 61 §7b): no model store on the node is
@@ -15802,6 +15819,15 @@ mod model_stores_tests {
 
     /// The row is part of every node's checks.
     #[test]
+    fn a_refused_agent_url_is_a_failed_agent_address_row() {
+        let n = json!({"node_id": "n1", "ip_address": "100.64.0.5", "agent_url_refused": "its host is not the node's registered address"});
+        let c = agent_address_check("n1", &n).expect("a refusal is a row");
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("n1") && c.detail.contains("its host is not the node's registered address") && c.detail.contains("https://100.64.0.5:8081"), "{}", c.detail);
+        assert!(agent_address_check("n1", &json!({"ip_address": "100.64.0.5"})).is_none(), "nothing refused, no row");
+    }
+
+    #[test]
     fn node_checks_carry_the_model_stores_row() {
         let n = json!({"id": "n1", "status": "online",
             "data_roots": {"stores": {"checked": 4, "world_writable": [{"path": "/var/lib/noo/models", "store": "models", "mode": "0777"}]}}});
@@ -15809,6 +15835,14 @@ mod model_stores_tests {
         let row = c.iter().find(|c| c.name == "model stores").expect("a model stores row");
         assert_eq!(row.verdict, Verdict::Warn);
         assert!(row.detail.contains("GGUF files are hashed against the controller's manifest at each start on a placed node, only when it has one"), "{}", row.detail);
+    }
+
+    #[test]
+    fn node_checks_carry_the_agent_address_row() {
+        let n = json!({"id": "n1", "status": "online", "ip_address": "100.64.0.5", "agent_url_refused": "it is not https"});
+        let c = node_checks(&n, "", "", 0, None);
+        let row = c.iter().find(|c| c.name == "agent address").expect("an agent address row");
+        assert_eq!(row.verdict, Verdict::Fail);
     }
 }
 

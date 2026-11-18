@@ -242,6 +242,66 @@ pub(crate) fn acceptable_node_ip(ip: &str) -> bool {
     }
 }
 
+/// A node's `agent_url` must be https on an explicit port at its registered
+/// address: the URL's host is an IP literal equal to `ip` (itself a dialable
+/// node address), with no user info, query, fragment or path. The agent
+/// builds exactly this (`https://<ip>:<AgentPort>`, node-agent-go heartbeat
+/// `agentURL`), and the gateway dials it with the node's credentials, so any
+/// other host is refused. The port is the agent's own (8081, or 8082 for a
+/// second agent on the same host): any explicit port on the node's own
+/// address is accepted.
+pub(crate) fn acceptable_agent_url(url: &str, ip: &str) -> Result<(), &'static str> {
+    if !acceptable_node_ip(ip) {
+        return Err("the node has no registered dialable address to hold it to");
+    }
+    let Ok(u) = reqwest::Url::parse(url.trim()) else { return Err("it is not a URL") };
+    if u.scheme() != "https" {
+        return Err("it is not https");
+    }
+    if !u.username().is_empty() || u.password().is_some() || u.query().is_some() || u.fragment().is_some() || !matches!(u.path(), "" | "/") {
+        return Err("it carries user info, a path, a query or a fragment");
+    }
+    if u.port().is_none() {
+        return Err("it names no port");
+    }
+    let host = u.host_str().unwrap_or("").trim_start_matches('[').trim_end_matches(']');
+    let Ok(host_ip) = host.parse::<std::net::IpAddr>() else { return Err("its host is not an IP address") };
+    if ip.trim().parse::<std::net::IpAddr>().ok() != Some(host_ip) {
+        return Err("its host is not the node's registered address");
+    }
+    Ok(())
+}
+
+/// A heartbeat's `agent_url` onto the node record (`data`, already carrying
+/// this beat's `ip_address`): stored only when it passes
+/// [`acceptable_agent_url`]; a refusal is recorded as `agent_url_refused`
+/// (the reason) and cleared by the next URL that fits; a stored URL that no
+/// longer fits the address is removed, so the record's readers dial
+/// `https://<ip>:8081`.
+pub(crate) fn apply_agent_url(data: &mut Value, offered: Option<&str>, node_id: &str) {
+    let ip_now = data.get("ip_address").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if let Some(offered) = offered {
+        match acceptable_agent_url(offered, &ip_now) {
+            Ok(()) => {
+                data["agent_url"] = json!(offered);
+                if let Some(m) = data.as_object_mut() {
+                    m.remove("agent_url_refused");
+                }
+            }
+            Err(why) => {
+                tracing::warn!(node = %node_id, offered = %offered, reason = why, "heartbeat agent_url refused — the gateway dials the registered address instead");
+                data["agent_url_refused"] = json!(why);
+            }
+        }
+    }
+    let stored = data.get("agent_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if !stored.is_empty() && acceptable_agent_url(&stored, &ip_now).is_err() {
+        if let Some(m) = data.as_object_mut() {
+            m.remove("agent_url");
+        }
+    }
+}
+
 /// Carry a heartbeat field onto the node record when the agent reported it;
 /// leave the record's copy alone when the beat omits it (an older agent) or
 /// sends null. Never synthesised: absence on the record means "this agent
@@ -758,7 +818,13 @@ async fn node_heartbeat(
     // stays empty and get_node_agent_url() falls back to {ip}:8081 — which
     // silently routes a SECOND agent's traffic (e.g. a Tier 5 sensor
     // companion on :8082) to the first agent on that host.
-    if let Some(v) = body.get("agent_url") { if !v.is_null() { data["agent_url"] = v.clone(); } }
+    // ...and held to acceptable_agent_url against the registered address: an
+    // offered URL that fails is not stored, and a stored one that no longer
+    // fits (the address moved) is removed, so every reader of the record
+    // dials https://<ip>:8081 instead. The reason is kept on the record as
+    // `agent_url_refused` for `noo cluster verify`, and cleared once a beat's
+    // URL fits.
+    apply_agent_url(&mut data, body.get("agent_url").and_then(|v| v.as_str()), &node_id);
     // node-agent build version — refresh from the heartbeat so a redeployed
     // node reflects its new binary without waiting for re-registration.
     if let Some(v) = body.get("app_version") { if !v.is_null() { data["app_version"] = v.clone(); } }
@@ -9673,5 +9739,79 @@ mod chat_context_detail_tests {
         assert!(body.contains("chat_context_rows(&placement_json, &record, profile_context, stack)"), "computed from the placements served");
         assert!(body.contains("\"chat_context_detail\": chat_context_detail,"));
         assert!(body.contains("if let Some(map) = chat_contexts \u{7b}\n        body[\"chat_contexts\"] = map;"), "only Some sets the key");
+    }
+}
+
+#[cfg(test)]
+mod agent_url_tests {
+    //! A node's agent_url must be https on an explicit port at its registered
+    //! address: one test per check.
+    use super::{acceptable_agent_url, apply_agent_url};
+    use serde_json::json;
+
+    #[test]
+    fn a_node_agent_url_at_its_registered_address_is_accepted() {
+        assert!(acceptable_agent_url("https://100.64.0.5:8081", "100.64.0.5").is_ok());
+        assert!(acceptable_agent_url("https://100.64.0.5:8082/", "100.64.0.5").is_ok(), "a second agent on the same host");
+        assert!(acceptable_agent_url("https://[fd7a:115c::1]:8081", "fd7a:115c::1").is_ok());
+    }
+
+    #[test]
+    fn a_node_agent_url_must_be_https() {
+        assert_eq!(acceptable_agent_url("http://100.64.0.5:8081", "100.64.0.5"), Err("it is not https"));
+    }
+
+    #[test]
+    fn a_node_agent_url_must_name_the_registered_address() {
+        assert_eq!(acceptable_agent_url("https://100.64.0.6:8081", "100.64.0.5"), Err("its host is not the node's registered address"));
+        assert_eq!(acceptable_agent_url("https://node-1.tail:8081", "100.64.0.5"), Err("its host is not an IP address"));
+    }
+
+    #[test]
+    fn a_node_agent_url_must_name_its_port() {
+        assert_eq!(acceptable_agent_url("https://100.64.0.5", "100.64.0.5"), Err("it names no port"));
+    }
+
+    #[test]
+    fn a_node_agent_url_carries_no_user_info_path_query_or_fragment() {
+        for bad in ["https://u:p@100.64.0.5:8081", "https://100.64.0.5:8081/api", "https://100.64.0.5:8081/?x=1", "https://100.64.0.5:8081/#f"] {
+            assert_eq!(acceptable_agent_url(bad, "100.64.0.5"), Err("it carries user info, a path, a query or a fragment"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_node_agent_url_needs_a_dialable_registered_address() {
+        for ip in ["", "127.0.0.1", "169.254.169.254", "not-an-ip"] {
+            assert!(acceptable_agent_url("https://127.0.0.1:8081", ip).is_err(), "{ip:?}");
+        }
+    }
+
+    #[test]
+    fn a_heartbeat_agent_url_is_stored_only_when_it_fits_and_a_refusal_is_recorded() {
+        let mut data = json!({"ip_address": "100.64.0.5"});
+        apply_agent_url(&mut data, Some("https://100.64.0.5:8081"), "n1");
+        assert_eq!(data["agent_url"], "https://100.64.0.5:8081");
+        assert!(data.get("agent_url_refused").is_none());
+
+        apply_agent_url(&mut data, Some("https://10.9.9.9:8081"), "n1");
+        assert_eq!(data["agent_url"], "https://100.64.0.5:8081", "a refused URL is not stored");
+        assert_eq!(data["agent_url_refused"], "its host is not the node's registered address");
+
+        apply_agent_url(&mut data, Some("https://100.64.0.5:8081"), "n1");
+        assert!(data.get("agent_url_refused").is_none(), "a fitting URL clears the refusal");
+    }
+
+    #[test]
+    fn a_stored_agent_url_that_no_longer_fits_the_address_is_removed() {
+        let mut data = json!({"ip_address": "100.64.0.7", "agent_url": "https://100.64.0.5:8081"});
+        apply_agent_url(&mut data, None, "n1");
+        assert!(data.get("agent_url").is_none(), "{data}");
+    }
+
+    #[test]
+    fn the_heartbeat_holds_agent_url_to_the_rule() {
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        assert!(own.contains("apply_agent_url(&mut data, body.get(\"agent_url\").and_then(|v| v.as_str()), &node_id);"), "the heartbeat stores agent_url through apply_agent_url");
+        assert!(!own.contains("data[\"agent_url\"] = v.clone()"), "no unchecked copy of agent_url");
     }
 }
