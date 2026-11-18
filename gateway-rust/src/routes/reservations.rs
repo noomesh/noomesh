@@ -1042,7 +1042,7 @@ pub(crate) fn workload_proxy_upstream(container: &str, path: &str, query: &str) 
         if !plain(seg) {
             return Err("the proxied path must be plain segments: no '.' or '..' segment, no backslash or control character".into());
         }
-        segs.push(crate::mcp_external::percent_encode_segment(seg));
+        segs.push(seg.to_string());
     }
     let prefix = format!("/api/containers/{container}/proxy/");
     let upstream = format!("{prefix}{}{query}", segs.join("/"));
