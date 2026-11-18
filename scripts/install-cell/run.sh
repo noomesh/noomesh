@@ -390,9 +390,12 @@ print(\"verdict=absent detail=no ollama models row for \" + me)
     break
   done
   echo "$out"
+  # the ollama that pulled it: the record depends on what that version adds
+  # to a pulled manifest (0.40 adds the manifest itself and its list)
+  ov="$(sudo -n docker exec noo-ollama ollama --version 2>/dev/null | sed -n "s/.*version is //p" | head -n 1)"
   case "$out" in
-    verdict=ok*) echo "OLLAMA-VERIFIED PASS: the model onboard pulled is verified against the controller'"'"'s record of its pull: ${out#*detail=}" ;;
-    *) echo "OLLAMA-VERIFIED FAIL: a fresh install'"'"'s ollama models row should read verified, not: ${out}"; exit 1 ;;
+    verdict=ok*) echo "OLLAMA-VERIFIED PASS (ollama ${ov:-?}): the model onboard pulled is verified against the controller'"'"'s record of its pull: ${out#*detail=}" ;;
+    *) echo "OLLAMA-VERIFIED FAIL (ollama ${ov:-?}): a fresh install'"'"'s ollama models row should read verified, not: ${out}"; exit 1 ;;
   esac'
 # PROBE (general, rc.4): the same JSON from the cell's OLD shell, which lacks
 # the docker group: the rows that need docker must say "not judged" with the
