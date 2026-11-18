@@ -238,8 +238,13 @@ func (r *Reconciler) OllamaVerifyReport() any { return r.ollamaVerify.report() }
 
 // clearBackendStart clears a backend_start refusal on the success path,
 // except the ollama verification refusal, which only the verification loop
-// clears: a container that runs says nothing about the bytes it loads.
+// clears: a container that runs says nothing about the bytes it loads; and
+// a missing gguf's refusal, which stands until ggufPresent sees the file.
 func (r *Reconciler) clearBackendStart(backend string) {
+	if msg := r.ggufMissing[backend]; msg != "" {
+		refusals.Record("backend_start", backend, msg)
+		return
+	}
 	if backend == "ollama" {
 		if msg := r.ollamaVerify.standingRefusal(); msg != "" {
 			refusals.Record("backend_start", backend, msg)
