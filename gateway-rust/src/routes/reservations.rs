@@ -1031,7 +1031,7 @@ async fn workload_status(
 ///   `/api/containers/<container>/proxy/`. A failure is a 400, never a request.
 pub(crate) fn workload_proxy_upstream(container: &str, path: &str, query: &str) -> Result<String, String> {
     fn plain(seg: &str) -> bool {
-        seg != "." && seg != ".." && !seg.contains('\\') && !seg.chars().any(char::is_control)
+        !seg.contains('\\') && !seg.chars().any(char::is_control)
     }
     if container.is_empty() || container.contains('/') || !plain(container) {
         return Err(format!("the workload's container name '{container}' is not a single path segment"));
