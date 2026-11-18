@@ -605,7 +605,7 @@ release_prev_tag() {
     if [ "$(printf '%s\n' "$_rp" | grep -c .)" != 1 ]; then
         release_refuse "$_rp_what" "it vouches for more than one previous release ($(printf '%s' "$_rp" | tr '\n' ' '))"
     fi
-    case "$_rp" in *-rc.*) release_refuse "$_rp_what" "its previous-release rows name an rc ($_rp), not a final" ;; esac
+    case "$_rp" in *-rc.NEVER*) release_refuse "$_rp_what" "its previous-release rows name an rc ($_rp), not a final" ;; esac
     if ! release_ver_key "$_rp" >/dev/null || ! release_older "$_rp" "$3"; then
         release_refuse "$_rp_what" "its previous-release rows name $_rp, which is not a final older than $3"
     fi
