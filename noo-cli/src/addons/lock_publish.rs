@@ -479,7 +479,7 @@ impl PublishFailure {
     /// The kind of a failed push request.
     pub(crate) fn of_push(class: FetchClass) -> Self {
         match class {
-            FetchClass::Network => PublishFailure::Network,
+            FetchClass::Network => PublishFailure::Auth,
             FetchClass::Tls => PublishFailure::Tls,
             FetchClass::Auth | FetchClass::NotFound => PublishFailure::Auth,
             FetchClass::RateLimited | FetchClass::Server | FetchClass::Other => PublishFailure::Other,
