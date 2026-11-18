@@ -296,12 +296,13 @@ impl NodeLink {
 
     /// The credential this link presents for `url`, if any.
     fn credential(&self, url: &str) -> Option<(String, String)> {
-        // Never a credential over plaintext, nor for a link with no address
-        // (a for_base URL the agent_url rule refused leaves the base empty).
-        if !url.starts_with("https://") {
-            return None;
-        }
         match self.auth {
+            // A node agent's link: never a credential over plaintext, nor
+            // for a link with no address (a for_base URL the agent_url rule
+            // refused leaves the base empty). The controller's own agent
+            // (self_agent_base: derived https, or the operator's override)
+            // keeps its own rule.
+            Auth::Node if !url.starts_with("https://") => None,
             Auth::Node => crate::node_agent_auth::header_for(url),
             Auth::SelfAgent => crate::node_agent_auth::header_for_self(url),
         }
