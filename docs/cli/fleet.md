@@ -681,10 +681,10 @@ it is immediate and a force, and the audit row says `legacy`.
 the GPU and the mesh's, without lease ids to copy:
 
 ```bash
-noo cluster gpu mode awolf              # the current mode, and how long a hold has lasted
-noo cluster gpu mode awolf user         # drain, hold with purpose "user", wait until the GPU is free
-noo cluster gpu mode awolf mesh         # check the GPU is free, release with resume-now, wait until vLLM is warm
-noo cluster gpu mode awolf user --for 2h  # the same, and the node hands the GPU back after 2 hours
+noo cluster gpu mode node-a              # the current mode, and how long a hold has lasted
+noo cluster gpu mode node-a user         # drain, hold with purpose "user", wait until the GPU is free
+noo cluster gpu mode node-a mesh         # check the GPU is free, release with resume-now, wait until vLLM is warm
+noo cluster gpu mode node-a user --for 2h  # the same, and the node hands the GPU back after 2 hours
 ```
 
 The mode is read from the node's GPU lease, never stored: no lease and vLLM
@@ -727,7 +727,7 @@ lasted and how much of the GPU other work still uses.
   while vLLM is still warming only waits. A node held by someone else, or
   reserved for an add-on workload, is refused with the line that ends that
   hold; the mode verb does not end another operator's hold.
-- The time from release to a warm vLLM on awolf is measured live, not by the
+- The time from release to a warm vLLM on node-a is measured live, not by the
   unit tests; see the measured figure when it is recorded here.
 
 ### Reservations: a feature takes a GPU, the pool gets it back
@@ -742,7 +742,7 @@ stay as the low-level emergency tools underneath.
 ```bash
 noo cluster workloads                              # what the installed add-ons declare
 noo cluster reserve pai-voice/voice-worker         # the mesh picks a node: any live node with enough free GPU memory
-noo cluster reserve pai-voice/voice-worker --node awolf   # or pin one
+noo cluster reserve pai-voice/voice-worker --node node-a   # or pin one
 noo cluster reservations                           # id, workload, holder, node, state, since
 noo cluster release <reservation-id>               # the GPU returns to the pool
 ```
