@@ -194,18 +194,23 @@ def judge():
         # the CLI never reports the old exit 75.
         hand = [l.strip() for l in (roll_journal + "\n" + roll).splitlines()
                 if "applier-only bundle: this applier is already installed" in l and "nothing to install" in l]
-        e75 = [l.strip() for l in roll.splitlines() if "reported exit 75" in l]
-        # The applier-only bundle is staged only when applier_first_due holds
-        # (the node never reported an apply, or has no applier; provision.rs):
-        # the CLI says "installed the applier — staging the full bundle". A
-        # node that already reported an apply gets none: not applicable (97).
-        due = "installed the applier — staging the full bundle" in roll or bool(e75) or bool(hand)
-        if not due:
-            say("A8", "NOT APPLICABLE", "no applier-only bundle in this roll (the self node had already reported an apply)")
-        elif len(hand) >= 1 and not e75:
-            say("A8", "PASS", hand[0])
+        # The CLI's three outcomes for a staged applier-only bundle
+        # (upgrade.rs, one-to-one): "installed the applier" -> PASS with the
+        # handshake line; "reported exit N" -> FAIL; "no report for the
+        # applier" -> FAIL. None of them: no applier-only bundle was staged
+        # (applier_first_due did not hold) -> not applicable (97).
+        installed = [l.strip() for l in roll.splitlines() if "installed the applier — staging the full bundle" in l]
+        exited = [l.strip() for l in roll.splitlines() if re.search(r"the applier-only bundle reported exit \d+", l)]
+        unreported = [l.strip() for l in roll.splitlines() if "no report for the applier — staging the full bundle without confirmation" in l]
+        if exited:
+            say("A8", "FAIL", exited[0])
+        elif unreported:
+            say("A8", "FAIL", "the applier-only bundle was staged but never reported: " + unreported[0])
+        elif installed:
+            say("A8", "PASS" if hand else "FAIL",
+                hand[0] if hand else installed[0] + " — but no 'this applier is already installed … nothing to install' in the --all window")
         else:
-            say("A8", "FAIL", " | ".join(e75[:1] + hand[:2]) or "no 'applier-only bundle: this applier is already installed … nothing to install' in the --all window")
+            say("A8", "NOT APPLICABLE", "no applier-only bundle in this roll (the self node had already reported an apply)")
 
     # ── after the same-tag --stack ──
     if stack is None:

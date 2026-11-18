@@ -220,3 +220,14 @@ def test_a8_is_not_applicable_when_no_applier_only_bundle_was_staged(tmp_path):
     roll = ROLL_OK.replace("+ runner-a: installed the applier — staging the full bundle\n", "")
     rc, got = cell(tmp_path, roll=roll, journal=JOURNAL_OK.split("\n", 1)[1])
     assert " NOT APPLICABLE: " in got["A8"], got["A8"]
+
+
+def test_a8_maps_the_three_cli_outcomes_one_to_one(tmp_path):
+    """upgrade.rs: installed -> PASS (with the handshake), reported exit N -> FAIL, no report -> FAIL (97)."""
+    base = ROLL_OK.replace("+ runner-a: installed the applier — staging the full bundle\n", "")
+    rc, got = cell(tmp_path, roll=base + "! runner-a: no report for the applier — staging the full bundle without confirmation\n")
+    assert " FAIL: " in got["A8"] and "staged but never reported" in got["A8"], got["A8"]
+    rc, got = cell(tmp_path / "b", roll=base + "! runner-a: the applier-only bundle reported exit 76 — staging the full bundle anyway\n")
+    assert " FAIL: " in got["A8"] and "reported exit 76" in got["A8"], got["A8"]
+    rc, got = cell(tmp_path / "c", journal=JOURNAL_OK.split("\n", 1)[1])
+    assert " FAIL: " in got["A8"] and "installed the applier" in got["A8"], "installed but no handshake line: " + got["A8"]
