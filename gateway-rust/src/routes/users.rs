@@ -1380,7 +1380,7 @@ async fn orgs_list(
         String,
         String,
         Option<String>,
-        Option<chrono::DateTime<chrono::Utc>>,
+        Option<jiff_sqlx::Timestamp>,
     )>(
         "SELECT o.id, o.name, o.description, o.created_at FROM noo_orgs o ORDER BY o.id",
     )
@@ -1400,7 +1400,7 @@ async fn orgs_list(
                 "id": id,
                 "name": name,
                 "description": description,
-                "created_at": created_at,
+                "created_at": created_at.map(|t| crate::wire_time::rfc3339_z(t.to_jiff())),
                 "members": count_of(&id),
             })
         })
@@ -1577,7 +1577,7 @@ async fn user_links_list(
         String,
         String,
         Option<String>,
-        Option<chrono::DateTime<chrono::Utc>>,
+        Option<jiff_sqlx::Timestamp>,
     )>(
         "SELECT channel, channel_user_id, display_name, linked_at \
          FROM noo_user_channel_links WHERE username = $1 ORDER BY linked_at DESC",
@@ -1593,7 +1593,7 @@ async fn user_links_list(
                 "channel": channel,
                 "channel_user_id": channel_user_id,
                 "display_name": display_name,
-                "linked_at": linked_at,
+                "linked_at": linked_at.map(|t| crate::wire_time::rfc3339_z(t.to_jiff())),
             })
         })
         .collect();
@@ -1720,7 +1720,7 @@ async fn team_spaces_list(
     _op: OperatorOrInternal,
     Path(team): Path<String>,
 ) -> AppResult {
-    let rows = sqlx::query_as::<_, (String, String, Option<chrono::DateTime<chrono::Utc>>)>(
+    let rows = sqlx::query_as::<_, (String, String, Option<jiff_sqlx::Timestamp>)>(
         "SELECT channel, channel_space_id, created_at FROM noo_channel_team_links \
          WHERE team = $1 ORDER BY created_at DESC",
     )
@@ -1730,7 +1730,7 @@ async fn team_spaces_list(
     let spaces: Vec<Value> = rows
         .into_iter()
         .map(|(channel, space_id, created_at)| {
-            json!({ "channel": channel, "space_id": space_id, "created_at": created_at })
+            json!({ "channel": channel, "space_id": space_id, "created_at": created_at.map(|t| crate::wire_time::rfc3339_z(t.to_jiff())) })
         })
         .collect();
     Ok(Json(json!({ "team": team, "spaces": spaces, "count": spaces.len() })))
@@ -1925,7 +1925,7 @@ async fn proposals_list(
                 "payload": payload.unwrap_or_else(|| json!({})),
                 "requested_by": by,
                 "status": status,
-                "created_at": created,
+                "created_at": created.map(|t| crate::wire_time::rfc3339_z(t.to_jiff())),
                 "decided_by": decided_by,
             })
         })
@@ -1944,7 +1944,7 @@ pub(crate) type ProposalRow = (
     Option<Value>,
     Option<String>,
     String,
-    Option<chrono::DateTime<chrono::Utc>>,
+    Option<jiff_sqlx::Timestamp>,
     Option<String>,
 );
 
@@ -1982,7 +1982,7 @@ async fn proposal_get(
     };
     Ok(Json(json!({
         "id": id, "action": action, "payload": payload.unwrap_or_else(|| json!({})),
-        "requested_by": by, "status": status, "created_at": created, "decided_by": decided_by,
+        "requested_by": by, "status": status, "created_at": created.map(|t| crate::wire_time::rfc3339_z(t.to_jiff())), "decided_by": decided_by,
     })))
 }
 
@@ -2279,12 +2279,12 @@ async fn service_keys_list(
         String,
         Value,
         bool,
-        Option<chrono::DateTime<chrono::Utc>>,
-        Option<chrono::DateTime<chrono::Utc>>,
+        Option<jiff_sqlx::Timestamp>,
+        Option<jiff_sqlx::Timestamp>,
         Option<String>,
         Option<i64>,
         Option<String>,
-        Option<chrono::DateTime<chrono::Utc>>,
+        Option<jiff_sqlx::Timestamp>,
         String,
     )>(
         // superseded_at: an unfinished rotation is a state an operator has to
@@ -2313,12 +2313,12 @@ async fn service_keys_list(
                 "scopes": scopes,
                 "retired_scopes": retired,
                 "active": active,
-                "created_at": created,
-                "last_used_at": last_used,
+                "created_at": created.map(|t| crate::wire_time::rfc3339_z(t.to_jiff())),
+                "last_used_at": last_used.map(|t| crate::wire_time::rfc3339_z(t.to_jiff())),
                 "note": note,
                 "rpm_limit": rpm,
                 "user_id": user_id,
-                "superseded_at": superseded,
+                "superseded_at": superseded.map(|t| crate::wire_time::rfc3339_z(t.to_jiff())),
                 "context_overflow": overflow,
             })
         })
@@ -2748,8 +2748,8 @@ async fn service_key_self_status(
     let username = self_requester(&ctx)?.sub.clone();
     let consumer = self_consumer(&username);
     let row: Option<(
-        Option<chrono::DateTime<chrono::Utc>>,
-        Option<chrono::DateTime<chrono::Utc>>,
+        Option<jiff_sqlx::Timestamp>,
+        Option<jiff_sqlx::Timestamp>,
         Option<String>,
         Option<i64>,
     )> = sqlx::query_as(
@@ -2766,8 +2766,8 @@ async fn service_key_self_status(
             "consumer": consumer,
             "user_id": username,
             "scopes": ["mcp"],
-            "created_at": created,
-            "last_used_at": last_used,
+            "created_at": created.map(|t| crate::wire_time::rfc3339_z(t.to_jiff())),
+            "last_used_at": last_used.map(|t| crate::wire_time::rfc3339_z(t.to_jiff())),
             "note": note,
             "rpm_limit": rpm,
         }),
@@ -2829,8 +2829,8 @@ pub(crate) const RETIRE_SUPERSEDED_SQL: &str =
 /// is exactly why retiring may not be judged from "I restarted the
 /// container". That judgement is an echo of one's own action (#258).
 pub(crate) fn rotation_is_complete(
-    last_used: Option<chrono::DateTime<chrono::Utc>>,
-    created: chrono::DateTime<chrono::Utc>,
+    last_used: Option<jiff::Timestamp>,
+    created: jiff::Timestamp,
 ) -> bool {
     last_used.is_some_and(|t| t >= created)
 }
@@ -2866,7 +2866,7 @@ async fn service_key_retire(
     require_may_manage_key_consumer(&state.db, &ctx, &consumer).await?;
 
     // The current key is the active one that is NOT superseded.
-    let current: Option<(Option<chrono::DateTime<chrono::Utc>>, chrono::DateTime<chrono::Utc>)> =
+    let current: Option<(Option<jiff_sqlx::Timestamp>, jiff_sqlx::Timestamp)> =
         sqlx::query_as(
             "SELECT last_used_at, created_at FROM noo_service_keys \
              WHERE consumer = $1 AND active = true AND superseded_at IS NULL \
@@ -2883,7 +2883,7 @@ async fn service_key_retire(
         )));
     };
 
-    let new_key_used = rotation_is_complete(last_used, created);
+    let new_key_used = rotation_is_complete(last_used.map(|t| t.to_jiff()), created.to_jiff());
     let any_superseded_used: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM noo_service_keys \
          WHERE consumer = $1 AND active = true AND superseded_at IS NOT NULL \
@@ -2898,7 +2898,7 @@ async fn service_key_retire(
              would leave the consumer holding a key that is about to stop working, which is \
              exactly what rotation-with-overlap exists to prevent. Install the new value, \
              recreate the consumer, and retire once it has called.",
-            last_used.map(|t| t.to_rfc3339()).unwrap_or_else(|| "never".into())
+            last_used.map(|t| crate::wire_time::rfc3339_offset(t.to_jiff())).unwrap_or_else(|| "never".into())
         )));
     }
     if !new_key_used {
@@ -4053,8 +4053,8 @@ async fn api_users_proposals(
         Option<String>,
         Option<String>,
         String,
-        Option<chrono::DateTime<chrono::Utc>>,
-        Option<chrono::DateTime<chrono::Utc>>,
+        Option<jiff_sqlx::Timestamp>,
+        Option<jiff_sqlx::Timestamp>,
         Option<String>,
         Option<Value>,
     )>(
@@ -4078,8 +4078,8 @@ async fn api_users_proposals(
                 "note": note,
                 "requested_by": requested_by,
                 "status": status,
-                "created_at": created,
-                "decided_at": decided,
+                "created_at": created.map(|t| crate::wire_time::rfc3339_z(t.to_jiff())),
+                "decided_at": decided.map(|t| crate::wire_time::rfc3339_z(t.to_jiff())),
                 "decided_by": decided_by,
                 "result": result,
             })
@@ -5049,7 +5049,7 @@ pub(crate) mod tests {
             .await;
     }
 
-    use chrono::{Duration, Utc};
+    use jiff::{SignedDuration, Timestamp};
 
     /// A rotation is finished when the NEW key has been seen, not when the
     /// operator believes they installed it. Retiring on belief is what makes
@@ -5057,13 +5057,13 @@ pub(crate) mod tests {
     /// which is now inactive, and a refused bearer logs nothing.
     #[test]
     fn a_rotation_is_not_complete_until_the_new_key_has_been_used() {
-        let created = Utc::now();
+        let created = Timestamp::now();
         assert!(
             !super::rotation_is_complete(None, created),
             "never used must not read as complete"
         );
         assert!(
-            super::rotation_is_complete(Some(created + Duration::seconds(1)), created),
+            super::rotation_is_complete(Some(created + SignedDuration::from_secs(1)), created),
             "used after minting is complete"
         );
         assert!(
@@ -5090,9 +5090,9 @@ pub(crate) mod tests {
     /// weaker rule that would let an old key's activity retire its successor.
     #[test]
     fn activity_predating_the_key_is_not_evidence_for_it() {
-        let created = Utc::now();
+        let created = Timestamp::now();
         assert!(
-            !super::rotation_is_complete(Some(created - Duration::seconds(1)), created),
+            !super::rotation_is_complete(Some(created - SignedDuration::from_secs(1)), created),
             "a stamp older than the key must not count as the key having been used"
         );
     }
