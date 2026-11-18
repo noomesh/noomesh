@@ -953,7 +953,16 @@ fn build_env_vars(g: &Globals, a: &ProvisionArgs, site: &ProvSite, id: &ProvIden
     //     (2026-09-28 newcomer rehearsal, blank box on a lab network).
     //  4. The literal `noo-controller` — last resort when tailscale is down,
     //     correct only for the single-controller tailnet install.
-    let ctrl_host = match controller_host(&site.root, HostFor::RemoteNode) {
+    //
+    // That order is for a node on ANOTHER machine. The controller's own node
+    // reaches its controller the way the self node does (loopback where the
+    // gateway listens on it, else its own names): rendering it as a remote
+    // node gave a no-tailnet single box the literal `noo-controller`, which
+    // nothing on the host resolves, and its first `noo upgrade --all` cut its
+    // own agent off (0.6.27-rc.2's UPGRADE cell: `lookup noo-controller ...
+    // server misbehaving`, no heartbeat from the new build). The same host
+    // is NATS_URL's below.
+    let ctrl_host = match controller_host(&site.root, host_for(site.is_self)) {
         Ok(h) => h,
         Err(e) => fail(g.json, ExitCode::Generic, "controller_host", &e, Some(CONTROLLER_HOST_REMEDY)),
     };
@@ -2708,6 +2717,13 @@ pub(crate) enum HostFor {
     /// This controller's own node: loopback is right when the gateway
     /// listens on it.
     SelfNode,
+}
+
+/// Which way a provisioned node reaches this controller: the self node as
+/// the self node, every other node as a remote one. The rail's agent env
+/// (`build_env_vars`) and the local install agree on the self node's host.
+pub(crate) fn host_for(is_self: bool) -> HostFor {
+    if is_self { HostFor::SelfNode } else { HostFor::RemoteNode }
 }
 
 /// What to do when no name reaches a tailnet-bound gateway.
@@ -7082,6 +7098,33 @@ mod controller_host_tests {
 
     /// A gateway on loopback only is reachable only as loopback: the self node
     /// gets localhost even when a tailnet name or a floating name exists.
+    #[test]
+    fn the_rail_renders_the_self_node_as_the_self_node() {
+        assert_eq!(host_for(true), HostFor::SelfNode);
+        assert_eq!(host_for(false), HostFor::RemoteNode);
+        // The rail's agent env asks for the host by the node's own lane, never
+        // a hard-coded RemoteNode (rc.2: the self node got `noo-controller`).
+        let own = crate::test_src::own_code(include_str!("provision.rs"));
+        let body = crate::test_src::fn_body(&own, "fn build_env_vars(");
+        assert!(body.contains("controller_host(&site.root, host_for(site.is_self))"), "build_env_vars must ask by the node's lane");
+        assert!(!body.contains("HostFor::RemoteNode"), "build_env_vars hard-codes the remote lane");
+        // and the controller_url and nats_url share that one host
+        assert!(body.contains(r#"format!("https://{ctrl_host}:8080")"#) && body.contains(r#"format!("tls://{ctrl_host}:4222")"#));
+    }
+
+    /// A no-tailnet single box (the gateway on loopback, no declared name):
+    /// the self node reaches `localhost`; only a remote node gets the
+    /// literal last resort. What rc.2's UPGRADE cell cut off.
+    #[test]
+    fn a_no_tailnet_single_box_gives_its_self_node_localhost_not_noo_controller() {
+        // the default bind ("") and `all`: what a stranger's box has
+        for mode in ["", "all"] {
+            let ctrl = |who| controller_host_from(mode, "", None, None, who);
+            assert_eq!(ctrl(host_for(true)), Ok("localhost".into()), "{mode:?}");
+            assert_eq!(ctrl(host_for(false)), Ok("noo-controller".into()), "{mode:?}");
+        }
+    }
+
     #[test]
     fn controller_host_local_bind_is_localhost_for_the_self_node() {
         for mode in ["local", "127.0.0.1"] {
