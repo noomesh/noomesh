@@ -1265,7 +1265,7 @@ func (c *Client) preseedGGUF(ctx context.Context, backend, model string) (bool, 
 // transport error with no proof of a mismatch) returns nil and the start goes
 // on with whatever local file is there, as documented (availability).
 func ggufFetchOutcome(backend, model, dest string, err error, now time.Time) error {
-	if !errors.Is(err, preseed.ErrPresentMismatch) {
+	if err == nil {
 		return nil
 	}
 	refusal := &GGUFMismatchError{Backend: backend, Model: model, Path: dest, Detail: err.Error()}
