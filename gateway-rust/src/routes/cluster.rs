@@ -272,6 +272,29 @@ pub(crate) fn acceptable_agent_url(url: &str, ip: &str) -> Result<(), &'static s
     Ok(())
 }
 
+/// Whether a stored `agent_url` may be dialled (`NodeLink::from_record`): it
+/// is https, and when the record holds a registered address it passes
+/// [`acceptable_agent_url`] against it. A heartbeat stores `agent_url` only
+/// with a registered address it fits (`apply_agent_url`), so a URL with no
+/// address on its record was not written by a heartbeat.
+pub(crate) fn dialable_agent_url(url: &str, ip: &str) -> bool {
+    if ip.trim().is_empty() {
+        return reqwest::Url::parse(url.trim()).is_ok_and(|u| u.scheme() == "https");
+    }
+    acceptable_agent_url(url, ip).is_ok()
+}
+
+/// The `ip_address` a registration stores: the reported one when it is a
+/// dialable node address ([`acceptable_node_ip`], the heartbeat's rule),
+/// otherwise none (the node is reached over its bus or tunnel until a
+/// heartbeat reports one that is).
+pub(crate) fn registered_ip(body: &Value) -> Value {
+    match body.get("ip_address").and_then(|v| v.as_str()) {
+        Some(ip) if acceptable_node_ip(ip) => json!(ip),
+        _ => Value::Null,
+    }
+}
+
 /// A heartbeat's `agent_url` onto the node record (`data`, already carrying
 /// this beat's `ip_address`): stored only when it passes
 /// [`acceptable_agent_url`]; a refusal is recorded as `agent_url_refused`
@@ -1227,7 +1250,7 @@ async fn node_register_body(
     let data = json!({
         "id": node_id,
         "hostname": body.get("hostname").and_then(|h| h.as_str()).unwrap_or(node_id),
-        "ip_address": body.get("ip_address"),
+        "ip_address": registered_ip(&body),
         "tier": caps.get("tier").or(body.get("tier")),
         "gpu_model": caps.get("gpu_model"),
         "gpu_count": caps.get("gpu_count"),
@@ -9806,6 +9829,17 @@ mod agent_url_tests {
         let mut data = json!({"ip_address": "100.64.0.7", "agent_url": "https://100.64.0.5:8081"});
         apply_agent_url(&mut data, None, "n1");
         assert!(data.get("agent_url").is_none(), "{data}");
+    }
+
+    #[test]
+    fn a_registration_stores_only_a_dialable_address() {
+        use super::registered_ip;
+        assert_eq!(registered_ip(&json!({"ip_address": "100.64.0.5"})), json!("100.64.0.5"));
+        for bad in ["127.0.0.1", "169.254.169.254", "0.0.0.0", "node.example", ""] {
+            assert!(registered_ip(&json!({"ip_address": bad})).is_null(), "{bad}");
+        }
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        assert!(own.contains("\"ip_address\": registered_ip(&body),"), "the registration stores the address through registered_ip");
     }
 
     #[test]

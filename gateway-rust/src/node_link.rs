@@ -137,7 +137,7 @@ impl NodeLink {
                 // Dialled only when it is https on an explicit port at the
                 // node's registered address (a record written before the
                 // heartbeat held it to that); otherwise the address below.
-                if !url.is_empty() && crate::routes::cluster::acceptable_agent_url(url, ip).is_ok() {
+                if !url.is_empty() && crate::routes::cluster::dialable_agent_url(url, ip) {
                     return Ok(Self::with_node(url.to_string(), node_id).advertising(data));
                 }
             }
@@ -728,6 +728,14 @@ mod tests {
         assert_eq!(l.base(), "https://10.0.0.9:8081", "the registered address, not the stored URL");
         let l = NodeLink::from_record("n9", Some(&json!({"agent_url": "http://10.0.0.9:8081", "ip_address": "10.0.0.9"}))).unwrap();
         assert_eq!(l.base(), "https://10.0.0.9:8081");
+    }
+
+    #[test]
+    fn a_stored_agent_url_without_a_registered_address_must_still_be_https() {
+        let l = NodeLink::from_record("n8", Some(&json!({"agent_url": "https://127.0.0.1:9443"}))).unwrap();
+        assert_eq!(l.base(), "https://127.0.0.1:9443");
+        let l = NodeLink::from_record("n8", Some(&json!({"agent_url": "http://127.0.0.1:9443"})));
+        assert!(l.map(|l| l.base().to_string()).unwrap_or_default() != "http://127.0.0.1:9443", "never a plaintext agent URL");
     }
 
     #[test]
