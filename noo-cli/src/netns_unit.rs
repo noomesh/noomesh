@@ -456,7 +456,8 @@ mod tests {
     /// stages to: the pair the controller decides from.
     #[test]
     fn the_shipped_applier_takes_the_kind() {
-        let Ok(src) = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/noo-apply.sh")) else { return };
+        let Some(p) = crate::test_support::repo_file_or_skip("scripts/noo-apply.sh") else { return };
+        let src = std::fs::read_to_string(p).expect("scripts/noo-apply.sh");
         let a = applier_of(&src);
         assert!(a.knows_kind && a.generation >= MIN_APPLIER_GENERATION, "{a:?}");
     }
