@@ -218,7 +218,7 @@ one has run, and whether it applies.
 
 ```sh
 noo cluster profile <node> --set thinking=on
-noo cluster profile <node> --set first_byte_secs=1200 stream_idle_secs=900
+noo cluster profile <node> --set first_byte_secs=1200 --set stream_idle_secs=900
 noo cluster profile <node> --set foreign_kinds=codex,copilot   # none: no foreign kind
 noo cluster profile <node> --clear thinking                    # back to measured / tier
 noo cluster profile <node> --clear-all

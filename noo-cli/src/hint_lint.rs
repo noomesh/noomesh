@@ -612,7 +612,10 @@ fn strip_globals(tokens: &[String]) -> Vec<String> {
             i += 1;
             continue;
         }
-        if GLOBAL_FLAGS.contains(&t) {
+        // `--version`/`-V` are global only before the command (`noo
+        // --version`); after it they are the command's own flag (`noo upgrade
+        // --version 0.6.27`), as the CLI's parser treats them.
+        if GLOBAL_FLAGS.contains(&t) && !(matches!(t, "--version" | "-V") && !out.is_empty()) {
             i += if GLOBAL_FLAGS_WITH_VALUE.contains(&t) { 2 } else { 1 };
             continue;
         }
@@ -1315,6 +1318,138 @@ fn is_allowed(file: &str, text: &str, hit: &mut [bool]) -> bool {
     false
 }
 
+/// The command path starts with a registered hidden command (main.rs
+/// `HIDDEN_NATIVE` / `HIDDEN_NO_USAGE`).
+#[cfg(test)]
+fn is_hidden_path(cmd: &[String]) -> bool {
+    let words = strip_globals(cmd);
+    crate::HIDDEN_NATIVE.iter().chain(crate::HIDDEN_NO_USAGE.iter()).any(|entry| {
+        entry.len() <= words.len() && entry.iter().zip(&words).all(|(e, w)| *e == w.as_str())
+    })
+}
+
+/// Markdown files under `dir`, recursively.
+#[cfg(test)]
+fn collect_md_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_md_files(&p, out);
+        } else if p.extension().is_some_and(|x| x == "md") {
+            out.push(p);
+        }
+    }
+}
+
+/// The `noo …` command lines a reader is told to type: lines in a fenced
+/// block whose language is a shell (or none), with a leading `$ ` prompt or
+/// `sudo ` dropped, `\` continuations joined, and `$VAR` / `"${VAR}"`
+/// turned into a `<VAR>` placeholder. (1-based line, command).
+#[cfg(test)]
+fn doc_command_lines(text: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let mut in_block = false;
+    let mut shell = false;
+    let mut pending: Option<(usize, String)> = None;
+    for (i, raw) in text.lines().enumerate() {
+        let t = raw.trim_start();
+        if let Some(lang) = t.strip_prefix("```") {
+            if in_block {
+                in_block = false;
+                pending = None;
+            } else {
+                in_block = true;
+                let info = lang.trim().to_ascii_lowercase();
+                let lang = info.split_whitespace().next().unwrap_or("");
+                // ```sh addon=<name>: commands an add-on registers at runtime,
+                // which the core usage table cannot know.
+                shell = matches!(lang, "" | "sh" | "bash" | "shell" | "console" | "zsh") && !info.contains("addon=");
+            }
+            continue;
+        }
+        if !in_block || !shell {
+            continue;
+        }
+        let mut line = t.to_string();
+        if let Some((start, mut acc)) = pending.take() {
+            acc.push(' ');
+            acc.push_str(line.trim());
+            line = acc;
+            if let Some(stripped) = line.strip_suffix('\\') {
+                pending = Some((start, stripped.trim_end().to_string()));
+                continue;
+            }
+            out.push((start, doc_placeholders(&shell_words(&line))));
+            continue;
+        }
+        let mut cmd = line.as_str();
+        if let Some(r) = cmd.strip_prefix("$ ") {
+            cmd = r;
+        }
+        if let Some(r) = cmd.strip_prefix("sudo ") {
+            cmd = r;
+        }
+        if !(cmd == "noo" || cmd.starts_with("noo ")) {
+            continue;
+        }
+        if let Some(stripped) = cmd.strip_suffix('\\') {
+            pending = Some((i + 1, stripped.trim_end().to_string()));
+            continue;
+        }
+        out.push((i + 1, doc_placeholders(&shell_words(cmd))));
+    }
+    out
+}
+
+/// A shell line as the parser would see its words, by rule: a quoted span
+/// (`"…"` or `'…'`, the other quote allowed inside) is ONE value and becomes
+/// `<q>`; an unquoted `#` after a blank starts a comment (dropped: a comment
+/// that mentions `noo` is prose, not a second command); an unquoted `<` or
+/// `>` redirect ends the command.
+#[cfg(test)]
+fn shell_words(line: &str) -> String {
+    let mut out = String::new();
+    let mut chars = line.chars().peekable();
+    let mut prev_blank = true;
+    while let Some(c) = chars.next() {
+        match c {
+            '"' | '\'' => {
+                for d in chars.by_ref() {
+                    if d == c {
+                        break;
+                    }
+                }
+                out.push_str("<q>");
+                prev_blank = false;
+            }
+            '#' if prev_blank => break,
+            '<' | '>' if prev_blank && chars.peek().is_none_or(|n| n.is_whitespace()) => break,
+            _ => {
+                prev_blank = c.is_whitespace();
+                out.push(c);
+            }
+        }
+    }
+    out.trim_end().to_string()
+}
+
+/// `$VAR`, `"$VAR"`, `${VAR}` and `"${VAR}"` tokens become `<VAR>`.
+#[cfg(test)]
+fn doc_placeholders(cmd: &str) -> String {
+    cmd.split(' ')
+        .map(|w| {
+            let bare = w.trim_matches('"');
+            let name = bare.strip_prefix("${").and_then(|r| r.strip_suffix('}')).or_else(|| bare.strip_prefix('$'));
+            match name {
+                Some(n) if !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => format!("<{n}>"),
+                _ => w.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1648,6 +1783,70 @@ mod tests {
             }
         }
         assert!(raw.is_empty(), "string literals that suggest a wholesale tailnet push:\n{}", raw.join("\n"));
+    }
+
+    #[test]
+    fn every_documented_command_parses() {
+        // Every `noo …` line in a shell code block of docs/**/*.md and the
+        // README parses against `usage::USAGE`, by the same rules as the
+        // CLI's own hints (`normalize_hint` + `check_one`): commands,
+        // subcommands and flags. Placeholders are handled by rule, never by a
+        // list: `<…>`/`[…]`/`{…}` collapse as in a hint, and `$VAR` /
+        // `"${VAR}"` read as a placeholder value. (2026-11-18 launch audit:
+        // 64 documented commands were run by nothing and none was checked.)
+        // `repo`, not `root`: tests/test_standalone_asset_parity.py reads every
+        // `root.join("…")` as a file the shipped CLI loads at runtime; these are
+        // read by this test only, never by the binary.
+        let repo = crate::test_support::repo_root();
+        let mut files = vec![repo.join("README.md")];
+        collect_md_files(&repo.join("docs"), &mut files);
+        assert!(files.len() > 20, "found too few docs ({}): wrong root {repo:?}?", files.len());
+        let mut checked = 0usize;
+        let mut bad: Vec<String> = Vec::new();
+        for f in &files {
+            let Ok(text) = std::fs::read_to_string(f) else { continue };
+            let rel = f.strip_prefix(&repo).unwrap_or(f).display().to_string();
+            for (line, cmd_line) in doc_command_lines(&text) {
+                for cmd in normalize_hint(&cmd_line) {
+                    if cmd.is_empty() {
+                        continue;
+                    }
+                    checked += 1;
+                    // A hidden command is real (registered) but has no usage
+                    // row by design: its path is accepted, its args unchecked.
+                    if is_hidden_path(&cmd) {
+                        continue;
+                    }
+                    let (verdict, syntax) = check_one(&cmd);
+                    if let Verdict::Mismatch(k) = verdict {
+                        bad.push(format!("{rel}:{line}  {}  \"{cmd_line}\"  — synopsis: {}", k.label(), syntax.unwrap_or("")));
+                    }
+                }
+            }
+        }
+        assert!(checked > 100, "only {checked} documented commands found: the extraction is broken");
+        bad.sort();
+        bad.dedup();
+        assert!(bad.is_empty(), "{} documented command(s) do not parse:\n{}", bad.len(), bad.join("\n"));
+    }
+
+    #[test]
+    fn shell_words_keeps_a_quoted_value_whole_and_drops_comments_and_redirects() {
+        assert_eq!(shell_words(r#"noo security service-key self --note "work laptop""#), "noo security service-key self --note <q>");
+        assert_eq!(shell_words(r#"noo logs query '{container="noo-gateway"} |= "401"'"#), "noo logs query <q>");
+        assert_eq!(shell_words("noo stack reset --dist   # deep clean → noo onboard"), "noo stack reset --dist");
+        assert_eq!(shell_words("noo addons registry-login x --registry r < token.txt"), "noo addons registry-login x --registry r");
+        assert_eq!(shell_words("noo cluster provision a#b"), "noo cluster provision a#b", "a # inside a word is not a comment");
+        assert_eq!(doc_placeholders("noo x $NODE ${ID}"), "noo x <NODE> <ID>");
+    }
+
+    #[test]
+    fn the_doc_extraction_reads_shell_blocks_only_and_by_rule() {
+        let md = "x `noo nope` inline is prose\n```sh addon=evolve\nnoo loop status\n```\n```sh\n$ noo health\nsudo noo stack start\nnoo cluster provision \"$NODE\" \\\n  --wait\necho noo\n```\n```text\nnoo not-a-command\n```\n```\nnoo whoami   # comment\n```\n";
+        let got = doc_command_lines(md);
+        let cmds: Vec<&str> = got.iter().map(|(_, c)| c.as_str()).collect();
+        assert_eq!(cmds, vec!["noo health", "noo stack start", "noo cluster provision <q> --wait", "noo whoami"], "{got:?}");
+        assert_eq!(got[0].0, 6, "1-based line of the command");
     }
 
     #[test]
