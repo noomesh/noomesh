@@ -684,6 +684,22 @@ jobs:
         go vet ./...
         go test ./...
 
+    # The node's declarations file is root's (mode 644) and the agent reads it
+    # as its own unprivileged user: proven here by reading as a uid that does
+    # NOT own it (the test re-runs itself as uid 65534; it needs root to do
+    # that). Missing sudo is a FAIL, never a skip.
+    - name: The node-local declarations file is read as a non-owner uid (sudo)
+      if: needs.scope.outputs.code == 'true'
+      run: |
+        sudo -n true || { echo "::error::no passwordless sudo: the node-local non-owner read cannot be proven"; exit 1; }
+        go test -c -o /tmp/nodelocal.test ./internal/nodelocal/
+        chmod 755 /tmp/nodelocal.test
+        log="$RUNNER_TEMP/nodelocal-uid.log"
+        set -o pipefail
+        sudo -n /tmp/nodelocal.test -test.run '^TestTheAgentsUidReadsARootOwnedFile$' -test.v 2>&1 | tee "$log"
+        grep -E '^--- PASS: TestTheAgentsUidReadsARootOwnedFile' "$log" \
+          || { echo "::error::the node-local non-owner read did not report PASS"; exit 1; }
+
     # node-mac is a real darwin node: the darwin agent and its test files must
     # build. Cross-compiled on Linux; `-exec /bin/true` compiles each test
     # binary without running it (a darwin binary cannot run here).

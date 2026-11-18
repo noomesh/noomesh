@@ -606,6 +606,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
         (Some(p), s) => out.push(ok("harness", format!("{} (policy {p})", if s.is_empty() { "-" } else { s }))),
     } }
     out.extend(model_stores_check(id, n));
+    out.extend(node_local_check(id, n));
     out.extend(backend_caps_check(id, n));
     out.extend(agent_address_check(id, n));
     out.extend(ollama_models_check(id, n));
@@ -663,6 +664,67 @@ pub(crate) fn backend_caps_check(id: &str, n: &Value) -> Option<Check> {
         Some("none") => Some(ok(NAME, format!("{id}: none (NOO_BACKEND_CAP_ADD=none)"))),
         _ => None,
     }
+}
+
+/// The `node-local` row: the node's OWN declarations file (the agent's
+/// `nodelocal`: /etc/noo-node-agent.local.env, root's, on Linux and the
+/// Mac), which no apply ever writes, so a declaration survives a roll.
+/// OK naming what the node declares; WARN when the file was refused whole
+/// (its mode or owner), when a declaration was refused (a trust declaration
+/// is then NOT in effect), or when the file names keys that are not
+/// node-local (ignored). No row when the node declares nothing.
+pub(crate) fn node_local_check(id: &str, n: &Value) -> Option<Check> {
+    const NAME: &str = "node-local";
+    let nl = n.get("node_local").filter(|v| v.is_object())?;
+    let path = nl["path"].as_str().unwrap_or("the node's declarations file");
+    let ignored: Vec<String> = nl["ignored"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+    let objs = |k: &str| nl[k].as_array().cloned().unwrap_or_default();
+    let declared = objs("declared");
+    let refused = objs("refused");
+    let file_refused = nl["state"].as_str() == Some("refused");
+    // A trust declaration that arrives through the agent's environment (a
+    // systemd drop-in) still works, but belongs in the local file.
+    let env_trust: Vec<String> = declared
+        .iter()
+        .filter(|d| d["trust"].as_bool() == Some(true) && d["source"].as_str() == Some("environment"))
+        .filter_map(|d| d["key"].as_str().map(str::to_string))
+        .collect();
+    let named: Vec<String> = declared
+        .iter()
+        .map(|d| format!("{} ({})", d["key"].as_str().unwrap_or("?"), d["source"].as_str().unwrap_or("?")))
+        .collect();
+    let mut problems = Vec::new();
+    let mut fixes = Vec::new();
+    if file_refused {
+        problems.push(format!("{path} was refused whole ({}); none of its declarations is in effect", nl["why"].as_str().unwrap_or("refused")));
+        fixes.push(format!("make {path} a regular file owned by root, mode 644, in a root-owned directory (sudo chown root {path}; sudo chmod 644 {path})"));
+    }
+    if !refused.is_empty() {
+        let r: Vec<String> = refused
+            .iter()
+            .map(|x| format!("{} from {} ({})", x["key"].as_str().unwrap_or("?"), x["source"].as_str().unwrap_or("?"), x["why"].as_str().unwrap_or("refused")))
+            .collect();
+        problems.push(format!("refused, NOT in effect: {}", r.join("; ")));
+        fixes.push(format!("fix those values in {path}, then restart the node agent"));
+    }
+    if !env_trust.is_empty() {
+        problems.push(format!("trust declarations read from the agent's environment, not {path}: {}", env_trust.join(", ")));
+        fixes.push(format!("move {} into {path} (and out of the systemd drop-in or agent env), then restart the node agent", env_trust.join(", ")));
+    }
+    if !ignored.is_empty() {
+        problems.push(format!("ignored (not node-local keys): {}", ignored.join(", ")));
+    }
+    if !problems.is_empty() {
+        return Some(warn(
+            NAME,
+            format!("{id}: {}; in effect: {}", problems.join("; "), if named.is_empty() { "none".into() } else { named.join(", ") }),
+            Some(format!("on {id}: {}", if fixes.is_empty() { format!("remove those lines from {path}") } else { fixes.join("; ") })),
+        ));
+    }
+    if named.is_empty() {
+        return None;
+    }
+    Some(ok(NAME, format!("{id}: {}", named.join(", "))))
 }
 
 /// The `model stores` row (proposal 61 §7b): no model store on the node is
@@ -15887,6 +15949,41 @@ mod model_stores_tests {
         let n = json!({"id": "n1", "status": "online", "backend_caps": {"source": "env", "granted": [], "refused": ["SYS_ADMIN"], "allowed": ["CHOWN"]}});
         let c = node_checks(&n, "", "", 0, None);
         assert!(c.iter().any(|c| c.name == "backend caps" && c.verdict == Verdict::Warn), "{:?}", c.iter().map(|c| c.name).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_node_local_refusal_is_a_warn_naming_the_key() {
+        let n = json!({"node_local": {"path": "/etc/noo-node-agent.local.env", "state": "read", "declared": [{"key": "NOO_GPU_YIELD", "source": "local file", "trust": false}],
+            "refused": [{"key": "NOO_BACKEND_CAP_ADD", "why": "\"SYS_ADMIN\" is not grantable", "source": "local file", "trust": true}], "ignored": ["NOO_CLUSTER_SECRET"]}});
+        let c = node_local_check("n1", &n).expect("a refusal is a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("NOO_BACKEND_CAP_ADD") && c.detail.contains("NOT in effect") && c.detail.contains("NOO_CLUSTER_SECRET"), "{}", c.detail);
+        let whole = json!({"node_local": {"path": "/etc/noo-node-agent.local.env", "state": "refused", "why": "mode 0666 is group- or world-writable (chmod 600)"}});
+        let c = node_local_check("n1", &whole).expect("a refused file is a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("refused whole") && c.remedy.as_deref().is_some_and(|r| r.contains("sudo chmod 644")), "{c:?}");
+    }
+
+    #[test]
+    fn node_local_declarations_are_listed_and_absent_is_silent() {
+        let n = json!({"node_local": {"path": "/x", "state": "read", "declared": [{"key": "NOO_ALLOW_OLLAMA_REGISTRY_PULL", "source": "local file", "trust": true}], "refused": [], "ignored": []}});
+        let c = node_local_check("n1", &n).expect("declarations are a row");
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("NOO_ALLOW_OLLAMA_REGISTRY_PULL (local file)"), "{}", c.detail);
+        // A trust declaration from the environment WARNs with the move-it line.
+        let env = json!({"node_local": {"path": "/x", "state": "absent", "declared": [{"key": "NOO_BACKEND_CAP_ADD", "source": "environment", "trust": true}], "refused": [], "ignored": []}});
+        let c = node_local_check("n1", &env).expect("an environment trust key is a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.remedy.as_deref().is_some_and(|r| r.contains("move NOO_BACKEND_CAP_ADD into /x")), "{c:?}");
+        assert!(node_local_check("n1", &json!({"node_local": {"state": "absent"}})).is_none());
+        assert!(node_local_check("n1", &json!({})).is_none());
+    }
+
+    #[test]
+    fn node_checks_carry_the_node_local_row() {
+        let n = json!({"id": "n1", "status": "online", "node_local": {"path": "/x", "state": "read", "declared": [{"key": "NOO_GPU_YIELD", "source": "local file", "trust": false}], "refused": [], "ignored": []}});
+        let c = node_checks(&n, "", "", 0, None);
+        assert!(c.iter().any(|c| c.name == "node-local"), "{:?}", c.iter().map(|c| c.name).collect::<Vec<_>>());
     }
 
     #[test]

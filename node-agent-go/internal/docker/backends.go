@@ -1766,6 +1766,11 @@ var backendCapAllowed = map[string]bool{
 	"SYS_NICE": true, "IPC_LOCK": true, "SYS_RESOURCE": true, "AUDIT_WRITE": true,
 }
 
+// BackendCapGrantable reports whether NOO_BACKEND_CAP_ADD may grant name
+// (normalised: upper-case, no CAP_ prefix). The node-local declarations file
+// holds a declared set to this same allow-list.
+func BackendCapGrantable(name string) bool { return backendCapAllowed[name] }
+
 func backendCapAllowedList() []string {
 	out := make([]string, 0, len(backendCapAllowed))
 	for k := range backendCapAllowed {

@@ -769,8 +769,9 @@ container's published loopback port. A relayed WebSocket closes with code
 4001 when the reservation ends. Nothing else on the node is reachable that
 way, and a workload that is not reserved answers 409.
 
-**Knobs** (operator overrides; on a Linux node set them in a systemd drop-in, `sudo systemctl edit noo-node-agent`
-then `[Service]` / `Environment=NOO_GPU_YIELD=off`, and restart the agent. Not in `/etc/noo-node-agent.env`:
+**Knobs** (operator overrides; set them in the node's local declarations file,
+`/etc/noo-node-agent.local.env` (Linux and Mac; root's, mode 644), and restart the agent, see
+[the node's own declarations](../security/node-agent.md#the-nodes-own-declarations). Not in `/etc/noo-node-agent.env`:
 every roll replaces that file whole and a hand-added line is gone):
 
 | Variable | Default | Meaning |

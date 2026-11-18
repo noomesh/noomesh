@@ -153,6 +153,10 @@ type Reporter struct {
 	// provider answering nil (nothing checked yet) omits the key.
 	ollamaVerify atomic.Pointer[func() any]
 
+	// nodeLocal reports the node's own declarations file (nodelocal): which
+	// keys it declares, which it refused and why, sent as `node_local`.
+	nodeLocal atomic.Pointer[func() any]
+
 	// backendCaps reports the backend containers' capability set and what
 	// the node's environment asked for that is not grantable, sent as
 	// `backend_caps`. nil = not wired (no Docker backends here).
@@ -402,6 +406,17 @@ func (r *Reporter) SetModelSets(f func() any) { r.modelSets.Store(&f) }
 // SetOllamaVerify installs the provider of `ollama_verify`: [{model, state,
 // anchor, model_layer, reason, remedy?, checked_at}].
 func (r *Reporter) SetOllamaVerify(f func() any) { r.ollamaVerify.Store(&f) }
+
+// SetNodeLocal installs the provider of `node_local`.
+func (r *Reporter) SetNodeLocal(f func() any) { r.nodeLocal.Store(&f) }
+
+func (r *Reporter) nodeLocalReport() any {
+	f := r.nodeLocal.Load()
+	if f == nil || *f == nil {
+		return nil
+	}
+	return (*f)()
+}
 
 // SetBackendCaps installs the provider of `backend_caps`: {source, granted,
 // refused, allowed}.
