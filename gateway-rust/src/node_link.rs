@@ -164,6 +164,14 @@ impl NodeLink {
         Err(AppError::NotFound(format!("Node '{node_id}' not found in mesh_nodes")))
     }
 
+    /// A link to `base` carrying `record`'s transports, as `from_record`
+    /// builds it, without the agent_url rule: for tests whose stand-in node
+    /// is a plain-HTTP loopback server (the rule refuses both).
+    #[cfg(test)]
+    pub(crate) fn for_test_server(base: &str, node_id: &str, record: &Value) -> Self {
+        Self::with_node(base.to_string(), node_id).advertising(record)
+    }
+
     fn with_node(base: String, node_id: &str) -> Self {
         Self { base, node_id: Some(node_id.to_string()), auth: Auth::Node, nats_rpc: false, bus: None, tunnel: false }
     }

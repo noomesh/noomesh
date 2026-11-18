@@ -679,11 +679,11 @@ fn install(node: &str) -> (Arc<Session>, mpsc::Receiver<Frame>) {
 }
 
 fn tunnelled_link(node: &str, agent_url: &str) -> crate::node_link::NodeLink {
-    crate::node_link::NodeLink::from_record(
+    crate::node_link::NodeLink::for_test_server(
+        agent_url,
         node,
-        Some(&json!({"agent_url": agent_url, "control_transports": {"https_listener": true, "nats_rpc": false, "tunnel": true}})),
+        &json!({"agent_url": agent_url, "control_transports": {"https_listener": true, "nats_rpc": false, "tunnel": true}}),
     )
-    .unwrap()
 }
 
 /// A plain HTTP server standing in for the node's :8081, answering "via-https".
@@ -800,7 +800,7 @@ async fn without_a_live_tunnel_or_an_advertisement_the_call_is_https_as_before()
     assert_eq!(link.request(Method::GET, "/x").send().await.unwrap().text().await.unwrap(), "via-https");
     // Live, but the record does not advertise (an old node): HTTPS.
     let (_sess, _rx) = install("route-old");
-    let old = crate::node_link::NodeLink::from_record("route-old", Some(&json!({"agent_url": url}))).unwrap();
+    let old = crate::node_link::NodeLink::for_test_server(&url, "route-old", &json!({"agent_url": url}));
     assert_eq!(old.request(Method::GET, "/x").send().await.unwrap().text().await.unwrap(), "via-https");
 }
 
