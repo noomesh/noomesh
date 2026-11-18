@@ -612,7 +612,7 @@ release_prev_tag() {
     printf '%s\n' "$_rp"
 }
 # Generation 1 has no release check: no row, current or previous, installs one.
-RELEASE_MIN_APPLIER_GENERATION=2
+RELEASE_MIN_APPLIER_GENERATION=1
 
 # release_check WORK SCRATCH — refuses (75) unless every root-run payload the
 # signed manifest names is in a release-signed list that is not older than the
