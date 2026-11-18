@@ -700,6 +700,19 @@ jobs:
             context: .
             platforms: linux/amd64,linux/arm64
             extra_args: ""
+          # llamacpp-cuda: the GPU llama-server (docker/Dockerfile.llamacpp-cuda,
+          # CUDA 12.9: compute 6.1 Pascal through Blackwell, PTX forward
+          # fallback). amd64 ONLY: no arm64 node has a CUDA GPU the agent
+          # starts it on, and a QEMU CUDA compile would cost hours. A separate
+          # image from llamacpp so only a node that runs llamacpp on its GPU
+          # downloads its ~3 GB (the CUDA 12.9 runtime base alone is 2.4 GB compressed): the lock row is staged on demand
+          # (noo-cli image_stage::ON_DEMAND_LOCK_ROWS), never by every roll.
+          - name: llamacpp-cuda
+            image: llamacpp-cuda
+            dockerfile: docker/Dockerfile.llamacpp-cuda
+            context: .
+            platforms: linux/amd64
+            extra_args: ""
           # ollama: the hardened Ollama (docker/Dockerfile.ollama): the pinned
           # upstream release tarball, sha256-verified, on the same DHI base.
           # amd64 + arm64, like llamacpp. The tarball is fetched and unpacked in

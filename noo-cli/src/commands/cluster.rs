@@ -650,12 +650,12 @@ pub(crate) fn desired_cell(p: &serde_json::Value) -> String {
 }
 
 /// The `on` cell: the placement's declared hardware target, or what it falls
-/// back to when undeclared.
-pub(crate) fn target_cell(p: &serde_json::Value) -> String {
+/// back to when undeclared. `node` is the node's record (its GPU facts).
+pub(crate) fn target_cell(p: &serde_json::Value, node: &serde_json::Value) -> String {
     match p["target"].as_str() {
-        // i545 45: a gpu target the image cannot honour runs on the cpu.
-        Some(t) if super::cluster_tune::runs_on_cpu_regardless(p["backend"].as_str().unwrap_or(""), t) => {
-            format!("{t} {}", ui::muted("(runs on cpu: the llamacpp image has no GPU build)"))
+        // i545 45: a gpu target this node cannot honour runs on the cpu.
+        Some(t) if super::cluster_tune::runs_on_cpu_regardless(p["backend"].as_str().unwrap_or(""), t, node) => {
+            format!("{t} {}", ui::muted("(runs on cpu: this node cannot run the CUDA llama.cpp image)"))
         }
         Some(t) => t.to_string(),
         None if p["env"]["N_GPU_LAYERS"].as_str() == Some("0") => format!("cpu {}", ui::muted("(N_GPU_LAYERS=0)")),
@@ -726,7 +726,7 @@ pub(crate) fn role_capabilities_section_with(n: &serde_json::Value, placements: 
         let on = placements
             .and_then(|ps| ps.as_array())
             .and_then(|ps| ps.iter().find(|p| p["backend"] == c["backend"] && p["role"].as_str().filter(|r| !r.is_empty()).unwrap_or("chat") == c["role"].as_str().unwrap_or("chat")))
-            .map(|p| format!(" ({})", target_cell(p)))
+            .map(|p| format!(" ({})", target_cell(p, n)))
             .unwrap_or_default();
         out.push_str(&format!(
             "  {:<8} {} on {}{}  {}{}\n",
@@ -850,7 +850,7 @@ fn print_desired(node: &str, body: &serde_json::Value, node_live: &serde_json::V
                 truncate(backend, 12),
                 role.to_string(),
                 truncate(p["model"].as_str().unwrap_or(""), 52),
-                target_cell(p),
+                target_cell(p, node_live),
                 mem_cell(p),
                 p["port"].as_i64().map(|v| v.to_string()).unwrap_or_default(),
                 if p["tls"].as_bool().unwrap_or(false) { "tls".into() } else { String::new() },
@@ -1398,16 +1398,18 @@ fn plan_target_and_tuning(
     }).and_then(|p| p["target"].as_str()).map(str::to_string);
     let node_rec = fetch_node_opt(g, node);
     let hw = node_rec.as_ref().map(t::Hardware::of).unwrap_or_default();
+    let node_facts = node_rec.clone().unwrap_or(serde_json::Value::Null);
     let pre_env = merge_placement_env(current, explicit);
     let target = t::resolve_target(on, backend, &hw, stored_target.as_deref(), &pre_env)
         .unwrap_or_else(|e| fail(g.json, ExitCode::Usage, "bad_target", &e, Some(&format!("noo cluster show {node}"))));
-    // i545 45/46: a GPU target the image cannot honour is placed on cpu, with
+    // i545 45/46: a GPU target this node cannot honour (llamacpp where the
+    // CUDA image cannot run: t::llamacpp_gpu_usable) is placed on cpu, with
     // CPU sizing and N_GPU_LAYERS=0, and said so; never a GPU-sized
-    // placement that silently runs on the CPU.
-    let cpu_build = t::runs_on_cpu_regardless(backend, target);
+    // placement that silently runs on the CPU. On a node that can, gpu stays.
+    let cpu_build = t::runs_on_cpu_regardless(backend, target, &node_facts);
     let target = if cpu_build { "cpu" } else { target };
     let target_why = match (on, stored_target.as_deref()) {
-        _ if cpu_build => "the llamacpp image has no GPU build".to_string(),
+        _ if cpu_build => "this node cannot run the CUDA llama.cpp image".to_string(),
         (Some(_), _) => "--on".to_string(),
         (None, Some(s)) if s == target => "as already placed".to_string(),
         _ if t::target_env(backend, "gpu", &pre_env).iter().any(|(k, _)| k == "N_GPU_LAYERS") && target == "cpu" => "N_GPU_LAYERS=0 pins it to cpu".to_string(),
@@ -1449,7 +1451,7 @@ fn plan_target_and_tuning(
         notes.push("ollama on cpu: the agent gives the container no GPU device".into());
     }
     if cpu_build {
-        let note = format!("{}; placed on cpu instead. For a GPU, place the model on ollama or vllm", t::LLAMACPP_NO_GPU_NOTE);
+        let note = format!("{}; placed on cpu instead. For a GPU, use a node that reports both, or place the model on ollama or vllm", t::LLAMACPP_NO_GPU_NOTE);
         if !g.json {
             ui::warned(&note);
         }
@@ -1567,7 +1569,7 @@ mod gpu_build_tests {
     fn a_gpu_target_the_image_cannot_honour_is_placed_on_cpu_and_said() {
         let own = crate::test_src::own_code(include_str!("cluster.rs"));
         let b = crate::test_src::fn_body(&own, "fn plan_target_and_tuning(");
-        let check = b.find("let cpu_build = t::runs_on_cpu_regardless(backend, target);").expect("the check");
+        let check = b.find("let cpu_build = t::runs_on_cpu_regardless(backend, target, &node_facts);").expect("the check");
         let swap = b.find("let target = if cpu_build { \"cpu\" } else { target };").expect("the swap");
         let env = b.find("t::target_env(backend, target, &pre_env)").expect("the target env");
         let fit = b.find("\"target\": target, \"model_size_bytes\"").expect("the fit");
@@ -1578,11 +1580,14 @@ mod gpu_build_tests {
     #[test]
     fn status_marks_a_gpu_target_that_runs_on_the_cpu() {
         let llama = serde_json::json!({"backend": "llamacpp", "target": "gpu"});
-        assert!(super::target_cell(&llama).contains("runs on cpu"), "{}", super::target_cell(&llama));
+        let old_gpu = serde_json::json!({"vram_gb": 8.0, "nvidia_runtime": true, "gpu_compute_cap": "5.2"});
+        assert!(super::target_cell(&llama, &old_gpu).contains("runs on cpu"), "{}", super::target_cell(&llama, &old_gpu));
+        let usable = serde_json::json!({"vram_gb": 8.0, "nvidia_runtime": true, "gpu_compute_cap": "6.1"});
+        assert_eq!(super::target_cell(&llama, &usable), "gpu", "a node that can run the CUDA image runs it on the GPU");
         let ollama = serde_json::json!({"backend": "ollama", "target": "gpu"});
-        assert_eq!(super::target_cell(&ollama), "gpu");
+        assert_eq!(super::target_cell(&ollama, &old_gpu), "gpu");
         let cpu = serde_json::json!({"backend": "llamacpp", "target": "cpu"});
-        assert_eq!(super::target_cell(&cpu), "cpu");
+        assert_eq!(super::target_cell(&cpu, &old_gpu), "cpu");
     }
 }
 
@@ -1737,7 +1742,7 @@ mod placement_env_tests {
         let out = role_capabilities_section_with(&n, Some(&ps));
         assert!(out.contains("g.gguf on llamacpp (cpu)"), "{out}");
         let legacy = json!({"backend": "llamacpp", "target": null, "env": {"N_GPU_LAYERS": "0"}});
-        assert!(target_cell(&legacy).starts_with("cpu"));
+        assert!(target_cell(&legacy, &n).starts_with("cpu"));
         let cfg = json!({"usage_profile": null, "usage_profile_effective": "shared", "usage_profile_source": "default for a worker"});
         let u = usage_cell(&cfg);
         assert!(u.contains("shared") && u.contains("default for a worker") && u.contains("--usage"), "{u}");

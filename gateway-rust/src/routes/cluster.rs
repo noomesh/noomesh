@@ -415,6 +415,12 @@ const I300_BEAT_KEYS: &[(&str, BeatShape)] = &[
     // controller's store (`{model, state, anchor, model_layer, reason,
     // remedy?, checked_at}`), read by the `ollama models` verify row.
     ("ollama_verify", BeatShape::Objects(64)),
+    // Per llamacpp started on the GPU, what llama-server's own startup lines
+    // said (`{backend, model, target, state, offloaded?, total?,
+    // cuda_devices?, device?, compute_cap?, failure?, cause?, checked_at}`;
+    // node-agent-go docker/llamacpp_offload.go), read by the `llamacpp
+    // offload` verify row: 0 offloaded on a GPU start is a WARN.
+    ("llamacpp_offload", BeatShape::Objects(8)),
 ];
 
 fn beat_shape_ok(v: &Value, shape: BeatShape) -> bool {
@@ -4676,6 +4682,10 @@ pub(crate) fn validate_target(backend: &str, target: Option<&str>, node: &Value)
     if t == "gpu" && crate::placement_fit::node_reports_memory(node) && !crate::placement_fit::node_has_gpu(node) {
         return Err("this node reports no GPU: place it with target cpu".into());
     }
+    // llamacpp `gpu` is accepted on any GPU node, and fits and runs as cpu on
+    // one that cannot use the CUDA image (no nvidia runtime, compute below
+    // 6.1): placement_fit::resolve_target (llamacpp_gpu_usable) and the node
+    // agent (docker.LlamacppGPUUsable) apply the same rule.
     Ok(())
 }
 
@@ -5000,7 +5010,7 @@ fn with_size_hint(node: &mut Value, model: Option<&str>, size: Option<u64>) {
 /// gateway can name, no store mounted, or the node's arch unknown).
 /// The bool is whether the node runs NOO_IMAGE_SOURCE=rail (refuse) or not
 /// (warn only).
-async fn placement_staging_refusal(state: &AppState, node_id: &str, backend: &str, body_image: Option<&str>) -> Option<(String, bool)> {
+async fn placement_staging_refusal(state: &AppState, node_id: &str, backend: &str, body_image: Option<&str>, target: Option<&str>) -> Option<(String, bool)> {
     use crate::routes::artifacts as art;
     let dir = art::image_store_dir();
     if !dir.is_dir() {
@@ -5016,7 +5026,11 @@ async fn placement_staging_refusal(state: &AppState, node_id: &str, backend: &st
         return None;
     }
     let index = art::read_staged_index(&dir);
-    let image = art::placement_required_image(backend, body_image, &arch, index.release.as_ref(), &index.own_roots)?;
+    // llamacpp on this node's GPU starts the CUDA build: that is the image to
+    // have staged (and the one `noo cluster place` stages on this refusal).
+    // A CPU node is never asked for it.
+    let on_gpu = backend == "llamacpp" && crate::placement_fit::llamacpp_runs_on_gpu(target, &node);
+    let image = art::placement_required_image(backend, body_image, &arch, index.release.as_ref(), &index.own_roots, on_gpu)?;
     if art::image_is_staged(&dir, &image, &arch) {
         return None;
     }
@@ -5191,7 +5205,8 @@ async fn placement_put(
     // Judged only when the store is mounted here and the node reports its
     // architecture; `noo cluster place` stages and retries on this refusal.
     if desired == "running" && backend != "harness" {
-        if let Some((msg, rail)) = placement_staging_refusal(&state, &node_id, &backend, body.image.as_deref()).await {
+        let staged_target = body.target.as_deref().map(str::trim).filter(|t| !t.is_empty());
+        if let Some((msg, rail)) = placement_staging_refusal(&state, &node_id, &backend, body.image.as_deref(), staged_target).await {
             if rail && !body.force {
                 return Err(AppError::Conflict(msg));
             }
@@ -9141,7 +9156,27 @@ mod i300_beat_tests {
             ],
             "node_workloads": [{"addon": "rhaddon", "name": "worker", "state": "provisioned", "ready": false, "door_port": 41001}],
             "ollama_verify": [{"model": "harrier", "state": "verified", "anchor": "gguf", "model_layer": "sha256:5f26", "reason": "", "checked_at": "t"}],
+            "llamacpp_offload": [{"backend": "llamacpp", "model": "m.gguf", "target": "gpu", "state": "gpu", "offloaded": 33, "total": 33,
+                "cuda_devices": 1, "device": "NVIDIA GeForce GTX 1080", "compute_cap": "6.1", "checked_at": "t"}],
         })
+    }
+
+    /// The agent's `llamacpp_offload` (a GPU llamacpp start's offload, read
+    /// from llama-server's log) reaches the record, so `noo cluster verify`
+    /// can WARN on 0 offloaded; a beat without it removes it (the llamacpp
+    /// stopped or moved to cpu), and a non-list is unknown.
+    #[test]
+    fn llamacpp_offload_is_carried_and_removed_when_absent() {
+        let mut data = json!({"id": "n1"});
+        let beat = json!({"llamacpp_offload": [{"backend": "llamacpp", "model": "m.gguf", "target": "gpu", "state": "cpu",
+            "cuda_devices": 0, "failure": "CUDA driver version is insufficient for CUDA runtime version", "checked_at": "t"}]});
+        carry_i300(&mut data, &beat);
+        assert_eq!(data["llamacpp_offload"], beat["llamacpp_offload"], "{data}");
+        carry_i300(&mut data, &json!({"running_backends": {}}));
+        assert!(data.get("llamacpp_offload").is_none(), "absent from the beat, so gone: {data}");
+        carry_i300(&mut data, &beat);
+        carry_i300(&mut data, &json!({"llamacpp_offload": {"backend": "llamacpp"}}));
+        assert!(data.get("llamacpp_offload").is_none(), "a non-list is unknown: {data}");
     }
 
     /// Every A4 key reaches the record; a later beat without it (an older

@@ -162,6 +162,12 @@ type Reporter struct {
 	// `backend_caps`. nil = not wired (no Docker backends here).
 	backendCaps atomic.Pointer[func() any]
 
+	// llamacppOffload reports, per llamacpp started on the GPU, how many
+	// layers llama-server offloaded and the CUDA device it found, sent as
+	// `llamacpp_offload`. nil = not wired; a provider answering nil (no GPU
+	// llamacpp start) omits the key.
+	llamacppOffload atomic.Pointer[func() any]
+
 	// nodeFacts supplies the i300 F5b keys: the node facts, the consent policy
 	// and approvals, and `node_workloads`. It returns only the keys it knows;
 	// everything absent is omitted. nil = not wired. Installed after the loop
@@ -424,6 +430,19 @@ func (r *Reporter) SetBackendCaps(f func() any) { r.backendCaps.Store(&f) }
 
 func (r *Reporter) backendCapsReport() any {
 	f := r.backendCaps.Load()
+	if f == nil || *f == nil {
+		return nil
+	}
+	return (*f)()
+}
+
+// SetLlamacppOffload installs the provider of `llamacpp_offload`: [{backend,
+// model, target, state, offloaded, total, cuda_devices, device, compute_cap,
+// failure, cause, checked_at}].
+func (r *Reporter) SetLlamacppOffload(f func() any) { r.llamacppOffload.Store(&f) }
+
+func (r *Reporter) llamacppOffloadReport() any {
+	f := r.llamacppOffload.Load()
 	if f == nil || *f == nil {
 		return nil
 	}

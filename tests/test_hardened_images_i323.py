@@ -82,7 +82,7 @@ def test_dockerfile_ollama_verifies_a_sha256_per_arch():
 
 
 def test_the_ollama_pin_is_one_version_in_the_dockerfile_and_the_agent_fallback():
-    assert f'upstreamOllamaImage   = "ollama/ollama:{PIN["version"]}"' in BACKENDS
+    assert re.search(r'upstreamOllamaImage\s+= "ollama/ollama:' + re.escape(PIN["version"]) + '"', BACKENDS)
 
 
 def test_the_ollama_lock_row_is_ours_and_every_compose_ollama_runs_it():
@@ -116,12 +116,31 @@ def _arches_from_matrix(name: str) -> list[str]:
 def test_the_published_arch_tables_equal_the_release_matrix():
     """Gateway and CLI keep a twin of the matrix `platforms` (the lock records only
     index digests); this is what keeps them from drifting."""
-    for path, pat in (("gateway-rust/src/routes/artifacts.rs", r"OWN_IMAGE_ARCHES: &\[\(&str, &\[&str\]\)\] = &\[(.*?)\];"),
-                      ("noo-cli/src/commands/image_stage.rs", r"OWN_IMAGE_ARCHES: &\[\(&str, &\[&str\]\)\] = &\[(.*?)\];")):
+    for path, pat in (("gateway-rust/src/routes/artifacts.rs", r"OWN_IMAGE_ARCHES: &\[\(&str, &\[&str\]\)\] =\s*&\[(.*?)\];"),
+                      ("noo-cli/src/commands/image_stage.rs", r"OWN_IMAGE_ARCHES: &\[\(&str, &\[&str\]\)\] =\s*&\[(.*?)\];")):
         src = (ROOT / path).read_text()
         body = re.search(pat, src).group(1)
-        table = {n: sorted(re.findall(r'"([a-z0-9]+)"', arches)) for n, arches in re.findall(r'\("([a-z]+)", &\[(.*?)\]\)', body)}
-        assert table == {n: _arches_from_matrix(n) for n in ("llamacpp", "ollama")}, (path, table)
+        table = {n: sorted(re.findall(r'"([a-z0-9]+)"', arches)) for n, arches in re.findall(r'\("([a-z0-9-]+)", &\[(.*?)\]\)', body)}
+        assert table == {n: _arches_from_matrix(n) for n in ("llamacpp", "llamacpp-cuda", "ollama")}, (path, table)
+
+
+def test_the_cuda_llamacpp_image_is_amd64_only_and_a_cuda_12_build():
+    """0.6.28: the GPU llama.cpp image. amd64 only (no arm64 node runs it on a
+    CUDA GPU); CUDA 12.9, not 13 (13 dropped compute < 7.5, the fleet has
+    Pascal); real cubins for the consumer families plus ONE low virtual arch
+    as the forward PTX fallback; never `native`."""
+    r = _row("llamacpp-cuda")
+    assert r["platforms"] == "linux/amd64" and r["dockerfile"] == "docker/Dockerfile.llamacpp-cuda", r
+    text = (ROOT / r["dockerfile"]).read_text()
+    code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+    froms = re.findall(r"^FROM\s+(\S+)", code, re.M)
+    assert len(froms) == 2 and all(f.startswith("${HUB_MIRROR}/nvidia/cuda:12.9.") and "@sha256:" in f for f in froms), froms
+    assert "devel" in froms[0] and "runtime" in froms[1], froms
+    assert "-DGGML_CUDA=ON" in code and "-DGGML_NATIVE=OFF" in code and "native" not in code.replace("GGML_NATIVE", "")
+    m = re.search(r'^ARG CUDA_ARCHITECTURES="([^"]+)"', code, re.M)
+    assert m and m.group(1) == "61-real;75-real;86-real;89-real;120-real;61-virtual", m and m.group(1)
+    assert '-DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}"' in code
+    assert re.findall(r"^USER\s+(\S+)", code, re.M)[-1] == "nonroot"
 
 
 def test_verify_fails_on_upstream_drift():

@@ -516,6 +516,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     out.extend(images_staged_check(n));
     out.extend(door_pin_check(n));
     out.extend(gpu_target_cpu_build_check(n));
+    out.extend(llamacpp_offload_check(n));
     out.extend(hardened_images_check(n));
 
     // 6c''. Vendor telemetry (docs/security/telemetry.md): no running
@@ -1293,10 +1294,11 @@ pub(crate) fn images_staged_check(n: &Value) -> Option<Check> {
     ))
 }
 
-/// The `gpu target` row (i545 45/46): placements declared on `gpu` whose
-/// image has no GPU build (`gpu_targets_on_cpu_builds`, injected by
-/// `with_harness_wanted` from desired-config). They run on the CPU while
-/// sized and reported as GPU. No row when there are none.
+/// The `gpu target` row (i545 45/46): placements declared on `gpu` that this
+/// node cannot run on its GPU (llamacpp where the CUDA image cannot run:
+/// `gpu_targets_on_cpu_builds`, injected by `with_harness_wanted` from
+/// desired-config and the node's GPU facts). They run on the CPU while
+/// declared GPU. No row when there are none.
 pub(crate) fn gpu_target_cpu_build_check(n: &Value) -> Option<Check> {
     let id = n["id"].as_str().unwrap_or("?");
     let list = n["gpu_targets_on_cpu_builds"].as_array()?;
@@ -1305,11 +1307,81 @@ pub(crate) fn gpu_target_cpu_build_check(n: &Value) -> Option<Check> {
     Some(warn(
         "gpu target",
         format!(
-            "placed on gpu but running on the CPU (the llamacpp image has no GPU build): {}",
+            "placed on gpu but running on the CPU (this node cannot run the CUDA llama.cpp image: it needs an NVIDIA GPU of compute 6.1+ and the nvidia runtime): {}",
             names.join(", ")
         ),
         Some(format!("noo cluster place {id} {first} --on cpu   # CPU sizing; for a GPU, place it on ollama or vllm")),
     ))
+}
+
+/// Why a GPU llamacpp start offloaded nothing, from what the agent read in
+/// llama-server's log; the same rule as node-agent-go's offloadCause, for a
+/// report that carries no `cause`.
+const LLAMACPP_CAUSE_DRIVER: &str = "the NVIDIA driver is too old for the CUDA 12.9 build (needs a 12.9-capable driver; a GPU that runs the PTX fallback needs driver 575 or newer)";
+const LLAMACPP_CAUSE_NO_DEVICE: &str = "no CUDA device was visible in the container";
+
+fn llamacpp_offload_cause(r: &Value) -> String {
+    if let Some(c) = r["cause"].as_str().filter(|c| !c.is_empty()) {
+        return c.to_string();
+    }
+    let failure = r["failure"].as_str().unwrap_or("");
+    if failure.contains("no CUDA-capable device") {
+        LLAMACPP_CAUSE_NO_DEVICE.to_string()
+    } else if !failure.is_empty() {
+        LLAMACPP_CAUSE_DRIVER.to_string()
+    } else if r["cuda_devices"].as_u64().unwrap_or(0) == 0 {
+        LLAMACPP_CAUSE_NO_DEVICE.to_string()
+    } else {
+        "llama.cpp was started with no GPU layers (N_GPU_LAYERS resolved to 0)".to_string()
+    }
+}
+
+/// The `llamacpp offload` row: after a llamacpp start on the GPU the agent
+/// reads llama-server's own startup lines (`llamacpp_offload`: layers
+/// offloaded of the total, the CUDA device, any CUDA init failure). OK names
+/// the device and the layers; WARN when a GPU start offloaded none, CUDA
+/// failed, or no offload line came by the agent's bound: the model runs on
+/// the CPU while the GPU stays reserved. No row without a GPU llamacpp start,
+/// while the model is still loading, or from an agent that does not report it.
+pub(crate) fn llamacpp_offload_check(n: &Value) -> Option<Check> {
+    const NAME: &str = "llamacpp offload";
+    let id = n["id"].as_str().unwrap_or("?");
+    let rows = n.get("llamacpp_offload")?.as_array()?;
+    let mut good = Vec::new();
+    let mut warns = Vec::new();
+    let mut models = Vec::new();
+    for r in rows.iter().filter(|r| r["target"].as_str() == Some("gpu")) {
+        let model = r["model"].as_str().filter(|m| !m.is_empty()).unwrap_or("<model>");
+        let offloaded = r["offloaded"].as_u64();
+        let total = r["total"].as_u64();
+        let failure = r["failure"].as_str().unwrap_or("");
+        let state = r["state"].as_str().unwrap_or("");
+        let on_gpu = failure.is_empty() && offloaded.is_some_and(|o| o > 0);
+        if on_gpu {
+            let device = r["device"].as_str().filter(|d| !d.is_empty()).unwrap_or("the GPU");
+            good.push(format!("llamacpp on {device}: {}/{} layers offloaded ({model})", offloaded.unwrap_or(0), total.unwrap_or(0)));
+            continue;
+        }
+        let what = match (failure.is_empty(), offloaded, state) {
+            (false, _, _) => format!("CUDA failed ({failure})"),
+            (true, Some(0), _) => format!("0/{} layers offloaded", total.unwrap_or(0)),
+            (true, None, "cpu") => "no layer offloaded (llama-server loaded the model without the GPU)".to_string(),
+            (true, None, "unknown") => "no offload line from llama-server by the agent's bound".to_string(),
+            _ => continue, // still loading
+        };
+        warns.push(format!("{model} placed on gpu runs on the CPU: {what}; likely cause: {}", llamacpp_offload_cause(r)));
+        models.push(model.to_string());
+    }
+    if let Some(first) = models.first() {
+        let mut d = warns.join("; ");
+        if !good.is_empty() {
+            d.push_str(&format!("; on the GPU: {}", good.join(", ")));
+        }
+        return Some(warn(NAME, d, Some(format!(
+            "update the NVIDIA driver on {id} (the CUDA 12.9 build needs a 12.9-capable driver, 575 or newer for a GPU on the PTX fallback), or place it on cpu: noo cluster place {id} llamacpp {first} --on cpu"
+        ))));
+    }
+    (!good.is_empty()).then(|| ok(NAME, good.join(", ")))
 }
 
 /// The hardened image of ours that replaces an upstream backend image
@@ -1991,7 +2063,7 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
     // Placements whose image is not staged on the artifact rail for this
     // node's arch (read from the image store on THIS host; empty elsewhere).
     let unstaged = match (desired.as_ref(), crate::commands::image_stage::node_arch(&n)) {
-        (Some(d), Some(arch)) => crate::commands::image_stage::unstaged_for(&d["placements"], arch),
+        (Some(d), Some(arch)) => crate::commands::image_stage::unstaged_for(&d["placements"], arch, &n),
         _ => Vec::new(),
     };
     // The `door pin` row: each pinned stunnel door this node runs, and the
@@ -2001,10 +2073,10 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
         (Some(d), Some(arch)) => door_pin_facts(g, &d["placements"], arch),
         _ => Vec::new(),
     };
-    // i545 45/46: placements on a gpu target whose image has no GPU build.
+    // i545 45/46: placements on a gpu target this node cannot run on its GPU.
     let cpu_built = desired
         .as_ref()
-        .map(|d| crate::commands::cluster_tune::gpu_targets_on_cpu_builds(&d["placements"]))
+        .map(|d| crate::commands::cluster_tune::gpu_targets_on_cpu_builds(&d["placements"], &n))
         .unwrap_or_default();
     // Control over the bus: a node that advertises it gets one health round
     // trip over NATS, run by the gateway (the only principal that may send).
@@ -12462,7 +12534,7 @@ mod tests {
         assert_eq!(c.remedy.as_deref().unwrap().split("   #").next().unwrap(), "noo cluster place Lenovo-P52s llamacpp gemma-4-E2B-it-Q4_K_M.gguf --on cpu");
         let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
         let inject = crate::test_src::fn_body(&own, "fn with_harness_wanted(");
-        assert!(inject.contains("gpu_targets_on_cpu_builds(&d[\"placements\"])"), "fed from desired-config");
+        assert!(inject.contains("gpu_targets_on_cpu_builds(&d[\"placements\"], &n)"), "fed from desired-config and the node's GPU facts");
         assert!(own.contains("out.extend(gpu_target_cpu_build_check(n));"), "the row is in the run");
     }
 
@@ -16409,5 +16481,63 @@ mod backend_starts_tests {
         ]));
         let c = backend_starts_check("ctrl", &n).unwrap();
         assert_eq!(c.detail, "ctrl: llamacpp: r");
+    }
+}
+
+#[cfg(test)]
+mod llamacpp_offload_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn node(rows: Value) -> Value {
+        json!({"id": "node-a", "status": "online", "llamacpp_offload": rows})
+    }
+
+    #[test]
+    fn llamacpp_offload_ok_names_the_device_and_the_layers() {
+        let n = node(json!([{"backend": "llamacpp", "model": "llama-3.1-8b-Q4_K_M.gguf", "target": "gpu", "state": "gpu",
+            "offloaded": 33, "total": 33, "cuda_devices": 1, "device": "NVIDIA GeForce GTX 1080", "compute_cap": "6.1", "checked_at": "t"}]));
+        let c = llamacpp_offload_check(&n).expect("a GPU start is a row");
+        assert_eq!(c.verdict, Verdict::Ok, "{c:?}");
+        assert!(c.detail.starts_with("llamacpp on NVIDIA GeForce GTX 1080: 33/33 layers offloaded"), "{}", c.detail);
+    }
+
+    #[test]
+    fn llamacpp_offload_zero_offloaded_warns_naming_the_driver_and_both_remedies() {
+        let n = node(json!([{"backend": "llamacpp", "model": "m.gguf", "target": "gpu", "state": "cpu",
+            "offloaded": 0, "total": 33, "cuda_devices": 0, "checked_at": "t"}]));
+        let c = llamacpp_offload_check(&n).expect("0 offloaded is a row");
+        assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
+        assert!(c.detail.contains("0/33 layers offloaded"), "{}", c.detail);
+        let remedy = c.remedy.as_deref().unwrap_or("");
+        assert!(remedy.contains("update the NVIDIA driver on node-a"), "{remedy}");
+        assert!(remedy.contains("noo cluster place node-a llamacpp m.gguf --on cpu"), "{remedy}");
+    }
+
+    #[test]
+    fn llamacpp_offload_cuda_init_failure_warns_naming_the_driver() {
+        let n = node(json!([{"backend": "llamacpp", "model": "m.gguf", "target": "gpu", "state": "cpu", "cuda_devices": 0,
+            "failure": "CUDA driver version is insufficient for CUDA runtime version", "checked_at": "t"}]));
+        let c = llamacpp_offload_check(&n).expect("a CUDA failure is a row");
+        assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
+        assert!(c.detail.contains("CUDA failed (CUDA driver version is insufficient"), "{}", c.detail);
+        assert!(c.detail.contains("the NVIDIA driver is too old for the CUDA 12.9 build"), "{}", c.detail);
+    }
+
+    #[test]
+    fn llamacpp_offload_no_row_on_cpu_loading_or_absent() {
+        assert!(llamacpp_offload_check(&json!({"id": "node-a"})).is_none(), "an agent that does not report it: no row");
+        assert!(llamacpp_offload_check(&node(json!([]))).is_none());
+        let cpu = node(json!([{"backend": "llamacpp", "model": "m.gguf", "target": "cpu", "state": "cpu", "offloaded": 0, "total": 33}]));
+        assert!(llamacpp_offload_check(&cpu).is_none(), "a cpu placement offloads nothing by design");
+        let loading = node(json!([{"backend": "llamacpp", "model": "m.gguf", "target": "gpu", "state": "loading", "checked_at": "t"}]));
+        assert!(llamacpp_offload_check(&loading).is_none(), "still loading is not an answer");
+    }
+
+    #[test]
+    fn node_checks_carry_the_llamacpp_offload_row() {
+        let n = node(json!([{"backend": "llamacpp", "model": "m.gguf", "target": "gpu", "state": "unknown", "checked_at": "t"}]));
+        let c = node_checks(&n, "", "", 0, None);
+        assert!(c.iter().any(|c| c.name == "llamacpp offload" && c.verdict == Verdict::Warn), "{:?}", c.iter().map(|c| c.name).collect::<Vec<_>>());
     }
 }

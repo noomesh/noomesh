@@ -562,7 +562,8 @@ pub fn cluster_sync_images(g: &Globals, args: &[String]) -> Result<i32, Unhandle
         // the node-bound release images it staged (plus any -i image).
         let (lock, prefix, tag) = crate::commands::image_stage::read_controller_lock(g);
         let arches = crate::commands::image_stage::fleet_arches_from_gateway(g);
-        let sum = crate::commands::image_stage::stage_lock(g, &lock, &prefix, &tag, &arches, false);
+        let on_demand = crate::commands::image_stage::on_demand_from_gateway(g);
+        let sum = crate::commands::image_stage::stage_lock(g, &lock, &prefix, &tag, &arches, false, &on_demand);
         for f in &sum.failed {
             ui::warned(f);
         }

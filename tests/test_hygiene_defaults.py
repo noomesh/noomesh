@@ -119,6 +119,16 @@ def test_the_local_builder_agrees_with_the_dockerfile_default():
     assert a == b, f"Dockerfile pins {a}, build-hardened-llamacpp.sh pins {b}"
 
 
+def test_the_cuda_image_builds_the_same_immutable_ref_and_refuses_a_moving_one():
+    """docker/Dockerfile.llamacpp-cuda is the GPU build of the SAME llama.cpp:
+    one ref for both images, and the same refusal of a moving one."""
+    cpu = (REPO / "docker/Dockerfile.llamacpp").read_text()
+    gpu = (REPO / "docker/Dockerfile.llamacpp-cuda").read_text()
+    ref = lambda t: re.search(r"^ARG LLAMACPP_REF=(\S+)$", t, re.M).group(1)
+    assert ref(gpu) == ref(cpu) and ref(gpu) not in MOVING, (ref(cpu), ref(gpu))
+    assert "LLAMACPP_ALLOW_MOVING_REF" in gpu and "master|main|HEAD|" in gpu and "LLAMACPP_COMMIT" in gpu
+
+
 # ── the admin-JWT fallback ─────────────────────────────────────────────────
 
 def test_no_admin_token_is_minted_in_worker_code():

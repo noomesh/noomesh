@@ -16,7 +16,10 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 
 # Matrix images that are build stages or base layers, not compose services.
-NOT_A_COMPOSE_SERVICE = {"deps-core", "deps-base", "static-ffmpeg"}
+# llamacpp-cuda: started by the node agent only, on a node that runs llamacpp on
+# a GPU it can use; never a compose service, so no box pulls its ~3 GB by
+# default (a fresh single box with no NVIDIA GPU never sees it).
+NOT_A_COMPOSE_SERVICE = {"deps-core", "deps-base", "static-ffmpeg", "llamacpp-cuda"}
 # Matrix image name → compose service name where they differ.
 # `stunnel` is one image behind several sidecars; the one a dist install
 # runs on the controller is the standalone embedder's (the others are on

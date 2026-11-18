@@ -671,6 +671,14 @@ func (r *Reconciler) planEffective(ctx context.Context, t *tick) bool {
 }
 
 func (r *Reconciler) sizeGpuYield(ctx context.Context, t *tick) bool {
+	// This node's GPU facts (NVIDIA GPU, nvidia runtime, compute capability),
+	// read once a tick BEFORE anything below decides where llamacpp runs:
+	// gpuyield's GPU set, the prefetch, the spec hash and the start all read
+	// them (dockerpkg.LlamacppGPUUsable: the CUDA image only on a node that
+	// can use it).
+	if r.docker != nil {
+		r.docker.RefreshGPUFacts(ctx)
+	}
 	// The shared-GPU yield sizes what the GPU backends need from these.
 	gpuyield.PublishPlacements(gpuPlacements(t.effective))
 	// The proxy's admission counts requests against these (occupancy).
@@ -915,7 +923,7 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 			ModelsDir:   t.modelsDir,
 			ExtraEnv:    extraEnv,
 			SpecHash:    desiredHash,
-			Target:      p.Target,
+			Target:      dockerpkg.StartTarget(p.Backend, p.Target, p.Env),
 			MemoryLimit: p.MemoryLimitBytes,
 		}
 		if err := r.docker.StartBackend(ctx, p.Backend, p.Model, 0, overrides); err != nil {
@@ -1415,7 +1423,7 @@ func specHashWith(p placement, key contentKeyFn) (string, bool) {
 	// after the 0.6.13 roll). Folded in only when set, so a node with no
 	// release pin, and a backend on an upstream image, keep their hash.
 	if p.Image == "" {
-		if img := dockerpkg.ReleaseBackendImage(p.Backend); img != "" {
+		if img := dockerpkg.ReleaseBackendImage(p.Backend, dockerpkg.StartTarget(p.Backend, p.Target, p.Env)); img != "" {
 			k, ok := key(img)
 			if !ok {
 				return "", false

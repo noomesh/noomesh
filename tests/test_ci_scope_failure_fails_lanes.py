@@ -60,7 +60,7 @@ def test_test_core_still_runs_when_scope_fails():
 def test_every_job_that_needs_scope_is_gated_or_known_optional():
     # A new job that needs scope must choose: gated (fail on a broken scope)
     # or listed here as not required, where skipping is harmless.
-    optional = {"test-core", "test-core-advisory", "ui", "build", "llamacpp-image", "ollama-image", "voice-images"}
+    optional = {"test-core", "test-core-advisory", "ui", "build", "llamacpp-image", "llamacpp-cuda-image", "ollama-image", "voice-images"}
     for name, job in JOBS.items():
         needs = job.get("needs") or []
         needs = [needs] if isinstance(needs, str) else needs

@@ -142,6 +142,18 @@ With no `--on`, a placement keeps the target it already has; otherwise
 `N_GPU_LAYERS=0` means cpu, and a node with a GPU defaults to gpu. `--on
 gpu` on a node that reports no GPU is refused.
 
+llamacpp on gpu runs the CUDA build of llama.cpp (`llamacpp-cuda`, CUDA
+12.9, amd64) with every layer on the GPU, on a node with an NVIDIA GPU of
+compute capability 6.1 or newer (GTX 10xx and later) and the NVIDIA
+container runtime, as its heartbeat reports them. On any other node, a GPU
+too old, no runtime, or not reported yet, `place` puts it on cpu instead and
+says why, and the fit and the node agent do the same, so `show` and `verify`
+never call a CPU-bound placement GPU. Only a node that runs llamacpp on its
+GPU downloads the CUDA image: about 3 GB the first time, then only the
+layers a release changed. `verify`'s `llamacpp offload` row shows how many
+layers llama-server put on the GPU; 0 offloaded or a CUDA failure is a WARN
+naming the NVIDIA driver (too old for CUDA 12.9) or a missing CUDA device.
+
 `noo cluster fit` budgets each placement against its own pool: a gpu
 placement against GPU memory (`vram`, or the `unified` GPU share on Apple
 Silicon), a cpu placement against RAM (on a unified-memory node, the RAM

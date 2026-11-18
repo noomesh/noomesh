@@ -65,3 +65,38 @@ func TestLlamacppMemoryLimitIsThePlacementsWhenSent(t *testing.T) {
 		t.Fatalf("derived limit must replace the spec's, got %d", got)
 	}
 }
+
+// A llamacpp start placed on gpu, or with no target, on a node that cannot
+// use the CUDA image runs as cpu: no GPU reserve (hence no device request,
+// whatever hasNvidiaGPU says) and no layer offload. Other backends keep their
+// placement's target.
+func TestLlamacppOnANodeThatCannotUseTheGPUBuildStartsAsCPUWhateverTheTarget(t *testing.T) {
+	unusable := GPUFacts{NvidiaGPU: true, NvidiaRuntime: true, MinComputeCap: "5.2"}
+	for _, target := range []string{"gpu", ""} {
+		env := map[string]string{}
+		if got := applyTarget("llamacpp", target, unusable, env, "all"); got != "0" {
+			t.Fatalf("target %q: gpu reserve %q, want 0 (no device request)", target, got)
+		}
+		if env["N_GPU_LAYERS"] != "0" || env["LLAMA_ARG_N_GPU_LAYERS"] != "0" {
+			t.Fatalf("target %q: llamacpp offloads nothing: %v", target, env)
+		}
+		if v, ok := env["CUDA_VISIBLE_DEVICES"]; !ok || v != "" {
+			t.Fatalf("target %q: CUDA_VISIBLE_DEVICES must be set empty: %v", target, env)
+		}
+		// The explicit 0 beats the "auto" sentinel that becomes 999 on a GPU node.
+		list := buildEnvList(map[string]string{"N_GPU_LAYERS": "${N_GPU_LAYERS:-auto}"}, env)
+		found := false
+		for _, kv := range list {
+			if kv == "N_GPU_LAYERS=0" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("target %q: N_GPU_LAYERS=0 not in the container env %v", target, list)
+		}
+	}
+	env := map[string]string{}
+	if got := applyTarget("ollama", "gpu", unusable, env, "all"); got != "all" || len(env) != 0 {
+		t.Fatalf("ollama on gpu keeps its reserve and env: %q %v", got, env)
+	}
+}
