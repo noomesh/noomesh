@@ -152,7 +152,7 @@ def test_bwrap_argv_mounts_no_proc(tmp_path):
     # Docker's masked /proc paths are locked inside the call's user
     # namespace, so the kernel refuses a fresh procfs there
     # (mount_too_revealing): `--proc /proc` made every call fail in a
-    # container (pop-os, 0.6.13). And no bind of the container's /proc,
+    # container (ctrl, 0.6.13). And no bind of the container's /proc,
     # which would show the code this server and the other calls.
     argv = sandbox.bwrap_argv(str(tmp_path))
     assert "--proc" not in argv
@@ -579,7 +579,7 @@ def _proc_is_masked() -> bool:
 
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap not installed here")
 def test_bwrap_live_runs_and_proves_its_isolation_under_dockers_proc_masks(scrubbed_python):
-    # The pop-os failure (0.6.13): in a container, a fresh procfs is refused
+    # The ctrl failure (0.6.13): in a container, a fresh procfs is refused
     # inside the call's user namespace, so the probe failed and every call was
     # refused. NOO_SANDBOX_TEST_PROC_MASK=1 (the CI step that builds the masks)
     # makes this a hard test rather than one that skips.

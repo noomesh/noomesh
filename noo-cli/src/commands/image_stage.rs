@@ -1068,7 +1068,7 @@ impl StageRun {
     /// is already finished (its later `finish` is a no-op). The new gateway
     /// hands every node the new lock's digest-pinned backend refs the moment
     /// it is up; a rail node whose arch tar is not staged yet refuses the
-    /// start (0.6.26 roll: robopi, `node.reconcile_refused` five times in two
+    /// start (0.6.26 roll: node-pi, `node.reconcile_refused` five times in two
     /// minutes and one operator alert, until the arm64 tar landed at
     /// 16:59:55). Staging first costs the roll about the launch's length.
     pub(crate) fn finish_before_launch(self, g: &Globals) -> StageRun {

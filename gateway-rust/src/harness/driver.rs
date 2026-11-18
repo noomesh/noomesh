@@ -1463,7 +1463,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        DriverCtx::new("awolf", "https://gateway:8080/", k, pinned(), &|n| parent.get(n).cloned()).unwrap()
+        DriverCtx::new("node-a", "https://gateway:8080/", k, pinned(), &|n| parent.get(n).cloned()).unwrap()
     }
 
     #[derive(Default)]
@@ -1617,7 +1617,7 @@ mod tests {
     }
 
     /// A vendor CLI that never reaches the model (hung before its first call,
-    /// as Copilot and Claude Code were on mcmini, 2026-10-24) is killed at
+    /// as Copilot and Claude Code were on node-mac, 2026-10-24) is killed at
     /// the stall bound with the reason, not at the 900 s wall.
     #[tokio::test]
     async fn a_cli_that_never_calls_the_model_is_killed_at_the_stall_bound() {
@@ -2305,7 +2305,7 @@ mod tests {
         };
         let r = run_turn_on(&ctx, &rail, &req, &crate::websocket::NullSink).await.unwrap();
         assert_eq!(r.response, "the answer is 42");
-        assert_eq!(r.node.as_deref(), Some("awolf"));
+        assert_eq!(r.node.as_deref(), Some("node-a"));
         let c = rail.calls.lock().unwrap();
         assert_eq!(c.saved, vec![("user".to_string(), "what is it?".to_string()), ("assistant".to_string(), "the answer is 42".to_string())]);
         assert_eq!(c.keys_revoked.len(), 1);

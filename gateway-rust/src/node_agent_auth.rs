@@ -207,7 +207,7 @@ fn self_flagged() -> bool {
 // The `mesh_nodes` KV has a 120 s TTL, so after the bus was down longer than
 // that (a reboot, a stack upgrade that recreates NATS) `seed` finds nothing,
 // and every self-agent call before that agent's first beat carried
-// `NOO_NODE_AGENT_TOKEN`. On pop-os 2026-10-28 the kiosk seat's keyless mint
+// `NOO_NODE_AGENT_TOKEN`. On ctrl 2026-10-28 the kiosk seat's keyless mint
 // (`/api/kiosk/token/tailnet` → `GET /tailnet/whois`) landed 17 s after the
 // gateway started and before the beat: the agent's `static_token` lane
 // counted it, the only static-token use left in the fleet.
@@ -609,7 +609,7 @@ mod tests {
                 get(move |h: axum::http::HeaderMap| async move {
                     let mut body = json!({"status": "healthy", "version": "0.6.13"});
                     if admits_leaf && h.get("authorization").is_none() {
-                        body["node_id"] = json!("pop-os");
+                        body["node_id"] = json!("ctrl");
                     }
                     axum::Json(body)
                 }),
@@ -619,7 +619,7 @@ mod tests {
                 get(move |h: axum::http::HeaderMap| async move {
                     let auth = h.get("authorization").and_then(|v| v.to_str().ok()).map(str::to_string);
                     seen_c.lock().unwrap().push(auth);
-                    axum::Json(json!({"name": "homeserver"}))
+                    axum::Json(json!({"name": "node-h"}))
                 }),
             );
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -631,14 +631,14 @@ mod tests {
     /// The kiosk mint's whois, as `routes::kiosk` sends it.
     async fn self_whois(base: &str) {
         crate::node_link::NodeLink::self_agent_at(base.to_string())
-            .request(reqwest::Method::GET, "/tailnet/whois?ip=100.111.73.72")
+            .request(reqwest::Method::GET, "/tailnet/whois?ip=100.64.0.100")
             .into_http()
             .send()
             .await
             .unwrap();
     }
 
-    /// The pop-os 2026-10-28 case: the gateway starts with an empty
+    /// The ctrl 2026-10-28 case: the gateway starts with an empty
     /// `mesh_nodes` KV (the bus was down past its TTL), and the first call to
     /// its own agent comes before that agent's first heartbeat. The startup
     /// step must already have learned that the agent admits the leaf, so the
@@ -694,11 +694,11 @@ mod tests {
         with_token(|| {
             note_self_probe(true);
             assert!(header_for_self("https://controller.tail:8081").is_none());
-            note("pop-os", &json!({"ip_address": "100.72.99.2", "self_node": true}));
+            note("ctrl", &json!({"ip_address": "100.64.0.101", "self_node": true}));
             assert!(header_for_self("https://controller.tail:8081").is_some(), "the beat said no: bearer");
             note_self_probe(true);
             assert!(header_for_self("https://controller.tail:8081").is_some(), "a late probe never overrides a beat");
-            note("pop-os", &json!({"ip_address": "100.72.99.2", "self_node": true, CAPABILITY: true}));
+            note("ctrl", &json!({"ip_address": "100.64.0.101", "self_node": true, CAPABILITY: true}));
             note_self_probe(false);
             assert!(header_for_self("https://controller.tail:8081").is_none(), "nor the other way");
         });
@@ -739,7 +739,7 @@ mod tests {
 
     #[test]
     fn the_leaf_capability_is_read_only_from_a_node_id_in_the_answer() {
-        assert!(self_agent_admits_leaf(&json!({"status": "healthy", "node_id": "pop-os"})));
+        assert!(self_agent_admits_leaf(&json!({"status": "healthy", "node_id": "ctrl"})));
         for v in [json!({"status": "healthy", "version": "0.6.13"}), json!({"node_id": ""}), json!({"node_id": 1}), json!({})] {
             assert!(!self_agent_admits_leaf(&v), "{v}");
         }

@@ -1252,11 +1252,11 @@ var placementEnvExact = map[string]struct{}{
 	// requests send their own options.num_ctx, so raising it leaves an
 	// embedder sharing the same ollama alone. A vendor CLI harness needs it:
 	// Claude Code's system prompt overflows ollama's 4096 default and the
-	// model answers a truncated prompt (mcmini probe, 2026-10-19).
+	// model answers a truncated prompt (node-mac probe, 2026-10-19).
 	"OLLAMA_CONTEXT_LENGTH": {},
 	// Attention kernel and KV-cache quantisation. On a unified-memory Mac
 	// these are the difference between a 32k context that fits and one
-	// that swaps (mcmini, 2026-10-21: flash attention + q8_0 cache).
+	// that swaps (node-mac, 2026-10-21: flash attention + q8_0 cache).
 	"OLLAMA_FLASH_ATTENTION": {}, "OLLAMA_KV_CACHE_TYPE": {},
 	// Log level of the served process. Not a secret, frequently needed.
 	"LOG_LEVEL": {}, "RUST_LOG": {},
@@ -1361,7 +1361,7 @@ func offlineContentKey(ref string) (string, bool) {
 // i935): a digest-pinned ref by repo@digest, a tag-only one by the
 // controller manifest's lock digest when the controller vouches one. A roll
 // that only re-tags an image then changes no hash and recreates nothing
-// (the 0.6.26 roll recreated aserve's and robopi's Ollama twice each for
+// (the 0.6.26 roll recreated node-b's and node-pi's Ollama twice each for
 // identical digests). known=false: a key could not be learned this tick;
 // the caller makes no drift decision on it.
 func specHashWith(p placement, key contentKeyFn) (string, bool) {
@@ -1403,7 +1403,7 @@ func specHashWith(p placement, key contentKeyFn) (string, bool) {
 	// the placement names none) and the door sidecar's. A stack roll moves
 	// NOO_IMAGE_TAG and nothing else, so without these a backend kept the
 	// previous release's image until something unrelated recreated it
-	// (awolf 2026-10-28: noo-llamacpp and noo-stunnel-llamacpp on v0.6.12
+	// (node-a 2026-10-28: noo-llamacpp and noo-stunnel-llamacpp on v0.6.12
 	// after the 0.6.13 roll). Folded in only when set, so a node with no
 	// release pin, and a backend on an upstream image, keep their hash.
 	if p.Image == "" {

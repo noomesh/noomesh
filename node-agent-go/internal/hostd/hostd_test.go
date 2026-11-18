@@ -724,7 +724,7 @@ func TestReclaimRemovesOnlyStaleLabelledBuildVolumes(t *testing.T) {
 }
 
 // The dry run says what rung 4 keeps and why, not only a stale count: on
-// awolf (2026-11-16) three live noo-batch caches read as "1 stale
+// node-a (2026-11-16) three live noo-batch caches read as "1 stale
 // build-cache volume(s)", which looked like the rung could not see them.
 func TestReclaimDryRunSaysWhichBuildVolumesItKeepsAndWhy(t *testing.T) {
 	e, fr := testEngine(t)

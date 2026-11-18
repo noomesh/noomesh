@@ -651,10 +651,10 @@ mod door_key_tests {
 
     #[test]
     fn a_door_key_consumer_is_a_harness_name_and_yields_a_connection_label() {
-        let c = door_key_consumer("awolf", "3f2a9c10-aaaa-bbbb");
-        assert_eq!(c, "harness:awolf:3f2a9c10");
+        let c = door_key_consumer("node-a", "3f2a9c10-aaaa-bbbb");
+        assert_eq!(c, "harness:node-a:3f2a9c10");
         assert!(c.starts_with(DOOR_KEY_CONSUMER_PREFIX));
-        assert_eq!(crate::auth::connection_label(&c).as_deref(), Some("harness-awolf-3f2a9c10"));
+        assert_eq!(crate::auth::connection_label(&c).as_deref(), Some("harness-node-a-3f2a9c10"));
     }
 }
 

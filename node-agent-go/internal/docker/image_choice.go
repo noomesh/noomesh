@@ -103,7 +103,7 @@ func chooseBackendImage(backend string, spec BackendSpec, override string) (back
 	if ref == "" || isOwnImage(ref) {
 		// Until this cut an own ref kept its digest, so the node asked the
 		// rail for a tar named after it, which never exists, and refused a
-		// staged image (aserve, robopi: ollama, 0.6.17 and 0.6.18).
+		// staged image (node-b, node-pi: ollama, 0.6.17 and 0.6.18).
 		tagRef, digest := splitDigest(ref)
 		return backendImageChoice{Ref: tagRef, Pin: digest, RailOnly: ref != ""}, nil
 	}

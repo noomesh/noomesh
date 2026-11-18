@@ -3,7 +3,7 @@
 
 """The Linux harness reads its CA and pair as systemd credentials (finding 116).
 
-On pop-os (0.6.20) the harness restart-looped with NATS "CertificateRequired":
+On ctrl (0.6.20) the harness restart-looped with NATS "CertificateRequired":
 it runs as noo-harness, in no group but its own (i119), and /etc/noo/pki is
 0750 root:noo-agent, so it could reach neither the CA nor its own pair. The
 operator refused to loosen those modes. Instead:

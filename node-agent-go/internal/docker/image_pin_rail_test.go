@@ -16,7 +16,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/imagesource"
 )
 
-// The 0.6.18 roll: aserve and robopi refused the staged hardened ollama
+// The 0.6.18 roll: node-b and node-pi refused the staged hardened ollama
 // because the agent asked the rail for a tar named after the lock's digest.
 
 const (

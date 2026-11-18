@@ -34,7 +34,7 @@ const inspectJSON = `[
  {"Name":"envnet","Internal":false,"Labels":{},"IPAM":{"Config":[{"Subnet":"172.22.0.0/16"}]},"Containers":{}}
 ]`
 
-const infoPlain = `{"OperatingSystem":"Ubuntu 24.04 LTS","Name":"awolf","SecurityOptions":["name=apparmor","name=seccomp,profile=builtin"]}`
+const infoPlain = `{"OperatingSystem":"Ubuntu 24.04 LTS","Name":"node-a","SecurityOptions":["name=apparmor","name=seccomp,profile=builtin"]}`
 
 const iptablesLegacySave = `-P INPUT ACCEPT
 -P FORWARD DROP
@@ -70,7 +70,7 @@ func TestSelectNetwork(t *testing.T) {
 		{"anything", map[string]string{"com.docker.compose.project": "pai-assistant"}, Config{}, false},
 		{"anything", map[string]string{"com.docker.compose.project": "mine"}, Config{ComposeProject: "mine"}, true},
 		{"anything", map[string]string{"com.docker.compose.project": "mine"}, Config{}, false},
-		// Ownership, never a name prefix: awolf runs noo-lab (no labels) and
+		// Ownership, never a name prefix: node-a runs noo-lab (no labels) and
 		// noo-google-test_* (another compose project), neither noomesh's.
 		{"noo-whatever", nil, Config{}, false},
 		{"noo-lab", map[string]string{}, Config{ComposeProject: "noomesh"}, false},

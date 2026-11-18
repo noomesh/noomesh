@@ -1544,12 +1544,12 @@ mod tests {
         assert_eq!(progress::stall_bound(&env(Some("30"))).as_secs(), 600, "never under ten minutes");
         assert_eq!(progress::stall_bound(&env(Some("soon"))).as_secs(), 2700);
 
-        let note = progress::stalled_note("mcmini", 2700);
-        assert!(note.starts_with("stalled:") && note.contains("mcmini") && note.contains("2700 s"), "{note}");
+        let note = progress::stalled_note("node-mac", 2700);
+        assert!(note.starts_with("stalled:") && note.contains("node-mac") && note.contains("2700 s"), "{note}");
 
-        let body = json!({"node": "mcmini", "slot_freed": true, "stalled": ["a", 7, "b"], "stall_secs": 2700});
+        let body = json!({"node": "node-mac", "slot_freed": true, "stalled": ["a", 7, "b"], "stall_secs": 2700});
         assert_eq!(stalled_from_ready(&body), (vec!["a".to_string(), "b".to_string()], 2700));
-        assert_eq!(stalled_from_ready(&json!({"node": "mcmini"})), (Vec::new(), 0));
+        assert_eq!(stalled_from_ready(&json!({"node": "node-mac"})), (Vec::new(), 0));
     }
 
     /// i227 fix 2: the recheck window, and the sweep offering a long-queued
@@ -1713,35 +1713,35 @@ mod tests {
     #[test]
     fn a_harness_reply_decides_where_a_task_goes() {
         use serde_json::json;
-        let busy = json!({"ack": false, "busy": true, "node": "mcmini", "running": 8, "capacity": 8});
+        let busy = json!({"ack": false, "busy": true, "node": "node-mac", "running": 8, "capacity": 8});
         assert_eq!(harness_answer(Some(&busy)), HarnessAnswer::Busy { running: 8, capacity: 8 });
-        match place_after("mcmini", &harness_answer(Some(&busy))) {
+        match place_after("node-mac", &harness_answer(Some(&busy))) {
             Placement::Queued { why, running: 8, capacity: 8 } => {
                 assert!(why.contains("busy (8 of 8 running)") && why.contains("queued for it"), "{why}");
                 assert!(!why.contains("fallback") && !why.contains("in process"), "a busy node never means the controller: {why}");
             }
             other => panic!("busy must queue: {other:?}"),
         }
-        let taken = json!({"ack": true, "node": "mcmini"});
-        assert_eq!(place_after("mcmini", &harness_answer(Some(&taken))), Placement::Dispatched { already: false });
-        let already = json!({"ack": true, "already": true, "node": "mcmini"});
-        assert_eq!(place_after("mcmini", &harness_answer(Some(&already))), Placement::Dispatched { already: true });
+        let taken = json!({"ack": true, "node": "node-mac"});
+        assert_eq!(place_after("node-mac", &harness_answer(Some(&taken))), Placement::Dispatched { already: false });
+        let already = json!({"ack": true, "already": true, "node": "node-mac"});
+        assert_eq!(place_after("node-mac", &harness_answer(Some(&already))), Placement::Dispatched { already: true });
         assert_eq!(harness_answer(None), HarnessAnswer::Silent);
-        match place_after("mcmini", &harness_answer(None)) {
+        match place_after("node-mac", &harness_answer(None)) {
             Placement::Fallback { why, answered: false } => assert!(why.contains("did not answer within 3s") && why.ends_with("(fallback)"), "{why}"),
             other => panic!("silence is the fallback: {other:?}"),
         }
-        let refused = json!({"ack": false, "node": "mcmini"});
-        match place_after("mcmini", &harness_answer(Some(&refused))) {
+        let refused = json!({"ack": false, "node": "node-mac"});
+        match place_after("node-mac", &harness_answer(Some(&refused))) {
             Placement::Fallback { why, answered: true } => assert!(why.contains("refused") && why.ends_with("(fallback)"), "{why}"),
             other => panic!("a refusal is the fallback: {other:?}"),
         }
         assert_eq!(harness_answer(Some(&json!("garbage"))), HarnessAnswer::Refused);
         // The outcome the API shows for each.
-        let q = Started::queued("mcmini".into(), "busy");
+        let q = Started::queued("node-mac".into(), "busy");
         assert!(q.queued && !q.dispatched);
-        assert!(Started::dispatched("mcmini".into()).dispatched);
-        let f = Started::here("pop-os".into(), "fallback");
+        assert!(Started::dispatched("node-mac".into()).dispatched);
+        let f = Started::here("ctrl".into(), "fallback");
         assert!(!f.queued && !f.dispatched);
     }
 
@@ -1749,9 +1749,9 @@ mod tests {
     /// only no answer at all runs it on the controller, and says so.
     #[test]
     fn a_busy_node_queues_the_task_and_only_silence_falls_back() {
-        let q = Started::queued("mcmini".into(), "busy");
-        assert!(q.queued && !q.dispatched && q.node() == "mcmini");
-        assert!(!Started::dispatched("mcmini".into()).queued && !Started::here("pop-os".into(), "x").queued);
+        let q = Started::queued("node-mac".into(), "busy");
+        assert!(q.queued && !q.dispatched && q.node() == "node-mac");
+        assert!(!Started::dispatched("node-mac".into()).queued && !Started::here("ctrl".into(), "x").queued);
         let src = include_str!("tasks.rs").split("fn a_busy_node_queues_the_task_and_only_silence_falls_back").next().unwrap();
         let start = src.split("pub async fn start(").nth(1).unwrap().split("\nfn run_in_process(").next().unwrap();
         let decide = start.find("place_after(&node, &harness_answer(").expect("the reply goes through the one rule");

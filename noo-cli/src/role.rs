@@ -334,15 +334,15 @@ mod self_identity_tests {
     }
 
     /// Every source the old match read is still read: nothing recognised
-    /// before is dropped (awolf: node-name `awolf`, uname -n `AWOLF`).
+    /// before is dropped (node-a: node-name `node-a`, uname -n `NODE-A`).
     #[test]
     fn every_source_is_recognised_and_the_name_is_the_first() {
-        let s = id(Some("awolf"), &["nid-1", "nid-2"], Some("host-file"), Some("AWOLF-UNAME"));
-        for n in ["AWOLF", "nid-1", "nid-2", "HOST-FILE", "awolf-uname"] {
+        let s = id(Some("node-a"), &["nid-1", "nid-2"], Some("host-file"), Some("NODE-A-UNAME"));
+        for n in ["NODE-A", "nid-1", "nid-2", "HOST-FILE", "node-a-uname"] {
             assert!(s.is(n), "{n}");
         }
-        assert_eq!(s.name().as_deref(), Some("awolf"));
-        assert!(!s.is("pop-os") && !s.is("") && !s.is("   "));
+        assert_eq!(s.name().as_deref(), Some("node-a"));
+        assert!(!s.is("ctrl") && !s.is("") && !s.is("   "));
     }
 
     /// The name chain is the old one: marker, NODE_ID, /etc/hostname; only

@@ -112,7 +112,7 @@ func TestContainerDialAddrFollowsTheDoorNamespace(t *testing.T) {
 // door with no alias joins under its own name only.
 func TestTheVLLMDoorTakesTheEngineName(t *testing.T) {
 	prev := doorSelfName
-	doorSelfName = func() (string, error) { return "awolf", nil }
+	doorSelfName = func() (string, error) { return "node-a", nil }
 	t.Cleanup(func() { doorSelfName = prev })
 	t.Setenv("NOO_PKI_DIR", t.TempDir())
 
@@ -153,7 +153,7 @@ func TestTheVLLMDoorTakesTheEngineName(t *testing.T) {
 			conf = s
 		}
 	}
-	for _, needle := range []string{"accept = noo-stunnel-vllm:8000", "connect = 127.0.0.1:8000", "cert = /tls/services/vllm/service.crt", "verify = 2", "checkHost = awolf"} {
+	for _, needle := range []string{"accept = noo-stunnel-vllm:8000", "connect = 127.0.0.1:8000", "cert = /tls/services/vllm/service.crt", "verify = 2", "checkHost = node-a"} {
 		if !strings.Contains(conf, needle) {
 			t.Errorf("vllm door conf lacks %q:\n%s", needle, conf)
 		}

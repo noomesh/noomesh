@@ -797,7 +797,7 @@ mod tests {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let model = cutting_model(calls.clone()).await;
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::json!({"exp": now + 30, "harness": "node:mcmini"}).to_string());
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::json!({"exp": now + 30, "harness": "node:node-mac"}).to_string());
         let token = format!("e30.{payload}.sig");
         assert_eq!(jwt_exp_unverified(&token), Some(now + 30));
         let rt = RemoteRuntime::connect(&gw, &token, reqwest::Client::new()).await.unwrap().pin_backend(openai_at(&model));
@@ -850,7 +850,7 @@ mod tests {
         format!("http://{addr}")
     }
 
-    /// The console's phase line (#624): a harness turn on mcmini says where
+    /// The console's phase line (#624): a harness turn on node-mac says where
     /// it went, that the backend began answering, and, from the agent's
     /// comment, that it waits behind two others, all before the first token.
     #[tokio::test]
@@ -860,7 +860,7 @@ mod tests {
         let gw = fake_gateway(seen.clone()).await;
         let model = queued_model().await;
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::json!({"exp": now + 3600, "harness": "node:mcmini"}).to_string());
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::json!({"exp": now + 3600, "harness": "node:node-mac"}).to_string());
         let token = format!("e30.{payload}.sig");
         let rt = RemoteRuntime::connect(&gw, &token, reqwest::Client::new()).await.unwrap().pin_backend(openai_at(&model));
         let sink = Recorder::default();
@@ -872,13 +872,13 @@ mod tests {
         let phases: Vec<&Value> = events.iter().filter(|(k, _)| k == "phase").map(|(_, v)| v).collect();
         assert_eq!(phases.len(), 3, "{events:?}");
         let r = phases[0];
-        assert_eq!((r["phase"].as_str(), r["node"].as_str(), r["via"].as_str()), (Some("routed"), Some("mcmini"), Some("harness")));
+        assert_eq!((r["phase"].as_str(), r["node"].as_str(), r["via"].as_str()), (Some("routed"), Some("node-mac"), Some("harness")));
         assert_eq!((r["attempt"].as_u64(), r["model"].as_str()), (Some(1), Some("gemma4:12b")));
         assert!(r["slots_busy"].is_null(), "a harness knows no heartbeat slots: {r}");
         assert_eq!(phases[1]["phase"], "prompt");
         assert!(phases[1]["input_tokens"].as_u64().is_some_and(|t| t > 0), "{}", phases[1]);
         let q = phases[2];
-        assert_eq!((q["phase"].as_str(), q["node"].as_str()), (Some("routed"), Some("mcmini")));
+        assert_eq!((q["phase"].as_str(), q["node"].as_str()), (Some("routed"), Some("node-mac")));
         assert_eq!((q["slots_busy"].as_u64(), q["slots_total"].as_u64(), q["queued_ahead"].as_u64()), (Some(2), Some(2), Some(2)));
         let first_phase = events.iter().position(|(k, _)| k == "phase").unwrap();
         let first_token = events.iter().position(|(k, _)| k == "content").expect("content");
@@ -890,8 +890,8 @@ mod tests {
     fn the_harness_node_reads_only_a_node_claim() {
         use base64::Engine as _;
         let enc = |v: Value| format!("h.{}.s", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string()));
-        assert_eq!(jwt_harness_node_unverified(&enc(serde_json::json!({"harness": "node:mcmini"}))), Some("mcmini".into()));
-        assert_eq!(jwt_harness_node_unverified(&enc(serde_json::json!({"harness": "mcmini"}))), None);
+        assert_eq!(jwt_harness_node_unverified(&enc(serde_json::json!({"harness": "node:node-mac"}))), Some("node-mac".into()));
+        assert_eq!(jwt_harness_node_unverified(&enc(serde_json::json!({"harness": "node-mac"}))), None);
         assert_eq!(jwt_harness_node_unverified(&enc(serde_json::json!({"harness": "node:"}))), None);
         assert_eq!(jwt_harness_node_unverified("tok-123"), None);
     }

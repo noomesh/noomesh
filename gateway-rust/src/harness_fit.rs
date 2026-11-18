@@ -7,7 +7,7 @@
 //! `config/harness-kinds.json`, measured by `noo-gateway harness probe`):
 //! the size of its CLI's first request to the model. A node whose chat
 //! window is below it cannot run the kind at all. On 2026-10-24 every
-//! vendor kind failed on awolf's 16 384-token vLLM window that way, with a
+//! vendor kind failed on node-a's 16 384-token vLLM window that way, with a
 //! 400 on the first request and nothing at placement time to say so.
 //!
 //! The verdict, pure ([`judge`]):
@@ -205,16 +205,16 @@ mod tests {
         Some(Window { tokens, source: "x".into(), model_ceiling: false })
     }
 
-    /// awolf on 2026-10-24: vLLM at the image default, no profile value.
+    /// node-a on 2026-10-24: vLLM at the image default, no profile value.
     #[test]
-    fn the_awolf_window_refuses_copilot_with_the_numbers() {
+    fn the_node_a_window_refuses_copilot_with_the_numbers() {
         let win = chat_window("vllm", &json!({"VLLM_MAX_MODEL_LEN": "16384"}), Some("gemma-4-12B-it-qat-w4a16-ct"), &Value::Null, 32768);
         assert_eq!(win, Some(Window { tokens: 16384, source: "VLLM_MAX_MODEL_LEN on its vllm placement".to_string(), model_ceiling: false }));
         let fit = judge(Some(16385), win);
         assert!(matches!(fit, Fit::Short { floor: 16385, need: 20482, window: 16384, model_ceiling: false, .. }), "{fit:?}");
-        let m = message("awolf", "copilot", &fit, Some(("vllm", "gemma-4-12b"))).unwrap();
-        assert!(m.starts_with("copilot cannot run on awolf: its first request is about 16385 tokens"), "{m}");
-        assert!(m.contains("Fits here: noo") && m.ends_with("`noo cluster place awolf vllm gemma-4-12b --env VLLM_MAX_MODEL_LEN=32768`"), "{m}");
+        let m = message("node-a", "copilot", &fit, Some(("vllm", "gemma-4-12b"))).unwrap();
+        assert!(m.starts_with("copilot cannot run on node-a: its first request is about 16385 tokens"), "{m}");
+        assert!(m.contains("Fits here: noo") && m.ends_with("`noo cluster place node-a vllm gemma-4-12b --env VLLM_MAX_MODEL_LEN=32768`"), "{m}");
     }
 
     #[test]

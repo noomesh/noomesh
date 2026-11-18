@@ -280,7 +280,7 @@ def test_the_start_launcher_stops_refused_addons_and_says_what_did_not_start() -
     restart = (ROOT / "scripts/noomesh-restart.sh").read_text()
     assert "    addons_stop_leftovers addons_stop_refused || exit 1\n" in restart
     # A declared-off add-on is removed BEFORE the whole-stack up, by every
-    # launcher (pop-os 2026-11-05: start exited before its after-up stop ran,
+    # launcher (ctrl 2026-11-05: start exited before its after-up stop ran,
     # and restart never handled a declared-off add-on at all).
     for name, up_line in [("noomesh-start.sh", "noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d --force-recreate"),
                           ("noomesh-restart.sh", "noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d --no-build --force-recreate"),

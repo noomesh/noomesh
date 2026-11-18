@@ -401,7 +401,7 @@ So `noo upgrade` counts, before rolling nodes, every online Linux node (an
 older agent that still reports `legacy` becomes rail on this roll), and a
 failed stage of the release images refuses the node roll unless `--force`.
 Darwin nodes start no containers and are unaffected. After the roll, check
-awolf (largest image set) and robopi (arm64) with `noo cluster verify`:
+node-a (largest image set) and node-pi (arm64) with `noo cluster verify`:
 `image sources` should read all from the rail, with third-party `registry`
 entries accepted under `NOO_IMAGE_REGISTRY_FALLBACK=public`.
 

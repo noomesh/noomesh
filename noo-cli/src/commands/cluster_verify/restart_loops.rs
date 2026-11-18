@@ -18,7 +18,7 @@
 //! last [`RECENT_SECS`], or (the upgrade gate) started after the stack roll.
 //! The upgrade gate counts only the restarts made DURING the roll: a
 //! [`Baseline`] taken when the roll starts holds each container's Id and
-//! RestartCount, so a lifetime count is never judged (pop-os 2026-11-05: two
+//! RestartCount, so a lifetime count is never judged (ctrl 2026-11-05: two
 //! containers the operator had `docker stop`ped, 117 lifetime restarts,
 //! refused a clean roll). A container that is not live is judged by how it
 //! ended ([`Ended`]): crashed during the roll refuses, stopped before it is
@@ -567,7 +567,7 @@ mod tests {
         |_| {}
     }
 
-    /// pop-os 2026-11-05: the operator `docker stop`ped two looping
+    /// ctrl 2026-11-05: the operator `docker stop`ped two looping
     /// containers BEFORE the roll; Exited, 117 lifetime restarts, last start
     /// minutes old. The gate passed nothing and refused the roll. Now: not a
     /// loop, one line, no refusal.

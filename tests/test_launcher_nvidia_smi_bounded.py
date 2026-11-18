@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026 PersonifAI LLC
 
-"""A stuck nvidia-smi must not stall the launchers (0.6.16; awolf, 2026-10-31).
+"""A stuck nvidia-smi must not stall the launchers (0.6.16; node-a, 2026-10-31).
 
 On a WSL2 node whose GPU a Windows program is using, one `nvidia-smi` call
 blocked 11 minutes, uninterruptibly, in the dxg driver. `timeout 5 nvidia-smi`

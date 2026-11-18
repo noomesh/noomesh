@@ -4,7 +4,7 @@
 //! gemma-4's reasoning-channel tokens, removed from a stream as it arrives.
 //!
 //! gemma-4 wraps its reasoning in `<|channel>thought … <channel|>`. vLLM
-//! strips special tokens; ollama (mcmini, 2026-10-16) passes them through as
+//! strips special tokens; ollama (node-mac, 2026-10-16) passes them through as
 //! text, so every streamed thinking block opened with a literal
 //! `<|channel>thought` in the dashboard's thinking panel. Only the persisted
 //! reply looked right once the turn ended.

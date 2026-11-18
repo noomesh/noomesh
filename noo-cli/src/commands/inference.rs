@@ -260,9 +260,9 @@ mod tests {
 
     #[test]
     fn without_raw_the_body_has_no_context_key() {
-        let (body, _) = build_run_request(&a(&["hi", "-n", "awolf"])).unwrap();
+        let (body, _) = build_run_request(&a(&["hi", "-n", "node-a"])).unwrap();
         assert!(body.get("context").is_none(), "{body}");
-        assert_eq!(body["node"], "awolf");
+        assert_eq!(body["node"], "node-a");
         assert_eq!(body["max_tokens"], 512);
     }
 
@@ -274,7 +274,7 @@ mod tests {
         use serde_json::json;
         let refusal = json!({"success": false, "code": "empty_response",
             "error": "the model returned only reasoning and no answer (finish_reason: stop)",
-            "finish_reason": "stop", "reasoning": "five words", "node": "pop-os"}).to_string();
+            "finish_reason": "stop", "reasoning": "five words", "node": "ctrl"}).to_string();
         match run_outcome(Err((502, refusal))) {
             RunOutcome::Failed { kind, msg, hint } => {
                 assert_eq!(kind, "empty_response");
@@ -283,7 +283,7 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        for old in [json!({"success": true, "data": {"response": "", "node": "pop-os"}}), json!({"success": true, "data": {"response": "  \n"}})] {
+        for old in [json!({"success": true, "data": {"response": "", "node": "ctrl"}}), json!({"success": true, "data": {"response": "  \n"}})] {
             assert!(matches!(run_outcome(Ok(old.clone())), RunOutcome::Failed { kind: "empty_response", .. }), "{old}");
         }
         assert!(matches!(run_outcome(Ok(json!({"success": false, "error": "boom"}))),

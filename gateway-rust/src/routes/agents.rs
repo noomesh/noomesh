@@ -1402,27 +1402,27 @@ mod tests {
     #[test]
     fn the_directory_leads_with_who_is_online_and_collapses_short_lived_names() {
         let mut es = vec![
-            dir_entry("rbwolf", "claude-general", "chosen", 60, false),
-            dir_entry("rbwolf", "claude-weekly", "chosen", 3 * 86_400, false),
-            dir_entry("rbwolf", "codex-aaaaaa", "default", 30, false),
-            dir_entry("rbwolf", "codex-bbbbbb", "default", 3_600, false),
+            dir_entry("owner", "claude-general", "chosen", 60, false),
+            dir_entry("owner", "claude-weekly", "chosen", 3 * 86_400, false),
+            dir_entry("owner", "codex-aaaaaa", "default", 30, false),
+            dir_entry("owner", "codex-bbbbbb", "default", 3_600, false),
         ];
         for i in 0..40 {
-            es.push(dir_entry("rbwolf", &format!("codex-old{i:03}"), "default", 2 * 86_400, true));
+            es.push(dir_entry("owner", &format!("codex-old{i:03}"), "default", 2 * 86_400, true));
         }
-        let orphans = vec![("rbwolf".to_string(), "claude-weekly".to_string(), 3i64)];
+        let orphans = vec![("owner".to_string(), "claude-weekly".to_string(), 3i64)];
         let w = crate::agent_mailbox::Windows::default();
         let v = directory_json(&es, &orphans, &w, None, 0);
         let a = &v["accounts"][0];
-        assert_eq!(a["online"], json!(["rbwolf/codex-aaaaaa", "rbwolf/claude-general"]), "online, most recently seen first");
-        assert_eq!(a["chosen"][0]["name"], "rbwolf/claude-general");
+        assert_eq!(a["online"], json!(["owner/codex-aaaaaa", "owner/claude-general"]), "online, most recently seen first");
+        assert_eq!(a["chosen"][0]["name"], "owner/claude-general");
         assert_eq!(a["chosen"][0]["state"], "online");
         assert_eq!(a["chosen"][1]["state"], "idle", "a chosen name a few days quiet is resumable");
         let codex = &a["short_lived"][0];
         assert_eq!(codex["type"], "codex");
         assert_eq!(codex["counts"]["retired"], 40);
         assert_eq!(codex["listed"].as_array().unwrap().len(), 2, "only the online and recent ones are listed");
-        assert_eq!(a["orphaned"][0], json!({"name": "rbwolf/claude-weekly", "unread": 3}));
+        assert_eq!(a["orphaned"][0], json!({"name": "owner/claude-weekly", "unread": 3}));
         // One type, paged: every one of its names, 20 at a time.
         let p0 = directory_json(&es, &orphans, &w, Some("codex"), 0);
         let c0 = &p0["accounts"][0]["short_lived"][0];
@@ -1435,7 +1435,7 @@ mod tests {
     fn the_messages_list_echoes_the_filter_it_applied() {
         let f = crate::repo::agent_messages::Filter {
             agent: None,
-            owner: Some("rbwolf"),
+            owner: Some("owner"),
             node_prefix: None,
             from: None,
             to: None,
@@ -1446,11 +1446,11 @@ mod tests {
             harness: None,
             since: None,
             unread_only: false,
-            reader: Some("rbwolf/claude-x"),
+            reader: Some("owner/claude-x"),
             limit: 50,
             orphans: crate::repo::agent_messages::OrphanView::Hide,
         };
-        assert_eq!(super::applied_filter(&f), json!({"scope": "own: rbwolf", "limit": 50}));
+        assert_eq!(super::applied_filter(&f), json!({"scope": "own: owner", "limit": 50}));
         let f = crate::repo::agent_messages::Filter { thread: Some("thr_b"), unread_only: true, owner: None, ..f };
         assert_eq!(super::applied_filter(&f), json!({"scope": "all", "thread": "thr_b", "unread": true, "limit": 50}));
         let own = crate::test_src::own_code(include_str!("agents.rs"));

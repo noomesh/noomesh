@@ -3,7 +3,7 @@
 
 """`noo stack restart <name>`: names resolve, compose failure is not success.
 
-Live 2026-10-14 (pop-os): `noo stack restart evolve` -> compose "no such
+Live 2026-10-14 (ctrl): `noo stack restart evolve` -> compose "no such
 service: evolve" -> "Services restarted", exit 0. scripts/lib-restart.sh now
 resolves the names `noo stack status` shows (evolve -> noo-evolve), add-on keys
 (x-noo-addon `containers:`), refuses unknown names listing the valid ones, and

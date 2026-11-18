@@ -1422,15 +1422,15 @@ mod tests {
         let _guard = env_guard();
         use crate::auth::Role;
         std::env::set_var("NOO_JWT_SECRET", "test-secret-mcp-door");
-        let t = mint_caller_jwt("rbwolf", Role::User, &[], "self:rbwolf", Some("claude-general")).unwrap();
+        let t = mint_caller_jwt("owner", Role::User, &[], "self:owner", Some("claude-general")).unwrap();
         let c = crate::auth::verify_token(&t, "test-secret-mcp-door").unwrap();
-        assert_eq!(c.sub, "rbwolf/claude-general");
-        assert_eq!(c.act.as_ref().unwrap().sub, "key:self:rbwolf");
-        assert_eq!(c.harness.as_deref(), Some("mcp-external:self:rbwolf"));
+        assert_eq!(c.sub, "owner/claude-general");
+        assert_eq!(c.act.as_ref().unwrap().sub, "key:self:owner");
+        assert_eq!(c.harness.as_deref(), Some("mcp-external:self:owner"));
         // The label is the only caller-influenced input, and it is a name
         // segment: it cannot carry a different account or harness.
-        assert!(crate::agent_mailbox::parse_as("evil/claude-general", "rbwolf").is_err());
-        assert!(crate::agent_mailbox::parse_as("claude-general\",harness\":\"x", "rbwolf").is_err());
+        assert!(crate::agent_mailbox::parse_as("evil/claude-general", "owner").is_err());
+        assert!(crate::agent_mailbox::parse_as("claude-general\",harness\":\"x", "owner").is_err());
     }
 
     #[test]

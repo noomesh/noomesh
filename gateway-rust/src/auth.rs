@@ -6808,7 +6808,7 @@ mod v2_never_counts_as_v1_tests {
 
     #[test]
     fn a_signed_v2_token_never_verifies_as_v1() {
-        for actor in ["host2", "pop-os", "mcmini", "1800000000", "v2", "a"] {
+        for actor in ["host2", "ctrl", "node-mac", "1800000000", "v2", "a"] {
             for (method, uri, body) in [("POST", "/api/cluster/nodes/x/heartbeat", &b"{}"[..]), ("GET", "/api/cluster/nodes/x/desired-config", &b""[..])] {
                 let tok = crate::cluster_token_v2::sign(SECRET, method, uri, body, actor, NOW, "00112233445566778899aabbccddeeff").unwrap();
                 assert!(crate::cluster_token_v2::is_v2(&tok), "{tok}");

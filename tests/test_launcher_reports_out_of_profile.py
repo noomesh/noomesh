@@ -4,7 +4,7 @@
 """A whole-stack `up` records what the stack runs and reports a RUNNING
 container of a profile it does not run; it never reaps one.
 
-pop-os kept `noo-stunnel-ollama` (compose service stunnel-ollama, profiles
+ctrl kept `noo-stunnel-ollama` (compose service stunnel-ollama, profiles
 ollama/gpu-tier2, stunnel v0.6.2, created 2026-10-15) Up for a month after the
 controller stopped running that profile: `up` ignores unselected profiles,
 `--remove-orphans` is never passed, and noo_created_guard removes only Created

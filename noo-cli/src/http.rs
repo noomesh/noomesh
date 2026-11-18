@@ -256,7 +256,7 @@ pub fn resolve_trust(base_url: &str) -> Result<Trust, String> {
 /// precedence testable, including on a machine that IS enrolled. The same
 /// for the candidates: [`cluster_ca_candidates`] always ends at the literal
 /// `/etc/noo/pki/ca.crt`, so a test that asserted the platform verifier
-/// failed on every enrolled box (followup 186c), awolf included.
+/// failed on every enrolled box (followup 186c), node-a included.
 fn resolve_trust_with(base_url: &str, enrolled: Option<String>, candidates: &[PathBuf]) -> Result<Trust, String> {
     let base = base_url.trim_end_matches('/');
 

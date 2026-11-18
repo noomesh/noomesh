@@ -15,7 +15,7 @@ import type { TrafficMessage } from './useAgentTraffic';
 
 const msg = (body: unknown, to = 'thread'): TrafficMessage => ({
   id: 'm1',
-  from: 'rbwolf/operator-rbwolf',
+  from: 'owner/operator-owner',
   to,
   kind: 'message',
   body,
@@ -44,8 +44,8 @@ describe('AgentTrafficPanel', () => {
     render(<Message m={msg({ text: 'hi' })} />);
     expect(document.querySelector('.traffic-route')?.textContent).toContain('→ the thread');
     cleanup();
-    render(<Message m={msg({ text: 'hi' }, 'rbwolf/codex-lse1ln')} />);
-    expect(document.querySelector('.traffic-route')?.textContent).toContain('→ rbwolf/codex-lse1ln');
+    render(<Message m={msg({ text: 'hi' }, 'owner/codex-lse1ln')} />);
+    expect(document.querySelector('.traffic-route')?.textContent).toContain('→ owner/codex-lse1ln');
   });
 
   it('styles the participant dropdown like the console, in the dark scheme', () => {

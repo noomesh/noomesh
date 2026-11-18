@@ -16,7 +16,7 @@ import (
 // agent restart there are no previous capabilities in memory: a probe that
 // was slow at that moment (WSL2, with our own vLLM loading) registered the
 // node with 0 GB. The controller derives the tier from vram_gb, so that
-// dropped awolf to the unknown tier, changed its harness profile's context
+// dropped node-a to the unknown tier, changed its harness profile's context
 // from 32768 to 16384, and reloaded vLLM twice (noomesh-internal i575).
 const lastGPUFile = "last-gpu.json"
 

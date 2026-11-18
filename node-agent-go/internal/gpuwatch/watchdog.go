@@ -100,7 +100,7 @@ type Watchdog struct {
 	// servingNoted marks containers whose "probe failed but the backend is
 	// serving" verdict has already been logged once. Under WSL2 nvidia-smi can
 	// fail inside a container for as long as it runs, so that verdict repeats
-	// every cycle; logging it every time buried real faults (awolf, 2026-10).
+	// every cycle; logging it every time buried real faults (node-a, 2026-10).
 	servingNoted map[string]bool
 	lastRestart  map[string]time.Time
 	restartTotal int

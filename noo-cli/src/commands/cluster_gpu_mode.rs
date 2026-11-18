@@ -888,7 +888,7 @@ mod tests {
 
     /// A node record: `gc` is its gpu_contention, `vllm` its vllm container.
     fn node(gc: Value, vllm: Value) -> Value {
-        json!({"id": "awolf", "status": "online", "gpu_contention": gc, "backend_containers": {"vllm": vllm}})
+        json!({"id": "node-a", "status": "online", "gpu_contention": gc, "backend_containers": {"vllm": vllm}})
     }
 
     fn warm() -> Value {
@@ -910,7 +910,7 @@ mod tests {
     fn user_gc(free_mb: u64, foreign_mb: u64) -> Value {
         json!({"state": "held", "method": "memory-accounting", "total_mb": 16384, "free_mb": free_mb, "foreign_mb": foreign_mb,
             "noomesh_mb": 0, "need_mb": 11500, "paused_backends": ["vllm"],
-            "lease": {"owner": "rbwolf", "operation_id": "op-7", "generation": 4, "mode": "drain", "reason": "user", "purpose": "user",
+            "lease": {"owner": "owner", "operation_id": "op-7", "generation": 4, "mode": "drain", "reason": "user", "purpose": "user",
                 "since": "2026-11-01T10:00:00Z"}})
     }
 
@@ -979,7 +979,7 @@ mod tests {
         assert_eq!(lease_mode(&user_gc(15000, 0)), Mode::User);
         let reservation = json!({"state": "held", "lease": {"operation_id": "r-1", "workload": "rhaddon/worker", "purpose": ""}});
         assert_eq!(lease_mode(&reservation), Mode::Workload("rhaddon/worker".into()));
-        let manual = json!({"state": "held", "reason": "voice", "lease": {"owner": "rbwolf", "operation_id": "op-1", "generation": 2}});
+        let manual = json!({"state": "held", "reason": "voice", "lease": {"owner": "owner", "operation_id": "op-1", "generation": 2}});
         assert_eq!(lease_mode(&manual), Mode::Manual);
         assert_eq!(lease_mode(&json!({"state": "held"})), Mode::Manual, "an agent with no lease at all");
         let old = json!({"state": "held", "lease": {"operation_id": "op-1", "reason": "user"}});
@@ -1039,11 +1039,11 @@ mod tests {
     fn mesh_refuses_while_the_operators_work_uses_the_gpu() {
         for (free, foreign) in [(4000, 1000), (15000, 6000)] {
             let mut f = Fake { node: node(user_gc(free, foreign), stopped()), ..Default::default() };
-            let r = run(&mut f, &args("awolf", Want::Mesh), Want::Mesh).unwrap_err();
+            let r = run(&mut f, &args("node-a", Want::Mesh), Want::Mesh).unwrap_err();
             assert_eq!(r.kind, "gpu_busy_by_other_work", "{r:?}");
             assert!(!r.remote, "the verb's own refusal exits 1");
             assert!(r.msg.contains("still in use by other work"), "{}", r.msg);
-            assert!(r.hint.as_deref().unwrap().starts_with("noo cluster gpu mode awolf mesh --wait 300"));
+            assert!(r.hint.as_deref().unwrap().starts_with("noo cluster gpu mode node-a mesh --wait 300"));
             assert!(f.calls.is_empty(), "no write when the GPU is busy: {:?}", f.calls);
         }
     }
@@ -1054,7 +1054,7 @@ mod tests {
         let mut f = Fake { node: busy(), on_release: node(free_gc(), warm()), ..Default::default() };
         // The first look is busy; two more looks stay busy, the next is clear.
         f.before = VecDeque::from([busy(), busy(), busy(), node(user_gc(15000, 0), stopped())]);
-        let mut a = args("awolf", Want::Mesh);
+        let mut a = args("node-a", Want::Mesh);
         a.wait = Some(60);
         let out = run(&mut f, &a, Want::Mesh).unwrap();
         assert_eq!(f.calls, vec!["release".to_string()], "released once the check passed");
@@ -1067,7 +1067,7 @@ mod tests {
         assert_eq!(out.warm, Some(true));
         // A budget that runs out while the GPU is still busy is the refusal.
         let mut f = Fake { node: busy(), ..Default::default() };
-        let mut a = args("awolf", Want::Mesh);
+        let mut a = args("node-a", Want::Mesh);
         a.wait = Some(20);
         let r = run(&mut f, &a, Want::Mesh).unwrap_err();
         assert_eq!(r.kind, "gpu_busy_by_other_work");
@@ -1079,7 +1079,7 @@ mod tests {
     fn mesh_waits_for_proof_then_reports_warm() {
         let mut f = Fake { node: node(user_gc(15000, 0), stopped()), on_release: node(free_gc(), starting()), ..Default::default() };
         f.after = VecDeque::from([node(free_gc(), starting()), node(free_gc(), starting()), node(free_gc(), warm())]);
-        let out = run(&mut f, &args("awolf", Want::Mesh), Want::Mesh).unwrap();
+        let out = run(&mut f, &args("node-a", Want::Mesh), Want::Mesh).unwrap();
         assert!(out.changed);
         assert_eq!(out.previous, Mode::User);
         assert_eq!(out.mode, Mode::Mesh);
@@ -1097,7 +1097,7 @@ mod tests {
     #[test]
     fn mesh_no_wait_returns_after_the_release() {
         let mut f = Fake { node: node(user_gc(15000, 0), stopped()), on_release: node(free_gc(), starting()), ..Default::default() };
-        let mut a = args("awolf", Want::Mesh);
+        let mut a = args("node-a", Want::Mesh);
         a.no_wait = true;
         let out = run(&mut f, &a, Want::Mesh).unwrap();
         assert!(out.changed);
@@ -1109,26 +1109,26 @@ mod tests {
     #[test]
     fn mesh_that_never_warms_is_needs_attention() {
         let mut f = Fake { node: node(user_gc(15000, 0), stopped()), on_release: node(free_gc(), starting()), ..Default::default() };
-        let mut a = args("awolf", Want::Mesh);
+        let mut a = args("node-a", Want::Mesh);
         a.wait = Some(30);
         let r = run(&mut f, &a, Want::Mesh).unwrap_err();
         assert_eq!(r.kind, "needs_attention");
         assert!(r.msg.contains("after 30 s") && r.msg.contains("Nothing was rolled back"), "{}", r.msg);
         assert_eq!(f.clock, 30);
-        assert!(r.hint.unwrap().starts_with("noo cluster verify awolf"));
+        assert!(r.hint.unwrap().starts_with("noo cluster verify node-a"));
     }
 
     #[test]
     fn repeats_are_idempotent() {
         // mesh on a node that is already mesh and warm: no write.
         let mut f = Fake { node: node(free_gc(), warm()), ..Default::default() };
-        let out = run(&mut f, &args("awolf", Want::Mesh), Want::Mesh).unwrap();
+        let out = run(&mut f, &args("node-a", Want::Mesh), Want::Mesh).unwrap();
         assert!(!out.changed);
         assert!(out.note.unwrap().contains("already mode mesh"));
         assert!(f.calls.is_empty());
         // user on a node already user: no write.
         let mut f = Fake { node: node(user_gc(15000, 0), stopped()), ..Default::default() };
-        let out = run(&mut f, &args("awolf", Want::User), Want::User).unwrap();
+        let out = run(&mut f, &args("node-a", Want::User), Want::User).unwrap();
         assert!(!out.changed);
         assert_eq!(out.mode, Mode::User);
         assert!(f.calls.is_empty());
@@ -1136,13 +1136,13 @@ mod tests {
         let warming = || node(free_gc(), json!({"running": true, "health": "healthy", "warmup": "running"}));
         let mut f = Fake { node: warming(), ..Default::default() };
         f.before = VecDeque::from([warming(), warming(), node(free_gc(), warm())]);
-        let out = run(&mut f, &args("awolf", Want::Mesh), Want::Mesh).unwrap();
+        let out = run(&mut f, &args("node-a", Want::Mesh), Want::Mesh).unwrap();
         assert_eq!(out.warm, Some(true));
         assert!(!out.changed);
         assert!(f.calls.is_empty(), "a repeat never releases again");
         // mesh on a node with no vllm container reported.
-        let mut f = Fake { node: json!({"id": "awolf", "status": "online", "gpu_contention": {"state": "free"}}), ..Default::default() };
-        assert!(!run(&mut f, &args("awolf", Want::Mesh), Want::Mesh).unwrap().changed);
+        let mut f = Fake { node: json!({"id": "node-a", "status": "online", "gpu_contention": {"state": "free"}}), ..Default::default() };
+        assert!(!run(&mut f, &args("node-a", Want::Mesh), Want::Mesh).unwrap().changed);
     }
 
     #[test]
@@ -1154,7 +1154,7 @@ mod tests {
         };
         let mut f = Fake { node: node(free_gc(), warm()), on_hold: drained(11500), ..Default::default() };
         f.after = VecDeque::from([drained(11500), drained(11500), drained(0)]);
-        let mut a = args("awolf", Want::User);
+        let mut a = args("node-a", Want::User);
         a.timeout = Some(300);
         let out = run(&mut f, &a, Want::User).unwrap();
         assert_eq!(f.calls, vec!["hold".to_string()]);
@@ -1182,7 +1182,7 @@ mod tests {
         let mut stuck_gc = user_gc(5000, 0);
         stuck_gc["noomesh_mb"] = json!(2000);
         let mut f = Fake { node: node(free_gc(), warm()), on_hold: node(stuck_gc, stopped()), ..Default::default() };
-        let mut a = args("awolf", Want::User);
+        let mut a = args("node-a", Want::User);
         a.immediate = true;
         let out = run(&mut f, &a, Want::User).unwrap();
         assert_eq!(f.bodies[0]["mode"], "immediate");
@@ -1199,25 +1199,25 @@ mod tests {
             Plan::Refuse(r) => r,
             other => panic!("not a refusal: {other:?}"),
         };
-        let manual = node(json!({"state": "held", "reason": "voice", "lease": {"owner": "rbwolf", "operation_id": "op-1", "generation": 2}}), stopped());
+        let manual = node(json!({"state": "held", "reason": "voice", "lease": {"owner": "owner", "operation_id": "op-1", "generation": 2}}), stopped());
         let r = plan(manual.clone(), Want::User);
         assert_eq!(r.kind, "gpu_held_by_other");
-        assert!(r.hint.unwrap().starts_with("noo cluster gpu hold awolf --force"));
+        assert!(r.hint.unwrap().starts_with("noo cluster gpu hold node-a --force"));
         let r = plan(manual, Want::Mesh);
         assert_eq!(r.kind, "gpu_held_by_other");
-        assert!(r.hint.unwrap().starts_with("noo cluster gpu release awolf --operation op-1 --generation 2"));
+        assert!(r.hint.unwrap().starts_with("noo cluster gpu release node-a --operation op-1 --generation 2"));
         let reserved = node(json!({"state": "held", "lease": {"operation_id": "res-9", "workload": "rhaddon/worker"}}), stopped());
         let r = plan(reserved.clone(), Want::Mesh);
         assert!(r.hint.as_deref().unwrap().starts_with("noo cluster release res-9"), "{r:?}");
         assert_eq!(plan(reserved, Want::User).kind, "gpu_held_by_other");
-        let draining = node(json!({"state": "draining", "lease": {"owner": "rbwolf"}}), stopped());
+        let draining = node(json!({"state": "draining", "lease": {"owner": "owner"}}), stopped());
         assert_eq!(plan(draining.clone(), Want::Mesh).kind, "gpu_transition_in_progress");
         assert_eq!(plan(draining, Want::User).kind, "gpu_transition_in_progress");
         let yielded = node(json!({"state": "yielded", "foreign_mb": 9000}), stopped());
         assert_eq!(plan(yielded, Want::Mesh).kind, "gpu_yielded");
-        let off = json!({"id": "awolf", "status": "offline", "gpu_contention": {"state": "free"}});
+        let off = json!({"id": "node-a", "status": "offline", "gpu_contention": {"state": "free"}});
         assert_eq!(plan(off, Want::User).kind, "node_not_reporting");
-        assert_eq!(plan(json!({"id": "awolf", "status": "online"}), Want::User).kind, "gpu_not_reported");
+        assert_eq!(plan(json!({"id": "node-a", "status": "online"}), Want::User).kind, "gpu_not_reported");
         for (why, text) in [("driver-lost", "reboot"), ("no-nvidia", "no NVIDIA GPU"), ("unified-memory", "unified memory")] {
             let n = node(json!({"state": "free", "method": "not-measured", "unmeasured": why}), stopped());
             let r = plan(n, Want::User);
@@ -1238,7 +1238,7 @@ mod tests {
             held["method"] = json!("not-measured");
             held.as_object_mut().unwrap().remove("noomesh_mb");
             let mut f = Fake { node: node(gc, warm()), on_hold: node(held, stopped()), ..Default::default() };
-            let out = run(&mut f, &args("awolf", Want::User), Want::User).unwrap();
+            let out = run(&mut f, &args("node-a", Want::User), Want::User).unwrap();
             assert_eq!(f.calls, vec!["hold".to_string()], "the hold goes ahead");
             assert!(out.warning.as_deref().unwrap().contains("GPU memory can't be read right now"), "{:?}", out.warning);
             assert_eq!(out.free_confirmed, Some(false), "free is not confirmed");
@@ -1254,14 +1254,14 @@ mod tests {
         unread.as_object_mut().unwrap().remove("free_mb");
         unread.as_object_mut().unwrap().remove("foreign_mb");
         let mut f = Fake { node: node(unread.clone(), stopped()), ..Default::default() };
-        let r = run(&mut f, &args("awolf", Want::Mesh), Want::Mesh).unwrap_err();
+        let r = run(&mut f, &args("node-a", Want::Mesh), Want::Mesh).unwrap_err();
         assert_eq!(r.kind, "gpu_unreadable");
         assert!(r.msg.contains("can't confirm the GPU is clear"), "{}", r.msg);
-        assert!(r.hint.unwrap().starts_with("noo cluster gpu mode awolf mesh --wait 300"));
+        assert!(r.hint.unwrap().starts_with("noo cluster gpu mode node-a mesh --wait 300"));
         assert!(f.calls.is_empty());
         let mut f = Fake { node: node(unread.clone(), stopped()), on_release: node(free_gc(), warm()), ..Default::default() };
         f.before = VecDeque::from([node(unread.clone(), stopped()), node(unread, stopped()), node(user_gc(15000, 0), stopped())]);
-        let mut a = args("awolf", Want::Mesh);
+        let mut a = args("node-a", Want::Mesh);
         a.wait = Some(60);
         let out = run(&mut f, &a, Want::Mesh).unwrap();
         assert_eq!(f.calls, vec!["release".to_string()]);
@@ -1270,50 +1270,50 @@ mod tests {
 
     #[test]
     fn gateway_refusals_map_to_the_existing_kinds() {
-        let r = gateway_refusal("awolf", "hold", 409, &json!({"error": "drain_timeout: still in flight after 2m0s (vllm: 1)"}).to_string());
+        let r = gateway_refusal("node-a", "hold", 409, &json!({"error": "drain_timeout: still in flight after 2m0s (vllm: 1)"}).to_string());
         assert_eq!(r.kind, "gpu_drain_timeout");
         assert!(r.remote);
-        assert!(r.hint.unwrap().starts_with("noo cluster gpu mode awolf user --timeout 600"));
-        let r = gateway_refusal("awolf", "hold", 409, &json!({"error": "held_by_other: held by a (operation op-1, generation 2)"}).to_string());
+        assert!(r.hint.unwrap().starts_with("noo cluster gpu mode node-a user --timeout 600"));
+        let r = gateway_refusal("node-a", "hold", 409, &json!({"error": "held_by_other: held by a (operation op-1, generation 2)"}).to_string());
         assert_eq!(r.kind, "gpu_held_by_other");
-        let r = gateway_refusal("awolf", "release", 409, "transition_in_progress: x");
+        let r = gateway_refusal("node-a", "release", 409, "transition_in_progress: x");
         assert_eq!(r.kind, "gpu_transition_in_progress");
-        let r = gateway_refusal("awolf", "hold", 500, "boom");
+        let r = gateway_refusal("node-a", "hold", 500, "boom");
         assert_eq!((r.kind, r.remote), ("remote_error", true));
         let mut f = Fake { node: node(free_gc(), warm()), hold_err: Some((409, "drain_timeout: busy".into())), ..Default::default() };
-        let r = run(&mut f, &args("awolf", Want::User), Want::User).unwrap_err();
+        let r = run(&mut f, &args("node-a", Want::User), Want::User).unwrap_err();
         assert_eq!(r.kind, "gpu_drain_timeout");
         let mut f = Fake { node: node(user_gc(15000, 0), stopped()), release_err: Some((409, "held_by_other: held by a".into())), ..Default::default() };
-        let r = run(&mut f, &args("awolf", Want::Mesh), Want::Mesh).unwrap_err();
+        let r = run(&mut f, &args("node-a", Want::Mesh), Want::Mesh).unwrap_err();
         assert_eq!(r.kind, "gpu_held_by_other");
     }
 
     #[test]
     fn show_reads_the_mode_without_writing() {
         let mut f = Fake { node: node(user_gc(15000, 0), stopped()), ..Default::default() };
-        let out = show(&mut f, "awolf").unwrap();
+        let out = show(&mut f, "node-a").unwrap();
         assert_eq!(out.mode, Mode::User);
         assert!(!out.changed);
         assert!(f.calls.is_empty());
         assert_eq!(out.to_json()["lease"]["operation_id"], "op-7");
         let mut f = Fake { node: node(free_gc(), warm()), ..Default::default() };
-        assert_eq!(show(&mut f, "awolf").unwrap().mode, Mode::Mesh);
+        assert_eq!(show(&mut f, "node-a").unwrap().mode, Mode::Mesh);
     }
 
     #[test]
     fn for_parses_durations_and_refuses_the_rest() {
         let of = |v: &[&str]| parse_gpu_mode(&a(v));
-        assert_eq!(of(&["awolf", "user", "--for", "30m"]).unwrap().for_secs, Some(1800));
-        assert_eq!(of(&["awolf", "user", "--for", "2h"]).unwrap().for_secs, Some(7200));
-        assert_eq!(of(&["awolf", "user", "--for", "1d"]).unwrap().for_secs, Some(86_400));
-        assert_eq!(of(&["awolf", "user", "--for", "90s"]).unwrap().for_secs, Some(90));
-        assert_eq!(of(&["awolf", "user"]).unwrap().for_secs, None, "no --for is indefinite");
+        assert_eq!(of(&["node-a", "user", "--for", "30m"]).unwrap().for_secs, Some(1800));
+        assert_eq!(of(&["node-a", "user", "--for", "2h"]).unwrap().for_secs, Some(7200));
+        assert_eq!(of(&["node-a", "user", "--for", "1d"]).unwrap().for_secs, Some(86_400));
+        assert_eq!(of(&["node-a", "user", "--for", "90s"]).unwrap().for_secs, Some(90));
+        assert_eq!(of(&["node-a", "user"]).unwrap().for_secs, None, "no --for is indefinite");
         for bad in ["10s", "8d", "0", "-5m", "soon", "2w", "99999999999999d"] {
-            assert!(of(&["awolf", "user", "--for", bad]).is_err(), "{bad}");
+            assert!(of(&["node-a", "user", "--for", bad]).is_err(), "{bad}");
         }
-        let mesh = of(&["awolf", "mesh", "--for", "1h"]).unwrap_err().to_string();
+        let mesh = of(&["node-a", "mesh", "--for", "1h"]).unwrap_err().to_string();
         assert!(mesh.contains("mesh ends the hold"), "{mesh}");
-        let none = of(&["awolf", "--for", "1h"]).unwrap_err().to_string();
+        let none = of(&["node-a", "--for", "1h"]).unwrap_err().to_string();
         assert!(none.contains("name one"), "{none}");
     }
 
@@ -1326,7 +1326,7 @@ mod tests {
             node(gc, stopped())
         };
         let mut f = Fake { node: node(free_gc(), warm()), on_hold: drained(), ..Default::default() };
-        let mut a = args("awolf", Want::User);
+        let mut a = args("node-a", Want::User);
         a.for_secs = Some(5400);
         let out = run(&mut f, &a, Want::User).unwrap();
         assert_eq!(f.bodies[0]["for_secs"], 5400);
@@ -1334,13 +1334,13 @@ mod tests {
         assert!(out.warning.is_none());
         // Without --for the body is the one it always was.
         let mut f = Fake { node: node(free_gc(), warm()), on_hold: drained(), ..Default::default() };
-        run(&mut f, &args("awolf", Want::User), Want::User).unwrap();
+        run(&mut f, &args("node-a", Want::User), Want::User).unwrap();
         assert!(f.bodies[0].get("for_secs").is_none(), "{}", f.bodies[0]);
         // An agent that drops the field answers with no expiry: say so.
         let mut plain = user_gc(15000, 0);
         plain["noomesh_mb"] = json!(0);
         let mut f = Fake { node: node(free_gc(), warm()), on_hold: node(plain, stopped()), ..Default::default() };
-        let mut a = args("awolf", Want::User);
+        let mut a = args("node-a", Want::User);
         a.for_secs = Some(5400);
         let out = run(&mut f, &a, Want::User).unwrap();
         assert!(out.warning.unwrap().contains("older than --for"));
@@ -1355,7 +1355,7 @@ mod tests {
         };
         let mut f = Fake { node: with_expiry("2026-11-01T11:00:00Z"), on_hold: with_expiry("2026-11-01T13:00:00Z"), ..Default::default() };
         f.clock = super::super::cluster_verify::parse_rfc3339_unix("2026-11-01T10:00:00Z").unwrap();
-        let mut a = args("awolf", Want::User);
+        let mut a = args("node-a", Want::User);
         a.for_secs = Some(7200);
         let out = run(&mut f, &a, Want::User).unwrap();
         assert_eq!(f.calls, vec!["hold".to_string()], "one hold call, no release, no polling for free memory");
@@ -1363,10 +1363,10 @@ mod tests {
         assert_eq!(f.bodies[0]["for_secs"], 7200);
         assert_eq!(f.bodies[0]["force"], false);
         assert!(out.changed);
-        assert_eq!(out.note.as_deref(), Some("awolf: mode user, until 13:00 UTC (in 3 h 0 min)"));
+        assert_eq!(out.note.as_deref(), Some("node-a: mode user, until 13:00 UTC (in 3 h 0 min)"));
         // Without --for a repeat of `user` still changes nothing.
         let mut f = Fake { node: with_expiry("2026-11-01T11:00:00Z"), ..Default::default() };
-        let out = run(&mut f, &args("awolf", Want::User), Want::User).unwrap();
+        let out = run(&mut f, &args("node-a", Want::User), Want::User).unwrap();
         assert!(!out.changed && f.calls.is_empty());
     }
 
@@ -1385,24 +1385,24 @@ mod tests {
 
     #[test]
     fn parses_the_arguments() {
-        assert_eq!(parse_gpu_mode(&a(&["awolf"])),
-            Ok(GpuModeArgs { node: "awolf".into(), mode: None, timeout: None, immediate: false, wait: None, no_wait: false, for_secs: None }));
-        assert_eq!(parse_gpu_mode(&a(&["awolf", "user", "--timeout", "300", "--immediate"])),
-            Ok(GpuModeArgs { node: "awolf".into(), mode: Some(Want::User), timeout: Some(300), immediate: true, wait: None, no_wait: false, for_secs: None }));
-        assert_eq!(parse_gpu_mode(&a(&["--wait", "120", "awolf", "mesh"])),
-            Ok(GpuModeArgs { node: "awolf".into(), mode: Some(Want::Mesh), timeout: None, immediate: false, wait: Some(120), no_wait: false, for_secs: None }));
-        assert!(parse_gpu_mode(&a(&["awolf", "mesh", "--no-wait"])).unwrap().no_wait);
+        assert_eq!(parse_gpu_mode(&a(&["node-a"])),
+            Ok(GpuModeArgs { node: "node-a".into(), mode: None, timeout: None, immediate: false, wait: None, no_wait: false, for_secs: None }));
+        assert_eq!(parse_gpu_mode(&a(&["node-a", "user", "--timeout", "300", "--immediate"])),
+            Ok(GpuModeArgs { node: "node-a".into(), mode: Some(Want::User), timeout: Some(300), immediate: true, wait: None, no_wait: false, for_secs: None }));
+        assert_eq!(parse_gpu_mode(&a(&["--wait", "120", "node-a", "mesh"])),
+            Ok(GpuModeArgs { node: "node-a".into(), mode: Some(Want::Mesh), timeout: None, immediate: false, wait: Some(120), no_wait: false, for_secs: None }));
+        assert!(parse_gpu_mode(&a(&["node-a", "mesh", "--no-wait"])).unwrap().no_wait);
         assert!(parse_gpu_mode(&a(&[])).is_err());
-        assert!(parse_gpu_mode(&a(&["awolf", "vr"])).unwrap_err().to_string().contains("unknown mode"));
-        assert!(parse_gpu_mode(&a(&["awolf", "voice"])).unwrap_err().to_string().contains("not available yet"));
-        assert!(parse_gpu_mode(&a(&["awolf", "user", "mesh", "x"])).is_err());
-        assert!(parse_gpu_mode(&a(&["awolf", "mesh", "--wait", "5", "--no-wait"])).is_err());
-        assert!(parse_gpu_mode(&a(&["awolf", "mesh", "--immediate"])).is_err(), "immediate is for user");
-        assert!(parse_gpu_mode(&a(&["awolf", "mesh", "--timeout", "5"])).is_err(), "timeout is the drain's");
-        assert!(parse_gpu_mode(&a(&["awolf", "user", "--no-wait"])).is_err());
-        assert!(parse_gpu_mode(&a(&["awolf", "user", "--wait", "5"])).is_err());
-        assert!(parse_gpu_mode(&a(&["awolf", "--immediate"])).is_err(), "a flag with no mode changes nothing");
-        assert!(parse_gpu_mode(&a(&["awolf", "user", "--timeout", "soon"])).is_err());
-        assert!(parse_gpu_mode(&a(&["awolf", "user", "--bogus"])).is_err());
+        assert!(parse_gpu_mode(&a(&["node-a", "vr"])).unwrap_err().to_string().contains("unknown mode"));
+        assert!(parse_gpu_mode(&a(&["node-a", "voice"])).unwrap_err().to_string().contains("not available yet"));
+        assert!(parse_gpu_mode(&a(&["node-a", "user", "mesh", "x"])).is_err());
+        assert!(parse_gpu_mode(&a(&["node-a", "mesh", "--wait", "5", "--no-wait"])).is_err());
+        assert!(parse_gpu_mode(&a(&["node-a", "mesh", "--immediate"])).is_err(), "immediate is for user");
+        assert!(parse_gpu_mode(&a(&["node-a", "mesh", "--timeout", "5"])).is_err(), "timeout is the drain's");
+        assert!(parse_gpu_mode(&a(&["node-a", "user", "--no-wait"])).is_err());
+        assert!(parse_gpu_mode(&a(&["node-a", "user", "--wait", "5"])).is_err());
+        assert!(parse_gpu_mode(&a(&["node-a", "--immediate"])).is_err(), "a flag with no mode changes nothing");
+        assert!(parse_gpu_mode(&a(&["node-a", "user", "--timeout", "soon"])).is_err());
+        assert!(parse_gpu_mode(&a(&["node-a", "user", "--bogus"])).is_err());
     }
 }

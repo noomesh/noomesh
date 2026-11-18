@@ -3405,7 +3405,7 @@ pub(crate) fn backend_start_cooled_down(node_id: &str, backend: &str) -> bool {
 /// either variable: it can change under the node with no check, and a
 /// 0.6.7+ agent refuses it anyway. Compose renders `VLLM_IMAGE` into the
 /// locked variable too, so an operator's `VLLM_IMAGE=vllm/vllm-openai:latest`
-/// used to replace the lock's digest-pinned ref outright (awolf ran
+/// used to replace the lock's digest-pinned ref outright (node-a ran
 /// `:latest` from a 0.6.6 agent, 2026-10-20). It is skipped, logged, and the
 /// next candidate (or the node's own versioned default) is used.
 pub(crate) fn backend_image_ref(backend: &str, get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
@@ -3449,7 +3449,7 @@ pub(crate) fn backend_image_ref(backend: &str, get: &dyn Fn(&str) -> Option<Stri
 /// null unless an operator set one, so the reconciler — how a node normally
 /// starts a backend — never received the lock's digest (only the manual
 /// `/start` route did). A node then fell back to its own versioned default
-/// with no digest, and a 0.6.8 agent refuses that: aserve and robopi could
+/// with no digest, and a 0.6.8 agent refuses that: node-b and node-pi could
 /// not recreate `noo-ollama` after its floating container was removed
 /// (`refusing image "ollama/ollama:0.40.5": it has no @sha256 digest`).
 pub(crate) fn placement_image(backend: &str, image: Option<String>, get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
@@ -4946,7 +4946,7 @@ async fn placement_staging_refusal(state: &AppState, node_id: &str, backend: &st
 /// tick is the fallback, so a node that is off the bus, older than the op
 /// (404) or unreachable costs a log line and nothing else. Without this a
 /// harness kind change landed up to 5 min after `noo cluster place`
-/// (both awolf and mcmini, harness compare 2026-10-24).
+/// (both node-a and node-mac, harness compare 2026-10-24).
 pub(super) fn nudge_reconcile(state: Arc<AppState>, node_id: String) {
     tokio::spawn(async move {
         let link = match crate::node_link::NodeLink::for_node(&state, &node_id).await {
@@ -5073,7 +5073,7 @@ async fn placement_put(
 
     // i226 phase B: does the harness kind fit the node's chat window? A
     // kind whose first request is larger than the window fails on its first
-    // model call (every vendor kind on awolf's 16k vLLM, 2026-10-24); say so
+    // model call (every vendor kind on node-a's 16k vLLM, 2026-10-24); say so
     // here, with the numbers and what fits.
     if desired == "running" && backend == "harness" {
         let kind = body.env.as_ref().and_then(|e| e.get("NOO_HARNESS_KIND")).and_then(|k| k.as_str()).unwrap_or("noo").to_string();
@@ -7539,12 +7539,12 @@ mod heartbeat_carry_tests {
 
     #[test]
     fn with_contention_replaces_only_the_contention() {
-        let rec = json!({"id": "awolf", "status": "online", "gpu_contention": {"state": "free"}});
+        let rec = json!({"id": "node-a", "status": "online", "gpu_contention": {"state": "free"}});
         let gc = json!({"state": "held", "lease": {"operation_id": "op-1", "owner": "op"}});
         let merged = with_contention(rec, gc.clone());
         assert_eq!(merged["gpu_contention"], gc);
         assert_eq!(merged["status"], "online");
-        assert_eq!(merged["id"], "awolf");
+        assert_eq!(merged["id"], "node-a");
         // A record with no prior contention gains it.
         assert_eq!(with_contention(json!({"id": "x"}), gc.clone())["gpu_contention"], gc);
     }
@@ -7631,16 +7631,16 @@ mod honesty_tests {
         let placements = vec![
             p("host2", "harrier:latest", "running"),
             p("host6", "harrier", "stopped"),
-            p("awolf", "nomic-embed-code", "running"),
+            p("node-a", "nomic-embed-code", "running"),
             p("host9", "bge-m3", "running"),
         ];
-        let v = embedding_space_view(&spaces, &placements, &["HOST2".to_string(), "awolf".to_string()], &[]);
+        let v = embedding_space_view(&spaces, &placements, &["HOST2".to_string(), "node-a".to_string()], &[]);
         let k = &v["spaces"][0];
         assert_eq!(k["space"], "knowledge");
         assert_eq!(k["default"], true);
         assert_eq!(k["pool"].as_array().unwrap().len(), 2);
         assert_eq!(k["live"], 1, "host6 is stopped: in the pool, not live");
-        assert_eq!(v["spaces"][1]["pool"][0]["node"], "awolf");
+        assert_eq!(v["spaces"][1]["pool"][0]["node"], "node-a");
         assert_eq!(v["spaces"][1]["live"], 1);
         assert_eq!(v["unmatched"][0]["node"], "host9");
     }
@@ -7654,11 +7654,11 @@ mod honesty_tests {
             Space { space: "knowledge".into(), model: "harrier".into(), dims: Some(1024), migration: None },
             Space { space: "code".into(), model: "nomic-embed-code".into(), dims: None, migration: None },
         ];
-        let p = |m: &str| ("awolf".to_string(), "ollama".to_string(), Some(m.to_string()), "running".to_string());
-        let v = embedding_space_view(&spaces, &[p("harrier"), p("nomic-embed-code")], &["awolf".to_string()], &[]);
+        let p = |m: &str| ("node-a".to_string(), "ollama".to_string(), Some(m.to_string()), "running".to_string());
+        let v = embedding_space_view(&spaces, &[p("harrier"), p("nomic-embed-code")], &["node-a".to_string()], &[]);
         for i in 0..2 {
             assert_eq!(v["spaces"][i]["pool"].as_array().unwrap().len(), 1, "{v}");
-            assert_eq!(v["spaces"][i]["pool"][0]["node"], "awolf");
+            assert_eq!(v["spaces"][i]["pool"][0]["node"], "node-a");
             assert_eq!(v["spaces"][i]["live"], 1);
         }
         assert!(v["unmatched"].as_array().unwrap().is_empty());

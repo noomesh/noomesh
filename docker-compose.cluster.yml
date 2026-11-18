@@ -1678,7 +1678,7 @@ services:
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
-    # llama-server writes nothing outside /models (docker diff, awolf 2026-10-28).
+    # llama-server writes nothing outside /models (docker diff, node-a 2026-10-28).
     read_only: true
     tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=64m"]
     # NOT in gpu-tier2: the launcher auto-adds that profile on any 4-10 GB

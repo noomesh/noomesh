@@ -3,7 +3,7 @@
 
 //! How long an idle client connection may hold a socket in the gateway.
 //!
-//! On 2026-11-02 the pop-os gateway ran out of file descriptors (RLIMIT_NOFILE
+//! On 2026-11-02 the ctrl gateway ran out of file descriptors (RLIMIT_NOFILE
 //! 1024) after ~45 h and spent five hours unable to read its secrets or reach
 //! Postgres. The sockets were idle HTTP/1 keep-alive connections. A node agent
 //! in a retry loop built a fresh Go transport per request (no idle timeout)

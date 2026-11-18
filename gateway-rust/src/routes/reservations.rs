@@ -1370,7 +1370,7 @@ mod tests {
     }
 
     fn node(gc: Value) -> Value {
-        json!({"id": "awolf", "status": "online", "last_heartbeat": 1000.0, "vram_gb": 16, "gpu_contention": gc})
+        json!({"id": "node-a", "status": "online", "last_heartbeat": 1000.0, "vram_gb": 16, "gpu_contention": gc})
     }
 
     // ── i300 node workloads (H4) ──────────────────────────────────────────
@@ -1556,12 +1556,12 @@ mod tests {
     #[test]
     fn a_reservation_is_read_from_the_nodes_lease() {
         let rec = json!({"gpu_contention": {"state": "held", "total_mb": 16376, "paused_backends": ["vllm"],
-            "lease": {"operation_id": "res-1", "owner": "rbwolf", "workload": "pai-voice/voice-worker", "generation": 3, "since": "t", "mode": "drain", "reason": "reservation pai-voice/voice-worker"}}});
-        let r = reservation_of("awolf", &rec).unwrap();
+            "lease": {"operation_id": "res-1", "owner": "owner", "workload": "pai-voice/voice-worker", "generation": 3, "since": "t", "mode": "drain", "reason": "reservation pai-voice/voice-worker"}}});
+        let r = reservation_of("node-a", &rec).unwrap();
         assert_eq!(r["id"], "res-1");
         assert_eq!(r["workload"], "pai-voice/voice-worker");
-        assert_eq!(r["holder"], "rbwolf");
-        assert_eq!(r["node"], "awolf");
+        assert_eq!(r["holder"], "owner");
+        assert_eq!(r["node"], "node-a");
         assert_eq!(r["generation"], 3);
         assert_eq!(r["paused_backends"], json!(["vllm"]));
         assert!(reservation_of("x", &json!({"gpu_contention": {"state": "free"}})).is_none());
@@ -1575,7 +1575,7 @@ mod tests {
 
     #[test]
     fn a_not_declared_start_is_a_retryable_503_and_other_failures_say_why() {
-        match start_failure("rhaddon/rhworker", "awolf", "not_declared (404): no such workload", true) {
+        match start_failure("rhaddon/rhworker", "node-a", "not_declared (404): no such workload", true) {
             AppError::UnavailableRetry { code, detail, retry_after_secs } => {
                 assert_eq!(code, "node_workloads_not_loaded");
                 assert!(detail.contains("has not loaded its workload declarations yet; retry"), "{detail}");
@@ -1637,15 +1637,15 @@ mod tests {
     /// The record the hold write-back produces yields the new lease at once.
     #[test]
     fn a_merged_record_lists_the_new_lease_and_a_release_clears_it() {
-        let rec = json!({"id": "awolf", "status": "online", "gpu_contention": {"state": "free", "total_mb": 16376}});
+        let rec = json!({"id": "node-a", "status": "online", "gpu_contention": {"state": "free", "total_mb": 16376}});
         let held = super::super::cluster::with_contention(rec, json!({"state": "held", "total_mb": 16376, "paused_backends": ["vllm"],
             "lease": {"operation_id": "op-7", "owner": "op", "workload": "pai-voice/voice-worker", "generation": 3}}));
-        let r = reservation_of("awolf", &held).expect("the new lease is a reservation");
+        let r = reservation_of("node-a", &held).expect("the new lease is a reservation");
         assert_eq!(r["id"], "op-7");
         assert_eq!(r["generation"], 3);
         assert_eq!(r["state"], "held");
         let freed = super::super::cluster::with_contention(held, json!({"state": "free", "total_mb": 16376}));
-        assert!(reservation_of("awolf", &freed).is_none());
+        assert!(reservation_of("node-a", &freed).is_none());
     }
 
     /// Source test: the reservation routes are operator-gated and audited;
@@ -1696,18 +1696,18 @@ mod tests {
         let rec = json!({"node_workloads": [
             {"addon": "rhaddon", "name": "rhworker", "state": "provisioned", "ready": false, "door_port": 0, "reason": "door_leaf_missing"},
             {"addon": "rhaddon", "name": "rhok", "state": "provisioned", "ready": false, "door_port": 7001}]});
-        match node_workload_refusal(&rec, "rhaddon", "rhworker", "awolf") {
+        match node_workload_refusal(&rec, "rhaddon", "rhworker", "node-a") {
             Some(AppError::Conflict(m)) => {
                 assert!(m.starts_with("door_leaf_missing: "), "the agent's reason leads: {m}");
                 assert!(m.contains("nothing was held"), "{m}");
             }
             other => panic!("door_leaf_missing must refuse with the agent's reason, got {other:?}"),
         }
-        assert!(node_workload_refusal(&rec, "rhaddon", "rhok", "awolf").is_none(), "a clean provisioned row may start");
+        assert!(node_workload_refusal(&rec, "rhaddon", "rhok", "node-a").is_none(), "a clean provisioned row may start");
         let attn = json!({"node_workloads": [{"addon": "rhaddon", "name": "rhworker", "state": "needs_attention", "ready": false, "door_port": 0}]});
-        assert!(matches!(node_workload_refusal(&attn, "rhaddon", "rhworker", "awolf"), Some(AppError::Conflict(m)) if m.starts_with("needs_attention: ")));
-        for rec in [json!({"node_workloads": []}), json!({"id": "awolf"})] {
-            match node_workload_refusal(&rec, "rhaddon", "rhworker", "awolf") {
+        assert!(matches!(node_workload_refusal(&attn, "rhaddon", "rhworker", "node-a"), Some(AppError::Conflict(m)) if m.starts_with("needs_attention: ")));
+        for rec in [json!({"node_workloads": []}), json!({"id": "node-a"})] {
+            match node_workload_refusal(&rec, "rhaddon", "rhworker", "node-a") {
                 Some(AppError::UnavailableRetry { code, .. }) => assert_eq!(code, "node_workloads_not_loaded"),
                 other => panic!("no row is not yet provisioned (retry), got {other:?}"),
             }
@@ -1769,21 +1769,21 @@ mod tests {
         let link = crate::node_link::NodeLink::for_base(&base);
         let d = managed_decl("rhaddon", &nw_decl(), 0);
         let rec = json!({"node_workloads": [{"addon": "rhaddon", "name": d.name.clone(), "state": "provisioned", "ready": false, "door_port": 0, "reason": "door_leaf_missing"}]});
-        let free = Managed { node: "awolf".into(), free: true };
-        let e = preflight(&link, &d, Some(&free), &rec, &d.key(), "awolf").await.unwrap_err();
+        let free = Managed { node: "node-a".into(), free: true };
+        let e = preflight(&link, &d, Some(&free), &rec, &d.key(), "node-a").await.unwrap_err();
         assert!(e.to_string().starts_with("door_leaf_missing: "), "{e}");
-        let held = Managed { node: "awolf".into(), free: false };
+        let held = Managed { node: "node-a".into(), free: false };
         let clean = json!({"node_workloads": [{"addon": "rhaddon", "name": d.name.clone(), "state": "provisioned", "ready": false, "door_port": 1}]});
-        let e = preflight(&link, &d, Some(&held), &clean, &d.key(), "awolf").await.unwrap_err();
+        let e = preflight(&link, &d, Some(&held), &clean, &d.key(), "node-a").await.unwrap_err();
         assert!(e.to_string().contains("already reserved"), "{e}");
-        assert!(preflight(&link, &d, Some(&free), &clean, &d.key(), "awolf").await.is_ok(), "a free, clean row passes without a call");
+        assert!(preflight(&link, &d, Some(&free), &clean, &d.key(), "node-a").await.is_ok(), "a free, clean row passes without a call");
     }
 
     /// An i163 workload: the agent's status (a read) answers before the hold.
     #[tokio::test]
     async fn an_i163_workload_the_agent_does_not_declare_is_refused_before_the_hold() {
         let link = crate::node_link::NodeLink::for_base(&crate::upstream_body::stub("404 Not Found", None, b"{\"error\":\"not_declared\",\"detail\":\"no bundle\"}").await);
-        match preflight(&link, &decl(true, 1), None, &json!({}), "rhaddon/rhworker", "awolf").await {
+        match preflight(&link, &decl(true, 1), None, &json!({}), "rhaddon/rhworker", "node-a").await {
             Err(AppError::UnavailableRetry { code, detail, .. }) => {
                 assert_eq!(code, "node_workloads_not_loaded");
                 assert!(detail.contains("nothing was held"), "{detail}");
@@ -1791,7 +1791,7 @@ mod tests {
             other => panic!("not_declared before the hold is a retry, got {other:?}"),
         }
         let link = crate::node_link::NodeLink::for_base(&crate::upstream_body::stub("404 Not Found", None, b"{\"error\":\"no_container\",\"detail\":\"gone\"}").await);
-        let e = preflight(&link, &decl(true, 1), None, &json!({}), "rhaddon/rhworker", "awolf").await.unwrap_err();
+        let e = preflight(&link, &decl(true, 1), None, &json!({}), "rhaddon/rhworker", "node-a").await.unwrap_err();
         assert!(matches!(&e, AppError::Conflict(m) if m.starts_with("no_container (404)")), "{e:?}");
     }
 
@@ -1837,21 +1837,21 @@ mod tests {
         assert_eq!((r["id"].as_str(), r["workload"].as_str(), r["holder"].as_str(), r["node"].as_str(), r["state"].as_str()),
             (Some("r-cpu"), Some("rhaddon/echo"), Some("alice"), Some("rhx-node2"), Some("held")));
         assert_eq!((r["gpu"].as_bool(), r["source"].as_str(), r["generation"].as_u64()), (Some(false), Some("placement"), Some(0)));
-        let lease = lease_res("r-gpu", "rhaddon/rhworker", "awolf");
+        let lease = lease_res("r-gpu", "rhaddon/rhworker", "node-a");
         assert_eq!((lease["gpu"].as_bool(), lease["source"].as_str()), (Some(true), Some("lease")));
     }
 
     #[test]
     fn the_merged_list_never_reports_one_reservation_twice() {
         // A GPU workload: its lease AND its row carry the same id: once.
-        let gpu = merge_reservations(vec![lease_res("r1", "rhaddon/rhworker", "awolf")],
-            &[held_row("r1", "rhaddon", "rhworker", "awolf", Some("alice"))]);
+        let gpu = merge_reservations(vec![lease_res("r1", "rhaddon/rhworker", "node-a")],
+            &[held_row("r1", "rhaddon", "rhworker", "node-a", Some("alice"))]);
         assert_eq!(gpu.len(), 1);
         assert_eq!(gpu[0]["source"], "lease");
         // The same, with the row as a pre-124 gateway left it (holder and
         // reserved_at NULL): still the lease's, listed once, with its owner.
-        let old = merge_reservations(vec![lease_res("r1", "rhaddon/rhworker", "awolf")],
-            &[crate::repo::node_workload_placements::Held { reserved_at: None, ..held_row("r1", "rhaddon", "rhworker", "awolf", None) }]);
+        let old = merge_reservations(vec![lease_res("r1", "rhaddon/rhworker", "node-a")],
+            &[crate::repo::node_workload_placements::Held { reserved_at: None, ..held_row("r1", "rhaddon", "rhworker", "node-a", None) }]);
         assert_eq!(old.len(), 1, "{old:?}");
         assert_eq!((old[0]["source"].as_str(), old[0]["holder"].as_str(), old[0]["gpu"].as_bool()), (Some("lease"), Some("alice"), Some(true)));
         // gpu-0 -> GPU on one node: the old CPU row (r-a, no lease) and the new

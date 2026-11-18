@@ -1283,9 +1283,9 @@ mod tests {
         assert!(image_is_staged(&dir, tag, "amd64"));
         assert!(!image_is_staged(&dir, &pinned, "arm64"), "the other arch is still unstaged");
         let _ = std::fs::remove_dir_all(&dir);
-        let m = not_staged_refusal("robopi", &pinned, "arm64");
+        let m = not_staged_refusal("node-pi", &pinned, "arm64");
         assert!(m.contains(&format!("image {pinned} for arm64 is not staged")), "{m}");
-        assert!(m.contains(&format!("noo cluster sync-images robopi -i {tag}`")), "{m}");
+        assert!(m.contains(&format!("noo cluster sync-images node-pi -i {tag}`")), "{m}");
     }
 
     #[test]

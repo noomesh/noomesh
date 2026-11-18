@@ -2247,18 +2247,18 @@ mod tests {
     #[test]
     fn the_self_nodes_birth_cert_is_the_host_file_alone() {
         const PEM: &str = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
-        assert_eq!(self_birth_cert("pop-os", Some("pop-os"), || Some(PEM.into())),
+        assert_eq!(self_birth_cert("ctrl", Some("ctrl"), || Some(PEM.into())),
             Some(Some(PEM.trim().to_string())));
-        assert_eq!(self_birth_cert("Pop-OS", Some("pop-os"), || Some(PEM.into())),
+        assert_eq!(self_birth_cert("Ctrl", Some("ctrl"), || Some(PEM.into())),
             Some(Some(PEM.trim().to_string())), "case-insensitive, as node names are");
-        assert_eq!(self_birth_cert("pop-os", Some("pop-os"), || None), Some(None),
+        assert_eq!(self_birth_cert("ctrl", Some("ctrl"), || None), Some(None),
             "no file: no cert, and the DB is NOT consulted");
-        assert_eq!(self_birth_cert("pop-os", Some("pop-os"), || Some("garbage".into())), Some(None));
+        assert_eq!(self_birth_cert("ctrl", Some("ctrl"), || Some("garbage".into())), Some(None));
         // Every other node: the enrollment record decides (the reader is
         // not even called).
-        assert_eq!(self_birth_cert("aserve", Some("pop-os"), || panic!("read for a remote node")), None);
-        assert_eq!(self_birth_cert("pop-os", None, || panic!("read with no self id")), None);
-        assert_eq!(self_birth_cert("pop-os", Some(" "), || panic!("read with a blank self id")), None);
+        assert_eq!(self_birth_cert("node-b", Some("ctrl"), || panic!("read for a remote node")), None);
+        assert_eq!(self_birth_cert("ctrl", None, || panic!("read with no self id")), None);
+        assert_eq!(self_birth_cert("ctrl", Some(" "), || panic!("read with a blank self id")), None);
     }
 
     /// 0.6.3-rc.1 F1: the gateway reads the self node's cert from the PKI's
@@ -2266,8 +2266,8 @@ mod tests {
     /// (which does not exist before the node identity does).
     #[test]
     fn the_self_nodes_cert_is_read_from_the_pki_view() {
-        assert_eq!(self_birth_cert_path("pop-os"), "/app/pki/nodes/pop-os/birth.crt");
-        assert_eq!(self_birth_cert_path(" pop-os "), "/app/pki/nodes/pop-os/birth.crt");
+        assert_eq!(self_birth_cert_path("ctrl"), "/app/pki/nodes/ctrl/birth.crt");
+        assert_eq!(self_birth_cert_path(" ctrl "), "/app/pki/nodes/ctrl/birth.crt");
         let src = include_str!("bootstrap.rs");
         let code = &crate::test_src::own_code(src);
         assert!(!code.contains(&["\"/etc/noo/", "self-node"].concat()), "no host /etc path is read");

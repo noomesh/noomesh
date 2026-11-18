@@ -149,7 +149,7 @@ agent sets `User: "0"` on them explicitly.
 | `vllm`, `vllm-secondary`, `ollama`, `ollama-embed`, `ollama-embed-cpu`, `tei`, `tei-gpu`, `reranker`, `airllm` | ALL, plus `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETGID`, `SETUID` (the node agent's backend set) | yes | no (below) |
 
 **Backends that keep a writable root, and why** (measured with `docker diff`
-on running containers, awolf, 2026-10-28):
+on running containers, node-a, 2026-10-28):
 
 - `vllm`: runs as root and writes `/tmp` (torch inductor, cutlass), `/root/.nv`
   (CUDA compute cache), `/root/.triton` (kernel cache) and `/etc/ld.so.cache`
@@ -246,7 +246,7 @@ others read-only). Inside a call's new user namespace those mounts are
 locked, and the kernel then refuses a fresh procfs (no procfs in the mount
 namespace is fully visible). Through 0.6.13 the jail asked for one
 (`--proc /proc`), so with the AppArmor profile in place every call still
-failed, with "Can't mount proc on /proc: Operation not permitted" (pop-os,
+failed, with "Can't mount proc on /proc: Operation not permitted" (ctrl,
 2026-10-26). The jail now mounts no `/proc` at all and keeps every
 namespace. The other ways out were each worse:
 

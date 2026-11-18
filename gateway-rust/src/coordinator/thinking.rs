@@ -5,7 +5,7 @@
 //! answers, decided per node.
 //!
 //! Why: a reasoning model on a slow node spends most of a call thinking.
-//! gemma4:12b on an M4 (mcmini, 2026-10-17) took 3-4.5 min per model call,
+//! gemma4:12b on an M4 (node-mac, 2026-10-17) took 3-4.5 min per model call,
 //! mostly reasoning, and a three-call turn overran the 900 s turn deadline.
 //! `off` there trades depth for an answer that arrives.
 //!
@@ -116,7 +116,7 @@ pub fn asks_no_reasoning(body: &Value) -> bool {
 ///   `think: false` and which vLLM and llama-server ignore as an unknown
 ///   field. Both, always, because a harness speaks to its node agent's proxy
 ///   as `openai` (`NOO_HARNESS_BACKEND=openai`) and does not know which
-///   engine is behind it: on mcmini that engine is Ollama, which ignores
+///   engine is behind it: on node-mac that engine is Ollama, which ignores
 ///   `chat_template_kwargs`. When the backend type does say `ollama`,
 ///   `"think": false` too. Not `reasoning_effort`: vLLM validates it
 ///   against `low|medium|high` and would refuse `none`. Not on a cloud

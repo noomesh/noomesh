@@ -16,7 +16,7 @@ import (
 // model bytes in. HF weights are verified at each backend start on a placed
 // node, GGUF files at start when the controller has a manifest, Ollama models
 // against the controller's record about every 10 minutes; a store written by
-// hand, or a node without a controller record, is not. Found on awolf
+// hand, or a node without a controller record, is not. Found on node-a
 // 2026-11-17: hf-cache, hub, models and ollama 0777.
 //
 // The heartbeat's `data_roots.stores` is

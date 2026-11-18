@@ -1202,7 +1202,7 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     reconcile_storage_dirs(g, &roll.root, &roll.tag, target_stack_lock.as_deref());
     // i458 (b): the deploy slice moves WITH the pin. Written after every
     // refusal above, so a refused roll leaves the old release's compose and
-    // scripts over the old images (pop-os, 0.6.16: CLI and slice 0.6.16 over
+    // scripts over the old images (ctrl, 0.6.16: CLI and slice 0.6.16 over
     // 0.6.15 images after the storage refusal).
     refresh_deploy_slice(g, &roll);
     move_pin(g, &roll, target_stack_lock.as_deref(), &addon_prep);
@@ -1219,7 +1219,7 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
 
     // Stage node images BEFORE the stack moves: the new gateway hands every
     // node the new lock's backend refs as soon as it is up, and a rail node
-    // refuses one whose arch tar is not staged yet (0.6.26 roll, robopi:
+    // refuses one whose arch tar is not staged yet (0.6.26 roll, node-pi:
     // `node.reconcile_refused` until the arm64 tar landed, 2 min later).
     let staging = crate::commands::image_stage::start_stage_release_images(g, target_stack_lock.clone(), &roll.tag)
         .finish_before_launch(g);
@@ -3139,7 +3139,7 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
     }
     let waited = if pending.is_empty() { Vec::new() } else { wait_and_settle_nodes(g, &pending, me.as_deref(), &mut failed) };
     // One line per node, whatever the others did (0.6.21: "stopped at the
-    // nodes stage" hid that pop-os upgraded fine beside a failed node).
+    // nodes stage" hid that ctrl upgraded fine beside a failed node).
     let order: Vec<String> = rail_order.iter().cloned().chain(me.clone()).collect();
     print_node_outcomes(g, &node_outcome_rows(&order, &skipped, &waited, &failed));
     if g.json && !stagger.json.is_empty() {
@@ -7448,7 +7448,7 @@ mod door_node_id_tests {
     /// own rule (tests/test_stunnel_door_pinning.py runs the shell side).
     #[test]
     fn door_node_id_problem_matches_the_doors_rule() {
-        for ok in ["host8", "pop-os", "node_1.lan", "\"host8\"", "'host8'"] {
+        for ok in ["host8", "ctrl", "node_1.lan", "\"host8\"", "'host8'"] {
             assert_eq!(super::door_node_id_problem(ok), None, "{ok}");
         }
         for bad in ["", "  ", "auto", "a b", "x;y", "host8/../x", "$(id)"] {
@@ -7978,7 +7978,7 @@ mod json_stdout_tests {
 
 /// i458 (b): the deploy slice moves with the pin. A roll refused in the
 /// stack stage left the NEW release's compose and scripts over the OLD
-/// images on pop-os (0.6.16): stage 1's `stack sync-assets` and the stack
+/// images on ctrl (0.6.16): stage 1's `stack sync-assets` and the stack
 /// stage's refresh both wrote the slice before the storage refusal.
 #[cfg(test)]
 mod slice_pin_tests {
@@ -7986,7 +7986,7 @@ mod slice_pin_tests {
 
     #[test]
     fn the_slice_waits_while_the_pin_is_behind_the_pairing() {
-        // the pop-os state: CLI paired with 0.6.16, stack still on 0.6.15
+        // the ctrl state: CLI paired with 0.6.16, stack still on 0.6.15
         assert_eq!(slice_defer("v0.6.15", "stack-v0.6.16"), Some(("v0.6.15".into(), "v0.6.16".into())));
         // an rc CLI over the last final, and one rc over another
         assert!(slice_defer("v0.6.16", "stack-v0.6.17-rc.1").is_some());
@@ -8030,7 +8030,7 @@ mod slice_pin_tests {
 }
 
 /// The 0.6.26 roll: staging overlapped the launch, the new gateway handed
-/// robopi the v0.6.26 ollama ref before its arm64 tar existed, and robopi
+/// node-pi the v0.6.26 ollama ref before its arm64 tar existed, and node-pi
 /// refused it for two minutes (`node.reconcile_refused`, one operator alert).
 #[cfg(test)]
 mod stage_before_launch_tests {
@@ -8067,8 +8067,8 @@ mod embedder_after_roll_tests {
 
 /// 123 (outside tester, 0.6.21): a self node that had never reported an
 /// apply held `stage_applier_first`'s 600 s fetch wait inside STAGING, so
-/// pop-os was staged only after it; and "stopped at the nodes stage" hid
-/// that pop-os then upgraded fine.
+/// ctrl was staged only after it; and "stopped at the nodes stage" hid
+/// that ctrl then upgraded fine.
 #[cfg(test)]
 mod nodes_stage_nonblocking_tests {
     use super::{full_bundle_follows, node_outcome_lines, node_outcome_rows, outcome_of, NodeOutcome, Outcome};
@@ -8112,20 +8112,20 @@ mod nodes_stage_nonblocking_tests {
         NodeOutcome { node: n.into(), outcome: o, why: format!("{} why", o.word()), elapsed_secs: secs }
     }
 
-    /// The tester's run: the self node failed (never fetched), pop-os
+    /// The tester's run: the self node failed (never fetched), ctrl
     /// applied. Both have a line; a skipped node and a staging failure too;
     /// a node this stage never touched has none.
     #[test]
     fn every_touched_node_gets_a_row_in_order() {
-        let order: Vec<String> = ["host8", "pop-os", "host6", "untouched", "Lenovo-P52s"].iter().map(|s| s.to_string()).collect();
+        let order: Vec<String> = ["host8", "ctrl", "host6", "untouched", "Lenovo-P52s"].iter().map(|s| s.to_string()).collect();
         let skipped = vec![("host8".to_string(), "last seen 3 h ago".to_string())];
-        let waited = vec![row("pop-os", Outcome::Applied, 95), row("Lenovo-P52s", Outcome::NotFetched, 600)];
+        let waited = vec![row("ctrl", Outcome::Applied, 95), row("Lenovo-P52s", Outcome::NotFetched, 600)];
         let failed = vec!["host6".to_string(), "Lenovo-P52s (self node)".to_string()];
         let rows = node_outcome_rows(&order, &skipped, &waited, &failed);
         let got: Vec<(&str, Outcome)> = rows.iter().map(|r| (r.node.as_str(), r.outcome)).collect();
         assert_eq!(got, [
             ("host8", Outcome::SkippedOffline),
-            ("pop-os", Outcome::Applied),
+            ("ctrl", Outcome::Applied),
             ("host6", Outcome::NotStaged),
             ("Lenovo-P52s", Outcome::NotFetched),
         ]);
@@ -8137,9 +8137,9 @@ mod nodes_stage_nonblocking_tests {
 
     #[test]
     fn the_table_has_one_line_per_node_with_outcome_seconds_and_why() {
-        let lines = node_outcome_lines(&[row("pop-os", Outcome::Applied, 95), row("Lenovo-P52s", Outcome::NotFetched, 600)]);
+        let lines = node_outcome_lines(&[row("ctrl-1", Outcome::Applied, 95), row("Lenovo-P52s", Outcome::NotFetched, 600)]);
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("pop-os") && lines[0].contains("applied") && lines[0].contains("95s"), "{}", lines[0]);
+        assert!(lines[0].contains("ctrl-1") && lines[0].contains("applied") && lines[0].contains("95s"), "{}", lines[0]);
         assert!(lines[1].contains("Lenovo-P52s") && lines[1].contains("not fetched") && lines[1].contains("600s") && lines[1].contains("why"), "{}", lines[1]);
     }
 

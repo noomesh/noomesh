@@ -463,8 +463,8 @@ mod tests {
     /// `cluster_hmac_v1` series any more.
     #[tokio::test]
     async fn a_refused_v1_token_is_not_counted_as_admitted() {
-        let out = rendered(&[hmac_v1_refused_use("pop-os", "/api/cluster/nodes/pop-os/heartbeat")]).await;
-        assert!(out.contains(r#"noo_legacy_lane_uses_total{caller="pop-os",lane="cluster_hmac_v1_refused",route_class="cluster"} 1"#), "{out}");
+        let out = rendered(&[hmac_v1_refused_use("ctrl", "/api/cluster/nodes/ctrl/heartbeat")]).await;
+        assert!(out.contains(r#"noo_legacy_lane_uses_total{caller="ctrl",lane="cluster_hmac_v1_refused",route_class="cluster"} 1"#), "{out}");
         assert!(!out.contains(r#"lane="cluster_hmac_v1""#), "a refusal is not an admitted use: {out}");
     }
 

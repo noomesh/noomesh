@@ -475,14 +475,14 @@ mod tests {
             "--env", "RH_CPU_OFFLOAD=false",
         ];
         v.extend_from_slice(extra);
-        v.extend_from_slice(&["awolf", "rhaddon/native-voice"]);
+        v.extend_from_slice(&["node-a", "rhaddon/native-voice"]);
         a(&v)
     }
 
     #[test]
     fn place_builds_exactly_the_put_body_for_the_voice_placement() {
         let p = parse_place(&voice_args(&[])).expect("parses");
-        assert_eq!((p.node.as_str(), p.addon.as_str(), p.workload.as_str()), ("awolf", "rhaddon", "native-voice"));
+        assert_eq!((p.node.as_str(), p.addon.as_str(), p.workload.as_str()), ("node-a", "rhaddon", "native-voice"));
         assert_eq!(
             place_body(&p),
             json!({
@@ -506,7 +506,7 @@ mod tests {
         let p = parse_place(&voice_args(&["--on-controller"])).expect("parses");
         assert!(p.on_controller);
         assert_eq!(place_body(&p)["on_controller"], json!(true));
-        let bare = parse_place(&a(&["awolf", "a/b"])).expect("parses");
+        let bare = parse_place(&a(&["node-a", "a/b"])).expect("parses");
         assert_eq!(place_body(&bare), json!({"sets": {}, "env": {}, "on_controller": false}));
     }
 
@@ -557,8 +557,8 @@ mod tests {
     #[test]
     fn the_path_percent_encodes_every_segment() {
         assert_eq!(
-            placement_path("awolf", "rhaddon", "native-voice"),
-            "/api/cluster/nodes/awolf/node-workloads/rhaddon/native-voice"
+            placement_path("node-a", "rhaddon", "native-voice"),
+            "/api/cluster/nodes/node-a/node-workloads/rhaddon/native-voice"
         );
         let p = placement_path("a/b", "x?y", "w z");
         assert_eq!(p, "/api/cluster/nodes/a%2Fb/node-workloads/x%3Fy/w%20z");
@@ -571,9 +571,9 @@ mod tests {
 
     #[test]
     fn a_409_refusal_shows_the_code_and_the_detail() {
-        let text = json!({"error": "gpu_too_small", "detail": "awolf has no GPU with 24 GB free"}).to_string();
+        let text = json!({"error": "gpu_too_small", "detail": "node-a has no GPU with 24 GB free"}).to_string();
         let (code, detail) = parse_refusal(409, &text);
-        assert_eq!(format_refusal(&code, &detail), "refused (gpu_too_small): awolf has no GPU with 24 GB free");
+        assert_eq!(format_refusal(&code, &detail), "refused (gpu_too_small): node-a has no GPU with 24 GB free");
         let (code, detail) = parse_refusal(502, "bad gateway");
         assert_eq!(format_refusal(&code, &detail), "refused (http_502): bad gateway");
         assert_eq!(format_refusal("not_found", ""), "refused (not_found)");
@@ -582,39 +582,39 @@ mod tests {
     #[test]
     fn the_approve_hint_appears_for_consent_codes_only() {
         let detail = "rhaddon at sha256:0123abcdef9876 is not approved on the node";
-        let hint = approve_hint("consent_unapproved", "awolf", "rhaddon", detail).expect("hint");
-        assert_eq!(hint, "on awolf, run: sudo \"$(command -v noo)\" node workloads approve rhaddon sha256:0123abcdef9876");
+        let hint = approve_hint("consent_unapproved", "node-a", "rhaddon", detail).expect("hint");
+        assert_eq!(hint, "on node-a, run: sudo \"$(command -v noo)\" node workloads approve rhaddon sha256:0123abcdef9876");
         assert!(!hint.starts_with("noo ") && !hint.contains('`'), "plain prose, outside the hint lint");
-        let bare = approve_hint("consent_unapproved", "awolf", "rhaddon", "no approval recorded").expect("hint");
+        let bare = approve_hint("consent_unapproved", "node-a", "rhaddon", "no approval recorded").expect("hint");
         assert!(bare.ends_with("approve rhaddon <digest>"), "{bare}");
-        let none = approve_hint("consent_none", "awolf", "rhaddon", "this node's addon_workloads_policy is none").expect("hint");
+        let none = approve_hint("consent_none", "node-a", "rhaddon", "this node's addon_workloads_policy is none").expect("hint");
         assert!(none.contains("NOO_ADDON_WORKLOADS=none") && !none.contains("approve rhaddon"), "{none}");
-        let old = approve_hint("consent_none", "awolf", "rhaddon", "the node does not report its addon_workloads_policy").expect("hint");
+        let old = approve_hint("consent_none", "node-a", "rhaddon", "the node does not report its addon_workloads_policy").expect("hint");
         assert!(old.contains("roll it") && !old.contains("NOO_ADDON_WORKLOADS=none"), "{old}");
         for other in ["gpu_too_small", "not_found", "bad_sets", "image_missing", ""] {
-            assert_eq!(approve_hint(other, "awolf", "rhaddon", detail), None, "{other:?}");
+            assert_eq!(approve_hint(other, "node-a", "rhaddon", detail), None, "{other:?}");
         }
     }
 
     #[test]
     fn a_placed_summary_names_state_image_and_a_short_digest() {
         let resp = json!({
-            "node_id": "awolf", "addon": "rhaddon", "workload": "native-voice", "state": "provisioned",
+            "node_id": "node-a", "addon": "rhaddon", "workload": "native-voice", "state": "provisioned",
             "image": {"name": "ghcr.io/x/voice:1", "digest": "sha256:0123456789abcdef0123456789abcdef", "id": "i", "artifact": "a"},
         });
         assert_eq!(
             format_placed(&resp),
-            "rhaddon/native-voice: placed on awolf — provisioned, image ghcr.io/x/voice:1 sha256:0123456789ab"
+            "rhaddon/native-voice: placed on node-a — provisioned, image ghcr.io/x/voice:1 sha256:0123456789ab"
         );
         assert_eq!(
-            format_unplaced(&json!({"node_id": "awolf", "addon": "rhaddon", "workload": "native-voice", "removed": true})),
-            "rhaddon/native-voice: unplaced from awolf"
+            format_unplaced(&json!({"node_id": "node-a", "addon": "rhaddon", "workload": "native-voice", "removed": true})),
+            "rhaddon/native-voice: unplaced from node-a"
         );
     }
 
     fn listing() -> Value {
         json!({
-            "node_id": "awolf",
+            "node_id": "node-a",
             "node_workloads": [
                 {"addon": "rhaddon", "workload": "native-voice", "profile": "int8",
                  "sets": {"main": [{"id": "m", "revision": "r"}]}, "env": {}, "on_controller": false,
@@ -640,23 +640,23 @@ mod tests {
         );
         assert_eq!(workload_row(&all[1])[2], "-");
         assert_eq!(workload_row(&all[1])[3], "-");
-        assert_eq!(parse_show(&a(&["awolf", "rhaddon/native-voice"])), Ok(("awolf".to_string(), Some(("rhaddon".to_string(), "native-voice".to_string())))));
-        assert_eq!(parse_show(&a(&["awolf"])), Ok(("awolf".to_string(), None)));
+        assert_eq!(parse_show(&a(&["node-a", "rhaddon/native-voice"])), Ok(("node-a".to_string(), Some(("rhaddon".to_string(), "native-voice".to_string())))));
+        assert_eq!(parse_show(&a(&["node-a"])), Ok(("node-a".to_string(), None)));
     }
 
     #[test]
     fn retry_takes_a_node_and_at_most_one_set() {
-        assert_eq!(parse_retry(&a(&["awolf"])), Ok(("awolf".to_string(), None)));
-        assert_eq!(parse_retry(&a(&["awolf", "rh-main-v1@fdaf4090"])), Ok(("awolf".to_string(), Some("rh-main-v1@fdaf4090".to_string()))));
+        assert_eq!(parse_retry(&a(&["node-a"])), Ok(("node-a".to_string(), None)));
+        assert_eq!(parse_retry(&a(&["node-a", "rh-main-v1@fdaf4090"])), Ok(("node-a".to_string(), Some("rh-main-v1@fdaf4090".to_string()))));
         assert!(parse_retry(&a(&[])).is_err());
-        assert!(parse_retry(&a(&["awolf", "a@b", "c@d"])).is_err());
+        assert!(parse_retry(&a(&["node-a", "a@b", "c@d"])).is_err());
         assert!(parse_retry(&a(&[".."])).is_err());
     }
 
     #[test]
     fn a_retry_set_that_is_not_id_at_rev_fails_before_any_request() {
         for bad in ["rh-main", "@r1", "rh-main@", "a@b@c", "main=a@b@", "@"] {
-            assert!(parse_retry(&a(&["awolf", bad])).is_err(), "{bad:?} must be refused");
+            assert!(parse_retry(&a(&["node-a", bad])).is_err(), "{bad:?} must be refused");
         }
     }
 
@@ -664,16 +664,16 @@ mod tests {
     fn retry_posts_the_set_or_an_empty_object_to_the_nodes_route() {
         assert_eq!(retry_body(None), json!({}));
         assert_eq!(retry_body(Some("rh-main@r1")), json!({"set": "rh-main@r1"}));
-        assert_eq!(retry_path("awolf"), "/api/cluster/nodes/awolf/model-set-retry");
+        assert_eq!(retry_path("node-a"), "/api/cluster/nodes/node-a/model-set-retry");
         assert_eq!(retry_path("a/b"), "/api/cluster/nodes/a%2Fb/model-set-retry");
     }
 
     #[test]
     fn the_retry_line_says_when_the_node_acts() {
         assert_eq!(
-            format_retry("awolf", None),
-            "retry requested for every refused model set on awolf: the node retries now if it is reachable, else on its next reconcile (≤5 min)"
+            format_retry("node-a", None),
+            "retry requested for every refused model set on node-a: the node retries now if it is reachable, else on its next reconcile (≤5 min)"
         );
-        assert!(format_retry("awolf", Some("rh-main@r1")).contains("model set rh-main@r1 on awolf"));
+        assert!(format_retry("node-a", Some("rh-main@r1")).contains("model set rh-main@r1 on node-a"));
     }
 }

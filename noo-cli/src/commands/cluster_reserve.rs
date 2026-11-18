@@ -266,8 +266,8 @@ mod tests {
     fn parses_reserve_and_release() {
         assert_eq!(parse_reserve(&a(&["pai-voice/voice-worker"])),
             Ok(ReserveArgs { workload: "pai-voice/voice-worker".into(), node: None, hand_over: None, timeout: None }));
-        assert_eq!(parse_reserve(&a(&["pai-voice/voice-worker", "--node", "awolf", "--hand-over", "res-1", "--timeout", "300"])),
-            Ok(ReserveArgs { workload: "pai-voice/voice-worker".into(), node: Some("awolf".into()), hand_over: Some("res-1".into()), timeout: Some(300) }));
+        assert_eq!(parse_reserve(&a(&["pai-voice/voice-worker", "--node", "node-a", "--hand-over", "res-1", "--timeout", "300"])),
+            Ok(ReserveArgs { workload: "pai-voice/voice-worker".into(), node: Some("node-a".into()), hand_over: Some("res-1".into()), timeout: Some(300) }));
         assert!(parse_reserve(&a(&["voice-worker"])).is_err(), "addon/workload");
         assert!(parse_reserve(&a(&[])).is_err());
         assert!(parse_reserve(&a(&["a/b", "--node"])).is_err());
@@ -285,9 +285,9 @@ mod tests {
         let (k, h) = refusal_hint("release", "res-1", 409, "not_owner: reservation res-1 is held by a");
         assert_eq!(k, "reservation_not_owner");
         assert!(h.starts_with("noo cluster release res-1 --force"));
-        assert_eq!(refusal_hint("reserve", "a/b", 409, "no node can take a/b: awolf: GPU held by x").0, "no_node_fits");
+        assert_eq!(refusal_hint("reserve", "a/b", 409, "no node can take a/b: node-a: GPU held by x").0, "no_node_fits");
         assert_eq!(refusal_hint("reserve", "a/b", 409, "drain_timeout: still in flight").0, "reservation_needs_attention");
-        assert_eq!(refusal_hint("release", "r", 409, "a/b did not stop on awolf: drain route refused").0, "reservation_needs_attention");
+        assert_eq!(refusal_hint("release", "r", 409, "a/b did not stop on node-a: drain route refused").0, "reservation_needs_attention");
     }
 }
 

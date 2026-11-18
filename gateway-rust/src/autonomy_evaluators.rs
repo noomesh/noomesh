@@ -2232,7 +2232,7 @@ pub fn expiring_among(found: Vec<(String, Option<i64>)>, now: i64, cutoff: i64) 
 /// At most this many certificates are named in one alert line.
 const EXPIRING_NAMED: usize = 8;
 
-/// `node pop-os (12 days), cluster CA (25 days)`; past [`EXPIRING_NAMED`],
+/// `node ctrl (12 days), cluster CA (25 days)`; past [`EXPIRING_NAMED`],
 /// `and N more`.
 pub fn expiring_names(certs: &[ExpiringCert]) -> String {
     let mut parts: Vec<String> = certs
@@ -3339,8 +3339,8 @@ mod tests {
     #[test]
     fn drift_alerts_only_on_a_miss_seen_twice_in_a_row() {
         let mut seen = std::collections::HashMap::new();
-        let h = ("awolf".to_string(), "harness".to_string());
-        let v = ("awolf".to_string(), "vllm".to_string());
+        let h = ("node-a".to_string(), "harness".to_string());
+        let v = ("node-a".to_string(), "vllm".to_string());
         assert!(confirm_drift(&mut seen, std::slice::from_ref(&h), 2).is_empty(), "first miss: a blip");
         assert!(confirm_drift(&mut seen, &[], 2).is_empty(), "recovered: forgotten");
         assert!(confirm_drift(&mut seen, std::slice::from_ref(&h), 2).is_empty(), "missing again: starts from one");
@@ -4950,7 +4950,7 @@ mod expiring_cert_names_tests {
         let pki = Path::new("/p");
         assert_eq!(cert_label(pki, Path::new("/p/ca.crt")), "cluster CA");
         assert_eq!(cert_label(pki, Path::new("/p/gateway/gateway.crt")), "gateway");
-        assert_eq!(cert_label(pki, Path::new("/p/nodes/pop-os/node.crt")), "node pop-os");
+        assert_eq!(cert_label(pki, Path::new("/p/nodes/ctrl/node.crt")), "node ctrl");
         assert_eq!(cert_label(pki, Path::new("/p/services/x/service.crt")), "services/x/service.crt");
     }
 

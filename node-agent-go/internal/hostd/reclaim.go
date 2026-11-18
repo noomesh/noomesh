@@ -353,7 +353,7 @@ func (e *Engine) staleBuildVolumes(ctx context.Context, now time.Time) []string 
 // buildVolumes is rung 4's view of the labelled, unattached build volumes:
 // the stale ones, and every one it keeps with the reason. The dry run says
 // both: a count of stale volumes alone read as "it does not see them" when
-// the volumes were live caches (awolf, 2026-11-16: three noo-batch target
+// the volumes were live caches (node-a, 2026-11-16: three noo-batch target
 // volumes, 18 GB, checkouts present and rebuilt that day, reported as "1
 // stale build-cache volume(s)").
 type buildVolumes struct {

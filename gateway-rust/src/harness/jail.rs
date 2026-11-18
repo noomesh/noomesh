@@ -1301,7 +1301,7 @@ mod tests {
             // Bounded: a just-spawned sibling on a loaded box can sit in
             // uninterruptible sleep (state D) while it pages in, and its
             // environ reads back empty then (i812: one local batch check of
-            // #1205, awolf under load).
+            // #1205, node-a under load).
             let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
             let got = loop {
                 let read = read_sibling_env(pid, &canary).await;

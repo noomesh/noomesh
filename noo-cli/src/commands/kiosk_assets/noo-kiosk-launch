@@ -26,7 +26,7 @@ STATE="${NOO_KIOSK_STATE:-/var/lib/kiosk}"
 # Not belt-and-braces. On the first real display the journal carried only
 # systemd's own lines across dozens of restart cycles — no launcher
 # output at all, though this script does echo its reasons. It happened
-# again after the 0.6.25 roll on homeserver: status=1/FAILURE in the same
+# again after the 0.6.25 roll on node-h: status=1/FAILURE in the same
 # second, in a restart loop, and not one line saying why. Whatever routes
 # this unit's stdout away, logger writes to the syslog socket instead, and a
 # file we write ourselves cannot be routed away from us.

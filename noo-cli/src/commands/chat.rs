@@ -139,7 +139,7 @@ impl Served {
         }
     }
 
-    /// `ollama · qwen2.5:0.5b on awolf`, with any unknown part left out
+    /// `ollama · qwen2.5:0.5b on node-a`, with any unknown part left out
     /// rather than printed as `?`; `None` when nothing is known.
     fn line(&self) -> Option<String> {
         let what = match (&self.backend, &self.model) {
@@ -644,7 +644,7 @@ mod tests {
         let mut acc = Served::default();
         for raw in [
             r#"{"type":"metadata","conversation_id":"c","model":"qwen2.5:0.5b","backend":"ollama","engine":"rust"}"#,
-            r#"{"type":"phase","phase":"routed","node":"awolf","backend":"ollama","model":"qwen2.5:0.5b","attempt":1}"#,
+            r#"{"type":"phase","phase":"routed","node":"node-a","backend":"ollama","model":"qwen2.5:0.5b","attempt":1}"#,
             // A tool round's frames name no backend: they must not blank it.
             r#"{"type":"metadata","deadline_stop":true,"iteration":2}"#,
             r#"{"type":"tool_call","name":"noo_rag_query"}"#,
@@ -653,7 +653,7 @@ mod tests {
                 acc.merge(&sv);
             }
         }
-        assert_eq!(acc.line().as_deref(), Some("ollama · qwen2.5:0.5b on awolf"));
+        assert_eq!(acc.line().as_deref(), Some("ollama · qwen2.5:0.5b on node-a"));
         // Before any routed phase: no node, and no "on ?".
         let only = served_from(&serde_json::json!({"backend": "ollama", "model": "m"}), "node_id");
         assert_eq!(only.line().as_deref(), Some("ollama · m"));

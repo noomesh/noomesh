@@ -434,7 +434,7 @@ mod tests {
         std::fs::metadata(p).unwrap().permissions().mode() & 0o777
     }
 
-    /// The pop-os case: the base exists and belongs to another uid (root,
+    /// The ctrl case: the base exists and belongs to another uid (root,
     /// after Docker made it for a missing bind source). The add-on is
     /// refused with the exact chown and the directory is not touched: its
     /// mode is what it was. Checking the owner after `private_dir` chmods

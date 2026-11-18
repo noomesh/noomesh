@@ -39,7 +39,7 @@ func TestListingFailureIsLoggedOncePerCause(t *testing.T) {
 	}
 }
 
-// mcmini's shape (0.6.25, 2026-11-16): a Mac with no docker socket, where
+// node-mac's shape (0.6.25, 2026-11-16): a Mac with no docker socket, where
 // BOTH listings fail on every tick. The noomesh-container listing warned
 // every 15 s (about 5,760 lines a day); each listing now warns once per
 // cause, and says once when it works again.

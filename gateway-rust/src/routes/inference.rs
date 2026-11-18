@@ -1969,9 +1969,9 @@ mod pinned_no_chat_tests {
 
     #[test]
     fn an_embed_only_node_has_no_chat_backend() {
-        // robopi / aserve on 2026-10-14: ollama serving harrier, placed for embed.
+        // node-pi / node-b on 2026-10-14: ollama serving harrier, placed for embed.
         let rb = running(serde_json::json!({"ollama": "harrier"}));
-        let got = pick_chat_backend("robopi", &rb, &non_chat(&[("robopi", "ollama")]));
+        let got = pick_chat_backend("node-pi", &rb, &non_chat(&[("node-pi", "ollama")]));
         assert_eq!(got, Err(vec![("ollama".to_string(), "harrier".to_string())]));
     }
 
@@ -1979,7 +1979,7 @@ mod pinned_no_chat_tests {
     fn a_chat_backend_behind_an_embedder_is_still_found() {
         // vllm > ollama > llamacpp: the embedder used to win by order alone.
         let rb = running(serde_json::json!({"ollama": "harrier", "llamacpp": "gemma-4-E2B"}));
-        let got = pick_chat_backend("robopi", &rb, &non_chat(&[("robopi", "ollama")]));
+        let got = pick_chat_backend("node-pi", &rb, &non_chat(&[("node-pi", "ollama")]));
         assert_eq!(got, Ok(("llamacpp".to_string(), "gemma-4-E2B".to_string())));
     }
 
@@ -1987,7 +1987,7 @@ mod pinned_no_chat_tests {
     fn the_role_set_is_per_node() {
         // Another node's embed placement does not make this node's ollama non-chat.
         let rb = running(serde_json::json!({"ollama": "llama3.2:3b"}));
-        let got = pick_chat_backend("host9", &rb, &non_chat(&[("robopi", "ollama")]));
+        let got = pick_chat_backend("host9", &rb, &non_chat(&[("node-pi", "ollama")]));
         assert_eq!(got, Ok(("ollama".to_string(), "llama3.2:3b".to_string())));
     }
 
@@ -2000,15 +2000,15 @@ mod pinned_no_chat_tests {
     #[test]
     fn the_refusal_names_the_node_its_roles_and_the_way_out() {
         let msg = no_chat_refusal(
-            "robopi",
+            "node-pi",
             &[("ollama".into(), "harrier".into())],
             &[("ollama".into(), "embed".into())],
         );
-        assert!(msg.contains("node 'robopi' serves no chat"), "{msg}");
+        assert!(msg.contains("node 'node-pi' serves no chat"), "{msg}");
         assert!(msg.contains("ollama (harrier) for embed"), "{msg}");
         assert!(msg.contains("noo cluster status"), "{msg}");
         // Unknown role still reads as a sentence.
-        let msg = no_chat_refusal("aserve", &[("ollama".into(), "harrier".into())], &[]);
+        let msg = no_chat_refusal("node-b", &[("ollama".into(), "harrier".into())], &[]);
         assert!(msg.contains("for a non-chat role"), "{msg}");
     }
 
@@ -2028,8 +2028,8 @@ mod pinned_no_chat_tests {
 
     #[test]
     fn an_embed_only_node_is_still_a_pin() {
-        // `model: "robopi"` must route to the refusal, not fall through to the
-        // coordinator as if "robopi" were a model name.
+        // `model: "node-pi"` must route to the refusal, not fall through to the
+        // coordinator as if "node-pi" were a model name.
         assert!(NodeChat::NoChat("x".into()).is_node());
         assert!(NodeChat::Serves("a".into(), "b".into(), "c".into()).is_node());
         assert!(!NodeChat::Unknown.is_node());

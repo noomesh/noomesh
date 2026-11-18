@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// awolf, 2026-11-07: every resume of vLLM was followed 2m19s later by
+// node-a, 2026-11-07: every resume of vLLM was followed 2m19s later by
 // nvidia-smi timing out (vLLM's own weight load stalls it on WSL2), read as
 // a Windows program, and vLLM was paused again: a self-yield loop. A probe
 // timeout within NOO_GPU_TIMEOUT_GRACE_S of one of our GPU backends starting
@@ -53,7 +53,7 @@ func TestAResumeOpensTheGraceSoTheNodeDoesNotYieldToItself(t *testing.T) {
 	if r := c.Report(); r.State == StateYielded || len(d.starts) != 1 {
 		t.Fatalf("setup: want resumed: %+v starts=%v", r, d.starts)
 	}
-	// awolf's pattern: the probe stalls 2m19s after the resume, for minutes.
+	// node-a's pattern: the probe stalls 2m19s after the resume, for minutes.
 	p.r = pidReading(8000, 0)
 	tickFor(c, clk, 135*time.Second)
 	p.r = timedOut

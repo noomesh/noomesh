@@ -437,7 +437,7 @@ pub(crate) const HOST_TICKET_GRANT: &str = "host_ticket";
 /// site, so the Strict `noo_refresh` cookie rides along when a page served on
 /// another port of this host (an add-on's UI) POSTs here. A form-style POST
 /// needs no CORS preflight to take effect, so without this an add-on page
-/// could log the console out (2026-11-01 on pop-os: a logout with no console
+/// could log the console out (2026-11-01 on ctrl: a logout with no console
 /// request before it), rotate its refresh, or log the browser into another
 /// account (login CSRF, which plants a refresh cookie).
 ///
@@ -2394,20 +2394,20 @@ mod tests {
         assert!(session_origin_refusal(&h(&[("sec-fetch-site", "same-origin")])).is_ok());
         assert!(session_origin_refusal(&h(&[("sec-fetch-site", "none")])).is_ok(), "a navigation");
         for site in ["same-site", "cross-site", "Same-Site"] {
-            let e = session_origin_refusal(&h(&[("sec-fetch-site", site), ("origin", "https://pop-os.ts.net:8443")]))
+            let e = session_origin_refusal(&h(&[("sec-fetch-site", site), ("origin", "https://ctrl.ts.net:8443")]))
                 .expect_err(site);
             assert!(e.contains("console's own pages"), "{e}");
         }
         // An older browser: Origin must be this Host (default ports folded).
-        let host = "pop-os.ts.net";
-        assert!(session_origin_refusal(&h(&[("origin", "https://pop-os.ts.net"), ("host", host)])).is_ok());
-        assert!(session_origin_refusal(&h(&[("origin", "https://pop-os.ts.net:443"), ("host", host)])).is_ok());
-        assert!(session_origin_refusal(&h(&[("origin", "https://pop-os.ts.net"), ("host", "pop-os.ts.net:443")])).is_ok());
+        let host = "ctrl.ts.net";
+        assert!(session_origin_refusal(&h(&[("origin", "https://ctrl.ts.net"), ("host", host)])).is_ok());
+        assert!(session_origin_refusal(&h(&[("origin", "https://ctrl.ts.net:443"), ("host", host)])).is_ok());
+        assert!(session_origin_refusal(&h(&[("origin", "https://ctrl.ts.net"), ("host", "ctrl.ts.net:443")])).is_ok());
         assert!(session_origin_refusal(&h(&[("origin", "http://127.0.0.1:8080"), ("host", "127.0.0.1:8080")])).is_ok());
-        for bad in ["https://pop-os.ts.net:8443", "https://evil.example", "null", "file://x", "https://"] {
+        for bad in ["https://ctrl.ts.net:8443", "https://evil.example", "null", "file://x", "https://"] {
             assert!(session_origin_refusal(&h(&[("origin", bad), ("host", host)])).is_err(), "{bad}");
         }
-        assert!(session_origin_refusal(&h(&[("origin", "https://pop-os.ts.net")])).is_err(), "no Host: refuse");
+        assert!(session_origin_refusal(&h(&[("origin", "https://ctrl.ts.net")])).is_err(), "no Host: refuse");
         // Not a browser: unchanged.
         assert!(session_origin_refusal(&h(&[])).is_ok());
         assert!(session_origin_refusal(&h(&[("authorization", "Bearer x")])).is_ok());

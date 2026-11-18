@@ -92,7 +92,7 @@ async def _resolve_org_teams(store: Any, user_id: "str | None") -> "tuple[str | 
 # "what can you tell me about trading" arrived looking exactly like a
 # request, and the search is trigram similarity, so it ranks a question by
 # its WORDING ("tell me about ...") rather than its topic. gemma-4 12B on
-# mcmini answered that old question instead of the one asked (2026-10-16).
+# node-mac answered that old question instead of the one asked (2026-10-16).
 # Every line now says when it was said and by whom; the loop's own tool-call
 # records and the message being answered are dropped.
 MEMORY_OVERFETCH = 3

@@ -43,7 +43,7 @@ func itoa(n int) string {
 	return string(b)
 }
 
-// controllerRig: pop-os. The agent's chat backend noo-llamacpp is stopped or
+// controllerRig: ctrl. The agent's chat backend noo-llamacpp is stopped or
 // on CPU; the compose stack's GPU embedder noo-ollama-embed and an older
 // name-only noo-ollama hold the GPU.
 func controllerRig(probe Probe, cg map[int]string) (*Controller, *fakeDocker, *clock) {

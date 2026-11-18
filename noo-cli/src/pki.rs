@@ -3284,7 +3284,7 @@ mod key_mode_tests {
         assert!(dirs_again.is_empty(), "{dirs_again:?}");
     }
 
-    /// i277a, the pop-os shape: a third-party add-on's leaf
+    /// i277a, the ctrl shape: a third-party add-on's leaf
     /// (`services/<addon>/service.key`, no reader row) that an older
     /// install left 0644. The scan finds it, `fix-modes` makes it 0600, and
     /// the next scan is clean.
@@ -3381,7 +3381,7 @@ mod key_mode_tests {
     /// 0.6.12 moved the sandbox server off `nonroot` (65532) to its own uid
     /// (`SANDBOX_SERVER_UID`). An upgraded install's sandbox key still
     /// carries the OLD hand-over, `user:65532:r--` (what `setfacl -m` left on
-    /// pop-os). The fix pass the upgrade runs must hand it to the new uid
+    /// ctrl). The fix pass the upgrade runs must hand it to the new uid
     /// AND take it from the old one: an added entry beside the stale one
     /// leaves 65532 (redis, loki, the voice doors…) able to read the
     /// sandbox's key, audited as exposed on every pass forever.
