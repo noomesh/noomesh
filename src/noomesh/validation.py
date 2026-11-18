@@ -169,6 +169,10 @@ class ToolInputValidator:
         if not host:
             raise ValidationError("URL must include a host")
 
+        allowlist = [d.strip().lower() for d in os.getenv("NOO_EGRESS_ALLOWLIST", "").split(",") if d.strip()]
+        if allowlist and not any(host == d or host.endswith("." + d) for d in allowlist):
+            raise ValidationError(f"host '{host}' is not in the egress allow-list")
+
         # Never allow the obvious loopback name even before resolution.
         if host in ("localhost", "localhost.localdomain"):
             raise ValidationError("URL host resolves to a forbidden (loopback) address")
