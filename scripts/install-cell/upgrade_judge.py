@@ -2,7 +2,7 @@
 # Copyright 2026 PersonifAI LLC
 """The UPGRADE cell's resolver and judge (scripts/install-cell/upgrade.sh).
 
-    upgrade_judge.py resolve CLI_TAG PREV_OUT TARGET_OUT
+    upgrade_judge.py resolve OWNER/REPO CLI_TAG PREV_OUT TARGET_OUT
         The newest noo-cli-vX.Y.Z FINAL strictly below the release under test.
     upgrade_judge.py before VERIFY_JSON SELF
         The self node's rows that say what the box was before the roll.
@@ -22,8 +22,8 @@ import sys
 import urllib.request
 
 
-def resolve(tag, prev_out, target_out):
-    req = urllib.request.Request("https://api.github.com/repos/noomesh/noomesh/releases?per_page=100",
+def resolve(repo, tag, prev_out, target_out):
+    req = urllib.request.Request("https://api.github.com/repos/%s/releases?per_page=100" % repo,
                                  headers={"Accept": "application/vnd.github+json"})
     if os.environ.get("GH_TOKEN"):
         req.add_header("Authorization", "Bearer " + os.environ["GH_TOKEN"])
@@ -280,11 +280,11 @@ def judge():
 
 if __name__ == "__main__":
     a = sys.argv[1:]
-    if a[:1] == ["resolve"] and len(a) == 4:
+    if a[:1] == ["resolve"] and len(a) == 5:
         resolve(*a[1:])
     elif a[:1] == ["before"] and len(a) == 3:
         before(*a[1:])
     elif a[:1] == ["judge"]:
         sys.exit(judge())
     else:
-        sys.exit("usage: upgrade_judge.py resolve TAG PREV TARGET | before VERIFY SELF | judge")
+        sys.exit("usage: upgrade_judge.py resolve OWNER/REPO TAG PREV TARGET | before VERIFY SELF | judge")
