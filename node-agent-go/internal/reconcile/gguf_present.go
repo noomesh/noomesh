@@ -25,8 +25,10 @@ func effectiveModelsDir(t *tick) string {
 }
 
 // ggufPresent guards a start of a placed .gguf model: it reports whether the
-// file is in the effective models dir. A missing file is not started (the
-// container would crash-loop) and is a backend_start refusal that stands
+// file is in the effective models dir. A missing file that was quarantined
+// (#1303 moved it aside), or one missing from a controller-declared dir, is
+// not started (the container would crash-loop); a plain missing file on the
+// node's default dir goes on to the start, whose preseed fetches it and is a backend_start refusal that stands
 // while the file is missing: clearBackendStart re-records it, so neither a
 // container still running nor a later start that "succeeds" clears it. It is
 // dropped here once the file is back; the start that follows clears the
@@ -52,9 +54,17 @@ func (r *Reconciler) ggufPresent(ctx context.Context, t *tick, p placement) bool
 		delete(r.ggufMissing, p.Backend)
 		return true
 	}
+	aside := newestQuarantined(dir, p.Model)
+	if aside == "" && t.modelsDir == "" {
+		// The node's own default dir and nothing was quarantined: the start's
+		// preseed fetches a verified copy from the controller's store, as it
+		// always has (a first placement). Only a file #1303 moved aside, or
+		// one missing from a dir the controller declared, is refused here.
+		return true
+	}
 	fix := "noo cluster sync-model-files " + r.cfg.NodeID + " -m " + p.Model
 	reason := "model_missing: " + p.Model + " is not in " + dir + "; ship it: " + fix
-	if aside := newestQuarantined(dir, p.Model); aside != "" {
+	if aside != "" {
 		reason = "gguf_quarantined: " + p.Model + " was proven not to match the controller's record and moved aside to " +
 			aside + "; ship the verified file: " + fix
 	}

@@ -54,20 +54,23 @@ func ggufStartRefusals() map[string]string {
 
 var ggufPlacement = placement{Backend: "llamacpp", Model: ggufModel, DesiredState: "running"}
 
-func TestMissingGGUFOnDefaultModelsDirIsNotStartedAndRefused(t *testing.T) {
+func TestQuarantinedGGUFOnDefaultModelsDirIsNotStartedAndRefused(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("MODELS_DIR", dir)
+	touch(t, filepath.Join(dir, ggufModel+".quarantined-20261118T134753Z"))
 	present, asked := false, ""
 	r := ggufFixture(t, &present, &asked)
 	// No controller-declared models_dir: the node's own default is mounted.
 	tk := &tick{desired: &desiredConfig{}}
 	if r.ggufPresent(context.Background(), tk, ggufPlacement) {
-		t.Fatal("a missing gguf on the default models dir was let through to start")
+		t.Fatal("a quarantined gguf on the default models dir was let through to start")
 	}
 	if asked != dir {
 		t.Fatalf("checked dir %q, want the effective default %q", asked, dir)
 	}
-	want := "model_missing: m.gguf is not in " + dir + "; ship it: noo cluster sync-model-files node-a -m m.gguf"
+	want := "gguf_quarantined: m.gguf was proven not to match the controller's record and moved aside to " +
+		filepath.Join(dir, ggufModel+".quarantined-20261118T134753Z") +
+		"; ship the verified file: noo cluster sync-model-files node-a -m m.gguf"
 	if got := ggufStartRefusals()["llamacpp"]; got != want {
 		t.Fatalf("refusal = %q, want %q", got, want)
 	}
@@ -141,5 +144,22 @@ func TestGGUFPresentAgainStartsAndClearsTheRefusal(t *testing.T) {
 	r.clearBackendStart("llamacpp") // the start succeeded
 	if got, ok := ggufStartRefusals()["llamacpp"]; ok {
 		t.Fatalf("refusal still standing after the file returned and the start succeeded: %q", got)
+	}
+}
+
+// A plain missing gguf on the node's own default dir (a first placement,
+// nothing quarantined) goes on to the start, whose preseed fetches a verified
+// copy from the controller's store: no refusal, as before #1303's guard.
+func TestMissingGGUFOnDefaultModelsDirWithoutQuarantineGoesOnToPreseed(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("MODELS_DIR", dir)
+	present := false
+	r := ggufFixture(t, &present, nil)
+	tk := &tick{desired: &desiredConfig{}}
+	if !r.ggufPresent(context.Background(), tk, ggufPlacement) {
+		t.Fatal("a first placement on the default dir was refused before the preseed could fetch it")
+	}
+	if got := ggufStartRefusals()["llamacpp"]; got != "" {
+		t.Fatalf("refusal recorded for a fetchable first placement: %q", got)
 	}
 }

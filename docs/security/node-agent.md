@@ -933,7 +933,9 @@ at each start on a placed node and re-fetched on a mismatch; a file proven
 not to match whose re-fetch fails is moved aside (`<file>.quarantined-<time>`,
 never deleted) and the start is refused, naming the file and `noo cluster
 sync-model-files <node> -m <file>`; every later start is refused too (a
-missing gguf is never started, on any models dir), and verify's `backend
+quarantined gguf is never started, nor one missing from a models dir the
+controller declared; a first placement on the node's own default dir is
+still fetched by the start's preseed), and verify's `backend
 starts` row shows the refusal until the verified file is shipped (`noo
 cluster sync-model-files <node> -m <model>`); a container already running
 keeps running until its next start; with no manifest, or an unreachable
