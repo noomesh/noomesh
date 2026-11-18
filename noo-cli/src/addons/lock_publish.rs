@@ -536,7 +536,7 @@ pub fn publish(pusher: &Pusher, fetcher: &lock_fetch::Client, root: &str, plan: 
             .map_err(|e| err(PublishFailure::of_push(e.class), format!("{reference}: {}", e.summary())))?;
         let got = fetcher
             .fetch_via(&route, tag)
-            .map_err(|e| err(PublishFailure::ReadBack, format!("{reference} was pushed and does not read back: {}", e.summary())))?;
+            .map_err(|e| err(PublishFailure::of_push(e.class), format!("{reference} was pushed and does not read back: {}", e.summary())))?;
         read_back_matches(plan, &got)
             .map_err(|e| err(PublishFailure::ReadBack, format!("{reference} was pushed and reads back wrong: {e}")))?;
         let first = out.is_empty();
