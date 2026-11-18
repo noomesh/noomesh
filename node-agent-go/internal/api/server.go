@@ -28,6 +28,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/hardware"
 	"github.com/noomesh/noomesh/node-agent-go/internal/mcpsrv"
 	"github.com/noomesh/noomesh/node-agent-go/internal/metrics"
+	"github.com/noomesh/noomesh/node-agent-go/internal/stopdrain"
 )
 
 // quietTLSLogger suppresses noisy TLS handshake errors from localhost
@@ -48,6 +49,10 @@ func (q quietTLSLogger) Write(p []byte) (n int, err error) {
 
 // Server is the HTTP control API server.
 type Server struct {
+	// drain guards the inference routes during a stop (stopdrain); nil
+	// until the agent installs it, which serves every call as before.
+	drain atomic.Pointer[stopdrain.Gate]
+
 	cfg       *config.Config
 	docker    *dockerpkg.Client
 	gpu       *hardware.GPUDetector
@@ -369,14 +374,14 @@ func (s *Server) registerRoutes() {
 	harnessMW := func(h http.Handler) http.Handler {
 		return auth.OwnHarnessLeafOrToken(s.cfg)(auth.ControllerOrOwnHarness(s.cfg)(h))
 	}
-	s.mux.Handle("POST /v1/chat/completions", harnessMW(http.HandlerFunc(s.handleInferenceProxy)))
+	s.mux.Handle("POST /v1/chat/completions", harnessMW(s.drainGuard(http.HandlerFunc(s.handleInferenceProxy))))
 	// The harness learns its kind here (read-only). Same door as its chat
 	// route (own leaf, loopback, bearer optional), narrowed to the harness
 	// ALONE by ownHarnessOnly: the controller has the database and needs
 	// nothing from this.
 	s.mux.Handle("GET /harness/placement", harnessMW(ownHarnessOnly(http.HandlerFunc(s.handleHarnessPlacement))))
-	s.mux.Handle("POST /v1/completions", modelMW(http.HandlerFunc(s.handleInferenceProxy)))
-	s.mux.Handle("POST /v1/embeddings", ctrlMW(http.HandlerFunc(s.handleInferenceProxy)))
+	s.mux.Handle("POST /v1/completions", modelMW(s.drainGuard(http.HandlerFunc(s.handleInferenceProxy))))
+	s.mux.Handle("POST /v1/embeddings", ctrlMW(s.drainGuard(http.HandlerFunc(s.handleInferenceProxy))))
 	// A placed vLLM's /metrics for the gateway's collector (backend_metrics.go).
 	s.mux.Handle("GET /backend-metrics/{backend}", ctrlMW(http.HandlerFunc(s.handleBackendMetrics)))
 	// Whether a running ollama is reachable, by a read that loads nothing
@@ -504,4 +509,32 @@ func (s *Server) ListenAndServeWithTLS(tlsCfg *tls.Config) error {
 	}
 	slog.Info("control API starting with TLS", "addr", addr)
 	return server.ListenAndServeTLS("", "")
+}
+
+// SetDrain installs the stop drain on the inference routes (stopdrain).
+func (s *Server) SetDrain(g *stopdrain.Gate) { s.drain.Store(g) }
+
+// drainGuard routes an inference call through the stop drain once it is
+// installed. It sits INSIDE the auth middleware, so the caller's verified
+// principal is known when the gate decides whose marker counts.
+func (s *Server) drainGuard(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if g := s.drain.Load(); g != nil {
+			g.Wrap(h).ServeHTTP(w, r)
+			return
+		}
+		r.Header.Del(stopdrain.ResendHeader)
+		h.ServeHTTP(w, r)
+	})
+}
+
+// IsController says whether r is the verified controller: a controller leaf
+// on the mTLS control API, or a stream over this node's own tunnel. Only
+// its X-Noo-Resend marker counts (stopdrain).
+func IsController(r *http.Request) bool {
+	if auth.IsTunnelController(r) {
+		return true
+	}
+	p, ok := auth.FromContext(r.Context())
+	return ok && p.Identified && p.Controller
 }

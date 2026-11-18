@@ -48,6 +48,16 @@ var (
 		p["capabilities"] = r.caps
 	}}
 
+	// The previous stop's drain (stopdrain), once: what finished, what was
+	// cut and whether the bound was hit, for the roll's node report. Absent
+	// on every other beat.
+	secLastStop = payloadSection{name: "last_stop", add: func(r *Reporter, p map[string]any) {
+		if raw := r.pendingLastStop(); raw != nil {
+			p["last_stop"] = raw
+			r.lastStopSent = true
+		}
+	}}
+
 	secPosture = payloadSection{name: "posture", add: func(r *Reporter, p map[string]any) {
 		// Posture, on every beat and at registration: a running agent
 		// requires a client certificate on its control API, and `noo cluster
@@ -171,6 +181,7 @@ var heartbeatSections = []payloadSection{
 	secModelSets,
 	secOllamaVerify,
 	secNodeFacts,
+	secLastStop,
 }
 
 // Heartbeat-only sections.

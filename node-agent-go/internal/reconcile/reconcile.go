@@ -112,6 +112,9 @@ type desiredConfig struct {
 	// The controller's node reclaim policy (disk_watermark location). A
 	// pre-policy gateway omits it; nil means "do not act".
 	DiskReclaim *diskreclaim.Policy `json:"disk_reclaim"`
+	// What the controller understands from this agent (stopdrain): absent on
+	// an older gateway, which then never gets the node_restarting refusal.
+	GatewayFeatures []string `json:"gateway_features"`
 	// The node's resolved harness profile (tier default, override,
 	// measured). A pre-profile gateway omits it; absent means "no
 	// profile", which is exactly the behaviour before profiles existed.
@@ -151,6 +154,9 @@ type Reconciler struct {
 	// onReclaimPolicy receives desired-config's disk_reclaim on every
 	// successful fetch (nil when the gateway sends none).
 	onReclaimPolicy func(*diskreclaim.Policy)
+	// onGatewayFeatures receives desired-config's gateway_features on every
+	// pass (the stop drain's permission to refuse new calls).
+	onGatewayFeatures func([]string)
 	// mcp supervises the external MCP servers placed here. nil when the
 	// agent was built without one (tests); Apply is then skipped.
 	mcp *mcpsrv.Supervisor
@@ -322,6 +328,10 @@ func New(cfg *config.Config, docker *dockerpkg.Client, client *http.Client, harn
 // policy (diskreclaim.Reclaimer.SetPolicy).
 func (r *Reconciler) SetDiskReclaimSink(f func(*diskreclaim.Policy)) { r.onReclaimPolicy = f }
 
+// SetGatewayFeaturesSink installs the receiver for the controller's
+// gateway_features (stopdrain.Gate.SetFeatures).
+func (r *Reconciler) SetGatewayFeaturesSink(f func([]string)) { r.onGatewayFeatures = f }
+
 // MCP returns the external-MCP supervisor so the API server can route
 // tool calls (phase C) and /health can show what is live.
 func (r *Reconciler) MCP() *mcpsrv.Supervisor { return r.mcp }
@@ -484,6 +494,9 @@ func (r *Reconciler) publishProfileAndEmbedTarget(ctx context.Context, t *tick) 
 	// has a disk to keep.
 	if r.onReclaimPolicy != nil {
 		r.onReclaimPolicy(t.desired.DiskReclaim)
+	}
+	if r.onGatewayFeatures != nil {
+		r.onGatewayFeatures(t.desired.GatewayFeatures)
 	}
 	// Publish the embed target as soon as desired state is known - before any
 	// early return, so removing the last embed placement (or every placement)
