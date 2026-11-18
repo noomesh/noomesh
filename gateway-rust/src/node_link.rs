@@ -296,6 +296,11 @@ impl NodeLink {
 
     /// The credential this link presents for `url`, if any.
     fn credential(&self, url: &str) -> Option<(String, String)> {
+        // Never a credential over plaintext, nor for a link with no address
+        // (a for_base URL the agent_url rule refused leaves the base empty).
+        if !url.starts_with("https://") {
+            return None;
+        }
         match self.auth {
             Auth::Node => crate::node_agent_auth::header_for(url),
             Auth::SelfAgent => crate::node_agent_auth::header_for_self(url),
@@ -752,10 +757,17 @@ mod tests {
 
     #[test]
     fn a_plaintext_base_gets_no_address_and_no_credential() {
+        // With a node-agent token configured (as on a real controller), the
+        // https link carries it and the refused plaintext one carries nothing.
+        let _g = crate::node_agent_auth::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        crate::node_agent_auth::clear_for_test();
+        std::env::set_var("NOO_NODE_AGENT_TOKEN", "static-test-token");
         let l = NodeLink::for_base("http://10.0.0.9:8081");
         assert_eq!(l.base(), "", "a plaintext agent URL is never a base");
         assert!(l.auth_headers().is_empty(), "no credential for it");
-        assert_eq!(NodeLink::for_base("https://10.0.0.9:8081").base(), "https://10.0.0.9:8081");
+        let s = NodeLink::for_base("https://10.0.0.9:8081");
+        assert_eq!(s.base(), "https://10.0.0.9:8081");
+        assert!(!s.auth_headers().is_empty(), "the token is live: an https agent link carries it");
     }
 
     #[test]
