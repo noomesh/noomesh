@@ -1150,6 +1150,192 @@ harness_egress_remove() {
 }
 # END harness_egress
 
+# BEGIN agent_protect
+# The node agent's unit gets a filesystem hold (proposal 61 §7a):
+#   /etc/systemd/system/noo-node-agent.service.d/50-noomesh-protect.conf
+# ProtectSystem=strict, PrivateTmp=yes, ProtectHome=read-only, and one
+# ReadWritePaths= line per directory the agent measurably writes: its state
+# dir (staging and spool are fixed paths under /var/lib/noo-node-agent, so it
+# is listed even when NOO_AGENT_STATE moves the rest), NOO_AGENT_STATE, the
+# declared data roots, each NOO_HOST_ROOTS element, and exactly
+# /var/lib/docker/containers (the agent truncates container logs).
+#
+# The paths come from the STAGED agent-env, which signing.key signs, not the
+# release. So what is rendered from it stays config and never becomes root
+# code:
+#   * the directive names are fixed here; a value only ever fills a
+#     ReadWritePaths= path;
+#   * every value must be a normalised absolute path of [A-Za-z0-9._@+/-]
+#     (no whitespace, newline, CR, %, quote, backslash, `.`/`..` component,
+#     `//` or trailing `/`), and must not be, contain, or sit below a path
+#     the hold exists to protect (AP_DENY_TREES; /home only exactly), checked
+#     on the literal path and on where it resolves;
+#   * ONE bad value refuses the WHOLE drop-in: the installed one (or none) is
+#     left exactly as it was, one line names the KEY (never its value), and
+#     nothing is reloaded or restarted. A value is never rewritten into
+#     another.
+# A path that exists is listed bare; a missing one with `-` (systemd's
+# "ignore if missing": a bare missing path fails the unit's start).
+# /var/lib/docker/containers is always `-`. The order is fixed (state dir,
+# NOO_AGENT_STATE, AP_ROOT_KEYS in order, NOO_HOST_ROOTS in order, docker
+# logs), first occurrence wins, so an unchanged env renders unchanged bytes.
+# A change installs 0644 root:root, daemon-reloads, and sets need_restart:
+# the agent restarts once, at the end, through the agent-env block's path.
+# AGENT_DROPIN_DIR / AP_OWNER_ARGS / AP_STAT_OWNER are seams for the
+# unprivileged test (tests/test_agent_protect_apply.py), as HE_* are.
+AGENT_DROPIN_DIR="${AGENT_DROPIN_DIR:-/etc/systemd/system/noo-node-agent.service.d}"
+AGENT_DROPIN="$AGENT_DROPIN_DIR/50-noomesh-protect.conf"
+AP_OWNER_ARGS="${AP_OWNER_ARGS--o root -g root}"   # empty in tests (not root)
+AP_STAT_OWNER="${AP_STAT_OWNER-root:root}"
+AP_STATE_DIR=/var/lib/noo-node-agent
+AP_DOCKER_LOGS=/var/lib/docker/containers
+AP_ROOT_KEYS="NOO_DATA_ROOT MODELS_DIR HF_CACHE_DIR OLLAMA_DATA_DIR NOO_SKILLS_HOST_DIR"
+# NOO_HOST_ROOTS is split as the agent splits it: filepath.SplitList (':'
+# on Linux), empty elements skipped (node-agent-go/internal/docker/hostroots.go).
+AP_HOST_ROOTS_MAX=16
+# Denied as the path itself, anything below it, or anything above it (a
+# parent would cover it). /bin /sbin /lib* are /usr on a merged-/usr host.
+AP_DENY_TREES="/etc /usr /boot /root /var/lib/docker /bin /sbin /lib /lib32 /lib64 /libx32"
+# Denied as the path itself or anything above it; BELOW is allowed (a data
+# root under /home is a real layout, and ProtectHome needs it listed).
+AP_DENY_EXACT="/home"
+AP_CHANGED=0
+AP_BAD_KEY=""
+AP_PATHS=""
+
+# ap_env_value FILE KEY — KEY's value, read the way the agent-env block reads
+# its roots (last line wins).
+ap_env_value() {
+    grep -E "^$2=" "$1" | tail -1 | cut -d= -f2- || true
+}
+
+# ap_denied PATH — 0 when PATH is, contains or (for a tree) sits below a
+# protected path. The one exception under /var/lib/docker is exactly
+# $AP_DOCKER_LOGS.
+ap_denied() {
+    [ "$1" = / ] && return 0
+    for _ap_d in $AP_DENY_TREES; do
+        case "$_ap_d/" in "$1"/*) return 0 ;; esac
+        case "$1" in "$_ap_d"/*) [ "$1" = "$AP_DOCKER_LOGS" ] || return 0 ;; esac
+    done
+    for _ap_d in $AP_DENY_EXACT; do
+        case "$_ap_d/" in "$1"/*) return 0 ;; esac
+    done
+    return 1
+}
+
+# ap_path_ok PATH — the shape rule, then the deny list on the literal path
+# and on the path it resolves to.
+ap_path_ok() {
+    case "$1" in /?*) ;; *) return 1 ;; esac
+    case "$1" in *[!A-Za-z0-9._@+/-]*) return 1 ;; esac
+    case "$1" in *//*|*/./*|*/../*|*/.|*/..|*/) return 1 ;; esac
+    ap_denied "$1" && return 1
+    _ap_real="$(realpath -m -- "$1" 2>/dev/null)" || return 1
+    [ -n "$_ap_real" ] || return 1
+    ap_denied "$_ap_real" && return 1
+    return 0
+}
+
+# ap_add KEY PATH — validate and append (first occurrence wins); on a bad
+# value set AP_BAD_KEY and fail.
+ap_add() {
+    ap_path_ok "$2" || { AP_BAD_KEY="$1"; return 1; }
+    case "
+$AP_PATHS
+" in *"
+$2
+"*) return 0 ;; esac
+    AP_PATHS="${AP_PATHS:+$AP_PATHS
+}$2"
+}
+
+# ap_collect ENV — every path the agent writes, or fail naming the first bad key.
+ap_collect() {
+    AP_PATHS=""; AP_BAD_KEY=""
+    ap_add AP_STATE_DIR "$AP_STATE_DIR" || return 1
+    _ap_v="$(ap_env_value "$1" NOO_AGENT_STATE)"
+    [ -z "$_ap_v" ] || ap_add NOO_AGENT_STATE "$_ap_v" || return 1
+    for _ap_k in $AP_ROOT_KEYS; do
+        _ap_v="$(ap_env_value "$1" "$_ap_k")"
+        [ -z "$_ap_v" ] || ap_add "$_ap_k" "$_ap_v" || return 1
+    done
+    _ap_rest="$(ap_env_value "$1" NOO_HOST_ROOTS)"
+    _ap_n=0
+    while [ -n "$_ap_rest" ]; do
+        case "$_ap_rest" in
+            *:*) _ap_e="${_ap_rest%%:*}"; _ap_rest="${_ap_rest#*:}" ;;
+            *)   _ap_e="$_ap_rest"; _ap_rest="" ;;
+        esac
+        [ -n "$_ap_e" ] || continue
+        _ap_n=$((_ap_n + 1))
+        [ "$_ap_n" -le "$AP_HOST_ROOTS_MAX" ] || { AP_BAD_KEY=NOO_HOST_ROOTS; return 1; }
+        ap_add NOO_HOST_ROOTS "$_ap_e" || return 1
+    done
+    ap_add AP_DOCKER_LOGS "$AP_DOCKER_LOGS" || return 1
+    return 0
+}
+
+# ap_render — the drop-in from AP_PATHS: fixed lines, then one
+# ReadWritePaths= per path.
+ap_render() {
+    printf '%s\n' "# Rendered by noo-apply from the agent env: the node agent writes only where it must." \
+        "[Service]" "ProtectSystem=strict" "PrivateTmp=yes" "ProtectHome=read-only"
+    while IFS= read -r _ap_p; do
+        [ -n "$_ap_p" ] || continue
+        if [ "$_ap_p" = "$AP_DOCKER_LOGS" ] || [ ! -e "$_ap_p" ]; then
+            printf 'ReadWritePaths=-%s\n' "$_ap_p"
+        else
+            printf 'ReadWritePaths=%s\n' "$_ap_p"
+        fi
+    done <<AP_EOF
+$AP_PATHS
+AP_EOF
+}
+
+# ap_same INSTALLED CANDIDATE — bytes, mode 644 and owner (config_unchanged).
+ap_same() {
+    if [ -n "$AP_STAT_OWNER" ]; then
+        config_unchanged "$2" "$1" 644 "$AP_STAT_OWNER"
+    else
+        [ -f "$1" ] && cmp -s "$2" "$1"
+    fi
+}
+
+# agent_protect_apply ENV — render from the staged agent-env; on a change,
+# install, daemon-reload and ask for the agent restart (need_restart).
+agent_protect_apply() {
+    AP_CHANGED=0
+    if ! ap_collect "$1"; then
+        echo "noo-apply: agent-protect: REFUSED — $AP_BAD_KEY is not a path the agent may be allowed to write; the drop-in is left as it was" >&2
+        applied="$applied agent-protect=REFUSED:$AP_BAD_KEY"
+        return 0
+    fi
+    _ap_tmp="$(mktemp)"
+    ap_render > "$_ap_tmp"
+    if ap_same "$AGENT_DROPIN" "$_ap_tmp"; then
+        rm -f -- "$_ap_tmp"
+        return 0
+    fi
+    # shellcheck disable=SC2086
+    install -d -m 755 $AP_OWNER_ARGS "$AGENT_DROPIN_DIR"
+    # shellcheck disable=SC2086
+    install -m 644 $AP_OWNER_ARGS "$_ap_tmp" "$AGENT_DROPIN"
+    rm -f -- "$_ap_tmp"
+    AP_CHANGED=1
+    systemctl daemon-reload 2>/dev/null || true
+    need_restart=1
+    applied="$applied agent-protect"
+}
+
+# agent_protect_remove — teardown: the drop-in, and its directory if empty.
+agent_protect_remove() {
+    rm -f -- "${AGENT_DROPIN:?}"
+    rmdir -- "${AGENT_DROPIN_DIR:?}" 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+}
+# END agent_protect
+
 # ── teardown — the graceful, controller-initiated node destroy ─────────────
 # A signed `teardown` kind means "return this node to never-met-the-fleet".
 # It runs the local de-enroll — but that script deletes noo-apply itself,
@@ -1179,6 +1365,7 @@ if [ -f "$WORK/files/teardown" ]; then
         echo "noo-apply: teardown requested but $DEENROLL is not installed" >&2
         exit 69
     fi
+    agent_protect_remove
     harness_egress_remove
     logger -t noo-apply "teardown authorized (node=$have) — dismantling in 5s, detached" 2>/dev/null || true
     echo "applied: teardown ($have) — node will dismantle itself in ~5s"
@@ -1858,6 +2045,9 @@ if [ -f "$WORK/files/agent-env" ]; then
     hf_hub_reown "$(grep -E '^NOO_DATA_ROOT=' "$WORK/files/agent-env" | tail -1 | cut -d= -f2-)" \
         "$(grep -E '^HF_CACHE_DIR=' "$WORK/files/agent-env" | tail -1 | cut -d= -f2-)"
     applied="$applied $ae_state"
+    # The agent's filesystem hold, from the same staged env (agent_protect).
+    # A change sets need_restart: the one agent restart at the end.
+    agent_protect_apply "$WORK/files/agent-env"
 fi
 
 # nats-creds — the node's OWN NATS credential. Applied AFTER
