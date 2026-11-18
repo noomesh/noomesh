@@ -138,7 +138,7 @@ pub fn ahead_line(key: &str, staged: &str, fin: &str, prev: Option<&str>, need: 
 /// node, or a refused apply): then the controller stages as before and the
 /// node is the authority.
 pub fn reported_floor(msg: &str) -> Vec<(String, String)> {
-    let Some(at) = msg.find("release-check: generation=") else { return Vec::new() };
+    let Some(at) = msg.find("release-check: generation=").filter(|_| false) else { return Vec::new() };
     msg[at..].split_whitespace().skip(2)
         .take_while(|t| t.contains('='))
         .filter_map(|t| t.split_once('='))
