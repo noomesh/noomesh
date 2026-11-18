@@ -24,7 +24,7 @@ ROLL_OK = """\
 + runner-a: bundle staged, applied
 """
 STACK_OK = """\
-  installing noo-netns-restore.service: staged to the self-node runner-a, whose applier installs it (no sudo)
+> Installing noo-netns-restore.service: staged to the self-node runner-a, whose applier installs it (no sudo)
 + noo-netns-restore.service installed and enabled by the self-node's applier
 """
 JOURNAL_OK = "Nov 18 noo-fetch[1]: noo-apply: applier-only bundle: this applier is already installed (sha256 ab12), nothing to install\nNov 18 noo-apply[1]: release-check: generation=2 release=none release-prev=none\nNov 18 noo-apply[1]: applied: agent-env agent-protect=6\n"
@@ -48,26 +48,27 @@ GOOD_CTL = [
 
 def cell(tmp, roll=ROLL_OK, stack=STACK_OK, journal=JOURNAL_OK, roll_rc="0", self_rows=None, ctl_rows=None,
          chat="ok\n", chat_rc=0, unit=True, sudo_journal="", unit_user=None, stack_journal=None, exec_start=None):
-    out, j = tmp / "out", tmp / "out" / "judge"
+    out, j, jr = tmp / "out", tmp / "out" / "judge", tmp / "raw"
     (out / "logs").mkdir(parents=True)
     j.mkdir()
+    jr.mkdir()  # raw journals: outside the uploaded dir, as upgrade.sh keeps them
     if roll is not None:
         (out / "logs" / "upgrade-all.log").write_text(roll)
         (j / "roll.rc").write_text(roll_rc)
     if stack is not None:
         (out / "logs" / "upgrade-stack-same-tag.log").write_text(stack)
     (j / "target").write_text("noo-cli-v0.6.27-rc.9")
-    (j / "apply.journal").write_text(journal if stack_journal is None else journal + stack_journal)
-    (j / "roll-window.journal").write_text(journal)
-    (j / "node.journal").write_text("")
-    (j / "sudo-stack.journal").write_text(sudo_journal)
+    (jr / "apply.journal").write_text(journal if stack_journal is None else journal + stack_journal)
+    (jr / "roll-window.journal").write_text(journal)
+    (jr / "node.journal").write_text("")
+    (jr / "sudo-stack.journal").write_text(sudo_journal)
     v = verify(GOOD_SELF if self_rows is None else self_rows, GOOD_CTL if ctl_rows is None else ctl_rows)
     (j / "verify-after.json").write_text(v)
     (j / "verify-final.json").write_text(v)
     (out / "logs" / "chat-after.log").write_text(chat)
     (out / "steps.jsonl").write_text(json.dumps({"step": "chat-after", "rc": chat_rc}) + "\n")
     me = subprocess.run(["id", "-un"], capture_output=True, text=True).stdout.strip()
-    env = dict(os.environ, OUT=str(out), J=str(j), SELF=SELF, NETNS_UNIT_ENABLED="enabled",
+    env = dict(os.environ, OUT=str(out), J=str(j), JR=str(jr), SELF=SELF, NETNS_UNIT_ENABLED="enabled",
                NETNS_UNIT_OWNER="%d:%d" % (os.getuid(), os.getgid()))
     u = tmp / "noo-netns-restore.service"
     if unit:

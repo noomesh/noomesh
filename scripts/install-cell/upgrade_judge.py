@@ -90,6 +90,8 @@ def text(path):
 
 def judge():
     out, j, me = os.environ["OUT"], os.environ["J"], os.environ["SELF"]
+    # raw journals live outside the uploaded dir (upgrade.sh JR)
+    jr = os.environ.get("JR", j)
     lines, failed = [], False
 
     def say(aid, verdict, why):
@@ -100,9 +102,9 @@ def judge():
     roll = text(os.path.join(out, "logs", "upgrade-all.log"))
     stack = text(os.path.join(out, "logs", "upgrade-stack-same-tag.log"))
     # the whole roll (--all and the same-tag --stack): A3, where a refusal anywhere counts
-    journal = (text(os.path.join(j, "apply.journal")) or "") + (text(os.path.join(j, "node.journal")) or "")
+    journal = (text(os.path.join(jr, "apply.journal")) or "") + (text(os.path.join(jr, "node.journal")) or "")
     # the --all window only (captured before the --stack ran): A2
-    roll_journal = text(os.path.join(j, "roll-window.journal")) or ""
+    roll_journal = text(os.path.join(jr, "roll-window.journal")) or ""
     after = load(os.path.join(j, "verify-after.json"))
     final = load(os.path.join(j, "verify-final.json"))
     roll_rc = (text(os.path.join(j, "roll.rc")) or "").strip()
@@ -219,7 +221,9 @@ def judge():
     else:
         s1 = "installing noo-netns-restore.service: staged to the self-node"
         s2 = "noo-netns-restore.service installed and enabled by the self-node's applier"
-        a, b = [l.strip() for l in stack.splitlines() if s1 in l and "whose applier installs it (no sudo)" in l], s2 in stack
+        # the CLI sentence-cases its status lines ("Installing …"): match without case
+        low = stack.lower()
+        a, b = [l.strip() for l in stack.splitlines() if s1.lower() in l.lower() and "whose applier installs it (no sudo)" in l], s2.lower() in low
         if a and b:
             say("B1", "PASS", a[0] + " + " + s2)
         else:
@@ -252,7 +256,7 @@ def judge():
         except OSError as e:
             say("B2", "FAIL", "%s: %s" % (unit, e.strerror))
 
-        sj = text(os.path.join(j, "sudo-stack.journal")) or ""
+        sj = text(os.path.join(jr, "sudo-stack.journal")) or ""
         cmds = [l.strip() for l in sj.splitlines() if "COMMAND=" in l]
         say("B3", "FAIL" if cmds else "PASS",
             ("%d sudo command(s) during the --stack: %s" % (len(cmds), cmds[0])) if cmds
