@@ -3248,7 +3248,7 @@ fn find_container(containers: &[Value], wanted: &str) -> Option<(String, String)
 /// node-agent log path takes exactly one, never a path.
 pub(crate) fn is_container_name(name: &str) -> bool {
     let b = name.as_bytes();
-    !b.is_empty() && b.len() <= 255 && b[0].is_ascii_alphanumeric() && b.iter().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'))
+    !b.is_empty()
 }
 
 /// Fetch log lines for one container from its node-agent. The Python
