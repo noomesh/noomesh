@@ -746,7 +746,21 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 			return
 		}
 		curModel, isRunning := t.running[p.Backend]
-		desiredHash := specHash(p)
+		desiredHash, hashKnown := specHashWith(p, func(ref string) (string, bool) { return dockerpkg.ContentKey(ctx, ref) })
+		if !hashKnown {
+			if isRunning && modelname.Matches(curModel, p.Model) {
+				// An image's content key could not be learned (the
+				// controller's manifest route did not answer): no drift
+				// decision on a guess. The running backend stays; the next
+				// tick asks again.
+				slog.Info("reconcile.spec_hash_unknown", "backend", p.Backend,
+					"detail", "an image's content digest could not be asked of the controller; leaving the running backend")
+				return
+			}
+			// Not running: start it, stamped with the offline key (a later
+			// tick that learns the digest recreates it at most once).
+			desiredHash = specHash(p)
+		}
 		// Converged when running with the placement's model (compare
 		// basenames — detection may report a bare filename) AND the
 		// stamped spec hash matches the desired one.
@@ -1313,11 +1327,40 @@ var volatileEnvKeys = map[string]bool{
 // port/tls edit that the model-name check alone misses) and the container must
 // be recreated. MUST be deterministic across ticks for an unchanged placement.
 func specHash(p placement) string {
+	sum, _ := specHashWith(p, offlineContentKey)
+	return sum
+}
+
+// contentKeyFn is an image ref's content identity for the hash, and whether
+// it is known (dockerpkg.ContentKey in production).
+type contentKeyFn func(ref string) (string, bool)
+
+// offlineContentKey keys a digest-pinned ref by repo@digest and any other
+// ref by itself: ContentKey without the controller lookup.
+func offlineContentKey(ref string) (string, bool) {
+	if strings.Contains(ref, "@sha256:") {
+		return dockerpkg.ContentKey(context.Background(), ref)
+	}
+	return ref, true
+}
+
+// specHashWith is specHash with each image keyed by its CONTENT (proposal
+// i935): a digest-pinned ref by repo@digest, a tag-only one by the
+// controller manifest's lock digest when the controller vouches one. A roll
+// that only re-tags an image then changes no hash and recreates nothing
+// (the 0.6.26 roll recreated aserve's and robopi's Ollama twice each for
+// identical digests). known=false: a key could not be learned this tick;
+// the caller makes no drift decision on it.
+func specHashWith(p placement, key contentKeyFn) (string, bool) {
 	h := sha256.New()
 	// Field-tagged, newline-delimited canonical form — tags prevent a value
 	// from one field colliding with another (e.g. model="a\nimage=b").
 	fmt.Fprintf(h, "model=%s\n", p.Model)
-	fmt.Fprintf(h, "image=%s\n", p.Image)
+	img, ok := key(p.Image)
+	if !ok {
+		return "", false
+	}
+	fmt.Fprintf(h, "image=%s\n", img)
 	fmt.Fprintf(h, "port=%d\n", p.Port)
 	fmt.Fprintf(h, "tls=%t\n", p.TLS)
 	// The DOOR the agent creates a backend with is part of its spec: a
@@ -1352,11 +1395,19 @@ func specHash(p placement) string {
 	// release pin, and a backend on an upstream image, keep their hash.
 	if p.Image == "" {
 		if img := dockerpkg.ReleaseBackendImage(p.Backend); img != "" {
-			fmt.Fprintf(h, "releaseimage=%s\n", img)
+			k, ok := key(img)
+			if !ok {
+				return "", false
+			}
+			fmt.Fprintf(h, "releaseimage=%s\n", k)
 		}
 	}
 	if img := dockerpkg.ReleaseSidecarImage(p.Backend); img != "" {
-		fmt.Fprintf(h, "sidecarimage=%s\n", img)
+		k, ok := key(img)
+		if !ok {
+			return "", false
+		}
+		fmt.Fprintf(h, "sidecarimage=%s\n", k)
 	}
 	// Likewise the derived memory limit: a new limit needs a new container.
 	if p.MemoryLimitBytes > 0 {
@@ -1374,7 +1425,7 @@ func specHash(p placement) string {
 	for _, k := range keys {
 		fmt.Fprintf(h, "env.%s=%s\n", k, p.Env[k])
 	}
-	return hex.EncodeToString(h.Sum(nil))
+	return hex.EncodeToString(h.Sum(nil)), true
 }
 
 // driftDecision is what to do for a running backend whose model already
