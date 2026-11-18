@@ -1572,10 +1572,19 @@ The fleet signing key (`signing.key` on the controller) decides what a node
 *applies*: certs, env, units, which backends to run. Since applier generation
 2 (noomesh 0.6.27) it no longer decides what **root code** a node runs. A
 node installs a root-run file only if its sha256 is in a list the **release
-key** signed. That key's seed lives in the release pipeline and an offline
-operator copy, never on a controller. So whoever holds `signing.key`, or the
-controller's operator account, can install only code that a published release
-or rc ships.
+key** signed. That key's seed is held by the release maintainers (the
+release pipeline's secret store and their own build machine), never by a
+controller. So through the rail, meaning any bundle a controller stages,
+whoever holds `signing.key` or the controller's operator account can install
+only root code that a published release or rc ships.
+
+Two root installs do not go through the rail and are not covered by this
+check. Both need the operator at the machine:
+- **The self node's first install inside `noo onboard`.** It installs
+  `noo-hostd` with sudo on the controller itself, checked against the CLI's
+  own signed manifest rather than the applier's release check. It also
+  reuses a `/usr/local/bin/noo-hostd` that is already there.
+- **Vendor CLIs** (below).
 
 | Root-run kind | Must be listed in | Under |
 |---|---|---|
