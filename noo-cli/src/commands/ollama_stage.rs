@@ -607,7 +607,7 @@ pub(crate) fn record_after_pull(
     if !missing.is_empty() || !foreign.is_empty() {
         let mut why = Vec::new();
         if !missing.is_empty() { why.push(format!("the registry names {} it lacks", missing.join(", "))); }
-        if !foreign.is_empty() { why.push(format!("it adds {}", foreign.join(", "))); }
+        if !foreign.is_empty() { why.push("it adds an entry".to_string()); }
         return PullRecord::Differs(why.join("; "));
     }
     let fetched = format!("sha256:{}", hex::encode(Sha256::digest(&p.raw)));
