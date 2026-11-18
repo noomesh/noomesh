@@ -460,6 +460,9 @@ standard input), else `GH_TOKEN` / `GITHUB_TOKEN`, and is never printed.
 
 ## Command reference
 
+The `noo security at-rest` commands are opt-in and not yet validated on real
+hardware (decision 2026-10-26).
+
 <!-- BEGIN GENERATED: cli-reference section="Security" — do not edit; regenerate with scripts/gen-cli-docs.py -->
 ### `noo security` — Users, secrets, PKI, scanning, CA trust
 | Command | Arguments | What it does |
@@ -505,7 +508,7 @@ standard input), else `GH_TOKEN` / `GITHUB_TOKEN`, and is never printed.
 | `noo security tailnet policy` | `[--merge \| --push] [--yes]` | Compare live tailnet policy to declared; --merge adds what is missing, --push replaces |
 | `noo security audit verify` | — | Verify audit hashes, the chain, and its head against the exported head (operator-only) |
 | `noo security audit list` | `[--since <30m\|24h\|7d\|time>] [--event <type>] [--actor <name>] [-n\|--limit <n>] [--cursor <c>]` | List security audit rows, newest first, with source address (operator-only) |
-| `noo security at-rest status` | `[--json]` | Show TPM facts, how to enable one, and your recorded at-rest encryption decision. All `at-rest` commands: opt-in, not yet validated on real hardware (decision 2026-10-26) |
+| `noo security at-rest status` | `[--json]` | Show TPM facts, how to enable one, and your recorded at-rest encryption decision |
 | `noo security at-rest opt-out` | — | Record that you accept unencrypted data at rest (audited; needs your own login) |
 | `noo security at-rest opt-in` | — | Withdraw the at-rest opt-out (audited; needs your own login) |
 | `noo security at-rest create-volume` | `[--size <GiB>] [--pcrs 7\|none\|auto] [--defer-recovery-key] [--dry-run]` | Create the TPM-unlocked encrypted state volume; shows its recovery key once |
