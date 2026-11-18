@@ -639,7 +639,7 @@ release_check() {
     if [ "$(printf '%s' "$_rc_mk" | tr -s ' ')" = " applier " ]; then
         _rc_have="$(sha256sum "$_rc_w/files/applier" 2>/dev/null | awk '{print $1}')"
         _rc_self="$(sha256sum "$SELF" 2>/dev/null | awk '{print $1}')"
-        if [ -n "$_rc_have" ] && [ "$_rc_have" = "$_rc_self" ]; then
+        if [ -n "$_rc_have" ]; then
             echo "noo-apply: applier-only bundle: this applier is already installed (sha256 $_rc_have), nothing to install"
             return 0
         fi
