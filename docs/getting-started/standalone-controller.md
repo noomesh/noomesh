@@ -31,7 +31,7 @@ that one. `--standalone` is the explicit override either way.
 ```bash
 # the release installer (install.md §1):
 curl -fsSL https://github.com/noomesh/noomesh/releases/download/<noo-cli-tag>/install.sh -o install.sh && sh install.sh
-noo onboard --standalone                     # the control plane, monitoring included
+noo onboard --standalone                     # the control plane, lean monitoring by default
 ```
 
 `--bundle` applies whenever onboarding ends up standalone, whether that's
@@ -59,8 +59,8 @@ sensitive is embedded. From there the eleven wizard steps run unchanged.
 The `standalone` compose profile: `gateway`, `worker`, `trellion`,
 `sandbox`, `postgres`, `redis`, `nats`, `model-cache`, `ollama-embed`
 (the embedding server the knowledge routes use on a standalone box) and
-the monitoring set — `loki`, `tempo`, `prometheus`, `alertmanager`, `grafana`, `node-exporter` and, on a GPU
-host, `nvidia-exporter` — **not** `node-agent`: the agent runs as a host
+the monitoring set — `prometheus`, `alertmanager`, `node-exporter` and, on a GPU
+host, `nvidia-exporter`; `loki`, `tempo` and `grafana` only if you said yes to them in the wizard — **not** `node-agent`: the agent runs as a host
 process installed by the pull rail (`noo enroll` + `noo cluster
 provision`), not a compose service. That is the `controller` profile with
 the local embedder in place of the containerised agent, and it is enough
@@ -134,7 +134,7 @@ noo cluster status
 `provision` resolves everything from the node's enrollment record, issues
 its certificate, renders the agent env, extracts the arch-matched agent
 binary from the released node-agent image, signs the bundle with the
-cluster CA, encrypts it to the node's birth certificate and stages it at
+fleet signing key, encrypts it to the node's birth certificate and stages it at
 the gateway. The node's fetch timer pulls and applies it — the controller
 never opens a connection to the node, so nodes behind NAT work. Re-run
 `provision` to re-provision. A node that predates the pull rail (no birth
@@ -145,7 +145,7 @@ retired.
 
 Two controllers can share one tailnet. Mesh isolation does not come from
 the tailnet; it comes from each controller's **CA**: a node's trust anchor
-lands at birth and the node refuses bundles signed by any other CA.
+lands at birth and the node refuses any bundle not signed by the signing key it holds.
 
 - Give the second controller its own tailnet hostname (the wizard asks;
   the default `noo-controller` would collide and be auto-suffixed).

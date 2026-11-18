@@ -36,8 +36,8 @@ signs noo-apply bundles. No new key is designed.
   `PKCS_ECDSA_P384_SHA384` (`noo-cli/src/pki.rs:232`; the comment at
   `noo-cli/src/pki.rs:283` says the same: "the CA and fleet signing keys are
   P-384"). Signatures are made with `openssl dgst -sha256 -sign`
-  (`scripts/sign-bundle.sh:85`) and checked with `openssl dgst -sha256 -verify`
-  (`scripts/noo-apply.sh:181`), so the signature is **ECDSA over the SHA-256
+  (`scripts/sign-bundle.sh`, the `openssl dgst -sha256 -sign` line) and checked with `openssl dgst -sha256 -verify`
+  (`bundle_signature_lane` in `scripts/noo-apply.sh`), so the signature is **ECDSA over the SHA-256
   digest, DER (ASN.1) encoded**. In Go that is
   `ecdsa.VerifyASN1(pub, sha256.Sum256(bytes), sig)`.
 - **The signature is detached**: a file `model-set.json.sig` beside the
@@ -48,9 +48,9 @@ signs noo-apply bundles. No new key is designed.
   (`noo-cli/src/pki.rs:190` and `:197`).
 - **Where a node keeps the public half.** The `signing-pub` bundle kind is
   installed as `signing.pub` in the node's PKI directory,
-  `/etc/noo/pki/signing.pub` (`scripts/noo-apply.sh:64` for the directory,
-  `:173` where the verifier reads it, `:833` where the bundle installs it,
-  mode 644, `root:noo-agent`). A node that holds no `signing.pub` cannot verify
+  `/etc/noo/pki/signing.pub` (`scripts/noo-apply.sh`: `PKI=/etc/noo/pki` for the directory,
+  `bundle_signature_lane` where the verifier reads it, the `signing-pub` step
+  where the bundle installs it, mode 644, `root:noo-agent`). A node that holds no `signing.pub` cannot verify
   a set and reports `set_unverified`. Key rotation is the existing
   `noo security pki rotate-signing-key` path; a set signed under a retired key
   is re-signed by the controller, and the node accepts any key it retains.
