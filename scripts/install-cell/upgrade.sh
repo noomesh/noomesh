@@ -58,13 +58,17 @@ PY
 # ── 1. the previous final, from the releases API ────────────────────────────
 # The newest noo-cli-vX.Y.Z FINAL (no prerelease) strictly below the release
 # under test's X.Y.Z. CLI_TAG=latest: the newest final, and the one before.
-step resolve-previous 60 -- python3 "$HERE/upgrade_judge.py" resolve "$CLI_TAG" "$J/prev" "$J/target" || finish
+# The repo is the one the README's install line downloads from (never typed
+# here: the release repo has one declared home).
+README="$HERE/../../README.md"
+LINE="$(grep -m1 -E '^[^#]*releases/latest/download/install\.sh' "$README" 2>/dev/null)"
+REPO="$(printf '%s' "$LINE" | sed -nE 's#.*github\.com/([^/]+/[^/]+)/releases/.*#\1#p')"
+[ -n "$REPO" ] || { step resolve-previous 10 -- sh -c 'echo "upgrade-cell: no install line naming a github repo in README.md"; exit 1'; finish; }
+step resolve-previous 60 -- python3 "$HERE/upgrade_judge.py" resolve "$REPO" "$CLI_TAG" "$J/prev" "$J/target" || finish
 PREV="$(cat "$J/prev")"; TARGET="$(cat "$J/target")"
 meta upgrade "$PREV -> $TARGET"
 
 # ── 2. install the previous final the README's way, onboard ─────────────────
-README="$HERE/../../README.md"
-LINE="$(grep -m1 -E '^[^#]*releases/latest/download/install\.sh' "$README" 2>/dev/null)"
 [ -n "$LINE" ] || { step install 10 -- sh -c 'echo "upgrade-cell: no install line in README.md"; exit 1'; finish; }
 LINE="$(printf '%s' "$LINE" | sed "s#releases/latest/download/#releases/download/$PREV/#")"
 export NOO_CLI_VERSION="$PREV"
