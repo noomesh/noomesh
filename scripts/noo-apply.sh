@@ -1802,7 +1802,7 @@ nu_user_ok() {
     case "$NU_USER" in ''|-*|.*|*[!A-Za-z0-9._-]*) NU_BAD=user; return 1 ;; esac
     [ "${#NU_USER}" -le 32 ] || { NU_BAD=user; return 1; }
     _nu_uid="$(id -u "$NU_USER" 2>/dev/null)" || { NU_BAD=user; return 1; }
-    case "$_nu_uid" in ''|*[!0-9]*|0) NU_BAD=user; return 1 ;; esac
+    case "$_nu_uid" in ''|*[!0-9]*) NU_BAD=user; return 1 ;; esac
     return 0
 }
 
