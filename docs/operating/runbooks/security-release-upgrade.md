@@ -1030,7 +1030,7 @@ ref too, so the bare command means what it looks like.
 And the preseed no longer asks for a helper at all. Copying a file needs no
 container: the agent binary already carries the preseed code, so the HF
 snapshot mirror and the verified GGUF fetch run **in the agent process**
-against the host path, over the same `:8083` rail with the same manifest
+against the host path, over mTLS to `https://<controller>:8443` with the same manifest
 digest check. The helper rail above still matters — the remaining host
 operations (creating the models dir, probing host files) genuinely need root
 inside a container — but a node that never runs those can preseed weights

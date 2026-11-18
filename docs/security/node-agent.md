@@ -899,7 +899,7 @@ node a URL to dial instead.
 
 A GGUF preseed from the controller's weight cache proceeds only when the
 controller's artifact manifest states a `sha256` for those bytes, which the
-helper verifies while streaming. A missing manifest **refuses the preseed**;
+agent process verifies while streaming (no helper container). A missing manifest **refuses the preseed**;
 it does not copy the bytes unverified. The manifest route hashes the same
 directory the cache serves, so a missing manifest means the cache does not
 hold the file either.
@@ -916,10 +916,15 @@ declared data roots (the data root, the HF cache, the models dir, the Ollama
 store) and their first-level directories from the heartbeat, and WARNs on
 any that is writable by others without the sticky bit. The WARN names each
 path, its mode and owner, the exact `sudo chmod o-w <path>`, and what that
-store's loads are protected by: HF weights are re-verified against the
-controller's manifest on load; GGUF files are re-verified at start when the
-controller has a manifest for them; Ollama models are re-verified against the
-controller when it holds a record of them (see below), a hand pull is not.
+store's loads are protected by: HF weights are verified against the
+controller's manifest at each backend start on a placed node (an unverifiable
+snapshot refuses the start; a running container is not re-hashed; an unplaced
+node is not checked); GGUF files are hashed against the controller's manifest
+at each start on a placed node and re-fetched on a mismatch (with no manifest,
+or a failed fetch, the agent logs a WARN and llama.cpp still loads the local
+file); Ollama models are checked about every 10 minutes and at backend start,
+repaired from the controller, and refused only when the repair fails (native
+Ollama on a Mac is report-only), a hand pull is not.
 
 Put models on a node with `noo models pull` (or `noo cluster
 sync-model-files` for GGUF), or run a hand download as the store's owner.
