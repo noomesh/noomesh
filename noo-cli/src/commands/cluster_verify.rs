@@ -830,6 +830,12 @@ pub(crate) fn model_stores_check(id: &str, n: &Value) -> Option<Check> {
 /// ref has no record and no such remedy. There is no
 /// switch that marks a model trusted. No row when the agent does not report it
 /// (no Ollama placement, or an agent that predates the check).
+///
+/// The stack lane (the controller's own node checking the stack's Ollama,
+/// `lane: "stack"`) is report-only: compose manages that Ollama, so a
+/// mismatch names the re-pull, not "not repaired here". A store file the
+/// agent may not read is `cannot-read`, a WARN with its own remedy line (the
+/// agent's: make the store readable), never a mismatch.
 pub(crate) fn ollama_models_check(id: &str, n: &Value) -> Option<Check> {
     // `noo models pull` acts on the gateway's Ollama: the controller's own
     // node only. Elsewhere the model is staged and imported onto that node.
@@ -852,6 +858,8 @@ pub(crate) fn ollama_models_check(id: &str, n: &Value) -> Option<Check> {
     let mut warns = Vec::new();
     let mut fails = Vec::new();
     let mut remedies: Vec<String> = Vec::new();
+    // Remedies that are not a re-pull (an unreadable store): their own line.
+    let mut read_fixes: Vec<String> = Vec::new();
     for r in rows {
         let model = r["model"].as_str().unwrap_or("?");
         let anchor = r["anchor"].as_str().unwrap_or("");
@@ -874,11 +882,26 @@ pub(crate) fn ollama_models_check(id: &str, n: &Value) -> Option<Check> {
                     remedies.push(pull());
                 }
             }
+            "mismatch" if r["lane"].as_str() == Some("stack") => {
+                warns.push(format!("{model}: does NOT match the controller ({reason}); the stack's Ollama is compose-managed, so the agent reports this and does not repair it: re-pull it through noo"));
+                remedies.push(r["remedy"].as_str().filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| format!("noo models pull {model}")));
+            }
             "mismatch" => { warns.push(format!("{model}: does NOT match the controller ({reason}); not repaired here (the agent does not manage this Ollama)")); remedies.push(pull()); }
+            "cannot-read" => {
+                warns.push(format!("{model}: cannot be checked, the agent cannot read the store ({})", if reason.is_empty() { "permission denied" } else { reason }));
+                if let Some(fix) = r["remedy"].as_str().filter(|s| !s.is_empty()) {
+                    if !read_fixes.iter().any(|f| f == fix) { read_fixes.push(fix.to_string()); }
+                }
+            }
             _ => warns.push(format!("{model}: could not be checked ({})", if reason.is_empty() { "no reason given" } else { reason })),
         }
     }
-    let remedy = (!remedies.is_empty()).then(|| format!("on {id}: {}", remedies.join(" && ")));
+    let mut lines: Vec<String> = Vec::new();
+    if !remedies.is_empty() { lines.push(format!("on {id}: {}", remedies.join(" && "))); }
+    if !read_fixes.is_empty() {
+        lines.push(format!("on {id}: {} (the store is not readable by the agent's user; or check the Ollama image's umask)", read_fixes.join(" && ")));
+    }
+    let remedy = (!lines.is_empty()).then(|| lines.join("\n"));
     if !fails.is_empty() {
         let mut d = format!("refused (does not match the controller, and the repair failed): {}", fails.join("; "));
         if !warns.is_empty() { d.push_str(&format!("; also {}", warns.join("; "))); }
@@ -16508,6 +16531,43 @@ mod ollama_models_tests {
         assert_eq!(c.verdict, Verdict::Fail);
         assert!(c.detail.contains("harrier: the local model layer is sha256:aaaa"), "{}", c.detail);
         assert_eq!(c.remedy.as_deref(), Some("on node-pi: noo cluster import-model node-pi harrier"));
+    }
+
+    /// i1021: the controller's own node checks the stack's Ollama: a mismatch
+    /// there names the re-pull, never "the agent does not manage this Ollama"
+    /// with no next step.
+    #[test]
+    fn a_stack_lane_mismatch_names_the_re_pull() {
+        let n = json!({"self_node": true, "ollama_verify": [{"model": "qwen2.5:0.5b", "state": "mismatch", "anchor": "mirror",
+            "lane": "stack", "reason": "no local manifest", "remedy": "noo models pull qwen2.5:0.5b"}]});
+        let c = ollama_models_check("ctrl", &n).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("qwen2.5:0.5b: does NOT match the controller (no local manifest); the stack's Ollama is compose-managed"), "{}", c.detail);
+        assert!(!c.detail.contains("not repaired here"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("on ctrl: noo models pull qwen2.5:0.5b"));
+    }
+
+    /// i1021: a store file the agent may not read is its own state, with its
+    /// own remedy line: never a mismatch, never a re-pull alone.
+    #[test]
+    fn a_store_the_agent_cannot_read_warns_with_its_own_remedy_line() {
+        let n = json!({"self_node": true, "ollama_verify": [
+            {"model": "qwen2.5:0.5b", "state": "cannot-read", "anchor": "mirror", "lane": "stack",
+             "reason": "cannot read /var/lib/noo/ollama/models/blobs/sha256-aa as noo-agent (permission denied)",
+             "remedy": "sudo chmod -R o+rX /var/lib/noo/ollama/models"},
+            {"model": "gemma4:e2b", "state": "unverified", "anchor": "none", "reason": "no controller record"}]});
+        let c = ollama_models_check("ctrl", &n).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("qwen2.5:0.5b: cannot be checked, the agent cannot read the store (cannot read /var/lib/noo/ollama/models/blobs/sha256-aa as noo-agent (permission denied))"), "{}", c.detail);
+        assert!(!c.detail.contains("does NOT match"), "{}", c.detail);
+        // Without a record the row still says so (the no-ACL path stays honest).
+        assert!(c.detail.contains("gemma4:e2b: unverified (no controller record)"), "{}", c.detail);
+        let remedy = c.remedy.unwrap_or_default();
+        let lines: Vec<&str> = remedy.lines().collect();
+        assert_eq!(lines, vec![
+            "on ctrl: noo models pull gemma4:e2b",
+            "on ctrl: sudo chmod -R o+rX /var/lib/noo/ollama/models (the store is not readable by the agent's user; or check the Ollama image's umask)",
+        ], "{remedy}");
     }
 
     /// Native Ollama reports a mismatch without repairing it: a WARN.

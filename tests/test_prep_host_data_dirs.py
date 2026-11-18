@@ -79,7 +79,21 @@ def _block() -> str:
     return m.group(1)
 
 
-def _run(tmp: Path, data_root: Path) -> list[str]:
+# setfacl as prep-host calls it: logged, answering $SETFACL_RC.
+SETFACL_SHIM = r"""#!/bin/bash
+printf '%s\n' "$*" >> "$SETFACL_LOG"
+exit "${SETFACL_RC:-0}"
+"""
+
+
+def _run(tmp: Path, data_root: Path, enroll_user: str = "", setfacl: str = "host") -> list[str]:
+    """Run the block. setfacl: "host" (whatever this machine has), "ok" or
+    "refuses" (a shim answering 0 or 1), or "missing" (PATH holds only the
+    tools the block uses, none of them setfacl)."""
+    return _run_full(tmp, data_root, enroll_user, setfacl)[0]
+
+
+def _run_full(tmp: Path, data_root: Path, enroll_user: str = "", setfacl: str = "host") -> tuple[list[str], str, list[str]]:
     bindir = tmp / "bin"
     bindir.mkdir(exist_ok=True)
     shim = bindir / "install"
@@ -87,18 +101,39 @@ def _run(tmp: Path, data_root: Path) -> list[str]:
     shim.chmod(0o755)
     log = tmp / "install.log"
     log.write_text("")
-    script = "set -eu\n" + _block()
+    acl_log = tmp / "setfacl.log"
+    acl_log.write_text("")
+    path = f"{bindir}:{os.environ.get('PATH', '/usr/bin:/bin')}"
+    if setfacl in ("ok", "refuses"):
+        s = bindir / "setfacl"
+        s.write_text(SETFACL_SHIM)
+        s.chmod(0o755)
+    elif setfacl == "missing":
+        for tool in ("ls", "mkdir"):
+            link = bindir / tool
+            if not link.exists():
+                link.symlink_to(shutil.which(tool))
+        path = str(bindir)
+    # prep-host's own `say`, defined above the block.
+    script = "set -eu\nsay() { printf 'prep-host: %s\\n' \"$*\"; }\n" + _block()
     env = dict(os.environ)
     env.update(
-        PATH=f"{bindir}:{env.get('PATH', '/usr/bin:/bin')}",
+        PATH=path,
         NOO_DATA_ROOT=str(data_root),
+        ENROLL_USER=enroll_user,
         SHIM_LOG=str(log),
+        SETFACL_LOG=str(acl_log),
+        SETFACL_RC="1" if setfacl == "refuses" else "0",
         SHIM_AGENT_ID=f"{AGENT[0]}:{AGENT[1]}",
         SHIM_REAL_INSTALL=REAL_INSTALL or "/usr/bin/install",
     )
-    r = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+    r = subprocess.run([shutil.which("bash") or "/bin/bash", "-c", script], env=env, capture_output=True, text=True)
     assert r.returncode == 0, f"the data-dirs block failed: {r.stderr}"
-    return [line for line in log.read_text().splitlines() if line]
+    return (
+        [line for line in log.read_text().splitlines() if line],
+        r.stdout,
+        [line for line in acl_log.read_text().splitlines() if line],
+    )
 
 
 def _owner(p: Path) -> tuple[int, int]:
@@ -240,3 +275,65 @@ def test_a_hub_with_content_or_a_symlink_hub_is_left_to_the_applier():
         (root / "hf-cache" / "hub").symlink_to(elsewhere)
         calls = _run(tmp, root)
         assert not _named(calls, root / "hf-cache" / "hub"), f"a symlinked hub was passed to install: {calls}"
+
+
+# ── The installing operator's write access to the model store (i1021) ──
+
+FETCH = ROOT / "noo-cli" / "src" / "commands" / "models_fetch.rs"
+
+
+def _guide_lines(store: str, group: str, me: str) -> list[str]:
+    """The two remedies of the store's own refusal (models_fetch.rs
+    unwritable_guide), each as `command  # why`, filled in: prep prints the
+    same text."""
+    body = FETCH.read_text().split("pub(crate) fn unwritable_guide(", 1)[1].split("\n}\n", 1)[0]
+    pairs = re.findall(r'\(\s*format!\("((?:sudo chmod|sudo setfacl)[^"]*)"\),\s*(?:format!\()?"([^"]*)"', body)
+    assert len(pairs) == 2, f"unwritable_guide's two remedies were not found: {pairs}"
+    fill = lambda t: t.replace("{dir}", store).replace("{group}", group).replace("{me}", me)
+    return [f"{fill(cmd)}  # {fill(why)}" for cmd, why in pairs]
+
+
+def test_prep_grants_the_installing_operator_write_access_to_the_model_store_only():
+    """The installing operator gets the guide's exact ACL on models, inside
+    prep's sudo, and the output names it (prep's stdout is onboard's stderr:
+    provision.rs root_shell). Never on hf-cache, the ollama store or the root."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        root = tmp / "noo"
+        _, out, acl = _run_full(tmp, root, enroll_user="alice", setfacl="ok")
+        assert acl == [f"-m u:alice:rwx -m d:u:alice:rwx {root / 'models'}"], acl
+        assert f"prep-host: granted alice write access to the model store {root / 'models'}" in out, out
+        for other in (root, root / "hf-cache", root / "ollama", root / "hf-cache" / "hub"):
+            assert not [c for c in acl if c.endswith(f" {other}")], f"an ACL on {other}: {acl}"
+
+
+def test_prep_without_setfacl_prints_the_store_guide_and_goes_on():
+    """No setfacl (a host without the acl package), or one the store refuses
+    (an NFS export): no grant, the store guide's own remedies are printed
+    (the same text as models_fetch.rs unwritable_guide), and prep goes on."""
+    import tempfile
+
+    for case in ("missing", "refuses"):
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            root = tmp / "noo"
+            _, out, _ = _run_full(tmp, root, enroll_user="alice", setfacl=case)
+            store = str(root / "models")
+            assert f"prep-host: could not grant alice write access to the model store {store}: " in out, f"{case}: {out}"
+            assert "granted alice" not in out, f"{case}: {out}"
+            for line in _guide_lines(store, "noo-agent", "alice"):
+                assert f"prep-host:   {line}" in out, f"{case}: the guide line {line!r} is not in prep's output:\n{out}"
+            assert (root / "models").is_dir()
+
+
+def test_prep_grants_nothing_without_an_installing_operator():
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        root = tmp / "noo"
+        _, out, acl = _run_full(tmp, root, enroll_user="", setfacl="ok")
+        assert acl == [], acl
+        assert "no installing operator named" in out, out

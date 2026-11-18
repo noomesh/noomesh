@@ -7492,6 +7492,9 @@ mod first_model_probe_tests {
         let after = pull.find("ollama_stage::record_after_pull(pending,").expect("the record is written after the pull");
         assert!(before < run && run < ok && ok < after, "fetch, pull, then record on success");
         assert!(pull[after..].contains("read_container_manifest(target, r)"), "the record compares with the container that pulled");
+        // An unwritable store (found before the pull): its one line, then the
+        // store guide's command (i1021).
+        assert!(pull[after..].contains("if let Some(cmd) = record.remedy() {"), "onboard prints the store guide's command");
     }
 
     #[test]
@@ -7715,6 +7718,11 @@ fn pull_ollama(ctx: &mut Ctx, model: &str) {
         });
         if let Some(line) = record.line() {
             if record.written() { ctx.info(&line) } else { ctx.warn(&line) }
+        }
+        // A store this user cannot write (checked before the pull): the
+        // store guide's ACL command for it, after the one line.
+        if let Some(cmd) = record.remedy() {
+            ctx.info(&format!("to record pulls: {cmd}"));
         }
         // Record the choice where the LAUNCHER reads it (finding #70): the
         // start script pulls "${OLLAMA_MODEL:-gemma4:e2b}" on every stack
