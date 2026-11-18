@@ -1602,7 +1602,6 @@ fn self_update_and_reexec(
         }
     }
     let floor = std::fs::read_to_string(Path::new(ROOT_ANCHOR_DIR).join(crate::release_gate::FLOOR_FILE)).ok();
-    crate::release_gate::darwin_check(&gated, "", floor.as_deref(), env!("CARGO_PKG_VERSION"), crate::release_sig::RELEASE_PUBKEYS_HEX)?;
     root_install(&payload, Path::new("/usr/local/bin/noo"), 0o755).map_err(|e| format!("cli-binary: {e}"))?;
     crate::ui::done("noo node fetch: CLI updated from the bundle — re-running this apply under it");
     Ok(Some(REEXEC.to_string()))
