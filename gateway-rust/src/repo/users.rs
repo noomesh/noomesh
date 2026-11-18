@@ -295,15 +295,10 @@ where
 
 /// The `login` row: `(username, hashed_password, disabled, scopes,
 /// failed_login_count, locked_until, role)`.
-pub type LoginRow = (
-    String,
-    String,
-    bool,
-    Value,
-    Option<i32>,
-    Option<chrono::DateTime<chrono::Utc>>,
-    String,
-);
+pub type LoginRow = (String, String, bool, Value, Option<i32>, Option<jiff::Timestamp>, String);
+
+/// [`LoginRow`] as Postgres decodes it (jiff-sqlx carries the timestamptz).
+type LoginRowDb = (String, String, bool, Value, Option<i32>, Option<jiff_sqlx::Timestamp>, String);
 
 /// The row the login path needs, `None` when there is no such account.
 /// `scopes` falls back to `["read"]` and `failed_login_count` to 0 in SQL.
@@ -311,7 +306,7 @@ pub async fn login_row<'e, E>(db: E, username: &str) -> Result<Option<LoginRow>,
 where
     E: sqlx::PgExecutor<'e>,
 {
-    sqlx::query_as::<_, LoginRow>(
+    let row = sqlx::query_as::<_, LoginRowDb>(
         "SELECT username, hashed_password, disabled, \
                 COALESCE(scopes, '[\"read\"]'::jsonb), \
                 COALESCE(failed_login_count, 0), locked_until, role \
@@ -319,7 +314,8 @@ where
     )
     .bind(username)
     .fetch_optional(db)
-    .await
+    .await?;
+    Ok(row.map(|(u, h, d, s, f, locked, role)| (u, h, d, s, f, locked.map(jiff_sqlx::Timestamp::to_jiff), role)))
 }
 
 /// The account's `user_uuid` — the one spelling of "who owns this" that the
