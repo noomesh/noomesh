@@ -540,7 +540,7 @@ release_names_for() {
 # node's record allows: the node is AHEAD of its controller (i940). One line,
 # the same words as noo-cli release_gate::ahead_line, exit 75.
 release_refuse_ahead() {
-    echo "noo-apply: REFUSED $1 $2 — this node is ahead of its controller (it applied $3${4:+ after $4}; the controller staged $2): roll the controller to $5 or later (noo upgrade --stack), then this node takes its bundles again (75)" >&2
+    echo "noo-apply: REFUSED $1 $2 — this node applied $3; it steps back at most one final, never to $2 (75)" >&2
     logger -t noo-apply "REFUSED release check: $1 $2 — node ahead of its controller ($3${4:+ after $4})" 2>/dev/null || true
     exit 75
 }
