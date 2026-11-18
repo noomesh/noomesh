@@ -1790,7 +1790,7 @@ nu_parse() {
         case "$_nu_l" in
             user=*) _nu_u=$((_nu_u + 1)); NU_USER="${_nu_l#user=}" ;;
             root=*) _nu_r=$((_nu_r + 1)); NU_ROOT="${_nu_l#root=}" ;;
-            *) NU_BAD=shape; return 1 ;;
+            *) : ;;
         esac
     done < "$1"
     [ "$_nu_u" = 1 ] && [ "$_nu_r" = 1 ] || { NU_BAD=shape; return 1; }
