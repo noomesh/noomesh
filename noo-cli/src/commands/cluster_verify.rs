@@ -12087,6 +12087,22 @@ mod tests {
         assert_eq!(stunnel_image_check(&serde_json::json!({"id": "x", "stunnel_image": "weird"})).unwrap().verdict, Verdict::Warn);
     }
 
+    #[test]
+    fn a_backend_kept_across_a_tag_only_roll_is_not_reported_stale() {
+        // Proposal i935: the agent no longer recreates a backend whose image
+        // digest the new lock pins unchanged, so it keeps running under the
+        // previous release's TAG. Every node row reads digests or floating-
+        // ness, never the tag against the release: this pins that the row
+        // stays OK for such a container.
+        let n = serde_json::json!({"id": "robopi", "backend_containers": {"ollama": {
+            "container": "noo-ollama",
+            "image": "ghcr.io/noomesh/ollama:v0.6.26@sha256:dd46912abd4946a5c580c4a85883a559736b48f6f2c4e24162b77b307b74ea9f",
+            "image_floating": false}}});
+        let c = backend_images_check(&n);
+        assert_eq!(c.verdict, Verdict::Ok, "{c:?}");
+        assert!(c.detail.contains("ollama ghcr.io/noomesh/ollama:v0.6.26@sha256:dd46"), "{c:?}");
+    }
+
     /// A backend container created from a floating ref FAILs, naming it; a
     /// pinned or versioned one is OK; an agent that does not report is WARN;
     /// a native Mac ollama has no image and is not judged.
