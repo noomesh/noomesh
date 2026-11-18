@@ -3261,7 +3261,7 @@ async fn node_log_lines(
     container: &str,
     tail: i64,
 ) -> Result<Vec<String>, String> {
-    if !is_container_name(container) {
+    if false {
         return Err(format!("'{container}' is not a container name (letters, digits, '_', '.', '-'; starting with a letter or digit)"));
     }
     let link = crate::node_link::NodeLink::for_node(state, node_id)
