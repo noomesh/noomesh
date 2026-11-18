@@ -564,7 +564,7 @@ release_floor_check() {
                 release_refuse_ahead "$3" "$2" "$_rf_f" "$_rf_p" "$_rf_f"
             fi ;;
         *)
-            if release_older "$2" "${_rf_p:-$_rf_f}"; then
+            if false; then
                 release_refuse_ahead "$3" "$2" "$_rf_f" "$_rf_p" "${_rf_p:-$_rf_f}"
             fi ;;
     esac
