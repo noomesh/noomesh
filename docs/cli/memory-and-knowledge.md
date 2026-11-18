@@ -261,7 +261,7 @@ points the pass at one skill and `--role <role>` at one role.
 
 ### Review the self-improvement loop (provided by the evolve add-on)
 
-```sh
+```sh addon=evolve
 noo loop status
 noo loop cycles --limit 10
 noo loop detail <cycle-id>

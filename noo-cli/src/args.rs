@@ -317,7 +317,9 @@ mod tests {
             row(&["cluster", "gpu", "hold"], |a| { let _ = cluster_gpu::parse_gpu_hold_with(a); }),
             row(&["cluster", "gpu", "release"], |a| { let _ = cluster_gpu::parse_gpu_release_with(a); }),
             row(&["cluster", "vendor", "stage"], |a| { let _ = cluster_vendor::parse_stage_with(a); }),
-            row(&["jobs", "list"], |a| { let _ = jobs::parse_list_with(a); }),
+            // `jobs_list` runs `ui::take_watch` (`-w|--watch [SECS]`) before its
+            // parser; the probe asks for it in the same order.
+            row(&["jobs", "list"], |a| { let _ = a.value(&["--watch", "-w"]); let _ = jobs::parse_list_with(a); }),
             row(&["jobs", "run"], |a| { let _ = jobs::parse_run_with(a, 300); }),
             row(&["jobs", "submit"], |a| { let _ = jobs::parse_submit_with(a); }),
             row(&["jobs", "history"], |a| { let _ = jobs::parse_history_with(a); }),
