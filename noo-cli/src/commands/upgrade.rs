@@ -2745,6 +2745,7 @@ fn reconcile_netns_unit(g: &Globals, root: &std::path::Path) {
             if !g.json {
                 ui::step(&format!("installing {}: staged to the self-node {node}, whose applier installs it (no sudo)", nu::UNIT_NAME));
             }
+            let _ = nu::install(tty, &unit);
             match nu::stage_to_self_node(g, &node, &owner, &root_s) {
                 Ok(()) if nu::state(&unit) == nu::State::Current => {
                     if !g.json { ui::done(&format!("{} installed and enabled by the self-node's applier", nu::UNIT_NAME)); }
