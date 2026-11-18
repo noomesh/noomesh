@@ -35,14 +35,7 @@ use serde_json::Value;
 ///
 /// `created_at` is `NOT NULL DEFAULT now()`. Both original call sites typed it
 /// `Option<DateTime<Utc>>`, which claimed a state the column forbids.
-pub type UserSummary = (
-    String,
-    bool,
-    Value,
-    chrono::DateTime<chrono::Utc>,
-    Option<chrono::DateTime<chrono::Utc>>,
-    i32,
-);
+pub type UserSummary = (String, bool, Value, jiff::Timestamp, Option<jiff::Timestamp>, i32);
 
 /// [`UserSummary`] plus `locked_until` and `role`, for the admin listing that
 /// surfaces lockout state and the account's permission tier.
@@ -50,10 +43,23 @@ pub type UserSummaryLocked = (
     String,
     bool,
     Value,
-    chrono::DateTime<chrono::Utc>,
-    Option<chrono::DateTime<chrono::Utc>>,
+    jiff::Timestamp,
+    Option<jiff::Timestamp>,
     i32,
-    Option<chrono::DateTime<chrono::Utc>>,
+    Option<jiff::Timestamp>,
+    String,
+);
+
+/// [`UserSummaryLocked`] as Postgres decodes it: jiff-sqlx carries the
+/// timestamptz decode (sqlx 0.9 has no jiff feature).
+type UserSummaryLockedRow = (
+    String,
+    bool,
+    Value,
+    jiff_sqlx::Timestamp,
+    Option<jiff_sqlx::Timestamp>,
+    i32,
+    Option<jiff_sqlx::Timestamp>,
     String,
 );
 
@@ -63,8 +69,11 @@ where
     E: sqlx::PgExecutor<'e>,
 {
     let rows = sqlx::query!(
-        "SELECT username, disabled, scopes, created_at, last_login_at, \
-         failed_login_count FROM noo_users ORDER BY created_at"
+        r#"SELECT username, disabled, scopes,
+                  created_at AS "created_at: jiff_sqlx::Timestamp",
+                  last_login_at AS "last_login_at: jiff_sqlx::Timestamp",
+                  failed_login_count
+           FROM noo_users ORDER BY created_at"#
     )
     .fetch_all(db)
     .await?;
@@ -75,8 +84,8 @@ where
                 r.username,
                 r.disabled,
                 r.scopes,
-                r.created_at,
-                r.last_login_at,
+                r.created_at.to_jiff(),
+                r.last_login_at.map(jiff_sqlx::Timestamp::to_jiff),
                 r.failed_login_count,
             )
         })
@@ -92,12 +101,18 @@ pub async fn list_with_lock<'e, E>(db: E) -> Result<Vec<UserSummaryLocked>, sqlx
 where
     E: sqlx::PgExecutor<'e>,
 {
-    sqlx::query_as::<_, UserSummaryLocked>(
+    let rows = sqlx::query_as::<_, UserSummaryLockedRow>(
         "SELECT username, disabled, scopes, created_at, last_login_at, \
          failed_login_count, locked_until, role FROM noo_users ORDER BY created_at",
     )
     .fetch_all(db)
-    .await
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(u, d, s, created, last, failed, locked, role)| {
+            (u, d, s, created.to_jiff(), last.map(jiff_sqlx::Timestamp::to_jiff), failed, locked.map(jiff_sqlx::Timestamp::to_jiff), role)
+        })
+        .collect())
 }
 
 /// Org every account lands in when the caller does not name one. Matches the

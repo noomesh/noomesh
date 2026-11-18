@@ -248,10 +248,10 @@ async fn users_list(
                 "disabled": disabled,
                 "scopes": scopes,
                 "role": role,
-                "created_at": created,
-                "last_login_at": last_login,
+                "created_at": crate::wire_time::rfc3339_z(created),
+                "last_login_at": last_login.map(crate::wire_time::rfc3339_z),
                 "failed_login_count": failed,
-                "locked_until": locked_until,
+                "locked_until": locked_until.map(crate::wire_time::rfc3339_z),
             })
         })
         .collect();
@@ -3754,10 +3754,10 @@ async fn api_users_list(
                 "disabled": disabled,
                 "scopes": scopes,
                 "role": role,
-                "created_at": created,
-                "last_login_at": last_login,
+                "created_at": crate::wire_time::rfc3339_z(created),
+                "last_login_at": last_login.map(crate::wire_time::rfc3339_z),
                 "failed_login_count": failed,
-                "locked_until": locked,
+                "locked_until": locked.map(crate::wire_time::rfc3339_z),
             })
         })
         .collect();
