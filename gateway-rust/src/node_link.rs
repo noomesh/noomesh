@@ -133,7 +133,11 @@ impl NodeLink {
     pub(crate) fn from_record(node_id: &str, record: Option<&Value>) -> Result<Self, AppError> {
         if let Some(data) = record {
             if let Some(url) = data.get("agent_url").and_then(|v| v.as_str()) {
-                if !url.is_empty() {
+                let ip = data.get("ip_address").and_then(|v| v.as_str()).unwrap_or("");
+                // Dialled only when it is https on an explicit port at the
+                // node's registered address (a record written before the
+                // heartbeat held it to that); otherwise the address below.
+                if !url.is_empty() && crate::routes::cluster::acceptable_agent_url(url, ip).is_ok() {
                     return Ok(Self::with_node(url.to_string(), node_id).advertising(data));
                 }
             }
@@ -719,13 +723,21 @@ mod tests {
     use crate::node_agent_auth::TEST_SERIAL as SERIAL;
 
     #[test]
+    fn a_stored_agent_url_off_the_registered_address_is_not_dialled() {
+        let l = NodeLink::from_record("n9", Some(&json!({"agent_url": "https://10.9.9.9:8081", "ip_address": "10.0.0.9"}))).unwrap();
+        assert_eq!(l.base(), "https://10.0.0.9:8081", "the registered address, not the stored URL");
+        let l = NodeLink::from_record("n9", Some(&json!({"agent_url": "http://10.0.0.9:8081", "ip_address": "10.0.0.9"}))).unwrap();
+        assert_eq!(l.base(), "https://10.0.0.9:8081");
+    }
+
+    #[test]
     fn agent_url_wins_then_the_ip_falls_back_and_a_missing_node_is_not_found() {
         let l = NodeLink::from_record(
             "n1",
-            Some(&json!({"agent_url": "https://n1.tail:9000", "ip_address": "10.0.0.1"})),
+            Some(&json!({"agent_url": "https://10.0.0.1:8082", "ip_address": "10.0.0.1"})),
         )
         .unwrap();
-        assert_eq!(l.base(), "https://n1.tail:9000");
+        assert_eq!(l.base(), "https://10.0.0.1:8082");
         assert_eq!(l.node_id(), Some("n1"));
 
         let l = NodeLink::from_record("n2", Some(&json!({"agent_url": "", "ip_address": "10.0.0.2"}))).unwrap();

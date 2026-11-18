@@ -425,6 +425,13 @@ another node's address; an address a live node already holds is not shared,
 and a call to it stays on HTTPS. Behind NAT the observed address will not match
 the agent's, so those calls stay on HTTPS too).
 
+**A node's `agent_url` is held to its registered address.** The gateway
+stores the `agent_url` a heartbeat reports only when it is https, names an
+explicit port, and its host is the node's registered `ip_address`, with no
+user info, path, query or fragment. One that does not fit is neither stored
+nor dialled: the gateway dials `https://<ip>:8081`, and `noo cluster verify`
+shows an `agent address` FAIL naming the node and the reason.
+
 ---
 
 ## Declared host roots
