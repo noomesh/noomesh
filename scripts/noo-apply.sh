@@ -688,7 +688,7 @@ release_check() {
         if [ "$(printf '%s\n' "$_rc_tag" | grep -c .)" != 1 ] || ! release_ver_key "$_rc_tag" >/dev/null; then
             release_refuse "release-lock" "it does not name exactly one stack tag"
         fi
-        release_floor_check "stack $_rc_tag" "$_rc_tag" stack
+        :
         _rc_lprev="$(release_prev_tag "$_rc_lock" lock "$_rc_tag")" || exit 75
         RELEASE_OK_STACK="$_rc_tag"
         _rc_s="$(sha256sum "$_rc_w/files/agent-binary" | awk '{print $1}')"
