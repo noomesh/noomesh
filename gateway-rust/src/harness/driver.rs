@@ -329,7 +329,7 @@ fn validate_launch(kind: &str, which: &str, launch: &Launch) -> Result<()> {
 pub struct DoorKey {
     pub key: String,
     pub key_id: String,
-    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub expires_at: Option<jiff::Timestamp>,
 }
 
 /// What the driver asks of the gateway. [`RemoteRuntime`] in production; a
@@ -400,8 +400,7 @@ fn parse_door_key(v: &Value) -> Result<DoorKey> {
     let expires_at = v
         .get("expires_at")
         .and_then(|e| e.as_str())
-        .and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok())
-        .map(|e| e.with_timezone(&chrono::Utc));
+        .and_then(|e| crate::wire_time::parse_rfc3339(e).ok());
     Ok(DoorKey { key: key.to_string(), key_id: key_id.to_string(), expires_at })
 }
 
@@ -774,10 +773,11 @@ pub fn fill_command_without_mcp(command: &[String], prompt: &str) -> Vec<String>
 
 /// An invocation's limit: the configured timeout, cut to the door key's
 /// expiry — a CLI never runs on past the credential it was given.
-pub fn effective_timeout(configured: Duration, key_expires: Option<chrono::DateTime<chrono::Utc>>, now: chrono::DateTime<chrono::Utc>) -> Duration {
+pub fn effective_timeout(configured: Duration, key_expires: Option<jiff::Timestamp>, now: jiff::Timestamp) -> Duration {
     match key_expires {
         Some(e) => {
-            let left = (e - now).to_std().unwrap_or(Duration::ZERO);
+            // Negative (already past) does not convert: zero, then the 1 s floor.
+            let left = Duration::try_from(e.duration_since(now)).unwrap_or(Duration::ZERO);
             configured.min(left).max(Duration::from_secs(1))
         }
         None => configured,
@@ -1080,7 +1080,7 @@ async fn invoke<R: DriverRail>(
         let system_prompt = ws.write_system_prompt(&ctx.launch)?;
         let env = build_env(ctx, ws, translator.base_url());
         let argv = fill_command(&with_system_prompt(&ctx.launch.command, system_prompt.as_deref()), prompt, &mcp);
-        let timeout = effective_timeout(ctx.timeout, key.expires_at, chrono::Utc::now());
+        let timeout = effective_timeout(ctx.timeout, key.expires_at, jiff::Timestamp::now());
         let bound = if task_id.is_some() { ctx.stall } else { ctx.stall.min(TURN_STALL) };
         tracing::info!(kind = %ctx.kind.kind, cli = %argv[0], prompt = variant.name(), task = task_id.unwrap_or(""), timeout_secs = timeout.as_secs(), stall_secs = bound.as_secs(), "harness driver: running the CLI");
         let stall = Stall { activity: translator.activity(), bound };
@@ -1514,7 +1514,7 @@ mod tests {
             Ok(DoorKey {
                 key: format!("noo-sk-door-{}", c.keys_minted),
                 key_id: format!("key-{}", c.keys_minted),
-                expires_at: Some(chrono::Utc::now() + chrono::Duration::seconds(self.key_ttl_secs)),
+                expires_at: Some(jiff::Timestamp::now() + jiff::SignedDuration::from_secs(self.key_ttl_secs)),
             })
         }
         async fn door_key_revoke(&self, key_id: &str) {
@@ -1942,14 +1942,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// The harness reads the expiry exactly as the gateway's door-key reply
+    /// prints it (routes/harness.rs: wire_time::rfc3339_offset); an
+    /// unreadable one is no expiry (the configured timeout stands), as before.
+    #[test]
+    fn a_door_key_reply_s_expiry_reads_back_to_the_same_instant() {
+        let at = jiff::Timestamp::from_microsecond(1_800_000_000_123_456).unwrap();
+        let reply = serde_json::json!({"key": "k", "key_id": "i", "expires_at": crate::wire_time::rfc3339_offset(at)});
+        assert_eq!(parse_door_key(&reply).unwrap().expires_at, Some(at));
+        let odd = serde_json::json!({"key": "k", "expires_at": "tomorrow"});
+        assert_eq!(parse_door_key(&odd).unwrap().expires_at, None);
+    }
+
     #[test]
     fn a_run_never_outlives_its_door_key() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
+        let s = |n| jiff::SignedDuration::from_secs(n);
         let t = Duration::from_secs(900);
         assert_eq!(effective_timeout(t, None, now), t);
-        assert_eq!(effective_timeout(t, Some(now + chrono::Duration::seconds(120)), now), Duration::from_secs(120));
-        assert_eq!(effective_timeout(t, Some(now + chrono::Duration::seconds(5000)), now), t);
-        assert_eq!(effective_timeout(t, Some(now - chrono::Duration::seconds(5)), now), Duration::from_secs(1));
+        assert_eq!(effective_timeout(t, Some(now + s(120)), now), Duration::from_secs(120));
+        assert_eq!(effective_timeout(t, Some(now + s(5000)), now), t);
+        assert_eq!(effective_timeout(t, Some(now - s(5)), now), Duration::from_secs(1));
     }
 
     #[test]
