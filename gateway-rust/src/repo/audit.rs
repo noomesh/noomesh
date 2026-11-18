@@ -15,15 +15,13 @@
 //! would need the `.sqlx` offline cache regenerated. `"timestamp"` is quoted
 //! in the statements that name it as a column because it is a type keyword.
 
-use chrono::{DateTime, Utc};
-
 // ── Reads ───────────────────────────────────────────────────────────────
 
 /// One listed row: `(id, timestamp, event_type, severity, actor, resource,
 /// outcome, request_id, details_text, chain_seq, entry_hash)`.
 pub type ListRow = (
     String,
-    DateTime<Utc>,
+    jiff::Timestamp,
     String,
     String,
     String,
@@ -40,16 +38,29 @@ pub type ListRow = (
 /// one extra to learn whether another page exists).
 pub async fn list<'e, E>(
     db: E,
-    since: Option<DateTime<Utc>>,
+    since: Option<jiff::Timestamp>,
     event_type: Option<&str>,
     actor: Option<&str>,
-    cursor: Option<(DateTime<Utc>, &str)>,
+    cursor: Option<(jiff::Timestamp, &str)>,
     limit: i64,
 ) -> Result<Vec<ListRow>, sqlx::Error>
 where
     E: sqlx::PgExecutor<'e>,
 {
-    sqlx::query_as(
+    type Db = (
+        String,
+        jiff_sqlx::Timestamp,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    );
+    let rows: Vec<Db> = sqlx::query_as(
         "SELECT id::text, \"timestamp\", event_type, severity, actor, resource, outcome, \
                 request_id, details::text, chain_seq, entry_hash \
            FROM noo_security_audit \
@@ -60,14 +71,18 @@ where
           ORDER BY \"timestamp\" DESC, id DESC \
           LIMIT $6",
     )
-    .bind(since)
+    .bind(since.map(jiff_sqlx::Timestamp::from))
     .bind(event_type)
     .bind(actor)
-    .bind(cursor.map(|c| c.0))
+    .bind(cursor.map(|c| jiff_sqlx::Timestamp::from(c.0)))
     .bind(cursor.map(|c| c.1))
     .bind(limit)
     .fetch_all(db)
-    .await
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.0, r.1.to_jiff(), r.2, r.3, r.4, r.5, r.6, r.7, r.8, r.9, r.10))
+        .collect())
 }
 
 /// Event counts by `event_type` over the trailing `interval` (a Postgres

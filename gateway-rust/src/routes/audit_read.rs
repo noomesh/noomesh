@@ -16,7 +16,7 @@ use crate::audit::{AuditEvent, AuditKind};
 use std::sync::Arc;
 
 use axum::{extract::{Query, State}, routing::get, Json, Router};
-use chrono::{DateTime, Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -46,10 +46,13 @@ struct ListParams {
 }
 
 /// `30m` / `24h` / `7d` / `2w` or an RFC 3339 time, as an instant.
-pub(crate) fn parse_since(raw: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
+///
+/// A window reaching back past the calendar jiff holds (year -9999) is
+/// refused like any other bad window, never widened to "everything".
+pub(crate) fn parse_since(raw: &str, now: Timestamp) -> Result<Timestamp, String> {
     let raw = raw.trim();
-    if let Ok(t) = DateTime::parse_from_rfc3339(raw) {
-        return Ok(t.with_timezone(&Utc));
+    if let Ok(t) = crate::wire_time::parse_rfc3339(raw) {
+        return Ok(t);
     }
     let bad = || format!("`since` must be an RFC 3339 time or a window like 30m, 24h, 7d (got {raw:?})");
     let Some((last, _)) = raw.char_indices().last() else { return Err(bad()) };
@@ -58,26 +61,27 @@ pub(crate) fn parse_since(raw: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>
     if n <= 0 {
         return Err(bad());
     }
-    let span = match unit {
-        "m" => Duration::try_minutes(n),
-        "h" => Duration::try_hours(n),
-        "d" => Duration::try_days(n),
-        "w" => Duration::try_weeks(n),
+    // UTC windows: a day is 86400 s, a week 7 of them, as chrono counted.
+    let unit_secs: i64 = match unit {
+        "m" => 60,
+        "h" => 3_600,
+        "d" => 86_400,
+        "w" => 604_800,
         _ => return Err(bad()),
-    }
-    .ok_or_else(bad)?;
-    now.checked_sub_signed(span).ok_or_else(bad)
+    };
+    let secs = n.checked_mul(unit_secs).ok_or_else(bad)?;
+    now.checked_sub(SignedDuration::from_secs(secs)).map_err(|_| bad())
 }
 
 /// A page boundary: the last row's `(timestamp, id)`, microsecond-exact.
-pub(crate) fn encode_cursor(ts: DateTime<Utc>, id: &str) -> String {
-    format!("{}|{id}", ts.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+pub(crate) fn encode_cursor(ts: Timestamp, id: &str) -> String {
+    format!("{}|{id}", crate::wire_time::rfc3339_micros_z(ts))
 }
 
-pub(crate) fn decode_cursor(raw: &str) -> Result<(DateTime<Utc>, String), String> {
+pub(crate) fn decode_cursor(raw: &str) -> Result<(Timestamp, String), String> {
     let bad = || "`cursor` is not one this route returned".to_string();
     let (ts, id) = raw.split_once('|').ok_or_else(bad)?;
-    let ts = DateTime::parse_from_rfc3339(ts).map_err(|_| bad())?.with_timezone(&Utc);
+    let ts = crate::wire_time::parse_rfc3339(ts).map_err(|_| bad())?;
     uuid::Uuid::parse_str(id).map_err(|_| bad())?;
     Ok((ts, id.to_string()))
 }
@@ -99,7 +103,7 @@ async fn security_audit_list(
     reader: Operator,
     Query(p): Query<ListParams>,
 ) -> AppResult {
-    let now = Utc::now();
+    let now = Timestamp::now();
     let since = p
         .since
         .as_deref()
@@ -138,7 +142,7 @@ async fn security_audit_list(
         .map(|r| {
             json!({
                 "id": r.0,
-                "timestamp": r.1.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+                "timestamp": crate::wire_time::rfc3339_micros_z(r.1),
                 "event_type": r.2,
                 "severity": r.3,
                 "actor": r.4,
@@ -159,7 +163,7 @@ async fn security_audit_list(
         AuditEvent::new(AuditKind::AuditLogRead, &reader, "noo_security_audit")
             .outcome(crate::audit::Outcome::custom("success"))
             .details(json!({
-            "since": since.map(|t| t.to_rfc3339()),
+            "since": since.map(crate::wire_time::rfc3339_offset),
             "event_type": event_type,
             "actor": actor,
             "limit": limit,
@@ -181,8 +185,8 @@ async fn security_audit_list(
 mod tests {
     use super::*;
 
-    fn at(s: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(s).expect("time").with_timezone(&Utc)
+    fn at(s: &str) -> Timestamp {
+        s.parse().expect("time")
     }
 
     #[test]
@@ -200,6 +204,16 @@ mod tests {
         for bad in ["", "yesterday", "0h", "-5m", "5x", "h", "99999999999999999999d", "5é"] {
             assert!(parse_since(bad, now).is_err(), "{bad:?} must be refused");
         }
+    }
+
+    /// A window past the calendar (here ~13,700 years back) is refused, not
+    /// widened to every row; one inside it still answers.
+    #[test]
+    fn a_window_past_the_calendar_is_refused() {
+        let now = at("2026-10-16T12:00:00Z");
+        assert!(parse_since("5000000d", now).is_err());
+        assert!(parse_since("153722867280912931m", now).is_err(), "seconds overflow");
+        assert_eq!(parse_since("520w", now).unwrap(), at("2016-10-28T12:00:00Z"));
     }
 
     #[test]
