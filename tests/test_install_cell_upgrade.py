@@ -26,7 +26,7 @@ STACK_OK = """\
   installing noo-netns-restore.service: staged to the self-node runner-a, whose applier installs it (no sudo)
 + noo-netns-restore.service installed and enabled by the self-node's applier
 """
-JOURNAL_OK = "Nov 18 noo-apply[1]: release-check: generation=2 release=none release-prev=none\nNov 18 noo-apply[1]: applied: agent-env agent-protect=6\n"
+JOURNAL_OK = "Nov 18 noo-fetch[1]: noo-apply: applier-only bundle: this applier is already installed (sha256 ab12), nothing to install\nNov 18 noo-apply[1]: release-check: generation=2 release=none release-prev=none\nNov 18 noo-apply[1]: applied: agent-env agent-protect=6\n"
 
 
 def verify(self_rows, ctl_rows):
@@ -80,7 +80,7 @@ def cell(tmp, roll=ROLL_OK, stack=STACK_OK, journal=JOURNAL_OK, roll_rc="0", sel
 def test_a_clean_first_roll_passes_every_assert(tmp_path):
     rc, got = cell(tmp_path)
     assert rc == 0, got
-    for a in ("A1", "A2", "A3", "A4", "A5", "A6", "A7", "B1", "B2", "B3", "G1", "G2", "G3", "G4", "G5"):
+    for a in ("A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "B1", "B2", "B3", "G1", "G2", "G3", "G4", "G5"):
         assert " PASS: " in got[a], got[a]
     assert "release-check: generation=2" in got["A2"]
     assert "generation 1) predates the netns-unit kind" in got["A5"]
@@ -204,3 +204,11 @@ def test_the_first_roll_bootstrap_refusal_still_fails_a3(tmp_path):
     j = JOURNAL_OK + "noo-apply[1]: REFUSED release check: applier — the bundle carries root code but no release-signed list (release-sums)\n"
     rc, got = cell(tmp_path, journal=j, roll=ROLL_OK + "! runner-a: the applier-only bundle reported exit 75 — staging the full bundle anyway\n")
     assert " FAIL: " in got["A3"] and "no release-signed list" in got["A3"], got["A3"]
+
+
+def test_rc2s_exit_75_bootstrap_fails_a8_and_rc3s_clean_handshake_passes(tmp_path):
+    rc, got = cell(tmp_path, journal=JOURNAL_OK.split("\n", 1)[1],
+                   roll=ROLL_OK + "! runner-a: the applier-only bundle reported exit 75 — staging the full bundle anyway\n")
+    assert " FAIL: " in got["A8"] and "reported exit 75" in got["A8"], got["A8"]
+    rc, got = cell(tmp_path / "b")
+    assert " PASS: " in got["A8"] and "this applier is already installed" in got["A8"], got["A8"]
