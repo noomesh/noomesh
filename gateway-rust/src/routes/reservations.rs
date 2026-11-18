@@ -1099,7 +1099,7 @@ async fn workload_proxy(
     }
     let link = crate::node_link::NodeLink::for_node(&state, &node).await?;
     let query = parts.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
-    let upstream = workload_proxy_upstream(&decl.container, &path, &query).map_err(AppError::BadRequest)?;
+    let upstream = format!("/api/containers/{}/proxy/{}{query}", decl.container, path.trim_start_matches('/'));
 
     if is_websocket_upgrade(&parts.headers) {
         // The relay dials the agent's address; the tunnel does not carry a
