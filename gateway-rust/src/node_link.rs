@@ -207,8 +207,20 @@ impl NodeLink {
     }
 
     /// The agent at an address the caller already holds (a record's
-    /// `agent_url`, a backend URL).
+    /// `agent_url`, a backend URL). Held to the agent_url rule's address-less
+    /// form (`dialable_agent_url`): only an https URL becomes the base; any
+    /// other has no address, so it is never dialled and no credential is
+    /// attached for it.
     pub fn for_base(url: &str) -> Self {
+        let base = if crate::routes::cluster::dialable_agent_url(url, "") { url.to_string() } else { String::new() };
+        Self { base, node_id: None, auth: Auth::Node, nats_rpc: false, bus: None, tunnel: false }
+    }
+
+    /// `for_base` without the rule, for tests whose stand-in agent is a
+    /// plain-HTTP loopback server. Test code only (a source guard below holds
+    /// that nothing outside tests calls it).
+    #[cfg(test)]
+    pub(crate) fn for_test_base(url: &str) -> Self {
         Self { base: url.to_string(), node_id: None, auth: Auth::Node, nats_rpc: false, bus: None, tunnel: false }
     }
 
@@ -736,6 +748,44 @@ mod tests {
         assert_eq!(l.base(), "https://10.0.0.9:8081", "the registered address, not the stored URL");
         let l = NodeLink::from_record("n9", Some(&json!({"agent_url": "http://10.0.0.9:8081", "ip_address": "10.0.0.9"}))).unwrap();
         assert_eq!(l.base(), "https://10.0.0.9:8081");
+    }
+
+    #[test]
+    fn a_plaintext_base_gets_no_address_and_no_credential() {
+        let l = NodeLink::for_base("http://10.0.0.9:8081");
+        assert_eq!(l.base(), "", "a plaintext agent URL is never a base");
+        assert!(l.auth_headers().is_empty(), "no credential for it");
+        assert_eq!(NodeLink::for_base("https://10.0.0.9:8081").base(), "https://10.0.0.9:8081");
+    }
+
+    #[test]
+    fn no_production_code_builds_a_node_link_without_the_rule() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        assert!(files.len() > 50, "the walk found the sources");
+        for f in files {
+            let name = f.display().to_string();
+            if name.ends_with("tests.rs") || name.ends_with("_tests.rs") {
+                continue;
+            }
+            let own = crate::test_src::own_code(&std::fs::read_to_string(&f).unwrap());
+            for test_only in ["::for_test_base(", "::for_test_server("] {
+                assert!(!own.contains(test_only), "{name} calls {test_only} outside tests");
+            }
+        }
+        let own = crate::test_src::own_code(include_str!("node_link.rs"));
+        let for_base = crate::test_src::fn_body(&own, "pub fn for_base(");
+        assert!(for_base.contains("dialable_agent_url(url, \"\")"), "for_base holds the URL to the rule");
     }
 
     #[test]

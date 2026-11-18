@@ -1682,7 +1682,7 @@ mod tests {
     /// workload, never `{}` handed to the caller as the agent's answer.
     #[tokio::test]
     async fn a_cut_off_actuator_answer_is_an_error_not_an_empty_object() {
-        let link = crate::node_link::NodeLink::for_base(&crate::upstream_body::stub_cut_short().await);
+        let link = crate::node_link::NodeLink::for_test_base(&crate::upstream_body::stub_cut_short().await);
         let e = actuator(&link, &decl(true, 1), "/start", json!({}), 5).await.unwrap_err();
         assert!(e.starts_with("the voice-worker workload actuator answered HTTP 200 but its body could not be read"), "{e}");
     }
@@ -1766,7 +1766,7 @@ mod tests {
         let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", dead.local_addr().unwrap());
         drop(dead);
-        let link = crate::node_link::NodeLink::for_base(&base);
+        let link = crate::node_link::NodeLink::for_test_base(&base);
         let d = managed_decl("rhaddon", &nw_decl(), 0);
         let rec = json!({"node_workloads": [{"addon": "rhaddon", "name": d.name.clone(), "state": "provisioned", "ready": false, "door_port": 0, "reason": "door_leaf_missing"}]});
         let free = Managed { node: "node-a".into(), free: true };
@@ -1782,7 +1782,7 @@ mod tests {
     /// An i163 workload: the agent's status (a read) answers before the hold.
     #[tokio::test]
     async fn an_i163_workload_the_agent_does_not_declare_is_refused_before_the_hold() {
-        let link = crate::node_link::NodeLink::for_base(&crate::upstream_body::stub("404 Not Found", None, b"{\"error\":\"not_declared\",\"detail\":\"no bundle\"}").await);
+        let link = crate::node_link::NodeLink::for_test_base(&crate::upstream_body::stub("404 Not Found", None, b"{\"error\":\"not_declared\",\"detail\":\"no bundle\"}").await);
         match preflight(&link, &decl(true, 1), None, &json!({}), "rhaddon/rhworker", "node-a").await {
             Err(AppError::UnavailableRetry { code, detail, .. }) => {
                 assert_eq!(code, "node_workloads_not_loaded");
@@ -1790,7 +1790,7 @@ mod tests {
             }
             other => panic!("not_declared before the hold is a retry, got {other:?}"),
         }
-        let link = crate::node_link::NodeLink::for_base(&crate::upstream_body::stub("404 Not Found", None, b"{\"error\":\"no_container\",\"detail\":\"gone\"}").await);
+        let link = crate::node_link::NodeLink::for_test_base(&crate::upstream_body::stub("404 Not Found", None, b"{\"error\":\"no_container\",\"detail\":\"gone\"}").await);
         let e = preflight(&link, &decl(true, 1), None, &json!({}), "rhaddon/rhworker", "node-a").await.unwrap_err();
         assert!(matches!(&e, AppError::Conflict(m) if m.starts_with("no_container (404)")), "{e:?}");
     }

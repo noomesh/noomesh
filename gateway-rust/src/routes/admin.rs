@@ -5562,7 +5562,7 @@ mod node_list_tests {
         let cut = stub_cut_short().await;
         let down = stub("500 Internal Server Error", None, b"[]").await;
         let odd = stub("200 OK", None, b"{\"containers\": []}").await;
-        let t = |id: &str, b: &str| (id.to_string(), format!("{id}.lan"), crate::node_link::NodeLink::for_base(b));
+        let t = |id: &str, b: &str| (id.to_string(), format!("{id}.lan"), crate::node_link::NodeLink::for_test_base(b));
         let (items, unreachable) =
             gather_node_lists(vec![t("a", &good), t("b", &cut), t("c", &down), t("d", &odd)], "/logs/containers").await;
         assert_eq!(items, vec![json!({"name": "noo-gateway", "node_id": "a", "node_hostname": "a.lan"})]);

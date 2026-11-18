@@ -8040,7 +8040,7 @@ mod gpu_label_tests {
     #[tokio::test]
     async fn a_node_gpu_is_its_model_none_or_a_named_error() {
         use crate::upstream_body::{stub, stub_cut_short};
-        let link = |b: &str| crate::node_link::NodeLink::for_base(b);
+        let link = |b: &str| crate::node_link::NodeLink::for_test_base(b);
         let base = stub("200 OK", None, b"{\"available\": true, \"gpu_model\": \"RTX 4080\", \"temperature_c\": 61}").await;
         let gpu = super::node_gpu(&link(&base), "host3", "host3.lan", 0).await.unwrap().expect("a GPU");
         assert_eq!(gpu["name"], "RTX 4080");
