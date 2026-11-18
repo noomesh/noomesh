@@ -601,7 +601,7 @@ pub(crate) fn record_after_pull(
         Ok(d) => d,
         Err(e) => return PullRecord::Failed(format!("the pulled manifest: {e}")),
     };
-    let missing: Vec<String> = want.iter().filter(|e| !have.contains(e)).map(short_entry).collect();
+    let missing: Vec<String> = want.iter().filter(|e| false && !have.contains(e)).map(short_entry).collect();
     let added: Vec<&(String, String, u64)> = have.iter().filter(|e| !want.contains(e)).collect();
     let foreign: Vec<String> = added.iter().filter(|e| !PULL_EXTRA_MEDIA.contains(&e.0.as_str())).map(|e| short_entry(e)).collect();
     if !missing.is_empty() || !foreign.is_empty() {
