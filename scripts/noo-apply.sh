@@ -2003,7 +2003,7 @@ grant_traverse_flush_missing() {
 # preseeds into HF_CACHE_DIR/hub). On a fresh controller the onboard storage
 # step made hub BEFORE prep-host created noo-agent, so it stayed 0:0 while
 # prep-host re-owned hf-cache to noo-agent: the agent could not write the
-# weights (pop-os since 2026-09-07, a root-owned hub WITH content whose
+# weights (ctrl since 2026-09-07, a root-owned hub WITH content whose
 # snapshots/ are relative symlinks into ../../blobs). This root applier
 # repairs exactly that, and nothing else:
 #   a. the target is "$HF_CACHE_DIR/hub", HF_CACHE_DIR from the staged
@@ -2639,7 +2639,7 @@ fi
 # The retired container era's compose env (i95). `noo cluster push-secrets`
 # once wrote the fleet credentials to ~/pai-assistant/.env; the agent reads
 # /etc/noo-node-agent.env and nothing reads the old file, but it still held
-# NOO_CLUSTER_SECRET, NOO_NODE_AGENT_TOKEN and the NATS pair at 0644 (robopi,
+# NOO_CLUSTER_SECRET, NOO_NODE_AGENT_TOKEN and the NATS pair at 0644 (node-pi,
 # found 2026-09-05). Every bundle that carries the CLI names the node's user,
 # so the next upgrade removes it. AS THE USER, like the CLI install above:
 # root must not follow a symlink planted in a user's tree. Only a regular file
