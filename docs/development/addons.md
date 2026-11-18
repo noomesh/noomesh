@@ -1446,6 +1446,17 @@ the file (or standard input with `--token-file -`) and is never printed;
 `--user <name>` sets the login name for registries that check it (GHCR checks
 only the token).
 
+**The registry must serve https.** The registry root is `host/path` on the
+default https port; a port is not accepted yet. The publish, and every user's
+`noo addons upgrade`, speak https only. A local plain-http registry
+(`registry:2` on port 80, say) cannot be published to: the publish fails with
+`addon_lock_publish_failed`, the error names `network error`, and the hint
+starts `the registry did not answer over https`. A registry whose certificate
+this machine does not trust fails with `TLS verification failed`: add the CA
+that signed it to the system trust store, since verification is never turned
+off. Each failure's hint names its kind (network, TLS, access refused, or
+read-back), so only a refused push asks for a token.
+
 What it pushes is what this oras (1.2 or later) command pushes, kept here for
 reference:
 
