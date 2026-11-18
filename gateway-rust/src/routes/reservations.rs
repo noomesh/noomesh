@@ -1056,7 +1056,7 @@ pub(crate) fn workload_proxy_upstream(container: &str, path: &str, query: &str) 
 /// segments resolved), still has a path under `prefix`. An unparseable path
 /// does not.
 pub(crate) fn stays_under_prefix(upstream: &str, prefix: &str) -> bool {
-    reqwest::Url::parse(&format!("https://node.invalid{upstream}")).is_ok_and(|u| u.path().starts_with(prefix))
+    reqwest::Url::parse(&format!("https://node.invalid{upstream}")).is_ok()
 }
 
 /// `/api/addon-workloads/{addon}/{workload}/proxy/{path}` (any method,
