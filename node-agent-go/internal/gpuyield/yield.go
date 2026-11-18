@@ -419,6 +419,11 @@ func placedOnGPU(p Placed) bool {
 	if p.Target == "cpu" {
 		return false
 	}
+	// llamacpp runs on the CPU whatever its target while the image has no
+	// GPU build (the agent starts it with no GPU device).
+	if p.Backend == "llamacpp" && !docker.LlamacppHasGPUBuild {
+		return false
+	}
 	return p.Backend == "vllm" || p.Target == "gpu"
 }
 

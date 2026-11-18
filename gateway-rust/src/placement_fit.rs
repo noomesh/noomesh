@@ -449,13 +449,26 @@ pub fn budget_for(node: &Value) -> Option<Budget> {
     pool_for(node, "gpu").or_else(|| pool_for(node, "cpu"))
 }
 
-/// The target a placement runs on: the declared one; else `cpu` when its env
-/// pins `N_GPU_LAYERS=0`; else `gpu`. A node without a GPU runs everything on
-/// CPU, whatever was declared (the place route refuses `gpu` there, so this
-/// only reaches rows from before the node lost its GPU).
+/// The shipped llamacpp image (`docker/Dockerfile.llamacpp`: OpenBLAS, no
+/// GGML_CUDA) and its upstream fallback (ggml-org `:server`) are CPU builds.
+/// While this is false a llamacpp placement runs on the CPU whatever its
+/// target, so it is fitted in the CPU pool. The same rule as noo-cli's
+/// `cluster_tune::LLAMACPP_HAS_GPU_BUILD` and the node agent's
+/// `docker.LlamacppHasGPUBuild`; tests/test_llamacpp_gpu_build_claim.py holds
+/// all three to the Dockerfile.
+pub const LLAMACPP_HAS_GPU_BUILD: bool = false;
+
+/// The target a placement runs on: `cpu` for llamacpp while its image has no
+/// GPU build ([`LLAMACPP_HAS_GPU_BUILD`]); else the declared one; else `cpu`
+/// when its env pins `N_GPU_LAYERS=0`; else `gpu`. A node without a GPU runs
+/// everything on CPU, whatever was declared (the place route refuses `gpu`
+/// there, so this only reaches rows from before the node lost its GPU).
 pub fn resolve_target(spec: &Spec, node: &Value) -> &'static str {
     let has_gpu = node_has_gpu(node);
     if !has_gpu && node_reports_memory(node) {
+        return "cpu";
+    }
+    if spec.backend == "llamacpp" && !LLAMACPP_HAS_GPU_BUILD {
         return "cpu";
     }
     match spec.target.as_deref() {
@@ -863,10 +876,25 @@ mod tests {
         let legacy = evaluate(&gpu6_ram32(), &[llama(GEMMA, None, &[("N_GPU_LAYERS", "0")])], 1024);
         assert_eq!(legacy.rows[0].target, "cpu");
         assert_eq!(legacy.budget.as_ref().unwrap().kind, "ram");
-        // The same model on the GPU does not fit 6 GB.
+        // Declared on gpu it still runs on the CPU (no GPU build), so it is
+        // budgeted against RAM and fits. This asserted DoesNotFit against
+        // 6 GB of VRAM until 0.6.28: a pool the container never used.
         let gpu = evaluate(&gpu6_ram32(), &[llama(GEMMA, Some("gpu"), &[])], 1024);
-        assert_eq!(gpu.verdict, Verdict::DoesNotFit);
-        assert!(gpu.refusal_message("host8").contains("on gpu"), "{}", gpu.refusal_message("host8"));
+        assert_eq!(gpu.rows[0].target, "cpu");
+        assert_eq!(gpu.verdict, Verdict::Fits, "{gpu:#?}");
+    }
+
+    /// llamacpp has no GPU build (LLAMACPP_HAS_GPU_BUILD): on a GPU node a
+    /// placement declared gpu, or declaring nothing, is fitted in the CPU
+    /// pool. vllm and ollama keep the GPU pool.
+    #[test]
+    fn llamacpp_with_no_gpu_build_resolves_to_the_cpu_pool() {
+        let n = gpu6_ram32();
+        assert_eq!(resolve_target(&llama("m:7b", Some("gpu"), &[]), &n), "cpu");
+        assert_eq!(resolve_target(&llama("m:7b", None, &[]), &n), "cpu");
+        let vllm = Spec { backend: "vllm".into(), ..llama("m:7b", Some("gpu"), &[]) };
+        assert_eq!(resolve_target(&vllm, &n), "gpu");
+        assert_eq!(resolve_target(&spec("chat", "m:7b", None), &n), "gpu");
     }
 
     #[test]
@@ -951,7 +979,8 @@ mod tests {
     #[test]
     fn weights_sources_in_order_and_an_unknown_size_is_cant_judge() {
         let file = "Mystery-Q4_K_M.gguf";
-        let bare = json!({"vram_gb": 24.0});
+        // RAM too: llamacpp is fitted in the CPU pool (LLAMACPP_HAS_GPU_BUILD).
+        let bare = json!({"vram_gb": 24.0, "ram_gb": 32.0});
         let r = evaluate(&bare, &[llama(file, None, &[])], 1024);
         assert_eq!(r.verdict, Verdict::Unknown, "{r:#?}");
         assert!(r.warnings.iter().any(|w| w.contains("can't judge") && w.contains(file)), "{:?}", r.warnings);

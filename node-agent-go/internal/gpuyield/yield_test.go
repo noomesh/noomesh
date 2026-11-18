@@ -565,3 +565,15 @@ func TestAfterAYieldResidueResumesAsFree(t *testing.T) {
 	}
 	t.Fatalf("never resumed: %+v", c.Report())
 }
+
+// A llamacpp placement on gpu holds no GPU while its image has no GPU build
+// (docker.LlamacppHasGPUBuild): the agent starts it on the CPU, so yielding
+// the GPU must not count it. vllm still is a GPU placement.
+func TestLlamacppWithNoGPUBuildIsNotPlacedOnGPU(t *testing.T) {
+	if placedOnGPU(Placed{Backend: "llamacpp", Target: "gpu"}) {
+		t.Fatal("llamacpp on gpu runs on the CPU: not placed on the GPU")
+	}
+	if !placedOnGPU(Placed{Backend: "vllm"}) || !placedOnGPU(Placed{Backend: "ollama", Target: "gpu"}) {
+		t.Fatal("vllm, and ollama on gpu, are placed on the GPU")
+	}
+}
