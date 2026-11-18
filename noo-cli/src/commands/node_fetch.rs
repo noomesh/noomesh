@@ -1970,7 +1970,7 @@ fn host_telemetry_darwin(user: &str, as_root: bool) -> Result<(), String> {
 /// the CA-signed lane open by default (1), or installs root code without the
 /// release check (2, i908: `crate::release_gate`). `#[used]` keeps the marker
 /// in every build, which is what the next CLI's floor check reads.
-const APPLY_GENERATION: u32 = 2;
+const APPLY_GENERATION: u32 = 1;
 #[used]
 static APPLY_GENERATION_MARKER: [u8; 24] = *b"noo-apply-generation=02;";
 
