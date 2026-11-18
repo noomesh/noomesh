@@ -363,6 +363,18 @@ step verify 900 -- bash -c 'fresh cluster verify --wait'
 # executor's "profile: 3.x form") is readable from the cell's artifacts. Same
 # redactor and upload scan as every log. Never the failed step.
 step probe-verify-json 300 -- bash -c 'fresh --json cluster verify'
+# The container onboard pulled the chat model into, chosen the way onboard's
+# pull_ollama chooses it (noo-cli onboard/steps.rs): noo-ollama-embed on a
+# standalone install (NOO_STANDALONE=1 or a .noo-standalone marker in the
+# install), else noo-ollama. The OLLAMA-VERIFIED probe reads its version.
+onboard_ollama_container() {
+    if [ "${NOO_STANDALONE:-}" = 1 ] || [ -n "$(find "$HOME" -maxdepth 4 -name .noo-standalone -print -quit 2>/dev/null)" ]; then
+        echo noo-ollama-embed
+    else
+        echo noo-ollama
+    fi
+}
+export -f onboard_ollama_container
 # PROBE (fa, 0.6.27-rc.2): the chat model onboard pulled is VERIFIED on a
 # fresh install. rc.1 WARNed "unverified (no controller record)" on every
 # controller cell: onboard's pull wrote no record, and the row's own remedy
@@ -391,11 +403,13 @@ print(\"verdict=absent detail=no ollama models row for \" + me)
   done
   echo "$out"
   # the ollama that pulled it: the record depends on what that version adds
-  # to a pulled manifest (0.40 adds the manifest itself and its list)
-  ov="$(sudo -n docker exec noo-ollama ollama --version 2>/dev/null | sed -n "s/.*version is //p" | head -n 1)"
+  # to a pulled manifest (0.40 adds the manifest itself and its list). Read
+  # from the container onboard pulled into (noo-ollama-embed on a one-box).
+  oc="$(onboard_ollama_container)"
+  ov="$( { docker exec "$oc" ollama --version 2>/dev/null || sudo -n docker exec "$oc" ollama --version 2>/dev/null; } | sed -n "s/.*version is //p" | head -n 1)"
   case "$out" in
-    verdict=ok*) echo "OLLAMA-VERIFIED PASS (ollama ${ov:-?}): the model onboard pulled is verified against the controller'"'"'s record of its pull: ${out#*detail=}" ;;
-    *) echo "OLLAMA-VERIFIED FAIL (ollama ${ov:-?}): a fresh install'"'"'s ollama models row should read verified, not: ${out}"; exit 1 ;;
+    verdict=ok*) echo "OLLAMA-VERIFIED PASS (ollama ${ov:-?} in $oc): the model onboard pulled is verified against the controller'"'"'s record of its pull: ${out#*detail=}" ;;
+    *) echo "OLLAMA-VERIFIED FAIL (ollama ${ov:-?} in $oc): a fresh install'"'"'s ollama models row should read verified, not: ${out}"; exit 1 ;;
   esac'
 # PROBE (general, rc.4): the same JSON from the cell's OLD shell, which lacks
 # the docker group: the rows that need docker must say "not judged" with the

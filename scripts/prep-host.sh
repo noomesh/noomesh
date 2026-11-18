@@ -742,6 +742,38 @@ data_dir() {  # data_dir DIR USER:GROUP: create DIR with that owner if it is mis
 }
 data_dir "$NOO_DATA_ROOT" noo-agent:noo-agent
 install -d -o noo-agent -g noo-agent "$NOO_DATA_ROOT/hf-cache" "$NOO_DATA_ROOT/models"
+# The installing operator writes the model store too (i1021). Onboard's model
+# step records each Ollama pull there as that operator (noo-cli
+# ollama_stage.rs record_after_pull), and `noo models fetch` writes weights
+# there; the re-own above left it noo-agent's 0755, so both failed with
+# EACCES on a fresh box. This is the exact ACL the store's own refusal tells
+# the operator to set (noo-cli models_fetch.rs unwritable_guide), set here
+# inside the one sudo they already gave prep, and named in prep's output.
+#   - models ONLY: never hf-cache, the ollama store or the data root;
+#   - the owner stays noo-agent: never chown (NFS refuses it, and the service
+#     account must keep owning it);
+#   - no setfacl, or a store that refuses ACLs (NFS), or any failure: the
+#     guide's remedy is printed and prep goes on. It never fails onboard.
+# The operator is ENROLL_USER (PREP_ENROLL_USER from the CLI, else SUDO_USER).
+models_store_grant() {  # models_store_grant DIR USER
+    if [ -z "$2" ] || [ "$2" = root ]; then
+        say "no installing operator named (PREP_ENROLL_USER/SUDO_USER): the model store $1 is writable by noo-agent and root only"
+        return 0
+    fi
+    if command -v setfacl >/dev/null 2>&1 && setfacl -m "u:$2:rwx" -m "d:u:$2:rwx" "$1" 2>/dev/null; then
+        say "granted $2 write access to the model store $1 (an ACL; the owner stays noo-agent)"
+        return 0
+    fi
+    if command -v setfacl >/dev/null 2>&1; then
+        say "could not grant $2 write access to the model store $1: setfacl refused (an NFS export takes ACLs on the server). Until then $2 cannot record pulls or fetch models into it:"
+    else
+        say "could not grant $2 write access to the model store $1: setfacl is not installed (the acl package). Until then $2 cannot record pulls or fetch models into it:"
+    fi
+    say "  sudo setfacl -m u:$2:rwx -m d:u:$2:rwx $1  # or grant just you write access with an ACL (NFSv4 exports: nfs4_setfacl on the server)"
+    say "  sudo chmod g+ws $1 && sudo usermod -aG noo-agent $2  # make the store group-writable for 'noo-agent' and join it (log in again afterwards); on NFS run the chmod on the server that exports it"
+    return 0
+}
+models_store_grant "$NOO_DATA_ROOT/models" "${ENROLL_USER:-}"
 if [ ! -L "$NOO_DATA_ROOT/hf-cache/hub" ] && { [ ! -e "$NOO_DATA_ROOT/hf-cache/hub" ] || { [ -d "$NOO_DATA_ROOT/hf-cache/hub" ] && [ -z "$(ls -A "$NOO_DATA_ROOT/hf-cache/hub")" ]; }; }; then
     install -d -o noo-agent -g noo-agent "$NOO_DATA_ROOT/hf-cache/hub"
 fi

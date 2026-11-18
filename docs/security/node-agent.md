@@ -995,6 +995,20 @@ There is no setting that marks a model trusted. On a node whose Ollama the
 agent does not manage (a Mac's native Ollama) a mismatch is reported, never
 repaired or refused.
 
+The controller's own node adopts the stack's Ollama (`noo-ollama-embed` on a
+one-box install). Its check reads the store compose binds for that container,
+`${NOO_DATA_ROOT}/ollama/models` (not `OLLAMA_DATA_DIR`, and not the agent's
+home), and is report-only: compose manages that Ollama, so the agent removes
+nothing and re-installs nothing there. A mismatch names the fix on that box,
+`noo models pull <tag>`, which pulls into the stack's Ollama again and rewrites
+the record.
+
+The agent reads Ollama's store through its "other" permission bits (the store
+belongs to the Ollama image's user). A manifest or blob it may not read is
+reported as "cannot read <path>" with its own remedy, `sudo chmod -R o+rX
+<store>` (or check the Ollama image's umask), never as a missing manifest or a
+mismatch.
+
 ## Backend door leaves
 
 Every backend the agent starts serves through a door that requires a

@@ -230,6 +230,14 @@ What it does, in order:
   directory group-writable (`chmod g+ws`) and join that group, or grant
   yourself an ACL (`setfacl -m u:<you>:rwx`). On NFS, apply either one on
   the server that exports the directory.
+  On a fresh install `noo onboard` sets that ACL for you: host prep, inside
+  the one sudo it already runs, grants the installing operator write access
+  to the model store (`$NOO_DATA_ROOT/models` only, never `hf-cache`, the
+  Ollama store or the data root; the owner stays `noo-agent`) and says so
+  ("granted <you> write access to the model store <dir>"). Without `setfacl`,
+  or on an NFS store that refuses it, prep prints the two remedies above and
+  goes on. An existing install is not changed: the first `noo models fetch`
+  or `noo models pull` on it prints the remedy.
 - **Authenticates with the controller's Hugging Face token**: `HF_TOKEN` (or
   `HUGGING_FACE_HUB_TOKEN`) from the process environment, else from the
   encrypted store `secrets/env.sops`. The token is sent only as an
@@ -315,6 +323,13 @@ installed, and only when every layer the registry's manifest names is in it
 unchanged and it adds nothing but the manifest Ollama pulled (the registry's
 own, by its sha256) and the list that named it. Verify-on-load checks against it; a placed node
 cannot import from it and is told to run `noo models fetch ollama:<tag>`.
+The record is written as you, so the store must be writable by you, the same
+test `noo models fetch` makes, checked before the pull. When it is not, the
+pull still happens, unrecorded: one line names the store, you and its owner,
+followed by the exact `sudo setfacl -m u:<you>:rwx -m d:u:<you>:rwx <store>`
+command, and the agent reports the model "unverified (no controller record)"
+until you pull it again. No other failure of the record is shown as a raw
+error number: it says what was being written.
 
 On the node, reconcile asks the store about a placed tag it does not hold; a
 staged tag takes the same import path as `noo cluster import-model`, which

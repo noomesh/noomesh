@@ -736,9 +736,11 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 				// loopback API the probe uses.
 				// Every role's model, not just the primary.
 				r.ensureOllamaModels(ctx, r.cfg.NodeID, t.ollamaRows, r.native.HasModel, r.native.Pull)
-				// Report only on a native ollama: never repaired, never
-				// refused (the server is the operator's).
-				r.verifyOllamaModels(ctx, t.ollamaRows, true)
+				// Report only on an adopted ollama: never repaired, never
+				// refused (the server is the operator's, or the stack's).
+				// The lane's runtime picks the store the check reads: the
+				// stack's is ${NOO_DATA_ROOT}/ollama, not this agent's HOME.
+				r.verifyOllamaModels(ctx, t.ollamaRows, adoptedLane(r.native.Runtime()))
 				// Advertise what the server holds, not only what it
 				// has loaded: an idle ollama has nothing loaded, and a
 				// heartbeat with no model is never routed to.
@@ -809,7 +811,7 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 				r.ensureOllamaModels(ctx, r.cfg.NodeID, t.ollamaRows, r.docker.OllamaHasModel, r.docker.OllamaPull)
 				// Then the bytes it holds, against the controller's store
 				// (off-tick; see ollama_verify.go).
-				r.verifyOllamaModels(ctx, t.ollamaRows, false)
+				r.verifyOllamaModels(ctx, t.ollamaRows, dockerpkg.OllamaLaneContainer)
 			}
 			curHash, hasLabel := t.specLabels[p.Backend]
 			switch decideBackendDrift(hasLabel, curHash, desiredHash, r.driftRecreated[p.Backend], t.floating[p.Backend]) {
@@ -1659,17 +1661,30 @@ func egressReaderFor(h hostsvc.Service) func(ctx context.Context) hostsvc.Egress
 	return rd.Read
 }
 
+// adoptedLane is the verifier lane of an adopted ollama with runtime rt: the
+// stack's on the controller's own node, else a native one. Never the
+// container lane, which repairs.
+func adoptedLane(rt string) string {
+	if rt == dockerpkg.OllamaLaneStack {
+		return dockerpkg.OllamaLaneStack
+	}
+	return dockerpkg.OllamaLaneNative
+}
+
 // ollamaVerifier is the production check: one verifier per lane (the
-// container's store, or a native ollama's), built once.
-func ollamaVerifier(c *dockerpkg.Client) func(context.Context, string, bool) dockerpkg.OllamaVerifyResult {
-	var once [2]sync.Once
-	var vs [2]*dockerpkg.OllamaVerifier
-	return func(ctx context.Context, model string, native bool) dockerpkg.OllamaVerifyResult {
+// container's store, a native ollama's, or the stack's), built once.
+func ollamaVerifier(c *dockerpkg.Client) func(context.Context, string, string) dockerpkg.OllamaVerifyResult {
+	lanes := [3]string{dockerpkg.OllamaLaneContainer, dockerpkg.OllamaLaneNative, dockerpkg.OllamaLaneStack}
+	var once [3]sync.Once
+	var vs [3]*dockerpkg.OllamaVerifier
+	return func(ctx context.Context, model string, lane string) dockerpkg.OllamaVerifyResult {
 		i := 0
-		if native {
-			i = 1
+		for j, l := range lanes {
+			if l == lane {
+				i = j
+			}
 		}
-		once[i].Do(func() { vs[i] = c.NewOllamaVerifier(native) })
+		once[i].Do(func() { vs[i] = c.NewOllamaVerifier(lanes[i]) })
 		return vs[i].Verify(ctx, model)
 	}
 }

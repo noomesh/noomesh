@@ -149,6 +149,22 @@ fn can_write_dir(dir: &Path) -> bool {
     unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
 }
 
+/// Who cannot write `dir`: `(me, owner, group, mode)` when the invoking user
+/// cannot ([`can_write_dir`]), None when they can. The one test every writer
+/// of the store makes: `noo models fetch` ([`writable_store`]) and the record
+/// of a pull (ollama_stage.rs `record_before_pull`).
+pub(crate) fn store_unwritable(dir: &Path) -> Option<(String, String, String, u32)> {
+    if can_write_dir(dir) {
+        return None;
+    }
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(dir).ok();
+    let (uid, gid, mode) = md.map(|m| (m.uid(), m.gid(), m.mode())).unwrap_or((0, 0, 0));
+    // SAFETY: geteuid has no preconditions.
+    let me = user_name(unsafe { libc::geteuid() });
+    Some((me, user_name(uid), group_name(gid), mode))
+}
+
 /// The refusal for a store the invoking user cannot write, with the exact
 /// remedy. Pure (names passed in), for the tests.
 ///
@@ -812,13 +828,8 @@ pub(crate) fn writable_store(g: &Globals, rerun: &str) -> (String, PathBuf) {
             Some("set MODELS_DIR in .env to the directory the model-cache serves as /gguf/, or create it"),
         );
     }
-    if !can_write_dir(&dir) {
-        use std::os::unix::fs::MetadataExt;
-        let md = std::fs::metadata(&dir).ok();
-        let (uid, gid, mode) = md.map(|m| (m.uid(), m.gid(), m.mode())).unwrap_or((0, 0, 0));
-        // SAFETY: geteuid has no preconditions.
-        let me = user_name(unsafe { libc::geteuid() });
-        let (msg, mut guide) = unwritable_guide(&store, &user_name(uid), &group_name(gid), mode, &me);
+    if let Some((me, owner, group, mode)) = store_unwritable(&dir) {
+        let (msg, mut guide) = unwritable_guide(&store, &owner, &group, mode, &me);
         guide[2].0 = rerun.to_string();
         if g.json {
             fail(true, ExitCode::Generic, "store_not_writable", &msg, Some(&guide[0].0));
