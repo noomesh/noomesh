@@ -245,10 +245,24 @@ pub fn darwin_check(
     if let Some(f) = fin {
         would_accept("release", &version, Some(f), prev)?;
     }
+    // The previous final this list vouches for (`<asset>@v<prev>` rows).
+    let prev_tag = prev_tag_of_sums(&sums, &version)?;
+    let mut recorded = version.clone();
     for kind in DARWIN_LISTED.iter().copied().filter(|k| payloads.contains_key(*k)) {
         let sha = sha256_hex(&payloads[kind]);
-        if !names_for(&sums, &sha).iter().any(|n| darwin_asset_ok(kind, n)) {
-            return Err(refuse(kind, &format!("sha256 {sha} is not in release {version}'s signed list")));
+        let names = names_for(&sums, &sha);
+        if names.iter().any(|n| darwin_asset_ok(kind, n)) {
+            continue;
+        }
+        match prev_tag.as_deref() {
+            Some(p) if names.iter().any(|n| prev_name(n, p).is_some_and(|b| darwin_asset_ok(kind, b))) => {
+                // The previous final's own payload: judged as that release.
+                if let Some(f) = fin {
+                    would_accept("release", p, Some(f), prev)?;
+                }
+                recorded = p.to_string();
+            }
+            _ => return Err(refuse(kind, &format!("sha256 {sha} is not in release {version}'s signed list"))),
         }
     }
     for kind in DARWIN_PLISTS.iter().copied().filter(|k| payloads.contains_key(*k)) {
@@ -263,7 +277,46 @@ pub fn darwin_check(
             return Err(refuse(kind, &format!("sha256 {sha} is not release {version}'s LaunchDaemon for {user}")));
         }
     }
-    Ok(Some(version))
+    Ok(Some(recorded))
+}
+
+/// `<asset>` when `name` is `<asset>@v<prev>`.
+fn prev_name<'a>(name: &'a str, prev: &str) -> Option<&'a str> {
+    name.strip_suffix(prev).and_then(|r| r.strip_suffix("@v"))
+}
+
+/// Every release also vouches for its PREVIOUS FINAL: rows `<sha>
+/// <asset>@v<prev>` in sha256sums.txt. The one tag those rows name, if any:
+/// Err (the refusal line) for a second tag, an rc, or a tag not older than
+/// the list's own release `own`. Same rule as noo-apply.sh `release_prev_tag`.
+pub fn prev_tag_of_sums(sums: &str, own: &str) -> Result<Option<String>, String> {
+    let tags: Vec<&str> = sums.lines()
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .map(|n| n.trim_start_matches('*').rsplit('/').next().unwrap_or(n))
+        .filter_map(|n| n.split_once("@v").map(|(_, t)| t))
+        .collect();
+    one_prev_tag(tags, own, "release-sums")
+}
+
+/// [`prev_tag_of_sums`] for a stack lock's `# node-agent-sha256@v<prev>` rows.
+pub fn prev_tag_of_lock(lock: &str, own: &str) -> Result<Option<String>, String> {
+    let tags: Vec<&str> = lock.lines()
+        .filter_map(|l| l.strip_prefix("# node-agent-sha256@v"))
+        .filter_map(|r| r.split(' ').next())
+        .collect();
+    one_prev_tag(tags, own, "release-lock")
+}
+
+fn one_prev_tag(mut tags: Vec<&str>, own: &str, what: &str) -> Result<Option<String>, String> {
+    tags.sort_unstable();
+    tags.dedup();
+    match tags.as_slice() {
+        [] => Ok(None),
+        [t] if t.contains("-rc.") => Err(refuse(what, &format!("its previous-release rows name an rc ({t}), not a final"))),
+        [t] if version_key(t).is_some() && older(t, own) => Ok(Some(t.to_string())),
+        [t] => Err(refuse(what, &format!("its previous-release rows name {t}, which is not a final older than {own}"))),
+        many => Err(refuse(what, &format!("it vouches for more than one previous release ({})", many.join(" ")))),
+    }
 }
 
 /// The controller's pre-check: every root-run kind in `files` is listed in
@@ -271,15 +324,26 @@ pub fn darwin_check(
 /// bundle the node would refuse is refused here, before it is staged, with
 /// the same words. Ok(()) also when the bundle carries no root code.
 pub fn controller_check(files: &[(&str, Vec<u8>)], darwin: bool, sums: &str, version: &str, lock: Option<&str>) -> Result<(), String> {
+    let prev = prev_tag_of_sums(sums, version)?;
+    let lock_prev = match lock {
+        Some(l) => {
+            let tag = l.lines().find_map(|x| x.strip_prefix("# stack ")).map(str::trim).unwrap_or("");
+            prev_tag_of_lock(l, tag)?
+        }
+        None => None,
+    };
     for (kind, bytes) in files {
         let sha = sha256_hex(bytes);
+        let names = names_for(sums, &sha);
+        // A row for this release, or one for the previous final it vouches for.
+        let any = |ok: &dyn Fn(&str) -> bool| names.iter().any(|n| ok(*n) || prev.as_deref().and_then(|p| prev_name(*n, p)).is_some_and(ok));
         let listed = match (darwin, *kind) {
-            (true, k) if DARWIN_LISTED.contains(&k) => names_for(sums, &sha).iter().any(|n| darwin_asset_ok(k, n)),
-            (false, "applier") => names_for(sums, &sha).contains(&"noo-apply.sh"),
-            (false, "fetcher") => names_for(sums, &sha).contains(&"noo-fetch.sh"),
-            (false, "hostd-binary") => names_for(sums, &sha).iter().any(|n| linux_asset_ok("noo-hostd-", n)),
-            (false, "harness-binary") => names_for(sums, &sha).iter().any(|n| linux_asset_ok("noo-gateway-", n)),
-            (false, "agent-binary") => lock.is_some_and(|l| lock_lists_agent(l, &sha)),
+            (true, k) if DARWIN_LISTED.contains(&k) => any(&|n| darwin_asset_ok(k, n)),
+            (false, "applier") => any(&|n| n == "noo-apply.sh"),
+            (false, "fetcher") => any(&|n| n == "noo-fetch.sh"),
+            (false, "hostd-binary") => any(&|n| linux_asset_ok("noo-hostd-", n)),
+            (false, "harness-binary") => any(&|n| linux_asset_ok("noo-gateway-", n)),
+            (false, "agent-binary") => lock.is_some_and(|l| lock_lists_agent(l, &sha, lock_prev.as_deref())),
             _ => true,
         };
         if !listed {
@@ -296,12 +360,17 @@ fn linux_asset_ok(prefix: &str, name: &str) -> bool {
         .is_some_and(|arch| !arch.is_empty() && arch.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'))
 }
 
-/// Does the signed stack lock carry a `# node-agent-sha256 linux/<arch> <sha>` row for `sha`?
-pub fn lock_lists_agent(lock: &str, sha: &str) -> bool {
+/// Does the signed stack lock carry a `# node-agent-sha256 linux/<arch> <sha>`
+/// row for `sha` (or, with `prev`, a `# node-agent-sha256@v<prev> …` one)?
+pub fn lock_lists_agent(lock: &str, sha: &str, prev: Option<&str>) -> bool {
+    let prev_key = prev.map(|p| format!("node-agent-sha256@v{p}"));
     lock.lines().any(|l| {
         let mut it = l.trim_end().splitn(4, ' ');
-        matches!((it.next(), it.next(), it.next(), it.next()),
-            (Some("#"), Some("node-agent-sha256"), Some("linux/amd64" | "linux/arm64"), Some(s)) if s.eq_ignore_ascii_case(sha))
+        let (hash, key, arch, s) = (it.next(), it.next(), it.next(), it.next());
+        hash == Some("#")
+            && key.is_some_and(|k| k == "node-agent-sha256" || prev_key.as_deref() == Some(k))
+            && matches!(arch, Some("linux/amd64" | "linux/arm64"))
+            && s.is_some_and(|s| s.eq_ignore_ascii_case(sha))
     })
 }
 
@@ -434,6 +503,34 @@ mod tests {
         let h = crate::commands::provision::DARWIN_HARNESS_PLIST.replace("__USER__", "bob");
         let p = bundle("0.6.27", &[], &[("harness-plist", h.as_bytes())]);
         assert!(check(&p, None).unwrap_err().contains("harness-plist"), "another user's plist passed");
+    }
+
+    /// i908: every release vouches for its previous final; such a payload is
+    /// judged by the floor as that release, and only ONE older final may be named.
+    #[test]
+    fn a_previous_release_row_is_judged_as_that_release() {
+        let hostd: &[u8] = b"0.6.27 hostd";
+        let row = format!("{}  noo-hostd-aarch64-apple-darwin@v0.6.27", sha256_hex(hostd));
+        // Listed ONLY as the previous final's (`@v0.6.27`), re-signed.
+        let mut p = bundle("0.6.28", &[], &[("hostd-binary", hostd)]);
+        let mut sums = String::from_utf8(p["release-sums"].clone()).unwrap();
+        sums.push_str(&format!("{row}\n"));
+        p.insert("release-sums.sig".into(), sign(&release_key(), sums.as_bytes()).into_bytes());
+        p.insert("release-sums".into(), sums.into_bytes());
+        // One back: accepted, and recorded as 0.6.27 (the record does not move).
+        assert_eq!(check_as(&p, Some("release-final 0.6.28\nrelease-prev 0.6.27\n"), "0.6.28").unwrap().as_deref(), Some("0.6.27"));
+        // Two back: refused, ahead wording.
+        assert!(check_as(&p, Some("release-final 0.6.29\nrelease-prev 0.6.28\n"), "0.6.29").unwrap_err()
+            .starts_with("REFUSED release 0.6.27 — this node is ahead of its controller"));
+        // One previous final only, older than the list's own release, never an rc.
+        let s2 = "aa  noo-hostd-x@v0.6.26\nbb  noo-fetch.sh@v0.6.25\n";
+        assert!(prev_tag_of_sums(s2, "0.6.27").unwrap_err().contains("more than one previous release"));
+        assert!(prev_tag_of_sums("aa  noo-apply.sh@v0.6.27\n", "0.6.27").unwrap_err().contains("not a final older than"));
+        assert!(prev_tag_of_sums("aa  noo-apply.sh@v0.6.26-rc.1\n", "0.6.27").unwrap_err().contains("an rc"));
+        assert_eq!(prev_tag_of_sums("aa  noo-apply.sh@v0.6.26\n", "0.6.27").unwrap().as_deref(), Some("0.6.26"));
+        assert_eq!(prev_tag_of_lock("# node-agent-sha256@v0.6.26 linux/amd64 aa\n", "v0.6.27").unwrap().as_deref(), Some("0.6.26"));
+        assert!(lock_lists_agent("# node-agent-sha256@v0.6.26 linux/amd64 aa\n", "aa", Some("0.6.26")));
+        assert!(!lock_lists_agent("# node-agent-sha256@v0.6.26 linux/amd64 aa\n", "aa", None));
     }
 
     /// The controller reads what the node last reported and asks the same question.

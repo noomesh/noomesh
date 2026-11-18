@@ -1580,6 +1580,20 @@ or rc ships.
   and the previous one, and an rc of the current or a later release, nothing
   older. So a bad release can be rolled back once, and an old release cannot
   be replayed.
+- **Each release vouches for the one before.** The release job adds the
+  previous final's own root-run payloads to this release's lists, by digest
+  from that final's signed lists: `<sha>  <asset>@v<prev>` in
+  `sha256sums.txt`, `# node-agent-sha256@v<prev> linux/<arch> <sha>` in the
+  lock. A payload matched only by such a row is judged as release `<prev>`
+  (one back accepted, two back refused) and does not move the record. A list
+  names one such release, a final older than its own. No row ever installs a
+  generation-1 applier.
+- **A node ahead of its controller says so.** A staged release older than the
+  record allows is refused as "this node is ahead of its controller", naming
+  the release to roll the controller to (`noo upgrade --stack`). The
+  controller reads each node's reported record and refuses to stage such a
+  bundle first; `noo cluster verify`'s `release check` row FAILs for a node
+  whose last bundle was refused, since it refuses every bundle until fixed.
 - **No dev path.** A build that is not a published release or rc has no
   signed list. The node refuses its root code with exit 75 and one line
   naming the kind, its sha256 and the remedy: roll to a published release or
