@@ -52,7 +52,7 @@ def refused(r: subprocess.CompletedProcess, why: str) -> str:
     assert why in r.stderr, r.stderr
     assert "nothing installed" not in r.stdout
     line = [l for l in r.stderr.splitlines() if "REFUSED" in l][-1]
-    assert "roll to a published release or rc" in line, line
+    assert "roll to a published release or rc" in line or "(noo upgrade --stack)" in line, line
     return line
 
 
@@ -235,7 +235,7 @@ def test_the_release_floor_steps_back_one_final(fleet: Fleet, final: str, prev: 
     if ok:
         passed(r)
     else:
-        refused(r, "steps back at most one final" if "-rc." not in version else "an rc of a release older")
+        refused(r, "this node is ahead of its controller")
 
 
 @pytest.mark.parametrize("final,prev,tag,ok", [
@@ -248,7 +248,7 @@ def test_the_stack_floor_steps_back_one_final(fleet: Fleet, final: str, prev: st
     if ok:
         passed(r)
     else:
-        refused(r, "steps back at most one final")
+        refused(r, "this node is ahead of its controller")
 
 
 def test_a_floor_record_that_is_not_a_version_refuses(fleet: Fleet) -> None:
@@ -393,7 +393,16 @@ def test_provision_attaches_the_lists_after_every_payload_and_before_signing() -
 
 def test_every_other_bundle_carrying_the_applier_carries_the_lists() -> None:
     sub = (REPO / "noo-cli/src/commands/cluster_provision_subprocess.rs").read_text()
-    assert 'if kind == "applier" || kind == "hostd-binary" {\n                let proof = crate::commands::provision::release_proof_for(g, &files)?;' in sub
+    gate = sub[sub.index('if kind == "applier" || kind == "hostd-binary" {'):]
+    gate = gate[:gate.index("files.extend(proof);")]
+    assert "node_floor_refusal(&msg" in gate and "release_proof_for(g, &files)?" in gate, gate
+
+
+def test_the_controller_refuses_a_node_ahead_before_staging() -> None:
+    body = PROVISION[PROVISION.index("fn attach_release_proof("):]
+    body = body[:body.index("\n}\n")]
+    assert body.index("node_floor_refusal(&reported_apply_msg(g, &a.node)") < body.index('files.push(("release-sums"')
+    assert 'Some("noo upgrade --stack")' in body
     sec = (REPO / "noo-cli/src/commands/security_local.rs").read_text()
     push = sec[sec.index("fn build_signed_cert_bundle("):]
     push = push[:push.index("\n}\n")]
@@ -410,3 +419,38 @@ def test_upgrade_hostd_ships_the_release_asset_with_its_list() -> None:
     assert 'if kind == "applier" || kind == "hostd-binary" {' in sub
     usage = (REPO / "noo-cli/src/usage.rs").read_text()
     assert '(&["cluster", "upgrade-hostd"], "<node>... [-y|--yes|--force]"' in usage
+
+
+# i940: a node ahead of its controller says so, naming what to roll to.
+@pytest.mark.parametrize("record,version,line", [
+    ("release-final 0.6.29\nrelease-prev 0.6.28\n", "0.6.27",
+     "REFUSED release 0.6.27 — this node is ahead of its controller (it applied 0.6.29 after 0.6.28; the controller staged 0.6.27): "
+     "roll the controller to 0.6.28 or later (noo upgrade --stack), then this node takes its bundles again (75)"),
+    ("release-final 0.6.28\n", "0.6.27",
+     "REFUSED release 0.6.27 — this node is ahead of its controller (it applied 0.6.28; the controller staged 0.6.27): "
+     "roll the controller to 0.6.28 or later (noo upgrade --stack), then this node takes its bundles again (75)"),
+    ("release-final 0.6.28\nrelease-prev 0.6.27\n", "0.6.27-rc.4",
+     "REFUSED release 0.6.27-rc.4 — this node is ahead of its controller (it applied 0.6.28 after 0.6.27; the controller staged 0.6.27-rc.4): "
+     "roll the controller to 0.6.28 or later (noo upgrade --stack), then this node takes its bundles again (75)"),
+])
+def test_a_node_ahead_of_its_controller_names_the_cause(fleet: Fleet, record: str, version: str, line: str) -> None:
+    fleet.floor.write_text(record)
+    files = {"hostd-binary": PAYLOADS["hostd-binary"]}
+    r = fleet.apply(fleet.bundle({**files, **fleet.release_proof(files, version=version)}))
+    assert r.returncode == 75 and f"noo-apply: {line}" in r.stderr.splitlines(), r.stderr
+
+
+def test_a_stack_ahead_names_the_cause(fleet: Fleet) -> None:
+    fleet.floor.write_text("stack-final v0.6.29\nstack-prev v0.6.28\n")
+    files = {"agent-binary": PAYLOADS["agent-binary"]}
+    r = fleet.apply(fleet.bundle({**files, **fleet.release_proof(files, stack="v0.6.27")}))
+    assert ("noo-apply: REFUSED stack v0.6.27 — this node is ahead of its controller (it applied v0.6.29 after v0.6.28; "
+            "the controller staged v0.6.27): roll the controller to v0.6.28 or later (noo upgrade --stack), then this node "
+            "takes its bundles again (75)") in r.stderr.splitlines(), r.stderr
+
+
+def test_the_shell_and_rust_ahead_lines_are_the_same_words() -> None:
+    rs = (REPO / "noo-cli/src/release_gate.rs").read_text()
+    for frag in ["this node is ahead of its controller (it applied ", "; the controller staged ",
+                 " or later (noo upgrade --stack), then this node takes its bundles again ("]:
+        assert frag in TEXT and frag in rs, frag

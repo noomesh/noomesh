@@ -5604,7 +5604,7 @@ pub(crate) fn release_check_row(reports: &[(String, Option<i64>, String)]) -> Op
     let (mut active, mut inactive, mut refused) = (Vec::new(), Vec::new(), Vec::new());
     for (node, rc, msg) in reports {
         if *rc == Some(crate::release_gate::REFUSED) && msg.contains("REFUSED") {
-            refused.push(node.clone());
+            refused.push((node.clone(), refusal_line(msg)));
             continue;
         }
         let generation = msg.find(RELEASE_CHECK_TAG).and_then(|at| {
@@ -5625,16 +5625,35 @@ pub(crate) fn release_check_row(reports: &[(String, Option<i64>, String)]) -> Op
     if !inactive.is_empty() {
         detail.push_str(&format!("; NOT yet on {}: their applier predates the check, so the fleet signing key alone still decides their root code", inactive.join(", ")));
     }
-    if let Some(first) = refused.first() {
-        return Some(fail(NAME, format!(
-            "{detail}; {} REFUSED root code its release list does not name (exit 75): a bundle carried a binary no published release ships",
-            refused.join(", ")),
-            format!("on the controller: noo upgrade --all from a published release or rc; the node's journal (journalctl -t noo-apply) names the kind and sha256 — {first}")));
+    if !refused.is_empty() {
+        let ahead = refused.iter().any(|(_, line)| line.contains("this node is ahead of its controller"));
+        let unlisted = refused.iter().any(|(_, line)| !line.contains("this node is ahead of its controller"));
+        let said: Vec<String> = refused.iter().map(|(node, line)| format!(
+            "{node} refused its last bundle ({line}): a refused node refuses ALL bundles from this controller, \
+             cert pushes included, until the cause is fixed")).collect();
+        let mut remedy = Vec::new();
+        if ahead {
+            remedy.push("node ahead of its controller: noo upgrade --stack (roll the controller to the release the line names)");
+        }
+        if unlisted {
+            remedy.push("root code no release lists: roll to a published release or rc (noo upgrade --all)");
+        }
+        return Some(fail(NAME, format!("{}; {detail}", said.join("; ")), remedy.join("; ")));
     }
     if !inactive.is_empty() {
         return Some(warn(NAME, detail, Some("noo upgrade --all — the first roll installs the checking applier on the signing key alone; from then on root code needs the release key".to_string())));
     }
     Some(ok(NAME, detail))
+}
+
+/// The refusal line in an apply report: from its last `REFUSED` through the
+/// `(75)` that ends it (the Linux report is the applier's log tail with line
+/// breaks folded to spaces; the Mac's is the error itself).
+fn refusal_line(msg: &str) -> String {
+    let Some(at) = msg.rfind("REFUSED") else { return msg.trim().to_string() };
+    let rest = &msg[at..];
+    let end = rest.find("(75)").map(|i| i + 4).unwrap_or(rest.len());
+    rest[..end].trim().to_string()
 }
 
 /// The `vendor CLIs` row (i908): a vendor CLI (Claude Code, Copilot CLI,
@@ -13020,10 +13039,26 @@ mod tests {
         assert!(c.detail.contains("NOT yet on host7") && !c.detail.contains("NOT yet on host3"), "{}", c.detail);
         let gen1 = "release-check: generation=1 release=none".to_string();
         assert_eq!(release_check_row(&[("host8".into(), Some(0), gen1)]).unwrap().verdict, Verdict::Warn);
-        let refused = "noo-apply: REFUSED hostd-binary — sha256 ab is not in release 0.6.27's signed list; roll to a published release or rc (75)".to_string();
-        let c = release_check_row(&[("host3".into(), Some(0), on), ("host9".into(), Some(75), refused)]).unwrap();
+        let refused = "noo-fetch: x noo-apply: REFUSED hostd-binary — sha256 ab is not in release 0.6.27's signed list; roll to a published release or rc (75) more".to_string();
+        let c = release_check_row(&[("host3".into(), Some(0), on.clone()), ("host9".into(), Some(75), refused)]).unwrap();
         assert_eq!(c.verdict, Verdict::Fail);
-        assert!(c.detail.contains("host9 REFUSED"), "{}", c.detail);
+        assert!(c.detail.contains("host9 refused its last bundle (REFUSED hostd-binary — sha256 ab is not in release 0.6.27's signed list; \
+            roll to a published release or rc (75)): a refused node refuses ALL bundles from this controller, cert pushes included, until the cause is fixed"), "{}", c.detail);
+        let r = c.remedy.clone().unwrap();
+        assert!(r.contains("roll to a published release or rc") && !r.contains("--stack"), "{r}");
+    }
+
+    /// i940: a node ahead of its controller fails the row ON THE CONTROLLER,
+    /// with the stack roll as the remedy.
+    #[test]
+    fn a_node_ahead_of_its_controller_fails_the_release_check_row() {
+        let line = "REFUSED release 0.6.27 — this node is ahead of its controller (it applied 0.6.29 after 0.6.28; the controller staged 0.6.27): \
+                    roll the controller to 0.6.28 or later (noo upgrade --stack), then this node takes its bundles again (75)";
+        let c = release_check_row(&[("host5".into(), Some(75), format!("noo-apply: {line}"))]).unwrap();
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains(&format!("host5 refused its last bundle ({line}): a refused node refuses ALL bundles")), "{}", c.detail);
+        let r = c.remedy.unwrap();
+        assert!(r.contains("noo upgrade --stack") && !r.contains("published release"), "{r}");
     }
 
     #[test]
