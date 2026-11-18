@@ -1687,8 +1687,13 @@ check. Both need the operator at the machine:
   `vendor CLIs` (which nodes carry a self-attested CLI).
 
 The first roll to 0.6.27 installs the checking applier on the signing key
-alone, because the applier already on the node predates the check. From then
-on the generation floor refuses any applier older than generation 2.
+alone, because the applier already on the node predates the check. That
+first, applier-only bundle can carry no release list (an older applier
+refuses unknown kinds), so once the new applier runs on it, it finds its
+one payload is itself and says `applier-only bundle: this applier is already
+installed`, with no refusal and no failed apply. The full bundle, with its
+lists, follows. From then on the generation floor refuses any applier older
+than generation 2.
 
 ### For agents
 
