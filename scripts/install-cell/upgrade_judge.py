@@ -195,7 +195,14 @@ def judge():
         hand = [l.strip() for l in (roll_journal + "\n" + roll).splitlines()
                 if "applier-only bundle: this applier is already installed" in l and "nothing to install" in l]
         e75 = [l.strip() for l in roll.splitlines() if "reported exit 75" in l]
-        if len(hand) >= 1 and not e75:
+        # The applier-only bundle is staged only when applier_first_due holds
+        # (the node never reported an apply, or has no applier; provision.rs):
+        # the CLI says "installed the applier — staging the full bundle". A
+        # node that already reported an apply gets none: not applicable (97).
+        due = "installed the applier — staging the full bundle" in roll or bool(e75) or bool(hand)
+        if not due:
+            say("A8", "NOT APPLICABLE", "no applier-only bundle in this roll (the self node had already reported an apply)")
+        elif len(hand) >= 1 and not e75:
             say("A8", "PASS", hand[0])
         else:
             say("A8", "FAIL", " | ".join(e75[:1] + hand[:2]) or "no 'applier-only bundle: this applier is already installed … nothing to install' in the --all window")
