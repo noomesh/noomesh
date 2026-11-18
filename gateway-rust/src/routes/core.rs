@@ -1548,10 +1548,7 @@ async fn lookup_user_db(
 
     let (uname, hashed_pw, disabled, scopes_json, _fail_count, locked_until, role_str) = row;
 
-    // Check lockout
-    let is_locked = locked_until
-        .map(|lu| lu > chrono::Utc::now())
-        .unwrap_or(false);
+    let is_locked = locked_now(locked_until, jiff::Timestamp::now());
 
     let scopes: Vec<String> = scopes_json.as_array()
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
@@ -1571,6 +1568,38 @@ async fn lookup_user_db(
         scopes,
         role,
     }))
+}
+
+/// A lockout is in force while `locked_until` is still ahead of `now`; at the
+/// instant itself it has ended, and no `locked_until` is no lockout.
+fn locked_now(locked_until: Option<jiff::Timestamp>, now: jiff::Timestamp) -> bool {
+    locked_until.is_some_and(|until| until > now)
+}
+
+#[cfg(test)]
+mod lockout_tests {
+    use super::locked_now;
+    use jiff::{SignedDuration, Timestamp};
+
+    #[test]
+    fn a_lockout_holds_until_its_instant_and_not_after() {
+        let now = Timestamp::from_second(1_800_000_000).unwrap();
+        let ms = SignedDuration::from_millis(1);
+        assert!(locked_now(Some(now + ms), now), "a lockout ending after now holds");
+        assert!(!locked_now(Some(now), now), "at its instant the lockout has ended");
+        assert!(!locked_now(Some(now - ms), now), "a lockout in the past is over");
+        assert!(!locked_now(None, now), "no locked_until is no lockout");
+    }
+
+    /// The login lookup must ask with the current time and fold the lockout
+    /// into `disabled`, or a locked account logs in.
+    #[test]
+    fn the_login_lookup_refuses_a_locked_account() {
+        let own = crate::test_src::own_code(include_str!("core.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn lookup_user_db(");
+        assert!(body.contains("locked_now(locked_until, jiff::Timestamp::now())"), "the lookup must check the lockout against now");
+        assert!(body.contains("disabled: disabled || is_locked,"), "a locked account must read as disabled");
+    }
 }
 
 /// What the DB can tell us about existing admin accounts.
