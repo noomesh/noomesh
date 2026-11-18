@@ -157,12 +157,7 @@ where
 
 /// Grant row type for the admin listing: `(username, roles, updated_at,
 /// updated_by)`. `updated_at` is `NOT NULL DEFAULT now()`.
-pub type GrantDetail = (
-    String,
-    Value,
-    chrono::DateTime<chrono::Utc>,
-    Option<String>,
-);
+pub type GrantDetail = (String, Value, jiff::Timestamp, Option<String>);
 
 /// All grants with audit columns, for the admin listing.
 pub async fn list_grants_detailed<'e, E>(db: E) -> Result<Vec<GrantDetail>, sqlx::Error>
@@ -170,25 +165,20 @@ where
     E: sqlx::PgExecutor<'e>,
 {
     let rows = sqlx::query!(
-        "SELECT username, roles, updated_at, updated_by \
-         FROM noo_kb_role_grants ORDER BY username"
+        r#"SELECT username, roles, updated_at AS "updated_at: jiff_sqlx::Timestamp", updated_by
+           FROM noo_kb_role_grants ORDER BY username"#
     )
     .fetch_all(db)
     .await?;
     Ok(rows
         .into_iter()
-        .map(|r| (r.username, r.roles, r.updated_at, r.updated_by))
+        .map(|r| (r.username, r.roles, r.updated_at.to_jiff(), r.updated_by))
         .collect())
 }
 
 /// Team row type: `(name, description, created_at, created_by)`.
 /// `created_at` is `NOT NULL DEFAULT now()`.
-pub type TeamDetail = (
-    String,
-    Option<String>,
-    chrono::DateTime<chrono::Utc>,
-    Option<String>,
-);
+pub type TeamDetail = (String, Option<String>, jiff::Timestamp, Option<String>);
 
 /// All teams, ordered by name.
 ///
@@ -200,14 +190,14 @@ where
     E: sqlx::PgExecutor<'e>,
 {
     let rows = sqlx::query!(
-        "SELECT name, description, created_at, created_by \
-         FROM noo_kb_teams ORDER BY name"
+        r#"SELECT name, description, created_at AS "created_at: jiff_sqlx::Timestamp", created_by
+           FROM noo_kb_teams ORDER BY name"#
     )
     .fetch_all(db)
     .await?;
     Ok(rows
         .into_iter()
-        .map(|r| (r.name, r.description, r.created_at, r.created_by))
+        .map(|r| (r.name, r.description, r.created_at.to_jiff(), r.created_by))
         .collect())
 }
 
