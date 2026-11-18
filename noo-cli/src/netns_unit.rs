@@ -265,7 +265,7 @@ pub(crate) enum Route {
 pub(crate) fn route(owner_is_root: bool, applier: Option<Applier>, self_node: bool, at_terminal: bool, root_ok: bool) -> Route {
     if !owner_is_root && self_node {
         match applier {
-            Some(a) if a.generation >= MIN_APPLIER_GENERATION && a.knows_kind => return Route::Stage,
+            Some(a) if a.generation >= MIN_APPLIER_GENERATION => return Route::Stage,
             Some(a) => return Route::OldApplier(a.generation),
             None => {}
         }
