@@ -1171,9 +1171,7 @@ mod tests {
         let mut r = row(id, et, "gateway", "ok", key);
         r.actor = actor.into();
         r.entry_hash = Some(r.hash_under(key));
-        r.timestamp = chrono::DateTime::from_timestamp(CP_AT + secs, 0)
-            .expect("in range")
-            .to_rfc3339();
+        r.timestamp = crate::wire_time::rfc3339_offset(jiff::Timestamp::from_second(CP_AT + secs).expect("in range"));
         r.ts_us = (CP_AT + secs) * 1_000_000;
         r
     }
@@ -1385,7 +1383,7 @@ mod tests {
 
     fn at(r: &mut AuditRow, secs: i64) {
         r.ts_us = (CP_AT + secs) * 1_000_000;
-        r.timestamp = chrono::DateTime::from_timestamp(CP_AT + secs, 0).expect("in range").to_rfc3339();
+        r.timestamp = crate::wire_time::rfc3339_offset(jiff::Timestamp::from_second(CP_AT + secs).expect("in range"));
     }
 
     fn sign_v2(r: &mut AuditRow, key: &[u8]) {
