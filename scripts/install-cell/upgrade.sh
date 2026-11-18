@@ -29,6 +29,10 @@ mkdir -p "$OUT" "$OUT/stranger-cwd"
 . "$HERE/lib.sh"
 export PATH="$HOME/.local/bin:$PATH"
 J="$OUT/judge"; mkdir -p "$J"
+# Raw journals stay OUTSIDE the uploaded dir: the artifacts are public, and
+# the applier's own `node.key=unchanged` trips the secret scan (rc.2, rc.3).
+# The judge reads them; only its verdict lines are uploaded.
+JR="$(mktemp -d)"; chmod 700 "$JR"
 
 meta cell "$CELL"
 meta runner "$RUNNER"
@@ -108,7 +112,7 @@ noo --json cluster verify > "$J/verify-after.json" 2>/dev/null
 # noo-fetch.service, so journald files it as `noo-fetch`, NOT `-t noo-apply`
 # (only its `logger -t noo-apply` refusals land there): keep both.
 sudo -n journalctl --no-pager --since "@$ROLL_T0" 2>/dev/null | grep -E "noo-apply|noo-fetch|noo-node-agent" \
-  | python3 "$CELL_PY" redact > "$J/roll-window.journal"
+  | python3 "$CELL_PY" redact > "$JR/roll-window.journal"
 
 # ── 4. the same-tag --stack (1b's Stage route on a node whose applier is new) ─
 # 0.6.26's onboard already installed noo-netns-restore.service (its own sudo
@@ -118,10 +122,14 @@ sudo -n journalctl --no-pager --since "@$ROLL_T0" 2>/dev/null | grep -E "noo-app
 step remove-netns-unit 60 -- sh -c 'echo "unit before: $(ls -l /etc/systemd/system/noo-netns-restore.service 2>&1)"
   sudo -n rm -f /etc/systemd/system/noo-netns-restore.service && sudo -n systemctl daemon-reload; echo "__rm=$?"
   echo "unit after: $(ls /etc/systemd/system/noo-netns-restore.service 2>&1)"'
+# journald's --since is whole seconds: keep the cell's own sudo (the capture
+# above, the unit removal) out of the --stack's window.
+sleep 2
 STACK_T0="$(date +%s)"
 step upgrade-stack-same-tag 2400 -- noo upgrade --stack --version "$TARGET" --yes
 echo "$?" > "$J/stack.rc"
 STACK_T1="$(date +%s)"
+sleep 2
 
 # ── 5. a chat answer after both ────────────────────────────────────────────
 step chat-after 900 -- noo chat --message "Reply with the single word ok."
@@ -130,10 +138,10 @@ step chat-after 900 -- noo chat --message "Reply with the single word ok."
 noo --json cluster verify > "$J/verify-final.json" 2>/dev/null
 # Every journal goes through the cell's redactor before it is kept: the
 # artifacts are PUBLIC, and these files are not written by step().
-sudo -n journalctl -t noo-apply --no-pager --since "@$ROLL_T0" 2>/dev/null | python3 "$CELL_PY" redact > "$J/apply.journal"
+sudo -n journalctl -t noo-apply --no-pager --since "@$ROLL_T0" 2>/dev/null | python3 "$CELL_PY" redact > "$JR/apply.journal"
 sudo -n journalctl --no-pager --since "@$ROLL_T0" 2>/dev/null | grep -E "noo-apply|noo-fetch|noo-node-agent" \
-  | python3 "$CELL_PY" redact > "$J/node.journal"
-sudo -n journalctl _COMM=sudo --no-pager --since "@$STACK_T0" --until "@$STACK_T1" 2>/dev/null | python3 "$CELL_PY" redact > "$J/sudo-stack.journal"
-export J SELF ROLL_T0 OUT
+  | python3 "$CELL_PY" redact > "$JR/node.journal"
+sudo -n journalctl _COMM=sudo --no-pager --since "@$STACK_T0" --until "@$STACK_T1" 2>/dev/null | python3 "$CELL_PY" redact > "$JR/sudo-stack.journal"
+export J JR SELF ROLL_T0 OUT
 step judge 120 -- python3 "$HERE/upgrade_judge.py" judge
 finish
