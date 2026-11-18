@@ -480,7 +480,7 @@ impl PublishFailure {
     pub(crate) fn of_push(class: FetchClass) -> Self {
         match class {
             FetchClass::Network => PublishFailure::Network,
-            FetchClass::Tls => PublishFailure::Tls,
+            FetchClass::Tls => PublishFailure::Network,
             FetchClass::Auth | FetchClass::NotFound => PublishFailure::Auth,
             FetchClass::RateLimited | FetchClass::Server | FetchClass::Other => PublishFailure::Other,
         }
