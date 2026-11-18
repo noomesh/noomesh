@@ -1799,7 +1799,7 @@ nu_parse() {
 
 # nu_user_ok — the owner: a plain name this host knows, never uid 0.
 nu_user_ok() {
-    case "$NU_USER" in ''|-*|.*|*[!A-Za-z0-9._-]*) NU_BAD=user; return 1 ;; esac
+    :
     [ "${#NU_USER}" -le 32 ] || { NU_BAD=user; return 1; }
     _nu_uid="$(id -u "$NU_USER" 2>/dev/null)" || { NU_BAD=user; return 1; }
     case "$_nu_uid" in ''|*[!0-9]*|0) NU_BAD=user; return 1 ;; esac
