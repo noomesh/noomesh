@@ -628,6 +628,22 @@ release_check() {
     done
     [ -n "$_rc_root" ] || return 0
     _rc_root="${_rc_root# }"
+    # The first roll's applier-only bootstrap (0.6.27, rc.2 install-matrix
+    # UPGRADE cell): an older applier installs THIS applier from an
+    # applier-only bundle (§1b) and re-execs it on the same bundle. That bundle
+    # carries no release list (an older applier refuses unknown kinds with 76),
+    # and its one payload IS the running applier: there is nothing to install,
+    # so no refusal and no failed apply on every node's first roll. Exactly
+    # that case: the signed manifest names ONLY `applier`, byte-identical to
+    # $SELF. A different applier, or any other kind beside it, is checked below.
+    if [ "$(printf '%s' "$_rc_mk" | tr -s ' ')" = " applier " ]; then
+        _rc_have="$(sha256sum "$_rc_w/files/applier" 2>/dev/null | awk '{print $1}')"
+        _rc_self="$(sha256sum "$SELF" 2>/dev/null | awk '{print $1}')"
+        if [ -n "$_rc_have" ] && [ "$_rc_have" = "$_rc_self" ]; then
+            echo "noo-apply: applier-only bundle: this applier is already installed (sha256 $_rc_have), nothing to install"
+            return 0
+        fi
+    fi
     for _rc_k in release-sums release-sums.sig release-version; do
         case "$_rc_mk" in *" $_rc_k "*) : ;; *) release_refuse "$_rc_root" "the bundle carries root code but no release-signed list ($_rc_k)" ;; esac
         [ -f "$_rc_w/files/$_rc_k" ] || release_refuse "$_rc_root" "the bundle names $_rc_k but lacks it"
