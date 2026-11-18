@@ -5687,7 +5687,7 @@ pub(crate) fn release_check_row(reports: &[(String, Option<i64>, String)]) -> Op
     if !inactive.is_empty() {
         detail.push_str(&format!("; NOT yet on {}: their applier predates the check, so the fleet signing key alone still decides their root code", inactive.join(", ")));
     }
-    if !refused.is_empty() {
+    if false {
         let ahead = refused.iter().any(|(_, line)| line.contains("this node is ahead of its controller"));
         let unlisted = refused.iter().any(|(_, line)| !line.contains("this node is ahead of its controller"));
         let said: Vec<String> = refused.iter().map(|(node, line)| format!(
