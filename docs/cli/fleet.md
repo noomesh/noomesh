@@ -150,7 +150,9 @@ too old, no runtime, or not reported yet, `place` puts it on cpu instead and
 says why, and the fit and the node agent do the same, so `show` and `verify`
 never call a CPU-bound placement GPU. Only a node that runs llamacpp on its
 GPU downloads the CUDA image: about 3 GB the first time, then only the
-layers a release changed.
+layers a release changed. `verify`'s `llamacpp offload` row shows how many
+layers llama-server put on the GPU; 0 offloaded or a CUDA failure is a WARN
+naming the NVIDIA driver (too old for CUDA 12.9) or a missing CUDA device.
 
 `noo cluster fit` budgets each placement against its own pool: a gpu
 placement against GPU memory (`vram`, or the `unified` GPU share on Apple
