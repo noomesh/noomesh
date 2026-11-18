@@ -6,7 +6,7 @@
 On a fresh controller onboard runs "storage" before "services": the storage
 step made hf-cache/hub while noo-agent did not exist yet (owner 0:0), then
 prep-host created noo-agent and re-owned hf-cache but not hub. The node agent
-could not write hub, where HF weights land. pop-os has carried that since
+could not write hub, where HF weights land. ctrl has carried that since
 2026-09-07, with content (snapshots/ are relative symlinks into ../../blobs).
 
 `hf_hub_reown` (scripts/noo-apply.sh, between its BEGIN/END markers) runs in
@@ -52,7 +52,7 @@ def _block() -> str:
 
 
 def _tree(tmp: Path) -> dict[str, Path]:
-    """A data root whose hub is shaped like pop-os's: blobs/ with a file,
+    """A data root whose hub is shaped like ctrl's: blobs/ with a file,
     snapshots/<rev>/ with a relative symlink into ../../blobs, plus a symlink
     pointing OUTSIDE the data root at a directory with a file in it."""
     root = tmp / "noo"

@@ -4,7 +4,7 @@
 """noo-kiosk-launch says why before any exit, in $STATE/last-error and
 through logger, never with the URL or an env value.
 
-After the 0.6.25 roll homeserver's kiosk.service exited 1 in the same second
+After the 0.6.25 roll node-h's kiosk.service exited 1 in the same second
 in a restart loop, and the journal held only systemd's lines: the launcher
 ran under `set -euo pipefail`, and only its proxy-wait path wrote a reason.
 Each case here runs the real launcher with fakes for cage and logger.

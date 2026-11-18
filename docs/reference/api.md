@@ -297,6 +297,22 @@ and its context. The judgment uses the backend's learned token ratio, and
 only the most favourable measured one while it is still learning, so a
 prompt this lets through can still be cut: it is then flagged as above.
 
+**A node restarting.** When a node's agent restarts (a roll, `noo upgrade
+--nodes`), it lets answers that are already streaming finish (up to 30 s)
+and refuses NEW calls with `503 {"error":{"code":"node_restarting"}}` and a
+`Retry-After` that covers the rest of the drain and the restart. You rarely
+see that answer:
+
+| your call | what happens |
+|---|---|
+| the class has another candidate | it is answered there at once (`fallback: true`) |
+| interactive (`/v1`, `/api/external`), no other candidate | the gateway waits the `Retry-After` (at most 30 s, never past your request's own deadline) and sends it again; you see a slower answer |
+| the node is still restarting after that, or too many calls already wait on it (32 per node) | `503`, code `node_restarting`, with the node's `Retry-After`: send it again after that |
+
+A non-streamed answer the node cut while it stopped is sent again whole by
+the gateway (nothing of it had reached you). A streamed answer still open
+when the 30 s bound passes ends early; the roll names the node and the count.
+
 `fallback: true` means the answering candidate was not the class's first
 choice. Nothing on this surface names a node, an address or a URL — the
 headers are informational and are never accepted as credentials or
@@ -527,7 +543,7 @@ capped at 200 000 characters a turn. It is not the answer, which arrives as
 | GET | `/bootstrap/prep`, `/bootstrap/apply`, `/bootstrap/deenroll`, `/bootstrap/fetch`, `/bootstrap/ca.crt` | the pull rail a node walks during enrollment |
 | POST, GET | `/api/cluster/provision-bundle/{node}`, `…/status`; GET `/bootstrap/bundle/{node}`; POST `/bootstrap/bundle/{node}/applied` | signed provisioning bundles |
 | PUT, GET | `/api/cluster/cli-asset/{name}`, `/bootstrap/cli/{name}` | CLI binaries served to nodes |
-| GET | `/api/artifacts/manifest/{kind}/{name}` | artifact rail manifests (`gguf`, `modelfile`, `image`; `binary` is retired): `{size_bytes, sha256, data_path}`. The sha256 is cached by path, size, nanosecond mtime, inode and device (an entry from an older gateway, without them, re-hashes once); a file not yet hashed is hashed in the background, and a request that would wait more than ~8 s gets `202 {"status":"hashing","retry_after_secs"}` with `Retry-After` — ask again. `noo cluster sync-model-files` warms this before it queues the node jobs |
+| GET | `/api/artifacts/manifest/{kind}/{name}` | artifact rail manifests (`gguf`, `hf`, `image`, `modelfile`, `modelset`, `ollamablob`, `ollamamanifest`; `binary` is retired): `{size_bytes, sha256, data_path}`. The sha256 is cached by path, size, nanosecond mtime, inode and device (an entry from an older gateway, without them, re-hashes once); a file not yet hashed is hashed in the background, and a request that would wait more than ~8 s gets `202 {"status":"hashing","retry_after_secs"}` with `Retry-After` — ask again. `noo cluster sync-model-files` warms this before it queues the node jobs |
 
 
 ## Models

@@ -1219,7 +1219,7 @@ struct EnrollPaste<'a> {
 }
 
 fn print_enroll_paste(p: &EnrollPaste) {
-    say(&ui::emph("run AS YOUR USER on the node (one sudo prompt)"));
+    say(&ui::emph("run AS YOUR USER on the node (it runs several sudo commands; sudo asks for your password)"));
     say("");
     say(&ui::status_line(Glyph::Step, "step 1 — make sure the noo CLI is on the node (skip if `noo --version` already works):"));
     // The controller-mirror lane used to lead here, fetched with

@@ -342,8 +342,8 @@ it into `.env` (as `true`/`false`) and **recreate the node-agent container**
 when it differs; `list` and `cluster verify` report the container's actual
 `HostConfig.Privileged` (`docker inspect`), so "at desired" means the
 container. On a host with no such container the row says "container not
-checked". The profiles are `hardened` (approval mode, unprivileged agents) and
-`dev` (the opposite); **both** leave the external MCP door closed —
+checked". The profiles are `hardened` (approval mode, unprivileged opt-in node-agent container) and
+`dev` (the opposite); the profile only affects that compose container, and fleet node agents are host processes with the Docker socket; **both** leave the external MCP door closed —
 opening it is a decision about a specific person,
 never a side effect of a bundle. `set` and `apply-profile` are
 operator-only (your operator client certificate plus a token bound to it,
@@ -460,6 +460,9 @@ standard input), else `GH_TOKEN` / `GITHUB_TOKEN`, and is never printed.
 
 ## Command reference
 
+The `noo security at-rest` commands are opt-in and not yet validated on real
+hardware (decision 2026-10-26).
+
 <!-- BEGIN GENERATED: cli-reference section="Security" — do not edit; regenerate with scripts/gen-cli-docs.py -->
 ### `noo security` — Users, secrets, PKI, scanning, CA trust
 | Command | Arguments | What it does |
@@ -551,12 +554,12 @@ standard input), else `GH_TOKEN` / `GITHUB_TOKEN`, and is never printed.
 | `noo security scan` | `[--strict]` | Scan this install's or node's posture; exit 1 on a CRITICAL, or any finding with --strict |
 | `noo security pki rotate-all` | `[--warn-days <n>] [--new-days <n>] [--yes] [--reload \| --no-reload] [--no-deliver]` | Re-issue expiring certs, deliver to nodes, restart consumers; asks for confirmation (-y) |
 | `noo security pki rotate-ca` | `[--ca-days <n>] [--leaf-days <n>] [--yes] [--retire-old]` | Cross-signed CA rotation across every node; asks for confirmation (-y) |
-| `noo security pki rotate-signing-key` | `[<node>] [--deliver-only] [--yes]` | Mint the fleet code-signing key and deliver its public half to every node (-y to confirm) |
+| `noo security pki rotate-signing-key` | `[<node>] [--deliver-only] [-y\|--yes]` | Mint the fleet code-signing key and deliver its public half to every node (-y to confirm) |
 | `noo security secrets absorb-files` | `[-y\|--yes]` | Fold file credentials and legacy secrets/*.txt into env.sops; shreds what reads back (-y) |
 | `noo security pki issue-node` | `<node> [<ip>] [--days <n>] [--mint-only]` | Issue a node cert and deliver it, waiting for the node to confirm it applied |
 | `noo security pki push-nodes` | `[<node>] [--days <n>] [--yes]` | Re-issue node certs plus ca.crt and stage them on the pull rail for each node |
 | `noo security trust-ca` | `[<ca_path>]` | Install the cluster CA into the OS trust store (default $NOO_PKI_DIR/ca.crt) |
-| `noo security untrust-ca` | `[--yes]` | Remove the cluster CA (by name) from the OS trust store; asks for confirmation (-y) |
+| `noo security untrust-ca` | `[-y\|--yes]` | Remove the cluster CA (by name) from the OS trust store; asks for confirmation (-y) |
 
 ### `noo auth` — Per-user CLI credentials
 | Command | Arguments | What it does |

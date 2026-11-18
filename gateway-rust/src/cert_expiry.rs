@@ -265,7 +265,7 @@ fn verify_against_real_pki() {
     let Ok(dir) = std::env::var("NOO_VERIFY_PKI_DIR") else {
         panic!("set NOO_VERIFY_PKI_DIR to a real PKI directory");
     };
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
     let certs = expiring_certs(std::path::Path::new(&dir), 99_999, now);
     assert!(!certs.is_empty(), "no certificates parsed from {dir}");
     for c in &certs {

@@ -221,7 +221,7 @@ class NooAgentSend(ToolDef):
     (e.g. "host3/claude-code-1"), or "thread" to post into an existing thread
     (needs thread_id), or "*" to broadcast (operators and internal services
     only). A to that names no inbox (e.g. a bare "general" for
-    "rbpai/claude-general") is refused with the closest registered names, and
+    "user/claude-general") is refused with the closest registered names, and
     nothing is sent. A name under a real account that no session holds is
     delivered, with a warning naming what you may have meant.
     Recorded and delivered over NATS; the sender is the caller's identity —

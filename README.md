@@ -36,9 +36,10 @@ noo stack start && noo health
 
 When the wizard finishes: dashboard at `https://localhost:8080` (and on
 your tailnet name, if you joined one). The certificate is issued by the
-install's own CA, so a browser warns until it trusts that CA. Grafana at
-`https://localhost:3000` comes up on every install (the monitoring set is in
-both the `controller` and the `standalone` compose profile).
+install's own CA, so a browser warns until it trusts that CA. Grafana,
+Loki and Tempo run only if you answer yes in the wizard; a non-interactive
+install is lean (Prometheus, Alertmanager, node-exporter). See
+[monitoring](./docs/operating/monitoring.md).
 Then: [your first chat](./docs/getting-started/first-chat.md) ·
 [add-ons](./docs/getting-started/add-ons.md) ·
 [standalone controller](./docs/getting-started/standalone-controller.md).
@@ -110,7 +111,10 @@ run as their own containers:
 - **Channels** — Telegram, WhatsApp, Google Chat; MCP doors for your own
   Claude Code or any MCP client
 - **Security by default** — JWT and per-user credentials, cluster HMAC,
-  PKI/mTLS, secrets encrypted at rest with SOPS/age, sandboxed execution,
+  PKI/mTLS, secret values encrypted in a SOPS/age store (the age key itself
+  and each node's secrets are plain files readable by root and their owner,
+  mode 0600; disk encryption is opt-in, not yet validated on real hardware,
+  decision 2026-10-26), sandboxed execution,
   audit logging
 
 ```bash
@@ -141,7 +145,7 @@ ships:
 - [CLI reference](./docs/cli/README.md), generated from the binary
 - [Configuration](./docs/reference/config.md) and
   [environment variables](./docs/reference/env.md)
-- [Telemetry](./docs/security/telemetry.md): there is none
+- [Telemetry](./docs/security/telemetry.md): none from noomesh's own code; the page lists the residual third-party traffic
 
 ## Contributing and security
 

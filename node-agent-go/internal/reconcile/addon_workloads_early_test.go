@@ -21,7 +21,7 @@ func TestAddonWorkloadsDeclaredBeforeFirstTick(t *testing.T) {
 		_, _ = w.Write([]byte(`{"addon_workloads":[{"addon":"rhaddon","name":"rhworker","container":"rhaddon-rhworker","gpu":true}]}`))
 	}))
 	defer srv.Close()
-	r := &Reconciler{cfg: &config.Config{ControllerURL: srv.URL, NodeID: "awolf"}, client: srv.Client()}
+	r := &Reconciler{cfg: &config.Config{ControllerURL: srv.URL, NodeID: "node-a"}, client: srv.Client()}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go r.Run(ctx)

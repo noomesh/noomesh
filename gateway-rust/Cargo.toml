@@ -147,6 +147,13 @@ regex = "1"
 hex = "0.4"
 time = "0.3"  # axum-extra cookie expiry uses this crate's Duration
 chrono = { version = "0.4", features = ["serde"] }
+# chrono's replacement (i923: RUSTSEC-2026-0543/0555, chrono and chrono-tz
+# unmaintained). Wave 1: the wire printers and parser only (wire_time.rs),
+# golden-tested against chrono, which stays until the last wave.
+jiff = { version = "1", default-features = false, features = ["std"] }
+# sqlx 0.9 has no jiff feature: jiff-sqlx carries the Postgres Encode/Decode
+# (i923 wave 2b: query! columns typed as jiff_sqlx::Timestamp).
+jiff-sqlx = { version = "1", features = ["postgres"] }
 # Timezone-aware cron evaluation for the heartbeat scheduler.
 # Default TZ is read from NOO_HEARTBEAT_TZ (default America/New_York).
 chrono-tz = "0.10"

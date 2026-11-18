@@ -31,7 +31,7 @@ export interface ChatPaneProps {
 const shortModel = (m: string) => m.split('/').pop() ?? m;
 
 /**
- * What a turn is doing before its first token ("queued on mcmini (2/2 busy)
+ * What a turn is doing before its first token ("queued on node-mac (2/2 busy)
  * · 4s", "thinking… 12s"), its timer ticking once a second while shown.
  */
 export function PhaseLine({ phase }: { phase: TurnPhase }) {

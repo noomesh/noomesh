@@ -3,7 +3,7 @@
 
 //! The gateway's open file descriptors, against its `RLIMIT_NOFILE`.
 //!
-//! On 2026-11-02 the pop-os gateway (0.6.15, up ~45 h) reached its soft
+//! On 2026-11-02 the ctrl gateway (0.6.15, up ~45 h) reached its soft
 //! limit of 1024 and logged 51,760 `Too many open files (os error 24)`
 //! lines in five hours. It could not read `/run/secrets/*` or reach
 //! Postgres, `/health` went red, and external chat answered 401 until an

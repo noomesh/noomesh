@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-// The 2026-11-11 survey's real awolf figures, as cgroup v2 files.
+// The 2026-11-11 survey's real node-a figures, as cgroup v2 files.
 func fakeCgroup(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
@@ -54,15 +54,15 @@ func TestUnitStatsReadTheRealFiguresAndSkipWhatIsAbsent(t *testing.T) {
 
 func TestTheMetricsTextNamesEachUnitAndOmitsTheUnknown(t *testing.T) {
 	units := ReadUnitStats(fakeCgroup(t), NoomeshUnits)
-	text := ProcessMetricsText("awolf", ProcSelf{ResidentBytes: 30000000, CPUSeconds: 1.5}, true, units)
+	text := ProcessMetricsText("node-a", ProcSelf{ResidentBytes: 30000000, CPUSeconds: 1.5}, true, units)
 	for _, want := range []string{
 		"process_resident_memory_bytes 30000000\n",
 		"# TYPE process_cpu_seconds_total counter\nprocess_cpu_seconds_total 1.5\n",
-		`noo_unit_memory_bytes{node_id="awolf",unit="noo-harness"} 3526656`,
-		`noo_unit_swap_bytes{node_id="awolf",unit="noo-harness"} 3040870`,
-		`noo_unit_memory_peak_bytes{node_id="awolf",unit="noo-harness"} 55513088`,
-		`noo_unit_cpu_seconds_total{node_id="awolf",unit="noo-node-agent"} 1135.038018`,
-		`noo_unit_memory_bytes{node_id="awolf",unit="noo-hostd"} 91500000`,
+		`noo_unit_memory_bytes{node_id="node-a",unit="noo-harness"} 3526656`,
+		`noo_unit_swap_bytes{node_id="node-a",unit="noo-harness"} 3040870`,
+		`noo_unit_memory_peak_bytes{node_id="node-a",unit="noo-harness"} 55513088`,
+		`noo_unit_cpu_seconds_total{node_id="node-a",unit="noo-node-agent"} 1135.038018`,
+		`noo_unit_memory_bytes{node_id="node-a",unit="noo-hostd"} 91500000`,
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("missing %q in:\n%s", want, text)

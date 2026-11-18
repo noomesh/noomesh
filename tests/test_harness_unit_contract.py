@@ -84,7 +84,10 @@ def test_applier_refusals_match_the_unit() -> None:
     """The applier's harness-unit greps and the unit agree on the exact
     lines, so a rename on either side fails here, not on a node."""
     text = APPLY.read_text()
-    block = text[text.index('if [ -f "$WORK/files/harness-unit" ]'):]
+    # The harness-unit APPLY section (its own `…]; then` line), not the first
+    # mention: the systemd-floor pre-check also opens with `if [ -f …harness-unit ]`,
+    # and slicing from there swept unrelated applier blocks into this guard.
+    block = text[text.index('if [ -f "$WORK/files/harness-unit" ]; then'):]
     block = block[: block.index("applied=\"$applied harness-unit\"")]
     assert "grep -qE '^User=noo-harness$'" in block
     assert "SupplementaryGroups=.*docker" in block

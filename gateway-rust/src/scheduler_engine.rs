@@ -487,7 +487,7 @@ async fn try_dispatch_job(
         return BLOCKED;
     };
 
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = crate::wire_time::rfc3339_offset(jiff::Timestamp::now());
     let node_set = format!("{NODE_JOBS_PREFIX}{}", node.id);
     let claimed = redis
         .eval_i64(
@@ -558,7 +558,7 @@ pub async fn requeue_job(state: &AppState, job_id: &str, node_id: &str) {
     }
     let failures = num(&hash, "dispatch_failures", 0) + 1;
     let max_retries = num(&hash, "max_retries", 2);
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = crate::wire_time::rfc3339_offset(jiff::Timestamp::now());
 
     if failures > max_retries {
         let error = format!("dispatch failed {failures}x (last node: {node_id} never acked)");
@@ -607,7 +607,7 @@ pub async fn requeue_for_retry(
     let key = format!("{JOB_KEY_PREFIX}{job_id}");
     let hash: HashMap<String, String> = redis.hgetall(&key).await.unwrap_or_default();
     let priority = num(&hash, "priority", 5);
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = crate::wire_time::rfc3339_offset(jiff::Timestamp::now());
     let mut fields: Vec<(&str, &str)> = vec![
         ("status", "queued"),
         ("node_id", ""),
@@ -670,7 +670,7 @@ pub async fn terminalize(state: &AppState, job_id: &str, status: &str, result: &
     if hash.is_empty() {
         return false;
     }
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = crate::wire_time::rfc3339_offset(jiff::Timestamp::now());
     let node_id = hash.get("node_id").cloned().unwrap_or_default();
     let summary = history_summary(&hash, status, error, &now);
 

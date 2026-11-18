@@ -45,20 +45,14 @@ def test_code_validation():
     assert "os" in dangerous
 
 
-def test_url_validation():
-    """Test URL sanitization"""
-    validator = ToolInputValidator()
+def test_no_url_validator_or_egress_allowlist_knob_remains():
+    """sanitize_url (an SSRF check) had no caller anywhere, and
+    NOO_EGRESS_ALLOWLIST, read only inside it, restricted nothing: both are
+    gone, so neither can be mistaken for a guard. Outbound requests are
+    bounded where they are made (docs/security/networks-and-containers.md)."""
+    import pathlib
 
-    # Valid URLs
-    assert validator.sanitize_url("https://example.com")
-    assert validator.sanitize_url("http://example.com/path")
-
-    # Invalid URLs
-    with pytest.raises(ValidationError):
-        validator.sanitize_url("http://localhost/admin")
-
-    with pytest.raises(ValidationError):
-        validator.sanitize_url("http://127.0.0.1/")
-
-    with pytest.raises(ValidationError):
-        validator.sanitize_url("ftp://example.com")
+    assert not hasattr(ToolInputValidator, "sanitize_url")
+    root = pathlib.Path(__file__).resolve().parents[1]
+    for rel in ("docs/reference/env.md", ".env.example", "noomesh.yaml.example", "src/noomesh/validation.py"):
+        assert "NOO_EGRESS_ALLOWLIST" not in (root / rel).read_text(), rel

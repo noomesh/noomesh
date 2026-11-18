@@ -956,6 +956,70 @@ func TestModelStatsMergesTheChatModel(t *testing.T) {
 // on the FIRST heartbeat, with no reconcile pass. The ollama here is up with
 // nothing loaded (the state right after a restart); the model can only come
 // from the persisted held set.
+// The Mac shape (node-mac, 2026-11-07 on): the agent runs as the enrolling user,
+// the state dir stays root's and only the owned subdirs are the user's. The
+// seed must be saved and read there, so the first heartbeat after a restart
+// still names the held model. Root ignores directory modes, so as root the
+// read-only root cannot be simulated: skipped there (CI runs as a user).
+func TestMacFirstHeartbeatAfterRestartSeedsFromTheOwnedSubdir(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory modes; the read-only state root cannot be simulated")
+	}
+	ollama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/tags":
+			_, _ = w.Write([]byte(`{"models":[{"name":"gemma4:e4b-it-qat","model":"gemma4:e4b-it-qat"}]}`))
+		case "/api/ps":
+			_, _ = w.Write([]byte(`{"models":[]}`))
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer ollama.Close()
+	stateDir := t.TempDir()
+	// The root applier's layout: the owned subdirs exist, the root is not
+	// writable by the agent's user.
+	if err := os.MkdirAll(filepath.Join(stateDir, "held"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(stateDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(stateDir, 0o755) })
+
+	prev := backendrt.NewStackAt(ollama.URL)
+	prev.SetHeldModels("gemma4:e4b-it-qat")
+	if err := prev.SaveHeld(stateDir); err != nil {
+		t.Fatalf("save into the owned subdir under a read-only state root: %v", err)
+	}
+	prev.SetHeldModels()
+
+	var payload map[string]any
+	ctrl := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/cluster/nodes/test-node/heartbeat" {
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+		}
+		w.WriteHeader(200)
+	}))
+	defer ctrl.Close()
+	lane := backendrt.NewStackAt(ollama.URL)
+	lane.SetHeldModels()
+	if _, err := lane.SeedHeld(stateDir); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{NodeID: "test-node", ControllerURL: ctrl.URL, Tier: 3}
+	gpu := hardware.NewGPUDetector()
+	rpt := NewReporter(cfg, &http.Client{Timeout: 5 * time.Second}, metrics.NewCollector(gpu), gpu,
+		func() (map[string]string, error) { return lane.Running(context.Background()), nil },
+		func() int { return 0 },
+	)
+	rpt.SendHeartbeat()
+	backends, _ := payload["running_backends"].(map[string]any)
+	if got := backends["ollama"]; got != "gemma4:e4b-it-qat" {
+		t.Fatalf("first heartbeat after a Mac restart: running_backends[ollama] = %v, want gemma4:e4b-it-qat", got)
+	}
+}
+
 func TestFirstHeartbeatAfterRestartReportsSeededHeldModel(t *testing.T) {
 	ollama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -1011,7 +1075,7 @@ func TestFirstHeartbeatAfterRestartReportsSeededHeldModel(t *testing.T) {
 		}
 	})
 	t.Run("corrupt file", func(t *testing.T) {
-		if err := os.WriteFile(filepath.Join(stateDir, "held-models.json"), []byte("\x00garbage"), 0o600); err != nil {
+		if err := os.WriteFile(filepath.Join(stateDir, "held", "held-models.json"), []byte("\x00garbage"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		if got, ok := run(t)["ollama"]; !ok || got != "" {
@@ -1019,7 +1083,7 @@ func TestFirstHeartbeatAfterRestartReportsSeededHeldModel(t *testing.T) {
 		}
 	})
 	t.Run("missing file", func(t *testing.T) {
-		if err := os.Remove(filepath.Join(stateDir, "held-models.json")); err != nil {
+		if err := os.Remove(filepath.Join(stateDir, "held", "held-models.json")); err != nil {
 			t.Fatal(err)
 		}
 		if got, ok := run(t)["ollama"]; !ok || got != "" {

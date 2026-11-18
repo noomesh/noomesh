@@ -156,33 +156,33 @@ mod tests {
 
     #[test]
     fn a_full_slow_fallback_never_starts_while_a_free_one_is_allowed() {
-        // mcmini slots_full=4/2,queued=2 listed FIRST (the 01:38 order); awolf free.
-        let cands = [cand("mcmini", "ollama", Some((4, 2, 2))), cand("awolf", "vllm", Some((0, 8, 0)))];
-        let p = plan(&cands, NONE_IN_FLIGHT, &p50s(&[("mcmini", 170_000), ("awolf", 3_300)]));
-        assert_eq!(p, Plan::Try(vec![1]), "awolf only");
+        // node-mac slots_full=4/2,queued=2 listed FIRST (the 01:38 order); node-a free.
+        let cands = [cand("node-mac", "ollama", Some((4, 2, 2))), cand("node-a", "vllm", Some((0, 8, 0)))];
+        let p = plan(&cands, NONE_IN_FLIGHT, &p50s(&[("node-mac", 170_000), ("node-a", 3_300)]));
+        assert_eq!(p, Plan::Try(vec![1]), "node-a only");
     }
 
     #[test]
     fn a_free_but_slow_backend_is_skipped_for_an_interactive_request() {
-        let cands = [cand("mcmini", "ollama", Some((0, 2, 0))), cand("awolf", "vllm", Some((8, 8, 0)))];
-        // mcmini is free but 170 s; awolf is full, 1 ahead × 3.3 s → 6.6 s.
-        let p = plan(&cands, NONE_IN_FLIGHT, &p50s(&[("mcmini", 170_000), ("awolf", 3_300)]));
+        let cands = [cand("node-mac", "ollama", Some((0, 2, 0))), cand("node-a", "vllm", Some((8, 8, 0)))];
+        // node-mac is free but 170 s; node-a is full, 1 ahead × 3.3 s → 6.6 s.
+        let p = plan(&cands, NONE_IN_FLIGHT, &p50s(&[("node-mac", 170_000), ("node-a", 3_300)]));
         assert_eq!(p, Plan::Try(vec![1]));
     }
 
     #[test]
     fn every_candidate_full_goes_shortest_expected_wait_first() {
-        let cands = [cand("mcmini", "ollama", Some((2, 2, 0))), cand("awolf", "vllm", Some((8, 8, 3)))];
-        // mcmini: (0+1+1) × 20 s = 40 s; awolf: (3+1+1) × 3.3 s = 16.5 s.
-        let p = plan(&cands, NONE_IN_FLIGHT, &p50s(&[("mcmini", 20_000), ("awolf", 3_300)]));
+        let cands = [cand("node-mac", "ollama", Some((2, 2, 0))), cand("node-a", "vllm", Some((8, 8, 3)))];
+        // node-mac: (0+1+1) × 20 s = 40 s; node-a: (3+1+1) × 3.3 s = 16.5 s.
+        let p = plan(&cands, NONE_IN_FLIGHT, &p50s(&[("node-mac", 20_000), ("node-a", 3_300)]));
         assert_eq!(p, Plan::Try(vec![1, 0]));
     }
 
     #[test]
     fn nothing_within_sixty_seconds_is_a_503_with_retry_after_and_a_reason() {
-        let cands = [cand("mcmini", "ollama", Some((4, 2, 2)))];
+        let cands = [cand("node-mac", "ollama", Some((4, 2, 2)))];
         // (2+1+1) × 170 s = 680 s.
-        match plan(&cands, NONE_IN_FLIGHT, &p50s(&[("mcmini", 170_000)])) {
+        match plan(&cands, NONE_IN_FLIGHT, &p50s(&[("node-mac", 170_000)])) {
             Plan::Refuse { retry_after_secs, reason } => {
                 assert_eq!(retry_after_secs, 680);
                 assert_eq!(reason, "all chat backends busy; expected wait 680 s");
@@ -193,14 +193,14 @@ mod tests {
 
     #[test]
     fn no_evidence_is_not_a_reason_to_skip() {
-        let cands = [cand("awolf", "vllm", None), cand("mcmini", "ollama", Some((0, 2, 0)))];
+        let cands = [cand("node-a", "vllm", None), cand("node-mac", "ollama", Some((0, 2, 0)))];
         assert_eq!(plan(&cands, NONE_IN_FLIGHT, &|_| None), Plan::Try(vec![0, 1]), "class order kept");
     }
 
     #[test]
     fn this_gateways_own_in_flight_count_makes_a_backend_full() {
-        let cands = [cand("mcmini", "ollama", Some((0, 2, 0))), cand("awolf", "vllm", Some((0, 8, 0)))];
-        let in_flight = |c: &Candidate| if c.node_id == "mcmini" { 2 } else { 0 };
+        let cands = [cand("node-mac", "ollama", Some((0, 2, 0))), cand("node-a", "vllm", Some((0, 8, 0)))];
+        let in_flight = |c: &Candidate| if c.node_id == "node-mac" { 2 } else { 0 };
         assert_eq!(plan(&cands, &in_flight, &|_| Some(1_000)), Plan::Try(vec![1]));
     }
 
@@ -211,7 +211,7 @@ mod tests {
     #[test]
     fn it_never_returns_a_candidate_it_was_not_given() {
         let sets: Vec<Vec<Candidate>> = vec![
-            vec![cand("awolf", "vllm", Some((8, 8, 9)))],
+            vec![cand("node-a", "vllm", Some((8, 8, 9)))],
             vec![cand("a", "vllm", None), cand("b", "ollama", Some((2, 2, 0)))],
             vec![cand("a", "vllm", Some((0, 8, 0))), cand("b", "ollama", Some((2, 2, 1))), cand("c", "llamacpp", None)],
         ];

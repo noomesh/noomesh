@@ -1,8 +1,11 @@
 # Telemetry and outbound traffic
 
-noomesh sends no telemetry. No component it ships or launches reports
-usage, analytics or crashes to a vendor, and none checks for updates on
-its own. Some of the third-party software noomesh runs *does* phone home
+noomesh sends no telemetry. No component it ships reports usage,
+analytics or crashes to a vendor, and none checks for updates on its own.
+The one residual exception among the CLIs it launches is the Codex
+harness, which still looks up two hostnames at start (see
+[Agent harnesses](#agent-harnesses)); on a Mac nothing holds its
+connections off the internet either. Some of the third-party software noomesh runs *does* phone home
 by default, so this page lists every component, what it would send, the
 switch that turns it off, and how to check the switch yourself. That covers
 the host software noomesh installs or lives beside (Tailscale, Homebrew, the
@@ -29,7 +32,7 @@ lists that traffic.
 | **llama.cpp server** (`llamacpp`, llama.cpp reranker) | None. | Nothing to switch off. | — |
 | **AirLLM** | Built on `transformers` and `huggingface_hub`. | `HF_HUB_DISABLE_TELEMETRY=1`, `DO_NOT_TRACK=1` | compose `airllm`; node agent `airllm` spec; image `ENV` |
 | **Headless browser** (Playwright Chromium, `browser`) | Chromium's background services: component and variations updates, Safe Browsing list fetches, crash reports, domain-reliability reports, metrics upload. | `--disable-background-networking`, `--disable-component-update`, `--disable-domain-reliability`, `--disable-breakpad`, `--disable-client-side-phishing-detection`, `--disable-sync`, `--metrics-recording-only`, `--no-pings` | `src/noomesh/tools/browser/server.py`. Playwright passes most of these by default; they are written out so the claim does not depend on a library default. |
-| **Kiosk display** (Chromium on a kiosk host) | Same Chromium background services. | The same flag group. The host's own tailscaled and OS reporters are covered in [Kiosk displays](#kiosk-displays). | `noo-kiosk-launch`; `noo kiosk setup` |
+| **Kiosk display** (Chromium on a kiosk host) | Same Chromium background services. | Seven of the eight flags: `--disable-client-side-phishing-detection` is not passed. The host's own tailscaled and OS reporters are covered in [Kiosk displays](#kiosk-displays). | `noo-kiosk-launch`; `noo kiosk setup` |
 | **Loki** | Sends anonymous usage statistics to `stats.grafana.org`. | `analytics: reporting_enabled: false` | `monitoring/loki/*.yml` |
 | **Tempo** (request traces, i359) | Sends anonymous usage statistics to `stats.grafana.org`. It receives spans only from the gateway, inside the cluster, and sends nothing on. | `usage_report: reporting_enabled: false` | `monitoring/tempo/*.yml` |
 | **Grafana** | Usage reporting, version and plugin-update checks, the news feed, gravatar, plugin signing-key fetches, preinstalled plugins and external snapshots all reach grafana.com or Google storage. | `[analytics] reporting_enabled = false`, `check_for_updates = false`, `check_for_plugin_updates = false`, `feedback_links_enabled = false`; `[news] news_feed_enabled = false`; `[snapshots] external_enabled = false`; `[security] disable_gravatar = true`; `[plugins] plugin_admin_enabled = false`, `public_key_retrieval_disabled = true`, `preinstall_disabled = true`, `preinstall_auto_update = false`; `[cloud_migration] enabled = false`; and `[grafana_com] api_url = http://127.0.0.1:9/api` as a fallback, so any grafana.com call a setting above does not cover goes to a closed local port | `configs/grafana/grafana.ini`. `noo cluster verify --controller` FAILs its `grafana door` row if any of these is back on. |
@@ -91,8 +94,8 @@ evidence method is in [Verify it yourself](#verify-it-yourself).
 
 | Kind | Reporting | How | Not covered |
 |---|---|---|---|
-| `claude-code` | Observed off (no-route probe, 2026-11-12, Claude Code 2.1.292): only loopback connections, no DNS question | Environment: the `claude-code` rows below | The WebFetch hostname preflight (below); the probe does not call WebFetch |
-| `codex` | **Switches applied; the CLI still resolves `api.github.com` and `chatgpt.com` at start** (observed 2026-11-12, codex-cli 0.163.0, no-route probe: 8 DNS questions, no other outbound attempt). It cannot connect once the harness unit's network allowlist ships, and the lookups stop once the harness unit's own resolver ships | `config.toml` keys the driver writes into the run's own `CODEX_HOME` before each launch | The two lookups above: no Codex setting that stops them has been found yet |
+| `claude-code` | Observed off (no-route probe, 2026-11-12, Claude Code 2.1.292): only loopback connections, no DNS question | Environment: the `claude-code` rows below | The probe does not call WebFetch; the preflight is closed by settings (below) |
+| `codex` | **Switches applied; the CLI still resolves `api.github.com` and `chatgpt.com` at start** (observed 2026-11-12, codex-cli 0.163.0, no-route probe: 8 DNS questions, no other outbound attempt). On Linux with systemd both the harness unit's network allowlist and its own resolver ship, so it cannot connect and the lookups fail with no packet sent; on a Mac neither exists | `config.toml` keys the driver writes into the run's own `CODEX_HOME` before each launch | The two lookups above: no Codex setting that stops them has been found yet |
 | `copilot` | Observed off (no-route probe, 2026-11-12, GitHub Copilot CLI 1.0.98): only loopback connections, no DNS question; both probe tests pass with no route, so offline mode needs no GitHub | `COPILOT_OFFLINE=true`, the only switch GitHub documents | Offline mode removes GitHub-backed features (below) |
 
 Codex CLI takes no environment switch for its reporting: its
@@ -125,11 +128,10 @@ What the switches do not cover, stated plainly:
   says this "is not affected by `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`";
   its opt-out is the settings key `skipWebFetchPreflight`, not an environment
   variable ([data usage](https://code.claude.com/docs/en/data-usage)).
-  **This gap is open today:** the `claude-code` kind allows WebFetch, and the
-  runner writes no settings file, so a claude-code harness that fetches a web
-  page sends that page's hostname to `api.anthropic.com` first. Until the
-  runner writes `skipWebFetchPreflight` (or drops WebFetch from the kind),
-  treat a claude-code harness's WebFetch as sending hostnames to Anthropic.
+  **This gap is closed:** the `claude-code` kind launches with
+  `--disallowedTools WebFetch,WebSearch` and the runner writes
+  `skipWebFetchPreflight: true` into the run's settings file, so no hostname
+  is sent (it was open before the runner wrote that file).
 - **Copilot CLI has no separate telemetry switch.** GitHub documents none;
   `COPILOT_OFFLINE=true` is the only documented way, and noomesh sets it. Offline mode also removes the
   features that need GitHub (`/delegate`, the GitHub MCP server, code
@@ -439,7 +441,8 @@ after the stack starts, for example with
 or `ollama.com`. The exception is a model download or cloud call you
 started yourself.
 On an idle controller (0.6.24 or later, nothing asked of it) the same
-capture should show no questions at all. A container's question is forwarded
+capture should show no questions from the noomesh containers. The host's
+tailscaled, OS reporters and apt timers can still query DNS. A container's question is forwarded
 by Docker from the host, so the name, not the source address, says which
 service asked.
 
@@ -470,8 +473,9 @@ containers' included), names each destination from DNS and the TLS server
 name, says which container or process made it and how many bytes went each
 way, and writes a table to `egress.md`. It keeps no payloads, changes no
 firewall rule (it turns on the kernel's per-connection byte counters and
-restores the setting when it stops), writes only to `--out`, and says what it
-cannot see. It needs root, `conntrack`, `tcpdump`, `ss` and `python3`, and
+restores the setting when it stops; it may load `nf_conntrack` if absent and
+leaves it loaded), writes only to `--out`, and says what it
+cannot see. It runs on Linux only and needs root, `conntrack`, `tcpdump`, `ss` and `python3`, and
 refuses without them. Leave the stack idle while it runs and the table should
 be empty; run it across a model download or a chat with a cloud model and you
 will see exactly that traffic and nothing else.
@@ -483,7 +487,7 @@ setting you chose. None of it is a report about you or your machines.
 
 | Traffic | Destination | When |
 |---|---|---|
-| Model downloads | Hugging Face Hub (`huggingface.co`, its CDN) | A vLLM, TEI, AirLLM or `noo models` pull of a model that is not already cached. Whisper and Piper fetch their model or voice on first use. A placed node (one with `NOO_MODEL_CACHE_URL`) never reaches the Hub: its backends run `HF_HUB_OFFLINE=1` with no Hugging Face token, and a model missing from the controller's store is refused, not downloaded. Only the controller downloads. |
+| Model downloads | Hugging Face Hub (`huggingface.co`, its CDN) | A vLLM, TEI, AirLLM or `noo models` pull of a model that is not already cached. Whisper and Piper never download: they run `HF_HUB_OFFLINE=1` and the controller stages their model or voice. A placed node (one with `NOO_MODEL_CACHE_URL`) never reaches the Hub: its backends run `HF_HUB_OFFLINE=1` with no Hugging Face token, and a model missing from the controller's store is refused, not downloaded. Only the controller downloads. |
 | Ollama model pulls | `registry.ollama.ai` (and the CDN it redirects blob downloads to) | `noo models fetch ollama:<tag>` and an Ollama pull, both on the controller. The fetch checks every blob against the digest in the registry's manifest and stores the model; a placed node then imports it from the controller's store and never contacts `registry.ollama.ai` or `ollama.com`. A placed node refuses a registry tag the controller has not staged, unless `NOO_ALLOW_OLLAMA_REGISTRY_PULL=1` is set on that node |
 | Model catalog browsing | `huggingface.co` API, `ollama.com`, `registry.ollama.ai` | `noo models search`; `noo models list` / `recommended` / `ollama` with `--refresh` or an expired catalog cache |
 | Image pulls | `ghcr.io`, `dhi.io`, Docker Hub, `mcr.microsoft.com`, NVIDIA | `noo stack start`, `noo upgrade`, provisioning, building images |
@@ -500,7 +504,7 @@ setting you chose. None of it is a report about you or your machines.
 | Cloud models | Anthropic, OpenAI, Google Gemini APIs | Only when `CLOUD_PROVIDERS_ENABLED` is on, a `claude-*`, `gpt-*` or `gemini-*` model is selected and its key is configured. The model runs the full agent loop, so each request carries the whole turn: the system prompt, the retrieved context, memory, conversation summaries and recall, runtime-written skills and device reports (fenced as reference data in the user's turn), the conversation, the tool definitions and the tool results |
 | Agent harness on a cloud model | The model vendor (Anthropic for Claude Code, the provider you set for Copilot CLI, OpenAI for Codex CLI) | Only if a third-party harness is pointed at a cloud model instead of the node's own endpoint. The prompts go to that vendor: this is the cloud-model traffic above, not telemetry. By default the harness is pointed at the node's own endpoint, so this does not arise unless you point it elsewhere. |
 | Web search | DuckDuckGo's HTML endpoint, or the provider set in `search.provider` (SearXNG, Brave, Tavily) | When an agent, a chat or a scheduled task uses `web_search` |
-| Browser tool | Whatever page it is sent to | When an agent uses the browser tool. `BROWSER_URL_ALLOWLIST` limits it. |
+| Browser tool | Whatever page it is sent to | When an agent uses the browser tool. `BROWSER_URL_ALLOWLIST` is empty by default; when set it is a substring match at `/navigate` only, and in-page JavaScript does not pass through it. |
 | Build-time package installs | PyPI, the PyTorch wheel index, Go and crates.io registries, Debian/Alpine mirrors | Building images, not running them |
 
 ### Name lookups for noomesh's own services

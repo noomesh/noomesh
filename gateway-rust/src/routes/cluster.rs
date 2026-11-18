@@ -242,6 +242,89 @@ pub(crate) fn acceptable_node_ip(ip: &str) -> bool {
     }
 }
 
+/// A node's `agent_url` must be https on an explicit port at its registered
+/// address: the URL's host is an IP literal equal to `ip` (itself a dialable
+/// node address), with no user info, query, fragment or path. The agent
+/// builds exactly this (`https://<ip>:<AgentPort>`, node-agent-go heartbeat
+/// `agentURL`), and the gateway dials it with the node's credentials, so any
+/// other host is refused. The port is the agent's own (8081, or 8082 for a
+/// second agent on the same host): any explicit port on the node's own
+/// address is accepted.
+pub(crate) fn acceptable_agent_url(url: &str, ip: &str) -> Result<(), &'static str> {
+    if !acceptable_node_ip(ip) {
+        return Err("the node has no registered dialable address to hold it to");
+    }
+    let Ok(u) = reqwest::Url::parse(url.trim()) else { return Err("it is not a URL") };
+    if u.scheme() != "https" {
+        return Err("it is not https");
+    }
+    if !u.username().is_empty() || u.password().is_some() || u.query().is_some() || u.fragment().is_some() || !matches!(u.path(), "" | "/") {
+        return Err("it carries user info, a path, a query or a fragment");
+    }
+    if u.port().is_none() {
+        return Err("it names no port");
+    }
+    let host = u.host_str().unwrap_or("").trim_start_matches('[').trim_end_matches(']');
+    let Ok(host_ip) = host.parse::<std::net::IpAddr>() else { return Err("its host is not an IP address") };
+    if ip.trim().parse::<std::net::IpAddr>().ok() != Some(host_ip) {
+        return Err("its host is not the node's registered address");
+    }
+    Ok(())
+}
+
+/// Whether a stored `agent_url` may be dialled (`NodeLink::from_record`): it
+/// is https, and when the record holds a registered address it passes
+/// [`acceptable_agent_url`] against it. A heartbeat stores `agent_url` only
+/// with a registered address it fits (`apply_agent_url`), so a URL with no
+/// address on its record was not written by a heartbeat.
+pub(crate) fn dialable_agent_url(url: &str, ip: &str) -> bool {
+    if ip.trim().is_empty() {
+        return reqwest::Url::parse(url.trim()).is_ok_and(|u| u.scheme() == "https");
+    }
+    acceptable_agent_url(url, ip).is_ok()
+}
+
+/// The `ip_address` a registration stores: the reported one when it is a
+/// dialable node address ([`acceptable_node_ip`], the heartbeat's rule),
+/// otherwise none (the node is reached over its bus or tunnel until a
+/// heartbeat reports one that is).
+pub(crate) fn registered_ip(body: &Value) -> Value {
+    match body.get("ip_address").and_then(|v| v.as_str()) {
+        Some(ip) if acceptable_node_ip(ip) => json!(ip),
+        _ => Value::Null,
+    }
+}
+
+/// A heartbeat's `agent_url` onto the node record (`data`, already carrying
+/// this beat's `ip_address`): stored only when it passes
+/// [`acceptable_agent_url`]; a refusal is recorded as `agent_url_refused`
+/// (the reason) and cleared by the next URL that fits; a stored URL that no
+/// longer fits the address is removed, so the record's readers dial
+/// `https://<ip>:8081`.
+pub(crate) fn apply_agent_url(data: &mut Value, offered: Option<&str>, node_id: &str) {
+    let ip_now = data.get("ip_address").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if let Some(offered) = offered {
+        match acceptable_agent_url(offered, &ip_now) {
+            Ok(()) => {
+                data["agent_url"] = json!(offered);
+                if let Some(m) = data.as_object_mut() {
+                    m.remove("agent_url_refused");
+                }
+            }
+            Err(why) => {
+                tracing::warn!(node = %node_id, offered = %offered, reason = why, "heartbeat agent_url refused — the gateway dials the registered address instead");
+                data["agent_url_refused"] = json!(why);
+            }
+        }
+    }
+    let stored = data.get("agent_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if !stored.is_empty() && acceptable_agent_url(&stored, &ip_now).is_err() {
+        if let Some(m) = data.as_object_mut() {
+            m.remove("agent_url");
+        }
+    }
+}
+
 /// Carry a heartbeat field onto the node record when the agent reported it;
 /// leave the record's copy alone when the beat omits it (an older agent) or
 /// sends null. Never synthesised: absence on the record means "this agent
@@ -328,6 +411,10 @@ const I300_BEAT_KEYS: &[(&str, BeatShape)] = &[
     ("addon_workloads_approvals", BeatShape::Objects(256)),
     ("model_sets", BeatShape::Objects(256)),
     ("node_workloads", BeatShape::Objects(64)),
+    // Proposal 61 §7b: each placed Ollama model checked against the
+    // controller's store (`{model, state, anchor, model_layer, reason,
+    // remedy?, checked_at}`), read by the `ollama models` verify row.
+    ("ollama_verify", BeatShape::Objects(64)),
 ];
 
 fn beat_shape_ok(v: &Value, shape: BeatShape) -> bool {
@@ -600,6 +687,11 @@ async fn node_heartbeat(
     // a new heartbeat field is dropped by default, and the row would have
     // read every node as "agent predates the shipper".
     carry_reported(&mut data, &body, "log_ship");
+    // The agent's previous stop drain (node-agent-go stopdrain), sent in
+    // one beat after a restart and kept on the record until the next stop:
+    // the roll's node report reads it (what finished, what was cut, whether
+    // the 30 s bound was hit).
+    carry_reported(&mut data, &body, "last_stop");
     // The node's measured model speed (`POST /bench` on the agent,
     // `noo cluster profile <node> --bench`): `{model, backend, load_secs,
     // prefill_tps, decode_tps, prompt_tokens, at}`. Absent until a bench has
@@ -749,7 +841,13 @@ async fn node_heartbeat(
     // stays empty and get_node_agent_url() falls back to {ip}:8081 — which
     // silently routes a SECOND agent's traffic (e.g. a Tier 5 sensor
     // companion on :8082) to the first agent on that host.
-    if let Some(v) = body.get("agent_url") { if !v.is_null() { data["agent_url"] = v.clone(); } }
+    // ...and held to acceptable_agent_url against the registered address: an
+    // offered URL that fails is not stored, and a stored one that no longer
+    // fits (the address moved) is removed, so every reader of the record
+    // dials https://<ip>:8081 instead. The reason is kept on the record as
+    // `agent_url_refused` for `noo cluster verify`, and cleared once a beat's
+    // URL fits.
+    apply_agent_url(&mut data, body.get("agent_url").and_then(|v| v.as_str()), &node_id);
     // node-agent build version — refresh from the heartbeat so a redeployed
     // node reflects its new binary without waiting for re-registration.
     if let Some(v) = body.get("app_version") { if !v.is_null() { data["app_version"] = v.clone(); } }
@@ -1152,7 +1250,7 @@ async fn node_register_body(
     let data = json!({
         "id": node_id,
         "hostname": body.get("hostname").and_then(|h| h.as_str()).unwrap_or(node_id),
-        "ip_address": body.get("ip_address"),
+        "ip_address": registered_ip(&body),
         "tier": caps.get("tier").or(body.get("tier")),
         "gpu_model": caps.get("gpu_model"),
         "gpu_count": caps.get("gpu_count"),
@@ -3396,7 +3494,7 @@ pub(crate) fn backend_start_cooled_down(node_id: &str, backend: &str) -> bool {
 /// either variable: it can change under the node with no check, and a
 /// 0.6.7+ agent refuses it anyway. Compose renders `VLLM_IMAGE` into the
 /// locked variable too, so an operator's `VLLM_IMAGE=vllm/vllm-openai:latest`
-/// used to replace the lock's digest-pinned ref outright (awolf ran
+/// used to replace the lock's digest-pinned ref outright (node-a ran
 /// `:latest` from a 0.6.6 agent, 2026-10-20). It is skipped, logged, and the
 /// next candidate (or the node's own versioned default) is used.
 pub(crate) fn backend_image_ref(backend: &str, get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
@@ -3440,7 +3538,7 @@ pub(crate) fn backend_image_ref(backend: &str, get: &dyn Fn(&str) -> Option<Stri
 /// null unless an operator set one, so the reconciler — how a node normally
 /// starts a backend — never received the lock's digest (only the manual
 /// `/start` route did). A node then fell back to its own versioned default
-/// with no digest, and a 0.6.8 agent refuses that: aserve and robopi could
+/// with no digest, and a 0.6.8 agent refuses that: node-b and node-pi could
 /// not recreate `noo-ollama` after its floating container was removed
 /// (`refusing image "ollama/ollama:0.40.5": it has no @sha256 digest`).
 pub(crate) fn placement_image(backend: &str, image: Option<String>, get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
@@ -4224,6 +4322,11 @@ async fn desired_config_get(
         // agent queues its own ladder under it. Absent on older gateways.
         "disk_reclaim": crate::autonomy_evaluators::node_reclaim_policy(&state).await,
         "engine": "rust",
+        // What this gateway understands from a node agent (node_restart): an
+        // agent refuses new calls with `node_restarting` during its stop
+        // drain only when its controller lists that here; otherwise new
+        // calls behave as they did before the drain existed.
+        "gateway_features": [crate::node_restart::FEATURE],
         // i802, for `noo cluster show`: per Ollama chat model, the context the
         // daemon runs now, the decided one, why, and the model's ceiling.
         "chat_context_detail": chat_context_detail,
@@ -4932,7 +5035,7 @@ async fn placement_staging_refusal(state: &AppState, node_id: &str, backend: &st
 /// tick is the fallback, so a node that is off the bus, older than the op
 /// (404) or unreachable costs a log line and nothing else. Without this a
 /// harness kind change landed up to 5 min after `noo cluster place`
-/// (both awolf and mcmini, harness compare 2026-10-24).
+/// (both node-a and node-mac, harness compare 2026-10-24).
 pub(super) fn nudge_reconcile(state: Arc<AppState>, node_id: String) {
     tokio::spawn(async move {
         let link = match crate::node_link::NodeLink::for_node(&state, &node_id).await {
@@ -5059,7 +5162,7 @@ async fn placement_put(
 
     // i226 phase B: does the harness kind fit the node's chat window? A
     // kind whose first request is larger than the window fails on its first
-    // model call (every vendor kind on awolf's 16k vLLM, 2026-10-24); say so
+    // model call (every vendor kind on node-a's 16k vLLM, 2026-10-24); say so
     // here, with the numbers and what fits.
     if desired == "running" && backend == "harness" {
         let kind = body.env.as_ref().and_then(|e| e.get("NOO_HARNESS_KIND")).and_then(|k| k.as_str()).unwrap_or("noo").to_string();
@@ -7311,6 +7414,7 @@ mod heartbeat_carry_tests {
         let handler = src.split("async fn node_heartbeat(").nth(1).expect("the handler")
             .split("\nasync fn ").next().unwrap();
         assert!(handler.contains("carry_reported(&mut data, &body, \"log_ship\")"), "node_heartbeat does not carry log_ship");
+        assert!(handler.contains("carry_reported(&mut data, &body, \"last_stop\")"), "node_heartbeat does not keep the agent's last stop drain: the roll cannot report it");
         assert!(handler.contains("carry_reported(&mut data, &body, \"peer_identity_enforced\")"),
             "node_heartbeat does not carry peer_identity_enforced — the verify row would judge a stale registration");
     }
@@ -7524,12 +7628,12 @@ mod heartbeat_carry_tests {
 
     #[test]
     fn with_contention_replaces_only_the_contention() {
-        let rec = json!({"id": "awolf", "status": "online", "gpu_contention": {"state": "free"}});
+        let rec = json!({"id": "node-a", "status": "online", "gpu_contention": {"state": "free"}});
         let gc = json!({"state": "held", "lease": {"operation_id": "op-1", "owner": "op"}});
         let merged = with_contention(rec, gc.clone());
         assert_eq!(merged["gpu_contention"], gc);
         assert_eq!(merged["status"], "online");
-        assert_eq!(merged["id"], "awolf");
+        assert_eq!(merged["id"], "node-a");
         // A record with no prior contention gains it.
         assert_eq!(with_contention(json!({"id": "x"}), gc.clone())["gpu_contention"], gc);
     }
@@ -7616,16 +7720,16 @@ mod honesty_tests {
         let placements = vec![
             p("host2", "harrier:latest", "running"),
             p("host6", "harrier", "stopped"),
-            p("awolf", "nomic-embed-code", "running"),
+            p("node-a", "nomic-embed-code", "running"),
             p("host9", "bge-m3", "running"),
         ];
-        let v = embedding_space_view(&spaces, &placements, &["HOST2".to_string(), "awolf".to_string()], &[]);
+        let v = embedding_space_view(&spaces, &placements, &["HOST2".to_string(), "node-a".to_string()], &[]);
         let k = &v["spaces"][0];
         assert_eq!(k["space"], "knowledge");
         assert_eq!(k["default"], true);
         assert_eq!(k["pool"].as_array().unwrap().len(), 2);
         assert_eq!(k["live"], 1, "host6 is stopped: in the pool, not live");
-        assert_eq!(v["spaces"][1]["pool"][0]["node"], "awolf");
+        assert_eq!(v["spaces"][1]["pool"][0]["node"], "node-a");
         assert_eq!(v["spaces"][1]["live"], 1);
         assert_eq!(v["unmatched"][0]["node"], "host9");
     }
@@ -7639,11 +7743,11 @@ mod honesty_tests {
             Space { space: "knowledge".into(), model: "harrier".into(), dims: Some(1024), migration: None },
             Space { space: "code".into(), model: "nomic-embed-code".into(), dims: None, migration: None },
         ];
-        let p = |m: &str| ("awolf".to_string(), "ollama".to_string(), Some(m.to_string()), "running".to_string());
-        let v = embedding_space_view(&spaces, &[p("harrier"), p("nomic-embed-code")], &["awolf".to_string()], &[]);
+        let p = |m: &str| ("node-a".to_string(), "ollama".to_string(), Some(m.to_string()), "running".to_string());
+        let v = embedding_space_view(&spaces, &[p("harrier"), p("nomic-embed-code")], &["node-a".to_string()], &[]);
         for i in 0..2 {
             assert_eq!(v["spaces"][i]["pool"].as_array().unwrap().len(), 1, "{v}");
-            assert_eq!(v["spaces"][i]["pool"][0]["node"], "awolf");
+            assert_eq!(v["spaces"][i]["pool"][0]["node"], "node-a");
             assert_eq!(v["spaces"][i]["live"], 1);
         }
         assert!(v["unmatched"].as_array().unwrap().is_empty());
@@ -7936,7 +8040,7 @@ mod gpu_label_tests {
     #[tokio::test]
     async fn a_node_gpu_is_its_model_none_or_a_named_error() {
         use crate::upstream_body::{stub, stub_cut_short};
-        let link = |b: &str| crate::node_link::NodeLink::for_base(b);
+        let link = |b: &str| crate::node_link::NodeLink::for_test_base(b);
         let base = stub("200 OK", None, b"{\"available\": true, \"gpu_model\": \"RTX 4080\", \"temperature_c\": 61}").await;
         let gpu = super::node_gpu(&link(&base), "host3", "host3.lan", 0).await.unwrap().expect("a GPU");
         assert_eq!(gpu["name"], "RTX 4080");
@@ -9032,6 +9136,7 @@ mod i300_beat_tests {
                 {"id": "rh-tts", "revision": "r3", "state": "refused", "reason": "disk", "retry_at": "2026-11-09T14:32:00Z", "free_bytes": 4_500_000_000u64, "need_bytes": 9_600_000_000u64},
             ],
             "node_workloads": [{"addon": "rhaddon", "name": "worker", "state": "provisioned", "ready": false, "door_port": 41001}],
+            "ollama_verify": [{"model": "harrier", "state": "verified", "anchor": "gguf", "model_layer": "sha256:5f26", "reason": "", "checked_at": "t"}],
         })
     }
 
@@ -9657,5 +9762,90 @@ mod chat_context_detail_tests {
         assert!(body.contains("chat_context_rows(&placement_json, &record, profile_context, stack)"), "computed from the placements served");
         assert!(body.contains("\"chat_context_detail\": chat_context_detail,"));
         assert!(body.contains("if let Some(map) = chat_contexts \u{7b}\n        body[\"chat_contexts\"] = map;"), "only Some sets the key");
+    }
+}
+
+#[cfg(test)]
+mod agent_url_tests {
+    //! A node's agent_url must be https on an explicit port at its registered
+    //! address: one test per check.
+    use super::{acceptable_agent_url, apply_agent_url};
+    use serde_json::json;
+
+    #[test]
+    fn a_node_agent_url_at_its_registered_address_is_accepted() {
+        assert!(acceptable_agent_url("https://100.64.0.5:8081", "100.64.0.5").is_ok());
+        assert!(acceptable_agent_url("https://100.64.0.5:8082/", "100.64.0.5").is_ok(), "a second agent on the same host");
+        assert!(acceptable_agent_url("https://[fd7a:115c::1]:8081", "fd7a:115c::1").is_ok());
+    }
+
+    #[test]
+    fn a_node_agent_url_must_be_https() {
+        assert_eq!(acceptable_agent_url("http://100.64.0.5:8081", "100.64.0.5"), Err("it is not https"));
+    }
+
+    #[test]
+    fn a_node_agent_url_must_name_the_registered_address() {
+        assert_eq!(acceptable_agent_url("https://100.64.0.6:8081", "100.64.0.5"), Err("its host is not the node's registered address"));
+        assert_eq!(acceptable_agent_url("https://node-1.tail:8081", "100.64.0.5"), Err("its host is not an IP address"));
+    }
+
+    #[test]
+    fn a_node_agent_url_must_name_its_port() {
+        assert_eq!(acceptable_agent_url("https://100.64.0.5", "100.64.0.5"), Err("it names no port"));
+    }
+
+    #[test]
+    fn a_node_agent_url_carries_no_user_info_path_query_or_fragment() {
+        for bad in ["https://u:p@100.64.0.5:8081", "https://100.64.0.5:8081/api", "https://100.64.0.5:8081/?x=1", "https://100.64.0.5:8081/#f"] {
+            assert_eq!(acceptable_agent_url(bad, "100.64.0.5"), Err("it carries user info, a path, a query or a fragment"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_node_agent_url_needs_a_dialable_registered_address() {
+        for ip in ["", "127.0.0.1", "169.254.169.254", "not-an-ip"] {
+            assert!(acceptable_agent_url("https://127.0.0.1:8081", ip).is_err(), "{ip:?}");
+        }
+    }
+
+    #[test]
+    fn a_heartbeat_agent_url_is_stored_only_when_it_fits_and_a_refusal_is_recorded() {
+        let mut data = json!({"ip_address": "100.64.0.5"});
+        apply_agent_url(&mut data, Some("https://100.64.0.5:8081"), "n1");
+        assert_eq!(data["agent_url"], "https://100.64.0.5:8081");
+        assert!(data.get("agent_url_refused").is_none());
+
+        apply_agent_url(&mut data, Some("https://10.9.9.9:8081"), "n1");
+        assert_eq!(data["agent_url"], "https://100.64.0.5:8081", "a refused URL is not stored");
+        assert_eq!(data["agent_url_refused"], "its host is not the node's registered address");
+
+        apply_agent_url(&mut data, Some("https://100.64.0.5:8081"), "n1");
+        assert!(data.get("agent_url_refused").is_none(), "a fitting URL clears the refusal");
+    }
+
+    #[test]
+    fn a_stored_agent_url_that_no_longer_fits_the_address_is_removed() {
+        let mut data = json!({"ip_address": "100.64.0.7", "agent_url": "https://100.64.0.5:8081"});
+        apply_agent_url(&mut data, None, "n1");
+        assert!(data.get("agent_url").is_none(), "{data}");
+    }
+
+    #[test]
+    fn a_registration_stores_only_a_dialable_address() {
+        use super::registered_ip;
+        assert_eq!(registered_ip(&json!({"ip_address": "100.64.0.5"})), json!("100.64.0.5"));
+        for bad in ["127.0.0.1", "169.254.169.254", "0.0.0.0", "node.example", ""] {
+            assert!(registered_ip(&json!({"ip_address": bad})).is_null(), "{bad}");
+        }
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        assert!(own.contains("\"ip_address\": registered_ip(&body),"), "the registration stores the address through registered_ip");
+    }
+
+    #[test]
+    fn the_heartbeat_holds_agent_url_to_the_rule() {
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        assert!(own.contains("apply_agent_url(&mut data, body.get(\"agent_url\").and_then(|v| v.as_str()), &node_id);"), "the heartbeat stores agent_url through apply_agent_url");
+        assert!(!own.contains("data[\"agent_url\"] = v.clone()"), "no unchecked copy of agent_url");
     }
 }

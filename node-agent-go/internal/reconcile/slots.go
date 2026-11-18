@@ -27,7 +27,7 @@ var slotKeys = map[string][]string{
 // NOO_HARNESS_KIND by design (convergeHarness reads it; the harness is a
 // host service, never a container), so running the filter over it raised
 // "node refused 1 desired-state instruction" on every kind change while the
-// change itself went through (awolf, 2026-10-24, the harness compare).
+// change itself went through (node-a, 2026-10-24, the harness compare).
 func backendSlots(effective []placement) map[string]int {
 	out := map[string]int{}
 	for _, p := range effective {

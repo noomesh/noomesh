@@ -245,13 +245,24 @@ func validSHA256(s string) (string, error) {
 // that reports bytes of an ALREADY-PRESENT dest as they are re-hashed (the
 // HF preseed's "verifying … n/total GB" line). progress keeps its meaning:
 // bytes of the file written so far.
-func (c *Client) fetchVerified(ctx context.Context, fileURL, dest, expectedSHA256 string, progress, onHash func(int64)) (bool, error) {
+func (c *Client) fetchVerified(ctx context.Context, fileURL, dest, expectedSHA256 string, progress, onHash func(int64)) (wrote bool, err error) {
 	want, err := validSHA256(expectedSHA256)
 	if err != nil {
 		return false, err
 	}
-	if ok, _ := c.verifyPresent(dest, want, onHash); ok {
+	ok, presentErr := c.verifyPresent(dest, want, onHash)
+	if ok {
 		return false, nil // verified present — nothing to do
+	}
+	// A file that IS there and was just proven to differ from the manifest:
+	// if the fetch below fails, it is still there, and the caller must know
+	// it holds bytes proven wrong, not merely unverified (PresentMismatchError).
+	if errors.Is(presentErr, ErrDigestMismatch) {
+		defer func() {
+			if err != nil {
+				err = &PresentMismatchError{Mismatch: presentErr, Fetch: err}
+			}
+		}()
 	}
 	// Absent, unreadable or mismatching: fetch and land over it.
 
@@ -427,6 +438,35 @@ func contentRangeStart(v string) (int64, bool) {
 // ErrDigestMismatch: the bytes arrived but do not hash to the manifest's
 // sha256. A VERIFICATION failure — callers must refuse, never fall back.
 var ErrDigestMismatch = errors.New("digest mismatch")
+
+// ErrPresentMismatch: the file already at the destination was PROVEN to
+// differ from the manifest, and the fetch that would have replaced it failed,
+// so those bytes are still there. A missing manifest or an unreachable store
+// never produces it: only a hash that was computed and disagreed.
+var ErrPresentMismatch = errors.New("the present file does not match the manifest and could not be replaced")
+
+// PresentMismatchError carries both halves. It matches ErrPresentMismatch and
+// unwraps to the FETCH error only, so a caller that inspects why the fetch
+// failed (ErrDigestMismatch for a corrupt transfer, a transport error) sees
+// exactly what it saw before.
+type PresentMismatchError struct {
+	Mismatch error // what verifyPresent found
+	Fetch    error // why the replacement failed
+}
+
+func (e *PresentMismatchError) Error() string {
+	return fmt.Sprintf("%v; the re-fetch failed: %v", e.Mismatch, e.Fetch)
+}
+
+func (e *PresentMismatchError) Is(target error) bool { return target == ErrPresentMismatch }
+
+func (e *PresentMismatchError) Unwrap() error { return e.Fetch }
+
+// HashFile is the sha256 (lowercase hex) of a file already on disk, hashed
+// at lowered priority like every other verification hash on this node. For
+// callers outside this package that verify through a VerifiedRecord
+// themselves (the ollama store check, docker/ollama_verify.go).
+func HashFile(path string) (string, error) { return hashFile(path, nil) }
 
 // hashCalls counts hashFile calls: the tests' view of "re-hashed or not".
 var hashCalls atomic.Int64

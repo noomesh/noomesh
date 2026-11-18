@@ -188,6 +188,13 @@ mkdir -p "$OUT/stranger-cwd"
 step install 600 -- sh -c "cd '$OUT/stranger-cwd' && $LINE" || finish
 step version 30 -- noo --version || finish
 meta installed_version "$(noo --version 2>/dev/null | head -1)"
+# PROBES (2026-11-18 launch audit, items 1-3: documented first-run commands
+# nothing ran). Each prints one `… PASS:` / `… FAIL:` line; as probe-* steps
+# the summary counts them and they never fail the cell (a report, not a gate).
+# install.md:86 `noo whoami   # "client-only" on a fresh host — expected`.
+step probe-docs-whoami-installed 30 -- sh -c 'out="$(noo whoami 2>&1)"; rc=$?; printf "%s\n" "$out"
+  if [ $rc = 0 ] && printf "%s" "$out" | grep -q "client-only"; then echo "WHOAMI-INSTALLED PASS: a fresh host reads client-only, as install.md says"
+  else echo "WHOAMI-INSTALLED FAIL: install.md says a fresh host reads \"client-only\" (rc=$rc)"; exit 1; fi'
 
 if [ "$SCOPE" = node-partial ]; then
     # macOS is a NODE: it needs a controller this hosted runner cannot reach,
@@ -270,20 +277,33 @@ if [ "${EXPECT:-}" = refusal ]; then
     finish
 fi
 
+# The ci onboard steps below pass `--root-ok`, which this harness (dev) has and
+# a release cut before it does not (0.6.26: every ci cell failed at onboard,
+# run 44259137054). The installed CLI's own `noo onboard --help` says whether
+# it has the flag; without it the cell is NOT RUN, with the reason and the fix,
+# instead of a FAIL that reads as a product failure in every cell.
+if [ "$ONBOARD" != interactive ] && ! noo onboard --help 2>&1 | grep -q -- '--root-ok'; then
+    meta limits "harness newer than the installed CLI ($(noo --version 2>/dev/null | head -1)): its onboard has no --root-ok, which these ci steps pass; dispatch with cli_tag=<a release that has it> (0.6.27-rc.1 or later)"
+    meta not_run "the installed CLI predates the harness's onboard flags (--root-ok)"
+    echo "::notice::$CELL: the installed CLI has no onboard --root-ok; this harness needs a newer cli_tag: not run"
+    teardown
+    finish
+fi
+
 if [ "$ONBOARD" = interactive ]; then
     hook onboard-interactive.sh || fail_onboarded
 elif [ "$MODEL" = tiny ]; then
     # --ci takes the declared OLLAMA_MODEL, which onboard reads from the
     # install's .env only (not the process env): onboard everything but the
     # model, declare the tiny one there, then run the model section alone.
-    step onboard 2700 -- noo onboard --ci --skip-model || fail_onboarded
+    step onboard 2700 -- noo onboard --ci --root-ok --skip-model || fail_onboarded
     envf="$(find "$HOME" -maxdepth 4 -name .noo-standalone -print -quit 2>/dev/null)"
     envf="${envf%/.noo-standalone}/.env"
     step declare-tiny-model 30 -- sh -c "test -f '$envf' && { grep -v '^OLLAMA_MODEL=' '$envf' > '$envf.tmp'; echo 'OLLAMA_MODEL=$TINY_MODEL' >> '$envf.tmp'; mv '$envf.tmp' '$envf'; echo \"OLLAMA_MODEL=$TINY_MODEL in $envf\"; }" \
         || fail_onboarded
     step onboard-model 1800 -- noo onboard --ci --only model || fail_onboarded
 else
-    step onboard 3600 -- noo onboard --ci || fail_onboarded
+    step onboard 3600 -- noo onboard --ci --root-ok || fail_onboarded
 fi
 # The model was placed above: the agent's view on success too (see agent_dump).
 agent_dump model
@@ -292,6 +312,16 @@ agent_dump model
 step stack-start 1800 -- noo stack start || fail_onboarded
 step health 600 -- sh -c 'for i in $(seq 1 40); do noo health >/dev/null 2>&1 && break; sleep 15; done; noo health' \
     || fail_onboarded
+# PROBES: install.md:226 `noo whoami   # controller / node / both / client-only`
+# (an onboarded controller), and install.md:228 / troubleshooting.md:9
+# `noo doctor docker` (setup-and-host.md:106: a clean daemon prints
+# `no unclean-shutdown damage signature`).
+step probe-docs-whoami-onboarded 30 -- sh -c 'out="$(noo whoami 2>&1)"; rc=$?; printf "%s\n" "$out"
+  if [ $rc = 0 ] && printf "%s" "$out" | grep -q "^this box: controller"; then echo "WHOAMI-ONBOARDED PASS: an onboarded controller reads controller"
+  else echo "WHOAMI-ONBOARDED FAIL: after onboard, whoami should read controller (rc=$rc)"; exit 1; fi'
+step probe-docs-doctor-docker 120 -- sh -c 'out="$(noo doctor docker 2>&1)"; rc=$?; printf "%s\n" "$out"
+  if [ $rc = 0 ] && printf "%s" "$out" | grep -q "no unclean-shutdown damage signature"; then echo "DOCTOR-DOCKER PASS: a clean daemon reads as setup-and-host.md says"
+  else echo "DOCTOR-DOCKER FAIL: a fresh daemon should exit 0 with \"no unclean-shutdown damage signature\" (rc=$rc)"; exit 1; fi'
 # Not in the README's path (it is `stack start && health`, then chat): a red
 # verify is recorded with every row, and the stranger still asks the question.
 if [ "$MODEL" = tiny ]; then
@@ -433,6 +463,10 @@ step first-answer 1800 -- sh -c '
     echo "FIRST-ANSWER NOTE: the tiny test model ($TINY_MODEL) did not answer the prompt; this cell runs MODEL=$MODEL, not the product default, so this is not a product verdict"
   fi' || fail_onboarded
 meta first_answer_s "$(( $(date +%s) - CELL_START ))"
+# PROBE: first-chat.md:14 / README.md:121 `noo chat`, the interactive REPL a
+# stranger opens first (the step above runs only `--message`). Through a pty:
+# one prompt, an answer, `/exit`, a clean exit.
+step probe-docs-chat-repl 1200 -- python3 "$HERE/chat_repl.py" --timeout 900 -- noo chat
 
 # PROBE (operator 2026-11-14): cold-load delays, AFTER first-answer so the
 # idle series above is untouched. coldload.py stops every model ollama ps

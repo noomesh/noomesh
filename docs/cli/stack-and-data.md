@@ -67,7 +67,7 @@ noo stack rebuild-status --follow
 Foreground rebuilds run `scripts/noomesh-rebuild.sh` (`--no-cache`,
 `--profile`, `--gateway-engine`/`--node-engine` are foreground-only).
 `--background` needs noo-hostd running (the controller-mode user unit
-`noo onboard` installs; `systemctl --user status noo-hostd`) — otherwise
+`noo onboard` installs at a terminal or with `--ci --root-ok`; plain `--ci` skips it; `systemctl --user status noo-hostd`) — otherwise
 it refuses and points at `noo onboard --only services` — and drops a
 `stack-rebuild` job into `.noo-host-spool/` for hostd to run; the same
 job shows in the dashboard under Self-Regulation → Host Operations.
@@ -208,8 +208,8 @@ skipped unless `--integration`. See [testing.md](../development/developer-guide.
 ### `noo stack` — The Docker stack on THIS host: start/stop/restart/clean/status (the fleet is `cluster`)
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo stack status` | — | Show stack container status (from docker ps) |
-| `noo stack logs` | `[<service>...] [--follow] [--tail <n>]` | Show container logs for one service or compose logs for many |
+| `noo stack status` | `[-w\|--watch [<secs>]]` | Show stack container status (from docker ps) |
+| `noo stack logs` | `[<service>...] [-f\|--follow] [--tail <n>]` | Show container logs for one service or compose logs for many |
 | `noo stack restart` | `[--profile <p>] [--force] [<service>...]` | Restart services by status name or add-on key; --force recreates (reloads env, secrets) |
 | `noo stack start` | `[--profile <p>] [--pull] [--build] [--dist] [--dev] [--tag <tag>]` | Start the stack via scripts/noomesh-start.sh |
 | `noo stack stop` | `[--volumes [-y\|--yes]]` | Stop the stack; --volumes deletes the database and every volume, after a typed confirm |

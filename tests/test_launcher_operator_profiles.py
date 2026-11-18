@@ -52,6 +52,28 @@ def test_the_environment_wins_over_the_env_file(tmp_path):
     assert _args(tmp_path, "COMPOSE_PROFILES=embed-cpu\n", env_var="sensors").stdout == "--profile sensors"
 
 
+def test_both_set_and_different_says_which_won(tmp_path):
+    # 0.6.26-rc.1 A-leftover: the dind exports COMPOSE_PROFILES=embed-cpu and
+    # the item's .env line (embed-cpu,ollama) was never read, silently.
+    r = _args(tmp_path, "COMPOSE_PROFILES=embed-cpu,ollama\n", env_var="embed-cpu")
+    assert r.stdout == "--profile embed-cpu", r
+    warns = [l for l in r.stderr.splitlines() if l.startswith("WARN: COMPOSE_PROFILES")]
+    assert warns == [
+        "WARN: COMPOSE_PROFILES is set in this launch's environment (embed-cpu) and in .env (embed-cpu,ollama): "
+        "the environment's is used and .env's line is ignored (unset COMPOSE_PROFILES to use .env)"
+    ], r.stderr
+
+
+@pytest.mark.parametrize("env_file,env_var", [
+    ("COMPOSE_PROFILES=sensors, embed-cpu\n", "embed-cpu,sensors"),  # same set, other order and spacing
+    ("COMPOSE_PROFILES=embed-cpu\n", None),                            # .env only
+    ("NOO_DATA_ROOT=/x\n", "embed-cpu"),                               # environment only
+])
+def test_one_source_or_the_same_set_says_nothing(tmp_path, env_file, env_var):
+    r = _args(tmp_path, env_file, env_var=env_var)
+    assert "COMPOSE_PROFILES is set" not in r.stderr, r.stderr
+
+
 def test_no_setting_is_no_flag(tmp_path):
     assert _args(tmp_path, None).stdout == ""
 

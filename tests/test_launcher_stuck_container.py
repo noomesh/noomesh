@@ -2,7 +2,7 @@
 # Copyright 2026 PersonifAI LLC
 
 """One unkillable container must not take the whole stack down
-(scripts/lib-stuck-container.sh; controller pop-os, 2026-10-20).
+(scripts/lib-stuck-container.sh; controller ctrl, 2026-10-20).
 
 `docker compose up --force-recreate` failed with "cannot stop container: <id>:
 tried to kill container, but did not receive an exit event" for

@@ -1,5 +1,7 @@
 # At-rest recovery: the encrypted state volume did not open
 
+> Opt-in, not yet validated on real hardware (decision 2026-10-26).
+
 A controller that said yes to encryption at rest (i10a) keeps its sensitive
 state (postgres, redis, nats, prometheus, grafana, loki, noo-data, the PKI
 and an escrow copy of the age key) on a LUKS2 volume backed by the file

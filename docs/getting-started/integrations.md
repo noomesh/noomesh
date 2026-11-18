@@ -276,7 +276,7 @@ is no plaintext fallback. Provider outages leave saved credentials intact.
 Deploy the reviewed gateway, CLI, UI and migrations through the normal stack
 release. Configure that controller's exact HTTPS callback in both Google and
 its `integrations.providers.google.web_redirect_uri`. An existing trusted
-HTTPS console address can use its normal port; the AWOLF test's extra port is
+HTTPS console address can use its normal port; the NODE-A test's extra port is
 not required on other hosts. Preserve callbacks still used by other installs.
 
 Import the installer-owned Web secret through that controller's encrypted
@@ -284,7 +284,7 @@ secret workflow and generate its own integration encryption key. Use an
 existing real Noomesh user on both the execution CLI and approving phone.
 Run `noo auth connect google --pair` against this controller and verify that
 the displayed phone URL belongs to it. Reconnect each Google account there;
-do not copy the AWOLF test user's credentials or database rows into another
+do not copy the NODE-A test user's credentials or database rows into another
 installation. The private test app's credentials are not publisher defaults.
 
 Removing a verified account deletes local credentials and source settings and

@@ -18,7 +18,7 @@ The server's uid is its OWN (0.6.12). Docker without userns-remap counts
 RLIMIT_NPROC per real uid across the host, so the sandbox's `nproc: 256`
 bounds its threads only while no other service runs as that uid. As
 `nonroot` (65532) it shared the count with redis, the monitoring set, the
-voice doors, stunnel and the Python services; on pop-os (0.6.11) that was
+voice doors, stunnel and the Python services; on ctrl (0.6.11) that was
 exactly 256, every thread the server started failed and `/health` answered
 500. The pins below derive the server's uid from the compose launcher and
 the Dockerfile's passwd line, and every other uid from the tree's text.

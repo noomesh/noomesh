@@ -22,7 +22,7 @@ def _clean():
 
 
 REPLY = "_INBOX_gw.BqJB7wouIJniIDngCeiy39.BqJB7wouIJniIDngCen4ei"
-# Exactly what nats-py handed the callback on pop-os 2026-10-14 20:54:44.
+# Exactly what nats-py handed the callback on ctrl 2026-10-14 20:54:44.
 LIVE_ERROR = 'nats: permissions violation for publish to "_inbox_gw.bqjb7wouijniidngceiy39.bqjb7wouijniidngcen4ei"'
 
 

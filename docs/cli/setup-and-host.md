@@ -48,6 +48,7 @@ noo onboard                 # interactive wizard
 noo onboard --tui           # same wizard, full-screen (needs a TTY)
 noo onboard --web           # same wizard in a browser (--port to move it)
 noo onboard --ci            # accept defaults and env; never blocks
+noo onboard --ci --root-ok  # also the root steps, via sudo -n (passwordless sudo; never probed)
 ```
 
 The wizard runs eleven steps in dependency order — prerequisites,
@@ -115,7 +116,8 @@ noo cluster bootstrap-token create --node gpu-2
 ```
 
 It prints a one-liner. Paste that on the node — it is the only `sudo` the
-node ever needs. The three forms `noo enroll` accepts are the blob the
+node needs to enrol. Later node-side actions (`noo node workloads …`,
+de-enrolment) use `sudo` too. The three forms `noo enroll` accepts are the blob the
 one-liner carries (`noo enroll noo1.<base64>`), an explicit
 `--url <controller> --token <t>`, and `--via-tailnet <https://controller>`
 (no token: identity is proved by Tailscale `whois` plus a dial-back). The
@@ -156,7 +158,13 @@ after it, so `--stack` always uses the new release's assets and its baked
 stack tag (`--tag vX.Y.Z` overrides the pairing). `--stack` manages
 standalone installs only; on a checkout use `noo stack start`/`rebuild`.
 `--nodes` ends `bundles staged for all N node(s) — each applies on its next
-fetch tick`. An enrolled node upgrades its own binary from the controller's
+fetch tick`. Nodes that callers fail over between (the candidates of one
+model class, the pool of one embedding space) are never all restarting at
+once: before staging a node, the roll checks that each of its groups keeps
+one other offered candidate (two for a group of four or more), and otherwise
+waits, at most 150 s once the restarting node has applied, saying what it
+waits for. A wait that runs out is said with the command to check
+(`noo cluster verify --wait`) and the roll goes on. An enrolled node upgrades its own binary from the controller's
 mirror (`/bootstrap/cli`), so nodes need no GitHub access. From the mirror it
 downloads only when the mirror's signed manifest names a different version or
 binary than the one running; an unverified manifest never counts as current. Private release
@@ -284,7 +292,7 @@ the other nodes first: [Start over](../getting-started/start-over.md).
 ### `noo onboard` — Setup wizard
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo onboard` | `[--tui\|--web [--port <n>]] [--non-interactive\|--ci] [--dry-run] [--reconfigure] [--standalone [--bundle <url\|path>]] [--from-archive <f> [--passphrase-file <f>]] [--only <sections>] [--min-free-gb <n>] [--skip-tailscale] [--skip-security] [--skip-storage] [--skip-services] [--skip-trellion] [--skip-model] [--skip-channels] [--mcp-door\|--no-mcp-door] [--monitoring-full\|--no-monitoring-full] [--skip-addons] [--secrets-backend sops]` | Run the setup wizard to bootstrap a controller (secrets, PKI, .env, compose, model) |
+| `noo onboard` | `[--tui\|--web [--port <n>]] [--non-interactive\|--ci] [--root-ok] [--dry-run] [--reconfigure] [--standalone [--bundle <url\|path>]] [--from-archive <f> [--passphrase-file <f>]] [--only <sections>] [--min-free-gb <n>] [--skip-tailscale] [--skip-security] [--skip-storage] [--skip-services] [--skip-trellion] [--skip-model] [--skip-channels] [--mcp-door\|--no-mcp-door] [--monitoring-full\|--no-monitoring-full] [--skip-addons] [--secrets-backend sops]` | Run the setup wizard to bootstrap a controller (secrets, PKI, .env, compose, model) |
 
 ### `noo enroll` — Join this machine to a noomesh fleet as a worker
 | Command | Arguments | What it does |

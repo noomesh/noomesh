@@ -484,7 +484,7 @@ async fn logs_docker_stats(
 ) -> AppJson {
     let targets = container_targets(&state, params.node_id.as_deref()).await;
     let (results, unreachable) = gather_node_lists(targets, "/stats/containers").await;
-    let timestamp = chrono::Utc::now().to_rfc3339();
+    let timestamp = crate::wire_time::rfc3339_offset(jiff::Timestamp::now());
     Json(json!({"containers": results, "unreachable": unreachable, "timestamp": timestamp}))
 }
 
@@ -1228,7 +1228,7 @@ async fn cancel_job(
         ));
     }
 
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = crate::wire_time::rfc3339_offset(jiff::Timestamp::now());
 
     // Update job hash: status → cancelled
     redis.hset(&key, &[
@@ -1256,7 +1256,7 @@ async fn cancel_job(
         let nid = node_id.to_string();
         tokio::spawn(async move {
             let payload = serde_json::json!({
-                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "timestamp": crate::wire_time::rfc3339_offset(jiff::Timestamp::now()),
                 "type": "job.cancel",
                 "data": {
                     "job_id": jid,
@@ -1345,7 +1345,7 @@ async fn reprioritize_job(
         ));
     }
 
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = crate::wire_time::rfc3339_offset(jiff::Timestamp::now());
     let priority_str = body.priority.to_string();
 
     // Update job hash
@@ -1742,7 +1742,7 @@ pub(crate) async fn submit_job_to_redis(
     }
 
     let job_id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = crate::wire_time::rfc3339_offset(jiff::Timestamp::now());
     let payload_str = serde_json::to_string(payload).unwrap_or_default();
 
     let key = format!("{JOB_KEY_PREFIX}{job_id}");
@@ -2067,7 +2067,7 @@ async fn spawn_test_run(state: &Arc<AppState>, suite: &str) -> String {
     // so max_retries=0 — a Python requeue would hand this job to a node-agent
     // that cannot run it; instead the reaper marks a hung run dead once
     // timeout_sec elapses (dispatched_at/node_id make it reaper-visible).
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = crate::wire_time::rfc3339_offset(jiff::Timestamp::now());
     const TESTS_TIMEOUT_SEC: i64 = 3600;
     if let Some(redis) = state.redis.as_ref() {
         let key = format!("{JOB_KEY_PREFIX}{job_id}");
@@ -2135,7 +2135,7 @@ async fn spawn_test_run(state: &Arc<AppState>, suite: &str) -> String {
         tracing::info!(job_id = %job_id_clone, status, "tests: finished");
 
         if let Some(redis) = state_bg.redis.as_ref() {
-            let done_at = chrono::Utc::now().to_rfc3339();
+            let done_at = crate::wire_time::rfc3339_offset(jiff::Timestamp::now());
             let key = format!("{JOB_KEY_PREFIX}{job_id_clone}");
             let error = if status == "failed" { summary.as_str() } else { "" };
             let _ = redis.hset(&key, &[
@@ -2967,7 +2967,7 @@ pub(crate) async fn host_spool_write_command(
         "rollback": null,
         "args": args,
         "requested_by": requested_by,
-        "ts": chrono::Utc::now().to_rfc3339(),
+        "ts": crate::wire_time::rfc3339_offset(jiff::Timestamp::now()),
     });
 
     let dir = std::path::Path::new(&spool_dir);
@@ -3244,6 +3244,13 @@ fn find_container(containers: &[Value], wanted: &str) -> Option<(String, String)
     None
 }
 
+/// A container name as Docker allows it (`[a-zA-Z0-9][a-zA-Z0-9_.-]*`): the
+/// node-agent log path takes exactly one, never a path.
+pub(crate) fn is_container_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    !b.is_empty() && b.len() <= 255 && b[0].is_ascii_alphanumeric() && b.iter().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'))
+}
+
 /// Fetch log lines for one container from its node-agent. The Python
 /// handlers went through GET /api/logs/node/{node}/{container}, which clamps
 /// `tail` to 2000 — the same clamp is applied here so behaviour matches the
@@ -3254,6 +3261,9 @@ async fn node_log_lines(
     container: &str,
     tail: i64,
 ) -> Result<Vec<String>, String> {
+    if !is_container_name(container) {
+        return Err(format!("'{container}' is not a container name (letters, digits, '_', '.', '-'; starting with a letter or digit)"));
+    }
     let link = crate::node_link::NodeLink::for_node(state, node_id)
         .await
         .map_err(|_| "node-agent logs failed: HTTP 404".to_string())?;
@@ -4294,7 +4304,7 @@ pub(crate) async fn self_modify_audit(entry: Value) {
     let write = async {
         let mut entry = entry;
         if let Some(obj) = entry.as_object_mut() {
-            obj.insert("ts".into(), json!(chrono::Utc::now().to_rfc3339()));
+            obj.insert("ts".into(), json!(crate::wire_time::rfc3339_offset(jiff::Timestamp::now())));
         }
         let path = std::env::var("NOO_SELF_MODIFY_AUDIT_PATH")
             .unwrap_or_else(|_| "/data/noo_self_modify_audit.jsonl".into());
@@ -5552,7 +5562,7 @@ mod node_list_tests {
         let cut = stub_cut_short().await;
         let down = stub("500 Internal Server Error", None, b"[]").await;
         let odd = stub("200 OK", None, b"{\"containers\": []}").await;
-        let t = |id: &str, b: &str| (id.to_string(), format!("{id}.lan"), crate::node_link::NodeLink::for_base(b));
+        let t = |id: &str, b: &str| (id.to_string(), format!("{id}.lan"), crate::node_link::NodeLink::for_test_base(b));
         let (items, unreachable) =
             gather_node_lists(vec![t("a", &good), t("b", &cut), t("c", &down), t("d", &odd)], "/logs/containers").await;
         assert_eq!(items, vec![json!({"name": "noo-gateway", "node_id": "a", "node_hostname": "a.lan"})]);
@@ -5609,5 +5619,29 @@ mod monitoring_off_tests {
         let body = crate::test_src::fn_body(&own, "async fn logs_search(");
         assert!(body.contains("logs_search::search_answer(outcome, &built)"), "{body}");
         assert!(body.contains("logs_search::query_configured_loki(&built)"), "{body}");
+    }
+}
+
+#[cfg(test)]
+mod container_name_tests {
+    use super::is_container_name;
+
+    #[test]
+    fn a_node_log_request_names_one_container_never_a_path() {
+        for ok in ["noo-gateway", "vllm_1", "a.b-c", "X9"] {
+            assert!(is_container_name(ok), "{ok}");
+        }
+        for bad in ["", "a/b", "../x", "..", ".hidden", "-x", "a?tail=1", "a%2Fb", "a b", "a\\b"] {
+            assert!(!is_container_name(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_node_log_fetch_checks_the_container_name_before_building_its_url() {
+        let own = crate::test_src::own_code(include_str!("admin.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn node_log_lines(");
+        let check = body.find("if !is_container_name(container)").expect("the name check");
+        let url = body.find("format!(\"/logs/{container}").expect("the log URL");
+        assert!(check < url, "the container name is checked before the URL is built");
     }
 }

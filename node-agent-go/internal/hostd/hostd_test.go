@@ -723,6 +723,51 @@ func TestReclaimRemovesOnlyStaleLabelledBuildVolumes(t *testing.T) {
 	}
 }
 
+// The dry run says what rung 4 keeps and why, not only a stale count: on
+// node-a (2026-11-16) three live noo-batch caches read as "1 stale
+// build-cache volume(s)", which looked like the rung could not see them.
+func TestReclaimDryRunSaysWhichBuildVolumesItKeepsAndWhy(t *testing.T) {
+	e, fr := testEngine(t)
+	root := t.TempDir()
+	live := filepath.Join(root, "batch-check", "gateway-rust")
+	if err := os.MkdirAll(live, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fresh := filepath.Join(root, "vol-fresh")
+	if err := os.MkdirAll(fresh, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-3 * time.Hour)
+	if err := os.Chtimes(fresh, old, old); err != nil {
+		t.Fatal(err)
+	}
+	fr.stdout["volume ls"] = "vol-fresh\nvol-gone\nvol-nomount\n"
+	fr.stdout["vol-fresh"] = live + "|" + fresh
+	fr.stdout["vol-gone"] = filepath.Join(root, "deleted") + "|" + fresh
+	fr.stdout["vol-nomount"] = live + "|" + filepath.Join(root, "no-such-mount")
+	r := queue(t, e, "c", Command{Op: "disk-reclaim", Service: "docker",
+		Args: []string{"dry_run=true", "watermark=1"}})
+	want := "rung4: 1 stale build-cache volume(s); 2 kept: vol-fresh (checkout present, used 3h ago), " +
+		"vol-nomount (checkout present, last use unreadable)"
+	if !strings.Contains(r.Stderr, want) {
+		t.Errorf("dry run must say what it keeps and why:\nwant %q\ngot  %q", want, r.Stderr)
+	}
+	for _, c := range fr.joined() {
+		if strings.HasPrefix(c, "docker volume rm") {
+			t.Errorf("a dry run removed a volume: %q", c)
+		}
+	}
+	if got := ago(90 * time.Second); got != "1m" {
+		t.Errorf("ago(90s) = %q", got)
+	}
+	if got := ago(50 * time.Hour); got != "2d" {
+		t.Errorf("ago(50h) = %q", got)
+	}
+	if got := rung4Line(buildVolumes{}); !strings.Contains(got, "not listed") {
+		t.Errorf("a failed listing must say so, not report 0: %q", got)
+	}
+}
+
 // A worker's hostd serves disk-reclaim, so the node's agent can relieve its
 // own disk — the controller's ladder cannot reach it.
 func TestWorkerModeServesDiskReclaim(t *testing.T) {

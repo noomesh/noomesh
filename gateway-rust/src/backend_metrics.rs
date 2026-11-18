@@ -367,9 +367,9 @@ python_gc_objects_collected_total{generation="0"} 100.0
         let (samples, _) = parse(text);
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].labels, vec![("engine".to_string(), "0".to_string())]);
-        let snap = vec![TargetScrape { node: "awolf".into(), backend: "vllm".into(), up: true, samples, types: BTreeMap::new() }];
+        let snap = vec![TargetScrape { node: "node-a".into(), backend: "vllm".into(), up: true, samples, types: BTreeMap::new() }];
         let out = render(&snap);
-        assert!(out.contains("vllm:num_requests_waiting{node=\"awolf\",backend=\"vllm\",engine=\"0\"} 1\n"), "{out}");
+        assert!(out.contains("vllm:num_requests_waiting{node=\"node-a\",backend=\"vllm\",engine=\"0\"} 1\n"), "{out}");
         assert!(!out.contains("evil") && !out.contains("spoof"), "{out}");
     }
 
@@ -400,25 +400,25 @@ python_gc_objects_collected_total{generation="0"} 100.0
     #[test]
     fn a_down_target_reports_up_zero_and_no_values() {
         let snap = vec![
-            TargetScrape { node: "awolf".into(), backend: "vllm".into(), up: false, samples: Vec::new(), types: BTreeMap::new() },
-            TargetScrape { node: "pop-os".into(), backend: "vllm".into(), up: true, samples: parse(VLLM).0, types: parse(VLLM).1 },
+            TargetScrape { node: "node-a".into(), backend: "vllm".into(), up: false, samples: Vec::new(), types: BTreeMap::new() },
+            TargetScrape { node: "ctrl".into(), backend: "vllm".into(), up: true, samples: parse(VLLM).0, types: parse(VLLM).1 },
         ];
         let out = render(&snap);
-        assert!(out.contains("noo_backend_metrics_up{node=\"awolf\",backend=\"vllm\"} 0\n"), "{out}");
-        assert!(out.contains("noo_backend_metrics_up{node=\"pop-os\",backend=\"vllm\"} 1\n"), "{out}");
-        assert!(!out.lines().any(|l| l.starts_with("vllm:") && l.contains("node=\"awolf\"")), "{out}");
+        assert!(out.contains("noo_backend_metrics_up{node=\"node-a\",backend=\"vllm\"} 0\n"), "{out}");
+        assert!(out.contains("noo_backend_metrics_up{node=\"ctrl\",backend=\"vllm\"} 1\n"), "{out}");
+        assert!(!out.lines().any(|l| l.starts_with("vllm:") && l.contains("node=\"node-a\"")), "{out}");
         assert_eq!(out.matches("# TYPE vllm:time_to_first_token_seconds histogram").count(), 1);
     }
 
     #[test]
     fn targets_are_the_placed_vllms_only() {
         let rows = vec![
-            ("awolf".to_string(), "vllm".to_string(), None, "chat".to_string()),
-            ("awolf".to_string(), "vllm".to_string(), None, "chat".to_string()),
-            ("mcmini".to_string(), "ollama".to_string(), None, "chat".to_string()),
-            ("pop-os".to_string(), "vllm-secondary".to_string(), None, "chat".to_string()),
+            ("node-a".to_string(), "vllm".to_string(), None, "chat".to_string()),
+            ("node-a".to_string(), "vllm".to_string(), None, "chat".to_string()),
+            ("node-mac".to_string(), "ollama".to_string(), None, "chat".to_string()),
+            ("ctrl".to_string(), "vllm-secondary".to_string(), None, "chat".to_string()),
         ];
-        assert_eq!(targets(&rows), vec![("awolf".into(), "vllm".into()), ("pop-os".into(), "vllm-secondary".into())]);
+        assert_eq!(targets(&rows), vec![("ctrl".into(), "vllm-secondary".into()), ("node-a".into(), "vllm".into())]);
     }
 
     #[test]

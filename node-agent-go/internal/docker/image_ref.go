@@ -194,7 +194,7 @@ type ociIndexEntry struct {
 // application/vnd.docker.attestation.manifest.v1+json and
 // `io.containerd.manifest.subject`), so a single-platform tar of a buildx
 // image lists two entries and holds ONE image. Counting it as an image
-// refused every arm64 sidecar (robopi, 0.6.15 stunnel, 2026-11-01).
+// refused every arm64 sidecar (node-pi, 0.6.15 stunnel, 2026-11-01).
 func (e ociIndexEntry) isAttestation() bool {
 	return e.ArtifactType == "application/vnd.docker.attestation.manifest.v1+json" ||
 		e.Annotations["vnd.docker.reference.type"] == "attestation-manifest" ||

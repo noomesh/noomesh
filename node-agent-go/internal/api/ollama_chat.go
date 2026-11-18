@@ -21,7 +21,7 @@ import (
 //
 // Ollama's OpenAI-compatible layer does not stream a request that carries
 // `tools`: it holds every chunk until the whole answer exists, so the first
-// byte arrives when the answer is complete. Measured on mcmini (Ollama
+// byte arrives when the answer is complete. Measured on node-mac (Ollama
 // 0.33.3, gemma4:12b, the same short prompt, 2026-10-21): /v1 with one tool
 // 84 s to the first byte, every chunk at once; /v1 without tools 4 s;
 // /api/chat with the same tool 2 s, one token per ~0.33 s. Every call the
@@ -601,7 +601,7 @@ func withoutThinkOnRefusal(status int, msg string, body []byte) ([]byte, bool) {
 // A reply made of nothing but the model's reserved vocabulary (gemma's
 // `<unusedN>` ids) is not text: a broken sample, never an answer. Returned
 // as a backend error so the caller retries or fails loudly instead of
-// posting it as a result (noomesh-internal i174, mcmini 2026-10-22).
+// posting it as a result (noomesh-internal i174, node-mac 2026-10-22).
 var reservedTokenRe = regexp.MustCompile(`^(\s*<unused\d+>)+\s*$`)
 
 const badOutputMessage = "the model answered with reserved tokens only (<unusedN>); not an answer — check the backend's KV cache / quantisation settings"

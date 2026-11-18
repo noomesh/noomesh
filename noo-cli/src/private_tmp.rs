@@ -79,7 +79,13 @@ mod tests {
             let mode = std::fs::metadata(d).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "{} is {mode:o}", d.display());
             let name = d.file_name().unwrap().to_string_lossy().to_string();
-            assert!(!name.contains(&std::process::id().to_string()), "the name carries the pid: {name}");
+            // No `-`-separated component IS the pid (the old `noo-<what>-<pid>`
+            // shape). Not "contains its digits": in a build container the pid
+            // has 2-3 digits, and 16 random hex characters held them by chance
+            // (`…0b5811c1…` for pid 11, 2026-11-18), a flake. A pid glued onto
+            // the random part instead breaks the 16-character check below.
+            let pid = std::process::id().to_string();
+            assert!(!name.split('-').any(|c| c == pid), "the name carries the pid: {name}");
             let suffix = name.strip_prefix("noo-private-tmp-test-").expect("prefix");
             assert_eq!(suffix.len(), 16, "not 64 random bits: {name}");
         }

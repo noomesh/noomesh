@@ -1252,7 +1252,7 @@ pub fn embed_backlog_verdict(
 /// snapshot. Errors only when the count itself cannot be read.
 pub async fn embed_backlog_status(state: &AppState) -> Result<EmbedBacklog, String> {
     let n = count_unembedded(&state.db).await?;
-    let now_secs = chrono::Utc::now().timestamp();
+    let now_secs = jiff::Timestamp::now().as_second();
     let snapshot = match redis(state) {
         Some(r) => r
             .get_string(EMBED_BACKLOG_SNAPSHOT_KEY)
@@ -2232,7 +2232,7 @@ pub fn expiring_among(found: Vec<(String, Option<i64>)>, now: i64, cutoff: i64) 
 /// At most this many certificates are named in one alert line.
 const EXPIRING_NAMED: usize = 8;
 
-/// `node pop-os (12 days), cluster CA (25 days)`; past [`EXPIRING_NAMED`],
+/// `node ctrl (12 days), cluster CA (25 days)`; past [`EXPIRING_NAMED`],
 /// `and N more`.
 pub fn expiring_names(certs: &[ExpiringCert]) -> String {
     let mut parts: Vec<String> = certs
@@ -2315,7 +2315,7 @@ pub async fn certs_expiring_within(days_threshold: i64) -> Vec<ExpiringCert> {
     //    nowhere else), and therefore the last reason the runtime image
     //    needed a shell and a package manager. Dropping it is what lets the
     //    gateway move to the shell-less hardened base.
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
     let cutoff = (chrono::Utc::now() + chrono::Duration::days(days_threshold)).timestamp();
     // None = unreadable or unparseable. Same outcome as the subprocess's
     // non-zero exit, but now it is one code path instead of three.
@@ -3083,7 +3083,7 @@ mod dispatch_health_probe_tests {
     #[tokio::test]
     async fn the_ollama_probe_sends_a_read_never_a_chat_or_generate() {
         let (base, log) = mock_agent(healthy).await;
-        let link = crate::node_link::NodeLink::for_base(&base);
+        let link = crate::node_link::NodeLink::for_test_base(&base);
         assert!(matches!(probe_backend_via_link(&link, "ollama").await, BackendProbe::Reachable));
         let got = seen(&log);
         assert_eq!(got.len(), 1, "one request: {got:?}");
@@ -3103,7 +3103,7 @@ mod dispatch_health_probe_tests {
     #[tokio::test]
     async fn a_dead_ollama_is_unreachable() {
         let (base, log) = mock_agent(dead_ollama).await;
-        let link = crate::node_link::NodeLink::for_base(&base);
+        let link = crate::node_link::NodeLink::for_test_base(&base);
         match probe_backend_via_link(&link, "ollama").await {
             BackendProbe::Unreachable(detail) => assert!(detail.contains("connection refused"), "{detail}"),
             BackendProbe::Reachable => panic!("a dead ollama read as reachable"),
@@ -3119,7 +3119,7 @@ mod dispatch_health_probe_tests {
         let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", dead.local_addr().unwrap());
         drop(dead);
-        let link = crate::node_link::NodeLink::for_base(&base);
+        let link = crate::node_link::NodeLink::for_test_base(&base);
         for b in ["ollama", "vllm"] {
             assert!(matches!(probe_backend_via_link(&link, b).await, BackendProbe::AgentUnreachable), "{b}");
         }
@@ -3131,7 +3131,7 @@ mod dispatch_health_probe_tests {
     async fn the_engines_keep_the_invalid_chat_probe() {
         for b in ["vllm", "llamacpp"] {
             let (base, log) = mock_agent(healthy).await;
-            let link = crate::node_link::NodeLink::for_base(&base);
+            let link = crate::node_link::NodeLink::for_test_base(&base);
             assert!(matches!(probe_backend_via_link(&link, b).await, BackendProbe::Reachable), "{b}");
             let got = seen(&log);
             assert_eq!(got.len(), 1, "{b}: {got:?}");
@@ -3141,7 +3141,7 @@ mod dispatch_health_probe_tests {
             assert_eq!(body, serde_json::json!({"model": ""}), "{b}");
         }
         let (base, _) = mock_agent(dead_ollama).await;
-        let link = crate::node_link::NodeLink::for_base(&base);
+        let link = crate::node_link::NodeLink::for_test_base(&base);
         assert!(matches!(probe_backend_via_link(&link, "vllm").await, BackendProbe::Unreachable(_)), "a dead engine");
     }
 
@@ -3339,8 +3339,8 @@ mod tests {
     #[test]
     fn drift_alerts_only_on_a_miss_seen_twice_in_a_row() {
         let mut seen = std::collections::HashMap::new();
-        let h = ("awolf".to_string(), "harness".to_string());
-        let v = ("awolf".to_string(), "vllm".to_string());
+        let h = ("node-a".to_string(), "harness".to_string());
+        let v = ("node-a".to_string(), "vllm".to_string());
         assert!(confirm_drift(&mut seen, std::slice::from_ref(&h), 2).is_empty(), "first miss: a blip");
         assert!(confirm_drift(&mut seen, &[], 2).is_empty(), "recovered: forgotten");
         assert!(confirm_drift(&mut seen, std::slice::from_ref(&h), 2).is_empty(), "missing again: starts from one");
@@ -4950,7 +4950,7 @@ mod expiring_cert_names_tests {
         let pki = Path::new("/p");
         assert_eq!(cert_label(pki, Path::new("/p/ca.crt")), "cluster CA");
         assert_eq!(cert_label(pki, Path::new("/p/gateway/gateway.crt")), "gateway");
-        assert_eq!(cert_label(pki, Path::new("/p/nodes/pop-os/node.crt")), "node pop-os");
+        assert_eq!(cert_label(pki, Path::new("/p/nodes/ctrl/node.crt")), "node ctrl");
         assert_eq!(cert_label(pki, Path::new("/p/services/x/service.crt")), "services/x/service.crt");
     }
 

@@ -335,7 +335,7 @@ async fn chat(State(sh): State<Arc<Shared>>, Json(body): Json<Value>) -> Respons
     });
     let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("noo-probe-mock").to_string();
     let usage = json!({"prompt_tokens": 42, "completion_tokens": 7, "total_tokens": 49});
-    let created = chrono::Utc::now().timestamp();
+    let created = jiff::Timestamp::now().as_second();
     let id = format!("chatcmpl-probe-{}", uuid::Uuid::new_v4().simple());
     let call_id = format!("call_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
     if !stream {

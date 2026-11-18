@@ -28,3 +28,23 @@ func TestDesiredConfigCarriesTheReclaimPolicy(t *testing.T) {
 		t.Fatalf("absent policy decoded as %+v", without.DiskReclaim)
 	}
 }
+
+// desired-config's gateway_features reach the stop drain: present on a
+// gateway that reads node_restarting, absent (nil, so never refused) on an
+// older one.
+func TestDesiredConfigCarriesTheGatewayFeatures(t *testing.T) {
+	var with desiredConfig
+	if err := json.Unmarshal([]byte(`{"node":null,"placements":[],"gateway_features":["node_restarting"]}`), &with); err != nil {
+		t.Fatal(err)
+	}
+	if len(with.GatewayFeatures) != 1 || with.GatewayFeatures[0] != "node_restarting" {
+		t.Fatalf("features = %v", with.GatewayFeatures)
+	}
+	var without desiredConfig
+	if err := json.Unmarshal([]byte(`{"node":null,"placements":[]}`), &without); err != nil {
+		t.Fatal(err)
+	}
+	if without.GatewayFeatures != nil {
+		t.Fatalf("absent features decoded as %v", without.GatewayFeatures)
+	}
+}

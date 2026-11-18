@@ -629,11 +629,11 @@ mod tests {
     /// the node alone rather than guessing.
     #[test]
     fn the_dispatched_event_names_node_and_kind_from_the_ack() {
-        let new = json!({"ack": true, "node": "mcmini", "kind": "copilot"});
-        assert_eq!(dispatched_event("mcmini", ack_kind(&new).as_deref()), json!({"node": "mcmini", "kind": "copilot"}));
-        for old in [json!({"ack": true, "node": "mcmini"}), json!({"ack": true, "node": "mcmini", "kind": " "})] {
+        let new = json!({"ack": true, "node": "node-mac", "kind": "copilot"});
+        assert_eq!(dispatched_event("node-mac", ack_kind(&new).as_deref()), json!({"node": "node-mac", "kind": "copilot"}));
+        for old in [json!({"ack": true, "node": "node-mac"}), json!({"ack": true, "node": "node-mac", "kind": " "})] {
             assert_eq!(ack_kind(&old), None);
-            assert_eq!(dispatched_event("mcmini", None), json!({"node": "mcmini"}));
+            assert_eq!(dispatched_event("node-mac", None), json!({"node": "node-mac"}));
         }
         let src = include_str!("dispatch.rs").split("mod tests").next().unwrap();
         assert!(src.contains("sink.send_event(\"harness_dispatched\", dispatched_event(&node, kind.as_deref())).await;"));

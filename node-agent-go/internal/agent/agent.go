@@ -10,14 +10,18 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"github.com/noomesh/noomesh/node-agent-go/internal/diskreclaim"
+	"github.com/noomesh/noomesh/node-agent-go/internal/stopdrain"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -53,11 +57,16 @@ type Agent struct {
 	// docker calls behind them hang off this: shutdown cancels them. Set once
 	// at the top of Run, before any goroutine that reads it starts.
 	runCtx context.Context
-	cfg    *config.Config
-	docker *dockerpkg.Client
-	gpu    *hardware.GPUDetector
-	coll   *metrics.Collector
-	http   *http.Client
+	// drain: the stop drain on the inference routes (stopdrain); serving
+	// is set once the agent is past registration, after which a signal no
+	// longer cancels the run at once (the drain runs first).
+	drain   *stopdrain.Gate
+	serving atomic.Bool
+	cfg     *config.Config
+	docker  *dockerpkg.Client
+	gpu     *hardware.GPUDetector
+	coll    *metrics.Collector
+	http    *http.Client
 
 	nats *messaging.Client
 	jobs *jobs.Executor
@@ -255,6 +264,8 @@ func New(cfg *config.Config) (*Agent, error) {
 
 	// API server
 	server := api.NewServer(cfg, docker, gpu, coll)
+	drain := stopdrain.New(api.IsController)
+	server.SetDrain(drain)
 	server.DetectBindIP = func() string {
 		ip := heartbeat.DetectHostIP(cfg)
 		if heartbeat.UsableHostIP(ip) == "" {
@@ -271,6 +282,7 @@ func New(cfg *config.Config) (*Agent, error) {
 		http:    httpClient,
 		hb:      hb,
 		server:  server,
+		drain:   drain,
 		native:  backendrt.NewAdopted(),
 		ollama:  nativeOllamaGuard(),
 		harness: hostsvc.New(),
@@ -304,7 +316,12 @@ func (a *Agent) Run() error {
 		select {
 		case sig := <-sigCh:
 			stopSig <- sig
-			cancel()
+			// Serving: step 5 drains first and cancels after (the tunnel and
+			// heartbeat run on ctx; cancelling here would cut what the drain
+			// keeps). Before that, nothing is served yet: cancel at once.
+			if !a.serving.Load() {
+				cancel()
+			}
 		case <-ctx.Done():
 		}
 	}()
@@ -418,6 +435,7 @@ func (a *Agent) Run() error {
 	}
 	a.hb.SetModelSets(rec.ModelSetsReport)
 	a.hb.SetModelSetsFreeBytes(rec.ModelSetsFreeBytes)
+	a.hb.SetOllamaVerify(rec.OllamaVerifyReport)
 	a.hb.SetNodeFacts(rec.NodeFacts)
 	if mc := rec.NodeWorkloadControl(); mc != nil {
 		a.server.SetManagedWorkloads(mc)
@@ -465,6 +483,7 @@ func (a *Agent) Run() error {
 
 	reclaimer := diskreclaim.New(hostd.WorkerSpoolDir)
 	rec.SetDiskReclaimSink(reclaimer.SetPolicy)
+	rec.SetGatewayFeaturesSink(a.drain.SetFeatures)
 	a.server.SetDiskReclaim(func() any { return reclaimer.State() })
 	go reclaimer.Run(ctx)
 	go rec.Run(ctx)
@@ -478,6 +497,7 @@ func (a *Agent) Run() error {
 	a.startSpanExport(ctx)
 
 	// 5. Wait for shutdown signal
+	a.serving.Store(true)
 	select {
 	case err := <-srvErr:
 		cancel()
@@ -485,6 +505,7 @@ func (a *Agent) Run() error {
 		return fmt.Errorf("control API: %w", err)
 	case sig := <-stopSig:
 		slog.Info("shutting down", "signal", sig)
+		a.drainOnStop()
 	}
 	cancel()
 
@@ -1102,4 +1123,29 @@ type occupancyDrainer struct{}
 func (occupancyDrainer) SetDraining(backends []string, on bool) { occupancy.SetDraining(backends, on) }
 func (occupancyDrainer) WaitIdle(ctx context.Context, backends []string) (bool, map[string]int) {
 	return occupancy.WaitIdle(ctx, backends)
+}
+
+// drainOnStop lets the inference streams a caller is reading finish before
+// the agent exits (stopdrain), cuts the ones the controller re-sends whole,
+// and leaves a record the next start reports once in its heartbeat.
+func (a *Agent) drainOnStop() {
+	if a.drain == nil {
+		return
+	}
+	res := a.drain.Drain(stopdrain.Bound, 100*time.Millisecond)
+	level := slog.LevelInfo
+	if res.BoundHit {
+		level = slog.LevelWarn
+	}
+	slog.Log(context.Background(), level, "agent_stop_drain",
+		"drained", res.Drained, "cut_marked", res.CutMarked, "cut_at_bound", res.CutAtBound,
+		"oldest_age_secs", res.OldestAgeSecs, "bound_hit", res.BoundHit, "drain_secs", res.DrainSecs)
+	if a.cfg.StateDir == "" {
+		return
+	}
+	if b, err := json.Marshal(res); err == nil {
+		if err := os.WriteFile(filepath.Join(a.cfg.StateDir, stopdrain.RecordFile), b, 0o600); err != nil {
+			slog.Warn("agent_stop_drain record not written", "error", err)
+		}
+	}
 }

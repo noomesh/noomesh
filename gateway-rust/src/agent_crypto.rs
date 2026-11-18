@@ -446,7 +446,7 @@ pub async fn register_keys(
         "ed25519": record["ed25519"],
         "alg": record["alg"].as_str().unwrap_or(ALG),
         "sig": record["sig"],
-        "registered_at": chrono::Utc::now().to_rfc3339(),
+        "registered_at": crate::wire_time::rfc3339_offset(jiff::Timestamp::now()),
         "registered_by": registered_by,
     });
     if let Some(p) = record.get("prev_sig") {

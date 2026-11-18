@@ -436,6 +436,12 @@ PYOVR
     fi
 }
 
+# _profile_set LIST - a COMPOSE_PROFILES value as a sorted, deduplicated,
+# comma-joined set: two values naming the same profiles compare equal.
+_profile_set() {
+    printf '%s' "$1" | tr -d " \t\r\"'" | tr ',' '\n' | sed '/^$/d' | sort -u | paste -sd, -
+}
+
 # operator_profile_args - `--profile X` for every profile the operator listed
 # in COMPOSE_PROFILES (the environment first, else the stack's .env), comma-
 # separated, deduplicated, names checked. Empty when none.
@@ -445,10 +451,20 @@ PYOVR
 # profile the operator enables the documented way (`COMPOSE_PROFILES=embed-cpu`
 # in .env, the embed-capacity runbook) never started until the launcher
 # passed it on itself. Used unquoted: the empty result expands to nothing.
+#
+# Both set and naming different profiles: the environment's wins, and one
+# WARN says so. Two sources answering one question with one silent winner
+# cost a rehearsal item its first run (0.6.26-rc.1 A-leftover: the dind
+# exports COMPOSE_PROFILES=embed-cpu, the item's .env line was never read).
 operator_profile_args() {
-    local raw="${COMPOSE_PROFILES:-}"
-    if [ -z "$raw" ] && [ -f ".env" ]; then
-        raw="$(grep -E '^[[:space:]]*COMPOSE_PROFILES=' .env | tail -1 | cut -d= -f2- | tr -d " \t\r\"'")"
+    local raw="${COMPOSE_PROFILES:-}" dotenv=""
+    if [ -f ".env" ]; then
+        dotenv="$(grep -E '^[[:space:]]*COMPOSE_PROFILES=' .env | tail -1 | cut -d= -f2- | tr -d " \t\r\"'")"
+    fi
+    if [ -z "$raw" ]; then
+        raw="$dotenv"
+    elif [ -n "$dotenv" ] && [ "$(_profile_set "$raw")" != "$(_profile_set "$dotenv")" ]; then
+        echo "WARN: COMPOSE_PROFILES is set in this launch's environment ($(_profile_set "$raw")) and in .env ($(_profile_set "$dotenv")): the environment's is used and .env's line is ignored (unset COMPOSE_PROFILES to use .env)" >&2
     fi
     local out="" p
     local -a _ps=()

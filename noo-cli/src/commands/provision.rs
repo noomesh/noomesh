@@ -343,6 +343,7 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
     drop_binaries_the_node_already_runs(g, &a, &machine, &mut files);
     attach_door_leaves(g, &a, &enrollment, &machine, &ca, &work, &mut files);
     attach_nats_credential(g, &a, &site, &work, &mut files);
+    attach_release_proof(g, &a, &site, &machine, &work, &mut files);
     let bundle = sign_bundle(g, &a, &ca, &files, &work);
 
     // Stage it at the gateway, then judge what the node reports.
@@ -374,6 +375,10 @@ struct ProvisionArgs {
     harness: Option<String>,
     move_data: bool,
     stage_only: bool,
+    /// `--root-ok` (i907): with no terminal, the self node's root steps
+    /// (its identity, its controller-url) run through sudo — the owner says
+    /// sudo needs no password here. Never found out by probing sudo.
+    root_ok: bool,
 }
 
 /// Where this provision runs: the install root, and whether the node being
@@ -448,17 +453,19 @@ fn parse_provision_args(g: &Globals, args: &[String]) -> ProvisionArgs {
     // for them together). It removes ONLY the apply wait: `--wait` still
     // governs the enrollment wait at step 1, exactly as it always has.
     let mut stage_only = false;
+    let mut root_ok = false;
     let mut it = args.iter().peekable();
     while let Some(tok) = it.next() {
         match tok.as_str() {
             "--local" => local = true,
             "--move-data" => move_data = true,
             "--stage-only" => stage_only = true,
+            "--root-ok" => root_ok = true,
             "--harness" => {
                 let v = it.next().cloned().unwrap_or_default();
                 if !matches!(v.as_str(), "auto" | "manual" | "off") {
                     fail(g.json, ExitCode::Usage, "usage", "--harness must be auto, manual or off",
-                        Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--stage-only] [--move-data]"));
+                        Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--stage-only] [--move-data] [--root-ok]"));
                 }
                 harness = Some(v);
             }
@@ -474,19 +481,19 @@ fn parse_provision_args(g: &Globals, args: &[String]) -> ProvisionArgs {
             // through to another implementation.
             t if t.starts_with('-') => fail(g.json, ExitCode::Usage, "usage",
                 &format!("unknown flag: {t}"),
-                Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--stage-only] [--move-data]")),
+                Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--stage-only] [--move-data] [--root-ok]")),
             t if node.is_none() => node = Some(t.to_string()),
             t if tier.is_none() => tier = Some(t.to_string()),
             t => fail(g.json, ExitCode::Usage, "usage",
                 &format!("unexpected argument: {t}"),
-                Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--stage-only] [--move-data]")),
+                Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--stage-only] [--move-data] [--root-ok]")),
         }
     }
     let Some(node) = node else {
         fail(g.json, ExitCode::Usage, "usage", "node name required",
-            Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--stage-only] [--move-data]"));
+            Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--stage-only] [--move-data] [--root-ok]"));
     };
-    ProvisionArgs { node, tier, wait, local, harness, move_data, stage_only }
+    ProvisionArgs { node, tier, wait, local, harness, move_data, stage_only, root_ok }
 }
 
 /// Print the node header and settle which lane the node rides.
@@ -518,7 +525,10 @@ fn begin_provision(g: &Globals, a: &ProvisionArgs) -> ProvSite {
     }
     if is_self {
         let missing = pull_units_missing(&node);
-        match self_node_lane(&node, &missing, !missing.is_empty() && can_sudo_here()) {
+        // i907: may the one sudo run — a terminal, or --root-ok. Never a
+        // `sudo -n true` probe (a refused attempt in auth.log each roll).
+        let at_terminal = crate::onboard::steps::stdin_at_terminal();
+        match self_node_lane(&node, &missing, !missing.is_empty() && crate::onboard::steps::root_step_runs(at_terminal, a.root_ok)) {
             SelfLane::Rail => {}
             SelfLane::CreateIdentity => {
                 if let Err(e) = ensure_self_identity(&node) {
@@ -527,7 +537,7 @@ fn begin_provision(g: &Globals, a: &ProvisionArgs) -> ProvSite {
             }
             SelfLane::Refuse(why) => fail(g.json, ExitCode::Generic, "self_node_units", &why, Some(SELF_RAIL_REMEDY)),
         }
-        if let Err(e) = converge_self_controller_url(&root) {
+        if let Err(e) = converge_self_controller_url(&root, a.root_ok) {
             fail(g.json, ExitCode::Generic, "controller_url", &e, Some(CONTROLLER_HOST_REMEDY));
         }
     }
@@ -1562,6 +1572,124 @@ fn sign_bundle(g: &Globals, a: &ProvisionArgs, ca: &crate::pki::ClusterCa, files
     }
 }
 
+/// The Linux kinds that run as root, which a node installs only from a
+/// release-signed list (scripts/noo-apply.sh §1c, `RELEASE_LISTED_KINDS` +
+/// the agent). `cli-binary` installs into the user's ~/.local/bin as the user.
+const LINUX_RELEASE_KINDS: &[&str] = &["applier", "fetcher", "hostd-binary", "harness-binary", "agent-binary"];
+
+/// The release-signed lists that vouch for the bundle's root code (i908).
+///
+/// A node installs root code only if the RELEASE key listed it
+/// (scripts/noo-apply.sh §1c; a Mac: `crate::release_gate`). So a bundle that
+/// carries any carries the lists: this release's signed `sha256sums.txt`, its
+/// `.sig` and the version text it names, and with a Linux agent the stack's
+/// signed lock and its `.sig`. Judged here first by the node's own rule, so a
+/// bundle the node would refuse is never staged. There is no dev path: a CLI
+/// that is not a published release (or rc) has no signed list to send, and
+/// provision stops, saying so.
+fn attach_release_proof(g: &Globals, a: &ProvisionArgs, site: &ProvSite, m: &ProvMachine, work: &Path, files: &mut Vec<(&'static str, Vec<u8>)>) {
+    use crate::release_gate::{DARWIN_LISTED, DARWIN_PLISTS};
+    let root_kinds: Vec<&'static str> = files.iter().map(|(k, _)| *k)
+        .filter(|k| if m.darwin { DARWIN_LISTED.contains(k) || DARWIN_PLISTS.contains(k) } else { LINUX_RELEASE_KINDS.contains(k) })
+        .collect();
+    if root_kinds.is_empty() {
+        return;
+    }
+    let kinds = root_kinds.join(", ");
+    let (sums, sig) = verified_release_manifest(g, &site.root).unwrap_or_else(|e| release_refused(g, &a.node, work, &format!(
+        "the bundle carries root code ({kinds}) and nodes install root code only from a release-signed list, \
+         but this CLI's is not available: {e}")));
+    let version = env!("CARGO_PKG_VERSION");
+    let lock = if !m.darwin && root_kinds.contains(&"agent-binary") {
+        let tag = image_tag();
+        match super::upgrade::verified_stack_lock_signed(g, &tag) {
+            Ok(Some(pair)) => Some(pair),
+            Ok(None) => release_refused(g, &a.node, work, &format!(
+                "stack-{tag} publishes no signed lock, and nodes install the agent only from one")),
+            Err(e) => release_refused(g, &a.node, work, &e),
+        }
+    } else {
+        None
+    };
+    if let Err(e) = crate::release_gate::controller_check(files.as_slice(), m.darwin, &sums, version, lock.as_ref().map(|(l, _)| l.as_str())) {
+        release_refused(g, &a.node, work, &e);
+    }
+    // i940: a node AHEAD of this controller would refuse the bundle (its
+    // record allows nothing this old). Said here, before staging, in the
+    // node's own words, from the record the node last reported.
+    let stack_tag = lock.as_ref().and_then(|(l, _)| l.lines().find_map(|x| x.strip_prefix("# stack ")).map(|t| t.trim().to_string()));
+    if let Some(why) = node_floor_refusal(&reported_apply_msg(g, &a.node), version, stack_tag.as_deref()) {
+        scrub(work);
+        fail(g.json, ExitCode::Generic, "node_ahead", &format!("{}: {why}", a.node), Some("noo upgrade --stack"));
+    }
+    nnote(&format!("bundle carries release {version}'s signed list for its root code ({kinds})"));
+    files.push(("release-sums", sums.into_bytes()));
+    files.push(("release-sums.sig", sig.into_bytes()));
+    files.push(("release-version", format!("{version}\n").into_bytes()));
+    if let Some((lock, lock_sig)) = lock {
+        files.push(("release-lock", lock.into_bytes()));
+        files.push(("release-lock.sig", lock_sig.into_bytes()));
+    }
+}
+
+/// The message of `node`'s last apply report (the status route's `apply_msg`,
+/// which carries the applier's `release-check:` line); empty when none.
+pub(crate) fn reported_apply_msg(g: &Globals, node: &str) -> String {
+    crate::http::get_json_opt(g, &format!("/api/cluster/provision-bundle/{node}/status"), true, 10)
+        .and_then(|st| st.get("apply_msg").and_then(|v| v.as_str()).map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// i940: would the node whose last apply report is `apply_msg` refuse a
+/// bundle staged from `release` (and, with an agent, stack `stack`)? The
+/// refusal line, word for word what the node would print
+/// ([`crate::release_gate::would_accept`], the node's own rule). None when it
+/// would accept, or when the report carries no record (an older node, or a
+/// refused apply): then the node is the authority, as before.
+pub(crate) fn node_floor_refusal(apply_msg: &str, release: &str, stack: Option<&str>) -> Option<String> {
+    let f = crate::release_gate::reported_floor(apply_msg);
+    let get = |k: &str| f.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str());
+    crate::release_gate::would_accept("release", release, get("release"), get("release-prev")).err()
+        .or_else(|| stack.and_then(|t| crate::release_gate::would_accept("stack", t, get("stack"), get("stack-prev")).err()))
+}
+
+/// The release proof for a Linux bundle built outside `cluster provision`
+/// (`noo cluster upgrade-applier`): the lists [`attach_release_proof`] adds,
+/// no agent. Err when this CLI's signed list is not available or does not
+/// list the bundle's root code — the node would refuse it.
+pub(crate) fn release_proof_for(g: &Globals, files: &[(&str, Vec<u8>)]) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
+    let (sums, sig) = verified_release_manifest(g, &crate::envfile::repo_root())?;
+    proof_rows(files, sums, sig)
+}
+
+/// [`release_proof_for`] from this controller's verified asset cache alone
+/// (no fetch), for a bundle built where no `Globals` is at hand (a cert push
+/// that carries the applier). None when the cache holds no verified list for
+/// this release or it does not list the root code: the caller then leaves
+/// the root code out (certs need no list).
+pub(crate) fn cached_release_proof(files: &[(&str, Vec<u8>)]) -> Option<Vec<(&'static str, Vec<u8>)>> {
+    let dir = cli_asset_cache_dir(&crate::envfile::repo_root());
+    let (sums, sig) = manifest_with(&dir, env!("CARGO_PKG_VERSION"), &mut |_| Err("cache only".to_string()),
+        &|d, s| crate::release_sig::verify(d, s).map(|_| ())).ok()?;
+    proof_rows(files, sums, sig).ok()
+}
+
+fn proof_rows(files: &[(&str, Vec<u8>)], sums: String, sig: String) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
+    let version = env!("CARGO_PKG_VERSION");
+    crate::release_gate::controller_check(files, false, &sums, version, None)?;
+    Ok(vec![
+        ("release-sums", sums.into_bytes()),
+        ("release-sums.sig", sig.into_bytes()),
+        ("release-version", format!("{version}\n").into_bytes()),
+    ])
+}
+
+/// Stop a provision whose root code no release lists: the node would refuse it.
+fn release_refused(g: &Globals, node: &str, work: &Path, why: &str) -> ! {
+    scrub(work);
+    fail(g.json, ExitCode::Generic, "release_check", &format!("{node}: {why}"), Some(crate::release_gate::REMEDY))
+}
+
 /// Set (to `1`) by the nodes stage around the restage that follows a
 /// staged applier: stage the FULL bundle, not the applier again.
 pub(crate) const FULL_BUNDLE_ENV: &str = "NOO_PROVISION_FULL_BUNDLE";
@@ -2047,7 +2175,8 @@ pub(crate) fn self_node_lane(node: &str, missing: &[String], can_sudo: bool) -> 
     } else {
         SelfLane::Refuse(format!(
             "'{node}' is this controller's own node and its node identity is missing ({}): creating \
-             it takes sudo once, and sudo would prompt in this non-interactive run",
+             it takes sudo once, and this run has no terminal to ask at (unattended, where sudo needs \
+             no password, add --root-ok)",
             missing.join(", ")
         ))
     }
@@ -2075,7 +2204,7 @@ pub(crate) fn self_agent_step(
     agent_active: bool,
     identity_ok: bool,
     interactive: bool,
-    sudo_quiet: bool,
+    root_ok: bool,
 ) -> SelfAgentStep {
     use crate::role::Controller;
     match controller {
@@ -2087,21 +2216,13 @@ pub(crate) fn self_agent_step(
     if identity_ok {
         return if agent_active { SelfAgentStep::AlreadyOnRail } else { SelfAgentStep::Rail };
     }
-    if !interactive && !sudo_quiet {
+    if !interactive && !root_ok {
         return SelfAgentStep::Skip(
-            "the node identity is missing and creating it takes sudo, which would prompt in this \
-             non-interactive run — run `noo onboard --only services` at a terminal".into());
+            "the node identity is missing and creating it takes sudo, and this run has no terminal \
+             to ask at — run `noo onboard --only services` at a terminal (unattended, where sudo \
+             needs no password, add --root-ok)".into());
     }
     if agent_installed { SelfAgentStep::Rail } else { SelfAgentStep::FirstInstall }
-}
-
-/// Can sudo run here without hanging: it is already cached/passwordless, or
-/// someone is at a terminal to answer it.
-pub(crate) fn can_sudo_here() -> bool {
-    let quiet = Command::new("sudo").args(["-n", "true"])
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-        .status().map(|s| s.success()).unwrap_or(false);
-    quiet || std::io::IsTerminal::is_terminal(&std::io::stdin())
 }
 
 /// The root script that creates (or repairs) the self node's identity: a
@@ -2726,14 +2847,17 @@ fn controller_url_fix_script(url: &str, etc: &Path) -> String {
 /// the node's fetch timer polled a door that does not exist). Runs on every
 /// self-node provision, which `noo upgrade --all` goes through; a healthy
 /// record costs one file read.
-fn converge_self_controller_url(root: &Path) -> Result<(), String> {
+fn converge_self_controller_url(root: &Path, root_ok: bool) -> Result<(), String> {
     let Ok(recorded) = std::fs::read_to_string(SELF_CONTROLLER_URL) else { return Ok(()) };
     let mode = bind_mode(root);
     let Some(url) = controller_url_fix(&recorded, &mode, || controller_host(root, HostFor::SelfNode))? else { return Ok(()) };
-    if !can_sudo_here() {
-        return Err(format!(
-            "this node polls {} but the gateway listens on the tailnet only, and correcting it takes sudo, which would prompt \
-             in this non-interactive run — run `noo onboard --only services` at a terminal", recorded.trim()));
+    let at_terminal = crate::onboard::steps::stdin_at_terminal();
+    if let crate::onboard::steps::RootStep::Refuse(why) = crate::onboard::steps::root_step(
+        at_terminal, root_ok,
+        &format!("this node polls {} but the gateway listens on the tailnet only; correcting it", recorded.trim()),
+        "`noo onboard --only services`")
+    {
+        return Err(why);
     }
     nstep(&format!("this node polled {} but the gateway listens on the tailnet only — pointing it at {url} (sudo)", recorded.trim()));
     let fix = controller_url_fix_script(&url, Path::new("/etc/noo"));
@@ -4199,7 +4323,7 @@ fn obtain_agent_binary_darwin(g: &Globals, root: &Path, goarch: &str) -> Result<
 /// Rendered per node (`__USER__`): a LaunchDaemon, not a LaunchAgent —
 /// runs at boot as the enrolling user with no console login, which is
 /// what a headless Mac mini needs and what an SSH session can load.
-const DARWIN_AGENT_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+pub(crate) const DARWIN_AGENT_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>net.noomesh.node-agent</string>
@@ -4224,7 +4348,7 @@ const DARWIN_AGENT_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 /// The harness LaunchDaemon. Installed by the darwin applier,
 /// loaded/unloaded by the agent per placement — never RunAtLoad: placed =
 /// running, and nothing else starts it.
-const DARWIN_HARNESS_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+pub(crate) const DARWIN_HARNESS_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>net.noomesh.harness</string>
@@ -4694,7 +4818,7 @@ pub(crate) const CLUSTER_TRUST_ENV_KEYS: &[&str] = &["NODE_AGENT_BIND"];
 /// This is the TAG the keys first shipped in, not the version the change was
 /// written against: the keys landed on dev while 0.6.8 was in flight and were
 /// first released in noo-cli-v0.6.10. With the floor at 0.6.8, a 0.6.9 Mac
-/// (mcmini, 2026-10-23) was sent the keys and its applier refused the whole
+/// (node-mac, 2026-10-23) was sent the keys and its applier refused the whole
 /// bundle with exit 65 — including the CLI that would have taught it the keys.
 /// The applier now self-updates before it validates (node_fetch.rs
 /// `verify_bundle_with`), so this floor is belt-and-braces for Macs whose
@@ -4809,7 +4933,7 @@ mod cluster_trust_tests {
         assert!(applier_knows_cluster_trust_keys(false, "noo-cli-v0.5.1"), "linux self-updates its applier");
         assert!(!applier_knows_cluster_trust_keys(true, "noo-cli-v0.6.7+abc"));
         // 0.6.8 and 0.6.9 shipped WITHOUT the keys in the Mac applier's
-        // allow-list; mcmini on noo-cli-v0.6.9 refused the 0.6.10 bundle.
+        // allow-list; node-mac on noo-cli-v0.6.9 refused the 0.6.10 bundle.
         assert!(!applier_knows_cluster_trust_keys(true, "noo-cli-v0.6.8"));
         assert!(!applier_knows_cluster_trust_keys(true, "noo-cli-v0.6.9+bdf4c07"));
         assert!(applier_knows_cluster_trust_keys(true, "noo-cli-v0.6.10+c6c4814"));
@@ -4898,8 +5022,8 @@ mod cli_asset_refill_tests {
         assert!(cli.contains("cached_release_asset(g, &root, &asset)"), "the CLI asset is fetched when the cache lacks it");
         assert!(cli.contains("Err(e) => nnote(&cli_omitted_note(&node, &asset, &e))"), "and its absence is said");
         assert!(!cli.contains("std::fs::read(&cached)"), "never a cache-only read again");
-        let note = super::cli_omitted_note("robopi", "noo-aarch64-unknown-linux-musl", "HTTP 503");
-        for want in ["robopi", "noo-aarch64-unknown-linux-musl", "HTTP 503", "noo upgrade --nodes"] {
+        let note = super::cli_omitted_note("node-pi", "noo-aarch64-unknown-linux-musl", "HTTP 503");
+        for want in ["node-pi", "noo-aarch64-unknown-linux-musl", "HTTP 503", "noo upgrade --nodes"] {
             assert!(note.contains(want), "{want}: {note}");
         }
     }
@@ -5352,7 +5476,7 @@ mod tests {
         for v in ["noo-cli-v0.6.5", "noo-cli-v0.6.5+7b00c90", "noo-cli-v0.6.6", "noo-cli-v0.7.0", "noo-cli-v1.0.0"] {
             assert!(bundle_gzip_gate(v).is_ok(), "gzip withheld from {v}");
         }
-        // The Linux agents report the stack tag (live, 0.6.5 roll on pop-os):
+        // The Linux agents report the stack tag (live, 0.6.5 roll on ctrl):
         // `stack-v<semver>+<40-hex>`. And a bare `v<semver>`.
         let sha = "ff917285b5cb2f43bc2b249393af91dffcf0c298";
         for v in [format!("stack-v0.6.4+{sha}"), "stack-v0.6.4".into(), "v0.6.4".into(), "v0.6.4+abc".into()] {
@@ -6057,40 +6181,40 @@ mod self_node_rail_tests {
 
     #[test]
     fn a_prepped_controller_has_no_missing_units() {
-        assert!(missing_pull_units("pop-os", &units(&ALL), Some("pop-os\n")).is_empty());
-        assert!(missing_pull_units("pop-os", &units(&ALL), Some("Pop-OS")).is_empty());
+        assert!(missing_pull_units("ctrl", &units(&ALL), Some("ctrl\n")).is_empty());
+        assert!(missing_pull_units("ctrl", &units(&ALL), Some("Ctrl")).is_empty());
     }
 
     #[test]
     fn each_missing_unit_is_named() {
-        let m = missing_pull_units("pop-os", &units(&ALL[..2]), Some("pop-os"));
+        let m = missing_pull_units("ctrl", &units(&ALL[..2]), Some("ctrl"));
         assert_eq!(m, vec!["noo-fetch.timer".to_string(), "the birth cert".to_string()]);
-        let m = missing_pull_units("pop-os", &units(&ALL), None);
+        let m = missing_pull_units("ctrl", &units(&ALL), None);
         assert!(m.len() == 1 && m[0].contains("no node name"), "{m:?}");
-        let m = missing_pull_units("pop-os", &units(&ALL), Some("host8"));
-        assert!(m[0].contains("names 'host8', not 'pop-os'"), "{m:?}");
+        let m = missing_pull_units("ctrl", &units(&ALL), Some("host8"));
+        assert!(m[0].contains("names 'host8', not 'ctrl'"), "{m:?}");
     }
 
-    /// pop-os before 0.6.3: prepped by the old local lane, no birth key, no
+    /// ctrl before 0.6.3: prepped by the old local lane, no birth key, no
     /// gateway copy. The first `--nodes` creates the identity once.
     #[test]
     fn a_pre_i67_controller_creates_its_identity_once_then_rides_the_rail() {
         let pre = ["/usr/local/bin/noo-fetch", "/usr/local/bin/noo-apply"];
-        let missing = missing_pull_units("pop-os", &units(&pre), Some("pop-os"));
-        assert_eq!(self_node_lane("pop-os", &missing, true), SelfLane::CreateIdentity);
+        let missing = missing_pull_units("ctrl", &units(&pre), Some("ctrl"));
+        assert_eq!(self_node_lane("ctrl", &missing, true), SelfLane::CreateIdentity);
         // Once created, nothing is missing: the rail, no sudo.
-        let after = missing_pull_units("pop-os", &units(&ALL), Some("pop-os"));
-        assert_eq!(self_node_lane("pop-os", &after, true), SelfLane::Rail);
-        assert_eq!(self_node_lane("pop-os", &after, false), SelfLane::Rail, "the rail never needs sudo");
+        let after = missing_pull_units("ctrl", &units(&ALL), Some("ctrl"));
+        assert_eq!(self_node_lane("ctrl", &after, true), SelfLane::Rail);
+        assert_eq!(self_node_lane("ctrl", &after, false), SelfLane::Rail, "the rail never needs sudo");
     }
 
     #[test]
     fn without_identity_and_without_sudo_the_rail_refuses_with_the_remedy() {
         let missing = vec!["noo-fetch.timer".to_string()];
-        let SelfLane::Refuse(why) = self_node_lane("pop-os", &missing, false) else {
+        let SelfLane::Refuse(why) = self_node_lane("ctrl", &missing, false) else {
             panic!("no identity and no way to sudo must refuse");
         };
-        assert!(why.contains("'pop-os' is this controller's own node"), "{why}");
+        assert!(why.contains("'ctrl' is this controller's own node"), "{why}");
         assert!(why.contains("noo-fetch.timer") && why.contains("sudo once"), "{why}");
         assert_eq!(SELF_RAIL_REMEDY, "noo onboard --only services");
     }
@@ -6103,24 +6227,24 @@ mod self_node_rail_tests {
         let base = std::env::temp_dir().join(format!("noo-selfcert-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let pki = base.join("pki");
-        std::fs::create_dir_all(pki.join("nodes/pop-os")).unwrap();
+        std::fs::create_dir_all(pki.join("nodes/ctrl")).unwrap();
         let host = base.join("birth.crt");
         let pem = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
         std::fs::write(&host, pem).unwrap();
-        assert_eq!(sync_self_birth_cert(&pki, "pop-os", &host), Ok(true));
-        assert_eq!(std::fs::read_to_string(pki.join("nodes/pop-os/birth.crt")).unwrap(), pem);
-        assert_eq!(std::fs::read_to_string(pki.join("public/nodes/pop-os/birth.crt")).unwrap(), pem,
+        assert_eq!(sync_self_birth_cert(&pki, "ctrl", &host), Ok(true));
+        assert_eq!(std::fs::read_to_string(pki.join("nodes/ctrl/birth.crt")).unwrap(), pem);
+        assert_eq!(std::fs::read_to_string(pki.join("public/nodes/ctrl/birth.crt")).unwrap(), pem,
             "mirrored into the view the gateway mounts at /app/pki/nodes");
-        assert_eq!(sync_self_birth_cert(&pki, "pop-os", &host), Ok(false), "idempotent");
+        assert_eq!(sync_self_birth_cert(&pki, "ctrl", &host), Ok(false), "idempotent");
         // A new identity replaces the view's copy.
         let pem2 = pem.replace("AAAA", "BBBB");
         std::fs::write(&host, &pem2).unwrap();
-        assert_eq!(sync_self_birth_cert(&pki, "pop-os", &host), Ok(true));
-        assert_eq!(std::fs::read_to_string(pki.join("public/nodes/pop-os/birth.crt")).unwrap(), pem2);
+        assert_eq!(sync_self_birth_cert(&pki, "ctrl", &host), Ok(true));
+        assert_eq!(std::fs::read_to_string(pki.join("public/nodes/ctrl/birth.crt")).unwrap(), pem2);
         // Not a certificate, or no file: an error, nothing written.
         std::fs::write(&host, "garbage").unwrap();
-        assert!(sync_self_birth_cert(&pki, "pop-os", &host).unwrap_err().contains("not a PEM"));
-        assert!(sync_self_birth_cert(&pki, "pop-os", &base.join("nope")).is_err());
+        assert!(sync_self_birth_cert(&pki, "ctrl", &host).unwrap_err().contains("not a PEM"));
+        assert!(sync_self_birth_cert(&pki, "ctrl", &base.join("nope")).is_err());
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -6148,7 +6272,8 @@ mod self_node_rail_tests {
         let install = f.find("|| crate::commands::provision::provision_local(g, &node_id, None)").unwrap_or_else(|| panic!("{f}"));
         let warn = f.find("if let Err(e) = installed").unwrap_or_else(|| panic!("{f}"));
         assert!(install < warn, "the install's returned error is what the caller handles: {f}");
-        assert!(f.contains("provision_one(g, &node_id, &[])"), "the rail branch runs in a child");
+        assert!(f.contains("provision_one(g, &node_id, extra)"), "the rail branch runs in a child");
+        assert!(f.contains(r#"if root_ok { &["--root-ok"] } else { &[] }"#), "the child gets --root-ok only when this run has it: {f}");
         assert!(!f.contains("fail("), "{f}");
     }
 
@@ -6208,9 +6333,9 @@ mod self_node_rail_tests {
     #[test]
     fn the_gateways_view_of_the_self_node_is_judged_with_a_remedy_per_cause() {
         let fp = "ab".repeat(32);
-        let ok = format!(r#"{{"node":"pop-os","birth_cert_sha256":"{fp}"}}"#);
-        assert_eq!(judge_gateway_self_view("pop-os", &fp, Some((200, &ok))), Ok(()));
-        let e = |a: Option<(u16, &str)>| judge_gateway_self_view("pop-os", &fp, a).unwrap_err();
+        let ok = format!(r#"{{"node":"ctrl","birth_cert_sha256":"{fp}"}}"#);
+        assert_eq!(judge_gateway_self_view("ctrl", &fp, Some((200, &ok))), Ok(()));
+        let e = |a: Option<(u16, &str)>| judge_gateway_self_view("ctrl", &fp, a).unwrap_err();
         let p = e(None);
         assert_eq!((p.code, p.remedy.as_str()), ("gateway_unreachable", "noo stack status"));
         let p = e(Some((404, "")));
@@ -6219,11 +6344,11 @@ mod self_node_rail_tests {
         assert_eq!(e(Some((500, ""))).code, "gateway_error");
         let p = e(Some((200, r#"{"node":"host8","birth_cert_sha256":null}"#)));
         assert_eq!(p.code, "self_id_mismatch");
-        assert!(p.msg.contains("'host8'") && p.msg.contains("'pop-os'") && p.msg.contains("NODE_ID"), "{}", p.msg);
-        let p = e(Some((200, r#"{"node":"pop-os","birth_cert_sha256":null}"#)));
+        assert!(p.msg.contains("'host8'") && p.msg.contains("'ctrl'") && p.msg.contains("NODE_ID"), "{}", p.msg);
+        let p = e(Some((200, r#"{"node":"ctrl","birth_cert_sha256":null}"#)));
         assert_eq!((p.code, p.remedy.as_str()), ("gateway_no_self_cert", "noo upgrade --stack"));
-        let p = e(Some((200, &format!(r#"{{"node":"pop-os","birth_cert_sha256":"{}"}}"#, "cd".repeat(32)))));
-        assert_eq!((p.code, p.remedy.as_str()), ("gateway_self_cert_stale", "noo cluster provision pop-os"));
+        let p = e(Some((200, &format!(r#"{{"node":"ctrl","birth_cert_sha256":"{}"}}"#, "cd".repeat(32)))));
+        assert_eq!((p.code, p.remedy.as_str()), ("gateway_self_cert_stale", "noo cluster provision ctrl"));
     }
 
     /// onboard's self-agent step: standalone/checkout × interactive/--ci.
@@ -6241,7 +6366,7 @@ mod self_node_rail_tests {
             // Identity in place: the rail, interactive or not, no sudo.
             assert_eq!(step(Some(c), true, true, true, false, false), SelfAgentStep::AlreadyOnRail);
             assert_eq!(step(Some(c), true, false, true, false, false), SelfAgentStep::Rail);
-            // Agent installed, identity missing (pop-os): the rail, which
+            // Agent installed, identity missing (ctrl): the rail, which
             // creates the identity once — at a terminal or with quiet sudo.
             assert_eq!(step(Some(c), true, true, false, true, false), SelfAgentStep::Rail);
             assert_eq!(step(Some(c), true, true, false, false, true), SelfAgentStep::Rail, "--ci with quiet sudo");
@@ -6299,7 +6424,7 @@ mod self_node_rail_tests {
     #[test]
     fn every_bundle_must_carry_this_nodes_nats_creds() {
         let nc = |n: &str| crate::commands::nats_users::creds_payload(n, "pw").into_bytes();
-        for node in ["aserve", "pop-os"] {
+        for node in ["node-b", "ctrl"] {
             let files: Vec<(&str, Vec<u8>)> = vec![("agent-env", b"x".to_vec()), ("nats-creds", nc(node))];
             assert_eq!(require_nats_creds(node, &files), Ok(()), "{node}");
             let without: Vec<(&str, Vec<u8>)> = vec![("agent-env", b"x".to_vec())];
@@ -6320,15 +6445,15 @@ mod self_node_rail_tests {
 
     #[test]
     fn the_self_nodes_bus_principal_is_not_the_gateways() {
-        let payload = crate::commands::nats_users::creds_payload("pop-os", "pw");
-        assert_eq!(check_nats_creds("pop-os", payload.as_bytes()), Ok(()));
+        let payload = crate::commands::nats_users::creds_payload("ctrl", "pw");
+        assert_eq!(check_nats_creds("ctrl", payload.as_bytes()), Ok(()));
         let user = payload.lines().find_map(|l| l.strip_prefix("NATS_NODE_USER=")).unwrap();
-        assert_eq!(user, "node-pop-os");
+        assert_eq!(user, "node-ctrl");
         for principal in crate::commands::nats_users::CONTROLLER_PRINCIPALS {
             assert_ne!(user, *principal, "the self node must not present a controller principal");
         }
-        let key = crate::commands::nats_users::node_secret_key("pop-os");
-        assert_eq!(key, "NATS_NODE_PASSWORD_POP_OS");
+        let key = crate::commands::nats_users::node_secret_key("ctrl");
+        assert_eq!(key, "NATS_NODE_PASSWORD_CTRL");
         assert_ne!(key, "NATS_GATEWAY_PASSWORD");
         assert_ne!(key, "NATS_WORKER_PASSWORD");
     }
@@ -7063,5 +7188,29 @@ mod controller_host_tests {
         let b = crate::test_src::fn_body(&prod, "fn begin_provision(");
         assert!(b.contains("converge_self_controller_url("), "{b}");
         assert!(b.find("if is_self").unwrap() < b.find("converge_self_controller_url(").unwrap(), "{b}");
+    }
+}
+
+#[cfg(test)]
+mod harness_model_url_tests {
+    /// The harness reaches its node's own agent at NOO_HARNESS_MODEL_URL, and
+    /// the gateway's node links take https only. That URL is pinned to
+    /// https over loopback where it is rendered, the template takes it from
+    /// that variable, and the Mac's harness-env key list carries it.
+    #[test]
+    fn the_harness_model_url_is_the_nodes_own_agent_over_https_loopback() {
+        let own = crate::test_src::own_code(include_str!("provision.rs"));
+        assert!(
+            own.contains("hvars.insert(\"noo_harness_model_url\", format!(\"https://127.0.0.1:{}\","),
+            "provision renders the harness's model URL as https on loopback"
+        );
+        assert!(
+            super::super::enroll::asset_harness_env_tmpl().contains("NOO_HARNESS_MODEL_URL={{ noo_harness_model_url }}"),
+            "the harness template takes it from that variable"
+        );
+        let nf = crate::test_src::own_code(include_str!("node_fetch.rs"));
+        let at = nf.find("const HARNESS_ENV_KEYS").expect("the Mac's harness-env key list");
+        let list = nf[at..].split("];").next().unwrap();
+        assert!(list.contains("\"NOO_HARNESS_MODEL_URL\""), "the Mac applier carries it");
     }
 }

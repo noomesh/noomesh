@@ -4,7 +4,7 @@
 //! A critical heartbeat task that never ran, or never completed, alerts.
 //!
 //! Until now the only backup alert was for a backup that RAN and FAILED
-//! (`backup_completion`, `heartbeat.task_failed`). 2026-10-24, the pop-os
+//! (`backup_completion`, `heartbeat.task_failed`). 2026-10-24, the ctrl
 //! controller: the data NVMe failed at 21:07Z on 10-23 and Postgres was down
 //! until ~14:15Z on 10-24. The `database_backup` task (`30 3 * * *`) did not
 //! run at 03:30 — the gateway and database that schedule it were down — so

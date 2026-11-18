@@ -435,18 +435,22 @@ pub(crate) const NEEDS_A_HAND: &str = "only these need you: a key owned by anoth
 /// in that gid) was left 0644 so its service keeps starting. A roll that
 /// MOVES a reader makes one on every such box: 0.6.12 hands the sandbox key
 /// from 65532 to the sandbox server's own uid. So, as onboard does (i266),
-/// the grant goes through `sudo -n` when sudo needs no password (the rail's
-/// applier, a cloud image's user); otherwise the roll says LOUDLY that the
-/// keys are world-readable and names the command that prints each line. No
-/// password prompt in the middle of a roll.
+/// at a terminal the grant is stated and run through sudo (a prompt is
+/// expected); with no terminal no sudo runs at all and the roll says LOUDLY
+/// that the keys are world-readable and names the command that prints each
+/// line. Decided from isatty(stdin), never a `sudo -n true` probe (i907).
 pub(crate) fn reconcile_key_modes(g: &Globals, ca: &ClusterCa) -> ModeRepair {
     let mut repair = ModeRepair::run(ca);
     let pending = sudo_grant_pending(&repair.keys);
-    if !pending.is_empty() && crate::onboard::steps::passwordless_sudo() {
+    let at_terminal = !g.json && crate::onboard::steps::stdin_at_terminal();
+    if !pending.is_empty() && crate::onboard::steps::root_step_runs(at_terminal, false) {
+        ui::step(&format!(
+            "handing {} private key(s) to their container uid through sudo (chgrp + 0640) — otherwise every local account can read them",
+            pending.len()));
         for i in pending {
             let f = &mut repair.keys[i];
             let crate::pki::KeyReader::ContainerUid(uid) = f.reader else { continue };
-            if crate::pki::grant_read_to_uid_via_sudo(&ca.dir.join(&f.rel), uid, true).is_ok() {
+            if crate::pki::grant_read_to_uid_via_sudo(&ca.dir.join(&f.rel), uid, false).is_ok() {
                 f.needs = None;
                 f.granted_via = "sudo";
                 f.after = 0o640;

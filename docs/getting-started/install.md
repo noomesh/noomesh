@@ -8,11 +8,11 @@ This is the primary path; [standalone-controller.md](standalone-controller.md)
 is the no-checkout variant of the same step, and
 `noo --help` lists every command.
 
-Requirements: Linux (or WSL2), Docker with the Compose v2 plugin (v2.40 or
-newer; `docker compose version` must work — Ubuntu's `docker.io` ships without
+Requirements: Linux (or WSL2), Docker with the Compose v2 plugin
+(`docker compose version` must work — Ubuntu's `docker.io` ships without
 it, add `docker-compose-v2` from Ubuntu, or `docker-compose-plugin` from Docker's
 own apt repository, which is newer and preferred), and optionally an NVIDIA GPU. The services run from Docker
-images; nothing Python is needed on the host for the launcher itself — the
+images; nothing Python is needed on the host for the launcher itself (the installer's signature check needs `python3`, OpenSSL 3, or an already-installed `noo`) — the
 `noo` binary you just installed reads `noomesh.yaml` for it (compose_env,
 the add-on map, and the watched-folder/workspace mounts regenerated on
 every start). A host `python3` with PyYAML is only used as a fallback in a
@@ -51,13 +51,13 @@ numbers are approximate and grow with the models you pull):
 | Disk | 25 GB free where Docker keeps its images | the stack's images and data (~12 GB, measured on a fresh amd64 install), the default model (`gemma4:e2b`, 7.2 GB), and headroom for an upgrade. `noo onboard` checks this before it starts and stops below it; `noo onboard --min-free-gb <n>` sets another floor if you know this box needs less |
 | RAM | 16 GB | the stack idles at ~6 GB; a CPU-only box also holds the model in RAM |
 | GPU | optional; 4 GB+ VRAM to run a model on it | under ~10 GB the wizard offers a model verified to fit; with none, Ollama runs on CPU (slow) and the wizard offers a model that fits the free memory, or says none does |
-| Network | outbound HTTPS to `ghcr.io` and `ollama.com` at install | pulling images and the first model; nothing inbound |
+| Network | outbound HTTPS to `ghcr.io`, `ollama.com` and `github.com` at install | pulling images and the first model, plus releases, the stack lock and its signature, and the hostd asset from GitHub; nothing inbound |
 
 ## 1. Install the `noo` binary
 
 `noo` is a single static binary published on every `noo-cli-v*` GitHub
 release, for `x86_64` and `aarch64` Linux (musl) and Apple-silicon macOS.
-The installer resolves the newest release, downloads the asset for your
+The installer resolves the newest final release (release candidates only with `NOO_CLI_PRERELEASE=1`), downloads the asset for your
 platform plus the release's signed `sha256sums.txt`, checks that manifest's
 signature against a release key pinned in the script, refuses to install on
 a signature or checksum mismatch, and puts the binary in `~/.local/bin/noo`.
@@ -123,6 +123,10 @@ pulled; the wizard, the CLI and the running stack are the same.
 |---|---|---|
 | **dist** | a git checkout | pulled from the release registry (`stack-v*` tags) |
 | **dev** | a git checkout and `docker login dhi.io` (hardened base images) | built from this source tree — for changing the code |
+
+The install matrix runs the release path above on fresh machines; this
+from-source path is **not** covered by it (nothing installs from a fresh
+clone in CI), so treat it as the developer's path.
 
 ```bash
 git clone https://github.com/noomesh/noomesh.git ~/noomesh

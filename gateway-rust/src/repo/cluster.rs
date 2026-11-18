@@ -90,7 +90,7 @@ where
 /// `(backend, role)` for every RUNNING placement on one node.
 ///
 /// For naming what a node serves when a pinned chat cannot go there (i69a:
-/// "node robopi serves embed (ollama)"), not for routing. Runtime query for
+/// "node node-pi serves embed (ollama)"), not for routing. Runtime query for
 /// the same offline-cache reason as `placements_non_chat`.
 pub async fn node_running_roles<'e, E>(db: E, node_id: &str) -> Result<Vec<(String, String)>, sqlx::Error>
 where

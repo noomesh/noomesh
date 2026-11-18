@@ -177,10 +177,28 @@ fn ct_eq(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// The header the door sets on every answer it makes itself, naming why.
+pub const ERROR_HEADER: &str = "x-noo-tunnel-error";
+/// The code for a tunnel that failed BEFORE the node's response head.
+pub const LOST: &str = "tunnel_lost";
+
+/// Is this answer the door's own pre-head `tunnel_lost` 502? Then the node
+/// sent nothing back and the caller has received nothing: an inference
+/// call may be sent again, to the same node after a wait or to another
+/// (live, 0.6.26 roll, 2026-11-17T17:01:09Z: a chat 502 while node-a's agent
+/// restarted; the backend answered again 0.7 s later). A tunnel that drops
+/// MID-stream is never this: its 200 head already left, and the body ends
+/// short. Keyed on the door's header, which a plain HTTPS backend does not
+/// send, never on a word in the body.
+pub fn lost_before_head(status: u16, headers: &axum::http::HeaderMap) -> bool {
+    status == StatusCode::BAD_GATEWAY.as_u16()
+        && headers.get(ERROR_HEADER).and_then(|v| v.to_str().ok()) == Some(LOST)
+}
+
 fn error_response(status: StatusCode, code: &str, detail: String) -> Response {
     let mut r = (status, axum::Json(json!({"detail": detail, "error": code}))).into_response();
     if let Ok(v) = HeaderValue::from_str(code) {
-        r.headers_mut().insert("x-noo-tunnel-error", v);
+        r.headers_mut().insert(ERROR_HEADER, v);
     }
     if status == StatusCode::SERVICE_UNAVAILABLE {
         r.headers_mut().insert("retry-after", HeaderValue::from_static("1"));
@@ -255,7 +273,7 @@ async fn door(State(secret): State<Arc<String>>, req: axum::extract::Request) ->
         }
         Err(e @ TunnelError::Busy { .. }) => error_response(StatusCode::SERVICE_UNAVAILABLE, "tunnel_busy", e.to_string()),
         Err(e @ TunnelError::BadRequest(_)) => error_response(StatusCode::BAD_REQUEST, "tunnel_request", e.to_string()),
-        Err(e) => error_response(StatusCode::BAD_GATEWAY, "tunnel_lost", e.to_string()),
+        Err(e) => error_response(StatusCode::BAD_GATEWAY, LOST, e.to_string()),
     }
 }
 
@@ -263,12 +281,40 @@ async fn door(State(secret): State<Arc<String>>, req: axum::extract::Request) ->
 mod tests {
     use super::*;
 
+    /// The door's own pre-head loss is the rule, and only that: built by the
+    /// door's `error_response`, its body is the one the gateway logged live
+    /// (0.6.26 roll, ref-0fe0d2de82).
+    #[tokio::test]
+    async fn the_doors_pre_head_loss_and_nothing_else_is_the_rule() {
+        let lost = error_response(StatusCode::BAD_GATEWAY, LOST, "tunnel_lost: the tunnel to node node-a dropped (the connection failed)".into());
+        assert!(lost_before_head(lost.status().as_u16(), lost.headers()));
+        let body = axum::body::to_bytes(lost.into_body(), 4096).await.expect("body");
+        assert_eq!(
+            std::str::from_utf8(&body).expect("utf8"),
+            r#"{"detail":"tunnel_lost: the tunnel to node node-a dropped (the connection failed)","error":"tunnel_lost"}"#
+        );
+        // The door's other answers are not a lost tunnel.
+        let busy = error_response(StatusCode::SERVICE_UNAVAILABLE, "tunnel_busy", "full".into());
+        assert!(!lost_before_head(busy.status().as_u16(), busy.headers()), "busy is load, decided elsewhere");
+        let bad = error_response(StatusCode::BAD_REQUEST, "tunnel_request", "bad".into());
+        assert!(!lost_before_head(bad.status().as_u16(), bad.headers()));
+        // The header is the rule, with that code, on a 502 only.
+        let mut h = axum::http::HeaderMap::new();
+        assert!(!lost_before_head(502, &h), "a plain 502 is the backend's own");
+        h.insert(ERROR_HEADER, HeaderValue::from_static("tunnel_reset"));
+        assert!(!lost_before_head(502, &h), "another code is not a pre-head loss");
+        h.insert(ERROR_HEADER, HeaderValue::from_static(LOST));
+        assert!(lost_before_head(502, &h));
+        // A mid-stream drop's head is the node's 200: never this rule.
+        assert!(!lost_before_head(200, &h));
+    }
+
     #[test]
     fn the_door_path_is_node_and_the_untouched_rest() {
         let (n, t) = parse_target("/host9/v1/chat/completions", Some("a=1&b=%2F")).unwrap();
         assert_eq!((n.as_str(), t.as_str()), ("host9", "/v1/chat/completions?a=1&b=%2F"));
-        let (n, t) = parse_target("/pop%2Dos/api/containers/x/proxy/a%2Fb", None).unwrap();
-        assert_eq!((n.as_str(), t.as_str()), ("pop-os", "/api/containers/x/proxy/a%2Fb"), "the rest keeps its percent-encoding");
+        let (n, t) = parse_target("/ct%72l/api/containers/x/proxy/a%2Fb", None).unwrap();
+        assert_eq!((n.as_str(), t.as_str()), ("ctrl", "/api/containers/x/proxy/a%2Fb"), "the rest keeps its percent-encoding");
         assert_eq!(parse_target("/host9", None).unwrap().1, "/");
         assert!(parse_target("//gpu", None).is_none(), "an empty node id");
         assert!(parse_target("/", None).is_none());

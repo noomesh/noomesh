@@ -278,7 +278,7 @@ func TestPullImageArtifactSecondCallerFindsItLocal(t *testing.T) {
 	}
 	results := make(chan out, 2)
 	pull := func() {
-		r, err := (&Client{}).PullImageArtifact(context.Background(), "race:1", "", "noo-old")
+		r, err := (&Client{}).PullImageArtifact(context.Background(), "race:1", "", "noo-ollama")
 		results <- out{r, err}
 	}
 	go pull()
@@ -292,7 +292,7 @@ func TestPullImageArtifactSecondCallerFindsItLocal(t *testing.T) {
 		switch {
 		case o.err == nil && o.res.Status == "up_to_date":
 			upToDate++
-			if o.res.Removed != "noo-old" {
+			if o.res.Removed != "noo-ollama" {
 				t.Fatalf("the waiter must still remove the old container, Removed=%q", o.res.Removed)
 			}
 		case IsImageNotStaged(o.err):
@@ -301,8 +301,8 @@ func TestPullImageArtifactSecondCallerFindsItLocal(t *testing.T) {
 			t.Fatalf("unexpected result %+v %v", o.res, o.err)
 		}
 	}
-	if len(removed) != 1 || removed[0] != "noo-old" {
-		t.Fatalf("daemon removals %v, want [noo-old]", removed)
+	if len(removed) != 1 || removed[0] != "noo-ollama" {
+		t.Fatalf("daemon removals %v, want [noo-ollama]", removed)
 	}
 	if upToDate != 1 || refused != 1 || atomic.LoadInt32(&manifestCalls) != 2 {
 		t.Fatalf("upToDate=%d refused=%d manifestCalls=%d, want 1 1 2 (one pull asks for the .tar.gz then the .tar name)", upToDate, refused, manifestCalls)

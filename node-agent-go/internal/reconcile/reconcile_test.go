@@ -137,7 +137,7 @@ func TestShortHash(t *testing.T) {
 // decideSpecDrift covers the recreate/converge/stuck state machine, including
 // the absent-label adoption path (a container predating this feature) and the
 // restart-loop guard.
-// 0.6.8 live (aserve, robopi): noo-ollama ran ollama/ollama:latest with a
+// 0.6.8 live (node-b, node-pi): noo-ollama ran ollama/ollama:latest with a
 // spec label that matched, so the reconciler called it converged and
 // `noo cluster provision --wait` changed nothing. A floating ref is drift,
 // recreated once per desired hash and never looped.

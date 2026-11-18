@@ -311,7 +311,7 @@ compose_report_undeclared() {
 # A whole-stack `up` starts only the active profiles' services and leaves a
 # RUNNING container of any other declared service alone: compose ignores
 # unselected profiles, `--remove-orphans` is never passed (above), and
-# noo_created_guard removes only Created ones. pop-os kept a
+# noo_created_guard removes only Created ones. ctrl kept a
 # `noo-stunnel-ollama` (profile ollama, stunnel v0.6.2, created 2026-10-15)
 # Up for a month after the controller stopped running that profile, and the
 # 0.6.25 `stack images` gate failed on it. So, after the up, the launcher

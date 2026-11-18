@@ -63,7 +63,7 @@ class Node:
         self.dropin_dir = self.root / "noo-harness.service.d"
         self.dropin = self.dropin_dir / "50-noomesh-egress.conf"
         self.hosts_db = tmp / "getent.db"      # "name addr" lines; absent name = unresolvable
-        self.hosts_db.write_text("ctl.example.net 203.0.113.9\nnats.example.net 100.64.1.2\n")
+        self.hosts_db.write_text("ctl.example.net 203.0.113.9\nnats.example.net 100.64.0.100\n")
         self.ip_out = tmp / "ip.out"
         self.ip_out.write_text("")
         self.probe_out = tmp / "probe.out"
@@ -152,7 +152,7 @@ BASE_ALLOW = sorted("127.0.0.1/32 ::1/128 10.0.0.0/8 172.16.0.0/12 192.168.0.0/1
 # ── the rendered files, exactly ─────────────────────────────────────────────
 
 def test_the_drop_in_is_exactly_the_contract(node: Node) -> None:
-    node.hosts_db.write_text("ctl.example.net 203.0.113.9\nnats.example.net 100.64.1.2\n")
+    node.hosts_db.write_text("ctl.example.net 203.0.113.9\nnats.example.net 100.64.0.100\n")
     applied_of(node.run())
     assert node.dropin.read_text() == (
         "# Rendered by noo-apply: the harness and every CLI it launches reach only local and tailnet\n"
@@ -191,14 +191,14 @@ def test_without_a_host_nsswitch_the_minimal_one_is_written(node: Node) -> None:
 
 
 def test_hosts_file_has_header_locals_and_one_line_per_address(node: Node) -> None:
-    node.hosts_db.write_text("ctl.example.net 203.0.113.9\nctl.example.net 2001:db8::9\nnats.example.net 100.64.1.2\n")
+    node.hosts_db.write_text("ctl.example.net 203.0.113.9\nctl.example.net 2001:db8::9\nnats.example.net 100.64.0.100\n")
     applied_of(node.run())
     lines = (node.net / "hosts").read_text().splitlines()
     assert re.fullmatch(r"# Rendered by noo-apply at \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", lines[0]), lines[0]
     assert lines[1:] == [
         "# names: ctl.example.net nats.example.net",
         "127.0.0.1 localhost", "::1 localhost", "127.0.1.1 host3",
-        "2001:db8::9 ctl.example.net", "203.0.113.9 ctl.example.net", "100.64.1.2 nats.example.net",
+        "2001:db8::9 ctl.example.net", "203.0.113.9 ctl.example.net", "100.64.0.100 nats.example.net",
     ]
 
 
@@ -212,7 +212,7 @@ def test_literal_ips_and_localhost_are_not_names(node: Node) -> None:
 # ── the allowlist ───────────────────────────────────────────────────────────
 
 def test_allowlist_without_a_public_controller_address_is_the_base_only(node: Node) -> None:
-    node.hosts_db.write_text("ctl.example.net 192.168.1.5\nnats.example.net 100.64.1.2\n")
+    node.hosts_db.write_text("ctl.example.net 192.168.1.5\nnats.example.net 100.64.0.100\n")
     applied_of(node.run())
     assert allow_line(node).split() == sorted(BASE_ALLOW)
 
@@ -223,7 +223,7 @@ def test_a_public_controller_address_is_the_one_public_entry(node: Node) -> None
 
 
 def test_a_public_v6_controller_address_is_a_slash_128(node: Node) -> None:
-    node.hosts_db.write_text("ctl.example.net 2001:db8::9\nnats.example.net 100.64.1.2\n")
+    node.hosts_db.write_text("ctl.example.net 2001:db8::9\nnats.example.net 100.64.0.100\n")
     applied_of(node.run())
     assert "2001:db8::9/128" in allow_line(node).split()
 
@@ -266,12 +266,12 @@ def test_nothing_in_test_net_1_is_ever_allowed(node: Node) -> None:
 # ── a name that does not resolve ───────────────────────────────────────────
 
 def test_an_unresolvable_name_is_tagged_left_out_and_never_falls_back(node: Node) -> None:
-    node.hosts_db.write_text("nats.example.net 100.64.1.2\n")
+    node.hosts_db.write_text("nats.example.net 100.64.0.100\n")
     r = node.run()
     assert "harness-egress=UNRESOLVED:ctl.example.net" in applied_of(r)
     assert "ctl.example.net does not resolve" in r.stderr or "'ctl.example.net' does not resolve" in r.stderr
     hosts = (node.net / "hosts").read_text()
-    assert "100.64.1.2 nats.example.net" in hosts
+    assert "100.64.0.100 nats.example.net" in hosts
     assert not re.search(r"^\S+ ctl\.example\.net$", hosts, re.M)
     assert "# names: ctl.example.net nats.example.net" in hosts   # still listed, so the agent can call it stale
     assert "nameserver 192.0.2.53" in (node.net / "resolv.conf").read_text()
@@ -361,7 +361,7 @@ def test_a_second_identical_apply_rewrites_nothing_and_restarts_nothing(node: No
 
 def test_a_changed_controller_address_rewrites_and_restarts(node: Node) -> None:
     applied_of(node.run())
-    node.hosts_db.write_text("ctl.example.net 203.0.113.10\nnats.example.net 100.64.1.2\n")
+    node.hosts_db.write_text("ctl.example.net 203.0.113.10\nnats.example.net 100.64.0.100\n")
     r = node.run()
     assert "harness-egress-files" in applied_of(r) and "RESTART=1" in r.stdout
     assert "203.0.113.10/32" in allow_line(node).split()
@@ -440,7 +440,7 @@ def test_the_precheck_gets_every_controller_host_and_port_with_defaults(node: No
 def test_a_failing_precheck_installs_nothing_removes_the_old_hold_and_restarts(node: Node) -> None:
     applied_of(node.run())
     assert node.dropin.exists()
-    node.hosts_db.write_text("ctl.example.net 203.0.113.10\nnats.example.net 100.64.1.2\n")
+    node.hosts_db.write_text("ctl.example.net 203.0.113.10\nnats.example.net 100.64.0.100\n")
     node.check_out.write_text("FAIL ctl.example.net 8000 connect\nok nats.example.net 4222\n")
     node.log.write_text("")
     r = node.run()
@@ -464,7 +464,7 @@ def test_a_failing_precheck_on_a_node_with_no_hold_installs_nothing_and_asks_no_
 
 def test_a_missing_systemd_run_is_a_failed_precheck(node: Node) -> None:
     applied_of(node.run())
-    node.hosts_db.write_text("ctl.example.net 203.0.113.10\nnats.example.net 100.64.1.2\n")
+    node.hosts_db.write_text("ctl.example.net 203.0.113.10\nnats.example.net 100.64.0.100\n")
     node.drop_systemd_run()
     r = node.run()
     a = applied_of(r)

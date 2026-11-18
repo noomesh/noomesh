@@ -200,8 +200,8 @@ func (e *Engine) diskReclaim(ctx context.Context, dryRun bool, watermark int, ca
 			"DRY RUN (nothing removed) — %s | rung1: %d dangling image(s) "+
 				"| rung2: build cache reclaimable %s (only >7d would be pruned) "+
 				"| rung3: rename-orphan container(s): %s "+
-				"| rung4: %d stale build-cache volume(s) | %s",
-			report, nDangling, cache, orphans, len(e.staleBuildVolumes(ctx, time.Now())), rung5)
+				"| rung4: %s | %s",
+			report, nDangling, cache, orphans, rung4Line(e.classifyBuildVolumes(ctx, time.Now())), rung5)
 	}
 
 	// Rung 1 — dangling images.
@@ -347,12 +347,31 @@ const buildVolumeIdle = 7 * 24 * time.Hour
 // not changed for buildVolumeIdle. An unreadable label or mountpoint keeps
 // the volume — when in doubt, this rung does nothing.
 func (e *Engine) staleBuildVolumes(ctx context.Context, now time.Time) []string {
+	return e.classifyBuildVolumes(ctx, now).stale
+}
+
+// buildVolumes is rung 4's view of the labelled, unattached build volumes:
+// the stale ones, and every one it keeps with the reason. The dry run says
+// both: a count of stale volumes alone read as "it does not see them" when
+// the volumes were live caches (node-a, 2026-11-16: three noo-batch target
+// volumes, 18 GB, checkouts present and rebuilt that day, reported as "1
+// stale build-cache volume(s)").
+type buildVolumes struct {
+	stale  []string
+	kept   []keptVolume
+	listed bool // the listing itself answered
+}
+
+type keptVolume struct{ name, why string }
+
+func (e *Engine) classifyBuildVolumes(ctx context.Context, now time.Time) buildVolumes {
+	var r buildVolumes
 	rc, out := e.Runner.Capture(ctx, reclaimDir, "docker", "volume", "ls", "-q",
 		"--filter", "dangling=true", "--filter", "label="+buildVolumeLabel)
 	if rc != 0 {
-		return nil
+		return r
 	}
-	var stale []string
+	r.listed = true
 	for _, v := range strings.Split(out, "\n") {
 		v = strings.TrimSpace(v)
 		if v == "" {
@@ -361,21 +380,59 @@ func (e *Engine) staleBuildVolumes(ctx context.Context, now time.Time) []string 
 		rc, info := e.Runner.Capture(ctx, reclaimDir, "docker", "volume", "inspect", "-f",
 			`{{index .Labels "`+buildVolumeLabel+`"}}|{{.Mountpoint}}`, v)
 		if rc != 0 {
+			r.kept = append(r.kept, keptVolume{v, "cannot be inspected"})
 			continue
 		}
 		src, mount, ok := strings.Cut(strings.TrimSpace(info), "|")
 		if !ok || src == "" {
+			r.kept = append(r.kept, keptVolume{v, "label unreadable"})
 			continue
 		}
 		if _, err := os.Stat(src); os.IsNotExist(err) {
-			stale = append(stale, v) // the checkout it caches is gone
+			r.stale = append(r.stale, v) // the checkout it caches is gone
 			continue
 		}
-		if t, ok := newestMtime(mount); ok && now.Sub(t) > buildVolumeIdle {
-			stale = append(stale, v)
+		t, ok := newestMtime(mount)
+		switch {
+		case !ok:
+			r.kept = append(r.kept, keptVolume{v, "checkout present, last use unreadable"})
+		case now.Sub(t) > buildVolumeIdle:
+			r.stale = append(r.stale, v)
+		default:
+			r.kept = append(r.kept, keptVolume{v, "checkout present, used " + ago(now.Sub(t)) + " ago"})
 		}
 	}
-	return stale
+	return r
+}
+
+// ago is a coarse age for the dry-run line: minutes, hours or days.
+func ago(d time.Duration) string {
+	switch {
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d/time.Minute))
+	case d < 48*time.Hour:
+		return fmt.Sprintf("%dh", int(d/time.Hour))
+	default:
+		return fmt.Sprintf("%dd", int(d/(24*time.Hour)))
+	}
+}
+
+// rung4Line is the dry run's rung-4 text: the stale count, then each kept
+// volume with why (checkout present and used within a week is a live cache,
+// which this rung never takes; bounding those is the owning tool's job).
+func rung4Line(b buildVolumes) string {
+	if !b.listed {
+		return "build-cache volumes not listed (docker volume ls failed)"
+	}
+	line := fmt.Sprintf("%d stale build-cache volume(s)", len(b.stale))
+	if len(b.kept) == 0 {
+		return line
+	}
+	parts := make([]string, 0, len(b.kept))
+	for _, k := range b.kept {
+		parts = append(parts, k.name+" ("+k.why+")")
+	}
+	return fmt.Sprintf("%s; %d kept: %s", line, len(b.kept), strings.Join(parts, ", "))
 }
 
 // newestMtime is the latest modification time of dir and its direct entries

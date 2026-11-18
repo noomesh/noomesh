@@ -13,6 +13,19 @@ and which hardening the long-running controller containers run under.
 | `noo-sandbox` | **yes** | gateway, worker, trellion, `sandbox` | the code-execution link, no egress |
 | `noo-browser` | no | gateway, worker, trellion, `browser` | the headless browser, which has to reach the web |
 
+What bounds where a tool can reach, today:
+
+- **Code execution** (the `sandbox` container) is on `noo-sandbox` only,
+  which is `internal: true`: it has no route out.
+- **The headless browser** (`browser` profile, opt-in) reaches the web.
+  `BROWSER_URL_ALLOWLIST` is empty by default; when set it is a substring
+  match on `/navigate` only, and in-page JavaScript does not pass through it.
+- **The gateway, worker and trellion** are on `noo-cluster`, which is not
+  internal: the network does not limit which public hosts they reach, and
+  there is no host allow-list setting for them.
+- **A harness** on a Linux node with systemd is held off the internet by its
+  unit (see [the node agent's page](./node-agent.md)); a Mac has no such hold.
+
 ### Postgres and Redis are on `noo-db` only
 
 A container on `noo-cluster` that is not a database client has no route to
@@ -136,7 +149,7 @@ agent sets `User: "0"` on them explicitly.
 | `vllm`, `vllm-secondary`, `ollama`, `ollama-embed`, `ollama-embed-cpu`, `tei`, `tei-gpu`, `reranker`, `airllm` | ALL, plus `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETGID`, `SETUID` (the node agent's backend set) | yes | no (below) |
 
 **Backends that keep a writable root, and why** (measured with `docker diff`
-on running containers, awolf, 2026-10-28):
+on running containers, node-a, 2026-10-28):
 
 - `vllm`: runs as root and writes `/tmp` (torch inductor, cutlass), `/root/.nv`
   (CUDA compute cache), `/root/.triton` (kernel cache) and `/etc/ld.so.cache`
@@ -200,8 +213,8 @@ verify --controller` fails the `sandbox executor` row when it is not 65590
 or when `/health` answers 5xx. An upgrade hands the existing sandbox key from
 65532 to 65590 in the same mode pass it runs before the launcher (`noo
 security pki fix-modes` on demand): by ACL or group as the operator, through
-`sudo -n` when that is all that can, and loudly, never quietly, when neither
-can.
+sudo when that is all that can and you are at a terminal (never a `sudo -n
+true` probe off one), and loudly, never quietly, otherwise.
 
 #### AppArmor on Ubuntu 24.04 and later
 
@@ -233,7 +246,7 @@ others read-only). Inside a call's new user namespace those mounts are
 locked, and the kernel then refuses a fresh procfs (no procfs in the mount
 namespace is fully visible). Through 0.6.13 the jail asked for one
 (`--proc /proc`), so with the AppArmor profile in place every call still
-failed, with "Can't mount proc on /proc: Operation not permitted" (pop-os,
+failed, with "Can't mount proc on /proc: Operation not permitted" (ctrl,
 2026-10-26). The jail now mounts no `/proc` at all and keeps every
 namespace. The other ways out were each worse:
 

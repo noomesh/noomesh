@@ -320,7 +320,7 @@ pub struct Raised {
 /// Record the floor for `account`. Never fails the caller; see the module doc.
 pub async fn raise(state: &AppState, account: &str, reason: Reason) -> Raised {
     let account = crate::auth::account_of(account);
-    let floor = floor_for(reason, chrono::Utc::now().timestamp_millis());
+    let floor = floor_for(reason, jiff::Timestamp::now().as_millisecond());
     let ttl = floor_ttl_secs();
     local().raise(account, floor, Duration::from_secs(ttl as u64), Instant::now());
     let shared = match state.redis.as_ref() {

@@ -248,10 +248,10 @@ async fn users_list(
                 "disabled": disabled,
                 "scopes": scopes,
                 "role": role,
-                "created_at": created,
-                "last_login_at": last_login,
+                "created_at": crate::wire_time::rfc3339_z(created),
+                "last_login_at": last_login.map(crate::wire_time::rfc3339_z),
                 "failed_login_count": failed,
-                "locked_until": locked_until,
+                "locked_until": locked_until.map(crate::wire_time::rfc3339_z),
             })
         })
         .collect();
@@ -1785,7 +1785,7 @@ async fn role_grants_list(
             json!({
                 "username": username,
                 "roles": roles,
-                "updated_at": updated_at,
+                "updated_at": crate::wire_time::rfc3339_z(updated_at),
                 "updated_by": updated_by,
             })
         })
@@ -3754,10 +3754,10 @@ async fn api_users_list(
                 "disabled": disabled,
                 "scopes": scopes,
                 "role": role,
-                "created_at": created,
-                "last_login_at": last_login,
+                "created_at": crate::wire_time::rfc3339_z(created),
+                "last_login_at": last_login.map(crate::wire_time::rfc3339_z),
                 "failed_login_count": failed,
-                "locked_until": locked,
+                "locked_until": locked.map(crate::wire_time::rfc3339_z),
             })
         })
         .collect();
@@ -4281,7 +4281,7 @@ async fn api_kb_teams(State(state): State<Arc<AppState>>) -> AppResult {
         teams.push(json!({
             "name": name,
             "description": description,
-            "created_at": created_at,
+            "created_at": crate::wire_time::rfc3339_z(created_at),
             "created_by": created_by,
             "members": members,
             "doc_count": doc_count,
@@ -6019,13 +6019,13 @@ mod key_policy_setter_tests {
 
     #[test]
     fn a_person_sets_it_and_no_key_or_agent_does() {
-        assert!(person_sets_key_policy(origin_of_requester(Some(&ctx("rbwolf", None, None)))).is_ok(), "the operator, CLI or console");
+        assert!(person_sets_key_policy(origin_of_requester(Some(&ctx("owner", None, None)))).is_ok(), "the operator, CLI or console");
         for (who, c) in [
-            ("a token exchanged from a key", ctx("rbwolf", None, Some("key:paiserve"))),
+            ("a token exchanged from a key", ctx("owner", None, Some("key:paiserve"))),
             ("an add-on's exchanged token", ctx("addon:example", None, None)),
             ("a service identity", ctx("svc:grafana", None, None)),
-            ("a harness door", ctx("rbwolf", Some("claude-code"), None)),
-            ("a delegated credential", ctx("rbwolf", None, Some("worker:run-1"))),
+            ("a harness door", ctx("owner", Some("claude-code"), None)),
+            ("a delegated credential", ctx("owner", None, Some("worker:run-1"))),
         ] {
             let refused = person_sets_key_policy(origin_of_requester(Some(&c)));
             assert!(matches!(refused, Err(crate::routes::AppError::Forbidden(_))), "{who} must be refused");

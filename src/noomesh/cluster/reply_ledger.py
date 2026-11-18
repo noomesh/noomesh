@@ -7,7 +7,7 @@ NATS reports a refused publish ASYNCHRONOUSLY: ``msg.respond`` returns as
 if it worked, and the only trace is an error callback carrying
 ``nats: permissions violation for publish to "<subject>"`` — lowercased by
 nats-py, with nothing saying it was the answer to a request. That is how i69
-looked on pop-os: a ``rag_generator.done`` line, then a bare
+looked on ctrl: a ``rag_generator.done`` line, then a bare
 ``nats_async_error``, and a caller that never got its answer.
 
 The worker records each reply subject when a request arrives; the error

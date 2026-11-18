@@ -177,7 +177,7 @@ def _new_local_flow(host_ips: str, line: str) -> str:
 
 
 def test_a_new_host_connection_is_named_by_its_local_tuple_in_either_order():
-    ips = "172.31.250.10 100.72.0.5 fd7a:115c:a1e0::1"
+    ips = "172.31.250.10 100.64.0.100 fd7a:115c:a1e0::1"
     out_first = ("[1794585167.068] [NEW] tcp 6 120 SYN_SENT src=172.31.250.10 dst=140.82.114.34 sport=55586 dport=443 "
                  "[UNREPLIED] src=140.82.114.34 dst=172.31.250.10 sport=443 dport=55586 id=7")
     assert _new_local_flow(ips, out_first) == "140.82.114.34 55586"

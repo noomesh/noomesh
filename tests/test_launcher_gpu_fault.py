@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026 PersonifAI LLC
 
-"""A GPU fault must not take the controller down (i277e; pop-os, 2026-10-28).
+"""A GPU fault must not take the controller down (i277e; ctrl, 2026-10-28).
 
 The GPU embed container failed at start with the CDI error
 "error getting device handle for index '0': Unknown Error"; compose aborted

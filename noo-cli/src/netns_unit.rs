@@ -202,6 +202,133 @@ pub(crate) fn remove(may_prompt: bool) -> Result<bool, String> {
     Ok(true)
 }
 
+/// i907 step 1b: the bundle kind the controller's self-node applier renders
+/// the unit from (scripts/noo-apply.sh, block `netns_unit`). The unit text is
+/// the applier's own template; the kind carries only [`payload`].
+pub(crate) const KIND: &str = "netns-unit";
+/// This machine's root applier: the self-node's, installed by prep-host
+/// (root:root 0755, so readable here without root).
+pub(crate) const APPLIER_PATH: &str = "/usr/local/bin/noo-apply";
+/// The applier generation that has the release check (i908) and, from the
+/// same release on, the `netns-unit` kind.
+pub(crate) const MIN_APPLIER_GENERATION: u32 = 2;
+
+/// The kind's payload: the install owner and root, nothing else. The applier
+/// refuses any other line and checks both against the host. Pure.
+pub(crate) fn payload(owner: &str, install_root: &str) -> String {
+    format!("user={owner}\nroot={install_root}\n")
+}
+
+/// What an applier can do, read from its text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Applier {
+    pub generation: u32,
+    /// Its KNOWN_KINDS names [`KIND`]: an applier without it exits 76 on the
+    /// whole bundle.
+    pub knows_kind: bool,
+}
+
+/// [`Applier`] from the applier's own text (`NOO_APPLY_GENERATION=` and
+/// `KNOWN_KINDS="…"` lines). Pure.
+pub(crate) fn applier_of(text: &str) -> Applier {
+    let generation = text.lines().find_map(|l| l.strip_prefix("NOO_APPLY_GENERATION="))
+        .and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0);
+    let knows_kind = text.lines().find_map(|l| l.strip_prefix("KNOWN_KINDS=\""))
+        .map(|v| v.trim_end_matches('"').split_whitespace().any(|k| k == KIND)).unwrap_or(false);
+    Applier { generation, knows_kind }
+}
+
+/// This machine's applier, if it has one.
+pub(crate) fn applier_here() -> Option<Applier> {
+    std::fs::read_to_string(APPLIER_PATH).ok().map(|t| applier_of(&t))
+}
+
+/// How the unit reaches this controller (i907 step 1b).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Route {
+    /// The self-node's applier knows the kind: stage it, no sudo.
+    Stage,
+    /// The self-node's applier (this generation) predates the kind; staging it
+    /// would refuse the bundle (exit 76). Named, nothing run, no sudo.
+    OldApplier(u32),
+    /// No applier here (or a root install, which the applier never renders):
+    /// the one stated root step, which `root_step_runs` lets run.
+    Sudo,
+    /// The same, refused: no terminal, no `--root-ok`, not root. The line says
+    /// the step and the command.
+    Stated(String),
+}
+
+/// The decision. Pure over what was read: whether the install owner is root
+/// (the applier never renders `User=root`), this machine's applier, whether
+/// it has a self node, and [`crate::onboard::steps::root_step`]'s inputs.
+pub(crate) fn route(owner_is_root: bool, applier: Option<Applier>, self_node: bool, at_terminal: bool, root_ok: bool) -> Route {
+    if !owner_is_root && self_node {
+        match applier {
+            Some(a) if a.generation >= MIN_APPLIER_GENERATION && a.knows_kind => return Route::Stage,
+            Some(a) => return Route::OldApplier(a.generation),
+            None => {}
+        }
+    }
+    // root_step's rule, worded here: `noo upgrade` has no `--root-ok` to offer.
+    if crate::onboard::steps::root_step_runs(at_terminal, root_ok) {
+        Route::Sudo
+    } else {
+        Route::Stated(format!(
+            "installing {UNIT_NAME} needs root, this controller has no self-node applier to do it, and this run has \
+             no terminal to ask at: run it once at a terminal: {REMEDY}"))
+    }
+}
+
+/// `noo cluster verify`'s remedy for a missing/stale/disabled unit, by route.
+pub(crate) fn remedy_for(owner_is_root: bool, applier: Option<Applier>, self_node: bool) -> &'static str {
+    // The terminal question does not change the remedy: it is run at one.
+    match route(owner_is_root, applier, self_node, true, false) {
+        Route::Stage => STAGE_REMEDY,
+        Route::OldApplier(_) => OLD_APPLIER_REMEDY,
+        Route::Sudo | Route::Stated(_) => SUDO_REMEDY,
+    }
+}
+/// The self-node's applier installs it; nothing asks for a password.
+pub(crate) const STAGE_REMEDY: &str = "noo upgrade --stack (the self-node's applier installs it; no sudo)";
+/// One roll brings the self-node an applier that knows the kind, the next installs the unit.
+pub(crate) const OLD_APPLIER_REMEDY: &str =
+    "noo upgrade --all (it brings the self-node an applier that knows netns-unit), then noo upgrade --stack installs it with no sudo";
+/// No applier on this controller: the one stated sudo.
+pub(crate) const SUDO_REMEDY: &str =
+    "noo upgrade --stack at a terminal (sudo asks once: this controller has no self-node applier to install it)";
+
+/// The self-node's verdict on the kind, from its apply report. Pure.
+pub(crate) fn apply_verdict(apply_msg: &str) -> Result<(), String> {
+    for t in apply_msg.split_whitespace() {
+        if let Some(v) = t.strip_prefix("netns-unit=") {
+            if v.starts_with("REFUSED") || v == "NOT-ENABLED" {
+                return Err(format!("the self-node's applier said netns-unit={v}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Stage the kind to the self node `node` and wait for its applier (the
+/// rail's pull, a poke, the apply report). Ok only for an exit-0 apply that
+/// did not refuse the kind.
+pub(crate) fn stage_to_self_node(g: &crate::Globals, node: &str, owner: &str, install_root: &str) -> Result<(), String> {
+    use crate::commands::security_local as sl;
+    let ca = crate::pki::ClusterCa::new(crate::pki::pki_dir());
+    if !ca.ca_exists() {
+        return Err("no cluster CA here".into());
+    }
+    let work = crate::private_tmp::dir(&format!("noo-{KIND}-{node}"))?;
+    let files = [(KIND, payload(owner, install_root).into_bytes())];
+    let out = sl::build_signed_bundle(&ca, node, &files, &work).map(|b| sl::deliver_signed_bundle(g, node, &b, &work, None));
+    let _ = std::fs::remove_dir_all(&work);
+    match out? {
+        sl::CertDelivery::Applied => apply_verdict(&crate::commands::provision::reported_apply_msg(g, node)),
+        other => Err(other.label()),
+    }
+}
+
 /// The manual commands, for a host where sudo could not run here.
 pub(crate) fn manual_removal() -> String {
     format!("sudo systemctl disable {UNIT_NAME}; sudo rm -f {UNIT_PATH}; sudo systemctl daemon-reload")
@@ -309,6 +436,105 @@ mod tests {
         let mut g = own.clone();
         g[2] = seen("/root/.noo", 0, 0o40775);
         assert!(unit_for("root", "/root/.noo", |_| root_only(&g)).unwrap_err().contains("/root/.noo is writable by others than root (mode 775)"));
+    }
+
+    const GEN2_WITH_KIND: &str = "#!/bin/bash\nNOO_APPLY_GENERATION=2\nKNOWN_KINDS=\"ca.crt applier netns-unit\"\n";
+    const GEN2_WITHOUT: &str = "#!/bin/bash\nNOO_APPLY_GENERATION=2\nKNOWN_KINDS=\"ca.crt applier\"\n";
+    const GEN1: &str = "#!/bin/bash\nNOO_APPLY_GENERATION=1\nKNOWN_KINDS=\"ca.crt applier\"\n";
+
+    #[test]
+    fn the_applier_is_read_from_its_own_text() {
+        assert_eq!(applier_of(GEN2_WITH_KIND), Applier { generation: 2, knows_kind: true });
+        assert_eq!(applier_of(GEN2_WITHOUT), Applier { generation: 2, knows_kind: false });
+        assert_eq!(applier_of(GEN1), Applier { generation: 1, knows_kind: false });
+        assert_eq!(applier_of("#!/bin/sh\n"), Applier { generation: 0, knows_kind: false });
+        // A kind whose name only contains ours is not ours.
+        assert!(!applier_of("KNOWN_KINDS=\"netns-unit-2\"\n").knows_kind);
+    }
+
+    /// The shipped applier knows the kind and is the generation the route
+    /// stages to: the pair the controller decides from.
+    #[test]
+    fn the_shipped_applier_takes_the_kind() {
+        let Some(p) = crate::test_support::repo_file_or_skip("scripts/noo-apply.sh") else { return };
+        let src = std::fs::read_to_string(p).expect("scripts/noo-apply.sh");
+        let a = applier_of(&src);
+        assert!(a.knows_kind && a.generation >= MIN_APPLIER_GENERATION, "{a:?}");
+    }
+
+    /// i907 step 1b: an applier of generation 2 that knows the kind gets it
+    /// staged; nothing runs sudo.
+    #[test]
+    fn a_gen2_self_node_applier_is_staged_to() {
+        let a = applier_of(GEN2_WITH_KIND);
+        for tty in [true, false] {
+            assert_eq!(route(false, Some(a), true, tty, false), Route::Stage);
+        }
+        assert_eq!(remedy_for(false, Some(a), true), STAGE_REMEDY);
+    }
+
+    /// An older applier would exit 76 on the whole bundle: skipped and named,
+    /// never sudo, terminal or not.
+    #[test]
+    fn an_old_applier_is_skipped_and_named_never_sudo() {
+        for (text, generation) in [(GEN1, 1), (GEN2_WITHOUT, 2)] {
+            for tty in [true, false] {
+                assert_eq!(route(false, Some(applier_of(text)), true, tty, true), Route::OldApplier(generation));
+            }
+            assert_eq!(remedy_for(false, Some(applier_of(text)), true), OLD_APPLIER_REMEDY);
+        }
+    }
+
+    /// No applier (or no self node): the one stated sudo, under root_step's
+    /// rule (#1287): a terminal, --root-ok, or already root; else said, not run.
+    #[test]
+    fn no_applier_is_a_stated_sudo_per_root_step() {
+        let gen2 = Some(applier_of(GEN2_WITH_KIND));
+        for (applier, self_node) in [(None, true), (None, false), (gen2, false)] {
+            assert_eq!(route(false, applier, self_node, true, false), Route::Sudo);
+            assert_eq!(route(false, applier, self_node, false, true), Route::Sudo);
+            let Route::Stated(why) = route(false, applier, self_node, false, false) else { panic!("no terminal, no --root-ok, not root") };
+            assert!(why.contains(REMEDY) && why.contains(UNIT_NAME), "{why}");
+            assert_eq!(remedy_for(false, applier, self_node), SUDO_REMEDY);
+        }
+        crate::onboard::steps::AS_ROOT.with(|c| c.set(true));
+        let as_root = route(false, None, true, false, false);
+        crate::onboard::steps::AS_ROOT.with(|c| c.set(false));
+        assert_eq!(as_root, Route::Sudo, "a root process runs its root step");
+    }
+
+    /// The applier never renders User=root: a root install takes the root
+    /// step even beside an applier that knows the kind.
+    #[test]
+    fn a_root_install_is_never_staged() {
+        assert_eq!(route(true, Some(applier_of(GEN2_WITH_KIND)), true, true, false), Route::Sudo);
+        assert!(matches!(route(true, Some(applier_of(GEN2_WITH_KIND)), true, false, false), Route::Stated(_)));
+    }
+
+    /// i907 step 1b: the roll reaches `install` (sudo_write_root_file's
+    /// `sudo tee` of the unit) only from its no-applier arm; the stage arm
+    /// and the old-applier arm run no sudo.
+    #[test]
+    fn the_roll_installs_with_sudo_only_where_there_is_no_applier() {
+        let up = crate::test_src::own_code(include_str!("commands/upgrade.rs"));
+        let body = crate::test_src::fn_body(&up, "fn reconcile_netns_unit(");
+        assert_eq!(body.matches("nu::install(").count(), 1, "{body}");
+        let stage = body.find("nu::Route::Stage =>").expect("the stage arm");
+        let sudo = body.find("nu::Route::Sudo =>").expect("the no-applier arm");
+        let at = body.find("nu::install(").unwrap();
+        let stated = body.find("nu::Route::Stated(").expect("the stated arm");
+        assert!(stage < sudo && sudo < at && at < stated, "{body}");
+        assert!(body[stage..sudo].contains("nu::stage_to_self_node("), "{body}");
+        assert!(!body.contains("sudo_write_root_file") && !body.contains("sudo_cmd"), "{body}");
+    }
+
+    #[test]
+    fn the_payload_is_two_lines_and_the_verdict_reads_a_refusal() {
+        assert_eq!(payload("alex", "/home/alex/.noo"), "user=alex\nroot=/home/alex/.noo\n");
+        assert_eq!(apply_verdict("applied: netns-unit release-check: generation=2"), Ok(()));
+        assert_eq!(apply_verdict("applied: netns-unit=unchanged"), Ok(()));
+        assert!(apply_verdict("applied: netns-unit=REFUSED:root-owner").unwrap_err().contains("REFUSED:root-owner"));
+        assert!(apply_verdict("applied: netns-unit=NOT-ENABLED").is_err());
     }
 
     #[test]

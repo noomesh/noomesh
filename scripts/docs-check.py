@@ -70,7 +70,7 @@ def _repo_root() -> Path:
 REPO = _repo_root()
 DOCS = REPO / "docs"
 INDEX = DOCS / "README.md"
-ROOT_MD = ["README.md", "CONTRIBUTING.md", "SECURITY.md"]
+ROOT_MD = ["README.md", "CONTRIBUTING.md", "SECURITY.md", "AGENTS.md"]
 
 LINK_RE = re.compile(r"\]\(([^)\s]+?)(?:#[^)\s]*)?\)")
 CODE_FENCE_RE = re.compile(r"^(```|~~~)")
@@ -372,6 +372,32 @@ def check_proposal_numbers(errors: list[str]) -> None:
             errors.append(f"internal/proposals/README.md links {target}, which does not exist")
 
 
+AGENTS_MD = "AGENTS.md"
+TWO_PARTS = ("## For people", "## For agents")
+
+
+def check_agents_pages(errors: list[str]) -> None:
+    """A page AGENTS.md points agents at is written in the two-part shape:
+    exactly one `## For people` and one `## For agents`, in that order, and
+    no other H2 (operator, 2026-11-14: one page, a short part a person
+    reads and an exact part an agent acts on, no fact in both)."""
+    agents = REPO / AGENTS_MD
+    if not agents.exists():
+        return
+    for lineno, target in iter_links(agents):
+        if not target.startswith("docs/") or not target.endswith(".md"):
+            continue
+        page = REPO / target
+        if not page.exists():
+            continue  # check_links reports it
+        h2 = [l.strip() for l in page.read_text(encoding="utf-8").splitlines() if l.startswith("## ")]
+        if tuple(h2) != TWO_PARTS:
+            errors.append(
+                f"{AGENTS_MD}:{lineno}: {target} must have exactly the H2s "
+                f"{' then '.join(TWO_PARTS)} (has {h2 or 'none'})"
+            )
+
+
 def main() -> int:
     errors: list[str] = []
     warnings: list[str] = []
@@ -382,6 +408,7 @@ def main() -> int:
     check_forbidden(errors)
     check_commands(errors)
     check_proposal_numbers(errors)
+    check_agents_pages(errors)
     for w in warnings:
         print(f"docs-check: WARNING {w}")
     for e in errors:

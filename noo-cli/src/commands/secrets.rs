@@ -1288,7 +1288,7 @@ pub fn spec_or_family(key: &str) -> Option<&'static SecretSpec> {
 /// `NATS_NODE_PASSWORD_<NODE>`: one per node, so no static row can name
 /// them (see the note above `NATS_NODE_PASSWORD` in CORE_REGISTRY). They do
 /// have a rotation path, and the audit said "no rotation plan" for every
-/// node's key (pop-os onboarding, 2026-11-05). Recognised by shape here and
+/// node's key (ctrl onboarding, 2026-11-05). Recognised by shape here and
 /// NOT part of `registry()`, so nothing expects a literal key to exist.
 pub(crate) const NATS_NODE_FAMILY: SecretSpec = SecretSpec {
     key: "NATS_NODE_PASSWORD_<NODE>",
@@ -8687,16 +8687,16 @@ mod audit_classify_tests {
         audit_findings(&audit_rows(&sops, &env), true, &|_| false)
     }
 
-    /// pop-os onboarding 2026-11-05: every node's password, the TLS key path
+    /// ctrl onboarding 2026-11-05: every node's password, the TLS key path
     /// and the Google Chat key path read "unclassified-credential: no
     /// rotation plan". A node password has one (nats-creds rotate); the
     /// other two hold paths.
     #[test]
     fn node_passwords_and_path_valued_names_are_not_unclassified() {
-        let f = audit(&[("NATS_NODE_PASSWORD_HOST8", "pw8"), ("NATS_NODE_PASSWORD_POP_OS", "pwp")],
+        let f = audit(&[("NATS_NODE_PASSWORD_HOST8", "pw8"), ("NATS_NODE_PASSWORD_CTRL", "pwp")],
                       &[("NOO_TLS_KEY", "/var/lib/noo/state/pki/gateway/gateway.key"),
                         ("GOOGLE_CHAT_CREDENTIALS", "/app/google-chat-sa-key.json")]);
-        for k in ["NATS_NODE_PASSWORD_HOST8", "NATS_NODE_PASSWORD_POP_OS", "NOO_TLS_KEY", "GOOGLE_CHAT_CREDENTIALS"] {
+        for k in ["NATS_NODE_PASSWORD_HOST8", "NATS_NODE_PASSWORD_CTRL", "NOO_TLS_KEY", "GOOGLE_CHAT_CREDENTIALS"] {
             assert!(!f.iter().any(|x| x.key == k && matches!(x.kind, "unclassified-credential" | "credential-in-env" | "key-material-not-a-path")),
                 "{k}: {f:?}");
         }

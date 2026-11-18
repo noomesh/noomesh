@@ -2969,7 +2969,7 @@ async fn action_idle_scaledown(
         .and_then(|v| v.as_array())
         .unwrap_or(&empty);
 
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
     let idle = idle_backend_candidates(backends, now, idle_threshold_sec);
 
     if idle.is_empty() {
@@ -3877,7 +3877,7 @@ async fn cert_rotation_check_in(config: &Value, candidates: &[String]) -> Result
         return Err(no_pki_dir_error("Cert rotation check", candidates));
     };
     let warn = warn_days(config);
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
     let dir = std::path::Path::new(&pki_dir);
 
     // A configured PKI dir that holds no readable certificate is a BROKEN
@@ -3932,7 +3932,7 @@ async fn cert_auto_rotate_in(config: &Value, candidates: &[String]) -> Result<St
         return Err(no_pki_dir_error("Cert auto-rotate", candidates));
     };
     let warn = warn_days(config);
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
 
     // Same reasoning as cert_rotation_check: a configured directory holding
     // no readable certificate means the pre-scan saw nothing, which must not

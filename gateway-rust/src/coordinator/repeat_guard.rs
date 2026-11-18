@@ -3,7 +3,7 @@
 
 //! One search per question per turn.
 //!
-//! gemma-4 12B on mcmini (2026-10-16) spent seven iterations of one turn
+//! gemma-4 12B on node-mac (2026-10-16) spent seven iterations of one turn
 //! re-running `noo_rag_query` for "What do we know about trading?", "What is
 //! trading?", "What is trading?" (hybrid) — every result empty, every
 //! iteration re-planning from scratch. Nothing in the loop noticed. Only the
@@ -95,7 +95,7 @@ mod tests {
 
     #[test]
     fn rewording_the_same_question_is_a_repeat() {
-        // The three lookups mcmini ran on 2026-10-16.
+        // The three lookups node-mac ran on 2026-10-16.
         let mut g = RepeatGuard::default();
         assert!(g.check(&call("noo_rag_query", json!({"question": "What do we know about trading?"})), 1).is_none());
         let r = g

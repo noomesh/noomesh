@@ -237,10 +237,16 @@ def _classify(changed: list[str], **env: str) -> dict[str, str]:
 
 def test_the_classifier_narrows_and_fails_open() -> None:
     """What the rule actually does, per diff shape."""
+    internal = _classify(["internal/b.md"])
+    assert internal == {"code": "false", "gateway": "false", "cli": "false",
+                        "sqlx": "false", "ui": "false", "llamacpp": "false",
+                        "ollama": "false", "voice": "false", "deferred": "false", "defer_tests": "false"}
+    # docs/ and README.md arm the CLI lane only: its unit tests hold every
+    # documented `noo …` line to the usage table (noomesh#1320).
     docs = _classify(["docs/a.md", "internal/b.md"])
-    assert docs == {"code": "false", "gateway": "false", "cli": "false",
-                    "sqlx": "false", "ui": "false", "llamacpp": "false",
-                    "ollama": "false", "voice": "false", "deferred": "false", "defer_tests": "false"}
+    assert docs == {**internal, "cli": "true"}, docs
+    assert _classify(["README.md"])["cli"] == "true"
+    assert _classify(["AGENTS.md"])["cli"] == "false", "only docs/ and README.md are documented commands"
 
     cli = _classify(["noo-cli/src/main.rs"])
     assert cli["cli"] == "true" and cli["gateway"] == "false" and cli["sqlx"] == "false"

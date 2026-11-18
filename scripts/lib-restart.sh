@@ -4,7 +4,7 @@
 # lib-restart.sh - name resolution and exit status for `noo stack restart
 # <name>...` (noomesh-restart.sh). Sourced after lib-ui.sh and lib-compose.sh.
 #
-# Live finding 2026-10-14 (pop-os): `noo stack restart evolve` printed
+# Live finding 2026-10-14 (ctrl): `noo stack restart evolve` printed
 # "Restarting evolve", compose said "no such service: evolve", and the launcher
 # still closed with "Services restarted" and exit 0. Two defects:
 #   1. compose's exit status was never read for a named service;

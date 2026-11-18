@@ -1409,8 +1409,8 @@ mod display_reader_tests {
     /// without the kiosk scope, is not a display.
     #[test]
     fn only_a_kiosk_credential_names_its_device() {
-        assert_eq!(kiosk_device(&ctx("kiosk:homeserver-1", &["kiosk"])).as_deref(), Some("homeserver-1"));
-        assert_eq!(kiosk_device(&ctx("kiosk:homeserver-1", &["read"])), None);
+        assert_eq!(kiosk_device(&ctx("kiosk:node-h-1", &["kiosk"])).as_deref(), Some("node-h-1"));
+        assert_eq!(kiosk_device(&ctx("kiosk:node-h-1", &["read"])), None);
         assert_eq!(kiosk_device(&ctx("alice", &["kiosk"])), None);
         assert_eq!(kiosk_device(&ctx("kiosk:", &["kiosk"])), None);
     }

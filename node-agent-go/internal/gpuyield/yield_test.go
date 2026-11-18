@@ -495,7 +495,7 @@ func TestUnmeasuredReportedAndClearedOnMeasured(t *testing.T) {
 
 // ── the "shared" floor (speed review 2026-11-11) ──
 
-// awolf's live heartbeat on 2026-11-11: the WSL/Windows desktop compositor
+// node-a's live heartbeat on 2026-11-11: the WSL/Windows desktop compositor
 // holds 316 MiB of a 16 GiB card beside noomesh's 14745 MiB. That is
 // residue, not a competing workload: the node must read FREE, with the yield
 // on or off, or routing demotes its vLLM behind a slower node.

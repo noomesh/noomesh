@@ -23,7 +23,7 @@ import (
 // Every image the stack runs is pulled BY DIGEST from its lock, so an image
 // a later release replaced keeps its RepoDigest and is never "dangling":
 // rung 1 cannot see it, and every release and rc a host ever pulled stays
-// (pop-os, 2026-11-13: ~58 GB of superseded images in the first 60 lines of
+// (ctrl, 2026-11-13: ~58 GB of superseded images in the first 60 lines of
 // `docker system df -v`). This rung removes an image ONLY when all of:
 //
 //  1. it is OURS: every one of its tags and repo digests is under a

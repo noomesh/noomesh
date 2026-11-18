@@ -204,7 +204,7 @@ def _fresh_page(state: Path, age: int = 0) -> None:
 
 
 def test_a_live_display_with_no_socket_is_its_own_exit_code(tmp_path: Path, capsys) -> None:
-    # homeserver after the 0.6.24 roll: Chromium up, page.json fresh, no
+    # node-h after the 0.6.24 roll: Chromium up, page.json fresh, no
     # /run/kiosk (a kiosk.service from before the broker has no
     # RuntimeDirectory=kiosk). Not "is kiosk.service running?" (it is).
     state = tmp_path / "state"

@@ -5,8 +5,12 @@ package main
 
 import (
 	"os"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/noomesh/noomesh/node-agent-go/internal/stopdrain"
 )
 
 // The shipped unit must be able to recover a node WITHOUT anything reaching
@@ -48,5 +52,27 @@ func TestUnitCanAlwaysRecoverWithoutTheController(t *testing.T) {
 	// problem the 2026-08-14 comment was written about.
 	if got := directive("RestartSec"); got != "30" {
 		t.Errorf("RestartSec=%q — expected 30s, the ceiling that replaced 5/60s", got)
+	}
+}
+
+// The stop drain (stopdrain.Bound) must finish before systemd's SIGKILL:
+// TimeoutStopSec is the bound plus 20 s for the rest of the shutdown.
+func TestUnitStopTimeoutOutlastsTheDrain(t *testing.T) {
+	raw, err := os.ReadFile("../../deploy/noo-node-agent.service")
+	if err != nil {
+		t.Fatalf("read unit: %v", err)
+	}
+	got := ""
+	for _, line := range strings.Split(string(raw), "\n") {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(line), "TimeoutStopSec="); ok {
+			got = v
+		}
+	}
+	secs, err := strconv.Atoi(got)
+	if err != nil {
+		t.Fatalf("TimeoutStopSec=%q: must be whole seconds", got)
+	}
+	if want := int((stopdrain.Bound + 20*time.Second).Seconds()); secs != want {
+		t.Errorf("TimeoutStopSec=%d, want %d (the stop drain bound + 20 s)", secs, want)
 	}
 }

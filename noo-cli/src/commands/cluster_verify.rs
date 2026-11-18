@@ -605,10 +605,122 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
         (Some("off"), "running") => out.push(fail("harness", "policy off but the harness is running", format!("noo cluster unplace {id} harness"))),
         (Some(p), s) => out.push(ok("harness", format!("{} (policy {p})", if s.is_empty() { "-" } else { s }))),
     } }
+    out.extend(model_stores_check(id, n));
+    out.extend(agent_address_check(id, n));
+    out.extend(ollama_models_check(id, n));
     out.extend(harness_tasks_check(n));
     out.extend(harness_egress_check(id, n));
     settle_after_roll(n, &mut out);
     out
+}
+
+/// The `agent address` row: a node's agent_url must be https on an explicit
+/// port at its registered address (the gateway's heartbeat holds it to that).
+/// When the gateway refused the URL a node reported, it keeps the reason on
+/// the node record as `agent_url_refused` and dials `https://<ip>:8081`
+/// instead: a FAIL naming the node and the reason. No row when nothing was
+/// refused.
+pub(crate) fn agent_address_check(id: &str, n: &Value) -> Option<Check> {
+    let why = n["agent_url_refused"].as_str().filter(|s| !s.is_empty())?;
+    let ip = n["ip_address"].as_str().unwrap_or("its registered address");
+    Some(fail(
+        "agent address",
+        format!("{id}: the gateway refused the agent_url this node reported ({why}); it dials https://{ip}:8081 instead"),
+        format!("on {id}, set the agent's address (NODE_IP in /etc/noo-node-agent.env) to the address it is registered at, so it reports https://<that address>:<its port>"),
+    ))
+}
+
+/// The `model stores` row (proposal 61 §7b): no model store on the node is
+/// writable by every account on the host. The agent reports each declared
+/// data root and its first-level subdirectories that are world-writable
+/// (o+w without the sticky bit) as `data_roots.stores.world_writable`; a
+/// healthy node sends only the count it checked. A world-writable store is a
+/// store anyone can plant model bytes in, so the WARN names each path, its
+/// mode and owner, the exact chmod, and what that store's loads are protected
+/// by today. No row from an agent that does not report it (it predates the
+/// field; `noo upgrade --all` rolls it).
+pub(crate) fn model_stores_check(id: &str, n: &Value) -> Option<Check> {
+    const NAME: &str = "model stores";
+    let st = n["data_roots"].get("stores").filter(|v| v.is_object())?;
+    let checked = st["checked"].as_u64().unwrap_or(0);
+    let bad: Vec<&Value> = st["world_writable"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
+    if bad.is_empty() {
+        return Some(ok(NAME, format!("none world-writable ({checked} store director{} checked)", if checked == 1 { "y" } else { "ies" })));
+    }
+    let guard = |store: &str| match store {
+        "hf_cache" => "HF weights are verified against the controller's manifest at each backend start, on a placed node only",
+        "models" => "GGUF files are hashed against the controller's manifest at each start on a placed node, only when it has one",
+        "ollama" => "Ollama models are checked against the controller's record about every 10 minutes and at backend start, when it holds one (the `ollama models` row); a hand pull is not",
+        _ => "anyone can rename or replace the stores under it",
+    };
+    let mut parts = Vec::new();
+    let mut fixes = Vec::new();
+    for e in &bad {
+        let path = e["path"].as_str().unwrap_or("?");
+        let owner = match (e["uid"].as_i64(), e["gid"].as_i64()) {
+            (Some(u), Some(g)) => format!(", owner {u}:{g}"),
+            _ => String::new(),
+        };
+        parts.push(format!("{path} (mode {}{owner}; {})", e["mode"].as_str().unwrap_or("?"), guard(e["store"].as_str().unwrap_or(""))));
+        fixes.push(format!("sudo chmod o-w {path}"));
+    }
+    Some(warn(NAME, format!(
+        "{} world-writable: any account on {id} can plant model bytes there: {}",
+        bad.len(), parts.join("; ")),
+        Some(format!("on {id}: {}   # keep the owner; hand downloads: `noo models pull <model>`, or run them as the store's owner",
+            fixes.join(" && ")))))
+}
+
+/// The `ollama models` row (proposal 61 §7b): each placed Ollama model checked
+/// against the controller's store, from the agent's `ollama_verify`. The
+/// weights a node serves are the controller's when the local manifest's layers
+/// equal the controller's mirrored manifest, or its model layer equals the
+/// controller's GGUF. A mismatch is repaired from the controller (re-install or
+/// rebuild) and only a failed repair refuses the model. A model the controller
+/// has no record of (a hand `ollama pull`) is never refused: it is a WARN whose
+/// remedy re-pulls it through noo, which is how a hand pull is blessed. There
+/// is no switch that marks a model trusted. No row when the agent does not
+/// report it (no Ollama placement, or an agent that predates the check).
+pub(crate) fn ollama_models_check(id: &str, n: &Value) -> Option<Check> {
+    const NAME: &str = "ollama models";
+    let rows = n.get("ollama_verify")?.as_array()?;
+    if rows.is_empty() {
+        return None;
+    }
+    let short = |d: &str| d.strip_prefix("sha256:").map(|h| format!("sha256:{}…", &h[..h.len().min(12)])).unwrap_or_default();
+    let mut good = Vec::new();
+    let mut warns = Vec::new();
+    let mut fails = Vec::new();
+    let mut remedies: Vec<String> = Vec::new();
+    for r in rows {
+        let model = r["model"].as_str().unwrap_or("?");
+        let anchor = r["anchor"].as_str().unwrap_or("");
+        let layer = short(r["model_layer"].as_str().unwrap_or(""));
+        let reason = r["reason"].as_str().unwrap_or("");
+        let pull = || format!("noo models pull {model}");
+        match r["state"].as_str().unwrap_or("") {
+            "verified" | "rebuilt" => good.push(format!("{model} ({} anchor{}{})", anchor,
+                if layer.is_empty() { String::new() } else { format!(", weights {layer}") },
+                if r["state"] == "rebuilt" { ", repaired from the controller" } else { "" })),
+            "refused" => { fails.push(format!("{model}: {reason}")); remedies.push(pull()); }
+            "unverified" => { warns.push(format!("{model}: unverified ({}); re-pull it through noo to verify it",
+                if reason.is_empty() { "no controller record" } else { reason })); remedies.push(pull()); }
+            "mismatch" => { warns.push(format!("{model}: does NOT match the controller ({reason}); not repaired here (the agent does not manage this Ollama)")); remedies.push(pull()); }
+            _ => warns.push(format!("{model}: could not be checked ({})", if reason.is_empty() { "no reason given" } else { reason })),
+        }
+    }
+    let remedy = (!remedies.is_empty()).then(|| format!("on {id}: {}", remedies.join(" && ")));
+    if !fails.is_empty() {
+        let mut d = format!("refused (does not match the controller, and the repair failed): {}", fails.join("; "));
+        if !warns.is_empty() { d.push_str(&format!("; also {}", warns.join("; "))); }
+        return Some(fail(NAME, d, remedy.unwrap_or_default()));
+    }
+    if !warns.is_empty() {
+        let mut d = warns.join("; ");
+        if !good.is_empty() { d.push_str(&format!("; verified: {}", good.join(", "))); }
+        return Some(warn(NAME, d, remedy));
+    }
+    Some(ok(NAME, format!("verified against the controller: {}", good.join(", "))))
 }
 
 /// The `harness egress` row (enforcement step 1): whether this node's harness,
@@ -2957,8 +3069,11 @@ pub(crate) fn noo_data_bound_check(seen: &NooDataSeen, want: Option<&str>) -> Ch
 /// enabled on this systemd controller, so a container that joins another's
 /// network (noo-ollama-embed) comes back after every dockerd start? Pure.
 /// `state`: Err is why this install cannot have the unit (`render_here`).
-pub(crate) fn netns_restore_row(systemd: bool, state: Result<crate::netns_unit::State, String>) -> Check {
-    use crate::netns_unit::{State, REMEDY, ROOT_REFUSAL, ROOT_REMEDY, UNIT_NAME};
+/// `remedy`: how this controller gets it (i907 step 1b,
+/// `netns_unit::remedy_for`): the self-node's applier, a newer applier
+/// first, or the one stated sudo where there is no applier.
+pub(crate) fn netns_restore_row(systemd: bool, state: Result<crate::netns_unit::State, String>, remedy: &str) -> Check {
+    use crate::netns_unit::{State, ROOT_REFUSAL, ROOT_REMEDY, UNIT_NAME};
     const NAME: &str = "netns restore";
     if !systemd {
         return ok(NAME, "no systemd here: noo-hostd's boot-restore restarts a namespace-joined container after a reboot; a dockerd restart alone is not covered");
@@ -2966,11 +3081,11 @@ pub(crate) fn netns_restore_row(systemd: bool, state: Result<crate::netns_unit::
     let lose = "after a reboot or a dockerd restart, a container that joins another's network (noo-ollama-embed) can stay down";
     match state {
         Ok(State::Current) => ok(NAME, format!("{UNIT_NAME} installed and enabled: it runs after every dockerd start")),
-        Ok(State::Disabled) => warn(NAME, format!("{UNIT_NAME} is installed but not enabled: {lose}"), Some(REMEDY.into())),
-        Ok(State::Stale) => warn(NAME, format!("{UNIT_NAME} is not the unit this install writes (older, or for a moved install): {lose}"), Some(REMEDY.into())),
-        Ok(State::Missing) => warn(NAME, format!("{UNIT_NAME} is not installed: {lose}"), Some(REMEDY.into())),
+        Ok(State::Disabled) => warn(NAME, format!("{UNIT_NAME} is installed but not enabled: {lose}"), Some(remedy.into())),
+        Ok(State::Stale) => warn(NAME, format!("{UNIT_NAME} is not the unit this install writes (older, or for a moved install): {lose}"), Some(remedy.into())),
+        Ok(State::Missing) => warn(NAME, format!("{UNIT_NAME} is not installed: {lose}"), Some(remedy.into())),
         Err(why) => {
-            let remedy = if why.starts_with(ROOT_REFUSAL) { ROOT_REMEDY } else { REMEDY };
+            let remedy = if why.starts_with(ROOT_REFUSAL) { ROOT_REMEDY } else { remedy };
             warn(NAME, format!("{UNIT_NAME} cannot be installed ({why}): {lose}"), Some(remedy.into()))
         }
     }
@@ -2980,7 +3095,8 @@ fn netns_restore_row_here(root: &std::path::Path) -> Check {
     use crate::netns_unit as nu;
     let systemd = nu::systemd_here();
     let state = if systemd { nu::render_here(&root.display().to_string()).map(|u| nu::state(&u)) } else { Err(String::new()) };
-    netns_restore_row(systemd, state)
+    let remedy = nu::remedy_for(nu::owner() == "root", nu::applier_here(), crate::commands::provision::self_node_name().is_some());
+    netns_restore_row(systemd, state, remedy)
 }
 
 /// The `ollama slots` row's advice (i802), and the command that applies it.
@@ -5488,6 +5604,161 @@ pub(crate) fn harness_systemd_check(reports: &[(String, Option<i64>, String)]) -
     ))
 }
 
+/// What the Linux applier writes on its `applied:` line for the node agent's
+/// filesystem hold (scripts/noo-apply.sh, agent_protect): `agent-protect=N`
+/// or `agent-protect=unchanged:N` (N writable paths), or
+/// `agent-protect=REFUSED:<KEY>`. No tag at all on a host without systemd.
+pub(crate) const AGENT_PROTECT_TAG: &str = "agent-protect=";
+
+/// The remedy for a refused hold: the key names which setting to fix.
+fn agent_protect_remedy(node: &str, key: &str) -> String {
+    match key {
+        "NOO_DATA_ROOT" | "HF_CACHE_DIR" | "OLLAMA_DATA_DIR" => format!(
+            "give {node} a plain absolute data root outside the system trees: \
+             noo cluster set-config {node} --data-root <path> && noo cluster provision {node} --wait"
+        ),
+        "MODELS_DIR" => format!(
+            "give {node} a plain absolute models dir outside the system trees: \
+             noo cluster set-config {node} --models-dir <path> && noo cluster provision {node} --wait"
+        ),
+        _ => format!(
+            "set {key} on {node} to plain absolute paths outside the system trees, then: noo cluster provision {node} --wait"
+        ),
+    }
+}
+
+/// The `agent protect` row (proposal 61 phase 0b): from each node's last
+/// apply report, whether the node agent's unit is held to the paths it
+/// writes. A refusal on any node is a FAIL naming the node and the key (that
+/// node keeps its previous hold, or none); otherwise OK naming each held node
+/// and how many paths it leaves writable. No row when no node reports a hold
+/// (a Mac or another host without systemd writes no tag).
+pub(crate) fn agent_protect_check(reports: &[(String, Option<i64>, String)]) -> Option<Check> {
+    let mut held: Vec<String> = Vec::new();
+    let mut refused: Vec<(String, String)> = Vec::new();
+    for (node, _, msg) in reports {
+        let Some(at) = msg.find(AGENT_PROTECT_TAG) else { continue };
+        let val = msg[at + AGENT_PROTECT_TAG.len()..].split_whitespace().next().unwrap_or("");
+        if let Some(key) = val.strip_prefix("REFUSED:") {
+            refused.push((node.clone(), key.to_string()));
+        } else {
+            let n = val.strip_prefix("unchanged:").unwrap_or(val);
+            if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
+                held.push(format!("{node} ({n} writable paths)"));
+            }
+        }
+    }
+    if let Some((first, key)) = refused.first() {
+        let names: Vec<String> = refused.iter().map(|(n, k)| format!("{n} ({k})")).collect();
+        return Some(fail(
+            "agent protect",
+            format!(
+                "the applier REFUSED the node agent's filesystem hold on {}: the named setting is not a path \
+                 the agent may be allowed to write; that node keeps its previous hold, or none",
+                names.join(", ")
+            ),
+            agent_protect_remedy(first, key),
+        ));
+    }
+    if held.is_empty() {
+        return None;
+    }
+    Some(ok("agent protect", format!("the node agent writes only where it must on {}", held.join(", "))))
+}
+
+/// What a node's applier prints once it checks root code against the
+/// release (i908): `release-check: generation=<n> release=<floor> …`
+/// (scripts/noo-apply.sh, node_fetch.rs `release_check_note`).
+pub(crate) const RELEASE_CHECK_TAG: &str = "release-check: generation=";
+/// The applier generation that carries the release check.
+pub(crate) const RELEASE_CHECK_GENERATION: u32 = 2;
+
+/// The `release check` row (i908): per node, from its last apply report,
+/// whether its applier installs root code only from a release-signed list
+/// (generation >= [`RELEASE_CHECK_GENERATION`]) and the release floor it
+/// holds. A node whose last apply REFUSED root code (exit 75) FAILs, naming
+/// it; a node whose applier predates the check WARNs (the first roll
+/// installs it). No row when there are no reports.
+pub(crate) fn release_check_row(reports: &[(String, Option<i64>, String)]) -> Option<Check> {
+    const NAME: &str = "release check";
+    if reports.is_empty() {
+        return None;
+    }
+    let (mut active, mut inactive, mut refused) = (Vec::new(), Vec::new(), Vec::new());
+    for (node, rc, msg) in reports {
+        if *rc == Some(crate::release_gate::REFUSED) && msg.contains("REFUSED") {
+            refused.push((node.clone(), refusal_line(msg)));
+            continue;
+        }
+        let generation = msg.find(RELEASE_CHECK_TAG).and_then(|at| {
+            let rest = &msg[at + RELEASE_CHECK_TAG.len()..];
+            rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse::<u32>().ok()
+                .map(|n| (n, rest.split_whitespace().find_map(|t| t.strip_prefix("release=")).unwrap_or("none").to_string()))
+        });
+        match generation {
+            Some((n, rel)) if n >= RELEASE_CHECK_GENERATION => active.push(format!("{node} (floor {rel})")),
+            _ => inactive.push(node.clone()),
+        }
+    }
+    let mut detail = if active.is_empty() {
+        "no node reports the release check yet".to_string()
+    } else {
+        format!("root code installs only from a release-signed list on {}", active.join(", "))
+    };
+    if !inactive.is_empty() {
+        detail.push_str(&format!("; NOT yet on {}: their applier predates the check, so the fleet signing key alone still decides their root code", inactive.join(", ")));
+    }
+    if !refused.is_empty() {
+        let ahead = refused.iter().any(|(_, line)| line.contains("this node is ahead of its controller"));
+        let unlisted = refused.iter().any(|(_, line)| !line.contains("this node is ahead of its controller"));
+        let said: Vec<String> = refused.iter().map(|(node, line)| format!(
+            "{node} refused its last bundle ({line}): a refused node refuses ALL bundles from this controller, \
+             cert pushes included, until the cause is fixed")).collect();
+        let mut remedy = Vec::new();
+        if ahead {
+            remedy.push("node ahead of its controller: noo upgrade --stack (roll the controller to the release the line names)");
+        }
+        if unlisted {
+            remedy.push("root code no release lists: roll to a published release or rc (noo upgrade --all)");
+        }
+        return Some(fail(NAME, format!("{}; {detail}", said.join("; ")), remedy.join("; ")));
+    }
+    if !inactive.is_empty() {
+        return Some(warn(NAME, detail, Some("noo upgrade --all — the first roll installs the checking applier on the signing key alone; from then on root code needs the release key".to_string())));
+    }
+    Some(ok(NAME, detail))
+}
+
+/// The refusal line in an apply report: from its last `REFUSED` through the
+/// `(75)` that ends it (the Linux report is the applier's log tail with line
+/// breaks folded to spaces; the Mac's is the error itself).
+fn refusal_line(msg: &str) -> String {
+    let Some(at) = msg.rfind("REFUSED") else { return msg.trim().to_string() };
+    let rest = &msg[at..];
+    let end = rest.find("(75)").map(|i| i + 4).unwrap_or(rest.len());
+    rest[..end].trim().to_string()
+}
+
+/// The `vendor CLIs` row (i908): a vendor CLI (Claude Code, Copilot CLI,
+/// Codex) is third-party, so no noomesh release lists it. It installs
+/// root-owned under /usr/local/bin with only the sha256 the controller
+/// pinned (config/harness-kinds.json) behind it — self-attested by the
+/// bundle, not release-signed. Said plainly, naming the nodes that carry
+/// one; no row when none does.
+pub(crate) fn vendor_cli_row(reports: &[(String, Option<i64>, String)]) -> Option<Check> {
+    let carriers: Vec<&str> = reports
+        .iter()
+        .filter(|(_, _, msg)| msg.split_whitespace().any(|t| t.starts_with("vendor-cli")))
+        .map(|(node, _, _)| node.as_str())
+        .collect();
+    if carriers.is_empty() {
+        return None;
+    }
+    Some(ok("vendor CLIs", format!(
+        "self-attested, not release-signed: {} carr{} a third-party CLI checked only against the sha256 this controller pinned (config/harness-kinds.json)",
+        carriers.join(", "), if carriers.len() == 1 { "ies" } else { "y" })))
+}
+
 /// A Mac whose last apply report says root REFUSED to install its CLI or
 /// helper (`… root-refused: noo-cli,noo-hostd`, node_fetch.rs
 /// `apply_report_msg`): the directory was not root's alone, typically a
@@ -7931,10 +8202,12 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // `cluster.postgres_memory` (unset = standard): the sizes asked for,
         // and "recreate needed" while the running postgres has others.
         checks.push(pg_memory::live(&root));
-        // HF_CACHE_DIR/hub owned like HF_CACHE_DIR: a fresh controller's
+        // <HF cache>/hub owned like the HF cache: a fresh controller's
         // storage step made it 0:0 before prep-host created noo-agent; the
-        // self-node's applier re-owns it (noo-apply.sh hf_hub_reown).
-        checks.push(hf_hub::live());
+        // self-node's applier re-owns it (noo-apply.sh hf_hub_reown). The
+        // cache judged is the self-node AGENT's (its heartbeat in `fleet`),
+        // plus the compose cache's own row when that is another directory.
+        checks.extend(hf_hub::live(Some(&Value::Array(fleet.clone()))));
         // One "<name> at rest" row per directory that holds state in the
         // clear (`at_rest_dirs`): the process env is what the launcher
         // resolved from `.env`, so the paths are the ones compose bound.
@@ -8096,6 +8369,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(with_node_root_refusals(with_node_anchors(with_retired_apply_lanes_and_adoption(
             legacy_lanes_check(metrics.as_deref(), &fleet, now), &apply_reports, &unadopted), &apply_reports, expected), &apply_reports));
         checks.extend(harness_systemd_check(&apply_reports));
+        checks.extend(agent_protect_check(&apply_reports));
+        checks.extend(release_check_row(&apply_reports));
+        checks.extend(vendor_cli_row(&apply_reports));
         let anonymous = crate::http::get_raw_opt(g, &format!("{LOGS_QUERY_ROUTE}?query=%7Bnode%3D%22verify%22%7D&limit=1"), false, 10)
             .map(|(status, _)| status);
         checks.push(logs_access_check(anonymous));
@@ -12045,6 +12321,22 @@ mod tests {
         assert_eq!(stunnel_image_check(&serde_json::json!({"id": "x", "stunnel_image": "weird"})).unwrap().verdict, Verdict::Warn);
     }
 
+    #[test]
+    fn a_backend_kept_across_a_tag_only_roll_is_not_reported_stale() {
+        // Proposal i935: the agent no longer recreates a backend whose image
+        // digest the new lock pins unchanged, so it keeps running under the
+        // previous release's TAG. Every node row reads digests or floating-
+        // ness, never the tag against the release: this pins that the row
+        // stays OK for such a container.
+        let n = serde_json::json!({"id": "robopi", "backend_containers": {"ollama": {
+            "container": "noo-ollama",
+            "image": "ghcr.io/noomesh/ollama:v0.6.26@sha256:dd46912abd4946a5c580c4a85883a559736b48f6f2c4e24162b77b307b74ea9f",
+            "image_floating": false}}});
+        let c = backend_images_check(&n);
+        assert_eq!(c.verdict, Verdict::Ok, "{c:?}");
+        assert!(c.detail.contains("ollama ghcr.io/noomesh/ollama:v0.6.26@sha256:dd46"), "{c:?}");
+    }
+
     /// A backend container created from a floating ref FAILs, naming it; a
     /// pinned or versioned one is OK; an agent that does not report is WARN;
     /// a native Mac ollama has no image and is not judged.
@@ -12816,6 +13108,81 @@ mod tests {
         assert_eq!(c.verdict, Verdict::Warn);
         assert!(c.detail.contains("host6 (systemd 245)") && !c.detail.contains("host7"), "{}", c.detail);
         assert!(c.remedy.as_deref().is_some_and(|r| r.contains("noo cluster provision host6")), "{:?}", c.remedy);
+    }
+
+    /// proposal 61 phase 0b: the agent protect row reads each node's last
+    /// apply report. Held = OK with the writable-path count (a written and an
+    /// unchanged hold alike); a refusal anywhere = FAIL naming the node and
+    /// key, with the set-config remedy; no tag anywhere (a Mac) = no row.
+    #[test]
+    fn the_agent_protect_row_reads_held_refused_and_absent() {
+        let mac = ("mac1".to_string(), Some(0), "applied: agent-env verified-by: signing-key".to_string());
+        assert!(agent_protect_check(std::slice::from_ref(&mac)).is_none(), "no systemd: no row");
+        let held = [
+            ("host6".to_string(), Some(0), "applied: agent-env agent-protect=8 verified-by: signing-key".to_string()),
+            ("host7".to_string(), Some(0), "applied: agent-env=unchanged agent-protect=unchanged:7".to_string()),
+            mac.clone(),
+        ];
+        let c = agent_protect_check(&held).expect("a held node is a row");
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("host6 (8 writable paths)") && c.detail.contains("host7 (7 writable paths)"), "{}", c.detail);
+        assert!(!c.detail.contains("mac1"), "{}", c.detail);
+        let refused = [
+            held[0].clone(),
+            ("host8".to_string(), Some(0), "applied: agent-env agent-protect=REFUSED:NOO_DATA_ROOT".to_string()),
+        ];
+        let c = agent_protect_check(&refused).expect("a refusal is a row");
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("host8 (NOO_DATA_ROOT)"), "{}", c.detail);
+        assert!(c.remedy.as_deref().is_some_and(|r| r.contains("noo cluster set-config host8 --data-root <path>")), "{:?}", c.remedy);
+    }
+
+    /// i908: the release check row reads each node's last apply report.
+    #[test]
+    fn the_release_check_row_names_active_inactive_and_refusing_nodes() {
+        assert!(release_check_row(&[]).is_none());
+        let on = "applied: agent-env\nrelease-check: generation=2 release=0.6.27 stack=v0.6.27\nbinary-sha: agent-binary=ab".to_string();
+        let mac = "applied v release-check: generation=2 release=0.6.27".to_string();
+        let c = release_check_row(&[("host3".into(), Some(0), on.clone()), ("host6".into(), Some(0), mac)]).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.contains("host3 (floor 0.6.27)") && c.detail.contains("host6 (floor 0.6.27)"), "{}", c.detail);
+        let old = "applied: agent-env\nbinary-sha: agent-binary=ab".to_string();
+        let c = release_check_row(&[("host3".into(), Some(0), on.clone()), ("host7".into(), Some(0), old)]).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("NOT yet on host7") && !c.detail.contains("NOT yet on host3"), "{}", c.detail);
+        let gen1 = "release-check: generation=1 release=none".to_string();
+        assert_eq!(release_check_row(&[("host8".into(), Some(0), gen1)]).unwrap().verdict, Verdict::Warn);
+        let refused = "noo-fetch: x noo-apply: REFUSED hostd-binary — sha256 ab is not in release 0.6.27's signed list; roll to a published release or rc (75) more".to_string();
+        let c = release_check_row(&[("host3".into(), Some(0), on.clone()), ("host9".into(), Some(75), refused)]).unwrap();
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("host9 refused its last bundle (REFUSED hostd-binary — sha256 ab is not in release 0.6.27's signed list; \
+            roll to a published release or rc (75)): a refused node refuses ALL bundles from this controller, cert pushes included, until the cause is fixed"), "{}", c.detail);
+        let r = c.remedy.clone().unwrap();
+        assert!(r.contains("roll to a published release or rc") && !r.contains("--stack"), "{r}");
+    }
+
+    /// i940: a node ahead of its controller fails the row ON THE CONTROLLER,
+    /// with the stack roll as the remedy.
+    #[test]
+    fn a_node_ahead_of_its_controller_fails_the_release_check_row() {
+        let line = "REFUSED release 0.6.27 — this node is ahead of its controller (it applied 0.6.29 after 0.6.28; the controller staged 0.6.27): \
+                    roll the controller to 0.6.28 or later (noo upgrade --stack), then this node takes its bundles again (75)";
+        let c = release_check_row(&[("host5".into(), Some(75), format!("noo-apply: {line}"))]).unwrap();
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains(&format!("host5 refused its last bundle ({line}): a refused node refuses ALL bundles")), "{}", c.detail);
+        let r = c.remedy.unwrap();
+        assert!(r.contains("noo upgrade --stack") && !r.contains("published release"), "{r}");
+    }
+
+    #[test]
+    fn the_vendor_cli_row_says_self_attested_and_names_the_nodes() {
+        assert!(vendor_cli_row(&[("host3".into(), Some(0), "applied: agent-env".into())]).is_none());
+        let c = vendor_cli_row(&[
+            ("host3".into(), Some(0), "applied: agent-env vendor-cli=unchanged".into()),
+            ("host4".into(), Some(0), "applied: agent-env".into()),
+        ]).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("self-attested, not release-signed: host3 carries") && !c.detail.contains("host4"), "{}", c.detail);
     }
 
     #[test]
@@ -14649,13 +15016,14 @@ mod vantage_tests {
 
     /// Every row the controller half writes from THIS machine's files and
     /// containers (the rows an outside run on a node turned red).
-    const CONTROLLER_ONLY_ROWS: [&str; 35] = [
+    const CONTROLLER_ONLY_ROWS: [&str; 36] = [
         "self-agent lane", "model cache", "loki", "tempo", "grafana door", "audit key", "secrets at rest",
         "shared secrets", "secrets audit", "grafana sso", "gateway pki view", "loki listener", "tempo listener",
         "sandbox listener", "backend tls", "nats tls", "nats principals", "postgres hba", "postgres role identity",
         "postgres tls", "sandbox executor", "data directories", "data root filesystem", "monitoring web config",
         "secrets not in env", "node-agent privilege", "callers", "tailnet policy", "last backup", "off-site backup",
         "pki at rest", "image retention", "stack images", "postgres memory", "hf-cache hub owner",
+        "controller hf-cache hub owner",
     ];
 
     #[test]
@@ -14966,14 +15334,19 @@ mod netns_restore_row_tests {
 
     #[test]
     fn the_row_shows_whether_the_unit_runs_after_every_dockerd_start() {
-        assert_eq!(netns_restore_row(true, Ok(State::Current)).verdict, Verdict::Ok);
-        for s in [Ok(State::Missing), Ok(State::Stale), Ok(State::Disabled), Err("not a usable install path for the unit: \"x\"".to_string())] {
-            let c = netns_restore_row(true, s.clone());
-            assert_eq!(c.verdict, Verdict::Warn, "{s:?}");
-            assert_eq!(c.remedy.as_deref(), Some(crate::netns_unit::REMEDY), "{s:?}");
-            assert!(c.detail.contains("noo-ollama-embed"), "{}", c.detail);
+        use crate::netns_unit::{OLD_APPLIER_REMEDY, STAGE_REMEDY, SUDO_REMEDY};
+        for remedy in [STAGE_REMEDY, OLD_APPLIER_REMEDY, SUDO_REMEDY] {
+            for s in [Ok(State::Missing), Ok(State::Stale), Ok(State::Disabled), Err("not a usable install path for the unit: \"x\"".to_string())] {
+                let c = netns_restore_row(true, s.clone(), remedy);
+                assert_eq!(c.verdict, Verdict::Warn, "{s:?}");
+                assert_eq!(c.remedy.as_deref(), Some(remedy), "{s:?}");
+                assert!(c.detail.contains("noo-ollama-embed"), "{}", c.detail);
+            }
         }
-        let c = netns_restore_row(false, Err(String::new()));
+        // i907 step 1b: only the no-applier remedy names sudo.
+        assert!(STAGE_REMEDY.contains("no sudo") && OLD_APPLIER_REMEDY.contains("no sudo") && SUDO_REMEDY.contains("sudo asks once"));
+        assert_eq!(netns_restore_row(true, Ok(State::Current), STAGE_REMEDY).verdict, Verdict::Ok);
+        let c = netns_restore_row(false, Err(String::new()), STAGE_REMEDY);
         assert_eq!(c.verdict, Verdict::Ok);
         assert!(c.detail.contains("no systemd") && c.detail.contains("not covered"), "{}", c.detail);
     }
@@ -14985,7 +15358,7 @@ mod netns_restore_row_tests {
     fn a_refused_root_install_says_which_path_and_how_to_fix_it() {
         use crate::netns_unit::{ROOT_REFUSAL, ROOT_REMEDY};
         let why = format!("{ROOT_REFUSAL}: /home/alex/.noo/scripts/noo-netns-restore.sh belongs to uid 1000, not root");
-        let c = netns_restore_row(true, Err(why));
+        let c = netns_restore_row(true, Err(why), crate::netns_unit::STAGE_REMEDY);
         assert_eq!(c.verdict, Verdict::Warn);
         assert!(c.detail.contains("cannot be installed") && c.detail.contains("belongs to uid 1000, not root"), "{}", c.detail);
         assert_eq!(c.remedy.as_deref(), Some(ROOT_REMEDY));
@@ -15401,5 +15774,128 @@ mod cpu_only_ollama_slots_tests {
         let compose = include_str!("../../../docker-compose.cluster.yml");
         assert!(compose.contains("\n  ollama-embed:\n"), "the service the remedy restarts");
         assert!(compose.contains("OLLAMA_NUM_PARALLEL=${OLLAMA_EMBED_NUM_PARALLEL:-4}"), "the key the row reads is the one compose reads");
+    }
+}
+
+#[cfg(test)]
+mod model_stores_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// An agent that does not report the field gives no row.
+    #[test]
+    fn no_row_from_an_agent_that_does_not_report_stores() {
+        assert!(model_stores_check("n1", &json!({"data_roots": {"noo_data_root": "/var/lib/noo"}})).is_none());
+        assert!(model_stores_check("n1", &json!({})).is_none());
+    }
+
+    /// Nothing world-writable is OK, with the count the agent checked.
+    #[test]
+    fn a_node_with_no_world_writable_store_is_ok() {
+        let c = model_stores_check("n1", &json!({"data_roots": {"stores": {"checked": 7, "world_writable": []}}})).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("7 store directories checked"), "{}", c.detail);
+    }
+
+    /// Each world-writable store is a WARN naming its path, mode, owner, the
+    /// exact chmod, and what its loads are protected by.
+    #[test]
+    fn a_world_writable_store_warns_with_the_path_the_chmod_and_its_protection() {
+        let n = json!({"data_roots": {"stores": {"checked": 9, "world_writable": [
+            {"path": "/data/noo/hf-cache", "store": "hf_cache", "mode": "0777", "uid": 1000, "gid": 1000},
+            {"path": "/data/noo/ollama", "store": "ollama", "mode": "0777", "uid": 1000, "gid": 1000},
+        ]}}});
+        let c = model_stores_check("awolf", &n).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        for want in ["2 world-writable", "/data/noo/hf-cache (mode 0777, owner 1000:1000",
+            "HF weights are verified against the controller's manifest at each backend start, on a placed node only", "/data/noo/ollama",
+            "Ollama models are checked against the controller's record about every 10 minutes"] {
+            assert!(c.detail.contains(want), "{want}: {}", c.detail);
+        }
+        let r = c.remedy.unwrap();
+        assert!(r.starts_with("on awolf: sudo chmod o-w /data/noo/hf-cache && sudo chmod o-w /data/noo/ollama"), "{r}");
+        assert!(r.contains("noo models pull"), "{r}");
+    }
+
+    /// The row is part of every node's checks.
+    #[test]
+    fn a_refused_agent_url_is_a_failed_agent_address_row() {
+        let n = json!({"node_id": "n1", "ip_address": "100.64.0.5", "agent_url_refused": "its host is not the node's registered address"});
+        let c = agent_address_check("n1", &n).expect("a refusal is a row");
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("n1") && c.detail.contains("its host is not the node's registered address") && c.detail.contains("https://100.64.0.5:8081"), "{}", c.detail);
+        assert!(agent_address_check("n1", &json!({"ip_address": "100.64.0.5"})).is_none(), "nothing refused, no row");
+    }
+
+    #[test]
+    fn node_checks_carry_the_model_stores_row() {
+        let n = json!({"id": "n1", "status": "online",
+            "data_roots": {"stores": {"checked": 4, "world_writable": [{"path": "/var/lib/noo/models", "store": "models", "mode": "0777"}]}}});
+        let c = node_checks(&n, "", "", 0, None);
+        let row = c.iter().find(|c| c.name == "model stores").expect("a model stores row");
+        assert_eq!(row.verdict, Verdict::Warn);
+        assert!(row.detail.contains("GGUF files are hashed against the controller's manifest at each start on a placed node, only when it has one"), "{}", row.detail);
+    }
+
+    #[test]
+    fn node_checks_carry_the_agent_address_row() {
+        let n = json!({"id": "n1", "status": "online", "ip_address": "100.64.0.5", "agent_url_refused": "it is not https"});
+        let c = node_checks(&n, "", "", 0, None);
+        let row = c.iter().find(|c| c.name == "agent address").expect("an agent address row");
+        assert_eq!(row.verdict, Verdict::Fail);
+    }
+}
+
+#[cfg(test)]
+mod ollama_models_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn no_row_without_the_field_or_with_no_models() {
+        assert!(ollama_models_check("n", &json!({})).is_none());
+        assert!(ollama_models_check("n", &json!({"ollama_verify": []})).is_none());
+    }
+
+    #[test]
+    fn verified_models_are_ok_and_show_the_weight_digest() {
+        let n = json!({"ollama_verify": [{"model": "harrier", "state": "verified", "anchor": "gguf",
+            "model_layer": "sha256:5f26506ab57fd817ce4a8b9d24946a60d40bc76d82a2defa7cd754ae01e9de80"}]});
+        let c = ollama_models_check("pop-os", &n).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("harrier (gguf anchor, weights sha256:5f26506ab57f…)"), "{}", c.detail);
+    }
+
+    /// A hand pull is a WARN whose remedy re-pulls through noo, never a refusal.
+    #[test]
+    fn a_hand_pull_warns_with_the_re_pull_remedy_and_is_never_a_fail() {
+        let n = json!({"ollama_verify": [{"model": "gemma4:e4b-it-qat", "state": "unverified", "anchor": "none",
+            "reason": "no controller record"}]});
+        let c = ollama_models_check("mcmini", &n).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("gemma4:e4b-it-qat: unverified (no controller record)"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("on mcmini: noo models pull gemma4:e4b-it-qat"));
+    }
+
+    /// A refused model is a FAIL naming the blob (in the reason) and the remedy.
+    #[test]
+    fn a_refused_model_fails_naming_the_reason_and_the_remedy() {
+        let n = json!({"ollama_verify": [
+            {"model": "harrier", "state": "refused", "anchor": "gguf",
+             "reason": "the local model layer is sha256:aaaa, the controller's harrier-Q4_K_M.gguf is sha256:5f26"},
+            {"model": "llama3", "state": "verified", "anchor": "mirror"}]});
+        let c = ollama_models_check("robopi", &n).unwrap();
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("harrier: the local model layer is sha256:aaaa"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("on robopi: noo models pull harrier"));
+    }
+
+    /// Native Ollama reports a mismatch without repairing it: a WARN.
+    #[test]
+    fn a_native_mismatch_is_a_warn_that_says_it_was_not_repaired() {
+        let n = json!({"ollama_verify": [{"model": "harrier", "state": "mismatch", "anchor": "gguf", "reason": "blob bad"}]});
+        let c = ollama_models_check("mcmini", &n).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("not repaired here"), "{}", c.detail);
     }
 }

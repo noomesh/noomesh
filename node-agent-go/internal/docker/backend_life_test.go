@@ -114,7 +114,7 @@ func TestStunnelBackendKey(t *testing.T) {
 	}
 }
 
-// A container an older agent created from `vllm/vllm-openai:latest` (awolf,
+// A container an older agent created from `vllm/vllm-openai:latest` (node-a,
 // 2026-10-20, before the floating-ref refusal) is reported as floating; a
 // pinned, versioned or rail-own ref is not.
 func TestImageFactsFlagsAFloatingThirdPartyRef(t *testing.T) {

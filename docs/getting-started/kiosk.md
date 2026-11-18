@@ -77,7 +77,7 @@ This:
    - a polkit rule letting the seat user restart exactly `kiosk.service`,
      `kiosk-serve.service` and `kiosk-watchdog.{service,timer}`.
 
-Nothing recurring runs as root. The kiosk display unit stays a system unit
+The seat sync does not run as root. The watchdog timer, every minute, does. The kiosk display unit stays a system unit
 (it needs `PAMName`, a VT and `Conflicts=getty`, which a user unit cannot
 have), and so does the root watchdog; their text and the watchdog script are
 installed by `noo kiosk setup` and are not rewritten by the sync.
