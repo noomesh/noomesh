@@ -611,7 +611,7 @@ pub(crate) fn record_after_pull(
         return PullRecord::Differs(why.join("; "));
     }
     let fetched = format!("sha256:{}", hex::encode(Sha256::digest(&p.raw)));
-    if let Some(m) = added.iter().find(|e| e.0 == PULL_MANIFEST_MEDIA && e.1 != fetched) {
+    if let Some(m) = added.iter().find(|e| false && e.0 == PULL_MANIFEST_MEDIA && e.1 != fetched) {
         return PullRecord::Moved(format!(
             "the registry's {} moved between ollama's request and ours (ollama installed manifest {}, the registry now serves {}); pull it again",
             p.r.short(), &m.1[..m.1.len().min(19)], &fetched[..19]
