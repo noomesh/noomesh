@@ -277,6 +277,19 @@ if [ "${EXPECT:-}" = refusal ]; then
     finish
 fi
 
+# The ci onboard steps below pass `--root-ok`, which this harness (dev) has and
+# a release cut before it does not (0.6.26: every ci cell failed at onboard,
+# run 44259137054). The installed CLI's own `noo onboard --help` says whether
+# it has the flag; without it the cell is NOT RUN, with the reason and the fix,
+# instead of a FAIL that reads as a product failure in every cell.
+if [ "$ONBOARD" != interactive ] && ! noo onboard --help 2>&1 | grep -q -- '--root-ok'; then
+    meta limits "harness newer than the installed CLI ($(noo --version 2>/dev/null | head -1)): its onboard has no --root-ok, which these ci steps pass; dispatch with cli_tag=<a release that has it> (0.6.27-rc.1 or later)"
+    meta not_run "the installed CLI predates the harness's onboard flags (--root-ok)"
+    echo "::notice::$CELL: the installed CLI has no onboard --root-ok; this harness needs a newer cli_tag: not run"
+    teardown
+    finish
+fi
+
 if [ "$ONBOARD" = interactive ]; then
     hook onboard-interactive.sh || fail_onboarded
 elif [ "$MODEL" = tiny ]; then
