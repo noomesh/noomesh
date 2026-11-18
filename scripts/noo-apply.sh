@@ -536,6 +536,14 @@ release_floor_of() {
 release_names_for() {
     awk -v s="$2" 'NF >= 2 && tolower($1) == s { n = $2; sub(/^\*/, "", n); sub(/.*\//, "", n); print n }' "$1"
 }
+# release_refuse_ahead KEY V F P NEED — the staged release is older than this
+# node's record allows: the node is AHEAD of its controller (i940). One line,
+# the same words as noo-cli release_gate::ahead_line, exit 75.
+release_refuse_ahead() {
+    echo "noo-apply: REFUSED $1 $2 — this node is ahead of its controller (it applied $3${4:+ after $4}; the controller staged $2): roll the controller to $5 or later (noo upgrade --stack), then this node takes its bundles again (75)" >&2
+    logger -t noo-apply "REFUSED release check: $1 $2 — node ahead of its controller ($3${4:+ after $4})" 2>/dev/null || true
+    exit 75
+}
 # release_floor_check WHAT VALUE KEY — the one-step-back rule for KEY
 # (`release` or `stack`). The record keeps the last two FINALS applied:
 # KEY-final (newest) and KEY-prev (the one before). A final is accepted when it
@@ -553,11 +561,11 @@ release_floor_check() {
     case "$2" in
         *-rc.*)
             if release_older "${2%-rc.*}" "$_rf_f"; then
-                release_refuse "$1" "it is an rc of a release older than the current final $3 $_rf_f; a node takes an rc of the current or a later release only"
+                release_refuse_ahead "$3" "$2" "$_rf_f" "$_rf_p" "$_rf_f"
             fi ;;
         *)
             if release_older "$2" "${_rf_p:-$_rf_f}"; then
-                release_refuse "$1" "this node applied $3 $_rf_f${_rf_p:+ after $_rf_p}; it steps back at most one final, never to $2"
+                release_refuse_ahead "$3" "$2" "$_rf_f" "$_rf_p" "${_rf_p:-$_rf_f}"
             fi ;;
     esac
     return 0
@@ -3062,6 +3070,6 @@ esac
 # END report_installed_binaries
 # The release check's state (i908), for `noo cluster verify`'s `release check`
 # row: this applier's generation and the floor it now holds.
-echo "release-check: generation=$NOO_APPLY_GENERATION release=$(release_floor_of release-final | grep . || echo none) release-prev=$(release_floor_of release-prev | grep . || echo none) stack=$(release_floor_of stack-final | grep . || echo none) verifier=${RELEASE_VERIFIER:-none}"
+echo "release-check: generation=$NOO_APPLY_GENERATION release=$(release_floor_of release-final | grep . || echo none) release-prev=$(release_floor_of release-prev | grep . || echo none) stack=$(release_floor_of stack-final | grep . || echo none) stack-prev=$(release_floor_of stack-prev | grep . || echo none) verifier=${RELEASE_VERIFIER:-none}"
 # Last line of the apply, so the fetcher's tail of this log always carries it.
 [ -z "$binary_shas" ] || echo "binary-sha:$binary_shas"

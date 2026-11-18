@@ -1689,6 +1689,11 @@ pub(crate) fn deliver_kind_to_nodes_then(
             // i908: the applier and hostd are root code; the node installs
             // them only with the release's signed list beside them.
             if kind == "applier" || kind == "hostd-binary" {
+                // i940: a node ahead of this controller would refuse it.
+                let msg = crate::commands::provision::reported_apply_msg(g, node);
+                if let Some(why) = crate::commands::provision::node_floor_refusal(&msg, env!("CARGO_PKG_VERSION"), None) {
+                    return Err(why);
+                }
                 let proof = crate::commands::provision::release_proof_for(g, &files)?;
                 files.extend(proof);
             }
