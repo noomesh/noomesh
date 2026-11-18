@@ -2710,17 +2710,21 @@ pub(crate) fn netns_unit_needs_install(systemd: bool, state: crate::netns_unit::
 
 /// The stack stage (`noo upgrade --stack` and `--all`), on the controller this
 /// command runs on, never a remote node: install or refresh
-/// noo-netns-restore.service, which installs onboarded before rc.3 lack. On a
-/// terminal sudo may ask once, with the reason on the line above; off a
-/// terminal `sudo -n`, and a refusal is a warning naming the one command.
-/// Never fails the roll; `noo cluster verify` shows the `netns restore` row.
+/// noo-netns-restore.service, which installs onboarded before rc.3 lack.
+/// i907 step 1b: the controller's self-node applier installs it (the
+/// `netns-unit` kind, staged here, no sudo). An applier that predates the
+/// kind is named, never sudo'd around. Only a controller with no applier
+/// keeps the one stated sudo, under `root_step`'s rule (a terminal, or
+/// already root; never unattended). Never fails the roll; `noo cluster
+/// verify` shows the `netns restore` row.
 fn reconcile_netns_unit(g: &Globals, root: &std::path::Path) {
     use crate::netns_unit as nu;
     let systemd = nu::systemd_here();
     if !systemd {
         return;
     }
-    let unit = match nu::render_here(&root.display().to_string()) {
+    let root_s = root.display().to_string();
+    let unit = match nu::render_here(&root_s) {
         Ok(u) => u,
         Err(e) => {
             if !g.json { ui::warned(&format!("{} not installed: {e}", nu::UNIT_NAME)); }
@@ -2732,16 +2736,51 @@ fn reconcile_netns_unit(g: &Globals, root: &std::path::Path) {
     }
     // SAFETY: isatty has no preconditions.
     let tty = !g.json && unsafe { libc::isatty(0) } == 1;
-    if tty {
-        ui::step(&format!("installing {}: it starts the containers that join another's network after every dockerd start (sudo may ask)", nu::UNIT_NAME));
-    }
-    match nu::install(tty, &unit) {
-        Ok(()) => { if !g.json { ui::done(&format!("{} installed and enabled", nu::UNIT_NAME)); } }
-        Err(e) => {
+    let owner = nu::owner();
+    let node = crate::commands::provision::self_node_name();
+    let lose = "after a reboot or a dockerd restart, a container that joins another's network (noo-ollama-embed) can stay down";
+    match nu::route(owner == "root", nu::applier_here(), node.is_some(), tty, false) {
+        nu::Route::Stage => {
+            let node = node.unwrap_or_default();
             if !g.json {
-                ui::warned(&format!("{} not installed ({e}): after a reboot or a dockerd restart, a container that joins another's network (noo-ollama-embed) can stay down", nu::UNIT_NAME));
-                ui::guide(&[(nu::REMEDY, "run it in a terminal: sudo asks once and the stack stage installs the unit")]);
+                ui::step(&format!("installing {}: staged to the self-node {node}, whose applier installs it (no sudo)", nu::UNIT_NAME));
             }
+            match nu::stage_to_self_node(g, &node, &owner, &root_s) {
+                Ok(()) if nu::state(&unit) == nu::State::Current => {
+                    if !g.json { ui::done(&format!("{} installed and enabled by the self-node's applier", nu::UNIT_NAME)); }
+                }
+                Ok(()) => {
+                    if !g.json { ui::warned(&format!("{} applied by the self-node but not current here: {lose}", nu::UNIT_NAME)); }
+                }
+                Err(e) => {
+                    if !g.json { ui::warned(&format!("{} not installed ({e}): {lose}", nu::UNIT_NAME)); }
+                }
+            }
+        }
+        nu::Route::OldApplier(generation) => {
+            if !g.json {
+                ui::warned(&format!(
+                    "{} not installed: the self-node's applier (generation {generation}) predates the netns-unit kind, so no sudo is run for it: {lose}",
+                    nu::UNIT_NAME));
+                ui::guide(&[(nu::OLD_APPLIER_REMEDY, "the self-node's applier installs it, nothing asks for a password")]);
+            }
+        }
+        nu::Route::Sudo => {
+            if tty {
+                ui::step(&format!("installing {}: it starts the containers that join another's network after every dockerd start (this controller has no self-node applier; sudo may ask)", nu::UNIT_NAME));
+            }
+            match nu::install(tty, &unit) {
+                Ok(()) => { if !g.json { ui::done(&format!("{} installed and enabled", nu::UNIT_NAME)); } }
+                Err(e) => {
+                    if !g.json {
+                        ui::warned(&format!("{} not installed ({e}): {lose}", nu::UNIT_NAME));
+                        ui::guide(&[(nu::SUDO_REMEDY, "sudo asks once and the stack stage installs the unit")]);
+                    }
+                }
+            }
+        }
+        nu::Route::Stated(why) => {
+            if !g.json { ui::warned(&format!("{why}: {lose}")); }
         }
     }
 }

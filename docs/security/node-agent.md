@@ -1595,7 +1595,18 @@ check. Both need the operator at the machine:
 | `agent-binary` (Linux) | the stack's `stack-<tag>.lock` | `# node-agent-sha256 linux/<arch> <sha256>` |
 | Mac `cli-binary`, `hostd-binary`, `agent-binary`, `harness-binary` | the CLI release's `sha256sums.txt` | `noo-*-apple-darwin` |
 | Mac `agent-plist`, `harness-plist` | this release's own template for this node's user (never root) | — |
+| `netns-unit` (the controller's self node) | nothing: it carries only `user=` and `root=`; the applier renders `noo-netns-restore.service` from its own template, never with `User=root` | — |
 
+- **The netns restore unit needs no sudo on a roll.** When `noo upgrade`
+  finds `noo-netns-restore.service` missing or stale on a controller, it stages
+  the `netns-unit` kind to the self node. That node's applier checks the two
+  values (the owner is a real account other than root and owns the install
+  and its `scripts/noo-netns-restore.sh`), renders the unit, and installs and
+  enables it. A bad value refuses the kind and leaves the unit as it was. If
+  the self node's applier is older than the kind, nothing runs and
+  `noo cluster verify` names the roll that fixes it. A controller with no self
+  node, or a root install, keeps one stated sudo: run at a terminal or as
+  root, never unattended.
 - **The lists ride in the bundle.** `noo cluster provision` attaches
   `sha256sums.txt` and its signature, the version text it names, and (with a
   Linux agent) the stack lock and its signature. It checks them first with the
