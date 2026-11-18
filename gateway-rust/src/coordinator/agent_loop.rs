@@ -1829,6 +1829,8 @@ async fn judge_call<R: HarnessRuntime>(rt: &R, usage: &mut UsageStats, backend: 
     let read = crate::chat_context::read_call(ctx, sent_estimate, evaluated, calib);
     match read {
         crate::chat_context::CallRead::Cut if ollama => {
+            // the ratio that let this prompt be sent is suspect: back to untrusted
+            crate::chat_context::forget(&backend.url, &backend.model);
             note_backend_cut(rt, usage, backend, Truncation { sent_estimate, evaluated, context: ctx }).await;
         }
         crate::chat_context::CallRead::OnTheLine if ollama => {
