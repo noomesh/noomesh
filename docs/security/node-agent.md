@@ -1575,8 +1575,11 @@ as it was and the applier's line says `agent-protect=REFUSED:<KEY>`.
 `noo cluster verify` shows the hold as the `agent protect` row, from each
 node's last apply: OK names every held node and how many paths it leaves
 writable; a refusal is a FAIL naming the node and the setting, with the
-`noo cluster set-config` that fixes it. A host without systemd (a Mac) has no
-hold and no row.
+`noo cluster set-config` that fixes it. Any other node with no hold report is
+a WARN naming it: a fresh controller's own agent is installed by `noo onboard`
+outside the applier and is not held until its first rail apply
+(`noo cluster provision <self> --wait`). A Mac (no systemd) owes no hold and
+is not listed; a Mac-only fleet has no row.
 
 ## Root code comes from a release
 

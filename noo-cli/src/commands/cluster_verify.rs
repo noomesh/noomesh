@@ -5704,7 +5704,9 @@ pub(crate) fn harness_systemd_check(reports: &[(String, Option<i64>, String)]) -
 /// What the Linux applier writes on its `applied:` line for the node agent's
 /// filesystem hold (scripts/noo-apply.sh, agent_protect): `agent-protect=N`
 /// or `agent-protect=unchanged:N` (N writable paths), or
-/// `agent-protect=REFUSED:<KEY>`. No tag at all on a host without systemd.
+/// `agent-protect=REFUSED:<KEY>`. No tag at all when the applier did not
+/// hold the agent: a Mac (no systemd), an applier older than the hold, or a
+/// node agent installed outside the applier (onboard's first install).
 pub(crate) const AGENT_PROTECT_TAG: &str = "agent-protect=";
 
 /// The remedy for a refused hold: the key names which setting to fix.
@@ -5726,12 +5728,19 @@ fn agent_protect_remedy(node: &str, key: &str) -> String {
 
 /// The `agent protect` row (proposal 61 phase 0b): from each node's last
 /// apply report, whether the node agent's unit is held to the paths it
-/// writes. A refusal on any node is a FAIL naming the node and the key (that
-/// node keeps its previous hold, or none); otherwise OK naming each held node
-/// and how many paths it leaves writable. No row when no node reports a hold
-/// (a Mac or another host without systemd writes no tag).
-pub(crate) fn agent_protect_check(reports: &[(String, Option<i64>, String)]) -> Option<Check> {
+/// writes. `nodes` is every node with whether its noo-hostd reports macOS
+/// (`hostd.host.os == "darwin"`): a Mac has no systemd, so no hold is due.
+///
+/// A refusal on any node is a FAIL naming the node and the key (that node
+/// keeps its previous hold, or none). Otherwise any other node (an unknown OS
+/// counts: absence is never read as "no systemd") whose last report carries
+/// no hold, or that has no report at all, is a WARN naming it: its agent was
+/// installed by onboard (outside the applier) or never applied, and is not
+/// held. Otherwise OK naming each held node and how many paths it leaves
+/// writable. No row only when every node is a Mac (or there are none).
+pub(crate) fn agent_protect_check(nodes: &[(String, bool)], reports: &[(String, Option<i64>, String)]) -> Option<Check> {
     let mut held: Vec<String> = Vec::new();
+    let mut held_nodes: Vec<&str> = Vec::new();
     let mut refused: Vec<(String, String)> = Vec::new();
     for (node, _, msg) in reports {
         let Some(at) = msg.find(AGENT_PROTECT_TAG) else { continue };
@@ -5742,6 +5751,7 @@ pub(crate) fn agent_protect_check(reports: &[(String, Option<i64>, String)]) -> 
             let n = val.strip_prefix("unchanged:").unwrap_or(val);
             if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
                 held.push(format!("{node} ({n} writable paths)"));
+                held_nodes.push(node.as_str());
             }
         }
     }
@@ -5757,8 +5767,24 @@ pub(crate) fn agent_protect_check(reports: &[(String, Option<i64>, String)]) -> 
             agent_protect_remedy(first, key),
         ));
     }
-    if held.is_empty() {
+    let due: Vec<&str> = nodes.iter().filter(|(_, mac)| !*mac).map(|(n, _)| n.as_str()).collect();
+    if due.is_empty() {
         return None;
+    }
+    let unheld: Vec<&str> = due.iter().copied().filter(|n| !held_nodes.contains(n)).collect();
+    if let Some(first) = unheld.first() {
+        let mut detail = format!(
+            "no hold reported on {} (installed by onboard, or never applied): its node agent is not held to the paths it writes",
+            unheld.join(", ")
+        );
+        if !held.is_empty() {
+            detail.push_str(&format!("; held: {}", held.join(", ")));
+        }
+        return Some(warn(
+            "agent protect",
+            detail,
+            Some(format!("for each node listed: noo cluster provision {first} --wait")),
+        ));
     }
     Some(ok("agent protect", format!("the node agent writes only where it must on {}", held.join(", "))))
 }
@@ -8466,7 +8492,14 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(with_node_root_refusals(with_node_anchors(with_retired_apply_lanes_and_adoption(
             legacy_lanes_check(metrics.as_deref(), &fleet, now), &apply_reports, &unadopted), &apply_reports, expected), &apply_reports));
         checks.extend(harness_systemd_check(&apply_reports));
-        checks.extend(agent_protect_check(&apply_reports));
+        // Every node, and whether it is a Mac (no systemd, so no hold is
+        // due): a node with no bundle row has no report at all, and still
+        // counts.
+        let protect_nodes: Vec<(String, bool)> = fleet
+            .iter()
+            .filter_map(|n| Some((n["id"].as_str()?.to_string(), n["hostd"]["host"]["os"].as_str() == Some("darwin"))))
+            .collect();
+        checks.extend(agent_protect_check(&protect_nodes, &apply_reports));
         checks.extend(release_check_row(&apply_reports));
         checks.extend(vendor_cli_row(&apply_reports));
         let anonymous = crate::http::get_raw_opt(g, &format!("{LOGS_QUERY_ROUTE}?query=%7Bnode%3D%22verify%22%7D&limit=1"), false, 10)
@@ -13210,17 +13243,17 @@ mod tests {
     /// proposal 61 phase 0b: the agent protect row reads each node's last
     /// apply report. Held = OK with the writable-path count (a written and an
     /// unchanged hold alike); a refusal anywhere = FAIL naming the node and
-    /// key, with the set-config remedy; no tag anywhere (a Mac) = no row.
+    /// key, with the set-config remedy; a Mac with no tag is not listed.
     #[test]
     fn the_agent_protect_row_reads_held_refused_and_absent() {
         let mac = ("mac1".to_string(), Some(0), "applied: agent-env verified-by: signing-key".to_string());
-        assert!(agent_protect_check(std::slice::from_ref(&mac)).is_none(), "no systemd: no row");
         let held = [
             ("host6".to_string(), Some(0), "applied: agent-env agent-protect=8 verified-by: signing-key".to_string()),
             ("host7".to_string(), Some(0), "applied: agent-env=unchanged agent-protect=unchanged:7".to_string()),
             mac.clone(),
         ];
-        let c = agent_protect_check(&held).expect("a held node is a row");
+        let nodes = [("host6".to_string(), false), ("host7".to_string(), false), ("mac1".to_string(), true)];
+        let c = agent_protect_check(&nodes, &held).expect("a held node is a row");
         assert_eq!(c.verdict, Verdict::Ok);
         assert!(c.detail.contains("host6 (8 writable paths)") && c.detail.contains("host7 (7 writable paths)"), "{}", c.detail);
         assert!(!c.detail.contains("mac1"), "{}", c.detail);
@@ -13228,10 +13261,83 @@ mod tests {
             held[0].clone(),
             ("host8".to_string(), Some(0), "applied: agent-env agent-protect=REFUSED:NOO_DATA_ROOT".to_string()),
         ];
-        let c = agent_protect_check(&refused).expect("a refusal is a row");
+        let nodes = [("host6".to_string(), false), ("host8".to_string(), false)];
+        let c = agent_protect_check(&nodes, &refused).expect("a refusal is a row");
         assert_eq!(c.verdict, Verdict::Fail);
         assert!(c.detail.contains("host8 (NOO_DATA_ROOT)"), "{}", c.detail);
         assert!(c.remedy.as_deref().is_some_and(|r| r.contains("noo cluster set-config host8 --data-root <path>")), "{:?}", c.remedy);
+    }
+
+    /// A node that is not a Mac with no apply report at all (no bundle row,
+    /// e.g. a controller whose own agent onboard installed outside the
+    /// applier) is not held: WARN naming it, remedy the rail apply.
+    #[test]
+    fn the_agent_protect_row_warns_on_a_node_with_no_report() {
+        let c = agent_protect_check(&[("ctrl".to_string(), false)], &[]).expect("an unheld node is a row");
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("no hold reported on ctrl (installed by onboard, or never applied)"), "{}", c.detail);
+        assert!(c.detail.contains("not held to the paths it writes") && !c.detail.contains("held:"), "{}", c.detail);
+        assert!(c.remedy.as_deref().is_some_and(|r| r.contains("noo cluster provision ctrl --wait")), "{:?}", c.remedy);
+    }
+
+    /// A node that is not a Mac whose last report carries no tag (an applier
+    /// older than the hold) is not held: WARN naming it.
+    #[test]
+    fn the_agent_protect_row_warns_on_a_report_without_the_tag() {
+        let old = [("node_a".to_string(), Some(0), "applied: agent-env verified-by: signing-key".to_string())];
+        let c = agent_protect_check(&[("node_a".to_string(), false)], &old).expect("an untagged node is a row");
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("no hold reported on node_a ("), "{}", c.detail);
+        assert!(c.remedy.as_deref().is_some_and(|r| r.contains("noo cluster provision node_a --wait")), "{:?}", c.remedy);
+    }
+
+    /// A Mac (no systemd) owes no hold: never listed, and a Mac-only fleet
+    /// has no row at all.
+    #[test]
+    fn the_agent_protect_row_skips_a_mac() {
+        assert!(agent_protect_check(&[("mac1".to_string(), true)], &[]).is_none(), "a Mac-only fleet: no row");
+        let reports = [("host6".to_string(), Some(0), "applied: agent-protect=8".to_string())];
+        let c = agent_protect_check(&[("host6".to_string(), false), ("mac1".to_string(), true)], &reports).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(!c.detail.contains("mac1"), "{}", c.detail);
+    }
+
+    /// Held and unheld nodes together: WARN naming the unheld and listing
+    /// the held after them.
+    #[test]
+    fn the_agent_protect_row_names_unheld_and_lists_held() {
+        let reports = [
+            ("host6".to_string(), Some(0), "applied: agent-protect=8".to_string()),
+            ("host7".to_string(), Some(0), "applied: agent-env".to_string()),
+        ];
+        let nodes = [("ctrl".to_string(), false), ("host6".to_string(), false), ("host7".to_string(), false)];
+        let c = agent_protect_check(&nodes, &reports).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.starts_with("no hold reported on ctrl, host7 ("), "{}", c.detail);
+        assert!(c.detail.ends_with("; held: host6 (8 writable paths)"), "{}", c.detail);
+        assert!(c.remedy.as_deref().is_some_and(|r| r.contains("noo cluster provision ctrl --wait")), "{:?}", c.remedy);
+    }
+
+    /// A refusal anywhere stays a FAIL, ahead of any unheld node's WARN.
+    #[test]
+    fn the_agent_protect_row_fails_on_a_refusal_before_warning() {
+        let reports = [("host8".to_string(), Some(0), "applied: agent-protect=REFUSED:MODELS_DIR".to_string())];
+        let nodes = [("ctrl".to_string(), false), ("host8".to_string(), false)];
+        let c = agent_protect_check(&nodes, &reports).unwrap();
+        assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+        assert!(c.detail.contains("REFUSED the node agent's filesystem hold on host8 (MODELS_DIR)") && !c.detail.contains("ctrl"), "{}", c.detail);
+    }
+
+    /// Every node that is not a Mac held: OK, unchanged.
+    #[test]
+    fn the_agent_protect_row_is_ok_when_all_are_held() {
+        let reports = [
+            ("host6".to_string(), Some(0), "applied: agent-protect=8".to_string()),
+            ("host7".to_string(), Some(0), "applied: agent-protect=unchanged:7".to_string()),
+        ];
+        let c = agent_protect_check(&[("host6".to_string(), false), ("host7".to_string(), false)], &reports).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert_eq!(c.detail, "the node agent writes only where it must on host6 (8 writable paths), host7 (7 writable paths)");
     }
 
     /// i908: the release check row reads each node's last apply report.
