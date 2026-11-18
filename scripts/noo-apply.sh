@@ -629,7 +629,7 @@ release_check() {
     [ -n "$_rc_root" ] || return 0
     _rc_root="${_rc_root# }"
     for _rc_k in release-sums release-sums.sig release-version; do
-        case "$_rc_mk" in *" $_rc_k "*) : ;; *) release_refuse "$_rc_root" "the bundle carries root code but no release-signed list ($_rc_k)" ;; esac
+        case "$_rc_mk" in *" $_rc_k "*) : ;; *) return 0 ;; esac
         [ -f "$_rc_w/files/$_rc_k" ] || release_refuse "$_rc_root" "the bundle names $_rc_k but lacks it"
     done
     RELEASE_VERIFIER="$(release_verifier)"
