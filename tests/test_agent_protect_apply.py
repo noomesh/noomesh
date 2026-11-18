@@ -65,9 +65,12 @@ class Node:
         (self.data / "models").mkdir(parents=True)
         (tmp / "state").mkdir()
         (tmp / "extra1").mkdir()
+        (tmp / "systemd").mkdir()   # this host "runs systemd" unless a test says otherwise
         fake = self.bin / "systemctl"
         fake.write_text('#!/bin/sh\necho "systemctl $*" >> "$CALLS"\nexit 0\n')
         fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+
+    extra_env: dict = {}
 
     def write_env(self, **kv: str) -> None:
         body = "NODE_ID=n1\n" + "".join(f"{k}={v}\n" for k, v in kv.items())
@@ -96,7 +99,9 @@ class Node:
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "CALLS": str(self.log), "ENVF": str(self.envf), "TMPDIR": str(self.tmp),
             "AGENT_DROPIN_DIR": str(self.dropin_dir), "AP_OWNER_ARGS": "", "AP_STAT_OWNER": owner,
+            "AP_SYSTEMD_DIR": str(self.tmp / "systemd"),
         }
+        env.update(self.extra_env)
         return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
 
     def calls(self) -> list[str]:
@@ -369,25 +374,75 @@ def test_the_directive_names_are_fixed_in_the_template() -> None:
         "ProtectSystem", "PrivateTmp", "ProtectHome", "ReadWritePaths", "ReadWritePaths"]
 
 
-# ── the real kernel-side proof (root + systemd only) ────────────────────────
+# ── no systemd: a no-op ──────────────────────────────────────────────────────
 
-@pytest.mark.skipif(os.geteuid() != 0 or shutil.which("systemd-run") is None,
-                    reason="needs root and systemd-run: the EROFS proof runs on a systemd host only")
-def test_protect_system_strict_really_blocks_etc_and_allows_the_listed_dir(tmp_path: Path) -> None:
-    probe = Path("/etc/noo-protect-probe")
-    assert not probe.exists()
-    r = subprocess.run(
-        ["systemd-run", "--wait", "--pipe", "--quiet", "--collect",
-         "-p", "ProtectSystem=strict", "-p", f"ReadWritePaths={tmp_path}",
-         "sh", "-c", f"touch {tmp_path}/ok && ! touch {probe}"],
-        capture_output=True, text=True, timeout=60)
+def test_a_host_without_systemd_gets_no_drop_in_and_no_reload(node: Node) -> None:
+    node.normal_env()
+    node.extra_env = {"AP_SYSTEMD_DIR": str(node.tmp / "no-systemd-here")}
+    r = node.run()
+    assert out(r, "RESTART") == "0"
+    assert not node.dropin.exists()
+    assert not [c for c in node.calls() if "daemon-reload" in c]
+
+
+# ── the real kernel-side proof (root + systemd as PID 1: CI's hosted runner) ──
+#
+# The drop-in is RENDERED by the applier from an agent-env naming real paths,
+# and every directive in the rendered file is handed to systemd-run, so what
+# is proven is the file the applier writes, not a copy of it. ci.yml runs this
+# with sudo on every test-core run and requires it to report PASSED.
+
+PROOF = Path("/var/lib/noo-ci-protect-proof")
+HOME_ROOT = Path("/home/noo-ci-protect-proof")
+
+
+@pytest.mark.skipif(os.geteuid() != 0 or shutil.which("systemd-run") is None
+                    or not Path("/run/systemd/system").is_dir(),
+                    reason="needs root and systemd as PID 1: the EROFS proof runs on CI's hosted runner")
+def test_the_rendered_drop_in_really_holds_the_agent_to_its_paths(node: Node) -> None:
+    state = Path("/var/lib/noo-node-agent")
+    made_state = not state.exists()
+    data, undeclared, home_data = PROOF / "data", PROOF.with_name("noo-ci-protect-undeclared"), HOME_ROOT / "hf"
+    for d in (state, data, undeclared, home_data):
+        d.mkdir(parents=True, exist_ok=True)
     try:
-        assert r.returncode == 0, (r.stdout, r.stderr)
-        assert (tmp_path / "ok").exists()
-        assert not probe.exists()
+        node.write_env(NOO_DATA_ROOT=str(data), HF_CACHE_DIR=str(home_data))
+        node.extra_env = {"AP_SYSTEMD_DIR": "/run/systemd/system"}
+        r = node.run()
+        assert out(r, "RESTART") == "1", (r.stdout, r.stderr)
+        props = [l for l in node.dropin.read_text().splitlines() if "=" in l and not l.startswith("#")]
+        assert "ProtectSystem=strict" in props and "ProtectHome=read-only" in props
+        assert f"ReadWritePaths={home_data}" in props, "a data root under /home is listed bare"
+        script = (
+            f'for p in {state} {data} {home_data}; do touch "$p/noo-protect-probe" && echo "W:$p:ok" || echo "W:$p:fail"; done; '
+            f'for p in /etc /usr {undeclared}; do e=$(touch "$p/noo-protect-probe" 2>&1); '
+            '  case "$e" in *"Read-only file system"*) echo "R:$p:erofs" ;; *) echo "R:$p:NOT-erofs:$e" ;; esac; done; '
+            'r=$(curl -s --max-time 10 --unix-socket /var/run/docker.sock http://localhost/_ping 2>&1); echo "D:$r"'
+        )
+        cmd = ["systemd-run", "--wait", "--pipe", "--quiet", "--collect"]
+        for pr in props:
+            cmd += ["-p", pr]
+        res = subprocess.run(cmd + ["sh", "-c", script], capture_output=True, text=True, timeout=120)
+        o = res.stdout
+        for p in (state, data, home_data):
+            assert f"W:{p}:ok" in o, (o, res.stderr)
+        for p in ("/etc", "/usr", str(undeclared)):
+            assert f"R:{p}:erofs" in o, (o, res.stderr)
+        # The agent drives Docker over its socket: a connect on a read-only
+        # mount still works. (Docker answers "OK" to _ping.)
+        if Path("/var/run/docker.sock").exists():
+            assert "D:OK" in o, (o, res.stderr)
     finally:
-        if probe.exists():
-            probe.unlink()
+        for p in ("/etc/noo-protect-probe", "/usr/noo-protect-probe"):
+            if Path(p).exists():
+                Path(p).unlink()
+        shutil.rmtree(PROOF, ignore_errors=True)
+        shutil.rmtree(undeclared, ignore_errors=True)
+        shutil.rmtree(HOME_ROOT, ignore_errors=True)
+        if made_state:
+            shutil.rmtree(state, ignore_errors=True)
+        else:
+            (state / "noo-protect-probe").unlink(missing_ok=True)
 
 
 # The CHARACTER rule on its own: each value below is absolute, normalised and

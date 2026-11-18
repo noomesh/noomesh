@@ -1306,6 +1306,9 @@ ap_same() {
 # install, daemon-reload and ask for the agent restart (need_restart).
 agent_protect_apply() {
     AP_CHANGED=0
+    # No systemd here (a Mac's launchd, a container without systemd as PID 1):
+    # there is no unit to hold, so nothing is written.
+    [ -d "${AP_SYSTEMD_DIR:-/run/systemd/system}" ] || return 0
     if ! ap_collect "$1"; then
         echo "noo-apply: agent-protect: REFUSED — $AP_BAD_KEY is not a path the agent may be allowed to write; the drop-in is left as it was" >&2
         applied="$applied agent-protect=REFUSED:$AP_BAD_KEY"
