@@ -764,8 +764,15 @@ pub(crate) fn model_stores_check(id: &str, n: &Value) -> Option<Check> {
     Some(warn(NAME, format!(
         "{} world-writable: any account on {id} can plant model bytes there: {}",
         bad.len(), parts.join("; ")),
-        Some(format!("on {id}: {}   # keep the owner; hand downloads: `noo models pull <model>`, or run them as the store's owner",
-            fixes.join(" && ")))))
+        Some(format!("on {id}: {}   # keep the owner; hand downloads: {}, or run them as the store's owner",
+            fixes.join(" && "),
+            // `noo models pull` reaches the gateway's Ollama only: the
+            // controller's own node. Elsewhere: stage, then import onto it.
+            if n["self_node"].as_bool() == Some(true) {
+                "`noo models pull <model>`".to_string()
+            } else {
+                format!("`noo models fetch ollama:<tag>` then `noo cluster import-model {id} ollama:<tag>`")
+            }))))
 }
 
 /// The `ollama models` row (proposal 61 §7b): each placed Ollama model checked
@@ -779,10 +786,28 @@ pub(crate) fn model_stores_check(id: &str, n: &Value) -> Option<Check> {
 /// bytes are unchanged since, not that the registry served the right model. A
 /// model the controller has no record of (a hand `ollama pull`) is never
 /// refused: it is a WARN whose remedy re-pulls it through noo, which writes
-/// the record. An hf.co/ ref has no record and no such remedy. There is no
+/// the record. The remedy names the command that acts on THAT node's Ollama:
+/// `noo models pull` reaches only the controller's own (the gateway's), so it
+/// is the remedy on the controller's own node; any other node (a container or
+/// a native Mac, whose host binary the import uses) gets the model staged on
+/// the controller and imported onto it (`noo models fetch ollama:<tag>`, then
+/// `noo cluster import-model <node> ollama:<tag>`; harrier, an artifact, by
+/// import-model alone). No command records a pull on another node. An hf.co/
+/// ref has no record and no such remedy. There is no
 /// switch that marks a model trusted. No row when the agent does not report it
 /// (no Ollama placement, or an agent that predates the check).
 pub(crate) fn ollama_models_check(id: &str, n: &Value) -> Option<Check> {
+    // `noo models pull` acts on the gateway's Ollama: the controller's own
+    // node only. Elsewhere the model is staged and imported onto that node.
+    fn ollama_remedy(id: &str, n: &Value, model: &str) -> String {
+        if n["self_node"].as_bool() == Some(true) {
+            format!("noo models pull {model}")
+        } else if model == "harrier" {
+            format!("noo cluster import-model {id} harrier")
+        } else {
+            format!("noo models fetch ollama:{model} && noo cluster import-model {id} ollama:{model}")
+        }
+    }
     const NAME: &str = "ollama models";
     let rows = n.get("ollama_verify")?.as_array()?;
     if rows.is_empty() {
@@ -798,7 +823,7 @@ pub(crate) fn ollama_models_check(id: &str, n: &Value) -> Option<Check> {
         let anchor = r["anchor"].as_str().unwrap_or("");
         let layer = short(r["model_layer"].as_str().unwrap_or(""));
         let reason = r["reason"].as_str().unwrap_or("");
-        let pull = || format!("noo models pull {model}");
+        let pull = || ollama_remedy(id, n, model);
         match r["state"].as_str().unwrap_or("") {
             "verified" | "rebuilt" => good.push(format!("{model} ({}{}{})",
                 if anchor == "mirror" { "matches the controller's record of its pull".to_string() } else { format!("{anchor} anchor") },
@@ -15924,7 +15949,11 @@ mod model_stores_tests {
         }
         let r = c.remedy.unwrap();
         assert!(r.starts_with("on node-a: sudo chmod o-w /data/noo/hf-cache && sudo chmod o-w /data/noo/ollama"), "{r}");
-        assert!(r.contains("noo models pull"), "{r}");
+        assert!(r.contains("noo cluster import-model node-a ollama:<tag>") && !r.contains("noo models pull"), "another node: {r}");
+        let mut own = n.clone();
+        own["self_node"] = json!(true);
+        let r = model_stores_check("ctrl", &own).unwrap().remedy.unwrap();
+        assert!(r.contains("`noo models pull <model>`"), "the controller's own node: {r}");
     }
 
     /// The row is part of every node's checks.
@@ -16046,7 +16075,34 @@ mod ollama_models_tests {
         let c = ollama_models_check("node-mac", &n).unwrap();
         assert_eq!(c.verdict, Verdict::Warn);
         assert!(c.detail.contains("gemma4:e4b-it-qat: unverified (no controller record)"), "{}", c.detail);
-        assert_eq!(c.remedy.as_deref(), Some("on node-mac: noo models pull gemma4:e4b-it-qat"));
+        assert_eq!(c.remedy.as_deref(),
+            Some("on node-mac: noo models fetch ollama:gemma4:e4b-it-qat && noo cluster import-model node-mac ollama:gemma4:e4b-it-qat"));
+    }
+
+    /// `noo models pull` reaches only the controller's own Ollama: it is the
+    /// remedy there and nowhere else.
+    #[test]
+    fn the_re_pull_remedy_is_noo_models_pull_only_on_the_controllers_own_node() {
+        let n = json!({"self_node": true, "ollama_verify": [{"model": "gemma4:e2b", "state": "unverified", "anchor": "none",
+            "reason": "no controller record"}]});
+        let c = ollama_models_check("ctrl", &n).unwrap();
+        assert_eq!(c.remedy.as_deref(), Some("on ctrl: noo models pull gemma4:e2b"));
+        let n = json!({"self_node": false, "ollama_verify": [{"model": "gemma4:e2b", "state": "unverified", "anchor": "none",
+            "reason": "no controller record"}]});
+        let c = ollama_models_check("node-a", &n).unwrap();
+        let r = c.remedy.unwrap_or_default();
+        assert!(!r.contains("noo models pull"), "another node's Ollama is not the gateway's: {r}");
+        assert_eq!(r, "on node-a: noo models fetch ollama:gemma4:e2b && noo cluster import-model node-a ollama:gemma4:e2b");
+    }
+
+    /// harrier is an artifact, not a registry tag: on another node it is
+    /// imported by name (import-model stages it), never fetched as ollama:.
+    #[test]
+    fn harrier_on_another_node_is_imported_by_name() {
+        let n = json!({"ollama_verify": [{"model": "harrier", "state": "unverified", "anchor": "none",
+            "reason": "no controller record"}]});
+        let c = ollama_models_check("node-a", &n).unwrap();
+        assert_eq!(c.remedy.as_deref(), Some("on node-a: noo cluster import-model node-a harrier"));
     }
 
     /// A mirror anchor says what it proves: the bytes are the ones the
@@ -16083,7 +16139,7 @@ mod ollama_models_tests {
         let c = ollama_models_check("node-pi", &n).unwrap();
         assert_eq!(c.verdict, Verdict::Fail);
         assert!(c.detail.contains("harrier: the local model layer is sha256:aaaa"), "{}", c.detail);
-        assert_eq!(c.remedy.as_deref(), Some("on node-pi: noo models pull harrier"));
+        assert_eq!(c.remedy.as_deref(), Some("on node-pi: noo cluster import-model node-pi harrier"));
     }
 
     /// Native Ollama reports a mismatch without repairing it: a WARN.

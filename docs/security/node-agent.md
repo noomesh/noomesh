@@ -968,8 +968,13 @@ and the remedy. Hashing is cached by file identity (device, inode, size,
 mtime, ctime), so only the first check after a change reads the whole file.
 
 A model the controller has no record of (a hand `ollama pull`) is never
-refused: the row WARNs and its remedy, `noo models pull <model>`, re-pulls it
-through the controller, which writes the record. The record is written only
+refused: the row WARNs with a remedy that acts on THAT node's Ollama. On the
+controller's own node it is `noo models pull <model>`, which pulls through the
+gateway's Ollama and writes the record. `noo models pull` reaches no other
+node, so on any other node (a container or a Mac's native Ollama) the remedy
+stages the tag on the controller and imports it there: `noo models fetch
+ollama:<tag>`, then `noo cluster import-model <node> ollama:<tag>` (harrier, an
+artifact: `noo cluster import-model <node> harrier`). The record is written only
 when the manifest the controller fetched names exactly what the pull
 installed; a tag that moved in between leaves none (run it again). An
 `hf.co/` ref has no record and no remedy. A placed node (rail, pull-only)

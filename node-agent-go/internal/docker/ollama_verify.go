@@ -87,8 +87,26 @@ type OllamaVerifyResult struct {
 	Blob string `json:"-"`
 }
 
-// ollamaRemedy is the operator's fix for any model this check cannot vouch for.
-func ollamaRemedy(model string) string { return "noo models pull " + model }
+// ollamaRemedy is the operator's fix for any model this check cannot vouch
+// for, as a command that acts on THIS node's Ollama. `noo models pull` reaches
+// only the gateway's Ollama, so it is the fix on the controller's own node
+// (NOO_SELF_NODE) and nowhere else: another node gets the model staged on the
+// controller and imported onto it (harrier, an artifact, by name). No command
+// records a pull on another node.
+func ollamaRemedy(model string) string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("NOO_SELF_NODE"))) {
+	case "1", "true", "yes":
+		return "noo models pull " + model
+	}
+	node := strings.TrimSpace(os.Getenv("NODE_ID"))
+	if node == "" || node == "auto" {
+		node = "<this node>"
+	}
+	if model == "harrier" {
+		return "noo cluster import-model " + node + " harrier"
+	}
+	return "noo models fetch ollama:" + model + " && noo cluster import-model " + node + " ollama:" + model
+}
 
 // OllamaVerifier checks placed models in one ollama store.
 type OllamaVerifier struct {
