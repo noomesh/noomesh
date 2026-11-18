@@ -97,6 +97,13 @@ step upgrade-all 3600 -- noo upgrade --all --version "$TARGET" --yes
 ROLL_RC=$?
 echo "$ROLL_RC" > "$J/roll.rc"
 noo --json cluster verify > "$J/verify-after.json" 2>/dev/null
+# The --all window ONLY, captured before the same-tag --stack can apply
+# anything: A2 judges whether --all installed the generation-2 applier, and a
+# release-check line from the later --stack must not stand in for it (97).
+# The applier's `release-check: generation=…` is noo-apply's stdout under
+# noo-fetch.service, so journald files it as `noo-fetch`, NOT `-t noo-apply`
+# (only its `logger -t noo-apply` refusals land there): keep both.
+sudo -n journalctl --no-pager --since "@$ROLL_T0" 2>/dev/null | grep -E "noo-apply|noo-fetch|noo-node-agent" > "$J/roll-window.journal"
 
 # ── 4. the same-tag --stack (1b's Stage route on a node whose applier is new) ─
 STACK_T0="$(date +%s)"

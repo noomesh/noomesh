@@ -45,7 +45,7 @@ GOOD_CTL = [
 
 
 def cell(tmp, roll=ROLL_OK, stack=STACK_OK, journal=JOURNAL_OK, roll_rc="0", self_rows=None, ctl_rows=None,
-         chat="ok\n", chat_rc=0, unit=True, sudo_journal="", unit_user=None):
+         chat="ok\n", chat_rc=0, unit=True, sudo_journal="", unit_user=None, stack_journal=None):
     out, j = tmp / "out", tmp / "out" / "judge"
     (out / "logs").mkdir(parents=True)
     j.mkdir()
@@ -54,7 +54,8 @@ def cell(tmp, roll=ROLL_OK, stack=STACK_OK, journal=JOURNAL_OK, roll_rc="0", sel
         (j / "roll.rc").write_text(roll_rc)
     if stack is not None:
         (out / "logs" / "upgrade-stack-same-tag.log").write_text(stack)
-    (j / "apply.journal").write_text(journal)
+    (j / "apply.journal").write_text(journal if stack_journal is None else journal + stack_journal)
+    (j / "roll-window.journal").write_text(journal)
     (j / "node.journal").write_text("")
     (j / "sudo-stack.journal").write_text(sudo_journal)
     v = verify(GOOD_SELF if self_rows is None else self_rows, GOOD_CTL if ctl_rows is None else ctl_rows)
@@ -154,3 +155,17 @@ def test_a_roll_that_never_ran_is_not_reached(tmp_path):
 def test_no_chat_answer_after_the_upgrade_fails_g5(tmp_path):
     rc, got = cell(tmp_path, chat="Error: no chat backend is ready\n", chat_rc=1)
     assert " FAIL: " in got["G5"] and "no chat backend" in got["G5"], got["G5"]
+
+
+def test_a2_judges_the_all_window_only_never_the_later_stack(tmp_path):
+    """--all left the old applier; only the same-tag --stack's apply logged
+    generation=2. A2 must FAIL: that is the first-roll failure (97)."""
+    rc, got = cell(tmp_path, journal="noo-fetch[1]: release-check: generation=1 release=none\n",
+                   stack_journal="noo-fetch[2]: release-check: generation=2 release=none release-prev=none\n")
+    assert " FAIL: " in got["A2"] and "generation=1" in got["A2"], got["A2"]
+
+
+def test_a3_names_the_step_a_refusal_came_from(tmp_path):
+    stack = STACK_OK + "noo-apply: REFUSED netns-unit — not in the release list; run noo upgrade --all (75)\n"
+    rc, got = cell(tmp_path, stack=stack)
+    assert " FAIL: " in got["A3"] and "--stack: noo-apply: REFUSED netns-unit" in got["A3"], got["A3"]

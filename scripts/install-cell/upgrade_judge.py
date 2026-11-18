@@ -99,7 +99,10 @@ def judge():
 
     roll = text(os.path.join(out, "logs", "upgrade-all.log"))
     stack = text(os.path.join(out, "logs", "upgrade-stack-same-tag.log"))
+    # the whole roll (--all and the same-tag --stack): A3, where a refusal anywhere counts
     journal = (text(os.path.join(j, "apply.journal")) or "") + (text(os.path.join(j, "node.journal")) or "")
+    # the --all window only (captured before the --stack ran): A2
+    roll_journal = text(os.path.join(j, "roll-window.journal")) or ""
     after = load(os.path.join(j, "verify-after.json"))
     final = load(os.path.join(j, "verify-final.json"))
     roll_rc = (text(os.path.join(j, "roll.rc")) or "").strip()
@@ -116,18 +119,18 @@ def judge():
         else:
             say("A1", "FAIL", "exit %s; %s" % (roll_rc or "?", " | ".join(stopped[:3]) or "no stop line"))
 
-        tags = re.findall(r"release-check: generation=\d+[^\n]*", journal + "\n" + roll)
+        tags = re.findall(r"release-check: generation=\d+[^\n]*", roll_journal + "\n" + roll)
         if any("generation=2" in t for t in tags):
             say("A2", "PASS", [t for t in tags if "generation=2" in t][-1])
         elif tags:
             say("A2", "FAIL", "the applier reports %s (the old applier is still in place)" % tags[-1])
         else:
-            say("A2", "FAIL", "no 'release-check:' line from the applier since the roll began")
+            say("A2", "FAIL", "no 'release-check:' line from the applier during the --all roll")
 
-        refused = [l for l in (roll + "\n" + (stack or "") + "\n" + journal).splitlines()
-                   if "noo-apply: REFUSED" in l or "REFUSED release check:" in l]
+        refused = [("%s: %s" % (src, l.strip())) for src, body in (("--all", roll), ("--stack", stack or ""), ("journal", journal))
+                   for l in body.splitlines() if "noo-apply: REFUSED" in l or "REFUSED release check:" in l]
         say("A3", "FAIL" if refused else "PASS",
-            " | ".join(refused[:2]) if refused else "no 'noo-apply: REFUSED' in the roll, the --stack or the node's journal")
+            " | ".join(refused[:2]) if refused else "no 'noo-apply: REFUSED' in the --all roll, the --stack or the node's journal")
 
         rc = rows(after, "release check", me)
         ok = [c for c in rc if c.get("verdict") == "ok" and "root code installs only from a release-signed list on" in (c.get("detail") or "")]
