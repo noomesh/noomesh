@@ -1429,7 +1429,13 @@ contains, one of those.
 
 ### The harness unit is held off the internet
 
-The Landlock jail limits files. The network is limited by the node's applier
+This holds on Linux with systemd and `harness-egress=enforced` only. A Mac
+(launchd) has no egress hold: its harness runs with nothing holding it off
+the internet. A failed pre-check or an old systemd also leaves the harness
+unrestricted (the tag below says so). Where it is held, private, link-local
+and tailnet ranges stay reachable.
+
+The Landlock jail limits files. On Linux the network is limited by the node's applier
 (`scripts/noo-apply.sh`), as root, on every apply that carries the harness
 unit or its env. It renders `/etc/noo/harness-net/` (a `resolv.conf` that
 names only 192.0.2.53, a TEST-NET-1 address that is never allowed, so a name

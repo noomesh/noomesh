@@ -93,8 +93,10 @@ The harness never runs a vendor CLI unconfined. On Linux the CLI runs in
 a Landlock jail: it can write only its task's working directory, HOME and
 TMPDIR, and read only the system trees a runtime needs, a short list of
 `/etc` files and the cluster CA file. It cannot read the node's keys, env
-files, secrets or data root, nor the harness's environment. The network is
-not restricted. A node whose kernel cannot provide Landlock (or a Mac
+files, secrets or data root, nor the harness's environment. The jail
+alone does not restrict the network, and a Mac has no other network limit. On
+Linux with systemd the harness unit is also held off the internet (see
+[the egress hold](../security/node-agent.md#the-harness-unit-is-held-off-the-internet)). A node whose kernel cannot provide Landlock (or a Mac
 without `sandbox-exec`) cannot run a foreign kind. Its tasks are
 checkpointed with `harness jail unavailable: …; foreign CLIs never run
 unjailed`, and the harness logs the reason at startup (`noo cluster logs

@@ -842,6 +842,7 @@ registry. The add-on that owns them reads them from its own container
 environment; a row here would be a switch on another process's behaviour that
 this one cannot honour.
 
+At-rest encryption (i10a) is opt-in, not yet validated on real hardware (decision 2026-10-26).
 `at_rest.unencrypted_accepted` records that a person has accepted this
 controller's data being stored unencrypted on disk (i10a). It has no env
 layer and can be set only by a person's own credential: the cluster
