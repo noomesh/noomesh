@@ -275,9 +275,14 @@ func (c *Client) PullOllamaModel(ctx context.Context, name string) (*PullOllamaM
 	}
 	slog.Info("ollama model staged", "model", name, "weight", weight, "work", work, "staged_from_registry", cand.staged)
 
-	// Host binary first: a node running ollama natively has no noo-ollama
-	// container to copy into, and this is the cheaper path when it exists.
-	if bin, ok := ollamaBinary(); ok {
+	// The host binary only where no managed noo-ollama exists (a node that
+	// runs ollama natively has no container to copy into); where the
+	// container exists it is this node's Ollama (ollamaImportHost).
+	bin, host, pathErr := c.ollamaImportHost(ctx)
+	if pathErr != nil {
+		return nil, pathErr
+	}
+	if host {
 		if out, runErr := runOllamaCreate(ctx, bin, work, name, mfName); runErr != nil {
 			return nil, fmt.Errorf("ollama create failed on the host binary: %s", lastLine(out))
 		}
@@ -464,7 +469,7 @@ func runOllamaCreate(ctx context.Context, bin, dir, name, modelfile string) (str
 func (c *Client) ollamaCreateInContainer(ctx context.Context, work, name, modelfile, weight string) (string, error) {
 	if !c.isRunning(ctx, OllamaContainer) {
 		return "", fmt.Errorf(
-			"no `ollama` binary on this node and the %s container is not running — start it (`noo cluster start-backend %s ollama`) or install ollama, then re-run",
+			"the %s container is not running and the import goes only to it on this node — start it (`noo cluster start-backend %s ollama`), then re-run",
 			OllamaContainer, os.Getenv("NODE_ID"))
 	}
 	tarball, err := dirTar(work, []string{modelfile, weight})

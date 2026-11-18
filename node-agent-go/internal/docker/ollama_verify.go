@@ -178,14 +178,21 @@ func fetchStoreArtifact(ctx context.Context, name, sha string) ([]byte, error) {
 // repairOllamaModel removes the blobs whose bytes are wrong (inside
 // noo-ollama, as its own user) and runs the import path again: a mirror is
 // re-installed, a Modelfile model rebuilt from its verified GGUF.
+//
+// A failure names the path the rebuild took (the container or the host
+// binary, ollamaImportVia), so the refusal on the first heartbeat says where
+// it failed, not only that it did.
 func (c *Client) repairOllamaModel(ctx context.Context, model string, bad []string) error {
 	if len(bad) > 0 {
 		if err := c.removeOllamaBlobs(ctx, bad); err != nil {
-			return err
+			return fmt.Errorf("removing the bad blobs in %s: %w", OllamaContainer, err)
 		}
 	}
-	_, err := c.PullOllamaModel(ctx, model)
-	return err
+	via := c.ollamaImportVia(ctx)
+	if _, err := c.PullOllamaModel(ctx, model); err != nil {
+		return fmt.Errorf("the rebuild through %s: %w", via, err)
+	}
+	return nil
 }
 
 var blobHexRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
