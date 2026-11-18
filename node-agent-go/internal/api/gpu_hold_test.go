@@ -40,11 +40,11 @@ func TestGPUHoldAndReleaseCarryTheLeaseAndMapRefusals(t *testing.T) {
 		return w.Code, out
 	}
 
-	code, out := do(s.handleGPUHold, `{"reason":"voice","owner":"rbwolf","operation_id":"op-1","workload":"pai-voice/voice-worker","mode":"drain","timeout_secs":30}`)
+	code, out := do(s.handleGPUHold, `{"reason":"voice","owner":"owner","operation_id":"op-1","workload":"pai-voice/voice-worker","mode":"drain","timeout_secs":30}`)
 	if code != 200 || out["status"] != "held" {
 		t.Fatalf("%d %v", code, out)
 	}
-	if gotHold.OperationID != "op-1" || gotHold.Owner != "rbwolf" || gotHold.Mode != "drain" || gotHold.Workload != "pai-voice/voice-worker" || gotHold.Timeout != 30*time.Second || gotHold.Force {
+	if gotHold.OperationID != "op-1" || gotHold.Owner != "owner" || gotHold.Mode != "drain" || gotHold.Workload != "pai-voice/voice-worker" || gotHold.Timeout != 30*time.Second || gotHold.Force {
 		t.Fatalf("hold request: %+v", gotHold)
 	}
 	if lease := out["gpu_contention"].(map[string]any)["lease"].(map[string]any); lease["generation"] != float64(7) {

@@ -133,7 +133,11 @@ impl NodeLink {
     pub(crate) fn from_record(node_id: &str, record: Option<&Value>) -> Result<Self, AppError> {
         if let Some(data) = record {
             if let Some(url) = data.get("agent_url").and_then(|v| v.as_str()) {
-                if !url.is_empty() {
+                let ip = data.get("ip_address").and_then(|v| v.as_str()).unwrap_or("");
+                // Dialled only when it is https on an explicit port at the
+                // node's registered address (a record written before the
+                // heartbeat held it to that); otherwise the address below.
+                if !url.is_empty() && crate::routes::cluster::dialable_agent_url(url, ip) {
                     return Ok(Self::with_node(url.to_string(), node_id).advertising(data));
                 }
             }
@@ -158,6 +162,14 @@ impl NodeLink {
             return Err(AppError::NotFound(no_address_message(node_id)));
         }
         Err(AppError::NotFound(format!("Node '{node_id}' not found in mesh_nodes")))
+    }
+
+    /// A link to `base` carrying `record`'s transports, as `from_record`
+    /// builds it, without the agent_url rule: for tests whose stand-in node
+    /// is a plain-HTTP loopback server (the rule refuses both).
+    #[cfg(test)]
+    pub(crate) fn for_test_server(base: &str, node_id: &str, record: &Value) -> Self {
+        Self::with_node(base.to_string(), node_id).advertising(record)
     }
 
     fn with_node(base: String, node_id: &str) -> Self {
@@ -195,8 +207,20 @@ impl NodeLink {
     }
 
     /// The agent at an address the caller already holds (a record's
-    /// `agent_url`, a backend URL).
+    /// `agent_url`, a backend URL). Held to the agent_url rule's address-less
+    /// form (`dialable_agent_url`): only an https URL becomes the base; any
+    /// other has no address, so it is never dialled and no credential is
+    /// attached for it.
     pub fn for_base(url: &str) -> Self {
+        let base = if crate::routes::cluster::dialable_agent_url(url, "") { url.to_string() } else { String::new() };
+        Self { base, node_id: None, auth: Auth::Node, nats_rpc: false, bus: None, tunnel: false }
+    }
+
+    /// `for_base` without the rule, for tests whose stand-in agent is a
+    /// plain-HTTP loopback server. Test code only (a source guard below holds
+    /// that nothing outside tests calls it).
+    #[cfg(test)]
+    pub(crate) fn for_test_base(url: &str) -> Self {
         Self { base: url.to_string(), node_id: None, auth: Auth::Node, nats_rpc: false, bus: None, tunnel: false }
     }
 
@@ -273,6 +297,12 @@ impl NodeLink {
     /// The credential this link presents for `url`, if any.
     fn credential(&self, url: &str) -> Option<(String, String)> {
         match self.auth {
+            // A node agent's link: never a credential over plaintext, nor
+            // for a link with no address (a for_base URL the agent_url rule
+            // refused leaves the base empty). The controller's own agent
+            // (self_agent_base: derived https, or the operator's override)
+            // keeps its own rule.
+            Auth::Node if !url.starts_with("https://") => None,
             Auth::Node => crate::node_agent_auth::header_for(url),
             Auth::SelfAgent => crate::node_agent_auth::header_for_self(url),
         }
@@ -719,13 +749,74 @@ mod tests {
     use crate::node_agent_auth::TEST_SERIAL as SERIAL;
 
     #[test]
+    fn a_stored_agent_url_off_the_registered_address_is_not_dialled() {
+        let l = NodeLink::from_record("n9", Some(&json!({"agent_url": "https://10.9.9.9:8081", "ip_address": "10.0.0.9"}))).unwrap();
+        assert_eq!(l.base(), "https://10.0.0.9:8081", "the registered address, not the stored URL");
+        let l = NodeLink::from_record("n9", Some(&json!({"agent_url": "http://10.0.0.9:8081", "ip_address": "10.0.0.9"}))).unwrap();
+        assert_eq!(l.base(), "https://10.0.0.9:8081");
+    }
+
+    #[test]
+    fn a_plaintext_base_gets_no_address_and_no_credential() {
+        // With a node-agent token configured (as on a real controller), the
+        // https link carries it and the refused plaintext one carries nothing.
+        let _g = crate::node_agent_auth::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        crate::node_agent_auth::clear_for_test();
+        std::env::set_var("NOO_NODE_AGENT_TOKEN", "static-test-token");
+        let l = NodeLink::for_base("http://10.0.0.9:8081");
+        assert_eq!(l.base(), "", "a plaintext agent URL is never a base");
+        assert!(l.auth_headers().is_empty(), "no credential for it");
+        let s = NodeLink::for_base("https://10.0.0.9:8081");
+        assert_eq!(s.base(), "https://10.0.0.9:8081");
+        assert!(!s.auth_headers().is_empty(), "the token is live: an https agent link carries it");
+    }
+
+    #[test]
+    fn no_production_code_builds_a_node_link_without_the_rule() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        assert!(files.len() > 50, "the walk found the sources");
+        for f in files {
+            let name = f.display().to_string();
+            if name.ends_with("tests.rs") || name.ends_with("_tests.rs") {
+                continue;
+            }
+            let own = crate::test_src::own_code(&std::fs::read_to_string(&f).unwrap());
+            for test_only in ["::for_test_base(", "::for_test_server("] {
+                assert!(!own.contains(test_only), "{name} calls {test_only} outside tests");
+            }
+        }
+        let own = crate::test_src::own_code(include_str!("node_link.rs"));
+        let for_base = crate::test_src::fn_body(&own, "pub fn for_base(");
+        assert!(for_base.contains("dialable_agent_url(url, \"\")"), "for_base holds the URL to the rule");
+    }
+
+    #[test]
+    fn a_stored_agent_url_without_a_registered_address_must_still_be_https() {
+        let l = NodeLink::from_record("n8", Some(&json!({"agent_url": "https://127.0.0.1:9443"}))).unwrap();
+        assert_eq!(l.base(), "https://127.0.0.1:9443");
+        let l = NodeLink::from_record("n8", Some(&json!({"agent_url": "http://127.0.0.1:9443"})));
+        assert!(l.map(|l| l.base().to_string()).unwrap_or_default() != "http://127.0.0.1:9443", "never a plaintext agent URL");
+    }
+
+    #[test]
     fn agent_url_wins_then_the_ip_falls_back_and_a_missing_node_is_not_found() {
         let l = NodeLink::from_record(
             "n1",
-            Some(&json!({"agent_url": "https://n1.tail:9000", "ip_address": "10.0.0.1"})),
+            Some(&json!({"agent_url": "https://10.0.0.1:8082", "ip_address": "10.0.0.1"})),
         )
         .unwrap();
-        assert_eq!(l.base(), "https://n1.tail:9000");
+        assert_eq!(l.base(), "https://10.0.0.1:8082");
         assert_eq!(l.node_id(), Some("n1"));
 
         let l = NodeLink::from_record("n2", Some(&json!({"agent_url": "", "ip_address": "10.0.0.2"}))).unwrap();

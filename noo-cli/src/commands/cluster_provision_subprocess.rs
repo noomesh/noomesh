@@ -1685,7 +1685,18 @@ pub(crate) fn deliver_kind_to_nodes_then(
             let payload = payload_for(node)?;
             // i689: a fresh 0700 dir; what is staged here is CA-signed.
             let work = crate::private_tmp::dir(&format!("noo-{kind}-{node}"))?;
-            let files: Vec<(&str, Vec<u8>)> = vec![(kind, payload)];
+            let mut files: Vec<(&str, Vec<u8>)> = vec![(kind, payload)];
+            // i908: the applier and hostd are root code; the node installs
+            // them only with the release's signed list beside them.
+            if kind == "applier" || kind == "hostd-binary" {
+                // i940: a node ahead of this controller would refuse it.
+                let msg = crate::commands::provision::reported_apply_msg(g, node);
+                if let Some(why) = crate::commands::provision::node_floor_refusal(&msg, env!("CARGO_PKG_VERSION"), None) {
+                    return Err(why);
+                }
+                let proof = crate::commands::provision::release_proof_for(g, &files)?;
+                files.extend(proof);
+            }
             let bundle = crate::commands::security_local::build_signed_bundle(&ca, node, &files, &work)?;
             let d = crate::commands::security_local::deliver_signed_bundle(g, node, &bundle, &work, None);
             let _ = std::fs::remove_dir_all(&work);
@@ -1775,21 +1786,21 @@ pub(crate) fn deliver_kind_to_nodes_then(
     Ok(if failed > 0 { 1 } else { 0 })
 }
 
-/// `noo cluster upgrade-hostd NODE... [--skip-build] [--yes]` — roll the
-/// confined-root host daemon over the pull rail (fu73). `noo cluster verify
-/// <node>` afterwards is the acceptance test (the agent swap this used to
-/// precede was retired by an earlier release). Nodes whose applier
-/// predates the hostd-binary kind refuse with exit 76 — converge them once
-/// (re-run the enrollment paste, or `noo cluster upgrade-applier` after
-/// their applier is current).
+/// `noo cluster upgrade-hostd NODE... [--yes]` — roll the confined-root host
+/// daemon over the pull rail (fu73) as the RELEASE's own binary: the
+/// release-listed `noo-hostd-<arch>-unknown-linux-gnu` from the verified
+/// release download provision uses ([`super::provision::cached_release_asset`]),
+/// carried with the release's signed list (i908: a node installs root code
+/// only if the release key listed it). It used to cross-build from a checkout;
+/// a node refuses that binary, so the build path is gone (no controller-own
+/// use of it existed: the controller's hostd refreshes from the same release
+/// asset). `noo cluster verify <node>` afterwards is the acceptance test.
 pub fn cluster_upgrade_hostd(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut nodes: Vec<String> = Vec::new();
     let mut yes = false;
-    let mut skip_build = false;
     for tok in args {
         match tok.as_str() {
             "--force" | "--yes" | "-y" => yes = true,
-            "--skip-build" => skip_build = true,
             t if t.starts_with('-') => return Err(Unhandled),
             t => nodes.push(t.to_string()),
         }
@@ -1799,85 +1810,42 @@ pub fn cluster_upgrade_hostd(g: &Globals, args: &[String]) -> Result<i32, Unhand
             "name the node(s) to roll: noo cluster upgrade-hostd <node> [<node>…]",
             Some("hostd rolls are deliberate and serial — no implicit fleet-wide default"));
     }
-
-    // Arch per node from the registry; unknown builds both (over-building
-    // is cheap).
+    // Arch per node from the registry.
     let doc = crate::http::get_json(g, "/api/cluster/nodes", true, 10);
     let empty = Vec::new();
     let known = doc["nodes"].as_array().unwrap_or(&empty);
-    let mut arches: Vec<&'static str> = Vec::new();
-    let mut node_arch: Vec<(String, Option<NodeArch>)> = Vec::new();
-    for node in &nodes {
+    let node_arch: Vec<(String, Option<NodeArch>)> = nodes.iter().map(|node| {
         let entry = known.iter().find(|n| {
             n.get("id").and_then(|v| v.as_str())
                 .or_else(|| n.get("node_id").and_then(|v| v.as_str()))
                 .or_else(|| n.get("name").and_then(|v| v.as_str()))
                 .is_some_and(|id| id.eq_ignore_ascii_case(node))
         });
-        let arch = entry.and_then(|n| node_arch_signal(n).map(|(a, _)| a));
-        match arch {
-            Some(NodeArch::Arm) => arches.push("arm64"),
-            Some(_) => arches.push("amd64"),
-            None => arches.extend(["amd64", "arm64"]),
-        }
-        node_arch.push((node.clone(), arch));
-    }
-    arches.sort_unstable();
-    arches.dedup();
+        (node.clone(), entry.and_then(|n| node_arch_signal(n).map(|(a, _)| a)))
+    }).collect();
     super::confirm_destructive(g, yes, "roll noo-hostd on", &nodes.join(", "));
-
-    if !skip_build && !repo_root().join("node-agent-go").join("build-cross.sh").is_file() {
-        fail(g.json, ExitCode::Generic, "not_checkout",
-            &format!("cross-building noo-hostd needs the source checkout (node-agent-go/build-cross.sh \
-                      is not under {}) — a binary-installed controller has no tree to build from",
-                     repo_root().display()),
-            Some("run this from a checkout, or pass --skip-build with prebuilt node-agent-go/noo-hostd-<arch> binaries"));
-    }
-    if !skip_build {
-        if !g.json {
-            say(&ui::phase("Build"));
-        }
-        for arch in &arches {
-            if !g.json {
-                ui::step(&format!("cross-building noo-hostd for {arch}"));
-            }
-            let rc = Command::new(repo_root().join("node-agent-go").join("build-cross.sh"))
-                .arg(arch)
-                .env("BINARY", "noo-hostd")
-                .status()
-                .map(|s| s.code().unwrap_or(1))
-                .unwrap_or(1);
-            if rc != 0 {
-                fail(g.json, ExitCode::Generic, "build_failed",
-                    &format!("cross-build noo-hostd for {arch} failed — aborting before touching any node"), None);
-            }
-            if !g.json {
-                ui::done(&format!("noo-hostd built for {arch}"));
-            }
-        }
-    }
     if !g.json {
         say(&ui::phase("Deliver"));
     }
-
+    let root = repo_root();
     let payload = move |node: &str| -> Result<Vec<u8>, String> {
-        let arch = node_arch
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(node))
-            .and_then(|(_, a)| *a);
-        let goarch = match arch {
-            Some(NodeArch::Arm) => "arm64",
-            Some(_) => "amd64",
-            None => return Err(
-                "arch unknown for this node — pass an arch-known registered node, or build \
-                 and deliver by hand".into()),
-        };
-        std::fs::read(repo_root().join("node-agent-go").join(format!("noo-hostd-{goarch}")))
-            .map_err(|e| format!("built binary missing ({e}) — did the cross-build run?"))
+        let arch = node_arch.iter().find(|(n, _)| n.eq_ignore_ascii_case(node)).and_then(|(_, a)| *a);
+        let asset = hostd_release_asset(arch)?;
+        super::provision::cached_release_asset(g, &root, &asset)
     };
     deliver_kind_to_nodes(g, &nodes, "hostd-binary", &payload,
         "the applier keeps .prev and reverts a hostd with no fresh heartbeat; \
          acceptance: noo cluster verify <node>")
+}
+
+/// The release asset `upgrade-hostd` ships to a Linux node of `arch`.
+fn hostd_release_asset(arch: Option<NodeArch>) -> Result<String, String> {
+    let arch = match arch {
+        Some(NodeArch::Arm) => "aarch64",
+        Some(_) => "x86_64",
+        None => return Err("arch unknown for this node — pass an arch-known registered node".into()),
+    };
+    super::provision::hostd_asset_for("linux", arch).ok_or_else(|| format!("no hostd release asset for linux/{arch}"))
 }
 
 /// `noo cluster upgrade-applier NODE... [--yes]` — ship the current
@@ -1975,6 +1943,32 @@ pub fn cluster_restart_backends(g: &Globals, args: &[String]) -> Result<i32, Unh
     let payload = move |_node: &str| -> Result<Vec<u8>, String> { Ok(list.clone().into_bytes()) };
     deliver_kind_to_nodes(g, std::slice::from_ref(&node), "restart-backends", &payload,
         "restarts are logged in the node journal (tag noo-apply)")
+}
+
+#[cfg(test)]
+mod upgrade_hostd_tests {
+    use super::*;
+
+    /// i908: upgrade-hostd ships the release-listed asset for the node's
+    /// arch, which the controller's own pre-check (the node's rule) accepts
+    /// as hostd; there is no build path left.
+    #[test]
+    fn upgrade_hostd_ships_a_release_listed_asset() {
+        use sha2::{Digest, Sha256};
+        let bytes = b"release hostd".to_vec();
+        for (arch, want) in [(Some(NodeArch::Arm), "noo-hostd-aarch64-unknown-linux-gnu"),
+                             (Some(NodeArch::X86), "noo-hostd-x86_64-unknown-linux-gnu")] {
+            let asset = hostd_release_asset(arch).unwrap();
+            assert_eq!(asset, want);
+            let sums = format!("{}  {asset}\n", hex::encode(Sha256::digest(&bytes)));
+            let files: Vec<(&str, Vec<u8>)> = vec![("hostd-binary", bytes.clone())];
+            assert!(crate::release_gate::controller_check(&files, false, &sums, "0.6.27", None).is_ok());
+        }
+        assert!(hostd_release_asset(None).is_err());
+        let src = crate::test_src::own_code(include_str!("cluster_provision_subprocess.rs"));
+        let f = crate::test_src::fn_body(&src, "pub fn cluster_upgrade_hostd(");
+        assert!(f.contains("cached_release_asset(") && !f.contains("build-cross"), "upgrade-hostd builds from a checkout");
+    }
 }
 
 #[cfg(test)]

@@ -1064,6 +1064,19 @@ pub(crate) fn start_stage_release_images(g: &Globals, lock: Option<String>, tag:
 }
 
 impl StageRun {
+    /// Join and report NOW, before the stack moves, and hand back a run that
+    /// is already finished (its later `finish` is a no-op). The new gateway
+    /// hands every node the new lock's digest-pinned backend refs the moment
+    /// it is up; a rail node whose arch tar is not staged yet refuses the
+    /// start (0.6.26 roll: node-pi, `node.reconcile_refused` five times in two
+    /// minutes and one operator alert, until the arm64 tar landed at
+    /// 16:59:55). Staging first costs the roll about the launch's length.
+    pub(crate) fn finish_before_launch(self, g: &Globals) -> StageRun {
+        let tag = self.tag.clone();
+        self.finish(g);
+        StageRun { handle: None, tag }
+    }
+
     /// Join the thread (always; never detach, so no `.exporting` tar is cut
     /// off by a process exit) and print what it did. A panic is reported as a
     /// staging failure AND recorded in the staged index, so the nodes stage's
@@ -1078,7 +1091,7 @@ impl StageRun {
             }
             Ok(StageOutcome::Done(sum)) => {
                 if !g.json {
-                    ui::step("Node images (staged on the artifact rail while the stack rolled; nodes pull them from here, never from a registry)");
+                    ui::step("Node images (staged on the artifact rail before the stack moved; nodes pull them from here, never from a registry)");
                 }
                 print_summary(g, &sum);
                 if !sum.failed.is_empty() && !g.json {
@@ -1230,6 +1243,29 @@ pub(crate) fn parse_not_staged(msg: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The roll joins staging before the stack moves: a still-running stage
+    /// is finished by the time `finish_before_launch` returns, and what it
+    /// hands back is already finished (launch_stack's own finish is a no-op).
+    #[test]
+    fn finish_before_launch_joins_the_staging_thread_first() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let done = Arc::new(AtomicBool::new(false));
+        let d = done.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            d.store(true, Ordering::SeqCst);
+            StageOutcome::NoLock
+        });
+        let g = crate::Globals { json: true, verbose: false, gateway_override: None, timeout_secs: None, token: None, quiet: false };
+        let run = StageRun { handle: Some(handle), tag: "v0.6.27".into() };
+        let after = run.finish_before_launch(&g);
+        assert!(done.load(Ordering::SeqCst), "staging finished before the launch could start");
+        assert!(after.handle.is_none(), "the run handed to launch_stack is already finished");
+        assert_eq!(after.tag, "v0.6.27");
+        after.finish(&g); // a no-op
+    }
     use serde_json::json;
 
     const D: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

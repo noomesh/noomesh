@@ -82,8 +82,11 @@ impl CutWatch {
         judge_with(self.ctx, self.sent_estimate, evaluated, calib)
     }
 
-    /// Count the cut, and say it once an hour per (consumer, model).
+    /// Count the cut, and say it once an hour per (consumer, model). The
+    /// (backend URL, model) ratio goes back to untrusted: a cut means the
+    /// prompt was larger than the ratio in use said.
     pub async fn note(&self, cut: &Cut) {
+        crate::chat_context::forget(&self.backend_url, &self.model);
         let labels = HashMap::from([
             ("consumer".to_string(), self.consumer.clone()),
             ("model".to_string(), self.model.clone()),

@@ -6,7 +6,7 @@
 //! image_retention.go), and the previous locks kept for rollback.
 //!
 //! Every stack image is pulled BY DIGEST, so a superseded one is never
-//! "dangling" and every release a controller ever pulled stays (pop-os,
+//! "dangling" and every release a controller ever pulled stays (ctrl,
 //! 2026-11-13: ~58 GB in the first 60 lines of `docker system df -v`). The
 //! keep file names what may NOT go, by exact `repo@sha256:` digest or image
 //! ID, never by name pattern:
@@ -995,7 +995,7 @@ mod tests {
     /// default chat, another node).
     fn verify_with(rows: Vec<Value>) -> Value {
         let mut checks = vec![
-            row("cert expiry", "warn", "node pop-os in 12 days"),
+            row("cert expiry", "warn", "node ctrl in 12 days"),
             row("default chat", "fail", "no chat model"),
             row("backup", "fail", "no backup in 3 days"),
         ];

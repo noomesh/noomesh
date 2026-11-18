@@ -214,7 +214,7 @@ pub(super) async fn fetch_memory_context(
 
 /// The memory rows are matched by wording, not topic, and arrive as old
 /// messages — one of which a small model once took for the question it was
-/// asked (mcmini, 2026-10-16). Say what they are before the model reads them.
+/// asked (node-mac, 2026-10-16). Say what they are before the model reads them.
 fn frame_memory(lines: &str) -> String {
     format!(
         "Excerpts from EARLIER conversations, matched by similar wording. They are \
@@ -1798,7 +1798,7 @@ mod system_prompt_budget_tests {
     }
 
     /// The operator's efficiency rule, measured: a one-word task sent an
-    /// 8,380 estimated-token system prompt on 2026-11-11 (awolf harness,
+    /// 8,380 estimated-token system prompt on 2026-11-11 (node-a harness,
     /// `request_size`), on every model call. Since the persona split
     /// (i802), a non-ops Compact turn's standing text (core persona, clock
     /// rule, no skill, the three core tools' schemas) fits half of a
@@ -1818,9 +1818,9 @@ mod system_prompt_budget_tests {
         }
         // An ops objective still gets the guidance in either tier; the
         // operator skill rides only the Full tier (Compact takes no skill).
-        let ops = system_prompt_for(&root, "Restart the vllm backend on node awolf", PromptTier::Compact);
+        let ops = system_prompt_for(&root, "Restart the vllm backend on node node-a", PromptTier::Compact);
         assert!(ops.contains("## Cluster Nodes (live)") && !ops.contains("## Skill: "), "{}", &ops[ops.len().saturating_sub(400)..]);
-        let full = system_prompt_for(&root, "Restart the vllm backend on node awolf", PromptTier::Full);
+        let full = system_prompt_for(&root, "Restart the vllm backend on node node-a", PromptTier::Full);
         assert!(full.contains("## Skill: cluster-operator"), "{}", &full[full.len().saturating_sub(400)..]);
     }
 
@@ -1831,7 +1831,7 @@ mod system_prompt_budget_tests {
         let Some(root) = repo_root_or_skip() else { return };
         let full = format!("{}{CLUSTER_GUIDANCE}{CLOCK_RULE}", persona(&root, PromptTier::Full));
         assert!(real_tokens(&full) <= FULL_BUDGET, "{} real tokens > {FULL_BUDGET}", real_tokens(&full));
-        let ops = system_prompt_for(&root, "Restart the vllm backend on node awolf", PromptTier::Full);
+        let ops = system_prompt_for(&root, "Restart the vllm backend on node node-a", PromptTier::Full);
         assert!(ops.contains("## Cluster Nodes (live)") && ops.contains("## Skill: cluster-operator"), "{}", &ops[ops.len().saturating_sub(400)..]);
         let calm = system_prompt_for(&root, "Write me a short poem about autumn.", PromptTier::Full);
         assert!(!calm.contains("## Cluster Nodes (live)"), "cluster guidance without ops intent");
@@ -1839,7 +1839,7 @@ mod system_prompt_budget_tests {
 
     #[test]
     fn ops_intent_is_whole_words_about_running_the_cluster() {
-        for yes in ["restart the vllm backend", "why is node awolf offline", "rotate the TLS certificate", "scale the cluster"] {
+        for yes in ["restart the vllm backend", "why is node node-a offline", "rotate the TLS certificate", "scale the cluster"] {
             assert!(ops_intent(yes), "{yes}");
         }
         for no in ["Reply with the single word ok", "noomesh is great", "a model aeroplane", "write a poem about nodes of light"] {

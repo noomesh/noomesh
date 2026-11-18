@@ -48,6 +48,16 @@ var (
 		p["capabilities"] = r.caps
 	}}
 
+	// The previous stop's drain (stopdrain), once: what finished, what was
+	// cut and whether the bound was hit, for the roll's node report. Absent
+	// on every other beat.
+	secLastStop = payloadSection{name: "last_stop", add: func(r *Reporter, p map[string]any) {
+		if raw := r.pendingLastStop(); raw != nil {
+			p["last_stop"] = raw
+			r.lastStopSent = true
+		}
+	}}
+
 	secPosture = payloadSection{name: "posture", add: func(r *Reporter, p map[string]any) {
 		// Posture, on every beat and at registration: a running agent
 		// requires a client certificate on its control API, and `noo cluster
@@ -169,7 +179,11 @@ var heartbeatSections = []payloadSection{
 	secLanes,
 	secGPUContention,
 	secModelSets,
+	secOllamaVerify,
+	secNodeLocal,
+	secBackendCaps,
 	secNodeFacts,
+	secLastStop,
 }
 
 // Heartbeat-only sections.
@@ -195,6 +209,34 @@ var (
 		// OMITTED when unknown, never 0.
 		if free, ok := r.modelSetsFreeBytes(); ok {
 			p["model_sets_free_bytes"] = free
+		}
+	}}
+
+	secOllamaVerify = payloadSection{name: "ollamaVerify", add: func(r *Reporter, p map[string]any) {
+		// Each placed Ollama model checked against the controller's store
+		// (reconcile/ollama_verify.go): state, anchor and the model layer's
+		// digest, so the controller sees every node's weight digest. OMITTED
+		// until a check has run: an empty list would claim "none placed".
+		if ov := r.ollamaVerifyReport(); ov != nil {
+			p["ollama_verify"] = ov
+		}
+	}}
+
+	secBackendCaps = payloadSection{name: "backendCaps", add: func(r *Reporter, p map[string]any) {
+		// The backend containers' capability set (docker/backends.go): a
+		// name NOO_BACKEND_CAP_ADD asked for outside the allow-list is
+		// dropped, and this is how the controller learns it. OMITTED where
+		// no Docker backends run (not wired).
+		if bc := r.backendCapsReport(); bc != nil {
+			p["backend_caps"] = bc
+		}
+	}}
+
+	secNodeLocal = payloadSection{name: "nodeLocal", add: func(r *Reporter, p map[string]any) {
+		// The node's own declarations (nodelocal): what it declares and what
+		// it refused, so a declaration is seen to survive a roll.
+		if nl := r.nodeLocalReport(); nl != nil {
+			p["node_local"] = nl
 		}
 	}}
 

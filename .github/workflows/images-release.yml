@@ -1130,6 +1130,59 @@ jobs:
           echo "signing CLI verified against the signed manifest of $cli_tag ($got)"
           chmod +x noo-x86_64-unknown-linux-gnu
 
+      # i908: a node installs its agent binary only if its sha256 is in this
+      # signed lock. The binary is the one inside the node-agent image at the
+      # digest this lock pins (what `noo cluster provision` extracts and
+      # bundles), read here per arch into `# node-agent-sha256 linux/<arch>
+      # <sha256>` rows. A comment row with no `@`, so no lock reader takes it
+      # for an image. No seed in this step.
+      - name: Record the node agent binary's sha256 per arch
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          d="$(sed -n 's/^node-agent@\(sha256:[0-9a-f]\{64\}\)$/\1/p' digests/node-agent)"
+          [ -n "$d" ] || { echo "::error::digests/node-agent pins no node-agent image — the lock could not vouch for the node agent"; exit 1; }
+          : > agent-shas.txt
+          for arch in amd64 arm64; do
+            cid="$(docker create --platform "linux/$arch" "$REGISTRY/$OWNER/node-agent@$d")"
+            docker cp "$cid:/usr/local/bin/noo-node-agent" "noo-node-agent-$arch"
+            docker rm -f "$cid" >/dev/null
+            # The tag is stamped into the binary (-ldflags): the same proof
+            # provision applies before it bundles one.
+            grep -aqF "$TAG" "noo-node-agent-$arch" \
+              || { echo "::error::the linux/$arch agent in node-agent@$d does not carry $TAG"; exit 1; }
+            echo "# node-agent-sha256 linux/$arch $(sha256sum "noo-node-agent-$arch" | cut -d' ' -f1)" >> agent-shas.txt
+          done
+          # i908: this lock vouches for the PREVIOUS FINAL's agent too (a node
+          # may step back one release): stack-v<prev>.lock's signature verified
+          # with the keys in this tree, its node-agent digest extracted per arch
+          # as above, rows `# node-agent-sha256@v<prev> linux/<arch> <sha256>`.
+          # About 1 minute (two image pulls). No previous final: none.
+          prev="$(git ls-remote --tags origin 'refs/tags/stack-v*' \
+            | sed -n 's|.*refs/tags/stack-v\([0-9]*\.[0-9]*\.[0-9]*\)$|\1|p' \
+            | python3 scripts/release-vouch-previous.py prev-final --this "${TAG#v}")"
+          if [ -n "$prev" ]; then
+            pd="$RUNNER_TEMP/prev-lock"; rm -rf "$pd"; mkdir -p "$pd"
+            for a in "stack-v$prev.lock" "stack-v$prev.lock.sig"; do
+              gh release download "stack-v$prev" --repo "${{ github.repository }}" --pattern "$a" --dir "$pd" --clobber
+            done
+            pdig="$(python3 scripts/release-vouch-previous.py lock --prev "$prev" --dir "$pd")"
+            for arch in amd64 arm64; do
+              cid="$(docker create --platform "linux/$arch" "$REGISTRY/$OWNER/node-agent@$pdig")"
+              docker cp "$cid:/usr/local/bin/noo-node-agent" "prev-agent-$arch"
+              docker rm -f "$cid" >/dev/null
+              grep -aqF "v$prev" "prev-agent-$arch" \
+                || { echo "::error::the linux/$arch agent in node-agent@$pdig does not carry v$prev"; exit 1; }
+              echo "# node-agent-sha256@v$prev linux/$arch $(sha256sum "prev-agent-$arch" | cut -d' ' -f1)" >> agent-shas.txt
+            done
+          else
+            echo "no final before $TAG: nothing to vouch for"
+          fi
+          cat agent-shas.txt
+
       # The seed is scoped to this step alone — the step that does nothing but
       # sign a file assembled from artifacts this workflow produced itself.
       # Every fetch, every download and every piece of third-party input
@@ -1154,7 +1207,16 @@ jobs:
           # Then the release's storage directory lists (i467): `noo upgrade
           # --check` on an older CLI reads the target's directories from
           # here, signed, so a mirror cannot drop or add one.
-          { echo "# stack $TAG"; echo "# mesh-migration-head $head"; cat storage-dirs.txt; cat digests/* | sort; } > "stack-$TAG.lock"
+          # Then the node agent binary's sha256 per arch (i908): what a node
+          # checks the agent-binary in its bundle against.
+          # Exactly two rows for this release and, when there is a previous
+          # final, exactly two for it (one tag), and nothing else.
+          cur="$(grep -cE '^# node-agent-sha256 linux/(amd64|arm64) [0-9a-f]{64}$' agent-shas.txt || true)"
+          prv="$(grep -cE '^# node-agent-sha256@v[0-9]+\.[0-9]+\.[0-9]+ linux/(amd64|arm64) [0-9a-f]{64}$' agent-shas.txt || true)"
+          tags="$(sed -n 's/^# node-agent-sha256@v\([^ ]*\) .*/\1/p' agent-shas.txt | sort -u | grep -c . || true)"
+          [ "$cur" = 2 ] && { [ "$prv" = 0 ] || { [ "$prv" = 2 ] && [ "$tags" = 1 ]; }; } && [ "$(wc -l < agent-shas.txt)" = "$((cur + prv))" ] \
+            || { echo "::error::agent-shas.txt is not two node-agent-sha256 rows plus, with a previous final, two @v<prev> rows of one tag"; cat agent-shas.txt; exit 1; }
+          { echo "# stack $TAG"; echo "# mesh-migration-head $head"; cat storage-dirs.txt; cat agent-shas.txt; cat digests/* | sort; } > "stack-$TAG.lock"
           echo "== stack-$TAG.lock =="; cat "stack-$TAG.lock"
           ./noo-x86_64-unknown-linux-gnu security release-sign "stack-$TAG.lock"
           ./noo-x86_64-unknown-linux-gnu security release-verify "stack-$TAG.lock"

@@ -3454,7 +3454,7 @@ fn ensure_pki(ctx: &mut Ctx) {
         // the run says so plainly and does not complete.
         let outstanding: Vec<crate::pki::KeyFix> = fixes.iter().filter(|f| f.needs.is_some()).cloned().collect();
         let interactive = !ctx.non_interactive && ctx.ui.inherit_stdio() && super::prompt::stdin_is_tty();
-        let sudo_usable = !outstanding.is_empty() && (interactive || passwordless_sudo());
+        let sudo_usable = !outstanding.is_empty() && root_step_runs(interactive, ctx.skip.root_ok);
         match crate::pki::key_grant_plan(outstanding.len(), sudo_usable) {
             crate::pki::KeyGrantPlan::Nothing => {}
             crate::pki::KeyGrantPlan::Sudo => {
@@ -4441,7 +4441,7 @@ pub(crate) fn storage_base(name: &str, target: &Path) -> PathBuf {
 /// ([`subdir_owner`]) when it has one; for the node agent's write targets
 /// ([`agent_subdir`]) the `noo-agent` account when the host has one; else
 /// whoever owns the root it sits under, read BEFORE anything is created. A root the operator owns gives
-/// the operator; a root owned by the node agent (pop-os: 993:982, as its
+/// the operator; a root owned by the node agent (ctrl: 993:982, as its
 /// `models`) gives the node agent. Onboarding's storage step, its sudo path
 /// and the stack roll (`noo upgrade`, including a lock-only directory) all
 /// ask here, so no two places decide differently.
@@ -4568,7 +4568,7 @@ pub(crate) fn missing_components(base: &Path, name: &str) -> Vec<PathBuf> {
 /// The sudo fallback for one storage directory, as `install -d` argument
 /// lists: one per MISSING component (GNU `install -d -o -g -m` re-owns and
 /// re-modes a directory that already exists, so an existing parent such as
-/// pop-os's 993:982 `models` must never be passed), each with its owner: the
+/// ctrl's 993:982 `models` must never be passed), each with its owner: the
 /// leaf its [`intended_owner`], a parent the root's owner.
 pub(crate) fn sudo_install_plan(name: &str, target: &Path) -> std::io::Result<Vec<Vec<String>>> {
     let base = storage_base(name, target);
@@ -5921,14 +5921,12 @@ fn ensure_self_agent(ctx: &mut Ctx) {
     };
     let identity_ok = crate::commands::provision::pull_units_missing(&node_id).is_empty();
     let interactive = !ctx.non_interactive && ctx.ui.inherit_stdio() && super::prompt::stdin_is_tty();
-    let sudo_quiet = sudo_cmd(false).args(["true"])
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-        .status().map(|s| s.success()).unwrap_or(false);
+    let root_ok = ctx.skip.root_ok || running_as_root();
     let controller = crate::role::detect().controller;
     use crate::commands::provision::{self_agent_step, SelfAgentStep};
     match self_agent_step(controller.as_ref(),
         std::path::Path::new("/usr/local/bin/noo-node-agent").is_file(),
-        systemctl_active, identity_ok, interactive, sudo_quiet)
+        systemctl_active, identity_ok, interactive, root_ok)
     {
         SelfAgentStep::Skip(why) => ctx.info(&format!("Self-agent: skipped — {why}.")),
         SelfAgentStep::AlreadyOnRail => ctx.info("Self-agent already running (noo-node-agent); upgrades reach it over the rail."),
@@ -5943,8 +5941,11 @@ fn ensure_self_agent(ctx: &mut Ctx) {
             // exiting, and that must not end onboard here. One retry after
             // another API wait (i545 finding 8).
             let g = ctx.g;
+            // --root-ok reaches the child: its own decision reads only
+            // isatty(stdin) and the flag, never a sudo probe (i907).
+            let extra: &[&str] = if root_ok { &["--root-ok"] } else { &[] };
             let ran = retry_once(
-                || match crate::commands::upgrade::provision_one(g, &node_id, &[]) {
+                || match crate::commands::upgrade::provision_one(g, &node_id, extra) {
                     Ok(0) => Ok(()),
                     _ => Err(()),
                 },
@@ -6402,8 +6403,9 @@ fn stop_watcher(ctx: &mut Ctx) {
 
 /// Whether this run may install noo-hostd. The binary goes to
 /// /usr/local/bin through sudo, so an interactive run can answer sudo's
-/// prompt; a non-interactive one (`--ci`, no terminal) can only when sudo
-/// is passwordless, which a cloud image's default user and a CI box have.
+/// prompt; a non-interactive one (`--ci`, no terminal) only on `--root-ok`
+/// (i907: the owner says sudo is passwordless — a cloud image's default
+/// user, a CI box; never found out by probing sudo).
 /// Before i251 `--ci` always skipped, and on a host with systemd the
 /// launcher then refused to create the spool it treats as hostd's, so the
 /// documented non-interactive install never started the stack. Pure, so
@@ -6415,10 +6417,10 @@ pub(crate) enum HostdInstall {
     Skip,
 }
 
-pub(crate) fn hostd_install_decision(interactive: bool, sudo_quiet: bool) -> HostdInstall {
+pub(crate) fn hostd_install_decision(interactive: bool, root_ok: bool) -> HostdInstall {
     if interactive {
         HostdInstall::Interactive
-    } else if sudo_quiet {
+    } else if root_ok {
         HostdInstall::PasswordlessSudo
     } else {
         HostdInstall::Skip
@@ -6483,30 +6485,78 @@ pub(crate) fn sudo_refused(ctx: &mut Ctx, what: &str, cmd: &str) {
     ctx.state.hard_failures.push(line);
 }
 
-/// `sudo -n true`: sudo works here without a prompt (a cloud image's
-/// default user, a CI box, the film's box). What a non-interactive run may
-/// elevate with: hostd's install (i251), the private-key grants (i266).
-pub(crate) fn passwordless_sudo() -> bool {
-    sudo_cmd(false)
-        .arg("true")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+/// i907: whether a root step runs in this run, decided WITHOUT invoking
+/// sudo (the product never runs sudo to find out whether it could — a
+/// `sudo -n true` probe is a refused attempt in auth.log on every box where
+/// sudo wants a password). At a terminal the step is stated and run (a
+/// prompt is expected); with no terminal it runs only on the explicit
+/// opt-in `--root-ok` (sudo needs no password here: a CI box, a cloud
+/// image's default user), else it is refused with the step and the exact
+/// command to run at a terminal. Pure, so every answer is pinned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RootStep {
+    Run,
+    Refuse(String),
+}
+
+/// i907: a process that is ALREADY root needs no sudo for a root step and
+/// nothing can prompt, so it counts as `--root-ok` (the rehearsal, the
+/// sandbox script, a root shell). Read from geteuid, never by running sudo.
+/// Tests see `false` unless one sets [`AS_ROOT`], so a root test runner does
+/// not change their verdicts.
+pub(crate) fn running_as_root() -> bool {
+    #[cfg(test)]
+    {
+        AS_ROOT.with(|c| c.get())
+    }
+    #[cfg(all(not(test), unix))]
+    {
+        // SAFETY: geteuid has no preconditions.
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(all(not(test), not(unix)))]
+    {
+        false
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static AS_ROOT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn root_step(at_terminal: bool, root_ok: bool, what: &str, cmd: &str) -> RootStep {
+    if at_terminal || root_ok || running_as_root() {
+        RootStep::Run
+    } else {
+        RootStep::Refuse(format!(
+            "{what} needs root and this run has no terminal to ask at — run it at a terminal: {cmd} \
+             (unattended, where sudo needs no password, add --root-ok)"))
+    }
+}
+
+/// [`root_step`]'s yes/no, for a caller that words its own refusal.
+pub(crate) fn root_step_runs(at_terminal: bool, root_ok: bool) -> bool {
+    root_step(at_terminal, root_ok, "", "") == RootStep::Run
+}
+
+/// Is a person at this process's terminal: `isatty(stdin)`. The only thing a
+/// root-step decision outside onboard reads (onboard also has `--ci`, the
+/// full-screen UI and `--root-ok`: [`Ctx`]).
+pub(crate) fn stdin_at_terminal() -> bool {
+    std::io::IsTerminal::is_terminal(&std::io::stdin())
 }
 
 fn hostd_can_run_here(ctx: &mut Ctx) -> bool {
     let interactive = !ctx.non_interactive && ctx.ui.inherit_stdio() && super::prompt::stdin_is_tty();
-    let sudo_quiet = !interactive && passwordless_sudo();
-    match hostd_install_decision(interactive, sudo_quiet) {
+    match hostd_install_decision(interactive, ctx.skip.root_ok || running_as_root()) {
         HostdInstall::Interactive => true,
         HostdInstall::PasswordlessSudo => {
-            ctx.info("noo-hostd: no terminal, but sudo needs no password here — installing it (controller mode, a user unit)");
+            ctx.info("noo-hostd: no terminal, and --root-ok says sudo needs no password here — installing it (controller mode, a user unit)");
             true
         }
         HostdInstall::Skip => {
-            ctx.info("noo-hostd not installed here (needs sudo and a terminal). Later: noo onboard --only services");
+            ctx.info("noo-hostd not installed here (needs sudo and a terminal). Later, at a terminal: noo onboard --only services (unattended, where sudo needs no password, add --root-ok)");
             false
         }
     }
@@ -7429,6 +7479,21 @@ mod first_model_probe_tests {
         assert!(!probe_error_is_unverifiable("model 'x' is not served by any node; the only chat backend is the Ollama"));
     }
 
+    /// Onboard's pull writes the controller's record of itself: the registry
+    /// manifest is fetched before `ollama pull`, and recorded only after a
+    /// pull that succeeded, against the container that pulled.
+    #[test]
+    fn the_onboard_pull_records_itself_in_the_controller_store() {
+        let src = crate::test_src::own_code(include_str!("steps.rs"));
+        let pull = crate::test_src::fn_body(&src, "fn pull_ollama(");
+        let before = pull.find("ollama_stage::record_before_pull(").expect("the manifest is fetched before the pull");
+        let run = pull.find("cmd.args([\"exec\", target, \"ollama\", \"pull\", model]);").expect("the pull");
+        let ok = pull.find("if code == 0 {").expect("the success branch");
+        let after = pull.find("ollama_stage::record_after_pull(pending,").expect("the record is written after the pull");
+        assert!(before < run && run < ok && ok < after, "fetch, pull, then record on success");
+        assert!(pull[after..].contains("read_container_manifest(target, r)"), "the record compares with the container that pulled");
+    }
+
     #[test]
     fn the_model_step_verifies_after_the_pull() {
         let src = include_str!("steps.rs");
@@ -7627,12 +7692,30 @@ fn pull_ollama(ctx: &mut Ctx, model: &str) {
     // the launcher's pre-pull fetches the RIGHT model on next start even
     // when this pull fails.
     ctx.update_env("OLLAMA_MODEL", model);
+    // The registry's manifest, fetched before the pull: the controller's
+    // record of it is written after, only if the pull installed exactly it
+    // (commands/ollama_stage.rs, "The record of a pull"). An hf.co/ ref has
+    // none.
+    let pending = crate::commands::ollama_stage::record_before_pull(
+        &crate::commands::ollama_stage::registry_base(),
+        model,
+        Path::new(&crate::commands::models_fetch::store_dir_from(
+            Some(ctx.read_env("MODELS_DIR").as_str()),
+            Some(ctx.read_env("NOO_DATA_ROOT").as_str()),
+        )),
+    );
     // Stream pull output live (inherited stdio on the console; forwarded
     // Line events when the TUI owns the terminal).
     let mut cmd = Command::new("docker");
     cmd.args(["exec", target, "ollama", "pull", model]);
     let code = sh::stream_status(ctx, cmd);
     if code == 0 {
+        let record = crate::commands::ollama_stage::record_after_pull(pending, |r| {
+            crate::commands::ollama_stage::read_container_manifest(target, r)
+        });
+        if let Some(line) = record.line() {
+            if record.written() { ctx.info(&line) } else { ctx.warn(&line) }
+        }
         // Record the choice where the LAUNCHER reads it (finding #70): the
         // start script pulls "${OLLAMA_MODEL:-gemma4:e2b}" on every stack
         // start when SOME model already exists there, otherwise skips the
@@ -8982,10 +9065,34 @@ pub fn provision_service_keys(ctx: &mut Ctx) {
 
 #[cfg(test)]
 mod hostd_tests {
-    use super::{hostd_install_args, hostd_install_decision, looks_like_elf, HostdInstall};
+    use super::{hostd_install_args, hostd_install_decision, looks_like_elf, root_step, root_step_runs, HostdInstall, RootStep};
 
-    /// i251: `--ci` on a host with systemd. A terminal is only needed for
-    /// sudo's password; with passwordless sudo the non-interactive run
+    /// i907: the root-step decision reads the terminal and `--root-ok`,
+    /// nothing else (no sudo probe). At a terminal: run (a prompt is
+    /// expected). No terminal, no flag: refused, naming the step and the
+    /// command to run at a terminal. No terminal with the flag: run.
+    #[test]
+    fn a_root_step_runs_at_a_terminal_or_on_root_ok_and_is_named_otherwise() {
+        assert_eq!(root_step(true, false, "the CA trust", "noo onboard --only services"), RootStep::Run);
+        assert_eq!(root_step(true, true, "the CA trust", "noo onboard --only services"), RootStep::Run);
+        assert_eq!(root_step(false, true, "the CA trust", "noo onboard --only services"), RootStep::Run, "--root-ok: unattended, sudo -n");
+        let RootStep::Refuse(why) = root_step(false, false, "the CA trust", "noo onboard --only services") else {
+            panic!("no terminal and no --root-ok must refuse");
+        };
+        assert!(why.starts_with("the CA trust needs root"), "{why}");
+        assert!(why.contains("no terminal") && why.contains("run it at a terminal: noo onboard --only services"), "{why}");
+        assert!(why.contains("--root-ok"), "the refusal names the opt-in: {why}");
+        assert!(root_step_runs(true, false) && root_step_runs(false, true) && !root_step_runs(false, false));
+        // Already root: no sudo runs, nothing can prompt — it runs, unattended.
+        crate::onboard::steps::AS_ROOT.with(|c| c.set(true));
+        let as_root = root_step(false, false, "the CA trust", "noo onboard --only services");
+        crate::onboard::steps::AS_ROOT.with(|c| c.set(false));
+        assert_eq!(as_root, RootStep::Run, "a root process runs its root steps without --root-ok");
+    }
+
+    /// i251 + i907: `--ci` on a host with systemd. A terminal is only needed
+    /// for sudo's password; with `--root-ok` (the owner says sudo needs no
+    /// password — never found out by probing) the non-interactive run
     /// installs hostd like the interactive one does. Without either it
     /// skips, as before.
     #[test]
@@ -10087,12 +10194,12 @@ mod storage_owner_tests {
         let _ = std::fs::remove_dir_all(&b);
     }
 
-    /// pop-os 2026-11-05: root 993:982, models 993:982, the voice dirs
+    /// ctrl 2026-11-05: root 993:982, models 993:982, the voice dirs
     /// missing, tempo missing. The sudo path gives each its owner and never
     /// touches `models`.
     #[test]
     fn the_pop_os_layout_gets_its_owners() {
-        let b = base("popos");
+        let b = base("ctrl");
         std::fs::create_dir_all(b.join("models")).unwrap();
         let agent = (993, 982);
         let plan = sudo_install_plan_with("models/voice/piper", &b.join("models/voice/piper"), agent, agent);

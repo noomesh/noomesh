@@ -299,7 +299,7 @@ def bwrap_argv(scratch: str, ro_paths: tuple[str, ...] = RO_PATHS, program: tupl
     kernel then refuses a fresh procfs (mount_too_revealing: no procfs in
     this mount namespace is fully visible), so `--proc /proc` failed with
     "Can't mount proc on /proc: Operation not permitted" in every Docker
-    container whose security profile let Bubblewrap get that far (pop-os,
+    container whose security profile let Bubblewrap get that far (ctrl,
     0.6.13). Binding the container's /proc instead would show the code
     this server and every other call. Lifting the masks
     (systempaths=unconfined) would loosen the container for the server

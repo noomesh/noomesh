@@ -236,6 +236,8 @@ mod tools;
 mod web_search;
 mod tts_client;
 mod usage;
+mod wire_time;
+mod node_restart;
 mod request_trace;
 mod verify;
 mod websocket;

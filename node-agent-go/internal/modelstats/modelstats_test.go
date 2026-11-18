@@ -54,7 +54,7 @@ func TestParse(t *testing.T) {
 }
 
 // An /api/show body (trimmed): model_info mirrors the GGUF's keys under the
-// architecture's prefix. 262144 is gemma4:12b's, read from its GGUF on awolf.
+// architecture's prefix. 262144 is gemma4:12b's, read from its GGUF on node-a.
 const showBody = `{"modelfile":"…","details":{"family":"gemma4"},"model_info":{
  "general.architecture":"gemma4","gemma4.block_count":48,"gemma4.context_length":262144,
  "gemma4.attention.head_count_kv":[8,8]}}`

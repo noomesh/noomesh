@@ -1131,7 +1131,7 @@ mod tests {
         assert!(e.warnings.iter().all(|w| !w.contains("OLLAMA_CONTEXT_LENGTH")), "{:?}", e.warnings);
     }
 
-    /// i655, mcmini's real figures (Ollama 0.40.16, 2026-11-11): e4b's
+    /// i655, node-mac's real figures (Ollama 0.40.16, 2026-11-11): e4b's
     /// /api/ps size (0.58 GB) is below its 6.1 GB of weights, so fit uses the
     /// estimate and says why; harrier's (0.57 GB over 0.40 GB of weights) is a
     /// real measurement and stays one.

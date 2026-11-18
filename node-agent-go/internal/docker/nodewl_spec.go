@@ -215,7 +215,7 @@ func workerLabels(e nodewl.Entry) map[string]string {
 // mode=1777"), the form rootFloor gives every door's /tmp: the Mounts API's
 // TmpfsOptions.Options accepts only exec/noexec and a real daemon refuses
 // nosuid and nodev there ("invalid mount config for type tmpfs: invalid
-// option: nosuid", awolf 0.6.21; the fake daemon in the unit tests never
+// option: nosuid", node-a 0.6.21; the fake daemon in the unit tests never
 // checked). A tmpfs_mb entry used to be a mount.TypeTmpfs. A max_mb entry is a per-workload named volume of the
 // local driver backed by a tmpfs of that size: Docker's local driver cannot
 // cap a volume otherwise (the size option needs an xfs project quota the

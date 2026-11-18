@@ -102,7 +102,7 @@ pub const DEFAULT_STREAM_IDLE_SECS: u64 = 300;
 ///
 /// A stream has NO total bound. [`backend_timeout`] is a whole-request
 /// timeout, and on a streamed body it cut a slow node's answer at exactly
-/// 300 s while tokens were still arriving (mcmini, gemma4:12b reasoning for
+/// 300 s while tokens were still arriving (node-mac, gemma4:12b reasoning for
 /// 3-4.5 min per call, 2026-10-17). A stream is alive while bytes arrive;
 /// what ends it is silence.
 ///

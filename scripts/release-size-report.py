@@ -139,7 +139,7 @@ def _baseline_module():
 MB = _baseline_module()
 NODE_SHARE_LABEL = MB.NODE_SHARE_LABEL
 FLEET_LINE = ("fleet, read-only: on 0.6.24+ each node agent exports its own process_resident_memory_bytes "
-              "and noo_unit_memory_bytes (#1026); real-hardware node figures (robopi, the Mac) are read from "
+              "and noo_unit_memory_bytes (#1026); real-hardware node figures (node-pi, the Mac) are read from "
               "the metrics door, no manual measurement.")
 
 

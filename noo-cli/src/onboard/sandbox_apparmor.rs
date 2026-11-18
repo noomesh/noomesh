@@ -27,7 +27,7 @@
 
 use std::path::Path;
 
-use super::steps::{ctx_sudo, ctx_sudo_may_prompt, passwordless_sudo};
+use super::steps::{ctx_sudo, ctx_sudo_may_prompt, root_step_runs};
 use super::Ctx;
 
 /// The profile's name inside the kernel and the compose `apparmor=` value.
@@ -222,11 +222,12 @@ pub(crate) fn ensure(ctx: &mut Ctx) {
                 refuse(ctx, &format!("{} is missing from the install root", ctx.repo_root.join(BUNDLED).display()), &src);
                 return;
             }
-            if !ctx_sudo_may_prompt(ctx) && !passwordless_sudo() {
+            if !root_step_runs(ctx_sudo_may_prompt(ctx), ctx.skip.root_ok) {
                 // Loud in every mode, not only --ci (sudo_refused's rule): a
                 // full-screen run cannot prompt either, and a sandbox that
-                // refuses every call is not a warning.
-                refuse(ctx, "sudo needs a password and this run cannot ask", &src);
+                // refuses every call is not a warning. Decided from the
+                // terminal and --root-ok, never a sudo probe (i907).
+                refuse(ctx, "installing it needs root and this run has no terminal to ask at (unattended, where sudo needs no password, add --root-ok)", &src);
                 return;
             }
             ctx.progress("Installing the sandbox AppArmor profile (Bubblewrap needs mount under AppArmor)...");
@@ -267,7 +268,7 @@ mod tests {
 
     #[test]
     fn the_lsm_comes_from_the_kernel_list_not_the_distribution() {
-        assert_eq!(active_lsm(Some("lockdown,capability,landlock,yama,apparmor,ima,evm\n")), Lsm::AppArmor, "aserve, Ubuntu 26.04");
+        assert_eq!(active_lsm(Some("lockdown,capability,landlock,yama,apparmor,ima,evm\n")), Lsm::AppArmor, "node-b, Ubuntu 26.04");
         assert_eq!(active_lsm(Some("lockdown,capability,yama,apparmor")), Lsm::AppArmor, "Debian");
         assert_eq!(active_lsm(Some("lockdown,capability,yama,selinux,bpf,landlock")), Lsm::SeLinux, "Fedora");
         assert_eq!(active_lsm(Some("capability,landlock,lockdown,yama,bpf")), Lsm::Neither, "Arch");

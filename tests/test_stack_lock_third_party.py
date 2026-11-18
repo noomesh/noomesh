@@ -173,7 +173,7 @@ def test_node_defaults_name_the_compose_versions():
 
 def test_lock_job_signs_the_tag_into_the_lock():
     wf = (ROOT / ".github/workflows/images-release.yml").read_text()
-    assert '{ echo "# stack $TAG"; echo "# mesh-migration-head $head"; cat storage-dirs.txt; cat digests/* | sort; } > "stack-$TAG.lock"' in wf
+    assert '{ echo "# stack $TAG"; echo "# mesh-migration-head $head"; cat storage-dirs.txt; cat agent-shas.txt; cat digests/* | sort; } > "stack-$TAG.lock"' in wf
 
 
 def test_lock_job_signs_the_migration_head_from_a_seedless_step():
@@ -193,7 +193,7 @@ def test_lock_job_signs_the_storage_lines():
     so `noo upgrade --check` reads them from verified bytes."""
     wf = (ROOT / ".github/workflows/images-release.yml").read_text()
     assert wf.index("cp noo-cli/src/onboard/storage-dirs.lock-lines storage-dirs.txt") < wf.index("Fetch and verify the signing CLI")
-    assert wf.index("cat storage-dirs.txt; cat digests/*") < wf.index('security release-sign "stack-$TAG.lock"')
+    assert wf.index("cat storage-dirs.txt; cat agent-shas.txt; cat digests/*") < wf.index('security release-sign "stack-$TAG.lock"')
 
 
 def _lib_dist_fn(name):

@@ -211,28 +211,28 @@ mod tests {
 
     #[test]
     fn a_node_whose_leaf_covers_its_address_is_listed_with_only_host_port_and_node() {
-        let pem = leaf(&["aserve", "localhost"], &["100.98.144.38", "127.0.0.1"]);
-        let (body, skipped) = targets(&[("aserve".into(), rec("https://100.98.144.38:8081"))], |_| Some(pem.clone()));
+        let pem = leaf(&["node-b", "localhost"], &["100.64.0.100", "127.0.0.1"]);
+        let (body, skipped) = targets(&[("node-b".into(), rec("https://100.64.0.100:8081"))], |_| Some(pem.clone()));
         assert!(skipped.is_empty(), "{skipped:?}");
-        assert_eq!(body, vec![json!({ "targets": ["100.98.144.38:8081"], "labels": { "node": "aserve" } })]);
+        assert_eq!(body, vec![json!({ "targets": ["100.64.0.100:8081"], "labels": { "node": "node-b" } })]);
     }
 
     #[test]
     fn a_leaf_without_a_san_for_the_address_is_left_out_with_the_reissue_command() {
-        let pem = leaf(&["aserve", "localhost"], &["10.0.0.9", "127.0.0.1"]);
-        let (body, skipped) = targets(&[("aserve".into(), rec("https://100.98.144.38:8081"))], |_| Some(pem.clone()));
+        let pem = leaf(&["node-b", "localhost"], &["10.0.0.9", "127.0.0.1"]);
+        let (body, skipped) = targets(&[("node-b".into(), rec("https://100.64.0.100:8081"))], |_| Some(pem.clone()));
         assert!(body.is_empty(), "{body:?}");
         assert_eq!(skipped.len(), 1);
-        assert!(skipped[0].reason.contains("noo security pki issue-node aserve 100.98.144.38"), "{:?}", skipped[0]);
+        assert!(skipped[0].reason.contains("noo security pki issue-node node-b 100.64.0.100"), "{:?}", skipped[0]);
     }
 
     #[test]
     fn a_name_address_needs_a_dns_san_and_an_ip_san_never_stands_for_it() {
         let by_name = leaf(&["noo-controller", "localhost"], &["127.0.0.1"]);
-        let (body, _) = targets(&[("pop-os".into(), rec("https://noo-controller:8081"))], |_| Some(by_name.clone()));
+        let (body, _) = targets(&[("ctrl".into(), rec("https://noo-controller:8081"))], |_| Some(by_name.clone()));
         assert_eq!(body.len(), 1, "a DNS SAN covers a name address");
-        let ip_only = leaf(&["localhost"], &["100.72.99.2"]);
-        let (body, skipped) = targets(&[("pop-os".into(), rec("https://noo-controller:8081"))], |_| Some(ip_only.clone()));
+        let ip_only = leaf(&["localhost"], &["100.64.0.101"]);
+        let (body, skipped) = targets(&[("ctrl".into(), rec("https://noo-controller:8081"))], |_| Some(ip_only.clone()));
         assert!(body.is_empty() && skipped.len() == 1, "an IP SAN is not a name");
     }
 

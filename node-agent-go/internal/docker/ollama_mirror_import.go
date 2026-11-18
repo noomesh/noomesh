@@ -105,7 +105,11 @@ func (c *Client) importMirror(ctx context.Context, name string, r mirrorRef, gm 
 
 	var deps mirrorDeps
 	var via, base string
-	if _, ok := ollamaBinary(); ok {
+	_, host, pathErr := c.ollamaImportHost(ctx)
+	if pathErr != nil {
+		return nil, pathErr
+	}
+	if host {
 		via, base = "host", nativeOllamaBase()
 		modelsDir := nativeOllamaModelsDir()
 		deps.writeManifest = func(_ context.Context, ns, n, tag string, b []byte) (*manifestWrite, error) {
@@ -118,13 +122,13 @@ func (c *Client) importMirror(ctx context.Context, name string, r mirrorRef, gm 
 		}
 		if !c.isRunning(ctx, OllamaContainer) {
 			return nil, fmt.Errorf(
-				"no `ollama` binary on this node and the %s container is not running — start it (`noo cluster start-backend %s ollama`) or install ollama, then re-run",
+				"the %s container is not running and the import goes only to it on this node — start it (`noo cluster start-backend %s ollama`), then re-run",
 				OllamaContainer, os.Getenv("NODE_ID"))
 		}
 		if strings.TrimSpace(os.Getenv("OLLAMA_URL")) != "" {
 			// The blobs would go to the daemon at OLLAMA_URL and the manifest
 			// into the container's store: two ollamas, one half each.
-			return nil, fmt.Errorf("OLLAMA_URL is set (%s) but this node has no host ollama, so the import would write into %s while pushing to that URL — unset OLLAMA_URL or install ollama on the host",
+			return nil, fmt.Errorf("OLLAMA_URL is set (%s) but the import goes to the container on this node, so it would write into %s while pushing to that URL — unset OLLAMA_URL or install ollama on the host",
 				os.Getenv("OLLAMA_URL"), OllamaContainer)
 		}
 		via, base = "container", c.BackendDialURL(ctx, "ollama")
@@ -150,6 +154,12 @@ func (c *Client) importMirror(ctx context.Context, name string, r mirrorRef, gm 
 	return &PullOllamaModelResult{Status: "created", Model: name, Via: via, ManifestSHA256: m.SHA256, Blobs: len(m.Blobs)}, nil
 }
 
+// ErrOllamaRecordOnly is a tag whose manifest the controller's store holds
+// without the blobs it names: the record `noo models pull` and onboard write
+// of a pull (manifest only, no bytes), or a stage whose blobs were removed.
+// There is nothing to import or repair from until the tag is staged.
+var ErrOllamaRecordOnly = errors.New("the controller holds the record of this pull, not its bytes")
+
 // fetchMirrorBlob fetches one blob from the store into work. The store's
 // digest for the file must be the blob's own name: a file that hashes to
 // anything else is not that blob, whatever the transfer says.
@@ -157,7 +167,7 @@ func fetchMirrorBlob(ctx context.Context, model string, b mirrorBlob, cacheURL, 
 	n := b.blobName()
 	am, err := awaitArtifactManifest(ctx, "ollamablob", n)
 	if errors.Is(err, ErrArtifactAbsent) {
-		return "", fmt.Errorf("the controller store's mirror of %s lacks blob %s (%s) — restage it with `noo models fetch ollama:%s --force`", model, b.short(), b.Media, model)
+		return "", fmt.Errorf("%w (its store has no blob %s, %s): run `noo models fetch ollama:%s` to stage them", ErrOllamaRecordOnly, b.short(), b.Media, model)
 	}
 	if err != nil {
 		return "", fmt.Errorf("could not get the artifact manifest for blob %s from the controller: %w", b.short(), err)

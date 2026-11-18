@@ -57,7 +57,7 @@ func TestPrefetchSelectsOnlyPlacementsTheStartLoopWillStart(t *testing.T) {
 	}
 
 	// Converged label, but the container runs on a floating ref an older
-	// agent picked (aserve's noo-ollama on ollama/ollama:latest): a recreate.
+	// agent picked (node-b's noo-ollama on ollama/ollama:latest): a recreate.
 	labels["embedding"] = specHash(converged)
 	floating := map[string]string{"embedding": "ollama/ollama:latest"}
 	refs, n = imagesToPrefetch(effective, running, labels, floating, native, map[string]string{})

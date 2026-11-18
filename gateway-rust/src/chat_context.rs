@@ -243,7 +243,7 @@ pub fn decide(backend: &str, env: &Value, model: &str, node: &Value, profile_con
 /// Never decide below what the daemon already runs the model at (when that
 /// is within the declaration): the box holds it today, and an unmeasured
 /// model's conservative cache figure must not shrink a working context on
-/// the roll (mcmini runs gemma4:12b at its tier's 32768 from the plist).
+/// the roll (node-mac runs gemma4:12b at its tier's 32768 from the plist).
 pub fn held_at_running(fit: Fit, declared: u64, running: Option<u64>) -> Fit {
     match running.filter(|r| *r > fit.tokens && *r <= declared) {
         Some(r) => Fit { tokens: r, capped: Some(format!("kept at the {r} it already runs (the fit alone said {}: {})", fit.tokens, fit.capped.unwrap_or_default())) },
@@ -732,6 +732,15 @@ fn calibrations() -> std::sync::MutexGuard<'static, CalibMap> {
     CALIBRATION.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Forget what this process learned for (backend URL, model): back to
+/// untrusted (ratio 1.0, which over-counts: safe). Called on a detected cut.
+/// A trusted ratio that is too LOW (learned, then a model swapped in under the
+/// same name) overfills prompts; a cut teaches nothing (only a whole read
+/// does), so without this it would stay wrong.
+pub fn forget(backend_url: &str, model: &str) {
+    calibrations().remove(&(backend_url.to_string(), model.trim().to_string()));
+}
+
 /// What this process has learned for (backend URL, model).
 pub fn calibration(backend_url: &str, model: &str) -> Calibration {
     calibrations().get(&(backend_url.to_string(), model.trim().to_string())).copied().unwrap_or_default()
@@ -767,11 +776,17 @@ pub enum CallRead {
 
 /// The cut signature (i802 D): Ollama cut the prompt when the count lands
 /// within [`CUT_SLACK`] of [`cut_length`] AND the prompt was larger than the
-/// context: by the calibrated estimate once the ratio is trusted, else by
-/// the raw estimate past 1.5× the context (the raw estimate runs high).
+/// context: by the raw estimate past 1.5× the context (the raw estimate runs
+/// high), OR by the calibrated estimate once the ratio is trusted. The ratio
+/// can only ADD a cut, never clear one: a trusted ratio that is too low is
+/// exactly what a cut must be able to expose ([`forget`]), so the ratio under
+/// doubt does not get to call the cut a coincidence. An honest low ratio whose
+/// whole read lands on the line with a raw estimate past 1.5× is read as a
+/// cut too: it re-learns in three samples, over-counting meanwhile (safe).
 pub fn read_call(ctx: u64, sent_estimate: u64, evaluated: u64, calib: Calibration) -> CallRead {
     let on_line = evaluated.abs_diff(cut_length(ctx)) <= CUT_SLACK;
-    let larger = if calib.trusted() { calib.calibrated(sent_estimate) > ctx } else { sent_estimate.saturating_mul(2) > ctx.saturating_mul(3) };
+    let raw_larger = sent_estimate.saturating_mul(2) > ctx.saturating_mul(3);
+    let larger = raw_larger || (calib.trusted() && calib.calibrated(sent_estimate) > ctx);
     if on_line && larger {
         CallRead::Cut
     } else if on_line {
@@ -1154,7 +1169,7 @@ mod tests {
         assert_eq!(read_call(4096, 8800, 2051, fresh), CallRead::Cut, "raw 8,800 > 1.5 x 4,096");
         assert_eq!(read_call(4096, 5000, 2051, fresh), CallRead::OnTheLine, "raw 5,000 may be 2,051 real: not alerted");
         let gemma = Calibration { ratio: 0.25, samples: 3 };
-        assert_eq!(read_call(4096, 8800, 2051, gemma), CallRead::OnTheLine, "calibrated 2,200 fits 4,096");
+        assert_eq!(read_call(4096, 8800, 2051, gemma), CallRead::Cut, "raw 8,800 > 1.5 x 4,096: the ratio under doubt cannot clear a cut");
         let qwen = Calibration { ratio: 0.6, samples: 3 };
         assert_eq!(read_call(4096, 8800, 2051, qwen), CallRead::Cut, "calibrated 5,280 does not");
         assert_eq!(read_call(4096, 8800, 2040, fresh), CallRead::Cut, "within 16");
@@ -1206,4 +1221,55 @@ mod tests {
         let ret = f[gate..].find("return None;").map(|i| gate + i).expect("the gate returns None");
         assert!(ret < f.find(".await").expect("it reads"), "{f}");
     }
+
+    /// A too-low trusted ratio (learned, then a model swapped in under the
+    /// same name) and an overfilled prompt: the cut is seen, not filed as a
+    /// coincidence on the line, and the key goes back to untrusted.
+    #[test]
+    fn a_too_low_trusted_ratio_cannot_hide_a_cut_and_a_cut_resets_it() {
+        let url = "http://node_a:11434/forget-test";
+        let model = "swapped:1b";
+        forget(url, model);
+        for _ in 0..3 {
+            learn(url, model, 1000, 300);
+        }
+        let low = calibration(url, model);
+        assert!(low.trusted() && (low.ratio - 0.30).abs() < 1e-9, "{low:?}");
+        // the new model really counts ~0.65 per estimated token: 8,000 -> 5,200 > 4,096, cut to 2,051
+        assert_eq!(low.calibrated(8000), 2400, "the low ratio thinks it fits");
+        assert_eq!(read_call(4096, 8000, 2051, low), CallRead::Cut);
+        forget(url, model);
+        let reset = calibration(url, model);
+        assert!(!reset.trusted() && reset.ratio == 1.0, "{reset:?}");
+        // a whole read after the reset learns again from scratch
+        assert_eq!(read_call(16384, 3000, 1950, reset), CallRead::Whole);
+        let again = learn(url, model, 3000, 1950);
+        assert_eq!(again.samples, 1);
+        assert!((again.ratio - 0.65).abs() < 1e-9, "{again:?}");
+        forget(url, model);
+    }
+
+    /// Both paths that detect a cut forget the ratio: the coordinator's
+    /// Ollama arm, and the raw proxy's CutWatch::note (every judged cut).
+    #[test]
+    fn every_detected_cut_forgets_the_ratio() {
+        let al = include_str!("coordinator/agent_loop.rs");
+        let arm = al.find("crate::chat_context::CallRead::Cut if ollama =>").expect("the coordinator's cut arm");
+        let arm = &al[arm..arm + al[arm..].find("\n        }").expect("arm end")];
+        assert!(arm.contains("crate::chat_context::forget(&backend.url, &backend.model);"), "{arm}");
+        let cc = include_str!("context_cut.rs");
+        let note = crate::test_src::fn_body(cc, "pub async fn note(");
+        assert!(note.contains("crate::chat_context::forget(&self.backend_url, &self.model);"), "{note}");
+    }
+
+    /// An honest trusted ratio is not reset by a call that fits: off the
+    /// line it is a whole read (it teaches), and on the line with a raw
+    /// estimate under 1.5x the context it is only on the line.
+    #[test]
+    fn an_honest_ratio_is_not_cut_by_a_call_that_fits() {
+        let honest = Calibration { ratio: 0.65, samples: 5 };
+        assert_eq!(read_call(4096, 3000, 1950, honest), CallRead::Whole);
+        assert_eq!(read_call(4096, 3100, 2051, honest), CallRead::OnTheLine, "raw 3,100 <= 1.5 x 4,096 and 2,015 calibrated fits");
+    }
+
 }

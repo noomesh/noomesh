@@ -213,7 +213,7 @@ type NoomeshContainer struct {
 	// Orphan: recognised by NAME only. It carries neither the stack's compose
 	// project label nor the agent's noo.managed-by label, so nothing this
 	// agent or the stack currently owns made it — an older-image leftover
-	// (found live on pop-os 2026-10-21: a noo-ollama from before the labels).
+	// (found live on ctrl 2026-10-21: a noo-ollama from before the labels).
 	// It is still noomesh's GPU use; it is flagged so it can be cleaned up.
 	Orphan bool
 }

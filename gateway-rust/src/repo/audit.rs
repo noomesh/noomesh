@@ -15,15 +15,13 @@
 //! would need the `.sqlx` offline cache regenerated. `"timestamp"` is quoted
 //! in the statements that name it as a column because it is a type keyword.
 
-use chrono::{DateTime, Utc};
-
 // ── Reads ───────────────────────────────────────────────────────────────
 
 /// One listed row: `(id, timestamp, event_type, severity, actor, resource,
 /// outcome, request_id, details_text, chain_seq, entry_hash)`.
 pub type ListRow = (
     String,
-    DateTime<Utc>,
+    jiff::Timestamp,
     String,
     String,
     String,
@@ -40,16 +38,29 @@ pub type ListRow = (
 /// one extra to learn whether another page exists).
 pub async fn list<'e, E>(
     db: E,
-    since: Option<DateTime<Utc>>,
+    since: Option<jiff::Timestamp>,
     event_type: Option<&str>,
     actor: Option<&str>,
-    cursor: Option<(DateTime<Utc>, &str)>,
+    cursor: Option<(jiff::Timestamp, &str)>,
     limit: i64,
 ) -> Result<Vec<ListRow>, sqlx::Error>
 where
     E: sqlx::PgExecutor<'e>,
 {
-    sqlx::query_as(
+    type Db = (
+        String,
+        jiff_sqlx::Timestamp,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    );
+    let rows: Vec<Db> = sqlx::query_as(
         "SELECT id::text, \"timestamp\", event_type, severity, actor, resource, outcome, \
                 request_id, details::text, chain_seq, entry_hash \
            FROM noo_security_audit \
@@ -60,14 +71,18 @@ where
           ORDER BY \"timestamp\" DESC, id DESC \
           LIMIT $6",
     )
-    .bind(since)
+    .bind(since.map(jiff_sqlx::Timestamp::from))
     .bind(event_type)
     .bind(actor)
-    .bind(cursor.map(|c| c.0))
+    .bind(cursor.map(|c| jiff_sqlx::Timestamp::from(c.0)))
     .bind(cursor.map(|c| c.1))
     .bind(limit)
     .fetch_all(db)
-    .await
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.0, r.1.to_jiff(), r.2, r.3, r.4, r.5, r.6, r.7, r.8, r.9, r.10))
+        .collect())
 }
 
 /// Event counts by `event_type` over the trailing `interval` (a Postgres
@@ -160,26 +175,27 @@ where
 }
 
 /// `(chain_seq, chain_hash, timestamp)` of the newest chained row.
-pub type ChainTail = (i64, String, DateTime<Utc>);
+pub type ChainTail = (i64, String, jiff::Timestamp);
 
 /// The chain's tail. Callers hold the chain advisory lock when it matters.
 pub async fn chain_tail<'e, E>(db: E) -> Result<Option<ChainTail>, sqlx::Error>
 where
     E: sqlx::PgExecutor<'e>,
 {
-    sqlx::query_as::<_, ChainTail>(
+    let row = sqlx::query_as::<_, (i64, String, jiff_sqlx::Timestamp)>(
         "SELECT chain_seq, chain_hash, \"timestamp\" FROM noo_security_audit \
          WHERE chain_seq IS NOT NULL ORDER BY chain_seq DESC LIMIT 1",
     )
     .fetch_optional(db)
-    .await
+    .await?;
+    Ok(row.map(|(seq, hash, ts)| (seq, hash, ts.to_jiff())))
 }
 
 /// `(min, max)` chained `chain_seq` with a timestamp in `[start, end)`.
 pub async fn chain_span<'e, E>(
     db: E,
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
+    start: jiff::Timestamp,
+    end: jiff::Timestamp,
 ) -> Result<(Option<i64>, Option<i64>), sqlx::Error>
 where
     E: sqlx::PgExecutor<'e>,
@@ -188,8 +204,8 @@ where
         "SELECT min(chain_seq), max(chain_seq) FROM noo_security_audit \
          WHERE \"timestamp\" >= $1 AND \"timestamp\" < $2 AND chain_seq IS NOT NULL",
     )
-    .bind(start)
-    .bind(end)
+    .bind(jiff_sqlx::Timestamp::from(start))
+    .bind(jiff_sqlx::Timestamp::from(end))
     .fetch_one(db)
     .await
 }
@@ -199,8 +215,8 @@ where
 pub async fn chain_hash_at<'e, E>(
     db: E,
     seq: i64,
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
+    start: jiff::Timestamp,
+    end: jiff::Timestamp,
 ) -> Result<Option<Option<String>>, sqlx::Error>
 where
     E: sqlx::PgExecutor<'e>,
@@ -210,8 +226,8 @@ where
          AND \"timestamp\" >= $2 AND \"timestamp\" < $3",
     )
     .bind(seq)
-    .bind(start)
-    .bind(end)
+    .bind(jiff_sqlx::Timestamp::from(start))
+    .bind(jiff_sqlx::Timestamp::from(end))
     .fetch_optional(db)
     .await
 }
@@ -238,21 +254,23 @@ where
 /// Rows not yet in the chain: `(id, timestamp, entry_hash)`.
 pub async fn unchained<'e, E>(
     db: E,
-) -> Result<Vec<(String, DateTime<Utc>, Option<String>)>, sqlx::Error>
+) -> Result<Vec<(String, jiff::Timestamp, Option<String>)>, sqlx::Error>
 where
     E: sqlx::PgExecutor<'e>,
 {
-    sqlx::query_as(
+    let rows: Vec<(String, jiff_sqlx::Timestamp, Option<String>)> = sqlx::query_as(
         "SELECT id::text, \"timestamp\", entry_hash FROM noo_security_audit WHERE chain_seq IS NULL",
     )
     .fetch_all(db)
-    .await
+    .await?;
+    Ok(rows.into_iter().map(|(id, ts, h)| (id, ts.to_jiff(), h)).collect())
 }
 
-/// The thirteen columns `verify` judges, as one tuple.
+/// The thirteen columns `verify` judges, as one tuple, as Postgres decodes
+/// it (jiff-sqlx carries the timestamptz; `to_row` converts it once).
 pub type VerifyRow = (
     String,
-    DateTime<Utc>,
+    jiff_sqlx::Timestamp,
     String,
     String,
     String,
@@ -308,7 +326,7 @@ where
 /// `request_id`, `prev_hash` and the chain pair are NULL when `None`.
 pub struct InsertRow<'a> {
     pub id: &'a str,
-    pub ts: DateTime<Utc>,
+    pub ts: jiff::Timestamp,
     pub event_type: &'a str,
     pub severity: &'a str,
     pub actor: &'a str,
@@ -335,7 +353,7 @@ where
          VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13)",
     )
     .bind(r.id)
-    .bind(r.ts)
+    .bind(jiff_sqlx::Timestamp::from(r.ts))
     .bind(r.event_type)
     .bind(r.severity)
     .bind(r.actor)

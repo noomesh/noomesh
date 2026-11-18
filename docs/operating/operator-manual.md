@@ -164,7 +164,7 @@ noo stack rebuild-status --follow
 ```
 
 `--background` needs noo-hostd, the controller-mode user unit `noo
-onboard` installs (`systemctl --user status noo-hostd`; reinstall with
+onboard` installs at a terminal or with `--ci --root-ok` (plain `--ci` skips it) (`systemctl --user status noo-hostd`; reinstall with
 `noo onboard --only services`). The same executor runs scheduled
 backups, certificate rotation and disk reclaim from the spool. A
 background rebuild logs to `.noo-host-spool/<name>.rebuild.log` and refuses `--profile`
@@ -208,27 +208,9 @@ Roll node agents without touching the stack: `noo cluster upgrade-agents`
 over the pull rail, applied with a health-checked restart). Its old
 gateway-signed binary swap is retired.
 
-### Old images after an upgrade
-
-After a roll, `noo upgrade --stack` removes superseded images that are
-provably ours: noomesh's images, and each pinned add-on image's own
-repository, that no current or previous lock or pin names and no container
-uses. A lock names each image by digest, and the image is kept by that
-digest whatever name Docker holds it under. It never touches anything else:
-your own images, and Docker Hub images (short names such as `redis:7`), are
-always kept. A Hub image the stack lock pins (`nats`, `nginx`) is named in
-the keep file too; it would be kept either way, since a Hub short name is
-never ours to remove. This is the only step of a
-roll that removes images (see the 0.6.25 entry below). The first roll that
-carries this only previews (it lists what it would remove in
-`.noo-host-spool/image-retention-report.json`); later rolls remove. Set
-`cluster.image_retention: preview` (keep previewing) or `off` in
-`noomesh.yaml` to change that.
-
-Cleanup runs only when the roll's `stack images`, `add-on pins` and
-`add-on containers` rows in `noo cluster verify --controller` pass. When
-they do not, the roll says which row blocked it, and the `image retention`
-row says so until a roll cleans.
+Old images: a roll removes the ones it superseded, after a preview, and
+nothing else in a roll removes images (since 0.6.25, below); see
+[disk-and-images.md](disk-and-images.md).
 
 A container still running from a compose profile this stack no longer runs
 (for example `noo-stunnel-ollama` after the controller stopped running its own
@@ -247,7 +229,7 @@ works, so read it before you pull.
 
 Up to 0.6.24 every `noo upgrade --stack` also removed noomesh images no
 container used, whatever `cluster.image_retention` said, the previous
-release's included. That step is gone: image retention (above) is the only
+release's included. That step is gone: image retention ([disk-and-images.md](disk-and-images.md)) is the only
 remover. So the first 0.6.25 roll removes nothing; it lists what the next
 one would (`.noo-host-spool/image-retention-report.json`, and the
 `image retention` row of `noo cluster verify --controller`). Until that next
@@ -405,7 +387,7 @@ failed heartbeat tasks) arrive on your configured channel; the
 | Grafana refuses the login, or Open Grafana answers 503 | `noo cluster verify --controller` (`grafana door`, `grafana sso`) | Grafana has no password login: open it from the console. A 503 means single sign-on is off — `noo upgrade --stack` fills `GRAFANA_ROOT_URL` |
 | Open Grafana shows a certificate error (`ERR_CERT_AUTHORITY_INVALID`) on a tailnet controller | `noo cluster verify --controller` (`grafana door`) | Grafana is published straight on the tailnet IP, or nothing fronts its port. `noo upgrade --stack` adds the `tailscale serve` entry that presents the tailnet's certificate, then moves Grafana to loopback. If the roll warns that the entry could not be written, run the `tailscale serve --bg --https=3000 https://127.0.0.1:3000` line it prints (tailscaled up), then `noo upgrade --stack` again. If the row says the port carries another entry, that entry is yours: noo will not overwrite it |
 | Open Grafana fails from another machine on a `local`/`all`/LAN controller | `noo cluster verify --controller` (`grafana door`) | Grafana is on the controller's loopback only. Tunnel first: `ssh -L 3000:127.0.0.1:3000 <you>@<controller>`, then Open Grafana |
-| disk full | `noo logs errors`; alerts | `noo autonomy decisions -l disk_watermark` shows what reclaiming would remove; `noo autonomy live disk_watermark` (or Go live in the console's Autonomy panel) arms it and takes it out of preview, so it acts; `noo autonomy preview disk_watermark` stops it |
+| disk full | `noo logs errors`; alerts | [disk-and-images.md](disk-and-images.md) |
 
 Emergency stop: `noo stack stop` (or, when the launcher itself cannot
 run, `cd ~/.noo && docker compose -f docker-compose.cluster.yml kill` —

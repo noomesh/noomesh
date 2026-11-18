@@ -120,7 +120,7 @@ x-trellion-env: &trellion-env
   #     NOO_GENERIC_WEBHOOK_CHANNELS (Rust webhook router; Python side
   #     is reached via NATS payloads), NOO_SELF_MODIFY_RATE_*
   #     (read directly by the Rust restart/rebuild rate limiter),
-  #     NOO_ENCRYPTION_KEY / NOO_EGRESS_ALLOWLIST / NOO_CONTROLLER_ID /
+  #     NOO_ENCRYPTION_KEY / NOO_CONTROLLER_ID /
   #     NOO_BACKEND_MIN_VRAM_GB (not in the gateway allowlist today
   #     either — flagged in the WP-T23 audit as pre-existing gaps,
   #     add to BOTH blocks if ever needed).

@@ -21,8 +21,8 @@
 // to end the pass early.
 //
 // Placements whose model FILE is absent are skipped with a loud log
-// (`reconcile.model_missing`) instead of starting a crash-looping
-// container — the exact 2026-07-03 host8 failure mode.
+// (`reconcile.model_missing`) and a backend_start refusal instead of
+// starting a crash-looping container — the exact 2026-07-03 host8 failure mode.
 package reconcile
 
 import (
@@ -112,6 +112,9 @@ type desiredConfig struct {
 	// The controller's node reclaim policy (disk_watermark location). A
 	// pre-policy gateway omits it; nil means "do not act".
 	DiskReclaim *diskreclaim.Policy `json:"disk_reclaim"`
+	// What the controller understands from this agent (stopdrain): absent on
+	// an older gateway, which then never gets the node_restarting refusal.
+	GatewayFeatures []string `json:"gateway_features"`
 	// The node's resolved harness profile (tier default, override,
 	// measured). A pre-profile gateway omits it; absent means "no
 	// profile", which is exactly the behaviour before profiles existed.
@@ -151,6 +154,9 @@ type Reconciler struct {
 	// onReclaimPolicy receives desired-config's disk_reclaim on every
 	// successful fetch (nil when the gateway sends none).
 	onReclaimPolicy func(*diskreclaim.Policy)
+	// onGatewayFeatures receives desired-config's gateway_features on every
+	// pass (the stop drain's permission to refuse new calls).
+	onGatewayFeatures func([]string)
 	// mcp supervises the external MCP servers placed here. nil when the
 	// agent was built without one (tests); Apply is then skipped.
 	mcp *mcpsrv.Supervisor
@@ -239,12 +245,23 @@ type Reconciler struct {
 	// desired hash to change. Single-goroutine (ticker) access; no lock.
 	driftRecreated map[string]string
 
+	// ggufMissing: backend -> the standing refusal for a placed .gguf that
+	// is missing from the effective models dir (ggufPresent). Kept until
+	// the file is back so nothing clears the refusal meanwhile. Tick
+	// goroutine only. ggufExists checks the file; nil = r.docker's.
+	ggufMissing map[string]string
+	ggufExists  func(ctx context.Context, dir, file string) (bool, error)
+
 	// ollamaPulls tracks the registry pull an ollama placement needs, per
 	// model: one in flight at a time, and a failed pull waits before it is
 	// retried (a tag that does not exist would otherwise be re-attempted
 	// every tick). Written from the tick goroutine and the pull goroutine.
 	pullMu      sync.Mutex
 	ollamaPulls map[string]*ollamaPullState
+
+	// ollamaVerify checks every placed ollama model's bytes against the
+	// controller's store, off the tick (ollama_verify.go). nil = not wired.
+	ollamaVerify *ollamaVerifyLoop
 
 	// storeHas says whether the controller's store publishes the model's
 	// Modelfile, i.e. whether it reaches nodes only via `noo cluster
@@ -296,6 +313,7 @@ func New(cfg *config.Config, docker *dockerpkg.Client, client *http.Client, harn
 		cfg:             cfg,
 		docker:          docker,
 		ollamaPulls:     map[string]*ollamaPullState{},
+		ollamaVerify:    newOllamaVerifyLoop(ollamaVerifier(docker)),
 		storeHas:        dockerpkg.ModelInStore,
 		importModel:     docker.ImportOllamaModel,
 		client:          client,
@@ -310,12 +328,18 @@ func New(cfg *config.Config, docker *dockerpkg.Client, client *http.Client, harn
 		cliInstalled:    cliOnPath,
 		harnessEgress:   egressReaderFor(harness),
 		driftRecreated:  map[string]string{},
+		ggufMissing:     map[string]string{},
+		ggufExists:      docker.HostFileExists,
 	}
 }
 
 // SetDiskReclaimSink installs the receiver for the controller's node reclaim
 // policy (diskreclaim.Reclaimer.SetPolicy).
 func (r *Reconciler) SetDiskReclaimSink(f func(*diskreclaim.Policy)) { r.onReclaimPolicy = f }
+
+// SetGatewayFeaturesSink installs the receiver for the controller's
+// gateway_features (stopdrain.Gate.SetFeatures).
+func (r *Reconciler) SetGatewayFeaturesSink(f func([]string)) { r.onGatewayFeatures = f }
 
 // MCP returns the external-MCP supervisor so the API server can route
 // tool calls (phase C) and /health can show what is live.
@@ -479,6 +503,9 @@ func (r *Reconciler) publishProfileAndEmbedTarget(ctx context.Context, t *tick) 
 	// has a disk to keep.
 	if r.onReclaimPolicy != nil {
 		r.onReclaimPolicy(t.desired.DiskReclaim)
+	}
+	if r.onGatewayFeatures != nil {
+		r.onGatewayFeatures(t.desired.GatewayFeatures)
 	}
 	// Publish the embed target as soon as desired state is known - before any
 	// early return, so removing the last embed placement (or every placement)
@@ -701,6 +728,9 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 				// loopback API the probe uses.
 				// Every role's model, not just the primary.
 				r.ensureOllamaModels(ctx, r.cfg.NodeID, t.ollamaRows, r.native.HasModel, r.native.Pull)
+				// Report only on a native ollama: never repaired, never
+				// refused (the server is the operator's).
+				r.verifyOllamaModels(ctx, t.ollamaRows, true)
 				// Advertise what the server holds, not only what it
 				// has loaded: an idle ollama has nothing loaded, and a
 				// heartbeat with no model is never routed to.
@@ -738,19 +768,40 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 			return
 		}
 		curModel, isRunning := t.running[p.Backend]
-		desiredHash := specHash(p)
+		desiredHash, hashKnown := specHashWith(p, func(ref string) (string, bool) { return dockerpkg.ContentKey(ctx, ref) })
+		if !hashKnown {
+			if isRunning && modelname.Matches(curModel, p.Model) {
+				// An image's content key could not be learned (the
+				// controller's manifest route did not answer): no drift
+				// decision on a guess. The running backend stays; the next
+				// tick asks again.
+				slog.Info("reconcile.spec_hash_unknown", "backend", p.Backend,
+					"detail", "an image's content digest could not be asked of the controller; leaving the running backend")
+				return
+			}
+			// Not running: start it, stamped with the offline key (a later
+			// tick that learns the digest recreates it at most once).
+			desiredHash = specHash(p)
+		}
 		// Converged when running with the placement's model (compare
 		// basenames — detection may report a bare filename) AND the
 		// stamped spec hash matches the desired one.
 		if isRunning && modelname.Matches(curModel, p.Model) {
 			// Running as asked: an earlier start failure no longer
-			// applies.
-			refusals.Clear("backend_start", p.Backend)
+			// applies, unless its gguf is still missing (a container
+			// left running on a refused start): re-check that one.
+			if r.ggufMissing[p.Backend] != "" {
+				r.ggufPresent(ctx, t, p)
+			}
+			r.clearBackendStart(p.Backend)
 			if p.Backend == "ollama" {
 				// The container is up with OLLAMA_MODEL set; that says
 				// nothing about whether the weights are there. Pull the
 				// tag if the container lacks it (off-tick; see ollamaPulls).
 				r.ensureOllamaModels(ctx, r.cfg.NodeID, t.ollamaRows, r.docker.OllamaHasModel, r.docker.OllamaPull)
+				// Then the bytes it holds, against the controller's store
+				// (off-tick; see ollama_verify.go).
+				r.verifyOllamaModels(ctx, t.ollamaRows, false)
 			}
 			curHash, hasLabel := t.specLabels[p.Backend]
 			switch decideBackendDrift(hasLabel, curHash, desiredHash, r.driftRecreated[p.Backend], t.floating[p.Backend]) {
@@ -847,17 +898,12 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 					", and this placement's model lives in it")
 			return
 		}
-		if t.modelsDir != "" && strings.HasSuffix(p.Model, ".gguf") {
-			exists, err := r.docker.HostFileExists(ctx, t.modelsDir, p.Model)
-			if err != nil {
-				slog.Warn("reconcile.model_check_failed", "error", err)
-			} else if !exists {
-				slog.Error("reconcile.model_missing",
-					"backend", p.Backend, "model", p.Model,
-					"models_dir", t.modelsDir,
-					"fix", "noo cluster sync-model-files "+r.cfg.NodeID+" -m "+p.Model)
-				return
-			}
+		// In the EFFECTIVE models dir (the one StartBackend mounts), not
+		// only a controller-declared one, and recorded as a refusal: a
+		// gguf quarantined by the preseed (docker.ggufFetchOutcome) is
+		// missing here on the next pass, and starting anyway crash-loops.
+		if !r.ggufPresent(ctx, t, p) {
+			return
 		}
 
 		extraEnv := buildPlacementEnv(p)
@@ -894,7 +940,7 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 			refusals.Record("backend_start", p.Backend, err.Error())
 			return
 		}
-		refusals.Clear("backend_start", p.Backend)
+		r.clearBackendStart(p.Backend)
 	}
 }
 
@@ -925,6 +971,10 @@ func (r *Reconciler) reportAndCleanup(ctx context.Context, t *tick) bool {
 		}
 	}
 	modelpresence.Retain(keep)
+	if len(t.ollamaRows) == 0 {
+		// No ollama placed: no verification result or refusal outlives it.
+		r.ollamaVerify.retain(nil)
+	}
 	return true
 }
 
@@ -1210,11 +1260,11 @@ var placementEnvExact = map[string]struct{}{
 	// requests send their own options.num_ctx, so raising it leaves an
 	// embedder sharing the same ollama alone. A vendor CLI harness needs it:
 	// Claude Code's system prompt overflows ollama's 4096 default and the
-	// model answers a truncated prompt (mcmini probe, 2026-10-19).
+	// model answers a truncated prompt (node-mac probe, 2026-10-19).
 	"OLLAMA_CONTEXT_LENGTH": {},
 	// Attention kernel and KV-cache quantisation. On a unified-memory Mac
 	// these are the difference between a 32k context that fits and one
-	// that swaps (mcmini, 2026-10-21: flash attention + q8_0 cache).
+	// that swaps (node-mac, 2026-10-21: flash attention + q8_0 cache).
 	"OLLAMA_FLASH_ATTENTION": {}, "OLLAMA_KV_CACHE_TYPE": {},
 	// Log level of the served process. Not a secret, frequently needed.
 	"LOG_LEVEL": {}, "RUST_LOG": {},
@@ -1298,11 +1348,40 @@ var volatileEnvKeys = map[string]bool{
 // port/tls edit that the model-name check alone misses) and the container must
 // be recreated. MUST be deterministic across ticks for an unchanged placement.
 func specHash(p placement) string {
+	sum, _ := specHashWith(p, offlineContentKey)
+	return sum
+}
+
+// contentKeyFn is an image ref's content identity for the hash, and whether
+// it is known (dockerpkg.ContentKey in production).
+type contentKeyFn func(ref string) (string, bool)
+
+// offlineContentKey keys a digest-pinned ref by repo@digest and any other
+// ref by itself: ContentKey without the controller lookup.
+func offlineContentKey(ref string) (string, bool) {
+	if strings.Contains(ref, "@sha256:") {
+		return dockerpkg.ContentKey(context.Background(), ref)
+	}
+	return ref, true
+}
+
+// specHashWith is specHash with each image keyed by its CONTENT (proposal
+// i935): a digest-pinned ref by repo@digest, a tag-only one by the
+// controller manifest's lock digest when the controller vouches one. A roll
+// that only re-tags an image then changes no hash and recreates nothing
+// (the 0.6.26 roll recreated node-b's and node-pi's Ollama twice each for
+// identical digests). known=false: a key could not be learned this tick;
+// the caller makes no drift decision on it.
+func specHashWith(p placement, key contentKeyFn) (string, bool) {
 	h := sha256.New()
 	// Field-tagged, newline-delimited canonical form — tags prevent a value
 	// from one field colliding with another (e.g. model="a\nimage=b").
 	fmt.Fprintf(h, "model=%s\n", p.Model)
-	fmt.Fprintf(h, "image=%s\n", p.Image)
+	img, ok := key(p.Image)
+	if !ok {
+		return "", false
+	}
+	fmt.Fprintf(h, "image=%s\n", img)
 	fmt.Fprintf(h, "port=%d\n", p.Port)
 	fmt.Fprintf(h, "tls=%t\n", p.TLS)
 	// The DOOR the agent creates a backend with is part of its spec: a
@@ -1332,16 +1411,24 @@ func specHash(p placement) string {
 	// the placement names none) and the door sidecar's. A stack roll moves
 	// NOO_IMAGE_TAG and nothing else, so without these a backend kept the
 	// previous release's image until something unrelated recreated it
-	// (awolf 2026-10-28: noo-llamacpp and noo-stunnel-llamacpp on v0.6.12
+	// (node-a 2026-10-28: noo-llamacpp and noo-stunnel-llamacpp on v0.6.12
 	// after the 0.6.13 roll). Folded in only when set, so a node with no
 	// release pin, and a backend on an upstream image, keep their hash.
 	if p.Image == "" {
 		if img := dockerpkg.ReleaseBackendImage(p.Backend); img != "" {
-			fmt.Fprintf(h, "releaseimage=%s\n", img)
+			k, ok := key(img)
+			if !ok {
+				return "", false
+			}
+			fmt.Fprintf(h, "releaseimage=%s\n", k)
 		}
 	}
 	if img := dockerpkg.ReleaseSidecarImage(p.Backend); img != "" {
-		fmt.Fprintf(h, "sidecarimage=%s\n", img)
+		k, ok := key(img)
+		if !ok {
+			return "", false
+		}
+		fmt.Fprintf(h, "sidecarimage=%s\n", k)
 	}
 	// Likewise the derived memory limit: a new limit needs a new container.
 	if p.MemoryLimitBytes > 0 {
@@ -1359,7 +1446,7 @@ func specHash(p placement) string {
 	for _, k := range keys {
 		fmt.Fprintf(h, "env.%s=%s\n", k, p.Env[k])
 	}
-	return hex.EncodeToString(h.Sum(nil))
+	return hex.EncodeToString(h.Sum(nil)), true
 }
 
 // driftDecision is what to do for a running backend whose model already
@@ -1562,4 +1649,19 @@ func egressReaderFor(h hostsvc.Service) func(ctx context.Context) hostsvc.Egress
 	}
 	rd := hostsvc.DefaultEgressReader()
 	return rd.Read
+}
+
+// ollamaVerifier is the production check: one verifier per lane (the
+// container's store, or a native ollama's), built once.
+func ollamaVerifier(c *dockerpkg.Client) func(context.Context, string, bool) dockerpkg.OllamaVerifyResult {
+	var once [2]sync.Once
+	var vs [2]*dockerpkg.OllamaVerifier
+	return func(ctx context.Context, model string, native bool) dockerpkg.OllamaVerifyResult {
+		i := 0
+		if native {
+			i = 1
+		}
+		once[i].Do(func() { vs[i] = c.NewOllamaVerifier(native) })
+		return vs[i].Verify(ctx, model)
+	}
 }

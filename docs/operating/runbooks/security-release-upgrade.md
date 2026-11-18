@@ -499,8 +499,12 @@ noo cluster show <one-gpu-node>
 ```
 
 Confirm both serve. If an image needs more, add
-`NOO_BACKEND_CAP_ADD=<CAP>` to that node's `/etc/noo-node-agent.env` and
-restart the agent — node-local, no code change.
+`NOO_BACKEND_CAP_ADD=<CAP>` to that node's local declarations file
+(`/etc/noo-node-agent.local.env`; see [the node's own declarations](../../security/node-agent.md#the-nodes-own-declarations))
+and restart the agent: node-local, no code change, and it survives every
+roll (the rendered `/etc/noo-node-agent.env` does not keep a hand-added line). Only the capabilities in the
+[env reference](../../reference/env.md) are grantable; anything that lets a
+container reach the host is refused and logged.
 
 Watch that node's journal for two new refusal lines:
 
@@ -614,9 +618,9 @@ ls -l /etc/noo/pki/signing.pub
 journalctl -u noo-fetch -n 30 | grep verified-by     # expect: verified-by: signing-key
 ```
 
-Adoption is per node and recorded on the controller, so a node that has not
-confirmed keeps receiving CA-signed bundles and nothing breaks while the
-fleet converges.
+Adoption is per node and recorded on the controller. A node that has not
+adopted the signing key gets no bundle until the key is delivered to it
+(`noo security pki rotate-signing-key <node> --deliver-only`).
 
 **Read the closing summary carefully — only one of its three outcomes is
 work.** The marker needs positive proof (an apply report of exit 0), and a
@@ -642,11 +646,11 @@ noo security pki rotate-signing-key --json --deliver-only -y \
 anything at all is unproven. **`orphaned_material`** lists key material for
 nodes the registry does not know — see [C7](#c7-loose-ends).
 
-> **Roll every node before the next release.** The compatibility arm that
-> still accepts a CA-signed bundle WARNs on every apply and is removed in the
-> release after this one. A node that never adopted can then only be
-> recovered by re-enrolling it. It is arm 1 of two — see
-> [C8](#c8-next-release-removals).
+> **Every node must adopt the signing key.** The CA-signed apply lane is
+> retired: a node accepts a bundle only if the signing key it holds signed it,
+> or if the CA signed a bundle carrying `signing-pub` and nothing else. A node
+> that never adopted gets nothing until the key is delivered; if that fails,
+> re-enroll it. See [C8](#c8-next-release-removals).
 
 ### C5. Monitoring service leaves and the Grafana password
 
@@ -1028,7 +1032,7 @@ ref too, so the bare command means what it looks like.
 And the preseed no longer asks for a helper at all. Copying a file needs no
 container: the agent binary already carries the preseed code, so the HF
 snapshot mirror and the verified GGUF fetch run **in the agent process**
-against the host path, over the same `:8083` rail with the same manifest
+against the host path, over mTLS to `https://<controller>:8443` with the same manifest
 digest check. The helper rail above still matters — the remaining host
 operations (creating the models dir, probing host files) genuinely need root
 inside a container — but a node that never runs those can preseed weights

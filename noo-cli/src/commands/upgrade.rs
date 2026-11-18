@@ -39,7 +39,8 @@
 //!      `rerender_nats_users_for_roll`, `refresh_deploy_slice`, `move_pin`.
 //!   6. launcher inputs: service certs, grafana door, gateway PKI view, voice
 //!      models, add-on NATS principals.
-//!   7. node-image staging starts (overlapping), then `launch_stack`.
+//!   7. node-image staging runs to completion, then `launch_stack` (the new
+//!      gateway hands nodes the new refs; they must already be staged).
 //! The source-reading tests read the list for ORDER and the owning phase for
 //! CONTENT (`phase_src` at the bottom of this file).
 
@@ -1201,7 +1202,7 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     reconcile_storage_dirs(g, &roll.root, &roll.tag, target_stack_lock.as_deref());
     // i458 (b): the deploy slice moves WITH the pin. Written after every
     // refusal above, so a refused roll leaves the old release's compose and
-    // scripts over the old images (pop-os, 0.6.16: CLI and slice 0.6.16 over
+    // scripts over the old images (ctrl, 0.6.16: CLI and slice 0.6.16 over
     // 0.6.15 images after the storage refusal).
     refresh_deploy_slice(g, &roll);
     move_pin(g, &roll, target_stack_lock.as_deref(), &addon_prep);
@@ -1216,8 +1217,12 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
 
     reconcile_cpu_only_slots(g, &roll.root);
 
-    // Stage node images (overlapping the launcher), then launch.
-    let staging = crate::commands::image_stage::start_stage_release_images(g, target_stack_lock.clone(), &roll.tag);
+    // Stage node images BEFORE the stack moves: the new gateway hands every
+    // node the new lock's backend refs as soon as it is up, and a rail node
+    // refuses one whose arch tar is not staged yet (0.6.26 roll, node-pi:
+    // `node.reconcile_refused` until the arm64 tar landed, 2 min later).
+    let staging = crate::commands::image_stage::start_stage_release_images(g, target_stack_lock.clone(), &roll.tag)
+        .finish_before_launch(g);
     launch_stack(g, &roll, staging, stops)
 }
 
@@ -2705,17 +2710,21 @@ pub(crate) fn netns_unit_needs_install(systemd: bool, state: crate::netns_unit::
 
 /// The stack stage (`noo upgrade --stack` and `--all`), on the controller this
 /// command runs on, never a remote node: install or refresh
-/// noo-netns-restore.service, which installs onboarded before rc.3 lack. On a
-/// terminal sudo may ask once, with the reason on the line above; off a
-/// terminal `sudo -n`, and a refusal is a warning naming the one command.
-/// Never fails the roll; `noo cluster verify` shows the `netns restore` row.
+/// noo-netns-restore.service, which installs onboarded before rc.3 lack.
+/// i907 step 1b: the controller's self-node applier installs it (the
+/// `netns-unit` kind, staged here, no sudo). An applier that predates the
+/// kind is named, never sudo'd around. Only a controller with no applier
+/// keeps the one stated sudo, under `root_step`'s rule (a terminal, or
+/// already root; never unattended). Never fails the roll; `noo cluster
+/// verify` shows the `netns restore` row.
 fn reconcile_netns_unit(g: &Globals, root: &std::path::Path) {
     use crate::netns_unit as nu;
     let systemd = nu::systemd_here();
     if !systemd {
         return;
     }
-    let unit = match nu::render_here(&root.display().to_string()) {
+    let root_s = root.display().to_string();
+    let unit = match nu::render_here(&root_s) {
         Ok(u) => u,
         Err(e) => {
             if !g.json { ui::warned(&format!("{} not installed: {e}", nu::UNIT_NAME)); }
@@ -2727,16 +2736,51 @@ fn reconcile_netns_unit(g: &Globals, root: &std::path::Path) {
     }
     // SAFETY: isatty has no preconditions.
     let tty = !g.json && unsafe { libc::isatty(0) } == 1;
-    if tty {
-        ui::step(&format!("installing {}: it starts the containers that join another's network after every dockerd start (sudo may ask)", nu::UNIT_NAME));
-    }
-    match nu::install(tty, &unit) {
-        Ok(()) => { if !g.json { ui::done(&format!("{} installed and enabled", nu::UNIT_NAME)); } }
-        Err(e) => {
+    let owner = nu::owner();
+    let node = crate::commands::provision::self_node_name();
+    let lose = "after a reboot or a dockerd restart, a container that joins another's network (noo-ollama-embed) can stay down";
+    match nu::route(owner == "root", nu::applier_here(), node.is_some(), tty, false) {
+        nu::Route::Stage => {
+            let node = node.unwrap_or_default();
             if !g.json {
-                ui::warned(&format!("{} not installed ({e}): after a reboot or a dockerd restart, a container that joins another's network (noo-ollama-embed) can stay down", nu::UNIT_NAME));
-                ui::guide(&[(nu::REMEDY, "run it in a terminal: sudo asks once and the stack stage installs the unit")]);
+                ui::step(&format!("installing {}: staged to the self-node {node}, whose applier installs it (no sudo)", nu::UNIT_NAME));
             }
+            match nu::stage_to_self_node(g, &node, &owner, &root_s) {
+                Ok(()) if nu::state(&unit) == nu::State::Current => {
+                    if !g.json { ui::done(&format!("{} installed and enabled by the self-node's applier", nu::UNIT_NAME)); }
+                }
+                Ok(()) => {
+                    if !g.json { ui::warned(&format!("{} applied by the self-node but not current here: {lose}", nu::UNIT_NAME)); }
+                }
+                Err(e) => {
+                    if !g.json { ui::warned(&format!("{} not installed ({e}): {lose}", nu::UNIT_NAME)); }
+                }
+            }
+        }
+        nu::Route::OldApplier(generation) => {
+            if !g.json {
+                ui::warned(&format!(
+                    "{} not installed: the self-node's applier (generation {generation}) predates the netns-unit kind, so no sudo is run for it: {lose}",
+                    nu::UNIT_NAME));
+                ui::guide(&[(nu::OLD_APPLIER_REMEDY, "the self-node's applier installs it, nothing asks for a password")]);
+            }
+        }
+        nu::Route::Sudo => {
+            if tty {
+                ui::step(&format!("installing {}: it starts the containers that join another's network after every dockerd start (this controller has no self-node applier; sudo may ask)", nu::UNIT_NAME));
+            }
+            match nu::install(tty, &unit) {
+                Ok(()) => { if !g.json { ui::done(&format!("{} installed and enabled", nu::UNIT_NAME)); } }
+                Err(e) => {
+                    if !g.json {
+                        ui::warned(&format!("{} not installed ({e}): {lose}", nu::UNIT_NAME));
+                        ui::guide(&[(nu::SUDO_REMEDY, "sudo asks once and the stack stage installs the unit")]);
+                    }
+                }
+            }
+        }
+        nu::Route::Stated(why) => {
+            if !g.json { ui::warned(&format!("{why}: {lose}")); }
         }
     }
 }
@@ -2919,6 +2963,8 @@ fn rail_names(mut names: Vec<String>, is_self: impl Fn(&str) -> bool, on_control
 /// rides the same rail, last (i67): no sudo, and a refusal with the remedy
 /// when its pull units are missing.
 fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
+    // A node agent's stop during THIS roll is reported (drain_bound_hits).
+    let roll_started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     // The gateway wait is the caller's Gateway phase (run_fleet_stages).
     let doc = crate::http::get_json(g, "/api/security/bootstrap-tokens", true, 15);
     let Some(toks) = doc.get("tokens").and_then(|t| t.as_array()) else {
@@ -3027,7 +3073,15 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
     if drew_wait {
         ui::clear_line();
     }
-    for n in &names {
+    // i949: two nodes callers fail over between (a model class, an embedding
+    // space) are never restarting together. The groups are read once, before
+    // anything is staged; the rail is staged in an order that keeps a pair
+    // apart, and each staging first waits (bounded) for every earlier-staged
+    // node sharing a group with it to apply and be offered again.
+    let me = local_agent_node(&names);
+    let mut stagger = super::roll_stagger::Stagger::start(g, &names, me.as_deref());
+    let rail_order: Vec<String> = stagger.order.iter().filter(|n| Some(n.as_str()) != me.as_deref()).cloned().collect();
+    for n in &rail_order {
         if let Some((_, why)) = skipped.iter().find(|(s, _)| s == n) {
             ui::blank();
             ui::say(&ui::item(n));
@@ -3045,6 +3099,7 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
         // A node that needs the applier first gets ONLY that bundle now;
         // the combined wait restages the full one when it is in.
         let applier_first = super::provision::applier_first_for(g, n);
+        stagger.before(g, n);
         // `--stage-only`: stage and poke, return at once. The apply is
         // waited for below, for every node together, so one slow node no
         // longer holds up staging the rest.
@@ -3059,7 +3114,11 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
         // has no sha the node cannot be waited on and is reported failed
         // here instead of silently counted as staged.
         match super::provision::staged_sha_of(g, n) {
-            Some(sha) => pending.push(super::provision::PendingApply { node: n.clone(), sha, legacy, applier_first }),
+            Some(sha) => {
+                let p = super::provision::PendingApply { node: n.clone(), sha, legacy, applier_first };
+                stagger.staged(&p);
+                pending.push(p);
+            }
             None => {
                 ui::say_err(&ui::sub(&ui::status_line(Glyph::Err,
                     &format!("{n}: staged, but the gateway reports no staged bundle to wait on"))));
@@ -3072,17 +3131,24 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
     // --stage-only like the rest and waited for in the combined wait below,
     // where its own post-apply steps (lane record, controller hostd restart)
     // run through `after_self_applied`.
-    let me = local_agent_node(&names);
     if let Some(me) = &me {
         // The child prints its own `ui::item` label, as the rail nodes do.
         ui::blank();
+        stagger.before(g, me);
         upgrade_self_node(g, me, &mut failed, &mut pending);
     }
     let waited = if pending.is_empty() { Vec::new() } else { wait_and_settle_nodes(g, &pending, me.as_deref(), &mut failed) };
     // One line per node, whatever the others did (0.6.21: "stopped at the
-    // nodes stage" hid that pop-os upgraded fine beside a failed node).
-    let order: Vec<String> = names.iter().cloned().chain(me.clone()).collect();
+    // nodes stage" hid that ctrl upgraded fine beside a failed node).
+    let order: Vec<String> = rail_order.iter().cloned().chain(me.clone()).collect();
     print_node_outcomes(g, &node_outcome_rows(&order, &skipped, &waited, &failed));
+    if g.json && !stagger.json.is_empty() {
+        println!("{}", serde_json::json!({"stagger": stagger.json}));
+    }
+    for line in &stagger.notes {
+        ui::say(&ui::status_line(Glyph::Warn, line));
+    }
+    print_drain_bound_hits(g, &order, roll_started);
     // A node whose first staging failed is already in `failed`; waiting
     // for it to apply a bundle it never got would only burn the budget.
     let waiting: Vec<String> = leafless.into_iter()
@@ -3367,6 +3433,49 @@ pub(crate) fn print_node_outcomes(g: &Globals, rows: &[NodeOutcome]) {
     for line in node_outcome_lines(rows) {
         ui::say(&line);
     }
+}
+
+/// A node agent whose stop during this roll hit its drain bound cut answers
+/// a caller was still reading (node-agent-go stopdrain, 30 s): one line per
+/// such node, after the table. Read from the gateway's node records
+/// (`last_stop`, kept from the agent's first beat after its restart); a
+/// node whose beat has not arrived yet, or an older agent, says nothing.
+fn print_drain_bound_hits(g: &Globals, order: &[String], since_unix: u64) {
+    let Ok(nodes) = crate::http::get_json_try(g, "/api/cluster/nodes", true, 10) else {
+        return;
+    };
+    let lines = drain_bound_hits(&nodes, order, since_unix);
+    if lines.is_empty() {
+        return;
+    }
+    if g.json {
+        println!("{}", serde_json::json!({ "drain_bound_hits": lines }));
+        return;
+    }
+    for line in lines {
+        ui::say(&ui::sub(&ui::status_line(Glyph::Warn, &line)));
+    }
+}
+
+/// The lines [`print_drain_bound_hits`] prints, pure.
+pub(crate) fn drain_bound_hits(nodes: &serde_json::Value, order: &[String], since_unix: u64) -> Vec<String> {
+    let list = nodes.get("nodes").unwrap_or(nodes).as_array().cloned().unwrap_or_default();
+    order
+        .iter()
+        .filter_map(|name| {
+            let n = list.iter().find(|n| n.get("id").and_then(|v| v.as_str()) == Some(name.as_str()))?;
+            let s = n.get("last_stop")?;
+            let during = s.get("at_unix").and_then(|v| v.as_u64()).is_some_and(|t| t >= since_unix);
+            if !during || s.get("bound_hit").and_then(|v| v.as_bool()) != Some(true) {
+                return None;
+            }
+            let cut = s.get("cut_at_bound").and_then(|v| v.as_u64()).unwrap_or(0);
+            let oldest = s.get("oldest_age_secs").and_then(|v| v.as_u64()).unwrap_or(0);
+            Some(format!(
+                "{name}: its agent's stop cut {cut} streaming answer(s) at the 30 s drain bound (oldest {oldest} s old); those callers saw the answer end early"
+            ))
+        })
+        .collect()
 }
 
 /// The table's text lines (no colour decisions beyond the glyph).
@@ -4939,6 +5048,21 @@ pub(crate) fn verified_stack_lock(g: &Globals, tag: &str) -> Result<Option<Strin
         m.insert(tag.to_string(), r.clone());
     }
     r
+}
+
+/// The release-signed stack lock of `tag` AND its signature text (i908: a
+/// bundle that carries the Linux agent carries both, and the node verifies
+/// them itself). The lock is [`verified_stack_lock`]'s; the signature is
+/// fetched from the same release and verified over those exact bytes.
+/// `Ok(None)`: the release publishes no lock.
+pub(crate) fn verified_stack_lock_signed(g: &Globals, tag: &str) -> Result<Option<(String, String)>, String> {
+    let Some(text) = verified_stack_lock(g, tag)? else { return Ok(None) };
+    let rel = format!("stack-{tag}");
+    let name = format!("{rel}.lock.sig");
+    let sig = fetch_tag_file(g, &rel, &name).map_err(|e| format!("{name}: {}", e.summary()))?;
+    let sig = String::from_utf8_lossy(&sig).to_string();
+    crate::release_sig::verify(text.as_bytes(), &sig).map_err(|e| format!("{name}: {e}"))?;
+    Ok(Some((text, sig)))
 }
 
 /// [`fetch_stack_lock`] without the exit: `Err((code, message, remedy))`.
@@ -7324,7 +7448,7 @@ mod door_node_id_tests {
     /// own rule (tests/test_stunnel_door_pinning.py runs the shell side).
     #[test]
     fn door_node_id_problem_matches_the_doors_rule() {
-        for ok in ["host8", "pop-os", "node_1.lan", "\"host8\"", "'host8'"] {
+        for ok in ["host8", "ctrl", "node_1.lan", "\"host8\"", "'host8'"] {
             assert_eq!(super::door_node_id_problem(ok), None, "{ok}");
         }
         for bad in ["", "  ", "auto", "a b", "x;y", "host8/../x", "$(id)"] {
@@ -7854,7 +7978,7 @@ mod json_stdout_tests {
 
 /// i458 (b): the deploy slice moves with the pin. A roll refused in the
 /// stack stage left the NEW release's compose and scripts over the OLD
-/// images on pop-os (0.6.16): stage 1's `stack sync-assets` and the stack
+/// images on ctrl (0.6.16): stage 1's `stack sync-assets` and the stack
 /// stage's refresh both wrote the slice before the storage refusal.
 #[cfg(test)]
 mod slice_pin_tests {
@@ -7862,7 +7986,7 @@ mod slice_pin_tests {
 
     #[test]
     fn the_slice_waits_while_the_pin_is_behind_the_pairing() {
-        // the pop-os state: CLI paired with 0.6.16, stack still on 0.6.15
+        // the ctrl state: CLI paired with 0.6.16, stack still on 0.6.15
         assert_eq!(slice_defer("v0.6.15", "stack-v0.6.16"), Some(("v0.6.15".into(), "v0.6.16".into())));
         // an rc CLI over the last final, and one rc over another
         assert!(slice_defer("v0.6.16", "stack-v0.6.17-rc.1").is_some());
@@ -7905,6 +8029,22 @@ mod slice_pin_tests {
     }
 }
 
+/// The 0.6.26 roll: staging overlapped the launch, the new gateway handed
+/// node-pi the v0.6.26 ollama ref before its arm64 tar existed, and node-pi
+/// refused it for two minutes (`node.reconcile_refused`, one operator alert).
+#[cfg(test)]
+mod stage_before_launch_tests {
+    #[test]
+    fn node_images_are_staged_before_the_stack_moves() {
+        let src = crate::test_src::own_code(include_str!("upgrade.rs"));
+        let up = crate::test_src::fn_body(&src, "fn upgrade_stack(");
+        let start = up.find("start_stage_release_images(").expect("the roll stages node images");
+        let join = up.find(".finish_before_launch(g);").expect("and joins them");
+        let launch = up.find("launch_stack(g, &roll, staging, stops)").expect("then launches");
+        assert!(start < join && join < launch, "staging is finished before launch_stack");
+    }
+}
+
 #[cfg(test)]
 mod embedder_after_roll_tests {
     /// i545 finding 53 and the rc.3 rehearsal: only onboard and `noo migrate
@@ -7927,8 +8067,8 @@ mod embedder_after_roll_tests {
 
 /// 123 (outside tester, 0.6.21): a self node that had never reported an
 /// apply held `stage_applier_first`'s 600 s fetch wait inside STAGING, so
-/// pop-os was staged only after it; and "stopped at the nodes stage" hid
-/// that pop-os then upgraded fine.
+/// ctrl was staged only after it; and "stopped at the nodes stage" hid
+/// that ctrl then upgraded fine.
 #[cfg(test)]
 mod nodes_stage_nonblocking_tests {
     use super::{full_bundle_follows, node_outcome_lines, node_outcome_rows, outcome_of, NodeOutcome, Outcome};
@@ -7972,20 +8112,20 @@ mod nodes_stage_nonblocking_tests {
         NodeOutcome { node: n.into(), outcome: o, why: format!("{} why", o.word()), elapsed_secs: secs }
     }
 
-    /// The tester's run: the self node failed (never fetched), pop-os
+    /// The tester's run: the self node failed (never fetched), ctrl
     /// applied. Both have a line; a skipped node and a staging failure too;
     /// a node this stage never touched has none.
     #[test]
     fn every_touched_node_gets_a_row_in_order() {
-        let order: Vec<String> = ["host8", "pop-os", "host6", "untouched", "Lenovo-P52s"].iter().map(|s| s.to_string()).collect();
+        let order: Vec<String> = ["host8", "ctrl", "host6", "untouched", "Lenovo-P52s"].iter().map(|s| s.to_string()).collect();
         let skipped = vec![("host8".to_string(), "last seen 3 h ago".to_string())];
-        let waited = vec![row("pop-os", Outcome::Applied, 95), row("Lenovo-P52s", Outcome::NotFetched, 600)];
+        let waited = vec![row("ctrl", Outcome::Applied, 95), row("Lenovo-P52s", Outcome::NotFetched, 600)];
         let failed = vec!["host6".to_string(), "Lenovo-P52s (self node)".to_string()];
         let rows = node_outcome_rows(&order, &skipped, &waited, &failed);
         let got: Vec<(&str, Outcome)> = rows.iter().map(|r| (r.node.as_str(), r.outcome)).collect();
         assert_eq!(got, [
             ("host8", Outcome::SkippedOffline),
-            ("pop-os", Outcome::Applied),
+            ("ctrl", Outcome::Applied),
             ("host6", Outcome::NotStaged),
             ("Lenovo-P52s", Outcome::NotFetched),
         ]);
@@ -7997,9 +8137,9 @@ mod nodes_stage_nonblocking_tests {
 
     #[test]
     fn the_table_has_one_line_per_node_with_outcome_seconds_and_why() {
-        let lines = node_outcome_lines(&[row("pop-os", Outcome::Applied, 95), row("Lenovo-P52s", Outcome::NotFetched, 600)]);
+        let lines = node_outcome_lines(&[row("ctrl-1", Outcome::Applied, 95), row("Lenovo-P52s", Outcome::NotFetched, 600)]);
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("pop-os") && lines[0].contains("applied") && lines[0].contains("95s"), "{}", lines[0]);
+        assert!(lines[0].contains("ctrl-1") && lines[0].contains("applied") && lines[0].contains("95s"), "{}", lines[0]);
         assert!(lines[1].contains("Lenovo-P52s") && lines[1].contains("not fetched") && lines[1].contains("600s") && lines[1].contains("why"), "{}", lines[1]);
     }
 
@@ -8231,5 +8371,44 @@ mod cpu_only_slots_upgrade_tests {
         assert!(stack.contains("reconcile_cpu_only_slots(g, &roll.root);"), "{stack}");
         let nodes = crate::test_src::fn_body(&own, "fn upgrade_nodes(");
         assert!(!nodes.contains("reconcile_cpu_only_slots"), "a node's upgrade never touches it");
+    }
+}
+
+/// The roll's node report for a node agent's stop drain (node-agent-go
+/// stopdrain, option B of the 0.6.26 roll's chat 502).
+#[cfg(test)]
+mod drain_report_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// One line per rolled node whose stop DURING this roll hit the bound;
+    /// nothing for a stop that drained cleanly, a stop before this roll, a
+    /// node not in this roll, or an agent that never reported.
+    #[test]
+    fn a_stop_that_hit_the_bound_during_the_roll_gets_one_line() {
+        let nodes = json!({"nodes": [
+            {"id": "node_a", "last_stop": {"bound_hit": true, "cut_at_bound": 2, "oldest_age_secs": 41, "at_unix": 2000}},
+            {"id": "node_b", "last_stop": {"bound_hit": false, "drained": 3, "at_unix": 2000}},
+            {"id": "node_c", "last_stop": {"bound_hit": true, "cut_at_bound": 1, "oldest_age_secs": 33, "at_unix": 900}},
+            {"id": "node_d"},
+            {"id": "elsewhere", "last_stop": {"bound_hit": true, "cut_at_bound": 1, "at_unix": 2000}},
+        ]});
+        let order: Vec<String> = ["node_a", "node_b", "node_c", "node_d"].iter().map(|s| s.to_string()).collect();
+        let lines = drain_bound_hits(&nodes, &order, 1000);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("node_a: its agent's stop cut 2 streaming answer(s) at the 30 s drain bound (oldest 41 s old)"), "{}", lines[0]);
+        // The bare-array shape of /api/cluster/nodes reads the same.
+        let bare = nodes["nodes"].clone();
+        assert_eq!(drain_bound_hits(&bare, &order, 1000), lines);
+    }
+
+    #[test]
+    fn the_nodes_stage_prints_it_after_the_table() {
+        let code = include_str!("upgrade.rs");
+        let body = code.split("fn upgrade_nodes(g: &Globals)").nth(1).expect("upgrade_nodes").split("\nfn ").next().unwrap();
+        let table = body.find("print_node_outcomes(g, &node_outcome_rows(&order, &skipped, &waited, &failed));").expect("the table");
+        let report = body.find("print_drain_bound_hits(g, &order, roll_started);").expect("the drain report");
+        assert!(table < report, "after the table");
+        assert!(body.find("let roll_started").expect("the roll's start") < table);
     }
 }

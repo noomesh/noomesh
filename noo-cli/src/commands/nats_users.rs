@@ -319,7 +319,7 @@ pub(crate) const RESPONSE_EXPIRES: &str = "20m";
 /// replaces that map with an empty one. So any request in flight across a
 /// SIGHUP has its reply refused as a `Publish Violation` on `_INBOX_gw.…`,
 /// however short the request — the window above never comes into it. On
-/// pop-os 2026-10-14 a 12 s `worker.rag.query` (MCP `noo_rag_query`) was
+/// ctrl 2026-10-14 a 12 s `worker.rag.query` (MCP `noo_rag_query`) was
 /// delivered at 20:54:32, NATS reloaded at 20:54:37 (a provision's
 /// re-render + HUP), and the reply at 20:54:44 was refused (i69). A slow
 /// answer is simply more likely to straddle a reload.
@@ -1387,10 +1387,10 @@ mod tests {
     #[test]
     fn seat_has_no_bus_principal() {
         // The fleet as the gateway lists it: the nodes, and separately a seat.
-        let nodes = serde_json::json!({"nodes": [{"id": "host3"}, {"id": "pop-os"}]});
+        let nodes = serde_json::json!({"nodes": [{"id": "host3"}, {"id": "ctrl"}]});
         let seats = serde_json::json!({"seats": [{"seat_name": "lobby", "role": "seat"}]});
         let ids = nodes_from_registry(&nodes);
-        assert_eq!(ids, ["host3", "pop-os"]);
+        assert_eq!(ids, ["ctrl", "host3"]);
         // The seats document is not a nodes document: read as one, it
         // yields nothing (it has no `nodes` array).
         assert!(nodes_from_registry(&seats).is_empty());

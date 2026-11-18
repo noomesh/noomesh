@@ -2137,24 +2137,24 @@ mod pinned_hold_tests {
 
     #[test]
     fn a_pin_with_a_live_serving_node_is_unchanged_by_a_held_one() {
-        let held = [held("awolf", "vllm", "gemma4")];
-        let live = [live("pop-os", "llamacpp", "gemma4")];
+        let held = [held("node-a", "vllm", "gemma4")];
+        let live = [live("ctrl", "llamacpp", "gemma4")];
         assert!(pin_all_held(&held, &live, "gemma4").is_none(), "the live node serves it: no refusal");
     }
 
     #[test]
     fn a_pin_with_nothing_held_is_unchanged() {
         assert!(pin_all_held(&[], &[], "gemma4").is_none(), "the not-served path owns this");
-        let other = [held("awolf", "vllm", "qwen3")];
+        let other = [held("node-a", "vllm", "qwen3")];
         assert!(pin_all_held(&other, &[], "gemma4").is_none(), "a held lane of another model is not this pin");
     }
 
     #[test]
     fn a_pin_whose_every_serving_lane_is_held_is_refused_naming_them() {
-        let both = [held("awolf", "vllm", "gemma4:latest"), held("aserve", "vllm", "gemma4")];
-        let why = pin_all_held(&both, &[live("pop-os", "ollama", "qwen3")], "gemma4").expect("refusal");
+        let both = [held("node-a", "vllm", "gemma4:latest"), held("node-b", "vllm", "gemma4")];
+        let why = pin_all_held(&both, &[live("ctrl", "ollama", "qwen3")], "gemma4").expect("refusal");
         assert!(why.contains("every node serving 'gemma4' has its GPU held"), "{why}");
-        assert!(why.contains("awolf=vllm") && why.contains("aserve=vllm"), "{why}");
+        assert!(why.contains("node-a=vllm") && why.contains("node-b=vllm"), "{why}");
     }
 }
 
@@ -2182,19 +2182,19 @@ mod unpinned_tests {
     fn the_heartbeat_path_picks_the_same_node_as_raw_chat_for_an_unpinned_turn() {
         // The 2026-10-17 fleet (addresses no other test notes a stall on).
         let nodes = vec![
-            node("pop-os", "192.0.2.211", "ollama", "gemma4:e2b-it-qat", false, 0.05),
-            node("mcmini", "192.0.2.212", "ollama", "gemma4:12b", true, 0.4),
+            node("ctrl", "192.0.2.211", "ollama", "gemma4:e2b-it-qat", false, 0.05),
+            node("node-mac", "192.0.2.212", "ollama", "gemma4:12b", true, 0.4),
         ];
         let t = build_table(&nodes, &[], &Declarations::default());
         let raw = select(&t, None, None, false, &|_| false).expect("raw chat selection");
         let task = pick_unpinned(&t, &[]).expect("heartbeat selection");
-        assert_eq!(raw.candidates[0].node_id, "mcmini");
+        assert_eq!(raw.candidates[0].node_id, "node-mac");
         assert_eq!(task.candidates[0].node_id, raw.candidates[0].node_id);
         assert_eq!(task.candidates[0].url, "https://192.0.2.212:8081");
-        // After mcmini failed this turn (its ResolvedBackend.url excluded),
-        // the turn fails over to the next node, never back to mcmini.
+        // After node-mac failed this turn (its ResolvedBackend.url excluded),
+        // the turn fails over to the next node, never back to node-mac.
         let next = pick_unpinned(&t, &["https://192.0.2.212:8081".to_string()]).expect("failover");
-        assert_eq!(next.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["pop-os"]);
+        assert_eq!(next.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["ctrl"]);
         assert!(pick_unpinned(&t, &["https://192.0.2.212:8081".into(), "https://192.0.2.211:8081".into()]).is_none(),
             "nothing left: fall through to discovery / the static last resort");
     }

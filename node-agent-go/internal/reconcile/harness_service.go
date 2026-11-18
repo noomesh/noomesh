@@ -172,7 +172,7 @@ func (r *Reconciler) recordHarnessPlacement(all []placement) {
 // HarnessPlacementKnown is whether a desired-config has been applied yet.
 // Until it has, "no harness placement" is not an answer: at a roll the
 // agent and the harness restart in the same second, and a harness that read
-// "not placed" ran on built-in defaults (i658, awolf 2026-11-11).
+// "not placed" ran on built-in defaults (i658, node-a 2026-11-11).
 func (r *Reconciler) HarnessPlacementKnown() bool {
 	r.harnessMu.RLock()
 	defer r.harnessMu.RUnlock()

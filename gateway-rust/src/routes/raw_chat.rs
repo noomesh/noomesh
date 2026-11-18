@@ -484,6 +484,12 @@ where
     let mut all_stalled = true;
     // Every failure so far was a full backend: if so, the answer is a 503.
     let mut all_busy = true;
+    // Every failure so far was a node agent restarting: if so, the answer is
+    // its 503 with the Retry-After it gave (the bounded wait ran out or had
+    // no place). `restart_waited` is what this call already waited in all.
+    let mut all_restarting = true;
+    let mut last_restart: Option<Duration> = None;
+    let mut restart_waited = Duration::ZERO;
 
     // The order of attempts: each candidate once, and (interactive, the
     // expected-wait rule) the first choice once more after `retry_first`
@@ -543,6 +549,10 @@ where
         // With another candidate to go to, a full backend should say so at
         // once rather than queue us; the last one is waited on.
         let req = if last { req } else { req.header(BUSY_HEADER, BUSY_REJECT) };
+        // An aggregated answer reaches the caller only once complete: this
+        // gateway re-sends it whole if the node cuts it, so a restarting
+        // node may cut it at once instead of draining it (node_restart).
+        let req = if aggregate { req.header(crate::node_restart::RESEND_HEADER, crate::node_restart::RESEND_WHOLE) } else { req };
         let sent = if stream || aggregate {
             tokio::time::timeout(header_limit, req.send()).await
         } else {
@@ -550,6 +560,7 @@ where
         };
         let mut stalled = false;
         let mut busy = false;
+        let mut restarting: Option<Duration> = None;
         let failure = match sent {
             Err(_) if aggregate => {
                 stalled = true;
@@ -589,27 +600,41 @@ where
                         Err(ReadFailure::Backend(m)) => format!("the backend reported an error mid-answer: {}", crate::text::clip(&m, 200)),
                     }
                 } else {
-                    match resp.json().await {
-                        Ok(data) => return Ok(CoreSuccess { index: i, attempts: tried, body: CoreBody::Json(data), guard }),
-                        Err(e) => {
-                            return Err(RawChatError::new(
-                                StatusCode::BAD_GATEWAY,
-                                "backend_error",
-                                format!("backend at {} returned an unparseable body: {e}", cand.url),
-                            ))
-                        }
+                    // Read whole, then parsed: reqwest's json() reports a body
+                    // cut part-way as a decode error, which would hide the cut.
+                    match resp.bytes().await {
+                        // The body broke before it was read whole (the node cut
+                        // it): nothing reached the caller, so it is sent again.
+                        Err(e) => format!("the answer broke before it was complete: {e}"),
+                        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                            Ok(data) => return Ok(CoreSuccess { index: i, attempts: tried, body: CoreBody::Json(data), guard }),
+                            Err(e) => {
+                                return Err(RawChatError::new(
+                                    StatusCode::BAD_GATEWAY,
+                                    "backend_error",
+                                    format!("backend at {} returned an unparseable body: {e}", cand.url),
+                                ))
+                            }
+                        },
                     }
                 }
             }
             Ok(Ok(resp)) => {
                 let status = resp.status();
                 coordinator::warn_if_node_agent_outdated(status, &url);
+                // The tunnel door's pre-head loss: nothing reached the
+                // caller, so it is retried like a backend that is down.
+                let door_lost = crate::tunnel_door::lost_before_head(status.as_u16(), resp.headers());
+                let headers = resp.headers().clone();
                 let text = resp.text().await.unwrap_or_default();
-                if is_busy_reply(status.as_u16(), &text) {
+                restarting = crate::node_restart::restart_wait(status.as_u16(), &headers, &text);
+                if let Some(w) = restarting {
+                    format!("the node agent is restarting (retry after {}s)", w.as_secs())
+                } else if is_busy_reply(status.as_u16(), &text) {
                     busy = true;
                     busy_text(&text, cand)
                 } else {
-                    if !coordinator::is_retryable_llm_http_error(status.as_u16(), &text) {
+                    if !door_lost && !coordinator::is_retryable_llm_http_error(status.as_u16(), &text) {
                         let st = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
                         return Err(RawChatError::upstream(st, &text, &cand.model, &cand.url));
                     }
@@ -619,6 +644,7 @@ where
         };
         all_stalled &= stalled;
         all_busy &= busy;
+        all_restarting &= restarting.is_some();
         if stalled {
             // Demote it for the next requests too, not only this one.
             classes::note_stall(&cand.url, &cand.backend);
@@ -632,8 +658,40 @@ where
         }
         failed.push((cand.url.clone(), cand.backend.clone()));
         last_failure = failure.clone();
-        if !retried_first && i == 0 && !busy && guard.may_retry(tried) {
+        if let Some(wait) = restarting {
+            last_restart = Some(wait);
+            let other = candidates
+                .iter()
+                .any(|c| !(c.url == cand.url && c.backend == cand.backend) && !failed.iter().any(|(u, b)| u == &c.url && b == &c.backend));
+            // With another candidate it fails over as any failure does; an
+            // interactive call with none waits the node out, bounded.
+            if !other && retry_first.is_some() && guard.may_retry(tried) {
+                let left = crate::node_restart::MAX_WAIT.saturating_sub(restart_waited).min(deadline.saturating_duration_since(Instant::now()));
+                let w = wait.min(left);
+                if !w.is_zero() {
+                    match crate::node_restart::try_wait(&cand.url) {
+                        Some(_place) => {
+                            // Waiting holds no in-flight ticket: routing sees no phantom load.
+                            drop(ticket);
+                            tracing::info!(class, node = %cand.node_id, wait_ms = w.as_millis() as u64, "raw_chat_wait_node_restart");
+                            tokio::time::sleep(w).await;
+                            restart_waited += w;
+                            retried_first = true;
+                            failed.pop();
+                            order.insert(k, i);
+                            continue;
+                        }
+                        None => tracing::warn!(class, node = %cand.node_id, "raw_chat_node_restart_waiters_full"),
+                    }
+                }
+            }
+        }
+        // A restarting node is never retried by the fixed wait: it was
+        // waited out above, or it has another candidate to fail over to.
+        if !retried_first && i == 0 && !busy && restarting.is_none() && guard.may_retry(tried) {
             retried_first = true;
+            // The wait holds no in-flight ticket either.
+            drop(ticket);
             let wait = retry_first.unwrap_or_default().min(deadline.saturating_duration_since(Instant::now()));
             tracing::info!(class, node = %cand.node_id, wait_ms = wait.as_millis() as u64, "raw_chat_retry_first_choice");
             tokio::time::sleep(wait).await;
@@ -660,6 +718,17 @@ where
         }
     }
 
+    if tried > 0 && all_restarting {
+        let detail = format!("every candidate of class '{class}' is restarting its node agent ({tried} tried of {}; last: {last_failure})", candidates.len());
+        let mut e = RawChatError::request_refused(
+            StatusCode::SERVICE_UNAVAILABLE,
+            crate::node_restart::CODE,
+            "the model's node is restarting; send the request again after the time in Retry-After",
+        );
+        e.detail = detail;
+        e.retry_after = last_restart.map(|d| d.as_secs().max(1));
+        return Err(e);
+    }
     if tried > 0 && all_busy {
         let detail = format!("every candidate of class '{class}' is busy ({tried} tried of {}; last: {last_failure})", candidates.len());
         return Err(RawChatError { retry_after: Some(BUSY_RETRY_AFTER_SECS), ..RawChatError::new(StatusCode::SERVICE_UNAVAILABLE, "backend_busy", detail) });
@@ -1147,26 +1216,26 @@ mod node_pin_tests {
     fn the_node_pin_comes_from_the_header_or_the_body_and_never_reaches_the_backend() {
         let none = PinHeaders::default();
         let header = |n: &str| PinHeaders { node: Some(n.into()), strict: None };
-        let mut body = json!({"model": "default", "node": "mcmini", "messages": []});
-        assert_eq!(node_pin(&mut body, &none).unwrap(), NodePin { node: Some("mcmini".into()), strict: false }, "a preference by default");
+        let mut body = json!({"model": "default", "node": "node-mac", "messages": []});
+        assert_eq!(node_pin(&mut body, &none).unwrap(), NodePin { node: Some("node-mac".into()), strict: false }, "a preference by default");
         assert!(body.get("node").is_none(), "stripped before forwarding");
-        let mut body = json!({"node": "mcmini"});
-        assert_eq!(node_pin(&mut body, &header("pop-os")).unwrap().node.as_deref(), Some("pop-os"), "the header wins");
+        let mut body = json!({"node": "node-mac"});
+        assert_eq!(node_pin(&mut body, &header("ctrl")).unwrap().node.as_deref(), Some("ctrl"), "the header wins");
         let mut body = json!({"node": "  "});
         assert_eq!(node_pin(&mut body, &none).unwrap().node, None);
         let mut body = json!({"node": 7});
         assert_eq!(node_pin(&mut body, &none).unwrap_err().status, StatusCode::BAD_REQUEST);
         // Strict: the body field, the header (which wins), both stripped.
-        let mut body = json!({"node": "mcmini", "node_strict": true});
-        assert_eq!(node_pin(&mut body, &none).unwrap(), NodePin { node: Some("mcmini".into()), strict: true });
+        let mut body = json!({"node": "node-mac", "node_strict": true});
+        assert_eq!(node_pin(&mut body, &none).unwrap(), NodePin { node: Some("node-mac".into()), strict: true });
         assert!(body.get("node_strict").is_none());
-        let mut body = json!({"node": "mcmini", "node_strict": true});
+        let mut body = json!({"node": "node-mac", "node_strict": true});
         assert!(!node_pin(&mut body, &PinHeaders { node: None, strict: Some(false) }).unwrap().strict);
         let mut body = json!({"node_strict": "yes"});
         assert_eq!(node_pin(&mut body, &none).unwrap_err().status, StatusCode::BAD_REQUEST);
         let mut h = axum::http::HeaderMap::new();
-        h.insert(HEADER_NODE, HeaderValue::from_static(" mcmini "));
-        assert_eq!(pin_headers(&h), PinHeaders { node: Some("mcmini".into()), strict: None });
+        h.insert(HEADER_NODE, HeaderValue::from_static(" node-mac "));
+        assert_eq!(pin_headers(&h), PinHeaders { node: Some("node-mac".into()), strict: None });
         for (v, strict) in [("1", true), ("true", true), ("YES", true), ("on", true), ("anything", true), ("0", false), ("false", false), ("no", false), ("off", false)] {
             h.insert(HEADER_NODE_STRICT, HeaderValue::from_str(v).unwrap());
             assert_eq!(pin_headers(&h).strict, Some(strict), "{v}");
@@ -1178,9 +1247,9 @@ mod node_pin_tests {
         use classes::Refusal;
         assert_eq!(refusal_error(Refusal::UnknownNode("node 'x' is not a node".into())).status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(refusal_error(Refusal::NodeServesNoChat("node 'x' serves no chat".into())).status, StatusCode::UNPROCESSABLE_ENTITY);
-        let e = refusal_error(Refusal::NodeCannotServe("node 'pop-os' does not serve 'gemma4:12b'; it serves ollama=gemma4:e2b-it-qat".into()));
+        let e = refusal_error(Refusal::NodeCannotServe("node 'ctrl' does not serve 'gemma4:12b'; it serves ollama=gemma4:e2b-it-qat".into()));
         assert_eq!(e.status, StatusCode::CONFLICT);
-        assert_eq!(e.public_message(), "node 'pop-os' does not serve 'gemma4:12b'");
+        assert_eq!(e.public_message(), "node 'ctrl' does not serve 'gemma4:12b'");
         assert!(e.detail.contains("e2b"), "the detail keeps it for the operator");
         assert_eq!(refusal_error(Refusal::UnknownModel("m".into())).status, StatusCode::NOT_FOUND);
         assert_eq!(refusal_error(Refusal::NoCandidates("m".into())).status, StatusCode::SERVICE_UNAVAILABLE);
@@ -1344,7 +1413,7 @@ mod tests {
 
     #[test]
     fn a_stand_in_first_candidate_is_reported_as_a_fallback() {
-        let mut c = cand("mcmini", "ollama", "gemma4:12b", "https://100.64.0.2:8081");
+        let mut c = cand("node-mac", "ollama", "gemma4:12b", "https://100.64.0.2:8081");
         assert!(!is_fallback(0, &c));
         assert!(is_fallback(1, &c));
         c.rank = "fallback,rank=gpu,params=12,load=0.20".into();
@@ -1440,7 +1509,28 @@ mod tests {
         /// The live `backend_unreachable` 502 on its first request (vLLM
         /// resetting the connection), then a prompt answer.
         FailsFirst(&'static str),
+        /// The tunnel door's own pre-head 502 on the first request (the
+        /// 0.6.26 roll, 17:01:09Z: node-a's agent restarting), with its
+        /// `x-noo-tunnel-error: tunnel_lost` header, then a prompt answer.
+        DoorLostFirst(&'static str),
+        /// The same body WITHOUT the door's header, then an answer: a
+        /// backend that merely says the words is not the door.
+        DoorBodyOnlyFirst(&'static str),
+        /// The door's mid-stream drop: a 200 head and two content frames,
+        /// then the connection closes without the terminating chunk.
+        DoorLostMidStream,
+        /// A node agent restarting (node_restart): its 503 `node_restarting`
+        /// with `Retry-After: 1` on the first request, then an answer.
+        RestartsFirst(&'static str),
+        /// A plain JSON answer (no SSE: `n > 1`) cut part-way on the first
+        /// request, then a whole one.
+        JsonCutFirst,
     }
+
+    /// The door's answer to a tunnel lost before the node's head, byte for
+    /// byte as the gateway logged it live (ref-0fe0d2de82).
+    const DOOR_LOST_BODY: &str =
+        r#"{"detail":"tunnel_lost: the tunnel to node node_a dropped (the connection failed)","error":"tunnel_lost"}"#;
 
     struct FakeBackend {
         url: String,
@@ -1518,6 +1608,52 @@ mod tests {
                             let body = r#"{"error":{"code":"backend_unreachable","message":"read tcp 172.18.0.1:45704->172.18.0.2:8000: read: connection reset by peer","type":"node_agent_proxy_error"}}"#;
                             let reply = format!("HTTP/1.1 502 Bad Gateway\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}", body.len());
                             let _ = sock.write_all(reply.as_bytes()).await;
+                        }
+                        Fake::DoorLostFirst(_) | Fake::DoorBodyOnlyFirst(_) if first_request => {
+                            let marker = if matches!(mode, Fake::DoorLostFirst(_)) { "x-noo-tunnel-error: tunnel_lost\r\n" } else { "" };
+                            let reply = format!(
+                                "HTTP/1.1 502 Bad Gateway\r\ncontent-type: application/json\r\n{marker}content-length: {}\r\n\r\n{DOOR_LOST_BODY}",
+                                DOOR_LOST_BODY.len()
+                            );
+                            let _ = sock.write_all(reply.as_bytes()).await;
+                        }
+                        Fake::DoorLostFirst(text) | Fake::DoorBodyOnlyFirst(text) => {
+                            let _ = sock.write_all(head.as_bytes()).await;
+                            for f in [delta(text), fin, usage, "data: [DONE]\n\n".to_string()] {
+                                let _ = sock.write_all(&chunk(&f)).await;
+                            }
+                            let _ = sock.write_all(b"0\r\n\r\n").await;
+                        }
+                        Fake::RestartsFirst(_) if first_request => {
+                            let body = r#"{"error":{"code":"node_restarting","message":"the node agent is restarting"}}"#;
+                            let reply = format!(
+                                "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\nretry-after: 1\r\ncontent-length: {}\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = sock.write_all(reply.as_bytes()).await;
+                        }
+                        Fake::RestartsFirst(text) => {
+                            let _ = sock.write_all(head.as_bytes()).await;
+                            for f in [delta(text), fin, usage, "data: [DONE]\n\n".to_string()] {
+                                let _ = sock.write_all(&chunk(&f)).await;
+                            }
+                            let _ = sock.write_all(b"0\r\n\r\n").await;
+                        }
+                        Fake::JsonCutFirst if first_request => {
+                            // Promises 400 bytes, sends a few, closes.
+                            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 400\r\n\r\n{\"id\":\"c\",").await;
+                        }
+                        Fake::JsonCutFirst => {
+                            let body = r#"{"id":"c","choices":[{"index":0,"message":{"role":"assistant","content":"whole"}},{"index":1,"message":{"role":"assistant","content":"whole"}}]}"#;
+                            let reply = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}", body.len());
+                            let _ = sock.write_all(reply.as_bytes()).await;
+                        }
+                        Fake::DoorLostMidStream => {
+                            let _ = sock.write_all(head.as_bytes()).await;
+                            for t in ["half ", "an answer "] {
+                                let _ = sock.write_all(&chunk(&delta(t))).await;
+                            }
+                            // Closed here: no terminating chunk.
                         }
                         Fake::FailsFirst(text) => {
                             let _ = sock.write_all(head.as_bytes()).await;
@@ -1647,7 +1783,7 @@ mod tests {
         for stream in [false, true] {
             let full = fake_backend(Fake::Busy).await;
             let spare = fake_backend(Fake::Answer("from the spare")).await;
-            let cands = [cand("mcmini", "ollama", "m", &full.url), cand("pop-os", "ollama", "m", &spare.url)];
+            let cands = [cand("node-mac", "ollama", "m", &full.url), cand("ctrl", "ollama", "m", &spare.url)];
             let started = Instant::now();
             // Its own long window: a busy candidate that was waited out would
             // take all of it, so half of it separates "at once" from "at the
@@ -1667,7 +1803,7 @@ mod tests {
     #[tokio::test]
     async fn a_lone_candidate_is_never_asked_to_reject() {
         let only = fake_backend(Fake::Answer("ok")).await;
-        let (r, _) = run(&[cand("mcmini", "ollama", "m", &only.url)], false, FAST).await;
+        let (r, _) = run(&[cand("node-mac", "ollama", "m", &only.url)], false, FAST).await;
         assert_eq!(json_of(r).0, 0);
         assert_eq!(only.asked_to_reject(), vec![false]);
     }
@@ -1696,9 +1832,9 @@ mod tests {
         assert!(!is_busy_reply(502, r#"{"error":{"code":"backend_busy"}}"#));
         assert!(!is_busy_reply(503, r#"{"error":{"code":"backend_unreachable"}}"#));
         assert!(is_busy_reply(503, r#"{"error":{"code":"backend_draining","message":"ollama is draining for a GPU hold"}}"#), "draining is moved on from like busy");
-        let c = cand("mcmini", "ollama", "m", "http://x");
+        let c = cand("node-mac", "ollama", "m", "http://x");
         let t = busy_text(r#"{"error":{"code":"backend_busy","message":"every slot on ollama is taken (2 in flight of 2, 1 queued)"}}"#, &c);
-        assert_eq!(t, "busy: mcmini/ollama has every slot taken (every slot on ollama is taken (2 in flight of 2, 1 queued))");
+        assert_eq!(t, "busy: node-mac/ollama has every slot taken (every slot on ollama is taken (2 in flight of 2, 1 queued))");
     }
 
     #[tokio::test]
@@ -1724,7 +1860,7 @@ mod tests {
         }
     }
 
-    /// 2026-10-19: every external chat to mcmini (the only live chat-default
+    /// 2026-10-19: every external chat to node-mac (the only live chat-default
     /// candidate, a 12B on ollama) was cut at 30 s and answered 504, for
     /// hours, although the node answered when given time. With nothing left
     /// to fail over to, the window is the deadline.
@@ -1732,7 +1868,7 @@ mod tests {
     async fn the_last_candidate_is_given_the_deadline_not_the_stall_window() {
         let slow = fake_backend(Fake::LateStart { wait: Duration::from_millis(700), text: "late but whole" }).await;
         for stream in [false, true] {
-            let (r, alerts) = run(&[cand("mcmini", "ollama", "gemma4:12b", &slow.url)], stream, FAST).await;
+            let (r, alerts) = run(&[cand("node-mac", "ollama", "gemma4:12b", &slow.url)], stream, FAST).await;
             let ok = r.unwrap_or_else(|e| panic!("stream={stream}: {}", e.detail));
             if !stream {
                 let (_, data) = json_of(Ok(ok));
@@ -1834,36 +1970,158 @@ mod tests {
         assert_eq!(e.status, StatusCode::BAD_GATEWAY, "{}", e.detail);
     }
 
-    /// The expected-wait rule's retry (speed review 2026-11-11): awolf's
+    /// The expected-wait rule's retry (speed review 2026-11-11): node-a's
     /// vLLM resetting the connection once is retried after the wait, and
     /// answers; the slow fallback behind it is never touched.
     #[tokio::test]
     async fn the_first_choice_failing_once_is_retried_after_the_wait_and_answers() {
-        let awolf = fake_backend(Fake::FailsFirst("hi")).await;
-        let mcmini = fake_backend(Fake::Answer("slow")).await;
+        let node_a = fake_backend(Fake::FailsFirst("hi")).await;
+        let node_mac = fake_backend(Fake::Answer("slow")).await;
         let wait = Duration::from_millis(300);
         let t0 = Instant::now();
         let (r, _) = run_until_with_retry(
-            &[cand("awolf", "vllm", "m", &awolf.url), cand("mcmini", "ollama", "m", &mcmini.url)],
+            &[cand("node-a", "vllm", "m", &node_a.url), cand("node-mac", "ollama", "m", &node_mac.url)],
             false, FAST, Duration::from_secs(20), Some(wait),
         )
         .await;
         let (index, _) = json_of(r);
-        assert_eq!(index, 0, "awolf answered the retry");
+        assert_eq!(index, 0, "node-a answered the retry");
         assert!(t0.elapsed() >= wait, "the retry waited {:?}", t0.elapsed());
-        assert_eq!(awolf.seen.lock().unwrap().len(), 2, "one retry, not more");
-        assert!(mcmini.seen.lock().unwrap().is_empty(), "the fallback was never touched");
+        assert_eq!(node_a.seen.lock().unwrap().len(), 2, "one retry, not more");
+        assert!(node_mac.seen.lock().unwrap().is_empty(), "the fallback was never touched");
         assert_eq!(crate::coordinator::expected_wait::RETRY_FIRST_AFTER, Duration::from_secs(2));
+    }
+
+    /// The 0.6.26 roll's chat 502 (17:01:09Z): the class's ONLY candidate
+    /// answered with the tunnel door's pre-head `tunnel_lost` while its node
+    /// agent restarted. That is the backend being down for a moment, so the
+    /// expected-wait rule retries it after the wait, and it answers.
+    #[tokio::test]
+    async fn the_doors_pre_head_loss_on_the_only_node_is_retried_after_the_wait() {
+        let node_a = fake_backend(Fake::DoorLostFirst("hi")).await;
+        let wait = Duration::from_millis(300);
+        let t0 = Instant::now();
+        let (r, alerts) = run_until_with_retry(&[cand("node-a", "vllm", "m", &node_a.url)], false, FAST, Duration::from_secs(20), Some(wait)).await;
+        let (index, data) = json_of(r);
+        assert_eq!(index, 0);
+        assert_eq!(data.pointer("/choices/0/message/content").and_then(Value::as_str), Some("hi"));
+        assert!(t0.elapsed() >= wait, "the retry waited {:?}", t0.elapsed());
+        assert_eq!(node_a.seen.lock().unwrap().len(), 2, "sent once more, not more");
+        drop(alerts);
+    }
+
+    /// A node agent restarting (node_restart), the class's ONLY candidate:
+    /// an interactive call waits the node's Retry-After and is answered, not
+    /// refused. The call was marked as re-sent whole (it is aggregated).
+    #[tokio::test]
+    async fn the_only_node_restarting_is_waited_out_and_answers() {
+        let node_a = fake_backend(Fake::RestartsFirst("hi")).await;
+        let t0 = Instant::now();
+        let (r, _) = run_until_with_retry(&[cand("node-a", "vllm", "m", &node_a.url)], false, FAST, Duration::from_secs(20), Some(Duration::from_millis(300))).await;
+        let (index, data) = json_of(r);
+        assert_eq!(index, 0);
+        assert_eq!(data.pointer("/choices/0/message/content").and_then(Value::as_str), Some("hi"));
+        assert!(t0.elapsed() >= Duration::from_secs(1), "the node's Retry-After was waited, not the fixed 300 ms: {:?}", t0.elapsed());
+        assert_eq!(node_a.seen.lock().unwrap().len(), 2);
+        assert!(node_a.heads.lock().unwrap().iter().all(|h| h.contains("x-noo-resend: whole")), "an aggregated call says it is re-sent whole");
+    }
+
+    /// With another candidate the restart is a failure like any other: the
+    /// call moves on at once, it does not wait.
+    #[tokio::test]
+    async fn a_restarting_node_with_another_candidate_fails_over_at_once() {
+        let node_a = fake_backend(Fake::RestartsFirst("never")).await;
+        let node_mac = fake_backend(Fake::Answer("other")).await;
+        let t0 = Instant::now();
+        let (r, _) = run_until_with_retry(
+            &[cand("node-a", "vllm", "m", &node_a.url), cand("node-mac", "ollama", "m", &node_mac.url)],
+            false, FAST, Duration::from_secs(20), Some(Duration::from_millis(300)),
+        )
+        .await;
+        assert_eq!(json_of(r).0, 1);
+        assert!(t0.elapsed() < Duration::from_secs(1), "no wait with somewhere else to go: {:?}", t0.elapsed());
+    }
+
+    /// Not interactive (no retry rule: a batch source, a strict pin): no
+    /// wait. The caller gets the node's 503 with the Retry-After it gave.
+    #[tokio::test]
+    async fn without_the_rule_a_restart_is_a_503_naming_the_wait() {
+        let node_a = fake_backend(Fake::RestartsFirst("never")).await;
+        let (r, _) = run_until_with_retry(&[cand("node-a", "vllm", "m", &node_a.url)], false, FAST, Duration::from_secs(20), None).await;
+        let e = match r {
+            Err(e) => e,
+            Ok(_) => panic!("no wait without the rule"),
+        };
+        assert_eq!(e.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(e.kind, crate::node_restart::CODE);
+        assert_eq!(e.retry_after, Some(1));
+        assert_eq!(node_a.seen.lock().unwrap().len(), 1);
+    }
+
+    /// A streaming caller's call is never marked: its bytes reach the
+    /// caller as they come, so a restarting node must let it finish.
+    #[tokio::test]
+    async fn a_streamed_call_is_never_marked_resend_whole() {
+        let b = fake_backend(Fake::Answer("hi")).await;
+        let (r, _) = run(&[cand("n", "vllm", "m", &b.url)], true, FAST).await;
+        assert!(r.is_ok());
+        assert!(b.heads.lock().unwrap().iter().all(|h| !h.contains("x-noo-resend")), "{:?}", b.heads.lock().unwrap());
+    }
+
+    /// A plain JSON answer (no SSE: `n > 1`) cut part-way reached nobody: it
+    /// is sent again and the whole one answers. A whole body that does not
+    /// parse stays final.
+    #[tokio::test]
+    async fn a_plain_json_answer_cut_part_way_is_sent_again() {
+        let b = fake_backend(Fake::JsonCutFirst).await;
+        let client = reqwest::Client::new();
+        let r = failover_core(
+            &client, "chat-default", &[cand("node-a", "vllm", "m", &b.url)], false, FAST,
+            Instant::now() + Duration::from_secs(20), Some(Duration::from_millis(100)),
+            |c| (CHAT_PATH.to_string(), json!({"model": c.model, "n": 2, "messages": [{"role":"user","content":"hi"}]})),
+            |_, _| Box::pin(async {}),
+        )
+        .await;
+        let (_, data) = json_of(r);
+        assert_eq!(data.pointer("/choices/1/message/content").and_then(Value::as_str), Some("whole"));
+        assert_eq!(b.seen.lock().unwrap().len(), 2, "sent once more");
+    }
+
+    /// The rule is the door's header, not the words: the same body from a
+    /// backend without the header stays the final 502 it was.
+    #[tokio::test]
+    async fn the_doors_words_without_its_header_are_not_retried() {
+        let b = fake_backend(Fake::DoorBodyOnlyFirst("hi")).await;
+        let (r, _) = run_until_with_retry(&[cand("node-a", "vllm", "m", &b.url)], false, FAST, Duration::from_secs(20), Some(Duration::from_millis(300))).await;
+        let e = match r {
+            Err(e) => e,
+            Ok(_) => panic!("a 502 without the door's header must stay final"),
+        };
+        assert_eq!(e.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(b.seen.lock().unwrap().len(), 1, "never sent again");
+    }
+
+    /// A tunnel that drops MID-stream is never re-sent to a streaming caller:
+    /// its 200 head and the first bytes went out, and the body ends short.
+    #[tokio::test]
+    async fn a_door_drop_mid_stream_reaches_a_streaming_caller_and_is_never_resent() {
+        let b = fake_backend(Fake::DoorLostMidStream).await;
+        let (r, _) = run_until_with_retry(&[cand("node-a", "vllm", "m", &b.url)], true, FAST, Duration::from_secs(20), Some(Duration::from_millis(300))).await;
+        let ok = r.unwrap_or_else(|e| panic!("the stream is the caller's: {}", e.detail));
+        assert!(matches!(ok.body, CoreBody::Stream(_)));
+        assert_eq!(ok.index, 0);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(b.seen.lock().unwrap().len(), 1, "never sent again");
     }
 
     /// Without the rule (a strict pin, a batch source), failover is as it was.
     #[tokio::test]
     async fn without_the_rule_a_failure_moves_on_with_no_retry() {
-        let awolf = fake_backend(Fake::FailsFirst("hi")).await;
-        let mcmini = fake_backend(Fake::Answer("ok")).await;
-        let (r, _) = run(&[cand("awolf", "vllm", "m", &awolf.url), cand("mcmini", "ollama", "m", &mcmini.url)], false, FAST).await;
+        let node_a = fake_backend(Fake::FailsFirst("hi")).await;
+        let node_mac = fake_backend(Fake::Answer("ok")).await;
+        let (r, _) = run(&[cand("node-a", "vllm", "m", &node_a.url), cand("node-mac", "ollama", "m", &node_mac.url)], false, FAST).await;
         assert_eq!(json_of(r).0, 1);
-        assert_eq!(awolf.seen.lock().unwrap().len(), 1);
+        assert_eq!(node_a.seen.lock().unwrap().len(), 1);
     }
 
     /// A busy answer is load, not a transient failure: never retried.

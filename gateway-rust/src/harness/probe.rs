@@ -842,10 +842,10 @@ mod tests {
     #[test]
     fn the_env_file_fills_only_what_is_unset_and_flags_win_over_both() {
         let file = parse_env_file(
-            "# comment\nNODE_ID=awolf\nNOO_HARNESS_MODEL_URL=https://127.0.0.1:8081/v1\nNOO_HARNESS_MODEL=auto\nexport NOO_TLS_CERT=\"/etc/noo/pki/nodes/awolf.crt\"\nNOO_HARNESS_BACKEND='openai'\nNATS_NODE_USER=\nnot a line\n",
+            "# comment\nNODE_ID=node-a\nNOO_HARNESS_MODEL_URL=https://127.0.0.1:8081/v1\nNOO_HARNESS_MODEL=auto\nexport NOO_TLS_CERT=\"/etc/noo/pki/nodes/node-a.crt\"\nNOO_HARNESS_BACKEND='openai'\nNATS_NODE_USER=\nnot a line\n",
         );
         assert_eq!(file.len(), 6);
-        assert_eq!(file[3], ("NOO_TLS_CERT".to_string(), "/etc/noo/pki/nodes/awolf.crt".to_string()));
+        assert_eq!(file[3], ("NOO_TLS_CERT".to_string(), "/etc/noo/pki/nodes/node-a.crt".to_string()));
         assert_eq!(file[4].1, "openai");
         let env: BTreeMap<&str, &str> = [("NOO_HARNESS_MODEL", "qwen-env"), ("NOO_HARNESS_BACKEND", "")].into_iter().collect();
         let get = |k: &str| env.get(k).map(|v| v.to_string());
@@ -874,16 +874,16 @@ mod tests {
             match n {
                 "nobody" => Ok(RunAsUser { user: n.into(), uid: 65534, gid: 65534 }),
                 "root" | "toor" => Ok(RunAsUser { user: n.into(), uid: 0, gid: 0 }),
-                "rbpai" => Ok(RunAsUser { user: n.into(), uid: 1000, gid: 1000 }),
+                "user" => Ok(RunAsUser { user: n.into(), uid: 1000, gid: 1000 }),
                 _ => bail!("no such user {n:?}"),
             }
         };
         assert_eq!(decide_run_as(0, None, &users).unwrap().unwrap().user, "nobody", "root defaults to nobody");
-        assert_eq!(decide_run_as(0, Some("rbpai"), &users).unwrap().unwrap().uid, 1000);
+        assert_eq!(decide_run_as(0, Some("user"), &users).unwrap().unwrap().uid, 1000);
         assert!(decide_run_as(0, Some("toor"), &users).unwrap_err().to_string().contains("uid 0"));
         assert!(decide_run_as(0, Some("ghost"), &users).is_err());
         assert_eq!(decide_run_as(1000, None, &users).unwrap(), None, "a user runs it as themselves");
-        assert_eq!(decide_run_as(1000, Some("rbpai"), &users).unwrap(), None);
+        assert_eq!(decide_run_as(1000, Some("user"), &users).unwrap(), None);
         assert!(decide_run_as(1000, Some("nobody"), &users).unwrap_err().to_string().contains("needs root"));
         assert!(lookup_user("root").map(|u| u.uid == 0).unwrap_or(true));
     }

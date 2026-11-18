@@ -8,7 +8,14 @@ PR body or an issue.
 ## P1. Least privilege
 
 Containers run non-root, on read-only roots, with capabilities dropped. Nodes
-hold no credentials. A change that widens access is made by a person, never by
+hold their own identity and the fleet's shared secrets, nothing more: their
+own certificate and key (`/etc/noo/pki`, key mode 640 `root:noo-agent`) and
+their own NATS user, plus `NOO_NODE_AGENT_TOKEN` and `NOO_CLUSTER_SECRET`,
+which are **fleet-wide** (every node holds the same values). On Linux they live in
+`/etc/noo-node-agent.env` (0600, root) and `/etc/noo/agent-secrets/` (0600,
+the agent's user). A node holds no key that signs for the controller (its CA
+certificate and `signing.pub` are public) and no SSH key or sudoers grant
+from the controller. A change that widens access is made by a person, never by
 an agent's credential. A helper runs as root only for a documented hard
 blocker.
 

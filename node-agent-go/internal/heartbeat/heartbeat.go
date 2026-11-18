@@ -14,12 +14,14 @@ import (
 	"errors"
 	"fmt"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelstats"
+	"github.com/noomesh/noomesh/node-agent-go/internal/stopdrain"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -146,6 +148,20 @@ type Reporter struct {
 	// wired; ok=false (unreadable, or no models dir) omits the key.
 	modelSetsFree atomic.Pointer[func() (int64, bool)]
 
+	// ollamaVerify reports each placed Ollama model's verification against
+	// the controller's store, sent as `ollama_verify`. nil = not wired, and a
+	// provider answering nil (nothing checked yet) omits the key.
+	ollamaVerify atomic.Pointer[func() any]
+
+	// nodeLocal reports the node's own declarations file (nodelocal): which
+	// keys it declares, which it refused and why, sent as `node_local`.
+	nodeLocal atomic.Pointer[func() any]
+
+	// backendCaps reports the backend containers' capability set and what
+	// the node's environment asked for that is not grantable, sent as
+	// `backend_caps`. nil = not wired (no Docker backends here).
+	backendCaps atomic.Pointer[func() any]
+
 	// nodeFacts supplies the i300 F5b keys: the node facts, the consent policy
 	// and approvals, and `node_workloads`. It returns only the keys it knows;
 	// everything absent is omitted. nil = not wired. Installed after the loop
@@ -171,6 +187,12 @@ type Reporter struct {
 	// loop's goroutine (SendHeartbeat is not called concurrently).
 	failStreak  int
 	silentSince time.Time
+	// The previous stop's drain record (stopdrain.RecordFile), reported once:
+	// read on the first beat, sent until a beat carrying it is delivered,
+	// then removed. lastStopRead stops a second read when there is none.
+	lastStop     json.RawMessage
+	lastStopRead bool
+	lastStopSent bool
 
 	// encoding is the gzip state (beatgzip.go). Same goroutine as
 	// failStreak.
@@ -380,6 +402,41 @@ func (r *Reporter) gpuContentionReport() any {
 // `model_sets` ([{id, revision, state, reason?, ...delivery fields}]). It returns nil when the
 // state cannot be read.
 func (r *Reporter) SetModelSets(f func() any) { r.modelSets.Store(&f) }
+
+// SetOllamaVerify installs the provider of `ollama_verify`: [{model, state,
+// anchor, model_layer, reason, remedy?, checked_at}].
+func (r *Reporter) SetOllamaVerify(f func() any) { r.ollamaVerify.Store(&f) }
+
+// SetNodeLocal installs the provider of `node_local`.
+func (r *Reporter) SetNodeLocal(f func() any) { r.nodeLocal.Store(&f) }
+
+func (r *Reporter) nodeLocalReport() any {
+	f := r.nodeLocal.Load()
+	if f == nil || *f == nil {
+		return nil
+	}
+	return (*f)()
+}
+
+// SetBackendCaps installs the provider of `backend_caps`: {source, granted,
+// refused, allowed}.
+func (r *Reporter) SetBackendCaps(f func() any) { r.backendCaps.Store(&f) }
+
+func (r *Reporter) backendCapsReport() any {
+	f := r.backendCaps.Load()
+	if f == nil || *f == nil {
+		return nil
+	}
+	return (*f)()
+}
+
+func (r *Reporter) ollamaVerifyReport() any {
+	f := r.ollamaVerify.Load()
+	if f == nil || *f == nil {
+		return nil
+	}
+	return (*f)()
+}
 
 // SetModelSetsFreeBytes installs the provider of `model_sets_free_bytes`.
 func (r *Reporter) SetModelSetsFreeBytes(f func() (int64, bool)) { r.modelSetsFree.Store(&f) }
@@ -723,6 +780,7 @@ func (r *Reporter) noteOutcome(clk *stageClock, err error) {
 		}
 		return
 	}
+	r.lastStopDelivered()
 	if r.failStreak > 0 {
 		slog.Info("heartbeat delivery resumed",
 			"after_failures", r.failStreak,
@@ -1088,5 +1146,32 @@ func addLoad(payload map[string]any, m metrics.SystemMetrics) {
 	}
 	if m.CPULoad != nil {
 		payload["cpu_load"] = *m.CPULoad
+	}
+}
+
+// pendingLastStop is the previous stop's drain record while it is still to
+// be reported, else nil. Read once from the state dir; a missing or
+// unreadable record is simply nothing to report.
+func (r *Reporter) pendingLastStop() json.RawMessage {
+	if !r.lastStopRead {
+		r.lastStopRead = true
+		if r.cfg != nil && r.cfg.StateDir != "" {
+			if b, err := os.ReadFile(filepath.Join(r.cfg.StateDir, stopdrain.RecordFile)); err == nil && json.Valid(b) {
+				r.lastStop = b
+			}
+		}
+	}
+	return r.lastStop
+}
+
+// lastStopDelivered closes the report once a beat that carried it arrived.
+func (r *Reporter) lastStopDelivered() {
+	if !r.lastStopSent {
+		return
+	}
+	r.lastStopSent = false
+	r.lastStop = nil
+	if r.cfg != nil && r.cfg.StateDir != "" {
+		_ = os.Remove(filepath.Join(r.cfg.StateDir, stopdrain.RecordFile))
 	}
 }

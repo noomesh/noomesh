@@ -118,7 +118,7 @@ func TestParseDarwinLoadavg(t *testing.T) {
 	}
 }
 
-// A real sample, captured on the mcmini fleet node (Apple silicon, macOS):
+// A real sample, captured on the node-mac fleet node (Apple silicon, macOS):
 // `sysctl -n vm.loadavg` printed "{ 1.02 1.08 1.03 }" and `sysctl -n hw.ncpu`
 // printed 10. The heartbeat's load is then 1.02/10 = 0.102.
 func TestParseDarwinLoadavgCapturedSample(t *testing.T) {

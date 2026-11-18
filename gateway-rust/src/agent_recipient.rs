@@ -76,8 +76,8 @@ pub(crate) fn decide(to: &str, standing: Standing, registered: &[String]) -> Rec
 }
 
 /// Registered names that look like `to`: those it is the start of
-/// (`rbpai/claude-gen`), then those containing its session part (`general`
-/// in `rbpai/claude-general`), case-insensitively; failing both, the names
+/// (`user/claude-gen`), then those containing its session part (`general`
+/// in `user/claude-general`), case-insensitively; failing both, the names
 /// under `to`'s account.
 fn candidates(to: &str, registered: &[String]) -> Vec<String> {
     let lower = to.to_ascii_lowercase();
@@ -245,7 +245,7 @@ mod tests {
     use super::*;
 
     fn names() -> Vec<String> {
-        ["rbpai/claude-general", "rbpai/claude-harness", "rbwolf/claude-self-rbwolf", "rbwolf/codex-general2"].map(String::from).to_vec()
+        ["user/claude-general", "user/claude-harness", "owner/claude-self-owner", "owner/codex-general2"].map(String::from).to_vec()
     }
 
     /// The i277g case: a bare `general` reaches nobody. It is refused, naming
@@ -253,9 +253,9 @@ mod tests {
     #[test]
     fn an_unknown_name_is_refused_with_candidates() {
         let Recipient::Unknown(c) = decide("general", Standing::Nobody, &names()) else { panic!("general must be refused") };
-        assert_eq!(c, ["rbpai/claude-general", "rbwolf/codex-general2"]);
+        assert_eq!(c, ["user/claude-general", "owner/codex-general2"]);
         let msg = refusal("general", &c);
-        assert!(msg.contains("was not sent") && msg.contains("did you mean: rbpai/claude-general"), "{msg}");
+        assert!(msg.contains("was not sent") && msg.contains("did you mean: user/claude-general"), "{msg}");
         // Nothing close at all: still refused, and says so.
         let Recipient::Unknown(c) = decide("nobody", Standing::Nobody, &names()) else { panic!() };
         assert!(c.is_empty());
@@ -265,8 +265,8 @@ mod tests {
     /// A held name is delivered as written, with nothing to warn about.
     #[test]
     fn a_known_name_is_delivered_as_written() {
-        assert_eq!(decide("rbpai/claude-general", Standing::Held, &names()), Recipient::Known);
-        assert_eq!(decide("rbwolf", Standing::Held, &names()), Recipient::Known);
+        assert_eq!(decide("user/claude-general", Standing::Held, &names()), Recipient::Known);
+        assert_eq!(decide("owner", Standing::Held, &names()), Recipient::Known);
     }
 
     /// Under a real account but held by nobody: delivered (the account's
@@ -275,21 +275,21 @@ mod tests {
     /// name is offered first, never substituted.
     #[test]
     fn an_unheld_name_under_an_account_is_delivered_with_a_warning() {
-        let Recipient::Unheld(c) = decide("rbpai/claude-gen", Standing::AccountOnly, &names()) else { panic!() };
-        assert_eq!(c, ["rbpai/claude-general"], "the one name it is the start of");
-        let w = unheld_warning("rbpai/claude-gen", &c);
-        assert!(w.contains("delivered to that name") && w.ends_with("did you mean: rbpai/claude-general"), "{w}");
+        let Recipient::Unheld(c) = decide("user/claude-gen", Standing::AccountOnly, &names()) else { panic!() };
+        assert_eq!(c, ["user/claude-general"], "the one name it is the start of");
+        let w = unheld_warning("user/claude-gen", &c);
+        assert!(w.contains("delivered to that name") && w.ends_with("did you mean: user/claude-general"), "{w}");
         // A typo inside the account: nothing starts with or contains it, so
         // the account's own names are offered.
-        let Recipient::Unheld(c) = decide("rbpai/claude-genreal", Standing::AccountOnly, &names()) else { panic!() };
-        assert_eq!(c, ["rbpai/claude-general", "rbpai/claude-harness"]);
+        let Recipient::Unheld(c) = decide("user/claude-genreal", Standing::AccountOnly, &names()) else { panic!() };
+        assert_eq!(c, ["user/claude-general", "user/claude-harness"]);
         // A minted window with a registered namesake is not rewritten: the
         // namesake is only suggested.
         let reg = vec!["alice/w10".to_string()];
         assert_eq!(decide("alice/w1", Standing::AccountOnly, &reg), Recipient::Unheld(vec!["alice/w10".into()]));
         // The name itself is never offered as its own alternative.
-        let Recipient::Unheld(c) = decide("rbpai/claude-general", Standing::AccountOnly, &names()) else { panic!() };
-        assert!(!c.contains(&"rbpai/claude-general".to_string()), "{c:?}");
+        let Recipient::Unheld(c) = decide("user/claude-general", Standing::AccountOnly, &names()) else { panic!() };
+        assert!(!c.contains(&"user/claude-general".to_string()), "{c:?}");
     }
 
     #[test]
@@ -297,7 +297,7 @@ mod tests {
         assert!(thread_needs_an_id("thread", None).unwrap_err().contains("nothing was sent"));
         assert!(thread_needs_an_id("thread", Some(" ")).is_err());
         assert!(thread_needs_an_id("thread", Some("thr_a")).is_ok());
-        assert!(thread_needs_an_id("rbpai/claude-general", None).is_ok());
+        assert!(thread_needs_an_id("user/claude-general", None).is_ok());
     }
 
     /// Both ways a message is sent check the recipient before publishing:

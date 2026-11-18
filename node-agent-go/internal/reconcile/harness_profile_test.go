@@ -35,7 +35,7 @@ func TestOnceKeepsTheLastGoodProfileAndClearsOnAbsence(t *testing.T) {
 		_, _ = w.Write([]byte(body.Load().(string)))
 	}))
 	defer srv.Close()
-	r := &Reconciler{cfg: &config.Config{ControllerURL: srv.URL, NodeID: "mcmini"}, client: srv.Client()}
+	r := &Reconciler{cfg: &config.Config{ControllerURL: srv.URL, NodeID: "node-mac"}, client: srv.Client()}
 
 	body.Store(`{"node":null,"placements":[],"harness_profile":{"tier":2,"first_byte_secs":600,"ollama_context":32768,"foreign_kinds":["codex"]}}`)
 	r.Once(context.Background())
@@ -155,7 +155,7 @@ func TestProfileOllamaContextJoinsTheSpecOnlyWhenThePlacementDoesNotSetIt(t *tes
 
 // One profile value, every chat engine: vLLM gets VLLM_MAX_MODEL_LEN and
 // llama.cpp N_CTX from the same default Ollama always got, when the
-// placement does not decide the window itself (awolf ran vLLM at the image
+// placement does not decide the window itself (node-a ran vLLM at the image
 // default 16384 beside Ollama's 32768 at the same tier, 2026-10-24).
 func TestTheProfileContextReachesEveryChatEngineThatDoesNotSetItsOwn(t *testing.T) {
 	p32 := &harnessprofile.Profile{Context: 32768}

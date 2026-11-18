@@ -29,7 +29,7 @@ ships. The rule is "always sops, never plaintext".
 
 | Value | Meaning |
 |---|---|
-| `sops` | decrypt `secrets/env.sops` at launch. No plaintext secrets at rest. Fails closed: a missing `sops` binary, a missing store, or an unavailable age key stops the launch with a message naming `scripts/noo-secrets-sops-init.sh`, rather than starting with no secrets |
+| `sops` | decrypt `secrets/env.sops` at launch. No plaintext secret files on the controller's launcher path (they sit on tmpfs only). The age key (`~/.config/sops/age/keys.txt`) and node and harness secrets (`/etc/noo/agent-secrets`, `/etc/noo/harness-secrets`; a Mac under `~/noomesh/`) are plaintext files, mode `0600`. Fails closed: a missing `sops` binary, a missing store, or an unavailable age key stops the launch with a message naming `scripts/noo-secrets-sops-init.sh`, rather than starting with no secrets |
 | `env` | **retired (2026-09-30).** Secrets in plaintext `.env`. `noo onboard --secrets-backend env` is refused (exit 2), and the wizard never falls back to it: a missing or failing SOPS init script stops onboarding with exit 1 before any secret is minted. The launcher refuses to start an install that predates this (below), as does everything else that judges it |
 
 An install still on `env`, or holding any secret-class value in `.env`

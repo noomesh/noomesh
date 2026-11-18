@@ -683,7 +683,7 @@ pub type Summarised = (std::process::ExitStatus, ComposeTally, Vec<String>);
 
 /// The lines to print under a failed summarised run: the child's last lines,
 /// unfiltered, and how to see everything. A non-zero exit is never silent
-/// (pop-os 2026-11-05: the launcher exited 1 twice and the operator saw only
+/// (ctrl 2026-11-05: the launcher exited 1 twice and the operator saw only
 /// its banners, because every line it printed was absorbed or there were
 /// none to classify). Empty on success.
 pub fn failure_tail(ok: bool, tail: &[String], rerun: &str) -> Vec<String> {
@@ -1804,7 +1804,7 @@ mod failure_tail_tests {
         c
     }
 
-    /// pop-os 2026-11-05: the launcher exited 1 and the operator saw only its
+    /// ctrl 2026-11-05: the launcher exited 1 and the operator saw only its
     /// banners. A fake launcher prints a progress line the summary absorbs,
     /// an unclassified line, and exits 1: both reach the failure output.
     #[test]

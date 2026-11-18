@@ -27,7 +27,7 @@
 // A probe timeout does not count as pressure for NOO_GPU_TIMEOUT_GRACE_S
 // (300 s) after one of OUR GPU backends starts or is resumed: on WSL2 a vLLM
 // loading its weights stalls nvidia-smi itself, and reading that as a
-// Windows program made awolf yield to its own backend every few minutes
+// Windows program made node-a yield to its own backend every few minutes
 // (2026-11-07). Measured foreign use is never graced.
 // A probe that answered before and now misses its deadline (nvidia-smi
 // stalls while a Windows program loads the GPU on WSL2) counts as pressure
@@ -92,9 +92,9 @@ const PauseReason = "gpu_in_use_by_other"
 // "shared": max(sharedFloorMinMB, sharedFloorPercent% of the card). Residue
 // is not a competing workload: pai-voice drained to idle still holds
 // ~113 MiB, a bare-metal driver/Xorg a few hundred, and the WSL/Windows
-// desktop compositor ~316 MiB (awolf, 2026-11-11). "shared" demotes the
+// desktop compositor ~316 MiB (node-a, 2026-11-11). "shared" demotes the
 // node's GPU backends at routing (classes.rs gpu_shared), so a 256 MiB
-// floor sent every default-class chat from awolf's vLLM to a slower node
+// floor sent every default-class chat from node-a's vLLM to a slower node
 // because of the desktop (since 0.6.7). An unknown total uses the minimum.
 const (
 	sharedFloorMinMB   = 1024
@@ -280,7 +280,7 @@ type Controller struct {
 	owned         []docker.NoomeshContainer // this tick's noomesh containers
 	ownedErr      error                     // non-nil: docker could not list them
 	// The two docker listings' last failures, so a host with no docker (a
-	// Mac running a native ollama: mcmini, every 15 s) warns once per
+	// Mac running a native ollama: node-mac, every 15 s) warns once per
 	// cause, not once per tick.
 	gpuList   listLog
 	ownedList listLog
@@ -796,7 +796,7 @@ var containerIDRe = regexp.MustCompile(`[0-9a-f]{64}`)
 // every noomesh container on the host, not just the backends this agent
 // starts: the compose-managed noo-ollama-embed / noo-tei / ... and
 // older-image orphans hold GPU memory too, and counting them as foreign made
-// a controller yield its own chat backend to its own embedder (pop-os,
+// a controller yield its own chat backend to its own embedder (ctrl,
 // 2026-10-21).
 //
 // Fail-safe: a process that cannot be attributed (cgroup unreadable or PID

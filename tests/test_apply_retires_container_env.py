@@ -22,7 +22,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 APPLIER = (REPO / "scripts" / "noo-apply.sh").read_text()
 
-STALE = "NODE_ID=robopi\nNOO_CLUSTER_SECRET=old\nNOO_NODE_AGENT_TOKEN=old\nNATS_USER=u\nNATS_PASSWORD=p\n"
+STALE = "NODE_ID=node-pi\nNOO_CLUSTER_SECRET=old\nNOO_NODE_AGENT_TOKEN=old\nNATS_USER=u\nNATS_PASSWORD=p\n"
 
 
 def block() -> str:

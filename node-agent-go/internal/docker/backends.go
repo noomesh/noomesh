@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -174,7 +175,7 @@ type BackendSpec struct {
 	// ReadOnlyRoot runs the container on a read-only root filesystem with a
 	// tmpfs /tmp (rootFloor). Set only for an image whose write set was
 	// measured empty outside its mounts (`docker diff` on a running
-	// container): llama-server (awolf, 2026-10-28, a day of serving: no
+	// container): llama-server (node-a, 2026-10-28, a day of serving: no
 	// write). vLLM, ollama and TEI write caches into their image paths and
 	// are not set until measured with a writable cache mount (i301).
 	ReadOnlyRoot bool
@@ -872,7 +873,9 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 	// An UNPLACED node (no NOO_MODEL_CACHE_URL: the controller's own agent, a
 	// dev box) has no store to preseed from; it runs online as before.
 	// GGUF weights (llama.cpp) are a flat file; copy from the store if present.
-	c.preseedGGUF(ctx, backend, model)
+	if _, err := c.preseedGGUF(ctx, backend, model); err != nil {
+		return err
+	}
 
 	// Placement-driven extras win over everything env-derived.
 	for k, v := range overrides.ExtraEnv {
@@ -1185,15 +1188,15 @@ func (c *Client) StopBackendSDK(ctx context.Context, backend string) error {
 // as it would today if the file were absent. Requires NOO_MODEL_CACHE_URL.
 // In-process, against the host path: the agent is a host process (the
 // disposable helper container it once ran in is retired).
-func (c *Client) preseedGGUF(ctx context.Context, backend, model string) bool {
+func (c *Client) preseedGGUF(ctx context.Context, backend, model string) (bool, error) {
 	cacheURL := preseed.CacheURL()
 	// llamacpp LLMs and gguf rerankers (llamacpp-engine reranker backend)
 	// both load flat gguf files from /models.
 	if cacheURL == "" || model == "" || (backend != "llamacpp" && backend != "reranker") {
-		return false
+		return false, nil
 	}
 	if !strings.HasSuffix(strings.ToLower(model), ".gguf") || strings.Contains(model, "/") {
-		return false // only bare GGUF filenames; guard path traversal
+		return false, nil // only bare GGUF filenames; guard path traversal
 	}
 	src := fmt.Sprintf("%s/gguf/%s", cacheURL, url.PathEscape(model))
 	modelsHost := resolveEnv(modelsSource)
@@ -1228,13 +1231,16 @@ func (c *Client) preseedGGUF(ctx context.Context, backend, model string) bool {
 			"fix", "roll a gateway >= stack-v0.2.25 (which serves /api/artifacts/manifest), "+
 				"confirm the file is in the controller's model store, or place it on the node "+
 				"with `noo cluster sync-model-files`")
-		return false
+		return false, nil
 	}
 	slog.Info("gguf preseed will verify against controller manifest",
 		"model", model, "sha256", sha[:12]+"…")
 	fctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
 	wrote, err := preseed.New().FetchOneVerified(fctx, src, dest, sha)
+	if refusal := ggufFetchOutcome(backend, model, dest, err, time.Now()); refusal != nil {
+		return false, refusal
+	}
 	if err != nil {
 		if isPermissionErr(err) {
 			slog.Error("gguf preseed cannot write the node's models dir — expecting local file or manual placement",
@@ -1244,10 +1250,55 @@ func (c *Client) preseedGGUF(ctx context.Context, backend, model string) bool {
 			slog.Info("gguf preseed miss; expecting local file or manual placement",
 				"model", model, "src", src, "err", err)
 		}
-		return false
+		return false, nil
 	}
 	slog.Info("gguf preseeded from controller store", "model", model, "wrote", wrote, "dest", dest)
-	return true
+	return true, nil
+}
+
+// ggufFetchOutcome turns a preseed failure into a refusal in exactly one case:
+// the file in the models dir was PROVEN to differ from the controller's
+// manifest and could not be replaced (preseed.ErrPresentMismatch). Those bytes
+// are moved aside (renamed, never deleted, so they can be examined) and the
+// backend start is refused: a file the agent has just shown to be wrong is
+// never loaded. Every other failure (no manifest, an unreachable controller, a
+// transport error with no proof of a mismatch) returns nil and the start goes
+// on with whatever local file is there, as documented (availability).
+func ggufFetchOutcome(backend, model, dest string, err error, now time.Time) error {
+	if !errors.Is(err, preseed.ErrPresentMismatch) {
+		return nil
+	}
+	refusal := &GGUFMismatchError{Backend: backend, Model: model, Path: dest, Detail: err.Error()}
+	aside := dest + ".quarantined-" + now.UTC().Format("20060102T150405Z")
+	if rerr := os.Rename(dest, aside); rerr != nil {
+		refusal.QuarantineErr = rerr.Error()
+	} else {
+		refusal.Quarantined = aside
+	}
+	slog.Error("gguf refused: the local file does not match the controller's record and could not be replaced",
+		"backend", backend, "model", model, "path", dest, "quarantined", refusal.Quarantined,
+		"quarantine_error", refusal.QuarantineErr, "detail", err)
+	return refusal
+}
+
+// GGUFMismatchError refuses a llama.cpp/reranker start whose GGUF was proven
+// to differ from the controller's record and could not be re-fetched. It is
+// returned from the backend start, so it fails over like any other start
+// failure (the same path as an HF model_cache_miss and #1291's refusals).
+type GGUFMismatchError struct {
+	Backend, Model, Path       string
+	Quarantined, QuarantineErr string
+	Detail                     string
+}
+
+func (e *GGUFMismatchError) Error() string {
+	where := "it was moved aside to " + e.Quarantined
+	if e.Quarantined == "" {
+		where = "it could NOT be moved aside (" + e.QuarantineErr + ") and is still at " + e.Path + "; it is not loaded"
+	}
+	return fmt.Sprintf("gguf_mismatch: %s needs %s, but %s does not match the controller's record and could not be re-fetched (%s); "+
+		"%s. Once this node reaches the controller, re-fetch it with `noo cluster sync-model-files %s -m %s`; the next start loads the verified file",
+		e.Backend, e.Model, e.Path, e.Detail, where, nodeIDOrPlaceholder(), e.Model)
 }
 
 // isPermissionErr tells "this process may not write here" from every other
@@ -1703,24 +1754,93 @@ var backendCapsDefault = []string{"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "
 // roots and the skill bind roots.
 const BackendCapsEnv = "NOO_BACKEND_CAP_ADD"
 
-func backendCaps() []string {
-	v := strings.TrimSpace(os.Getenv(BackendCapsEnv))
+// backendCapAllowed is every capability NOO_BACKEND_CAP_ADD may grant
+// (proposal 61 phase 0): default-deny. What is left out is what reaches the
+// host from a container: SYS_ADMIN (mounts, namespaces), SYS_PTRACE,
+// SYS_MODULE, SYS_RAWIO, DAC_READ_SEARCH (open_by_handle_at), NET_ADMIN,
+// MKNOD, BPF, PERFMON, SYS_BOOT, SYS_TIME, MAC_*, LINUX_IMMUTABLE, SYSLOG,
+// SETFCAP, SETPCAP, and the literal ALL.
+var backendCapAllowed = map[string]bool{
+	"CHOWN": true, "DAC_OVERRIDE": true, "FOWNER": true, "FSETID": true,
+	"SETGID": true, "SETUID": true, "KILL": true, "NET_BIND_SERVICE": true,
+	"SYS_NICE": true, "IPC_LOCK": true, "SYS_RESOURCE": true, "AUDIT_WRITE": true,
+}
+
+// BackendCapGrantable reports whether NOO_BACKEND_CAP_ADD may grant name
+// (normalised: upper-case, no CAP_ prefix). The node-local declarations file
+// holds a declared set to this same allow-list.
+func BackendCapGrantable(name string) bool { return backendCapAllowed[name] }
+
+func backendCapAllowedList() []string {
+	out := make([]string, 0, len(backendCapAllowed))
+	for k := range backendCapAllowed {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// capsDecision is what NOO_BACKEND_CAP_ADD asked for and what the agent
+// grants: Source is "default" (unset), "none" or "env"; Refused holds every
+// requested name outside backendCapAllowed (dropped, never granted).
+type capsDecision struct {
+	Source  string
+	Granted []string
+	Refused []string
+}
+
+func decideBackendCaps(v string) capsDecision {
+	v = strings.TrimSpace(v)
 	if v == "" {
-		return backendCapsDefault
+		return capsDecision{Source: "default", Granted: backendCapsDefault}
 	}
 	if strings.EqualFold(v, "none") {
-		return nil
+		return capsDecision{Source: "none"}
 	}
-	out := make([]string, 0, 8)
+	d := capsDecision{Source: "env", Granted: make([]string, 0, 8)}
 	for _, c := range strings.Split(v, ",") {
 		c = strings.ToUpper(strings.TrimSpace(strings.TrimPrefix(strings.ToUpper(strings.TrimSpace(c)), "CAP_")))
-		if c != "" {
-			out = append(out, c)
+		if c == "" {
+			continue
 		}
+		if !backendCapAllowed[c] {
+			d.Refused = append(d.Refused, c)
+			continue
+		}
+		d.Granted = append(d.Granted, c)
+	}
+	return d
+}
+
+func backendCaps() []string {
+	d := decideBackendCaps(os.Getenv(BackendCapsEnv))
+	if d.Source != "env" {
+		return d.Granted
+	}
+	if len(d.Refused) > 0 {
+		slog.Error("backend containers: capabilities refused from the node's environment (each one lets a container reach the host; not grantable here)",
+			"env", BackendCapsEnv, "refused", d.Refused, "allowed", backendCapAllowedList())
 	}
 	slog.Info("backend containers: capability set widened by the node's own environment",
-		"env", BackendCapsEnv, "cap_add", out)
-	return out
+		"env", BackendCapsEnv, "cap_add", d.Granted)
+	return d.Granted
+}
+
+// BackendCapsReport is the heartbeat's `backend_caps`: where the backend
+// containers' capability set comes from (`source`), what is granted, what
+// NOO_BACKEND_CAP_ADD asked for that is not grantable (`refused`: dropped,
+// the backend starts without it), and the allow-list. `noo cluster verify`
+// WARNs on a refusal, which is otherwise only an agent-log line.
+func BackendCapsReport() any {
+	d := decideBackendCaps(os.Getenv(BackendCapsEnv))
+	granted, refused := d.Granted, d.Refused
+	if granted == nil {
+		granted = []string{}
+	}
+	if refused == nil {
+		refused = []string{}
+	}
+	return map[string]any{"source": d.Source, "granted": granted, "refused": refused, "allowed": backendCapAllowedList()}
 }
 
 // envOr returns the value of env var `name`, or `fallback` if unset/empty.
@@ -1825,7 +1945,7 @@ func ContainerNameFor(backend string) string {
 // The controller never sends these images (routes/cluster.rs
 // backend_image_ref: "the node derives its own release ref"), so the
 // placement's Image is empty and the spec hash did not change when the node
-// rolled: awolf ran noo-llamacpp on v0.6.12 after the 0.6.13 roll, with
+// rolled: node-a ran noo-llamacpp on v0.6.12 after the 0.6.13 roll, with
 // llamacpp:v0.6.13 staged on the rail. reconcile.specHash folds this in.
 func ReleaseBackendImage(backend string) string {
 	prefix, tag := os.Getenv("NOO_IMAGE_PREFIX"), os.Getenv("NOO_IMAGE_TAG")

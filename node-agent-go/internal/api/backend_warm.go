@@ -9,7 +9,7 @@ package api
 // (`jit_monitor.py`: "Triton kernel JIT compilation during inference:
 // kernel_unified_attention ... consider extending warmup to cover this
 // shape/config"), so the first chat after every start paid the compile:
-// ~25 s on awolf. Its own load-time warmup does not cover a short chat at
+// ~25 s on node-a. Its own load-time warmup does not cover a short chat at
 // max_tokens 1, and its GET /health answers 200 before any of it.
 //
 // The agent now sends that request itself, once per container start: after

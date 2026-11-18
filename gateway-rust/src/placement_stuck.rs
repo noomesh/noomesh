@@ -259,7 +259,7 @@ pub fn spawn(state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     fn held(expires: &str) -> Value {
-        serde_json::json!({"id": "awolf", "gpu_contention": {
+        serde_json::json!({"id": "node-a", "gpu_contention": {
             "state": "held", "paused_backends": ["vllm"], "reason": "an add-on session",
             "lease": {"owner": "rhaddon", "operation_id": "op-77", "workload": "rhaddon/worker",
                       "generation": 4, "mode": "immediate", "since": "2026-11-12T15:00:00Z", "expires_at": expires}}})

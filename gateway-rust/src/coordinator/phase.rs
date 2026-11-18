@@ -118,17 +118,17 @@ mod tests {
     #[test]
     fn a_routed_frame_carries_the_slots_the_attempt_and_where_it_moved_from() {
         let s = Slots { in_flight: 2, total: 2, queued: 1 };
-        let f = routed("mcmini", "ollama", "gemma4:12b", Some(s), 0, 1, None, "gateway");
+        let f = routed("node-mac", "ollama", "gemma4:12b", Some(s), 0, 1, None, "gateway");
         assert_eq!(f["phase"], "routed");
-        assert_eq!(f["node"], "mcmini");
+        assert_eq!(f["node"], "node-mac");
         assert_eq!((f["slots_busy"].as_u64(), f["slots_total"].as_u64(), f["queued_ahead"].as_u64()), (Some(2), Some(2), Some(1)));
         assert_eq!(f["attempt"], 1);
         assert!(f.get("previous_node").is_none(), "attempt 1 names no previous node");
         // A free slot: nobody is ahead, whatever the agent's queue says.
-        let f = routed("awolf", "vllm", "m", Some(Slots { in_flight: 1, total: 4, queued: 3 }), 0, 1, None, "gateway");
+        let f = routed("node-a", "vllm", "m", Some(Slots { in_flight: 1, total: 4, queued: 3 }), 0, 1, None, "gateway");
         assert_eq!((f["slots_busy"].as_u64(), f["queued_ahead"].as_u64()), (Some(1), Some(0)));
         // This gateway's own count fills a slot the heartbeat still showed free.
-        let f = routed("awolf", "vllm", "m", Some(Slots { in_flight: 0, total: 1, queued: 2 }), 1, 1, None, "gateway");
+        let f = routed("node-a", "vllm", "m", Some(Slots { in_flight: 0, total: 1, queued: 2 }), 1, 1, None, "gateway");
         assert_eq!((f["slots_busy"].as_u64(), f["queued_ahead"].as_u64()), (Some(1), Some(2)));
         // Unknown slots are null, so the console says "sending to <node>".
         let f = routed("host8", "ollama", "m", None, 3, 2, Some(&Moved { node: "host3".into(), reason: "HTTP 502 (backend unreachable)\nmore".into() }), "gateway");
@@ -143,12 +143,12 @@ mod tests {
         assert_eq!(queued_ahead(": queued ahead=3"), Some(3));
         assert_eq!(queued_ahead(": keep-alive"), None);
         assert_eq!(queued_ahead("data: {}"), None);
-        let r = routed("mcmini", "ollama", "m", Some(Slots { in_flight: 1, total: 2, queued: 0 }), 0, 1, None, "gateway");
+        let r = routed("node-mac", "ollama", "m", Some(Slots { in_flight: 1, total: 2, queued: 0 }), 0, 1, None, "gateway");
         let q = queued(&r, 1, Some(2), Some(2));
         assert_eq!((q["slots_busy"].as_u64(), q["slots_total"].as_u64(), q["queued_ahead"].as_u64()), (Some(2), Some(2), Some(1)));
-        assert_eq!((q["node"].as_str(), q["attempt"].as_u64()), (Some("mcmini"), Some(1)));
+        assert_eq!((q["node"].as_str(), q["attempt"].as_u64()), (Some("node-mac"), Some(1)));
         // No occupancy headers and no known slots: still a queue, sizes unknown.
-        let r = routed("mcmini", "ollama", "m", None, 0, 1, None, "gateway");
+        let r = routed("node-mac", "ollama", "m", None, 0, 1, None, "gateway");
         let q = queued(&r, 2, None, None);
         assert!(q["slots_busy"].is_null() && q["slots_total"].is_null());
         assert_eq!(q["queued_ahead"], 2);

@@ -248,7 +248,7 @@ For search that reliably runs, pick another provider:
 | `backends.<name>.enabled`, `.model` | — | per-backend defaults (`ollama`, `vllm`, `llamacpp`); vLLM also takes `quantization`, `gpu_memory_utilization`, `extra_args` (`tool_call_parser`, `tensor_parallel_size`) |
 | `shard_key` | env `NOO_SHARD_KEY` → `NODE_ID` → `default` | tag written into every conversation's metadata |
 | `auto_scale`, `idle_timeout_sec`, `pinned_backends[]` | `true`, `1800`, `[]` | placement policy (Python) |
-| `image_retention` | unset | `live` \| `preview` \| `off`: superseded images after a roll (operator manual, Upgrade) |
+| `image_retention` | unset | `live` \| `preview` \| `off`: superseded images after a roll ([disk-and-images.md](../operating/disk-and-images.md#for-agents)) |
 | `monitoring` | unset (= `full`) | `full` \| `lean`: whether Grafana, Loki and Tempo run; `noo stack monitoring on\|off\|status` ([monitoring](../operating/monitoring.md)) |
 | `postgres_memory` | unset (= `standard`) | `standard` \| `auto`: how much memory Postgres takes ([below](#postgres-memory)) |
 
@@ -709,7 +709,7 @@ Decide in this order:
    | Gate | Meaning |
    |---|---|
    | `NOO_EXEC_APPROVAL_MODE` | `auto` \| `approval` \| `strict` tool-execution gating |
-   | `NOO_NODE_AGENT_PRIVILEGED` | whether the node-agent **container** runs privileged (mirrored into `.env` for compose, and the container is recreated on change; `posture list` reports the container's actual state) — an opt-in compose profile the fleet does not deploy; every node runs the host binary as `noo-agent` in the `docker` group ([node-agent.md](../security/node-agent.md)) |
+   | `NOO_NODE_AGENT_PRIVILEGED` | whether the node-agent **container** runs privileged (mirrored into `.env` for compose, and the container is recreated on change; `posture list` reports the container's actual state) — an opt-in compose profile the fleet does not deploy; every Linux node runs the host binary as `noo-agent` in the `docker` group (a Mac runs it as the enrolling user) ([node-agent.md](../security/node-agent.md)) |
    | `NOO_MCP_EXTERNAL_ENABLED` | opens the user MCP door (`/mcp/user`) |
 
    At boot the gateway (and the Python worker) read the table and set those
@@ -726,7 +726,7 @@ Decide in this order:
    ```
 
    Profiles: `hardened` = `approval` mode, unprivileged node-agent container;
-   `dev` = `auto` mode, privileged node-agent container. Neither changes what
+   `dev` = `auto` mode, privileged node-agent container (the opt-in compose one; fleet node agents are host processes with the Docker socket). Neither changes what
    a node accepts from the controller — that is the node's own contract, not
    a posture key ([node-agent.md](../security/node-agent.md)).
    Tenant isolation is deliberately not a
@@ -842,6 +842,7 @@ registry. The add-on that owns them reads them from its own container
 environment; a row here would be a switch on another process's behaviour that
 this one cannot honour.
 
+At-rest encryption (i10a) is opt-in, not yet validated on real hardware (decision 2026-10-26).
 `at_rest.unencrypted_accepted` records that a person has accepted this
 controller's data being stored unencrypted on disk (i10a). It has no env
 layer and can be set only by a person's own credential: the cluster

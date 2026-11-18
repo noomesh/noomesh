@@ -132,21 +132,21 @@ fn session_token(
     secret: &str,
 ) -> Result<(String, i64), TokenIssueError> {
     let expire_minutes = token_expire_minutes();
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let expire_secs = expire_minutes * 60;
-    let exp = now + chrono::TimeDelta::seconds(expire_secs);
+    let exp = now + jiff::SignedDuration::from_secs(expire_secs);
 
     let mut claims = serde_json::json!({
         "sub": username,
         "role": role.as_str(),
         "scopes": scopes,
-        "exp": exp.timestamp(),
-        "iat": now.timestamp(),
+        "exp": exp.as_second(),
+        "iat": now.as_second(),
         // Millisecond mint time: the session floor (`session_floor.rs`) is in
         // ms, so a token minted in the same second as a logout is ordered
         // against it correctly. Person sessions only; delegated tokens keep
         // their exact claim sets.
-        "iat_ms": now.timestamp_millis(),
+        "iat_ms": now.as_millisecond(),
         "iss": crate::auth::JWT_ISSUER,
         "aud": crate::auth::JWT_AUDIENCE,
     });
@@ -437,7 +437,7 @@ pub(crate) const HOST_TICKET_GRANT: &str = "host_ticket";
 /// site, so the Strict `noo_refresh` cookie rides along when a page served on
 /// another port of this host (an add-on's UI) POSTs here. A form-style POST
 /// needs no CORS preflight to take effect, so without this an add-on page
-/// could log the console out (2026-11-01 on pop-os: a logout with no console
+/// could log the console out (2026-11-01 on ctrl: a logout with no console
 /// request before it), rotate its refresh, or log the browser into another
 /// account (login CSRF, which plants a refresh cookie).
 ///
@@ -674,8 +674,7 @@ async fn issue_login(state: &AppState, user: &UserRecord, ua: Option<&str>, ip: 
     // re-prompts at the access-token TTL).
     let raw_refresh = auth_refresh::generate_raw_token();
     let refresh_ttl_days = auth_refresh::refresh_ttl_days();
-    let refresh_expires_at = chrono::Utc::now()
-        + chrono::TimeDelta::days(refresh_ttl_days);
+    let refresh_expires_at = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(refresh_ttl_days * 24);
     let stored = auth_refresh::store_token(
         &state.db,
         &user.username,
@@ -971,7 +970,7 @@ async fn rotate_refresh(
         return spent_token(db, &seen.user_id, &seen.id, ip).await;
     }
 
-    if seen.expires_at < chrono::Utc::now() {
+    if seen.expires_at < jiff::Timestamp::now() {
         // Spend it on the way out — it is dead either way, and leaving live
         // rows behind means the replay sweep has nothing to catch later.
         let _ = auth_refresh::revoke_token(db, &seen.id).await;
@@ -1069,7 +1068,7 @@ async fn rotate_refresh(
 
     let new_raw = auth_refresh::generate_raw_token();
     let new_expires =
-        chrono::Utc::now() + chrono::TimeDelta::days(auth_refresh::refresh_ttl_days());
+        jiff::Timestamp::now() + jiff::SignedDuration::from_hours(auth_refresh::refresh_ttl_days() * 24);
     if let Err(e) = auth_refresh::store_token(
         &mut *tx,
         &user.username,
@@ -1548,10 +1547,7 @@ async fn lookup_user_db(
 
     let (uname, hashed_pw, disabled, scopes_json, _fail_count, locked_until, role_str) = row;
 
-    // Check lockout
-    let is_locked = locked_until
-        .map(|lu| lu > chrono::Utc::now())
-        .unwrap_or(false);
+    let is_locked = locked_now(locked_until, jiff::Timestamp::now());
 
     let scopes: Vec<String> = scopes_json.as_array()
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
@@ -1571,6 +1567,66 @@ async fn lookup_user_db(
         scopes,
         role,
     }))
+}
+
+/// A lockout is in force while `locked_until` is still ahead of `now`; at the
+/// instant itself it has ended, and no `locked_until` is no lockout.
+fn locked_now(locked_until: Option<jiff::Timestamp>, now: jiff::Timestamp) -> bool {
+    locked_until.is_some_and(|until| until > now)
+}
+
+#[cfg(test)]
+mod lockout_tests {
+    use super::locked_now;
+    use jiff::{SignedDuration, Timestamp};
+
+    #[test]
+    fn a_lockout_holds_until_its_instant_and_not_after() {
+        let now = Timestamp::from_second(1_800_000_000).unwrap();
+        let ms = SignedDuration::from_millis(1);
+        assert!(locked_now(Some(now + ms), now), "a lockout ending after now holds");
+        assert!(!locked_now(Some(now), now), "at its instant the lockout has ended");
+        assert!(!locked_now(Some(now - ms), now), "a lockout in the past is over");
+        assert!(!locked_now(None, now), "no locked_until is no lockout");
+    }
+
+    /// A session token's claims: `exp` is its TTL after `iat`, `iat` is now,
+    /// and `iat_ms` is the same instant in milliseconds (the session floor
+    /// orders logouts by it).
+    #[test]
+    fn a_session_token_expires_its_ttl_after_it_was_issued() {
+        use base64::Engine;
+        let before = jiff::Timestamp::now().as_second();
+        let (token, ttl) = super::session_token("alice", crate::auth::Role::User, vec!["read".into()], None, "a-test-only-session-secret")
+            .unwrap_or_else(|_| panic!("mint"));
+        let payload = token.split('.').nth(1).expect("a JWT has a payload");
+        let claims: serde_json::Value =
+            serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).expect("base64url")).expect("json");
+        let (iat, exp, iat_ms) = (claims["iat"].as_i64().unwrap(), claims["exp"].as_i64().unwrap(), claims["iat_ms"].as_i64().unwrap());
+        assert_eq!(exp - iat, ttl, "exp is the TTL after iat");
+        assert_eq!(iat_ms.div_euclid(1000), iat, "iat_ms is iat's instant in ms");
+        assert!((before..=before + 5).contains(&iat), "iat is now ({before}), got {iat}");
+    }
+
+    /// A refresh is refused (and the token spent) once its expiry has passed
+    /// the current time; at the instant itself it still rotates, as before.
+    #[test]
+    fn a_refresh_past_its_expiry_is_refused() {
+        let own = crate::test_src::own_code(include_str!("core.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn rotate_refresh(");
+        assert!(body.contains("if seen.expires_at < jiff::Timestamp::now() {"), "expiry must be judged against now");
+        assert!(body.contains("return Rotation::Refused(\"Refresh token expired\");"));
+    }
+
+    /// The login lookup must ask with the current time and fold the lockout
+    /// into `disabled`, or a locked account logs in.
+    #[test]
+    fn the_login_lookup_refuses_a_locked_account() {
+        let own = crate::test_src::own_code(include_str!("core.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn lookup_user_db(");
+        assert!(body.contains("locked_now(locked_until, jiff::Timestamp::now())"), "the lookup must check the lockout against now");
+        assert!(body.contains("disabled: disabled || is_locked,"), "a locked account must read as disabled");
+    }
 }
 
 /// What the DB can tell us about existing admin accounts.
@@ -2394,20 +2450,20 @@ mod tests {
         assert!(session_origin_refusal(&h(&[("sec-fetch-site", "same-origin")])).is_ok());
         assert!(session_origin_refusal(&h(&[("sec-fetch-site", "none")])).is_ok(), "a navigation");
         for site in ["same-site", "cross-site", "Same-Site"] {
-            let e = session_origin_refusal(&h(&[("sec-fetch-site", site), ("origin", "https://pop-os.ts.net:8443")]))
+            let e = session_origin_refusal(&h(&[("sec-fetch-site", site), ("origin", "https://ctrl.ts.net:8443")]))
                 .expect_err(site);
             assert!(e.contains("console's own pages"), "{e}");
         }
         // An older browser: Origin must be this Host (default ports folded).
-        let host = "pop-os.ts.net";
-        assert!(session_origin_refusal(&h(&[("origin", "https://pop-os.ts.net"), ("host", host)])).is_ok());
-        assert!(session_origin_refusal(&h(&[("origin", "https://pop-os.ts.net:443"), ("host", host)])).is_ok());
-        assert!(session_origin_refusal(&h(&[("origin", "https://pop-os.ts.net"), ("host", "pop-os.ts.net:443")])).is_ok());
+        let host = "ctrl.ts.net";
+        assert!(session_origin_refusal(&h(&[("origin", "https://ctrl.ts.net"), ("host", host)])).is_ok());
+        assert!(session_origin_refusal(&h(&[("origin", "https://ctrl.ts.net:443"), ("host", host)])).is_ok());
+        assert!(session_origin_refusal(&h(&[("origin", "https://ctrl.ts.net"), ("host", "ctrl.ts.net:443")])).is_ok());
         assert!(session_origin_refusal(&h(&[("origin", "http://127.0.0.1:8080"), ("host", "127.0.0.1:8080")])).is_ok());
-        for bad in ["https://pop-os.ts.net:8443", "https://evil.example", "null", "file://x", "https://"] {
+        for bad in ["https://ctrl.ts.net:8443", "https://evil.example", "null", "file://x", "https://"] {
             assert!(session_origin_refusal(&h(&[("origin", bad), ("host", host)])).is_err(), "{bad}");
         }
-        assert!(session_origin_refusal(&h(&[("origin", "https://pop-os.ts.net")])).is_err(), "no Host: refuse");
+        assert!(session_origin_refusal(&h(&[("origin", "https://ctrl.ts.net")])).is_err(), "no Host: refuse");
         // Not a browser: unchanged.
         assert!(session_origin_refusal(&h(&[])).is_ok());
         assert!(session_origin_refusal(&h(&[("authorization", "Bearer x")])).is_ok());

@@ -93,8 +93,10 @@ The harness never runs a vendor CLI unconfined. On Linux the CLI runs in
 a Landlock jail: it can write only its task's working directory, HOME and
 TMPDIR, and read only the system trees a runtime needs, a short list of
 `/etc` files and the cluster CA file. It cannot read the node's keys, env
-files, secrets or data root, nor the harness's environment. The network is
-not restricted. A node whose kernel cannot provide Landlock (or a Mac
+files, secrets or data root, nor the harness's environment. The jail
+alone does not restrict the network, and a Mac has no other network limit. On
+Linux with systemd the harness unit is also held off the internet (see
+[the egress hold](../security/node-agent.md#the-harness-unit-is-held-off-the-internet)). A node whose kernel cannot provide Landlock (or a Mac
 without `sandbox-exec`) cannot run a foreign kind. Its tasks are
 checkpointed with `harness jail unavailable: …; foreign CLIs never run
 unjailed`, and the harness logs the reason at startup (`noo cluster logs
@@ -216,7 +218,7 @@ one has run, and whether it applies.
 
 ```sh
 noo cluster profile <node> --set thinking=on
-noo cluster profile <node> --set first_byte_secs=1200 stream_idle_secs=900
+noo cluster profile <node> --set first_byte_secs=1200 --set stream_idle_secs=900
 noo cluster profile <node> --set foreign_kinds=codex,copilot   # none: no foreign kind
 noo cluster profile <node> --clear thinking                    # back to measured / tier
 noo cluster profile <node> --clear-all
@@ -379,7 +381,7 @@ both numbers. A model neither declares has no ceiling. A vLLM model whose
 - **Below the floor × 1.25:** placed, with a `tight` warning.
 - **Floor not declared:** never refused. Codex and Claude Code's slim launch
   are not measured yet. Copilot and Claude Code carry 16 385, the lower bound
-  vLLM reported on awolf on 2026-10-24, until the probe measures them.
+  vLLM reported on node-a on 2026-10-24, until the probe measures them.
 
 Other flags: `--cli <absolute path>` (default: the kind's `cli` on PATH),
 `--test reply|file|both` (default `both`), `--prompt full|slim` (Claude

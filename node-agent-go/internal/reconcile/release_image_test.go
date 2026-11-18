@@ -12,7 +12,7 @@ func rollTo(t *testing.T, tag string) {
 	t.Setenv("NOO_IMAGE_TAG", tag)
 }
 
-// awolf 2026-10-28: the agent rolled to 0.6.13 and recreated vLLM, but
+// node-a 2026-10-28: the agent rolled to 0.6.13 and recreated vLLM, but
 // noo-llamacpp and its stunnel door stayed on v0.6.12 for good. The
 // controller sends no image for llama.cpp (the node derives its release
 // ref), so the placement is unchanged by a roll; the spec hash must still

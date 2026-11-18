@@ -5,7 +5,7 @@
 //!
 //! `noo cluster provision` reads a node's running CLI version, its derived
 //! tier and its data roots off `GET /api/cluster/nodes`. On the 0.6.20 roll
-//! the second `noo upgrade --nodes` found awolf and pop-os with none of them
+//! the second `noo upgrade --nodes` found node-a and ctrl with none of them
 //! and fell back three times in silence: "no CLI version" (so an
 //! uncompressed 528 MB bundle), tier from enrollment facts, data-root check
 //! skipped. The record it read was the gateway's DATABASE row for a node
@@ -152,49 +152,49 @@ mod tests {
         json!({ "nodes": list }).to_string()
     }
 
-    fn live_awolf() -> Value {
-        json!({"id": "awolf", "status": "online", "app_version": "noo-cli-v0.6.20", "derived_tier": 2,
+    fn live_node_a() -> Value {
+        json!({"id": "node-a", "status": "online", "app_version": "noo-cli-v0.6.20", "derived_tier": 2,
                "data_roots": {"noo_data_root": "/data/noo"}})
     }
 
     /// The 0.6.20 roll's shape: the gateway's database row for a node whose
     /// live entry expired (routes/cluster.rs merges it as `offline`).
-    fn db_row_awolf() -> Value {
-        json!({"id": "awolf", "status": "offline", "status_detail": "no heartbeat on the bus",
+    fn db_row_node_a() -> Value {
+        json!({"id": "node-a", "status": "offline", "status_detail": "no heartbeat on the bus",
                "last_heartbeat": "2026-11-09T21:10:04Z", "last_heartbeat_source": "database", "tier": 2})
     }
 
     #[test]
     fn a_database_row_is_offline_not_a_live_record() {
-        let body = nodes(json!([db_row_awolf()]));
-        let s = classify(Some((200, &body)), "awolf");
+        let body = nodes(json!([db_row_node_a()]));
+        let s = classify(Some((200, &body)), "node-a");
         assert_eq!(s, LiveState::Offline { since: Some("2026-11-09T21:10:04Z".into()), detail: Some("no heartbeat on the bus".into()) });
         assert!(s.live().is_none(), "a database row has no heartbeat facts and must not be read as live");
-        let live = nodes(json!([live_awolf()]));
-        assert_eq!(classify(Some((200, &live)), "awolf"), LiveState::Live(live_awolf()));
+        let live = nodes(json!([live_node_a()]));
+        assert_eq!(classify(Some((200, &live)), "node-a"), LiveState::Live(live_node_a()));
     }
 
     #[test]
     fn a_failed_fetch_says_why_instead_of_reading_as_nothing() {
-        assert!(matches!(classify(None, "awolf"), LiveState::Unreachable(w) if w.contains("did not answer")));
-        assert!(matches!(classify(Some((502, "bad gateway")), "awolf"), LiveState::Unreachable(w) if w.contains("HTTP 502")));
-        assert!(matches!(classify(Some((200, "<html>")), "awolf"), LiveState::Unreachable(w) if w.contains("JSON")));
-        assert_eq!(classify(Some((200, &nodes(json!([live_awolf()])))), "pop-os"), LiveState::Absent);
+        assert!(matches!(classify(None, "node-a"), LiveState::Unreachable(w) if w.contains("did not answer")));
+        assert!(matches!(classify(Some((502, "bad gateway")), "node-a"), LiveState::Unreachable(w) if w.contains("HTTP 502")));
+        assert!(matches!(classify(Some((200, "<html>")), "node-a"), LiveState::Unreachable(w) if w.contains("JSON")));
+        assert_eq!(classify(Some((200, &nodes(json!([live_node_a()])))), "ctrl"), LiveState::Absent);
     }
 
     #[test]
     fn the_wait_stops_at_the_first_live_record_and_is_bounded() {
         // A just-restarted agent: two asks find the database row, the third
         // its fresh heartbeat.
-        let answers = [nodes(json!([db_row_awolf()])), nodes(json!([db_row_awolf()])), nodes(json!([live_awolf()]))];
+        let answers = [nodes(json!([db_row_node_a()])), nodes(json!([db_row_node_a()])), nodes(json!([live_node_a()]))];
         let mut i = 0;
         let mut pauses = 0;
-        let (s, asked) = wait_live(&mut || { i += 1; Some((200, answers[i - 1].clone())) }, "awolf", 12, &mut || pauses += 1);
+        let (s, asked) = wait_live(&mut || { i += 1; Some((200, answers[i - 1].clone())) }, "node-a", 12, &mut || pauses += 1);
         assert_eq!((asked, pauses), (3, 2));
         assert!(s.live().is_some());
         // Never live: exactly `tries` asks, and the last state is returned.
         let mut n = 0;
-        let (s, asked) = wait_live(&mut || { n += 1; Some((200, nodes(json!([db_row_awolf()])))) }, "awolf", 4, &mut || {});
+        let (s, asked) = wait_live(&mut || { n += 1; Some((200, nodes(json!([db_row_node_a()])))) }, "node-a", 4, &mut || {});
         assert_eq!((asked, n), (4, 4));
         assert!(matches!(s, LiveState::Offline { .. }));
     }
@@ -203,19 +203,19 @@ mod tests {
     fn a_node_never_heard_from_is_not_waited_on() {
         // A first provision: the agent the bundle installs does not exist yet.
         let mut pauses = 0;
-        let (s, asked) = wait_live(&mut || Some((200, nodes(json!([live_awolf()])))), "pop-os", 12, &mut || pauses += 1);
+        let (s, asked) = wait_live(&mut || Some((200, nodes(json!([live_node_a()])))), "ctrl", 12, &mut || pauses += 1);
         assert_eq!((s, asked, pauses), (LiveState::Absent, 1, 0));
     }
 
     #[test]
     fn the_fallback_line_names_why_and_every_fact_it_loses() {
-        let line = fallback_line("awolf", &LiveState::Offline { since: Some("2026-11-09T21:10:04Z".into()), detail: None }, 60).unwrap();
-        for part in ["awolf has no live record after 60s", "last heartbeat 2026-11-09T21:10:04Z", "enrollment facts",
+        let line = fallback_line("node-a", &LiveState::Offline { since: Some("2026-11-09T21:10:04Z".into()), detail: None }, 60).unwrap();
+        for part in ["node-a has no live record after 60s", "last heartbeat 2026-11-09T21:10:04Z", "enrollment facts",
                      "uncompressed", "data-root check is skipped"] {
             assert!(line.contains(part), "{part:?} missing from {line}");
         }
-        let unreachable = fallback_line("awolf", &LiveState::Unreachable("GET /api/cluster/nodes answered HTTP 502".into()), 60).unwrap();
+        let unreachable = fallback_line("node-a", &LiveState::Unreachable("GET /api/cluster/nodes answered HTTP 502".into()), 60).unwrap();
         assert!(unreachable.contains("HTTP 502"), "the swallowed fetch error must be visible: {unreachable}");
-        assert_eq!(fallback_line("awolf", &LiveState::Live(live_awolf()), 0), None);
+        assert_eq!(fallback_line("node-a", &LiveState::Live(live_node_a()), 0), None);
     }
 }

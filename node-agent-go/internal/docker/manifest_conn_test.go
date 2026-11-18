@@ -70,7 +70,7 @@ func (w *connWatch) allClosedWithin(d time.Duration) bool {
 
 // 2026-11-02: each manifest lookup built its own transport with no idle
 // timeout, so every request left its keep-alive connection open on both
-// ends. robopi's retry loop held ~22 more an hour on the controller until
+// ends. node-pi's retry loop held ~22 more an hour on the controller until
 // the gateway ran out of file descriptors. A lookup now closes its
 // connection when it returns.
 func TestAManifestLookupLeavesNoConnectionOpen(t *testing.T) {

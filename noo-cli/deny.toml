@@ -1,4 +1,4 @@
-# cargo-deny config for the advisory gate (ci.yml job `rust-advisories`).
+# cargo-deny config for the advisory gate (ci.yml jobs `rust-advisories (gateway-rust)` / `(noo-cli)`).
 # Scope: RustSec advisories only. Licences and bans are not gated here.
 #
 # Vulnerabilities fail the job. Every ignore below needs a reason; delete the

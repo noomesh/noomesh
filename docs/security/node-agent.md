@@ -11,7 +11,7 @@ The question this page answers is the next one. **A controller that has been
 taken over — a compromised gateway process, an edited `noo_node_config` row,
 a stolen gateway certificate — is inside the trust boundary for issuing
 instructions. It must not thereby own the boxes.** The node agent runs as
-`noo-agent` in the `docker` group, which is host-root-equivalent; if desired
+`noo-agent` in the `docker` group on Linux (a Mac runs it as the enrolling user; a controller host with no `noo-agent` account runs it as root), and the docker socket is host-root-equivalent; if desired
 state can name any path, any image and any command, then one row in one table
 is root on every node in the fleet.
 
@@ -425,6 +425,13 @@ another node's address; an address a live node already holds is not shared,
 and a call to it stays on HTTPS. Behind NAT the observed address will not match
 the agent's, so those calls stay on HTTPS too).
 
+**A node's `agent_url` is held to its registered address.** The gateway
+stores the `agent_url` a heartbeat reports only when it is https, names an
+explicit port, and its host is the node's registered `ip_address`, with no
+user info, path, query or fragment. One that does not fit is neither stored
+nor dialled: the gateway dials `https://<ip>:8081`, and `noo cluster verify`
+shows an `agent address` FAIL naming the node and the reason.
+
 ---
 
 ## Declared host roots
@@ -511,9 +518,20 @@ Every container the agent creates on a controller's instruction runs with:
   keep a writable root until theirs is moved to a cache mount
   ([networks and containers](networks-and-containers.md#container-hardening)).
 
-`NOO_BACKEND_CAP_ADD` (node-local) widens the backend set for an image that
-genuinely needs more; `NOO_CONTAINER_RUN_USER` and
+`NOO_BACKEND_CAP_ADD` (a node-local declaration, [below](#the-nodes-own-declarations)) widens the backend set for an image that
+genuinely needs more, from an allow-list only: a capability that lets a
+container reach the host (`SYS_ADMIN`, `SYS_PTRACE`, `DAC_READ_SEARCH`,
+`NET_ADMIN`, `ALL`, …) is refused: dropped, so the backend starts without
+it, and reported in the heartbeat; `noo cluster verify`'s `backend caps` row
+WARNs naming the node, the refused names and the allow-list
+([env reference](../reference/env.md)). `NOO_CONTAINER_RUN_USER` and
 `NOO_CONTAINER_IMAGE_ALLOW` do the same for managed containers.
+
+The agent's own root helper container (the `chown` of an Ollama store, a
+`test -e` on a host directory) runs with `CapDrop ALL` plus only `CHOWN`,
+`DAC_OVERRIDE` and `FOWNER`, `no-new-privileges` and no network, and only
+on a path under the node's declared data roots. A `/pull` request's
+`remove_container` removes only a backend container the agent manages.
 
 ## Backend doors on a node
 
@@ -890,7 +908,7 @@ node a URL to dial instead.
 
 A GGUF preseed from the controller's weight cache proceeds only when the
 controller's artifact manifest states a `sha256` for those bytes, which the
-helper verifies while streaming. A missing manifest **refuses the preseed**;
+agent process verifies while streaming (no helper container). A missing manifest **refuses the preseed**;
 it does not copy the bytes unverified. The manifest route hashes the same
 directory the cache serves, so a missing manifest means the cache does not
 hold the file either.
@@ -898,6 +916,84 @@ hold the file either.
 This needs a gateway at `stack-v0.2.25` or newer. Against an older gateway a
 node never preseeds GGUFs — ship the file with `noo cluster
 sync-model-files`, or roll the gateway first.
+
+### Model stores are not world-writable
+
+A store any account on the host can write is a store anyone can plant model
+bytes in. The `model stores` row of `noo cluster verify` reads each node's
+declared data roots (the data root, the HF cache, the models dir, the Ollama
+store) and their first-level directories from the heartbeat, and WARNs on
+any that is writable by others without the sticky bit. The WARN names each
+path, its mode and owner, the exact `sudo chmod o-w <path>`, and what that
+store's loads are protected by: HF weights are verified against the
+controller's manifest at each backend start on a placed node (an unverifiable
+snapshot refuses the start; a running container is not re-hashed; an unplaced
+node is not checked); GGUF files are hashed against the controller's manifest
+at each start on a placed node and re-fetched on a mismatch; a file proven
+not to match whose re-fetch fails is moved aside (`<file>.quarantined-<time>`,
+never deleted) and the start is refused, naming the file and `noo cluster
+sync-model-files <node> -m <file>`; every later start is refused too (a
+quarantined gguf is never started, nor one missing from a models dir the
+controller declared; a first placement on the node's own default dir is
+still fetched by the start's preseed), and verify's `backend
+starts` row shows the refusal until the verified file is shipped (`noo
+cluster sync-model-files <node> -m <model>`); a container already running
+keeps running until its next start; with no manifest, or an unreachable
+controller and no proof of a mismatch, the agent logs a WARN and llama.cpp
+loads the local file; Ollama models are checked about every 10 minutes and at backend start,
+repaired from the controller, and refused only when the repair fails (native
+Ollama on a Mac is report-only), a hand pull is not.
+
+Put models on a node with `noo models pull` (or `noo cluster
+sync-model-files` for GGUF), or run a hand download as the store's owner.
+Never make a store world-writable so a download works.
+
+### Ollama models are verified against the controller
+
+On every node where the agent runs Ollama, each placed model is checked
+against the controller's store, and the `ollama models` row of `noo cluster
+verify` reports it:
+
+- **A registry tag the controller holds a manifest for**: staged with every
+  blob (`noo models fetch ollama:<tag>`), or recorded alone when the
+  controller pulled it (`noo models pull <tag>`, and onboard's first model).
+  The local manifest's layers must equal that manifest's, and every blob must
+  hash to its digest. This proves the bytes are unchanged since the
+  controller recorded the tag, not that the registry served the right model.
+- **A model built from a GGUF** (a `<name>.Modelfile` in the store): its
+  model layer must be the controller's GGUF, by sha256. The other layers
+  (template, parameters) are not anchored yet.
+
+A mismatch is repaired from the controller (the bad blobs are removed, then
+the model is re-installed or rebuilt from the verified GGUF). A pulled model
+is not repaired: the record of a pull holds no bytes, so a blob it needs is
+refused at once ("no bytes to repair from"), and the remedy is the re-pull.
+Only when a repair fails, or cannot be made, is the model refused: the node stops advertising it, the
+gateway routes elsewhere, and the row is a FAIL naming the model, the blob
+and the remedy. Hashing is cached by file identity (device, inode, size,
+mtime, ctime), so only the first check after a change reads the whole file.
+
+A model the controller has no record of (a hand `ollama pull`) is never
+refused: the row WARNs with a remedy that acts on THAT node's Ollama. On the
+controller's own node it is `noo models pull <model>`, which pulls through the
+gateway's Ollama and writes the record. `noo models pull` reaches no other
+node, so on any other node (a container or a Mac's native Ollama) the remedy
+stages the tag on the controller and imports it there: `noo models fetch
+ollama:<tag>`, then `noo cluster import-model <node> ollama:<tag>` (harrier, an
+artifact: `noo cluster import-model <node> harrier`). The record is the
+manifest the pull installed, written only when every layer the registry's
+manifest names (config, weights, template, parameters, licence) is in it with
+the same digest and size, and it adds only the manifest Ollama pulled (whose
+digest must be the registry manifest the controller fetched) and the list
+that named it. So every layer matches what the registry served at the pull. A
+tag that moved between the two requests leaves no record and says so; any
+other difference names the entries that differ. An
+`hf.co/` ref has no record and no remedy. A placed node (rail, pull-only)
+still needs the bytes staged with `noo models fetch ollama:<tag>`: importing
+from a record alone is refused by name.
+There is no setting that marks a model trusted. On a node whose Ollama the
+agent does not manage (a Mac's native Ollama) a mismatch is reported, never
+repaired or refused.
 
 ## Backend door leaves
 
@@ -1236,7 +1332,7 @@ What this does and does not add:
   while any online Linux node exists, an older agent that becomes rail on
   the roll included.
 - **Third-party public images** may fall back to their registry only under
-  `NOO_IMAGE_REGISTRY_FALLBACK=public` (node-local; the default). Set it to
+  `NOO_IMAGE_REGISTRY_FALLBACK=public` (a [node-local declaration](#the-nodes-own-declarations); the default). Set it to
   `off` for a node that must never reach an internet registry. Every
   fallback is logged and shows on `noo cluster verify` as source
   `registry`.
@@ -1371,7 +1467,13 @@ contains, one of those.
 
 ### The harness unit is held off the internet
 
-The Landlock jail limits files. The network is limited by the node's applier
+This holds on Linux with systemd and `harness-egress=enforced` only. A Mac
+(launchd) has no egress hold: its harness runs with nothing holding it off
+the internet. A failed pre-check or an old systemd also leaves the harness
+unrestricted (the tag below says so). Where it is held, private, link-local
+and tailnet ranges stay reachable.
+
+The Landlock jail limits files. On Linux the network is limited by the node's applier
 (`scripts/noo-apply.sh`), as root, on every apply that carries the harness
 unit or its env. It renders `/etc/noo/harness-net/` (a `resolv.conf` that
 names only 192.0.2.53, a TEST-NET-1 address that is never allowed, so a name
@@ -1478,16 +1580,226 @@ Every command it runs goes through an allow-list that refuses any firewall or
 Docker write before it executes. It does no name lookups; use
 `docs/security/egress-capture.sh` for hostnames.
 
+## The agent's unit: it writes only where it must
+
+On a node whose bundle carries an agent-env, the root applier adds
+`/etc/systemd/system/noo-node-agent.service.d/50-noomesh-protect.conf`:
+`ProtectSystem=strict`, `PrivateTmp=yes`, `ProtectHome=read-only`, and one
+`ReadWritePaths=` per path the agent writes: its state dir
+(`/var/lib/noo-node-agent`), the node's declared data roots (`NOO_DATA_ROOT`,
+`MODELS_DIR`, `HF_CACHE_DIR`, `OLLAMA_DATA_DIR`, `NOO_SKILLS_HOST_DIR`, each
+`NOO_HOST_ROOTS` entry) and Docker's container logs. The rest of the host is
+read-only to the agent process.
+
+The paths come from the agent-env, so each is checked before it is written
+into the unit: absolute and normalised, from a narrow character set (no
+whitespace, `%`, quotes or backslash), and never `/`, a system tree (`/etc`,
+`/usr`, `/boot`, `/root`, `/var/lib/docker`, …) or a parent of one, checked
+again after symlinks are resolved. One bad value leaves the installed drop-in
+as it was and the applier's line says `agent-protect=REFUSED:<KEY>`.
+
+`noo cluster verify` shows the hold as the `agent protect` row, from each
+node's last apply: OK names every held node and how many paths it leaves
+writable; a refusal is a FAIL naming the node and the setting, with the
+`noo cluster set-config` that fixes it. Any other node with no hold report is
+a WARN naming it: a fresh controller's own agent is installed by `noo onboard`
+outside the applier and is not held until its first rail apply
+(`noo cluster provision <self> --wait`). A Mac (no systemd) owes no hold and
+is not listed; a Mac-only fleet has no row.
+
+## Root code comes from a release
+
+The fleet signing key (`signing.key` on the controller) decides what a node
+*applies*: certs, env, units, which backends to run. Since applier generation
+2 (noomesh 0.6.27) it no longer decides what **root code** a node runs. A
+node installs a root-run file only if its sha256 is in a list the **release
+key** signed. That key's seed is held by the release maintainers (the
+release pipeline's secret store and their own build machine), never by a
+controller. So through the rail, meaning any bundle a controller stages,
+whoever holds `signing.key` or the controller's operator account can install
+only root code that a published release or rc ships.
+
+Two root installs do not go through the rail and are not covered by this
+check. Both need the operator at the machine:
+- **The self node's first install inside `noo onboard`.** It installs
+  `noo-hostd` with sudo on the controller itself, checked against the CLI's
+  own signed manifest rather than the applier's release check. It also
+  reuses a `/usr/local/bin/noo-hostd` that is already there.
+- **Vendor CLIs** (below).
+
+| Root-run kind | Must be listed in | Under |
+|---|---|---|
+| `applier` (`noo-apply`) | the CLI release's `sha256sums.txt` | `noo-apply.sh` |
+| `fetcher` (`noo-fetch`) | the same | `noo-fetch.sh` |
+| `hostd-binary` | the same | `noo-hostd-<target>` |
+| `harness-binary` | the same | `noo-gateway-<target>` |
+| `agent-binary` (Linux) | the stack's `stack-<tag>.lock` | `# node-agent-sha256 linux/<arch> <sha256>` |
+| Mac `cli-binary`, `hostd-binary`, `agent-binary`, `harness-binary` | the CLI release's `sha256sums.txt` | `noo-*-apple-darwin` |
+| Mac `agent-plist`, `harness-plist` | this release's own template for this node's user (never root) | — |
+| `netns-unit` (the controller's self node) | nothing: it carries only `user=` and `root=`; the applier renders `noo-netns-restore.service` from its own template, never with `User=root` | — |
+
+- **The netns restore unit needs no sudo on a roll.** When `noo upgrade`
+  finds `noo-netns-restore.service` missing or stale on a controller, it stages
+  the `netns-unit` kind to the self node. That node's applier checks the two
+  values (the owner is a real account other than root and owns the install
+  and its `scripts/noo-netns-restore.sh`), renders the unit, and installs and
+  enables it. A bad value refuses the kind and leaves the unit as it was. If
+  the self node's applier is older than the kind, nothing runs and
+  `noo cluster verify` names the roll that fixes it. A controller with no self
+  node, or a root install, keeps one stated sudo: run at a terminal or as
+  root, never unattended.
+- **The lists ride in the bundle.** `noo cluster provision` attaches
+  `sha256sums.txt` and its signature, the version text it names, and (with a
+  Linux agent) the stack lock and its signature. It checks them first with the
+  node's own rule, so it never stages a bundle the node would refuse.
+- **One step back, no further.** A node records the last two finals it
+  applied (`/etc/noo/release-floor`, root-owned; on a Mac under
+  `/Library/Application Support/noomesh/pki/`). It accepts the current final
+  and the previous one, and an rc of the current or a later release, nothing
+  older. So an old release cannot be replayed, and a node will take one
+  step back. The controller-side command that stages a step back is not in
+  0.6.27: the node accepts it, the CLI cannot yet send it.
+- **Each release vouches for the one before.** The release job adds the
+  previous final's own root-run payloads to this release's lists, by digest
+  from that final's signed lists: `<sha>  <asset>@v<prev>` in
+  `sha256sums.txt`, `# node-agent-sha256@v<prev> linux/<arch> <sha>` in the
+  lock. A payload matched only by such a row is judged as release `<prev>`
+  (one back accepted, two back refused) and does not move the record. A list
+  names one such release, a final older than its own. No row ever installs a
+  generation-1 applier.
+- **A node ahead of its controller says so.** A staged release older than the
+  record allows is refused as "this node is ahead of its controller", naming
+  the release to roll the controller to (`noo upgrade --stack`). The
+  controller reads each node's reported record and refuses to stage such a
+  bundle first; `noo cluster verify`'s `release check` row FAILs for a node
+  whose last bundle was refused, since it refuses every bundle until fixed.
+- **No dev path.** A build that is not a published release or rc has no
+  signed list. The node refuses its root code with exit 75 and one line
+  naming the kind, its sha256 and the remedy: roll to a published release or
+  rc.
+- **A re-key does not open a door.** The release keys are compiled into the
+  applier itself, which is root code and listed like the rest. Nothing a
+  bundle installs (`signing.pub`, `ca.crt`) feeds the check, and a bundle
+  that carries `signing-pub` is checked like any other.
+- **What stays on the signing key alone:** config (agent env and image
+  choice, certs, fleet secrets, teardown), the user's own `~/.local/bin/noo`
+  on Linux (not root), and **vendor CLIs**. A vendor CLI (Claude Code,
+  Copilot CLI, Codex) is third-party. It installs root-owned under
+  `/usr/local/bin` with only the sha256 this controller pinned
+  (`config/harness-kinds.json`) behind it: self-attested by the bundle.
+- **See it:** `noo cluster verify --controller`, rows `release check`
+  (which nodes enforce it and the floor each holds; a refusal FAILs it) and
+  `vendor CLIs` (which nodes carry a self-attested CLI).
+
+The first roll to 0.6.27 installs the checking applier on the signing key
+alone, because the applier already on the node predates the check. That
+first, applier-only bundle can carry no release list (an older applier
+refuses unknown kinds), so once the new applier runs on it, it finds its
+one payload is itself and says `applier-only bundle: this applier is already
+installed`, with no refusal and no failed apply. The full bundle, with its
+lists, follows. From then on the generation floor refuses any applier older
+than generation 2.
+
+### For agents
+
+- Never stage root code that is not in the release's signed list. If
+  `noo cluster provision` stops with `release_check`, the CLI or stack on the
+  controller is not a published release or rc: roll it (`noo upgrade --all`).
+  There is no opt-in, dev key or environment switch, and none may be added.
+- A node's exit 75 in `apply_rc`, or a `release check` FAIL, names the kind
+  and sha256: compare it with the release's `sha256sums.txt` or
+  `stack-<tag>.lock`.
+- A node steps back one final at most. Two finals back is refused by design:
+  the remedy is a newer release or rc that carries the fix, never editing the
+  floor file.
+- `NOO_APPLY_RELEASE_PUBKEYS_HEX` and `NOO_APPLY_RELEASE_FLOOR` are test seams,
+  read only in `NOO_APPLY_VERIFY_ONLY=1` mode, which installs nothing.
+- A Linux node verifies the Ed25519 signature with OpenSSL 3 (`pkeyutl
+  -rawin`), else with a standard-library Ed25519 check in python3 that is
+  part of the applier (so the applier's release row covers it). With
+  neither, it refuses root code: "needs OpenSSL 3 or python3".
+- `noo cluster upgrade-hostd` ships the release's own hostd asset with the
+  release's signed list; there is no checkout build.
+
+## The node's own declarations
+
+A node limits what the controller may make it do. Those limits are the
+node's own declarations, made ON the node, in `/etc/noo-node-agent.local.env`
+(Linux and Mac alike), a file only the node's operator writes and that no
+apply or roll ever touches. It is root's file: owned by root, mode `644`, in
+a root-owned directory. The agent, which runs as its own unprivileged user,
+can read it but never write it, so a compromised agent can never grant itself
+a capability: a declaration the agent could write for itself would not bound
+it. It holds no secrets.
+
+```sh
+# Linux
+sudo install -m 644 -o root -g root /dev/null /etc/noo-node-agent.local.env
+echo 'NOO_ALLOW_OLLAMA_REGISTRY_PULL=1' | sudo tee -a /etc/noo-node-agent.local.env
+sudo systemctl restart noo-node-agent
+# Mac
+sudo install -m 644 -o root -g wheel /dev/null /etc/noo-node-agent.local.env
+echo 'NOO_ALLOW_OLLAMA_REGISTRY_PULL=1' | sudo tee -a /etc/noo-node-agent.local.env
+sudo launchctl kickstart -k system/net.noomesh.node-agent
+```
+
+The controller-rendered agent env (`/etc/noo-node-agent.env`, the Mac's
+`agent.env`) is replaced whole on every apply, so a line added there by hand
+is gone at the next roll. Declarations go in the local file instead.
+
+The agent reads the file itself at start (it is data, never run by a shell)
+and takes only these keys, by name:
+
+- **trust declarations:** `NOO_BACKEND_CAP_ADD`, `NOO_CONTAINER_IMAGE_ALLOW`,
+  `NOO_CONTAINER_RUN_USER`, `NOO_SKILL_RUN_USER`, `NOO_SKILL_BIND_ROOTS`,
+  `NOO_MCP_SECRETS_FILE`, `NOO_ALLOW_OLLAMA_REGISTRY_PULL`,
+  `NOO_IMAGE_REGISTRY_FALLBACK`;
+- **tuning:** `NOO_GPU_YIELD`, `NOO_GPU_YIELD_FOREIGN_MB`,
+  `NOO_GPU_YIELD_AFTER_S`, `NOO_GPU_RESUME_AFTER_S`, `NOO_GPU_TIMEOUT_GRACE_S`,
+  `NOO_LOG_SHIP`, `NOO_LOG_SHIP_UNITS`, `NOO_AGENT_TUNNEL`.
+
+Any other name in the file is ignored and named: the file can never set a
+controller-owned value such as the cluster secret or the bind address.
+
+Each value is held to its own narrow rule, whatever its source:
+
+- capabilities only from the agent's allow-list; an image allow-list of
+  repositories or namespace prefixes (a whole registry is refused); run users
+  `uid[:gid]` and never root; bind roots absolute, normalised and outside the
+  system trees; `0`/`1`, `on`/`off` and whole numbers where those are meant;
+- a value with a quote, backslash, `$`, backtick, `%` or space is refused.
+
+**Fail closed:**
+
+- a refused trust declaration is NOT in effect (a refused registry fallback is
+  `off`);
+- a refused tuning value leaves the agent's default.
+
+A file that is not a regular file, is group- or world-writable, is not owned
+by root, sits in a directory that is not root's alone (checked where the path
+really leads: macOS's `/etc` is `/private/etc`), or that the agent cannot read
+is refused whole, named in the row, and nothing in it is applied.
+
+A node-local key that still arrives through the agent's environment (a
+systemd drop-in) keeps working, held to the same rules; the local file wins
+when both set a key. `noo cluster verify`'s `node-local` row:
+
+- lists each node's declarations and where each came from;
+- WARNs on a refused one, on a refused file, and on a trust declaration read
+  from the environment (move it into the local file).
+
 ## What is still root
 
-`noo-hostd` is root on the node, and deliberately so: it has no listener, it
+`noo-hostd` is root on a worker node (on the controller it runs as the operator's user), and deliberately so: it has no listener, it
 reads a file spool, and it runs a fixed list of operations. Host filesystem
 work the agent needs (creating and chowning the models dir) runs through a
 short-lived helper container rather than through the agent itself, with the
 path validated against the declared roots and every externally-supplied value
 passed as a shell **argument**, never interpolated into a command line.
 
-The node agent itself is not root and not a privileged container: it is a
+The node agent is not a privileged container, and on a prepared node it is not
+root: on Linux it is a
 systemd host process running as `noo-agent` with `NoNewPrivileges=true` and
-membership of the `docker` group. The docker socket is the agent's real
+membership of the `docker` group (on a Mac it runs as the enrolling user, with no
+`docker` group; with no `noo-agent` account the unit runs as root). The docker socket is the agent's real
 privilege, and it is why every bound on this page exists.

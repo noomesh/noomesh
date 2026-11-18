@@ -50,8 +50,8 @@
 //! model nothing serves resolves to the dynamic default instead of a 404.
 //! The mesh heals: when the node a caller preferred is off doing something
 //! else, another node answers, slower or smaller, and the served-model
-//! header says which. Live failure that day: trellion named awolf's vLLM
-//! model while awolf's GPU ran a voice test, and every knowledge answer
+//! header says which. Live failure that day: trellion named node-a's vLLM
+//! model while node-a's GPU ran a voice test, and every knowledge answer
 //! failed with `model_not_found` although two other nodes served chat.
 //! A node pin is a preference too: that node first, then the class's other
 //! nodes, then the mesh. Only a STRICT node pin (`X-Noo-Node-Strict` /
@@ -648,7 +648,7 @@ pub struct Slots {
 /// as of its last heartbeat) and this gateway's own live count, so neither
 /// a stale heartbeat nor callers this gateway cannot see hide a full node.
 /// Unknown slots are never "full". 2026-11-01: a console turn sat behind two
-/// external callers on mcmini's ollama while awolf's vLLM was free.
+/// external callers on node-mac's ollama while node-a's vLLM was free.
 pub fn full_rank(c: &Candidate, in_flight: usize) -> u32 {
     match c.slots {
         Some(s) if s.total > 0 && (s.in_flight as usize).max(in_flight) >= s.total as usize => 1 + s.queued,
@@ -2478,7 +2478,7 @@ mod tests {
 
     /// chat-default as a pool of host3's vLLM 12B and host6's ollama 12B,
     /// with host8's e2b as a degraded last resort — the shape the operator
-    /// asked for on 2026-10-16 (awolf + mcmini sharing chat).
+    /// asked for on 2026-10-16 (node-a + node-mac sharing chat).
     fn pool_decl(pool: bool) -> Declarations {
         Declarations {
             classes: vec![DeclaredClass {
@@ -2646,14 +2646,14 @@ mod tests {
 
     // ── the dynamic default (operator rule 2026-10-17) ────────────────
 
-    /// The 2026-10-17 fleet: the controller pop-os serving `gemma4:e2b-it-qat`
-    /// from a CPU ollama (idle-looking load), mcmini an M4 (unified memory)
+    /// The 2026-10-17 fleet: the controller ctrl serving `gemma4:e2b-it-qat`
+    /// from a CPU ollama (idle-looking load), node-mac an M4 (unified memory)
     /// serving `gemma4:12b`, busier by heartbeat. Onboarding wrote
-    /// `ollama` + `gemma4:e2b-it-qat` into pop-os's yaml.
+    /// `ollama` + `gemma4:e2b-it-qat` into ctrl's yaml.
     fn incident() -> Vec<NodeFacts> {
         vec![
-            node("pop-os", "100.64.1.1", &[("ollama", "gemma4:e2b-it-qat")], &[], false, 1, 0.05),
-            node("mcmini", "100.64.1.2", &[("ollama", "gemma4:12b")], &[], true, 3, 0.4),
+            node("ctrl", "100.64.0.100", &[("ollama", "gemma4:e2b-it-qat")], &[], false, 1, 0.05),
+            node("node-mac", "100.64.0.101", &[("ollama", "gemma4:12b")], &[], true, 3, 0.4),
         ]
     }
 
@@ -2670,27 +2670,27 @@ mod tests {
     }
 
     /// Reverting the dynamic default to a one-model derivation sends this to
-    /// pop-os (the only model group that matches the yaml, or the single
+    /// ctrl (the only model group that matches the yaml, or the single
     /// best group) and fails here.
     #[test]
-    fn incident_mcmini_12b_gpu_beats_popos_e2b_cpu() {
+    fn incident_node_mac_12b_gpu_beats_ctrl_e2b_cpu() {
         let t = build_table(&incident(), &[], &Declarations::default());
         let sel = select_with(&t, None, None, false, &|_| false, &idle, &fresh).unwrap();
         assert_eq!(sel.class, CHAT_DEFAULT);
         assert_eq!(sel.label, "chat-default(dynamic)");
         let order: Vec<&str> = sel.candidates.iter().map(|c| c.node_id.as_str()).collect();
-        assert_eq!(order, ["mcmini", "pop-os"], "both nodes are candidates, the GPU 12B first");
+        assert_eq!(order, ["node-mac", "ctrl"], "both nodes are candidates, the GPU 12B first");
         assert_eq!(sel.candidates[0].rank, "rank=gpu,params=12,load=0.40");
         assert_eq!(sel.candidates[1].rank, "rank=cpu,params=2,load=0.05");
-        // Even with a GPU on pop-os the bigger model wins (quality key).
+        // Even with a GPU on ctrl the bigger model wins (quality key).
         let mut nodes = incident();
         nodes[0].gpu = true;
         let t = build_table(&nodes, &[], &Declarations::default());
-        assert_eq!(first_node(&select_with(&t, None, None, false, &|_| false, &idle, &fresh).unwrap()), "mcmini");
+        assert_eq!(first_node(&select_with(&t, None, None, false, &|_| false, &idle, &fresh).unwrap()), "node-mac");
         // The built-in aliases land on the same dynamic class.
         let t = build_table(&incident(), &[], &Declarations::default());
         for alias in BUILTIN_ALIASES {
-            assert_eq!(first_node(&select_with(&t, Some(alias), None, false, &|_| false, &idle, &fresh).unwrap()), "mcmini");
+            assert_eq!(first_node(&select_with(&t, Some(alias), None, false, &|_| false, &idle, &fresh).unwrap()), "node-mac");
         }
     }
 
@@ -2707,15 +2707,15 @@ mod tests {
             assert!(sel.candidates.iter().all(|c| !c.rank.starts_with("fallback,")), "{p}: no preference was unmet: {:?}", sel.candidates);
         }
         assert!(t.ids().iter().any(|i| i == "knowledge") && t.ids().iter().any(|i| i == "graph"), "{:?}", t.ids());
-        // Declared: `knowledge` prefers pop-os's model, mcmini stays behind it.
+        // Declared: `knowledge` prefers ctrl's model, node-mac stays behind it.
         let decl = Declarations { classes: vec![], aliases: vec![("knowledge".into(), "gemma4:e2b-it-qat".into())] };
         let t = build_table(&incident(), &[], &decl);
         let sel = select_with(&t, Some("knowledge"), None, false, &|_| false, &idle, &fresh).unwrap();
         let order: Vec<&str> = sel.candidates.iter().map(|c| c.node_id.as_str()).collect();
-        assert_eq!(order, ["pop-os", "mcmini"], "{:?}", sel.candidates);
+        assert_eq!(order, ["ctrl", "node-mac"], "{:?}", sel.candidates);
         assert!(sel.candidates[1].rank.starts_with("fallback,"), "{:?}", sel.candidates[1]);
         // `graph` is still undeclared: the mesh, best node first.
-        assert_eq!(first_node(&select_with(&t, Some("graph"), None, false, &|_| false, &idle, &fresh).unwrap()), "mcmini");
+        assert_eq!(first_node(&select_with(&t, Some("graph"), None, false, &|_| false, &idle, &fresh).unwrap()), "node-mac");
         // Purposes are declarable (the built-ins are not).
         assert!(valid_name("knowledge").is_ok());
     }
@@ -2739,30 +2739,30 @@ mod tests {
         let t = build_table(&nodes, &[], &Declarations::default());
         let sel = select_with(&t, None, None, false, &|_| false, &idle, &fresh).unwrap();
         let order: Vec<&str> = sel.candidates.iter().map(|c| c.node_id.as_str()).collect();
-        assert_eq!(order, ["pop-os"], "the critical node is out while another is left");
-        assert!(sel.skipped.iter().any(|s| s.starts_with("mcmini/ollama: thermal critical")), "{:?}", sel.skipped);
+        assert_eq!(order, ["ctrl"], "the critical node is out while another is left");
+        assert!(sel.skipped.iter().any(|s| s.starts_with("node-mac/ollama: thermal critical")), "{:?}", sel.skipped);
         assert!(!sel.last_resort);
-        // pop-os already failed this request: mcmini is all that is left.
-        let sel = select_with(&t, None, None, false, &|c| c.node_id == "pop-os", &idle, &fresh).unwrap();
-        assert_eq!(first_node(&sel), "mcmini");
+        // ctrl already failed this request: node-mac is all that is left.
+        let sel = select_with(&t, None, None, false, &|c| c.node_id == "ctrl", &idle, &fresh).unwrap();
+        assert_eq!(first_node(&sel), "node-mac");
         assert!(sel.last_resort);
         // `serious` is a demotion, not an exclusion.
         let mut nodes = incident();
         nodes[1].thermal = Some("serious".into());
         let t = build_table(&nodes, &[], &Declarations::default());
         let order: Vec<String> = select_with(&t, None, None, false, &|_| false, &idle, &fresh).unwrap().candidates.iter().map(|c| c.node_id.clone()).collect();
-        assert_eq!(order, ["pop-os", "mcmini"]);
+        assert_eq!(order, ["ctrl", "node-mac"]);
     }
 
     #[test]
     fn a_stalled_node_is_demoted_for_five_minutes_then_back() {
         let t = build_table(&incident(), &[], &Declarations::default());
-        let mcmini_stalled = |c: &Candidate| c.node_id == "mcmini";
-        let sel = select_with(&t, None, None, false, &|_| false, &idle, &mcmini_stalled).unwrap();
+        let node_mac_stalled = |c: &Candidate| c.node_id == "node-mac";
+        let sel = select_with(&t, None, None, false, &|_| false, &idle, &node_mac_stalled).unwrap();
         let order: Vec<&str> = sel.candidates.iter().map(|c| c.node_id.as_str()).collect();
-        assert_eq!(order, ["pop-os", "mcmini"], "demoted, not dropped");
+        assert_eq!(order, ["ctrl", "node-mac"], "demoted, not dropped");
         assert!(sel.candidates[1].rank.contains("stalled"));
-        assert!(sel.skipped.iter().any(|s| s.starts_with("mcmini/ollama: stalled")), "{:?}", sel.skipped);
+        assert!(sel.skipped.iter().any(|s| s.starts_with("node-mac/ollama: stalled")), "{:?}", sel.skipped);
         // The memory itself: 5 minutes from the stall, then gone.
         let at = Instant::now();
         assert_eq!(STALL_DEMOTION, Duration::from_secs(300));
@@ -2773,35 +2773,35 @@ mod tests {
         nodes[1].ip = "192.0.2.201".into();
         let t = build_table(&nodes, &[], &Declarations::default());
         let d = t.class(CHAT_DEFAULT).unwrap();
-        assert_eq!(ordered(d, &[])[0].node_id, "mcmini");
+        assert_eq!(ordered(d, &[])[0].node_id, "node-mac");
         note_stall("https://192.0.2.201:8081", "ollama");
         assert!(recently_stalled("https://192.0.2.201:8081", "ollama"));
         assert!(!recently_stalled("https://192.0.2.201:8081", "vllm"), "per backend");
-        assert_eq!(ordered(d, &[])[0].node_id, "pop-os");
+        assert_eq!(ordered(d, &[])[0].node_id, "ctrl");
     }
 
     #[test]
     fn a_quarantined_node_is_excluded_unless_it_is_the_only_one_left() {
         let rec = |status: &str| {
             serde_json::json!({
-                "id": "mcmini", "ip_address": "100.64.1.2", "status": status, "current_load": 0.1,
+                "id": "node-mac", "ip_address": "100.64.0.101", "status": status, "current_load": 0.1,
                 "capabilities": {"unified_memory": true},
                 "running_backends": {"ollama": "gemma4:12b"}, "last_heartbeat": 1000.0,
             })
         };
-        let q = node_facts_from_kv("mcmini", &rec("quarantined"), &[], 1001.0);
+        let q = node_facts_from_kv("node-mac", &rec("quarantined"), &[], 1001.0);
         assert!(q.quarantined);
         let mut nodes = incident();
         nodes[1] = q;
         let t = build_table(&nodes, &[], &Declarations::default());
         let sel = select_with(&t, None, None, false, &|_| false, &idle, &fresh).unwrap();
-        assert_eq!(sel.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["pop-os"]);
-        assert!(sel.skipped.iter().any(|s| s == "mcmini/ollama: quarantined"), "{:?}", sel.skipped);
+        assert_eq!(sel.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["ctrl"]);
+        assert!(sel.skipped.iter().any(|s| s == "node-mac/ollama: quarantined"), "{:?}", sel.skipped);
         let only = build_table(&nodes[1..], &[], &Declarations::default());
         let sel = select_with(&only, None, None, false, &|_| false, &idle, &fresh).unwrap();
-        assert_eq!(first_node(&sel), "mcmini");
+        assert_eq!(first_node(&sel), "node-mac");
         assert!(sel.last_resort);
-        assert!(!node_facts_from_kv("mcmini", &rec("online"), &[], 1001.0).quarantined);
+        assert!(!node_facts_from_kv("node-mac", &rec("online"), &[], 1001.0).quarantined);
     }
 
     #[test]
@@ -2810,7 +2810,7 @@ mod tests {
         let sel = select_with(&t, Some("gemma4:e2b-it-qat"), None, false, &|_| false, &idle, &fresh).unwrap();
         assert_eq!(sel.class, "gemma4:e2b-it-qat");
         // The named model first, then the rest of the mesh behind it.
-        assert_eq!(sel.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["pop-os", "mcmini"]);
+        assert_eq!(sel.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["ctrl", "node-mac"]);
         assert!(!sel.candidates[0].rank.starts_with("fallback"));
         assert!(sel.candidates[1].rank.starts_with("fallback,"), "{}", sel.candidates[1].rank);
         assert_eq!(sel.candidates[1].class_label, "gemma4:e2b-it-qat+mesh");
@@ -2818,15 +2818,15 @@ mod tests {
         assert!(!t.class("gemma4:12b").unwrap().dynamic);
     }
 
-    /// 2026-10-19: trellion named awolf's vLLM model while awolf's GPU ran
+    /// 2026-10-19: trellion named node-a's vLLM model while node-a's GPU ran
     /// a voice test; every knowledge answer was a `model_not_found` although
-    /// mcmini and pop-os served chat. A model name is a preference.
+    /// node-mac and ctrl served chat. A model name is a preference.
     #[test]
     fn a_model_nothing_serves_is_answered_by_the_mesh_not_refused() {
         let t = build_table(&incident(), &[], &Declarations::default());
         let sel = select_with(&t, Some("google/gemma-4-12B-it-qat-w4a16-ct"), None, false, &|_| false, &idle, &fresh).unwrap();
         assert_eq!(sel.class, CHAT_DEFAULT);
-        assert_eq!(sel.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["mcmini", "pop-os"]);
+        assert_eq!(sel.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["node-mac", "ctrl"]);
         assert!(sel.skipped.iter().any(|s| s.contains("not served by any live node")), "{:?}", sel.skipped);
         // Every one of them is a fallback for the caller (raw chat's `noo.fallback`).
         assert!(sel.candidates.iter().all(|c| c.rank.starts_with("fallback,")), "{:?}", sel.candidates.iter().map(|c| &c.rank).collect::<Vec<_>>());
@@ -2835,26 +2835,26 @@ mod tests {
         assert!(matches!(select_with(&empty, Some("x"), None, false, &|_| false, &idle, &fresh), Err(Refusal::UnknownModel(_))));
     }
 
-    /// A declared class whose every candidate is offline (awolf down,
-    /// pop-os-ma gone) still answers from whatever is live.
+    /// A declared class whose every candidate is offline (node-a down,
+    /// ctrl-ma gone) still answers from whatever is live.
     #[test]
     fn a_declared_class_with_nothing_live_falls_through_to_the_mesh() {
         let decl = Declarations {
             classes: vec![DeclaredClass {
                 name: "fast".into(),
                 pool: false,
-                candidates: vec![DeclaredCandidate { node_id: "awolf".into(), backend: "vllm".into(), model: Some("google/gemma-4-12B-it-qat-w4a16-ct".into()), degraded: false }],
+                candidates: vec![DeclaredCandidate { node_id: "node-a".into(), backend: "vllm".into(), model: Some("google/gemma-4-12B-it-qat-w4a16-ct".into()), degraded: false }],
             }],
             aliases: vec![],
         };
         let t = build_table(&incident(), &[], &decl);
         let sel = select_with(&t, Some("fast"), None, false, &|_| false, &idle, &fresh).unwrap();
-        assert_eq!(sel.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["mcmini", "pop-os"]);
+        assert_eq!(sel.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["node-mac", "ctrl"]);
         assert!(sel.candidates.iter().all(|c| c.rank.starts_with("fallback,")));
         assert!(sel.skipped.iter().any(|s| s.contains("class 'fast' has nothing routable")), "{:?}", sel.skipped);
         // Excluded (already failed this request) stays excluded in the fallback too.
-        let sel = select_with(&t, Some("fast"), None, false, &|c| c.node_id == "mcmini", &idle, &fresh).unwrap();
-        assert_eq!(first_node(&sel), "pop-os");
+        let sel = select_with(&t, Some("fast"), None, false, &|c| c.node_id == "node-mac", &idle, &fresh).unwrap();
+        assert_eq!(first_node(&sel), "ctrl");
         assert!(matches!(select_with(&t, Some("fast"), None, false, &|_| true, &idle, &fresh), Err(Refusal::NoCandidates(_))));
     }
 
@@ -2864,7 +2864,7 @@ mod tests {
             classes: vec![DeclaredClass {
                 name: CHAT_DEFAULT.into(),
                 pool: false,
-                candidates: vec![DeclaredCandidate { node_id: "pop-os".into(), backend: "ollama".into(), model: None, degraded: false }],
+                candidates: vec![DeclaredCandidate { node_id: "ctrl".into(), backend: "ollama".into(), model: None, degraded: false }],
             }],
             aliases: vec![],
         };
@@ -2874,26 +2874,26 @@ mod tests {
         let sel = select_with(&t, None, None, false, &|_| false, &idle, &fresh).unwrap();
         assert_eq!(sel.label, "chat-default(declared)");
         // The operator's choice first, not the ranking's; the mesh behind it.
-        assert_eq!(sel.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["pop-os", "mcmini"]);
+        assert_eq!(sel.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["ctrl", "node-mac"]);
         assert!(sel.candidates[1].rank.starts_with("fallback,"));
         // The dynamic pool is still there for a node pin.
-        assert_eq!(first_node(&select_with(&t, None, Some("mcmini"), true, &|_| false, &idle, &fresh).unwrap()), "mcmini");
+        assert_eq!(first_node(&select_with(&t, None, Some("node-mac"), true, &|_| false, &idle, &fresh).unwrap()), "node-mac");
     }
 
     #[test]
     fn a_node_pin_filters_and_refuses_clearly() {
         let mut nodes = incident();
-        let mut embedder = node("host2", "100.64.1.3", &[("ollama", "harrier")], &[], false, 2, 0.0);
+        let mut embedder = node("host2", "100.64.0.102", &[("ollama", "harrier")], &[], false, 2, 0.0);
         embedder.non_chat = vec!["ollama".into()];
         nodes.push(embedder);
         let t = build_table(&nodes, &[], &Declarations::default());
-        let sel = select_with(&t, None, Some("pop-os"), true, &|_| false, &idle, &fresh).unwrap();
+        let sel = select_with(&t, None, Some("ctrl"), true, &|_| false, &idle, &fresh).unwrap();
         // A strict node pin: no mesh fallback behind it.
-        assert_eq!(sel.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["pop-os"]);
-        assert_eq!(first_node(&select_with(&t, Some("default"), Some("POP-OS"), true, &|_| false, &idle, &fresh).unwrap()), "pop-os");
+        assert_eq!(sel.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["ctrl"]);
+        assert_eq!(first_node(&select_with(&t, Some("default"), Some("CTRL"), true, &|_| false, &idle, &fresh).unwrap()), "ctrl");
         assert!(matches!(select_with(&t, None, Some("ghost"), true, &|_| false, &idle, &fresh), Err(Refusal::UnknownNode(_))));
         assert!(matches!(select_with(&t, None, Some("host2"), true, &|_| false, &idle, &fresh), Err(Refusal::NodeServesNoChat(_))));
-        match select_with(&t, Some("gemma4:12b"), Some("pop-os"), true, &|_| false, &idle, &fresh) {
+        match select_with(&t, Some("gemma4:12b"), Some("ctrl"), true, &|_| false, &idle, &fresh) {
             Err(Refusal::NodeCannotServe(m)) => assert!(m.contains("ollama=gemma4:e2b-it-qat"), "{m}"),
             other => panic!("{other:?}"),
         }
@@ -2901,7 +2901,7 @@ mod tests {
         let mut nodes = incident();
         nodes[0].thermal = Some("critical".into());
         let t = build_table(&nodes, &[], &Declarations::default());
-        assert_eq!(first_node(&select_with(&t, None, Some("pop-os"), true, &|_| false, &idle, &fresh).unwrap()), "pop-os");
+        assert_eq!(first_node(&select_with(&t, None, Some("ctrl"), true, &|_| false, &idle, &fresh).unwrap()), "ctrl");
     }
 
     /// Operator 2026-10-19 (option 1): a node pin is a preference — that node
@@ -2909,32 +2909,32 @@ mod tests {
     #[test]
     fn a_node_pin_is_a_preference_unless_strict() {
         let mut nodes = incident();
-        let mut embedder = node("host2", "100.64.1.3", &[("ollama", "harrier")], &[], false, 2, 0.0);
+        let mut embedder = node("host2", "100.64.0.102", &[("ollama", "harrier")], &[], false, 2, 0.0);
         embedder.non_chat = vec!["ollama".into()];
         nodes.push(embedder);
         let t = build_table(&nodes, &[], &Declarations::default());
         let order = |sel: &Selection| sel.candidates.iter().map(|c| c.node_id.clone()).collect::<Vec<_>>();
 
         // The preferred node is up: it answers first, not as a fallback.
-        let sel = select_with(&t, None, Some("pop-os"), false, &|_| false, &idle, &fresh).unwrap();
-        assert_eq!(order(&sel), ["pop-os", "mcmini"]);
+        let sel = select_with(&t, None, Some("ctrl"), false, &|_| false, &idle, &fresh).unwrap();
+        assert_eq!(order(&sel), ["ctrl", "node-mac"]);
         assert!(!sel.candidates[0].rank.starts_with("fallback"));
         assert!(sel.candidates[1].rank.starts_with("fallback,"));
 
         // The preferred node already failed this request (busy, down): the pool.
-        let sel = select_with(&t, None, Some("pop-os"), false, &|c| c.node_id == "pop-os", &idle, &fresh).unwrap();
-        assert_eq!(order(&sel), ["mcmini"]);
+        let sel = select_with(&t, None, Some("ctrl"), false, &|c| c.node_id == "ctrl", &idle, &fresh).unwrap();
+        assert_eq!(order(&sel), ["node-mac"]);
         assert!(sel.candidates[0].rank.starts_with("fallback,"), "flagged");
 
         // A node serving no chat (an embedder): the pool answers, the embedder never does.
         let sel = select_with(&t, None, Some("host2"), false, &|_| false, &idle, &fresh).unwrap();
-        assert_eq!(order(&sel), ["mcmini", "pop-os"]);
+        assert_eq!(order(&sel), ["node-mac", "ctrl"]);
         assert!(sel.candidates.iter().all(|c| c.rank.starts_with("fallback,")));
         assert!(sel.skipped.iter().any(|s| s.contains("the mesh answers instead")), "{:?}", sel.skipped);
 
         // Node + model, the node does not serve it: the model's nodes, then the pool.
-        let sel = select_with(&t, Some("gemma4:12b"), Some("pop-os"), false, &|_| false, &idle, &fresh).unwrap();
-        assert_eq!(order(&sel), ["mcmini", "pop-os"]);
+        let sel = select_with(&t, Some("gemma4:12b"), Some("ctrl"), false, &|_| false, &idle, &fresh).unwrap();
+        assert_eq!(order(&sel), ["node-mac", "ctrl"]);
         assert!(sel.candidates.iter().all(|c| c.rank.starts_with("fallback,")));
 
         // A name that is no node of this mesh: refused either way, a typo is not "any node".
@@ -2944,13 +2944,13 @@ mod tests {
 
         // Strict keeps today's refusals and never leaves the node.
         assert!(matches!(select_with(&t, None, Some("host2"), true, &|_| false, &idle, &fresh), Err(Refusal::NodeServesNoChat(_))));
-        assert!(matches!(select_with(&t, Some("gemma4:12b"), Some("pop-os"), true, &|_| false, &idle, &fresh), Err(Refusal::NodeCannotServe(_))));
-        let stalled_pop = |c: &Candidate| c.node_id == "pop-os";
-        let sel = select_with(&t, None, Some("pop-os"), true, &|_| false, &idle, &stalled_pop).unwrap();
-        assert_eq!(order(&sel), ["pop-os"], "a stalled strict node is still the only one");
-        assert!(matches!(select_with(&t, None, Some("pop-os"), true, &|c| c.node_id == "pop-os", &idle, &fresh), Err(Refusal::NoCandidates(_))));
+        assert!(matches!(select_with(&t, Some("gemma4:12b"), Some("ctrl"), true, &|_| false, &idle, &fresh), Err(Refusal::NodeCannotServe(_))));
+        let stalled_pop = |c: &Candidate| c.node_id == "ctrl";
+        let sel = select_with(&t, None, Some("ctrl"), true, &|_| false, &idle, &stalled_pop).unwrap();
+        assert_eq!(order(&sel), ["ctrl"], "a stalled strict node is still the only one");
+        assert!(matches!(select_with(&t, None, Some("ctrl"), true, &|c| c.node_id == "ctrl", &idle, &fresh), Err(Refusal::NoCandidates(_))));
         // strict with no node means nothing.
-        assert_eq!(order(&select_with(&t, None, None, true, &|_| false, &idle, &fresh).unwrap()), ["mcmini", "pop-os"]);
+        assert_eq!(order(&select_with(&t, None, None, true, &|_| false, &idle, &fresh).unwrap()), ["node-mac", "ctrl"]);
     }
 
     /// A GPU hold in progress keeps the node out of routing before the
@@ -2959,7 +2959,7 @@ mod tests {
     #[test]
     fn a_gpu_hold_marks_lanes_out_of_routing_before_the_heartbeat() {
         let id = "hold-mark-test";
-        let n = node(id, "100.64.1.9", &[("vllm", "m"), ("llamacpp", "m")], &[], true, 1, 0.1);
+        let n = node(id, "100.64.0.103", &[("vllm", "m"), ("llamacpp", "m")], &[], true, 1, 0.1);
         let lanes = |t: &ClassTable| -> Vec<String> {
             t.classes.iter().find(|c| c.name == CHAT_DEFAULT).map(|c| c.candidates.iter().map(|c| c.backend.clone()).collect()).unwrap_or_default()
         };
@@ -2999,14 +2999,14 @@ mod tests {
     #[test]
     fn gpu_contention_shared_demotes_and_a_paused_lane_is_no_candidate() {
         let rec = serde_json::json!({
-            "id": "mcmini", "ip_address": "100.64.1.2", "current_load": 0.1, "last_heartbeat": 1000.0,
+            "id": "node-mac", "ip_address": "100.64.0.101", "current_load": 0.1, "last_heartbeat": 1000.0,
             "capabilities": {"unified_memory": true},
             "running_backends": {"ollama": "gemma4:12b", "llamacpp": "gemma4:26b-a4b-it-qat"},
             "gpu_contention": {"state": "shared", "foreign_mb": 4000, "paused_backends": ["llamacpp"]},
             "thermal_state": "Serious",
             "model_stats": [{"name": "mystery-model", "size_bytes": 7_200_000_000u64}],
         });
-        let f = node_facts_from_kv("mcmini", &rec, &[], 1001.0);
+        let f = node_facts_from_kv("node-mac", &rec, &[], 1001.0);
         assert!(f.gpu_shared);
         assert_eq!(f.paused_backends, vec!["llamacpp"]);
         assert_eq!(f.thermal.as_deref(), Some("serious"));
@@ -3022,29 +3022,29 @@ mod tests {
         let t = build_table(&[gpu_pop, m], &[], &Declarations::default());
         let sel = select_with(&t, None, None, false, &|_| false, &idle, &fresh).unwrap();
         let order: Vec<String> = sel.candidates.iter().map(|c| format!("{}/{}", c.node_id, c.backend)).collect();
-        assert_eq!(order, ["pop-os/ollama", "mcmini/ollama"], "shared GPU sorts after a free one; the paused lane is gone");
+        assert_eq!(order, ["ctrl/ollama", "node-mac/ollama"], "shared GPU sorts after a free one; the paused lane is gone");
     }
 
-    /// 2026-11-01: a console turn sat "answering on mcmini" behind two
-    /// external callers on mcmini's ollama (2/2 slots busy) while awolf's vLLM
+    /// 2026-11-01: a console turn sat "answering on node-mac" behind two
+    /// external callers on node-mac's ollama (2/2 slots busy) while node-a's vLLM
     /// was free but demoted as "GPU shared". A full backend sorts after every
     /// one that can start now, shared GPU or not.
     #[test]
     fn a_backend_with_every_slot_busy_sorts_after_a_free_one_on_a_shared_gpu() {
-        let mcmini = serde_json::json!({
-            "id": "mcmini", "ip_address": "100.64.1.2", "current_load": 0.2, "last_heartbeat": 1000.0,
+        let node_mac = serde_json::json!({
+            "id": "node-mac", "ip_address": "100.64.0.101", "current_load": 0.2, "last_heartbeat": 1000.0,
             "capabilities": {"unified_memory": true},
             "running_backends": {"ollama": "gemma4:12b"},
             "backend_containers": {"ollama": {"running": true, "serving": true, "in_flight": 2, "slots": 2, "queued": 1}},
         });
-        let awolf = serde_json::json!({
-            "id": "awolf", "ip_address": "100.64.1.3", "current_load": 0.1, "last_heartbeat": 1000.0, "vram_gb": 16.0,
+        let node_a = serde_json::json!({
+            "id": "node-a", "ip_address": "100.64.0.102", "current_load": 0.1, "last_heartbeat": 1000.0, "vram_gb": 16.0,
             "running_backends": {"vllm": "google/gemma-4-12B-it-qat-w4a16-ct"},
             "gpu_contention": {"state": "shared", "foreign_mb": 11000},
             "backend_containers": {"vllm": {"running": true, "serving": true, "in_flight": 0, "slots": 4, "queued": 0}},
         });
-        let m = node_facts_from_kv("mcmini", &mcmini, &[], 1001.0);
-        let a = node_facts_from_kv("awolf", &awolf, &[], 1001.0);
+        let m = node_facts_from_kv("node-mac", &node_mac, &[], 1001.0);
+        let a = node_facts_from_kv("node-a", &node_a, &[], 1001.0);
         assert_eq!(m.slots, vec![("ollama".to_string(), Slots { in_flight: 2, total: 2, queued: 1 })]);
         assert!(a.gpu_shared);
         let order = |nodes: &[NodeFacts]| {
@@ -3053,18 +3053,18 @@ mod tests {
             (sel.candidates.iter().map(|c| c.node_id.clone()).collect::<Vec<_>>(), sel)
         };
         let (got, sel) = order(&[m.clone(), a.clone()]);
-        assert_eq!(got, ["awolf", "mcmini"], "the free shared-GPU vLLM goes first");
+        assert_eq!(got, ["node-a", "node-mac"], "the free shared-GPU vLLM goes first");
         assert!(sel.candidates[1].rank.contains("slots_full=2/2,queued=1"), "{}", sel.candidates[1].rank);
-        assert!(sel.skipped.iter().any(|s| s == "mcmini/ollama: all 2 slots busy, 1 queued (demoted)"), "{:?}", sel.skipped);
-        // The same nodes with a free slot on mcmini: the shared GPU demotes awolf
+        assert!(sel.skipped.iter().any(|s| s == "node-mac/ollama: all 2 slots busy, 1 queued (demoted)"), "{:?}", sel.skipped);
+        // The same nodes with a free slot on node-mac: the shared GPU demotes node-a
         // again. The slot count, not the fixture, moved it.
         let mut m_free = m.clone();
         m_free.slots = vec![("ollama".to_string(), Slots { in_flight: 1, total: 2, queued: 0 })];
-        assert_eq!(order(&[m_free, a.clone()]).0, ["mcmini", "awolf"]);
+        assert_eq!(order(&[m_free, a.clone()]).0, ["node-mac", "node-a"]);
         // An older agent (no slots reported) is never treated as full.
         let mut m_old = m;
         m_old.slots.clear();
-        assert_eq!(order(&[m_old, a]).0, ["mcmini", "awolf"]);
+        assert_eq!(order(&[m_old, a]).0, ["node-mac", "node-a"]);
     }
 
     /// Every candidate full: the shorter queue first. This gateway's own live
@@ -3098,41 +3098,41 @@ mod tests {
     #[test]
     fn route_of_finds_the_node_and_its_backends_slots_by_url() {
         let s = Slots { in_flight: 2, total: 2, queued: 1 };
-        let mut m = node("mcmini", "100.64.1.2", &[("ollama", "gemma4:12b")], &[], true, 2, 0.1);
+        let mut m = node("node-mac", "100.64.0.101", &[("ollama", "gemma4:12b")], &[], true, 2, 0.1);
         m.slots = vec![("ollama".into(), s)];
-        let a = node("awolf", "100.64.1.3", &[("vllm", HF)], &[], true, 1, 0.1);
+        let a = node("node-a", "100.64.0.102", &[("vllm", HF)], &[], true, 1, 0.1);
         let nodes = [a.clone(), m.clone()];
-        assert_eq!(route_of(&nodes, &url_for(&m, "ollama"), "ollama"), Some(("mcmini".to_string(), Some(s))));
-        assert_eq!(route_of(&nodes, &url_for(&a, "vllm"), "vllm"), Some(("awolf".to_string(), None)), "no slots reported");
+        assert_eq!(route_of(&nodes, &url_for(&m, "ollama"), "ollama"), Some(("node-mac".to_string(), Some(s))));
+        assert_eq!(route_of(&nodes, &url_for(&a, "vllm"), "vllm"), Some(("node-a".to_string(), None)), "no slots reported");
         assert_eq!(route_of(&nodes, "http://10.9.9.9:11434", "ollama"), None);
     }
 
-    /// 185b case 2: mcmini's agent beats, but its ollama stopped answering.
+    /// 185b case 2: node-mac's agent beats, but its ollama stopped answering.
     /// The GPU 12B would win on rank; reported not serving, it sorts after
-    /// pop-os and says why. Its llamacpp on the same node is untouched.
+    /// ctrl and says why. Its llamacpp on the same node is untouched.
     #[test]
     fn a_backend_the_agent_reports_not_serving_sorts_last_and_says_why() {
         let rec = serde_json::json!({
-            "id": "mcmini", "ip_address": "100.64.1.2", "current_load": 0.4, "last_heartbeat": 1000.0,
+            "id": "node-mac", "ip_address": "100.64.0.101", "current_load": 0.4, "last_heartbeat": 1000.0,
             "running_backends": {"ollama": "gemma4:12b", "llamacpp": "gemma4:26b-a4b-it-qat"},
             "backend_containers": {
                 "ollama": {"running": true, "serving": false, "serving_reason": "probe timed out after 60s"},
                 "llamacpp": {"running": true, "serving": true},
             },
         });
-        let f = node_facts_from_kv("mcmini", &rec, &[], 1001.0);
+        let f = node_facts_from_kv("node-mac", &rec, &[], 1001.0);
         assert_eq!(f.not_serving, vec![("ollama".to_string(), "probe timed out after 60s".to_string())]);
         let mut m = incident()[1].clone();
         m.not_serving = f.not_serving.clone();
         let t = build_table(&[incident()[0].clone(), m], &[], &Declarations::default());
         let sel = select_with(&t, None, None, false, &|_| false, &idle, &fresh).unwrap();
         let order: Vec<&str> = sel.candidates.iter().map(|c| c.node_id.as_str()).collect();
-        assert_eq!(order, ["pop-os", "mcmini"], "the wedged GPU 12B no longer wins");
+        assert_eq!(order, ["ctrl", "node-mac"], "the wedged GPU 12B no longer wins");
         assert!(!sel.candidates[1].healthy);
         assert_eq!(sel.candidates[1].health, "ollama not serving: probe timed out after 60s");
-        // Without the report the same table puts mcmini first: the sort, not the fixture, moved it.
+        // Without the report the same table puts node-mac first: the sort, not the fixture, moved it.
         let t = build_table(&incident(), &[], &Declarations::default());
-        assert_eq!(first_node(&select_with(&t, None, None, false, &|_| false, &idle, &fresh).unwrap()), "mcmini");
+        assert_eq!(first_node(&select_with(&t, None, None, false, &|_| false, &idle, &fresh).unwrap()), "node-mac");
         let other = backend_health(&f, "llamacpp");
         assert!(other.0, "{other:?}");
     }

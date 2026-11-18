@@ -161,7 +161,7 @@ struct CreateSeatTokenBody {
 pub(crate) struct MintedSeatToken {
     pub id: uuid::Uuid,
     pub raw: String,
-    pub expires_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: jiff::Timestamp,
 }
 
 /// Insert a single-use seat token. `role` is written explicitly and pinned by
@@ -173,7 +173,7 @@ pub(crate) async fn mint_seat_token(
     by: &str,
 ) -> Result<MintedSeatToken, sqlx::Error> {
     let raw = generate_seat_token();
-    let (id, expires_at): (uuid::Uuid, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+    let (id, expires_at): (uuid::Uuid, jiff_sqlx::Timestamp) = sqlx::query_as(
         "INSERT INTO noo_seat_tokens (token_hash, role, seat_name, created_by, expires_at) \
          VALUES ($1, 'seat', $2, $3, now() + make_interval(secs => $4)) \
          RETURNING id, expires_at",
@@ -184,7 +184,7 @@ pub(crate) async fn mint_seat_token(
     .bind(ttl_secs as f64)
     .fetch_one(db)
     .await?;
-    Ok(MintedSeatToken { id, raw, expires_at })
+    Ok(MintedSeatToken { id, raw, expires_at: expires_at.to_jiff() })
 }
 
 /// POST /api/cluster/seat-tokens — mint a one-time seat enrolment token.
@@ -232,7 +232,7 @@ async fn seat_token_create(
         "role": "seat",
         "seat_name": seat,
         "token": t.raw,
-        "expires_at": t.expires_at.to_rfc3339(),
+        "expires_at": crate::wire_time::rfc3339_offset(t.expires_at),
         "controller_url": gateway,
         "ca_sha256": ca_sha256,
         "note": "single-use; enrolls a kiosk SEAT, never a node — it expires, burns on first use, \
@@ -245,15 +245,15 @@ async fn seat_tokens_list(
     State(state): State<Arc<AppState>>,
     _op: Operator,
 ) -> AppResult {
-    type Row = (uuid::Uuid, String, String, String, chrono::DateTime<chrono::Utc>,
-                chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>, Option<String>, bool);
+    type Row = (uuid::Uuid, String, String, String, jiff_sqlx::Timestamp,
+                jiff_sqlx::Timestamp, Option<jiff_sqlx::Timestamp>, Option<String>, bool);
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT id, role, seat_name, created_by, created_at, expires_at, used_at, used_by_ip, revoked \
          FROM noo_seat_tokens ORDER BY created_at DESC LIMIT 200",
     )
     .fetch_all(&state.db)
     .await?;
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let tokens: Vec<Value> = rows
         .into_iter()
         .map(|(id, role, seat, by, created, expires, used, ip, revoked)| {
@@ -261,11 +261,11 @@ async fn seat_tokens_list(
                 "id": id.to_string(),
                 "role": role,
                 "seat_name": seat,
-                "status": token_status(revoked, used.is_some(), expires <= now),
+                "status": token_status(revoked, used.is_some(), expires.to_jiff() <= now),
                 "created_by": by,
-                "created_at": created.to_rfc3339(),
-                "expires_at": expires.to_rfc3339(),
-                "used_at": used.map(|t| t.to_rfc3339()),
+                "created_at": crate::wire_time::rfc3339_offset(created.to_jiff()),
+                "expires_at": crate::wire_time::rfc3339_offset(expires.to_jiff()),
+                "used_at": used.map(|t| crate::wire_time::rfc3339_offset(t.to_jiff())),
                 "used_by_ip": ip,
             })
         })
@@ -394,7 +394,7 @@ pub(crate) async fn redeem_seat_token(
     presented_seat: &str,
     ip: &str,
 ) -> Result<Result<(uuid::Uuid, String), (SeatDeny, Option<uuid::Uuid>)>, sqlx::Error> {
-    type Row = (uuid::Uuid, String, String, bool, Option<chrono::DateTime<chrono::Utc>>, chrono::DateTime<chrono::Utc>);
+    type Row = (uuid::Uuid, String, String, bool, Option<jiff_sqlx::Timestamp>, jiff_sqlx::Timestamp);
     let row: Option<Row> = sqlx::query_as(
         "SELECT id, role, seat_name, revoked, used_at, expires_at FROM noo_seat_tokens WHERE token_hash = $1",
     )
@@ -404,7 +404,7 @@ pub(crate) async fn redeem_seat_token(
     let Some((id, role, seat, revoked, used_at, expires_at)) = row else {
         return Ok(Err((SeatDeny::Unknown, None)));
     };
-    if let Err(d) = judge_seat_token(revoked, used_at.is_some(), expires_at <= chrono::Utc::now(), &role, &seat, presented_seat) {
+    if let Err(d) = judge_seat_token(revoked, used_at.is_some(), expires_at.to_jiff() <= jiff::Timestamp::now(), &role, &seat, presented_seat) {
         return Ok(Err((d, Some(id))));
     }
     let claimed = sqlx::query(
@@ -560,11 +560,11 @@ async fn seats_list(
     cluster: Option<Extension<ClusterNode>>,
 ) -> AppResult {
     let _ = seat_admin_guard(&op, &cluster)?;
-    type Row = (String, String, Option<Value>, Option<String>, chrono::DateTime<chrono::Utc>,
-                Option<chrono::DateTime<chrono::Utc>>, Option<Value>, Option<String>,
-                Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>,
+    type Row = (String, String, Option<Value>, Option<String>, jiff_sqlx::Timestamp,
+                Option<jiff_sqlx::Timestamp>, Option<Value>, Option<String>,
+                Option<jiff_sqlx::Timestamp>, Option<jiff_sqlx::Timestamp>,
                 Option<String>, Option<i32>, Option<String>, Option<String>,
-                Option<chrono::DateTime<chrono::Utc>>, Option<Value>);
+                Option<jiff_sqlx::Timestamp>, Option<Value>);
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT s.seat_name, s.birth_cert, s.facts, s.enroll_user, s.enrolled_at, s.last_seen, s.heartbeat, \
                 encode(sha256(b.blob), 'hex'), b.fetched_at, b.applied_at, b.applied_sha, b.apply_rc, b.apply_msg, \
@@ -581,17 +581,17 @@ async fn seats_list(
                 "seat_name": name,
                 "tailnet_name": tailnet,
                 "display": display.unwrap_or_else(|| json!({})),
-                "revoked_at": revoked.map(|t| t.to_rfc3339()),
+                "revoked_at": revoked.map(|t| crate::wire_time::rfc3339_offset(t.to_jiff())),
                 "role": "seat",
                 "birth_cert": cert,
                 "facts": facts,
                 "enroll_user": user,
-                "enrolled_at": enrolled.to_rfc3339(),
-                "last_seen": seen.map(|t| t.to_rfc3339()),
+                "enrolled_at": crate::wire_time::rfc3339_offset(enrolled.to_jiff()),
+                "last_seen": seen.map(|t| crate::wire_time::rfc3339_offset(t.to_jiff())),
                 "heartbeat": hb,
                 "staged_sha": sha,
-                "fetched_at": fetched.map(|t| t.to_rfc3339()),
-                "applied_at": applied.map(|t| t.to_rfc3339()),
+                "fetched_at": fetched.map(|t| crate::wire_time::rfc3339_offset(t.to_jiff())),
+                "applied_at": applied.map(|t| crate::wire_time::rfc3339_offset(t.to_jiff())),
                 "applied_sha": applied_sha,
                 "apply_rc": rc,
                 "apply_msg": msg,
@@ -654,9 +654,9 @@ async fn seat_bundle_status(
     if !valid_node_name(&seat) {
         return Err(AppError::BadRequest("invalid seat name".into()));
     }
-    type Row = (chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>, i64,
-                Option<chrono::DateTime<chrono::Utc>>, Option<String>, Option<i32>, Option<String>, String,
-                Option<chrono::DateTime<chrono::Utc>>, Option<Value>);
+    type Row = (jiff_sqlx::Timestamp, Option<jiff_sqlx::Timestamp>, i64,
+                Option<jiff_sqlx::Timestamp>, Option<String>, Option<i32>, Option<String>, String,
+                Option<jiff_sqlx::Timestamp>, Option<Value>);
     let row: Option<Row> = sqlx::query_as(
         "SELECT b.created_at, b.fetched_at, octet_length(b.blob)::bigint, b.applied_at, b.applied_sha, \
                 b.apply_rc, b.apply_msg, encode(sha256(b.blob), 'hex'), s.last_seen, s.heartbeat \
@@ -668,15 +668,15 @@ async fn seat_bundle_status(
     match row {
         Some((staged, fetched, bytes, applied, applied_sha, rc, msg, sha, seen, hb)) => Ok(Json(json!({
             "seat": seat,
-            "staged_at": staged.to_rfc3339(),
-            "fetched_at": fetched.map(|t| t.to_rfc3339()),
+            "staged_at": crate::wire_time::rfc3339_offset(staged.to_jiff()),
+            "fetched_at": fetched.map(|t| crate::wire_time::rfc3339_offset(t.to_jiff())),
             "bytes": bytes,
             "sha256": sha,
-            "applied_at": applied.map(|t| t.to_rfc3339()),
+            "applied_at": applied.map(|t| crate::wire_time::rfc3339_offset(t.to_jiff())),
             "applied_sha": applied_sha,
             "apply_rc": rc,
             "apply_msg": msg,
-            "last_seen": seen.map(|t| t.to_rfc3339()),
+            "last_seen": seen.map(|t| crate::wire_time::rfc3339_offset(t.to_jiff())),
             "heartbeat": hb,
         }))),
         None => Err(AppError::NotFound("no bundle staged".into())),
@@ -693,10 +693,10 @@ async fn seat_bundle_status(
 ///
 /// `Ok(None)` means no row: the seat is not enrolled. A database error is a
 /// 503 that names it, never "no cert": on 2026-11-02 a gateway out of file
-/// descriptors refused the homeserver seat as `NoBirthCert` and told the
+/// descriptors refused the node-h seat as `NoBirthCert` and told the
 /// operator to re-enroll a seat whose row was there all along.
 /// The seat's birth certificate and, when it was revoked, when.
-type SeatCert = (String, Option<chrono::DateTime<chrono::Utc>>);
+type SeatCert = (String, Option<jiff_sqlx::Timestamp>);
 
 async fn seat_cert_for(db: &sqlx::PgPool, seat: &str) -> Result<Option<SeatCert>, AppError> {
     sqlx::query_as::<_, SeatCert>("SELECT birth_cert, revoked_at FROM noo_seats WHERE seat_name = $1")
@@ -725,9 +725,9 @@ async fn check_seat_proof(
     debug_assert!(purpose.is_seat());
     let header = headers.get(BIRTH_PROOF_HEADER).and_then(|v| v.to_str().ok());
     let row = seat_cert_for(db, seat).await?;
-    revoked_refusal(seat, row.as_ref().and_then(|(_, at)| *at))?;
+    revoked_refusal(seat, row.as_ref().and_then(|(_, at)| *at).map(jiff_sqlx::Timestamp::to_jiff))?;
     let cert = row.map(|(cert, _)| cert);
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
     crate::birth_proof::verify(header, purpose, seat, sha, cert.as_deref(), now).map_err(|e| {
         tracing::warn!(seat = %seat, reason = ?e, "seat_proof_rejected");
         AppError::Forbidden(format!("seat proof refused for '{seat}': {e:?} (sign \"noo-seat-<purpose>:<seat>:<sha>:<ts>\" with the seat's birth key)"))
@@ -737,13 +737,13 @@ async fn check_seat_proof(
 /// A revoked seat is refused before its proof is checked: revocation cuts the
 /// whole rail (bundle, fetched, applied, heartbeat) and, through the keyless
 /// mint, its display. Re-enrolment with a new seat token clears it (i510).
-fn revoked_refusal(seat: &str, revoked_at: Option<chrono::DateTime<chrono::Utc>>) -> Result<(), AppError> {
+fn revoked_refusal(seat: &str, revoked_at: Option<jiff::Timestamp>) -> Result<(), AppError> {
     match revoked_at {
         Some(at) => {
             tracing::warn!(seat = %seat, revoked_at = %at, "seat_rail_refused_revoked");
             Err(AppError::Forbidden(format!(
                 "seat '{seat}' was revoked at {}; enrol it again with a new seat token (noo kiosk seat-token {seat})",
-                at.to_rfc3339()
+                crate::wire_time::rfc3339_offset(at)
             )))
         }
         None => Ok(()),
@@ -1122,6 +1122,16 @@ mod tests {
 
     /// The guarded UPDATE re-checks every condition, including the claim, so
     /// a concurrent second redeemer gets `rows_affected = 0`.
+    /// Redemption judges the token's expiry against the current time before
+    /// the claim (whose SQL re-checks it): a fixed time would let an expired
+    /// seat token through the Rust judgement.
+    #[test]
+    fn redemption_judges_expiry_against_now() {
+        let own = crate::test_src::own_code(include_str!("seats.rs"));
+        let body = crate::test_src::fn_body(&own, "pub(crate) async fn redeem_seat_token(");
+        assert!(body.contains("expires_at.to_jiff() <= jiff::Timestamp::now()"), "the expiry must be judged against now");
+    }
+
     #[test]
     fn the_seat_claim_update_is_guarded_for_single_use() {
         let src = include_str!("seats.rs");
@@ -1171,17 +1181,17 @@ mod tests {
 
     /// A database that cannot answer is a 503 naming the error, never the
     /// `NoBirthCert` 403 that tells the operator to re-enroll (2026-11-02:
-    /// the homeserver seat, a gateway out of file descriptors).
+    /// the node-h seat, a gateway out of file descriptors).
     #[tokio::test]
     async fn an_unreadable_seat_cert_is_a_503_not_no_birth_cert() {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .acquire_timeout(std::time::Duration::from_millis(200))
             .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
             .expect("lazy pool");
-        let got = check_seat_proof(&pool, &HeaderMap::new(), Purpose::SeatHeartbeat, "homeserver", "abc").await;
+        let got = check_seat_proof(&pool, &HeaderMap::new(), Purpose::SeatHeartbeat, "node-h", "abc").await;
         match got {
             Err(AppError::Unavailable(m)) => {
-                assert!(m.contains("cannot read the birth certificate recorded for seat 'homeserver'"), "{m}");
+                assert!(m.contains("cannot read the birth certificate recorded for seat 'node-h'"), "{m}");
                 assert!(!m.contains("re-enroll") && !m.contains("NoBirthCert"), "{m}");
             }
             other => panic!("expected a 503, got {other:?}"),
@@ -1256,7 +1266,7 @@ mod seat_binding_tests {
     #[test]
     fn a_revoked_seat_is_refused_on_its_rail() {
         assert!(revoked_refusal("hall", None).is_ok());
-        let at = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let at = jiff::Timestamp::from_second(1_800_000_000).unwrap();
         let refused = revoked_refusal("hall", Some(at)).expect_err("revoked");
         let msg = format!("{refused:?}");
         assert!(msg.contains("seat 'hall' was revoked"), "{msg}");
@@ -1267,7 +1277,7 @@ mod seat_binding_tests {
     /// anything else is no claim at all.
     #[test]
     fn a_tailnet_claim_is_a_plain_host_label() {
-        assert_eq!(tailnet_claim(&json!({"tailnet": {"name": "Homeserver-1", "ip": "100.64.0.9"}})).as_deref(), Some("homeserver-1"));
+        assert_eq!(tailnet_claim(&json!({"tailnet": {"name": "Node-h-1", "ip": "100.64.0.9"}})).as_deref(), Some("node-h-1"));
         for bad in [json!({}), json!({"tailnet": {}}), json!({"tailnet": {"name": ""}}),
                     json!({"tailnet": {"name": "a.b"}}), json!({"tailnet": {"name": "-x"}}),
                     json!({"tailnet": {"name": "x y"}}), json!({"tailnet": {"name": "a".repeat(64)}})] {
@@ -1298,7 +1308,7 @@ mod seat_binding_tests {
         }
         let receipt = crate::test_src::fn_body(&own, "async fn staged_seat_sha(");
         assert!(receipt.contains("crate::bundle_etag::cached_sha(&tag, current)"), "the receipt hashes in Postgres every time");
-        assert_ne!(super::seat_etag_key("homeserver"), "homeserver", "a seat would share a node's cache entry");
+        assert_ne!(super::seat_etag_key("node-h"), "node-h", "a seat would share a node's cache entry");
         assert!(crate::test_src::fn_body(&own, "async fn seat_bundle_put(").contains("crate::bundle_etag::forget(&seat_etag_key(&seat))"));
     }
 

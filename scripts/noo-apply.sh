@@ -53,7 +53,11 @@ BUNDLE="${1:?usage: noo-apply <bundle.tar>}"
 # CA-signed lane open by default, so a signed bundle carrying one would
 # re-open the lane this applier retired. Bump it when a retirement must not
 # be undone by a downgrade.
-NOO_APPLY_GENERATION=1
+#   1  the CA-signed lane retired.
+#   2  i908: root code installs only if the RELEASE key listed it (§1c). An
+#      applier of generation 1 has no §1c, so installing one would let a
+#      signing-key holder install any root code again.
+NOO_APPLY_GENERATION=2
 
 # VERIFY-ONLY (tests): run every check, install nothing, exit 0 before the
 # first write. Only in this mode may the anchor paths be redirected and the
@@ -64,16 +68,18 @@ if [ "$VERIFY_ONLY" = 1 ]; then
     PKI="${NOO_APPLY_PKI:-/etc/noo/pki}"
     NODE_ENV="${NOO_APPLY_NODE_ENV:-/etc/noo-node-agent.env}"
     SELF="${NOO_APPLY_SELF:-/usr/local/bin/noo-apply}"
+    RELEASE_FLOOR="${NOO_APPLY_RELEASE_FLOOR:-/etc/noo/release-floor}"
 else
     PKI=/etc/noo/pki
     NODE_ENV=/etc/noo-node-agent.env
     SELF=/usr/local/bin/noo-apply
+    RELEASE_FLOOR=/etc/noo/release-floor
     [ "$(id -u)" = 0 ] || { echo "noo-apply: must run as root (noo-fetch runs it from its root timer)" >&2; exit 1; }
 fi
 CA="$PKI/ca.crt"
 [ -f "$CA" ] || { echo "noo-apply: no trusted CA at $CA — enroll this node first" >&2; exit 78; }
 
-KNOWN_KINDS="ca.crt node.crt node.key agent-env agent-unit agent-binary teardown applier hostd-binary restart-backends host-telemetry cli-binary cli-user fetcher nats-creds fleet-secrets signing-pub harness-binary harness-env harness-unit svc-vllm.crt svc-vllm.key svc-llamacpp.crt svc-llamacpp.key svc-ollama.crt svc-ollama.key svc-tei.crt svc-tei.key svc-reranker.crt svc-reranker.key vendor-cli vendor-cli-manifest vendor-cli-2 vendor-cli-2-manifest vendor-cli-3 vendor-cli-3-manifest"
+KNOWN_KINDS="ca.crt node.crt node.key agent-env agent-unit agent-binary teardown applier hostd-binary restart-backends host-telemetry cli-binary cli-user fetcher nats-creds fleet-secrets signing-pub harness-binary harness-env harness-unit svc-vllm.crt svc-vllm.key svc-llamacpp.crt svc-llamacpp.key svc-ollama.crt svc-ollama.key svc-tei.crt svc-tei.key svc-reranker.crt svc-reranker.key vendor-cli vendor-cli-manifest vendor-cli-2 vendor-cli-2-manifest vendor-cli-3 vendor-cli-3-manifest release-sums release-sums.sig release-version release-lock release-lock.sig netns-unit"
 
 # An add-on's node workload door leaf travels as svc-addon-<addon>-<workload>
 # .crt|.key. The set is open (one pair per enabled add-on workload), so it is
@@ -329,6 +335,416 @@ if [ "$AGE" -lt -300 ]; then
     exit 77
 fi
 
+# ── 1c. Release check (i908): root code installs only if the RELEASE listed it
+#
+# signing.key decides what a node APPLIES; it does not decide what root code
+# the node RUNS. Every root-run payload must be listed, by sha256, in a list
+# the RELEASE key signed (Ed25519; its seed lives in the release pipeline and
+# an off-repo operator copy, never on a controller):
+#   applier         noo-apply.sh              the CLI release's sha256sums.txt
+#   fetcher         noo-fetch.sh              (same)
+#   hostd-binary    noo-hostd-<linux target>  (same)
+#   harness-binary  noo-gateway-<linux target> (same)
+#   agent-binary    `# node-agent-sha256 linux/<arch> <sha>` in the stack's
+#                   signed stack-<tag>.lock (the binary in the node-agent image)
+# The bundle carries the lists: release-sums + release-sums.sig, release-version
+# (the text whose sha256 is the list's noo-release-version row) and, with an
+# agent, release-lock + release-lock.sig. cli-binary on Linux installs into the
+# user's ~/.local/bin as the user, so it is not root code and is not checked.
+#
+# signing-pub: a cluster's own key, never a release artifact, so it cannot be
+# listed. What gates it: the verifying keys below are compiled into THIS file
+# (itself release-checked as `applier`), and nothing a bundle installs —
+# signing.pub, ca.crt — feeds this check. A re-key therefore changes who can
+# stage config, never which root code this node accepts; and a bundle that
+# carries signing-pub is judged here like any other (no rollover lane skips
+# §1c), so a re-key cannot carry unlisted root code in with it.
+#
+# The floor, one step back (operator 2026-11-17): a node accepts the release
+# list of the current FINAL it applied and of the previous final, nothing
+# older, so a genuine but superseded release cannot be replayed while a bad
+# release can still be rolled back once. An rc is accepted when it is an rc of
+# the current or a later release. The record is $RELEASE_FLOOR, root-owned:
+# the last two finals applied (`release-final`, `release-prev`, and the same
+# for `stack`), written at the end of a successful apply (release_floor_write).
+# The oldest accepted release never goes down; an rc never moves the record.
+#
+# The signature: OpenSSL 3 (`pkeyutl -rawin`) where the node has it; else the
+# stdlib-only Ed25519 check below in python3 (a node on OpenSSL 1.1.1). It is
+# part of this file, so the applier's own release row covers it. Neither:
+# refused, saying the node needs OpenSSL 3 or python3.
+#
+# There is no dev path: a payload not in a published release or rc is refused,
+# exit 75, with one line naming the kind, its sha256 and the remedy.
+# BEGIN release_check
+# Current key first: the same list as noo-cli/src/release_sig.rs
+# RELEASE_PUBKEYS_HEX (tests/test_apply_release_check.py holds them equal).
+RELEASE_PUBKEYS_HEX="13be2244d5b91b1d5c29dfffd94a3817cb774c906785cf700e10a86d7be62d43"
+# Only the verify-only mode, which installs nothing and exits before the first
+# write, may point the check at a test key. A real apply never reads it.
+if [ "$VERIFY_ONLY" = 1 ] && [ -n "${NOO_APPLY_RELEASE_PUBKEYS_HEX:-}" ]; then
+    RELEASE_PUBKEYS_HEX="$NOO_APPLY_RELEASE_PUBKEYS_HEX"
+fi
+# The root-run kinds held to release-sums (agent-binary: to the stack lock).
+RELEASE_LISTED_KINDS="applier fetcher hostd-binary harness-binary"
+RELEASE_REMEDY="roll to a published release or rc (on the controller: noo upgrade --all)"
+
+release_asset_re() {  # $1 = kind -> ERE the release asset name must match
+    case "$1" in
+        applier) echo '^noo-apply\.sh$' ;;
+        fetcher) echo '^noo-fetch\.sh$' ;;
+        hostd-binary) echo '^noo-hostd-[a-z0-9_]+-unknown-linux-(gnu|musl)$' ;;
+        harness-binary) echo '^noo-gateway-[a-z0-9_]+-unknown-linux-(gnu|musl)$' ;;
+        *) echo '^$' ;;
+    esac
+}
+
+release_refuse() {  # $1 = what, $2 = why — one line, exit 75
+    echo "noo-apply: REFUSED $1 — $2; $RELEASE_REMEDY (75)" >&2
+    logger -t noo-apply "REFUSED release check: $1 — $2" 2>/dev/null || true
+    exit 75
+}
+
+# OpenSSL 3 verifies a raw Ed25519 signature (`pkeyutl -rawin`); 1.1.1 cannot.
+release_openssl_ok() { openssl pkeyutl -help 2>&1 | grep -q -- '-rawin'; }
+
+# The fallback verifier: Ed25519 (RFC 8032 §5.1.7) on the Python standard
+# library alone, as scripts/verify-release-signature.py does it (a test holds
+# the two to the same answers). argv: DATA-FILE SIG-BASE64URL KEY-HEX...;
+# exit 0 when one key verifies.
+RELEASE_PY_ED25519="$(cat <<'PY'
+import base64, hashlib, sys
+P = 2**255 - 19
+D = -121665 * pow(121666, P - 2, P) % P
+L = 2**252 + 27742317777372353535851937790883648493
+def recover_x(y, sign):
+    if y >= P:
+        return None
+    x2 = (y * y - 1) * pow(D * y * y + 1, P - 2, P) % P
+    if x2 == 0:
+        return None if sign else 0
+    x = pow(x2, (P + 3) // 8, P)
+    if (x * x - x2) % P != 0:
+        x = x * pow(2, (P - 1) // 4, P) % P
+    if (x * x - x2) % P != 0:
+        return None
+    if (x & 1) != sign:
+        x = P - x
+    return x
+def add(p, q):
+    a = (p[1] - p[0]) * (q[1] - q[0]) % P
+    b = (p[1] + p[0]) * (q[1] + q[0]) % P
+    c = 2 * p[3] * q[3] * D % P
+    e = 2 * p[2] * q[2] % P
+    return ((b - a) * (e - c) % P, (e + c) * (b + a) % P, (e - c) * (e + c) % P, (b - a) * (b + a) % P)
+def mul(s, p):
+    acc = (0, 1, 1, 0)
+    while s > 0:
+        if s & 1:
+            acc = add(acc, p)
+        p = add(p, p)
+        s >>= 1
+    return acc
+GY = 4 * pow(5, P - 2, P) % P
+GX = recover_x(GY, 0)
+G = (GX, GY, 1, GX * GY % P)
+def point(raw):
+    if len(raw) != 32:
+        return None
+    y = int.from_bytes(raw, "little")
+    x = recover_x(y & ((1 << 255) - 1), y >> 255)
+    return None if x is None else (x, y & ((1 << 255) - 1), 1, x * (y & ((1 << 255) - 1)) % P)
+def verify(pub, sig, msg):
+    a = point(pub)
+    if a is None or len(sig) != 64:
+        return False
+    r = point(sig[:32])
+    if r is None:
+        return False
+    s = int.from_bytes(sig[32:], "little")
+    if s >= L:
+        return False
+    h = int.from_bytes(hashlib.sha512(sig[:32] + pub + msg).digest(), "little") % L
+    lhs = mul(s, G)
+    rhs = add(r, mul(h, a))
+    return (lhs[0] * rhs[2] - rhs[0] * lhs[2]) % P == 0 and (lhs[1] * rhs[2] - rhs[1] * lhs[2]) % P == 0
+msg = open(sys.argv[1], "rb").read()
+sig = base64.urlsafe_b64decode(sys.argv[2] + "=" * (-len(sys.argv[2]) % 4))
+sys.exit(0 if any(len(k) == 64 and verify(bytes.fromhex(k), sig, msg) for k in sys.argv[3:]) else 1)
+PY
+)"
+release_python_ok() {
+    python3 -I -c 'import base64, hashlib, sys; sys.exit(0 if sys.version_info >= (3, 6) else 1)' >/dev/null 2>&1
+}
+# release_verifier — the tool this node verifies a release signature with:
+# openssl, python, or nothing.
+release_verifier() {
+    if release_openssl_ok; then echo openssl; elif release_python_ok; then echo python; fi
+}
+
+# release_sig_ok DATA SIGFILE SCRATCH — 0 when a pinned release key verifies
+# the `noo-sig1.<base64url ed25519 signature>` in SIGFILE over DATA's bytes,
+# with $RELEASE_VERIFIER (release_verifier).
+release_sig_ok() {
+    _rs_sig="$(tr -d ' \r\n' < "$2")"
+    case "$_rs_sig" in noo-sig1.*) _rs_sig="${_rs_sig#noo-sig1.}" ;; *) return 1 ;; esac
+    printf '%s\n' "$_rs_sig" | LC_ALL=C grep -qxE '[A-Za-z0-9_-]{86}' || return 1
+    if [ "${RELEASE_VERIFIER:-}" = python ]; then
+        # shellcheck disable=SC2086
+        python3 -I -c "$RELEASE_PY_ED25519" "$1" "$_rs_sig" $RELEASE_PUBKEYS_HEX >/dev/null 2>&1
+        return
+    fi
+    [ "${RELEASE_VERIFIER:-}" = openssl ] || return 1
+    printf '%s==\n' "$_rs_sig" | tr '_-' '/+' | openssl base64 -d -A > "$3/release.sig" 2>/dev/null || return 1
+    [ "$(wc -c < "$3/release.sig")" -eq 64 ] || return 1
+    for _rs_k in $RELEASE_PUBKEYS_HEX; do
+        printf '%s\n' "$_rs_k" | LC_ALL=C grep -qxE '[0-9a-f]{64}' || continue
+        # SubjectPublicKeyInfo for Ed25519: the fixed 12-byte prefix + the key.
+        # shellcheck disable=SC2059
+        printf "$(printf '302a300506032b6570032100%s' "$_rs_k" | sed 's/../\\x&/g')" > "$3/release.der"
+        if openssl pkeyutl -verify -pubin -keyform DER -inkey "$3/release.der" -rawin \
+            -in "$1" -sigfile "$3/release.sig" >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# release_ver_key V — a fixed-width sort key for X.Y.Z or X.Y.Z-rc.N (a final
+# sorts after its rcs; `stack-` and `v` prefixes are dropped). Fails for any
+# other shape, so only plain digits ever reach the arithmetic.
+release_ver_key() {
+    _rv="${1#stack-}"; _rv="${_rv#v}"
+    printf '%s\n' "$_rv" | LC_ALL=C grep -qxE '[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}(-rc\.[0-9]{1,4})?' || return 1
+    _rv_rc=99999
+    case "$_rv" in *-rc.*) _rv_rc="${_rv##*-rc.}"; _rv="${_rv%-rc.*}" ;; esac
+    _rv_a="${_rv%%.*}"; _rv_b="${_rv#*.}"; _rv_c="${_rv_b#*.}"; _rv_b="${_rv_b%%.*}"
+    printf '%05d%05d%05d%05d\n' "$((10#$_rv_a))" "$((10#$_rv_b))" "$((10#$_rv_c))" "$((10#$_rv_rc))"
+}
+# release_older A B — 0 when A is an OLDER release than B (both well-formed).
+release_older() {
+    _ro_a="$(release_ver_key "$1")" || return 1
+    _ro_b="$(release_ver_key "$2")" || return 1
+    [ "$_ro_a" \< "$_ro_b" ]
+}
+# release_floor_of KEY — the recorded floor for `release` or `stack`, or nothing.
+release_floor_of() {
+    [ -f "$RELEASE_FLOOR" ] || return 0
+    sed -n "s/^$1 //p" "$RELEASE_FLOOR" | head -1
+}
+# release_names_for SUMS SHA — every asset name SUMS lists with that sha256.
+release_names_for() {
+    awk -v s="$2" 'NF >= 2 && tolower($1) == s { n = $2; sub(/^\*/, "", n); sub(/.*\//, "", n); print n }' "$1"
+}
+# release_refuse_ahead KEY V F P NEED — the staged release is older than this
+# node's record allows: the node is AHEAD of its controller (i940). One line,
+# the same words as noo-cli release_gate::ahead_line, exit 75.
+release_refuse_ahead() {
+    echo "noo-apply: REFUSED $1 $2 — this node is ahead of its controller (it applied $3${4:+ after $4}; the controller staged $2): roll the controller to $5 or later (noo upgrade --stack), then this node takes its bundles again (75)" >&2
+    logger -t noo-apply "REFUSED release check: $1 $2 — node ahead of its controller ($3${4:+ after $4})" 2>/dev/null || true
+    exit 75
+}
+# release_floor_check WHAT VALUE KEY — the one-step-back rule for KEY
+# (`release` or `stack`). The record keeps the last two FINALS applied:
+# KEY-final (newest) and KEY-prev (the one before). A final is accepted when it
+# is not older than KEY-prev (KEY-final while only one is recorded); an rc when
+# its release (the X.Y.Z of X.Y.Z-rc.N) is not older than KEY-final: an rc of
+# the current or a later release. Nothing recorded: any signed list.
+release_floor_check() {
+    _rf_f="$(release_floor_of "$3-final")"; _rf_p="$(release_floor_of "$3-prev")"
+    for _rf_x in "$_rf_f" "$_rf_p"; do
+        if [ -n "$_rf_x" ] && ! release_ver_key "$_rf_x" >/dev/null; then
+            release_refuse "$1" "the floor record $RELEASE_FLOOR names '$_rf_x', which is not a version"
+        fi
+    done
+    [ -n "$_rf_f" ] || return 0
+    case "$2" in
+        *-rc.*)
+            if release_older "${2%-rc.*}" "$_rf_f"; then
+                release_refuse_ahead "$3" "$2" "$_rf_f" "$_rf_p" "$_rf_f"
+            fi ;;
+        *)
+            if release_older "$2" "${_rf_p:-$_rf_f}"; then
+                release_refuse_ahead "$3" "$2" "$_rf_f" "$_rf_p" "${_rf_p:-$_rf_f}"
+            fi ;;
+    esac
+    return 0
+}
+# release_floor_next KEY VALUE — "<final> <prev>" for KEY after applying VALUE:
+# a newer final shifts the record by one; an rc, or a final already recorded
+# or between the two, leaves it as it is (the oldest accepted never goes down).
+release_floor_next() {
+    _rn_f="$(release_floor_of "$1-final")"; _rn_p="$(release_floor_of "$1-prev")"
+    case "$2" in
+        ''|*-rc.*) : ;;
+        *)
+            if [ -z "$_rn_f" ]; then
+                _rn_f="$2"
+            elif release_older "$_rn_f" "$2"; then
+                _rn_p="$_rn_f"; _rn_f="$2"
+            fi ;;
+    esac
+    echo "$_rn_f $_rn_p"
+}
+
+# Every release also vouches for its PREVIOUS FINAL (the release job derives
+# them by digest): sha256sums.txt rows `<sha>  <asset>@v<prev>`, lock rows
+# `# node-agent-sha256@v<prev> linux/<arch> <sha>`. A payload matched only by
+# such a row is judged by the floor as release <prev> (one final back is
+# accepted, two back refused), and the record then does not move. A list may
+# name ONE such tag, a final older than the list's own release.
+# release_prev_tag FILE KIND OWN — the one tag FILE's `@v` rows name, or
+# nothing; refuses (75) a second tag, an rc, or one not older than OWN.
+release_prev_tag() {
+    case "$2" in
+        sums) _rp="$(awk 'NF >= 2 { n = $2; sub(/^\*/, "", n); sub(/.*\//, "", n); if (n ~ /@v/) { sub(/.*@v/, "", n); print n } }' "$1" | sort -u)" ;;
+        lock) _rp="$(sed -n 's/^# node-agent-sha256@v\([^ ]*\) .*$/\1/p' "$1" | sort -u)" ;;
+    esac
+    [ -n "$_rp" ] || return 0
+    _rp_what="release-sums"; [ "$2" = lock ] && _rp_what="release-lock"
+    if [ "$(printf '%s\n' "$_rp" | grep -c .)" != 1 ]; then
+        release_refuse "$_rp_what" "it vouches for more than one previous release ($(printf '%s' "$_rp" | tr '\n' ' '))"
+    fi
+    case "$_rp" in *-rc.*) release_refuse "$_rp_what" "its previous-release rows name an rc ($_rp), not a final" ;; esac
+    if ! release_ver_key "$_rp" >/dev/null || ! release_older "$_rp" "$3"; then
+        release_refuse "$_rp_what" "its previous-release rows name $_rp, which is not a final older than $3"
+    fi
+    printf '%s\n' "$_rp"
+}
+# Generation 1 has no release check: no row, current or previous, installs one.
+RELEASE_MIN_APPLIER_GENERATION=2
+
+# release_check WORK SCRATCH — refuses (75) unless every root-run payload the
+# signed manifest names is in a release-signed list that is not older than the
+# floor. Sets RELEASE_OK_VERSION / RELEASE_OK_STACK for release_floor_write.
+release_check() {
+    _rc_w="$1"; _rc_t="$2"
+    RELEASE_OK_VERSION=""; RELEASE_OK_STACK=""
+    # The kinds the SIGNED manifest names, never what is on disk.
+    _rc_mk=" $(awk '!/^#/ && NF >= 2 {print $2}' "$_rc_w/manifest" | tr '\n' ' ') "
+    _rc_root=""
+    for _rc_k in $RELEASE_LISTED_KINDS agent-binary; do
+        case "$_rc_mk" in *" $_rc_k "*) _rc_root="$_rc_root $_rc_k" ;; esac
+    done
+    [ -n "$_rc_root" ] || return 0
+    _rc_root="${_rc_root# }"
+    # The first roll's applier-only bootstrap (0.6.27, rc.2 install-matrix
+    # UPGRADE cell): an older applier installs THIS applier from an
+    # applier-only bundle (§1b) and re-execs it on the same bundle. That bundle
+    # carries no release list (an older applier refuses unknown kinds with 76),
+    # and its one payload IS the running applier: there is nothing to install,
+    # so no refusal and no failed apply on every node's first roll. Exactly
+    # that case: the signed manifest names ONLY `applier`, byte-identical to
+    # $SELF. A different applier, or any other kind beside it, is checked below.
+    if [ "$(printf '%s' "$_rc_mk" | tr -s ' ')" = " applier " ]; then
+        _rc_have="$(sha256sum "$_rc_w/files/applier" 2>/dev/null | awk '{print $1}')"
+        _rc_self="$(sha256sum "$SELF" 2>/dev/null | awk '{print $1}')"
+        if [ -n "$_rc_have" ] && [ "$_rc_have" = "$_rc_self" ]; then
+            echo "noo-apply: applier-only bundle: this applier is already installed (sha256 $_rc_have), nothing to install"
+            return 0
+        fi
+    fi
+    for _rc_k in release-sums release-sums.sig release-version; do
+        case "$_rc_mk" in *" $_rc_k "*) : ;; *) release_refuse "$_rc_root" "the bundle carries root code but no release-signed list ($_rc_k)" ;; esac
+        [ -f "$_rc_w/files/$_rc_k" ] || release_refuse "$_rc_root" "the bundle names $_rc_k but lacks it"
+    done
+    RELEASE_VERIFIER="$(release_verifier)"
+    if [ -z "$RELEASE_VERIFIER" ]; then
+        release_refuse "$_rc_root" "this node cannot verify an Ed25519 release signature: it needs OpenSSL 3 or python3 (openssl here: $(openssl version 2>/dev/null | awk '{print $1, $2}'))"
+    fi
+    _rc_sums="$_rc_w/files/release-sums"
+    if ! release_sig_ok "$_rc_sums" "$_rc_w/files/release-sums.sig" "$_rc_t"; then
+        release_refuse "release-sums" "its signature does not verify against a release key this applier pins"
+    fi
+    # The list names its release: release-version is the text whose sha256 is
+    # the signed noo-release-version row.
+    _rc_ver="$(tr -d '\r' < "$_rc_w/files/release-version")"
+    if [ "$(wc -l < "$_rc_w/files/release-version")" != 1 ] || ! release_ver_key "$_rc_ver" >/dev/null; then
+        release_refuse "release-version" "it is not one X.Y.Z or X.Y.Z-rc.N line"
+    fi
+    _rc_vs="$(sha256sum "$_rc_w/files/release-version" | awk '{print $1}')"
+    if ! release_names_for "$_rc_sums" "$_rc_vs" | grep -qx 'noo-release-version'; then
+        release_refuse "release-version" "$_rc_ver is not the release the signed list names"
+    fi
+    release_floor_check "release $_rc_ver" "$_rc_ver" release
+    _rc_prev="$(release_prev_tag "$_rc_sums" sums "$_rc_ver")" || exit 75
+    _rc_rec="$_rc_ver"
+    for _rc_k in $RELEASE_LISTED_KINDS; do
+        case "$_rc_mk" in *" $_rc_k "*) : ;; *) continue ;; esac
+        [ -f "$_rc_w/files/$_rc_k" ] || release_refuse "$_rc_k" "the bundle names it but lacks it"
+        _rc_s="$(sha256sum "$_rc_w/files/$_rc_k" | awk '{print $1}')"
+        _rc_n="$(release_names_for "$_rc_sums" "$_rc_s")"
+        if printf '%s\n' "$_rc_n" | LC_ALL=C grep -qE "$(release_asset_re "$_rc_k")"; then
+            :
+        elif [ -n "$_rc_prev" ] && printf '%s\n' "$_rc_n" | sed -n "s/@v$(printf '%s' "$_rc_prev" | sed 's/\./\\./g')\$//p" \
+                | LC_ALL=C grep -qE "$(release_asset_re "$_rc_k")"; then
+            # The previous final's own payload: judged as that release.
+            release_floor_check "release $_rc_prev" "$_rc_prev" release
+            _rc_rec="$_rc_prev"
+        else
+            release_refuse "$_rc_k" "sha256 $_rc_s is not in release $_rc_ver's signed list"
+        fi
+        if [ "$_rc_k" = applier ]; then
+            _rc_g="$(grep -m1 -E '^NOO_APPLY_GENERATION=[0-9]+$' "$_rc_w/files/applier" | cut -d= -f2)"
+            if [ "${_rc_g:-0}" -lt "$RELEASE_MIN_APPLIER_GENERATION" ]; then
+                release_refuse applier "sha256 $_rc_s is applier generation ${_rc_g:-0}, which has no release check; a node keeps generation $RELEASE_MIN_APPLIER_GENERATION or later, a step back included"
+            fi
+        fi
+    done
+    case "$_rc_mk" in *" agent-binary "*)
+        for _rc_k in release-lock release-lock.sig; do
+            case "$_rc_mk" in *" $_rc_k "*) : ;; *) release_refuse agent-binary "the bundle carries the agent but not the release-signed stack lock ($_rc_k)" ;; esac
+            [ -f "$_rc_w/files/$_rc_k" ] || release_refuse agent-binary "the bundle names $_rc_k but lacks it"
+        done
+        _rc_lock="$_rc_w/files/release-lock"
+        if ! release_sig_ok "$_rc_lock" "$_rc_w/files/release-lock.sig" "$_rc_t"; then
+            release_refuse "release-lock" "its signature does not verify against a release key this applier pins"
+        fi
+        _rc_tag="$(sed -n 's/^# stack //p' "$_rc_lock" | tr -d '\r' | sort -u)"
+        if [ "$(printf '%s\n' "$_rc_tag" | grep -c .)" != 1 ] || ! release_ver_key "$_rc_tag" >/dev/null; then
+            release_refuse "release-lock" "it does not name exactly one stack tag"
+        fi
+        release_floor_check "stack $_rc_tag" "$_rc_tag" stack
+        _rc_lprev="$(release_prev_tag "$_rc_lock" lock "$_rc_tag")" || exit 75
+        RELEASE_OK_STACK="$_rc_tag"
+        _rc_s="$(sha256sum "$_rc_w/files/agent-binary" | awk '{print $1}')"
+        if LC_ALL=C grep -qxE "# node-agent-sha256 linux/(amd64|arm64) $_rc_s" "$_rc_lock"; then
+            :
+        elif [ -n "$_rc_lprev" ] && LC_ALL=C grep -qxE "# node-agent-sha256@v$(printf '%s' "$_rc_lprev" | sed 's/\./\\./g') linux/(amd64|arm64) $_rc_s" "$_rc_lock"; then
+            release_floor_check "stack v$_rc_lprev" "v$_rc_lprev" stack
+            RELEASE_OK_STACK="v$_rc_lprev"
+        else
+            release_refuse agent-binary "sha256 $_rc_s is not in stack $_rc_tag's signed lock"
+        fi
+        ;;
+    esac
+    RELEASE_OK_VERSION="$_rc_rec"
+    return 0
+}
+
+# release_floor_write VERSION STACK — record what this apply verified
+# (release_floor_next). Root-owned, 0644, replaced atomically.
+release_floor_write() {
+    read -r _rw_rf _rw_rp <<EOF_FLOOR
+$(release_floor_next release "$1")
+EOF_FLOOR
+    read -r _rw_sf _rw_sp <<EOF_FLOOR
+$(release_floor_next stack "$2")
+EOF_FLOOR
+    [ -n "$_rw_rf$_rw_sf" ] || return 0
+    {
+        echo "# noo-apply (i908): the last two finals this node applied; it steps back at most one. Written by the applier."
+        [ -z "$_rw_rf" ] || echo "release-final $_rw_rf"
+        [ -z "$_rw_rp" ] || echo "release-prev $_rw_rp"
+        [ -z "$_rw_sf" ] || echo "stack-final $_rw_sf"
+        [ -z "$_rw_sp" ] || echo "stack-prev $_rw_sp"
+    } > "$RELEASE_FLOOR.next"
+    chmod 644 "$RELEASE_FLOOR.next"
+    mv -f "$RELEASE_FLOOR.next" "$RELEASE_FLOOR"
+}
+# END release_check
+release_check "$WORK" "$KEYS"
+
 # ── 1b. Applier self-update comes FIRST (2026-09-03): a bundle that carries
 # a newer noo-apply must be applied BY that noo-apply, or every new kind in
 # the same bundle is refused by the old one (HOST3 refused `cli-binary`
@@ -451,7 +867,7 @@ env_payload_ok() {
 # test pins these sums to those files). A directive check let a `User=` in
 # the wrong section, a `StandardOutput=file:` that pid 1 opens as root, or a
 # line hidden behind a CR through; an exact match lets nothing through.
-AGENT_UNIT_SHA256="946dede0eb81ab164afb4d61e9000ffc38d550dc0424333ff792c4dc16bf02e4"
+AGENT_UNIT_SHA256="fa1deaf48ff3b03dda26cbbcc650322278c21845eeb321804ce2f9feafdd3639"
 HARNESS_UNIT_SHA256="6ce5d363e5ada9c70635a7c3b5f23002a80796f505ff2a9aac1fda9f531b0e0b"
 unit_payload_ok() {
     _f="$1"; _kind="$2"
@@ -473,7 +889,7 @@ unit_payload_ok() {
 # a directive or key hidden behind either would reach pid 1 unchecked. Every
 # text kind is held to this, including the merges (nats-creds,
 # fleet-secrets), whose lines land in an EnvironmentFile.
-TEXT_KINDS="agent-env harness-env nats-creds fleet-secrets host-telemetry teardown cli-user signing-pub ca.crt node.crt node.key agent-unit harness-unit restart-backends vendor-cli-manifest vendor-cli-2-manifest vendor-cli-3-manifest"
+TEXT_KINDS="agent-env harness-env nats-creds fleet-secrets host-telemetry teardown cli-user signing-pub ca.crt node.crt node.key agent-unit harness-unit restart-backends vendor-cli-manifest vendor-cli-2-manifest vendor-cli-3-manifest release-sums release-sums.sig release-version release-lock release-lock.sig netns-unit"
 text_payload_ok() {
     if ! LC_ALL=C tr -d '\r\000' < "$1" | cmp -s - "$1"; then
         _shape_refuse "$2" "carries a carriage return or NUL byte"
@@ -810,6 +1226,7 @@ NODE_ID="${NODE_ID:-$(hostname)}"
 
 if [ "$VERIFY_ONLY" = 1 ]; then
     echo "verified-by: $SIG_VIA"
+    echo "release-check: verified release=${RELEASE_OK_VERSION:-none} stack=${RELEASE_OK_STACK:-none} verifier=${RELEASE_VERIFIER:-none}"
     [ -n "$HARNESS_REFUSED" ] && echo "verify-only: refused:$HARNESS_REFUSED"
     echo "verify-only: every check passed; nothing installed"
     exit 0
@@ -1150,6 +1567,347 @@ harness_egress_remove() {
 }
 # END harness_egress
 
+# BEGIN agent_protect
+# The node agent's unit gets a filesystem hold (proposal 61 §7a):
+#   /etc/systemd/system/noo-node-agent.service.d/50-noomesh-protect.conf
+# ProtectSystem=strict, PrivateTmp=yes, ProtectHome=read-only, and one
+# ReadWritePaths= line per directory the agent measurably writes: its state
+# dir (staging and spool are fixed paths under /var/lib/noo-node-agent, so it
+# is listed even when NOO_AGENT_STATE moves the rest), NOO_AGENT_STATE, the
+# declared data roots, each NOO_HOST_ROOTS element, and exactly
+# /var/lib/docker/containers (the agent truncates container logs).
+#
+# The paths come from the STAGED agent-env, which signing.key signs, not the
+# release. So what is rendered from it stays config and never becomes root
+# code:
+#   * the directive names are fixed here; a value only ever fills a
+#     ReadWritePaths= path;
+#   * every value must be a normalised absolute path of [A-Za-z0-9._@+/-]
+#     (no whitespace, newline, CR, %, quote, backslash, `.`/`..` component,
+#     `//` or trailing `/`), and must not be, contain, or sit below a path
+#     the hold exists to protect (AP_DENY_TREES; /home only exactly), checked
+#     on the literal path and on where it resolves;
+#   * ONE bad value refuses the WHOLE drop-in: the installed one (or none) is
+#     left exactly as it was, one line names the KEY (never its value), and
+#     nothing is reloaded or restarted. A value is never rewritten into
+#     another.
+# A path that exists is listed bare; a missing one with `-` (systemd's
+# "ignore if missing": a bare missing path fails the unit's start).
+# /var/lib/docker/containers is always `-`. The order is fixed (state dir,
+# NOO_AGENT_STATE, AP_ROOT_KEYS in order, NOO_HOST_ROOTS in order, docker
+# logs), first occurrence wins, so an unchanged env renders unchanged bytes.
+# A change installs 0644 root:root, daemon-reloads, and sets need_restart:
+# the agent restarts once, at the end, through the agent-env block's path.
+# AGENT_DROPIN_DIR / AP_OWNER_ARGS / AP_STAT_OWNER are seams for the
+# unprivileged test (tests/test_agent_protect_apply.py), as HE_* are.
+AGENT_DROPIN_DIR="${AGENT_DROPIN_DIR:-/etc/systemd/system/noo-node-agent.service.d}"
+AGENT_DROPIN="$AGENT_DROPIN_DIR/50-noomesh-protect.conf"
+AP_OWNER_ARGS="${AP_OWNER_ARGS--o root -g root}"   # empty in tests (not root)
+AP_STAT_OWNER="${AP_STAT_OWNER-root:root}"
+AP_STATE_DIR=/var/lib/noo-node-agent
+AP_DOCKER_LOGS=/var/lib/docker/containers
+AP_ROOT_KEYS="NOO_DATA_ROOT MODELS_DIR HF_CACHE_DIR OLLAMA_DATA_DIR NOO_SKILLS_HOST_DIR"
+# NOO_HOST_ROOTS is split as the agent splits it: filepath.SplitList (':'
+# on Linux), empty elements skipped (node-agent-go/internal/docker/hostroots.go).
+AP_HOST_ROOTS_MAX=16
+# Denied as the path itself, anything below it, or anything above it (a
+# parent would cover it). /bin /sbin /lib* are /usr on a merged-/usr host.
+AP_DENY_TREES="/etc /usr /boot /root /var/lib/docker /bin /sbin /lib /lib32 /lib64 /libx32"
+# Denied as the path itself or anything above it; BELOW is allowed (a data
+# root under /home is a real layout, and ProtectHome needs it listed).
+AP_DENY_EXACT="/home"
+AP_CHANGED=0
+AP_BAD_KEY=""
+AP_PATHS=""
+
+# ap_env_value FILE KEY — KEY's value, read the way the agent-env block reads
+# its roots (last line wins).
+ap_env_value() {
+    grep -E "^$2=" "$1" | tail -1 | cut -d= -f2- || true
+}
+
+# ap_denied PATH — 0 when PATH is, contains or (for a tree) sits below a
+# protected path. The one exception under /var/lib/docker is exactly
+# $AP_DOCKER_LOGS.
+ap_denied() {
+    [ "$1" = / ] && return 0
+    for _ap_d in $AP_DENY_TREES; do
+        case "$_ap_d/" in "$1"/*) return 0 ;; esac
+        case "$1" in "$_ap_d"/*) [ "$1" = "$AP_DOCKER_LOGS" ] || return 0 ;; esac
+    done
+    for _ap_d in $AP_DENY_EXACT; do
+        case "$_ap_d/" in "$1"/*) return 0 ;; esac
+    done
+    return 1
+}
+
+# ap_path_ok PATH — the shape rule, then the deny list on the literal path
+# and on the path it resolves to.
+ap_path_ok() {
+    case "$1" in /?*) ;; *) return 1 ;; esac
+    case "$1" in *[!A-Za-z0-9._@+/-]*) return 1 ;; esac
+    case "$1" in *//*|*/./*|*/../*|*/.|*/..|*/) return 1 ;; esac
+    ap_denied "$1" && return 1
+    _ap_real="$(realpath -m -- "$1" 2>/dev/null)" || return 1
+    [ -n "$_ap_real" ] || return 1
+    ap_denied "$_ap_real" && return 1
+    return 0
+}
+
+# ap_add KEY PATH — validate and append (first occurrence wins); on a bad
+# value set AP_BAD_KEY and fail.
+ap_add() {
+    ap_path_ok "$2" || { AP_BAD_KEY="$1"; return 1; }
+    case "
+$AP_PATHS
+" in *"
+$2
+"*) return 0 ;; esac
+    AP_PATHS="${AP_PATHS:+$AP_PATHS
+}$2"
+}
+
+# ap_collect ENV — every path the agent writes, or fail naming the first bad key.
+ap_collect() {
+    AP_PATHS=""; AP_BAD_KEY=""
+    ap_add AP_STATE_DIR "$AP_STATE_DIR" || return 1
+    _ap_v="$(ap_env_value "$1" NOO_AGENT_STATE)"
+    [ -z "$_ap_v" ] || ap_add NOO_AGENT_STATE "$_ap_v" || return 1
+    for _ap_k in $AP_ROOT_KEYS; do
+        _ap_v="$(ap_env_value "$1" "$_ap_k")"
+        [ -z "$_ap_v" ] || ap_add "$_ap_k" "$_ap_v" || return 1
+    done
+    _ap_rest="$(ap_env_value "$1" NOO_HOST_ROOTS)"
+    _ap_n=0
+    while [ -n "$_ap_rest" ]; do
+        case "$_ap_rest" in
+            *:*) _ap_e="${_ap_rest%%:*}"; _ap_rest="${_ap_rest#*:}" ;;
+            *)   _ap_e="$_ap_rest"; _ap_rest="" ;;
+        esac
+        [ -n "$_ap_e" ] || continue
+        _ap_n=$((_ap_n + 1))
+        [ "$_ap_n" -le "$AP_HOST_ROOTS_MAX" ] || { AP_BAD_KEY=NOO_HOST_ROOTS; return 1; }
+        ap_add NOO_HOST_ROOTS "$_ap_e" || return 1
+    done
+    ap_add AP_DOCKER_LOGS "$AP_DOCKER_LOGS" || return 1
+    return 0
+}
+
+# ap_render — the drop-in from AP_PATHS: fixed lines, then one
+# ReadWritePaths= per path.
+ap_render() {
+    printf '%s\n' "# Rendered by noo-apply from the agent env: the node agent writes only where it must." \
+        "[Service]" "ProtectSystem=strict" "PrivateTmp=yes" "ProtectHome=read-only"
+    while IFS= read -r _ap_p; do
+        [ -n "$_ap_p" ] || continue
+        if [ "$_ap_p" = "$AP_DOCKER_LOGS" ] || [ ! -e "$_ap_p" ]; then
+            printf 'ReadWritePaths=-%s\n' "$_ap_p"
+        else
+            printf 'ReadWritePaths=%s\n' "$_ap_p"
+        fi
+    done <<AP_EOF
+$AP_PATHS
+AP_EOF
+}
+
+# ap_same INSTALLED CANDIDATE — bytes, mode 644 and owner (config_unchanged).
+ap_same() {
+    if [ -n "$AP_STAT_OWNER" ]; then
+        config_unchanged "$2" "$1" 644 "$AP_STAT_OWNER"
+    else
+        [ -f "$1" ] && cmp -s "$2" "$1"
+    fi
+}
+
+# agent_protect_apply ENV — render from the staged agent-env; on a change,
+# install, daemon-reload and ask for the agent restart (need_restart).
+agent_protect_apply() {
+    AP_CHANGED=0
+    # No systemd here (a Mac's launchd, a container without systemd as PID 1):
+    # there is no unit to hold, so nothing is written.
+    [ -d "${AP_SYSTEMD_DIR:-/run/systemd/system}" ] || return 0
+    if ! ap_collect "$1"; then
+        echo "noo-apply: agent-protect: REFUSED — $AP_BAD_KEY is not a path the agent may be allowed to write; the drop-in is left as it was" >&2
+        applied="$applied agent-protect=REFUSED:$AP_BAD_KEY"
+        return 0
+    fi
+    # The applied line ALWAYS says how many paths the hold leaves writable
+    # (`agent-protect=N`, or `=unchanged:N`), so the node's last apply report
+    # carries the hold's state for `noo cluster verify`'s agent protect row,
+    # not only the apply that changed it.
+    _ap_cnt="$(printf '%s\n' "$AP_PATHS" | grep -c .)"
+    _ap_tmp="$(mktemp)"
+    ap_render > "$_ap_tmp"
+    if ap_same "$AGENT_DROPIN" "$_ap_tmp"; then
+        rm -f -- "$_ap_tmp"
+        applied="$applied agent-protect=unchanged:$_ap_cnt"
+        return 0
+    fi
+    # shellcheck disable=SC2086
+    install -d -m 755 $AP_OWNER_ARGS "$AGENT_DROPIN_DIR"
+    # shellcheck disable=SC2086
+    install -m 644 $AP_OWNER_ARGS "$_ap_tmp" "$AGENT_DROPIN"
+    rm -f -- "$_ap_tmp"
+    AP_CHANGED=1
+    systemctl daemon-reload 2>/dev/null || true
+    need_restart=1
+    applied="$applied agent-protect=$_ap_cnt"
+}
+
+# agent_protect_remove — teardown: the drop-in, and its directory if empty.
+agent_protect_remove() {
+    rm -f -- "${AGENT_DROPIN:?}"
+    rmdir -- "${AGENT_DROPIN_DIR:?}" 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+}
+# END agent_protect
+
+# BEGIN netns_unit
+# noo-netns-restore.service (i907 step 1b): the controller's self-node renders
+# and installs it, so a roll needs no sudo for it. The unit runs, after every
+# dockerd start, the install's scripts/noo-netns-restore.sh AS THE INSTALL
+# OWNER (noo-cli netns_unit.rs explains why it exists).
+#
+# The unit text is a template in THIS file (release-listed as `applier`, i908).
+# The `netns-unit` kind carries two parameters and nothing else:
+#   user=<the install owner>
+#   root=<the install root, absolute>
+# signing.key alone vouches for them, so they are judged here and can only
+# fill User= and the path in ExecStart=:
+#   * exactly those two lines, each once; any other line (a newline plus
+#     `ExecStartPre=`) refuses the kind;
+#   * user: [A-Za-z0-9._-], at most 32, not starting with `-` or `.`, an
+#     account this host has, and never root or another uid 0: a bundle never
+#     makes root run a script;
+#   * root: a normalised absolute path of [A-Za-z0-9._@+/-] (so no space,
+#     newline, %, quote or backslash), at most 200, not a symlink, a
+#     directory owned by that user, with scripts/noo-netns-restore.sh a
+#     regular file (not a link) owned by that user. The unit then runs, as
+#     U, only a file U owns: nothing U could not run already.
+# A refusal is one line naming the field (never its value), `netns-unit=
+# REFUSED:<field>` on the applied line, and the installed unit (or none) left
+# exactly as it was. A change installs 0644 root:root, daemon-reloads and
+# enables (WantedBy=docker.service), as the CLI's sudo install did. Unchanged
+# bytes, mode, owner and enabled: `netns-unit=unchanged`, nothing run.
+# NETNS_UNIT_DIR / NU_OWNER_ARGS / NU_STAT_OWNER / NU_SYSTEMD_DIR are seams
+# for the unprivileged test (tests/test_netns_unit_apply.py).
+NETNS_UNIT_NAME=noo-netns-restore.service
+NETNS_UNIT_DIR="${NETNS_UNIT_DIR:-/etc/systemd/system}"
+NETNS_UNIT="$NETNS_UNIT_DIR/$NETNS_UNIT_NAME"
+NU_OWNER_ARGS="${NU_OWNER_ARGS--o root -g root}"   # empty in tests (not root)
+NU_STAT_OWNER="${NU_STAT_OWNER-root:root}"
+NU_USER=""; NU_ROOT=""; NU_BAD=""
+
+# nu_parse FILE — NU_USER and NU_ROOT from the payload, or NU_BAD names why not.
+nu_parse() {
+    NU_USER=""; NU_ROOT=""; NU_BAD=""
+    _nu_u=0; _nu_r=0
+    while IFS= read -r _nu_l || [ -n "$_nu_l" ]; do
+        case "$_nu_l" in
+            user=*) _nu_u=$((_nu_u + 1)); NU_USER="${_nu_l#user=}" ;;
+            root=*) _nu_r=$((_nu_r + 1)); NU_ROOT="${_nu_l#root=}" ;;
+            *) NU_BAD=shape; return 1 ;;
+        esac
+    done < "$1"
+    [ "$_nu_u" = 1 ] && [ "$_nu_r" = 1 ] || { NU_BAD=shape; return 1; }
+    return 0
+}
+
+# nu_user_ok — the owner: a plain name this host knows, never uid 0.
+nu_user_ok() {
+    case "$NU_USER" in ''|-*|.*|*[!A-Za-z0-9._-]*) NU_BAD=user; return 1 ;; esac
+    [ "${#NU_USER}" -le 32 ] || { NU_BAD=user; return 1; }
+    _nu_uid="$(id -u "$NU_USER" 2>/dev/null)" || { NU_BAD=user; return 1; }
+    case "$_nu_uid" in ''|*[!0-9]*|0) NU_BAD=user; return 1 ;; esac
+    return 0
+}
+
+# nu_root_ok — the install root: shape, then what the host says about it.
+nu_root_ok() {
+    case "$NU_ROOT" in /?*) ;; *) NU_BAD=root; return 1 ;; esac
+    case "$NU_ROOT" in *[!A-Za-z0-9._@+/-]*) NU_BAD=root; return 1 ;; esac
+    case "$NU_ROOT" in *//*|*/./*|*/../*|*/.|*/..|*/) NU_BAD=root; return 1 ;; esac
+    [ "${#NU_ROOT}" -le 200 ] || { NU_BAD=root; return 1; }
+    [ -d "$NU_ROOT" ] && [ ! -L "$NU_ROOT" ] || { NU_BAD=root; return 1; }
+    [ "$(stat -c %u "$NU_ROOT" 2>/dev/null)" = "$_nu_uid" ] || { NU_BAD=root-owner; return 1; }
+    _nu_s="$NU_ROOT/scripts/noo-netns-restore.sh"
+    [ -f "$_nu_s" ] && [ ! -L "$_nu_s" ] || { NU_BAD=script; return 1; }
+    [ "$(stat -c %u "$_nu_s" 2>/dev/null)" = "$_nu_uid" ] || { NU_BAD=script-owner; return 1; }
+    return 0
+}
+
+# nu_render — the unit: byte for byte noo-cli's netns_unit::render for a
+# non-root owner (tests/test_netns_unit_apply.py holds them equal).
+nu_render() {
+    printf '%s\n' \
+        "[Unit]" \
+        "Description=noomesh: start the containers that join another's network after dockerd starts" \
+        "After=docker.service" \
+        "PartOf=docker.service" \
+        "" \
+        "[Service]" \
+        "Type=oneshot" \
+        "RemainAfterExit=yes" \
+        "User=$NU_USER" \
+        "ExecStart=/bin/bash \"$NU_ROOT/scripts/noo-netns-restore.sh\"" \
+        "" \
+        "[Install]" \
+        "WantedBy=docker.service"
+}
+
+# nu_same INSTALLED CANDIDATE — bytes, mode 644 and owner (config_unchanged).
+nu_same() {
+    if [ -n "$NU_STAT_OWNER" ]; then
+        config_unchanged "$2" "$1" 644 "$NU_STAT_OWNER"
+    else
+        [ -f "$1" ] && cmp -s "$2" "$1"
+    fi
+}
+
+# netns_unit_apply PAYLOAD — render, compare, install on a change, enable.
+netns_unit_apply() {
+    # No systemd (a container without it as PID 1): nothing to install;
+    # noo-hostd's boot-restore runs the script at boot there.
+    if [ ! -d "${NU_SYSTEMD_DIR:-/run/systemd/system}" ]; then
+        applied="$applied netns-unit=no-systemd"
+        return 0
+    fi
+    if ! nu_parse "$1" || ! nu_user_ok || ! nu_root_ok; then
+        echo "noo-apply: netns-unit: REFUSED — $NU_BAD is not a value the unit may carry; $NETNS_UNIT_NAME is left as it was" >&2
+        logger -t noo-apply "REFUSED netns-unit: $NU_BAD" 2>/dev/null || true
+        applied="$applied netns-unit=REFUSED:$NU_BAD"
+        return 0
+    fi
+    _nu_tmp="$(mktemp)"
+    nu_render > "$_nu_tmp"
+    if nu_same "$NETNS_UNIT" "$_nu_tmp" && systemctl is-enabled --quiet "$NETNS_UNIT_NAME" 2>/dev/null; then
+        rm -f -- "$_nu_tmp"
+        applied="$applied netns-unit=unchanged"
+        return 0
+    fi
+    if ! nu_same "$NETNS_UNIT" "$_nu_tmp"; then
+        # shellcheck disable=SC2086
+        install -m 644 $NU_OWNER_ARGS "$_nu_tmp" "$NETNS_UNIT"
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+    rm -f -- "$_nu_tmp"
+    if ! systemctl enable "$NETNS_UNIT_NAME" >/dev/null 2>&1; then
+        echo "noo-apply: netns-unit: $NETNS_UNIT_NAME is installed but systemctl enable failed" >&2
+        applied="$applied netns-unit=NOT-ENABLED"
+        return 0
+    fi
+    applied="$applied netns-unit"
+}
+
+# netns_unit_remove — teardown: disable, delete, reload.
+netns_unit_remove() {
+    [ -e "$NETNS_UNIT" ] || return 0
+    systemctl disable "$NETNS_UNIT_NAME" >/dev/null 2>&1 || true
+    rm -f -- "${NETNS_UNIT:?}"
+    systemctl daemon-reload 2>/dev/null || true
+}
+# END netns_unit
+
 # ── teardown — the graceful, controller-initiated node destroy ─────────────
 # A signed `teardown` kind means "return this node to never-met-the-fleet".
 # It runs the local de-enroll — but that script deletes noo-apply itself,
@@ -1179,6 +1937,8 @@ if [ -f "$WORK/files/teardown" ]; then
         echo "noo-apply: teardown requested but $DEENROLL is not installed" >&2
         exit 69
     fi
+    netns_unit_remove
+    agent_protect_remove
     harness_egress_remove
     logger -t noo-apply "teardown authorized (node=$have) — dismantling in 5s, detached" 2>/dev/null || true
     echo "applied: teardown ($have) — node will dismantle itself in ~5s"
@@ -1406,7 +2166,7 @@ grant_traverse_flush_missing() {
 # preseeds into HF_CACHE_DIR/hub). On a fresh controller the onboard storage
 # step made hub BEFORE prep-host created noo-agent, so it stayed 0:0 while
 # prep-host re-owned hf-cache to noo-agent: the agent could not write the
-# weights (pop-os since 2026-09-07, a root-owned hub WITH content whose
+# weights (ctrl since 2026-09-07, a root-owned hub WITH content whose
 # snapshots/ are relative symlinks into ../../blobs). This root applier
 # repairs exactly that, and nothing else:
 #   a. the target is "$HF_CACHE_DIR/hub", HF_CACHE_DIR from the staged
@@ -1858,6 +2618,9 @@ if [ -f "$WORK/files/agent-env" ]; then
     hf_hub_reown "$(grep -E '^NOO_DATA_ROOT=' "$WORK/files/agent-env" | tail -1 | cut -d= -f2-)" \
         "$(grep -E '^HF_CACHE_DIR=' "$WORK/files/agent-env" | tail -1 | cut -d= -f2-)"
     applied="$applied $ae_state"
+    # The agent's filesystem hold, from the same staged env (agent_protect).
+    # A change sets need_restart: the one agent restart at the end.
+    agent_protect_apply "$WORK/files/agent-env"
 fi
 
 # nats-creds — the node's OWN NATS credential. Applied AFTER
@@ -2039,7 +2802,7 @@ fi
 # The retired container era's compose env (i95). `noo cluster push-secrets`
 # once wrote the fleet credentials to ~/pai-assistant/.env; the agent reads
 # /etc/noo-node-agent.env and nothing reads the old file, but it still held
-# NOO_CLUSTER_SECRET, NOO_NODE_AGENT_TOKEN and the NATS pair at 0644 (robopi,
+# NOO_CLUSTER_SECRET, NOO_NODE_AGENT_TOKEN and the NATS pair at 0644 (node-pi,
 # found 2026-09-05). Every bundle that carries the CLI names the node's user,
 # so the next upgrade removes it. AS THE USER, like the CLI install above:
 # root must not follow a symlink planted in a user's tree. Only a regular file
@@ -2178,6 +2941,13 @@ if [ -f "$WORK/files/host-telemetry" ]; then
     host_telemetry_payload_ok "$WORK/files/host-telemetry" "$NODE_ID" || exit $?
     host_telemetry_apply || exit $?
     applied="$applied host-telemetry"
+fi
+
+# netns-unit — see netns_unit: the controller's self-node renders
+# noo-netns-restore.service from its own template; the kind carries only the
+# install owner and root, judged there.
+if [ -f "$WORK/files/netns-unit" ]; then
+    netns_unit_apply "$WORK/files/netns-unit"
 fi
 
 # agent-unit — first install is what turns a prepped host into a NODE
@@ -2392,6 +3162,8 @@ if [ -f /etc/noo-harness.env ] && id -u noo-harness >/dev/null 2>&1; then
         noo-harness "" "$HARNESS_SECRET_KEYS" "$HARNESS_SECRET_CAPABILITY" || exit $?
     if [ "$ASF_CHANGED" = 1 ]; then need_harness_restart=1; fi
 fi
+# Every install above succeeded: raise the release floor to what §1c verified.
+release_floor_write "$RELEASE_OK_VERSION" "$RELEASE_OK_STACK"
 logger -t noo-apply "applied:$applied (node=$NODE_ID, verified-by=$SIG_VIA)" 2>/dev/null || true
 echo "applied:$applied"
 echo "verified-by: $SIG_VIA"
@@ -2515,5 +3287,8 @@ case " $binary_shas " in
         ;;
 esac
 # END report_installed_binaries
+# The release check's state (i908), for `noo cluster verify`'s `release check`
+# row: this applier's generation and the floor it now holds.
+echo "release-check: generation=$NOO_APPLY_GENERATION release=$(release_floor_of release-final | grep . || echo none) release-prev=$(release_floor_of release-prev | grep . || echo none) stack=$(release_floor_of stack-final | grep . || echo none) stack-prev=$(release_floor_of stack-prev | grep . || echo none) verifier=${RELEASE_VERIFIER:-none}"
 # Last line of the apply, so the fetcher's tail of this log always carries it.
 [ -z "$binary_shas" ] || echo "binary-sha:$binary_shas"

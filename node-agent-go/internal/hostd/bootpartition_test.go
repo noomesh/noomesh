@@ -30,7 +30,7 @@ const (
 // The incident layout: ESP full, 7.1.5's initramfs is outsized and its ESP
 // copy is truncated, its DKMS modules are uncompressed while 7.0.11's are not.
 func incidentTree(t *testing.T) string {
-	root, _ := popOSAfterRecovery(t)
+	root, _ := ctrlAfterRecovery(t)
 	efi := "boot/efi/EFI/host8-0123abcd"
 	// Make 7.1.5 the kernelstub default (its EFI copy), 7.0.11 the previous.
 	write(t, root, efi+"/vmlinuz.efi", "kernel 7.1.5")

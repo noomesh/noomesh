@@ -1107,9 +1107,9 @@ pub(crate) async fn write_audit_row_outcome(
 }
 
 /// Now, as `timestamptz` will store it: whole microseconds.
-pub(crate) fn stored_now() -> chrono::DateTime<chrono::Utc> {
-    let us = chrono::Utc::now().timestamp_micros();
-    chrono::DateTime::from_timestamp_micros(us).expect("now is in range")
+pub(crate) fn stored_now() -> jiff::Timestamp {
+    let us = jiff::Timestamp::now().as_microsecond();
+    jiff::Timestamp::from_microsecond(us).expect("now is in range")
 }
 
 /// Insert one fully-formed, already-signed row, healing a missing partition
@@ -1121,7 +1121,7 @@ pub(crate) fn stored_now() -> chrono::DateTime<chrono::Utc> {
 pub(crate) async fn insert_signed_audit_row(
     db: &sqlx::PgPool,
     id: &str,
-    ts: chrono::DateTime<chrono::Utc>,
+    ts: jiff::Timestamp,
     event_type: &str,
     severity: &str,
     actor: &str,
@@ -1383,6 +1383,6 @@ mod tests {
     fn the_writer_stamps_whole_microseconds() {
         // The hashed time is the stored time: timestamptz keeps microseconds.
         let t = stored_now();
-        assert_eq!(t.timestamp_subsec_nanos() % 1_000, 0);
+        assert_eq!(t.subsec_nanosecond() % 1_000, 0);
     }
 }

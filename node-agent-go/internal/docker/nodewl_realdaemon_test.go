@@ -18,7 +18,7 @@ import (
 // TestRealDaemonAcceptsTheWorkloadCreateSpecs sends the provisioner's three
 // create calls (network, door, worker) to a REAL Docker daemon and removes
 // what it made. Everything else in this package fakes the daemon, and a fake
-// accepts any option: on awolf (0.6.21) the first live create was refused
+// accepts any option: on node-a (0.6.21) the first live create was refused
 // with "invalid mount config for type tmpfs: invalid option: nosuid", which
 // no unit test could have seen.
 //

@@ -294,7 +294,7 @@ pub enum Plan {
     Rewritten { seq: i64 },
 }
 
-pub fn plan(db_seq: i64, db_hash: &str, last: Option<&SignedHead>, now: chrono::DateTime<chrono::Utc>) -> Plan {
+pub fn plan(db_seq: i64, db_hash: &str, last: Option<&SignedHead>, now: jiff::Timestamp) -> Plan {
     let Some(last) = last else { return Plan::Record };
     if db_seq < last.seq {
         return Plan::Regressed { exported: last.seq, db: db_seq };
@@ -303,8 +303,9 @@ pub fn plan(db_seq: i64, db_hash: &str, last: Option<&SignedHead>, now: chrono::
         if db_hash != last.chain_hash {
             return Plan::Rewritten { seq: db_seq };
         }
-        let age = chrono::DateTime::parse_from_rfc3339(&last.time)
-            .map(|t| now.signed_duration_since(t).num_seconds())
+        // Whole seconds, truncated toward zero (chrono's num_seconds did the same).
+        let age = crate::wire_time::parse_rfc3339(&last.time)
+            .map(|t| now.duration_since(t).as_secs())
             .unwrap_or(i64::MAX);
         return if age >= REFRESH_SECS { Plan::Record } else { Plan::Unchanged };
     }
@@ -337,11 +338,11 @@ pub async fn run_once(state: &AppState) -> anyhow::Result<()> {
         FileRead::Text(t) => parse(&t, &key).heads.into_iter().max_by_key(|h| h.seq),
         FileRead::Unreadable(e) => anyhow::bail!("cannot read {}: {e}", path.display()),
     };
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     match plan(seq, &hash, last.as_ref(), now) {
         Plan::Unchanged => Ok(()),
         Plan::Record => {
-            let head = SignedHead::sign(&key, seq, &hash, &now.to_rfc3339());
+            let head = SignedHead::sign(&key, seq, &hash, &crate::wire_time::rfc3339_offset(now));
             append(&path, &head).map_err(|e| anyhow::anyhow!("cannot append to {}: {e}", path.display()))?;
             publish(state, &head).await;
             Ok(())
@@ -383,7 +384,7 @@ async fn publish(state: &AppState, head: &SignedHead) {
         "detail": serde_json::to_string(head).unwrap_or_default(),
         "ref": crate::egress::new_ref(),
         "outcome": "recorded",
-        "ts": chrono::Utc::now().to_rfc3339(),
+        "ts": crate::wire_time::rfc3339_offset(jiff::Timestamp::now()),
     });
     if let Ok(bytes) = serde_json::to_vec(&payload) {
         if let Err(e) = state.js.publish(format!("events.ops.{EVENT_KIND}"), bytes.into()).await {
@@ -558,15 +559,29 @@ mod tests {
 
     #[test]
     fn the_exporter_never_writes_an_older_head_over_a_newer_one() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-10-19T04:05:00+00:00").unwrap().into();
+        let at = |s: &str| s.parse::<jiff::Timestamp>().unwrap();
+        let now = at("2026-10-19T04:05:00+00:00");
         let last = head(10, "h10");
         assert_eq!(plan(7, "h7", Some(&last), now), Plan::Regressed { exported: 10, db: 7 });
         assert_eq!(plan(10, "zzz", Some(&last), now), Plan::Rewritten { seq: 10 });
         assert_eq!(plan(10, "h10", Some(&last), now), Plan::Unchanged);
         assert_eq!(plan(11, "h11", Some(&last), now), Plan::Record);
         assert_eq!(plan(1, "h1", None, now), Plan::Record);
-        let next_day = chrono::DateTime::parse_from_rfc3339("2026-10-20T04:05:00+00:00").unwrap().into();
+        let next_day = at("2026-10-20T04:05:00+00:00");
         assert_eq!(plan(10, "h10", Some(&last), next_day), Plan::Record, "an unchanged head is re-recorded daily");
+        // The head was signed at 04:00:00: a day is up at 04:00:00 the next day.
+        let almost = at("2026-10-20T03:59:59.999+00:00");
+        assert_eq!(plan(10, "h10", Some(&last), almost), Plan::Unchanged, "not before a full day has passed");
+        assert_eq!(plan(10, "h10", Some(&last), at("2026-10-20T04:00:00+00:00")), Plan::Record, "a full day re-records");
+    }
+
+    /// The head's signed time keeps the `+00:00` text every earlier head
+    /// carries (wire_time pins the printer; this pins that it is the one used).
+    #[test]
+    fn a_new_head_signs_the_time_in_the_offset_form() {
+        let own = crate::test_src::own_code(include_str!("audit_head_export.rs"));
+        let body = crate::test_src::fn_body(&own, "pub async fn run_once(");
+        assert!(body.contains("SignedHead::sign(&key, seq, &hash, &crate::wire_time::rfc3339_offset(now))"));
     }
 
     #[test]

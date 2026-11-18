@@ -418,7 +418,7 @@ func (c *Config) HTTPTransport() (*http.Transport, error) {
 		// A bare &http.Transport{} keeps an idle connection forever, and
 		// several callers build one per request (the artifact manifest
 		// lookups, preseed.New), so each request left a connection open on
-		// both ends. On 2026-11-02 robopi's manifest retry loop held ~22 new
+		// both ends. On 2026-11-02 node-pi's manifest retry loop held ~22 new
 		// ones an hour on the controller until its gateway hit EMFILE.
 		// DefaultTransport's values: idle connections go after 90 s.
 		IdleConnTimeout:     ControllerIdleConnTimeout,

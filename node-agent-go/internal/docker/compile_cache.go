@@ -9,7 +9,7 @@ package docker
 // (Inductor) for the model graph and Triton for its attention kernels
 // (`jit_monitor.py`: "Triton kernel JIT compilation during inference:
 // kernel_unified_attention"). Each cache lived in the container layer
-// (`/root/.triton`, `/root/.cache/vllm`; `docker diff` on awolf), so a roll or
+// (`/root/.triton`, `/root/.cache/vllm`; `docker diff` on node-a), so a roll or
 // a restart paid the whole compile again on the first chat (~25 s).
 //
 // Where each one goes, read from the pinned versions (vLLM v0.25.0):

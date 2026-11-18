@@ -1018,6 +1018,47 @@ async fn workload_status(
 
 // ── the workload proxy ───────────────────────────────────────────────────
 
+/// The node-agent URL path for a workload's proxied request: the add-on's
+/// path is validated segment by segment and must stay under its container's
+/// proxy prefix.
+///
+/// - The container name is one plain segment.
+/// - Each path segment is plain: never `.` or `..`, no backslash, no control
+///   character. It is re-encoded (`percent_encode_segment`), so a decoded `?`,
+///   `#` or `/` stays data and cannot start a query, a fragment or a segment.
+/// - The URL is then parsed the way the request client parses it (dot
+///   segments resolved), and its path must still start with
+///   `/api/containers/<container>/proxy/`. A failure is a 400, never a request.
+pub(crate) fn workload_proxy_upstream(container: &str, path: &str, query: &str) -> Result<String, String> {
+    fn plain(seg: &str) -> bool {
+        seg != "." && seg != ".." && !seg.contains('\\') && !seg.chars().any(char::is_control)
+    }
+    if container.is_empty() || container.contains('/') || !plain(container) {
+        return Err(format!("the workload's container name '{container}' is not a single path segment"));
+    }
+    let container = crate::mcp_external::percent_encode_segment(container);
+    let mut segs = Vec::new();
+    for seg in path.trim_start_matches('/').split('/') {
+        if !plain(seg) {
+            return Err("the proxied path must be plain segments: no '.' or '..' segment, no backslash or control character".into());
+        }
+        segs.push(crate::mcp_external::percent_encode_segment(seg));
+    }
+    let prefix = format!("/api/containers/{container}/proxy/");
+    let upstream = format!("{prefix}{}{query}", segs.join("/"));
+    if !stays_under_prefix(&upstream, &prefix) {
+        return Err("the proxied path must stay under the workload's container proxy".into());
+    }
+    Ok(upstream)
+}
+
+/// Whether `upstream`, parsed the way the request client parses it (dot
+/// segments resolved), still has a path under `prefix`. An unparseable path
+/// does not.
+pub(crate) fn stays_under_prefix(upstream: &str, prefix: &str) -> bool {
+    reqwest::Url::parse(&format!("https://node.invalid{upstream}")).is_ok_and(|u| u.path().starts_with(prefix))
+}
+
 /// `/api/addon-workloads/{addon}/{workload}/proxy/{path}` (any method,
 /// WebSocket upgrades included): the add-on's own token (`addon:svc:<addon>`)
 /// or an operator reaches the RESERVED workload's container through the
@@ -1058,7 +1099,7 @@ async fn workload_proxy(
     }
     let link = crate::node_link::NodeLink::for_node(&state, &node).await?;
     let query = parts.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
-    let upstream = format!("/api/containers/{}/proxy/{}{query}", decl.container, path.trim_start_matches('/'));
+    let upstream = workload_proxy_upstream(&decl.container, &path, &query).map_err(AppError::BadRequest)?;
 
     if is_websocket_upgrade(&parts.headers) {
         // The relay dials the agent's address; the tunnel does not carry a
@@ -1329,7 +1370,7 @@ mod tests {
     }
 
     fn node(gc: Value) -> Value {
-        json!({"id": "awolf", "status": "online", "last_heartbeat": 1000.0, "vram_gb": 16, "gpu_contention": gc})
+        json!({"id": "node-a", "status": "online", "last_heartbeat": 1000.0, "vram_gb": 16, "gpu_contention": gc})
     }
 
     // ── i300 node workloads (H4) ──────────────────────────────────────────
@@ -1515,12 +1556,12 @@ mod tests {
     #[test]
     fn a_reservation_is_read_from_the_nodes_lease() {
         let rec = json!({"gpu_contention": {"state": "held", "total_mb": 16376, "paused_backends": ["vllm"],
-            "lease": {"operation_id": "res-1", "owner": "rbwolf", "workload": "pai-voice/voice-worker", "generation": 3, "since": "t", "mode": "drain", "reason": "reservation pai-voice/voice-worker"}}});
-        let r = reservation_of("awolf", &rec).unwrap();
+            "lease": {"operation_id": "res-1", "owner": "owner", "workload": "pai-voice/voice-worker", "generation": 3, "since": "t", "mode": "drain", "reason": "reservation pai-voice/voice-worker"}}});
+        let r = reservation_of("node-a", &rec).unwrap();
         assert_eq!(r["id"], "res-1");
         assert_eq!(r["workload"], "pai-voice/voice-worker");
-        assert_eq!(r["holder"], "rbwolf");
-        assert_eq!(r["node"], "awolf");
+        assert_eq!(r["holder"], "owner");
+        assert_eq!(r["node"], "node-a");
         assert_eq!(r["generation"], 3);
         assert_eq!(r["paused_backends"], json!(["vllm"]));
         assert!(reservation_of("x", &json!({"gpu_contention": {"state": "free"}})).is_none());
@@ -1534,7 +1575,7 @@ mod tests {
 
     #[test]
     fn a_not_declared_start_is_a_retryable_503_and_other_failures_say_why() {
-        match start_failure("rhaddon/rhworker", "awolf", "not_declared (404): no such workload", true) {
+        match start_failure("rhaddon/rhworker", "node-a", "not_declared (404): no such workload", true) {
             AppError::UnavailableRetry { code, detail, retry_after_secs } => {
                 assert_eq!(code, "node_workloads_not_loaded");
                 assert!(detail.contains("has not loaded its workload declarations yet; retry"), "{detail}");
@@ -1596,15 +1637,15 @@ mod tests {
     /// The record the hold write-back produces yields the new lease at once.
     #[test]
     fn a_merged_record_lists_the_new_lease_and_a_release_clears_it() {
-        let rec = json!({"id": "awolf", "status": "online", "gpu_contention": {"state": "free", "total_mb": 16376}});
+        let rec = json!({"id": "node-a", "status": "online", "gpu_contention": {"state": "free", "total_mb": 16376}});
         let held = super::super::cluster::with_contention(rec, json!({"state": "held", "total_mb": 16376, "paused_backends": ["vllm"],
             "lease": {"operation_id": "op-7", "owner": "op", "workload": "pai-voice/voice-worker", "generation": 3}}));
-        let r = reservation_of("awolf", &held).expect("the new lease is a reservation");
+        let r = reservation_of("node-a", &held).expect("the new lease is a reservation");
         assert_eq!(r["id"], "op-7");
         assert_eq!(r["generation"], 3);
         assert_eq!(r["state"], "held");
         let freed = super::super::cluster::with_contention(held, json!({"state": "free", "total_mb": 16376}));
-        assert!(reservation_of("awolf", &freed).is_none());
+        assert!(reservation_of("node-a", &freed).is_none());
     }
 
     /// Source test: the reservation routes are operator-gated and audited;
@@ -1641,7 +1682,7 @@ mod tests {
     /// workload, never `{}` handed to the caller as the agent's answer.
     #[tokio::test]
     async fn a_cut_off_actuator_answer_is_an_error_not_an_empty_object() {
-        let link = crate::node_link::NodeLink::for_base(&crate::upstream_body::stub_cut_short().await);
+        let link = crate::node_link::NodeLink::for_test_base(&crate::upstream_body::stub_cut_short().await);
         let e = actuator(&link, &decl(true, 1), "/start", json!({}), 5).await.unwrap_err();
         assert!(e.starts_with("the voice-worker workload actuator answered HTTP 200 but its body could not be read"), "{e}");
     }
@@ -1655,18 +1696,18 @@ mod tests {
         let rec = json!({"node_workloads": [
             {"addon": "rhaddon", "name": "rhworker", "state": "provisioned", "ready": false, "door_port": 0, "reason": "door_leaf_missing"},
             {"addon": "rhaddon", "name": "rhok", "state": "provisioned", "ready": false, "door_port": 7001}]});
-        match node_workload_refusal(&rec, "rhaddon", "rhworker", "awolf") {
+        match node_workload_refusal(&rec, "rhaddon", "rhworker", "node-a") {
             Some(AppError::Conflict(m)) => {
                 assert!(m.starts_with("door_leaf_missing: "), "the agent's reason leads: {m}");
                 assert!(m.contains("nothing was held"), "{m}");
             }
             other => panic!("door_leaf_missing must refuse with the agent's reason, got {other:?}"),
         }
-        assert!(node_workload_refusal(&rec, "rhaddon", "rhok", "awolf").is_none(), "a clean provisioned row may start");
+        assert!(node_workload_refusal(&rec, "rhaddon", "rhok", "node-a").is_none(), "a clean provisioned row may start");
         let attn = json!({"node_workloads": [{"addon": "rhaddon", "name": "rhworker", "state": "needs_attention", "ready": false, "door_port": 0}]});
-        assert!(matches!(node_workload_refusal(&attn, "rhaddon", "rhworker", "awolf"), Some(AppError::Conflict(m)) if m.starts_with("needs_attention: ")));
-        for rec in [json!({"node_workloads": []}), json!({"id": "awolf"})] {
-            match node_workload_refusal(&rec, "rhaddon", "rhworker", "awolf") {
+        assert!(matches!(node_workload_refusal(&attn, "rhaddon", "rhworker", "node-a"), Some(AppError::Conflict(m)) if m.starts_with("needs_attention: ")));
+        for rec in [json!({"node_workloads": []}), json!({"id": "node-a"})] {
+            match node_workload_refusal(&rec, "rhaddon", "rhworker", "node-a") {
                 Some(AppError::UnavailableRetry { code, .. }) => assert_eq!(code, "node_workloads_not_loaded"),
                 other => panic!("no row is not yet provisioned (retry), got {other:?}"),
             }
@@ -1725,32 +1766,32 @@ mod tests {
         let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", dead.local_addr().unwrap());
         drop(dead);
-        let link = crate::node_link::NodeLink::for_base(&base);
+        let link = crate::node_link::NodeLink::for_test_base(&base);
         let d = managed_decl("rhaddon", &nw_decl(), 0);
         let rec = json!({"node_workloads": [{"addon": "rhaddon", "name": d.name.clone(), "state": "provisioned", "ready": false, "door_port": 0, "reason": "door_leaf_missing"}]});
-        let free = Managed { node: "awolf".into(), free: true };
-        let e = preflight(&link, &d, Some(&free), &rec, &d.key(), "awolf").await.unwrap_err();
+        let free = Managed { node: "node-a".into(), free: true };
+        let e = preflight(&link, &d, Some(&free), &rec, &d.key(), "node-a").await.unwrap_err();
         assert!(e.to_string().starts_with("door_leaf_missing: "), "{e}");
-        let held = Managed { node: "awolf".into(), free: false };
+        let held = Managed { node: "node-a".into(), free: false };
         let clean = json!({"node_workloads": [{"addon": "rhaddon", "name": d.name.clone(), "state": "provisioned", "ready": false, "door_port": 1}]});
-        let e = preflight(&link, &d, Some(&held), &clean, &d.key(), "awolf").await.unwrap_err();
+        let e = preflight(&link, &d, Some(&held), &clean, &d.key(), "node-a").await.unwrap_err();
         assert!(e.to_string().contains("already reserved"), "{e}");
-        assert!(preflight(&link, &d, Some(&free), &clean, &d.key(), "awolf").await.is_ok(), "a free, clean row passes without a call");
+        assert!(preflight(&link, &d, Some(&free), &clean, &d.key(), "node-a").await.is_ok(), "a free, clean row passes without a call");
     }
 
     /// An i163 workload: the agent's status (a read) answers before the hold.
     #[tokio::test]
     async fn an_i163_workload_the_agent_does_not_declare_is_refused_before_the_hold() {
-        let link = crate::node_link::NodeLink::for_base(&crate::upstream_body::stub("404 Not Found", None, b"{\"error\":\"not_declared\",\"detail\":\"no bundle\"}").await);
-        match preflight(&link, &decl(true, 1), None, &json!({}), "rhaddon/rhworker", "awolf").await {
+        let link = crate::node_link::NodeLink::for_test_base(&crate::upstream_body::stub("404 Not Found", None, b"{\"error\":\"not_declared\",\"detail\":\"no bundle\"}").await);
+        match preflight(&link, &decl(true, 1), None, &json!({}), "rhaddon/rhworker", "node-a").await {
             Err(AppError::UnavailableRetry { code, detail, .. }) => {
                 assert_eq!(code, "node_workloads_not_loaded");
                 assert!(detail.contains("nothing was held"), "{detail}");
             }
             other => panic!("not_declared before the hold is a retry, got {other:?}"),
         }
-        let link = crate::node_link::NodeLink::for_base(&crate::upstream_body::stub("404 Not Found", None, b"{\"error\":\"no_container\",\"detail\":\"gone\"}").await);
-        let e = preflight(&link, &decl(true, 1), None, &json!({}), "rhaddon/rhworker", "awolf").await.unwrap_err();
+        let link = crate::node_link::NodeLink::for_test_base(&crate::upstream_body::stub("404 Not Found", None, b"{\"error\":\"no_container\",\"detail\":\"gone\"}").await);
+        let e = preflight(&link, &decl(true, 1), None, &json!({}), "rhaddon/rhworker", "node-a").await.unwrap_err();
         assert!(matches!(&e, AppError::Conflict(m) if m.starts_with("no_container (404)")), "{e:?}");
     }
 
@@ -1796,21 +1837,21 @@ mod tests {
         assert_eq!((r["id"].as_str(), r["workload"].as_str(), r["holder"].as_str(), r["node"].as_str(), r["state"].as_str()),
             (Some("r-cpu"), Some("rhaddon/echo"), Some("alice"), Some("rhx-node2"), Some("held")));
         assert_eq!((r["gpu"].as_bool(), r["source"].as_str(), r["generation"].as_u64()), (Some(false), Some("placement"), Some(0)));
-        let lease = lease_res("r-gpu", "rhaddon/rhworker", "awolf");
+        let lease = lease_res("r-gpu", "rhaddon/rhworker", "node-a");
         assert_eq!((lease["gpu"].as_bool(), lease["source"].as_str()), (Some(true), Some("lease")));
     }
 
     #[test]
     fn the_merged_list_never_reports_one_reservation_twice() {
         // A GPU workload: its lease AND its row carry the same id: once.
-        let gpu = merge_reservations(vec![lease_res("r1", "rhaddon/rhworker", "awolf")],
-            &[held_row("r1", "rhaddon", "rhworker", "awolf", Some("alice"))]);
+        let gpu = merge_reservations(vec![lease_res("r1", "rhaddon/rhworker", "node-a")],
+            &[held_row("r1", "rhaddon", "rhworker", "node-a", Some("alice"))]);
         assert_eq!(gpu.len(), 1);
         assert_eq!(gpu[0]["source"], "lease");
         // The same, with the row as a pre-124 gateway left it (holder and
         // reserved_at NULL): still the lease's, listed once, with its owner.
-        let old = merge_reservations(vec![lease_res("r1", "rhaddon/rhworker", "awolf")],
-            &[crate::repo::node_workload_placements::Held { reserved_at: None, ..held_row("r1", "rhaddon", "rhworker", "awolf", None) }]);
+        let old = merge_reservations(vec![lease_res("r1", "rhaddon/rhworker", "node-a")],
+            &[crate::repo::node_workload_placements::Held { reserved_at: None, ..held_row("r1", "rhaddon", "rhworker", "node-a", None) }]);
         assert_eq!(old.len(), 1, "{old:?}");
         assert_eq!((old[0]["source"].as_str(), old[0]["holder"].as_str(), old[0]["gpu"].as_bool()), (Some("lease"), Some("alice"), Some(true)));
         // gpu-0 -> GPU on one node: the old CPU row (r-a, no lease) and the new
@@ -1875,4 +1916,61 @@ mod tests {
         assert!(rel.contains("if r[\"source\"] == \"placement\" \u{7b}") && rel.contains("\"release\","), "only a row-held reservation skips the GPU release");
     }
 
+
+    // The add-on workload proxy path is validated segment by segment and must
+    // stay under its container's proxy prefix: one test per check.
+
+    #[test]
+    fn a_plain_workload_path_is_forwarded_under_its_container_proxy() {
+        assert_eq!(
+            workload_proxy_upstream("coord-1", "/v1/chat/completions", "?stream=1").unwrap(),
+            "/api/containers/coord-1/proxy/v1/chat/completions?stream=1"
+        );
+    }
+
+    #[test]
+    fn a_workload_container_name_must_be_one_plain_segment() {
+        for bad in ["", "a/b", "..", "."] {
+            assert!(workload_proxy_upstream(bad, "x", "").is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_workload_path_may_not_hold_a_dot_or_dot_dot_segment() {
+        for bad in ["../x", "a/../../b", "./x", "a/."] {
+            assert!(workload_proxy_upstream("c", bad, "").is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_workload_path_may_not_hold_a_backslash() {
+        assert!(workload_proxy_upstream("c", "a\\..\\b", "").is_err());
+    }
+
+    #[test]
+    fn a_workload_path_may_not_hold_a_control_character() {
+        assert!(workload_proxy_upstream("c", "a\nb", "").is_err());
+        assert!(workload_proxy_upstream("c", "a\u{0}b", "").is_err());
+    }
+
+    #[test]
+    fn a_workload_path_segment_is_re_encoded_so_it_stays_data() {
+        assert_eq!(workload_proxy_upstream("c", "a?b/c#d/e%f", "").unwrap(), "/api/containers/c/proxy/a%3Fb/c%23d/e%25f");
+    }
+
+    #[test]
+    fn a_resolved_path_must_still_sit_under_the_container_proxy_prefix() {
+        let prefix = "/api/containers/c/proxy/";
+        assert!(stays_under_prefix("/api/containers/c/proxy/v1/x", prefix));
+        assert!(!stays_under_prefix("/api/containers/c/proxy/../../x", prefix));
+        assert!(!stays_under_prefix("/api/containers/c/proxy/%2e%2e/%2e%2e/x", prefix));
+        assert!(!stays_under_prefix("/elsewhere", prefix));
+    }
+
+    #[test]
+    fn the_workload_proxy_forwards_only_the_validated_upstream() {
+        let own = crate::test_src::own_code(include_str!("reservations.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn workload_proxy(");
+        assert!(body.contains("let upstream = workload_proxy_upstream(&decl.container, &path, &query).map_err(AppError::BadRequest)?;"), "the proxy must build its upstream through the validator");
+    }
 }

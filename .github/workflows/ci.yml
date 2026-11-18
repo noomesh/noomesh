@@ -316,7 +316,12 @@ jobs:
         while IFS= read -r f; do
           [ -n "$f" ] || continue
           case "$f" in
-            docs/*|internal/*|*.md)   ;;
+            # docs/ and README.md arm the CLI lane: its unit tests hold every
+            # documented `noo …` line to the CLI's own usage table
+            # (hint_lint::every_documented_command_parses, noomesh#1320). A
+            # docs-only change ran none of them before, PR or merge queue.
+            docs/*|README.md)         cli=true ;;
+            internal/*|*.md)          ;;
             # The gateway also owns the sqlx offline data and the mesh
             # migrations that sqlx-drift diffs against Alembic.
             gateway-rust/*)           gateway=true; sqlx=true; ui=true ;;
@@ -583,7 +588,7 @@ jobs:
         # queue run (operator, 2026-11-11).
         pytest tests/ -v -n auto --dist worksteal --durations=50 --durations-min=1 "${args[@]}"
 
-    # The sandbox jail as it runs in a container (pop-os, 0.6.13): Docker
+    # The sandbox jail as it runs in a container (ctrl, 0.6.13): Docker
     # masks paths under every container's /proc, the kernel then refuses a
     # fresh procfs inside the call's user namespace, and a jail that asked
     # for one refused every call. A hosted runner's /proc has no masks, so
@@ -608,6 +613,22 @@ jobs:
         # Proof it ran and passed, not merely exited 0.
         grep -E '^PASSED tests/test_sandbox_exec_isolation.py::test_bwrap_live_runs_and_proves_its_isolation_under_dockers_proc_masks' "$log" \
           || { echo "::error::the masked-/proc sandbox test did not report PASSED"; exit 1; }
+
+    - name: The node agent's protect drop-in holds on real systemd (sudo)
+      run: |
+        # proposal 61 phase 0b: the drop-in the applier renders, handed to a
+        # real systemd (PID 1 on the hosted runner): the agent's state dir, a
+        # data root and a data root under /home are writable; /etc, /usr and
+        # an undeclared /var path are EROFS; Docker's socket still answers.
+        # Missing sudo or systemd is a FAIL, never a skip.
+        sudo -n true || { echo "::error::no passwordless sudo: the protect drop-in proof cannot run"; exit 1; }
+        [ -d /run/systemd/system ] || { echo "::error::systemd is not PID 1 here: the protect drop-in proof cannot run"; exit 1; }
+        log="$RUNNER_TEMP/agent-protect-systemd.log"
+        set -o pipefail
+        sudo -n -E env "PATH=$PATH" "$(command -v python)" -m pytest -rA -p no:cacheprovider \
+          tests/test_agent_protect_apply.py -k "really_holds_the_agent" 2>&1 | tee "$log"
+        grep -E '^PASSED tests/test_agent_protect_apply.py::test_the_rendered_drop_in_really_holds_the_agent_to_its_paths' "$log" \
+          || { echo "::error::the protect drop-in proof did not report PASSED"; exit 1; }
 
     # Coverage is a BUILD ARTIFACT, not a third-party upload (visible per run,
     # no token, no network call that can take a green run down), and since
@@ -663,7 +684,23 @@ jobs:
         go vet ./...
         go test ./...
 
-    # mcmini is a real darwin node: the darwin agent and its test files must
+    # The node's declarations file is root's (mode 644) and the agent reads it
+    # as its own unprivileged user: proven here by reading as a uid that does
+    # NOT own it (the test re-runs itself as uid 65534; it needs root to do
+    # that). Missing sudo is a FAIL, never a skip.
+    - name: The node-local declarations file is read as a non-owner uid (sudo)
+      if: needs.scope.outputs.code == 'true'
+      run: |
+        sudo -n true || { echo "::error::no passwordless sudo: the node-local non-owner read cannot be proven"; exit 1; }
+        go test -c -o /tmp/nodelocal.test ./internal/nodelocal/
+        chmod 755 /tmp/nodelocal.test
+        log="$RUNNER_TEMP/nodelocal-uid.log"
+        set -o pipefail
+        sudo -n /tmp/nodelocal.test -test.run '^TestTheAgentsUidReadsARootOwnedFile$' -test.v 2>&1 | tee "$log"
+        grep -E '^--- PASS: TestTheAgentsUidReadsARootOwnedFile' "$log" \
+          || { echo "::error::the node-local non-owner read did not report PASS"; exit 1; }
+
+    # node-mac is a real darwin node: the darwin agent and its test files must
     # build. Cross-compiled on Linux; `-exec /bin/true` compiles each test
     # binary without running it (a darwin binary cannot run here).
     - name: Build and vet for darwin (compile-only tests)
@@ -2185,21 +2222,42 @@ jobs:
   # fails anything; cargo-deny reads the RustSec database directly and fails on
   # every vulnerability in Cargo.lock. Each crate's deny.toml carries the
   # explicit, commented ignore list (rsa: verify-only, no fix upstream).
-  rust-advisories:
+  # Two jobs, not a matrix, and named exactly as the matrix legs were. A PR
+  # opened with the `full-ci` label fires `opened` and `labeled` together; the
+  # PR concurrency group above lets the second run cancel the first. A matrix
+  # job cancelled before it splits leaves ONE check named plain
+  # `rust-advisories`, and no check in the surviving run carries that name, so
+  # the PR's rollup kept a CANCELLED entry beside both green legs and the
+  # enqueue rule (cancelled refuses) blocked it. Every other job keeps its name
+  # in both runs, so the later run's result replaces it. tests/
+  # test_ci_no_matrix_parent.py keeps ci.yml matrix-free.
+  rust-advisories-gateway:
+    name: rust-advisories (gateway-rust)
     runs-on: ubuntu-latest
     needs: preflight
-    strategy:
-      fail-fast: false
-      matrix:
-        crate: [gateway-rust, noo-cli]
     steps:
 
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-    - name: cargo-deny check advisories (${{ matrix.crate }})
+    - name: cargo-deny check advisories (gateway-rust)
       uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25   # v2.1.1
       with:
-        manifest-path: ${{ matrix.crate }}/Cargo.toml
+        manifest-path: gateway-rust/Cargo.toml
+        command: check advisories
+        log-level: warn
+
+  rust-advisories-noo-cli:
+    name: rust-advisories (noo-cli)
+    runs-on: ubuntu-latest
+    needs: preflight
+    steps:
+
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+    - name: cargo-deny check advisories (noo-cli)
+      uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25   # v2.1.1
+      with:
+        manifest-path: noo-cli/Cargo.toml
         command: check advisories
         log-level: warn
 

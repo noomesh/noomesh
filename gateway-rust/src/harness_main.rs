@@ -147,7 +147,7 @@ fn stalled_tasks(
 /// translator), it leaves the running set, and the node tells the gateway
 /// on `harness.ready.<node>` with `stalled`, which fails it with the reason.
 /// Without this a wedged task held its permit until an operator stopped it
-/// (two dead tasks held mcmini's both permits for fifteen hours).
+/// (two dead tasks held node-mac's both permits for fifteen hours).
 fn spawn_stall_watchdog(
     nats: async_nats::Client,
     node: String,
@@ -424,7 +424,7 @@ pub async fn run() -> Result<()> {
                 // when idle. Taking EVERY permit proves nothing runs and
                 // keeps anything from starting; the service manager
                 // (Restart=always) brings the harness back with the new
-                // value (i658: awolf ran a whole day on a default it had
+                // value (i658: node-a ran a whole day on a default it had
                 // already been told to change). Busy: try again next minute.
                 if idle_moved {
                     if !self_restart_allowed(started_at.elapsed()) {
@@ -837,7 +837,14 @@ pub(crate) async fn fetch_placement(client: &reqwest::Client, agent_url: &str) -
     let mut u = reqwest::Url::parse(agent_url.trim())?;
     u.set_path("");
     u.set_query(None);
-    let req = crate::node_link::NodeLink::for_base(u.as_str().trim_end_matches('/'))
+    // The agent's link goes through the agent_url rule (https only). The
+    // tests stand in a plain-HTTP fake agent, so under test only the link is
+    // built without the rule (`for_test_base`, never in production code).
+    #[cfg(not(test))]
+    let link = crate::node_link::NodeLink::for_base(u.as_str().trim_end_matches('/'));
+    #[cfg(test)]
+    let link = crate::node_link::NodeLink::for_test_base(u.as_str().trim_end_matches('/'));
+    let req = link
         .request_on(client, reqwest::Method::GET, "/harness/placement")
         .timeout(Duration::from_secs(10));
     let resp = req.send().await.map_err(|e| anyhow!("GET /harness/placement: {e}"))?;

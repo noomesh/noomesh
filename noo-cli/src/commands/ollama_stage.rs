@@ -456,6 +456,194 @@ pub(crate) fn stage(
     })
 }
 
+// ── The record of a pull ────────────────────────────────────────────────
+//
+// `noo models pull <tag>` and onboard's first model pull a tag into the
+// controller's ollama; neither stages bytes in this store. What they leave is
+// a RECORD: the manifest that pull installed, verbatim, as
+// `<stem>.ollama-manifest` and no blob (a model layer is GBs, and the bytes
+// are in ollama's store already). It is written only when every entry of the
+// registry manifest fetched here (config and every layer) is in it with the
+// same digest and size, and it adds nothing but the manifest it pulled and the
+// list that named it (ollama 0.40 records those as blobs), the pulled-manifest
+// entry being the sha256 of the bytes fetched here: so every layer of the
+// record matches what the registry served at the pull. A tag that moved
+// between ollama's request and ours leaves no record, and says so.
+// Verify-on-load checks a model's local manifest and blobs against it: the
+// bytes equal what the registry served when this controller recorded the
+// pull, which is not proof that the registry served the right model. A placed node that would
+// import the tag finds no blobs and is told to stage them
+// (`noo models fetch ollama:<tag>`).
+
+/// What became of the record of one pull.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PullRecord {
+    /// Written (or already there, the same bytes) at this path.
+    Written(PathBuf),
+    /// Not a registry.ollama.ai tag (an `hf.co/…` ref): nothing to record.
+    NotRegistry,
+    /// This box has no controller model store: nothing recorded.
+    NoStore(String),
+    /// The registry's tag moved between ollama's request and ours: ollama
+    /// recorded a manifest (sha256 named) other than the bytes we fetched.
+    Moved(String),
+    /// The pull installed a manifest that is not the registry's: the entries
+    /// that differ, named. Nothing recorded.
+    Differs(String),
+    /// A step failed: nothing recorded.
+    Failed(String),
+}
+
+impl PullRecord {
+    /// The one line the operator is told; None for a ref that has no record.
+    pub(crate) fn line(&self) -> Option<String> {
+        match self {
+            PullRecord::Written(p) => Some(format!(
+                "recorded the pull in the controller's store ({}): verify-on-load checks this model's bytes against it",
+                p.display()
+            )),
+            PullRecord::NotRegistry => None,
+            PullRecord::NoStore(why) | PullRecord::Failed(why) => Some(format!("no controller record written: {why}")),
+            PullRecord::Moved(why) => Some(format!("no controller record written: {why}")),
+            PullRecord::Differs(why) => Some(format!("no controller record written: the pull installed a manifest that is not the registry's: {why}")),
+        }
+    }
+
+    pub(crate) fn written(&self) -> bool {
+        matches!(self, PullRecord::Written(_))
+    }
+}
+
+/// The registry manifest fetched before a pull, waiting for the pull.
+#[derive(Debug)]
+pub(crate) struct PendingRecord {
+    r: OllamaRef,
+    raw: Vec<u8>,
+    store: PathBuf,
+}
+
+/// Step one, BEFORE the pull: fetch the registry's manifest for `model` over
+/// HTTPS from here (never through the container), validated with the rules
+/// the node applies. A ref that is not on the registry, or a box with no
+/// store, is the answer itself.
+pub(crate) fn record_before_pull(base: &str, model: &str, store: &Path) -> Result<PendingRecord, PullRecord> {
+    let Ok(r) = parse_ref(model) else {
+        return Err(PullRecord::NotRegistry);
+    };
+    if !store.is_dir() {
+        return Err(PullRecord::NoStore(format!(
+            "this box has no controller model store ({}); pull on the controller to record it",
+            store.display()
+        )));
+    }
+    let raw = get_manifest(base, &r)
+        .and_then(|raw| check_manifest(&raw).map(|_| raw))
+        .map_err(|e| PullRecord::Failed(format!("the registry manifest: {e}")))?;
+    Ok(PendingRecord { r, raw, store: store.to_path_buf() })
+}
+
+/// The only entries an ollama adds to a pulled manifest's `layers`: the
+/// manifest it pulled (its digest is the sha256 of the registry's bytes) and,
+/// for some tags, the list that named it. Both are stored as blobs, so the
+/// node hashes them like any layer (ollama 0.40, 2026-11-18 probe).
+const PULL_MANIFEST_MEDIA: &str = "application/vnd.docker.distribution.manifest.v2+json";
+const PULL_EXTRA_MEDIA: [&str; 2] = [PULL_MANIFEST_MEDIA, "application/vnd.ollama.manifest.list.v2+json"];
+
+/// Every entry a manifest names (config first, then layers), as (mediaType,
+/// digest, size).
+fn manifest_entries(raw: &[u8]) -> Result<Vec<(String, String, u64)>, String> {
+    let m: Value = serde_json::from_slice(raw).map_err(|e| format!("not JSON: {e}"))?;
+    let entry = |v: &Value| -> Result<(String, String, u64), String> {
+        Ok((
+            v["mediaType"].as_str().unwrap_or("").to_string(),
+            v["digest"].as_str().ok_or("an entry has no digest")?.to_string(),
+            v["size"].as_u64().unwrap_or(0),
+        ))
+    };
+    let mut out = vec![entry(&m["config"]).map_err(|_| "no config digest".to_string())?];
+    for l in m["layers"].as_array().ok_or("no layers")? {
+        out.push(entry(l)?);
+    }
+    Ok(out)
+}
+
+fn short_entry((media, digest, _): &(String, String, u64)) -> String {
+    format!("{} {}", short_media(media), &digest[..digest.len().min(19)])
+}
+
+/// Step two, AFTER a pull that succeeded: `read_local` returns the manifest
+/// the ollama that pulled now holds for the tag. Its bytes are written as the
+/// record, replacing any older record of the tag, only when:
+///  1. every entry the FETCHED registry manifest names (config and every
+///     layer) is in it with the same digest and size;
+///  2. every entry it adds is one of [`PULL_EXTRA_MEDIA`];
+///  3. an added pulled-manifest entry, if any, is the sha256 of the bytes we
+///     fetched (else the tag moved between ollama's request and ours).
+/// The record is the installed manifest (the node compares its own with it
+/// both ways), and every layer of it matches what the registry served.
+pub(crate) fn record_after_pull(
+    pending: Result<PendingRecord, PullRecord>,
+    read_local: impl FnOnce(&OllamaRef) -> Result<Vec<u8>, String>,
+) -> PullRecord {
+    let p = match pending {
+        Ok(p) => p,
+        Err(answer) => return answer,
+    };
+    let local = match read_local(&p.r) {
+        Ok(b) => b,
+        Err(e) => return PullRecord::Failed(format!("the pulled manifest could not be read: {e}")),
+    };
+    let want = match manifest_entries(&p.raw) {
+        Ok(d) => d,
+        Err(e) => return PullRecord::Failed(format!("the registry manifest: {e}")),
+    };
+    let have = match manifest_entries(&local) {
+        Ok(d) => d,
+        Err(e) => return PullRecord::Failed(format!("the pulled manifest: {e}")),
+    };
+    let missing: Vec<String> = want.iter().filter(|e| !have.contains(e)).map(short_entry).collect();
+    let added: Vec<&(String, String, u64)> = have.iter().filter(|e| !want.contains(e)).collect();
+    let foreign: Vec<String> = added.iter().filter(|e| !PULL_EXTRA_MEDIA.contains(&e.0.as_str())).map(|e| short_entry(e)).collect();
+    if !missing.is_empty() || !foreign.is_empty() {
+        let mut why = Vec::new();
+        if !missing.is_empty() { why.push(format!("the registry names {} it lacks", missing.join(", "))); }
+        if !foreign.is_empty() { why.push(format!("it adds {}", foreign.join(", "))); }
+        return PullRecord::Differs(why.join("; "));
+    }
+    let fetched = format!("sha256:{}", hex::encode(Sha256::digest(&p.raw)));
+    if let Some(m) = added.iter().find(|e| e.0 == PULL_MANIFEST_MEDIA && e.1 != fetched) {
+        return PullRecord::Moved(format!(
+            "the registry's {} moved between ollama's request and ours (ollama installed manifest {}, the registry now serves {}); pull it again",
+            p.r.short(), &m.1[..m.1.len().min(19)], &fetched[..19]
+        ));
+    }
+    let name = format!("{}{MIRROR_MANIFEST_SUFFIX}", p.r.stem());
+    match install_bytes(&p.store, &name, &local) {
+        Ok(path) => PullRecord::Written(path),
+        Err(e) => PullRecord::Failed(format!("writing {name}: {e}")),
+    }
+}
+
+/// Where an ollama container keeps its store: the hardened image's, then the
+/// upstream image's (node-agent-go/internal/docker/ollama_store.go).
+const OLLAMA_CONTAINER_STORES: [&str; 2] = ["/home/nonroot/.ollama", "/root/.ollama"];
+
+/// The manifest `container`'s ollama holds for `r`, read inside it. ollama
+/// keeps the path lowercased, as the node does.
+pub(crate) fn read_container_manifest(container: &str, r: &OllamaRef) -> Result<Vec<u8>, String> {
+    let rel = format!("{}/{}/{}", r.ns, r.name, r.tag).to_ascii_lowercase();
+    let mut last = String::new();
+    for root in OLLAMA_CONTAINER_STORES {
+        let path = format!("{root}/models/manifests/registry.ollama.ai/{rel}");
+        match std::process::Command::new("docker").args(["exec", container, "cat", &path]).output() {
+            Ok(o) if o.status.success() => return Ok(o.stdout),
+            Ok(o) => last = String::from_utf8_lossy(&o.stderr).trim().to_string(),
+            Err(e) => return Err(format!("docker exec {container}: {e}")),
+        }
+    }
+    Err(format!("{container} holds no manifest for {} ({last})", r.short()))
+}
+
 // ── The command ─────────────────────────────────────────────────────────
 
 /// `application/vnd.ollama.image.projector` -> `projector`.
@@ -1098,6 +1286,177 @@ mod tests {
         assert!(e.to_string().contains("no library/gemma4:nope"), "{e}");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── The record of a pull ────────────────────────────────────────────
+
+    /// What ollama keeps after the pull: the same digests, its own layout.
+    fn pulled(manifest: &Value) -> Vec<u8> {
+        manifest.to_string().into_bytes()
+    }
+
+    #[test]
+    fn a_pull_whose_manifest_matches_is_recorded_verbatim_without_a_blob() {
+        let w = weight();
+        let (manifest, blobs) = model_fixture(&w);
+        let raw = pretty(&manifest);
+        let reg = serve_raw(raw.clone(), blobs, None, 8);
+        let dir = tmpdir("record-ok");
+        let pending = record_before_pull(&reg.base, "gemma4:12b", &dir);
+        let rec = record_after_pull(pending, |r| {
+            assert_eq!(r.stem(), "ollama+library+gemma4+12b");
+            Ok(pulled(&manifest))
+        });
+        assert_eq!(rec, PullRecord::Written(dir.join(MANIFEST)));
+        // The installed manifest (an ollama that adds nothing: conditions 1
+        // and 2 alone): the node compares its own with these bytes.
+        assert_eq!(std::fs::read(dir.join(MANIFEST)).unwrap(), pulled(&manifest));
+        assert_eq!(names(&dir), vec![MANIFEST.to_string()], "a record carries no blob");
+        assert_eq!(reg.blob_hits(), 0, "a record requests no blob");
+        assert!(rec.line().unwrap().contains("recorded the pull in the controller's store"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pull_whose_layer_differs_writes_no_record_and_names_the_entries() {
+        let w = weight();
+        let (manifest, blobs) = model_fixture(&w);
+        let reg = serve_raw(pretty(&manifest), blobs, None, 8);
+        let dir = tmpdir("record-differs");
+        // ollama installed a different model layer than the registry names.
+        let mut other = manifest.clone();
+        other["layers"][0] = layer_json(MODEL_MEDIA, b"GGUF the tag's next weights");
+        let rec = record_after_pull(record_before_pull(&reg.base, "gemma4:12b", &dir), |_| Ok(pulled(&other)));
+        assert!(matches!(rec, PullRecord::Differs(_)), "{rec:?}");
+        let line = rec.line().unwrap();
+        assert!(line.starts_with("no controller record written: the pull installed a manifest that is not the registry's: the registry names model sha256:"), "{line}");
+        assert!(line.contains("; it adds model sha256:"), "{line}");
+        assert!(!line.contains("run it again"), "the old misleading line: {line}");
+        assert!(names(&dir).is_empty(), "{:?}", names(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pull_record_replaces_an_older_record_of_the_tag() {
+        let w = weight();
+        let (manifest, blobs) = model_fixture(&w);
+        let raw = pretty(&manifest);
+        let reg = serve_raw(raw.clone(), blobs, None, 8);
+        let dir = tmpdir("record-replace");
+        std::fs::write(dir.join(MANIFEST), b"{\"old\":true}").unwrap();
+        let rec = record_after_pull(record_before_pull(&reg.base, "gemma4:12b", &dir), |_| Ok(pulled(&manifest)));
+        assert!(rec.written(), "{rec:?}");
+        assert_eq!(std::fs::read(dir.join(MANIFEST)).unwrap(), pulled(&manifest));
+        assert_ne!(raw, b"{\"old\":true}".to_vec());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What ollama 0.40 installs: the registry's entries plus the manifest it
+    /// pulled (its digest the sha256 of the registry's bytes) and the list
+    /// that named it, both stored as blobs (2026-11-18 hosted probe).
+    fn installed_by_ollama_040(manifest: &Value, raw: &[u8], list_digest: &str) -> Value {
+        let mut m = manifest.clone();
+        let layers = m["layers"].as_array_mut().unwrap();
+        layers.push(json!({"mediaType": PULL_MANIFEST_MEDIA,
+            "digest": format!("sha256:{}", hex::encode(Sha256::digest(raw))), "size": raw.len()}));
+        layers.push(json!({"mediaType": "application/vnd.ollama.manifest.list.v2+json", "digest": list_digest, "size": 470}));
+        m
+    }
+
+    #[test]
+    fn an_ollama_that_adds_the_pulled_manifest_is_recorded_as_installed() {
+        let w = weight();
+        let (manifest, blobs) = model_fixture(&w);
+        let raw = pretty(&manifest);
+        let reg = serve_raw(raw.clone(), blobs, None, 8);
+        let dir = tmpdir("record-ollama040");
+        let installed = installed_by_ollama_040(&manifest, &raw, "sha256:862c9e801351aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let rec = record_after_pull(record_before_pull(&reg.base, "gemma4:12b", &dir), |_| Ok(pulled(&installed)));
+        assert_eq!(rec, PullRecord::Written(dir.join(MANIFEST)));
+        assert_eq!(std::fs::read(dir.join(MANIFEST)).unwrap(), pulled(&installed), "the record is the installed manifest");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_registry_layer_the_install_lacks_is_refused_naming_it() {
+        let w = weight();
+        let (manifest, blobs) = model_fixture(&w);
+        let raw = pretty(&manifest);
+        let reg = serve_raw(raw.clone(), blobs, None, 8);
+        let dir = tmpdir("record-lacks");
+        let mut installed = installed_by_ollama_040(&manifest, &raw, "sha256:862c9e801351aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        // the params layer is gone; nothing foreign is added
+        installed["layers"].as_array_mut().unwrap().retain(|l| l["mediaType"] != "application/vnd.ollama.image.params");
+        let rec = record_after_pull(record_before_pull(&reg.base, "gemma4:12b", &dir), |_| Ok(pulled(&installed)));
+        assert!(matches!(rec, PullRecord::Differs(_)), "{rec:?}");
+        let line = rec.line().unwrap();
+        assert!(line.contains("the registry names params sha256:") && line.contains("it lacks") && !line.contains("it adds"), "{line}");
+        assert!(names(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_added_entry_of_another_type_is_refused_naming_it() {
+        let w = weight();
+        let (manifest, blobs) = model_fixture(&w);
+        let raw = pretty(&manifest);
+        let reg = serve_raw(raw.clone(), blobs, None, 8);
+        let dir = tmpdir("record-foreign");
+        let mut installed = installed_by_ollama_040(&manifest, &raw, "sha256:862c9e801351aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        installed["layers"].as_array_mut().unwrap().push(json!({"mediaType": "application/vnd.oci.image.index.v1+json",
+            "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "size": 99}));
+        let rec = record_after_pull(record_before_pull(&reg.base, "gemma4:12b", &dir), |_| Ok(pulled(&installed)));
+        assert!(matches!(rec, PullRecord::Differs(_)), "{rec:?}");
+        assert!(rec.line().unwrap().contains("it adds application/vnd.oci.image.index.v1+json sha256:0123456789ab"), "{:?}", rec.line());
+        assert!(names(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pulled_manifest_entry_that_is_not_our_bytes_is_the_tag_that_moved() {
+        let w = weight();
+        let (manifest, blobs) = model_fixture(&w);
+        let raw = pretty(&manifest);
+        let reg = serve_raw(raw.clone(), blobs, None, 8);
+        let dir = tmpdir("record-moved");
+        let mut installed = installed_by_ollama_040(&manifest, &raw, "sha256:862c9e801351aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let entry = installed["layers"].as_array_mut().unwrap().iter_mut()
+            .find(|l| l["mediaType"] == PULL_MANIFEST_MEDIA).expect("the pulled-manifest entry");
+        entry["digest"] = json!("sha256:feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface");
+        let rec = record_after_pull(record_before_pull(&reg.base, "gemma4:12b", &dir), |_| Ok(pulled(&installed)));
+        assert!(matches!(rec, PullRecord::Moved(_)), "{rec:?}");
+        let line = rec.line().unwrap();
+        assert!(line.contains("the registry's gemma4:12b moved between ollama's request and ours (ollama installed manifest sha256:feedfacefeed"), "{line}");
+        assert!(names(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_hf_ref_pull_writes_no_record_and_asks_nothing() {
+        let w = weight();
+        let (manifest, blobs) = model_fixture(&w);
+        let reg = serve(manifest, blobs, None, 8);
+        let dir = tmpdir("record-hf");
+        let pending = record_before_pull(&reg.base, "hf.co/org/repo:Q4_K_M", &dir);
+        assert!(matches!(pending, Err(PullRecord::NotRegistry)), "{pending:?}");
+        let rec = record_after_pull(pending, |_| panic!("an hf.co ref has no manifest to read"));
+        assert_eq!(rec, PullRecord::NotRegistry);
+        assert_eq!(rec.line(), None);
+        assert!(reg.hits.lock().unwrap().is_empty(), "the registry was asked about an hf.co ref");
+        assert!(names(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_box_without_the_store_says_so_and_writes_nothing() {
+        let w = weight();
+        let (manifest, blobs) = model_fixture(&w);
+        let reg = serve(manifest.clone(), blobs, None, 8);
+        let dir = tmpdir("record-nostore").join("absent");
+        let rec = record_after_pull(record_before_pull(&reg.base, "gemma4:12b", &dir), |_| Ok(pulled(&manifest)));
+        assert!(matches!(rec, PullRecord::NoStore(_)), "{rec:?}");
+        assert!(rec.line().unwrap().starts_with("no controller record written: this box has no controller model store"));
+        assert!(!dir.exists());
     }
 
     #[test]

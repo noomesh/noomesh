@@ -46,13 +46,16 @@ By default this also mints a tagged Tailscale auth key and prints a
 self-contained paste:
 
 ```
-run AS YOUR USER on the node (one sudo prompt)
+run AS YOUR USER on the node (it runs several sudo commands; sudo asks for your password)
 step 1 — make sure the noo CLI is on the node (skip if `noo --version` already works):
   command -v noo >/dev/null || { curl -fsSL https://github.com/noomesh/noomesh/releases/latest/download/install.sh -o install.sh && sh install.sh; }
 step 2 — enroll (joins the tailnet, runs host prep, installs the agent):
   noo enroll noo1.<blob>
 bound to node: gpu-2. When the paste finishes: noo cluster provision gpu-2 --wait
 ```
+
+The paste runs several `sudo` commands; you type your password once while
+sudo's credential cache holds.
 
 The raw token is shown once and never stored; `--no-tailscale` prints the
 same paste without a tailnet key, for a node already on the network; `--cidr`
@@ -73,7 +76,7 @@ redemption record, derives the tier from the node's live facts once it has
 heartbeated, else from the hardware facts it reported at enrollment (SBC or bare ARM → 4, GPU → 2, else 3; unified
 memory goes by usable GPU memory — CUDA ≥ 10 GB → 1, ≥ 4 GB → 2, else 4;
 pass a tier argument to override; a node with no facts on record must
-re-enroll), issues the node cert, and builds **one CA-signed bundle**
+re-enroll), issues the node cert, and builds **one bundle signed by the fleet signing key**
 (agent env with the credentials, systemd unit, agent binary, certs). On a
 pull-enrolled node the bundle is encrypted to the node's birth cert and
 staged at the gateway; the node's fetcher collects it and reports back:
@@ -411,7 +414,7 @@ cutover has begun it cannot be cancelled. A space with a migration cannot be uns
 ```sh
 noo models recommended                      # per detected tier; prefers LAN-cached models
 noo models info Qwen/Qwen2.5-7B-Instruct    # gating, licence, formats
-noo models pull qwen2.5:7b-instruct         # through the gateway's Ollama proxy, streamed progress
+noo models pull qwen2.5:7b-instruct         # through the gateway's Ollama proxy, streamed progress; records the pull in the controller store
 noo models cached                           # what running backends have loaded
 noo models fetch <org>/<repo> <file.gguf>   # GGUF from Hugging Face into the controller store (resumable, sha256-verified)
 ```
@@ -467,8 +470,9 @@ noo cluster upgrade-agents                 # every online remote worker, seriall
 ```
 
 Both travel the pull rail in bundles signed by the fleet signing key — no
-SSH. `upgrade-hostd` cross-builds per architecture and delivers a signed
-`hostd-binary` bundle (`collected — node-side apply is the verdict from
+SSH. `upgrade-hostd` ships the release's own `noo-hostd-<arch>` (the asset
+provision verifies against the release's signed list, which rides with it)
+in a signed `hostd-binary` bundle (`collected — node-side apply is the verdict from
 here`); the applier keeps `.prev` and reverts a hostd that produces no fresh
 heartbeat. `upgrade-agents` restages each node's provision bundle (the
 agent binary rides in it) with `noo cluster provision <node> --wait`, one
@@ -499,7 +503,7 @@ fleet-key set; there is no `--key` flag. The shared `NATS_USER` /
 its own, delivered by `noo cluster nats-creds rotate <node>`). It
 reads the controller value from `secrets/env.sops`, checks it against the
 live gateway's env, and for every key the gateway agrees with, stages a
-CA-signed `fleet-secrets` bundle — a dotenv fragment, end-to-end encrypted
+`fleet-secrets` bundle signed by the fleet signing key — a dotenv fragment, end-to-end encrypted
 to each node's birth cert — on the pull rail. Each node's applier merges
 the fragment into `/etc/noo-node-agent.env` and restarts the agent, which
 reconnects presenting the controller's value. A key the gateway disagrees
@@ -519,7 +523,7 @@ noo cluster teardown-node gpu-2 --factory -y       # also purge its data and rem
 noo cluster teardown-node gpu-2 -y --keep-tailnet-record   # keep the device record (the next enroll registers as gpu-2-1)
 ```
 
-The command confirms, stages a CA-signed `teardown` bundle on the pull
+The command confirms, stages a `teardown` bundle signed by the fleet signing key on the pull
 rail — there is no fallback lane; a node with no birth cert on record
 predates the rail and must be re-enrolled first — waits up to four
 minutes for the node to fetch it, then **verifies silence** — polls until
@@ -677,10 +681,10 @@ it is immediate and a force, and the audit row says `legacy`.
 the GPU and the mesh's, without lease ids to copy:
 
 ```bash
-noo cluster gpu mode awolf              # the current mode, and how long a hold has lasted
-noo cluster gpu mode awolf user         # drain, hold with purpose "user", wait until the GPU is free
-noo cluster gpu mode awolf mesh         # check the GPU is free, release with resume-now, wait until vLLM is warm
-noo cluster gpu mode awolf user --for 2h  # the same, and the node hands the GPU back after 2 hours
+noo cluster gpu mode node-a              # the current mode, and how long a hold has lasted
+noo cluster gpu mode node-a user         # drain, hold with purpose "user", wait until the GPU is free
+noo cluster gpu mode node-a mesh         # check the GPU is free, release with resume-now, wait until vLLM is warm
+noo cluster gpu mode node-a user --for 2h  # the same, and the node hands the GPU back after 2 hours
 ```
 
 The mode is read from the node's GPU lease, never stored: no lease and vLLM
@@ -723,7 +727,7 @@ lasted and how much of the GPU other work still uses.
   while vLLM is still warming only waits. A node held by someone else, or
   reserved for an add-on workload, is refused with the line that ends that
   hold; the mode verb does not end another operator's hold.
-- The time from release to a warm vLLM on awolf is measured live, not by the
+- The time from release to a warm vLLM on node-a is measured live, not by the
   unit tests; see the measured figure when it is recorded here.
 
 ### Reservations: a feature takes a GPU, the pool gets it back
@@ -738,7 +742,7 @@ stay as the low-level emergency tools underneath.
 ```bash
 noo cluster workloads                              # what the installed add-ons declare
 noo cluster reserve pai-voice/voice-worker         # the mesh picks a node: any live node with enough free GPU memory
-noo cluster reserve pai-voice/voice-worker --node awolf   # or pin one
+noo cluster reserve pai-voice/voice-worker --node node-a   # or pin one
 noo cluster reservations                           # id, workload, holder, node, state, since
 noo cluster release <reservation-id>               # the GPU returns to the pool
 ```
@@ -765,8 +769,9 @@ container's published loopback port. A relayed WebSocket closes with code
 4001 when the reservation ends. Nothing else on the node is reachable that
 way, and a workload that is not reserved answers 409.
 
-**Knobs** (operator overrides; on a Linux node set them in a systemd drop-in, `sudo systemctl edit noo-node-agent`
-then `[Service]` / `Environment=NOO_GPU_YIELD=off`, and restart the agent. Not in `/etc/noo-node-agent.env`:
+**Knobs** (operator overrides; set them in the node's local declarations file,
+`/etc/noo-node-agent.local.env` (Linux and Mac; root's, mode 644), and restart the agent, see
+[the node's own declarations](../security/node-agent.md#the-nodes-own-declarations). Not in `/etc/noo-node-agent.env`:
 every roll replaces that file whole and a hand-added line is gone):
 
 | Variable | Default | Meaning |
@@ -869,7 +874,7 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 | `noo cluster set-config` | `<node> [--usage shared\|dedicated\|default] [--harness auto\|manual\|off] [--loop-budget <n>\|default] [--data-root <path>] [--models-dir <path>] [--ip <ip>] [--tier <n>] [--gpu-model <model>] [--vram-gb <n>] [--min-battery <pct>] [--require-wifi <bool>] [--block-thermal <s,s>] [--policy-default] [--vendor-kinds <kind,kind>\|none]` | Update a node's stored config row with only the given fields |
 | `noo cluster clear-cooldowns` | — | Clear backend auto-start cooldown backoff on every node |
 | `noo cluster teardown-node` | `<node> \| --all [--purge-data] [--purge-tailscale] [--factory] [--keep-tailnet-record] [-y\|--yes]` | Dismantle a node or --all, verify silence, forget it and delete its tailnet record |
-| `noo cluster provision` | `<node> [<tier>] [--harness auto\|manual\|off] [--wait [<secs>]] [--stage-only] [--move-data]` | Stage a node's signed bundle; --wait blocks until enrolled, --stage-only skips the apply |
+| `noo cluster provision` | `<node> [<tier>] [--harness auto\|manual\|off] [--wait [<secs>]] [--stage-only] [--move-data] [--root-ok]` | Stage a node's signed bundle; --wait blocks until enrolled, --stage-only skips the apply |
 | `noo cluster sync-model-files` | `[<node>...] [-m\|--model <file>]... [--dry-run]` | Dispatch a job per node to pull GGUF weights from the controller store and verify them |
 | `noo cluster bootstrap-token create` | `[--ttl <1h\|30m\|24h\|secs>] [--role <role>] [--cidr <cidr>] [--node <name>] [--with-tailscale\|--no-tailscale] [--controller-approvals]` | Mint a single-use enrollment token and print the node enrollment one-liner |
 | `noo cluster bootstrap-token list` | — | List bootstrap tokens with status, creator, expiry and redeeming IP |
@@ -878,7 +883,7 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 | `noo cluster set-primary` | `[--to <target>] --promoted [-y\|--yes]` | Move the primary-controller role; promote Postgres on the target first, then --promoted |
 | `noo cluster sync-images` | `[<node>...] [-i\|--image <img>]... [--images <a,b>] [--restart\|--no-restart] [--all] [--stage-only] [--lock] [--arch <a,b>] [--all-images]` | Stage images on the artifact rail, then nodes pull them (--stage-only: stage, no pull) |
 | `noo cluster upgrade-agents` | `[<node>...] [-y\|--yes]` | Restage node agents serially in signed bundles over the pull rail; asks to confirm (-y) |
-| `noo cluster upgrade-hostd` | `<node>... [--skip-build] [-y\|--yes\|--force]` | Roll noo-hostd to the named nodes over the pull rail as a signed bundle |
+| `noo cluster upgrade-hostd` | `<node>... [-y\|--yes\|--force]` | Roll noo-hostd to the named nodes over the pull rail as a signed bundle |
 | `noo cluster upgrade-applier` | `<node>... [-y\|--yes\|--force]` | Ship the current noo-apply to nodes over the rail; asks for confirmation (-y) |
 | `noo cluster restart-backends` | `<node> <noo-svc>... [-y\|--yes\|--force]` | Restart noo-* backend containers on a node via a rail-delivered bundle |
 | `noo cluster host-telemetry apply` | `[<node>...] [--all] [--include-controller] [-y\|--yes]` | Switch off tailscaled's log upload on nodes over the pull rail, one at a time |
@@ -888,7 +893,7 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 | `noo cluster vendor install` | `<node> <kind>...` | Carry these vendor CLIs on a node whatever its placement names; restage to deliver |
 | `noo cluster vendor` | — | Print vendor subcommand usage (stage, status, install) |
 | `noo cluster push-secrets` | `[<node>...] [--dry-run] [--explain] [--gateway-container <name>] [--sops-file <path>] [-y\|--yes]` | Stage fleet-wide secrets from env.sops as a bundle each node collects |
-| `noo cluster nats-users render` | `[--rotate] [--dry-run] [-y\|--yes]` | Mint per-principal NATS passwords from the gateway registry and render users.conf |
+| `noo cluster nats-users render` | `[--rotate] [--drop-legacy] [--dry-run] [-y\|--yes]` | Mint per-principal NATS passwords from the gateway registry and render users.conf |
 | `noo cluster nats-creds rotate` | `<node\|gateway\|worker\|trellion\|trellion_intel>... [--mint-only] [--restart] [-y\|--yes]` | Rotate a bus credential: nodes deliver over the rail; others re-render + recreate |
 | `noo cluster import-model` | `<node> <name> [--place] [--role chat\|embed\|rerank] [-b\|--backend <backend>]` | Import a store model or a staged ollama:<tag> into a node's ollama |
 | `noo cluster ship-model` | `<hf_id> <node> [--name <name>] [--quant <quant>] [--place] [-b\|--backend <backend>]` | Convert an HF model to GGUF and have a node import it; needs a source checkout |
@@ -930,7 +935,7 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 ### `noo jobs` — Job queue & scheduler management
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo jobs list` | `[--limit <n>] [--status <s>] [--node <id>]` | List queued and running jobs from the gateway job queue |
+| `noo jobs list` | `[--limit <n>] [--status <s>] [--node <id>] [-w\|--watch [<secs>]]` | List queued and running jobs from the gateway job queue |
 | `noo jobs run` | `<prompt> [--async] [--priority <n>] [--backend <b>] [--node <id>] [-t <secs>] [--type <type>]` | Submit an inference job and poll until it finishes unless --async |
 | `noo jobs status` | `<job-id> [--wait]` | Show one job record, optionally polling until it reaches a terminal state |
 | `noo jobs submit` | `[--type <t>] [--priority <n>] [--backend <b>] [--payload <json>]` | Submit a job with a raw JSON payload and print its id (a prompt: jobs run --async) |

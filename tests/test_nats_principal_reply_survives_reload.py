@@ -10,7 +10,7 @@ authorization while the responder is still working, then has it reply.
 
 nats-server keeps `allow_responses` entries in a per-connection map that a
 config reload replaces (`reloadAuthorization` -> `RegisterUser` ->
-`setPermissions`). On pop-os 2026-10-14 that refused a 12 s
+`setPermissions`). On ctrl 2026-10-14 that refused a 12 s
 `worker.rag.query` reply as a `Publish Violation` on `_INBOX_gw.…` and the
 caller never got the answer (i69, fixed for the worker). Nodes and the
 add-ons were left on `allow_responses` (i70); each principal now holds a
