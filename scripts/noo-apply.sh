@@ -79,7 +79,7 @@ fi
 CA="$PKI/ca.crt"
 [ -f "$CA" ] || { echo "noo-apply: no trusted CA at $CA — enroll this node first" >&2; exit 78; }
 
-KNOWN_KINDS="ca.crt node.crt node.key agent-env agent-unit agent-binary teardown applier hostd-binary restart-backends host-telemetry cli-binary cli-user fetcher nats-creds fleet-secrets signing-pub harness-binary harness-env harness-unit svc-vllm.crt svc-vllm.key svc-llamacpp.crt svc-llamacpp.key svc-ollama.crt svc-ollama.key svc-tei.crt svc-tei.key svc-reranker.crt svc-reranker.key vendor-cli vendor-cli-manifest vendor-cli-2 vendor-cli-2-manifest vendor-cli-3 vendor-cli-3-manifest release-sums release-sums.sig release-version release-lock release-lock.sig"
+KNOWN_KINDS="ca.crt node.crt node.key agent-env agent-unit agent-binary teardown applier hostd-binary restart-backends host-telemetry cli-binary cli-user fetcher nats-creds fleet-secrets signing-pub harness-binary harness-env harness-unit svc-vllm.crt svc-vllm.key svc-llamacpp.crt svc-llamacpp.key svc-ollama.crt svc-ollama.key svc-tei.crt svc-tei.key svc-reranker.crt svc-reranker.key vendor-cli vendor-cli-manifest vendor-cli-2 vendor-cli-2-manifest vendor-cli-3 vendor-cli-3-manifest release-sums release-sums.sig release-version release-lock release-lock.sig netns-unit"
 
 # An add-on's node workload door leaf travels as svc-addon-<addon>-<workload>
 # .crt|.key. The set is open (one pair per enabled add-on workload), so it is
@@ -873,7 +873,7 @@ unit_payload_ok() {
 # a directive or key hidden behind either would reach pid 1 unchecked. Every
 # text kind is held to this, including the merges (nats-creds,
 # fleet-secrets), whose lines land in an EnvironmentFile.
-TEXT_KINDS="agent-env harness-env nats-creds fleet-secrets host-telemetry teardown cli-user signing-pub ca.crt node.crt node.key agent-unit harness-unit restart-backends vendor-cli-manifest vendor-cli-2-manifest vendor-cli-3-manifest release-sums release-sums.sig release-version release-lock release-lock.sig"
+TEXT_KINDS="agent-env harness-env nats-creds fleet-secrets host-telemetry teardown cli-user signing-pub ca.crt node.crt node.key agent-unit harness-unit restart-backends vendor-cli-manifest vendor-cli-2-manifest vendor-cli-3-manifest release-sums release-sums.sig release-version release-lock release-lock.sig netns-unit"
 text_payload_ok() {
     if ! LC_ALL=C tr -d '\r\000' < "$1" | cmp -s - "$1"; then
         _shape_refuse "$2" "carries a carriage return or NUL byte"
@@ -1746,6 +1746,152 @@ agent_protect_remove() {
 }
 # END agent_protect
 
+# BEGIN netns_unit
+# noo-netns-restore.service (i907 step 1b): the controller's self-node renders
+# and installs it, so a roll needs no sudo for it. The unit runs, after every
+# dockerd start, the install's scripts/noo-netns-restore.sh AS THE INSTALL
+# OWNER (noo-cli netns_unit.rs explains why it exists).
+#
+# The unit text is a template in THIS file (release-listed as `applier`, i908).
+# The `netns-unit` kind carries two parameters and nothing else:
+#   user=<the install owner>
+#   root=<the install root, absolute>
+# signing.key alone vouches for them, so they are judged here and can only
+# fill User= and the path in ExecStart=:
+#   * exactly those two lines, each once; any other line (a newline plus
+#     `ExecStartPre=`) refuses the kind;
+#   * user: [A-Za-z0-9._-], at most 32, not starting with `-` or `.`, an
+#     account this host has, and never root or another uid 0: a bundle never
+#     makes root run a script;
+#   * root: a normalised absolute path of [A-Za-z0-9._@+/-] (so no space,
+#     newline, %, quote or backslash), at most 200, not a symlink, a
+#     directory owned by that user, with scripts/noo-netns-restore.sh a
+#     regular file (not a link) owned by that user. The unit then runs, as
+#     U, only a file U owns: nothing U could not run already.
+# A refusal is one line naming the field (never its value), `netns-unit=
+# REFUSED:<field>` on the applied line, and the installed unit (or none) left
+# exactly as it was. A change installs 0644 root:root, daemon-reloads and
+# enables (WantedBy=docker.service), as the CLI's sudo install did. Unchanged
+# bytes, mode, owner and enabled: `netns-unit=unchanged`, nothing run.
+# NETNS_UNIT_DIR / NU_OWNER_ARGS / NU_STAT_OWNER / NU_SYSTEMD_DIR are seams
+# for the unprivileged test (tests/test_netns_unit_apply.py).
+NETNS_UNIT_NAME=noo-netns-restore.service
+NETNS_UNIT_DIR="${NETNS_UNIT_DIR:-/etc/systemd/system}"
+NETNS_UNIT="$NETNS_UNIT_DIR/$NETNS_UNIT_NAME"
+NU_OWNER_ARGS="${NU_OWNER_ARGS--o root -g root}"   # empty in tests (not root)
+NU_STAT_OWNER="${NU_STAT_OWNER-root:root}"
+NU_USER=""; NU_ROOT=""; NU_BAD=""
+
+# nu_parse FILE — NU_USER and NU_ROOT from the payload, or NU_BAD names why not.
+nu_parse() {
+    NU_USER=""; NU_ROOT=""; NU_BAD=""
+    _nu_u=0; _nu_r=0
+    while IFS= read -r _nu_l || [ -n "$_nu_l" ]; do
+        case "$_nu_l" in
+            user=*) _nu_u=$((_nu_u + 1)); NU_USER="${_nu_l#user=}" ;;
+            root=*) _nu_r=$((_nu_r + 1)); NU_ROOT="${_nu_l#root=}" ;;
+            *) NU_BAD=shape; return 1 ;;
+        esac
+    done < "$1"
+    [ "$_nu_u" = 1 ] && [ "$_nu_r" = 1 ] || { NU_BAD=shape; return 1; }
+    return 0
+}
+
+# nu_user_ok — the owner: a plain name this host knows, never uid 0.
+nu_user_ok() {
+    case "$NU_USER" in ''|-*|.*|*[!A-Za-z0-9._-]*) NU_BAD=user; return 1 ;; esac
+    [ "${#NU_USER}" -le 32 ] || { NU_BAD=user; return 1; }
+    _nu_uid="$(id -u "$NU_USER" 2>/dev/null)" || { NU_BAD=user; return 1; }
+    case "$_nu_uid" in ''|*[!0-9]*|0) NU_BAD=user; return 1 ;; esac
+    return 0
+}
+
+# nu_root_ok — the install root: shape, then what the host says about it.
+nu_root_ok() {
+    case "$NU_ROOT" in /?*) ;; *) NU_BAD=root; return 1 ;; esac
+    case "$NU_ROOT" in *[!A-Za-z0-9._@+/-]*) NU_BAD=root; return 1 ;; esac
+    case "$NU_ROOT" in *//*|*/./*|*/../*|*/.|*/..|*/) NU_BAD=root; return 1 ;; esac
+    [ "${#NU_ROOT}" -le 200 ] || { NU_BAD=root; return 1; }
+    [ -d "$NU_ROOT" ] && [ ! -L "$NU_ROOT" ] || { NU_BAD=root; return 1; }
+    [ "$(stat -c %u "$NU_ROOT" 2>/dev/null)" = "$_nu_uid" ] || { NU_BAD=root-owner; return 1; }
+    _nu_s="$NU_ROOT/scripts/noo-netns-restore.sh"
+    [ -f "$_nu_s" ] && [ ! -L "$_nu_s" ] || { NU_BAD=script; return 1; }
+    [ "$(stat -c %u "$_nu_s" 2>/dev/null)" = "$_nu_uid" ] || { NU_BAD=script-owner; return 1; }
+    return 0
+}
+
+# nu_render — the unit: byte for byte noo-cli's netns_unit::render for a
+# non-root owner (tests/test_netns_unit_apply.py holds them equal).
+nu_render() {
+    printf '%s\n' \
+        "[Unit]" \
+        "Description=noomesh: start the containers that join another's network after dockerd starts" \
+        "After=docker.service" \
+        "PartOf=docker.service" \
+        "" \
+        "[Service]" \
+        "Type=oneshot" \
+        "RemainAfterExit=yes" \
+        "User=$NU_USER" \
+        "ExecStart=/bin/bash \"$NU_ROOT/scripts/noo-netns-restore.sh\"" \
+        "" \
+        "[Install]" \
+        "WantedBy=docker.service"
+}
+
+# nu_same INSTALLED CANDIDATE — bytes, mode 644 and owner (config_unchanged).
+nu_same() {
+    if [ -n "$NU_STAT_OWNER" ]; then
+        config_unchanged "$2" "$1" 644 "$NU_STAT_OWNER"
+    else
+        [ -f "$1" ] && cmp -s "$2" "$1"
+    fi
+}
+
+# netns_unit_apply PAYLOAD — render, compare, install on a change, enable.
+netns_unit_apply() {
+    # No systemd (a container without it as PID 1): nothing to install;
+    # noo-hostd's boot-restore runs the script at boot there.
+    if [ ! -d "${NU_SYSTEMD_DIR:-/run/systemd/system}" ]; then
+        applied="$applied netns-unit=no-systemd"
+        return 0
+    fi
+    if ! nu_parse "$1" || ! nu_user_ok || ! nu_root_ok; then
+        echo "noo-apply: netns-unit: REFUSED — $NU_BAD is not a value the unit may carry; $NETNS_UNIT_NAME is left as it was" >&2
+        logger -t noo-apply "REFUSED netns-unit: $NU_BAD" 2>/dev/null || true
+        applied="$applied netns-unit=REFUSED:$NU_BAD"
+        return 0
+    fi
+    _nu_tmp="$(mktemp)"
+    nu_render > "$_nu_tmp"
+    if nu_same "$NETNS_UNIT" "$_nu_tmp" && systemctl is-enabled --quiet "$NETNS_UNIT_NAME" 2>/dev/null; then
+        rm -f -- "$_nu_tmp"
+        applied="$applied netns-unit=unchanged"
+        return 0
+    fi
+    if ! nu_same "$NETNS_UNIT" "$_nu_tmp"; then
+        # shellcheck disable=SC2086
+        install -m 644 $NU_OWNER_ARGS "$_nu_tmp" "$NETNS_UNIT"
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+    rm -f -- "$_nu_tmp"
+    if ! systemctl enable "$NETNS_UNIT_NAME" >/dev/null 2>&1; then
+        echo "noo-apply: netns-unit: $NETNS_UNIT_NAME is installed but systemctl enable failed" >&2
+        applied="$applied netns-unit=NOT-ENABLED"
+        return 0
+    fi
+    applied="$applied netns-unit"
+}
+
+# netns_unit_remove — teardown: disable, delete, reload.
+netns_unit_remove() {
+    [ -e "$NETNS_UNIT" ] || return 0
+    systemctl disable "$NETNS_UNIT_NAME" >/dev/null 2>&1 || true
+    rm -f -- "${NETNS_UNIT:?}"
+    systemctl daemon-reload 2>/dev/null || true
+}
+# END netns_unit
+
 # ── teardown — the graceful, controller-initiated node destroy ─────────────
 # A signed `teardown` kind means "return this node to never-met-the-fleet".
 # It runs the local de-enroll — but that script deletes noo-apply itself,
@@ -1775,6 +1921,7 @@ if [ -f "$WORK/files/teardown" ]; then
         echo "noo-apply: teardown requested but $DEENROLL is not installed" >&2
         exit 69
     fi
+    netns_unit_remove
     agent_protect_remove
     harness_egress_remove
     logger -t noo-apply "teardown authorized (node=$have) — dismantling in 5s, detached" 2>/dev/null || true
@@ -2778,6 +2925,13 @@ if [ -f "$WORK/files/host-telemetry" ]; then
     host_telemetry_payload_ok "$WORK/files/host-telemetry" "$NODE_ID" || exit $?
     host_telemetry_apply || exit $?
     applied="$applied host-telemetry"
+fi
+
+# netns-unit — see netns_unit: the controller's self-node renders
+# noo-netns-restore.service from its own template; the kind carries only the
+# install owner and root, judged there.
+if [ -f "$WORK/files/netns-unit" ]; then
+    netns_unit_apply "$WORK/files/netns-unit"
 fi
 
 # agent-unit — first install is what turns a prepped host into a NODE
