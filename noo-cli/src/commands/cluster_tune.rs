@@ -13,10 +13,14 @@
 //! 088) and acted on by the node agent: a `cpu` container gets no GPU device
 //! and `CUDA_VISIBLE_DEVICES` emptied. Per backend:
 //!
-//! * llamacpp: `cpu` also writes `N_GPU_LAYERS=0` into the placement env, so
-//!   the choice is visible in `noo cluster desired` and an older agent that
-//!   ignores `target` still offloads nothing; `gpu` removes a stored
-//!   `N_GPU_LAYERS=0` (the agent's `auto` then offloads every layer);
+//! * llamacpp: always `cpu` while its image has no GPU build
+//!   ([`LLAMACPP_HAS_GPU_BUILD`]): `place` turns a `gpu` target into `cpu`
+//!   and says so, and the gateway's fit and the node agent take a llamacpp
+//!   placement as `cpu` whatever it declares. `cpu` also writes
+//!   `N_GPU_LAYERS=0` into the placement env, so the choice is visible in
+//!   `noo cluster desired` and an older agent that ignores `target` still
+//!   offloads nothing (a `gpu` target, reachable only with a GPU build,
+//!   would remove a stored `N_GPU_LAYERS=0`);
 //! * ollama: no env key - the daemon's device is the agent's to withhold
 //!   (`num_gpu` is a per-request option and `CUDA_VISIBLE_DEVICES` is not on
 //!   the placement allow-list, deliberately);
@@ -36,7 +40,7 @@
 //! |---|---|---|
 //! | `N_THREADS` (llamacpp on cpu) | 25% of cores, at least 2 | cores - 2, at least 1 |
 //! | `N_PARALLEL` / `OLLAMA_NUM_PARALLEL` | 1 | chat: 2 on gpu, 1 on cpu; embed: 4 |
-//! | `N_BATCH` (llamacpp) | 256 cpu / 512 gpu | 512 cpu / 2048 gpu |
+//! | `N_BATCH` (llamacpp, always cpu) | 256 | 512 |
 //! | `N_CTX` (llamacpp chat) / `OLLAMA_CONTEXT_LENGTH` (ollama chat) | half the pool's free memory as KV | same |
 //!
 //! `N_CTX` and `OLLAMA_CONTEXT_LENGTH` use the fit check's conservative KV
@@ -120,8 +124,10 @@ fn env_str(env: &Value, key: &str) -> Option<String> {
 /// (OpenBLAS, no CUDA). A llamacpp placement `--on gpu` was accepted, sized
 /// with GPU numbers and given the GPU device, and then ran on the CPU with
 /// `--gpu-layers` ignored (noomesh-internal i545 45/46). The gateway's
-/// `placement_fit::LLAMACPP_HAS_GPU_BUILD` says the same, and
-/// tests/test_llamacpp_gpu_build_claim.py holds both to the Dockerfile.
+/// `placement_fit::LLAMACPP_HAS_GPU_BUILD` (the fit puts llamacpp in the CPU
+/// pool) and the node agent's `docker.LlamacppHasGPUBuild` (the container
+/// gets no GPU device and `N_GPU_LAYERS=0`) say the same, and
+/// tests/test_llamacpp_gpu_build_claim.py holds all three to the Dockerfile.
 pub const LLAMACPP_HAS_GPU_BUILD: bool = false;
 
 /// Why a llamacpp `gpu` target is not honoured, said where it happens.

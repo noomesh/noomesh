@@ -4676,6 +4676,9 @@ pub(crate) fn validate_target(backend: &str, target: Option<&str>, node: &Value)
     if t == "gpu" && crate::placement_fit::node_reports_memory(node) && !crate::placement_fit::node_has_gpu(node) {
         return Err("this node reports no GPU: place it with target cpu".into());
     }
+    // llamacpp `gpu` is accepted (older clients send it) but fits and runs as
+    // cpu while the image has no GPU build: placement_fit::resolve_target and
+    // the node agent both apply placement_fit::LLAMACPP_HAS_GPU_BUILD.
     Ok(())
 }
 

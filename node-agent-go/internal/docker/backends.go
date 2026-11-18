@@ -329,10 +329,12 @@ var backendSpecs = map[string]BackendSpec{
 		ReadOnlyRoot: true,
 		Env: map[string]string{
 			"MODEL_PATH": "${LLAMACPP_MODEL:-/models/llama-7b-Q5_K_M.gguf}",
-			// "auto" sentinel — buildEnvList resolves it to "999" (offload
-			// all layers to GPU) when hasNvidiaGPU() is true, else "0"
-			// (CPU-only). User can still set N_GPU_LAYERS=N explicitly to
-			// override (e.g., partial offload, or force CPU on a GPU node).
+			// "auto" sentinel — buildEnvList resolves it to "999" when
+			// hasNvidiaGPU() is true, else "0". Every image this tree builds
+			// or defaults to is a CPU build (LlamacppHasGPUBuild), so no
+			// layer is ever offloaded: effectiveTarget takes every llamacpp
+			// start as cpu, and cpuTargetEnv pins N_GPU_LAYERS=0 before
+			// "auto" is read.
 			"N_GPU_LAYERS": "${N_GPU_LAYERS:-auto}",
 			"N_CTX":        "${N_CTX:-4096}",
 			"N_THREADS":    "${N_THREADS:-4}",
@@ -604,13 +606,52 @@ type StartOverrides struct {
 	// declared). "cpu" means the container gets NO GPU device request and
 	// CUDA_VISIBLE_DEVICES is emptied, and llama.cpp offloads no layers —
 	// whatever N_GPU_LAYERS says, since there is no device to offload to.
-	// Anything else leaves the existing GPU logic alone.
+	// Anything else leaves the existing GPU logic alone, except llamacpp,
+	// which effectiveTarget always takes as "cpu" (LlamacppHasGPUBuild).
 	Target string
 
 	// MemoryLimit (bytes) replaces a llama.cpp container's fixed spec limit
 	// when > 0: the controller derives it from the model's fit estimate and
 	// caps it by the node's usage profile. Ignored for other backends.
 	MemoryLimit int64
+}
+
+// LlamacppHasGPUBuild says whether the llama.cpp image this tree builds
+// (docker/Dockerfile.llamacpp: OpenBLAS, no GGML_CUDA) or defaults to
+// (upstream ggml-org :server, its CPU tag) can use a GPU. It cannot, so a
+// llamacpp container given the GPU device and N_GPU_LAYERS=999 held the
+// device and ran on the CPU. The same rule as noo-cli's
+// cluster_tune::LLAMACPP_HAS_GPU_BUILD and the gateway's
+// placement_fit::LLAMACPP_HAS_GPU_BUILD; tests/test_llamacpp_gpu_build_claim.py
+// holds all three to the Dockerfile.
+const LlamacppHasGPUBuild = false
+
+// effectiveTarget is the target a start runs on: the placement's, except
+// llamacpp, which is cpu whatever the placement says (gpu or none) while its
+// image has no GPU build. The bool says the placement's target was replaced.
+func effectiveTarget(backend, target string) (string, bool) {
+	if backend == "llamacpp" && !LlamacppHasGPUBuild && target != "cpu" {
+		return "cpu", true
+	}
+	return target, false
+}
+
+// applyTarget stamps the effective target on a start: on cpu, cpuTargetEnv
+// into env and no GPU reserve (so no device request, GPU node or not).
+// Returns the GPU reserve to use.
+func applyTarget(backend, target string, env map[string]string, gpuReserve string) string {
+	eff, replaced := effectiveTarget(backend, target)
+	if replaced {
+		slog.Info("llamacpp target taken as cpu: the llama.cpp image has no GPU build",
+			"placement_target", target, "backend", backend)
+	}
+	if eff != "cpu" {
+		return gpuReserve
+	}
+	for k, v := range cpuTargetEnv(backend) {
+		env[k] = v
+	}
+	return "0"
 }
 
 // cpuTargetEnv is what the agent stamps on a container placed with target
@@ -883,12 +924,7 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 	}
 	// A cpu target overrides even the placement's own GPU sizing: there is
 	// no device to size for.
-	if overrides.Target == "cpu" {
-		for k, v := range cpuTargetEnv(backend) {
-			envOverrides[k] = v
-		}
-		gpuReserve = "0"
-	}
+	gpuReserve = applyTarget(backend, overrides.Target, envOverrides, gpuReserve)
 	if backend == "llamacpp" {
 		mirrorLlamaArgs(envOverrides)
 		spec.CPULimit = llamacppCPULimit(spec.CPULimit, envOverrides["N_THREADS"], runtime.NumCPU())
