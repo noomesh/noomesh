@@ -3083,7 +3083,7 @@ mod dispatch_health_probe_tests {
     #[tokio::test]
     async fn the_ollama_probe_sends_a_read_never_a_chat_or_generate() {
         let (base, log) = mock_agent(healthy).await;
-        let link = crate::node_link::NodeLink::for_base(&base);
+        let link = crate::node_link::NodeLink::for_test_base(&base);
         assert!(matches!(probe_backend_via_link(&link, "ollama").await, BackendProbe::Reachable));
         let got = seen(&log);
         assert_eq!(got.len(), 1, "one request: {got:?}");
@@ -3103,7 +3103,7 @@ mod dispatch_health_probe_tests {
     #[tokio::test]
     async fn a_dead_ollama_is_unreachable() {
         let (base, log) = mock_agent(dead_ollama).await;
-        let link = crate::node_link::NodeLink::for_base(&base);
+        let link = crate::node_link::NodeLink::for_test_base(&base);
         match probe_backend_via_link(&link, "ollama").await {
             BackendProbe::Unreachable(detail) => assert!(detail.contains("connection refused"), "{detail}"),
             BackendProbe::Reachable => panic!("a dead ollama read as reachable"),
@@ -3119,7 +3119,7 @@ mod dispatch_health_probe_tests {
         let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", dead.local_addr().unwrap());
         drop(dead);
-        let link = crate::node_link::NodeLink::for_base(&base);
+        let link = crate::node_link::NodeLink::for_test_base(&base);
         for b in ["ollama", "vllm"] {
             assert!(matches!(probe_backend_via_link(&link, b).await, BackendProbe::AgentUnreachable), "{b}");
         }
@@ -3131,7 +3131,7 @@ mod dispatch_health_probe_tests {
     async fn the_engines_keep_the_invalid_chat_probe() {
         for b in ["vllm", "llamacpp"] {
             let (base, log) = mock_agent(healthy).await;
-            let link = crate::node_link::NodeLink::for_base(&base);
+            let link = crate::node_link::NodeLink::for_test_base(&base);
             assert!(matches!(probe_backend_via_link(&link, b).await, BackendProbe::Reachable), "{b}");
             let got = seen(&log);
             assert_eq!(got.len(), 1, "{b}: {got:?}");
@@ -3141,7 +3141,7 @@ mod dispatch_health_probe_tests {
             assert_eq!(body, serde_json::json!({"model": ""}), "{b}");
         }
         let (base, _) = mock_agent(dead_ollama).await;
-        let link = crate::node_link::NodeLink::for_base(&base);
+        let link = crate::node_link::NodeLink::for_test_base(&base);
         assert!(matches!(probe_backend_via_link(&link, "vllm").await, BackendProbe::Unreachable(_)), "a dead engine");
     }
 
