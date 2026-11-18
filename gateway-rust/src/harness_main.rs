@@ -837,7 +837,14 @@ pub(crate) async fn fetch_placement(client: &reqwest::Client, agent_url: &str) -
     let mut u = reqwest::Url::parse(agent_url.trim())?;
     u.set_path("");
     u.set_query(None);
-    let req = crate::node_link::NodeLink::for_base(u.as_str().trim_end_matches('/'))
+    // The agent's link goes through the agent_url rule (https only). The
+    // tests stand in a plain-HTTP fake agent, so under test only the link is
+    // built without the rule (`for_test_base`, never in production code).
+    #[cfg(not(test))]
+    let link = crate::node_link::NodeLink::for_base(u.as_str().trim_end_matches('/'));
+    #[cfg(test)]
+    let link = crate::node_link::NodeLink::for_test_base(u.as_str().trim_end_matches('/'));
+    let req = link
         .request_on(client, reqwest::Method::GET, "/harness/placement")
         .timeout(Duration::from_secs(10));
     let resp = req.send().await.map_err(|e| anyhow!("GET /harness/placement: {e}"))?;
