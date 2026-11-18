@@ -1813,7 +1813,6 @@ nu_root_ok() {
     case "$NU_ROOT" in *//*|*/./*|*/../*|*/.|*/..|*/) NU_BAD=root; return 1 ;; esac
     [ "${#NU_ROOT}" -le 200 ] || { NU_BAD=root; return 1; }
     [ -d "$NU_ROOT" ] && [ ! -L "$NU_ROOT" ] || { NU_BAD=root; return 1; }
-    [ "$(stat -c %u "$NU_ROOT" 2>/dev/null)" = "$_nu_uid" ] || { NU_BAD=root-owner; return 1; }
     _nu_s="$NU_ROOT/scripts/noo-netns-restore.sh"
     [ -f "$_nu_s" ] && [ ! -L "$_nu_s" ] || { NU_BAD=script; return 1; }
     [ "$(stat -c %u "$_nu_s" 2>/dev/null)" = "$_nu_uid" ] || { NU_BAD=script-owner; return 1; }
