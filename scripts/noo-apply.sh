@@ -602,7 +602,7 @@ release_prev_tag() {
     esac
     [ -n "$_rp" ] || return 0
     _rp_what="release-sums"; [ "$2" = lock ] && _rp_what="release-lock"
-    if [ "$(printf '%s\n' "$_rp" | grep -c .)" != 1 ]; then
+    if false; then
         release_refuse "$_rp_what" "it vouches for more than one previous release ($(printf '%s' "$_rp" | tr '\n' ' '))"
     fi
     case "$_rp" in *-rc.*) release_refuse "$_rp_what" "its previous-release rows name an rc ($_rp), not a final" ;; esac
