@@ -948,23 +948,33 @@ On every node where the agent runs Ollama, each placed model is checked
 against the controller's store, and the `ollama models` row of `noo cluster
 verify` reports it:
 
-- **A model staged as a mirror** (`noo models pull` / `noo models fetch
-  ollama:<tag>`): the local manifest's layers must equal the controller's
-  mirrored manifest, and every blob must hash to its digest.
+- **A registry tag the controller holds a manifest for**: staged with every
+  blob (`noo models fetch ollama:<tag>`), or recorded alone when the
+  controller pulled it (`noo models pull <tag>`, and onboard's first model).
+  The local manifest's layers must equal that manifest's, and every blob must
+  hash to its digest. This proves the bytes are unchanged since the
+  controller recorded the tag, not that the registry served the right model.
 - **A model built from a GGUF** (a `<name>.Modelfile` in the store): its
   model layer must be the controller's GGUF, by sha256. The other layers
   (template, parameters) are not anchored yet.
 
 A mismatch is repaired from the controller (the bad blobs are removed, then
-the model is re-installed or rebuilt from the verified GGUF). Only when that
-repair fails is the model refused: the node stops advertising it, the
+the model is re-installed or rebuilt from the verified GGUF). A pulled model
+is not repaired: the record of a pull holds no bytes, so a blob it needs is
+refused at once ("no bytes to repair from"), and the remedy is the re-pull.
+Only when a repair fails, or cannot be made, is the model refused: the node stops advertising it, the
 gateway routes elsewhere, and the row is a FAIL naming the model, the blob
 and the remedy. Hashing is cached by file identity (device, inode, size,
 mtime, ctime), so only the first check after a change reads the whole file.
 
 A model the controller has no record of (a hand `ollama pull`) is never
 refused: the row WARNs and its remedy, `noo models pull <model>`, re-pulls it
-through the controller, which is how a hand-pulled model becomes verified.
+through the controller, which writes the record. The record is written only
+when the manifest the controller fetched names exactly what the pull
+installed; a tag that moved in between leaves none (run it again). An
+`hf.co/` ref has no record and no remedy. A placed node (rail, pull-only)
+still needs the bytes staged with `noo models fetch ollama:<tag>`: importing
+from a record alone is refused by name.
 There is no setting that marks a model trusted. On a node whose Ollama the
 agent does not manage (a Mac's native Ollama) a mismatch is reported, never
 repaired or refused.

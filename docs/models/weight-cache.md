@@ -309,6 +309,11 @@ What it does, in order:
   when a node first asks for its manifest (the artifact manifest route
   hashes any file not yet hashed).
 
+`noo models pull <tag>` and onboard's first model write only the manifest
+(the controller's record of the pull, no blob), and only when it names exactly
+what the pull installed. Verify-on-load checks against it; a placed node
+cannot import from it and is told to run `noo models fetch ollama:<tag>`.
+
 On the node, reconcile asks the store about a placed tag it does not hold; a
 staged tag takes the same import path as `noo cluster import-model`, which
 now accepts the tag itself: `noo cluster import-model <node> ollama:gemma4:12b

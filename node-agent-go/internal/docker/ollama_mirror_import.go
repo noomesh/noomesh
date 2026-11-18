@@ -154,6 +154,12 @@ func (c *Client) importMirror(ctx context.Context, name string, r mirrorRef, gm 
 	return &PullOllamaModelResult{Status: "created", Model: name, Via: via, ManifestSHA256: m.SHA256, Blobs: len(m.Blobs)}, nil
 }
 
+// ErrOllamaRecordOnly is a tag whose manifest the controller's store holds
+// without the blobs it names: the record `noo models pull` and onboard write
+// of a pull (manifest only, no bytes), or a stage whose blobs were removed.
+// There is nothing to import or repair from until the tag is staged.
+var ErrOllamaRecordOnly = errors.New("the controller holds the record of this pull, not its bytes")
+
 // fetchMirrorBlob fetches one blob from the store into work. The store's
 // digest for the file must be the blob's own name: a file that hashes to
 // anything else is not that blob, whatever the transfer says.
@@ -161,7 +167,7 @@ func fetchMirrorBlob(ctx context.Context, model string, b mirrorBlob, cacheURL, 
 	n := b.blobName()
 	am, err := awaitArtifactManifest(ctx, "ollamablob", n)
 	if errors.Is(err, ErrArtifactAbsent) {
-		return "", fmt.Errorf("the controller store's mirror of %s lacks blob %s (%s) — restage it with `noo models fetch ollama:%s --force`", model, b.short(), b.Media, model)
+		return "", fmt.Errorf("%w (its store has no blob %s, %s): run `noo models fetch ollama:%s` to stage them", ErrOllamaRecordOnly, b.short(), b.Media, model)
 	}
 	if err != nil {
 		return "", fmt.Errorf("could not get the artifact manifest for blob %s from the controller: %w", b.short(), err)

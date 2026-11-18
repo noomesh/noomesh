@@ -13,17 +13,23 @@
 // controller's artifact store, and the check is "the store holds what the
 // controller says this model is":
 //
-//   - mirror: the controller staged the registry manifest (ollamamanifest
-//     kind). The local manifest's config digest and layer digest SET must
-//     equal the controller's, and every one of those blobs must hash to its
-//     digest.
+//   - mirror: the controller holds the registry manifest (ollamamanifest
+//     kind): staged with every blob (`noo models fetch ollama:<tag>`), or
+//     recorded alone when it pulled the tag (`noo models pull`, onboard). The
+//     local manifest's config digest and layer digest SET must equal the
+//     controller's, and every one of those blobs must hash to its digest. It
+//     proves the bytes are what the controller recorded, not that the
+//     registry served the right model. A record with no bytes in the store
+//     cannot repair: a mismatch is refused, and the remedy is a re-pull.
 //   - gguf: the controller publishes <name>.Modelfile (a converted model,
 //     e.g. harrier, or a tag staged as GGUF + Modelfile). The local manifest's
 //     MODEL layer must be sha256:<the controller's gguf sha256 for the file
 //     the Modelfile's FROM names>, and that blob must hash to it.
 //   - none: no controller record (a hand `ollama pull`). Reported as
 //     unverified, never refused: `noo models pull <model>` re-pulls it through
-//     the controller, which blesses it.
+//     the controller, which writes the record of that pull. An hf.co/ ref
+//     has no record at all (the controller records registry.ollama.ai tags
+//     only), and no remedy.
 //
 // Hashing goes through a VerifiedRecord (verified/ollama-blobs.json in the
 // agent's own state dir), so a re-check of unchanged blobs is a stat.
@@ -382,6 +388,7 @@ type finding struct {
 	reason     string
 	blob       string   // offending digest, "sha256:<hex>"
 	bad        []string // hexes whose files exist with the wrong bytes
+	missing    []string // hexes the anchor names whose files are absent
 	modelLayer string
 }
 
@@ -394,6 +401,12 @@ func (v *OllamaVerifier) Verify(ctx context.Context, model string) OllamaVerifyR
 	}
 	res := OllamaVerifyResult{Model: model, Anchor: OllamaAnchorNone, CheckedAt: now().UTC().Format(time.RFC3339)}
 	name := strings.TrimPrefix(strings.TrimSpace(model), "ollama:")
+	if strings.HasPrefix(strings.ToLower(name), "hf.co/") {
+		// Not a registry.ollama.ai tag: nothing records it, and a re-pull
+		// would not either, so no remedy is offered.
+		res.State, res.Reason = OllamaUnverified, "hf.co refs have no controller record"
+		return res
+	}
 	ns, n, tag, err := parseOllamaRef(name)
 	if err != nil {
 		res.State, res.Reason = OllamaVerifyErr, err.Error()
@@ -434,6 +447,15 @@ func (v *OllamaVerifier) Verify(ctx context.Context, model string) OllamaVerifyR
 	if a.kind == OllamaAnchorGGUF {
 		verb = "rebuilding it from the controller's verified GGUF"
 	}
+	if a.kind == OllamaAnchorMirror {
+		// A record of a pull holds no bytes: refuse before removing anything.
+		if h := v.storeLacksBytes(ctx, f); h != "" {
+			res.State, res.Remedy = OllamaRefused, ollamaRemedy(model)
+			res.Reason = fmt.Sprintf("%s: blob %s does not match the controller's record (%s), and this model's record is the controller's record of its pull, with no bytes to repair from (the store has no blob sha256:%s) — run `%s`",
+				model, f.blob, f.reason, h[:12], res.Remedy)
+			return res
+		}
+	}
 	if v.repair == nil {
 		return v.refuse(res, model, f, verb, errors.New("no repair path on this agent"))
 	}
@@ -462,11 +484,25 @@ func (v *OllamaVerifier) refuse(res OllamaVerifyResult, model string, f finding,
 	return res
 }
 
+// storeLacksBytes is the first blob a mirror repair would need from the
+// controller's store (one this node lacks, or holds with the wrong bytes)
+// that the store does not hold, "" when it holds them all. A question the
+// store did not answer is not "absent": the repair is tried and says why.
+func (v *OllamaVerifier) storeLacksBytes(ctx context.Context, f finding) string {
+	for _, h := range append(append([]string(nil), f.bad...), f.missing...) {
+		_, err := v.lookup(ctx, "ollamablob", mirrorBlob{Hex: h}.blobName())
+		if errors.Is(err, ErrArtifactAbsent) {
+			return h
+		}
+	}
+	return ""
+}
+
 func anchorWhat(kind string) string {
 	if kind == OllamaAnchorGGUF {
 		return "GGUF"
 	}
-	return "mirrored manifest"
+	return "record of its pull"
 }
 
 // localModelLayer is the model-layer digest the local manifest names, "" if
@@ -541,6 +577,7 @@ func (v *OllamaVerifier) checkMirror(body []byte, lm *localManifest, lerr, lmErr
 			if firstMissing == "" {
 				firstMissing = "sha256:" + b.Hex
 			}
+			f.missing = append(f.missing, b.Hex)
 		}
 	}
 	switch {

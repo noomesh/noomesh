@@ -154,6 +154,14 @@ pub fn models_pull(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         );
     }
 
+    // The registry's manifest, fetched before the pull: the controller's
+    // record of it is written after, only if the pull installed exactly it
+    // (commands/ollama_stage.rs, "The record of a pull").
+    let pending = crate::commands::ollama_stage::record_before_pull(
+        &crate::commands::ollama_stage::registry_base(),
+        &model,
+        std::path::Path::new(&crate::commands::models_fetch::controller_store_dir()),
+    );
     let body = serde_json::json!({ "model": model });
     let mut resp = post_json_stream(g, "/api/terminal/ollama/pull", &body, true, 600);
     let status = resp.status().as_u16();
@@ -260,9 +268,21 @@ pub fn models_pull(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             Some("check the ollama backend's logs; the download may still be running server-side"),
         );
     }
+    // The pull went to the gateway's ollama: this install's ollama service.
+    let ollama = crate::envfile::container(&compose_service_for_backend(&crate::envfile::repo_root(), "ollama"));
+    let record = crate::commands::ollama_stage::record_after_pull(pending, |r| {
+        crate::commands::ollama_stage::read_container_manifest(&ollama, r)
+    });
     if g.json {
-        println!("{}", last.unwrap_or(serde_json::json!({"status": "success"})));
+        let mut out = last.unwrap_or(serde_json::json!({"status": "success"}));
+        if let Some(o) = out.as_object_mut() {
+            o.insert("controller_record".into(), json!({"written": record.written(), "detail": record.line()}));
+        }
+        println!("{out}");
     } else {
+        if let Some(line) = record.line() {
+            if record.written() { ui::step(&line) } else { ui::warned(&line) }
+        }
         ui::close_done(&format!("{model} pulled"));
         let switch = format!("noo models switch {model} --backend ollama");
         ui::guide(&[
@@ -1809,6 +1829,22 @@ mod harrier_pull_tests {
         assert!(route < ollama, "harrier must be routed before the Ollama pull");
         assert!(pull[route..ollama].contains("pull_harrier(g)"));
         assert!(crate::test_src::fn_body(&src, "fn pull_harrier(").contains("ensure_embed_model_core(\"harrier\")"));
+    }
+
+    /// The Ollama pull writes the controller's record of itself: the registry
+    /// manifest is fetched before the gateway pull, and recorded after it
+    /// against what the gateway's ollama now holds (ollama_stage.rs tests the
+    /// recorder itself).
+    #[test]
+    fn models_pull_records_the_ollama_pull_in_the_controller_store() {
+        let src = crate::test_src::own_code(include_str!("models.rs"));
+        let pull = crate::test_src::fn_body(&src, "pub fn models_pull(");
+        let before = pull.find("ollama_stage::record_before_pull(").expect("the manifest is fetched before the pull");
+        let ollama = pull.find("/api/terminal/ollama/pull").expect("the ollama pull");
+        let finished = pull.find("if !finished").expect("the completion check");
+        let after = pull.find("ollama_stage::record_after_pull(pending,").expect("the record is written after the pull");
+        assert!(before < ollama && finished < after, "fetch, pull, confirm the pull, then record");
+        assert!(pull[after..].contains("read_container_manifest(&ollama, r)"), "the record compares with the gateway's ollama");
     }
 
     #[test]

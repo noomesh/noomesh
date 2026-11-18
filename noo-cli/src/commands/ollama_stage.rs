@@ -42,6 +42,7 @@
 //! store manifest that differs is a conflict unless `--force`; an interrupted
 //! blob download resumes (HTTP Range) on re-run.
 
+use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -454,6 +455,148 @@ pub(crate) fn stage(
         downloaded,
         resumed_from: resumed_total,
     })
+}
+
+// ── The record of a pull ────────────────────────────────────────────────
+//
+// `noo models pull <tag>` and onboard's first model pull a tag into the
+// controller's ollama; neither stages bytes in this store. What they leave is
+// a RECORD: the registry manifest, verbatim, as `<stem>.ollama-manifest` and
+// no blob (a model layer is GBs, and the bytes are in ollama's store already).
+// It is written only when the manifest fetched here names exactly the config
+// and layers the ollama that pulled now holds; a tag that moved between the
+// two requests leaves no record, and a record is never built from what is on
+// disk. Verify-on-load checks a model's local manifest and blobs against it:
+// the bytes equal what this controller recorded at the pull, which is not
+// proof that the registry served the right model. A placed node that would
+// import the tag finds no blobs and is told to stage them
+// (`noo models fetch ollama:<tag>`).
+
+/// What became of the record of one pull.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PullRecord {
+    /// Written (or already there, the same bytes) at this path.
+    Written(PathBuf),
+    /// Not a registry.ollama.ai tag (an `hf.co/…` ref): nothing to record.
+    NotRegistry,
+    /// This box has no controller model store: nothing recorded.
+    NoStore(String),
+    /// The registry's tag (named) changed during the pull: nothing recorded.
+    Moved(String),
+    /// A step failed: nothing recorded.
+    Failed(String),
+}
+
+impl PullRecord {
+    /// The one line the operator is told; None for a ref that has no record.
+    pub(crate) fn line(&self) -> Option<String> {
+        match self {
+            PullRecord::Written(p) => Some(format!(
+                "recorded the pull in the controller's store ({}): verify-on-load checks this model's bytes against it",
+                p.display()
+            )),
+            PullRecord::NotRegistry => None,
+            PullRecord::NoStore(why) | PullRecord::Failed(why) => Some(format!("no controller record written: {why}")),
+            PullRecord::Moved(tag) => Some(format!("the registry's {tag} changed during the pull; no record written — run it again")),
+        }
+    }
+
+    pub(crate) fn written(&self) -> bool {
+        matches!(self, PullRecord::Written(_))
+    }
+}
+
+/// The registry manifest fetched before a pull, waiting for the pull.
+#[derive(Debug)]
+pub(crate) struct PendingRecord {
+    r: OllamaRef,
+    raw: Vec<u8>,
+    store: PathBuf,
+}
+
+/// Step one, BEFORE the pull: fetch the registry's manifest for `model` over
+/// HTTPS from here (never through the container), validated with the rules
+/// the node applies. A ref that is not on the registry, or a box with no
+/// store, is the answer itself.
+pub(crate) fn record_before_pull(base: &str, model: &str, store: &Path) -> Result<PendingRecord, PullRecord> {
+    let Ok(r) = parse_ref(model) else {
+        return Err(PullRecord::NotRegistry);
+    };
+    if !store.is_dir() {
+        return Err(PullRecord::NoStore(format!(
+            "this box has no controller model store ({}); pull on the controller to record it",
+            store.display()
+        )));
+    }
+    let raw = get_manifest(base, &r)
+        .and_then(|raw| check_manifest(&raw).map(|_| raw))
+        .map_err(|e| PullRecord::Failed(format!("the registry manifest: {e}")))?;
+    Ok(PendingRecord { r, raw, store: store.to_path_buf() })
+}
+
+/// The config digest and the SET of layer digests a manifest names.
+fn named_digests(raw: &[u8]) -> Result<(String, BTreeSet<String>), String> {
+    let m: Value = serde_json::from_slice(raw).map_err(|e| format!("not JSON: {e}"))?;
+    let config = m["config"]["digest"].as_str().ok_or("no config digest")?.to_string();
+    let mut layers = BTreeSet::new();
+    for l in m["layers"].as_array().ok_or("no layers")? {
+        layers.insert(l["digest"].as_str().ok_or("a layer has no digest")?.to_string());
+    }
+    Ok((config, layers))
+}
+
+/// Step two, AFTER a pull that succeeded: `read_local` returns the manifest
+/// the ollama that pulled now holds for the tag. Only when it names the same
+/// config and layers as the fetched manifest are the FETCHED bytes written,
+/// replacing any older record of the tag.
+pub(crate) fn record_after_pull(
+    pending: Result<PendingRecord, PullRecord>,
+    read_local: impl FnOnce(&OllamaRef) -> Result<Vec<u8>, String>,
+) -> PullRecord {
+    let p = match pending {
+        Ok(p) => p,
+        Err(answer) => return answer,
+    };
+    let local = match read_local(&p.r) {
+        Ok(b) => b,
+        Err(e) => return PullRecord::Failed(format!("the pulled manifest could not be read: {e}")),
+    };
+    let want = match named_digests(&p.raw) {
+        Ok(d) => d,
+        Err(e) => return PullRecord::Failed(format!("the registry manifest: {e}")),
+    };
+    let have = match named_digests(&local) {
+        Ok(d) => d,
+        Err(e) => return PullRecord::Failed(format!("the pulled manifest: {e}")),
+    };
+    if want != have {
+        return PullRecord::Moved(p.r.short());
+    }
+    let name = format!("{}{MIRROR_MANIFEST_SUFFIX}", p.r.stem());
+    match install_bytes(&p.store, &name, &p.raw) {
+        Ok(path) => PullRecord::Written(path),
+        Err(e) => PullRecord::Failed(format!("writing {name}: {e}")),
+    }
+}
+
+/// Where an ollama container keeps its store: the hardened image's, then the
+/// upstream image's (node-agent-go/internal/docker/ollama_store.go).
+const OLLAMA_CONTAINER_STORES: [&str; 2] = ["/home/nonroot/.ollama", "/root/.ollama"];
+
+/// The manifest `container`'s ollama holds for `r`, read inside it. ollama
+/// keeps the path lowercased, as the node does.
+pub(crate) fn read_container_manifest(container: &str, r: &OllamaRef) -> Result<Vec<u8>, String> {
+    let rel = format!("{}/{}/{}", r.ns, r.name, r.tag).to_ascii_lowercase();
+    let mut last = String::new();
+    for root in OLLAMA_CONTAINER_STORES {
+        let path = format!("{root}/models/manifests/registry.ollama.ai/{rel}");
+        match std::process::Command::new("docker").args(["exec", container, "cat", &path]).output() {
+            Ok(o) if o.status.success() => return Ok(o.stdout),
+            Ok(o) => last = String::from_utf8_lossy(&o.stderr).trim().to_string(),
+            Err(e) => return Err(format!("docker exec {container}: {e}")),
+        }
+    }
+    Err(format!("{container} holds no manifest for {} ({last})", r.short()))
 }
 
 // ── The command ─────────────────────────────────────────────────────────
@@ -1098,6 +1241,92 @@ mod tests {
         assert!(e.to_string().contains("no library/gemma4:nope"), "{e}");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── The record of a pull ────────────────────────────────────────────
+
+    /// What ollama keeps after the pull: the same digests, its own layout.
+    fn pulled(manifest: &Value) -> Vec<u8> {
+        manifest.to_string().into_bytes()
+    }
+
+    #[test]
+    fn a_pull_whose_manifest_matches_is_recorded_verbatim_without_a_blob() {
+        let w = weight();
+        let (manifest, blobs) = model_fixture(&w);
+        let raw = pretty(&manifest);
+        let reg = serve_raw(raw.clone(), blobs, None, 8);
+        let dir = tmpdir("record-ok");
+        let pending = record_before_pull(&reg.base, "gemma4:12b", &dir);
+        let rec = record_after_pull(pending, |r| {
+            assert_eq!(r.stem(), "ollama+library+gemma4+12b");
+            Ok(pulled(&manifest))
+        });
+        assert_eq!(rec, PullRecord::Written(dir.join(MANIFEST)));
+        // The registry's bytes, not ollama's: the node digests these exactly.
+        assert_eq!(std::fs::read(dir.join(MANIFEST)).unwrap(), raw);
+        assert_eq!(names(&dir), vec![MANIFEST.to_string()], "a record carries no blob");
+        assert_eq!(reg.blob_hits(), 0, "a record requests no blob");
+        assert!(rec.line().unwrap().contains("recorded the pull in the controller's store"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tag_that_moved_during_the_pull_writes_no_record() {
+        let w = weight();
+        let (manifest, blobs) = model_fixture(&w);
+        let reg = serve_raw(pretty(&manifest), blobs, None, 8);
+        let dir = tmpdir("record-moved");
+        // ollama installed a different model layer than the registry now names.
+        let mut other = manifest.clone();
+        other["layers"][0] = layer_json(MODEL_MEDIA, b"GGUF the tag's next weights");
+        let rec = record_after_pull(record_before_pull(&reg.base, "gemma4:12b", &dir), |_| Ok(pulled(&other)));
+        assert_eq!(rec, PullRecord::Moved("gemma4:12b".into()));
+        assert_eq!(rec.line().unwrap(), "the registry's gemma4:12b changed during the pull; no record written — run it again");
+        assert!(names(&dir).is_empty(), "{:?}", names(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pull_record_replaces_an_older_record_of_the_tag() {
+        let w = weight();
+        let (manifest, blobs) = model_fixture(&w);
+        let raw = pretty(&manifest);
+        let reg = serve_raw(raw.clone(), blobs, None, 8);
+        let dir = tmpdir("record-replace");
+        std::fs::write(dir.join(MANIFEST), b"{\"old\":true}").unwrap();
+        let rec = record_after_pull(record_before_pull(&reg.base, "gemma4:12b", &dir), |_| Ok(pulled(&manifest)));
+        assert!(rec.written(), "{rec:?}");
+        assert_eq!(std::fs::read(dir.join(MANIFEST)).unwrap(), raw);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_hf_ref_pull_writes_no_record_and_asks_nothing() {
+        let w = weight();
+        let (manifest, blobs) = model_fixture(&w);
+        let reg = serve(manifest, blobs, None, 8);
+        let dir = tmpdir("record-hf");
+        let pending = record_before_pull(&reg.base, "hf.co/org/repo:Q4_K_M", &dir);
+        assert!(matches!(pending, Err(PullRecord::NotRegistry)), "{pending:?}");
+        let rec = record_after_pull(pending, |_| panic!("an hf.co ref has no manifest to read"));
+        assert_eq!(rec, PullRecord::NotRegistry);
+        assert_eq!(rec.line(), None);
+        assert!(reg.hits.lock().unwrap().is_empty(), "the registry was asked about an hf.co ref");
+        assert!(names(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_box_without_the_store_says_so_and_writes_nothing() {
+        let w = weight();
+        let (manifest, blobs) = model_fixture(&w);
+        let reg = serve(manifest.clone(), blobs, None, 8);
+        let dir = tmpdir("record-nostore").join("absent");
+        let rec = record_after_pull(record_before_pull(&reg.base, "gemma4:12b", &dir), |_| Ok(pulled(&manifest)));
+        assert!(matches!(rec, PullRecord::NoStore(_)), "{rec:?}");
+        assert!(rec.line().unwrap().starts_with("no controller record written: this box has no controller model store"));
+        assert!(!dir.exists());
     }
 
     #[test]
