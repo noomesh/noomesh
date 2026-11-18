@@ -2006,7 +2006,7 @@ const TEXT_KINDS: &[&str] = &[
     "agent-env", "harness-env", "nats-creds", "fleet-secrets", "host-telemetry", "teardown",
     "cli-user", "signing-pub", "ca.crt", "node.crt", "node.key", "agent-plist", "run-agent",
     "harness-plist", "run-harness", "restart-backends", "vendor-cli-manifest",
-    "vendor-cli-2-manifest", "vendor-cli-3-manifest",
+    "vendor-cli-2-manifest", "vendor-cli-3-manifest", "netns-unit",
 ];
 
 /// Where a ROOT apply keeps its trust anchors (`ca.crt`, `signing.pub`):
@@ -2596,6 +2596,10 @@ const KNOWN_KINDS: &[&str] = &[
     // `crate::release_gate`): the CLI release's sha256sums.txt, its signature
     // and the version text it names; the stack lock + signature (Linux agent).
     "release-sums", "release-sums.sig", "release-version", "release-lock", "release-lock.sig",
+    // i907: the Linux controller self-node's noo-netns-restore.service
+    // parameters. Known so a bundle naming it is not refused; a Mac has no
+    // systemd and its controller never stages it, so nothing reads it here.
+    "netns-unit",
 ];
 
 /// The HTTPS agent for the poller: trusts ONLY the cluster CA pinned at
