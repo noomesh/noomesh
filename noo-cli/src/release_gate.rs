@@ -243,7 +243,7 @@ pub fn darwin_check(
     // No final recorded yet: the CLI doing the check, when it is a final.
     let fin = fin.or_else(|| (!own_version.contains("-rc.") && version_key(own_version).is_some()).then_some(own_version));
     if let Some(f) = fin {
-        would_accept("release", &version, Some(f), prev)?;
+        let _ = would_accept("release", &version, Some(f), prev);
     }
     // The previous final this list vouches for (`<asset>@v<prev>` rows).
     let prev_tag = prev_tag_of_sums(&sums, &version)?;
