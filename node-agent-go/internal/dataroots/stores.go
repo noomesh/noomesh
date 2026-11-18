@@ -13,8 +13,11 @@ import (
 
 // The model stores' modes, for the `model stores` verify row (proposal 61
 // §7b). A store anyone on the host can write is a store anyone can plant
-// model bytes in: HF weights are re-verified on load, the rest is not
-// (yet). Found on awolf 2026-11-17: hf-cache, hub, models and ollama 0777.
+// model bytes in. HF weights are verified at each backend start on a placed
+// node, GGUF files at start when the controller has a manifest, Ollama models
+// against the controller's record about every 10 minutes; a store written by
+// hand, or a node without a controller record, is not. Found on awolf
+// 2026-11-17: hf-cache, hub, models and ollama 0777.
 //
 // The heartbeat's `data_roots.stores` is
 //
