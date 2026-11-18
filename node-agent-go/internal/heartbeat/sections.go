@@ -180,6 +180,7 @@ var heartbeatSections = []payloadSection{
 	secGPUContention,
 	secModelSets,
 	secOllamaVerify,
+	secNodeLocal,
 	secBackendCaps,
 	secNodeFacts,
 	secLastStop,
@@ -228,6 +229,14 @@ var (
 		// no Docker backends run (not wired).
 		if bc := r.backendCapsReport(); bc != nil {
 			p["backend_caps"] = bc
+		}
+	}}
+
+	secNodeLocal = payloadSection{name: "nodeLocal", add: func(r *Reporter, p map[string]any) {
+		// The node's own declarations (nodelocal): what it declares and what
+		// it refused, so a declaration is seen to survive a roll.
+		if nl := r.nodeLocalReport(); nl != nil {
+			p["node_local"] = nl
 		}
 	}}
 

@@ -76,3 +76,17 @@ func TestUnitStopTimeoutOutlastsTheDrain(t *testing.T) {
 		t.Errorf("TimeoutStopSec=%d, want %d (the stop drain bound + 20 s)", secs, want)
 	}
 }
+
+// The node's own declarations are applied before anything reads the
+// environment: before the legacy-root adoption and before config.Load.
+func TestNodeLocalDeclarationsAreAppliedBeforeTheEnvironmentIsRead(t *testing.T) {
+	b, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	at, adopt, load := strings.Index(src, "nodelocal.Apply()"), strings.Index(src, "dataroots.AdoptLegacyRoot("), strings.Index(src, "cfg := config.Load()")
+	if at < 0 || adopt < 0 || load < 0 || at > adopt || at > load {
+		t.Fatalf("nodelocal.Apply() at %d must come before AdoptLegacyRoot (%d) and config.Load (%d)", at, adopt, load)
+	}
+}

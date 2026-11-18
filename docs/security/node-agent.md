@@ -518,7 +518,7 @@ Every container the agent creates on a controller's instruction runs with:
   keep a writable root until theirs is moved to a cache mount
   ([networks and containers](networks-and-containers.md#container-hardening)).
 
-`NOO_BACKEND_CAP_ADD` (node-local) widens the backend set for an image that
+`NOO_BACKEND_CAP_ADD` (a node-local declaration, [below](#the-nodes-own-declarations)) widens the backend set for an image that
 genuinely needs more, from an allow-list only: a capability that lets a
 container reach the host (`SYS_ADMIN`, `SYS_PTRACE`, `DAC_READ_SEARCH`,
 `NET_ADMIN`, `ALL`, …) is refused: dropped, so the backend starts without
@@ -1306,7 +1306,7 @@ What this does and does not add:
   while any online Linux node exists, an older agent that becomes rail on
   the roll included.
 - **Third-party public images** may fall back to their registry only under
-  `NOO_IMAGE_REGISTRY_FALLBACK=public` (node-local; the default). Set it to
+  `NOO_IMAGE_REGISTRY_FALLBACK=public` (a [node-local declaration](#the-nodes-own-declarations); the default). Set it to
   `off` for a node that must never reach an internet registry. Every
   fallback is logged and shows on `noo cluster verify` as source
   `registry`.
@@ -1686,6 +1686,73 @@ on the generation floor refuses any applier older than generation 2.
   neither, it refuses root code: "needs OpenSSL 3 or python3".
 - `noo cluster upgrade-hostd` ships the release's own hostd asset with the
   release's signed list; there is no checkout build.
+
+## The node's own declarations
+
+A node limits what the controller may make it do. Those limits are the
+node's own declarations, made ON the node, in `/etc/noo-node-agent.local.env`
+(Linux and Mac alike), a file only the node's operator writes and that no
+apply or roll ever touches. It is root's file: owned by root, mode `644`, in
+a root-owned directory. The agent, which runs as its own unprivileged user,
+can read it but never write it, so a compromised agent can never grant itself
+a capability: a declaration the agent could write for itself would not bound
+it. It holds no secrets.
+
+```sh
+# Linux
+sudo install -m 644 -o root -g root /dev/null /etc/noo-node-agent.local.env
+echo 'NOO_ALLOW_OLLAMA_REGISTRY_PULL=1' | sudo tee -a /etc/noo-node-agent.local.env
+sudo systemctl restart noo-node-agent
+# Mac
+sudo install -m 644 -o root -g wheel /dev/null /etc/noo-node-agent.local.env
+echo 'NOO_ALLOW_OLLAMA_REGISTRY_PULL=1' | sudo tee -a /etc/noo-node-agent.local.env
+sudo launchctl kickstart -k system/net.noomesh.node-agent
+```
+
+The controller-rendered agent env (`/etc/noo-node-agent.env`, the Mac's
+`agent.env`) is replaced whole on every apply, so a line added there by hand
+is gone at the next roll. Declarations go in the local file instead.
+
+The agent reads the file itself at start (it is data, never run by a shell)
+and takes only these keys, by name:
+
+- **trust declarations:** `NOO_BACKEND_CAP_ADD`, `NOO_CONTAINER_IMAGE_ALLOW`,
+  `NOO_CONTAINER_RUN_USER`, `NOO_SKILL_RUN_USER`, `NOO_SKILL_BIND_ROOTS`,
+  `NOO_MCP_SECRETS_FILE`, `NOO_ALLOW_OLLAMA_REGISTRY_PULL`,
+  `NOO_IMAGE_REGISTRY_FALLBACK`;
+- **tuning:** `NOO_GPU_YIELD`, `NOO_GPU_YIELD_FOREIGN_MB`,
+  `NOO_GPU_YIELD_AFTER_S`, `NOO_GPU_RESUME_AFTER_S`, `NOO_GPU_TIMEOUT_GRACE_S`,
+  `NOO_LOG_SHIP`, `NOO_LOG_SHIP_UNITS`, `NOO_AGENT_TUNNEL`.
+
+Any other name in the file is ignored and named: the file can never set a
+controller-owned value such as the cluster secret or the bind address.
+
+Each value is held to its own narrow rule, whatever its source:
+
+- capabilities only from the agent's allow-list; an image allow-list of
+  repositories or namespace prefixes (a whole registry is refused); run users
+  `uid[:gid]` and never root; bind roots absolute, normalised and outside the
+  system trees; `0`/`1`, `on`/`off` and whole numbers where those are meant;
+- a value with a quote, backslash, `$`, backtick, `%` or space is refused.
+
+**Fail closed:**
+
+- a refused trust declaration is NOT in effect (a refused registry fallback is
+  `off`);
+- a refused tuning value leaves the agent's default.
+
+A file that is not a regular file, is group- or world-writable, is not owned
+by root, sits in a directory that is not root's alone (checked where the path
+really leads: macOS's `/etc` is `/private/etc`), or that the agent cannot read
+is refused whole, named in the row, and nothing in it is applied.
+
+A node-local key that still arrives through the agent's environment (a
+systemd drop-in) keeps working, held to the same rules; the local file wins
+when both set a key. `noo cluster verify`'s `node-local` row:
+
+- lists each node's declarations and where each came from;
+- WARNs on a refused one, on a refused file, and on a trust declaration read
+  from the environment (move it into the local file).
 
 ## What is still root
 
