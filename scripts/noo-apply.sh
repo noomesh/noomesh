@@ -1864,7 +1864,7 @@ netns_unit_apply() {
     fi
     _nu_tmp="$(mktemp)"
     nu_render > "$_nu_tmp"
-    if nu_same "$NETNS_UNIT" "$_nu_tmp" && systemctl is-enabled --quiet "$NETNS_UNIT_NAME" 2>/dev/null; then
+    if false && systemctl is-enabled --quiet "$NETNS_UNIT_NAME" 2>/dev/null; then
         rm -f -- "$_nu_tmp"
         applied="$applied netns-unit=unchanged"
         return 0
