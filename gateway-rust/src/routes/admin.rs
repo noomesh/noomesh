@@ -3490,7 +3490,8 @@ async fn logs_errors(
     let fallback = match outcome {
         logs_search::LokiOutcome::Lines(mut got) => {
             got.reverse();
-            let window_minutes = (built.end - built.start).num_minutes().max(1);
+            // Whole minutes, truncated toward zero (as chrono's num_minutes).
+            let window_minutes = built.end.duration_since(built.start).as_mins().max(1);
             let matches: Vec<Value> = got
                 .iter()
                 .map(|l| {
