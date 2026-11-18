@@ -1785,7 +1785,7 @@ async fn role_grants_list(
             json!({
                 "username": username,
                 "roles": roles,
-                "updated_at": updated_at,
+                "updated_at": crate::wire_time::rfc3339_z(updated_at),
                 "updated_by": updated_by,
             })
         })
@@ -4281,7 +4281,7 @@ async fn api_kb_teams(State(state): State<Arc<AppState>>) -> AppResult {
         teams.push(json!({
             "name": name,
             "description": description,
-            "created_at": created_at,
+            "created_at": crate::wire_time::rfc3339_z(created_at),
             "created_by": created_by,
             "members": members,
             "doc_count": doc_count,
