@@ -247,7 +247,12 @@ pub enum Glyph {
 
 impl Glyph {
     fn raw(self) -> &'static str {
-        if styled() {
+        self.raw_in(styled())
+    }
+
+    /// The glyph in the given mode (styled or plain).
+    fn raw_in(self, styled: bool) -> &'static str {
+        if styled {
             match self {
                 Glyph::Ok => "✓",
                 Glyph::Err => "✗",
@@ -937,13 +942,46 @@ pub fn guide(entries: &[(&str, &str)]) {
     if quiet() || entries.is_empty() {
         return;
     }
-    println!("{}", rule());
+    for line in guide_lines(entries) {
+        println!("{line}");
+    }
+}
+
+/// The row glyphs of a table (`noo cluster verify`, in both modes, and the
+/// plain bullet). Rehearsal parsers count `^ +<glyph> +<name> {2,}` as a row,
+/// so no guidance line may start, after its indent, with one of these and a
+/// space.
+pub(crate) const ROW_GLYPHS: [&str; 10] = ["-", "+", "x", "!", "?", "~", "◇", "✓", "✗", "•"];
+
+/// Does `line` (colour stripped, indent ignored) start like a table row: a
+/// row glyph, then a space?
+pub(crate) fn looks_like_row(line: &str) -> bool {
+    let t = plain(line);
+    let t = t.trim_start();
+    ROW_GLYPHS.iter().any(|g| t.strip_prefix(g).is_some_and(|rest| rest.starts_with(' ')))
+}
+
+/// A guidance note's text, never shaped like a row: text that would start
+/// with a row glyph and a space is put in parentheses.
+fn not_a_row(text: &str) -> String {
+    if looks_like_row(text) {
+        format!("({text})")
+    } else {
+        text.to_string()
+    }
+}
+
+/// The lines [`guide`] prints: the rule, then each command (`▸`/`>`, never a
+/// row glyph) and its note (indented, never row-shaped: [`not_a_row`]).
+pub(crate) fn guide_lines(entries: &[(&str, &str)]) -> Vec<String> {
+    let mut out = vec![rule()];
     for (c, why) in entries {
-        println!("{}", hint(c));
+        out.push(hint(c));
         if !why.is_empty() {
-            println!("{}", note(why));
+            out.push(note(&not_a_row(why)));
         }
     }
+    out
 }
 /// The captured value: printed plain on stdout in every mode except
 /// `--json` (the caller owns the JSON path). This is what `--quiet` keeps.
@@ -1594,6 +1632,44 @@ mod tests {
     // Mode is process-global and cached; cargo test's stdout is a pipe, so
     // every test here asserts the PLAIN rendering. Escape shapes are
     // covered by `escape_shapes`, which bypasses the cache.
+
+    /// A guidance block is never read as table rows: rehearsal parsers count
+    /// `^ +<glyph> +<name>` lines as rows, in plain and in styled output. The
+    /// command line leads with the hint glyph (`>` plain, `▸` styled), the
+    /// rule is `-`/`─` with no space after, and a note whose text would start
+    /// with a row glyph is put in parentheses.
+    #[test]
+    fn no_guidance_line_starts_with_a_row_glyph() {
+        let entries = [
+            ("noo tasks list", "node-a: harness tasks; node-b: harness tasks"),
+            ("x fix", "x 2 rows"),
+            ("noo health", "- held"),
+            ("noo gpu", "◇ accepted"),
+            ("noo y", "! careful"),
+            ("", ""),
+        ];
+        // Plain (cargo test's mode): the lines themselves.
+        let lines = guide_lines(&entries);
+        assert_eq!(lines.len(), 1 + 6 + 5, "{lines:?}");
+        for l in &lines {
+            assert!(!looks_like_row(l), "a guidance line reads as a row: {l:?}");
+        }
+        assert!(lines.contains(&note("(x 2 rows)")), "{lines:?}");
+        // Styled: the same shapes with the styled glyphs and rule.
+        for styled in [false, true] {
+            let hint_glyph = Glyph::Hint.raw_in(styled);
+            assert!(!ROW_GLYPHS.contains(&hint_glyph), "the hint glyph is a row glyph when styled={styled}");
+            for (c, why) in &entries {
+                assert!(!looks_like_row(&format!("{hint_glyph} {c}")), "styled={styled}: {c}");
+                assert!(!looks_like_row(&format!("    {}", not_a_row(why))), "styled={styled}: {why}");
+            }
+            let rule_char = if styled { "─" } else { "-" };
+            assert!(!looks_like_row(&rule_char.repeat(40)));
+        }
+        // The guard itself: a row is recognised whatever its indent or colour.
+        assert!(looks_like_row("  x  gpu   held"));
+        assert!(looks_like_row("\x1b[31m✗\x1b[0m sandbox  down"));
+    }
 
     #[test]
     fn plain_mode_under_cargo_test() {
