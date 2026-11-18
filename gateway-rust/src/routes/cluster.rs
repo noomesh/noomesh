@@ -604,6 +604,11 @@ async fn node_heartbeat(
     // a new heartbeat field is dropped by default, and the row would have
     // read every node as "agent predates the shipper".
     carry_reported(&mut data, &body, "log_ship");
+    // The agent's previous stop drain (node-agent-go stopdrain), sent in
+    // one beat after a restart and kept on the record until the next stop:
+    // the roll's node report reads it (what finished, what was cut, whether
+    // the 30 s bound was hit).
+    carry_reported(&mut data, &body, "last_stop");
     // The node's measured model speed (`POST /bench` on the agent,
     // `noo cluster profile <node> --bench`): `{model, backend, load_secs,
     // prefill_tps, decode_tps, prompt_tokens, at}`. Absent until a bench has
@@ -7320,6 +7325,7 @@ mod heartbeat_carry_tests {
         let handler = src.split("async fn node_heartbeat(").nth(1).expect("the handler")
             .split("\nasync fn ").next().unwrap();
         assert!(handler.contains("carry_reported(&mut data, &body, \"log_ship\")"), "node_heartbeat does not carry log_ship");
+        assert!(handler.contains("carry_reported(&mut data, &body, \"last_stop\")"), "node_heartbeat does not keep the agent's last stop drain: the roll cannot report it");
         assert!(handler.contains("carry_reported(&mut data, &body, \"peer_identity_enforced\")"),
             "node_heartbeat does not carry peer_identity_enforced — the verify row would judge a stale registration");
     }

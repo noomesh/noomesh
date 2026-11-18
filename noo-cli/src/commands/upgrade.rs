@@ -2924,6 +2924,8 @@ fn rail_names(mut names: Vec<String>, is_self: impl Fn(&str) -> bool, on_control
 /// rides the same rail, last (i67): no sudo, and a refusal with the remedy
 /// when its pull units are missing.
 fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
+    // A node agent's stop during THIS roll is reported (drain_bound_hits).
+    let roll_started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     // The gateway wait is the caller's Gateway phase (run_fleet_stages).
     let doc = crate::http::get_json(g, "/api/security/bootstrap-tokens", true, 15);
     let Some(toks) = doc.get("tokens").and_then(|t| t.as_array()) else {
@@ -3107,6 +3109,7 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
     for line in &stagger.notes {
         ui::say(&ui::status_line(Glyph::Warn, line));
     }
+    print_drain_bound_hits(g, &order, roll_started);
     // A node whose first staging failed is already in `failed`; waiting
     // for it to apply a bundle it never got would only burn the budget.
     let waiting: Vec<String> = leafless.into_iter()
@@ -3391,6 +3394,49 @@ pub(crate) fn print_node_outcomes(g: &Globals, rows: &[NodeOutcome]) {
     for line in node_outcome_lines(rows) {
         ui::say(&line);
     }
+}
+
+/// A node agent whose stop during this roll hit its drain bound cut answers
+/// a caller was still reading (node-agent-go stopdrain, 30 s): one line per
+/// such node, after the table. Read from the gateway's node records
+/// (`last_stop`, kept from the agent's first beat after its restart); a
+/// node whose beat has not arrived yet, or an older agent, says nothing.
+fn print_drain_bound_hits(g: &Globals, order: &[String], since_unix: u64) {
+    let Ok(nodes) = crate::http::get_json_try(g, "/api/cluster/nodes", true, 10) else {
+        return;
+    };
+    let lines = drain_bound_hits(&nodes, order, since_unix);
+    if lines.is_empty() {
+        return;
+    }
+    if g.json {
+        println!("{}", serde_json::json!({ "drain_bound_hits": lines }));
+        return;
+    }
+    for line in lines {
+        ui::say(&ui::sub(&ui::status_line(Glyph::Warn, &line)));
+    }
+}
+
+/// The lines [`print_drain_bound_hits`] prints, pure.
+pub(crate) fn drain_bound_hits(nodes: &serde_json::Value, order: &[String], since_unix: u64) -> Vec<String> {
+    let list = nodes.get("nodes").unwrap_or(nodes).as_array().cloned().unwrap_or_default();
+    order
+        .iter()
+        .filter_map(|name| {
+            let n = list.iter().find(|n| n.get("id").and_then(|v| v.as_str()) == Some(name.as_str()))?;
+            let s = n.get("last_stop")?;
+            let during = s.get("at_unix").and_then(|v| v.as_u64()).is_some_and(|t| t >= since_unix);
+            if !during || s.get("bound_hit").and_then(|v| v.as_bool()) != Some(true) {
+                return None;
+            }
+            let cut = s.get("cut_at_bound").and_then(|v| v.as_u64()).unwrap_or(0);
+            let oldest = s.get("oldest_age_secs").and_then(|v| v.as_u64()).unwrap_or(0);
+            Some(format!(
+                "{name}: its agent's stop cut {cut} streaming answer(s) at the 30 s drain bound (oldest {oldest} s old); those callers saw the answer end early"
+            ))
+        })
+        .collect()
 }
 
 /// The table's text lines (no colour decisions beyond the glyph).
@@ -8286,5 +8332,44 @@ mod cpu_only_slots_upgrade_tests {
         assert!(stack.contains("reconcile_cpu_only_slots(g, &roll.root);"), "{stack}");
         let nodes = crate::test_src::fn_body(&own, "fn upgrade_nodes(");
         assert!(!nodes.contains("reconcile_cpu_only_slots"), "a node's upgrade never touches it");
+    }
+}
+
+/// The roll's node report for a node agent's stop drain (node-agent-go
+/// stopdrain, option B of the 0.6.26 roll's chat 502).
+#[cfg(test)]
+mod drain_report_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// One line per rolled node whose stop DURING this roll hit the bound;
+    /// nothing for a stop that drained cleanly, a stop before this roll, a
+    /// node not in this roll, or an agent that never reported.
+    #[test]
+    fn a_stop_that_hit_the_bound_during_the_roll_gets_one_line() {
+        let nodes = json!({"nodes": [
+            {"id": "node_a", "last_stop": {"bound_hit": true, "cut_at_bound": 2, "oldest_age_secs": 41, "at_unix": 2000}},
+            {"id": "node_b", "last_stop": {"bound_hit": false, "drained": 3, "at_unix": 2000}},
+            {"id": "node_c", "last_stop": {"bound_hit": true, "cut_at_bound": 1, "oldest_age_secs": 33, "at_unix": 900}},
+            {"id": "node_d"},
+            {"id": "elsewhere", "last_stop": {"bound_hit": true, "cut_at_bound": 1, "at_unix": 2000}},
+        ]});
+        let order: Vec<String> = ["node_a", "node_b", "node_c", "node_d"].iter().map(|s| s.to_string()).collect();
+        let lines = drain_bound_hits(&nodes, &order, 1000);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("node_a: its agent's stop cut 2 streaming answer(s) at the 30 s drain bound (oldest 41 s old)"), "{}", lines[0]);
+        // The bare-array shape of /api/cluster/nodes reads the same.
+        let bare = nodes["nodes"].clone();
+        assert_eq!(drain_bound_hits(&bare, &order, 1000), lines);
+    }
+
+    #[test]
+    fn the_nodes_stage_prints_it_after_the_table() {
+        let code = include_str!("upgrade.rs");
+        let body = code.split("fn upgrade_nodes(g: &Globals)").nth(1).expect("upgrade_nodes").split("\nfn ").next().unwrap();
+        let table = body.find("print_node_outcomes(g, &node_outcome_rows(&order, &skipped, &waited, &failed));").expect("the table");
+        let report = body.find("print_drain_bound_hits(g, &order, roll_started);").expect("the drain report");
+        assert!(table < report, "after the table");
+        assert!(body.find("let roll_started").expect("the roll's start") < table);
     }
 }

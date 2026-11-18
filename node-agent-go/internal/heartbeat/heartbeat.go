@@ -14,12 +14,14 @@ import (
 	"errors"
 	"fmt"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelstats"
+	"github.com/noomesh/noomesh/node-agent-go/internal/stopdrain"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -176,6 +178,12 @@ type Reporter struct {
 	// loop's goroutine (SendHeartbeat is not called concurrently).
 	failStreak  int
 	silentSince time.Time
+	// The previous stop's drain record (stopdrain.RecordFile), reported once:
+	// read on the first beat, sent until a beat carrying it is delivered,
+	// then removed. lastStopRead stops a second read when there is none.
+	lastStop     json.RawMessage
+	lastStopRead bool
+	lastStopSent bool
 
 	// encoding is the gzip state (beatgzip.go). Same goroutine as
 	// failStreak.
@@ -740,6 +748,7 @@ func (r *Reporter) noteOutcome(clk *stageClock, err error) {
 		}
 		return
 	}
+	r.lastStopDelivered()
 	if r.failStreak > 0 {
 		slog.Info("heartbeat delivery resumed",
 			"after_failures", r.failStreak,
@@ -1105,5 +1114,32 @@ func addLoad(payload map[string]any, m metrics.SystemMetrics) {
 	}
 	if m.CPULoad != nil {
 		payload["cpu_load"] = *m.CPULoad
+	}
+}
+
+// pendingLastStop is the previous stop's drain record while it is still to
+// be reported, else nil. Read once from the state dir; a missing or
+// unreadable record is simply nothing to report.
+func (r *Reporter) pendingLastStop() json.RawMessage {
+	if !r.lastStopRead {
+		r.lastStopRead = true
+		if r.cfg != nil && r.cfg.StateDir != "" {
+			if b, err := os.ReadFile(filepath.Join(r.cfg.StateDir, stopdrain.RecordFile)); err == nil && json.Valid(b) {
+				r.lastStop = b
+			}
+		}
+	}
+	return r.lastStop
+}
+
+// lastStopDelivered closes the report once a beat that carried it arrived.
+func (r *Reporter) lastStopDelivered() {
+	if !r.lastStopSent {
+		return
+	}
+	r.lastStopSent = false
+	r.lastStop = nil
+	if r.cfg != nil && r.cfg.StateDir != "" {
+		_ = os.Remove(filepath.Join(r.cfg.StateDir, stopdrain.RecordFile))
 	}
 }
