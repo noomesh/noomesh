@@ -109,7 +109,7 @@ def judge():
 
     # ── after --all ──
     if roll is None:
-        for a in ("A1", "A2", "A3", "A4", "A5", "A6", "A7"):
+        for a in ("A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8"):
             say(a, "NOT REACHED", "the --all roll did not run")
     else:
         stopped = [l for l in roll.splitlines() if "Upgrade stopped at the" in l or "staging failed" in l
@@ -187,6 +187,18 @@ def judge():
             say("A7", "PASS", "the self node heartbeats on the new build: %s" % ver[0].get("detail"))
         else:
             say("A7", "FAIL", " | ".join((cut[:1] + silent[:1] + ["version: %s: %s" % (ver[0].get("verdict"), ver[0].get("detail")) if ver else "no version row"])))
+
+        # A8: the old→new applier handshake ran cleanly (from rc.3, #1350):
+        # the generation-2 applier, re-execed on the applier-only bundle,
+        # says it is already installed exactly once in the --all window, and
+        # the CLI never reports the old exit 75.
+        hand = [l.strip() for l in (roll_journal + "\n" + roll).splitlines()
+                if "applier-only bundle: this applier is already installed" in l and "nothing to install" in l]
+        e75 = [l.strip() for l in roll.splitlines() if "reported exit 75" in l]
+        if len(hand) >= 1 and not e75:
+            say("A8", "PASS", hand[0])
+        else:
+            say("A8", "FAIL", " | ".join(e75[:1] + hand[:2]) or "no 'applier-only bundle: this applier is already installed … nothing to install' in the --all window")
 
     # ── after the same-tag --stack ──
     if stack is None:
