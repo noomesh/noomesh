@@ -239,6 +239,30 @@ def test_a_badly_shaped_root_is_refused(node: Node, root: str) -> None:
     assert_refused(node, before, "root")
 
 
+@pytest.mark.parametrize("name", ["in%h", 'in"q', "in\\b", "in b", "in\tt"])
+def test_a_root_outside_the_charset_is_refused_even_when_it_is_a_real_install(node: Node, name: str) -> None:
+    """The charset rule alone: the directory exists and the user owns it and
+    its script, so only the shape can refuse a systemd specifier or a quote."""
+    before = installed(node)
+    odd = node.tmp / name
+    (odd / "scripts").mkdir(parents=True)
+    (odd / "scripts" / "noo-netns-restore.sh").write_text("#!/bin/sh\n")
+    if os.getuid() == 0:
+        for p in (odd, odd / "scripts", odd / "scripts" / "noo-netns-restore.sh"):
+            os.chown(p, UID, UID)
+    node.write(f"user=alex\nroot={odd}\n")
+    assert_refused(node, before, "root")
+
+
+@pytest.mark.parametrize("user", ["-alex", ".alex", "al%ex", 'al"ex', "al\\ex", "a" * 33])
+def test_a_user_the_host_knows_is_still_held_to_its_shape(node: Node, user: str) -> None:
+    """The shape rule alone: this host's `id` answers for any name."""
+    before = installed(node)
+    node._exe("id", f'#!/bin/sh\n[ "$1" = -u ] || exit 2\necho {UID}\n')
+    node.write(f"user={user}\nroot={node.install}\n")
+    assert_refused(node, before, "user")
+
+
 def test_a_root_the_user_does_not_own_is_refused(node: Node) -> None:
     before = installed(node)
     other = node.tmp / "elsewhere"
