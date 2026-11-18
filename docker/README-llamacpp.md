@@ -31,9 +31,14 @@ ships it to an edge node.
 
 ## Where nodes look
 
-A node prefers, in order: a release-pinned image (when the deployment carries
-a release pin), then a local build tagged `pai-assistant/llamacpp:<arch>` or
-`:latest` when one exists on that node, and only then the upstream
-`ghcr.io/ggml-org/llama.cpp:server`. `LLAMACPP_IMAGE` overrides this
-resolution on both the node agent and the `docker-compose.cluster.yml`
-service.
+A node with a release pin (`NOO_IMAGE_PREFIX` and `NOO_IMAGE_TAG`) runs this
+image from its release and never falls back: not staged for its arch is a
+refusal naming the restage command. A box with no release pin (a dev box)
+runs upstream `ghcr.io/ggml-org/llama.cpp:server`. A local build
+(`pai-assistant/llamacpp:<arch>`) is never a default: it runs only where
+`LLAMACPP_IMAGE` (node agent and the `docker-compose.cluster.yml` service) or
+a placement's image names it (`node-agent-go/internal/docker/backends.go`
+`llamacppDefaultImage`).
+
+It is a CPU build on every arch (no `GGML_CUDA`): a GPU target cannot speed it
+up, and `noo cluster place` records llamacpp as cpu.

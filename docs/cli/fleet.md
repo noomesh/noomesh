@@ -140,7 +140,9 @@ noo cluster fit gpu-2 --with llamacpp gemma-3-27b-it-Q4_K_M.gguf --on cpu
 
 With no `--on`, a placement keeps the target it already has; otherwise
 `N_GPU_LAYERS=0` means cpu, and a node with a GPU defaults to gpu. `--on
-gpu` on a node that reports no GPU is refused.
+gpu` on a node that reports no GPU is refused. **llamacpp is the exception:**
+the shipped llama.cpp image is a CPU (OpenBLAS) build with no CUDA, so `place`
+records a llamacpp placement as cpu whatever `--on` says, and prints why.
 
 `noo cluster fit` budgets each placement against its own pool: a gpu
 placement against GPU memory (`vram`, or the `unified` GPU share on Apple
@@ -159,7 +161,7 @@ each value with the reason:
 |---|---|---|
 | `N_THREADS` (llamacpp on cpu) | about 25% of the cores, at least 2 | cores minus 2 |
 | `N_PARALLEL` / `OLLAMA_NUM_PARALLEL` | 1 | chat: 2 on gpu, 1 on cpu; embed: 4 |
-| `N_BATCH` (llamacpp) | 256 cpu / 512 gpu | 512 cpu / 2048 gpu |
+| `N_BATCH` (llamacpp, always cpu: see above) | 256 | 512 |
 | `N_CTX` (llamacpp chat) | sized so the KV cache takes at most half the memory left after the model, a power of two from 2048 to 32768 | same |
 | GPU headroom in `fit` | `max(20%, 2 GB)` | `max(10%, 1 GB)` |
 
