@@ -259,7 +259,7 @@ def judge():
         sj = text(os.path.join(jr, "sudo-stack.journal")) or ""
         cmds = [l.strip() for l in sj.splitlines() if "COMMAND=" in l]
         say("B3", "FAIL" if cmds else "PASS",
-            ("%d sudo command(s) during the --stack: %s" % (len(cmds), cmds[0])) if cmds
+            ("%d sudo command(s) during the --stack: %s" % (len(cmds), " | ".join(cmds))) if cmds
             else "0 sudo commands in the journal during the same-tag --stack (operator: %s)"
             % subprocess.run(["id", "-un"], capture_output=True, text=True).stdout.strip())
 
