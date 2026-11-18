@@ -54,6 +54,9 @@ step 2 — enroll (joins the tailnet, runs host prep, installs the agent):
 bound to node: gpu-2. When the paste finishes: noo cluster provision gpu-2 --wait
 ```
 
+The paste runs several `sudo` commands; you type your password once while
+sudo's credential cache holds.
+
 The raw token is shown once and never stored; `--no-tailscale` prints the
 same paste without a tailnet key, for a node already on the network; `--cidr`
 restricts where it can be redeemed. `noo cluster bootstrap-token list`

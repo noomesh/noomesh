@@ -164,7 +164,7 @@ noo stack rebuild-status --follow
 ```
 
 `--background` needs noo-hostd, the controller-mode user unit `noo
-onboard` installs (`systemctl --user status noo-hostd`; reinstall with
+onboard` installs at a terminal or with `--ci --root-ok` (plain `--ci` skips it) (`systemctl --user status noo-hostd`; reinstall with
 `noo onboard --only services`). The same executor runs scheduled
 backups, certificate rotation and disk reclaim from the spool. A
 background rebuild logs to `.noo-host-spool/<name>.rebuild.log` and refuses `--profile`
