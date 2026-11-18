@@ -523,3 +523,40 @@ def test_a_lock_names_one_previous_final_only(fleet: Fleet) -> None:
     proof = fleet.release_proof(files, stack="v0.6.27", unlisted_kinds=("agent-binary",),
                                 extra_lock_rows=(f"# node-agent-sha256@v0.6.26 linux/amd64 {a}", f"# node-agent-sha256@v0.6.25 linux/arm64 {a}"))
     refused(fleet.apply(fleet.bundle({**files, **proof})), "release-lock — it vouches for more than one previous release")
+
+
+# ── the first roll's applier-only bootstrap (rc.2 UPGRADE cell, A3) ─────────
+# An older applier installs this applier from an applier-only bundle and
+# re-execs it on the same bundle, which can carry no release list. When the
+# bundle's ONE payload is byte-identical to the installed applier there is
+# nothing to install: exit 0, one plain line, no REFUSED. Anything else is
+# still checked: a DIFFERENT applier with no list is refused
+# (test_root_code_without_any_release_list_is_refused[applier]).
+
+def _installed_is(fleet: Fleet, body: bytes) -> None:
+    fleet.self_path.write_bytes(body)
+
+
+def test_an_applier_only_bundle_of_the_installed_applier_is_a_clean_no_op(fleet: Fleet) -> None:
+    body = PAYLOADS["applier"]
+    _installed_is(fleet, body)
+    r = fleet.apply(fleet.bundle({"applier": body}, release=False))
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert "applier-only bundle: this applier is already installed" in r.stdout, r.stdout
+    assert hashlib.sha256(body).hexdigest() in r.stdout
+    assert "REFUSED" not in r.stdout + r.stderr, r.stderr
+
+
+def test_an_applier_only_bundle_of_a_different_applier_is_still_refused(fleet: Fleet) -> None:
+    _installed_is(fleet, PAYLOADS["applier"] + b"\n# the installed one differs\n")
+    line = refused(fleet.apply(fleet.bundle({"applier": PAYLOADS["applier"]}, release=False)), "no release-signed list")
+    assert "applier" in line
+
+
+def test_the_installed_applier_beside_another_kind_is_still_checked(fleet: Fleet) -> None:
+    # Not applier-only: the identical applier plus root code is not exempt.
+    body = PAYLOADS["applier"]
+    _installed_is(fleet, body)
+    line = refused(fleet.apply(fleet.bundle({"applier": body, "fetcher": PAYLOADS["fetcher"]}, release=False)),
+                   "no release-signed list")
+    assert "fetcher" in line or "applier" in line
