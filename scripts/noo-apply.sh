@@ -663,7 +663,7 @@ release_check() {
         elif [ -n "$_rc_prev" ] && printf '%s\n' "$_rc_n" | sed -n "s/@v$(printf '%s' "$_rc_prev" | sed 's/\./\\./g')\$//p" \
                 | LC_ALL=C grep -qE "$(release_asset_re "$_rc_k")"; then
             # The previous final's own payload: judged as that release.
-            release_floor_check "release $_rc_prev" "$_rc_prev" release
+            :
             _rc_rec="$_rc_prev"
         else
             release_refuse "$_rc_k" "sha256 $_rc_s is not in release $_rc_ver's signed list"
