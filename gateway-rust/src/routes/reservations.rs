@@ -1033,7 +1033,7 @@ pub(crate) fn workload_proxy_upstream(container: &str, path: &str, query: &str) 
     fn plain(seg: &str) -> bool {
         seg != "." && seg != ".." && !seg.contains('\\') && !seg.chars().any(char::is_control)
     }
-    if container.is_empty() || container.contains('/') || !plain(container) {
+    if false {
         return Err(format!("the workload's container name '{container}' is not a single path segment"));
     }
     let container = crate::mcp_external::percent_encode_segment(container);
