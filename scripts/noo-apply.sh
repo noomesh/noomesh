@@ -587,6 +587,33 @@ release_floor_next() {
     echo "$_rn_f $_rn_p"
 }
 
+# Every release also vouches for its PREVIOUS FINAL (the release job derives
+# them by digest): sha256sums.txt rows `<sha>  <asset>@v<prev>`, lock rows
+# `# node-agent-sha256@v<prev> linux/<arch> <sha>`. A payload matched only by
+# such a row is judged by the floor as release <prev> (one final back is
+# accepted, two back refused), and the record then does not move. A list may
+# name ONE such tag, a final older than the list's own release.
+# release_prev_tag FILE KIND OWN — the one tag FILE's `@v` rows name, or
+# nothing; refuses (75) a second tag, an rc, or one not older than OWN.
+release_prev_tag() {
+    case "$2" in
+        sums) _rp="$(awk 'NF >= 2 { n = $2; sub(/^\*/, "", n); sub(/.*\//, "", n); if (n ~ /@v/) { sub(/.*@v/, "", n); print n } }' "$1" | sort -u)" ;;
+        lock) _rp="$(sed -n 's/^# node-agent-sha256@v\([^ ]*\) .*$/\1/p' "$1" | sort -u)" ;;
+    esac
+    [ -n "$_rp" ] || return 0
+    _rp_what="release-sums"; [ "$2" = lock ] && _rp_what="release-lock"
+    if [ "$(printf '%s\n' "$_rp" | grep -c .)" != 1 ]; then
+        release_refuse "$_rp_what" "it vouches for more than one previous release ($(printf '%s' "$_rp" | tr '\n' ' '))"
+    fi
+    case "$_rp" in *-rc.*) release_refuse "$_rp_what" "its previous-release rows name an rc ($_rp), not a final" ;; esac
+    if ! release_ver_key "$_rp" >/dev/null || ! release_older "$_rp" "$3"; then
+        release_refuse "$_rp_what" "its previous-release rows name $_rp, which is not a final older than $3"
+    fi
+    printf '%s\n' "$_rp"
+}
+# Generation 1 has no release check: no row, current or previous, installs one.
+RELEASE_MIN_APPLIER_GENERATION=2
+
 # release_check WORK SCRATCH — refuses (75) unless every root-run payload the
 # signed manifest names is in a release-signed list that is not older than the
 # floor. Sets RELEASE_OK_VERSION / RELEASE_OK_STACK for release_floor_write.
@@ -624,12 +651,28 @@ release_check() {
         release_refuse "release-version" "$_rc_ver is not the release the signed list names"
     fi
     release_floor_check "release $_rc_ver" "$_rc_ver" release
+    _rc_prev="$(release_prev_tag "$_rc_sums" sums "$_rc_ver")" || exit 75
+    _rc_rec="$_rc_ver"
     for _rc_k in $RELEASE_LISTED_KINDS; do
         case "$_rc_mk" in *" $_rc_k "*) : ;; *) continue ;; esac
         [ -f "$_rc_w/files/$_rc_k" ] || release_refuse "$_rc_k" "the bundle names it but lacks it"
         _rc_s="$(sha256sum "$_rc_w/files/$_rc_k" | awk '{print $1}')"
-        if ! release_names_for "$_rc_sums" "$_rc_s" | LC_ALL=C grep -qE "$(release_asset_re "$_rc_k")"; then
+        _rc_n="$(release_names_for "$_rc_sums" "$_rc_s")"
+        if printf '%s\n' "$_rc_n" | LC_ALL=C grep -qE "$(release_asset_re "$_rc_k")"; then
+            :
+        elif [ -n "$_rc_prev" ] && printf '%s\n' "$_rc_n" | sed -n "s/@v$(printf '%s' "$_rc_prev" | sed 's/\./\\./g')\$//p" \
+                | LC_ALL=C grep -qE "$(release_asset_re "$_rc_k")"; then
+            # The previous final's own payload: judged as that release.
+            release_floor_check "release $_rc_prev" "$_rc_prev" release
+            _rc_rec="$_rc_prev"
+        else
             release_refuse "$_rc_k" "sha256 $_rc_s is not in release $_rc_ver's signed list"
+        fi
+        if [ "$_rc_k" = applier ]; then
+            _rc_g="$(grep -m1 -E '^NOO_APPLY_GENERATION=[0-9]+$' "$_rc_w/files/applier" | cut -d= -f2)"
+            if [ "${_rc_g:-0}" -lt "$RELEASE_MIN_APPLIER_GENERATION" ]; then
+                release_refuse applier "sha256 $_rc_s is applier generation ${_rc_g:-0}, which has no release check; a node keeps generation $RELEASE_MIN_APPLIER_GENERATION or later, a step back included"
+            fi
         fi
     done
     case "$_rc_mk" in *" agent-binary "*)
@@ -646,14 +689,20 @@ release_check() {
             release_refuse "release-lock" "it does not name exactly one stack tag"
         fi
         release_floor_check "stack $_rc_tag" "$_rc_tag" stack
+        _rc_lprev="$(release_prev_tag "$_rc_lock" lock "$_rc_tag")" || exit 75
+        RELEASE_OK_STACK="$_rc_tag"
         _rc_s="$(sha256sum "$_rc_w/files/agent-binary" | awk '{print $1}')"
-        if ! LC_ALL=C grep -qxE "# node-agent-sha256 linux/(amd64|arm64) $_rc_s" "$_rc_lock"; then
+        if LC_ALL=C grep -qxE "# node-agent-sha256 linux/(amd64|arm64) $_rc_s" "$_rc_lock"; then
+            :
+        elif [ -n "$_rc_lprev" ] && LC_ALL=C grep -qxE "# node-agent-sha256@v$(printf '%s' "$_rc_lprev" | sed 's/\./\\./g') linux/(amd64|arm64) $_rc_s" "$_rc_lock"; then
+            release_floor_check "stack v$_rc_lprev" "v$_rc_lprev" stack
+            RELEASE_OK_STACK="v$_rc_lprev"
+        else
             release_refuse agent-binary "sha256 $_rc_s is not in stack $_rc_tag's signed lock"
         fi
-        RELEASE_OK_STACK="$_rc_tag"
         ;;
     esac
-    RELEASE_OK_VERSION="$_rc_ver"
+    RELEASE_OK_VERSION="$_rc_rec"
     return 0
 }
 

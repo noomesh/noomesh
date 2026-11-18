@@ -28,6 +28,8 @@ import tarfile
 import time
 from pathlib import Path
 
+import re
+
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
@@ -105,7 +107,8 @@ class Fleet:
 
     def release_proof(self, files: dict[str, bytes], *, version: str = "0.6.27", stack: str = "v0.6.27",
                       sums_key: "ReleaseKey | None" = None, lock_key: "ReleaseKey | None" = None,
-                      unlisted_kinds: tuple[str, ...] = ()) -> dict[str, bytes]:
+                      unlisted_kinds: tuple[str, ...] = (), extra_sums_rows: tuple[str, ...] = (),
+                      extra_lock_rows: tuple[str, ...] = ()) -> dict[str, bytes]:
         """The release-signed lists that vouch for every root kind in `files`
         (except `unlisted_kinds`): what provision attaches from the release."""
         ver = f"{version}\n".encode()
@@ -114,13 +117,14 @@ class Fleet:
             if kind in files and kind not in unlisted_kinds:
                 rows.append(f"{hashlib.sha256(files[kind]).hexdigest()}  {asset}")
         rows.append(f"{hashlib.sha256(ver).hexdigest()}  noo-release-version")
+        rows += list(extra_sums_rows)
         sums = ("\n".join(rows) + "\n").encode()
         proof = {"release-sums": sums, "release-sums.sig": (sums_key or self.release).sign(sums), "release-version": ver}
         if "agent-binary" in files:
             agent = "" if "agent-binary" in unlisted_kinds else \
                 f"# node-agent-sha256 linux/amd64 {hashlib.sha256(files['agent-binary']).hexdigest()}\n"
             lock = (f"# stack {stack}\n# mesh-migration-head 0001\n"
-                    f"node-agent@sha256:{'a' * 64}\n{agent}").encode()
+                    f"node-agent@sha256:{'a' * 64}\n{agent}" + "".join(r + "\n" for r in extra_lock_rows)).encode()
             proof["release-lock"] = lock
             proof["release-lock.sig"] = (lock_key or self.release).sign(lock)
         return proof
@@ -162,7 +166,7 @@ class Fleet:
                 t.addfile(ti)
         return out
 
-    def apply(self, bundle: Path) -> subprocess.CompletedProcess:
+    def apply(self, bundle: Path, applier: Path = APPLIER) -> subprocess.CompletedProcess:
         env = {
             "PATH": self.path,
             "NOO_APPLY_VERIFY_ONLY": "1",
@@ -172,7 +176,7 @@ class Fleet:
             "NOO_APPLY_RELEASE_PUBKEYS_HEX": self.release.pub_hex,
             "NOO_APPLY_RELEASE_FLOOR": str(self.floor),
         }
-        return subprocess.run(["bash", str(APPLIER), str(bundle)], capture_output=True, text=True, env=env)
+        return subprocess.run(["bash", str(applier), str(bundle)], capture_output=True, text=True, env=env)
 
 
 @pytest.fixture
@@ -305,8 +309,17 @@ def test_a_ca_signed_rollover_carrying_an_applier_is_refused(tmp_path: Path) -> 
 # ── item 8: no applier downgrade ────────────────────────────────────────────
 
 def test_an_older_applier_is_refused(fleet: Fleet) -> None:
+    # §1b's floor, past §1c: the installed applier is a later generation (3)
+    # than the release-listed one in the bundle (2).
+    gen3 = fleet.tmp / "noo-apply-gen3"
+    gen3.write_bytes(re.sub(rb"(?m)^NOO_APPLY_GENERATION=\d+$", b"NOO_APPLY_GENERATION=3", APPLIER.read_bytes()))
+    fleet.self_path.write_bytes(gen3.read_bytes())
+    refused(fleet.apply(fleet.bundle({"applier": APPLIER.read_bytes()}), applier=gen3), 65, "older than this one")
+
+
+def test_an_applier_with_no_generation_never_installs(fleet: Fleet) -> None:
     old = b"\n".join(l for l in APPLIER.read_bytes().split(b"\n") if not l.startswith(b"NOO_APPLY_GENERATION="))
-    refused(fleet.apply(fleet.bundle({"applier": old})), 65, "older than this one")
+    refused(fleet.apply(fleet.bundle({"applier": old})), 75, "applier generation 0, which has no release check")
 
 
 def test_the_overrides_are_honoured_only_in_verify_only_mode() -> None:

@@ -57,16 +57,35 @@ def test_the_stack_lock_is_digest_rows_and_headers_only() -> None:
     )
 
 
-def test_the_agent_sha_rows_are_exactly_two_validated_rows() -> None:
+def test_the_agent_sha_rows_are_exactly_two_validated_rows(tmp_path) -> None:
     """i908: agent-shas.txt is written in a step that holds no seed, and the
     signing step refuses it unless it is exactly the two `# node-agent-sha256`
-    rows, so nothing else can ride into the signed lock."""
+    rows plus, when there is a previous final, two `@v<prev>` rows of ONE tag,
+    so nothing else can ride into the signed lock. The real guard is run."""
+    import subprocess
     job = _job("lock")
     made = job.index(": > agent-shas.txt")
     assert "NOO_RELEASE_SIGNING_SEED" not in job[job.rindex("- name:", 0, made):made], "the writing step holds no seed"
     sign = _step(job, "Assemble + sign stack-$TAG.lock")
-    check = """[ "$(wc -l < agent-shas.txt)" = 2 ] && [ "$(grep -cE '^# node-agent-sha256 linux/(amd64|arm64) [0-9a-f]{64}$' agent-shas.txt)" = 2 ]"""
-    assert check in sign and sign.index(check) < sign.index('> "stack-$TAG.lock"')
+    g0 = sign.index('cur="$(grep -cE')
+    g1 = sign.index("exit 1; }", g0) + len("exit 1; }")
+    guard = "\n".join(l.strip() for l in sign[g0:g1].splitlines())
+    assert g1 < sign.index('> "stack-$TAG.lock"')
+    a, b = "a" * 64, "b" * 64
+    cases = {
+        f"# node-agent-sha256 linux/amd64 {a}\n# node-agent-sha256 linux/arm64 {b}\n": True,
+        f"# node-agent-sha256 linux/amd64 {a}\n# node-agent-sha256 linux/arm64 {b}\n"
+        f"# node-agent-sha256@v0.6.26 linux/amd64 {a}\n# node-agent-sha256@v0.6.26 linux/arm64 {b}\n": True,
+        f"# node-agent-sha256 linux/amd64 {a}\n": False,
+        f"# node-agent-sha256 linux/amd64 {a}\n# node-agent-sha256 linux/arm64 {b}\nnode-agent@sha256:{a}\n": False,
+        f"# node-agent-sha256 linux/amd64 {a}\n# node-agent-sha256 linux/arm64 {b}\n"
+        f"# node-agent-sha256@v0.6.26 linux/amd64 {a}\n# node-agent-sha256@v0.6.25 linux/arm64 {b}\n": False,
+        f"# node-agent-sha256 linux/amd64 {a}\n# node-agent-sha256 linux/arm64 {b}\n# node-agent-sha256@v0.6.26 linux/amd64 {a}\n": False,
+    }
+    for text, ok in cases.items():
+        (tmp_path / "agent-shas.txt").write_text(text)
+        r = subprocess.run(["bash", "-c", "set -eu\n" + guard + "\necho GUARD-PASSED"], cwd=tmp_path, capture_output=True, text=True)
+        assert ("GUARD-PASSED" in r.stdout) == ok, (text, r.stdout, r.stderr)
 
 
 def test_the_storage_lines_are_the_checked_in_file_validated_before_signing() -> None:

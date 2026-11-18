@@ -702,6 +702,41 @@ jobs:
           chmod +x dist/noo-x86_64-unknown-linux-gnu
           python3 scripts/cli-release-reuse.py verify --rc-tag "$RC_TAG" --dist dist --noo dist/noo-x86_64-unknown-linux-gnu
 
+      # i908: every release vouches for its PREVIOUS FINAL, so a node can step
+      # back one release. A node accepts root code only from the release-signed
+      # list its controller sends; with these rows that list also carries the
+      # previous final's root-run payloads, as `<sha>  <asset>@v<prev>`,
+      # derived by digest from that final's OWN signed list (its signature
+      # verified with the keys in this tree), never rebuilt: noo-apply.sh and
+      # noo-fetch.sh as its tag has them, refused unless every Linux CLI that
+      # release published embeds exactly those bytes; hostd, the harness and
+      # the macOS CLI and agent rows copied. No seed in this step. About 1
+      # minute (four CLI downloads). No previous final: nothing to add.
+      - name: Vouch for the previous final (i908)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          v="$(cat dist/noo-release-version)"
+          prev="$(git ls-remote --tags origin 'refs/tags/stack-v*' \
+            | sed -n 's|.*refs/tags/stack-v\([0-9]*\.[0-9]*\.[0-9]*\)$|\1|p' \
+            | python3 scripts/release-vouch-previous.py prev-final --this "$v")"
+          if [ -z "$prev" ]; then echo "no final before $v: nothing to vouch for"; exit 0; fi
+          d="$RUNNER_TEMP/prev-final"; rm -rf "$d"; mkdir -p "$d"
+          for a in sha256sums.txt sha256sums.txt.sig; do
+            gh release download "noo-cli-v$prev" --repo "$GITHUB_REPOSITORY" --pattern "$a" --dir "$d" --clobber
+          done
+          for a in $(awk '{n=$2; sub(/^\*/,"",n)} n ~ /^noo-[a-z0-9_]+-unknown-linux-(gnu|musl)$/ {print n}' "$d/sha256sums.txt"); do
+            gh release download "noo-cli-v$prev" --repo "$GITHUB_REPOSITORY" --pattern "$a" --dir "$d" --clobber
+          done
+          git fetch --no-tags --depth=1 origin "refs/tags/noo-cli-v$prev:refs/tags/noo-cli-v$prev"
+          for s in noo-apply.sh noo-fetch.sh; do git show "noo-cli-v$prev:scripts/$s" > "$d/$s"; done
+          python3 scripts/release-vouch-previous.py sums --prev "$prev" --dir "$d" > "$d/rows"
+          cat "$d/rows"
+          grep -q "  noo-apply.sh@v$prev\$" "$d/rows" && grep -q "  noo-fetch.sh@v$prev\$" "$d/rows" \
+            || { echo "::error::no noo-apply.sh / noo-fetch.sh row for $prev"; exit 1; }
+          cat "$d/rows" >> dist/sha256sums.txt
+
       - name: Sign the checksum manifest (an earlier change slice B)
         # The seed lives only in this secret (+ the operator's off-repo copy).
         # No secret → no release: an unsigned tag would be refused by every
@@ -765,7 +800,7 @@ jobs:
           | \`noo-aarch64-unknown-linux-gnu\` | Linux aarch64 / arm64 (glibc) |
           | \`noo-hostd-<target>\` | the confined-root helper a node needs before it can start a harness; staged by \`noo upgrade --nodes\` as \`hostd-binary\` |
           | \`noo-gateway-<target>\` | the gateway binary — what a node runs as its harness (\`noo-gateway harness\`), delivered over the rail by \`noo upgrade --nodes\`; x86_64 / aarch64 glibc, macOS arm64 |
-          | \`sha256sums.txt\` | combined manifest (\`sha256sum -c sha256sums.txt\`) |
+          | \`sha256sums.txt\` | combined manifest (\`sha256sum -c --ignore-missing sha256sums.txt\`: its \`<asset>@v<previous final>\` rows vouch for the previous release's own assets) |
           | \`noo-apply.sh\`, \`noo-fetch.sh\` | the node's root applier and fetcher, as the CLI embeds them; a node installs either only if its sha256 is in the signed manifest |
           | \`noo-stack-bundle.tar.gz\` | standalone deploy slice — \`pai onboard --standalone --bundle <url>\` |
 
