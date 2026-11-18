@@ -1921,7 +1921,6 @@ if [ -f "$WORK/files/teardown" ]; then
         echo "noo-apply: teardown requested but $DEENROLL is not installed" >&2
         exit 69
     fi
-    netns_unit_remove
     agent_protect_remove
     harness_egress_remove
     logger -t noo-apply "teardown authorized (node=$have) — dismantling in 5s, detached" 2>/dev/null || true
