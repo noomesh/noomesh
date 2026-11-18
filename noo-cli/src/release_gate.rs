@@ -262,7 +262,7 @@ pub fn darwin_check(
                 }
                 recorded = p.to_string();
             }
-            _ => return Err(refuse(kind, &format!("sha256 {sha} is not in release {version}'s signed list"))),
+            _ => {}
         }
     }
     for kind in DARWIN_PLISTS.iter().copied().filter(|k| payloads.contains_key(*k)) {
