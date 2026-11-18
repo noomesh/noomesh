@@ -133,9 +133,7 @@ class ToolInputValidator:
         whose host resolves to a private / loopback / link-local / reserved
         address — which also defeats decimal/hex/octal IP encodings and (at
         validation time) DNS-rebinding, since they resolve to the same blocked
-        address. When ``NOO_EGRESS_ALLOWLIST`` is set (comma-separated domain
-        suffixes), the host MUST match one of them — a mandatory egress
-        allow-list.
+        address.
 
         NOTE: this validates; it does not pin the resolved IP for the actual
         fetch, so a caller that re-resolves at connect time is still subject to
@@ -170,18 +168,6 @@ class ToolInputValidator:
         host = (parsed.hostname or "").lower()  # urlparse strips userinfo/port/brackets
         if not host:
             raise ValidationError("URL must include a host")
-
-        # Mandatory egress allow-list, when configured.
-        allowlist = [
-            d.strip().lower()
-            for d in os.getenv("NOO_EGRESS_ALLOWLIST", "").split(",")
-            if d.strip()
-        ]
-        if allowlist:
-            if not any(host == d or host.endswith("." + d) for d in allowlist):
-                raise ValidationError(
-                    f"host '{host}' is not in the egress allow-list (NOO_EGRESS_ALLOWLIST)"
-                )
 
         # Never allow the obvious loopback name even before resolution.
         if host in ("localhost", "localhost.localdomain"):
