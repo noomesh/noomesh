@@ -415,6 +415,12 @@ const I300_BEAT_KEYS: &[(&str, BeatShape)] = &[
     // controller's store (`{model, state, anchor, model_layer, reason,
     // remedy?, checked_at}`), read by the `ollama models` verify row.
     ("ollama_verify", BeatShape::Objects(64)),
+    // Per llamacpp started on the GPU, what llama-server's own startup lines
+    // said (`{backend, model, target, state, offloaded?, total?,
+    // cuda_devices?, device?, compute_cap?, failure?, cause?, checked_at}`;
+    // node-agent-go docker/llamacpp_offload.go), read by the `llamacpp
+    // offload` verify row: 0 offloaded on a GPU start is a WARN.
+    ("llamacpp_offload", BeatShape::Objects(8)),
 ];
 
 fn beat_shape_ok(v: &Value, shape: BeatShape) -> bool {
@@ -9150,7 +9156,27 @@ mod i300_beat_tests {
             ],
             "node_workloads": [{"addon": "rhaddon", "name": "worker", "state": "provisioned", "ready": false, "door_port": 41001}],
             "ollama_verify": [{"model": "harrier", "state": "verified", "anchor": "gguf", "model_layer": "sha256:5f26", "reason": "", "checked_at": "t"}],
+            "llamacpp_offload": [{"backend": "llamacpp", "model": "m.gguf", "target": "gpu", "state": "gpu", "offloaded": 33, "total": 33,
+                "cuda_devices": 1, "device": "NVIDIA GeForce GTX 1080", "compute_cap": "6.1", "checked_at": "t"}],
         })
+    }
+
+    /// The agent's `llamacpp_offload` (a GPU llamacpp start's offload, read
+    /// from llama-server's log) reaches the record, so `noo cluster verify`
+    /// can WARN on 0 offloaded; a beat without it removes it (the llamacpp
+    /// stopped or moved to cpu), and a non-list is unknown.
+    #[test]
+    fn llamacpp_offload_is_carried_and_removed_when_absent() {
+        let mut data = json!({"id": "n1"});
+        let beat = json!({"llamacpp_offload": [{"backend": "llamacpp", "model": "m.gguf", "target": "gpu", "state": "cpu",
+            "cuda_devices": 0, "failure": "CUDA driver version is insufficient for CUDA runtime version", "checked_at": "t"}]});
+        carry_i300(&mut data, &beat);
+        assert_eq!(data["llamacpp_offload"], beat["llamacpp_offload"], "{data}");
+        carry_i300(&mut data, &json!({"running_backends": {}}));
+        assert!(data.get("llamacpp_offload").is_none(), "absent from the beat, so gone: {data}");
+        carry_i300(&mut data, &beat);
+        carry_i300(&mut data, &json!({"llamacpp_offload": {"backend": "llamacpp"}}));
+        assert!(data.get("llamacpp_offload").is_none(), "a non-list is unknown: {data}");
     }
 
     /// Every A4 key reaches the record; a later beat without it (an older

@@ -182,6 +182,7 @@ var heartbeatSections = []payloadSection{
 	secOllamaVerify,
 	secNodeLocal,
 	secBackendCaps,
+	secLlamacppOffload,
 	secNodeFacts,
 	secLastStop,
 }
@@ -229,6 +230,16 @@ var (
 		// no Docker backends run (not wired).
 		if bc := r.backendCapsReport(); bc != nil {
 			p["backend_caps"] = bc
+		}
+	}}
+
+	secLlamacppOffload = payloadSection{name: "llamacppOffload", add: func(r *Reporter, p map[string]any) {
+		// Per llamacpp started on the GPU: the layers llama-server offloaded
+		// and the CUDA device it found, read from its own startup lines
+		// (docker/llamacpp_offload.go). `noo cluster verify` WARNs on a GPU
+		// start that offloaded none. OMITTED when there is no GPU start.
+		if lo := r.llamacppOffloadReport(); lo != nil {
+			p["llamacpp_offload"] = lo
 		}
 	}}
 

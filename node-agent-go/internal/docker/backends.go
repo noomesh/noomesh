@@ -1195,6 +1195,9 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 
 	slog.Info("backend started via SDK", "backend", backend, "model", model, "container", spec.ContainerName,
 		"door", backendDialURL(backend, nil))
+	// A GPU llamacpp start: read llama-server's own startup lines and report
+	// whether its layers reached the GPU (llamacpp_offload.go).
+	c.startLlamacppOffloadWatch(ctx, backend, model, spec.ContainerName, llamacppOnGPU(overrides.Target, gpuFacts))
 	return nil
 }
 
@@ -1217,6 +1220,8 @@ func (c *Client) StopBackendSDK(ctx context.Context, backend string) error {
 		slog.Debug("remove container note", "container", spec.ContainerName, "error", err)
 	}
 	c.removeSidecar(ctx, backend)
+	// A stopped llamacpp reports no offload.
+	c.startLlamacppOffloadWatch(ctx, backend, "", spec.ContainerName, false)
 
 	slog.Info("backend stopped via SDK", "backend", backend, "container", spec.ContainerName)
 	return nil

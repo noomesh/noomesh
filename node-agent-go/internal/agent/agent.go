@@ -440,6 +440,7 @@ func (a *Agent) Run() error {
 	a.hb.SetNodeLocal(nodelocal.Current)
 	if a.docker != nil {
 		a.hb.SetBackendCaps(dockerpkg.BackendCapsReport)
+		a.hb.SetLlamacppOffload(dockerpkg.LlamacppOffloadReport)
 	}
 	a.hb.SetNodeFacts(rec.NodeFacts)
 	if mc := rec.NodeWorkloadControl(); mc != nil {

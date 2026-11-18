@@ -49,6 +49,15 @@ stages it on the controller only when some node has such a placement (else
 `noo cluster place` stages it the first time one is placed).
 `LLAMACPP_CUDA_IMAGE` overrides it, as `LLAMACPP_IMAGE` does the CPU image.
 
+A CUDA build whose CUDA init fails (a driver too old for CUDA 12.9, or no
+device in the container) does not stop: it loads the model on the CPU. So
+after a GPU start the agent reads llama-server's own startup lines (`found N
+CUDA devices`, `offloaded N/M layers to GPU`, `failed to initialize CUDA`)
+and reports them; `noo cluster verify` shows the offload in a `llamacpp
+offload` row, and 0 offloaded or a CUDA failure is a WARN naming the likely
+cause (the NVIDIA driver, or no CUDA device) and the remedy: update the
+driver, or place it on cpu.
+
 ## Building it yourself
 
 ```
