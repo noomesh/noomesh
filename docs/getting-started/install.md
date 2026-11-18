@@ -124,6 +124,10 @@ pulled; the wizard, the CLI and the running stack are the same.
 | **dist** | a git checkout | pulled from the release registry (`stack-v*` tags) |
 | **dev** | a git checkout and `docker login dhi.io` (hardened base images) | built from this source tree — for changing the code |
 
+The install matrix runs the release path above on fresh machines; this
+from-source path is **not** covered by it (nothing installs from a fresh
+clone in CI), so treat it as the developer's path.
+
 ```bash
 git clone https://github.com/noomesh/noomesh.git ~/noomesh
 cd ~/noomesh
