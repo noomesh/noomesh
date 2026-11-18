@@ -388,3 +388,13 @@ def test_protect_system_strict_really_blocks_etc_and_allows_the_listed_dir(tmp_p
     finally:
         if probe.exists():
             probe.unlink()
+
+
+# The CHARACTER rule on its own: each value below is absolute, normalised and
+# not denied, so only the allowed-character class can refuse it (the two
+# tests above are also refused by the absolute-path rule, which masks it).
+@pytest.mark.parametrize("bad", ["/data/%h", '/data/da"ta', "/data/a b", "/data/a\\b", "/data/a$b", "/data/a;b"])
+def test_a_bad_character_inside_an_absolute_path_is_refused(node: Node, bad: str) -> None:
+    before = installed(node)
+    node.write_env(MODELS_DIR=f"{node.tmp}{bad}")
+    assert_refused(node, before, "MODELS_DIR")
