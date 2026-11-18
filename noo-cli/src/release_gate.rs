@@ -336,7 +336,7 @@ pub fn controller_check(files: &[(&str, Vec<u8>)], darwin: bool, sums: &str, ver
         let sha = sha256_hex(bytes);
         let names = names_for(sums, &sha);
         // A row for this release, or one for the previous final it vouches for.
-        let any = |ok: &dyn Fn(&str) -> bool| names.iter().any(|n| ok(*n) || prev.as_deref().and_then(|p| prev_name(*n, p)).is_some_and(ok));
+        let any = |ok: &dyn Fn(&str) -> bool| names.iter().any(|n| ok(n) || prev.as_deref().and_then(|p| prev_name(n, p)).is_some_and(ok));
         let listed = match (darwin, *kind) {
             (true, k) if DARWIN_LISTED.contains(&k) => any(&|n| darwin_asset_ok(k, n)),
             (false, "applier") => any(&|n| n == "noo-apply.sh"),
