@@ -834,8 +834,10 @@ pub(crate) fn model_stores_check(id: &str, n: &Value) -> Option<Check> {
 /// The stack lane (the controller's own node checking the stack's Ollama,
 /// `lane: "stack"`) is report-only: compose manages that Ollama, so a
 /// mismatch names the re-pull, not "not repaired here". A store file the
-/// agent may not read is `cannot-read`, a WARN with its own remedy line (the
-/// agent's: make the store readable), never a mismatch.
+/// agent may not read is `cannot-read`, a WARN with its own remedy line,
+/// never a mismatch. That line leads with the re-pull through noo (our Ollama
+/// image writes the store 755/644, so a re-pull rewrites the files readable)
+/// and gives the agent's `sudo chmod` only as the fallback.
 pub(crate) fn ollama_models_check(id: &str, n: &Value) -> Option<Check> {
     // `noo models pull` acts on the gateway's Ollama: the controller's own
     // node only. Elsewhere the model is staged and imported onto that node.
@@ -889,17 +891,23 @@ pub(crate) fn ollama_models_check(id: &str, n: &Value) -> Option<Check> {
             "mismatch" => { warns.push(format!("{model}: does NOT match the controller ({reason}); not repaired here (the agent does not manage this Ollama)")); remedies.push(pull()); }
             "cannot-read" => {
                 warns.push(format!("{model}: cannot be checked, the agent cannot read the store ({})", if reason.is_empty() { "permission denied" } else { reason }));
-                if let Some(fix) = r["remedy"].as_str().filter(|s| !s.is_empty()) {
-                    if !read_fixes.iter().any(|f| f == fix) { read_fixes.push(fix.to_string()); }
-                }
+                // The agent's remedy is `<re-pull>; if the files stay
+                // unreadable: <chmod>` (an older agent sent the chmod alone):
+                // the re-pull first, the chmod labelled as the fallback.
+                const FALLBACK: &str = "; if the files stay unreadable: ";
+                let agent = r["remedy"].as_str().unwrap_or("");
+                let chmod = agent.rsplit_once(FALLBACK).map_or(agent, |(_, c)| c);
+                let mut fix = format!("{} (Ollama rewrites the blobs and the manifest with its own modes)", pull());
+                if !chmod.is_empty() { fix.push_str(&format!("{FALLBACK}{chmod}")); }
+                if !read_fixes.contains(&fix) { read_fixes.push(fix); }
             }
             _ => warns.push(format!("{model}: could not be checked ({})", if reason.is_empty() { "no reason given" } else { reason })),
         }
     }
     let mut lines: Vec<String> = Vec::new();
     if !remedies.is_empty() { lines.push(format!("on {id}: {}", remedies.join(" && "))); }
-    if !read_fixes.is_empty() {
-        lines.push(format!("on {id}: {} (the store is not readable by the agent's user; or check the Ollama image's umask)", read_fixes.join(" && ")));
+    for fix in &read_fixes {
+        lines.push(format!("on {id}: {fix}"));
     }
     let remedy = (!lines.is_empty()).then(|| lines.join("\n"));
     if !fails.is_empty() {
@@ -16554,7 +16562,7 @@ mod ollama_models_tests {
         let n = json!({"self_node": true, "ollama_verify": [
             {"model": "qwen2.5:0.5b", "state": "cannot-read", "anchor": "mirror", "lane": "stack",
              "reason": "cannot read /var/lib/noo/ollama/models/blobs/sha256-aa as noo-agent (permission denied)",
-             "remedy": "sudo chmod -R o+rX /var/lib/noo/ollama/models"},
+             "remedy": "noo models pull qwen2.5:0.5b; if the files stay unreadable: sudo chmod -R o+rX /var/lib/noo/ollama/models"},
             {"model": "gemma4:e2b", "state": "unverified", "anchor": "none", "reason": "no controller record"}]});
         let c = ollama_models_check("ctrl", &n).unwrap();
         assert_eq!(c.verdict, Verdict::Warn);
@@ -16566,8 +16574,17 @@ mod ollama_models_tests {
         let lines: Vec<&str> = remedy.lines().collect();
         assert_eq!(lines, vec![
             "on ctrl: noo models pull gemma4:e2b",
-            "on ctrl: sudo chmod -R o+rX /var/lib/noo/ollama/models (the store is not readable by the agent's user; or check the Ollama image's umask)",
+            "on ctrl: noo models pull qwen2.5:0.5b (Ollama rewrites the blobs and the manifest with its own modes); if the files stay unreadable: sudo chmod -R o+rX /var/lib/noo/ollama/models",
         ], "{remedy}");
+        // The order: the re-pull leads, the sudo chmod is the labelled fallback.
+        let read = lines[1];
+        let (pull, chmod) = (read.find("noo models pull").unwrap(), read.find("sudo chmod").unwrap());
+        assert!(pull < chmod && read[pull..chmod].ends_with("; if the files stay unreadable: "), "{read}");
+        // An older agent's chmod-only remedy is still put after the re-pull.
+        let old = json!({"self_node": true, "ollama_verify": [{"model": "m:1b", "state": "cannot-read", "reason": "r",
+            "remedy": "sudo chmod -R o+rX /s"}]});
+        assert_eq!(ollama_models_check("ctrl", &old).unwrap().remedy.as_deref(),
+            Some("on ctrl: noo models pull m:1b (Ollama rewrites the blobs and the manifest with its own modes); if the files stay unreadable: sudo chmod -R o+rX /s"));
     }
 
     /// Native Ollama reports a mismatch without repairing it: a WARN.

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -646,12 +647,32 @@ func TestOllamaVerifyAStoreFileTheAgentCannotReadIsCannotRead(t *testing.T) {
 			if strings.Contains(res.Reason, "no local manifest") {
 				t.Errorf("an unreadable file reads as absent: %q", res.Reason)
 			}
-			if res.Remedy != "sudo chmod -R o+rX "+rg.v.ModelsDir {
-				t.Errorf("remedy %q", res.Remedy)
-			}
 			if len(rg.repairs) != 0 {
 				t.Errorf("repaired: %+v", rg.repairs)
 			}
 		})
+	}
+}
+
+// The cannot-read remedy leads with what normally makes the store readable,
+// the re-pull through noo (Ollama rewrites the files with its shipped modes,
+// 755/644), and gives the sudo chmod only after it, labelled as the fallback.
+func TestOllamaCannotReadRemedyRePullsFirstAndChmodIsTheFallback(t *testing.T) {
+	// The container lane on the controller's own node: its re-pull is `noo
+	// models pull` through ollamaRemedy, so this test reads the order alone,
+	// not the stack lane's remedy (TestOllamaStackLaneRemedyIsNooModelsPull).
+	t.Setenv("NOO_SELF_NODE", "1")
+	rg := newLaneRig(t, OllamaLaneContainer)
+	res := rg.v.cannotRead(OllamaVerifyResult{}, mirrorModel, &unreadableErr{path: rg.v.blobPath("aa"), err: fs.ErrPermission})
+	want := "noo models pull " + mirrorModel + "; if the files stay unreadable: sudo chmod -R o+rX " + rg.v.ModelsDir
+	if res.Remedy != want {
+		t.Fatalf("remedy %q, want %q", res.Remedy, want)
+	}
+	pull, chmod := strings.Index(res.Remedy, "noo models pull"), strings.Index(res.Remedy, "sudo chmod")
+	if pull != 0 || chmod < pull {
+		t.Fatalf("the re-pull must come first and the chmod after it: %q", res.Remedy)
+	}
+	if !strings.Contains(res.Reason, "755/644 (umask 0022)") {
+		t.Errorf("reason does not say what makes the store readable: %q", res.Reason)
 	}
 }
