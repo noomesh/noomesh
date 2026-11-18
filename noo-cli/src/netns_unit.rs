@@ -510,6 +510,23 @@ mod tests {
         assert!(matches!(route(true, Some(applier_of(GEN2_WITH_KIND)), true, false, false), Route::Stated(_)));
     }
 
+    /// i907 step 1b: the roll reaches `install` (sudo_write_root_file's
+    /// `sudo tee` of the unit) only from its no-applier arm; the stage arm
+    /// and the old-applier arm run no sudo.
+    #[test]
+    fn the_roll_installs_with_sudo_only_where_there_is_no_applier() {
+        let up = crate::test_src::own_code(include_str!("commands/upgrade.rs"));
+        let body = crate::test_src::fn_body(&up, "fn reconcile_netns_unit(");
+        assert_eq!(body.matches("nu::install(").count(), 1, "{body}");
+        let stage = body.find("nu::Route::Stage =>").expect("the stage arm");
+        let sudo = body.find("nu::Route::Sudo =>").expect("the no-applier arm");
+        let at = body.find("nu::install(").unwrap();
+        let stated = body.find("nu::Route::Stated(").expect("the stated arm");
+        assert!(stage < sudo && sudo < at && at < stated, "{body}");
+        assert!(body[stage..sudo].contains("nu::stage_to_self_node("), "{body}");
+        assert!(!body.contains("sudo_write_root_file") && !body.contains("sudo_cmd"), "{body}");
+    }
+
     #[test]
     fn the_payload_is_two_lines_and_the_verdict_reads_a_refusal() {
         assert_eq!(payload("alex", "/home/alex/.noo"), "user=alex\nroot=/home/alex/.noo\n");
