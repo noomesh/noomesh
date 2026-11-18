@@ -449,26 +449,55 @@ pub fn budget_for(node: &Value) -> Option<Budget> {
     pool_for(node, "gpu").or_else(|| pool_for(node, "cpu"))
 }
 
-/// The shipped llamacpp image (`docker/Dockerfile.llamacpp`: OpenBLAS, no
-/// GGML_CUDA) and its upstream fallback (ggml-org `:server`) are CPU builds.
-/// While this is false a llamacpp placement runs on the CPU whatever its
-/// target, so it is fitted in the CPU pool. The same rule as noo-cli's
-/// `cluster_tune::LLAMACPP_HAS_GPU_BUILD` and the node agent's
-/// `docker.LlamacppHasGPUBuild`; tests/test_llamacpp_gpu_build_claim.py holds
-/// all three to the Dockerfile.
-pub const LLAMACPP_HAS_GPU_BUILD: bool = false;
+/// A GPU build of llama.cpp exists: since 0.6.28 the CUDA image
+/// (`docker/Dockerfile.llamacpp-cuda`, CUDA 12.9), beside the OpenBLAS CPU
+/// image. The same claim as noo-cli's `cluster_tune::LLAMACPP_HAS_GPU_BUILD`
+/// and the node agent's `docker.LlamacppHasGPUBuild`;
+/// tests/test_llamacpp_gpu_build_claim.py holds all three to the CUDA
+/// Dockerfile's `-DGGML_CUDA=ON`.
+pub const LLAMACPP_HAS_GPU_BUILD: bool = true;
 
-/// The target a placement runs on: `cpu` for llamacpp while its image has no
-/// GPU build ([`LLAMACPP_HAS_GPU_BUILD`]); else the declared one; else `cpu`
-/// when its env pins `N_GPU_LAYERS=0`; else `gpu`. A node without a GPU runs
-/// everything on CPU, whatever was declared (the place route refuses `gpu`
-/// there, so this only reaches rows from before the node lost its GPU).
+/// The lowest compute capability the CUDA image carries code for (its lowest
+/// cubin and its PTX fallback are compute_61; PTX only runs forward). The
+/// node agent's `docker.LlamacppMinComputeCap` and noo-cli's
+/// `cluster_tune::LLAMACPP_MIN_COMPUTE_CAP`.
+pub const LLAMACPP_MIN_COMPUTE_CAP: &str = "6.1";
+
+/// Can this node run llama.cpp on its GPU, from the facts its heartbeat
+/// reports: a GPU build exists, it reports a GPU, the nvidia runtime is
+/// registered (`nvidia_runtime`) and its lowest GPU is at least
+/// [`LLAMACPP_MIN_COMPUTE_CAP`] (`gpu_compute_cap`). A fact not reported is
+/// "no". The node agent's `docker.LlamacppGPUUsable` decides the same from
+/// the same probes, so the fit and the container agree on the pool.
+pub fn llamacpp_gpu_usable(node: &Value) -> bool {
+    LLAMACPP_HAS_GPU_BUILD
+        && node_has_gpu(node)
+        && node.get("nvidia_runtime").and_then(Value::as_bool) == Some(true)
+        && node
+            .get("gpu_compute_cap")
+            .and_then(Value::as_str)
+            .and_then(|have| crate::node_workloads::compute_cap_at_least(have, LLAMACPP_MIN_COMPUTE_CAP))
+            == Some(true)
+}
+
+/// Does a llamacpp placement with this declared `target` run on the node's
+/// GPU: not declared `cpu`, on a node that can use the GPU build. What the
+/// place route stages (the CUDA image or the CPU one) follows this too.
+pub fn llamacpp_runs_on_gpu(target: Option<&str>, node: &Value) -> bool {
+    target != Some("cpu") && llamacpp_gpu_usable(node)
+}
+
+/// The target a placement runs on: `cpu` for llamacpp on a node that cannot
+/// use its GPU build ([`llamacpp_gpu_usable`]); else the declared one; else
+/// `cpu` when its env pins `N_GPU_LAYERS=0`; else `gpu`. A node without a GPU
+/// runs everything on CPU, whatever was declared (the place route refuses
+/// `gpu` there, so this only reaches rows from before the node lost its GPU).
 pub fn resolve_target(spec: &Spec, node: &Value) -> &'static str {
     let has_gpu = node_has_gpu(node);
     if !has_gpu && node_reports_memory(node) {
         return "cpu";
     }
-    if spec.backend == "llamacpp" && !LLAMACPP_HAS_GPU_BUILD {
+    if spec.backend == "llamacpp" && !llamacpp_gpu_usable(node) {
         return "cpu";
     }
     match spec.target.as_deref() {
@@ -876,25 +905,58 @@ mod tests {
         let legacy = evaluate(&gpu6_ram32(), &[llama(GEMMA, None, &[("N_GPU_LAYERS", "0")])], 1024);
         assert_eq!(legacy.rows[0].target, "cpu");
         assert_eq!(legacy.budget.as_ref().unwrap().kind, "ram");
-        // Declared on gpu it still runs on the CPU (no GPU build), so it is
-        // budgeted against RAM and fits. This asserted DoesNotFit against
-        // 6 GB of VRAM until 0.6.28: a pool the container never used.
+        // Declared on gpu on a node that cannot use the CUDA image (this
+        // one reports no nvidia runtime and no compute capability), it runs
+        // on the CPU, so it is budgeted against RAM and fits.
         let gpu = evaluate(&gpu6_ram32(), &[llama(GEMMA, Some("gpu"), &[])], 1024);
         assert_eq!(gpu.rows[0].target, "cpu");
         assert_eq!(gpu.verdict, Verdict::Fits, "{gpu:#?}");
+        // On a node that can, the same placement is judged in VRAM: 6 GB
+        // does not hold it.
+        let usable = evaluate(&usable_gpu6_ram32("6.1"), &[llama(GEMMA, Some("gpu"), &[])], 1024);
+        assert_eq!(usable.rows[0].target, "gpu");
+        assert_eq!(usable.verdict, Verdict::DoesNotFit, "{usable:#?}");
     }
 
-    /// llamacpp has no GPU build (LLAMACPP_HAS_GPU_BUILD): on a GPU node a
-    /// placement declared gpu, or declaring nothing, is fitted in the CPU
-    /// pool. vllm and ollama keep the GPU pool.
+    /// The same 6 GB GPU node, reporting what the agent's heartbeat does
+    /// (i300 facts): the nvidia runtime registered and its compute capability.
+    fn usable_gpu6_ram32(cap: &str) -> Value {
+        let mut n = gpu6_ram32();
+        n["nvidia_runtime"] = json!(true);
+        n["gpu_compute_cap"] = json!(cap);
+        n
+    }
+
+    /// A llamacpp placement on a node that can use the CUDA image (NVIDIA
+    /// runtime, compute >= 6.1) is fitted in the GPU pool, declared gpu or
+    /// declaring nothing; cpu stays cpu. vllm and ollama are unchanged.
     #[test]
-    fn llamacpp_with_no_gpu_build_resolves_to_the_cpu_pool() {
-        let n = gpu6_ram32();
-        assert_eq!(resolve_target(&llama("m:7b", Some("gpu"), &[]), &n), "cpu");
-        assert_eq!(resolve_target(&llama("m:7b", None, &[]), &n), "cpu");
+    fn llamacpp_on_a_usable_gpu_node_resolves_to_the_gpu_pool() {
+        let n = usable_gpu6_ram32("6.1");
+        assert!(llamacpp_gpu_usable(&n));
+        assert_eq!(resolve_target(&llama("m:7b", Some("gpu"), &[]), &n), "gpu");
+        assert_eq!(resolve_target(&llama("m:7b", None, &[]), &n), "gpu");
+        assert_eq!(resolve_target(&llama("m:7b", Some("cpu"), &[]), &n), "cpu");
+        assert!(llamacpp_runs_on_gpu(Some("gpu"), &n) && llamacpp_runs_on_gpu(None, &n) && !llamacpp_runs_on_gpu(Some("cpu"), &n));
         let vllm = Spec { backend: "vllm".into(), ..llama("m:7b", Some("gpu"), &[]) };
         assert_eq!(resolve_target(&vllm, &n), "gpu");
         assert_eq!(resolve_target(&spec("chat", "m:7b", None), &n), "gpu");
+    }
+
+    /// A node that cannot use the CUDA image (compute below 6.1, unknown, no
+    /// nvidia runtime, or not reported) fits llamacpp in the CPU pool, the
+    /// pool the agent's CPU image runs in.
+    #[test]
+    fn llamacpp_below_the_compute_floor_or_without_the_runtime_resolves_to_the_cpu_pool() {
+        let mut no_runtime = usable_gpu6_ram32("8.6");
+        no_runtime["nvidia_runtime"] = json!(false);
+        let mut unreported = usable_gpu6_ram32("8.6");
+        unreported.as_object_mut().unwrap().remove("nvidia_runtime");
+        for n in [usable_gpu6_ram32("5.2"), usable_gpu6_ram32("6.0"), usable_gpu6_ram32("eight"), no_runtime, unreported, gpu6_ram32()] {
+            assert!(!llamacpp_gpu_usable(&n), "{n}");
+            assert_eq!(resolve_target(&llama("m:7b", Some("gpu"), &[]), &n), "cpu", "{n}");
+            assert_eq!(resolve_target(&llama("m:7b", None, &[]), &n), "cpu", "{n}");
+        }
     }
 
     #[test]
@@ -979,7 +1041,8 @@ mod tests {
     #[test]
     fn weights_sources_in_order_and_an_unknown_size_is_cant_judge() {
         let file = "Mystery-Q4_K_M.gguf";
-        // RAM too: llamacpp is fitted in the CPU pool (LLAMACPP_HAS_GPU_BUILD).
+        // RAM too: llamacpp is fitted in the CPU pool on a node that does
+        // not report the nvidia runtime and its compute capability.
         let bare = json!({"vram_gb": 24.0, "ram_gb": 32.0});
         let r = evaluate(&bare, &[llama(file, None, &[])], 1024);
         assert_eq!(r.verdict, Verdict::Unknown, "{r:#?}");

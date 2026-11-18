@@ -42,6 +42,7 @@ MATRIX = WF["jobs"]["images"]["strategy"]["matrix"]["include"]
 
 LOCK = """gateway@sha256:g
 llamacpp@sha256:l
+llamacpp-cuda@sha256:c
 ollama@sha256:o
 node-agent@sha256:n
 nvidia-exporter@sha256:x
@@ -389,7 +390,7 @@ from datetime import datetime, timedelta, timezone
 NOW = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc)
 FP = "sha256:" + "f" * 64
 SDIG = "sha256:" + "5" * 64
-DAILY = ("llamacpp", "ollama", "stunnel", "postgres-pgvector", "whisper", "piper", "nvidia-exporter")
+DAILY = ("llamacpp", "llamacpp-cuda", "ollama", "stunnel", "postgres-pgvector", "whisper", "piper", "nvidia-exporter")
 NEW_VERSION = {"stack-v1.3.0-rc.1": "N"}   # a new version's rc.1: no lower rc, everything would build
 
 

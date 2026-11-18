@@ -86,7 +86,7 @@ func validKeepNamespace(ns string) bool {
 }
 
 // buildNodeKeep is the keep file, pure over its inputs.
-func buildNodeKeep(d *desiredConfig, rawDesired []byte, imageRef func(backend, override string) string,
+func buildNodeKeep(d *desiredConfig, rawDesired []byte, imageRef func(backend, override, target string) string,
 	localID func(ref string) string, roots []string, prev *keepFileOut, now time.Time) *keepFileOut {
 	seen := map[string]bool{}
 	var cur []keepOut
@@ -105,7 +105,7 @@ func buildNodeKeep(d *desiredConfig, rawDesired []byte, imageRef func(backend, o
 		}
 	}
 	for _, p := range d.Placements {
-		ref := imageRef(p.Backend, p.Image)
+		ref := imageRef(p.Backend, p.Image, dockerpkg.StartTarget(p.Backend, p.Target, p.Env))
 		if ref == "" {
 			continue
 		}

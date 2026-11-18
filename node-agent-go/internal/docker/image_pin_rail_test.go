@@ -52,7 +52,7 @@ func TestOwnImageRefsNameTheStagedTarLikeTheCLIAndTheGateway(t *testing.T) {
 		// The row's registry is this node's own prefix, so the ref is ours.
 		repo := r.StagedRef[:strings.LastIndex(r.StagedRef, ":")]
 		t.Setenv("NOO_IMAGE_PREFIX", repo[:strings.LastIndex(repo, "/")])
-		ch, err := chooseBackendImage("ollama", backendSpecs["ollama"], r.Ref)
+		ch, err := chooseBackendImage("ollama", backendSpecs["ollama"], r.Ref, "")
 		if err != nil {
 			t.Fatalf("%s: %v", r.Ref, err)
 		}

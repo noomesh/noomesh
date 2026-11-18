@@ -1,0 +1,143 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# GPU llama.cpp backend: llama-server built from UPSTREAM SOURCE with CUDA
+# 12.9, runs as nonroot. The CPU image (docker/Dockerfile.llamacpp, OpenBLAS,
+# amd64 + arm64) is unchanged and stays the image every other node runs; this
+# one is amd64 ONLY and is fetched only by a node that starts llamacpp on its
+# GPU (docker/README-llamacpp.md "The CUDA image").
+#
+# Why CUDA 12.9 and not 13: CUDA 13 dropped every GPU below compute
+# capability 7.5 (Maxwell, Pascal, Volta), and the fleet runs Pascal cards
+# (compute 6.1). A CUDA 12.x binary runs on any driver new enough for 12.9
+# (>= 575), the newer 580-series drivers included, so ONE 12.9 image covers
+# Pascal through Blackwell.
+#
+# Same pins, same refusal and same env interface as the CPU image: the
+# llama.cpp ref is the one docker/Dockerfile.llamacpp builds
+# (tests/test_hygiene_defaults.py holds the two equal), a moving ref is
+# refused, and the CMD reads MODEL_PATH / N_GPU_LAYERS / N_CTX / N_THREADS /
+# HOST / PORT exactly as the CPU image's does, so the node agent starts either
+# image with one spec.
+
+# ── Builder ──────────────────────────────────────────────────────────
+# Base images: NVIDIA's CUDA images on Docker Hub (Docker Hardened Images
+# publishes no CUDA 12.9 base we can pin). They come through our GHCR mirror
+# of Docker Hub (.github/hub-mirror.txt, scripts/hub-mirror.py: the release
+# passes --build-arg HUB_MIRROR=<prefix>; a local build without a ghcr.io
+# login passes --build-arg HUB_MIRROR=docker.io). Digest-pinned: a manifest
+# copy preserves the digest, so the mirror and Hub give the same bytes.
+ARG HUB_MIRROR=ghcr.io/noomesh/mirror
+FROM ${HUB_MIRROR}/nvidia/cuda:12.9.1-devel-ubuntu24.04@sha256:020bc241a628776338f4d4053fed4c38f6f7f3d7eb5919fecb8de313bb8ba47c AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# An IMMUTABLE upstream tag, the same one docker/Dockerfile.llamacpp builds.
+# Bump both together. `b9628` is upstream tag c2ba3e47a2038a2c4f51138c1843e374b174e83d.
+ARG LLAMACPP_REF=b9628
+# Break glass, exactly as in docker/Dockerfile.llamacpp.
+ARG LLAMACPP_ALLOW_MOVING_REF=0
+WORKDIR /src
+RUN set -eu; \
+    case "${LLAMACPP_REF}" in \
+        master|main|HEAD|"") \
+            if [ "${LLAMACPP_ALLOW_MOVING_REF}" != "1" ]; then \
+                echo "Dockerfile.llamacpp-cuda: LLAMACPP_REF='${LLAMACPP_REF}' is a moving ref." >&2; \
+                echo "  Two builds of the same image tag would contain different code, and" >&2; \
+                echo "  nothing would record which. Pass an immutable tag (e.g. b10917), or" >&2; \
+                echo "  --build-arg LLAMACPP_ALLOW_MOVING_REF=1 if you really mean it." >&2; \
+                exit 64; \
+            fi ;; \
+    esac; \
+    git clone --depth 1 --branch "${LLAMACPP_REF}" \
+        https://github.com/ggml-org/llama.cpp.git .; \
+    git rev-parse HEAD > /src/LLAMACPP_COMMIT; \
+    echo "llama.cpp ${LLAMACPP_REF} = $(cat /src/LLAMACPP_COMMIT)"
+
+# The GPUs the image carries code for. A REAL arch (`NN-real`) is a cubin:
+# machine code for that compute capability, loaded as is on that GPU family.
+# A VIRTUAL arch (`NN-virtual`) is PTX, which the driver JIT-compiles on first
+# use for its GPU, and PTX only ever runs FORWARD: compute_61 PTX runs on any
+# GPU of compute 6.1 or newer, never on an older one. So:
+#   61-real   Pascal consumer (GTX 10xx, compute 6.1)
+#   75-real   Turing (RTX 20xx, GTX 16xx, T4)
+#   86-real   Ampere consumer (RTX 30xx, A2/A10/A40)
+#   89-real   Ada (RTX 40xx, L4/L40)
+#   120-real  Blackwell consumer (RTX 50xx)
+#   61-virtual  the ONE forward fallback: every GPU without a cubin above
+#               (Volta 7.0, A100 8.0, Orin 8.7, Hopper 9.0, B200 10.0, ...)
+#               runs by JIT from compute_61 PTX. The lowest arch is the
+#               fallback because only it covers everything above it.
+# The first start on a JIT-only GPU compiles the PTX (minutes, once; the
+# driver caches it). Never `native` (the build runner has no GPU, and the image
+# must not depend on the machine that built it), and no list that drops 61:
+# a Pascal card would have nothing to run. Below 6.0 nothing runs: the node
+# agent never starts this image there (docker.LlamacppMinComputeCap).
+ARG CUDA_ARCHITECTURES="61-real;75-real;86-real;89-real;120-real;61-virtual"
+
+# GGML_CUDA=ON: the CUDA backend. GGML_NATIVE=OFF: no -march=native, a
+# portable binary. GGML_BACKEND_DL=ON + GGML_CPU_ALL_VARIANTS=ON (upstream's
+# own CUDA image does the same): every backend is a module llama-server loads
+# at start, the CPU one picked for the host's instruction set. That is what
+# lets the image START where the CUDA driver is absent (libcuda.so.1 comes
+# from the host's driver via the NVIDIA container runtime): the CUDA module
+# then fails to load and llama-server runs with no CUDA device instead of
+# failing to link (ci.yml llamacpp-cuda-image runs it on a GPU-less runner).
+# --allow-shlib-undefined: the link sees only libcuda's stub, as upstream's.
+# No web UI and no UI download, for the reason docker/Dockerfile.llamacpp
+# gives. The whole tree is built (not `--target llama-server`): with
+# BACKEND_DL the backend modules are separate targets llama-server does not
+# link.
+RUN cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF \
+      -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}" \
+      -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON \
+      -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF \
+      -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
+ && cmake --build build --config Release -j"$(nproc)" \
+ && mkdir -p /out \
+ && cp -a build/bin/. /out/ \
+ && find build -name '*.so*' -not -path 'build/bin/*' -exec cp -P {} /out/ \;
+
+# ── Runtime ──────────────────────────────────────────────────────────
+FROM ${HUB_MIRROR}/nvidia/cuda:12.9.1-runtime-ubuntu24.04@sha256:1287141d283b8f06f45681b56a48a85791398c615888b1f96bfb9fc981392d98
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# The same nonroot user the CPU image's DHI base carries (65532), so a file
+# either image writes has the same owner.
+RUN groupadd --system --gid 65532 nonroot \
+ && useradd --system --uid 65532 --gid 65532 --no-create-home --shell /usr/sbin/nologin nonroot
+
+COPY --from=builder /out/ /opt/llama/
+# What this image actually contains (the same file as the CPU image's).
+COPY --from=builder /src/LLAMACPP_COMMIT /opt/llama/LLAMACPP_COMMIT
+# The base's LD_LIBRARY_PATH (/usr/local/nvidia/lib*, where the NVIDIA
+# runtime mounts the driver) stays on the path after ours.
+ENV PATH="/opt/llama:${PATH}" LD_LIBRARY_PATH="/opt/llama:${LD_LIBRARY_PATH}"
+
+WORKDIR /app
+RUN chown nonroot:nonroot /app
+
+# The CPU image's env interface. N_GPU_LAYERS defaults to every layer here
+# (the agent always sets it: "auto" is 999 on a GPU start).
+ENV MODEL_PATH=/models/model.gguf N_GPU_LAYERS=999 N_CTX=4096 N_THREADS=4 HOST=0.0.0.0 PORT=8085
+EXPOSE 8085
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s \
+    CMD curl -fs "http://localhost:${PORT}/health" || exit 1
+
+USER nonroot
+
+# The base image has no entrypoint script we want; the CMD runs directly.
+ENTRYPOINT []
+
+# Translate the stable env interface into upstream llama-server flags: the
+# same CMD as docker/Dockerfile.llamacpp.
+CMD ["sh","-c","exec llama-server \
+  --model \"${MODEL_PATH}\" --n-gpu-layers \"${N_GPU_LAYERS}\" \
+  --ctx-size \"${N_CTX}\" --threads \"${N_THREADS}\" \
+  --host \"${HOST}\" --port \"${PORT}\" --jinja"]

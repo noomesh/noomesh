@@ -87,7 +87,7 @@ BASE_SOURCES = {"DHI_REGISTRY": "dhi.io", "HUB_MIRROR": "docker.io"}
 # Built daily and staged. Not here, and rebuilt by every release: gateway,
 # node-agent, worker and trellion carry noomesh source; sandbox is built FROM
 # deps-core:$TAG and COPYs src/**, so its inputs move with every release.
-DAILY = ("llamacpp", "ollama", "stunnel", "postgres-pgvector", "whisper", "piper", "nvidia-exporter")
+DAILY = ("llamacpp", "llamacpp-cuda", "ollama", "stunnel", "postgres-pgvector", "whisper", "piper", "nvidia-exporter")
 
 # Context-level ignore files that can change what a COPY sends.
 IGNORE_FILES = (".dockerignore", "docker/.dockerignore")

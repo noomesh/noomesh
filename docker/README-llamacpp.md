@@ -16,6 +16,39 @@ all pull that image, on ARM nodes too (noomesh-internal i323). There is no
 upstream fallback: a node with this image neither local nor staged for its arch
 refuses the start and names the restage command.
 
+## The CUDA image
+
+`Dockerfile.llamacpp-cuda` is the GPU build of the same llama.cpp ref
+(`LLAMACPP_REF`, the same moving-ref refusal, the same env interface and
+CMD), published as `ghcr.io/noomesh/llamacpp-cuda:<stack-tag>` for
+`linux/amd64` only. Its bases are NVIDIA's `nvidia/cuda:12.9.1-devel` and
+`-runtime` (Ubuntu 24.04), digest-pinned and pulled through the GHCR mirror
+of Docker Hub; it runs as `nonroot` (65532), like the CPU image.
+
+CUDA 12.9, not 13: CUDA 13 dropped every GPU below compute capability 7.5,
+which would leave the Pascal cards (GTX 10xx, compute 6.1) behind. A CUDA 12
+binary also runs on newer drivers (the 580 series included).
+
+GPU code (`CUDA_ARCHITECTURES`): real cubins for `61` (Pascal), `75`
+(Turing), `86` (Ampere consumer), `89` (Ada) and `120` (Blackwell consumer),
+plus `61-virtual`, compute_61 PTX. PTX is compiled by the driver on first use
+and only runs on its own or a NEWER GPU, so it is the forward fallback for
+every GPU without a cubin (Volta, A100, Hopper, data-centre Blackwell; the
+first start compiles for minutes, once) and nothing runs below compute 6.1.
+Never `native`. The backends are loadable modules (`GGML_BACKEND_DL`), so
+the image starts on a machine with no NVIDIA driver and simply lists no CUDA
+device (CI runs it that way).
+
+Who downloads it (about 3 GB: the CUDA 12.9 runtime base alone is 2.4 GB
+compressed): only a node that starts llamacpp on its GPU. The node agent
+takes the CUDA image when the placement is not `cpu` and the node has an
+NVIDIA GPU of compute 6.1 or newer and the NVIDIA container runtime;
+everything else, ARM nodes included, runs the CPU image above. It is not a
+compose service, so `noo onboard` and `noo stack` never pull it, and a roll
+stages it on the controller only when some node has such a placement (else
+`noo cluster place` stages it the first time one is placed).
+`LLAMACPP_CUDA_IMAGE` overrides it, as `LLAMACPP_IMAGE` does the CPU image.
+
 ## Building it yourself
 
 ```
@@ -36,4 +69,5 @@ a release pin), then a local build tagged `pai-assistant/llamacpp:<arch>` or
 `:latest` when one exists on that node, and only then the upstream
 `ghcr.io/ggml-org/llama.cpp:server`. `LLAMACPP_IMAGE` overrides this
 resolution on both the node agent and the `docker-compose.cluster.yml`
-service.
+service. For a GPU start the same order applies to `llamacpp-cuda`, upstream's
+`ghcr.io/ggml-org/llama.cpp:server-cuda` and `LLAMACPP_CUDA_IMAGE`.

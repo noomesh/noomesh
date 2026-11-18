@@ -415,14 +415,19 @@ func (c *Controller) refreshGPUSetLocked(backends []docker.GPUBackend) {
 	}
 }
 
+// llamacppOnGPUHere is the node agent's rule for this node
+// (docker.LlamacppGPUUsableHere); a var so tests can pose as a node.
+var llamacppOnGPUHere = docker.LlamacppGPUUsableHere
+
 func placedOnGPU(p Placed) bool {
-	if p.Target == "cpu" {
+	if docker.StartTarget(p.Backend, p.Target, p.Env) == "cpu" {
 		return false
 	}
-	// llamacpp runs on the CPU whatever its target while the image has no
-	// GPU build (the agent starts it with no GPU device).
-	if p.Backend == "llamacpp" && !docker.LlamacppHasGPUBuild {
-		return false
+	// llamacpp holds the GPU exactly when the agent starts it on the GPU:
+	// the CUDA image on a node that can use it (gpu or no target), else the
+	// CPU image with no GPU device (docker.LlamacppGPUUsable).
+	if p.Backend == "llamacpp" {
+		return llamacppOnGPUHere()
 	}
 	return p.Backend == "vllm" || p.Target == "gpu"
 }
