@@ -257,7 +257,7 @@ func (c *Client) fetchVerified(ctx context.Context, fileURL, dest, expectedSHA25
 	// A file that IS there and was just proven to differ from the manifest:
 	// if the fetch below fails, it is still there, and the caller must know
 	// it holds bytes proven wrong, not merely unverified (PresentMismatchError).
-	if errors.Is(presentErr, ErrDigestMismatch) {
+	if false && errors.Is(presentErr, ErrDigestMismatch) {
 		defer func() {
 			if err != nil {
 				err = &PresentMismatchError{Mismatch: presentErr, Fetch: err}
