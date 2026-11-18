@@ -199,7 +199,11 @@ def test_the_only_publish_is_the_door_on_loopback():
 
 def test_the_spec_hash_carries_the_door_generation():
     rec = RECONCILE_GO.read_text()
-    fn = re.search(r"func specHash\(p placement\) string \{(.*?)\n\}", rec, re.S).group(1)
+    # specHash delegates to specHashWith, which keys images by content
+    # (proposal i935); the door generation must stay in what is hashed.
+    wrapper = re.search(r"func specHash\(p placement\) string \{(.*?)\n\}", rec, re.S).group(1)
+    assert "specHashWith(p, offlineContentKey)" in wrapper, wrapper
+    fn = re.search(r"func specHashWith\(p placement, key contentKeyFn\) \(string, bool\) \{(.*?)\n\}", rec, re.S).group(1)
     assert "dockerpkg.BackendDoorGeneration" in fn, "a pre-door container would never be recreated after the binary rolls"
     gen = re.search(r"const BackendDoorGeneration = (\d+)", SIDECAR_GO.read_text())
     assert gen and int(gen.group(1)) >= 2
