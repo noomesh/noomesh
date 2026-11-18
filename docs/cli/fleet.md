@@ -76,7 +76,7 @@ redemption record, derives the tier from the node's live facts once it has
 heartbeated, else from the hardware facts it reported at enrollment (SBC or bare ARM → 4, GPU → 2, else 3; unified
 memory goes by usable GPU memory — CUDA ≥ 10 GB → 1, ≥ 4 GB → 2, else 4;
 pass a tier argument to override; a node with no facts on record must
-re-enroll), issues the node cert, and builds **one CA-signed bundle**
+re-enroll), issues the node cert, and builds **one bundle signed by the fleet signing key**
 (agent env with the credentials, systemd unit, agent binary, certs). On a
 pull-enrolled node the bundle is encrypted to the node's birth cert and
 staged at the gateway; the node's fetcher collects it and reports back:
@@ -502,7 +502,7 @@ fleet-key set; there is no `--key` flag. The shared `NATS_USER` /
 its own, delivered by `noo cluster nats-creds rotate <node>`). It
 reads the controller value from `secrets/env.sops`, checks it against the
 live gateway's env, and for every key the gateway agrees with, stages a
-CA-signed `fleet-secrets` bundle — a dotenv fragment, end-to-end encrypted
+`fleet-secrets` bundle signed by the fleet signing key — a dotenv fragment, end-to-end encrypted
 to each node's birth cert — on the pull rail. Each node's applier merges
 the fragment into `/etc/noo-node-agent.env` and restarts the agent, which
 reconnects presenting the controller's value. A key the gateway disagrees
@@ -522,7 +522,7 @@ noo cluster teardown-node gpu-2 --factory -y       # also purge its data and rem
 noo cluster teardown-node gpu-2 -y --keep-tailnet-record   # keep the device record (the next enroll registers as gpu-2-1)
 ```
 
-The command confirms, stages a CA-signed `teardown` bundle on the pull
+The command confirms, stages a `teardown` bundle signed by the fleet signing key on the pull
 rail — there is no fallback lane; a node with no birth cert on record
 predates the rail and must be re-enrolled first — waits up to four
 minutes for the node to fetch it, then **verifies silence** — polls until
