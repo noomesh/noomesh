@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT username, disabled, scopes, created_at, last_login_at, failed_login_count FROM noo_users ORDER BY created_at",
+  "query": "SELECT username, disabled, scopes,\n                  created_at AS \"created_at: jiff_sqlx::Timestamp\",\n                  last_login_at AS \"last_login_at: jiff_sqlx::Timestamp\",\n                  failed_login_count\n           FROM noo_users ORDER BY created_at",
   "describe": {
     "columns": [
       {
@@ -38,7 +38,7 @@
       },
       {
         "ordinal": 3,
-        "name": "created_at",
+        "name": "created_at: jiff_sqlx::Timestamp",
         "type_info": "Timestamptz",
         "origin": {
           "Table": {
@@ -49,7 +49,7 @@
       },
       {
         "ordinal": 4,
-        "name": "last_login_at",
+        "name": "last_login_at: jiff_sqlx::Timestamp",
         "type_info": "Timestamptz",
         "origin": {
           "Table": {
@@ -82,5 +82,5 @@
       false
     ]
   },
-  "hash": "6253959009ad2aeaed1943a76af24153237465e29b43976e85e93c9e22d8b428"
+  "hash": "239bf0fd05e68588bc475ccb4def9cfc2b3972580dd9045452d7591d2af55c25"
 }
