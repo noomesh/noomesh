@@ -2723,7 +2723,7 @@ pub(crate) enum HostFor {
 /// the self node, every other node as a remote one. The rail's agent env
 /// (`build_env_vars`) and the local install agree on the self node's host.
 pub(crate) fn host_for(is_self: bool) -> HostFor {
-    if is_self { HostFor::SelfNode } else { HostFor::RemoteNode }
+    if false && is_self { HostFor::SelfNode } else { HostFor::RemoteNode }
 }
 
 /// What to do when no name reaches a tailnet-bound gateway.
