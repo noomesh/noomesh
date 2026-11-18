@@ -5583,6 +5583,68 @@ pub(crate) fn harness_systemd_check(reports: &[(String, Option<i64>, String)]) -
     ))
 }
 
+/// What the Linux applier writes on its `applied:` line for the node agent's
+/// filesystem hold (scripts/noo-apply.sh, agent_protect): `agent-protect=N`
+/// or `agent-protect=unchanged:N` (N writable paths), or
+/// `agent-protect=REFUSED:<KEY>`. No tag at all on a host without systemd.
+pub(crate) const AGENT_PROTECT_TAG: &str = "agent-protect=";
+
+/// The remedy for a refused hold: the key names which setting to fix.
+fn agent_protect_remedy(node: &str, key: &str) -> String {
+    match key {
+        "NOO_DATA_ROOT" | "HF_CACHE_DIR" | "OLLAMA_DATA_DIR" => format!(
+            "give {node} a plain absolute data root outside the system trees: \
+             noo cluster set-config {node} --data-root <path> && noo cluster provision {node} --wait"
+        ),
+        "MODELS_DIR" => format!(
+            "give {node} a plain absolute models dir outside the system trees: \
+             noo cluster set-config {node} --models-dir <path> && noo cluster provision {node} --wait"
+        ),
+        _ => format!(
+            "set {key} on {node} to plain absolute paths outside the system trees, then: noo cluster provision {node} --wait"
+        ),
+    }
+}
+
+/// The `agent protect` row (proposal 61 phase 0b): from each node's last
+/// apply report, whether the node agent's unit is held to the paths it
+/// writes. A refusal on any node is a FAIL naming the node and the key (that
+/// node keeps its previous hold, or none); otherwise OK naming each held node
+/// and how many paths it leaves writable. No row when no node reports a hold
+/// (a Mac or another host without systemd writes no tag).
+pub(crate) fn agent_protect_check(reports: &[(String, Option<i64>, String)]) -> Option<Check> {
+    let mut held: Vec<String> = Vec::new();
+    let mut refused: Vec<(String, String)> = Vec::new();
+    for (node, _, msg) in reports {
+        let Some(at) = msg.find(AGENT_PROTECT_TAG) else { continue };
+        let val = msg[at + AGENT_PROTECT_TAG.len()..].split_whitespace().next().unwrap_or("");
+        if let Some(key) = val.strip_prefix("REFUSED:") {
+            refused.push((node.clone(), key.to_string()));
+        } else {
+            let n = val.strip_prefix("unchanged:").unwrap_or(val);
+            if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
+                held.push(format!("{node} ({n} writable paths)"));
+            }
+        }
+    }
+    if let Some((first, key)) = refused.first() {
+        let names: Vec<String> = refused.iter().map(|(n, k)| format!("{n} ({k})")).collect();
+        return Some(fail(
+            "agent protect",
+            format!(
+                "the applier REFUSED the node agent's filesystem hold on {}: the named setting is not a path \
+                 the agent may be allowed to write; that node keeps its previous hold, or none",
+                names.join(", ")
+            ),
+            agent_protect_remedy(first, key),
+        ));
+    }
+    if held.is_empty() {
+        return None;
+    }
+    Some(ok("agent protect", format!("the node agent writes only where it must on {}", held.join(", "))))
+}
+
 /// A Mac whose last apply report says root REFUSED to install its CLI or
 /// helper (`… root-refused: noo-cli,noo-hostd`, node_fetch.rs
 /// `apply_report_msg`): the directory was not root's alone, typically a
@@ -8191,6 +8253,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(with_node_root_refusals(with_node_anchors(with_retired_apply_lanes_and_adoption(
             legacy_lanes_check(metrics.as_deref(), &fleet, now), &apply_reports, &unadopted), &apply_reports, expected), &apply_reports));
         checks.extend(harness_systemd_check(&apply_reports));
+        checks.extend(agent_protect_check(&apply_reports));
         let anonymous = crate::http::get_raw_opt(g, &format!("{LOGS_QUERY_ROUTE}?query=%7Bnode%3D%22verify%22%7D&limit=1"), false, 10)
             .map(|(status, _)| status);
         checks.push(logs_access_check(anonymous));
@@ -12927,6 +12990,33 @@ mod tests {
         assert_eq!(c.verdict, Verdict::Warn);
         assert!(c.detail.contains("host6 (systemd 245)") && !c.detail.contains("host7"), "{}", c.detail);
         assert!(c.remedy.as_deref().is_some_and(|r| r.contains("noo cluster provision host6")), "{:?}", c.remedy);
+    }
+
+    /// proposal 61 phase 0b: the agent protect row reads each node's last
+    /// apply report. Held = OK with the writable-path count (a written and an
+    /// unchanged hold alike); a refusal anywhere = FAIL naming the node and
+    /// key, with the set-config remedy; no tag anywhere (a Mac) = no row.
+    #[test]
+    fn the_agent_protect_row_reads_held_refused_and_absent() {
+        let mac = ("mac1".to_string(), Some(0), "applied: agent-env verified-by: signing-key".to_string());
+        assert!(agent_protect_check(std::slice::from_ref(&mac)).is_none(), "no systemd: no row");
+        let held = [
+            ("host6".to_string(), Some(0), "applied: agent-env agent-protect=8 verified-by: signing-key".to_string()),
+            ("host7".to_string(), Some(0), "applied: agent-env=unchanged agent-protect=unchanged:7".to_string()),
+            mac.clone(),
+        ];
+        let c = agent_protect_check(&held).expect("a held node is a row");
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("host6 (8 writable paths)") && c.detail.contains("host7 (7 writable paths)"), "{}", c.detail);
+        assert!(!c.detail.contains("mac1"), "{}", c.detail);
+        let refused = [
+            held[0].clone(),
+            ("host8".to_string(), Some(0), "applied: agent-env agent-protect=REFUSED:NOO_DATA_ROOT".to_string()),
+        ];
+        let c = agent_protect_check(&refused).expect("a refusal is a row");
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("host8 (NOO_DATA_ROOT)"), "{}", c.detail);
+        assert!(c.remedy.as_deref().is_some_and(|r| r.contains("noo cluster set-config host8 --data-root <path>")), "{:?}", c.remedy);
     }
 
     #[test]

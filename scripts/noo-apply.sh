@@ -1314,10 +1314,16 @@ agent_protect_apply() {
         applied="$applied agent-protect=REFUSED:$AP_BAD_KEY"
         return 0
     fi
+    # The applied line ALWAYS says how many paths the hold leaves writable
+    # (`agent-protect=N`, or `=unchanged:N`), so the node's last apply report
+    # carries the hold's state for `noo cluster verify`'s agent protect row,
+    # not only the apply that changed it.
+    _ap_cnt="$(printf '%s\n' "$AP_PATHS" | grep -c .)"
     _ap_tmp="$(mktemp)"
     ap_render > "$_ap_tmp"
     if ap_same "$AGENT_DROPIN" "$_ap_tmp"; then
         rm -f -- "$_ap_tmp"
+        applied="$applied agent-protect=unchanged:$_ap_cnt"
         return 0
     fi
     # shellcheck disable=SC2086
@@ -1328,7 +1334,7 @@ agent_protect_apply() {
     AP_CHANGED=1
     systemctl daemon-reload 2>/dev/null || true
     need_restart=1
-    applied="$applied agent-protect"
+    applied="$applied agent-protect=$_ap_cnt"
 }
 
 # agent_protect_remove — teardown: the drop-in, and its directory if empty.
