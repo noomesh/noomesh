@@ -967,7 +967,7 @@ fn build_env_vars(g: &Globals, a: &ProvisionArgs, site: &ProvSite, id: &ProvIden
         Err(e) => fail(g.json, ExitCode::Generic, "controller_host", &e, Some(CONTROLLER_HOST_REMEDY)),
     };
     vars.insert("controller_url", format!("https://{ctrl_host}:8080"));
-    vars.insert("nats_url", format!("tls://{ctrl_host}:4222"));
+    vars.insert("nats_url", format!("tls://{}:4222", "noo-controller"));
     vars.insert("noo_node_agent_token", creds.agent_token);
     vars.insert("noo_cluster_secret", creds.cluster_secret);
     vars.insert("noo_pki_dir", String::from("/etc/noo/pki"));
