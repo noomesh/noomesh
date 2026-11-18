@@ -29,6 +29,24 @@ pub(crate) fn docker_lines(args: &[&str]) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Why `docker version` failed, from its own error: a socket this process may
+/// not open (the daemon is up), or a daemon that is not there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DaemonState {
+    Denied,
+    Down,
+}
+
+/// Pure: docker's stderr read as [`DaemonState`].
+pub(crate) fn daemon_verdict(stderr: &str) -> DaemonState {
+    let e = stderr.to_ascii_lowercase();
+    if e.contains("permission denied") {
+        DaemonState::Denied
+    } else {
+        DaemonState::Down
+    }
+}
+
 /// `noo doctor docker` — detect the unclean-shutdown damage signature
 /// (ghost records, empty names, fleet-wide 255s) and print the
 /// recovery. Read-only: the repair needs root, and this box's sudo is the
@@ -38,16 +56,26 @@ pub fn doctor_docker(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         return Err(Unhandled);
     }
 
-    // Daemon functional at all?
-    let daemon_ok = Command::new("docker")
-        .args(["version", "--format", "{{.Server.Version}}"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !daemon_ok {
-        fail(g.json, ExitCode::Generic, "daemon_down",
-            "the docker daemon is not answering",
-            Some("sudo systemctl start docker — then re-run noo doctor docker"));
+    // Daemon functional at all? A shell that cannot use the socket yet (the
+    // user joined the docker group in this login session) is not a daemon
+    // that is down: 2026-11-18 install matrix, both stranger cells, the stack
+    // up and answering chat, and this said "not answering" with
+    // `systemctl start docker` as the remedy. Relaunch with the group first,
+    // as every other docker-gated command does; then say what docker said.
+    let out = Command::new("docker").args(["version", "--format", "{{.Server.Version}}"]).output();
+    if !out.as_ref().is_ok_and(|o| o.status.success()) {
+        let err = out.as_ref().map(|o| String::from_utf8_lossy(&o.stderr).into_owned()).unwrap_or_else(|e| e.to_string());
+        if let Some(rc) = crate::docker_group::relaunch_if_needed(&err) {
+            return Ok(rc);
+        }
+        match daemon_verdict(&err) {
+            DaemonState::Denied => fail(g.json, ExitCode::Generic, "docker_access",
+                "the docker daemon is running, but this shell cannot use it yet (permission denied on the docker socket)",
+                Some("open a new terminal or run `newgrp docker` (after joining the docker group), or: sudo noo doctor docker")),
+            DaemonState::Down => fail(g.json, ExitCode::Generic, "daemon_down",
+                "the docker daemon is not answering",
+                Some("sudo systemctl start docker — then re-run noo doctor docker")),
+        }
     }
 
     let ids = docker_lines(&["ps", "-aq"]);
@@ -2445,3 +2473,30 @@ mod container_env_cache_tests {
         assert!(!body.contains("container_env(c)"), "no per-secret inspect");
     }
 }
+
+#[cfg(test)]
+mod docker_access_tests {
+    use super::*;
+
+    #[test]
+    fn a_denied_socket_is_not_a_daemon_that_is_down() {
+        let denied = "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock: Get \"http://%2Fvar%2Frun%2Fdocker.sock/v1.47/version\": dial unix /var/run/docker.sock: connect: permission denied";
+        assert_eq!(daemon_verdict(denied), DaemonState::Denied);
+        let down = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?";
+        assert_eq!(daemon_verdict(down), DaemonState::Down);
+        assert_eq!(daemon_verdict(""), DaemonState::Down, "no docker binary / no output: down");
+    }
+
+    /// The relaunch comes before either refusal, as every docker-gated
+    /// command's does (docker_group::every_docker_gate_tries_the_relaunch_before_refusing).
+    #[test]
+    fn doctor_docker_tries_the_group_relaunch_before_refusing() {
+        let own = crate::test_src::own_code(include_str!("doctor.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn doctor_docker(");
+        let r = body.find("crate::docker_group::relaunch_if_needed(&err)").expect("doctor docker tries the relaunch");
+        let denied = body.find("\"docker_access\"").expect("the access refusal");
+        let down = body.find("\"daemon_down\"").expect("the daemon-down refusal");
+        assert!(r < denied && r < down, "{body}");
+    }
+}
+
