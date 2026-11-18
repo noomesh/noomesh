@@ -4,7 +4,7 @@
 # Daily build of the infra images, OUTSIDE the release (noomesh-internal i567).
 #
 # llamacpp (llama-server compiled from source, arm64 under QEMU: ~60 min),
-# ollama, stunnel, postgres-pgvector, whisper, piper and nvidia-exporter carry
+# llamacpp-cuda (the same, CUDA 12.9, amd64 only), ollama, stunnel, postgres-pgvector, whisper, piper and nvidia-exporter carry
 # no noomesh source and change a few times a quarter, yet every new version's
 # rc.1 rebuilt them. Here they are built once a day from dev, which also picks
 # up the day's apt/apk/pip security updates, then:

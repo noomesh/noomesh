@@ -18,22 +18,23 @@ func pinRelease(t *testing.T) {
 	t.Helper()
 	t.Setenv("NOO_IMAGE_PREFIX", "ghcr.io/noomesh")
 	t.Setenv("NOO_IMAGE_TAG", "v0.6.15")
-	for _, v := range []string{"LLAMACPP_IMAGE", "OLLAMA_IMAGE", "RERANK_IMAGE", "RERANK_ENGINE"} {
+	for _, v := range []string{"LLAMACPP_IMAGE", "LLAMACPP_CUDA_IMAGE", "OLLAMA_IMAGE", "RERANK_IMAGE", "RERANK_ENGINE"} {
 		t.Setenv(v, "")
 	}
 }
 
 func TestHardenedDefaultsAreOursOnEveryArch(t *testing.T) {
 	pinRelease(t)
+	poseGPUFacts(t, GPUFacts{}) // a CPU node: llamacpp takes its CPU build
 	for backend, want := range map[string]string{
 		"llamacpp": "ghcr.io/noomesh/llamacpp:v0.6.15",
 		"reranker": "ghcr.io/noomesh/llamacpp:v0.6.15",
 		"ollama":   "ghcr.io/noomesh/ollama:v0.6.15",
 	} {
-		if ours := hardenedDefault(backend); ours != want {
+		if ours := hardenedDefault(backend, true); ours != want {
 			t.Errorf("%s: hardenedDefault = %q, want %q", backend, ours, want)
 		}
-		choice, err := chooseBackendImage(backend, backendSpecs[backend], "")
+		choice, err := chooseBackendImage(backend, backendSpecs[backend], "", "")
 		if err != nil {
 			t.Fatalf("%s: %v", backend, err)
 		}
@@ -53,27 +54,27 @@ func TestExplicitImagesWin(t *testing.T) {
 	pinRelease(t)
 	pin := "@sha256:" + strings.Repeat("a", 64)
 	t.Run("placement override", func(t *testing.T) {
-		c, err := chooseBackendImage("ollama", backendSpecs["ollama"], "ollama/ollama:0.40.5"+pin)
+		c, err := chooseBackendImage("ollama", backendSpecs["ollama"], "ollama/ollama:0.40.5"+pin, "")
 		if err != nil || !strings.HasPrefix(c.Ref, "ollama/ollama:0.40.5") {
 			t.Fatalf("choice %+v err %v", c, err)
 		}
 	})
 	t.Run("LLAMACPP_IMAGE", func(t *testing.T) {
 		t.Setenv("LLAMACPP_IMAGE", "registry.example/mine/llama:1")
-		if ours := hardenedDefault("llamacpp"); ours != "" {
+		if ours := hardenedDefault("llamacpp", true); ours != "" {
 			t.Fatalf("an explicit LLAMACPP_IMAGE must disable the hardened default, got %q", ours)
 		}
 	})
 	t.Run("OLLAMA_IMAGE", func(t *testing.T) {
 		t.Setenv("OLLAMA_IMAGE", "ollama/ollama:0.40.5"+pin)
-		c, err := chooseBackendImage("ollama", backendSpecs["ollama"], "")
+		c, err := chooseBackendImage("ollama", backendSpecs["ollama"], "", "")
 		if err != nil || !strings.HasPrefix(c.Ref, "ollama/ollama:0.40.5") {
 			t.Fatalf("choice %+v err %v", c, err)
 		}
 	})
 	t.Run("RERANK_ENGINE=tei", func(t *testing.T) {
 		t.Setenv("RERANK_ENGINE", "tei")
-		if ours := hardenedDefault("reranker"); ours != "" {
+		if ours := hardenedDefault("reranker", true); ours != "" {
 			t.Fatalf("the TEI reranker has no hardened llama default, got %q", ours)
 		}
 	})
@@ -83,13 +84,13 @@ func TestNoReleasePinKeepsTheUpstreamDefault(t *testing.T) {
 	t.Setenv("NOO_IMAGE_PREFIX", "")
 	t.Setenv("NOO_IMAGE_TAG", "")
 	t.Setenv("OLLAMA_IMAGE", "")
-	if ours := hardenedDefault("ollama"); ours != "" {
+	if ours := hardenedDefault("ollama", true); ours != "" {
 		t.Fatalf("no pin: hardenedDefault must be empty, got %q", ours)
 	}
 	if got := ollamaDefaultImage(); got != upstreamOllamaImage {
 		t.Errorf("ollamaDefaultImage with no pin = %q", got)
 	}
-	c, err := chooseBackendImage("ollama", backendSpecs["ollama"], "")
+	c, err := chooseBackendImage("ollama", backendSpecs["ollama"], "", "")
 	if err != nil || c.Ref != upstreamOllamaImage {
 		t.Fatalf("choice %+v err %v", c, err)
 	}
@@ -139,12 +140,12 @@ func TestNoUpstreamFallbackCodeRemains(t *testing.T) {
 // onto the new release image, and a stable release is a stable value (no loop).
 func TestReleaseBackendImageCoversOllama(t *testing.T) {
 	pinRelease(t)
-	a := ReleaseBackendImage("ollama")
-	if a != "ghcr.io/noomesh/ollama:v0.6.15" || a != ReleaseBackendImage("ollama") {
+	a := ReleaseBackendImage("ollama", "")
+	if a != "ghcr.io/noomesh/ollama:v0.6.15" || a != ReleaseBackendImage("ollama", "") {
 		t.Fatalf("ReleaseBackendImage(ollama) = %q", a)
 	}
 	t.Setenv("OLLAMA_IMAGE", "ollama/ollama:0.40.5")
-	if got := ReleaseBackendImage("ollama"); got != "" {
+	if got := ReleaseBackendImage("ollama", ""); got != "" {
 		t.Errorf("an upstream override is not this release's image, got %q", got)
 	}
 }

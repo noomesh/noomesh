@@ -82,7 +82,7 @@ func imagesToPrefetch(
 		if p.Model != "" && dockerpkg.ExpectsGGUFModel(p.Backend) && !strings.HasSuffix(p.Model, ".gguf") {
 			continue
 		}
-		ref := placementImageFn(p.Backend, p.Image)
+		ref := placementImageFn(p.Backend, p.Image, dockerpkg.StartTarget(p.Backend, p.Target, p.Env))
 		if ref == "" {
 			continue
 		}

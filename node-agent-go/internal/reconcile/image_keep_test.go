@@ -12,7 +12,7 @@ import (
 const dgA = "ghcr.io/noomesh/llamacpp@sha256:" + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 const dgB = "registry.example.net/acme/tool@sha256:" + "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
-func fakeRef(backend, override string) string {
+func fakeRef(backend, override, _ string) string {
 	if override != "" {
 		return override
 	}

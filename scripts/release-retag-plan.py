@@ -67,7 +67,7 @@ Output (JSON on stdout, and to $GITHUB_OUTPUT when set):
     staged        {"image": "<created>"} images re-tagged from :staged
 
 STAGED INFRA IMAGES (noomesh-internal i567). The infra images in
-scripts/infra-staged.py DAILY (llamacpp, ollama, stunnel, postgres-pgvector,
+scripts/infra-staged.py DAILY (llamacpp, llamacpp-cuda, ollama, stunnel, postgres-pgvector,
 whisper, piper, nvidia-exporter) are built, scanned and staged once a day by
 infra-staged.yml, outside the release. Any of them the rc path above would
 BUILD is instead re-tagged from `<image>:staged` when, on EVERY platform, the
@@ -122,6 +122,7 @@ SIBLING_INPUTS: dict[str, tuple[str, ...]] = {
     "piper": (),
     "postgres-pgvector": (),
     "llamacpp": (),
+    "llamacpp-cuda": (),
     "stunnel": (),
     "ollama": (),
     "nvidia-exporter": (),

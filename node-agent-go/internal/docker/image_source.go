@@ -435,19 +435,21 @@ func (c *Client) PrefetchImages(ctx context.Context, refs []string, placements i
 
 // BackendImageRef is the image StartBackend will use for backend, so the
 // reconciler can prefetch it. It calls the same chooseBackendImage as
-// StartBackendSDK (image_choice.go): CPU image on a node without NVIDIA, the
-// controller's override, ${VAR} substitution and the pinning policy. It
+// StartBackendSDK (image_choice.go): CPU image on a node without NVIDIA (for
+// llamacpp: unless the placement runs on this node's GPU, so a CPU node never
+// prefetches the CUDA image), the controller's override, ${VAR}
+// substitution and the pinning policy. It
 // returns "" when it cannot tell (unknown backend) or when the policy refuses
 // the ref (the start path reports why). For a hardened default it is OURS; if
 // ours is not staged the start falls back to upstream and the prefetch has
 // merely failed (logged). A wrong answer here only costs a missed or wasted
 // prefetch.
-func BackendImageRef(backend, override string) string {
+func BackendImageRef(backend, override, target string) string {
 	spec, ok := backendSpecs[backend]
 	if !ok {
 		return ""
 	}
-	choice, err := chooseBackendImage(backend, spec, override)
+	choice, err := chooseBackendImage(backend, spec, override, target)
 	if err != nil {
 		return "" // the start path refuses it with the explanation
 	}

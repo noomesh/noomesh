@@ -143,7 +143,15 @@ pub(crate) const NO_VARIANT: &str = "no variant for";
 /// (`OWN_IMAGE_ARCHES`); tests/test_hardened_images_i323.py holds both equal
 /// to the matrix. For these images a missing arch is a FAILURE, never a skip:
 /// the node does not fall back to an upstream image.
-pub(crate) const OWN_IMAGE_ARCHES: &[(&str, &[&str])] = &[("llamacpp", &["amd64", "arm64"]), ("ollama", &["amd64", "arm64"])];
+pub(crate) const OWN_IMAGE_ARCHES: &[(&str, &[&str])] =
+    &[("llamacpp", &["amd64", "arm64"]), ("llamacpp-cuda", &["amd64"]), ("ollama", &["amd64", "arm64"])];
+
+/// Release images staged ON DEMAND, never by every lock stage: the GPU
+/// llama.cpp build (~3 GB, amd64 only) is staged only when some node runs a
+/// llamacpp placement on a GPU it can use ([`on_demand_rows_for`]), or when
+/// `noo cluster place` meets the gateway's not-staged refusal for it. A fleet
+/// with no such placement never downloads it, the controller included.
+pub(crate) const ON_DEMAND_LOCK_ROWS: &[&str] = &["llamacpp-cuda"];
 
 /// Is `image` (a lock row name or a full ref) one the release publishes for `arch`?
 pub(crate) fn own_image_published(image: &str, arch: &str) -> bool {
@@ -181,7 +189,7 @@ pub(crate) fn parse_lock(text: &str) -> Vec<LockRow> {
 }
 
 pub(crate) fn node_bound(name: &str) -> bool {
-    !CONTROLLER_ONLY.contains(&name) && !name.starts_with("deps-") && !THIRD_PARTY_LOCK_ROWS.contains(&name)
+    !CONTROLLER_ONLY.contains(&name) && !name.starts_with("deps-") && !THIRD_PARTY_LOCK_ROWS.contains(&name) && !ON_DEMAND_LOCK_ROWS.contains(&name)
 }
 
 /// Does `stage_lock` stage this lock row? Node-bound release images, or
@@ -860,10 +868,16 @@ enum Staged {
     Failed(String),
 }
 
-/// Every arch of ONE lock image, in order, on the calling thread.
+/// Every arch of ONE lock image, in order, on the calling thread. An
+/// on-demand image ([`ON_DEMAND_LOCK_ROWS`]) is staged only for the arches the
+/// release publishes it for (the CUDA llama.cpp: amd64).
 fn stage_lock_image(g: &Globals, image: &str, digest: &str, tag: &str, source: &str, arches: &[String], release: &Release) -> Vec<Staged> {
     let mut out = Vec::new();
+    let name = repo_of(image).rsplit('/').next().unwrap_or(image);
     for arch in arches {
+        if ON_DEMAND_LOCK_ROWS.contains(&name) && !own_image_published(image, arch) {
+            continue;
+        }
         let label = format!("{image} ({arch})");
         if !g.json {
             emit(Line::Step(format!("staging {label}")));
@@ -901,7 +915,11 @@ fn stage_lock_image(g: &Globals, image: &str, digest: &str, tag: &str, source: &
 /// A failing job never cancels the others. Output of a pooled run is printed
 /// in lock order after every job finished (not interleaved); the serial pass
 /// (parallelism 1) prints as it goes, as it always did.
-pub(crate) fn stage_lock(g: &Globals, lock: &str, prefix: &str, tag: &str, arches: &[String], all: bool) -> Summary {
+///
+/// `on_demand`: the [`ON_DEMAND_LOCK_ROWS`] a placement needs now
+/// ([`on_demand_from_gateway`]); staged like the node-bound rows. Without it
+/// (and without `all`) they are skipped.
+pub(crate) fn stage_lock(g: &Globals, lock: &str, prefix: &str, tag: &str, arches: &[String], all: bool, on_demand: &[String]) -> Summary {
     let prefix = prefix.trim_end_matches('/');
     let mut sum = Summary::default();
     let dir = images_store_dir();
@@ -912,7 +930,7 @@ pub(crate) fn stage_lock(g: &Globals, lock: &str, prefix: &str, tag: &str, arche
     let pins = door_pin_refs(prefix);
     let mut rows: Vec<(String, String, String, &str)> = parse_lock(lock)
         .into_iter()
-        .filter(|r| stages_from_lock(&r.name, all))
+        .filter(|r| stages_from_lock(&r.name, all) || (ON_DEMAND_LOCK_ROWS.contains(&r.name.as_str()) && on_demand.contains(&r.name)))
         .map(|r| (format!("{prefix}/{}:{tag}", r.name), r.digest, tag.to_string(), "lock"))
         .filter(|(image, ..)| !pins.iter().any(|(p, ..)| p == image))
         .collect();
@@ -977,6 +995,50 @@ pub(crate) fn stage_lock(g: &Globals, lock: &str, prefix: &str, tag: &str, arche
         sum.failed.push(format!("{STAGED_INDEX}: {e}"));
     }
     sum
+}
+
+/// Does this desired-config placement, on this node, start the CUDA llama.cpp
+/// image: a running llamacpp placement naming no image of its own, not on
+/// `cpu` (an undeclared target with `N_GPU_LAYERS=0` is cpu, as the agent and
+/// the gateway read it), on a node that can use its GPU
+/// ([`crate::commands::cluster_tune::llamacpp_gpu_usable`]).
+pub(crate) fn placement_starts_cuda_llamacpp(p: &Value, node: &Value) -> bool {
+    let target = p["target"].as_str().map(str::trim).filter(|t| !t.is_empty());
+    let legacy_cpu = target.is_none() && p["env"]["N_GPU_LAYERS"].as_str().map(str::trim) == Some("0");
+    p["backend"].as_str() == Some("llamacpp")
+        && p["desired_state"].as_str() == Some("running")
+        && p["image"].as_str().map(str::trim).unwrap_or("").is_empty()
+        && target != Some("cpu")
+        && !legacy_cpu
+        && crate::commands::cluster_tune::llamacpp_gpu_usable(node)
+}
+
+/// The [`ON_DEMAND_LOCK_ROWS`] the fleet needs: `llamacpp-cuda` when some
+/// amd64 node has a placement that [`placement_starts_cuda_llamacpp`]. Only a
+/// node that can use its GPU is asked for its placements.
+pub(crate) fn on_demand_rows_for(nodes: &[Value], placements_of: &mut dyn FnMut(&str) -> Option<Value>) -> Vec<String> {
+    let wants_cuda = nodes
+        .iter()
+        .filter(|n| node_arch(n) == Some("amd64") && crate::commands::cluster_tune::llamacpp_gpu_usable(n))
+        .any(|n| {
+            let id = n["id"].as_str().unwrap_or("");
+            !id.is_empty()
+                && placements_of(id).is_some_and(|ps| ps.as_array().is_some_and(|a| a.iter().any(|p| placement_starts_cuda_llamacpp(p, n))))
+        });
+    if wants_cuda { vec!["llamacpp-cuda".to_string()] } else { Vec::new() }
+}
+
+/// [`on_demand_rows_for`] from the gateway: the node list, and the
+/// desired-config of each node that can use its GPU. Unreadable is "none
+/// needed": the place-time refusal (`noo cluster place` stages it then) and
+/// the agent's not-staged refusal stay the backstop.
+pub(crate) fn on_demand_from_gateway(g: &Globals) -> Vec<String> {
+    let nodes = crate::http::get_json_opt(g, "/api/cluster/nodes", true, 10)
+        .and_then(|b| b["nodes"].as_array().cloned())
+        .unwrap_or_default();
+    on_demand_rows_for(&nodes, &mut |id: &str| {
+        crate::http::get_json_opt(g, &format!("/api/cluster/nodes/{}/desired-config", crate::commands::urlencode(id)), true, 10).map(|d| d["placements"].clone())
+    })
 }
 
 /// The fleet's architectures, from the gateway (all nodes, not only online:
@@ -1058,7 +1120,7 @@ pub(crate) fn start_stage_release_images(g: &Globals, lock: Option<String>, tag:
         let Some(lock) = lock else { return StageOutcome::NoLock };
         let prefix = crate::commands::provision::release_var("NOO_IMAGE_PREFIX");
         let prefix = if prefix.is_empty() { crate::registry::IMAGE_NAMESPACE.to_string() } else { prefix };
-        StageOutcome::Done(stage_lock(&quiet, &lock, &prefix, &t, &fleet_arches_from_gateway(&quiet), false))
+        StageOutcome::Done(stage_lock(&quiet, &lock, &prefix, &t, &fleet_arches_from_gateway(&quiet), false, &on_demand_from_gateway(&quiet)))
     });
     StageRun { handle: Some(handle), tag: tag_owned }
 }
@@ -1157,7 +1219,7 @@ pub(crate) fn stage_selection(g: &Globals, images: &[String], arches: &[String],
     let mut sum = Summary::default();
     if from_lock {
         let (lock, prefix, tag) = read_controller_lock(g);
-        sum = stage_lock(g, &lock, &prefix, &tag, arches, all);
+        sum = stage_lock(g, &lock, &prefix, &tag, arches, all, &on_demand_from_gateway(g));
     }
     for img in images {
         for arch in arches {
@@ -1191,7 +1253,8 @@ pub(crate) fn run_stage_only(g: &Globals, images: &[String], arches: &[String], 
 
 /// The image a placement needs staged, when it can be named — the CLI twin
 /// of the gateway's `placement_required_image` (same rule, same tests).
-pub(crate) fn placement_required_image(backend: &str, image: Option<&str>, arch: &str, release: Option<&Release>, roots: &[&str]) -> Option<String> {
+/// `on_gpu`: llamacpp starts the CUDA build there (amd64 only).
+pub(crate) fn placement_required_image(backend: &str, image: Option<&str>, arch: &str, release: Option<&Release>, roots: &[&str], on_gpu: bool) -> Option<String> {
     if let Some(img) = image.map(str::trim).filter(|i| !i.is_empty()) {
         let mut all: Vec<&str> = roots.to_vec();
         if let Some(r) = release {
@@ -1200,12 +1263,15 @@ pub(crate) fn placement_required_image(backend: &str, image: Option<&str>, arch:
         return is_own_image_with(img, &all).then(|| img.to_string());
     }
     let r = release?;
-    (backend == "llamacpp" && arch == "amd64").then(|| format!("{}/llamacpp:{}", r.prefix.trim_end_matches('/'), r.tag))
+    let name = if on_gpu { "llamacpp-cuda" } else { "llamacpp" };
+    (backend == "llamacpp" && arch == "amd64").then(|| format!("{}/{name}:{}", r.prefix.trim_end_matches('/'), r.tag))
 }
 
 /// Running placements whose image is not staged for the node's arch — the
 /// `images staged` verify row's input. Empty when the store is not here.
-pub(crate) fn unstaged_for(placements: &Value, arch: &str) -> Vec<String> {
+/// `node` is the node's record: a llamacpp placement on a GPU it can use
+/// needs the CUDA build staged, any other the CPU one.
+pub(crate) fn unstaged_for(placements: &Value, arch: &str, node: &Value) -> Vec<String> {
     let dir = images_store_dir();
     if !dir.is_dir() {
         return Vec::new();
@@ -1218,7 +1284,7 @@ pub(crate) fn unstaged_for(placements: &Value, arch: &str) -> Vec<String> {
         .filter(|p| p["desired_state"].as_str() == Some("running") && p["backend"].as_str() != Some("harness"))
         .filter_map(|p| {
             let roots: Vec<&str> = idx.own_roots.iter().map(String::as_str).collect();
-            placement_required_image(p["backend"].as_str().unwrap_or(""), p["image"].as_str(), arch, idx.release.as_ref(), &roots)
+            placement_required_image(p["backend"].as_str().unwrap_or(""), p["image"].as_str(), arch, idx.release.as_ref(), &roots, placement_starts_cuda_llamacpp(p, node))
         })
         .filter(|img| !image_staged_in(&dir, img, arch))
         .collect();
@@ -1408,16 +1474,59 @@ gateway@{D}
         assert!(v["doors"]["vllm"]["digest"].as_str().is_some_and(|d| d == digest.as_str()));
     }
 
+    /// The CUDA llama.cpp row (~3 GB) is never staged by a lock stage or
+    /// pulled by `sync-images --lock`; it is staged only when an amd64 node
+    /// that can use its GPU has a running llamacpp placement that starts it.
+    #[test]
+    fn the_cuda_llamacpp_row_is_staged_only_for_a_node_that_runs_llamacpp_on_its_gpu() {
+        assert!(!node_bound("llamacpp-cuda") && node_bound("llamacpp"));
+        assert!(!stages_from_lock("llamacpp-cuda", false), "a roll never stages it by default");
+        let lock = format!("llamacpp@sha256:{}\nllamacpp-cuda@sha256:{}\n", "a".repeat(64), "b".repeat(64));
+        assert!(!lock_node_refs(&lock, "reg.example/acme", "v1").iter().any(|r| r.contains("llamacpp-cuda")), "sync-images --lock never pushes it");
+        assert!(own_image_published("llamacpp-cuda", "amd64") && !own_image_published("llamacpp-cuda", "arm64"));
+
+        let gpu = |id: &str, cap: &str| json!({"id": id, "capabilities": {"arch": "x86_64", "vram_gb": 8.0}, "nvidia_runtime": true, "gpu_compute_cap": cap});
+        let place = |target: Option<&str>| {
+            let mut p = json!({"backend": "llamacpp", "model": "m.gguf", "desired_state": "running"});
+            if let Some(t) = target {
+                p["target"] = json!(t);
+            }
+            json!([p])
+        };
+        fn ask(nodes: &[Value], ps: &Value) -> (Vec<String>, Vec<String>) {
+            let mut asked = Vec::new();
+            let rows = on_demand_rows_for(nodes, &mut |id: &str| {
+                asked.push(id.to_string());
+                Some(ps.clone())
+            });
+            (rows, asked)
+        }
+        let cuda = vec!["llamacpp-cuda".to_string()];
+        assert_eq!(ask(&[gpu("node-a", "6.1")], &place(Some("gpu"))).0, cuda);
+        assert_eq!(ask(&[gpu("node-a", "8.6")], &place(None)).0, cuda, "no target on a usable node runs on the GPU");
+        assert!(ask(&[gpu("node-a", "8.6")], &place(Some("cpu"))).0.is_empty(), "a cpu placement");
+        assert!(ask(&[gpu("node-a", "5.2")], &place(Some("gpu"))).0.is_empty(), "a GPU below the image's lowest arch");
+        let cpu_node = json!({"id": "node-b", "capabilities": {"arch": "x86_64", "ram_gb": 16.0}});
+        let arm = json!({"id": "node-c", "capabilities": {"arch": "aarch64", "vram_gb": 8.0}, "nvidia_runtime": true, "gpu_compute_cap": "8.7"});
+        let (rows, asked) = ask(&[cpu_node, arm], &place(Some("gpu")));
+        assert!(rows.is_empty());
+        assert!(asked.is_empty(), "only an amd64 node that can use its GPU is asked for its placements: {asked:?}");
+        let legacy = json!([{"backend": "llamacpp", "model": "m.gguf", "desired_state": "running", "env": {"N_GPU_LAYERS": "0"}}]);
+        assert!(!placement_starts_cuda_llamacpp(&legacy[0], &gpu("node-a", "8.6")), "no target + N_GPU_LAYERS=0 is cpu");
+    }
+
     #[test]
     fn placement_required_image_matches_the_gateway_rule() {
         let rel = Release { prefix: "reg.example/acme".into(), tag: "v0.2.103".into() };
-        assert_eq!(placement_required_image("llamacpp", None, "amd64", Some(&rel), &[]).as_deref(), Some("reg.example/acme/llamacpp:v0.2.103"));
-        assert!(placement_required_image("llamacpp", None, "arm64", Some(&rel), &[]).is_none());
-        assert!(placement_required_image("vllm", Some("vllm/vllm-openai:latest"), "amd64", Some(&rel), &[]).is_none());
-        assert_eq!(placement_required_image("x", Some("noo-browser:latest"), "amd64", None, &[]).as_deref(), Some("noo-browser:latest"));
-        assert_eq!(placement_required_image("x", Some("reg.example/acme/vllm:v1"), "amd64", Some(&rel), &[]).as_deref(), Some("reg.example/acme/vllm:v1"));
+        assert_eq!(placement_required_image("llamacpp", None, "amd64", Some(&rel), &[], false).as_deref(), Some("reg.example/acme/llamacpp:v0.2.103"));
+        assert!(placement_required_image("llamacpp", None, "arm64", Some(&rel), &[], false).is_none());
+        assert!(placement_required_image("vllm", Some("vllm/vllm-openai:latest"), "amd64", Some(&rel), &[], false).is_none());
+        assert_eq!(placement_required_image("x", Some("noo-browser:latest"), "amd64", None, &[], false).as_deref(), Some("noo-browser:latest"));
+        assert_eq!(placement_required_image("x", Some("reg.example/acme/vllm:v1"), "amd64", Some(&rel), &[], false).as_deref(), Some("reg.example/acme/vllm:v1"));
+        // llamacpp on a node's GPU: the CUDA build (amd64 only).
+        assert_eq!(placement_required_image("llamacpp", None, "amd64", Some(&rel), &[], true).as_deref(), Some("reg.example/acme/llamacpp-cuda:v0.2.103"));
         // The old `contains("/noomesh/")` said yes here; the shared rule says no.
-        assert!(placement_required_image("x", Some("quay.io/someone/noomesh/x:1"), "amd64", Some(&rel), &[]).is_none());
+        assert!(placement_required_image("x", Some("quay.io/someone/noomesh/x:1"), "amd64", Some(&rel), &[], false).is_none());
     }
 
     #[test]
@@ -1810,7 +1919,7 @@ gateway@{D}
         let mut gl = g();
         gl.gateway_override = Some("https://127.0.0.1:9".into()); // prewarm is best-effort; refuse fast
         let arches = vec!["amd64".to_string(), "arm64".to_string()];
-        let sum = stage_lock(&gl, &lock, "reg.example/acme", "v1", &arches, true);
+        let sum = stage_lock(&gl, &lock, "reg.example/acme", "v1", &arches, true, &[]);
         PARALLELISM_OVERRIDE.with(|p| p.set(None));
         SHARED_FAKE.with(|s| *s.borrow_mut() = None);
 

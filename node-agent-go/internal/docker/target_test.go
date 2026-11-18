@@ -66,14 +66,15 @@ func TestLlamacppMemoryLimitIsThePlacementsWhenSent(t *testing.T) {
 	}
 }
 
-// A llamacpp start placed on gpu, or with no target, on a GPU node runs as
-// cpu: the image has no GPU build (LlamacppHasGPUBuild), so no GPU reserve
-// (hence no device request, whatever hasNvidiaGPU says) and no layer offload.
-// Other backends keep their placement's target.
-func TestLlamacppWithNoGPUBuildStartsAsCPUWhateverTheTarget(t *testing.T) {
+// A llamacpp start placed on gpu, or with no target, on a node that cannot
+// use the CUDA image runs as cpu: no GPU reserve (hence no device request,
+// whatever hasNvidiaGPU says) and no layer offload. Other backends keep their
+// placement's target.
+func TestLlamacppOnANodeThatCannotUseTheGPUBuildStartsAsCPUWhateverTheTarget(t *testing.T) {
+	unusable := GPUFacts{NvidiaGPU: true, NvidiaRuntime: true, MinComputeCap: "5.2"}
 	for _, target := range []string{"gpu", ""} {
 		env := map[string]string{}
-		if got := applyTarget("llamacpp", target, env, "all"); got != "0" {
+		if got := applyTarget("llamacpp", target, unusable, env, "all"); got != "0" {
 			t.Fatalf("target %q: gpu reserve %q, want 0 (no device request)", target, got)
 		}
 		if env["N_GPU_LAYERS"] != "0" || env["LLAMA_ARG_N_GPU_LAYERS"] != "0" {
@@ -95,7 +96,7 @@ func TestLlamacppWithNoGPUBuildStartsAsCPUWhateverTheTarget(t *testing.T) {
 		}
 	}
 	env := map[string]string{}
-	if got := applyTarget("ollama", "gpu", env, "all"); got != "all" || len(env) != 0 {
+	if got := applyTarget("ollama", "gpu", unusable, env, "all"); got != "all" || len(env) != 0 {
 		t.Fatalf("ollama on gpu keeps its reserve and env: %q %v", got, env)
 	}
 }

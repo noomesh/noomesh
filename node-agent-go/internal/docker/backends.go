@@ -319,22 +319,28 @@ var backendSpecs = map[string]BackendSpec{
 		HealthcheckCmd: vllmHealthcheckCmd,
 	},
 	"llamacpp": {
-		// Image is overridable via LLAMACPP_IMAGE env var. The default is our
-		// hardened llama-server from this node's release on every arch
-		// (llamacppDefaultImage); a node with no release pin runs upstream
-		// ggml-org. Not staged for the arch is a refusal, never a fallback.
-		Image:         envOr("LLAMACPP_IMAGE", llamacppDefaultImage()),
+		// TWO images (0.6.28). Image is the CUDA build (LLAMACPP_CUDA_IMAGE
+		// overrides; default our docker/Dockerfile.llamacpp-cuda from this
+		// node's release, amd64 only), taken only when the start runs on the
+		// GPU: llamacppOnGPU, i.e. a target other than cpu on a node where
+		// LlamacppGPUUsable (NVIDIA GPU, nvidia runtime, compute >=
+		// LlamacppMinComputeCap). Every other start takes CPUImage, the
+		// OpenBLAS build (LLAMACPP_IMAGE overrides; default ours on every
+		// arch). So only a node that runs llamacpp on its GPU ever fetches
+		// the CUDA image. A node with no release pin runs upstream ggml-org.
+		// Not staged for the arch is a refusal, never a fallback.
+		Image:         envOr("LLAMACPP_CUDA_IMAGE", llamacppCUDADefaultImage()),
+		CPUImage:      envOr("LLAMACPP_IMAGE", llamacppDefaultImage()),
 		ContainerName: "noo-llamacpp",
 		// llama-server writes nothing outside /models (read-only too).
 		ReadOnlyRoot: true,
 		Env: map[string]string{
 			"MODEL_PATH": "${LLAMACPP_MODEL:-/models/llama-7b-Q5_K_M.gguf}",
 			// "auto" sentinel — buildEnvList resolves it to "999" when
-			// hasNvidiaGPU() is true, else "0". Every image this tree builds
-			// or defaults to is a CPU build (LlamacppHasGPUBuild), so no
-			// layer is ever offloaded: effectiveTarget takes every llamacpp
-			// start as cpu, and cpuTargetEnv pins N_GPU_LAYERS=0 before
-			// "auto" is read.
+			// hasNvidiaGPU() is true, else "0". A start on a node that cannot
+			// use the CUDA image is taken as cpu (effectiveTarget), and
+			// cpuTargetEnv pins N_GPU_LAYERS=0 before "auto" is read; a GPU
+			// start runs the CUDA image and offloads every layer.
 			"N_GPU_LAYERS": "${N_GPU_LAYERS:-auto}",
 			"N_CTX":        "${N_CTX:-4096}",
 			"N_THREADS":    "${N_THREADS:-4}",
@@ -607,7 +613,8 @@ type StartOverrides struct {
 	// CUDA_VISIBLE_DEVICES is emptied, and llama.cpp offloads no layers —
 	// whatever N_GPU_LAYERS says, since there is no device to offload to.
 	// Anything else leaves the existing GPU logic alone, except llamacpp,
-	// which effectiveTarget always takes as "cpu" (LlamacppHasGPUBuild).
+	// which effectiveTarget takes as "cpu" on a node that cannot use the
+	// CUDA image (LlamacppGPUUsable).
 	Target string
 
 	// MemoryLimit (bytes) replaces a llama.cpp container's fixed spec limit
@@ -616,21 +623,23 @@ type StartOverrides struct {
 	MemoryLimit int64
 }
 
-// LlamacppHasGPUBuild says whether the llama.cpp image this tree builds
-// (docker/Dockerfile.llamacpp: OpenBLAS, no GGML_CUDA) or defaults to
-// (upstream ggml-org :server, its CPU tag) can use a GPU. It cannot, so a
-// llamacpp container given the GPU device and N_GPU_LAYERS=999 held the
-// device and ran on the CPU. The same rule as noo-cli's
+// LlamacppHasGPUBuild says whether a GPU build of llama.cpp exists: since
+// 0.6.28 it does, docker/Dockerfile.llamacpp-cuda (CUDA 12.9). Until then
+// every llama.cpp image was a CPU build, and a llamacpp container given the
+// GPU device and N_GPU_LAYERS=999 held the device and ran on the CPU. Even
+// with the build, a node that cannot use it (LlamacppGPUUsable) runs
+// llamacpp as cpu. The same claim as noo-cli's
 // cluster_tune::LLAMACPP_HAS_GPU_BUILD and the gateway's
 // placement_fit::LLAMACPP_HAS_GPU_BUILD; tests/test_llamacpp_gpu_build_claim.py
-// holds all three to the Dockerfile.
-const LlamacppHasGPUBuild = false
+// holds all three to the CUDA Dockerfile's -DGGML_CUDA=ON.
+const LlamacppHasGPUBuild = true
 
 // effectiveTarget is the target a start runs on: the placement's, except
-// llamacpp, which is cpu whatever the placement says (gpu or none) while its
-// image has no GPU build. The bool says the placement's target was replaced.
-func effectiveTarget(backend, target string) (string, bool) {
-	if backend == "llamacpp" && !LlamacppHasGPUBuild && target != "cpu" {
+// llamacpp on a node that cannot use the CUDA image, which is cpu whatever
+// the placement says (gpu or none). The bool says the placement's target was
+// replaced.
+func effectiveTarget(backend, target string, f GPUFacts) (string, bool) {
+	if backend == "llamacpp" && target != "cpu" && !LlamacppGPUUsable(f) {
 		return "cpu", true
 	}
 	return target, false
@@ -639,11 +648,12 @@ func effectiveTarget(backend, target string) (string, bool) {
 // applyTarget stamps the effective target on a start: on cpu, cpuTargetEnv
 // into env and no GPU reserve (so no device request, GPU node or not).
 // Returns the GPU reserve to use.
-func applyTarget(backend, target string, env map[string]string, gpuReserve string) string {
-	eff, replaced := effectiveTarget(backend, target)
+func applyTarget(backend, target string, f GPUFacts, env map[string]string, gpuReserve string) string {
+	eff, replaced := effectiveTarget(backend, target, f)
 	if replaced {
-		slog.Info("llamacpp target taken as cpu: the llama.cpp image has no GPU build",
-			"placement_target", target, "backend", backend)
+		slog.Info("llamacpp target taken as cpu: this node cannot run the CUDA llama.cpp image",
+			"placement_target", target, "backend", backend, "nvidia_gpu", f.NvidiaGPU,
+			"nvidia_runtime", f.NvidiaRuntime, "compute_cap", f.MinComputeCap, "needs_compute_cap", LlamacppMinComputeCap)
 	}
 	if eff != "cpu" {
 		return gpuReserve
@@ -748,7 +758,10 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 	// hasNvidiaGPU() below), then the controller's override, else
 	// ${VLLM_IMAGE:-default} env substitution - and the policy that refuses a
 	// floating or digest-less third-party ref.
-	choice, err := chooseBackendImage(backend, spec, overrides.Image)
+	// The GPU facts are read once for the start, so the image (the CUDA
+	// llama.cpp build or the CPU one) and the target applied below agree.
+	gpuFacts := c.gpuFactsForStart(ctx)
+	choice, err := chooseBackendImageFor(backend, spec, overrides.Image, overrides.Target, gpuFacts)
 	if err != nil {
 		return err
 	}
@@ -924,7 +937,7 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 	}
 	// A cpu target overrides even the placement's own GPU sizing: there is
 	// no device to size for.
-	gpuReserve = applyTarget(backend, overrides.Target, envOverrides, gpuReserve)
+	gpuReserve = applyTarget(backend, overrides.Target, gpuFacts, envOverrides, gpuReserve)
 	if backend == "llamacpp" {
 		mirrorLlamaArgs(envOverrides)
 		spec.CPULimit = llamacppCPULimit(spec.CPULimit, envOverrides["N_THREADS"], runtime.NumCPU())
@@ -1103,13 +1116,7 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 	// runtime, start on CPU and say so once per start.
 	if gpuReserve != "" && gpuReserve != "0" && hasNvidiaGPU() {
 		if c.nvidiaRuntimeRegistered(ctx) {
-			hostCfg.Resources.DeviceRequests = []container.DeviceRequest{
-				{
-					Driver:       "nvidia",
-					Capabilities: [][]string{{"gpu"}},
-					Count:        parseGPUCount(gpuReserve),
-				},
-			}
+			hostCfg.Resources.DeviceRequests = gpuDeviceRequests(gpuReserve)
 		} else {
 			slog.Warn("GPU detected but the NVIDIA container runtime is not registered with Docker — starting on CPU",
 				"backend", backend, "fix", "install the NVIDIA container toolkit (nvidia-ctk runtime configure) and restart docker, or set NOO_NO_GPU=1")
@@ -1756,6 +1763,16 @@ func parseGPUCount(s string) int {
 	return n
 }
 
+// gpuDeviceRequests is the NVIDIA device request for a GPU reserve ("all" or
+// a count), on a node with an NVIDIA GPU and the nvidia runtime.
+func gpuDeviceRequests(gpuReserve string) []container.DeviceRequest {
+	return []container.DeviceRequest{{
+		Driver:       "nvidia",
+		Capabilities: [][]string{{"gpu"}},
+		Count:        parseGPUCount(gpuReserve),
+	}}
+}
+
 // rootTmpfs is the scratch a read-only-root container gets: /tmp only,
 // bounded, never executable.
 var rootTmpfs = map[string]string{"/tmp": "rw,noexec,nosuid,nodev,size=64m"}
@@ -1983,7 +2000,11 @@ func ContainerNameFor(backend string) string {
 // placement's Image is empty and the spec hash did not change when the node
 // rolled: node-a ran noo-llamacpp on v0.6.12 after the 0.6.13 roll, with
 // llamacpp:v0.6.13 staged on the rail. reconcile.specHash folds this in.
-func ReleaseBackendImage(backend string) string {
+//
+// target is the placement's: llamacpp derives the CUDA image for a start that
+// runs on this node's GPU (llamacppOnGPU), the CPU image otherwise, so a node
+// that becomes able to use its GPU (or stops) recreates on the right one.
+func ReleaseBackendImage(backend, target string) string {
 	prefix, tag := os.Getenv("NOO_IMAGE_PREFIX"), os.Getenv("NOO_IMAGE_TAG")
 	if prefix == "" || tag == "" {
 		return ""
@@ -1991,7 +2012,11 @@ func ReleaseBackendImage(backend string) string {
 	var img string
 	switch backend {
 	case "llamacpp":
-		img = envOr("LLAMACPP_IMAGE", llamacppDefaultImage())
+		if llamacppOnGPU(target, NodeGPUFacts()) {
+			img = envOr("LLAMACPP_CUDA_IMAGE", llamacppCUDADefaultImage())
+		} else {
+			img = envOr("LLAMACPP_IMAGE", llamacppDefaultImage())
+		}
 	case "reranker":
 		if strings.EqualFold(strings.TrimSpace(os.Getenv("RERANK_ENGINE")), "tei") {
 			return ""
@@ -2012,8 +2037,9 @@ func ReleaseBackendImage(backend string) string {
 // pin runs ours and never falls back to these. The ollama version is the one
 // docker/Dockerfile.ollama packages (tests/test_hardened_images_i323.py).
 const (
-	upstreamLlamacppImage = "ghcr.io/ggml-org/llama.cpp:server"
-	upstreamOllamaImage   = "ollama/ollama:0.40.16"
+	upstreamLlamacppImage     = "ghcr.io/ggml-org/llama.cpp:server"
+	upstreamLlamacppCUDAImage = "ghcr.io/ggml-org/llama.cpp:server-cuda"
+	upstreamOllamaImage       = "ollama/ollama:0.40.16"
 )
 
 // releaseImage is <NOO_IMAGE_PREFIX>/<name>:<NOO_IMAGE_TAG>, "" on a node with
@@ -2040,6 +2066,17 @@ func llamacppDefaultImage() string {
 	return upstreamLlamacppImage
 }
 
+// llamacppCUDADefaultImage is the GPU llama.cpp image a node runs when nothing
+// names one: OUR CUDA build from this node's release (amd64 only; a GPU start
+// happens only on an NVIDIA node), else upstream's CUDA server image on a box
+// with no release pin.
+func llamacppCUDADefaultImage() string {
+	if img := releaseImage("llamacpp-cuda"); img != "" {
+		return img
+	}
+	return upstreamLlamacppCUDAImage
+}
+
 // ollamaDefaultImage is the same for Ollama: ours from the release, else the
 // upstream pin.
 func ollamaDefaultImage() string {
@@ -2052,12 +2089,16 @@ func ollamaDefaultImage() string {
 // hardenedDefault is OUR hardened image for a backend whose default is one,
 // or "" when the backend has none, when an explicit image env names one (that
 // always wins), or when this node has no release pin. There is no upstream
-// fallback for these images: not staged is a refusal.
-func hardenedDefault(backend string) string {
+// fallback for these images: not staged is a refusal. cpuImage picks
+// llamacpp's CPU build (llamacpp) over its CUDA build (llamacpp-cuda).
+func hardenedDefault(backend string, cpuImage bool) string {
 	var envVar, name string
 	switch backend {
 	case "llamacpp":
-		envVar, name = "LLAMACPP_IMAGE", "llamacpp"
+		envVar, name = "LLAMACPP_CUDA_IMAGE", "llamacpp-cuda"
+		if cpuImage {
+			envVar, name = "LLAMACPP_IMAGE", "llamacpp"
+		}
 	case "reranker":
 		if strings.EqualFold(strings.TrimSpace(os.Getenv("RERANK_ENGINE")), "tei") {
 			return ""
