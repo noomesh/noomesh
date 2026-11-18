@@ -112,24 +112,24 @@ func TestAMirrorManifestThatCouldMisleadIsRefused(t *testing.T) {
 		many[i] = layer(ollamaModelMedia, fmt.Sprintf("sha256:%064x", i+1), 1)
 	}
 	cases := map[string][]byte{
-		"schemaVersion 1":       wrap(1, cfg, model),
-		"no config":             wrap(2, "", model),
-		"no layers":             wrap(2, cfg),
-		"too many layers":       wrap(2, cfg, many...),
-		"uppercase digest":      wrap(2, cfg, layer(ollamaModelMedia, "sha256:"+strings.Repeat("B", 64), 10)),
-		"short digest":          wrap(2, cfg, layer(ollamaModelMedia, "sha256:"+strings.Repeat("b", 63), 10)),
-		"sha512 digest":         wrap(2, cfg, layer(ollamaModelMedia, "sha512:"+strings.Repeat("b", 64), 10)),
-		"a path as a digest":    wrap(2, cfg, layer(ollamaModelMedia, "sha256:../../../../etc/passwd", 10)),
-		"size 0":                wrap(2, cfg, layer(ollamaModelMedia, good, 0)),
-		"negative size":         wrap(2, cfg, layer(ollamaModelMedia, good, -1)),
-		"size over the bound":   wrap(2, cfg, layer(ollamaModelMedia, good, mirrorMaxBlobBytes+1)),
-		"sizes over the bound":  wrap(2, cfg, layer(ollamaModelMedia, good, mirrorMaxBlobBytes), layer("x/y", "sha256:"+strings.Repeat("c", 64), 1)),
-		"one blob, two sizes":   wrap(2, cfg, model, layer(ollamaModelMedia, good, 11)),
+		"schemaVersion 1":         wrap(1, cfg, model),
+		"no config":               wrap(2, "", model),
+		"no layers":               wrap(2, cfg),
+		"too many layers":         wrap(2, cfg, many...),
+		"uppercase digest":        wrap(2, cfg, layer(ollamaModelMedia, "sha256:"+strings.Repeat("B", 64), 10)),
+		"short digest":            wrap(2, cfg, layer(ollamaModelMedia, "sha256:"+strings.Repeat("b", 63), 10)),
+		"sha512 digest":           wrap(2, cfg, layer(ollamaModelMedia, "sha512:"+strings.Repeat("b", 64), 10)),
+		"a path as a digest":      wrap(2, cfg, layer(ollamaModelMedia, "sha256:../../../../etc/passwd", 10)),
+		"size 0":                  wrap(2, cfg, layer(ollamaModelMedia, good, 0)),
+		"negative size":           wrap(2, cfg, layer(ollamaModelMedia, good, -1)),
+		"size over the bound":     wrap(2, cfg, layer(ollamaModelMedia, good, mirrorMaxBlobBytes+1)),
+		"sizes over the bound":    wrap(2, cfg, layer(ollamaModelMedia, good, mirrorMaxBlobBytes), layer("x/y", "sha256:"+strings.Repeat("c", 64), 1)),
+		"one blob, two sizes":     wrap(2, cfg, model, layer(ollamaModelMedia, good, 11)),
 		"a media type with a /..": wrap(2, cfg, model, layer("a b", "sha256:"+strings.Repeat("c", 64), 1)),
-		"no model layer":        wrap(2, cfg, layer("application/vnd.ollama.image.template", good, 10)),
-		"missing size":          wrap(2, cfg, `{"mediaType":"x","digest":"`+good+`"}`),
-		"not JSON":              []byte("<html>"),
-		"over 1 MiB":            append(wrap(2, cfg, model), bytes.Repeat([]byte(" "), mirrorMaxManifestBytes)...),
+		"no model layer":          wrap(2, cfg, layer("application/vnd.ollama.image.template", good, 10)),
+		"missing size":            wrap(2, cfg, `{"mediaType":"x","digest":"`+good+`"}`),
+		"not JSON":                []byte("<html>"),
+		"over 1 MiB":              append(wrap(2, cfg, model), bytes.Repeat([]byte(" "), mirrorMaxManifestBytes)...),
 	}
 	for name, body := range cases {
 		if _, err := parseMirrorManifest(body); err == nil {
@@ -198,12 +198,12 @@ func (f *fakeAPI) TagDigest(_ context.Context, model string) (string, bool, erro
 }
 
 type mirrorRun struct {
-	api               *fakeAPI
-	fetched           []string
-	written, undone   int
-	committed         int
-	writeLists        string // the digest the fake daemon then lists
-	writeErr          error
+	api             *fakeAPI
+	fetched         []string
+	written, undone int
+	committed       int
+	writeLists      string // the digest the fake daemon then lists
+	writeErr        error
 }
 
 func (r *mirrorRun) deps(t *testing.T, blobs map[string][]byte) mirrorDeps {
@@ -784,6 +784,34 @@ func TestAStoreBlobWhoseDigestIsNotItsNameIsRefused(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(models, "manifests")); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatal("a manifest was written for an incomplete model")
+	}
+}
+
+// The record a pull leaves is the manifest alone: a node that would import
+// the tag from it is told so by name, and pushes and writes nothing.
+func TestAPullRecordWithoutItsBlobsIsRefusedByName(t *testing.T) {
+	body, _ := visionFixture()
+	stem := "ollama+library+gemma4+e2b-it-qat"
+	stageController(t, map[string][]byte{stem + mirrorManifestSuffix: body})
+	models := filepath.Join(t.TempDir(), "models")
+	_ = os.Mkdir(models, 0o755)
+	t.Setenv("OLLAMA_MODELS", models)
+	daemon, pushed := storeDaemon(t, models)
+	t.Setenv("OLLAMA_URL", daemon.URL)
+	_, err := (&Client{}).PullOllamaModel(t.Context(), "gemma4:e2b-it-qat")
+	if !errors.Is(err, ErrOllamaRecordOnly) {
+		t.Fatalf("want the record-only refusal, got %v", err)
+	}
+	for _, want := range []string{"the controller holds the record of this pull, not its bytes", "run `noo models fetch ollama:gemma4:e2b-it-qat` to stage them"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q does not say %q", err, want)
+		}
+	}
+	if len(*pushed) != 0 {
+		t.Fatalf("pushed %v from a record with no bytes", *pushed)
+	}
+	if _, err := os.Stat(filepath.Join(models, "manifests")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatal("a manifest was written for a model whose bytes never came")
 	}
 }
 

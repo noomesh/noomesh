@@ -414,7 +414,7 @@ cutover has begun it cannot be cancelled. A space with a migration cannot be uns
 ```sh
 noo models recommended                      # per detected tier; prefers LAN-cached models
 noo models info Qwen/Qwen2.5-7B-Instruct    # gating, licence, formats
-noo models pull qwen2.5:7b-instruct         # through the gateway's Ollama proxy, streamed progress
+noo models pull qwen2.5:7b-instruct         # through the gateway's Ollama proxy, streamed progress; records the pull in the controller store
 noo models cached                           # what running backends have loaded
 noo models fetch <org>/<repo> <file.gguf>   # GGUF from Hugging Face into the controller store (resumable, sha256-verified)
 ```

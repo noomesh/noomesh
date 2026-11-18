@@ -773,11 +773,15 @@ pub(crate) fn model_stores_check(id: &str, n: &Value) -> Option<Check> {
 /// weights a node serves are the controller's when the local manifest's layers
 /// equal the controller's mirrored manifest, or its model layer equals the
 /// controller's GGUF. A mismatch is repaired from the controller (re-install or
-/// rebuild) and only a failed repair refuses the model. A model the controller
-/// has no record of (a hand `ollama pull`) is never refused: it is a WARN whose
-/// remedy re-pulls it through noo, which is how a hand pull is blessed. There
-/// is no switch that marks a model trusted. No row when the agent does not
-/// report it (no Ollama placement, or an agent that predates the check).
+/// rebuild) and only a failed repair refuses the model. A mirror anchor is the
+/// registry manifest the controller recorded when it pulled (`noo models pull`,
+/// onboard) or staged (`noo models fetch ollama:<tag>`) the tag: it proves the
+/// bytes are unchanged since, not that the registry served the right model. A
+/// model the controller has no record of (a hand `ollama pull`) is never
+/// refused: it is a WARN whose remedy re-pulls it through noo, which writes
+/// the record. An hf.co/ ref has no record and no such remedy. There is no
+/// switch that marks a model trusted. No row when the agent does not report it
+/// (no Ollama placement, or an agent that predates the check).
 pub(crate) fn ollama_models_check(id: &str, n: &Value) -> Option<Check> {
     const NAME: &str = "ollama models";
     let rows = n.get("ollama_verify")?.as_array()?;
@@ -796,12 +800,21 @@ pub(crate) fn ollama_models_check(id: &str, n: &Value) -> Option<Check> {
         let reason = r["reason"].as_str().unwrap_or("");
         let pull = || format!("noo models pull {model}");
         match r["state"].as_str().unwrap_or("") {
-            "verified" | "rebuilt" => good.push(format!("{model} ({} anchor{}{})", anchor,
+            "verified" | "rebuilt" => good.push(format!("{model} ({}{}{})",
+                if anchor == "mirror" { "matches the controller's record of its pull".to_string() } else { format!("{anchor} anchor") },
                 if layer.is_empty() { String::new() } else { format!(", weights {layer}") },
                 if r["state"] == "rebuilt" { ", repaired from the controller" } else { "" })),
             "refused" => { fails.push(format!("{model}: {reason}")); remedies.push(pull()); }
-            "unverified" => { warns.push(format!("{model}: unverified ({}); re-pull it through noo to verify it",
-                if reason.is_empty() { "no controller record" } else { reason })); remedies.push(pull()); }
+            "unverified" => {
+                let why = if reason.is_empty() { "no controller record" } else { reason };
+                // A re-pull of an hf.co/ ref records nothing: no remedy to give.
+                if model.to_ascii_lowercase().starts_with("hf.co/") {
+                    warns.push(format!("{model}: unverified ({why})"));
+                } else {
+                    warns.push(format!("{model}: unverified ({why}); re-pull it through noo to verify it"));
+                    remedies.push(pull());
+                }
+            }
             "mismatch" => { warns.push(format!("{model}: does NOT match the controller ({reason}); not repaired here (the agent does not manage this Ollama)")); remedies.push(pull()); }
             _ => warns.push(format!("{model}: could not be checked ({})", if reason.is_empty() { "no reason given" } else { reason })),
         }
@@ -16034,6 +16047,30 @@ mod ollama_models_tests {
         assert_eq!(c.verdict, Verdict::Warn);
         assert!(c.detail.contains("gemma4:e4b-it-qat: unverified (no controller record)"), "{}", c.detail);
         assert_eq!(c.remedy.as_deref(), Some("on node-mac: noo models pull gemma4:e4b-it-qat"));
+    }
+
+    /// A mirror anchor says what it proves: the bytes are the ones the
+    /// controller recorded when it pulled the tag.
+    #[test]
+    fn a_verified_pull_says_it_matches_the_controllers_record_of_its_pull() {
+        let n = json!({"ollama_verify": [{"model": "gemma4:e2b", "state": "verified", "anchor": "mirror",
+            "model_layer": "sha256:5f26506ab57fd817ce4a8b9d24946a60d40bc76d82a2defa7cd754ae01e9de80"}]});
+        let c = ollama_models_check("ctrl", &n).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("gemma4:e2b (matches the controller's record of its pull, weights sha256:5f26506ab57f…)"), "{}", c.detail);
+    }
+
+    /// An hf.co/ ref has no controller record, and a re-pull would not write
+    /// one: a WARN with its own reason and no re-pull remedy.
+    #[test]
+    fn an_hf_ref_is_unverified_without_a_re_pull_remedy() {
+        let n = json!({"ollama_verify": [{"model": "hf.co/org/repo:Q4_K_M", "state": "unverified", "anchor": "none",
+            "reason": "hf.co refs have no controller record"}]});
+        let c = ollama_models_check("ctrl", &n).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("hf.co/org/repo:Q4_K_M: unverified (hf.co refs have no controller record)"), "{}", c.detail);
+        assert!(!c.detail.contains("re-pull"), "{}", c.detail);
+        assert_eq!(c.remedy, None);
     }
 
     /// A refused model is a FAIL naming the blob (in the reason) and the remedy.
