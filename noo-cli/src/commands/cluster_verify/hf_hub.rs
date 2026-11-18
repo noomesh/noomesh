@@ -12,7 +12,7 @@
 //! WHICH HF cache: the one the self-node AGENT stages into, never the CLI's
 //! own `HF_CACHE_DIR` (that is the controller compose's cache, which vllm/TEI
 //! mount and the gateway serves as /hf/; it may be a different directory,
-//! pop-os 0.6.26: an operator-owned NFS dir). The agent's cache is, in order:
+//! ctrl 0.6.26: an operator-owned NFS dir). The agent's cache is, in order:
 //! (a) what the self node's heartbeat reports (`data_roots.hf_cache_dir`,
 //! node-agent-go dataroots.Resolve over the agent's env); (b) the agent's
 //! EnvironmentFile [`AGENT_ENV`] (HF_CACHE_DIR, else NOO_DATA_ROOT/hf-cache);
@@ -263,9 +263,9 @@ mod tests {
     fn local(cache_owner: Option<Owner>, hub: Hub) -> Seen {
         Seen { cache_owner, hub, netfs: None }
     }
-    const HB: &str = "reported by self node pop-os";
+    const HB: &str = "reported by self node ctrl";
 
-    /// pop-os since 2026-09-07 (and every fresh controller before the fix):
+    /// ctrl since 2026-09-07 (and every fresh controller before the fix):
     /// hub 0:0 under a noo-agent hf-cache.
     #[test]
     fn a_root_owned_hub_under_the_agents_hf_cache_warns_with_both_owners() {
@@ -274,7 +274,7 @@ mod tests {
         assert_eq!(c.name, ROW);
         assert_eq!(
             c.detail,
-            "/var/lib/noo/hf-cache/hub is owned by 0:0, /var/lib/noo/hf-cache (reported by self node pop-os) by 122:998: \
+            "/var/lib/noo/hf-cache/hub is owned by 0:0, /var/lib/noo/hf-cache (reported by self node ctrl) by 122:998: \
              the self-node's applier re-owns it at its next apply"
         );
     }
@@ -307,7 +307,7 @@ mod tests {
         assert!(s.detail.contains("is a symlink") && s.detail.contains("122:998") && s.detail.contains("/d/hf-cache/hub"), "{}", s.detail);
     }
 
-    /// pop-os after the 0.6.26 roll, the compose cache: hub 1000:1001 under
+    /// ctrl after the 0.6.26 roll, the compose cache: hub 1000:1001 under
     /// hf-cache 1000:1000. Same uid: OK, the path printed, no applier text.
     #[test]
     fn the_same_uid_with_another_gid_is_ok_and_names_the_path() {
@@ -338,7 +338,7 @@ mod tests {
     #[test]
     fn a_network_filesystem_is_not_judged() {
         let mi = "22 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw\n\
-                  90 22 0:51 / /mnt/fleet rw,relatime shared:40 - nfs4 192.168.5.130:/srv/storage rw,vers=4.2\n\
+                  90 22 0:51 / /mnt/fleet rw,relatime shared:40 - nfs4 192.0.2.10:/srv/storage rw,vers=4.2\n\
                   91 22 0:52 / /mnt/my\\040share rw - cifs //nas/s rw\n\
                   92 90 8:3 / /mnt/fleet/local rw - ext4 /dev/sdb1 rw\n";
         assert_eq!(network_fs(mi, "/mnt/fleet/models/hf"), Some(("nfs4".into(), "/mnt/fleet".into())));
@@ -360,18 +360,18 @@ mod tests {
     #[test]
     fn the_agents_cache_comes_from_the_heartbeat_then_the_env_file() {
         let fleet = json!({"nodes": [
-            {"id": "awolf", "data_roots": {"noo_data_root": "/data/noo", "hf_cache_dir": "/data/noo/hf-cache"}},
-            {"id": "pop-os", "self_node": true, "data_roots": {"noo_data_root": "/media/rbwolf/extradrive1/noo",
-                "hf_cache_dir": "/media/rbwolf/extradrive1/noo/hf-cache/"}}]});
+            {"id": "node_a", "data_roots": {"noo_data_root": "/data/noo", "hf_cache_dir": "/data/noo/hf-cache"}},
+            {"id": "ctrl", "self_node": true, "data_roots": {"noo_data_root": "/srv/noo",
+                "hf_cache_dir": "/srv/noo/hf-cache/"}}]});
         let env = "NOO_DATA_ROOT=/env/noo\nHF_CACHE_DIR=\"/env/hf\"\n";
         let a = agent_cache(Some(&fleet), &|_| false, Some(env)).unwrap();
-        assert_eq!(a.path, "/media/rbwolf/extradrive1/noo/hf-cache");
-        assert_eq!(a.root.as_deref(), Some("/media/rbwolf/extradrive1/noo"));
-        assert_eq!(a.from, "reported by self node pop-os");
+        assert_eq!(a.path, "/srv/noo/hf-cache");
+        assert_eq!(a.root.as_deref(), Some("/srv/noo"));
+        assert_eq!(a.from, "reported by self node ctrl");
         // No self_node flag: the id the identity names.
         let mut f2 = fleet.clone();
         f2["nodes"][1]["self_node"] = Value::Null;
-        assert_eq!(agent_cache(Some(&f2), &|id| id == "awolf", Some(env)).unwrap().path, "/data/noo/hf-cache");
+        assert_eq!(agent_cache(Some(&f2), &|id| id == "node_a", Some(env)).unwrap().path, "/data/noo/hf-cache");
         // A heartbeat with only the root: its hf-cache child.
         let f3 = json!({"nodes": [{"id": "box", "self_node": true, "data_roots": {"noo_data_root": "/r"}}]});
         assert_eq!(agent_cache(Some(&f3), &|_| false, None).unwrap().path, "/r/hf-cache");
