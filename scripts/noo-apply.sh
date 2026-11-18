@@ -386,7 +386,7 @@ if [ "$VERIFY_ONLY" = 1 ] && [ -n "${NOO_APPLY_RELEASE_PUBKEYS_HEX:-}" ]; then
     RELEASE_PUBKEYS_HEX="$NOO_APPLY_RELEASE_PUBKEYS_HEX"
 fi
 # The root-run kinds held to release-sums (agent-binary: to the stack lock).
-RELEASE_LISTED_KINDS="applier fetcher hostd-binary harness-binary"
+RELEASE_LISTED_KINDS="applier fetcher hostd-binary"
 RELEASE_REMEDY="roll to a published release or rc (on the controller: noo upgrade --all)"
 
 release_asset_re() {  # $1 = kind -> ERE the release asset name must match
