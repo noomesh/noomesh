@@ -600,18 +600,22 @@ where
                         Err(ReadFailure::Backend(m)) => format!("the backend reported an error mid-answer: {}", crate::text::clip(&m, 200)),
                     }
                 } else {
-                    match resp.json().await {
-                        Ok(data) => return Ok(CoreSuccess { index: i, attempts: tried, body: CoreBody::Json(data), guard }),
+                    // Read whole, then parsed: reqwest's json() reports a body
+                    // cut part-way as a decode error, which would hide the cut.
+                    match resp.bytes().await {
                         // The body broke before it was read whole (the node cut
                         // it): nothing reached the caller, so it is sent again.
-                        Err(e) if !e.is_decode() => format!("the answer broke before it was complete: {e}"),
-                        Err(e) => {
-                            return Err(RawChatError::new(
-                                StatusCode::BAD_GATEWAY,
-                                "backend_error",
-                                format!("backend at {} returned an unparseable body: {e}", cand.url),
-                            ))
-                        }
+                        Err(e) => format!("the answer broke before it was complete: {e}"),
+                        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                            Ok(data) => return Ok(CoreSuccess { index: i, attempts: tried, body: CoreBody::Json(data), guard }),
+                            Err(e) => {
+                                return Err(RawChatError::new(
+                                    StatusCode::BAD_GATEWAY,
+                                    "backend_error",
+                                    format!("backend at {} returned an unparseable body: {e}", cand.url),
+                                ))
+                            }
+                        },
                     }
                 }
             }
@@ -682,7 +686,9 @@ where
                 }
             }
         }
-        if !retried_first && i == 0 && !busy && guard.may_retry(tried) {
+        // A restarting node is never retried by the fixed wait: it was
+        // waited out above, or it has another candidate to fail over to.
+        if !retried_first && i == 0 && !busy && restarting.is_none() && guard.may_retry(tried) {
             retried_first = true;
             // The wait holds no in-flight ticket either.
             drop(ticket);
