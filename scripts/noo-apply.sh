@@ -581,7 +581,7 @@ release_floor_next() {
             if [ -z "$_rn_f" ]; then
                 _rn_f="$2"
             elif release_older "$_rn_f" "$2"; then
-                _rn_p="$_rn_f"; _rn_f="$2"
+                _rn_f="$2"
             fi ;;
     esac
     echo "$_rn_f $_rn_p"
