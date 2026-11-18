@@ -394,7 +394,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     match (status, hb_age) {
         ("online", Some(age)) if age <= HEARTBEAT_MAX_AGE_SECS => out.push(ok("online", format!("heartbeat {age}s ago"))),
         ("online", Some(age)) => out.push(fail("online", format!("status says online but the last heartbeat is {age}s old"),
-            format!("noo cluster logs {id}"))),
+            format!("noo cluster logs {id}   # and the `legacy lanes` row: if it names {id} under {GATEWAY_REFUSED_FLEET_NO_CERT_LANE}, its beats are refused for carrying no node certificate (noo cluster provision {id} --wait)"))),
         ("online", None) => out.push(warn("online", "online, no heartbeat timestamp reported", None)),
         // i677 #17: right after the gateway (re)started it has not heard a
         // gossip round yet. Not a pass (Starting exits 1); `--wait` polls it.
@@ -5377,6 +5377,13 @@ pub(crate) const GATEWAY_REFUSED_CONTROLLER_LANE: &str = "controller_shared_secr
 /// A fleet-secret HMAC that did not come from a
 /// node (a controller service still holding the node credential).
 pub(crate) const GATEWAY_REFUSED_FLEET_OFF_NODE_LANE: &str = "fleet_secret_off_node_refused";
+/// Counted REFUSALS: a fleet-secret token from a node that presented no node
+/// certificate while mTLS is enforced (gateway `fleet_token_placement`). The
+/// `caller` is the node the token claims. A real node refused this way stops
+/// being heard (its heartbeats are refused), so `online` turns stale with no
+/// reason of its own: this lane is the reason. Typical cause: a PKI rotation
+/// whose new leaf did not land on that node.
+pub(crate) const GATEWAY_REFUSED_FLEET_NO_CERT_LANE: &str = "fleet_token_no_cert_refused";
 /// A fleet-secret HMAC on the inference surface, REFUSED. The
 /// `NOO_SELF_CALL_SHARED_SECRET` bridge that once admitted it is deleted
 /// (the lane `self_call_shared_secret` is no longer counted); every count
@@ -5536,10 +5543,22 @@ pub(crate) fn legacy_lanes_check(metrics: Option<&str>, fleet: &[Value], now_uni
     let (refused, refused_who) = lane_breakdown(g.lanes.get(GATEWAY_REFUSED_LANE).map(Vec::as_slice).unwrap_or(&[]));
     let (c_refused, c_who) = lane_breakdown(g.lanes.get(GATEWAY_REFUSED_CONTROLLER_LANE).map(Vec::as_slice).unwrap_or(&[]));
     let (f_refused, f_who) = lane_breakdown(g.lanes.get(GATEWAY_REFUSED_FLEET_OFF_NODE_LANE).map(Vec::as_slice).unwrap_or(&[]));
+    let no_cert = g.lanes.get(GATEWAY_REFUSED_FLEET_NO_CERT_LANE).map(Vec::as_slice).unwrap_or(&[]);
+    let (n_refused, n_who) = lane_breakdown(no_cert);
+    // The node refused most often, for a concrete remedy.
+    let n_first = no_cert.iter().filter(|(_, c)| *c > 0).max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0))).map(|(w, _)| w.clone());
     let (s_refused, s_who) = lane_breakdown(g.lanes.get(GATEWAY_REFUSED_SELF_CALL_LANE).map(Vec::as_slice).unwrap_or(&[]));
     let (v1_refused, v1_who) = lane_breakdown(g.lanes.get(V1_REFUSED_LANE).map(Vec::as_slice).unwrap_or(&[]));
     let node_v1_who = if node_v1_refused.is_empty() { String::new() } else { format!(" ({})", node_v1_refused.join(", ")) };
-    let detail = format!("{detail}; {GATEWAY_REFUSED_LANE} {refused}{refused_who}; {GATEWAY_REFUSED_CONTROLLER_LANE} {c_refused}{c_who}; {GATEWAY_REFUSED_FLEET_OFF_NODE_LANE} {f_refused}{f_who}; {GATEWAY_REFUSED_SELF_CALL_LANE} {s_refused}{s_who}; {V1_REFUSED_LANE} gateway refused (by caller) {v1_refused}{v1_who}, nodes refused (by node) {node_v1_refused_n}{node_v1_who}");
+    let detail = format!("{detail}; {GATEWAY_REFUSED_LANE} {refused}{refused_who}; {GATEWAY_REFUSED_CONTROLLER_LANE} {c_refused}{c_who}; {GATEWAY_REFUSED_FLEET_OFF_NODE_LANE} {f_refused}{f_who}; {GATEWAY_REFUSED_FLEET_NO_CERT_LANE} {n_refused}{n_who}; {GATEWAY_REFUSED_SELF_CALL_LANE} {s_refused}{s_who}; {V1_REFUSED_LANE} gateway refused (by caller) {v1_refused}{v1_who}, nodes refused (by node) {node_v1_refused_n}{node_v1_who}");
+    // First: a node locked out of the gateway (its heartbeats among the
+    // refused requests) is the most urgent thing this row can say.
+    if n_refused > 0 {
+        let node = n_first.unwrap_or_else(|| "<node>".into());
+        return warn(NAME,
+            format!("requests from a node with no node certificate were REFUSED {n_refused} time(s){n_who}: mTLS is enforced, so that node's heartbeats are refused and it goes stale (its `online` row) — {detail}"),
+            Some(format!("noo cluster provision {node} --wait   # re-issues the node's certificate (NOO_TLS_CERT/NOO_TLS_KEY in its agent env); for each node named")));
+    }
     if f_refused > 0 {
         return warn(NAME,
             format!("a non-node caller signed with the fleet secret and was REFUSED {f_refused} time(s){f_who} — {detail}"),
@@ -10903,6 +10922,20 @@ mod tests {
         assert_eq!(verdict(&node_checks(&n, "v0.2.70", "0.5.57", now, Some(true)), "online"), Verdict::Fail);
     }
 
+    /// A stale node's remedy points at the reason a locked-out node has: its
+    /// beats refused for carrying no node certificate (the legacy lanes row).
+    #[test]
+    fn a_stale_heartbeat_points_at_the_no_certificate_refusal() {
+        let now = 1_800_000_000;
+        let mut n = healthy(now);
+        n["last_heartbeat"] = stamp(now - 900).into();
+        let checks = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        let online = checks.iter().find(|c| c.name == "online").expect("an online row");
+        let r = online.remedy.clone().unwrap_or_default();
+        assert!(r.contains("`legacy lanes` row") && r.contains("fleet_token_no_cert_refused"), "{r}");
+        assert!(r.contains("noo cluster provision host3 --wait"), "{r}");
+    }
+
     #[test]
     fn the_nats_principals_row_fails_on_a_legacy_users_conf_or_a_stale_bridge() {
         use crate::commands::nats_users::{render_users_conf, Principal, Role};
@@ -13413,6 +13446,39 @@ mod tests {
         let c = legacy_lanes_check(Some(&fleet), &[], 1_800_000_000);
         assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
         assert!(c.detail.contains("fleet_secret_off_node_refused 2 (worker 2)"), "{}", c.detail);
+    }
+
+    /// A node whose requests (its heartbeats among them) are refused for
+    /// carrying no node certificate is named, with the re-issue remedy: it
+    /// is locked out and otherwise only goes stale.
+    #[test]
+    fn a_node_refused_for_no_certificate_warns_naming_it() {
+        let start = 1_800_000_000 - 30 * 86_400;
+        let quiet = legacy_lanes_check(Some(&format!("noo_gateway_start_time_seconds {start}\n")), &[], 1_800_000_000);
+        assert!(quiet.detail.contains("fleet_token_no_cert_refused 0"), "{}", quiet.detail);
+        let text = format!("noo_gateway_start_time_seconds {start}\n\
+            noo_legacy_lane_uses_total{{caller=\"node-a\",lane=\"fleet_token_no_cert_refused\",route_class=\"cluster\"}} 7\n\
+            noo_legacy_lane_uses_total{{caller=\"node-b\",lane=\"fleet_token_no_cert_refused\",route_class=\"cluster\"}} 2\n");
+        let c = legacy_lanes_check(Some(&text), &[], 1_800_000_000);
+        assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
+        assert!(c.detail.contains("with no node certificate were REFUSED 9 time(s) (node-a 7, node-b 2)"), "{}", c.detail);
+        assert!(c.detail.contains("fleet_token_no_cert_refused 9 (node-a 7, node-b 2)"), "{}", c.detail);
+        let r = c.remedy.unwrap_or_default();
+        assert!(r.starts_with("noo cluster provision node-a --wait"), "the node refused most often: {r}");
+    }
+
+    /// A node locked out outranks the other refusals in the one verdict the
+    /// row gives.
+    #[test]
+    fn the_no_certificate_refusal_outranks_the_off_node_one() {
+        let start = 1_800_000_000 - 30 * 86_400;
+        let text = format!("noo_gateway_start_time_seconds {start}\n\
+            noo_legacy_lane_uses_total{{caller=\"worker\",lane=\"fleet_secret_off_node_refused\",route_class=\"cluster\"}} 2\n\
+            noo_legacy_lane_uses_total{{caller=\"node-a\",lane=\"fleet_token_no_cert_refused\",route_class=\"cluster\"}} 1\n");
+        let c = legacy_lanes_check(Some(&text), &[], 1_800_000_000);
+        assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
+        assert!(c.detail.starts_with("requests from a node with no node certificate were REFUSED 1 time(s) (node-a 1)"), "{}", c.detail);
+        assert!(c.remedy.unwrap_or_default().contains("noo cluster provision node-a --wait"));
     }
 
     // ── retired apply lanes in the legacy-lanes row ──
