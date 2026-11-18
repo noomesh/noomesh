@@ -327,7 +327,8 @@ def test_the_size_job_waits_for_the_cells_and_reads_both_cells_memory():
     yaml = pytest.importorskip("yaml")
     doc = yaml.safe_load((ROOT / ".github/workflows/install-matrix.yml").read_text())
     size = doc["jobs"]["size"]
-    assert size["needs"] == "cell" and size["if"] == "always()", "runs when cells fail"
+    # runs when cells fail; skipped only on an upgrade-cell-only dispatch (no cell ran)
+    assert size["needs"] == "cell" and size["if"] == "always() && inputs.cells != 'upgrade'", size["if"]
     dl = [s for s in size["steps"] if str(s.get("uses", "")).startswith("actions/download-artifact@")]
     assert {s["with"]["name"] for s in dl} == {"install-cell-ubuntu-24.04-amd64-default", "install-cell-ubuntu-22.04-amd64"}
     assert all(re.fullmatch(r"actions/download-artifact@[0-9a-f]{40}", s["uses"]) and s.get("continue-on-error")

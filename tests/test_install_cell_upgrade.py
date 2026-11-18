@@ -1,0 +1,156 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+"""The install matrix's UPGRADE cell judge (scripts/install-cell/upgrade_judge.py).
+
+Each assert prints one `UPGRADE <id> PASS|FAIL|NOTE|NOT REACHED` line. These
+tests feed the judge the outputs a real roll writes and check the verdict AND
+that the evidence is the product's own line: a judge that passes without
+reading what it judges is the bug these exist for.
+"""
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+JUDGE = ROOT / "scripts" / "install-cell" / "upgrade_judge.py"
+SELF = "runner-a"
+
+ROLL_OK = """\
++ stack v0.6.27-rc.9: images staged
+  noo-netns-restore.service not installed: the self-node's applier (generation 1) predates the netns-unit kind, so no sudo is run for it
++ runner-a: bundle staged, applied
+"""
+STACK_OK = """\
+  installing noo-netns-restore.service: staged to the self-node runner-a, whose applier installs it (no sudo)
++ noo-netns-restore.service installed and enabled by the self-node's applier
+"""
+JOURNAL_OK = "Nov 18 noo-apply[1]: release-check: generation=2 release=none release-prev=none\nNov 18 noo-apply[1]: applied: agent-env agent-protect=6\n"
+
+
+def verify(self_rows, ctl_rows):
+    return json.dumps({"nodes": [{"node": SELF, "checks": self_rows}], "controller": {"checks": ctl_rows}})
+
+
+GOOD_SELF = [
+    {"name": "release check", "verdict": "ok", "detail": "root code installs only from a release-signed list on runner-a (floor none)"},
+    {"name": "ollama models", "verdict": "ok", "detail": "verified against the controller: gemma4:e2b (matches the controller's record of its pull)"},
+]
+GOOD_CTL = [
+    {"name": "agent protect", "verdict": "ok", "detail": "the node agent writes only where it must on runner-a (6 writable paths)"},
+    {"name": "hf-cache hub owner", "verdict": "ok", "detail": "both owned by 999:987"},
+    {"name": "legacy lanes", "verdict": "ok", "detail": "0 uses"},
+]
+
+
+def cell(tmp, roll=ROLL_OK, stack=STACK_OK, journal=JOURNAL_OK, roll_rc="0", self_rows=None, ctl_rows=None,
+         chat="ok\n", chat_rc=0, unit=True, sudo_journal="", unit_user=None):
+    out, j = tmp / "out", tmp / "out" / "judge"
+    (out / "logs").mkdir(parents=True)
+    j.mkdir()
+    if roll is not None:
+        (out / "logs" / "upgrade-all.log").write_text(roll)
+        (j / "roll.rc").write_text(roll_rc)
+    if stack is not None:
+        (out / "logs" / "upgrade-stack-same-tag.log").write_text(stack)
+    (j / "apply.journal").write_text(journal)
+    (j / "node.journal").write_text("")
+    (j / "sudo-stack.journal").write_text(sudo_journal)
+    v = verify(GOOD_SELF if self_rows is None else self_rows, GOOD_CTL if ctl_rows is None else ctl_rows)
+    (j / "verify-after.json").write_text(v)
+    (j / "verify-final.json").write_text(v)
+    (out / "logs" / "chat-after.log").write_text(chat)
+    (out / "steps.jsonl").write_text(json.dumps({"step": "chat-after", "rc": chat_rc}) + "\n")
+    me = subprocess.run(["id", "-un"], capture_output=True, text=True).stdout.strip()
+    env = dict(os.environ, OUT=str(out), J=str(j), SELF=SELF, NETNS_UNIT_ENABLED="enabled",
+               NETNS_UNIT_OWNER="%d:%d" % (os.getuid(), os.getgid()))
+    u = tmp / "noo-netns-restore.service"
+    if unit:
+        u.write_text("[Service]\nUser=%s\nExecStart=/home/%s/.local/share/noo/noo-netns-restore.sh\n" % (unit_user or me, me))
+        u.chmod(0o644)
+    env["NETNS_UNIT"] = str(u)
+    r = subprocess.run([sys.executable, str(JUDGE), "judge"], env=env, capture_output=True, text=True)
+    return r.returncode, {l.split()[1]: l for l in r.stdout.splitlines() if l.startswith("UPGRADE ")}
+
+
+def test_a_clean_first_roll_passes_every_assert(tmp_path):
+    rc, got = cell(tmp_path)
+    assert rc == 0, got
+    for a in ("A1", "A2", "A3", "A4", "A5", "A6", "B1", "B2", "B3", "G1", "G2", "G3", "G4", "G5"):
+        assert " PASS: " in got[a], got[a]
+    assert "release-check: generation=2" in got["A2"]
+    assert "generation 1) predates the netns-unit kind" in got["A5"]
+    assert "staged to the self-node runner-a, whose applier installs it (no sudo)" in got["B1"]
+
+
+def test_the_rc1_dind_stop_is_a_fail_quoting_it(tmp_path):
+    roll = "x runner-a not staged — staging failed\n  Upgrade stopped at the nodes stage\n"
+    rc, got = cell(tmp_path, roll=roll, roll_rc="1")
+    assert rc == 1
+    assert " FAIL: " in got["A1"] and "Upgrade stopped at the nodes stage" in got["A1"], got["A1"]
+
+
+def test_an_old_applier_or_no_release_check_line_fails_a2(tmp_path):
+    rc, got = cell(tmp_path, journal="noo-apply[1]: release-check: generation=1 release=none\n")
+    assert " FAIL: " in got["A2"] and "generation=1" in got["A2"], got["A2"]
+    rc, got = cell(tmp_path / "b", journal="noo-apply[1]: applied: agent-env\n")
+    assert " FAIL: " in got["A2"] and "no 'release-check:' line" in got["A2"], got["A2"]
+
+
+def test_a_refused_line_anywhere_fails_a3(tmp_path):
+    j = JOURNAL_OK + "noo-apply[1]: noo-apply: REFUSED applier — not in the release list; run noo upgrade --all (75)\n"
+    rc, got = cell(tmp_path, journal=j)
+    assert rc == 1 and " FAIL: " in got["A3"] and "noo-apply: REFUSED applier" in got["A3"], got["A3"]
+
+
+def test_a_release_check_warn_naming_an_old_applier_fails_a4(tmp_path):
+    rows = [dict(GOOD_SELF[0], verdict="warn", detail="NOT yet on runner-a: their applier predates the check"), GOOD_SELF[1]]
+    rc, got = cell(tmp_path, self_rows=rows)
+    assert " FAIL: " in got["A4"] and "NOT yet on runner-a" in got["A4"], got["A4"]
+
+
+def test_a_sudo_on_the_netns_unit_fails_a5_and_b3(tmp_path):
+    roll = ROLL_OK.replace("so no sudo is run for it", "so no sudo is run for it") + "  sudo tee /etc/systemd/system/noo-netns-restore.service\n"
+    rc, got = cell(tmp_path, roll=roll, sudo_journal="Nov 18 sudo[9]: runner : COMMAND=/usr/bin/tee /etc/systemd/system/noo-netns-restore.service\n")
+    assert " FAIL: " in got["A5"] and "sudo tee" in got["A5"], got["A5"]
+    assert " FAIL: " in got["B3"] and "COMMAND=/usr/bin/tee" in got["B3"], got["B3"]
+
+
+def test_an_unheld_agent_fails_a6(tmp_path):
+    ctl = [dict(GOOD_CTL[0], verdict="warn", detail="no hold reported on runner-a (installed by onboard, or never applied)")] + GOOD_CTL[1:]
+    rc, got = cell(tmp_path, ctl_rows=ctl)
+    assert " FAIL: " in got["A6"] and "no hold reported on runner-a" in got["A6"], got["A6"]
+
+
+def test_the_netns_unit_must_be_the_install_owners(tmp_path):
+    rc, got = cell(tmp_path, unit_user="root")
+    assert " FAIL: " in got["B2"] and "User=root" in got["B2"], got["B2"]
+    rc, got = cell(tmp_path / "b", unit=False)
+    assert " FAIL: " in got["B2"], got["B2"]
+
+
+def test_a_model_pulled_before_the_record_existed_is_a_note_not_a_fail(tmp_path):
+    rows = [GOOD_SELF[0], {"name": "ollama models", "verdict": "warn", "remedy": "on runner-a: noo models pull gemma4:e2b",
+                           "detail": "gemma4:e2b: unverified (no controller record); re-pull it through noo to verify it"}]
+    rc, got = cell(tmp_path, self_rows=rows)
+    assert rc == 0 and " NOTE: " in got["G2"] and "noo models pull gemma4:e2b" in got["G2"], got["G2"]
+
+
+def test_a_backend_start_refusal_or_a_used_lane_fails(tmp_path):
+    rows = GOOD_SELF + [{"name": "backend starts", "verdict": "fail", "detail": "runner-a: llamacpp: model_missing: m.gguf"}]
+    ctl = GOOD_CTL[:2] + [{"name": "legacy lanes", "verdict": "warn", "detail": "requests from a node with no node certificate were REFUSED 3 time(s)"}]
+    rc, got = cell(tmp_path, self_rows=rows, ctl_rows=ctl)
+    assert " FAIL: " in got["G3"] and "model_missing" in got["G3"], got["G3"]
+    assert " FAIL: " in got["G4"] and "no node certificate" in got["G4"], got["G4"]
+
+
+def test_a_roll_that_never_ran_is_not_reached(tmp_path):
+    rc, got = cell(tmp_path, roll=None, stack=None)
+    for a in ("A1", "A6", "B1", "B3"):
+        assert " NOT REACHED: " in got[a], got[a]
+
+
+def test_no_chat_answer_after_the_upgrade_fails_g5(tmp_path):
+    rc, got = cell(tmp_path, chat="Error: no chat backend is ready\n", chat_rc=1)
+    assert " FAIL: " in got["G5"] and "no chat backend" in got["G5"], got["G5"]

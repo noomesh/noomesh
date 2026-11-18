@@ -22,6 +22,8 @@
 # Cells and owners: scripts/install-cell/run.sh drives every cell (97);
 # prep-no-docker.sh and onboard-interactive.sh are the stranger-box cell's
 # hooks (fa). A cell whose hook does not exist yet reports "not run".
+# scripts/install-cell/upgrade.sh drives the upgrade cell (fa); dispatch with
+# cells=upgrade to run it alone.
 name: install matrix
 
 on:
@@ -30,6 +32,9 @@ on:
       cli_tag:
         description: 'Which release a cell installs: latest (the README line, verbatim) or a tag (noo-cli-vX.Y.Z)'
         default: latest
+      cells:
+        description: 'all (every fresh-install cell and the upgrade cell), fresh (the fresh-install cells only) or upgrade (the upgrade cell only)'
+        default: all
   schedule:
     - cron: '13 2 * * *'   # 02:13 UTC, away from the merge-queue peak
   push:
@@ -45,6 +50,7 @@ concurrency:
 jobs:
   cell:
     name: ${{ matrix.cell }}
+    if: inputs.cells != 'upgrade'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     continue-on-error: ${{ matrix.experimental }}
@@ -120,6 +126,7 @@ jobs:
   # reports WSL2 working on windows-2025. Experimental: if WSL2 or Docker in
   # it is refused, this cell says so verbatim and does not fail the run.
   wsl2:
+    if: inputs.cells != 'upgrade'
     name: windows-2025-wsl2 (experimental)
     runs-on: windows-2025
     timeout-minutes: 120
@@ -177,10 +184,53 @@ jobs:
   # Plus the stack's memory at idle, MEASURED by two cells' probe-memory-
   # baseline (operator 2026-11-14): so it waits for the cells, and runs when
   # they fail (a cell without memory.json is reported "not measured: why").
+  # THE UPGRADE CELL (fa, 2026-11-18): the first roll a real fleet makes. A
+  # box on the previous final (resolved from the releases API: the newest
+  # noo-cli-vX.Y.Z final below cli_tag) takes cli_tag with `noo upgrade
+  # --all`, then a same-tag `noo upgrade --stack`. systemd is PID 1 here,
+  # which the rehearsal's dind cannot give: its self node never collects or
+  # applies a bundle. One `UPGRADE <id> PASS|FAIL` line per assert (i908's
+  # release check, i907 1b's netns unit, the agent's hold, the verify rows,
+  # the journal, a chat answer after). Dispatch only: it judges a release.
+  upgrade:
+    name: upgrade-24.04
+    if: github.event_name == 'workflow_dispatch' && inputs.cells != 'fresh'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - name: Checkout (the cell harness only)   # actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            README.md
+            scripts/install-cell
+            scripts/ci-free-disk.sh
+          sparse-checkout-cone-mode: false
+      - name: Free disk (the runner's preinstalled toolchains; reported)
+        run: df -h / && bash scripts/ci-free-disk.sh && df -h /
+      - name: Run the upgrade cell
+        env:
+          OUT: ${{ runner.temp }}/cell
+          CELL: upgrade-24.04
+          RUNNER: ubuntu-24.04
+          CLI_TAG: ${{ inputs.cli_tag || 'latest' }}
+          # read-only: the releases list (the previous final); never written
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/install-cell/upgrade.sh
+      - name: Upload the cell's report (redacted; scanned by upgrade.sh)
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: install-cell-upgrade-24.04
+          path: ${{ runner.temp }}/cell/
+          retention-days: 14
+          if-no-files-found: warn
+
   size:
     name: release size
     needs: cell
-    if: always()
+    if: always() && inputs.cells != 'upgrade'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
