@@ -42,9 +42,16 @@ uses one (`docker ps -a --filter ancestor=<image>`), then
 **When the disk fills.** The `disk_watermark` rule watches the controller
 and every node. In preview it only reports what it would reclaim:
 `noo autonomy decisions -l disk_watermark`. `noo autonomy live
-disk_watermark` lets it act: dangling images and build cache first, then
-superseded images of ours, on the controller and on every node.
-`noo autonomy preview disk_watermark` puts it back.
+disk_watermark` lets it act, in this order, on the controller and on every
+node: dangling images; Docker build cache older than a week; stopped
+leftover containers from an interrupted compose rename; noomesh's own Rust
+build-cache volumes (only the labelled ones a source build makes, only
+unused, and only when their checkout is gone or they sat idle a week); then
+superseded images of ours. `noo autonomy preview disk_watermark` puts it
+back. Its report names every build-cache volume it kept, and why (a
+checkout still there and used recently, a last use it could not read, a
+label or volume it could not inspect), so a large cache it left alone is
+never a mystery.
 
 **A WSL2 controller.** The distro's `.vhdx` file on Windows never shrinks by
 itself; freeing space inside the distro does not free it on Windows.
@@ -53,7 +60,8 @@ Windows-native copy of it (from an elevated PowerShell, copy it to
 `%LOCALAPPDATA%\pai\` and register a weekly task that runs that copy). Named
 volumes (`postgres-data`, `ollama-data`, `hf-cache`, …) hold your data and
 model weights: no cleanup here touches them, and deleting from them is your
-own decision. `docker system df -v` shows what holds the space.
+own decision. The one kind of volume the disk rule ever removes is the
+labelled Rust build cache above, never one of these. `docker system df -v` shows what holds the space.
 
 ## For agents
 
@@ -112,7 +120,7 @@ check fault, which blocks.
 | deleter | runs | gate |
 |---|---|---|
 | hostd rung 5, superseded images | after a verified roll | the setting, the gate above, a current keep file |
-| hostd reclaim rungs 1–5 | disk past watermark | `disk_watermark` live |
+| hostd reclaim rungs 1–5: dangling images; build cache older than 7 days; stopped `<12hex>_noo-*` rename orphans; unused `noo.cargo-docker-src`-labelled build volumes whose checkout is gone or idle 7 days (the dry run lists each kept one with its reason); superseded images of ours | disk past watermark | `disk_watermark` live |
 | node agent `POST /cleanup/images` | the disk_cleanup heartbeat | dangling only; sent with `dry_run: true` |
 | node agent deep clean | `clean --deep` | opt-in |
 | `noo offboard` | the operator | the command |
