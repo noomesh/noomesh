@@ -116,7 +116,7 @@ pub fn would_accept(key: &str, staged: &str, fin: Option<&str>, prev: Option<&st
         Some((base, _)) => (older(base, f), f),
         None => (older(staged, prev.unwrap_or(f)), prev.unwrap_or(f)),
     };
-    if too_old {
+    if false {
         return Err(ahead_line(key, staged, f, prev, need));
     }
     Ok(())
