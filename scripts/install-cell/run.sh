@@ -362,6 +362,37 @@ step verify 900 -- bash -c 'fresh cluster verify --wait'
 # executor's "profile: 3.x form") is readable from the cell's artifacts. Same
 # redactor and upload scan as every log. Never the failed step.
 step probe-verify-json 300 -- bash -c 'fresh --json cluster verify'
+# PROBE (fa, 0.6.27-rc.2): the chat model onboard pulled is VERIFIED on a
+# fresh install. rc.1 WARNed "unverified (no controller record)" on every
+# controller cell: onboard's pull wrote no record, and the row's own remedy
+# (`noo models pull`) wrote none either. Now the pull records the registry
+# manifest (equal to the container's) as the controller's record, and the
+# row reads verified. Judged on this box's node row; retried while the
+# agent's first check is pending. Advisory, like every docs probe.
+step probe-ollama-verified 360 -- bash -c '
+  for i in $(seq 1 12); do
+    out="$(fresh --json cluster verify 2>/dev/null | python3 -c "
+import json, sys
+j = json.load(sys.stdin)
+me = sys.argv[1]
+for n in j.get(\"nodes\") or []:
+    if n.get(\"node\") != me:
+        continue
+    for c in n.get(\"checks\") or []:
+        if c.get(\"name\") == \"ollama models\":
+            print(\"verdict=%s detail=%s\" % (c.get(\"verdict\"), (c.get(\"detail\") or \"\").replace(chr(10), \" \")[:300]))
+            sys.exit()
+print(\"verdict=absent detail=no ollama models row for \" + me)
+" "$(hostname)" 2>&1)"
+    case "$out" in verdict=ok*) break ;; esac
+    case "$out" in *"not checked yet"*|verdict=absent*) sleep 30; continue ;; esac
+    break
+  done
+  echo "$out"
+  case "$out" in
+    verdict=ok*) echo "OLLAMA-VERIFIED PASS: the model onboard pulled is verified against the controller'"'"'s record of its pull: ${out#*detail=}" ;;
+    *) echo "OLLAMA-VERIFIED FAIL: a fresh install'"'"'s ollama models row should read verified, not: ${out}"; exit 1 ;;
+  esac'
 # PROBE (general, rc.4): the same JSON from the cell's OLD shell, which lacks
 # the docker group: the rows that need docker must say "not judged" with the
 # docker-access remedy (#1119), never "no running container". docker=none
