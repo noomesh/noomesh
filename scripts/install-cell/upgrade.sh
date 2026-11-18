@@ -142,6 +142,9 @@ sudo -n journalctl -t noo-apply --no-pager --since "@$ROLL_T0" 2>/dev/null | pyt
 sudo -n journalctl --no-pager --since "@$ROLL_T0" 2>/dev/null | grep -E "noo-apply|noo-fetch|noo-node-agent" \
   | python3 "$CELL_PY" redact > "$JR/node.journal"
 sudo -n journalctl _COMM=sudo --no-pager --since "@$STACK_T0" --until "@$STACK_T1" 2>/dev/null | python3 "$CELL_PY" redact > "$JR/sudo-stack.journal"
+# B3's evidence is uploaded on its own (COMMAND= lines only, redacted), so a
+# withheld artifact can never hide which sudo ran during the --stack.
+grep -E "COMMAND=" "$JR/sudo-stack.journal" > "$J/sudo-during-stack.txt" || true
 export J JR SELF ROLL_T0 OUT
 step judge 120 -- python3 "$HERE/upgrade_judge.py" judge
 finish

@@ -232,3 +232,10 @@ def test_a8_maps_the_three_cli_outcomes_one_to_one(tmp_path):
     assert " FAIL: " in got["A8"] and "reported exit 76" in got["A8"], got["A8"]
     rc, got = cell(tmp_path / "c", journal=JOURNAL_OK.split("\n", 1)[1])
     assert " FAIL: " in got["A8"] and "installed the applier" in got["A8"], "installed but no handshake line: " + got["A8"]
+
+
+def test_b3_names_every_sudo_command_during_the_stack(tmp_path):
+    sj = ("Nov 18 sudo[1]: runner : COMMAND=/usr/bin/tee /etc/systemd/system/noo-netns-restore.service\n"
+          "Nov 18 sudo[2]: runner : COMMAND=/usr/bin/systemctl daemon-reload\n")
+    rc, got = cell(tmp_path, sudo_journal=sj)
+    assert " FAIL: 2 sudo command(s)" in got["B3"] and "/usr/bin/tee" in got["B3"] and "daemon-reload" in got["B3"], got["B3"]
