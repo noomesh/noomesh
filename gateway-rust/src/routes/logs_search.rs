@@ -644,7 +644,9 @@ mod tests {
         assert!(parse_time("yesterday", n).is_err());
         // A count too large to subtract is a bad time, never a panic (chrono's
         // Duration::days panicked here on a request's own `since`).
-        for huge in ["9999999999999999d", "153722867280912931m", "5000000d"] {
+        // 213503982334602d overflows i64 seconds by just enough that silent
+        // wrapping would read it as ~17 h ago: it must be refused, not wrapped.
+        for huge in ["9999999999999999d", "153722867280912931m", "5000000d", "213503982334602d"] {
             assert!(parse_time(huge, n).is_err(), "{huge:?} must be refused");
         }
         assert!(parse_time("3w", n).is_err());
