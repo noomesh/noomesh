@@ -180,6 +180,8 @@ var heartbeatSections = []payloadSection{
 	secGPUContention,
 	secModelSets,
 	secOllamaVerify,
+	secNodeLocal,
+	secBackendCaps,
 	secNodeFacts,
 	secLastStop,
 }
@@ -217,6 +219,24 @@ var (
 		// until a check has run: an empty list would claim "none placed".
 		if ov := r.ollamaVerifyReport(); ov != nil {
 			p["ollama_verify"] = ov
+		}
+	}}
+
+	secBackendCaps = payloadSection{name: "backendCaps", add: func(r *Reporter, p map[string]any) {
+		// The backend containers' capability set (docker/backends.go): a
+		// name NOO_BACKEND_CAP_ADD asked for outside the allow-list is
+		// dropped, and this is how the controller learns it. OMITTED where
+		// no Docker backends run (not wired).
+		if bc := r.backendCapsReport(); bc != nil {
+			p["backend_caps"] = bc
+		}
+	}}
+
+	secNodeLocal = payloadSection{name: "nodeLocal", add: func(r *Reporter, p map[string]any) {
+		// The node's own declarations (nodelocal): what it declares and what
+		// it refused, so a declaration is seen to survive a roll.
+		if nl := r.nodeLocalReport(); nl != nil {
+			p["node_local"] = nl
 		}
 	}}
 

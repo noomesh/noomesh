@@ -94,7 +94,7 @@ fn fail(name: &'static str, detail: impl Into<String>, remedy: impl Into<String>
 /// - last install `rail` (or onboard's first install): OK;
 /// - anything else while the units exist: FAIL — an older CLI's local lane
 ///   installed it after onboard (`local-lane.state` without a lane record),
-///   which left hostd behind on pop-os after the 0.6.2 roll.
+///   which left hostd behind on ctrl after the 0.6.2 roll.
 pub(crate) fn self_agent_lane_check(
     node: &str,
     missing_units: &[String],
@@ -394,7 +394,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     match (status, hb_age) {
         ("online", Some(age)) if age <= HEARTBEAT_MAX_AGE_SECS => out.push(ok("online", format!("heartbeat {age}s ago"))),
         ("online", Some(age)) => out.push(fail("online", format!("status says online but the last heartbeat is {age}s old"),
-            format!("noo cluster logs {id}"))),
+            format!("noo cluster logs {id}   # and the `legacy lanes` row: if it names {id} under {GATEWAY_REFUSED_FLEET_NO_CERT_LANE}, its beats are refused for carrying no node certificate (noo cluster provision {id} --wait)"))),
         ("online", None) => out.push(warn("online", "online, no heartbeat timestamp reported", None)),
         // i677 #17: right after the gateway (re)started it has not heard a
         // gossip round yet. Not a pass (Starting exits 1); `--wait` polls it.
@@ -606,12 +606,47 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
         (Some(p), s) => out.push(ok("harness", format!("{} (policy {p})", if s.is_empty() { "-" } else { s }))),
     } }
     out.extend(model_stores_check(id, n));
+    out.extend(backend_starts_check(id, n));
+    out.extend(node_local_check(id, n));
+    out.extend(backend_caps_check(id, n));
     out.extend(agent_address_check(id, n));
     out.extend(ollama_models_check(id, n));
     out.extend(harness_tasks_check(n));
     out.extend(harness_egress_check(id, n));
     settle_after_roll(n, &mut out);
     out
+}
+
+/// The `backend starts` row: each start the node refused and keeps refusing,
+/// from its `reconcile_refusals` (scope `backend_start` or `placement`). A
+/// gguf quarantined by the preseed, or missing from the models dir, is one:
+/// the agent does not start it until the verified file is shipped, and until
+/// this row only the node's journal said so. FAIL naming each `<target>:
+/// <reason>`; the remedy is the `noo cluster sync-model-files` command a
+/// reason names, else `noo cluster show <node>`. No row when there are none.
+pub(crate) fn backend_starts_check(id: &str, n: &Value) -> Option<Check> {
+    const NAME: &str = "backend starts";
+    const SYNC: &str = "noo cluster sync-model-files";
+    let refusals: Vec<&Value> = n["reconcile_refusals"].as_array()
+        .map(|rs| rs.iter().filter(|r| r["scope"] == "backend_start" || r["scope"] == "placement").collect())
+        .unwrap_or_default();
+    if refusals.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    let mut remedies: Vec<String> = Vec::new();
+    for r in &refusals {
+        let reason = r["reason"].as_str().unwrap_or("no reason reported");
+        parts.push(format!("{}: {reason}", r["target"].as_str().unwrap_or("?")));
+        let remedy = match reason.find(SYNC) {
+            Some(i) => reason[i..].split(['`', ';']).next().unwrap_or(SYNC).trim_end().to_string(),
+            None => format!("noo cluster show {id}   # the node's refusal says why"),
+        };
+        if !remedies.contains(&remedy) {
+            remedies.push(remedy);
+        }
+    }
+    Some(fail(NAME, format!("{id}: {}", parts.join(" | ")), remedies.join("; ")))
 }
 
 /// The `agent address` row: a node's agent_url must be https on an explicit
@@ -628,6 +663,101 @@ pub(crate) fn agent_address_check(id: &str, n: &Value) -> Option<Check> {
         format!("{id}: the gateway refused the agent_url this node reported ({why}); it dials https://{ip}:8081 instead"),
         format!("on {id}, set the agent's address (NODE_IP in /etc/noo-node-agent.env) to the address it is registered at, so it reports https://<that address>:<its port>"),
     ))
+}
+
+/// The `backend caps` row (#1283): the capability set a node's backend
+/// containers keep after `CapDrop ALL`. A name `NOO_BACKEND_CAP_ADD` asks for
+/// outside the allow-list is DROPPED (the backend starts without it, and the
+/// agent only logs it), so the row WARNs naming the node, the refused names
+/// and the allow-list. OK naming the set when the node's environment widened
+/// it; no row on the default set, or from an agent that does not report it.
+pub(crate) fn backend_caps_check(id: &str, n: &Value) -> Option<Check> {
+    const NAME: &str = "backend caps";
+    let bc = n.get("backend_caps").filter(|v| v.is_object())?;
+    let list = |k: &str| -> Vec<String> {
+        bc[k].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default()
+    };
+    let (granted, refused, allowed) = (list("granted"), list("refused"), list("allowed"));
+    if !refused.is_empty() {
+        return Some(warn(
+            NAME,
+            format!(
+                "{id}: NOO_BACKEND_CAP_ADD asks for {} — not grantable (each lets a container reach the host), so backend containers start WITHOUT it; granted: {}",
+                refused.join(", "),
+                if granted.is_empty() { "none".to_string() } else { granted.join(", ") }
+            ),
+            Some(format!(
+                "on {id}, keep NOO_BACKEND_CAP_ADD (the node agent's environment, /etc/noo-node-agent.env) to names from the allow-list: {}",
+                allowed.join(", ")
+            )),
+        ));
+    }
+    match bc["source"].as_str() {
+        Some("env") => Some(ok(NAME, format!("{id}: widened by the node's environment to {}", granted.join(", ")))),
+        Some("none") => Some(ok(NAME, format!("{id}: none (NOO_BACKEND_CAP_ADD=none)"))),
+        _ => None,
+    }
+}
+
+/// The `node-local` row: the node's OWN declarations file (the agent's
+/// `nodelocal`: /etc/noo-node-agent.local.env, root's, on Linux and the
+/// Mac), which no apply ever writes, so a declaration survives a roll.
+/// OK naming what the node declares; WARN when the file was refused whole
+/// (its mode or owner), when a declaration was refused (a trust declaration
+/// is then NOT in effect), or when the file names keys that are not
+/// node-local (ignored). No row when the node declares nothing.
+pub(crate) fn node_local_check(id: &str, n: &Value) -> Option<Check> {
+    const NAME: &str = "node-local";
+    let nl = n.get("node_local").filter(|v| v.is_object())?;
+    let path = nl["path"].as_str().unwrap_or("the node's declarations file");
+    let ignored: Vec<String> = nl["ignored"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+    let objs = |k: &str| nl[k].as_array().cloned().unwrap_or_default();
+    let declared = objs("declared");
+    let refused = objs("refused");
+    let file_refused = nl["state"].as_str() == Some("refused");
+    // A trust declaration that arrives through the agent's environment (a
+    // systemd drop-in) still works, but belongs in the local file.
+    let env_trust: Vec<String> = declared
+        .iter()
+        .filter(|d| d["trust"].as_bool() == Some(true) && d["source"].as_str() == Some("environment"))
+        .filter_map(|d| d["key"].as_str().map(str::to_string))
+        .collect();
+    let named: Vec<String> = declared
+        .iter()
+        .map(|d| format!("{} ({})", d["key"].as_str().unwrap_or("?"), d["source"].as_str().unwrap_or("?")))
+        .collect();
+    let mut problems = Vec::new();
+    let mut fixes = Vec::new();
+    if file_refused {
+        problems.push(format!("{path} was refused whole ({}); none of its declarations is in effect", nl["why"].as_str().unwrap_or("refused")));
+        fixes.push(format!("make {path} a regular file owned by root, mode 644, in a root-owned directory (sudo chown root {path}; sudo chmod 644 {path})"));
+    }
+    if !refused.is_empty() {
+        let r: Vec<String> = refused
+            .iter()
+            .map(|x| format!("{} from {} ({})", x["key"].as_str().unwrap_or("?"), x["source"].as_str().unwrap_or("?"), x["why"].as_str().unwrap_or("refused")))
+            .collect();
+        problems.push(format!("refused, NOT in effect: {}", r.join("; ")));
+        fixes.push(format!("fix those values in {path}, then restart the node agent"));
+    }
+    if !env_trust.is_empty() {
+        problems.push(format!("trust declarations read from the agent's environment, not {path}: {}", env_trust.join(", ")));
+        fixes.push(format!("move {} into {path} (and out of the systemd drop-in or agent env), then restart the node agent", env_trust.join(", ")));
+    }
+    if !ignored.is_empty() {
+        problems.push(format!("ignored (not node-local keys): {}", ignored.join(", ")));
+    }
+    if !problems.is_empty() {
+        return Some(warn(
+            NAME,
+            format!("{id}: {}; in effect: {}", problems.join("; "), if named.is_empty() { "none".into() } else { named.join(", ") }),
+            Some(format!("on {id}: {}", if fixes.is_empty() { format!("remove those lines from {path}") } else { fixes.join("; ") })),
+        ));
+    }
+    if named.is_empty() {
+        return None;
+    }
+    Some(ok(NAME, format!("{id}: {}", named.join(", "))))
 }
 
 /// The `model stores` row (proposal 61 §7b): no model store on the node is
@@ -667,8 +797,15 @@ pub(crate) fn model_stores_check(id: &str, n: &Value) -> Option<Check> {
     Some(warn(NAME, format!(
         "{} world-writable: any account on {id} can plant model bytes there: {}",
         bad.len(), parts.join("; ")),
-        Some(format!("on {id}: {}   # keep the owner; hand downloads: `noo models pull <model>`, or run them as the store's owner",
-            fixes.join(" && ")))))
+        Some(format!("on {id}: {}   # keep the owner; hand downloads: {}, or run them as the store's owner",
+            fixes.join(" && "),
+            // `noo models pull` reaches the gateway's Ollama only: the
+            // controller's own node. Elsewhere: stage, then import onto it.
+            if n["self_node"].as_bool() == Some(true) {
+                "`noo models pull <model>`".to_string()
+            } else {
+                format!("`noo models fetch ollama:<tag>` then `noo cluster import-model {id} ollama:<tag>`")
+            }))))
 }
 
 /// The `ollama models` row (proposal 61 §7b): each placed Ollama model checked
@@ -676,12 +813,34 @@ pub(crate) fn model_stores_check(id: &str, n: &Value) -> Option<Check> {
 /// weights a node serves are the controller's when the local manifest's layers
 /// equal the controller's mirrored manifest, or its model layer equals the
 /// controller's GGUF. A mismatch is repaired from the controller (re-install or
-/// rebuild) and only a failed repair refuses the model. A model the controller
-/// has no record of (a hand `ollama pull`) is never refused: it is a WARN whose
-/// remedy re-pulls it through noo, which is how a hand pull is blessed. There
-/// is no switch that marks a model trusted. No row when the agent does not
-/// report it (no Ollama placement, or an agent that predates the check).
+/// rebuild) and only a failed repair refuses the model. A mirror anchor is the
+/// registry manifest the controller recorded when it pulled (`noo models pull`,
+/// onboard) or staged (`noo models fetch ollama:<tag>`) the tag: it proves the
+/// bytes are unchanged since, not that the registry served the right model. A
+/// model the controller has no record of (a hand `ollama pull`) is never
+/// refused: it is a WARN whose remedy re-pulls it through noo, which writes
+/// the record. The remedy names the command that acts on THAT node's Ollama:
+/// `noo models pull` reaches only the controller's own (the gateway's), so it
+/// is the remedy on the controller's own node; any other node (a container or
+/// a native Mac, whose host binary the import uses) gets the model staged on
+/// the controller and imported onto it (`noo models fetch ollama:<tag>`, then
+/// `noo cluster import-model <node> ollama:<tag>`; harrier, an artifact, by
+/// import-model alone). No command records a pull on another node. An hf.co/
+/// ref has no record and no such remedy. There is no
+/// switch that marks a model trusted. No row when the agent does not report it
+/// (no Ollama placement, or an agent that predates the check).
 pub(crate) fn ollama_models_check(id: &str, n: &Value) -> Option<Check> {
+    // `noo models pull` acts on the gateway's Ollama: the controller's own
+    // node only. Elsewhere the model is staged and imported onto that node.
+    fn ollama_remedy(id: &str, n: &Value, model: &str) -> String {
+        if n["self_node"].as_bool() == Some(true) {
+            format!("noo models pull {model}")
+        } else if model == "harrier" {
+            format!("noo cluster import-model {id} harrier")
+        } else {
+            format!("noo models fetch ollama:{model} && noo cluster import-model {id} ollama:{model}")
+        }
+    }
     const NAME: &str = "ollama models";
     let rows = n.get("ollama_verify")?.as_array()?;
     if rows.is_empty() {
@@ -697,14 +856,23 @@ pub(crate) fn ollama_models_check(id: &str, n: &Value) -> Option<Check> {
         let anchor = r["anchor"].as_str().unwrap_or("");
         let layer = short(r["model_layer"].as_str().unwrap_or(""));
         let reason = r["reason"].as_str().unwrap_or("");
-        let pull = || format!("noo models pull {model}");
+        let pull = || ollama_remedy(id, n, model);
         match r["state"].as_str().unwrap_or("") {
-            "verified" | "rebuilt" => good.push(format!("{model} ({} anchor{}{})", anchor,
+            "verified" | "rebuilt" => good.push(format!("{model} ({}{}{})",
+                if anchor == "mirror" { "matches the controller's record of its pull".to_string() } else { format!("{anchor} anchor") },
                 if layer.is_empty() { String::new() } else { format!(", weights {layer}") },
                 if r["state"] == "rebuilt" { ", repaired from the controller" } else { "" })),
             "refused" => { fails.push(format!("{model}: {reason}")); remedies.push(pull()); }
-            "unverified" => { warns.push(format!("{model}: unverified ({}); re-pull it through noo to verify it",
-                if reason.is_empty() { "no controller record" } else { reason })); remedies.push(pull()); }
+            "unverified" => {
+                let why = if reason.is_empty() { "no controller record" } else { reason };
+                // A re-pull of an hf.co/ ref records nothing: no remedy to give.
+                if model.to_ascii_lowercase().starts_with("hf.co/") {
+                    warns.push(format!("{model}: unverified ({why})"));
+                } else {
+                    warns.push(format!("{model}: unverified ({why}); re-pull it through noo to verify it"));
+                    remedies.push(pull());
+                }
+            }
             "mismatch" => { warns.push(format!("{model}: does NOT match the controller ({reason}); not repaired here (the agent does not manage this Ollama)")); remedies.push(pull()); }
             _ => warns.push(format!("{model}: could not be checked ({})", if reason.is_empty() { "no reason given" } else { reason })),
         }
@@ -1004,7 +1172,7 @@ pub(crate) fn gpu_contention_check_at(n: &Value, now_unix: i64) -> Option<Check>
                 compact_secs(gc["unmeasured_for_s"].as_i64().unwrap_or(0))),
             None),
         // The figures are the reading now, with our backends stopped; the
-        // reason is why it yielded (awolf, 2026-11-07, read "foreign 0.0 GB"
+        // reason is why it yielded (node-a, 2026-11-07, read "foreign 0.0 GB"
         // for a yield on a probe timeout).
         "yielded" => warn("gpu",
             format!("yielded: {paused_phrase} ({}foreign {:.1} GB, {method}{off}) — resumes when the GPU frees",
@@ -1300,7 +1468,7 @@ pub(crate) fn stunnel_image_check(n: &Value) -> Option<Check> {
 /// and whether that ref can move under it (`image_floating`: no digest, tag
 /// `latest` or none, not a rail-only image of ours). A floating one FAILs:
 /// a current agent refuses to create such a container, so one running is a
-/// leftover from an older agent (awolf's `noo-vllm` on
+/// leftover from an older agent (node-a's `noo-vllm` on
 /// `vllm/vllm-openai:latest`, 2026-10-20). An entry without the key is an
 /// agent that predates the report: WARN, never a claimed pass.
 pub(crate) fn backend_images_check(n: &Value) -> Check {
@@ -1331,7 +1499,7 @@ pub(crate) fn backend_images_check(n: &Value) -> Check {
         return fail(
             NAME,
             format!("{} — a floating ref (no digest; tag latest or none) can change under the node with no check", floating.join("; ")),
-            // What works (0.6.8 live, aserve + robopi): an agent before
+            // What works (0.6.8 live, node-b + node-pi): an agent before
             // 0.6.10 never replaces a RUNNING container, so a provision that
             // left the binaries alone changed nothing; removed, it is
             // recreated from the ref desired-config carries (the signed
@@ -4169,7 +4337,7 @@ pub(crate) fn sandbox_listener_check(compose: Option<&str>, probe: Option<&Sandb
 /// handed to (`pki::SANDBOX_SERVER_UID`), a uid no other service runs as:
 /// the kernel counts the container's `nproc: 256` per uid host-wide, and as
 /// `nonroot` (65532) the other services spent it, so every thread the
-/// server started failed and `/health` answered 500 (0.6.11, pop-os). A
+/// server started failed and `/health` answered 500 (0.6.11, ctrl). A
 /// `/health` that answers 5xx is a FAIL, not "no body": the sandbox is up
 /// and refusing.
 /// The sandbox row with the installed AppArmor profile's form appended,
@@ -5280,6 +5448,13 @@ pub(crate) const GATEWAY_REFUSED_CONTROLLER_LANE: &str = "controller_shared_secr
 /// A fleet-secret HMAC that did not come from a
 /// node (a controller service still holding the node credential).
 pub(crate) const GATEWAY_REFUSED_FLEET_OFF_NODE_LANE: &str = "fleet_secret_off_node_refused";
+/// Counted REFUSALS: a fleet-secret token from a node that presented no node
+/// certificate while mTLS is enforced (gateway `fleet_token_placement`). The
+/// `caller` is the node the token claims. A real node refused this way stops
+/// being heard (its heartbeats are refused), so `online` turns stale with no
+/// reason of its own: this lane is the reason. Typical cause: a PKI rotation
+/// whose new leaf did not land on that node.
+pub(crate) const GATEWAY_REFUSED_FLEET_NO_CERT_LANE: &str = "fleet_token_no_cert_refused";
 /// A fleet-secret HMAC on the inference surface, REFUSED. The
 /// `NOO_SELF_CALL_SHARED_SECRET` bridge that once admitted it is deleted
 /// (the lane `self_call_shared_secret` is no longer counted); every count
@@ -5439,10 +5614,22 @@ pub(crate) fn legacy_lanes_check(metrics: Option<&str>, fleet: &[Value], now_uni
     let (refused, refused_who) = lane_breakdown(g.lanes.get(GATEWAY_REFUSED_LANE).map(Vec::as_slice).unwrap_or(&[]));
     let (c_refused, c_who) = lane_breakdown(g.lanes.get(GATEWAY_REFUSED_CONTROLLER_LANE).map(Vec::as_slice).unwrap_or(&[]));
     let (f_refused, f_who) = lane_breakdown(g.lanes.get(GATEWAY_REFUSED_FLEET_OFF_NODE_LANE).map(Vec::as_slice).unwrap_or(&[]));
+    let no_cert = g.lanes.get(GATEWAY_REFUSED_FLEET_NO_CERT_LANE).map(Vec::as_slice).unwrap_or(&[]);
+    let (n_refused, n_who) = lane_breakdown(no_cert);
+    // The node refused most often, for a concrete remedy.
+    let n_first = no_cert.iter().filter(|(_, c)| *c > 0).max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0))).map(|(w, _)| w.clone());
     let (s_refused, s_who) = lane_breakdown(g.lanes.get(GATEWAY_REFUSED_SELF_CALL_LANE).map(Vec::as_slice).unwrap_or(&[]));
     let (v1_refused, v1_who) = lane_breakdown(g.lanes.get(V1_REFUSED_LANE).map(Vec::as_slice).unwrap_or(&[]));
     let node_v1_who = if node_v1_refused.is_empty() { String::new() } else { format!(" ({})", node_v1_refused.join(", ")) };
-    let detail = format!("{detail}; {GATEWAY_REFUSED_LANE} {refused}{refused_who}; {GATEWAY_REFUSED_CONTROLLER_LANE} {c_refused}{c_who}; {GATEWAY_REFUSED_FLEET_OFF_NODE_LANE} {f_refused}{f_who}; {GATEWAY_REFUSED_SELF_CALL_LANE} {s_refused}{s_who}; {V1_REFUSED_LANE} gateway refused (by caller) {v1_refused}{v1_who}, nodes refused (by node) {node_v1_refused_n}{node_v1_who}");
+    let detail = format!("{detail}; {GATEWAY_REFUSED_LANE} {refused}{refused_who}; {GATEWAY_REFUSED_CONTROLLER_LANE} {c_refused}{c_who}; {GATEWAY_REFUSED_FLEET_OFF_NODE_LANE} {f_refused}{f_who}; {GATEWAY_REFUSED_FLEET_NO_CERT_LANE} {n_refused}{n_who}; {GATEWAY_REFUSED_SELF_CALL_LANE} {s_refused}{s_who}; {V1_REFUSED_LANE} gateway refused (by caller) {v1_refused}{v1_who}, nodes refused (by node) {node_v1_refused_n}{node_v1_who}");
+    // First: a node locked out of the gateway (its heartbeats among the
+    // refused requests) is the most urgent thing this row can say.
+    if n_refused > 0 {
+        let node = n_first.unwrap_or_else(|| "<node>".into());
+        return warn(NAME,
+            format!("requests from a node with no node certificate were REFUSED {n_refused} time(s){n_who}: mTLS is enforced, so that node's heartbeats are refused and it goes stale (its `online` row) — {detail}"),
+            Some(format!("noo cluster provision {node} --wait   # re-issues the node's certificate (NOO_TLS_CERT/NOO_TLS_KEY in its agent env); for each node named")));
+    }
     if f_refused > 0 {
         return warn(NAME,
             format!("a non-node caller signed with the fleet secret and was REFUSED {f_refused} time(s){f_who} — {detail}"),
@@ -5607,7 +5794,9 @@ pub(crate) fn harness_systemd_check(reports: &[(String, Option<i64>, String)]) -
 /// What the Linux applier writes on its `applied:` line for the node agent's
 /// filesystem hold (scripts/noo-apply.sh, agent_protect): `agent-protect=N`
 /// or `agent-protect=unchanged:N` (N writable paths), or
-/// `agent-protect=REFUSED:<KEY>`. No tag at all on a host without systemd.
+/// `agent-protect=REFUSED:<KEY>`. No tag at all when the applier did not
+/// hold the agent: a Mac (no systemd), an applier older than the hold, or a
+/// node agent installed outside the applier (onboard's first install).
 pub(crate) const AGENT_PROTECT_TAG: &str = "agent-protect=";
 
 /// The remedy for a refused hold: the key names which setting to fix.
@@ -5629,12 +5818,19 @@ fn agent_protect_remedy(node: &str, key: &str) -> String {
 
 /// The `agent protect` row (proposal 61 phase 0b): from each node's last
 /// apply report, whether the node agent's unit is held to the paths it
-/// writes. A refusal on any node is a FAIL naming the node and the key (that
-/// node keeps its previous hold, or none); otherwise OK naming each held node
-/// and how many paths it leaves writable. No row when no node reports a hold
-/// (a Mac or another host without systemd writes no tag).
-pub(crate) fn agent_protect_check(reports: &[(String, Option<i64>, String)]) -> Option<Check> {
+/// writes. `nodes` is every node with whether its noo-hostd reports macOS
+/// (`hostd.host.os == "darwin"`): a Mac has no systemd, so no hold is due.
+///
+/// A refusal on any node is a FAIL naming the node and the key (that node
+/// keeps its previous hold, or none). Otherwise any other node (an unknown OS
+/// counts: absence is never read as "no systemd") whose last report carries
+/// no hold, or that has no report at all, is a WARN naming it: its agent was
+/// installed by onboard (outside the applier) or never applied, and is not
+/// held. Otherwise OK naming each held node and how many paths it leaves
+/// writable. No row only when every node is a Mac (or there are none).
+pub(crate) fn agent_protect_check(nodes: &[(String, bool)], reports: &[(String, Option<i64>, String)]) -> Option<Check> {
     let mut held: Vec<String> = Vec::new();
+    let mut held_nodes: Vec<&str> = Vec::new();
     let mut refused: Vec<(String, String)> = Vec::new();
     for (node, _, msg) in reports {
         let Some(at) = msg.find(AGENT_PROTECT_TAG) else { continue };
@@ -5645,6 +5841,7 @@ pub(crate) fn agent_protect_check(reports: &[(String, Option<i64>, String)]) -> 
             let n = val.strip_prefix("unchanged:").unwrap_or(val);
             if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
                 held.push(format!("{node} ({n} writable paths)"));
+                held_nodes.push(node.as_str());
             }
         }
     }
@@ -5660,8 +5857,24 @@ pub(crate) fn agent_protect_check(reports: &[(String, Option<i64>, String)]) -> 
             agent_protect_remedy(first, key),
         ));
     }
-    if held.is_empty() {
+    let due: Vec<&str> = nodes.iter().filter(|(_, mac)| !*mac).map(|(n, _)| n.as_str()).collect();
+    if due.is_empty() {
         return None;
+    }
+    let unheld: Vec<&str> = due.iter().copied().filter(|n| !held_nodes.contains(n)).collect();
+    if let Some(first) = unheld.first() {
+        let mut detail = format!(
+            "no hold reported on {} (installed by onboard, or never applied): its node agent is not held to the paths it writes",
+            unheld.join(", ")
+        );
+        if !held.is_empty() {
+            detail.push_str(&format!("; held: {}", held.join(", ")));
+        }
+        return Some(warn(
+            "agent protect",
+            detail,
+            Some(format!("for each node listed: noo cluster provision {first} --wait")),
+        ));
     }
     Some(ok("agent protect", format!("the node agent writes only where it must on {}", held.join(", "))))
 }
@@ -6994,7 +7207,7 @@ pub(crate) fn gateway_redis_check(health: Option<&Value>) -> Check {
 
 /// The `gateway fds` row: the gateway's open file descriptors against its
 /// soft `RLIMIT_NOFILE` (`dependencies.fds` in the authenticated `/health`).
-/// On 2026-11-02 the pop-os gateway hit the limit after ~45 h and spent five
+/// On 2026-11-02 the ctrl gateway hit the limit after ~45 h and spent five
 /// hours unable to read its secrets or reach Postgres; nothing had shown the
 /// climb. Warn at the gateway's own warn share (70%), fail at its critical
 /// share (90%) or when it could not count at all. The gateway names both
@@ -7263,7 +7476,7 @@ mod gateway_addon_tests {
     use serde_json::{json, Value};
 
     /// An authenticated /health body as the 0.6.16 gateway writes it, with
-    /// the refusal pop-os logged on 2026-10-31 (renamed).
+    /// the refusal ctrl logged on 2026-10-31 (renamed).
     fn captured(refused: Value) -> Value {
         json!({
             "status": "healthy",
@@ -8340,7 +8553,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // the same /metrics text, node counts from each node record.
         // Each node's last apply report, for the
         // retired apply lanes (a refusal is a node that kept its old state).
-        // One read per node, side by side (serially ~0.7 s each on awolf).
+        // One read per node, side by side (serially ~0.7 s each on node-a).
         let bundle_ids: Vec<&str> = fleet.iter().filter_map(|n| n["id"].as_str()).collect();
         let apply_reports: Vec<(String, Option<i64>, String)> = par_map(&bundle_ids, |id| {
             let st = get_json_opt(g, &format!("/api/cluster/provision-bundle/{id}/status"), true, 10)?;
@@ -8369,7 +8582,14 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(with_node_root_refusals(with_node_anchors(with_retired_apply_lanes_and_adoption(
             legacy_lanes_check(metrics.as_deref(), &fleet, now), &apply_reports, &unadopted), &apply_reports, expected), &apply_reports));
         checks.extend(harness_systemd_check(&apply_reports));
-        checks.extend(agent_protect_check(&apply_reports));
+        // Every node, and whether it is a Mac (no systemd, so no hold is
+        // due): a node with no bundle row has no report at all, and still
+        // counts.
+        let protect_nodes: Vec<(String, bool)> = fleet
+            .iter()
+            .filter_map(|n| Some((n["id"].as_str()?.to_string(), n["hostd"]["host"]["os"].as_str() == Some("darwin"))))
+            .collect();
+        checks.extend(agent_protect_check(&protect_nodes, &apply_reports));
         checks.extend(release_check_row(&apply_reports));
         checks.extend(vendor_cli_row(&apply_reports));
         let anonymous = crate::http::get_raw_opt(g, &format!("{LOGS_QUERY_ROUTE}?query=%7Bnode%3D%22verify%22%7D&limit=1"), false, 10)
@@ -8691,7 +8911,7 @@ pub(crate) fn parse_active_services(text: &str) -> Option<ActiveServices> {
 }
 
 /// Split RUNNING compose containers of this stack's project whose service
-/// the stack does not run (a profile it dropped: pop-os's
+/// the stack does not run (a profile it dropped: ctrl's
 /// `noo-stunnel-ollama`, 0.6.25 roll) from everything else. `None` (no
 /// record: a launcher from before it) splits nothing, so `stack images`
 /// judges as before.
@@ -9165,25 +9385,25 @@ mod tests {
         use super::default_chat_check;
         let two = serde_json::json!({"classes": [{"name": "chat-default", "declared": false, "dynamic": true,
             "routing_order": [
-                {"node_id": "mcmini", "backend": "ollama", "model": "gemma4:12b", "gpu": true, "reason": "rank=gpu,params=12,load=0.40"},
-                {"node_id": "pop-os", "backend": "ollama", "model": "gemma4:e2b-it-qat", "gpu": false, "reason": "rank=cpu,params=2,load=0.05"},
+                {"node_id": "node-mac", "backend": "ollama", "model": "gemma4:12b", "gpu": true, "reason": "rank=gpu,params=12,load=0.40"},
+                {"node_id": "ctrl", "backend": "ollama", "model": "gemma4:e2b-it-qat", "gpu": false, "reason": "rank=cpu,params=2,load=0.05"},
             ],
-            "skipped": [{"node_id": "awolf", "backend": "vllm", "reason": "thermal critical"}]}]});
+            "skipped": [{"node_id": "node-a", "backend": "vllm", "reason": "thermal critical"}]}]});
         let c = default_chat_check(Some(&two));
         assert_eq!(c.verdict, super::Verdict::Ok, "{c:?}");
-        assert!(c.detail.starts_with("dynamic: mcmini/ollama=gemma4:12b (rank=gpu,params=12,load=0.40) > pop-os/"), "{}", c.detail);
-        assert!(c.detail.contains("skipped awolf/vllm: thermal critical"), "{}", c.detail);
+        assert!(c.detail.starts_with("dynamic: node-mac/ollama=gemma4:12b (rank=gpu,params=12,load=0.40) > ctrl/"), "{}", c.detail);
+        assert!(c.detail.contains("skipped node-a/vllm: thermal critical"), "{}", c.detail);
 
         let cpu = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": [
-            {"node_id": "pop-os", "backend": "ollama", "model": "e2b", "gpu": false},
+            {"node_id": "ctrl", "backend": "ollama", "model": "e2b", "gpu": false},
             {"node_id": "pi", "backend": "llamacpp", "model": "x", "gpu": false}]}]});
         let c = default_chat_check(Some(&cpu));
         assert_eq!(c.verdict, super::Verdict::Warn);
         assert!(c.detail.contains("only CPU"), "{}", c.detail);
 
         let one = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": [
-            {"node_id": "awolf", "backend": "vllm", "model": "HF", "gpu": true},
-            {"node_id": "awolf", "backend": "ollama", "model": "m", "gpu": true}]}]});
+            {"node_id": "node-a", "backend": "vllm", "model": "HF", "gpu": true},
+            {"node_id": "node-a", "backend": "ollama", "model": "m", "gpu": true}]}]});
         let c = default_chat_check(Some(&one));
         assert_eq!(c.verdict, super::Verdict::Warn);
         assert!(c.detail.contains("one node"), "{}", c.detail);
@@ -9192,10 +9412,10 @@ mod tests {
         // so it neither appears in the row nor makes a two-node mesh look it.
         let emb = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": [
             {"node_id": "ctl", "backend": "ollama", "model": "harrier:latest", "gpu": true},
-            {"node_id": "awolf", "backend": "vllm", "model": "HF", "gpu": true}]}]});
+            {"node_id": "node-a", "backend": "vllm", "model": "HF", "gpu": true}]}]});
         let c = default_chat_check(Some(&emb));
         assert!(!c.detail.contains("harrier"), "{}", c.detail);
-        assert!(c.detail.contains("one node"), "only awolf is a chat node: {}", c.detail);
+        assert!(c.detail.contains("one node"), "only node-a is a chat node: {}", c.detail);
         let only_emb = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": [
             {"node_id": "ctl", "backend": "ollama", "model": "harrier:latest", "gpu": true}]}]});
         assert_eq!(default_chat_check(Some(&only_emb)).verdict, super::Verdict::Fail);
@@ -9360,8 +9580,8 @@ mod tests {
         let mac = serde_json::json!({ "os": "macos", "arch": "arm64" });
         let pi = serde_json::json!({ "os": "linux", "arch": "aarch64" });
         let needs = vec![
-            asset_need("mcmini", Some(&mac), false),
-            asset_need("robopi", Some(&pi), false),
+            asset_need("node-mac", Some(&mac), false),
+            asset_need("node-pi", Some(&pi), false),
             asset_need("ctl", None, true),
         ];
         assert_eq!(needs[2].assets, vec!["noo-hostd-x86_64-unknown-linux-gnu".to_string()], "self node: hostd only");
@@ -9370,8 +9590,8 @@ mod tests {
             .filter(|a| a != "noo-gateway-aarch64-apple-darwin").collect();
         let c = release_assets_check("0.6.17", &needs, &|a: &str| have.iter().any(|h| h == a));
         assert_eq!(c.verdict, Verdict::Warn);
-        assert!(c.detail.contains("noo-gateway-aarch64-apple-darwin (mcmini)"), "{}", c.detail);
-        assert!(!c.detail.contains("robopi)"), "robopi has all it needs: {}", c.detail);
+        assert!(c.detail.contains("noo-gateway-aarch64-apple-darwin (node-mac)"), "{}", c.detail);
+        assert!(!c.detail.contains("node-pi)"), "node-pi has all it needs: {}", c.detail);
         assert!(c.detail.contains("ctl assumed linux/x86_64"), "the guess is visible: {}", c.detail);
         assert_eq!(c.remedy.as_deref(), Some("noo upgrade --nodes"));
         let c = release_assets_check("0.6.17", &needs, &|_: &str| true);
@@ -9386,20 +9606,20 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("noo-asset-cache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let nodes = vec![serde_json::json!({ "id": "robopi-i11b-test" })];
-        let toks = vec![serde_json::json!({ "node_name": "robopi-i11b-test", "used_at": "2026-11-04T10:00:00Z",
+        let nodes = vec![serde_json::json!({ "id": "node-pi-i11b-test" })];
+        let toks = vec![serde_json::json!({ "node_name": "node-pi-i11b-test", "used_at": "2026-11-04T10:00:00Z",
             "used_by_ip": "100.1.1.1", "facts": { "os": "linux", "arch": "aarch64" } })];
         let off = release_assets_row(false, &dir, &nodes, &toks).unwrap();
         assert_eq!(off.verdict, Verdict::Warn);
         assert!(off.detail.starts_with("not checked") && !off.detail.contains("missing"), "{}", off.detail);
         let c = release_assets_row(true, &dir, &nodes, &toks).unwrap();
-        assert!(c.detail.contains("noo-hostd-aarch64-unknown-linux-gnu (robopi-i11b-test)"), "{}", c.detail);
+        assert!(c.detail.contains("noo-hostd-aarch64-unknown-linux-gnu (node-pi-i11b-test)"), "{}", c.detail);
         for a in ["noo-hostd-aarch64-unknown-linux-gnu", "noo-gateway-aarch64-unknown-linux-musl", "noo-aarch64-unknown-linux-musl"] {
             std::fs::write(dir.join(a), b"x").unwrap();
         }
         std::fs::write(dir.join("noo-aarch64-unknown-linux-musl"), b"").unwrap();
         let c = release_assets_row(true, &dir, &nodes, &toks).unwrap();
-        assert!(c.detail.contains("noo-aarch64-unknown-linux-musl (robopi-i11b-test)"), "an empty file is not an asset: {}", c.detail);
+        assert!(c.detail.contains("noo-aarch64-unknown-linux-musl (node-pi-i11b-test)"), "an empty file is not an asset: {}", c.detail);
         std::fs::write(dir.join("noo-aarch64-unknown-linux-musl"), b"x").unwrap();
         assert_eq!(release_assets_row(true, &dir, &nodes, &toks).unwrap().verdict, Verdict::Ok);
         assert!(release_assets_row(true, &dir, &[], &toks).is_none(), "no fleet, no row");
@@ -10556,11 +10776,11 @@ mod tests {
         assert_eq!(verdict(&c, "harness egress"), Verdict::Ok);
 
         let mut stale = held.clone();
-        stale["stale_hosts"] = serde_json::json!(["pop-os.tail1234.ts.net"]);
+        stale["stale_hosts"] = serde_json::json!(["ctrl.tail1234.ts.net"]);
         let c = node_checks(&with_egress(now, stale), "v0.2.70", "0.5.57", now, Some(true));
         assert_eq!(verdict(&c, "harness egress"), Verdict::Fail);
         let row = c.iter().find(|c| c.name == "harness egress").unwrap();
-        assert!(row.detail.contains("pop-os.tail1234.ts.net") && row.remedy.as_deref().unwrap().contains("host6"));
+        assert!(row.detail.contains("ctrl.tail1234.ts.net") && row.remedy.as_deref().unwrap().contains("host6"));
 
         let mut open = held.clone();
         open["state"] = "unenforced".into();
@@ -10584,17 +10804,17 @@ mod tests {
         assert!(node_checks(&ctl, "v0.2.70", "0.5.57", now, Some(true)).iter().all(|c| c.name != "harness egress"));
     }
 
-    /// A harness under a runtime with no hold (mcmini, a Mac node: launchd)
+    /// A harness under a runtime with no hold (node-mac, a Mac node: launchd)
     /// is an exposure said as one, a WARN naming the runtime, with no upgrade
     /// hint (no agent version reports a hold there). The host_services below
-    /// is mcmini's own heartbeat on 0.6.24, as `noo_cluster_status` returned
+    /// is node-mac's own heartbeat on 0.6.24, as `noo_cluster_status` returned
     /// it (2026-11-15). A systemd harness that reports no hold is still an
     /// agent too old to say, hint kept, and so is a heartbeat with no runtime.
     #[test]
     fn a_harness_with_no_hold_on_its_runtime_is_an_exposure_not_an_old_agent() {
         let now = 1_800_000_000;
         let mut mac = healthy(now);
-        mac["id"] = "mcmini".into();
+        mac["id"] = "node-mac".into();
         mac["os"] = "darwin".into();
         mac["host_services"] = serde_json::json!({"harness": {"kind": "noo", "runtime": "launchd", "state": "running"}});
         let c = node_checks(&mac, "v0.2.70", "0.5.57", now, Some(true));
@@ -10771,6 +10991,20 @@ mod tests {
         let mut n = healthy(now);
         n["last_heartbeat"] = stamp(now - 900).into();
         assert_eq!(verdict(&node_checks(&n, "v0.2.70", "0.5.57", now, Some(true)), "online"), Verdict::Fail);
+    }
+
+    /// A stale node's remedy points at the reason a locked-out node has: its
+    /// beats refused for carrying no node certificate (the legacy lanes row).
+    #[test]
+    fn a_stale_heartbeat_points_at_the_no_certificate_refusal() {
+        let now = 1_800_000_000;
+        let mut n = healthy(now);
+        n["last_heartbeat"] = stamp(now - 900).into();
+        let checks = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        let online = checks.iter().find(|c| c.name == "online").expect("an online row");
+        let r = online.remedy.clone().unwrap_or_default();
+        assert!(r.contains("`legacy lanes` row") && r.contains("fleet_token_no_cert_refused"), "{r}");
+        assert!(r.contains("noo cluster provision host3 --wait"), "{r}");
     }
 
     #[test]
@@ -11337,21 +11571,21 @@ mod tests {
     #[test]
     fn the_tailscale_ssh_row_names_mesh_devices_that_run_it() {
         let st = serde_json::json!({
-            "Self": {"HostName": "pop-os", "Tags": ["tag:controller"]},
+            "Self": {"HostName": "ctrl", "Tags": ["tag:controller"]},
             "Peer": {
-                "a": {"HostName": "aserve", "Tags": ["tag:worker"], "sshHostKeys": ["ssh-ed25519 AAAA"]},
+                "a": {"HostName": "node-b", "Tags": ["tag:worker"], "sshHostKeys": ["ssh-ed25519 AAAA"]},
                 "b": {"HostName": "laptop", "sshHostKeys": ["ssh-ed25519 BBBB"]},
-                "c": {"HostName": "robopi", "Tags": ["tag:worker"], "sshHostKeys": []}
+                "c": {"HostName": "node-pi", "Tags": ["tag:worker"], "sshHostKeys": []}
             }
         });
         let c = tailscale_ssh_check(Ok(st));
         assert_eq!(c.verdict, Verdict::Warn);
-        assert!(c.detail.contains("aserve") && !c.detail.contains("laptop") && !c.detail.contains("robopi"), "{}", c.detail);
+        assert!(c.detail.contains("node-b") && !c.detail.contains("laptop") && !c.detail.contains("node-pi"), "{}", c.detail);
         assert!(c.remedy.unwrap().contains("tailscale set --ssh=false"));
-        let quiet = serde_json::json!({"Self": {"HostName": "pop-os", "Tags": ["tag:controller"]}, "Peer": {}});
+        let quiet = serde_json::json!({"Self": {"HostName": "ctrl", "Tags": ["tag:controller"]}, "Peer": {}});
         assert_eq!(tailscale_ssh_check(Ok(quiet)).verdict, Verdict::Ok);
-        let self_on = serde_json::json!({"Self": {"HostName": "pop-os", "Tags": ["tag:controller"], "sshHostKeys": ["k"]}});
-        assert!(tailscale_ssh_check(Ok(self_on)).detail.contains("pop-os"));
+        let self_on = serde_json::json!({"Self": {"HostName": "ctrl", "Tags": ["tag:controller"], "sshHostKeys": ["k"]}});
+        assert!(tailscale_ssh_check(Ok(self_on)).detail.contains("ctrl"));
         assert_eq!(tailscale_ssh_check(Err("not running".into())).verdict, Verdict::Warn);
     }
 
@@ -11699,7 +11933,7 @@ mod tests {
         assert_eq!(sandbox_executor_check(None).verdict, Verdict::Warn);
     }
 
-    /// 0.6.13 on pop-os: with the AppArmor profile loaded the jail still
+    /// 0.6.13 on ctrl: with the AppArmor profile loaded the jail still
     /// failed, "Can't mount proc", which is Docker's /proc masks and not
     /// AppArmor. The row sent the operator to install a profile already
     /// installed. Each reason gets its own remedy, and a passed self-test
@@ -11738,7 +11972,7 @@ mod tests {
         assert!(c.detail.ends_with("isolation bwrap"), "{}", c.detail);
     }
 
-    /// 0.6.11 on pop-os: the server ran as `nonroot` (65532), the kernel
+    /// 0.6.11 on ctrl: the server ran as `nonroot` (65532), the kernel
     /// counted its `nproc: 256` with every other 65532 process on the host,
     /// and `/health` answered 500 (`can't start new thread`). The row read
     /// that as "no /health body", a warning. A 5xx is a FAIL; a server that
@@ -11766,7 +12000,7 @@ mod tests {
         let c = sandbox_executor_check(Some(&sandbox_health(exec.clone(), bwrap.clone())));
         assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
 
-        // what pop-os printed: the leaf was answered, with a 500 and no JSON
+        // what ctrl printed: the leaf was answered, with a 500 and no JSON
         let broken = sandbox_probe("refused: x", "answered HTTP/1.1 500 Internal Server Error", "refused: y");
         let c = sandbox_executor_check(Some(&broken));
         assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
@@ -12116,13 +12350,13 @@ mod tests {
         assert_eq!(hardened_replacement("ghcr.io/ggml-org/llama.cpp:server", "v1").as_deref(), Some("ghcr.io/noomesh/llamacpp:v1"));
         assert_eq!(hardened_replacement("ghcr.io/noomesh/ollama:v1", "v1"), None, "ours is already the hardened one");
         assert_eq!(hardened_replacement("vllm/vllm-openai:v0.25.0", "v1"), None);
-        let n = serde_json::json!({"id": "robopi", "image_sources": [
+        let n = serde_json::json!({"id": "node-pi", "image_sources": [
             {"image": "ghcr.io/noomesh/stunnel:v0.6.15", "source": "rail"},
             {"image": "ollama/ollama:0.40.5", "source": "registry"},
             {"image": "ghcr.io/ggml-org/llama.cpp:server", "source": "registry"}]});
         let c = hardened_images_check(&n).expect("a row");
         assert_eq!(c.verdict, Verdict::Fail, "drift is a FAIL, not a warning");
-        assert!(c.remedy.as_deref().unwrap_or("").contains("sync-images robopi -i ghcr.io/noomesh/ollama:v0.6.15"), "{:?}", c.remedy);
+        assert!(c.remedy.as_deref().unwrap_or("").contains("sync-images node-pi -i ghcr.io/noomesh/ollama:v0.6.15"), "{:?}", c.remedy);
         assert!(c.detail.contains("ollama/ollama:0.40.5 -> ghcr.io/noomesh/ollama:v0.6.15"), "{}", c.detail);
         assert!(c.detail.contains("ghcr.io/ggml-org/llama.cpp:server -> ghcr.io/noomesh/llamacpp:v0.6.15"), "{}", c.detail);
         // Nothing to replace, or an agent that reports nothing: no row.
@@ -12239,7 +12473,7 @@ mod tests {
         if let Some(b) = staged_by {
             f["staged_by"] = b.into();
         }
-        serde_json::json!({"id": "awolf", "door_pins": [f]})
+        serde_json::json!({"id": "node-a", "door_pins": [f]})
     }
 
     /// A pinned door staged by exactly its pin passes, naming the door.
@@ -12301,11 +12535,11 @@ mod tests {
     #[test]
     fn images_staged_hint_stages_a_pinned_ref_by_its_tag() {
         let pinned = format!("reg.example:5000/acme/ollama:v0.6.16@sha256:{}", "e".repeat(64));
-        let n = serde_json::json!({"id": "robopi", "unstaged_images": [pinned]});
+        let n = serde_json::json!({"id": "node-pi", "unstaged_images": [pinned]});
         let c = images_staged_check(&n).unwrap();
         assert!(c.detail.contains(&pinned), "the row names what is placed: {}", c.detail);
         let remedy = c.remedy.unwrap();
-        assert!(remedy.contains("noo cluster sync-images robopi -i reg.example:5000/acme/ollama:v0.6.16 "), "{remedy}");
+        assert!(remedy.contains("noo cluster sync-images node-pi -i reg.example:5000/acme/ollama:v0.6.16 "), "{remedy}");
         assert!(!remedy.contains('@'), "{remedy}");
     }
 
@@ -12328,7 +12562,7 @@ mod tests {
         // previous release's TAG. Every node row reads digests or floating-
         // ness, never the tag against the release: this pins that the row
         // stays OK for such a container.
-        let n = serde_json::json!({"id": "robopi", "backend_containers": {"ollama": {
+        let n = serde_json::json!({"id": "node-pi", "backend_containers": {"ollama": {
             "container": "noo-ollama",
             "image": "ghcr.io/noomesh/ollama:v0.6.26@sha256:dd46912abd4946a5c580c4a85883a559736b48f6f2c4e24162b77b307b74ea9f",
             "image_floating": false}}});
@@ -12342,17 +12576,17 @@ mod tests {
     /// a native Mac ollama has no image and is not judged.
     #[test]
     fn backend_images_row_fails_on_a_floating_ref() {
-        let n = serde_json::json!({"id": "awolf", "backend_containers": {
+        let n = serde_json::json!({"id": "node-a", "backend_containers": {
             "vllm": {"running": true, "container": "noo-vllm", "image": "vllm/vllm-openai:latest", "image_floating": true}}});
         let c = backend_images_check(&n);
         assert_eq!(c.verdict, Verdict::Fail, "{c:?}");
         assert!(c.detail.contains("noo-vllm runs vllm/vllm-openai:latest"), "{}", c.detail);
         // 0.6.8 live: a provision changed nothing; removing the container is
         // what makes the agent recreate it from the lock's pinned ref.
-        assert!(c.remedy.as_deref().unwrap_or("").starts_with("docker rm -f noo-vllm   # on awolf"), "{c:?}");
+        assert!(c.remedy.as_deref().unwrap_or("").starts_with("docker rm -f noo-vllm   # on node-a"), "{c:?}");
         assert!(c.remedy.as_deref().unwrap_or("").contains("a 0.6.10+ agent does this itself"), "{c:?}");
 
-        let pinned = serde_json::json!({"id": "awolf", "backend_containers": {
+        let pinned = serde_json::json!({"id": "node-a", "backend_containers": {
             "vllm": {"running": true, "image": "vllm/vllm-openai:v0.29.0", "image_floating": false},
             "ollama": {"managed": true, "runtime": "native", "running": true}}});
         let c = backend_images_check(&pinned);
@@ -13113,17 +13347,17 @@ mod tests {
     /// proposal 61 phase 0b: the agent protect row reads each node's last
     /// apply report. Held = OK with the writable-path count (a written and an
     /// unchanged hold alike); a refusal anywhere = FAIL naming the node and
-    /// key, with the set-config remedy; no tag anywhere (a Mac) = no row.
+    /// key, with the set-config remedy; a Mac with no tag is not listed.
     #[test]
     fn the_agent_protect_row_reads_held_refused_and_absent() {
         let mac = ("mac1".to_string(), Some(0), "applied: agent-env verified-by: signing-key".to_string());
-        assert!(agent_protect_check(std::slice::from_ref(&mac)).is_none(), "no systemd: no row");
         let held = [
             ("host6".to_string(), Some(0), "applied: agent-env agent-protect=8 verified-by: signing-key".to_string()),
             ("host7".to_string(), Some(0), "applied: agent-env=unchanged agent-protect=unchanged:7".to_string()),
             mac.clone(),
         ];
-        let c = agent_protect_check(&held).expect("a held node is a row");
+        let nodes = [("host6".to_string(), false), ("host7".to_string(), false), ("mac1".to_string(), true)];
+        let c = agent_protect_check(&nodes, &held).expect("a held node is a row");
         assert_eq!(c.verdict, Verdict::Ok);
         assert!(c.detail.contains("host6 (8 writable paths)") && c.detail.contains("host7 (7 writable paths)"), "{}", c.detail);
         assert!(!c.detail.contains("mac1"), "{}", c.detail);
@@ -13131,10 +13365,83 @@ mod tests {
             held[0].clone(),
             ("host8".to_string(), Some(0), "applied: agent-env agent-protect=REFUSED:NOO_DATA_ROOT".to_string()),
         ];
-        let c = agent_protect_check(&refused).expect("a refusal is a row");
+        let nodes = [("host6".to_string(), false), ("host8".to_string(), false)];
+        let c = agent_protect_check(&nodes, &refused).expect("a refusal is a row");
         assert_eq!(c.verdict, Verdict::Fail);
         assert!(c.detail.contains("host8 (NOO_DATA_ROOT)"), "{}", c.detail);
         assert!(c.remedy.as_deref().is_some_and(|r| r.contains("noo cluster set-config host8 --data-root <path>")), "{:?}", c.remedy);
+    }
+
+    /// A node that is not a Mac with no apply report at all (no bundle row,
+    /// e.g. a controller whose own agent onboard installed outside the
+    /// applier) is not held: WARN naming it, remedy the rail apply.
+    #[test]
+    fn the_agent_protect_row_warns_on_a_node_with_no_report() {
+        let c = agent_protect_check(&[("ctrl".to_string(), false)], &[]).expect("an unheld node is a row");
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("no hold reported on ctrl (installed by onboard, or never applied)"), "{}", c.detail);
+        assert!(c.detail.contains("not held to the paths it writes") && !c.detail.contains("held:"), "{}", c.detail);
+        assert!(c.remedy.as_deref().is_some_and(|r| r.contains("noo cluster provision ctrl --wait")), "{:?}", c.remedy);
+    }
+
+    /// A node that is not a Mac whose last report carries no tag (an applier
+    /// older than the hold) is not held: WARN naming it.
+    #[test]
+    fn the_agent_protect_row_warns_on_a_report_without_the_tag() {
+        let old = [("node_a".to_string(), Some(0), "applied: agent-env verified-by: signing-key".to_string())];
+        let c = agent_protect_check(&[("node_a".to_string(), false)], &old).expect("an untagged node is a row");
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("no hold reported on node_a ("), "{}", c.detail);
+        assert!(c.remedy.as_deref().is_some_and(|r| r.contains("noo cluster provision node_a --wait")), "{:?}", c.remedy);
+    }
+
+    /// A Mac (no systemd) owes no hold: never listed, and a Mac-only fleet
+    /// has no row at all.
+    #[test]
+    fn the_agent_protect_row_skips_a_mac() {
+        assert!(agent_protect_check(&[("mac1".to_string(), true)], &[]).is_none(), "a Mac-only fleet: no row");
+        let reports = [("host6".to_string(), Some(0), "applied: agent-protect=8".to_string())];
+        let c = agent_protect_check(&[("host6".to_string(), false), ("mac1".to_string(), true)], &reports).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(!c.detail.contains("mac1"), "{}", c.detail);
+    }
+
+    /// Held and unheld nodes together: WARN naming the unheld and listing
+    /// the held after them.
+    #[test]
+    fn the_agent_protect_row_names_unheld_and_lists_held() {
+        let reports = [
+            ("host6".to_string(), Some(0), "applied: agent-protect=8".to_string()),
+            ("host7".to_string(), Some(0), "applied: agent-env".to_string()),
+        ];
+        let nodes = [("ctrl".to_string(), false), ("host6".to_string(), false), ("host7".to_string(), false)];
+        let c = agent_protect_check(&nodes, &reports).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.starts_with("no hold reported on ctrl, host7 ("), "{}", c.detail);
+        assert!(c.detail.ends_with("; held: host6 (8 writable paths)"), "{}", c.detail);
+        assert!(c.remedy.as_deref().is_some_and(|r| r.contains("noo cluster provision ctrl --wait")), "{:?}", c.remedy);
+    }
+
+    /// A refusal anywhere stays a FAIL, ahead of any unheld node's WARN.
+    #[test]
+    fn the_agent_protect_row_fails_on_a_refusal_before_warning() {
+        let reports = [("host8".to_string(), Some(0), "applied: agent-protect=REFUSED:MODELS_DIR".to_string())];
+        let nodes = [("ctrl".to_string(), false), ("host8".to_string(), false)];
+        let c = agent_protect_check(&nodes, &reports).unwrap();
+        assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+        assert!(c.detail.contains("REFUSED the node agent's filesystem hold on host8 (MODELS_DIR)") && !c.detail.contains("ctrl"), "{}", c.detail);
+    }
+
+    /// Every node that is not a Mac held: OK, unchanged.
+    #[test]
+    fn the_agent_protect_row_is_ok_when_all_are_held() {
+        let reports = [
+            ("host6".to_string(), Some(0), "applied: agent-protect=8".to_string()),
+            ("host7".to_string(), Some(0), "applied: agent-protect=unchanged:7".to_string()),
+        ];
+        let c = agent_protect_check(&[("host6".to_string(), false), ("host7".to_string(), false)], &reports).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert_eq!(c.detail, "the node agent writes only where it must on host6 (8 writable paths), host7 (7 writable paths)");
     }
 
     /// i908: the release check row reads each node's last apply report.
@@ -13210,6 +13517,39 @@ mod tests {
         let c = legacy_lanes_check(Some(&fleet), &[], 1_800_000_000);
         assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
         assert!(c.detail.contains("fleet_secret_off_node_refused 2 (worker 2)"), "{}", c.detail);
+    }
+
+    /// A node whose requests (its heartbeats among them) are refused for
+    /// carrying no node certificate is named, with the re-issue remedy: it
+    /// is locked out and otherwise only goes stale.
+    #[test]
+    fn a_node_refused_for_no_certificate_warns_naming_it() {
+        let start = 1_800_000_000 - 30 * 86_400;
+        let quiet = legacy_lanes_check(Some(&format!("noo_gateway_start_time_seconds {start}\n")), &[], 1_800_000_000);
+        assert!(quiet.detail.contains("fleet_token_no_cert_refused 0"), "{}", quiet.detail);
+        let text = format!("noo_gateway_start_time_seconds {start}\n\
+            noo_legacy_lane_uses_total{{caller=\"node-a\",lane=\"fleet_token_no_cert_refused\",route_class=\"cluster\"}} 7\n\
+            noo_legacy_lane_uses_total{{caller=\"node-b\",lane=\"fleet_token_no_cert_refused\",route_class=\"cluster\"}} 2\n");
+        let c = legacy_lanes_check(Some(&text), &[], 1_800_000_000);
+        assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
+        assert!(c.detail.contains("with no node certificate were REFUSED 9 time(s) (node-a 7, node-b 2)"), "{}", c.detail);
+        assert!(c.detail.contains("fleet_token_no_cert_refused 9 (node-a 7, node-b 2)"), "{}", c.detail);
+        let r = c.remedy.unwrap_or_default();
+        assert!(r.starts_with("noo cluster provision node-a --wait"), "the node refused most often: {r}");
+    }
+
+    /// A node locked out outranks the other refusals in the one verdict the
+    /// row gives.
+    #[test]
+    fn the_no_certificate_refusal_outranks_the_off_node_one() {
+        let start = 1_800_000_000 - 30 * 86_400;
+        let text = format!("noo_gateway_start_time_seconds {start}\n\
+            noo_legacy_lane_uses_total{{caller=\"worker\",lane=\"fleet_secret_off_node_refused\",route_class=\"cluster\"}} 2\n\
+            noo_legacy_lane_uses_total{{caller=\"node-a\",lane=\"fleet_token_no_cert_refused\",route_class=\"cluster\"}} 1\n");
+        let c = legacy_lanes_check(Some(&text), &[], 1_800_000_000);
+        assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
+        assert!(c.detail.starts_with("requests from a node with no node certificate were REFUSED 1 time(s) (node-a 1)"), "{}", c.detail);
+        assert!(c.remedy.unwrap_or_default().contains("noo cluster provision node-a --wait"));
     }
 
     // ── retired apply lanes in the legacy-lanes row ──
@@ -13386,14 +13726,14 @@ mod tests {
     fn a_refused_v1_token_is_a_refusal_not_an_admission() {
         let now = 1_790_000_000;
         let text = lane_metrics(now - 86_400, &[
-            r#"noo_legacy_lane_uses_total{caller="pop-os",lane="cluster_hmac_v1_refused",route_class="cluster"} 12"#,
+            r#"noo_legacy_lane_uses_total{caller="ctrl",lane="cluster_hmac_v1_refused",route_class="cluster"} 12"#,
         ]);
         let lanes = serde_json::json!({ "since_unix": now - 86_400, "static_token": 0, "cluster_hmac_v1_refused": 0 });
         let c = legacy_lanes_check(Some(&text), &[lane_node("host3", now, Some(lanes))], now);
         assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
-        assert!(c.detail.contains("the gateway REFUSED it 12 time(s) (pop-os 12)"), "{}", c.detail);
+        assert!(c.detail.contains("the gateway REFUSED it 12 time(s) (ctrl 12)"), "{}", c.detail);
         assert!(!c.detail.contains("in use:") && !c.detail.contains("(gateway admitted)"), "{}", c.detail);
-        assert!(c.detail.contains("cluster_hmac_v1_refused gateway refused (by caller) 12 (pop-os 12)"), "{}", c.detail);
+        assert!(c.detail.contains("cluster_hmac_v1_refused gateway refused (by caller) 12 (ctrl 12)"), "{}", c.detail);
         assert!(!c.detail.contains("cluster_hmac_v1 "), "the deleted admission lane is not shown: {}", c.detail);
         assert!(c.remedy.as_deref().unwrap_or("").contains("noo upgrade --nodes"), "{:?}", c.remedy);
 
@@ -13414,7 +13754,7 @@ mod tests {
     fn the_deleted_v1_admission_lane_and_whois_are_not_read() {
         let now = 1_790_000_000;
         let text = lane_metrics(now - 8 * 86_400, &[
-            r#"noo_legacy_lane_uses_total{caller="pop-os",lane="cluster_hmac_v1",route_class="cluster"} 46"#,
+            r#"noo_legacy_lane_uses_total{caller="ctrl",lane="cluster_hmac_v1",route_class="cluster"} 46"#,
         ]);
         let lanes = serde_json::json!({ "since_unix": now - 8 * 86_400, "static_token": 0, "whois_non_controller": 0, "cluster_hmac_v1": 2 });
         let c = legacy_lanes_check(Some(&text), &[lane_node("host3", now, Some(lanes))], now);
@@ -14002,7 +14342,7 @@ mod self_agent_lane_tests {
 
     #[test]
     fn a_rail_installed_self_node_passes() {
-        let c = self_agent_lane_check("pop-os", &[], None, Some("rail"), true);
+        let c = self_agent_lane_check("ctrl", &[], None, Some("rail"), true);
         assert_eq!(c.verdict, Verdict::Ok);
         assert_eq!(c.name, "self-agent lane");
         assert!(c.detail.starts_with("rail"), "{}", c.detail);
@@ -14010,26 +14350,26 @@ mod self_agent_lane_tests {
 
     #[test]
     fn onboards_first_install_reads_as_the_rail() {
-        let c = self_agent_lane_check("pop-os", &[], None, Some("onboard"), true);
+        let c = self_agent_lane_check("ctrl", &[], None, Some("onboard"), true);
         assert_eq!(c.verdict, Verdict::Ok);
         assert!(c.detail.starts_with("rail"), "{}", c.detail);
     }
 
-    /// pop-os after the 0.6.2 roll: units in place, the last install was
+    /// ctrl after the 0.6.2 roll: units in place, the last install was
     /// the old local lane (its state file, no lane record).
     #[test]
     fn the_local_lane_after_onboard_fails_with_the_rail_as_the_remedy() {
-        let c = self_agent_lane_check("pop-os", &[], None, None, true);
+        let c = self_agent_lane_check("ctrl", &[], None, None, true);
         assert_eq!(c.verdict, Verdict::Fail);
         assert!(c.detail.starts_with("local"), "{}", c.detail);
         assert!(c.detail.contains("local-lane.state"), "{}", c.detail);
-        assert_eq!(c.remedy.as_deref(), Some("noo cluster provision pop-os"));
-        assert_eq!(self_agent_lane_check("pop-os", &[], None, Some("local"), false).verdict, Verdict::Fail);
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster provision ctrl"));
+        assert_eq!(self_agent_lane_check("ctrl", &[], None, Some("local"), false).verdict, Verdict::Fail);
     }
 
     #[test]
     fn missing_pull_units_fail_with_onboard_as_the_remedy() {
-        let c = self_agent_lane_check("pop-os", &["noo-fetch.timer".to_string()], None, Some("rail"), false);
+        let c = self_agent_lane_check("ctrl", &["noo-fetch.timer".to_string()], None, Some("rail"), false);
         assert_eq!(c.verdict, Verdict::Fail);
         assert!(c.detail.contains("noo-fetch.timer"), "{}", c.detail);
         assert_eq!(c.remedy.as_deref(), Some("noo onboard --only services"));
@@ -14043,7 +14383,7 @@ mod self_agent_lane_tests {
             code: "gateway_no_self_cert", msg: "the gateway cannot read this node's birth cert".into(),
             remedy: "noo upgrade --stack".into(),
         };
-        let c = self_agent_lane_check("pop-os", &[], Some(&p), Some("rail"), false);
+        let c = self_agent_lane_check("ctrl", &[], Some(&p), Some("rail"), false);
         assert_eq!(c.verdict, Verdict::Fail);
         assert_eq!(c.remedy.as_deref(), Some("noo upgrade --stack"));
     }
@@ -14054,14 +14394,14 @@ mod harness_tasks_tests {
     use super::*;
 
     fn node(tasks: Value) -> Value {
-        serde_json::json!({"id": "mcmini", "tasks": tasks})
+        serde_json::json!({"id": "node-mac", "tasks": tasks})
     }
 
     #[test]
     fn nothing_held_is_ok_and_no_summary_is_no_row() {
         let c = harness_tasks_check(&node(serde_json::json!({"running": 0, "queued": 0}))).unwrap();
         assert_eq!((c.verdict, c.name, c.detail.as_str()), (Verdict::Ok, "harness tasks", "none held"));
-        assert!(harness_tasks_check(&serde_json::json!({"id": "mcmini"})).is_none(), "an older gateway: no row");
+        assert!(harness_tasks_check(&serde_json::json!({"id": "node-mac"})).is_none(), "an older gateway: no row");
     }
 
     #[test]
@@ -14209,7 +14549,7 @@ mod gpu_contention_tests {
         assert!(!c.detail.contains("foreign"), "{}", c.detail);
     }
 
-    /// awolf, 2026-11-07: a yield on a probe timeout, read back once the
+    /// node-a, 2026-11-07: a yield on a probe timeout, read back once the
     /// probe answered again, said only "foreign 0.0 GB, nvidia-smi". The row
     /// names the agent's reason first, then the reading now.
     #[test]
@@ -14261,45 +14601,45 @@ mod gpu_contention_tests {
         // the lease, so the operator's release is a compare-and-set.
         let c = gpu_contention_check(&node(serde_json::json!({
             "state": "held", "reason": "voice", "method": "nvidia-smi", "paused_backends": ["vllm"],
-            "lease": {"owner": "rbwolf", "operation_id": "op-1", "generation": 4}}))).unwrap();
-        assert_eq!(c.detail, "mode held (manual): held by rbwolf (voice): vllm paused");
+            "lease": {"owner": "owner", "operation_id": "op-1", "generation": 4}}))).unwrap();
+        assert_eq!(c.detail, "mode held (manual): held by owner (voice): vllm paused");
         assert_eq!(c.remedy.as_deref(), Some("noo cluster gpu release host3 --operation op-1 --generation 4   # when the other work is done"));
         let c = gpu_contention_check(&node(serde_json::json!({
-            "state": "draining", "method": "nvidia-smi", "paused_backends": [], "lease": {"owner": "rbwolf"}}))).unwrap();
+            "state": "draining", "method": "nvidia-smi", "paused_backends": [], "lease": {"owner": "owner"}}))).unwrap();
         assert_eq!(c.verdict, Verdict::Warn);
-        assert!(c.detail.starts_with("mode switching: hold by rbwolf draining"), "{}", c.detail);
+        assert!(c.detail.starts_with("mode switching: hold by owner draining"), "{}", c.detail);
     }
 
     #[test]
     fn a_timed_user_hold_says_until_when() {
         let held = node(serde_json::json!({
             "state": "held", "reason": "user", "method": "memory-accounting", "paused_backends": ["vllm"], "foreign_mb": 0,
-            "lease": {"owner": "rbwolf", "operation_id": "op-7", "generation": 4, "purpose": "user",
+            "lease": {"owner": "owner", "operation_id": "op-7", "generation": 4, "purpose": "user",
                 "since": "2026-11-01T10:00:00Z", "expires_at": "2026-11-01T17:40:00Z"}}));
         let since = parse_rfc3339_unix("2026-11-01T10:00:00Z").unwrap();
         let c = gpu_contention_check_at(&held, since + 6 * 3600 + 20 * 60).unwrap();
-        assert_eq!(c.detail, "mode user: held by rbwolf (user): vllm paused, for 6 h 20 min, until 17:40 UTC (in 80 min)");
+        assert_eq!(c.detail, "mode user: held by owner (user): vllm paused, for 6 h 20 min, until 17:40 UTC (in 80 min)");
     }
 
     #[test]
     fn a_user_hold_names_its_mode_its_age_and_what_still_uses_the_gpu() {
         let held = |foreign: u64| node(serde_json::json!({
             "state": "held", "reason": "user", "method": "memory-accounting", "paused_backends": ["vllm"], "foreign_mb": foreign,
-            "lease": {"owner": "rbwolf", "operation_id": "op-7", "generation": 4, "purpose": "user", "since": "2026-11-01T10:00:00Z"}}));
+            "lease": {"owner": "owner", "operation_id": "op-7", "generation": 4, "purpose": "user", "since": "2026-11-01T10:00:00Z"}}));
         let since = parse_rfc3339_unix("2026-11-01T10:00:00Z").unwrap();
         let c = gpu_contention_check_at(&held(3277), since + 7500).unwrap();
         assert_eq!(c.verdict, Verdict::Warn);
-        assert_eq!(c.detail, "mode user: held by rbwolf (user): vllm paused, for 2 h 5 min, GPU in use 3.2 GB");
+        assert_eq!(c.detail, "mode user: held by owner (user): vllm paused, for 2 h 5 min, GPU in use 3.2 GB");
         assert_eq!(c.remedy.as_deref(), Some("noo cluster gpu mode host3 mesh   # when the other work is done"));
         let clear = gpu_contention_check_at(&held(0), since + 90).unwrap();
-        assert_eq!(clear.detail, "mode user: held by rbwolf (user): vllm paused, for 1 min");
+        assert_eq!(clear.detail, "mode user: held by owner (user): vllm paused, for 1 min");
         // No clock: no age, and the row still names the mode.
-        assert_eq!(gpu_contention_check(&held(0)).unwrap().detail, "mode user: held by rbwolf (user): vllm paused");
+        assert_eq!(gpu_contention_check(&held(0)).unwrap().detail, "mode user: held by owner (user): vllm paused");
         let reserved = node(serde_json::json!({
             "state": "held", "method": "nvidia-smi", "paused_backends": ["vllm"],
-            "lease": {"owner": "rbwolf", "operation_id": "res-1", "generation": 6, "workload": "rhaddon/worker"}}));
+            "lease": {"owner": "owner", "operation_id": "res-1", "generation": 6, "workload": "rhaddon/worker"}}));
         let c = gpu_contention_check(&reserved).unwrap();
-        assert!(c.detail.starts_with("mode workload rhaddon/worker: held by rbwolf"), "{}", c.detail);
+        assert!(c.detail.starts_with("mode workload rhaddon/worker: held by owner"), "{}", c.detail);
         // A reservation ends when its workload releases it: the release is
         // offered only as ending it early, never as the fix.
         assert_eq!(c.remedy.as_deref(),
@@ -14327,17 +14667,17 @@ mod gpu_contention_tests {
     fn seat_layout_and_display_warn_remedies_print_in_the_seat_section() {
         let seen = "2025-10-09T08:53:10Z";
         let now = parse_rfc3339_unix(seen).unwrap() + 10;
-        let seat = serde_json::json!({"seat_name": "homeserver", "enroll_user": "rbwolf", "last_seen": seen,
+        let seat = serde_json::json!({"seat_name": "node-h", "enroll_user": "owner", "last_seen": seen,
             "heartbeat": {"cli_version": "0.6.11", "layout": "user", "user_cli_current": true, "kiosk_serve": "active",
                           "kiosk_display": "active", "kiosk_bins": "home", "console_build": "stack-v0.6.11"}});
         let checks = crate::commands::kiosk_seat::seat_checks(&seat, "0.6.11", "stack-v0.6.11", now);
         let row = checks.iter().find(|c| c.name == "display binaries").expect("the home layout is a row");
         assert_eq!(row.verdict, Verdict::Warn, "a display that still runs is a WARN");
-        let want = "on homeserver: sudo ~rbwolf/.local/libexec/noo-seat/noo kiosk seat-sync --migrate";
-        let r = remedies_to_print("seat homeserver", &checks);
+        let want = "on node-h: sudo ~owner/.local/libexec/noo-seat/noo kiosk seat-sync --migrate";
+        let r = remedies_to_print("seat node-h", &checks);
         assert!(r.iter().any(|(rem, names)| *rem == want && names.contains(&"display binaries")), "{r:?}");
         // The same WARN in a node section stays remedy-less (only gpu prints there).
-        assert!(remedies_to_print("homeserver", &checks).iter().all(|(rem, _)| *rem != want));
+        assert!(remedies_to_print("node-h", &checks).iter().all(|(rem, _)| *rem != want));
         // The legacy root layout's WARN prints in the seat section too.
         let legacy = vec![warn("seat layout", "still on the root layout", Some("on s: sudo /usr/local/libexec/noo-seat/noo kiosk seat-sync --migrate".into()))];
         assert_eq!(remedies_to_print("seat s", &legacy).len(), 1);
@@ -14660,7 +15000,7 @@ mod storage_dirs_row_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// pop-os 11-03: the voice model mounts, nested two deep.
+    /// ctrl 11-03: the voice model mounts, nested two deep.
     #[test]
     fn nested_dirs_are_checked_too() {
         let (base, data) = install_without("voice", &["models/voice/whisper", "models/voice/piper"]);
@@ -14789,19 +15129,19 @@ mod model_memory_tests {
     #[test]
     fn a_measured_overrun_is_a_warning_naming_the_node_and_the_fix() {
         let c = model_memory_check(&[
-            ("awolf".into(), Some(json!({"warnings": ["tight: 20.1 GB needed leaves 3.9 GB"]}))),
-            ("pop-os".into(), Some(json!({"verdict": "does_not_fit", "warnings": [TESTER]}))),
+            ("node-a".into(), Some(json!({"warnings": ["tight: 20.1 GB needed leaves 3.9 GB"]}))),
+            ("ctrl".into(), Some(json!({"verdict": "does_not_fit", "warnings": [TESTER]}))),
         ]);
         assert_eq!(c.verdict, Verdict::Warn);
-        assert!(c.detail.starts_with("pop-os: qwen3:4b measured 7.1 GB") && !c.detail.contains("tight"), "{}", c.detail);
-        assert_eq!(c.remedy.as_deref(), Some("noo cluster fit pop-os"));
+        assert!(c.detail.starts_with("ctrl: qwen3:4b measured 7.1 GB") && !c.detail.contains("tight"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster fit ctrl"));
     }
 
     #[test]
     fn quiet_reports_are_ok_and_an_unread_one_says_so() {
-        let fine = model_memory_check(&[("awolf".into(), Some(json!({"warnings": []})))]);
+        let fine = model_memory_check(&[("node-a".into(), Some(json!({"warnings": []})))]);
         assert_eq!(fine.verdict, Verdict::Ok);
-        let unread = model_memory_check(&[("awolf".into(), Some(json!({}))), ("host6".into(), None)]);
+        let unread = model_memory_check(&[("node-a".into(), Some(json!({}))), ("host6".into(), None)]);
         assert!(unread.verdict == Verdict::Warn && unread.detail.contains("host6"), "{}", unread.detail);
     }
 }
@@ -14816,31 +15156,31 @@ mod agent_metrics_tests {
     }
 
     fn nodes() -> Vec<(String, String)> {
-        vec![("aserve".into(), "100.98.144.38".into()), ("awolf".into(), "100.89.31.92".into())]
+        vec![("node-b".into(), "100.64.0.100".into()), ("node-a".into(), "100.64.0.101".into())]
     }
 
     #[test]
     fn every_agent_up_is_ok_with_the_count() {
-        let c = agent_metrics_check(&nodes(), Some(&up(&[("aserve", "1"), ("awolf", "1")])), &|_, _| Some(true));
+        let c = agent_metrics_check(&nodes(), Some(&up(&[("node-b", "1"), ("node-a", "1")])), &|_, _| Some(true));
         assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
         assert!(c.detail.starts_with("2/2"), "{}", c.detail);
     }
 
     #[test]
     fn a_node_left_out_for_its_san_counts_as_not_scraped_and_names_the_reissue() {
-        let c = agent_metrics_check(&nodes(), Some(&up(&[("awolf", "1")])), &|id, _| Some(id != "aserve"));
+        let c = agent_metrics_check(&nodes(), Some(&up(&[("node-a", "1")])), &|id, _| Some(id != "node-b"));
         assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
-        assert!(c.detail.starts_with("1/2") && c.detail.contains("aserve") && c.detail.contains("no SAN for 100.98.144.38"), "{}", c.detail);
-        assert_eq!(c.remedy.as_deref(), Some("noo security pki issue-node aserve 100.98.144.38"));
+        assert!(c.detail.starts_with("1/2") && c.detail.contains("node-b") && c.detail.contains("no SAN for 100.64.0.100"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo security pki issue-node node-b 100.64.0.100"));
     }
 
     #[test]
     fn a_failing_scrape_and_an_unlisted_node_are_named_differently() {
-        let c = agent_metrics_check(&nodes(), Some(&up(&[("aserve", "0")])), &|_, _| Some(true));
+        let c = agent_metrics_check(&nodes(), Some(&up(&[("node-b", "0")])), &|_, _| Some(true));
         assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
         assert!(c.detail.starts_with("0/2"), "{}", c.detail);
-        assert!(c.detail.contains("aserve (the scrape of 100.98.144.38:8081 is failing"), "{}", c.detail);
-        assert!(c.detail.contains("awolf (not in the scrape list yet"), "{}", c.detail);
+        assert!(c.detail.contains("node-b (the scrape of 100.64.0.100:8081 is failing"), "{}", c.detail);
+        assert!(c.detail.contains("node-a (not in the scrape list yet"), "{}", c.detail);
         assert!(c.remedy.is_none());
     }
 
@@ -14851,7 +15191,7 @@ mod agent_metrics_tests {
 
     #[test]
     fn the_agent_host_is_read_like_the_gateway_reads_it() {
-        assert_eq!(agent_url_host("https://100.98.144.38:8081").as_deref(), Some("100.98.144.38"));
+        assert_eq!(agent_url_host("https://100.64.0.100:8081").as_deref(), Some("100.64.0.100"));
         assert_eq!(agent_url_host("https://[fd7a::1]:8081/x").as_deref(), Some("fd7a::1"));
         assert_eq!(agent_url_host("https://noo-controller:8081").as_deref(), Some("noo-controller"));
         assert_eq!(agent_url_host("https://:8081"), None);
@@ -14866,12 +15206,12 @@ mod agent_mail_tests {
     #[test]
     fn orphaned_mail_is_a_warning_naming_the_account_and_mailbox() {
         let body = json!({"accounts": [
-            {"account": "rbwolf", "orphaned": [{"name": "rbwolf/claude-weekly", "unread": 3}]},
+            {"account": "owner", "orphaned": [{"name": "owner/claude-weekly", "unread": 3}]},
             {"account": "alice", "orphaned": []},
         ]});
         let c = agent_mail_check(Some(&body));
         assert_eq!(c.verdict, Verdict::Warn);
-        assert!(c.detail.contains("3 unread") && c.detail.contains("rbwolf/claude-weekly 3"), "{}", c.detail);
+        assert!(c.detail.contains("3 unread") && c.detail.contains("owner/claude-weekly 3"), "{}", c.detail);
         assert!(!c.detail.contains("alice"));
         assert_eq!(agent_mail_check(Some(&json!({"accounts": []}))).verdict, Verdict::Ok);
         assert_eq!(agent_mail_check(None).verdict, Verdict::Warn);
@@ -14964,19 +15304,19 @@ mod vantage_tests {
 
     fn fleet(marked: Option<&str>) -> Value {
         json!({"nodes": [
-            {"id": "pop-os", "controller_host": marked == Some("pop-os"), "app_version": "stack-v0.6.24+abc"},
-            {"id": "awolf", "controller_host": false, "app_version": "stack-v0.6.24+abc"},
+            {"id": "ctrl", "controller_host": marked == Some("ctrl"), "app_version": "stack-v0.6.24+abc"},
+            {"id": "node-a", "controller_host": false, "app_version": "stack-v0.6.24+abc"},
         ]})
     }
 
     #[test]
     fn the_gateway_mark_decides_first() {
-        let me_awolf = |n: &str| n == "awolf";
-        let me_popos = |n: &str| n == "pop-os";
+        let me_node_a = |n: &str| n == "node-a";
+        let me_ctrl = |n: &str| n == "ctrl";
         // A node with a dev checkout (.env + noomesh.yaml) is still a node.
-        assert_eq!(decide_vantage(Some(&fleet(Some("pop-os"))), &me_awolf, true, false, Some("awolf")),
-            Vantage::Node { controller: Some("pop-os".into()) });
-        assert_eq!(decide_vantage(Some(&fleet(Some("pop-os"))), &me_popos, true, true, Some("pop-os")), Vantage::Controller);
+        assert_eq!(decide_vantage(Some(&fleet(Some("ctrl"))), &me_node_a, true, false, Some("node-a")),
+            Vantage::Node { controller: Some("ctrl".into()) });
+        assert_eq!(decide_vantage(Some(&fleet(Some("ctrl"))), &me_ctrl, true, true, Some("ctrl")), Vantage::Controller);
     }
 
     #[test]
@@ -14984,10 +15324,10 @@ mod vantage_tests {
         let nobody = |_: &str| false;
         // Onboard's last step: the stack just started, the gateway may not answer yet.
         assert_eq!(decide_vantage(None, &nobody, true, true, None), Vantage::Controller);
-        assert_eq!(decide_vantage(Some(&fleet(None)), &nobody, true, true, Some("pop-os")), Vantage::Controller);
+        assert_eq!(decide_vantage(Some(&fleet(None)), &nobody, true, true, Some("ctrl")), Vantage::Controller);
         // The gateway is down and this box has a checkout but no gateway container: a node.
-        assert_eq!(decide_vantage(None, &nobody, true, false, Some("awolf")), Vantage::Node { controller: None });
-        assert_eq!(decide_vantage(None, &nobody, false, false, Some("awolf")), Vantage::Node { controller: None });
+        assert_eq!(decide_vantage(None, &nobody, true, false, Some("node-a")), Vantage::Node { controller: None });
+        assert_eq!(decide_vantage(None, &nobody, false, false, Some("node-a")), Vantage::Node { controller: None });
         assert!(matches!(decide_vantage(None, &nobody, true, false, None), Vantage::Unknown(_)));
         assert!(matches!(decide_vantage(None, &nobody, false, false, None), Vantage::Unknown(_)));
     }
@@ -14995,20 +15335,20 @@ mod vantage_tests {
     #[test]
     fn off_the_controller_one_line_names_where_to_run_it() {
         assert_eq!(not_the_controller_line(&Vantage::Controller), None);
-        assert_eq!(not_the_controller_line(&Vantage::Node { controller: Some("pop-os".into()) }).unwrap(),
-            "controller rows not run: this machine is a node; run `noo cluster verify --controller` on the controller (pop-os)");
+        assert_eq!(not_the_controller_line(&Vantage::Node { controller: Some("ctrl".into()) }).unwrap(),
+            "controller rows not run: this machine is a node; run `noo cluster verify --controller` on the controller (ctrl)");
         let u = not_the_controller_line(&Vantage::Unknown("no install".into())).unwrap();
         assert!(u.contains("could not be told (no install)") && u.contains("noo cluster verify --controller"), "{u}");
     }
 
     #[test]
     fn a_node_compares_with_the_controllers_release_as_the_gateway_states_it() {
-        let mut f = fleet(Some("pop-os"));
+        let mut f = fleet(Some("ctrl"));
         assert_eq!(stack_tag_from_gateway(&f), "v0.6.24", "the controller node's agent, when the gateway predates stack_tag");
         f["stack_tag"] = "v0.6.25".into();
         assert_eq!(stack_tag_from_gateway(&f), "v0.6.25", "the gateway's own word first");
         assert_eq!(stack_tag_from_gateway(&fleet(None)), "", "nothing stated: not compared");
-        let n = json!({"id": "awolf", "app_version": "stack-v0.6.23+abc"});
+        let n = json!({"id": "node-a", "app_version": "stack-v0.6.23+abc"});
         let v = node_checks(&n, "", "0.6.24", 2_000_000, Some(true)).into_iter().find(|c| c.name == "version").unwrap();
         assert_eq!(v.verdict, Verdict::Warn, "an unstated release is never a FAIL: {v:?}");
         assert!(v.detail.contains("not compared"), "{}", v.detail);
@@ -15028,14 +15368,14 @@ mod vantage_tests {
 
     #[test]
     fn no_controller_row_and_no_env_edit_on_a_node_fixture() {
-        let healthy = json!({"id": "awolf", "status": "online", "last_heartbeat": "1970-01-24T03:33:10Z",
+        let healthy = json!({"id": "node-a", "status": "online", "last_heartbeat": "1970-01-24T03:33:10Z",
             "nats_state": "connected", "nats_role": "node", "app_version": "stack-v0.6.24+abc",
             "cert_not_after": 2_000_000 + 90 * 86_400, "peer_identity_enforced": true,
             "hostd": {"alive": true, "age_secs": 3}, "controller_host": false});
-        let broken = json!({"id": "awolf", "status": "offline", "nats_state": "disconnected", "nats_role": "fleet",
+        let broken = json!({"id": "node-a", "status": "offline", "nats_state": "disconnected", "nats_role": "fleet",
             "app_version": "stack-v0.6.22+abc", "peer_identity_enforced": false,
             "hostd": {"alive": false, "detail": "stale"}});
-        let seat = json!({"seat_name": "homeserver", "heartbeat": {"cli_version": "0.6.23", "kiosk_serve": "failed",
+        let seat = json!({"seat_name": "node-h", "heartbeat": {"cli_version": "0.6.23", "kiosk_serve": "failed",
             "console_build": "stack-v0.6.22"}, "apply_msg": "display=restarted"});
         for (label, mut rows) in [
             ("healthy node", node_checks(&healthy, "v0.6.24", "0.6.24", 2_000_000, None)),
@@ -15159,9 +15499,9 @@ mod cert_expiry_row_tests {
 
     #[test]
     fn healthy_certificates_name_the_soonest() {
-        let r = cert_expiry_row(&[c("gateway", 200), c("cluster CA", 3000), c("node pop-os", 80)]);
+        let r = cert_expiry_row(&[c("gateway", 200), c("cluster CA", 3000), c("node ctrl", 80)]);
         assert_eq!(r.verdict, Verdict::Ok);
-        assert_eq!(r.detail, "3 certificate(s); the soonest, node pop-os, in 80 days");
+        assert_eq!(r.detail, "3 certificate(s); the soonest, node ctrl, in 80 days");
     }
 
     #[test]
@@ -15207,7 +15547,7 @@ mod settle_after_roll_tests {
     use serde_json::json;
 
     fn silent_node() -> Value {
-        json!({"id": "pop-os", "status": "offline", "nats_state": "disconnected", "nats_role": "node",
+        json!({"id": "ctrl", "status": "offline", "nats_state": "disconnected", "nats_role": "node",
                "app_version": "stack-v0.6.22+abc", "hostd": {"alive": false, "detail": "stale heartbeat"}})
     }
 
@@ -15266,13 +15606,13 @@ mod reservation_pause_tests {
     use super::*;
     use serde_json::json;
 
-    fn held_awolf(expires: Option<&str>) -> Value {
+    fn held_node_a(expires: Option<&str>) -> Value {
         let mut lease = json!({"generation": 6, "mode": "drain", "operation_id": "58586ceb",
-            "owner": "rbwolf", "reason": "reservation rhaddon/worker", "workload": "rhaddon/worker"});
+            "owner": "owner", "reason": "reservation rhaddon/worker", "workload": "rhaddon/worker"});
         if let Some(e) = expires {
             lease["expires_at"] = e.into();
         }
-        json!({"id": "awolf",
+        json!({"id": "node-a",
             "lanes": [{"backend": "vllm", "model": "gemma-4-12B", "state": "down", "reason": "not running"}],
             "gpu_contention": {"state": "held", "method": "memory-accounting-unattributed", "paused_backends": ["vllm"],
                 "reason": "reservation rhaddon/worker", "lease": lease}})
@@ -15280,25 +15620,25 @@ mod reservation_pause_tests {
 
     #[test]
     fn a_lane_paused_for_a_reservation_is_said_as_paused_not_down() {
-        let c = lanes_check_at(&held_awolf(None), 2_000_000_000);
+        let c = lanes_check_at(&held_node_a(None), 2_000_000_000);
         assert_eq!(c.verdict, Verdict::Ok, "{c:?}");
-        assert!(c.detail.starts_with("vllm=gemma-4-12B: paused for GPU reservation 58586ceb (rhaddon/worker) by rbwolf: reservation rhaddon/worker; "),
+        assert!(c.detail.starts_with("vllm=gemma-4-12B: paused for GPU reservation 58586ceb (rhaddon/worker) by owner: reservation rhaddon/worker; "),
             "{}", c.detail);
         assert!(!c.detail.contains("down"), "{}", c.detail);
     }
 
     #[test]
     fn an_expired_hold_excuses_nothing_and_the_lane_is_down_again() {
-        let c = lanes_check_at(&held_awolf(Some("2026-11-12T15:00:00Z")), 2_000_000_000);
+        let c = lanes_check_at(&held_node_a(Some("2026-11-12T15:00:00Z")), 2_000_000_000);
         assert_eq!(c.verdict, Verdict::Warn);
         assert!(c.detail.starts_with("not routed: vllm=gemma-4-12B: down (not running)"), "{}", c.detail);
-        let unreadable = lanes_check_at(&held_awolf(Some("soon")), 2_000_000_000);
+        let unreadable = lanes_check_at(&held_node_a(Some("soon")), 2_000_000_000);
         assert_eq!(unreadable.verdict, Verdict::Warn, "an expiry nobody can read excuses nothing");
     }
 
     #[test]
     fn a_backend_not_in_paused_backends_stays_down() {
-        let mut n = held_awolf(None);
+        let mut n = held_node_a(None);
         n["gpu_contention"]["paused_backends"] = json!(["llamacpp"]);
         assert_eq!(lanes_check_at(&n, 2_000_000_000).verdict, Verdict::Warn);
         assert_eq!(paused_on_purpose(&n, "vllm", 2_000_000_000), None);
@@ -15313,17 +15653,17 @@ mod reservation_pause_tests {
     #[test]
     fn the_gpu_rows_remedy_for_a_reservation_says_releasing_stops_the_workload() {
         // A hand hold (no workload) keeps the release as its way out.
-        let mut manual = held_awolf(None);
+        let mut manual = held_node_a(None);
         manual["gpu_contention"]["lease"]["workload"] = Value::Null;
         let m = gpu_contention_check_at(&manual, 2_000_000_000).unwrap().remedy.unwrap();
-        assert!(m.starts_with("noo cluster gpu release awolf --operation 58586ceb --generation 6"), "{m}");
-        let n = held_awolf(None);
+        assert!(m.starts_with("noo cluster gpu release node-a --operation 58586ceb --generation 6"), "{m}");
+        let n = held_node_a(None);
         let c = gpu_contention_check_at(&n, 2_000_000_000).unwrap();
         let r = c.remedy.unwrap();
         // Offering `gpu release` as THE fix for a live reservation would end
         // the workload holding it (an operator's voice session, 11-12).
         assert!(!r.starts_with("noo cluster gpu release"), "a live reservation's remedy must not be the release: {r}");
-        assert!(r.starts_with("nothing to do: released when rhaddon/worker ends; to end it early (stops rhaddon/worker): noo cluster gpu release awolf --operation 58586ceb --generation 6"), "{r}");
+        assert!(r.starts_with("nothing to do: released when rhaddon/worker ends; to end it early (stops rhaddon/worker): noo cluster gpu release node-a --operation 58586ceb --generation 6"), "{r}");
     }
 }
 
@@ -15651,7 +15991,7 @@ mod image_retention_row_tests {
         assert_eq!(image_retention_row(Some(Ok(rep)), Some(json!({"rows": []}))).verdict, Verdict::Ok);
     }
 
-    /// pop-os after the 0.6.25 roll: `noo-stunnel-ollama` (compose service
+    /// ctrl after the 0.6.25 roll: `noo-stunnel-ollama` (compose service
     /// stunnel-ollama, profiles ollama/gpu-tier2, stunnel v0.6.2, created
     /// 2026-10-15) still Up a month after the controller stopped running that
     /// profile, beside the embedder's own current door. `stack images` failed
@@ -15675,7 +16015,7 @@ mod image_retention_row_tests {
             c("noo-stunnel-ollama", "ghcr.io/noomesh/stunnel:v0.6.2", &old, "stunnel-ollama"),
             c("noo-stunnel-ollama-embed", &format!("ghcr.io/noomesh/stunnel:v0.6.25@sha256:{d}"), &cur, "stunnel-ollama-embed"),
         ];
-        // Without the record (a launcher from before it): judged as before, the FAIL pop-os saw.
+        // Without the record (a launcher from before it): judged as before, the FAIL ctrl saw.
         let rows = stack_rows(Some(&lock), Ok(cs.clone()), None, "noo");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].verdict, Verdict::Fail, "{:?}", rows[0]);
@@ -15805,7 +16145,7 @@ mod model_stores_tests {
             {"path": "/data/noo/hf-cache", "store": "hf_cache", "mode": "0777", "uid": 1000, "gid": 1000},
             {"path": "/data/noo/ollama", "store": "ollama", "mode": "0777", "uid": 1000, "gid": 1000},
         ]}}});
-        let c = model_stores_check("awolf", &n).unwrap();
+        let c = model_stores_check("node-a", &n).unwrap();
         assert_eq!(c.verdict, Verdict::Warn);
         for want in ["2 world-writable", "/data/noo/hf-cache (mode 0777, owner 1000:1000",
             "HF weights are verified against the controller's manifest at each backend start, on a placed node only", "/data/noo/ollama",
@@ -15813,8 +16153,12 @@ mod model_stores_tests {
             assert!(c.detail.contains(want), "{want}: {}", c.detail);
         }
         let r = c.remedy.unwrap();
-        assert!(r.starts_with("on awolf: sudo chmod o-w /data/noo/hf-cache && sudo chmod o-w /data/noo/ollama"), "{r}");
-        assert!(r.contains("noo models pull"), "{r}");
+        assert!(r.starts_with("on node-a: sudo chmod o-w /data/noo/hf-cache && sudo chmod o-w /data/noo/ollama"), "{r}");
+        assert!(r.contains("noo cluster import-model node-a ollama:<tag>") && !r.contains("noo models pull"), "another node: {r}");
+        let mut own = n.clone();
+        own["self_node"] = json!(true);
+        let r = model_stores_check("ctrl", &own).unwrap().remedy.unwrap();
+        assert!(r.contains("`noo models pull <model>`"), "the controller's own node: {r}");
     }
 
     /// The row is part of every node's checks.
@@ -15825,6 +16169,68 @@ mod model_stores_tests {
         assert_eq!(c.verdict, Verdict::Fail);
         assert!(c.detail.contains("n1") && c.detail.contains("its host is not the node's registered address") && c.detail.contains("https://100.64.0.5:8081"), "{}", c.detail);
         assert!(agent_address_check("n1", &json!({"ip_address": "100.64.0.5"})).is_none(), "nothing refused, no row");
+    }
+
+    #[test]
+    fn a_refused_backend_cap_is_a_warn_naming_it_and_the_allow_list() {
+        let n = json!({"backend_caps": {"source": "env", "granted": ["CHOWN"], "refused": ["SYS_ADMIN"], "allowed": ["AUDIT_WRITE", "CHOWN"]}});
+        let c = backend_caps_check("n1", &n).expect("a refusal is a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("n1") && c.detail.contains("SYS_ADMIN") && c.detail.contains("WITHOUT it"), "{}", c.detail);
+        assert!(c.remedy.as_deref().is_some_and(|r| r.contains("AUDIT_WRITE, CHOWN") && r.contains("NOO_BACKEND_CAP_ADD")), "{:?}", c.remedy);
+    }
+
+    #[test]
+    fn backend_caps_are_ok_when_widened_and_silent_on_the_default() {
+        let widened = json!({"backend_caps": {"source": "env", "granted": ["CHOWN", "SYS_NICE"], "refused": [], "allowed": []}});
+        let c = backend_caps_check("n1", &widened).expect("a widened set is a row");
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("CHOWN, SYS_NICE"), "{}", c.detail);
+        let default = json!({"backend_caps": {"source": "default", "granted": ["CHOWN"], "refused": [], "allowed": []}});
+        assert!(backend_caps_check("n1", &default).is_none());
+        assert!(backend_caps_check("n1", &json!({})).is_none(), "an agent that does not report it: no row");
+    }
+
+    #[test]
+    fn node_checks_carry_the_backend_caps_row() {
+        let n = json!({"id": "n1", "status": "online", "backend_caps": {"source": "env", "granted": [], "refused": ["SYS_ADMIN"], "allowed": ["CHOWN"]}});
+        let c = node_checks(&n, "", "", 0, None);
+        assert!(c.iter().any(|c| c.name == "backend caps" && c.verdict == Verdict::Warn), "{:?}", c.iter().map(|c| c.name).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_node_local_refusal_is_a_warn_naming_the_key() {
+        let n = json!({"node_local": {"path": "/etc/noo-node-agent.local.env", "state": "read", "declared": [{"key": "NOO_GPU_YIELD", "source": "local file", "trust": false}],
+            "refused": [{"key": "NOO_BACKEND_CAP_ADD", "why": "\"SYS_ADMIN\" is not grantable", "source": "local file", "trust": true}], "ignored": ["NOO_CLUSTER_SECRET"]}});
+        let c = node_local_check("n1", &n).expect("a refusal is a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("NOO_BACKEND_CAP_ADD") && c.detail.contains("NOT in effect") && c.detail.contains("NOO_CLUSTER_SECRET"), "{}", c.detail);
+        let whole = json!({"node_local": {"path": "/etc/noo-node-agent.local.env", "state": "refused", "why": "mode 0666 is group- or world-writable (chmod 600)"}});
+        let c = node_local_check("n1", &whole).expect("a refused file is a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("refused whole") && c.remedy.as_deref().is_some_and(|r| r.contains("sudo chmod 644")), "{c:?}");
+    }
+
+    #[test]
+    fn node_local_declarations_are_listed_and_absent_is_silent() {
+        let n = json!({"node_local": {"path": "/x", "state": "read", "declared": [{"key": "NOO_ALLOW_OLLAMA_REGISTRY_PULL", "source": "local file", "trust": true}], "refused": [], "ignored": []}});
+        let c = node_local_check("n1", &n).expect("declarations are a row");
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("NOO_ALLOW_OLLAMA_REGISTRY_PULL (local file)"), "{}", c.detail);
+        // A trust declaration from the environment WARNs with the move-it line.
+        let env = json!({"node_local": {"path": "/x", "state": "absent", "declared": [{"key": "NOO_BACKEND_CAP_ADD", "source": "environment", "trust": true}], "refused": [], "ignored": []}});
+        let c = node_local_check("n1", &env).expect("an environment trust key is a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.remedy.as_deref().is_some_and(|r| r.contains("move NOO_BACKEND_CAP_ADD into /x")), "{c:?}");
+        assert!(node_local_check("n1", &json!({"node_local": {"state": "absent"}})).is_none());
+        assert!(node_local_check("n1", &json!({})).is_none());
+    }
+
+    #[test]
+    fn node_checks_carry_the_node_local_row() {
+        let n = json!({"id": "n1", "status": "online", "node_local": {"path": "/x", "state": "read", "declared": [{"key": "NOO_GPU_YIELD", "source": "local file", "trust": false}], "refused": [], "ignored": []}});
+        let c = node_checks(&n, "", "", 0, None);
+        assert!(c.iter().any(|c| c.name == "node-local"), "{:?}", c.iter().map(|c| c.name).collect::<Vec<_>>());
     }
 
     #[test]
@@ -15861,7 +16267,7 @@ mod ollama_models_tests {
     fn verified_models_are_ok_and_show_the_weight_digest() {
         let n = json!({"ollama_verify": [{"model": "harrier", "state": "verified", "anchor": "gguf",
             "model_layer": "sha256:5f26506ab57fd817ce4a8b9d24946a60d40bc76d82a2defa7cd754ae01e9de80"}]});
-        let c = ollama_models_check("pop-os", &n).unwrap();
+        let c = ollama_models_check("ctrl", &n).unwrap();
         assert_eq!(c.verdict, Verdict::Ok);
         assert!(c.detail.contains("harrier (gguf anchor, weights sha256:5f26506ab57f…)"), "{}", c.detail);
     }
@@ -15871,10 +16277,61 @@ mod ollama_models_tests {
     fn a_hand_pull_warns_with_the_re_pull_remedy_and_is_never_a_fail() {
         let n = json!({"ollama_verify": [{"model": "gemma4:e4b-it-qat", "state": "unverified", "anchor": "none",
             "reason": "no controller record"}]});
-        let c = ollama_models_check("mcmini", &n).unwrap();
+        let c = ollama_models_check("node-mac", &n).unwrap();
         assert_eq!(c.verdict, Verdict::Warn);
         assert!(c.detail.contains("gemma4:e4b-it-qat: unverified (no controller record)"), "{}", c.detail);
-        assert_eq!(c.remedy.as_deref(), Some("on mcmini: noo models pull gemma4:e4b-it-qat"));
+        assert_eq!(c.remedy.as_deref(),
+            Some("on node-mac: noo models fetch ollama:gemma4:e4b-it-qat && noo cluster import-model node-mac ollama:gemma4:e4b-it-qat"));
+    }
+
+    /// `noo models pull` reaches only the controller's own Ollama: it is the
+    /// remedy there and nowhere else.
+    #[test]
+    fn the_re_pull_remedy_is_noo_models_pull_only_on_the_controllers_own_node() {
+        let n = json!({"self_node": true, "ollama_verify": [{"model": "gemma4:e2b", "state": "unverified", "anchor": "none",
+            "reason": "no controller record"}]});
+        let c = ollama_models_check("ctrl", &n).unwrap();
+        assert_eq!(c.remedy.as_deref(), Some("on ctrl: noo models pull gemma4:e2b"));
+        let n = json!({"self_node": false, "ollama_verify": [{"model": "gemma4:e2b", "state": "unverified", "anchor": "none",
+            "reason": "no controller record"}]});
+        let c = ollama_models_check("node-a", &n).unwrap();
+        let r = c.remedy.unwrap_or_default();
+        assert!(!r.contains("noo models pull"), "another node's Ollama is not the gateway's: {r}");
+        assert_eq!(r, "on node-a: noo models fetch ollama:gemma4:e2b && noo cluster import-model node-a ollama:gemma4:e2b");
+    }
+
+    /// harrier is an artifact, not a registry tag: on another node it is
+    /// imported by name (import-model stages it), never fetched as ollama:.
+    #[test]
+    fn harrier_on_another_node_is_imported_by_name() {
+        let n = json!({"ollama_verify": [{"model": "harrier", "state": "unverified", "anchor": "none",
+            "reason": "no controller record"}]});
+        let c = ollama_models_check("node-a", &n).unwrap();
+        assert_eq!(c.remedy.as_deref(), Some("on node-a: noo cluster import-model node-a harrier"));
+    }
+
+    /// A mirror anchor says what it proves: the bytes are the ones the
+    /// controller recorded when it pulled the tag.
+    #[test]
+    fn a_verified_pull_says_it_matches_the_controllers_record_of_its_pull() {
+        let n = json!({"ollama_verify": [{"model": "gemma4:e2b", "state": "verified", "anchor": "mirror",
+            "model_layer": "sha256:5f26506ab57fd817ce4a8b9d24946a60d40bc76d82a2defa7cd754ae01e9de80"}]});
+        let c = ollama_models_check("ctrl", &n).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("gemma4:e2b (matches the controller's record of its pull, weights sha256:5f26506ab57f…)"), "{}", c.detail);
+    }
+
+    /// An hf.co/ ref has no controller record, and a re-pull would not write
+    /// one: a WARN with its own reason and no re-pull remedy.
+    #[test]
+    fn an_hf_ref_is_unverified_without_a_re_pull_remedy() {
+        let n = json!({"ollama_verify": [{"model": "hf.co/org/repo:Q4_K_M", "state": "unverified", "anchor": "none",
+            "reason": "hf.co refs have no controller record"}]});
+        let c = ollama_models_check("ctrl", &n).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("hf.co/org/repo:Q4_K_M: unverified (hf.co refs have no controller record)"), "{}", c.detail);
+        assert!(!c.detail.contains("re-pull"), "{}", c.detail);
+        assert_eq!(c.remedy, None);
     }
 
     /// A refused model is a FAIL naming the blob (in the reason) and the remedy.
@@ -15884,18 +16341,73 @@ mod ollama_models_tests {
             {"model": "harrier", "state": "refused", "anchor": "gguf",
              "reason": "the local model layer is sha256:aaaa, the controller's harrier-Q4_K_M.gguf is sha256:5f26"},
             {"model": "llama3", "state": "verified", "anchor": "mirror"}]});
-        let c = ollama_models_check("robopi", &n).unwrap();
+        let c = ollama_models_check("node-pi", &n).unwrap();
         assert_eq!(c.verdict, Verdict::Fail);
         assert!(c.detail.contains("harrier: the local model layer is sha256:aaaa"), "{}", c.detail);
-        assert_eq!(c.remedy.as_deref(), Some("on robopi: noo models pull harrier"));
+        assert_eq!(c.remedy.as_deref(), Some("on node-pi: noo cluster import-model node-pi harrier"));
     }
 
     /// Native Ollama reports a mismatch without repairing it: a WARN.
     #[test]
     fn a_native_mismatch_is_a_warn_that_says_it_was_not_repaired() {
         let n = json!({"ollama_verify": [{"model": "harrier", "state": "mismatch", "anchor": "gguf", "reason": "blob bad"}]});
-        let c = ollama_models_check("mcmini", &n).unwrap();
+        let c = ollama_models_check("node-mac", &n).unwrap();
         assert_eq!(c.verdict, Verdict::Warn);
         assert!(c.detail.contains("not repaired here"), "{}", c.detail);
+    }
+}
+
+#[cfg(test)]
+mod backend_starts_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn node(refusals: Value) -> Value {
+        json!({"id": "node-a", "status": "online", "reconcile_refusals": refusals})
+    }
+
+    #[test]
+    fn a_quarantined_gguf_fails_naming_target_reason_and_the_sync_remedy() {
+        let reason = "gguf_quarantined: m.gguf was proven not to match the controller's record and moved aside to /var/lib/noo/models/m.gguf.quarantined-20261117T120000Z; ship the verified file: noo cluster sync-model-files node-a -m m.gguf";
+        let c = node_checks(&node(json!([{"scope": "backend_start", "target": "llamacpp", "reason": reason}])), "", "", 0, None);
+        let row = c.iter().find(|c| c.name == "backend starts").expect("a backend starts row");
+        assert_eq!(row.verdict, Verdict::Fail);
+        assert_eq!(row.detail, format!("node-a: llamacpp: {reason}"));
+        assert_eq!(row.remedy.as_deref(), Some("noo cluster sync-model-files node-a -m m.gguf"));
+    }
+
+    #[test]
+    fn a_start_refusal_naming_no_sync_command_gets_the_cluster_show_remedy() {
+        let c = backend_starts_check("node-a", &node(json!([{"scope": "backend_start", "target": "vllm", "reason": "image pull: unauthorized"}]))).unwrap();
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert_eq!(c.detail, "node-a: vllm: image pull: unauthorized");
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster show node-a   # the node's refusal says why"));
+    }
+
+    #[test]
+    fn a_placement_refusal_is_in_the_row() {
+        let c = backend_starts_check("node-a", &node(json!([{"scope": "placement", "target": "llamacpp",
+            "reason": "this node refused the controller's models_dir /srv/models, and this placement's model lives in it"}]))).unwrap();
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert_eq!(c.detail, "node-a: llamacpp: this node refused the controller's models_dir /srv/models, and this placement's model lives in it");
+    }
+
+    #[test]
+    fn no_start_refusals_no_row() {
+        assert!(backend_starts_check("node-a", &json!({"id": "node-a"})).is_none());
+        assert!(backend_starts_check("node-a", &node(json!([]))).is_none());
+        let c = node_checks(&json!({"id": "node-a", "status": "online"}), "", "", 0, None);
+        assert!(!c.iter().any(|c| c.name == "backend starts"), "{:?}", c.iter().map(|c| c.name).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn door_and_model_cache_refusals_are_not_start_refusals() {
+        let n = node(json!([
+            {"scope": "backend_tls", "target": "vllm", "reason": "no leaf"},
+            {"scope": "model_cache_url", "target": "NOO_MODEL_CACHE_URL", "reason": "plaintext"},
+            {"scope": "backend_start", "target": "llamacpp", "reason": "r"},
+        ]));
+        let c = backend_starts_check("ctrl", &n).unwrap();
+        assert_eq!(c.detail, "ctrl: llamacpp: r");
     }
 }

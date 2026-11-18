@@ -21,6 +21,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/dataroots"
 	"github.com/noomesh/noomesh/node-agent-go/internal/imagesource"
 	"github.com/noomesh/noomesh/node-agent-go/internal/logring"
+	"github.com/noomesh/noomesh/node-agent-go/internal/nodelocal"
 	"log/slog"
 	"net/http"
 	"os"
@@ -141,6 +142,10 @@ func main() {
 	)
 	slog.SetDefault(slog.New(handler))
 	imagesource.LogRetired()
+
+	// The node's own declarations (nodelocal): applied before anything reads
+	// the environment, so every later read sees them.
+	nodelocal.Apply()
 
 	// A retired certificate-organization override is a refusal, not a
 	// silently ignored knob: an operator who set one believes it widens or

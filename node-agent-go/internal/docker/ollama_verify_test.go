@@ -26,6 +26,7 @@ type verifyRig struct {
 	store     map[string]string // kind/name -> sha256 (the controller's manifests)
 	bodies    map[string][]byte // name -> body (the data plane)
 	lookupErr error
+	asked     []string // every kind/name the controller was asked about
 	hashes    int
 	repairs   []repairCall
 	// repairFn runs as the repair; nil = succeed doing nothing.
@@ -46,6 +47,7 @@ func newVerifyRig(t *testing.T, native bool) *verifyRig {
 		Native:    native,
 		Record:    preseed.OpenVerifiedRecord(filepath.Join(root, "state", "verified", "ollama-blobs.json")),
 		lookup: func(_ context.Context, kind, name string) (string, error) {
+			rg.asked = append(rg.asked, kind+"/"+name)
 			if rg.lookupErr != nil {
 				return "", rg.lookupErr
 			}
@@ -151,9 +153,19 @@ const (
 	templateV1  = "{{ .Prompt }}"
 )
 
-// mirrorSetup stages a mirror on the controller and installs it locally,
-// matching. Returns the model and config hexes.
+// mirrorSetup stages a mirror on the controller (the manifest and every
+// blob) and installs it locally, matching. Returns the model and config hexes.
 func (rg *verifyRig) mirrorSetup() (model, config string) {
+	model, config = rg.pullRecordSetup()
+	for _, h := range []string{model, config, hexOf([]byte(templateV1))} {
+		rg.store["ollamablob/"+mirrorBlob{Hex: h}.blobName()] = h
+	}
+	return model, config
+}
+
+// pullRecordSetup is the controller's record of a pull: the registry
+// manifest alone, no blob in the store. Installed locally, matching.
+func (rg *verifyRig) pullRecordSetup() (model, config string) {
 	model = rg.blob(weightsV1)
 	config = rg.blob(configV1)
 	tmpl := rg.blob(templateV1)
@@ -165,6 +177,84 @@ func (rg *verifyRig) mirrorSetup() (model, config string) {
 	rg.bodies[mf] = body
 	rg.localManifest("library", "llama3.2", "1b", body)
 	return model, config
+}
+
+// A record of a pull verifies from the manifest alone: the blobs are hashed
+// here, against the digests it names, and the store is never asked for one.
+func TestOllamaVerifyPullRecordMatchingIsVerifiedWithoutStoreBytes(t *testing.T) {
+	rg := newVerifyRig(t, false)
+	model, _ := rg.pullRecordSetup()
+	res := rg.v.Verify(context.Background(), mirrorModel)
+	if res.State != OllamaVerified || res.Anchor != OllamaAnchorMirror || res.ModelLayer != "sha256:"+model {
+		t.Fatalf("got %+v", res)
+	}
+	if res.Reason != "matches the controller's record of its pull" {
+		t.Errorf("reason %q does not say what the record proves", res.Reason)
+	}
+	for _, a := range rg.asked {
+		if strings.HasPrefix(a, "ollamablob/") {
+			t.Errorf("the store was asked for a blob: %s", a)
+		}
+	}
+}
+
+// The attacker case against a record of a pull: a self-consistent layer the
+// record never named is a mismatch, never verified.
+func TestOllamaVerifyPullRecordRefusesALayerItNeverNamed(t *testing.T) {
+	rg := newVerifyRig(t, false)
+	_, config := rg.pullRecordSetup()
+	evil := rg.blob("attacker weights")
+	rg.localManifest("library", "llama3.2", "1b",
+		manifestBody(layerSpec{"application/vnd.docker.container.image.v1+json", config, len(configV1)},
+			layerSpec{ollamaModelMedia, evil, len("attacker weights")},
+			layerSpec{ollamaModelMedia, hexOf([]byte(weightsV1)), len(weightsV1)},
+			layerSpec{"application/vnd.ollama.image.template", hexOf([]byte(templateV1)), len(templateV1)}))
+	rg.repairFn = func() error { return errors.New("repair refused in this test") }
+	res := rg.v.Verify(context.Background(), mirrorModel)
+	if res.State != OllamaRefused {
+		t.Fatalf("got %+v, want refused", res)
+	}
+	if res.Blob != "sha256:"+evil || !strings.Contains(res.Reason, "which the controller's does not") {
+		t.Errorf("the offending layer is not the one the record never named: %+v", res)
+	}
+}
+
+// A bad blob under a record of a pull: the store has no bytes to repair
+// from, so the model is refused, nothing is removed, and the remedy is the
+// re-pull.
+func TestOllamaVerifyPullRecordBadBlobIsRefusedWithNoBytesToRepairFrom(t *testing.T) {
+	t.Setenv("NOO_SELF_NODE", "1") // the controller's own node: `noo models pull` reaches its Ollama
+	rg := newVerifyRig(t, false)
+	model, _ := rg.pullRecordSetup()
+	rg.writeBlobAt(model, "tampered weights, same name")
+	res := rg.v.Verify(context.Background(), mirrorModel)
+	if len(rg.repairs) != 0 {
+		t.Fatalf("a repair was attempted with no bytes to repair from: %+v", rg.repairs)
+	}
+	if res.State != OllamaRefused || res.Remedy != "noo models pull "+mirrorModel {
+		t.Fatalf("got %+v, want refused with the re-pull", res)
+	}
+	for _, want := range []string{"sha256:" + model, "this model's record is the controller's record of its pull, with no bytes to repair from", "noo models pull " + mirrorModel} {
+		if !strings.Contains(res.Reason, want) {
+			t.Errorf("refusal %q does not say %q", res.Reason, want)
+		}
+	}
+}
+
+// An hf.co/ ref is no registry.ollama.ai tag: unverified for its own reason,
+// with no re-pull remedy (a re-pull would record nothing either).
+func TestOllamaVerifyAnHFRefIsUnverifiedWithItsOwnReason(t *testing.T) {
+	rg := newVerifyRig(t, false)
+	res := rg.v.Verify(context.Background(), "hf.co/org/repo:Q4_K_M")
+	if res.State != OllamaUnverified || res.Anchor != OllamaAnchorNone {
+		t.Fatalf("got %+v", res)
+	}
+	if res.Reason != "hf.co refs have no controller record" || res.Remedy != "" {
+		t.Errorf("reason/remedy = %q / %q", res.Reason, res.Remedy)
+	}
+	if len(rg.asked) != 0 || len(rg.repairs) != 0 {
+		t.Errorf("an hf.co ref was looked up or repaired: %v %+v", rg.asked, rg.repairs)
+	}
 }
 
 func TestOllamaVerifyMirrorMatchingIsVerified(t *testing.T) {
@@ -201,6 +291,7 @@ func TestOllamaVerifyMirrorChangedBlobIsReinstalled(t *testing.T) {
 }
 
 func TestOllamaVerifyMirrorReinstallFailingRefuses(t *testing.T) {
+	t.Setenv("NOO_SELF_NODE", "1") // the controller's own node: `noo models pull` reaches its Ollama
 	rg := newVerifyRig(t, false)
 	model, _ := rg.mirrorSetup()
 	rg.writeBlobAt(model, "tampered weights, same name")
@@ -247,9 +338,9 @@ func TestOllamaVerifyMirrorSelfConsistentSwapIsMismatch(t *testing.T) {
 }
 
 const (
-	ggufModel  = "harrier"
-	ggufWeight = "harrier-q8_0.gguf"
-	harrierBytes  = "GGUF harrier weights"
+	ggufModel    = "harrier"
+	ggufWeight   = "harrier-q8_0.gguf"
+	harrierBytes = "GGUF harrier weights"
 )
 
 // ggufSetup publishes harrier.Modelfile + its GGUF on the controller and
@@ -303,6 +394,7 @@ func TestOllamaVerifyGGUFDifferentModelLayerIsRebuilt(t *testing.T) {
 }
 
 func TestOllamaVerifyGGUFRebuildFailingRefuses(t *testing.T) {
+	t.Setenv("NOO_SELF_NODE", "1") // the controller's own node: `noo models pull` reaches its Ollama
 	rg := newVerifyRig(t, false)
 	model := rg.ggufSetup()
 	rg.writeBlobAt(model, "tampered GGUF bytes")
@@ -322,6 +414,7 @@ func TestOllamaVerifyGGUFRebuildFailingRefuses(t *testing.T) {
 }
 
 func TestOllamaVerifyNoControllerRecordIsUnverifiedNeverRefused(t *testing.T) {
+	t.Setenv("NOO_SELF_NODE", "1") // the controller's own node: `noo models pull` reaches its Ollama
 	rg := newVerifyRig(t, false)
 	h := rg.blob("hand pulled")
 	rg.localManifest("library", "mistral", "latest",
@@ -420,5 +513,23 @@ func TestOllamaVerifyRecordSkipsUnchangedAndCatchesRewrite(t *testing.T) {
 	}
 	if rg.hashes != first+1 {
 		t.Fatalf("a rewritten blob (mtime restored) was not re-hashed: %d hashes, want %d", rg.hashes, first+1)
+	}
+}
+
+// On any node but the controller's own, `noo models pull` would act on the
+// gateway's Ollama, not this one: the remedy stages and imports onto THIS
+// node instead (harrier by name). Never the pull.
+func TestOllamaRemedyActsOnThisNodesOllama(t *testing.T) {
+	t.Setenv("NOO_SELF_NODE", "")
+	t.Setenv("NODE_ID", "node-a")
+	if got, want := ollamaRemedy("gemma4:e2b"), "noo models fetch ollama:gemma4:e2b && noo cluster import-model node-a ollama:gemma4:e2b"; got != want {
+		t.Fatalf("another node: %q, want %q", got, want)
+	}
+	if got, want := ollamaRemedy("harrier"), "noo cluster import-model node-a harrier"; got != want {
+		t.Fatalf("harrier on another node: %q, want %q", got, want)
+	}
+	t.Setenv("NOO_SELF_NODE", "1")
+	if got, want := ollamaRemedy("gemma4:e2b"), "noo models pull gemma4:e2b"; got != want {
+		t.Fatalf("the controller's own node: %q, want %q", got, want)
 	}
 }

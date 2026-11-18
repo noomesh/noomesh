@@ -785,8 +785,8 @@ type RowTuple = crate::repo::audit::VerifyRow;
 fn to_row(t: RowTuple) -> AuditRow {
     AuditRow {
         id: t.0,
-        timestamp: t.1.to_rfc3339(),
-        ts_us: t.1.timestamp_micros(),
+        timestamp: crate::wire_time::rfc3339_offset(t.1.to_jiff()),
+        ts_us: t.1.to_jiff().as_microsecond(),
         event_type: t.2,
         severity: t.3,
         actor: t.4,
@@ -1171,9 +1171,7 @@ mod tests {
         let mut r = row(id, et, "gateway", "ok", key);
         r.actor = actor.into();
         r.entry_hash = Some(r.hash_under(key));
-        r.timestamp = chrono::DateTime::from_timestamp(CP_AT + secs, 0)
-            .expect("in range")
-            .to_rfc3339();
+        r.timestamp = crate::wire_time::rfc3339_offset(jiff::Timestamp::from_second(CP_AT + secs).expect("in range"));
         r.ts_us = (CP_AT + secs) * 1_000_000;
         r
     }
@@ -1385,7 +1383,7 @@ mod tests {
 
     fn at(r: &mut AuditRow, secs: i64) {
         r.ts_us = (CP_AT + secs) * 1_000_000;
-        r.timestamp = chrono::DateTime::from_timestamp(CP_AT + secs, 0).expect("in range").to_rfc3339();
+        r.timestamp = crate::wire_time::rfc3339_offset(jiff::Timestamp::from_second(CP_AT + secs).expect("in range"));
     }
 
     fn sign_v2(r: &mut AuditRow, key: &[u8]) {
@@ -1756,7 +1754,7 @@ mod tests {
                 let id = uuid::Uuid::new_v4().to_string();
                 assert!(
                     crate::audit::insert_signed_audit_row(
-                        &db, &id, chrono::Utc::now(), et, "info", "proof", "gateway", "ok", "{}",
+                        &db, &id, crate::audit::stored_now(), et, "info", "proof", "gateway", "ok", "{}",
                         None, &h, None
                     )
                     .await

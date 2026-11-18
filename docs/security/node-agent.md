@@ -518,10 +518,12 @@ Every container the agent creates on a controller's instruction runs with:
   keep a writable root until theirs is moved to a cache mount
   ([networks and containers](networks-and-containers.md#container-hardening)).
 
-`NOO_BACKEND_CAP_ADD` (node-local) widens the backend set for an image that
+`NOO_BACKEND_CAP_ADD` (a node-local declaration, [below](#the-nodes-own-declarations)) widens the backend set for an image that
 genuinely needs more, from an allow-list only: a capability that lets a
 container reach the host (`SYS_ADMIN`, `SYS_PTRACE`, `DAC_READ_SEARCH`,
-`NET_ADMIN`, `ALL`, …) is refused and logged
+`NET_ADMIN`, `ALL`, …) is refused: dropped, so the backend starts without
+it, and reported in the heartbeat; `noo cluster verify`'s `backend caps` row
+WARNs naming the node, the refused names and the allow-list
 ([env reference](../reference/env.md)). `NOO_CONTAINER_RUN_USER` and
 `NOO_CONTAINER_IMAGE_ALLOW` do the same for managed containers.
 
@@ -930,7 +932,13 @@ node is not checked); GGUF files are hashed against the controller's manifest
 at each start on a placed node and re-fetched on a mismatch; a file proven
 not to match whose re-fetch fails is moved aside (`<file>.quarantined-<time>`,
 never deleted) and the start is refused, naming the file and `noo cluster
-sync-model-files <node> -m <file>`; with no manifest, or an unreachable
+sync-model-files <node> -m <file>`; every later start is refused too (a
+quarantined gguf is never started, nor one missing from a models dir the
+controller declared; a first placement on the node's own default dir is
+still fetched by the start's preseed), and verify's `backend
+starts` row shows the refusal until the verified file is shipped (`noo
+cluster sync-model-files <node> -m <model>`); a container already running
+keeps running until its next start; with no manifest, or an unreachable
 controller and no proof of a mismatch, the agent logs a WARN and llama.cpp
 loads the local file; Ollama models are checked about every 10 minutes and at backend start,
 repaired from the controller, and refused only when the repair fails (native
@@ -946,23 +954,38 @@ On every node where the agent runs Ollama, each placed model is checked
 against the controller's store, and the `ollama models` row of `noo cluster
 verify` reports it:
 
-- **A model staged as a mirror** (`noo models pull` / `noo models fetch
-  ollama:<tag>`): the local manifest's layers must equal the controller's
-  mirrored manifest, and every blob must hash to its digest.
+- **A registry tag the controller holds a manifest for**: staged with every
+  blob (`noo models fetch ollama:<tag>`), or recorded alone when the
+  controller pulled it (`noo models pull <tag>`, and onboard's first model).
+  The local manifest's layers must equal that manifest's, and every blob must
+  hash to its digest. This proves the bytes are unchanged since the
+  controller recorded the tag, not that the registry served the right model.
 - **A model built from a GGUF** (a `<name>.Modelfile` in the store): its
   model layer must be the controller's GGUF, by sha256. The other layers
   (template, parameters) are not anchored yet.
 
 A mismatch is repaired from the controller (the bad blobs are removed, then
-the model is re-installed or rebuilt from the verified GGUF). Only when that
-repair fails is the model refused: the node stops advertising it, the
+the model is re-installed or rebuilt from the verified GGUF). A pulled model
+is not repaired: the record of a pull holds no bytes, so a blob it needs is
+refused at once ("no bytes to repair from"), and the remedy is the re-pull.
+Only when a repair fails, or cannot be made, is the model refused: the node stops advertising it, the
 gateway routes elsewhere, and the row is a FAIL naming the model, the blob
 and the remedy. Hashing is cached by file identity (device, inode, size,
 mtime, ctime), so only the first check after a change reads the whole file.
 
 A model the controller has no record of (a hand `ollama pull`) is never
-refused: the row WARNs and its remedy, `noo models pull <model>`, re-pulls it
-through the controller, which is how a hand-pulled model becomes verified.
+refused: the row WARNs with a remedy that acts on THAT node's Ollama. On the
+controller's own node it is `noo models pull <model>`, which pulls through the
+gateway's Ollama and writes the record. `noo models pull` reaches no other
+node, so on any other node (a container or a Mac's native Ollama) the remedy
+stages the tag on the controller and imports it there: `noo models fetch
+ollama:<tag>`, then `noo cluster import-model <node> ollama:<tag>` (harrier, an
+artifact: `noo cluster import-model <node> harrier`). The record is written only
+when the manifest the controller fetched names exactly what the pull
+installed; a tag that moved in between leaves none (run it again). An
+`hf.co/` ref has no record and no remedy. A placed node (rail, pull-only)
+still needs the bytes staged with `noo models fetch ollama:<tag>`: importing
+from a record alone is refused by name.
 There is no setting that marks a model trusted. On a node whose Ollama the
 agent does not manage (a Mac's native Ollama) a mismatch is reported, never
 repaired or refused.
@@ -1304,7 +1327,7 @@ What this does and does not add:
   while any online Linux node exists, an older agent that becomes rail on
   the roll included.
 - **Third-party public images** may fall back to their registry only under
-  `NOO_IMAGE_REGISTRY_FALLBACK=public` (node-local; the default). Set it to
+  `NOO_IMAGE_REGISTRY_FALLBACK=public` (a [node-local declaration](#the-nodes-own-declarations); the default). Set it to
   `off` for a node that must never reach an internet registry. Every
   fallback is logged and shows on `noo cluster verify` as source
   `registry`.
@@ -1573,8 +1596,11 @@ as it was and the applier's line says `agent-protect=REFUSED:<KEY>`.
 `noo cluster verify` shows the hold as the `agent protect` row, from each
 node's last apply: OK names every held node and how many paths it leaves
 writable; a refusal is a FAIL naming the node and the setting, with the
-`noo cluster set-config` that fixes it. A host without systemd (a Mac) has no
-hold and no row.
+`noo cluster set-config` that fixes it. Any other node with no hold report is
+a WARN naming it: a fresh controller's own agent is installed by `noo onboard`
+outside the applier and is not held until its first rail apply
+(`noo cluster provision <self> --wait`). A Mac (no systemd) owes no hold and
+is not listed; a Mac-only fleet has no row.
 
 ## Root code comes from a release
 
@@ -1684,6 +1710,73 @@ on the generation floor refuses any applier older than generation 2.
   neither, it refuses root code: "needs OpenSSL 3 or python3".
 - `noo cluster upgrade-hostd` ships the release's own hostd asset with the
   release's signed list; there is no checkout build.
+
+## The node's own declarations
+
+A node limits what the controller may make it do. Those limits are the
+node's own declarations, made ON the node, in `/etc/noo-node-agent.local.env`
+(Linux and Mac alike), a file only the node's operator writes and that no
+apply or roll ever touches. It is root's file: owned by root, mode `644`, in
+a root-owned directory. The agent, which runs as its own unprivileged user,
+can read it but never write it, so a compromised agent can never grant itself
+a capability: a declaration the agent could write for itself would not bound
+it. It holds no secrets.
+
+```sh
+# Linux
+sudo install -m 644 -o root -g root /dev/null /etc/noo-node-agent.local.env
+echo 'NOO_ALLOW_OLLAMA_REGISTRY_PULL=1' | sudo tee -a /etc/noo-node-agent.local.env
+sudo systemctl restart noo-node-agent
+# Mac
+sudo install -m 644 -o root -g wheel /dev/null /etc/noo-node-agent.local.env
+echo 'NOO_ALLOW_OLLAMA_REGISTRY_PULL=1' | sudo tee -a /etc/noo-node-agent.local.env
+sudo launchctl kickstart -k system/net.noomesh.node-agent
+```
+
+The controller-rendered agent env (`/etc/noo-node-agent.env`, the Mac's
+`agent.env`) is replaced whole on every apply, so a line added there by hand
+is gone at the next roll. Declarations go in the local file instead.
+
+The agent reads the file itself at start (it is data, never run by a shell)
+and takes only these keys, by name:
+
+- **trust declarations:** `NOO_BACKEND_CAP_ADD`, `NOO_CONTAINER_IMAGE_ALLOW`,
+  `NOO_CONTAINER_RUN_USER`, `NOO_SKILL_RUN_USER`, `NOO_SKILL_BIND_ROOTS`,
+  `NOO_MCP_SECRETS_FILE`, `NOO_ALLOW_OLLAMA_REGISTRY_PULL`,
+  `NOO_IMAGE_REGISTRY_FALLBACK`;
+- **tuning:** `NOO_GPU_YIELD`, `NOO_GPU_YIELD_FOREIGN_MB`,
+  `NOO_GPU_YIELD_AFTER_S`, `NOO_GPU_RESUME_AFTER_S`, `NOO_GPU_TIMEOUT_GRACE_S`,
+  `NOO_LOG_SHIP`, `NOO_LOG_SHIP_UNITS`, `NOO_AGENT_TUNNEL`.
+
+Any other name in the file is ignored and named: the file can never set a
+controller-owned value such as the cluster secret or the bind address.
+
+Each value is held to its own narrow rule, whatever its source:
+
+- capabilities only from the agent's allow-list; an image allow-list of
+  repositories or namespace prefixes (a whole registry is refused); run users
+  `uid[:gid]` and never root; bind roots absolute, normalised and outside the
+  system trees; `0`/`1`, `on`/`off` and whole numbers where those are meant;
+- a value with a quote, backslash, `$`, backtick, `%` or space is refused.
+
+**Fail closed:**
+
+- a refused trust declaration is NOT in effect (a refused registry fallback is
+  `off`);
+- a refused tuning value leaves the agent's default.
+
+A file that is not a regular file, is group- or world-writable, is not owned
+by root, sits in a directory that is not root's alone (checked where the path
+really leads: macOS's `/etc` is `/private/etc`), or that the agent cannot read
+is refused whole, named in the row, and nothing in it is applied.
+
+A node-local key that still arrives through the agent's environment (a
+systemd drop-in) keeps working, held to the same rules; the local file wins
+when both set a key. `noo cluster verify`'s `node-local` row:
+
+- lists each node's declarations and where each came from;
+- WARNs on a refused one, on a refused file, and on a trust declaration read
+  from the environment (move it into the local file).
 
 ## What is still root
 

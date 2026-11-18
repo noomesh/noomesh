@@ -86,7 +86,7 @@ struct KeyInfo {
     /// harness mints for a foreign CLI (`mint_door_key`); `None` = no expiry.
     /// Checked on the cached path too, so a key stops at its expiry, not up
     /// to one cache TTL later.
-    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    expires_at: Option<jiff::Timestamp>,
     consumer: String,
     scopes: Vec<String>,
     rpm_limit: Option<i64>,
@@ -252,7 +252,7 @@ fn snapshot_answer(slot: &RwLock<Option<Cache>>, hash: &str, max_age: Duration) 
     if c.loaded.elapsed() >= max_age {
         return None;
     }
-    Some(c.map.get(hash).filter(|k| live(k.expires_at, chrono::Utc::now())).map(KeyInfo::consumer))
+    Some(c.map.get(hash).filter(|k| live(k.expires_at, jiff::Timestamp::now())).map(KeyInfo::consumer))
 }
 
 /// [`resolve`] over an explicit snapshot slot, so tests hold their own.
@@ -272,7 +272,7 @@ async fn resolve_in(slot: &RwLock<Option<Cache>>, db: &PgPool, token: &str) -> R
     // the key still authenticates as a machine key and is visibly unbound,
     // instead of vanishing and reading as "revoked".
     #[allow(clippy::type_complexity)]
-    let rows = sqlx::query_as::<_, (String, String, Value, Option<i64>, Option<String>, Option<Value>, Option<String>, Option<chrono::DateTime<chrono::Utc>>)>(
+    let rows = sqlx::query_as::<_, (String, String, Value, Option<i64>, Option<String>, Option<Value>, Option<String>, Option<jiff_sqlx::Timestamp>)>(
         "SELECT k.key_hash, k.consumer, k.scopes, k.rpm_limit, u.username, u.scopes, u.role, k.expires_at \
          FROM noo_service_keys k \
          LEFT JOIN noo_users u ON u.username = k.user_id AND u.disabled = false \
@@ -333,7 +333,7 @@ async fn resolve_in(slot: &RwLock<Option<Cache>>, db: &PgPool, token: &str) -> R
         };
         map.insert(
             key_hash,
-            KeyInfo { expires_at, consumer, scopes, rpm_limit, user, user_scopes, user_role },
+            KeyInfo { expires_at: expires_at.map(jiff_sqlx::Timestamp::to_jiff), consumer, scopes, rpm_limit, user, user_scopes, user_role },
         );
     }
 
@@ -364,7 +364,7 @@ async fn resolve_in(slot: &RwLock<Option<Cache>>, db: &PgPool, token: &str) -> R
 }
 
 /// Whether a key with this expiry is usable at `now`.
-fn live(expires_at: Option<chrono::DateTime<chrono::Utc>>, now: chrono::DateTime<chrono::Utc>) -> bool {
+fn live(expires_at: Option<jiff::Timestamp>, now: jiff::Timestamp) -> bool {
     expires_at.is_none_or(|e| e > now)
 }
 
@@ -492,7 +492,7 @@ pub fn door_key_consumer(node: &str, conversation_id: &str) -> String {
 pub struct DoorKey {
     pub key: String,
     pub id: uuid::Uuid,
-    pub expires_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: jiff::Timestamp,
 }
 
 /// Mint the short-lived user-door key a node harness hands its foreign CLI:
@@ -515,7 +515,8 @@ pub async fn mint_door_key(db: &PgPool, user: &str, consumer: &str, ttl_secs: u6
         format!("noo-sk-{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
     };
     let id = uuid::Uuid::new_v4();
-    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(ttl_secs.min(i64::MAX as u64) as i64);
+    // ttl_secs is bounded by the turn's own expiry (routes/harness.rs door_key_ttl).
+    let expires_at = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(ttl_secs.min(i64::MAX as u64) as i64);
     sqlx::query(
         "INSERT INTO noo_service_keys (id, consumer, key_hash, scopes, note, user_id, expires_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7)",
@@ -526,7 +527,7 @@ pub async fn mint_door_key(db: &PgPool, user: &str, consumer: &str, ttl_secs: u6
     .bind(serde_json::json!(["mcp"]))
     .bind("node harness: a foreign CLI's door key, expires with its turn")
     .bind(user)
-    .bind(expires_at)
+    .bind(jiff_sqlx::Timestamp::from(expires_at))
     .execute(db)
     .await?;
     invalidate_cache();
@@ -642,11 +643,21 @@ mod door_key_tests {
 
     #[test]
     fn an_expired_key_is_dead_and_an_unexpiring_one_lives() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
+        let s = |n| jiff::SignedDuration::from_secs(n);
         assert!(live(None, now));
-        assert!(live(Some(now + chrono::Duration::seconds(5)), now));
+        assert!(live(Some(now + s(5)), now));
         assert!(!live(Some(now), now));
-        assert!(!live(Some(now - chrono::Duration::seconds(1)), now));
+        assert!(!live(Some(now - s(1)), now));
+    }
+
+    /// The cached path must judge expiry against the current time, or a
+    /// door key outlives its turn for as long as the snapshot is held.
+    #[test]
+    fn the_cached_answer_checks_expiry_against_now() {
+        let own = crate::test_src::own_code(include_str!("service_keys.rs"));
+        let body = crate::test_src::fn_body(&own, "fn snapshot_answer(");
+        assert!(body.contains("live(k.expires_at, jiff::Timestamp::now())"), "the snapshot must drop a key whose expiry has passed");
     }
 
     #[test]

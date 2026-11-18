@@ -223,7 +223,7 @@ pub fn spawn_drainer(db: sqlx::PgPool) {
 /// `details` with `queued_at` (RFC 3339, now) added, for a security row that
 /// is about to wait: the row's own time will be when it lands.
 pub fn stamp_queued_at(details: &str) -> String {
-    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    let now = crate::wire_time::rfc3339_micros_z(jiff::Timestamp::now());
     match serde_json::from_str::<serde_json::Value>(details) {
         Ok(serde_json::Value::Object(mut m)) => {
             m.insert("queued_at".into(), serde_json::Value::String(now));

@@ -21,8 +21,8 @@
 // to end the pass early.
 //
 // Placements whose model FILE is absent are skipped with a loud log
-// (`reconcile.model_missing`) instead of starting a crash-looping
-// container — the exact 2026-07-03 host8 failure mode.
+// (`reconcile.model_missing`) and a backend_start refusal instead of
+// starting a crash-looping container — the exact 2026-07-03 host8 failure mode.
 package reconcile
 
 import (
@@ -245,6 +245,13 @@ type Reconciler struct {
 	// desired hash to change. Single-goroutine (ticker) access; no lock.
 	driftRecreated map[string]string
 
+	// ggufMissing: backend -> the standing refusal for a placed .gguf that
+	// is missing from the effective models dir (ggufPresent). Kept until
+	// the file is back so nothing clears the refusal meanwhile. Tick
+	// goroutine only. ggufExists checks the file; nil = r.docker's.
+	ggufMissing map[string]string
+	ggufExists  func(ctx context.Context, dir, file string) (bool, error)
+
 	// ollamaPulls tracks the registry pull an ollama placement needs, per
 	// model: one in flight at a time, and a failed pull waits before it is
 	// retried (a tag that does not exist would otherwise be re-attempted
@@ -321,6 +328,8 @@ func New(cfg *config.Config, docker *dockerpkg.Client, client *http.Client, harn
 		cliInstalled:    cliOnPath,
 		harnessEgress:   egressReaderFor(harness),
 		driftRecreated:  map[string]string{},
+		ggufMissing:     map[string]string{},
+		ggufExists:      docker.HostFileExists,
 	}
 }
 
@@ -779,7 +788,11 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 		// stamped spec hash matches the desired one.
 		if isRunning && modelname.Matches(curModel, p.Model) {
 			// Running as asked: an earlier start failure no longer
-			// applies.
+			// applies, unless its gguf is still missing (a container
+			// left running on a refused start): re-check that one.
+			if r.ggufMissing[p.Backend] != "" {
+				r.ggufPresent(ctx, t, p)
+			}
 			r.clearBackendStart(p.Backend)
 			if p.Backend == "ollama" {
 				// The container is up with OLLAMA_MODEL set; that says
@@ -885,17 +898,12 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 					", and this placement's model lives in it")
 			return
 		}
-		if t.modelsDir != "" && strings.HasSuffix(p.Model, ".gguf") {
-			exists, err := r.docker.HostFileExists(ctx, t.modelsDir, p.Model)
-			if err != nil {
-				slog.Warn("reconcile.model_check_failed", "error", err)
-			} else if !exists {
-				slog.Error("reconcile.model_missing",
-					"backend", p.Backend, "model", p.Model,
-					"models_dir", t.modelsDir,
-					"fix", "noo cluster sync-model-files "+r.cfg.NodeID+" -m "+p.Model)
-				return
-			}
+		// In the EFFECTIVE models dir (the one StartBackend mounts), not
+		// only a controller-declared one, and recorded as a refusal: a
+		// gguf quarantined by the preseed (docker.ggufFetchOutcome) is
+		// missing here on the next pass, and starting anyway crash-loops.
+		if !r.ggufPresent(ctx, t, p) {
+			return
 		}
 
 		extraEnv := buildPlacementEnv(p)

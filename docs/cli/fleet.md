@@ -414,7 +414,7 @@ cutover has begun it cannot be cancelled. A space with a migration cannot be uns
 ```sh
 noo models recommended                      # per detected tier; prefers LAN-cached models
 noo models info Qwen/Qwen2.5-7B-Instruct    # gating, licence, formats
-noo models pull qwen2.5:7b-instruct         # through the gateway's Ollama proxy, streamed progress
+noo models pull qwen2.5:7b-instruct         # through the gateway's Ollama proxy, streamed progress; records the pull in the controller store
 noo models cached                           # what running backends have loaded
 noo models fetch <org>/<repo> <file.gguf>   # GGUF from Hugging Face into the controller store (resumable, sha256-verified)
 ```
@@ -681,10 +681,10 @@ it is immediate and a force, and the audit row says `legacy`.
 the GPU and the mesh's, without lease ids to copy:
 
 ```bash
-noo cluster gpu mode awolf              # the current mode, and how long a hold has lasted
-noo cluster gpu mode awolf user         # drain, hold with purpose "user", wait until the GPU is free
-noo cluster gpu mode awolf mesh         # check the GPU is free, release with resume-now, wait until vLLM is warm
-noo cluster gpu mode awolf user --for 2h  # the same, and the node hands the GPU back after 2 hours
+noo cluster gpu mode node-a              # the current mode, and how long a hold has lasted
+noo cluster gpu mode node-a user         # drain, hold with purpose "user", wait until the GPU is free
+noo cluster gpu mode node-a mesh         # check the GPU is free, release with resume-now, wait until vLLM is warm
+noo cluster gpu mode node-a user --for 2h  # the same, and the node hands the GPU back after 2 hours
 ```
 
 The mode is read from the node's GPU lease, never stored: no lease and vLLM
@@ -727,7 +727,7 @@ lasted and how much of the GPU other work still uses.
   while vLLM is still warming only waits. A node held by someone else, or
   reserved for an add-on workload, is refused with the line that ends that
   hold; the mode verb does not end another operator's hold.
-- The time from release to a warm vLLM on awolf is measured live, not by the
+- The time from release to a warm vLLM on node-a is measured live, not by the
   unit tests; see the measured figure when it is recorded here.
 
 ### Reservations: a feature takes a GPU, the pool gets it back
@@ -742,7 +742,7 @@ stay as the low-level emergency tools underneath.
 ```bash
 noo cluster workloads                              # what the installed add-ons declare
 noo cluster reserve pai-voice/voice-worker         # the mesh picks a node: any live node with enough free GPU memory
-noo cluster reserve pai-voice/voice-worker --node awolf   # or pin one
+noo cluster reserve pai-voice/voice-worker --node node-a   # or pin one
 noo cluster reservations                           # id, workload, holder, node, state, since
 noo cluster release <reservation-id>               # the GPU returns to the pool
 ```
@@ -769,8 +769,9 @@ container's published loopback port. A relayed WebSocket closes with code
 4001 when the reservation ends. Nothing else on the node is reachable that
 way, and a workload that is not reserved answers 409.
 
-**Knobs** (operator overrides; on a Linux node set them in a systemd drop-in, `sudo systemctl edit noo-node-agent`
-then `[Service]` / `Environment=NOO_GPU_YIELD=off`, and restart the agent. Not in `/etc/noo-node-agent.env`:
+**Knobs** (operator overrides; set them in the node's local declarations file,
+`/etc/noo-node-agent.local.env` (Linux and Mac; root's, mode 644), and restart the agent, see
+[the node's own declarations](../security/node-agent.md#the-nodes-own-declarations). Not in `/etc/noo-node-agent.env`:
 every roll replaces that file whole and a hand-added line is gone):
 
 | Variable | Default | Meaning |

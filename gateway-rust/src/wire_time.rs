@@ -12,6 +12,11 @@
 //! - [`rfc3339_z`]: what chrono's serde printed for a `DateTime<Utc>` field,
 //!   the offset spelled `Z`.
 //!
+//! A third form is for text that must keep microseconds in a fixed width
+//! (the audit read API's timestamps and page cursors, the audit spool):
+//! [`rfc3339_micros_z`], chrono's `to_rfc3339_opts(SecondsFormat::Micros,
+//! true)`, always six digits.
+//!
 //! Both write the sub-second part the way chrono's `SecondsFormat::AutoSi`
 //! does: nothing for a whole second, else 3, 6 or 9 digits, the fewest of
 //! those that hold it exactly. Postgres keeps microseconds, so a value read
@@ -33,6 +38,15 @@ pub fn rfc3339_z(ts: Timestamp) -> String {
     format_utc(ts, "Z")
 }
 
+/// `to_rfc3339_opts(SecondsFormat::Micros, true)`, byte for byte: `Z`, always
+/// six sub-second digits, anything finer than a microsecond dropped (not
+/// rounded), as chrono did.
+pub fn rfc3339_micros_z(ts: Timestamp) -> String {
+    let dt = jiff::tz::Offset::UTC.to_datetime(ts);
+    let frac = format!(".{:06}", dt.subsec_nanosecond() / 1_000);
+    ymd_hms(dt, &frac, "Z")
+}
+
 /// An RFC 3339 time with any offset, as `DateTime::parse_from_rfc3339` read it.
 pub fn parse_rfc3339(s: &str) -> Result<Timestamp, jiff::Error> {
     s.parse::<Timestamp>()
@@ -50,6 +64,10 @@ fn format_utc(ts: Timestamp, offset: &str) -> String {
     } else {
         format!(".{nanos:09}")
     };
+    ymd_hms(dt, &frac, offset)
+}
+
+fn ymd_hms(dt: jiff::civil::DateTime, frac: &str, offset: &str) -> String {
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{frac}{offset}",
         dt.year(),
@@ -113,6 +131,19 @@ mod tests {
             let serde = serde_json::to_value(c).expect("serialises");
             assert_eq!(serde_json::Value::String(rfc3339_z(jiff_of(c))), serde, "{c:?}");
         }
+    }
+
+    #[test]
+    fn the_micros_form_is_chronos_micros_opts_byte_for_byte() {
+        for c in instants() {
+            assert_eq!(rfc3339_micros_z(jiff_of(c)), c.to_rfc3339_opts(SecondsFormat::Micros, true), "{c:?}");
+        }
+        // Six digits whatever the value, and below a microsecond is dropped.
+        let micros = |us: i64| Timestamp::from_microsecond(us).expect("in range");
+        assert_eq!(rfc3339_micros_z(micros(1_763_400_000_000_000)), "2025-11-17T17:20:00.000000Z");
+        assert_eq!(rfc3339_micros_z(micros(1_763_400_000_120_000)), "2025-11-17T17:20:00.120000Z");
+        let almost = Timestamp::new(1_763_400_000, 999_999_999).expect("in range");
+        assert_eq!(rfc3339_micros_z(almost), "2025-11-17T17:20:00.999999Z");
     }
 
     /// Postgres `timestamptz` holds microseconds: the read-back value prints

@@ -43,6 +43,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/logship"
 	"github.com/noomesh/noomesh/node-agent-go/internal/messaging"
 	"github.com/noomesh/noomesh/node-agent-go/internal/metrics"
+	"github.com/noomesh/noomesh/node-agent-go/internal/nodelocal"
 	"github.com/noomesh/noomesh/node-agent-go/internal/occupancy"
 	"github.com/noomesh/noomesh/node-agent-go/internal/reconcile"
 	"github.com/noomesh/noomesh/node-agent-go/internal/tracing"
@@ -436,6 +437,10 @@ func (a *Agent) Run() error {
 	a.hb.SetModelSets(rec.ModelSetsReport)
 	a.hb.SetModelSetsFreeBytes(rec.ModelSetsFreeBytes)
 	a.hb.SetOllamaVerify(rec.OllamaVerifyReport)
+	a.hb.SetNodeLocal(nodelocal.Current)
+	if a.docker != nil {
+		a.hb.SetBackendCaps(dockerpkg.BackendCapsReport)
+	}
 	a.hb.SetNodeFacts(rec.NodeFacts)
 	if mc := rec.NodeWorkloadControl(); mc != nil {
 		a.server.SetManagedWorkloads(mc)

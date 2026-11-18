@@ -7479,6 +7479,21 @@ mod first_model_probe_tests {
         assert!(!probe_error_is_unverifiable("model 'x' is not served by any node; the only chat backend is the Ollama"));
     }
 
+    /// Onboard's pull writes the controller's record of itself: the registry
+    /// manifest is fetched before `ollama pull`, and recorded only after a
+    /// pull that succeeded, against the container that pulled.
+    #[test]
+    fn the_onboard_pull_records_itself_in_the_controller_store() {
+        let src = crate::test_src::own_code(include_str!("steps.rs"));
+        let pull = crate::test_src::fn_body(&src, "fn pull_ollama(");
+        let before = pull.find("ollama_stage::record_before_pull(").expect("the manifest is fetched before the pull");
+        let run = pull.find("cmd.args([\"exec\", target, \"ollama\", \"pull\", model]);").expect("the pull");
+        let ok = pull.find("if code == 0 {").expect("the success branch");
+        let after = pull.find("ollama_stage::record_after_pull(pending,").expect("the record is written after the pull");
+        assert!(before < run && run < ok && ok < after, "fetch, pull, then record on success");
+        assert!(pull[after..].contains("read_container_manifest(target, r)"), "the record compares with the container that pulled");
+    }
+
     #[test]
     fn the_model_step_verifies_after_the_pull() {
         let src = include_str!("steps.rs");
@@ -7677,12 +7692,30 @@ fn pull_ollama(ctx: &mut Ctx, model: &str) {
     // the launcher's pre-pull fetches the RIGHT model on next start even
     // when this pull fails.
     ctx.update_env("OLLAMA_MODEL", model);
+    // The registry's manifest, fetched before the pull: the controller's
+    // record of it is written after, only if the pull installed exactly it
+    // (commands/ollama_stage.rs, "The record of a pull"). An hf.co/ ref has
+    // none.
+    let pending = crate::commands::ollama_stage::record_before_pull(
+        &crate::commands::ollama_stage::registry_base(),
+        model,
+        Path::new(&crate::commands::models_fetch::store_dir_from(
+            Some(ctx.read_env("MODELS_DIR").as_str()),
+            Some(ctx.read_env("NOO_DATA_ROOT").as_str()),
+        )),
+    );
     // Stream pull output live (inherited stdio on the console; forwarded
     // Line events when the TUI owns the terminal).
     let mut cmd = Command::new("docker");
     cmd.args(["exec", target, "ollama", "pull", model]);
     let code = sh::stream_status(ctx, cmd);
     if code == 0 {
+        let record = crate::commands::ollama_stage::record_after_pull(pending, |r| {
+            crate::commands::ollama_stage::read_container_manifest(target, r)
+        });
+        if let Some(line) = record.line() {
+            if record.written() { ctx.info(&line) } else { ctx.warn(&line) }
+        }
         // Record the choice where the LAUNCHER reads it (finding #70): the
         // start script pulls "${OLLAMA_MODEL:-gemma4:e2b}" on every stack
         // start when SOME model already exists there, otherwise skips the

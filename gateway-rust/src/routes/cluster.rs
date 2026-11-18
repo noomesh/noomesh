@@ -712,6 +712,8 @@ async fn node_heartbeat(
     // with the root a bundle would render before staging; `verify`'s
     // `data root` row reads it. Replaced whole on every beat.
     carry_reported(&mut data, &body, "data_roots");
+    carry_reported(&mut data, &body, "node_local");
+    carry_reported(&mut data, &body, "backend_caps");
     // Legacy credential lanes the agent admitted since it started
     // `{since_unix, static_token, cluster_hmac_v1_refused}`.
     // `noo cluster verify --controller`'s `legacy lanes` row reads it.
@@ -1287,6 +1289,8 @@ async fn node_register_body(
     // And the data roots, or a re-registration hides the
     // root the node runs on from provision until the next beat.
     carry_reported(&mut data, &body, "data_roots");
+    carry_reported(&mut data, &body, "node_local");
+    carry_reported(&mut data, &body, "backend_caps");
     // And the legacy-lane counts.
     carry_reported(&mut data, &body, "legacy_lanes");
     // And the last model bench (the harness profile's measured speed).
@@ -9847,5 +9851,29 @@ mod agent_url_tests {
         let own = crate::test_src::own_code(include_str!("cluster.rs"));
         assert!(own.contains("apply_agent_url(&mut data, body.get(\"agent_url\").and_then(|v| v.as_str()), &node_id);"), "the heartbeat stores agent_url through apply_agent_url");
         assert!(!own.contains("data[\"agent_url\"] = v.clone()"), "no unchecked copy of agent_url");
+    }
+}
+
+#[cfg(test)]
+mod backend_caps_carry_tests {
+    /// A node's `backend_caps` (its backend containers' capability set and
+    /// what it refused) is carried onto the record by both the heartbeat and
+    /// the registration, as `data_roots` is, so `noo cluster verify` can read it.
+    #[test]
+    fn both_beats_carry_backend_caps_onto_the_record() {
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        assert_eq!(own.matches("carry_reported(&mut data, &body, \"backend_caps\");").count(), 2, "heartbeat and registration both carry it");
+    }
+}
+
+#[cfg(test)]
+mod node_local_carry_tests {
+    /// A node's `node_local` report (its own declarations file: what it
+    /// declares and what it refused) is carried onto the record by both the
+    /// heartbeat and the registration, so `noo cluster verify` can list it.
+    #[test]
+    fn both_beats_carry_node_local_onto_the_record() {
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        assert_eq!(own.matches("carry_reported(&mut data, &body, \"node_local\");").count(), 2);
     }
 }

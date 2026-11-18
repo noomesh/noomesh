@@ -58,7 +58,6 @@
 //! volume and the operator event stream); `verify` compares the two. The verifier also holds the same key as the writers, so it proves
 //! the log is intact, not who held the key.
 
-use chrono::{DateTime, Utc};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::Serialize;
 use sha2::Sha256;
@@ -217,7 +216,7 @@ pub(crate) async fn insert_in_tx(
         entry_key,
         &RowV2 {
             id: &id,
-            ts_us: ts.timestamp_micros(),
+            ts_us: ts.as_microsecond(),
             event_type: row.event_type,
             severity: row.severity,
             actor: row.actor,
@@ -272,6 +271,13 @@ pub(crate) async fn write_row(
     Ok(seq)
 }
 
+/// 00:00 UTC on the first of `month` in `year`: a monthly partition's
+/// bound. `None` for a month or year no calendar has.
+fn month_start(year: i32, month: u32) -> Option<jiff::Timestamp> {
+    let d = jiff::civil::Date::new(i16::try_from(year).ok()?, i8::try_from(month).ok()?, 1).ok()?;
+    jiff::tz::TimeZone::UTC.to_timestamp(d.to_datetime(jiff::civil::Time::midnight())).ok()
+}
+
 /// Retention step: record, signed and chained, that `year`-`month`'s partition
 /// is about to be dropped. Names the partition's chained seq range and the
 /// `chain_hash` of its last row; the verifier then reads that gap as retention
@@ -283,16 +289,12 @@ pub(crate) async fn write_row(
 /// tail, database error) and the caller MUST NOT drop. Called by
 /// `audit_partition::rotate` after the export verifies and before the drop.
 pub(crate) async fn record_retention_checkpoint(db: &sqlx::PgPool, year: i32, month: u32) -> Result<bool, String> {
-    use chrono::TimeZone as _;
     let Some(key) = crate::audit_integrity::current_key() else {
         return Err("no NOO_AUDIT_HMAC_KEY: cannot sign the retention checkpoint".into());
     };
-    let start = Utc
-        .with_ymd_and_hms(year, month, 1, 0, 0, 0)
-        .single()
-        .ok_or_else(|| format!("bad partition {year}-{month}"))?;
+    let start = month_start(year, month).ok_or_else(|| format!("bad partition {year}-{month}"))?;
     let (ny, nm) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
-    let end = Utc.with_ymd_and_hms(ny, nm, 1, 0, 0, 0).single().ok_or_else(|| "bad partition end".to_string())?;
+    let end = month_start(ny, nm).ok_or_else(|| "bad partition end".to_string())?;
     let e = |what: &str, err: sqlx::Error| format!("retention checkpoint {year}-{month:02}: {what}: {err}");
 
     let mut tx = db.begin().await.map_err(|x| e("begin", x))?;
@@ -399,10 +401,10 @@ async fn try_genesis(db: &sqlx::PgPool, key: &[u8]) -> Result<GenesisOutcome, sq
     if fetch_tail(&mut tx).await?.is_some() {
         return Ok(GenesisOutcome::AlreadyPresent);
     }
-    let legacy: Vec<(String, DateTime<Utc>, Option<String>)> =
+    let legacy: Vec<(String, jiff::Timestamp, Option<String>)> =
         crate::repo::audit::unchained(&mut *tx).await?;
     let digest_rows: Vec<(i64, String, Option<String>)> =
-        legacy.into_iter().map(|(id, t, h)| (t.timestamp_micros(), id, h)).collect();
+        legacy.into_iter().map(|(id, t, h)| (t.as_microsecond(), id, h)).collect();
     let genesis = Genesis {
         legacy_rows: digest_rows.len() as u64,
         legacy_through_us: digest_rows.iter().map(|r| r.0).max().unwrap_or(0),
@@ -711,6 +713,16 @@ pub fn verify(rows: &[AuditRow], key: Option<&[u8]>, r: &mut Report) {
 mod tests {
     use super::*;
     use crate::audit_integrity::{row_hash_v2, Keys, RowV2};
+
+    #[test]
+    fn a_partition_spans_whole_utc_months() {
+        let at = |s: &str| s.parse::<jiff::Timestamp>().unwrap();
+        assert_eq!(month_start(2026, 6), Some(at("2026-06-01T00:00:00Z")));
+        assert_eq!(month_start(2026, 12), Some(at("2026-12-01T00:00:00Z")));
+        assert_eq!(month_start(2027, 1), Some(at("2027-01-01T00:00:00Z")), "December's end is the next January");
+        assert_eq!(month_start(2026, 13), None);
+        assert_eq!(month_start(2026, 0), None);
+    }
 
     const KEY: &[u8] = b"chain-test-key";
 
