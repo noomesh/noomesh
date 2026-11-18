@@ -3032,7 +3032,15 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
     if drew_wait {
         ui::clear_line();
     }
-    for n in &names {
+    // i949: two nodes callers fail over between (a model class, an embedding
+    // space) are never restarting together. The groups are read once, before
+    // anything is staged; the rail is staged in an order that keeps a pair
+    // apart, and each staging first waits (bounded) for every earlier-staged
+    // node sharing a group with it to apply and be offered again.
+    let me = local_agent_node(&names);
+    let mut stagger = super::roll_stagger::Stagger::start(g, &names, me.as_deref());
+    let rail_order: Vec<String> = stagger.order.iter().filter(|n| Some(n.as_str()) != me.as_deref()).cloned().collect();
+    for n in &rail_order {
         if let Some((_, why)) = skipped.iter().find(|(s, _)| s == n) {
             ui::blank();
             ui::say(&ui::item(n));
@@ -3050,6 +3058,7 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
         // A node that needs the applier first gets ONLY that bundle now;
         // the combined wait restages the full one when it is in.
         let applier_first = super::provision::applier_first_for(g, n);
+        stagger.before(g, n);
         // `--stage-only`: stage and poke, return at once. The apply is
         // waited for below, for every node together, so one slow node no
         // longer holds up staging the rest.
@@ -3064,7 +3073,11 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
         // has no sha the node cannot be waited on and is reported failed
         // here instead of silently counted as staged.
         match super::provision::staged_sha_of(g, n) {
-            Some(sha) => pending.push(super::provision::PendingApply { node: n.clone(), sha, legacy, applier_first }),
+            Some(sha) => {
+                let p = super::provision::PendingApply { node: n.clone(), sha, legacy, applier_first };
+                stagger.staged(&p);
+                pending.push(p);
+            }
             None => {
                 ui::say_err(&ui::sub(&ui::status_line(Glyph::Err,
                     &format!("{n}: staged, but the gateway reports no staged bundle to wait on"))));
@@ -3077,17 +3090,23 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
     // --stage-only like the rest and waited for in the combined wait below,
     // where its own post-apply steps (lane record, controller hostd restart)
     // run through `after_self_applied`.
-    let me = local_agent_node(&names);
     if let Some(me) = &me {
         // The child prints its own `ui::item` label, as the rail nodes do.
         ui::blank();
+        stagger.before(g, me);
         upgrade_self_node(g, me, &mut failed, &mut pending);
     }
     let waited = if pending.is_empty() { Vec::new() } else { wait_and_settle_nodes(g, &pending, me.as_deref(), &mut failed) };
     // One line per node, whatever the others did (0.6.21: "stopped at the
     // nodes stage" hid that pop-os upgraded fine beside a failed node).
-    let order: Vec<String> = names.iter().cloned().chain(me.clone()).collect();
+    let order: Vec<String> = rail_order.iter().cloned().chain(me.clone()).collect();
     print_node_outcomes(g, &node_outcome_rows(&order, &skipped, &waited, &failed));
+    if g.json && !stagger.json.is_empty() {
+        println!("{}", serde_json::json!({"stagger": stagger.json}));
+    }
+    for line in &stagger.notes {
+        ui::say(&ui::status_line(Glyph::Warn, line));
+    }
     // A node whose first staging failed is already in `failed`; waiting
     // for it to apply a bundle it never got would only burn the budget.
     let waiting: Vec<String> = leafless.into_iter()
