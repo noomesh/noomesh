@@ -105,7 +105,11 @@ func (c *Client) importMirror(ctx context.Context, name string, r mirrorRef, gm 
 
 	var deps mirrorDeps
 	var via, base string
-	if _, ok := ollamaBinary(); ok {
+	_, host, pathErr := c.ollamaImportHost(ctx)
+	if pathErr != nil {
+		return nil, pathErr
+	}
+	if host {
 		via, base = "host", nativeOllamaBase()
 		modelsDir := nativeOllamaModelsDir()
 		deps.writeManifest = func(_ context.Context, ns, n, tag string, b []byte) (*manifestWrite, error) {
@@ -118,13 +122,13 @@ func (c *Client) importMirror(ctx context.Context, name string, r mirrorRef, gm 
 		}
 		if !c.isRunning(ctx, OllamaContainer) {
 			return nil, fmt.Errorf(
-				"no `ollama` binary on this node and the %s container is not running — start it (`noo cluster start-backend %s ollama`) or install ollama, then re-run",
+				"the %s container is not running and the import goes only to it on this node — start it (`noo cluster start-backend %s ollama`), then re-run",
 				OllamaContainer, os.Getenv("NODE_ID"))
 		}
 		if strings.TrimSpace(os.Getenv("OLLAMA_URL")) != "" {
 			// The blobs would go to the daemon at OLLAMA_URL and the manifest
 			// into the container's store: two ollamas, one half each.
-			return nil, fmt.Errorf("OLLAMA_URL is set (%s) but this node has no host ollama, so the import would write into %s while pushing to that URL — unset OLLAMA_URL or install ollama on the host",
+			return nil, fmt.Errorf("OLLAMA_URL is set (%s) but the import goes to the container on this node, so it would write into %s while pushing to that URL — unset OLLAMA_URL or install ollama on the host",
 				os.Getenv("OLLAMA_URL"), OllamaContainer)
 		}
 		via, base = "container", c.BackendDialURL(ctx, "ollama")
