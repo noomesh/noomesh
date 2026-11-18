@@ -681,7 +681,7 @@ return 1
 "#;
 
 async fn cas_flip(redis: &RedisCache, job_id: &str, expect_status: &str, expect_updated: &str, reason: &str) -> bool {
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = crate::wire_time::rfc3339_offset(jiff::Timestamp::now());
     redis
         .eval_i64(
             FLIP_SCRIPT,
@@ -754,7 +754,7 @@ pub async fn submit(
     if let Err(why) = &probe {
         tracing::warn!(model = %target.model, error = %why, "embed_jobs.queue_probe_failed — running the batch in the gateway");
     }
-    let now_unix = chrono::Utc::now().timestamp();
+    let now_unix = jiff::Timestamp::now().as_second();
     match decide(&probe, now_unix) {
         Decision::TooBusy { pending } => Err(SubmitError::Busy {
             retry_after_secs: BUSY_RETRY_AFTER_SECS,
@@ -769,7 +769,7 @@ pub async fn submit(
                 return Err(unavailable_for(&target));
             }
             let job_id = uuid::Uuid::new_v4().to_string();
-            let now = chrono::Utc::now().to_rfc3339();
+            let now = crate::wire_time::rfc3339_offset(jiff::Timestamp::now());
             let job = NewJob { id: &job_id, target: &target, slug: &sl, n, owner, path: JobPath::Push, now: &now };
             if !create_job(redis, &job).await {
                 return Err(SubmitError::Unavailable("could not record the job".into()));
@@ -784,7 +784,7 @@ pub async fn submit(
         }
         Decision::Pull => {
             let job_id = uuid::Uuid::new_v4().to_string();
-            let now = chrono::Utc::now().to_rfc3339();
+            let now = crate::wire_time::rfc3339_offset(jiff::Timestamp::now());
             // The text first, then the job, then the message: a worker can
             // ack the moment the message lands, and an event about a job the
             // gateway has not written yet is ignored.
@@ -948,7 +948,7 @@ async fn run_push(state: &Arc<AppState>, job_id: &str, t: &Target, texts: &[Stri
 /// Mark the job as alive now, for [`verdict`]'s stale rule.
 async fn touch(state: &AppState, job_id: &str) {
     if let Some(redis) = state.redis.as_ref() {
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = crate::wire_time::rfc3339_offset(jiff::Timestamp::now());
         redis.hset(&format!("{JOB_KEY_PREFIX}{job_id}"), &[("updated_at", now.as_str())]).await;
     }
 }
@@ -1744,7 +1744,7 @@ mod tests {
     }
 
     fn judge(j: &HashMap<String, String>, queue: Option<QueueInfo>) -> Verdict {
-        verdict(j, chrono::Utc::now(), queue.as_ref(), chrono::Utc::now().timestamp())
+        verdict(j, chrono::Utc::now(), queue.as_ref(), jiff::Timestamp::now().as_second())
     }
 
     #[test]

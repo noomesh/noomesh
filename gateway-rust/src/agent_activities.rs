@@ -218,7 +218,7 @@ pub async fn complete_activity(
     }
     let note_entry = final_note.map(|n| {
         json!({
-            "at": Utc::now().to_rfc3339(),
+            "at": crate::wire_time::rfc3339_offset(jiff::Timestamp::now()),
             "kind": "final",
             "summary": n,
         })

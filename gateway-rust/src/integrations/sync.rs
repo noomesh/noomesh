@@ -314,7 +314,7 @@ pub(crate) async fn page(
             lookback_days,
         } => {
             if initial {
-                c.before = chrono::Utc::now().timestamp() + 1;
+                c.before = jiff::Timestamp::now().as_second() + 1;
             }
             let after = c.before - i64::from(*lookback_days) * 86400;
             if !c.fetching {

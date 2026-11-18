@@ -115,7 +115,7 @@ pub async fn active(js: &async_nats::jetstream::Context, now: i64) -> Vec<Mainte
 }
 
 fn now_secs() -> i64 {
-    chrono::Utc::now().timestamp()
+    jiff::Timestamp::now().as_second()
 }
 
 /// PUT /api/cluster/nodes/{node_id}/maintenance — body `{reason, until_secs?}`.

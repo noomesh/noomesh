@@ -146,7 +146,7 @@ fn ops_event_payload(alert: &OperatorAlert, reference: &str, message: &str, outc
         "detail": alert.detail,
         "ref": reference,
         "outcome": outcome,
-        "ts": chrono::Utc::now().to_rfc3339(),
+        "ts": crate::wire_time::rfc3339_offset(jiff::Timestamp::now()),
     })
 }
 
@@ -390,7 +390,7 @@ pub async fn open_conditions(state: &AppState) -> Vec<PersistState> {
 }
 
 fn unix_now() -> i64 {
-    chrono::Utc::now().timestamp()
+    jiff::Timestamp::now().as_second()
 }
 
 async fn target_muted(state: &AppState, target: &str, now: i64) -> bool {

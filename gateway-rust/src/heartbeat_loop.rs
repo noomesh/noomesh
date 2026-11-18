@@ -788,7 +788,7 @@ pub async fn execute_task(state: Arc<AppState>, task_id: &str) -> Result<(), Str
     if let Some(activity_id_str) = config.get("activity_id").and_then(|v| v.as_str()) {
         if let Ok(activity_uuid) = uuid::Uuid::parse_str(activity_id_str) {
             let entry = serde_json::json!({
-                "at": Utc::now().to_rfc3339(),
+                "at": crate::wire_time::rfc3339_offset(jiff::Timestamp::now()),
                 "kind": if status == "success" { "task_completed" } else { "task_failed" },
                 "summary": format!(
                     "Task '{}' ({}) {} in {}ms",
@@ -907,7 +907,7 @@ async fn delegate_to_python(
         task_id: task_id.to_string(),
         task_name: task_name.to_string(),
         action: action.to_string(),
-        dispatched_at: chrono::Utc::now().timestamp(),
+        dispatched_at: jiff::Timestamp::now().as_second(),
     };
     crate::heartbeat_reconcile::record_dispatch(state, &dispatch).await;
 

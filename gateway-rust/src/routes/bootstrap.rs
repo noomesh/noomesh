@@ -1604,7 +1604,7 @@ async fn check_birth_proof(
 ) -> Result<(), AppError> {
     let header = headers.get(BIRTH_PROOF_HEADER).and_then(|v| v.to_str().ok());
     let cert = birth_cert_for(db, node).await?;
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
     crate::birth_proof::verify(header, purpose, node, sha, cert.as_deref(), now).map_err(|e| {
         tracing::warn!(node = %node, reason = ?e, "bundle_pull_write_proof_rejected");
         AppError::Forbidden(e.message(node))

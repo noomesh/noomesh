@@ -1108,7 +1108,7 @@ pub(crate) async fn write_audit_row_outcome(
 
 /// Now, as `timestamptz` will store it: whole microseconds.
 pub(crate) fn stored_now() -> chrono::DateTime<chrono::Utc> {
-    let us = chrono::Utc::now().timestamp_micros();
+    let us = jiff::Timestamp::now().as_microsecond();
     chrono::DateTime::from_timestamp_micros(us).expect("now is in range")
 }
 

@@ -383,7 +383,7 @@ async fn publish(state: &AppState, head: &SignedHead) {
         "detail": serde_json::to_string(head).unwrap_or_default(),
         "ref": crate::egress::new_ref(),
         "outcome": "recorded",
-        "ts": chrono::Utc::now().to_rfc3339(),
+        "ts": crate::wire_time::rfc3339_offset(jiff::Timestamp::now()),
     });
     if let Ok(bytes) = serde_json::to_vec(&payload) {
         if let Err(e) = state.js.publish(format!("events.ops.{EVENT_KIND}"), bytes.into()).await {
