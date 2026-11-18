@@ -785,8 +785,8 @@ type RowTuple = crate::repo::audit::VerifyRow;
 fn to_row(t: RowTuple) -> AuditRow {
     AuditRow {
         id: t.0,
-        timestamp: t.1.to_rfc3339(),
-        ts_us: t.1.timestamp_micros(),
+        timestamp: crate::wire_time::rfc3339_offset(t.1.to_jiff()),
+        ts_us: t.1.to_jiff().as_microsecond(),
         event_type: t.2,
         severity: t.3,
         actor: t.4,
@@ -1756,7 +1756,7 @@ mod tests {
                 let id = uuid::Uuid::new_v4().to_string();
                 assert!(
                     crate::audit::insert_signed_audit_row(
-                        &db, &id, chrono::Utc::now(), et, "info", "proof", "gateway", "ok", "{}",
+                        &db, &id, crate::audit::stored_now(), et, "info", "proof", "gateway", "ok", "{}",
                         None, &h, None
                     )
                     .await
