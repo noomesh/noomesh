@@ -1549,6 +1549,12 @@ whitespace, `%`, quotes or backslash), and never `/`, a system tree (`/etc`,
 again after symlinks are resolved. One bad value leaves the installed drop-in
 as it was and the applier's line says `agent-protect=REFUSED:<KEY>`.
 
+`noo cluster verify` shows the hold as the `agent protect` row, from each
+node's last apply: OK names every held node and how many paths it leaves
+writable; a refusal is a FAIL naming the node and the setting, with the
+`noo cluster set-config` that fixes it. A host without systemd (a Mac) has no
+hold and no row.
+
 ## What is still root
 
 `noo-hostd` is root on the node, and deliberately so: it has no listener, it

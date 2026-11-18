@@ -163,14 +163,14 @@ def test_a_normal_agent_env_renders_the_golden_drop_in(node: Node) -> None:
     )
     assert stat.S_IMODE(node.dropin.stat().st_mode) == 0o644
     assert node.calls() == ["systemctl daemon-reload"]
-    assert out(r, "RESTART") == "1" and out(r, "APPLIED").split() == ["agent-protect"]
+    assert out(r, "RESTART") == "1" and out(r, "APPLIED").split() == [f"agent-protect={len(rw_paths(node))}"]
 
 
 def test_unchanged_on_a_second_apply_no_rewrite_no_reload_no_restart(node: Node) -> None:
     before = installed(node)
     st = node.dropin.stat()
     r = node.run()
-    assert out(r, "RESTART") == "0" and out(r, "APPLIED") == ""
+    assert out(r, "RESTART") == "0" and out(r, "APPLIED").split() == [f"agent-protect=unchanged:{len(rw_paths(node))}"]
     assert node.calls() == []
     assert node.dropin.read_bytes() == before
     st2 = node.dropin.stat()
@@ -383,6 +383,7 @@ def test_a_host_without_systemd_gets_no_drop_in_and_no_reload(node: Node) -> Non
     assert out(r, "RESTART") == "0"
     assert not node.dropin.exists()
     assert not [c for c in node.calls() if "daemon-reload" in c]
+    assert "agent-protect" not in out(r, "APPLIED"), "no systemd: no claim on the applied line"
 
 
 # ── the real kernel-side proof (root + systemd as PID 1: CI's hosted runner) ──
