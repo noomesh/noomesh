@@ -84,10 +84,13 @@ func TestNoSpaceRefusesBeforeAnyFetch(t *testing.T) {
 	if got := atomic.LoadInt64(requests); got != 0 {
 		t.Fatalf("the store was asked %d time(s): a shortfall must refuse before the fetch", got)
 	}
-	for _, want := range []string{noSpacePrefix, staging, "100 MiB free", "docker image prune -f", "--on cpu"} {
+	for _, want := range []string{noSpacePrefix, staging, "100 MiB free", "noo autonomy decisions -l disk_watermark", "noo autonomy live disk_watermark", "--on cpu"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the refusal does not name %q: %v", want, err)
 		}
+	}
+	if strings.Contains(err.Error(), "docker image prune") {
+		t.Errorf("the remedy must be noo's reclaim, not a raw docker command: %v", err)
 	}
 }
 
