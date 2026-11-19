@@ -28,7 +28,7 @@ func clearImageEnv(t *testing.T) {
 func TestBackendSpecDefaultsAreVersioned(t *testing.T) {
 	clearImageEnv(t)
 	for _, name := range []string{"vllm", "ollama", "embedding"} {
-		ref := pickBackendImage(backendSpecs[name], "")
+		ref := pickBackendImage(backendSpecs[name], "", !hasNvidiaGPU())
 		if isFloatingRef(ref) {
 			t.Errorf("%s default image %q floats", name, ref)
 		}
@@ -42,21 +42,21 @@ func TestChooseBackendImagePolicy(t *testing.T) {
 	t.Run("floating override refused everywhere", func(t *testing.T) {
 		clearImageEnv(t)
 		for _, ref := range []string{"vllm/vllm-openai:latest", "vllm/vllm-openai", "docker.io/vllm/vllm-openai"} {
-			if _, err := chooseBackendImage("vllm", spec, ref); err == nil || !strings.Contains(err.Error(), "floating") {
+			if _, err := chooseBackendImage("vllm", spec, ref, ""); err == nil || !strings.Contains(err.Error(), "floating") {
 				t.Errorf("%q: want a floating-image refusal, got %v", ref, err)
 			}
 		}
 	})
 	t.Run("every node strips the digest and forbids the registry", func(t *testing.T) {
 		clearImageEnv(t)
-		ch, err := chooseBackendImage("vllm", spec, pinned)
+		ch, err := chooseBackendImage("vllm", spec, pinned, "")
 		if err != nil || ch.Ref != "vllm/vllm-openai:v0.25.0" || !ch.RailOnly {
 			t.Fatalf("got %+v, %v", ch, err)
 		}
 	})
 	t.Run("old controller: a node may run its default only from the rail", func(t *testing.T) {
 		clearImageEnv(t)
-		ch, err := chooseBackendImage("vllm", spec, "")
+		ch, err := chooseBackendImage("vllm", spec, "", "")
 		if err != nil || !ch.RailOnly || ch.Ref != "vllm/vllm-openai:v0.25.0" {
 			t.Fatalf("got %+v, %v", ch, err)
 		}
@@ -64,7 +64,7 @@ func TestChooseBackendImagePolicy(t *testing.T) {
 	t.Run("our own local build names are exempt", func(t *testing.T) {
 		clearImageEnv(t)
 		t.Setenv("NOO_IMAGE_PREFIX", "ghcr.io/noomesh")
-		if _, err := chooseBackendImage("airllm", backendSpecs["airllm"], ""); err != nil {
+		if _, err := chooseBackendImage("airllm", backendSpecs["airllm"], "", ""); err != nil {
 			t.Fatalf("airllm local build: %v", err)
 		}
 	})
@@ -74,7 +74,7 @@ func TestChooseBackendImagePolicy(t *testing.T) {
 func TestPrefetchRefIsTheStartRef(t *testing.T) {
 	clearImageEnv(t)
 	override := "vllm/vllm-openai:v0.25.0" + pinDigest
-	pre := BackendImageRef("vllm", override)
+	pre := BackendImageRef("vllm", override, "")
 
 	asked := recordEnsure(t)
 	c := &Client{}
@@ -86,7 +86,7 @@ func TestPrefetchRefIsTheStartRef(t *testing.T) {
 		t.Fatalf("prefetch %q != start %q", pre, (*asked)[0])
 	}
 	// a ref the policy refuses is not prefetched, and the start refuses it
-	if got := BackendImageRef("vllm", "vllm/vllm-openai:latest"); got != "" {
+	if got := BackendImageRef("vllm", "vllm/vllm-openai:latest", ""); got != "" {
 		t.Fatalf("prefetch of a refused ref = %q", got)
 	}
 }

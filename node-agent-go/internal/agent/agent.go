@@ -237,9 +237,10 @@ func New(cfg *config.Config) (*Agent, error) {
 	// (returns nil), which keeps the containerised path byte-identical. It
 	// also wraps http.DefaultTransport, covering the bare clients in the
 	// tree; the shared transport and the api proxies adopt the same dialer.
+	// Every other backend-dialing transport reads the same dialer through
+	// containerdial.ApplyDial.
 	if dial := containerdial.Install(docker); dial != nil {
-		transport.DialContext = dial
-		api.BackendDialContext = dial
+		containerdial.ApplyDial(transport)
 		slog.Info("host-mode container dialer installed — backend names resolve via docker inspect")
 	}
 
@@ -440,6 +441,7 @@ func (a *Agent) Run() error {
 	a.hb.SetNodeLocal(nodelocal.Current)
 	if a.docker != nil {
 		a.hb.SetBackendCaps(dockerpkg.BackendCapsReport)
+		a.hb.SetLlamacppOffload(dockerpkg.LlamacppOffloadReport)
 	}
 	a.hb.SetNodeFacts(rec.NodeFacts)
 	if mc := rec.NodeWorkloadControl(); mc != nil {

@@ -4,27 +4,32 @@
 # Daily build of the infra images, OUTSIDE the release (noomesh-internal i567).
 #
 # llamacpp (llama-server compiled from source, arm64 under QEMU: ~60 min),
-# ollama, stunnel, postgres-pgvector, whisper, piper and nvidia-exporter carry
+# llamacpp-cuda (the same, CUDA 12.9, amd64 only), ollama, stunnel, postgres-pgvector, whisper, piper and nvidia-exporter carry
 # no noomesh source and change a few times a quarter, yet every new version's
-# rc.1 rebuilt them. Here they are built once a day from dev, which also picks
-# up the day's apt/apk/pip security updates, then:
+# rc.1 rebuilt them. Here they are built once a day from dev, on the day's
+# refreshed base images (TODAY'S BASES below: a rebuild alone takes no distro
+# fix, every FROM is pinned by digest), then:
 #
 #   1. pushed ONLY to an immutable `:staged-YYYYMMDD-<run>` tag, labelled with
 #      the content fingerprint (scripts/infra-staged.py) and the build time;
 #   2. scanned with Trivy (the version ci.yml's security-scan pins), fixable
 #      HIGH/CRITICAL, every platform; the current `:staged` is scanned with the
-#      SAME database in the same run;
+#      SAME database in the same run (scripts/infra-scan.sh, which the
+#      release's fallback build runs too);
 #   3. promoted to `:staged` only when the new build has no fixable
 #      HIGH/CRITICAL finding that the current :staged lacks. Gating on "new",
-#      not on zero: the Dockerfiles do not `apt-get upgrade`, so a fixable
-#      finding in a digest-pinned base layer stays until
+#      not on zero: the Dockerfiles do not `apt-get upgrade` (one exception:
+#      llamacpp-cuda's runtime stage takes noble-security, its Dockerfile says
+#      why), so a fixable finding in a digest-pinned base layer stays until
 #      refresh-image-digests.yml moves the pin; a zero gate would freeze
 #      :staged for good.
 #
 # A failed build or scan, or a new finding, leaves the previous :staged where
 # it is and turns the run red. The release refuses a :staged older than 3 days
-# and builds the image itself (loudly), so a broken daily job costs release
-# minutes, never a stale or unscanned image.
+# and builds the image itself (loudly), then scans that build with this same
+# script and gate against the current :staged, before its digest reaches the
+# signed lock (images-release.yml "Scan … as infra-staged does"); so a broken
+# daily job costs release minutes, never a stale or unscanned image.
 #
 # The build arguments come from the images-release.yml matrix
 # (`infra-staged.py matrix`), so the staged image is built exactly as the
@@ -182,66 +187,18 @@ jobs:
           [ -n "$d" ] || { echo "::error::$REF:$DATE_TAG does not resolve after the push"; exit 1; }
           echo "DIGEST=$d" >> "$GITHUB_ENV"
 
-      # Same pinned, checksum-verified install as ci.yml's security-scan.
+      # Same pinned, checksum-verified install as ci.yml's security-scan; the
+      # pin lives in scripts/infra-scan.sh alone.
       - name: Install Trivy (pinned, checksum-verified)
-        env:
-          TRIVY_VERSION: "0.70.0"
-          TRIVY_SHA256: "8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9"
-        run: |
-          dir="$RUNNER_TEMP/trivy-bin"
-          mkdir -p "$dir"
-          curl -fsSL --retry 3 -o "$dir/trivy.tgz" \
-            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
-          echo "${TRIVY_SHA256}  $dir/trivy.tgz" | sha256sum -c -
-          tar -xzf "$dir/trivy.tgz" -C "$dir" trivy
-          rm -f "$dir/trivy.tgz"
-          echo "$dir" >> "$GITHUB_PATH"
-          "$dir/trivy" --version
+        run: scripts/infra-scan.sh install-trivy
 
       # Every platform of the new build, and of the current :staged, against
       # ONE vulnerability database (downloaded once, then --skip-db-update).
       - name: Scan the new build and the current :staged
-        run: |
-          set -eu
-          mkdir -p scan/new scan/old
-          trivy image --download-db-only
-          old="$(docker buildx imagetools inspect "$REF:staged" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"' || true)"
-          echo "OLD_DIGEST=$old" >> "$GITHUB_ENV"
-          # The platforms the current staged copy HAS. A platform the new build
-          # adds (the whisper/piper staged copies were amd64-only, 2026-11-11) has no
-          # old copy to scan: Trivy failed the whole job on it, so the staged
-          # copy never moved. Now it is simply not scanned on the old side, and the
-          # gate counts every finding on it as new.
-          old_platforms=""
-          if [ -n "$old" ]; then
-            old_platforms="$(docker buildx imagetools inspect --raw "$REF@$old" | python3 scripts/infra-staged.py platforms)"
-            echo "current staged copy platforms: ${old_platforms:-none}"
-          fi
-          for p in $(echo "${{ matrix.platforms }}" | tr ',' ' '); do
-            n="$(echo "$p" | tr '/' '-')"
-            trivy image --skip-db-update --image-src remote --platform "$p" \
-              --severity HIGH,CRITICAL --ignore-unfixed --format json \
-              -o "scan/new/$n.json" "$REF@$DIGEST"
-            if [ -n "$old" ] && case " $old_platforms " in *" $p "*) true ;; *) false ;; esac; then
-              trivy image --skip-db-update --image-src remote --platform "$p" \
-                --severity HIGH,CRITICAL --ignore-unfixed --format json \
-                -o "scan/old/$n.json" "$REF@$old"
-            fi
-          done
+        run: scripts/infra-scan.sh scan "$REF" "$DIGEST" "${{ matrix.platforms }}"
 
       - name: Gate — no fixable HIGH/CRITICAL the current :staged lacks
-        run: |
-          # pipefail: without it `| tee` would turn the gate's exit 1 into 0.
-          set -euo pipefail
-          if [ -n "$OLD_DIGEST" ]; then
-            # Only the platforms the current staged copy has (maybe none of the
-            # new ones): a missing one is gated in full, never skipped.
-            shopt -s nullglob
-            olds=(scan/old/*.json)
-            python3 scripts/infra-staged.py new-findings --new scan/new/*.json --old "${olds[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
-          else
-            python3 scripts/infra-staged.py new-findings --new scan/new/*.json | tee -a "$GITHUB_STEP_SUMMARY"
-          fi
+        run: scripts/infra-scan.sh gate
 
       - name: Promote to :staged
         env:
@@ -260,3 +217,32 @@ jobs:
             echo "::error::$REF:staged is $now after promoting $DIGEST"; exit 1
           fi
           echo "| ${{ matrix.image }} | \`$DATE_TAG\` | \`$DIGEST\` | \`$FP\` | replaces \`${OLD_DIGEST:-none}\` |" >> "$GITHUB_STEP_SUMMARY"
+
+  # i1042: four red nights (2026-11-15..18) went unnoticed: GitHub mails a
+  # scheduled run's failure only to whoever last edited the cron line. The
+  # SECOND consecutive failed run opens one `infra-staged-red` issue (later
+  # ones comment on it); a green run closes it. Never on a pull_request or any
+  # event a fork can trigger, and the issue write is granted to this job only.
+  # The repository is public: the script puts only image names, CVE/GHSA ids,
+  # package names, :staged ages and the run URL in the issue.
+  red-issue:
+    name: second red run opens an issue, a green run closes it
+    needs: [matrix, stage]
+    if: always() && github.repository == 'noomesh/noomesh' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read   # the checkout
+      actions: read    # this run's jobs and logs, the previous scheduled runs
+      issues: write    # the infra-staged-red label and issue
+    steps:
+      - name: Checkout   # actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Open, update or close the infra-staged-red issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          NEEDS: ${{ toJSON(needs) }}
+        run: python3 scripts/infra-staged-red.py

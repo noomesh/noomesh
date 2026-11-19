@@ -143,7 +143,15 @@ pub(crate) const NO_VARIANT: &str = "no variant for";
 /// (`OWN_IMAGE_ARCHES`); tests/test_hardened_images_i323.py holds both equal
 /// to the matrix. For these images a missing arch is a FAILURE, never a skip:
 /// the node does not fall back to an upstream image.
-pub(crate) const OWN_IMAGE_ARCHES: &[(&str, &[&str])] = &[("llamacpp", &["amd64", "arm64"]), ("ollama", &["amd64", "arm64"])];
+pub(crate) const OWN_IMAGE_ARCHES: &[(&str, &[&str])] =
+    &[("llamacpp", &["amd64", "arm64"]), ("llamacpp-cuda", &["amd64"]), ("ollama", &["amd64", "arm64"])];
+
+/// Release images staged ON DEMAND, never by every lock stage: the GPU
+/// llama.cpp build (~3 GB, amd64 only) is staged only when some node runs a
+/// llamacpp placement on a GPU it can use ([`on_demand_rows_for`]), or when
+/// `noo cluster place` meets the gateway's not-staged refusal for it. A fleet
+/// with no such placement never downloads it, the controller included.
+pub(crate) const ON_DEMAND_LOCK_ROWS: &[&str] = &["llamacpp-cuda"];
 
 /// Is `image` (a lock row name or a full ref) one the release publishes for `arch`?
 pub(crate) fn own_image_published(image: &str, arch: &str) -> bool {
@@ -181,7 +189,7 @@ pub(crate) fn parse_lock(text: &str) -> Vec<LockRow> {
 }
 
 pub(crate) fn node_bound(name: &str) -> bool {
-    !CONTROLLER_ONLY.contains(&name) && !name.starts_with("deps-") && !THIRD_PARTY_LOCK_ROWS.contains(&name)
+    !CONTROLLER_ONLY.contains(&name) && !name.starts_with("deps-") && !THIRD_PARTY_LOCK_ROWS.contains(&name) && !ON_DEMAND_LOCK_ROWS.contains(&name)
 }
 
 /// Does `stage_lock` stage this lock row? Node-bound release images, or
@@ -427,11 +435,34 @@ pub(crate) fn lock_tags_to_prune(idx: &StagedIndex, current: &str) -> Vec<String
 /// worker threads (a lost update would drop a staged image from the index).
 static INDEX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Record a staged image (read-modify-write of the index).
+/// What restages the release's own images by their lock digest.
+pub(crate) const RESTAGE_BY_LOCK: &str = "noo cluster sync-images --stage-only --lock";
+
+/// The refusal for a by-name stage of (`image`, `arch`) when the index holds
+/// it by a lock digest: the by-name record would replace it, and a node whose
+/// backend is pinned to that digest refuses its next start. None when the
+/// index holds no digest-staged record for it (a non-release image, or one
+/// never staged), so a by-name stage is fine.
+pub(crate) fn by_name_over_lock(idx: &StagedIndex, image: &str, arch: &str) -> Option<String> {
+    let held = idx.images.iter().find(|r| r.image == image && r.arch == arch && !r.lock_digest.is_empty())?;
+    Some(format!(
+        "{image} ({arch}) is staged by its release-lock digest {}; a by-name stage would replace it and a node pinned to that digest would refuse its next start. Restage it by digest: {RESTAGE_BY_LOCK}",
+        held.lock_digest
+    ))
+}
+
+/// Record a staged image (read-modify-write of the index). A by-name record
+/// never replaces one staged by a lock digest ([`by_name_over_lock`]); a
+/// digest-staged record (a newer release, a door pin) replaces anything.
 pub(crate) fn record_staged(rec: StagedRecord, release: Option<Release>) -> Result<(), String> {
     let _held = INDEX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = images_store_dir();
     let mut idx = read_index(&dir);
+    if rec.lock_digest.is_empty() {
+        if let Some(refusal) = by_name_over_lock(&idx, &rec.image, &rec.arch) {
+            return Err(refusal);
+        }
+    }
     if release.is_some() {
         idx.release = release;
     }
@@ -777,10 +808,39 @@ pub(crate) fn prewarm(g: &Globals, tar: &str) {
 }
 
 /// Stage one image for one arch end to end (pull, export, index, pre-warm).
+/// Every by-name stager (`sync-images -i`, the full `sync-images` push,
+/// `place`'s not-staged retry) comes through here: an image the controller's
+/// release lock pins is staged by its lock digest, whatever the caller asked.
 pub(crate) fn stage_and_record(g: &Globals, image: &str, arch: &str, source: &str) -> Result<StagedRecord, String> {
-    let rec = stage_image(g, image, arch, None, source)?;
-    record_staged(rec.clone(), None)?;
+    let lock = controller_lock_opt()?;
+    let rec = stage_record_with(g, image, arch, source, lock.as_ref().map(|(l, p, t)| (l.as_str(), p.as_str(), t.as_str())))?;
     prewarm(g, &rec.tar);
+    Ok(rec)
+}
+
+/// [`stage_and_record`] without the pre-warm, against `lock` (its text,
+/// prefix, tag; None = no lock on this controller). An image the lock pins
+/// ([`lock_pin_for`]) is staged by its digest and recorded exactly as
+/// `stage_lock` records it (source `lock` or `door-pin`, with its release
+/// tag), so retention prunes it with its release and the node's pin check
+/// finds the digest. Anything else is staged by name under `source`; that
+/// is refused before any pull when the index holds the image by a digest.
+fn stage_record_with(g: &Globals, image: &str, arch: &str, source: &str, lock: Option<(&str, &str, &str)>) -> Result<StagedRecord, String> {
+    let pin = lock.and_then(|(l, p, t)| lock_pin_for(image, l, p, t));
+    let rec = match pin {
+        Some((digest, release_tag, pin_source)) => {
+            let mut rec = stage_image(g, image, arch, Some(&digest), pin_source)?;
+            rec.release_tag = release_tag;
+            rec
+        }
+        None => {
+            if let Some(refusal) = by_name_over_lock(&read_index(&images_store_dir()), image, arch) {
+                return Err(refusal);
+            }
+            stage_image(g, image, arch, None, source)?
+        }
+    };
+    record_staged(rec.clone(), None)?;
     Ok(rec)
 }
 
@@ -860,10 +920,16 @@ enum Staged {
     Failed(String),
 }
 
-/// Every arch of ONE lock image, in order, on the calling thread.
+/// Every arch of ONE lock image, in order, on the calling thread. An
+/// on-demand image ([`ON_DEMAND_LOCK_ROWS`]) is staged only for the arches the
+/// release publishes it for (the CUDA llama.cpp: amd64).
 fn stage_lock_image(g: &Globals, image: &str, digest: &str, tag: &str, source: &str, arches: &[String], release: &Release) -> Vec<Staged> {
     let mut out = Vec::new();
+    let name = repo_of(image).rsplit('/').next().unwrap_or(image);
     for arch in arches {
+        if ON_DEMAND_LOCK_ROWS.contains(&name) && !own_image_published(image, arch) {
+            continue;
+        }
         let label = format!("{image} ({arch})");
         if !g.json {
             emit(Line::Step(format!("staging {label}")));
@@ -901,7 +967,11 @@ fn stage_lock_image(g: &Globals, image: &str, digest: &str, tag: &str, source: &
 /// A failing job never cancels the others. Output of a pooled run is printed
 /// in lock order after every job finished (not interleaved); the serial pass
 /// (parallelism 1) prints as it goes, as it always did.
-pub(crate) fn stage_lock(g: &Globals, lock: &str, prefix: &str, tag: &str, arches: &[String], all: bool) -> Summary {
+///
+/// `on_demand`: the [`ON_DEMAND_LOCK_ROWS`] a placement needs now
+/// ([`on_demand_from_gateway`]); staged like the node-bound rows. Without it
+/// (and without `all`) they are skipped.
+pub(crate) fn stage_lock(g: &Globals, lock: &str, prefix: &str, tag: &str, arches: &[String], all: bool, on_demand: &[String]) -> Summary {
     let prefix = prefix.trim_end_matches('/');
     let mut sum = Summary::default();
     let dir = images_store_dir();
@@ -912,7 +982,7 @@ pub(crate) fn stage_lock(g: &Globals, lock: &str, prefix: &str, tag: &str, arche
     let pins = door_pin_refs(prefix);
     let mut rows: Vec<(String, String, String, &str)> = parse_lock(lock)
         .into_iter()
-        .filter(|r| stages_from_lock(&r.name, all))
+        .filter(|r| stages_from_lock(&r.name, all) || (ON_DEMAND_LOCK_ROWS.contains(&r.name.as_str()) && on_demand.contains(&r.name)))
         .map(|r| (format!("{prefix}/{}:{tag}", r.name), r.digest, tag.to_string(), "lock"))
         .filter(|(image, ..)| !pins.iter().any(|(p, ..)| p == image))
         .collect();
@@ -977,6 +1047,50 @@ pub(crate) fn stage_lock(g: &Globals, lock: &str, prefix: &str, tag: &str, arche
         sum.failed.push(format!("{STAGED_INDEX}: {e}"));
     }
     sum
+}
+
+/// Does this desired-config placement, on this node, start the CUDA llama.cpp
+/// image: a running llamacpp placement naming no image of its own, not on
+/// `cpu` (an undeclared target with `N_GPU_LAYERS=0` is cpu, as the agent and
+/// the gateway read it), on a node that can use its GPU
+/// ([`crate::commands::cluster_tune::llamacpp_gpu_usable`]).
+pub(crate) fn placement_starts_cuda_llamacpp(p: &Value, node: &Value) -> bool {
+    let target = p["target"].as_str().map(str::trim).filter(|t| !t.is_empty());
+    let legacy_cpu = target.is_none() && p["env"]["N_GPU_LAYERS"].as_str().map(str::trim) == Some("0");
+    p["backend"].as_str() == Some("llamacpp")
+        && p["desired_state"].as_str() == Some("running")
+        && p["image"].as_str().map(str::trim).unwrap_or("").is_empty()
+        && target != Some("cpu")
+        && !legacy_cpu
+        && crate::commands::cluster_tune::llamacpp_gpu_usable(node)
+}
+
+/// The [`ON_DEMAND_LOCK_ROWS`] the fleet needs: `llamacpp-cuda` when some
+/// amd64 node has a placement that [`placement_starts_cuda_llamacpp`]. Only a
+/// node that can use its GPU is asked for its placements.
+pub(crate) fn on_demand_rows_for(nodes: &[Value], placements_of: &mut dyn FnMut(&str) -> Option<Value>) -> Vec<String> {
+    let wants_cuda = nodes
+        .iter()
+        .filter(|n| node_arch(n) == Some("amd64") && crate::commands::cluster_tune::llamacpp_gpu_usable(n))
+        .any(|n| {
+            let id = n["id"].as_str().unwrap_or("");
+            !id.is_empty()
+                && placements_of(id).is_some_and(|ps| ps.as_array().is_some_and(|a| a.iter().any(|p| placement_starts_cuda_llamacpp(p, n))))
+        });
+    if wants_cuda { vec!["llamacpp-cuda".to_string()] } else { Vec::new() }
+}
+
+/// [`on_demand_rows_for`] from the gateway: the node list, and the
+/// desired-config of each node that can use its GPU. Unreadable is "none
+/// needed": the place-time refusal (`noo cluster place` stages it then) and
+/// the agent's not-staged refusal stay the backstop.
+pub(crate) fn on_demand_from_gateway(g: &Globals) -> Vec<String> {
+    let nodes = crate::http::get_json_opt(g, "/api/cluster/nodes", true, 10)
+        .and_then(|b| b["nodes"].as_array().cloned())
+        .unwrap_or_default();
+    on_demand_rows_for(&nodes, &mut |id: &str| {
+        crate::http::get_json_opt(g, &format!("/api/cluster/nodes/{}/desired-config", crate::commands::urlencode(id)), true, 10).map(|d| d["placements"].clone())
+    })
 }
 
 /// The fleet's architectures, from the gateway (all nodes, not only online:
@@ -1058,7 +1172,7 @@ pub(crate) fn start_stage_release_images(g: &Globals, lock: Option<String>, tag:
         let Some(lock) = lock else { return StageOutcome::NoLock };
         let prefix = crate::commands::provision::release_var("NOO_IMAGE_PREFIX");
         let prefix = if prefix.is_empty() { crate::registry::IMAGE_NAMESPACE.to_string() } else { prefix };
-        StageOutcome::Done(stage_lock(&quiet, &lock, &prefix, &t, &fleet_arches_from_gateway(&quiet), false))
+        StageOutcome::Done(stage_lock(&quiet, &lock, &prefix, &t, &fleet_arches_from_gateway(&quiet), false, &on_demand_from_gateway(&quiet)))
     });
     StageRun { handle: Some(handle), tag: tag_owned }
 }
@@ -1121,17 +1235,90 @@ impl StageRun {
 /// missing (a controller that never ran `noo upgrade`).
 pub(crate) fn read_controller_lock(g: &Globals) -> (String, String, String) {
     let root = crate::envfile::repo_root();
-    let lock = match std::fs::read_to_string(root.join("stack.lock")) {
-        Ok(l) => l,
+    match std::fs::read_to_string(root.join("stack.lock")) {
+        Ok(l) => lock_release(l),
         Err(e) => crate::output::fail(g.json, crate::output::ExitCode::Generic, "no_stack_lock",
             &format!("cannot read {}: {e}", root.join("stack.lock").display()),
             Some("noo upgrade   # verifies and writes the release-signed lock, then stages")),
-    };
+    }
+}
+
+/// A lock's text with the image prefix and release tag it is staged under.
+fn lock_release(lock: String) -> (String, String, String) {
     let tag = lock.lines().find_map(|l| l.strip_prefix("# tag ").map(|t| t.trim().to_string()))
         .unwrap_or_else(|| crate::commands::provision::release_var("NOO_IMAGE_TAG"));
     let prefix = crate::commands::provision::release_var("NOO_IMAGE_PREFIX");
     let prefix = if prefix.is_empty() { crate::registry::IMAGE_NAMESPACE.to_string() } else { prefix };
     (lock, prefix, tag)
+}
+
+/// [`read_controller_lock`] that never exits: None when this host has no
+/// stack lock. Any other read error is an Err (an unreadable lock is not an
+/// absent one).
+pub(crate) fn controller_lock_opt() -> Result<Option<LockRelease>, String> {
+    let path = crate::envfile::repo_root().join("stack.lock");
+    lock_opt_from(std::fs::read_to_string(&path)).map_err(|e| format!("cannot read {}: {e}", path.display()))
+}
+
+/// A stack lock's text, image prefix and release tag.
+pub(crate) type LockRelease = (String, String, String);
+
+fn lock_opt_from(read: std::io::Result<String>) -> Result<Option<LockRelease>, std::io::Error> {
+    match read {
+        Ok(l) => Ok(Some(lock_release(l))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// What the release pins `image` to, as `stage_lock` stages it:
+/// `(sha256:…, release tag, source)`. A pinned door's ref (`door-pin`, its
+/// own tag) first, as `stage_lock` stages a lock row equal to a pin as the
+/// pin; else a lock row whose `<prefix>/<name>:<tag>` is exactly `image`
+/// (`lock`, the lock's tag; third-party rows are never ours). None for an
+/// image the release does not carry.
+pub(crate) fn lock_pin_for(image: &str, lock: &str, prefix: &str, tag: &str) -> Option<(String, String, &'static str)> {
+    let prefix = prefix.trim_end_matches('/');
+    if let Some((_, digest, pin_tag)) = door_pin_refs(prefix).into_iter().find(|(p, ..)| p == image) {
+        return Some((digest, pin_tag, DOOR_PIN_SOURCE));
+    }
+    parse_lock(lock)
+        .into_iter()
+        .filter(|r| stages_from_lock(&r.name, true))
+        .find(|r| format!("{prefix}/{}:{tag}", r.name) == image)
+        .map(|r| (r.digest, tag.to_string(), "lock"))
+}
+
+/// Every ref [`lock_pin_for`] answers for: the lock's release images and the
+/// pinned doors.
+pub(crate) fn lock_pinned_refs(lock: &str, prefix: &str, tag: &str) -> Vec<String> {
+    let prefix = prefix.trim_end_matches('/');
+    let mut refs: Vec<String> = parse_lock(lock).into_iter().filter(|r| stages_from_lock(&r.name, true)).map(|r| format!("{prefix}/{}:{tag}", r.name)).collect();
+    for (image, ..) in door_pin_refs(prefix) {
+        if !refs.contains(&image) {
+            refs.push(image);
+        }
+    }
+    refs
+}
+
+/// [`lock_pinned_refs`] of this controller's lock; empty with no readable lock
+/// (a node, or a controller that never ran `noo upgrade`).
+pub(crate) fn lock_pinned_refs_here() -> Vec<String> {
+    match controller_lock_opt() {
+        Ok(Some((l, p, t))) => lock_pinned_refs(&l, &p, &t),
+        _ => Vec::new(),
+    }
+}
+
+/// The remedy that stages `image` for `arch`: a release-pinned image by its
+/// lock digest (`--stage-only --lock`), anything else by name with `-i`.
+pub(crate) fn stage_remedy(image: &str, arch: &str, pinned: bool) -> String {
+    if pinned {
+        format!("{RESTAGE_BY_LOCK}   # the release pins {image}: it is staged by its lock digest")
+    } else {
+        format!("noo cluster sync-images --stage-only -i {image} --arch {arch}")
+    }
 }
 
 /// The `<prefix>/<name>:<tag>` refs of the lock's node-bound release images,
@@ -1157,7 +1344,7 @@ pub(crate) fn stage_selection(g: &Globals, images: &[String], arches: &[String],
     let mut sum = Summary::default();
     if from_lock {
         let (lock, prefix, tag) = read_controller_lock(g);
-        sum = stage_lock(g, &lock, &prefix, &tag, arches, all);
+        sum = stage_lock(g, &lock, &prefix, &tag, arches, all, &on_demand_from_gateway(g));
     }
     for img in images {
         for arch in arches {
@@ -1191,7 +1378,8 @@ pub(crate) fn run_stage_only(g: &Globals, images: &[String], arches: &[String], 
 
 /// The image a placement needs staged, when it can be named — the CLI twin
 /// of the gateway's `placement_required_image` (same rule, same tests).
-pub(crate) fn placement_required_image(backend: &str, image: Option<&str>, arch: &str, release: Option<&Release>, roots: &[&str]) -> Option<String> {
+/// `on_gpu`: llamacpp starts the CUDA build there (amd64 only).
+pub(crate) fn placement_required_image(backend: &str, image: Option<&str>, arch: &str, release: Option<&Release>, roots: &[&str], on_gpu: bool) -> Option<String> {
     if let Some(img) = image.map(str::trim).filter(|i| !i.is_empty()) {
         let mut all: Vec<&str> = roots.to_vec();
         if let Some(r) = release {
@@ -1200,12 +1388,15 @@ pub(crate) fn placement_required_image(backend: &str, image: Option<&str>, arch:
         return is_own_image_with(img, &all).then(|| img.to_string());
     }
     let r = release?;
-    (backend == "llamacpp" && arch == "amd64").then(|| format!("{}/llamacpp:{}", r.prefix.trim_end_matches('/'), r.tag))
+    let name = if on_gpu { "llamacpp-cuda" } else { "llamacpp" };
+    (backend == "llamacpp" && arch == "amd64").then(|| format!("{}/{name}:{}", r.prefix.trim_end_matches('/'), r.tag))
 }
 
 /// Running placements whose image is not staged for the node's arch — the
 /// `images staged` verify row's input. Empty when the store is not here.
-pub(crate) fn unstaged_for(placements: &Value, arch: &str) -> Vec<String> {
+/// `node` is the node's record: a llamacpp placement on a GPU it can use
+/// needs the CUDA build staged, any other the CPU one.
+pub(crate) fn unstaged_for(placements: &Value, arch: &str, node: &Value) -> Vec<String> {
     let dir = images_store_dir();
     if !dir.is_dir() {
         return Vec::new();
@@ -1218,7 +1409,7 @@ pub(crate) fn unstaged_for(placements: &Value, arch: &str) -> Vec<String> {
         .filter(|p| p["desired_state"].as_str() == Some("running") && p["backend"].as_str() != Some("harness"))
         .filter_map(|p| {
             let roots: Vec<&str> = idx.own_roots.iter().map(String::as_str).collect();
-            placement_required_image(p["backend"].as_str().unwrap_or(""), p["image"].as_str(), arch, idx.release.as_ref(), &roots)
+            placement_required_image(p["backend"].as_str().unwrap_or(""), p["image"].as_str(), arch, idx.release.as_ref(), &roots, placement_starts_cuda_llamacpp(p, node))
         })
         .filter(|img| !image_staged_in(&dir, img, arch))
         .collect();
@@ -1408,16 +1599,59 @@ gateway@{D}
         assert!(v["doors"]["vllm"]["digest"].as_str().is_some_and(|d| d == digest.as_str()));
     }
 
+    /// The CUDA llama.cpp row (~3 GB) is never staged by a lock stage or
+    /// pulled by `sync-images --lock`; it is staged only when an amd64 node
+    /// that can use its GPU has a running llamacpp placement that starts it.
+    #[test]
+    fn the_cuda_llamacpp_row_is_staged_only_for_a_node_that_runs_llamacpp_on_its_gpu() {
+        assert!(!node_bound("llamacpp-cuda") && node_bound("llamacpp"));
+        assert!(!stages_from_lock("llamacpp-cuda", false), "a roll never stages it by default");
+        let lock = format!("llamacpp@sha256:{}\nllamacpp-cuda@sha256:{}\n", "a".repeat(64), "b".repeat(64));
+        assert!(!lock_node_refs(&lock, "reg.example/acme", "v1").iter().any(|r| r.contains("llamacpp-cuda")), "sync-images --lock never pushes it");
+        assert!(own_image_published("llamacpp-cuda", "amd64") && !own_image_published("llamacpp-cuda", "arm64"));
+
+        let gpu = |id: &str, cap: &str| json!({"id": id, "capabilities": {"arch": "x86_64", "vram_gb": 8.0}, "nvidia_runtime": true, "gpu_compute_cap": cap});
+        let place = |target: Option<&str>| {
+            let mut p = json!({"backend": "llamacpp", "model": "m.gguf", "desired_state": "running"});
+            if let Some(t) = target {
+                p["target"] = json!(t);
+            }
+            json!([p])
+        };
+        fn ask(nodes: &[Value], ps: &Value) -> (Vec<String>, Vec<String>) {
+            let mut asked = Vec::new();
+            let rows = on_demand_rows_for(nodes, &mut |id: &str| {
+                asked.push(id.to_string());
+                Some(ps.clone())
+            });
+            (rows, asked)
+        }
+        let cuda = vec!["llamacpp-cuda".to_string()];
+        assert_eq!(ask(&[gpu("node-a", "6.1")], &place(Some("gpu"))).0, cuda);
+        assert_eq!(ask(&[gpu("node-a", "8.6")], &place(None)).0, cuda, "no target on a usable node runs on the GPU");
+        assert!(ask(&[gpu("node-a", "8.6")], &place(Some("cpu"))).0.is_empty(), "a cpu placement");
+        assert!(ask(&[gpu("node-a", "5.2")], &place(Some("gpu"))).0.is_empty(), "a GPU below the image's lowest arch");
+        let cpu_node = json!({"id": "node-b", "capabilities": {"arch": "x86_64", "ram_gb": 16.0}});
+        let arm = json!({"id": "node-c", "capabilities": {"arch": "aarch64", "vram_gb": 8.0}, "nvidia_runtime": true, "gpu_compute_cap": "8.7"});
+        let (rows, asked) = ask(&[cpu_node, arm], &place(Some("gpu")));
+        assert!(rows.is_empty());
+        assert!(asked.is_empty(), "only an amd64 node that can use its GPU is asked for its placements: {asked:?}");
+        let legacy = json!([{"backend": "llamacpp", "model": "m.gguf", "desired_state": "running", "env": {"N_GPU_LAYERS": "0"}}]);
+        assert!(!placement_starts_cuda_llamacpp(&legacy[0], &gpu("node-a", "8.6")), "no target + N_GPU_LAYERS=0 is cpu");
+    }
+
     #[test]
     fn placement_required_image_matches_the_gateway_rule() {
         let rel = Release { prefix: "reg.example/acme".into(), tag: "v0.2.103".into() };
-        assert_eq!(placement_required_image("llamacpp", None, "amd64", Some(&rel), &[]).as_deref(), Some("reg.example/acme/llamacpp:v0.2.103"));
-        assert!(placement_required_image("llamacpp", None, "arm64", Some(&rel), &[]).is_none());
-        assert!(placement_required_image("vllm", Some("vllm/vllm-openai:latest"), "amd64", Some(&rel), &[]).is_none());
-        assert_eq!(placement_required_image("x", Some("noo-browser:latest"), "amd64", None, &[]).as_deref(), Some("noo-browser:latest"));
-        assert_eq!(placement_required_image("x", Some("reg.example/acme/vllm:v1"), "amd64", Some(&rel), &[]).as_deref(), Some("reg.example/acme/vllm:v1"));
+        assert_eq!(placement_required_image("llamacpp", None, "amd64", Some(&rel), &[], false).as_deref(), Some("reg.example/acme/llamacpp:v0.2.103"));
+        assert!(placement_required_image("llamacpp", None, "arm64", Some(&rel), &[], false).is_none());
+        assert!(placement_required_image("vllm", Some("vllm/vllm-openai:latest"), "amd64", Some(&rel), &[], false).is_none());
+        assert_eq!(placement_required_image("x", Some("noo-browser:latest"), "amd64", None, &[], false).as_deref(), Some("noo-browser:latest"));
+        assert_eq!(placement_required_image("x", Some("reg.example/acme/vllm:v1"), "amd64", Some(&rel), &[], false).as_deref(), Some("reg.example/acme/vllm:v1"));
+        // llamacpp on a node's GPU: the CUDA build (amd64 only).
+        assert_eq!(placement_required_image("llamacpp", None, "amd64", Some(&rel), &[], true).as_deref(), Some("reg.example/acme/llamacpp-cuda:v0.2.103"));
         // The old `contains("/noomesh/")` said yes here; the shared rule says no.
-        assert!(placement_required_image("x", Some("quay.io/someone/noomesh/x:1"), "amd64", Some(&rel), &[]).is_none());
+        assert!(placement_required_image("x", Some("quay.io/someone/noomesh/x:1"), "amd64", Some(&rel), &[], false).is_none());
     }
 
     #[test]
@@ -1810,7 +2044,7 @@ gateway@{D}
         let mut gl = g();
         gl.gateway_override = Some("https://127.0.0.1:9".into()); // prewarm is best-effort; refuse fast
         let arches = vec!["amd64".to_string(), "arm64".to_string()];
-        let sum = stage_lock(&gl, &lock, "reg.example/acme", "v1", &arches, true);
+        let sum = stage_lock(&gl, &lock, "reg.example/acme", "v1", &arches, true, &[]);
         PARALLELISM_OVERRIDE.with(|p| p.set(None));
         SHARED_FAKE.with(|s| *s.borrow_mut() = None);
 
@@ -1873,5 +2107,147 @@ gateway@{D}
         });
         drop(StageRun { handle: Some(handle), tag: "v1".into() });
         assert!(flag.load(std::sync::atomic::Ordering::SeqCst), "drop must have waited for the thread");
+    }
+
+    // ── a release-pinned image is staged by its lock digest, whoever asks ──
+
+    const PREFIX: &str = "reg.example/acme";
+
+    fn lock_text() -> String {
+        format!("# tag v1\nnode-agent@{D}\nnats@{D}\n")
+    }
+
+    /// The host-arch daemon: inspect answers for any ref, tag and save work.
+    fn host_daemon() -> Daemon {
+        daemon(move |l| match l {
+            l if l.starts_with("version") => Ok("amd64".into()),
+            l if l.starts_with("image inspect") => Ok("sha256:hostid amd64".into()),
+            l if l.starts_with("tag ") => Ok(String::new()),
+            other => Err(format!("unexpected: {other}")),
+        })
+    }
+
+    #[test]
+    fn lock_pin_for_matches_the_refs_stage_lock_builds() {
+        let lock = lock_text();
+        assert_eq!(lock_pin_for(&format!("{PREFIX}/node-agent:v1"), &lock, PREFIX, "v1"), Some((D.to_string(), "v1".to_string(), "lock")));
+        assert_eq!(lock_pin_for(&format!("{PREFIX}/node-agent:v1"), &lock, &format!("{PREFIX}/"), "v1").map(|p| p.2), Some("lock"));
+        assert_eq!(lock_pin_for(&format!("{PREFIX}/node-agent:v0"), &lock, PREFIX, "v1"), None, "another release's tag");
+        assert_eq!(lock_pin_for(&format!("{PREFIX}/nats:v1"), &lock, PREFIX, "v1"), None, "a third-party row is never ours");
+        assert_eq!(lock_pin_for(&format!("{PREFIX}/other:v1"), &lock, PREFIX, "v1"), None);
+        let (pin, digest, pin_tag) = door_pin_refs(PREFIX).into_iter().next().expect("a pinned door");
+        assert_eq!(lock_pin_for(&pin, &lock, PREFIX, "v1"), Some((digest, pin_tag, DOOR_PIN_SOURCE)));
+        assert!(lock_pinned_refs(&lock, PREFIX, "v1").contains(&format!("{PREFIX}/node-agent:v1")));
+        assert!(lock_pinned_refs(&lock, PREFIX, "v1").contains(&pin));
+    }
+
+    /// THE defect: `sync-images -i <a lock image>` re-staged it by name and
+    /// blanked the record's lock digest; a node pinned to it refused its next
+    /// start. Now it is staged by the digest and recorded as `stage_lock` does.
+    #[test]
+    fn an_i_stage_of_a_lock_image_keeps_the_lock_digest() {
+        let _l = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = store("i-pinned");
+        let d = host_daemon();
+        let lock = lock_text();
+        let image = format!("{PREFIX}/node-agent:v1");
+        let rec = stage_record_with(&g(), &image, "amd64", "sync-images", Some((lock.as_str(), PREFIX, "v1"))).expect("stage");
+        assert_eq!((rec.lock_digest.as_str(), rec.source.as_str(), rec.release_tag.as_str()), (D, "lock", "v1"), "{rec:?}");
+        let calls = d.calls.borrow().clone();
+        assert!(calls.iter().any(|c| c == &format!("tag {PREFIX}/node-agent@{D} {image}")), "taken by the digest: {calls:?}");
+        let idx = read_index(&dir);
+        assert_eq!(idx.images.len(), 1);
+        assert_eq!(idx.images[0].lock_digest, D);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_i_stage_of_an_image_the_lock_does_not_pin_is_by_name() {
+        let _l = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = store("i-unpinned");
+        let d = host_daemon();
+        let lock = lock_text();
+        let image = format!("{PREFIX}/other:v1");
+        let rec = stage_record_with(&g(), &image, "amd64", "sync-images", Some((lock.as_str(), PREFIX, "v1"))).expect("stage");
+        assert_eq!((rec.lock_digest.as_str(), rec.source.as_str(), rec.release_tag.as_str()), ("", "sync-images", ""), "{rec:?}");
+        assert!(d.calls.borrow().iter().all(|c| !c.starts_with("tag ")), "{:?}", d.calls.borrow());
+        // And again by name over its own by-name record: nothing to protect.
+        stage_record_with(&g(), &image, "amd64", "sync-images", Some((lock.as_str(), PREFIX, "v1"))).expect("restage by name");
+        assert_eq!(read_index(&dir).images.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn with_no_stack_lock_a_stage_is_by_name() {
+        let _l = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = store("no-lock");
+        let _d = host_daemon();
+        let rec = stage_record_with(&g(), &format!("{PREFIX}/node-agent:v1"), "amd64", "place", None).expect("stage");
+        assert_eq!((rec.lock_digest.as_str(), rec.source.as_str()), ("", "place"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let gone = std::io::Error::new(std::io::ErrorKind::NotFound, "no file");
+        assert!(lock_opt_from(Err(gone)).expect("absent is no error").is_none());
+        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        assert!(lock_opt_from(Err(denied)).is_err(), "an unreadable lock is not an absent one");
+        let (_, _, tag) = lock_opt_from(Ok(lock_text())).unwrap().unwrap();
+        assert_eq!(tag, "v1");
+    }
+
+    /// The backstop: a by-name record never replaces a digest-staged one; a
+    /// newer digest-staged record (the next release) does.
+    #[test]
+    fn a_by_name_record_never_replaces_a_lock_record() {
+        let _l = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = store("backstop");
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = format!("{PREFIX}/node-agent:v1");
+        record_staged(rec(&image, "amd64", "v1", 1), None).expect("lock record");
+        let mut by_name = rec(&image, "amd64", "", 2);
+        by_name.lock_digest = String::new();
+        by_name.source = "sync-images".into();
+        let before = std::fs::read(dir.join(STAGED_INDEX)).unwrap();
+        let err = record_staged(by_name.clone(), None).expect_err("refused");
+        assert!(err.contains(&image) && err.contains("(amd64)") && err.contains(RESTAGE_BY_LOCK), "{err}");
+        assert_eq!(std::fs::read(dir.join(STAGED_INDEX)).unwrap(), before, "the index is unchanged");
+        // The other arch is a different record: by name is fine there.
+        let mut arm = by_name.clone();
+        arm.arch = "arm64".into();
+        record_staged(arm, None).expect("no lock record for arm64");
+        // A newer lock record replaces the old one.
+        let mut newer = rec(&image, "amd64", "v2", 3);
+        newer.lock_digest = format!("sha256:{}", "c".repeat(64));
+        record_staged(newer.clone(), None).expect("digest over digest");
+        let idx = read_index(&dir);
+        assert_eq!(idx.images.iter().find(|r| r.arch == "amd64").unwrap(), &newer);
+        // stage_record_with refuses before any pull.
+        let d = host_daemon();
+        let err = stage_record_with(&g(), &image, "amd64", "place", None).expect_err("refused");
+        assert!(err.contains(RESTAGE_BY_LOCK), "{err}");
+        assert!(d.calls.borrow().is_empty(), "nothing pulled or exported: {:?}", d.calls.borrow());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_stage_remedy_restages_a_pinned_image_by_the_lock() {
+        let r = stage_remedy("p/llamacpp-cuda:v1", "amd64", true);
+        assert!(r.starts_with(RESTAGE_BY_LOCK) && !r.contains(" -i "), "{r}");
+        assert_eq!(stage_remedy("p/x:v1", "arm64", false), "noo cluster sync-images --stage-only -i p/x:v1 --arch arm64");
+    }
+
+    /// Every by-name stager goes through `stage_and_record`, which re-derives
+    /// the lock digest: `-i`, the full `sync-images` push, and `place`.
+    #[test]
+    fn every_by_name_stager_goes_through_stage_and_record() {
+        let own = crate::test_src::own_code(include_str!("image_stage.rs"));
+        let sar = crate::test_src::fn_body(&own, "pub(crate) fn stage_and_record(");
+        assert!(sar.contains("controller_lock_opt()?") && sar.contains("stage_record_with("), "{sar}");
+        assert!(crate::test_src::fn_body(&own, "fn stage_record_with(").contains("lock_pin_for(image, l, p, t)"));
+        assert!(crate::test_src::fn_body(&own, "pub(crate) fn stage_selection(").contains("stage_and_record(g, img, arch, source)"));
+        let sync = crate::test_src::own_code(include_str!("cluster_provision_subprocess.rs"));
+        let pull = crate::test_src::fn_body(&sync, "fn sync_image_via_pull(");
+        assert!(pull.contains("image_stage::stage_and_record(g, image, arch, \"sync-images\")") && !pull.contains("stage_image("), "{pull}");
+        let cluster = crate::test_src::own_code(include_str!("cluster.rs"));
+        assert!(cluster.contains("image_stage::stage_and_record(g, &img, &arch, \"place\")"));
+        assert!(!cluster.contains("image_stage::stage_image(") && !sync.contains("image_stage::stage_image("), "no by-name stage around it");
     }
 }

@@ -11,7 +11,7 @@ import (
 func fakeImages(t *testing.T) {
 	t.Helper()
 	prev := placementImageFn
-	placementImageFn = func(backend, override string) string {
+	placementImageFn = func(backend, override, _ string) string {
 		if override != "" {
 			return override
 		}
@@ -68,7 +68,7 @@ func TestPrefetchSelectsOnlyPlacementsTheStartLoopWillStart(t *testing.T) {
 
 func TestPrefetchSkipsPlacementsWhoseImageCannotBeNamed(t *testing.T) {
 	prev := placementImageFn
-	placementImageFn = func(string, string) string { return "" }
+	placementImageFn = func(string, string, string) string { return "" }
 	t.Cleanup(func() { placementImageFn = prev })
 	refs, n := imagesToPrefetch([]placement{{Backend: "vllm", Model: "m", DesiredState: "running"}},
 		map[string]string{}, map[string]string{}, nil, map[string]string{}, map[string]string{})

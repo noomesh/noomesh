@@ -230,6 +230,14 @@ What it does, in order:
   directory group-writable (`chmod g+ws`) and join that group, or grant
   yourself an ACL (`setfacl -m u:<you>:rwx`). On NFS, apply either one on
   the server that exports the directory.
+  On a fresh install `noo onboard` sets that ACL for you: host prep, inside
+  the one sudo it already runs, grants the installing operator write access
+  to the model store (`$NOO_DATA_ROOT/models` only, never `hf-cache`, the
+  Ollama store or the data root; the owner stays `noo-agent`) and says so
+  ("granted <you> write access to the model store <dir>"). Without `setfacl`,
+  or on an NFS store that refuses it, prep prints the two remedies above and
+  goes on. An existing install is not changed: the first `noo models fetch`
+  or `noo models pull` on it prints the remedy.
 - **Authenticates with the controller's Hugging Face token**: `HF_TOKEN` (or
   `HUGGING_FACE_HUB_TOKEN`) from the process environment, else from the
   encrypted store `secrets/env.sops`. The token is sent only as an
@@ -315,6 +323,13 @@ installed, and only when every layer the registry's manifest names is in it
 unchanged and it adds nothing but the manifest Ollama pulled (the registry's
 own, by its sha256) and the list that named it. Verify-on-load checks against it; a placed node
 cannot import from it and is told to run `noo models fetch ollama:<tag>`.
+The record is written as you, so the store must be writable by you, the same
+test `noo models fetch` makes, checked before the pull. When it is not, the
+pull still happens, unrecorded: one line names the store, you and its owner,
+followed by the exact `sudo setfacl -m u:<you>:rwx -m d:u:<you>:rwx <store>`
+command, and the agent reports the model "unverified (no controller record)"
+until you pull it again. No other failure of the record is shown as a raw
+error number: it says what was being written.
 
 On the node, reconcile asks the store about a placed tag it does not hold; a
 staged tag takes the same import path as `noo cluster import-model`, which
@@ -358,6 +373,7 @@ node on its versioned default, which a registry node refuses (with the
 controller roll that fixes it) and a node runs only
 if the controller staged that image (`noo cluster sync-images <node> -i
 <image>`), since the rail verifies the tar against the gateway's manifest.
+A release-pinned image is staged by its lock digest (`noo cluster sync-images --stage-only --lock`), also when named with `-i`; `-i` is for images the release does not carry.
 On a rail node the image never comes from a registry.
 
 ### What the controller stages
@@ -368,6 +384,10 @@ On a rail node the image never comes from a registry.
 | `noo cluster sync-images --stage-only [--lock] [-i IMG]… [--arch a,b] [--all-images]` | the lock (default) and/or named images | same; `--all-images` stages the controller-only lock images too; stops after staging, no node pulls |
 | `noo cluster sync-images <node> -i IMG` (or `--lock <node>` for the lock's node-bound images) | a named image, for that node's architecture | then asks the node's agent to pull it now |
 | `noo cluster place …` refused with "not staged" | the placement's image | stages it, then places again |
+
+A release-pinned image is staged by its lock digest (`noo cluster sync-images --stage-only --lock`), also when named with `-i`; `-i` is for images the release does not carry. The index never trades a digest-staged record for a by-name one (that
+stage is refused naming `--stage-only --lock`), and `noo cluster verify
+--controller`'s `staged release images` row WARNs on one staged by name.
 
 **Multi-arch.** Architectures come from the nodes' reported
 `capabilities.arch` (an older agent's `is_arm`/tier 4 counts as arm64) plus
@@ -428,9 +448,25 @@ its image through one function (`EnsureImage`):
    left on an older ID would loop) and must match the node's architecture.
    Any of those failing is a **refusal**. A local copy at a *different* ID
    than the staged one is replaced — unless the fetch fails in **transport**
-   (cache unreachable, timeout, disk full): then the local copy runs, logged
+   (cache unreachable, timeout): then the local copy runs, logged
    as `image.rail_transport_failed` and reported `local`, and the rail is
    not retried for 30 minutes.
+   Before fetching, the agent checks free space for the tar (the manifest's
+   `size_bytes`) in its staging dir and for the load in Docker's data root
+   (an estimate: the larger of 2 × the tar or the tar + 2 GiB, plus 512 MiB;
+   the sum when both are one filesystem). A shortfall, or a real "no space
+   left on device", is a `not enough disk space for image …` refusal naming
+   the path, free and needed space; it is **not** backed off, so the start
+   goes ahead on the next reconcile pass after space is freed (after a real
+   "no space left on device", once that filesystem has gained 1 GiB over
+   the free space seen at the failure, so the tar is not re-fetched every
+   pass). The refusal and `noo cluster verify`'s `backend starts` row name
+   noo's own reclaim first: `noo autonomy decisions -l disk_watermark`
+   shows what it would free on that node, `noo autonomy live
+   disk_watermark` lets it act (an operator decision; see
+   [disk-and-images.md](../operating/disk-and-images.md), "When the disk fills"); for llamacpp,
+   placing it `--on cpu` also helps. A
+   manifest without `size_bytes` (an older gateway) skips the check.
 3. **Local, nothing to compare** (not staged, an older gateway, controller
    unreachable) → used, and reported as `local`.
 4. **Absent and not staged** → for our images (`$NOO_IMAGE_PREFIX/*`, the
@@ -442,6 +478,7 @@ its image through one function (`EnsureImage`):
    logged at WARN as `image.registry_fallback`; `off` makes the node
    rail-only. Prefer staging those too (`noo cluster sync-images <node> -i
    ollama/ollama:latest`) so a node needs no internet registry at all.
+   A release-pinned image is staged by its lock digest (`noo cluster sync-images --stage-only --lock`), also when named with `-i`; `-i` is for images the release does not carry.
 
 The agent's only registry pull is that fallback; a test
 (`TestNoRegistryPullOutsideTheFallback`) fails on any other `ImagePull`.

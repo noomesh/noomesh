@@ -191,9 +191,10 @@ jobs:
         fi
         # <<< merge-group base
         # ── llamacpp: its OWN inputs, on every event ─────────────────────
-        # The llama-server image has one input in this tree:
-        # docker/Dockerfile.llamacpp (tests/test_ci_scope_declarations.py holds it
-        # to that). On a pull request the PR's diff decides (that path or this
+        # The llama-server images have one input each in this tree:
+        # docker/Dockerfile.llamacpp and docker/Dockerfile.llamacpp-cuda
+        # (tests/test_ci_scope_declarations.py holds them to that); either one
+        # arms both image jobs (llamacpp-image, llamacpp-cuda-image). On a pull request the PR's diff decides (that path or this
         # workflow); on a push the tree diff against the last final release
         # decides, so a break keeps compiling until it ships. A CHANGED-FILES
         # test, never a file-presence test: a moved Dockerfile shows up as a
@@ -201,7 +202,7 @@ jobs:
         # against compiles it.
         if [ -n "${BASE:-}" ]; then
           lc_range="$BASE...HEAD"
-          lc_pattern='^(docker/Dockerfile\.llamacpp$|\.github/workflows/ci\.yml$)'
+          lc_pattern='^(docker/Dockerfile\.llamacpp(-cuda)?$|\.github/workflows/ci\.yml$)'
           ol_pattern='^(docker/Dockerfile\.ollama$|\.github/workflows/ci\.yml$)'
           vo_pattern='^(docker/Dockerfile\.(whisper|piper)$|docker/(voice_local|whisper_server|piper_server)\.py$|\.github/workflows/ci\.yml$)'
         else
@@ -210,7 +211,7 @@ jobs:
             lc_release=refs/remotes/origin/main
           fi
           lc_range="${lc_release:+$lc_release..HEAD}"
-          lc_pattern='^docker/Dockerfile\.llamacpp$'
+          lc_pattern='^docker/Dockerfile\.llamacpp(-cuda)?$'
           ol_pattern='^docker/Dockerfile\.ollama$'
           vo_pattern='^(docker/Dockerfile\.(whisper|piper)$|docker/(voice_local|whisper_server|piper_server)\.py$)'
         fi
@@ -2025,7 +2026,158 @@ jobs:
         # pin) and the binary, with the runtime stage's libraries, must start.
         docker run --rm --entrypoint sh noomesh-llamacpp:${{ github.sha }} \
           -c 'cat /opt/llama/LLAMACPP_COMMIT && llama-server --version'
+        # The pin is proven IN the image, not only in the Dockerfile: the
+        # commit the image records and the binary reports must be what
+        # LLAMACPP_REF resolves to upstream, read independently here.
+        ref="$(sed -n 's/^ARG LLAMACPP_REF=//p' docker/Dockerfile.llamacpp | head -n 1)"
+        want="$(git ls-remote https://github.com/ggml-org/llama.cpp "refs/tags/$ref^{}" "refs/tags/$ref" | awk 'NR==1{print $1}')"
+        [ -n "$want" ] || { echo "::error::could not resolve llama.cpp $ref upstream"; exit 1; }
+        got="$(docker run --rm --entrypoint cat noomesh-llamacpp:${{ github.sha }} /opt/llama/LLAMACPP_COMMIT)"
+        ver="$(docker run --rm --entrypoint llama-server noomesh-llamacpp:${{ github.sha }} --version 2>&1 | sed -n 's/^version: [0-9]* (\([0-9a-f]*\)).*/\1/p' | head -n 1)"
+        echo "llama.cpp $ref = $want; image records $got; binary reports $ver"
+        [ "$got" = "$want" ] || { echo "::error::the image holds llama.cpp $got, not $ref ($want)"; exit 1; }
+        case "$want" in "$ver"*) ;; *) echo "::error::llama-server reports $ver, not $ref ($want)"; exit 1;; esac
         docker rmi noomesh-llamacpp:${{ github.sha }} >/dev/null 2>&1 || true
+
+  llamacpp-cuda-image:
+    # The GPU llama-server (docker/Dockerfile.llamacpp-cuda, CUDA 12.9) is
+    # otherwise built by the release workflow and the daily infra build alone.
+    # Same shape and the same switch as llamacpp-image (either Dockerfile arms
+    # both): the WHOLE image, amd64 (its only platform), nothing pushed. The
+    # hosted runner has no GPU, which is the case this job proves: the image
+    # must START where no CUDA driver is present (the CUDA backend is a module
+    # that fails to load, GGML_BACKEND_DL) and report no CUDA device, rather
+    # than die at load time on a missing libcuda.so.1. That a GPU is used is
+    # not provable here; the release notes' roll check covers it on a GPU node.
+    runs-on: ubuntu-latest
+    needs: [preflight, scope]
+    if: ${{ github.repository == 'noomesh/noomesh' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !cancelled() && needs.preflight.result == 'success' && needs.scope.result == 'success' && needs.scope.outputs.llamacpp == 'true' }}
+    concurrency:
+      group: ci-llamacpp-cuda-image-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    steps:
+
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+    # The CUDA devel base alone is several GB unpacked.
+    - name: Free disk (preinstalled toolchains the build does not use)
+      run: scripts/ci-free-disk.sh
+
+    # The nvidia/cuda bases from the GHCR mirror (.github/hub-mirror.txt), as
+    # in the release; a miss answers docker.io with a warning, never a failure.
+    # The bridge flag HUB_MIRROR_OFF must not become the steady state on the
+    # public repository (as in `build`).
+    - name: Refuse HUB_MIRROR_OFF on a public repository
+      if: github.repository == 'noomesh/noomesh' && vars.HUB_MIRROR_OFF != '' && vars.HUB_MIRROR_OFF != '0' && vars.HUB_MIRROR_OFF != 'false'
+      run: |
+        echo "::error::HUB_MIRROR_OFF is set on a public repository: Docker Hub pulls are rate limited. Populate the GHCR mirrors and delete the variable."
+        exit 1
+    - name: Docker Hub bases from the mirror (Hub on a miss)
+      env:
+        GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        HUB_MIRROR: ${{ vars.HUB_MIRROR }}
+        HUB_MIRROR_OFF: ${{ vars.HUB_MIRROR_OFF }}
+      run: |
+        echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin \
+          || echo "::warning::ghcr.io login failed — the mirror check will fall back to Docker Hub"
+        echo "HUB_PREFIX=$(python3 "$GITHUB_WORKSPACE/scripts/hub-mirror.py" dockerfile "$GITHUB_WORKSPACE/docker/Dockerfile.llamacpp-cuda")" >> "$GITHUB_ENV"
+
+    - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+    - uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487  # v4.0.0
+
+    - name: Build the CUDA llama-server image (every stage, linux/amd64)
+      run: |
+        set -o pipefail
+        docker buildx build --load -f docker/Dockerfile.llamacpp-cuda \
+          --build-arg HUB_MIRROR="${HUB_PREFIX:-docker.io}" \
+          --cache-from type=gha,scope=ci-llamacpp-cuda \
+          --cache-to type=gha,mode=max,scope=ci-llamacpp-cuda \
+          -t noomesh-llamacpp-cuda:${{ github.sha }} . 2>&1 | tail -n 200
+
+    - name: The image starts on a runner with no GPU and lists no CUDA device
+      run: |
+        set -eu
+        img=noomesh-llamacpp-cuda:${{ github.sha }}
+        # Which llama.cpp it holds, and the binary starts (exit 0).
+        docker run --rm --entrypoint sh "$img" -c 'cat /opt/llama/LLAMACPP_COMMIT && llama-server --version'
+        # The pin is proven IN the image, not only in the Dockerfile: the
+        # commit the image records and the binary reports must be what
+        # LLAMACPP_REF resolves to upstream, read independently here.
+        ref="$(sed -n 's/^ARG LLAMACPP_REF=//p' docker/Dockerfile.llamacpp-cuda | head -n 1)"
+        want="$(git ls-remote https://github.com/ggml-org/llama.cpp "refs/tags/$ref^{}" "refs/tags/$ref" | awk 'NR==1{print $1}')"
+        [ -n "$want" ] || { echo "::error::could not resolve llama.cpp $ref upstream"; exit 1; }
+        got="$(docker run --rm --entrypoint cat "$img" /opt/llama/LLAMACPP_COMMIT)"
+        ver="$(docker run --rm --entrypoint llama-server "$img" --version 2>&1 | sed -n 's/^version: [0-9]* (\([0-9a-f]*\)).*/\1/p' | head -n 1)"
+        echo "llama.cpp $ref = $want; image records $got; binary reports $ver"
+        [ "$got" = "$want" ] || { echo "::error::the image holds llama.cpp $got, not $ref ($want)"; exit 1; }
+        case "$want" in "$ver"*) ;; *) echo "::error::llama-server reports $ver, not $ref ($want)"; exit 1;; esac
+        # --list-devices (llama.cpp b9628 common/arg.cpp): loads every backend
+        # module, prints "Available devices:" and one line per NON-CPU
+        # device ("  CUDA0: <name> (<n> MiB, <n> MiB free)"), exits 0. With no
+        # GPU and no driver the CUDA module does not load, so the list is
+        # empty. A non-zero exit (a crash on the missing driver) fails here.
+        out="$(docker run --rm --entrypoint llama-server "$img" --list-devices 2>&1)"
+        printf '%s\n' "$out"
+        printf '%s\n' "$out" | grep -q '^Available devices:' \
+          || { echo "::error::--list-devices printed no device list"; exit 1; }
+        if printf '%s\n' "$out" | grep -qE '^[[:space:]]+CUDA[0-9]+:'; then
+          echo "::error::a GPU-less runner listed a CUDA device"; exit 1
+        fi
+        # The runtime stage removes packages (gnupg, apt). A GPU-less run
+        # cannot tell "the CUDA module did not load for want of a driver"
+        # from "it did not load for want of a library the slimming took", so
+        # every module and binary in /opt/llama must resolve every library
+        # but libcuda.so.1 (the host driver's, mounted by the NVIDIA runtime).
+        # And curl must run: both healthchecks (the image's and the node
+        # agent's) are `curl .../health`.
+        missing="$(docker run --rm --entrypoint sh "$img" -c \
+          'for f in /opt/llama/*.so* /opt/llama/llama-server; do ldd "$f" | sed -n "s|^\t*\([^ ]*\) => not found|$f: \1|p"; done' \
+          | grep -v ': libcuda\.so\.1$' || true)"
+        [ -z "$missing" ] || { printf '%s\n' "$missing"; echo "::error::a library llama-server needs is missing from the image"; exit 1; }
+        docker run --rm --entrypoint curl "$img" --version | head -n 1
+
+    # REPORT, not a gate: what the runtime stage's security upgrade and
+    # removals (docker/Dockerfile.llamacpp-cuda) change against the pinned
+    # NVIDIA runtime base: installed packages (`dpkg-query -W`), image size and
+    # the fixable HIGH/CRITICAL findings, by the same code as the daily staged
+    # gate (scripts/infra-staged.py new-findings). The Trivy pin is the one
+    # ollama-image and infra-staged.yml use (tests/test_llamacpp_cuda_runtime_slim.py
+    # holds this copy equal to ollama-image's). `--scanners vuln`: the report
+    # reads only vulnerabilities, and a secret scan of a multi-GB CUDA image
+    # costs minutes for nothing.
+    - name: Base vs ours, packages, size and Trivy findings (report only)
+      continue-on-error: true
+      env:
+        IMAGE: noomesh-llamacpp-cuda:${{ github.sha }}
+      run: |
+        set -euo pipefail
+        # The runtime base exactly as the Dockerfile pins it, through the
+        # same mirror prefix the build used.
+        from="$(sed -n 's|^FROM ${HUB_MIRROR}/\(nvidia/cuda:[^ ]*-runtime-[^ ]*\)$|\1|p' docker/Dockerfile.llamacpp-cuda | head -n 1)"
+        [ -n "$from" ] || { echo "::error::no runtime FROM in docker/Dockerfile.llamacpp-cuda"; exit 1; }
+        base="${HUB_PREFIX:-docker.io}/$from"
+        docker pull -q "$base"
+        r="$RUNNER_TEMP/report"; mkdir -p "$r/base" "$r/ours"
+        docker run --rm --entrypoint dpkg-query "$base" -W -f '${Package}\n' | sort > "$r/base.pkgs"
+        docker run --rm --entrypoint dpkg-query "$IMAGE" -W -f '${Package}\n' | sort > "$r/ours.pkgs"
+        size() { docker image inspect -f '{{.Size}}' "$1" | awk '{printf "%.0f MB", $1 / 1000000}'; }
+        # The one Trivy pin (scripts/infra-scan.sh: version + sha256-verified).
+        scripts/infra-scan.sh install-trivy
+        dir="$RUNNER_TEMP/trivy-bin"
+        "$dir/trivy" image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --format json \
+          -o "$r/base/linux-amd64.json" "$base"
+        "$dir/trivy" image --skip-db-update --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --format json \
+          -o "$r/ours/linux-amd64.json" "$IMAGE"
+        { echo "### llamacpp-cuda image: base vs ours (report only)"; echo '```'
+          echo "base  $base"
+          echo "base  $(wc -l < "$r/base.pkgs") packages, $(size "$base")"
+          echo "ours  $(wc -l < "$r/ours.pkgs") packages, $(size "$IMAGE")"
+          echo "removed: $(comm -23 "$r/base.pkgs" "$r/ours.pkgs" | tr '\n' ' ')"
+          echo "added:   $(comm -13 "$r/base.pkgs" "$r/ours.pkgs" | tr '\n' ' ')"
+          echo; echo "base:"; python3 scripts/infra-staged.py new-findings --new "$r/base/linux-amd64.json" || true
+          echo; echo "ours:"; python3 scripts/infra-staged.py new-findings --new "$r/ours/linux-amd64.json" || true
+          echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+        docker rmi "$IMAGE" "$base" >/dev/null 2>&1 || true
 
   ollama-image:
     # The hardened ollama image (docker/Dockerfile.ollama) is built by the

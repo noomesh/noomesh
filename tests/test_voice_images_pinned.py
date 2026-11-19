@@ -64,6 +64,32 @@ def test_whisper_pins_an_av_that_accepts_metadata_errors() -> None:
     assert int(m.group(1)) < 19, "av>=19 dropped av.open(metadata_errors=) which faster_whisper decode_audio passes"
 
 
+# Floors from the infra-staged gate (0.6.28-rc.2 block, 2026-11-15): Trivy
+# found fixable HIGH findings in the voice images' starlette 0.46.2
+# (CVE-2025-62727, CVE-2026-48818, CVE-2026-54283) and whisper's filelock
+# 4.2.0 (CVE-2026-112940). These are the versions core-lock/ml-lock vet.
+_FLOORS = {
+    "docker/Dockerfile.whisper": {"starlette": (1, 10, 0), "filelock": (4, 2, 6)},
+    "docker/Dockerfile.piper": {"starlette": (1, 10, 0)},
+}
+
+
+def _pinned_version(text: str, pkg: str) -> tuple[int, ...] | None:
+    m = re.search(rf"(?<![A-Za-z0-9._-]){re.escape(pkg)}==([0-9][0-9.]*)\b", text)
+    return tuple(int(x) for x in m.group(1).rstrip(".").split(".")) if m else None
+
+
+def test_voice_images_pin_no_known_vulnerable_starlette_or_filelock() -> None:
+    for rel, floors in _FLOORS.items():
+        text = (ROOT / rel).read_text()
+        for pkg, floor in floors.items():
+            got = _pinned_version(text, pkg)
+            assert got is not None, f"{rel}: no `{pkg}==` pin — the parse is wrong, not the file clean"
+            assert got >= floor, (
+                f"{rel}: {pkg}=={'.'.join(map(str, got))} is below {'.'.join(map(str, floor))}, "
+                "which carries fixable HIGH CVEs that hold the image at the infra-staged gate"
+            )
+
 def test_the_guard_catches_a_floating_line() -> None:
     bad = 'RUN pip install --no-cache-dir \\\n    faster-whisper==1.1.1 \\\n    "fastapi>=0.115,<0.116" requests\n'
     (toks,) = pip_installs(bad)

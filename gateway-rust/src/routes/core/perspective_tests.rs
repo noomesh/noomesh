@@ -235,7 +235,7 @@ fn me_answers_as_the_perspective() {
         id: "0f9c1d2e-0000-4000-8000-000000000001".into(),
         dims: Perspective { role_cap: Some(Role::User), ..Perspective::default() },
     };
-    let seen = me_answer(&u, Some((&prs, chrono::Utc::now())));
+    let seen = me_answer(&u, Some((&prs, jiff::Timestamp::now())));
     assert_eq!(seen["role"], "user");
     assert_eq!(seen["scopes"], json!(["read"]), "the real scopes leaked into a user view");
     assert_eq!(seen["perspective"]["id"], prs.id);
@@ -356,7 +356,7 @@ async fn the_cap_ends_an_orphaned_perspective() {
 #[test]
 fn the_cap_is_not_advertised() {
     let dims = Perspective { role_cap: Some(Role::User), core_only: true, ..Perspective::default() };
-    let at = chrono::Utc::now();
+    let at = jiff::Timestamp::now();
     let v = perspective::view("0f9c1d2e-0000-4000-8000-000000000001", &dims, at);
     let mut keys: Vec<&str> = v.as_object().expect("an object").keys().map(String::as_str).collect();
     keys.sort_unstable();

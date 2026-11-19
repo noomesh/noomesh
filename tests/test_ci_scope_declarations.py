@@ -62,6 +62,9 @@ OWNS = {
     "router-harness": "gateway",
     "ui": "ui",
     "llamacpp-image": "llamacpp",
+    # The GPU llama-server image (0.6.28): the same switch, armed by either
+    # llamacpp Dockerfile.
+    "llamacpp-cuda-image": "llamacpp",
     "ollama-image": "ollama",
     "voice-images": "voice",
 }
@@ -295,7 +298,7 @@ def test_the_classifier_narrows_and_fails_open() -> None:
         assert got["voice"] == "false", f"{unknown} built the voice images: {got}"
 
     # Its own inputs, and the workflow that builds it, do arm it.
-    for own in (["docker/Dockerfile.llamacpp"], [".github/workflows/ci.yml"]):
+    for own in (["docker/Dockerfile.llamacpp"], ["docker/Dockerfile.llamacpp-cuda"], [".github/workflows/ci.yml"]):
         assert _classify(own)["llamacpp"] == "true", f"{own} must compile llama-server"
     for own in (["docker/Dockerfile.ollama"], [".github/workflows/ci.yml"]):
         assert _classify(own)["ollama"] == "true", f"{own} must build the ollama image"
@@ -512,6 +515,19 @@ def test_the_llamacpp_image_reads_nothing_else_from_the_tree() -> None:
     )
 
 
+def test_the_cuda_llamacpp_image_reads_nothing_else_from_the_tree() -> None:
+    """The same soundness condition for docker/Dockerfile.llamacpp-cuda, which
+    arms the same llamacpp switch: no COPY from the build context."""
+    df = (ROOT / "docker/Dockerfile.llamacpp-cuda").read_text()
+    copies = [ln.strip() for ln in df.splitlines() if re.match(r"\s*(COPY|ADD)\b", ln)]
+    assert copies, "no COPY in docker/Dockerfile.llamacpp-cuda — this guard parsed the wrong file"
+    from_context = [c for c in copies if "--from=" not in c]
+    assert not from_context, (
+        f"docker/Dockerfile.llamacpp-cuda now reads the build context ({from_context}); "
+        "add those paths to the llamacpp switch in ci.yml's scope step"
+    )
+
+
 def test_the_ollama_image_reads_nothing_else_from_the_tree() -> None:
     """The same soundness condition as llamacpp's, for the ollama switch:
     docker/Dockerfile.ollama takes no input from the build context."""
@@ -560,7 +576,7 @@ def test_both_image_lanes_build_every_stage() -> None:
     """i415: a lane that builds `--target builder` proves nothing about the
     runtime stage, which is where 0.6.16-rc.1's release failed."""
     wf = _workflow()
-    for job in ("llamacpp-image", "ollama-image"):
+    for job in ("llamacpp-image", "llamacpp-cuda-image", "ollama-image"):
         runs = " ".join(s.get("run", "") for s in wf["jobs"][job]["steps"])
         assert "docker buildx build" in runs, f"{job} builds nothing"
         assert "--target" not in runs, f"{job} builds one stage only: {job} must build the whole image"

@@ -425,6 +425,7 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
         util::GpuDetect::Found(model, vram) => {
             ctx.state.gpu_model = model.clone();
             ctx.state.vram_gb = vram;
+            ctx.state.compute_cap = util::detect_compute_cap();
             ctx.state.tier = util::tier_for_vram(vram);
             ctx.success(&format!("GPU: {model} ({vram:.0} GB) — Tier {}", ctx.state.tier));
         }
@@ -497,13 +498,26 @@ systemctl restart docker"#;
 
     // Backends for this tier
     ctx.info("Available LLM backends for your hardware:");
-    match ctx.state.tier {
-        1 => {
+    // The hardware decides here, not the install shape: standalone is the
+    // model step's question.
+    match (ctx.state.tier, vllm_offer(ctx.state.tier, ctx.state.compute_cap.as_deref(), false)) {
+        (1, VllmOffer::BelowFloor(why)) => {
+            ctx.info("  Ollama — runs on this GPU, GGUF quantized (recommended)");
+            ctx.info("  llama.cpp — flexible, GGUF with GPU offload");
+            say_vllm_floor_once(ctx, &why);
+        }
+        (1, VllmOffer::OfferNotRecommended(why)) => {
+            ctx.info("  Ollama — simple setup, GGUF quantized (recommended)");
+            ctx.info("  vLLM — fastest inference, AWQ/GPTQ quantized");
+            ctx.info("  llama.cpp — flexible, GGUF with GPU offload");
+            say_vllm_floor_once(ctx, &why);
+        }
+        (1, _) => {
             ctx.info("  vLLM — fastest inference, AWQ/GPTQ quantized (recommended)");
             ctx.info("  Ollama — simple setup, GGUF quantized");
             ctx.info("  llama.cpp — flexible, GGUF with GPU offload");
         }
-        2 => {
+        (2, _) => {
             ctx.info("  Ollama — best for 4-10 GB VRAM (recommended)");
             ctx.info("  llama.cpp — GGUF with partial GPU offload");
         }
@@ -6055,11 +6069,25 @@ pub(crate) fn harrier_artifact_ref() -> String {
 /// Ctx-free core, shared with `noo migrate import` (which has no wizard
 /// context but the same duty: a configured embedder that is not PRESENT is
 /// silent RAG death). Returns display lines tagged +success/!warn/.progress.
+/// Does `ollama list`'s output name `model`? Compared against the NAME
+/// column only (the first field of each row; the `NAME` header is skipped),
+/// exactly or as `<model>:latest` when the model names no tag. A substring
+/// of the whole output is not an answer: a hex-only name can sit inside the
+/// 12-hex ID column, and "bge" is a prefix of "bge-m3" — either false match
+/// skipped the embedder pull and left RAG without one. Pure.
+pub(crate) fn ollama_list_has(out: &str, model: &str) -> bool {
+    let tagged = if model.contains(':') { model.to_string() } else { format!("{model}:latest") };
+    out.lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|name| *name != "NAME")
+        .any(|name| name == model || name == tagged)
+}
+
 pub(crate) fn ensure_embed_model_core(model: &str) -> Vec<String> {
     let mut out_lines = Vec::new();
     let embed = crate::envfile::container("ollama-embed");
     let (probe, out) = sh::docker(&["exec", &embed, "ollama", "list"]);
-    if probe == 0 && out.contains(model) {
+    if probe == 0 && ollama_list_has(&out, model) {
         return out_lines; // already present
     }
     if model == "harrier" {
@@ -6954,6 +6982,7 @@ pub fn first_model(ctx: &mut Ctx) {
             util::GpuDetect::Found(gpu, vram) => {
                 ctx.state.gpu_model = gpu;
                 ctx.state.vram_gb = vram;
+                ctx.state.compute_cap = util::detect_compute_cap();
                 ctx.state.tier = util::tier_for_vram(vram);
             }
             util::GpuDetect::Busy => {
@@ -6970,7 +6999,10 @@ pub fn first_model(ctx: &mut Ctx) {
     // Already-configured + cached?
     let existing_vllm = ctx.read_env("VLLM_MODEL");
     let standalone_box = ctx.repo_root.join(".noo-standalone").exists();
-    if vllm_shortcut_applies(&existing_vllm, standalone_box) && hf_model_cached(ctx, &existing_vllm) {
+    // A cached vLLM model is no shortcut on a GPU below the vLLM image's
+    // compute floor: it could not start there.
+    let below_floor = matches!(vllm_offer(ctx.state.tier, ctx.state.compute_cap.as_deref(), standalone_box), VllmOffer::BelowFloor(_));
+    if vllm_shortcut_applies(&existing_vllm, standalone_box) && !below_floor && hf_model_cached(ctx, &existing_vllm) {
         ctx.info(&format!("Model already downloaded: {existing_vllm}"));
         let keep = ctx.non_interactive || ctx.asker.confirm(&format!("Use cached model {existing_vllm}?"), true);
         if keep {
@@ -7031,12 +7063,16 @@ pub fn first_model(ctx: &mut Ctx) {
     // that will place it — and is not offered on standalone, where the
     // embed ollama already holds the GPU.
     let standalone = ctx.repo_root.join(".noo-standalone").exists();
-    let offer_vllm = ctx.state.tier == 1 && !standalone;
+    let offer = vllm_offer(ctx.state.tier, ctx.state.compute_cap.as_deref(), standalone);
+    let offer_vllm = matches!(offer, VllmOffer::Offer | VllmOffer::OfferNotRecommended(_));
     let backend: String = if ctx.non_interactive {
         ctx.info("Auto-selected backend: ollama");
         "ollama".to_string()
     } else {
         ctx.info("1. Ollama — local inference, GGUF (recommended)");
+        if let VllmOffer::BelowFloor(why) | VllmOffer::OfferNotRecommended(why) = &offer {
+            say_vllm_floor_once(ctx, why);
+        }
         let mut max = 1;
         let vllm_choice = if offer_vllm {
             max += 1;
@@ -7186,6 +7222,54 @@ pub fn first_model(ctx: &mut Ctx) {
     }
 }
 
+/// What onboarding says of vLLM on this box.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VllmOffer {
+    /// Offered as a choice, and recommended on the prereqs list.
+    Offer,
+    /// Not for this tier or install (standalone): nothing to explain.
+    No,
+    /// A tier-1 GPU whose compute capability could not be read: still offered
+    /// (a refusal rests on a known fact), never recommended, and this line
+    /// says why.
+    OfferNotRecommended(String),
+    /// A tier-1 GPU KNOWN to be below the vLLM image's compute floor: not
+    /// offered, never recommended, and this line says why.
+    BelowFloor(String),
+}
+
+/// Whether onboarding offers (and recommends) vLLM: a tier-1 GPU (10 GB VRAM
+/// or more), not a standalone box, and a compute capability at or above the
+/// vLLM image's floor (`crate::vllm_floor`). A known capability below it is
+/// not offered; an unknown one is offered without the recommendation. Pure.
+pub(crate) fn vllm_offer(tier: u8, compute_cap: Option<&str>, standalone: bool) -> VllmOffer {
+    if tier != 1 || standalone {
+        return VllmOffer::No;
+    }
+    if crate::vllm_floor::usable(compute_cap) {
+        return VllmOffer::Offer;
+    }
+    match compute_cap.filter(|c| crate::vllm_floor::parse_compute_cap(c).is_some()) {
+        Some(c) => VllmOffer::BelowFloor(format!(
+            "vLLM not offered: {}; this GPU is {c} — Ollama runs models on this GPU",
+            crate::vllm_floor::needs()
+        )),
+        None => VllmOffer::OfferNotRecommended(format!(
+            "vLLM offered but not recommended: this GPU's compute capability is unknown (nvidia-smi could not read it), and {}",
+            crate::vllm_floor::needs()
+        )),
+    }
+}
+
+/// Print why vLLM is not offered (or not recommended), once per run (the
+/// prereqs list and the model step both reach it).
+fn say_vllm_floor_once(ctx: &mut Ctx, why: &str) {
+    if !ctx.state.vllm_floor_said {
+        ctx.state.vllm_floor_said = true;
+        ctx.info(&format!("  {why}"));
+    }
+}
+
 /// Does a leftover `VLLM_MODEL` short-circuit the model step into "use the
 /// cached vLLM model"? Never on a standalone box: vLLM is not offered there
 /// (the embed Ollama holds the GPU), and a `.env` or HF cache kept from an
@@ -7223,13 +7307,40 @@ fn chat_probe_answered(doc: &serde_json::Value) -> Result<(), String> {
 }
 
 /// A probe the wizard cannot make is not a model that cannot answer: no
-/// stored login, or a credential the route refuses. Everything else
-/// (timeout, 404 not served, 5xx, unreachable) is the install's fault.
-fn probe_error_is_unverifiable(err: &str) -> bool {
-    let e = err.to_ascii_lowercase();
-    ["401", "403", "unauthorized", "forbidden", "not logged in", "log in", "login"]
-        .iter()
-        .any(|k| e.contains(k))
+/// stored login (the gateway answers 401) or a credential the route refuses
+/// (403). Everything else (timeout, 404 not served, 5xx, unreachable) is the
+/// install's fault.
+///
+/// Decided on the typed HTTP status only, never on a substring of the
+/// error: the 0.6.28-rc.2 install matrix got a retryable 404 whose body
+/// carried the random ref "ref-2b0d6401ee", read "401" in it, and quit the
+/// retry loop after one try.
+fn probe_error_is_unverifiable(err: &crate::http::TryFail) -> bool {
+    matches!(err.status, Some(401 | 403))
+}
+
+/// The probe failure as one line: `HTTP <status>: <the server's message>`,
+/// trimmed, or the transport sentence when nothing answered.
+fn probe_fail_summary(err: &crate::http::TryFail) -> String {
+    let Some(status) = err.status else {
+        return err.line.clone();
+    };
+    let doc = serde_json::from_str::<serde_json::Value>(&err.body).ok();
+    let said = doc
+        .as_ref()
+        .and_then(|v| {
+            v["error"]["message"]
+                .as_str()
+                .or_else(|| v["detail"].as_str())
+                .or_else(|| v["error"].as_str())
+                .or_else(|| v["message"].as_str())
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| if err.body.trim().is_empty() { err.line.clone() } else { err.body.clone() });
+    let said = said.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cut: String = said.chars().take(240).collect();
+    let more = if cut.len() < said.len() { "…" } else { "" };
+    format!("HTTP {status}: {cut}{more}")
 }
 
 /// The pair of facts a first-model success must rest on: the configured
@@ -7252,18 +7363,18 @@ fn default_model_mismatch(read: &Result<(String, String), String>, model: &str) 
 /// its node (a controller with a node agent learns of a fresh pull at the
 /// next heartbeat; the gateway answers "not served by any node" until then).
 /// Bounded: 5 tries, 10 s apart. Any other error returns at once.
-fn chat_probe(ctx: &Ctx, model: Option<&str>) -> Result<(), String> {
+fn chat_probe(ctx: &Ctx, model: Option<&str>) -> Result<(), crate::http::TryFail> {
     let body = chat_probe_body(model);
-    let mut last = String::new();
+    let mut last = crate::http::TryFail::local("");
     for attempt in 0..5 {
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_secs(10));
         }
-        match crate::http::post_json_try(ctx.g, "/api/inference", &body, true, 180)
-            .and_then(|doc| chat_probe_answered(&doc))
+        match crate::http::post_json_status_try(ctx.g, "/api/inference", &body, true, 180)
+            .and_then(|doc| chat_probe_answered(&doc).map_err(crate::http::TryFail::local))
         {
             Ok(()) => return Ok(()),
-            Err(e) if model.is_some() && e.contains("is not served by any node") && attempt < 4 => last = e,
+            Err(e) if model.is_some() && e.line.contains("is not served by any node") && attempt < 4 => last = e,
             Err(e) => return Err(e),
         }
     }
@@ -7290,10 +7401,12 @@ fn verify_first_model(ctx: &mut Ctx) {
     match chat_probe(ctx, Some(&model)) {
         Ok(()) => {}
         Err(e) if probe_error_is_unverifiable(&e) => {
+            let e = probe_fail_summary(&e);
             ctx.warn(&format!("Could not check chat for {model} ({e}). Check it: noo chat --model {model} --message hi"));
             return;
         }
         Err(e) => {
+            let e = probe_fail_summary(&e);
             let line = format!(
                 "model: {model} was pulled but a chat request for it failed: {e}. Check: noo cluster verify; noo chat --model {model} --message hi"
             );
@@ -7313,14 +7426,28 @@ fn verify_first_model(ctx: &mut Ctx) {
     match unpinned_probe_until_routed(ctx) {
         Ok(()) => ctx.success("Chat with no model named (what `noo chat` sends) answers"),
         Err(e) => {
-            let line = format!(
-                "model: {model} answers when named, but chat with no model named does not ({e}). \
-                 Check: noo cluster verify --controller; noo chat --message hi"
-            );
+            let line = unpinned_failure_line(&model, &e);
             ctx.error(&line);
             ctx.state.hard_failures.push(line);
         }
     }
+}
+
+/// The hard-failure line for unpinned chat that never answered: a refused
+/// credential (401/403) says so and how to log in; anything else names the
+/// last error the retries saw (status and the server's message). Pure.
+fn unpinned_failure_line(model: &str, last: &crate::http::TryFail) -> String {
+    let e = probe_fail_summary(last);
+    if probe_error_is_unverifiable(last) {
+        return format!(
+            "model: chat with no model named was refused ({e}): not logged in, or this login is not allowed to chat. \
+             Fix: noo auth login; then noo chat --message hi"
+        );
+    }
+    format!(
+        "model: {model} answers when named, but chat with no model named does not after {UNPINNED_TRIES} tries \
+         (last error: {e}). Check: noo cluster verify --controller; noo chat --message hi"
+    )
 }
 
 /// The ollama chat placement already declared on this node, if any (its
@@ -7399,16 +7526,45 @@ fn place_pulled_model(ctx: &mut Ctx, model: &str) {
     }
 }
 
+/// How many unpinned probes, 10 s apart, before the model step gives up.
+const UNPINNED_TRIES: u32 = 9;
+
+/// The one line said while unpinned chat is retried (not one per try).
+const UNPINNED_WAITING: &str = "Waiting for the chat lane: the agent reports a placed model with its next heartbeat \
+     (up to ~30 s); retrying every 10 s...";
+
 /// Unpinned chat, retried while a fresh placement becomes a lane: the
 /// agent's reconcile tick plus the gateway's 30 s placement cache. Bounded:
 /// 9 tries, 10 s apart.
-fn unpinned_probe_until_routed(ctx: &Ctx) -> Result<(), String> {
-    let mut last = String::new();
-    for attempt in 0..9 {
+fn unpinned_probe_until_routed(ctx: &Ctx) -> Result<(), crate::http::TryFail> {
+    retry_until_routed(
+        UNPINNED_TRIES,
+        || chat_probe(ctx, None),
+        || std::thread::sleep(std::time::Duration::from_secs(10)),
+        || ctx.progress(UNPINNED_WAITING),
+    )
+}
+
+/// The retry loop of [`unpinned_probe_until_routed`], with the probe, the
+/// pause and the waiting line injected so a test runs it without a gateway
+/// or a sleep. A refused credential (401/403, by status) stops at once;
+/// any other failure is retried, `waiting` is called once at the first
+/// retry, and giving up returns the LAST error.
+fn retry_until_routed<P, S, W>(tries: u32, mut probe: P, mut pause: S, mut waiting: W) -> Result<(), crate::http::TryFail>
+where
+    P: FnMut() -> Result<(), crate::http::TryFail>,
+    S: FnMut(),
+    W: FnMut(),
+{
+    let mut last = crate::http::TryFail::local("no probe was made");
+    for attempt in 0..tries {
         if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_secs(10));
+            if attempt == 1 {
+                waiting();
+            }
+            pause();
         }
-        match chat_probe(ctx, None) {
+        match probe() {
             Ok(()) => return Ok(()),
             Err(e) if probe_error_is_unverifiable(&e) => return Err(e),
             Err(e) => last = e,
@@ -7435,13 +7591,53 @@ mod chown_failure_tests {
 
 #[cfg(test)]
 mod first_model_probe_tests {
-    use super::{chat_probe_answered, chat_probe_body, default_model_mismatch, probe_error_is_unverifiable, vllm_shortcut_applies};
+    use super::{
+        chat_probe_answered, chat_probe_body, default_model_mismatch, probe_error_is_unverifiable, retry_until_routed,
+        unpinned_failure_line, vllm_offer, vllm_shortcut_applies, VllmOffer,
+    };
+    use crate::http::TryFail;
 
     #[test]
     fn a_leftover_vllm_model_does_not_short_circuit_a_standalone_install() {
         assert!(!vllm_shortcut_applies("Qwen/Qwen3-8B-AWQ", true));
         assert!(vllm_shortcut_applies("Qwen/Qwen3-8B-AWQ", false));
         assert!(!vllm_shortcut_applies("", false));
+    }
+
+    /// vLLM is offered and recommended on a tier-1 GPU at or above the vLLM
+    /// image's compute floor, never on standalone; known below the floor, it
+    /// is not offered and the line says why, once.
+    #[test]
+    fn vllm_is_offered_only_on_a_tier_one_gpu_at_or_above_the_compute_floor() {
+        assert_eq!(vllm_offer(1, Some("8.6"), false), VllmOffer::Offer);
+        assert_eq!(vllm_offer(1, Some("7.5"), false), VllmOffer::Offer, "the floor itself is usable");
+        assert_eq!(vllm_offer(1, Some("10.0"), false), VllmOffer::Offer, "compared as numbers");
+        match vllm_offer(1, Some("6.1"), false) {
+            VllmOffer::BelowFloor(why) => assert!(
+                why.contains("this GPU is 6.1") && why.contains("7.5+") && why.contains("CUDA 13.0") && why.contains("Ollama runs"),
+                "{why}"
+            ),
+            other => panic!("a compute 6.1 GPU is below the floor: {other:?}"),
+        }
+        assert_eq!(vllm_offer(1, Some("8.6"), true), VllmOffer::No, "never on standalone");
+        assert_eq!(vllm_offer(2, Some("6.1"), false), VllmOffer::No, "tier 2 never offered it: nothing to explain");
+    }
+
+    /// A refusal rests on a known fact: a tier-1 GPU whose compute capability
+    /// could not be read (or does not parse) is still offered vLLM, but not
+    /// recommended, and the line says why.
+    #[test]
+    fn vllm_is_offered_but_not_recommended_when_the_compute_cap_is_unknown() {
+        for cap in [None, Some("[N/A]")] {
+            match vllm_offer(1, cap, false) {
+                VllmOffer::OfferNotRecommended(why) => assert!(
+                    why.contains("not recommended") && why.contains("unknown") && why.contains("7.5+"),
+                    "{why}"
+                ),
+                other => panic!("unknown ({cap:?}) is offered without the recommendation: {other:?}"),
+            }
+        }
+        assert_eq!(vllm_offer(1, None, true), VllmOffer::No, "never on standalone");
     }
 
     #[test]
@@ -7472,11 +7668,89 @@ mod first_model_probe_tests {
         assert!(chat_probe_answered(&serde_json::json!({})).is_err());
     }
 
+    /// The 0.6.28-rc.2 install-matrix 404: not served yet, with a random
+    /// ref that holds "401".
+    const NOT_SERVED_404: &str = r#"{"error":{"message":"resolve failed: model 'gemma4:e2b' is not served by any node","type":"not_found","ref":"ref-2b0d6401ee"}}"#;
+
+    /// (a) A 404 whose body carries "401" in a random ref, or "403" in a
+    /// digest, is not a refused login: the loop retries it.
     #[test]
-    fn a_refused_login_is_unverifiable_but_a_timeout_or_404_is_a_failure() {
-        assert!(probe_error_is_unverifiable("HTTP 401: Unauthorized"));
-        assert!(!probe_error_is_unverifiable("the gateway is up but this answer took longer than 180s"));
-        assert!(!probe_error_is_unverifiable("model 'x' is not served by any node; the only chat backend is the Ollama"));
+    fn a_status_digit_inside_a_body_id_is_not_a_refused_login() {
+        let ref_404 = TryFail::from_status(404, NOT_SERVED_404);
+        assert!(ref_404.line.contains("2b0d6401ee"), "the line still carries the body: {}", ref_404.line);
+        assert!(!probe_error_is_unverifiable(&ref_404), "ref-2b0d6401ee is not a 401");
+        let digest_404 = TryFail::from_status(404, r#"{"error":"model sha256:9f403c1e not found","ref":"ref-0000000000"}"#);
+        assert!(!probe_error_is_unverifiable(&digest_404), "a 403 inside a digest is not a 403");
+        assert!(!probe_error_is_unverifiable(&TryFail::from_status(503, "login service warming up")));
+        assert!(!probe_error_is_unverifiable(&TryFail::local("the gateway is up but this answer took longer than 180s")));
+        // The loop: two such 404s, then the lane appears.
+        let mut answers = vec![Ok(()), Err(digest_404), Err(ref_404)];
+        let mut probes = 0;
+        let got = retry_until_routed(9, || { probes += 1; answers.pop().unwrap() }, || {}, || {});
+        assert_eq!((got, probes), (Ok(()), 3), "a 404 is retried until the lane answers");
+    }
+
+    /// (b) A real 401 or 403, by status, is unverifiable and stops the loop
+    /// at the first try, with no waiting line.
+    #[test]
+    fn a_real_401_or_403_stops_the_probe_at_once() {
+        for status in [401u16, 403] {
+            let refused = TryFail::from_status(status, r#"{"detail":"credentials rejected"}"#);
+            assert!(probe_error_is_unverifiable(&refused), "{status}");
+            let (mut probes, mut pauses, mut waits) = (0, 0, 0);
+            let got = retry_until_routed(9, || { probes += 1; Err(refused.clone()) }, || pauses += 1, || waits += 1);
+            assert_eq!(got.unwrap_err().status, Some(status));
+            assert_eq!((probes, pauses, waits), (1, 0, 0), "{status} stops at once");
+            let line = unpinned_failure_line("gemma4:e2b", &refused);
+            assert!(line.contains("not logged in") && line.contains("noo auth login"), "{line}");
+        }
+    }
+
+    /// (c) Giving up after every try names the LAST error: its status and
+    /// the server's message, trimmed.
+    #[test]
+    fn giving_up_names_the_last_error() {
+        let first = TryFail::from_status(503, r#"{"detail":"gateway warming up"}"#);
+        let last = TryFail::from_status(404, NOT_SERVED_404);
+        let mut answers = vec![Err(last.clone()), Err(first.clone()), Err(first)];
+        let got = retry_until_routed(3, || answers.pop().unwrap(), || {}, || {}).unwrap_err();
+        assert_eq!(got, last, "the last error, not the first");
+        let line = unpinned_failure_line("gemma4:e2b", &got);
+        assert!(
+            line.contains("last error: HTTP 404: resolve failed: model 'gemma4:e2b' is not served by any node"),
+            "{line}"
+        );
+        assert!(!line.contains("warming up") && !line.contains("not logged in"), "{line}");
+    }
+
+    /// The embedder pull is skipped only when the NAME column holds the
+    /// model: not a hex-only name sitting inside the ID column, not "bge"
+    /// as a prefix of "bge-m3".
+    #[test]
+    fn the_embedder_is_present_only_by_its_name_column() {
+        use super::ollama_list_has;
+        let out = "NAME                 ID              SIZE      MODIFIED\n\
+                   bge-m3:latest        790764642607    1.2 GB    2 days ago\n\
+                   harrier:latest       3e2f0a1b2c3d    600 MB    3 days ago\n";
+        assert!(!ollama_list_has(out, "bge"), "a prefix of bge-m3 is not bge");
+        assert!(!ollama_list_has(out, "0a1b2c"), "a hex name inside the ID column is not listed");
+        assert!(!ollama_list_has(out, "NAME"), "the header is not a model");
+        assert!(ollama_list_has(out, "harrier"), "an untagged name matches :latest");
+        assert!(ollama_list_has(out, "bge-m3:latest"));
+        assert!(ollama_list_has(out, "bge-m3"));
+        assert!(!ollama_list_has(out, "harrier:v2"), "another tag is another model");
+        assert!(!ollama_list_has("", "harrier"));
+    }
+
+    /// (d) The waiting line is said once while the loop retries, not once
+    /// per try.
+    #[test]
+    fn the_waiting_line_is_said_once_not_per_try() {
+        let not_served = TryFail::from_status(404, NOT_SERVED_404);
+        let (mut probes, mut pauses, mut waits) = (0, 0, 0);
+        let got = retry_until_routed(9, || { probes += 1; Err(not_served.clone()) }, || pauses += 1, || waits += 1);
+        assert!(got.is_err());
+        assert_eq!((probes, pauses, waits), (9, 8, 1), "nine tries, eight pauses, one waiting line");
     }
 
     /// Onboard's pull writes the controller's record of itself: the registry
@@ -7492,6 +7766,9 @@ mod first_model_probe_tests {
         let after = pull.find("ollama_stage::record_after_pull(pending,").expect("the record is written after the pull");
         assert!(before < run && run < ok && ok < after, "fetch, pull, then record on success");
         assert!(pull[after..].contains("read_container_manifest(target, r)"), "the record compares with the container that pulled");
+        // An unwritable store (found before the pull): its one line, then the
+        // store guide's command (i1021).
+        assert!(pull[after..].contains("if let Some(cmd) = record.remedy() {"), "onboard prints the store guide's command");
     }
 
     #[test]
@@ -7715,6 +7992,11 @@ fn pull_ollama(ctx: &mut Ctx, model: &str) {
         });
         if let Some(line) = record.line() {
             if record.written() { ctx.info(&line) } else { ctx.warn(&line) }
+        }
+        // A store this user cannot write (checked before the pull): the
+        // store guide's ACL command for it, after the one line.
+        if let Some(cmd) = record.remedy() {
+            ctx.info(&format!("to record pulls: {cmd}"));
         }
         // Record the choice where the LAUNCHER reads it (finding #70): the
         // start script pulls "${OLLAMA_MODEL:-gemma4:e2b}" on every stack

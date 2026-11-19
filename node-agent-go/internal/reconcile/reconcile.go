@@ -280,6 +280,16 @@ type Reconciler struct {
 	// Guarded by pullMu.
 	knownImportOnly map[string]bool
 
+	// nudges counts Nudge calls (taken or coalesced), for tests.
+	nudges atomic.Uint64
+	// backendReady says whether a backend this agent just started answers
+	// what the next tick will ask of it (nudgeWhenReady). nil = no
+	// readiness nudge; the ticker alone brings the next pass.
+	backendReady func(ctx context.Context, backend, model string) bool
+	// afterFunc schedules a quick import retry's nudge (r.after); nil =
+	// time.AfterFunc. Injected for tests.
+	afterFunc func(time.Duration, func())
+
 	// envConflicts are the placement_env_conflict refusal targets recorded
 	// last pass, so ones that resolved are cleared.
 	envConflicts map[string]bool
@@ -289,6 +299,11 @@ type ollamaPullState struct {
 	inFlight   bool
 	lastFailed time.Time
 	failures   int
+	// doorRetries counts the quick retries spent on dial-level import
+	// failures (importDoorRetryAfter); reset by a success or by any failure
+	// the door answered. Past the last one, a dial failure takes the normal
+	// backoff.
+	doorRetries int
 }
 
 // ollamaPullRetryAfter is how long a failed pull is left alone.
@@ -309,13 +324,13 @@ func shouldStartOllamaPull(st *ollamaPullState, now time.Time) bool {
 func New(cfg *config.Config, docker *dockerpkg.Client, client *http.Client, harness hostsvc.Service) *Reconciler {
 	sets := modelsets.New(dockerpkg.ModelsDir(), cfg)
 	nw, facts := newNodeWorkloads(cfg, docker, sets)
-	return &Reconciler{
+	r := &Reconciler{
 		cfg:             cfg,
 		docker:          docker,
 		ollamaPulls:     map[string]*ollamaPullState{},
-		ollamaVerify:    newOllamaVerifyLoop(ollamaVerifier(docker)),
 		storeHas:        dockerpkg.ModelInStore,
 		importModel:     docker.ImportOllamaModel,
+		backendReady:    dockerBackendReady(docker),
 		client:          client,
 		mcp:             mcpsrv.New(cfg, client, docker),
 		sets:            sets,
@@ -331,6 +346,8 @@ func New(cfg *config.Config, docker *dockerpkg.Client, client *http.Client, harn
 		ggufMissing:     map[string]string{},
 		ggufExists:      docker.HostFileExists,
 	}
+	r.ollamaVerify = newOllamaVerifyLoop(ollamaVerifier(docker), r.Nudge)
+	return r
 }
 
 // SetDiskReclaimSink installs the receiver for the controller's node reclaim
@@ -386,6 +403,7 @@ func (r *Reconciler) Run(ctx context.Context) {
 // yield, after resuming, so a placed backend it never started comes up).
 // Non-blocking; nudges coalesce.
 func (r *Reconciler) Nudge() {
+	r.nudges.Add(1)
 	select {
 	case r.nudgeCh() <- struct{}{}:
 	default:
@@ -395,6 +413,83 @@ func (r *Reconciler) Nudge() {
 func (r *Reconciler) nudgeCh() chan struct{} {
 	r.nudgeOnce.Do(func() { r.nudge = make(chan struct{}, 1) })
 	return r.nudge
+}
+
+// A start tick only starts the container: the work that follows (ensure
+// the placed model is held, import it, verify its bytes) runs on the NEXT
+// tick, which the ticker alone brings defaultInterval later. Measured on a
+// hosted node (0.6.28-rc.2): placing an ollama model took ~11 min to read
+// verified for ~3 s of import, one full interval per step. So these events
+// nudge, once each:
+//
+//   - an ollama container this agent just started answers through the
+//     door the import dials (nudgeWhenReady, importDoorReady), so the next
+//     tick's ensure and import find it up;
+//   - an import of a placed model finishes successfully (startOllamaImport),
+//     so the next tick sees it held and schedules its verification;
+//   - a verify pass ends that was busy while a tick found other models due
+//     (ollamaVerifyLoop.missed), so they are checked on the next tick; a
+//     pass that skipped nothing never nudges;
+//   - an import failed because its door could not be dialled (doorNotUp):
+//     a few quick retries, one spaced nudge each (importDoorRetryAfter).
+//
+// Any other FAILED import or pull never nudges: its backoff
+// (ollamaPullRetryAfter) decides when it is tried again. Nudges coalesce (a
+// buffer of one), so any number of them while a pass runs or one is pending
+// is one extra pass.
+const (
+	startReadyWithin = 60 * time.Second
+	startReadyEvery  = 2 * time.Second
+)
+
+// nudgeWhenReady polls a just-started backend every `every`, for at most
+// `within`, and nudges ONCE when it is ready, then stops. Not ready in time:
+// no nudge (the ticker brings the next pass). Run in its own goroutine.
+func (r *Reconciler) nudgeWhenReady(ctx context.Context, backend, model string, within, every time.Duration) {
+	if r.backendReady == nil {
+		return
+	}
+	deadline := time.Now().Add(within)
+	for {
+		pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		ready := r.backendReady(pctx, backend, model)
+		cancel()
+		if ready {
+			slog.Info("reconcile.backend_ready_nudge", "backend", backend, "model", model,
+				"detail", "a backend this agent started answers; reconciling now instead of at the next tick")
+			r.Nudge()
+			return
+		}
+		if !time.Now().Add(every).Before(deadline) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(every):
+		}
+	}
+}
+
+// backendStarted is the success path of a start: the earlier start refusal
+// no longer applies, and an ollama container gets its readiness nudge (the
+// only backend whose next tick has work left: ensure, import, verify).
+func (r *Reconciler) backendStarted(ctx context.Context, backend, model string) {
+	r.clearBackendStart(backend)
+	if backend == "ollama" {
+		go r.nudgeWhenReady(ctx, backend, model, startReadyWithin, startReadyEvery)
+	}
+}
+
+// dockerBackendReady is the production readiness: the Ollama API the
+// import dials answers through its door (importDoorReady). Not `ollama
+// list` inside noo-ollama: that answers before the noo-stunnel-ollama
+// sidecar the import goes through is up (0.6.28-rc.3).
+func dockerBackendReady(c *dockerpkg.Client) func(context.Context, string, string) bool {
+	if c == nil {
+		return importDoorReady(nil)
+	}
+	return importDoorReady(c.OllamaImportDoorAnswers)
 }
 
 // tick is the state of one reconcile pass, built up phase by phase.
@@ -671,6 +766,14 @@ func (r *Reconciler) planEffective(ctx context.Context, t *tick) bool {
 }
 
 func (r *Reconciler) sizeGpuYield(ctx context.Context, t *tick) bool {
+	// This node's GPU facts (NVIDIA GPU, nvidia runtime, compute capability),
+	// read once a tick BEFORE anything below decides where llamacpp runs:
+	// gpuyield's GPU set, the prefetch, the spec hash and the start all read
+	// them (dockerpkg.LlamacppGPUUsable: the CUDA image only on a node that
+	// can use it).
+	if r.docker != nil {
+		r.docker.RefreshGPUFacts(ctx)
+	}
 	// The shared-GPU yield sizes what the GPU backends need from these.
 	gpuyield.PublishPlacements(gpuPlacements(t.effective))
 	// The proxy's admission counts requests against these (occupancy).
@@ -728,9 +831,11 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 				// loopback API the probe uses.
 				// Every role's model, not just the primary.
 				r.ensureOllamaModels(ctx, r.cfg.NodeID, t.ollamaRows, r.native.HasModel, r.native.Pull)
-				// Report only on a native ollama: never repaired, never
-				// refused (the server is the operator's).
-				r.verifyOllamaModels(ctx, t.ollamaRows, true)
+				// Report only on an adopted ollama: never repaired, never
+				// refused (the server is the operator's, or the stack's).
+				// The lane's runtime picks the store the check reads: the
+				// stack's is ${NOO_DATA_ROOT}/ollama, not this agent's HOME.
+				r.verifyOllamaModels(ctx, t.ollamaRows, adoptedLane(r.native.Runtime()))
 				// Advertise what the server holds, not only what it
 				// has loaded: an idle ollama has nothing loaded, and a
 				// heartbeat with no model is never routed to.
@@ -801,7 +906,7 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 				r.ensureOllamaModels(ctx, r.cfg.NodeID, t.ollamaRows, r.docker.OllamaHasModel, r.docker.OllamaPull)
 				// Then the bytes it holds, against the controller's store
 				// (off-tick; see ollama_verify.go).
-				r.verifyOllamaModels(ctx, t.ollamaRows, false)
+				r.verifyOllamaModels(ctx, t.ollamaRows, dockerpkg.OllamaLaneContainer)
 			}
 			curHash, hasLabel := t.specLabels[p.Backend]
 			switch decideBackendDrift(hasLabel, curHash, desiredHash, r.driftRecreated[p.Backend], t.floating[p.Backend]) {
@@ -905,6 +1010,14 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 		if !r.ggufPresent(ctx, t, p) {
 			return
 		}
+		// The vLLM image's compute floor: a GPU its CUDA cannot drive would
+		// crash-loop the engine. Refused, and recorded for the `backend
+		// starts` verify row; the gateway refuses such a placement too.
+		if why := vllmComputeRefusal(p.Backend, r.minComputeCap()); why != "" {
+			slog.Error("reconcile.backend_refused", "backend", p.Backend, "reason", why)
+			refusals.Record("backend_start", p.Backend, why)
+			return
+		}
 
 		extraEnv := buildPlacementEnv(p)
 		slog.Info("reconcile.starting_backend",
@@ -915,7 +1028,7 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 			ModelsDir:   t.modelsDir,
 			ExtraEnv:    extraEnv,
 			SpecHash:    desiredHash,
-			Target:      p.Target,
+			Target:      dockerpkg.StartTarget(p.Backend, p.Target, p.Env),
 			MemoryLimit: p.MemoryLimitBytes,
 		}
 		if err := r.docker.StartBackend(ctx, p.Backend, p.Model, 0, overrides); err != nil {
@@ -940,7 +1053,7 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 			refusals.Record("backend_start", p.Backend, err.Error())
 			return
 		}
-		r.clearBackendStart(p.Backend)
+		r.backendStarted(ctx, p.Backend, p.Model)
 	}
 }
 
@@ -959,6 +1072,9 @@ func (r *Reconciler) reportAndCleanup(ctx context.Context, t *tick) bool {
 	// A harness whose placement was REMOVED is never visited by the loop
 	// above, which only walks placements that exist. Stop it here.
 	r.reapUnplacedHarness(ctx, t.desired.Placements)
+	// Nor does a vLLM backend no longer placed keep its start refusal: the
+	// compute-floor refusal's remedy IS the unplace.
+	clearUnplacedVllmRefusals(t.desired.Placements)
 	// A placement that was removed or stopped must stop reporting a model
 	// presence; only still-wanted ollama placements keep one.
 	// Keys of every still-wanted ollama placement survive, including the
@@ -1158,6 +1274,24 @@ func (r *Reconciler) startOllamaImport(ctx context.Context, node, key, model, ro
 		defer r.pullMu.Unlock()
 		st.inFlight = false
 		if err != nil {
+			// Never a substring of err's text: doorNotUp reads its type.
+			if doorNotUp(err) && st.doorRetries < len(importDoorRetryAfter) {
+				wait := importDoorRetryAfter[st.doorRetries]
+				st.doorRetries++
+				slog.Warn("reconcile.ollama_import_door_not_up", "model", model, "backend", key,
+					"error", err, "quick_retry", st.doorRetries, "of", len(importDoorRetryAfter), "retry_in", wait.String(),
+					"detail", "the import could not dial ollama's door (not up yet); retrying shortly, without the "+ollamaPullRetryAfter.String()+" backoff")
+				r.after(wait, r.Nudge)
+				return
+			}
+			if !doorNotUp(err) {
+				st.doorRetries = 0
+			} else if st.doorRetries == len(importDoorRetryAfter) {
+				st.doorRetries++ // logged once until a success or an answered failure
+				slog.Warn("reconcile.ollama_import_door_retries_spent", "model", model, "backend", key,
+					"quick_retries", len(importDoorRetryAfter),
+					"detail", "ollama's door never answered the quick retries; the normal backoff applies")
+			}
 			st.failures++
 			st.lastFailed = time.Now()
 			slog.Error("reconcile.ollama_import_failed", "model", model, "backend", key,
@@ -1168,11 +1302,17 @@ func (r *Reconciler) startOllamaImport(ctx context.Context, node, key, model, ro
 			return
 		}
 		st.failures = 0
+		st.doorRetries = 0
 		st.lastFailed = time.Time{}
 		// The next tick sees the model held and clears presence + refusal;
 		// clearing the refusal now just keeps the window honest.
 		refusals.Clear("placement_model", key)
 		slog.Info("reconcile.ollama_import_done", "model", model, "backend", key, "detail", out)
+		// Now, not a full interval later: the next pass sees the model
+		// held and schedules its verification in that same pass. Only on
+		// success; a failure waits out its backoff (the rule above
+		// startReadyWithin).
+		r.Nudge()
 	}()
 }
 
@@ -1415,7 +1555,7 @@ func specHashWith(p placement, key contentKeyFn) (string, bool) {
 	// after the 0.6.13 roll). Folded in only when set, so a node with no
 	// release pin, and a backend on an upstream image, keep their hash.
 	if p.Image == "" {
-		if img := dockerpkg.ReleaseBackendImage(p.Backend); img != "" {
+		if img := dockerpkg.ReleaseBackendImage(p.Backend, dockerpkg.StartTarget(p.Backend, p.Target, p.Env)); img != "" {
 			k, ok := key(img)
 			if !ok {
 				return "", false
@@ -1651,17 +1791,30 @@ func egressReaderFor(h hostsvc.Service) func(ctx context.Context) hostsvc.Egress
 	return rd.Read
 }
 
+// adoptedLane is the verifier lane of an adopted ollama with runtime rt: the
+// stack's on the controller's own node, else a native one. Never the
+// container lane, which repairs.
+func adoptedLane(rt string) string {
+	if rt == dockerpkg.OllamaLaneStack {
+		return dockerpkg.OllamaLaneStack
+	}
+	return dockerpkg.OllamaLaneNative
+}
+
 // ollamaVerifier is the production check: one verifier per lane (the
-// container's store, or a native ollama's), built once.
-func ollamaVerifier(c *dockerpkg.Client) func(context.Context, string, bool) dockerpkg.OllamaVerifyResult {
-	var once [2]sync.Once
-	var vs [2]*dockerpkg.OllamaVerifier
-	return func(ctx context.Context, model string, native bool) dockerpkg.OllamaVerifyResult {
+// container's store, a native ollama's, or the stack's), built once.
+func ollamaVerifier(c *dockerpkg.Client) func(context.Context, string, string) dockerpkg.OllamaVerifyResult {
+	lanes := [3]string{dockerpkg.OllamaLaneContainer, dockerpkg.OllamaLaneNative, dockerpkg.OllamaLaneStack}
+	var once [3]sync.Once
+	var vs [3]*dockerpkg.OllamaVerifier
+	return func(ctx context.Context, model string, lane string) dockerpkg.OllamaVerifyResult {
 		i := 0
-		if native {
-			i = 1
+		for j, l := range lanes {
+			if l == lane {
+				i = j
+			}
 		}
-		once[i].Do(func() { vs[i] = c.NewOllamaVerifier(native) })
+		once[i].Do(func() { vs[i] = c.NewOllamaVerifier(lanes[i]) })
 		return vs[i].Verify(ctx, model)
 	}
 }

@@ -1055,12 +1055,18 @@ pub(crate) fn is_own_image_with(image: &str, roots: &[&str]) -> bool {
 /// stage is refused up front.
 /// A third-party image is not required: a node may take it from its public
 /// registry under NOO_IMAGE_REGISTRY_FALLBACK. None = nothing to judge.
+///
+/// `on_gpu`: the placement runs llamacpp on the node's GPU
+/// (`placement_fit::llamacpp_runs_on_gpu`), so the node starts the CUDA build
+/// (`llamacpp-cuda`, amd64 only) and THAT is what must be staged; otherwise
+/// the CPU build. So a CPU node is never asked for the ~3 GB CUDA image.
 pub(crate) fn placement_required_image(
     backend: &str,
     body_image: Option<&str>,
     node_arch: &str,
     release: Option<&StagedRelease>,
     own_roots: &[String],
+    on_gpu: bool,
 ) -> Option<String> {
     if let Some(img) = body_image.map(str::trim).filter(|i| !i.is_empty()) {
         let mut roots: Vec<&str> = own_roots.iter().map(String::as_str).collect();
@@ -1070,7 +1076,7 @@ pub(crate) fn placement_required_image(
         return is_own_image_with(img, &roots).then(|| img.to_string());
     }
     let r = release?;
-    let name = release_image_for_backend(backend)?;
+    let name = release_image_for_backend(backend, on_gpu)?;
     published_for_arch(name, node_arch).then(|| format!("{}/{name}:{}", r.prefix.trim_end_matches('/'), r.tag))
 }
 
@@ -1080,10 +1086,12 @@ pub(crate) fn placement_required_image(
 /// images-release.yml matrix rows; the lock records only index digests, so this
 /// table is the gateway's copy and tests/test_hardened_images_i323.py fails if
 /// it drifts from the matrix.
-pub(crate) const OWN_IMAGE_ARCHES: &[(&str, &[&str])] = &[("llamacpp", &["amd64", "arm64"]), ("ollama", &["amd64", "arm64"])];
+pub(crate) const OWN_IMAGE_ARCHES: &[(&str, &[&str])] =
+    &[("llamacpp", &["amd64", "arm64"]), ("llamacpp-cuda", &["amd64"]), ("ollama", &["amd64", "arm64"])];
 
-fn release_image_for_backend(backend: &str) -> Option<&'static str> {
+fn release_image_for_backend(backend: &str, on_gpu: bool) -> Option<&'static str> {
     match backend {
+        "llamacpp" if on_gpu => Some("llamacpp-cuda"),
         "llamacpp" => Some("llamacpp"),
         "ollama" => Some("ollama"),
         _ => None,
@@ -1125,37 +1133,49 @@ mod tests {
         let rel = StagedRelease { prefix: "reg.example/acme".into(), tag: "v0.2.103".into() };
         // The host8-ma case: llamacpp on an amd64 node with no explicit image.
         assert_eq!(
-            placement_required_image("llamacpp", None, "amd64", Some(&rel), &[]).as_deref(),
+            placement_required_image("llamacpp", None, "amd64", Some(&rel), &[], false).as_deref(),
             Some("reg.example/acme/llamacpp:v0.2.103")
         );
         // ARM nodes take our llamacpp too (published for arm64): required, so an
         // unstaged arm64 image is refused up front instead of falling back.
         assert_eq!(
-            placement_required_image("llamacpp", None, "arm64", Some(&rel), &[]).as_deref(),
+            placement_required_image("llamacpp", None, "arm64", Some(&rel), &[], false).as_deref(),
             Some("reg.example/acme/llamacpp:v0.2.103")
         );
         for arch in ["amd64", "arm64"] {
             assert_eq!(
-                placement_required_image("ollama", None, arch, Some(&rel), &[]).as_deref(),
+                placement_required_image("ollama", None, arch, Some(&rel), &[], false).as_deref(),
                 Some("reg.example/acme/ollama:v0.2.103"),
                 "{arch}"
             );
         }
         // An arch the release does not publish: nothing to require.
-        assert!(placement_required_image("llamacpp", None, "riscv64", Some(&rel), &[]).is_none());
+        assert!(placement_required_image("llamacpp", None, "riscv64", Some(&rel), &[], false).is_none());
         // An explicit image of ours is required; a third-party one is not.
         assert_eq!(
-            placement_required_image("vllm", Some("reg.example/acme/vllm:v1"), "amd64", Some(&rel), &[]).as_deref(),
+            placement_required_image("vllm", Some("reg.example/acme/vllm:v1"), "amd64", Some(&rel), &[], false).as_deref(),
             Some("reg.example/acme/vllm:v1")
         );
-        assert!(placement_required_image("vllm", Some("vllm/vllm-openai:latest"), "amd64", Some(&rel), &[]).is_none());
+        assert!(placement_required_image("vllm", Some("vllm/vllm-openai:latest"), "amd64", Some(&rel), &[], false).is_none());
         // `contains("/noomesh/")` used to call this ours; the shared rule does not.
-        assert!(placement_required_image("vllm", Some("quay.io/someone/noomesh/x:1"), "amd64", Some(&rel), &[]).is_none());
+        assert!(placement_required_image("vllm", Some("quay.io/someone/noomesh/x:1"), "amd64", Some(&rel), &[], false).is_none());
         // own_roots from the index count too.
-        assert!(placement_required_image("vllm", Some("other.example/ns/v:1"), "amd64", None, &["other.example/ns".into()]).is_some());
+        assert!(placement_required_image("vllm", Some("other.example/ns/v:1"), "amd64", None, &["other.example/ns".into()], false).is_some());
+        // llamacpp on a node's GPU needs the CUDA build, amd64 only: an arm64
+        // GPU start does not exist, so there is nothing to require there.
+        assert_eq!(
+            placement_required_image("llamacpp", None, "amd64", Some(&rel), &[], true).as_deref(),
+            Some("reg.example/acme/llamacpp-cuda:v0.2.103")
+        );
+        assert!(placement_required_image("llamacpp", None, "arm64", Some(&rel), &[], true).is_none());
+        assert_eq!(
+            placement_required_image("ollama", None, "amd64", Some(&rel), &[], true).as_deref(),
+            Some("reg.example/acme/ollama:v0.2.103"),
+            "on_gpu changes llamacpp's image only"
+        );
         // No staged release, no explicit image: nothing the gateway can judge.
-        assert!(placement_required_image("llamacpp", None, "amd64", None, &[]).is_none());
-        assert!(placement_required_image("vllm", None, "amd64", Some(&rel), &[]).is_none());
+        assert!(placement_required_image("llamacpp", None, "amd64", None, &[], false).is_none());
+        assert!(placement_required_image("vllm", None, "amd64", Some(&rel), &[], false).is_none());
     }
 
     #[test]
@@ -1176,7 +1196,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let rel = StagedRelease { prefix: "reg.example/acme".into(), tag: "v1".into() };
         for backend in ["llamacpp", "ollama"] {
-            let image = placement_required_image(backend, None, "arm64", Some(&rel), &[]).expect("arm64 is published");
+            let image = placement_required_image(backend, None, "arm64", Some(&rel), &[], false).expect("arm64 is published");
             std::fs::write(dir.join(image_tar_gz_name(&image, "amd64")), b"x").unwrap();
             assert!(image_is_staged(&dir, &image, "amd64"), "{backend}: amd64 staged");
             assert!(!image_is_staged(&dir, &image, "arm64"), "{backend}: arm64 NOT staged, so the placement is refused");

@@ -77,8 +77,8 @@ type backendImageChoice struct {
 
 // pickBackendImage is the pure part of the choice: CPU/GPU image, then the
 // controller's override or ${VAR} substitution. No policy.
-func pickBackendImage(spec BackendSpec, override string) string {
-	if spec.CPUImage != "" && !hasNvidiaGPU() {
+func pickBackendImage(spec BackendSpec, override string, cpuImage bool) string {
+	if spec.CPUImage != "" && cpuImage {
 		spec.Image = spec.CPUImage
 	}
 	if override != "" {
@@ -87,16 +87,35 @@ func pickBackendImage(spec BackendSpec, override string) string {
 	return resolveEnv(spec.Image)
 }
 
-// chooseBackendImage picks the backend's image and applies the policy above.
-// override is StartOverrides.Image (the controller's / the placement's).
-func chooseBackendImage(backend string, spec BackendSpec, override string) (backendImageChoice, error) {
-	ref := pickBackendImage(spec, override)
+// wantsCPUImage says which of a spec's two images a start takes: llamacpp
+// the CPU build unless the start runs on this node's GPU (llamacppOnGPU: the
+// placement's target and LlamacppGPUUsable); every other backend with a
+// CPUImage (TEI embedding/reranker) the CPU one on a node without an NVIDIA
+// GPU, as before.
+func wantsCPUImage(backend, target string, f GPUFacts) bool {
+	if backend == "llamacpp" {
+		return !llamacppOnGPU(target, f)
+	}
+	return !hasNvidiaGPU()
+}
+
+// chooseBackendImage is chooseBackendImageFor on this node's current GPU facts.
+func chooseBackendImage(backend string, spec BackendSpec, override, target string) (backendImageChoice, error) {
+	return chooseBackendImageFor(backend, spec, override, target, NodeGPUFacts())
+}
+
+// chooseBackendImageFor picks the backend's image and applies the policy
+// above. override is StartOverrides.Image (the controller's / the
+// placement's); target is the placement's hardware target.
+func chooseBackendImageFor(backend string, spec BackendSpec, override, target string, f GPUFacts) (backendImageChoice, error) {
+	cpuImage := wantsCPUImage(backend, target, f)
+	ref := pickBackendImage(spec, override, cpuImage)
 	// Nothing named an image: the default is OUR hardened build from this
 	// node's release (an image of ours, rail-only). There is NO upstream
 	// fallback: if ours is not staged for this arch the start is refused,
 	// loudly, with the restage command (ImageNotStagedError).
 	if override == "" {
-		if ours := hardenedDefault(backend); ours != "" {
+		if ours := hardenedDefault(backend, cpuImage); ours != "" {
 			return backendImageChoice{Ref: ours, RailOnly: true}, nil
 		}
 	}

@@ -1332,7 +1332,7 @@ async fn auth_me(
 /// Under one, `role` is the narrowed role (from the live role), `scopes` are
 /// what that role expands to, and `perspective` names it — `{id, dims,
 /// started_at}`, never `cap_at`.
-fn me_answer(u: &UserRecord, seen: Option<(&crate::perspective::PrsClaim, chrono::DateTime<chrono::Utc>)>) -> Value {
+fn me_answer(u: &UserRecord, seen: Option<(&crate::perspective::PrsClaim, jiff::Timestamp)>) -> Value {
     match seen {
         None => json!({
             "username": u.username,

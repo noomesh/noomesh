@@ -142,6 +142,18 @@ With no `--on`, a placement keeps the target it already has; otherwise
 `N_GPU_LAYERS=0` means cpu, and a node with a GPU defaults to gpu. `--on
 gpu` on a node that reports no GPU is refused.
 
+llamacpp on gpu runs the CUDA build of llama.cpp (`llamacpp-cuda`, CUDA
+12.9, amd64) with every layer on the GPU, on a node with an NVIDIA GPU of
+compute capability 6.1 or newer (GTX 10xx and later) and the NVIDIA
+container runtime, as its heartbeat reports them. On any other node, a GPU
+too old, no runtime, or not reported yet, `place` puts it on cpu instead and
+says why, and the fit and the node agent do the same, so `show` and `verify`
+never call a CPU-bound placement GPU. Only a node that runs llamacpp on its
+GPU downloads the CUDA image: about 3 GB the first time, then only the
+layers a release changed. `verify`'s `llamacpp offload` row shows how many
+layers llama-server put on the GPU; 0 offloaded or a CUDA failure is a WARN
+naming the NVIDIA driver (too old for CUDA 12.9) or a missing CUDA device.
+
 `noo cluster fit` budgets each placement against its own pool: a gpu
 placement against GPU memory (`vram`, or the `unified` GPU share on Apple
 Silicon), a cpu placement against RAM (on a unified-memory node, the RAM
@@ -226,8 +238,11 @@ then fewest requests in flight and the lowest load. A quarantined or
 thermal-`critical` node is left out unless nothing else is. Nodes come and
 go: a busy, hot or offline node drops out and rejoins on its own. The
 yaml's `cluster.backends.<x>.model` (what onboarding put on the local
-backend) is a placement hint and does not narrow this. Declaring
-`chat-default` puts your list ahead of the dynamic pool; `class list`
+backend) is a placement hint and does not narrow this. With no live chat
+lane yet (the first ~30 s after a placement), unpinned chat falls back to the
+static Ollama (`services.ollama_url`), which is sent the placed chat model
+when it holds it and the yaml's model only when no chat model is placed.
+Declaring `chat-default` puts your list ahead of the dynamic pool; `class list`
 prints `chat-default: dynamic (all live chat nodes)` or `declared`, and
 `noo cluster verify --controller` has a `default chat` row listing the live
 candidates in order (`!` when only CPU candidates or one node remain, `x`
@@ -328,7 +343,11 @@ that follows its chat backend.
 `place` writes a placement to the node's desired config
 (`gpu-2: ollama → qwen2.5:7b-instruct (running) — agent reconciles within
 5 min`; the gateway also nudges the agent at once, so a reachable node
-converges within seconds and 5 min is the fallback); `--stopped` records it without starting, `--port`/`--tls`/`--image`
+converges within seconds and 5 min is the fallback; for an ollama placement
+the agent also re-runs as soon as the container it started answers and again
+when a model import finishes, so `noo cluster verify`'s `ollama models` row
+reads verified about a minute after `place`, plus the import and its first
+byte check); `--stopped` records it without starting, `--port`/`--tls`/`--image`
 pin the container. `desired` shows the node's config row (ip, tier, ssh
 user, data root, models dir, GPU override) and its placements
 (`backend | model | port | tls | desired`). `unplace` removes the record
@@ -825,6 +844,10 @@ drain_started, drained_at}`, plus `workload` for a reservation and
   30 minutes is a warning with `noo tasks list` as the remedy, never a failure:
   the harness releases a stalled task itself, and a queue is capacity, not a
   fault. Child tasks count; parked ones do not.
+- Every FAIL and WARN row of a node section prints its remedy under that
+  section, FAILs first, as the controller section does; a WARN remedy that is
+  the same on several nodes (such as `noo tasks list`) prints once after the
+  node sections, naming each node and row (not in `--brief`).
 
 ## Related guides
 

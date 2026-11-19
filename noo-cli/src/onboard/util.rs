@@ -124,6 +124,33 @@ pub fn parse_gpu_line(stdout: &str) -> Option<(String, f64)> {
     Some((model, vram_mb / 1024.0))
 }
 
+/// The local GPU's CUDA compute capability (`"8.6"`), the LOWEST across its
+/// GPUs (the agent's heartbeat `gpu_compute_cap` takes the same), via one
+/// `nvidia-smi --query-gpu=compute_cap` under the deadline. None when nvidia-smi
+/// is absent, busy, too old to know the field, or says something that does not
+/// parse: unknown, which the vLLM compute floor reads as below it.
+pub fn detect_compute_cap() -> Option<String> {
+    use crate::host_exec::{nvidia_smi_within, SmiAnswer, SMI_DEADLINE};
+    match nvidia_smi_within(SMI_DEADLINE, &["--query-gpu=compute_cap", "--format=csv,noheader"]) {
+        SmiAnswer::Done(out) if out.status.success() => lowest_compute_cap(&String::from_utf8_lossy(&out.stdout)),
+        _ => None,
+    }
+}
+
+/// The lowest compute capability in the csv answer, one GPU per line, compared
+/// as numbers. Any line that does not parse makes the answer unknown. Pure.
+pub fn lowest_compute_cap(stdout: &str) -> Option<String> {
+    let mut lowest: Option<((u32, u32), &str)> = None;
+    for line in stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let v = crate::vllm_floor::parse_compute_cap(line)?;
+        match lowest {
+            Some((l, _)) if l <= v => {}
+            _ => lowest = Some((v, line)),
+        }
+    }
+    lowest.map(|(_, s)| s.to_string())
+}
+
 /// The tier when the GPU query is busy: keep the one already chosen, and only
 /// when none was (0) say CPU-only 3 rather than guess a VRAM. Pure.
 pub fn tier_when_busy(current: u8) -> u8 {
@@ -208,6 +235,10 @@ mod tests {
         assert_eq!(parse_gpu_line("NVIDIA RTX 4090, 24564\n"), Some(("NVIDIA RTX 4090".to_string(), 24564.0 / 1024.0)));
         assert_eq!(parse_gpu_line("NVIDIA GB10, [N/A]\n"), None);
         assert_eq!(parse_gpu_line(""), None);
+        assert_eq!(lowest_compute_cap("8.6\n6.1\n").as_deref(), Some("6.1"), "the lowest GPU decides");
+        assert_eq!(lowest_compute_cap("10.0\n8.9\n").as_deref(), Some("8.9"), "as numbers");
+        assert_eq!(lowest_compute_cap("8.6\n[N/A]\n"), None, "one unknown GPU makes it unknown");
+        assert_eq!(lowest_compute_cap(""), None);
     }
 
     #[test]

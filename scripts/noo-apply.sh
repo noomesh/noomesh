@@ -630,12 +630,14 @@ release_check() {
     _rc_root="${_rc_root# }"
     # The first roll's applier-only bootstrap (0.6.27, rc.2 install-matrix
     # UPGRADE cell): an older applier installs THIS applier from an
-    # applier-only bundle (§1b) and re-execs it on the same bundle. That bundle
-    # carries no release list (an older applier refuses unknown kinds with 76),
-    # and its one payload IS the running applier: there is nothing to install,
-    # so no refusal and no failed apply on every node's first roll. Exactly
-    # that case: the signed manifest names ONLY `applier`, byte-identical to
-    # $SELF. A different applier, or any other kind beside it, is checked below.
+    # applier-only bundle (§1b) and re-execs it on the same bundle. Since
+    # 0.6.28 that bundle carries the release-signed list (an older applier
+    # self-replaces before its kind allowlist) and is checked below like any
+    # other. One from an older controller carries none; when its one payload
+    # IS the running applier there is nothing to install, so no refusal.
+    # Exactly that case: the signed manifest names ONLY `applier`,
+    # byte-identical to $SELF. A different applier, or any other kind beside
+    # it, is checked below.
     if [ "$(printf '%s' "$_rc_mk" | tr -s ' ')" = " applier " ]; then
         _rc_have="$(sha256sum "$_rc_w/files/applier" 2>/dev/null | awk '{print $1}')"
         _rc_self="$(sha256sum "$SELF" 2>/dev/null | awk '{print $1}')"
@@ -1336,10 +1338,16 @@ he_targets() {
 # The pre-check, run INSIDE a transient unit with the hold's own properties:
 # every controller name resolves through getent and its port accepts a TCP
 # connection within 5 s. One line per target: "ok NAME PORT" / "FAIL NAME PORT WHY".
+# A literal IPv4 target is not looked up: it is its own address, and getent
+# would look it up IN REVERSE, which the hold's files-only hosts cannot answer
+# (a controller URL that is a LAN address never got the hold). Its port must
+# still answer under the hold.
 HE_CHECK='rc=0
 while [ $# -ge 2 ]; do
     n=$1; p=$2; shift 2
-    if ! getent hosts "$n" >/dev/null 2>&1; then echo "FAIL $n $p lookup"; rc=1; continue; fi
+    case $n in
+        *[!0-9.]*) if ! getent hosts "$n" >/dev/null 2>&1; then echo "FAIL $n $p lookup"; rc=1; continue; fi ;;
+    esac
     if timeout 5 bash -c "exec 3<>/dev/tcp/\$0/\$1" "$n" "$p" 2>/dev/null; then echo "ok $n $p"; else echo "FAIL $n $p connect"; rc=1; fi
 done
 exit $rc'
@@ -1496,6 +1504,14 @@ harness_egress_apply() {
     he_names > "$_he_tmp/names"
     if he_ula_on_host; then HE_ULA_ALLOWED=1; else HE_ULA_ALLOWED=0; fi
     he_render_hosts "$_he_tmp/names" "$_he_tmp/hosts"
+    # A controller URL that is a literal IPv4 address names nothing to resolve:
+    # allow the address itself when the base list does not cover it, as a name
+    # resolving to it would be.
+    he_targets | while read -r _he_h _he_p; do
+        case "$_he_h" in ""|*[!0-9.]*) continue ;; esac
+        he_v4_int "$_he_h" >/dev/null || continue
+        he_covered "$_he_h" || printf '%s\n' "$_he_h"
+    done >> "$HE_EXTRA"
     # The timestamp line alone is not a change: keep the installed header.
     if [ -f "$HE_NET_DIR/hosts" ] && [ "$(sed 1d "$_he_tmp/hosts")" = "$(sed 1d "$HE_NET_DIR/hosts")" ]; then
         cp "$HE_NET_DIR/hosts" "$_he_tmp/hosts"
@@ -1530,7 +1546,11 @@ harness_egress_apply() {
             { [ -e "$HE_DROPIN" ] || [ -e "$HE_NET_DIR" ]; } && _he_had=1
             harness_egress_remove
             case "${_he_tmp:?}" in */noo-he-stage.??????) rm -rf -- "$_he_tmp" ;; esac
-            echo "noo-apply: harness-egress: the hold was NOT applied ($_he_why: a controller name did not resolve or its port did not answer under the hold); the harness runs unrestricted and codex placements are refused" >&2
+            case "$_he_why" in
+                selfcheck-unavailable) _he_how="the pre-check could not run under the hold (no systemd-run here) or answered nothing" ;;
+                *) _he_how="a controller name did not resolve or its port did not answer under the hold" ;;
+            esac
+            echo "noo-apply: harness-egress: the hold was NOT applied ($_he_why: $_he_how); the harness runs unrestricted and codex placements are refused" >&2
             if [ "$_he_had" = 1 ]; then need_harness_restart=1; applied="$applied harness-egress-files"; fi
             applied="$applied harness-egress=UNENFORCED:$_he_why"
             return 0

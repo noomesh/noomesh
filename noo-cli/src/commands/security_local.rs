@@ -3454,11 +3454,66 @@ pub fn pki_issue_node(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
 }
 
-pub(crate) fn parse_push_nodes_with(a: &mut Args) -> Result<(Option<String>, i64, bool), ArgError> {
+pub(crate) fn parse_push_nodes_with(a: &mut Args) -> Result<(Option<String>, i64, bool, Vec<String>), ArgError> {
     let days = positive_days(a, &["--days"], crate::pki::DEFAULT_DAYS)?;
     let yes = a.flag(&["--yes", "--force", "-y"]);
+    let allow = a.values(&["--allow-shared-address"])?;
     let only = a.maybe_one("<node>")?;
-    Ok((only, days, yes))
+    Ok((only, days, yes, allow))
+}
+
+/// The host of an `agent_url` (`https://HOST:PORT`): brackets and port off.
+fn url_host_of(url: &str) -> Option<String> {
+    let authority = url.split("//").nth(1)?.split('/').next()?;
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next()?,
+        None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
+    };
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+fn is_loopback_addr(a: &str) -> bool {
+    a.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Each node's claim on addresses: its registered `ip` / `ip_address`, the
+/// host of its `agent_url`, and the IP SANs of its leaf in this controller's
+/// PKI (`leaf_ips`). Loopback is left out: every leaf carries 127.0.0.1.
+pub(crate) fn node_address_claims(nodes: &[serde_json::Value], leaf_ips: &dyn Fn(&str) -> Vec<String>) -> Vec<(String, Vec<String>)> {
+    nodes
+        .iter()
+        .filter_map(|n| {
+            let id = n["id"].as_str()?.to_string();
+            let mut addrs: Vec<String> = ["ip", "ip_address"].iter().filter_map(|k| n[*k].as_str().map(|a| a.trim().to_string())).collect();
+            addrs.extend(n["agent_url"].as_str().and_then(url_host_of));
+            addrs.extend(leaf_ips(&id));
+            addrs.retain(|a| !a.is_empty() && !is_loopback_addr(a));
+            addrs.sort();
+            addrs.dedup();
+            Some((id, addrs))
+        })
+        .collect()
+}
+
+/// The OTHER node, if any, that already claims `addr` (registered, dialed, or
+/// a SAN in its leaf). A leaf naming another node's address lets its holder
+/// answer as that node to whatever dials the address: the gateway pins no
+/// node identity, only the SAN. So a certificate for such an address is never
+/// issued on a remedy's word (i1045).
+pub(crate) fn address_claimed_by_other(node: &str, addr: &str, claims: &[(String, Vec<String>)]) -> Option<String> {
+    let addr = addr.trim();
+    if addr.is_empty() || is_loopback_addr(addr) {
+        return None;
+    }
+    claims
+        .iter()
+        .find(|(id, addrs)| !id.eq_ignore_ascii_case(node) && addrs.iter().any(|a| a.eq_ignore_ascii_case(addr)))
+        .map(|(id, _)| id.clone())
+}
+
+/// The leaf IP SANs of `node` in this controller's PKI (empty when unreadable).
+pub(crate) fn local_leaf_ips(node: &str) -> Vec<String> {
+    ClusterCa::cert_names(&pki_dir().join("nodes").join(node).join("node.crt")).map(|n| n.ips).unwrap_or_default()
 }
 
 /// `noo security pki push-nodes [NODE] [--days N] [--yes]` — re-issue each
@@ -3480,7 +3535,7 @@ pub(crate) fn parse_push_nodes_with(a: &mut Args) -> Result<(Option<String>, i64
 /// node-agent (host unit or container, whichever the node runs) — nothing
 /// here reaches into the node to restart anything.
 pub fn pki_push_nodes(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let (only, days, yes) = parse_push_nodes_with(&mut Args::new(args))?;
+    let (only, days, yes, allow) = parse_push_nodes_with(&mut Args::new(args))?;
 
     let ca = ClusterCa::new(pki_dir());
     if !ca.ca_exists() {
@@ -3535,8 +3590,26 @@ pub fn pki_push_nodes(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if !g.json {
         println!("{}", ui::phase("push"));
     }
+    // Every node's claim on an address, read once: a leaf is never issued for
+    // an address another node registered, is dialed at, or holds a SAN for.
+    let registry: Vec<serde_json::Value> = crate::http::get_json_opt(g, "/api/cluster/nodes", true, 10)
+        .and_then(|b| b["nodes"].as_array().cloned())
+        .unwrap_or_default();
+    let claims = node_address_claims(&registry, &local_leaf_ips);
     let mut failed: Vec<String> = Vec::new();
     for (name, host, _user) in &nodes {
+        if let Some(other) = address_claimed_by_other(name, host, &claims) {
+            if !allow.iter().any(|a| a.trim() == host.trim()) {
+                if !g.json {
+                    println!("{}", ui::item(name));
+                    println!("{}", ui::sub(&ui::status_line(Glyph::Err, &format!(
+                        "REFUSED: {host} is also {other}'s (registered, dialed, or in its leaf); a certificate for it would let {name} answer as {other}. \
+                         Investigate; if it is really shared: --allow-shared-address {host}"))));
+                }
+                failed.push(name.clone());
+                continue;
+            }
+        }
         if !g.json {
             println!("{}", ui::item(name));
             println!("{}", ui::sub(&ui::status_line(Glyph::Step, "issuing the node certificate")));
@@ -6512,5 +6585,57 @@ mod tailnet_record_tests {
         assert!(t.keep_record && t.yes && t.node.as_deref() == Some("n1"));
         let b: Vec<String> = ["n1"].iter().map(|s| s.to_string()).collect();
         assert!(!parse_teardown_node(&b).unwrap_or_else(|_| panic!("parse")).keep_record, "the default deletes it");
+    }
+}
+
+#[cfg(test)]
+mod address_claim_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn claims() -> Vec<(String, Vec<String>)> {
+        let fleet = vec![
+            json!({"id": "node-a", "ip": "192.0.2.10", "agent_url": "https://192.0.2.10:8081"}),
+            json!({"id": "node-c", "ip": "192.0.2.30", "agent_url": "https://198.51.100.7:8081"}),
+        ];
+        node_address_claims(&fleet, &|id: &str| if id == "node-c" { vec!["203.0.113.5".to_string(), "127.0.0.1".to_string()] } else { vec![] })
+    }
+
+    #[test]
+    fn another_node_s_registered_dialed_or_leaf_address_is_claimed() {
+        let c = claims();
+        assert_eq!(address_claimed_by_other("node-b", "192.0.2.30", &c).as_deref(), Some("node-c"), "registered");
+        assert_eq!(address_claimed_by_other("node-b", "198.51.100.7", &c).as_deref(), Some("node-c"), "dialed (agent_url)");
+        assert_eq!(address_claimed_by_other("node-b", "203.0.113.5", &c).as_deref(), Some("node-c"), "a SAN in its leaf");
+    }
+
+    #[test]
+    fn its_own_address_loopback_or_a_free_one_is_not() {
+        let c = claims();
+        assert_eq!(address_claimed_by_other("node-c", "192.0.2.30", &c), None, "a node's own address");
+        assert_eq!(address_claimed_by_other("node-b", "127.0.0.1", &c), None, "loopback is in every leaf");
+        assert_eq!(address_claimed_by_other("node-b", "192.0.2.99", &c), None);
+        assert!(!c.iter().any(|(_, a)| a.iter().any(|x| x == "127.0.0.1")), "loopback is not a claim");
+    }
+
+    #[test]
+    fn push_nodes_takes_the_shared_address_flag() {
+        let args: Vec<String> = ["node-b", "--allow-shared-address", "192.0.2.30"].iter().map(|s| s.to_string()).collect();
+        let (only, _, _, allow) = parse_push_nodes_with(&mut Args::new(&args)).expect("parses");
+        assert_eq!(only.as_deref(), Some("node-b"));
+        assert_eq!(allow, vec!["192.0.2.30".to_string()]);
+    }
+
+    /// push-nodes asks before it issues, and only the EXACT address the
+    /// operator names lets a claimed one through.
+    #[test]
+    fn push_nodes_refuses_a_claimed_address_before_it_issues() {
+        let src = include_str!("security_local.rs");
+        let code = &src[..src.find("mod address_claim_tests").expect("tests")];
+        let body = &code[code.find("pub fn pki_push_nodes(").expect("fn")..];
+        let check = body.find("address_claimed_by_other(name, host, &claims)").expect("the check");
+        let issue = body.find("ca.issue_node_cert(name, host").expect("the issue");
+        assert!(check < issue, "the check runs before the certificate is issued");
+        assert!(body.contains("if !allow.iter().any(|a| a.trim() == host.trim()) {"), "only the named address is allowed");
     }
 }

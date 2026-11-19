@@ -30,13 +30,13 @@ func TestOllamaVerifyRefusalReportedOncePerState(t *testing.T) {
 	refusals.Reset()
 	t.Cleanup(refusals.Reset)
 	state := dockerpkg.OllamaRefused
-	l := newOllamaVerifyLoop(func(_ context.Context, model string, native bool) dockerpkg.OllamaVerifyResult {
+	l := newOllamaVerifyLoop(func(_ context.Context, model string, _ string) dockerpkg.OllamaVerifyResult {
 		return dockerpkg.OllamaVerifyResult{Model: model, State: state, Anchor: dockerpkg.OllamaAnchorMirror,
 			Blob: "sha256:aa", Reason: model + ": blob sha256:aa ... run `noo models pull " + model + "`"}
-	})
+	}, nil)
 	r := &Reconciler{ollamaVerify: l}
 
-	l.runPass(context.Background(), []string{"llama3.2:1b"}, false)
+	l.runPass(context.Background(), []string{"llama3.2:1b"}, dockerpkg.OllamaLaneContainer)
 	first := backendStartRefusals()
 	if len(first) != 1 {
 		t.Fatalf("want one backend_start refusal, got %+v", refusals.List())
@@ -44,7 +44,7 @@ func TestOllamaVerifyRefusalReportedOncePerState(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		// A converged tick, then another check with the same verdict.
 		r.clearBackendStart("ollama")
-		l.runPass(context.Background(), []string{"llama3.2:1b"}, false)
+		l.runPass(context.Background(), []string{"llama3.2:1b"}, dockerpkg.OllamaLaneContainer)
 	}
 	again := backendStartRefusals()
 	if len(again) != 1 || again[0].Since != first[0].Since {
@@ -56,7 +56,7 @@ func TestOllamaVerifyRefusalReportedOncePerState(t *testing.T) {
 
 	// Fixed: the loop clears it, and the converged tick then clears too.
 	state = dockerpkg.OllamaVerified
-	l.runPass(context.Background(), []string{"llama3.2:1b"}, false)
+	l.runPass(context.Background(), []string{"llama3.2:1b"}, dockerpkg.OllamaLaneContainer)
 	if got := backendStartRefusals(); len(got) != 0 {
 		t.Fatalf("a verified model left the refusal standing: %+v", got)
 	}
@@ -68,13 +68,13 @@ func TestOllamaVerifyRefusedModelReportedAbsent(t *testing.T) {
 	refusals.Reset()
 	modelpresence.Reset()
 	t.Cleanup(func() { refusals.Reset(); modelpresence.Reset() })
-	l := newOllamaVerifyLoop(func(_ context.Context, model string, _ bool) dockerpkg.OllamaVerifyResult {
+	l := newOllamaVerifyLoop(func(_ context.Context, model string, _ string) dockerpkg.OllamaVerifyResult {
 		st := dockerpkg.OllamaVerified
 		if model == "bad:1b" {
 			st = dockerpkg.OllamaRefused
 		}
 		return dockerpkg.OllamaVerifyResult{Model: model, State: st}
-	})
+	}, nil)
 	r := &Reconciler{ollamaVerify: l}
 	rows := []placement{
 		{Backend: "ollama", Model: "good:1b", Role: "chat", DesiredState: "running"},
@@ -82,8 +82,8 @@ func TestOllamaVerifyRefusedModelReportedAbsent(t *testing.T) {
 	}
 	modelpresence.Set("ollama", modelpresence.Entry{Model: "good:1b", Role: "chat", Present: true})
 	modelpresence.Set("ollama#embed", modelpresence.Entry{Model: "bad:1b", Role: "embed", Present: true})
-	l.runPass(context.Background(), []string{"good:1b", "bad:1b"}, false)
-	r.verifyOllamaModels(context.Background(), rows, false)
+	l.runPass(context.Background(), []string{"good:1b", "bad:1b"}, dockerpkg.OllamaLaneContainer)
+	r.verifyOllamaModels(context.Background(), rows, dockerpkg.OllamaLaneContainer)
 	p := modelpresence.Report()
 	if !p["ollama"].Present {
 		t.Errorf("the verified model was reported absent: %+v", p)
@@ -98,15 +98,15 @@ func TestOllamaVerifyRefusedModelReportedAbsent(t *testing.T) {
 func TestOllamaVerifyRunsOffTick(t *testing.T) {
 	release := make(chan struct{})
 	calls := make(chan string, 4)
-	l := newOllamaVerifyLoop(func(_ context.Context, model string, _ bool) dockerpkg.OllamaVerifyResult {
+	l := newOllamaVerifyLoop(func(_ context.Context, model string, _ string) dockerpkg.OllamaVerifyResult {
 		calls <- model
 		<-release
 		return dockerpkg.OllamaVerifyResult{Model: model, State: dockerpkg.OllamaVerified}
-	})
+	}, nil)
 	done := make(chan struct{})
 	go func() {
-		l.schedule(context.Background(), []string{"m:1b"}, false)
-		l.schedule(context.Background(), []string{"m:1b"}, false)
+		l.schedule(context.Background(), []string{"m:1b"}, dockerpkg.OllamaLaneContainer)
+		l.schedule(context.Background(), []string{"m:1b"}, dockerpkg.OllamaLaneContainer)
 		close(done)
 	}()
 	select {
@@ -120,5 +120,20 @@ func TestOllamaVerifyRunsOffTick(t *testing.T) {
 	case m := <-calls:
 		t.Fatalf("a second pass ran while one was in flight: %s", m)
 	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// The adopted lane's runtime reaches the verifier: the controller's own node
+// ("stack") checks the stack's store, a Mac ("native") its host Ollama's, and
+// an adopted lane is never checked as the agent's container (which repairs).
+func TestOllamaVerifyAdoptedLaneIsTheRuntimes(t *testing.T) {
+	for rt, want := range map[string]string{
+		"stack":  dockerpkg.OllamaLaneStack,
+		"native": dockerpkg.OllamaLaneNative,
+		"":       dockerpkg.OllamaLaneNative,
+	} {
+		if got := adoptedLane(rt); got != want {
+			t.Errorf("adoptedLane(%q) = %q, want %q", rt, got, want)
+		}
 	}
 }

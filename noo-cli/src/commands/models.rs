@@ -276,12 +276,17 @@ pub fn models_pull(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if g.json {
         let mut out = last.unwrap_or(serde_json::json!({"status": "success"}));
         if let Some(o) = out.as_object_mut() {
-            o.insert("controller_record".into(), json!({"written": record.written(), "detail": record.line()}));
+            o.insert("controller_record".into(), json!({"written": record.written(), "detail": record.line(), "remedy": record.remedy()}));
         }
         println!("{out}");
     } else {
         if let Some(line) = record.line() {
             if record.written() { ui::step(&line) } else { ui::warned(&line) }
+        }
+        // A store this user cannot write (checked before the pull): the
+        // store guide's ACL command for it, after the one line.
+        if let Some(cmd) = record.remedy() {
+            ui::guide(&[(cmd, "lets you record pulls in the model store; then pull again")]);
         }
         ui::close_done(&format!("{model} pulled"));
         let switch = format!("noo models switch {model} --backend ollama");
@@ -1845,6 +1850,10 @@ mod harrier_pull_tests {
         let after = pull.find("ollama_stage::record_after_pull(pending,").expect("the record is written after the pull");
         assert!(before < ollama && finished < after, "fetch, pull, confirm the pull, then record");
         assert!(pull[after..].contains("read_container_manifest(&ollama, r)"), "the record compares with the gateway's ollama");
+        // An unwritable store (found before the pull): its one line, then the
+        // store guide's command, in --json too (i1021).
+        assert!(pull[after..].contains("if let Some(cmd) = record.remedy() {"), "models pull prints the store guide's command");
+        assert!(pull[after..].contains("\"remedy\": record.remedy()"), "--json carries it");
     }
 
     #[test]

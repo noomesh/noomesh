@@ -516,6 +516,8 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     out.extend(images_staged_check(n));
     out.extend(door_pin_check(n));
     out.extend(gpu_target_cpu_build_check(n));
+    out.extend(llamacpp_offload_check(n));
+    out.extend(vllm_compute_check(n));
     out.extend(hardened_images_check(n));
 
     // 6c''. Vendor telemetry (docs/security/telemetry.md): no running
@@ -638,8 +640,10 @@ pub(crate) fn backend_starts_check(id: &str, n: &Value) -> Option<Check> {
     for r in &refusals {
         let reason = r["reason"].as_str().unwrap_or("no reason reported");
         parts.push(format!("{}: {reason}", r["target"].as_str().unwrap_or("?")));
+        let target = r["target"].as_str().unwrap_or("?");
         let remedy = match reason.find(SYNC) {
             Some(i) => reason[i..].split(['`', ';']).next().unwrap_or(SYNC).trim_end().to_string(),
+            None if is_no_space_refusal(reason) => no_space_remedy(id, target),
             None => format!("noo cluster show {id}   # the node's refusal says why"),
         };
         if !remedies.contains(&remedy) {
@@ -647,6 +651,29 @@ pub(crate) fn backend_starts_check(id: &str, n: &Value) -> Option<Check> {
         }
     }
     Some(fail(NAME, format!("{id}: {}", parts.join(" | ")), remedies.join("; ")))
+}
+
+/// The agent's image-pull refusal for disk space: its typed NoSpaceError
+/// (node-agent-go/internal/docker/image_space.go `noSpacePrefix`, keep in
+/// lockstep) or a raw ENOSPC from an older agent.
+fn is_no_space_refusal(reason: &str) -> bool {
+    reason.contains("not enough disk space for image") || reason.contains("no space left on device")
+}
+
+/// The disk remedy for a no-space start refusal: noo's own reclaim (the
+/// `disk_watermark` rule, docs/operating/disk-and-images.md) first, never a
+/// raw docker command on a remote shell; llamacpp can also move to its
+/// smaller CPU image.
+fn no_space_remedy(id: &str, target: &str) -> String {
+    let mut r = format!(
+        "free space on {id}: `noo autonomy decisions -l disk_watermark` shows what noo's reclaim would free there; \
+         `noo autonomy live disk_watermark` lets it act (an operator decision; see docs/operating/disk-and-images.md)"
+    );
+    if target == "llamacpp" {
+        r.push_str(&format!(", or place it on cpu: noo cluster place {id} llamacpp <model> --on cpu"));
+    }
+    r.push_str(&format!("; noo cluster show {id}"));
+    r
 }
 
 /// The `agent address` row: a node's agent_url must be https on an explicit
@@ -829,6 +856,14 @@ pub(crate) fn model_stores_check(id: &str, n: &Value) -> Option<Check> {
 /// ref has no record and no such remedy. There is no
 /// switch that marks a model trusted. No row when the agent does not report it
 /// (no Ollama placement, or an agent that predates the check).
+///
+/// The stack lane (the controller's own node checking the stack's Ollama,
+/// `lane: "stack"`) is report-only: compose manages that Ollama, so a
+/// mismatch names the re-pull, not "not repaired here". A store file the
+/// agent may not read is `cannot-read`, a WARN with its own remedy line,
+/// never a mismatch. That line leads with the re-pull through noo (our Ollama
+/// image writes the store 755/644, so a re-pull rewrites the files readable)
+/// and gives the agent's `sudo chmod` only as the fallback.
 pub(crate) fn ollama_models_check(id: &str, n: &Value) -> Option<Check> {
     // `noo models pull` acts on the gateway's Ollama: the controller's own
     // node only. Elsewhere the model is staged and imported onto that node.
@@ -851,6 +886,8 @@ pub(crate) fn ollama_models_check(id: &str, n: &Value) -> Option<Check> {
     let mut warns = Vec::new();
     let mut fails = Vec::new();
     let mut remedies: Vec<String> = Vec::new();
+    // Remedies that are not a re-pull (an unreadable store): their own line.
+    let mut read_fixes: Vec<String> = Vec::new();
     for r in rows {
         let model = r["model"].as_str().unwrap_or("?");
         let anchor = r["anchor"].as_str().unwrap_or("");
@@ -873,11 +910,32 @@ pub(crate) fn ollama_models_check(id: &str, n: &Value) -> Option<Check> {
                     remedies.push(pull());
                 }
             }
+            "mismatch" if r["lane"].as_str() == Some("stack") => {
+                warns.push(format!("{model}: does NOT match the controller ({reason}); the stack's Ollama is compose-managed, so the agent reports this and does not repair it: re-pull it through noo"));
+                remedies.push(r["remedy"].as_str().filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| format!("noo models pull {model}")));
+            }
             "mismatch" => { warns.push(format!("{model}: does NOT match the controller ({reason}); not repaired here (the agent does not manage this Ollama)")); remedies.push(pull()); }
+            "cannot-read" => {
+                warns.push(format!("{model}: cannot be checked, the agent cannot read the store ({})", if reason.is_empty() { "permission denied" } else { reason }));
+                // The agent's remedy is `<re-pull>; if the files stay
+                // unreadable: <chmod>` (an older agent sent the chmod alone):
+                // the re-pull first, the chmod labelled as the fallback.
+                const FALLBACK: &str = "; if the files stay unreadable: ";
+                let agent = r["remedy"].as_str().unwrap_or("");
+                let chmod = agent.rsplit_once(FALLBACK).map_or(agent, |(_, c)| c);
+                let mut fix = format!("{} (Ollama rewrites the blobs and the manifest with its own modes)", pull());
+                if !chmod.is_empty() { fix.push_str(&format!("{FALLBACK}{chmod}")); }
+                if !read_fixes.contains(&fix) { read_fixes.push(fix); }
+            }
             _ => warns.push(format!("{model}: could not be checked ({})", if reason.is_empty() { "no reason given" } else { reason })),
         }
     }
-    let remedy = (!remedies.is_empty()).then(|| format!("on {id}: {}", remedies.join(" && ")));
+    let mut lines: Vec<String> = Vec::new();
+    if !remedies.is_empty() { lines.push(format!("on {id}: {}", remedies.join(" && "))); }
+    for fix in &read_fixes {
+        lines.push(format!("on {id}: {fix}"));
+    }
+    let remedy = (!lines.is_empty()).then(|| lines.join("\n"));
     if !fails.is_empty() {
         let mut d = format!("refused (does not match the controller, and the repair failed): {}", fails.join("; "));
         if !warns.is_empty() { d.push_str(&format!("; also {}", warns.join("; "))); }
@@ -933,7 +991,7 @@ pub(crate) fn harness_egress_check(id: &str, n: &Value) -> Option<Check> {
             stale.join(", ")), format!("noo cluster provision {id}   # re-renders the hosts file and the allowlist")),
         Some("unenforced") => fail(NAME, format!(
             "NOT held off the internet ({reason}); placements of kind codex are refused here (Codex resolves api.github.com and chatgpt.com at start)"),
-            format!("noo cluster provision {id}   # then: noo cluster verify; a host whose systemd cannot apply IPAddressDeny (cgroup v1, systemd < 235) needs a systemd upgrade")),
+            format!("noo cluster provision {id}   # its apply report says why the hold was not applied: selfcheck-<host>-<port> = this node cannot reach that controller address under the hold (check its controller URL and that port); selfcheck-unavailable = no systemd-run on this host; on cgroup v1 or systemd < 235, upgrade systemd")),
         _ => warn(NAME, format!("unknown{}: nothing proves this node's harness is held off the internet",
             if reason.is_empty() { String::new() } else { format!(" ({reason})") }),
             Some(format!("noo cluster logs {id} harness   # the harness logs its egress self-test at start"))),
@@ -1268,8 +1326,25 @@ pub(crate) fn image_sources_check(n: &Value) -> Option<Check> {
     Some(warn(
         "image sources",
         format!("not from the artifact rail: {}", list.join(", ")),
-        Some(format!("noo cluster sync-images {id} -i {first}   # stage it; the agent takes the rail copy on its next start")),
+        Some(if release_pinned(n, first) {
+            pinned_remedy(first)
+        } else {
+            format!("noo cluster sync-images {id} -i {first}   # stage it; the agent takes the rail copy on its next start")
+        }),
     ))
+}
+
+/// Does the controller's release lock pin `image` (`release_pinned_images`,
+/// injected by `with_harness_wanted` from this host's stack lock)? Such an
+/// image is staged by its lock digest, never with `-i` (a by-name record is
+/// refused by every node pinned to the digest).
+fn release_pinned(n: &Value, image: &str) -> bool {
+    n["release_pinned_images"].as_array().is_some_and(|a| a.iter().any(|v| v.as_str() == Some(image)))
+}
+
+/// The remedy for a release-pinned image that is not on the rail.
+fn pinned_remedy(image: &str) -> String {
+    format!("{}   # the release pins {image}: it is staged by its lock digest", crate::commands::image_stage::RESTAGE_BY_LOCK)
 }
 
 /// The `images staged` row: running placements whose image is not staged on
@@ -1286,17 +1361,19 @@ pub(crate) fn images_staged_check(n: &Value) -> Option<Check> {
         "images staged",
         format!("placed but not staged on the artifact rail: {}", names.join(", ")),
         // Staged by tag: `-i repo:tag@digest` would name a tar nothing reads.
-        Some(format!(
-            "noo cluster sync-images {id} -i {}   # or `noo upgrade` for the release images",
-            crate::commands::image_stage::staged_ref(first)
-        )),
+        Some(if release_pinned(n, crate::commands::image_stage::staged_ref(first)) {
+            pinned_remedy(crate::commands::image_stage::staged_ref(first))
+        } else {
+            format!("noo cluster sync-images {id} -i {}   # or `noo upgrade` for the release images", crate::commands::image_stage::staged_ref(first))
+        }),
     ))
 }
 
-/// The `gpu target` row (i545 45/46): placements declared on `gpu` whose
-/// image has no GPU build (`gpu_targets_on_cpu_builds`, injected by
-/// `with_harness_wanted` from desired-config). They run on the CPU while
-/// sized and reported as GPU. No row when there are none.
+/// The `gpu target` row (i545 45/46): placements declared on `gpu` that this
+/// node cannot run on its GPU (llamacpp where the CUDA image cannot run:
+/// `gpu_targets_on_cpu_builds`, injected by `with_harness_wanted` from
+/// desired-config and the node's GPU facts). They run on the CPU while
+/// declared GPU. No row when there are none.
 pub(crate) fn gpu_target_cpu_build_check(n: &Value) -> Option<Check> {
     let id = n["id"].as_str().unwrap_or("?");
     let list = n["gpu_targets_on_cpu_builds"].as_array()?;
@@ -1305,10 +1382,130 @@ pub(crate) fn gpu_target_cpu_build_check(n: &Value) -> Option<Check> {
     Some(warn(
         "gpu target",
         format!(
-            "placed on gpu but running on the CPU (the llamacpp image has no GPU build): {}",
+            "placed on gpu but running on the CPU (this node cannot run the CUDA llama.cpp image: it needs an NVIDIA GPU of compute 6.1+ and the nvidia runtime): {}",
             names.join(", ")
         ),
         Some(format!("noo cluster place {id} {first} --on cpu   # CPU sizing; for a GPU, place it on ollama or vllm")),
+    ))
+}
+
+/// Why a GPU llamacpp start offloaded nothing, from what the agent read in
+/// llama-server's log; the same rule as node-agent-go's offloadCause, for a
+/// report that carries no `cause`.
+const LLAMACPP_CAUSE_DRIVER: &str = "the NVIDIA driver is too old for the CUDA 12.9 build (needs a 12.9-capable driver; a GPU that runs the PTX fallback needs driver 575 or newer)";
+const LLAMACPP_CAUSE_NO_DEVICE: &str = "no CUDA device was visible in the container";
+
+fn llamacpp_offload_cause(r: &Value) -> String {
+    if let Some(c) = r["cause"].as_str().filter(|c| !c.is_empty()) {
+        return c.to_string();
+    }
+    let failure = r["failure"].as_str().unwrap_or("");
+    if failure.contains("no CUDA-capable device") {
+        LLAMACPP_CAUSE_NO_DEVICE.to_string()
+    } else if !failure.is_empty() {
+        LLAMACPP_CAUSE_DRIVER.to_string()
+    } else if r["cuda_devices"].as_u64().unwrap_or(0) == 0 {
+        LLAMACPP_CAUSE_NO_DEVICE.to_string()
+    } else {
+        "llama.cpp was started with no GPU layers (N_GPU_LAYERS resolved to 0)".to_string()
+    }
+}
+
+/// The `llamacpp offload` row: after a llamacpp start on the GPU the agent
+/// reads llama-server's own startup lines (`llamacpp_offload`: layers
+/// offloaded of the total, the CUDA device, any CUDA init failure). OK names
+/// the device and the layers; WARN when a GPU start offloaded none, CUDA
+/// failed, or no offload line came by the agent's bound: the model runs on
+/// the CPU while the GPU stays reserved. No row without a GPU llamacpp start,
+/// while the model is still loading, or from an agent that does not report it.
+pub(crate) fn llamacpp_offload_check(n: &Value) -> Option<Check> {
+    const NAME: &str = "llamacpp offload";
+    let id = n["id"].as_str().unwrap_or("?");
+    let rows = n.get("llamacpp_offload")?.as_array()?;
+    let mut good = Vec::new();
+    let mut warns = Vec::new();
+    let mut models = Vec::new();
+    for r in rows.iter().filter(|r| r["target"].as_str() == Some("gpu")) {
+        let model = r["model"].as_str().filter(|m| !m.is_empty()).unwrap_or("<model>");
+        let offloaded = r["offloaded"].as_u64();
+        let total = r["total"].as_u64();
+        let failure = r["failure"].as_str().unwrap_or("");
+        let state = r["state"].as_str().unwrap_or("");
+        let on_gpu = failure.is_empty() && offloaded.is_some_and(|o| o > 0);
+        if on_gpu {
+            let device = r["device"].as_str().filter(|d| !d.is_empty()).unwrap_or("the GPU");
+            good.push(format!("llamacpp on {device}: {}/{} layers offloaded ({model})", offloaded.unwrap_or(0), total.unwrap_or(0)));
+            continue;
+        }
+        let what = match (failure.is_empty(), offloaded, state) {
+            (false, _, _) => format!("CUDA failed ({failure})"),
+            (true, Some(0), _) => format!("0/{} layers offloaded", total.unwrap_or(0)),
+            (true, None, "cpu") => "no layer offloaded (llama-server loaded the model without the GPU)".to_string(),
+            (true, None, "unknown") => "no offload line from llama-server by the agent's bound".to_string(),
+            _ => continue, // still loading
+        };
+        warns.push(format!("{model} placed on gpu runs on the CPU: {what}; likely cause: {}", llamacpp_offload_cause(r)));
+        models.push(model.to_string());
+    }
+    if let Some(first) = models.first() {
+        let mut d = warns.join("; ");
+        if !good.is_empty() {
+            d.push_str(&format!("; on the GPU: {}", good.join(", ")));
+        }
+        return Some(warn(NAME, d, Some(format!(
+            "update the NVIDIA driver on {id} (the CUDA 12.9 build needs a 12.9-capable driver, 575 or newer for a GPU on the PTX fallback), or place it on cpu: noo cluster place {id} llamacpp {first} --on cpu"
+        ))));
+    }
+    (!good.is_empty()).then(|| ok(NAME, good.join(", ")))
+}
+
+/// The running vLLM placements of a node's desired config, as `<backend>
+/// <model>` (both vLLM backends run the one pinned image).
+pub(crate) fn vllm_placements(placements: &Value) -> Vec<String> {
+    placements
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|p| matches!(p["backend"].as_str(), Some("vllm" | "vllm-secondary")) && p["desired_state"] != "stopped")
+                .map(|p| format!("{} {}", p["backend"].as_str().unwrap_or(""), p["model"].as_str().unwrap_or("")).trim_end().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `vllm compute` row: a vLLM placement (`vllm_placements`, injected by
+/// `with_harness_wanted` from desired-config) on a node whose GPU is KNOWN to
+/// be below the vLLM image's compute floor (`crate::vllm_floor`) can never
+/// start: FAIL naming it, the node's `gpu_compute_cap` and the floor, with the
+/// remedy (unplace it, place the model on ollama or llamacpp). A node that does
+/// not report a parsable `gpu_compute_cap` (an agent older than 0.6.18, or its
+/// nvidia-smi cannot answer) is unknown: WARN, never FAIL — a failure rests on
+/// a known fact. No row without a vLLM placement or at/above the floor.
+pub(crate) fn vllm_compute_check(n: &Value) -> Option<Check> {
+    const NAME: &str = "vllm compute";
+    let id = n["id"].as_str().unwrap_or("?");
+    let placed: Vec<&str> = n["vllm_placements"].as_array()?.iter().filter_map(Value::as_str).collect();
+    let first = placed.first()?;
+    let cap = n["gpu_compute_cap"].as_str().filter(|c| crate::vllm_floor::parse_compute_cap(c).is_some());
+    let backend = first.split(' ').next().unwrap_or("vllm");
+    let Some(c) = cap else {
+        return Some(warn(
+            NAME,
+            format!(
+                "{id}: {} placed; its GPU compute capability is unknown: it could not be read (no gpu_compute_cap: an agent older than 0.6.18, or its nvidia-smi cannot answer), and {}",
+                placed.join(", "),
+                crate::vllm_floor::needs()
+            ),
+            Some(format!("noo cluster provision {id} --wait   # a current agent reports it; on a GPU below the floor: noo cluster unplace {id} {backend}")),
+        ));
+    };
+    if crate::vllm_floor::usable(Some(c)) {
+        return None;
+    }
+    Some(fail(
+        NAME,
+        format!("{id}: {} placed, but {}; its GPU is compute {c}", placed.join(", "), crate::vllm_floor::needs()),
+        format!("noo cluster unplace {id} {backend}   # then: noo cluster place {id} ollama <model> (Ollama runs this GPU), or llamacpp"),
     ))
 }
 
@@ -1349,7 +1546,11 @@ pub(crate) fn hardened_images_check(n: &Value) -> Option<Check> {
     Some(fail(
         "hardened images",
         format!("drift: upstream image(s) running where a hardened build of ours exists (a node never falls back to upstream on its own): {}", list.join(", ")),
-        format!("noo cluster sync-images {id} -i {first_ours}   # stage ours; the node's reconciler then recreates the backend on it; unset LLAMACPP_IMAGE / OLLAMA_IMAGE if an override pins upstream"),
+        if release_pinned(n, first_ours) {
+            format!("{}   # stages ours by its lock digest; the node's reconciler then recreates the backend on it; unset LLAMACPP_IMAGE / OLLAMA_IMAGE if an override pins upstream", crate::commands::image_stage::RESTAGE_BY_LOCK)
+        } else {
+            format!("noo cluster sync-images {id} -i {first_ours}   # stage ours; the node's reconciler then recreates the backend on it; unset LLAMACPP_IMAGE / OLLAMA_IMAGE if an override pins upstream")
+        },
     ))
 }
 
@@ -1991,7 +2192,7 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
     // Placements whose image is not staged on the artifact rail for this
     // node's arch (read from the image store on THIS host; empty elsewhere).
     let unstaged = match (desired.as_ref(), crate::commands::image_stage::node_arch(&n)) {
-        (Some(d), Some(arch)) => crate::commands::image_stage::unstaged_for(&d["placements"], arch),
+        (Some(d), Some(arch)) => crate::commands::image_stage::unstaged_for(&d["placements"], arch, &n),
         _ => Vec::new(),
     };
     // The `door pin` row: each pinned stunnel door this node runs, and the
@@ -2001,11 +2202,16 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
         (Some(d), Some(arch)) => door_pin_facts(g, &d["placements"], arch),
         _ => Vec::new(),
     };
-    // i545 45/46: placements on a gpu target whose image has no GPU build.
+    // The refs this host's release lock pins: their remedies restage by digest.
+    let release_pinned = crate::commands::image_stage::lock_pinned_refs_here();
+    // i545 45/46: placements on a gpu target this node cannot run on its GPU.
     let cpu_built = desired
         .as_ref()
-        .map(|d| crate::commands::cluster_tune::gpu_targets_on_cpu_builds(&d["placements"]))
+        .map(|d| crate::commands::cluster_tune::gpu_targets_on_cpu_builds(&d["placements"], &n))
         .unwrap_or_default();
+    // The `vllm compute` row: the vLLM placements, judged against the node's
+    // gpu_compute_cap.
+    let vllm_placed = desired.as_ref().map(|d| vllm_placements(&d["placements"])).unwrap_or_default();
     // Control over the bus: a node that advertises it gets one health round
     // trip over NATS, run by the gateway (the only principal that may send).
     // Nothing is asked of a node that does not advertise, so its row reads
@@ -2035,8 +2241,14 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
         if !door_pins.is_empty() {
             obj.insert("door_pins".into(), serde_json::json!(door_pins));
         }
+        if !release_pinned.is_empty() {
+            obj.insert("release_pinned_images".into(), serde_json::json!(release_pinned));
+        }
         if !cpu_built.is_empty() {
             obj.insert("gpu_targets_on_cpu_builds".into(), serde_json::json!(cpu_built));
+        }
+        if !vllm_placed.is_empty() {
+            obj.insert("vllm_placements".into(), serde_json::json!(vllm_placed));
         }
         if let Some(w) = wanted {
             obj.insert("harness_wanted".into(), Value::Bool(w));
@@ -2852,6 +3064,49 @@ pub(crate) fn agent_metrics_check(nodes: &[(String, String)], up: Option<&Value>
         return warn(NAME, format!("{}/{total} node agents scraped; not: {}", total - unscraped.len(), unscraped.join("; ")), remedy);
     }
     ok(NAME, format!("{total}/{total} node agents scraped"))
+}
+
+/// The `agent certificate` row: the node's leaf (the controller's copy under
+/// `pki/nodes/<id>/node.crt`) must cover the host of the `agent_url` the
+/// gateway dials. When it does not, every gateway call to the node fails TLS
+/// ("bad certificate"): imports, logs, the Prometheus scrape. The usual cause
+/// is a leaf issued from the address the gateway saw at enrollment (a proxy,
+/// Docker Desktop's forwarder or a hairpin) while the node reports its own.
+/// No row when the leaf covers it. A leaf this controller cannot read is a
+/// WARN ("cannot be checked"), never silence: no row must mean "covered".
+///
+/// The remedy issues a leaf for `host`, so it is given only when no OTHER
+/// node claims that address (`other`: its registered or dialed address, or a
+/// SAN in its leaf). A leaf for another node's address would let this node
+/// answer as that one; then it is a finding to investigate, with no remedy.
+pub(crate) fn agent_cert_check(id: &str, host: &str, covers: Option<bool>, other: Option<&str>) -> Option<Check> {
+    match covers {
+        Some(true) => return None,
+        None => {
+            return Some(warn(
+                "agent certificate",
+                format!("{id}: cannot be checked: its certificate could not be read here (pki/nodes/{id}/node.crt in the controller's PKI dir), so whether it covers the address the controller dials it at ({host}) is unknown"),
+                Some("noo security pki status   # shows each node's leaf; run verify as a user that can read the controller's PKI dir".to_string()),
+            ))
+        }
+        Some(false) => {}
+    }
+    Some(match other {
+        Some(other) => Check {
+            name: "agent certificate",
+            verdict: Verdict::Fail,
+            detail: format!(
+                "{id}: its certificate does not cover the address the controller dials it at ({host}), and {host} is also {other}'s \
+                 (its registered or dialed address, or a SAN in its leaf). Investigate before issuing anything: a certificate for {host} would let {id} answer as {other}"
+            ),
+            remedy: None,
+        },
+        None => fail(
+            "agent certificate",
+            format!("{id}: its certificate does not cover the address the controller dials it at ({host}), so every call to it fails TLS (imports, logs, metrics); `noo security pki push-nodes {id}` will issue it a certificate for {host}"),
+            format!("noo security pki push-nodes {id}   # then: noo cluster verify"),
+        ),
+    })
 }
 
 pub(crate) fn agent_mail_check(body: Option<&Value>) -> Check {
@@ -7555,30 +7810,35 @@ mod gateway_addon_tests {
     }
 }
 
-/// The seat rows whose WARN remedy is the only way out and must print in a
-/// `seat <name>` section: the layout moves (`seat-sync --migrate`, run on the
-/// seat under sudo) and the display. 0.6.10 printed the legacy-layout WARN
-/// only in `--json`.
-const SEAT_WARN_REMEDY_ROWS: [&str; 4] = ["seat layout", "display binaries", "display", "display held"];
+/// The `(remedy, row names)` pairs a section prints under its table: every
+/// FAIL and every WARN row's, in every section (controller, node, seat,
+/// `verify <node>`). STARTING and Accepted rows print none.
+///
+/// Node and seat WARNs used to stay remedy-less. No reason was ever recorded,
+/// and the filter was widened case by case after a remedy nobody saw: the
+/// controller's WARNs (v0.2.95, `service-key grants`), a node's held `gpu`
+/// (rehearsal 0.6.7-rc.1 F4: `gpu release` was only in `--json`), a seat's
+/// layout and display rows (0.6.10). Now the rule is the same everywhere.
+/// The noise a healthy fleet would get from one constant remedy per node is
+/// pooled instead ([`shared_node_remedies`]).
+fn remedies_to_print(checks: &[Check]) -> Vec<(&str, Vec<&str>)> {
+    remedy_groups(checks).into_iter().map(|(r, names, _)| (r, names)).collect()
+}
 
-/// The `(remedy, row name)` pairs a section prints under its table: every
-/// FAIL row's, and in the controller section every WARN row's too. In a
-/// node section only the held `gpu` WARN prints its remedy: `gpu release` is
-/// the one way out of an operator hold and was visible only in `--json`
-/// (rehearsal 0.6.7-rc.1 F4). Other node WARNs stay remedy-less on purpose.
-/// In a seat section the layout and display WARNs print theirs
-/// ([`SEAT_WARN_REMEDY_ROWS`]).
-fn remedies_to_print<'a>(title: &str, checks: &'a [Check]) -> Vec<(&'a str, Vec<&'a str>)> {
+/// One remedy, the rows it covers, and whether a FAIL row needs it.
+type RemedyGroup<'a> = (&'a str, Vec<&'a str>, bool);
+
+/// A node id and the rows of its section a remedy covers.
+type NodeRows<'a> = (&'a str, Vec<&'a str>);
+
+/// [`remedies_to_print`] with, for each remedy, whether a FAIL row needs it.
+fn remedy_groups(checks: &[Check]) -> Vec<RemedyGroup<'_>> {
     // An identical remedy is printed once, with every row it covers (the
     // v0.2.97 roll printed one LUKS remedy nine times, once per `* at rest`).
     // FAIL remedies lead: the first one printed is the next command to run,
     // and a warning's (a LUKS move) must not stand in front of a failure's.
-    let seat_section = title.starts_with("seat ");
-    let mut out: Vec<(&str, Vec<&str>, bool)> = Vec::new();
-    for c in checks.iter()
-        .filter(|c| c.verdict == Verdict::Fail || (c.verdict == Verdict::Warn && (title == "controller" || c.name == "gpu"
-            || (seat_section && SEAT_WARN_REMEDY_ROWS.contains(&c.name)))))
-    {
+    let mut out: Vec<RemedyGroup> = Vec::new();
+    for c in checks.iter().filter(|c| matches!(c.verdict, Verdict::Fail | Verdict::Warn)) {
         let Some(r) = c.remedy.as_deref() else { continue };
         let fails = c.verdict == Verdict::Fail;
         match out.iter_mut().find(|(x, _, _)| *x == r) {
@@ -7590,7 +7850,39 @@ fn remedies_to_print<'a>(title: &str, checks: &'a [Check]) -> Vec<(&'a str, Vec<
         }
     }
     out.sort_by_key(|(_, _, fails)| !*fails);
-    out.into_iter().map(|(r, names, _)| (r, names)).collect()
+    out
+}
+
+/// The WARN remedies a full verify prints ONCE for several node sections
+/// instead of in each: the identical text, a WARN (never a FAIL) in two or
+/// more node sections. Each is `(remedy, "<node>: <rows>; <node>: <rows>")`,
+/// the note that names what it covers, the way a section's note names its
+/// rows. A healthy fleet otherwise repeats the same kernel, driver or `noo
+/// tasks list` line under every node.
+///
+/// A FAIL's remedy always stays in its section (it is that section's next
+/// command), and a remedy that names its node differs from every other
+/// node's, so it stays in its section too.
+fn shared_node_remedies(sections: &[(String, Vec<Check>)]) -> Vec<(String, String)> {
+    let mut seen: Vec<(&str, Vec<NodeRows>, bool)> = Vec::new();
+    for (id, checks) in sections {
+        for (r, names, fails) in remedy_groups(checks) {
+            match seen.iter_mut().find(|(x, _, _)| *x == r) {
+                Some((_, nodes, f)) => {
+                    nodes.push((id.as_str(), names));
+                    *f |= fails;
+                }
+                None => seen.push((r, vec![(id.as_str(), names)], fails)),
+            }
+        }
+    }
+    seen.into_iter()
+        .filter(|(_, nodes, fails)| !*fails && nodes.len() >= 2)
+        .map(|(r, nodes, _)| {
+            let note = nodes.iter().map(|(id, rows)| format!("{id}: {}", rows.join(", "))).collect::<Vec<_>>().join("; ");
+            (r.to_string(), note)
+        })
+        .collect()
 }
 
 /// The `at_rest_dirs` rows. In the default output they print as one
@@ -7802,9 +8094,11 @@ fn brief_split(checks: &[Check]) -> BriefSplit<'_> {
     b
 }
 
-/// One section, rendered the way the caller asked.
-fn show(title: &str, checks: &[Check], verbose: bool, brief: bool) -> bool {
-    if brief && !verbose { render_brief(title, checks) } else { render(title, checks, verbose) }
+/// One section, rendered the way the caller asked. `pooled` are the remedies
+/// printed once after the node sections ([`shared_node_remedies`]), left out
+/// here.
+fn show(title: &str, checks: &[Check], verbose: bool, brief: bool, pooled: &[(String, String)]) -> bool {
+    if brief && !verbose { render_brief(title, checks) } else { render_in(title, checks, verbose, pooled) }
 }
 
 /// onboard's closing verify: the section line, then the rows a new user
@@ -7826,7 +8120,7 @@ fn render_brief(title: &str, checks: &[Check]) -> bool {
             vec![ui::glyph_cell(glyph), c.name.to_string(), detail]
         }).collect();
         print!("{}", ui::table(&[Col::left(""), Col::left("invariant"), Col::left("state")], &rows));
-        let grouped = remedies_to_print(title, &shown);
+        let grouped = remedies_to_print(&shown);
         let whys: Vec<String> = grouped.iter().map(|(_, names)| names.join(", ")).collect();
         let entries: Vec<(&str, &str)> = grouped.iter().zip(&whys).map(|((r, _), w)| (*r, w.as_str())).collect();
         ui::guide(&entries);
@@ -7859,6 +8153,12 @@ fn later_lines(later: &[&Check]) -> Vec<String> {
 }
 
 fn render(title: &str, checks: &[Check], verbose: bool) -> bool {
+    render_in(title, checks, verbose, &[])
+}
+
+/// [`render`] without the remedies in `pooled` (printed once for several
+/// node sections).
+fn render_in(title: &str, checks: &[Check], verbose: bool, pooled: &[(String, String)]) -> bool {
     let d = digest(checks, verbose);
     if verbose {
         println!("{}", ui::section(title));
@@ -7880,10 +8180,13 @@ fn render(title: &str, checks: &[Check], verbose: bool) -> bool {
         print!("{}", ui::table(&[Col::left(""), Col::left("invariant"), Col::left("state")], &rows));
     }
     let failed: Vec<&Check> = checks.iter().filter(|c| c.verdict == Verdict::Fail).collect();
-    // FAIL remedies always; WARN remedies too in the controller section (the
-    // v0.2.95 roll: `service-key grants` warned with a remedy nobody saw).
+    // FAIL and WARN remedies, FAILs first (remedies_to_print), but not the
+    // ones pooled for several node sections.
     // Judged on every row, not the digest's: a grouped row keeps its remedy.
-    let grouped = remedies_to_print(title, checks);
+    let grouped: Vec<(&str, Vec<&str>)> = remedies_to_print(checks)
+        .into_iter()
+        .filter(|(r, _)| !pooled.iter().any(|(p, _)| p == r))
+        .collect();
     let whys: Vec<String> = grouped.iter().map(|(_, names)| names.join(", ")).collect();
     let entries: Vec<(&str, &str)> = grouped.iter().zip(&whys).map(|((r, _), w)| (*r, w.as_str())).collect();
     ui::guide(&entries);
@@ -7984,6 +8287,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let reads_from = Instant::now();
         let enriched = par_map(&selected, |n| with_harness_wanted(g, n));
         laps.push((format!("node reads ({} node(s), side by side)", selected.len()), reads_from.elapsed()));
+        let mut sections: Vec<(String, Vec<Check>)> = Vec::new();
         for (n, wanted) in selected.iter().zip(&enriched) {
             let id = n["id"].as_str().unwrap_or("?");
             let mut record = wanted.clone();
@@ -7997,10 +8301,23 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             if g.json {
                 node_json.push(serde_json::json!({ "node": id, "ok": node_ok, "checks": checks_json(&checks) }));
             } else {
-                let title = format!("node {id}");
-                show(&title, &checks, g.verbose, brief);
-                tally.add(&title, &checks);
+                sections.push((id.to_string(), checks));
             }
+        }
+        // A WARN remedy identical across node sections prints once, after
+        // them, naming the nodes and rows it covers. Not in --brief, whose
+        // contract is that every section's remedies stand above its own
+        // "Worth doing later" lines.
+        let pooled = if brief && !g.verbose { Vec::new() } else { shared_node_remedies(&sections) };
+        for (id, checks) in &sections {
+            let title = format!("node {id}");
+            show(&title, checks, g.verbose, brief, &pooled);
+            tally.add(&title, checks);
+        }
+        if !pooled.is_empty() {
+            let entries: Vec<(&str, &str)> = pooled.iter().map(|(r, w)| (r.as_str(), w.as_str())).collect();
+            ui::guide(&entries);
+            println!();
         }
         json_out.insert("nodes".into(), Value::Array(node_json));
 
@@ -8036,7 +8353,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     seat_json.push(serde_json::json!({ "seat": name, "ok": seat_ok, "checks": checks_json(&checks) }));
                 } else {
                     let title = format!("seat {name}");
-                    show(&title, &checks, g.verbose, brief);
+                    show(&title, &checks, g.verbose, brief, &[]);
                     tally.add(&title, &checks);
                 }
             }
@@ -8149,6 +8466,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(cert_expiry_row(&certs));
         checks.extend(stack_rows_here(&crate::envfile::repo_root()));
         checks.push(image_retention_row_here(&crate::envfile::repo_root()));
+        if let Some(row) = staged_release_images_row_here() {
+            checks.push(row);
+        }
         checks.push(noo_data_bound_row(&crate::envfile::repo_root()));
         checks.push(netns_restore_row_here(&crate::envfile::repo_root()));
         // i802: advisory only, on a CPU-only controller.
@@ -8276,6 +8596,17 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             Some(names.ips.iter().chain(names.dns.iter()).any(|n| n.eq_ignore_ascii_case(host)))
         };
         checks.push(agent_metrics_check(&agents, up.as_ref(), &covers));
+        // i-cert: a node whose leaf does not cover the address the gateway
+        // dials it at refuses every call (imports, logs, the scrape). The
+        // self node is reached another way and is not judged here.
+        let claims = super::security_local::node_address_claims(&fleet, &super::security_local::local_leaf_ips);
+        for (id, host) in &agents {
+            let is_self = fleet.iter().any(|n| n["id"].as_str() == Some(id.as_str()) && n["self_node"].as_bool() == Some(true));
+            if !is_self {
+                let other = super::security_local::address_claimed_by_other(id, host, &claims);
+                checks.extend(agent_cert_check(id, host, covers(id, host), other.as_deref()));
+            }
+        }
         // The gateway's own Redis connection (authenticated /health: the
         // anonymous body carries no dependency map).
         let health = health_body(g);
@@ -8607,7 +8938,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             if !want_nodes {
                 println!("{}", ui::header("cluster verify", Some("controller")));
             }
-            show("controller", &checks, g.verbose, brief);
+            show("controller", &checks, g.verbose, brief, &[]);
             tally.add("controller", &checks);
         }
     }
@@ -8850,6 +9181,40 @@ pub(crate) fn image_retention_row(report: Option<Result<Value, String>>, blocked
         ok(NAME, format!("{} superseded image(s) of ours, {size} reclaimable; report only, nothing removed ({when})", marked.len()))
     } else {
         ok(NAME, format!("removed {} superseded image(s) of ours, {size} freed ({when})", marked.len()))
+    }
+}
+
+/// The `staged release images` row: every image the controller's rail holds
+/// that the release lock pins (`lock` = its text, prefix, tag) must be staged
+/// by its lock digest. One staged by name (an `-i` stage before 0.6.28, or a
+/// hand edit) is refused by each node whose backend is pinned to the digest,
+/// at that backend's next start: WARN now, before a restart finds it. No row
+/// without a lock (a controller that never ran `noo upgrade`).
+pub(crate) fn staged_release_images_check(lock: Option<(&str, &str, &str)>, idx: &crate::commands::image_stage::StagedIndex) -> Option<Check> {
+    const NAME: &str = "staged release images";
+    let (l, p, t) = lock?;
+    let mut pinned = 0usize;
+    let mut by_name = Vec::new();
+    for r in &idx.images {
+        let Some((digest, ..)) = crate::commands::image_stage::lock_pin_for(&r.image, l, p, t) else { continue };
+        pinned += 1;
+        if r.lock_digest.is_empty() {
+            by_name.push(format!("{} ({}) is staged by name, but the release pins it to {digest}: a node pinned to it refuses its next start", r.image, r.arch));
+        }
+    }
+    if by_name.is_empty() {
+        return Some(ok(NAME, format!("{pinned} staged image(s) the release pins, all by their lock digest")));
+    }
+    Some(warn(NAME, by_name.join("; "), Some(crate::commands::image_stage::RESTAGE_BY_LOCK.to_string())))
+}
+
+/// [`staged_release_images_check`] for this controller's lock and rail.
+pub(crate) fn staged_release_images_row_here() -> Option<Check> {
+    use crate::commands::image_stage as st;
+    match st::controller_lock_opt() {
+        Ok(Some((l, p, t))) => staged_release_images_check(Some((l.as_str(), p.as_str(), t.as_str())), &st::read_index(&st::images_store_dir())),
+        Ok(None) => None,
+        Err(e) => Some(warn("staged release images", format!("not checked: {e}"), None)),
     }
 }
 
@@ -9651,31 +10016,70 @@ mod tests {
         assert_eq!(verdict(&c, "tailnet control"), Verdict::Ok);
     }
 
+    /// A node section prints its WARN remedies, as the controller's always
+    /// did, after the FAILs' (the first command printed is the next to run).
+    /// STARTING and Accepted rows print none.
     #[test]
-    fn warn_remedies_print_in_the_controller_section_only() {
+    fn a_node_warn_remedy_prints_after_the_fails() {
+        let mut starting = warn("online", "agent starting", Some("wait".into()));
+        starting.verdict = Verdict::Starting;
+        let mut accepted = warn("pki at rest", "accepted risk", Some("noo security at-rest".into()));
+        accepted.verdict = Verdict::Accepted;
         let rows = vec![
-            warn("service-key grants", "evolve lacks prompt_skills:write", Some("noo security service-key provision evolve".into())),
+            warn("harness tasks", "1 running, past the stall bound", Some("noo tasks list".into())),
             warn("loki", "no remedy", None),
             fail("x", "bad", "noo health"),
+            starting,
+            accepted,
         ];
-        let c = remedies_to_print("controller", &rows);
-        // The FAIL remedy leads, ahead of the WARN listed before it.
-        assert_eq!(c, vec![("noo health", vec!["x"]), ("noo security service-key provision evolve", vec!["service-key grants"])]);
-        assert_eq!(remedies_to_print("node a", &rows), vec![("noo health", vec!["x"])]);
+        assert_eq!(remedies_to_print(&rows), vec![("noo health", vec!["x"]), ("noo tasks list", vec!["harness tasks"])]);
+    }
+
+    /// One constant WARN remedy on several nodes (a kernel or driver step,
+    /// `noo tasks list`) prints once after the node sections, its note naming
+    /// each node and the rows it covers; the sections leave it out.
+    #[test]
+    fn a_constant_remedy_shared_by_several_nodes_prints_once_naming_the_nodes() {
+        let tasks = || warn("harness tasks", "1 running, past the stall bound", Some("noo tasks list".into()));
+        let sections = vec![
+            ("node-a".to_string(), vec![tasks()]),
+            ("node-b".to_string(), vec![ok("online", "yes")]),
+            ("node-c".to_string(), vec![tasks()]),
+        ];
+        let pooled = shared_node_remedies(&sections);
+        assert_eq!(pooled, vec![("noo tasks list".to_string(), "node-a: harness tasks; node-c: harness tasks".to_string())]);
+    }
+
+    /// A remedy that names its node (a GPU release, a provision) differs on
+    /// every node and stays in its own section; so does a FAIL's remedy, even
+    /// when shared (it is that section's next command), and a remedy only one
+    /// node needs.
+    #[test]
+    fn a_node_specific_remedy_stays_in_its_section() {
+        let release = |id: &str| warn("gpu", "held by operator", Some(format!("noo cluster gpu release {id}")));
+        let sections = vec![
+            ("node-a".to_string(), vec![release("node-a"), fail("bus", "down", "noo stack restart nats"), warn("kernel", "old", Some("sudo apt upgrade".into()))]),
+            ("node-b".to_string(), vec![release("node-b"), fail("bus", "down", "noo stack restart nats")]),
+        ];
+        assert!(shared_node_remedies(&sections).is_empty(), "{:?}", shared_node_remedies(&sections));
+        // In its section the release prints as before.
+        assert!(remedies_to_print(&sections[0].1).iter().any(|(r, _)| *r == "noo cluster gpu release node-a"));
     }
 
     #[test]
     fn identical_remedies_print_once_with_every_row_they_cover() {
         let luks = at_rest_remedy("loki at rest");
         assert_ne!(luks, at_rest_remedy("age key at rest"));
+        // FAIL rows, so this reads the grouping alone (a_node_warn_remedy_
+        // prints_after_the_fails reads which verdicts print).
         let rows = vec![
-            warn("loki at rest", "plaintext", Some(luks.into())),
-            warn("loki", "other", Some("noo health".into())),
-            warn("postgres at rest", "plaintext", Some(luks.into())),
-            warn("age key at rest", "plaintext", Some(at_rest_remedy("age key at rest").into())),
-            warn("pki at rest", "plaintext", Some(at_rest_remedy("pki at rest").into())),
+            fail("loki at rest", "plaintext", luks),
+            fail("loki", "other", "noo health"),
+            fail("postgres at rest", "plaintext", luks),
+            fail("age key at rest", "plaintext", at_rest_remedy("age key at rest")),
+            fail("pki at rest", "plaintext", at_rest_remedy("pki at rest")),
         ];
-        let c = remedies_to_print("controller", &rows);
+        let c = remedies_to_print(&rows);
         assert_eq!(
             c,
             vec![
@@ -9686,7 +10090,7 @@ mod tests {
         );
         // Node sections group identical FAIL remedies the same way.
         let fails = vec![fail("a", "x", "noo fix"), fail("b", "x", "noo fix")];
-        assert_eq!(remedies_to_print("node n", &fails), vec![("noo fix", vec!["a", "b"])]);
+        assert_eq!(remedies_to_print(&fails), vec![("noo fix", vec!["a", "b"])]);
     }
 
     /// host8, v0.2.95 roll: 7.1.5 installed (vmlinuz symlink), but the
@@ -10789,6 +11193,9 @@ mod tests {
         assert_eq!(verdict(&c, "harness egress"), Verdict::Fail);
         let row = c.iter().find(|c| c.name == "harness egress").unwrap();
         assert!(row.detail.contains("codex") && row.detail.contains("chatgpt.com") && row.detail.contains("no IPAddressDeny"));
+        let remedy = row.remedy.as_deref().unwrap();
+        assert!(remedy.contains("noo cluster provision host6") && remedy.contains("selfcheck-<host>-<port>") && remedy.contains("selfcheck-unavailable"),
+            "the remedy names what the apply report's tag means: {remedy}");
 
         let c = node_checks(&with_egress(now, serde_json::json!({"state": "unknown", "reason": "no self-test file"})), "v0.2.70", "0.5.57", now, Some(true));
         assert_eq!(verdict(&c, "harness egress"), Verdict::Warn);
@@ -12462,8 +12869,49 @@ mod tests {
         assert_eq!(c.remedy.as_deref().unwrap().split("   #").next().unwrap(), "noo cluster place Lenovo-P52s llamacpp gemma-4-E2B-it-Q4_K_M.gguf --on cpu");
         let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
         let inject = crate::test_src::fn_body(&own, "fn with_harness_wanted(");
-        assert!(inject.contains("gpu_targets_on_cpu_builds(&d[\"placements\"])"), "fed from desired-config");
+        assert!(inject.contains("gpu_targets_on_cpu_builds(&d[\"placements\"], &n)"), "fed from desired-config and the node's GPU facts");
         assert!(own.contains("out.extend(gpu_target_cpu_build_check(n));"), "the row is in the run");
+    }
+
+    /// The `vllm compute` row FAILs when a vLLM placement sits on a node below
+    /// the vLLM image's compute floor (or one that does not report its compute
+    /// capability), naming it, the floor and the remedy; no row otherwise.
+    #[test]
+    fn vllm_compute_row_fails_a_vllm_placement_below_the_floor() {
+        use serde_json::json;
+        let placed = vllm_placements(&json!([
+            {"backend": "vllm", "model": "org/gemma", "desired_state": "running"},
+            {"backend": "vllm-secondary", "model": "org/qwen", "desired_state": "stopped"},
+            {"backend": "ollama", "model": "gemma4:12b", "desired_state": "running"},
+        ]));
+        assert_eq!(placed, vec!["vllm org/gemma".to_string()], "running vLLM placements only");
+        let n = json!({"id": "node-a", "gpu_compute_cap": "6.1", "vllm_placements": placed});
+        let c = vllm_compute_check(&n).expect("a row");
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("node-a") && c.detail.contains("vllm org/gemma") && c.detail.contains("compute 6.1") && c.detail.contains("7.5+"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref().unwrap().split("   #").next().unwrap(), "noo cluster unplace node-a vllm");
+        assert!(vllm_compute_check(&json!({"id": "node-a", "gpu_compute_cap": "8.6", "vllm_placements": ["vllm org/gemma"]})).is_none(), "at/above the floor: no row");
+        assert!(vllm_compute_check(&json!({"id": "node-a", "gpu_compute_cap": "6.1"})).is_none(), "no vLLM placed: no row");
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let inject = crate::test_src::fn_body(&own, "fn with_harness_wanted(");
+        assert!(inject.contains("vllm_placements(&d[\"placements\"])"), "fed from desired-config");
+        assert!(own.contains("out.extend(vllm_compute_check(n));"), "the row is in the run");
+    }
+
+    /// A FAIL rests on a known fact: a vLLM placement on a node whose compute
+    /// capability is unknown (not reported, or unparsable) is a WARN saying it
+    /// could not be read, never a FAIL.
+    #[test]
+    fn vllm_compute_row_warns_when_the_compute_cap_is_unknown() {
+        use serde_json::json;
+        for n in [
+            json!({"id": "node-a", "vllm_placements": ["vllm org/gemma"]}),
+            json!({"id": "node-a", "gpu_compute_cap": "eight", "vllm_placements": ["vllm org/gemma"]}),
+        ] {
+            let c = vllm_compute_check(&n).expect("a row");
+            assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+            assert!(c.detail.contains("unknown") && c.detail.contains("could not be read") && c.detail.contains("7.5+"), "{}", c.detail);
+        }
     }
 
     const VLLM_PIN: &str = "sha256:8a3e44b7e3a1aef61a0852c444a01df319b506bf87083fef93c21367e6bffa2b";
@@ -12541,6 +12989,57 @@ mod tests {
         let remedy = c.remedy.unwrap();
         assert!(remedy.contains("noo cluster sync-images node-pi -i reg.example:5000/acme/ollama:v0.6.16 "), "{remedy}");
         assert!(!remedy.contains('@'), "{remedy}");
+    }
+
+    /// A release-pinned image is restaged by its lock digest
+    /// (`--stage-only --lock`), never with `-i`; `-i` stays for the rest.
+    #[test]
+    fn staging_remedies_restage_a_release_pinned_image_by_the_lock() {
+        let lock_only = crate::commands::image_stage::RESTAGE_BY_LOCK;
+        let pinned = "reg/acme/llamacpp:v2";
+        let n = serde_json::json!({"id": "host8-ma", "unstaged_images": [format!("{pinned}@sha256:{}", "e".repeat(64))],
+            "release_pinned_images": [pinned, "reg/acme/stunnel:v1"],
+            "image_sources": [{"image": pinned, "source": "local"}]});
+        for c in [images_staged_check(&n).unwrap(), image_sources_check(&n).unwrap()] {
+            let r = c.remedy.unwrap();
+            assert!(r.starts_with(lock_only) && !r.contains(" -i "), "{}: {r}", c.name);
+        }
+        let mut other = n.clone();
+        other["release_pinned_images"] = serde_json::json!(["reg/acme/other:v2"]);
+        for c in [images_staged_check(&other).unwrap(), image_sources_check(&other).unwrap()] {
+            let r = c.remedy.unwrap();
+            assert!(r.contains(&format!("sync-images host8-ma -i {pinned}")) && !r.contains("--stage-only"), "{}: {r}", c.name);
+        }
+        let up = serde_json::json!({"id": "node-pi", "release_pinned_images": ["ghcr.io/noomesh/ollama:v0.6.15"], "image_sources": [
+            {"image": "ghcr.io/noomesh/stunnel:v0.6.15", "source": "rail"},
+            {"image": "ollama/ollama:0.40.5", "source": "registry"}]});
+        let r = hardened_images_check(&up).unwrap().remedy.unwrap();
+        assert!(r.starts_with(lock_only) && !r.contains(" -i "), "{r}");
+    }
+
+    /// `staged release images`: a staged image the release pins, recorded by
+    /// name, WARNs before a pinned node's next start refuses it.
+    #[test]
+    fn staged_release_images_row_warns_on_a_pinned_image_staged_by_name() {
+        use crate::commands::image_stage::{StagedIndex, StagedRecord};
+        let d = format!("sha256:{}", "a".repeat(64));
+        let lock = format!("# tag v1\nnode-agent@{d}\n");
+        let r = |image: &str, arch: &str, digest: &str| StagedRecord {
+            image: image.into(), arch: arch.into(), tar: String::new(), image_id: String::new(),
+            lock_digest: digest.into(), source: if digest.is_empty() { "sync-images".into() } else { "lock".into() },
+            release_tag: String::new(), staged_at: 1 };
+        let mut idx = StagedIndex { images: vec![r("reg/acme/node-agent:v1", "amd64", &d), r("reg/acme/other:v1", "amd64", "")], ..Default::default() };
+        let c = staged_release_images_check(Some((lock.as_str(), "reg/acme", "v1")), &idx).unwrap();
+        assert_eq!((c.name, c.verdict), ("staged release images", Verdict::Ok), "{}", c.detail);
+        assert!(c.detail.starts_with("1 staged image(s)"), "a by-name non-release image is not counted: {}", c.detail);
+        idx.images.push(r("reg/acme/node-agent:v1", "arm64", ""));
+        let c = staged_release_images_check(Some((lock.as_str(), "reg/acme", "v1")), &idx).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert_eq!(c.detail, format!("reg/acme/node-agent:v1 (arm64) is staged by name, but the release pins it to {d}: a node pinned to it refuses its next start"));
+        assert_eq!(c.remedy.as_deref(), Some(crate::commands::image_stage::RESTAGE_BY_LOCK));
+        assert!(staged_release_images_check(None, &idx).is_none(), "no lock, no row");
+        let src = include_str!("cluster_verify.rs");
+        assert!(src.contains("if let Some(row) = staged_release_images_row_here() {\n            checks.push(row);"));
     }
 
     #[test]
@@ -12957,7 +13456,7 @@ mod tests {
         assert_eq!(j[2]["verdict"], "warn");
         // the same predicate the exit code uses
         assert!(rows.iter().all(|c| c.verdict != Verdict::Fail && c.verdict != Verdict::Starting));
-        assert!(remedies_to_print("controller", &rows).iter().all(|(_, names)| !names.contains(&"postgres at rest")));
+        assert!(remedies_to_print(&rows).iter().all(|(_, names)| !names.contains(&"postgres at rest")));
         assert_ne!(Verdict::Accepted, Verdict::Ok, "accepted is not a pass");
         assert_ne!(Verdict::Accepted, Verdict::Warn);
         assert_ne!(ui::glyph(Glyph::Accepted), ui::glyph(Glyph::Warn));
@@ -14647,17 +15146,14 @@ mod gpu_contention_tests {
     }
 
     #[test]
-    fn held_with_nothing_paused_says_so_and_the_remedy_prints_in_a_node_section() {
+    fn held_with_nothing_paused_says_so_and_names_the_release() {
         let c = gpu_contention_check(&node(serde_json::json!({
             "state": "held", "method": "nvidia-smi", "paused_backends": []}))).unwrap();
         assert_eq!(c.detail, "mode held (manual): held by operator: no GPU backend paused");
-        let checks = vec![c];
-        let r = remedies_to_print("host3", &checks);
-        assert_eq!(r.len(), 1, "the gpu warn prints its remedy in a node section");
-        assert!(r[0].0.starts_with("noo cluster gpu release host3"));
-        // other node warns stay remedy-less
-        let other = vec![warn("harness", "x", Some("noo cluster desired host3".into()))];
-        assert!(remedies_to_print("host3", &other).is_empty());
+        // A node WARN, so its remedy prints in the node section
+        // (a_node_warn_remedy_prints_after_the_fails).
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.remedy.as_deref().unwrap_or("").starts_with("noo cluster gpu release host3"), "{:?}", c.remedy);
     }
 
     /// A seat whose display runs from a home directory (the 0.6.10
@@ -14674,16 +15170,9 @@ mod gpu_contention_tests {
         let row = checks.iter().find(|c| c.name == "display binaries").expect("the home layout is a row");
         assert_eq!(row.verdict, Verdict::Warn, "a display that still runs is a WARN");
         let want = "on node-h: sudo ~owner/.local/libexec/noo-seat/noo kiosk seat-sync --migrate";
-        let r = remedies_to_print("seat node-h", &checks);
-        assert!(r.iter().any(|(rem, names)| *rem == want && names.contains(&"display binaries")), "{r:?}");
-        // The same WARN in a node section stays remedy-less (only gpu prints there).
-        assert!(remedies_to_print("node-h", &checks).iter().all(|(rem, _)| *rem != want));
-        // The legacy root layout's WARN prints in the seat section too.
-        let legacy = vec![warn("seat layout", "still on the root layout", Some("on s: sudo /usr/local/libexec/noo-seat/noo kiosk seat-sync --migrate".into()))];
-        assert_eq!(remedies_to_print("seat s", &legacy).len(), 1);
-        // Other seat WARNs keep the node rule.
-        let other = vec![warn("seat cli", "x", Some("noo upgrade --seats".into()))];
-        assert!(remedies_to_print("seat s", &other).is_empty());
+        // A WARN with that remedy: it prints in the seat section like every
+        // WARN's (a_node_warn_remedy_prints_after_the_fails).
+        assert_eq!(row.remedy.as_deref(), Some(want));
     }
 
     #[test]
@@ -14812,7 +15301,7 @@ mod digest_tests {
         let names: Vec<&str> = d.rows.iter().map(|c| c.name).collect();
         assert_eq!(names, vec!["data at rest", "sandbox", "backup age"]);
         // The remedy still prints, from the full list of checks.
-        assert_eq!(remedies_to_print("controller", &checks)[0].0, "noo sandbox doctor");
+        assert_eq!(remedies_to_print(&checks)[0].0, "noo sandbox doctor");
         let line = summary_line("controller", &d.counts);
         assert!(line.contains("controller") && line.contains(&passes.to_string()) && line.contains('1'), "{line}");
     }
@@ -15356,14 +15845,14 @@ mod vantage_tests {
 
     /// Every row the controller half writes from THIS machine's files and
     /// containers (the rows an outside run on a node turned red).
-    const CONTROLLER_ONLY_ROWS: [&str; 36] = [
+    const CONTROLLER_ONLY_ROWS: [&str; 37] = [
         "self-agent lane", "model cache", "loki", "tempo", "grafana door", "audit key", "secrets at rest",
         "shared secrets", "secrets audit", "grafana sso", "gateway pki view", "loki listener", "tempo listener",
         "sandbox listener", "backend tls", "nats tls", "nats principals", "postgres hba", "postgres role identity",
         "postgres tls", "sandbox executor", "data directories", "data root filesystem", "monitoring web config",
         "secrets not in env", "node-agent privilege", "callers", "tailnet policy", "last backup", "off-site backup",
         "pki at rest", "image retention", "stack images", "postgres memory", "hf-cache hub owner",
-        "controller hf-cache hub owner",
+        "controller hf-cache hub owner", "staged release images",
     ];
 
     #[test]
@@ -16347,6 +16836,52 @@ mod ollama_models_tests {
         assert_eq!(c.remedy.as_deref(), Some("on node-pi: noo cluster import-model node-pi harrier"));
     }
 
+    /// i1021: the controller's own node checks the stack's Ollama: a mismatch
+    /// there names the re-pull, never "the agent does not manage this Ollama"
+    /// with no next step.
+    #[test]
+    fn a_stack_lane_mismatch_names_the_re_pull() {
+        let n = json!({"self_node": true, "ollama_verify": [{"model": "qwen2.5:0.5b", "state": "mismatch", "anchor": "mirror",
+            "lane": "stack", "reason": "no local manifest", "remedy": "noo models pull qwen2.5:0.5b"}]});
+        let c = ollama_models_check("ctrl", &n).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("qwen2.5:0.5b: does NOT match the controller (no local manifest); the stack's Ollama is compose-managed"), "{}", c.detail);
+        assert!(!c.detail.contains("not repaired here"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("on ctrl: noo models pull qwen2.5:0.5b"));
+    }
+
+    /// i1021: a store file the agent may not read is its own state, with its
+    /// own remedy line: never a mismatch, never a re-pull alone.
+    #[test]
+    fn a_store_the_agent_cannot_read_warns_with_its_own_remedy_line() {
+        let n = json!({"self_node": true, "ollama_verify": [
+            {"model": "qwen2.5:0.5b", "state": "cannot-read", "anchor": "mirror", "lane": "stack",
+             "reason": "cannot read /var/lib/noo/ollama/models/blobs/sha256-aa as noo-agent (permission denied)",
+             "remedy": "noo models pull qwen2.5:0.5b; if the files stay unreadable: sudo chmod -R o+rX /var/lib/noo/ollama/models"},
+            {"model": "gemma4:e2b", "state": "unverified", "anchor": "none", "reason": "no controller record"}]});
+        let c = ollama_models_check("ctrl", &n).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("qwen2.5:0.5b: cannot be checked, the agent cannot read the store (cannot read /var/lib/noo/ollama/models/blobs/sha256-aa as noo-agent (permission denied))"), "{}", c.detail);
+        assert!(!c.detail.contains("does NOT match"), "{}", c.detail);
+        // Without a record the row still says so (the no-ACL path stays honest).
+        assert!(c.detail.contains("gemma4:e2b: unverified (no controller record)"), "{}", c.detail);
+        let remedy = c.remedy.unwrap_or_default();
+        let lines: Vec<&str> = remedy.lines().collect();
+        assert_eq!(lines, vec![
+            "on ctrl: noo models pull gemma4:e2b",
+            "on ctrl: noo models pull qwen2.5:0.5b (Ollama rewrites the blobs and the manifest with its own modes); if the files stay unreadable: sudo chmod -R o+rX /var/lib/noo/ollama/models",
+        ], "{remedy}");
+        // The order: the re-pull leads, the sudo chmod is the labelled fallback.
+        let read = lines[1];
+        let (pull, chmod) = (read.find("noo models pull").unwrap(), read.find("sudo chmod").unwrap());
+        assert!(pull < chmod && read[pull..chmod].ends_with("; if the files stay unreadable: "), "{read}");
+        // An older agent's chmod-only remedy is still put after the re-pull.
+        let old = json!({"self_node": true, "ollama_verify": [{"model": "m:1b", "state": "cannot-read", "reason": "r",
+            "remedy": "sudo chmod -R o+rX /s"}]});
+        assert_eq!(ollama_models_check("ctrl", &old).unwrap().remedy.as_deref(),
+            Some("on ctrl: noo models pull m:1b (Ollama rewrites the blobs and the manifest with its own modes); if the files stay unreadable: sudo chmod -R o+rX /s"));
+    }
+
     /// Native Ollama reports a mismatch without repairing it: a WARN.
     #[test]
     fn a_native_mismatch_is_a_warn_that_says_it_was_not_repaired() {
@@ -16385,6 +16920,33 @@ mod backend_starts_tests {
     }
 
     #[test]
+    fn a_no_space_start_refusal_gets_the_disk_remedy() {
+        let typed = "pull ghcr.io/x/llamacpp:v1 over the artifact rail: not enough disk space for image ghcr.io/x/llamacpp:v1: Docker's data root (/var/lib/docker) has 900 MiB free; this pull needs 9000 MiB there";
+        let c = backend_starts_check("node-a", &node(json!([{"scope": "backend_start", "target": "llamacpp", "reason": typed}]))).unwrap();
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert_eq!(
+            c.remedy.as_deref(),
+            Some(
+                "free space on node-a: `noo autonomy decisions -l disk_watermark` shows what noo's reclaim would free there; \
+                 `noo autonomy live disk_watermark` lets it act (an operator decision; see docs/operating/disk-and-images.md), \
+                 or place it on cpu: noo cluster place node-a llamacpp <model> --on cpu; noo cluster show node-a"
+            )
+        );
+        assert!(!c.remedy.as_deref().unwrap_or("").contains("docker image prune"), "{:?}", c.remedy);
+        let raw = backend_starts_check("node-a", &node(json!([{"scope": "backend_start", "target": "vllm", "reason": "docker load: write /x: no space left on device"}]))).unwrap();
+        assert_eq!(raw.verdict, Verdict::Fail);
+        assert_eq!(
+            raw.remedy.as_deref(),
+            Some(
+                "free space on node-a: `noo autonomy decisions -l disk_watermark` shows what noo's reclaim would free there; \
+                 `noo autonomy live disk_watermark` lets it act (an operator decision; see docs/operating/disk-and-images.md); \
+                 noo cluster show node-a"
+            )
+        );
+        assert!(!raw.remedy.as_deref().unwrap_or("").contains("docker image prune"), "{:?}", raw.remedy);
+    }
+
+    #[test]
     fn a_placement_refusal_is_in_the_row() {
         let c = backend_starts_check("node-a", &node(json!([{"scope": "placement", "target": "llamacpp",
             "reason": "this node refused the controller's models_dir /srv/models, and this placement's model lives in it"}]))).unwrap();
@@ -16409,5 +16971,112 @@ mod backend_starts_tests {
         ]));
         let c = backend_starts_check("ctrl", &n).unwrap();
         assert_eq!(c.detail, "ctrl: llamacpp: r");
+    }
+}
+
+#[cfg(test)]
+mod llamacpp_offload_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn node(rows: Value) -> Value {
+        json!({"id": "node-a", "status": "online", "llamacpp_offload": rows})
+    }
+
+    #[test]
+    fn llamacpp_offload_ok_names_the_device_and_the_layers() {
+        let n = node(json!([{"backend": "llamacpp", "model": "llama-3.1-8b-Q4_K_M.gguf", "target": "gpu", "state": "gpu",
+            "offloaded": 33, "total": 33, "cuda_devices": 1, "device": "NVIDIA GeForce GTX 1080", "compute_cap": "6.1", "checked_at": "t"}]));
+        let c = llamacpp_offload_check(&n).expect("a GPU start is a row");
+        assert_eq!(c.verdict, Verdict::Ok, "{c:?}");
+        assert!(c.detail.starts_with("llamacpp on NVIDIA GeForce GTX 1080: 33/33 layers offloaded"), "{}", c.detail);
+    }
+
+    #[test]
+    fn llamacpp_offload_zero_offloaded_warns_naming_the_driver_and_both_remedies() {
+        let n = node(json!([{"backend": "llamacpp", "model": "m.gguf", "target": "gpu", "state": "cpu",
+            "offloaded": 0, "total": 33, "cuda_devices": 0, "checked_at": "t"}]));
+        let c = llamacpp_offload_check(&n).expect("0 offloaded is a row");
+        assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
+        assert!(c.detail.contains("0/33 layers offloaded"), "{}", c.detail);
+        let remedy = c.remedy.as_deref().unwrap_or("");
+        assert!(remedy.contains("update the NVIDIA driver on node-a"), "{remedy}");
+        assert!(remedy.contains("noo cluster place node-a llamacpp m.gguf --on cpu"), "{remedy}");
+    }
+
+    #[test]
+    fn llamacpp_offload_cuda_init_failure_warns_naming_the_driver() {
+        let n = node(json!([{"backend": "llamacpp", "model": "m.gguf", "target": "gpu", "state": "cpu", "cuda_devices": 0,
+            "failure": "CUDA driver version is insufficient for CUDA runtime version", "checked_at": "t"}]));
+        let c = llamacpp_offload_check(&n).expect("a CUDA failure is a row");
+        assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
+        assert!(c.detail.contains("CUDA failed (CUDA driver version is insufficient"), "{}", c.detail);
+        assert!(c.detail.contains("the NVIDIA driver is too old for the CUDA 12.9 build"), "{}", c.detail);
+    }
+
+    #[test]
+    fn llamacpp_offload_no_row_on_cpu_loading_or_absent() {
+        assert!(llamacpp_offload_check(&json!({"id": "node-a"})).is_none(), "an agent that does not report it: no row");
+        assert!(llamacpp_offload_check(&node(json!([]))).is_none());
+        let cpu = node(json!([{"backend": "llamacpp", "model": "m.gguf", "target": "cpu", "state": "cpu", "offloaded": 0, "total": 33}]));
+        assert!(llamacpp_offload_check(&cpu).is_none(), "a cpu placement offloads nothing by design");
+        let loading = node(json!([{"backend": "llamacpp", "model": "m.gguf", "target": "gpu", "state": "loading", "checked_at": "t"}]));
+        assert!(llamacpp_offload_check(&loading).is_none(), "still loading is not an answer");
+    }
+
+    #[test]
+    fn node_checks_carry_the_llamacpp_offload_row() {
+        let n = node(json!([{"backend": "llamacpp", "model": "m.gguf", "target": "gpu", "state": "unknown", "checked_at": "t"}]));
+        let c = node_checks(&n, "", "", 0, None);
+        assert!(c.iter().any(|c| c.name == "llamacpp offload" && c.verdict == Verdict::Warn), "{:?}", c.iter().map(|c| c.name).collect::<Vec<_>>());
+    }
+}
+
+#[cfg(test)]
+mod agent_cert_tests {
+    use super::*;
+
+    #[test]
+    fn a_leaf_that_misses_the_dialed_address_fails_naming_both() {
+        let row = agent_cert_check("node-b", "192.0.2.41", Some(false), None).expect("a row");
+        assert_eq!(row.name, "agent certificate");
+        assert_eq!(row.verdict, Verdict::Fail);
+        assert!(row.detail.contains("node-b") && row.detail.contains("192.0.2.41") && row.detail.contains("fails TLS"), "{}", row.detail);
+        assert!(row.remedy.as_deref().unwrap().contains("noo security pki push-nodes node-b"));
+        assert!(row.detail.contains("will issue it a certificate for 192.0.2.41"), "the row says what it would certify: {}", row.detail);
+    }
+
+    /// The address is another node's: a finding, never a remedy that would
+    /// issue this node a certificate for it.
+    #[test]
+    fn an_address_another_node_claims_is_a_finding_with_no_remedy() {
+        let row = agent_cert_check("node-b", "192.0.2.41", Some(false), Some("node-c")).expect("a row");
+        assert_eq!(row.verdict, Verdict::Fail);
+        assert!(row.remedy.is_none(), "no push-nodes remedy on a collision: {:?}", row.remedy);
+        assert!(row.detail.contains("also node-c's") && row.detail.contains("answer as node-c"), "{}", row.detail);
+    }
+
+    /// The row is asked for every registered node agent but the self node.
+    #[test]
+    fn verify_asks_every_non_self_agent_for_the_row() {
+        let src = include_str!("cluster_verify.rs");
+        let code = &src[..src.find("mod agent_cert_tests").expect("the test module")];
+        assert!(code.contains("let other = super::security_local::address_claimed_by_other(id, host, &claims);"));
+        assert!(code.contains("checks.extend(agent_cert_check(id, host, covers(id, host), other.as_deref()));"));
+        assert!(code.contains("n[\"self_node\"].as_bool() == Some(true)"));
+    }
+
+    #[test]
+    fn no_row_only_when_the_leaf_covers_it() {
+        assert!(agent_cert_check("node-b", "192.0.2.41", Some(true), None).is_none());
+    }
+
+    /// An unreadable leaf is said, never silent: no row must mean "covered".
+    #[test]
+    fn an_unreadable_leaf_is_a_warning_not_silence() {
+        let row = agent_cert_check("node-b", "192.0.2.41", None, None).expect("a row, not silence");
+        assert_eq!(row.verdict, Verdict::Warn);
+        assert!(row.detail.contains("node-b: cannot be checked") && row.detail.contains("(192.0.2.41)"), "{}", row.detail);
+        assert!(row.remedy.as_deref().unwrap().contains("noo security pki status"));
     }
 }

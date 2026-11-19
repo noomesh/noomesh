@@ -557,7 +557,7 @@ hardware (decision 2026-10-26).
 | `noo security pki rotate-signing-key` | `[<node>] [--deliver-only] [-y\|--yes]` | Mint the fleet code-signing key and deliver its public half to every node (-y to confirm) |
 | `noo security secrets absorb-files` | `[-y\|--yes]` | Fold file credentials and legacy secrets/*.txt into env.sops; shreds what reads back (-y) |
 | `noo security pki issue-node` | `<node> [<ip>] [--days <n>] [--mint-only]` | Issue a node cert and deliver it, waiting for the node to confirm it applied |
-| `noo security pki push-nodes` | `[<node>] [--days <n>] [--yes]` | Re-issue node certs plus ca.crt and stage them on the pull rail for each node |
+| `noo security pki push-nodes` | `[<node>] [--days <n>] [--yes] [--allow-shared-address <addr>]` | Re-issue node certs plus ca.crt and stage them on the pull rail for each node |
 | `noo security trust-ca` | `[<ca_path>]` | Install the cluster CA into the OS trust store (default $NOO_PKI_DIR/ca.crt) |
 | `noo security untrust-ca` | `[-y\|--yes]` | Remove the cluster CA (by name) from the OS trust store; asks for confirmation (-y) |
 

@@ -31,6 +31,17 @@
 //     has no record at all (the controller records registry.ollama.ai tags
 //     only), and no remedy.
 //
+// Three lanes read three stores (OllamaLaneContainer, OllamaLaneNative,
+// OllamaLaneStack). The stack lane is the controller's own node adopting the
+// stack's Ollama (noo-ollama-embed on a one-box): compose manages it, so the
+// check reports and never repairs, and its remedy is the command that re-pulls
+// into it, `noo models pull <tag>`.
+//
+// A store file the agent cannot read (EACCES) is its own state,
+// OllamaCannotRead, never "no local manifest" or a hash failure: the agent
+// reads the stack's store through its "other" permission bits, and an Ollama
+// that wrote 0600 files would otherwise show as a fake mismatch.
+//
 // Hashing goes through a VerifiedRecord (verified/ollama-blobs.json in the
 // agent's own state dir), so a re-check of unchanged blobs is a stat.
 package docker
@@ -40,8 +51,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
+	"os/user"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -61,7 +74,43 @@ const (
 	OllamaRebuilt    = "rebuilt"
 	OllamaRefused    = "refused"
 	OllamaVerifyErr  = "error"
+	// OllamaCannotRead: a manifest or blob of the local store exists but
+	// the agent may not read it (permission). Report only, with its own
+	// remedy: nothing is known about the bytes.
+	OllamaCannotRead = "cannot-read"
 )
+
+// The lane a verifier checks: which Ollama, and so which store. The adopted
+// lanes carry backendrt.Native's Runtime() labels.
+const (
+	// OllamaLaneContainer: the agent's own noo-ollama container
+	// (OLLAMA_DATA_DIR/models). Repaired from the controller.
+	OllamaLaneContainer = ""
+	// OllamaLaneNative: a host Ollama the operator runs (a Mac's). Report
+	// only.
+	OllamaLaneNative = "native"
+	// OllamaLaneStack: the stack's Ollama on the controller's own node,
+	// compose-managed. Report only.
+	OllamaLaneStack = "stack"
+)
+
+// stackOllamaSource is the host directory compose binds as ollama-embed's
+// (and ollama's) store: ${NOO_DATA_ROOT}/ollama (docker-compose.cluster.yml,
+// volumes ollama-data and ollama-embed-data). It follows NOO_DATA_ROOT, NOT
+// OLLAMA_DATA_DIR: that override is the agent's own container's.
+var stackOllamaSource = dataRootSource + "/ollama"
+
+// ollamaModelsDir is the models directory (manifests/ and blobs/) of the
+// Ollama on lane.
+func ollamaModelsDir(lane string) string {
+	switch lane {
+	case OllamaLaneNative:
+		return nativeOllamaModelsDir()
+	case OllamaLaneStack:
+		return filepath.Join(resolveEnv(stackOllamaSource), "models")
+	}
+	return filepath.Join(resolveEnv(ollamaSource), "models")
+}
 
 // Anchors: what the controller's store vouches for the model with.
 const (
@@ -81,7 +130,10 @@ type OllamaVerifyResult struct {
 	ModelLayer string `json:"model_layer"`
 	Reason     string `json:"reason"`
 	Remedy     string `json:"remedy,omitempty"`
-	CheckedAt  string `json:"checked_at"`
+	// Lane is the verifier's lane when it is an adopted one ("native",
+	// "stack"), so the verify row can say who repairs a mismatch.
+	Lane      string `json:"lane,omitempty"`
+	CheckedAt string `json:"checked_at"`
 	// Blob is the offending digest of a mismatch (not on the wire: it is in
 	// Reason already).
 	Blob string `json:"-"`
@@ -115,6 +167,9 @@ type OllamaVerifier struct {
 	// Native: the agent does not manage this ollama (a Mac's own). Report
 	// only: never repair, never refuse.
 	Native bool
+	// Lane is OllamaLaneContainer, OllamaLaneNative or OllamaLaneStack. The
+	// stack lane is report-only too, and its remedy is `noo models pull`.
+	Lane   string
 	Record *preseed.VerifiedRecord
 
 	// Seams (set by NewOllamaVerifier; replaced in tests).
@@ -138,19 +193,19 @@ var ollamaVerifyRecordPath = func() string {
 	return filepath.Join(nodeconfig.Load().StateDir, "verified", "ollama-blobs.json")
 }
 
-// NewOllamaVerifier is the production verifier for this node's ollama: the
-// container's store (OLLAMA_DATA_DIR/models) or, native, the host ollama's
-// models dir.
-func (c *Client) NewOllamaVerifier(native bool) *OllamaVerifier {
-	models := filepath.Join(resolveEnv(ollamaSource), "models")
+// NewOllamaVerifier is the production verifier for this node's ollama on
+// lane: the container's store (OLLAMA_DATA_DIR/models), the host ollama's
+// models dir (native), or the stack's (${NOO_DATA_ROOT}/ollama/models).
+func (c *Client) NewOllamaVerifier(lane string) *OllamaVerifier {
+	models := ollamaModelsDir(lane)
 	mounted := []string{resolveEnv(hfCacheSource), resolveEnv(modelsSource), resolveEnv(ollamaSource)}
-	if native {
-		models = nativeOllamaModelsDir()
+	if lane != OllamaLaneContainer {
 		mounted = append(mounted, models)
 	}
 	return &OllamaVerifier{
 		ModelsDir: models,
-		Native:    native,
+		Native:    lane == OllamaLaneNative,
+		Lane:      lane,
 		Record:    preseed.OpenVerifiedRecord(ollamaVerifyRecordPath(), mounted...),
 		lookup: func(ctx context.Context, kind, name string) (string, error) {
 			m, err := lookupArtifactManifest(ctx, kind, name)
@@ -294,6 +349,70 @@ func (m *localManifest) modelLayers() []string {
 	return out
 }
 
+// reportOnly: the agent does not manage this Ollama (a native one, or the
+// stack's), so a mismatch is reported and nothing is removed or re-installed.
+func (v *OllamaVerifier) reportOnly() bool {
+	return v.Native || v.Lane == OllamaLaneStack
+}
+
+// remedy is the operator's fix for model on this verifier's Ollama. On the
+// stack lane that is the re-pull into the stack's Ollama, which also
+// rewrites the controller's record of the pull.
+func (v *OllamaVerifier) remedy(model string) string {
+	if v.Lane == OllamaLaneStack {
+		return "noo models pull " + model
+	}
+	return ollamaRemedy(model)
+}
+
+// unreadableErr is a local store file the agent may not read (EACCES): a
+// state of its own (OllamaCannotRead), never "absent" and never a verdict.
+type unreadableErr struct {
+	path string
+	err  error
+}
+
+func (e *unreadableErr) Error() string { return "cannot read " + e.path + ": " + e.err.Error() }
+func (e *unreadableErr) Unwrap() error { return e.err }
+
+// localRead marks a permission error on path as unreadableErr; any other
+// error passes through.
+func localRead(path string, err error) error {
+	if err != nil && errors.Is(err, fs.ErrPermission) {
+		return &unreadableErr{path: path, err: err}
+	}
+	return err
+}
+
+// agentUser names the account this agent reads the store as.
+func agentUser() string {
+	if u, err := user.Current(); err == nil && u.Username != "" {
+		return u.Username
+	}
+	return fmt.Sprintf("uid %d", os.Getuid())
+}
+
+// ollamaUnreadableFallback joins a cannot-read remedy's re-pull to its
+// fallback; the CLI's verify row splits on it.
+const ollamaUnreadableFallback = "; if the files stay unreadable: "
+
+// cannotRead is the result for a store file the agent may not read.
+//
+// The store is readable as shipped: our Ollama image writes it with umask
+// 0022 (directories 755, files 644; measured on Ollama 0.40.16), and the
+// agent reads it through the "other" bits. A 0600 file usually means
+// something other than our image wrote it, or the umask was changed. So the
+// remedy leads with the re-pull through noo (Ollama rewrites the blobs and
+// the manifest with its own modes), and the chmod, which needs sudo, is
+// only the fallback.
+func (v *OllamaVerifier) cannotRead(res OllamaVerifyResult, model string, ue *unreadableErr) OllamaVerifyResult {
+	res.State = OllamaCannotRead
+	res.Reason = fmt.Sprintf("cannot read %s as %s (permission denied): the agent reads this store through its \"other\" permission bits and this file grants none, so its bytes are not checked; our Ollama image writes the store 755/644 (umask 0022), so the file was likely written by something else or under a changed umask",
+		ue.path, agentUser())
+	res.Remedy = v.remedy(model) + ollamaUnreadableFallback + "sudo chmod -R o+rX " + v.ModelsDir
+	return res
+}
+
 func (v *OllamaVerifier) manifestPath(ns, name, tag string) string {
 	return filepath.Join(v.ModelsDir, "manifests", "registry.ollama.ai", ns, name, tag)
 }
@@ -320,7 +439,7 @@ func (v *OllamaVerifier) checkBlob(hex string) (blobVerdict, error) {
 		return blobMissing, nil
 	}
 	if err != nil {
-		return 0, err
+		return 0, localRead(p, err)
 	}
 	if !fi.Mode().IsRegular() {
 		return blobBad, nil
@@ -331,7 +450,7 @@ func (v *OllamaVerifier) checkBlob(hex string) (blobVerdict, error) {
 	got, err := v.hash(p)
 	if err != nil {
 		v.Record.Forget(p)
-		return 0, err
+		return 0, localRead(p, err)
 	}
 	if got != hex {
 		v.Record.Forget(p)
@@ -417,7 +536,7 @@ func (v *OllamaVerifier) Verify(ctx context.Context, model string) OllamaVerifyR
 	if v.now != nil {
 		now = v.now
 	}
-	res := OllamaVerifyResult{Model: model, Anchor: OllamaAnchorNone, CheckedAt: now().UTC().Format(time.RFC3339)}
+	res := OllamaVerifyResult{Model: model, Anchor: OllamaAnchorNone, Lane: v.Lane, CheckedAt: now().UTC().Format(time.RFC3339)}
 	name := strings.TrimPrefix(strings.TrimSpace(model), "ollama:")
 	if strings.HasPrefix(strings.ToLower(name), "hf.co/") {
 		// Not a registry.ollama.ai tag: nothing records it, and a re-pull
@@ -440,14 +559,18 @@ func (v *OllamaVerifier) Verify(ctx context.Context, model string) OllamaVerifyR
 	}
 	res.Anchor = a.kind
 	if a.kind == OllamaAnchorNone {
-		res.State, res.Reason, res.Remedy = OllamaUnverified, "no controller record", ollamaRemedy(model)
+		res.State, res.Reason, res.Remedy = OllamaUnverified, "no controller record", v.remedy(model)
 		res.ModelLayer = localModelLayer(mpath)
 		return res
 	}
 	f, err := v.check(ctx, a, mpath)
 	if err != nil {
-		res.State, res.Reason = OllamaVerifyErr, err.Error()
 		res.ModelLayer = localModelLayer(mpath)
+		var ue *unreadableErr
+		if errors.As(err, &ue) {
+			return v.cannotRead(res, model, ue)
+		}
+		res.State, res.Reason = OllamaVerifyErr, err.Error()
 		return res
 	}
 	res.ModelLayer = f.modelLayer
@@ -456,9 +579,11 @@ func (v *OllamaVerifier) Verify(ctx context.Context, model string) OllamaVerifyR
 		return res
 	}
 	res.Blob = f.blob
-	if v.Native {
-		// Not ours to touch: the operator's ollama. Report only.
-		res.State, res.Reason, res.Remedy = OllamaMismatch, f.reason, ollamaRemedy(model)
+	if v.reportOnly() {
+		// Not ours to touch: the operator's ollama, or the stack's
+		// (compose-managed). Report only: no blob is removed, nothing is
+		// re-installed.
+		res.State, res.Reason, res.Remedy = OllamaMismatch, f.reason, v.remedy(model)
 		return res
 	}
 	verb := "re-installing it from the controller's mirror"
@@ -550,7 +675,7 @@ func (v *OllamaVerifier) check(ctx context.Context, a anchorRef, mpath string) (
 	}
 	lb, lerr := os.ReadFile(mpath)
 	if lerr != nil && !errors.Is(lerr, os.ErrNotExist) {
-		return finding{}, fmt.Errorf("read the local manifest: %w", lerr)
+		return finding{}, fmt.Errorf("read the local manifest: %w", localRead(mpath, lerr))
 	}
 	var lm *localManifest
 	var lmErr error

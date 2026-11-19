@@ -16,6 +16,8 @@
 //! (the audit read API's timestamps and page cursors, the audit spool):
 //! [`rfc3339_micros_z`], chrono's `to_rfc3339_opts(SecondsFormat::Micros,
 //! true)`, always six digits.
+//! [`rfc3339_secs_z`] and [`rfc3339_millis_z`] are its `Secs` and `Millis`
+//! siblings (the log search window and its lines).
 //!
 //! Both write the sub-second part the way chrono's `SecondsFormat::AutoSi`
 //! does: nothing for a whole second, else 3, 6 or 9 digits, the fewest of
@@ -44,6 +46,20 @@ pub fn rfc3339_z(ts: Timestamp) -> String {
 pub fn rfc3339_micros_z(ts: Timestamp) -> String {
     let dt = jiff::tz::Offset::UTC.to_datetime(ts);
     let frac = format!(".{:06}", dt.subsec_nanosecond() / 1_000);
+    ymd_hms(dt, &frac, "Z")
+}
+
+/// `to_rfc3339_opts(SecondsFormat::Secs, true)`, byte for byte: `Z`, no
+/// sub-second part (dropped, not rounded), as chrono did.
+pub fn rfc3339_secs_z(ts: Timestamp) -> String {
+    ymd_hms(jiff::tz::Offset::UTC.to_datetime(ts), "", "Z")
+}
+
+/// `to_rfc3339_opts(SecondsFormat::Millis, true)`, byte for byte: `Z`,
+/// always three sub-second digits, finer than a millisecond dropped.
+pub fn rfc3339_millis_z(ts: Timestamp) -> String {
+    let dt = jiff::tz::Offset::UTC.to_datetime(ts);
+    let frac = format!(".{:03}", dt.subsec_nanosecond() / 1_000_000);
     ymd_hms(dt, &frac, "Z")
 }
 
@@ -144,6 +160,18 @@ mod tests {
         assert_eq!(rfc3339_micros_z(micros(1_763_400_000_120_000)), "2025-11-17T17:20:00.120000Z");
         let almost = Timestamp::new(1_763_400_000, 999_999_999).expect("in range");
         assert_eq!(rfc3339_micros_z(almost), "2025-11-17T17:20:00.999999Z");
+    }
+
+    #[test]
+    fn the_secs_and_millis_forms_are_chronos_opts_byte_for_byte() {
+        for c in instants() {
+            assert_eq!(rfc3339_secs_z(jiff_of(c)), c.to_rfc3339_opts(SecondsFormat::Secs, true), "{c:?}");
+            assert_eq!(rfc3339_millis_z(jiff_of(c)), c.to_rfc3339_opts(SecondsFormat::Millis, true), "{c:?}");
+        }
+        let almost = Timestamp::new(1_763_400_000, 999_999_999).expect("in range");
+        assert_eq!(rfc3339_secs_z(almost), "2025-11-17T17:20:00Z");
+        assert_eq!(rfc3339_millis_z(almost), "2025-11-17T17:20:00.999Z");
+        assert_eq!(rfc3339_millis_z(Timestamp::new(1_763_400_000, 0).expect("in range")), "2025-11-17T17:20:00.000Z");
     }
 
     /// Postgres `timestamptz` holds microseconds: the read-back value prints

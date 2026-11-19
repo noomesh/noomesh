@@ -48,7 +48,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::models_fetch::{agent, download_part, get_following, human, io, sha256_file, writable_store, FetchErr, PartEvent, Retry, RESUME_DELAYS};
+use super::models_fetch::{agent, download_part, get_following, human, io, sha256_file, store_unwritable, unwritable_guide, writable_store, FetchErr, PartEvent, Retry, RESUME_DELAYS};
 use crate::args::{ArgError, Args};
 use crate::output::{fail, ExitCode};
 use crate::ui;
@@ -484,6 +484,11 @@ pub(crate) enum PullRecord {
     NotRegistry,
     /// This box has no controller model store: nothing recorded.
     NoStore(String),
+    /// The store is there but the invoking user cannot write it (checked
+    /// before the pull, the test `noo models fetch` makes): the pull goes
+    /// on unrecorded. `remedy` is the store guide's ACL command for this
+    /// store and user.
+    Unwritable { why: String, remedy: String },
     /// The registry's tag moved between ollama's request and ours: ollama
     /// recorded a manifest (sha256 named) other than the bytes we fetched.
     Moved(String),
@@ -496,13 +501,29 @@ pub(crate) enum PullRecord {
 
 impl PullRecord {
     /// The one line the operator is told; None for a ref that has no record.
+    /// Never a raw errno: every I/O failure is said as what was being done
+    /// and the system's words for it ([`no_errno`]).
     pub(crate) fn line(&self) -> Option<String> {
+        self.line_raw().map(|l| no_errno(&l))
+    }
+
+    /// The command that would let this user record pulls, when that is
+    /// what stood in the way.
+    pub(crate) fn remedy(&self) -> Option<&str> {
+        match self {
+            PullRecord::Unwritable { remedy, .. } => Some(remedy.as_str()),
+            _ => None,
+        }
+    }
+
+    fn line_raw(&self) -> Option<String> {
         match self {
             PullRecord::Written(p) => Some(format!(
                 "recorded the pull in the controller's store ({}): verify-on-load checks this model's bytes against it",
                 p.display()
             )),
             PullRecord::NotRegistry => None,
+            PullRecord::Unwritable { why, .. } => Some(why.clone()),
             PullRecord::NoStore(why) | PullRecord::Failed(why) => Some(format!("no controller record written: {why}")),
             PullRecord::Moved(why) => Some(format!("no controller record written: {why}")),
             PullRecord::Differs(why) => Some(format!("no controller record written: the pull installed a manifest that is not the registry's: {why}")),
@@ -512,6 +533,27 @@ impl PullRecord {
     pub(crate) fn written(&self) -> bool {
         matches!(self, PullRecord::Written(_))
     }
+}
+
+/// `text` without the `(os error N)` the standard library appends to an OS
+/// error: the operator reads what was being done and the system's words for
+/// the failure ("Permission denied"), not an errno.
+pub(crate) fn no_errno(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(" (os error ") {
+        let tail = &rest[i + " (os error ".len()..];
+        let digits = tail.chars().take_while(char::is_ascii_digit).count();
+        if digits > 0 && tail[digits..].starts_with(')') {
+            out.push_str(&rest[..i]);
+            rest = &tail[digits + 1..];
+        } else {
+            out.push_str(&rest[..i + 1]);
+            rest = &rest[i + 1..];
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The registry manifest fetched before a pull, waiting for the pull.
@@ -524,8 +566,11 @@ pub(crate) struct PendingRecord {
 
 /// Step one, BEFORE the pull: fetch the registry's manifest for `model` over
 /// HTTPS from here (never through the container), validated with the rules
-/// the node applies. A ref that is not on the registry, or a box with no
-/// store, is the answer itself.
+/// the node applies. A ref that is not on the registry, a box with no store,
+/// or a store this user cannot write (the same test as `noo models fetch`,
+/// made before anything is fetched) is the answer itself: the pull goes on,
+/// unrecorded, and the operator is told which store, which user, its owner,
+/// and the store guide's ACL command.
 pub(crate) fn record_before_pull(base: &str, model: &str, store: &Path) -> Result<PendingRecord, PullRecord> {
     let Ok(r) = parse_ref(model) else {
         return Err(PullRecord::NotRegistry);
@@ -535,6 +580,17 @@ pub(crate) fn record_before_pull(base: &str, model: &str, store: &Path) -> Resul
             "this box has no controller model store ({}); pull on the controller to record it",
             store.display()
         )));
+    }
+    let unwritable = store_unwritable(store);
+    if let Some((me, owner, group, mode)) = unwritable {
+        let dir = store.display().to_string();
+        let (_, guide) = unwritable_guide(&dir, &owner, &group, mode, &me);
+        return Err(PullRecord::Unwritable {
+            why: format!(
+                "the model store {dir} is not writable by {me} (owner {owner}:{group}): the pull is not recorded, so the agent will report it unverified"
+            ),
+            remedy: guide[1].0.clone(),
+        });
     }
     let raw = get_manifest(base, &r)
         .and_then(|raw| check_manifest(&raw).map(|_| raw))
@@ -620,7 +676,7 @@ pub(crate) fn record_after_pull(
     let name = format!("{}{MIRROR_MANIFEST_SUFFIX}", p.r.stem());
     match install_bytes(&p.store, &name, &local) {
         Ok(path) => PullRecord::Written(path),
-        Err(e) => PullRecord::Failed(format!("writing {name}: {e}")),
+        Err(e) => PullRecord::Failed(format!("writing the record {name} into {}: {e}", p.store.display())),
     }
 }
 
@@ -1457,6 +1513,96 @@ mod tests {
         assert!(matches!(rec, PullRecord::NoStore(_)), "{rec:?}");
         assert!(rec.line().unwrap().starts_with("no controller record written: this box has no controller model store"));
         assert!(!dir.exists());
+    }
+
+    /// i1021: a store this user cannot write is found BEFORE the pull, by the
+    /// test `noo models fetch` makes: the registry is not asked, the pull goes
+    /// on unrecorded, and the one line names the store, the user and the
+    /// owner, followed by the store guide's exact setfacl command. No errno.
+    #[test]
+    fn the_recorder_refuses_an_unwritable_store_up_front_with_the_guide() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root writes a 0555 directory: nothing to refuse
+        }
+        let w = weight();
+        let (manifest, blobs) = model_fixture(&w);
+        let reg = serve(manifest.clone(), blobs, None, 8);
+        let dir = tmpdir("record-unwritable");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let pending = record_before_pull(&reg.base, "gemma4:12b", &dir);
+        let rec = record_after_pull(pending, |_| Ok(pulled(&manifest)));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(rec, PullRecord::Unwritable { .. }), "{rec:?}");
+        assert!(!rec.written());
+        let d = dir.display().to_string();
+        let line = rec.line().unwrap();
+        assert!(line.starts_with(&format!("the model store {d} is not writable by ")), "{line}");
+        assert!(line.contains(" (owner ") && line.ends_with("the pull is not recorded, so the agent will report it unverified"), "{line}");
+        for raw in ["Permission denied", "os error", ".tmp"] {
+            assert!(!line.contains(raw), "{raw} in {line}");
+        }
+        let remedy = rec.remedy().expect("the guide's command");
+        assert!(remedy.starts_with("sudo setfacl -m u:") && remedy.contains(":rwx -m d:u:") && remedy.ends_with(&format!(":rwx {d}")), "{remedy}");
+        assert!(reg.hits.lock().unwrap().is_empty(), "the registry was asked although nothing could be recorded");
+        assert!(names(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Any other I/O failure of the recorder is said as what was being done,
+    /// in the system's words, never with a raw errno.
+    #[test]
+    fn a_record_that_cannot_be_written_names_the_step_and_no_errno() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(no_errno("writing /s/.x.tmp: Permission denied (os error 13)"), "writing /s/.x.tmp: Permission denied");
+        assert_eq!(no_errno("a (os error x) b (os error 2)"), "a (os error x) b");
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let w = weight();
+        let (manifest, blobs) = model_fixture(&w);
+        let reg = serve_raw(pretty(&manifest), blobs, None, 8);
+        let dir = tmpdir("record-errno");
+        let pending = record_before_pull(&reg.base, "gemma4:12b", &dir);
+        assert!(pending.is_ok(), "{pending:?}");
+        // The store turns read-only between the check and the write.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let rec = record_after_pull(pending, |_| Ok(pulled(&manifest)));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(rec, PullRecord::Failed(_)), "{rec:?}");
+        let line = rec.line().unwrap();
+        assert!(line.starts_with(&format!("no controller record written: writing the record {MANIFEST} into {}: ", dir.display())), "{line}");
+        assert!(line.contains("Permission denied") && !line.contains("os error"), "{line}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The container-level proof (.github/workflows/ollama-pull-record.yml),
+    /// selected by that job alone: our ollama image runs as
+    /// $NOO_PULLRECORD_CONTAINER with its store bound on the runner. The
+    /// production recorder fetches the registry manifest, the image pulls the
+    /// model, and the record of that pull is written into the controller
+    /// store $NOO_PULLRECORD_STORE, compared with the manifest the container
+    /// installed (the steps onboard's pull_ollama takes). The agent's
+    /// verifier then reads it (node-agent-go docker
+    /// TestPullRecordContainerStackLaneVerifiesARealPull).
+    #[test]
+    #[ignore = "the container job's proof: needs our ollama image running (NOO_PULLRECORD_CONTAINER), NOO_PULLRECORD_STORE and the registry"]
+    fn the_record_of_a_real_pull_is_written_into_the_controller_store() {
+        let store = PathBuf::from(std::env::var("NOO_PULLRECORD_STORE").expect("NOO_PULLRECORD_STORE: the controller store"));
+        let container = std::env::var("NOO_PULLRECORD_CONTAINER").expect("NOO_PULLRECORD_CONTAINER: the running ollama");
+        let model = std::env::var("NOO_PULLRECORD_MODEL").unwrap_or_else(|_| "qwen2.5:0.5b".to_string());
+        let pending = record_before_pull(&registry_base(), &model, &store);
+        assert!(pending.is_ok(), "{pending:?}");
+        let pulled = std::process::Command::new("docker")
+            .args(["exec", &container, "ollama", "pull", &model])
+            .status()
+            .expect("docker exec");
+        assert!(pulled.success(), "ollama pull {model} in {container}: {pulled}");
+        let rec = record_after_pull(pending, |r| read_container_manifest(&container, r));
+        println!("{}", rec.line().unwrap_or_default());
+        assert!(rec.written(), "{rec:?}");
     }
 
     #[test]

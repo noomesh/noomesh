@@ -65,9 +65,11 @@ Output (JSON on stdout, and to $GITHUB_OUTPUT when set):
     source_tags   {"image": "<rc image tag>" | "@sha256:..."} what each re-tag
                   copies: the rc's tag, or a staged image's exact digest
     staged        {"image": "<created>"} images re-tagged from :staged
+    infra         ["image", ...] the infra images (infra-staged.py DAILY), to
+                  $GITHUB_OUTPUT only: the images leg scans one it BUILDS
 
 STAGED INFRA IMAGES (noomesh-internal i567). The infra images in
-scripts/infra-staged.py DAILY (llamacpp, ollama, stunnel, postgres-pgvector,
+scripts/infra-staged.py DAILY (llamacpp, llamacpp-cuda, ollama, stunnel, postgres-pgvector,
 whisper, piper, nvidia-exporter) are built, scanned and staged once a day by
 infra-staged.yml, outside the release. Any of them the rc path above would
 BUILD is instead re-tagged from `<image>:staged` when, on EVERY platform, the
@@ -77,7 +79,9 @@ most STAGED_MAX_AGE_DAYS old. The digest is pinned at plan time: the re-tag
 copies `<image>@<digest>`, never the moving :staged tag. Anything else — no
 :staged, a missing or different label, an older copy (the daily job is
 broken), no fingerprint (an unpinned FROM), a registry error — BUILDS, and
-the plan says why. The lock records the exact digest as for any image, plus a
+the plan says why; the images leg then scans and gates that build exactly as
+infra-staged.yml gates a staged one (scripts/infra-scan.sh), so the fallback
+never ships unscanned. The lock records the exact digest as for any image, plus a
 `staged-from:<image>@<created>` provenance row (not an image row: it has no
 sha256, so every lock reader skips it, like `retagged-from:`).
 
@@ -122,6 +126,7 @@ SIBLING_INPUTS: dict[str, tuple[str, ...]] = {
     "piper": (),
     "postgres-pgvector": (),
     "llamacpp": (),
+    "llamacpp-cuda": (),
     "stunnel": (),
     "ollama": (),
     "nvidia-exporter": (),
@@ -482,7 +487,8 @@ def apply_staged(result: dict, staged_of, fingerprint_of, now, daily) -> dict:
         staged[img] = created.strftime("%Y-%m-%dT%H:%M:%SZ")
         if base_label:
             staged_bases[img] = base_label
-        result["why"][img] = f"re-tag {img}:staged {digest[:19]} (built {staged[img]}, fingerprint matches)"
+        result["why"][img] = (f"re-tag from :staged {digest[:19]} (built {staged[img]}, fingerprint matches; "
+                              "passed infra-staged's gate)")
     return result
 
 
@@ -624,7 +630,8 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps(p, indent=2))
     for img, why in sorted(p["why"].items()):
         if why.startswith("BUILD (no usable :staged copy)"):
-            print(f"::warning::{img}: {why}", file=sys.stderr)
+            print(f"::warning::{img}: {why}; built here, then scanned and gated as infra-staged does",
+                  file=sys.stderr)
     n = sum(p["retag"].values())
     print(f"release-retag-plan: {tag}: re-tag {n} image(s) from {p['rc_tag'] or '-'}, "
           f"build {len(p['retag']) - n}", file=sys.stderr)
@@ -638,6 +645,7 @@ def main(argv: list[str] | None = None) -> int:
             f.write(f"source_tags={json.dumps(p['source_tags'], separators=(',', ':'))}\n")
             f.write(f"staged={json.dumps(p['staged'], separators=(',', ':'))}\n")
             f.write(f"staged_bases={json.dumps(p.get('staged_bases', {}), separators=(',', ':'))}\n")
+            f.write(f"infra={json.dumps(list(_infra_staged().DAILY), separators=(',', ':'))}\n")
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a") as f:

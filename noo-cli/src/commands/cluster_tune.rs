@@ -13,10 +13,16 @@
 //! 088) and acted on by the node agent: a `cpu` container gets no GPU device
 //! and `CUDA_VISIBLE_DEVICES` emptied. Per backend:
 //!
-//! * llamacpp: `cpu` also writes `N_GPU_LAYERS=0` into the placement env, so
-//!   the choice is visible in `noo cluster desired` and an older agent that
-//!   ignores `target` still offloads nothing; `gpu` removes a stored
-//!   `N_GPU_LAYERS=0` (the agent's `auto` then offloads every layer);
+//! * llamacpp: `gpu` runs the CUDA image (docker/Dockerfile.llamacpp-cuda)
+//!   on a node that can use it ([`llamacpp_gpu_usable`]: an NVIDIA GPU of
+//!   compute [`LLAMACPP_MIN_COMPUTE_CAP`] or newer and the nvidia container
+//!   runtime, as its heartbeat reports them); on any other node `place` turns
+//!   a `gpu` target into `cpu` and says so, and the gateway's fit and the
+//!   node agent take it as `cpu` too. `cpu` also writes `N_GPU_LAYERS=0`
+//!   into the placement env, so the choice is visible in `noo cluster
+//!   desired` and an older agent that ignores `target` still offloads
+//!   nothing; `gpu` removes a stored `N_GPU_LAYERS=0` (the agent's `auto`
+//!   then offloads every layer);
 //! * ollama: no env key - the daemon's device is the agent's to withhold
 //!   (`num_gpu` is a per-request option and `CUDA_VISIBLE_DEVICES` is not on
 //!   the placement allow-list, deliberately);
@@ -116,32 +122,64 @@ fn env_str(env: &Value, key: &str) -> Option<String> {
     }
 }
 
-/// The shipped llamacpp image (`docker/Dockerfile.llamacpp`) is a CPU build
-/// (OpenBLAS, no CUDA). A llamacpp placement `--on gpu` was accepted, sized
-/// with GPU numbers and given the GPU device, and then ran on the CPU with
+/// A GPU build of llama.cpp exists: since 0.6.28 the CUDA image
+/// (`docker/Dockerfile.llamacpp-cuda`, CUDA 12.9) beside the OpenBLAS CPU
+/// image. Before it, a llamacpp placement `--on gpu` was accepted, sized with
+/// GPU numbers and given the GPU device, and then ran on the CPU with
 /// `--gpu-layers` ignored (noomesh-internal i545 45/46). The gateway's
-/// `placement_fit::LLAMACPP_HAS_GPU_BUILD` says the same, and
-/// tests/test_llamacpp_gpu_build_claim.py holds both to the Dockerfile.
-pub const LLAMACPP_HAS_GPU_BUILD: bool = false;
+/// `placement_fit::LLAMACPP_HAS_GPU_BUILD` and the node agent's
+/// `docker.LlamacppHasGPUBuild` make the same claim, and
+/// tests/test_llamacpp_gpu_build_claim.py holds all three to the CUDA
+/// Dockerfile.
+pub const LLAMACPP_HAS_GPU_BUILD: bool = true;
 
-/// Why a llamacpp `gpu` target is not honoured, said where it happens.
+/// The lowest compute capability the CUDA image carries code for (its lowest
+/// cubin and its PTX fallback are compute_61; PTX only runs forward). The
+/// gateway's `placement_fit::LLAMACPP_MIN_COMPUTE_CAP`, the agent's
+/// `docker.LlamacppMinComputeCap`.
+pub const LLAMACPP_MIN_COMPUTE_CAP: &str = "6.1";
+
+/// Why a llamacpp `gpu` target is not honoured on a node, said where it happens.
 pub const LLAMACPP_NO_GPU_NOTE: &str =
-    "the shipped llamacpp image is a CPU (OpenBLAS) build with no CUDA, so on a GPU target it would run on the CPU with GPU sizing";
+    "this node cannot run the CUDA llama.cpp image (it needs an NVIDIA GPU of compute 6.1 or newer and the nvidia container runtime, as the node reports them), so on a GPU target it would run on the CPU with GPU sizing";
+
+/// `(major, minor)` of a compute capability (`"8.6"`), None when it does not parse.
+fn compute_cap(s: &str) -> Option<(u32, u32)> {
+    let (a, b) = s.trim().split_once('.')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
+}
+
+/// Can this node run llama.cpp on its GPU, from its record (`GET
+/// /api/cluster/nodes`: the heartbeat's `nvidia_runtime` and
+/// `gpu_compute_cap`): a GPU build exists, it reports a GPU, the nvidia
+/// runtime is registered and its lowest GPU is at least
+/// [`LLAMACPP_MIN_COMPUTE_CAP`], compared as numbers. A fact not reported is
+/// "no". The gateway's `placement_fit::llamacpp_gpu_usable` and the agent's
+/// `docker.LlamacppGPUUsable` are the same rule.
+pub fn llamacpp_gpu_usable(node: &Value) -> bool {
+    let caps = &node["capabilities"];
+    let runtime = node["nvidia_runtime"].as_bool().or_else(|| caps["nvidia_runtime"].as_bool());
+    let cap = node["gpu_compute_cap"].as_str().or_else(|| caps["gpu_compute_cap"].as_str()).and_then(compute_cap);
+    LLAMACPP_HAS_GPU_BUILD
+        && Hardware::of(node).vram_gb.is_some()
+        && runtime == Some(true)
+        && cap.zip(compute_cap(LLAMACPP_MIN_COMPUTE_CAP)).is_some_and(|(have, need)| have >= need)
+}
 
 /// `backend` on `target` would run on the CPU whatever the target says:
-/// llamacpp on `gpu` while its image has no GPU build.
-pub fn runs_on_cpu_regardless(backend: &str, target: &str) -> bool {
-    backend == "llamacpp" && target == "gpu" && !LLAMACPP_HAS_GPU_BUILD
+/// llamacpp on `gpu` on a node that cannot use the CUDA image.
+pub fn runs_on_cpu_regardless(backend: &str, target: &str, node: &Value) -> bool {
+    backend == "llamacpp" && target == "gpu" && !llamacpp_gpu_usable(node)
 }
 
 /// `<backend> <model>` of every placement in a desired-config `placements`
-/// list that [`runs_on_cpu_regardless`]: placed on gpu, runs on cpu.
-pub fn gpu_targets_on_cpu_builds(placements: &Value) -> Vec<String> {
+/// list that [`runs_on_cpu_regardless`] on `node`: placed on gpu, runs on cpu.
+pub fn gpu_targets_on_cpu_builds(placements: &Value, node: &Value) -> Vec<String> {
     placements
         .as_array()
         .map(|a| {
             a.iter()
-                .filter(|p| runs_on_cpu_regardless(p["backend"].as_str().unwrap_or(""), p["target"].as_str().unwrap_or("")))
+                .filter(|p| runs_on_cpu_regardless(p["backend"].as_str().unwrap_or(""), p["target"].as_str().unwrap_or(""), node))
                 .map(|p| format!("{} {}", p["backend"].as_str().unwrap_or(""), p["model"].as_str().unwrap_or("")))
                 .collect()
         })
@@ -440,14 +478,41 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// i545 45/46: only llamacpp on gpu runs on the cpu regardless, while its
-    /// image has no GPU build; every other pair is honoured as declared.
+    /// A node record as `GET /api/cluster/nodes` carries it: a 6 GB GPU and
+    /// the heartbeat's nvidia runtime and compute capability.
+    fn gpu_node(runtime: Option<bool>, cap: Option<&str>) -> Value {
+        let mut n = json!({"capabilities": {"vram_gb": 6.0, "ram_gb": 32.0, "cpu_cores": 8}});
+        if let Some(r) = runtime {
+            n["nvidia_runtime"] = json!(r);
+        }
+        if let Some(c) = cap {
+            n["gpu_compute_cap"] = json!(c);
+        }
+        n
+    }
+
+    /// llamacpp on gpu is swapped to cpu ONLY on a node that cannot use the
+    /// CUDA image (compute below 6.1 or unknown, no nvidia runtime, no GPU);
+    /// on one that can it stays gpu. Every other pair is honoured as declared.
     #[test]
-    fn only_a_gpu_llamacpp_runs_on_the_cpu_regardless() {
-        assert!(runs_on_cpu_regardless("llamacpp", "gpu"));
-        assert!(!runs_on_cpu_regardless("llamacpp", "cpu"));
+    fn runs_on_cpu_regardless_only_on_a_node_that_cannot_use_the_cuda_image() {
+        let usable = gpu_node(Some(true), Some("6.1"));
+        assert!(llamacpp_gpu_usable(&usable) && llamacpp_gpu_usable(&gpu_node(Some(true), Some("12.0"))));
+        assert!(!runs_on_cpu_regardless("llamacpp", "gpu", &usable), "a usable node runs llamacpp on its GPU");
+        for unusable in [
+            gpu_node(Some(true), Some("5.2")),
+            gpu_node(Some(true), Some("6.0")),
+            gpu_node(Some(true), None),
+            gpu_node(Some(false), Some("8.6")),
+            gpu_node(None, Some("8.6")),
+            json!({"ram_gb": 16.0, "nvidia_runtime": true, "gpu_compute_cap": "8.6"}),
+        ] {
+            assert!(runs_on_cpu_regardless("llamacpp", "gpu", &unusable), "{unusable}");
+        }
+        let unusable = gpu_node(Some(true), Some("5.2"));
+        assert!(!runs_on_cpu_regardless("llamacpp", "cpu", &unusable));
         for b in ["ollama", "vllm", "vllm-secondary"] {
-            assert!(!runs_on_cpu_regardless(b, "gpu"), "{b}");
+            assert!(!runs_on_cpu_regardless(b, "gpu", &unusable), "{b}");
         }
         let placements = json!([
             {"backend": "llamacpp", "model": "a.gguf", "target": "gpu"},
@@ -455,8 +520,25 @@ mod tests {
             {"backend": "ollama", "model": "c", "target": "gpu"},
             {"backend": "llamacpp", "model": "d.gguf"}
         ]);
-        assert_eq!(gpu_targets_on_cpu_builds(&placements), vec!["llamacpp a.gguf".to_string()]);
-        assert!(gpu_targets_on_cpu_builds(&json!(null)).is_empty());
+        assert_eq!(gpu_targets_on_cpu_builds(&placements, &unusable), vec!["llamacpp a.gguf".to_string()]);
+        assert!(gpu_targets_on_cpu_builds(&placements, &usable).is_empty());
+        assert!(gpu_targets_on_cpu_builds(&json!(null), &unusable).is_empty());
+    }
+
+    /// N_BATCH for llamacpp: 256 cpu / 512 gpu shared, 512 cpu / 2048 gpu
+    /// dedicated (the module doc's row), and `tune` writes the gpu value for a
+    /// gpu placement.
+    #[test]
+    fn llamacpp_n_batch_is_512_shared_and_2048_dedicated_on_gpu() {
+        assert_eq!(batch_for("shared", "gpu"), 512);
+        assert_eq!(batch_for("dedicated", "gpu"), 2048);
+        assert_eq!(batch_for("shared", "cpu"), 256);
+        assert_eq!(batch_for("dedicated", "cpu"), 512);
+        let input = TuneInput { backend: "llamacpp", role: "rerank", target: "gpu", usage: "dedicated", cpu_cores: Some(8), weights_gb: None, free_gb: None, kv: None };
+        let b = tune(&input).into_iter().find(|c| c.key == "N_BATCH").expect("an N_BATCH choice");
+        assert_eq!(b.value, "2048", "a gpu llamacpp placement on a dedicated node");
+        let doc = include_str!("cluster_tune.rs");
+        assert!(doc.contains("//! | `N_BATCH` (llamacpp) | 256 cpu / 512 gpu | 512 cpu / 2048 gpu |"), "the module doc's N_BATCH row");
     }
 
     fn hw(cores: u64, ram: f64, vram: Option<f64>) -> Hardware {
