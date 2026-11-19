@@ -433,11 +433,22 @@ func detectUnifiedMemory(gpuAPI string, vram, ramGB float64) (bool, float64) {
 				return true, usable
 			}
 		}
-		if gpuAPI == "cuda" && vram > 0 && ramGB > 0 && vram >= ramGB*0.9 {
+		if cudaPoolIsRAM(runtime.GOARCH, gpuAPI, vram, ramGB) {
 			return true, usable // DGX Spark-class: the CUDA pool IS the RAM
 		}
 	}
 	return false, 0
+}
+
+// cudaPoolIsRAM is the DGX Spark-class rule: nvidia-smi reports a CUDA pool
+// about the size of RAM because the pool IS the RAM (GB10, Grace: arm64).
+// On amd64 a CUDA pool is a discrete card's own memory.total, never system
+// RAM, however the sizes compare: a 24 GB card in a 16 GB desktop, or two
+// 24 GB P40s with 24 GB of RAM, was classed "unified" by the ratio alone and
+// lost its CPU pool (RAM − VRAM) and its per-card list. Pure: the
+// architecture is passed in, so both branches run on the CI's amd64 runner.
+func cudaPoolIsRAM(goarch, gpuAPI string, vram, ramGB float64) bool {
+	return goarch == "arm64" && gpuAPI == "cuda" && vram > 0 && ramGB > 0 && vram >= ramGB*0.9
 }
 
 func unifiedGPUModel() string {
