@@ -966,7 +966,7 @@ pub(crate) fn harness_egress_check(id: &str, n: &Value) -> Option<Check> {
             stale.join(", ")), format!("noo cluster provision {id}   # re-renders the hosts file and the allowlist")),
         Some("unenforced") => fail(NAME, format!(
             "NOT held off the internet ({reason}); placements of kind codex are refused here (Codex resolves api.github.com and chatgpt.com at start)"),
-            format!("noo cluster provision {id}   # then: noo cluster verify; a host whose systemd cannot apply IPAddressDeny (cgroup v1, systemd < 235) needs a systemd upgrade")),
+            format!("noo cluster provision {id}   # its apply report says why the hold was not applied: selfcheck-<host>-<port> = this node cannot reach that controller address under the hold (check its controller URL and that port); selfcheck-unavailable = no systemd-run on this host; on cgroup v1 or systemd < 235, upgrade systemd")),
         _ => warn(NAME, format!("unknown{}: nothing proves this node's harness is held off the internet",
             if reason.is_empty() { String::new() } else { format!(" ({reason})") }),
             Some(format!("noo cluster logs {id} harness   # the harness logs its egress self-test at start"))),
@@ -11114,6 +11114,9 @@ mod tests {
         assert_eq!(verdict(&c, "harness egress"), Verdict::Fail);
         let row = c.iter().find(|c| c.name == "harness egress").unwrap();
         assert!(row.detail.contains("codex") && row.detail.contains("chatgpt.com") && row.detail.contains("no IPAddressDeny"));
+        let remedy = row.remedy.as_deref().unwrap();
+        assert!(remedy.contains("noo cluster provision host6") && remedy.contains("selfcheck-<host>-<port>") && remedy.contains("selfcheck-unavailable"),
+            "the remedy names what the apply report's tag means: {remedy}");
 
         let c = node_checks(&with_egress(now, serde_json::json!({"state": "unknown", "reason": "no self-test file"})), "v0.2.70", "0.5.57", now, Some(true));
         assert_eq!(verdict(&c, "harness egress"), Verdict::Warn);
