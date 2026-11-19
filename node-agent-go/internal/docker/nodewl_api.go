@@ -259,7 +259,13 @@ var _ = network.EndpointSettings{} // the create path builds these (nodewl_spec.
 // fetchRailTar brings one staged image tar over the mTLS rail, checking its
 // sha256 against the rail manifest before a byte of it is handed to docker.
 // The tar is single-use: cleanup removes it.
-func fetchRailTar(ctx context.Context, artifact string) (string, func(), error) {
+//
+// Before a byte is fetched it checks the staging dir has room for the tar and
+// dockerRoot (Docker's data root; "" checks the staging dir only) for its
+// load, exactly as PullImageArtifact does (checkImagePullSpace, from the
+// manifest's size_bytes; no size is no check). A shortfall, or a real ENOSPC
+// from the fetch, is a NoSpaceError: ensureImage never backs it off.
+func fetchRailTar(ctx context.Context, artifact, dockerRoot string) (string, func(), error) {
 	// No "." / ".." / hidden names: the real name is noo-addon-wl_<...>.tar
 	// (nodewl.ParseDesired holds it to its exact per-entry pattern; this is
 	// the last guard before the path is built, so it does not rely on that).
@@ -280,6 +286,9 @@ func fetchRailTar(ctx context.Context, artifact string) (string, func(), error) 
 	if err := os.MkdirAll(stagingDir(), 0o755); err != nil {
 		return "", nil, fmt.Errorf("staging dir: %w", err)
 	}
+	if err := checkImagePullSpace(artifact, stagingDir(), dockerRoot, m.SizeBytes); err != nil {
+		return "", nil, err
+	}
 	staged := filepath.Join(stagingDir(), artifact)
 	slog.Info("pulling node workload image", "tar", artifact, "sha256", m.SHA256[:min(12, len(m.SHA256))]+"…")
 	fetchCtx, cancel := context.WithTimeout(ctx, 40*time.Minute)
@@ -288,7 +297,7 @@ func fetchRailTar(ctx context.Context, artifact string) (string, func(), error) 
 		if errors.Is(err, preseed.ErrDigestMismatch) {
 			return "", nil, &ImageVerificationError{Ref: artifact, Err: err}
 		}
-		return "", nil, err
+		return "", nil, classifyNoSpace(artifact, "the agent's staging dir", stagingDir(), err)
 	}
 	return staged, func() { _ = os.Remove(staged) }, nil
 }

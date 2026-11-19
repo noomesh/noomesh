@@ -634,7 +634,7 @@ The agent's fixed vocabulary for the `reason` of a `node_workloads` or
 | `set_slot_invalid` | `sets` names an undeclared slot, several sets for a `many: false` slot, or a malformed id or revision | fix the placement |
 | `set_unverified` | a set's signature, hashes or `.verified` marker did not check out | re-stage the set; check the node holds `signing.pub` |
 | `profile_invalid` | the entry's `profile` is missing, not one of the main set's profiles, or not realtime-capable for a realtime workload | fix the placement's profile |
-| `disk` | the data root lacks space for the set or the scratch plus the margin | free space on the node |
+| `disk` | the data root lacks space for the set or the scratch plus the margin; or the workload's image tar has no room: checked before the fetch from the rail manifest's `size_bytes` (the agent's staging dir for the tar, Docker's data root for its load, as for a backend image; no size, no check), or the fetch or `docker load` ran out of space. Retried on the next pass, never on the `image_unavailable` backoff | free space on the node |
 | `consent_none` | the node's owner set `NOO_ADDON_WORKLOADS=none` (the kill switch) | only the node's owner can unset it |
 | `consent_unapproved` | policy is `approve` (the default) and this add-on and digest are not approved | on the node: `sudo "$(command -v noo)" node workloads approve <addon> <digest>` |
 | `nvidia_runtime_missing` | `accel.gpu` > 0 and the nvidia runtime is not registered | install the NVIDIA container toolkit |
