@@ -286,6 +286,9 @@ type Reconciler struct {
 	// what the next tick will ask of it (nudgeWhenReady). nil = no
 	// readiness nudge; the ticker alone brings the next pass.
 	backendReady func(ctx context.Context, backend, model string) bool
+	// afterFunc schedules a quick import retry's nudge (r.after); nil =
+	// time.AfterFunc. Injected for tests.
+	afterFunc func(time.Duration, func())
 
 	// envConflicts are the placement_env_conflict refusal targets recorded
 	// last pass, so ones that resolved are cleared.
@@ -296,6 +299,11 @@ type ollamaPullState struct {
 	inFlight   bool
 	lastFailed time.Time
 	failures   int
+	// doorRetries counts the quick retries spent on dial-level import
+	// failures (importDoorRetryAfter); reset by a success or by any failure
+	// the door answered. Past the last one, a dial failure takes the normal
+	// backoff.
+	doorRetries int
 }
 
 // ollamaPullRetryAfter is how long a failed pull is left alone.
@@ -411,20 +419,24 @@ func (r *Reconciler) nudgeCh() chan struct{} {
 // the placed model is held, import it, verify its bytes) runs on the NEXT
 // tick, which the ticker alone brings defaultInterval later. Measured on a
 // hosted node (0.6.28-rc.2): placing an ollama model took ~11 min to read
-// verified for ~3 s of import, one full interval per step. So two events
+// verified for ~3 s of import, one full interval per step. So these events
 // nudge, once each:
 //
-//   - an ollama container this agent just started answers `ollama list`
-//     (nudgeWhenReady), so the next tick's ensure can see the model;
+//   - an ollama container this agent just started answers through the
+//     door the import dials (nudgeWhenReady, importDoorReady), so the next
+//     tick's ensure and import find it up;
 //   - an import of a placed model finishes successfully (startOllamaImport),
 //     so the next tick sees it held and schedules its verification;
 //   - a verify pass ends that was busy while a tick found other models due
 //     (ollamaVerifyLoop.missed), so they are checked on the next tick; a
-//     pass that skipped nothing never nudges.
+//     pass that skipped nothing never nudges;
+//   - an import failed because its door could not be dialled (doorNotUp):
+//     a few quick retries, one spaced nudge each (importDoorRetryAfter).
 //
-// A FAILED import or pull never nudges: its backoff (ollamaPullRetryAfter)
-// decides when it is tried again. Nudges coalesce (a buffer of one), so any
-// number of them while a pass runs or one is pending is one extra pass.
+// Any other FAILED import or pull never nudges: its backoff
+// (ollamaPullRetryAfter) decides when it is tried again. Nudges coalesce (a
+// buffer of one), so any number of them while a pass runs or one is pending
+// is one extra pass.
 const (
 	startReadyWithin = 60 * time.Second
 	startReadyEvery  = 2 * time.Second
@@ -469,16 +481,15 @@ func (r *Reconciler) backendStarted(ctx context.Context, backend, model string) 
 	}
 }
 
-// dockerBackendReady is the production readiness: the ollama container
-// answers the very `ollama list` the next tick's ensureOllamaModel runs.
+// dockerBackendReady is the production readiness: the Ollama API the
+// import dials answers through its door (importDoorReady). Not `ollama
+// list` inside noo-ollama: that answers before the noo-stunnel-ollama
+// sidecar the import goes through is up (0.6.28-rc.3).
 func dockerBackendReady(c *dockerpkg.Client) func(context.Context, string, string) bool {
-	return func(ctx context.Context, backend, model string) bool {
-		if backend != "ollama" || c == nil {
-			return false
-		}
-		_, err := c.OllamaHasModel(ctx, model)
-		return err == nil
+	if c == nil {
+		return importDoorReady(nil)
 	}
+	return importDoorReady(c.OllamaImportDoorAnswers)
 }
 
 // tick is the state of one reconcile pass, built up phase by phase.
@@ -1263,6 +1274,24 @@ func (r *Reconciler) startOllamaImport(ctx context.Context, node, key, model, ro
 		defer r.pullMu.Unlock()
 		st.inFlight = false
 		if err != nil {
+			// Never a substring of err's text: doorNotUp reads its type.
+			if doorNotUp(err) && st.doorRetries < len(importDoorRetryAfter) {
+				wait := importDoorRetryAfter[st.doorRetries]
+				st.doorRetries++
+				slog.Warn("reconcile.ollama_import_door_not_up", "model", model, "backend", key,
+					"error", err, "quick_retry", st.doorRetries, "of", len(importDoorRetryAfter), "retry_in", wait.String(),
+					"detail", "the import could not dial ollama's door (not up yet); retrying shortly, without the "+ollamaPullRetryAfter.String()+" backoff")
+				r.after(wait, r.Nudge)
+				return
+			}
+			if !doorNotUp(err) {
+				st.doorRetries = 0
+			} else if st.doorRetries == len(importDoorRetryAfter) {
+				st.doorRetries++ // logged once until a success or an answered failure
+				slog.Warn("reconcile.ollama_import_door_retries_spent", "model", model, "backend", key,
+					"quick_retries", len(importDoorRetryAfter),
+					"detail", "ollama's door never answered the quick retries; the normal backoff applies")
+			}
 			st.failures++
 			st.lastFailed = time.Now()
 			slog.Error("reconcile.ollama_import_failed", "model", model, "backend", key,
@@ -1273,6 +1302,7 @@ func (r *Reconciler) startOllamaImport(ctx context.Context, node, key, model, ro
 			return
 		}
 		st.failures = 0
+		st.doorRetries = 0
 		st.lastFailed = time.Time{}
 		// The next tick sees the model held and clears presence + refusal;
 		// clearing the refusal now just keeps the window honest.

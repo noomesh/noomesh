@@ -73,7 +73,11 @@ def test_go_const_derives_from_the_store_constant():
     store = re.search(r'ollamaOursStore\s*=\s*"([^"]+)"', _read("node-agent-go/internal/docker/ollama_store.go"))
     assert store and store.group(1) == "/home/nonroot/.ollama"
     assert 'const convertDir = ollamaOursStore + "/convert"' in go
-    assert "CopyUIDGID: true" in go
+    # The copy carries the owner in the tar headers (convertOwner), never
+    # CopyUIDGID: Docker Engine < 28 looks the image's `USER 65532:65532` up
+    # as a passwd NAME and fails (getent unable to find entry).
+    assert "CopyUIDGID: true" not in go
+    assert "Uid:      convertOwner," in go
 
 
 @pytest.mark.skipif(

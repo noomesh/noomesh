@@ -106,3 +106,42 @@ func TestOllamaImportDoorNameUnresolvableWithoutHostDial(t *testing.T) {
 		t.Fatalf("%s resolved without the host-mode dialer; the host-mode test proves nothing here", testOllamaDoor)
 	}
 }
+
+// The readiness probe (OllamaImportDoorAnswers) asks the door the import
+// dials: any HTTP status through it is an answer; a door whose name does not
+// resolve is not, and its error keeps the *net.DNSError reconcile's
+// dial-level class reads (by type, never by message).
+func TestOllamaImportDoorAnswers_AnyStatusAnswers_UnresolvedIsTyped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/tags" {
+			t.Errorf("probe asked %s, want /api/tags", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+	hostModeDialer(t, srv)
+	_, port, _ := net.SplitHostPort(srv.Listener.Addr().String())
+	base := "http://" + net.JoinHostPort(testOllamaDoor, port)
+	tr, err := ollamaTransport(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.CloseIdleConnections()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := (&ollamaHTTP{base: base, transport: tr}).Answers(ctx); err != nil {
+		t.Fatalf("an HTTP 500 through the door is an answer, got %v", err)
+	}
+
+	t.Cleanup(containerdial.SwapForTest(nil))
+	tr2, err := ollamaTransport("http://" + testOllamaDoor + ":11434")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr2.CloseIdleConnections()
+	err = (&ollamaHTTP{base: "http://" + testOllamaDoor + ":11434", transport: tr2}).Answers(ctx)
+	var dnsErr *net.DNSError
+	if err == nil || !errors.As(err, &dnsErr) {
+		t.Fatalf("an unresolvable door: err = %v, want one carrying *net.DNSError", err)
+	}
+}
