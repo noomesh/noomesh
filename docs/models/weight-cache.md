@@ -460,8 +460,12 @@ its image through one function (`EnsureImage`):
    goes ahead on the next reconcile pass after space is freed (after a real
    "no space left on device", once that filesystem has gained 1 GiB over
    the free space seen at the failure, so the tar is not re-fetched every
-   pass), and
-   `noo cluster verify`'s `backend starts` row gives the disk remedy. A
+   pass). The refusal and `noo cluster verify`'s `backend starts` row name
+   noo's own reclaim first: `noo autonomy decisions -l disk_watermark`
+   shows what it would free on that node, `noo autonomy live
+   disk_watermark` lets it act (an operator decision; see
+   [disk-and-images.md](../operating/disk-and-images.md), "When the disk fills"); for llamacpp,
+   placing it `--on cpu` also helps. A
    manifest without `size_bytes` (an older gateway) skips the check.
 3. **Local, nothing to compare** (not staged, an older gateway, controller
    unreachable) → used, and reported as `local`.

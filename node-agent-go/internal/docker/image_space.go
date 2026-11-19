@@ -156,11 +156,15 @@ type NoSpaceError struct {
 }
 
 func (e *NoSpaceError) Error() string {
-	remedy := "free space there (`docker image prune -f` on this node; `noo cluster show " + nodeIDOrPlaceholder() + "`)"
+	// noo's own way first (the disk_watermark reclaim), never a raw docker
+	// command on a remote shell.
+	node := nodeIDOrPlaceholder()
+	remedy := "free space on " + node + ": `noo autonomy decisions -l disk_watermark` shows what noo's reclaim would free there; " +
+		"`noo autonomy live disk_watermark` lets it act (an operator decision; see docs/operating/disk-and-images.md)"
 	if strings.Contains(e.Ref, "llamacpp") {
-		remedy += ", or place llamacpp on cpu (`noo cluster place " + nodeIDOrPlaceholder() + " llamacpp <model> --on cpu`)"
+		remedy += ", or place it on cpu: `noo cluster place " + node + " llamacpp <model> --on cpu`"
 	}
-	remedy += "; the next reconcile pass retries as soon as there is room"
+	remedy += "; `noo cluster show " + node + "`; the next reconcile pass retries as soon as there is room"
 	if e.Waiting {
 		return fmt.Sprintf("%s %s: waiting for space: %s had %d MiB free when the last pull ran out; retrying once it has more — %s",
 			noSpacePrefix, e.Ref, e.Path, e.Free>>20, remedy)

@@ -660,13 +660,19 @@ fn is_no_space_refusal(reason: &str) -> bool {
     reason.contains("not enough disk space for image") || reason.contains("no space left on device")
 }
 
-/// The disk remedy for a no-space start refusal; llamacpp can also move to
-/// its smaller CPU image.
+/// The disk remedy for a no-space start refusal: noo's own reclaim (the
+/// `disk_watermark` rule, docs/operating/disk-and-images.md) first, never a
+/// raw docker command on a remote shell; llamacpp can also move to its
+/// smaller CPU image.
 fn no_space_remedy(id: &str, target: &str) -> String {
-    let mut r = format!("on {id}: free space for the image (docker image prune -f on that node; noo cluster show {id})");
+    let mut r = format!(
+        "free space on {id}: `noo autonomy decisions -l disk_watermark` shows what noo's reclaim would free there; \
+         `noo autonomy live disk_watermark` lets it act (an operator decision; see docs/operating/disk-and-images.md)"
+    );
     if target == "llamacpp" {
-        r.push_str(&format!(" or place it on cpu: noo cluster place {id} llamacpp <model> --on cpu"));
+        r.push_str(&format!(", or place it on cpu: noo cluster place {id} llamacpp <model> --on cpu"));
     }
+    r.push_str(&format!("; noo cluster show {id}"));
     r
 }
 
@@ -16866,11 +16872,24 @@ mod backend_starts_tests {
         assert_eq!(c.verdict, Verdict::Fail);
         assert_eq!(
             c.remedy.as_deref(),
-            Some("on node-a: free space for the image (docker image prune -f on that node; noo cluster show node-a) or place it on cpu: noo cluster place node-a llamacpp <model> --on cpu")
+            Some(
+                "free space on node-a: `noo autonomy decisions -l disk_watermark` shows what noo's reclaim would free there; \
+                 `noo autonomy live disk_watermark` lets it act (an operator decision; see docs/operating/disk-and-images.md), \
+                 or place it on cpu: noo cluster place node-a llamacpp <model> --on cpu; noo cluster show node-a"
+            )
         );
+        assert!(!c.remedy.as_deref().unwrap_or("").contains("docker image prune"), "{:?}", c.remedy);
         let raw = backend_starts_check("node-a", &node(json!([{"scope": "backend_start", "target": "vllm", "reason": "docker load: write /x: no space left on device"}]))).unwrap();
         assert_eq!(raw.verdict, Verdict::Fail);
-        assert_eq!(raw.remedy.as_deref(), Some("on node-a: free space for the image (docker image prune -f on that node; noo cluster show node-a)"));
+        assert_eq!(
+            raw.remedy.as_deref(),
+            Some(
+                "free space on node-a: `noo autonomy decisions -l disk_watermark` shows what noo's reclaim would free there; \
+                 `noo autonomy live disk_watermark` lets it act (an operator decision; see docs/operating/disk-and-images.md); \
+                 noo cluster show node-a"
+            )
+        );
+        assert!(!raw.remedy.as_deref().unwrap_or("").contains("docker image prune"), "{:?}", raw.remedy);
     }
 
     #[test]
