@@ -916,6 +916,53 @@ pub fn post_json_try(
     with_auth: bool,
     default_timeout: u64,
 ) -> Result<serde_json::Value, String> {
+    post_json_status_try(g, path, body, with_auth, default_timeout).map_err(|f| f.line)
+}
+
+/// A tolerant request that did not return a 2xx JSON body.
+///
+/// `status` is the gateway's HTTP status when it answered with a non-2xx;
+/// `None` when nothing answered (transport, TLS, timeout) or a 2xx body was
+/// not JSON. `line` is the sentence [`post_json_try`] returns; `body` the
+/// raw response text (empty without an answer).
+///
+/// Decide on `status`, never on a substring of `line` or `body`: a body
+/// carries random ids, and the 0.6.28-rc.2 install matrix read the 404 ref
+/// "ref-2b0d6401ee" as a 401.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TryFail {
+    pub status: Option<u16>,
+    pub line: String,
+    pub body: String,
+}
+
+impl TryFail {
+    /// A failure with no HTTP status (no answer, or a local refusal).
+    pub fn local(line: impl Into<String>) -> Self {
+        TryFail { status: None, line: line.into(), body: String::new() }
+    }
+
+    /// The failure from a non-2xx answer: the `detail` sentence when the
+    /// body carries one, else `HTTP <status>: <body>` (the line
+    /// `post_json_try` has always returned).
+    pub fn from_status(status: u16, text: &str) -> Self {
+        let line = serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .and_then(|v| v["detail"].as_str().map(str::to_string))
+            .unwrap_or_else(|| format!("HTTP {status}: {text}"));
+        TryFail { status: Some(status), line, body: text.to_string() }
+    }
+}
+
+/// [`post_json_try`] with the status typed: `Err(TryFail)` carries the HTTP
+/// status as a number, for callers whose retry or refusal turns on it.
+pub fn post_json_status_try(
+    g: &Globals,
+    path: &str,
+    body: &serde_json::Value,
+    with_auth: bool,
+    default_timeout: u64,
+) -> Result<serde_json::Value, TryFail> {
     let base = crate::envfile::gateway_url(&g.gateway_override);
     let url = format!("{base}{path}");
     if g.verbose {
@@ -929,18 +976,14 @@ pub fn post_json_try(
         }
         req.send_json(body)
     })
-    .map_err(|e| describe_send_error(&base, &e, effective_timeout(g, default_timeout)))?;
+    .map_err(|e| TryFail::local(describe_send_error(&base, &e, effective_timeout(g, default_timeout))))?;
     let status = resp.status().as_u16();
     let text = resp.body_mut().read_to_string().unwrap_or_default();
     if (200..=299).contains(&status) {
         return serde_json::from_str(&text)
-            .map_err(|_| format!("gateway returned non-JSON body from {path}"));
+            .map_err(|_| TryFail::local(format!("gateway returned non-JSON body from {path}")));
     }
-    let detail = serde_json::from_str::<serde_json::Value>(&text)
-        .ok()
-        .and_then(|v| v["detail"].as_str().map(str::to_string))
-        .unwrap_or_else(|| format!("HTTP {status}: {text}"));
-    Err(detail)
+    Err(TryFail::from_status(status, &text))
 }
 
 /// Tolerant PUT (parity with `post_json_try`): returns `Err(detail)` on
