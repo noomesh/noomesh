@@ -173,7 +173,72 @@ func clearRailFailure(ref string) {
 func resetRailBackoff() {
 	railFailMu.Lock()
 	railFail = map[string]railFailure{}
+	noSpaceSeen = map[string]noSpaceRecord{}
 	railFailMu.Unlock()
+}
+
+// noSpaceRetryStep is how much a filesystem must gain, over the free space
+// seen when a pull REALLY ran out on it, before the pull is tried again:
+// the larger of imageSpaceMargin and 1 GiB.
+var noSpaceRetryStep = max(imageSpaceMargin, uint64(1)<<30)
+
+// noSpaceRecord: a pull of a ref ran out of space for real (ENOSPC
+// mid-fetch or at load — not the pre-check, which costs nothing to repeat)
+// at path, which had free bytes free right after. Without it the next pass
+// could pass the pre-check again (the estimate was too low) and re-download
+// the tar every pass. It is a loop guard keyed on a fact (free space), not
+// a timed backoff: the pull is retried as soon as path gains
+// noSpaceRetryStep. Guarded by railFailMu.
+type noSpaceRecord struct {
+	path string
+	free uint64
+}
+
+var noSpaceSeen = map[string]noSpaceRecord{}
+
+// noteNoSpace records a REAL out-of-space failure of ref, with the free
+// space read right after it. A pre-check refusal (no Err) or a path whose
+// free space cannot be read records nothing: retry, as before.
+func noteNoSpace(ref string, err error) {
+	var ns *NoSpaceError
+	if !errors.As(err, &ns) || ns.Err == nil || ns.Waiting {
+		return
+	}
+	st, serr := diskStatFn(ns.Path)
+	if serr != nil {
+		return
+	}
+	railFailMu.Lock()
+	noSpaceSeen[ref] = noSpaceRecord{path: ns.Path, free: st.free}
+	railFailMu.Unlock()
+}
+
+func clearNoSpace(ref string) {
+	railFailMu.Lock()
+	delete(noSpaceSeen, ref)
+	railFailMu.Unlock()
+}
+
+// noSpaceGate: a waiting NoSpaceError while ref's last pull ran out of
+// space and its path has not gained noSpaceRetryStep since; nil (try the
+// pull) otherwise. Grown past the step → the record is cleared. Free space
+// unknown now → nil, the record kept: no loop guard on an unknown.
+func noSpaceGate(ref string) error {
+	railFailMu.Lock()
+	rec, ok := noSpaceSeen[ref]
+	railFailMu.Unlock()
+	if !ok {
+		return nil
+	}
+	st, err := diskStatFn(rec.path)
+	if err != nil {
+		return nil
+	}
+	if st.free < rec.free+noSpaceRetryStep {
+		return &NoSpaceError{Ref: ref, What: "the filesystem the last pull ran out on", Path: rec.path, Free: rec.free, Waiting: true}
+	}
+	clearNoSpace(ref)
+	return nil
 }
 
 // The daemon-facing steps, as package vars so the decision is testable
@@ -265,13 +330,20 @@ func (c *Client) resolveImage(ctx context.Context, ref string) (source, imageID 
 			slog.Info("local image differs from the one staged on the controller; pulling the staged one over the rail",
 				"image", ref, "local", shortImageID(localID), "staged", shortImageID(known[0]))
 		}
-		if err := imageRailPull(ctx, c, ref); err != nil {
+		err = noSpaceGate(ref)
+		if err == nil {
+			err = imageRailPull(ctx, c, ref)
+		}
+		if err != nil {
 			if IsImageVerification(err) {
 				return "", "", fmt.Errorf("pull %s over the artifact rail: %w", ref, err)
 			}
 			if IsNoSpace(err) {
 				// Not transport: no backoff. The next reconcile pass re-checks
-				// the space (a statfs) and pulls as soon as there is room.
+				// the space (a statfs) and pulls as soon as there is room; a
+				// REAL ENOSPC is remembered so it is not re-fetched until
+				// that path has gained noSpaceRetryStep (noSpaceGate).
+				noteNoSpace(ref, err)
 				if present {
 					slog.Warn("image.rail_no_space: running the local copy; the rail is retried on the next pass",
 						"image", ref, "local", shortImageID(localID), "err", err)
@@ -288,6 +360,7 @@ func (c *Client) resolveImage(ctx context.Context, ref string) (source, imageID 
 			return "", "", fmt.Errorf("pull %s over the artifact rail: %w", ref, err)
 		}
 		clearRailFailure(ref)
+		clearNoSpace(ref)
 		id, _ := imageLocalID(ctx, c, ref)
 		return imagesource.Rail, id, nil
 	}

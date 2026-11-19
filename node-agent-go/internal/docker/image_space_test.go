@@ -159,3 +159,75 @@ func TestRawENOSPCFromLoadIsNoSpace(t *testing.T) {
 		t.Errorf("a fetch write's ENOSPC: want a NoSpaceError wrapping it, got %v", werr)
 	}
 }
+
+// noSpaceRecorded reports whether ref has a real-ENOSPC record. Tests only.
+func noSpaceRecorded(ref string) bool {
+	railFailMu.Lock()
+	defer railFailMu.Unlock()
+	_, ok := noSpaceSeen[ref]
+	return ok
+}
+
+// realENOSPC is what PullImageArtifact returns when the fetch's write ran
+// out of space for real (classifyNoSpace).
+func realENOSPC(path string) error {
+	return &NoSpaceError{Ref: ownRef, What: "the agent's staging dir", Path: path, Err: fmt.Errorf("fetch x: %w", syscall.ENOSPC)}
+}
+
+// A real ENOSPC (the estimate passed, the disk did not) is not re-fetched
+// on the next pass while free space is unchanged; once the path gains
+// noSpaceRetryStep the pull is tried again. No timer involved.
+func TestARealENOSPCDoesNotRefetchUntilSpaceGrows(t *testing.T) {
+	f := &fakeImageRail{local: map[string]string{}, staged: stagedAt(ownRef, "sha256:new"), railErr: realENOSPC("/staging")}
+	f.install(t)
+	disks := map[string]diskStat{"/staging": {dev: 1, free: 1 * gib}}
+	stubDisks(t, "/root", disks)
+
+	for i := 0; i < 2; i++ {
+		if err := (&Client{}).EnsureImage(context.Background(), ownRef); !IsNoSpace(err) {
+			t.Fatalf("pass %d: want the no-space refusal, got %v", i, err)
+		}
+	}
+	if len(f.railPulls) != 1 {
+		t.Fatalf("free space unchanged: want ONE fetch over two passes, got %d", len(f.railPulls))
+	}
+	err := (&Client{}).EnsureImage(context.Background(), ownRef)
+	if err == nil || !strings.Contains(err.Error(), "waiting for space: /staging had 1024 MiB free") {
+		t.Fatalf("the waiting refusal must name the path and the free space seen: %v", err)
+	}
+
+	disks["/staging"] = diskStat{dev: 1, free: 1*gib + noSpaceRetryStep}
+	f.railErr = nil
+	if err := (&Client{}).EnsureImage(context.Background(), ownRef); err != nil {
+		t.Fatalf("free space grew past the step: the pull must run, got %v", err)
+	}
+	if len(f.railPulls) != 2 {
+		t.Fatalf("after the space grew: want a second fetch, got %d", len(f.railPulls))
+	}
+}
+
+// A successful pull clears the record, also when it ran without the gate
+// (free space unknown at the time: retried, the record kept until then).
+func TestASuccessfulPullClearsTheNoSpaceRecord(t *testing.T) {
+	f := &fakeImageRail{local: map[string]string{}, staged: stagedAt(ownRef, "sha256:new"), railErr: realENOSPC("/staging")}
+	f.install(t)
+	disks := map[string]diskStat{"/staging": {dev: 1, free: 1 * gib}}
+	stubDisks(t, "/root", disks)
+	if err := (&Client{}).EnsureImage(context.Background(), ownRef); !IsNoSpace(err) {
+		t.Fatalf("want the no-space refusal, got %v", err)
+	}
+	if !noSpaceRecorded(ownRef) {
+		t.Fatal("a real ENOSPC with a readable path must be recorded")
+	}
+	delete(disks, "/staging") // free space unknown: retried, no loop guard
+	f.railErr = nil
+	if err := (&Client{}).EnsureImage(context.Background(), ownRef); err != nil {
+		t.Fatalf("unknown free space must retry, got %v", err)
+	}
+	if len(f.railPulls) != 2 {
+		t.Fatalf("want the retry to fetch, got %d pulls", len(f.railPulls))
+	}
+	if noSpaceRecorded(ownRef) {
+		t.Fatal("a successful pull must clear the no-space record")
+	}
+}
