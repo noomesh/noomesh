@@ -178,7 +178,7 @@ func uncoveredBackendFns(t *testing.T, path, rel string) []string {
 		if !info.uncovered() || controllerOnly[rel+":"+name] {
 			continue
 		}
-		if fileDialsBackend || info.namesDoor {
+		if fileDialsBackend {
 			out = append(out, rel+": "+name)
 		}
 	}
