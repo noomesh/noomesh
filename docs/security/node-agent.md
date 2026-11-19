@@ -760,7 +760,10 @@ address of its own, so the dialer follows its `container:` network mode one
 hop to the door (`ContainerDialAddr`), the same address docker DNS gives a
 containerised caller. The CA the
 proxy verifies doors with is the agent's `NOO_TLS_CA` (the container path
-`/app/pki/ca.crt` only for a containerised agent).
+`/app/pki/ca.crt` only for a containerised agent). Every transport the
+agent builds to dial a backend (the inference proxies, the Ollama store
+import, an adopted lane's `OLLAMA_URL`) takes the shared dialer through
+`containerdial.ApplyDial`; a test fails on one that does not.
 
 | Host | Address the dialer uses | Published on the host |
 |---|---|---|

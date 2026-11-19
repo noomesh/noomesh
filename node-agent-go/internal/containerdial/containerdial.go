@@ -248,5 +248,52 @@ func Install(inner IPResolver) dialFn {
 	if t, ok := http.DefaultTransport.(*http.Transport); ok {
 		t.DialContext = wrapped
 	}
+	setInstalled(wrapped)
 	return wrapped
+}
+
+// installed is the host-mode dialer Install built, nil in container mode
+// (and before Install runs). It is the ONE place a transport the agent
+// builds for itself gets the host-mode dial: every *http.Transport that can
+// dial a backend by its docker-DNS name (BackendDialURL, a door, a noo-*
+// container, an OLLAMA_URL) goes through ApplyDial. A transport built
+// fresh (config.HTTPTransport, &http.Transport{}) does NOT inherit
+// http.DefaultTransport's dialer — the Ollama store import built one and
+// dialled "noo-stunnel-ollama" through the system resolver on every
+// host-mode node (0.6.27). TestBackendTransportsApplyTheHostDial pins the
+// call sites.
+var (
+	installedMu sync.RWMutex
+	installed   dialFn
+)
+
+func setInstalled(d dialFn) {
+	installedMu.Lock()
+	installed = d
+	installedMu.Unlock()
+}
+
+// Installed returns the host-mode dialer, or nil in container mode.
+func Installed() dialFn {
+	installedMu.RLock()
+	defer installedMu.RUnlock()
+	return installed
+}
+
+// ApplyDial gives t the host-mode dialer when one is installed and returns
+// t. In container mode it leaves t untouched (its default dialer), so the
+// containerised path stays byte-identical.
+func ApplyDial(t *http.Transport) *http.Transport {
+	if d := Installed(); d != nil && t != nil {
+		t.DialContext = d
+	}
+	return t
+}
+
+// SwapForTest installs d as the host-mode dialer (nil = container mode) and
+// returns the restore. Tests only: production sets it through Install.
+func SwapForTest(d func(ctx context.Context, network, addr string) (net.Conn, error)) (restore func()) {
+	prev := Installed()
+	setInstalled(d)
+	return func() { setInstalled(prev) }
 }
