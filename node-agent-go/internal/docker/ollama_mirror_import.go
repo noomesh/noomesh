@@ -74,6 +74,60 @@ func ollamaTransport(base string) (*http.Transport, error) {
 	return containerdial.ApplyDial(&http.Transport{Proxy: nil, MaxIdleConnsPerHost: 2, IdleConnTimeout: 30 * time.Second}), nil
 }
 
+// ollamaImportBase is the Ollama API a mirror import talks to on this node:
+// the host daemon where no managed container exists (ollamaImportHost), else
+// the managed container's door (BackendDialURL), refused while that
+// container is not running or OLLAMA_URL points elsewhere. importMirror and
+// OllamaImportDoorAnswers both take it from here, so "the door answers" is
+// asked of the very URL the import then dials.
+func (c *Client) ollamaImportBase(ctx context.Context) (via, base string, host bool, err error) {
+	_, host, err = c.ollamaImportHost(ctx)
+	if err != nil {
+		return "", "", false, err
+	}
+	if host {
+		return "host", nativeOllamaBase(), true, nil
+	}
+	if c == nil || c.docker == nil {
+		return "", "", false, fmt.Errorf("no `ollama` binary on this node and Docker is not available to run it in %s", OllamaContainer)
+	}
+	if !c.isRunning(ctx, OllamaContainer) {
+		return "", "", false, fmt.Errorf(
+			"the %s container is not running and the import goes only to it on this node — start it (`noo cluster start-backend %s ollama`), then re-run",
+			OllamaContainer, os.Getenv("NODE_ID"))
+	}
+	if strings.TrimSpace(os.Getenv("OLLAMA_URL")) != "" {
+		// The blobs would go to the daemon at OLLAMA_URL and the manifest
+		// into the container's store: two ollamas, one half each.
+		return "", "", false, fmt.Errorf("OLLAMA_URL is set (%s) but the import goes to the container on this node, so it would write into %s while pushing to that URL — unset OLLAMA_URL or install ollama on the host",
+			os.Getenv("OLLAMA_URL"), OllamaContainer)
+	}
+	return "container", c.BackendDialURL(ctx, "ollama"), false, nil
+}
+
+// OllamaImportDoorAnswers asks the Ollama API a mirror import would dial
+// (ollamaImportBase, through ollamaTransport: on the container lane the
+// separate noo-stunnel-ollama sidecar, not the noo-ollama container) for
+// /api/tags. nil = an HTTP answer came back through it, whatever its status;
+// an error = the import's own path is not up yet (the door's name does not
+// resolve, the dial is refused) or the path could not be chosen.
+//
+// 0.6.28-rc.3: `ollama list` inside noo-ollama answered 1.7 s after the
+// start while the sidecar was not yet a resolvable container; the import
+// that readiness nudged failed "lookup noo-stunnel-ollama ... no such host".
+func (c *Client) OllamaImportDoorAnswers(ctx context.Context) error {
+	_, base, _, err := c.ollamaImportBase(ctx)
+	if err != nil {
+		return err
+	}
+	tr, err := ollamaTransport(base)
+	if err != nil {
+		return fmt.Errorf("dialling ollama at %s: %w", base, err)
+	}
+	defer tr.CloseIdleConnections()
+	return (&ollamaHTTP{base: base, transport: tr}).Answers(ctx)
+}
+
 // mirrorRef is a staged registry tag, resolved.
 type mirrorRef struct {
 	ns, name, tag string
@@ -111,34 +165,17 @@ func (c *Client) importMirror(ctx context.Context, name string, r mirrorRef, gm 
 	}
 
 	var deps mirrorDeps
-	var via, base string
-	_, host, pathErr := c.ollamaImportHost(ctx)
-	if pathErr != nil {
-		return nil, pathErr
+	via, base, host, err := c.ollamaImportBase(ctx)
+	if err != nil {
+		return nil, err
 	}
 	if host {
-		via, base = "host", nativeOllamaBase()
 		modelsDir := nativeOllamaModelsDir()
 		deps.writeManifest = func(_ context.Context, ns, n, tag string, b []byte) (*manifestWrite, error) {
 			return writeManifestNative(modelsDir, ns, n, tag, b)
 		}
 		deps.checkSpace = func(missing []mirrorBlob) error { return requireFree(modelsDir, missing, "ollama's model store") }
 	} else {
-		if c == nil || c.docker == nil {
-			return nil, fmt.Errorf("no `ollama` binary on this node and Docker is not available to run it in %s", OllamaContainer)
-		}
-		if !c.isRunning(ctx, OllamaContainer) {
-			return nil, fmt.Errorf(
-				"the %s container is not running and the import goes only to it on this node — start it (`noo cluster start-backend %s ollama`), then re-run",
-				OllamaContainer, os.Getenv("NODE_ID"))
-		}
-		if strings.TrimSpace(os.Getenv("OLLAMA_URL")) != "" {
-			// The blobs would go to the daemon at OLLAMA_URL and the manifest
-			// into the container's store: two ollamas, one half each.
-			return nil, fmt.Errorf("OLLAMA_URL is set (%s) but the import goes to the container on this node, so it would write into %s while pushing to that URL — unset OLLAMA_URL or install ollama on the host",
-				os.Getenv("OLLAMA_URL"), OllamaContainer)
-		}
-		via, base = "container", c.BackendDialURL(ctx, "ollama")
 		deps.writeManifest = c.writeManifestContainer
 	}
 	tr, err := ollamaTransport(base)
