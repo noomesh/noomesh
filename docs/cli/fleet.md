@@ -238,8 +238,11 @@ then fewest requests in flight and the lowest load. A quarantined or
 thermal-`critical` node is left out unless nothing else is. Nodes come and
 go: a busy, hot or offline node drops out and rejoins on its own. The
 yaml's `cluster.backends.<x>.model` (what onboarding put on the local
-backend) is a placement hint and does not narrow this. Declaring
-`chat-default` puts your list ahead of the dynamic pool; `class list`
+backend) is a placement hint and does not narrow this. With no live chat
+lane yet (the first ~30 s after a placement), unpinned chat falls back to the
+static Ollama (`services.ollama_url`), which is sent the placed chat model
+when it holds it and the yaml's model only when no chat model is placed.
+Declaring `chat-default` puts your list ahead of the dynamic pool; `class list`
 prints `chat-default: dynamic (all live chat nodes)` or `declared`, and
 `noo cluster verify --controller` has a `default chat` row listing the live
 candidates in order (`!` when only CPU candidates or one node remain, `x`
@@ -340,7 +343,11 @@ that follows its chat backend.
 `place` writes a placement to the node's desired config
 (`gpu-2: ollama → qwen2.5:7b-instruct (running) — agent reconciles within
 5 min`; the gateway also nudges the agent at once, so a reachable node
-converges within seconds and 5 min is the fallback); `--stopped` records it without starting, `--port`/`--tls`/`--image`
+converges within seconds and 5 min is the fallback; for an ollama placement
+the agent also re-runs as soon as the container it started answers and again
+when a model import finishes, so `noo cluster verify`'s `ollama models` row
+reads verified about a minute after `place`, plus the import and its first
+byte check); `--stopped` records it without starting, `--port`/`--tls`/`--image`
 pin the container. `desired` shows the node's config row (ip, tier, ssh
 user, data root, models dir, GPU override) and its placements
 (`backend | model | port | tls | desired`). `unplace` removes the record

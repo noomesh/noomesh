@@ -1719,6 +1719,27 @@ pub(crate) fn applier_first_for(g: &Globals, node: &str) -> bool {
         && std::env::var(FULL_BUNDLE_ENV).as_deref() != Ok("1")
 }
 
+/// The applier-only bundle of a node's first roll: the applier and, when
+/// this CLI holds its release's verified signed list, that list
+/// (`proof`: [`release_proof_for`], the rows [`attach_release_proof`] adds
+/// for root code). Carrying it is safe for an older applier: since stack
+/// v0.6.0 every applier self-replaces (§1b) before its kind allowlist (§2,
+/// exit 76), so the list kinds never reach that refusal; the applier it
+/// re-execs verifies the list (§1c). Without a proof, the applier alone and
+/// why: the node's rule stays strict (i908) and a generation-2 applier
+/// refuses root code with no list.
+fn applier_only_files(apply: &[u8], proof: impl FnOnce(&[(&str, Vec<u8>)]) -> Result<Vec<(&'static str, Vec<u8>)>, String>)
+    -> (Vec<(&'static str, Vec<u8>)>, Option<String>) {
+    let mut files: Vec<(&'static str, Vec<u8>)> = vec![("applier", apply.to_vec())];
+    match proof(&files) {
+        Ok(rows) => {
+            files.extend(rows);
+            (files, None)
+        }
+        Err(e) => (files, Some(e)),
+    }
+}
+
 /// A node that has never reported an apply runs the legacy fetcher/applier pair: stage an applier-only bundle first, the one kind every applier accepts. Returns (whether the node is legacy, whether ONLY the applier was staged: `--stage-only`, where the caller restages the full bundle).
 /// A node that has never reported an apply outcome runs the legacy
 /// fetcher/applier pair (pre-2026-09-03): its applier refuses every
@@ -1739,7 +1760,12 @@ fn stage_applier_first(g: &Globals, a: &ProvisionArgs, m: &ProvMachine, ca: &cra
             nstep(&format!("{node} has never reported an apply — staging the applier alone first"));
             let w2 = crate::private_tmp::dir(&format!("noo-provision-applier-{node}"))
                 .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "bundle_failed", &e, None));
-            let pre: Vec<(&str, Vec<u8>)> = vec![("applier", apply.as_bytes().to_vec())];
+            let (pre, no_list) = applier_only_files(apply.as_bytes(), |f| release_proof_for(g, f));
+            match no_list {
+                None => nnote(&format!("{node}: the applier bundle carries release {}'s signed list", env!("CARGO_PKG_VERSION"))),
+                Some(e) => warn_line(&format!(
+                    "{node}: the applier bundle goes without a release-signed list ({e}) — an applier of generation 2 or later refuses it (exit 75); the full bundle follows")),
+            }
             let b2 = match super::security_local::build_signed_bundle(ca, &node, &pre, &w2) {
                 Ok(b) => b,
                 Err(e) => { scrub(&w2); fail(g.json, ExitCode::Generic, "bundle_failed", &e, None); }
@@ -4432,21 +4458,29 @@ pub(crate) const POKE_RETRY_WINDOW_SECS: u64 = 60;
 pub(crate) const POKE_RETRY_STEP_SECS: u64 = 10;
 
 /// Is this submit failure the gateway's "not yet" rather than a verdict?
-/// The gateway answers 503 with `{"error":"redis_reconnecting"}` while its
-/// Redis client reconnects (older gateways: a bare 500 naming Redis). Any
-/// other status is an answer (bad body, auth, unknown node) and is not
-/// retried. The text is what `post_json_try` hands back: the `detail` field
-/// when there is one, else `HTTP <status>: <body>`.
-pub(crate) fn poke_is_transient(err: &str) -> bool {
-    let lower = err.to_ascii_lowercase();
-    lower.starts_with("http 503") || lower.contains("redis")
+/// The gateway answers 503 with the code `{"error":"redis_reconnecting"}`
+/// while its Redis client reconnects; older gateways answered a bare
+/// `500 {"error":"Redis not connected"}`. Any other status is an answer
+/// (bad body, auth, unknown node) and is not retried.
+///
+/// Decided on the typed status and the body's exact `error` field, never on
+/// a substring of the text: "redis" can be part of a node or host name the
+/// error echoes, and a random ref can hold "503".
+pub(crate) fn poke_is_transient(err: &crate::http::TryFail) -> bool {
+    let doc = serde_json::from_str::<serde_json::Value>(&err.body).ok();
+    let code = doc.as_ref().and_then(|v| v["error"].as_str()).unwrap_or("");
+    match err.status {
+        Some(503) => code == "redis_reconnecting",
+        Some(500) => code.starts_with("Redis not connected"),
+        _ => false,
+    }
 }
 
 pub(crate) fn poke_fetch(g: &Globals, node: &str) -> bool {
     let body = poke_fetch_body(node);
     let started = std::time::Instant::now();
     loop {
-        match crate::http::post_json_try(g, "/api/jobs/submit", &body, true, 10) {
+        match crate::http::post_json_status_try(g, "/api/jobs/submit", &body, true, 10) {
             Ok(v) if v.get("error").is_none() => {
                 nstep(&format!("poked {node} over the bus to fetch now (job {})",
                     v.get("job_id").or_else(|| v.get("id")).and_then(|j| j.as_str()).unwrap_or("queued")));
@@ -4459,12 +4493,12 @@ pub(crate) fn poke_fetch(g: &Globals, node: &str) -> bool {
                 return false;
             }
             Err(e) if poke_is_transient(&e) && started.elapsed().as_secs() + POKE_RETRY_STEP_SECS <= POKE_RETRY_WINDOW_SECS => {
-                nstep(&format!("poke not taken yet ({e}) — retrying in {POKE_RETRY_STEP_SECS}s"));
+                nstep(&format!("poke not taken yet ({}) — retrying in {POKE_RETRY_STEP_SECS}s", e.line));
                 std::thread::sleep(std::time::Duration::from_secs(POKE_RETRY_STEP_SECS));
             }
             Err(e) => {
                 warn_line(&format!(
-                    "poke failed ({e}) — {node} will only fetch on its own timer, up to about 5 minutes"));
+                    "poke failed ({}) — {node} will only fetch on its own timer, up to about 5 minutes", e.line));
                 return false;
             }
         }
@@ -5057,16 +5091,34 @@ mod cli_asset_refill_tests {
 #[cfg(test)]
 mod poke_fetch_tests {
     use super::{poke_fetch_body, poke_is_transient, POKE_EXPIRE_AFTER_SEC, POKE_RETRY_WINDOW_SECS, POKE_RETRY_STEP_SECS};
+    use crate::http::TryFail;
 
     #[test]
     fn only_the_gateways_not_yet_is_retried() {
-        assert!(poke_is_transient(r#"HTTP 503: {"error":"redis_reconnecting"}"#));
-        assert!(poke_is_transient("Redis not connected"), "an older gateway's bare 500 detail");
-        assert!(poke_is_transient("HTTP 500: Redis not connected"));
-        assert!(!poke_is_transient("HTTP 400: force_node unknown"));
-        assert!(!poke_is_transient("HTTP 401: operator key required"));
-        assert!(!poke_is_transient("connection refused (gateway down?)"), "a transport failure is the gateway wait's job");
+        let reconnecting = TryFail::from_status(
+            503,
+            r#"{"error":"redis_reconnecting","detail":"Redis not connected: this needs the gateway's Redis client, which is not connected yet — retry shortly","retry_after_secs":5}"#,
+        );
+        assert!(poke_is_transient(&reconnecting));
+        assert!(poke_is_transient(&TryFail::from_status(500, r#"{"error":"Redis not connected"}"#)), "an older gateway's bare 500");
+        assert!(!poke_is_transient(&TryFail::from_status(400, r#"{"error":"force_node unknown"}"#)));
+        assert!(!poke_is_transient(&TryFail::from_status(401, r#"{"error":"operator key required"}"#)));
+        assert!(!poke_is_transient(&TryFail::local("connection refused (gateway down?)")), "a transport failure is the gateway wait's job");
         const { assert!(POKE_RETRY_WINDOW_SECS >= POKE_RETRY_STEP_SECS && POKE_RETRY_WINDOW_SECS < 600) };
+    }
+
+    /// A verdict that names a host called "redis-box", or a 500 whose random
+    /// ref holds "503", is an answer, not the gateway's "not yet".
+    #[test]
+    fn a_redis_named_host_or_a_503_in_a_ref_is_not_retried() {
+        let named = TryFail::from_status(400, r#"{"error":"force_node 'redis-box' is not a registered node"}"#);
+        assert!(!poke_is_transient(&named), "a host named redis-box is not Redis reconnecting");
+        let ref_500 = TryFail::from_status(
+            500,
+            r#"{"error":"internal error","detail":"internal error (ref ref-c503aa91f0); the gateway log has the cause","ref":"ref-c503aa91f0"}"#,
+        );
+        assert!(!poke_is_transient(&ref_500), "a 503 inside a ref is not a 503");
+        assert!(!poke_is_transient(&TryFail::local("HTTP 503 from redis-box")), "no status, no retry");
     }
 
     #[test]
@@ -7255,5 +7307,31 @@ mod harness_model_url_tests {
         let at = nf.find("const HARNESS_ENV_KEYS").expect("the Mac's harness-env key list");
         let list = nf[at..].split("];").next().unwrap();
         assert!(list.contains("\"NOO_HARNESS_MODEL_URL\""), "the Mac applier carries it");
+    }
+}
+
+#[cfg(test)]
+mod applier_only_list_tests {
+    use super::*;
+
+    /// The first roll's applier-only bundle carries the release-signed list
+    /// (0.6.28-rc.2 UPGRADE cell: without it a generation-2 applier refused a
+    /// different applier, exit 75), and the controller's pre-check accepts it.
+    #[test]
+    fn the_applier_only_bundle_carries_the_release_list() {
+        let apply = b"#!/bin/sh\n# noo-apply\nNOO_APPLY_GENERATION=2\n".to_vec();
+        let sums = format!("{}  noo-apply.sh\n", sha256_hex(&apply));
+        let (files, why) = applier_only_files(&apply, |f| proof_rows(f, sums.clone(), "sig".to_string()));
+        assert_eq!(why, None);
+        let kinds: Vec<&str> = files.iter().map(|(k, _)| *k).collect();
+        assert_eq!(kinds, ["applier", "release-sums", "release-sums.sig", "release-version"]);
+        assert_eq!(files[3].1, format!("{}\n", env!("CARGO_PKG_VERSION")).into_bytes());
+        assert!(crate::release_gate::controller_check(&files, false, &sums, env!("CARGO_PKG_VERSION"), None).is_ok());
+
+        // No proof (a list that does not name this applier, or none at all):
+        // the applier alone, and why — the node's rule stays strict.
+        let (files, why) = applier_only_files(&apply, |f| proof_rows(f, String::new(), "sig".to_string()));
+        assert_eq!(files.iter().map(|(k, _)| *k).collect::<Vec<_>>(), ["applier"]);
+        assert!(why.is_some_and(|e| e.contains("applier")));
     }
 }

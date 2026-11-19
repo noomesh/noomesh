@@ -280,6 +280,13 @@ type Reconciler struct {
 	// Guarded by pullMu.
 	knownImportOnly map[string]bool
 
+	// nudges counts Nudge calls (taken or coalesced), for tests.
+	nudges atomic.Uint64
+	// backendReady says whether a backend this agent just started answers
+	// what the next tick will ask of it (nudgeWhenReady). nil = no
+	// readiness nudge; the ticker alone brings the next pass.
+	backendReady func(ctx context.Context, backend, model string) bool
+
 	// envConflicts are the placement_env_conflict refusal targets recorded
 	// last pass, so ones that resolved are cleared.
 	envConflicts map[string]bool
@@ -309,13 +316,13 @@ func shouldStartOllamaPull(st *ollamaPullState, now time.Time) bool {
 func New(cfg *config.Config, docker *dockerpkg.Client, client *http.Client, harness hostsvc.Service) *Reconciler {
 	sets := modelsets.New(dockerpkg.ModelsDir(), cfg)
 	nw, facts := newNodeWorkloads(cfg, docker, sets)
-	return &Reconciler{
+	r := &Reconciler{
 		cfg:             cfg,
 		docker:          docker,
 		ollamaPulls:     map[string]*ollamaPullState{},
-		ollamaVerify:    newOllamaVerifyLoop(ollamaVerifier(docker)),
 		storeHas:        dockerpkg.ModelInStore,
 		importModel:     docker.ImportOllamaModel,
+		backendReady:    dockerBackendReady(docker),
 		client:          client,
 		mcp:             mcpsrv.New(cfg, client, docker),
 		sets:            sets,
@@ -331,6 +338,8 @@ func New(cfg *config.Config, docker *dockerpkg.Client, client *http.Client, harn
 		ggufMissing:     map[string]string{},
 		ggufExists:      docker.HostFileExists,
 	}
+	r.ollamaVerify = newOllamaVerifyLoop(ollamaVerifier(docker), r.Nudge)
+	return r
 }
 
 // SetDiskReclaimSink installs the receiver for the controller's node reclaim
@@ -386,6 +395,7 @@ func (r *Reconciler) Run(ctx context.Context) {
 // yield, after resuming, so a placed backend it never started comes up).
 // Non-blocking; nudges coalesce.
 func (r *Reconciler) Nudge() {
+	r.nudges.Add(1)
 	select {
 	case r.nudgeCh() <- struct{}{}:
 	default:
@@ -395,6 +405,80 @@ func (r *Reconciler) Nudge() {
 func (r *Reconciler) nudgeCh() chan struct{} {
 	r.nudgeOnce.Do(func() { r.nudge = make(chan struct{}, 1) })
 	return r.nudge
+}
+
+// A start tick only starts the container: the work that follows (ensure
+// the placed model is held, import it, verify its bytes) runs on the NEXT
+// tick, which the ticker alone brings defaultInterval later. Measured on a
+// hosted node (0.6.28-rc.2): placing an ollama model took ~11 min to read
+// verified for ~3 s of import, one full interval per step. So two events
+// nudge, once each:
+//
+//   - an ollama container this agent just started answers `ollama list`
+//     (nudgeWhenReady), so the next tick's ensure can see the model;
+//   - an import of a placed model finishes successfully (startOllamaImport),
+//     so the next tick sees it held and schedules its verification;
+//   - a verify pass ends that was busy while a tick found other models due
+//     (ollamaVerifyLoop.missed), so they are checked on the next tick; a
+//     pass that skipped nothing never nudges.
+//
+// A FAILED import or pull never nudges: its backoff (ollamaPullRetryAfter)
+// decides when it is tried again. Nudges coalesce (a buffer of one), so any
+// number of them while a pass runs or one is pending is one extra pass.
+const (
+	startReadyWithin = 60 * time.Second
+	startReadyEvery  = 2 * time.Second
+)
+
+// nudgeWhenReady polls a just-started backend every `every`, for at most
+// `within`, and nudges ONCE when it is ready, then stops. Not ready in time:
+// no nudge (the ticker brings the next pass). Run in its own goroutine.
+func (r *Reconciler) nudgeWhenReady(ctx context.Context, backend, model string, within, every time.Duration) {
+	if r.backendReady == nil {
+		return
+	}
+	deadline := time.Now().Add(within)
+	for {
+		pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		ready := r.backendReady(pctx, backend, model)
+		cancel()
+		if ready {
+			slog.Info("reconcile.backend_ready_nudge", "backend", backend, "model", model,
+				"detail", "a backend this agent started answers; reconciling now instead of at the next tick")
+			r.Nudge()
+			return
+		}
+		if !time.Now().Add(every).Before(deadline) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(every):
+		}
+	}
+}
+
+// backendStarted is the success path of a start: the earlier start refusal
+// no longer applies, and an ollama container gets its readiness nudge (the
+// only backend whose next tick has work left: ensure, import, verify).
+func (r *Reconciler) backendStarted(ctx context.Context, backend, model string) {
+	r.clearBackendStart(backend)
+	if backend == "ollama" {
+		go r.nudgeWhenReady(ctx, backend, model, startReadyWithin, startReadyEvery)
+	}
+}
+
+// dockerBackendReady is the production readiness: the ollama container
+// answers the very `ollama list` the next tick's ensureOllamaModel runs.
+func dockerBackendReady(c *dockerpkg.Client) func(context.Context, string, string) bool {
+	return func(ctx context.Context, backend, model string) bool {
+		if backend != "ollama" || c == nil {
+			return false
+		}
+		_, err := c.OllamaHasModel(ctx, model)
+		return err == nil
+	}
 }
 
 // tick is the state of one reconcile pass, built up phase by phase.
@@ -958,7 +1042,7 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 			refusals.Record("backend_start", p.Backend, err.Error())
 			return
 		}
-		r.clearBackendStart(p.Backend)
+		r.backendStarted(ctx, p.Backend, p.Model)
 	}
 }
 
@@ -1194,6 +1278,11 @@ func (r *Reconciler) startOllamaImport(ctx context.Context, node, key, model, ro
 		// clearing the refusal now just keeps the window honest.
 		refusals.Clear("placement_model", key)
 		slog.Info("reconcile.ollama_import_done", "model", model, "backend", key, "detail", out)
+		// Now, not a full interval later: the next pass sees the model
+		// held and schedules its verification in that same pass. Only on
+		// success; a failure waits out its backoff (the rule above
+		// startReadyWithin).
+		r.Nudge()
 	}()
 }
 

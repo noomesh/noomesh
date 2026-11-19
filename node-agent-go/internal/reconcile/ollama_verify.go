@@ -44,6 +44,8 @@ type ollamaVerifyLoop struct {
 	// the adopted lanes, native and stack, are report only).
 	verify func(ctx context.Context, model string, lane string) dockerpkg.OllamaVerifyResult
 	now    func() time.Time
+	// nudge asks reconcile for a pass now (Reconciler.Nudge); nil = none.
+	nudge func()
 
 	mu      sync.Mutex
 	results map[string]dockerpkg.OllamaVerifyResult
@@ -54,11 +56,16 @@ type ollamaVerifyLoop struct {
 	// refusalsLogged counts transitions into a (new) refusal: what the
 	// operator is told, once per state.
 	refusalsLogged int
+	// missed: a schedule found due models while a pass was busy and could
+	// not start them. The pass that ends clears it and nudges ONCE, so they
+	// are checked on the next tick, not the next interval.
+	missed bool
 }
 
-func newOllamaVerifyLoop(verify func(context.Context, string, string) dockerpkg.OllamaVerifyResult) *ollamaVerifyLoop {
+func newOllamaVerifyLoop(verify func(context.Context, string, string) dockerpkg.OllamaVerifyResult, nudge func()) *ollamaVerifyLoop {
 	return &ollamaVerifyLoop{
 		verify:  verify,
+		nudge:   nudge,
 		now:     time.Now,
 		results: map[string]dockerpkg.OllamaVerifyResult{},
 		lastRun: map[string]time.Time{},
@@ -78,13 +85,18 @@ func (l *ollamaVerifyLoop) dueLocked(models []string) []string {
 }
 
 // schedule starts a pass over the due models in its own goroutine, unless
-// one is running. ctx is the Run context: the pass outlives the tick.
+// one is running: then the due models are remembered as missed, and the
+// running pass nudges reconcile when it ends (a pass that skipped nothing
+// never nudges). ctx is the Run context: the pass outlives the tick.
 func (l *ollamaVerifyLoop) schedule(ctx context.Context, models []string, lane string) {
 	if l == nil || l.verify == nil {
 		return
 	}
 	l.mu.Lock()
 	if l.busy {
+		if len(l.dueLocked(models)) > 0 {
+			l.missed = true
+		}
 		l.mu.Unlock()
 		return
 	}
@@ -99,7 +111,12 @@ func (l *ollamaVerifyLoop) schedule(ctx context.Context, models []string, lane s
 		defer func() {
 			l.mu.Lock()
 			l.busy = false
+			missed := l.missed
+			l.missed = false
 			l.mu.Unlock()
+			if missed && l.nudge != nil {
+				l.nudge()
+			}
 		}()
 		l.runPass(ctx, due, lane)
 	}()

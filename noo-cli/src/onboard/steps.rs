@@ -6069,11 +6069,25 @@ pub(crate) fn harrier_artifact_ref() -> String {
 /// Ctx-free core, shared with `noo migrate import` (which has no wizard
 /// context but the same duty: a configured embedder that is not PRESENT is
 /// silent RAG death). Returns display lines tagged +success/!warn/.progress.
+/// Does `ollama list`'s output name `model`? Compared against the NAME
+/// column only (the first field of each row; the `NAME` header is skipped),
+/// exactly or as `<model>:latest` when the model names no tag. A substring
+/// of the whole output is not an answer: a hex-only name can sit inside the
+/// 12-hex ID column, and "bge" is a prefix of "bge-m3" — either false match
+/// skipped the embedder pull and left RAG without one. Pure.
+pub(crate) fn ollama_list_has(out: &str, model: &str) -> bool {
+    let tagged = if model.contains(':') { model.to_string() } else { format!("{model}:latest") };
+    out.lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|name| *name != "NAME")
+        .any(|name| name == model || name == tagged)
+}
+
 pub(crate) fn ensure_embed_model_core(model: &str) -> Vec<String> {
     let mut out_lines = Vec::new();
     let embed = crate::envfile::container("ollama-embed");
     let (probe, out) = sh::docker(&["exec", &embed, "ollama", "list"]);
-    if probe == 0 && out.contains(model) {
+    if probe == 0 && ollama_list_has(&out, model) {
         return out_lines; // already present
     }
     if model == "harrier" {
@@ -7293,13 +7307,40 @@ fn chat_probe_answered(doc: &serde_json::Value) -> Result<(), String> {
 }
 
 /// A probe the wizard cannot make is not a model that cannot answer: no
-/// stored login, or a credential the route refuses. Everything else
-/// (timeout, 404 not served, 5xx, unreachable) is the install's fault.
-fn probe_error_is_unverifiable(err: &str) -> bool {
-    let e = err.to_ascii_lowercase();
-    ["401", "403", "unauthorized", "forbidden", "not logged in", "log in", "login"]
-        .iter()
-        .any(|k| e.contains(k))
+/// stored login (the gateway answers 401) or a credential the route refuses
+/// (403). Everything else (timeout, 404 not served, 5xx, unreachable) is the
+/// install's fault.
+///
+/// Decided on the typed HTTP status only, never on a substring of the
+/// error: the 0.6.28-rc.2 install matrix got a retryable 404 whose body
+/// carried the random ref "ref-2b0d6401ee", read "401" in it, and quit the
+/// retry loop after one try.
+fn probe_error_is_unverifiable(err: &crate::http::TryFail) -> bool {
+    matches!(err.status, Some(401 | 403))
+}
+
+/// The probe failure as one line: `HTTP <status>: <the server's message>`,
+/// trimmed, or the transport sentence when nothing answered.
+fn probe_fail_summary(err: &crate::http::TryFail) -> String {
+    let Some(status) = err.status else {
+        return err.line.clone();
+    };
+    let doc = serde_json::from_str::<serde_json::Value>(&err.body).ok();
+    let said = doc
+        .as_ref()
+        .and_then(|v| {
+            v["error"]["message"]
+                .as_str()
+                .or_else(|| v["detail"].as_str())
+                .or_else(|| v["error"].as_str())
+                .or_else(|| v["message"].as_str())
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| if err.body.trim().is_empty() { err.line.clone() } else { err.body.clone() });
+    let said = said.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cut: String = said.chars().take(240).collect();
+    let more = if cut.len() < said.len() { "…" } else { "" };
+    format!("HTTP {status}: {cut}{more}")
 }
 
 /// The pair of facts a first-model success must rest on: the configured
@@ -7322,18 +7363,18 @@ fn default_model_mismatch(read: &Result<(String, String), String>, model: &str) 
 /// its node (a controller with a node agent learns of a fresh pull at the
 /// next heartbeat; the gateway answers "not served by any node" until then).
 /// Bounded: 5 tries, 10 s apart. Any other error returns at once.
-fn chat_probe(ctx: &Ctx, model: Option<&str>) -> Result<(), String> {
+fn chat_probe(ctx: &Ctx, model: Option<&str>) -> Result<(), crate::http::TryFail> {
     let body = chat_probe_body(model);
-    let mut last = String::new();
+    let mut last = crate::http::TryFail::local("");
     for attempt in 0..5 {
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_secs(10));
         }
-        match crate::http::post_json_try(ctx.g, "/api/inference", &body, true, 180)
-            .and_then(|doc| chat_probe_answered(&doc))
+        match crate::http::post_json_status_try(ctx.g, "/api/inference", &body, true, 180)
+            .and_then(|doc| chat_probe_answered(&doc).map_err(crate::http::TryFail::local))
         {
             Ok(()) => return Ok(()),
-            Err(e) if model.is_some() && e.contains("is not served by any node") && attempt < 4 => last = e,
+            Err(e) if model.is_some() && e.line.contains("is not served by any node") && attempt < 4 => last = e,
             Err(e) => return Err(e),
         }
     }
@@ -7360,10 +7401,12 @@ fn verify_first_model(ctx: &mut Ctx) {
     match chat_probe(ctx, Some(&model)) {
         Ok(()) => {}
         Err(e) if probe_error_is_unverifiable(&e) => {
+            let e = probe_fail_summary(&e);
             ctx.warn(&format!("Could not check chat for {model} ({e}). Check it: noo chat --model {model} --message hi"));
             return;
         }
         Err(e) => {
+            let e = probe_fail_summary(&e);
             let line = format!(
                 "model: {model} was pulled but a chat request for it failed: {e}. Check: noo cluster verify; noo chat --model {model} --message hi"
             );
@@ -7383,14 +7426,28 @@ fn verify_first_model(ctx: &mut Ctx) {
     match unpinned_probe_until_routed(ctx) {
         Ok(()) => ctx.success("Chat with no model named (what `noo chat` sends) answers"),
         Err(e) => {
-            let line = format!(
-                "model: {model} answers when named, but chat with no model named does not ({e}). \
-                 Check: noo cluster verify --controller; noo chat --message hi"
-            );
+            let line = unpinned_failure_line(&model, &e);
             ctx.error(&line);
             ctx.state.hard_failures.push(line);
         }
     }
+}
+
+/// The hard-failure line for unpinned chat that never answered: a refused
+/// credential (401/403) says so and how to log in; anything else names the
+/// last error the retries saw (status and the server's message). Pure.
+fn unpinned_failure_line(model: &str, last: &crate::http::TryFail) -> String {
+    let e = probe_fail_summary(last);
+    if probe_error_is_unverifiable(last) {
+        return format!(
+            "model: chat with no model named was refused ({e}): not logged in, or this login is not allowed to chat. \
+             Fix: noo auth login; then noo chat --message hi"
+        );
+    }
+    format!(
+        "model: {model} answers when named, but chat with no model named does not after {UNPINNED_TRIES} tries \
+         (last error: {e}). Check: noo cluster verify --controller; noo chat --message hi"
+    )
 }
 
 /// The ollama chat placement already declared on this node, if any (its
@@ -7469,16 +7526,45 @@ fn place_pulled_model(ctx: &mut Ctx, model: &str) {
     }
 }
 
+/// How many unpinned probes, 10 s apart, before the model step gives up.
+const UNPINNED_TRIES: u32 = 9;
+
+/// The one line said while unpinned chat is retried (not one per try).
+const UNPINNED_WAITING: &str = "Waiting for the chat lane: the agent reports a placed model with its next heartbeat \
+     (up to ~30 s); retrying every 10 s...";
+
 /// Unpinned chat, retried while a fresh placement becomes a lane: the
 /// agent's reconcile tick plus the gateway's 30 s placement cache. Bounded:
 /// 9 tries, 10 s apart.
-fn unpinned_probe_until_routed(ctx: &Ctx) -> Result<(), String> {
-    let mut last = String::new();
-    for attempt in 0..9 {
+fn unpinned_probe_until_routed(ctx: &Ctx) -> Result<(), crate::http::TryFail> {
+    retry_until_routed(
+        UNPINNED_TRIES,
+        || chat_probe(ctx, None),
+        || std::thread::sleep(std::time::Duration::from_secs(10)),
+        || ctx.progress(UNPINNED_WAITING),
+    )
+}
+
+/// The retry loop of [`unpinned_probe_until_routed`], with the probe, the
+/// pause and the waiting line injected so a test runs it without a gateway
+/// or a sleep. A refused credential (401/403, by status) stops at once;
+/// any other failure is retried, `waiting` is called once at the first
+/// retry, and giving up returns the LAST error.
+fn retry_until_routed<P, S, W>(tries: u32, mut probe: P, mut pause: S, mut waiting: W) -> Result<(), crate::http::TryFail>
+where
+    P: FnMut() -> Result<(), crate::http::TryFail>,
+    S: FnMut(),
+    W: FnMut(),
+{
+    let mut last = crate::http::TryFail::local("no probe was made");
+    for attempt in 0..tries {
         if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_secs(10));
+            if attempt == 1 {
+                waiting();
+            }
+            pause();
         }
-        match chat_probe(ctx, None) {
+        match probe() {
             Ok(()) => return Ok(()),
             Err(e) if probe_error_is_unverifiable(&e) => return Err(e),
             Err(e) => last = e,
@@ -7505,7 +7591,11 @@ mod chown_failure_tests {
 
 #[cfg(test)]
 mod first_model_probe_tests {
-    use super::{chat_probe_answered, chat_probe_body, default_model_mismatch, probe_error_is_unverifiable, vllm_offer, vllm_shortcut_applies, VllmOffer};
+    use super::{
+        chat_probe_answered, chat_probe_body, default_model_mismatch, probe_error_is_unverifiable, retry_until_routed,
+        unpinned_failure_line, vllm_offer, vllm_shortcut_applies, VllmOffer,
+    };
+    use crate::http::TryFail;
 
     #[test]
     fn a_leftover_vllm_model_does_not_short_circuit_a_standalone_install() {
@@ -7578,11 +7668,89 @@ mod first_model_probe_tests {
         assert!(chat_probe_answered(&serde_json::json!({})).is_err());
     }
 
+    /// The 0.6.28-rc.2 install-matrix 404: not served yet, with a random
+    /// ref that holds "401".
+    const NOT_SERVED_404: &str = r#"{"error":{"message":"resolve failed: model 'gemma4:e2b' is not served by any node","type":"not_found","ref":"ref-2b0d6401ee"}}"#;
+
+    /// (a) A 404 whose body carries "401" in a random ref, or "403" in a
+    /// digest, is not a refused login: the loop retries it.
     #[test]
-    fn a_refused_login_is_unverifiable_but_a_timeout_or_404_is_a_failure() {
-        assert!(probe_error_is_unverifiable("HTTP 401: Unauthorized"));
-        assert!(!probe_error_is_unverifiable("the gateway is up but this answer took longer than 180s"));
-        assert!(!probe_error_is_unverifiable("model 'x' is not served by any node; the only chat backend is the Ollama"));
+    fn a_status_digit_inside_a_body_id_is_not_a_refused_login() {
+        let ref_404 = TryFail::from_status(404, NOT_SERVED_404);
+        assert!(ref_404.line.contains("2b0d6401ee"), "the line still carries the body: {}", ref_404.line);
+        assert!(!probe_error_is_unverifiable(&ref_404), "ref-2b0d6401ee is not a 401");
+        let digest_404 = TryFail::from_status(404, r#"{"error":"model sha256:9f403c1e not found","ref":"ref-0000000000"}"#);
+        assert!(!probe_error_is_unverifiable(&digest_404), "a 403 inside a digest is not a 403");
+        assert!(!probe_error_is_unverifiable(&TryFail::from_status(503, "login service warming up")));
+        assert!(!probe_error_is_unverifiable(&TryFail::local("the gateway is up but this answer took longer than 180s")));
+        // The loop: two such 404s, then the lane appears.
+        let mut answers = vec![Ok(()), Err(digest_404), Err(ref_404)];
+        let mut probes = 0;
+        let got = retry_until_routed(9, || { probes += 1; answers.pop().unwrap() }, || {}, || {});
+        assert_eq!((got, probes), (Ok(()), 3), "a 404 is retried until the lane answers");
+    }
+
+    /// (b) A real 401 or 403, by status, is unverifiable and stops the loop
+    /// at the first try, with no waiting line.
+    #[test]
+    fn a_real_401_or_403_stops_the_probe_at_once() {
+        for status in [401u16, 403] {
+            let refused = TryFail::from_status(status, r#"{"detail":"credentials rejected"}"#);
+            assert!(probe_error_is_unverifiable(&refused), "{status}");
+            let (mut probes, mut pauses, mut waits) = (0, 0, 0);
+            let got = retry_until_routed(9, || { probes += 1; Err(refused.clone()) }, || pauses += 1, || waits += 1);
+            assert_eq!(got.unwrap_err().status, Some(status));
+            assert_eq!((probes, pauses, waits), (1, 0, 0), "{status} stops at once");
+            let line = unpinned_failure_line("gemma4:e2b", &refused);
+            assert!(line.contains("not logged in") && line.contains("noo auth login"), "{line}");
+        }
+    }
+
+    /// (c) Giving up after every try names the LAST error: its status and
+    /// the server's message, trimmed.
+    #[test]
+    fn giving_up_names_the_last_error() {
+        let first = TryFail::from_status(503, r#"{"detail":"gateway warming up"}"#);
+        let last = TryFail::from_status(404, NOT_SERVED_404);
+        let mut answers = vec![Err(last.clone()), Err(first.clone()), Err(first)];
+        let got = retry_until_routed(3, || answers.pop().unwrap(), || {}, || {}).unwrap_err();
+        assert_eq!(got, last, "the last error, not the first");
+        let line = unpinned_failure_line("gemma4:e2b", &got);
+        assert!(
+            line.contains("last error: HTTP 404: resolve failed: model 'gemma4:e2b' is not served by any node"),
+            "{line}"
+        );
+        assert!(!line.contains("warming up") && !line.contains("not logged in"), "{line}");
+    }
+
+    /// The embedder pull is skipped only when the NAME column holds the
+    /// model: not a hex-only name sitting inside the ID column, not "bge"
+    /// as a prefix of "bge-m3".
+    #[test]
+    fn the_embedder_is_present_only_by_its_name_column() {
+        use super::ollama_list_has;
+        let out = "NAME                 ID              SIZE      MODIFIED\n\
+                   bge-m3:latest        790764642607    1.2 GB    2 days ago\n\
+                   harrier:latest       3e2f0a1b2c3d    600 MB    3 days ago\n";
+        assert!(!ollama_list_has(out, "bge"), "a prefix of bge-m3 is not bge");
+        assert!(!ollama_list_has(out, "0a1b2c"), "a hex name inside the ID column is not listed");
+        assert!(!ollama_list_has(out, "NAME"), "the header is not a model");
+        assert!(ollama_list_has(out, "harrier"), "an untagged name matches :latest");
+        assert!(ollama_list_has(out, "bge-m3:latest"));
+        assert!(ollama_list_has(out, "bge-m3"));
+        assert!(!ollama_list_has(out, "harrier:v2"), "another tag is another model");
+        assert!(!ollama_list_has("", "harrier"));
+    }
+
+    /// (d) The waiting line is said once while the loop retries, not once
+    /// per try.
+    #[test]
+    fn the_waiting_line_is_said_once_not_per_try() {
+        let not_served = TryFail::from_status(404, NOT_SERVED_404);
+        let (mut probes, mut pauses, mut waits) = (0, 0, 0);
+        let got = retry_until_routed(9, || { probes += 1; Err(not_served.clone()) }, || pauses += 1, || waits += 1);
+        assert!(got.is_err());
+        assert_eq!((probes, pauses, waits), (9, 8, 1), "nine tries, eight pauses, one waiting line");
     }
 
     /// Onboard's pull writes the controller's record of itself: the registry
