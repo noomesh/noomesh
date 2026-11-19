@@ -3073,12 +3073,31 @@ pub(crate) fn agent_metrics_check(nodes: &[(String, String)], up: Option<&Value>
 /// is a leaf issued from the address the gateway saw at enrollment (a proxy,
 /// Docker Desktop's forwarder or a hairpin) while the node reports its own.
 /// No row when the leaf covers it or cannot be read here.
-pub(crate) fn agent_cert_check(id: &str, host: &str, covers: Option<bool>) -> Option<Check> {
-    (covers == Some(false)).then(|| fail(
-        "agent certificate",
-        format!("{id}: its certificate does not cover the address the controller dials it at ({host}), so every call to it fails TLS (imports, logs, metrics)"),
-        format!("noo security pki push-nodes {id}   # re-issues its leaf for its registered address; then: noo cluster verify"),
-    ))
+///
+/// The remedy issues a leaf for `host`, so it is given only when no OTHER
+/// node claims that address (`other`: its registered or dialed address, or a
+/// SAN in its leaf). A leaf for another node's address would let this node
+/// answer as that one; then it is a finding to investigate, with no remedy.
+pub(crate) fn agent_cert_check(id: &str, host: &str, covers: Option<bool>, other: Option<&str>) -> Option<Check> {
+    if covers != Some(false) {
+        return None;
+    }
+    Some(match other {
+        Some(other) => Check {
+            name: "agent certificate",
+            verdict: Verdict::Fail,
+            detail: format!(
+                "{id}: its certificate does not cover the address the controller dials it at ({host}), and {host} is also {other}'s \
+                 (its registered or dialed address, or a SAN in its leaf). Investigate before issuing anything: a certificate for {host} would let {id} answer as {other}"
+            ),
+            remedy: None,
+        },
+        None => fail(
+            "agent certificate",
+            format!("{id}: its certificate does not cover the address the controller dials it at ({host}), so every call to it fails TLS (imports, logs, metrics); `noo security pki push-nodes {id}` will issue it a certificate for {host}"),
+            format!("noo security pki push-nodes {id}   # then: noo cluster verify"),
+        ),
+    })
 }
 
 pub(crate) fn agent_mail_check(body: Option<&Value>) -> Check {
@@ -8571,10 +8590,12 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // i-cert: a node whose leaf does not cover the address the gateway
         // dials it at refuses every call (imports, logs, the scrape). The
         // self node is reached another way and is not judged here.
+        let claims = super::security_local::node_address_claims(&fleet, &super::security_local::local_leaf_ips);
         for (id, host) in &agents {
             let is_self = fleet.iter().any(|n| n["id"].as_str() == Some(id.as_str()) && n["self_node"].as_bool() == Some(true));
             if !is_self {
-                checks.extend(agent_cert_check(id, host, covers(id, host)));
+                let other = super::security_local::address_claimed_by_other(id, host, &claims);
+                checks.extend(agent_cert_check(id, host, covers(id, host), other.as_deref()));
             }
         }
         // The gateway's own Redis connection (authenticated /health: the
@@ -17008,11 +17029,22 @@ mod agent_cert_tests {
 
     #[test]
     fn a_leaf_that_misses_the_dialed_address_fails_naming_both() {
-        let row = agent_cert_check("node-b", "192.0.2.41", Some(false)).expect("a row");
+        let row = agent_cert_check("node-b", "192.0.2.41", Some(false), None).expect("a row");
         assert_eq!(row.name, "agent certificate");
         assert_eq!(row.verdict, Verdict::Fail);
         assert!(row.detail.contains("node-b") && row.detail.contains("192.0.2.41") && row.detail.contains("fails TLS"), "{}", row.detail);
         assert!(row.remedy.as_deref().unwrap().contains("noo security pki push-nodes node-b"));
+        assert!(row.detail.contains("will issue it a certificate for 192.0.2.41"), "the row says what it would certify: {}", row.detail);
+    }
+
+    /// The address is another node's: a finding, never a remedy that would
+    /// issue this node a certificate for it.
+    #[test]
+    fn an_address_another_node_claims_is_a_finding_with_no_remedy() {
+        let row = agent_cert_check("node-b", "192.0.2.41", Some(false), Some("node-c")).expect("a row");
+        assert_eq!(row.verdict, Verdict::Fail);
+        assert!(row.remedy.is_none(), "no push-nodes remedy on a collision: {:?}", row.remedy);
+        assert!(row.detail.contains("also node-c's") && row.detail.contains("answer as node-c"), "{}", row.detail);
     }
 
     /// The row is asked for every registered node agent but the self node.
@@ -17020,13 +17052,14 @@ mod agent_cert_tests {
     fn verify_asks_every_non_self_agent_for_the_row() {
         let src = include_str!("cluster_verify.rs");
         let code = &src[..src.find("mod agent_cert_tests").expect("the test module")];
-        assert!(code.contains("checks.extend(agent_cert_check(id, host, covers(id, host)));"));
+        assert!(code.contains("let other = super::security_local::address_claimed_by_other(id, host, &claims);"));
+        assert!(code.contains("checks.extend(agent_cert_check(id, host, covers(id, host), other.as_deref()));"));
         assert!(code.contains("n[\"self_node\"].as_bool() == Some(true)"));
     }
 
     #[test]
     fn no_row_when_the_leaf_covers_it_or_cannot_be_read() {
-        assert!(agent_cert_check("node-b", "192.0.2.41", Some(true)).is_none());
-        assert!(agent_cert_check("node-b", "192.0.2.41", None).is_none());
+        assert!(agent_cert_check("node-b", "192.0.2.41", Some(true), None).is_none());
+        assert!(agent_cert_check("node-b", "192.0.2.41", None, None).is_none());
     }
 }
