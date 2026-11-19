@@ -316,8 +316,9 @@ func ApplyDial(t *http.Transport) *http.Transport {
 			base = zero.DialContext
 		}
 	}
+	eager := Installed()
 	t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		if d := Installed(); d != nil {
+		if d := eager; d != nil {
 			return d(ctx, network, addr)
 		}
 		return base(ctx, network, addr)
