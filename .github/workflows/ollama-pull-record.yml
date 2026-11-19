@@ -23,6 +23,16 @@
 # tests/test_prep_host_data_dirs.py) or a whole install (the install matrix's
 # OLLAMA-VERIFIED probe gates the final). GitHub-hosted only, no secrets
 # beyond the read-only token; the model is the smallest the probes use.
+#
+# The second job, copy-owner, runs the agent's two copies into noo-ollama
+# (writeManifestContainer, the mirror import's manifest; ollamaCreateInContainer,
+# the convert path's dirTar'd pair) against the same image on two daemons:
+# the runner's own dockerd and a docker:27-dind one. Our image sets
+# `USER 65532:65532`; a CopyToContainer with CopyUIDGID makes Docker 27 and
+# older look the whole "65532:65532" up in passwd and refuse the copy
+# (getent unable to find entry), while Docker 28+ splits uid:gid. The test
+# (ollama_copy_owner_realdaemon_test.go) asserts the copy succeeds and what it
+# wrote is owned 65532:65532 on BOTH.
 name: ollama-pull-record
 
 on:
@@ -34,6 +44,8 @@ on:
       - 'node-agent-go/internal/docker/ollama_verify*.go'
       - 'node-agent-go/internal/docker/ollama_mirror*.go'
       - 'node-agent-go/internal/docker/data_root.go'
+      - 'node-agent-go/internal/docker/ollama_model.go'
+      - 'node-agent-go/internal/docker/ollama_copy_owner*_test.go'
       - 'docker/Dockerfile.ollama'
       - '.github/workflows/ollama-pull-record.yml'
   workflow_dispatch:
@@ -133,3 +145,79 @@ jobs:
       - name: Ollama log
         if: always()
         run: docker logs "$NOO_PULLRECORD_CONTAINER" 2>&1 | tail -n 50 || true
+
+  copy-owner:
+    name: copy-owner (${{ matrix.daemon }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # runner: the hosted image's docker-ce (28/29), which splits uid:gid.
+        # docker-27: a Docker 27 daemon in dind, which does not.
+        daemon: [ runner, docker-27 ]
+    env:
+      OLLAMA_IMAGE: ghcr.io/${{ github.repository_owner }}/ollama:staged
+      DIND_IMAGE: docker:27-dind
+      DIND_HOST: tcp://127.0.0.1:2375
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e   # v7.0.0
+        with:
+          go-version-file: node-agent-go/go.mod
+          cache-dependency-path: node-agent-go/go.sum
+
+      - name: Per-job Docker credential store and GHCR login
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          export DOCKER_CONFIG="$RUNNER_TEMP/.docker"
+          mkdir -p "$DOCKER_CONFIG"
+          echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin \
+            || echo "::warning::ghcr.io login failed: pulling $OLLAMA_IMAGE anonymously"
+
+      - name: Pull our ollama image (the runner's daemon)
+        run: |
+          set -eu
+          docker pull "$OLLAMA_IMAGE"
+          docker version --format 'runner daemon: Docker {{.Server.Version}} (API {{.Server.APIVersion}})'
+
+      - name: Start a Docker 27 daemon (dind) and load the image into it
+        if: matrix.daemon == 'docker-27'
+        run: |
+          set -eu
+          # No TLS: the daemon listens on plain tcp 2375, published on the
+          # runner's loopback only.
+          docker run -d --privileged --name dind -e DOCKER_TLS_CERTDIR= \
+            -p 127.0.0.1:2375:2375 "$DIND_IMAGE"
+          for i in $(seq 1 60); do
+            docker -H "$DIND_HOST" version >/dev/null 2>&1 && break
+            sleep 2
+          done
+          ver="$(docker -H "$DIND_HOST" version --format '{{.Server.Version}}')"
+          echo "dind daemon: Docker $ver"
+          case "$ver" in
+            27.*) ;;
+            *) echo "::error::$DIND_IMAGE answered as Docker $ver, not 27: this leg would prove nothing"; exit 1 ;;
+          esac
+          docker save "$OLLAMA_IMAGE" | docker -H "$DIND_HOST" load
+          echo "DOCKER_HOST=$DIND_HOST" >> "$GITHUB_ENV"
+
+      - name: The agent's copies into noo-ollama keep the store owner
+        working-directory: node-agent-go
+        env:
+          NOO_REAL_DAEMON_OWNER_TEST: "1"
+          NOO_OWNER_TEST_IMAGE: ${{ env.OLLAMA_IMAGE }}
+        run: |
+          set -eu
+          echo "DOCKER_HOST=${DOCKER_HOST:-<the runner's socket>}"
+          docker version --format 'server under test: Docker {{.Server.Version}} (API {{.Server.APIVersion}})'
+          go test -count=1 -v -run '^TestRealDaemonCopiesIntoOllamaKeepTheStoreOwner$' ./internal/docker/
+
+      - name: dind log
+        if: always() && matrix.daemon == 'docker-27'
+        run: env -u DOCKER_HOST docker logs dind 2>&1 | tail -n 50 || true
