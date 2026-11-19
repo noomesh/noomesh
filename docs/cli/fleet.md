@@ -238,8 +238,11 @@ then fewest requests in flight and the lowest load. A quarantined or
 thermal-`critical` node is left out unless nothing else is. Nodes come and
 go: a busy, hot or offline node drops out and rejoins on its own. The
 yaml's `cluster.backends.<x>.model` (what onboarding put on the local
-backend) is a placement hint and does not narrow this. Declaring
-`chat-default` puts your list ahead of the dynamic pool; `class list`
+backend) is a placement hint and does not narrow this. With no live chat
+lane yet (the first ~30 s after a placement), unpinned chat falls back to the
+static Ollama (`services.ollama_url`), which is sent the placed chat model
+when it holds it and the yaml's model only when no chat model is placed.
+Declaring `chat-default` puts your list ahead of the dynamic pool; `class list`
 prints `chat-default: dynamic (all live chat nodes)` or `declared`, and
 `noo cluster verify --controller` has a `default chat` row listing the live
 candidates in order (`!` when only CPU candidates or one node remain, `x`
