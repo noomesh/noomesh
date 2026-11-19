@@ -1719,6 +1719,27 @@ pub(crate) fn applier_first_for(g: &Globals, node: &str) -> bool {
         && std::env::var(FULL_BUNDLE_ENV).as_deref() != Ok("1")
 }
 
+/// The applier-only bundle of a node's first roll: the applier and, when
+/// this CLI holds its release's verified signed list, that list
+/// (`proof`: [`release_proof_for`], the rows [`attach_release_proof`] adds
+/// for root code). Carrying it is safe for an older applier: since stack
+/// v0.6.0 every applier self-replaces (§1b) before its kind allowlist (§2,
+/// exit 76), so the list kinds never reach that refusal; the applier it
+/// re-execs verifies the list (§1c). Without a proof, the applier alone and
+/// why: the node's rule stays strict (i908) and a generation-2 applier
+/// refuses root code with no list.
+fn applier_only_files(apply: &[u8], proof: impl FnOnce(&[(&str, Vec<u8>)]) -> Result<Vec<(&'static str, Vec<u8>)>, String>)
+    -> (Vec<(&'static str, Vec<u8>)>, Option<String>) {
+    let mut files: Vec<(&'static str, Vec<u8>)> = vec![("applier", apply.to_vec())];
+    match proof(&files) {
+        Ok(rows) => {
+            files.extend(rows);
+            (files, None)
+        }
+        Err(e) => (files, Some(e)),
+    }
+}
+
 /// A node that has never reported an apply runs the legacy fetcher/applier pair: stage an applier-only bundle first, the one kind every applier accepts. Returns (whether the node is legacy, whether ONLY the applier was staged: `--stage-only`, where the caller restages the full bundle).
 /// A node that has never reported an apply outcome runs the legacy
 /// fetcher/applier pair (pre-2026-09-03): its applier refuses every
@@ -1739,7 +1760,12 @@ fn stage_applier_first(g: &Globals, a: &ProvisionArgs, m: &ProvMachine, ca: &cra
             nstep(&format!("{node} has never reported an apply — staging the applier alone first"));
             let w2 = crate::private_tmp::dir(&format!("noo-provision-applier-{node}"))
                 .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "bundle_failed", &e, None));
-            let pre: Vec<(&str, Vec<u8>)> = vec![("applier", apply.as_bytes().to_vec())];
+            let (pre, no_list) = applier_only_files(apply.as_bytes(), |f| release_proof_for(g, f));
+            match no_list {
+                None => nnote(&format!("{node}: the applier bundle carries release {}'s signed list", env!("CARGO_PKG_VERSION"))),
+                Some(e) => warn_line(&format!(
+                    "{node}: the applier bundle goes without a release-signed list ({e}) — an applier of generation 2 or later refuses it (exit 75); the full bundle follows")),
+            }
             let b2 = match super::security_local::build_signed_bundle(ca, &node, &pre, &w2) {
                 Ok(b) => b,
                 Err(e) => { scrub(&w2); fail(g.json, ExitCode::Generic, "bundle_failed", &e, None); }
@@ -7255,5 +7281,31 @@ mod harness_model_url_tests {
         let at = nf.find("const HARNESS_ENV_KEYS").expect("the Mac's harness-env key list");
         let list = nf[at..].split("];").next().unwrap();
         assert!(list.contains("\"NOO_HARNESS_MODEL_URL\""), "the Mac applier carries it");
+    }
+}
+
+#[cfg(test)]
+mod applier_only_list_tests {
+    use super::*;
+
+    /// The first roll's applier-only bundle carries the release-signed list
+    /// (0.6.28-rc.2 UPGRADE cell: without it a generation-2 applier refused a
+    /// different applier, exit 75), and the controller's pre-check accepts it.
+    #[test]
+    fn the_applier_only_bundle_carries_the_release_list() {
+        let apply = b"#!/bin/sh\n# noo-apply\nNOO_APPLY_GENERATION=2\n".to_vec();
+        let sums = format!("{}  noo-apply.sh\n", sha256_hex(&apply));
+        let (files, why) = applier_only_files(&apply, |f| proof_rows(f, sums.clone(), "sig".to_string()));
+        assert_eq!(why, None);
+        let kinds: Vec<&str> = files.iter().map(|(k, _)| *k).collect();
+        assert_eq!(kinds, ["applier", "release-sums", "release-sums.sig", "release-version"]);
+        assert_eq!(files[3].1, format!("{}\n", env!("CARGO_PKG_VERSION")).into_bytes());
+        assert!(crate::release_gate::controller_check(&files, false, &sums, env!("CARGO_PKG_VERSION"), None).is_ok());
+
+        // No proof (a list that does not name this applier, or none at all):
+        // the applier alone, and why — the node's rule stays strict.
+        let (files, why) = applier_only_files(&apply, |f| proof_rows(f, String::new(), "sig".to_string()));
+        assert_eq!(files.iter().map(|(k, _)| *k).collect::<Vec<_>>(), ["applier"]);
+        assert!(why.is_some_and(|e| e.contains("applier")));
     }
 }
