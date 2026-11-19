@@ -255,8 +255,11 @@ def test_a8_maps_the_three_cli_outcomes_one_to_one(tmp_path):
     assert " FAIL: " in got["A8"] and "staged but never reported" in got["A8"], got["A8"]
     rc, got = cell(tmp_path / "b", roll=base + "! runner-a: the applier-only bundle reported exit 76 — staging the full bundle anyway\n")
     assert " FAIL: " in got["A8"] and "reported exit 76" in got["A8"], got["A8"]
+    # From rc.3 (#1381): a DIFFERENT applier is installed from the applier-only
+    # bundle (it carries the signed list), so there is no "already installed"
+    # handshake line: "installed the applier" alone is the clean outcome.
     rc, got = cell(tmp_path / "c", journal=JOURNAL_OK.split("\n", 1)[1])
-    assert " FAIL: " in got["A8"] and "installed the applier" in got["A8"], "installed but no handshake line: " + got["A8"]
+    assert " PASS: " in got["A8"] and "installed the applier" in got["A8"], "an installed applier is clean: " + got["A8"]
 
 
 def test_b3_names_every_sudo_command_during_the_stack(tmp_path):
@@ -319,3 +322,21 @@ def test_i1_says_it_reshaped_the_self_node_by_hand_on_every_verdict(tmp_path):
     # last: nothing after it but the judge, which reads captured files only
     tail = sh[sh.index("step i1-reshape-self-node-by-hand-into-a-worker-env"):]
     assert [l for l in tail.splitlines()[1:] if l.startswith("step ")] == ['step judge 120 -- python3 "$HERE/upgrade_judge.py" judge']
+
+
+def test_i1_a_failed_import_is_a_fail_even_when_a_retry_verified_it(tmp_path):
+    """0.6.28-rc.3: the import raced the door and failed; a backoff retry
+    would verify the model later. "Passes on the retry" must not read green."""
+    j = ('Nov 19 runner noo-node-agent[1]: {"time":"2026-11-19T11:01:47.476Z","level":"INFO","msg":"reconcile.starting_backend"}\n'
+         'Nov 19 runner noo-node-agent[1]: {"time":"2026-11-19T11:01:49.218Z","level":"WARN","msg":"reconcile.ollama_import_failed",'
+         '"error":"asking ollama for blob 005f95c74751: Head \\"https://noo-stunnel-ollama:11434/api/blobs/sha256:005f\\": dial tcp: connection refused"}\n'
+         'Nov 19 runner noo-node-agent[1]: {"time":"2026-11-19T11:12:01.000Z","level":"INFO","msg":"reconcile.ollama_verify","state":"verified"}\n')
+    rc, got = cell(tmp_path, i1={"journal": j})
+    assert rc == 1 and " FAIL: the import failed at least once: " in got["I1"], got["I1"]
+
+
+def test_i1_pass_reports_the_seconds_from_start_to_verified(tmp_path):
+    j = ('Nov 19 runner noo-node-agent[1]: {"time":"2026-11-19T11:01:47.476Z","level":"INFO","msg":"reconcile.starting_backend"}\n'
+         'Nov 19 runner noo-node-agent[1]: {"time":"2026-11-19T11:02:31.900Z","level":"INFO","msg":"reconcile.ollama_verify","state":"verified"}\n')
+    rc, got = cell(tmp_path, i1={"journal": j})
+    assert rc == 0 and " PASS: " in got["I1"] and "starting_backend → ollama_verify in 44 s" in got["I1"], got["I1"]

@@ -120,6 +120,21 @@ def lookup_quote(l):
     return ("%s: " % m.group(1) if m else "") + body
 
 
+def i1_seconds(journal):
+    """Seconds from the agent's reconcile.starting_backend to its first
+    reconcile.ollama_verify, from the JSON "time" fields; None if absent."""
+    import datetime as _d
+    def at(key):
+        for l in journal:
+            if '"msg":"%s"' % key in l:
+                m = re.search(r'"time":"([0-9T:.-]+)', l)
+                if m:
+                    return _d.datetime.fromisoformat(m.group(1)[:26])
+        return None
+    a, z = at("reconcile.starting_backend"), at("reconcile.ollama_verify")
+    return int(round((z - a).total_seconds())) if a and z and z >= a else None
+
+
 def i1(j, jr, me, recs=None):
     """I1: the mirror import reached the agent-MANAGED noo-ollama through its
     door by docker name (host-mode dial). recs None = the wait loop's probe:
@@ -143,9 +158,16 @@ def i1(j, jr, me, recs=None):
     d = (om[0].get("detail") or "") if om else ""
     verified = bool(re.search(r"(verified against the controller: |; verified: )[^;]*?(?<![\w.:/-])%s \(" % re.escape(model), d)) \
         and ("%s: " % model) not in d
+    # A failed import is a FAIL even when a later retry verified the model:
+    # "passes on the retry" must not read green (0.6.28-rc.3: the import raced
+    # the door, failed, and only a backoff retry would have succeeded).
+    failed = [l.strip() for l in journal if "ollama_import_failed" in l]
+    if failed:
+        return "FAIL", "the import failed at least once: " + lookup_quote(failed[0])
     if tags and verified:
-        return "PASS", "%s served by the managed noo-ollama (ollama list: %s); ollama models: %s; no lookup error in the agent's journal" % (
-            model, " ".join(tags[0].split()[:3]), d)
+        took = i1_seconds(journal)
+        return "PASS", "%s served by the managed noo-ollama (ollama list: %s); ollama models: %s; no lookup error and no failed import in the agent's journal%s" % (
+            model, " ".join(tags[0].split()[:3]), d, ("; starting_backend → ollama_verify in %s s" % took) if took is not None else "")
     if recs is None:
         return "PENDING", "served=%s verified=%s" % (bool(tags), verified)
     failed = [l.strip() for l in journal if "ollama_import_failed" in l or "ollama_model_import_only_missing" in l]
@@ -277,8 +299,11 @@ def judge():
         elif unreported:
             say("A8", "FAIL", "the applier-only bundle was staged but never reported: " + unreported[0])
         elif installed:
-            say("A8", "PASS" if hand else "FAIL",
-                hand[0] if hand else installed[0] + " — but no 'this applier is already installed … nothing to install' in the --all window")
+            # From rc.3 (#1381) the applier-only bundle carries the release's
+            # signed list: an applier that DIFFERS from the installed one is
+            # installed ("installed the applier — staging the full bundle");
+            # an identical one says it is already installed. Both are clean.
+            say("A8", "PASS", installed[0] + ((" | " + hand[0]) if hand else ""))
         else:
             say("A8", "NOT APPLICABLE", "no applier-only bundle in this roll (the self node had already reported an apply)")
 
