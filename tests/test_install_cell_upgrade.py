@@ -340,3 +340,15 @@ def test_i1_pass_reports_the_seconds_from_start_to_verified(tmp_path):
          'Nov 19 runner noo-node-agent[1]: {"time":"2026-11-19T11:02:31.900Z","level":"INFO","msg":"reconcile.ollama_verify","state":"verified"}\n')
     rc, got = cell(tmp_path, i1={"journal": j})
     assert rc == 0 and " PASS: " in got["I1"] and "starting_backend → ollama_verify in 44 s" in got["I1"], got["I1"]
+
+
+def test_i1_a_quick_retried_door_failure_is_a_fail_on_rc4(tmp_path):
+    """#1388: a dial-level failure logs ollama_import_door_not_up and is retried
+    within a minute. With ready = the door answers it should not happen, so
+    it is a FAIL even when the retry verified the model."""
+    j = ('Nov 19 runner noo-node-agent[1]: {"time":"2026-11-19T11:01:47.476Z","level":"INFO","msg":"reconcile.starting_backend"}\n'
+         'Nov 19 runner noo-node-agent[1]: {"time":"2026-11-19T11:01:49.218Z","level":"WARN","msg":"reconcile.ollama_import_door_not_up",'
+         '"error":"dial tcp 172.18.0.3:11434: connect: connection refused","quick_retry":1}\n'
+         'Nov 19 runner noo-node-agent[1]: {"time":"2026-11-19T11:01:55.000Z","level":"INFO","msg":"reconcile.ollama_verify","state":"verified"}\n')
+    rc, got = cell(tmp_path, i1={"journal": j})
+    assert rc == 1 and " FAIL: the import started before the door answered (1 quick retry): " in got["I1"], got["I1"]

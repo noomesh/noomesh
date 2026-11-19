@@ -164,6 +164,14 @@ def i1(j, jr, me, recs=None):
     failed = [l.strip() for l in journal if "ollama_import_failed" in l]
     if failed:
         return "FAIL", "the import failed at least once: " + lookup_quote(failed[0])
+    # From #1388 a dial-level failure (the door not up yet) is retried quickly
+    # and logs ollama_import_door_not_up instead. With "ready" meaning the door
+    # answers, it should not happen: FAIL while we learn whether it ever does
+    # (release lead, rc.4), even when a quick retry then verified the model.
+    quick = [l.strip() for l in journal if "ollama_import_door_not_up" in l]
+    if quick:
+        return "FAIL", "the import started before the door answered (%d quick retr%s): %s" % (
+            len(quick), "y" if len(quick) == 1 else "ies", lookup_quote(quick[0]))
     if tags and verified:
         took = i1_seconds(journal)
         return "PASS", "%s served by the managed noo-ollama (ollama list: %s); ollama models: %s; no lookup error and no failed import in the agent's journal%s" % (
