@@ -480,7 +480,7 @@ func (c *Client) ollamaCreateInContainer(ctx context.Context, work, name, modelf
 	defer cancel()
 	if _, err := c.docker.CopyToContainer(copyCtx, OllamaContainer, client.CopyToContainerOptions{
 		DestinationPath: "/",
-		Content:         tarball,
+		Content:         tarball, CopyUIDGID: true,
 		// No CopyUIDGID: every tar header carries the owner (convertOwner,
 		// uid/gid 65532, the image's non-root user), and the daemon's untar
 		// chowns each entry to it. CopyUIDGID would make the daemon look up
