@@ -511,6 +511,10 @@ type Client struct {
 	names     []string
 	namesAt   time.Time
 	proxyNow  func() time.Time // tests; nil = time.Now
+
+	// The heartbeat's docker_engine fact, cached (engine_version.go).
+	engineOnce sync.Once
+	engine     *engineProbe
 }
 
 // proxyCacheTTL bounds how stale the proxy's view of the running backends

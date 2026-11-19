@@ -472,6 +472,13 @@ pub fn cluster_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ("gpu model", str_of(&n["gpu_model"])),
         ("cpu", caps["cpu_cores"].as_i64().map(|c| format!("{c} cores")).unwrap_or(dash.clone())),
         ("platform", format!("{}/{}", str_of(&caps["os"]), str_of(&caps["arch"]))),
+        // i1058: the node's Docker Engine; `noo cluster verify` judges it.
+        ("docker engine", match n["docker_engine"]["state"].as_str() {
+            Some("ok") => format!("{} ({})", str_of(&n["docker_engine"]["version"]), str_of(&n["docker_engine"]["kind"])),
+            Some("none") => "none (native backends only)".to_string(),
+            Some("unreadable") => ui::warn(&format!("unreadable: {}", str_of(&n["docker_engine"]["error"]))).to_string(),
+            _ => ui::muted("not reported (agent predates this release)").to_string(),
+        }),
         ("self node", match n["self_node"].as_bool() {
             Some(true) => "yes — the controller's own device (its ollama is the stack's, adopted)".to_string(),
             Some(false) => "no".to_string(),
