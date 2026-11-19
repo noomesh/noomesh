@@ -91,14 +91,6 @@ def _job(name: str) -> dict:
     return yaml.safe_load(CI.read_text())["jobs"][name]
 
 
-def _trivy_pin(job: dict) -> tuple[str, str]:
-    for step in job["steps"]:
-        env = step.get("env") or {}
-        if "TRIVY_VERSION" in env:
-            return env["TRIVY_VERSION"], env["TRIVY_SHA256"]
-    raise AssertionError("no step pins TRIVY_VERSION")
-
-
 def test_ci_cuda_job_reports_packages_size_and_a_trivy_scan_without_failing():
     steps = _job("llamacpp-cuda-image")["steps"]
     names = [s.get("name", "") for s in steps]
@@ -109,7 +101,8 @@ def test_ci_cuda_job_reports_packages_size_and_a_trivy_scan_without_failing():
     run = step["run"]
     assert step.get("continue-on-error") is True, "the report must never fail the job"
     assert run.count("--severity HIGH,CRITICAL --ignore-unfixed") == 2, "the base and ours, the gate's flags"
-    assert 'sha256sum -c -' in run, "the Trivy download must be checksum-verified"
+    assert "scripts/infra-scan.sh install-trivy" in run, "Trivy from the one pin, sha256-verified there"
+    assert "TRIVY_VERSION" not in str(step.get("env") or {}), "no second pin in this job"
     assert 'scripts/infra-staged.py new-findings --new "$r/base/linux-amd64.json"' in run
     assert 'scripts/infra-staged.py new-findings --new "$r/ours/linux-amd64.json"' in run
     assert run.count("dpkg-query") == 2 and "-W" in run, "package count of the base and ours"
@@ -120,5 +113,9 @@ def test_ci_cuda_job_reports_packages_size_and_a_trivy_scan_without_failing():
     assert "--list-devices" in gate and "LLAMACPP_REF" in gate and "ldd" in gate
 
 
-def test_ci_cuda_report_uses_the_same_trivy_pin_as_ollama_image():
-    assert _trivy_pin(_job("llamacpp-cuda-image")) == _trivy_pin(_job("ollama-image"))
+def test_ci_cuda_report_installs_trivy_from_the_one_pin():
+    # scripts/infra-scan.sh holds the one Trivy pin (#1369); this job carries none.
+    steps = _job("llamacpp-cuda-image")["steps"]
+    assert not any("TRIVY_VERSION" in (s.get("env") or {}) for s in steps), "a second pin in llamacpp-cuda-image"
+    run = next(s["run"] for s in steps if "new-findings" in (s.get("run") or ""))
+    assert run.index("scripts/infra-scan.sh install-trivy") < run.index('"$dir/trivy" image')
