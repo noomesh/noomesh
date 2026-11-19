@@ -69,7 +69,7 @@ func ollamaTransport(base string) (*http.Transport, error) {
 		if err != nil {
 			return nil, err
 		}
-		return containerdial.ApplyDial(tr), nil
+		return tr, nil
 	}
 	return containerdial.ApplyDial(&http.Transport{Proxy: nil, MaxIdleConnsPerHost: 2, IdleConnTimeout: 30 * time.Second}), nil
 }
