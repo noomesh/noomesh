@@ -312,7 +312,7 @@ fn sync_image_via_pull(g: &Globals, image: &str, node_id: &str, arch: &str, rest
     // Stage for the NODE's architecture: an arm64 node gets an arm64 tar,
     // pulled by platform with the controller's registry login
     // (image_stage.rs) — no more "not arm64-built, skipping".
-    let rec = crate::commands::image_stage::stage_and_record(g, image, arch, "sync-images")?;
+    let rec = crate::commands::image_stage::stage_image(g, image, arch, None, "sync-images")?;
     let (tar_name, local_id) = (rec.tar, rec.image_id);
     // --restart maps to "remove the old container after a verified load":
     // the agent force-removes it and BackendManager / desired-state
