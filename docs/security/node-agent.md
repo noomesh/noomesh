@@ -1317,7 +1317,7 @@ What this does and does not add:
   raise the bar above "the controller vouches".
 - **Our images are rail-only.** A not-staged image of ours is a refusal
   naming `noo cluster sync-images <node> -i <image>` / `noo upgrade`, never
-  a registry pull.
+  a registry pull. A release-pinned image is staged by its lock digest (`noo cluster sync-images --stage-only --lock`), also when named with `-i`; `-i` is for images the release does not carry.
 - **Vendor CLIs are rail-only too.** A harness kind's vendor CLI (and the
   runtime it runs on) is fetched by the controller with
   `noo cluster vendor stage`, verified against the sha256 pinned in
@@ -1528,6 +1528,8 @@ reaches the controller on the heartbeat with the exact command to fix it:
 ```
 noo cluster sync-images <node> -i <the ref> --no-restart
 ```
+
+A release-pinned image is staged by its lock digest (`noo cluster sync-images --stage-only --lock`), also when named with `-i`; `-i` is for images the release does not carry.
 
 The `-i` matters. A bare `noo cluster sync-images <node>` ships the
 *unprefixed local build* names, so on a released node it reports success

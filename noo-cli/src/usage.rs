@@ -64,7 +64,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
         (&["cluster", "bootstrap-token", "revoke"], "<id>", "Revoke a bootstrap token by id (idempotent)"),
         (&["cluster", "bootstrap-token"], "", "Print bootstrap-token subcommand usage (create, list, revoke)"),
         (&["cluster", "set-primary"], "[--to <target>] --promoted [-y|--yes]", "Move the primary-controller role; promote Postgres on the target first, then --promoted"),
-        (&["cluster", "sync-images"], "[<node>...] [-i|--image <img>]... [--images <a,b>] [--restart|--no-restart] [--all] [--stage-only] [--lock] [--arch <a,b>] [--all-images]", "Stage images on the artifact rail, then nodes pull them (--stage-only: stage, no pull)"),
+        (&["cluster", "sync-images"], "[<node>...] [-i|--image <img>]... [--images <a,b>] [--restart|--no-restart] [--all] [--stage-only] [--lock] [--arch <a,b>] [--all-images]", "Stage images on the artifact rail, then nodes pull them (--stage-only: stage, no pull; a release-pinned image is staged by its lock digest, also via -i; -i is for images the release does not carry)"),
         (&["cluster", "upgrade-agents"], "[<node>...] [-y|--yes]", "Restage node agents serially in signed bundles over the pull rail; asks to confirm (-y)"),
         (&["cluster", "upgrade-hostd"], "<node>... [-y|--yes|--force]", "Roll noo-hostd to the named nodes over the pull rail as a signed bundle"),
         (&["cluster", "upgrade-applier"], "<node>... [-y|--yes|--force]", "Ship the current noo-apply to nodes over the rail; asks for confirmation (-y)"),

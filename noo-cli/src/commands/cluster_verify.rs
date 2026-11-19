@@ -1269,8 +1269,25 @@ pub(crate) fn image_sources_check(n: &Value) -> Option<Check> {
     Some(warn(
         "image sources",
         format!("not from the artifact rail: {}", list.join(", ")),
-        Some(format!("noo cluster sync-images {id} -i {first}   # stage it; the agent takes the rail copy on its next start")),
+        Some(if release_pinned(n, first) {
+            pinned_remedy(first)
+        } else {
+            format!("noo cluster sync-images {id} -i {first}   # stage it; the agent takes the rail copy on its next start")
+        }),
     ))
+}
+
+/// Does the controller's release lock pin `image` (`release_pinned_images`,
+/// injected by `with_harness_wanted` from this host's stack lock)? Such an
+/// image is staged by its lock digest, never with `-i` (a by-name record is
+/// refused by every node pinned to the digest).
+fn release_pinned(n: &Value, image: &str) -> bool {
+    n["release_pinned_images"].as_array().is_some_and(|a| a.iter().any(|v| v.as_str() == Some(image)))
+}
+
+/// The remedy for a release-pinned image that is not on the rail.
+fn pinned_remedy(image: &str) -> String {
+    format!("{}   # the release pins {image}: it is staged by its lock digest", crate::commands::image_stage::RESTAGE_BY_LOCK)
 }
 
 /// The `images staged` row: running placements whose image is not staged on
@@ -1287,10 +1304,11 @@ pub(crate) fn images_staged_check(n: &Value) -> Option<Check> {
         "images staged",
         format!("placed but not staged on the artifact rail: {}", names.join(", ")),
         // Staged by tag: `-i repo:tag@digest` would name a tar nothing reads.
-        Some(format!(
-            "noo cluster sync-images {id} -i {}   # or `noo upgrade` for the release images",
-            crate::commands::image_stage::staged_ref(first)
-        )),
+        Some(if release_pinned(n, crate::commands::image_stage::staged_ref(first)) {
+            pinned_remedy(crate::commands::image_stage::staged_ref(first))
+        } else {
+            format!("noo cluster sync-images {id} -i {}   # or `noo upgrade` for the release images", crate::commands::image_stage::staged_ref(first))
+        }),
     ))
 }
 
@@ -1421,7 +1439,11 @@ pub(crate) fn hardened_images_check(n: &Value) -> Option<Check> {
     Some(fail(
         "hardened images",
         format!("drift: upstream image(s) running where a hardened build of ours exists (a node never falls back to upstream on its own): {}", list.join(", ")),
-        format!("noo cluster sync-images {id} -i {first_ours}   # stage ours; the node's reconciler then recreates the backend on it; unset LLAMACPP_IMAGE / OLLAMA_IMAGE if an override pins upstream"),
+        if release_pinned(n, first_ours) {
+            format!("{}   # stages ours by its lock digest; the node's reconciler then recreates the backend on it; unset LLAMACPP_IMAGE / OLLAMA_IMAGE if an override pins upstream", crate::commands::image_stage::RESTAGE_BY_LOCK)
+        } else {
+            format!("noo cluster sync-images {id} -i {first_ours}   # stage ours; the node's reconciler then recreates the backend on it; unset LLAMACPP_IMAGE / OLLAMA_IMAGE if an override pins upstream")
+        },
     ))
 }
 
@@ -2073,6 +2095,8 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
         (Some(d), Some(arch)) => door_pin_facts(g, &d["placements"], arch),
         _ => Vec::new(),
     };
+    // The refs this host's release lock pins: their remedies restage by digest.
+    let release_pinned = crate::commands::image_stage::lock_pinned_refs_here();
     // i545 45/46: placements on a gpu target this node cannot run on its GPU.
     let cpu_built = desired
         .as_ref()
@@ -2106,6 +2130,9 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
         }
         if !door_pins.is_empty() {
             obj.insert("door_pins".into(), serde_json::json!(door_pins));
+        }
+        if !release_pinned.is_empty() {
+            obj.insert("release_pinned_images".into(), serde_json::json!(release_pinned));
         }
         if !cpu_built.is_empty() {
             obj.insert("gpu_targets_on_cpu_builds".into(), serde_json::json!(cpu_built));
@@ -8221,6 +8248,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(cert_expiry_row(&certs));
         checks.extend(stack_rows_here(&crate::envfile::repo_root()));
         checks.push(image_retention_row_here(&crate::envfile::repo_root()));
+        if let Some(row) = staged_release_images_row_here() {
+            checks.push(row);
+        }
         checks.push(noo_data_bound_row(&crate::envfile::repo_root()));
         checks.push(netns_restore_row_here(&crate::envfile::repo_root()));
         // i802: advisory only, on a CPU-only controller.
@@ -8922,6 +8952,40 @@ pub(crate) fn image_retention_row(report: Option<Result<Value, String>>, blocked
         ok(NAME, format!("{} superseded image(s) of ours, {size} reclaimable; report only, nothing removed ({when})", marked.len()))
     } else {
         ok(NAME, format!("removed {} superseded image(s) of ours, {size} freed ({when})", marked.len()))
+    }
+}
+
+/// The `staged release images` row: every image the controller's rail holds
+/// that the release lock pins (`lock` = its text, prefix, tag) must be staged
+/// by its lock digest. One staged by name (an `-i` stage before 0.6.28, or a
+/// hand edit) is refused by each node whose backend is pinned to the digest,
+/// at that backend's next start: WARN now, before a restart finds it. No row
+/// without a lock (a controller that never ran `noo upgrade`).
+pub(crate) fn staged_release_images_check(lock: Option<(&str, &str, &str)>, idx: &crate::commands::image_stage::StagedIndex) -> Option<Check> {
+    const NAME: &str = "staged release images";
+    let (l, p, t) = lock?;
+    let mut pinned = 0usize;
+    let mut by_name = Vec::new();
+    for r in &idx.images {
+        let Some((digest, ..)) = crate::commands::image_stage::lock_pin_for(&r.image, l, p, t) else { continue };
+        pinned += 1;
+        if r.lock_digest.is_empty() {
+            by_name.push(format!("{} ({}) is staged by name, but the release pins it to {digest}: a node pinned to it refuses its next start", r.image, r.arch));
+        }
+    }
+    if by_name.is_empty() {
+        return Some(ok(NAME, format!("{pinned} staged image(s) the release pins, all by their lock digest")));
+    }
+    Some(warn(NAME, by_name.join("; "), Some(crate::commands::image_stage::RESTAGE_BY_LOCK.to_string())))
+}
+
+/// [`staged_release_images_check`] for this controller's lock and rail.
+pub(crate) fn staged_release_images_row_here() -> Option<Check> {
+    use crate::commands::image_stage as st;
+    match st::controller_lock_opt() {
+        Ok(Some((l, p, t))) => staged_release_images_check(Some((l.as_str(), p.as_str(), t.as_str())), &st::read_index(&st::images_store_dir())),
+        Ok(None) => None,
+        Err(e) => Some(warn("staged release images", format!("not checked: {e}"), None)),
     }
 }
 
@@ -12615,6 +12679,57 @@ mod tests {
         assert!(!remedy.contains('@'), "{remedy}");
     }
 
+    /// A release-pinned image is restaged by its lock digest
+    /// (`--stage-only --lock`), never with `-i`; `-i` stays for the rest.
+    #[test]
+    fn staging_remedies_restage_a_release_pinned_image_by_the_lock() {
+        let lock_only = crate::commands::image_stage::RESTAGE_BY_LOCK;
+        let pinned = "reg/acme/llamacpp:v2";
+        let n = serde_json::json!({"id": "host8-ma", "unstaged_images": [format!("{pinned}@sha256:{}", "e".repeat(64))],
+            "release_pinned_images": [pinned, "reg/acme/stunnel:v1"],
+            "image_sources": [{"image": pinned, "source": "local"}]});
+        for c in [images_staged_check(&n).unwrap(), image_sources_check(&n).unwrap()] {
+            let r = c.remedy.unwrap();
+            assert!(r.starts_with(lock_only) && !r.contains(" -i "), "{}: {r}", c.name);
+        }
+        let mut other = n.clone();
+        other["release_pinned_images"] = serde_json::json!(["reg/acme/other:v2"]);
+        for c in [images_staged_check(&other).unwrap(), image_sources_check(&other).unwrap()] {
+            let r = c.remedy.unwrap();
+            assert!(r.contains(&format!("sync-images host8-ma -i {pinned}")) && !r.contains("--stage-only"), "{}: {r}", c.name);
+        }
+        let up = serde_json::json!({"id": "node-pi", "release_pinned_images": ["ghcr.io/noomesh/ollama:v0.6.15"], "image_sources": [
+            {"image": "ghcr.io/noomesh/stunnel:v0.6.15", "source": "rail"},
+            {"image": "ollama/ollama:0.40.5", "source": "registry"}]});
+        let r = hardened_images_check(&up).unwrap().remedy.unwrap();
+        assert!(r.starts_with(lock_only) && !r.contains(" -i "), "{r}");
+    }
+
+    /// `staged release images`: a staged image the release pins, recorded by
+    /// name, WARNs before a pinned node's next start refuses it.
+    #[test]
+    fn staged_release_images_row_warns_on_a_pinned_image_staged_by_name() {
+        use crate::commands::image_stage::{StagedIndex, StagedRecord};
+        let d = format!("sha256:{}", "a".repeat(64));
+        let lock = format!("# tag v1\nnode-agent@{d}\n");
+        let r = |image: &str, arch: &str, digest: &str| StagedRecord {
+            image: image.into(), arch: arch.into(), tar: String::new(), image_id: String::new(),
+            lock_digest: digest.into(), source: if digest.is_empty() { "sync-images".into() } else { "lock".into() },
+            release_tag: String::new(), staged_at: 1 };
+        let mut idx = StagedIndex { images: vec![r("reg/acme/node-agent:v1", "amd64", &d), r("reg/acme/other:v1", "amd64", "")], ..Default::default() };
+        let c = staged_release_images_check(Some((lock.as_str(), "reg/acme", "v1")), &idx).unwrap();
+        assert_eq!((c.name, c.verdict), ("staged release images", Verdict::Ok), "{}", c.detail);
+        assert!(c.detail.starts_with("1 staged image(s)"), "a by-name non-release image is not counted: {}", c.detail);
+        idx.images.push(r("reg/acme/node-agent:v1", "arm64", ""));
+        let c = staged_release_images_check(Some((lock.as_str(), "reg/acme", "v1")), &idx).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert_eq!(c.detail, format!("reg/acme/node-agent:v1 (arm64) is staged by name, but the release pins it to {d}: a node pinned to it refuses its next start"));
+        assert_eq!(c.remedy.as_deref(), Some(crate::commands::image_stage::RESTAGE_BY_LOCK));
+        assert!(staged_release_images_check(None, &idx).is_none(), "no lock, no row");
+        let src = include_str!("cluster_verify.rs");
+        assert!(src.contains("if let Some(row) = staged_release_images_row_here() {\n            checks.push(row);"));
+    }
+
     #[test]
     fn the_sidecar_image_row_warns_on_the_alpine_fallback() {
         let c = stunnel_image_check(&serde_json::json!({"id": "host9", "stunnel_image": "fallback-alpine"})).expect("a row");
@@ -15428,14 +15543,14 @@ mod vantage_tests {
 
     /// Every row the controller half writes from THIS machine's files and
     /// containers (the rows an outside run on a node turned red).
-    const CONTROLLER_ONLY_ROWS: [&str; 36] = [
+    const CONTROLLER_ONLY_ROWS: [&str; 37] = [
         "self-agent lane", "model cache", "loki", "tempo", "grafana door", "audit key", "secrets at rest",
         "shared secrets", "secrets audit", "grafana sso", "gateway pki view", "loki listener", "tempo listener",
         "sandbox listener", "backend tls", "nats tls", "nats principals", "postgres hba", "postgres role identity",
         "postgres tls", "sandbox executor", "data directories", "data root filesystem", "monitoring web config",
         "secrets not in env", "node-agent privilege", "callers", "tailnet policy", "last backup", "off-site backup",
         "pki at rest", "image retention", "stack images", "postgres memory", "hf-cache hub owner",
-        "controller hf-cache hub owner",
+        "controller hf-cache hub owner", "staged release images",
     ];
 
     #[test]
