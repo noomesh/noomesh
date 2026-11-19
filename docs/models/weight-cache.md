@@ -457,7 +457,10 @@ its image through one function (`EnsureImage`):
    the sum when both are one filesystem). A shortfall, or a real "no space
    left on device", is a `not enough disk space for image …` refusal naming
    the path, free and needed space; it is **not** backed off, so the start
-   goes ahead on the next reconcile pass after space is freed, and
+   goes ahead on the next reconcile pass after space is freed (after a real
+   "no space left on device", once that filesystem has gained 1 GiB over
+   the free space seen at the failure, so the tar is not re-fetched every
+   pass), and
    `noo cluster verify`'s `backend starts` row gives the disk remedy. A
    manifest without `size_bytes` (an older gateway) skips the check.
 3. **Local, nothing to compare** (not staged, an older gateway, controller

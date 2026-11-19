@@ -149,6 +149,10 @@ type NoSpaceError struct {
 	Free uint64
 	Need uint64
 	Err  error // the raw ENOSPC, when that is what was seen
+	// Waiting: no pull was tried — the last one ran out of space at Path
+	// with Free bytes free, and Path has not gained noSpaceRetryStep since
+	// (noSpaceGate, image_source.go).
+	Waiting bool
 }
 
 func (e *NoSpaceError) Error() string {
@@ -157,6 +161,10 @@ func (e *NoSpaceError) Error() string {
 		remedy += ", or place llamacpp on cpu (`noo cluster place " + nodeIDOrPlaceholder() + " llamacpp <model> --on cpu`)"
 	}
 	remedy += "; the next reconcile pass retries as soon as there is room"
+	if e.Waiting {
+		return fmt.Sprintf("%s %s: waiting for space: %s had %d MiB free when the last pull ran out; retrying once it has more — %s",
+			noSpacePrefix, e.Ref, e.Path, e.Free>>20, remedy)
+	}
 	if e.Err != nil {
 		return fmt.Sprintf("%s %s: %s (%s) ran out of space (%v) — %s", noSpacePrefix, e.Ref, e.What, e.Path, e.Err, remedy)
 	}
