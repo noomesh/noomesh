@@ -121,7 +121,7 @@ func (f *Facts) Report(ctx context.Context) map[string]any {
 	}
 	if f.DockerEngine != nil {
 		if eng := f.DockerEngine(ctx); eng != nil {
-			out["docker_engine"] = eng
+			_ = eng
 		}
 	}
 	return out
