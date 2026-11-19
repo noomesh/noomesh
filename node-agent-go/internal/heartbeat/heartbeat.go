@@ -154,6 +154,11 @@ type Reporter struct {
 	// (i1036). nil = not wired (no Docker); ok=false omits the key.
 	imageStoreFree atomic.Pointer[func() (int64, bool)]
 
+	// heldImages reports, for this release's own backend images, whether
+	// Docker holds each one (docker/held_images.go), sent as `held_images`
+	// (i1036). nil = not wired; an empty or nil answer omits the key.
+	heldImages atomic.Pointer[func() map[string]bool]
+
 	// ollamaVerify reports each placed Ollama model's verification against
 	// the controller's store, sent as `ollama_verify`. nil = not wired, and a
 	// provider answering nil (nothing checked yet) omits the key.
@@ -476,6 +481,17 @@ func (r *Reporter) modelSetsFreeBytes() (int64, bool) {
 
 // SetImageStoreFreeBytes installs the provider of `image_store_free_bytes`.
 func (r *Reporter) SetImageStoreFreeBytes(f func() (int64, bool)) { r.imageStoreFree.Store(&f) }
+
+// SetHeldImages installs the provider of `held_images`.
+func (r *Reporter) SetHeldImages(f func() map[string]bool) { r.heldImages.Store(&f) }
+
+func (r *Reporter) heldImagesReport() map[string]bool {
+	f := r.heldImages.Load()
+	if f == nil || *f == nil {
+		return nil
+	}
+	return (*f)()
+}
 
 func (r *Reporter) imageStoreFreeBytes() (int64, bool) {
 	f := r.imageStoreFree.Load()

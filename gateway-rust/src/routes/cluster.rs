@@ -392,6 +392,9 @@ enum BeatShape {
     /// One small object: its `state` is one of these, and every value is a
     /// string of at most 256 bytes (at most 8 keys).
     StateObject(&'static [&'static str]),
+    /// An object of at most this many keys, each a non-empty string of at
+    /// most 512 bytes mapped to a bool.
+    BoolMap(usize),
 }
 
 /// The A4 keys. Placement (i300 H3) reads only what this stores: a key left
@@ -414,6 +417,11 @@ const I300_BEAT_KEYS: &[(&str, BeatShape)] = &[
     // and the agent's staging dir. The GPU llama.cpp place check reads it; an
     // agent that does not send it is unknown there (a warning, no refusal).
     ("image_store_free_bytes", BeatShape::NonNegInt),
+    // i1036: {ref: held} for the release's own backend images (the agent's
+    // `docker image inspect` of each; a ref it could not judge is absent).
+    // The GPU llama.cpp place check refuses only a node that does NOT hold
+    // the CUDA image.
+    ("held_images", BeatShape::BoolMap(16)),
     ("addon_workloads_policy", BeatShape::OneOf(&["none", "approve", "auto"])),
     ("addon_workloads_approvals", BeatShape::Objects(256)),
     ("model_sets", BeatShape::Objects(256)),
@@ -450,6 +458,9 @@ fn beat_shape_ok(v: &Value, shape: BeatShape) -> bool {
                 && o.get("state").and_then(Value::as_str).is_some_and(|s| states.contains(&s))
                 && o.values().all(|x| x.as_str().is_some_and(|s| s.len() <= 256))
         }),
+        BeatShape::BoolMap(max) => v
+            .as_object()
+            .is_some_and(|o| o.len() <= max && o.iter().all(|(k, b)| !k.is_empty() && k.len() <= 512 && b.is_boolean())),
     }
 }
 
@@ -4832,18 +4843,31 @@ pub(crate) struct ImageSpaceFacts {
     pub unpacked_bytes: Option<u64>,
 }
 
-/// Does the node already hold `image`? Read from the heartbeat's
-/// `image_sources` (each image this agent run started a container from, with
-/// its local image ID): held when a row's image ID equals the staged one (the
-/// agent then retags or skips, moving no tar), or, when either ID is unknown,
-/// when a row names the same ref. A node that reports none is NOT known to
-/// hold it: the caller then checks the space, and refuses only on a known
-/// free figure.
-pub(crate) fn node_holds_image(node: &Value, image: &str, staged_id: Option<&str>) -> bool {
+/// Whether a node holds an image, as its heartbeat says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Holding {
+    /// It holds it: a pull moves no tar.
+    Held,
+    /// Its agent inspected the ref and Docker does not have it.
+    NotHeld,
+    /// Nothing says: an agent older than `held_images`, or one whose release
+    /// tag (so whose ref) differs from the staged one.
+    Unknown,
+}
+
+/// Does the node already hold `image`?
+/// - Held: `held_images[ref]` is true (the agent's own `docker image
+///   inspect`, i1036), or a row of `image_sources` (each image this agent run
+///   started a container from) has the staged image ID (the agent then
+///   retags, moving no tar) or, when an ID is unknown on either side, the
+///   same ref.
+/// - NotHeld: `held_images[ref]` is false.
+/// - Unknown: neither says.
+pub(crate) fn node_holds_image(node: &Value, image: &str, staged_id: Option<&str>) -> Holding {
     use crate::routes::artifacts::staged_ref;
     let want = staged_ref(image);
     let staged_id = staged_id.filter(|i| !i.is_empty());
-    node.get("image_sources").and_then(Value::as_array).is_some_and(|rows| {
+    let started = node.get("image_sources").and_then(Value::as_array).is_some_and(|rows| {
         rows.iter().any(|r| {
             let id = r.get("image_id").and_then(Value::as_str).filter(|i| !i.is_empty());
             match (staged_id, id) {
@@ -4851,49 +4875,83 @@ pub(crate) fn node_holds_image(node: &Value, image: &str, staged_id: Option<&str
                 _ => r.get("image").and_then(Value::as_str).is_some_and(|i| staged_ref(i) == want),
             }
         })
-    })
+    });
+    if started {
+        return Holding::Held;
+    }
+    match node.get("held_images").and_then(|h| h.get(want)).and_then(Value::as_bool) {
+        Some(true) => Holding::Held,
+        Some(false) => Holding::NotHeld,
+        None => Holding::Unknown,
+    }
 }
 
-/// MiB for the refusal's text: each part rounded UP, so the parts shown add
-/// up to the total shown and never understate it.
-fn mib_up(bytes: u64) -> u64 {
-    bytes.div_ceil(1 << 20)
+/// Tenths of a GB (10^8 bytes) for the texts: the need's parts rounded UP, so
+/// the parts shown add up to the total shown and never understate it; the
+/// free figure rounded down.
+fn gb_tenths_up(bytes: u64) -> u64 {
+    bytes.div_ceil(100_000_000)
 }
 
-/// The refusal for a GPU llama.cpp placement whose node is known to lack the
-/// room to pull the CUDA image. noo's own reclaim first, never a raw docker
-/// command.
-pub(crate) fn image_space_refusal(node_id: &str, model: Option<&str>, image: &str, free: u64, need: &ImageSpaceNeed) -> String {
-    let (tar, load, margin) = (mib_up(need.tar), mib_up(need.load), mib_up(need.margin));
+fn gb(tenths: u64) -> String {
+    format!("{}.{}", tenths / 10, tenths % 10)
+}
+
+/// "X GB free" and "about Y GB to pull and unpack (tar A + unpacked B +
+/// margin C; …)": Y is the sum of the parts as shown.
+fn image_space_figures(free: u64, need: &ImageSpaceNeed) -> (String, String) {
+    let (tar, load, margin) = (gb_tenths_up(need.tar), gb_tenths_up(need.load), gb_tenths_up(need.margin));
+    let total = tar + load + margin;
+    let free = format!("{} GB free", gb(free / 100_000_000));
+    let need = format!(
+        "about {} GB to pull and unpack (tar {} + unpacked {} + margin {}; the unpacked figure is the larger of the image's \
+         recorded size, {} GB, and the node agent's own estimate, which its pull check uses)",
+        gb(total),
+        gb(tar),
+        gb(load),
+        gb(margin),
+        gb(gb_tenths_up(need.unpacked)),
+    );
+    (free, need)
+}
+
+/// noo's own reclaim first, never a raw docker command.
+fn image_space_reclaim(node_id: &str) -> String {
     format!(
-        "{node_id} has no room to pull {image}: its image store has {free} MiB free (image_store_free_bytes, the least free of \
-         Docker's data root, containerd's root and the agent's staging dir), and the pull needs {total} MiB = tar {tar} + load {load} + \
-         margin {margin} (load: the image's unpacked size, {unpacked} MiB, or the node agent's own estimate when larger), so the \
-         llamacpp start would fail on the node. Free space with noo's reclaim: `noo autonomy decisions -l disk_watermark` shows what it \
-         would free on {node_id}; `noo autonomy live disk_watermark` lets it act (an operator decision; see \
-         docs/operating/disk-and-images.md). Or place it on cpu: `noo cluster place {node_id} llamacpp {model} --on cpu`. \
+        "free space with noo's reclaim: `noo autonomy decisions -l disk_watermark` shows what it would free on {node_id}; \
+         `noo autonomy live disk_watermark` lets it act (an operator decision; see docs/operating/disk-and-images.md)"
+    )
+}
+
+/// The refusal for a GPU llama.cpp placement on a node that does not hold
+/// the CUDA image and is known to lack the room to pull it.
+pub(crate) fn image_space_refusal(node_id: &str, model: Option<&str>, image: &str, free: u64, need: &ImageSpaceNeed) -> String {
+    let (free, need) = image_space_figures(free, need);
+    format!(
+        "{node_id} has {free} in its image store and does not hold {image}, which needs {need}, so the llamacpp start would \
+         wait on the node for space (the image store is the least free of Docker's data root, containerd's root and the agent's \
+         staging dir). To place it: {reclaim}. Or place it on cpu: `noo cluster place {node_id} llamacpp {model} --on cpu`. \
          --force places it anyway",
-        free = free >> 20,
-        total = tar + load + margin,
-        unpacked = mib_up(need.unpacked),
+        reclaim = image_space_reclaim(node_id),
         model = model.map(str::trim).filter(|m| !m.is_empty()).unwrap_or("<model>"),
     )
 }
 
 /// i1036: a running llama.cpp placement on the node's GPU starts the CUDA
 /// image (~2.6 GB tar, ~4 GB unpacked, sharing no layers with the CPU one).
-/// When the node does not already hold it ([`node_holds_image`]) and is KNOWN
-/// to have less free space (`image_store_free_bytes`) than the pull needs
+/// When the node does NOT hold it ([`Holding::NotHeld`]) and is KNOWN to have
+/// less free space (`image_store_free_bytes`) than the pull needs
 /// ([`image_space_need`]), it is refused (Err), naming the numbers and the
-/// remedy. Unknown on either side (an agent that does not report the key, an
-/// image whose unpacked size was not recorded) proceeds with one warning
-/// (Ok(Some)); no guessed ratio stands in for a missing size. Any other
-/// backend, or llama.cpp on cpu, is not judged.
+/// remedy. Unknown on any side (whether it holds the image, its free space,
+/// the image's unpacked size) proceeds with one warning (Ok(Some)) saying
+/// what is unknown; no guessed ratio stands in for a missing size. A node
+/// that holds it, any other backend, or llama.cpp on cpu is not judged.
 pub(crate) fn validate_image_space(node_id: &str, backend: &str, on_gpu: bool, model: Option<&str>, img: &ImageSpaceFacts, node: &Value) -> Result<Option<String>, String> {
     if backend != "llamacpp" || !on_gpu {
         return Ok(None);
     }
-    if node_holds_image(node, &img.image, img.image_id.as_deref()) {
+    let holding = node_holds_image(node, &img.image, img.image_id.as_deref());
+    if holding == Holding::Held {
         return Ok(None);
     }
     let image = img.image.as_str();
@@ -4906,9 +4964,9 @@ pub(crate) fn validate_image_space(node_id: &str, backend: &str, on_gpu: bool, m
     };
     let (Some(tar), Some(unpacked)) = (img.tar_bytes.filter(|b| *b > 0), img.unpacked_bytes.filter(|b| *b > 0)) else {
         return Ok(Some(format!(
-            "{backend} on {node_id}: whether {image} fits in the {} MiB free there is unknown: its unpacked size was not recorded \
+            "{backend} on {node_id}: whether {image} fits in the {} GB free there is unknown: its unpacked size was not recorded \
              when it was staged (staged by an older noo). Restage it to record it: `noo cluster sync-images {node_id} -i {}`",
-            free >> 20,
+            gb(free / 100_000_000),
             crate::routes::artifacts::staged_ref(image)
         )));
     };
@@ -4916,7 +4974,16 @@ pub(crate) fn validate_image_space(node_id: &str, backend: &str, on_gpu: bool, m
     if free >= need.total {
         return Ok(None);
     }
-    Err(image_space_refusal(node_id, model, image, free, &need))
+    if holding == Holding::NotHeld {
+        return Err(image_space_refusal(node_id, model, image, free, &need));
+    }
+    let (free_s, need_s) = image_space_figures(free, &need);
+    Ok(Some(format!(
+        "{backend} on {node_id}: {node_id} has {free_s} in its image store, and {image} needs {need_s}, but \
+         whether the node already holds it is unknown (its agent does not report held_images for it: an agent older than this \
+         release, or one on another release tag). If it does not, the start will wait on the node for space; {}",
+        image_space_reclaim(node_id)
+    )))
 }
 
 /// The facts [`validate_image_space`] reads about the image a llama.cpp
@@ -9485,6 +9552,7 @@ mod i300_beat_tests {
             "data_root_free_gb": 412.5,
             "model_sets_free_bytes": 442_986_717_184u64,
             "image_store_free_bytes": 7_100_000_000u64,
+            "held_images": {"reg.example/acme/llamacpp-cuda:v1": false, "reg.example/acme/ollama:v1": true},
             "addon_workloads_policy": "approve",
             "addon_workloads_approvals": [{"addon": "rhaddon", "digest": format!("sha256:{}", "a".repeat(64))}],
             "model_sets": [
@@ -9570,6 +9638,7 @@ mod i300_beat_tests {
             "data_root_free_gb": "lots",
             "model_sets_free_bytes": -1,
             "image_store_free_bytes": "lots",
+            "held_images": {"reg.example/acme/llamacpp-cuda:v1": "yes"},
             "addon_workloads_policy": "always",
             "model_sets": [1, 2],
             "node_workloads": {"addon": "rhaddon"},
@@ -9577,7 +9646,7 @@ mod i300_beat_tests {
         });
         carry_i300(&mut data, &full_beat());
         carry_i300(&mut data, &bad);
-        for key in ["gpu_compute_cap", "os", "nvidia_runtime", "data_root_free_gb", "model_sets_free_bytes", "image_store_free_bytes", "addon_workloads_policy", "model_sets", "node_workloads", "addon_workloads_approvals"] {
+        for key in ["gpu_compute_cap", "os", "nvidia_runtime", "data_root_free_gb", "model_sets_free_bytes", "image_store_free_bytes", "held_images", "addon_workloads_policy", "model_sets", "node_workloads", "addon_workloads_approvals"] {
             assert!(data.get(key).is_none(), "{key}: a misshapen value is unknown, never kept: {data}");
         }
         // An empty list is a fact (no sets, no workloads), not unknown.
@@ -9621,6 +9690,23 @@ mod i300_beat_tests {
         carry_i300(&mut data, &json!({"image_store_free_bytes": 5}));
         carry_i300(&mut data, &json!({"running_backends": {}}));
         assert!(data.get("image_store_free_bytes").is_none(), "an agent that stops sending it is unknown: {data}");
+    }
+
+    /// i1036: `held_images` is stored when it is an object of refs to bools
+    /// (16 at most, an empty object included); a non-bool value, an empty
+    /// ref, too many refs or a non-object is unknown, and is removed.
+    #[test]
+    fn held_images_keeps_a_map_of_bools_and_drops_anything_else() {
+        let mut data = json!({"id": "n1"});
+        let good = json!({"reg.example/acme/llamacpp-cuda:v1": false, "reg.example/acme/ollama:v1": true});
+        carry_i300(&mut data, &json!({"held_images": good.clone()}));
+        assert_eq!(data["held_images"], good);
+        let many: serde_json::Map<String, Value> = (0..17).map(|i| (format!("r{i}"), json!(true))).collect();
+        for bad in [json!({"r": "yes"}), json!({"r": 1}), json!({"": true}), json!([{"r": true}]), json!(true), Value::Object(many)] {
+            carry_i300(&mut data, &json!({"held_images": good.clone()}));
+            carry_i300(&mut data, &json!({"held_images": bad.clone()}));
+            assert!(data.get("held_images").is_none(), "{bad}: unknown, never kept: {data}");
+        }
     }
 
     /// i607b: the new row fields ride inside `model_sets` untouched.
@@ -10393,14 +10479,22 @@ mod image_space_tests {
         ImageSpaceFacts { image: CUDA.into(), image_id: Some("sha256:cuda".into()), tar_bytes: Some(TAR), unpacked_bytes: unpacked }
     }
 
+    /// A node whose agent inspected the CUDA ref and does not hold it.
     fn node(free: u64) -> Value {
-        json!({"image_store_free_bytes": free})
+        json!({"image_store_free_bytes": free, "held_images": {"reg.example/acme/llamacpp-cuda:v1": false}})
     }
 
-    /// The integers right after `pat` in `msg`.
-    fn ints_after(msg: &str, pat: &str, n: usize) -> Vec<u64> {
+    /// The tenths of a GB written right after `pat` in `msg` ("8.6" → 86).
+    fn gbs_after(msg: &str, pat: &str, n: usize) -> Vec<u64> {
         let tail = msg.split_once(pat).unwrap_or_else(|| panic!("no {pat:?} in {msg}")).1;
-        tail.split(|c: char| !c.is_ascii_digit()).filter(|t| !t.is_empty()).take(n).map(|t| t.parse().unwrap()).collect()
+        tail.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .filter(|t| t.contains('.') && t.chars().next().is_some_and(|c| c.is_ascii_digit()))
+            .take(n)
+            .map(|t| {
+                let (whole, tenth) = t.split_once('.').unwrap();
+                whole.parse::<u64>().unwrap() * 10 + tenth.parse::<u64>().unwrap()
+            })
+            .collect()
     }
 
     /// The need is the agent's same-filesystem formula: tar + load + 512 MiB,
@@ -10419,12 +10513,13 @@ mod image_space_tests {
         assert_eq!(agent_image_load_estimate(1 << 30), 3 << 30);
     }
 
-    /// Known short: refused, naming the node, the image, the numbers and
-    /// noo's reclaim before anything else; exactly enough passes.
+    /// NotHeld and known short: refused, naming the node, that it does not
+    /// hold the image, the numbers and noo's reclaim before anything else;
+    /// exactly enough passes.
     #[test]
-    fn a_known_shortfall_is_refused_with_the_reclaim_remedy() {
+    fn a_known_shortfall_on_a_node_without_the_image_is_refused() {
         let e = validate_image_space("node_a", "llamacpp", true, Some("m.gguf"), &cuda(Some(UNPACKED)), &node(7_100_000_000)).unwrap_err();
-        assert!(e.contains("node_a") && e.contains(CUDA), "{e}");
+        assert!(e.starts_with("node_a has 7.1 GB free in its image store and does not hold reg.example/acme/llamacpp-cuda:v1, which needs about"), "{e}");
         let reclaim = e.find("noo autonomy decisions -l disk_watermark").expect("the reclaim preview");
         assert!(e.contains("noo autonomy live disk_watermark") && e.contains("docs/operating/disk-and-images.md"), "{e}");
         let cpu = e.find("noo cluster place node_a llamacpp m.gguf --on cpu").expect("the cpu alternative");
@@ -10436,28 +10531,44 @@ mod image_space_tests {
         assert_eq!(validate_image_space("node_a", "llamacpp", true, None, &cuda(Some(UNPACKED)), &node(need - 1)).map_err(|_| ()), Err(()));
     }
 
-    /// The refusal's numbers add up: total = tar + load + margin as shown, each
-    /// the part rounded up to MiB, and the free figure shown is below it.
+    /// The refusal's numbers add up: the total shown is tar + unpacked +
+    /// margin as shown, each a part rounded up to 0.1 GB, and the free figure
+    /// shown is below it. (A tar whose parts round up by more than the total
+    /// does, so a total rounded on its own would not add up.)
     #[test]
     fn the_refusals_numbers_add_up() {
-        let need = image_space_need(TAR, UNPACKED);
+        let need = image_space_need(2_650_000_000, UNPACKED);
         let e = image_space_refusal("node_a", None, CUDA, 7_100_000_000, &need);
-        let parts = ints_after(&e, "needs ", 4);
-        let [total, tar, load, margin] = parts[..] else { panic!("{e}") };
-        assert_eq!(total, tar + load + margin, "{e}");
-        assert_eq!((tar, load, margin), (TAR.div_ceil(1 << 20), need.load.div_ceil(1 << 20), 512), "{e}");
-        let free = ints_after(&e, "store has ", 1)[0];
-        assert_eq!(free, 7_100_000_000 >> 20, "{e}");
+        let parts = gbs_after(&e, "needs about ", 4);
+        let [total, tar, unpacked, margin] = parts[..] else { panic!("{e}") };
+        assert_eq!(total, tar + unpacked + margin, "{e}");
+        assert_eq!((tar, unpacked, margin), (27, 53, 6), "each part rounded up: {e}");
+        let free = gbs_after(&e, "node_a has ", 1)[0];
+        assert_eq!(free, 71, "{e}");
         assert!(free < total, "{e}");
         assert!(e.contains("<model>"), "no model named: a placeholder: {e}");
     }
 
-    /// An agent that does not report the key (older than this release, or
-    /// its disks unreadable) is unknown: a warning, never a refusal, and
+    /// Whether the node holds the image is unknown (no `held_images` for the
+    /// ref: an older agent, or another release tag) and it is short: a
+    /// warning with the numbers, never a refusal.
+    #[test]
+    fn an_unknown_holding_and_a_shortfall_warns_with_the_numbers() {
+        for n in [json!({"image_store_free_bytes": 7_100_000_000u64}), json!({"image_store_free_bytes": 7_100_000_000u64, "held_images": {"reg.example/acme/llamacpp-cuda:v0": false}})] {
+            let w = validate_image_space("node_a", "llamacpp", true, None, &cuda(Some(UNPACKED)), &n)
+                .expect("unknown is not refused")
+                .expect("one warning");
+            assert!(w.contains("node_a has 7.1 GB free") && w.contains("needs about 8.4 GB") && w.contains("whether the node already holds it is unknown"), "{w}");
+            assert!(w.contains("held_images") && w.contains("noo autonomy decisions -l disk_watermark"), "{w}");
+        }
+    }
+
+    /// An agent that does not report the free key (older than this release,
+    /// or its disks unreadable) is unknown: a warning, never a refusal, and
     /// never read as 0 free.
     #[test]
     fn an_agent_without_the_key_warns_and_places() {
-        let w = validate_image_space("node_a", "llamacpp", true, None, &cuda(Some(UNPACKED)), &json!({"vram_gb": 8.0}))
+        let w = validate_image_space("node_a", "llamacpp", true, None, &cuda(Some(UNPACKED)), &json!({"vram_gb": 8.0, "held_images": {"reg.example/acme/llamacpp-cuda:v1": false}}))
             .expect("unknown is not refused")
             .expect("one warning");
         assert!(w.contains("node_a") && w.contains("image_store_free_bytes") && w.contains("unknown"), "{w}");
@@ -10475,22 +10586,27 @@ mod image_space_tests {
         assert!(matches!(validate_image_space("node_a", "llamacpp", true, None, &no_tar, &node(1 << 30)), Ok(Some(_))));
     }
 
-    /// A node that already holds the CUDA image moves no tar: no check. Held
-    /// is the same image ID (under any tag: the agent retags), or, when an ID
-    /// is unknown, the same ref (a digest-pinned one included). The same ref
-    /// at ANOTHER image ID is a pull, so it is checked.
+    /// A node that holds the CUDA image moves no tar: no check, however
+    /// short. Held is `held_images[ref] == true`, or an `image_sources` row
+    /// with the staged image ID (under any tag: the agent retags) or, when an
+    /// ID is unknown, the same ref (a digest-pinned one included). The same
+    /// ref at ANOTHER image ID is not held by that row.
     #[test]
     fn a_node_already_holding_the_cuda_image_is_not_checked() {
-        let short = |rows: Value| json!({"image_store_free_bytes": 1u64 << 20, "image_sources": rows});
-        let held = |rows: Value| validate_image_space("node_a", "llamacpp", true, None, &cuda(Some(UNPACKED)), &short(rows));
-        assert_eq!(held(json!([{"image": CUDA, "source": "rail", "image_id": "sha256:cuda"}])), Ok(None), "same ref, same id");
-        assert_eq!(held(json!([{"image": "reg.example/acme/llamacpp-cuda:v0", "source": "rail", "image_id": "sha256:cuda"}])), Ok(None), "same id, another tag");
-        assert_eq!(held(json!([{"image": CUDA, "source": "local"}])), Ok(None), "same ref, no id reported");
-        assert_eq!(held(json!([{"image": format!("{CUDA}@sha256:{}", "d".repeat(64)), "source": "rail"}])), Ok(None), "a digest-pinned ref");
-        assert!(held(json!([{"image": CUDA, "source": "rail", "image_id": "sha256:older"}])).is_err(), "same ref, another id: a pull");
-        assert!(held(json!([{"image": "reg.example/acme/llamacpp:v1", "source": "rail", "image_id": "sha256:cpu"}])).is_err(), "the cpu image is not it");
-        assert!(held(json!([])).is_err(), "none held");
-        assert!(validate_image_space("node_a", "llamacpp", true, None, &cuda(Some(UNPACKED)), &node(1 << 20)).is_err(), "no image_sources: not known held, free known");
+        assert_eq!(node_holds_image(&json!({"held_images": {"reg.example/acme/llamacpp-cuda:v1": true}}), CUDA, Some("sha256:cuda")), Holding::Held);
+        assert_eq!(node_holds_image(&json!({"held_images": {"reg.example/acme/llamacpp-cuda:v1": false}}), CUDA, Some("sha256:cuda")), Holding::NotHeld);
+        assert_eq!(node_holds_image(&json!({}), CUDA, Some("sha256:cuda")), Holding::Unknown);
+        let short = |held: Value, rows: Value| json!({"image_store_free_bytes": 1u64 << 20, "held_images": held, "image_sources": rows});
+        let check = |n: Value| validate_image_space("node_a", "llamacpp", true, None, &cuda(Some(UNPACKED)), &n);
+        assert_eq!(check(short(json!({"reg.example/acme/llamacpp-cuda:v1": true}), json!([]))), Ok(None), "held_images says held");
+        let not = || json!({"reg.example/acme/llamacpp-cuda:v1": false});
+        assert_eq!(check(short(not(), json!([{"image": CUDA, "source": "rail", "image_id": "sha256:cuda"}]))), Ok(None), "same ref, same id");
+        assert_eq!(check(short(not(), json!([{"image": "reg.example/acme/llamacpp-cuda:v0", "source": "rail", "image_id": "sha256:cuda"}]))), Ok(None), "same id, another tag");
+        assert_eq!(check(short(not(), json!([{"image": CUDA, "source": "local"}]))), Ok(None), "same ref, no id reported");
+        assert_eq!(check(short(not(), json!([{"image": format!("{CUDA}@sha256:{}", "d".repeat(64)), "source": "rail"}]))), Ok(None), "a digest-pinned ref");
+        assert_ne!(check(short(not(), json!([{"image": CUDA, "source": "rail", "image_id": "sha256:older"}]))), Ok(None), "same ref, another id: a pull");
+        assert_ne!(check(short(not(), json!([{"image": "reg.example/acme/llamacpp:v1", "source": "rail", "image_id": "sha256:cpu"}]))), Ok(None), "the cpu image is not it");
+        assert_ne!(check(short(not(), json!([]))), Ok(None), "none held: checked");
     }
 
     /// llama.cpp on cpu pulls the cpu image, and no other backend pulls the

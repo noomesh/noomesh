@@ -179,6 +179,7 @@ func (c *Client) PullImageArtifact(ctx context.Context, ref, controllerImageID, 
 		if id, ok := retagVouched(ctx, dockerImageStore{c}, ref, m); ok {
 			slog.Info("image.retagged_by_id: the staged image is already here under another tag; tagged, nothing fetched",
 				"image", ref, "id", shortImageID(id), "tar", tarName)
+			invalidateHeldImages()
 			out := &PullImageArtifactResult{Status: "up_to_date", Image: ref, Tar: tarName, Arch: arch}
 			c.removeAfterLoad(ctx, removeContainer, out)
 			return out, nil
@@ -243,6 +244,7 @@ func (c *Client) PullImageArtifact(ctx context.Context, ref, controllerImageID, 
 		return nil, err
 	}
 	rememberRailImage(sha, id)
+	invalidateHeldImages() // held_images: the next beat sees it
 
 	out := &PullImageArtifactResult{Status: "loaded", Image: ref, Tar: tarName, Arch: arch}
 	c.removeAfterLoad(ctx, removeContainer, out)
