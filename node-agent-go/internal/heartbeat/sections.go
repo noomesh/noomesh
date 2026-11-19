@@ -222,6 +222,13 @@ var (
 		if free, ok := r.imageStoreFreeBytes(); ok {
 			p["image_store_free_bytes"] = free
 		}
+		// i1036: {ref: held} for the release's own backend images, so the
+		// check knows whether the CUDA image is a pull. OMITTED when Docker
+		// could not answer for any of them; a ref it could not judge is left
+		// out, never sent as false.
+		if held := r.heldImagesReport(); len(held) > 0 {
+			p["held_images"] = held
+		}
 	}}
 
 	secOllamaVerify = payloadSection{name: "ollamaVerify", add: func(r *Reporter, p map[string]any) {

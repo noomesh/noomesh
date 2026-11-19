@@ -226,6 +226,9 @@ func installShape(t *testing.T, srvURL string, s sizeShape) *Reporter {
 	r.SetModelSets(func() any { return s.modelSets })
 	r.SetModelSetsFreeBytes(func() (int64, bool) { return 391100000000, true })
 	r.SetImageStoreFreeBytes(func() (int64, bool) { return 391100000000, true })
+	r.SetHeldImages(func() map[string]bool {
+		return map[string]bool{"ghcr.io/noomesh/llamacpp-cuda:v0.6.29": true, "ghcr.io/noomesh/llamacpp:v0.6.29": false, "ghcr.io/noomesh/ollama:v0.6.29": true}
+	})
 	r.SetNodeFacts(func() map[string]any { return s.facts })
 	r.caps = &s.caps
 	return r

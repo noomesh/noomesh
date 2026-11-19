@@ -56,13 +56,14 @@ never a mystery.
 **Before a GPU llama.cpp is placed.** llama.cpp on a GPU runs a CUDA
 image of about 2.6 GB to download and 4 GB on disk. `noo cluster place
 <node> llamacpp <model>` checks that the node has room for it first, unless
-the node already has the image. A node that is short is refused, with its
-free space and the space the image needs. To make room, run noo's own
+the node already has the image. A node that is short and does not have the
+image is refused, with its free space and the space the image needs. To make room, run noo's own
 cleanup on that node: `noo autonomy decisions -l disk_watermark` shows what
 it would free, and `noo autonomy live disk_watermark` lets it act (both
 above). Or run the model on the CPU: add `--on cpu`. `--force` places it
 anyway, and its start then waits on the node until there is room. When noo
-cannot tell (an older node agent, or an image staged by an older noo), the
+cannot tell (an older node agent, which does not say whether it has the
+image or how much room it has, or an image staged by an older noo), the
 placement goes through with a warning instead.
 
 **A WSL2 controller.** The distro's `.vhdx` file on Windows never shrinks by
@@ -167,12 +168,15 @@ the agent's `llamacppOnGPU`), is checked against the staged image it pulls
 | `tar` | the staged tar's size in the controller's store |
 | `unpacked` | `unpacked_bytes` in `staged-images.json`, recorded at stage time from `docker image inspect --format '{{.Size}}'` |
 | `need` | tar + max(unpacked, 2 × tar, tar + 2 GiB) + 512 MiB: the node agent's same-filesystem formula (`image_space.go`), with the real unpacked size when it is larger than the agent's estimate |
-| held | the node's `image_sources` has a row with the staged image ID, or (an ID unknown on either side) the same ref: no check |
+| held | the node's `held_images` maps the staged ref to `true`, or its `image_sources` has a row with the staged image ID, or (an ID unknown on either side) the same ref: no check |
+| not held | `held_images` maps the staged ref to `false` (the agent inspected it; Docker does not have it) |
+| unknown | neither: no `held_images`, or none for that ref (an older agent, or one on another release tag) |
 
 | case | answer |
 |---|---|
 | held, llamacpp on cpu, another backend, nothing staged, the node's arch unknown | not judged |
-| `free` and `need` known, `free < need` | 409; the message names the node, the image, `free` and the need as tar + load + margin, in MiB, then `noo autonomy decisions -l disk_watermark` / `noo autonomy live disk_watermark`, then `--on cpu` |
+| not held, `free` and `need` known, `free < need` | 409; the message starts `<node> has <free> in its image store and does not hold <image>, which needs <need>`, where free reads `<X> GB free` and need reads `about <Y> GB to pull and unpack (tar <A> + unpacked <B> + margin <C>; …`, Y being A + B + C (each rounded up to 0.1 GB; the unpacked part is the larger of the recorded size and the agent's estimate), then `noo autonomy decisions -l disk_watermark` / `noo autonomy live disk_watermark`, then `--on cpu` |
+| unknown, `free < need` | placed; one warning in `warnings` with the same numbers, saying `whether the node already holds it is unknown` |
 | the same with `force: true` | placed; the refusal is in `warnings`, prefixed `forced past a disk shortfall:` |
 | `image_store_free_bytes` absent (an older agent, or a disk it could not read) | placed; one warning in `warnings` |
 | `unpacked_bytes` absent (staged by an older noo) | placed; one warning naming `noo cluster sync-images <node> -i <image>`, which restages it and records the size |
