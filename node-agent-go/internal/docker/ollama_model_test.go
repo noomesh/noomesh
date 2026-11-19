@@ -8,9 +8,14 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"io/fs"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -213,5 +218,177 @@ func TestConvertDirIsNotRootLevelAndEntriesAreOwnedByTheImageUser(t *testing.T) 
 	}
 	if got := convertCleanupCmd(); got[len(got)-1] != convertDir {
 		t.Errorf("cleanup targets %v, want %s", got, convertDir)
+	}
+}
+
+// ── copies into noo-ollama carry their owner in the tar, not CopyUIDGID ──
+//
+// rc.4: with CopyUIDGID the daemon resolves the container's Config.User
+// through a passwd lookup; the image's `USER 65532:65532` is taken whole as a
+// name and the copy fails ("getent unable to find entry \"65532:65532\" in
+// passwd database"). Without it the daemon's untar chowns each entry to its
+// tar header's uid/gid, so every header must name the owner.
+
+// archiveCopy is one PUT /containers/<name>/archive the fake daemon saw.
+type archiveCopy struct {
+	query map[string][]string
+	body  []byte
+}
+
+// newCopyCaptureDaemon fakes the Docker API for noo-ollama: running, its
+// store mounted at ollamaOursStore, every exec exiting 0, and every archive
+// copy recorded.
+func newCopyCaptureDaemon(t *testing.T) (*Client, func() []archiveCopy) {
+	t.Helper()
+	var mu sync.Mutex
+	var copies []archiveCopy
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		switch {
+		case strings.HasSuffix(p, "/_ping"):
+			w.Header().Set("API-Version", "1.45")
+			_, _ = w.Write([]byte("OK"))
+		case r.Method == http.MethodGet && strings.HasSuffix(p, "/containers/"+OllamaContainer+"/json"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"Id":"c1","Name":"/` + OllamaContainer + `","State":{"Status":"running","Running":true},"Mounts":[{"Type":"volume","Destination":"` + ollamaOursStore + `"}]}`))
+		case r.Method == http.MethodPut && strings.HasSuffix(p, "/containers/"+OllamaContainer+"/archive"):
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			copies = append(copies, archiveCopy{query: r.URL.Query(), body: body})
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasSuffix(p, "/containers/"+OllamaContainer+"/exec"):
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"Id":"e1"}`))
+		case r.Method == http.MethodPost && strings.HasSuffix(p, "/exec/e1/start"):
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			conn, buf, err := hj.Hijack()
+			if err != nil {
+				return
+			}
+			_, _ = buf.WriteString("HTTP/1.1 101 UPGRADED\r\nContent-Type: application/vnd.docker.raw-stream\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n")
+			_ = buf.Flush()
+			_ = conn.Close()
+		case r.Method == http.MethodGet && strings.HasSuffix(p, "/exec/e1/json"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ID":"e1","Running":false,"ExitCode":0}`))
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"message":"not faked: ` + r.Method + " " + p + `"}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("DOCKER_HOST", "tcp://"+strings.TrimPrefix(srv.URL, "http://"))
+	c, err := NewClient(http.DefaultClient, "http", "test", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c, func() []archiveCopy {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]archiveCopy(nil), copies...)
+	}
+}
+
+// checkCopyOwnedBy asserts the copy did not ask for CopyUIDGID and that every
+// entry in its archive is owned by uid:uid.
+func checkCopyOwnedBy(t *testing.T, cp archiveCopy, uid int, wantEntries int) {
+	t.Helper()
+	if v, ok := cp.query["copyUIDGID"]; ok {
+		t.Errorf("the copy asked for copyUIDGID=%v; the daemon would look up the image's USER as a passwd name and fail", v)
+	}
+	tr := tar.NewReader(bytes.NewReader(cp.body))
+	n := 0
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read the copied tar: %v", err)
+		}
+		n++
+		if h.Uid != uid || h.Gid != uid {
+			t.Errorf("entry %q owned %d:%d, want %d:%d (the daemon chowns to the header)", h.Name, h.Uid, h.Gid, uid, uid)
+		}
+	}
+	if n != wantEntries {
+		t.Errorf("the copied tar has %d entries, want %d", n, wantEntries)
+	}
+}
+
+func TestWriteManifestCopyCarriesTheOwnerWithoutCopyUIDGID(t *testing.T) {
+	c, copies := newCopyCaptureDaemon(t)
+	mw, err := c.writeManifestContainer(t.Context(), "library", "qwen2.5", "0.5b", []byte(`{"schemaVersion":2}`))
+	if err != nil {
+		t.Fatalf("writeManifestContainer: %v", err)
+	}
+	if mw != nil && mw.commit != nil {
+		mw.commit()
+	}
+	got := copies()
+	if len(got) != 1 {
+		t.Fatalf("want one archive copy, got %d", len(got))
+	}
+	checkCopyOwnedBy(t, got[0], ollamaStoreUID, 1)
+}
+
+func TestOllamaCreateCopyCarriesTheOwnerWithoutCopyUIDGID(t *testing.T) {
+	c, copies := newCopyCaptureDaemon(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "m.Modelfile"), []byte("FROM ./w.gguf\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "w.gguf"), []byte("weights"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ollamaCreateInContainer(t.Context(), dir, "m", "m.Modelfile", "w.gguf"); err != nil {
+		t.Fatalf("ollamaCreateInContainer: %v", err)
+	}
+	got := copies()
+	if len(got) != 1 {
+		t.Fatalf("want one archive copy, got %d", len(got))
+	}
+	checkCopyOwnedBy(t, got[0], convertOwner, 3)
+}
+
+// Source guard: no CopyUIDGID: true in the agent's non-test code. The daemon
+// resolves the container's USER through passwd for it, and our hardened
+// images run as a numeric `USER 65532:65532` that has no passwd entry, so the
+// copy fails on a real daemon. Put the owner in the tar headers instead.
+func TestNoCopyUIDGIDInAgentCode(t *testing.T) {
+	re := regexp.MustCompile(`CopyUIDGID\s*:\s*true`)
+	root := ".." // node-agent-go/internal
+	walked := 0
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(p, ".go") || strings.HasSuffix(p, "_test.go") {
+			return nil
+		}
+		walked++
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		for i, line := range strings.Split(string(b), "\n") {
+			if re.MatchString(line) {
+				t.Errorf("%s:%d sets CopyUIDGID: true — the daemon looks the image's numeric USER up as a passwd name and the copy fails; set Uid/Gid in the tar headers instead", p, i+1)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if walked < 10 {
+		t.Fatalf("the guard walked %d files under %s; it is not reading the agent's code", walked, root)
 	}
 }
