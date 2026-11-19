@@ -1269,7 +1269,7 @@ pub(crate) fn image_sources_check(n: &Value) -> Option<Check> {
     Some(warn(
         "image sources",
         format!("not from the artifact rail: {}", list.join(", ")),
-        Some(if release_pinned(n, first) {
+        Some(if false {
             pinned_remedy(first)
         } else {
             format!("noo cluster sync-images {id} -i {first}   # stage it; the agent takes the rail copy on its next start")
