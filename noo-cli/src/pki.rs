@@ -1778,6 +1778,14 @@ impl ClusterCa {
         extra_ips: &[String],
         role: &NodeRole,
     ) -> Result<(PathBuf, PathBuf), String> {
+        // i1074: a worker named like a SAN every leaf (or the controller's)
+        // carries would match any of them; never mint one.
+        if matches!(role, NodeRole::Worker) {
+            let controller = if crate::role::detect().controller.is_some() { ControllerNames::declared().dns } else { Vec::new() };
+            if let Some(why) = reserved_worker_name(node_id, &controller) {
+                return Err(why);
+            }
+        }
         let node_dir = self.dir.join("nodes").join(node_id);
         let crt_path = node_dir.join("node.crt");
         let mut dns: Vec<String> = vec![node_id.into(), "localhost".into()];
@@ -3785,5 +3793,55 @@ mod sha1_kat_tests {
         let hex = |b: Vec<u8>| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
         assert_eq!(hex(super::sha1_of(b"abc")), "a9993e364706816aba3e25717850c26c9cd0d89d");
         assert_eq!(hex(super::sha1_of(b"")), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+    }
+}
+
+/// The names every node leaf carries as DNS SANs (`issue_node_cert`), so no
+/// node may be called that: a node named `node-agent` would match any leaf
+/// by name (i1074, 97's second read).
+pub const RESERVED_NODE_NAMES: &[&str] = &["localhost", "node-agent"];
+
+/// Why `node` may not be a WORKER's name, if it may not: one of
+/// [`RESERVED_NODE_NAMES`], or one of the controller's own names
+/// (`controller_dns`, which only the controller's leaf carries).
+pub fn reserved_worker_name(node: &str, controller_dns: &[String]) -> Option<String> {
+    let n = node.trim();
+    if RESERVED_NODE_NAMES.iter().any(|r| r.eq_ignore_ascii_case(n)) {
+        return Some(format!(
+            "'{n}' is a name every node certificate carries ({}): a node called that would match any of them. Enroll it under another name",
+            RESERVED_NODE_NAMES.join(", ")
+        ));
+    }
+    if controller_dns.iter().any(|d| d.eq_ignore_ascii_case(n)) {
+        return Some(format!("'{n}' is one of the controller's own names: no worker certificate may carry it. Enroll it under another name"));
+    }
+    None
+}
+
+#[cfg(test)]
+mod reserved_name_tests {
+    use super::*;
+
+    #[test]
+    fn a_worker_may_not_take_a_san_every_leaf_carries_or_a_controller_name() {
+        let ctl = vec!["noo-controller".to_string(), "noo-controller.example.ts.net".to_string()];
+        for n in ["localhost", "LocalHost", "node-agent", " node-agent "] {
+            assert!(reserved_worker_name(n, &ctl).is_some(), "{n:?} must be refused");
+        }
+        assert!(reserved_worker_name("noo-controller", &ctl).is_some());
+        assert!(reserved_worker_name("NOO-CONTROLLER.example.ts.net", &ctl).is_some());
+        assert!(reserved_worker_name("node-b", &ctl).is_none());
+        assert!(reserved_worker_name("node-agent-2", &ctl).is_none(), "only the exact names");
+    }
+
+    /// The refusal sits at the one place every leaf is minted, before a file is written.
+    #[test]
+    fn issuing_a_worker_leaf_refuses_a_reserved_name_first() {
+        let src = include_str!("pki.rs");
+        let code = &src[..src.find("mod reserved_name_tests").expect("tests")];
+        let body = &code[code.find("pub fn issue_node_cert(").expect("fn")..];
+        let check = body.find("reserved_worker_name(node_id, &controller)").expect("the check");
+        let write = body.find("let node_dir = self.dir.join(\"nodes\")").expect("the first write");
+        assert!(check < write);
     }
 }
