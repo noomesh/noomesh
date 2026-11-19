@@ -71,7 +71,7 @@ func ollamaTransport(base string) (*http.Transport, error) {
 		}
 		return containerdial.ApplyDial(tr), nil
 	}
-	return containerdial.ApplyDial(&http.Transport{Proxy: nil, MaxIdleConnsPerHost: 2, IdleConnTimeout: 30 * time.Second}), nil
+	return &http.Transport{Proxy: nil, MaxIdleConnsPerHost: 2, IdleConnTimeout: 30 * time.Second}, nil
 }
 
 // mirrorRef is a staged registry tag, resolved.
