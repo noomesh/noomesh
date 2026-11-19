@@ -35,6 +35,9 @@ on:
       cells:
         description: 'all (every fresh-install cell and the upgrade cell), fresh (the fresh-install cells only) or upgrade (the upgrade cell only)'
         default: all
+      prev_tag:
+        description: 'upgrade cell only: the final to install before the roll (noo-cli-vX.Y.Z); empty = the newest final below the release under test'
+        default: ''
   schedule:
     - cron: '13 2 * * *'   # 02:13 UTC, away from the merge-queue peak
   push:
@@ -215,6 +218,7 @@ jobs:
           CELL: upgrade-24.04
           RUNNER: ubuntu-24.04
           CLI_TAG: ${{ inputs.cli_tag || 'latest' }}
+          UPGRADE_PREV: ${{ inputs.prev_tag }}
           # read-only: the releases list (the previous final); never written
           GH_TOKEN: ${{ github.token }}
         run: bash scripts/install-cell/upgrade.sh

@@ -71,6 +71,12 @@ REPO="$(printf '%s' "$LINE" | sed -nE 's#.*github\.com/([^/]+/[^/]+)/releases/.*
 [ -n "$REPO" ] || { step resolve-previous 10 -- sh -c 'echo "upgrade-cell: no install line naming a github repo in README.md"; exit 1'; finish; }
 step resolve-previous 60 -- python3 "$HERE/upgrade_judge.py" resolve "$REPO" "$CLI_TAG" "$J/prev" "$J/target" || finish
 PREV="$(cat "$J/prev")"; TARGET="$(cat "$J/target")"
+# An explicit previous final (the gen-1 path from an older final, e.g. 0.6.26):
+# the release under test stays the resolved one; only the start point moves.
+if [ -n "${UPGRADE_PREV:-}" ]; then
+    case "$UPGRADE_PREV" in noo-cli-v[0-9]*.[0-9]*.[0-9]*) ;; *) step resolve-previous-override 10 -- sh -c "echo 'upgrade-cell: UPGRADE_PREV is not noo-cli-vX.Y.Z: $UPGRADE_PREV'; exit 1"; finish ;; esac
+    echo "previous final overridden: $UPGRADE_PREV (resolved: $PREV)"; PREV="$UPGRADE_PREV"; echo "$PREV" > "$J/prev"
+fi
 meta upgrade "$PREV -> $TARGET"
 
 # ── 2. install the previous final the README's way, onboard ─────────────────
@@ -167,7 +173,9 @@ export J JR SELF ROLL_T0 OUT
 # import-only tag (startOllamaImport -> PullOllamaModel -> importMirror).
 # Bounded: fetch 900 s, place 300 s, the wait I1_WAIT (+120 s slack).
 I1_MODEL="qwen2.5:0.5b"
-I1_WAIT=600
+# 25 min: the first verify pass after an import hashes every placed model
+# (onboard's 4.6 GB one too) under nice on a 2-vCPU runner.
+I1_WAIT=1500
 echo "$I1_MODEL" > "$J/i1-model"
 # An install from the previous final has a store its operator cannot write
 # (0.6.28 grants the ACL at onboard only; an upgrade grants nothing silently
@@ -211,6 +219,11 @@ if step i1-fetch 900 -- bash -c '
         [ "$(date +%s)" -ge "$end" ] && { echo "waited ${wait}s"; break; }
         sleep 15
       done
+      # Kept (redacted, already): the agent verify, import and dial lines,
+      # so a missing `ollama models` row can be explained from the artifact.
+      grep -E "ollama_verify|ollama\.verify|reconcile\.ollama|ollama mirror import|ollama_import_|containerdial|lookup noo-stunnel|no such host" "$JR/i1.journal" \
+        | cut -c1-400 | tail -n 200 > "$J/i1-agent.txt"
+      echo "agent lines kept: $(wc -l < "$J/i1-agent.txt")"
       grep -E "ollama mirror import|ollama_import_|lookup noo-stunnel|no such host" "$JR/i1.journal" | tail -n 5 | cut -c1-400
       grep -m1 -F "$model" "$J/i1-tags.txt"; true' \
       i1 "$I1_MODEL" "$I1_T0" "$CELL_PY" "$HERE/upgrade_judge.py" "$I1_WAIT"
