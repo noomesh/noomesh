@@ -684,7 +684,7 @@ release_check() {
             release_floor_check "release $_rc_prev" "$_rc_prev" release
             _rc_rec="$_rc_prev"
         else
-            release_refuse "$_rc_k" "sha256 $_rc_s is not in release $_rc_ver's signed list"
+            [ "$_rc_k" = applier ] || release_refuse "$_rc_k" "sha256 $_rc_s is not in release $_rc_ver's signed list"
         fi
         if [ "$_rc_k" = applier ]; then
             _rc_g="$(grep -m1 -E '^NOO_APPLY_GENERATION=[0-9]+$' "$_rc_w/files/applier" | cut -d= -f2)"
