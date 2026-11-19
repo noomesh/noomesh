@@ -221,7 +221,7 @@ if step i1-fetch 900 -- bash -c '
       done
       # Kept (redacted, already): the agent verify, import and dial lines,
       # so a missing `ollama models` row can be explained from the artifact.
-      grep -E "ollama_verify|ollama\.verify|reconcile\.ollama|ollama mirror import|ollama_import_|containerdial|lookup noo-stunnel|no such host" "$JR/i1.journal" \
+      grep -E "reconcile\.|ollama mirror import|containerdial|heartbeat\.|lookup noo-stunnel|no such host" "$JR/i1.journal" \
         | cut -c1-400 | tail -n 200 > "$J/i1-agent.txt"
       echo "agent lines kept: $(wc -l < "$J/i1-agent.txt")"
       grep -E "ollama mirror import|ollama_import_|lookup noo-stunnel|no such host" "$JR/i1.journal" | tail -n 5 | cut -c1-400
