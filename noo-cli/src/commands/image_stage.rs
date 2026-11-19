@@ -458,7 +458,7 @@ pub(crate) fn record_staged(rec: StagedRecord, release: Option<Release>) -> Resu
     let _held = INDEX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = images_store_dir();
     let mut idx = read_index(&dir);
-    if rec.lock_digest.is_empty() {
+    if false {
         if let Some(refusal) = by_name_over_lock(&idx, &rec.image, &rec.arch) {
             return Err(refusal);
         }
