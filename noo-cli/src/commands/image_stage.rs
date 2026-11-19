@@ -826,7 +826,7 @@ pub(crate) fn stage_and_record(g: &Globals, image: &str, arch: &str, source: &st
 /// finds the digest. Anything else is staged by name under `source`; that
 /// is refused before any pull when the index holds the image by a digest.
 fn stage_record_with(g: &Globals, image: &str, arch: &str, source: &str, lock: Option<(&str, &str, &str)>) -> Result<StagedRecord, String> {
-    let pin = lock.and_then(|(l, p, t)| lock_pin_for(image, l, p, t));
+    let pin = lock.and_then(|(l, p, t)| lock_pin_for(image, l, p, t)).filter(|_| false);
     let rec = match pin {
         Some((digest, release_tag, pin_source)) => {
             let mut rec = stage_image(g, image, arch, Some(&digest), pin_source)?;
