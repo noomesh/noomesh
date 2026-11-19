@@ -447,6 +447,11 @@ async fn bootstrap_token_create(
                 "node_name must be <= 64 chars of [a-zA-Z0-9._-]".into(),
             ));
         }
+        if reserved_node_name(n) {
+            return Err(AppError::BadRequest(format!(
+                "node_name '{n}' is a name every node certificate carries (localhost, node-agent): a node called that would match any of them. Choose another name"
+            )));
+        }
     }
 
     let allowed_cidr = body
@@ -2370,5 +2375,35 @@ mod tests {
         }
         assert!(!src.contains(&["\"NOO_BOOTSTRAP_", "ACCEPT_UNSIGNED_FETCH\""].concat()),
             "the retired gate must not be read again");
+    }
+}
+
+/// The DNS SANs every node leaf carries (noo-cli `RESERVED_NODE_NAMES`): no
+/// token may bind a node to one, since a node so named would match any leaf
+/// by name (i1074). The controller's own names are refused where the leaf is
+/// minted (noo-cli `reserved_worker_name`), which knows them.
+pub(crate) fn reserved_node_name(n: &str) -> bool {
+    ["localhost", "node-agent"].iter().any(|r| r.eq_ignore_ascii_case(n.trim()))
+}
+
+#[cfg(test)]
+mod reserved_node_name_tests {
+    use super::reserved_node_name;
+
+    #[test]
+    fn a_token_never_binds_a_san_every_leaf_carries() {
+        for n in ["localhost", "LOCALHOST", "node-agent"] {
+            assert!(reserved_node_name(n), "{n}");
+        }
+        for n in ["node-b", "node-agent-2", "localhost2"] {
+            assert!(!reserved_node_name(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn minting_a_token_checks_the_bound_name() {
+        let src = include_str!("bootstrap.rs");
+        let code = &src[..src.find("mod reserved_node_name_tests").expect("tests")];
+        assert!(code.contains("if reserved_node_name(n) {"), "the mint must refuse a reserved name");
     }
 }
