@@ -3072,15 +3072,24 @@ pub(crate) fn agent_metrics_check(nodes: &[(String, String)], up: Option<&Value>
 /// ("bad certificate"): imports, logs, the Prometheus scrape. The usual cause
 /// is a leaf issued from the address the gateway saw at enrollment (a proxy,
 /// Docker Desktop's forwarder or a hairpin) while the node reports its own.
-/// No row when the leaf covers it or cannot be read here.
+/// No row when the leaf covers it. A leaf this controller cannot read is a
+/// WARN ("cannot be checked"), never silence: no row must mean "covered".
 ///
 /// The remedy issues a leaf for `host`, so it is given only when no OTHER
 /// node claims that address (`other`: its registered or dialed address, or a
 /// SAN in its leaf). A leaf for another node's address would let this node
 /// answer as that one; then it is a finding to investigate, with no remedy.
 pub(crate) fn agent_cert_check(id: &str, host: &str, covers: Option<bool>, other: Option<&str>) -> Option<Check> {
-    if covers != Some(false) {
-        return None;
+    match covers {
+        Some(true) => return None,
+        None => {
+            return Some(warn(
+                "agent certificate",
+                format!("{id}: cannot be checked: its certificate could not be read here (pki/nodes/{id}/node.crt in the controller's PKI dir), so whether it covers the address the controller dials it at ({host}) is unknown"),
+                Some("noo security pki status   # shows each node's leaf; run verify as a user that can read the controller's PKI dir".to_string()),
+            ))
+        }
+        Some(false) => {}
     }
     Some(match other {
         Some(other) => Check {
@@ -17058,8 +17067,16 @@ mod agent_cert_tests {
     }
 
     #[test]
-    fn no_row_when_the_leaf_covers_it_or_cannot_be_read() {
+    fn no_row_only_when_the_leaf_covers_it() {
         assert!(agent_cert_check("node-b", "192.0.2.41", Some(true), None).is_none());
-        assert!(agent_cert_check("node-b", "192.0.2.41", None, None).is_none());
+    }
+
+    /// An unreadable leaf is said, never silent: no row must mean "covered".
+    #[test]
+    fn an_unreadable_leaf_is_a_warning_not_silence() {
+        let row = agent_cert_check("node-b", "192.0.2.41", None, None).expect("a row, not silence");
+        assert_eq!(row.verdict, Verdict::Warn);
+        assert!(row.detail.contains("node-b: cannot be checked") && row.detail.contains("(192.0.2.41)"), "{}", row.detail);
+        assert!(row.remedy.as_deref().unwrap().contains("noo security pki status"));
     }
 }
