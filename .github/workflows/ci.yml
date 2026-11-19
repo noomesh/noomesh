@@ -2148,8 +2148,6 @@ jobs:
     - name: Base vs ours, packages, size and Trivy findings (report only)
       continue-on-error: true
       env:
-        TRIVY_VERSION: "0.70.0"
-        TRIVY_SHA256: "8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9"
         IMAGE: noomesh-llamacpp-cuda:${{ github.sha }}
       run: |
         set -euo pipefail
@@ -2163,11 +2161,9 @@ jobs:
         docker run --rm --entrypoint dpkg-query "$base" -W -f '${Package}\n' | sort > "$r/base.pkgs"
         docker run --rm --entrypoint dpkg-query "$IMAGE" -W -f '${Package}\n' | sort > "$r/ours.pkgs"
         size() { docker image inspect -f '{{.Size}}' "$1" | awk '{printf "%.0f MB", $1 / 1000000}'; }
-        dir="$RUNNER_TEMP/trivy-bin"; mkdir -p "$dir"
-        curl -fsSL --retry 3 -o "$dir/trivy.tgz" \
-          "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
-        echo "${TRIVY_SHA256}  $dir/trivy.tgz" | sha256sum -c -
-        tar -xzf "$dir/trivy.tgz" -C "$dir" trivy
+        # The one Trivy pin (scripts/infra-scan.sh: version + sha256-verified).
+        scripts/infra-scan.sh install-trivy
+        dir="$RUNNER_TEMP/trivy-bin"
         "$dir/trivy" image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --format json \
           -o "$r/base/linux-amd64.json" "$base"
         "$dir/trivy" image --skip-db-update --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --format json \
