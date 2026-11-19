@@ -522,7 +522,7 @@ func dirTar(dir string, names []string) (*bytes.Buffer, error) {
 	if err := tw.WriteHeader(&tar.Header{
 		Name:     root + "/",
 		Mode:     0o755,
-		Uid:      convertOwner,
+		Uid:      0,
 		Gid:      convertOwner,
 		Typeflag: tar.TypeDir,
 		ModTime:  time.Unix(0, 0),
