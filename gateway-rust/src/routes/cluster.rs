@@ -428,7 +428,6 @@ const I300_BEAT_KEYS: &[(&str, BeatShape)] = &[
     // dockerd | docker-desktop | podman), `{state: none}` (no Docker) or
     // `{state: unreadable, error}`; read by the `docker engine` verify row.
     // Absent is an agent that predates it.
-    ("docker_engine", BeatShape::StateObject(&["ok", "none", "unreadable"])),
 ];
 
 fn beat_shape_ok(v: &Value, shape: BeatShape) -> bool {
