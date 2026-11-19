@@ -688,6 +688,24 @@ fn server_from_yaml(id: &str, v: &serde_json::Value) -> serde_json::Value {
 
 /// `noo mcp import [<file>] [--dry-run]` — upsert every server + placement
 /// from a YAML file (default config/mcp-servers.yaml).
+///
+/// The create is switched to an update only when the gateway said THIS id is
+/// already registered: `POST /api/mcp/servers` answers 400 with
+/// `{"error":"server '<id>' already exists — …"}` (a 409 is accepted too).
+/// The 400 is shared with every validation refusal, whose text can echo the
+/// user's own spec or note, so the sentence must START with the id the CLI
+/// sent; "already exists" anywhere else is a failed register.
+fn server_already_registered(e: &crate::http::TryFail, id: &str) -> bool {
+    match e.status {
+        Some(409) => true,
+        Some(400) => serde_json::from_str::<serde_json::Value>(&e.body)
+            .ok()
+            .and_then(|v| v["error"].as_str().map(str::to_string))
+            .is_some_and(|m| m.starts_with(&format!("server '{id}' already exists"))),
+        _ => false,
+    }
+}
+
 pub fn mcp_import(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut file = std::path::PathBuf::from("config/mcp-servers.yaml");
     let mut dry = false;
@@ -715,16 +733,16 @@ pub fn mcp_import(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             println!("{}", ui::status_line(Glyph::Step, &format!("would register {id}: {body}")));
         } else {
             // Create, or update the mutable half if it already exists.
-            match crate::http::post_json_try(g, "/api/mcp/servers", &body, true, 15) {
+            match crate::http::post_json_status_try(g, "/api/mcp/servers", &body, true, 15) {
                 Ok(_) => { ui::done(&format!("{id}: registered")); ok += 1; }
-                Err(e) if e.contains("already exists") => {
+                Err(e) if server_already_registered(&e, id) => {
                     let upd = json!({ "spec": body["spec"], "kind": body["kind"], "audience": body["audience"], "note": body["note"], "enabled": body["enabled"] });
                     match crate::http::put_json_try(g, &format!("/api/mcp/servers/{}", super::urlencode(id)), &upd, true, 15) {
                         Ok(_) => { ui::done(&format!("{id}: updated")); ok += 1; }
                         Err(e) => { println!("{}", ui::status_line(Glyph::Err, &format!("{id}: update failed ({e})"))); failed += 1; }
                     }
                 }
-                Err(e) => { println!("{}", ui::status_line(Glyph::Err, &format!("{id}: register failed ({e})"))); failed += 1; continue; }
+                Err(e) => { println!("{}", ui::status_line(Glyph::Err, &format!("{id}: register failed ({})", e.line))); failed += 1; continue; }
             }
         }
         for node in v["placements"].as_array().into_iter().flatten().filter_map(|n| n.as_str()) {
@@ -791,6 +809,25 @@ pub fn mcp_export(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Import switches POST to PUT only when the gateway said this id is
+    /// already registered; a validation 400 that echoes a note saying
+    /// "already exists" is a failed register, not an update.
+    #[test]
+    fn only_this_ids_already_exists_switches_import_to_an_update() {
+        use crate::http::TryFail;
+        let echoed = TryFail::from_status(
+            400,
+            r#"{"error":"spec.command must be an absolute path (note: 'the server already exists on the old box')"}"#,
+        );
+        assert!(!server_already_registered(&echoed, "files"), "a user note echoed in a 400 is not a conflict");
+        let other = TryFail::from_status(400, r#"{"error":"server 'files-old' already exists — `noo mcp server show files-old` or update it"}"#);
+        assert!(!server_already_registered(&other, "files"), "another id's conflict is not this one");
+        let mine = TryFail::from_status(400, r#"{"error":"server 'files' already exists — `noo mcp server show files` or update it"}"#);
+        assert!(server_already_registered(&mine, "files"));
+        assert!(server_already_registered(&TryFail::from_status(409, "{}"), "files"), "a 409 is a conflict");
+        assert!(!server_already_registered(&TryFail::local("server 'files' already exists"), "files"), "no status, no update");
+    }
 
     #[test]
     fn parses_plain_json_response() {

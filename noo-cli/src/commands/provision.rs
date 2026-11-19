@@ -4458,21 +4458,29 @@ pub(crate) const POKE_RETRY_WINDOW_SECS: u64 = 60;
 pub(crate) const POKE_RETRY_STEP_SECS: u64 = 10;
 
 /// Is this submit failure the gateway's "not yet" rather than a verdict?
-/// The gateway answers 503 with `{"error":"redis_reconnecting"}` while its
-/// Redis client reconnects (older gateways: a bare 500 naming Redis). Any
-/// other status is an answer (bad body, auth, unknown node) and is not
-/// retried. The text is what `post_json_try` hands back: the `detail` field
-/// when there is one, else `HTTP <status>: <body>`.
-pub(crate) fn poke_is_transient(err: &str) -> bool {
-    let lower = err.to_ascii_lowercase();
-    lower.starts_with("http 503") || lower.contains("redis")
+/// The gateway answers 503 with the code `{"error":"redis_reconnecting"}`
+/// while its Redis client reconnects; older gateways answered a bare
+/// `500 {"error":"Redis not connected"}`. Any other status is an answer
+/// (bad body, auth, unknown node) and is not retried.
+///
+/// Decided on the typed status and the body's exact `error` field, never on
+/// a substring of the text: "redis" can be part of a node or host name the
+/// error echoes, and a random ref can hold "503".
+pub(crate) fn poke_is_transient(err: &crate::http::TryFail) -> bool {
+    let doc = serde_json::from_str::<serde_json::Value>(&err.body).ok();
+    let code = doc.as_ref().and_then(|v| v["error"].as_str()).unwrap_or("");
+    match err.status {
+        Some(503) => code == "redis_reconnecting",
+        Some(500) => code.starts_with("Redis not connected"),
+        _ => false,
+    }
 }
 
 pub(crate) fn poke_fetch(g: &Globals, node: &str) -> bool {
     let body = poke_fetch_body(node);
     let started = std::time::Instant::now();
     loop {
-        match crate::http::post_json_try(g, "/api/jobs/submit", &body, true, 10) {
+        match crate::http::post_json_status_try(g, "/api/jobs/submit", &body, true, 10) {
             Ok(v) if v.get("error").is_none() => {
                 nstep(&format!("poked {node} over the bus to fetch now (job {})",
                     v.get("job_id").or_else(|| v.get("id")).and_then(|j| j.as_str()).unwrap_or("queued")));
@@ -4485,12 +4493,12 @@ pub(crate) fn poke_fetch(g: &Globals, node: &str) -> bool {
                 return false;
             }
             Err(e) if poke_is_transient(&e) && started.elapsed().as_secs() + POKE_RETRY_STEP_SECS <= POKE_RETRY_WINDOW_SECS => {
-                nstep(&format!("poke not taken yet ({e}) — retrying in {POKE_RETRY_STEP_SECS}s"));
+                nstep(&format!("poke not taken yet ({}) — retrying in {POKE_RETRY_STEP_SECS}s", e.line));
                 std::thread::sleep(std::time::Duration::from_secs(POKE_RETRY_STEP_SECS));
             }
             Err(e) => {
                 warn_line(&format!(
-                    "poke failed ({e}) — {node} will only fetch on its own timer, up to about 5 minutes"));
+                    "poke failed ({}) — {node} will only fetch on its own timer, up to about 5 minutes", e.line));
                 return false;
             }
         }
@@ -5083,16 +5091,34 @@ mod cli_asset_refill_tests {
 #[cfg(test)]
 mod poke_fetch_tests {
     use super::{poke_fetch_body, poke_is_transient, POKE_EXPIRE_AFTER_SEC, POKE_RETRY_WINDOW_SECS, POKE_RETRY_STEP_SECS};
+    use crate::http::TryFail;
 
     #[test]
     fn only_the_gateways_not_yet_is_retried() {
-        assert!(poke_is_transient(r#"HTTP 503: {"error":"redis_reconnecting"}"#));
-        assert!(poke_is_transient("Redis not connected"), "an older gateway's bare 500 detail");
-        assert!(poke_is_transient("HTTP 500: Redis not connected"));
-        assert!(!poke_is_transient("HTTP 400: force_node unknown"));
-        assert!(!poke_is_transient("HTTP 401: operator key required"));
-        assert!(!poke_is_transient("connection refused (gateway down?)"), "a transport failure is the gateway wait's job");
+        let reconnecting = TryFail::from_status(
+            503,
+            r#"{"error":"redis_reconnecting","detail":"Redis not connected: this needs the gateway's Redis client, which is not connected yet — retry shortly","retry_after_secs":5}"#,
+        );
+        assert!(poke_is_transient(&reconnecting));
+        assert!(poke_is_transient(&TryFail::from_status(500, r#"{"error":"Redis not connected"}"#)), "an older gateway's bare 500");
+        assert!(!poke_is_transient(&TryFail::from_status(400, r#"{"error":"force_node unknown"}"#)));
+        assert!(!poke_is_transient(&TryFail::from_status(401, r#"{"error":"operator key required"}"#)));
+        assert!(!poke_is_transient(&TryFail::local("connection refused (gateway down?)")), "a transport failure is the gateway wait's job");
         const { assert!(POKE_RETRY_WINDOW_SECS >= POKE_RETRY_STEP_SECS && POKE_RETRY_WINDOW_SECS < 600) };
+    }
+
+    /// A verdict that names a host called "redis-box", or a 500 whose random
+    /// ref holds "503", is an answer, not the gateway's "not yet".
+    #[test]
+    fn a_redis_named_host_or_a_503_in_a_ref_is_not_retried() {
+        let named = TryFail::from_status(400, r#"{"error":"force_node 'redis-box' is not a registered node"}"#);
+        assert!(!poke_is_transient(&named), "a host named redis-box is not Redis reconnecting");
+        let ref_500 = TryFail::from_status(
+            500,
+            r#"{"error":"internal error","detail":"internal error (ref ref-c503aa91f0); the gateway log has the cause","ref":"ref-c503aa91f0"}"#,
+        );
+        assert!(!poke_is_transient(&ref_500), "a 503 inside a ref is not a 503");
+        assert!(!poke_is_transient(&TryFail::local("HTTP 503 from redis-box")), "no status, no retry");
     }
 
     #[test]

@@ -249,10 +249,10 @@ pub fn channels_import(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     for r in take_array(&doc, "recipients") {
         let label = format!("recipient {}:{}", r["channel"].as_str().unwrap_or("?"),
             r["recipient_id"].as_str().unwrap_or("?"));
-        match crate::http::post_json_try(g, "/api/channels/saved-recipients", &r, true, 10) {
+        match crate::http::post_json_status_try(g, "/api/channels/saved-recipients", &r, true, 10) {
             Ok(_) => ok += 1,
-            Err(e) if e.contains("409") || e.contains("already exists") => skipped += 1,
-            Err(e) => failed.push(format!("{label}: {e}")),
+            Err(e) if recipient_already_present(&e) => skipped += 1,
+            Err(e) => failed.push(format!("{label}: {}", e.line)),
         }
     }
     if g.json {
@@ -273,6 +273,38 @@ pub fn channels_import(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ui::guide(&[("noo channels status", "what did land")]);
     }
     Ok(if failed.is_empty() { 0 } else { 1 })
+}
+
+/// Did the gateway refuse a saved-recipient import because the row is
+/// already there? `POST /api/channels/saved-recipients` answers 409
+/// (`AppError::Conflict`) for that, and only the typed status decides it:
+/// "409" or "already exists" inside a body (a random 500 ref, a numeric
+/// recipient id, the recipient's own name) is not a conflict.
+fn recipient_already_present(e: &crate::http::TryFail) -> bool {
+    e.status == Some(409)
+}
+
+#[cfg(test)]
+mod recipient_conflict_tests {
+    use super::recipient_already_present;
+    use crate::http::TryFail;
+
+    /// A failed import whose body holds "409" (a random ref, a recipient id)
+    /// or "already exists" is a failure, not "already present"; only the
+    /// gateway's 409 is.
+    #[test]
+    fn only_a_409_status_counts_a_recipient_as_already_present() {
+        let ref_500 = TryFail::from_status(
+            500,
+            r#"{"error":"internal error","detail":"internal error (ref ref-7a409c1e2b); the gateway log has the cause","ref":"ref-7a409c1e2b"}"#,
+        );
+        assert!(!recipient_already_present(&ref_500), "a 409 inside a ref is not a conflict");
+        let id_400 = TryFail::from_status(400, r#"{"error":"recipient 4409123 already exists in another address book? no: bad channel"}"#);
+        assert!(!recipient_already_present(&id_400), "an id or phrase in a 400 body is not a conflict");
+        assert!(!recipient_already_present(&TryFail::local("cannot reach gateway at https://ctrl:8443: 409 retries")));
+        let conflict = TryFail::from_status(409, r#"{"error":"Recipient already exists for this channel"}"#);
+        assert!(recipient_already_present(&conflict));
+    }
 }
 
 #[cfg(test)]
