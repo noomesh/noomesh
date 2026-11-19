@@ -340,7 +340,11 @@ that follows its chat backend.
 `place` writes a placement to the node's desired config
 (`gpu-2: ollama → qwen2.5:7b-instruct (running) — agent reconciles within
 5 min`; the gateway also nudges the agent at once, so a reachable node
-converges within seconds and 5 min is the fallback); `--stopped` records it without starting, `--port`/`--tls`/`--image`
+converges within seconds and 5 min is the fallback; for an ollama placement
+the agent also re-runs as soon as the container it started answers and again
+when a model import finishes, so `noo cluster verify`'s `ollama models` row
+reads verified about a minute after `place`, plus the import and its first
+byte check); `--stopped` records it without starting, `--port`/`--tls`/`--image`
 pin the container. `desired` shows the node's config row (ip, tier, ssh
 user, data root, models dir, GPU override) and its placements
 (`backend | model | port | tls | desired`). `unplace` removes the record
