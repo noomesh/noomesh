@@ -91,7 +91,7 @@ func engineReport(res client.ServerVersionResult, err error, noDocker func(error
 		if len(msg) > maxEngineErrLen {
 			msg = msg[:maxEngineErrLen]
 		}
-		return map[string]any{"state": EngineStateUnreadable, "error": msg}
+		return map[string]any{"state": EngineStateNone}
 	}
 	v := strings.TrimSpace(res.Version)
 	if v == "" {
