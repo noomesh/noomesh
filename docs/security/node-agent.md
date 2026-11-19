@@ -1318,10 +1318,12 @@ What this does and does not add:
   anything but the requested ref is refused before `docker load`; a loaded
   image that does not resolve under the requested ref, or is built for
   another architecture, is refused before a container starts. Those are
-  VERIFICATION failures: never run, never fallen back from. A TRANSPORT or
-  disk failure (cache unreachable, timeout, no space) with the image already
-  present runs the local copy, reported as `local`, and the rail is not
-  retried for 30 minutes.
+  VERIFICATION failures: never run, never fallen back from. A TRANSPORT
+  failure (cache unreachable, timeout) with the image already present runs
+  the local copy, reported as `local`, and the rail is not retried for 30
+  minutes. Too little disk space (checked before the fetch, or a real
+  ENOSPC) runs a present local copy the same way but is retried on the next
+  reconcile pass.
 - **What this does NOT protect against, said plainly.** The manifest is
   authenticated, not signed: under this design **a compromised gateway (or
   anyone who can write the controller's image store) chooses the bytes

@@ -228,7 +228,8 @@ func TestTransportFailureRunsTheLocalCopyAndBacksOff(t *testing.T) {
 	}
 
 	// Absent + transport failure: an error (nothing to run), also backed off.
-	g := &fakeImageRail{local: map[string]string{}, staged: stagedAt(ownRef, "sha256:new"), railErr: errors.New("no space left on device")}
+	// (A full disk is NOT transport: TestNoSpaceIsNotBackedOff.)
+	g := &fakeImageRail{local: map[string]string{}, staged: stagedAt(ownRef, "sha256:new"), railErr: errors.New("fetch x: dial tcp 192.0.2.1:8443: connect: connection refused")}
 	g.install(t)
 	for i := 0; i < 2; i++ {
 		if err := (&Client{}).EnsureImage(context.Background(), ownRef); err == nil {
