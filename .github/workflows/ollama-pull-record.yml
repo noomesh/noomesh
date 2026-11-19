@@ -158,7 +158,9 @@ jobs:
         daemon: [ runner, docker-27 ]
     env:
       OLLAMA_IMAGE: ghcr.io/${{ github.repository_owner }}/ollama:staged
-      DIND_IMAGE: docker:27-dind
+      # Pinned by digest (docker:27-dind on 2026-11-19); the leg also refuses a
+      # server that is not 27.x, so a stale pin cannot make it prove nothing.
+      DIND_IMAGE: docker:27-dind@sha256:aa3df78ecf320f5fafdce71c659f1629e96e9de0968305fe1de670e0ca9176ce
       DIND_HOST: tcp://127.0.0.1:2375
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -169,6 +171,11 @@ jobs:
         with:
           go-version-file: node-agent-go/go.mod
           cache-dependency-path: node-agent-go/go.sum
+
+      # The staged ollama image is several GB and the docker-27 leg holds it
+      # twice (the runner's daemon and dind's).
+      - name: Free disk
+        run: scripts/ci-free-disk.sh
 
       - name: Per-job Docker credential store and GHCR login
         env:
