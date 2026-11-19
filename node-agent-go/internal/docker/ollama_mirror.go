@@ -397,6 +397,18 @@ func (o *ollamaHTTP) do(ctx context.Context, method, path string, body io.Reader
 	return cl.Do(req)
 }
 
+// Answers is the cheapest exchange with the daemon: GET /api/tags. Any HTTP
+// status is an answer (the path is up); only a failed exchange is an error.
+func (o *ollamaHTTP) Answers(ctx context.Context) error {
+	resp, err := o.do(ctx, http.MethodGet, "/api/tags", nil, 0, 10*time.Second)
+	if err != nil {
+		return err
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	resp.Body.Close()
+	return nil
+}
+
 func (o *ollamaHTTP) HasBlob(ctx context.Context, h string) (bool, error) {
 	resp, err := o.do(ctx, http.MethodHead, "/api/blobs/sha256:"+h, nil, 0, 30*time.Second)
 	if err != nil {
