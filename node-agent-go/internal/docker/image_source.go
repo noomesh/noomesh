@@ -72,12 +72,15 @@ import (
 //
 // A rail pull that fails VERIFICATION (tar sha256, archive contents, loaded
 // image ID, architecture) is a refusal: nothing is run. A pull that fails in
-// TRANSPORT or on DISK (no NOO_MODEL_CACHE_URL, cache unreachable, timeout,
-// staging dir full) while the image is present locally runs the local copy
-// as source "local" with a WARN — the controller being briefly unreachable
-// must not take down a backend the node already holds — and the ref is not
-// retried for railRetryBackoff, so a flaky link does not re-download a
-// multi-GB tar on every reconcile tick.
+// TRANSPORT (no NOO_MODEL_CACHE_URL, cache unreachable, timeout) while the
+// image is present locally runs the local copy as source "local" with a
+// WARN — the controller being briefly unreachable must not take down a
+// backend the node already holds — and the ref is not retried for
+// railRetryBackoff, so a flaky link does not re-download a multi-GB tar on
+// every reconcile tick. A pull refused for DISK SPACE (NoSpaceError: the
+// pre-fetch check, or a real ENOSPC from the fetch or the load) runs a local
+// copy the same way but is NOT backed off: the check is a statfs, so every
+// pass re-asks and the pull starts as soon as space is freed.
 //
 // # The rollout switch
 //
@@ -264,6 +267,16 @@ func (c *Client) resolveImage(ctx context.Context, ref string) (source, imageID 
 		}
 		if err := imageRailPull(ctx, c, ref); err != nil {
 			if IsImageVerification(err) {
+				return "", "", fmt.Errorf("pull %s over the artifact rail: %w", ref, err)
+			}
+			if IsNoSpace(err) {
+				// Not transport: no backoff. The next reconcile pass re-checks
+				// the space (a statfs) and pulls as soon as there is room.
+				if present {
+					slog.Warn("image.rail_no_space: running the local copy; the rail is retried on the next pass",
+						"image", ref, "local", shortImageID(localID), "err", err)
+					return imagesource.Local, localID, nil
+				}
 				return "", "", fmt.Errorf("pull %s over the artifact rail: %w", ref, err)
 			}
 			noteRailFailure(ref, err)

@@ -640,8 +640,10 @@ pub(crate) fn backend_starts_check(id: &str, n: &Value) -> Option<Check> {
     for r in &refusals {
         let reason = r["reason"].as_str().unwrap_or("no reason reported");
         parts.push(format!("{}: {reason}", r["target"].as_str().unwrap_or("?")));
+        let target = r["target"].as_str().unwrap_or("?");
         let remedy = match reason.find(SYNC) {
             Some(i) => reason[i..].split(['`', ';']).next().unwrap_or(SYNC).trim_end().to_string(),
+            None if is_no_space_refusal(reason) => no_space_remedy(id, target),
             None => format!("noo cluster show {id}   # the node's refusal says why"),
         };
         if !remedies.contains(&remedy) {
@@ -649,6 +651,23 @@ pub(crate) fn backend_starts_check(id: &str, n: &Value) -> Option<Check> {
         }
     }
     Some(fail(NAME, format!("{id}: {}", parts.join(" | ")), remedies.join("; ")))
+}
+
+/// The agent's image-pull refusal for disk space: its typed NoSpaceError
+/// (node-agent-go/internal/docker/image_space.go `noSpacePrefix`, keep in
+/// lockstep) or a raw ENOSPC from an older agent.
+fn is_no_space_refusal(reason: &str) -> bool {
+    reason.contains("not enough disk space for image") || reason.contains("no space left on device")
+}
+
+/// The disk remedy for a no-space start refusal; llamacpp can also move to
+/// its smaller CPU image.
+fn no_space_remedy(id: &str, target: &str) -> String {
+    let mut r = format!("on {id}: free space for the image (docker image prune -f on that node; noo cluster show {id})");
+    if target == "llamacpp" {
+        r.push_str(&format!(" or place it on cpu: noo cluster place {id} llamacpp <model> --on cpu"));
+    }
+    r
 }
 
 /// The `agent address` row: a node's agent_url must be https on an explicit
@@ -16838,6 +16857,20 @@ mod backend_starts_tests {
         assert_eq!(c.verdict, Verdict::Fail);
         assert_eq!(c.detail, "node-a: vllm: image pull: unauthorized");
         assert_eq!(c.remedy.as_deref(), Some("noo cluster show node-a   # the node's refusal says why"));
+    }
+
+    #[test]
+    fn a_no_space_start_refusal_gets_the_disk_remedy() {
+        let typed = "pull ghcr.io/x/llamacpp:v1 over the artifact rail: not enough disk space for image ghcr.io/x/llamacpp:v1: Docker's data root (/var/lib/docker) has 900 MiB free; this pull needs 9000 MiB there";
+        let c = backend_starts_check("node-a", &node(json!([{"scope": "backend_start", "target": "llamacpp", "reason": typed}]))).unwrap();
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert_eq!(
+            c.remedy.as_deref(),
+            Some("on node-a: free space for the image (docker image prune -f on that node; noo cluster show node-a) or place it on cpu: noo cluster place node-a llamacpp <model> --on cpu")
+        );
+        let raw = backend_starts_check("node-a", &node(json!([{"scope": "backend_start", "target": "vllm", "reason": "docker load: write /x: no space left on device"}]))).unwrap();
+        assert_eq!(raw.verdict, Verdict::Fail);
+        assert_eq!(raw.remedy.as_deref(), Some("on node-a: free space for the image (docker image prune -f on that node; noo cluster show node-a)"));
     }
 
     #[test]

@@ -1405,6 +1405,9 @@ type artifactManifest struct {
 	SignerCertPEM string `json:"signer_cert_pem"`
 	ImageID       string `json:"image_id"`
 	LockDigest    string `json:"lock_digest"`
+	// SizeBytes is the artifact's size on the controller (the tar, for an
+	// image). 0 from a gateway that does not send it: "unknown".
+	SizeBytes uint64 `json:"size_bytes"`
 }
 
 // fetchArtifactManifest asks the gateway's artifact control plane for the

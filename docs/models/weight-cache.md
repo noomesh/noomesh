@@ -448,9 +448,18 @@ its image through one function (`EnsureImage`):
    left on an older ID would loop) and must match the node's architecture.
    Any of those failing is a **refusal**. A local copy at a *different* ID
    than the staged one is replaced — unless the fetch fails in **transport**
-   (cache unreachable, timeout, disk full): then the local copy runs, logged
+   (cache unreachable, timeout): then the local copy runs, logged
    as `image.rail_transport_failed` and reported `local`, and the rail is
    not retried for 30 minutes.
+   Before fetching, the agent checks free space for the tar (the manifest's
+   `size_bytes`) in its staging dir and for the load in Docker's data root
+   (an estimate: the larger of 2 × the tar or the tar + 2 GiB, plus 512 MiB;
+   the sum when both are one filesystem). A shortfall, or a real "no space
+   left on device", is a `not enough disk space for image …` refusal naming
+   the path, free and needed space; it is **not** backed off, so the start
+   goes ahead on the next reconcile pass after space is freed, and
+   `noo cluster verify`'s `backend starts` row gives the disk remedy. A
+   manifest without `size_bytes` (an older gateway) skips the check.
 3. **Local, nothing to compare** (not staged, an older gateway, controller
    unreachable) → used, and reported as `local`.
 4. **Absent and not staged** → for our images (`$NOO_IMAGE_PREFIX/*`, the
