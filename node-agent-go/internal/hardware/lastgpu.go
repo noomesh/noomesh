@@ -24,6 +24,10 @@ type lastGPU struct {
 	GPUModel string  `json:"gpu_model"`
 	VRAMGB   float64 `json:"vram_gb"`
 	GPUCount int     `json:"gpu_count"`
+
+	// Absent in a file an older agent wrote: one card, as before.
+	VRAMTotalGB float64   `json:"vram_total_gb,omitempty"`
+	GPUVRAMGB   []float64 `json:"gpu_vram_gb,omitempty"`
 }
 
 // LoadLastGPU returns the saved GPU fields as Detect's prev, or nil when
@@ -41,7 +45,8 @@ func LoadLastGPU(dir string) *Capabilities {
 	if json.Unmarshal(b, &g) != nil || (g.GPUModel == "" && g.VRAMGB <= 0) {
 		return nil
 	}
-	return &Capabilities{GPUModel: g.GPUModel, VRAMGB: g.VRAMGB, GPUCount: g.GPUCount}
+	return &Capabilities{GPUModel: g.GPUModel, VRAMGB: g.VRAMGB, GPUCount: g.GPUCount,
+		VRAMTotalGB: g.VRAMTotalGB, GPUVRAMGB: g.GPUVRAMGB}
 }
 
 // SaveLastGPU records c's GPU fields when c came from a complete probe. A
@@ -52,7 +57,8 @@ func SaveLastGPU(dir string, c Capabilities) error {
 	if dir == "" || c.ProbeIncomplete {
 		return nil
 	}
-	b, err := json.Marshal(lastGPU{GPUModel: c.GPUModel, VRAMGB: c.VRAMGB, GPUCount: c.GPUCount})
+	b, err := json.Marshal(lastGPU{GPUModel: c.GPUModel, VRAMGB: c.VRAMGB, GPUCount: c.GPUCount,
+		VRAMTotalGB: c.VRAMTotalGB, GPUVRAMGB: c.GPUVRAMGB})
 	if err != nil {
 		return err
 	}

@@ -613,7 +613,7 @@ func (r *Reporter) SendHeartbeat() {
 	m := r.collector.Collect()
 	clk.mark("metrics")
 
-	gpuModel, vramGB, gpuErr := r.gpuIdentity()
+	gpuModel, vramGB, gpuCards, gpuErr := r.gpuIdentity()
 	r.redetectCaps(gpuErr)
 	clk.mark("gpu_identity")
 	power := hardware.ReadPowerStatus()
@@ -667,6 +667,13 @@ func (r *Reporter) SendHeartbeat() {
 	if gpuErr == nil {
 		payload["gpu_model"] = gpuModel
 		payload["vram_gb"] = vramGB
+		// vram_gb is ONE card; these are every card and their sum, from the
+		// same query. Sent only with a list: without one the gateway budgets
+		// one card, as before.
+		if len(gpuCards) > 0 {
+			payload["gpu_vram_gb"] = gpuCards
+			payload["vram_total_gb"] = hardware.SumVRAM(gpuCards)
+		}
 	}
 	addLoad(payload, m)
 	if m.MemUsedGB == nil {
@@ -1104,7 +1111,9 @@ func (r *Reporter) controlTransports() map[string]bool {
 // the probe's. A failed probe returns an error and the caller omits both keys
 // (the gateway keeps the stored value of an omitted key), instead of
 // reporting "" and 0 for a GPU node. Warns once per change of the error.
-func (r *Reporter) gpuIdentity() (model string, vramGB float64, err error) {
+// cards is each GPU's memory from the same nvidia-smi query; nil with a
+// configured VRAM_GB (one card) or a probe that offers no list.
+func (r *Reporter) gpuIdentity() (model string, vramGB float64, cards []float64, err error) {
 	model = r.cfg.GPUModel
 	if model == "" {
 		m, merr := r.gpu.DetectModel()
@@ -1112,8 +1121,8 @@ func (r *Reporter) gpuIdentity() (model string, vramGB float64, err error) {
 	}
 	vramGB = r.cfg.VRAMGB
 	if vramGB == 0 {
-		v, verr := r.gpu.DetectVRAM()
-		vramGB, err = v, errors.Join(err, verr)
+		v, c, verr := hardware.ProbeVRAMCards(r.gpu)
+		vramGB, cards, err = v, c, errors.Join(err, verr)
 	}
 	if err != nil {
 		if msg := err.Error(); msg != r.gpuProbeErr {
@@ -1121,13 +1130,13 @@ func (r *Reporter) gpuIdentity() (model string, vramGB float64, err error) {
 			slog.Warn("gpu probe failed; heartbeat omits gpu_model and vram_gb so the controller keeps the last value",
 				"error", err)
 		}
-		return "", 0, err
+		return "", 0, nil, err
 	}
 	if r.gpuProbeErr != "" {
 		r.gpuProbeErr = ""
 		slog.Info("gpu probe recovered")
 	}
-	return model, vramGB, nil
+	return model, vramGB, cards, nil
 }
 
 // redetectCaps re-runs hardware.Detect on a beat while the registered

@@ -645,6 +645,11 @@ async fn node_heartbeat(
     if let Some(v) = body.get("cpu_cores") { if !v.is_null() { data["cpu_cores"] = v.clone(); } }
     if let Some(v) = body.get("ram_gb") { if !v.is_null() { data["ram_gb"] = v.clone(); } }
     if let Some(v) = body.get("vram_gb") { if !v.is_null() { data["vram_gb"] = v.clone(); } }
+    // vram_gb is ONE card; every card (gpu_vram_gb) and their sum
+    // (vram_total_gb) budget a placement that splits across GPUs
+    // (placement_fit::gpu_pool_spanning). Omitted = keep the stored value.
+    if let Some(v) = body.get("vram_total_gb") { if !v.is_null() { data["vram_total_gb"] = v.clone(); } }
+    if let Some(v) = body.get("gpu_vram_gb") { if !v.is_null() { data["gpu_vram_gb"] = v.clone(); } }
     // Node-broadcast network identity: geographic/site label and the interface
     // the node published its control API on (surfaced for the eval report +
     // dashboard; see NODE_LOCATION and the H-N5 bind_addr broadcast).
@@ -1263,6 +1268,8 @@ async fn node_register_body(
         "gpu_model": caps.get("gpu_model"),
         "gpu_count": caps.get("gpu_count"),
         "vram_gb": caps.get("vram_gb"),
+        "vram_total_gb": caps.get("vram_total_gb"),
+        "gpu_vram_gb": caps.get("gpu_vram_gb"),
         "cpu_cores": caps.get("cpu_cores"),
         "ram_gb": caps.get("ram_gb"),
         "is_arm": caps.get("is_arm"),

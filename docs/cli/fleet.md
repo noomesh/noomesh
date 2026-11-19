@@ -157,7 +157,13 @@ naming the NVIDIA driver (too old for CUDA 12.9) or a missing CUDA device.
 `noo cluster fit` budgets each placement against its own pool: a gpu
 placement against GPU memory (`vram`, or the `unified` GPU share on Apple
 Silicon), a cpu placement against RAM (on a unified-memory node, the RAM
-the GPU share leaves). A model is sized from, in order: what the node
+the GPU share leaves). On a node with several GPUs, an `ollama` or
+`llamacpp` placement (both split a model across GPUs) is budgeted against
+every card, with the headroom reserved on each card (`across 2 GPUs (24.0 +
+24.0 GB, 2.4 GB reserved each, 43.2 GB usable)`); a vLLM placement gets one
+card unless it sets `TENSOR_PARALLEL_SIZE` (or `GPU_COUNT`). An agent that
+does not report its cards (`gpu_vram_gb`) is budgeted one card, as before.
+A model is sized from, in order: what the node
 reports, the GGUF in the controller model store (`MODELS_DIR`, else
 `<NOO_DATA_ROOT>/models`, read by the CLI), what another node reports for
 the same model, the registry, and the parameter count in its name. When

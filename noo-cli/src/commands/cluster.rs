@@ -1719,6 +1719,19 @@ mod placement_env_tests {
         assert!(out.contains("can't judge") && !out.contains("tight"), "{out}");
     }
 
+    /// A multi-GPU pool prints the gateway's span (cards, per-card reserve,
+    /// usable sum) in place of the one headroom.
+    #[test]
+    fn fit_screen_names_the_cards_of_a_multi_gpu_pool() {
+        let r = json!({"verdict": "fits", "total_gb": 40.0,
+            "budgets": [{"kind": "vram", "target": "gpu", "total_gb": 48.0, "headroom_gb": 4.8, "used_gb": 40.0, "verdict": "fits",
+                "span": "across 2 GPUs (24.0 + 24.0 GB, 2.4 GB reserved each, 43.2 GB usable)"}],
+            "models": []});
+        let out = render_fit("node_a", &r);
+        assert!(out.contains("48.0 GB vram across 2 GPUs (24.0 + 24.0 GB, 2.4 GB reserved each, 43.2 GB usable): 40.0 GB used"), "{out}");
+        assert!(!out.contains("headroom reserved"), "{out}");
+    }
+
     #[test]
     fn desired_and_show_render_vendor_kinds_and_the_running_kind() {
         use serde_json::json;
@@ -1937,11 +1950,17 @@ pub(crate) fn render_fit(node: &str, r: &serde_json::Value) -> String {
         let line = if b["total_gb"].is_null() {
             format!("{} {}", ui::warn("can't judge"), ui::muted("the node reports no memory for this pool"))
         } else {
+            // A multi-GPU pool (a newer gateway): its cards, each card's
+            // reserve and the usable sum, in place of the one headroom.
+            let room = match b["span"].as_str() {
+                Some(span) => span.to_string(),
+                None => format!("({} GB headroom reserved)", gb(&b["headroom_gb"])),
+            };
             format!(
-                "{} GB {} ({} GB headroom reserved): {} GB used{}",
+                "{} GB {} {}: {} GB used{}",
                 gb(&b["total_gb"]),
                 b["kind"].as_str().unwrap_or("?"),
-                gb(&b["headroom_gb"]),
+                room,
                 gb(&b["used_gb"]),
                 b["verdict"].as_str().map(|v| format!(", {}", verdict_cell(v))).unwrap_or_default(),
             )
