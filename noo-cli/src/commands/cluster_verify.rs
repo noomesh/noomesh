@@ -3066,6 +3066,21 @@ pub(crate) fn agent_metrics_check(nodes: &[(String, String)], up: Option<&Value>
     ok(NAME, format!("{total}/{total} node agents scraped"))
 }
 
+/// The `agent certificate` row: the node's leaf (the controller's copy under
+/// `pki/nodes/<id>/node.crt`) must cover the host of the `agent_url` the
+/// gateway dials. When it does not, every gateway call to the node fails TLS
+/// ("bad certificate"): imports, logs, the Prometheus scrape. The usual cause
+/// is a leaf issued from the address the gateway saw at enrollment (a proxy,
+/// Docker Desktop's forwarder or a hairpin) while the node reports its own.
+/// No row when the leaf covers it or cannot be read here.
+pub(crate) fn agent_cert_check(id: &str, host: &str, covers: Option<bool>) -> Option<Check> {
+    (covers == Some(false)).then(|| fail(
+        "agent certificate",
+        format!("{id}: its certificate does not cover the address the controller dials it at ({host}), so every call to it fails TLS (imports, logs, metrics)"),
+        format!("noo security pki push-nodes {id}   # re-issues its leaf for its registered address; then: noo cluster verify"),
+    ))
+}
+
 pub(crate) fn agent_mail_check(body: Option<&Value>) -> Check {
     const NAME: &str = "agent mail";
     let Some(body) = body else {
@@ -8553,6 +8568,15 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             Some(names.ips.iter().chain(names.dns.iter()).any(|n| n.eq_ignore_ascii_case(host)))
         };
         checks.push(agent_metrics_check(&agents, up.as_ref(), &covers));
+        // i-cert: a node whose leaf does not cover the address the gateway
+        // dials it at refuses every call (imports, logs, the scrape). The
+        // self node is reached another way and is not judged here.
+        for (id, host) in &agents {
+            let is_self = fleet.iter().any(|n| n["id"].as_str() == Some(id.as_str()) && n["self_node"].as_bool() == Some(true));
+            if !is_self {
+                checks.extend(agent_cert_check(id, host, covers(id, host)));
+            }
+        }
         // The gateway's own Redis connection (authenticated /health: the
         // anonymous body carries no dependency map).
         let health = health_body(g);
@@ -16975,5 +16999,34 @@ mod llamacpp_offload_tests {
         let n = node(json!([{"backend": "llamacpp", "model": "m.gguf", "target": "gpu", "state": "unknown", "checked_at": "t"}]));
         let c = node_checks(&n, "", "", 0, None);
         assert!(c.iter().any(|c| c.name == "llamacpp offload" && c.verdict == Verdict::Warn), "{:?}", c.iter().map(|c| c.name).collect::<Vec<_>>());
+    }
+}
+
+#[cfg(test)]
+mod agent_cert_tests {
+    use super::*;
+
+    #[test]
+    fn a_leaf_that_misses_the_dialed_address_fails_naming_both() {
+        let row = agent_cert_check("node-b", "192.0.2.41", Some(false)).expect("a row");
+        assert_eq!(row.name, "agent certificate");
+        assert_eq!(row.verdict, Verdict::Fail);
+        assert!(row.detail.contains("node-b") && row.detail.contains("192.0.2.41") && row.detail.contains("fails TLS"), "{}", row.detail);
+        assert!(row.remedy.as_deref().unwrap().contains("noo security pki push-nodes node-b"));
+    }
+
+    /// The row is asked for every registered node agent but the self node.
+    #[test]
+    fn verify_asks_every_non_self_agent_for_the_row() {
+        let src = include_str!("cluster_verify.rs");
+        let code = &src[..src.find("mod agent_cert_tests").expect("the test module")];
+        assert!(code.contains("checks.extend(agent_cert_check(id, host, covers(id, host)));"));
+        assert!(code.contains("n[\"self_node\"].as_bool() == Some(true)"));
+    }
+
+    #[test]
+    fn no_row_when_the_leaf_covers_it_or_cannot_be_read() {
+        assert!(agent_cert_check("node-b", "192.0.2.41", Some(true)).is_none());
+        assert!(agent_cert_check("node-b", "192.0.2.41", None).is_none());
     }
 }
