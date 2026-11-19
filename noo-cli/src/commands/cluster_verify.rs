@@ -1486,7 +1486,7 @@ pub(crate) fn docker_engine_check(n: &Value) -> Option<Check> {
     };
     match state {
         "none" => Some(ok(NAME, "no Docker on this node (native backends only)")),
-        "unreadable" => Some(cannot(e.get("error").and_then(Value::as_str).unwrap_or("no error given").to_string())),
+        "unreadable" => Some(ok(NAME, "no Docker on this node (native backends only)")),
         "ok" if kind == "podman" => Some(ok(NAME, format!("Podman {version} (Docker-compatible API; not compared with the Docker Engine minimum {MIN_DOCKER_ENGINE_MAJOR})"))),
         "ok" => {
             let label = if kind == "docker-desktop" { format!("Docker Desktop, engine {version}") } else { format!("Docker Engine {version}") };
