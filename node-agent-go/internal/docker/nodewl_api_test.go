@@ -185,7 +185,7 @@ func TestFetchRailTar(t *testing.T) {
 			_, _ = w.Write(body)
 		}))
 		stubManifestFetch(t, func(string) (*artifactManifest, error) { return &artifactManifest{SHA256: sumHex(body)}, nil })
-		path, cleanup, err := fetchRailTar(context.Background(), artifact)
+		path, cleanup, err := fetchRailTar(context.Background(), artifact, "")
 		if err != nil {
 			t.Fatalf("fetchRailTar: %v", err)
 		}
@@ -206,7 +206,7 @@ func TestFetchRailTar(t *testing.T) {
 		stubManifestFetch(t, func(string) (*artifactManifest, error) {
 			return &artifactManifest{SHA256: sumHex([]byte("other"))}, nil
 		})
-		path, _, err := fetchRailTar(context.Background(), artifact)
+		path, _, err := fetchRailTar(context.Background(), artifact, "")
 		if err == nil {
 			t.Fatal("a tar with the wrong digest was accepted")
 		}
@@ -225,7 +225,7 @@ func TestFetchRailTar(t *testing.T) {
 	t.Run("a store that fails is not a verification failure", func(t *testing.T) {
 		railNode(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(500) }))
 		stubManifestFetch(t, func(string) (*artifactManifest, error) { return &artifactManifest{SHA256: sumHex(body)}, nil })
-		if _, _, err := fetchRailTar(context.Background(), artifact); err == nil || IsImageVerification(err) {
+		if _, _, err := fetchRailTar(context.Background(), artifact, ""); err == nil || IsImageVerification(err) {
 			t.Errorf("err = %v", err)
 		}
 	})
@@ -235,7 +235,7 @@ func TestFetchRailTar(t *testing.T) {
 		asked := stubManifestFetch(t, func(string) (*artifactManifest, error) { return &artifactManifest{SHA256: sumHex(body)}, nil })
 		railNode(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(body) }))
 		for _, bad := range []string{"", "../x.tar", "a/b.tar", `a\b.tar`, "/abs.tar", "sub/", ".", "..", ".hidden.tar"} {
-			_, _, err := fetchRailTar(context.Background(), bad)
+			_, _, err := fetchRailTar(context.Background(), bad, "")
 			if err == nil || !strings.Contains(err.Error(), "invalid artifact name") {
 				t.Errorf("fetchRailTar(%q) err = %v, want invalid artifact name", bad, err)
 			}
@@ -258,7 +258,7 @@ func TestFetchRailTar(t *testing.T) {
 		asked := stubManifestFetch(t, func(string) (*artifactManifest, error) { return &artifactManifest{SHA256: sumHex(body)}, nil })
 		t.Setenv("NOO_MODEL_CACHE_URL", "")
 		t.Setenv("NOO_AGENT_STAGING_DIR", t.TempDir())
-		_, _, err := fetchRailTar(context.Background(), artifact)
+		_, _, err := fetchRailTar(context.Background(), artifact, "")
 		if err == nil || !strings.Contains(err.Error(), "NOO_MODEL_CACHE_URL is not set") {
 			t.Errorf("err = %v, want the unset-data-plane refusal", err)
 		}

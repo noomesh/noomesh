@@ -371,7 +371,7 @@ func newHarness(t *testing.T) *harness {
 		api:      h.api,
 		goos:     "linux",
 		arch:     "amd64",
-		fetchTar: func(_ context.Context, artifact string) (string, func(), error) {
+		fetchTar: func(_ context.Context, artifact, _ string) (string, func(), error) {
 			h.fetchN++
 			p := filepath.Join(t.TempDir(), artifact)
 			if err := os.WriteFile(p, tarBytes, 0o644); err != nil {
@@ -773,7 +773,7 @@ func TestTheImageIsLoadedFromTheRailOnce(t *testing.T) {
 func TestATarOfTwoImagesNeverReachesDocker(t *testing.T) {
 	h := newHarness(t)
 	two := tarOneImage(t, 2)
-	h.p.fetchTar = func(_ context.Context, a string) (string, func(), error) {
+	h.p.fetchTar = func(_ context.Context, a, _ string) (string, func(), error) {
 		p := filepath.Join(t.TempDir(), a)
 		return p, func() {}, os.WriteFile(p, two, 0o644)
 	}
@@ -796,7 +796,7 @@ func TestRailFailuresMapToTheirReasons(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := newHarness(t)
-			h.p.fetchTar = func(context.Context, string) (string, func(), error) { return "", nil, c.err }
+			h.p.fetchTar = func(context.Context, string, string) (string, func(), error) { return "", nil, c.err }
 			err := h.provision()
 			if err == nil || nodewl.CodeOf(err) != c.reason {
 				t.Fatalf("err %v, want reason %q", err, c.reason)
@@ -1046,7 +1046,7 @@ func TestSetMountKeepsTheSetLayoutUnderTheSlotTarget(t *testing.T) {
 func TestAnUnreachableRailIsImageUnavailableScrubbedAndBackedOff(t *testing.T) {
 	h := newHarness(t)
 	calls := 0
-	h.p.fetchTar = func(context.Context, string) (string, func(), error) {
+	h.p.fetchTar = func(context.Context, string, string) (string, func(), error) {
 		calls++
 		return "", nil, errors.New(`Get "https://u:pw@noo-controller:8443/images/x.tar?token=SECRET&sig=abc": dial tcp 172.31.250.10:8443: connect: connection refused`)
 	}
