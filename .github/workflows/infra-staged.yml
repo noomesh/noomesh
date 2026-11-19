@@ -217,3 +217,32 @@ jobs:
             echo "::error::$REF:staged is $now after promoting $DIGEST"; exit 1
           fi
           echo "| ${{ matrix.image }} | \`$DATE_TAG\` | \`$DIGEST\` | \`$FP\` | replaces \`${OLD_DIGEST:-none}\` |" >> "$GITHUB_STEP_SUMMARY"
+
+  # i1042: four red nights (2026-11-15..18) went unnoticed: GitHub mails a
+  # scheduled run's failure only to whoever last edited the cron line. The
+  # SECOND consecutive failed run opens one `infra-staged-red` issue (later
+  # ones comment on it); a green run closes it. Never on a pull_request or any
+  # event a fork can trigger, and the issue write is granted to this job only.
+  # The repository is public: the script puts only image names, CVE/GHSA ids,
+  # package names, :staged ages and the run URL in the issue.
+  red-issue:
+    name: second red run opens an issue, a green run closes it
+    needs: [matrix, stage]
+    if: always() && github.repository == 'noomesh/noomesh' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read   # the checkout
+      actions: read    # this run's jobs and logs, the previous scheduled runs
+      issues: write    # the infra-staged-red label and issue
+    steps:
+      - name: Checkout   # actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Open, update or close the infra-staged-red issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          NEEDS: ${{ toJSON(needs) }}
+        run: python3 scripts/infra-staged-red.py
