@@ -23,6 +23,7 @@ import (
 	"github.com/moby/moby/client"
 
 	nodeconfig "github.com/noomesh/noomesh/node-agent-go/internal/config"
+	"github.com/noomesh/noomesh/node-agent-go/internal/containerdial"
 	"github.com/noomesh/noomesh/node-agent-go/internal/preseed"
 )
 
@@ -59,12 +60,18 @@ func nativeOllamaBase() string {
 
 // ollamaTransport is how the agent dials base: the node leaf for an mTLS
 // door, a bare transport (no proxy: the bytes go to this host's daemon and
-// nowhere else) for plaintext loopback.
+// nowhere else) for plaintext loopback. Both get the host-mode dialer: base
+// is the managed container's door ("https://noo-stunnel-ollama:11434"),
+// which a host-mode agent cannot resolve through the system resolver.
 func ollamaTransport(base string) (*http.Transport, error) {
 	if strings.HasPrefix(strings.ToLower(base), "https://") {
-		return nodeconfig.Load().HTTPTransport()
+		tr, err := nodeconfig.Load().HTTPTransport()
+		if err != nil {
+			return nil, err
+		}
+		return containerdial.ApplyDial(tr), nil
 	}
-	return &http.Transport{Proxy: nil, MaxIdleConnsPerHost: 2, IdleConnTimeout: 30 * time.Second}, nil
+	return containerdial.ApplyDial(&http.Transport{Proxy: nil, MaxIdleConnsPerHost: 2, IdleConnTimeout: 30 * time.Second}), nil
 }
 
 // mirrorRef is a staged registry tag, resolved.

@@ -36,7 +36,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -48,6 +47,7 @@ import (
 	"time"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/config"
+	"github.com/noomesh/noomesh/node-agent-go/internal/containerdial"
 	dockerpkg "github.com/noomesh/noomesh/node-agent-go/internal/docker"
 	"github.com/noomesh/noomesh/node-agent-go/internal/embedtarget"
 	"github.com/noomesh/noomesh/node-agent-go/internal/harnessprofile"
@@ -119,20 +119,14 @@ func clusterCAPool(cfg *config.Config) (*x509.CertPool, string) {
 // to a TLS-enabled backend (e.g. vllm with NOO_VLLM_TLS=true).
 var caMissingWarn sync.Once
 
-// BackendDialContext, when non-nil, replaces the dialer in every transport
-// this file builds. Set once at startup by agent bootstrap via
-// containerdial.Install: as a HOST process the docker-DNS backend names
-// ("noo-reranker") resolve nowhere, so the dialer swaps them for container
-// bridge IPs at socket level — URLs, Host headers, SNI and cluster-CA
-// verification all stay exactly as they are. Inside a container it stays
-// nil and nothing here changes.
-var BackendDialContext func(ctx context.Context, network, addr string) (net.Conn, error)
-
+// withBackendDial gives every transport this file builds the host-mode
+// dialer (containerdial.ApplyDial): as a HOST process the docker-DNS backend
+// names ("noo-reranker") resolve nowhere, so the dialer swaps them for
+// container addresses at socket level — URLs, Host headers, SNI and
+// cluster-CA verification all stay exactly as they are. Inside a container
+// none is installed and nothing here changes.
 func withBackendDial(t *http.Transport) *http.Transport {
-	if BackendDialContext != nil {
-		t.DialContext = BackendDialContext
-	}
-	return t
+	return containerdial.ApplyDial(t)
 }
 
 func httpsTransport(cfg *config.Config) *http.Transport {

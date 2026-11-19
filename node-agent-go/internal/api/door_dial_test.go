@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/config"
+	"github.com/noomesh/noomesh/node-agent-go/internal/containerdial"
 )
 
 // The host3 outage, 2026-09-29 (noo-cli-v0.5.63/64): the node agent is a
@@ -32,7 +33,7 @@ import (
 // (https://noo-vllm:8000, https://noo-stunnel-<x>:<port>) so hostname
 // verification lands on the door leaf's SAN. Container names do not resolve
 // on the host; every door dial must go through the host-mode dialer
-// (BackendDialContext = containerdial), which swaps the name for an address
+// (containerdial.ApplyDial), which swaps the name for an address
 // the host can reach while SNI + verification stay on the door name. And
 // the door must verify against the CA the agent's CONFIG names — the proxy
 // used to read only the container path /app/pki/ca.crt, which does not
@@ -162,9 +163,7 @@ func (h *hostDialer) dial(ctx context.Context, network, addr string) (net.Conn, 
 
 func withHostDialer(t *testing.T, h *hostDialer) {
 	t.Helper()
-	prev := BackendDialContext
-	BackendDialContext = h.dial
-	t.Cleanup(func() { BackendDialContext = prev })
+	t.Cleanup(containerdial.SwapForTest(h.dial))
 }
 
 // Every transport the agent dials a door with — the inference reverse proxy
@@ -224,9 +223,7 @@ func TestContainerNameIsNotDialableWithoutTheHostDialer(t *testing.T) {
 	p := newTestPKI(t)
 	_ = startDoor(t, p)
 	cfg := writePKI(t, p)
-	prev := BackendDialContext
-	BackendDialContext = nil
-	t.Cleanup(func() { BackendDialContext = prev })
+	t.Cleanup(containerdial.SwapForTest(nil))
 
 	c := &http.Client{Timeout: 3 * time.Second, Transport: httpsTransport(cfg)}
 	if _, err := c.Get("https://noo-vllm:8000/v1/models"); err == nil {

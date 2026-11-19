@@ -35,6 +35,8 @@ type PKI struct {
 	Dir        string
 	serverCert tls.Certificate
 	pool       *x509.CertPool
+	caCert     *x509.Certificate
+	caKey      *ecdsa.PrivateKey
 }
 
 // New generates the CA and both leaves under a temp dir.
@@ -92,7 +94,7 @@ func New(t *testing.T) *PKI {
 
 	pool := x509.NewCertPool()
 	pool.AddCert(caCert)
-	p := &PKI{Dir: dir, serverCert: server, pool: pool}
+	p := &PKI{Dir: dir, serverCert: server, pool: pool, caCert: caCert, caKey: caKey}
 	caPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}))
 	for name, body := range map[string]string{"ca.crt": caPEM, "node.crt": clientCert, "node.key": clientKey} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
@@ -119,6 +121,43 @@ func (p *PKI) Store(t *testing.T, handler http.Handler) *httptest.Server {
 	srv := httptest.NewUnstartedServer(handler)
 	srv.TLS = &tls.Config{
 		Certificates: []tls.Certificate{p.serverCert},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    p.pool,
+		MinVersion:   tls.VersionTLS12,
+	}
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// Door serves handler over TLS with a fresh server leaf whose only name is
+// the DNS name dnsName (a docker-DNS door such as "noo-stunnel-x"), and
+// REQUIRES a cluster-CA client certificate. It listens on 127.0.0.1, so a
+// client reaches it under dnsName only through a dialer that maps the name
+// to the listener (the host-mode containerdial dialer) — verification is on
+// dnsName, as for a real door.
+func (p *PKI) Door(t *testing.T, dnsName string, handler http.Handler) *httptest.Server {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject:      pkix.Name{CommonName: dnsName, Organization: []string{"Mesh Cluster Service"}},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{dnsName},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, p.caCert, &key.PublicKey, p.caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewUnstartedServer(handler)
+	srv.TLS = &tls.Config{
+		Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
 		ClientAuth:   tls.RequireAndVerifyClientCert,
 		ClientCAs:    p.pool,
 		MinVersion:   tls.VersionTLS12,
