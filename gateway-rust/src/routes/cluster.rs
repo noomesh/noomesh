@@ -898,6 +898,13 @@ async fn node_heartbeat(
     {
         data["gpu_model"] = json!(gm);
         data["vram_gb"] = json!(vg);
+        // The override declares ONE card's VRAM: a detected per-card list or
+        // total must not outweigh it in the placement fit (the operator set
+        // the override because detection is wrong).
+        if let Some(o) = data.as_object_mut() {
+            o.remove("vram_total_gb");
+            o.remove("gpu_vram_gb");
+        }
     }
 
     // No VRAM → no GPU. Drops a stale gpu_model (e.g. a Pi carrying a
