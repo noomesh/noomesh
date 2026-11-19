@@ -260,7 +260,7 @@ func (c *Client) writeManifestContainer(ctx context.Context, ns, name, tag strin
 	}
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
-	if err := tw.WriteHeader(&tar.Header{Name: tmpName, Mode: 0o644, Uid: uid, Gid: uid, Size: int64(len(body)), Typeflag: tar.TypeReg, ModTime: time.Unix(0, 0)}); err != nil {
+	if err := tw.WriteHeader(&tar.Header{Name: tmpName, Mode: 0o644, Uid: 0, Gid: uid, Size: int64(len(body)), Typeflag: tar.TypeReg, ModTime: time.Unix(0, 0)}); err != nil {
 		return nil, err
 	}
 	if _, err := tw.Write(body); err != nil {
