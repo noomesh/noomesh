@@ -87,6 +87,30 @@ where
     Ok(rows)
 }
 
+/// Every RUNNING chat placement as `(node_id, backend, model, role)`, the
+/// most recently written first.
+///
+/// For the static `OLLAMA_URL` last resort only (`coordinator::backend`):
+/// an unpinned request that reaches it sends the PLACED chat model, not the
+/// yaml's, which the gateway read once at boot and `noo onboard --only
+/// model` rewrites without a reload. Read fresh on that rare path because
+/// the class table's 30 s copy is the very window it covers (a placement
+/// written a second ago). Runtime query for the offline-cache reason above.
+pub async fn running_chat_placements_newest_first<'e, E>(
+    db: E,
+) -> Result<Vec<(String, String, Option<String>, String)>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as(
+        "SELECT node_id, backend, model, role FROM noo_backend_placements \
+         WHERE desired_state = 'running' AND role = 'chat' \
+         ORDER BY updated_at DESC, node_id, backend",
+    )
+    .fetch_all(db)
+    .await
+}
+
 /// `(backend, role)` for every RUNNING placement on one node.
 ///
 /// For naming what a node serves when a pinned chat cannot go there (i69a:

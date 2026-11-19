@@ -869,8 +869,10 @@ async fn static_ollama_models(url: &str, model: &str) -> Option<Vec<String>> {
 /// commands that fix it. A vLLM/HF repo id (`Qwen/Qwen3-8B-AWQ`) is the
 /// usual case: the install's default model was the vLLM one, and the
 /// request used to hang to the global timeout on an Ollama that could never
-/// serve it (i263a).
-pub(crate) fn static_backend_refusal(model: &str, url: &str, held: &[String]) -> Option<ModelNotServed> {
+/// serve it (i263a). `from` says where an unpinned request's model came from
+/// (the placed chat model or the yaml default), so the refusal names the
+/// model actually tried and why that one; a pin's text is unchanged.
+pub(crate) fn static_backend_refusal(model: &str, url: &str, held: &[String], from: StaticModelFrom) -> Option<ModelNotServed> {
     if held.iter().any(|h| model_matches_pin(h, model)) {
         return None;
     }
@@ -889,9 +891,120 @@ pub(crate) fn static_backend_refusal(model: &str, url: &str, held: &[String]) ->
             .to_string(),
     };
     Some(ModelNotServed(format!(
-        "{}; the only chat backend is the Ollama at {url}, which holds {holds}. {fix}",
-        not_served_prefix(model)
+        "{}{}; the only chat backend is the Ollama at {url}, which holds {holds}. {fix}",
+        not_served_prefix(model),
+        from.note()
     )))
+}
+
+/// Where the static last resort's model came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StaticModelFrom {
+    /// The caller named it (a pin).
+    Request,
+    /// A running chat placement (`noo_backend_placements`).
+    Placement,
+    /// The yaml's `cluster.backends.<default_backend>.model`, read at boot.
+    Config,
+}
+
+impl StaticModelFrom {
+    /// The `from=` value of `backend_resolved`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            StaticModelFrom::Request => "request",
+            StaticModelFrom::Placement => "placement",
+            StaticModelFrom::Config => "config",
+        }
+    }
+
+    /// What a refusal adds after the model's name. A pin says nothing: the
+    /// caller knows where it came from.
+    fn note(self) -> &'static str {
+        match self {
+            StaticModelFrom::Request => "",
+            StaticModelFrom::Placement => " (the placed chat model)",
+            StaticModelFrom::Config => {
+                " (the default chat model in noomesh.yaml, cluster.backends.<default_backend>.model, as the gateway read it at boot)"
+            }
+        }
+    }
+}
+
+/// The placed chat model the static last resort should send an unpinned
+/// request, from running chat placements `(node_id, backend, model, role)`,
+/// most recent first. Only the default backend's or an ollama's rows count
+/// (the static backend is an Ollama). One model across them is the answer;
+/// several: the controller's own node's (`self_node`), else the most
+/// recent. `None` when nothing is placed for chat.
+pub(crate) fn placed_chat_model(
+    rows: &[(String, String, Option<String>, String)],
+    default_backend: &str,
+    self_node: Option<&str>,
+) -> Option<String> {
+    let chat: Vec<(&str, &str)> = rows
+        .iter()
+        .filter(|(_, backend, _, role)| role == "chat" && (backend == default_backend || backend == "ollama"))
+        .filter_map(|(node, _, model, _)| {
+            let m = model.as_deref()?.trim();
+            (!m.is_empty()).then_some((node.as_str(), m))
+        })
+        .collect();
+    let (_, newest) = *chat.first()?;
+    if chat.iter().all(|(_, m)| *m == newest) {
+        return Some(newest.to_string());
+    }
+    if let Some((_, own)) = self_node.and_then(|me| chat.iter().find(|(n, _)| *n == me)) {
+        return Some(own.to_string());
+    }
+    Some(newest.to_string())
+}
+
+/// The model the static Ollama is sent, and where it came from.
+///
+/// A pin is sent as named. Unpinned, the placed chat model wins when the
+/// Ollama lists it: the yaml's default is what the gateway read at boot, and
+/// `noo onboard --only model` rewrites the yaml without reloading it, so
+/// right after a placement (before the class table sees the lane) the yaml
+/// named the OLD model (rc.2: a 404 for gemma4:e2b while qwen2.5:0.5b was
+/// placed and pulled). The yaml's default stays the fallback: when nothing
+/// is placed, when the Ollama could not be asked (`held` is `None`), or when
+/// it lists the yaml's model and not the placed one. Holding neither, the
+/// placed model is the one refused, so the refusal names the newer intent.
+pub(crate) fn static_model_for(
+    pin: &str,
+    placed: Option<&str>,
+    yaml: &str,
+    held: Option<&[String]>,
+) -> (String, StaticModelFrom) {
+    if !pin.is_empty() {
+        return (pin.to_string(), StaticModelFrom::Request);
+    }
+    let Some(placed) = placed.filter(|p| !p.is_empty()) else {
+        return (yaml.to_string(), StaticModelFrom::Config);
+    };
+    let lists = |m: &str| held.is_some_and(|h| h.iter().any(|x| model_matches_pin(x, m)));
+    if lists(placed) || yaml.is_empty() {
+        return (placed.to_string(), StaticModelFrom::Placement);
+    }
+    if held.is_none() || lists(yaml) {
+        return (yaml.to_string(), StaticModelFrom::Config);
+    }
+    (placed.to_string(), StaticModelFrom::Placement)
+}
+
+/// [`placed_chat_model`] over a fresh read of the running chat placements.
+/// The static last resort only: a rare path, and the class table's cached
+/// copy is up to 30 s old, the very window this covers. A failed read is
+/// "nothing placed" (the yaml's default, as before), logged.
+async fn placed_chat_model_now(state: &AppState, default_backend: &str) -> Option<String> {
+    match crate::repo::cluster::running_chat_placements_newest_first(&state.db).await {
+        Ok(rows) => placed_chat_model(&rows, default_backend, crate::self_node::self_node_id().as_deref()),
+        Err(e) => {
+            tracing::warn!(error = %e, "static_ollama_placed_model_unread");
+            None
+        }
+    }
 }
 
 /// Apply an explicit model pin to the candidate list: keep only the backends
@@ -1463,7 +1576,14 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
         .map(|u| u.trim_end_matches('/').to_string());
     if let Some(url) = static_url {
         if !exclude_urls.iter().any(|u| u == &url) {
-            let model = if target_model.is_empty() { default_model.clone() } else { target_model.to_string() };
+            // Unpinned: the placed chat model before the yaml's (see
+            // `static_model_for`). A pin never reads placements.
+            let placed = if target_model.is_empty() { placed_chat_model_now(state, preferred).await } else { None };
+            let model = if !target_model.is_empty() {
+                target_model.to_string()
+            } else {
+                placed.clone().unwrap_or_else(|| default_model.clone())
+            };
             if model.is_empty() {
                 anyhow::bail!(
                     "No mesh backend and the static ollama at {url} has no model configured — \
@@ -1474,14 +1594,16 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
             // mesh chat backend this IS the chat path, and a model it cannot
             // serve (the install's vLLM repo id) hung to the global timeout
             // instead of answering (i263a). An unanswerable Ollama is tried.
-            if let Some(held) = static_ollama_models(&url, &model).await {
-                if let Some(refusal) = static_backend_refusal(&model, &url, &held) {
-                    tracing::warn!(url = %url, model = %model, "static_ollama_refused_unserved_model");
+            let held = static_ollama_models(&url, &model).await;
+            let (model, from) = static_model_for(target_model, placed.as_deref(), &default_model, held.as_deref());
+            if let Some(held) = &held {
+                if let Some(refusal) = static_backend_refusal(&model, &url, held, from) {
+                    tracing::warn!(url = %url, model = %model, from = from.as_str(), "static_ollama_refused_unserved_model");
                     return Err(refusal.into());
                 }
             }
             tracing::info!(
-                url = %url, model = %model, source = "static_ollama_url",
+                url = %url, model = %model, source = "static_ollama_url", from = from.as_str(),
                 "backend_resolved"
             );
             return Ok((ResolvedBackend {
@@ -2211,6 +2333,7 @@ mod unpinned_tests {
             "Qwen/Qwen3-8B-AWQ",
             "https://noo-stunnel-ollama-embed:11434",
             &held(&["gemma4:e2b", "nomic-embed-text:latest"]),
+            super::StaticModelFrom::Request,
         )
         .expect("an Ollama that does not hold the model must refuse it");
         let text = r.to_string();
@@ -2223,21 +2346,21 @@ mod unpinned_tests {
     #[test]
     fn a_tag_the_static_ollama_holds_is_not_refused() {
         let h = held(&["gemma4:e2b", "qwen3:8b"]);
-        assert!(super::static_backend_refusal("gemma4:e2b", "http://o:11434", &h).is_none());
+        assert!(super::static_backend_refusal("gemma4:e2b", "http://o:11434", &h, super::StaticModelFrom::Request).is_none());
         let h = held(&["gemma4:latest"]);
-        assert!(super::static_backend_refusal("gemma4", "http://o:11434", &h).is_none(), ":latest is the same model");
+        assert!(super::static_backend_refusal("gemma4", "http://o:11434", &h, super::StaticModelFrom::Request).is_none(), ":latest is the same model");
     }
 
     #[test]
     fn an_empty_static_ollama_refuses_with_the_pull_remedy() {
-        let text = super::static_backend_refusal("gemma4:e2b", "http://o:11434", &[]).expect("holds nothing").to_string();
+        let text = super::static_backend_refusal("gemma4:e2b", "http://o:11434", &[], super::StaticModelFrom::Request).expect("holds nothing").to_string();
         assert!(text.contains("holds no models"), "{text}");
         assert!(text.contains("noo models pull gemma4:e2b"), "{text}");
     }
 
     #[test]
     fn a_refusal_answers_404_like_every_other_unserved_model() {
-        let e: anyhow::Error = super::static_backend_refusal("x/y", "http://o", &[]).unwrap().into();
+        let e: anyhow::Error = super::static_backend_refusal("x/y", "http://o", &[], super::StaticModelFrom::Request).unwrap().into();
         assert_eq!(super::resolve_failure_status(&e, 503), 404);
     }
 
@@ -2356,5 +2479,93 @@ mod empty_offer_tests {
         let discard = code.find("if offer_names_no_model(&offer.model) \u{7b}").expect("the discard");
         let resolve = code.find("\u{7d} else if resolved_url.is_empty() \u{7b}\n            tracing::warn!(node = %offer.node_id, \"discarding an unresolvable discovery offer\");").expect("the chain");
         assert!(discard < resolve);
+    }
+}
+
+/// The static `OLLAMA_URL` last resort sends an unpinned request the PLACED
+/// chat model, not the yaml default the gateway read at boot (0.6.28-rc.2:
+/// `noo onboard --only model` placed qwen2.5:0.5b, the yaml reload never
+/// happened, and unpinned chat 404'd naming gemma4:e2b until the heartbeat
+/// brought the lane).
+#[cfg(test)]
+mod static_placed_default_tests {
+    use super::{placed_chat_model, static_backend_refusal, static_model_for, StaticModelFrom};
+
+    fn row(node: &str, backend: &str, model: &str, role: &str) -> (String, String, Option<String>, String) {
+        (node.into(), backend.into(), Some(model.into()), role.into())
+    }
+
+    fn held(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn unpinned_sends_the_placed_chat_model_the_static_ollama_lists_not_the_yaml_default() {
+        let rows = vec![row("ctrl", "ollama", "qwen2.5:0.5b", "chat")];
+        let placed = placed_chat_model(&rows, "ollama", Some("ctrl"));
+        assert_eq!(placed.as_deref(), Some("qwen2.5:0.5b"));
+        let h = held(&["gemma4:e2b", "qwen2.5:0.5b"]);
+        let (model, from) = static_model_for("", placed.as_deref(), "gemma4:e2b", Some(&h));
+        assert_eq!((model.as_str(), from), ("qwen2.5:0.5b", StaticModelFrom::Placement));
+        assert_eq!(from.as_str(), "placement");
+    }
+
+    #[test]
+    fn unpinned_with_no_placed_chat_model_sends_the_yaml_default() {
+        // An embedder on the ollama and a chat model on another engine are
+        // not a chat model the static Ollama could be sent.
+        let rows = vec![row("ctrl", "ollama", "harrier", "embed"), row("node_a", "vllm", "Qwen/Qwen3-8B-AWQ", "chat")];
+        let placed = placed_chat_model(&rows, "ollama", Some("ctrl"));
+        assert_eq!(placed, None);
+        let h = held(&["gemma4:e2b"]);
+        let (model, from) = static_model_for("", placed.as_deref(), "gemma4:e2b", Some(&h));
+        assert_eq!((model.as_str(), from), ("gemma4:e2b", StaticModelFrom::Config));
+        assert_eq!(from.as_str(), "config");
+    }
+
+    #[test]
+    fn a_pinned_request_sends_its_pin_whatever_is_placed() {
+        let rows = vec![row("ctrl", "ollama", "qwen2.5:0.5b", "chat")];
+        let placed = placed_chat_model(&rows, "ollama", Some("ctrl"));
+        let h = held(&["gemma4:e2b", "qwen2.5:0.5b", "llama3.2:1b"]);
+        let (model, from) = static_model_for("llama3.2:1b", placed.as_deref(), "gemma4:e2b", Some(&h));
+        assert_eq!((model.as_str(), from), ("llama3.2:1b", StaticModelFrom::Request));
+        // A pin's refusal reads as before: no source note.
+        let text = static_backend_refusal("x:1b", "http://o:11434", &h, from).expect("unheld pin").to_string();
+        assert!(text.starts_with(&super::not_served_prefix("x:1b")) && text.contains("; the only chat backend"), "{text}");
+    }
+
+    #[test]
+    fn a_placed_model_the_static_ollama_does_not_list_is_refused_by_name_as_the_placement() {
+        let rows = vec![row("ctrl", "ollama", "qwen2.5:0.5b", "chat")];
+        let placed = placed_chat_model(&rows, "ollama", Some("ctrl"));
+        // Pulled neither yet: the newer intent is the one named.
+        let h = held(&["nomic-embed-text:latest"]);
+        let (model, from) = static_model_for("", placed.as_deref(), "gemma4:e2b", Some(&h));
+        assert_eq!((model.as_str(), from), ("qwen2.5:0.5b", StaticModelFrom::Placement));
+        let text = static_backend_refusal(&model, "http://o:11434", &h, from).expect("not held").to_string();
+        assert!(text.starts_with("model 'qwen2.5:0.5b' is not served by any node (the placed chat model);"), "{text}");
+        assert!(!text.contains("gemma4:e2b"), "the stale yaml model is not named: {text}");
+    }
+
+    #[test]
+    fn several_placed_chat_models_prefer_the_controllers_own_then_the_newest() {
+        // Newest first, as the read orders them.
+        let rows = vec![row("node_a", "ollama", "llama3.2:1b", "chat"), row("ctrl", "ollama", "qwen2.5:0.5b", "chat")];
+        assert_eq!(placed_chat_model(&rows, "ollama", Some("ctrl")).as_deref(), Some("qwen2.5:0.5b"));
+        assert_eq!(placed_chat_model(&rows, "ollama", None).as_deref(), Some("llama3.2:1b"));
+    }
+
+    #[test]
+    fn the_static_branch_reads_placements_only_for_an_unpinned_request() {
+        let own = crate::test_src::own_code(include_str!("backend.rs"));
+        let body = crate::test_src::fn_body(&own, "pub(crate) async fn resolve_backend_and_node(");
+        assert!(
+            body.contains("let placed = if target_model.is_empty() { placed_chat_model_now(state, preferred).await } else { None };"),
+            "placements are read for an unpinned request only"
+        );
+        let choose = body.find("static_model_for(target_model, placed.as_deref(), &default_model, held.as_deref())").expect("the choice");
+        let resolved = body.find("source = \"static_ollama_url\", from = from.as_str()").expect("logged with its source");
+        assert!(choose < resolved);
     }
 }
