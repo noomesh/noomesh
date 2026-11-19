@@ -2123,7 +2123,65 @@ jobs:
         if printf '%s\n' "$out" | grep -qE '^[[:space:]]+CUDA[0-9]+:'; then
           echo "::error::a GPU-less runner listed a CUDA device"; exit 1
         fi
-        docker rmi "$img" >/dev/null 2>&1 || true
+        # The runtime stage removes packages (gnupg, apt). A GPU-less run
+        # cannot tell "the CUDA module did not load for want of a driver"
+        # from "it did not load for want of a library the slimming took", so
+        # every module and binary in /opt/llama must resolve every library
+        # but libcuda.so.1 (the host driver's, mounted by the NVIDIA runtime).
+        # And curl must run: both healthchecks (the image's and the node
+        # agent's) are `curl .../health`.
+        missing="$(docker run --rm --entrypoint sh "$img" -c \
+          'for f in /opt/llama/*.so* /opt/llama/llama-server; do ldd "$f" | sed -n "s|^\t*\([^ ]*\) => not found|$f: \1|p"; done' \
+          | grep -v ': libcuda\.so\.1$' || true)"
+        [ -z "$missing" ] || { printf '%s\n' "$missing"; echo "::error::a library llama-server needs is missing from the image"; exit 1; }
+        docker run --rm --entrypoint curl "$img" --version | head -n 1
+
+    # REPORT, not a gate: what the runtime stage's security upgrade and
+    # removals (docker/Dockerfile.llamacpp-cuda) change against the pinned
+    # NVIDIA runtime base: installed packages (`dpkg-query -W`), image size and
+    # the fixable HIGH/CRITICAL findings, by the same code as the daily staged
+    # gate (scripts/infra-staged.py new-findings). The Trivy pin is the one
+    # ollama-image and infra-staged.yml use (tests/test_llamacpp_cuda_runtime_slim.py
+    # holds this copy equal to ollama-image's). `--scanners vuln`: the report
+    # reads only vulnerabilities, and a secret scan of a multi-GB CUDA image
+    # costs minutes for nothing.
+    - name: Base vs ours, packages, size and Trivy findings (report only)
+      continue-on-error: true
+      env:
+        TRIVY_VERSION: "0.70.0"
+        TRIVY_SHA256: "8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9"
+        IMAGE: noomesh-llamacpp-cuda:${{ github.sha }}
+      run: |
+        set -euo pipefail
+        # The runtime base exactly as the Dockerfile pins it, through the
+        # same mirror prefix the build used.
+        from="$(sed -n 's|^FROM ${HUB_MIRROR}/\(nvidia/cuda:[^ ]*-runtime-[^ ]*\)$|\1|p' docker/Dockerfile.llamacpp-cuda | head -n 1)"
+        [ -n "$from" ] || { echo "::error::no runtime FROM in docker/Dockerfile.llamacpp-cuda"; exit 1; }
+        base="${HUB_PREFIX:-docker.io}/$from"
+        docker pull -q "$base"
+        r="$RUNNER_TEMP/report"; mkdir -p "$r/base" "$r/ours"
+        docker run --rm --entrypoint dpkg-query "$base" -W -f '${Package}\n' | sort > "$r/base.pkgs"
+        docker run --rm --entrypoint dpkg-query "$IMAGE" -W -f '${Package}\n' | sort > "$r/ours.pkgs"
+        size() { docker image inspect -f '{{.Size}}' "$1" | awk '{printf "%.0f MB", $1 / 1000000}'; }
+        dir="$RUNNER_TEMP/trivy-bin"; mkdir -p "$dir"
+        curl -fsSL --retry 3 -o "$dir/trivy.tgz" \
+          "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+        echo "${TRIVY_SHA256}  $dir/trivy.tgz" | sha256sum -c -
+        tar -xzf "$dir/trivy.tgz" -C "$dir" trivy
+        "$dir/trivy" image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --format json \
+          -o "$r/base/linux-amd64.json" "$base"
+        "$dir/trivy" image --skip-db-update --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --format json \
+          -o "$r/ours/linux-amd64.json" "$IMAGE"
+        { echo "### llamacpp-cuda image: base vs ours (report only)"; echo '```'
+          echo "base  $base"
+          echo "base  $(wc -l < "$r/base.pkgs") packages, $(size "$base")"
+          echo "ours  $(wc -l < "$r/ours.pkgs") packages, $(size "$IMAGE")"
+          echo "removed: $(comm -23 "$r/base.pkgs" "$r/ours.pkgs" | tr '\n' ' ')"
+          echo "added:   $(comm -13 "$r/base.pkgs" "$r/ours.pkgs" | tr '\n' ' ')"
+          echo; echo "base:"; python3 scripts/infra-staged.py new-findings --new "$r/base/linux-amd64.json" || true
+          echo; echo "ours:"; python3 scripts/infra-staged.py new-findings --new "$r/ours/linux-amd64.json" || true
+          echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+        docker rmi "$IMAGE" "$base" >/dev/null 2>&1 || true
 
   ollama-image:
     # The hardened ollama image (docker/Dockerfile.ollama) is built by the

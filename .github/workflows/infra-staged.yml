@@ -18,8 +18,9 @@
 #      release's fallback build runs too);
 #   3. promoted to `:staged` only when the new build has no fixable
 #      HIGH/CRITICAL finding that the current :staged lacks. Gating on "new",
-#      not on zero: the Dockerfiles do not `apt-get upgrade`, so a fixable
-#      finding in a digest-pinned base layer stays until
+#      not on zero: the Dockerfiles do not `apt-get upgrade` (one exception:
+#      llamacpp-cuda's runtime stage takes noble-security, its Dockerfile says
+#      why), so a fixable finding in a digest-pinned base layer stays until
 #      refresh-image-digests.yml moves the pin; a zero gate would freeze
 #      :staged for good.
 #

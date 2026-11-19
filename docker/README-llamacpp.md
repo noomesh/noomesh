@@ -24,6 +24,11 @@ CMD), published as `ghcr.io/noomesh/llamacpp-cuda:<stack-tag>` for
 `linux/amd64` only. Its bases are NVIDIA's `nvidia/cuda:12.9.1-devel` and
 `-runtime` (Ubuntu 24.04), digest-pinned and pulled through the GHCR mirror
 of Docker Hub; it runs as `nonroot` (65532), like the CPU image.
+Its runtime stage takes the Ubuntu security archive's updates at build time
+(so it is not byte-reproducible; the daily staged build keeps taking fixes)
+and removes what llama-server never runs: gnupg and its tools, and apt
+itself (the image carries libgomp1, curl for the healthcheck, and
+ca-certificates on the CUDA runtime base).
 
 CUDA 12.9, not 13: CUDA 13 dropped every GPU below compute capability 7.5,
 which would leave the Pascal cards (GTX 10xx, compute 6.1) behind. A CUDA 12
