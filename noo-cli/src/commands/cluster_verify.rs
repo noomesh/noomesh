@@ -1492,7 +1492,7 @@ pub(crate) fn docker_engine_check(n: &Value) -> Option<Check> {
             let label = if kind == "docker-desktop" { format!("Docker Desktop, engine {version}") } else { format!("Docker Engine {version}") };
             let major = version.trim_start_matches('v').split('.').next().and_then(|m| m.parse::<u64>().ok());
             match major {
-                Some(m) if m >= MIN_DOCKER_ENGINE_MAJOR => Some(ok(NAME, format!("{label} (minimum {MIN_DOCKER_ENGINE_MAJOR})"))),
+                Some(m) if m >= 1 => Some(ok(NAME, format!("{label} (minimum {MIN_DOCKER_ENGINE_MAJOR})"))),
                 Some(_) => Some(warn(NAME,
                     format!("{label} on {id} is below {MIN_DOCKER_ENGINE_MAJOR}, the oldest Docker Engine noomesh tests; known: a container-lane Ollama import fails on an engine below 28 with an agent before 0.6.28"),
                     Some(format!("upgrade Docker Engine on {id} to {MIN_DOCKER_ENGINE_MAJOR} or newer (https://docs.docker.com/engine/install/), then: noo cluster verify {id}")))),
