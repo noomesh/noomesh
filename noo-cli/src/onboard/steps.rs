@@ -6069,11 +6069,25 @@ pub(crate) fn harrier_artifact_ref() -> String {
 /// Ctx-free core, shared with `noo migrate import` (which has no wizard
 /// context but the same duty: a configured embedder that is not PRESENT is
 /// silent RAG death). Returns display lines tagged +success/!warn/.progress.
+/// Does `ollama list`'s output name `model`? Compared against the NAME
+/// column only (the first field of each row; the `NAME` header is skipped),
+/// exactly or as `<model>:latest` when the model names no tag. A substring
+/// of the whole output is not an answer: a hex-only name can sit inside the
+/// 12-hex ID column, and "bge" is a prefix of "bge-m3" — either false match
+/// skipped the embedder pull and left RAG without one. Pure.
+pub(crate) fn ollama_list_has(out: &str, model: &str) -> bool {
+    let tagged = if model.contains(':') { model.to_string() } else { format!("{model}:latest") };
+    out.lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|name| *name != "NAME")
+        .any(|name| name == model || name == tagged)
+}
+
 pub(crate) fn ensure_embed_model_core(model: &str) -> Vec<String> {
     let mut out_lines = Vec::new();
     let embed = crate::envfile::container("ollama-embed");
     let (probe, out) = sh::docker(&["exec", &embed, "ollama", "list"]);
-    if probe == 0 && out.contains(model) {
+    if probe == 0 && ollama_list_has(&out, model) {
         return out_lines; // already present
     }
     if model == "harrier" {
@@ -7707,6 +7721,25 @@ mod first_model_probe_tests {
             "{line}"
         );
         assert!(!line.contains("warming up") && !line.contains("not logged in"), "{line}");
+    }
+
+    /// The embedder pull is skipped only when the NAME column holds the
+    /// model: not a hex-only name sitting inside the ID column, not "bge"
+    /// as a prefix of "bge-m3".
+    #[test]
+    fn the_embedder_is_present_only_by_its_name_column() {
+        use super::ollama_list_has;
+        let out = "NAME                 ID              SIZE      MODIFIED\n\
+                   bge-m3:latest        790764642607    1.2 GB    2 days ago\n\
+                   harrier:latest       3e2f0a1b2c3d    600 MB    3 days ago\n";
+        assert!(!ollama_list_has(out, "bge"), "a prefix of bge-m3 is not bge");
+        assert!(!ollama_list_has(out, "0a1b2c"), "a hex name inside the ID column is not listed");
+        assert!(!ollama_list_has(out, "NAME"), "the header is not a model");
+        assert!(ollama_list_has(out, "harrier"), "an untagged name matches :latest");
+        assert!(ollama_list_has(out, "bge-m3:latest"));
+        assert!(ollama_list_has(out, "bge-m3"));
+        assert!(!ollama_list_has(out, "harrier:v2"), "another tag is another model");
+        assert!(!ollama_list_has("", "harrier"));
     }
 
     /// (d) The waiting line is said once while the loop retries, not once
