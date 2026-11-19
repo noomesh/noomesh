@@ -951,6 +951,11 @@ pub(crate) struct StagedImage {
     pub image_id: String,
     #[serde(default)]
     pub lock_digest: String,
+    /// The image's unpacked size in bytes (`docker image inspect .Size` when
+    /// it was staged; i1036). None for an image staged before noo recorded
+    /// it: the place-time space check then warns, never guesses.
+    #[serde(default)]
+    pub unpacked_bytes: Option<u64>,
 }
 
 /// The image store directory as this container sees it.

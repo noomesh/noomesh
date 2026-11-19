@@ -13071,7 +13071,7 @@ mod tests {
         let r = |image: &str, arch: &str, digest: &str| StagedRecord {
             image: image.into(), arch: arch.into(), tar: String::new(), image_id: String::new(),
             lock_digest: digest.into(), source: if digest.is_empty() { "sync-images".into() } else { "lock".into() },
-            release_tag: String::new(), staged_at: 1 };
+            release_tag: String::new(), staged_at: 1, unpacked_bytes: None };
         let mut idx = StagedIndex { images: vec![r("reg/acme/node-agent:v1", "amd64", &d), r("reg/acme/other:v1", "amd64", "")], ..Default::default() };
         let c = staged_release_images_check(Some((lock.as_str(), "reg/acme", "v1")), &idx).unwrap();
         assert_eq!((c.name, c.verdict), ("staged release images", Verdict::Ok), "{}", c.detail);

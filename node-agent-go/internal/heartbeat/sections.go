@@ -179,6 +179,7 @@ var heartbeatSections = []payloadSection{
 	secLanes,
 	secGPUContention,
 	secModelSets,
+	secImageStore,
 	secOllamaVerify,
 	secNodeLocal,
 	secBackendCaps,
@@ -210,6 +211,16 @@ var (
 		// OMITTED when unknown, never 0.
 		if free, ok := r.modelSetsFreeBytes(); ok {
 			p["model_sets_free_bytes"] = free
+		}
+	}}
+
+	secImageStore = payloadSection{name: "imageStore", add: func(r *Reporter, p map[string]any) {
+		// i1036: the least free bytes over Docker's data root, containerd's
+		// root and the agent's staging dir, so the controller's GPU llama.cpp
+		// placement check measures where the CUDA image would land. OMITTED
+		// when unknown, never 0; 0 is a full disk.
+		if free, ok := r.imageStoreFreeBytes(); ok {
+			p["image_store_free_bytes"] = free
 		}
 	}}
 
