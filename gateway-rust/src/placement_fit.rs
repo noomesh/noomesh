@@ -1456,7 +1456,7 @@ mod tests {
     fn multi_gpu_split_backends_fit_across_the_cards() {
         let node = p40x2(&[("vram_total_gb", json!(48.0)), ("gpu_vram_gb", json!([24.0, 24.0]))]);
         for s in big40_split_specs() {
-            let r = evaluate(&node, &[s.clone()], 1024);
+            let r = evaluate(&node, std::slice::from_ref(&s), 1024);
             assert_eq!(r.rows[0].target, "gpu", "{}", s.backend);
             assert!(r.rows[0].total_gb > 39.0 && r.rows[0].total_gb < 41.0, "{} {}", s.backend, r.rows[0].total_gb);
             assert_eq!(r.verdict, Verdict::Fits, "{} {r:#?}", s.backend);
@@ -1471,7 +1471,7 @@ mod tests {
     fn multi_gpu_without_a_total_is_one_card_as_today() {
         let node = p40x2(&[]);
         for s in big40_split_specs() {
-            let r = evaluate(&node, &[s.clone()], 1024);
+            let r = evaluate(&node, std::slice::from_ref(&s), 1024);
             assert_eq!(r.verdict, Verdict::DoesNotFit, "{} {r:#?}", s.backend);
             let b = r.budget.as_ref().expect("a budget");
             assert!(b.total_gb == 24.0 && b.span.is_none(), "{b:?}");
@@ -1597,7 +1597,7 @@ mod tests {
         assert_eq!((a.kind, a.total_gb, a.headroom_gb), (b.kind, b.total_gb, b.headroom_gb));
         assert!(a.span.is_none() && a.span_text().is_none(), "{a:?}");
         for s in [spec("chat", GEMMA, None), llama("m:7b", Some("gpu"), &[])] {
-            let x = evaluate(&plain, &[s.clone()], 1024);
+            let x = evaluate(&plain, std::slice::from_ref(&s), 1024);
             let y = evaluate(&reported, &[s], 1024);
             assert_eq!(x.to_json(), y.to_json());
         }
