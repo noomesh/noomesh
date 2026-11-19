@@ -221,7 +221,7 @@ jobs:
           NOO_OWNER_TEST_IMAGE: ${{ env.OLLAMA_IMAGE }}
         run: |
           set -eu
-          echo "DOCKER_HOST=${DOCKER_HOST:-<the runner's socket>}"
+          echo "DOCKER_HOST=${DOCKER_HOST:-the runner socket}"
           docker version --format 'server under test: Docker {{.Server.Version}} (API {{.Server.APIVersion}})'
           go test -count=1 -v -run '^TestRealDaemonCopiesIntoOllamaKeepTheStoreOwner$' ./internal/docker/
 
