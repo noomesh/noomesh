@@ -316,11 +316,10 @@ func shouldStartOllamaPull(st *ollamaPullState, now time.Time) bool {
 func New(cfg *config.Config, docker *dockerpkg.Client, client *http.Client, harness hostsvc.Service) *Reconciler {
 	sets := modelsets.New(dockerpkg.ModelsDir(), cfg)
 	nw, facts := newNodeWorkloads(cfg, docker, sets)
-	return &Reconciler{
+	r := &Reconciler{
 		cfg:             cfg,
 		docker:          docker,
 		ollamaPulls:     map[string]*ollamaPullState{},
-		ollamaVerify:    newOllamaVerifyLoop(ollamaVerifier(docker)),
 		storeHas:        dockerpkg.ModelInStore,
 		importModel:     docker.ImportOllamaModel,
 		backendReady:    dockerBackendReady(docker),
@@ -339,6 +338,8 @@ func New(cfg *config.Config, docker *dockerpkg.Client, client *http.Client, harn
 		ggufMissing:     map[string]string{},
 		ggufExists:      docker.HostFileExists,
 	}
+	r.ollamaVerify = newOllamaVerifyLoop(ollamaVerifier(docker), r.Nudge)
+	return r
 }
 
 // SetDiskReclaimSink installs the receiver for the controller's node reclaim
@@ -416,7 +417,10 @@ func (r *Reconciler) nudgeCh() chan struct{} {
 //   - an ollama container this agent just started answers `ollama list`
 //     (nudgeWhenReady), so the next tick's ensure can see the model;
 //   - an import of a placed model finishes successfully (startOllamaImport),
-//     so the next tick sees it held and schedules its verification.
+//     so the next tick sees it held and schedules its verification;
+//   - a verify pass ends that was busy while a tick found other models due
+//     (ollamaVerifyLoop.missed), so they are checked on the next tick; a
+//     pass that skipped nothing never nudges.
 //
 // A FAILED import or pull never nudges: its backoff (ollamaPullRetryAfter)
 // decides when it is tried again. Nudges coalesce (a buffer of one), so any

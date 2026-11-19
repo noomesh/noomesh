@@ -11,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	dockerpkg "github.com/noomesh/noomesh/node-agent-go/internal/docker"
 )
 
 // 0.6.28-rc.2, a hosted node: `noo cluster place <node> ollama qwen2.5:0.5b`
@@ -134,5 +136,110 @@ func TestNudges_Coalesce(t *testing.T) {
 	<-r.nudgeCh()
 	if p := pendingNudges(r); p != 0 {
 		t.Fatalf("pending passes = %d after the one pass took it, want 0", p)
+	}
+}
+
+// gatedVerify is a verify loop whose passes block until released, and that
+// counts the nudges it asks for.
+type gatedVerify struct {
+	l       *ollamaVerifyLoop
+	release chan struct{}
+	mu      sync.Mutex
+	nudges  int
+	checked []string
+}
+
+func newGatedVerify() *gatedVerify {
+	g := &gatedVerify{release: make(chan struct{})}
+	g.l = newOllamaVerifyLoop(func(_ context.Context, model, _ string) dockerpkg.OllamaVerifyResult {
+		<-g.release
+		g.mu.Lock()
+		g.checked = append(g.checked, model)
+		g.mu.Unlock()
+		return dockerpkg.OllamaVerifyResult{Model: model, State: dockerpkg.OllamaVerified}
+	}, func() {
+		g.mu.Lock()
+		g.nudges++
+		g.mu.Unlock()
+	})
+	return g
+}
+
+func (g *gatedVerify) nudgeCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.nudges
+}
+
+// waitIdle waits for the running pass to end (busy cleared, nudge sent).
+func (g *gatedVerify) waitIdle(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		g.l.mu.Lock()
+		busy := g.l.busy
+		g.l.mu.Unlock()
+		if !busy {
+			time.Sleep(20 * time.Millisecond) // the deferred nudge follows busy=false
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("the verify pass never ended")
+}
+
+// A model that became due while a pass was busy (an import finished during
+// another model's first hash) is checked after that pass, not at the next
+// interval: the pass ends with ONE nudge.
+func TestVerifySkippedWhileBusy_NudgesAfterPass(t *testing.T) {
+	g := newGatedVerify()
+	ctx := context.Background()
+	g.l.schedule(ctx, []string{"llama3.2:1b"}, dockerpkg.OllamaLaneContainer)
+	// The next ticks, while that pass runs: a new model is due.
+	g.l.schedule(ctx, []string{"llama3.2:1b", "qwen2.5:0.5b"}, dockerpkg.OllamaLaneContainer)
+	g.l.schedule(ctx, []string{"llama3.2:1b", "qwen2.5:0.5b"}, dockerpkg.OllamaLaneContainer)
+	close(g.release)
+	g.waitIdle(t)
+	if n := g.nudgeCount(); n != 1 {
+		t.Fatalf("nudges = %d after a pass that skipped a due model, want exactly 1", n)
+	}
+	// The nudged tick starts the waiting model's pass.
+	g.l.schedule(ctx, []string{"llama3.2:1b", "qwen2.5:0.5b"}, dockerpkg.OllamaLaneContainer)
+	g.waitIdle(t)
+	g.mu.Lock()
+	checked := append([]string(nil), g.checked...)
+	g.mu.Unlock()
+	if len(checked) != 2 || checked[1] != "qwen2.5:0.5b" {
+		t.Fatalf("checked = %v, want the waiting model on the nudged tick", checked)
+	}
+	if n := g.nudgeCount(); n != 1 {
+		t.Fatalf("nudges = %d, want still 1: the second pass skipped nothing", n)
+	}
+
+	// Wired in production: the loop New builds nudges the reconciler.
+	r := tickFixture(t, &listDaemon{})
+	if r.ollamaVerify.nudge == nil {
+		t.Fatal("New must give the verify loop the reconciler's Nudge")
+	}
+	r.ollamaVerify.nudge()
+	if n := r.nudges.Load(); n != 1 {
+		t.Fatalf("the verify loop's nudge reached Reconciler.Nudge %d time(s), want 1", n)
+	}
+}
+
+// A pass that skipped nothing does not nudge, so a quiet node gets no extra
+// ticks: not alone, and not when the ticks during it found nothing due.
+func TestVerifyPassSkippedNothing_NoNudge(t *testing.T) {
+	g := newGatedVerify()
+	ctx := context.Background()
+	g.l.schedule(ctx, []string{"llama3.2:1b"}, dockerpkg.OllamaLaneContainer)
+	g.l.schedule(ctx, nil, dockerpkg.OllamaLaneContainer) // a tick with nothing held
+	close(g.release)
+	g.waitIdle(t)
+	// Re-checked just now: not due, so a tick schedules nothing.
+	g.l.schedule(ctx, []string{"llama3.2:1b"}, dockerpkg.OllamaLaneContainer)
+	g.waitIdle(t)
+	if n := g.nudgeCount(); n != 0 {
+		t.Fatalf("nudges = %d after passes that skipped nothing, want 0", n)
 	}
 }

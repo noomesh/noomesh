@@ -33,7 +33,7 @@ func TestOllamaVerifyRefusalReportedOncePerState(t *testing.T) {
 	l := newOllamaVerifyLoop(func(_ context.Context, model string, _ string) dockerpkg.OllamaVerifyResult {
 		return dockerpkg.OllamaVerifyResult{Model: model, State: state, Anchor: dockerpkg.OllamaAnchorMirror,
 			Blob: "sha256:aa", Reason: model + ": blob sha256:aa ... run `noo models pull " + model + "`"}
-	})
+	}, nil)
 	r := &Reconciler{ollamaVerify: l}
 
 	l.runPass(context.Background(), []string{"llama3.2:1b"}, dockerpkg.OllamaLaneContainer)
@@ -74,7 +74,7 @@ func TestOllamaVerifyRefusedModelReportedAbsent(t *testing.T) {
 			st = dockerpkg.OllamaRefused
 		}
 		return dockerpkg.OllamaVerifyResult{Model: model, State: st}
-	})
+	}, nil)
 	r := &Reconciler{ollamaVerify: l}
 	rows := []placement{
 		{Backend: "ollama", Model: "good:1b", Role: "chat", DesiredState: "running"},
@@ -102,7 +102,7 @@ func TestOllamaVerifyRunsOffTick(t *testing.T) {
 		calls <- model
 		<-release
 		return dockerpkg.OllamaVerifyResult{Model: model, State: dockerpkg.OllamaVerified}
-	})
+	}, nil)
 	done := make(chan struct{})
 	go func() {
 		l.schedule(context.Background(), []string{"m:1b"}, dockerpkg.OllamaLaneContainer)
