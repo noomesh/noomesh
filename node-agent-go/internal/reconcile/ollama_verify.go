@@ -40,8 +40,9 @@ import (
 const ollamaVerifyEvery = 10 * time.Minute
 
 type ollamaVerifyLoop struct {
-	// verify checks one model on the given lane (native = report only).
-	verify func(ctx context.Context, model string, native bool) dockerpkg.OllamaVerifyResult
+	// verify checks one model on the given lane (dockerpkg.OllamaLane*:
+	// the adopted lanes, native and stack, are report only).
+	verify func(ctx context.Context, model string, lane string) dockerpkg.OllamaVerifyResult
 	now    func() time.Time
 
 	mu      sync.Mutex
@@ -55,7 +56,7 @@ type ollamaVerifyLoop struct {
 	refusalsLogged int
 }
 
-func newOllamaVerifyLoop(verify func(context.Context, string, bool) dockerpkg.OllamaVerifyResult) *ollamaVerifyLoop {
+func newOllamaVerifyLoop(verify func(context.Context, string, string) dockerpkg.OllamaVerifyResult) *ollamaVerifyLoop {
 	return &ollamaVerifyLoop{
 		verify:  verify,
 		now:     time.Now,
@@ -78,7 +79,7 @@ func (l *ollamaVerifyLoop) dueLocked(models []string) []string {
 
 // schedule starts a pass over the due models in its own goroutine, unless
 // one is running. ctx is the Run context: the pass outlives the tick.
-func (l *ollamaVerifyLoop) schedule(ctx context.Context, models []string, native bool) {
+func (l *ollamaVerifyLoop) schedule(ctx context.Context, models []string, lane string) {
 	if l == nil || l.verify == nil {
 		return
 	}
@@ -100,15 +101,15 @@ func (l *ollamaVerifyLoop) schedule(ctx context.Context, models []string, native
 			l.busy = false
 			l.mu.Unlock()
 		}()
-		l.runPass(ctx, due, native)
+		l.runPass(ctx, due, lane)
 	}()
 }
 
 // runPass checks each model and publishes the results and the refusal.
-func (l *ollamaVerifyLoop) runPass(ctx context.Context, models []string, native bool) {
+func (l *ollamaVerifyLoop) runPass(ctx context.Context, models []string, lane string) {
 	for _, m := range models {
 		vctx, cancel := context.WithTimeout(ctx, 3*time.Hour)
-		res := l.verify(vctx, m, native)
+		res := l.verify(vctx, m, lane)
 		cancel()
 		l.mu.Lock()
 		prev, had := l.results[m]
@@ -256,7 +257,9 @@ func (r *Reconciler) clearBackendStart(backend string) {
 
 // verifyOllamaModels runs after ensureOllamaModels: schedules a check of
 // every placed model the server holds, and reports a refused one absent.
-func (r *Reconciler) verifyOllamaModels(ctx context.Context, rows []placement, native bool) {
+// lane is the Ollama checked (dockerpkg.OllamaLane*): the agent's container,
+// or the adopted lane's Runtime() ("native", "stack"), whose store differs.
+func (r *Reconciler) verifyOllamaModels(ctx context.Context, rows []placement, lane string) {
 	if r.ollamaVerify == nil {
 		return
 	}
@@ -281,7 +284,7 @@ func (r *Reconciler) verifyOllamaModels(ctx context.Context, rows []placement, n
 		}
 	}
 	r.ollamaVerify.retain(placed)
-	r.ollamaVerify.schedule(ctx, held, native)
+	r.ollamaVerify.schedule(ctx, held, lane)
 	for _, p := range ordered {
 		model := strings.TrimSpace(p.Model)
 		if !r.ollamaVerify.refused(model) {

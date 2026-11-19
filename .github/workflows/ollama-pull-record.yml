@@ -1,0 +1,135 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# The record of an Ollama pull, verified end to end against our real ollama
+# image (i1021), before merge and without a release. What it proves:
+#
+#   1. our ollama image (the staged one a release ships), with its store bound
+#      on the runner as a one-box install binds it (${NOO_DATA_ROOT}/ollama,
+#      owner 65532, the image's own umask), pulls a real model;
+#   2. the CLI's production recorder (noo-cli ollama_stage.rs
+#      record_before_pull / record_after_pull, an #[ignore] test only this job
+#      selects) fetches the registry manifest before that pull, compares it
+#      with the manifest the container installed, and writes the controller's
+#      record into a controller store on the runner;
+#   3. the agent's verifier on the "stack" lane (the controller's own node)
+#      finds that store from NOO_DATA_ROOT the way compose binds it, and
+#      reads it AS THE RUNNER'S UID, not 65532: exactly noo-agent's position,
+#      through the "other" permission bits. It must read "verified";
+#   4. with one blob made 0600 by its owner, the same check reads
+#      "cannot-read", never a missing manifest or a mismatch.
+#
+# It does not prove the host-prep ACL (scripts/prep-host.sh, tested in
+# tests/test_prep_host_data_dirs.py) or a whole install (the install matrix's
+# OLLAMA-VERIFIED probe gates the final). GitHub-hosted only, no secrets
+# beyond the read-only token; the model is the smallest the probes use.
+name: ollama-pull-record
+
+on:
+  pull_request:
+    branches: [ main, staging, develop, dev ]
+    paths:
+      - 'noo-cli/src/commands/ollama_stage.rs'
+      - 'noo-cli/src/commands/models_fetch.rs'
+      - 'node-agent-go/internal/docker/ollama_verify*.go'
+      - 'node-agent-go/internal/docker/ollama_mirror*.go'
+      - 'node-agent-go/internal/docker/data_root.go'
+      - 'docker/Dockerfile.ollama'
+      - '.github/workflows/ollama-pull-record.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read   # pull the staged ollama image from this repository owner's GHCR namespace
+
+concurrency:
+  group: ollama-pull-record-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ollama-pull-record:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      # The image a release ships: infra images are staged daily and a
+      # release re-tags :staged (infra-staged.yml). Pulled, never built here.
+      OLLAMA_IMAGE: ghcr.io/${{ github.repository_owner }}/ollama:staged
+      NOO_PULLRECORD_MODEL: qwen2.5:0.5b
+      NOO_PULLRECORD_CONTAINER: noo-ci-ollama
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e   # v7.0.0
+        with:
+          go-version-file: node-agent-go/go.mod
+          cache-dependency-path: node-agent-go/go.sum
+
+      # Per-job DOCKER_CONFIG first: a login in a shared credential store can
+      # be revoked under an overlapping job
+      # (tests/test_workflow_docker_login_isolation.py).
+      - name: Per-job Docker credential store and GHCR login
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          export DOCKER_CONFIG="$RUNNER_TEMP/.docker"
+          mkdir -p "$DOCKER_CONFIG"
+          echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin \
+            || echo "::warning::ghcr.io login failed: pulling $OLLAMA_IMAGE anonymously"
+
+      - name: Start our ollama image on a bound store
+        run: |
+          set -eu
+          data="$RUNNER_TEMP/noo"
+          store="$RUNNER_TEMP/controller-models"
+          # As prep-host creates it: the image's uid owns the Ollama store.
+          sudo install -d -o 65532 -g 65532 "$data/ollama"
+          mkdir -p "$store"
+          {
+            echo "NOO_PULLRECORD_DATA_ROOT=$data"
+            echo "NOO_PULLRECORD_STORE=$store"
+          } >> "$GITHUB_ENV"
+          docker run -d --name "$NOO_PULLRECORD_CONTAINER" \
+            --cap-drop ALL --security-opt no-new-privileges:true \
+            -v "$data/ollama:/home/nonroot/.ollama" "$OLLAMA_IMAGE"
+          for i in $(seq 1 30); do
+            docker exec "$NOO_PULLRECORD_CONTAINER" ollama list >/dev/null 2>&1 && break
+            sleep 2
+          done
+          docker exec "$NOO_PULLRECORD_CONTAINER" ollama --version
+          id -u
+
+      - name: Pull through it and record the pull (the CLI's recorder)
+        working-directory: noo-cli
+        run: |
+          set -eu
+          export PATH="$HOME/.cargo/bin:$PATH"
+          # The crate's pinned toolchain (noo-cli/rust-toolchain.toml): a
+          # rustup that no longer installs it implicitly is told to.
+          rustup toolchain install || rustup show active-toolchain
+          cargo test --locked --bin noo -- --ignored --nocapture \
+            the_record_of_a_real_pull_is_written_into_the_controller_store
+          ls -l "$NOO_PULLRECORD_STORE"
+          ls -ln "$NOO_PULLRECORD_DATA_ROOT/ollama/models/blobs"
+
+      - name: The stack lane verifies it, as the runner's uid
+        working-directory: node-agent-go
+        env:
+          NOO_PULLRECORD_WANT: verified
+        run: go test -count=1 -v -run '^TestPullRecordContainerStackLaneVerifiesARealPull$' ./internal/docker/
+
+      - name: One blob 0600, and the stack lane says it cannot read it
+        working-directory: node-agent-go
+        env:
+          NOO_PULLRECORD_WANT: cannot-read
+        run: |
+          set -eu
+          blob="$(ls "$NOO_PULLRECORD_DATA_ROOT/ollama/models/blobs" | head -n 1)"
+          sudo chmod 0600 "$NOO_PULLRECORD_DATA_ROOT/ollama/models/blobs/$blob"
+          go test -count=1 -v -run '^TestPullRecordContainerStackLaneVerifiesARealPull$' ./internal/docker/
+
+      - name: Ollama log
+        if: always()
+        run: docker logs "$NOO_PULLRECORD_CONTAINER" 2>&1 | tail -n 50 || true

@@ -39,7 +39,6 @@ use std::time::{Duration, Instant};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -347,8 +346,8 @@ pub fn refuse_mint(
 
 /// The perspective as `/auth/me` and the start/switch answers show it.
 /// Never `cap_at` (D-2: the cap is not advertised).
-pub fn view(id: &str, dims: &Perspective, started_at: DateTime<Utc>) -> Value {
-    json!({ "id": id, "dims": dims, "started_at": started_at.to_rfc3339() })
+pub fn view(id: &str, dims: &Perspective, started_at: jiff::Timestamp) -> Value {
+    json!({ "id": id, "dims": dims, "started_at": crate::wire_time::rfc3339_offset(started_at) })
 }
 
 // ───────────────────────── refusals ─────────────────────────
@@ -400,8 +399,8 @@ pub fn plain_session(claims: &Claims) -> Result<(), Refused> {
 struct Row {
     account: String,
     ended: bool,
-    cap_at: DateTime<Utc>,
-    started_at: DateTime<Utc>,
+    cap_at: jiff::Timestamp,
+    started_at: jiff::Timestamp,
 }
 
 /// How long a liveness answer is cached. Short, and ending a perspective in
@@ -458,7 +457,7 @@ pub enum Refusal {
 /// The middleware's check (§3.1 step 4): the row exists, belongs to `sub`,
 /// has not ended and is before `cap_at`. A row found past its cap is ended
 /// here, with reason `cap`. `Ok` carries `started_at` for `/auth/me`.
-pub async fn admit(db: &PgPool, sub: &str, prs: &PrsClaim) -> Result<DateTime<Utc>, Refusal> {
+pub async fn admit(db: &PgPool, sub: &str, prs: &PrsClaim) -> Result<jiff::Timestamp, Refusal> {
     if uuid::Uuid::parse_str(&prs.id).is_err() {
         return Err(Refusal::Unknown);
     }
@@ -480,13 +479,19 @@ pub async fn admit(db: &PgPool, sub: &str, prs: &PrsClaim) -> Result<DateTime<Ut
     // disagree by the hosts' clock skew, which only moves the moment a 12 h
     // safety net fires by that skew. Either side ends the row, and an ended
     // row is ended for both.
-    if Utc::now() >= row.cap_at {
+    if past_cap(row.cap_at, jiff::Timestamp::now()) {
         if let Err(e) = end(db, &prs.id, EndReason::Cap).await {
             tracing::warn!(perspective = %prs.id, error = %e, "perspective past its cap could not be ended");
         }
         return Err(Refusal::Ended);
     }
     Ok(row.started_at)
+}
+
+/// A perspective has reached its cap once now is at or after `cap_at`: at the
+/// instant itself it has ended.
+fn past_cap(cap_at: jiff::Timestamp, now: jiff::Timestamp) -> bool {
+    now >= cap_at
 }
 
 /// The HTTP answer for a refused `prs` token: 401 `perspective_ended`, or
@@ -605,7 +610,7 @@ pub async fn session_row(db: &PgPool, raw_cookie: &str, account: &str) -> Result
 pub struct Started {
     pub id: String,
     pub dims: Perspective,
-    pub started_at: DateTime<Utc>,
+    pub started_at: jiff::Timestamp,
     /// The narrowed role, from the account's LIVE role.
     pub role: Role,
 }
@@ -836,6 +841,25 @@ pub async fn carried(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 12 h cap: a perspective has ended at its instant, not after.
+    #[test]
+    fn a_perspective_ends_at_its_cap_instant() {
+        let cap: jiff::Timestamp = "2026-11-18T12:00:00Z".parse().unwrap();
+        let ms = jiff::SignedDuration::from_millis(1);
+        assert!(!past_cap(cap, cap - ms), "before the cap it is live");
+        assert!(past_cap(cap, cap), "at the cap it has ended");
+        assert!(past_cap(cap, cap + ms));
+    }
+
+    /// The middleware's admission asks with the current time.
+    #[test]
+    fn admission_checks_the_cap_against_now() {
+        let own = crate::test_src::own_code(include_str!("perspective.rs"));
+        let body = crate::test_src::fn_body(&own, "pub async fn admit(");
+        assert!(body.contains("if past_cap(row.cap_at, jiff::Timestamp::now()) {"));
+        assert!(body.contains("return Err(Refusal::Ended);"));
+    }
 
     const ROLES: [Role; 3] = [Role::User, Role::Operator, Role::Admin];
 

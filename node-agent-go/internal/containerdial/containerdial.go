@@ -50,6 +50,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -248,5 +249,86 @@ func Install(inner IPResolver) dialFn {
 	if t, ok := http.DefaultTransport.(*http.Transport); ok {
 		t.DialContext = wrapped
 	}
+	setInstalled(wrapped)
 	return wrapped
+}
+
+// installed is the host-mode dialer Install built, nil in container mode
+// (and before Install runs). It is the ONE place a transport the agent
+// builds for itself gets the host-mode dial: every *http.Transport that can
+// dial a backend by its docker-DNS name (BackendDialURL, a door, a noo-*
+// container, an OLLAMA_URL) goes through ApplyDial. A transport built
+// fresh (config.HTTPTransport, &http.Transport{}) does NOT inherit
+// http.DefaultTransport's dialer — the Ollama store import built one and
+// dialled "noo-stunnel-ollama" through the system resolver on every
+// host-mode node (0.6.27). TestBackendTransportsApplyTheHostDial pins the
+// call sites.
+//
+// An atomic pointer, not a mutex: ApplyDial's dial func reads it on EVERY
+// dial (see ApplyDial), so the read must be cheap and race-free.
+var installed atomic.Pointer[dialFn]
+
+func setInstalled(d dialFn) {
+	if d == nil {
+		installed.Store(nil)
+		return
+	}
+	installed.Store(&d)
+}
+
+// Installed returns the host-mode dialer, or nil in container mode (and
+// before Install runs).
+func Installed() dialFn {
+	if p := installed.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// ApplyDial gives t a dial func that consults Installed() at DIAL time and
+// returns t. Binding late is what makes the order free: a transport built
+// before Install (agent.New builds its shared transport first) still dials
+// through the host-mode dialer once Install has run. Binding at build time
+// left such a transport on the stock dialer for the life of the process.
+//
+// With nothing installed (container mode) the dial goes to base — the
+// dialer t had, or, when it had none, exactly the one net/http itself
+// falls back to (t.Dial, else a zero net.Dialer) — so the containerised
+// path dials as it always did. One more thing a non-nil DialContext would
+// change: net/http turns OFF automatic HTTP/2 for a transport with a
+// custom dialer. A transport that was eligible for it before (no TLS
+// config, no custom dialers) gets ForceAttemptHTTP2 so that stays as it
+// was too.
+func ApplyDial(t *http.Transport) *http.Transport {
+	if t == nil {
+		return nil
+	}
+	base := t.DialContext
+	if base == nil {
+		h2Auto := t.TLSClientConfig == nil && t.Dial == nil && t.DialTLS == nil && t.DialTLSContext == nil
+		if h2Auto {
+			t.ForceAttemptHTTP2 = true
+		}
+		if legacy := t.Dial; legacy != nil {
+			base = func(_ context.Context, network, addr string) (net.Conn, error) { return legacy(network, addr) }
+		} else {
+			var zero net.Dialer // net/http's own fallback when a transport names no dialer
+			base = zero.DialContext
+		}
+	}
+	t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if d := Installed(); d != nil {
+			return d(ctx, network, addr)
+		}
+		return base(ctx, network, addr)
+	}
+	return t
+}
+
+// SwapForTest installs d as the host-mode dialer (nil = container mode) and
+// returns the restore. Tests only: production sets it through Install.
+func SwapForTest(d func(ctx context.Context, network, addr string) (net.Conn, error)) (restore func()) {
+	prev := Installed()
+	setInstalled(d)
+	return func() { setInstalled(prev) }
 }

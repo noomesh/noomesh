@@ -470,6 +470,42 @@ def test_a_missing_systemd_run_is_a_failed_precheck(node: Node) -> None:
     a = applied_of(r)
     assert "harness-egress=UNENFORCED:selfcheck-unavailable" in a, a
     assert not node.dropin.exists() and not node.net.exists() and "RESTART=1" in r.stdout
+    assert "no systemd-run here" in r.stderr and "a controller name did not resolve" not in r.stderr, r.stderr
+
+
+def test_the_precheck_looks_up_names_but_not_a_literal_ip(tmp_path: Path) -> None:
+    """The check itself, run for real: getent always fails here, as a reverse
+    lookup does under the hold's files-only hosts. A literal IP is connected to,
+    never looked up; a name still must resolve."""
+    import socket
+    check = re.search(r"^HE_CHECK='(.*?)'\n", LIB, re.S | re.M).group(1)
+    (tmp_path / "check.sh").write_text(check)
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "getent").write_text("#!/bin/sh\nexit 2\n")
+    (fake / "getent").chmod(0o755)
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+    port = srv.getsockname()[1]
+    try:
+        r = subprocess.run(["bash", str(tmp_path / "check.sh"), "127.0.0.1", str(port), "ctl.example.net", "443"],
+                           capture_output=True, text=True, timeout=30,
+                           env={"PATH": f"{fake}:/usr/bin:/bin"})
+    finally:
+        srv.close()
+    assert f"ok 127.0.0.1 {port}" in r.stdout, r.stdout
+    assert "FAIL 127.0.0.1" not in r.stdout, r.stdout
+    assert "FAIL ctl.example.net 443 lookup" in r.stdout, r.stdout
+
+
+def test_a_literal_controller_ip_is_allowed_only_when_the_base_list_misses_it(node: Node) -> None:
+    node.env.write_text("NODE_ID=h\nNOO_GATEWAY_URL=https://203.0.113.10:8443\nNATS_URL=tls://203.0.113.10:4222\n")
+    applied_of(node.run())
+    assert "203.0.113.10/32" in allow_line(node).split()
+    node.env.write_text("NODE_ID=h\nNOO_GATEWAY_URL=https://192.168.1.10:8443\nNATS_URL=tls://192.168.1.10:4222\n")
+    applied_of(node.run())
+    assert sorted(allow_line(node).split()) == BASE_ALLOW, "a LAN address is already in the base list"
 
 
 def test_a_precheck_that_says_nothing_is_not_a_pass(node: Node) -> None:

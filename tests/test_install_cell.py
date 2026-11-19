@@ -837,3 +837,40 @@ def test_the_slots_ab_proves_the_daemon_runs_what_it_set():
     assert '[ "$got" = "$1" ] || {' in ab and "exit 1; }" in ab, ab
     probe = text[text.index("step probe-embed-slots"):]
     assert "docker exec noo-ollama-embed printenv OLLAMA_NUM_PARALLEL" in probe.split("\n")[0]
+
+
+def test_the_ollama_verified_probe_reads_the_container_onboard_pulled_into(tmp_path):
+    """i1021 (rc.4 printed `(ollama ?)`): the probe read `ollama --version` from
+    noo-ollama, but a standalone onboard pulls into noo-ollama-embed. It picks
+    the container the way pull_ollama does (NOO_STANDALONE=1 or a
+    .noo-standalone marker, else noo-ollama) and prints the version and the
+    container on every OLLAMA-VERIFIED line, PASS or FAIL."""
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    start = text.index("onboard_ollama_container() {")
+    fn = text[start:text.index("\n}\n", start) + 3]
+
+    def pick(home, standalone=""):
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(home), "NOO_STANDALONE": standalone}
+        r = subprocess.run(["bash", "-c", fn + "onboard_ollama_container"], env=env, capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        return r.stdout.strip()
+
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert pick(plain) == "noo-ollama"
+    assert pick(plain, "1") == "noo-ollama-embed"
+    one_box = tmp_path / "onebox"
+    (one_box / "noomesh").mkdir(parents=True)
+    (one_box / "noomesh" / ".noo-standalone").write_text("")
+    assert pick(one_box) == "noo-ollama-embed"
+    # onboard's own rule, which this mirrors
+    steps = (ROOT / "noo-cli/src/onboard/steps.rs").read_text()
+    assert 'let target = if standalone { "noo-ollama-embed" } else { "noo-ollama" };' in steps
+
+    probe = text[text.index("step probe-ollama-verified"):]
+    probe = probe[:probe.index("\n# PROBE", 1)]
+    assert 'oc="$(onboard_ollama_container)"' in probe, probe
+    assert "docker exec noo-ollama ollama" not in probe, probe
+    assert "export -f onboard_ollama_container" in text
+    lines = [ln for ln in probe.splitlines() if "OLLAMA-VERIFIED " in ln]
+    assert len(lines) == 2 and all("(ollama ${ov:-?} in $oc)" in ln for ln in lines), lines

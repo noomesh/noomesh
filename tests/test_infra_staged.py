@@ -234,10 +234,22 @@ def test_staged_moves_only_after_the_scan_gate_and_the_build_pushes_only_a_date_
         assert "if" not in s or i in (_idx("Set up buildx, second attempt"),), \
             f"step {s.get('name')} is conditional: a failed gate must stop every later step"
     assert '-t "$REF:$DATE_TAG"' in _steps()[build]["run"]
-    assert re.search(r"^set -\w*o pipefail$", _steps()[gate]["run"], re.M), \
+    # The scan and the gate live in scripts/infra-scan.sh (shared with the
+    # release's fallback build); the steps call exactly those commands.
+    assert _steps()[scan]["run"] == 'scripts/infra-scan.sh scan "$REF" "$DIGEST" "${{ matrix.platforms }}"'
+    assert _steps()[gate]["run"] == "scripts/infra-scan.sh gate"
+    assert re.search(r"^set -\w*o pipefail$", SCAN_SH, re.M), \
         "| tee without pipefail turns a failed gate green"
-    assert "new-findings" in _steps()[gate]["run"]
+    assert "new-findings" in _scan_fn("gate")
     assert '"$REF:staged" "$REF@$DIGEST"' in _steps()[promote]["run"]
+
+
+SCAN_SH = (ROOT / "scripts/infra-scan.sh").read_text()
+
+
+def _scan_fn(name):
+    """The body of one shell function of scripts/infra-scan.sh."""
+    return SCAN_SH.split(f"\n{name}() {{\n", 1)[1].split("\n}\n", 1)[0]
 
 
 def _buildx_lines(run):
@@ -246,10 +258,10 @@ def _buildx_lines(run):
 
 
 def test_the_old_staged_is_scanned_only_for_the_platforms_it_has():
-    scan = _steps()[_idx("Scan the new build")]["run"]
-    assert '| python3 scripts/infra-staged.py platforms)"' in scan
+    scan = _scan_fn("scan")
+    assert '| python3 "$HERE/infra-staged.py" platforms)"' in scan
     assert 'case " $old_platforms " in *" $p "*)' in scan, "only a platform the old index has is scanned"
-    gate = _steps()[_idx("Gate")]["run"]
+    gate = _scan_fn("gate")
     assert "shopt -s nullglob" in gate and '--old "${olds[@]}"' in gate, \
         "the gate gets exactly the old reports that exist, possibly none"
 

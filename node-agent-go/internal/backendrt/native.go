@@ -39,6 +39,7 @@ import (
 	"time"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/config"
+	"github.com/noomesh/noomesh/node-agent-go/internal/containerdial"
 	"github.com/noomesh/noomesh/node-agent-go/internal/preseed"
 )
 
@@ -255,7 +256,10 @@ func laneTransport(base string) (http.RoundTripper, error) {
 	if err != nil {
 		return nil, fmt.Errorf("OLLAMA_URL %s: %w", base, err)
 	}
-	return tr, nil
+	// Loopback in every shipped config (an IP never reaches docker), but
+	// OLLAMA_URL is operator-set and may name a door container; the
+	// host-mode dialer resolves that, and is a no-op in a container.
+	return containerdial.ApplyDial(tr), nil
 }
 
 func selfNodeFromEnv() bool {

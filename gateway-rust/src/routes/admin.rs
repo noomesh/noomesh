@@ -3383,7 +3383,7 @@ async fn logs_tail(
         direction: Some("backward".into()),
         ..Default::default()
     };
-    let built = logs_search::build(&spec, chrono::Utc::now()).map_err(AppError::BadRequest)?;
+    let built = logs_search::build(&spec, jiff::Timestamp::now()).map_err(AppError::BadRequest)?;
     let outcome = logs_search::query_configured_loki(&built).await;
     let fallback = match outcome {
         logs_search::LokiOutcome::Lines(mut got) => {
@@ -3485,12 +3485,13 @@ async fn logs_errors(
         direction: Some("backward".into()),
         ..Default::default()
     };
-    let built = logs_search::build(&spec, chrono::Utc::now()).map_err(AppError::BadRequest)?;
+    let built = logs_search::build(&spec, jiff::Timestamp::now()).map_err(AppError::BadRequest)?;
     let outcome = logs_search::query_configured_loki(&built).await;
     let fallback = match outcome {
         logs_search::LokiOutcome::Lines(mut got) => {
             got.reverse();
-            let window_minutes = (built.end - built.start).num_minutes().max(1);
+            // Whole minutes, truncated toward zero (as chrono's num_minutes).
+            let window_minutes = built.end.duration_since(built.start).as_mins().max(1);
             let matches: Vec<Value> = got
                 .iter()
                 .map(|l| {
@@ -3595,7 +3596,7 @@ async fn logs_errors(
 async fn logs_search(body: Option<Json<Value>>) -> AppResult {
     let body = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
     let spec = search_spec_from_body(&body);
-    let built = logs_search::build(&spec, chrono::Utc::now()).map_err(AppError::BadRequest)?;
+    let built = logs_search::build(&spec, jiff::Timestamp::now()).map_err(AppError::BadRequest)?;
     let outcome = logs_search::query_configured_loki(&built).await;
     logs_search::search_answer(outcome, &built).map(Json)
 }

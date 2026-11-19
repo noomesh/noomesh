@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -531,5 +532,147 @@ func TestOllamaRemedyActsOnThisNodesOllama(t *testing.T) {
 	t.Setenv("NOO_SELF_NODE", "1")
 	if got, want := ollamaRemedy("gemma4:e2b"), "noo models pull gemma4:e2b"; got != want {
 		t.Fatalf("the controller's own node: %q, want %q", got, want)
+	}
+}
+
+// ── The stack lane (the controller's own node) and unreadable stores ────
+
+// newLaneRig is a rig whose verifier checks lane.
+func newLaneRig(t *testing.T, lane string) *verifyRig {
+	t.Helper()
+	rg := newVerifyRig(t, lane == OllamaLaneNative)
+	rg.v.Lane = lane
+	return rg
+}
+
+// The self node adopts the stack's Ollama (noo-ollama-embed on a one-box):
+// its store is the directory compose binds, ${NOO_DATA_ROOT}/ollama, and its
+// models dir under that. Not OLLAMA_DATA_DIR (the agent's own container's),
+// and not the agent's HOME (the native lane's).
+func TestOllamaStackLaneReadsTheStacksStoreUnderTheDataRoot(t *testing.T) {
+	t.Setenv("NOO_DATA_ROOT", "/srv/noo")
+	t.Setenv("OLLAMA_DATA_DIR", "/elsewhere/ollama")
+	t.Setenv("OLLAMA_MODELS", "/home/someone/.ollama/models")
+	if got, want := ollamaModelsDir(OllamaLaneStack), "/srv/noo/ollama/models"; got != want {
+		t.Fatalf("stack lane reads %q, want %q (compose's ollama-embed-data bind)", got, want)
+	}
+	if got, want := ollamaModelsDir(OllamaLaneContainer), "/elsewhere/ollama/models"; got != want {
+		t.Fatalf("container lane reads %q, want %q", got, want)
+	}
+}
+
+// The stack's Ollama is compose-managed: a mismatch is reported, nothing is
+// removed and nothing re-installed, whatever the anchor.
+func TestOllamaStackLaneNeverRepairs(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(rg *verifyRig) string
+	}{
+		{"mirror", func(rg *verifyRig) string {
+			m, _ := rg.mirrorSetup()
+			rg.writeBlobAt(m, "tampered")
+			return mirrorModel
+		}},
+		{"pull record", func(rg *verifyRig) string {
+			m, _ := rg.pullRecordSetup()
+			rg.writeBlobAt(m, "tampered")
+			return mirrorModel
+		}},
+		{"gguf", func(rg *verifyRig) string {
+			m := rg.ggufSetup()
+			rg.writeBlobAt(m, "tampered")
+			return ggufModel
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rg := newLaneRig(t, OllamaLaneStack)
+			model := tc.setup(rg)
+			res := rg.v.Verify(context.Background(), model)
+			if len(rg.repairs) != 0 {
+				t.Fatalf("the stack's Ollama was repaired by the agent: %+v", rg.repairs)
+			}
+			if res.State != OllamaMismatch || res.Lane != OllamaLaneStack {
+				t.Fatalf("got %+v, want a stack-lane mismatch", res)
+			}
+		})
+	}
+}
+
+// On the stack lane the remedy is the command that fixes it on this box:
+// `noo models pull <tag>` re-pulls into the stack's Ollama and rewrites the
+// controller's record, even where NOO_SELF_NODE is not in the environment.
+func TestOllamaStackLaneRemedyIsNooModelsPull(t *testing.T) {
+	t.Setenv("NOO_SELF_NODE", "")
+	t.Setenv("NODE_ID", "node-a")
+	rg := newLaneRig(t, OllamaLaneStack)
+	if got, want := rg.v.remedy(mirrorModel), "noo models pull "+mirrorModel; got != want {
+		t.Fatalf("stack-lane remedy %q, want %q", got, want)
+	}
+	// A pull with no controller record (a hand pull): still unverified with
+	// that reason, and the re-pull as its remedy.
+	rg.localManifest("library", "mistral", "latest",
+		manifestBody(layerSpec{"application/vnd.docker.container.image.v1+json", rg.blob("c"), 1},
+			layerSpec{ollamaModelMedia, rg.blob("hand pulled"), 11}))
+	res := rg.v.Verify(context.Background(), "mistral")
+	if res.State != OllamaUnverified || res.Reason != "no controller record" || res.Remedy != "noo models pull mistral" {
+		t.Fatalf("got %+v", res)
+	}
+}
+
+// A blob or manifest the agent may not read (EACCES) is "cannot read", with
+// its own remedy: never "no local manifest", never a mismatch, never repaired.
+func TestOllamaVerifyAStoreFileTheAgentCannotReadIsCannotRead(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a 0000 file: this needs an unprivileged reader")
+	}
+	for _, which := range []string{"blob", "manifest"} {
+		t.Run(which, func(t *testing.T) {
+			rg := newLaneRig(t, OllamaLaneStack)
+			model, _ := rg.pullRecordSetup()
+			p := rg.v.blobPath(model)
+			if which == "manifest" {
+				p = rg.v.manifestPath("library", "llama3.2", "1b")
+			}
+			if err := os.Chmod(p, 0); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(p, 0o644) })
+			res := rg.v.Verify(context.Background(), mirrorModel)
+			if res.State != OllamaCannotRead {
+				t.Fatalf("got %+v, want %q", res, OllamaCannotRead)
+			}
+			if !strings.Contains(res.Reason, "cannot read "+p) || !strings.Contains(res.Reason, "permission denied") {
+				t.Errorf("reason %q does not name the file and the permission", res.Reason)
+			}
+			if strings.Contains(res.Reason, "no local manifest") {
+				t.Errorf("an unreadable file reads as absent: %q", res.Reason)
+			}
+			if len(rg.repairs) != 0 {
+				t.Errorf("repaired: %+v", rg.repairs)
+			}
+		})
+	}
+}
+
+// The cannot-read remedy leads with what normally makes the store readable,
+// the re-pull through noo (Ollama rewrites the files with its shipped modes,
+// 755/644), and gives the sudo chmod only after it, labelled as the fallback.
+func TestOllamaCannotReadRemedyRePullsFirstAndChmodIsTheFallback(t *testing.T) {
+	// The container lane on the controller's own node: its re-pull is `noo
+	// models pull` through ollamaRemedy, so this test reads the order alone,
+	// not the stack lane's remedy (TestOllamaStackLaneRemedyIsNooModelsPull).
+	t.Setenv("NOO_SELF_NODE", "1")
+	rg := newLaneRig(t, OllamaLaneContainer)
+	res := rg.v.cannotRead(OllamaVerifyResult{}, mirrorModel, &unreadableErr{path: rg.v.blobPath("aa"), err: fs.ErrPermission})
+	want := "noo models pull " + mirrorModel + "; if the files stay unreadable: sudo chmod -R o+rX " + rg.v.ModelsDir
+	if res.Remedy != want {
+		t.Fatalf("remedy %q, want %q", res.Remedy, want)
+	}
+	pull, chmod := strings.Index(res.Remedy, "noo models pull"), strings.Index(res.Remedy, "sudo chmod")
+	if pull != 0 || chmod < pull {
+		t.Fatalf("the re-pull must come first and the chmod after it: %q", res.Remedy)
+	}
+	if !strings.Contains(res.Reason, "755/644 (umask 0022)") {
+		t.Errorf("reason does not say what makes the store readable: %q", res.Reason)
 	}
 }

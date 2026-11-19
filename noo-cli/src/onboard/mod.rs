@@ -189,6 +189,13 @@ pub(crate) struct State {
     pub tier: u8,
     pub gpu_model: String,
     pub vram_gb: f64,
+    /// The local GPU's compute capability (the lowest of its GPUs), read with
+    /// the model and VRAM. None is unknown: vLLM is then offered but not
+    /// recommended (`steps::vllm_offer`).
+    pub compute_cap: Option<String>,
+    /// The line saying why vLLM is not offered on this GPU was printed; it is
+    /// said once per run.
+    pub vllm_floor_said: bool,
     /// The prereqs step found no GPU at all (`nvidia-smi` absent or failed;
     /// not merely busy). The environment step then seeds the CPU-only
     /// Ollama slot count on a new install (i802).

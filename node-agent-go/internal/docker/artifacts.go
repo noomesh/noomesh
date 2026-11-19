@@ -188,6 +188,12 @@ func (c *Client) PullImageArtifact(ctx context.Context, ref, controllerImageID, 
 	if err := os.MkdirAll(stagingDir(), 0o755); err != nil {
 		return nil, fmt.Errorf("staging dir: %w", err)
 	}
+	// Room for the tar AND its load, before a byte is fetched (image_space.go):
+	// a shortfall is a NoSpaceError, which resolveImage never backs off.
+	dockerRoot := dockerRootDirFn(ctx, c)
+	if err := checkImagePullSpace(ref, stagingDir(), dockerRoot, m.SizeBytes); err != nil {
+		return nil, err
+	}
 	staged := filepath.Join(stagingDir(), tarName)
 	src := cacheURL + "/images/" + url.PathEscape(tarName)
 	slog.Info("pulling image artifact", "image", ref, "tar", tarName, "sha256", sha[:12]+"…")
@@ -197,7 +203,7 @@ func (c *Client) PullImageArtifact(ctx context.Context, ref, controllerImageID, 
 		if errors.Is(err, preseed.ErrDigestMismatch) {
 			return nil, &ImageVerificationError{Ref: ref, Err: fmt.Errorf("fetch %s: %w", tarName, err)}
 		}
-		return nil, fmt.Errorf("fetch %s: %w", tarName, err)
+		return nil, classifyNoSpace(ref, "the agent's staging dir", stagingDir(), fmt.Errorf("fetch %s: %w", tarName, err))
 	}
 	// The tar is single-use: remove it whether or not the load succeeds. A
 	// re-run re-fetches (LAN-cheap), and a failed load never leaves a
@@ -221,14 +227,14 @@ func (c *Client) PullImageArtifact(ctx context.Context, ref, controllerImageID, 
 	defer f.Close()
 	res, err := c.docker.ImageLoad(ctx, f)
 	if err != nil {
-		return nil, fmt.Errorf("docker load: %w", err)
+		return nil, classifyNoSpace(ref, "Docker's data root", dockerRoot, fmt.Errorf("docker load: %w", err))
 	}
 	// Drain the progress stream — the daemon only commits the load as the
 	// body is consumed, and Close alone can truncate it.
 	loadOut := drainToString(res)
 	res.Close()
-	if strings.Contains(loadOut, "\"error\"") {
-		return nil, fmt.Errorf("docker load reported: %s", strings.TrimSpace(loadOut))
+	if err := loadReportError(ref, dockerRoot, loadOut); err != nil {
+		return nil, err
 	}
 	slog.Info("image artifact loaded", "image", ref, "detail", strings.TrimSpace(lastLine(loadOut)))
 
@@ -342,8 +348,9 @@ func nodeIDOrPlaceholder() string {
 
 // ImageVerificationError: the rail delivered something that does not check
 // out — tar sha256, archive contents, loaded image ID or architecture. Never
-// run, never fallen back from: the caller refuses the start. Every OTHER
-// rail failure (no cache URL, unreachable, timeout, disk full) is transport.
+// run, never fallen back from: the caller refuses the start. A full disk is
+// a NoSpaceError (image_space.go); every OTHER rail failure (no cache URL,
+// unreachable, timeout) is transport.
 type ImageVerificationError struct {
 	Ref string
 	Err error

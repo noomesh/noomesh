@@ -760,7 +760,10 @@ address of its own, so the dialer follows its `container:` network mode one
 hop to the door (`ContainerDialAddr`), the same address docker DNS gives a
 containerised caller. The CA the
 proxy verifies doors with is the agent's `NOO_TLS_CA` (the container path
-`/app/pki/ca.crt` only for a containerised agent).
+`/app/pki/ca.crt` only for a containerised agent). Every transport the
+agent builds to dial a backend (the inference proxies, the Ollama store
+import, an adopted lane's `OLLAMA_URL`) takes the shared dialer through
+`containerdial.ApplyDial`; a test fails on one that does not.
 
 | Host | Address the dialer uses | Published on the host |
 |---|---|---|
@@ -994,6 +997,25 @@ from a record alone is refused by name.
 There is no setting that marks a model trusted. On a node whose Ollama the
 agent does not manage (a Mac's native Ollama) a mismatch is reported, never
 repaired or refused.
+
+The controller's own node adopts the stack's Ollama (`noo-ollama-embed` on a
+one-box install). Its check reads the store compose binds for that container,
+`${NOO_DATA_ROOT}/ollama/models` (not `OLLAMA_DATA_DIR`, and not the agent's
+home), and is report-only: compose manages that Ollama, so the agent removes
+nothing and re-installs nothing there. A mismatch names the fix on that box,
+`noo models pull <tag>`, which pulls into the stack's Ollama again and rewrites
+the record.
+
+The agent reads Ollama's store through its "other" permission bits (the store
+belongs to the Ollama image's user). A manifest or blob it may not read is
+reported as "cannot read <path>" with its own remedy, never as a missing
+manifest or a mismatch. Our Ollama image writes the store with umask 0022
+(directories 755, files 644), which the agent can read; a 0600 file usually
+means something other than our image wrote it, or the umask was changed. The
+remedy first re-pulls through noo (`noo models pull <tag>` on the
+controller's own node), which has Ollama rewrite the blobs and the manifest
+with its own modes; if the files stay unreadable: `sudo chmod -R o+rX
+<store>`.
 
 ## Backend door leaves
 
@@ -1299,10 +1321,12 @@ What this does and does not add:
   anything but the requested ref is refused before `docker load`; a loaded
   image that does not resolve under the requested ref, or is built for
   another architecture, is refused before a container starts. Those are
-  VERIFICATION failures: never run, never fallen back from. A TRANSPORT or
-  disk failure (cache unreachable, timeout, no space) with the image already
-  present runs the local copy, reported as `local`, and the rail is not
-  retried for 30 minutes.
+  VERIFICATION failures: never run, never fallen back from. A TRANSPORT
+  failure (cache unreachable, timeout) with the image already present runs
+  the local copy, reported as `local`, and the rail is not retried for 30
+  minutes. Too little disk space (checked before the fetch, or a real
+  ENOSPC) runs a present local copy the same way but is retried on the next
+  reconcile pass.
 - **What this does NOT protect against, said plainly.** The manifest is
   authenticated, not signed: under this design **a compromised gateway (or
   anyone who can write the controller's image store) chooses the bytes
@@ -1317,7 +1341,7 @@ What this does and does not add:
   raise the bar above "the controller vouches".
 - **Our images are rail-only.** A not-staged image of ours is a refusal
   naming `noo cluster sync-images <node> -i <image>` / `noo upgrade`, never
-  a registry pull.
+  a registry pull. A release-pinned image is staged by its lock digest (`noo cluster sync-images --stage-only --lock`), also when named with `-i`; `-i` is for images the release does not carry.
 - **Vendor CLIs are rail-only too.** A harness kind's vendor CLI (and the
   runtime it runs on) is fetched by the controller with
   `noo cluster vendor stage`, verified against the sha256 pinned in
@@ -1528,6 +1552,8 @@ reaches the controller on the heartbeat with the exact command to fix it:
 ```
 noo cluster sync-images <node> -i <the ref> --no-restart
 ```
+
+A release-pinned image is staged by its lock digest (`noo cluster sync-images --stage-only --lock`), also when named with `-i`; `-i` is for images the release does not carry.
 
 The `-i` matters. A bare `noo cluster sync-images <node>` ships the
 *unprefixed local build* names, so on a released node it reports success

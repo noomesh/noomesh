@@ -103,6 +103,9 @@ jobs:
       source_tags: ${{ steps.plan.outputs.source_tags }}
       staged: ${{ steps.plan.outputs.staged }}
       staged_bases: ${{ steps.plan.outputs.staged_bases }}
+      # The infra images (JSON list: scripts/infra-staged.py DAILY, as the
+      # plan reads it). One the images leg BUILDS is scanned and gated there.
+      infra: ${{ steps.plan.outputs.infra }}
     steps:
       - name: Checkout (full history)   # actions/checkout@v7.0.1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -173,13 +176,16 @@ jobs:
       # (scripts/release-image-inputs.json); a change to this workflow or
       # the other lane files rebuilds everything.
       #
-      # STAGED INFRA IMAGES (i567): llamacpp, ollama, stunnel,
+      # STAGED INFRA IMAGES (i567): llamacpp, llamacpp-cuda, ollama, stunnel,
       # postgres-pgvector, whisper, piper and nvidia-exporter are built,
       # scanned and staged daily by infra-staged.yml. Any of them the rc path
       # would build is re-tagged from `<image>:staged` instead, when the staged
       # digest's fingerprint label equals this commit's on every platform and
       # it is at most 3 days old; otherwise it builds here, with a ::warning::
-      # saying why. The plan pins the digest; the re-tag copies that digest.
+      # saying why, and that build is scanned and gated exactly as the daily
+      # one is (images leg, "Scan … as infra-staged does") before its digest
+      # can reach the lock. The plan pins the digest; the re-tag copies that
+      # digest.
       - name: Registry login (read :staged labels)
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
       - name: Plan — re-tag from the rc or :staged, or build
@@ -556,6 +562,10 @@ jobs:
       # the rc's image tag, or `@sha256:…` for a staged infra image (i567)
       RC_TAG: ${{ fromJSON(needs.release-line.outputs.source_tags)[matrix.image] }}
       RC_DIGEST: ${{ fromJSON(needs.release-line.outputs.rc_digests)[matrix.image] }}
+      # 'true' for an infra image (scripts/infra-staged.py DAILY, via the plan)
+      INFRA: ${{ contains(fromJSON(needs.release-line.outputs.infra), matrix.image) }}
+      # when the daily job built a :staged copy this leg re-tags (else empty)
+      STAGED_AT: ${{ fromJSON(needs.release-line.outputs.staged)[matrix.image] }}
     strategy:
       fail-fast: false
       matrix:
@@ -907,6 +917,44 @@ jobs:
           mkdir -p digests
           d="$(docker buildx imagetools inspect "$REGISTRY/$OWNER/${{ matrix.image }}:$TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')"
           echo "${{ matrix.image }}@$d" | tee "digests/${{ matrix.image }}"
+          echo "PUSHED_DIGEST=$d" >> "$GITHUB_ENV"
+
+      # AN INFRA IMAGE BUILT HERE IS SCANNED AS A STAGED ONE IS. The plan
+      # builds an infra image when no :staged copy is usable (stale, other
+      # fingerprint, none yet); that build used to ship unscanned, and the
+      # rc -> final re-tag carried it into the final (0.6.28-rc.1's
+      # llamacpp-cuda). Now it gets infra-staged.yml's own scan and gate
+      # (scripts/infra-scan.sh): the pinned Trivy, every platform this leg
+      # built, fixable HIGH/CRITICAL, the current :staged scanned with the
+      # same database, and `infra-staged.py new-findings`. A NEW finding
+      # fails this leg, so `lock` (needs.images.result == 'success') never
+      # signs the digest and its artifact is never uploaded; inherited and
+      # RIDING findings are reported. No :staged at all (a first build):
+      # reported, not gated, and the line says so. Exactly as strict as the
+      # daily path, no more.
+      #
+      # NOT like the daily path: "Build + push" has already pushed :$TAG (and
+      # :latest on a final) when this runs; the daily build pushes only an
+      # immutable date tag before its gate, never :staged. So a failing scan
+      # means: the image is pushed as <tag> but kept out of the signed lock;
+      # nodes install by lock digest. (The push order is left as it is here.)
+      - name: Scan ${{ matrix.name }} as infra-staged does (built here, not re-tagged)
+        if: env.RETAG != 'true' && env.INFRA == 'true'
+        run: |
+          set -euo pipefail
+          scripts/infra-scan.sh install-trivy
+          export PATH="$RUNNER_TEMP/trivy-bin:$PATH"
+          ref="$REGISTRY/$OWNER/${{ matrix.image }}"
+          if ! { scripts/infra-scan.sh scan "$ref" "$PUSHED_DIGEST" "${{ matrix.platforms }}" && scripts/infra-scan.sh gate; }; then
+            echo "::error::${{ matrix.image }}: scan failed or found a new fixable HIGH/CRITICAL: the image is pushed as $ref:$TAG${PUSH_LATEST:+ and $ref:latest} but kept out of the signed lock; nodes install by lock digest"
+            exit 1
+          fi
+          scripts/infra-scan.sh verdict "${{ matrix.image }}"
+      # The other way an infra image ships: re-tagged, from :staged (it
+      # passed the daily gate) or from an rc (whose own run printed its line).
+      - name: Release log — ${{ matrix.name }} re-tagged
+        if: env.RETAG == 'true' && env.INFRA == 'true'
+        run: scripts/infra-scan.sh retag-line "${{ matrix.image }}" "$RC_TAG" "$STAGED_AT"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: digest-${{ matrix.image }}

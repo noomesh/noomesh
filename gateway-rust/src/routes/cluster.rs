@@ -4689,6 +4689,71 @@ pub(crate) fn validate_target(backend: &str, target: Option<&str>, node: &Value)
     Ok(())
 }
 
+/// The vLLM image this release pins (`docker-compose.cluster.yml`, the agent's
+/// `backends.go`), the CUDA it is built on, and the lowest GPU compute
+/// capability that CUDA supports. CUDA 13 dropped compute capability below 7.5
+/// (Pascal, Volta), so this vLLM cannot start on such a GPU. A property of the
+/// IMAGE, not of vLLM: `tests/test_vllm_compute_floor.py` fails when the pin
+/// moves and these do not. The CLI (`noo-cli/src/vllm_floor.rs`) and the agent
+/// (`docker.VllmMinComputeCap`) declare the same floor.
+pub(crate) const VLLM_IMAGE_TAG: &str = "v0.25.0";
+pub(crate) const VLLM_IMAGE_CUDA: &str = "13.0";
+pub(crate) const VLLM_MIN_COMPUTE_CAP: &str = "7.5";
+
+/// The backends that run the pinned vLLM image.
+pub(crate) fn is_vllm_backend(backend: &str) -> bool {
+    matches!(backend, "vllm" | "vllm-secondary")
+}
+
+/// What the pinned vLLM makes of a GPU of compute capability `cap` (the
+/// node's `gpu_compute_cap`, the LOWEST of its GPUs). Unknown is its own
+/// outcome, not "below": an agent older than 0.6.18 does not report
+/// `gpu_compute_cap`, nor does a node with no heartbeat yet or one whose
+/// nvidia-smi cannot answer. A refusal rests on a KNOWN fact; unknown only
+/// warns (place) or is not recommended (advice).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VllmCompute {
+    /// At or above the floor.
+    Usable,
+    /// Known and below the floor: why, naming the cap and the floor.
+    Below(String),
+    /// Not reported: why that matters.
+    Unknown(String),
+}
+
+/// The requirement, in one clause.
+fn vllm_needs() -> String {
+    format!("vLLM {VLLM_IMAGE_TAG} is built on CUDA {VLLM_IMAGE_CUDA}, which needs GPU compute capability {VLLM_MIN_COMPUTE_CAP}+")
+}
+
+pub(crate) fn vllm_compute(cap: Option<&str>) -> VllmCompute {
+    match cap.and_then(|c| crate::node_workloads::compute_cap_at_least(c, VLLM_MIN_COMPUTE_CAP)) {
+        Some(true) => VllmCompute::Usable,
+        Some(false) => VllmCompute::Below(format!("{}; this node's GPU is compute {}", vllm_needs(), cap.unwrap_or("?"))),
+        None => VllmCompute::Unknown(format!(
+            "this node's GPU compute capability is unknown: it could not be read (no gpu_compute_cap: an agent older than 0.6.18, no heartbeat yet, or nvidia-smi could not answer), and {} — on an older GPU it will not start",
+            vllm_needs()
+        )),
+    }
+}
+
+/// A vLLM placement on a node KNOWN to be below the vLLM image's compute floor
+/// is refused, naming the node, its compute capability, the floor and the
+/// alternative. An unknown capability proceeds with one warning (Ok(Some)).
+/// Any other backend, or a stopped placement, is not judged.
+pub(crate) fn validate_vllm_compute(node_id: &str, backend: &str, desired: &str, node: &Value) -> Result<Option<String>, String> {
+    if desired != "running" || !is_vllm_backend(backend) {
+        return Ok(None);
+    }
+    match vllm_compute(node.get("gpu_compute_cap").and_then(Value::as_str)) {
+        VllmCompute::Usable => Ok(None),
+        VllmCompute::Unknown(why) => Ok(Some(format!("{backend} on {node_id}: {why}"))),
+        VllmCompute::Below(why) => Err(format!(
+            "{backend} cannot run on {node_id}: {why}. Place the model on ollama (it runs on this GPU) or llamacpp instead: noo cluster place {node_id} ollama <model>"
+        )),
+    }
+}
+
 /// The roles a placement may name.
 pub const PLACEMENT_ROLES: &[&str] = &["chat", "embed", "rerank", "harness"];
 
@@ -5137,12 +5202,20 @@ async fn placement_put(
         let node = node_fit_facts(&state, &node_id).await?;
         validate_target(&backend, target, &node).map_err(AppError::BadRequest)?;
     }
+    // The vLLM image's compute floor: a running vLLM placement on a GPU its
+    // CUDA is known not to drive is refused here, not left to crash-loop on
+    // the node; an unknown capability proceeds with a warning.
+    let mut compute_warning: Option<String> = None;
+    if desired == "running" && is_vllm_backend(&backend) {
+        let node = node_fit_facts(&state, &node_id).await?;
+        compute_warning = validate_vllm_compute(&node_id, &backend, &desired, &node).map_err(AppError::BadRequest)?;
+    }
     validate_keep_warm(&backend, &role, body.keep_warm).map_err(AppError::BadRequest)?;
 
     // The memory-fit check (multi-role placements). A stopped placement holds
     // no memory and a harness is a host service; neither is judged.
     let mut fit_json = Value::Null;
-    let mut fit_warnings: Vec<String> = Vec::new();
+    let mut fit_warnings: Vec<String> = compute_warning.into_iter().collect();
     let mut memory_limit: Option<(u64, String)> = None;
     if desired == "running" && backend != "harness" {
         let existing = stored_placements(&state, &node_id).await?;
@@ -5373,11 +5446,13 @@ async fn placement_fit_post(
     let with = body.and_then(|Json(b)| b.with);
     let existing = stored_placements(&state, &node_id).await?;
     let mut node = node_fit_facts(&state, &node_id).await?;
+    let mut compute_warning: Option<String> = None;
     let (replacing, proposed) = match &with {
         Some(w) => {
             let role = resolve_role(&w.backend, w.role.as_deref()).map_err(AppError::BadRequest)?;
             let target = w.target.as_deref().map(str::trim).filter(|t| !t.is_empty());
             validate_target(&w.backend, target, &node).map_err(AppError::BadRequest)?;
+            compute_warning = validate_vllm_compute(&node_id, &w.backend, "running", &node).map_err(AppError::BadRequest)?;
             let mine = existing.iter().find(|e| same_placement_slot(e, &w.backend, &role, Some(&w.model)));
             let (model, env) = effective_after_upsert(mine, Some(&w.model), w.env.as_ref());
             let target = effective_target_after_upsert(mine, Some(&w.model), target);
@@ -5393,6 +5468,9 @@ async fn placement_fit_post(
         crate::embedding_client::EMBED_NUM_CTX,
     );
     let mut out = report.to_json();
+    if let (Some(w), Some(ws)) = (compute_warning, out["warnings"].as_array_mut()) {
+        ws.push(json!(w));
+    }
     out["node_id"] = json!(node_id);
     out["would_refuse"] = json!(report.verdict == crate::placement_fit::Verdict::DoesNotFit);
     out["usage_profile_source"] = node["usage_profile_source"].clone();
@@ -6605,6 +6683,10 @@ struct CapabilityManifest {
     cpu_cores: i64,
     #[allow(dead_code)]
     container_runtime: String,
+    /// The GPU's CUDA compute capability (`"8.6"`), the lowest of the node's
+    /// GPUs, as its heartbeat's `gpu_compute_cap` says. Absent is unknown,
+    /// which the vLLM compute floor reads as below it.
+    gpu_compute_cap: Option<String>,
 }
 
 impl Default for CapabilityManifest {
@@ -6620,6 +6702,7 @@ impl Default for CapabilityManifest {
             ram_gb: 0.0,
             cpu_cores: 0,
             container_runtime: "docker".into(),
+            gpu_compute_cap: None,
         }
     }
 }
@@ -6687,7 +6770,21 @@ as a native host process".into(),
     // Linux (and WSL2, which presents as linux).
     if osname == "linux" {
         let plan = if api == "cuda" {
-            if m.vram_gb >= VLLM_MIN_VRAM_GB {
+            let not_usable = match vllm_compute(m.gpu_compute_cap.as_deref()) {
+                VllmCompute::Usable => None,
+                VllmCompute::Below(why) | VllmCompute::Unknown(why) => Some(why),
+            };
+            if let (true, Some(why)) = (m.vram_gb >= VLLM_MIN_VRAM_GB, not_usable) {
+                // VRAM enough for vLLM, but the vLLM image's CUDA cannot (or
+                // may not) drive this GPU: advice recommends only what is
+                // known to run, so what a smaller CUDA node gets, and why.
+                BackendPlan {
+                    backend: "llamacpp".into(), launch_mode: "container".into(), viable: true,
+                    reason: format!("Linux + CUDA + {}GB VRAM — llama.cpp GPU build (or Ollama), not vLLM: {why}",
+                                    fmt_g(m.vram_gb)),
+                    warnings: vec![],
+                }
+            } else if m.vram_gb >= VLLM_MIN_VRAM_GB {
                 BackendPlan {
                     backend: "vllm".into(), launch_mode: "container".into(), viable: true,
                     reason: format!("Linux + CUDA + {}GB VRAM (>= {}) — vLLM",
@@ -6749,6 +6846,12 @@ fn apply_override(
     if ov == "vllm" && api != "cuda" {
         warn.push(format!("override=vllm but gpu_api='{api}' (vLLM needs CUDA — \
 it will likely fail to start on this node)"));
+    } else if ov == "vllm" {
+        match vllm_compute(m.gpu_compute_cap.as_deref()) {
+            VllmCompute::Below(why) => warn.push(format!("override=vllm but {why}: placing it is refused")),
+            VllmCompute::Unknown(why) => warn.push(format!("override=vllm but {why}")),
+            VllmCompute::Usable => {}
+        }
     }
     if matches!(ov, "vllm" | "llamacpp" | "tgi" | "sglang") && m.os == "darwin" {
         warn.push(format!("override={ov} on macOS runs in Docker (CPU-only — \
@@ -6786,8 +6889,16 @@ async fn suggest_placement(State(state): State<Arc<AppState>>, body: Option<Json
     let manifest_src = body.get("manifest").cloned()
         .filter(|v| !v.is_null())
         .unwrap_or_else(|| body.clone());
-    let manifest: CapabilityManifest = serde_json::from_value(manifest_src)
+    let mut manifest: CapabilityManifest = serde_json::from_value(manifest_src)
         .map_err(|e| AppError::BadRequest(format!("invalid manifest: {e}")))?;
+    // A manifest without the compute capability, for a named node, takes the
+    // one the node's heartbeat reports: the vLLM floor is judged on it.
+    if manifest.gpu_compute_cap.is_none() {
+        if let Some(node_id) = body.get("node_id").and_then(|v| v.as_str()) {
+            let node = node_fit_facts(&state, node_id).await?;
+            manifest.gpu_compute_cap = node.get("gpu_compute_cap").and_then(|v| v.as_str()).map(str::to_string);
+        }
+    }
     let override_backend = body.get("override_backend").and_then(|v| v.as_str());
 
     let api = if manifest.gpu_api.is_empty() { "none".to_string() }
@@ -6797,6 +6908,8 @@ async fn suggest_placement(State(state): State<Arc<AppState>>, body: Option<Json
     let mut not_viable: Vec<String> = Vec::new();
     if api != "cuda" {
         not_viable.push("vllm (requires an NVIDIA CUDA GPU)".into());
+    } else if let VllmCompute::Below(why) = vllm_compute(manifest.gpu_compute_cap.as_deref()) {
+        not_viable.push(format!("vllm ({why})"));
     }
     if manifest.os == "darwin" && !manifest.can_gpu_passthrough {
         not_viable.push("any containerized GPU backend (Docker-for-Mac \
@@ -6848,6 +6961,7 @@ native process)".into());
             "vram_gb": manifest.vram_gb,
             "unified_memory": manifest.unified_memory,
             "can_gpu_passthrough": manifest.can_gpu_passthrough,
+            "gpu_compute_cap": manifest.gpu_compute_cap,
         },
     })))
 }
@@ -9910,5 +10024,79 @@ mod node_local_carry_tests {
     fn both_beats_carry_node_local_onto_the_record() {
         let own = crate::test_src::own_code(include_str!("cluster.rs"));
         assert_eq!(own.matches("carry_reported(&mut data, &body, \"node_local\");").count(), 2);
+    }
+}
+
+#[cfg(test)]
+mod vllm_compute_floor_tests {
+    use super::*;
+
+    fn cuda(vram_gb: f64, cap: Option<&str>) -> CapabilityManifest {
+        CapabilityManifest {
+            gpu_api: "cuda".into(),
+            vram_gb,
+            gpu_compute_cap: cap.map(str::to_string),
+            ..CapabilityManifest::default()
+        }
+    }
+
+    /// The placement advice never recommends vLLM on a GPU below the vLLM
+    /// image's compute floor (a 24 GB P40 is compute 6.1): it recommends what
+    /// a smaller CUDA node gets, and says why. Unknown is not recommended either:
+    /// advice recommends only what is known to run.
+    #[test]
+    fn vllm_is_not_planned_below_the_compute_floor() {
+        let low = plan_placement(&cuda(24.0, Some("6.1")), None);
+        assert_eq!(low.backend, "llamacpp", "{}", low.reason);
+        assert!(low.reason.contains("6.1") && low.reason.contains(VLLM_MIN_COMPUTE_CAP) && low.reason.contains("CUDA 13.0"), "{}", low.reason);
+        let unknown = plan_placement(&cuda(24.0, None), None);
+        assert_eq!(unknown.backend, "llamacpp", "unknown is not recommended: {}", unknown.reason);
+        assert!(unknown.reason.contains("unknown"), "{}", unknown.reason);
+        assert_eq!(plan_placement(&cuda(24.0, Some("8.6")), None).backend, "vllm");
+        assert_eq!(plan_placement(&cuda(24.0, Some("7.5")), None).backend, "vllm", "the floor itself is usable");
+        assert_eq!(plan_placement(&cuda(24.0, Some("10.0")), None).backend, "vllm", "compared as numbers");
+        assert_eq!(plan_placement(&cuda(8.0, Some("8.6")), None).backend, "llamacpp", "the VRAM rule still applies");
+        let forced = plan_placement(&cuda(24.0, Some("6.1")), Some("vllm"));
+        assert!(forced.warnings.iter().any(|w| w.contains("override=vllm") && w.contains("6.1")), "{:?}", forced.warnings);
+    }
+
+    /// Placing vLLM on a node KNOWN to be below the floor is refused, naming
+    /// the node, its compute capability, the floor and the alternative; at or
+    /// above it, a stopped placement, or another backend is not judged. The
+    /// place and fit routes both run the check.
+    #[test]
+    fn placing_vllm_below_the_compute_floor_is_refused() {
+        let p40 = json!({"gpu_compute_cap": "6.1", "vram_gb": 24.0});
+        let e = validate_vllm_compute("node-a", "vllm", "running", &p40).unwrap_err();
+        assert!(e.contains("node-a") && e.contains("compute 6.1") && e.contains("7.5+") && e.contains("noo cluster place node-a ollama"), "{e}");
+        assert!(validate_vllm_compute("node-a", "vllm-secondary", "running", &p40).is_err());
+        assert_eq!(validate_vllm_compute("node-a", "vllm", "running", &json!({"gpu_compute_cap": "8.6"})), Ok(None));
+        assert_eq!(validate_vllm_compute("node-a", "vllm", "stopped", &p40), Ok(None), "stopping is never refused");
+        assert_eq!(validate_vllm_compute("node-a", "ollama", "running", &p40), Ok(None), "ollama runs on this GPU");
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let put = crate::test_src::fn_body(&own, "async fn placement_put(");
+        assert!(put.contains("compute_warning = validate_vllm_compute(&node_id, &backend, &desired, &node)"), "the place route checks the floor");
+        let fit = crate::test_src::fn_body(&own, "async fn placement_fit_post(");
+        assert!(fit.contains("compute_warning = validate_vllm_compute(&node_id, &w.backend, \"running\", &node)"), "and so does fit");
+    }
+
+    /// A refusal rests on a known fact: a node that does not report its compute
+    /// capability (an old agent, no heartbeat yet, nvidia-smi failed) is NOT
+    /// refused; the place proceeds with exactly one warning saying the
+    /// capability could not be read and what vLLM needs, carried in the place
+    /// and fit answers' `warnings`.
+    #[test]
+    fn placing_vllm_with_an_unknown_compute_cap_proceeds_with_a_warning() {
+        let w = validate_vllm_compute("node-a", "vllm", "running", &json!({"vram_gb": 24.0}))
+            .expect("unknown is not refused")
+            .expect("one warning");
+        assert!(w.contains("node-a") && w.contains("could not be read") && w.contains("vLLM v0.25.0") && w.contains("7.5+"), "{w}");
+        let unparsable = validate_vllm_compute("node-a", "vllm", "running", &json!({"gpu_compute_cap": "eight"}));
+        assert!(matches!(unparsable, Ok(Some(_))), "unparsable is unknown: {unparsable:?}");
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let put = crate::test_src::fn_body(&own, "async fn placement_put(");
+        assert!(put.contains("let mut fit_warnings: Vec<String> = compute_warning.into_iter().collect();"), "the place answer carries it");
+        let fit = crate::test_src::fn_body(&own, "async fn placement_fit_post(");
+        assert!(fit.contains("ws.push(json!(w));"), "and the fit answer");
     }
 }

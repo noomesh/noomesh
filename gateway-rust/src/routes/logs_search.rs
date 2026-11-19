@@ -32,16 +32,16 @@
 //! that answers is used as always (an older compose still runs it), and an
 //! install with the key unset keeps every error above unchanged.
 
-use chrono::{DateTime, Duration, SecondsFormat, TimeZone, Utc};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{json, Value};
 
 /// Hard ceiling on lines per answer, above `limit` in the body.
 pub const MAX_LIMIT: usize = 2000;
 pub const DEFAULT_LIMIT: usize = 200;
 /// Hard ceiling on the time range, whoever asked.
-pub const MAX_RANGE: Duration = Duration::days(7);
+pub const MAX_RANGE: SignedDuration = SignedDuration::from_hours(7 * 24);
 /// The window when the caller gives neither `since` nor `minutes`.
-pub const DEFAULT_SINCE: Duration = Duration::hours(1);
+pub const DEFAULT_SINCE: SignedDuration = SignedDuration::from_hours(1);
 pub const LOKI_QUERY_TIMEOUT_SECS: u64 = 30;
 
 pub const LEVELS: &[&str] = &["debug", "info", "warn", "error", "unknown"];
@@ -73,8 +73,8 @@ pub struct SearchSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuiltQuery {
     pub logql: String,
-    pub start: DateTime<Utc>,
-    pub end: DateTime<Utc>,
+    pub start: Timestamp,
+    pub end: Timestamp,
     pub limit: usize,
     pub direction: &'static str,
     /// The range was wider than [`MAX_RANGE`] and `start` was moved.
@@ -137,13 +137,16 @@ fn name_matcher(v: &str) -> String {
 
 /// `30m`, `2h`, `1d`, `45s`, `-15m` (the sign is ignored — a duration is
 /// always "ago"), or an RFC 3339 timestamp.
-pub fn parse_time(s: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
+///
+/// A duration too large to subtract (past the calendar, or an overflowing
+/// count) is refused like any bad time; it is never a panic.
+pub fn parse_time(s: &str, now: Timestamp) -> Result<Timestamp, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("empty time".into());
     }
-    if let Ok(t) = DateTime::parse_from_rfc3339(s) {
-        return Ok(t.with_timezone(&Utc));
+    if let Ok(t) = crate::wire_time::parse_rfc3339(s) {
+        return Ok(t);
     }
     let body = s.trim_start_matches('-');
     let (num, unit) = body.split_at(body.trim_end_matches(|c: char| c.is_ascii_alphabetic()).len());
@@ -151,15 +154,17 @@ pub fn parse_time(s: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, String> 
     if n < 0 {
         return Err(format!("bad time {s:?}: negative"));
     }
-    let d = match unit {
-        "s" | "sec" | "secs" => Duration::seconds(n),
-        "m" | "min" | "mins" => Duration::minutes(n),
-        "h" | "hr" | "hrs" => Duration::hours(n),
-        "d" | "day" | "days" => Duration::days(n),
-        "" => Duration::minutes(n),
+    let unit_secs: i64 = match unit {
+        "s" | "sec" | "secs" => 1,
+        "m" | "min" | "mins" => 60,
+        "h" | "hr" | "hrs" => 3_600,
+        "d" | "day" | "days" => 86_400,
+        "" => 60,
         _ => return Err(format!("bad time {s:?}: unit must be s, m, h or d")),
     };
-    Ok(now - d)
+    let out_of_range = || format!("bad time {s:?}: too far back");
+    let secs = n.checked_mul(unit_secs).ok_or_else(out_of_range)?;
+    now.checked_sub(SignedDuration::from_secs(secs)).map_err(|_| out_of_range())
 }
 
 fn validated(field: &str, value: &str, allowed: &[&str]) -> Result<Vec<String>, String> {
@@ -189,7 +194,7 @@ fn label_matcher(label: &str, values: &[String]) -> String {
 
 /// Build the LogQL and its bounds. Pure; `now` is passed so a test can pin
 /// the arithmetic.
-pub fn build(spec: &SearchSpec, now: DateTime<Utc>) -> Result<BuiltQuery, String> {
+pub fn build(spec: &SearchSpec, now: Timestamp) -> Result<BuiltQuery, String> {
     let end = match spec.until.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(u) => parse_time(u, now)?,
         None => now,
@@ -201,12 +206,12 @@ pub fn build(spec: &SearchSpec, now: DateTime<Utc>) -> Result<BuiltQuery, String
     if start >= end {
         return Err(format!(
             "since ({}) must be before until ({})",
-            start.to_rfc3339_opts(SecondsFormat::Secs, true),
-            end.to_rfc3339_opts(SecondsFormat::Secs, true)
+            crate::wire_time::rfc3339_secs_z(start),
+            crate::wire_time::rfc3339_secs_z(end)
         ));
     }
     let mut range_clamped = false;
-    if end - start > MAX_RANGE {
+    if end.duration_since(start) > MAX_RANGE {
         start = end - MAX_RANGE;
         range_clamped = true;
     }
@@ -276,7 +281,8 @@ pub struct Line {
 
 impl Line {
     pub fn ts_rfc3339(&self) -> String {
-        Utc.timestamp_nanos(self.ts_ns).to_rfc3339_opts(SecondsFormat::Millis, true)
+        // Any i64 of nanoseconds (1677..2262) is inside jiff's range.
+        Timestamp::from_nanosecond(i128::from(self.ts_ns)).map(crate::wire_time::rfc3339_millis_z).unwrap_or_default()
     }
     pub fn to_json(&self) -> Value {
         json!({
@@ -396,8 +402,8 @@ pub async fn query_loki_as(client: &reqwest::Client, loki_url: &str, q: &BuiltQu
         loki_url.trim_end_matches('/'),
         urlencoding::encode(&q.logql),
         q.limit,
-        q.start.timestamp_nanos_opt().unwrap_or(0),
-        q.end.timestamp_nanos_opt().unwrap_or(0),
+        i64::try_from(q.start.as_nanosecond()).unwrap_or(0),
+        i64::try_from(q.end.as_nanosecond()).unwrap_or(0),
         q.direction,
     );
     let sent = client
@@ -453,8 +459,8 @@ pub fn loki_envelope(q: &BuiltQuery, lines: &[Line]) -> Value {
     json!({
         "backend": "loki",
         "query": q.logql,
-        "start": q.start.to_rfc3339_opts(SecondsFormat::Secs, true),
-        "end": q.end.to_rfc3339_opts(SecondsFormat::Secs, true),
+        "start": crate::wire_time::rfc3339_secs_z(q.start),
+        "end": crate::wire_time::rfc3339_secs_z(q.end),
         "limit": q.limit,
         "count": lines.len(),
         "truncated": lines.len() >= q.limit,
@@ -522,8 +528,8 @@ pub fn merge(mut answer: Value, envelope: Value) -> Value {
 mod tests {
     use super::*;
 
-    fn now() -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 9, 28, 15, 0, 0).unwrap()
+    fn now() -> Timestamp {
+        "2026-09-28T15:00:00Z".parse().unwrap()
     }
 
     fn spec() -> SearchSpec {
@@ -621,21 +627,28 @@ mod tests {
     #[test]
     fn since_accepts_durations_and_rfc3339() {
         let n = now();
-        assert_eq!(parse_time("30m", n).unwrap(), n - Duration::minutes(30));
-        assert_eq!(parse_time("-15m", n).unwrap(), n - Duration::minutes(15));
-        assert_eq!(parse_time("2h", n).unwrap(), n - Duration::hours(2));
-        assert_eq!(parse_time("1d", n).unwrap(), n - Duration::days(1));
-        assert_eq!(parse_time("45s", n).unwrap(), n - Duration::seconds(45));
-        assert_eq!(parse_time("15", n).unwrap(), n - Duration::minutes(15), "bare number = minutes");
+        assert_eq!(parse_time("30m", n).unwrap(), n - SignedDuration::from_mins(30));
+        assert_eq!(parse_time("-15m", n).unwrap(), n - SignedDuration::from_mins(15));
+        assert_eq!(parse_time("2h", n).unwrap(), n - SignedDuration::from_hours(2));
+        assert_eq!(parse_time("1d", n).unwrap(), n - SignedDuration::from_hours(24));
+        assert_eq!(parse_time("45s", n).unwrap(), n - SignedDuration::from_secs(45));
+        assert_eq!(parse_time("15", n).unwrap(), n - SignedDuration::from_mins(15), "bare number = minutes");
         assert_eq!(
             parse_time("2026-09-28T14:02:00Z", n).unwrap(),
-            Utc.with_ymd_and_hms(2026, 9, 28, 14, 2, 0).unwrap()
+            "2026-09-28T14:02:00Z".parse::<Timestamp>().unwrap()
         );
         assert_eq!(
             parse_time("2026-09-28T16:02:00+02:00", n).unwrap(),
-            Utc.with_ymd_and_hms(2026, 9, 28, 14, 2, 0).unwrap()
+            "2026-09-28T14:02:00Z".parse::<Timestamp>().unwrap()
         );
         assert!(parse_time("yesterday", n).is_err());
+        // A count too large to subtract is a bad time, never a panic (chrono's
+        // Duration::days panicked here on a request's own `since`).
+        // 213503982334602d overflows i64 seconds by just enough that silent
+        // wrapping would read it as ~17 h ago: it must be refused, not wrapped.
+        for huge in ["9999999999999999d", "153722867280912931m", "5000000d", "213503982334602d"] {
+            assert!(parse_time(huge, n).is_err(), "{huge:?} must be refused");
+        }
         assert!(parse_time("3w", n).is_err());
         assert!(parse_time("", n).is_err());
     }
@@ -654,8 +667,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(q.logql, r#"{node="host3"}"#);
-        assert_eq!(q.start, Utc.with_ymd_and_hms(2026, 9, 28, 14, 0, 0).unwrap());
-        assert_eq!(q.end, Utc.with_ymd_and_hms(2026, 9, 28, 14, 5, 0).unwrap());
+        assert_eq!(q.start, "2026-09-28T14:00:00Z".parse::<Timestamp>().unwrap());
+        assert_eq!(q.end, "2026-09-28T14:05:00Z".parse::<Timestamp>().unwrap());
         assert_eq!(q.direction, "forward");
         assert!(!q.range_clamped);
     }
@@ -664,7 +677,7 @@ mod tests {
     fn default_window_is_an_hour_ending_now() {
         let q = build(&spec(), now()).unwrap();
         assert_eq!(q.end, now());
-        assert_eq!(q.start, now() - Duration::hours(1));
+        assert_eq!(q.start, now() - SignedDuration::from_hours(1));
     }
 
     #[test]
@@ -799,7 +812,7 @@ mod tests {
         assert!(first.starts_with("GET /loki/api/v1/query_range?query="), "{first}");
         assert!(first.contains(&format!("query={}", urlencoding::encode(&q.logql))), "{first}");
         assert!(first.contains("&limit=50&"), "{first}");
-        assert!(first.contains(&format!("&start={}&end={}&direction=backward", q.start.timestamp_nanos_opt().unwrap(), q.end.timestamp_nanos_opt().unwrap())), "{first}");
+        assert!(first.contains(&format!("&start={}&end={}&direction=backward", i64::try_from(q.start.as_nanosecond()).unwrap(), i64::try_from(q.end.as_nanosecond()).unwrap())), "{first}");
         let LokiOutcome::Lines(lines) = got else { panic!("{got:?}") };
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].node, "host8");

@@ -103,9 +103,58 @@ RUN cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF \
 # ── Runtime ──────────────────────────────────────────────────────────
 FROM ${HUB_MIRROR}/nvidia/cuda:12.9.1-runtime-ubuntu24.04@sha256:1287141d283b8f06f45681b56a48a85791398c615888b1f96bfb9fc981392d98
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgomp1 curl ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# Packages, in ONE layer:
+#   1. libgomp1 (llama-server's OpenMP), curl (the HEALTHCHECK below and the
+#      node agent's own healthcheck, `curl -fsS .../health`), ca-certificates.
+#   2. Every update the Ubuntu SECURITY archive has for what is installed.
+#      NVIDIA republishes this base rarely, so its Ubuntu packages go stale:
+#      on 2026-11-18 all 16 fixable HIGH findings in our image (gnupg x10,
+#      apt x2, openssl x4) were base packages at old versions.
+#      THIS STAGE IS DELIBERATELY NOT BYTE-REPRODUCIBLE: a build takes the
+#      security fixes published by the time it runs, so two builds of one
+#      commit can differ in their Ubuntu package versions. The base digest
+#      pin still fixes everything else (the CUDA libraries above all), and
+#      the daily infra-staged build (no layer cache) keeps taking the fixes.
+#      Security ONLY, not a plain `apt-get upgrade`: the base also carries
+#      NVIDIA's CUDA apt repository, and an upgrade from every source would
+#      move cuda-compat (the forward-compat libcuda) and other CUDA packages
+#      off what the digest pins, and take noble-updates' non-security
+#      changes too. So the upgrade sees ONE source, the base's own
+#      noble-security stanza (read from its ubuntu.sources, so the archive
+#      and keyring the base names are kept), and nothing else.
+#   3. What llama-server never runs, removed. gnupg and its tools: gnupg2
+#      gnupg gnupg-utils gpg gpg-agent gpgsm gpgconf dirmngr keyboxd (NVIDIA's
+#      base installs them only to add its repository key at build time), with
+#      the libraries only they needed (--autoremove: auto-installed AND now
+#      unneeded). Then apt itself: apt libapt-pkg6.0t64 and the two packages
+#      only apt needs, gpgv (noble's apt Depends on it to verify the archive)
+#      and ubuntu-keyring. Nothing runs apt in this image after the build:
+#      the node agent starts llama-server as nonroot, probes /health with curl
+#      and runs `nvidia-smi -L` (injected by the NVIDIA runtime); every
+#      rebuild starts again from the base, which has apt. None of the four is
+#      Essential, so a plain `dpkg --purge` takes them, no force flag.
+#      Essential packages (perl-base, ...) stay.
+# ci.yml llamacpp-cuda-image reports this image's package count, size and
+# Trivy findings next to the base's.
+RUN set -eux; \
+    export DEBIAN_FRONTEND=noninteractive; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends libgomp1 curl ca-certificates; \
+    mkdir /tmp/apt-security; \
+    awk -v RS= -v ORS='\n\n' '/(^|\n)Suites:[^\n]*noble-security/' \
+        /etc/apt/sources.list.d/ubuntu.sources > /tmp/apt-security/security.sources; \
+    grep -q '^Suites: noble-security$' /tmp/apt-security/security.sources; \
+    sec="-o Dir::Etc::SourceList=/dev/null -o Dir::Etc::SourceParts=/tmp/apt-security"; \
+    apt-get $sec update; \
+    apt-get $sec -y upgrade; \
+    apt-get purge -y --autoremove \
+        gnupg2 gnupg gnupg-utils gpg gpg-agent gpgsm gpgconf dirmngr keyboxd; \
+    rm -rf /var/lib/apt/lists/* /tmp/apt-security; \
+    dpkg --purge apt libapt-pkg6.0t64 gpgv ubuntu-keyring; \
+    rm -rf /var/lib/apt /var/cache/apt /etc/apt; \
+    if dpkg-query -W -f '${Package}\n' | grep -xE 'apt|gpgv|gpg|gnupg2?'; then \
+        echo "Dockerfile.llamacpp-cuda: apt or gnupg is still installed" >&2; exit 1; \
+    fi
 
 # The same nonroot user the CPU image's DHI base carries (65532), so a file
 # either image writes has the same owner.
