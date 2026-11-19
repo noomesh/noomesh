@@ -27,6 +27,16 @@ type Capabilities struct {
 	Tools    []string `json:"tools"`
 	Tier     int      `json:"tier"`
 
+	// VRAMTotalGB is every GPU's memory summed (vram_gb stays ONE card: it
+	// has many readers). GPUVRAMGB is each card's memory.total in GB, from
+	// the same nvidia-smi query. Without a list (a unified-memory node: one
+	// pool; a configured VRAM_GB, which names one card; a list that did not
+	// parse) the total is vram_gb and the gateway budgets one pool, as it
+	// always did. Both are omitted when vram_gb is unknown (a failed probe
+	// with nothing earlier).
+	VRAMTotalGB float64   `json:"vram_total_gb,omitempty"`
+	GPUVRAMGB   []float64 `json:"gpu_vram_gb,omitempty"`
+
 	// Capability-placement manifest fields (docs/NODE_CAPABILITY_PLACEMENT.md).
 	// The node reports these so the controller uses REPORTED truth instead of
 	// inferring the GPU API from the model string — which it can't do for a
@@ -76,10 +86,30 @@ func detectGPUAPI(gpuModel string) string {
 // suite that says nothing about the code.
 //
 // *GPUDetector satisfies this already; no call site changes.
+//
+// The per-card list is the optional VRAMCardsProbe, so a probe that only
+// answers DetectVRAM (the tests' fakes) reports one card, as before.
 type GPUProbe interface {
 	DetectVRAM() (float64, error)
 	DetectCount() (int, error)
 	DetectModel() (string, error)
+}
+
+// VRAMCardsProbe is the optional per-card half of GPUProbe: DetectVRAM's
+// answer and every card's memory from the one nvidia-smi query.
+// *GPUDetector implements it.
+type VRAMCardsProbe interface {
+	DetectVRAMCards() (vramGB float64, cards []float64, err error)
+}
+
+// ProbeVRAMCards is DetectVRAMCards when gpu offers it, else DetectVRAM with
+// no list (one card).
+func ProbeVRAMCards(gpu GPUProbe) (float64, []float64, error) {
+	if p, ok := gpu.(VRAMCardsProbe); ok {
+		return p.DetectVRAMCards()
+	}
+	v, err := gpu.DetectVRAM()
+	return v, nil, err
 }
 
 // Detect gathers hardware capabilities for this node.
@@ -92,10 +122,11 @@ type GPUProbe interface {
 // until the error clears. An absent nvidia-smi is a clean "no GPU".
 func Detect(cfg *config.Config, gpu GPUProbe, prev *Capabilities) (Capabilities, error) {
 	var probeErr error
+	var cards []float64 // per-card list; nil with a configured VRAM_GB
 	vram := cfg.VRAMGB
 	if vram == 0 {
-		v, err := gpu.DetectVRAM()
-		vram, probeErr = v, errors.Join(probeErr, err)
+		v, c, err := ProbeVRAMCards(gpu)
+		vram, cards, probeErr = v, c, errors.Join(probeErr, err)
 	}
 	gpuCount, err := gpu.DetectCount()
 	probeErr = errors.Join(probeErr, err)
@@ -114,6 +145,7 @@ func Detect(cfg *config.Config, gpu GPUProbe, prev *Capabilities) (Capabilities,
 			}
 			if vram == 0 {
 				vram = prev.VRAMGB
+				cards = prev.GPUVRAMGB
 			}
 			if gpuCount == 0 {
 				gpuCount = prev.GPUCount
@@ -161,6 +193,7 @@ func Detect(cfg *config.Config, gpu GPUProbe, prev *Capabilities) (Capabilities,
 		if vram <= 0 {
 			vram = usable
 		}
+		cards = nil // one pool: its total is vram_gb
 		if gpuCount == 0 {
 			gpuCount = 1
 		}
@@ -198,6 +231,16 @@ func Detect(cfg *config.Config, gpu GPUProbe, prev *Capabilities) (Capabilities,
 	// lands, instead of waiting for someone to remember this slice.
 	backends = servableBackends(backends)
 
+	// vram_total_gb: the per-card sum when the list is known, else the one
+	// pool vram_gb names (a unified node, a configured VRAM_GB, a list that
+	// did not parse). 0 (omitted) when vram_gb is 0.
+	vramTotal := vram
+	if len(cards) > 0 && vram > 0 {
+		vramTotal = SumVRAM(cards)
+	} else {
+		cards = nil
+	}
+
 	return Capabilities{
 		ProbeIncomplete: probeErr != nil,
 		CPUCores:        CPUCores(),
@@ -205,6 +248,8 @@ func Detect(cfg *config.Config, gpu GPUProbe, prev *Capabilities) (Capabilities,
 		GPUModel:        gpuModel,
 		VRAMGB:          vram,
 		GPUCount:        gpuCount,
+		VRAMTotalGB:     vramTotal,
+		GPUVRAMGB:       cards,
 		IsARM:           IsARM(),
 		Backends:        backends,
 		Tools:           tools,

@@ -19,7 +19,12 @@
 //! * the GPU pool - `unified` when the node reports
 //!   `capabilities.unified_memory` (Apple Silicon, Jetson, GB10): `vram_gb` IS
 //!   the usable GPU share of RAM (host6: 18 of 24 GB); else `vram`, a
-//!   discrete GPU's `vram_gb`;
+//!   discrete GPU's `vram_gb` (ONE card). When a placement on it splits a
+//!   model across GPUs (`ollama`, `llamacpp`: [`splits_across_gpus`]) or a
+//!   vLLM one runs tensor-parallel, the pool spans every card
+//!   ([`gpu_pool_spanning`]): each card's `gpu_vram_gb` with the headroom
+//!   applied per card and summed; else the reported `vram_total_gb` as one
+//!   pool ("per-card margin unknown"); else one card, as before;
 //! * the CPU pool - `ram`: `ram_gb`. On a unified-memory node the GPU share is
 //!   carved out of the same RAM, so the CPU pool is `ram_gb - vram_gb` (host6:
 //!   6 GB).
@@ -70,7 +75,8 @@
 //! * overhead: [`RUNTIME_OVERHEAD_GB`] per loaded model.
 //!
 //! vLLM reserves a fraction of the GPU: `GPU_MEMORY_UTILIZATION` (default
-//! [`VLLM_DEFAULT_UTIL`]) x the GPU pool. vLLM has no CPU target.
+//! [`VLLM_DEFAULT_UTIL`]) x one card x its tensor-parallel degree
+//! ([`vllm_tp`]), never more than the node's total. vLLM has no CPU target.
 //!
 //! ## Verdict
 //!
@@ -261,11 +267,55 @@ pub struct Budget {
     pub target: &'static str,
     pub total_gb: f64,
     pub headroom_gb: f64,
+    /// The GPUs a pool spans when it is more than one card
+    /// ([`gpu_pool_spanning`]); `None` for one card or a CPU pool.
+    pub span: Option<GpuSpan>,
+}
+
+/// What a multi-GPU pool spans.
+#[derive(Clone, Debug)]
+pub struct GpuSpan {
+    /// GPUs in the pool: the per-card list's length, else `gpu_count` when
+    /// it is more than one; `None` when not reported.
+    pub gpus: Option<u64>,
+    /// Each card's memory and the headroom reserved on it (GB), from
+    /// `gpu_vram_gb`. Empty when only `vram_total_gb` was reported: the
+    /// per-card margin is unknown and the headroom is the total's.
+    pub cards: Vec<(f64, f64)>,
 }
 
 impl Budget {
     pub fn usable_gb(&self) -> f64 {
         self.total_gb - self.headroom_gb
+    }
+
+    /// A multi-GPU pool's parts, for a message: "across 2 GPUs (24.0 + 24.0
+    /// GB, 2.4 GB reserved each, 43.2 GB usable)". The usable figure is the
+    /// cards less their reserves, so the printed parts add up; cards with
+    /// different reserves print each one ("reserved 2.4 + 1.2 GB"). `None`
+    /// for one card or a CPU pool.
+    pub fn span_text(&self) -> Option<String> {
+        let span = self.span.as_ref()?;
+        let across = match span.gpus {
+            Some(n) => format!("across {n} GPUs"),
+            None => "across the node's GPUs".to_string(),
+        };
+        let Some(&(_, first)) = span.cards.first() else {
+            return Some(format!(
+                "{across} ({:.1} GB in all, per-card margin unknown, {:.1} GB reserved, {:.1} GB usable)",
+                self.total_gb,
+                self.headroom_gb,
+                self.usable_gb()
+            ));
+        };
+        let sizes: Vec<String> = span.cards.iter().map(|(c, _)| format!("{c:.1}")).collect();
+        let reserved = if span.cards.iter().all(|(_, h)| (h - first).abs() < 0.05) {
+            format!("{first:.1} GB reserved each")
+        } else {
+            let each: Vec<String> = span.cards.iter().map(|(_, h)| format!("{h:.1}")).collect();
+            format!("reserved {} GB", each.join(" + "))
+        };
+        Some(format!("{across} ({} GB, {reserved}, {:.1} GB usable)", sizes.join(" + "), self.usable_gb()))
     }
 }
 
@@ -384,7 +434,7 @@ pub fn pool_for(node: &Value, target: &str) -> Option<Budget> {
     let headroom = |total: f64, frac: f64, min: f64| (total * frac).max(min);
     if target == "gpu" && vram > 0.0 {
         let (frac, min) = if shared { (SHARED_GPU_HEADROOM_FRAC, SHARED_GPU_HEADROOM_MIN_GB) } else { (HEADROOM_FRAC, HEADROOM_MIN_GB) };
-        return Some(Budget { kind: if unified { "unified" } else { "vram" }, target: "gpu", total_gb: vram, headroom_gb: headroom(vram, frac, min) });
+        return Some(Budget { kind: if unified { "unified" } else { "vram" }, target: "gpu", total_gb: vram, headroom_gb: headroom(vram, frac, min), span: None });
     }
     if target == "cpu" && ram > 0.0 {
         // Unified memory: the GPU share is carved out of the same RAM.
@@ -392,9 +442,108 @@ pub fn pool_for(node: &Value, target: &str) -> Option<Budget> {
         if total <= 0.0 {
             return None;
         }
-        return Some(Budget { kind: "ram", target: "cpu", total_gb: total, headroom_gb: headroom(total, HEADROOM_FRAC, HEADROOM_MIN_GB) });
+        return Some(Budget { kind: "ram", target: "cpu", total_gb: total, headroom_gb: headroom(total, HEADROOM_FRAC, HEADROOM_MIN_GB), span: None });
     }
     None
+}
+
+/// Backends whose engine spreads one model over every GPU the node has:
+/// llama.cpp's layer split and Ollama's scheduler. `ollama` and `llamacpp`,
+/// whatever the role (chat, embed and rerank run on the same engines).
+pub fn splits_across_gpus(backend: &str) -> bool {
+    matches!(backend, "ollama" | "llamacpp")
+}
+
+fn is_vllm(backend: &str) -> bool {
+    matches!(backend, "vllm" | "vllm-secondary")
+}
+
+/// Each GPU's memory (`gpu_vram_gb`, top level else `capabilities`), when
+/// every entry is a positive number. `None` when absent (an older agent, a
+/// configured VRAM_GB, a unified node) or malformed.
+fn node_gpu_cards(node: &Value) -> Option<Vec<f64>> {
+    let caps = &node["capabilities"];
+    let list = node["gpu_vram_gb"].as_array().or_else(|| caps["gpu_vram_gb"].as_array())?;
+    let cards = list.iter().map(|c| c.as_f64().filter(|g| *g > 0.0)).collect::<Option<Vec<f64>>>()?;
+    if cards.is_empty() {
+        None
+    } else {
+        Some(cards)
+    }
+}
+
+/// `vram_total_gb` (every GPU summed), top level else `capabilities`.
+fn node_vram_total(node: &Value) -> Option<f64> {
+    let caps = &node["capabilities"];
+    reported(&node["vram_total_gb"]).or_else(|| reported(&caps["vram_total_gb"]))
+}
+
+/// `gpu_count`, top level else `capabilities`, when at least 1.
+fn node_gpu_count(node: &Value) -> Option<u64> {
+    let caps = &node["capabilities"];
+    node["gpu_count"].as_f64().or_else(|| caps["gpu_count"].as_f64()).filter(|c| *c >= 1.0).map(|c| c as u64)
+}
+
+/// The GPU headroom [`pool_for`] reserves, for `gb` of GPU memory.
+fn gpu_headroom(node: &Value, gb: f64) -> f64 {
+    let (frac, min) = if usage_of(node) == "shared" { (SHARED_GPU_HEADROOM_FRAC, SHARED_GPU_HEADROOM_MIN_GB) } else { (HEADROOM_FRAC, HEADROOM_MIN_GB) };
+    (gb * frac).max(min)
+}
+
+/// The GPU pool for placements whose engine spreads across GPUs: every card
+/// the node reports (`gpu_vram_gb`), with the GPU headroom applied PER CARD
+/// and summed, so two 24 GB cards never get more than one 48 GB card would;
+/// else the reported `vram_total_gb` as one pool with one headroom (the
+/// per-card margin unknown); else [`pool_for`]'s one card. A unified pool,
+/// and anything that would come out no larger than one card, is that one
+/// card: an agent that reports no total budgets exactly as before.
+pub fn gpu_pool_spanning(node: &Value) -> Option<Budget> {
+    let one = pool_for(node, "gpu")?;
+    if one.kind != "vram" {
+        return Some(one);
+    }
+    if let Some(cards) = node_gpu_cards(node).filter(|c| c.len() >= 2) {
+        let total: f64 = cards.iter().sum();
+        if total > one.total_gb {
+            let per: Vec<(f64, f64)> = cards.iter().map(|c| (*c, gpu_headroom(node, *c))).collect();
+            let headroom: f64 = per.iter().map(|(_, h)| *h).sum();
+            let gpus = Some(per.len() as u64);
+            return Some(Budget { kind: "vram", target: "gpu", total_gb: total, headroom_gb: headroom, span: Some(GpuSpan { gpus, cards: per }) });
+        }
+    }
+    if let Some(total) = node_vram_total(node).filter(|t| *t > one.total_gb) {
+        let gpus = node_gpu_count(node).filter(|n| *n >= 2);
+        return Some(Budget { kind: "vram", target: "gpu", total_gb: total, headroom_gb: gpu_headroom(node, total), span: Some(GpuSpan { gpus, cards: Vec::new() }) });
+    }
+    Some(one)
+}
+
+/// A vLLM placement's tensor-parallel degree: its `TENSOR_PARALLEL_SIZE`,
+/// else its `GPU_COUNT` (the node agent sets both when a placement asks for
+/// more than one GPU), at least 1, and at most the node's `gpu_count` when
+/// it reports one.
+pub fn vllm_tp(spec: &Spec, node: &Value) -> u64 {
+    let tp = env_u64(&spec.env, "TENSOR_PARALLEL_SIZE").or_else(|| env_u64(&spec.env, "GPU_COUNT")).unwrap_or(1).max(1);
+    match node_gpu_count(node) {
+        Some(n) => tp.min(n),
+        None => tp,
+    }
+}
+
+/// The GPU memory a vLLM placement reserves its fraction of, and its
+/// tensor-parallel degree: one card (`vram_gb`) x [`vllm_tp`], never more
+/// than the node's total ([`gpu_pool_spanning`]'s, which is one card when
+/// no total is reported). Without tensor-parallel it is one card, as before.
+fn vllm_budget_gb(spec: &Spec, node: &Value) -> (f64, u64) {
+    let Some(card) = pool_for(node, "gpu").map(|b| b.total_gb) else {
+        return (0.0, 1);
+    };
+    let tp = vllm_tp(spec, node);
+    if tp <= 1 {
+        return (card, 1);
+    }
+    let total = gpu_pool_spanning(node).map(|b| b.total_gb).unwrap_or(card);
+    ((card * tp as f64).min(total), tp)
 }
 
 /// The llama.cpp container's floor on a GPU placement: the agent's old fixed
@@ -598,19 +747,35 @@ pub fn evaluate(node: &Value, specs: &[Spec], embed_ctx: u64) -> Report {
         .max()
         .unwrap_or(1)
         .max(1);
-    let gpu_pool = pool_for(node, "gpu");
+    // The GPU pool spans every card when a placement on it splits a model
+    // across GPUs (ollama, llamacpp) or a vLLM one runs tensor-parallel;
+    // otherwise it is one card, as before.
+    let gpu_spans = specs.iter().any(|s| {
+        (is_vllm(&s.backend) && vllm_tp(s, node) > 1) || (splits_across_gpus(&s.backend) && resolve_target(s, node) == "gpu")
+    });
+    let pool_of = |target: &str| -> Option<Budget> {
+        if target == "gpu" && gpu_spans {
+            gpu_pool_spanning(node)
+        } else {
+            pool_for(node, target)
+        }
+    };
     let mut rows = Vec::new();
     for s in specs {
         let mut notes = Vec::new();
         let target = resolve_target(s, node);
-        if s.backend == "vllm" || s.backend == "vllm-secondary" {
+        if is_vllm(&s.backend) {
             let util = env_str(&s.env, "GPU_MEMORY_UTILIZATION").and_then(|v| v.parse::<f64>().ok()).unwrap_or(VLLM_DEFAULT_UTIL);
-            let total_budget = gpu_pool.as_ref().map(|b| b.total_gb).unwrap_or(0.0);
+            let (total_budget, tp) = vllm_budget_gb(s, node);
+            let mut vnotes = vec![format!("vLLM reserves GPU_MEMORY_UTILIZATION {util} of the GPU")];
+            if tp > 1 {
+                vnotes.push(format!("tensor-parallel over {tp} GPUs: {total_budget:.1} GB"));
+            }
             rows.push(Row {
                 backend: s.backend.clone(), role: s.role.clone(), model: s.model.clone(), target: "gpu",
                 weights_gb: None, weights_source: "vllm", kv_gb: 0.0, overhead_gb: 0.0,
                 total_gb: util * total_budget, source: "estimated", keep_warm: s.keep_warm,
-                notes: vec![format!("vLLM reserves GPU_MEMORY_UTILIZATION {util} of the GPU")],
+                notes: vnotes,
                 declared_gb: util * total_budget, kv_per_token_bytes: None, kv_basis: "vllm",
             });
             continue;
@@ -677,7 +842,7 @@ pub fn evaluate(node: &Value, specs: &[Spec], embed_ctx: u64) -> Report {
         // measured size) says whether it fits.
         if let Some(b) = measured {
             let m = b as f64 / GB;
-            let budget = pool_for(node, target).map(|p| p.total_gb);
+            let budget = pool_of(target).map(|p| p.total_gb);
             let over_budget = budget.is_some_and(|t| m > t);
             if s.backend == "ollama" && s.role != "embed" && s.role != "rerank" && (over_budget || m > est_total * 1.5) {
                 let mut msg = format!("{} measured {m:.1} GB resident, estimated {est_total:.1} GB at num_ctx {ctx}", s.model);
@@ -724,7 +889,7 @@ pub fn evaluate(node: &Value, specs: &[Spec], embed_ctx: u64) -> Report {
         let used: f64 = mine.iter().map(|r| r.total_gb).sum();
         let declared_used: f64 = mine.iter().map(|r| r.declared_gb).sum();
         let unknown_size = mine.iter().any(|r| r.weights_gb.is_none() && r.source == "estimated" && r.weights_source != "vllm");
-        let budget = pool_for(node, target);
+        let budget = pool_of(target);
         let (verdict, shortfall) = match &budget {
             None => {
                 warnings.push(format!(
@@ -739,8 +904,13 @@ pub fn evaluate(node: &Value, specs: &[Spec], embed_ctx: u64) -> Report {
             Some(b) if used <= b.usable_gb() => (Verdict::Fits, 0.0),
             Some(b) => {
                 warnings.push(format!(
-                    "tight: {:.1} GB needed leaves {:.1} GB of the {:.1} GB {} budget, inside the {:.1} GB headroom",
-                    used, b.total_gb - used, b.total_gb, b.kind, b.headroom_gb
+                    "tight: {:.1} GB needed leaves {:.1} GB of the {:.1} GB {} budget{}, inside the {:.1} GB headroom",
+                    used,
+                    b.total_gb - used,
+                    b.total_gb,
+                    b.kind,
+                    b.span_text().map(|t| format!(" {t}")).unwrap_or_default(),
+                    b.headroom_gb
                 ));
                 (Verdict::Tight, 0.0)
             }
@@ -795,14 +965,18 @@ impl Report {
                     .map(|r| format!("{} [{}] {:.1} GB ({})", r.model, r.role, r.total_gb, r.source))
                     .collect();
                 let b = p.budget.as_ref();
+                // A multi-GPU pool names its cards and their reserves.
+                let room = b
+                    .and_then(|b| b.span_text())
+                    .unwrap_or_else(|| format!("({:.1} GB headroom reserved)", b.map(|b| b.headroom_gb).unwrap_or(0.0)));
                 format!(
-                    "on {}: {} need {:.1} GB, the {} budget is {:.1} GB ({:.1} GB headroom reserved): short by {:.1} GB",
+                    "on {}: {} need {:.1} GB, the {} budget is {:.1} GB {}: short by {:.1} GB",
                     p.target,
                     per.join(" + "),
                     p.used_gb,
                     b.map(|b| b.kind).unwrap_or("?"),
                     b.map(|b| b.total_gb).unwrap_or(0.0),
-                    b.map(|b| b.headroom_gb).unwrap_or(0.0),
+                    room,
                     p.shortfall_gb
                 )
             })
@@ -817,6 +991,11 @@ impl Report {
     pub fn to_json(&self) -> Value {
         let budget_json = |b: &Budget| json!({
             "kind": b.kind, "target": b.target, "total_gb": b.total_gb, "headroom_gb": b.headroom_gb, "usable_gb": b.usable_gb(),
+            // A multi-GPU pool: null for one card or a CPU pool.
+            "gpus": b.span.as_ref().and_then(|s| s.gpus),
+            "cards_gb": b.span.as_ref().filter(|s| !s.cards.is_empty()).map(|s| s.cards.iter().map(|(c, _)| *c).collect::<Vec<f64>>()),
+            "card_headroom_gb": b.span.as_ref().filter(|s| !s.cards.is_empty()).map(|s| s.cards.iter().map(|(_, h)| *h).collect::<Vec<f64>>()),
+            "span": b.span_text(),
         });
         json!({
             "verdict": self.verdict.as_str(),
@@ -1248,5 +1427,199 @@ mod tests {
     fn no_reported_memory_is_unknown_not_refused() {
         let r = evaluate(&json!({}), &[spec("chat", GEMMA, None)], 1024);
         assert_eq!(r.verdict, Verdict::Unknown);
+    }
+
+    // ── Multi-GPU: a node with two 24 GB cards (Tesla P40s, compute 6.1) ──
+
+    /// 38 GB of weights: with a 2048 context, about 40 GB resident.
+    const BIG40: &str = "p40-split-test:70b";
+
+    /// Two 24 GB cards; `reported` adds what a newer agent sends
+    /// (`vram_total_gb`, `gpu_vram_gb`).
+    fn p40x2(reported: &[(&str, Value)]) -> Value {
+        let mut n = json!({"vram_gb": 24.0, "gpu_count": 2, "ram_gb": 64.0, "nvidia_runtime": true, "gpu_compute_cap": "6.1",
+            "model_stats": [{"name": BIG40, "size_bytes": 38_000_000_000u64}]});
+        for (k, v) in reported {
+            n[*k] = v.clone();
+        }
+        n
+    }
+
+    /// The 40 GB model as a llamacpp and as an ollama placement.
+    fn big40_split_specs() -> Vec<Spec> {
+        vec![llama(BIG40, Some("gpu"), &[("N_CTX", "2048")]), spec_env("chat", BIG40, &[("OLLAMA_CONTEXT_LENGTH", "2048")])]
+    }
+
+    /// Rule 2: llama.cpp (layer split) and Ollama spread a model across the
+    /// GPUs, so their pool is every card: 40 GB fits on 2 x 24 GB.
+    #[test]
+    fn multi_gpu_split_backends_fit_across_the_cards() {
+        let node = p40x2(&[("vram_total_gb", json!(48.0)), ("gpu_vram_gb", json!([24.0, 24.0]))]);
+        for s in big40_split_specs() {
+            let r = evaluate(&node, &[s.clone()], 1024);
+            assert_eq!(r.rows[0].target, "gpu", "{}", s.backend);
+            assert!(r.rows[0].total_gb > 39.0 && r.rows[0].total_gb < 41.0, "{} {}", s.backend, r.rows[0].total_gb);
+            assert_eq!(r.verdict, Verdict::Fits, "{} {r:#?}", s.backend);
+            let b = r.budget.as_ref().expect("a budget");
+            assert!((b.total_gb - 48.0).abs() < 1e-9 && (b.usable_gb() - 43.2).abs() < 1e-6, "{b:?}");
+        }
+    }
+
+    /// Rule 2, the fallback: an agent that sends no total (or no list) is
+    /// one card, refused exactly as today; gpu_count is never multiplied in.
+    #[test]
+    fn multi_gpu_without_a_total_is_one_card_as_today() {
+        let node = p40x2(&[]);
+        for s in big40_split_specs() {
+            let r = evaluate(&node, &[s.clone()], 1024);
+            assert_eq!(r.verdict, Verdict::DoesNotFit, "{} {r:#?}", s.backend);
+            let b = r.budget.as_ref().expect("a budget");
+            assert!(b.total_gb == 24.0 && b.span.is_none(), "{b:?}");
+            assert!(!r.refusal_message("node_a").contains("across"), "{}", r.refusal_message("node_a"));
+        }
+        assert_eq!(gpu_pool_spanning(&node).expect("a pool").total_gb, 24.0);
+    }
+
+    /// Only `vram_total_gb` (no per-card list): one pool with one headroom,
+    /// and the message says the per-card margin is unknown.
+    #[test]
+    fn multi_gpu_total_without_the_list_is_one_pool_margin_unknown() {
+        let node = p40x2(&[("vram_total_gb", json!(48.0))]);
+        let b = gpu_pool_spanning(&node).expect("a pool");
+        assert_eq!(b.total_gb, 48.0);
+        assert!((b.headroom_gb - 4.8).abs() < 1e-9, "{b:?}");
+        let span = b.span_text().expect("a multi-GPU span");
+        assert!(span.contains("across 2 GPUs") && span.contains("per-card margin unknown"), "{span}");
+    }
+
+    /// The headroom is reserved PER CARD and summed: two cards never get more
+    /// than one card of their combined size, and less where the minimum bites.
+    #[test]
+    fn multi_gpu_headroom_is_per_card() {
+        let usable = |n: Value| gpu_pool_spanning(&n).expect("a pool").usable_gb();
+        // Dedicated: 1 GB minimum on each 6 GB card.
+        let two6 = usable(json!({"vram_gb": 6.0, "gpu_count": 2, "gpu_vram_gb": [6.0, 6.0]}));
+        let one12 = usable(json!({"vram_gb": 12.0}));
+        assert!((two6 - 10.0).abs() < 1e-9, "{two6}");
+        assert!(two6 < one12, "2 x 6 GB {two6} must be below 1 x 12 GB {one12}");
+        // Shared: 2 GB minimum on each 8 GB card.
+        let two8 = usable(json!({"vram_gb": 8.0, "gpu_vram_gb": [8.0, 8.0], "usage_profile": "shared"}));
+        let one16 = usable(json!({"vram_gb": 16.0, "usage_profile": "shared"}));
+        assert!((two8 - 12.0).abs() < 1e-9 && two8 < one16, "{two8} vs {one16}");
+        // The fraction is linear: 2 x 24 GB equals, never exceeds, 1 x 48 GB.
+        let two24 = usable(json!({"vram_gb": 24.0, "gpu_vram_gb": [24.0, 24.0]}));
+        let one48 = usable(json!({"vram_gb": 48.0}));
+        assert!(two24 <= one48 + 1e-9, "{two24} vs {one48}");
+    }
+
+    fn vllm_spec(env: &[(&str, &str)]) -> Spec {
+        Spec { backend: "vllm".into(), ..llama("m:7b", Some("gpu"), env) }
+    }
+
+    fn first_row(node: &Value, s: Spec) -> Row {
+        let mut r = evaluate(node, &[s], 1024);
+        r.rows.remove(0)
+    }
+
+    /// Rule 3: vLLM is one card unless tensor-parallel is configured; then
+    /// one card x TP, TP capped at the node's gpu_count, never past the total.
+    #[test]
+    fn vllm_budget_is_one_card_unless_tensor_parallel() {
+        let node = p40x2(&[("vram_total_gb", json!(48.0)), ("gpu_vram_gb", json!([24.0, 24.0]))]);
+        let one = first_row(&node, vllm_spec(&[]));
+        assert!((one.total_gb - 0.9 * 24.0).abs() < 1e-9, "{}", one.total_gb);
+        for env in [[("TENSOR_PARALLEL_SIZE", "2")], [("GPU_COUNT", "2")]] {
+            let two = first_row(&node, vllm_spec(&env));
+            assert!((two.total_gb - 0.9 * 48.0).abs() < 1e-9, "{env:?}: {}", two.total_gb);
+        }
+        let tp4 = vllm_spec(&[("TENSOR_PARALLEL_SIZE", "4")]);
+        assert_eq!(vllm_tp(&tp4, &node), 2, "TP 4 on a 2-GPU node is capped at 2");
+        let four = first_row(&node, tp4);
+        assert!((four.total_gb - 0.9 * 48.0).abs() < 1e-9, "{}", four.total_gb);
+        assert!(four.notes.iter().any(|n| n.contains("tensor-parallel over 2 GPUs")), "{:?}", four.notes);
+        // An agent that reports no total: one card, whatever TP says.
+        let bare = first_row(&json!({"vram_gb": 24.0}), vllm_spec(&[("TENSOR_PARALLEL_SIZE", "2")]));
+        assert!((bare.total_gb - 0.9 * 24.0).abs() < 1e-9, "{}", bare.total_gb);
+    }
+
+    /// (cards, reserves, usable) out of "across N GPUs (a + b GB, r GB
+    /// reserved each, u GB usable)" or "(a + b GB, reserved r1 + r2 GB, ...)".
+    fn parse_span(msg: &str) -> (Vec<f64>, Vec<f64>, f64) {
+        let start = msg.find("GPUs (").expect("a span") + "GPUs (".len();
+        let end = start + msg[start..].find(')').expect("a closed span");
+        let parts: Vec<&str> = msg[start..end].split(", ").collect();
+        assert_eq!(parts.len(), 3, "{msg}");
+        let nums = |s: &str| -> Vec<f64> {
+            s.split(|c: char| !(c.is_ascii_digit() || c == '.')).filter(|t| !t.is_empty()).map(|t| t.parse::<f64>().expect("a number")).collect()
+        };
+        let cards = nums(parts[0]);
+        let mut reserves = nums(parts[1]);
+        if parts[1].ends_with("each") {
+            reserves = vec![reserves[0]; cards.len()];
+        }
+        (cards, reserves, nums(parts[2])[0])
+    }
+
+    /// Rule 4: a multi-GPU pool's message names the cards, each card's
+    /// reserve and the usable sum, and the printed parts add up.
+    #[test]
+    fn multi_gpu_message_names_the_cards_and_adds_up() {
+        let cases = [
+            (json!([24.0, 24.0]), "across 2 GPUs (24.0 + 24.0 GB, 2.4 GB reserved each, 43.2 GB usable)"),
+            (json!([24.0, 12.0]), "across 2 GPUs (24.0 + 12.0 GB, reserved 2.4 + 1.2 GB, 32.4 GB usable)"),
+        ];
+        for (cards, want) in cases {
+            let node = json!({"vram_gb": 24.0, "gpu_count": 2, "gpu_vram_gb": cards});
+            let b = gpu_pool_spanning(&node).expect("a pool");
+            assert_eq!(b.span_text().as_deref(), Some(want));
+            let pool = PoolReport { budget: Some(b.clone()), target: "gpu", used_gb: 60.0, declared_used_gb: 60.0, stack_reserve_gb: 0.0, verdict: Verdict::DoesNotFit, shortfall_gb: 60.0 - b.total_gb };
+            let report = Report { verdict: Verdict::DoesNotFit, budget: Some(b), pools: vec![pool], usage: "dedicated", rows: Vec::new(), total_gb: 60.0, shortfall_gb: 12.0, warnings: Vec::new() };
+            let msg = report.refusal_message("node_a");
+            assert!(msg.contains(want), "{msg}");
+            let (c, r, usable) = parse_span(&msg);
+            assert_eq!(c.len(), r.len(), "{msg}");
+            let parts: f64 = c.iter().sum::<f64>() - r.iter().sum::<f64>();
+            assert!((usable - parts).abs() < 0.05, "printed usable {usable} != cards - reserves {parts}: {msg}");
+        }
+    }
+
+    /// A single-GPU node (and a unified one) is unchanged by reporting a
+    /// total and a one-card list.
+    #[test]
+    fn a_single_gpu_node_is_unchanged() {
+        let plain = json!({"vram_gb": 24.0, "ram_gb": 64.0, "nvidia_runtime": true, "gpu_compute_cap": "6.1"});
+        let mut reported = plain.clone();
+        reported["gpu_count"] = json!(1);
+        reported["vram_total_gb"] = json!(24.0);
+        reported["gpu_vram_gb"] = json!([24.0]);
+        let a = gpu_pool_spanning(&reported).expect("a pool");
+        let b = pool_for(&plain, "gpu").expect("a pool");
+        assert_eq!((a.kind, a.total_gb, a.headroom_gb), (b.kind, b.total_gb, b.headroom_gb));
+        assert!(a.span.is_none() && a.span_text().is_none(), "{a:?}");
+        for s in [spec("chat", GEMMA, None), llama("m:7b", Some("gpu"), &[])] {
+            let x = evaluate(&plain, &[s.clone()], 1024);
+            let y = evaluate(&reported, &[s], 1024);
+            assert_eq!(x.to_json(), y.to_json());
+        }
+        let mut mac = host6();
+        mac["capabilities"]["vram_total_gb"] = json!(18.0);
+        let u = gpu_pool_spanning(&mac).expect("a pool");
+        assert!(u.kind == "unified" && u.total_gb == 18.0 && u.span.is_none(), "{u:?}");
+    }
+
+    /// ollama_default_ctx keeps vram_gb x gpu_count; a reported total does
+    /// not change it.
+    #[test]
+    fn ollama_default_ctx_is_unchanged_with_a_reported_total() {
+        let cases = [
+            (json!({"vram_gb": 24.0, "gpu_count": 2, "vram_total_gb": 48.0, "gpu_vram_gb": [24.0, 24.0]}), 262144),
+            (json!({"vram_gb": 12.0, "gpu_count": 2, "vram_total_gb": 24.0}), 32768),
+            (json!({"vram_gb": 12.0, "capabilities": {"gpu_count": 2, "vram_total_gb": 24.0}}), 32768),
+            (json!({"vram_gb": 24.0, "vram_total_gb": 24.0}), 32768),
+            (json!({"vram_gb": 6.0, "vram_total_gb": 6.0}), 4096),
+        ];
+        for (node, want) in cases {
+            assert_eq!(ollama_default_ctx(&node, "gpu"), want, "{node}");
+        }
     }
 }

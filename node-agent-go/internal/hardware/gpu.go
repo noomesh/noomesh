@@ -93,22 +93,62 @@ func (g *GPUDetector) DetectModel() (string, error) {
 	return firstLine(out), nil
 }
 
-// DetectVRAM returns total VRAM in GB via nvidia-smi. (0, nil) means no GPU;
-// an error (including unparseable output) means unknown.
+// DetectVRAM returns ONE GPU's VRAM in GB (the first card nvidia-smi lists)
+// via nvidia-smi. (0, nil) means no GPU; an error (including unparseable
+// output) means unknown.
 func (g *GPUDetector) DetectVRAM() (float64, error) {
+	vram, _, err := g.DetectVRAMCards()
+	return vram, err
+}
+
+// DetectVRAMCards is DetectVRAM plus every card's memory.total in GB (the
+// same MiB/1024 unit), read from the SAME nvidia-smi query: one exec. The
+// first value is exactly DetectVRAM's (the first line; an unparseable first
+// line is an error). cards is nil when any line does not parse: the per-card
+// list is then unknown and omitted, while vram_gb stands as before.
+func (g *GPUDetector) DetectVRAMCards() (vramGB float64, cards []float64, err error) {
 	out, absent, err := smiQuery("--query-gpu=memory.total", "--format=csv,noheader,nounits")
 	if err != nil || absent {
-		return 0, err
+		return 0, nil, err
 	}
 	line := firstLine(out)
 	if line == "" {
-		return 0, nil
+		return 0, nil, nil
 	}
 	mb, perr := strconv.ParseFloat(line, 64)
 	if perr != nil {
-		return 0, fmt.Errorf("nvidia-smi memory.total: unparseable output %q: %w", line, perr)
+		return 0, nil, fmt.Errorf("nvidia-smi memory.total: unparseable output %q: %w", line, perr)
 	}
-	return round(mb/1024, 1), nil
+	return round(mb/1024, 1), parseVRAMCards(out), nil
+}
+
+// parseVRAMCards reads one memory.total (MiB) per non-blank line as GB.
+// nil when any line is not a number: a partial list would understate the
+// node, and the gateway reads a missing list as one card (today's fit).
+func parseVRAMCards(out string) []float64 {
+	var cards []float64
+	for _, l := range strings.Split(out, "\n") {
+		l = strings.TrimSpace(l)
+		if l == "" {
+			continue
+		}
+		mb, err := strconv.ParseFloat(l, 64)
+		if err != nil || mb <= 0 {
+			return nil
+		}
+		cards = append(cards, round(mb/1024, 1))
+	}
+	return cards
+}
+
+// SumVRAM is vram_total_gb: the sum of the per-card list, rounded like each
+// card. 0 for an empty list.
+func SumVRAM(cards []float64) float64 {
+	var total float64
+	for _, c := range cards {
+		total += c
+	}
+	return round(total, 1)
 }
 
 // DetectCount returns the number of GPUs available. (0, nil) means no GPU;
