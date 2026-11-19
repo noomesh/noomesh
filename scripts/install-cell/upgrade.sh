@@ -20,7 +20,8 @@
 # Every judged assert prints exactly one line, `UPGRADE <id> PASS|FAIL|NOT
 # REACHED: <why>`, quoting the product's own line on a FAIL. The asserts are
 # 97's spec (A1-A6 after `--all`, B1-B3 after the same-tag `--stack`) and
-# general's (G1-G5: the verify rows, the journal, a chat answer after).
+# general's (G1-G5: the verify rows, the journal, a chat answer after), and
+# I1 last (a mirror import into an agent-managed ollama, host-mode dial).
 set -uo pipefail
 : "${OUT:?}" "${CELL:=upgrade-24.04}" "${RUNNER:=?}" "${CLI_TAG:=latest}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -146,5 +147,59 @@ sudo -n journalctl _COMM=sudo --no-pager --since "@$STACK_T0" --until "@$STACK_T
 # withheld artifact can never hide which sudo ran during the --stack.
 grep -E "COMMAND=" "$JR/sudo-stack.journal" > "$J/sudo-during-stack.txt" || true
 export J JR SELF ROLL_T0 OUT
+
+# ── 6b. I1: a mirror import into an agent-MANAGED ollama, host-mode dial ───
+# Last, after every capture above, so nothing it changes reaches A1-G5.
+# A host-mode agent (systemd) reaches noo-ollama only through its mTLS door,
+# by docker name (noo-stunnel-ollama), which only containerdial's dial
+# resolves. 0.6.27's importMirror dialled it with a fresh transport, so the
+# import died on "lookup noo-stunnel-ollama". Nothing ran this path before:
+# the matrix cells use the stack's ollama-embed, which the self node ADOPTS
+# (NOO_SELF_NODE=1, OLLAMA_URL = its door: backendrt.NewAdopted) and never
+# imports into, and the rehearsal's agents run in containers.
+# On a standalone box no operator command makes the self node manage
+# noo-ollama: provision renders NOO_SELF_NODE=1 and OLLAMA_URL for it, and
+# importMirror refuses the container path while OLLAMA_URL is set. So the
+# agent is given a worker's env shape (both empty, what provision renders
+# for a node of a checkout controller) and restarted; from there the
+# commands are the operator's: stage the tag, place it, and the agent's
+# reconcile starts noo-ollama + noo-stunnel-ollama and imports the placed,
+# import-only tag (startOllamaImport -> PullOllamaModel -> importMirror).
+# Bounded: fetch 900 s, place 300 s, the wait I1_WAIT (+120 s slack).
+I1_MODEL="qwen2.5:0.5b"
+I1_WAIT=600
+echo "$I1_MODEL" > "$J/i1-model"
+if step i1-fetch 900 -- noo models fetch "ollama:$I1_MODEL"; then
+    # the window the I1 journal is read from: the agent's restart on
+    I1_T0="$(date +%s)"
+    step i1-worker-shape 180 -- bash -c '
+      f=/etc/noo-node-agent.env
+      sudo -n test -f "$f" || { echo "upgrade-cell: no $f on the self node"; exit 1; }
+      echo "before: $(sudo -n grep -E "^(NOO_SELF_NODE|OLLAMA_URL)=" "$f" | tr "\n" " ")"
+      sudo -n sed -i -E "s/^(NOO_SELF_NODE|OLLAMA_URL)=.*/\1=/" "$f" || exit 1
+      echo "after: $(sudo -n grep -E "^(NOO_SELF_NODE|OLLAMA_URL)=" "$f" | tr "\n" " ")"
+      sudo -n systemctl restart noo-node-agent.service || exit 1
+      for _ in $(seq 1 30); do systemctl is-active -q noo-node-agent.service && break; sleep 2; done
+      echo "noo-node-agent.service: $(systemctl is-active noo-node-agent.service)"
+      systemctl is-active -q noo-node-agent.service' \
+    && step i1-place 300 -- noo cluster place "$SELF" ollama "$I1_MODEL" \
+    && step i1-wait $((I1_WAIT + 120)) -- bash -c '
+      model="$1" t0="$2" CELL_PY="$3" JUDGE="$4" wait="$5"
+      end=$(( $(date +%s) + wait ))
+      while :; do
+        sudo -n journalctl --no-pager --since "@$t0" 2>/dev/null | grep -E "noo-node-agent" \
+          | python3 "$CELL_PY" redact > "$JR/i1.journal"
+        noo --json cluster verify > "$J/verify-i1.json" 2>/dev/null
+        { sudo -n docker exec noo-ollama ollama list 2>&1; echo "__rc=$?"; } | python3 "$CELL_PY" redact > "$J/i1-tags.txt"
+        state="$(python3 "$JUDGE" i1-probe)"
+        echo "$(date -u +%T) $state"
+        case "$state" in PASS*|FAIL*) break ;; esac
+        [ "$(date +%s)" -ge "$end" ] && { echo "waited ${wait}s"; break; }
+        sleep 15
+      done
+      grep -E "ollama mirror import|ollama_import_|lookup noo-stunnel|no such host" "$JR/i1.journal" | tail -n 5 | cut -c1-400
+      grep -m1 -F "$model" "$J/i1-tags.txt"; true' \
+      i1 "$I1_MODEL" "$I1_T0" "$CELL_PY" "$HERE/upgrade_judge.py" "$I1_WAIT"
+fi
 step judge 120 -- python3 "$HERE/upgrade_judge.py" judge
 finish

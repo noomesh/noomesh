@@ -46,8 +46,24 @@ GOOD_CTL = [
 ]
 
 
+I1_STEPS_OK = [("i1-fetch", 0, ""), ("i1-worker-shape", 0, ""), ("i1-place", 0, ""), ("i1-wait", 0, "")]
+I1_JOURNAL_OK = (
+    'Nov 18 runner-a noo-node-agent[3]: {"level":"INFO","msg":"reconcile.ollama_import_start","model":"qwen2.5:0.5b","backend":"ollama"}\n'
+    'Nov 18 runner-a noo-node-agent[3]: {"level":"INFO","msg":"ollama mirror import","model":"qwen2.5:0.5b","blobs":5,"via":"container","ollama":"https://noo-stunnel-ollama:11434"}\n'
+    'Nov 18 runner-a noo-node-agent[3]: {"level":"INFO","msg":"ollama mirror imported","model":"qwen2.5:0.5b","via":"container"}\n')
+I1_TAGS_OK = "NAME            ID              SIZE      MODIFIED\nqwen2.5:0.5b    a8b0c5157701    397 MB    5 seconds ago\n__rc=0\n"
+I1_ROWS_OK = GOOD_SELF[:2] + [{"name": "ollama models", "verdict": "ok",
+                               "detail": "verified against the controller: qwen2.5:0.5b (matches the controller's record of its pull, weights sha256:c5396e06af29…)"}]
+# 0.6.27's own line: importMirror's fresh transport has no containerdial dial
+I1_JOURNAL_0627 = I1_JOURNAL_OK.rsplit("Nov 18", 1)[0] + (
+    'Nov 18 runner-a noo-node-agent[3]: {"time":"2026-11-18T10:02:11Z","level":"ERROR","msg":"reconcile.ollama_import_failed",'
+    '"model":"qwen2.5:0.5b","backend":"ollama","error":"Head \\"https://noo-stunnel-ollama:11434/api/blobs/sha256:c5396e06af29\\": '
+    'dial tcp: lookup noo-stunnel-ollama on 127.0.0.53:53: no such host","failures":1,"retry_after":"10m0s"}\n')
+
+
 def cell(tmp, roll=ROLL_OK, stack=STACK_OK, journal=JOURNAL_OK, roll_rc="0", self_rows=None, ctl_rows=None,
-         chat="ok\n", chat_rc=0, unit=True, sudo_journal="", unit_user=None, stack_journal=None, exec_start=None):
+         chat="ok\n", chat_rc=0, unit=True, sudo_journal="", unit_user=None, stack_journal=None, exec_start=None,
+         i1=None):
     out, j, jr = tmp / "out", tmp / "out" / "judge", tmp / "raw"
     (out / "logs").mkdir(parents=True)
     j.mkdir()
@@ -67,6 +83,15 @@ def cell(tmp, roll=ROLL_OK, stack=STACK_OK, journal=JOURNAL_OK, roll_rc="0", sel
     (j / "verify-final.json").write_text(v)
     (out / "logs" / "chat-after.log").write_text(chat)
     (out / "steps.jsonl").write_text(json.dumps({"step": "chat-after", "rc": chat_rc}) + "\n")
+    if i1 is not None:
+        # I1's evidence, as upgrade.sh's step 6b writes it
+        with open(out / "steps.jsonl", "a") as f:
+            for name, rc, err in i1.get("steps", I1_STEPS_OK):
+                f.write(json.dumps({"step": name, "rc": rc, "first_error": err, "tail": [err]}) + "\n")
+        (j / "i1-model").write_text("qwen2.5:0.5b\n")
+        (jr / "i1.journal").write_text(i1.get("journal", I1_JOURNAL_OK))
+        (j / "i1-tags.txt").write_text(i1.get("tags", I1_TAGS_OK))
+        (j / "verify-i1.json").write_text(verify(i1.get("rows", I1_ROWS_OK), GOOD_CTL))
     me = subprocess.run(["id", "-un"], capture_output=True, text=True).stdout.strip()
     env = dict(os.environ, OUT=str(out), J=str(j), JR=str(jr), SELF=SELF, NETNS_UNIT_ENABLED="enabled",
                NETNS_UNIT_OWNER="%d:%d" % (os.getuid(), os.getgid()))
@@ -239,3 +264,40 @@ def test_b3_names_every_sudo_command_during_the_stack(tmp_path):
           "Nov 18 sudo[2]: runner : COMMAND=/usr/bin/systemctl daemon-reload\n")
     rc, got = cell(tmp_path, sudo_journal=sj)
     assert " FAIL: 2 sudo command(s)" in got["B3"] and "/usr/bin/tee" in got["B3"] and "daemon-reload" in got["B3"], got["B3"]
+
+
+def test_i1_passes_when_the_managed_ollama_serves_the_imported_tag_verified(tmp_path):
+    rc, got = cell(tmp_path, i1={})
+    assert rc == 0 and " PASS: " in got["I1"], got["I1"]
+    assert "qwen2.5:0.5b a8b0c5157701 397" in got["I1"] and "verified against the controller: qwen2.5:0.5b (" in got["I1"], got["I1"]
+
+
+def test_i1_fails_quoting_0627s_lookup_of_the_door_by_docker_name(tmp_path):
+    """0.6.27 / 0.6.28-rc.1: importMirror's transport never got containerdial's dial."""
+    rc, got = cell(tmp_path, i1={"journal": I1_JOURNAL_0627, "tags": "NAME ID SIZE MODIFIED\n__rc=0\n",
+                                 "rows": GOOD_SELF[:2] + [{"name": "ollama models", "verdict": "warn", "detail": "qwen2.5:0.5b: could not be checked (not in this node's ollama)"}]})
+    assert rc == 1 and " FAIL: the host-mode agent could not resolve the door by its docker name: " in got["I1"], got["I1"]
+    assert "reconcile.ollama_import_failed" in got["I1"] and "lookup noo-stunnel-ollama on 127.0.0.53:53: no such host" in got["I1"], got["I1"]
+    # systemd-resolved may answer a single-label name "server misbehaving": the lookup is the same defect
+    j = I1_JOURNAL_0627.replace("no such host", "server misbehaving")
+    rc, got = cell(tmp_path / "b", i1={"journal": j})
+    assert " FAIL: " in got["I1"] and "lookup noo-stunnel-ollama on 127.0.0.53:53: server misbehaving" in got["I1"], got["I1"]
+
+
+def test_i1_is_not_reached_when_a_prerequisite_command_failed_quoting_it(tmp_path):
+    err = "x qwen2.5:0.5b: the registry answered 503 Service Unavailable"
+    rc, got = cell(tmp_path, i1={"steps": [("i1-fetch", 0, ""), ("i1-worker-shape", 0, ""), ("i1-place", 1, err)],
+                                 "journal": "", "tags": ""})
+    assert " NOT REACHED: i1-place exited 1: " + err in got["I1"], got["I1"]
+    rc, got = cell(tmp_path / "b")
+    assert " NOT REACHED: the I1 step did not run" in got["I1"], got["I1"]
+
+
+def test_i1_served_but_unverified_fails_and_the_probe_waits_until_the_evidence_decides(tmp_path):
+    rows = GOOD_SELF[:2] + [{"name": "ollama models", "verdict": "warn", "detail": "qwen2.5:0.5b: unverified (no controller record); re-pull it through noo to verify it"}]
+    rc, got = cell(tmp_path, i1={"rows": rows})
+    assert " FAIL: qwen2.5:0.5b not imported within the wait: served by noo-ollama; ollama models: warn: " in got["I1"], got["I1"]
+    d = tmp_path / "out" / "judge"
+    env = dict(os.environ, J=str(d), JR=str(tmp_path / "raw"), SELF=SELF)
+    r = subprocess.run([sys.executable, str(JUDGE), "i1-probe"], env=env, capture_output=True, text=True)
+    assert r.stdout.startswith("PENDING: served=True verified=False"), r.stdout + r.stderr

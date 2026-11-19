@@ -10,6 +10,9 @@
         One line per assert, `UPGRADE <id> PASS|FAIL|NOTE|NOT REACHED: <why>`,
         quoting the product's own line on a FAIL. Exit 1 on any FAIL. Reads
         $OUT/logs/<step>.log and $J/* written by upgrade.sh.
+    upgrade_judge.py i1-probe
+        I1 from the evidence so far, for step 6b's wait loop: PENDING until
+        it is PASS or FAIL. Reads $J and $JR.
 
 Standard library only (hosted runner's python3).
 """
@@ -86,6 +89,71 @@ def text(path):
         return open(path, errors="replace").read()
     except OSError:
         return None
+
+
+I1_PREREQS = ("i1-fetch", "i1-worker-shape", "i1-place")
+
+
+def steps_of(out):
+    recs = {}
+    try:
+        for l in open(os.path.join(out, "steps.jsonl")):
+            if l.strip():
+                d = json.loads(l)
+                recs[d.get("step")] = d
+    except OSError:
+        pass
+    return recs
+
+
+def lookup_quote(l):
+    """The agent's own words around the failed lookup: its msg, then the
+    error from the URL it dialled to the resolver's answer."""
+    key = "lookup noo-stunnel" if "lookup noo-stunnel" in l else "no such host"
+    m = re.search(r'"msg":"([^"]*)"', l)
+    err = [e for e in re.findall(r'"error":"((?:[^"\\]|\\.)*)"', l) if key in e]
+    if err:
+        body = err[0].replace('\\"', '"')
+    else:
+        i = l.find(key)
+        body = l[max(0, i - (120 if key.startswith("lookup") else 200)):i + 160].strip()
+    return ("%s: " % m.group(1) if m else "") + body
+
+
+def i1(j, jr, me, recs=None):
+    """I1: the mirror import reached the agent-MANAGED noo-ollama through its
+    door by docker name (host-mode dial). recs None = the wait loop's probe:
+    PENDING until the evidence decides. Returns (verdict, why)."""
+    model = (text(os.path.join(j, "i1-model")) or "qwen2.5:0.5b").strip()
+    if recs is not None:
+        if "i1-fetch" not in recs:
+            return "NOT REACHED", "the I1 step did not run"
+        for name in I1_PREREQS:
+            r = recs.get(name)
+            if r is None:
+                return "NOT REACHED", "%s did not run" % name
+            if r.get("rc") != 0:
+                return "NOT REACHED", "%s exited %s: %s" % (name, r.get("rc"), r.get("first_error") or " | ".join((r.get("tail") or [])[-2:]))
+    journal = (text(os.path.join(jr, "i1.journal")) or "").splitlines()
+    looked = [l for l in journal if "lookup noo-stunnel" in l or "no such host" in l]
+    if looked:
+        return "FAIL", "the host-mode agent could not resolve the door by its docker name: " + lookup_quote(looked[0])
+    tags = [l for l in (text(os.path.join(j, "i1-tags.txt")) or "").splitlines() if l.split()[:1] == [model]]
+    om = rows(load(os.path.join(j, "verify-i1.json")), "ollama models", me)
+    d = (om[0].get("detail") or "") if om else ""
+    verified = bool(re.search(r"(verified against the controller: |; verified: )[^;]*?(?<![\w.:/-])%s \(" % re.escape(model), d)) \
+        and ("%s: " % model) not in d
+    if tags and verified:
+        return "PASS", "%s served by the managed noo-ollama (ollama list: %s); ollama models: %s; no lookup error in the agent's journal" % (
+            model, " ".join(tags[0].split()[:3]), d)
+    if recs is None:
+        return "PENDING", "served=%s verified=%s" % (bool(tags), verified)
+    failed = [l.strip() for l in journal if "ollama_import_failed" in l or "ollama_model_import_only_missing" in l]
+    if failed:
+        return "FAIL", "the import failed: " + failed[-1]
+    return "FAIL", "%s not imported within the wait: %s; ollama models: %s" % (
+        model, "served by noo-ollama" if tags else "not in noo-ollama's ollama list",
+        ("%s: %s" % (om[0].get("verdict"), d)) if om else "no row for this node")
 
 
 def judge():
@@ -302,6 +370,9 @@ def judge():
             "noo chat answered after the upgrade: %s" % one(" ".join(body[-2:]), 160) if rec.get("rc") == 0 and body
             else "noo chat exit %s: %s" % (rec.get("rc"), one(" ".join(body[-2:]), 200)))
 
+    # ── I1, last: the mirror import into an agent-managed ollama ──
+    say("I1", *i1(j, jr, me, steps_of(out)))
+
     print("\n".join(lines))
     return 1 if failed else 0
 
@@ -314,5 +385,8 @@ if __name__ == "__main__":
         before(*a[1:])
     elif a[:1] == ["judge"]:
         sys.exit(judge())
+    elif a[:1] == ["i1-probe"]:
+        e = os.environ
+        print("%s: %s" % i1(e["J"], e.get("JR", e["J"]), e["SELF"]))
     else:
-        sys.exit("usage: upgrade_judge.py resolve OWNER/REPO TAG PREV TARGET | before VERIFY SELF | judge")
+        sys.exit("usage: upgrade_judge.py resolve OWNER/REPO TAG PREV TARGET | before VERIFY SELF | judge | i1-probe")
