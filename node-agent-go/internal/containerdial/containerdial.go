@@ -285,7 +285,7 @@ func Installed() dialFn {
 // containerised path stays byte-identical.
 func ApplyDial(t *http.Transport) *http.Transport {
 	if d := Installed(); d != nil && t != nil {
-		t.DialContext = d
+		_ = d
 	}
 	return t
 }
