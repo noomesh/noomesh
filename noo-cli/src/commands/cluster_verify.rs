@@ -517,6 +517,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     out.extend(door_pin_check(n));
     out.extend(gpu_target_cpu_build_check(n));
     out.extend(llamacpp_offload_check(n));
+    out.extend(docker_engine_check(n));
     out.extend(vllm_compute_check(n));
     out.extend(hardened_images_check(n));
 
@@ -1457,6 +1458,49 @@ pub(crate) fn llamacpp_offload_check(n: &Value) -> Option<Check> {
         ))));
     }
     (!good.is_empty()).then(|| ok(NAME, good.join(", ")))
+}
+
+/// The oldest Docker Engine (major version) the project tests: CI's
+/// copy-owner job runs docker:27-dind. The one declared minimum: the
+/// `docker engine` verify row reads it, and docs/cli/fleet.md names it. The
+/// operator decides it (i1058); raise it here and nowhere else.
+pub(crate) const MIN_DOCKER_ENGINE_MAJOR: u64 = 27;
+
+/// The `docker engine` row (i1058), from the node's `docker_engine` fact.
+/// No row from an agent that predates the fact (a fleet mid-roll stays
+/// quiet). `none` (no Docker, a native-only node) is OK. `unreadable` is a
+/// WARN: the engine is there and could not be checked. A known Docker Engine
+/// below [`MIN_DOCKER_ENGINE_MAJOR`] is a WARN naming the upgrade; at or above
+/// it, OK. Podman's compat API is reported, not compared: its version is
+/// Podman's, not a Docker Engine's.
+pub(crate) fn docker_engine_check(n: &Value) -> Option<Check> {
+    const NAME: &str = "docker engine";
+    let e = n.get("docker_engine")?.as_object()?;
+    let id = n["id"].as_str().unwrap_or("?");
+    let state = e.get("state").and_then(Value::as_str).unwrap_or("");
+    let version = e.get("version").and_then(Value::as_str).unwrap_or("");
+    let kind = e.get("kind").and_then(Value::as_str).unwrap_or("dockerd");
+    let cannot = |why: String| {
+        warn(NAME, format!("cannot be checked: the Docker Engine version could not be read on {id} ({why})"),
+            Some(format!("on {id}: docker version   # is the daemon up, and can the agent reach its socket?")))
+    };
+    match state {
+        "none" => Some(ok(NAME, "no Docker on this node (native backends only)")),
+        "unreadable" => Some(cannot(e.get("error").and_then(Value::as_str).unwrap_or("no error given").to_string())),
+        "ok" if kind == "podman" => Some(ok(NAME, format!("Podman {version} (Docker-compatible API; not compared with the Docker Engine minimum {MIN_DOCKER_ENGINE_MAJOR})"))),
+        "ok" => {
+            let label = if kind == "docker-desktop" { format!("Docker Desktop, engine {version}") } else { format!("Docker Engine {version}") };
+            let major = version.trim_start_matches('v').split('.').next().and_then(|m| m.parse::<u64>().ok());
+            match major {
+                Some(m) if m >= MIN_DOCKER_ENGINE_MAJOR => Some(ok(NAME, format!("{label} (minimum {MIN_DOCKER_ENGINE_MAJOR})"))),
+                Some(_) => Some(warn(NAME,
+                    format!("{label} on {id} is below {MIN_DOCKER_ENGINE_MAJOR}, the oldest Docker Engine noomesh tests; known: a container-lane Ollama import fails on an engine below 28 with an agent before 0.6.28"),
+                    Some(format!("upgrade Docker Engine on {id} to {MIN_DOCKER_ENGINE_MAJOR} or newer (https://docs.docker.com/engine/install/), then: noo cluster verify {id}")))),
+                None => Some(cannot(format!("version {version:?} does not parse"))),
+            }
+        }
+        other => Some(cannot(format!("unknown state {other:?}"))),
+    }
 }
 
 /// The running vLLM placements of a node's desired config, as `<backend>
@@ -17029,6 +17073,58 @@ mod llamacpp_offload_tests {
         let n = node(json!([{"backend": "llamacpp", "model": "m.gguf", "target": "gpu", "state": "unknown", "checked_at": "t"}]));
         let c = node_checks(&n, "", "", 0, None);
         assert!(c.iter().any(|c| c.name == "llamacpp offload" && c.verdict == Verdict::Warn), "{:?}", c.iter().map(|c| c.name).collect::<Vec<_>>());
+    }
+}
+
+#[cfg(test)]
+mod docker_engine_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn node(engine: Value) -> Value {
+        json!({"id": "node_a", "status": "online", "docker_engine": engine})
+    }
+
+    #[test]
+    fn an_engine_below_the_minimum_warns_with_the_upgrade() {
+        let c = docker_engine_check(&node(json!({"state": "ok", "version": "26.1.4", "kind": "dockerd"}))).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
+        assert!(c.detail.contains("Docker Engine 26.1.4 on node_a is below 27"), "{}", c.detail);
+        assert!(c.detail.contains("container-lane Ollama import fails on an engine below 28"), "{}", c.detail);
+        assert!(c.remedy.as_deref().unwrap_or("").starts_with("upgrade Docker Engine on node_a to 27 or newer"), "{:?}", c.remedy);
+    }
+
+    #[test]
+    fn an_engine_at_or_above_the_minimum_is_ok() {
+        for (v, kind) in [("27.0.1", "dockerd"), ("28.5.1", "docker-desktop"), ("29.0.0-rc.1", "dockerd")] {
+            let c = docker_engine_check(&node(json!({"state": "ok", "version": v, "kind": kind}))).expect("a row");
+            assert_eq!(c.verdict, Verdict::Ok, "{v}: {c:?}");
+            assert!(c.detail.contains(v), "{}", c.detail);
+        }
+        assert_eq!(MIN_DOCKER_ENGINE_MAJOR, 27, "the declared minimum is the operator's (i1058)");
+    }
+
+    #[test]
+    fn an_unreadable_engine_warns_that_it_cannot_be_checked() {
+        let c = docker_engine_check(&node(json!({"state": "unreadable", "error": "permission denied on the socket"}))).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
+        assert!(c.detail.starts_with("cannot be checked: the Docker Engine version could not be read on node_a"), "{}", c.detail);
+        assert!(c.detail.contains("permission denied on the socket"), "{}", c.detail);
+    }
+
+    #[test]
+    fn no_docker_is_quiet_and_an_older_agent_has_no_row() {
+        let c = docker_engine_check(&node(json!({"state": "none"}))).expect("a row");
+        assert_eq!(c.verdict, Verdict::Ok, "{c:?}");
+        assert!(docker_engine_check(&json!({"id": "node_a"})).is_none(), "an agent that predates the fact: no row");
+        let podman = docker_engine_check(&node(json!({"state": "ok", "version": "5.2.2", "kind": "podman"}))).expect("a row");
+        assert_eq!(podman.verdict, Verdict::Ok, "Podman's version is not a Docker Engine's: {podman:?}");
+    }
+
+    #[test]
+    fn node_checks_carry_the_docker_engine_row() {
+        let c = node_checks(&node(json!({"state": "ok", "version": "24.0.7", "kind": "dockerd"})), "", "", 0, None);
+        assert!(c.iter().any(|c| c.name == "docker engine" && c.verdict == Verdict::Warn), "{:?}", c.iter().map(|c| c.name).collect::<Vec<_>>());
     }
 }
 

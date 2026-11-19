@@ -168,8 +168,8 @@ func TestTheNodeFactsAreBuiltFromTheConfig(t *testing.T) {
 	if facts.ComputeCaps == nil || facts.DataRootFreeGB == nil {
 		t.Fatalf("a probe is not wired: caps=%v disk=%v", facts.ComputeCaps != nil, facts.DataRootFreeGB != nil)
 	}
-	if facts.NvidiaRuntime != nil {
-		t.Fatal("an nvidia runtime probe without docker")
+	if facts.NvidiaRuntime != nil || facts.DockerEngine != nil {
+		t.Fatal("a docker probe without docker")
 	}
 	// Defaults: nothing set is approve (nothing approved, so nothing runs),
 	// and not the controller's host.

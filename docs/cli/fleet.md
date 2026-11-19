@@ -514,6 +514,26 @@ the node-side `noo-apply`; `noo cluster restart-backends gpu-2 noo-ollama`
 restarts named `noo-*` containers through the same rail. `noo upgrade
 --nodes` (Setup & host) restages the whole bundle instead.
 
+### Check each node's Docker Engine
+
+Each agent reports its Docker Engine in the heartbeat (`docker_engine`: the
+version and the kind, `dockerd`, `docker-desktop` or `podman`; `none` without
+Docker; `unreadable` with the error when Docker is there but its version
+could not be read). `noo cluster show <node>` prints it, and `noo cluster
+verify` has a `docker engine` row:
+
+- below **27**, the oldest Docker Engine the project tests (CI runs
+  `docker:27-dind`): WARN, with the upgrade as the remedy. Known consequence:
+  a container-lane Ollama import fails on an engine below 28 with an agent
+  before 0.6.28;
+- `unreadable`: WARN, `cannot be checked`, with the error;
+- `none` (a native-only node) and 27 or newer: ok. Podman is shown, not
+  compared;
+- an agent that predates the report: no row.
+
+The minimum is the operator's decision. It is declared once, as
+`MIN_DOCKER_ENGINE_MAJOR` in `noo-cli/src/commands/cluster_verify.rs`.
+
 ### Push a rotated fleet secret
 
 ```sh

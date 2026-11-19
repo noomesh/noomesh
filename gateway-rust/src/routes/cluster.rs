@@ -389,6 +389,9 @@ enum BeatShape {
     OneOf(&'static [&'static str]),
     /// A list of objects, at most this many.
     Objects(usize),
+    /// One small object: its `state` is one of these, and every value is a
+    /// string of at most 256 bytes (at most 8 keys).
+    StateObject(&'static [&'static str]),
 }
 
 /// The A4 keys. Placement (i300 H3) reads only what this stores: a key left
@@ -421,6 +424,11 @@ const I300_BEAT_KEYS: &[(&str, BeatShape)] = &[
     // node-agent-go docker/llamacpp_offload.go), read by the `llamacpp
     // offload` verify row: 0 offloaded on a GPU start is a WARN.
     ("llamacpp_offload", BeatShape::Objects(8)),
+    // i1058: the node's Docker Engine, `{state: ok, version, kind}` (kind
+    // dockerd | docker-desktop | podman), `{state: none}` (no Docker) or
+    // `{state: unreadable, error}`; read by the `docker engine` verify row.
+    // Absent is an agent that predates it.
+    ("docker_engine", BeatShape::StateObject(&["ok", "none", "unreadable"])),
 ];
 
 fn beat_shape_ok(v: &Value, shape: BeatShape) -> bool {
@@ -433,6 +441,11 @@ fn beat_shape_ok(v: &Value, shape: BeatShape) -> bool {
         BeatShape::Objects(max) => v
             .as_array()
             .is_some_and(|a| a.len() <= max && a.iter().all(Value::is_object)),
+        BeatShape::StateObject(states) => v.as_object().is_some_and(|o| {
+            o.len() <= 8
+                && o.get("state").and_then(Value::as_str).is_some_and(|s| states.contains(&s))
+                && o.values().all(|x| x.as_str().is_some_and(|s| s.len() <= 256))
+        }),
     }
 }
 
@@ -9286,7 +9299,38 @@ mod i300_beat_tests {
             "ollama_verify": [{"model": "harrier", "state": "verified", "anchor": "gguf", "model_layer": "sha256:5f26", "reason": "", "checked_at": "t"}],
             "llamacpp_offload": [{"backend": "llamacpp", "model": "m.gguf", "target": "gpu", "state": "gpu", "offloaded": 33, "total": 33,
                 "cuda_devices": 1, "device": "NVIDIA GeForce GTX 1080", "compute_cap": "6.1", "checked_at": "t"}],
+            "docker_engine": {"state": "ok", "version": "27.5.1", "kind": "dockerd"},
         })
+    }
+
+    /// i1058: each `docker_engine` state reaches the record as sent; a beat
+    /// without it removes it (an agent that predates it), and an unknown
+    /// state, a non-string value or a non-object is unknown, not stored.
+    #[test]
+    fn docker_engine_is_carried_in_each_state_and_removed_when_absent_or_misshapen() {
+        let mut data = json!({"id": "n1"});
+        for good in [
+            json!({"state": "ok", "version": "26.1.4", "kind": "docker-desktop"}),
+            json!({"state": "none"}),
+            json!({"state": "unreadable", "error": "Cannot connect to the Docker daemon"}),
+        ] {
+            carry_i300(&mut data, &json!({"docker_engine": good.clone()}));
+            assert_eq!(data["docker_engine"], good, "{data}");
+        }
+        carry_i300(&mut data, &json!({"running_backends": {}}));
+        assert!(data.get("docker_engine").is_none(), "absent from the beat, so gone: {data}");
+        for bad in [
+            json!({"state": "broken"}),
+            json!({"version": "27.0.1"}),
+            json!({"state": "ok", "version": 27}),
+            json!({"state": "unreadable", "error": "x".repeat(257)}),
+            json!("27.0.1"),
+            json!([{"state": "none"}]),
+        ] {
+            carry_i300(&mut data, &json!({"docker_engine": {"state": "none"}}));
+            carry_i300(&mut data, &json!({"docker_engine": bad.clone()}));
+            assert!(data.get("docker_engine").is_none(), "{bad} is unknown, never kept: {data}");
+        }
     }
 
     /// The agent's `llamacpp_offload` (a GPU llamacpp start's offload, read
