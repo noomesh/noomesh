@@ -169,7 +169,20 @@ export J JR SELF ROLL_T0 OUT
 I1_MODEL="qwen2.5:0.5b"
 I1_WAIT=600
 echo "$I1_MODEL" > "$J/i1-model"
-if step i1-fetch 900 -- noo models fetch "ollama:$I1_MODEL"; then
+# An install from the previous final has a store its operator cannot write
+# (0.6.28 grants the ACL at onboard only; an upgrade grants nothing silently
+# and the store's guide says what to run). The step applies the guide's OWN
+# setfacl line, printed by noo, and says so: an operator's documented step.
+if step i1-fetch 900 -- bash -c '
+  m="$1"; out="$(noo models fetch "ollama:$m" 2>&1)"; rc=$?; printf "%s\n" "$out"
+  if [ "$rc" != 0 ] && printf "%s" "$out" | grep -q "is not writable by"; then
+    cmd="$(printf "%s\n" "$out" | sed -n "s/^[[:space:]]*[>▸][[:space:]]*\(sudo setfacl -m [^#]*\).*/\1/p" | head -n 1 | sed "s/[[:space:]]*$//")"
+    [ -n "$cmd" ] || { echo "upgrade-cell: the store refused and its guide named no setfacl line"; exit 1; }
+    echo "upgrade-cell: applying the store guide'"'"'s own remedy (an existing install): $cmd"
+    sudo -n ${cmd#sudo } || exit 1
+    noo models fetch "ollama:$m"; exit $?
+  fi
+  exit "$rc"' i1-fetch "$I1_MODEL"; then
     # the window the I1 journal is read from: the agent's restart on
     I1_T0="$(date +%s)"
     step i1-reshape-self-node-by-hand-into-a-worker-env 180 -- bash -c '
