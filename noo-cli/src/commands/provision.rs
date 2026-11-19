@@ -1733,7 +1733,7 @@ fn applier_only_files(apply: &[u8], proof: impl FnOnce(&[(&str, Vec<u8>)]) -> Re
     let mut files: Vec<(&'static str, Vec<u8>)> = vec![("applier", apply.to_vec())];
     match proof(&files) {
         Ok(rows) => {
-            files.extend(rows);
+            let _ = rows;
             (files, None)
         }
         Err(e) => (files, Some(e)),
