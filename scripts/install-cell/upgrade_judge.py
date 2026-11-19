@@ -91,7 +91,7 @@ def text(path):
         return None
 
 
-I1_PREREQS = ("i1-fetch", "i1-worker-shape", "i1-place")
+I1_PREREQS = ("i1-fetch", "i1-reshape-self-node-by-hand-into-a-worker-env", "i1-place")
 
 
 def steps_of(out):
@@ -371,7 +371,8 @@ def judge():
             else "noo chat exit %s: %s" % (rec.get("rc"), one(" ".join(body[-2:]), 200)))
 
     # ── I1, last: the mirror import into an agent-managed ollama ──
-    say("I1", *i1(j, jr, me, steps_of(out)))
+    v, why = i1(j, jr, me, steps_of(out))
+    say("I1", v, why + " [emulates a worker's env; not provisioned as one]")
 
     print("\n".join(lines))
     return 1 if failed else 0

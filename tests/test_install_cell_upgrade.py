@@ -46,7 +46,7 @@ GOOD_CTL = [
 ]
 
 
-I1_STEPS_OK = [("i1-fetch", 0, ""), ("i1-worker-shape", 0, ""), ("i1-place", 0, ""), ("i1-wait", 0, "")]
+I1_STEPS_OK = [("i1-fetch", 0, ""), ("i1-reshape-self-node-by-hand-into-a-worker-env", 0, ""), ("i1-place", 0, ""), ("i1-wait", 0, "")]
 I1_JOURNAL_OK = (
     'Nov 18 runner-a noo-node-agent[3]: {"level":"INFO","msg":"reconcile.ollama_import_start","model":"qwen2.5:0.5b","backend":"ollama"}\n'
     'Nov 18 runner-a noo-node-agent[3]: {"level":"INFO","msg":"ollama mirror import","model":"qwen2.5:0.5b","blobs":5,"via":"container","ollama":"https://noo-stunnel-ollama:11434"}\n'
@@ -286,7 +286,7 @@ def test_i1_fails_quoting_0627s_lookup_of_the_door_by_docker_name(tmp_path):
 
 def test_i1_is_not_reached_when_a_prerequisite_command_failed_quoting_it(tmp_path):
     err = "x qwen2.5:0.5b: the registry answered 503 Service Unavailable"
-    rc, got = cell(tmp_path, i1={"steps": [("i1-fetch", 0, ""), ("i1-worker-shape", 0, ""), ("i1-place", 1, err)],
+    rc, got = cell(tmp_path, i1={"steps": [("i1-fetch", 0, ""), ("i1-reshape-self-node-by-hand-into-a-worker-env", 0, ""), ("i1-place", 1, err)],
                                  "journal": "", "tags": ""})
     assert " NOT REACHED: i1-place exited 1: " + err in got["I1"], got["I1"]
     rc, got = cell(tmp_path / "b")
@@ -301,3 +301,21 @@ def test_i1_served_but_unverified_fails_and_the_probe_waits_until_the_evidence_d
     env = dict(os.environ, J=str(d), JR=str(tmp_path / "raw"), SELF=SELF)
     r = subprocess.run([sys.executable, str(JUDGE), "i1-probe"], env=env, capture_output=True, text=True)
     assert r.stdout.startswith("PENDING: served=True verified=False"), r.stdout + r.stderr
+
+
+def test_i1_says_it_reshaped_the_self_node_by_hand_on_every_verdict(tmp_path):
+    """The release lead's condition (2026-11-19): I1 emulates a worker by
+    emptying NOO_SELF_NODE and OLLAMA_URL in the self node's agent env, by
+    hand, on a thrown-away runner; the step says so and every verdict names
+    the limit, so a PASS is never read as a provisioned worker's."""
+    limit = "[emulates a worker's env; not provisioned as one]"
+    for case, i1 in (("pass", {}), ("fail", {"journal": I1_JOURNAL_0627}),
+                     ("nr", {"steps": [("i1-fetch", 1, "x fetch failed")], "journal": "", "tags": ""})):
+        _, got = cell(tmp_path / case, i1=i1)
+        assert got["I1"].endswith(limit), (case, got["I1"])
+    sh = (ROOT / "scripts/install-cell/upgrade.sh").read_text()
+    assert "step i1-reshape-self-node-by-hand-into-a-worker-env " in sh
+    assert "reshaped by hand into a worker" in sh and "NOO_SELF_NODE and OLLAMA_URL emptied" in sh
+    # last: nothing after it but the judge, which reads captured files only
+    tail = sh[sh.index("step i1-reshape-self-node-by-hand-into-a-worker-env"):]
+    assert [l for l in tail.splitlines()[1:] if l.startswith("step ")] == ['step judge 120 -- python3 "$HERE/upgrade_judge.py" judge']

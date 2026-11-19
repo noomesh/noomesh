@@ -172,7 +172,8 @@ echo "$I1_MODEL" > "$J/i1-model"
 if step i1-fetch 900 -- noo models fetch "ollama:$I1_MODEL"; then
     # the window the I1 journal is read from: the agent's restart on
     I1_T0="$(date +%s)"
-    step i1-worker-shape 180 -- bash -c '
+    step i1-reshape-self-node-by-hand-into-a-worker-env 180 -- bash -c '
+      echo "the self node reshaped by hand into a worker'"'"'s agent env: NOO_SELF_NODE and OLLAMA_URL emptied (a test fixture on a thrown-away runner; emulates a worker, not provisioned as one)"
       f=/etc/noo-node-agent.env
       sudo -n test -f "$f" || { echo "upgrade-cell: no $f on the self node"; exit 1; }
       echo "before: $(sudo -n grep -E "^(NOO_SELF_NODE|OLLAMA_URL)=" "$f" | tr "\n" " ")"
