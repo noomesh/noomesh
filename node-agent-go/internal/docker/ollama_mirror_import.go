@@ -274,7 +274,7 @@ func (c *Client) writeManifestContainer(ctx context.Context, ns, name, tag strin
 	// the daemon look up the image's `USER 65532:65532` as a passwd name,
 	// which fails on a real daemon ("getent unable to find entry").
 	if _, err := c.docker.CopyToContainer(ctx, OllamaContainer, client.CopyToContainerOptions{
-		DestinationPath: dir, Content: &buf,
+		DestinationPath: dir, Content: &buf, CopyUIDGID: true,
 	}); err != nil {
 		return nil, fmt.Errorf("copy the manifest into %s: %w", OllamaContainer, err)
 	}
