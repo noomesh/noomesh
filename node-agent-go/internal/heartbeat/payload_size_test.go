@@ -225,6 +225,7 @@ func installShape(t *testing.T, srvURL string, s sizeShape) *Reporter {
 	r.SetGPUContention(func() any { return mustObj(t, s.gpuJSON) })
 	r.SetModelSets(func() any { return s.modelSets })
 	r.SetModelSetsFreeBytes(func() (int64, bool) { return 391100000000, true })
+	r.SetImageStoreFreeBytes(func() (int64, bool) { return 391100000000, true })
 	r.SetNodeFacts(func() map[string]any { return s.facts })
 	r.caps = &s.caps
 	return r

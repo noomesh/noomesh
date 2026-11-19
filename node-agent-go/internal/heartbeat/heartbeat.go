@@ -148,6 +148,12 @@ type Reporter struct {
 	// wired; ok=false (unreadable, or no models dir) omits the key.
 	modelSetsFree atomic.Pointer[func() (int64, bool)]
 
+	// imageStoreFree reports the least free bytes over the filesystems an
+	// image pull writes to (Docker's data root, containerd's root, the
+	// staging dir; docker/image_space.go), sent as `image_store_free_bytes`
+	// (i1036). nil = not wired (no Docker); ok=false omits the key.
+	imageStoreFree atomic.Pointer[func() (int64, bool)]
+
 	// ollamaVerify reports each placed Ollama model's verification against
 	// the controller's store, sent as `ollama_verify`. nil = not wired, and a
 	// provider answering nil (nothing checked yet) omits the key.
@@ -462,6 +468,17 @@ func (r *Reporter) SetModelSetsFreeBytes(f func() (int64, bool)) { r.modelSetsFr
 
 func (r *Reporter) modelSetsFreeBytes() (int64, bool) {
 	f := r.modelSetsFree.Load()
+	if f == nil || *f == nil {
+		return 0, false
+	}
+	return (*f)()
+}
+
+// SetImageStoreFreeBytes installs the provider of `image_store_free_bytes`.
+func (r *Reporter) SetImageStoreFreeBytes(f func() (int64, bool)) { r.imageStoreFree.Store(&f) }
+
+func (r *Reporter) imageStoreFreeBytes() (int64, bool) {
+	f := r.imageStoreFree.Load()
 	if f == nil || *f == nil {
 		return 0, false
 	}

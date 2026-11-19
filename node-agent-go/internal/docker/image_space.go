@@ -7,10 +7,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"math"
+	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/moby/moby/client"
 	"golang.org/x/sys/unix"
@@ -41,9 +46,12 @@ const imageLoadExtraFloor uint64 = 2 << 30
 // to need in Docker's data root: the larger of 2 × the tar or the tar +
 // 2 GiB. A STATED, CONSERVATIVE ESTIMATE: the unpacked size of an image is
 // not known on the node (the manifest carries only the tar's size_bytes,
-// and a .tar.gz unpacks to more than its own size). It is temporary — it is
-// replaced by the real unpacked size once the controller records it with
-// the staged tar (step 2), and this function is the one place to change.
+// and a .tar.gz unpacks to more than its own size). The controller now
+// records the real unpacked size with the staged tar (i1036), and its
+// place-time check (gateway-rust routes/cluster.rs image_space_need) needs
+// the tar + the LARGER of that size and this estimate + imageSpaceMargin, so
+// it refuses nothing this check would pass: change the two together
+// (TestImageLoadNeedFixedExample pins the shared number).
 func imageLoadNeed(tarBytes uint64) uint64 {
 	if twice := 2 * tarBytes; twice > tarBytes+imageLoadExtraFloor {
 		return twice
@@ -90,6 +98,90 @@ var dockerRootDirFn = func(ctx context.Context, c *Client) string {
 // a Mac, where Docker Desktop keeps it inside its Linux VM. A var so a test
 // can pin it.
 var dockerRootOnHost = runtime.GOOS == "linux"
+
+// containerdRootDir is containerd's root. On a node whose Docker keeps
+// images in the containerd image store, the unpacked layers land here and
+// not under DockerRootDir; `GET /health`'s disk list (api/handlers.go) and
+// the reclaim (diskreclaim.Paths) read the same path.
+const containerdRootDir = "/var/lib/containerd"
+
+// imageStoreFreeBytes is the heartbeat's `image_store_free_bytes` (i1036):
+// the LEAST free space, in bytes, over the filesystems an image pull writes
+// to — Docker's data root, containerd's root and the agent's staging dir —
+// so the controller can tell before it places a GPU llama.cpp whether the
+// CUDA image (~2.6 GB tar, ~4 GB unpacked) can land here.
+//
+// A path that does not exist is skipped, never counted as 0 (most nodes
+// have no containerd root). The staging dir is created on the first pull,
+// so until then its nearest existing parent is read: the filesystem the
+// fetch will write to. Any other read error, a host whose Docker data root
+// is not on this host (a Mac's VM) or no readable path at all is UNKNOWN:
+// ok=false, and the key is omitted (an i300 key: never 0 for unknown).
+func imageStoreFreeBytes(dockerRoot, staging string) (int64, bool) {
+	if !dockerRootOnHost {
+		return 0, false
+	}
+	var least uint64
+	seen := false
+	for _, p := range []struct {
+		path   string
+		walkUp bool
+	}{{dockerRoot, false}, {containerdRootDir, false}, {staging, true}} {
+		if p.path == "" {
+			continue
+		}
+		path := filepath.Clean(p.path)
+		st, err := diskStatFn(path)
+		for p.walkUp && errors.Is(err, fs.ErrNotExist) && filepath.Dir(path) != path {
+			path = filepath.Dir(path)
+			st, err = diskStatFn(path)
+		}
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			slog.Debug("heartbeat omits image_store_free_bytes", "path", path, "err", err)
+			return 0, false
+		}
+		if !seen || st.free < least {
+			least, seen = st.free, true
+		}
+	}
+	if !seen {
+		return 0, false
+	}
+	if least > math.MaxInt64 {
+		least = math.MaxInt64
+	}
+	return int64(least), true
+}
+
+// dockerRootTTL is how long the heartbeat reuses Docker's data root: it
+// changes only when the daemon restarts with another data-root, and asking
+// `docker info` every 30 s beat would cost a daemon round trip for nothing.
+const dockerRootTTL = 10 * time.Minute
+
+var dockerRootCache struct {
+	mu   sync.Mutex
+	root string
+	at   time.Time
+}
+
+// ImageStoreFreeBytes is the provider of the heartbeat's
+// `image_store_free_bytes` (imageStoreFreeBytes over this node's paths).
+// ctx bounds the `docker info` that reads Docker's data root.
+func (c *Client) ImageStoreFreeBytes(ctx context.Context) (int64, bool) {
+	dockerRootCache.mu.Lock()
+	if dockerRootCache.root == "" || time.Since(dockerRootCache.at) > dockerRootTTL {
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		dockerRootCache.root = dockerRootDirFn(ctx, c)
+		cancel()
+		dockerRootCache.at = time.Now()
+	}
+	root := dockerRootCache.root
+	dockerRootCache.mu.Unlock()
+	return imageStoreFreeBytes(root, stagingDir())
+}
 
 // checkImagePullSpace refuses a pull of a tar of tarBytes when the staging
 // dir lacks room for the tar, or Docker's data root lacks room for the

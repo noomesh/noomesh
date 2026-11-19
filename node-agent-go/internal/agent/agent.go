@@ -440,6 +440,7 @@ func (a *Agent) Run() error {
 	a.hb.SetOllamaVerify(rec.OllamaVerifyReport)
 	a.hb.SetNodeLocal(nodelocal.Current)
 	if a.docker != nil {
+		a.hb.SetImageStoreFreeBytes(func() (int64, bool) { return a.docker.ImageStoreFreeBytes(a.lifeCtx()) })
 		a.hb.SetBackendCaps(dockerpkg.BackendCapsReport)
 		a.hb.SetLlamacppOffload(dockerpkg.LlamacppOffloadReport)
 	}

@@ -364,6 +364,12 @@ pub(crate) struct StagedRecord {
     pub release_tag: String,
     #[serde(default)]
     pub staged_at: u64,
+    /// The image's unpacked size in bytes, `docker image inspect .Size` at
+    /// stage time (i1036): the gateway's GPU llama.cpp place check adds it to
+    /// the tar's size. Absent when it could not be read, or for an image
+    /// staged before noo recorded it; never estimated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unpacked_bytes: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
@@ -519,6 +525,22 @@ pub(crate) fn host_arch() -> String {
 /// Is the daemon on the containerd image store (multi-platform per tag)?
 fn containerd_store() -> bool {
     docker(&["info", "--format", "{{json .DriverStatus}}"]).map(|s| s.contains("io.containerd.snapshotter")).unwrap_or(false)
+}
+
+/// `docker image inspect --format '{{.Size}}'`'s answer as a byte count: a
+/// whole number above zero, else None (unknown is never recorded as 0).
+pub(crate) fn parse_unpacked_bytes(out: &str) -> Option<u64> {
+    out.trim().parse::<u64>().ok().filter(|b| *b > 0)
+}
+
+/// The unpacked size of `reference` (for `platform`, on the containerd
+/// store), or None when the daemon does not say.
+fn inspect_unpacked_bytes(platform: Option<&str>, reference: &str) -> Option<u64> {
+    let out = match platform {
+        Some(p) => docker(&["image", "inspect", "--platform", p, "--format", "{{.Size}}", reference]),
+        None => docker(&["image", "inspect", "--format", "{{.Size}}", reference]),
+    };
+    parse_unpacked_bytes(&out.ok()?)
 }
 
 fn inspect_id_arch(reference: &str) -> Option<(String, String)> {
@@ -747,7 +769,7 @@ pub(crate) fn stage_image(g: &Globals, image: &str, arch: &str, lock_digest: Opt
     let tar = image_tar_gz_name(image, arch);
     let platform = format!("linux/{arch}");
 
-    let image_id = if arch == host {
+    let (unpacked_bytes, image_id) = if arch == host {
         if inspect_id_arch(&src).is_none() {
             docker(&["pull", "-q", &src])?;
         }
@@ -766,7 +788,7 @@ pub(crate) fn stage_image(g: &Globals, image: &str, arch: &str, lock_digest: Opt
         } else {
             save_tar(&dir, &tar, &[id.as_str()], &id, g)?;
         }
-        id
+        (inspect_unpacked_bytes(None, &id), id)
     } else if containerd_store() {
         docker(&["pull", "-q", "--platform", &platform, &src]).map_err(|e| format!("{NO_VARIANT} {arch}? {e}"))?;
         if lock_digest.is_some() {
@@ -774,7 +796,7 @@ pub(crate) fn stage_image(g: &Globals, image: &str, arch: &str, lock_digest: Opt
         }
         let id = docker(&["image", "inspect", "--platform", &platform, "--format", "{{.Id}}", image]).unwrap_or_default();
         save_tar(&dir, &tar, &["--platform", &platform, image], &id, g)?;
-        id
+        (inspect_unpacked_bytes(Some(platform.as_str()), image), id)
     } else {
         let digest = match resolve_platform(&src, arch)? {
             PlatformPick::Missing => return Err(format!("{NO_VARIANT} {arch}: {src} publishes no linux/{arch} manifest")),
@@ -787,7 +809,7 @@ pub(crate) fn stage_image(g: &Globals, image: &str, arch: &str, lock_digest: Opt
             return Err(format!("{NO_VARIANT} {arch}: {image} publishes only {a}"));
         }
         save_tar(&dir, &tar, &[id.as_str()], &id, g)?;
-        id
+        (inspect_unpacked_bytes(None, &id), id)
     };
     Ok(StagedRecord {
         image: image.to_string(),
@@ -798,6 +820,7 @@ pub(crate) fn stage_image(g: &Globals, image: &str, arch: &str, lock_digest: Opt
         source: source.to_string(),
         release_tag: String::new(),
         staged_at: now_unix(),
+        unpacked_bytes,
     })
 }
 
@@ -1538,7 +1561,7 @@ mod tests {
 
     fn rec(image: &str, arch: &str, tag: &str, at: u64) -> StagedRecord {
         StagedRecord { image: image.into(), arch: arch.into(), tar: image_tar_name(image, arch), image_id: String::new(),
-            lock_digest: D.into(), source: "lock".into(), release_tag: tag.into(), staged_at: at }
+            lock_digest: D.into(), source: "lock".into(), release_tag: tag.into(), staged_at: at, unpacked_bytes: None }
     }
 
     #[test]
@@ -1867,6 +1890,49 @@ gateway@{D}
         assert_eq!(rec.image_id, "sha256:hostid");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// i1036: `docker image inspect .Size` is a byte count; anything else
+    /// (empty, not a number, zero, negative) is unknown, never 0.
+    #[test]
+    fn the_unpacked_size_parses_only_a_whole_positive_number() {
+        assert_eq!(parse_unpacked_bytes("4012345678\n"), Some(4_012_345_678));
+        for bad in ["", "0", "-5", "4.0e9", "sha256:hostid amd64", "<no value>"] {
+            assert_eq!(parse_unpacked_bytes(bad), None, "{bad:?}");
+        }
+    }
+
+    /// i1036: staging records the image's unpacked size (by the image ID it
+    /// saved) in the index, for the gateway's GPU llama.cpp place check; a
+    /// daemon that does not answer leaves it unrecorded.
+    #[test]
+    fn the_unpacked_size_is_recorded_at_stage_time() {
+        let _l = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = store("unpacked");
+        let d = daemon(move |l| match l {
+            l if l.starts_with("version") => Ok("amd64".into()),
+            "image inspect --format {{.Size}} sha256:hostid" => Ok("4000000000\n".into()),
+            l if l.starts_with("image inspect") => Ok("sha256:hostid amd64".into()),
+            l if l.starts_with("tag ") => Ok(String::new()),
+            other => Err(format!("unexpected: {other}")),
+        });
+        let rec = stage_image(&g(), &format!("{REPO}:v1"), "amd64", Some(D), "lock").expect("stage");
+        assert_eq!(rec.unpacked_bytes, Some(4_000_000_000), "{:?}", d.calls.borrow());
+        let json = serde_json::to_value(&rec).unwrap();
+        assert_eq!(json["unpacked_bytes"], 4_000_000_000u64, "written to the index: {json}");
+        drop(d);
+        let d = daemon(move |l| match l {
+            l if l.starts_with("version") => Ok("amd64".into()),
+            l if l.starts_with("image inspect --format {{.Size}}") => Err("no such image".into()),
+            l if l.starts_with("image inspect") => Ok("sha256:hostid amd64".into()),
+            l if l.starts_with("tag ") => Ok(String::new()),
+            other => Err(format!("unexpected: {other}")),
+        });
+        let rec = stage_image(&g(), &format!("{REPO}:v1"), "amd64", Some(D), "lock").expect("a size it cannot read never fails a stage");
+        assert_eq!(rec.unpacked_bytes, None);
+        assert!(serde_json::to_value(&rec).unwrap().get("unpacked_bytes").is_none(), "unknown is left out, not 0");
+        drop(d);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
