@@ -527,10 +527,12 @@ def test_a_lock_names_one_previous_final_only(fleet: Fleet) -> None:
 
 # ── the first roll's applier-only bootstrap (rc.2 UPGRADE cell, A3) ─────────
 # An older applier installs this applier from an applier-only bundle and
-# re-execs it on the same bundle, which can carry no release list. When the
-# bundle's ONE payload is byte-identical to the installed applier there is
-# nothing to install: exit 0, one plain line, no REFUSED. Anything else is
-# still checked: a DIFFERENT applier with no list is refused
+# re-execs it on the same bundle. Since 0.6.28 the controller sends that
+# bundle WITH the release-signed list (an older applier self-replaces in §1b
+# before its kind allowlist), and the new applier verifies it. One without a
+# list (an older controller) whose ONE payload is byte-identical to the
+# installed applier is a clean no-op: exit 0, one plain line, no REFUSED.
+# Anything else is still checked: a DIFFERENT applier with no list is refused
 # (test_root_code_without_any_release_list_is_refused[applier]).
 
 def _installed_is(fleet: Fleet, body: bytes) -> None:
@@ -560,3 +562,36 @@ def test_the_installed_applier_beside_another_kind_is_still_checked(fleet: Fleet
     line = refused(fleet.apply(fleet.bundle({"applier": body, "fetcher": PAYLOADS["fetcher"]}, release=False)),
                    "no release-signed list")
     assert "fetcher" in line or "applier" in line
+
+
+def test_an_applier_only_bundle_with_the_list_installs_a_different_applier(fleet: Fleet) -> None:
+    # The rc.2 UPGRADE cell: the installed applier differs from the carried
+    # one; with the release-signed list the carried one is verified, no REFUSED.
+    _installed_is(fleet, PAYLOADS["applier"] + b"\n# the installed one differs\n")
+    r = fleet.apply(fleet.bundle({"applier": PAYLOADS["applier"]}))
+    passed(r)
+    assert "release-check: verified release=0.6.27" in r.stdout, r.stdout
+    assert "REFUSED" not in r.stdout + r.stderr, r.stderr
+
+
+@pytest.mark.parametrize("installed", ["different", "identical"])
+def test_an_applier_only_bundle_whose_list_does_not_cover_the_applier_is_refused(fleet: Fleet, installed: str) -> None:
+    # A signed list that does not name the carried applier's sha256 is
+    # refused, and the identical-applier no-op never swallows a carried list.
+    body = PAYLOADS["applier"]
+    _installed_is(fleet, body if installed == "identical" else body + b"\n# the installed one differs\n")
+    files = {"applier": body}
+    files.update(fleet.release_proof(files, unlisted_kinds=("applier",)))
+    line = refused(fleet.apply(fleet.bundle(files, release=False)), "is not in")
+    assert "applier" in line and hashlib.sha256(body).hexdigest() in line, line
+
+
+def test_the_applier_only_bundle_is_staged_with_the_release_list() -> None:
+    saf = PROVISION[PROVISION.index("fn stage_applier_first("):]
+    saf = saf[:saf.index("\n}\n")]
+    assert "applier_only_files(apply.as_bytes(), |f| release_proof_for(g, f))" in saf, saf
+    assert saf.index("applier_only_files(") < saf.index("build_signed_bundle(ca, &node, &pre,")
+    assert 'vec![("applier"' not in saf, "an applier-only bundle built without the list"
+    aof = PROVISION[PROVISION.index("fn applier_only_files("):]
+    aof = aof[:aof.index("\n}\n")]
+    assert "files.extend(rows);" in aof, aof
