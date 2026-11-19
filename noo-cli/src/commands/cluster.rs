@@ -1238,7 +1238,8 @@ pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 if let Err(se) = crate::commands::image_stage::stage_and_record(g, &img, &arch, "place") {
                     crate::output::fail(g.json, crate::output::ExitCode::Generic, "image_not_staged",
                         &format!("could not stage {img} for {arch}: {se}"),
-                        Some(&format!("noo cluster sync-images --stage-only -i {img} --arch {arch}")));
+                        Some(&crate::commands::image_stage::stage_remedy(&img, &arch,
+                            crate::commands::image_stage::lock_pinned_refs_here().contains(&img))));
                 }
             }
             // Placed again after staging, or the refusal surfaces through the

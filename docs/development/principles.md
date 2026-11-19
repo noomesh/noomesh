@@ -42,7 +42,7 @@ Example: when a node needs the hardened llama.cpp or Ollama image and the
 controller has not staged it for the node's architecture, the start is
 refused. The message says it will not fall back to an upstream image and names
 the command that stages it (`noo cluster sync-images <node> -i <ref>`). A root
-upstream container is never started silently (#558).
+upstream container is never started silently (#558). A release-pinned image is staged by its lock digest (`noo cluster sync-images --stage-only --lock`), also when named with `-i`; `-i` is for images the release does not carry.
 
 ## P4. One behaviour, no throwaway switches
 

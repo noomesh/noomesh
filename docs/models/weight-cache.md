@@ -373,6 +373,7 @@ node on its versioned default, which a registry node refuses (with the
 controller roll that fixes it) and a node runs only
 if the controller staged that image (`noo cluster sync-images <node> -i
 <image>`), since the rail verifies the tar against the gateway's manifest.
+A release-pinned image is staged by its lock digest (`noo cluster sync-images --stage-only --lock`), also when named with `-i`; `-i` is for images the release does not carry.
 On a rail node the image never comes from a registry.
 
 ### What the controller stages
@@ -383,6 +384,10 @@ On a rail node the image never comes from a registry.
 | `noo cluster sync-images --stage-only [--lock] [-i IMG]… [--arch a,b] [--all-images]` | the lock (default) and/or named images | same; `--all-images` stages the controller-only lock images too; stops after staging, no node pulls |
 | `noo cluster sync-images <node> -i IMG` (or `--lock <node>` for the lock's node-bound images) | a named image, for that node's architecture | then asks the node's agent to pull it now |
 | `noo cluster place …` refused with "not staged" | the placement's image | stages it, then places again |
+
+A release-pinned image is staged by its lock digest (`noo cluster sync-images --stage-only --lock`), also when named with `-i`; `-i` is for images the release does not carry. The index never trades a digest-staged record for a by-name one (that
+stage is refused naming `--stage-only --lock`), and `noo cluster verify
+--controller`'s `staged release images` row WARNs on one staged by name.
 
 **Multi-arch.** Architectures come from the nodes' reported
 `capabilities.arch` (an older agent's `is_arm`/tier 4 counts as arm64) plus
@@ -457,6 +462,7 @@ its image through one function (`EnsureImage`):
    logged at WARN as `image.registry_fallback`; `off` makes the node
    rail-only. Prefer staging those too (`noo cluster sync-images <node> -i
    ollama/ollama:latest`) so a node needs no internet registry at all.
+   A release-pinned image is staged by its lock digest (`noo cluster sync-images --stage-only --lock`), also when named with `-i`; `-i` is for images the release does not carry.
 
 The agent's only registry pull is that fallback; a test
 (`TestNoRegistryPullOutsideTheFallback`) fails on any other `ImagePull`.
