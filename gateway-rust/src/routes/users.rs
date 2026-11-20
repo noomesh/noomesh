@@ -434,7 +434,7 @@ async fn user_set_scopes(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<SetScopesBody>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, ctx.as_deref(), "changing an account's scopes").await?;
+
     let by = scope_mutation_guard(&ctx)?.sub.clone();
     require_may_manage(&state.db, &ctx, &username).await?;
     // Dropping `admin` here demotes the account (repo::users::set_scopes
