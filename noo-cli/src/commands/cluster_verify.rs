@@ -3790,7 +3790,7 @@ pub(crate) fn noo_data_bound_check(seen: &NooDataSeen, want: Option<&str>) -> Ch
         NooDataSeen::Present { device, mountpoint, size, labelled, helper_missing } => {
             let size = match (size.as_deref(), helper_missing) {
                 (Some(s), _) => format!(", {s}"),
-                (None, true) => format!(", size not read: {HELPER_ABSENT}"),
+                (None, true) => String::new(),
                 (None, false) => String::new(),
             };
             let what = if device.is_empty() {
