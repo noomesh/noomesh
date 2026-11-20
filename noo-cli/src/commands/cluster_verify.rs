@@ -44,6 +44,7 @@ mod warmup;
 pub(crate) mod restart_loops;
 mod gpu_held;
 mod hf_hub;
+mod key_bindings;
 pub(crate) mod rows;
 
 /// One invariant, judged.
@@ -8783,6 +8784,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             &["security", "secrets", "audit"],
             &["security", "tailnet", "policy", "--merge"],
             &["security", "audit", "verify"],
+            &["security", "user", "list"],
         ];
         if licensed_on {
             reads.push(&["security", "entitlement", "show"]);
@@ -8790,13 +8792,14 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let mut got = par_map(&reads, |w| self_json(g, w)).into_iter();
         let mut next = || got.next().unwrap_or((127, Value::Null, String::new()));
         let (_, posture, _) = next();
-        let (_, keys, _) = next();
+        let (kc, keys, ke) = next();
         let (sc, secrets, _) = next();
         let (_, exposure, _) = next();
         let (_, strangers, _) = next();
         let (ac, audit, _) = next();
         let (_, tailnet, _) = next();
         let (_, audit_verdict, _) = next();
+        let (uc, users, ue) = next();
         let entitlement_read = if licensed_on { Some(next()) } else { None };
         let audit_errors = if audit.is_null() { None } else {
             Some(audit["findings"].as_array().map(|f| f.iter().filter(|x| x["severity"] == "error" || x["severity"] == "ERROR").count() as u64)
@@ -8819,6 +8822,8 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             controller_from,
             &format!("{} security and doctor reads, side by side", reads.len()),
         );
+        // i1096: the keys that act as an admin, or mint agent tokens.
+        checks.push(key_bindings::row((kc, &keys, &ke), (uc, &users, &ue)));
         checks.push(system_credentials_check(crate::commands::systems::store_missing_credentials()));
         // Is there a recent backup, and is it anywhere but this machine? 2026-10-24:
         // the 03:30 run never happened and nothing said so; every dump sat on the
