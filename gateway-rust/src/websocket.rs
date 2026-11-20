@@ -796,6 +796,27 @@ mod ws_ticket_tests {
         assert!(verify_ws_ticket(&params(Some(&stale), None), "/ws/coordinator", SECRET).unwrap_err().contains("expired"));
     }
 
+    /// REPRO (rc.3 finding, buggy behaviour on purpose): the bearer check
+    /// `POST /api/ws-ticket` runs (`auth::verify_token`) carries jsonwebtoken's
+    /// default 60 s leeway, so a token that expired 30 s ago still verifies and
+    /// is minted a ticket; the socket then refuses that ticket (4401, "do not
+    /// reconnect") and the client, never having seen a 401, never refreshes.
+    /// Function level: the handler's two calls, in order, without the router.
+    #[test]
+    fn repro_a_token_inside_the_leeway_is_minted_a_ticket_the_socket_refuses() {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let body = json!({"sub": "alice", "exp": now - 30, "role": "user", "scopes": ["read"],
+                          "iss": auth::JWT_ISSUER, "aud": auth::JWT_AUDIENCE});
+        let tok = encode(&Header::new(Algorithm::HS256), &body, &EncodingKey::from_secret(SECRET.as_bytes())).unwrap();
+        // What `ws_ticket` does with the bearer: verify, then mint.
+        let claims = auth::verify_token(&tok, SECRET).expect("inside the 60 s leeway the bearer still verifies");
+        let ticket = mint_ws_ticket(claims, "/ws/coordinator");
+        // BUG: a ticket was minted for an expired token, and the socket refuses it.
+        let e = verify_ws_ticket(&params(Some(&ticket), None), "/ws/coordinator", SECRET).unwrap_err();
+        assert!(e.contains("has expired"), "{e}");
+    }
+
     /// i515c: a JWT in a console socket URL is refused, with the way to do it
     /// instead; there is no fallback to `?token=`.
     #[test]
