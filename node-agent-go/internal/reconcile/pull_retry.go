@@ -40,7 +40,7 @@ var pullPermanentMarkers = []string{
 }
 
 // pullPermanentStatuses are the HTTP statuses that fail at once.
-var pullPermanentStatuses = []int{401, 403, 404}
+var pullPermanentStatuses = []int{401, 403}
 
 // pullNetworkMarkers are connect/timeout failures worth another try.
 var pullNetworkMarkers = []string{
