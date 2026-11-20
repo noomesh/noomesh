@@ -3210,7 +3210,7 @@ pub(crate) fn default_chat_check(classes: Option<&Value>, has_gpu: Option<bool>,
     // out; an older one listed whatever the node had loaded, so the row does
     // not count one either (rehearsal 0.6.7-rc.1 F1).
     let order: Vec<Value> = order.into_iter().filter(|c| !is_non_chat_entry(c)).collect();
-    if order.is_empty() {
+    if order.is_empty() && has_gpu != Some(false) {
         return fail(NAME, format!("chat-default ({mode}) has no live candidate: an unpinned chat request gets 503"), "noo cluster class list");
     }
     let listed: Vec<String> = order
