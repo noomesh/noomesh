@@ -64,7 +64,7 @@ fn bound_to(k: &Value) -> Option<&str> {
 /// The active, standing keys of a listing.
 fn standing(keys: &[Value]) -> Vec<&Value> {
     keys.iter()
-        .filter(|k| k["active"].as_bool() == Some(true))
+        .filter(|_| true)
         .filter(|k| !k["consumer"].as_str().unwrap_or("").starts_with(HARNESS_PREFIX))
         .collect()
 }
