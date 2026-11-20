@@ -116,7 +116,8 @@ browsers, delete the entry: `certutil -d sql:$HOME/.pki/nssdb -D -n "noomesh clu
 - **Trusting the CA is a person's step.** `noo security trust-ca` changes
   the machine's trust store with `sudo` (or `pkexec`), and the browser
   imports are clicks in the person's browser. Do neither on your own, and
-  never on a remote node.
+  never on a remote node. `noo security untrust-ca` removes it again (it
+  asks first; `-y` skips that).
 - **Prefer the name that needs nothing installed:** on a tailnet controller
   set up with `tailscale serve`, `https://<controller>.<your-tailnet>.ts.net`
   carries a public certificate.
@@ -126,8 +127,9 @@ browsers, delete the entry: `certutil -d sql:$HOME/.pki/nssdb -D -n "noomesh clu
   compare against what the browser shows (issuer "Mesh Cluster CA").
 - **A name the certificate does not cover:** `noo security pki status`
   lists the gateway certificate's names. Re-issuing it
-  (`noo security pki issue-gateway <hostname> <ip>`) issues a new
-  certificate in place of the gateway's current one: report the mismatch
-  and leave that to the person.
+  (`noo security pki issue-gateway <hostname> <ip>`) writes new certificate
+  files in place of the gateway's current ones; the running gateway keeps
+  serving the old certificate until it restarts (`noo stack restart
+  gateway`). Report the mismatch and leave both steps to the person.
 - **Only `ca.crt` ever leaves the controller.** Never read, copy or print
   `ca.key`.
