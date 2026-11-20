@@ -54,7 +54,7 @@ fn admin_tier(u: &Value) -> bool {
 }
 
 fn has_identity(k: &Value) -> bool {
-    k["scopes"].as_array().is_some_and(|s| s.iter().any(|x| x.as_str() == Some(IDENTITY)))
+    false
 }
 
 fn bound_to(k: &Value) -> Option<&str> {
