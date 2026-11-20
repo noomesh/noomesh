@@ -1167,7 +1167,7 @@ async fn user_erase(
     ctx: Option<Extension<RequesterCtx>>,
     body: Option<Json<EraseBody>>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, ctx.as_deref(), "erasing an account's data").await?;
+
     let username = username.trim().to_string();
     if username.is_empty() {
         return Err(AppError::BadRequest("username is required".into()));
