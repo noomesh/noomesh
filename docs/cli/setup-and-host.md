@@ -134,8 +134,8 @@ the controller run `noo cluster provision gpu-2 --wait` — see
 Before the tailnet join it checks that sudo can run (a terminal to ask the
 password at, which it asks once up front with `sudo -v`; or root; or
 `--root-ok`, the owner's word that sudo needs no password on an unattended
-run) and that `/var/lib` and the data root's disk have 5 GB free for the
-install; after the join, that the controller answers. A failed check stops
+run) and that `/var/lib` and the data root's disk are not plainly full (at
+least 2 GB free); after the join, that the controller answers. A failed check stops
 the run, says what is missing and what to do, and says the token was NOT
 used: run the same paste again once it is fixed. Codes: `enroll_needs_sudo`
 (exit 6), `enroll_low_disk` (exit 6), `enroll_controller_unreachable` (exit

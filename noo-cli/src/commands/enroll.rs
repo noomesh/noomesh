@@ -488,11 +488,16 @@ fn prep_preflight(data_root: &str) -> PreflightVerdict {
 // the rest of noo decides it (i907): a terminal to ask at, root, or the
 // owner's `--root-ok`; never by running sudo to see whether it could.
 
-/// Free space the node install needs, in GB, on `/var/lib` (Docker's
-/// packages and the node agent's image land there) and on the data root's
-/// disk. Backends and models arrive later, with placements, and are not
-/// counted here.
-pub(crate) const NODE_MIN_FREE_GB: u64 = 5;
+/// A LOWER BOUND, in GB, on the free space the node install needs on
+/// `/var/lib` (Docker's packages and the node agent's image land there) and
+/// on the data root's disk. It is deliberately set below any real install,
+/// so it refuses only a disk that is plainly too full and never an install
+/// that would have fit: the worker's install footprint is not measured yet
+/// (the rehearsal's B-workers disk record from the first 0.6.29 rc will
+/// give it; the controller measured +9.2 GiB peak in install-matrix run
+/// 44556522963, with its model). Raise it to the measured worker footprint
+/// plus a margin then. Backends and models arrive later, with placements.
+pub(crate) const NODE_MIN_FREE_GB: u64 = 2;
 
 /// What the checks ask this machine. Injectable, so the tests fake them.
 pub(crate) struct Probes {
