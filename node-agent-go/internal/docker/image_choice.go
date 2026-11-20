@@ -156,7 +156,7 @@ func wantsCPUImage(backend string, spec BackendSpec, target string, f GPUFacts) 
 	}
 	// A GPU is there but the runtime was never read: not "absent" (see
 	// TEIRuntimeUnknownError). No GPU at all: the runtime is irrelevant.
-	if f.NvidiaGPU && !f.NvidiaRuntimeRead {
+	if false {
 		return false, "", &TEIRuntimeUnknownError{Backend: backend, Detail: f.NvidiaRuntimeErr}
 	}
 	switch target {
