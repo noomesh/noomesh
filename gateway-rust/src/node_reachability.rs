@@ -277,7 +277,38 @@ pub async fn tick(state: &Arc<AppState>) {
     }
 }
 
+/// When the controller's own node is first probed after the gateway starts.
+/// The loop waits out its grace and then a full interval, so for ~3.5 min
+/// after every gateway start the controller's own node read "inbound: not
+/// yet checked" — onboard's closing verify, run right after the stack
+/// starts, always saw that (i1098). The self agent is local and already
+/// running, so it is dialled within seconds instead.
+const SELF_FIRST_PROBE_WAITS_SECS: [u64; 4] = [5, 10, 20, 30];
+
+/// Whether an early self probe's result is recorded. Only a success: a miss
+/// this early (the agent restarting beside the stack) is not yet evidence,
+/// and failures stay the loop's to judge, after its grace.
+fn early_probe_records(reach: &Reach) -> bool {
+    *reach == Reach::Ok
+}
+
+/// Probe the controller's own node a few times right after start, and
+/// record the first success. No alert either way: that is the loop's.
+async fn first_self_probe(state: &AppState) {
+    let Some(node) = crate::self_node::self_node_id() else { return };
+    for wait in SELF_FIRST_PROBE_WAITS_SECS {
+        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+        let reach = probe_node(state, &node).await;
+        if early_probe_records(&reach) {
+            record(state, &node, &reach).await;
+            return;
+        }
+    }
+}
+
 pub fn spawn(state: Arc<AppState>) {
+    let early = state.clone();
+    tokio::spawn(async move { first_self_probe(&early).await });
     crate::managed_loop::ManagedLoop::new("node_reachability", INTERVAL_SECS)
         .startup_grace(STARTUP_GRACE_SECS)
         .spawn(state, move |state| async move {
@@ -316,6 +347,17 @@ mod tests {
     #[test]
     fn a_self_agent_without_an_address_falls_back_to_the_record() {
         assert!(own_agent_link(true, || Err("localhost controller URL".into())).is_none());
+    }
+
+    #[test]
+    fn the_early_self_probe_records_only_a_success() {
+        // A miss in the first seconds after start is not evidence: the loop
+        // judges failures after its grace. Unknown says nothing either.
+        assert!(early_probe_records(&Reach::Ok));
+        assert!(!early_probe_records(&Reach::Failed("connection refused".into())));
+        assert!(!early_probe_records(&Reach::Unknown));
+        // Well inside the loop's grace, so the early probe never races it.
+        assert!(SELF_FIRST_PROBE_WAITS_SECS.iter().sum::<u64>() < STARTUP_GRACE_SECS);
     }
 
     #[test]

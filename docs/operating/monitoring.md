@@ -14,9 +14,10 @@ and prints the `sudo rm -rf` line to delete it yourself. While they are off,
 log search, Open Grafana and node log shipping answer "off by choice" with
 `noo stack monitoring on`, never an error. On a lean install
 `noo cluster verify` reads the `loki`, `tempo`, `grafana door`,
-`logs last seen` and absent `* at rest` rows as OK, "not installed by
-choice", and a node's `log shipper` row says the controller keeps no logs
-by choice. Prove it:
+`logs last seen` and the `loki`/`tempo`/`grafana at rest` rows of an
+absent or empty directory as OK, "not installed by choice", and a node's
+`log shipper` row says the controller keeps no logs by choice (OK, even
+while the agent has paused itself on the controller's `loki_off`). Prove it:
 
 ```sh
 noo health                                        # gateway + dependencies, exit 5 if degraded
@@ -884,7 +885,7 @@ fails; what each verdict means:
 
 | row | where | OK | WARN | FAIL | remedy |
 |---|---|---|---|---|---|
-| `log shipper` | per node, from the heartbeat's `log_ship` | `shipped N, last accepted <age> ago` (or `enabled, nothing to ship yet`); an agent that has not reported it yet also reads OK, with the wording "predates the shipper" once its heartbeat is old | off by choice (`last_error` names why: `NOO_LOG_SHIP=0` or no TLS material); the gateway's ingest route not answering (`route_ready:false`, an older gateway); nothing accepted yet with lines queued and no error; the host journal not following (the string carries its own fix, e.g. `hostd predates journal-follow`) | `shipping stalled since <age>: <last_error>` — enabled, lines queued or spilled, nothing accepted for 15 min; or nothing ever accepted and the gateway refuses | `noo cluster logs <node> agent`, then `noo logs status` on the controller; for "off": `NOO_LOG_SHIP` in `/etc/noo-node-agent.env` or `noo cluster provision <node>`; for the route: `noo upgrade --stack`; for the journal: `noo upgrade --nodes` (or `noo cluster provision <node> --wait` for one node) |
+| `log shipper` | per node, from the heartbeat's `log_ship` | `shipped N, last accepted <age> ago` (or `enabled, nothing to ship yet`); an agent that has not reported it yet also reads OK, with the wording "predates the shipper" once its heartbeat is old | off (`last_error` names why: `NOO_LOG_SHIP=0` or no TLS material; a `loki_off` refusal, the controller keeping no logs by choice, is OK instead); the gateway's ingest route not answering (`route_ready:false`, an older gateway); nothing accepted yet with lines queued and no error; the host journal not following (the string carries its own fix, e.g. `hostd predates journal-follow`) | `shipping stalled since <age>: <last_error>` — enabled, lines queued or spilled, nothing accepted for 15 min; or nothing ever accepted and the gateway refuses | `noo cluster logs <node> agent`, then `noo logs status` on the controller; for "off": `NOO_LOG_SHIP` in `/etc/noo-node-agent.env` or `noo cluster provision <node>`; for the route: `noo upgrade --stack`; for the journal: `noo upgrade --nodes` (or `noo cluster provision <node> --wait` for one node) |
 | `logs last seen` | controller, from the gateway's `noo_logs_last_seen_unix{node}` gauge on `/metrics` | `N node(s) shipping, oldest accepted <age> ago`; offline nodes are skipped and named | `no logs ever received from <node>` (the roll has not reached it, or shipping is off there; the gauge is in memory, so a just-restarted gateway reads this way for a minute); `/metrics` not readable | an ONLINE node whose last accepted push is over 15 min old | `noo cluster verify <node>` (its `log shipper` row says why), then `noo cluster logs <node> agent`; for "never": `noo upgrade --nodes` (or `noo cluster provision <node> --wait`) |
 | `logs access` | controller | an anonymous `GET /api/logs/query` is refused (401/403) | the probe got neither a refusal nor a body, or the gateway did not answer | the anonymous GET answered 2xx: the log doors are open to anyone who can reach the port | `noo upgrade --stack` to a gateway with `auth::LOGS_READ_PREFIX` |
 
