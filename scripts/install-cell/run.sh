@@ -208,6 +208,7 @@ if [ "$SCOPE" = node-partial ]; then
     # and hosted Apple-silicon runners have no Docker. Install + CLI only.
     meta limits "macOS node path stops before join: no reachable controller from a hosted runner, no Docker on hosted Apple silicon"
     step cli-help 60 -- noo --help
+    step verify-ratchet 10 -- python3 "$HERE/ratchet.py" skip "$CELL" "a node-only cell: no controller to verify"
     finish
 fi
 
@@ -281,6 +282,7 @@ if [ "${EXPECT:-}" = refusal ]; then
       if [ -n "$why" ]; then echo "REFUSAL FAIL: $why"; exit 1; fi
       echo "REFUSAL OK: onboard refused this $(uname -m) machine, named the reason and the node alternative, and started nothing"'
     teardown
+    step verify-ratchet 10 -- python3 "$HERE/ratchet.py" skip "$CELL" "an arm64 controller is refused: no install to verify"
     finish
 fi
 
@@ -402,6 +404,16 @@ step verify 900 -- bash -c 'fresh cluster verify --wait'
 # executor's "profile: 3.x form") is readable from the cell's artifacts. Same
 # redactor and upload scan as every log. Never the failed step.
 step probe-verify-json 300 -- bash -c 'fresh --json cluster verify'
+# THE WARN RATCHET (i1098): the JSON above, judged against this cell's
+# ceiling in warn-ratchet.json: more WARN rows than max_warn, or a WARN row
+# the ceiling does not name, FAILS the cell (a gate, not a probe; the cell
+# goes on so the probes after it still report). Counted by `verdict`, never
+# by text; an OK row tiered "later" is not a WARN. While the ceiling is
+# unmeasured it prints a NOTE with what it measured. Each WARN row prints
+# with its status (row_status: "awaiting operator decision" is NOT accepted).
+# A FAIL row fails the cell here once fail_rows_fail_the_cell is true (OFF
+# until the release lead approves fail_allowed). ratchet.py says more.
+step verify-ratchet 60 -- python3 "$HERE/ratchet.py" judge "$CELL" "$OUT/logs/probe-verify-json.log"
 # The container onboard pulled the chat model into, chosen the way onboard's
 # pull_ollama chooses it (noo-cli onboard/steps.rs): noo-ollama-embed on a
 # standalone install (NOO_STANDALONE=1 or a .noo-standalone marker in the
