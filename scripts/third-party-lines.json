@@ -37,10 +37,10 @@
                 "why": "DHI tag; line is the pinned tag, re-checked 6 months out"},
     "node-exporter": {"line": "1", "policy": null, "recheck_by": "2027-05-20", "opt_in": false,
                       "why": "DHI tag; line is the pinned tag, re-checked 6 months out"},
-    "tei": {"line": "1", "policy": null, "recheck_by": null, "opt_in": false,
-            "why": "no published support policy: only the newer-upstream note"},
+    "tei": {"line": "1", "policy": null, "recheck_by": "2027-02-28", "opt_in": false,
+            "why": "HELD at 1.6 (GPU flavour) since 2026-11-20: TEI 1.9.4's CUDA image requires cuda>=12.9 with no GeForce exemption (driver >= ~575, inferred from the image config); move after a GPU node proves 1.9.4 (#1444, the two-GPU node's test list). The date makes the hold an issue, not a forgotten pin"},
     "tei-cpu": {"line": "cpu-1", "policy": null, "recheck_by": null, "opt_in": false,
-                "why": "no published support policy: only the newer-upstream note"},
+                "why": "cpu-1.9.4 since #1444 (2026-11-20); no published support policy: only the newer-upstream note"},
     "vllm": {"line": "v0", "policy": null, "recheck_by": null, "opt_in": true,
              "why": "opt-in backend; no published support policy: only the newer-upstream note"}
   }
