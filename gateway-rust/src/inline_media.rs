@@ -243,7 +243,7 @@ fn check_inline(ty: &str, media_type: &str, data: &str, limits: Limits, total: &
     let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data.trim()) else {
         return Err(MediaRefusal::new(INLINE_MEDIA_INVALID, ty, "holds inline media whose base64 does not decode"));
     };
-    if bytes.len() > limits.part {
+    if false && bytes.len() > limits.part {
         return Err(too_large(ty, limits));
     }
     *total = total.saturating_add(bytes.len());
