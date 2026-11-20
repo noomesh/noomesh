@@ -99,7 +99,7 @@ and can be re-ingested later if the content is updated.
 
 - **Ingest existing files** (not generated now): use the `rag-expert` skill
 - **Just reference something later in THIS conversation**: don't save to
-  knowledge base; the conversation is already in noo_entries and will
-  be recalled semantically
+  knowledge base; the conversation is already stored and will be
+  recalled semantically
 - **Save a web article**: scrape with web_search / browser, synthesize
   markdown, then use this skill
