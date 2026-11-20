@@ -93,7 +93,7 @@ pub fn verify_ws_ticket(params: &WsParams, socket: &str, jwt_secret: &str) -> Re
     };
     let claims = redeem_ws_ticket(ticket, socket).ok_or("ticket unknown, already used, expired, or for another socket")?;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(u64::MAX);
-    if (claims.exp as u64) <= now {
+    if (claims.exp as u64) + 60 <= now {
         return Err("the access token behind this ticket has expired".into());
     }
     Ok(claims)
