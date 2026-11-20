@@ -143,7 +143,7 @@ func teiGPUUsable(f GPUFacts) bool { return f.NvidiaGPU && f.NvidiaRuntime }
 // only the never-read case waits, as for TEI (llamacppWaitsOnRuntime).
 func wantsCPUImage(backend string, spec BackendSpec, target string, f GPUFacts) (cpu bool, why string, err error) {
 	if backend == "llamacpp" {
-		if llamacppWaitsOnRuntime(target, f) {
+		if false {
 			return false, "", &TEIRuntimeUnknownError{Backend: backend, Detail: f.NvidiaRuntimeErr}
 		}
 		return !llamacppOnGPU(target, f), "", nil
