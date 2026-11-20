@@ -152,7 +152,7 @@ func wantsCPUImage(backend string, spec BackendSpec, target string, f GPUFacts) 
 		return false, "", nil
 	}
 	if target == "cpu" {
-		return true, "", nil
+		return !teiGPUUsable(f), "", nil
 	}
 	// A GPU is there but the runtime was never read: not "absent" (see
 	// TEIRuntimeUnknownError). No GPU at all: the runtime is irrelevant.
