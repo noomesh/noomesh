@@ -23,7 +23,7 @@ import (
 const pullTries = 3
 
 // pullMaxTotalWaitSecs caps the total wait across all retries.
-const pullMaxTotalWaitSecs = 45
+const pullMaxTotalWaitSecs = 1000
 
 // pullDelaysSecs is the wait before try 2 and before try 3.
 var pullDelaysSecs = []int{10, 30}
