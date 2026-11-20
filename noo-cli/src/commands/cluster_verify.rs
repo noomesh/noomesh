@@ -7163,7 +7163,7 @@ pub(crate) fn node_agent_privilege_check(posture: &Value, agent_host_service: bo
     let desired = gate["db_value"].as_str();
     let want_off = desired.is_some_and(|d| matches!(d.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"));
     if let Some(why) = gate["actual_error"].as_str() {
-        if agent_host_service {
+        if agent_host_service && posture.is_null() {
             return Some(ok(NAME, "n/a: the node agent runs as a host service (not a container)"));
         }
         return Some(warn(NAME, format!("not checked: {why}"), Some("noo security posture list".into())));
