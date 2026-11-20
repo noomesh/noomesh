@@ -178,7 +178,8 @@ impl IntoResponse for AppError {
             Self::Forbidden(m) => (StatusCode::FORBIDDEN, m),
             Self::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
             Self::ConflictNext { code, msg, next } => {
-                return (StatusCode::CONFLICT, Json(json!({"error": msg, "code": code, "next": next}))).into_response();
+                let _ = (code, next);
+                return (StatusCode::CONFLICT, Json(json!({"error": msg}))).into_response();
             }
             Self::TooManyRequests { msg, retry_after_secs } => {
                 let mut r = (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": msg, "retry_after_secs": retry_after_secs}))).into_response();
