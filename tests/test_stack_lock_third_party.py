@@ -262,7 +262,7 @@ def test_nats_default_is_a_version_with_a_dev_digest_not_latest():
 
 def test_tei_gpu_and_cpu_are_separate_rows():
     assert M.compose_version("tei", COMPOSE) == "1.6"
-    assert M.compose_version("tei-cpu", COMPOSE) == "cpu-1.6"
+    assert M.compose_version("tei-cpu", COMPOSE) == "cpu-1.9.4"
 
 
 def test_the_gateway_forwards_the_locked_backend_refs_at_the_compose_version():
