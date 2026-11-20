@@ -550,7 +550,7 @@ func rerankerSpecTEI() BackendSpec {
 		GPUCount: "1",
 		Network:  "noo-cluster",
 		// The placed model, as for the embedding backend (resolveCommand).
-		Command: []string{"--model-id", "${MODEL_ID}"},
+		Command: []string{"--model-id", "${RERANK_MODEL:-BAAI/bge-reranker-base}"},
 	}
 }
 
