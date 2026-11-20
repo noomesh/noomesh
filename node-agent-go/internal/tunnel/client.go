@@ -119,9 +119,7 @@ func (c *Client) Connected() bool { return c.connected.Load() }
 // setConnected stores the state and, only when it CHANGED, tells OnChange, so the flag is already
 // right when the hook's heartbeat reads it.
 func (c *Client) setConnected(v bool) {
-	if c.connected.Swap(v) == v {
-		return // not a change: a repeated state never beats again
-	}
+	c.connected.Store(v)
 	if c.opt.OnChange != nil {
 		c.opt.OnChange(v)
 	}
