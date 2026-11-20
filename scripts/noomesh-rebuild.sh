@@ -146,7 +146,6 @@ addons_report_licensed
 #
 # The three knobs are not optional; see the same block in start.sh for what
 # each one does.
-addons_export_launcher_env   # NOO_WORKER_SUPERVISOR, NOO_MIGRATIONS_ENVS (lib-addons.sh)
 # NOO_MCP_GATEWAY_HOST_PORT: owned by lib-instance.sh since the MCP hub
 # cutover (gateway holds host 3100). The stale 3199 export that used to
 # sit here would have re-parked the LIVE MCP door on every rebuild and
