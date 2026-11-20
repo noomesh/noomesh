@@ -2955,7 +2955,7 @@ async fn service_key_revoke(
     actor_ext: Option<Extension<AuthActor>>,
     ctx: Option<Extension<RequesterCtx>>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, ctx.as_deref(), "revoking a service key").await?;
+
     // revoking an Admin's bound key is a denial of service against that
     // account's MCP/inference access.
     require_may_manage_key_consumer(&state.db, &ctx, &consumer).await?;
