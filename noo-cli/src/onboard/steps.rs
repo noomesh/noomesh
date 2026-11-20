@@ -5718,16 +5718,18 @@ pub fn services(ctx: &mut Ctx) {
         // (~4.5 GB, opt-out so on by default) four steps before it asks
         // whether you want it — and stops it again if you say no.
         let mut script_args: Vec<&str> = vec!["--dist", "--core-only"];
+        // Onboard has just written the secrets, PKI and config this start
+        // reads: recreate every container. Later plain starts recreate only
+        // what changed (scripts/lib-start-inputs.sh). Only a launcher that
+        // knows the flag gets it; an older one forces every start anyway.
+        if sh::launcher_takes_recreate(&ctx.repo_root.join("scripts/noomesh-start.sh")) {
+            script_args.push("--recreate");
+        }
         if std::env::var("NOO_STANDALONE").as_deref() == Ok("1") {
             script_args.push("--profile");
             script_args.push("standalone");
         }
-        // Onboard has just written the secrets, PKI and config this start
-        // reads: recreate every container (NOO_START_RECREATE, the env form
-        // an older launcher ignores). Later plain starts recreate only what
-        // changed (scripts/lib-start-inputs.sh).
-        let recreate: &[(&str, &str)] = &[("NOO_START_RECREATE", "1")];
-        let mut code = sh::run_script_streamed_env(ctx, "noomesh-start.sh", &script_args, recreate);
+        let mut code = sh::run_script_streamed(ctx, "noomesh-start.sh", &script_args);
         if code != 0 {
             // Fix-and-retry IN PLACE (2026-09-01: a stale-volume failure
             // here cascaded "skipped" through the model step, the self-
@@ -5751,7 +5753,7 @@ pub fn services(ctx: &mut Ctx) {
                     .status();
                 fix_volume_mismatches(ctx);
             }
-            code = sh::run_script_streamed_env(ctx, "noomesh-start.sh", &script_args, recreate);
+            code = sh::run_script_streamed(ctx, "noomesh-start.sh", &script_args);
         }
         if code != 0 {
             ctx.error("Failed to start services from released images (after one repair retry)");
@@ -10500,25 +10502,27 @@ mod dist_stack_lock_tests {
         let src = include_str!("steps.rs");
         let body = &src[src.find("pub fn services(ctx: &mut Ctx)").expect("services step")..];
         let pin = body.find("if !pin_dist_stack_lock(ctx)").expect("the dist branch pins the lock");
-        let launch = body.find("run_script_streamed_env(ctx, \"noomesh-start.sh\"").expect("the dist launch");
+        let launch = body.find("run_script_streamed(ctx, \"noomesh-start.sh\", &script_args)").expect("the dist launch");
         assert!(pin < launch, "stack.lock must be verified and written before the launcher starts anything");
     }
 
     /// A plain start recreates only the containers whose config or secret /
     /// config file contents changed (scripts/lib-start-inputs.sh). Onboard's
     /// own Service Setup start has just written the secrets, PKI and config,
-    /// so it (and its one repair retry) still recreates every container,
-    /// through the env form an older launcher ignores. The add-ons step's
-    /// start applies a changed `addons:` map, which compose sees itself.
+    /// so it (and its one repair retry, same args) passes `--recreate` to a
+    /// launcher that takes it. The add-ons step's start applies a changed
+    /// `addons:` map, which compose sees itself.
     #[test]
     fn the_service_setup_start_recreates_every_container() {
         let src = crate::test_src::own_code(include_str!("steps.rs"));
         let services = crate::test_src::fn_body(&src, "pub fn services(ctx: &mut Ctx)");
-        assert!(services.contains("let recreate: &[(&str, &str)] = &[(\"NOO_START_RECREATE\", \"1\")];"));
-        assert_eq!(services.matches("run_script_streamed_env(ctx, \"noomesh-start.sh\", &script_args, recreate)").count(), 2,
-            "the first launch and its repair retry");
-        assert!(!services.contains("run_script_streamed(ctx, \"noomesh-start.sh\""), "no launch without the recreate");
-        assert!(!services.contains("\"--recreate\""), "never the flag: an older launcher reads it as a service name");
+        let check = services
+            .find("if sh::launcher_takes_recreate(&ctx.repo_root.join(\"scripts/noomesh-start.sh\")) {\n            script_args.push(\"--recreate\");")
+            .expect("the Service Setup start asks for --recreate");
+        let launches: Vec<usize> = services.match_indices("run_script_streamed(ctx, \"noomesh-start.sh\", &script_args)").map(|(i, _)| i).collect();
+        assert_eq!(launches.len(), 2, "the first launch and its repair retry");
+        assert!(launches.iter().all(|&l| check < l));
+        assert!(!src.contains("NOO_START_RECREATE"), "no environment switch");
     }
 }
 

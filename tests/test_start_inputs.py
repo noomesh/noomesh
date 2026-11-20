@@ -23,7 +23,7 @@ and compose's own hash does the rest. What this holds:
     the key is a 0600 file read by the helper itself, never an argument; an
     unreadable key refuses; the state file holds no raw digest;
   * the launcher: no literal --force-recreate on the full-start `up`; the
-    force comes only from `--recreate` / NOO_START_RECREATE=1 or a failed
+    force comes only from `--recreate` or a failed
     fingerprint; the secret digests are taken before the files are chowned;
   * the message: "N running, 0 recreated", or which files changed.
 """
@@ -356,6 +356,8 @@ def test_the_report_names_the_changed_files_not_their_hashes(tmp_path: Path) -> 
     assert not re.search(r"[0-9a-f]{32}", "\n".join(out))
     # No earlier state: just the names.
     assert SI.report_lines(before, after, {}, s2)[1:] == ["recreated: gateway"]
+    # A forced start says it was forced, not that inputs changed.
+    assert SI.report_lines(before, after, s1, s2, forced=True)[1] == "recreated: gateway (forced: every container)"
     # A recreate with no input change is compose's own (config or image).
     assert SI.report_lines(before, after, s2, s2)[1] == "recreated gateway: its compose config or image changed"
 
@@ -380,16 +382,21 @@ def _full_start_up(src: str) -> str:
 
 def test_the_full_start_up_forces_only_through_the_flag() -> None:
     src = START.read_text()
-    up = _full_start_up(src)
+    lib = LIB.read_text()
+    # start calls the lib's wrapper, the one CI drives against a real compose.
+    assert re.search(r"^    start_inputs_full_up \$BUILD_FLAG \$GPU_SCALE \$AGENT_SCALE \$ADDON_HOLD_SCALE \|\| _up_rc=\$\?$", src, re.M)
+    assert re.search(r'^    start_inputs_named_up "\$\{SERVICES\[@\]\}"$', src, re.M)
+    assert "noo_compose_up_isolating_stuck compose" not in "\n".join(
+        ln for ln in src.splitlines() if not ln.lstrip().startswith("#")), "start has no `up` of its own any more"
+    up = _full_start_up(lib)
     assert "--force-recreate" not in up, "a plain full start must not force every container"
     assert " up -d $START_UP_FORCE " in up
-    assert src.index("start_inputs_prepare || exit 1") < src.index(up)
-    # The targeted path carries the same labels and the same (absent) force.
-    assert 'up -d $START_UP_FORCE "${SERVICES[@]}"' in src
-    assert src.count("start_inputs_prepare || exit 1") == 2
+    full = lib[lib.index("start_inputs_full_up() {"):]
+    assert full.index("start_inputs_prepare || return 1") < full.index(up.strip())
+    named = lib[lib.index("start_inputs_named_up() {"):]
+    assert 'up -d $START_UP_FORCE "$@"' in named and named.index("start_inputs_prepare || return 1") < named.index("up -d")
     # The only place the force is spelled is the lib, and only for --recreate or a failed fingerprint.
     assert "--force-recreate" not in "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
-    lib = LIB.read_text()
     assert lib.count('START_UP_FORCE="--force-recreate"') == 4  # --recreate, no python3, no config, helper failed
 
 
@@ -408,8 +415,9 @@ def _parse(*args: str, env: dict[str, str] | None = None) -> str:
 def test_recreate_is_parsed_with_the_other_launcher_flags() -> None:
     assert _parse() == "recreate=false rest="
     assert _parse("--dist", "--recreate", "gateway") == "recreate=true rest=gateway"
-    assert _parse(env={"NOO_START_RECREATE": "1"}) == "recreate=true rest="
-    assert _parse(env={"NOO_START_RECREATE": "0"}) == "recreate=false rest="
+    # No environment switch: the flag on argv is the only way in.
+    assert _parse(env={"NOO_START_RECREATE": "1"}) == "recreate=false rest="
+    assert "NOO_START_RECREATE" not in START.read_text() and "NOO_START_RECREATE" not in LIB.read_text()
 
 
 def _prepare(tmp_path: Path, recreate: bool, config_rc: int = 0) -> str:
@@ -483,3 +491,22 @@ def test_write_secret_files_leaves_keyed_digests_for_every_secret(tmp_path: Path
         assert raw not in cache.read_text()
     finally:
         box.cleanup()
+
+
+def test_a_new_key_recreates_everything_once_and_says_so(tmp_path: Path) -> None:
+    i = Install(tmp_path)
+    r1, a, s1 = i.fingerprint()
+    assert "made a new start-inputs key" in r1.stderr
+    (tmp_path / "state.json").rename(tmp_path / "old.json")
+    r2, b, _ = i.fingerprint(old_state=tmp_path / "old.json")
+    assert "made a new start-inputs key" not in r2.stderr and a == b
+    i.key.unlink()
+    r3, c, s3 = i.fingerprint(old_state=tmp_path / "old.json")
+    assert "made a new start-inputs key" in r3.stderr
+    assert all(a[s] != c[s] for s in a), "every label moves with the key"
+    assert s1["key_id"] != s3["key_id"] and re.fullmatch(r"[0-9a-f]{16}", s3["key_id"])
+    before = {s: (f"{s}1", "running") for s in a}
+    after = {s: (f"{s}2", "running") for s in a}
+    out = SI.report_lines(before, after, s1, s3)
+    assert out[0] == "3 running, 3 recreated"
+    assert out[1] == "recreated: gateway, postgres, redis (the start-inputs key is new, so every label changed once)"

@@ -315,8 +315,17 @@ def service_inputs(name: str, svc: dict, cfg: dict, key: bytes, a, cached: dict[
     return inputs
 
 
+def key_id(key: bytes) -> str:
+    """Which key made a state file: a keyed value, so it names no key."""
+    return keyed(key, "key-id")[:16]
+
+
 def cmd_fingerprint(a) -> int:
+    new_key = not os.path.lexists(a.key_file)
     key = load_key(a.key_file)
+    if new_key:
+        note(f"made a new start-inputs key ({a.key_file}): every service's label changes once, "
+             "so this start recreates every container")
     try:
         cfg = json.load(sys.stdin)
     except ValueError as e:
@@ -345,7 +354,11 @@ def cmd_fingerprint(a) -> int:
     merged = dict(old.get("services") or {})
     for name, rec in new.items():
         merged[name] = {"inputs": {p: v for p, v in rec["inputs"].items()}}
-    write_private(a.state_out, json.dumps({"version": STATE_VERSION, "services": merged}, indent=1, sort_keys=True) + "\n")
+    if old.get("key_id") not in (None, key_id(key)):
+        # Values made with another key compare as "everything changed".
+        merged = {name: {"inputs": rec["inputs"]} for name, rec in new.items()}
+    write_private(a.state_out, json.dumps({"version": STATE_VERSION, "key_id": key_id(key), "services": merged},
+                                          indent=1, sort_keys=True) + "\n")
     return 0
 
 
@@ -378,15 +391,22 @@ def changed_paths(old: dict, new: dict) -> list[str]:
 
 
 def report_lines(before: dict, after: dict, old_state: dict, new_state: dict,
-                 root: str = "", secret_dir: str = "") -> list[str]:
+                 root: str = "", secret_dir: str = "", forced: bool = False) -> list[str]:
     running = sum(1 for _, (_, st) in after.items() if st == "running")
     recreated = sorted(s for s, (cid, _) in after.items() if s in before and before[s][0] != cid)
     created = sorted(s for s in after if s not in before)
     lines = [f"{running} running, {len(recreated)} recreated" + (f", {len(created)} created" if created else "")]
     if not recreated:
         return lines
+    if forced:
+        lines.append("recreated: " + ", ".join(recreated) + " (forced: every container)")
+        return lines
     olds = (old_state or {}).get("services") or {}
     news = (new_state or {}).get("services") or {}
+    old_id, new_id = (old_state or {}).get("key_id"), (new_state or {}).get("key_id")
+    if old_id and new_id and old_id != new_id:
+        lines.append("recreated: " + ", ".join(recreated) + " (the start-inputs key is new, so every label changed once)")
+        return lines
     if not olds:
         lines.append("recreated: " + ", ".join(recreated))
         return lines
@@ -406,7 +426,7 @@ def report_lines(before: dict, after: dict, old_state: dict, new_state: dict,
 def cmd_report(a) -> int:
     for line in report_lines(_read_snapshot(a.before), _read_snapshot(a.after),
                              _load_state(a.old_state), _load_state(a.new_state),
-                             os.path.abspath(a.root) if a.root else "", a.secret_dir or ""):
+                             os.path.abspath(a.root) if a.root else "", a.secret_dir or "", a.forced):
         print(line)
     return 0
 
@@ -437,6 +457,7 @@ def main(argv: list[str]) -> int:
     r.add_argument("--new-state", default="")
     r.add_argument("--root", default="")
     r.add_argument("--secret-dir", default="")
+    r.add_argument("--forced", action="store_true")
     a = p.parse_args(argv)
     try:
         if a.cmd == "secret-digests":

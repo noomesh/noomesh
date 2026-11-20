@@ -114,8 +114,13 @@ def test_both_launchers_use_it_and_the_rust_code_agrees():
     for name in ("noomesh-start.sh", "noomesh-restart.sh"):
         t = (SCRIPTS / name).read_text()
         assert "lib-stuck-container.sh" in t, name
-        # start forces only under --recreate ($START_UP_FORCE, lib-start-inputs.sh)
-        assert re.search(r"^\s*noo_compose_up_isolating_stuck compose .* up -d .*(--force-recreate|\$START_UP_FORCE)", t, re.M), name
+        # start's whole-stack `up` lives in lib-start-inputs.sh
+        # (start_inputs_full_up), forcing only under --recreate.
+        up = t
+        if name == "noomesh-start.sh":
+            assert re.search(r"^\s*start_inputs_full_up \$BUILD_FLAG", t, re.M), name
+            up = (SCRIPTS / "lib-start-inputs.sh").read_text()
+        assert re.search(r"^\s*noo_compose_up_isolating_stuck compose .* up -d .*(--force-recreate|\$START_UP_FORCE)", up, re.M), name
         assert '"$NOO_EXIT_STACK_PARTIAL"' in t
     assert "NOO_EXIT_STACK_PARTIAL=75" in (SCRIPTS / "lib-stuck-container.sh").read_text()
     assert "lib-stuck-container.sh" in (REPO_ROOT / "noo-cli" / "build.rs").read_text()

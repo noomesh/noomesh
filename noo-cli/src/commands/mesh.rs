@@ -671,7 +671,7 @@ pub(crate) fn front_addon_uis(g: &Globals) {
 /// secret/config file contents changed (scripts/lib-start-inputs.sh);
 /// `--recreate` recreates every one.
 pub fn mesh_start(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let script_args = start_script_args(args)?;
+    let script_args = for_launcher(start_script_args(args)?, &repo_root().join("scripts/noomesh-start.sh"));
     let rc = run_script(g, "noomesh-start.sh", &script_args, Some("start"));
     // The launcher's banner shows the bound IP; the address an operator
     // actually shares is the tailnet name, which the shell can't read
@@ -683,6 +683,16 @@ pub fn mesh_start(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         front_addon_uis(g);
     }
     Ok(rc)
+}
+
+/// An older launcher on disk (a checkout, a slice kept at the stack's release
+/// until `noo upgrade --stack`) forces every full start already, and would
+/// read `--recreate` as a service name: it gets everything else.
+fn for_launcher(mut script_args: Vec<String>, launcher: &std::path::Path) -> Vec<String> {
+    if !crate::onboard::sh::launcher_takes_recreate(launcher) {
+        script_args.retain(|a| a != "--recreate");
+    }
+    script_args
 }
 
 /// `noo stack start`'s words → the launcher's arguments.
@@ -734,7 +744,7 @@ fn start_script_args(args: &[String]) -> Result<Vec<String>, Unhandled> {
 
 #[cfg(test)]
 mod start_args_tests {
-    use super::start_script_args;
+    use super::{for_launcher, start_script_args};
 
     fn a(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -748,6 +758,18 @@ mod start_args_tests {
         assert_eq!(start_script_args(&a(&["--recreate"])).unwrap(), a(&["--recreate"]));
         assert_eq!(start_script_args(&a(&["--dist", "--recreate", "--tag", "v1"])).unwrap(), a(&["--dist", "--tag", "v1", "--recreate"]));
         assert!(start_script_args(&a(&["--force-recreate"])).is_err());
+    }
+
+    #[test]
+    fn an_older_launcher_never_gets_the_word() {
+        let dir = crate::private_tmp::Dir::new("noo-start-args").unwrap();
+        let new = dir.path().join("new.sh");
+        let old = dir.path().join("old.sh");
+        std::fs::write(&new, "case $1 in\n        --recreate)  START_RECREATE=true; shift ;;\nesac\n").unwrap();
+        std::fs::write(&old, "case $1 in\n        --dist)      DIST=true; shift ;;\nesac\n").unwrap();
+        let args = a(&["--dist", "--recreate"]);
+        assert_eq!(for_launcher(args.clone(), &new), a(&["--dist", "--recreate"]));
+        assert_eq!(for_launcher(args, &old), a(&["--dist"]));
     }
 }
 
