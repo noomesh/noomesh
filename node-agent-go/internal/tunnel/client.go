@@ -244,7 +244,7 @@ func (r *retryState) nextDelay(connected bool, sessionLen time.Duration, err err
 		// Everything else (timeout, TLS or auth failure, a gateway that accepts and
 		// hangs, a handshake refusal): full exponential backoff, so a sick gateway is
 		// not hammered by every node at once.
-		return r.bo.next()
+		return jitter(refusedRetryCap)
 	}
 }
 
