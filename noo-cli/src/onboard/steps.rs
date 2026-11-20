@@ -262,7 +262,7 @@ pub(crate) const ONLY_BACKEND_LINE: &str = "Backend: Ollama — local inference,
 /// mirror-images.yml's `ghcr.io/noomesh/<name>` copies); only the opt-in
 /// vLLM backend (`vllm/vllm-openai`) is still a Docker Hub image.
 pub(crate) const DOCKER_HUB_OPTIONAL: &str =
-    "Docker Hub: not logged in — not needed; the stack's images all come from ghcr.io (only a vLLM backend, if you pick one, pulls from Docker Hub)";
+    "Docker Hub: not logged in — optional; two base images (nats, nginx) pull anonymously from Docker Hub";
 
 /// This run installs a standalone controller: no checkout, released images
 /// only (`standalone::finish_prepare` sets NOO_STANDALONE; a re-onboard finds
