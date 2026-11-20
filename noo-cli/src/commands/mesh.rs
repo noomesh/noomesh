@@ -539,8 +539,12 @@ pub fn mesh_logs(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(run_script(g, "noomesh-logs.sh", &script_args, None))
 }
 
-/// Resolve a name to a live container: as given, else with a `noo-` prefix
-/// (compose service names like `gateway` map to containers `noo-gateway`).
+/// Resolve a name to a live container of THIS instance: the first of
+/// [`container_candidates`] that exists, else the name as given (docker
+/// reports the error). `noo --instance galaxy stack logs gateway` used to
+/// read the DEFAULT stack's `noo-gateway`: the lookup never applied the
+/// instance prefix, while every other docker boundary in the CLI does
+/// (envfile::container / envfile::instanced).
 pub(crate) fn resolve_container(name: &str) -> String {
     let exists = |n: &str| {
         Command::new("docker")
@@ -551,16 +555,38 @@ pub(crate) fn resolve_container(name: &str) -> String {
             .map(|s| s.success())
             .unwrap_or(false)
     };
-    if exists(name) {
-        return name.to_string();
+    container_candidates(name, &crate::envfile::container_prefix())
+        .into_iter()
+        .find(|c| exists(c))
+        .unwrap_or_else(|| name.to_string())
+}
+
+/// The names [`resolve_container`] tries, in order, for `name` under the
+/// container `prefix` (`noo` on the default instance, `noo-<name>` on a
+/// named one). Pure.
+/// - default instance: `name`, then `noo-<name>` (unchanged behaviour);
+/// - named instance: a `noo-X` name maps to `<prefix>-X` FIRST (never the
+///   default stack's `noo-X`); a bare `X` tries `X`, then `<prefix>-X`; a
+///   name already under the prefix is tried as given.
+pub(crate) fn container_candidates(name: &str, prefix: &str) -> Vec<String> {
+    let own = format!("{prefix}-");
+    let mut out: Vec<String> = Vec::new();
+    if name.starts_with(&own) {
+        out.push(name.to_string());
+        return out;
     }
-    if !name.starts_with("noo-") {
-        let prefixed = format!("noo-{name}");
-        if exists(&prefixed) {
-            return prefixed;
+    if prefix != "noo" {
+        if let Some(rest) = name.strip_prefix("noo-") {
+            // On a named instance a `noo-X` name means this instance's X.
+            out.push(format!("{own}{rest}"));
+            return out;
         }
     }
-    name.to_string() // let docker report the error
+    out.push(name.to_string());
+    if !name.starts_with("noo-") {
+        out.push(format!("{own}{name}"));
+    }
+    out
 }
 
 /// `noo stack restart [--profile P] [--force] [SERVICES…]` → scripts/noomesh-restart.sh
@@ -740,6 +766,35 @@ fn start_script_args(args: &[String]) -> Result<Vec<String>, Unhandled> {
         script_args.push("--recreate".into());
     }
     Ok(script_args)
+}
+
+#[cfg(test)]
+mod resolve_container_tests {
+    use super::container_candidates;
+
+    fn c(name: &str, prefix: &str) -> Vec<String> {
+        container_candidates(name, prefix)
+    }
+
+    #[test]
+    fn the_default_instance_resolves_as_before() {
+        assert_eq!(c("gateway", "noo"), ["gateway", "noo-gateway"]);
+        assert_eq!(c("noo-gateway", "noo"), ["noo-gateway"]);
+    }
+
+    #[test]
+    fn a_named_instance_never_reads_the_default_stacks_container() {
+        // `noo --instance galaxy stack logs gateway` read the default
+        // stack's noo-gateway: the lookup ignored the instance.
+        assert_eq!(c("gateway", "noo-galaxy"), ["gateway", "noo-galaxy-gateway"]);
+        assert_eq!(c("noo-gateway", "noo-galaxy"), ["noo-galaxy-gateway"]);
+        assert!(!c("noo-gateway", "noo-galaxy").contains(&"noo-gateway".to_string()));
+    }
+
+    #[test]
+    fn a_name_already_under_the_instance_prefix_is_taken_as_given() {
+        assert_eq!(c("noo-galaxy-gateway", "noo-galaxy"), ["noo-galaxy-gateway"]);
+    }
 }
 
 #[cfg(test)]
