@@ -3,7 +3,7 @@
 
 # A plain `noo stack start` recreates only the containers whose inputs
 # changed, proven against a REAL docker compose: the launcher's own
-# start_inputs_full_up (scripts/lib-start-inputs.sh) on a three-service
+# start_inputs_full_up (scripts/lib-start-inputs.sh) on a four-service
 # project (scripts/test-start-inputs/run.sh). Unit tests cannot show what
 # compose does with a label change, a dependent, or --force-recreate.
 #

@@ -396,12 +396,16 @@ def report_lines(before: dict, after: dict, old_state: dict, new_state: dict,
     recreated = sorted(s for s, (cid, _) in after.items() if s in before and before[s][0] != cid)
     created = sorted(s for s in after if s not in before)
     lines = [f"{running} running, {len(recreated)} recreated" + (f", {len(created)} created" if created else "")]
+    olds = (old_state or {}).get("services") or {}
+    if not olds:
+        # Missing or unreadable: it only NAMES files, so nothing is recreated
+        # on its account; the next start has one again.
+        lines.append("cannot name what changed: no previous record")
     if not recreated:
         return lines
     if forced:
         lines.append("recreated: " + ", ".join(recreated) + " (forced: every container)")
         return lines
-    olds = (old_state or {}).get("services") or {}
     news = (new_state or {}).get("services") or {}
     old_id, new_id = (old_state or {}).get("key_id"), (new_state or {}).get("key_id")
     if old_id and new_id and old_id != new_id:

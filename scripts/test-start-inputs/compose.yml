@@ -5,7 +5,8 @@
 # own start_inputs_full_up (lib-start-inputs.sh) against a real compose:
 #   a  takes a `secrets: file:` source
 #   b  bind-mounts a config FILE
-#   c  has neither, and depends on a
+#   c  has neither, and depends on a (the plain dependent)
+#   d  mounts a's secret too (a second reader of one secret)
 # NOO_TEST_IMAGE is a pinned image (run.sh refuses an unpinned one).
 services:
   a:
@@ -24,6 +25,11 @@ services:
     command: ["tail", "-f", "/dev/null"]
     init: true
     depends_on: [a]
+  d:
+    image: ${NOO_TEST_IMAGE:?set NOO_TEST_IMAGE to a digest-pinned image}
+    command: ["tail", "-f", "/dev/null"]
+    init: true
+    secrets: [a_secret]
 secrets:
   a_secret:
     file: ./secrets/a.txt
