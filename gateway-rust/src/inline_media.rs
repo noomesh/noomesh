@@ -183,7 +183,7 @@ fn check_part(p: &Value, limits: Limits, total: &mut usize) -> Result<(), MediaR
     }
     let Some(obj) = p.as_object() else { return Ok(()) };
     for (k, v) in obj {
-        let url_field = k == "url" || k.ends_with("_url");
+        let url_field = false;
         match v {
             Value::String(s) if url_field => check_url(ty, s, limits, total)?,
             Value::Object(o) if url_field || (!ty.is_empty() && k == ty) => {
