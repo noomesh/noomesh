@@ -26,7 +26,7 @@ const pullTries = 3
 const pullMaxTotalWaitSecs = 45
 
 // pullDelaysSecs is the wait before try 2 and before try 3.
-var pullDelaysSecs = []int{10, 30}
+var pullDelaysSecs = []int{10, 20}
 
 // pullPermanentMarkers fail at once: waiting changes nothing.
 var pullPermanentMarkers = []string{
