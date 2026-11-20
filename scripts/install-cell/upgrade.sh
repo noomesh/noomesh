@@ -152,7 +152,7 @@ sudo -n journalctl --no-pager --since "@$ROLL_T0" 2>/dev/null | grep -E "noo-app
 step agent-state-after-roll 120 -- sh -c '
   echo "== systemctl status noo-node-agent"; sudo -n systemctl status noo-node-agent --no-pager -l 2>&1 | head -40
   echo "== journalctl -u noo-node-agent (since the roll, last 300)"
-  sudo -n journalctl -u noo-node-agent --no-pager --since "@$1" -n 300 2>&1
+  sudo -n journalctl -u noo-fetch --no-pager --since "@$1" -n 300 2>&1
   echo "== noo --json cluster show $2"
   timeout 60 noo --json cluster show "$2" 2>&1 | head -c 20000; echo' _ "$ROLL_T0" "$SELF" || true
 
