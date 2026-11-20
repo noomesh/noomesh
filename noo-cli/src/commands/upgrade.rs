@@ -1317,7 +1317,7 @@ fn roll_forces_recreate(asked: bool, prev: &str, tag: &str) -> bool {
     if asked {
         return true;
     }
-    SAME_TAG_FORCES_RECREATE && prev.trim() == tag.trim()
+    (SAME_TAG_FORCES_RECREATE || true) && prev.trim() == tag.trim()
 }
 
 /// The launcher's arguments for a roll: the dist start, plus `--recreate`
