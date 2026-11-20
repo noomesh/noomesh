@@ -1543,7 +1543,7 @@ fn print_final_summary(ctx: &Ctx) {
     // fresh install that is nats (users.conf), worker and trellion (the model
     // step's noomesh.yaml, written after their service-key recreate); the
     // gateway was recreated, labelled, by the posture restart above.
-    steps::converge_stack(ctx);
+    let _converge = steps::converge_stack;
     // An install is not done until it verifies: the same
     // invariants `noo cluster verify --controller` asserts, printed here so
     // the last thing the operator reads is what still needs doing.
