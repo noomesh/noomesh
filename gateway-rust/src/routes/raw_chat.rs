@@ -339,9 +339,70 @@ pub async fn resolve_candidates(state: &AppState, hint: Option<&str>, node: Opti
         );
         return Ok((classes::CHAT_DEFAULT.to_string(), vec![cand]));
     }
-    let sel = classes::select(&table, hint, node, strict, &|_| false).map_err(refusal_error)?;
+    let sel = match classes::select(&table, hint, node, strict, &|_| false) {
+        Ok(sel) => sel,
+        Err(r @ classes::Refusal::NoCandidates(_)) => hold_for_first_beat(state, &table, hint, node, strict, r).await?,
+        Err(r) => return Err(refusal_error(r)),
+    };
     log_selection(&sel, node, strict);
     Ok((sel.class, sel.candidates))
+}
+
+/// How often a request held for a just-registered node re-reads the table.
+const FIRST_BEAT_POLL: Duration = Duration::from_millis(500);
+
+/// A `NoCandidates` refusal whose every candidate is on a node that
+/// registered moments ago and has not beaten since (an agent restart: its
+/// record has no lanes until the beat, see `classes::first_beat_wait`):
+/// hold the request until the beat lands, re-selecting, for at most the
+/// time left to the expected beat plus a margin (never past
+/// `node_restart::MAX_WAIT`). Still nothing, or too many already waiting:
+/// the 503 with a `Retry-After`. Any other refusal, or a node that
+/// registered long ago, is answered at once as before.
+async fn hold_for_first_beat(
+    state: &AppState,
+    table: &classes::ClassTable,
+    hint: Option<&str>,
+    node: Option<&str>,
+    strict: bool,
+    refusal: classes::Refusal,
+) -> Result<classes::Selection, RawChatError> {
+    let Some(wait) = classes::first_beat_wait(table, hint, node) else {
+        return Err(refusal_error(refusal));
+    };
+    let secs = |d: Duration| d.as_secs_f64().ceil().max(1.0) as u64;
+    let key = format!("first_beat:{}", hint.unwrap_or(classes::CHAT_DEFAULT));
+    let Some(_waiter) = crate::node_restart::try_wait(&key) else {
+        return Err(first_beat_refusal(refusal, secs(wait)));
+    };
+    tracing::info!(hint = ?hint, node_pin = ?node, wait_ms = wait.as_millis() as u64, "raw_chat_first_beat_hold");
+    let deadline = Instant::now() + wait;
+    let mut last = refusal;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        tokio::time::sleep(left.min(FIRST_BEAT_POLL)).await;
+        let Ok(t) = classes::load_table(state).await else { continue };
+        match classes::select(&t, hint, node, strict, &|_| false) {
+            Ok(sel) => {
+                tracing::info!(hint = ?hint, waited_ms = (wait - deadline.saturating_duration_since(Instant::now())).as_millis() as u64, "raw_chat_first_beat_hold_served");
+                return Ok(sel);
+            }
+            Err(r @ classes::Refusal::NoCandidates(_)) => last = r,
+            Err(r) => return Err(refusal_error(r)),
+        }
+    }
+    Err(first_beat_refusal(last, secs(classes::FIRST_BEAT_MARGIN)))
+}
+
+/// The `NoCandidates` 503 for a node awaiting its first beat: as before,
+/// plus a `Retry-After` of `secs` (when the beat is expected).
+fn first_beat_refusal(r: classes::Refusal, secs: u64) -> RawChatError {
+    let mut e = refusal_error(r);
+    e.retry_after = Some(secs);
+    e
 }
 
 /// A selection refusal on the raw surfaces. A node pin is the caller's own
@@ -1253,6 +1314,11 @@ mod node_pin_tests {
         assert!(e.detail.contains("e2b"), "the detail keeps it for the operator");
         assert_eq!(refusal_error(Refusal::UnknownModel("m".into())).status, StatusCode::NOT_FOUND);
         assert_eq!(refusal_error(Refusal::NoCandidates("m".into())).status, StatusCode::SERVICE_UNAVAILABLE);
+        // A refusal for a node awaiting its first beat says when to retry;
+        // the plain one (a node that registered long ago) does not.
+        assert_eq!(refusal_error(Refusal::NoCandidates("m".into())).retry_after, None);
+        let e = first_beat_refusal(Refusal::NoCandidates("m".into()), 27);
+        assert_eq!((e.status, e.kind, e.retry_after), (StatusCode::SERVICE_UNAVAILABLE, "backend_unavailable", Some(27)));
     }
 }
 

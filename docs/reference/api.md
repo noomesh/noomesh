@@ -309,6 +309,14 @@ see that answer:
 | interactive (`/v1`, `/api/external`), no other candidate | the gateway waits the `Retry-After` (at most 30 s, never past your request's own deadline) and sends it again; you see a slower answer |
 | the node is still restarting after that, or too many calls already wait on it (32 per node) | `503`, code `node_restarting`, with the node's `Retry-After`: send it again after that |
 
+When the agent is back it registers again and keeps the lanes it offered
+before the restart, then reports its current ones about a second later. If a
+class is served only by nodes that have registered and not yet reported,
+the gateway waits for that report (at most 30 s) and answers. If nothing can
+serve the call after that, the answer is `503 backend_unavailable` with a
+`Retry-After`. A class with nothing to serve for any other reason is refused
+at once, with no `Retry-After`, as before.
+
 A non-streamed answer the node cut while it stopped is sent again whole by
 the gateway (nothing of it had reached you). A streamed answer still open
 when the 30 s bound passes ends early; the roll names the node and the count.

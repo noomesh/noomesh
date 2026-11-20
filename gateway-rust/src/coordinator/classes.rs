@@ -247,6 +247,12 @@ pub struct NodeFacts {
     /// field; `running` then comes from `running_backends` as before. When it
     /// is `Some`, `running` holds only the routable chat lanes.
     pub lanes: Option<Vec<Lane>>,
+    /// Seconds until this node's first heartbeat is due, while it is
+    /// awaiting one: its record was written by a registration
+    /// (`registered_at`) less than [`HEARTBEAT_INTERVAL_SECS`] ago and no
+    /// beat has landed since (`last_heartbeat` absent or older). `None`
+    /// otherwise. See [`first_beat_wait`].
+    pub first_beat_due_secs: Option<f64>,
 }
 
 /// One row of `noo_backend_placements` as the table needs it:
@@ -523,6 +529,10 @@ pub struct ClassTable {
     /// `(node, backend, model, why)`. `load_table` logs them.
     #[serde(skip)]
     pub skipped_lanes: Vec<(String, String, String, String)>,
+    /// `(node, seconds until its first beat is due)` for every node that
+    /// registered and has not beaten since ([`NodeFacts::first_beat_due_secs`]).
+    #[serde(skip)]
+    pub first_beat_due: Vec<(String, f64)>,
 }
 
 impl ClassTable {
@@ -1004,7 +1014,36 @@ pub fn build_table(nodes: &[NodeFacts], placements: &[PlacementRow], decl: &Decl
             })
         })
         .collect();
-    ClassTable { classes, aliases, all_chat, nodes: node_ids, skipped_lanes }
+    let first_beat_due = nodes.iter().filter_map(|n| Some((n.node_id.clone(), n.first_beat_due_secs?))).collect();
+    ClassTable { classes, aliases, all_chat, nodes: node_ids, skipped_lanes, first_beat_due }
+}
+
+/// Past the expected first beat, how much longer a held request waits for
+/// it (the agent beats right after registering; the beat's own round trip
+/// and the gateway's KV write land within this).
+pub const FIRST_BEAT_MARGIN: Duration = Duration::from_secs(2);
+
+/// How long a request the class table refuses (`NoCandidates`) may wait for
+/// a just-registered node's first beat, or `None` to refuse at once as
+/// before. `Some` only when the class the request resolves to (narrowed to
+/// the pinned `node`'s candidates when one is named) has candidates and
+/// EVERY one is on a node awaiting its first beat: such a refusal is the
+/// registration's gap, not a node without the model (an agent restart
+/// left the record with no lanes until the beat). A node that registered
+/// long ago, or that has beaten since, is not waited for. The wait is the
+/// longest remaining time to an expected beat plus [`FIRST_BEAT_MARGIN`],
+/// never past [`crate::node_restart::MAX_WAIT`] (the bound on waiting out
+/// one node's restart).
+pub fn first_beat_wait(table: &ClassTable, hint: Option<&str>, node: Option<&str>) -> Option<Duration> {
+    let class = resolve_hint(table, hint)?;
+    let node = node.map(str::trim).filter(|n| !n.is_empty());
+    let mut longest: Option<f64> = None;
+    for c in class.candidates.iter().filter(|c| node.is_none_or(|n| c.node_id.eq_ignore_ascii_case(n))) {
+        let due = table.first_beat_due.iter().find(|(n, _)| n == &c.node_id).map(|(_, s)| *s)?;
+        longest = Some(longest.map_or(due, |l: f64| l.max(due)));
+    }
+    let secs = longest?.max(0.0);
+    Some((Duration::from_secs_f64(secs) + FIRST_BEAT_MARGIN).min(crate::node_restart::MAX_WAIT))
 }
 
 /// `lane loading: warming` — why a lane is not routed, for logs and verify.
@@ -1622,6 +1661,7 @@ pub fn node_facts_from_kv(key: &str, data: &Value, non_chat: &[(String, String)]
         .unwrap_or(false);
     let last = data.get("last_heartbeat").or_else(|| data.get("ts")).and_then(Value::as_f64);
     let slots = slots_of(data);
+    let first_beat_due_secs = first_beat_due_secs(data, now_unix);
     NodeFacts {
         slots,
         ip: data.get("ip_address").and_then(Value::as_str).unwrap_or("").to_string(),
@@ -1666,7 +1706,18 @@ pub fn node_facts_from_kv(key: &str, data: &Value, non_chat: &[(String, String)]
         unreported,
         lanes,
         node_id,
+        first_beat_due_secs,
     }
+}
+
+/// [`NodeFacts::first_beat_due_secs`] from a `mesh_nodes` record.
+fn first_beat_due_secs(data: &Value, now_unix: f64) -> Option<f64> {
+    let registered = data.get("registered_at").and_then(Value::as_f64)?;
+    if data.get("last_heartbeat").and_then(Value::as_f64).is_some_and(|b| b >= registered) {
+        return None;
+    }
+    let age = (now_unix - registered).max(0.0);
+    (age < HEARTBEAT_INTERVAL_SECS).then(|| HEARTBEAT_INTERVAL_SECS - age)
 }
 
 /// The chat-capable inference backends a heartbeat lists with an empty (or

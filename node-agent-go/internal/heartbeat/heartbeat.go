@@ -552,8 +552,23 @@ func (r *Reporter) natsStatus() any {
 	return r.busStatus()
 }
 
-// Register sends a registration request to the controller.
+// Register sends a registration request to the controller and, when it is
+// accepted, asks for a heartbeat at once: a registration carries no lanes,
+// so the controller cannot route to this node until its first beat. The
+// kick channel is buffered, so the boot registration's kick (made before
+// Run starts) is taken by Run's first select.
 func (r *Reporter) Register(caps hardware.Capabilities, hostIP string) bool {
+	if !r.register(caps, hostIP) {
+		return false
+	}
+	r.Kick()
+	return true
+}
+
+// register is Register without the kick. A heartbeat's 404 re-registers
+// through it: a kick there would beat again at once, and a controller that
+// keeps answering the beat 404 would turn that into a tight loop.
+func (r *Reporter) register(caps hardware.Capabilities, hostIP string) bool {
 	// Remember for the heartbeat echo (see Reporter.caps).
 	r.caps = &caps
 	selfURL := agentURL(r.cfg)
@@ -753,7 +768,7 @@ func (r *Reporter) SendHeartbeat() {
 			slog.Warn("gpu probe failed while re-registering; keeping the previous GPU capability", "error", capsErr)
 		}
 		hostIP := DetectHostIP(r.cfg)
-		r.Register(caps, hostIP)
+		r.register(caps, hostIP)
 		r.noteOutcome(clk, nil)
 	case status != 200:
 		r.noteOutcome(clk, fmt.Errorf("controller answered HTTP %d", status))
