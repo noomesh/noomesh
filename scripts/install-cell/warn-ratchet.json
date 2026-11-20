@@ -14,6 +14,11 @@
    "status": "awaiting operator decision",
    "why": "i1098 row 11: the daily backup runs at 03:30, a box minutes old has had none; DECIDE whether onboard runs the first backup (i1085 item 8)"
   },
+  "host_telemetry": {
+   "label": "node:host telemetry",
+   "status": "accepted",
+   "why": "the windows-2025-wsl2 cell ONLY (release lead, 11-20): the runner image's Ubuntu has motd-news enabled (fetches from motd.ubuntu.com); the row and its remedy are right. Only that cell's ceiling lists it, so any other cell showing it fails as a new row"
+  },
   "holds": {
    "label": "node:holds",
    "status": "awaiting operator decision",
