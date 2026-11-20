@@ -108,7 +108,7 @@ THIRD_PARTY: dict[str, dict[str, str]] = {
 # helper_image.rs: the bind-mount probe, the data-dir chown, `cluster verify`'s
 # `du`). It is the nginx row, so one bump of the mirrored nginx moves the
 # stack and the helper together; tests/test_helper_image_ride.py ties them.
-HELPER_ROW = "nginx"
+HELPER_ROW = "nats"
 
 ATTEMPTS = 4
 
