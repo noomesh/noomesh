@@ -2633,7 +2633,7 @@ pub(crate) fn host_checks(id: &str, host: &Value, hostd_alive: bool) -> Vec<Chec
             out.push(ok("holds", format!("{} platform package(s) held", platform.len())));
         } else {
             out.push(warn("holds",
-                format!("platform package(s) not held — an ordinary `apt upgrade` moves them: {}", unheld.join(", ")),
+                holds_detail(&unheld),
                 Some(format!("on {id}: sudo apt-mark hold {}", unheld.join(" ")))));
         }
     }
@@ -2682,6 +2682,19 @@ pub(crate) fn host_checks(id: &str, host: &Value, hostd_alive: bool) -> Vec<Chec
         out.push(ok("tailnet control", "connected to the control plane"));
     }
     out
+}
+
+/// The `holds` row's words (i1098 row 12, agreed): Docker unpinned is the
+/// case a newcomer meets on a fresh install, and what it costs is a restart
+/// of every container, not "a package moved".
+pub(crate) fn holds_detail(unheld: &[&str]) -> String {
+    let is_docker = |p: &&str| p.starts_with("docker") || *p == "containerd.io";
+    let (docker, other): (Vec<&str>, Vec<&str>) = unheld.iter().partition(is_docker);
+    if docker.is_empty() {
+        return format!("{} not pinned: a routine `apt upgrade` can move them. Hold them when you want control.", other.join(", "));
+    }
+    let also = if other.is_empty() { String::new() } else { format!(" (also not pinned: {})", other.join(", ")) };
+    format!("Docker isn't pinned: a routine `apt upgrade` can restart every container. Hold it when you want control.{also}")
 }
 
 /// The `host telemetry` row (docs/security/telemetry.md, "Host software").
@@ -18020,6 +18033,12 @@ mod remedy_command_tests {
         let holds = c.iter().find(|c| c.name == "holds").expect("a holds row");
         assert_eq!(holds.verdict, Verdict::Warn);
         assert_eq!(holds.remedy.as_deref(), Some("on node_a: sudo apt-mark hold docker-ce tailscale"));
+        // i1098 row 12, the agreed words: what an unpinned Docker costs.
+        assert_eq!(
+            holds.detail,
+            "Docker isn't pinned: a routine `apt upgrade` can restart every container. Hold it when you want control. (also not pinned: tailscale)"
+        );
+        assert_eq!(super::holds_detail(&["tailscale"]), "tailscale not pinned: a routine `apt upgrade` can move them. Hold them when you want control.");
     }
 
     /// The at-rest rows say what is planned without an internal id.
