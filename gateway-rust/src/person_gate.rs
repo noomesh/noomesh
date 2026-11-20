@@ -17,11 +17,15 @@
 //!
 //! The gate is IN ADDITION to each route's own role, tier and last-admin
 //! guards; it narrows who may act, it never widens.
+//!
+//! There is ONE named exception, [`NODE_ENROLMENT_AGENTS`]: minting a node
+//! bootstrap token (and a bare Tailscale join key) from the operator MCP door
+//! or an in-chat agent of an Operator or Admin.
 
 use serde_json::json;
 
 use crate::audit::{AuditEvent, AuditKind, Outcome};
-use crate::auth::RequesterCtx;
+use crate::auth::{RequesterCtx, Role};
 use crate::routes::AppError;
 use crate::task_guard::Origin;
 
@@ -37,10 +41,69 @@ pub(crate) fn person_required_message(what: &str) -> String {
     )
 }
 
+/// An agent credential a route admits beside a person. Only
+/// [`NODE_ENROLMENT_AGENTS`] exists; a new one is a decision, not a convenience.
+pub(crate) struct AgentAllowance {
+    /// What the allowance is for, in the log line of an admitted call.
+    pub(crate) name: &'static str,
+    /// The least role the agent's credential must carry.
+    pub(crate) min_role: Role,
+}
+
+/// The release lead's decision of 2026-11-20 (i1096): node enrolment is the
+/// one change of "who can do what" an agent may make, because the MCP
+/// operator door (`noo_mint_bootstrap_token`, `noo_mint_join_key`) and an
+/// Operator's in-chat agent are how a machine is added, and a person still
+/// runs the enrol command on that machine. Admitted: an operator-door token
+/// (minted for an `mcp:operator` key) or a worker-delegated token, either at
+/// Operator or above. Refused like any agent: a token exchanged from a key
+/// (`/api/identity/token`), the user door, an add-on, a kiosk, no account.
+pub(crate) const NODE_ENROLMENT_AGENTS: AgentAllowance =
+    AgentAllowance { name: "node enrolment (i1096, 2026-11-20)", min_role: Role::Operator };
+
+/// The `harness` claim every MCP door token carries: `mcp-external:<consumer>`
+/// (`mcp_external::caller_claims`).
+const DOOR_HARNESS_PREFIX: &str = "mcp-external:";
+
+/// The consumer prefix the OPERATOR door mints under (`mcp_local`'s
+/// `format!("operator:{consumer}")`); the user door mints the bare consumer.
+const OPERATOR_DOOR_CONSUMER_PREFIX: &str = "operator:";
+
+/// A token the operator MCP door minted for its own self-call: harness
+/// `mcp-external:operator:<c>` and actor `key:operator:<c>`, the same `<c>`.
+/// Both claims are signed by the gateway; no client sets them.
+fn operator_door_token(r: &RequesterCtx) -> bool {
+    let (Some(harness), Some(act)) = (r.harness.as_deref(), r.act.as_ref()) else {
+        return false;
+    };
+    let Some(consumer) = harness.strip_prefix(DOOR_HARNESS_PREFIX).and_then(|c| c.strip_prefix(OPERATOR_DOOR_CONSUMER_PREFIX)) else {
+        return false;
+    };
+    let act_consumer = act.sub.strip_prefix("key:").and_then(|c| c.strip_prefix(OPERATOR_DOOR_CONSUMER_PREFIX));
+    !consumer.is_empty() && act_consumer == Some(consumer) && act.task.is_none()
+}
+
+/// A worker-delegated token (`worker_delegation::claims`): actor
+/// `svc:worker` with the run id as its task, harness `worker:<task>`.
+fn worker_delegated_token(r: &RequesterCtx) -> bool {
+    let Some(act) = r.act.as_ref() else { return false };
+    let Some(task) = act.task.as_deref().filter(|t| !t.is_empty()) else { return false };
+    act.sub == crate::worker_delegation::WORKER_ACTOR
+        && r.harness.as_deref().and_then(|h| h.strip_prefix(crate::worker_delegation::HARNESS_PREFIX)) == Some(task)
+}
+
+impl AgentAllowance {
+    /// Does this allowance admit this (agent) credential?
+    pub(crate) fn admits(&self, r: &RequesterCtx) -> bool {
+        r.role >= self.min_role && (operator_door_token(r) || worker_delegated_token(r))
+    }
+}
+
 /// The rule, pure so it can be pinned: `None` = pass.
-pub(crate) fn verdict(origin: &Origin, what: &str) -> Option<AppError> {
+pub(crate) fn verdict(origin: &Origin, r: Option<&RequesterCtx>, allowance: Option<&AgentAllowance>, what: &str) -> Option<AppError> {
     match origin {
         Origin::Person { .. } => None,
+        Origin::Agent { .. } if allowance.zip(r).is_some_and(|(a, r)| a.admits(r)) => None,
         Origin::Agent { .. } => Some(AppError::ForbiddenCode { code: PERSON_REQUIRED, msg: person_required_message(what) }),
     }
 }
@@ -49,8 +112,25 @@ pub(crate) fn verdict(origin: &Origin, what: &str) -> Option<AppError> {
 /// audited. `r` is the request's [`RequesterCtx`] (`ctx.as_deref()` for an
 /// `Option<Extension<_>>`), `what` names the action for the message and the row.
 pub(crate) async fn require_person(db: &sqlx::PgPool, r: Option<&RequesterCtx>, what: &str) -> Result<(), AppError> {
+    gate(db, r, None, what).await
+}
+
+/// [`require_person`], also admitting the agents `allowance` names.
+pub(crate) async fn require_person_or_agent(
+    db: &sqlx::PgPool,
+    r: Option<&RequesterCtx>,
+    allowance: &AgentAllowance,
+    what: &str,
+) -> Result<(), AppError> {
+    gate(db, r, Some(allowance), what).await
+}
+
+async fn gate(db: &sqlx::PgPool, r: Option<&RequesterCtx>, allowance: Option<&AgentAllowance>, what: &str) -> Result<(), AppError> {
     let origin = crate::task_guard::resolve_origin_of(db, r).await;
-    let Some(refusal) = verdict(&origin, what) else {
+    let Some(refusal) = verdict(&origin, r, allowance, what) else {
+        if let (Origin::Agent { via, .. }, Some(a)) = (&origin, allowance) {
+            tracing::info!(what, via = %via, allowance = a.name, "person_gate_agent_admitted");
+        }
         return Ok(());
     };
     let via = match &origin {
@@ -84,7 +164,7 @@ pub(crate) async fn require_person(db: &sqlx::PgPool, r: Option<&RequesterCtx>, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{Actor, Role};
+    use crate::auth::Actor;
     use crate::task_guard::origin_of_requester;
 
     fn ctx(sub: &str, role: Role, harness: Option<&str>, act: Option<&str>, task: Option<&str>) -> RequesterCtx {
@@ -135,7 +215,7 @@ mod tests {
     #[test]
     fn a_person_passes_and_every_agent_is_refused_person_required() {
         let person = ctx("owner", Role::Admin, None, None, None);
-        assert!(verdict(&origin_of_requester(Some(&person)), "x").is_none(), "a login, session or operator-cert token");
+        assert!(verdict(&origin_of_requester(Some(&person)), Some(&person), None, "x").is_none(), "a login, session or operator-cert token");
         for (who, c) in [
             ("a token exchanged from a key", identity_exchanged(Role::Admin)),
             ("an operator-door token", operator_door(Role::Admin)),
@@ -146,14 +226,14 @@ mod tests {
             ("a kiosk token", ctx("kiosk:hall", Role::User, None, None, None)),
             ("a service identity", ctx("svc:grafana", Role::Admin, None, None, None)),
         ] {
-            let v = verdict(&origin_of_requester(Some(&c)), "issuing a service key");
+            let v = verdict(&origin_of_requester(Some(&c)), Some(&c), None, "issuing a service key");
             assert!(is_person_required(&v), "{who} must be refused person_required, got {v:?}");
         }
-        let none = verdict(&origin_of_requester(None), "x");
+        let none = verdict(&origin_of_requester(None), None, None, "x");
         assert!(is_person_required(&none), "a call with no account");
         // An account that is not an enabled user (resolve_origin's demotion).
         let gone = Origin::Agent { account: "gone".into(), via: "an account that is not an enabled user".into() };
-        assert!(is_person_required(&verdict(&gone, "x")));
+        assert!(is_person_required(&verdict(&gone, Some(&person), None, "x")));
     }
 
     #[test]
@@ -166,6 +246,46 @@ mod tests {
         );
         let r = axum::response::IntoResponse::into_response(e);
         assert_eq!(r.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    /// The one allowance: operator door and worker-delegated tokens at
+    /// Operator or above. Nothing else, at any role.
+    #[test]
+    fn node_enrolment_admits_the_operator_door_and_a_worker_at_operator_only() {
+        let a = &NODE_ENROLMENT_AGENTS;
+        let pass = |c: &RequesterCtx| verdict(&origin_of_requester(Some(c)), Some(c), Some(a), "minting a node bootstrap token").is_none();
+        assert!(pass(&operator_door(Role::Admin)), "the operator door (always Admin)");
+        assert!(pass(&operator_door(Role::Operator)), "an operator-door token at Operator");
+        assert!(pass(&worker(Role::Operator)), "an Operator's in-chat agent");
+        assert!(pass(&worker(Role::Admin)), "an Admin's in-chat agent");
+        let person = ctx("owner", Role::Operator, None, None, None);
+        assert!(pass(&person), "a person passes as before");
+
+        for (who, c) in [
+            ("an identity-exchanged Admin token", identity_exchanged(Role::Admin)),
+            ("an operator-door token at User", operator_door(Role::User)),
+            ("a worker at User", worker(Role::User)),
+            ("the user door at Admin", user_door(Role::Admin)),
+            ("an add-on delegated token", ctx("owner", Role::Admin, None, Some("addon:voice"), None)),
+            ("a door harness with a mismatched actor", ctx("owner", Role::Admin, Some("mcp-external:operator:a"), Some("key:operator:b"), None)),
+            ("a worker actor without its harness", ctx("owner", Role::Admin, None, Some("svc:worker"), Some("run-1"))),
+            ("a worker harness without a task", ctx("owner", Role::Admin, Some("worker:"), Some("svc:worker"), None)),
+            ("a service identity", ctx("svc:x", Role::Admin, None, None, None)),
+        ] {
+            let v = verdict(&origin_of_requester(Some(&c)), Some(&c), Some(a), "minting a node bootstrap token");
+            assert!(is_person_required(&v), "{who} must be refused, got {v:?}");
+        }
+        assert!(is_person_required(&verdict(&origin_of_requester(None), None, Some(a), "x")), "no account");
+    }
+
+    /// What the allowance reads is what the doors really mint.
+    #[test]
+    fn the_operator_door_mints_under_the_prefix_the_allowance_reads() {
+        let local = crate::test_src::own_code(include_str!("mcp_local.rs"));
+        let at = local.find("crate::mcp_external::mint_caller_jwt(").expect("the operator door mints its self-call token");
+        let call = &local[at..at + local[at..].find(") {").expect("the mint call closes")];
+        assert!(call.contains("&format!(\"operator:{consumer}\"),"), "the operator door's consumer prefix moved: {call}");
+        assert_eq!(OPERATOR_DOOR_CONSUMER_PREFIX, "operator:");
     }
 
     /// Every route the i1096 inventory found passable by a non-person
@@ -211,6 +331,10 @@ mod tests {
         ("seats.rs", "async fn seat_revoke(", "require_person("),
         ("cluster.rs", "async fn proposals_decide(", "require_person("),
         ("bootstrap.rs", "async fn bootstrap_token_revoke(", "require_person("),
+        // The one named allowance (NODE_ENROLMENT_AGENTS): a person, or the
+        // operator door / an Operator's in-chat agent.
+        ("bootstrap.rs", "async fn bootstrap_token_create(", "require_person_or_agent("),
+        ("cluster.rs", "async fn mint_join_key(", "require_person_or_agent("),
     ];
 
     fn source(file: &str) -> &'static str {
@@ -226,7 +350,7 @@ mod tests {
 
     #[test]
     fn every_route_that_changes_who_can_do_what_calls_the_person_gate_first() {
-        assert_eq!(GATED.len(), 34, "keep the list and the count in step");
+        assert_eq!(GATED.len(), 36, "keep the list and the count in step");
         for (file, marker, call) in GATED {
             let own = crate::test_src::own_code(source(file));
             let body = crate::test_src::fn_body(&own, marker);

@@ -114,6 +114,7 @@ the binary's own usage table by `scripts/gen-cli-docs.py`.
 | [security/model-context.md](security/model-context.md) | What a model reads as instructions (operator-controlled text only) and what it reads as fenced, untrusted data (retrieved documents, memory, summaries, evolved skills, device reports) |
 | [security/telemetry.md](security/telemetry.md) | No vendor telemetry: every component noomesh runs, what it would phone home with, the switch that stops it and how to verify it; and the outbound traffic that is not telemetry |
 | [security/secrets.md](security/secrets.md) | The three configuration planes, the SOPS+age secret store, `noo security secrets audit / resync / rotate / absorb-files`, and backing up the age key |
+| [security/who-changes-access.md](security/who-changes-access.md) | Which actions only a person may take (accounts, roles, service keys, KB access, seats, node joins), the one agent allowance (minting a node bootstrap token) and the `person_required` refusal |
 
 ## Development
 
