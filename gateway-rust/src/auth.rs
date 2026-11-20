@@ -3269,7 +3269,7 @@ pub async fn controller_door(
 /// attributed, scoped, quota'd or revoked. Every consumer now holds an
 /// issued key (`noo security service-key issue <name>`).
 ///
-/// Returns 401 for everything else. Skips path prefixes in
+/// Returns the one 401 ([`unauthenticated`]) for everything else. Skips path prefixes in
 /// `PUBLIC_PATH_PREFIXES`. There is no auth-disable override: auth is
 /// always on (fail-closed), in dev and prod alike.
 ///
@@ -3349,7 +3349,7 @@ pub async fn require_any_auth(
             }
             Err(why) => {
                 tracing::info!(path = %path, "grafana_ds_refused: {why}");
-                Err(StatusCode::UNAUTHORIZED)
+                Ok(unauthenticated())
             }
         };
     }
@@ -3361,7 +3361,7 @@ pub async fn require_any_auth(
         if defers_to_ws_handler(&request) {
             return Ok(next.run(request).await);
         }
-        return Err(StatusCode::UNAUTHORIZED);
+        return Ok(unauthenticated());
     };
 
     // Cluster token v2: a fleet-secret HMAC bound to THIS request (method,
@@ -3378,7 +3378,7 @@ pub async fn require_any_auth(
                 from_v2 = true;
                 v1_shaped
             }
-            Err(status) => return Err(status),
+            Err(status) => return Ok(v2_refusal(status)),
         }
     } else {
         t
@@ -3400,7 +3400,7 @@ pub async fn require_any_auth(
             // reconnect with the same JWT. See `session_floor`.
             if crate::session_floor::refuses(&state, &claims.sub, &t).await {
                 tracing::info!(target: "security", sub = %claims.sub, "token refused: issued before the account's session floor");
-                return Err(StatusCode::UNAUTHORIZED);
+                return Ok(unauthenticated());
             }
             // i538 "View as": a token narrowed to a perspective is honoured
             // only while its row is live, this account's, and before its
@@ -3441,7 +3441,7 @@ pub async fn require_any_auth(
                 let live = live_account_role(&state.db, &claims.sub).await;
                 if !rail_token_admitted(claims.resolved_role(), live) {
                     tracing::warn!(sub = %claims.sub, node = %turn.node, live = ?live, "harness token refused: account disabled, absent or below the token's role");
-                    return Err(StatusCode::UNAUTHORIZED);
+                    return Ok(unauthenticated());
                 }
                 request.extensions_mut().insert(turn);
             }
@@ -3462,7 +3462,7 @@ pub async fn require_any_auth(
                 let live = live_account_role(&state.db, &claims.sub).await;
                 if !rail_token_admitted(claims.resolved_role(), live) {
                     tracing::warn!(sub = %claims.sub, addon, live = ?live, "add-on delegated token refused: account disabled, absent or below the token's role");
-                    return Err(StatusCode::UNAUTHORIZED);
+                    return Ok(unauthenticated());
                 }
                 // f99: a token minted under an add-on feature is held to it on
                 // every use, so turning the feature off stops the add-on
@@ -3564,7 +3564,7 @@ pub async fn require_any_auth(
                     .map(|t| t.0.clone());
                 if !cert_binding_holds(claims.cnf.as_ref(), presented.as_deref()) {
                     tracing::warn!(sub = %claims.sub, "token refused: certificate binding does not hold");
-                    return Err(StatusCode::UNAUTHORIZED);
+                    return Ok(unauthenticated());
                 }
                 // tell handlers the token was BOUND (and that
                 // the binding held — the line above refused it otherwise).
@@ -3576,7 +3576,7 @@ pub async fn require_any_auth(
             }
             if claims.act.is_some() && !delegated_subject_enabled(&state.db, &claims.sub).await {
                 tracing::warn!(subject = %claims.sub, "delegated token refused: subject disabled or absent");
-                return Err(StatusCode::UNAUTHORIZED);
+                return Ok(unauthenticated());
             }
             if crate::worker_delegation::is_worker_delegated(&claims) {
                 tracing::info!(
@@ -3766,7 +3766,7 @@ pub async fn require_any_auth(
         };
         if let Some(consumer) = found {
             if !consumer.has_scope(required) {
-                return Err(StatusCode::UNAUTHORIZED);
+                return Ok(unauthenticated());
             }
             if let Some(limit) = consumer.rpm_limit {
                 if let Some(redis) = state.redis.as_ref() {
@@ -3780,7 +3780,7 @@ pub async fn require_any_auth(
             request.extensions_mut().insert(consumer);
             return Ok(next.run(request).await);
         }
-        return Err(StatusCode::UNAUTHORIZED);
+        return Ok(unauthenticated());
     }
 
     // Direct-key doors: the key itself, as the bearer, on the exact routes a
@@ -3842,11 +3842,46 @@ pub async fn require_any_auth(
 
     // No credential class accepted the bearer. A WebSocket handshake to a
     // handler-verified route is let through so the browser gets a 4401
-    // close it can act on; everything else is the plain 401.
+    // close it can act on; everything else is the one 401 (`unauthenticated`).
     if defers_to_ws_handler(&request) {
         return Ok(next.run(request).await);
     }
-    Err(StatusCode::UNAUTHORIZED)
+    Ok(unauthenticated())
+}
+
+/// The stable `code` of the one 401 a request gets when no credential class
+/// accepted it. The CLI keys its "sign in" line on it.
+pub const UNAUTHENTICATED_CODE: &str = "unauthenticated";
+
+/// The one sentence of that 401. It names no credential class and says
+/// nothing about whether the user, key or node exists.
+pub const UNAUTHENTICATED_MESSAGE: &str = "not signed in, or the credential was not accepted: sign in with `noo auth login`; a key or token may have expired or been revoked";
+
+/// The ONE answer to a request no credential class accepted: no credential,
+/// a malformed one, an unknown or wrong key, a bad signature, an expired
+/// token, a token of a disabled, logged-out or erased account. Every such
+/// branch returns exactly this, so a prober cannot tell the cases apart by
+/// status, body bytes or headers. Never add a field that varies per case
+/// (the class tried, the subject, the reason): the reason goes to the log.
+pub fn unauthenticated() -> Response {
+    use axum::response::IntoResponse;
+    let body = axum::Json(serde_json::json!({
+        "error": UNAUTHENTICATED_MESSAGE,
+        "code": UNAUTHENTICATED_CODE,
+    }));
+    (StatusCode::UNAUTHORIZED, body).into_response()
+}
+
+/// The answer to a refused v2 cluster token: its 401 is the one 401
+/// ([`unauthenticated`]); any other status (413, an over-size signed body)
+/// stays as it is.
+fn v2_refusal(status: StatusCode) -> Response {
+    use axum::response::IntoResponse;
+    if status == StatusCode::UNAUTHORIZED {
+        unauthenticated()
+    } else {
+        status.into_response()
+    }
 }
 
 /// The answer to a v1 cluster token (always refused): a 401 whose
@@ -4951,7 +4986,7 @@ mod tests {
         assert!(branch < bearer, "the leaf check must come before the bearer");
         let arm = &body[branch..bearer];
         assert!(arm.contains("return match grafana_ds_identity(scraper.as_ref(), request.headers())"), "{arm}");
-        assert!(arm.contains("Err(StatusCode::UNAUTHORIZED)"), "{arm}");
+        assert!(arm.contains("Ok(unauthenticated())"), "{arm}");
         // The public lists never name it.
         assert!(!PUBLIC_PATH_PREFIXES.iter().any(|p| GRAFANA_DS_PREFIX.starts_with(p) || p.starts_with(GRAFANA_DS_PREFIX)));
         assert!(!PUBLIC_PATHS_EXACT.iter().any(|p| p.starts_with(GRAFANA_DS_PREFIX)));
@@ -6296,7 +6331,7 @@ mod harness_rail_tests {
         let attach = body[branch..].find("request.extensions_mut().insert(turn)").expect("attach") + branch;
         assert!(check < attach);
         assert!(body[check..attach].contains("rail_token_admitted(claims.resolved_role(), live)"));
-        assert!(body[check..attach].contains("StatusCode::UNAUTHORIZED"));
+        assert!(body[check..attach].contains("return Ok(unauthenticated());"));
     }
 
     /// An add-on delegated token is confined, must belong to an add-on that
@@ -6315,7 +6350,7 @@ mod harness_rail_tests {
         assert!(body[registry..live].contains("e.delegates_tasks() && e.operator_enabled()"));
         assert!(body[registry..live].contains("StatusCode::FORBIDDEN"));
         assert!(body[live..attach].contains("rail_token_admitted(claims.resolved_role(), live)"));
-        assert!(body[live..attach].contains("StatusCode::UNAUTHORIZED"));
+        assert!(body[live..attach].contains("return Ok(unauthenticated());"));
         // f99: the feature the token was minted under is held on every use,
         // after the live role and before the extension is attached.
         assert!(body[live..attach].contains("crate::addon_delegation::feature_still_held(has_features, feature, addon, account_of(&claims.sub), live)"));
@@ -6790,7 +6825,7 @@ mod user_read_allowlist_tests {
         let floor = body.find("crate::session_floor::refuses(&state, &claims.sub, &t)").expect("floor check");
         let first_branch = body.find("harness_turn_for(&claims, &path)").expect("harness branch");
         assert!(verify < floor && floor < first_branch, "floor must precede every other use of the claims");
-        assert!(body[floor..first_branch].contains("StatusCode::UNAUTHORIZED"));
+        assert!(body[floor..first_branch].contains("return Ok(unauthenticated());"));
     }
 }
 
@@ -6839,7 +6874,7 @@ mod v2_never_counts_as_v1_tests {
         let v2 = body.find("if crate::cluster_token_v2::is_v2(&t) {").expect("the v2 branch");
         let admit = body[v2..].find("admit_cluster_token_v2(").expect("admit") + v2;
         let arm = &body[admit..admit + 400];
-        assert!(arm.contains("from_v2 = true") && arm.contains("Err(status) => return Err(status)"),
+        assert!(arm.contains("from_v2 = true") && arm.contains("Err(status) => return Ok(v2_refusal(status))"),
             "a v2 token must be admitted (from_v2) or refused, never handed on: {arm}");
         // There is no admitted-v1 count and no gate left.
         assert!(!src.contains(&["legacy_lanes::hmac_v1", "_use("].concat()), "the admitted v1 count is deleted");
@@ -6992,7 +7027,7 @@ mod voice_direct_key_tests {
                 match direct_key_admission((*found).clone(), required) {
                     DirectKey::Admit(_) => next.run(req).await,
                     DirectKey::Forbidden(r) => r,
-                    DirectKey::NotAKey => StatusCode::UNAUTHORIZED.into_response(),
+                    DirectKey::NotAKey => unauthenticated(),
                 }
             }
         };
@@ -7024,6 +7059,82 @@ mod voice_direct_key_tests {
         let (url, reached) = serve(None).await;
         let r = reqwest::Client::new().post(&url).send().await.unwrap();
         assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(r.json::<serde_json::Value>().await.unwrap()["code"], UNAUTHENTICATED_CODE);
         assert_eq!(*reached.lock().unwrap(), 0);
+    }
+}
+
+/// The one 401: every request no credential class accepted gets the same
+/// status, body bytes and headers, so no case can be told from another.
+/// The router harness (`routes/router_harness_tests.rs`, `assert_one_401`) drives
+/// the real middleware per case on a real database; these pin the answer
+/// itself and that the middleware has no other way to say 401.
+#[cfg(test)]
+mod unauthenticated_tests {
+    use super::*;
+
+    async fn parts(r: Response) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let status = r.status();
+        let headers = r.headers().clone();
+        let bytes = axum::body::to_bytes(r.into_body(), usize::MAX).await.expect("body").to_vec();
+        (status, headers, bytes)
+    }
+
+    #[tokio::test]
+    async fn the_one_401_is_json_with_a_stable_code_and_one_plain_sentence() {
+        let (status, headers, bytes) = parts(unauthenticated()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        // The content type every other JSON error uses (axum::Json), and no
+        // other header: nothing the answer carries can vary per case.
+        assert_eq!(headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()), Some("application/json"));
+        assert_eq!(headers.len(), 1, "the one 401 carries only its content type: {headers:?}");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("the body is JSON");
+        let o = v.as_object().expect("an object");
+        let mut keys: Vec<&str> = o.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["code", "error"], "no field may name the class tried or the subject: {v}");
+        assert_eq!(v["code"], UNAUTHENTICATED_CODE);
+        assert_eq!(v["code"], "unauthenticated", "the code is a contract with the CLI");
+        let sentence = v["error"].as_str().expect("a sentence");
+        assert_eq!(sentence, UNAUTHENTICATED_MESSAGE);
+        assert!(!sentence.trim().is_empty() && !sentence.contains('\n'), "one plain sentence: {sentence:?}");
+        assert!(sentence.contains("noo auth login"), "the next step is named: {sentence:?}");
+    }
+
+    #[tokio::test]
+    async fn every_401_is_byte_identical_and_a_v2_refusal_is_the_same_401() {
+        let first = parts(unauthenticated()).await;
+        for (case, r) in [
+            ("again", unauthenticated()),
+            ("a refused v2 cluster token", v2_refusal(StatusCode::UNAUTHORIZED)),
+        ] {
+            let got = parts(r).await;
+            assert_eq!(got.0, first.0, "{case}: status");
+            assert_eq!(got.1, first.1, "{case}: headers");
+            assert_eq!(got.2, first.2, "{case}: body bytes");
+        }
+        // Not a 401: an over-size signed body keeps its own status.
+        assert_eq!(v2_refusal(StatusCode::PAYLOAD_TOO_LARGE).status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// Source guard: inside the middleware no branch builds its own 401.
+    /// Every one goes through `unauthenticated()` (or `v2_refusal`, which
+    /// maps the v2 verifier's 401 to it). A branch that returned the old
+    /// bare `StatusCode::UNAUTHORIZED` would be an empty-bodied 401 a prober
+    /// could tell apart from the rest.
+    #[test]
+    fn the_middleware_answers_401_only_through_the_one_constructor() {
+        let own = crate::test_src::own_code(include_str!("auth.rs"));
+        let body = crate::test_src::fn_body(&own, "pub async fn require_any_auth(");
+        assert!(!body.contains("UNAUTHORIZED"), "a bare 401 in require_any_auth: use unauthenticated()");
+        // grafana-ds leaf, no bearer, session floor, harness live role,
+        // add-on delegated live role, certificate binding, delegated
+        // subject, exchange-door scope, exchange-door no key, the fall-through.
+        assert_eq!(body.matches("Ok(unauthenticated())").count(), 10, "a 401 branch was added or removed: list it here");
+        assert!(body.contains("Err(status) => return Ok(v2_refusal(status)),"));
+        // The constructor names constants only: nothing per request.
+        let ctor = crate::test_src::fn_body(&own, "pub fn unauthenticated()");
+        assert!(ctor.contains("\"error\": UNAUTHENTICATED_MESSAGE,") && ctor.contains("\"code\": UNAUTHENTICATED_CODE,"));
+        assert!(!ctor.contains("format!"), "{ctor}");
     }
 }

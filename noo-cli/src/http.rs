@@ -474,6 +474,32 @@ pub(crate) fn fail_send(g: &Globals, base: &str, e: &ureq::Error, default_timeou
     }
 }
 
+/// The `code` of the gateway's one 401 (gateway `auth::unauthenticated`):
+/// no credential class accepted the request. It never says which class was
+/// tried or whether the account exists, so neither can the CLI.
+pub(crate) const UNAUTHENTICATED_CODE: &str = "unauthenticated";
+
+/// The next step printed with that 401.
+pub(crate) const SIGN_IN_STEP: &str = "noo auth login";
+
+/// The gateway's sentence when `status`/`text` is its one 401, else `None`.
+pub(crate) fn unauthenticated_sentence(status: u16, text: &str) -> Option<String> {
+    if status != 401 {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    if v["code"].as_str() != Some(UNAUTHENTICATED_CODE) {
+        return None;
+    }
+    v["error"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+/// The line a caller that returns `Err(String)` prints for the one 401: the
+/// gateway's sentence and the next step, never a raw `HTTP 401:` prefix.
+pub(crate) fn unauthenticated_line(status: u16, text: &str) -> Option<String> {
+    unauthenticated_sentence(status, text).map(|s| format!("{s} (next: {SIGN_IN_STEP})"))
+}
+
 /// Uniform 401/403 exit (code 4), naming the credential the CLI actually
 /// sent and what to do about it. The CLI resolves --token → $NOO_TOKEN →
 /// the stored credential → nothing, and a rejection that doesn't say WHICH
@@ -483,12 +509,15 @@ pub(crate) fn fail_send(g: &Globals, base: &str, e: &ureq::Error, default_timeou
 /// "revoked", "expired 3 days ago" and "your account was disabled" are three
 /// different problems with three different fixes, and a bare 401 is none of
 /// them.
-fn auth_failed(g: &Globals, status: u16, path: &str) -> ! {
+///
+/// When the body is the gateway's one 401 (`code: "unauthenticated"`), its
+/// sentence leads the line instead of a status number.
+fn auth_failed(g: &Globals, status: u16, path: &str, body: Option<&str>) -> ! {
     let src = crate::auth::source(g);
-    let mut msg = format!(
-        "gateway rejected credentials ({status}) for {path} — sent {}",
-        src.describe()
-    );
+    let mut msg = match body.and_then(|b| unauthenticated_sentence(status, b)) {
+        Some(sentence) => format!("{sentence} ({path}; sent {})", src.describe()),
+        None => format!("gateway rejected credentials ({status}) for {path} — sent {}", src.describe()),
+    };
     if let Some(why) = crate::auth::refresh_failure() {
         msg.push_str(&format!("; the automatic refresh also failed: {why}"));
     }
@@ -779,9 +808,12 @@ pub fn get_json_try(
         return serde_json::from_str(&text)
             .map_err(|_| format!("gateway returned non-JSON body from {path}"));
     }
-    let detail = serde_json::from_str::<serde_json::Value>(&text)
-        .ok()
-        .and_then(|v| v["detail"].as_str().map(str::to_string))
+    let detail = unauthenticated_line(status, &text)
+        .or_else(|| {
+            serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| v["detail"].as_str().map(str::to_string))
+        })
         .unwrap_or_else(|| format!("HTTP {status}: {text}"));
     Err(detail)
 }
@@ -946,9 +978,12 @@ impl TryFail {
     /// body carries one, else `HTTP <status>: <body>` (the line
     /// `post_json_try` has always returned).
     pub fn from_status(status: u16, text: &str) -> Self {
-        let line = serde_json::from_str::<serde_json::Value>(text)
-            .ok()
-            .and_then(|v| v["detail"].as_str().map(str::to_string))
+        let line = unauthenticated_line(status, text)
+            .or_else(|| {
+                serde_json::from_str::<serde_json::Value>(text)
+                    .ok()
+                    .and_then(|v| v["detail"].as_str().map(str::to_string))
+            })
             .unwrap_or_else(|| format!("HTTP {status}: {text}"));
         TryFail { status: Some(status), line, body: text.to_string() }
     }
@@ -1016,9 +1051,12 @@ pub fn put_json_try(
         return serde_json::from_str(&text)
             .map_err(|_| format!("gateway returned non-JSON body from {path}"));
     }
-    let detail = serde_json::from_str::<serde_json::Value>(&text)
-        .ok()
-        .and_then(|v| v["detail"].as_str().map(str::to_string))
+    let detail = unauthenticated_line(status, &text)
+        .or_else(|| {
+            serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| v["detail"].as_str().map(str::to_string))
+        })
         .unwrap_or_else(|| format!("HTTP {status}: {text}"));
     Err(detail)
 }
@@ -1111,7 +1149,7 @@ pub fn delete_json_try(
         return serde_json::from_str(&text)
             .or_else(|_| Ok(serde_json::json!({"status": "ok"})));
     }
-    Err(format!("HTTP {status}: {text}"))
+    Err(unauthenticated_line(status, &text).unwrap_or_else(|| format!("HTTP {status}: {text}")))
 }
 
 /// DELETE `path` (no body); returns the parsed JSON response.
@@ -1175,7 +1213,7 @@ pub fn post_bytes(
                 None,
             )
         }),
-        401 | 403 => auth_failed(g, status, path),
+        401 | 403 => auth_failed(g, status, path, Some(&text)),
         _ => fail(
             g.json,
             ExitCode::RemoteError,
@@ -1250,7 +1288,10 @@ pub fn post_json_binary(
             }
             BinaryResponse { bytes, content_type, tts_backend }
         }
-        401 | 403 => auth_failed(g, status, path),
+        401 | 403 => {
+            let text = resp.body_mut().read_to_string().unwrap_or_default();
+            auth_failed(g, status, path, Some(&text))
+        }
         _ => {
             let text = resp.body_mut().read_to_string().unwrap_or_default();
             fail(
@@ -1360,7 +1401,7 @@ pub fn request_status(
                 None,
             )
         })),
-        401 | 403 => auth_failed(g, status, path),
+        401 | 403 => auth_failed(g, status, path, Some(&text)),
         _ => Err((status, text)),
     }
 }
@@ -1522,6 +1563,9 @@ pub(crate) fn post_raw(
 
 /// The gateway's `detail` (or the raw text) from an error body.
 pub(crate) fn detail_of(status: u16, text: &str) -> String {
+    if let Some(line) = unauthenticated_line(status, text) {
+        return line;
+    }
     serde_json::from_str::<serde_json::Value>(text)
         .ok()
         .and_then(|v| v["detail"].as_str().or_else(|| v["error"].as_str()).map(str::to_string))
@@ -2276,5 +2320,44 @@ mod gateway_answer_wait_tests {
     fn a_gateway_that_never_answers_times_out_after_the_budget() {
         // 60 s budget at 2 s per poll: asks at t=0,2,...,60.
         assert_eq!(run(u32::MAX, 60), (false, 31));
+    }
+}
+
+/// The gateway's one 401 (`code: "unauthenticated"`) is printed as its
+/// sentence plus the next step, never as `HTTP 401: <body>`.
+#[cfg(test)]
+mod unauthenticated_tests {
+    use super::*;
+
+    const SENTENCE: &str = "not signed in, or the credential was not accepted: sign in with `noo auth login`; a key or token may have expired or been revoked";
+
+    fn body() -> String {
+        serde_json::json!({"error": SENTENCE, "code": "unauthenticated"}).to_string()
+    }
+
+    #[test]
+    fn every_err_string_path_prints_the_sentence_and_the_next_step() {
+        let b = body();
+        for (name, line) in [
+            ("unauthenticated_line", unauthenticated_line(401, &b).expect("recognised")),
+            ("detail_of", detail_of(401, &b)),
+            ("TryFail::from_status", TryFail::from_status(401, &b).line),
+        ] {
+            assert!(line.contains(SENTENCE), "{name}: {line}");
+            assert!(line.contains("next: noo auth login"), "{name}: {line}");
+            assert!(!line.contains("HTTP 401"), "{name}: {line}");
+        }
+    }
+
+    #[test]
+    fn only_the_gateways_one_401_is_recognised() {
+        assert_eq!(unauthenticated_sentence(401, &body()).as_deref(), Some(SENTENCE));
+        // Another status, another code, an empty sentence or no JSON: not it.
+        assert_eq!(unauthenticated_sentence(403, &body()), None);
+        assert_eq!(unauthenticated_sentence(401, r#"{"error":"x","code":"cluster_token_v1_refused"}"#), None);
+        assert_eq!(unauthenticated_sentence(401, r#"{"error":"  ","code":"unauthenticated"}"#), None);
+        assert_eq!(unauthenticated_sentence(401, ""), None);
+        // An old gateway's empty 401 keeps the old line.
+        assert_eq!(detail_of(401, ""), "HTTP 401: ");
     }
 }

@@ -103,6 +103,35 @@ full spec) readable by anything that could reach the gateway; that hole is
 closed. See the security model
 for more on this posture.
 
+### The 401 answer
+
+A request no credential class accepts gets one answer, the same in every
+case: no credential, a malformed one, an unknown or wrong key, a bad
+signature, an expired token, a token under the account's session floor, and
+a token of a disabled or erased account. Same status, same body bytes, same
+headers:
+
+```
+HTTP/1.1 401 Unauthorized
+content-type: application/json
+
+{"code":"unauthenticated","error":"not signed in, or the credential was not accepted: sign in with `noo auth login`; a key or token may have expired or been revoked"}
+```
+
+Key on `code`; the sentence may change. It never names the credential class
+that was tried or says whether the user, key or node exists (the gateway log
+does). `GET /auth/me` answers the same 401. The CLI prints the sentence and
+the next step (`noo auth login`), not `HTTP 401:`.
+
+Some 401s still name their cause, because only a caller holding a real
+credential can reach them: a v1 cluster token (`cluster_token_v1_refused`,
+needs the fleet secret), an ended "View as" perspective (`perspective_ended`),
+and the add-on socket, UI and ticket routes behind a signed-in session.
+`POST /auth/token` keeps its own `Incorrect username or password`, the same
+for an unknown user, a wrong password and a disabled account. The MCP doors
+(`/mcp/user`, `/mcp/operator`) authenticate their own key and answer in their
+own words. A `/ws/*` socket closes with 4401.
+
 ### `POST /auth/token`
 
 Form (`application/x-www-form-urlencoded`) or JSON body with `username`
@@ -120,8 +149,9 @@ curl -s --cacert "${NOO_PKI_DIR:-$HOME/.config/mesh/pki}/ca.crt" -X POST https:/
 A refresh token is set as a cookie; `POST /auth/refresh` (alias
 `/api/auth/refresh`) rotates it, `POST /auth/logout` revokes it (a bearer-only
 logout, as the CLI makes, counts too) and ends the access token it was using,
-`GET /auth/me` returns the caller's identity and scopes (`401` for a disabled
-or deleted account, or a token issued before the account's session floor).
+`GET /auth/me` returns the caller's identity and scopes (the one
+[401](#the-401-answer) for a disabled or deleted account, or a token issued
+before the account's session floor).
 
 **Browser origin.** `POST /auth/token`, `/auth/refresh` and `/auth/logout`
 (and their `/api/auth/…` aliases) answer a browser only from the console's own
