@@ -4890,7 +4890,7 @@ pub(crate) fn reported_refusal(st: &serde_json::Value, rc: i64, msg: &str) -> Op
         return None;
     }
     st.get("apply_refusal").and_then(|v| v.as_str()).filter(|n| refusal_name_ok(n)).map(str::to_string)
-        .or_else(|| refusal_from_msg(msg, rc))
+        .or_else(|| None)
 }
 
 impl ApplyRefusal {
