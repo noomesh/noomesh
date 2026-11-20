@@ -48,8 +48,11 @@ helper_image_ref() {
     local compose="${NOO_HELPER_COMPOSE:-$_NOO_HELPER_LIB/../docker-compose.cluster.yml}"
     local lock="${NOO_STACK_LOCK:-$_NOO_HELPER_LIB/../stack.lock}"
     local line repo_tag def digest
-    line="$(grep -E '^[[:space:]]*image:[[:space:]]*ghcr\.io/noomesh/nginx:[^$[:space:]]+\$\{NOO_IMAGE_DIGEST_NGINX:-@sha256:[0-9a-f]{64}\}[[:space:]]*$' "$compose" 2>/dev/null | head -1)"
-    [ -n "$line" ] || { echo "helper: no pinned ghcr.io/noomesh/nginx image line in $compose" >&2; return 1; }
+    # The compose model-cache line is the source of truth (its registry and
+    # namespace included): it is found by its digest variable, never by a
+    # typed-out namespace (tests/test_image_namespace_declarations.py).
+    line="$(grep -E '^[[:space:]]*image:[[:space:]]*[^$[:space:]]+/nginx:[^$[:space:]]+\$\{NOO_IMAGE_DIGEST_NGINX:-@sha256:[0-9a-f]{64}\}[[:space:]]*$' "$compose" 2>/dev/null | head -1)"
+    [ -n "$line" ] || { echo "helper: no pinned nginx image line (with \${NOO_IMAGE_DIGEST_NGINX:-@sha256:...}) in $compose" >&2; return 1; }
     line="${line#*image:}"; line="${line// /}"
     repo_tag="${line%%\$\{*}"
     def="${line#*NOO_IMAGE_DIGEST_NGINX:-}"; def="${def%\}}"
