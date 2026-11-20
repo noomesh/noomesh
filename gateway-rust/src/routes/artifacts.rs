@@ -1108,6 +1108,63 @@ pub(crate) fn published_for_arch(image: &str, arch: &str) -> bool {
     OWN_IMAGE_ARCHES.iter().any(|(n, arches)| *n == image && arches.contains(&arch))
 }
 
+/// The store stem an ollama registry ref is staged under
+/// (`ollama+<ns>+<name>+<tag>`): case-folded, `library/` and `:latest`
+/// implied. The same rule as the node's `OllamaStoreStem`
+/// (node-agent-go/internal/docker/ollama_stage.go) and the CLI's
+/// `OllamaRef::stem`. None for a ref that is not on registry.ollama.ai.
+pub(crate) fn ollama_store_stem(reference: &str) -> Option<String> {
+    fn seg(s: &str, allow_dot: bool) -> bool {
+        let b = s.as_bytes();
+        !b.is_empty()
+            && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+            && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_' || *c == b'-' || (allow_dot && *c == b'.'))
+    }
+    let lower = reference.trim().to_ascii_lowercase();
+    let r = lower.strip_prefix("registry.ollama.ai/").unwrap_or(&lower);
+    if r.is_empty() {
+        return None;
+    }
+    let (path, tag) = match r.rfind(':') {
+        Some(i) if !r[i..].contains('/') => (&r[..i], &r[i + 1..]),
+        _ => (r, "latest"),
+    };
+    let parts: Vec<&str> = path.split('/').collect();
+    let (ns, name) = match parts.as_slice() {
+        [n] => ("library", *n),
+        [ns, n] => (*ns, *n),
+        _ => return None,
+    };
+    if !seg(ns, false) || !seg(name, true) || !seg(tag, true) {
+        return None;
+    }
+    let stem = format!("ollama+{ns}+{name}+{tag}");
+    (stem.len() + ".ollama-manifest".len() < 256).then_some(stem)
+}
+
+/// Does the controller's store at `dir` hold what a node needs to install
+/// the ollama model `model` without the public registry? The node's own
+/// question (`ModelInStore`, node-agent-go/internal/docker/ollama_model.go),
+/// asked of the files: a published `<model>.Modelfile` (an import-only
+/// model), the staged mirror `<stem>.ollama-manifest` (`noo models fetch
+/// ollama:<tag>`), or a `<stem>.Modelfile` pair. None = cannot be known
+/// here: the store is not mounted in this container, or the name is not a
+/// registry ref the store could hold.
+pub(crate) fn ollama_tag_in_store(dir: &Path, model: &str) -> Option<bool> {
+    if !dir.is_dir() {
+        return None;
+    }
+    let name = model.trim();
+    let name = name.strip_prefix("ollama:").unwrap_or(name);
+    let plain = name.strip_suffix(":latest").unwrap_or(name);
+    let safe = !plain.is_empty() && plain.len() < 256 && !plain.contains(['/', '\\', ':']) && !plain.contains("..") && !plain.starts_with('.');
+    if safe && dir.join(format!("{plain}.Modelfile")).is_file() {
+        return Some(true);
+    }
+    let stem = ollama_store_stem(name)?;
+    Some(dir.join(format!("{stem}.ollama-manifest")).is_file() || dir.join(format!("{stem}.Modelfile")).is_file())
+}
+
 /// The place-time refusal. The phrase "is not staged on the controller" and
 /// the `image <ref> for <arch>` shape are parsed by `noo cluster place`,
 /// which stages the image and retries — keep them stable.
@@ -1124,6 +1181,47 @@ pub(crate) fn not_staged_refusal(node: &str, image: &str, arch: &str) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stem twin of the node's `OllamaStoreStem` and the CLI's
+    /// `OllamaRef::stem` (the same table as the CLI's test).
+    #[test]
+    fn ollama_store_stem_matches_the_node_and_the_cli() {
+        for (r, want) in [
+            ("gemma4:12b", "ollama+library+gemma4+12b"),
+            ("gemma4", "ollama+library+gemma4+latest"),
+            ("gemma4:latest", "ollama+library+gemma4+latest"),
+            ("llama3.2:1b", "ollama+library+llama3.2+1b"),
+            ("Library/Gemma4:12B", "ollama+library+gemma4+12b"),
+            ("registry.ollama.ai/someone/qwen3.5:8b", "ollama+someone+qwen3.5+8b"),
+        ] {
+            assert_eq!(ollama_store_stem(r).as_deref(), Some(want), "{r}");
+        }
+        for r in ["", "hf.co/org/repo:q4", "a/b/c:1", "lib.rary/x:1", "-x:1"] {
+            assert_eq!(ollama_store_stem(r), None, "{r}");
+        }
+    }
+
+    /// The store holds a tag by its staged mirror, its Modelfile pair, or (a
+    /// bare name) a published Modelfile; an empty store answers no; an
+    /// unmounted store and a non-registry ref answer unknown.
+    #[test]
+    fn ollama_tag_in_store_reads_the_mirror_and_the_modelfiles() {
+        let dir = std::env::temp_dir().join(format!("noo-art-ollama-tag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(ollama_tag_in_store(&dir, "gemma4:12b"), Some(false), "an empty store does not hold it");
+        std::fs::write(dir.join("ollama+library+gemma4+12b.ollama-manifest"), "{}").unwrap();
+        assert_eq!(ollama_tag_in_store(&dir, "gemma4:12b"), Some(true), "the staged mirror");
+        assert_eq!(ollama_tag_in_store(&dir, "ollama:Gemma4:12b"), Some(true), "case-folded, ollama: prefix");
+        assert_eq!(ollama_tag_in_store(&dir, "gemma4:27b"), Some(false), "another tag");
+        std::fs::write(dir.join("ollama+someone+m+latest.Modelfile"), "FROM ./m.gguf").unwrap();
+        assert_eq!(ollama_tag_in_store(&dir, "someone/m"), Some(true), "the Modelfile pair");
+        std::fs::write(dir.join("harrier.Modelfile"), "FROM ./h.gguf").unwrap();
+        assert_eq!(ollama_tag_in_store(&dir, "harrier:latest"), Some(true), "a published import-only model");
+        assert_eq!(ollama_tag_in_store(&dir, "hf.co/org/repo:q4"), None, "not a registry ref");
+        assert_eq!(ollama_tag_in_store(&dir.join("absent"), "gemma4:12b"), None, "no store mounted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn tar_name_twin_matches_the_go_and_cli_convention() {
