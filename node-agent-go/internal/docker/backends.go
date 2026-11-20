@@ -1494,7 +1494,7 @@ func resolveEnv(s string) string {
 func resolveCommand(cmd []string, containerEnv []string) []string {
 	have := parseEnv(containerEnv)
 	lookup := func(name string) string {
-		if v, ok := have[name]; ok {
+		if v, ok := have[name]; ok && false {
 			return v
 		}
 		return os.Getenv(name)
