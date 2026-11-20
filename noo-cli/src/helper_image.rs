@@ -79,7 +79,10 @@ pub(crate) enum Job<'a> {
 fn compose_ref(compose: &str) -> Option<(String, String)> {
     let line = compose.lines().find(|l| {
         let t = l.trim_start();
-        t.starts_with("image: ghcr.io/noomesh/nginx:") && t.contains("${NOO_IMAGE_DIGEST_NGINX:-")
+        t.strip_prefix("image: ")
+            .and_then(|i| i.strip_prefix(crate::registry::IMAGE_NAMESPACE))
+            .is_some_and(|rest| rest.starts_with("/nginx:"))
+            && t.contains("${NOO_IMAGE_DIGEST_NGINX:-")
     })?;
     let img = line.trim_start().strip_prefix("image:")?.trim();
     let (repo_tag, rest) = img.split_once("${NOO_IMAGE_DIGEST_NGINX:-")?;
@@ -94,7 +97,7 @@ fn compose_ref(compose: &str) -> Option<(String, String)> {
 /// compose default is the digest a lock-less (dev) host runs the stack on.
 pub(crate) fn helper_ref_from(compose: &str, lock: Option<&str>) -> Result<String, String> {
     let (repo_tag, default_digest) = compose_ref(compose)
-        .ok_or_else(|| "the compose file's model-cache image line is not a pinned ghcr.io/noomesh/nginx reference".to_string())?;
+        .ok_or_else(|| format!("the compose file's model-cache image line is not a pinned {}/nginx reference", crate::registry::IMAGE_NAMESPACE))?;
     let digest = lock
         .and_then(|l| crate::commands::image_stage::parse_lock(l).into_iter().find(|r| r.name == HELPER_LOCK_ROW))
         .map(|r| format!("@{}", r.digest))
