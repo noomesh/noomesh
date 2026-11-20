@@ -869,7 +869,10 @@ drain_started, drained_at}`, plus `workload` for a reservation and
   streams carried by the tunnel and by HTTPS. It is a warning reading
   `NOT CHECKED` (never ok) for a node that does not advertise a tunnel, which
   keeps taking streaming calls over HTTPS :8081; a node that advertises one
-  while the gateway holds none, or gets no answer, FAILS. See
+  while the gateway holds none, or gets no answer, FAILS (not inside the
+  first 75 s after a gateway start: the node is still redialing). `noo onboard`'s
+  closing verify first waits up to 15 s for its own node's tunnel to report in;
+  `noo cluster verify` itself never waits. See
   [The node-held tunnel](../security/node-agent.md#the-node-held-tunnel).
 - `noo cluster verify host3` has a `gpu` row: `+ free`, or
   `! yielded: vllm paused (foreign 11.2 GB, memory-accounting)`. Yielded and

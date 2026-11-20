@@ -95,3 +95,38 @@ func TestHeartbeat404ReRegisterDoesNotKick(t *testing.T) {
 		t.Fatalf("pending kicks after a 404 re-register = %d, want 0", got)
 	}
 }
+
+// A kicked beat comes no sooner than kickFloor after the previous beat: a
+// flapping tunnel must not become a beat storm.
+func TestKickedBeatWaitsForTheFloorAfterThePreviousBeat(t *testing.T) {
+	old := kickFloor
+	kickFloor = 400 * time.Millisecond
+	t.Cleanup(func() { kickFloor = old })
+	srv, cap := captureServer(t)
+	cfg := &config.Config{NodeID: "n1", Tier: 2, ControllerURL: srv.URL, HeartbeatInterval: 3600}
+	r := NewReporter(cfg, &http.Client{Timeout: 5 * time.Second}, metrics.NewCollector(hardware.NewGPUDetector()),
+		&scriptedGPU{}, func() (map[string]string, error) { return map[string]string{}, nil }, func() int { return 0 })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go r.Run(ctx)
+	beats := func() int { cap.mu.Lock(); defer cap.mu.Unlock(); return len(cap.beats) }
+	r.Kick()
+	for deadline := time.Now().Add(5 * time.Second); beats() < 1 && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if beats() < 1 {
+		t.Fatal("the first kick sent no beat")
+	}
+	first := time.Now()
+	r.Kick()
+	time.Sleep(150 * time.Millisecond)
+	if beats() != 1 {
+		t.Fatalf("a second kick beat inside the floor (beats=%d)", beats())
+	}
+	for deadline := time.Now().Add(5 * time.Second); beats() < 2 && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if beats() != 2 || time.Since(first) < 300*time.Millisecond {
+		t.Fatalf("second beat missing or too early: beats=%d after %v", beats(), time.Since(first))
+	}
+}
