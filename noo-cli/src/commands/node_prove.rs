@@ -227,11 +227,11 @@ mod tests {
     }
 
     /// A cluster CA in a scratch dir, with `node` issued for 127.0.0.1.
-    fn cluster(tag: &str, node: &str) -> ((), ClusterCa) {
+    fn cluster(tag: &str, node: &str) -> ClusterCa {
         let ca = ClusterCa::new(scratch(tag));
         ca.generate_ca("Mesh Cluster CA", 30).expect("ca");
         ca.issue_node_cert(node, "127.0.0.1", 30, &["node-agent".to_string()], &[], &NodeRole::Worker).expect("leaf");
-        ((), ca)
+        ca
     }
 
     fn read(p: std::path::PathBuf) -> Vec<u8> {
@@ -277,7 +277,7 @@ mod tests {
 
     #[test]
     fn the_node_holding_its_own_key_proves_it_even_when_it_demands_a_client_cert() {
-        let (_d, ca) = cluster("a", "node_a");
+        let ca = cluster("a", "node_a");
         let crt = read(ca.dir.join("nodes/node_a/node.crt"));
         let port = serve_once(crt.clone(), read(ca.dir.join("nodes/node_a/node.key")), Some(read(ca.ca_cert_path())));
         prove_node_at(&read(ca.ca_cert_path()), &crt, "127.0.0.1", port, T).expect("proven");
@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn another_node_answering_at_the_address_does_not_prove_this_one() {
-        let (_d, ca) = cluster("a", "node_a");
+        let ca = cluster("a", "node_a");
         ca.issue_node_cert("node_b", "127.0.0.1", 30, &["node-agent".to_string()], &[], &NodeRole::Worker).unwrap();
         // node_b answers; the pin is node_a's leaf.
         let port = serve_once(read(ca.dir.join("nodes/node_b/node.crt")), read(ca.dir.join("nodes/node_b/node.key")), None);
@@ -296,8 +296,8 @@ mod tests {
 
     #[test]
     fn a_leaf_from_another_ca_does_not_chain_and_does_not_prove() {
-        let (_d, ca) = cluster("a", "node_a");
-        let (_r, rogue) = cluster("rogue", "node_a");
+        let ca = cluster("a", "node_a");
+        let rogue = cluster("rogue", "node_a");
         let port = serve_once(read(rogue.dir.join("nodes/node_a/node.crt")), read(rogue.dir.join("nodes/node_a/node.key")), None);
         let e = prove_node_at(&read(ca.ca_cert_path()), &read(ca.dir.join("nodes/node_a/node.crt")), "127.0.0.1", port, T)
             .unwrap_err();
@@ -307,7 +307,7 @@ mod tests {
     #[test]
     fn the_same_key_under_a_rogue_ca_still_does_not_chain() {
         // A stolen key re-certified by another CA: SPKI-equal, wrong chain.
-        let (_d, ca) = cluster("a", "node_a");
+        let ca = cluster("a", "node_a");
         let rogue = ClusterCa::new(scratch("r"));
         rogue.generate_ca("Mesh Cluster CA", 30).unwrap();
         let key_pem = String::from_utf8(read(ca.dir.join("nodes/node_a/node.key"))).unwrap();
@@ -367,7 +367,7 @@ mod tests {
 
     #[test]
     fn the_nodes_certificate_without_its_key_does_not_prove() {
-        let (_d, ca) = cluster("a", "node_a");
+        let ca = cluster("a", "node_a");
         ca.issue_node_cert("node_b", "127.0.0.1", 30, &["node-agent".to_string()], &[], &NodeRole::Worker).unwrap();
         // node_a's public certificate, but the handshake signed with node_b's key.
         let crt = read(ca.dir.join("nodes/node_a/node.crt"));
@@ -378,7 +378,7 @@ mod tests {
 
     #[test]
     fn nothing_listening_is_no_proof() {
-        let (_d, ca) = cluster("a", "node_a");
+        let ca = cluster("a", "node_a");
         let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port(); // dropped: closed
         let e = prove_node_at(&read(ca.ca_cert_path()), &read(ca.dir.join("nodes/node_a/node.crt")), "127.0.0.1", port, T)
             .unwrap_err();

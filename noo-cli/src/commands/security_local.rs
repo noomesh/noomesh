@@ -3454,13 +3454,22 @@ pub fn pki_issue_node(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
 }
 
-pub(crate) fn parse_push_nodes_with(a: &mut Args) -> Result<(Option<String>, i64, bool, Vec<String>, bool), ArgError> {
+/// `push-nodes`' arguments.
+pub(crate) struct PushNodesArgs {
+    pub only: Option<String>,
+    pub days: i64,
+    pub yes: bool,
+    pub allow: Vec<String>,
+    pub prove: bool,
+}
+
+pub(crate) fn parse_push_nodes_with(a: &mut Args) -> Result<PushNodesArgs, ArgError> {
     let days = positive_days(a, &["--days"], crate::pki::DEFAULT_DAYS)?;
     let yes = a.flag(&["--yes", "--force", "-y"]);
     let allow = a.values(&["--allow-shared-address"])?;
     let prove = a.flag(&["--prove"]);
     let only = a.maybe_one("<node>")?;
-    Ok((only, days, yes, allow, prove))
+    Ok(PushNodesArgs { only, days, yes, allow, prove })
 }
 
 /// The address and port `--prove` dials: the host and port of the node's
@@ -3666,7 +3675,7 @@ pub(crate) fn local_leaf_ips(node: &str) -> Vec<String> {
 /// node-agent (host unit or container, whichever the node runs) — nothing
 /// here reaches into the node to restart anything.
 pub fn pki_push_nodes(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let (only, days, yes, allow, prove) = parse_push_nodes_with(&mut Args::new(args))?;
+    let PushNodesArgs { only, days, yes, allow, prove } = parse_push_nodes_with(&mut Args::new(args))?;
     if prove {
         let Some(node) = only.as_deref() else {
             crate::output::fail(g.json, crate::output::ExitCode::Usage, "usage", "--prove takes exactly one node: noo security pki push-nodes <node> --prove", None);
@@ -6801,7 +6810,7 @@ mod address_claim_tests {
     #[test]
     fn prove_parses_and_stands_alone() {
         let a: Vec<String> = ["node-b", "--prove"].iter().map(|s| s.to_string()).collect();
-        let (only, _, _, allow, prove) = parse_push_nodes_with(&mut Args::new(&a)).unwrap();
+        let PushNodesArgs { only, allow, prove, .. } = parse_push_nodes_with(&mut Args::new(&a)).unwrap();
         assert_eq!((only.as_deref(), allow.is_empty(), prove), (Some("node-b"), true, true));
         let code = include_str!("security_local.rs");
         let body = crate::test_src::fn_body(code, "pub fn pki_push_nodes(");
@@ -6811,7 +6820,7 @@ mod address_claim_tests {
     #[test]
     fn push_nodes_takes_the_shared_address_flag() {
         let args: Vec<String> = ["node-b", "--allow-shared-address", "192.0.2.30"].iter().map(|s| s.to_string()).collect();
-        let (only, _, _, allow, _) = parse_push_nodes_with(&mut Args::new(&args)).expect("parses");
+        let PushNodesArgs { only, allow, .. } = parse_push_nodes_with(&mut Args::new(&args)).expect("parses");
         assert_eq!(only.as_deref(), Some("node-b"));
         assert_eq!(allow, vec!["192.0.2.30".to_string()]);
     }
