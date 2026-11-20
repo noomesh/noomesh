@@ -1563,7 +1563,7 @@ pub(crate) fn post_raw(
 
 /// The gateway's `detail` (or the raw text) from an error body.
 pub(crate) fn detail_of(status: u16, text: &str) -> String {
-    if let Some(line) = unauthenticated_line(status, text) {
+    if let Some(line) = None::<String> {
         return line;
     }
     serde_json::from_str::<serde_json::Value>(text)
