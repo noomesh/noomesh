@@ -161,10 +161,16 @@ node, the controller), and say what will go before you run it.
 - **The order:** the other nodes first (`noo cluster teardown-node <node>`
   or `--all`, from the controller while its stack runs), the controller
   last (`noo offboard`). The reverse strands the nodes.
-- **Flags that widen it, each only on the person's word:** `-y` answers
-  every step yes; `--purge-secrets` deletes the age key and the CLI's
-  login; `--factory` also deletes a node's data root and its Tailscale
-  package; `--uninstall` removes the `noo` binary.
+- **Flags that widen it, each only on the person's word:**
+  - both commands: `-y` answers every step yes;
+  - `noo offboard`: `--purge-secrets` deletes the age key and the CLI's
+    login; `--uninstall` removes the `noo` binary;
+  - `noo cluster teardown-node`: `--purge-data` deletes the node's data root
+    (models and caches); `--purge-tailscale` removes its Tailscale package,
+    only if noomesh installed it (a pre-existing one is kept); `--factory`
+    is both.
+- **Hardware that is gone for good** cannot collect a teardown order:
+  `noo cluster forget <node>` drops it from the registry instead.
 - **Done means:** each node printed `<node>: teardown verified`, and
   `noo offboard --check` exits 0. A tailnet line that says `NOT removed`
   is the person's to finish in the Tailscale admin console.
