@@ -2874,15 +2874,21 @@ pub(crate) fn log_shipper_check(id: &str, ls: &Value, now_unix: i64, hb_recent: 
         };
     }
     let last_error = ls["last_error"].as_str().unwrap_or("").trim().to_string();
+    // The controller runs no Loki by choice (`cluster.monitoring: lean`): its
+    // gateway refuses every batch with reason `loki_off`. Not a stall. Judged
+    // BEFORE `enabled`: on that refusal the agent pauses itself
+    // (`enabled=false`, logship), and a paused shipper is the by-choice
+    // state, not one to hand-edit the agent's env for. The paused agent also
+    // reports the reason as its own `reason` field.
+    if off_by_choice::gateway_reason(&last_error) == Some(off_by_choice::LOKI_OFF_REASON)
+        || ls["reason"].as_str() == Some(off_by_choice::LOKI_OFF_REASON)
+    {
+        return ok("log shipper", off_by_choice::SHIPPER_DETAIL);
+    }
     if ls["enabled"].as_bool() != Some(true) {
         let why = if last_error.is_empty() { "no reason reported".to_string() } else { last_error };
         return warn("log shipper", format!("off: {why}"),
             Some(format!("NOO_LOG_SHIP=1 in /etc/noo-node-agent.env on {id} and restart the agent; if it has no TLS material: noo cluster provision {id}")));
-    }
-    // The controller runs no Loki by choice (`cluster.monitoring: lean`): its
-    // gateway refuses every batch with reason `loki_off`. Not a stall.
-    if off_by_choice::gateway_reason(&last_error) == Some(off_by_choice::LOKI_OFF_REASON) {
-        return ok("log shipper", off_by_choice::SHIPPER_DETAIL);
     }
     if ls["route_ready"].as_bool() == Some(false) {
         return warn("log shipper",
@@ -4233,16 +4239,36 @@ pub(crate) fn docker_userns_check(daemon_json: Result<Option<String>, String>) -
     )
 }
 
+/// Why the controller's `tailscale status --json` could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TailscaleRead {
+    /// The binary is not on this host (the spawn failed NotFound): no
+    /// Tailscale here at all, a LAN-only install.
+    NotInstalled,
+    /// Anything else: it is installed and did not answer, or answered
+    /// something unreadable.
+    Failed(String),
+}
+
+/// A failed spawn of `tailscale`, by its io kind (never its message text).
+pub(crate) fn tailscale_spawn_error(e: &std::io::Error) -> TailscaleRead {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        TailscaleRead::NotInstalled
+    } else {
+        TailscaleRead::Failed(e.to_string())
+    }
+}
+
 /// The controller's own `tailscale status --json`, or why it could not be read.
-fn read_tailscale_status() -> Result<Value, String> {
+fn read_tailscale_status() -> Result<Value, TailscaleRead> {
     let out = std::process::Command::new(crate::commands::enroll::ts_bin())
         .args(["status", "--json"])
         .output()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| tailscale_spawn_error(&e))?;
     if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        return Err(TailscaleRead::Failed(String::from_utf8_lossy(&out.stderr).trim().to_string()));
     }
-    serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())
+    serde_json::from_slice(&out.stdout).map_err(|e| TailscaleRead::Failed(e.to_string()))
 }
 
 /// The "tailscale ssh" row. noomesh never uses Tailscale SSH (the
@@ -4252,11 +4278,12 @@ fn read_tailscale_status() -> Result<Value, String> {
 /// it is a WARN naming the box. Read from the controller's own tailnet
 /// view: a device running Tailscale SSH publishes SSH host keys to its
 /// peers. Ordinary sshd is not this row's business.
-pub(crate) fn tailscale_ssh_check(status: Result<Value, String>) -> Check {
+pub(crate) fn tailscale_ssh_check(status: Result<Value, TailscaleRead>) -> Check {
     const NAME: &str = "tailscale ssh";
     let status = match status {
         Ok(s) => s,
-        Err(e) => return warn(NAME, format!("could not read `tailscale status --json` here ({e}), so Tailscale SSH on mesh devices is not proven off"), None),
+        Err(TailscaleRead::NotInstalled) => return ok(NAME, "Tailscale is not installed: nothing here can run Tailscale SSH"),
+        Err(TailscaleRead::Failed(e)) => return warn(NAME, format!("could not read `tailscale status --json` here ({e}), so Tailscale SSH on mesh devices is not proven off"), None),
     };
     let mesh = |d: &Value| {
         d["Tags"].as_array().is_some_and(|t| {
@@ -6952,9 +6979,25 @@ pub(crate) fn addon_access_check(reads: AccessReads) -> Check {
     ok(ROW, format!("{} add-on(s), {features} feature(s): each one suggested for users or operators is on for someone{tail}", reads.len()))
 }
 
+/// What the verb reads off this host for [`controller_checks`]: plain facts,
+/// so the judgement stays pure.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ControllerHost {
+    /// The node agent runs here as a host systemd service
+    /// ([`NODE_AGENT_UNIT`] exists): there is no `noo-node-agent` container
+    /// to inspect, by design (onboard installs the self agent that way).
+    ///
+    /// [`NODE_AGENT_UNIT`]: crate::commands::security_scan_node::NODE_AGENT_UNIT
+    pub agent_host_service: bool,
+    /// Tailscale is not installed here ([`TailscaleRead::NotInstalled`]): a
+    /// LAN-only install, with no tailnet whose policy could be judged.
+    pub no_tailscale: bool,
+}
+
 /// Judge the posture, key and doctor outputs. Pure over the JSON so the
 /// decisions are pinned; the verb below only collects the inputs.
 pub(crate) fn controller_checks(
+    host: ControllerHost,
     posture: &Value,
     keys: &Value,
     required: &[(String, String)],
@@ -6993,7 +7036,7 @@ pub(crate) fn controller_checks(
         }
     }
 
-    out.extend(node_agent_privilege_check(posture));
+    out.extend(node_agent_privilege_check(posture, host.agent_host_service));
 
     let active: Vec<&str> = keys["keys"].as_array().unwrap_or(&empty).iter()
         .filter(|k| k["active"].as_bool().unwrap_or(false))
@@ -7049,6 +7092,9 @@ pub(crate) fn controller_checks(
         Some(m) => out.push(fail("tailnet policy",
             format!("the live policy lacks {} declared item(s): {}", m.len(), m.join("; ")),
             "noo security tailnet policy --merge   # adds only what is missing; keeps your own rules")),
+        // No Tailscale on this host: a LAN-only install has no tailnet, so
+        // there is no policy to read, and nothing to judge.
+        None if host.no_tailscale => out.push(ok("tailnet policy", "no tailnet (LAN-only, Tailscale is not installed): nothing to judge")),
         None => out.push(warn("tailnet policy", "not read (no tailnet API key?)", Some("noo security tailnet policy".into()))),
     }
 
@@ -7107,14 +7153,19 @@ pub(crate) fn erasure_archive_check(v: &Value) -> Check {
 /// access), against the desired posture. "At desired" has to mean the
 /// container, not the gateway's own env var. `None` when the posture JSON
 /// carries neither field (an older CLI or no such gate): nothing was seen, so
-/// no row is better than a green one.
-pub(crate) fn node_agent_privilege_check(posture: &Value) -> Option<Check> {
+/// no row is better than a green one. `agent_host_service`: the agent runs
+/// here as a host systemd service, so a container that cannot be inspected
+/// is not a gap: the gate governs a container this host does not run.
+pub(crate) fn node_agent_privilege_check(posture: &Value, agent_host_service: bool) -> Option<Check> {
     const NAME: &str = "node-agent privilege";
     const KEY: &str = "NOO_NODE_AGENT_PRIVILEGED";
     let gate = posture["posture"].as_array()?.iter().find(|g| g["key"] == KEY)?;
     let desired = gate["db_value"].as_str();
     let want_off = desired.is_some_and(|d| matches!(d.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"));
     if let Some(why) = gate["actual_error"].as_str() {
+        if agent_host_service {
+            return Some(ok(NAME, "n/a: the node agent runs as a host service (not a container)"));
+        }
         return Some(warn(NAME, format!("not checked: {why}"), Some("noo security posture list".into())));
     }
     let actual = match gate["actual"].as_str() {
@@ -8151,6 +8202,15 @@ struct Tally {
     notes: usize,
     /// ` — 3 node(s) on stack-v0.6.13`, or empty.
     context: String,
+    /// The sections render brief (`--brief`, not `--verbose`, not `--json`):
+    /// a WARN row with a brief tier is folded under "Worth doing later" or
+    /// "Not applicable here", not printed as a row.
+    brief: bool,
+    /// Under `brief`: the warnings and accepted rows printed as rows (what
+    /// [`brief_split`] keeps in `shown`). The closing line counts these:
+    /// "15 row(s) above to read" over 3 printed rows sent people looking
+    /// for 12 that were folded (i1098).
+    shown_notes: usize,
 }
 
 impl Tally {
@@ -8170,6 +8230,13 @@ impl Tally {
                 bucket.push(l);
             }
         }
+        if self.brief {
+            self.shown_notes += brief_split(checks)
+                .shown
+                .iter()
+                .filter(|c| matches!(c.verdict, Verdict::Warn | Verdict::Accepted))
+                .count();
+        }
     }
 }
 
@@ -8182,7 +8249,8 @@ fn verdict_line(t: &Tally) -> (Glyph, String) {
     if !t.starting.is_empty() {
         return (Glyph::Warn, format!("still starting: {} — re-run in a minute, or `noo cluster verify --wait`", t.starting.join(", ")));
     }
-    let seen = match t.notes {
+    let to_read = if t.brief { t.shown_notes } else { t.notes };
+    let seen = match to_read {
         0 => String::new(),
         n => format!("; {n} row(s) above to read"),
     };
@@ -8384,7 +8452,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut all_ok = true;
     let mut any_starting = false;
     let mut json_out = serde_json::Map::new();
-    let mut tally = Tally::default();
+    let mut tally = Tally { brief: brief && !g.verbose && !g.json, ..Tally::default() };
     let started = Instant::now();
     let mut laps: Vec<(String, Duration)> = Vec::new();
     // The fleet as the gateway listed it, when the node half read it: which
@@ -8501,7 +8569,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             let console = if seats.is_empty() { tag.clone() } else { crate::commands::kiosk_seat::controller_console_or(g, || tag.clone()) };
             let mut seat_json = Vec::new();
             if !g.json {
-                if let Some((heading, empty_line)) = seats_heading(listed.as_ref().map(Vec::len)) {
+                if let Some((heading, empty_line)) = seats_heading(listed.as_ref().map(Vec::len), g.verbose) {
                     println!("{}", ui::section(&heading));
                     if let Some(line) = empty_line {
                         println!("{}", ui::note(line));
@@ -8598,8 +8666,14 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 &crate::envfile::repo_root().join(".env"), crate::entitlement::STORE_KEY).trim().is_empty();
             entitlement_verdict(ec, &ent, env_copy)
         });
+        // Read once: the `tailscale ssh` row below judges it too.
+        let tailscale_status = read_tailscale_status();
+        let host = ControllerHost {
+            agent_host_service: std::path::Path::new(crate::commands::security_scan_node::NODE_AGENT_UNIT).is_file(),
+            no_tailscale: matches!(tailscale_status, Err(TailscaleRead::NotInstalled)),
+        };
         let mut checks = TimedChecks::new(
-            controller_checks(&posture, &keys, &required, (sc, &secrets), &exposure, &strangers, audit_errors, tailnet_missing, entitlement),
+            controller_checks(host, &posture, &keys, &required, (sc, &secrets), &exposure, &strangers, audit_errors, tailnet_missing, entitlement),
             controller_from,
             &format!("{} security and doctor reads, side by side", reads.len()),
         );
@@ -8820,7 +8894,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             .collect();
         checks.push(pki_key_modes_check(&key_issues, &grant_lines, sso.list_keys().len()));
         checks.push(docker_userns_check(read_daemon_json()));
-        checks.push(tailscale_ssh_check(read_tailscale_status()));
+        checks.push(tailscale_ssh_check(tailscale_status));
         let gw_mounts = std::fs::read_to_string(crate::envfile::repo_root().join("docker-compose.cluster.yml"))
             .ok()
             .and_then(|c| gateway_pki_mounts(&c));
@@ -8938,7 +9012,8 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 }
             }
             let exists = std::path::Path::new(&row.path).is_dir();
-            if let Some(c) = off_by_choice::state_dir_row(row.name, &monitoring, exists) {
+            let dir = std::path::Path::new(&row.path);
+            if let Some(c) = off_by_choice::state_dir_row(row.name, &monitoring, exists, || off_by_choice::holds_data(dir)) {
                 checks.push(c);
                 continue;
             }
@@ -9829,10 +9904,13 @@ pub(crate) fn heard_since(n: &Value, since: i64) -> bool {
 }
 
 /// The human Seats section header, by what the seat registry returned:
-/// `None` (an older gateway without one) prints nothing; an empty registry
-/// prints the section with one line naming the verb that enrolls a seat.
-pub(crate) fn seats_heading(count: Option<usize>) -> Option<(String, Option<&'static str>)> {
-    let n = count?;
+/// `None` (an older gateway without one) prints nothing. An empty registry
+/// prints nothing either: most installs have no kiosk seat, and "Seats (0)"
+/// on every run of a fresh box is a section to read that says nothing
+/// (i1098). Under `--verbose`, which shows every row, it prints with one
+/// line naming the verb that enrolls a seat. `--json` keeps `seats: []`.
+pub(crate) fn seats_heading(count: Option<usize>, verbose: bool) -> Option<(String, Option<&'static str>)> {
+    let n = count.filter(|n| *n > 0 || verbose)?;
     Some((format!("Seats ({n})"), (n == 0).then_some(NO_SEATS_LINE)))
 }
 
@@ -9841,14 +9919,19 @@ pub(crate) const NO_SEATS_LINE: &str = "no seats enrolled (noo kiosk seat-token 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn seats_section_prints_when_no_seat_is_enrolled() {
-        let (heading, line) = super::seats_heading(Some(0)).expect("an empty registry must still print the section");
+    fn seats_section_prints_only_when_a_seat_is_enrolled() {
+        // i1098: a box with no seat prints no Seats section by default.
+        assert_eq!(super::seats_heading(Some(0), false), None, "no seat: no section to read");
+        // --verbose shows everything, the empty registry with its verb too.
+        let (heading, line) = super::seats_heading(Some(0), true).expect("--verbose prints the empty section");
         assert_eq!(heading, "Seats (0)");
         assert_eq!(line, Some("no seats enrolled (noo kiosk seat-token <seat> mints one)"));
-        let (heading, line) = super::seats_heading(Some(2)).unwrap();
-        assert_eq!(heading, "Seats (2)");
-        assert_eq!(line, None, "enrolled seats render their own rows");
-        assert_eq!(super::seats_heading(None), None, "an older gateway without the registry stays silent");
+        for verbose in [false, true] {
+            let (heading, line) = super::seats_heading(Some(2), verbose).unwrap();
+            assert_eq!(heading, "Seats (2)");
+            assert_eq!(line, None, "enrolled seats render their own rows");
+            assert_eq!(super::seats_heading(None, verbose), None, "an older gateway without the registry stays silent");
+        }
     }
 
     /// An enabled add-on whose overlay declares no containers (no
@@ -11937,7 +12020,7 @@ mod tests {
             { "container": "noo-gateway", "host_port": 8080, "reach": "any-interface" }
         ]});
         let strangers = serde_json::json!({ "status": "storm" });
-        let c = controller_checks(&posture, &keys, &required, (0, &secrets), &exposure, &strangers, Some(0), Some(vec!["grant tag:worker → tag:controller:8443".into()]), Some(Ok(())));
+        let c = controller_checks(ControllerHost::default(), &posture, &keys, &required, (0, &secrets), &exposure, &strangers, Some(0), Some(vec!["grant tag:worker → tag:controller:8443".into()]), Some(Ok(())));
         assert_eq!(verdict(&c, "posture"), Verdict::Ok, "{:?}", c.iter().find(|c| c.name == "posture"));
         let k = c.iter().find(|c| c.name == "service keys").unwrap();
         assert_eq!(k.verdict, Verdict::Fail);
@@ -12036,19 +12119,77 @@ mod tests {
     fn node_agent_privilege_is_read_from_the_container() {
         let gate = |actual: serde_json::Value, db: &str| serde_json::json!({"posture": [
             {"key": "NOO_NODE_AGENT_PRIVILEGED", "running": db, "db_value": db, "actual": actual}]});
-        let v = |p: &serde_json::Value| node_agent_privilege_check(p).map(|c| c.verdict);
+        let v = |p: &serde_json::Value| node_agent_privilege_check(p, false).map(|c| c.verdict);
         // The bug: posture says false, the gateway's env says false, the container is privileged.
         assert_eq!(v(&gate(serde_json::json!("true"), "false")), Some(Verdict::Fail));
         assert_eq!(v(&gate(serde_json::json!("false"), "false")), Some(Verdict::Ok));
         assert_eq!(v(&gate(serde_json::json!("true"), "true")), Some(Verdict::Warn));
         // Could not inspect: warned as not checked, never ok.
         let unseen = serde_json::json!({"posture": [{"key": "NOO_NODE_AGENT_PRIVILEGED", "db_value": "false", "actual_error": "docker is not runnable"}]});
-        let c = node_agent_privilege_check(&unseen).unwrap();
+        let c = node_agent_privilege_check(&unseen, false).unwrap();
         assert_eq!(c.verdict, Verdict::Warn);
         assert!(c.detail.starts_with("not checked"), "{}", c.detail);
         // An older CLI's listing has no container fact: no row, not a green one.
         assert!(v(&serde_json::json!({"posture": [{"key": "NOO_NODE_AGENT_PRIVILEGED", "db_value": "false"}]})).is_none());
         assert!(v(&serde_json::json!({"posture": []})).is_none());
+    }
+
+    /// i1098: onboard installs the controller's own agent as a host systemd
+    /// service, so there is no `noo-node-agent` container to inspect. That
+    /// is not a gap: the gate governs a container this host does not run.
+    #[test]
+    fn node_agent_privilege_is_not_applicable_to_a_host_service_agent() {
+        let none = serde_json::json!({"posture": [{"key": "NOO_NODE_AGENT_PRIVILEGED", "db_value": "false",
+            "actual_error": "no noo-node-agent container on this host (the node-agent here is not compose-managed, or the stack is down)"}]});
+        let c = node_agent_privilege_check(&none, true).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert_eq!(c.detail, "n/a: the node agent runs as a host service (not a container)");
+        assert!(c.remedy.is_none());
+        // No host unit: unknown, so today's "not checked" warning stays.
+        let c = node_agent_privilege_check(&none, false).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.starts_with("not checked: no noo-node-agent container"), "{}", c.detail);
+        // A container that IS seen is judged as ever, host unit or not.
+        let privileged = serde_json::json!({"posture": [{"key": "NOO_NODE_AGENT_PRIVILEGED", "db_value": "false", "actual": "true"}]});
+        assert_eq!(node_agent_privilege_check(&privileged, true).map(|c| c.verdict), Some(Verdict::Fail));
+    }
+
+    /// i1098: a LAN-only install has no Tailscale and no tailnet: the
+    /// tailnet policy row has nothing to judge (OK), not "no API key?". With
+    /// Tailscale installed, an unread policy still warns; a read one that
+    /// lacks items still fails.
+    #[test]
+    fn the_tailnet_policy_row_is_ok_on_a_lan_only_install() {
+        let posture = serde_json::json!({"posture": [{"key": "NOO_EXEC_APPROVAL_MODE", "running": "approval", "db_value": "approval"}]});
+        let row = |host: ControllerHost, missing: Option<Vec<String>>| {
+            let c = controller_checks(host, &posture, &serde_json::json!({}), &[], (0, &serde_json::json!({})),
+                &serde_json::json!({}), &serde_json::json!({}), Some(0), missing, None);
+            c.into_iter().find(|c| c.name == "tailnet policy").unwrap()
+        };
+        let lan = ControllerHost { no_tailscale: true, ..ControllerHost::default() };
+        let c = row(lan, None);
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.starts_with("no tailnet (LAN-only"), "{}", c.detail);
+        let c = row(ControllerHost::default(), None);
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("not read"), "{}", c.detail);
+        assert_eq!(row(lan, Some(vec!["tag tag:worker".into()])).verdict, Verdict::Fail, "a policy that was read is judged");
+    }
+
+    /// i1098: no `tailscale` binary (the spawn fails NotFound) is a LAN-only
+    /// install: nothing here can run Tailscale SSH. Decided on the io kind,
+    /// never the message; any other failure keeps the warning.
+    #[test]
+    fn the_tailscale_ssh_row_is_ok_when_tailscale_is_not_installed() {
+        let absent = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(tailscale_spawn_error(&absent), TailscaleRead::NotInstalled);
+        let c = tailscale_ssh_check(Err(tailscale_spawn_error(&absent)));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert_eq!(c.detail, "Tailscale is not installed: nothing here can run Tailscale SSH");
+        // The message alone never decides: a NotFound-looking text of another kind warns.
+        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "No such file or directory (os error 2)");
+        assert!(matches!(tailscale_spawn_error(&denied), TailscaleRead::Failed(_)));
+        assert_eq!(tailscale_ssh_check(Err(tailscale_spawn_error(&denied))).verdict, Verdict::Warn);
     }
 
     #[test]
@@ -12222,7 +12363,7 @@ mod tests {
         assert_eq!(tailscale_ssh_check(Ok(quiet)).verdict, Verdict::Ok);
         let self_on = serde_json::json!({"Self": {"HostName": "ctrl", "Tags": ["tag:controller"], "sshHostKeys": ["k"]}});
         assert!(tailscale_ssh_check(Ok(self_on)).detail.contains("ctrl"));
-        assert_eq!(tailscale_ssh_check(Err("not running".into())).verdict, Verdict::Warn);
+        assert_eq!(tailscale_ssh_check(Err(TailscaleRead::Failed("not running".into()))).verdict, Verdict::Warn);
     }
 
     #[test]
@@ -15586,6 +15727,36 @@ mod digest_tests {
         let mut t = Tally::default();
         t.add("controller", &[warn("backup age", "old", None)]);
         assert_eq!(verdict_line(&t).1, "fleet healthy; 1 row(s) above to read");
+    }
+
+    /// i1098: onboard's brief closing verify printed "15 row(s) above to
+    /// read" over 3 printed rows: the count took the rows folded under
+    /// "Worth doing later" / "Not applicable here" too. Brief counts what it
+    /// prints as rows; the plain digest counts every note as before, and
+    /// `notes` (onboard's "notes, not errors") still counts them all.
+    #[test]
+    fn the_brief_closing_line_counts_only_the_rows_it_printed() {
+        let rows = vec![
+            warn("default chat", "only CPU candidates", None),
+            warn("last backup", "no successful backup on record", None),
+            warn("tailnet policy", "not read (no tailnet API key?)", None),
+            warn("postgres at rest", "in the clear", None),
+            warn("redis at rest", "in the clear", None),
+            ok("posture", "3 gates at desired"),
+        ];
+        let b = brief_split(&rows);
+        assert_eq!(b.shown.len(), 1, "{:?}", b.shown);
+        let mut brief = Tally { brief: true, ..Tally::default() };
+        brief.add("controller", &rows);
+        assert_eq!(verdict_line(&brief).1, "fleet healthy; 1 row(s) above to read");
+        assert_eq!(brief.notes, 4, "every note still counted (at rest as one) for onboard's closing line");
+        let mut plain = Tally::default();
+        plain.add("controller", &rows);
+        assert_eq!(verdict_line(&plain).1, "fleet healthy; 4 row(s) above to read");
+        // Everything folded: healthy, no count.
+        let mut folded = Tally { brief: true, ..Tally::default() };
+        folded.add("controller", &rows[1..]);
+        assert_eq!(verdict_line(&folded).1, "fleet healthy");
     }
 
     #[test]
