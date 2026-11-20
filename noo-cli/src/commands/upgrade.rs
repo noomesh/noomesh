@@ -3292,7 +3292,7 @@ fn outcome_of(end: &super::provision::ApplyEnd) -> (Outcome, String) {
     use super::provision::ApplyEnd;
     match end {
         ApplyEnd::Applied { rc: 0, .. } => (Outcome::Applied, "applied (exit 0)".into()),
-        ApplyEnd::Applied { rc, .. } => (Outcome::Refused, format!("the applier refused the bundle (exit {rc})")),
+        ApplyEnd::Applied { rc, .. } => (Outcome::Refused, format!("the applier refused the bundle (exit {rc}): {}", super::provision::apply_refusal(*rc).why)),
         ApplyEnd::LegacyUnconfirmed => (Outcome::Unconfirmed, "applied without confirmation (legacy fetcher)".into()),
         ApplyEnd::NotReported { fetched: true } => (Outcome::NotReported, "fetched, but no apply report".into()),
         ApplyEnd::NotReported { fetched: false } => (Outcome::NotFetched, "never fetched the bundle".into()),
@@ -3520,12 +3520,17 @@ fn settle_end(g: &Globals, n: &str, end: super::provision::ApplyEnd, is_self: bo
             ui::blank();
             ui::say(&ui::item(n));
             ui::capture("applier output", tail.trim());
+            // One row renders both: the line and guide here, the JSON row below.
+            let r = super::provision::apply_refusal(rc);
             ui::say_err(&ui::sub(&ui::status_line(Glyph::Err,
-                &format!("{n}: the applier refused the bundle (exit {rc}); the node kept its previous state"))));
+                &format!("{}; the node kept its previous state", r.headline(n, rc)))));
             if !g.json {
-                ui::guide(&[(&format!("noo cluster provision {n} --wait"), "fix the cause above, then re-stage")]);
+                ui::guide(&[(&r.next_command(n), r.guide_why())]);
             }
-            (serde_json::json!({"node": n, "outcome": "refused", "rc": rc}), Settled::Failed)
+            let mut row = r.json(n, rc);
+            row["node"] = serde_json::json!(n);
+            row["outcome"] = serde_json::json!("refused");
+            (row, Settled::Failed)
         }
         ApplyEnd::LegacyUnconfirmed => {
             (serde_json::json!({"node": n, "outcome": "unconfirmed"}), Settled::Unconfirmed)

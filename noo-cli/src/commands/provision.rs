@@ -115,6 +115,28 @@ fn fail_guided(g: &Globals, code: ExitCode, kind: &str, msg: &str, hint: &str, g
     std::process::exit(code as i32);
 }
 
+/// A node's applier refused its bundle with exit `rc`: one row of
+/// [`apply_refusal`] renders both the human lines and the `--json` envelope
+/// (`{error, code, hint}` plus `rc`, `why`, `next`, `needs_person`). The
+/// node's own log is a secondary "for detail" step, never the remedy.
+fn fail_apply_refused(g: &Globals, node: &str, rc: i64, darwin: bool) -> ! {
+    let r = apply_refusal(rc);
+    let msg = r.headline(node, rc);
+    if g.json {
+        let mut obj = r.json(node, rc);
+        obj["error"] = serde_json::Value::String(msg);
+        obj["hint"] = serde_json::Value::String(r.next_line(node));
+        eprintln!("{obj}");
+        ui::pager_finish();
+        std::process::exit(ExitCode::Generic as i32);
+    }
+    let next = r.next_command(node);
+    fail_guided(g, ExitCode::Generic, r.code, &msg, &r.next_line(node),
+        &[(&next, r.guide_why()),
+          (if darwin { "sudo /usr/local/bin/noo node fetch --user $(id -un)" } else { "journalctl -u noo-fetch -n 20" },
+           "on the node, for detail: the applier's own log")]);
+}
+
 
 /// Record that `node` holds the CURRENT fleet signing key, from the
 /// applier's own report of the bundle it just applied (exit 0).
@@ -1938,12 +1960,7 @@ fn await_apply(g: &Globals, a: &ProvisionArgs, m: &ProvMachine, staged: &ProvSta
         Some((rc, msg)) => {
             let tail: String = msg.chars().rev().take(400).collect::<Vec<_>>().into_iter().rev().collect();
             ui::capture("applier output", tail.trim());
-            fail_guided(g, ExitCode::Generic, "apply_failed",
-                &format!("{node}: the applier refused the bundle (exit {rc})"),
-                "the node kept its previous state; fix the cause and re-run `noo cluster provision <node>`",
-                &[(&reprovision, "the node kept its previous state — fix the cause above, then re-stage"),
-                  (if darwin { "sudo /usr/local/bin/noo node fetch --user $(id -un)" } else { "journalctl -u noo-fetch -n 20" },
-                   "on the node — the applier's own log, if the tail above is not enough")]);
+            fail_apply_refused(g, &node, rc, darwin);
         }
         None if legacy && seen_fetch => {
             println!("{}", ui::sub(&ui::status_line(Glyph::Warn,
@@ -4663,6 +4680,139 @@ pub(crate) struct PendingApply {
     pub applier_first: bool,
 }
 
+/// What a person does after a node's applier refused a bundle.
+///
+/// There is no "nothing: the node retries" row: the fetcher records a
+/// refused bundle's sha (scripts/noo-fetch.sh), so the same bundle is never
+/// applied again; only a new staging is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApplyNext {
+    /// Run this `noo` command on the controller (`<node>` filled in).
+    Run(&'static str),
+    /// A person acts or decides first (`what`), then runs `then`
+    /// (`<node>` filled in).
+    Person { what: &'static str, then: &'static str },
+}
+
+/// One row of the applier refusal table: a stable code, the reason in
+/// plain words, and the next step. The human lines and `--json` of
+/// `cluster provision` and `upgrade --nodes` render from this one row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ApplyRefusal {
+    pub code: &'static str,
+    pub why: &'static str,
+    pub next: ApplyNext,
+}
+
+/// The code a refusal gets when its exit code is not in the table.
+pub(crate) const APPLY_FAILED_UNKNOWN_RC: &str = "apply_failed_unknown_rc";
+
+/// Exit code (scripts/noo-apply.sh; the Mac applier reports the same codes)
+/// to its row. Built from the script's own `exit N` refusals; a code the
+/// table does not hold keeps the generic text under
+/// [`APPLY_FAILED_UNKNOWN_RC`].
+pub(crate) fn apply_refusal(rc: i64) -> ApplyRefusal {
+    let known = match rc {
+        65 => Some(ApplyRefusal {
+            code: "apply_refused_bundle_content",
+            why: "the bundle is malformed, or holds a part this node will not install (the applier output names it)",
+            next: ApplyNext::Person { what: "fix the part the applier output names", then: "noo cluster provision <node>" },
+        }),
+        69 => Some(ApplyRefusal {
+            code: "apply_refused_missing_tool",
+            why: "a tool the node needs is missing (gzip to unpack the bundle, or the teardown helper for a teardown)",
+            next: ApplyNext::Person { what: "install the missing tool on the node", then: "noo cluster provision <node>" },
+        }),
+        70 => Some(ApplyRefusal {
+            code: "apply_refused_node_settings",
+            why: "the node's own settings lost its node name while the bundle was merged in",
+            next: ApplyNext::Person { what: "re-enroll the node: run the line this prints on the node", then: "noo cluster bootstrap-token create --node <node>" },
+        }),
+        73 => Some(ApplyRefusal {
+            code: "apply_refused_cli_install",
+            why: "the node could not install the noo CLI for its user account",
+            next: ApplyNext::Person { what: "check that account on the node", then: "noo cluster provision <node>" },
+        }),
+        74 => Some(ApplyRefusal {
+            code: "apply_refused_checksum",
+            why: "a part of the bundle does not match its signed checksum (damaged on the way)",
+            next: ApplyNext::Run("noo cluster provision <node>"),
+        }),
+        75 => Some(ApplyRefusal {
+            code: "apply_refused_release_check",
+            why: "the bundle carries root code that no published release lists, or the node is ahead of its controller",
+            next: ApplyNext::Run("noo upgrade --all"),
+        }),
+        76 => Some(ApplyRefusal {
+            code: "apply_refused_applier_too_old",
+            why: "the node's applier is older than the bundle (or a part of it names another node)",
+            next: ApplyNext::Run("noo cluster upgrade-applier <node>"),
+        }),
+        77 => Some(ApplyRefusal {
+            code: "apply_refused_signature",
+            why: "the node could not trust the bundle: its signature, signing-key rollover, address or age failed the check",
+            next: ApplyNext::Person {
+                what: "if the node holds an older signing key, deliver the current one (a wrong clock on the node is the other cause)",
+                then: "noo security pki rotate-signing-key <node> --deliver-only",
+            },
+        }),
+        78 => Some(ApplyRefusal {
+            code: "apply_refused_not_enrolled",
+            why: "the machine is not set up as a node yet (no cluster CA, node settings or service group)",
+            next: ApplyNext::Person { what: "enroll it: run the line this prints on the node", then: "noo cluster bootstrap-token create --node <node>" },
+        }),
+        _ => None,
+    };
+    known.unwrap_or(ApplyRefusal {
+        code: APPLY_FAILED_UNKNOWN_RC,
+        why: "the applier output above says why",
+        next: ApplyNext::Person { what: "fix the cause the applier output names", then: "noo cluster provision <node>" },
+    })
+}
+
+impl ApplyRefusal {
+    /// The `noo` command of this row, with the node filled in.
+    pub(crate) fn next_command(&self, node: &str) -> String {
+        let cmd = match self.next {
+            ApplyNext::Run(c) => c,
+            ApplyNext::Person { then, .. } => then,
+        };
+        cmd.replace("<node>", node)
+    }
+
+    /// What the person does next, in one line.
+    pub(crate) fn next_line(&self, node: &str) -> String {
+        match self.next {
+            ApplyNext::Run(_) => format!("run `{}`", self.next_command(node)),
+            ApplyNext::Person { what, .. } => format!("needs a person: {what}, then `{}`", self.next_command(node)),
+        }
+    }
+
+    /// The headline: `<node>: the applier refused the bundle (exit N): why`.
+    pub(crate) fn headline(&self, node: &str, rc: i64) -> String {
+        format!("{node}: the applier refused the bundle (exit {rc}): {}", self.why)
+    }
+
+    /// The guide row the human output prints: the command and its why.
+    pub(crate) fn guide_why(&self) -> &'static str {
+        match self.next {
+            ApplyNext::Run(_) => "the next step; the node kept its previous state",
+            ApplyNext::Person { what, .. } => what,
+        }
+    }
+
+    /// The `--json` fields: the same row the human line renders.
+    pub(crate) fn json(&self, node: &str, rc: i64) -> serde_json::Value {
+        serde_json::json!({
+            "rc": rc,
+            "code": self.code,
+            "why": self.why,
+            "next": self.next_command(node),
+            "needs_person": matches!(self.next, ApplyNext::Person { .. }),
+        })
+    }
+}
+
 /// How one pending node ended.
 #[derive(Debug, PartialEq)]
 pub(crate) enum ApplyEnd {
@@ -7362,5 +7512,111 @@ mod onboard_door_leaf_line_tests {
         let all = door_leaf_lines(&issued, false);
         assert_eq!(all.len(), 3, "a person running provision reads every leaf");
         assert_eq!(all[0], "backend door leaf vllm: issued (no leaf yet)");
+    }
+}
+
+#[cfg(test)]
+mod apply_refusal_tests {
+    use super::{apply_refusal, ApplyNext, APPLY_FAILED_UNKNOWN_RC};
+
+    /// The refusal codes scripts/noo-apply.sh exits with (`exit N` outside
+    /// comments; 0 is success, 1 is `set -e`'s generic failure, not a
+    /// refusal), plus noo-fetch.sh's own refusal (`return 69`, gzip).
+    fn script_refusal_codes() -> Option<std::collections::BTreeSet<i64>> {
+        let mut set = std::collections::BTreeSet::new();
+        for (rel, word) in [("scripts/noo-apply.sh", "exit "), ("scripts/noo-fetch.sh", "return ")] {
+            let p = crate::test_support::repo_file_or_skip(rel)?;
+            let src = std::fs::read_to_string(p).expect(rel);
+            for line in src.lines().filter(|l| !l.trim_start().starts_with('#')) {
+                for (i, _) in line.match_indices(word) {
+                    let n: String = line[i + word.len()..].chars().take_while(|c| c.is_ascii_digit()).collect();
+                    // noo-fetch.sh: only its applier-style refusal (gzip, 69).
+                    let keep = word == "exit " || n == "69";
+                    if let (true, Ok(n)) = (keep, n.parse::<i64>()) {
+                        if n > 1 { set.insert(n); }
+                    }
+                }
+            }
+        }
+        Some(set)
+    }
+
+    /// The `noo …` command a row names, checked against the usage table:
+    /// its words are a real command and every flag it passes is in that
+    /// command's syntax line.
+    fn assert_real_command(cmd: &str) {
+        let words: Vec<&str> = cmd.split_whitespace().collect();
+        assert_eq!(words.first(), Some(&"noo"), "{cmd}");
+        let rest = &words[1..];
+        let n = (1..=rest.len()).rev()
+            .find(|&n| crate::usage::lookup(&rest[..n]).is_some())
+            .unwrap_or_else(|| panic!("`{cmd}` is not a noo command"));
+        let (syntax, _) = crate::usage::lookup(&rest[..n]).unwrap();
+        for flag in rest[n..].iter().filter(|w| w.starts_with('-')) {
+            assert!(syntax.contains(flag), "`{cmd}`: {flag} is not in its syntax `{syntax}`");
+        }
+    }
+
+    #[test]
+    fn every_script_refusal_has_a_distinct_row_with_a_real_command() {
+        let Some(codes) = script_refusal_codes() else { return };
+        assert!(codes.len() >= 9, "the scripts' refusal codes were not read: {codes:?}");
+        let mut seen = std::collections::BTreeSet::new();
+        for rc in &codes {
+            let r = apply_refusal(*rc);
+            assert_ne!(r.code, APPLY_FAILED_UNKNOWN_RC, "exit {rc} has no row in apply_refusal");
+            assert!(seen.insert(r.code), "exit {rc}: code {} is not distinct", r.code);
+            assert!(!r.why.trim().is_empty(), "exit {rc}: empty why");
+            assert!(!r.why.contains("kind"), "exit {rc}: `kind` is an internal word: {}", r.why);
+            let cmd = r.next_command("node_a");
+            assert!(!cmd.contains('<'), "exit {rc}: a placeholder is left in `{cmd}`");
+            if matches!(r.next, ApplyNext::Person { .. }) {
+                assert!(r.next_line("node_a").starts_with("needs a person: "), "exit {rc}");
+            }
+            assert_real_command(&cmd);
+        }
+    }
+
+    #[test]
+    fn release_applier_and_signature_refusals_do_not_send_a_reprovision() {
+        for rc in [75, 76, 77] {
+            let r = apply_refusal(rc);
+            let cmd = r.next_command("node_a");
+            assert!(!cmd.starts_with("noo cluster provision"), "exit {rc} would loop on a re-provision: {cmd}");
+            assert!(!r.next_line("node_a").contains("cluster provision"), "exit {rc}: {}", r.next_line("node_a"));
+        }
+        assert_eq!(apply_refusal(76).next_command("node_a"), "noo cluster upgrade-applier node_a");
+        assert_eq!(apply_refusal(75).next_command("node_a"), "noo upgrade --all");
+    }
+
+    #[test]
+    fn an_unknown_rc_keeps_the_generic_text_and_the_human_and_json_agree() {
+        let r = apply_refusal(2);
+        assert_eq!(r.code, APPLY_FAILED_UNKNOWN_RC);
+        assert_eq!(r.next_command("node_a"), "noo cluster provision node_a");
+        assert!(r.headline("node_a", 2).starts_with("node_a: the applier refused the bundle (exit 2)"));
+        for rc in [2, 65, 76, 77] {
+            let r = apply_refusal(rc);
+            let j = r.json("node_a", rc);
+            assert_eq!(j["code"], r.code);
+            assert_eq!(j["rc"], rc);
+            assert_eq!(j["next"], r.next_command("node_a"));
+            assert!(r.next_line("node_a").contains(&r.next_command("node_a")), "the human line names the same command");
+            assert!(!r.next_line("node_a").contains("journalctl"), "the node log is never the remedy");
+        }
+    }
+
+    /// Both callers render from the table; neither keeps its own remedy.
+    #[test]
+    fn provision_and_upgrade_render_refusals_from_the_table() {
+        let prov = crate::test_src::own_code(include_str!("provision.rs"));
+        let arm = crate::test_src::fn_body(&prov, "fn fail_apply_refused(");
+        assert!(arm.contains("apply_refusal(rc)") && arm.contains("r.json(node, rc)"), "{arm}");
+        let wait = crate::test_src::fn_body(&prov, "fn await_apply(");
+        assert!(wait.contains("fail_apply_refused(g, &node, rc, darwin)"), "await_apply keeps its own remedy");
+        assert!(!wait.contains("\"apply_failed\""), "the one-remedy code is back");
+        let up = crate::test_src::own_code(include_str!("upgrade.rs"));
+        let settle = crate::test_src::fn_body(&up, "fn settle_end(");
+        assert!(settle.contains("super::provision::apply_refusal(rc)") && settle.contains("r.json(n, rc)"), "{settle}");
     }
 }
