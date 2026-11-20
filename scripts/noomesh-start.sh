@@ -753,7 +753,7 @@ if [ ${#SERVICES[@]} -eq 0 ]; then
         # The helper (lib-helper-image.sh: the stack's own nginx by digest,
         # never Docker Hub) mounts that ONE file, nothing else; job
         # `chgrp-file` = CHOWN (chgrp) + FOWNER (chmod a file we do not own).
-        if ! { helper_ensure_present && helper_run chgrp-file sh "$PWD/noomesh.yaml":/f \
+        if ! { helper_ensure_present && docker run --rm -v "$PWD/noomesh.yaml":/f alpine sh \
                 -c 'chgrp 65532 /f && chmod 660 /f'; } >/dev/null 2>&1; then
             echo "NOTE: could not make noomesh.yaml group-writable by the gateway (gid 65532) — \
 'noo config set' and dashboard settings writes will fail with a permission error. To fix: \
