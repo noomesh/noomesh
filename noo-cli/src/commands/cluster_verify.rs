@@ -14536,6 +14536,13 @@ mod tests {
         assert!(c.detail.contains(&format!("host5 refused its last bundle ({line}): a refused node refuses ALL bundles")), "{}", c.detail);
         let r = c.remedy.unwrap();
         assert!(r.contains("noo upgrade --stack") && !r.contains("published release"), "{r}");
+        // The applier's name line follows the ahead line (newlines are spaces
+        // in a report): it says neither REFUSED nor a bare `(75)`, so the
+        // quoted refusal is still the ahead line, cut at its own `(75)`.
+        let named = format!("noo-apply: {line} noo-apply: refusal=node_ahead_of_controller (exit 75) ");
+        let c = release_check_row(&[("node_a".into(), Some(75), named)]).unwrap();
+        assert!(c.detail.contains(&format!("node_a refused its last bundle ({line}): a refused node")), "{}", c.detail);
+        assert!(!c.detail.contains("refusal="), "{}", c.detail);
     }
 
     #[test]
