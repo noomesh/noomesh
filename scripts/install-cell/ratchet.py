@@ -5,7 +5,7 @@
 ratchet"): a fresh install's `noo --json cluster verify` may not carry more
 WARN rows than its cell's ceiling, nor a WARN row the ceiling does not name.
 
-  ratchet.py judge CELL VERIFY_LOG [--ceiling FILE] [--rows ROWS_RS]
+  ratchet.py judge CELL VERIFY_LOG [--ceiling FILE] [--rows ROWS_RS] [--onboard-log PATH]...
       reads the verify JSON (the cell's logs/probe-verify-json.log) and the
       ceiling (warn-ratchet.json beside this file) and prints:
         RATCHET ROW: <id> (<section>:<name>) — <status>   one per WARN row
@@ -20,7 +20,12 @@ WARN rows than its cell's ceiling, nor a WARN row the ceiling does not name.
                                             fail_rows_fail_the_cell is true)
         VERIFY NOTE: …                      a FAIL row allow-listed, or seen while the
                                             rule is off
+        RATCHET NOT JUDGED: default_chat (<label>) — registry outage at onboard,
+            retries exhausted: "<5xx line>" … "<did not complete line>"
+                                            the ONE exemption (below)
       exit 1 on any FAIL, else 0.
+  ratchet.py run-summary DIR
+      ratchet NOT JUDGED cells: N (<cells>)   from DIR/install-cell-*/summary.json
   ratchet.py skip CELL REASON
       RATCHET NOTE: <cell> not judged: <reason>   (a cell with no full install)
   ratchet.py only-down --base-ref REF [--file PATH]
@@ -58,6 +63,17 @@ A FAIL row (i1098: "a FAIL row always fails the cell") fails the cell only
 while "fail_rows_fail_the_cell" is true; fail_allowed lists, by id, the
 FAIL rows that may stand, each with a "why". It only shrinks, by the same
 rule as the ceiling.
+
+The ONE exemption from that rule: a `default chat` FAIL (id default_chat)
+is NOT JUDGED, not failed, when the cell's onboard log (--onboard-log, any
+number; a missing file adds nothing) shows that the chat model's pull met a
+registry 5xx AND the bounded retry (noo-cli pull_retry.rs, #1475) was
+exhausted: a 5xx line, then the last try announced ("(try 3 of 3)"), then
+"Ollama pull did not complete", and no "pulled via Ollama" after the 5xx.
+A pull that recovered is judged. A build without the retry (no "retrying
+in" line at all) is judged too: the release lead's rule is that exhaustion
+must be visible, and a bare 5xx shows one try, not an exhausted retry.
+Every other FAIL row fails the cell whatever the onboard log says.
 """
 from __future__ import annotations
 
@@ -155,7 +171,42 @@ def status_lines(rows: list[tuple[str | None, str]], ceiling: dict) -> list[str]
     return out + leftover
 
 
-def verify_fail_lines(verify: dict | None, ceiling: dict, names: dict[str, str]) -> tuple[list[str], list[str]]:
+# The onboard model pull's lines (noo-cli onboard/steps.rs, pull_retry.rs).
+REGISTRY_5XX = re.compile(r"Error: (?:pull model manifest: )?5\d\d: |"
+                          r"registry answered 5\d\d \(a registry-side problem\): retrying in ")
+RETRY = re.compile(r"retrying in \d+ s \(try (\d+) of (\d+)\)")
+DID_NOT_COMPLETE = "Ollama pull did not complete"
+PULLED = re.compile(r"Model \S+ pulled via Ollama")
+EXEMPT_ROW = "default_chat"
+
+
+def _quote(line: str) -> str:
+    line = line.strip()
+    return line if len(line) <= 200 else line[:199] + "…"
+
+
+def registry_outage(text: str) -> tuple[str, str] | None:
+    """(the 5xx line, the "did not complete" line) when the onboard log
+    shows a registry 5xx whose bounded retry was exhausted with no later
+    success; else None."""
+    lines = text.splitlines()
+    i5 = next((i for i, l in enumerate(lines) if REGISTRY_5XX.search(l)), None)
+    if i5 is None:
+        return None
+    if any(PULLED.search(l) for l in lines[i5:]):
+        return None  # it recovered: the row is judged
+    last_try = [i for i, l in enumerate(lines)
+                if (m := RETRY.search(l)) and m.group(1) == m.group(2)]
+    if not last_try:
+        return None  # no visible retry (an older build): not exhausted, judged
+    done = [i for i, l in enumerate(lines) if DID_NOT_COMPLETE in l and i > last_try[-1]]
+    if not done:
+        return None
+    return _quote(lines[i5]), _quote(lines[done[-1]])
+
+
+def verify_fail_lines(verify: dict | None, ceiling: dict, names: dict[str, str],
+                      onboard: str = "") -> tuple[list[str], list[str]]:
     """(notes, fails) for the rows whose verdict is "fail"."""
     if verify is None:
         return [], []
@@ -165,10 +216,16 @@ def verify_fail_lines(verify: dict | None, ceiling: dict, names: dict[str, str])
     lab = labels(rows)
     allowed = ceiling.get("fail_allowed") or {}
     ok = sorted(r for r in lab if r in allowed)
-    bad = [f"{r} ({lab[r]})" for r in sorted(lab) if r not in allowed]
-    bad += sorted({label for rid, label in rows if not rid})
     notes = [f"VERIFY NOTE: allowed FAIL row(s): "
              + "; ".join(f"{r} ({allowed[r].get('why', '')})" for r in ok)] if ok else []
+    exempt = set()
+    outage = registry_outage(onboard) if EXEMPT_ROW in lab and EXEMPT_ROW not in allowed else None
+    if outage:
+        exempt.add(EXEMPT_ROW)
+        notes.append(f"RATCHET NOT JUDGED: {EXEMPT_ROW} ({lab[EXEMPT_ROW]}) — registry outage at onboard, "
+                     f"retries exhausted: \"{outage[0]}\" … \"{outage[1]}\"")
+    bad = [f"{r} ({lab[r]})" for r in sorted(lab) if r not in allowed and r not in exempt]
+    bad += sorted({label for rid, label in rows if not rid})
     if not bad:
         return notes, []
     if ceiling.get("fail_rows_fail_the_cell") is True:
@@ -204,12 +261,12 @@ def measured(entry: dict | None) -> bool:
 
 
 def judge(cell: str, verify: dict | None, ceiling: dict,
-          names: dict[str, str] | None = None) -> tuple[bool, list[str]]:
+          names: dict[str, str] | None = None, onboard: str = "") -> tuple[bool, list[str]]:
     """(ok, lines). NOTE lines first, FAIL lines last (the step record takes
-    its last line as the error)."""
+    its last line as the error). `onboard` is the cell's onboard log text."""
     names = registry() if names is None else names
     ok, lines = judge_warn(cell, verify, ceiling, names)
-    notes, fails = verify_fail_lines(verify, ceiling, names)
+    notes, fails = verify_fail_lines(verify, ceiling, names, onboard)
     head = [l for l in lines if not l.startswith("RATCHET FAIL")]
     tail = [l for l in lines if l.startswith("RATCHET FAIL")]
     return ok and not fails, head + notes + tail + fails
@@ -295,6 +352,21 @@ def only_down(base: dict, new: dict) -> list[str]:
     return bad
 
 
+def run_summary(root: Path) -> str:
+    """One line for the run: the cells whose verify-ratchet reported a row
+    NOT JUDGED (cell.py summary's `ratchet_not_judged`), so a registry
+    outage that keeps hiding the default chat row is seen run after run."""
+    cells = []
+    for s in sorted(root.glob("*/summary.json")):
+        try:
+            d = json.loads(s.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if d.get("ratchet_not_judged"):
+            cells.append(d.get("cell") or s.parent.name)
+    return f"ratchet NOT JUDGED cells: {len(cells)} ({', '.join(cells) or 'none'})"
+
+
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True)
 
@@ -318,9 +390,15 @@ def main(argv: list[str]) -> int:
         ceil = Path(argv[argv.index("--ceiling") + 1]) if "--ceiling" in argv else CEILING
         text = log.read_text(errors="replace") if log.exists() else ""
         names = registry(Path(argv[argv.index("--rows") + 1]) if "--rows" in argv else ROWS_RS)
-        ok, lines = judge(cell, verify_json(text), load_ceiling(ceil), names)
+        onboard = "".join(Path(argv[i + 1]).read_text(errors="replace") + "\n"
+                          for i, a in enumerate(argv[:-1])
+                          if a == "--onboard-log" and Path(argv[i + 1]).is_file())
+        ok, lines = judge(cell, verify_json(text), load_ceiling(ceil), names, onboard)
         print("\n".join(lines))
         return 0 if ok else 1
+    if len(argv) == 2 and argv[0] == "run-summary":
+        print(run_summary(Path(argv[1])))
+        return 0
     if len(argv) == 3 and argv[0] == "skip":
         print(f"RATCHET NOTE: {argv[1]} not judged: {argv[2]}")
         return 0

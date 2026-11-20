@@ -329,10 +329,14 @@ def test_the_size_job_waits_for_the_cells_and_reads_both_cells_memory():
     size = doc["jobs"]["size"]
     # runs when cells fail; skipped only on an upgrade-cell-only dispatch (no cell ran)
     assert size["needs"] == "cell" and size["if"] == "always() && inputs.cells != 'upgrade'", size["if"]
-    dl = [s for s in size["steps"] if str(s.get("uses", "")).startswith("actions/download-artifact@")]
+    every = [s for s in size["steps"] if str(s.get("uses", "")).startswith("actions/download-artifact@")]
+    # the memory cells by name; the verify ratchet's run summary takes every
+    # cell's report by pattern (tests/test_install_cell_ratchet.py)
+    dl = [s for s in every if "name" in s["with"]]
     assert {s["with"]["name"] for s in dl} == {"install-cell-ubuntu-24.04-amd64-default", "install-cell-ubuntu-22.04-amd64"}
+    assert [s["with"].get("pattern") for s in every if "name" not in s["with"]] == ["install-cell-*"]
     assert all(re.fullmatch(r"actions/download-artifact@[0-9a-f]{40}", s["uses"]) and s.get("continue-on-error")
-               for s in dl), "pinned by SHA; a missing artifact fails only its download"
+               for s in every), "pinned by SHA; a missing artifact fails only its download"
     run = next(s["run"] for s in size["steps"] if s.get("name") == "Size report")
     for cell in ("ubuntu-24.04-amd64-default", "ubuntu-22.04-amd64"):
         assert f'"{cell}=$M/install-cell-{cell}/memory.json"' in run
