@@ -3950,7 +3950,7 @@ fn auto_rotate_leaves(
     // be reported as "nothing needs rotating". Otherwise a wrong path silently
     // disables auto-rotation until certificates actually expire.
     let dir = std::path::Path::new(pki_dir);
-    let public_root = mount.public_root(dir);
+    let public_root = { let _ = mount; dir.to_path_buf() };
     if crate::cert_expiry::find_certs_in(dir, &public_root).is_empty() {
         return Err(format!(
             "Cert auto-rotate: no certificates found under {pki_dir} — the \
