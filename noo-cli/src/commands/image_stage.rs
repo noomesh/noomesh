@@ -1548,9 +1548,10 @@ mod tests {
 
     #[test]
     fn a_third_party_lock_row_is_never_staged() {
-        // `nats@sha256:` pins docker.io/library/nats:<version> for the
-        // controller's own start; it is not `<prefix>/nats:<tag>`, so a
-        // stage would ask the release registry for an image it never had.
+        // `nats@sha256:` pins our mirror ghcr.io/noomesh/nats:<upstream
+        // version> for the controller's own start; it is not
+        // `<prefix>/nats:<release tag>`, so a stage would ask the release
+        // registry for an image it never had.
         // `ollama` is OUR hardened image (docker/Dockerfile.ollama, i323) and
         // IS staged for the nodes.
         let lock = format!("# tag v0.6.5\ngateway@{D}\nnats@{D}\nollama@{D}\nllamacpp@{D}\n");

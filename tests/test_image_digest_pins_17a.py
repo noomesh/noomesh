@@ -54,7 +54,7 @@ def test_the_parser_found_the_sources_and_every_kind_of_them():
     seen = {(s.path, s.written) for s in SOURCES}
     assert ("docker/Dockerfile.llamacpp", "${DHI_REGISTRY}/uv:0-debian13-dev") in seen
     assert (".github/workflows/mirror-images.yml", "dhi.io/uv:0-debian13-dev") in seen
-    assert ("docker-compose.cluster.yml", "nats:2.14.9") in seen
+    assert ("docker-compose.cluster.yml", "ghcr.io/noomesh/nats:2.14.9") in seen   # our mirror of the official nats
 
 
 def test_every_third_party_image_source_is_digest_pinned():

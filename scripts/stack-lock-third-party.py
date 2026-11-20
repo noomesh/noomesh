@@ -28,9 +28,11 @@ release namespace, `<namespace>/<name>`, made by a mirror-images.yml lane
   anonymous   the digest must be readable WITHOUT credentials (this job logs
               in to ghcr.io, so a private package would otherwise resolve
               here and then fail every stranger's install).
-No row is such a mirror yet (nats and nginx still resolve from Docker Hub):
-the gates bite the moment a row's repo moves under the namespace. The DHI
-rows (`<namespace>/dhi/<name>`) are another family and are not gated here.
+nats and nginx are such rows: official Docker Hub images the stack runs from
+OUR mirror (`<namespace>/nats`, `<namespace>/nginx`), so an install never
+dials Docker Hub for them, and a mirror that is missing, private or carries
+another digest than its lane copied fails the lock job. The DHI rows
+(`<namespace>/dhi/<name>`) are another family and are not gated here.
 
   rows   --out DIR   resolve and write DIR/<name> (the lock job)
   check              parse the compose file only, print what would be resolved
@@ -83,8 +85,11 @@ def _plan_module():
 # An optional `${ANY_OVERRIDE:-...}` wrapper around the default is allowed
 # (OLLAMA_IMAGE, VLLM_IMAGE, NATS_IMAGE: an operator's own image wins).
 THIRD_PARTY: dict[str, dict[str, str]] = {
-    "nats": {"compose": "nats", "repo": "docker.io/library/nats", "ver": _VER},
-    "nginx": {"compose": "nginx", "repo": "docker.io/library/nginx", "ver": _VER},
+    # OUR mirrors of the official Docker Hub images (mirror-images.yml lanes,
+    # `dest_org: noomesh`): resolved from the mirror, held to its provenance
+    # and anonymous-pull gates (mirror_org below).
+    "nats": {"compose": NS + "/nats", "repo": NS + "/nats", "ver": _VER},
+    "nginx": {"compose": NS + "/nginx", "repo": NS + "/nginx", "ver": _VER},
     "redis": {"compose": _BASE + "/redis", "repo": DHI + "/redis", "ver": _VER},
     "loki": {"compose": _BASE + "/loki", "repo": DHI + "/loki", "ver": _VER},
     "tempo": {"compose": _BASE + "/tempo", "repo": DHI + "/tempo", "ver": _VER},

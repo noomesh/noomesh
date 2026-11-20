@@ -258,10 +258,11 @@ pub(crate) fn only_choice(options: usize) -> Option<usize> {
 pub(crate) const ONLY_BACKEND_LINE: &str = "Backend: Ollama — local inference, GGUF (the one backend for this machine)";
 
 /// The Docker Hub line when no login exists and base images come from the
-/// ghcr mirrors: two compose images still pull from Docker Hub itself
-/// (docker-compose.cluster.yml `nats:…`, `nginx:…`), anonymously.
+/// ghcr mirrors: every stack image does (nats and nginx too, from
+/// mirror-images.yml's `ghcr.io/noomesh/<name>` copies); only the opt-in
+/// vLLM backend (`vllm/vllm-openai`) is still a Docker Hub image.
 pub(crate) const DOCKER_HUB_OPTIONAL: &str =
-    "Docker Hub: not logged in — optional; two base images (nats, nginx) pull anonymously from Docker Hub";
+    "Docker Hub: not logged in — not needed; the stack's images all come from ghcr.io (only a vLLM backend, if you pick one, pulls from Docker Hub)";
 
 /// This run installs a standalone controller: no checkout, released images
 /// only (`standalone::finish_prepare` sets NOO_STANDALONE; a re-onboard finds
@@ -11570,12 +11571,14 @@ mod quiet_truthful_output_tests {
         assert_eq!(install_mode_without_asking(false), None);
         assert!(!offer_docker_hub_login(true));
         assert!(offer_docker_hub_login(false));
-        // nats and nginx come from Docker Hub itself, not the ghcr mirrors.
-        assert!(!DOCKER_HUB_OPTIONAL.contains("ghcr mirrors"));
-        assert!(DOCKER_HUB_OPTIONAL.contains("(nats, nginx) pull anonymously from Docker Hub"));
+        // nats and nginx come from our ghcr mirror now; vLLM alone is Docker Hub.
+        assert!(!DOCKER_HUB_OPTIONAL.contains("pull anonymously from Docker Hub"));
+        assert!(DOCKER_HUB_OPTIONAL.contains("all come from ghcr.io") && DOCKER_HUB_OPTIONAL.contains("only a vLLM backend"));
         let compose = include_str!("../../../docker-compose.cluster.yml");
-        assert!(compose.contains("image: ${NATS_IMAGE:-nats:"), "nats is no longer a Docker Hub image: reword DOCKER_HUB_OPTIONAL");
-        assert!(compose.contains("image: nginx:"), "nginx is no longer a Docker Hub image: reword DOCKER_HUB_OPTIONAL");
+        assert!(compose.contains("image: ${NATS_IMAGE:-ghcr.io/noomesh/nats:"), "nats pulls from elsewhere: reword DOCKER_HUB_OPTIONAL");
+        assert!(compose.contains("image: ghcr.io/noomesh/nginx:"), "nginx pulls from elsewhere: reword DOCKER_HUB_OPTIONAL");
+        assert!(!compose.contains("image: nginx:") && !compose.contains("${NATS_IMAGE:-nats:"), "a Docker Hub nats/nginx is back: reword DOCKER_HUB_OPTIONAL");
+        assert!(compose.contains("vllm/vllm-openai:"), "vLLM is no longer a Docker Hub image: reword DOCKER_HUB_OPTIONAL");
     }
 
     #[test]

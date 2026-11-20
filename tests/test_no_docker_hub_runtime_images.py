@@ -1,24 +1,23 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026 PersonifAI LLC
 
-"""The GHCR mirror lanes for the stack's last two Docker Hub runtime images.
+"""A fresh install pulls nothing from Docker Hub for the stack itself.
 
-The stack runs two official Docker Hub images, `nats:2.14.9` (the bus) and
-`nginx:<version>-alpine` (the model-cache weight server), straight from
-registry-1.docker.io: a stranger's install needs Docker Hub reachable and
-rides its anonymous rate limit. This change adds only the MIRROR, nothing
-consumes it yet:
-  - mirror-images.yml lanes copy them BY DIGEST to
-    `ghcr.io/noomesh/<name>:<tag>` (nats at the digest compose pins today,
-    nginx at 1.30.7, the version compose moves to separately);
-  - every lane is add-or-fail: a guard before the copy refuses to move a tag
-    that already holds another digest, and a step after it checks the mirror's
-    digest is the source's;
-  - the launcher's pull guard holds a third-party lock row to its digest pin
-    and never to the stack tag, so the mirror refs (under the image prefix,
-    upstream tag) start once compose names them.
-Compose, the lock rows and the docs move to the mirror in a later change,
-after the packages are public and an anonymous pull is confirmed.
+Until 2026-11-20 the stack ran two official Docker Hub images, `nats:2.14.9`
+(the bus) and `nginx:1.30.7-alpine` (the model-cache weight server), straight
+from registry-1.docker.io: a stranger's install needed Docker Hub reachable
+and rode its anonymous rate limit, while every other image came from ghcr.io.
+They now run from OUR mirror, `ghcr.io/noomesh/<name>:<tag>`:
+  - mirror-images.yml lanes copy them BY DIGEST (add-or-fail: a guard refuses
+    to move a tag that holds another digest, a step after the copy checks the
+    mirror's digest is the source's);
+  - compose defaults to the mirror at that same digest;
+  - their lock rows resolve from the mirror, so the lock job's provenance and
+    anonymous-pull gates (scripts/stack-lock-third-party.py) apply to them;
+  - the launcher's pull guard holds them to their digest pin and never to the
+    stack tag (they sit under the image prefix with their UPSTREAM tag);
+  - no compose service defaults to a Docker Hub image except the reasoned
+    NOT_MIRRORED ones (vLLM, an opt-in GPU backend).
 """
 from __future__ import annotations
 
@@ -40,6 +39,7 @@ spec.loader.exec_module(M)
 NS = M.NS   # ghcr.io/noomesh, read from scripts/lib-dist.sh
 ORG = NS.removeprefix("ghcr.io/")
 MIRRORED = {"nats": "nats:2.14.9", "nginx": "nginx:1.30.7-alpine"}
+COMPOSE_FILES = sorted(ROOT.glob("docker-compose*.yml"))
 # The upstream index digest each lane copies (checked against Docker Hub
 # 2026-11-20: the tag resolved to it).
 SOURCE_DIGEST = {
@@ -69,14 +69,15 @@ def test_the_mirror_lane_copies_the_compose_digest_by_digest(name):
     assert m, f"the lane must copy the official {MIRRORED[name]} BY DIGEST: {src}"
     assert lanes[0].get("auth") != "dhi"
     assert m.group(1) == SOURCE_DIGEST[name]
-    # Wherever compose names this version, it pins the digest the lane copies:
-    # the mirror carries the very bytes compose runs. (nats today; nginx once
-    # compose moves to 1.30.7, so a compose bump with another digest fails.)
+    # compose's default names the MIRROR at the very digest the lane copied:
+    # the mirror carries the very bytes compose runs, so a compose bump with
+    # another digest (or a lane bump without compose) fails here.
     compose = (ROOT / "docker-compose.cluster.yml").read_text()
-    dig = re.findall(re.escape(MIRRORED[name]) + r"\$\{NOO_IMAGE_DIGEST_[A-Z]+:-@(sha256:[0-9a-f]{64})\}", compose)
-    assert set(dig) <= {m.group(1)}, (dig, m.group(1))
-    if name == "nats":
-        assert dig, "compose pins nats 2.14.9 today: the agreement check must not be vacuous"
+    dig = re.findall(re.escape(f"{NS}/{MIRRORED[name]}") + r"\$\{NOO_IMAGE_DIGEST_[A-Z]+:-@(sha256:[0-9a-f]{64})\}",
+                     compose)
+    assert dig and set(dig) == {m.group(1)}, (dig, m.group(1))
+    # and the lock script reads the same lane (its provenance gate)
+    assert M.mirror_source_digest(name, MIRRORED[name].split(":", 1)[1], MIRROR_WF.read_text()) == m.group(1)
 
 
 def test_the_job_does_not_fail_fast():
@@ -231,7 +232,154 @@ def test_the_launcher_still_holds_a_stack_image_to_the_stack_tag():
     assert r.returncode == 1 and "this start runs v9.9.9" in r.stderr, r.stderr
 
 
-def test_the_launcher_still_accepts_todays_docker_hub_refs():
+def test_the_launcher_still_accepts_an_operators_docker_hub_override_at_its_pin():
+    # NATS_IMAGE may still name the Docker Hub image (an operator's choice): the
+    # third-party row holds it to the same digest pin wherever it comes from.
     r = _pull_guard([f"docker.io/library/nats:2.14.3@{D}", f"nginx:1.27-alpine@{G}"],
                     [f"NOO_IMAGE_DIGEST_NATS=@{D}", f"NOO_IMAGE_DIGEST_NGINX=@{G}"])
     assert r.returncode == 0, r.stderr
+
+
+# ── compose: no service defaults to Docker Hub, unless listed with a reason ──
+
+# Compose images that are neither ours (ghcr.io/noomesh/..., a local build, or
+# a first-party name the dist overlay re-points) nor allowed to be silent.
+# Repository -> why it is not mirrored. Adding one is a decision.
+NOT_MIRRORED = {
+    "vllm/vllm-openai":
+        "the vLLM backend: opt-in (a GPU backend the wizard asks about), multi-GB per tag, pulled "
+        "only when vLLM is placed; still Docker Hub by the release lead's decision, pinned by the "
+        "lock (row vllm)",
+    # Not Docker Hub at all: listed only because it is not OURS either.
+    "ghcr.io/huggingface/text-embeddings-inference":
+        "TEI: GitHub's registry (ghcr.io/huggingface), not Docker Hub; pinned by the lock "
+        "(rows tei, tei-cpu)",
+}
+
+
+def _default(img: str) -> str:
+    """The effective default of an operator override `${X_IMAGE:-<default>}`
+    (NATS_IMAGE, VLLM_IMAGE, ...); a `${NOO_BASE_REGISTRY:-...}/x` ref is no wrapper."""
+    m = re.fullmatch(r"\$\{[A-Z][A-Z0-9_]*_IMAGE:-(.*)\}", img)
+    return m.group(1) if m else img
+
+
+def _repo(ref: str) -> str:
+    ref = re.sub(r"\$\{NOO_IMAGE_DIGEST_[A-Z0-9_]+:-[^}]*\}", "", ref).split("@")[0]
+    ref = re.sub(r"^\$\{NOO_BASE_REGISTRY:-([^}]+)\}", r"\1", ref)
+    head, _, tail = ref.rpartition(":")
+    return head if head and "/" not in tail else ref
+
+
+def _is_docker_hub(repo: str) -> bool:
+    """A reference with no registry host (`nats`, `vllm/vllm-openai`) or an
+    explicit docker.io one resolves to Docker Hub."""
+    if "/" not in repo:
+        return True
+    first = repo.split("/", 1)[0]
+    return first in ("docker.io", "index.docker.io", "registry-1.docker.io") or not (
+        "." in first or ":" in first or first == "localhost")
+
+
+def _compose_images() -> list[tuple[str, str, str]]:
+    """(file, service, effective default image) of every pulled compose image."""
+    out = []
+    for f in COMPOSE_FILES:
+        for name, svc in (yaml.safe_load(f.read_text()).get("services") or {}).items():
+            svc = svc or {}
+            img = str(svc.get("image", ""))
+            if not img or "build" in svc:
+                continue
+            # First-party: the release prefix, or a local-build name the dist
+            # overlay (docker-compose.dist.yml) re-points at the prefix.
+            if img.startswith(("${NOO_IMAGE_PREFIX", "noomesh/", "noo-")) or _default(img).startswith("${NOO_IMAGE_PREFIX"):
+                continue
+            out.append((f.name, name, _default(img)))
+    return out
+
+
+def test_the_scan_sees_the_runtime_images():
+    # Not vacuous: a parser that finds nothing would pass every guard below.
+    repos = {_repo(i) for _, _, i in _compose_images()}
+    assert {NS + "/nats", NS + "/nginx", NS + "/dhi/redis", "vllm/vllm-openai"} <= repos, sorted(repos)
+    assert _is_docker_hub("nats") and _is_docker_hub("vllm/vllm-openai") and _is_docker_hub("docker.io/library/nginx")
+    assert not _is_docker_hub(NS + "/nats") and not _is_docker_hub("localhost:5000/x/y")
+    assert not _is_docker_hub("ghcr.io/huggingface/text-embeddings-inference")
+
+
+def test_no_compose_service_pulls_from_docker_hub_unlisted():
+    hub = sorted({f"{f}:{svc}: {img}" for f, svc, img in _compose_images()
+                  if _is_docker_hub(_repo(img)) and _repo(img) not in NOT_MIRRORED})
+    assert not hub, ("compose services that pull from Docker Hub: mirror them into "
+                     f"{NS}/<name> (mirror-images.yml) or list them in NOT_MIRRORED with the reason:\n  "
+                     + "\n  ".join(hub))
+
+
+def test_every_other_compose_image_is_ours_or_listed():
+    other = sorted({f"{f}:{svc}: {img}" for f, svc, img in _compose_images()
+                    if not _repo(img).startswith(NS + "/") and _repo(img) not in NOT_MIRRORED})
+    assert not other, other
+
+
+def test_the_not_mirrored_list_is_reasoned_and_not_stale():
+    repos = {_repo(i) for _, _, i in _compose_images()}
+    for repo, why in NOT_MIRRORED.items():
+        assert len(why) > 40, repo
+        assert repo in repos, f"{repo}: no compose service runs it any more, drop it"
+    # The two this change moved never come back to the list.
+    assert not ({"nats", "nginx", "library/nats", "library/nginx"} & set(NOT_MIRRORED))
+    # Docker Hub's remaining entry is vLLM alone.
+    assert {r for r in NOT_MIRRORED if _is_docker_hub(r)} == {"vllm/vllm-openai"}
+
+
+@pytest.mark.parametrize("name", sorted(MIRRORED))
+def test_compose_uses_the_ghcr_mirror(name):
+    imgs = [(f, svc, i) for f, svc, i in _compose_images() if _repo(i).rsplit("/", 1)[-1] == name
+            or _repo(i) in (name, f"library/{name}", f"docker.io/library/{name}")]
+    assert imgs, f"no compose service runs {name}"
+    for f, svc, img in imgs:
+        assert _repo(img) == f"{NS}/{name}", f"{f}:{svc} runs {img}: not our mirror {NS}/{name}"
+        assert img.startswith(f"{NS}/{MIRRORED[name]}$" + "{" + M.digest_var(name) + ":-@sha256:"), img
+
+
+@pytest.mark.parametrize("name", sorted(MIRRORED))
+def test_the_lock_rows_resolve_from_the_mirror(name):
+    compose = (ROOT / "docker-compose.cluster.yml").read_text()
+    entry = M.THIRD_PARTY[name]
+    assert entry["repo"] == entry["compose"] == f"{NS}/{name}"
+    assert M.mirror_org(name) == ORG, "a mirror row: the provenance and anonymous gates apply"
+    assert M.compose_version(name, compose) == MIRRORED[name].split(":", 1)[1]
+    # the CLI treats it as a third-party row (never staged for nodes)
+    rs = (ROOT / "noo-cli/src/commands/image_stage.rs").read_text()
+    rows = re.search(r"THIRD_PARTY_LOCK_ROWS: &\[&str\] = &\[([^\]]*)\]", rs).group(1)
+    assert f'"{name}"' in rows
+
+
+def test_the_lock_job_gates_both_mirror_rows_on_the_real_files(tmp_path, monkeypatch, capsys):
+    """`rows` on today's compose and mirror-images.yml: nats and nginx resolve
+    from the mirror, must equal the digest their lane copies, and are read
+    anonymously; a mirror at another digest writes no row."""
+    resolved, anon = [], []
+    monkeypatch.setattr(M, "resolve", lambda ref: resolved.append(ref) or SOURCE_DIGEST[ref.split("/")[-1].split(":")[0]])
+    monkeypatch.setattr(M, "anonymous_digest", lambda repo, d: anon.append((repo, d)) or ("present", d))
+    out = tmp_path / "d"
+    assert M.main(["rows", "--out", str(out), "--only", "nats", "--only", "nginx"]) == 0, capsys.readouterr().err
+    assert resolved == [f"{NS}/{MIRRORED[n]}" for n in sorted(MIRRORED)]
+    assert anon == [(f"{NS}/{n}", SOURCE_DIGEST[n]) for n in sorted(MIRRORED)]
+    for n in MIRRORED:
+        assert (out / n).read_text() == f"{n}@{SOURCE_DIGEST[n]}\n"
+    # the mirror at another digest than its lane copied: refused, no row
+    monkeypatch.setattr(M, "resolve", lambda ref: B)
+    assert M.main(["rows", "--out", str(tmp_path / "e"), "--only", "nats"]) == 1
+    assert "is not the upstream image" in capsys.readouterr().err
+    assert not (tmp_path / "e").exists()
+
+
+# ── the words a stranger reads ───────────────────────────────────────────────
+
+def test_install_doc_does_not_send_a_stranger_to_docker_hub():
+    doc = (ROOT / "docs/getting-started/install.md").read_text()
+    row = next(ln for ln in doc.splitlines() if ln.startswith("| Network |"))
+    before, _, vllm = row.partition("`registry-1.docker.io`")
+    assert vllm, row
+    assert "at install" in before and "only if you pick the vLLM backend" in vllm, row

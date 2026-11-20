@@ -1096,7 +1096,10 @@ jobs:
       # Third-party images the stack runs straight from their upstream
       # registry by a FIXED compose tag (ollama, nats, nginx, redis, loki,
       # prometheus, alertmanager, grafana, node-exporter, TEI, vLLM; the DHI
-      # ones resolve from the ghcr.io/noomesh/dhi mirror). Their index digest is
+      # ones resolve from the ghcr.io/noomesh/dhi mirror, nats and nginx from
+      # our ghcr.io/noomesh copies of the official images, each of which must
+      # equal the digest its mirror-images.yml lane copied and be pullable
+      # anonymously). Their index digest is
       # resolved from that tag NOW and becomes an ordinary `<name>@sha256:`
       # row, so `noo upgrade --stack` pulls them by digest and skips them when
       # unchanged (2026-10-15: `ollama/ollama:latest` re-pulled 91.6 s on
