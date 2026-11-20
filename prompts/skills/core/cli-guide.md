@@ -17,8 +17,11 @@ parent_skill: null
 # noomesh Interface Guide
 
 Mesh has two interfaces: the **CLI** (`noo` commands in the terminal) and the
-**Dashboard** (web UI at `http://<controller>:8080`). They talk to the same
-gateway — use whichever fits the task.
+**Dashboard** (web UI). They talk to the same gateway — use whichever fits
+the task. The gateway serves HTTPS only and binds loopback unless
+`NOO_BIND_MODE` says otherwise: the dashboard is `https://localhost:8080` on
+the controller, or `https://<controller>.<your-tailnet>.ts.net` from another
+machine on the tailnet.
 
 ## How It Works: Controller vs Nodes
 
@@ -26,17 +29,22 @@ gateway — use whichever fits the task.
 You (terminal or browser)
   │
   ▼
-Controller (:8080)          ← gateway, database, scheduler live here
+Controller (https :8080)    ← gateway, database, scheduler live here
   │
   ├──► Worker Node A (GPU)  ← runs AI backends (vLLM, Ollama, llamacpp)
   ├──► Worker Node B (GPU)
   └──► Worker Node C (CPU)
 ```
 
-- The **CLI always runs on the controller**. It sends instructions to the gateway.
-- The **gateway routes work to worker nodes** — starting backends, pulling models,
-  dispatching jobs. You never need to SSH into workers.
-- `noo models pull mistral` downloads to a **worker node**, not the controller.
+- The **CLI runs on any box it is installed on**: the controller, every enrolled
+  node, or a laptop that talks to a remote controller. It sends instructions to
+  the gateway. Verbs that act on the local stack (`noo stack`, `noo db`,
+  `noo logs`, `noo security pki`) run only on the controller; a node refuses them.
+- The **gateway routes work to worker nodes** — placements, model imports,
+  jobs. Nodes pull their work; nothing logs into a worker.
+- `noo models pull mistral` pulls into the **controller's own Ollama** (ollama
+  only). To stage a model for a node: `noo models fetch ollama:<tag>`, then
+  `noo cluster import-model <node> ollama:<tag>` (or `--place`).
 - `noo cluster place <node> vllm <model>` declares vLLM on a **worker node**, not locally.
 - Knowledge base, memory, and conversations live on the **controller** (PostgreSQL).
 
@@ -48,24 +56,23 @@ Set `CONTROLLER_URL` if the gateway isn't on localhost, or pass `--gateway` / `-
 |------|-----|-----------|
 | Quick commands, scripting, automation | **Best** | — |
 | Chat with the AI | `noo chat` | Chat tab (richer: voice, history, feedback) |
-| Check cluster health | `noo cluster status` | Cluster tab (node cards with load bars) |
-| Start/stop backends | `noo cluster place` / `unplace` | Backends tab (dropdowns, one-click) |
-| GPU metrics & charts | — | **Observability tab (only here)** |
-| Browse models & cache | `noo models search/pull` | Backends tab (HF catalog dropdowns) |
-| Ingest documents | `noo rag ingest file.pdf` | RAG tab (drag-and-drop + URL input) |
-| RAG query | `noo rag query "..."` | Explorer tab |
-| Explore knowledge graph | `noo graph search/detail` | **RAG tab 3D graph (only here)** |
-| Memory & embedding stats | `noo memory stats/embed` | Memory tab (richer: health score, charts) |
-| Search conversations | `noo memory search "..."` | Memory tab (semantic search) |
-| Job queue management | `noo jobs list/cancel/drain` | Jobs tab (same features, visual) |
-| Approval queue | `noo approval list/approve` | Self-Regulation tab + Security page |
-| Security violations | — | **Security dashboard (only here)** |
-| Self-identity | — | **Self-Regulation tab (only here)** |
-| Architecture diagrams | — | **Brain + Workflow pages (only here)** |
-| Feedback & DPO export | — | **Feedback tab (only here)** |
-| Disk cleanup | — | **Security dashboard (only here)** |
+| Check cluster health | `noo cluster status` / `verify` | Cluster tab (node cards with load bars) |
+| Declare/remove backends | `noo cluster place` / `unplace` | Backends tab |
+| GPU telemetry | — | **Observe tab (only here)** |
+| Browse models & cache | `noo models search/cached` | Backends tab (cached models) |
+| Ingest documents | `noo rag ingest file.pdf` | Documents tab (upload + URL input) |
+| RAG query | `noo rag query "..."` | Explorer tab (full builds) |
+| Explore knowledge graph | `noo graph search/detail` | Graph tab |
+| Memory & embedding stats | `noo memory stats/embed` | Memory tab |
+| Search conversations | `noo memory search "..."` | Memory tab |
+| Job queue management | `noo jobs list/cancel/drain` | Jobs tab (full builds) |
+| Approval queue | `noo approval list/approve` | Security tab (pending approvals) |
+| Security violations | — | **Security tab (only here)** |
+| Token usage | — | **Usage tab (only here)** |
+| Architecture diagram | — | **Architecture tab (only here)** |
+| Disk reclaim rule | — | Autonomy tab (rules) |
 | Cron tasks | `noo heartbeat list/add` | — |
-| Autonomy engine | `noo autonomy status/audit` | Self-Regulation tab |
+| Autonomy engine | `noo autonomy status/audit` | Autonomy tab (rules + decisions) |
 | Multi-agent collab | `noo agents collaborate` | — |
 | Workflows | `noo workflow run` | — |
 | Voice | `noo voice transcribe/speak` | Chat tab (push-to-talk) |
@@ -75,8 +82,8 @@ Set `CONTROLLER_URL` if the gateway isn't on localhost, or pass `--gateway` / `-
 
 **Rule of thumb:** CLI for operations and automation, Dashboard for monitoring
 and visual exploration. Some things are CLI-only (mesh, heartbeat, workflows,
-prompt-skills, db migrations). Some things are Dashboard-only (GPU charts,
-3D graph, security dashboard, self-regulation controls, feedback/DPO).
+prompt-skills, db migrations). Some things are Dashboard-only (GPU telemetry,
+security violations, token usage, the architecture diagram).
 
 ## CLI Quick Reference
 
@@ -92,16 +99,19 @@ noo inference agent "task"                # Agentic loop with tools
 ```
 noo cluster status                        # All nodes, GPUs, backends
 noo cluster provision <node>              # Provision an enrolled worker node
-noo cluster place gpu-node-1 vllm auto    # Declare a backend on a node (the agent converges)
+noo cluster place gpu-node-1 vllm Qwen/Qwen2.5-7B-Instruct  # Declare a backend + model (the agent converges)
+noo --json cluster verify --wait          # Wait for the fleet; exit 0 = every check holds
 noo cluster unplace gpu-node-1 vllm       # Remove the placement
 noo cluster down vllm --node gpu-node-1   # Stop backend on a node now
-noo cluster logs <node>                   # Fetch node logs via SSH
+noo cluster logs <node> [<service>] [-b <backend>] [-n <lines>]  # One-shot tail over the mesh (no -f)
 ```
 
-### Models (downloaded TO worker nodes, not the controller)
+### Models (staged on the controller, imported by nodes)
 ```
 noo models search "mistral"               # Search HuggingFace
-noo models pull <model> --backend vllm    # Download to a worker node
+noo models pull <model>                   # Pull into the controller's Ollama (ollama only)
+noo models fetch ollama:<tag>             # Stage an Ollama tag in the controller store
+noo cluster import-model <node> ollama:<tag>  # Import it into that node's Ollama
 noo models cached                         # Which models are on which nodes
 noo models recommended                    # Models for your hardware tiers
 ```
@@ -154,7 +164,7 @@ noo autonomy audit                        # Recent autonomous decisions
 
 ### Multi-Agent & Workflows
 ```
-noo agents collaborate "task"             # Planner + coder + reviewer
+noo agents collaborate "task"             # Roles via -r (default: researcher,analyst)
 noo workflow list                         # Available pipelines
 noo workflow run deep_research -i topic="X"
 ```
@@ -188,6 +198,7 @@ noo --version                             # Version info
 ## Tips
 - Add `--help` to any command: `noo jobs submit --help`
 - Use `-v` / `--verbose` for detailed output
-- Dashboard is at `http://<controller>:8080` — same host as the gateway
-- Dashboard pages: `/` (main), `/brain` (architecture), `/workflow` (data flow),
-  `/security` (violations & cleanup)
+- Dashboard is at `https://localhost:8080` on the controller, or its tailnet
+  `ts.net` name — same host and port as the gateway
+- The dashboard is one page (`/`); Cluster, Documents, Observe, Security,
+  Autonomy, Architecture etc. are tabs in its sidebar, not separate URLs

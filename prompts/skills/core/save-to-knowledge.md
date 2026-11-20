@@ -21,7 +21,7 @@ workspace and RAG system play distinct roles:
 
 | Layer | Path / Tool | Purpose |
 |-------|-------------|---------|
-| Workspace | `/workspace` (mounted at `/mnt/d/AgentWorkspace`) | File-system persistence. Editable, inspectable, NOT auto-indexed. |
+| Workspace | `workspace.mount` in noomesh.yaml (default `/workspace`; `workspace.host` is the host folder behind it) | File-system persistence. Editable, inspectable, NOT auto-indexed. |
 | RAG knowledge base | `noo_rag_ingest` | Vector-indexed + graph-extracted. Recalled by `noo_rag_query` on future turns. |
 
 To make content truly retrievable, you MUST do both: write to the workspace AND ingest into RAG.

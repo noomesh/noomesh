@@ -532,7 +532,12 @@ async fn dispatch(
 /// `initialize`): what it is, then how agent mail works, which a client
 /// with no hook can learn nowhere else.
 fn instructions() -> String {
-    format!("{} {}", "noomesh operator door: the full tool catalog, run with operator authority.", crate::agent_mailbox::MAILBOX_INSTRUCTIONS)
+    format!(
+        "{} {} {}",
+        "noomesh operator door: the full tool catalog, run with operator authority.",
+        "No door tool places models or runs verify: use the noo CLI on the controller (`noo cluster place <node> <backend> <model>`, then `noo --json cluster verify --wait`, exit 0 = healthy). To add a machine, call noo_mint_bootstrap_token; a person runs its enroll command on that machine.",
+        crate::agent_mailbox::MAILBOX_INSTRUCTIONS
+    )
 }
 
 #[cfg(test)]
