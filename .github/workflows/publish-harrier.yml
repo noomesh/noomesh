@@ -47,6 +47,22 @@ jobs:
     if: github.repository == 'noomesh/noomesh'
     runs-on: ubuntu-latest
     steps:
+      # FIRST, before anything else touches them: both free-text dispatch
+      # inputs, whole-string, or nothing runs. They reach a shell only as
+      # quoted env (tests/test_dispatch_inputs_never_reach_a_shell_raw.py).
+      - name: Validate dispatch inputs
+        shell: bash
+        env:
+          RELEASE: ${{ github.event.inputs.release }}
+          IMAGE_TAG: ${{ github.event.inputs.image_tag }}
+        run: |
+          export LC_ALL=C
+          re='^models-harrier-v[0-9]+$'
+          [[ $RELEASE =~ $re ]] || {
+            printf '::error::release %q refused: must be exactly models-harrier-v<N>\n' "$RELEASE"; exit 1; }
+          re='^v[0-9]+$'
+          [[ $IMAGE_TAG =~ $re ]] || {
+            printf '::error::image_tag %q refused: must be exactly v<N>\n' "$IMAGE_TAG"; exit 1; }
       - name: Fetch the release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

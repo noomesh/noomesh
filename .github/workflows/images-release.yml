@@ -106,7 +106,20 @@ jobs:
       # The infra images (JSON list: scripts/infra-staged.py DAILY, as the
       # plan reads it). One the images leg BUILDS is scanned and gated there.
       infra: ${{ steps.plan.outputs.infra }}
+    env:
+      RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}   # validated by the job's first step
     steps:
+      # FIRST, before anything else touches it: the tag (the free-text
+      # dispatch input `tag`, or the pushed tag's name) is a stack release
+      # tag, or nothing in this job runs. It reaches a shell only as
+      # "$RAW_TAG" (tests/test_dispatch_inputs_never_reach_a_shell_raw.py).
+      - name: Validate dispatch inputs
+        shell: bash
+        run: |
+          export LC_ALL=C
+          re='^(stack-)?v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'
+          [[ $RAW_TAG =~ $re ]] || {
+            printf '::error::tag %q refused: must be exactly vX.Y.Z or stack-vX.Y.Z with an optional -rc.N\n' "$RAW_TAG"; exit 1; }
       - name: Checkout (full history)   # actions/checkout@v7.0.1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -115,7 +128,7 @@ jobs:
         id: line
         run: |
           set -eu
-          raw="${{ github.event.inputs.tag || github.ref_name }}"
+          raw="$RAW_TAG"
           tag="stack-${raw#stack-}"
           case "$tag" in
             *-rc.*) line=staging ;;
@@ -197,7 +210,7 @@ jobs:
           RELEASE_RETAG: ${{ vars.RELEASE_RETAG }}
         run: |
           set -eu
-          raw="${{ github.event.inputs.tag || github.ref_name }}"
+          raw="$RAW_TAG"
           tag="stack-${raw#stack-}"
           python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --user pyyaml
           python3 scripts/release-retag-plan.py --tag "$tag" \
@@ -244,10 +257,22 @@ jobs:
     if: github.repository == 'noomesh/noomesh' && github.event.inputs.dry_run != 'true'
     runs-on: ubuntu-latest
     env:
+      RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}   # validated by the job's first step
       RETAG: ${{ fromJSON(needs.release-line.outputs.retag)['deps-core'] }}
       RC_TAG: ${{ needs.release-line.outputs.rc_image_tag }}
       RC_DIGEST: ${{ fromJSON(needs.release-line.outputs.rc_digests)['deps-core'] }}   # from the rc's stack-<rc>.bases; empty for an rc cut before it existed
     steps:
+      # FIRST, before anything else touches it: the tag (the free-text
+      # dispatch input `tag`, or the pushed tag's name) is a stack release
+      # tag, or nothing in this job runs. It reaches a shell only as
+      # "$RAW_TAG" (tests/test_dispatch_inputs_never_reach_a_shell_raw.py).
+      - name: Validate dispatch inputs
+        shell: bash
+        run: |
+          export LC_ALL=C
+          re='^(stack-)?v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'
+          [[ $RAW_TAG =~ $re ]] || {
+            printf '::error::tag %q refused: must be exactly vX.Y.Z or stack-vX.Y.Z with an optional -rc.N\n' "$RAW_TAG"; exit 1; }
       - name: Checkout   # actions/checkout@v7.0.1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -293,7 +318,7 @@ jobs:
           # launcher strips, so it looked for `:v0.2.25` and found nothing.
           # An input that is wrong only for the value a human would naturally
           # pass is worse than one that is always wrong.
-          raw="${{ github.event.inputs.tag || github.ref_name }}"
+          raw="$RAW_TAG"
           echo "TAG=${raw#stack-}" >> "$GITHUB_ENV"
           # A release candidate never moves `:latest` (promotion model).
           case "${raw#stack-}" in *-rc.*) ;; *) echo "PUSH_LATEST=1" >> "$GITHUB_ENV" ;; esac
@@ -365,10 +390,22 @@ jobs:
     if: github.repository == 'noomesh/noomesh'
     runs-on: ubuntu-latest
     env:
+      RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}   # validated by the job's first step
       RETAG: ${{ fromJSON(needs.release-line.outputs.retag)['deps-base'] }}
       RC_TAG: ${{ needs.release-line.outputs.rc_image_tag }}
       RC_DIGEST: ${{ fromJSON(needs.release-line.outputs.rc_digests)['deps-base'] }}   # from the rc's stack-<rc>.bases; empty for an rc cut before it existed
     steps:
+      # FIRST, before anything else touches it: the tag (the free-text
+      # dispatch input `tag`, or the pushed tag's name) is a stack release
+      # tag, or nothing in this job runs. It reaches a shell only as
+      # "$RAW_TAG" (tests/test_dispatch_inputs_never_reach_a_shell_raw.py).
+      - name: Validate dispatch inputs
+        shell: bash
+        run: |
+          export LC_ALL=C
+          re='^(stack-)?v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'
+          [[ $RAW_TAG =~ $re ]] || {
+            printf '::error::tag %q refused: must be exactly vX.Y.Z or stack-vX.Y.Z with an optional -rc.N\n' "$RAW_TAG"; exit 1; }
       - name: Checkout   # actions/checkout@v7.0.1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -482,7 +519,7 @@ jobs:
           # launcher strips, so it looked for `:v0.2.25` and found nothing.
           # An input that is wrong only for the value a human would naturally
           # pass is worse than one that is always wrong.
-          raw="${{ github.event.inputs.tag || github.ref_name }}"
+          raw="$RAW_TAG"
           echo "TAG=${raw#stack-}" >> "$GITHUB_ENV"
           # A release candidate never moves `:latest` (promotion model).
           case "${raw#stack-}" in *-rc.*) ;; *) echo "PUSH_LATEST=1" >> "$GITHUB_ENV" ;; esac
@@ -559,6 +596,7 @@ jobs:
     if: github.repository == 'noomesh/noomesh'
     runs-on: ubuntu-latest
     env:
+      RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}   # validated by the job's first step
       RETAG: ${{ fromJSON(needs.release-line.outputs.retag)[matrix.image] }}
       # the rc's image tag, or `@sha256:…` for a staged infra image (i567)
       RC_TAG: ${{ fromJSON(needs.release-line.outputs.source_tags)[matrix.image] }}
@@ -618,7 +656,7 @@ jobs:
             dockerfile: docker/Dockerfile.node-agent-go
             context: .
             platforms: linux/amd64,linux/arm64
-            extra_args: --build-arg NODE_AGENT_VERSION=${{ github.ref_name }} --build-arg NODE_AGENT_COMMIT=${{ github.sha }}
+            extra_args: --build-arg NODE_AGENT_VERSION=stack-$TAG --build-arg NODE_AGENT_COMMIT=${{ github.sha }}
           # ── Remaining controller-profile first-party images ──────────────
           # Published so `pai stack start --dist` is a genuine pull-only
           # install (no local build). All amd64: the controller is x86.
@@ -764,6 +802,17 @@ jobs:
             platforms: linux/amd64
             extra_args: ""
     steps:
+      # FIRST, before anything else touches it: the tag (the free-text
+      # dispatch input `tag`, or the pushed tag's name) is a stack release
+      # tag, or nothing in this job runs. It reaches a shell only as
+      # "$RAW_TAG" (tests/test_dispatch_inputs_never_reach_a_shell_raw.py).
+      - name: Validate dispatch inputs
+        shell: bash
+        run: |
+          export LC_ALL=C
+          re='^(stack-)?v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'
+          [[ $RAW_TAG =~ $re ]] || {
+            printf '::error::tag %q refused: must be exactly vX.Y.Z or stack-vX.Y.Z with an optional -rc.N\n' "$RAW_TAG"; exit 1; }
       - name: Checkout   # actions/checkout@v7.0.1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -815,7 +864,7 @@ jobs:
           # launcher strips, so it looked for `:v0.2.25` and found nothing.
           # An input that is wrong only for the value a human would naturally
           # pass is worse than one that is always wrong.
-          raw="${{ github.event.inputs.tag || github.ref_name }}"
+          raw="$RAW_TAG"
           echo "TAG=${raw#stack-}" >> "$GITHUB_ENV"
           # A release candidate never moves `:latest` (promotion model).
           case "${raw#stack-}" in *-rc.*) ;; *) echo "PUSH_LATEST=1" >> "$GITHUB_ENV" ;; esac
@@ -982,7 +1031,20 @@ jobs:
     permissions:
       contents: write
       packages: read
+    env:
+      RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}   # validated by the job's first step
     steps:
+      # FIRST, before anything else touches it: the tag (the free-text
+      # dispatch input `tag`, or the pushed tag's name) is a stack release
+      # tag, or nothing in this job runs. It reaches a shell only as
+      # "$RAW_TAG" (tests/test_dispatch_inputs_never_reach_a_shell_raw.py).
+      - name: Validate dispatch inputs
+        shell: bash
+        run: |
+          export LC_ALL=C
+          re='^(stack-)?v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'
+          [[ $RAW_TAG =~ $re ]] || {
+            printf '::error::tag %q refused: must be exactly vX.Y.Z or stack-vX.Y.Z with an optional -rc.N\n' "$RAW_TAG"; exit 1; }
       - name: Resolve tag
         run: |
           set -eu
@@ -995,7 +1057,7 @@ jobs:
           # launcher strips, so it looked for `:v0.2.25` and found nothing.
           # An input that is wrong only for the value a human would naturally
           # pass is worse than one that is always wrong.
-          raw="${{ github.event.inputs.tag || github.ref_name }}"
+          raw="$RAW_TAG"
           echo "TAG=${raw#stack-}" >> "$GITHUB_ENV"
           # A release candidate never moves `:latest` (promotion model).
           case "${raw#stack-}" in *-rc.*) ;; *) echo "PUSH_LATEST=1" >> "$GITHUB_ENV" ;; esac

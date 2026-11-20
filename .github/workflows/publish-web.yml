@@ -46,7 +46,21 @@ jobs:
     defaults:
       run:
         working-directory: ui
+    env:
+      RAW_TAG: ${{ inputs.tag || github.ref_name }}   # validated by the job's first step
     steps:
+      # FIRST, before anything else touches it: the tag (the free-text
+      # dispatch input `tag`, or the pushed tag's name) is a stack release
+      # tag, or nothing in this job runs. It reaches a shell only as
+      # "$RAW_TAG" (tests/test_dispatch_inputs_never_reach_a_shell_raw.py).
+      - name: Validate dispatch inputs
+        shell: bash
+        working-directory: .   # before the checkout: ui/ does not exist yet
+        run: |
+          export LC_ALL=C
+          re='^(stack-)?v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'
+          [[ $RAW_TAG =~ $re ]] || {
+            printf '::error::tag %q refused: must be exactly vX.Y.Z or stack-vX.Y.Z with an optional -rc.N\n' "$RAW_TAG"; exit 1; }
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
@@ -59,7 +73,7 @@ jobs:
         working-directory: .
         run: |
           set -eu
-          raw="${{ inputs.tag || github.ref_name }}"
+          raw="$RAW_TAG"
           tag="stack-${raw#stack-}"
           case "$tag" in *-rc.*) line=staging ;; *) line=main ;; esac
           git fetch --quiet origin "+refs/heads/$line:refs/remotes/origin/$line" 2>fetch.err || {
@@ -86,7 +100,7 @@ jobs:
         working-directory: .
         run: |
           set -eu
-          raw="${{ inputs.tag || github.ref_name }}"
+          raw="$RAW_TAG"
           echo "value=${raw#stack-}" >> "$GITHUB_OUTPUT"
 
       - name: Install

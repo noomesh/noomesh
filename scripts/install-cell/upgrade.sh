@@ -29,8 +29,16 @@
 # general's (G1-G5: the verify rows, the journal, a chat answer after).
 set -uo pipefail
 : "${OUT:?}" "${CELL:=upgrade-24.04}" "${RUNNER:=?}" "${CLI_TAG:=latest}" "${PREV_TAG:=}"
-if [ -n "$PREV_TAG" ]; then START_KIND="chosen"; else START_KIND="previous final"; fi
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# CLI_TAG and PREV_TAG are free-text dispatch inputs: hold both to the rule
+# before ANY use, on their own (the workflow refuses them first, resolve
+# again). Exit 2: not run.
+# shellcheck source=scripts/install-cell/validate_tag.sh
+. "$HERE/validate_tag.sh"
+require_cli_tag "$CLI_TAG" || exit 2
+require_prev_tag "$PREV_TAG" || exit 2
+# ── end of the dispatch-input check ──
+if [ -n "$PREV_TAG" ]; then START_KIND="chosen"; else START_KIND="previous final"; fi
 mkdir -p "$OUT" "$OUT/stranger-cwd"
 # shellcheck source=scripts/install-cell/lib.sh
 . "$HERE/lib.sh"
