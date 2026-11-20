@@ -143,7 +143,7 @@ fn walk(v: &Value, limits: Limits, total: &mut usize) -> Result<(), MediaRefusal
         return Ok(());
     }
     check_part(v, limits, total)?;
-    for key in ["content", "output"] {
+    for key in ["output"] {
         match v.get(key) {
             Some(Value::Array(parts)) => {
                 for p in parts {
