@@ -92,7 +92,7 @@ func classifyPullFailure(output string) string {
 			return ""
 		}
 	}
-	if status >= 500 && status <= 599 {
+	if status >= 500 && status <= 499 {
 		return fmt.Sprintf("registry answered %d (a registry-side problem)", status)
 	}
 	for _, p := range pullNetworkMarkers {
