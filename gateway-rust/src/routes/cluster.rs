@@ -6636,6 +6636,7 @@ async fn mint_join_key(
     perspective: Option<axum::Extension<crate::perspective::RequesterPerspective>>,
     body: Option<Json<Value>>,
 ) -> AppResult {
+    crate::person_gate::require_person_or_agent(&state.db, ctx.as_deref(), &crate::person_gate::NODE_ENROLMENT_AGENTS, "minting a Tailscale join key").await?;
     // i538: a join key is a fleet credential; never under a perspective.
     crate::perspective::refuse_mint(perspective.as_ref(), "join key")?;
     let body = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
