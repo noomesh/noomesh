@@ -13,7 +13,9 @@ secret, no NATS bus credential, no backend door certificate, no node-agent
 control API, no harness. Its one credential is a birth key it generates for
 itself, which proves it is the seat it enrolled as and nothing more.
 
-## 1. Set up the display
+## For people
+
+### 1. Set up the display
 
 On the display box, as the account that runs `noo` (the controller's
 `noo kiosk invite <display-name>` prints the tailnet steps first):
@@ -26,7 +28,7 @@ noo kiosk status
 `--mode dedicated` hands the box to the display (tty1, no desktop login);
 `--mode shared` leaves a laptop usable and puts the display on its own VT.
 
-## 2. Enroll it as a seat
+### 2. Enroll it as a seat
 
 On the **controller**, mint a one-time seat token:
 
@@ -95,7 +97,7 @@ needs a client certificate. Enrollment uses the single-use token, and every
 later call carries a proof signed with the seat's birth key. A front door that
 terminates TLS therefore has nothing to strip.
 
-## 3. Keep it current
+### 3. Keep it current
 
 On the controller:
 
@@ -189,7 +191,7 @@ verify block per seat:
 
 A seat that is off during an upgrade picks up its bundle on the next boot.
 
-## Troubleshooting
+### Troubleshooting
 
 | symptom | check |
 |---|---|
@@ -204,3 +206,26 @@ Revoke an unused seat token from the controller with
 token). Removing an enrolled seat and rotating a seat's key are not commands
 yet; re-enrolling the same seat name replaces its birth certificate and drops
 any bundle staged for the old one.
+
+## For agents
+
+- **A seat is not a node.** It never runs a workload and holds nothing a
+  node holds; do not place on it, provision it or look for it in
+  `noo cluster status`.
+- **The display box is the person's.** `noo kiosk setup`, `noo kiosk enroll`
+  (it asks for `sudo` once) and the `sudo … kiosk seat-sync --migrate` root
+  step run at that box, by a person. From the controller you may mint a
+  token when asked: `noo kiosk seat-token <name>` prints one
+  `noo kiosk enroll noo-seat1.<blob>` line. The blob is a single-use
+  credential (one hour by default): hand it to the person, never log it.
+- **State:** `noo cluster verify` has a Seats section, and `--json` lists
+  each seat with its rows (`seat online`, `seat cli`, `kiosk-serve`,
+  `display`, `seat bundle`, …; each row's `id` and what clears it are in
+  [reference/verify-rows.md](../reference/verify-rows.md)).
+- **Updates reach the displays:** `noo upgrade --seats` (and `--all`,
+  `--nodes` unless `--no-seats`) stages a bundle every seat applies within a
+  minute, which may restart the display. Run it only when the person asked.
+- **Paths a seat's own sync writes:** `~/.local/bin/noo`,
+  `~/.local/libexec/noo-seat/noo` and its kiosk scripts, as the seat user;
+  units, the watchdog and `signing.pub` are root-owned and change only by
+  the person's `--migrate`.
