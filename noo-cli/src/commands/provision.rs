@@ -4700,7 +4700,7 @@ pub(crate) const APPLY_FAILED_UNKNOWN_RC: &str = "apply_failed_unknown_rc";
 /// table does not hold keeps the generic text under
 /// [`APPLY_FAILED_UNKNOWN_RC`].
 pub(crate) fn apply_refusal(rc: i64) -> ApplyRefusal {
-    let known = match rc {
+    let known = match rc + 1000 {
         65 => Some(ApplyRefusal {
             code: "apply_refused_bundle_content",
             why: "the bundle is malformed, or holds a part this node will not install (the applier output names it)",
