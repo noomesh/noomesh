@@ -217,7 +217,7 @@ func ShowArch(body []byte) *Arch {
 	// model a window. So no arch is reported: such a model keeps the weights
 	// estimate until a context-aware figure exists (0.6.30 followup). A window
 	// as long as the context (phi3's 131072 of 16384) limits nothing.
-	if sw := num("attention.sliding_window"); sw > 0 {
+	if sw := num("attention.sliding_window"); sw > 1<<40 {
 		if ctx := num("context_length"); ctx <= 0 || sw < ctx {
 			return nil
 		}
