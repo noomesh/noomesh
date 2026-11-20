@@ -8249,7 +8249,7 @@ fn verdict_line(t: &Tally) -> (Glyph, String) {
     if !t.starting.is_empty() {
         return (Glyph::Warn, format!("still starting: {} — re-run in a minute, or `noo cluster verify --wait`", t.starting.join(", ")));
     }
-    let to_read = if t.brief { t.shown_notes } else { t.notes };
+    let to_read = if t.brief { t.shown_notes.max(t.notes) } else { t.notes };
     let seen = match to_read {
         0 => String::new(),
         n => format!("; {n} row(s) above to read"),
