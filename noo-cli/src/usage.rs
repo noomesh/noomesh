@@ -251,7 +251,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["models", "switch"], "<model> [--backend <b>] [-y|--yes]", "Switch the active model: rewrites .env/noomesh.yaml, restarts; asks (-y)"),
     (&["models", "refresh"], "[--backend <b>] [--llm]", "Rebuild the model catalog cache from HuggingFace, bypassing the TTL"),
     (&["health"], "", "Probe gateway /health and report per-dependency state; exit 5 if degraded"),
-    (&["inference", "run"], "<prompt> [-m <model>] [-n <node> [--strict-node]] [--raw] [-u <user>] [--max-tokens <n>] [-t <temperature>]", "Run one prompt; --raw skips mesh context (RAG, memory, skills)"),
+    (&["inference", "run"], "<prompt> [-m|--model <model>] [-n|--node <node> [--strict-node]] [--raw] [-u|--user <user>] [--max-tokens <n>] [-t|--temperature <temperature>]", "Run one prompt; --raw skips mesh context (RAG, memory, skills)"),
     (&["db", "status"], "", "Show gateway health and every migration stamp (mesh/trellion/evolve); --json supported"),
     (&["doctor", "docker"], "", "Detect unclean-shutdown docker damage (ghosts, empty names) and print recovery"),
     (&["doctor", "privileges"], "", "Report standing power on this box: sudoers drop-ins, gate binaries, SSH keys"),
@@ -472,6 +472,22 @@ pub fn is_command(words: &[&str]) -> bool {
 }
 
 /// (syntax, description) for exactly these command words.
+/// Syntax for the dev-checkout pytest runners (main.rs `HIDDEN_NO_USAGE`):
+/// shown by their own `--help` and usage error only. Kept out of [`USAGE`]
+/// so customer help, completion and the generated CLI docs never list
+/// commands that fail on a shipped install. Every flag here is `noo`'s own;
+/// neither command passes other arguments through to pytest.
+pub const DEV_USAGE: &[(&[&str], &str, &str)] = &[
+    (&["test", "run"], "[-x|--failfast | --no-failfast] [-k <pattern>] [--integration]", "In a dev checkout: run the repo's pytest suite; --integration adds tests/integration"),
+    (&["test", "coverage"], "[--html]", "In a dev checkout: run pytest with coverage; --html also writes an HTML report"),
+];
+
+/// [`lookup`], then [`DEV_USAGE`]: what a command's own `--help` and usage
+/// error show.
+pub fn help_lookup(words: &[&str]) -> Option<(&'static str, &'static str)> {
+    lookup(words).or_else(|| DEV_USAGE.iter().find(|(w, _, _)| *w == words).map(|(_, s, d)| (*s, *d)))
+}
+
 pub fn lookup(words: &[&str]) -> Option<(&'static str, &'static str)> {
     USAGE
         .iter()

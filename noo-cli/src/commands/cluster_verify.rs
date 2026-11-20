@@ -2527,7 +2527,7 @@ pub(crate) fn host_checks(id: &str, host: &Value, hostd_alive: bool) -> Vec<Chec
         } else {
             out.push(warn("holds",
                 format!("platform package(s) not held — an ordinary `apt upgrade` moves them: {}", unheld.join(", ")),
-                Some(format!("the hold command in {runbook}"))));
+                Some(format!("on {id}: sudo apt-mark hold {}", unheld.join(" ")))));
         }
     }
 
@@ -3028,13 +3028,31 @@ pub(crate) fn model_classes_check(classes: Option<&Value>) -> Check {
     ok("model classes", format!("{} declared class(es), {total} candidate(s) all placed or available", declared.len()))
 }
 
+/// The `default chat` remedy when no node in the fleet has a GPU.
+pub(crate) const CPU_ONLY_FLEET_CHAT_REMEDY: &str =
+    "none needed on a CPU-only fleet; adding a GPU node lets it move to a faster model";
+
+/// Whether any node in `/api/cluster/nodes` reports GPU memory (`vram_gb`,
+/// in `capabilities` or at the top level; a unified-memory node reports its
+/// pool). `None` when the list is empty: an unread fleet is not a CPU-only one.
+pub(crate) fn fleet_has_gpu(fleet: &[Value]) -> Option<bool> {
+    if fleet.is_empty() {
+        return None;
+    }
+    Some(fleet.iter().any(|n| n["capabilities"]["vram_gb"].as_f64().or_else(|| n["vram_gb"].as_f64()).unwrap_or(0.0) > 0.0))
+}
+
 /// The `default chat` row: where an unpinned request (`default`, `auto`, no
 /// model) goes right now — chat-default's live candidates in routing order
 /// (the gateway's `routing_order`), and who is left out. `x` when none; `!`
 /// when every candidate is CPU-only, when one node carries all of it (no
 /// fallback), or when only excluded nodes (thermal critical, quarantined)
 /// are left.
-pub(crate) fn default_chat_check(classes: Option<&Value>) -> Check {
+///
+/// `has_gpu` ([`fleet_has_gpu`]): on a fleet with no GPU node at all,
+/// CPU candidates are the only kind there can be, so the CPU-only warning
+/// names no place command — placing another CPU model changes nothing.
+pub(crate) fn default_chat_check(classes: Option<&Value>, has_gpu: Option<bool>) -> Check {
     const NAME: &str = "default chat";
     let Some(body) = classes else {
         return warn(NAME, "not read", Some("noo cluster class list".into()));
@@ -3097,7 +3115,12 @@ pub(crate) fn default_chat_check(classes: Option<&Value>) -> Check {
         return warn(NAME, format!("{detail} — only excluded nodes are left (thermal critical / quarantined)"), Some("noo cluster status".into()));
     }
     if !order.iter().any(is_gpu) {
-        return warn(NAME, format!("{detail} — only CPU candidates"), Some("noo cluster place <node> <backend> <model>".into()));
+        let remedy = if has_gpu == Some(false) {
+            CPU_ONLY_FLEET_CHAT_REMEDY
+        } else {
+            "noo cluster place <node> <backend> <model>"
+        };
+        return warn(NAME, format!("{detail} — only CPU candidates"), Some(remedy.into()));
     }
     if nodes.len() == 1 {
         return warn(NAME, format!("{detail} — one node carries every unpinned request (no fallback)"), Some("noo cluster place <node> <backend> <model>".into()));
@@ -3250,6 +3273,12 @@ pub(crate) fn agent_cert_check(id: &str, host: &str, covers: Option<bool>, other
     })
 }
 
+/// Where orphaned agent mail is read. No CLI command shows it (`noo agents
+/// inbox` reads the caller's own names only), so the remedy names the MCP
+/// tool as an MCP tool rather than as something to type in a shell.
+pub(crate) const AGENT_MAIL_ORPHANED_REMEDY: &str =
+    "read it with the MCP tool noo_agent_inbox (orphaned=true) from an agent session of that account; no noo command shows it";
+
 pub(crate) fn agent_mail_check(body: Option<&Value>) -> Check {
     const NAME: &str = "agent mail";
     let Some(body) = body else {
@@ -3277,7 +3306,7 @@ pub(crate) fn agent_mail_check(body: Option<&Value>) -> Check {
     warn(
         NAME,
         format!("{total} unread message(s) orphaned by retired mailboxes: {}", parts.join("; ")),
-        Some("read them with noo_agent_inbox orphaned=true through an MCP door (the account's own view)".into()),
+        Some(AGENT_MAIL_ORPHANED_REMEDY.into()),
     )
 }
 
@@ -5460,8 +5489,8 @@ pub(crate) fn at_rest_dirs(env: &dyn Fn(&str) -> Option<String>) -> Vec<AtRestDi
 /// LUKS2-volume plan. Both say what it protects (a drive in someone else's
 /// hands) and what it does not (root on the running machine). Planned, not
 /// built: no command is named. Rows with the same text print once.
-const AT_REST_REMEDY_KEYS: &str = "planned (i10a): seal these keys to this machine's TPM so they decrypt only into RAM at service start. Until then anyone holding the drive can read them; root on the running machine always can.";
-const AT_REST_REMEDY_DATA: &str = "planned (i10a): move the data root onto a LUKS2 volume on this disk (no reinstall), unlocked at boot by this machine's TPM. Until then anyone holding the drive can read these files; root on the running machine always can.";
+const AT_REST_REMEDY_KEYS: &str = "planned for a later release: seal these keys to this machine's TPM so they decrypt only into RAM at service start. Until then anyone holding the drive can read them; root on the running machine always can.";
+const AT_REST_REMEDY_DATA: &str = "planned for a later release: move the data root onto a LUKS2 volume on this disk (no reinstall), unlocked at boot by this machine's TPM. Until then anyone holding the drive can read these files; root on the running machine always can.";
 
 fn at_rest_remedy(name: &str) -> &'static str {
     match name {
@@ -5666,7 +5695,7 @@ pub(crate) fn at_rest_outside_check(
     warn(
         NAME,
         format!("in the clear, outside the ten rows above: {list}"),
-        Some("planned (i10a): claude-config and alertmanager-data ride the encrypted state volume; docker logs and journald need their own handling. Until then anyone holding the drive can read them.".into()),
+        Some("planned for a later release: claude-config and alertmanager-data ride the encrypted state volume; docker logs and journald need their own handling. Until then anyone holding the drive can read them.".into()),
     )
 }
 
@@ -6258,7 +6287,7 @@ pub(crate) fn agent_protect_check(nodes: &[(String, bool)], reports: &[(String, 
         return None;
     }
     let unheld: Vec<&str> = due.iter().copied().filter(|n| !held_nodes.contains(n)).collect();
-    if let Some(first) = unheld.first() {
+    if !unheld.is_empty() {
         let mut detail = format!(
             "no hold reported on {} (installed by onboard, or never applied): its node agent is not held to the paths it writes",
             unheld.join(", ")
@@ -6269,10 +6298,17 @@ pub(crate) fn agent_protect_check(nodes: &[(String, bool)], reports: &[(String, 
         return Some(warn(
             "agent protect",
             detail,
-            Some(format!("for each node listed: noo cluster provision {first} --wait")),
+            Some(provision_each(&unheld)),
         ));
     }
     Some(ok("agent protect", format!("the node agent writes only where it must on {}", held.join(", "))))
+}
+
+/// One `noo cluster provision <node> --wait` per node, in order:
+/// provision takes a single node, so a row that names several must give a
+/// command for each, not only the first.
+fn provision_each(nodes: &[&str]) -> String {
+    nodes.iter().map(|n| format!("noo cluster provision {n} --wait")).collect::<Vec<_>>().join("; ")
 }
 
 /// What a node's applier prints once it checks root code against the
@@ -8737,7 +8773,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let model_classes = get_json_opt(g, "/api/cluster/model-classes", true, 15);
         checks.push(model_classes_check(model_classes.as_ref()));
         // Where an unpinned chat goes: chat-default's live candidates.
-        checks.push(default_chat_check(model_classes.as_ref()));
+        checks.push(default_chat_check(model_classes.as_ref(), fleet_has_gpu(&fleet)));
         let spaces = get_json_opt(g, "/api/cluster/embedding-spaces", true, 15);
         checks.push(embedding_spaces_check(spaces.as_ref()));
         // Finding 126: a loaded model measured over its estimate or pool.
@@ -9980,7 +10016,7 @@ mod tests {
                 {"node_id": "ctrl", "backend": "ollama", "model": "gemma4:e2b-it-qat", "gpu": false, "reason": "rank=cpu,params=2,load=0.05"},
             ],
             "skipped": [{"node_id": "node-a", "backend": "vllm", "reason": "thermal critical"}]}]});
-        let c = default_chat_check(Some(&two));
+        let c = default_chat_check(Some(&two), None);
         assert_eq!(c.verdict, super::Verdict::Ok, "{c:?}");
         assert!(c.detail.starts_with("dynamic: node-mac/ollama=gemma4:12b (rank=gpu,params=12,load=0.40) > ctrl/"), "{}", c.detail);
         assert!(c.detail.contains("skipped node-a/vllm: thermal critical"), "{}", c.detail);
@@ -9988,14 +10024,14 @@ mod tests {
         let cpu = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": [
             {"node_id": "ctrl", "backend": "ollama", "model": "e2b", "gpu": false},
             {"node_id": "pi", "backend": "llamacpp", "model": "x", "gpu": false}]}]});
-        let c = default_chat_check(Some(&cpu));
+        let c = default_chat_check(Some(&cpu), None);
         assert_eq!(c.verdict, super::Verdict::Warn);
         assert!(c.detail.contains("only CPU"), "{}", c.detail);
 
         let one = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": [
             {"node_id": "node-a", "backend": "vllm", "model": "HF", "gpu": true},
             {"node_id": "node-a", "backend": "ollama", "model": "m", "gpu": true}]}]});
-        let c = default_chat_check(Some(&one));
+        let c = default_chat_check(Some(&one), None);
         assert_eq!(c.verdict, super::Verdict::Warn);
         assert!(c.detail.contains("one node"), "{}", c.detail);
 
@@ -10004,17 +10040,17 @@ mod tests {
         let emb = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": [
             {"node_id": "ctl", "backend": "ollama", "model": "harrier:latest", "gpu": true},
             {"node_id": "node-a", "backend": "vllm", "model": "HF", "gpu": true}]}]});
-        let c = default_chat_check(Some(&emb));
+        let c = default_chat_check(Some(&emb), None);
         assert!(!c.detail.contains("harrier"), "{}", c.detail);
         assert!(c.detail.contains("one node"), "only node-a is a chat node: {}", c.detail);
         let only_emb = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": [
             {"node_id": "ctl", "backend": "ollama", "model": "harrier:latest", "gpu": true}]}]});
-        assert_eq!(default_chat_check(Some(&only_emb)).verdict, super::Verdict::Fail);
+        assert_eq!(default_chat_check(Some(&only_emb), None).verdict, super::Verdict::Fail);
 
         let none = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": []}]});
-        assert_eq!(default_chat_check(Some(&none)).verdict, super::Verdict::Fail);
-        assert_eq!(default_chat_check(Some(&serde_json::json!({"classes": []}))).verdict, super::Verdict::Fail);
-        assert_eq!(default_chat_check(None).verdict, super::Verdict::Warn);
+        assert_eq!(default_chat_check(Some(&none), None).verdict, super::Verdict::Fail);
+        assert_eq!(default_chat_check(Some(&serde_json::json!({"classes": []})), None).verdict, super::Verdict::Fail);
+        assert_eq!(default_chat_check(None, None).verdict, super::Verdict::Warn);
     }
 
     use super::*;
@@ -16229,7 +16265,7 @@ mod default_chat_remedy_tests {
     /// verify and onboard's last line name the SAME one command (i677 #12).
     #[test]
     fn no_chat_default_names_the_first_model_command() {
-        let c = default_chat_check(Some(&serde_json::json!({"classes": []})));
+        let c = default_chat_check(Some(&serde_json::json!({"classes": []})), None);
         assert_eq!(c.verdict, Verdict::Fail);
         assert_eq!(c.remedy.as_deref(), Some(crate::onboard::FIRST_MODEL_CMD));
         assert!(crate::onboard::NO_CHAT_MODEL_YET.ends_with(c.remedy.as_deref().unwrap()));
@@ -17568,5 +17604,88 @@ mod json_parity_tests {
         assert!(seats_json(false, Vec::new()).is_null());
         assert_eq!(seats_json(true, Vec::new()), serde_json::json!([]));
         assert_eq!(seats_json(true, vec![serde_json::json!({"seat": "s"})]).as_array().map(Vec::len), Some(1));
+    }
+}
+
+/// Every remedy below is a command the user can run, or says plainly that
+/// none is needed or where the thing is read: no runbook pointer, no
+/// internal tracking id, no node left out.
+#[cfg(test)]
+mod remedy_command_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The `holds` row gives the hold command itself, on the node, for
+    /// exactly the packages not held — not a pointer into a runbook.
+    #[test]
+    fn the_holds_remedy_is_the_apt_mark_hold_command_on_the_node() {
+        let h = json!({
+            "os": "linux", "running_kernel": "7.0.11", "default_kernel": "7.0.11",
+            "platform": { "linux-system76": "7.1.5", "tailscale": "1.102.4", "docker-ce": "29.8.1" },
+            "held": ["linux-system76"],
+            "tailscale_state": "Running", "tailscale_online": true,
+        });
+        let c = host_checks("node_a", &h, true);
+        let holds = c.iter().find(|c| c.name == "holds").expect("a holds row");
+        assert_eq!(holds.verdict, Verdict::Warn);
+        assert_eq!(holds.remedy.as_deref(), Some("on node_a: sudo apt-mark hold docker-ce tailscale"));
+    }
+
+    /// The at-rest rows say what is planned without an internal id.
+    #[test]
+    fn the_at_rest_remedies_carry_no_internal_id() {
+        let item = |what: &str, path: &str| OutsideItem { what: what.into(), path: path.into(), encrypted: Some(false) };
+        let outside = at_rest_outside_check(&[item("docker volume claude-config", "/var/lib/docker/volumes/x_claude-config/_data")], None);
+        let outside = outside.remedy.expect("an exposed location has a remedy");
+        for r in [AT_REST_REMEDY_KEYS, AT_REST_REMEDY_DATA, outside.as_str()] {
+            assert!(!r.contains("i10a") && r.starts_with("planned for a later release: "), "{r}");
+        }
+    }
+
+    /// `noo cluster provision` takes one node, so the agent protect row
+    /// gives one command per unheld node, every one of them.
+    #[test]
+    fn the_agent_protect_remedy_provisions_every_unheld_node() {
+        let nodes = [("ctrl".to_string(), false), ("node_a".to_string(), false), ("node_b".to_string(), false)];
+        let reports = [("node_b".to_string(), Some(0), "applied: agent-protect=8".to_string())];
+        let c = agent_protect_check(&nodes, &reports).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert_eq!(
+            c.remedy.as_deref(),
+            Some("noo cluster provision ctrl --wait; noo cluster provision node_a --wait"),
+        );
+    }
+
+    /// On a fleet with no GPU node, CPU candidates are all there can be: the
+    /// row names no place command. With a GPU node it keeps the suggestion,
+    /// and an unread fleet is not taken for a CPU-only one.
+    #[test]
+    fn the_default_chat_cpu_only_remedy_depends_on_the_fleet_having_a_gpu() {
+        let cpu = json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": [
+            {"node_id": "ctrl", "backend": "ollama", "model": "e2b", "gpu": false}]}]});
+        let c = default_chat_check(Some(&cpu), Some(false));
+        assert_eq!(c.remedy.as_deref(), Some(CPU_ONLY_FLEET_CHAT_REMEDY));
+        assert!(!CPU_ONLY_FLEET_CHAT_REMEDY.contains("noo cluster place"));
+        for has_gpu in [Some(true), None] {
+            let c = default_chat_check(Some(&cpu), has_gpu);
+            assert_eq!(c.remedy.as_deref(), Some("noo cluster place <node> <backend> <model>"), "{has_gpu:?}");
+        }
+        let cpu_fleet = [json!({"id": "ctrl", "capabilities": {"vram_gb": 0.0}}), json!({"id": "node_a"})];
+        assert_eq!(fleet_has_gpu(&cpu_fleet), Some(false));
+        let gpu_fleet = [json!({"id": "ctrl"}), json!({"id": "node_a", "capabilities": {"vram_gb": 24.0}})];
+        assert_eq!(fleet_has_gpu(&gpu_fleet), Some(true));
+        assert_eq!(fleet_has_gpu(&[json!({"id": "node_b", "vram_gb": 8.0})]), Some(true));
+        assert_eq!(fleet_has_gpu(&[]), None);
+    }
+
+    /// Orphaned agent mail is read through an MCP tool; the remedy names it
+    /// as one and does not pass it off as a shell command.
+    #[test]
+    fn the_agent_mail_remedy_names_the_mcp_tool_as_one() {
+        let body = json!({"accounts": [{"account": "owner", "orphaned": [{"name": "owner/w", "unread": 2}]}]});
+        let c = agent_mail_check(Some(&body));
+        let r = c.remedy.expect("a remedy");
+        assert_eq!(r, AGENT_MAIL_ORPHANED_REMEDY);
+        assert!(r.contains("the MCP tool noo_agent_inbox (orphaned=true)") && !r.starts_with("read them with"), "{r}");
     }
 }

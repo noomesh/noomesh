@@ -1296,7 +1296,7 @@ fn print_native_help_for(words: &[String]) {
         .unwrap_or("");
 
     if let Some(entry) = exact {
-        let (syntax, about) = usage::lookup(entry).unwrap_or(("", ""));
+        let (syntax, about) = usage::help_lookup(entry).unwrap_or(("", ""));
         let joined = entry.join(" ");
         println!("{}", ui::header_as_is(&format!("noo {joined}"), if about.is_empty() { None } else { Some(about) }));
         println!("{}", ui::section("usage"));
@@ -1317,9 +1317,15 @@ fn print_native_help_for(words: &[String]) {
     println!();
     println!(
         "{}",
-        ui::muted("Globals: --json  --quiet  --color <mode>  --watch [s]  -v  -G/--gateway <url>  --timeout <s>  --token <jwt>  --instance <name>")
+        ui::muted(GLOBALS_HELP)
     );
 }
+
+/// The globals line under every command's `--help`. Long and short forms
+/// both, as `resolve_with` accepts them: `--verbose` was accepted (by
+/// `noo cluster status`, by every command) but the line showed only `-v`.
+const GLOBALS_HELP: &str =
+    "Globals: --json  -q/--quiet  --color <mode>  --watch [s]  -v/--verbose  -G/--gateway <url>  --timeout <s>  --token <jwt>  --instance <name>";
 
 /// Two-column rows: `noo <words> <syntax>` left, description right, wrapped
 /// so a long syntax never squeezes the description off the terminal.
@@ -1801,7 +1807,7 @@ fn main() {
 /// parser's "bad args" signal).
 fn usage_error(json: bool, prefix: &[&str]) -> ! {
     let joined = prefix.join(" ");
-    let (syntax, about) = usage::lookup(prefix).unwrap_or(("", ""));
+    let (syntax, about) = usage::help_lookup(prefix).unwrap_or(("", ""));
     // The parser's own reason (`--node needs a value`), when it gave one.
     let detail = args::take_message();
     let usage_line = if syntax.is_empty() { format!("noo {joined}") } else { format!("noo {joined} {syntax}") };
@@ -2110,6 +2116,38 @@ const SOURCES: &[(&str, &str)] = &[
             "cluster issue-token printed a token nothing validates; it was removed"
         );
         assert!(!is_hidden_native(&["cluster", "status"]));
+    }
+
+    /// Flags the parsers accept show in `--help`: the usage line
+    /// (`noo <words> <syntax>`, as `print_native_help_for` prints it) and the
+    /// globals line. `inference run` showed only `-n`, the globals line only
+    /// `-v`, and the dev-only `test run`/`test coverage` had no syntax at all.
+    #[test]
+    fn help_shows_every_flag_the_parser_accepts() {
+        let line = |w: &[&str]| {
+            let (syntax, _) = usage::help_lookup(w).unwrap_or_else(|| panic!("no help syntax for {w:?}"));
+            format!("noo {} {syntax}", w.join(" "))
+        };
+        let run = line(&["inference", "run"]);
+        for f in ["--node", "-n", "--model", "--user", "--temperature", "--strict-node"] {
+            assert!(run.contains(f), "{f} missing: {run}");
+        }
+        // A global: printed under every command's help, `cluster status` and
+        // `cluster verify` (whose guidance names `noo cluster verify --verbose`) alike.
+        assert!(GLOBALS_HELP.contains("-v/--verbose"), "{GLOBALS_HELP}");
+        let test_run = line(&["test", "run"]);
+        for f in ["--no-failfast", "--integration", "--failfast", "-k <pattern>"] {
+            assert!(test_run.contains(f), "{f} missing: {test_run}");
+        }
+        assert!(line(&["test", "coverage"]).contains("--html"));
+        // Still off the customer surface: no USAGE row, so no docs or completion.
+        for w in [&["test", "run"][..], &["test", "coverage"][..]] {
+            assert!(usage::lookup(w).is_none() && HIDDEN_NO_USAGE.contains(&w), "{w:?}");
+        }
+        // Every DEV_USAGE row is a hidden native command, never a customer one.
+        for (w, _, _) in usage::DEV_USAGE {
+            assert!(HIDDEN_NO_USAGE.contains(w), "{w:?}");
+        }
     }
 
     #[test]
