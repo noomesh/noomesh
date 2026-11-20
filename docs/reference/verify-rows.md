@@ -6,7 +6,8 @@ Every row `noo cluster verify` can print, and the few that `noo security
 at-rest preflight-firmware` prints. `!` is a warning (the verb still
 passes), `x` a failure (exit 1). A row's `id` is stable: programs key on it
 (`noo --json cluster verify` prints it beside `name`, which may be
-reworded). Node rows are under `nodes[].checks`, controller rows under
+reworded); `id` is never null, and a null is a bug to report. Node rows
+are under `nodes[].checks`, controller rows under
 `controller.checks`.
 
 ## Node rows (one set per node)
