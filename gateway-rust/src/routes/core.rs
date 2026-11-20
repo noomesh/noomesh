@@ -1318,7 +1318,7 @@ async fn auth_me(
         // Both are the one 401 (`auth::unauthenticated`), the same answer as
         // no token or a bad one, so /auth/me cannot be asked which accounts
         // exist or are disabled.
-        Some(_) | None => crate::auth::unauthenticated(),
+        Some(_) | None => (StatusCode::UNAUTHORIZED, Json(json!({"detail": "User no longer exists"}))).into_response(),
     }
 }
 
