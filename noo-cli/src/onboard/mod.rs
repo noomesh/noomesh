@@ -1739,7 +1739,7 @@ pub(crate) const CLOSING_VERIFY_NOT_DONE: &str =
 /// read-only unless `--scope` adds more), and the key bound to THAT account.
 /// Text only: binding a key to any account still works.
 pub(crate) const MCP_DOOR_ACCOUNT_CMD: &str = "noo security user create <agent>";
-pub(crate) const MCP_DOOR_KEY_CMD: &str = "noo security service-key issue <name> --user <agent> --scopes mcp";
+pub(crate) const MCP_DOOR_KEY_CMD: &str = "noo security service-key issue <name> --user <you> --scopes mcp";
 pub(crate) const MCP_DOOR_ADMIN_WARNING: &str = "a key bound to your own admin account can do everything you can";
 
 /// The door-key hint both onboard sites print. Pure.
