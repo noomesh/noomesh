@@ -9910,7 +9910,7 @@ pub(crate) fn heard_since(n: &Value, since: i64) -> bool {
 /// (i1098). Under `--verbose`, which shows every row, it prints with one
 /// line naming the verb that enrolls a seat. `--json` keeps `seats: []`.
 pub(crate) fn seats_heading(count: Option<usize>, verbose: bool) -> Option<(String, Option<&'static str>)> {
-    let n = count.filter(|n| *n > 0 || verbose)?;
+    let n = count.filter(|n| *n > 0 || verbose || *n == 0)?;
     Some((format!("Seats ({n})"), (n == 0).then_some(NO_SEATS_LINE)))
 }
 
