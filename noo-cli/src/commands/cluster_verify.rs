@@ -12048,7 +12048,7 @@ mod tests {
         assert_eq!(tailnet_merge_missing(&serde_json::json!({"in_sync": false})), None);
 
         let row = |missing: Option<Vec<String>>| {
-            let c = controller_checks(&serde_json::json!({"posture": []}), &serde_json::json!({"keys": []}), &[],
+            let c = controller_checks(ControllerHost::default(), &serde_json::json!({"posture": []}), &serde_json::json!({"keys": []}), &[],
                 (0, &Value::Null), &Value::Null, &Value::Null, None, missing, None);
             c.into_iter().find(|c| c.name == "tailnet policy").unwrap()
         };
@@ -12103,13 +12103,13 @@ mod tests {
     #[test]
     fn a_tailnet_bind_that_a_reboot_can_break_fails_exposure() {
         let exposure = serde_json::json!({ "status": "confined", "boot_safe": false, "ip_nonlocal_bind": false });
-        let c = controller_checks(&serde_json::json!({"posture": [{"key": "K", "running": "1", "db_value": "1"}]}),
+        let c = controller_checks(ControllerHost::default(), &serde_json::json!({"posture": [{"key": "K", "running": "1", "db_value": "1"}]}),
             &serde_json::json!({"keys": []}), &[], (0, &Value::Null), &exposure, &Value::Null, None, None, None);
         let e = c.iter().find(|c| c.name == "exposure").unwrap();
         assert_eq!(e.verdict, Verdict::Fail);
         assert!(e.remedy.as_deref().unwrap().contains("ip_nonlocal_bind=1"));
         let safe = serde_json::json!({ "status": "confined", "boot_safe": true });
-        let c = controller_checks(&serde_json::json!({"posture": [{"key": "K", "running": "1", "db_value": "1"}]}),
+        let c = controller_checks(ControllerHost::default(), &serde_json::json!({"posture": [{"key": "K", "running": "1", "db_value": "1"}]}),
             &serde_json::json!({"keys": []}), &[], (0, &Value::Null), &safe, &Value::Null, None, None, None);
         assert_eq!(verdict(&c, "exposure"), Verdict::Ok);
     }
@@ -12207,7 +12207,7 @@ mod tests {
         let posture = serde_json::json!({ "posture": [
             { "key": "NOO_EXEC_APPROVAL_MODE", "running": "strict", "db_value": "approval", "pending_restart": true },
         ]});
-        let c = controller_checks(&posture, &serde_json::json!({"keys": []}), &[], (0, &Value::Null), &Value::Null, &Value::Null, None, None, None);
+        let c = controller_checks(ControllerHost::default(), &posture, &serde_json::json!({"keys": []}), &[], (0, &Value::Null), &Value::Null, &Value::Null, None, None, None);
         let p = c.iter().find(|c| c.name == "posture").unwrap();
         assert_eq!(p.verdict, Verdict::Fail);
         assert!(p.detail.contains("NOO_EXEC_APPROVAL_MODE"));
@@ -16023,7 +16023,7 @@ mod missing_key_remedy_tests {
         let keys = serde_json::json!({ "count": 0, "keys": [] });
         let posture = serde_json::json!({ "count": 0, "posture": [] });
         let row = |required: Vec<(String, String)>| {
-            controller_checks(&posture, &keys, &required, (0, &serde_json::json!({})), &serde_json::json!({}),
+            controller_checks(ControllerHost::default(), &posture, &keys, &required, (0, &serde_json::json!({})), &serde_json::json!({}),
                 &serde_json::json!({}), Some(0), None, None)
                 .into_iter().find(|c| c.name == "service keys").expect("the row")
         };
