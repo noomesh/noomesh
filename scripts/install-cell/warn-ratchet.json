@@ -141,8 +141,8 @@
   "streaming_over_tunnel": {
    "label": "node:streaming over tunnel",
    "status": "under triage",
-   "by": null,
-   "why": "i1098: warns during a tunnel reconnect on the --ci default cell; a candidate for the next triage (no followup filed yet)"
+   "by": "i1128",
+   "why": "NOT CHECKED on a fresh install's closing verify: it runs before the gateway's first tunnel probe result (or during a reconnect); triage in followup i1128"
   },
   "ollama_slots": {
    "label": "controller:ollama slots",
