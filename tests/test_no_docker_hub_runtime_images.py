@@ -3,7 +3,7 @@
 
 """The GHCR mirror lanes for the stack's last two Docker Hub runtime images.
 
-The stack runs two official Docker Hub images, `nats:2.14.3` (the bus) and
+The stack runs two official Docker Hub images, `nats:2.14.9` (the bus) and
 `nginx:<version>-alpine` (the model-cache weight server), straight from
 registry-1.docker.io: a stranger's install needs Docker Hub reachable and
 rides its anonymous rate limit. This change adds only the MIRROR, nothing
@@ -39,11 +39,11 @@ spec.loader.exec_module(M)
 
 NS = M.NS   # ghcr.io/noomesh, read from scripts/lib-dist.sh
 ORG = NS.removeprefix("ghcr.io/")
-MIRRORED = {"nats": "nats:2.14.3", "nginx": "nginx:1.30.7-alpine"}
+MIRRORED = {"nats": "nats:2.14.9", "nginx": "nginx:1.30.7-alpine"}
 # The upstream index digest each lane copies (checked against Docker Hub
 # 2026-11-20: the tag resolved to it).
 SOURCE_DIGEST = {
-    "nats": "sha256:7ff2e641c33dbdb0dd13a943ba0b70d841b71275c607baa53ef9b8661f0b2d8c",
+    "nats": "sha256:f0e72e96696382cc1e5bc637befd3177bb2d5b07c37fb507f8edd09827a342a3",
     "nginx": "sha256:caf4e1e032a20f9c3c5e28fc7f25ffd768ad8677b4975c54193075997b3a97e3",
 }
 
@@ -76,7 +76,7 @@ def test_the_mirror_lane_copies_the_compose_digest_by_digest(name):
     dig = re.findall(re.escape(MIRRORED[name]) + r"\$\{NOO_IMAGE_DIGEST_[A-Z]+:-@(sha256:[0-9a-f]{64})\}", compose)
     assert set(dig) <= {m.group(1)}, (dig, m.group(1))
     if name == "nats":
-        assert dig, "compose pins nats 2.14.3 today: the agreement check must not be vacuous"
+        assert dig, "compose pins nats 2.14.9 today: the agreement check must not be vacuous"
 
 
 def test_the_job_does_not_fail_fast():

@@ -780,7 +780,7 @@ dist_reassert_pins() {
 # keeps the guard live when the lock is absent or for another tag. Anything
 # else under the prefix is a third-party or monitoring image a mirror put
 # there - `grafana:12-debian13-dev`, `loki:3`, `redis:8.6-debian13-dev`,
-# `nats:2.14.3@sha256:...` - whose compose tag is NOT the stack tag, and
+# `nats:2.14.9@sha256:...` - whose compose tag is NOT the stack tag, and
 # which the pull must fetch as declared. A third-party lock row (nats, nginx
 # once they run from our mirror under the prefix itself) never reaches this
 # test: dist_assert_pull_refs holds it to its digest pin and moves on.
@@ -898,7 +898,7 @@ dist_assert_pull_refs() {
         # digest: held to their pins below, wherever their registry is.
         dist_assert_third_party_ref "$_ref" || return 1
         # ...and only there. Our mirrors of upstream images
-        # (ghcr.io/noomesh/nats:2.14.3 and the like, mirror-images.yml) sit
+        # (ghcr.io/noomesh/nats:2.14.9 and the like, mirror-images.yml) sit
         # under the image prefix with their UPSTREAM tag; their lock row would
         # make dist_ref_is_stack_versioned call them stack images and hold
         # them to the stack tag, refusing every roll.

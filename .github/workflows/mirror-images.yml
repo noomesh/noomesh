@@ -135,8 +135,8 @@ jobs:
           # source here AND the compose default together. The windows/amd64
           # entry of the nats index carries ordinary (distributable) layers,
           # no foreign ones: the full index copies, digest unchanged.
-          - source: nats:2.14.3@sha256:7ff2e641c33dbdb0dd13a943ba0b70d841b71275c607baa53ef9b8661f0b2d8c
-            dest: nats:2.14.3
+          - source: nats:2.14.9@sha256:f0e72e96696382cc1e5bc637befd3177bb2d5b07c37fb507f8edd09827a342a3
+            dest: nats:2.14.9
             dest_org: noomesh
           - source: nginx:1.30.7-alpine@sha256:caf4e1e032a20f9c3c5e28fc7f25ffd768ad8677b4975c54193075997b3a97e3
             dest: nginx:1.30.7-alpine
