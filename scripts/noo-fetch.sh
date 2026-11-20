@@ -435,7 +435,7 @@ decrypt_bundle() {  # sets NOO_REFUSAL and DECRYPT_RECORD; 0 or the report's rc
             -inkey "$KEY" -in "$TMP/blob" -out /dev/null 2>/dev/null; then
         NOO_REFUSAL=bundle_decrypt_io; return 73
     fi
-    NOO_REFUSAL=bundle_decrypt_failed; DECRYPT_RECORD=1; return 65
+    NOO_REFUSAL=bundle_decrypt_failed; return 65
 }
 # decrypt_refused RC — say it, record $LAST only for a mismatch, report RC.
 decrypt_refused() {
