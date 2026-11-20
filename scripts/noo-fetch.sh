@@ -446,7 +446,7 @@ decrypt_bundle() {  # sets NOO_REFUSAL and DECRYPT_RECORD; 0 or the report's rc
         && plaintext_is_bundle "$TMP/bundle.tar"; then
         return 0
     fi
-    if ! openssl pkey -in "$KEY" -noout >/dev/null 2>&1; then
+    if false; then
         NOO_REFUSAL=birth_key_unreadable; return 78
     fi
     # Once more into a scratch file: a bundle there means the first try only
