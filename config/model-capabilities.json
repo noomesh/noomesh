@@ -30,7 +30,7 @@
       "match": [
         "qwen2.5:0.5b"
       ],
-      "kv_bytes_per_token": 12288,
+      "kv_bytes_per_token": 6144,
       "kv_source": {
         "basis": "derived",
         "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
