@@ -85,7 +85,6 @@ fn needs_login(body: &serde_json::Value) -> bool {
 /// there is none.
 pub(crate) fn dependency_log_target(dependency: &str) -> &str {
     match dependency {
-        "postgresql" => "postgres",
         "nats" => "nats",
         "redis" => "redis",
         "systems" | "addon_caller" | "fds" => "gateway",
