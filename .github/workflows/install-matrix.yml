@@ -113,6 +113,9 @@ jobs:
             docs/getting-started/install.md
             scripts/install-cell
             scripts/ci-free-disk.sh
+            # the verify row registry: ratchet.py maps a row name to its id
+            # when the installed CLI prints none (before #1411)
+            noo-cli/src/commands/cluster_verify/rows.rs
           sparse-checkout-cone-mode: false
       - name: Free disk (the runner's preinstalled toolchains; reported)
         if: runner.os == 'Linux'
@@ -174,6 +177,7 @@ jobs:
             docs/getting-started/first-chat.md
             docs/getting-started/install.md
             scripts/install-cell
+            noo-cli/src/commands/cluster_verify/rows.rs
           sparse-checkout-cone-mode: false
       - name: WSL2 + Ubuntu 24.04   # Vampire/setup-wsl v7.2.0
         # Run 1 (2026-11-12) never finished this step in 45 min: cap it so a
@@ -258,6 +262,9 @@ jobs:
             README.md
             scripts/install-cell
             scripts/ci-free-disk.sh
+            # the verify row registry: ratchet.py maps a row name to its id
+            # when the installed CLI prints none (before #1411)
+            noo-cli/src/commands/cluster_verify/rows.rs
           sparse-checkout-cone-mode: false
       - name: Free disk (the runner's preinstalled toolchains; reported)
         run: df -h / && bash scripts/ci-free-disk.sh && df -h /

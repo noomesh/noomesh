@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026 PersonifAI LLC
-"""The install matrix's WARN ratchet (noomesh-internal i1098, "The matrix
+"""The install matrix's verify ratchet (noomesh-internal i1098, "The matrix
 ratchet"): a fresh install's `noo --json cluster verify` may not carry more
 WARN rows than its cell's ceiling, nor a WARN row the ceiling does not name.
 
-  ratchet.py judge CELL VERIFY_LOG [--ceiling FILE]
+  ratchet.py judge CELL VERIFY_LOG [--ceiling FILE] [--rows ROWS_RS]
       reads the verify JSON (the cell's logs/probe-verify-json.log) and the
       ceiling (warn-ratchet.json beside this file) and prints:
-        RATCHET PASS: <n> WARN ≤ <max> (rows: …)
+        RATCHET ROW: <id> (<section>:<name>) — <status>   one per WARN row
+        RATCHET LEFTOVER: <id> (<label>) reported fixed by <by> but still WARNs
+        RATCHET PASS: <n> WARN ≤ <max> (rows: <ids>)
         RATCHET FAIL: <n> WARN > <max>
-        RATCHET FAIL: new WARN row(s): <rows>
-        RATCHET NOTE: lower the ceiling: <rows> gone   (a fix landed; its PR lowers it)
+        RATCHET FAIL: new WARN row(s): <id (label)>
+        RATCHET FAIL: row(s) with no id: <labels>   (neither the JSON nor rows.rs names it)
+        RATCHET NOTE: lower the ceiling: <ids> gone   (a fix landed; its PR lowers it)
         RATCHET NOTE: no measured ceiling for <cell> yet   (and what it measured now)
-        RATCHET ROW: <row> (<status>)      one per WARN row, its status from row_status
-        VERIFY FAIL: <rows>                 a row with verdict "fail" (only while
+        VERIFY FAIL: <ids>                  a row with verdict "fail" (only while
                                             fail_rows_fail_the_cell is true)
         VERIFY NOTE: …                      a FAIL row allow-listed, or seen while the
                                             rule is off
@@ -34,30 +36,33 @@ the tier: since #1458 a few OK rows carry `tier: "later"` (advice for later
 on a healthy box); they are OK, not WARN, and are not counted. A WARN row
 tiered "later" or "not_here" IS a WARN and is counted.
 
-A row's identity is "<section>:<name>", the section being controller, node
-or seat. Not the node's id: a hosted runner's hostname changes every run.
-Not the name alone: the row registry (noo-cli cluster_verify/rows.rs) gives
-each row a scope, and the same words in another section are another fact.
+A row's identity is its STABLE id from the rows registry (noo-cli
+cluster_verify/rows.rs, #1411): `noo --json cluster verify` prints it as
+each check's `id`. A row reworded under the same id is the same row. A CLI
+that prints no id (before #1411) is mapped name -> id through rows.rs; a row
+with neither FAILS the cell by name. "<section>:<name>" is only the label.
 
 Raising a ceiling is never routine. The one escape is a reviewed decision:
 a separate commit that adds, to that cell, "raise": {"from_max": <old>,
-"to_max": <new>, "add_rows": [<the added rows>], "reason": "<why, who
+"to_max": <new>, "add_rows": [<the added ids>], "reason": "<why, who
 decided>"}; only-down accepts a rise only when that record matches the rise
 exactly and was not already in the base.
 
-row_status names, per row, why it may stand: "awaiting operator decision"
+row_status names, per id, why a row may stand: "awaiting operator decision"
 (an undecided operator decision: NOT accepted), "accepted" (honest on a
-fresh box), "fix in flight" or "under triage". A WARN row it does not list
-prints "(no status recorded)".
+fresh box), "reported fixed" (a merged change says it no longer WARNs: if it
+does, a LEFTOVER line), "fix in flight" (not merged yet) or "under triage".
+The last three name their carrier in "by" (a PR or a followup).
 
 A FAIL row (i1098: "a FAIL row always fails the cell") fails the cell only
-while "fail_rows_fail_the_cell" is true; fail_allowed lists, by row, the
+while "fail_rows_fail_the_cell" is true; fail_allowed lists, by id, the
 FAIL rows that may stand, each with a "why". It only shrinks, by the same
 rule as the ceiling.
 """
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -65,8 +70,21 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 CEILING = HERE / "warn-ratchet.json"
 CEILING_REL = "scripts/install-cell/warn-ratchet.json"
+ROWS_RS = HERE.parent.parent / "noo-cli" / "src" / "commands" / "cluster_verify" / "rows.rs"
 MIN_REASON = 20
-STATUSES = ("awaiting operator decision", "accepted", "fix in flight", "under triage")
+STATUSES = ("awaiting operator decision", "accepted", "reported fixed", "fix in flight", "under triage")
+NEEDS_BY = ("reported fixed", "fix in flight")   # "by" must name the carrier
+BY_KEY = NEEDS_BY + ("under triage",)            # "by" must be present (null: no followup yet)
+ROW_RX = re.compile(r'id: "([^"]+)",\s*name: "([^"]+)",\s*scope: Scope::(\w+)')
+
+
+def registry(path: Path = ROWS_RS) -> dict[str, str]:
+    """name -> id, from rows.rs (empty when the file is not in this checkout)."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    return {name: rid for rid, name, _ in ROW_RX.findall(text)}
 
 
 def verify_json(text: str) -> dict | None:
@@ -87,46 +105,68 @@ def verify_json(text: str) -> dict | None:
     return None
 
 
-def rows_with(v: dict, verdict: str) -> list[str]:
-    """One "<section>:<name>" per row whose verdict is exactly `verdict`
-    (a row on two nodes counts twice), controller, nodes and seats."""
+def rows_with(v: dict, verdict: str, names: dict[str, str] | None = None) -> list[tuple[str | None, str]]:
+    """(id, "<section>:<name>") per row whose verdict is exactly `verdict`
+    (a row on two nodes counts twice), controller, nodes and seats. The id is
+    the check's own, else rows.rs's for its name, else None."""
+    names = registry() if names is None else names
     out = []
-    ctrl = v.get("controller") or {}
-    for c in ctrl.get("checks") or []:
+
+    def add(section: str, c: dict) -> None:
         if c.get("verdict") == verdict:
-            out.append(f"controller:{c.get('name')}")
+            name = c.get("name")
+            out.append((c.get("id") or names.get(name), f"{section}:{name}"))
+    for c in (v.get("controller") or {}).get("checks") or []:
+        add("controller", c)
     for section, items in (("node", v.get("nodes")), ("seat", v.get("seats"))):
         for it in items or []:
             for c in (it or {}).get("checks") or []:
-                if c.get("verdict") == verdict:
-                    out.append(f"{section}:{c.get('name')}")
+                add(section, c)
     return out
 
 
-def warn_rows(v: dict) -> list[str]:
-    return rows_with(v, "warn")
+def warn_rows(v: dict, names: dict[str, str] | None = None) -> list[tuple[str | None, str]]:
+    return rows_with(v, "warn", names)
 
 
-def fail_rows(v: dict) -> list[str]:
-    return rows_with(v, "fail")
+def fail_rows(v: dict, names: dict[str, str] | None = None) -> list[tuple[str | None, str]]:
+    return rows_with(v, "fail", names)
 
 
-def status_lines(rows: list[str], ceiling: dict) -> list[str]:
+def labels(rows: list[tuple[str | None, str]]) -> dict[str, str]:
+    """id -> label (the first seen)."""
+    out: dict[str, str] = {}
+    for rid, label in rows:
+        if rid:
+            out.setdefault(rid, label)
+    return out
+
+
+def status_lines(rows: list[tuple[str | None, str]], ceiling: dict) -> list[str]:
     st = ceiling.get("row_status") or {}
-    return [f"RATCHET ROW: {r} ({(st.get(r) or {}).get('status') or 'no status recorded'})"
-            for r in sorted(set(rows))]
+    out, leftover = [], []
+    for rid, label in sorted(labels(rows).items()):
+        e = st.get(rid) or {}
+        status = e.get("status") or "no status recorded"
+        by = f" by {e['by']}" if e.get("by") else ""
+        out.append(f"RATCHET ROW: {rid} ({label}) — {status}{by}")
+        if status == "reported fixed":
+            leftover.append(f"RATCHET LEFTOVER: {rid} ({label}) reported fixed by {e.get('by')} but still WARNs")
+    return out + leftover
 
 
-def verify_fail_lines(verify: dict | None, ceiling: dict) -> tuple[list[str], list[str]]:
+def verify_fail_lines(verify: dict | None, ceiling: dict, names: dict[str, str]) -> tuple[list[str], list[str]]:
     """(notes, fails) for the rows whose verdict is "fail"."""
     if verify is None:
         return [], []
-    rows = sorted(set(fail_rows(verify)))
+    rows = fail_rows(verify, names)
     if not rows:
         return [], []
+    lab = labels(rows)
     allowed = ceiling.get("fail_allowed") or {}
-    ok = [r for r in rows if r in allowed]
-    bad = [r for r in rows if r not in allowed]
+    ok = sorted(r for r in lab if r in allowed)
+    bad = [f"{r} ({lab[r]})" for r in sorted(lab) if r not in allowed]
+    bad += sorted({label for rid, label in rows if not rid})
     notes = [f"VERIFY NOTE: allowed FAIL row(s): "
              + "; ".join(f"{r} ({allowed[r].get('why', '')})" for r in ok)] if ok else []
     if not bad:
@@ -137,6 +177,24 @@ def verify_fail_lines(verify: dict | None, ceiling: dict) -> tuple[list[str], li
                     "(not fatal yet: fail_rows_fail_the_cell is false)"], []
 
 
+def status_problems(ceiling: dict) -> list[str]:
+    """Every row_status entry that breaks the status rules: a known status,
+    a "why", and the carrier: "reported fixed" and "fix in flight" name it
+    in "by"; "under triage" carries a "by" key (null: no followup filed yet)."""
+    bad = []
+    for rid, e in sorted((ceiling.get("row_status") or {}).items()):
+        st = (e or {}).get("status")
+        if st not in STATUSES:
+            bad.append(f"{rid}: unknown status {st!r}")
+        if not (e or {}).get("why"):
+            bad.append(f"{rid}: no why")
+        if st in NEEDS_BY and not str((e or {}).get("by") or "").strip():
+            bad.append(f"{rid}: {st} without \"by\" (the PR or followup that carries the fix)")
+        if st in BY_KEY and "by" not in (e or {}):
+            bad.append(f"{rid}: {st} without a \"by\" key")
+    return bad
+
+
 def load_ceiling(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -145,29 +203,37 @@ def measured(entry: dict | None) -> bool:
     return bool(entry) and entry.get("measured") is not None
 
 
-def judge(cell: str, verify: dict | None, ceiling: dict) -> tuple[bool, list[str]]:
+def judge(cell: str, verify: dict | None, ceiling: dict,
+          names: dict[str, str] | None = None) -> tuple[bool, list[str]]:
     """(ok, lines). NOTE lines first, FAIL lines last (the step record takes
     its last line as the error)."""
-    ok, lines = judge_warn(cell, verify, ceiling)
-    notes, fails = verify_fail_lines(verify, ceiling)
+    names = registry() if names is None else names
+    ok, lines = judge_warn(cell, verify, ceiling, names)
+    notes, fails = verify_fail_lines(verify, ceiling, names)
     head = [l for l in lines if not l.startswith("RATCHET FAIL")]
     tail = [l for l in lines if l.startswith("RATCHET FAIL")]
     return ok and not fails, head + notes + tail + fails
 
 
-def judge_warn(cell: str, verify: dict | None, ceiling: dict) -> tuple[bool, list[str]]:
+def judge_warn(cell: str, verify: dict | None, ceiling: dict, names: dict[str, str]) -> tuple[bool, list[str]]:
     entry = (ceiling.get("cells") or {}).get(cell)
-    rows = warn_rows(verify) if verify is not None else None
+    rows = warn_rows(verify, names) if verify is not None else None
+    unknown = sorted({label for rid, label in rows or [] if not rid})
+    no_id = [f"RATCHET FAIL: row(s) with no id: {', '.join(unknown)} "
+             "(the JSON has no id and rows.rs has no such name)"] if unknown else []
     if not measured(entry):
+        ids = sorted({rid for rid, _ in rows or [] if rid})
         now = ("no verify JSON was read" if rows is None else
-               f"measured now: {len(rows)} WARN, rows: {json.dumps(sorted(set(rows)), ensure_ascii=False)}")
-        return True, status_lines(rows or [], ceiling) + [f"RATCHET NOTE: no measured ceiling for {cell} yet ({now})"]
+               f"measured now: {len(rows)} WARN, rows: {json.dumps(ids, ensure_ascii=False)}")
+        return not no_id, status_lines(rows or [], ceiling) + \
+            [f"RATCHET NOTE: no measured ceiling for {cell} yet ({now})"] + no_id
     mx, allowed = entry.get("max_warn"), entry.get("rows")
     if not isinstance(mx, int) or not isinstance(allowed, list):
         return False, [f"RATCHET FAIL: the ceiling for {cell} is measured but has no max_warn/rows"]
     if rows is None:
         return False, [f"RATCHET FAIL: no verify JSON to judge for {cell}"]
-    n, seen, allowed = len(rows), set(rows), set(allowed)
+    lab = labels(rows)
+    n, seen, allowed = len(rows), set(lab), set(allowed)
     notes, fails = status_lines(rows, ceiling), []
     gone = sorted(allowed - seen)
     if gone:
@@ -178,7 +244,8 @@ def judge_warn(cell: str, verify: dict | None, ceiling: dict) -> tuple[bool, lis
         fails.append(f"RATCHET FAIL: {n} WARN > {mx}")
     new = sorted(seen - allowed)
     if new:
-        fails.append(f"RATCHET FAIL: new WARN row(s): {', '.join(new)}")
+        fails.append(f"RATCHET FAIL: new WARN row(s): {', '.join(f'{r} ({lab[r]})' for r in new)}")
+    fails += no_id
     if fails:
         return False, notes + fails
     listed = ", ".join(sorted(seen)) or "none"
@@ -250,7 +317,8 @@ def main(argv: list[str]) -> int:
         cell, log = argv[1], Path(argv[2])
         ceil = Path(argv[argv.index("--ceiling") + 1]) if "--ceiling" in argv else CEILING
         text = log.read_text(errors="replace") if log.exists() else ""
-        ok, lines = judge(cell, verify_json(text), load_ceiling(ceil))
+        names = registry(Path(argv[argv.index("--rows") + 1]) if "--rows" in argv else ROWS_RS)
+        ok, lines = judge(cell, verify_json(text), load_ceiling(ceil), names)
         print("\n".join(lines))
         return 0 if ok else 1
     if len(argv) == 3 and argv[0] == "skip":

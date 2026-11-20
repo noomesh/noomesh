@@ -1,114 +1,151 @@
 {
- "_rule": "noomesh-internal i1098, the matrix ratchet. Per fresh-install cell: the most WARN rows (verdict == \"warn\", controller + nodes + seats) its `noo --json cluster verify` may show, and the rows it may show them in (\"<controller|node|seat>:<row name>\"). The PR that removes a WARN lowers max_warn and drops the row. Raising is never allowed (tests/test_install_cell_ratchet.py compares this file with its version on dev); the one escape is a reviewed decision, in its own commit, adding to the cell \"raise\": {\"from_max\", \"to_max\", \"add_rows\", \"reason\"}. scripts/install-cell/ratchet.py judges it; a cell with \"measured\": null only prints a NOTE.",
+ "_rule": "noomesh-internal i1098, the matrix ratchet. Per fresh-install cell: the most WARN rows (verdict == \"warn\", controller + nodes + seats) its `noo --json cluster verify` may show, and the rows it may show them in, by the row's STABLE id from noo-cli cluster_verify/rows.rs (a reworded row keeps its id; \"label\" is only for people). The PR that removes a WARN lowers max_warn and drops the row. Raising is never allowed (tests/test_install_cell_ratchet.py compares this file with its version on dev); the one escape is a reviewed decision, in its own commit, adding to the cell \"raise\": {\"from_max\", \"to_max\", \"add_rows\" (ids), \"reason\"}. scripts/install-cell/ratchet.py judges it; a cell with \"measured\": null only prints a NOTE.",
  "fail_rows_fail_the_cell": false,
  "_fail_rule": "i1098: a FAIL row always fails the cell. OFF until the release lead approves fail_allowed (0.6.28-rc.4 and 0.6.28 fresh cells showed 0 FAIL rows; 0.6.29-rc.1's cells never reached verify). Turning it on is one-way; fail_allowed only shrinks, and a row added to it needs a \"why\" and a reviewed \"decision\".",
  "fail_allowed": {},
  "row_status": {
-  "controller:agent protect": {
+  "agent_protect": {
+   "label": "controller:agent protect",
    "status": "awaiting operator decision",
    "why": "i1098 row 10: onboard installs the self agent outside the applier, so no protect hold exists; DECIDE whether onboard installs the self node through the applier (i991; i1085 item 6)"
   },
-  "controller:last backup": {
+  "last_backup": {
+   "label": "controller:last backup",
    "status": "awaiting operator decision",
    "why": "i1098 row 11: the daily backup runs at 03:30, a box minutes old has had none; DECIDE whether onboard runs the first backup (i1085 item 8)"
   },
-  "node:holds": {
+  "holds": {
+   "label": "node:holds",
    "status": "awaiting operator decision",
    "why": "i1098 row 12: the installer's Docker packages are not held; DECIDE whether onboard holds what it installed (the remedy text is fixed separately)"
   },
-  "controller:at-rest tpm": {
+  "at_rest_tpm": {
+   "label": "controller:at-rest tpm",
    "status": "awaiting operator decision",
    "why": "i1098 row 14: the at-rest set, no TPM on a hosted VM; the operator decides at-rest"
   },
-  "controller:postgres at rest": {
+  "postgres_at_rest": {
+   "label": "controller:postgres at rest",
    "status": "awaiting operator decision",
    "why": "i1098 rows 15-21: the at-rest set, plaintext on the root disk without a TPM-backed volume; the operator decides at-rest"
   },
-  "controller:redis at rest": {
+  "redis_at_rest": {
+   "label": "controller:redis at rest",
    "status": "awaiting operator decision",
    "why": "i1098 rows 15-21: the at-rest set; the operator decides at-rest"
   },
-  "controller:nats at rest": {
+  "nats_at_rest": {
+   "label": "controller:nats at rest",
    "status": "awaiting operator decision",
    "why": "i1098 rows 15-21: the at-rest set; the operator decides at-rest"
   },
-  "controller:prometheus at rest": {
+  "prometheus_at_rest": {
+   "label": "controller:prometheus at rest",
    "status": "awaiting operator decision",
    "why": "i1098 rows 15-21: the at-rest set; the operator decides at-rest"
   },
-  "controller:noo-data at rest": {
+  "noo_data_at_rest": {
+   "label": "controller:noo-data at rest",
    "status": "awaiting operator decision",
    "why": "i1098 rows 15-21: the at-rest set; the operator decides at-rest"
   },
-  "controller:pki at rest": {
+  "pki_at_rest": {
+   "label": "controller:pki at rest",
    "status": "awaiting operator decision",
    "why": "i1098 rows 15-21: the at-rest set; the operator decides at-rest"
   },
-  "controller:age key at rest": {
+  "age_key_at_rest": {
+   "label": "controller:age key at rest",
    "status": "awaiting operator decision",
    "why": "i1098 rows 15-21: the at-rest set; the operator decides at-rest"
   },
-  "controller:at-rest swap": {
+  "at_rest_swap": {
+   "label": "controller:at-rest swap",
    "status": "awaiting operator decision",
    "why": "i1098 row 22: the at-rest set (a plain /swapfile; fixable without a TPM); the operator decides at-rest"
   },
-  "controller:at-rest outside the set": {
+  "at_rest_outside_the_set": {
+   "label": "controller:at-rest outside the set",
    "status": "awaiting operator decision",
    "why": "i1098 row 23: the at-rest set; the operator decides at-rest"
   },
-  "controller:at-rest volume": {
+  "at_rest_volume": {
+   "label": "controller:at-rest volume",
    "status": "awaiting operator decision",
    "why": "i1098 row 24: the at-rest set, no encrypted state volume without a TPM; the operator decides at-rest"
   },
-  "node:docker engine": {
+  "docker_engine": {
+   "label": "node:docker engine",
    "status": "awaiting operator decision",
    "why": "i1058: the Docker Engine minimum (MIN_DOCKER_ENGINE_MAJOR) is the operator's decision"
   },
-  "controller:off-site backup": {
+  "off_site_backup": {
+   "label": "controller:off-site backup",
    "status": "accepted",
    "why": "i1098 row 13: ACCEPT, nobody has chosen where backup copies go; honest on a fresh box"
   },
-  "node:log shipper": {
-   "status": "fix in flight",
-   "why": "i1098 row 1: FIX, a code-order bug (the by-choice loki_off reason is tested after enabled != true)"
+  "log_shipper": {
+   "label": "node:log shipper",
+   "status": "reported fixed",
+   "by": "#1433",
+   "why": "i1098 row 1: FIX (merged 11-20; must not WARN from 0.6.29-rc.2), a code-order bug (the by-choice loki_off reason is tested after enabled != true)"
   },
-  "node:inbound": {
-   "status": "fix in flight",
-   "why": "i1098 row 2: FIX, the first reachability probe runs after onboard's closing verify"
+  "inbound": {
+   "label": "node:inbound",
+   "status": "reported fixed",
+   "by": "#1433",
+   "why": "i1098 row 2: FIX (merged 11-20; must not WARN from 0.6.29-rc.2), the first reachability probe runs after onboard's closing verify"
   },
-  "controller:node-agent privilege": {
-   "status": "fix in flight",
-   "why": "i1098 row 3: FIX, the row inspects a container while the self agent is a host service"
+  "node_agent_privilege": {
+   "label": "controller:node-agent privilege",
+   "status": "reported fixed",
+   "by": "#1433",
+   "why": "i1098 row 3: FIX (merged 11-20; must not WARN from 0.6.29-rc.2), the row inspects a container while the self agent is a host service"
   },
-  "controller:tailnet policy": {
-   "status": "fix in flight",
-   "why": "i1098 row 4: FIX, a LAN-only install has no tailnet to judge"
+  "tailnet_policy": {
+   "label": "controller:tailnet policy",
+   "status": "reported fixed",
+   "by": "#1433",
+   "why": "i1098 row 4: FIX (merged 11-20; must not WARN from 0.6.29-rc.2), a LAN-only install has no tailnet to judge"
   },
-  "controller:tailscale ssh": {
-   "status": "fix in flight",
-   "why": "i1098 row 5: FIX, Tailscale is not installed"
+  "tailscale_ssh": {
+   "label": "controller:tailscale ssh",
+   "status": "reported fixed",
+   "by": "#1433",
+   "why": "i1098 row 5: FIX (merged 11-20; must not WARN from 0.6.29-rc.2), Tailscale is not installed"
   },
-  "controller:loki at rest": {
-   "status": "fix in flight",
-   "why": "i1098 row 6: FIX, lean monitoring leaves an empty directory judged as plaintext data"
+  "loki_at_rest": {
+   "label": "controller:loki at rest",
+   "status": "reported fixed",
+   "by": "#1433",
+   "why": "i1098 row 6: FIX (merged 11-20; must not WARN from 0.6.29-rc.2), lean monitoring leaves an empty directory judged as plaintext data"
   },
-  "controller:tempo at rest": {
-   "status": "fix in flight",
-   "why": "i1098 row 7: FIX, as loki at rest"
+  "tempo_at_rest": {
+   "label": "controller:tempo at rest",
+   "status": "reported fixed",
+   "by": "#1433",
+   "why": "i1098 row 7: FIX (merged 11-20; must not WARN from 0.6.29-rc.2), as loki at rest"
   },
-  "controller:grafana at rest": {
-   "status": "fix in flight",
-   "why": "i1098 row 8: FIX, as loki at rest"
+  "grafana_at_rest": {
+   "label": "controller:grafana at rest",
+   "status": "reported fixed",
+   "by": "#1433",
+   "why": "i1098 row 8: FIX (merged 11-20; must not WARN from 0.6.29-rc.2), as loki at rest"
   },
-  "controller:default chat": {
-   "status": "fix in flight",
-   "why": "i1098 row 9: FIX, a GPU-less fleet's default chat; #1458 makes it an OK row tiered later"
+  "default_chat": {
+   "label": "controller:default chat",
+   "status": "reported fixed",
+   "by": "#1458",
+   "why": "i1098 row 9: FIX (merged 11-20): a GPU-less or one-node fleet's default chat reads OK tiered later; must not WARN from 0.6.29-rc.2"
   },
-  "node:streaming over tunnel": {
+  "streaming_over_tunnel": {
+   "label": "node:streaming over tunnel",
    "status": "under triage",
-   "why": "i1098: warns during a tunnel reconnect on the --ci default cell; a candidate for the next triage"
+   "by": null,
+   "why": "i1098: warns during a tunnel reconnect on the --ci default cell; a candidate for the next triage (no followup filed yet)"
   },
-  "controller:ollama slots": {
+  "ollama_slots": {
+   "label": "controller:ollama slots",
    "status": "accepted",
    "why": "the slots4 cell sets the shared Ollama to 4 slots on purpose (the i802 A/B); the row reports that choice"
   }

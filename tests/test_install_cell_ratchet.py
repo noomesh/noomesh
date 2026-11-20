@@ -3,7 +3,8 @@
 
 """The install matrix's WARN ratchet (noomesh-internal i1098): a fresh
 install's verify may not show more WARN rows than its cell's ceiling, nor a
-WARN row the ceiling does not name, and the ceiling only ever goes down."""
+WARN row the ceiling does not name, and the ceiling only ever goes down.
+A row is its STABLE id from the rows registry; "<section>:<name>" is a label."""
 
 from __future__ import annotations
 
@@ -32,8 +33,13 @@ def _load(name, path):
 R = _load("install_cell_ratchet", RATCHET)
 
 
-def row(name, verdict, tier=None):
-    return {"id": name.replace(" ", "_"), "name": name, "verdict": verdict, "detail": "", "remedy": None, "tier": tier}
+def rid(name):
+    return name.replace(" ", "_").replace("-", "_")
+
+
+def row(name, verdict, tier=None, id_=None):
+    """A check as checks_json prints it, with the registry id (#1411)."""
+    return {"id": id_ or rid(name), "name": name, "verdict": verdict, "detail": "", "remedy": None, "tier": tier}
 
 
 def verify(controller=(), node=(), seats=None):
@@ -49,7 +55,7 @@ def verify(controller=(), node=(), seats=None):
 BASE_VERIFY = verify(controller=[row("holds", "warn", "later"), row("off-site backup", "warn", "later"),
                                  row("gateway", "ok")],
                      node=[row("ollama models", "warn"), row("tunnel", "ok")])
-BASE_ROWS = ["controller:holds", "controller:off-site backup", "node:ollama models"]
+BASE_ROWS = ["holds", "off_site_backup", "ollama_models"]
 
 
 def ceiling(cell="c", max_warn=3, rows=BASE_ROWS, measured="0.6.29-rc.2 run 1"):
@@ -75,19 +81,25 @@ def run_judge(tmp_path, v, ceil, cell="c", row_lines=False):
     return r.returncode, lines if row_lines else [l for l in lines if not l.startswith("RATCHET ROW: ")]
 
 
+def judge_lines(v, ceil, names=None, cell="c"):
+    """In process, with a given name -> id registry (the real one by default)."""
+    ok, lines = R.judge(cell, v, ceil, names)
+    return ok, [l for l in lines if not l.startswith("RATCHET ROW: ")]
+
+
 # ── the judge, on canned verify JSON ────────────────────────────────────────
 
 def test_pass_when_equal(tmp_path):
     rc, lines = run_judge(tmp_path, BASE_VERIFY, ceiling())
     assert rc == 0, lines
-    assert lines == ["RATCHET PASS: 3 WARN ≤ 3 (rows: controller:holds, controller:off-site backup, node:ollama models)"]
+    assert lines == ["RATCHET PASS: 3 WARN ≤ 3 (rows: holds, off_site_backup, ollama_models)"]
 
 
 def test_pass_when_fewer_and_says_lower_it(tmp_path):
     v = verify(controller=[row("holds", "warn"), row("off-site backup", "ok")], node=[row("ollama models", "warn")])
     rc, lines = run_judge(tmp_path, v, ceiling())
     assert rc == 0, lines
-    assert lines[0] == "RATCHET NOTE: lower the ceiling: controller:off-site backup gone"
+    assert lines[0] == "RATCHET NOTE: lower the ceiling: off_site_backup gone"
     assert lines[-1].startswith("RATCHET PASS: 2 WARN ≤ 3")
 
 
@@ -106,8 +118,8 @@ def test_fail_on_a_new_row_name_even_at_an_equal_count(tmp_path):
                node=[row("ollama models", "ok"), row("tunnel", "warn")])
     rc, lines = run_judge(tmp_path, v, ceiling())
     assert rc == 1, lines
-    assert "RATCHET FAIL: new WARN row(s): node:tunnel" in lines
-    assert "RATCHET NOTE: lower the ceiling: node:ollama models gone" in lines
+    assert "RATCHET FAIL: new WARN row(s): tunnel (node:tunnel)" in lines
+    assert "RATCHET NOTE: lower the ceiling: ollama_models gone" in lines
     assert not any(l.startswith("RATCHET PASS") for l in lines)
     assert lines[-1].startswith("RATCHET FAIL"), "the step record takes the last line as the error"
 
@@ -117,14 +129,14 @@ def test_both_fails_print_when_both_apply(tmp_path):
     v["controller"]["checks"].append(row("at-rest swap", "warn", "later"))
     rc, lines = run_judge(tmp_path, v, ceiling())
     assert rc == 1
-    assert lines == ["RATCHET FAIL: 4 WARN > 3", "RATCHET FAIL: new WARN row(s): controller:at-rest swap"]
+    assert lines == ["RATCHET FAIL: 4 WARN > 3", "RATCHET FAIL: new WARN row(s): at_rest_swap (controller:at-rest swap)"]
 
 
 def test_note_while_the_ceiling_is_unmeasured(tmp_path):
     rc, lines = run_judge(tmp_path, BASE_VERIFY, ceiling(max_warn=None, rows=None, measured=None))
     assert rc == 0
     assert len(lines) == 1 and lines[0].startswith("RATCHET NOTE: no measured ceiling for c yet")
-    assert "measured now: 3 WARN" in lines[0] and '"node:ollama models"' in lines[0], "the baseline to copy"
+    assert "measured now: 3 WARN" in lines[0] and '"ollama_models"' in lines[0], "the baseline to copy"
     # a cell the file does not list at all reads the same way
     rc, lines = run_judge(tmp_path, BASE_VERIFY, ceiling(cell="other"))
     assert rc == 0 and lines[0].startswith("RATCHET NOTE: no measured ceiling for c yet")
@@ -143,13 +155,14 @@ def test_a_later_tiered_ok_row_is_not_a_warn(tmp_path):
 def test_seats_and_nodes_are_counted(tmp_path):
     v = verify(controller=[row("holds", "warn")], node=[row("ollama models", "warn")],
                seats=[{"seat": "seat_a", "ok": True, "checks": [row("seat display", "warn"), row("seat link", "ok")]}])
-    assert sorted(R.warn_rows(v)) == ["controller:holds", "node:ollama models", "seat:seat display"]
-    rc, lines = run_judge(tmp_path, v, ceiling(max_warn=2, rows=["controller:holds", "node:ollama models"]))
+    assert sorted(R.warn_rows(v)) == [("holds", "controller:holds"), ("ollama_models", "node:ollama models"),
+                                      ("seat_display", "seat:seat display")]
+    rc, lines = run_judge(tmp_path, v, ceiling(max_warn=2, rows=["holds", "ollama_models"]))
     assert rc == 1
-    assert lines == ["RATCHET FAIL: 3 WARN > 2", "RATCHET FAIL: new WARN row(s): seat:seat display"]
+    assert lines == ["RATCHET FAIL: 3 WARN > 2", "RATCHET FAIL: new WARN row(s): seat_display (seat:seat display)"]
     # seats null (the gateway did not answer the list) is no crash and no WARN
     v["seats"] = None
-    assert sorted(R.warn_rows(v)) == ["controller:holds", "node:ollama models"]
+    assert sorted(R.warn_rows(v)) == [("holds", "controller:holds"), ("ollama_models", "node:ollama models")]
 
 
 def test_only_the_verdict_counts_never_the_text():
@@ -178,8 +191,8 @@ def test_only_down_refuses_a_rise_and_an_added_row():
     assert R.only_down(base, ceiling(max_warn=2, rows=BASE_ROWS[1:])) == [], "lowering is the point"
     up = R.only_down(base, ceiling(max_warn=4))
     assert len(up) == 1 and "max_warn 3 -> 4" in up[0]
-    swapped = R.only_down(base, ceiling(rows=BASE_ROWS[:2] + ["node:tunnel"]))
-    assert len(swapped) == 1 and "rows added: node:tunnel" in swapped[0], "a swap at an equal count"
+    swapped = R.only_down(base, ceiling(rows=BASE_ROWS[:2] + ["tunnel"]))
+    assert len(swapped) == 1 and "rows added: tunnel" in swapped[0], "a swap at an equal count"
     assert "removed" in R.only_down(base, {"cells": {}})[0]
     assert "unmeasured" in R.only_down(base, ceiling(max_warn=None, rows=None, measured=None))[0]
 
@@ -188,19 +201,19 @@ def test_the_first_measurement_and_a_new_cell_are_free():
     unmeasured = ceiling(max_warn=None, rows=None, measured=None)
     assert R.only_down(unmeasured, ceiling(max_warn=24)) == []
     new_cell = ceiling()
-    new_cell["cells"]["d"] = {"max_warn": 9, "rows": ["node:x"], "measured": "rc", "why": "new"}
+    new_cell["cells"]["d"] = {"max_warn": 9, "rows": ["x"], "measured": "rc", "why": "new"}
     assert R.only_down(ceiling(), new_cell) == []
 
 
 def test_the_reviewed_escape_must_match_the_rise_exactly():
     base = ceiling()
     reason = "operator 11-20: the tunnel row warns by design until i1100 lands"
-    ok = ceiling(max_warn=4, rows=BASE_ROWS + ["node:tunnel"])
-    ok["cells"]["c"]["raise"] = {"from_max": 3, "to_max": 4, "add_rows": ["node:tunnel"], "reason": reason}
+    ok = ceiling(max_warn=4, rows=BASE_ROWS + ["tunnel"])
+    ok["cells"]["c"]["raise"] = {"from_max": 3, "to_max": 4, "add_rows": ["tunnel"], "reason": reason}
     assert R.only_down(base, ok) == []
-    for bad in ({"from_max": 3, "to_max": 5, "add_rows": ["node:tunnel"], "reason": reason},
+    for bad in ({"from_max": 3, "to_max": 5, "add_rows": ["tunnel"], "reason": reason},
                 {"from_max": 3, "to_max": 4, "add_rows": [], "reason": reason},
-                {"from_max": 3, "to_max": 4, "add_rows": ["node:tunnel"], "reason": "because"}):
+                {"from_max": 3, "to_max": 4, "add_rows": ["tunnel"], "reason": "because"}):
         b = json.loads(json.dumps(ok))
         b["cells"]["c"]["raise"] = bad
         assert R.only_down(base, b), bad
@@ -287,8 +300,9 @@ def test_every_full_install_cell_has_a_ceiling_entry():
             continue
         assert isinstance(e["max_warn"], int) and e["max_warn"] >= 0, name
         assert isinstance(e["rows"], list) and len(e["rows"]) <= e["max_warn"], name
+        ids = set(R.registry().values())
         for r in e["rows"]:
-            assert r.split(":", 1)[0] in ("controller", "node", "seat") and ":" in r, (name, r)
+            assert r in ids, (name, r, "a ceiling row is a rows.rs id")
 
 
 def test_run_sh_judges_the_verify_json_and_skips_cells_without_an_install():
@@ -325,7 +339,7 @@ def test_the_judge_reads_the_redacted_log_step_writes(tmp_path):
                          input=as_log(v), capture_output=True, text=True, check=True).stdout
     assert "s3cr3t-value" not in red and "Tr0ub4dor" not in red, red
     got = R.verify_json(red)
-    assert got is not None and sorted(R.warn_rows(got)) == BASE_ROWS
+    assert got is not None and sorted(i for i, _ in R.warn_rows(got)) == BASE_ROWS
 
 
 # ── FAIL rows (i1098: "a FAIL row always fails the cell"), behind a flag ────
@@ -342,7 +356,7 @@ def test_a_fail_row_fails_the_cell_when_the_rule_is_on(tmp_path):
     c["fail_rows_fail_the_cell"] = True
     rc, lines = run_judge(tmp_path, _fail_verify(), c)
     assert rc == 1, lines
-    assert lines[-1] == "VERIFY FAIL: controller:shared secrets, seat:seat display"
+    assert lines[-1] == "VERIFY FAIL: seat_display (seat:seat display), shared_secrets (controller:shared secrets)"
     assert any(l.startswith("RATCHET PASS: 3 WARN") for l in lines), "the WARN count is judged on its own"
     # also while the ceiling is still unmeasured: the FAIL rule does not wait for a baseline
     c = ceiling(max_warn=None, rows=None, measured=None)
@@ -354,31 +368,31 @@ def test_a_fail_row_fails_the_cell_when_the_rule_is_on(tmp_path):
 def test_an_allow_listed_fail_row_is_a_note(tmp_path):
     c = ceiling()
     c["fail_rows_fail_the_cell"] = True
-    c["fail_allowed"] = {"controller:shared secrets": {"why": "runner-only: t"},
-                         "seat:seat display": {"why": "runner-only: u"}}
+    c["fail_allowed"] = {"shared_secrets": {"why": "runner-only: t"},
+                         "seat_display": {"why": "runner-only: u"}}
     rc, lines = run_judge(tmp_path, _fail_verify(), c)
     assert rc == 0, lines
-    assert ("VERIFY NOTE: allowed FAIL row(s): controller:shared secrets (runner-only: t); "
-            "seat:seat display (runner-only: u)") in lines
+    assert ("VERIFY NOTE: allowed FAIL row(s): seat_display (runner-only: u); "
+            "shared_secrets (runner-only: t)") in lines
 
 
 def test_while_the_rule_is_off_a_fail_row_is_reported_not_fatal(tmp_path):
     for c in (ceiling(), dict(ceiling(), fail_rows_fail_the_cell=False)):
         rc, lines = run_judge(tmp_path, _fail_verify(), c)
         assert rc == 0, lines
-        assert ("VERIFY NOTE: FAIL row(s) controller:shared secrets, seat:seat display "
+        assert ("VERIFY NOTE: FAIL row(s) seat_display (seat:seat display), shared_secrets (controller:shared secrets) "
                 "(not fatal yet: fail_rows_fail_the_cell is false)") in lines
 
 
 def test_each_warn_row_prints_with_its_status(tmp_path):
     c = ceiling()
-    c["row_status"] = {"controller:holds": {"status": "awaiting operator decision", "why": "x"},
-                       "node:ollama models": {"status": "accepted", "why": "y"}}
+    c["row_status"] = {"holds": {"status": "awaiting operator decision", "why": "x"},
+                       "ollama_models": {"status": "fix in flight", "by": "#1", "why": "y"}}
     rc, lines = run_judge(tmp_path, BASE_VERIFY, c, row_lines=True)
     assert rc == 0
-    assert lines[:3] == ["RATCHET ROW: controller:holds (awaiting operator decision)",
-                         "RATCHET ROW: controller:off-site backup (no status recorded)",
-                         "RATCHET ROW: node:ollama models (accepted)"]
+    assert lines[:3] == ["RATCHET ROW: holds (controller:holds) — awaiting operator decision",
+                         "RATCHET ROW: off_site_backup (controller:off-site backup) — no status recorded",
+                         "RATCHET ROW: ollama_models (node:ollama models) — fix in flight by #1"]
 
 
 def test_the_fail_rule_and_its_allow_list_only_tighten():
@@ -386,39 +400,87 @@ def test_the_fail_rule_and_its_allow_list_only_tighten():
     assert R.only_down(on, on) == []
     assert R.only_down(dict(ceiling(), fail_rows_fail_the_cell=False), on) == [], "switching it on is free"
     assert "switched off" in R.only_down(on, dict(on, fail_rows_fail_the_cell=False))[0]
-    added = dict(on, fail_allowed={"controller:x": {"why": "runner-only"}})
+    added = dict(on, fail_allowed={"x": {"why": "runner-only"}})
     assert "added without a" in R.only_down(on, added)[0]
-    decided = dict(on, fail_allowed={"controller:x": {"why": "runner-only",
+    decided = dict(on, fail_allowed={"x": {"why": "runner-only",
                                                        "decision": "release lead 11-20: a runner has no TPM"}})
     assert R.only_down(on, decided) == []
     assert R.only_down(decided, on) == [], "removing an allowed row is the point"
 
 
 UNDECIDED = {  # i1098 rows 10, 11, 12, 14-24, and i1058: the operator has not decided them
-    "controller:agent protect", "controller:last backup", "node:holds", "controller:at-rest tpm",
-    "controller:postgres at rest", "controller:redis at rest", "controller:nats at rest",
-    "controller:prometheus at rest", "controller:noo-data at rest", "controller:pki at rest",
-    "controller:age key at rest", "controller:at-rest swap", "controller:at-rest outside the set",
-    "controller:at-rest volume", "node:docker engine",
+    "agent_protect", "last_backup", "holds", "at_rest_tpm", "postgres_at_rest", "redis_at_rest", "nats_at_rest",
+    "prometheus_at_rest", "noo_data_at_rest", "pki_at_rest", "age_key_at_rest", "at_rest_swap",
+    "at_rest_outside_the_set", "at_rest_volume", "docker_engine",
+}
+REPORTED_FIXED = {  # i1098 rows 1-8 by #1433, row 9 by #1458 (both merged 11-20)
+    "log_shipper": "#1433", "inbound": "#1433",
+    "node_agent_privilege": "#1433", "tailnet_policy": "#1433",
+    "tailscale_ssh": "#1433", "loki_at_rest": "#1433",
+    "tempo_at_rest": "#1433", "grafana_at_rest": "#1433",
+    "default_chat": "#1458",
 }
 
 
-def test_undecided_rows_are_recorded_by_name_as_awaiting_the_operator():
+def test_the_checked_in_statuses_follow_the_rules():
     import re
     doc = json.loads(CEILING.read_text())
     st = doc["row_status"]
-    awaiting = {r for r, e in st.items() if e["status"] == "awaiting operator decision"}
-    assert awaiting == UNDECIDED, sorted(awaiting ^ UNDECIDED)
-    for r, e in st.items():
-        assert e["status"] in R.STATUSES and e.get("why"), r
-    # every name is a real verify row, in the section the registry gives it
+    assert R.status_problems(doc) == []
+    assert {r for r, e in st.items() if e["status"] == "awaiting operator decision"} == UNDECIDED
+    assert {r: e["by"] for r, e in st.items() if e["status"] == "reported fixed"} == REPORTED_FIXED
+    # every key is a real rows.rs id, and its label is that row's section:name
     reg = (ROOT / "noo-cli" / "src" / "commands" / "cluster_verify" / "rows.rs").read_text()
-    scope = {n: s.lower() for n, s in re.findall(r'name: "([^"]+)",\s*scope: Scope::(\w+)', reg)}
-    for r in st:
-        sec, name = r.split(":", 1)
-        assert scope.get(name) == sec, (r, scope.get(name))
+    by_id = {i: f"{s.lower()}:{n}" for i, n, s in re.findall(r'id: "([^"]+)",\s*name: "([^"]+)",\s*scope: Scope::(\w+)', reg)}
+    for r, e in st.items():
+        assert by_id.get(r) == e["label"], (r, e.get("label"), by_id.get(r))
     # a measured cell's rows all carry a status
     for cell, e in doc["cells"].items():
         for r in (e["rows"] or []) if e["measured"] is not None else []:
             assert r in st, (cell, r)
     assert doc["fail_rows_fail_the_cell"] is False, "OFF until the release lead approves fail_allowed"
+
+
+def test_fix_in_flight_names_its_carrier():
+    good = {"row_status": {"a": {"status": "fix in flight", "by": "#1", "why": "w"},
+                           "b": {"status": "under triage", "by": None, "why": "w"}}}
+    assert R.status_problems(good) == []
+    for bad in ({"status": "fix in flight", "why": "w"}, {"status": "fix in flight", "by": "", "why": "w"},
+                {"status": "reported fixed", "by": None, "why": "w"}, {"status": "under triage", "why": "w"},
+                {"status": "fine", "by": "x", "why": "w"}, {"status": "accepted"}):
+        assert R.status_problems({"row_status": {"a": bad}}), bad
+
+
+def test_a_reported_fixed_row_that_still_warns_is_a_leftover(tmp_path):
+    c = ceiling()
+    c["row_status"] = {"holds": {"status": "reported fixed", "by": "#1433", "why": "w"}}
+    rc, lines = run_judge(tmp_path, BASE_VERIFY, c)
+    assert rc == 0, lines
+    assert "RATCHET LEFTOVER: holds (controller:holds) reported fixed by #1433 but still WARNs" in lines
+    rc, lines = run_judge(tmp_path, BASE_VERIFY, dict(c, cells={}))
+    assert any(l.startswith("RATCHET LEFTOVER: holds") for l in lines), "unmeasured cells report it too"
+
+
+def test_a_reworded_row_keeps_its_id_and_is_not_new(tmp_path):
+    v = json.loads(json.dumps(BASE_VERIFY))
+    v["controller"]["checks"][0]["name"] = "docker packages held"   # reworded; id "holds" unchanged
+    rc, lines = run_judge(tmp_path, v, ceiling())
+    assert rc == 0, lines
+    assert lines == ["RATCHET PASS: 3 WARN ≤ 3 (rows: holds, off_site_backup, ollama_models)"]
+
+
+def test_a_cli_without_ids_is_mapped_through_rows_rs_and_an_unknown_name_fails():
+    v = verify(controller=[{"name": "last backup", "verdict": "warn"}],
+               node=[{"name": "holds", "verdict": "warn", "id": None}])
+    assert sorted(R.warn_rows(v)) == [("holds", "node:holds"), ("last_backup", "controller:last backup")]
+    ok, lines = judge_lines(v, ceiling(max_warn=2, rows=["holds", "last_backup"]))
+    assert ok and lines[-1] == "RATCHET PASS: 2 WARN ≤ 2 (rows: holds, last_backup)"
+    v["controller"]["checks"].append({"name": "a row nobody registered", "verdict": "warn"})
+    for c in (ceiling(max_warn=3, rows=["holds", "last_backup"]), ceiling(max_warn=None, rows=None, measured=None)):
+        ok, lines = judge_lines(v, c)
+        assert not ok, lines
+        assert lines[-1] == ("RATCHET FAIL: row(s) with no id: controller:a row nobody registered "
+                             "(the JSON has no id and rows.rs has no such name)")
+    # no registry in the checkout and no id in the JSON: the same loud FAIL
+    ok, lines = judge_lines(verify(controller=[{"name": "holds", "verdict": "warn"}]), ceiling(), names={})
+    assert not ok and "row(s) with no id: controller:holds" in lines[-1]
