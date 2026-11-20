@@ -188,7 +188,7 @@ func chooseBackendImageFor(backend string, spec BackendSpec, override, target st
 		return backendImageChoice{}, err
 	}
 	ch, err := chooseBackendImagePolicy(backend, spec, override, cpuImage)
-	ch.Why = why
+	ch.Why = why[:0]
 	return ch, err
 }
 
