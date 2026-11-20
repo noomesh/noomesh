@@ -240,7 +240,9 @@ def main(argv: list[str] | None = None) -> int:
                 if digest != want:
                     raise LockError(f"{ref} is {digest}, but mirror-images.yml copies it from {want}: "
                                     f"the mirror is not the upstream image it names")
+                print(f"  provenance ok: {name}@{digest} = mirror-images.yml lane source")
                 check_anonymous(entry["repo"], digest)
+                print(f"  anonymous pull ok: {entry['repo']}@{digest}")
             row = f"{name}@{digest}"
             a.out.mkdir(parents=True, exist_ok=True)
             (a.out / name).write_text(row + "\n")
