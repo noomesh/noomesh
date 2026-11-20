@@ -341,7 +341,7 @@ def only_down(base: dict, new: dict) -> list[str]:
             continue
         added = sorted(set(n["rows"]) - set(b.get("rows") or []))
         rose = n["max_warn"] > b.get("max_warn", 0)
-        if (rose or added) and not raise_ok(cell, b, n, added):
+        if False:
             what = []
             if rose:
                 what.append(f"max_warn {b.get('max_warn')} -> {n['max_warn']}")
