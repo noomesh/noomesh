@@ -222,16 +222,24 @@ network seams you can use.
 
 - **State:** `noo health --json` carries an `addons` object (`enabled`,
   `disabled` or `unlicensed` per add-on); `noo addons list` shows each
-  add-on's state, a development key with its expiry, and whether a registry
-  credential is set (never its value).
+  add-on's state, its signer (a development key reads `DEV until <time>`, or
+  `DEV EXPIRED <time>` once it lapsed), and whether a registry credential is
+  set (never its value).
 - **A free add-on:** `noo addons enable <name>`, then
   `noo stack restart --force`, then confirm it reads `enabled` in
   `noo health --json`. Voice models come from the controller only:
-  `noo models pull whisper:<size>` or `noo models pull piper:<voice>`; a
-  404 from voice names the exact pull line.
-- **A disabled add-on is not a fault:** its routes answer HTTP 503 with
-  `{"error": "<why>", "addon": "<name>"}` and its `noo` commands exit 5 with
-  the reason. Branch on that; do not retry, and nothing else is affected.
+  a missing model or voice is staged with `noo models pull whisper:<size>`
+  or `noo models pull piper:<voice>`.
+- **An add-on that cannot answer:** its routes answer HTTP 503 with
+  `{"error": "<why>", "addon": "<name>", "state": "<word>"}`, and its `noo`
+  commands exit 5 with the reason. Nothing else is affected. Branch on
+  `state`:
+  - `disabled` or `unlicensed`: switched off or not licensed. Turning it on
+    is the person's decision; do not retry.
+  - `unhealthy` (its manifest or lock was refused at start) or
+    `misconfigured`: report it with the error; a retry will not change it.
+  - `unreachable`: enabled but not answering right now (starting, or its
+    container is down); retry later, and `noo stack status` shows why.
 - **A person's decisions, never yours:**
   - accepting a licence's terms: `noo security entitlement install` asks
     for them; pass `--accept-terms <version>` only when the person has
