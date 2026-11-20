@@ -36,7 +36,7 @@
 //! A lock names an image by its manifest DIGEST, under whatever name the
 //! release wrote (`gateway@sha256:…`): the same digest is held locally as
 //! `ghcr.io/noomesh/gateway@sha256:…`, as `ghcr.io/noomesh/dhi/alertmanager@…`
-//! (the base images), as a Docker Hub short name (`nats@sha256:…`) or under
+//! (the base images), as a Docker Hub short name (`vllm/vllm-openai@sha256:…`) or under
 //! a mirror prefix. So every lock row is resolved BY DIGEST against the
 //! images docker holds ([`holding`]), never by name, and kept by the image
 //! ID that holds it. A Docker Hub image a lock pins is therefore kept like

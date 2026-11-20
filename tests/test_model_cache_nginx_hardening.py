@@ -56,9 +56,11 @@ def _statements(path: Path) -> list[list[str]]:
 
 
 def _nginx_pin() -> tuple[str, str]:
-    m = re.search(r"image:\s*nginx:(\d+\.\d+\.\d+)-alpine\$\{NOO_IMAGE_DIGEST_NGINX:-@sha256:([0-9a-f]{64})\}",
-                  COMPOSE.read_text())
-    assert m, "the model-cache must pin nginx:<x.y.z>-alpine by digest"
+    # the official image from OUR mirror (mirror-images.yml), never Docker Hub
+    m = re.search(r"^\s*image:\s*ghcr\.io/noomesh/nginx:(\d+\.\d+\.\d+)-alpine"
+                  r"\$\{NOO_IMAGE_DIGEST_NGINX:-@sha256:([0-9a-f]{64})\}\s*$",
+                  COMPOSE.read_text(), re.M)
+    assert m, "the model-cache must pin ghcr.io/noomesh/nginx:<x.y.z>-alpine by digest"
     return m.group(1), m.group(2)
 
 

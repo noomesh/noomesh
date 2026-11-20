@@ -1245,7 +1245,9 @@ services:
     # Pinned by digest (H-N4) — controller-only, x86. The signed stack lock carries the
     # release's digest (NOO_IMAGE_DIGEST_NATS, scripts/stack-lock-third-party.py); the
     # default digest below is the dev checkout's. Bump the tag deliberately.
-    image: ${NATS_IMAGE:-nats:2.14.9${NOO_IMAGE_DIGEST_NATS:-@sha256:f0e72e96696382cc1e5bc637befd3177bb2d5b07c37fb507f8edd09827a342a3}}
+    # Pulled from OUR mirror, never Docker Hub: mirror-images.yml copies the
+    # official nats:2.14.9 by this digest to ghcr.io/noomesh/nats (bump both).
+    image: ${NATS_IMAGE:-ghcr.io/noomesh/nats:2.14.9${NOO_IMAGE_DIGEST_NATS:-@sha256:f0e72e96696382cc1e5bc637befd3177bb2d5b07c37fb507f8edd09827a342a3}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-nats
     profiles: ["controller", "standalone"]
     ports:
@@ -3327,7 +3329,9 @@ services:
   # of re-downloading from HuggingFace. No HF proxy, no CDN. See
   # docs/models/weight-cache.md.
   model-cache:
-    image: nginx:1.30.7-alpine${NOO_IMAGE_DIGEST_NGINX:-@sha256:caf4e1e032a20f9c3c5e28fc7f25ffd768ad8677b4975c54193075997b3a97e3}
+    # The official nginx image from OUR mirror, never Docker Hub
+    # (mirror-images.yml copies nginx:1.30.7-alpine by this digest; bump both).
+    image: ghcr.io/noomesh/nginx:1.30.7-alpine${NOO_IMAGE_DIGEST_NGINX:-@sha256:caf4e1e032a20f9c3c5e28fc7f25ffd768ad8677b4975c54193075997b3a97e3}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-model-cache
     profiles: ["controller", "standalone"]
     ports:

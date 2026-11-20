@@ -31,8 +31,8 @@ An empty list `[]` means the cache holds no models yet. A `404` means
 
 ## What the cache serves
 
-The `model-cache` compose service (`nginx:1.30.7-alpine`, profiles
-`controller` and `standalone`) listens on port **8443** (mTLS) and serves
+The `model-cache` compose service (`nginx:1.30.7-alpine`, pulled from our mirror
+`ghcr.io/noomesh/nginx`; profiles `controller` and `standalone`) listens on port **8443** (mTLS) and serves
 three read-only trees from the controller's data root:
 
 | URL path | Host directory | Content |

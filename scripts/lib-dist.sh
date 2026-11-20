@@ -781,8 +781,8 @@ dist_reassert_pins() {
 # else under the prefix is a third-party or monitoring image a mirror put
 # there - `grafana:12-debian13-dev`, `loki:3`, `redis:8.6-debian13-dev`,
 # `nats:2.14.9@sha256:...` - whose compose tag is NOT the stack tag, and
-# which the pull must fetch as declared. A third-party lock row (nats, nginx
-# once they run from our mirror under the prefix itself) never reaches this
+# which the pull must fetch as declared. A third-party lock row (nats, nginx:
+# they run from our mirror under the prefix itself) never reaches this
 # test: dist_assert_pull_refs holds it to its digest pin and moves on.
 dist_ref_is_stack_versioned() {
     local _name="$1" _tag="$2" _var _p

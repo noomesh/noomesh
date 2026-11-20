@@ -98,7 +98,7 @@ numbers are approximate and grow with the models you pull):
 | Disk | 25 GB free where Docker keeps its images | the stack's images (~6.5 GB unique, measured), the default model (`gemma4:e2b`, a 4.6 GB download), and headroom for an upgrade; a fresh Ubuntu 24.04 that also installed Docker grew by ~15 GB. `noo onboard` checks this before it starts and stops below it; `noo onboard --min-free-gb <n>` sets another floor if you know this box needs less |
 | RAM | 16 GB | the stack idles at ~6 GB; a CPU-only box also holds the model in RAM |
 | GPU | optional; 4 GB+ VRAM to run a model on it | under ~10 GB the wizard offers a model verified to fit; with none, Ollama runs on CPU (slow) and the wizard offers a model that fits the free memory, or says none does |
-| Network | outbound HTTPS to `ghcr.io`, `registry-1.docker.io`, `ollama.com` and `github.com` at install; when the wizard installs Docker, also `get.docker.com`, `download.docker.com` and your distro's package mirror | pulling images and the first model, plus releases, the stack lock and its signature, and the hostd asset from GitHub; nothing inbound |
+| Network | outbound HTTPS to `ghcr.io`, `ollama.com` and `github.com` at install (every stack image comes from `ghcr.io`); when the wizard installs Docker, also `get.docker.com`, `download.docker.com` and your distro's package mirror; `registry-1.docker.io` only if you pick the vLLM backend | pulling images and the first model, plus releases, the stack lock and its signature, and the hostd asset from GitHub; nothing inbound |
 
 ### 1. Install the `noo` binary
 

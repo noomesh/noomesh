@@ -293,7 +293,7 @@ def test_the_final_lock_adds_its_digest_once():
     assert [t["digest"] for t in nginx] == [dev["nginx"], DB] and nginx[1]["version"] is None
     assert not any(t["row"] == "gateway" for t in tg), "only THIRD_PARTY rows"
     scans = M.scan_list(tg)
-    assert len(scans) == len({t["digest"] for t in tg}) and (DB, f"docker.io/library/nginx@{DB}") in scans
+    assert len(scans) == len({t["digest"] for t in tg}) and (DB, f"ghcr.io/noomesh/nginx@{DB}") in scans  # the lock row resolves from our mirror
 
 
 def test_the_lines_file_names_only_third_party_rows():
