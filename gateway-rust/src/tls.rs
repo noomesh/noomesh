@@ -356,6 +356,49 @@ pub fn pki_dir() -> Option<PathBuf> {
     env_path(PKI_DIR_ENV)
 }
 
+/// Where `startup_tasks::stage_pki` puts its ONE-TIME copy of the PKI at
+/// start (modes fixed, so the gateway's own leaf key is readable).
+pub const STAGED_PKI_DIR: &str = "/tmp/pki";
+/// The compose bind mounts of the controller's PKI, read-only. `nodes/`
+/// and `services/` there are the CLI's certificate-only mirror
+/// (`public/nodes`, `public/services`), whose CONTENTS the CLI updates in
+/// place, so the mount follows every enrolment and rotation.
+pub const LIVE_PKI_MOUNT: &str = "/app/pki";
+
+/// The staged copy and the live mount it was copied from. Production uses
+/// [`PkiMount::container`]; tests name temp dirs.
+#[derive(Debug, Clone, Copy)]
+pub struct PkiMount<'a> {
+    pub staged: &'a Path,
+    pub live: &'a Path,
+}
+
+impl PkiMount<'static> {
+    /// The gateway container's layout: `/tmp/pki` staged from `/app/pki`.
+    pub fn container() -> Self {
+        PkiMount { staged: Path::new(STAGED_PKI_DIR), live: Path::new(LIVE_PKI_MOUNT) }
+    }
+}
+
+impl PkiMount<'_> {
+    /// THE directory to read the PUBLIC trees (`nodes/`, `services/`)
+    /// under, for a PKI resolved to `pki_dir`. The staged copy is frozen at
+    /// start, so a node enrolled later is not in it: when `pki_dir` is the
+    /// staged copy, the answer is the live mount. Any other `pki_dir` (the
+    /// mount itself, or `NOO_PKI_DIR` when the gateway runs on the host) is
+    /// live already and is its own answer. Never the staged copy.
+    ///
+    /// `ca.crt` and `gateway/` stay on `pki_dir`: they change only with a
+    /// restart (which re-stages), and auth/mTLS reads the staged files.
+    pub fn public_root(&self, pki_dir: &Path) -> PathBuf {
+        if pki_dir == self.staged {
+            self.live.to_path_buf()
+        } else {
+            pki_dir.to_path_buf()
+        }
+    }
+}
+
 fn env_path(var: &str) -> Option<PathBuf> {
     let v = std::env::var(var).ok()?;
     let v = v.trim();
@@ -1248,5 +1291,127 @@ mod one_ca_reader {
             Some(v) => std::env::set_var("NOO_TLS_CA", v),
             None => std::env::remove_var("NOO_TLS_CA"),
         }
+    }
+}
+
+#[cfg(test)]
+mod public_trees_read_live {
+    //! i1118: the staged PKI copy (`/tmp/pki`) is made ONCE, at start, so its
+    //! `nodes/` and `services/` miss every node enrolled later. No gateway
+    //! source outside `stage_pki` reads those trees there:
+    //! - the staged path is spelled only here (the constant) and at the
+    //!   `stage_pki` call in startup_tasks.rs;
+    //! - a public tree is joined only onto the public root
+    //!   (`PkiMount::public_root`), never onto a resolved PKI dir;
+    //! - each reader of the public trees goes through `public_root`.
+    //!
+    //! Reads `test_src::own_code` (comments blanked, `#[cfg(test)]` items
+    //! dropped whole), so neither a doc comment nor this module counts.
+    use crate::test_src::{fn_body, own_code};
+    use std::path::{Path, PathBuf};
+
+    fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).expect("read src dir") {
+            let p = e.expect("dir entry").path();
+            if p.is_dir() {
+                rs_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+
+    /// (path relative to src/, own code) for every gateway source file.
+    fn sources() -> Vec<(String, String)> {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rs_files(&src, &mut files);
+        assert!(files.len() > 50, "the scan found {} files; the walk is broken", files.len());
+        files
+            .iter()
+            .map(|f| {
+                let rel = f.strip_prefix(&src).unwrap_or(f).display().to_string();
+                let raw = std::fs::read_to_string(f).expect("read source");
+                (rel, own_code(&raw))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn no_source_outside_stage_pki_reads_the_staged_public_trees() {
+        let staged = concat!("\"/tmp", "/pki");
+        let mut spelled: Vec<String> = Vec::new();
+        let mut joins_on_public = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for (rel, code) in sources() {
+            if code.contains(staged) {
+                spelled.push(rel.clone());
+            }
+            for tree in ["nodes", "services"] {
+                for needle in [format!(".join(\"{tree}\")"), format!(".join(\"{tree}/")] {
+                    for (at, _) in code.match_indices(needle.as_str()) {
+                        let before = code[..at].trim_end();
+                        if before.ends_with("public") || before.ends_with("public_root") {
+                            joins_on_public += 1;
+                        } else {
+                            let line = code[..at].matches('\n').count() + 1;
+                            offenders.push(format!("{rel}:{line}"));
+                        }
+                    }
+                }
+            }
+        }
+        spelled.sort();
+        assert_eq!(
+            spelled,
+            vec!["startup_tasks.rs".to_string(), "tls.rs".to_string()],
+            "the staged PKI path is spelled only by tls::STAGED_PKI_DIR and the stage_pki call; \
+             name tls::STAGED_PKI_DIR and read nodes/ and services/ via PkiMount::public_root"
+        );
+        assert!(
+            offenders.is_empty(),
+            "nodes/ or services/ joined onto something other than the public root \
+             (PkiMount::public_root) — a staged-copy read misses late-enrolled nodes: {offenders:?}"
+        );
+        assert!(joins_on_public >= 2, "the scan saw {joins_on_public} public-root joins; it is not reading the readers");
+    }
+
+    #[test]
+    fn every_public_tree_reader_goes_through_public_root() {
+        fn of<'a>(all: &'a [(String, String)], name: &str) -> &'a str {
+            &all.iter().find(|(rel, _)| rel == name).unwrap_or_else(|| panic!("{name} is gone")).1
+        }
+        let all = sources();
+        for (file, reader, call) in [
+            ("autonomy_evaluators.rs", "pub async fn certs_expiring_in(", "mount.public_root(pki_path)"),
+            ("routes/admin.rs", "async fn pki_status_body(", "mount.public_root(pki_path)"),
+            ("heartbeat_actions.rs", "async fn cert_rotation_check_in(", "mount.public_root(dir)"),
+            ("heartbeat_actions.rs", "fn auto_rotate_leaves(", "mount.public_root(dir)"),
+        ] {
+            let body = fn_body(of(&all, file), reader);
+            assert!(body.contains(call), "{file} `{reader}` must take nodes/ and services/ from `{call}`");
+        }
+        // Production callers hand the readers the container layout.
+        for (file, caller, callee) in [
+            ("autonomy_evaluators.rs", "pub async fn certs_expiring_within(", "certs_expiring_in("),
+            ("routes/admin.rs", "async fn security_pki_status(", "pki_status_body("),
+            ("heartbeat_actions.rs", "async fn action_cert_rotation_check(", "cert_rotation_check_in("),
+            ("heartbeat_actions.rs", "async fn action_cert_auto_rotate(", "cert_auto_rotate_in("),
+        ] {
+            let body = fn_body(of(&all, file), caller);
+            assert!(
+                body.contains(callee) && body.contains("PkiMount::container()"),
+                "{file} `{caller}` must call `{callee}` with PkiMount::container()"
+            );
+        }
+    }
+
+    #[test]
+    fn the_staged_copy_maps_to_the_live_mount() {
+        let m = super::PkiMount::container();
+        assert_eq!(m.public_root(Path::new("/tmp/pki")), PathBuf::from("/app/pki"));
+        assert_eq!(m.public_root(Path::new("/tmp/pki/")), PathBuf::from("/app/pki"));
+        assert_eq!(m.public_root(Path::new("/app/pki")), PathBuf::from("/app/pki"));
+        assert_eq!(m.public_root(Path::new("/home/op/.noo/pki")), PathBuf::from("/home/op/.noo/pki"));
     }
 }
