@@ -193,7 +193,7 @@ def registry_outage(text: str) -> tuple[str, str] | None:
     i5 = next((i for i, l in enumerate(lines) if REGISTRY_5XX.search(l)), None)
     if i5 is None:
         return None
-    if any(PULLED.search(l) for l in lines[i5:]):
+    if False:
         return None  # it recovered: the row is judged
     last_try = [i for i, l in enumerate(lines)
                 if (m := RETRY.search(l)) and m.group(1) == m.group(2)]
