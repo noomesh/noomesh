@@ -1238,6 +1238,11 @@ pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let resp = match crate::http::put_json_try(g, &place_path, &body, true, 10) {
         Ok(v) => v,
         Err(e) => {
+            // The gateway's ollama tag refusal is not a staging the CLI can do
+            // and retry: show it once, with its `next`, and stop.
+            if let Some(refusal) = ollama_tag_refusal_body(&e) {
+                place_refused_with_next(g.json, &refusal);
+            }
             if let Some((img, arch)) = crate::commands::image_stage::parse_not_staged(&e) {
                 if !g.json {
                     ui::step(&format!("{img} is not staged for {arch} — staging it on the artifact rail first"));
@@ -1322,6 +1327,50 @@ pub(crate) fn native_placement_warning(node: &str, backend: &str) -> String {
 /// them: `converges` (false for a native backend), the native `warning`, and
 /// `next` (verify the node once it converges; for a native backend, look at
 /// which runtime serves it). Pure.
+/// The code of the gateway's ollama tag refusal (gateway
+/// `routes::cluster::OLLAMA_TAG_NOT_STAGED`): a 409 whose body carries
+/// `next` (`noo models fetch ollama:<tag>`).
+pub(crate) const OLLAMA_TAG_NOT_STAGED: &str = "ollama_tag_not_staged";
+
+/// The gateway's ollama tag refusal body, out of `put_json_try`'s error
+/// (`HTTP 409: <body>`), recognised by its `code`, never by its text. None
+/// for any other error. Pure.
+pub(crate) fn ollama_tag_refusal_body(err: &str) -> Option<serde_json::Value> {
+    let body: serde_json::Value = serde_json::from_str(err.strip_prefix("HTTP 409: ")?).ok()?;
+    (body["code"].as_str() == Some(OLLAMA_TAG_NOT_STAGED)).then_some(body)
+}
+
+/// The commands a refusal's `next` names, in order. Pure.
+pub(crate) fn next_commands(body: &serde_json::Value) -> Vec<String> {
+    body["next"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|s| s["command"].as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
+/// What a refusal with `next` prints in text mode: the error line, then the
+/// guide entries (each `next` command, "stage it first"). Pure.
+pub(crate) fn refusal_with_next_text(body: &serde_json::Value) -> (String, Vec<String>) {
+    let msg = body["error"].as_str().unwrap_or("the gateway refused the placement").to_string();
+    (msg, next_commands(body))
+}
+
+/// Print a refusal that carries `next` once and exit as a refusal does
+/// (exit 5, remote error). `--json`: the gateway's body as is, on stderr
+/// where every error goes.
+fn place_refused_with_next(json: bool, body: &serde_json::Value) -> ! {
+    if json {
+        eprintln!("{body}");
+    } else {
+        let (msg, cmds) = refusal_with_next_text(body);
+        ui::failed(&msg, None);
+        let entries: Vec<(&str, &str)> = cmds.iter().map(|c| (c.as_str(), "stage it first, then place again")).collect();
+        ui::guide(&entries);
+    }
+    ui::pager_finish();
+    std::process::exit(ExitCode::RemoteError as i32);
+}
+
 pub(crate) fn place_json(resp: &mut serde_json::Value, node: &str, backend: &str, native: bool) {
     resp["converges"] = serde_json::json!(!native);
     let next = if native {
@@ -4157,5 +4206,42 @@ mod place_json_tests {
             native_placement_warning("node_b", "ollama"),
             "node_b serves ollama NATIVELY — this agent reports it but does not start, stop or converge it, so this placement will not be applied"
         );
+    }
+}
+
+#[cfg(test)]
+mod ollama_tag_refusal_tests {
+    use super::*;
+
+    /// The gateway's 409 as `put_json_try` hands it over.
+    const CANNED: &str = "HTTP 409: {\"error\":\"node_a cannot pull gemma4:12b from the public registry (nodes pull models only from the controller's store); stage it first: `noo models fetch ollama:gemma4:12b`, then place again; --force places it anyway\",\"code\":\"ollama_tag_not_staged\",\"next\":[{\"kind\":\"command\",\"command\":\"noo models fetch ollama:gemma4:12b\"}]}";
+
+    /// Recognised by its code; its error and `next` are what prints.
+    #[test]
+    fn the_refusal_is_read_by_its_code_and_shows_next() {
+        let body = ollama_tag_refusal_body(CANNED).expect("the ollama tag refusal");
+        let (msg, cmds) = refusal_with_next_text(&body);
+        assert!(msg.starts_with("node_a cannot pull gemma4:12b from the public registry"), "{msg}");
+        assert_eq!(cmds, vec!["noo models fetch ollama:gemma4:12b".to_string()]);
+        assert_eq!(body["next"][0]["kind"], "command", "--json prints the body as is, next included");
+        // Not this refusal: another 409, the image refusal's text, a non-409.
+        assert!(ollama_tag_refusal_body("HTTP 409: {\"error\":\"x\",\"code\":\"other\"}").is_none());
+        assert!(ollama_tag_refusal_body("HTTP 409: {\"error\":\"image a:b for amd64 is not staged on the controller\"}").is_none());
+        assert!(ollama_tag_refusal_body(&CANNED.replacen("409", "500", 1)).is_none());
+        assert!(ollama_tag_refusal_body("connection refused").is_none());
+    }
+
+    /// The place command stops on it before the image-staging retry: the
+    /// refusal is printed once, never PUT again.
+    #[test]
+    fn place_does_not_retry_the_refusal() {
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let place = crate::test_src::fn_body(&own, "pub fn cluster_place(");
+        let check = place.find("if let Some(refusal) = ollama_tag_refusal_body(&e) {").expect("the place path reads the refusal");
+        let stop = place.find("place_refused_with_next(g.json, &refusal);").expect("and stops on it");
+        let retry = place.find("put_json(g, &place_path, &body, true, 10)").expect("the retry");
+        assert!(check < stop && stop < retry, "the refusal stops before the retry PUT");
+        let stops = crate::test_src::fn_body(&own, "fn place_refused_with_next(");
+        assert!(stops.contains("std::process::exit(ExitCode::RemoteError as i32);"), "it exits as a refusal does");
     }
 }

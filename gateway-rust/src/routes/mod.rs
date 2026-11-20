@@ -116,10 +116,12 @@ pub enum AppError {
     Upstream(String),
     BadRequest(String),
     Conflict(String),
-    /// 409 with the steps that clear it: `{"error": msg, "next": next}`,
-    /// `next` in the agreed shape (`[{"kind": "command", "command": …}]`,
-    /// see `bootstrap::next_cmd`), so an agent reads the remedy as data.
-    ConflictNext { msg: String, next: Value },
+    /// 409 with a MACHINE-READABLE `code` and the steps that clear it:
+    /// `{"error": msg, "code": code, "next": next}`, `next` in the agreed
+    /// shape (`[{"kind": "command", "command": …}]`, see
+    /// `bootstrap::next_cmd`), so a client recognises the refusal by its code
+    /// (`noo cluster place` does not retry it) and reads the remedy as data.
+    ConflictNext { code: &'static str, msg: String, next: Value },
     Forbidden(String),
     /// The surface is deliberately not here — a disabled or unlicensed
     /// add-on, or a dependency the gateway knows is absent. 503 with an
@@ -175,8 +177,8 @@ impl IntoResponse for AppError {
             Self::Conflict(m) => (StatusCode::CONFLICT, m),
             Self::Forbidden(m) => (StatusCode::FORBIDDEN, m),
             Self::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
-            Self::ConflictNext { msg, next } => {
-                return (StatusCode::CONFLICT, Json(json!({"error": msg, "next": next}))).into_response();
+            Self::ConflictNext { code, msg, next } => {
+                return (StatusCode::CONFLICT, Json(json!({"error": msg, "code": code, "next": next}))).into_response();
             }
             Self::TooManyRequests { msg, retry_after_secs } => {
                 let mut r = (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": msg, "retry_after_secs": retry_after_secs}))).into_response();
