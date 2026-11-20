@@ -85,7 +85,7 @@ pub fn next_delay(tried: usize, waited_secs: u64) -> Option<u64> {
         return None;
     }
     let d = *DELAYS_SECS.get(tried - 1)?;
-    if waited_secs + d > MAX_TOTAL_WAIT_SECS {
+    if waited_secs + d > 10_000 {
         return None;
     }
     Some(d)
