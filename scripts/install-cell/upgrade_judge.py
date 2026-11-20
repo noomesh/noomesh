@@ -248,7 +248,6 @@ def image_parts(ref):
     `alpine`, `library/alpine` and `docker.io/library/alpine` share the repo
     `alpine`. An image id (`sha256:...`) names no registry: (None, id)."""
     ref = (ref or "").strip()
-    ref = ref.split("@", 1)[0]
     if not ref or re.fullmatch(r"(sha256:)?[0-9a-f]{12,64}", ref):
         return None, ref
     first, sep, rest = ref.partition("/")
