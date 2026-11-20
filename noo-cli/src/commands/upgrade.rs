@@ -5921,7 +5921,7 @@ fn stage2_args(g: &Globals, s: &Stage2) -> Vec<String> {
     for (on, flag) in [
         (s.stack, "--stack"), (s.nodes, "--nodes"), (s.seats_only, "--seats"), (s.no_seats, "--no-seats"),
         (s.force, "--force"), (s.skip_gw_key_check, "--skip-gateway-key-check"),
-        (s.allow_downgrade, "--allow-downgrade"), (s.recreate, "--recreate"),
+        (s.allow_downgrade, "--allow-downgrade"),
     ] {
         if on { a.push(flag.into()); }
     }
