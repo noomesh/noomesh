@@ -5,6 +5,16 @@ Every file under `docs/` is listed here exactly once
 first, then [cli](#cli) for how the command line is organised, then the
 reference and operating pages as you need them.
 
+**If you are an agent:**
+- **Changing this repository?** Start at [AGENTS.md](../AGENTS.md), the
+  hard rules and how changes are proven.
+- **Operating a cluster?** Read a page's `## For agents` part where it has one
+  (exact commands, flags, refusals, what to check after). Use `noo … --json`
+  for anything you parse. The generated references are the source of truth:
+  the commands ([CLI](#cli)) and the settings and API ([Reference](#reference)).
+  The MCP doors are under [Channels](#channels). Never run `sudo` on a remote
+  node, and never pass a secret as a command-line argument.
+
 ## Placeholders in commands
 
 Angle brackets mean "substitute your own value". The same idea always uses
