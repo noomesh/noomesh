@@ -104,6 +104,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["security", "user", "set-password"], "<username> [--password-stdin]", "Set a user's password (prompts unless --password-stdin)"),
     (&["security", "admin-password", "reset"], "[--stdout] [--yes]", "On the controller, no login: reset the admin, end its sessions, show the new password once"),
     (&["security", "user", "set-scopes"], "<username> --scope <scope>...", "Replace a user's auth scopes with the given set (admin-only)"),
+    (&["security", "user", "set-role"], "<username> <user|operator|admin>", "Set a user's permission tier, keeping other scopes (admin-only)"),
     (&["security", "user", "super-admin"], "<username> on|off --reason <text> [--password-stdin] [-y|--yes]", "Name or remove a super admin; re-enter your own password (super admin only)"),
     (&["security", "user", "allowance"], "<username> [-t|--tokens <n>] [-p|--period day|week|month] [--clear]", "Show, set or clear a user's standing token allowance per period (setting is admin-only)"),
     (&["security", "user", "set-org"], "<username> <org_id>", "Assign a user to an org"),

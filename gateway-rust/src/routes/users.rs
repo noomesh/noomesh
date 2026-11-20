@@ -3513,6 +3513,12 @@ async fn enabled_admin_count(db: &sqlx::PgPool) -> Result<i64, AppError> {
     Ok(crate::repo::users::enabled_admin_count(db).await?)
 }
 
+/// The command the last-admin refusal tells the operator to run. It must be a
+/// verb `noo` registers (`noo security user set-role`, which calls
+/// `user_set_role` above): `tests/test_last_admin_hint_names_a_cli_verb.py`
+/// holds the two together.
+pub(crate) const LAST_ADMIN_PROMOTE_CMD: &str = "noo security user set-role <user> admin";
+
 /// The last-admin guard: refuse to disable, erase or demote the only enabled
 /// admin left.
 ///
@@ -3539,7 +3545,7 @@ async fn require_not_last_admin(
     if enabled_admin_count(db).await? <= 1 {
         return Err(AppError::Forbidden(format!(
             "refusing to {verb} '{username}': it is the last enabled admin account. \
-             Promote another account to admin first (noo security user set-role <user> admin)."
+             Promote another account to admin first ({LAST_ADMIN_PROMOTE_CMD})."
         )));
     }
     Ok(())

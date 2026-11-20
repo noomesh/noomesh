@@ -299,15 +299,15 @@ prompt this lets through can still be cut: it is then flagged as above.
 
 **A node restarting.** When a node's agent restarts (a roll, `noo upgrade
 --nodes`), it lets answers that are already streaming finish (up to 30 s)
-and refuses NEW calls with `503 {"error":{"code":"node_restarting"}}` and a
-`Retry-After` that covers the rest of the drain and the restart. You rarely
-see that answer:
+and answers NEW calls from the gateway with `503
+{"error":{"code":"node_restarting"}}` and a `Retry-After` that covers the
+rest of the drain and the restart. You rarely see a refusal for it:
 
 | your call | what happens |
 |---|---|
 | the class has another candidate | it is answered there at once (`fallback: true`) |
 | interactive (`/v1`, `/api/external`), no other candidate | the gateway waits the `Retry-After` (at most 30 s, never past your request's own deadline) and sends it again; you see a slower answer |
-| the node is still restarting after that, or too many calls already wait on it (32 per node) | `503`, code `node_restarting`, with the node's `Retry-After`: send it again after that |
+| the node is still restarting after that, or too many calls already wait on it (32 per node) | `503` with `{"error": {"message", "type": "node_restarting", "ref"}}` and the node's `Retry-After`: send it again after that |
 
 A non-streamed answer the node cut while it stopped is sent again whole by
 the gateway (nothing of it had reached you). A streamed answer still open
@@ -326,10 +326,20 @@ with that `ref` and, for `/api/external/*`, in the audit row
 (`noo_external_requests.trace_id` / `error`) — **operator-side only**:
 `GET /api/external/usage` returns the consumer its rows' `status_code` and
 `ref`, never the `error` column. Types: `model_not_found`
-(404 — no class, alias or served model by that name), `backend_unavailable`
+(404 — no class, alias or served model by that name; see below),
+`node_restarting` (503 with `Retry-After`, above), `backend_unavailable`
 (503 — nothing routable; 502 — every candidate failed), `backend_error`
 (the backend answered with a non-retryable status), `bad_request`
 (the message names the field).
+
+A `model_not_found` also carries OpenAI's `code` and `param`, and its
+message names the model you sent (control characters dropped, cut at 128
+characters) and where to list what is served:
+
+```json
+{"error": {"message": "model 'gemma9:1b' is not served: no model, class or alias by that name. GET /v1/models lists what is served (an operator: noo cluster class list)",
+  "type": "model_not_found", "code": "model_not_found", "param": "model", "ref": "ref-3f9c2b1e0a"}}
+```
 
 ### Reasoning models: thinking, budgets and structured output
 
@@ -863,7 +873,7 @@ on the gateway's own). Broadcast is refused; a thread needs a seat.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET, POST | `/api/security/users`; PUT `…/{username}/password`; POST `…/disable`, `/role`, `/scopes`, `/org`, `/roles`, `/roles/revoke` | user management |
+| GET, POST | `/api/security/users`; PUT `…/{username}/password`; POST `…/disable`, `/role`, `/scopes`, `/org`, `/roles`, `/roles/revoke` | user management. `/role` takes `{role}` (`user`, `operator` or `admin`) (`noo security user set-role`), keeps the non-tier scopes, and refuses demoting yourself or the last enabled admin |
 | POST | `/api/security/users/{username}/erase` | right to be forgotten. Body `{dry_run?: bool (default **true**), keep_account?: bool}`: a bare call only previews the per-store row counts and the knowledge-base plan (personal documents go, shared ones are scrubbed). `dry_run: false` snapshots every matched row into the erasure archive and deletes it all in one transaction, removes the user's upload files (when nobody else uploaded the same bytes) and audits it (`user_erase`); `keep_account` wipes the data but keeps the login. Refused: a target above the caller's tier (`403`, also on the dry run), the configured operator account (`NOO_ADMIN_USER`/`NOO_OPERATOR_USER`, `400`), the last admin (unless `keep_account`). **`409` + `Retry-After`** while the account has a write-side [operation](#asynchronous-operations-routesopsrs) live or within its worker window; that refusal marks the account erase-pending, after which every new operation start for it is `423` (see *Erasing an account*). A refused erase is audited (`user_erase_refused`) |
 | GET | `/api/security/erasure-archive` | what the erase archive holds: row and run counts, the age of the oldest copy, the 30-day retention window (`retention_days`), and whether the daily purge is running (Operator+; an authenticated caller below Operator gets `403`, no credential `401`) |
 | GET, POST | `/api/security/users/{username}/links`; POST `/api/security/channel-links/unlink` | channel identity links |

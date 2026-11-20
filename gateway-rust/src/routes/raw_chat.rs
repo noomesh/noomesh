@@ -173,6 +173,24 @@ impl RawChatError {
         Self::new(status, "backend_error", format!("backend at {url} answered {status}: {}", crate::text::clip(body, 500)))
     }
 
+    /// A `model_not_found` 404 about the model the caller asked for: the
+    /// public message names it (the caller's own input, through
+    /// [`public_model_name`]) and says where to list what is served. Any
+    /// other error, an error that already set its own public message, and a
+    /// request with no model keep the general wording.
+    pub fn naming_model(mut self, requested: Option<&str>) -> Self {
+        if self.status != StatusCode::NOT_FOUND || self.kind != MODEL_NOT_FOUND || self.public.is_some() {
+            return self;
+        }
+        if let Some(name) = requested.map(public_model_name).filter(|n| !n.is_empty()) {
+            self.public = Some(format!(
+                "model '{name}' is not served: no model, class or alias by that name. \
+                 GET /v1/models lists what is served (an operator: {SERVED_MODELS_CMD})"
+            ));
+        }
+        self
+    }
+
     /// What the consumer reads. General by status unless the error set its own.
     pub fn public_message(&self) -> String {
         if let Some(p) = &self.public {
@@ -181,13 +199,20 @@ impl RawChatError {
         public_message_for(self.status)
     }
 
-    /// The OpenAI-shaped body: `{"error": {"message", "type", "ref"}}`.
+    /// The OpenAI-shaped body: `{"error": {"message", "type", "ref"}}`,
+    /// plus `code` and `param` on a `model_not_found` (OpenAI's own shape for
+    /// an unknown model: `code: "model_not_found"`, `param: "model"`).
     pub fn body(&self) -> Value {
-        json!({"error": {
+        let mut b = json!({"error": {
             "message": self.public_message(),
             "type": self.kind,
             "ref": self.reference,
-        }})
+        }});
+        if self.kind == MODEL_NOT_FOUND {
+            b["error"]["code"] = json!(MODEL_NOT_FOUND);
+            b["error"]["param"] = json!("model");
+        }
+        b
     }
 
     /// Log the detail under the reference. Called once, by whoever renders.
@@ -214,6 +239,31 @@ impl RawChatError {
         }
         resp
     }
+}
+
+/// The `type` (and OpenAI `code`) of a request for a model nothing serves.
+pub const MODEL_NOT_FOUND: &str = "model_not_found";
+
+/// The operator command that lists what the mesh serves, named in the
+/// `model_not_found` message beside `GET /v1/models`.
+pub const SERVED_MODELS_CMD: &str = "noo cluster class list";
+
+/// The longest model name echoed back in a `model_not_found` message, in
+/// characters; a longer one is cut with `…`.
+pub const MAX_ECHOED_MODEL_CHARS: usize = 128;
+
+/// The requested model name as it may appear in a public message: the
+/// caller's own input, trimmed, control characters dropped, and cut to
+/// [`MAX_ECHOED_MODEL_CHARS`] so a hostile name cannot forge lines or bloat
+/// the body.
+pub fn public_model_name(raw: &str) -> String {
+    let clean: String = raw.trim().chars().filter(|c| !c.is_control()).collect();
+    if clean.chars().count() <= MAX_ECHOED_MODEL_CHARS {
+        return clean;
+    }
+    let mut cut: String = clean.chars().take(MAX_ECHOED_MODEL_CHARS).collect();
+    cut.push('…');
+    cut
 }
 
 /// The general wording for a status. No node, address, URL or upstream text
@@ -1027,7 +1077,9 @@ pub async fn chat_completions_with(
     budget_fits_thinking(body)?;
     let pin = node_pin(body, pin)?;
     let hint = coordinator::model_hint(body.get("model").and_then(Value::as_str)).map(str::to_string);
-    let (class, cands) = resolve_candidates(state, hint.as_deref(), pin.node.as_deref(), pin.strict).await?;
+    let (class, cands) = resolve_candidates(state, hint.as_deref(), pin.node.as_deref(), pin.strict)
+        .await
+        .map_err(|e| e.naming_model(hint.as_deref()))?;
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if stream {
         body["stream_options"] = json!({"include_usage": true});
@@ -1040,6 +1092,7 @@ pub async fn chat_completions_with(
         ("/v1/chat/completions".to_string(), b)
     })
     .await
+    .map_err(|e| e.naming_model(hint.as_deref()))
 }
 
 /// The smallest `max_tokens` a structured-output request may carry while
@@ -1393,6 +1446,65 @@ mod tests {
             }
         }
         assert_eq!(public_message_for(StatusCode::NOT_FOUND), "no model, class or alias by that name is served");
+    }
+
+    /// A `/v1` request for a model nothing serves names the model the caller
+    /// sent (cleaned and capped), says where to list what is served, and
+    /// carries OpenAI's `code` and `param` beside the unchanged `type`.
+    #[test]
+    fn a_model_not_found_names_the_requested_model_and_carries_code_and_param() {
+        let e = RawChatError::from_resolve(&anyhow::Error::new(coordinator::ModelNotServed(
+            "model 'gemma9:1b' is not served by any node; nodes serve: host3=vllm:HF".into())))
+            .naming_model(Some("gemma9:1b"));
+        let b = e.body();
+        let msg = b["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("'gemma9:1b'"), "the requested model is named: {msg}");
+        assert!(msg.contains("GET /v1/models") && msg.contains(SERVED_MODELS_CMD), "{msg}");
+        assert!(!msg.contains("host3"), "the operator detail stays out: {msg}");
+        assert_eq!(b["error"]["type"], "model_not_found");
+        assert_eq!(b["error"]["code"], "model_not_found");
+        assert_eq!(b["error"]["param"], "model");
+        assert_clean(&b);
+
+        // The caller's own input, but cleaned: no control characters (no
+        // forged lines), and cut at the cap with an ellipsis.
+        let hostile = format!("evil\n\r\u{1b}[31m{}", "x".repeat(500));
+        let e = RawChatError::from_resolve(&anyhow::Error::new(coordinator::ModelNotServed("m".into())))
+            .naming_model(Some(&hostile));
+        let msg = e.public_message();
+        assert!(!msg.chars().any(char::is_control), "{msg:?}");
+        let echoed = public_model_name(&hostile);
+        assert!(msg.contains(&format!("'{echoed}'")), "{msg}");
+        assert_eq!(echoed.chars().count(), MAX_ECHOED_MODEL_CHARS + 1, "cut to the cap plus the ellipsis");
+        assert!(echoed.starts_with("evil[31m") && echoed.ends_with('…'), "{echoed}");
+        assert_eq!(public_model_name("  gemma4:12b  "), "gemma4:12b");
+
+        // No model named (or a blank one after cleaning): the general wording.
+        for none in [None, Some(""), Some("\u{7}")] {
+            let e = RawChatError::from_resolve(&anyhow::Error::new(coordinator::ModelNotServed("m".into()))).naming_model(none);
+            assert_eq!(e.public_message(), public_message_for(StatusCode::NOT_FOUND));
+            assert_eq!(e.body()["error"]["code"], "model_not_found", "code and param ride on every model_not_found");
+        }
+        // Any other error stays general and gains no code/param, and an
+        // error with its own public message keeps it.
+        let e = RawChatError::new(StatusCode::SERVICE_UNAVAILABLE, "backend_unavailable", "d").naming_model(Some("gemma9:1b"));
+        assert_eq!(e.public_message(), public_message_for(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(e.body()["error"].get("code").is_none() && e.body()["error"].get("param").is_none());
+        let e = RawChatError::request_refused(StatusCode::NOT_FOUND, "not_found", "no such record").naming_model(Some("gemma9:1b"));
+        assert_eq!(e.public_message(), "no such record");
+    }
+
+    /// The `/v1` paths that can answer `model_not_found` pass the caller's
+    /// model through `naming_model`: both exits of `chat_completions_with`
+    /// (resolve, failover) and the `/v1/responses` resolve.
+    #[test]
+    fn the_v1_paths_name_the_requested_model() {
+        let code = crate::test_src::own_code(include_str!("raw_chat.rs"));
+        let with = crate::test_src::fn_body(&code, "pub async fn chat_completions_with");
+        assert_eq!(with.matches(".map_err(|e| e.naming_model(hint.as_deref()))").count(), 2, "{with}");
+        let inf = crate::test_src::own_code(include_str!("inference.rs"));
+        let responses = crate::test_src::fn_body(&inf, "async fn v1_responses(");
+        assert!(responses.contains("e.naming_model(requested_model_hint(&body)).into_response(\"v1\")"), "{responses}");
     }
 
     #[test]
