@@ -36,7 +36,7 @@ helper_job_caps() {  # JOB -> caps, one per line (mirror of JOB_CAPS)
         chown)         printf '%s\n' CHOWN ;;
         du)            printf '%s\n' DAC_READ_SEARCH ;;
         secrets-chown) printf '%s\n' CHOWN DAC_READ_SEARCH ;;
-        chgrp-file)    printf '%s\n' CHOWN FOWNER ;;
+        chgrp-file)    printf '%s\n' CHOWN ;;
         data-dirs)     printf '%s\n' CHOWN DAC_OVERRIDE ;;
         reown)         printf '%s\n' CHOWN DAC_OVERRIDE ;;
         wipe)          printf '%s\n' CHOWN DAC_OVERRIDE ;;
