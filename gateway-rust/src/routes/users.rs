@@ -3235,7 +3235,7 @@ async fn service_key_set_context_overflow(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<ContextOverflowBody>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, ctx.as_deref(), "setting a key's context-overflow mode").await?;
+
     require_may_manage_key_consumer(&state.db, &ctx, &consumer).await?;
     let Some(mode) = crate::service_keys::ContextOverflow::parse(&body.mode) else {
         return Err(AppError::BadRequest(format!(
