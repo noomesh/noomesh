@@ -345,7 +345,7 @@ pub(crate) fn carry_reported(data: &mut Value, body: &Value, key: &str) {
 /// rebuilds the record from scratch, so without these every agent restart
 /// left the node unroutable until its first beat: an instant 503 for every
 /// chat to a class only it serves (~30 s on every roll and upgrade).
-pub(crate) const REGISTER_KEEPS_FROM_STORED: &[&str] = &["lanes", "running_backends", "available_models"];
+pub(crate) const REGISTER_KEEPS_FROM_STORED: &[&str] = &["running_backends", "available_models"];
 
 /// How old the stored record's last beat (or registration) may be for a
 /// registration to keep its routing fields: an agent restart, not a node
