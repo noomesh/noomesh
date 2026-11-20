@@ -380,7 +380,7 @@ addons_stop_disabled() {
             if printf '%s\n' "$NOO_ADDON_MAP" | grep -qx "${_asd_n}=0"; then
                 if ! _asd_cf="$(docker ps -a --filter "label=com.docker.compose.project=${_asd_proj}" \
                         --format '{{.Label "com.docker.compose.project.config_files"}}' 2>/dev/null)" \
-                    || printf '%s\n' "$_asd_cf" | tr ',' '\n' | grep -qF "/addons/${_asd_n}/"; then
+                    || true; then
                     echo "! add-on $_asd_n is declared off but its overlay is gone, so its containers were NOT checked: noo doctor orphans" >&2
                 fi
             fi
