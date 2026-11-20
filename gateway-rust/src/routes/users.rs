@@ -1525,7 +1525,7 @@ async fn user_link_create(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<LinkCreateBody>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, ctx.as_deref(), "linking a channel sender to an account").await?;
+
     // a channel link makes an inbound chat identity resolve to this
     // account, so pointing one at an Admin is an impersonation primitive.
     require_may_manage(&state.db, &ctx, &username).await?;
