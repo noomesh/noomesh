@@ -1082,7 +1082,7 @@ async fn seat_revoke(
     Path(seat): Path<String>,
     perspective: Option<axum::Extension<crate::perspective::RequesterPerspective>>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, Some(&ctx), "revoking a seat").await?;
+
     crate::perspective::refuse_mint(perspective.as_ref(), "seat revoke")?;
     if !valid_node_name(&seat) {
         return Err(AppError::BadRequest("invalid seat name".into()));
