@@ -79,6 +79,6 @@ Example:
 
 - Don't send empty messages — if the user said just "broadcast", ask
   for content
-- Respect recipient preferences stored in `noo_channel_recipients`
+- Respect recipient preferences: check them with `noo_channel_list_recipients`
 - For high-frequency automated broadcasts, consider wiring through
   `heartbeat` instead of direct tool calls

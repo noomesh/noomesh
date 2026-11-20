@@ -67,6 +67,11 @@ by hand or with `noo models pull` (Ollama only — see below).
 
 ### `HF_CACHE_DIR` is an HF_HOME, not a hub directory
 
+On the controller, `<HF cache>/hub` must be owned like the HF cache itself, or
+the self node's agent cannot write the weights. `noo cluster verify`'s
+`hf-cache hub owner` row says whether it is. The self node's applier repairs it
+at its next apply.
+
 This is the one layout mistake that produces a silent empty cache, so it is
 worth being exact. `HF_CACHE_DIR` is an **HF_HOME**: the directory
 `huggingface_hub` treats as its root, which holds `hub/` (and `xet/`,

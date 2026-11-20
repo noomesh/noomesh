@@ -312,3 +312,6 @@ a key act with more authority than any human account.
 | `404` on a call with a session header | the `Mcp-Session-Id` is unknown or expired (24 h idle; a gateway restart keeps sessions): the client should re-initialize |
 | `404` | the door is closed (`NOO_MCP_EXTERNAL_ENABLED` unset) or the path is wrong: the user door is `/mcp/user` on `:8080` (`/mcp/external` and the loopback `:3100` listener were both removed in stack-v0.2.40 — the operator door is `/mcp/operator` on `:8080` now) |
 | Query returns nothing | your account may not be in the audience for those docs — ask an operator to tag them `company`, or grant you a `team:*` role |
+
+What your client's tools return reaches a model as data, never as
+instructions: see [model-context.md](../security/model-context.md).

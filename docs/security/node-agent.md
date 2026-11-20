@@ -432,6 +432,20 @@ user info, path, query or fragment. One that does not fit is neither stored
 nor dialled: the gateway dials `https://<ip>:8081`, and `noo cluster verify`
 shows an `agent address` FAIL naming the node and the reason.
 
+**A node's certificate must cover the address it is dialled at.** A node
+enrolled without a tailnet address gets its leaf for the address the gateway
+saw at enrollment. Behind a reverse proxy, Docker Desktop's forwarder or a
+hairpin that is not the node's own, and every call to it then fails TLS.
+`noo cluster verify`'s `agent certificate` row:
+- **FAIL:** the leaf misses the dialled address. The remedy is
+  `noo security pki push-nodes <node>`, and the row says which address that
+  would certify.
+- **FAIL with no remedy:** that address is also another node's (registered,
+  dialled, or in its leaf). Investigate first; `push-nodes` refuses it too,
+  unless `--allow-shared-address <addr>` names it.
+- **WARN:** the controller cannot read the node's leaf.
+- **No row:** the leaf covers the address.
+
 ---
 
 ## Declared host roots
@@ -1535,6 +1549,23 @@ else (including no `systemd-run`), and `harness-egress=UNRESOLVED:<name>` per
 unresolved name. The probe never refuses the harness unit; the node agent
 reports the state and refuses the kinds that need enforcement. A teardown
 removes the drop-in and the directory.
+
+Before it installs the hold, the applier runs a pre-check under the hold's own
+settings: every controller name must resolve from the rendered `hosts` file,
+and every controller port must answer. A controller URL that is a literal IPv4
+address is connected to without a lookup, and an address outside the base
+ranges is added to the allowlist. If the pre-check fails, nothing is installed
+and the tag says why:
+- `UNENFORCED:selfcheck-<host>-<port>`: this node cannot reach that controller
+  address under the hold;
+- `UNENFORCED:selfcheck-unavailable`: no `systemd-run` on this host.
+
+`noo cluster verify`'s `harness egress` row:
+- **OK:** the unit is held and the harness's own self-test confirms it.
+- **FAIL:** not held. Codex placements are refused there.
+- **WARN:** unknown, or the node runs another runtime (launchd).
+- **The remedy:** `noo cluster provision <node>`. Its apply report carries the
+  tag above.
 
 ## The helper image
 
