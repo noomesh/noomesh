@@ -6183,6 +6183,12 @@ pub(crate) fn harrier_create_script(embed: &str, host_dir: &str) -> String {
     )
 }
 
+/// What a failed harrier fetch tells the operator to run. Only these retry
+/// it on their own: onboard's services step and the roll's embedder check
+/// (`ensure_embedder_after_roll`); `noo stack start` does not.
+pub(crate) const HARRIER_RETRY_HINT: &str =
+    "Run: noo models pull harrier (the next `noo upgrade` roll or `noo onboard` also retries it; `noo stack start` does not)";
+
 /// The refusal every harrier fetch gives when this host's signed stack lock
 /// pins no harrier (no lock, or a lock from a release before harrier was
 /// locked): it names the remedy. There is no override: the lock is the only
@@ -6197,8 +6203,9 @@ pub(crate) const HARRIER_NO_PIN: &str = "this release's lock pins no harrier yet
 /// proved nothing; by the lock's digest, that file is the release's too.
 /// Follows NOO_IMAGE_PREFIX so a mirror or a namespace change moves it with
 /// every other image (a mirror must serve the same digest). The digest comes
-/// from this host's stack lock and nowhere else.
-pub(crate) fn harrier_artifact_ref() -> Result<String, String> {
+/// from this host's stack lock and nowhere else, with the lock's GGUF sha
+/// (`# harrier-gguf-sha256`) that the unpacked weight must equal.
+pub(crate) fn harrier_artifact_ref() -> Result<crate::commands::harrier_store::HarrierPin, String> {
     let prefix = crate::commands::provision::release_var("NOO_IMAGE_PREFIX");
     let prefix = if prefix.is_empty() { crate::registry::IMAGE_NAMESPACE.to_string() } else { prefix.trim_end_matches('/').to_string() };
     let lock = crate::commands::image_stage::controller_lock_opt().map(|o| o.map(|(text, _, _)| text));
@@ -6206,13 +6213,14 @@ pub(crate) fn harrier_artifact_ref() -> Result<String, String> {
 }
 
 /// [`harrier_artifact_ref`] over its one input, this host's stack lock text
-/// (`Ok(None)`: no lock): the lock's `harrier@sha256:` row, or a refusal
-/// naming [`HARRIER_NO_PIN`]. Never a tag, never another source. Pure.
-pub(crate) fn harrier_ref_from(prefix: &str, lock: Result<Option<String>, String>) -> Result<String, String> {
+/// (`Ok(None)`: no lock): the lock's `harrier@sha256:` row (and GGUF line),
+/// or a refusal naming [`HARRIER_NO_PIN`]. Never a tag, never another
+/// source. Pure.
+pub(crate) fn harrier_ref_from(prefix: &str, lock: Result<Option<String>, String>) -> Result<crate::commands::harrier_store::HarrierPin, String> {
     let prefix = prefix.trim_end_matches('/');
     let lock = lock.map_err(|e| format!("the harrier embedder artifact is pinned by the stack lock, which could not be read ({e}) — refusing to pull it by its tag"))?;
-    if let Some((digest, _)) = lock.as_deref().and_then(crate::commands::image_stage::harrier_pin_in) {
-        return Ok(format!("{prefix}/harrier@{digest}"));
+    if let Some((digest, gguf)) = lock.as_deref().and_then(crate::commands::image_stage::harrier_pin_in) {
+        return Ok(crate::commands::harrier_store::HarrierPin { reference: format!("{prefix}/harrier@{digest}"), image: digest, gguf });
     }
     let why = if lock.is_none() { "this host has no stack.lock" } else { "its stack.lock is from a release before harrier was locked" };
     Err(format!("{HARRIER_NO_PIN} ({why}; harrier is pulled only by the digest the signed lock pins, never by its tag)"))
@@ -6260,41 +6268,67 @@ pub(crate) fn ensure_embed_model_core(model: &str) -> Vec<String> {
         // previous path ran `gh release download`, which a fresh host has
         // no `gh` for — and the release it named stayed behind in the old
         // repo — so every fresh box came up with no embedder (2026-09-07).
-        let artifact = match harrier_artifact_ref() {
-            Ok(r) => r,
+        let pin = match harrier_artifact_ref() {
+            Ok(p) => p,
             Err(e) => {
                 out_lines.push(format!("!{e} — RAG embedding stays down."));
                 return out_lines;
             }
         };
+        let artifact = pin.reference.clone();
         out_lines.push(format!(".Fetching the harrier embedder artifact into {embed} ({artifact})..."));
         // i689: a fresh 0700 dir; the weights checked here are what is served.
         let tmp_dir = crate::private_tmp::Dir::new("noo-harrier");
         let tmp = tmp_dir.as_ref().map(|d| d.path().to_path_buf()).unwrap_or_else(|_| std::path::PathBuf::from("/nonexistent/noo-harrier"));
-        let src = format!("noo-harrier-src-{}", std::process::id());
-        let fetched = Command::new("bash").arg("-c")
-            .arg(format!(
-                "docker rm -f '{src}' >/dev/null 2>&1; \
-                 docker pull -q '{artifact}' >/dev/null && \
-                 docker create --name '{src}' '{artifact}' >/dev/null && \
-                 docker cp '{src}:/harrier/.' '{d}/'; rc=$?; docker rm -f '{src}' >/dev/null 2>&1; exit $rc",
-                d = tmp.display()
-            ))
-            .status().map(|s| s.success()).unwrap_or(false);
-        let sha_ok = fetched && artifact_sha256_ok(&tmp, "harrier");
-        let created = sha_ok
-            && Command::new("bash").arg("-c")
+        let store = crate::commands::harrier_store::store_dir();
+        // The pull of harrier@<digest>, retried while the registry fails
+        // transiently (commands/harrier_store.rs). When it cannot be reached,
+        // the controller store's copy stands in, only if the lock vouches
+        // for it: the same image digest and GGUF.
+        let pulled = crate::commands::harrier_store::pull(&artifact, &mut |l| out_lines.push(format!(".{l}")));
+        let fetched: Result<bool, String> = match pulled {
+            Ok(()) if crate::commands::harrier_store::unpack(&artifact, &tmp) => Ok(false),
+            Ok(()) => Err(format!("{artifact} was pulled but could not be unpacked")),
+            Err(f) if f.class.transient() => crate::commands::harrier_store::take_store_copy(&store, &pin, &tmp)
+                .map(|_| true)
+                .map_err(|why| format!("{f}; the controller store's copy was not used: {why}")),
+            Err(f) => Err(f.to_string()),
+        };
+        // The registry's files are CHECKED here (sha256sum -c AND the lock's
+        // GGUF line); the store's copy was checked against its record and
+        // the lock as it was taken.
+        let checked = fetched.and_then(|from_store| {
+            if from_store {
+                Ok(true)
+            } else {
+                let c = crate::commands::harrier_store::verify_unpacked(&tmp, pin.gguf.as_deref())?;
+                // A checked pair goes into the controller's store, where
+                // nodes import it and a later fetch can fall back on it.
+                if c.lock_vouches {
+                    match crate::commands::harrier_store::place_in_store(&tmp, &store, &pin.image, &c) {
+                        Ok(_) => out_lines.push(format!(".Put the checked harrier pair into the controller store ({})", store.display())),
+                        Err(e) => out_lines.push(format!("!Could not put the checked harrier pair into the controller store ({e}); nodes cannot import harrier from it until it is there")),
+                    }
+                }
+                Ok(false)
+            }
+        });
+        let created = checked.and_then(|from_store| {
+            Command::new("bash").arg("-c")
                 .arg(harrier_create_script(&embed, &tmp.display().to_string()))
-                .status().map(|s| s.success()).unwrap_or(false);
+                .status().map(|s| s.success()).unwrap_or(false)
+                .then_some(from_store)
+                .ok_or_else(|| format!("`ollama create harrier` failed in {embed}"))
+        });
         let _ = std::fs::remove_dir_all(&tmp);
-        if created {
-            out_lines.push("+Embedding model ready: harrier (1024-dim)".into());
-        } else {
-            out_lines.push(format!(
-                "!Could not fetch/create harrier from {artifact} — RAG embedding stays down. Manual recovery:"));
-            out_lines.push(format!("      docker create --name harrier-src {artifact} && docker cp harrier-src:/harrier/. /tmp/harrier/ && docker rm harrier-src"));
-            out_lines.push(format!("      docker exec {embed} mkdir -p {OLLAMA_CONVERT_DIR} && docker cp /tmp/harrier/harrier-Q4_K_M.gguf {embed}:{OLLAMA_CONVERT_DIR}/ && docker cp /tmp/harrier/harrier.Modelfile {embed}:{OLLAMA_CONVERT_DIR}/Modelfile"));
-            out_lines.push(format!("      docker exec -w {OLLAMA_CONVERT_DIR} {embed} ollama create harrier -f Modelfile"));
+        match created {
+            Ok(false) => out_lines.push("+Embedding model ready: harrier (1024-dim)".into()),
+            Ok(true) => out_lines.push(
+                "+Embedding model ready: harrier (1024-dim); used the controller store's verified copy (registry unreachable)".into()),
+            Err(why) => {
+                out_lines.push(format!("!Could not fetch/create harrier from {artifact}: {why} — RAG embedding stays down."));
+                out_lines.push(format!("      {HARRIER_RETRY_HINT}"));
+            }
         }
         return out_lines;
     }
@@ -9225,7 +9259,10 @@ mod plaintext_credential_tests {
     #[test]
     fn harrier_is_pulled_by_the_lock_digest() {
         let r = super::harrier_ref_from("ghcr.io/noomesh/", Ok(Some(harrier_lock("v0.6.29")))).unwrap();
-        assert_eq!(r, format!("ghcr.io/noomesh/harrier@{HARRIER_IMG}"));
+        assert_eq!(r.reference, format!("ghcr.io/noomesh/harrier@{HARRIER_IMG}"));
+        assert_eq!(r.image, HARRIER_IMG);
+        // The lock's GGUF line comes with it: the unpacked weight must equal it.
+        assert_eq!(r.gguf.as_deref(), Some("sha256:5f26506ab57fd817ce4a8b9d24946a60d40bc76d82a2defa7cd754ae01e9de80"));
     }
 
     /// No lock, or a lock that pins no harrier, refuses with the remedy in
@@ -9249,10 +9286,26 @@ mod plaintext_credential_tests {
         let core = crate::test_src::fn_body(&src, "fn ensure_embed_model_core(");
         let pick = core.find("match harrier_artifact_ref() {").expect("the ref comes from the lock reader, as it is");
         let refuse = core[pick..].find("return out_lines;").map(|i| i + pick).expect("a refusal returns");
-        let pull = core.find("docker pull -q").expect("the pull");
+        let pull = core.find("harrier_store::pull(&artifact,").expect("the pull");
         assert!(pick < refuse && refuse < pull, "the refusal returns before the pull");
         let reader = crate::test_src::fn_body(&src, "fn harrier_artifact_ref(");
         assert!(reader.contains("controller_lock_opt()"), "the pin is read from this host's stack lock");
+    }
+
+    /// The registry's files reach `ollama create` (and the controller store)
+    /// only checked against the lock; the store's copy stands in only after a
+    /// TRANSIENT pull failure; a failure names the one command to run.
+    #[test]
+    fn the_embed_fetch_checks_against_the_lock_and_falls_back_only_when_unreachable() {
+        let src = crate::test_src::own_code(include_str!("steps.rs"));
+        let core = crate::test_src::fn_body(&src, "fn ensure_embed_model_core(");
+        let verify = core.find("harrier_store::verify_unpacked(&tmp, pin.gguf.as_deref())?").expect("the lock's GGUF line is checked");
+        let place = core.find("harrier_store::place_in_store(").expect("a checked pair is published to the store");
+        let create = core.find("harrier_create_script(&embed").expect("the create");
+        assert!(verify < place && place < create, "checked, then published, then created");
+        assert!(core.contains("Err(f) if f.class.transient() => crate::commands::harrier_store::take_store_copy("), "the store copy only after a transient failure");
+        assert!(core.contains("HARRIER_RETRY_HINT"), "the failure names the command");
+        assert!(super::HARRIER_RETRY_HINT.contains("noo models pull harrier"));
     }
 
     use super::carry_plan;

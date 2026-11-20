@@ -1070,6 +1070,45 @@ The refusal reads "this release's lock pins no harrier yet: run `noo upgrade
 --stack` first". The lock row is never staged to nodes and no compose service
 runs it: nodes import the weights from the controller store.
 
+**Checked means the lock agrees.** A fetched pair is used only when `sha256sum
+-c harrier.sha256` passes AND the GGUF's sha256 equals the lock's
+`harrier-gguf-sha256`: the sum file travels inside the image, so on its own it
+is the image's word, not the release's. A GGUF the lock does not name is
+refused, by the fetch and by `import-model` staging alike.
+
+**The store copy.** When onboard, `noo models pull harrier` or the roll's
+embedder check has a checked pair, it also puts it into the controller's model
+store (`MODELS_DIR`, else `<NOO_DATA_ROOT>/models`) exactly as `import-model`
+stages it: `harrier-Q4_K_M.gguf`, `harrier.Modelfile` (its `FROM ./` rewritten
+to the bare name the agent requires) and `harrier.sha256`, plus
+`harrier.artifact-pin`, a record of the image digest, GGUF sha and Modelfile
+sha the pair came from (removed first and written last, so a half-replaced
+pair has none). The GGUF is hard-linked from the temp dir when the store is on
+the same filesystem, else copied; either way the store holds about 0.4 GB for
+harrier. A node agent then finds `harrier.Modelfile` in the store (the
+gateway's `modelfile` manifest), treats harrier as import-only and imports it
+through the verified path, instead of refusing an Ollama registry pull.
+
+**Retries.** The `docker pull` of `harrier@<digest>`, and only it, is retried
+when it fails transiently: a registry 5xx or 429, a timeout, a reset or a
+refused connection. The status is read as a number from docker's error format
+(`received unexpected HTTP status: <code>`, or containerd's `unexpected status
+from … request to …: <code>`), never from a substring of the message; a 401,
+403, 404, a digest mismatch or anything unrecognised fails at once, and a
+checksum failure is never retried. Five tries at most, 5 s, 15 s, 30 s and
+40 s apart (90 s of waiting), each retry said ("ghcr.io answered 500; retrying
+in 15 s (2 of 4)").
+
+**The fallback: the lock decides, never the network.** If the registry still
+cannot be reached, the store's copy is used for `ollama create` only when its
+record names the lock's image digest and GGUF, and the copy's GGUF and
+Modelfile hash to what was recorded (the files are copied out first, and the
+copies are what is checked and used). The fetch then says "used the controller
+store's verified copy (registry unreachable)". A copy from another digest or
+GGUF, or with no record, is never used. When the fetch still fails it names
+one command, `noo models pull harrier`; the next `noo upgrade` roll and `noo
+onboard` retry it on their own, and `noo stack start` does not.
+
 **The upgrade window.** A 0.6.29 CLI over a lock that pins no harrier (before
 `noo upgrade --stack` has written the new lock, or after a rollback to 0.6.28
 or older) refuses every fresh harrier fetch: the onboard embedder step, `noo
