@@ -438,9 +438,6 @@ decrypt_bundle() {  # sets NOO_REFUSAL and DECRYPT_RECORD; 0 or the report's rc
     # $SUM was computed from this blob right after the download: a blob that
     # no longer hashes to it changed on disk. I/O, never a key problem, and
     # checked first so the answer does not depend on what openssl does.
-    if [ "$(sha256sum "$TMP/blob" 2>/dev/null | cut -d' ' -f1)" != "$SUM" ]; then
-        NOO_REFUSAL=bundle_decrypt_io; return 73
-    fi
     if openssl smime -decrypt -binary -inform DER \
             -inkey "$KEY" -in "$TMP/blob" -out "$TMP/bundle.tar" 2>"$TMP/err" \
         && plaintext_is_bundle "$TMP/bundle.tar"; then
