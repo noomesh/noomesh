@@ -63,7 +63,7 @@ pub fn mint_ws_ticket(claims: auth::Claims, socket: &str) -> String {
 /// the client, never shown a 401, never refreshes. Refusing here is the 401
 /// that makes it refresh. `now` is Unix seconds.
 pub fn mint_ws_ticket_checked(claims: auth::Claims, socket: &str, now: u64) -> Result<String, String> {
-    if (claims.exp as u64) <= now.saturating_add(WS_TICKET_TTL.as_secs()) {
+    if (claims.exp as u64) <= now {
         return Err("the access token has expired (or ends within the ticket's life): refresh it and mint again".into());
     }
     Ok(mint_ws_ticket(claims, socket))
