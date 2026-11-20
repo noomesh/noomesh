@@ -197,9 +197,7 @@ def registry_outage(text: str) -> tuple[str, str] | None:
         return None  # it recovered: the row is judged
     last_try = [i for i, l in enumerate(lines)
                 if (m := RETRY.search(l)) and m.group(1) == m.group(2)]
-    if not last_try:
-        return None  # no visible retry (an older build): not exhausted, judged
-    done = [i for i, l in enumerate(lines) if DID_NOT_COMPLETE in l and i > last_try[-1]]
+    done = [i for i, l in enumerate(lines) if DID_NOT_COMPLETE in l]
     if not done:
         return None
     return _quote(lines[i5]), _quote(lines[done[-1]])
