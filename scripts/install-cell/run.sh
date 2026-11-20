@@ -349,6 +349,45 @@ step start-input-restore 1800 -- sh -c 'noo security secrets remove TAVILY_API_K
     || fail_onboarded
 step start-recreate 1800 -- sh -c 'python3 "$1" snap "$2/start-c.before" && noo stack start --recreate && python3 "$1" snap "$2/start-c.after" \
   && python3 "$1" judge START-RECREATE "$2/start-c.before" "$2/start-c.after" --all' _ "$RC_PY" "$OUT" || fail_onboarded
+# (d) the REAL CLI after a provision (the release lead): `noo cluster
+#     provision <self> --wait` re-renders monitoring/nats/users.conf and HUPs
+#     nats (nats_users.rs hup_nats), which re-reads it live; a build with
+#     "stack start: a users.conf nats has reloaded no longer recreates nats"
+#     records the confirmed reload in the start-inputs state, and the next
+#     plain start must leave nats running. START-AFTER-PROVISION:
+#       PASS  nats not recreated;
+#       FAIL  nats recreated (each recreated container with the launcher's
+#             reason line), or the start failed;
+#       NOTE  users.conf unchanged by the provision (the same users: no
+#             reload to prove), or no reload record after it (a build
+#             without that change: "this build does not record nats reloads").
+#     A re-provision of a node already on the bus reuses every credential,
+#     so users.conf usually does NOT change and this NOTEs; the deterministic
+#     change (`noo cluster nats-creds rotate worker --restart`, a re-minted
+#     controller principal) rotates a live credential and recreates the
+#     worker before first-answer, so it is not done here. Not `||
+#     fail_onboarded`: the provision drives the self node's rail, which the
+#     three checks above do not, so a FAIL is the cell's failed step while
+#     the README's path still runs and stays readable.
+step start-after-provision 1800 -- bash -c '
+  rc_py="$1"; out="$2"
+  m="$(find "$HOME" -maxdepth 4 -name .noo-standalone -print -quit 2>/dev/null)"
+  inst="${m%/.noo-standalone}"; inst="${inst:-${NOO_REPO_ROOT:-$HOME/.noo}}"
+  conf="$inst/monitoring/nats/users.conf"
+  tmp="$(mktemp -d)"; trap "rm -rf $tmp" EXIT
+  sum() { python3 -c "import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], \"rb\").read()).hexdigest())" "$1" 2>/dev/null; }
+  c0="$(sum "$conf")"
+  timeout 900 noo cluster provision "$(hostname)" --wait 2>&1 | tee "$tmp/provision.log"; prc=${PIPESTATUS[0]}
+  c1="$(sum "$conf")"
+  if [ -z "$c0" ] || [ -z "$c1" ]; then ch=unknown; elif [ "$c0" = "$c1" ]; then ch=no; else ch=yes; fi
+  echo "users.conf changed by the provision: $ch"
+  rec="$(python3 "$rc_py" reload-record "$inst/.noo-start-inputs.json")"
+  echo "nats reload record after the provision: $rec"
+  python3 "$rc_py" snap "$out/start-d.before"
+  noo stack start 2>&1 | tee "$tmp/start.log"; src=${PIPESTATUS[0]}
+  python3 "$rc_py" snap "$out/start-d.after"
+  python3 "$rc_py" after-provision START-AFTER-PROVISION "$out/start-d.before" "$out/start-d.after" \
+    "$tmp/start.log" "$src" "$ch" "$rec" "$tmp/provision.log" "$prc"' _ "$RC_PY" "$OUT"
 step health-after-starts 600 -- sh -c 'for i in $(seq 1 40); do noo health >/dev/null 2>&1 && break; sleep 15; done; noo health' \
     || fail_onboarded
 # PROBES: install.md:226 `noo whoami   # controller / node / both / client-only`

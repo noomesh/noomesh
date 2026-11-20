@@ -29,6 +29,13 @@ STACK_OK = """\
 JOURNAL_OK = "Nov 18 noo-apply[1]: release-check: generation=2 release=none release-prev=none\nNov 18 noo-apply[1]: applied: agent-env agent-protect=6\n"
 
 
+# The plain start after the upgrade (B4): recreated.py snapshots and the
+# launcher's report (scripts/noo-start-inputs.py report_lines).
+SNAP = "noo-gateway g1 gateway postgres:service_healthy:false\nnoo-nats n1 nats -\nnoo-postgres p1 postgres -\n"
+START_OK = "> Starting the stack\n  Containers          3 running, 0 recreated\n+ stack up\n"
+ROLL_T0, STACK_T0, STACK_T1 = "1763629700", "1763629900", "1763630100"
+
+
 def verify(self_rows, ctl_rows):
     return json.dumps({"nodes": [{"node": SELF, "checks": self_rows}], "controller": {"checks": ctl_rows}})
 
@@ -46,7 +53,8 @@ GOOD_CTL = [
 
 
 def cell(tmp, roll=ROLL_OK, stack=STACK_OK, journal=JOURNAL_OK, roll_rc="0", self_rows=None, ctl_rows=None,
-         chat="ok\n", chat_rc=0, unit=True, sudo_journal="", unit_user=None, stack_journal=None, exec_start=None):
+         chat="ok\n", chat_rc=0, unit=True, sudo_journal="", unit_user=None, stack_journal=None, exec_start=None,
+         start_log=START_OK, start_rc=0, start_after=SNAP):
     out, j = tmp / "out", tmp / "out" / "judge"
     (out / "logs").mkdir(parents=True)
     j.mkdir()
@@ -64,9 +72,16 @@ def cell(tmp, roll=ROLL_OK, stack=STACK_OK, journal=JOURNAL_OK, roll_rc="0", sel
     (j / "verify-after.json").write_text(v)
     (j / "verify-final.json").write_text(v)
     (out / "logs" / "chat-after.log").write_text(chat)
-    (out / "steps.jsonl").write_text(json.dumps({"step": "chat-after", "rc": chat_rc}) + "\n")
+    steps = [{"step": "chat-after", "rc": chat_rc}]
+    if start_log is not None:
+        (out / "logs" / "start-after-upgrade.log").write_text(start_log)
+        (j / "start-after.before").write_text(SNAP)
+        (j / "start-after.after").write_text(start_after)
+        steps.insert(0, {"step": "start-after-upgrade", "rc": start_rc})
+    (out / "steps.jsonl").write_text("".join(json.dumps(d) + "\n" for d in steps))
     me = subprocess.run(["id", "-un"], capture_output=True, text=True).stdout.strip()
     env = dict(os.environ, OUT=str(out), J=str(j), SELF=SELF, NETNS_UNIT_ENABLED="enabled",
+               ROLL_T0=ROLL_T0, STACK_T0=STACK_T0, STACK_T1=STACK_T1,
                NETNS_UNIT_OWNER="%d:%d" % (os.getuid(), os.getgid()))
     u = tmp / "noo-netns-restore.service"
     if unit:
@@ -80,7 +95,7 @@ def cell(tmp, roll=ROLL_OK, stack=STACK_OK, journal=JOURNAL_OK, roll_rc="0", sel
 def test_a_clean_first_roll_passes_every_assert(tmp_path):
     rc, got = cell(tmp_path)
     assert rc == 0, got
-    for a in ("A1", "A2", "A3", "A4", "A5", "A6", "A7", "B1", "B2", "B3", "G1", "G2", "G3", "G4", "G5"):
+    for a in ("A1", "A2", "A3", "A4", "A5", "A6", "A7", "B1", "B2", "B3", "B4", "G1", "G2", "G3", "G4", "G5"):
         assert " PASS: " in got[a], got[a]
     assert "release-check: generation=2" in got["A2"]
     assert "generation 1) predates the netns-unit kind" in got["A5"]
@@ -158,7 +173,7 @@ def test_a_backend_start_refusal_or_a_used_lane_fails(tmp_path):
 
 def test_a_roll_that_never_ran_is_not_reached(tmp_path):
     rc, got = cell(tmp_path, roll=None, stack=None)
-    for a in ("A1", "A6", "B1", "B3"):
+    for a in ("A1", "A6", "B1", "B3", "B4"):
         assert " NOT REACHED: " in got[a], got[a]
 
 
@@ -222,3 +237,98 @@ def test_b1_matches_the_cli_s_capitalised_step_line(tmp_path):
     rc, got = cell(tmp_path, stack=stack)  # ONLY the capitalised line, as rc.1 printed it
     assert " PASS: " in got["B1"], got["B1"]
     assert "staged to the self-node runner-a" in got["B1"]
+
+
+# ── B3: the cell's own sudos, by exact command (0.6.26 -> rc.1, run 44706791256) ──
+def _sudo(cmd):
+    return "Nov 20 09:08:38 host sudo[9]:   runner : PWD=/home/runner ; USER=root ; COMMAND=%s\n" % cmd
+
+
+CELL_OWN = [
+    "/usr/bin/journalctl --no-pager --since @" + ROLL_T0,
+    "/usr/bin/rm -f /etc/systemd/system/noo-netns-restore.service",
+    "/usr/bin/systemctl daemon-reload",
+]
+
+
+def test_b3_ignores_the_cells_own_three_sudos_by_exact_command(tmp_path):
+    """run 44706791256: the roll-window journalctl, the unit removal and its
+    daemon-reload landed in STACK_T0's second and failed B3."""
+    rc, got = cell(tmp_path, sudo_journal="".join(_sudo(c) for c in CELL_OWN))
+    assert rc == 0 and " PASS: " in got["B3"] and "3 of the cell's own" in got["B3"], got["B3"]
+    # the other exact journalctl invocations upgrade.sh makes next to the window
+    more = ["/usr/bin/journalctl -t noo-apply --no-pager --since @" + ROLL_T0,
+            "/usr/bin/journalctl _COMM=sudo --no-pager --since @%s --until @%s" % (STACK_T0, STACK_T1)]
+    rc, got = cell(tmp_path / "b", sudo_journal="".join(_sudo(c) for c in more))
+    assert " PASS: " in got["B3"], got["B3"]
+
+
+def test_b3_still_fails_a_product_sudo_of_the_same_command_names(tmp_path):
+    for i, cmd in enumerate(["/usr/bin/journalctl -u noo-node-agent",
+                             "/usr/bin/systemctl restart docker",
+                             "/usr/bin/journalctl --no-pager --since @1763629701",
+                             "/usr/bin/rm -f /etc/systemd/system/noo-netns-restore.service.d",
+                             "/tmp/x/systemctl daemon-reload"]):
+        rc, got = cell(tmp_path / str(i), sudo_journal="".join(_sudo(c) for c in CELL_OWN) + _sudo(cmd))
+        assert rc == 1 and " FAIL: " in got["B3"] and "1 sudo command(s)" in got["B3"] and cmd in got["B3"], got["B3"]
+
+
+def test_upgrade_sh_sleeps_before_stack_t0_and_passes_the_window_to_the_judge():
+    text = (JUDGE.parent / "upgrade.sh").read_text()
+    rm = text.index("sudo -n rm -f /etc/systemd/system/noo-netns-restore.service && sudo -n systemctl daemon-reload")
+    t0 = text.index('STACK_T0="$(date +%s)"')
+    assert rm < text.index("sleep 1", rm) < t0
+    assert 'sudo -n journalctl --no-pager --since "@$ROLL_T0"' in text[:rm], "the roll-window capture B3 ignores"
+    assert "export J SELF ROLL_T0 STACK_T0 STACK_T1 OUT" in text
+
+
+# ── A3: the applier's refusal-name line (#1464) ─────────────────────────────
+def test_a3_fails_on_the_applier_refusal_name_line_naming_it(tmp_path):
+    j = JOURNAL_OK + "Nov 20 09:08:38 host noo-fetch[123]: noo-apply: refusal=bundle_decrypt_failed (exit 65)\n"
+    rc, got = cell(tmp_path, journal=j)
+    assert rc == 1 and "A3 FAIL: noo-apply refusal=bundle_decrypt_failed (exit 65)" in got["A3"], got["A3"]
+    rc, got = cell(tmp_path / "b", stack=STACK_OK + "noo-apply: refusal=bundle_decrypt_io (exit 73)\n")
+    assert rc == 1 and "A3 FAIL: noo-apply refusal=bundle_decrypt_io (exit 73)" in got["A3"], got["A3"]
+
+
+def test_a3_counts_only_the_exact_refusal_line(tmp_path):
+    for i, line in enumerate(["Nov 20 09:08:38 host noo-fetch[123]: noo-apply: refusal=Bad Name (exit 65)",
+                              "Nov 20 09:08:38 host noo-fetch[123]: noo-apply: refusal=bundle_decrypt_failed (exit 65) later",
+                              "Nov 20 09:08:38 host noo-fetch[123]: noo-apply: refusal=bundle_decrypt_failed"]):
+        rc, got = cell(tmp_path / str(i), journal=JOURNAL_OK + line + "\n")
+        assert rc == 0 and " PASS: " in got["A3"], (line, got["A3"])
+    rc, got = cell(tmp_path / "none")
+    assert " PASS: " in got["A3"], got["A3"]
+
+
+# ── B4: a plain start after the upgrade recreates nothing ───────────────────
+def test_b4_passes_on_0_recreated(tmp_path):
+    rc, got = cell(tmp_path)
+    assert rc == 0 and got["B4"].startswith("UPGRADE B4 PASS: 0 containers recreated"), got["B4"]
+    assert "3 running, 0 recreated" in got["B4"], got["B4"]
+
+
+def test_b4_fails_naming_each_recreated_container_with_its_reason(tmp_path):
+    after = SNAP.replace(" g1 ", " g2 ").replace(" n1 ", " n2 ")
+    log = ("  Containers          3 running, 2 recreated\n"
+           "    recreated gateway: its compose config or image changed\n"
+           "    recreated nats: its inputs changed (config monitoring/nats/users.conf)\n")
+    rc, got = cell(tmp_path, start_log=log, start_after=after)
+    assert rc == 1 and " FAIL: 2 recreated: noo-gateway, noo-nats" in got["B4"], got["B4"]
+    assert "noo-gateway (recreated gateway: its compose config or image changed)" in got["B4"], got["B4"]
+    assert "noo-nats (recreated nats: its inputs changed (config monitoring/nats/users.conf))" in got["B4"], got["B4"]
+
+
+def test_b4_fails_when_the_start_step_failed(tmp_path):
+    rc, got = cell(tmp_path, start_log="x the stack did not start: noo-gateway unhealthy\n", start_rc=1)
+    assert rc == 1 and " FAIL: noo stack start exited 1: x the stack did not start" in got["B4"], got["B4"]
+
+
+def test_upgrade_sh_runs_the_plain_start_after_the_stack_and_before_chat():
+    text = (JUDGE.parent / "upgrade.sh").read_text()
+    t1, start, chat = (text.index('STACK_T1="$(date +%s)"'), text.index("step start-after-upgrade "),
+                       text.index("step chat-after "))
+    assert t1 < start < chat
+    body = text[start:chat]
+    assert '"$HERE/recreated.py" "$J"' in body and "noo stack start; rc=$?" in body
+    assert 'snap "$2/start-after.before"' in body and 'snap "$2/start-after.after"' in body

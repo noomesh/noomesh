@@ -18,6 +18,8 @@ an agent-placed backend is not the launcher's.
 """
 from __future__ import annotations
 
+import json
+import re
 import subprocess
 import sys
 
@@ -61,6 +63,13 @@ def read(path: str) -> dict[str, tuple[str, str, str]]:
     return out
 
 
+def _read_or_empty(path: str) -> dict:
+    try:
+        return read(path)
+    except OSError:
+        return {}
+
+
 def judge(name: str, before: dict, after: dict, mode: str, only: str = "") -> tuple[bool, str]:
     recreated = sorted(n for n in before if n in after and before[n][0] != after[n][0])
     removed = sorted(n for n in before if n not in after)
@@ -91,6 +100,111 @@ def judge(name: str, before: dict, after: dict, mode: str, only: str = "") -> tu
     return False, f"{name} FAIL: {len(stray)} recreated that do not depend on {only}: {', '.join(stray)}{extra}"
 
 
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+# The launcher's report (scripts/noo-start-inputs.py report_lines, printed by
+# lib-start-inputs.sh start_inputs_report): the count line, then one line per
+# recreated SERVICE (or one "recreated: a, b (why)" line for all of them).
+COUNT_LINE = re.compile(r"\b([0-9]+) running, ([0-9]+) recreated\b.*$")
+REASON_LINE = re.compile(r"^recreated ([A-Za-z0-9_.-]+)(?:: .*)?$")
+ALL_LINE = re.compile(r"^recreated: .*$")
+
+
+def reasons(log: str) -> tuple[str, dict[str, str]]:
+    """(the launcher's count line or "", {service: its "recreated X: ..." line})
+    from a `noo stack start` output."""
+    count, per = "", {}
+    for raw in (log or "").splitlines():
+        line = ANSI.sub("", raw).strip()
+        m = COUNT_LINE.search(line)
+        if m:
+            count = m.group(0)
+        m = REASON_LINE.match(line)
+        if m:
+            per[m.group(1)] = line
+        elif ALL_LINE.match(line):
+            per.setdefault("*", line)
+    return count, per
+
+
+def recreated_with_reasons(before: dict, after: dict, log: str) -> list[str]:
+    """Each recreated container, with the launcher's line for its service."""
+    _, per = reasons(log)
+    out = []
+    for n in sorted(n for n in before if n in after and before[n][0] != after[n][0]):
+        svc = after[n][1]
+        out.append(f"{n} ({per.get(svc) or per.get('*') or 'no reason line from the launcher'})")
+    return out
+
+
+def plain_start(name: str, before: dict, after: dict, log: str, rc) -> tuple[str, str]:
+    """A plain `noo stack start` that must recreate nothing: (verdict, line)."""
+    count, _ = reasons(log)
+    if str(rc) != "0":
+        tail = [ANSI.sub("", l).strip() for l in (log or "").splitlines() if l.strip()]
+        return "FAIL", f"{name} FAIL: noo stack start exited {rc}: {tail[-1] if tail else 'no output'}"
+    ok, line = judge(name, before, after, "none")
+    if ok:
+        return "PASS", line + (f"; the launcher: {count}" if count else "")
+    moved = recreated_with_reasons(before, after, log)
+    return "FAIL", line + (f"; why: {'; '.join(moved)}" if moved else "")
+
+
+def reload_record(state_path: str) -> str:
+    """none | unconfirmed | confirmed: nats's reload record in the start-inputs
+    state (`"reloaded": {"nats": {"container": ID, "paths": {PATH: VALUE|null}}}`,
+    written by `noo` once a HUP is confirmed). Names only a kind: the values
+    are keyed and never leave the file."""
+    try:
+        state = json.load(open(state_path))
+    except (OSError, ValueError):
+        return "none"
+    rec = (state.get("reloaded") or {}).get("nats") if isinstance(state, dict) else None
+    if not isinstance(rec, dict):
+        return "none"
+    paths = rec.get("paths") if isinstance(rec.get("paths"), dict) else {}
+    if not rec.get("container") or not paths or any(not isinstance(v, str) for v in paths.values()):
+        return "unconfirmed"
+    return "confirmed"
+
+
+def after_provision(name: str, before: dict, after: dict, log: str, rc, conf_changed: str, record: str,
+                    prov_log: str, prov_rc) -> tuple[str, str]:
+    """The plain start after `noo cluster provision <self>`: (verdict, line).
+    The provision re-renders users.conf and HUPs nats, which re-reads it live;
+    a build that records the reload (stack start: "a users.conf nats has
+    reloaded no longer recreates nats") must then leave nats running."""
+    if str(rc) != "0":
+        return plain_start(name, before, after, log, rc)
+    if not before:
+        return "FAIL", f"{name} FAIL: no stack container was recorded before the start"
+    moved = [n for n in before if n in after and before[n][0] != after[n][0]]
+    nats = [n for n in moved if after[n][1] == "nats"]
+    why = recreated_with_reasons({n: before[n] for n in moved}, after, log)
+    prov = "" if str(prov_rc) == "0" else "; the provision exited %s: %s" % (
+        prov_rc, ([ANSI.sub("", l).strip() for l in (prov_log or "").splitlines() if l.strip()] or ["no output"])[-1])
+    if conf_changed not in ("yes", "no"):
+        return "FAIL", f"{name} FAIL: users.conf could not be read before and after the provision{prov}"
+    if conf_changed == "no":
+        if nats:
+            return "FAIL", f"{name} FAIL: users.conf unchanged by the provision, yet nats was recreated: {'; '.join(why)}{prov}"
+        return "NOTE", f"{name} NOTE: users.conf unchanged by the provision; nothing to reload{prov}"
+    if record == "none":
+        return "NOTE", (f"{name} NOTE: this build does not record nats reloads (no reload record after the provision); "
+                        f"nats {'recreated' if nats else 'not recreated'}{prov}")
+    if nats:
+        return "FAIL", (f"{name} FAIL: {len(moved)} recreated after the provision's users.conf reload "
+                        f"(record: {record}): {'; '.join(why)}{prov}")
+    others = f"; also recreated: {'; '.join(why)}" if moved else ""
+    return "PASS", f"{name} PASS: nats not recreated after the provision's users.conf reload (record: {record}){others}{prov}"
+
+
+def _text(path: str) -> str:
+    try:
+        return open(path, errors="replace").read()
+    except OSError:
+        return ""
+
+
 def main(argv: list[str]) -> int:
     if len(argv) == 2 and argv[0] == "snap":
         return snap(argv[1])
@@ -103,6 +217,15 @@ def main(argv: list[str]) -> int:
         ok, line = judge(argv[1], read(argv[2]), read(argv[3]), mode, only)
         print(line)
         return 0 if ok else 1
+    if len(argv) == 2 and argv[0] == "reload-record":
+        print(reload_record(argv[1]))
+        return 0
+    if len(argv) == 10 and argv[0] == "after-provision":
+        _, name, b, a, slog, src, changed, record, plog, prc = argv
+        verdict, line = after_provision(name, _read_or_empty(b), _read_or_empty(a), _text(slog), src, changed,
+                                        record, _text(plog), prc)
+        print(line)
+        return 1 if verdict == "FAIL" else 0
     print(__doc__, file=sys.stderr)
     return 2
 

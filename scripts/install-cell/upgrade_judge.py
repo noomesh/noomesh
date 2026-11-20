@@ -27,6 +27,9 @@ import sys
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import recreated  # noqa: E402  the plain-start parser run.sh's start checks use
+
 
 # fullmatch (`$` lets a trailing newline through); [0-9], not \d (Unicode digits)
 FINAL = re.compile(r"noo-cli-v([0-9]+)\.([0-9]+)\.([0-9]+)")
@@ -145,6 +148,19 @@ def before(path, self_node):
             print("before: %s %s: %s" % (name, c.get("verdict"), one(c.get("detail"), 200)))
 
 
+def step_rc(out, name):
+    """The step's exit code from steps.jsonl (the last record of that name)."""
+    rc = None
+    try:
+        for l in open(os.path.join(out, "steps.jsonl")):
+            d = json.loads(l)
+            if d.get("step") == name:
+                rc = d.get("rc")
+    except (OSError, ValueError):
+        pass
+    return rc
+
+
 def text(path):
     try:
         return open(path, errors="replace").read()
@@ -152,14 +168,72 @@ def text(path):
         return None
 
 
+# The applier's LAST line on a refusal (noomesh #1464): exactly
+# `noo-apply: refusal=<name> (exit <N>)`. It never says REFUSED, and it lands
+# in noo-fetch's journal (the applier is noo-fetch.service's child).
+REFUSAL = re.compile(r"^noo-apply: refusal=([a-z][a-z0-9_]*) \(exit ([0-9]+)\)$")
+# journald's short prefix: `Nov 20 09:08:38 host noo-fetch[123]: `
+JOURNAL_PREFIX = re.compile(r"^(?:.*? )?[A-Za-z0-9_.@-]+\[[0-9]+\]: ")
+
+
+def refusal(line):
+    """(name, exit) when the line, or its journal message, is the applier's
+    refusal-name line; else None."""
+    bare = line.strip()
+    m = JOURNAL_PREFIX.match(bare)
+    for msg in (bare, bare[m.end():] if m else None):
+        r = REFUSAL.match(msg) if msg is not None else None
+        if r:
+            return r.group(1), r.group(2)
+    return None
+
+
+# Where sudo puts a binary it resolved (secure_path): the cell's own commands
+# are recognised there only, never anywhere a product binary might live.
+SUDO_BIN_DIRS = ("/usr/bin/", "/bin/", "/usr/sbin/", "/sbin/")
+EPOCH = re.compile(r"[0-9]+")
+
+
+def own_sudo_commands(roll_t0, stack_t0, stack_t1):
+    """The EXACT sudo commands upgrade.sh itself runs in or next to the
+    same-tag --stack's window, arguments included (the release lead's rule:
+    never by command name, so a product `sudo journalctl -u …` or `sudo
+    systemctl restart …` still counts):
+      the --all window's journal and later the node's (`--since @ROLL_T0`),
+      the applier's journal (`-t noo-apply --since @ROLL_T0`),
+      the unit removal and its daemon-reload (remove-netns-unit),
+      and the sudo journal B3 reads itself."""
+    own = ["rm -f /etc/systemd/system/noo-netns-restore.service", "systemctl daemon-reload"]
+    if roll_t0 and EPOCH.fullmatch(roll_t0):
+        own += ["journalctl --no-pager --since @%s" % roll_t0,
+                "journalctl -t noo-apply --no-pager --since @%s" % roll_t0]
+    if stack_t0 and stack_t1 and EPOCH.fullmatch(stack_t0) and EPOCH.fullmatch(stack_t1):
+        own.append("journalctl _COMM=sudo --no-pager --since @%s --until @%s" % (stack_t0, stack_t1))
+    return own
+
+
+def is_own_sudo(line, own):
+    """True when the journal line's COMMAND= is exactly one of `own`, its
+    binary at a path sudo resolves to."""
+    m = re.search(r"COMMAND=(.*)$", line)
+    if not m:
+        return False
+    cmd = m.group(1).strip()
+    binary, sep, args = cmd.partition(" ")
+    d, _, base = binary.rpartition("/")
+    if d + "/" not in SUDO_BIN_DIRS:
+        return False
+    return base + sep + args in own
+
+
 def judge():
     out, j, me = os.environ["OUT"], os.environ["J"], os.environ["SELF"]
     lines, failed = [], False
 
-    def say(aid, verdict, why):
+    def say(aid, verdict, why, n=400):
         nonlocal failed
         failed |= verdict == "FAIL"
-        lines.append("UPGRADE %s %s: %s" % (aid, verdict, one(why, 400)))
+        lines.append("UPGRADE %s %s: %s" % (aid, verdict, one(why, n)))
 
     roll = text(os.path.join(out, "logs", "upgrade-all.log"))
     stack = text(os.path.join(out, "logs", "upgrade-stack-same-tag.log"))
@@ -191,13 +265,21 @@ def judge():
         else:
             say("A2", "FAIL", "no 'release-check:' line from the applier during the --all roll")
 
-        refused = [("%s: %s" % (src, l.strip())) for src, body in (("--all", roll), ("--stack", stack or ""), ("journal", journal))
-                   for l in body.splitlines() if "noo-apply: REFUSED" in l or "REFUSED release check:" in l]
+        refused = []
+        for src, body in (("--all", roll), ("--stack", stack or ""), ("journal", journal)):
+            for l in body.splitlines():
+                named = refusal(l)
+                if named:
+                    # the applier's refusal-name line (#1464): name and exit first
+                    refused.append("noo-apply refusal=%s (exit %s) (%s: %s)" % (named + (src, l.strip())))
+                elif "noo-apply: REFUSED" in l or "REFUSED release check:" in l:
+                    refused.append("%s: %s" % (src, l.strip()))
         # Strict: the first roll's applier-only bootstrap refusal is NOT
         # exempt (general, 2026-11-18): rc.3 makes an applier-only bundle
         # equal to the installed applier a no-op, so any REFUSED line FAILs.
         say("A3", "FAIL" if refused else "PASS",
-            " | ".join(refused[:2]) if refused else "no 'noo-apply: REFUSED' in the --all roll, the --stack or the node's journal")
+            " | ".join(refused[:2]) if refused else
+            "no 'noo-apply: REFUSED' and no 'noo-apply: refusal=' in the --all roll, the --stack or the node's journal")
 
         rc = rows(after, "release check", me)
         ok = [c for c in rc if c.get("verdict") == "ok" and "root code installs only from a release-signed list on" in (c.get("detail") or "")]
@@ -254,7 +336,7 @@ def judge():
 
     # ── after the same-tag --stack ──
     if stack is None:
-        for b in ("B1", "B2", "B3"):
+        for b in ("B1", "B2", "B3", "B4"):
             say(b, "NOT REACHED", "the same-tag --stack did not run")
     else:
         s1 = "installing noo-netns-restore.service: staged to the self-node"
@@ -295,11 +377,31 @@ def judge():
             say("B2", "FAIL", "%s: %s" % (unit, e.strerror))
 
         sj = text(os.path.join(j, "sudo-stack.journal")) or ""
-        cmds = [l.strip() for l in sj.splitlines() if "COMMAND=" in l]
+        own = own_sudo_commands(os.environ.get("ROLL_T0", ""), os.environ.get("STACK_T0", ""),
+                                os.environ.get("STACK_T1", ""))
+        every = [l.strip() for l in sj.splitlines() if "COMMAND=" in l]
+        cmds = [l for l in every if not is_own_sudo(l, own)]
+        mine = len(every) - len(cmds)
         say("B3", "FAIL" if cmds else "PASS",
             ("%d sudo command(s) during the --stack: %s" % (len(cmds), cmds[0])) if cmds
-            else "0 sudo commands in the journal during the same-tag --stack (operator: %s)"
-            % subprocess.run(["id", "-un"], capture_output=True, text=True).stdout.strip())
+            else "0 sudo commands in the journal during the same-tag --stack (operator: %s%s)"
+            % (subprocess.run(["id", "-un"], capture_output=True, text=True).stdout.strip(),
+               "; %d of the cell's own, matched exactly, not counted" % mine if mine else ""))
+
+        # B4: a plain `noo stack start` after the upgrade recreates nothing:
+        # every container the upgrade made carries the start-inputs labels
+        # (the release lead). Judged from the container IDs (recreated.py,
+        # the parser of run.sh's start-idempotent), the launcher's lines say why.
+        slog = text(os.path.join(out, "logs", "start-after-upgrade.log"))
+        if slog is None:
+            say("B4", "NOT REACHED", "no plain noo stack start after the upgrade")
+        else:
+            verdict, line = recreated.plain_start(
+                "B4", recreated._read_or_empty(os.path.join(j, "start-after.before")),
+                recreated._read_or_empty(os.path.join(j, "start-after.after")), slog,
+                step_rc(out, "start-after-upgrade"))
+            # every recreated container is named, each with its reason line
+            say("B4", verdict, line.split(": ", 1)[1] if ": " in line else line, 4000)
 
     # ── general's rows, after both ──
     v = final or after
