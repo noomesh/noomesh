@@ -127,7 +127,7 @@ pub(crate) const ROWS: &[Row] = &[
         scope: Scope::Controller,
         verdicts: &[Verdict::Warn, Verdict::Fail],
         meaning: "Whether the node agent's TLS certificate covers the address the controller dials, and no other node claims that address.",
-        clears: "Re-issue the node's certificate with `noo security pki push-nodes <node>`.",
+        clears: "Re-issue the node's certificate: `noo security pki push-nodes <node> --prove` for a private address (it first proves the node serves it), `noo security pki push-nodes <node>` for a public one.",
         findings: &[],
         shown_as: None,
         doc: None,
