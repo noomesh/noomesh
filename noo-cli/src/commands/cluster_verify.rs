@@ -954,7 +954,13 @@ pub(crate) fn ollama_models_check(id: &str, n: &Value) -> Option<Check> {
                 if !chmod.is_empty() { fix.push_str(&format!("{FALLBACK}{chmod}")); }
                 if !read_fixes.contains(&fix) { read_fixes.push(fix); }
             }
-            _ => warns.push(format!("{model}: could not be checked ({})", if reason.is_empty() { "no reason given" } else { reason })),
+            _ => {
+                // i1067: the agent's own "could not be checked: <why>" (a
+                // presence read that failed 3 passes running) is not said
+                // twice. No remedy: nothing the row knows fixes it.
+                let why = reason.strip_prefix("could not be checked: ").unwrap_or(reason);
+                warns.push(format!("{model}: could not be checked ({})", if why.is_empty() { "no reason given" } else { why }));
+            }
         }
     }
     let mut lines: Vec<String> = Vec::new();
@@ -16918,6 +16924,23 @@ mod ollama_models_tests {
         let c = ollama_models_check("node-a", &n).unwrap();
         assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
         assert_eq!(c.detail, "harrier: not yet checked; qwen2.5:0.5b: not yet checked");
+        assert_eq!(c.remedy, None);
+    }
+
+    /// i1067: pending is for "not yet", never "cannot": a model whose
+    /// presence the agent could not read 3 passes running is a WARN with
+    /// the count and the last error, and no remedy.
+    #[test]
+    fn a_model_whose_presence_cannot_be_read_warns_with_the_count_and_the_error() {
+        let n = json!({"self_node": true, "ollama_verify": [
+            {"model": "harrier", "state": "error", "anchor": "", "lane": "stack",
+             "reason": "could not be checked: its presence could not be read 3 times: context deadline exceeded"},
+            {"model": "qwen2.5:0.5b", "state": "verified", "anchor": "mirror", "lane": "stack"}]});
+        let c = ollama_models_check("ctrl", &n).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.starts_with(
+            "harrier: could not be checked (its presence could not be read 3 times: context deadline exceeded); verified: qwen2.5:0.5b"),
+            "{}", c.detail);
         assert_eq!(c.remedy, None);
     }
 

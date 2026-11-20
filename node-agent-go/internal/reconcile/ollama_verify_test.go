@@ -5,6 +5,7 @@ package reconcile
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -263,5 +264,69 @@ func TestOllamaVerifyKnownAbsentModelIsNotReported(t *testing.T) {
 	r.verifyOllamaModels(context.Background(), selfNodeRows, dockerpkg.OllamaLaneStack)
 	if got := reportedModels(t, l); len(got) != 1 || got[0] != "qwen2.5:0.5b" {
 		t.Fatalf("report = %v, want only the held model", got)
+	}
+}
+
+// harrierPasses runs one verifyOllamaModels pass per entry on the self-node
+// rows: qwen always read, harrier read (held) when the entry is "", else its
+// read fails with that error.
+func harrierPasses(t *testing.T, passes ...string) *ollamaVerifyLoop {
+	t.Helper()
+	modelpresence.Reset()
+	t.Cleanup(modelpresence.Reset)
+	l := blockedLoop(t)
+	r := &Reconciler{ollamaVerify: l}
+	for _, fail := range passes {
+		modelpresence.Set("ollama", modelpresence.Entry{Model: "qwen2.5:0.5b", Role: "chat", Present: true})
+		if fail == "" {
+			modelpresence.Set("ollama#embed", modelpresence.Entry{Model: "harrier", Role: "embed", Present: true})
+		} else {
+			modelpresence.Clear("ollama#embed")
+			l.notePresenceErr("harrier", errors.New(fail))
+		}
+		r.verifyOllamaModels(context.Background(), selfNodeRows, dockerpkg.OllamaLaneStack)
+	}
+	return l
+}
+
+// i1067: under the limit a model whose presence read failed is still
+// "not yet": pending.
+func TestOllamaVerifyTwoFailedReadsArePending(t *testing.T) {
+	l := harrierPasses(t, "timeout", "timeout")
+	if r := reportedRow(t, l, "harrier"); r.State != dockerpkg.OllamaPending {
+		t.Fatalf("harrier after 2 failed reads = %+v, want pending", r)
+	}
+}
+
+// i1067: pending is for "not yet", never "cannot": the third consecutive
+// failed read is a could-not-be-checked row with the count and the last
+// error.
+func TestOllamaVerifyThreeFailedReadsAreCouldNotBeChecked(t *testing.T) {
+	l := harrierPasses(t, "e1", "e2", "boom")
+	r := reportedRow(t, l, "harrier")
+	if r.State != dockerpkg.OllamaVerifyErr ||
+		r.Reason != "could not be checked: its presence could not be read 3 times: boom" ||
+		r.Lane != dockerpkg.OllamaLaneStack || r.Remedy != "" {
+		t.Fatalf("harrier after 3 failed reads = %+v", r)
+	}
+}
+
+// i1067: a successful read resets the count: only consecutive failures
+// count.
+func TestOllamaVerifyAReadResetsTheFailureCount(t *testing.T) {
+	l := harrierPasses(t, "e1", "e2", "", "e3")
+	if r := reportedRow(t, l, "harrier"); r.State != dockerpkg.OllamaPending {
+		t.Fatalf("harrier = %+v, want pending (the read in between resets the count)", r)
+	}
+}
+
+// i1067: the last error is kept bounded.
+func TestOllamaVerifyTheReadErrorIsBounded(t *testing.T) {
+	long := strings.Repeat("x", 300)
+	l := harrierPasses(t, long, long, long)
+	r := reportedRow(t, l, "harrier")
+	want := "could not be checked: its presence could not be read 3 times: " + strings.Repeat("x", 200)
+	if r.Reason != want {
+		t.Fatalf("reason is %d bytes, want %d: %q", len(r.Reason), len(want), r.Reason)
 	}
 }

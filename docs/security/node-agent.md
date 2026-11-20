@@ -971,7 +971,10 @@ Every model the node holds is in the row on every report. Until the agent
 has checked it (right after the agent starts, or before a new model's first
 check) it reads "<model>: not yet checked": not a problem, and not a verdict.
 The row's verdict comes from the checked models alone, and a row whose models
-are all not yet checked is OK.
+are all not yet checked is OK. "Not yet" is never "cannot": a model whose
+presence the agent could not read on 3 passes in a row (its Ollama did not
+answer the model list) is a WARN, "could not be checked", with the count and
+the last error.
 
 A mismatch is repaired from the controller (the bad blobs are removed, then
 the model is re-installed or rebuilt from the verified GGUF). A pulled model

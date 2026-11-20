@@ -5,6 +5,7 @@ package reconcile
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sort"
 	"strings"
@@ -56,7 +57,13 @@ type ollamaVerifyLoop struct {
 	// does not depend on which checks have finished since the agent
 	// started (i1067).
 	listed map[string]string
-	busy   bool
+	// unread counts each listed model's consecutive passes whose presence
+	// read failed (unknown, not absent), and readErr keeps the last
+	// failure's text, bounded. Pending is for "not yet", never "cannot":
+	// at ollamaPresenceFailLimit the pending row becomes a WARN (i1067).
+	unread  map[string]int
+	readErr map[string]string
+	busy    bool
 	// refusal is the standing backend_start reason ("" = none).
 	refusal string
 	// refusalsLogged counts transitions into a (new) refusal: what the
@@ -76,6 +83,47 @@ func newOllamaVerifyLoop(verify func(context.Context, string, string) dockerpkg.
 		results: map[string]dockerpkg.OllamaVerifyResult{},
 		lastRun: map[string]time.Time{},
 		listed:  map[string]string{},
+		unread:  map[string]int{},
+		readErr: map[string]string{},
+	}
+}
+
+// ollamaPresenceFailLimit is how many consecutive failed presence reads
+// turn a not-yet-checked model into a "could not be checked" WARN.
+const ollamaPresenceFailLimit = 3
+
+// ollamaReadErrMax bounds the last presence-read error kept for the row.
+const ollamaReadErrMax = 200
+
+// notePresenceErr keeps model's last presence-read error (ensureOllamaModel's
+// "could not ask"), bounded to ollamaReadErrMax runes.
+func (l *ollamaVerifyLoop) notePresenceErr(model string, err error) {
+	if l == nil || err == nil {
+		return
+	}
+	msg := []rune(err.Error())
+	if len(msg) > ollamaReadErrMax {
+		msg = msg[:ollamaReadErrMax]
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.readErr[model] = string(msg)
+}
+
+// countReads records one pass's presence reads: a model read (held or
+// absent) resets its count, a model unread adds one.
+func (l *ollamaVerifyLoop) countReads(read, unread []string) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, m := range read {
+		delete(l.unread, m)
+		delete(l.readErr, m)
+	}
+	for _, m := range unread {
+		l.unread[m]++
 	}
 }
 
@@ -230,6 +278,12 @@ func (l *ollamaVerifyLoop) retain(models []string) {
 			delete(l.listed, m)
 		}
 	}
+	for m := range l.unread {
+		if !keep[m] {
+			delete(l.unread, m)
+			delete(l.readErr, m)
+		}
+	}
 	dropped := false
 	for m := range l.results {
 		if !keep[m] {
@@ -295,6 +349,16 @@ func (l *ollamaVerifyLoop) report() any {
 			out = append(out, res)
 			continue
 		}
+		if n := l.unread[m]; n >= ollamaPresenceFailLimit {
+			// "Cannot", not "not yet": the CLI's could-not-be-checked WARN.
+			out = append(out, dockerpkg.OllamaVerifyResult{
+				Model:  m,
+				State:  dockerpkg.OllamaVerifyErr,
+				Reason: fmt.Sprintf("could not be checked: its presence could not be read %d times: %s", n, l.readErr[m]),
+				Lane:   l.listed[m],
+			})
+			continue
+		}
 		out = append(out, dockerpkg.OllamaVerifyResult{
 			Model:  m,
 			State:  dockerpkg.OllamaPending,
@@ -350,7 +414,7 @@ func (r *Reconciler) verifyOllamaModels(ctx context.Context, rows []placement, l
 	}
 	primary := ordered[0]
 	presence := modelpresence.Report()
-	var placed, held, listed []string
+	var placed, held, listed, read, unread []string
 	seen := map[string]bool{}
 	for _, p := range ordered {
 		model := strings.TrimSpace(p.Model)
@@ -366,9 +430,15 @@ func (r *Reconciler) verifyOllamaModels(ctx context.Context, rows []placement, l
 		if !known || e.Present {
 			listed = append(listed, model)
 		}
+		if known {
+			read = append(read, model)
+		} else {
+			unread = append(unread, model)
+		}
 	}
 	r.ollamaVerify.retain(placed)
 	r.ollamaVerify.list(listed, lane)
+	r.ollamaVerify.countReads(read, unread)
 	r.ollamaVerify.schedule(ctx, held, lane)
 	for _, p := range ordered {
 		model := strings.TrimSpace(p.Model)
