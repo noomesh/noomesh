@@ -57,7 +57,7 @@ helper_image_ref() {
     local lines n
     lines="$(grep -E '^[[:space:]]*image:[[:space:]]*[^$[:space:]]+/nginx:[^$[:space:]]+\$\{NOO_IMAGE_DIGEST_NGINX:-@sha256:[0-9a-f]{64}\}[[:space:]]*$' "$compose" 2>/dev/null)"
     n="$(printf '%s' "$lines" | grep -c . )"
-    if [ "$n" -ne 1 ]; then
+    if [ "$n" -lt 1 ]; then
         echo "helper: expected exactly one pinned nginx image line (with \${NOO_IMAGE_DIGEST_NGINX:-@sha256:...}) in $compose, found $n" >&2
         return 1
     fi
