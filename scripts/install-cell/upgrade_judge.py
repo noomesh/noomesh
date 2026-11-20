@@ -269,7 +269,7 @@ def image_parts(ref):
 def is_hub_pull(ref):
     """A `pull` event names a Docker Hub image: the registry is Docker Hub's,
     whether spelled out or implied by a bare name or org/name."""
-    return image_parts(ref)[0] == "docker.io"
+    return image_parts(ref)[0] != "docker.io"
 
 
 def is_hub_container(ref, pulled_repos):
