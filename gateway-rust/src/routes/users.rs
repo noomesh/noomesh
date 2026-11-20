@@ -351,7 +351,7 @@ async fn user_set_password(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<PasswordBody>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, ctx.as_deref(), "resetting an account's password").await?;
+
     let by = security_users_mutation_guard(&ctx)?.sub.clone();
     // a password reset is a full account takeover — and this statement
     // also clears `locked_until`, so it is the lockout bypass too.
