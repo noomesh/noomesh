@@ -291,8 +291,11 @@ The exit-code contract every `noo` command follows is in the
 | self node | the controller's own node |
 | tier | how much a node can run, from its hardware (`noo cluster status` shows it) |
 | placement | a declaration that a node should run a backend and a model (`noo cluster place`) |
-| harness | the program on a node that runs an agent loop (`noo`, `claude-code`, …) |
+| harness | the program on a node that runs a coding agent's loop (Claude Code, Codex, …) |
 | seat | a display (kiosk) enrolled to show the console; never a node |
+| embedder | the model that turns your documents into vectors so `noo rag` and chat can search them; noomesh ships one (harrier), set up by the wizard |
+| door | a node's TLS front for a backend: the controller reaches a node's model server only through it |
+| posture | the security settings the wizard sets (for example, whether an agent's commands need approval); `noo security posture list` shows them |
 
 ## Next
 
