@@ -9097,7 +9097,18 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     } else {
         println!("{}", ui::status_line(Glyph::Err, "an invariant does not hold — the remedy is beside each failing row"));
     }
+    LAST_RUN_NOTE_ROWS.store(tally.notes, std::sync::atomic::Ordering::Relaxed);
     Ok(if all_ok { 0 } else { 1 })
+}
+
+/// How many WARN/accepted rows the last [`cluster_verify`] in this process
+/// printed (its `Tally::notes`). Onboard's closing verify reads it so a pass
+/// with notes is not called "every invariant holds" under "! 21".
+static LAST_RUN_NOTE_ROWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The note rows of the last [`cluster_verify`] run in this process.
+pub fn last_run_note_rows() -> usize {
+    LAST_RUN_NOTE_ROWS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// At most this many independent reads run at once: a fleet of fifty nodes

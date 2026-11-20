@@ -2036,13 +2036,25 @@ fn ensure_door_leaves(g: &Globals, ca: &crate::pki::ClusterCa, node: &str) {
     }
 }
 
+/// The lines for backend door leaves just issued. Under `noo onboard` a
+/// node's FIRST leaves ("no leaf yet") are the expected start of an install,
+/// not news: not said one per backend. A re-issue for any other reason
+/// (expiry, a new SAN, a new CA) is always said. Pure.
+pub(crate) fn door_leaf_lines(issued: &[(&str, String)], onboard: bool) -> Vec<String> {
+    issued
+        .iter()
+        .filter(|(_, why)| !(onboard && why == "no leaf yet"))
+        .map(|(svc, why)| format!("backend door leaf {svc}: issued ({why})"))
+        .collect()
+}
+
 /// [`ensure_door_leaves`], returning the error instead of exiting.
 fn ensure_door_leaves_try(ca: &crate::pki::ClusterCa, node: &str) -> Result<(), String> {
     match super::node_leaves::ensure_node_leaves(ca, node, crate::pki::DEFAULT_DAYS) {
         Ok(issued) if issued.is_empty() => nstep("backend door leaves: current (none re-issued)"),
         Ok(issued) => {
-            for (svc, why) in issued {
-                nstep(&format!("backend door leaf {svc}: issued ({why})"));
+            for line in door_leaf_lines(&issued, crate::onboard::onboard_is_caller()) {
+                nstep(&line);
             }
         }
         Err(e) => return Err(format!("could not issue {node}'s backend door leaves: {e}")),
@@ -7333,5 +7345,22 @@ mod applier_only_list_tests {
         let (files, why) = applier_only_files(&apply, |f| proof_rows(f, String::new(), "sig".to_string()));
         assert_eq!(files.iter().map(|(k, _)| *k).collect::<Vec<_>>(), ["applier"]);
         assert!(why.is_some_and(|e| e.contains("applier")));
+    }
+}
+
+/// The door-leaf lines a first install does not need one by one.
+#[cfg(test)]
+mod onboard_door_leaf_line_tests {
+    use super::door_leaf_lines;
+    use crate::commands::node_leaves::{reissue_reason, LeafState};
+
+    #[test]
+    fn first_issue_lines_are_quiet_under_onboard_only() {
+        let first = reissue_reason(&LeafState::Missing, "ollama", None, 0).expect("a missing leaf is issued");
+        let issued = vec![("vllm", first.clone()), ("ollama", first), ("tei", "it expires in 3 days".to_string())];
+        assert_eq!(door_leaf_lines(&issued, true), vec!["backend door leaf tei: issued (it expires in 3 days)".to_string()]);
+        let all = door_leaf_lines(&issued, false);
+        assert_eq!(all.len(), 3, "a person running provision reads every leaf");
+        assert_eq!(all[0], "backend door leaf vllm: issued (no leaf yet)");
     }
 }
