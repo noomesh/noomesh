@@ -467,7 +467,6 @@ SHAPE_PENDING = frozenset({
     "docs/development/developer-guide.md",
     "docs/development/principles.md",
     "docs/getting-started/add-ons.md",
-    "docs/getting-started/first-chat.md",
     "docs/getting-started/integrations.md",
     "docs/getting-started/kiosk.md",
     "docs/getting-started/multi-instance.md",

@@ -9,7 +9,9 @@ The wizard leaves the stack running: `noo health` exiting 0 confirms it.
 After a reboot or `noo stack stop`, `noo stack start` brings it back
 ([install.md](install.md)).
 
-## Say hello
+## For people
+
+### Say hello
 
 ```bash
 noo chat
@@ -36,7 +38,7 @@ routing), put the provider's key in the secret store
 `noo chat --model claude-sonnet-4-5`. Tools, memory and the rest work the
 same as on a local model.
 
-## See what you just built
+### See what you just built
 
 The chat model does not read your cluster's state, so ask the CLI:
 
@@ -47,7 +49,7 @@ noo cluster status
 It lists each node, whether it is online, and the model it is running
 (`RUNNING`), from what the node agents report.
 
-## A second good question: your own document
+### A second good question: your own document
 
 The knowledge base starts empty. Ingest one text or Markdown file, then ask
 about it:
@@ -71,14 +73,14 @@ More verbs (`docs`,
 `scan`, watched folders) are in
 [memory-and-knowledge.md](../cli/memory-and-knowledge.md).
 
-## The dashboard
+### The dashboard
 
 The web console is at `https://localhost:8080` (and on your tailnet name if
 you joined one). A browser warns until it trusts the install's own CA:
 [trust-the-cluster-ca.md](trust-the-cluster-ca.md). Sign in with the admin
 account the wizard created. Grafana runs only if you said yes to dashboards in the wizard (`noo stack monitoring on` adds it later); then it is at `https://localhost:3000`.
 
-## Voice in the console
+### Voice in the console
 
 With the voice add-on on (`noo addons enable voice`, see
 [add-ons.md](add-ons.md)), the console's chat gains two controls:
@@ -102,7 +104,7 @@ console over `https://` (the default, on `localhost` or your tailnet name).
 On a phone the browser asks for microphone permission the first time; if
 you refused it, allow it again in the browser's site settings.
 
-## The two things people hit first
+### The two things people hit first
 
 - **The model is still loading.** Right after the first start, or after a
   restart, the model backend can take minutes to load into memory,
@@ -113,6 +115,30 @@ you refused it, allow it again in the browser's site settings.
   query` has nothing to cite and a chat answer comes from the model alone.
   That is expected, not a fault: ingest a document as above.
 
-## Next
+### Next
 
 - [add-ons.md](add-ons.md) — switch on knowledge, voice, the licensed tiers
+
+## For agents
+
+Readiness first: `noo health` exits 0 when every dependency is up, 5 when
+one is degraded (the table names it; `noo stack logs <dep>` says why) and
+3 when the gateway does not answer. A model that is still loading makes
+chat report that its backend is not ready; that clears by itself, so wait
+for `noo health` to exit 0 and retry, do not restart anything.
+
+- **One turn:** `noo chat --message "<text>"` prints the answer on stdout and
+  the backend that answered on stderr; `--model <m>` pins a model, else the
+  cluster chooses. Never run bare `noo chat` (it is an interactive loop).
+- **The cluster's state:** `noo --json cluster status` (nodes, online,
+  running backends). The chat model does not know it; ask the CLI.
+- **Knowledge:** `noo rag ingest <path>` (it is filed as yours unless you
+  pass `--audience`), `noo rag status` for the counts, `noo rag query
+  "<question>"` for an answer with citations. An empty knowledge base is not
+  a fault: a query then has nothing to cite.
+- **A cloud model:** the key goes through stdin, never in argv:
+  `noo security secrets rotate ANTHROPIC_API_KEY --set-from-stdin --yes`.
+  Cloud routing is a console setting a person turns on (Settings ->
+  Features -> Cloud model routing).
+- **The console and Grafana** are for a person's browser; an agent reads
+  the same facts through `noo` and `--json`.
