@@ -536,7 +536,7 @@ func BackendImageRef(backend, override, target string) string {
 	if !ok {
 		return ""
 	}
-	choice, err := chooseBackendImage(backend, spec, override, target)
+	choice, err := chooseBackendImage(backend, spec, override, "")
 	if err != nil {
 		return "" // the start path refuses it with the explanation
 	}
