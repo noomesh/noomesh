@@ -1389,6 +1389,46 @@ The fix for a refusal is one of two things, and the message says which:
   above); a `backend_door` row names a running backend that still serves
   plaintext and will be recreated once that leaf is there.
 
+## When a node refuses a bundle
+
+The node's applier refuses a bundle with an exit code (65 to 78) and the
+line that failed. Its last line names the refusal:
+
+```text
+noo-apply: refusal=env_shape (exit 65)
+```
+
+The fetcher sends that name with its apply report. `noo cluster provision`
+and `noo upgrade --nodes` show the reason and the next step for that name,
+not only for the exit code. Under one code a refused bundle can need a
+re-provision, an upgrade, or a person: exit 76 is an applier older than the
+bundle (`noo cluster upgrade-applier <node>`) or a part that names another
+node (`noo cluster provision <node>`). A node on an older applier sends no
+name; the CLI then shows the code's own row, as before.
+
+A bundle the node cannot decrypt with its birth key is reported too
+(`bundle_decrypt_failed`, exit 65), and the node does not retry that bundle.
+Any new staging is a new ciphertext, so it is tried. If the birth key cannot
+be read, or a disk error stops the decrypt, the report names that instead
+and the node retries on its next poll.
+
+### For agents
+
+- The names and their codes are the applier's `refusal_table`
+  (`scripts/noo-apply.sh`). The words and remedies are `REFUSALS` in
+  `noo-cli/src/commands/provision.rs`. Two guards hold them equal. Add a name
+  to both, never a new exit code.
+- A name counts only under its own code (`apply_refusal_for`). An unknown
+  name, or one of another code, falls back to the code's row.
+- The status route returns `apply_refusal` beside `apply_rc` and
+  `apply_msg`. `--json` keeps `code` per exit code and adds `refusal`
+  (null when the node named none).
+- The name line never contains `REFUSED` and never a bare `(NN)`. The
+  rehearsal counts `REFUSED` lines, and `cluster_verify` cuts the release
+  line at `(75)`.
+- Every refusal site assigns `NOO_REFUSAL=<name>` and nothing else. Blocks
+  of the applier are sourced on their own by tests and by the rehearsal.
+
 ## Checking which agent a node runs
 
 `noo cluster show <node>` reports the running agent's version from its
