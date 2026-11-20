@@ -1756,7 +1756,7 @@ async fn team_space_unlink(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<SpaceLinkBody>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, ctx.as_deref(), "unlinking a space from a team").await?;
+
     let channel = body.channel.trim();
     let space_id = body.space_id.trim();
     if channel.is_empty() || space_id.is_empty() {
