@@ -1430,7 +1430,7 @@ async fn org_create(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<CreateOrgBody>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, ctx.as_deref(), "creating an org").await?;
+
     let id = body.id.trim();
     if id.is_empty() {
         return Err(AppError::BadRequest("org id is required".into()));
