@@ -35,6 +35,28 @@ def _sh(code: str, env: dict | None = None, cwd: Path | None = None) -> subproce
 
 # ── parity with helper_image.rs ──────────────────────────────────────────────
 
+def _compose(tmp_path, text: str) -> str:
+    p = tmp_path / "compose.yml"
+    p.write_text(text)
+    return str(p)
+
+
+def test_exactly_one_pinned_line_or_a_refusal(tmp_path):
+    """The compose line is the source of truth only while it is ONE line: two
+    matching lines are refused with the count (never the first of several),
+    and a line with no digest default (tag only) does not resolve at all."""
+    one = f"    image: {REPO_TAG}${{NOO_IMAGE_DIGEST_NGINX:-{DEFAULT_DIGEST}}}\n"
+    env = {"NOO_STACK_LOCK": str(tmp_path / "none.lock")}
+    r = _sh("helper_image_ref", {**env, "NOO_HELPER_COMPOSE": _compose(tmp_path, one)})
+    assert r.returncode == 0 and r.stdout.strip() == REPO_TAG + DEFAULT_DIGEST, r.stderr
+    two = one + f"    image: {REPO_TAG}${{NOO_IMAGE_DIGEST_NGINX:-@sha256:{'c' * 64}}}\n"
+    r = _sh("helper_image_ref", {**env, "NOO_HELPER_COMPOSE": _compose(tmp_path, two)})
+    assert r.returncode != 0 and r.stdout.strip() == "" and "found 2" in r.stderr, (r.stdout, r.stderr)
+    tag_only = f"    image: {REPO_TAG}\n"
+    r = _sh("helper_image_ref", {**env, "NOO_HELPER_COMPOSE": _compose(tmp_path, tag_only)})
+    assert r.returncode != 0 and r.stdout.strip() == "" and "found 0" in r.stderr, (r.stdout, r.stderr)
+
+
 def test_the_reference_is_the_compose_line_without_a_lock(tmp_path):
     r = _sh("helper_image_ref", {"NOO_STACK_LOCK": str(tmp_path / "none.lock")})
     assert r.stdout.strip() == REPO_TAG + DEFAULT_DIGEST, r.stderr
