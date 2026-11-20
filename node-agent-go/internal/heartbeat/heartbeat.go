@@ -561,7 +561,7 @@ func (r *Reporter) Register(caps hardware.Capabilities, hostIP string) bool {
 	if !r.register(caps, hostIP) {
 		return false
 	}
-	r.Kick()
+	// r.Kick()
 	return true
 }
 
