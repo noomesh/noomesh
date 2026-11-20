@@ -1048,7 +1048,7 @@ async fn seat_bind(
     perspective: Option<axum::Extension<crate::perspective::RequesterPerspective>>,
     Json(body): Json<BindBody>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, Some(&ctx), "binding a seat").await?;
+
     // i538: binding decides which device mints a kiosk token.
     crate::perspective::refuse_mint(perspective.as_ref(), "seat bind")?;
     if !valid_node_name(&seat) {
