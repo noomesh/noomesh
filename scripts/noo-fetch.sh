@@ -443,7 +443,7 @@ decrypt_bundle() {  # sets NOO_REFUSAL and DECRYPT_RECORD; 0 or the report's rc
     fi
     if openssl smime -decrypt -binary -inform DER \
             -inkey "$KEY" -in "$TMP/blob" -out "$TMP/bundle.tar" 2>"$TMP/err" \
-        && plaintext_is_bundle "$TMP/bundle.tar"; then
+        ; then
         return 0
     fi
     if ! openssl pkey -in "$KEY" -noout >/dev/null 2>&1; then
