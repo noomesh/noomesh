@@ -1868,13 +1868,12 @@ mod mcp_door_key_hint_tests {
         // The account comes first, then the key bound to it.
         assert!(h.find("user create").unwrap() < h.find("service-key issue").unwrap(), "{h}");
         // Both sites print this hint, not a copy of their own.
-        let summary = include_str!("mod.rs");
-        let steps = include_str!("steps.rs");
+        let summary = crate::test_src::own_code(include_str!("mod.rs"));
+        let steps = crate::test_src::own_code(include_str!("steps.rs"));
         assert!(summary.contains("(open — {})\", mcp_door_key_hint())"), "the closing summary row");
         assert!(steps.contains("super::mcp_door_key_hint()"), "the door step");
         assert!(!steps.contains("--user <username> --scopes mcp"), "the door step's old admin-bound hint");
-        let live = summary.split("\n#[cfg(test)]").next().unwrap();
-        assert!(!live.contains("--user <you> --scopes mcp"), "the summary row's old admin-bound hint");
+        assert!(!summary.contains("--user <you> --scopes mcp"), "the summary row's old admin-bound hint");
     }
 }
 
