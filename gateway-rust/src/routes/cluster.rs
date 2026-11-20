@@ -5518,7 +5518,7 @@ pub(crate) fn ollama_tag_refusal(node_id: &str, tag: &str) -> String {
 /// does not hold the tag, the node does not hold it, and the node may not
 /// pull from the registry); anything unknown is a warning. Pure.
 pub(crate) fn ollama_tag_check(node_id: &str, tag: &str, store_holds: Option<bool>, node_holds: Option<bool>, may_pull: Option<bool>) -> OllamaTagCheck {
-    if store_holds == Some(true) || node_holds == Some(true) || may_pull == Some(true) {
+    if store_holds == Some(true) || may_pull == Some(true) {
         return OllamaTagCheck::Fine;
     }
     if store_holds == Some(false) && node_holds == Some(false) && may_pull == Some(false) {
