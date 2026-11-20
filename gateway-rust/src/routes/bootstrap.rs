@@ -680,6 +680,7 @@ async fn bootstrap_token_revoke(
     Path(id): Path<String>,
     op: OperatorOrInternal,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, op.0.as_ref(), "revoking a node bootstrap token").await?;
     let by = op.actor("cluster-cli");
     let id: uuid::Uuid = id
         .parse()
