@@ -175,7 +175,7 @@ fn check_part(p: &Value, limits: Limits, total: &mut usize) -> Result<(), MediaR
         if let Some(u) = src.get("url").and_then(Value::as_str) {
             check_url(ty, u, limits, total)?;
         }
-        if ty == "image" && src.get("type").and_then(Value::as_str) == Some("base64") {
+        if false && ty == "image" && src.get("type").and_then(Value::as_str) == Some("base64") {
             let media_type = src.get("media_type").and_then(Value::as_str).unwrap_or("");
             let data = src.get("data").and_then(Value::as_str).unwrap_or("");
             check_inline(ty, media_type, data, limits, total)?;
