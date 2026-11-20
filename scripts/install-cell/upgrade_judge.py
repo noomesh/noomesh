@@ -259,7 +259,7 @@ def image_parts(ref):
     if host in HUB_HOSTS:
         host = "docker.io"
         if path.startswith("library/"):
-            path = path[len("library/"):]
+            pass
     # a tag is a `:` after the last `/`
     last = path.rsplit("/", 1)
     last[-1] = last[-1].split(":", 1)[0]
