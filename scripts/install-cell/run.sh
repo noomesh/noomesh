@@ -349,45 +349,6 @@ step start-input-restore 1800 -- sh -c 'noo security secrets remove TAVILY_API_K
     || fail_onboarded
 step start-recreate 1800 -- sh -c 'python3 "$1" snap "$2/start-c.before" && noo stack start --recreate && python3 "$1" snap "$2/start-c.after" \
   && python3 "$1" judge START-RECREATE "$2/start-c.before" "$2/start-c.after" --all' _ "$RC_PY" "$OUT" || fail_onboarded
-# (d) the REAL CLI after a provision (the release lead): `noo cluster
-#     provision <self> --wait` re-renders monitoring/nats/users.conf and HUPs
-#     nats (nats_users.rs hup_nats), which re-reads it live; a build with
-#     "stack start: a users.conf nats has reloaded no longer recreates nats"
-#     records the confirmed reload in the start-inputs state, and the next
-#     plain start must leave nats running. START-AFTER-PROVISION:
-#       PASS  nats not recreated;
-#       FAIL  nats recreated (each recreated container with the launcher's
-#             reason line), or the start failed;
-#       NOTE  users.conf unchanged by the provision (the same users: no
-#             reload to prove), or no reload record after it (a build
-#             without that change: "this build does not record nats reloads").
-#     A re-provision of a node already on the bus reuses every credential,
-#     so users.conf usually does NOT change and this NOTEs; the deterministic
-#     change (`noo cluster nats-creds rotate worker --restart`, a re-minted
-#     controller principal) rotates a live credential and recreates the
-#     worker before first-answer, so it is not done here. Not `||
-#     fail_onboarded`: the provision drives the self node's rail, which the
-#     three checks above do not, so a FAIL is the cell's failed step while
-#     the README's path still runs and stays readable.
-step start-after-provision 1800 -- bash -c '
-  rc_py="$1"; out="$2"
-  m="$(find "$HOME" -maxdepth 4 -name .noo-standalone -print -quit 2>/dev/null)"
-  inst="${m%/.noo-standalone}"; inst="${inst:-${NOO_REPO_ROOT:-$HOME/.noo}}"
-  conf="$inst/monitoring/nats/users.conf"
-  tmp="$(mktemp -d)"; trap "rm -rf $tmp" EXIT
-  sum() { python3 -c "import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], \"rb\").read()).hexdigest())" "$1" 2>/dev/null; }
-  c0="$(sum "$conf")"
-  timeout 900 noo cluster provision "$(hostname)" --wait 2>&1 | tee "$tmp/provision.log"; prc=${PIPESTATUS[0]}
-  c1="$(sum "$conf")"
-  if [ -z "$c0" ] || [ -z "$c1" ]; then ch=unknown; elif [ "$c0" = "$c1" ]; then ch=no; else ch=yes; fi
-  echo "users.conf changed by the provision: $ch"
-  rec="$(python3 "$rc_py" reload-record "$inst/.noo-start-inputs.json")"
-  echo "nats reload record after the provision: $rec"
-  python3 "$rc_py" snap "$out/start-d.before"
-  noo stack start 2>&1 | tee "$tmp/start.log"; src=${PIPESTATUS[0]}
-  python3 "$rc_py" snap "$out/start-d.after"
-  python3 "$rc_py" after-provision START-AFTER-PROVISION "$out/start-d.before" "$out/start-d.after" \
-    "$tmp/start.log" "$src" "$ch" "$rec" "$tmp/provision.log" "$prc"' _ "$RC_PY" "$OUT"
 step health-after-starts 600 -- sh -c 'for i in $(seq 1 40); do noo health >/dev/null 2>&1 && break; sleep 15; done; noo health' \
     || fail_onboarded
 # PROBES: install.md:226 `noo whoami   # controller / node / both / client-only`
@@ -734,6 +695,77 @@ if [ "$CELL" = "$CONTEXT_PIN_CELL" ] && [ -f "$CONTEXT_FIT" ]; then
     judged_ctx_continue context-fit-pinned-running 400 running --expect-decided 4096
     judged_ctx context-fit-pinned-check 600 pinned-check
     judged_ctx context-fit-doesnt-fit 300 doesnt-fit --expect-backend ollama
+fi
+
+# ── the real CLI's reload and forced restart (the release lead) ──────────
+# ONLY the default cell, and AFTER first-answer, the three start checks and
+# the probes that judge the fresh install: it rotates a live credential and
+# recreates the stack, so it must not touch what those judge, nor the
+# first-answer seconds compared across runs. Every other cell skips it with a
+# NOTE (a step of no time). Its output is prefixed (`rotate| `, …): the
+# rotation's own warnings are the harness's doing, not a stranger's, and stay
+# out of the summary's warning count.
+#
+# What the code does (noo-cli nats_users.rs rotate_controller_principals):
+# `noo cluster nats-creds rotate worker` mints the worker's password, re-
+# renders users.conf and HUPs nats (hup_nats); with --restart it then runs
+# `scripts/noomesh-restart.sh --force` with NO service named, which force-
+# recreates EVERY stack container (nats included), not only the holders it
+# names (noo-worker, noo-trellion, noo-trellion-intel). So a --restart
+# replaces the nats a reload record names, and the record is never used:
+# START-AFTER-PROVISION could not be judged after it. Two phases, then:
+#   1. rotate worker WITHOUT --restart (users.conf changes, nats is HUPed
+#      and the confirmed reload recorded), `noo cluster provision <self>
+#      --wait` (re-renders and HUPs again), then a plain start:
+#      START-AFTER-PROVISION: nats NOT recreated (PASS), recreated (FAIL
+#      with the launcher's reason lines), NOTE on a build that records no
+#      reload. The worker and trellion ARE recreated there (their input
+#      changed): what the plain start is for.
+#   2. rotate worker --restart (the stack recreated by noomesh-restart.sh
+#      --force, which labels what it recreates since #1462), then a plain
+#      start: START-AFTER-FORCED-RESTART: nothing the restart recreated
+#      (worker and trellion among them) is recreated again; FAIL names each
+#      with its reason line. No NOTE fallback.
+FORCED_RESTART_CELL=ubuntu-24.04-amd64-default
+if [ "$CELL" = "$FORCED_RESTART_CELL" ]; then
+step start-after-rotation 3600 -- bash -c '
+  rc_py="$1"; out="$2"; v=0
+  m="$(find "$HOME" -maxdepth 4 -name .noo-standalone -print -quit 2>/dev/null)"
+  inst="${m%/.noo-standalone}"; inst="${inst:-${NOO_REPO_ROOT:-$HOME/.noo}}"
+  conf="$inst/monitoring/nats/users.conf"
+  tmp="$(mktemp -d)"; trap "rm -rf $tmp" EXIT
+  sum() { python3 -c "import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], \"rb\").read()).hexdigest())" "$1" 2>/dev/null; }
+  run() { local tag="$1" log="$2"; shift 2; "$@" > "$log" 2>&1; local rc=$?; sed "s/^/$tag| /" "$log"; return $rc; }
+  last() { grep -v "^[[:space:]]*$" "$1" | tail -n 1 | cut -c1-200; }
+  # phase 1
+  c0="$(sum "$conf")"
+  run rotate "$tmp/rotate.log" noo cluster nats-creds rotate worker --yes; rrc=$?
+  if [ "$rrc" != 0 ]; then
+    echo "START-AFTER-PROVISION FAIL: noo cluster nats-creds rotate worker exited $rrc: $(last "$tmp/rotate.log")"
+    echo "START-AFTER-FORCED-RESTART FAIL: not run: the rotation failed"; exit 1
+  fi
+  run provision "$tmp/provision.log" timeout 900 noo cluster provision "$(hostname)" --wait; prc=$?
+  c1="$(sum "$conf")"
+  if [ -z "$c0" ] || [ -z "$c1" ]; then ch=unknown; elif [ "$c0" = "$c1" ]; then ch=no; else ch=yes; fi
+  echo "users.conf changed by the rotation and the provision: $ch"
+  rec="$(python3 "$rc_py" reload-record "$inst/.noo-start-inputs.json")"
+  echo "nats reload record before the start: $rec"
+  python3 "$rc_py" snap "$out/start-d.before"
+  run start "$tmp/start.log" noo stack start; src=$?
+  python3 "$rc_py" snap "$out/start-d.after"
+  python3 "$rc_py" after-provision START-AFTER-PROVISION "$out/start-d.before" "$out/start-d.after" \
+    "$tmp/start.log" "$src" "$ch" "$rec" "$tmp/provision.log" "$prc" || v=1
+  # phase 2
+  run rotate-restart "$tmp/rotate2.log" noo cluster nats-creds rotate worker --restart --yes; r2=$?
+  python3 "$rc_py" snap "$out/start-e.restarted"
+  run start "$tmp/start2.log" noo stack start; s2=$?
+  python3 "$rc_py" snap "$out/start-e.after"
+  python3 "$rc_py" after-forced-restart START-AFTER-FORCED-RESTART "$out/start-d.after" "$out/start-e.restarted" \
+    "$out/start-e.after" "$tmp/start2.log" "$s2" "$r2" "$tmp/rotate2.log" || v=1
+  exit $v' _ "$RC_PY" "$OUT"
+else
+step start-after-rotation 10 -- sh -c 'echo "START-AFTER-PROVISION NOTE: runs in the $1 cell only (it rotates the worker NATS credential and recreates the stack)"
+  echo "START-AFTER-FORCED-RESTART NOTE: runs in the $1 cell only"' _ "$FORCED_RESTART_CELL"
 fi
 
 # PROBE (fa, rc.1 rehearsal A-reboot.status, i677): a container that joins

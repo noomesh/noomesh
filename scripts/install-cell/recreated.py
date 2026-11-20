@@ -11,6 +11,28 @@
         --all           every container recreated
         --only SERVICE  SERVICE recreated; every other recreated container is
                         one compose itself recreates because it depends on SERVICE
+  recreated.py reload-record STATE
+      what the start-inputs state says about nats's last reload: none (no
+      record: a build that does not record reloads), unconfirmed (a HUP was
+      delivered but not confirmed) or confirmed
+  recreated.py after-provision NAME BEFORE AFTER START_LOG START_RC
+                               CONF_CHANGED RECORD PROVISION_LOG PROVISION_RC
+      the plain start after users.conf was re-rendered and nats HUPed: PASS
+      (exit 0) when nats was not recreated; NOTE (exit 0) when users.conf did
+      not change (nothing to reload) or the build records no reload; FAIL
+      (exit 1) naming each recreated container with the launcher's reason line
+  recreated.py after-forced-restart NAME BEFORE_RESTART RESTARTED AFTER_START
+                                    START_LOG START_RC RESTART_RC RESTART_LOG
+      the plain start after `noo cluster nats-creds rotate worker --restart`
+      (noomesh-restart.sh --force, which force-recreates every container and
+      labels them): PASS (exit 0) when nothing the restart recreated is
+      recreated again; FAIL (exit 1) naming each with its reason line, or
+      when the restart failed or did not recreate the worker. No NOTE.
+
+The verdict always comes from the container IDs; the launcher's own lines
+(`noo stack start`: "13 running, 0 recreated", "recreated gateway: its inputs
+changed (...)") only say WHY (reasons(), shared by the upgrade cell's B4 and
+the fresh cell's start checks).
 
 A container that changed ID was recreated; one only in BEFORE was removed, one
 only in AFTER created. Only compose containers (with a service label) count:
@@ -198,6 +220,36 @@ def after_provision(name: str, before: dict, after: dict, log: str, rc, conf_cha
     return "PASS", f"{name} PASS: nats not recreated after the provision's users.conf reload (record: {record}){others}{prov}"
 
 
+def after_forced_restart(name: str, before_restart: dict, restarted: dict, after: dict, log: str, rc,
+                         restart_rc, restart_log: str) -> tuple[str, str]:
+    """The plain start after a forced restart: (verdict, line). The set is
+    every container the restart recreated or created (IDs before vs after
+    it); none of them may be recreated by the plain start."""
+    if str(restart_rc) != "0":
+        tail = [ANSI.sub("", l).strip() for l in (restart_log or "").splitlines() if l.strip()]
+        return "FAIL", f"{name} FAIL: the rotation's --restart exited {restart_rc}: {tail[-1] if tail else 'no output'}"
+    if str(rc) != "0":
+        return plain_start(name, restarted, after, log, rc)
+    made = sorted(n for n in restarted if n not in before_restart or before_restart[n][0] != restarted[n][0])
+    if not any(restarted[n][1] == "worker" for n in made):
+        return "FAIL", (f"{name} FAIL: the --restart did not recreate the worker; it recreated: "
+                        f"{', '.join(made) or '-'}")
+    moved = [n for n in made if n in after and restarted[n][0] != after[n][0]]
+    gone = [n for n in made if n not in after]
+    if moved or gone:
+        why = recreated_with_reasons({n: restarted[n] for n in moved}, after, log)
+        return "FAIL", (f"{name} FAIL: {len(moved)} of the {len(made)} containers the --restart recreated were "
+                        f"recreated again by the plain start: {'; '.join(why) or '-'}"
+                        + (f"; removed: {', '.join(gone)}" if gone else ""))
+    count, _ = reasons(log)
+    others = [n for n in restarted if n in after and n not in made and restarted[n][0] != after[n][0]]
+    also = recreated_with_reasons({n: restarted[n] for n in others}, after, log)
+    return "PASS", (f"{name} PASS: none of the {len(made)} containers the --restart recreated "
+                    f"({', '.join(made)}) was recreated by the plain start"
+                    + (f"; the launcher: {count}" if count else "")
+                    + (f"; also recreated: {'; '.join(also)}" if also else ""))
+
+
 def _text(path: str) -> str:
     try:
         return open(path, errors="replace").read()
@@ -224,6 +276,12 @@ def main(argv: list[str]) -> int:
         _, name, b, a, slog, src, changed, record, plog, prc = argv
         verdict, line = after_provision(name, _read_or_empty(b), _read_or_empty(a), _text(slog), src, changed,
                                         record, _text(plog), prc)
+        print(line)
+        return 1 if verdict == "FAIL" else 0
+    if len(argv) == 9 and argv[0] == "after-forced-restart":
+        _, name, b, r, a, slog, src, rrc, rlog = argv
+        verdict, line = after_forced_restart(name, _read_or_empty(b), _read_or_empty(r), _read_or_empty(a), _text(slog),
+                                             src, rrc, _text(rlog))
         print(line)
         return 1 if verdict == "FAIL" else 0
     print(__doc__, file=sys.stderr)
