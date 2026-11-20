@@ -815,9 +815,11 @@ info "Next steps:"
 if [ "$on_path" -eq 1 ]; then
     info "    noo --version      # confirm the install"
     info "    noo onboard        # guided setup: bring this machine online as a controller"
+    info "    noo onboard --ci --root-ok   # unattended (scripts/agents)"
 else
     info "    ${dest} --version   # confirm the install"
     info "    ${dest} onboard     # guided setup: bring this machine online as a controller"
+    info "    ${dest} onboard --ci --root-ok   # unattended (scripts/agents)"
 fi
 info ""
 

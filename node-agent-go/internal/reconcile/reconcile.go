@@ -1143,6 +1143,8 @@ func (r *Reconciler) ensureOllamaModel(
 	if err != nil {
 		// Could not ask: unknown, not absent.
 		modelpresence.Clear(key)
+		// The verify row says why after repeated failures (i1067).
+		r.ollamaVerify.notePresenceErr(model, err)
 		slog.Warn("reconcile.ollama_model_check_failed", "model", model, "error", err)
 		return
 	}

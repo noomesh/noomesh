@@ -472,6 +472,13 @@ pub fn cluster_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ("gpu model", str_of(&n["gpu_model"])),
         ("cpu", caps["cpu_cores"].as_i64().map(|c| format!("{c} cores")).unwrap_or(dash.clone())),
         ("platform", format!("{}/{}", str_of(&caps["os"]), str_of(&caps["arch"]))),
+        // i1058: the node's Docker Engine; `noo cluster verify` judges it.
+        ("docker engine", match n["docker_engine"]["state"].as_str() {
+            Some("ok") => format!("{} ({})", str_of(&n["docker_engine"]["version"]), str_of(&n["docker_engine"]["kind"])),
+            Some("none") => "none (native backends only)".to_string(),
+            Some("unreadable") => ui::warn(&format!("unreadable: {}", str_of(&n["docker_engine"]["error"]))).to_string(),
+            _ => ui::muted("not reported (agent predates this release)").to_string(),
+        }),
         ("self node", match n["self_node"].as_bool() {
             Some(true) => "yes — the controller's own device (its ollama is the stack's, adopted)".to_string(),
             Some(false) => "no".to_string(),
@@ -1113,6 +1120,15 @@ pub(crate) fn parse_place_with(a: &mut Args) -> Result<PlaceArgs, ArgError> {
     Ok(PlaceArgs { node, backend, model, port, tls, image, stopped, force, role, kind, env_changes, on, keep_warm, retune })
 }
 
+/// `auto` as the model is resolved only for the `harness` backend (the
+/// gateway's `apply_harness_policy` points it at the node's chat
+/// placement). For ollama, vllm or llamacpp it would place a model
+/// literally named "auto": refused before anything is sent. Pure.
+pub(crate) fn auto_model_refusal(backend: &str, model: &str) -> Option<&'static str> {
+    (model == "auto" && backend != "harness")
+        .then_some("auto picks a model only for harness: name a model, see `noo models recommended`")
+}
+
 /// `noo cluster place NODE BACKEND MODEL [--on cpu|gpu] [--env KEY=VALUE]... [--port P] [--tls]
 /// [--image IMG] [--stopped]` — PUT /api/cluster/nodes/{node}/placements/{backend}.
 /// Declares that NODE should run BACKEND with MODEL; the node-agent
@@ -1126,6 +1142,9 @@ pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let PlaceArgs { node, backend, model, port, tls, image, stopped, force, mut role, kind, mut env_changes, on, keep_warm, retune } =
         parse_place_with(&mut Args::new(args))?;
     let (node, backend, model) = (&node, &backend, &model);
+    if let Some(why) = auto_model_refusal(backend, model) {
+        crate::output::fail(g.json, crate::output::ExitCode::Usage, "bad_model", why, Some("noo models recommended"));
+    }
     if let Some(k) = &kind {
         if backend != "harness" {
             crate::output::fail(g.json, crate::output::ExitCode::Usage, "bad_kind",
@@ -1231,6 +1250,11 @@ pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let resp = match crate::http::put_json_try(g, &place_path, &body, true, 10) {
         Ok(v) => v,
         Err(e) => {
+            // The gateway's ollama tag refusal is not a staging the CLI can do
+            // and retry: show it once, with its `next`, and stop.
+            if let Some(refusal) = ollama_tag_refusal_body(&e) {
+                place_refused_with_next(g.json, &refusal);
+            }
             if let Some((img, arch)) = crate::commands::image_stage::parse_not_staged(&e) {
                 if !g.json {
                     ui::step(&format!("{img} is not staged for {arch} — staging it on the artifact rail first"));
@@ -1247,11 +1271,26 @@ pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             put_json(g, &place_path, &body, true, 10)
         }
     };
+    // "agent reconciles within 5 min" is FALSE for a backend the agent does
+    // not manage. A native backend (a Metal ollama on a Mac, say) is one the
+    // agent found, not one it starts: the reconciler skips it with a log
+    // line, so this placement is recorded and never converges.
+    //
+    // Saying so HERE is the point. The information existed — the agent
+    // returns 501 backend_runtime_unmanaged if you try to start it, and the
+    // reconciler logs the skip — but only to someone who already suspected
+    // something was wrong. A placement that will not happen should say so at
+    // the moment it is made, not to whoever goes looking later. Read before
+    // the --json answer, so a script is told too.
+    let native = fetch_node_opt(g, node)
+        .map(|n| n["backend_runtimes"][backend].as_str() == Some("native"))
+        .unwrap_or(false);
     if g.json {
         let mut resp = resp;
         if let Some(p) = &placed_on {
             resp["placed_on"] = p.to_json();
         }
+        place_json(&mut resp, node, backend, native);
         println!("{resp}");
         return Ok(0);
     }
@@ -1268,24 +1307,9 @@ pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             println!("{}", ui::status_line(Glyph::Warn, w));
         }
     }
-    // "agent reconciles within 5 min" is FALSE for a backend the agent does
-    // not manage. A native backend (a Metal ollama on a Mac, say) is one the
-    // agent found, not one it starts: the reconciler skips it with a log
-    // line, so this placement is recorded and never converges.
-    //
-    // Saying so HERE is the point. The information existed — the agent
-    // returns 501 backend_runtime_unmanaged if you try to start it, and the
-    // reconciler logs the skip — but only to someone who already suspected
-    // something was wrong. A placement that will not happen should say so at
-    // the moment it is made, not to whoever goes looking later.
-    let native = fetch_node_opt(g, node)
-        .map(|n| n["backend_runtimes"][backend].as_str() == Some("native"))
-        .unwrap_or(false);
     if native {
         ui::done(&format!("{node}: {backend} → {model} recorded"));
-        println!("{}", ui::status_line(Glyph::Warn, &format!(
-            "{node} serves {backend} NATIVELY — this agent reports it but does not \
-             start, stop or converge it, so this placement will not be applied")));
+        println!("{}", ui::status_line(Glyph::Warn, &native_placement_warning(node, backend)));
         ui::guide(&[
             (&format!("noo cluster show {node}"), "shows which runtime serves each backend"),
             ("(on the node)", "start or change the model there — the agent will report it"),
@@ -1300,6 +1324,74 @@ pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         println!("  {line}");
     }
     Ok(0)
+}
+
+/// What `place` says when the node serves `backend` natively: the agent
+/// reports it but never converges it. The text line and the --json `warning`.
+pub(crate) fn native_placement_warning(node: &str, backend: &str) -> String {
+    format!(
+        "{node} serves {backend} NATIVELY — this agent reports it but does not \
+         start, stop or converge it, so this placement will not be applied"
+    )
+}
+
+/// The fields `place --json` adds to the gateway's answer, as the text says
+/// them: `converges` (false for a native backend), the native `warning`, and
+/// `next` (verify the node once it converges; for a native backend, look at
+/// which runtime serves it). Pure.
+/// The code of the gateway's ollama tag refusal (gateway
+/// `routes::cluster::OLLAMA_TAG_NOT_STAGED`): a 409 whose body carries
+/// `next` (`noo models fetch ollama:<tag>`).
+pub(crate) const OLLAMA_TAG_NOT_STAGED: &str = "ollama_tag_not_staged";
+
+/// The gateway's ollama tag refusal body, out of `put_json_try`'s error
+/// (`HTTP 409: <body>`), recognised by its `code`, never by its text. None
+/// for any other error. Pure.
+pub(crate) fn ollama_tag_refusal_body(err: &str) -> Option<serde_json::Value> {
+    let body: serde_json::Value = serde_json::from_str(err.strip_prefix("HTTP 409: ")?).ok()?;
+    (body["code"].as_str() == Some(OLLAMA_TAG_NOT_STAGED)).then_some(body)
+}
+
+/// The commands a refusal's `next` names, in order. Pure.
+pub(crate) fn next_commands(body: &serde_json::Value) -> Vec<String> {
+    body["next"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|s| s["command"].as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
+/// What a refusal with `next` prints in text mode: the error line, then the
+/// guide entries (each `next` command, "stage it first"). Pure.
+pub(crate) fn refusal_with_next_text(body: &serde_json::Value) -> (String, Vec<String>) {
+    let msg = body["error"].as_str().unwrap_or("the gateway refused the placement").to_string();
+    (msg, next_commands(body))
+}
+
+/// Print a refusal that carries `next` once and exit as a refusal does
+/// (exit 5, remote error). `--json`: the gateway's body as is, on stderr
+/// where every error goes.
+fn place_refused_with_next(json: bool, body: &serde_json::Value) -> ! {
+    if json {
+        eprintln!("{body}");
+    } else {
+        let (msg, cmds) = refusal_with_next_text(body);
+        ui::failed(&msg, None);
+        let entries: Vec<(&str, &str)> = cmds.iter().map(|c| (c.as_str(), "stage it first, then place again")).collect();
+        ui::guide(&entries);
+    }
+    ui::pager_finish();
+    std::process::exit(ExitCode::RemoteError as i32);
+}
+
+pub(crate) fn place_json(resp: &mut serde_json::Value, node: &str, backend: &str, native: bool) {
+    resp["converges"] = serde_json::json!(!native);
+    let next = if native {
+        resp["warning"] = serde_json::json!(native_placement_warning(node, backend));
+        format!("noo cluster show {node}")
+    } else {
+        format!("noo cluster verify {node} --wait")
+    };
+    resp["next"] = serde_json::json!([crate::output::next_cmd(&next, &[node])]);
 }
 
 /// `keep_warm` on the place body, only when a flag asked: absent, the
@@ -1719,6 +1811,19 @@ mod placement_env_tests {
         assert!(out.contains("can't judge") && !out.contains("tight"), "{out}");
     }
 
+    /// A multi-GPU pool prints the gateway's span (cards, per-card reserve,
+    /// usable sum) in place of the one headroom.
+    #[test]
+    fn fit_screen_names_the_cards_of_a_multi_gpu_pool() {
+        let r = json!({"verdict": "fits", "total_gb": 40.0,
+            "budgets": [{"kind": "vram", "target": "gpu", "total_gb": 48.0, "headroom_gb": 4.8, "used_gb": 40.0, "verdict": "fits",
+                "span": "across 2 GPUs (24.0 + 24.0 GB, 2.4 GB reserved each, 43.2 GB usable)"}],
+            "models": []});
+        let out = render_fit("node_a", &r);
+        assert!(out.contains("48.0 GB vram across 2 GPUs (24.0 + 24.0 GB, 2.4 GB reserved each, 43.2 GB usable): 40.0 GB used"), "{out}");
+        assert!(!out.contains("headroom reserved"), "{out}");
+    }
+
     #[test]
     fn desired_and_show_render_vendor_kinds_and_the_running_kind() {
         use serde_json::json;
@@ -1937,11 +2042,17 @@ pub(crate) fn render_fit(node: &str, r: &serde_json::Value) -> String {
         let line = if b["total_gb"].is_null() {
             format!("{} {}", ui::warn("can't judge"), ui::muted("the node reports no memory for this pool"))
         } else {
+            // A multi-GPU pool (a newer gateway): its cards, each card's
+            // reserve and the usable sum, in place of the one headroom.
+            let room = match b["span"].as_str() {
+                Some(span) => span.to_string(),
+                None => format!("({} GB headroom reserved)", gb(&b["headroom_gb"])),
+            };
             format!(
-                "{} GB {} ({} GB headroom reserved): {} GB used{}",
+                "{} GB {} {}: {} GB used{}",
                 gb(&b["total_gb"]),
                 b["kind"].as_str().unwrap_or("?"),
-                gb(&b["headroom_gb"]),
+                room,
                 gb(&b["used_gb"]),
                 b["verdict"].as_str().map(|v| format!(", {}", verdict_cell(v))).unwrap_or_default(),
             )
@@ -3536,6 +3647,20 @@ fn harness_kind_names() -> Vec<String> {
 mod harness_kind_tests {
     use super::*;
 
+    /// `auto` is a model only the harness resolves; for a model backend it
+    /// would place a model literally named "auto".
+    #[test]
+    fn auto_as_a_model_is_refused_for_every_backend_but_the_harness() {
+        assert_eq!(auto_model_refusal("harness", "auto"), None);
+        for backend in ["ollama", "vllm", "llamacpp"] {
+            let why = auto_model_refusal(backend, "auto").unwrap_or_else(|| panic!("{backend} auto must be refused"));
+            assert!(why.contains("only for harness") && why.contains("`noo models recommended`"), "{why}");
+            assert_eq!(auto_model_refusal(backend, "gemma4:e2b"), None, "{backend}: a named model is placed");
+        }
+        let (_, about) = crate::usage::lookup(&["cluster", "place"]).expect("cluster place usage");
+        assert!(about.contains("auto: harness only"), "the usage line says auto is harness only: {about:?}");
+    }
+
     #[test]
     fn the_kinds_come_from_the_shipped_table() {
         let kinds = harness_kind_names();
@@ -4076,5 +4201,73 @@ mod keep_warm_tests {
         assert!(keep_warm_line(Some(true), "gemma4:12b").unwrap().contains("warm (declared)"));
         assert!(keep_warm_line(Some(false), "gemma4:12b").unwrap().contains("cleared"));
         assert!(keep_warm_line(None, "gemma4:12b").is_none());
+    }
+}
+
+#[cfg(test)]
+mod place_json_tests {
+    use super::*;
+
+    /// A managed backend converges: `next` verifies the node, no warning.
+    /// A native one never does: `converges` false, the text's own warning.
+    #[test]
+    fn place_json_says_whether_the_placement_converges() {
+        let mut resp = serde_json::json!({ "ok": true, "warnings": ["tight"] });
+        place_json(&mut resp, "node_a", "vllm", false);
+        assert_eq!(resp["converges"], true);
+        assert_eq!(resp["next"], serde_json::json!([{ "kind": "command", "command": "noo cluster verify node_a --wait", "nodes": ["node_a"] }]));
+        assert!(resp.get("warning").is_none());
+        assert_eq!(resp["warnings"][0], "tight", "the gateway's fields stay");
+        let mut resp = serde_json::json!({ "ok": true });
+        place_json(&mut resp, "node_b", "ollama", true);
+        assert_eq!(resp["converges"], false);
+        assert_eq!(resp["warning"], native_placement_warning("node_b", "ollama").as_str());
+        assert_eq!(resp["next"], serde_json::json!([{ "kind": "command", "command": "noo cluster show node_b", "nodes": ["node_b"] }]));
+    }
+
+    /// One string for the human line and the --json `warning`.
+    #[test]
+    fn native_placement_warning_names_node_backend_and_the_consequence() {
+        assert_eq!(
+            native_placement_warning("node_b", "ollama"),
+            "node_b serves ollama NATIVELY — this agent reports it but does not start, stop or converge it, so this placement will not be applied"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ollama_tag_refusal_tests {
+    use super::*;
+
+    /// The gateway's 409 as `put_json_try` hands it over.
+    const CANNED: &str = "HTTP 409: {\"error\":\"node_a cannot pull gemma4:12b from the public registry (nodes pull models only from the controller's store); stage it first: `noo models fetch ollama:gemma4:12b`, then place again; --force places it anyway\",\"code\":\"ollama_tag_not_staged\",\"next\":[{\"kind\":\"command\",\"command\":\"noo models fetch ollama:gemma4:12b\"}]}";
+
+    /// Recognised by its code; its error and `next` are what prints.
+    #[test]
+    fn the_refusal_is_read_by_its_code_and_shows_next() {
+        let body = ollama_tag_refusal_body(CANNED).expect("the ollama tag refusal");
+        let (msg, cmds) = refusal_with_next_text(&body);
+        assert!(msg.starts_with("node_a cannot pull gemma4:12b from the public registry"), "{msg}");
+        assert_eq!(cmds, vec!["noo models fetch ollama:gemma4:12b".to_string()]);
+        assert_eq!(body["next"][0]["kind"], "command", "--json prints the body as is, next included");
+        // Not this refusal: another 409, the image refusal's text, a non-409.
+        assert!(ollama_tag_refusal_body("HTTP 409: {\"error\":\"x\",\"code\":\"other\"}").is_none());
+        assert!(ollama_tag_refusal_body("HTTP 409: {\"error\":\"image a:b for amd64 is not staged on the controller\"}").is_none());
+        assert!(ollama_tag_refusal_body(&CANNED.replacen("409", "500", 1)).is_none());
+        assert!(ollama_tag_refusal_body("connection refused").is_none());
+    }
+
+    /// The place command stops on it before the image-staging retry: the
+    /// refusal is printed once, never PUT again.
+    #[test]
+    fn place_does_not_retry_the_refusal() {
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let place = crate::test_src::fn_body(&own, "pub fn cluster_place(");
+        let check = place.find("if let Some(refusal) = ollama_tag_refusal_body(&e) {").expect("the place path reads the refusal");
+        let stop = place.find("place_refused_with_next(g.json, &refusal);").expect("and stops on it");
+        let retry = place.find("put_json(g, &place_path, &body, true, 10)").expect("the retry");
+        assert!(check < stop && stop < retry, "the refusal stops before the retry PUT");
+        let stops = crate::test_src::fn_body(&own, "fn place_refused_with_next(");
+        assert!(stops.contains("std::process::exit(ExitCode::RemoteError as i32);"), "it exits as a refusal does");
     }
 }

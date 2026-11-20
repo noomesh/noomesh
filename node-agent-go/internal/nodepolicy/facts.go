@@ -50,6 +50,10 @@ type Facts struct {
 	ComputeCaps    func() ([]string, error)
 	NvidiaRuntime  func(ctx context.Context) (bool, error)
 	DataRootFreeGB func() (float64, error)
+	// DockerEngine is the `docker_engine` fact (i1058): always a state
+	// (ok with the version, none, or unreadable with the error), never
+	// omitted by a wired agent, so absent means an agent that predates it.
+	DockerEngine func(ctx context.Context) map[string]any
 
 	mu     sync.Mutex
 	capVal string
@@ -113,6 +117,11 @@ func (f *Facts) Report(ctx context.Context) map[string]any {
 			slog.Debug("heartbeat omits data_root_free_gb", "error", err)
 		} else {
 			out["data_root_free_gb"] = math.Round(gb*10) / 10
+		}
+	}
+	if f.DockerEngine != nil {
+		if eng := f.DockerEngine(ctx); eng != nil {
+			out["docker_engine"] = eng
 		}
 	}
 	return out

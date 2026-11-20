@@ -909,10 +909,9 @@ const GROUP_GUIDANCE: &[(&[&str], &str)] = &[
    - After ANY scheduling call, only claim success if the tool response shows `verified: true` and a real `task_id`. If the tool was rejected (id collision, bad schedule, etc.), report the actual error message to the user — do NOT say "successfully queued" if the tool errored or you didn't call it at all."#),
     (&["coding"], r#"## Tool Notes: coding
 
-When asked to implement, fix, refactor, or write code: use `noo_coding_task`. The tool has an `engine` parameter:
-   - `engine="local"` (preferred for: prompt/skill tweaks, single-file config changes, small one-or-two-edit tasks). Free — runs the same Claude Code CLI but routed through the cluster's local LLM.
-   - `engine="claude"` (default; use for: multi-file refactors, adding features, fixing complex bugs, anything that needs tests). Costs API $; use when the local engine is likely to fail or has already failed.
-   - When in doubt for a small change, try `engine="local"` first. If the result fails verification (audit log shows tier mismatch or the change doesn't take effect), retry with `engine="claude"`."#),
+`noo_coding_task` no longer runs code in the cluster: it refuses every task (it only serves the history of past tasks). Coding is done by the operator's own Claude Code, connected through the operator door (`/mcp/operator`).
+   - When asked to implement, fix, refactor or write code: say that this assistant does not edit code, and describe the change for the operator: which files, what to change, how to check it.
+   - Never call `noo_coding_task` to change files, provision nodes or run commands: it refuses, and saying it succeeded would be false."#),
 ];
 
 /// The `TOOL_GROUPS` names `user_message` selects, by the same keyword rule
@@ -2053,7 +2052,9 @@ mod prompt_tier_tests {
         let both = group_guidance(&["jobs", "heartbeat"]);
         assert_eq!(both.matches("noo_activity_list").count(), heartbeat.matches("noo_activity_list").count(), "one block, once");
         let coding = group_guidance(&["coding"]);
-        assert!(coding.contains("noo_coding_task") && coding.contains("engine=\"claude\"") && !coding.contains("noo_schedule_task"));
+        assert!(coding.contains("noo_coding_task") && coding.contains("refuses every task") && !coding.contains("noo_schedule_task"));
+        // The engines it once took are gone: guidance that names them sends the model to a tool that refuses.
+        assert!(!coding.contains("engine="), "{coding}");
         assert_eq!(group_guidance(&[]), "");
         assert_eq!(group_guidance(&["rag", "graph"]), "");
     }

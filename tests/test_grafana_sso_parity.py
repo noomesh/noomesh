@@ -357,17 +357,24 @@ def test_a_stack_roll_recreates_grafana() -> None:
     """New grafana.ini / provisioning only load when the container is
     recreated: grafana.ini is a FILE bind mount, pinned to the inode it was
     created with, and Grafana reads data-source provisioning at start. The
-    roll (`noo upgrade --stack`) runs the launcher with no service names,
-    and that path force-recreates every service, grafana included."""
+    roll (`noo upgrade --stack`) runs the launcher with no service names
+    and --recreate, so that path force-recreates every service,
+    grafana included. A plain start recreates grafana too when grafana.ini or
+    its provisioning changed: both are inputs of its `noo.inputs` label
+    (scripts/noo-start-inputs.py: a file bind mount, a read-only config dir
+    under the install root)."""
     upgrade = (ROOT / "noo-cli" / "src" / "commands" / "upgrade.rs").read_text()
     # The launcher invocation lives in the launch phase of the roll.
     body = upgrade.split("fn launch_stack(", 1)[1].split("\n}\n", 1)[0]
-    assert '.arg(root.join("scripts/noomesh-start.sh")).arg("--dist")\n' in body, "the roll names no services"
+    assert '.arg(root.join("scripts/noomesh-start.sh")).arg("--dist").arg("--recreate")\n' in body, "the roll names no services"
     start = (ROOT / "scripts" / "noomesh-start.sh").read_text()
     full = start.split('if [ ${#SERVICES[@]} -eq 0 ]', 1)
     assert len(full) == 2, "the launcher's all-services branch moved — re-read it"
     all_branch = full[1].split("\nelse\n", 1)[0]
-    assert "up -d --force-recreate" in all_branch, "the all-services `up` must force-recreate"
+    assert "start_inputs_full_up $BUILD_FLAG" in all_branch, "the all-services `up` takes the force from the lib"
+    assert '.arg("--dist").arg("--recreate")' in body, "the roll asks the launcher to recreate every service"
+    lib = (ROOT / "scripts" / "lib-start-inputs.sh").read_text()
+    assert 'if [ "${START_RECREATE:-false}" = true ]; then\n        START_UP_FORCE="--force-recreate"' in lib
 
 
 # Grafana's calls home, each turned off (PR #692). Grafana 12.4

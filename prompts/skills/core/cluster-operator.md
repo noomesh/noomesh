@@ -8,7 +8,7 @@ trigger_keywords: [cluster, node, backend, gpu, vllm, ollama, llamacpp, deploy]
 priority: 5
 max_context_chars: 4000
 composable: true
-requires_tools: [noo_cluster_status, noo_inference, noo_models_pull, noo_models_cached]
+requires_tools: [noo_cluster_status, noo_inference]
 fitness: 0.0
 generation: 0
 parent_skill: null
@@ -25,14 +25,20 @@ You are managing the noomesh compute cluster. Apply these operational principles
 - Tier 3 (CPU only): Ollama CPU mode, suitable for small models only
 
 ## Backend Lifecycle
-- Use `noo_models_cached` to check what's already downloaded
-- Pre-cache models with `noo_models_pull` before starting backends
-- Backends auto-start on demand; prefer explicit start for production
-- Idle backends (>10min) are candidates for scaledown
+- `noo_models_cached` / `noo_models_pull` are not on the user door
+  (`/mcp/user`); without them, ask the operator to stage models
+- A backend runs where it is placed: `noo cluster place <node> <backend> <model>`
+  is desired state the node agent converges. A chat request does not start one
+- Idle scaledown (autonomy `backend_idle_scaledown`): a node under 5% load for
+  5 checks in a row (every 600 s by default, so ~50 min; the interval is the
+  location's `check_interval_seconds`) alerts. Only when armed
+  (`enabled_action: true`) does it stop that node's undeclared backends
 
 ## Troubleshooting
 - Node OFFLINE: check last heartbeat, network connectivity, Docker status
-- Node QUARANTINED: 3+ consecutive failures; investigate before unquarantining
+- Node QUARANTINED: offline for 3 consecutive autonomy checks. There is no
+  unquarantine command: the node's next accepted heartbeat sets it online.
+  Find why it stopped beating (`noo cluster verify <node>`)
 - Backend start failure: check VRAM availability, model compatibility, port conflicts
 - High latency: check node load, consider model quantization or smaller model
 
@@ -40,4 +46,4 @@ You are managing the noomesh compute cluster. Apply these operational principles
 - Single user: one backend is sufficient
 - Multiple concurrent users: consider scaling to 2 replicas
 - Always check available VRAM before scaling up
-- Pinned backends are exempt from idle scaledown
+- Placed (declared) backends are never stopped by idle scaledown, nor is the cluster's last running backend

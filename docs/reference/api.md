@@ -299,15 +299,23 @@ prompt this lets through can still be cut: it is then flagged as above.
 
 **A node restarting.** When a node's agent restarts (a roll, `noo upgrade
 --nodes`), it lets answers that are already streaming finish (up to 30 s)
-and refuses NEW calls with `503 {"error":{"code":"node_restarting"}}` and a
-`Retry-After` that covers the rest of the drain and the restart. You rarely
-see that answer:
+and answers NEW calls from the gateway with `503
+{"error":{"code":"node_restarting"}}` and a `Retry-After` that covers the
+rest of the drain and the restart. You rarely see a refusal for it:
 
 | your call | what happens |
 |---|---|
 | the class has another candidate | it is answered there at once (`fallback: true`) |
 | interactive (`/v1`, `/api/external`), no other candidate | the gateway waits the `Retry-After` (at most 30 s, never past your request's own deadline) and sends it again; you see a slower answer |
-| the node is still restarting after that, or too many calls already wait on it (32 per node) | `503`, code `node_restarting`, with the node's `Retry-After`: send it again after that |
+| the node is still restarting after that, or too many calls already wait on it (32 per node) | `503` with `{"error": {"message", "type": "node_restarting", "ref"}}` and the node's `Retry-After`: send it again after that |
+
+When the agent is back it registers again and keeps the lanes it offered
+before the restart, then reports its current ones about a second later. If a
+class is served only by nodes that have registered and not yet reported,
+the gateway waits for that report (at most 30 s) and answers. If nothing can
+serve the call after that, the answer is `503 backend_unavailable` with a
+`Retry-After`. A class with nothing to serve for any other reason is refused
+at once, with no `Retry-After`, as before.
 
 A non-streamed answer the node cut while it stopped is sent again whole by
 the gateway (nothing of it had reached you). A streamed answer still open
@@ -326,10 +334,20 @@ with that `ref` and, for `/api/external/*`, in the audit row
 (`noo_external_requests.trace_id` / `error`) — **operator-side only**:
 `GET /api/external/usage` returns the consumer its rows' `status_code` and
 `ref`, never the `error` column. Types: `model_not_found`
-(404 — no class, alias or served model by that name), `backend_unavailable`
+(404 — no class, alias or served model by that name; see below),
+`node_restarting` (503 with `Retry-After`, above), `backend_unavailable`
 (503 — nothing routable; 502 — every candidate failed), `backend_error`
 (the backend answered with a non-retryable status), `bad_request`
 (the message names the field).
+
+A `model_not_found` also carries OpenAI's `code` and `param`, and its
+message names the model you sent (control characters dropped, cut at 128
+characters) and where to list what is served:
+
+```json
+{"error": {"message": "model 'gemma9:1b' is not served: no model, class or alias by that name. GET /v1/models lists what is served (an operator: noo cluster class list)",
+  "type": "model_not_found", "code": "model_not_found", "param": "model", "ref": "ref-3f9c2b1e0a"}}
+```
 
 ### Reasoning models: thinking, budgets and structured output
 
@@ -440,6 +458,51 @@ items, `usage.input_tokens`/`output_tokens`). `stream: true` emits the
 Responses event sequence (`response.created` through `response.completed`).
 Hosted tools (`web_search`, …) are dropped.
 
+### Media in chat content parts
+
+Images go to a model **inline**, as a `data:` URL (base64). Since 0.6.29 the
+gateway refuses a content part that names a remote media URL (`http:`,
+`https:`, `file:`, or any other scheme): the model server would fetch the link
+itself, from inside the cluster's network. A gateway-side fetch through an
+outbound guard may come later; until then a link is refused, never fetched.
+
+**For people.** Send the image's bytes, not a link:
+`{"type": "image_url", "image_url": {"url": "data:image/png;base64,<data>"}}`.
+PNG, JPEG, WebP and GIF are accepted. A client that sent image links gets a
+`400 remote_media_url_refused` and must send the image inline instead.
+
+**For agents.** The rule applies on `/v1/chat/completions`, `/v1/responses`
+(native and translated), `/api/external/chat/completions`,
+`/api/external/inference` (`kind: chat`) and the harness wire translator
+(`/v1/chat/completions`, `/v1/messages`, `/v1/responses`), and again in the
+node agent's inference proxy (scheme check only).
+
+- A media URL is: `image_url` (`{url}` or a string), `input_image.image_url`,
+  `file_url`, `audio_url`, `video_url`, an Anthropic `source: {type: "url"}`,
+  the object named by a part's own `type` when it has a `url` (`file: {url}`),
+  and any `url` / `*_url` field of a part of any type. Nested parts
+  (`tool_result.content`, a Responses item's `content` / `output`) are walked.
+  Text, tool calls and parts without a URL pass as before.
+- Inline media must be `data:<type>;base64,<data>` (or an Anthropic `source:
+  {type: "base64", media_type, data}` on an `image` block), of type
+  `image/png`, `image/jpeg` (`image/jpg` accepted), `image/webp` or
+  `image/gif`; the base64 must decode, and the first bytes must be the
+  declared type's signature. At most 8 MiB decoded per part and 16 MiB per
+  request (the gateway's chat routes also cap the whole JSON body at 2 MiB).
+- Refusals, as `error.type` and `error.code`, with `error.next` (`[{"kind":
+  "action", "text": …}, {"kind": "doc", "doc": …}]`):
+
+| code | status | when |
+|---|---|---|
+| `remote_media_url_refused` | 400 | a media URL that is not `data:` |
+| `inline_media_type_refused` | 400 | a `data:` type outside the list above (audio and video included) |
+| `inline_media_invalid` | 400 | not base64, or the base64 does not decode |
+| `inline_media_type_mismatch` | 400 | the bytes are not the declared type |
+| `inline_media_too_large` | 413 | over 8 MiB a part or 16 MiB a request |
+
+The node agent answers `400` with `error.code: remote_media_url_refused`.
+Neither the answer nor the log line carries the URL or the data; the log
+names the code, the route and the part type.
 
 ## WebSocket
 
@@ -523,7 +586,7 @@ capped at 200 000 characters a turn. It is not the answer, which arrives as
 | GET | `/api/cluster/status` | nodes, backends, scheduler and knowledge-base summary |
 | GET | `/api/cluster/nodes` | the node registry (from the `mesh_nodes` KV bucket merged with the database) |
 | POST | `/api/cluster/nodes/register`, `/api/cluster/nodes/{id}/register` | node-agent registration (hostname, ip, tier, capabilities) |
-| POST | `/api/cluster/nodes/{id}/heartbeat` | node-agent heartbeat: `load`, `cpu_load`, `cpu_cores`, `ram_gb`, `mem_used_gb`, `gpu_model`, `vram_gb`, `vram_used_gb`, `running_backends`, `ip_address`; `404` tells the agent to re-register. The reply advertises `accept_encoding: ["gzip"]`, after which the agent sends `Content-Encoding: gzip` (signed as sent; decoded after auth, capped at 256 KiB like a plain body, `413` beyond) |
+| POST | `/api/cluster/nodes/{id}/heartbeat` | node-agent heartbeat: `load`, `cpu_load`, `cpu_cores`, `ram_gb`, `mem_used_gb`, `gpu_model`, `vram_gb` (one card), `vram_total_gb` and `gpu_vram_gb` (every card, summed and listed; omitted with `vram_gb` on a failed probe), `vram_used_gb`, `running_backends`, `ip_address`; `404` tells the agent to re-register. The reply advertises `accept_encoding: ["gzip"]`, after which the agent sends `Content-Encoding: gzip` (signed as sent; decoded after auth, capped at 256 KiB like a plain body, `413` beyond) |
 | DELETE | `/api/cluster/nodes/{id}/forget` | remove a node |
 | GET | `/api/cluster/nodes/{node_id}/desired-config` | what the node-agent reconciles against |
 | PUT | `/api/cluster/nodes/{node_id}/config` | set node config (`usage_profile`: `shared` \| `dedicated` \| null for the default) |
@@ -863,7 +926,7 @@ on the gateway's own). Broadcast is refused; a thread needs a seat.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET, POST | `/api/security/users`; PUT `…/{username}/password`; POST `…/disable`, `/role`, `/scopes`, `/org`, `/roles`, `/roles/revoke` | user management |
+| GET, POST | `/api/security/users`; PUT `…/{username}/password`; POST `…/disable`, `/role`, `/scopes`, `/org`, `/roles`, `/roles/revoke` | user management. `/role` takes `{role}` (`user`, `operator` or `admin`) (console/API only; no CLI verb yet), keeps the non-tier scopes, and refuses demoting yourself or the last enabled admin |
 | POST | `/api/security/users/{username}/erase` | right to be forgotten. Body `{dry_run?: bool (default **true**), keep_account?: bool}`: a bare call only previews the per-store row counts and the knowledge-base plan (personal documents go, shared ones are scrubbed). `dry_run: false` snapshots every matched row into the erasure archive and deletes it all in one transaction, removes the user's upload files (when nobody else uploaded the same bytes) and audits it (`user_erase`); `keep_account` wipes the data but keeps the login. Refused: a target above the caller's tier (`403`, also on the dry run), the configured operator account (`NOO_ADMIN_USER`/`NOO_OPERATOR_USER`, `400`), the last admin (unless `keep_account`). **`409` + `Retry-After`** while the account has a write-side [operation](#asynchronous-operations-routesopsrs) live or within its worker window; that refusal marks the account erase-pending, after which every new operation start for it is `423` (see *Erasing an account*). A refused erase is audited (`user_erase_refused`) |
 | GET | `/api/security/erasure-archive` | what the erase archive holds: row and run counts, the age of the oldest copy, the 30-day retention window (`retention_days`), and whether the daily purge is running (Operator+; an authenticated caller below Operator gets `403`, no credential `401`) |
 | GET, POST | `/api/security/users/{username}/links`; POST `/api/security/channel-links/unlink` | channel identity links |

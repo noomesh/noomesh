@@ -290,6 +290,7 @@ async fn user_create(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<CreateUserBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "creating an account").await?;
     let by = security_users_mutation_guard(&ctx)?.sub.clone();
     // the requested scopes decide the new account's tier
     // (`repo::users::create` derives `role` from them), so an unclamped
@@ -350,6 +351,7 @@ async fn user_set_password(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<PasswordBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "resetting an account's password").await?;
     let by = security_users_mutation_guard(&ctx)?.sub.clone();
     // a password reset is a full account takeover — and this statement
     // also clears `locked_until`, so it is the lockout bypass too.
@@ -380,6 +382,7 @@ async fn user_disable(
     Path(username): Path<String>,
     ctx: Option<Extension<RequesterCtx>>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "disabling an account").await?;
     let by = security_users_mutation_guard(&ctx)?.sub.clone();
     require_may_manage(&state.db, &ctx, &username).await?;
     require_not_last_admin(&state.db, &username, "disable").await?;
@@ -431,6 +434,7 @@ async fn user_set_scopes(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<SetScopesBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "changing an account's scopes").await?;
     let by = scope_mutation_guard(&ctx)?.sub.clone();
     require_may_manage(&state.db, &ctx, &username).await?;
     // Dropping `admin` here demotes the account (repo::users::set_scopes
@@ -476,6 +480,7 @@ async fn user_set_role(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<SetRoleBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "changing an account's role").await?;
     let by = scope_mutation_guard(&ctx)?.sub.clone();
     let username = username.trim().to_string();
     if username.is_empty() {
@@ -1162,6 +1167,7 @@ async fn user_erase(
     ctx: Option<Extension<RequesterCtx>>,
     body: Option<Json<EraseBody>>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "erasing an account's data").await?;
     let username = username.trim().to_string();
     if username.is_empty() {
         return Err(AppError::BadRequest("username is required".into()));
@@ -1421,8 +1427,10 @@ struct CreateOrgBody {
 async fn org_create(
     State(state): State<Arc<AppState>>,
     actor_ext: Option<Extension<AuthActor>>,
+    ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<CreateOrgBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "creating an org").await?;
     let id = body.id.trim();
     if id.is_empty() {
         return Err(AppError::BadRequest("org id is required".into()));
@@ -1464,6 +1472,7 @@ async fn user_set_org(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<SetOrgBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "moving an account to another org").await?;
     // the org is the top tenant boundary — moving an account across it
     // changes what that account can see.
     require_may_manage(&state.db, &ctx, &username).await?;
@@ -1516,6 +1525,7 @@ async fn user_link_create(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<LinkCreateBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "linking a channel sender to an account").await?;
     // a channel link makes an inbound chat identity resolve to this
     // account, so pointing one at an Admin is an impersonation primitive.
     require_may_manage(&state.db, &ctx, &username).await?;
@@ -1614,6 +1624,7 @@ async fn channel_link_delete(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<LinkDeleteBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "unlinking a channel sender").await?;
     let channel = body.channel.trim();
     let channel_user_id = body.channel_user_id.trim();
     if channel.is_empty() || channel_user_id.is_empty() {
@@ -1676,8 +1687,10 @@ async fn team_space_link(
     State(state): State<Arc<AppState>>,
     Path(team): Path<String>,
     actor_ext: Option<Extension<AuthActor>>,
+    ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<SpaceLinkBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "linking a space to a team").await?;
     let team = team.trim();
     let channel = body.channel.trim();
     let space_id = body.space_id.trim();
@@ -1740,8 +1753,10 @@ async fn team_spaces_list(
 async fn team_space_unlink(
     State(state): State<Arc<AppState>>,
     actor_ext: Option<Extension<AuthActor>>,
+    ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<SpaceLinkBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "unlinking a space from a team").await?;
     let channel = body.channel.trim();
     let space_id = body.space_id.trim();
     if channel.is_empty() || space_id.is_empty() {
@@ -1831,6 +1846,7 @@ async fn user_grant_roles(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<RolesBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "granting KB roles").await?;
     // KB roles decide which documents the account can read.
     require_may_manage(&state.db, &ctx, &username).await?;
     let requested: Vec<String> = body
@@ -1875,6 +1891,7 @@ async fn user_revoke_roles(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<RolesBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "revoking KB roles").await?;
     require_may_manage(&state.db, &ctx, &username).await?;
     let existing = crate::repo::kb_grants::get_roles(&state.db, &username).await?;
     let existing: Vec<String> = existing
@@ -2034,6 +2051,10 @@ async fn proposal_decide(
     } else {
         username.trim().to_string()
     };
+
+    // A user-management proposal is decided by a person (i1096): approve or deny, never an agent,
+    // so an agent cannot file an account change and then decide it. Filing stays open to agents.
+    if action != crate::task_guard::PROPOSAL_ACTION { crate::person_gate::require_person(&state.db, ctx.as_deref(), "deciding a user-management proposal").await?; }
 
     // A scheduled task that destroys data is a PERSON'S decision: approving one needs a credential
     // with no harness claim and no `act`, holding the role the task needs. The spec is classified
@@ -2564,6 +2585,7 @@ async fn service_key_issue(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<IssueKeyBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "issuing a service key").await?;
     if body.consumer.trim().is_empty() {
         return Err(AppError::BadRequest("consumer is required".into()));
     }
@@ -2863,6 +2885,7 @@ async fn service_key_retire(
     actor_ext: Option<Extension<AuthActor>>,
     ctx: Option<Extension<RequesterCtx>>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "retiring a service key").await?;
     require_may_manage_key_consumer(&state.db, &ctx, &consumer).await?;
 
     // The current key is the active one that is NOT superseded.
@@ -2932,6 +2955,7 @@ async fn service_key_revoke(
     actor_ext: Option<Extension<AuthActor>>,
     ctx: Option<Extension<RequesterCtx>>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "revoking a service key").await?;
     // revoking an Admin's bound key is a denial of service against that
     // account's MCP/inference access.
     require_may_manage_key_consumer(&state.db, &ctx, &consumer).await?;
@@ -2990,6 +3014,7 @@ async fn service_key_revoke_and_disable(
     actor_ext: Option<Extension<AuthActor>>,
     ctx: Option<Extension<RequesterCtx>>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "revoking a service key and disabling its account").await?;
     let consumer = consumer.trim().to_string();
     let bound: Option<(Option<String>,)> = sqlx::query_as(
         "SELECT user_id FROM noo_service_keys \
@@ -3068,6 +3093,7 @@ async fn service_key_rotate(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<RotateBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "rotating a service key").await?;
     validate_key_scopes(&body.scopes)?;
     // rotation mints a NEW bearer credential for whoever the key is
     // bound to, so it is an issue by another name.
@@ -3154,6 +3180,7 @@ async fn service_key_set_quota(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<QuotaBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "setting a service key's quota").await?;
     // throttling an Admin's key to 1 rpm is the same denial of service
     // as revoking it, one step slower.
     require_may_manage_key_consumer(&state.db, &ctx, &consumer).await?;
@@ -3187,19 +3214,6 @@ async fn service_key_set_quota(
     })))
 }
 
-/// A key's policy is set by a person: any other origin (a service key, a
-/// token exchanged from one, an add-on, a harness door, a delegated
-/// credential, an account that is gone or disabled) is 403. Keys never
-/// manage keys.
-fn person_sets_key_policy(origin: crate::task_guard::Origin) -> Result<(), AppError> {
-    match origin {
-        crate::task_guard::Origin::Person { .. } => Ok(()),
-        crate::task_guard::Origin::Agent { via, .. } => Err(AppError::Forbidden(format!(
-            "a key's context-overflow mode is set by a person, not by {via}"
-        ))),
-    }
-}
-
 #[derive(Deserialize)]
 struct ContextOverflowBody {
     mode: String,
@@ -3211,8 +3225,8 @@ struct ContextOverflowBody {
 /// operator 2026-11-15.
 ///
 /// Set by a person, never by a key: a service key, a token exchanged from
-/// one, a harness door or a delegated credential is refused 403
-/// ([`crate::task_guard::resolve_origin`]), so no key widens or narrows
+/// one, a harness door or a delegated credential is refused
+/// 403 `person_required` ([`crate::person_gate`]), so no key widens or narrows
 /// its own or another key's answer. The operator CLI's token is a person's.
 async fn service_key_set_context_overflow(
     State(state): State<Arc<AppState>>,
@@ -3221,7 +3235,7 @@ async fn service_key_set_context_overflow(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<ContextOverflowBody>,
 ) -> AppResult {
-    person_sets_key_policy(crate::task_guard::resolve_origin(&state.db, &ctx).await)?;
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "setting a key's context-overflow mode").await?;
     require_may_manage_key_consumer(&state.db, &ctx, &consumer).await?;
     let Some(mode) = crate::service_keys::ContextOverflow::parse(&body.mode) else {
         return Err(AppError::BadRequest(format!(
@@ -3513,6 +3527,13 @@ async fn enabled_admin_count(db: &sqlx::PgPool) -> Result<i64, AppError> {
     Ok(crate::repo::users::enabled_admin_count(db).await?)
 }
 
+/// The command the last-admin refusal tells the operator to run: the existing
+/// `set-scopes`, which REPLACES the scope set, so it names the account's
+/// current scopes plus `admin` (`noo security user list` shows them).
+/// `tests/test_last_admin_hint_names_a_cli_verb.py` holds it to the CLI.
+pub(crate) const LAST_ADMIN_PROMOTE_CMD: &str =
+    "noo security user set-scopes <user> --scope <its current scopes>... --scope admin; `noo security user list` shows its current scopes";
+
 /// The last-admin guard: refuse to disable, erase or demote the only enabled
 /// admin left.
 ///
@@ -3539,7 +3560,7 @@ async fn require_not_last_admin(
     if enabled_admin_count(db).await? <= 1 {
         return Err(AppError::Forbidden(format!(
             "refusing to {verb} '{username}': it is the last enabled admin account. \
-             Promote another account to admin first (noo security user set-role <user> admin)."
+             Promote another account to admin first ({LAST_ADMIN_PROMOTE_CMD})."
         )));
     }
     Ok(())
@@ -3771,6 +3792,7 @@ async fn api_users_disable(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<Value>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "disabling or re-enabling an account").await?;
     let by = users_admin_mutation_guard(&ctx)?.sub.clone();
     let username = body_str(&body, "username");
     let disabled = body.get("disabled").and_then(Value::as_bool);
@@ -4156,6 +4178,7 @@ async fn api_kb_rule(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<Value>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "setting a KB rule").await?;
     let updated_by = ctx
         .as_ref()
         .map(|Extension(r)| r.sub.clone())
@@ -4297,6 +4320,7 @@ async fn api_kb_teams_create(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<Value>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "creating a team").await?;
     let raw_name = body_str(&body, "name");
     let trimmed = raw_name.trim();
     let name = trimmed.strip_prefix("team:").unwrap_or(trimmed).to_string();
@@ -4356,6 +4380,7 @@ async fn api_kb_teams_delete(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<Value>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "deleting a team (legacy route)").await?;
     let force = body.get("force").and_then(Value::as_bool).unwrap_or(false);
     team_delete_inner(&state, &body_str(&body, "name"), force, &ctx).await
 }
@@ -4372,6 +4397,7 @@ async fn security_team_delete(
     axum::extract::Query(q): axum::extract::Query<TeamDeleteQuery>,
     ctx: Option<Extension<RequesterCtx>>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "deleting a team").await?;
     team_delete_inner(&state, &team, q.force, &ctx).await
 }
 
@@ -5632,7 +5658,7 @@ pub(crate) mod tests {
             ("async fn service_key_rotate(", &["require_may_manage_key_consumer("]),
             ("async fn service_key_revoke(", &["require_may_manage_key_consumer("]),
             ("async fn service_key_set_quota(", &["require_may_manage_key_consumer("]),
-            ("async fn service_key_set_context_overflow(", &["person_sets_key_policy(crate::task_guard::resolve_origin(&state.db, &ctx).await)?;", "require_may_manage_key_consumer("]),
+            ("async fn service_key_set_context_overflow(", &["crate::person_gate::require_person(", "require_may_manage_key_consumer("]),
             ("async fn proposal_decide(", &["require_may_grant_value(", "require_may_manage("]),
             ("async fn api_users_disable(", &["require_may_manage(", "require_not_last_admin("]),
         ];
@@ -5996,40 +6022,5 @@ mod key_cache_invalidation_tests {
         assert!(got.is_some_and(|c| c.name == consumer), "a just-issued key is unknown until the snapshot expires");
         // No cleanup statement: the consumer is unique per run in a scratch
         // database, and a query here would raise this file's repo ratchet.
-    }
-}
-
-/// Keys never manage keys (i802 opt-in, operator 2026-11-15): who may set a
-/// key's context-overflow mode.
-#[cfg(test)]
-mod key_policy_setter_tests {
-    use super::person_sets_key_policy;
-    use crate::auth::{Actor, RequesterCtx, Role};
-    use crate::task_guard::origin_of_requester;
-
-    fn ctx(sub: &str, harness: Option<&str>, act: Option<&str>) -> RequesterCtx {
-        RequesterCtx {
-            sub: sub.into(),
-            scopes: vec!["admin".into()],
-            role: Role::Admin,
-            harness: harness.map(str::to_string),
-            act: act.map(|a| Actor { sub: a.into(), iss_user: None, task: None, feature: None }),
-        }
-    }
-
-    #[test]
-    fn a_person_sets_it_and_no_key_or_agent_does() {
-        assert!(person_sets_key_policy(origin_of_requester(Some(&ctx("owner", None, None)))).is_ok(), "the operator, CLI or console");
-        for (who, c) in [
-            ("a token exchanged from a key", ctx("owner", None, Some("key:paiserve"))),
-            ("an add-on's exchanged token", ctx("addon:example", None, None)),
-            ("a service identity", ctx("svc:grafana", None, None)),
-            ("a harness door", ctx("owner", Some("claude-code"), None)),
-            ("a delegated credential", ctx("owner", None, Some("worker:run-1"))),
-        ] {
-            let refused = person_sets_key_policy(origin_of_requester(Some(&c)));
-            assert!(matches!(refused, Err(crate::routes::AppError::Forbidden(_))), "{who} must be refused");
-        }
-        assert!(person_sets_key_policy(origin_of_requester(None)).is_err(), "a bare service key carries no requester");
     }
 }

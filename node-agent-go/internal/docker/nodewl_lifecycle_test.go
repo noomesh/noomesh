@@ -601,7 +601,7 @@ func TestAReadyLeafAndAnUnreachableRailEndAsImageUnavailable(t *testing.T) {
 	if !h.p.LeafReady(e.Addon, e.Name) {
 		t.Fatal("the harness's door leaf must be ready for this case")
 	}
-	h.p.fetchTar = func(context.Context, string) (string, func(), error) {
+	h.p.fetchTar = func(context.Context, string, string) (string, func(), error) {
 		return "", nil, errors.New(`Get "https://noo-controller:8443/images/w.tar": dial tcp 172.31.250.10:8443: connect: connection refused`)
 	}
 	h.p.Converge(context.Background(), e)

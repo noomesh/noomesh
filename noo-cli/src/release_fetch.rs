@@ -379,6 +379,97 @@ pub(crate) fn classify_gh_stderr(stderr: &str) -> FetchClass {
     FetchClass::Other
 }
 
+/// The segment docker's classic pull path prints before the registry's HTTP
+/// status (docker/distribution `registry/client`, `UnexpectedHTTPStatusError`:
+/// `"received unexpected HTTP status: " + resp.Status`, e.g. `500 Internal
+/// Server Error`: the line a real ghcr 500 printed during a stack restart).
+const DOCKER_STATUS_SEGMENT: &str = "received unexpected HTTP status";
+/// The containerd image store's form of the same thing (containerd
+/// `core/remotes/errors`, `ErrUnexpectedStatus`: `unexpected status from
+/// <METHOD> request to <URL>: <status>`), which docker 28's containerd path
+/// passes through (`daemon/containerd/registry_errors.go`).
+const CONTAINERD_STATUS_SEGMENT: (&str, &str) = ("unexpected status from ", " request to ");
+/// Whole `: `-separated segments that mean the registry was not reached, as
+/// Go prints them (each read in GOROOT): `internal/poll`
+/// `DeadlineExceededError` ("i/o timeout", a dial or read deadline), the
+/// errno strings of ECONNRESET and ECONNREFUSED (`syscall/zerrors_linux_*`),
+/// `net/http`'s `tlsHandshakeTimeoutError` ("net/http: TLS handshake
+/// timeout", split here as `net/http` + this) and `context`'s
+/// `deadlineExceededError`.
+const DOCKER_NETWORK_SEGMENTS: &[&str] = &[
+    "i/o timeout",
+    "connection reset by peer",
+    "connection refused",
+    "TLS handshake timeout",
+    "context deadline exceeded",
+];
+/// `net/http`'s client timeout, appended to the request's error
+/// (`client.go`: `" (Client.Timeout exceeded while awaiting headers)"`).
+const DOCKER_CLIENT_TIMEOUT_SUFFIX: &str = "(Client.Timeout exceeded while awaiting headers)";
+/// The registry's own error codes as docker prints them (`<code>: <message>`,
+/// distribution `registry/api/errcode`: the code lowercased, `_` as a
+/// space). `unavailable` is the registry's 503; `toomanyrequests` its 429.
+const DOCKER_REGISTRY_CODES: &[(&str, FetchClass)] = &[
+    ("toomanyrequests", FetchClass::RateLimited),
+    ("unavailable", FetchClass::Server),
+    ("unauthorized", FetchClass::Auth),
+    ("denied", FetchClass::Auth),
+    ("manifest unknown", FetchClass::NotFound),
+    ("name unknown", FetchClass::NotFound),
+];
+
+/// The HTTP status at the head of a status segment: three digits, then a
+/// space or the end (`500 Internal Server Error`, `503`). Anything else
+/// (`5000`, `500MB`, a digest) is not a status. Pure.
+fn http_status_at(seg: &str) -> Option<u16> {
+    let b = seg.as_bytes();
+    if b.len() < 3 || !b[..3].iter().all(u8::is_ascii_digit) || (b.len() > 3 && b[3] != b' ') {
+        return None;
+    }
+    seg[..3].parse::<u16>().ok().filter(|s| (100..=599).contains(s))
+}
+
+/// Classify a failed `docker pull`'s stderr: `(class, the registry's HTTP
+/// status when docker printed one)`. The docker CLI is the only signal, so
+/// this reads its error FORMAT, never a substring of the whole text: each
+/// line is split into Go's `: `-joined error segments, a status is read only
+/// from the segment right after [`DOCKER_STATUS_SEGMENT`] (or containerd's
+/// `unexpected status from … request to …`) and classed by its number through
+/// [`classify_status`], and a network failure only from a whole segment in
+/// [`DOCKER_NETWORK_SEGMENTS`]. A "500" anywhere else (a digest, a size) is
+/// nothing. A refusal (401/403/404, `denied`, `manifest unknown`) wins over a
+/// transient line; anything unrecognised is `Other`, which is never retried
+/// (a digest mismatch reads that way). Pure.
+pub(crate) fn classify_docker_pull(stderr: &str) -> (FetchClass, Option<u16>) {
+    let mut transient: Option<(FetchClass, Option<u16>)> = None;
+    for line in stderr.lines() {
+        let segs: Vec<&str> = line.split(": ").map(str::trim).collect();
+        for (i, seg) in segs.iter().enumerate() {
+            let (pre, mid) = CONTAINERD_STATUS_SEGMENT;
+            let is_status = *seg == DOCKER_STATUS_SEGMENT || (seg.starts_with(pre) && seg.contains(mid));
+            let hit = if is_status {
+                segs.get(i + 1).and_then(|s| http_status_at(s)).map(|code| {
+                    let class = classify_status(code, &|_| None, 0).map_or(FetchClass::Other, |(c, _)| c);
+                    (class, Some(code))
+                })
+            } else if DOCKER_NETWORK_SEGMENTS.contains(seg) || seg.ends_with(DOCKER_CLIENT_TIMEOUT_SUFFIX) {
+                Some((FetchClass::Network, None))
+            } else if i + 1 < segs.len() {
+                // A registry code is a segment with its message after it.
+                DOCKER_REGISTRY_CODES.iter().find(|(code, _)| code == seg).map(|(_, c)| (*c, None))
+            } else {
+                None
+            };
+            match hit {
+                Some((c, s)) if !c.transient() && c != FetchClass::Other => return (c, s),
+                Some(h) if transient.is_none() && h.0.transient() => transient = Some(h),
+                _ => {}
+            }
+        }
+    }
+    transient.unwrap_or((FetchClass::Other, None))
+}
+
 /// The informative part of gh's stderr: non-empty lines, joined, capped.
 pub(crate) fn gh_reason(stderr: &str) -> String {
     let s: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
@@ -862,5 +953,106 @@ mod tests {
             Some((FetchClass::RateLimited, Some(Duration::from_secs(30)))),
             "GitHub's secondary limit is a 403 with Retry-After"
         );
+    }
+}
+
+#[cfg(test)]
+mod docker_pull_tests {
+    use super::{classify_docker_pull, FetchClass};
+
+    /// The registry's 5xx, read from docker's status segment by number, is
+    /// transient (the 2026-11-19 ghcr 500 is the first line, verbatim).
+    #[test]
+    fn a_registry_5xx_is_transient() {
+        for (line, code) in [
+            ("Error response from daemon: received unexpected HTTP status: 500 Internal Server Error", 500),
+            ("Error response from daemon: received unexpected HTTP status: 502 Bad Gateway", 502),
+            ("Error response from daemon: received unexpected HTTP status: 503 Service Unavailable", 503),
+            ("Error response from daemon: received unexpected HTTP status: 504 Gateway Timeout", 504),
+            (
+                "Error response from daemon: unknown: unexpected status from HEAD request to https://ghcr.io/v2/o/harrier/manifests/sha256:0a1b: 503 Service Unavailable",
+                503,
+            ),
+        ] {
+            let (class, status) = classify_docker_pull(line);
+            assert_eq!(status, Some(code), "{line}");
+            assert_eq!(class, FetchClass::Server, "{line}");
+            assert!(class.transient(), "{line}");
+        }
+    }
+
+    /// A refusal is final: 401/403/404 by number, and the registry's own
+    /// codes for them.
+    #[test]
+    fn a_registry_4xx_is_fatal() {
+        for (line, want) in [
+            ("Error response from daemon: received unexpected HTTP status: 401 Unauthorized", FetchClass::Auth),
+            ("Error response from daemon: received unexpected HTTP status: 403 Forbidden", FetchClass::Auth),
+            ("Error response from daemon: received unexpected HTTP status: 404 Not Found", FetchClass::NotFound),
+            ("Error response from daemon: Head \"https://ghcr.io/v2/o/harrier/manifests/sha256:0a1b\": unauthorized: authentication required", FetchClass::Auth),
+            ("Error response from daemon: denied: requested access to the resource is denied", FetchClass::Auth),
+            ("Error response from daemon: manifest for ghcr.io/o/harrier@sha256:0a1b not found: manifest unknown: manifest unknown", FetchClass::NotFound),
+        ] {
+            let (class, _) = classify_docker_pull(line);
+            assert_eq!(class, want, "{line}");
+            assert!(!class.transient(), "{line}");
+        }
+    }
+
+    /// 429 is transient (the same bounded backoff: docker hides any
+    /// Retry-After), by number or by the registry's `toomanyrequests`.
+    #[test]
+    fn a_rate_limit_is_transient() {
+        for line in [
+            "Error response from daemon: received unexpected HTTP status: 429 Too Many Requests",
+            "Error response from daemon: toomanyrequests: retry-after: 1.2ms, allowed: 44000/minute",
+        ] {
+            let (class, _) = classify_docker_pull(line);
+            assert_eq!(class, FetchClass::RateLimited, "{line}");
+            assert!(class.transient(), "{line}");
+        }
+    }
+
+    /// A registry not reached: Go's own error strings, as whole segments.
+    #[test]
+    fn a_timeout_or_reset_is_transient() {
+        for line in [
+            "Error response from daemon: Head \"https://ghcr.io/v2/o/harrier/manifests/sha256:0a1b\": dial tcp 192.0.2.7:443: i/o timeout",
+            "Error response from daemon: Get \"https://ghcr.io/v2/\": read tcp 192.0.2.1:50312->192.0.2.7:443: read: connection reset by peer",
+            "Error response from daemon: Get \"https://ghcr.io/v2/\": dial tcp 192.0.2.7:443: connect: connection refused",
+            "Error response from daemon: Get \"https://ghcr.io/v2/\": net/http: TLS handshake timeout",
+            "Error response from daemon: Get \"https://ghcr.io/v2/\": context deadline exceeded",
+            "Error response from daemon: Get \"https://ghcr.io/v2/\": net/http: request canceled while waiting for connection (Client.Timeout exceeded while awaiting headers)",
+        ] {
+            let (class, status) = classify_docker_pull(line);
+            assert_eq!((class, status), (FetchClass::Network, None), "{line}");
+        }
+    }
+
+    /// The substring trap: "500" (or a timeout word) elsewhere in the text is
+    /// not a status. Each of these would have retried under contains("500").
+    #[test]
+    fn a_500_elsewhere_is_not_transient() {
+        for line in [
+            "Error response from daemon: manifest for ghcr.io/o/harrier@sha256:500500aa not found: manifest unknown: manifest unknown",
+            "failed to register layer: write /var/lib/docker/500/harrier-Q4_K_M.gguf: no space left on device",
+            "Error response from daemon: received unexpected HTTP status: 5000 Odd",
+            "Error response from daemon: received unexpected HTTP status: 500MB",
+            "pulling 500 MB failed: filesystem layer verification failed for digest sha256:5005",
+            "failed commit on ref \"layer-sha256:500a\": unexpected commit digest sha256:500b, expected sha256:500a: failed precondition",
+            "the request timed out after 500 ms with an i/o timeout somewhere",
+            "",
+        ] {
+            let (class, _) = classify_docker_pull(line);
+            assert!(!class.transient(), "{line:?} read as {class:?}");
+        }
+    }
+
+    /// A refusal on one line wins over a transient one on another.
+    #[test]
+    fn a_refusal_beats_a_transient_line() {
+        let s = "Error response from daemon: Get \"https://ghcr.io/v2/\": dial tcp 192.0.2.7:443: i/o timeout\n\
+                 Error response from daemon: received unexpected HTTP status: 403 Forbidden";
+        assert_eq!(classify_docker_pull(s), (FetchClass::Auth, Some(403)));
     }
 }

@@ -13,7 +13,8 @@
 # THIS repo, which is what lets ci.yml's `credentials:` block read it with
 # the ordinary GITHUB_TOKEN — no PAT involved.
 #
-# Run it by hand: `gh workflow run mirror-images.yml -R noomesh/noomesh --ref <ref>`.
+# Run it by hand: `gh workflow run mirror-images.yml -R noomesh/noomesh --ref <ref>`
+# (a read-only PLAN, the default), then `... -f mode=copy` to copy.
 # workflow_dispatch runs the file as it is on the ref it is dispatched from
 # (the default branch when --ref is omitted), so the release cutter dispatches
 # from the ref that carries the new lanes (dev, before an rc), not by waiting
@@ -21,20 +22,63 @@
 # push or schedule trigger: this workflow holds registry credentials and
 # pushes packages, so it starts only on a deliberate dispatch. Mirrored tags
 # are stable majors; refreshes are rare and deliberate.
+#
+# A dispatch only ever ADDS or FAILS (2026-11-19). `imagetools create --tag`
+# re-points the destination TAG at the file's digest, so a lane whose digest
+# differs from what the GHCR tag holds would silently move a tag someone may
+# pull by tag. The `plan` job (the default mode, read-only, no packages:write)
+# prints every lane's dest, pinned source digest, the tag's current digest and
+# the action (copy / skip / FAIL: scripts/mirror-plan.py, which parses this
+# file's matrix). `mode=copy` runs the copy job, whose per-lane guard copies an
+# ABSENT tag, skips one already at the source digest and FAILS a lane whose
+# tag holds another digest: it never overwrites. Moving a tag on purpose is a
+# deliberate act outside this workflow (delete the version, then copy).
 name: mirror images
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "plan = read-only table of what a copy would do; copy = add absent mirrors (never moves a tag)"
+        type: choice
+        options: [plan, copy]
+        default: plan
 
 permissions:
   contents: read
-  packages: write
+
+# Two dispatches never race between one's guard and the other's copy.
+concurrency:
+  group: mirror-images
+  cancel-in-progress: false
 
 jobs:
+  # Read-only: anonymous registry reads (a private package is re-read with
+  # this token, packages: read). Runs in both modes, before any write.
+  plan:
+    if: github.repository == 'noomesh/noomesh'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout   # actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Plan every lane (read-only)
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: python3 scripts/mirror-plan.py --summary "$GITHUB_STEP_SUMMARY"
+
   mirror:
     # Skipped outside the canonical repo: a fork has neither the DHI token nor
-    # the right to push to ghcr.io/noomesh.
-    if: github.repository == 'noomesh/noomesh'
+    # the right to push to ghcr.io/noomesh. Only an explicit `mode=copy`
+    # reaches it. It runs after the plan even when the plan found a FAIL lane:
+    # each lane's own guard refuses it, and the add-only lanes still land.
+    needs: plan
+    if: ${{ !cancelled() && github.repository == 'noomesh/noomesh' && inputs.mode == 'copy' }}
+    permissions:
+      contents: read
+      packages: write
     # Cloud runner on purpose: mirroring is pull-from-Hub + push-to-GHCR,
     # pure network I/O with no cache to reuse.
     runs-on: ubuntu-latest
@@ -75,6 +119,28 @@ jobs:
           - source: python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159
             dest: python:3.12-slim
             auth: hub
+
+          # ── Docker Hub RUNTIME images the stack runs (2026-11-19) ──────
+          # nats (the controller's bus) and nginx (the model-cache weight
+          # server) are the last two compose images pulled from Docker Hub.
+          # These lanes copy the official images BY DIGEST to
+          # ghcr.io/noomesh/<name>:<tag> (the PUBLIC upstream family, not
+          # dhi/). nats is the digest compose pins today; nginx is 1.30.7
+          # (1.27 is EOL; 1.30.7 carries the 2026-11-18 advisory fixes), the
+          # version compose moves to separately. Nothing runs the mirror yet: a later
+          # change points compose and the lock at it, once these packages are
+          # public and an anonymous pull is confirmed. From then the signed
+          # lock refuses a mirror digest that is not this source's
+          # (scripts/stack-lock-third-party.py). Bumping one: change the
+          # source here AND the compose default together. The windows/amd64
+          # entry of the nats index carries ordinary (distributable) layers,
+          # no foreign ones: the full index copies, digest unchanged.
+          - source: nats:2.14.9@sha256:f0e72e96696382cc1e5bc637befd3177bb2d5b07c37fb507f8edd09827a342a3
+            dest: nats:2.14.9
+            dest_org: noomesh
+          - source: nginx:1.30.7-alpine@sha256:caf4e1e032a20f9c3c5e28fc7f25ffd768ad8677b4975c54193075997b3a97e3
+            dest: nginx:1.30.7-alpine
+            dest_org: noomesh
 
           # ── dhi.io (runtime services) ────────────────────────────────
           # Three TLS-handshake timeouts against dhi.io on 2026-08-17
@@ -255,6 +321,45 @@ jobs:
           [ "${{ matrix.auth }}" = "dhi" ] && registry=dhi.io
           echo "$DHI_TOKEN" | docker login "$registry" -u "$DHI_USERNAME" --password-stdin
 
+      # ADD OR FAIL: read the destination tag's index digest the way the
+      # provenance step below does ({{json .Manifest.Digest}}). Absent ->
+      # copy; already the source digest -> skip the copy (no-op); any other
+      # digest -> fail this lane, never overwrite. A read that is neither a
+      # digest nor "not found" (auth, network) also fails: only a confirmed
+      # absence is copied over.
+      - name: Refuse to move an existing mirror tag
+        id: guard
+        run: |
+          dest_org="${{ matrix.dest_org || github.repository_owner }}"
+          dst="ghcr.io/${dest_org}/${{ matrix.dest }}"
+          src="${{ matrix.source }}"
+          case "$src" in
+            *@sha256:*) want="${src##*@}" ;;
+            *) echo "::error::$src is not pinned by digest: the mirror copies by digest, never a moving tag"; exit 1 ;;
+          esac
+          for attempt in 1 2 3; do
+            if out="$(docker buildx imagetools inspect "$dst" --format '{{json .Manifest.Digest}}' 2>&1)"; then
+              have="$(printf '%s' "$out" | tr -d '"[:space:]')"
+              if [ "$have" = "$want" ]; then
+                echo "$dst already is $want: skip the copy"
+                echo "action=skip" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "::error::$dst holds $have, but this lane copies $want: refusing to move an existing tag (someone may pull it by tag). Move it deliberately, outside this workflow."
+              exit 1
+            fi
+            case "$out" in
+              *": not found"*)
+                echo "$dst is absent: copy (add)"
+                echo "action=copy" >> "$GITHUB_OUTPUT"
+                exit 0 ;;
+            esac
+            echo "::warning::reading $dst failed (attempt ${attempt}/3): $out"
+            sleep $((15 * attempt))
+          done
+          echo "::error::could not read $dst: not proven absent, so not copied"
+          exit 1
+
       # imagetools COPIES THE MANIFEST LIST — every architecture the source
       # publishes survives. The previous `pull && tag && push` resolved to
       # the RUNNER's architecture and pushed a single-arch image, which
@@ -262,6 +367,7 @@ jobs:
       # image for them. Copying by digest-list also avoids re-uploading
       # layers GHCR already has.
       - name: Mirror ${{ matrix.source }} → GHCR (multi-arch manifest copy)
+        if: steps.guard.outputs.action == 'copy'
         run: |
           dest_org="${{ matrix.dest_org || github.repository_owner }}"
           # Bounded retry with growing backoff: a transient 429 from either
@@ -299,3 +405,25 @@ jobs:
             diff "$RUNNER_TEMP/src.txt" "$RUNNER_TEMP/dst.txt" || true
             exit 1
           fi
+
+      # Provenance: the copy is a manifest copy BY DIGEST, so the mirror's
+      # index digest IS the source's (the dhi lanes rely on the same: compose
+      # pins ghcr.io/noomesh/dhi/* at the dhi.io source digests). Anything
+      # that pins the mirror pins it at the source digest written above; a
+      # mirror under any other digest (a re-wrapped index, a moved tag copied
+      # instead of the pinned digest) would make every pin wrong. Fail here.
+      - name: Verify the mirror digest equals the source digest
+        run: |
+          dest_org="${{ matrix.dest_org || github.repository_owner }}"
+          src="${{ matrix.source }}"
+          case "$src" in
+            *@sha256:*) want="${src##*@}" ;;
+            *) echo "::error::$src is not pinned by digest: the mirror copies by digest, never a moving tag"; exit 1 ;;
+          esac
+          got="$(docker buildx imagetools inspect "ghcr.io/${dest_org}/${{ matrix.dest }}" \
+                   --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          if [ "$got" != "$want" ]; then
+            echo "::error::ghcr.io/${dest_org}/${{ matrix.dest }} is $got, but its source is $want"
+            exit 1
+          fi
+          echo "ghcr.io/${dest_org}/${{ matrix.dest }} = $want (the source's digest)"

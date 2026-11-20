@@ -38,19 +38,25 @@ M = _mod()
 COMPOSE = (ROOT / "docker-compose.cluster.yml").read_text()
 
 
+NGX = M.NS + "/nginx"   # ghcr.io/noomesh/nginx: our mirror of the official image
+ORG = M.NS.removeprefix("ghcr.io/")
+
+
 def test_compose_names_one_fixed_nginx_version():
     v = M.compose_version("nginx", COMPOSE)
     assert re.fullmatch(r"[0-9][A-Za-z0-9._-]*", v), v
 
 
 @pytest.mark.parametrize("text, why", [
-    ("    image: ${NGINX_IMAGE:-nginx:latest${NOO_IMAGE_DIGEST_NGINX:-}}\n", "latest"),
-    ("    image: ${NGINX_IMAGE:-nginx:1.0.0${NOO_IMAGE_DIGEST_NGINX:-}}\n"
-     "    image: ${NGINX_IMAGE:-nginx:1.0.0}\n", "carry the"),
-    ("    image: ${NGINX_IMAGE:-nginx:1.0.0${NOO_IMAGE_DIGEST_NGINX:-}}\n"
-     "    image: ${NGINX_IMAGE:-nginx:1.0.1${NOO_IMAGE_DIGEST_NGINX:-}}\n", "several versions"),
-    ("    image: nginx:latest\n", "no compose service"),
-    ("    image: nginx:1.27-alpine\n", "no compose service"),
+    ("    image: ${NGINX_IMAGE:-" + NGX + ":latest${NOO_IMAGE_DIGEST_NGINX:-}}\n", "latest"),
+    ("    image: ${NGINX_IMAGE:-" + NGX + ":1.0.0${NOO_IMAGE_DIGEST_NGINX:-}}\n"
+     "    image: ${NGINX_IMAGE:-" + NGX + ":1.0.0}\n", "carry the"),
+    ("    image: ${NGINX_IMAGE:-" + NGX + ":1.0.0${NOO_IMAGE_DIGEST_NGINX:-}}\n"
+     "    image: ${NGINX_IMAGE:-" + NGX + ":1.0.1${NOO_IMAGE_DIGEST_NGINX:-}}\n", "several versions"),
+    ("    image: " + NGX + ":latest\n", "no compose service"),
+    ("    image: " + NGX + ":1.30.7-alpine\n", "no compose service"),
+    # the Docker Hub spelling is not the image the lock pins any more
+    ("    image: nginx:1.30.7-alpine${NOO_IMAGE_DIGEST_NGINX:-}\n", "no compose service"),
 ])
 def test_a_compose_file_the_lock_cannot_pin_is_refused(text, why):
     with pytest.raises(M.LockError, match=why):
@@ -58,18 +64,130 @@ def test_a_compose_file_the_lock_cannot_pin_is_refused(text, why):
 
 
 def test_rows_writes_a_lock_row_from_the_resolved_digest(tmp_path, monkeypatch, capsys):
+    # An upstream (non-mirror) row: resolved where compose pulls it, no gates.
     seen = []
     monkeypatch.setattr(M, "resolve", lambda ref: seen.append(ref) or D)
+    monkeypatch.setattr(M, "anonymous_digest", lambda repo, d: pytest.fail(f"{repo} is no mirror row"))
     compose = tmp_path / "c.yml"
-    compose.write_text("    image: ${NGINX_IMAGE:-nginx:9.9.9${NOO_IMAGE_DIGEST_NGINX:-}}\n")
-    assert M.main(["rows", "--out", str(tmp_path / "digests"), "--compose", str(compose), "--only", "nginx"]) == 0
-    assert seen == ["docker.io/library/nginx:9.9.9"]
-    assert (tmp_path / "digests" / "nginx").read_text() == f"nginx@{D}\n"
+    compose.write_text("    image: ${VLLM_IMAGE:-vllm/vllm-openai:v9.9.9${NOO_IMAGE_DIGEST_VLLM:-}}\n")
+    assert M.main(["rows", "--out", str(tmp_path / "digests"), "--compose", str(compose), "--only", "vllm"]) == 0
+    assert seen == ["docker.io/vllm/vllm-openai:v9.9.9"]
+    assert (tmp_path / "digests" / "vllm").read_text() == f"vllm@{D}\n"
+
+
+# ── mirror rows: provenance + anonymous gates, ON for nats and nginx ───────
+
+def test_the_gates_are_on_for_nats_and_nginx():
+    # nats/nginx resolve from OUR mirror; nothing else is a direct child of
+    # the release namespace (the DHI rows are nested).
+    assert M.THIRD_PARTY["nats"]["repo"] == M.NS + "/nats"
+    assert M.THIRD_PARTY["nginx"]["repo"] == NGX
+    assert sorted(n for n in M.THIRD_PARTY if M.mirror_org(n)) == ["nats", "nginx"]
+    assert M.mirror_org("nats") == M.mirror_org("nginx") == ORG
+    assert M.mirror_org("redis") is None, "the nested dhi/ family is not a mirror row"
+    assert M.mirror_org("vllm") is None
+
+
+@pytest.fixture
+def mirrored_nginx(monkeypatch):
+    """nginx as declared: compose and repo under our mirror; the anonymous read stubbed."""
+    assert M.THIRD_PARTY["nginx"]["repo"] == NGX
+    anon = []
+    monkeypatch.setattr(M, "anonymous_digest", lambda repo, d: anon.append((repo, d)) or ("present", d))
+    return anon
+
+
+def _mirror_wf(tmp_path, *lanes):
+    body = "".join(f"          - source: {s}\n            dest: {d}\n" + (f"            dest_org: {o}\n" if o else "")
+                   for s, d, o in lanes)
+    wf = tmp_path / "mirror-images.yml"
+    wf.write_text("jobs:\n  mirror:\n    strategy:\n      matrix:\n        include:\n" + body + "    steps:\n"
+                  "      - name: x\n        run: |\n          dest: nginx:9.9.9\n")
+    return wf
+
+
+def _rows(tmp_path, wf):
+    compose = tmp_path / "c.yml"
+    compose.write_text("    image: ${NGINX_IMAGE:-" + NGX + ":9.9.9${NOO_IMAGE_DIGEST_NGINX:-}}\n")
+    return M.main(["rows", "--out", str(tmp_path / "d"), "--compose", str(compose),
+                   "--mirror-workflow", str(wf), "--only", "nginx"])
+
+
+def test_a_mirror_row_is_gated(mirrored_nginx, tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(M, "resolve", lambda ref: seen.append(ref) or D)
+    assert M.mirror_org("nginx") == ORG
+    assert _rows(tmp_path, _mirror_wf(tmp_path, (f"nginx:9.9.9@{D}", "nginx:9.9.9", ORG))) == 0
+    assert seen == [NGX + ":9.9.9"], "resolved from OUR mirror"
+    assert mirrored_nginx == [(NGX, D)], "the pinned digest was read anonymously"
+    assert (tmp_path / "d" / "nginx").read_text() == f"nginx@{D}\n"
+
+
+def test_a_lane_without_dest_org_copies_to_the_namespace_org(mirrored_nginx, tmp_path, monkeypatch):
+    monkeypatch.setattr(M, "resolve", lambda ref: D)
+    assert _rows(tmp_path, _mirror_wf(tmp_path, (f"nginx:9.9.9@{D}", "nginx:9.9.9", None))) == 0
+
+
+@pytest.mark.parametrize("lanes, why", [
+    # the mirror carries another digest than the upstream it was copied from
+    ([("nginx:9.9.9@sha256:" + "b" * 64, "nginx:9.9.9", ORG)], "is not the upstream image"),
+    # no lane copies this tag into the org the row names
+    ([(f"nginx:9.9.9@{D}", "nginx:9.9.8", ORG)], "no mirror-images.yml lane"),
+    ([(f"nginx:9.9.9@{D}", "nginx:9.9.9", ORG + "/dhi")], "no mirror-images.yml lane"),
+    # a lane copying a moving tag proves nothing
+    ([("nginx:9.9.9", "nginx:9.9.9", ORG)], "not by digest"),
+    # two lanes for one destination
+    ([(f"nginx:9.9.9@{D}", "nginx:9.9.9", ORG), (f"nginx:9.9.9@{D}", "nginx:9.9.9", None)], "2 mirror-images.yml lanes"),
+], ids=["other-digest", "other-tag", "other-org", "moving-tag", "two-lanes"])
+def test_rows_refuses_a_mirror_that_is_not_its_upstream(mirrored_nginx, tmp_path, monkeypatch, capsys, lanes, why):
+    monkeypatch.setattr(M, "resolve", lambda ref: D)
+    assert _rows(tmp_path, _mirror_wf(tmp_path, *lanes)) == 1
+    assert why in capsys.readouterr().err
+    assert not (tmp_path / "d").exists(), "no row for a mirror whose provenance failed"
+
+
+@pytest.mark.parametrize("state, got", [("unreadable", ""), ("absent", ""), ("error:token HTTP 500", ""),
+                                        ("present", "sha256:" + "b" * 64)],
+                         ids=["unreadable", "absent", "error", "other-digest"])
+def test_rows_refuses_a_mirror_a_stranger_cannot_pull(mirrored_nginx, tmp_path, monkeypatch, capsys, state, got):
+    monkeypatch.setattr(M, "resolve", lambda ref: D)
+    monkeypatch.setattr(M, "anonymous_digest", lambda repo, d: (state, got))
+    assert _rows(tmp_path, _mirror_wf(tmp_path, (f"nginx:9.9.9@{D}", "nginx:9.9.9", ORG))) == 1
+    assert "not pullable anonymously" in capsys.readouterr().err
+    assert not (tmp_path / "d").exists()
+
+
+def test_the_anonymous_read_sends_no_credentials(monkeypatch):
+    """check_anonymous reads with mirror-plan.fetch_digest and NO token."""
+    P = M._plan_module()
+    calls = []
+
+    def http(url, headers):
+        calls.append((url, dict(headers)))
+        if "/token?" in url:
+            return 200, {}, b'{"token": "anon"}'
+        return 200, {}, b"{}"
+    monkeypatch.setattr(P, "_http", http)
+    monkeypatch.setattr(M, "_plan_module", lambda: P)
+    import hashlib
+    d = "sha256:" + hashlib.sha256(b"{}").hexdigest()
+    M.check_anonymous(NGX, d)
+    assert calls[0][0].startswith("https://ghcr.io/token?scope=repository:" + ORG + "/nginx:pull")
+    assert "Authorization" not in calls[0][1], "an anonymous token request carries no credential"
+    assert calls[1][0] == f"https://ghcr.io/v2/{ORG}/nginx/manifests/{d}"
+
+
+def test_check_mode_names_the_mirror_source(mirrored_nginx, tmp_path, capsys):
+    compose = tmp_path / "c.yml"
+    compose.write_text("    image: ${NGINX_IMAGE:-" + NGX + ":9.9.9${NOO_IMAGE_DIGEST_NGINX:-}}\n")
+    wf = _mirror_wf(tmp_path, (f"nginx:9.9.9@{D}", "nginx:9.9.9", ORG))
+    assert M.main(["check", "--compose", str(compose), "--mirror-workflow", str(wf), "--only", "nginx"]) == 0
+    assert f"(mirror of {D})" in capsys.readouterr().out
 
 
 def test_rows_fails_the_job_on_latest(tmp_path):
     compose = tmp_path / "c.yml"
-    compose.write_text("    image: ${NGINX_IMAGE:-nginx:latest${NOO_IMAGE_DIGEST_NGINX:-}}\n")
+    compose.write_text("    image: ${NGINX_IMAGE:-" + NGX + ":latest${NOO_IMAGE_DIGEST_NGINX:-}}\n")
     assert M.main(["rows", "--out", str(tmp_path / "d"), "--compose", str(compose), "--only", "nginx"]) == 1
     assert not (tmp_path / "d").exists()
 
@@ -149,7 +267,7 @@ def test_nats_default_is_a_version_with_a_dev_digest_not_latest():
 
 def test_tei_gpu_and_cpu_are_separate_rows():
     assert M.compose_version("tei", COMPOSE) == "1.6"
-    assert M.compose_version("tei-cpu", COMPOSE) == "cpu-1.6"
+    assert M.compose_version("tei-cpu", COMPOSE) == "cpu-1.9.4"
 
 
 def test_the_gateway_forwards_the_locked_backend_refs_at_the_compose_version():

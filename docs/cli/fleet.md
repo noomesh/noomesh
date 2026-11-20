@@ -46,7 +46,7 @@ By default this also mints a tagged Tailscale auth key and prints a
 self-contained paste:
 
 ```
-run AS YOUR USER on the node (it runs several sudo commands; sudo asks for your password)
+run AS YOUR USER on the node (the enroll command runs sudo; a person types the password unless that machine has passwordless sudo)
 step 1 — make sure the noo CLI is on the node (skip if `noo --version` already works):
   command -v noo >/dev/null || { curl -fsSL https://github.com/noomesh/noomesh/releases/latest/download/install.sh -o install.sh && sh install.sh; }
 step 2 — enroll (joins the tailnet, runs host prep, installs the agent):
@@ -107,7 +107,17 @@ alternative is `noo cluster invite`, which prints
 
 ### Declare what a node should run
 
+On a node other than the controller's own, stage an Ollama tag first: the
+node refuses a tag the controller has not staged (`ollama_registry_pull_refused`).
+`noo cluster place` refuses such a tag up front (409, with
+`noo models fetch ollama:<tag>` as its next step) when the store does not
+hold it, the node does not hold it, and the node does not declare
+`NOO_ALLOW_OLLAMA_REGISTRY_PULL`; when one of those is unknown (a node
+whose Ollama lists no tags yet counts as unknown) it places with a
+warning. `--force` places it anyway.
+
 ```sh
+noo models fetch ollama:qwen2.5:7b-instruct
 noo cluster place gpu-2 ollama qwen2.5:7b-instruct
 noo cluster desired gpu-2
 noo cluster unplace gpu-2 ollama
@@ -157,7 +167,13 @@ naming the NVIDIA driver (too old for CUDA 12.9) or a missing CUDA device.
 `noo cluster fit` budgets each placement against its own pool: a gpu
 placement against GPU memory (`vram`, or the `unified` GPU share on Apple
 Silicon), a cpu placement against RAM (on a unified-memory node, the RAM
-the GPU share leaves). A model is sized from, in order: what the node
+the GPU share leaves). On a node with several GPUs, an `ollama` or
+`llamacpp` placement (both split a model across GPUs) is budgeted against
+every card, with the headroom reserved on each card (`across 2 GPUs (24.0 +
+24.0 GB, 2.4 GB reserved each, 43.2 GB usable)`); a vLLM placement gets one
+card unless it sets `TENSOR_PARALLEL_SIZE` (or `GPU_COUNT`). An agent that
+does not report its cards (`gpu_vram_gb`) is budgeted one card, as before.
+A model is sized from, in order: what the node
 reports, the GGUF in the controller model store (`MODELS_DIR`, else
 `<NOO_DATA_ROOT>/models`, read by the CLI), what another node reports for
 the same model, the registry, and the parameter count in its name. When
@@ -507,6 +523,26 @@ hostd refuses `swap-agent`, and `--skip-build`, `--drain-grace` and
 the node-side `noo-apply`; `noo cluster restart-backends gpu-2 noo-ollama`
 restarts named `noo-*` containers through the same rail. `noo upgrade
 --nodes` (Setup & host) restages the whole bundle instead.
+
+### Check each node's Docker Engine
+
+Each agent reports its Docker Engine in the heartbeat (`docker_engine`: the
+version and the kind, `dockerd`, `docker-desktop` or `podman`; `none` without
+Docker; `unreadable` with the error when Docker is there but its version
+could not be read). `noo cluster show <node>` prints it, and `noo cluster
+verify` has a `docker engine` row:
+
+- below **27**, the oldest Docker Engine the project tests (CI runs
+  `docker:27-dind`): WARN, with the upgrade as the remedy. Known consequence:
+  a container-lane Ollama import fails on an engine below 28 with an agent
+  before 0.6.28;
+- `unreadable`: WARN, `cannot be checked`, with the error;
+- `none` (a native-only node) and 27 or newer: ok. Podman is shown, not
+  compared;
+- an agent that predates the report: no row.
+
+The minimum is the operator's decision. It is declared once, as
+`MIN_DOCKER_ENGINE_MAJOR` in `noo-cli/src/commands/cluster_verify.rs`.
 
 ### Push a rotated fleet secret
 
@@ -867,7 +903,7 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 | `noo cluster proposals` | `[--status <s>] [--limit <n>]` | List the enrollment proposals agents filed, with each host in full |
 | `noo cluster show` | `<node>` | Show one node in full: hardware, agent version, tier drift, bus principal, roles |
 | `noo cluster forget` | `<node> [--purge-tailscale] [-y\|--yes]` | Remove a dead node's row, KV entry and enrollments; --purge-tailscale drops its device |
-| `noo cluster place` | `<node> <backend\|harness> <model\|auto> [--on cpu\|gpu] [--keep-warm\|--no-keep-warm] [--env KEY=VALUE]... [--kind noo\|claude-code\|copilot\|codex] [--role chat\|embed\|rerank] [--port <port>] [--tls] [--image <image>] [--stopped] [--force] [--retune]` | Declare a backend and model in a role on a node, on cpu or gpu; auto-tunes unless --env |
+| `noo cluster place` | `<node> <backend\|harness> <model\|auto> [--on cpu\|gpu] [--keep-warm\|--no-keep-warm] [--env KEY=VALUE]... [--kind noo\|claude-code\|copilot\|codex] [--role chat\|embed\|rerank] [--port <port>] [--tls] [--image <image>] [--stopped] [--force] [--retune]` | Declare a backend and model on a node (cpu or gpu), auto-tuned; model auto: harness only |
 | `noo cluster unplace` | `<node> <backend> [--role chat\|embed\|rerank] [--model <model>]` | Remove a placement, or one embed model; a container keeps running, a harness is stopped |
 | `noo cluster fit` | `<node> [--with <backend> <model> [--on cpu\|gpu] [--role <role>] [--env KEY=VALUE]...]` | Show whether placements fit a node's GPU memory and RAM, with or without one more |
 | `noo cluster class list` | — | Show the model classes consumers may send as `model`, with candidate placement and health |

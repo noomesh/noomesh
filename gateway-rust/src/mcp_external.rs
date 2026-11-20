@@ -999,7 +999,12 @@ async fn handle_rpc(state: &Arc<AppState>, headers: &HeaderMap, body: &[u8]) -> 
 /// `initialize`): what it is, then how agent mail works, which a client
 /// with no hook can learn nowhere else.
 fn instructions() -> String {
-    format!("{} {}", "noomesh user door: tools run as the account this key is bound to.", crate::agent_mailbox::MAILBOX_INSTRUCTIONS)
+    format!(
+        "{} {} {}",
+        "noomesh user door: tools run as the account this key is bound to.",
+        "No door tool places models or runs verify: the operator does, with the noo CLI on the controller (`noo cluster place <node> <backend> <model>`, then `noo --json cluster verify --wait`, exit 0 = healthy). Adding a machine is the operator's too: this door cannot mint the bootstrap token its enroll command needs.",
+        crate::agent_mailbox::MAILBOX_INSTRUCTIONS
+    )
 }
 
 #[cfg(test)]

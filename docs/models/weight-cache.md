@@ -31,8 +31,8 @@ An empty list `[]` means the cache holds no models yet. A `404` means
 
 ## What the cache serves
 
-The `model-cache` compose service (`nginx:1.27-alpine`, profiles
-`controller` and `standalone`) listens on port **8443** (mTLS) and serves
+The `model-cache` compose service (`nginx:1.30.7-alpine`, pulled from our mirror
+`ghcr.io/noomesh/nginx`; profiles `controller` and `standalone`) listens on port **8443** (mTLS) and serves
 three read-only trees from the controller's data root:
 
 | URL path | Host directory | Content |
@@ -66,6 +66,11 @@ The store fills itself: any model the controller runs lands in
 by hand or with `noo models pull` (Ollama only — see below).
 
 ### `HF_CACHE_DIR` is an HF_HOME, not a hub directory
+
+On the controller, `<HF cache>/hub` must be owned like the HF cache itself, or
+the self node's agent cannot write the weights. `noo cluster verify`'s
+`hf-cache hub owner` row says whether it is. The self node's applier repairs it
+at its next apply.
 
 This is the one layout mistake that produces a silent empty cache, so it is
 worth being exact. `HF_CACHE_DIR` is an **HF_HOME**: the directory

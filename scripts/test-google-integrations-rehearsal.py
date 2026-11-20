@@ -5,7 +5,8 @@
 
 No controller credentials, provider calls, host ports, or installation files.
 Build the gateway test binary with scripts/cargo-docker.sh first; see
-docs/channels/google-connections.md for the release checklist.
+docs/getting-started/integrations.md (Release rehearsal without Google
+credentials) for the release checklist.
 """
 
 from __future__ import annotations

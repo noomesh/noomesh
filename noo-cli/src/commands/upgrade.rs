@@ -1829,7 +1829,11 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
     let stuck_report = stuck_dir.path().join("stuck");
     let build_launch = || {
         let mut c = std::process::Command::new("bash");
-        c.arg(root.join("scripts/noomesh-start.sh")).arg("--dist")
+        // `--recreate`: a roll recreates every container (new images, new
+        // config, files replaced under their bind mounts). Always this
+        // binary's own launcher: refresh_deploy_slice materialised it just
+        // before (upgrade_stack), so it knows the flag.
+        c.arg(root.join("scripts/noomesh-start.sh")).arg("--dist").arg("--recreate")
             .env("NOO_IMAGE_TAG", tag)
             .env("NOO_STUCK_REPORT", &stuck_report)
             .env("NOO_CLI_BIN", &cli_bin)
@@ -3292,7 +3296,7 @@ fn outcome_of(end: &super::provision::ApplyEnd) -> (Outcome, String) {
     use super::provision::ApplyEnd;
     match end {
         ApplyEnd::Applied { rc: 0, .. } => (Outcome::Applied, "applied (exit 0)".into()),
-        ApplyEnd::Applied { rc, .. } => (Outcome::Refused, format!("the applier refused the bundle (exit {rc})")),
+        ApplyEnd::Applied { rc, .. } => (Outcome::Refused, format!("the applier refused the bundle (exit {rc}): {}", super::provision::apply_refusal(*rc).why)),
         ApplyEnd::LegacyUnconfirmed => (Outcome::Unconfirmed, "applied without confirmation (legacy fetcher)".into()),
         ApplyEnd::NotReported { fetched: true } => (Outcome::NotReported, "fetched, but no apply report".into()),
         ApplyEnd::NotReported { fetched: false } => (Outcome::NotFetched, "never fetched the bundle".into()),
@@ -3520,12 +3524,17 @@ fn settle_end(g: &Globals, n: &str, end: super::provision::ApplyEnd, is_self: bo
             ui::blank();
             ui::say(&ui::item(n));
             ui::capture("applier output", tail.trim());
+            // One row renders both: the line and guide here, the JSON row below.
+            let r = super::provision::apply_refusal(rc);
             ui::say_err(&ui::sub(&ui::status_line(Glyph::Err,
-                &format!("{n}: the applier refused the bundle (exit {rc}); the node kept its previous state"))));
+                &format!("{}; the node kept its previous state", r.headline(n, rc)))));
             if !g.json {
-                ui::guide(&[(&format!("noo cluster provision {n} --wait"), "fix the cause above, then re-stage")]);
+                ui::guide(&[(&r.next_command(n), r.guide_why())]);
             }
-            (serde_json::json!({"node": n, "outcome": "refused", "rc": rc}), Settled::Failed)
+            let mut row = r.json(n, rc);
+            row["node"] = serde_json::json!(n);
+            row["outcome"] = serde_json::json!("refused");
+            (row, Settled::Failed)
         }
         ApplyEnd::LegacyUnconfirmed => {
             (serde_json::json!({"node": n, "outcome": "unconfirmed"}), Settled::Unconfirmed)
@@ -8042,6 +8051,26 @@ mod stage_before_launch_tests {
         let join = up.find(".finish_before_launch(g);").expect("and joins them");
         let launch = up.find("launch_stack(g, &roll, staging, stops)").expect("then launches");
         assert!(start < join && join < launch, "staging is finished before launch_stack");
+    }
+}
+
+#[cfg(test)]
+mod roll_recreates_tests {
+    /// A plain `noo stack start` recreates only the containers whose config
+    /// or secret / config file contents changed (scripts/lib-start-inputs.sh).
+    /// A roll replaces images and files under their bind mounts, so it still
+    /// asks the launcher to recreate every container, on argv: the launcher
+    /// is this binary's own, materialised by refresh_deploy_slice first.
+    #[test]
+    fn the_roll_asks_the_launcher_to_recreate_every_container() {
+        let src = crate::test_src::own_code(include_str!("upgrade.rs"));
+        let launch = crate::test_src::fn_body(&src, "fn launch_stack(");
+        assert!(launch.contains(".arg(root.join(\"scripts/noomesh-start.sh\")).arg(\"--dist\").arg(\"--recreate\")"));
+        assert!(!src.contains("NOO_START_RECREATE"), "no environment switch");
+        let up = crate::test_src::fn_body(&src, "fn upgrade_stack(");
+        let slice = up.find("refresh_deploy_slice(g, &roll);").expect("the slice is refreshed");
+        let go = up.find("launch_stack(g, &roll, staging, stops)").expect("then launched");
+        assert!(slice < go, "the launcher that gets --recreate is this binary's own");
     }
 }
 

@@ -11,7 +11,9 @@ Not to be confused with connecting your own Claude Code (or any MCP client)
 door, and nothing is placed on a node. See
 [../channels/mcp-your-client.md](../channels/mcp-your-client.md).
 
-## At a glance
+## For people
+
+### At a glance
 
 | Kind | What it is | Status | Chat backends it can use | Vendor telemetry |
 |---|---|---|---|---|
@@ -33,7 +35,7 @@ the vendor CLI that must be on the node. The controller stages that CLI and
 ships it to the node over the rail (next section); until the node has it, a
 placement of that kind is refused.
 
-## Vendor CLIs are staged by the controller
+### Vendor CLIs are staged by the controller
 
 A node never fetches a vendor CLI. It gets one the way it gets the harness
 binary itself: in its signed bundle, from the controller.
@@ -87,7 +89,7 @@ harness runs the CLI, and the harness reports the CLI's own error. A bundle
 that carries a vendor CLI is large (each artefact is 100-250 MB), so the
 first restage after a placement takes longer to stage and to fetch.
 
-### The CLI runs jailed
+#### The CLI runs jailed
 
 The harness never runs a vendor CLI unconfined. On Linux the CLI runs in
 a Landlock jail: it can write only its task's working directory, HOME and
@@ -103,7 +105,7 @@ unjailed`, and the harness logs the reason at startup (`noo cluster logs
 <node> harness`). The exact allow-list is in
 [../security/node-agent.md](../security/node-agent.md#foreign-clis-run-in-a-jail).
 
-## Place a harness
+### Place a harness
 
 ```sh
 noo cluster place <node> harness auto                    # follow whichever chat backend the node runs
@@ -124,7 +126,7 @@ placed there and the node's agent reports it running. Otherwise the
 controller runs the turn in process, and a task's `why` says which of the
 two is missing.
 
-### Slow node models
+#### Slow node models
 
 A reasoning model on a slow node can spend several minutes on one model
 call, mostly thinking (gemma4:12b on an M4 Mac mini took 3 to 4.5 minutes
@@ -171,7 +173,7 @@ Both variables are described in
 [../reference/env.md](../reference/env.md). Each node also gets defaults for
 them from its harness profile, below.
 
-## Harness profiles
+### Harness profiles
 
 Each node has a harness profile: six settings that decide how a harness
 behaves on that node's hardware. The controller resolves it from three
@@ -203,7 +205,7 @@ default. For the node agent, the profile replaces
 `NOO_BACKEND_FIRST_BYTE_TIMEOUT_SECS`, which still applies on a box whose
 desired config carries no profile.
 
-### See a node's profile
+#### See a node's profile
 
 ```sh
 noo cluster profile <node>          # each field, its value and where it came from
@@ -214,7 +216,7 @@ Each row names its source: `tier N`, `override (tier N: <default>)`, or
 `measured from <model> at <time>`. The last block shows the node's bench, if
 one has run, and whether it applies.
 
-### Override a field
+#### Override a field
 
 ```sh
 noo cluster profile <node> --set thinking=on
@@ -233,7 +235,7 @@ reason, and nothing is written. Overrides are stored in the node's config
 (`noo_node_config.harness_profile`) and reach the node on its next
 desired-config poll.
 
-### Bench the node's model
+#### Bench the node's model
 
 ```sh
 noo cluster profile <node> --bench
@@ -273,7 +275,7 @@ harness reads it from its node agent: `thinking` (after
 harness starts, so a change waits for a restart) and `claude_prompt`
 (below; re-read every minute).
 
-### Slim Claude Code for small models
+#### Slim Claude Code for small models
 
 Claude Code's own system prompt and its 20 built-in tool definitions make
 its first request large. A small model must prefill all of it before its
@@ -308,7 +310,7 @@ To choose the launch for one node, set the override with
 default. To compare the two launches on a node, pass
 `--prompt full|slim` to the probe below.
 
-## Probe a kind before placing it
+### Probe a kind before placing it
 
 `noo-gateway harness probe` runs a kind's real vendor CLI once per test,
 exactly as the harness driver would run it for a task: the same launch
@@ -399,7 +401,7 @@ The probe changes no service, no placement and no file outside its
 workspace under the system temp directory. It removes that workspace when
 it finishes unless you pass `--keep`.
 
-## What happens when a kind cannot run
+### What happens when a kind cannot run
 
 The node agent checks a harness placement before it starts anything, in
 this order, and reports the first problem as the placement's refusal:
@@ -428,7 +430,7 @@ and `noo cluster status` prints it as `<node> harness: <reason>`.
 The gateway also refuses an unknown kind when you place it, before the node
 is involved.
 
-## Compare kinds on a node
+### Compare kinds on a node
 
 Which kind does better on your node is a measurement, not an opinion: the
 eval harness in `eval/` runs the same task set under each kind, in turn, on
@@ -482,7 +484,7 @@ in the scenario to run the tasks as a user and read only that user's usage.
 The `noo` kind records no token usage for its loops today, so its token
 columns read "not reported" rather than 0.
 
-### Across devices and models: the harness matrix
+#### Across devices and models: the harness matrix
 
 A scenario with a `harness_matrix:` block runs the same comparison on
 several nodes in turn (and, per node, under several models), so you can see
@@ -526,7 +528,7 @@ yours: each cell changes the node's harness placement for the run.
   (`eval/reports/harness-matrix-history.jsonl` by default; `-` keeps none),
   and the report draws the pass rate across runs from that file.
 
-## Telemetry
+### Telemetry
 
 The vendor switches each third-party harness must be launched with, the
 vendor documentation each comes from, and what the switches do not cover
@@ -534,7 +536,7 @@ vendor documentation each comes from, and what the switches do not cover
 [../security/telemetry.md](../security/telemetry.md#agent-harnesses). That
 table is guarded by a test, so it stays the one place they are listed.
 
-## Tested combinations
+### Tested combinations
 
 <!-- To fill in: the node / backend / model combinations the maintainers
 run with a `noo` harness, in the same shape as the Tested table in
@@ -542,7 +544,7 @@ supported-hardware.md. Leave the foreign kinds out until a vendor CLI has been r
 
 Not recorded yet.
 
-## Which harnesses we support, and in what order
+### Which harnesses we support, and in what order
 
 The foreign kinds we support, in priority order, are **Claude Code**,
 **Codex** and **GitHub Copilot CLI**. They are the three in the table above,
@@ -558,7 +560,7 @@ So does your own Claude Code, Codex or Copilot on a laptop.
 A tool that improves an agent's prompts, tools and skills, rather than
 running tasks, is not a harness kind either.
 
-## Getting a harness added
+### Getting a harness added
 
 A new kind is a change to `config/harness-kinds.json`, not a configuration
 value: the gateway and the node agent are built with that table, so a node
@@ -576,3 +578,33 @@ for one, open an issue naming the harness and the wire it speaks.
 
 See also [supported-hardware.md](supported-hardware.md) for the machines a
 harness can run on.
+
+## For agents
+
+- **Placing:** `noo cluster place <node> harness auto` places the default
+  kind, `noo`, following whichever chat backend the node runs (`auto` is a
+  model value only for `harness`). `--kind <kind>` picks another.
+- **A foreign kind is the person's choice.** `claude-code`, `copilot` and
+  `codex` run a third-party CLI on the node. Its CLI only ever comes from
+  the controller: `noo cluster vendor status` shows what is staged and
+  which nodes need it, `noo cluster vendor stage <kind>` fetches it on the
+  controller (150–250 MB, checked against the pinned sha256), then
+  `noo cluster provision <node>` ships it (`noo cluster vendor install
+  <node> <kind>…` carries a CLI on a node whatever its placement names).
+  A foreign CLI never runs
+  unjailed; on a node without the jail its tasks are checkpointed with the
+  reason.
+- **A refusal names its reason:** `noo cluster status` prints
+  `<node> harness: <reason>` (wire mismatch, unknown kind, runner or vendor
+  CLI not installed). A node whose chat window is below the kind's floor is
+  refused with the numbers and the `--env` line that raises it; `--force`
+  past that is the person's call.
+- **Probing a foreign kind:** `noo-gateway harness probe --kind
+  <claude-code|copilot|codex> --mock-model` tests the wire and the flags as
+  yourself and changes nothing outside its temp workspace; exit 0 only when
+  every test passed (there is no probe for `noo`). The real mode takes the
+  model from `NOO_HARNESS_MODEL_URL` / `NOO_HARNESS_MODEL` /
+  `NOO_HARNESS_BACKEND` first; only when it falls back to the root-only
+  `/etc/noo-harness.env` does it need `sudo` on the node, and that is the
+  person's. As root it runs the vendor CLI as `--run-as` (default
+  `nobody`), never as uid 0.

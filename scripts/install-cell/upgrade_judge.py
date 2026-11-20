@@ -244,7 +244,12 @@ def judge():
         say("G1", "PASS" if hf and hf[0].get("verdict") == "ok" else "FAIL",
             ("%s: %s" % (hf[0].get("verdict"), hf[0].get("detail"))) if hf else "no 'hf-cache hub owner' row")
     om = rows(v, "ollama models", me)
-    if om and om[0].get("verdict") == "ok":
+    if om and om[0].get("verdict") == "ok" and "not yet checked" in (om[0].get("detail") or ""):
+        # i1067: a held model the restarted agent has not checked yet is
+        # OK on the row, but proves nothing about its bytes.
+        say("G2", "NOTE", "the row is OK but a model is not yet checked (the agent's first pass after the roll): %s"
+            % om[0].get("detail"))
+    elif om and om[0].get("verdict") == "ok":
         say("G2", "PASS", om[0].get("detail"))
     elif om and "no controller record" in (om[0].get("detail") or ""):
         say("G2", "NOTE", "the model the previous final's onboard pulled has no controller record (the 0.6.27 roll note's "

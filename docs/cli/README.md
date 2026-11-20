@@ -136,7 +136,7 @@ Every native command accepts these (`print_native_help` in
 
 | Flag | Meaning |
 |---|---|
-| `--json` | raw gateway JSON on stdout — for scripts and agents |
+| `--json` | the result as JSON on stdout (the gateway's body, plus `next` / `warnings` / `summary` where the text guides) — for scripts and agents |
 | `--quiet`, `-q` | captured values only (ids, secrets, paths) |
 | `--color MODE` | `auto` \| `always` \| `never`; persist with `noo config set cli '{"color":"never"}'` |
 | `--watch [S]`, `-w` | redraw a status command every S seconds (`stack status`, `cluster status`, `jobs list`) |
@@ -194,7 +194,31 @@ Scripts branch on the code, not on prose.
 
 ### `--json` (`noo-cli/src/main.rs` module header, `output::fail`)
 
-- `--json` prints the gateway's raw JSON on stdout, nothing else.
+- `--json` prints the result as JSON on stdout, nothing else: the
+  gateway's body, plus `next` / `warnings` / `summary` fields wherever the
+  text prints guidance. Fields are only ever added, never renamed or removed.
+- `next` is always an array (`[]` when there is nothing to do) of
+  `{"kind": "command", "command": "<one shell line>"}`, with `"nodes": [...]`
+  when the command targets named nodes (`output::next_cmd`).
+- What the guidance fields carry, per command:
+  - `cluster verify`: `summary` (the closing verdict line), `stack_tag`
+    (the controller tag in the header; null when no node list was read),
+    `next` (`noo cluster verify --wait` while a row is starting), and on each
+    row `tier` (`later` | `not_here` | null, where onboard's brief groups it).
+    `seats` is `[]` when none are enrolled and null when the gateway did not
+    answer the seat list. Gateway unreachable: `next` is `noo health`,
+    `noo stack status`.
+  - `cluster place`: `converges` (false when the node serves the backend
+    natively), `warning` (then the same line the text prints), `next`
+    (`noo cluster verify <node> --wait`, or `noo cluster show <node>` for a
+    native backend).
+  - `cluster bootstrap-token create`: the gateway's `run_on`, `needs_human`
+    (the text prints it as the paste's first line) and `next` (install,
+    enroll, provision); `tailnet_skipped` also says why a tailnet key could
+    not be minted.
+  - `health`: the gateway's body, plus `needs_login: true` when the
+    dependencies were withheld (no credential) and `next` (the text's
+    suggestions).
 - Errors go to stderr — as `{"error","code","hint"}` JSON in `--json` mode.
 - Narration is not stderr: a script that wants only the value passes
   `--quiet`. In default mode everything a person sees is stdout (header,

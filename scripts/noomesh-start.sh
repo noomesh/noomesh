@@ -23,6 +23,9 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib-dist.sh"
 # is called further down. Sourcing twice is harmless: lib-config.sh has no
 # top-level side effects outside its functions.
 . "$(dirname "${BASH_SOURCE[0]}")/lib-config.sh"
+# Which services' secret and config FILES changed (the `noo.inputs` label):
+# sourced before load_secrets, whose secret-file writer feeds it.
+. "$(dirname "${BASH_SOURCE[0]}")/lib-start-inputs.sh"
 acquire_compose_lock || exit 1
 
 
@@ -49,12 +52,20 @@ FORCE_DEV=false
 # install pulls and starts trellion (~4.5 GB, opt-out so on by default) four
 # steps before the question, and stops it again if they say no.
 CORE_ONLY=false
+# --recreate: recreate every container, changed or not. A plain full start
+# recreates only the services whose compose config or `noo.inputs` label
+# (secret and config file contents, lib-start-inputs.sh) changed. The CLI
+# passes it only to a launcher that has this case (noo-cli onboard/sh.rs
+# launcher_takes_recreate): an older one reads an unknown word as a service
+# name, and forces every full start anyway.
+START_RECREATE=false
 _argv=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --dist)      DIST=true; shift ;;
         --dev)       FORCE_DEV=true; shift ;;
         --core-only) CORE_ONLY=true; shift ;;
+        --recreate)  START_RECREATE=true; shift ;;
         --tag)       DIST_TAG="$2"; EXPLICIT_TAG=1; shift 2 ;;
         --tag=*)     DIST_TAG="${1#*=}"; EXPLICIT_TAG=1; shift ;;
         *)           _argv+=("$1"); shift ;;
@@ -967,12 +978,16 @@ require_compose_v2 || exit 1
     addons_stop_leftovers addons_stop_disabled || exit 1
     # shellcheck disable=SC2086
     check_bind_sources --no-deps $_bind_skip $ACTIVE_SVCS || exit 1
-    # Start all services with profile(s)
-    # --force-recreate handles re-provisioning where stale containers may exist
-    # An unkillable leftover container (lib-stuck-container.sh) must not
-    # abort the whole `up`: everything else is started and the launcher
-    # exits $NOO_EXIT_STACK_PARTIAL (75) after the guard below has run.
-    noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d --force-recreate $BUILD_FLAG $GPU_SCALE $AGENT_SCALE $ADDON_HOLD_SCALE || _up_rc=$?
+    # Start all services with profile(s): start_inputs_full_up
+    # (lib-start-inputs.sh) runs `up -d` WITHOUT --force-recreate. Compose
+    # recreates a service whose config changed, and the `noo.inputs` label
+    # makes a changed secret or mounted config file a config change; the
+    # force is there only for --recreate or when the inputs could not be
+    # fingerprinted. It wraps noo_compose_up_isolating_stuck: an unkillable
+    # leftover container (lib-stuck-container.sh) must not abort the whole
+    # `up`: everything else is started and the launcher exits
+    # $NOO_EXIT_STACK_PARTIAL (75) after the guard below has run.
+    start_inputs_full_up $BUILD_FLAG $GPU_SCALE $AGENT_SCALE $ADDON_HOLD_SCALE || _up_rc=$?
     if [ "${_up_rc:-0}" -ne 0 ] && [ "${_up_rc:-0}" -ne "$NOO_EXIT_STACK_PARTIAL" ]; then exit "$_up_rc"; fi
     # Report, never reap: a container no compose file of this install declares
     # (186b). Exit status unchanged; `--remove-orphans` is not passed to any `up`.
@@ -1049,7 +1064,9 @@ else
     fi
     addon_refuse_held "${SERVICES[@]}" || exit 1
     check_bind_sources "${SERVICES[@]}" || exit 1
-    docker compose $COMPOSE_FILES $PROFILE_ARGS up -d "${SERVICES[@]}"
+    # The same `noo.inputs` labels as a full start, so naming a service does
+    # not drop its label (and recreate it again on the next full start).
+    start_inputs_named_up "${SERVICES[@]}"
     NOO_CREATED_GUARD_SERVICES="${SERVICES[*]}" noo_created_guard $(docker compose $COMPOSE_FILES $PROFILE_ARGS ps -aq "${SERVICES[@]}")
 fi
 
@@ -1076,7 +1093,8 @@ if [ -n "$OLLAMA_CTR" ]; then
             | grep -vE "^(${PAGEINDEX_EMBEDDING_MODEL:-}|${EMBEDDING_MODEL:-})$|embed|harrier|minilm|bge" | grep -q .; then
             OLLAMA_MODEL="gemma4:e2b"
             ui_note "no OLLAMA_MODEL declared — using the default (gemma4:e2b); set it in .env to change"
-        else
+        elif [ "${NOO_ONBOARD:-}" != 1 ]; then
+            # Under `noo onboard` its model step picks and pulls one next.
             ui_note "no chat model installed — skipping the default pull; pick one: noo models recommended / noo models pull <model>"
         fi
     fi
@@ -1120,6 +1138,9 @@ if [ -n "${OLLAMA_PULL_PID:-}" ]; then
     fi
 fi
 
+# The endpoint and verb guide is for a person who ran the launcher; under
+# `noo onboard` (NOO_ONBOARD=1) its own summary says where things are.
+if [ "${NOO_ONBOARD:-}" != 1 ]; then
 ui_phase "Endpoints"
 print_service_urls
 
@@ -1129,3 +1150,4 @@ ui_guide_cmd "noo stack status" "containers, health and ports in one table"
 ui_guide_cmd "noo stack logs -f [service]" "follow logs; omit the service for all of them"
 ui_guide_cmd "noo stack restart [service]" "restart one service or the whole stack"
 ui_guide_cmd "noo stack stop" "stop everything, data volumes kept"
+fi

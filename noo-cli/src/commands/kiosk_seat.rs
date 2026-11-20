@@ -2414,7 +2414,7 @@ pub(crate) fn print_seats_if_any(g: &Globals) {
 }
 
 fn check(name: &'static str, verdict: super::cluster_verify::Verdict, detail: String, remedy: Option<String>) -> super::cluster_verify::Check {
-    super::cluster_verify::Check { name, verdict, detail, remedy }
+    super::cluster_verify::Check { name, verdict, detail, remedy }.checked()
 }
 
 fn norm_tag(t: &str) -> String {

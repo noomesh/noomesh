@@ -4,7 +4,7 @@
 //! `noo health` — gateway liveness.
 
 use crate::http::get_json;
-use crate::output::ExitCode;
+use crate::output::{next_cmd, ExitCode};
 use crate::ui::{self, Col, Glyph};
 use crate::{Globals, Unhandled};
 
@@ -27,12 +27,17 @@ pub fn health(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let status = body["status"].as_str().unwrap_or("unknown");
     let healthy = matches!(status, "healthy" | "ok");
     if g.json {
+        // The gateway's body as it came, plus what the text tells a person:
+        // `needs_login` when the dependencies were withheld, `next` the
+        // commands the text suggests.
+        let mut body = body;
+        with_guidance(&mut body, healthy);
         println!("{body}");
     } else {
         let host = crate::role::detect().label();
         println!("{}", ui::header("gateway", Some(&format!("host {host}"))));
         print!("{}", ui::kv(&[("status", ui::state(status))]));
-        if body["dependencies"].as_object().is_none() {
+        if needs_login(&body) {
             // Say why the table is missing rather than showing status alone
             // and letting the reader wonder what happened to it.
             println!(
@@ -57,18 +62,82 @@ pub fn health(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             print!("{}", ui::table(&[Col::left(""), Col::left("dependency"), Col::left("state"), Col::left("")], &rows));
         }
         if !healthy {
-            let down: Vec<String> = body["dependencies"]
-                .as_object()
-                .map(|m| m.iter().filter(|(_, d)| d["healthy"].as_bool() == Some(false)).map(|(n, _)| n.clone()).collect())
-                .unwrap_or_default();
-            let logs: Vec<String> = down.iter().map(|d| format!("noo stack logs {d}")).collect();
-            let mut entries: Vec<(&str, &str)> = vec![("noo stack status", "shows which container is not running")];
-            for l in &logs {
-                entries.push((l.as_str(), "the dependency's own log usually names the cause"));
-            }
-            entries.push(("noo doctor docker", "if containers look damaged after an unclean shutdown"));
+            let steps = unhealthy_steps(&body);
+            let entries: Vec<(&str, &str)> = steps.iter().map(|(c, w)| (c.as_str(), *w)).collect();
             ui::guide(&entries);
         }
     }
     Ok(if healthy { 0 } else { ExitCode::RemoteError as i32 })
+}
+
+/// The body withholds `dependencies` from an anonymous caller: the text says
+/// "run `noo auth login` to see them". Pure.
+fn needs_login(body: &serde_json::Value) -> bool {
+    body["dependencies"].as_object().is_none()
+}
+
+/// What the text suggests on an unhealthy gateway, with why: the stack's
+/// status, each down dependency's log, then docker repair. Pure.
+fn unhealthy_steps(body: &serde_json::Value) -> Vec<(String, &'static str)> {
+    let down: Vec<String> = body["dependencies"]
+        .as_object()
+        .map(|m| m.iter().filter(|(_, d)| d["healthy"].as_bool() == Some(false)).map(|(n, _)| n.clone()).collect())
+        .unwrap_or_default();
+    let mut steps = vec![("noo stack status".to_string(), "shows which container is not running")];
+    for d in &down {
+        steps.push((format!("noo stack logs {d}"), "the dependency's own log usually names the cause"));
+    }
+    steps.push(("noo doctor docker".to_string(), "if containers look damaged after an unclean shutdown"));
+    steps
+}
+
+/// Add to the gateway's body (its fields kept) what the text says:
+/// `needs_login: true` when the dependencies were withheld, and `next` (the
+/// login, then the unhealthy steps; `[]` on a healthy, logged-in answer).
+/// Pure.
+fn with_guidance(body: &mut serde_json::Value, healthy: bool) {
+    if !body.is_object() {
+        return;
+    }
+    let mut next = Vec::new();
+    if needs_login(body) {
+        body["needs_login"] = serde_json::json!(true);
+        next.push(next_cmd("noo auth login", &[]));
+    }
+    if !healthy {
+        next.extend(unhealthy_steps(body).iter().map(|(c, _)| next_cmd(c, &[])));
+    }
+    body["next"] = serde_json::Value::Array(next);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// No `dependencies` in the body (anonymous): `needs_login` and the
+    /// login step, the body's own fields kept.
+    #[test]
+    fn health_json_says_needs_login_when_dependencies_are_withheld() {
+        let mut body = serde_json::json!({ "status": "healthy" });
+        with_guidance(&mut body, true);
+        assert_eq!(body["needs_login"], true);
+        assert_eq!(body["status"], "healthy");
+        assert_eq!(body["next"], serde_json::json!([{ "kind": "command", "command": "noo auth login" }]));
+        let mut body = serde_json::json!({ "status": "healthy", "dependencies": { "postgres": { "healthy": true } } });
+        with_guidance(&mut body, true);
+        assert!(body.get("needs_login").is_none());
+        assert_eq!(body["next"], serde_json::json!([]));
+    }
+
+    /// Unhealthy: `next` is the text guide's commands, in its order.
+    #[test]
+    fn health_json_next_is_the_text_guide() {
+        let mut body = serde_json::json!({ "status": "degraded", "dependencies": {
+            "postgres": { "healthy": false }, "nats": { "healthy": true } } });
+        with_guidance(&mut body, false);
+        let cmds: Vec<&str> = body["next"].as_array().unwrap().iter().filter_map(|s| s["command"].as_str()).collect();
+        assert_eq!(cmds, ["noo stack status", "noo stack logs postgres", "noo doctor docker"]);
+        let text: Vec<String> = unhealthy_steps(&body).into_iter().map(|(c, _)| c).collect();
+        assert_eq!(cmds, text);
+    }
 }

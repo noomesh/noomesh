@@ -432,6 +432,20 @@ user info, path, query or fragment. One that does not fit is neither stored
 nor dialled: the gateway dials `https://<ip>:8081`, and `noo cluster verify`
 shows an `agent address` FAIL naming the node and the reason.
 
+**A node's certificate must cover the address it is dialled at.** A node
+enrolled without a tailnet address gets its leaf for the address the gateway
+saw at enrollment. Behind a reverse proxy, Docker Desktop's forwarder or a
+hairpin that is not the node's own, and every call to it then fails TLS.
+`noo cluster verify`'s `agent certificate` row:
+- **FAIL:** the leaf misses the dialled address. The remedy is
+  `noo security pki push-nodes <node>`, and the row says which address that
+  would certify.
+- **FAIL with no remedy:** that address is also another node's (registered,
+  dialled, or in its leaf). Investigate first; `push-nodes` refuses it too,
+  unless `--allow-shared-address <addr>` names it.
+- **WARN:** the controller cannot read the node's leaf.
+- **No row:** the leaf covers the address.
+
 ---
 
 ## Declared host roots
@@ -967,6 +981,15 @@ verify` reports it:
   model layer must be the controller's GGUF, by sha256. The other layers
   (template, parameters) are not anchored yet.
 
+Every model the node holds is in the row on every report. Until the agent
+has checked it (right after the agent starts, or before a new model's first
+check) it reads "<model>: not yet checked": not a problem, and not a verdict.
+The row's verdict comes from the checked models alone, and a row whose models
+are all not yet checked is OK. "Not yet" is never "cannot": a model whose
+presence the agent could not read on 3 passes in a row (its Ollama did not
+answer the model list) is a WARN, "could not be checked", with the count and
+the last error.
+
 A mismatch is repaired from the controller (the bad blobs are removed, then
 the model is re-installed or rebuilt from the verified GGUF). A pulled model
 is not repaired: the record of a pull holds no bytes, so a blob it needs is
@@ -982,8 +1005,11 @@ controller's own node it is `noo models pull <model>`, which pulls through the
 gateway's Ollama and writes the record. `noo models pull` reaches no other
 node, so on any other node (a container or a Mac's native Ollama) the remedy
 stages the tag on the controller and imports it there: `noo models fetch
-ollama:<tag>`, then `noo cluster import-model <node> ollama:<tag>` (harrier, an
-artifact: `noo cluster import-model <node> harrier`). The record is the
+ollama:<tag>`, then `noo cluster import-model <node> ollama:<tag>`. harrier
+is an artifact, never a registry tag, on every node kind: `noo cluster
+import-model <node> harrier` on another node, and on the controller's own node
+`noo models pull harrier`, which copies the release artifact into the stack's
+embed container. The record is the
 manifest the pull installed, written only when every layer the registry's
 manifest names (config, weights, template, parameters, licence) is in it with
 the same digest and size, and it adds only the manifest Ollama pulled (whose
@@ -1016,6 +1042,87 @@ remedy first re-pulls through noo (`noo models pull <tag>` on the
 controller's own node), which has Ollama rewrite the blobs and the manifest
 with its own modes; if the files stay unreadable: `sudo chmod -R o+rX
 <store>`.
+
+### The harrier embedder artifact
+
+harrier, the default embedder, is not in any Ollama registry: it ships as an
+OCI image of three files (`harrier-Q4_K_M.gguf`, `harrier.Modelfile`,
+`harrier.sha256`), published once per tag by `publish-harrier.yml`, which
+refuses to overwrite a tag that exists and pushes no `:latest`. The release
+pins it **by digest** (`scripts/harrier-artifact.json`), and the lock job
+writes two lines into the signed stack lock:
+
+| Lock line | Value (0.6.28's harrier, `models-harrier-v1`) |
+|---|---|
+| `harrier@sha256:…` (the image) | `sha256:2fe41964a009bda0c55f299b632b122bcb4561ca4a833e3293c9f3cc685bab79` |
+| `# harrier-gguf-sha256 …` (the GGUF inside it) | `5f26506ab57fd817ce4a8b9d24946a60d40bc76d82a2defa7cd754ae01e9de80` |
+
+The lock job pulls that digest, runs `sha256sum -c harrier.sha256` on its files
+and checks that the file names the pinned GGUF sha before it signs. Every
+fetch on an install is `<prefix>/harrier@<the lock's digest>`: onboard (and
+`noo migrate import`, which is onboard), `noo models pull harrier`, the
+embedder check after `noo upgrade --stack`, and `noo cluster import-model
+<node> harrier` when it stages the pair into the controller store (which runs
+the same `sha256sum -c` first and stages nothing on a mismatch). A host whose
+`stack.lock` pins no harrier refuses the pull rather than take the mutable
+tag, and there is no override: the signed lock is the only source of the pin.
+The refusal reads "this release's lock pins no harrier yet: run `noo upgrade
+--stack` first". The lock row is never staged to nodes and no compose service
+runs it: nodes import the weights from the controller store.
+
+**Checked means the lock agrees.** A fetched pair is used only when `sha256sum
+-c harrier.sha256` passes AND the GGUF's sha256 equals the lock's
+`harrier-gguf-sha256`: the sum file travels inside the image, so on its own it
+is the image's word, not the release's. A GGUF the lock does not name is
+refused, by the fetch and by `import-model` staging alike.
+
+**The store copy.** When onboard, `noo models pull harrier` or the roll's
+embedder check has a checked pair, it also puts it into the controller's model
+store (`MODELS_DIR`, else `<NOO_DATA_ROOT>/models`) exactly as `import-model`
+stages it: `harrier-Q4_K_M.gguf`, `harrier.Modelfile` (its `FROM ./` rewritten
+to the bare name the agent requires) and `harrier.sha256`, plus
+`harrier.artifact-pin`, a record of the image digest, GGUF sha and Modelfile
+sha the pair came from (removed first and written last, so a half-replaced
+pair has none). The GGUF is hard-linked from the temp dir when the store is on
+the same filesystem, else copied; either way the store holds about 0.4 GB for
+harrier. A node agent then finds `harrier.Modelfile` in the store (the
+gateway's `modelfile` manifest), treats harrier as import-only and imports it
+through the verified path, instead of refusing an Ollama registry pull.
+
+**Retries.** The `docker pull` of `harrier@<digest>`, and only it, is retried
+when it fails transiently: a registry 5xx or 429, a timeout, a reset or a
+refused connection. The status is read as a number from docker's error format
+(`received unexpected HTTP status: <code>`, or containerd's `unexpected status
+from … request to …: <code>`), never from a substring of the message; a 401,
+403, 404, a digest mismatch or anything unrecognised fails at once, and a
+checksum failure is never retried. Five tries at most, 5 s, 15 s, 30 s and
+40 s apart (90 s of waiting), each retry said ("ghcr.io answered 500; retrying
+in 15 s (2 of 4)").
+
+**The fallback: the lock decides, never the network.** If the registry still
+cannot be reached, the store's copy is used for `ollama create` only when its
+record names the lock's image digest and GGUF, and the copy's GGUF and
+Modelfile hash to what was recorded (the files are copied out first, and the
+copies are what is checked and used). The fetch then says "used the controller
+store's verified copy (registry unreachable)". A copy from another digest or
+GGUF, or with no record, is never used. When the fetch still fails it names
+one command, `noo models pull harrier`; the next `noo upgrade` roll and `noo
+onboard` retry it on their own, and `noo stack start` does not.
+
+**The upgrade window.** A 0.6.29 CLI over a lock that pins no harrier (before
+`noo upgrade --stack` has written the new lock, or after a rollback to 0.6.28
+or older) refuses every fresh harrier fetch: the onboard embedder step, `noo
+models pull harrier` and `noo cluster import-model <node> harrier` staging.
+Nodes, and the controller's embed container, that already have harrier are
+unaffected: nothing is refetched while the model is present. The remedy is
+`noo upgrade --stack`.
+
+`noo cluster verify`'s `ollama models` row holds harrier to the release, not
+only to the controller: a node's (or the controller's own embed container's)
+harrier model layer is the sha256 of the GGUF `ollama create` imported, so it
+is compared with the lock's `harrier-gguf-sha256`. A different value FAILs,
+naming the node's weights, the pinned image and the pinned GGUF; an equal one
+says "the release's harrier". With no pin in the lock it is not compared.
 
 ## Backend door leaves
 
@@ -1523,6 +1630,23 @@ else (including no `systemd-run`), and `harness-egress=UNRESOLVED:<name>` per
 unresolved name. The probe never refuses the harness unit; the node agent
 reports the state and refuses the kinds that need enforcement. A teardown
 removes the drop-in and the directory.
+
+Before it installs the hold, the applier runs a pre-check under the hold's own
+settings: every controller name must resolve from the rendered `hosts` file,
+and every controller port must answer. A controller URL that is a literal IPv4
+address is connected to without a lookup, and an address outside the base
+ranges is added to the allowlist. If the pre-check fails, nothing is installed
+and the tag says why:
+- `UNENFORCED:selfcheck-<host>-<port>`: this node cannot reach that controller
+  address under the hold;
+- `UNENFORCED:selfcheck-unavailable`: no `systemd-run` on this host.
+
+`noo cluster verify`'s `harness egress` row:
+- **OK:** the unit is held and the harness's own self-test confirms it.
+- **FAIL:** not held. Codex placements are refused there.
+- **WARN:** unknown, or the node runs another runtime (launchd).
+- **The remedy:** `noo cluster provision <node>`. Its apply report carries the
+  tag above.
 
 ## The helper image
 

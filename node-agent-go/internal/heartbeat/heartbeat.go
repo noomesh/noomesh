@@ -148,6 +148,17 @@ type Reporter struct {
 	// wired; ok=false (unreadable, or no models dir) omits the key.
 	modelSetsFree atomic.Pointer[func() (int64, bool)]
 
+	// imageStoreFree reports the least free bytes over the filesystems an
+	// image pull writes to (Docker's data root, containerd's root, the
+	// staging dir; docker/image_space.go), sent as `image_store_free_bytes`
+	// (i1036). nil = not wired (no Docker); ok=false omits the key.
+	imageStoreFree atomic.Pointer[func() (int64, bool)]
+
+	// heldImages reports, for this release's own backend images, whether
+	// Docker holds each one (docker/held_images.go), sent as `held_images`
+	// (i1036). nil = not wired; an empty or nil answer omits the key.
+	heldImages atomic.Pointer[func() map[string]bool]
+
 	// ollamaVerify reports each placed Ollama model's verification against
 	// the controller's store, sent as `ollama_verify`. nil = not wired, and a
 	// provider answering nil (nothing checked yet) omits the key.
@@ -468,6 +479,28 @@ func (r *Reporter) modelSetsFreeBytes() (int64, bool) {
 	return (*f)()
 }
 
+// SetImageStoreFreeBytes installs the provider of `image_store_free_bytes`.
+func (r *Reporter) SetImageStoreFreeBytes(f func() (int64, bool)) { r.imageStoreFree.Store(&f) }
+
+// SetHeldImages installs the provider of `held_images`.
+func (r *Reporter) SetHeldImages(f func() map[string]bool) { r.heldImages.Store(&f) }
+
+func (r *Reporter) heldImagesReport() map[string]bool {
+	f := r.heldImages.Load()
+	if f == nil || *f == nil {
+		return nil
+	}
+	return (*f)()
+}
+
+func (r *Reporter) imageStoreFreeBytes() (int64, bool) {
+	f := r.imageStoreFree.Load()
+	if f == nil || *f == nil {
+		return 0, false
+	}
+	return (*f)()
+}
+
 func (r *Reporter) modelSetsReport() any {
 	f := r.modelSets.Load()
 	if f == nil || *f == nil {
@@ -519,8 +552,23 @@ func (r *Reporter) natsStatus() any {
 	return r.busStatus()
 }
 
-// Register sends a registration request to the controller.
+// Register sends a registration request to the controller and, when it is
+// accepted, asks for a heartbeat at once: a registration carries no lanes,
+// so the controller cannot route to this node until its first beat. The
+// kick channel is buffered, so the boot registration's kick (made before
+// Run starts) is taken by Run's first select.
 func (r *Reporter) Register(caps hardware.Capabilities, hostIP string) bool {
+	if !r.register(caps, hostIP) {
+		return false
+	}
+	r.Kick()
+	return true
+}
+
+// register is Register without the kick. A heartbeat's 404 re-registers
+// through it: a kick there would beat again at once, and a controller that
+// keeps answering the beat 404 would turn that into a tight loop.
+func (r *Reporter) register(caps hardware.Capabilities, hostIP string) bool {
 	// Remember for the heartbeat echo (see Reporter.caps).
 	r.caps = &caps
 	selfURL := agentURL(r.cfg)
@@ -613,7 +661,7 @@ func (r *Reporter) SendHeartbeat() {
 	m := r.collector.Collect()
 	clk.mark("metrics")
 
-	gpuModel, vramGB, gpuErr := r.gpuIdentity()
+	gpuModel, vramGB, gpuCards, gpuErr := r.gpuIdentity()
 	r.redetectCaps(gpuErr)
 	clk.mark("gpu_identity")
 	power := hardware.ReadPowerStatus()
@@ -667,6 +715,13 @@ func (r *Reporter) SendHeartbeat() {
 	if gpuErr == nil {
 		payload["gpu_model"] = gpuModel
 		payload["vram_gb"] = vramGB
+		// vram_gb is ONE card; these are every card and their sum, from the
+		// same query. Sent only with a list: without one the gateway budgets
+		// one card, as before.
+		if len(gpuCards) > 0 {
+			payload["gpu_vram_gb"] = gpuCards
+			payload["vram_total_gb"] = hardware.SumVRAM(gpuCards)
+		}
 	}
 	addLoad(payload, m)
 	if m.MemUsedGB == nil {
@@ -713,7 +768,7 @@ func (r *Reporter) SendHeartbeat() {
 			slog.Warn("gpu probe failed while re-registering; keeping the previous GPU capability", "error", capsErr)
 		}
 		hostIP := DetectHostIP(r.cfg)
-		r.Register(caps, hostIP)
+		r.register(caps, hostIP)
 		r.noteOutcome(clk, nil)
 	case status != 200:
 		r.noteOutcome(clk, fmt.Errorf("controller answered HTTP %d", status))
@@ -1104,7 +1159,9 @@ func (r *Reporter) controlTransports() map[string]bool {
 // the probe's. A failed probe returns an error and the caller omits both keys
 // (the gateway keeps the stored value of an omitted key), instead of
 // reporting "" and 0 for a GPU node. Warns once per change of the error.
-func (r *Reporter) gpuIdentity() (model string, vramGB float64, err error) {
+// cards is each GPU's memory from the same nvidia-smi query; nil with a
+// configured VRAM_GB (one card) or a probe that offers no list.
+func (r *Reporter) gpuIdentity() (model string, vramGB float64, cards []float64, err error) {
 	model = r.cfg.GPUModel
 	if model == "" {
 		m, merr := r.gpu.DetectModel()
@@ -1112,8 +1169,8 @@ func (r *Reporter) gpuIdentity() (model string, vramGB float64, err error) {
 	}
 	vramGB = r.cfg.VRAMGB
 	if vramGB == 0 {
-		v, verr := r.gpu.DetectVRAM()
-		vramGB, err = v, errors.Join(err, verr)
+		v, c, verr := hardware.ProbeVRAMCards(r.gpu)
+		vramGB, cards, err = v, c, errors.Join(err, verr)
 	}
 	if err != nil {
 		if msg := err.Error(); msg != r.gpuProbeErr {
@@ -1121,13 +1178,13 @@ func (r *Reporter) gpuIdentity() (model string, vramGB float64, err error) {
 			slog.Warn("gpu probe failed; heartbeat omits gpu_model and vram_gb so the controller keeps the last value",
 				"error", err)
 		}
-		return "", 0, err
+		return "", 0, nil, err
 	}
 	if r.gpuProbeErr != "" {
 		r.gpuProbeErr = ""
 		slog.Info("gpu probe recovered")
 	}
-	return model, vramGB, nil
+	return model, vramGB, cards, nil
 }
 
 // redetectCaps re-runs hardware.Detect on a beat while the registered

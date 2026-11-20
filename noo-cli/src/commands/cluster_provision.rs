@@ -1181,7 +1181,7 @@ pub(crate) fn public_install_line(repo: &str) -> String {
 /// the tag existed in the ACL) — the misleading layer cost a live debugging
 /// round (finding #37).
 fn explain_ts_mint_failure(e: &str) {
-    say(&ui::muted(&format!("tailscale key mint unavailable ({e}) — printing the enrollment-only paste; the node must already reach the controller (or pass --no-tailscale to silence this)")));
+    say(&ui::muted(&ts_mint_skipped(e)));
     if e.contains("invalid or not permitted") {
         // #46 corrected the remediation: with both tags on the client and
         // both declared, the missing piece is the OWNERSHIP chain — the
@@ -1192,6 +1192,34 @@ fn explain_ts_mint_failure(e: &str) {
             ("https://login.tailscale.com/admin/acls/file", "policy editor — add the co-owner, then re-run this command"),
             ("noo onboard --reconfigure --only enrollment", "if the client itself lacks a tag, regenerate it with both tags and re-paste here"),
         ]);
+    }
+}
+
+/// Why the paste carries no tailnet key when the mint failed: the first line
+/// the text prints and the `tailnet_skipped` reason under --json. Pure.
+pub(crate) fn ts_mint_skipped(e: &str) -> String {
+    format!("tailscale key mint unavailable ({e}) — the paste is enrollment-only; the node must already reach the controller (or pass --no-tailscale to silence this)")
+}
+
+/// Set `tailnet_skipped` on the gateway's answer to `reason`, unless the
+/// gateway already said why (the self-node case). Same shape: a sentence.
+pub(crate) fn with_tailnet_skipped(resp: &mut serde_json::Value, reason: Option<String>) {
+    if let Some(r) = reason {
+        if resp["tailnet_skipped"].as_str().is_none() {
+            resp["tailnet_skipped"] = json!(r);
+        }
+    }
+}
+
+/// The gateway's `next` steps name its own `enroll_command`; when the CLI
+/// changes that line (i596 `--controller-approvals`), the step that ran it
+/// carries the new line too. Pure.
+pub(crate) fn retarget_next(resp: &mut serde_json::Value, enroll: &str) {
+    let Some(old) = resp["enroll_command"].as_str().map(str::to_string) else { return };
+    if let Some(steps) = resp["next"].as_array_mut() {
+        for s in steps.iter_mut().filter(|s| s["command"].as_str() == Some(old.as_str())) {
+            s["command"] = json!(enroll);
+        }
     }
 }
 
@@ -1216,10 +1244,23 @@ struct EnrollPaste<'a> {
     self_node: bool,
     joins_tailnet: bool,
     node: Option<&'a str>,
+    /// The gateway's `needs_human`: what a person must do during the paste.
+    /// None from an older gateway (and the local composition).
+    needs_human: Option<&'a str>,
+}
+
+/// The paste's first line. The gateway's `needs_human` is the one string
+/// humans and agents read; an older gateway's answer has none, so the line
+/// it always said stands. Pure.
+pub(crate) fn run_as_line(needs_human: Option<&str>) -> String {
+    match needs_human.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(h) => format!("run AS YOUR USER on the node ({h})"),
+        None => "run AS YOUR USER on the node (it runs several sudo commands; sudo asks for your password)".to_string(),
+    }
 }
 
 fn print_enroll_paste(p: &EnrollPaste) {
-    say(&ui::emph("run AS YOUR USER on the node (it runs several sudo commands; sudo asks for your password)"));
+    say(&ui::emph(&run_as_line(p.needs_human)));
     say("");
     say(&ui::status_line(Glyph::Step, "step 1 — make sure the noo CLI is on the node (skip if `noo --version` already works):"));
     // The controller-mirror lane used to lead here, fetched with
@@ -1341,6 +1382,9 @@ pub fn cluster_bootstrap_token_create(g: &Globals, args: &[String]) -> Result<i3
     // field and returns neither command — the local composition below
     // stays for it.
     body["with_tailscale"] = json!(with_ts);
+    // Why the tailnet key was dropped, when the mint failed: printed now in
+    // text, carried as `tailnet_skipped` under --json.
+    let mut ts_skipped: Option<String> = None;
     let mut resp = match post_json_try(g, "/api/security/bootstrap-tokens", &body, true, 15) {
         Ok(v) => v,
         // The gateway refuses the WHOLE mint when the tailnet key fails (no
@@ -1350,6 +1394,7 @@ pub fn cluster_bootstrap_token_create(g: &Globals, args: &[String]) -> Result<i3
             if !g.json {
                 explain_ts_mint_failure(&e);
             }
+            ts_skipped = Some(ts_mint_skipped(&e));
             with_ts = false;
             body["with_tailscale"] = json!(false);
             match post_json_try(g, "/api/security/bootstrap-tokens", &body, true, 15) {
@@ -1363,9 +1408,11 @@ pub fn cluster_bootstrap_token_create(g: &Globals, args: &[String]) -> Result<i3
     // controller approvals during enrollment. It is a flag on the line the
     // operator pastes on the node, added here, not by the gateway.
     if let Some(e) = resp["enroll_command"].as_str().map(|e| enroll_line(e, controller_approvals)) {
+        retarget_next(&mut resp, &e);
         resp["enroll_command"] = json!(e);
     }
     if g.json {
+        with_tailnet_skipped(&mut resp, ts_skipped);
         println!("{resp}");
         return Ok(0);
     }
@@ -1395,6 +1442,7 @@ pub fn cluster_bootstrap_token_create(g: &Globals, args: &[String]) -> Result<i3
             self_node,
             joins_tailnet,
             node: resp["node_name"].as_str(),
+            needs_human: resp["needs_human"].as_str(),
         });
         let id = resp["id"].as_str().unwrap_or("?");
         let expires = resp["expires_at"].as_str().unwrap_or("?");
@@ -1514,6 +1562,7 @@ pub fn cluster_bootstrap_token_create(g: &Globals, args: &[String]) -> Result<i3
                     self_node,
                     joins_tailnet: true,
                     node: resp["node_name"].as_str(),
+                    needs_human: None,
                 });
                 return Ok(0);
             }
@@ -1689,6 +1738,49 @@ pub fn cluster_bootstrap_token_revoke(g: &Globals, args: &[String]) -> Result<i3
 #[cfg(test)]
 mod bootstrap_token_tests {
     use super::parse_ttl_seconds;
+
+    /// The paste's first line is the gateway's `needs_human`; an older
+    /// gateway without it keeps today's line.
+    #[test]
+    fn the_run_as_line_comes_from_needs_human() {
+        assert_eq!(
+            super::run_as_line(Some("the enroll command runs sudo; a person types the password unless that machine has passwordless sudo")),
+            "run AS YOUR USER on the node (the enroll command runs sudo; a person types the password unless that machine has passwordless sudo)"
+        );
+        let old = "run AS YOUR USER on the node (it runs several sudo commands; sudo asks for your password)";
+        assert_eq!(super::run_as_line(None), old);
+        assert_eq!(super::run_as_line(Some("  ")), old);
+    }
+
+    /// `--controller-approvals` changes the enroll line; the `next` step
+    /// that runs it says the same line.
+    #[test]
+    fn next_follows_the_enroll_line_the_cli_prints() {
+        let mut resp = serde_json::json!({
+            "enroll_command": "noo enroll noo1.B",
+            "next": [{ "kind": "command", "command": "I" }, { "kind": "command", "command": "noo enroll noo1.B" }]
+        });
+        super::retarget_next(&mut resp, "noo enroll noo1.B --controller-approvals");
+        assert_eq!(resp["next"][1]["command"], "noo enroll noo1.B --controller-approvals");
+        assert_eq!(resp["next"][0]["command"], "I");
+    }
+
+    /// A failed tailnet mint is carried as `tailnet_skipped`, the text's own
+    /// line; the gateway's self-node reason is never overwritten.
+    #[test]
+    fn a_failed_tailnet_mint_sets_tailnet_skipped() {
+        let mut resp = serde_json::json!({ "tailnet_skipped": null });
+        super::with_tailnet_skipped(&mut resp, Some(super::ts_mint_skipped("403 invalid or not permitted")));
+        let r = resp["tailnet_skipped"].as_str().expect("set");
+        assert!(r.starts_with("tailscale key mint unavailable (403 invalid or not permitted)"), "{r}");
+        assert!(r.contains("enrollment-only"), "{r}");
+        let mut resp = serde_json::json!({ "tailnet_skipped": "this is the controller's own device" });
+        super::with_tailnet_skipped(&mut resp, Some("x".into()));
+        assert_eq!(resp["tailnet_skipped"], "this is the controller's own device");
+        let mut resp = serde_json::json!({});
+        super::with_tailnet_skipped(&mut resp, None);
+        assert!(resp.get("tailnet_skipped").is_none());
+    }
 
     #[test]
     fn the_node_install_line_downloads_then_runs_and_matches_the_gateways() {

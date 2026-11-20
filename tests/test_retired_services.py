@@ -259,5 +259,6 @@ def test_the_launcher_removes_retired_before_its_whole_stack_up(name: str) -> No
     report = next((i for i, l in enumerate(lines) if "compose_report_undeclared" in l), None)
     assert call is not None, f"{name} must remove retired services"
     assert report is not None and call < report, f"{name}: removal must come before the up and its report"
-    ups = [i for i, l in enumerate(lines) if re.search(r"(^|\s)up\s+-d", l)]
+    # start's whole-stack `up` is start_inputs_full_up (lib-start-inputs.sh).
+    ups = [i for i, l in enumerate(lines) if re.search(r"(^|\s)up\s+-d|^\s*start_inputs_full_up\b", l)]
     assert ups and call < min(ups), f"{name}: removal at {call} must precede the first up at {min(ups)}"

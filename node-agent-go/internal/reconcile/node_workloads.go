@@ -49,14 +49,17 @@ func newNodeWorkloads(cfg *config.Config, docker *dockerpkg.Client, sets *models
 	approvals := nodepolicy.NewApprovals(cfg.StateDir)
 	ctl := newControllerApprovals(cfg)
 	var nvidia func(context.Context) (bool, error)
+	var engine func(context.Context) map[string]any
 	if docker != nil {
 		nvidia = docker.NvidiaRuntimeKnown
+		engine = docker.EngineReport
 	}
 	facts := &nodepolicy.Facts{
 		Mode: mode, Approvals: approvals, Controller: ctl, ControllerHost: cfg.SelfNode,
 		ComputeCaps:    (&hardware.GPUDetector{}).DetectComputeCaps,
 		NvidiaRuntime:  nvidia,
 		DataRootFreeGB: nodepolicy.DataRootFreeGB,
+		DockerEngine:   engine,
 	}
 	if docker == nil {
 		return nil, facts

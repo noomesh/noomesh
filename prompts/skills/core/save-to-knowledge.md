@@ -21,7 +21,7 @@ workspace and RAG system play distinct roles:
 
 | Layer | Path / Tool | Purpose |
 |-------|-------------|---------|
-| Workspace | `/workspace` (mounted at `/mnt/d/AgentWorkspace`) | File-system persistence. Editable, inspectable, NOT auto-indexed. |
+| Workspace | `workspace.mount` in noomesh.yaml (default `/workspace`; `workspace.host` is the host folder behind it) | File-system persistence. Editable, inspectable, NOT auto-indexed. |
 | RAG knowledge base | `noo_rag_ingest` | Vector-indexed + graph-extracted. Recalled by `noo_rag_query` on future turns. |
 
 To make content truly retrievable, you MUST do both: write to the workspace AND ingest into RAG.
@@ -99,7 +99,7 @@ and can be re-ingested later if the content is updated.
 
 - **Ingest existing files** (not generated now): use the `rag-expert` skill
 - **Just reference something later in THIS conversation**: don't save to
-  knowledge base; the conversation is already in noo_entries and will
-  be recalled semantically
+  knowledge base; the conversation is already stored and will be
+  recalled semantically
 - **Save a web article**: scrape with web_search / browser, synthesize
   markdown, then use this skill

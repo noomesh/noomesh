@@ -211,7 +211,7 @@ def test_the_agent_state_is_saved_after_the_model_step_even_when_it_passes():
     full = text.index("step onboard 3600")
     call = text.index("\nagent_dump model\n")
     assert call > model and call > full, "after both model paths"
-    assert call < text.index("step stack-start"), "before anything else moves the stack"
+    assert call < text.index("step health 600"), "before anything else moves the stack"
     body = text[text.index("agent_dump() {"):text.index("ON_STEP_FAIL=agent_dump")]
     assert 'noo --json cluster show "$(hostname)"' in body
     assert 'grep -E "reconcile_nudge|placement"' in body
@@ -874,3 +874,88 @@ def test_the_ollama_verified_probe_reads_the_container_onboard_pulled_into(tmp_p
     assert "export -f onboard_ollama_container" in text
     lines = [ln for ln in probe.splitlines() if "OLLAMA-VERIFIED " in ln]
     assert len(lines) == 2 and all("(ollama ${ov:-?} in $oc)" in ln for ln in lines), lines
+
+
+# ── the plain start after onboard (recreated.py) ───────────────────────────
+RC = _load("install_cell_recreated", ROOT / "scripts" / "install-cell" / "recreated.py")
+
+
+def _rc_files(tmp_path, before: dict, after: dict):
+    b, a = tmp_path / "before", tmp_path / "after"
+    b.write_text("".join(f"{n} {i} {s} {d}\n" for n, (i, s, d) in before.items()))
+    a.write_text("".join(f"{n} {i} {s} {d}\n" for n, (i, s, d) in after.items()))
+    return str(b), str(a)
+
+
+STACK = {"noo-gateway": ("g1", "gateway", "postgres:service_healthy:false"),
+         "noo-postgres": ("p1", "postgres", "-"),
+         "noo-trellion": ("t1", "trellion", "gateway:service_started:true,postgres:service_healthy:false")}
+
+
+def _run_judge(tmp_path, after: dict, *mode: str):
+    b, a = _rc_files(tmp_path, STACK, after)
+    r = subprocess.run([sys.executable, str(ROOT / "scripts/install-cell/recreated.py"), "judge", "X", b, a, *mode],
+                       capture_output=True, text=True)
+    return r.returncode, r.stdout.strip()
+
+
+def test_start_idempotent_passes_only_when_no_id_moved(tmp_path):
+    assert _run_judge(tmp_path, dict(STACK), "--none") == (0, "X PASS: 0 containers recreated (3 unchanged)")
+    moved = dict(STACK, **{"noo-postgres": ("p2", "postgres", "-")})
+    assert _run_judge(tmp_path, moved, "--none") == (1, "X FAIL: 1 recreated: noo-postgres")
+    gone = {k: v for k, v in STACK.items() if k != "noo-trellion"}
+    rc, out = _run_judge(tmp_path, gone, "--none")
+    assert rc == 1 and "removed: noo-trellion" in out
+
+
+def test_start_input_change_allows_only_the_service_and_its_dependents(tmp_path):
+    only_gw = dict(STACK, **{"noo-gateway": ("g2", "gateway", "postgres:service_healthy:false")})
+    rc, out = _run_judge(tmp_path, only_gw, "--only", "gateway")
+    assert rc == 0 and out.startswith("X PASS: only gateway recreated;"), out
+    with_dep = dict(only_gw, **{"noo-trellion": ("t2", "trellion", STACK["noo-trellion"][2])})
+    rc, out = _run_judge(tmp_path, with_dep, "--only", "gateway")
+    assert rc == 0 and "1 that depend on it: noo-trellion" in out, out
+    stray = dict(only_gw, **{"noo-postgres": ("p2", "postgres", "-")})
+    rc, out = _run_judge(tmp_path, stray, "--only", "gateway")
+    assert rc == 1 and "do not depend on gateway: noo-postgres" in out, out
+    rc, out = _run_judge(tmp_path, dict(STACK), "--only", "gateway")
+    assert rc == 1 and "gateway was not recreated" in out, out
+
+
+def test_start_recreate_needs_every_container_recreated(tmp_path):
+    every = {n: (i + "x", s, d) for n, (i, s, d) in STACK.items()}
+    assert _run_judge(tmp_path, every, "--all") == (0, "X PASS: all 3 containers recreated")
+    one_kept = dict(every, **{"noo-postgres": STACK["noo-postgres"]})
+    assert _run_judge(tmp_path, one_kept, "--all") == (1, "X FAIL: 1 not recreated: noo-postgres")
+
+
+def test_an_empty_before_is_never_a_pass(tmp_path):
+    b, a = _rc_files(tmp_path, {}, {})
+    ok, line = RC.judge("X", RC.read(b), RC.read(a), "none")
+    assert not ok and "no stack container was recorded" in line
+
+
+def test_the_stranger_checks_health_and_the_three_start_checks_fail_the_cell():
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    health = text.index("step health 600 ")
+    assert "step stack-start " not in text, "README step 3 is `noo health`: the wizard leaves the stack running"
+    order = [text.index(f"step {n} ") for n in ("start-idempotent", "start-input-change", "start-input-restore",
+                                                 "start-recreate", "health-after-starts")]
+    assert health < order[0] and order == sorted(order)
+    for name, verdict, mode in [("start-idempotent", "START-IDEMPOTENT", "--none"),
+                                ("start-input-change", "START-INPUT-CHANGE", "--only gateway"),
+                                ("start-recreate", "START-RECREATE", "--all")]:
+        body = text[text.index(f"step {name} "):]
+        body = body[:body.index("|| fail_onboarded") + len("|| fail_onboarded")]
+        assert f"judge {verdict} " in body and body.rstrip().endswith(f"{mode}' _ \"$RC_PY\" \"$OUT\" || fail_onboarded"), name
+        assert not name.startswith("probe-"), "a probe never fails the cell"
+    assert "noo stack start --recreate" in text[order[3]:order[4]]
+
+
+def test_a_failed_start_check_is_the_cells_failure(tmp_path):
+    rec = {"step": "start-idempotent", "rc": 1, "seconds": 1, "first_error": "START-IDEMPOTENT FAIL: 13 recreated",
+           "prompts": [], "warnings": [], "tail": []}
+    (tmp_path / "steps.jsonl").write_text(json.dumps(rec) + "\n")
+    (tmp_path / "meta.json").write_text("{}")
+    out = C.summarize(tmp_path)
+    assert out["result"] == "fail" and out["failed_step"] == "start-idempotent"
