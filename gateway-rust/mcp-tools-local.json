@@ -1438,15 +1438,15 @@
       "aliases": {},
       "auth": "cluster",
       "body_field": "",
-      "description": "Probe SSH reachability of inventory + (optional) ad-hoc subnet, and\ncross-check against the cluster registry. Read-only \u2014 no enrollment, no\nstate changes. Use BEFORE proposing a node-add to see what's reachable\nand which hosts are already enrolled.\n\nReturns: trusted_hosts (from the inventory file), discovered_hosts\n(subnet scan that aren't in inventory), and cluster_registered\n(already-enrolled nodes). Discovery is read-only: nothing here enrolls\nanything, and every enrolment needs a person on the target machine.",
+      "description": "List candidate hosts \u2014 the inventory file's, plus an optional ad-hoc\nsubnet \u2014 and cross-check them against the enrolled nodes. Each host's\n`ssh_reachable` only says whether TCP port 22 accepted a connection: a\nliveness hint, no login is attempted, and no node is ever enrolled or\nmanaged over SSH. Read-only \u2014 no state changes. Use BEFORE proposing a\nnode-add to see what is up and which hosts are already enrolled.\n\nReturns: trusted_hosts (from the inventory file), discovered_hosts\n(subnet scan that aren't in inventory), and cluster_registered\n(already-enrolled nodes). Nothing here enrolls anything: a machine\njoins only when a person runs a bootstrap-token enroll command on it\n(noo_mint_bootstrap_token).",
       "had_custom_format": false,
       "input_schema": {
         "additionalProperties": false,
-        "description": "Probe SSH reachability of inventory + (optional) ad-hoc subnet, and\ncross-check against the cluster registry. Read-only \u2014 no enrollment, no\nstate changes. Use BEFORE proposing a node-add to see what's reachable\nand which hosts are already enrolled.\n\nReturns: trusted_hosts (from the inventory file), discovered_hosts\n(subnet scan that aren't in inventory), and cluster_registered\n(already-enrolled nodes). Discovery is read-only: nothing here enrolls\nanything, and every enrolment needs a person on the target machine.",
+        "description": "List candidate hosts \u2014 the inventory file's, plus an optional ad-hoc\nsubnet \u2014 and cross-check them against the enrolled nodes. Each host's\n`ssh_reachable` only says whether TCP port 22 accepted a connection: a\nliveness hint, no login is attempted, and no node is ever enrolled or\nmanaged over SSH. Read-only \u2014 no state changes. Use BEFORE proposing a\nnode-add to see what is up and which hosts are already enrolled.\n\nReturns: trusted_hosts (from the inventory file), discovered_hosts\n(subnet scan that aren't in inventory), and cluster_registered\n(already-enrolled nodes). Nothing here enrolls anything: a machine\njoins only when a person runs a bootstrap-token enroll command on it\n(noo_mint_bootstrap_token).",
         "properties": {
           "skip_unreachable": {
             "default": true,
-            "description": "When true (default), omit hosts that don't answer on SSH/22. Set false to see the complete list including unreachable hosts.",
+            "description": "When true (default), omit non-inventory hosts that do not accept a TCP connection on port 22. Set false to see the complete list including unreachable hosts.",
             "title": "Skip Unreachable",
             "type": "boolean"
           },
@@ -1550,11 +1550,11 @@
               }
             ],
             "default": null,
-            "description": "Optional role hint for the playbook (gpu_tier1, gpu_tier2, edge_tier4). Auto-detected from hardware probe if omitted.",
+            "description": "Optional role hint recorded on the proposal for the reviewer (gpu_tier1, gpu_tier2, edge_tier4). The node reports its own hardware when it enrolls.",
             "title": "Role"
           },
           "user": {
-            "description": "SSH user on the target (e.g. 'ubuntu', 'noo')",
+            "description": "The login a person will use on the target to run the enroll command (e.g. 'ubuntu'). Recorded for the reviewer only; the controller never logs in",
             "title": "User",
             "type": "string"
           }

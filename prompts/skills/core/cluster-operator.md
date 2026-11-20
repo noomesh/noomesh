@@ -8,7 +8,7 @@ trigger_keywords: [cluster, node, backend, gpu, vllm, ollama, llamacpp, deploy]
 priority: 5
 max_context_chars: 4000
 composable: true
-requires_tools: [noo_cluster_status, noo_inference, noo_models_pull, noo_models_cached]
+requires_tools: [noo_cluster_status, noo_inference]
 fitness: 0.0
 generation: 0
 parent_skill: null
@@ -25,14 +25,17 @@ You are managing the noomesh compute cluster. Apply these operational principles
 - Tier 3 (CPU only): Ollama CPU mode, suitable for small models only
 
 ## Backend Lifecycle
-- Use `noo_models_cached` to check what's already downloaded
-- Pre-cache models with `noo_models_pull` before starting backends
-- Backends auto-start on demand; prefer explicit start for production
+- `noo_models_cached` / `noo_models_pull` are not on the user door
+  (`/mcp/user`); without them, ask the operator to stage models
+- A backend runs where it is placed: `noo cluster place <node> <backend> <model>`
+  is desired state the node agent converges. A chat request does not start one
 - Idle backends (>10min) are candidates for scaledown
 
 ## Troubleshooting
 - Node OFFLINE: check last heartbeat, network connectivity, Docker status
-- Node QUARANTINED: 3+ consecutive failures; investigate before unquarantining
+- Node QUARANTINED: offline for 3 consecutive autonomy checks. There is no
+  unquarantine command: the node's next accepted heartbeat sets it online.
+  Find why it stopped beating (`noo cluster verify <node>`)
 - Backend start failure: check VRAM availability, model compatibility, port conflicts
 - High latency: check node load, consider model quantization or smaller model
 

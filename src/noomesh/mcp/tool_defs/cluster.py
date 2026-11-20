@@ -102,15 +102,18 @@ class PaiModelsPull(ToolDef):
 
 @register
 class PaiClusterDiscover(ToolDef):
-    """Probe SSH reachability of inventory + (optional) ad-hoc subnet, and
-    cross-check against the cluster registry. Read-only — no enrollment, no
-    state changes. Use BEFORE proposing a node-add to see what's reachable
-    and which hosts are already enrolled.
+    """List candidate hosts — the inventory file's, plus an optional ad-hoc
+    subnet — and cross-check them against the enrolled nodes. Each host's
+    `ssh_reachable` only says whether TCP port 22 accepted a connection: a
+    liveness hint, no login is attempted, and no node is ever enrolled or
+    managed over SSH. Read-only — no state changes. Use BEFORE proposing a
+    node-add to see what is up and which hosts are already enrolled.
 
     Returns: trusted_hosts (from the inventory file), discovered_hosts
     (subnet scan that aren't in inventory), and cluster_registered
-    (already-enrolled nodes). Discovery is read-only: nothing here enrolls
-    anything, and every enrolment needs a person on the target machine."""
+    (already-enrolled nodes). Nothing here enrolls anything: a machine
+    joins only when a person runs a bootstrap-token enroll command on it
+    (noo_mint_bootstrap_token)."""
 
     name: ClassVar[str] = "noo_cluster_discover"
     description: ClassVar[str] = __doc__
@@ -126,7 +129,7 @@ class PaiClusterDiscover(ToolDef):
     )
     skip_unreachable: bool = Field(
         default=True,
-        description="When true (default), omit hosts that don't answer on SSH/22. "
+        description="When true (default), omit non-inventory hosts that do not accept a TCP connection on port 22. "
                     "Set false to see the complete list including unreachable hosts.",
     )
 
@@ -155,7 +158,8 @@ class PaiClusterPropose(ToolDef):
     risk_level: ClassVar[RiskLevel] = RiskLevel.LOW
 
     host: str = Field(description="IP or hostname to propose for enrollment")
-    user: str = Field(description="SSH user on the target (e.g. 'ubuntu', 'noo')")
+    user: str = Field(description="The login a person will use on the target to run the enroll command "
+                                  "(e.g. 'ubuntu'). Recorded for the reviewer only; the controller never logs in")
     reason: str = Field(
         description="Why are you proposing this? Logged for audit + shown to "
                     "the user when they review. Examples: 'discovered idle GPU "
@@ -163,8 +167,9 @@ class PaiClusterPropose(ToolDef):
     )
     role: Optional[str] = Field(
         default=None,
-        description="Optional role hint for the playbook (gpu_tier1, gpu_tier2, "
-                    "edge_tier4). Auto-detected from hardware probe if omitted."
+        description="Optional role hint recorded on the proposal for the reviewer "
+                    "(gpu_tier1, gpu_tier2, edge_tier4). The node reports its own "
+                    "hardware when it enrolls."
     )
 
 
