@@ -354,14 +354,18 @@ pub(crate) const REGISTER_KEEPS_FROM_STORED: &[&str] = &["lanes", "running_backe
 pub(crate) const STORED_CARRY_MAX_AGE_SECS: f64 = 4.0 * crate::coordinator::classes::HEARTBEAT_INTERVAL_SECS;
 
 /// Carry one field from the node's STORED record onto a registration's
-/// rebuilt one, when the registration body does not carry it: what the node
+/// rebuilt one, when the registration body does not carry it (a body that
+/// does is written as it is, and wins): what the node
 /// offered a second ago, kept until its next beat replaces it (a beat sets
 /// `lanes` and `running_backends` every time; a lane that turned out gone
 /// fails over as any dead lane does). `stored` is `None` when there is no
 /// record (first registration, or `noo cluster forget` purged it) or it is
 /// too old ([`stored_for_carry`]): then nothing is carried.
 pub(crate) fn carry_stored(data: &mut Value, stored: Option<&Value>, body: &Value, key: &str) {
-    if body.get(key).is_some_and(|v| !v.is_null()) {
+    // What the registration itself says wins, and is written: a body that
+    // carries the field (`lanes: []` included: "no lanes") is the newest fact.
+    if let Some(v) = body.get(key).filter(|v| !v.is_null()) {
+        data[key] = v.clone();
         return;
     }
     if let Some(v) = stored.and_then(|s| s.get(key)).filter(|v| !v.is_null()) {
