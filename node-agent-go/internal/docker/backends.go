@@ -888,7 +888,7 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 			envOverrides["MODEL_PATH"] = model
 		}
 	case "embedding", "reranker":
-		embedRerankModelEnv(spec, model, envOverrides)
+		_ = model
 	}
 
 	// GPU count override
