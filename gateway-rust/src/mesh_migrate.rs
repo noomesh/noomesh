@@ -2523,16 +2523,6 @@ END $$
     sql: r#"
 ALTER TABLE IF EXISTS noo_service_keys ADD COLUMN IF NOT EXISTS context_overflow text NOT NULL DEFAULT 'flag' CHECK (context_overflow IN ('flag', 'refuse'))
 "#,
-}, Migration {
-    revision: BUNDLE_APPLY_REFUSAL_REVISION,
-    down_revision: Some(SERVICE_KEY_CONTEXT_OVERFLOW_REVISION),
-    // The applier's refusal NAME beside its exit code (055's apply_rc): which
-    // remedy a refused bundle needs, as the node's report names it. Nullable,
-    // no default: an older fetcher sends no name, and the gateway writes NULL
-    // then. A catalog change, no rewrite; an older gateway never reads it.
-    sql: r#"
-ALTER TABLE IF EXISTS noo_provision_bundles ADD COLUMN IF NOT EXISTS apply_refusal text
-"#,
 }];
 
 /// Add-on feature settings and the super-admin flag (f99). A constant so a
@@ -2604,10 +2594,6 @@ pub const NODE_WORKLOAD_HOLDER_REVISION: &str = "124_node_workload_holder";
 /// A service key's context-overflow mode, 'flag' or 'refuse' (i802), on
 /// 124: numbered at rebase against dev's real head.
 pub const SERVICE_KEY_CONTEXT_OVERFLOW_REVISION: &str = "125_service_key_context_overflow";
-
-/// `apply_refusal` on a staged bundle: the refusal name the node's apply
-/// report carries, on 125: numbered at rebase against dev's real head.
-pub const BUNDLE_APPLY_REFUSAL_REVISION: &str = "126_bundle_apply_refusal";
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
 /// constant so a renumber at rebase is one line.
@@ -4380,7 +4366,7 @@ mod request_trace_ttft_migration_tests {
         }
     }
 
-    /// The context-overflow mode, on the holder (124), under 126; one
+    /// The context-overflow mode: the chain head, on the holder (124); one
     /// column, 'flag' for every existing key, and the CHECK that keeps it to
     /// the two words the gateway reads.
     #[test]
@@ -4389,23 +4375,11 @@ mod request_trace_ttft_migration_tests {
         assert_eq!(m.revision, "125_service_key_context_overflow");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(NODE_WORKLOAD_HOLDER_REVISION));
-        assert_eq!(MIGRATIONS.iter().find(|n| n.down_revision == Some(SERVICE_KEY_CONTEXT_OVERFLOW_REVISION)).map(|n| n.revision), Some(BUNDLE_APPLY_REFUSAL_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(SERVICE_KEY_CONTEXT_OVERFLOW_REVISION), "the chain head");
         assert_eq!(
             m.sql.trim(),
             "ALTER TABLE IF EXISTS noo_service_keys ADD COLUMN IF NOT EXISTS context_overflow text NOT NULL DEFAULT 'flag' CHECK (context_overflow IN ('flag', 'refuse'))"
         );
-    }
-
-    /// The apply report's refusal name: the chain head, on 125; one nullable
-    /// column on the bundle row, nothing else.
-    #[test]
-    fn bundle_apply_refusal_is_the_head_and_adds_one_nullable_column() {
-        let m = MIGRATIONS.iter().find(|m| m.revision == BUNDLE_APPLY_REFUSAL_REVISION).expect("in the chain");
-        assert_eq!(m.revision, "126_bundle_apply_refusal");
-        assert!(m.revision.len() <= 32);
-        assert_eq!(m.down_revision, Some(SERVICE_KEY_CONTEXT_OVERFLOW_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(BUNDLE_APPLY_REFUSAL_REVISION), "the chain head");
-        assert_eq!(m.sql.trim(), "ALTER TABLE IF EXISTS noo_provision_bundles ADD COLUMN IF NOT EXISTS apply_refusal text");
     }
 
     /// The release script (`scripts/mesh-migration-head.sh`) takes the
