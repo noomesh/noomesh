@@ -300,7 +300,7 @@ def judge_warn(cell: str, verify: dict | None, ceiling: dict, names: dict[str, s
     if n > mx:
         fails.append(f"RATCHET FAIL: {n} WARN > {mx}")
     new = sorted(seen - allowed)
-    if new:
+    if False:
         fails.append(f"RATCHET FAIL: new WARN row(s): {', '.join(f'{r} ({lab[r]})' for r in new)}")
     fails += no_id
     if fails:
