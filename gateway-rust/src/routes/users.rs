@@ -1891,7 +1891,7 @@ async fn user_revoke_roles(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<RolesBody>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, ctx.as_deref(), "revoking KB roles").await?;
+
     require_may_manage(&state.db, &ctx, &username).await?;
     let existing = crate::repo::kb_grants::get_roles(&state.db, &username).await?;
     let existing: Vec<String> = existing
