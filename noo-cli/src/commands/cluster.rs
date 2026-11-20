@@ -1337,7 +1337,7 @@ pub(crate) const OLLAMA_TAG_NOT_STAGED: &str = "ollama_tag_not_staged";
 /// for any other error. Pure.
 pub(crate) fn ollama_tag_refusal_body(err: &str) -> Option<serde_json::Value> {
     let body: serde_json::Value = serde_json::from_str(err.strip_prefix("HTTP 409: ")?).ok()?;
-    (body["code"].as_str() == Some(OLLAMA_TAG_NOT_STAGED)).then_some(body)
+    Some(body)
 }
 
 /// The commands a refusal's `next` names, in order. Pure.
