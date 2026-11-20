@@ -10297,21 +10297,24 @@ mod tests {
         let luks = at_rest_remedy("loki at rest");
         assert_ne!(luks, at_rest_remedy("age key at rest"));
         // FAIL rows, so this reads the grouping alone (a_node_warn_remedy_
-        // prints_after_the_fails reads which verdicts print).
+        // prints_after_the_fails reads which verdicts print). The rows are
+        // ones that can FAIL (the at-rest rows only warn); the two shared
+        // remedies are any two distinct strings.
+        let keys = at_rest_remedy("age key at rest");
         let rows = vec![
-            fail("loki at rest", "plaintext", luks),
+            fail("nats tls", "plaintext", luks),
             fail("loki", "other", "noo health"),
-            fail("postgres at rest", "plaintext", luks),
-            fail("age key at rest", "plaintext", at_rest_remedy("age key at rest")),
-            fail("pki at rest", "plaintext", at_rest_remedy("pki at rest")),
+            fail("postgres hba", "plaintext", luks),
+            fail("tempo listener", "plaintext", keys),
+            fail("loki listener", "plaintext", keys),
         ];
         let c = remedies_to_print(&rows);
         assert_eq!(
             c,
             vec![
-                (luks, vec!["loki at rest", "postgres at rest"]),
+                (luks, vec!["nats tls", "postgres hba"]),
                 ("noo health", vec!["loki"]),
-                (at_rest_remedy("age key at rest"), vec!["age key at rest", "pki at rest"]),
+                (keys, vec!["tempo listener", "loki listener"]),
             ]
         );
         // Node sections group identical FAIL remedies the same way.
@@ -15500,7 +15503,7 @@ mod digest_tests {
     /// A realistic controller section: lots of passes, every at-rest row (one
     /// of them a warning), a failing sandbox row and a warning.
     fn controller() -> Vec<Check> {
-        let mut v: Vec<Check> = ["posture", "service keys", "pki key modes", "postgres tls", "gateway redis", "nats bus"]
+        let mut v: Vec<Check> = ["posture", "service keys", "pki key modes", "postgres tls", "gateway redis", "gateway bus"]
             .iter().map(|n| ok(n, "ok")).collect();
         for n in AT_REST_DIR_ROWS {
             v.push(if n == "postgres at rest" {
@@ -15540,12 +15543,13 @@ mod digest_tests {
         assert_eq!(rows[0].verdict, Verdict::Warn);
         assert!(rows[0].detail.starts_with("postgres — "), "{}", rows[0].detail);
         assert!(!rows[0].detail.contains("loki") && !rows[0].detail.contains("redis"), "{}", rows[0].detail);
-        // Two not-clean dirs are both named; the worse verdict leads.
+        // Two not-clean dirs are both named; the worse verdict leads (the
+        // at-rest rows warn or are accepted: WARN outranks ACCEPTED).
         let mut checks = controller();
-        checks.push(fail("age key at rest", "world-readable", "chmod 600 key"));
+        checks.push(accepted("age key at rest", "accepted risk"));
         let d = digest(&checks, false);
         let g = d.rows.iter().find(|c| c.name == "data at rest").unwrap();
-        assert_eq!(g.verdict, Verdict::Fail);
+        assert_eq!(g.verdict, Verdict::Warn);
         assert!(g.detail.starts_with("postgres, age key — "), "{}", g.detail);
     }
 
