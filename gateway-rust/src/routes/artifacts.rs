@@ -1162,7 +1162,7 @@ pub(crate) fn ollama_tag_in_store(dir: &Path, model: &str) -> Option<bool> {
         return Some(true);
     }
     let stem = ollama_store_stem(name)?;
-    Some(dir.join(format!("{stem}.ollama-manifest")).is_file() || dir.join(format!("{stem}.Modelfile")).is_file())
+    Some(dir.join(format!("{stem}.Modelfile")).is_file())
 }
 
 /// The place-time refusal. The phrase "is not staged on the controller" and
