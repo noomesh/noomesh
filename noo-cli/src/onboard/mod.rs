@@ -1511,12 +1511,6 @@ fn print_final_summary(ctx: &Ctx) {
     // an install that is fully configured. Suppress the identity lines
     // when the steps that establish them did not run — a targeted run
     // reports only what it touched.
-    // Every step that writes a container's inputs has run: bring the stack
-    // in line with them NOW, with the operator's own plain start, so the
-    // first `noo stack start` after onboard recreates nothing. Before the
-    // posture restart: on a fresh install this recreates the gateway, which
-    // then runs the declared posture and needs no second restart.
-    steps::converge_stack(ctx);
     // The running posture must be the declared one before anyone walks
     // away. The posture step lands rows the gateway reads at START and
     // deliberately does not restart mid-wizard (see `security_posture`);
@@ -1542,6 +1536,14 @@ fn print_final_summary(ctx: &Ctx) {
             Some(_) => {}
         }
     }
+    // Every step that writes a container's inputs has run, and the posture
+    // restart (which labels what it recreates, noomesh-restart.sh) too: bring
+    // the stack in line with them NOW, with the operator's own plain start,
+    // so the first `noo stack start` after onboard recreates nothing. On a
+    // fresh install that is nats (users.conf), worker and trellion (the model
+    // step's noomesh.yaml, written after their service-key recreate); the
+    // gateway was recreated, labelled, by the posture restart above.
+    steps::converge_stack(ctx);
     // An install is not done until it verifies: the same
     // invariants `noo cluster verify --controller` asserts, printed here so
     // the last thing the operator reads is what still needs doing.
@@ -2079,9 +2081,9 @@ mod posture_tests {
     /// worker, because onboard wrote their inputs after its own start. Onboard
     /// now ends converged: `drive` runs every step that writes an input
     /// (`run_all`: services, service keys, self node, model, add-ons) BEFORE
-    /// the summary, and the summary's plain start comes before the posture
-    /// restart (so a fresh install's gateway is recreated once, not twice)
-    /// and before the closing verify (which reads the converged stack).
+    /// the summary, and the summary's plain start comes AFTER the posture
+    /// restart (the last recreate onboard does itself) and before the
+    /// closing verify (which reads the converged stack).
     #[test]
     fn onboard_ends_with_the_stack_in_line_with_what_it_wrote() {
         let own = crate::test_src::own_code(include_str!("mod.rs"));
@@ -2093,7 +2095,7 @@ mod posture_tests {
         let converge = body.find("steps::converge_stack(ctx);").expect("onboard does not end converged");
         let posture = body.find(r#""noomesh-restart.sh", &["--force", "gateway""#).expect("posture restart");
         let verify = body.find("FINAL_VERIFY_ARGS").expect("closing verify");
-        assert!(converge < posture, "converge before the posture restart, or the gateway is recreated twice");
+        assert!(posture < converge, "the last start must follow onboard's own last recreate (the posture restart)");
         assert!(converge < verify, "the closing verify must read the converged stack");
         assert_eq!(body.matches("steps::converge_stack(ctx);").count(), 1, "ONE last start");
         // No step that writes an input runs after it.

@@ -9677,10 +9677,10 @@ pub fn provision_service_keys(ctx: &mut Ctx) {
 /// keeps writing inputs after its Service Setup start (the self node's
 /// certificate into pki/public/nodes, its NATS user into users.conf, the
 /// service keys, the model step's noomesh.yaml), and its own recreates
-/// (`noomesh-restart.sh --force`) carry no `noo.inputs` label. Without this
-/// start the operator's first `noo stack start` did onboard's recreates
-/// for it, and the worker and trellion ran on the noomesh.yaml they read
-/// before the model step until then.
+/// (`noomesh-restart.sh --force`) carried no `noo.inputs` label (they do
+/// now). Without this start the operator's first `noo stack start` did
+/// onboard's recreates for it, and the worker and trellion ran on the
+/// noomesh.yaml they read before the model step until then.
 pub fn converge_stack(ctx: &Ctx) {
     if ctx.dry_run {
         ctx.dry("bring the stack in line with what onboard wrote: one plain start (recreates only the containers whose secrets or config changed)");
@@ -9703,7 +9703,7 @@ pub fn converge_stack(ctx: &Ctx) {
     }
     let (recreated, created) = recreated_by(&before, &compose_container_ids(ctx));
     ctx.success(&converge_line(&recreated, &created));
-    // The posture check and the closing verify ask the gateway next.
+    // The closing verify asks the gateway next.
     if recreated.iter().chain(created.iter()).any(|s| s == "gateway")
         && !sh::wait_for_http(ctx, "https://localhost:8080/health", 120)
     {
