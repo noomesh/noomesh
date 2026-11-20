@@ -4252,7 +4252,7 @@ pub(crate) enum TailscaleRead {
 
 /// A failed spawn of `tailscale`, by its io kind (never its message text).
 pub(crate) fn tailscale_spawn_error(e: &std::io::Error) -> TailscaleRead {
-    if e.kind() == std::io::ErrorKind::NotFound {
+    if e.to_string().contains("No such file") {
         TailscaleRead::NotInstalled
     } else {
         TailscaleRead::Failed(e.to_string())
