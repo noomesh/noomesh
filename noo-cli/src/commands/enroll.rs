@@ -499,6 +499,9 @@ fn prep_preflight(data_root: &str) -> PreflightVerdict {
 /// plus a margin then. Backends and models arrive later, with placements.
 pub(crate) const NODE_MIN_FREE_GB: u64 = 2;
 
+/// Free bytes on the filesystem holding a path; `None` when it cannot be read.
+pub(crate) type FreeBytes = Box<dyn Fn(&str) -> Option<u64>>;
+
 /// What the checks ask this machine. Injectable, so the tests fake them.
 pub(crate) struct Probes {
     pub is_root: Box<dyn Fn() -> bool>,
@@ -508,7 +511,7 @@ pub(crate) struct Probes {
     /// only when there is a terminal and the run is not root.
     pub sudo_validate: Box<dyn Fn() -> bool>,
     pub controller_reachable: Box<dyn Fn(&str) -> bool>,
-    pub free_bytes: Box<dyn Fn(&str) -> Option<u64>>,
+    pub free_bytes: FreeBytes,
 }
 
 impl Probes {
