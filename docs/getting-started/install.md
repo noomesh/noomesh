@@ -22,8 +22,8 @@ The wizard leaves the stack running. Check it with `noo health`, then
 `noo cluster verify`: no FAIL means ready; `!` rows are notes.
 
 You need Linux x86_64 (or WSL2), about 25 GB of free disk, 16 GB of RAM, and
-Docker with the Compose v2 plugin (on Ubuntu/Debian the wizard offers to
-install it). The details of each step are in the agent part below.
+Docker with the Compose v2 plugin, 2.24.6 or newer (the oldest our CI tests;
+on Ubuntu/Debian the wizard offers to install it). The details of each step are in the agent part below.
 
 **Next:**
 
@@ -35,7 +35,7 @@ install it). The details of each step are in the agent part below.
 
 ## For agents
 
-**What a person provides first:** Docker with the Compose v2 plugin (`noo onboard --ci` will not install it and stops at the prerequisites step), passwordless sudo (or a person runs each `sudo` line the wizard prints), and outbound HTTPS (the hosts in the minimums table below).
+**What a person provides first:** Docker with the Compose v2 plugin, 2.24.6 or newer (`noo onboard --ci` will not install it and stops at the prerequisites step), passwordless sudo (or a person runs each `sudo` line the wizard prints), and outbound HTTPS (the hosts in the minimums table below).
 
 **Steps, with their exit codes:**
 
@@ -54,7 +54,7 @@ This is the primary path; [standalone-controller.md](standalone-controller.md)
 is the no-checkout variant of the same step, and
 `noo --help` lists every command.
 
-Requirements: Linux (or WSL2), Docker with the Compose v2 plugin (on Ubuntu/Debian
+Requirements: Linux (or WSL2), Docker Compose v2, 2.24.6 or newer (the oldest our CI tests; on Ubuntu/Debian
 the wizard offers to install it: get.docker.com, uses sudo)
 (`docker compose version` must work — Ubuntu's `docker.io` ships without
 it, add `docker-compose-v2` from Ubuntu, or `docker-compose-plugin` from Docker's
@@ -67,6 +67,16 @@ contributor checkout running the scripts directly without `noo` on PATH;
 with neither, the launcher prints one line naming what it skipped and keeps
 the previous mounts (harmless on a fresh install, stale after you add
 folders). `git` only for a contributor checkout.
+
+Compose runs only on the controller (workers use the node agent's Docker
+API). Its minimum is `MIN_COMPOSE` in `noo-cli/src/commands/cluster_verify.rs`,
+the oldest Compose CI's `start-inputs` job runs (Ubuntu 24.04's
+`docker-compose-v2`); changing it is the operator's decision. `noo onboard`
+warns below it and goes on, and `noo cluster verify --controller` has a
+`docker compose` row: below 2.24.6 WARN (upgrade the package or Docker
+Desktop; noomesh does not install it), `cannot be checked` WARN when the
+version does not read, FAIL with the package to install when there is no
+Compose v2, ok otherwise.
 
 **On WSL2, keep the VM from idling out.** WSL2 shuts its virtual machine
 down after a period with no open Windows terminal into it, and that stops

@@ -541,6 +541,9 @@ changed secret *value* is not part of it (the source variable's name did not
 change), so `up -d` leaves the running container — and its old file — in
 place. Use `noo security secrets rotate` (it recreates the consumers) or
 `noo stack restart --force <service>` after changing a value by hand.
+On Docker Compose 2.24.x a recreate also recreates the service's
+dependents (newer Compose leaves them running), so a rotation there can
+restart more containers; nothing fails.
 
 Verify what a container actually received with `docker inspect`, not
 `docker exec … printenv` (the gateway image has no shell, so `printenv`

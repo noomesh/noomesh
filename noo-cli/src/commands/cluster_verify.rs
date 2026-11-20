@@ -1591,6 +1591,114 @@ pub(crate) fn docker_engine_check(n: &Value) -> Option<Check> {
     }
 }
 
+/// The oldest Docker Compose the project tests: CI's `start-inputs` job
+/// (`.github/workflows/start-inputs.yml`) runs the launcher's real `up` path
+/// on the runner's Compose and on 2.24.6, Ubuntu 24.04's `docker-compose-v2`
+/// and the oldest Compose the documented install route gives (green on both
+/// in run 44668278238). The twin of [`MIN_DOCKER_ENGINE_MAJOR`], and the one
+/// declared minimum: the controller's `docker compose` verify row and `noo
+/// onboard`'s Docker probe read it, and docs/getting-started/install.md names
+/// it. The operator decides it; raise it here and nowhere else.
+pub(crate) const MIN_COMPOSE: (u32, u32, u32) = (2, 24, 6);
+
+/// What `docker compose version --short` said on this machine. Compose runs
+/// only on the controller (the stack launcher); workers use the node agent's
+/// Docker API, so no node reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ComposeVersion {
+    /// A version, and the text it was read from (`v2.29.1-desktop.1`).
+    Known((u32, u32, u32), String),
+    /// No Compose v2: `docker compose` is not a docker command here.
+    Missing(String),
+    /// The command failed otherwise, or said something that does not parse.
+    Unreadable(String),
+}
+
+/// `2.24.6`, `v2.38.2`, `2.29.1-desktop.1` -> the three numbers. Anything
+/// else (empty, garbage, two parts) is `None`.
+pub(crate) fn parse_compose_version(text: &str) -> Option<(u32, u32, u32)> {
+    let t = text.trim();
+    let t = t.strip_prefix('v').unwrap_or(t);
+    let core = t.split(['-', '+']).next().unwrap_or("");
+    let mut parts = core.split('.').map(|p| p.parse::<u32>().ok());
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(Some(a)), Some(Some(b)), Some(Some(c)), None) => Some((a, b, c)),
+        _ => None,
+    }
+}
+
+/// A Compose version text that is known to come from a working Compose v2
+/// (onboard's probe already answered): `Known`, or `Unreadable` when it does
+/// not parse.
+pub(crate) fn compose_version_from_text(text: &str) -> ComposeVersion {
+    match parse_compose_version(text) {
+        Some(v) => ComposeVersion::Known(v, text.trim().to_string()),
+        None => ComposeVersion::Unreadable(format!("version {:?} does not parse", text.trim())),
+    }
+}
+
+/// Classify one run of `docker compose version --short`. Pure, so the
+/// states are pinned: docker saying `compose` is not a command (Ubuntu's
+/// `docker.io` without `docker-compose-v2`) is `Missing`; any other failure is
+/// `Unreadable` with docker's last line.
+pub(crate) fn compose_version_from(success: bool, stdout: &str, stderr: &str) -> ComposeVersion {
+    if success {
+        return compose_version_from_text(stdout.lines().next().unwrap_or(""));
+    }
+    let last = stderr.lines().rev().map(str::trim).find(|l| !l.is_empty()).unwrap_or("no error output").to_string();
+    let l = stderr.to_ascii_lowercase();
+    if l.contains("is not a docker command") || l.contains("unknown command") || l.contains("unknown shorthand flag") {
+        ComposeVersion::Missing(last)
+    } else {
+        ComposeVersion::Unreadable(last)
+    }
+}
+
+/// Run `<docker> compose version --short` here. Takes the binary so a test
+/// can hand it a fake.
+pub(crate) fn read_compose_version(docker: &str) -> ComposeVersion {
+    match Command::new(docker).args(["compose", "version", "--short"]).output() {
+        Ok(o) => compose_version_from(o.status.success(), &String::from_utf8_lossy(&o.stdout), &String::from_utf8_lossy(&o.stderr)),
+        Err(e) => ComposeVersion::Unreadable(format!("could not run {docker}: {e}")),
+    }
+}
+
+/// The plain-sentence remedy for a Compose below [`MIN_COMPOSE`]: noomesh
+/// cannot install it for the operator.
+pub(crate) fn compose_upgrade_remedy() -> String {
+    "upgrade the docker-compose-v2 package (or docker-compose-plugin from Docker's apt repository, or Docker Desktop), then: docker compose version".to_string()
+}
+
+/// `"2.24.6"` from [`MIN_COMPOSE`].
+pub(crate) fn min_compose_text() -> String {
+    format!("{}.{}.{}", MIN_COMPOSE.0, MIN_COMPOSE.1, MIN_COMPOSE.2)
+}
+
+/// The controller's `docker compose` row. Below [`MIN_COMPOSE`]: WARN, a
+/// declared floor and not a known failure (2.24.x does run the launcher; it
+/// recreates more dependents on a secret change). `Unreadable`: WARN,
+/// `cannot be checked`. `Missing` (no Compose v2): FAIL, as onboard's probe and
+/// the launcher's `require_compose_v2` refuse, with `none_remedy` (the
+/// package to install, from onboard). At or above: OK.
+// TODO(#1411): register this row in cluster_verify/rows.rs when the verify-row
+// registry lands on dev.
+pub(crate) fn docker_compose_check(v: &ComposeVersion, none_remedy: &str) -> Check {
+    const NAME: &str = "docker compose";
+    let min = min_compose_text();
+    match v {
+        ComposeVersion::Known(ver, text) if *ver >= MIN_COMPOSE => ok(NAME, format!("Docker Compose {text} (minimum {min})")),
+        ComposeVersion::Known(_, text) => warn(NAME,
+            format!("Docker Compose {text} is older than the oldest version noomesh tests ({min})"),
+            Some(compose_upgrade_remedy())),
+        ComposeVersion::Unreadable(why) => warn(NAME,
+            format!("cannot be checked: the Docker Compose version could not be read ({why})"),
+            Some("docker compose version   # does the Compose v2 plugin answer?".to_string())),
+        ComposeVersion::Missing(why) => fail(NAME,
+            format!("MISSING: no Compose v2 plugin, and the stack launcher runs every service through it (`docker compose version`: {why})"),
+            none_remedy.to_string()),
+    }
+}
+
 /// The running vLLM placements of a node's desired config, as `<backend>
 /// <model>` (both vLLM backends run the one pinned image).
 pub(crate) fn vllm_placements(placements: &Value) -> Vec<String> {
@@ -8820,6 +8928,8 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             .collect();
         checks.push(pki_key_modes_check(&key_issues, &grant_lines, sso.list_keys().len()));
         checks.push(docker_userns_check(read_daemon_json()));
+        // Compose runs only here (the stack launcher); nodes never run it.
+        checks.push(docker_compose_check(&read_compose_version("docker"), &crate::onboard::steps::compose_remedy_here()));
         checks.push(tailscale_ssh_check(read_tailscale_status()));
         let gw_mounts = std::fs::read_to_string(crate::envfile::repo_root().join("docker-compose.cluster.yml"))
             .ok()
@@ -17456,6 +17566,67 @@ mod docker_engine_tests {
     fn node_checks_carry_the_docker_engine_row() {
         let c = node_checks(&node(json!({"state": "ok", "version": "24.0.7", "kind": "dockerd"})), "", "", 0, None);
         assert!(c.iter().any(|c| c.name == "docker engine" && c.verdict == Verdict::Warn), "{:?}", c.iter().map(|c| c.name).collect::<Vec<_>>());
+    }
+}
+
+#[cfg(test)]
+mod docker_compose_tests {
+    use super::*;
+
+    fn known(text: &str) -> ComposeVersion {
+        compose_version_from(true, &format!("{text}\n"), "")
+    }
+
+    #[test]
+    fn compose_versions_parse_with_a_prefix_or_a_suffix() {
+        assert_eq!(parse_compose_version("2.24.6"), Some((2, 24, 6)));
+        assert_eq!(parse_compose_version("v2.38.2"), Some((2, 38, 2)));
+        assert_eq!(parse_compose_version("2.29.1-desktop.1"), Some((2, 29, 1)));
+        for bad in ["", "   ", "garbage", "2.24", "v2", "2.x.6", "2.24.6.1"] {
+            assert_eq!(parse_compose_version(bad), None, "{bad:?}");
+            assert!(matches!(known(bad), ComposeVersion::Unreadable(_)), "{bad:?} -> {:?}", known(bad));
+        }
+        assert_eq!(known("v2.38.2"), ComposeVersion::Known((2, 38, 2), "v2.38.2".into()));
+    }
+
+    #[test]
+    fn a_failed_read_is_missing_or_unreadable() {
+        let gone = compose_version_from(false, "", "docker: 'compose' is not a docker command.\nSee 'docker --help'\n");
+        assert!(matches!(gone, ComposeVersion::Missing(_)), "{gone:?}");
+        let shim = compose_version_from(false, "", "unknown shorthand flag: 'f' in -f\n");
+        assert!(matches!(shim, ComposeVersion::Missing(_)), "{shim:?}");
+        let other = compose_version_from(false, "", "permission denied while trying to connect\n");
+        assert_eq!(other, ComposeVersion::Unreadable("permission denied while trying to connect".into()));
+    }
+
+    #[test]
+    fn a_compose_below_the_minimum_warns_with_the_upgrade() {
+        for v in ["2.24.5", "v2.20.2", "1.29.2"] {
+            let c = docker_compose_check(&known(v), "install it");
+            assert_eq!(c.verdict, Verdict::Warn, "{v}: {c:?}");
+            assert_eq!(c.detail, format!("Docker Compose {v} is older than the oldest version noomesh tests (2.24.6)"));
+            assert!(c.remedy.as_deref().unwrap_or("").starts_with("upgrade the docker-compose-v2 package"), "{:?}", c.remedy);
+        }
+    }
+
+    #[test]
+    fn a_compose_at_or_above_the_minimum_is_ok() {
+        for v in ["2.24.6", "v2.38.2", "2.29.1-desktop.1", "2.25.0", "3.0.0"] {
+            let c = docker_compose_check(&known(v), "install it");
+            assert_eq!(c.verdict, Verdict::Ok, "{v}: {c:?}");
+            assert!(c.detail.contains(v), "{}", c.detail);
+        }
+        assert_eq!(MIN_COMPOSE, (2, 24, 6), "the declared minimum is the operator's: the start-inputs job's oldest Compose");
+    }
+
+    #[test]
+    fn an_unreadable_compose_warns_and_a_missing_one_fails_with_the_package() {
+        let c = docker_compose_check(&ComposeVersion::Unreadable("exit 1".into()), "install it");
+        assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
+        assert!(c.detail.starts_with("cannot be checked: the Docker Compose version could not be read (exit 1)"), "{}", c.detail);
+        let m = docker_compose_check(&ComposeVersion::Missing("not a docker command".into()), "install it with: sudo apt install docker-compose-v2");
+        assert_eq!(m.verdict, Verdict::Fail, "{m:?}");
+        assert_eq!(m.remedy.as_deref(), Some("install it with: sudo apt install docker-compose-v2"));
     }
 }
 

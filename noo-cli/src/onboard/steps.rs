@@ -470,7 +470,22 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
     // Skipped when docker itself is missing: that row already failed.
     if tool_version("docker").is_some() {
         match probe_compose("docker") {
-            Ok(v) => ctx.success(&format!("docker compose: {v}")),
+            // A working Compose below the oldest one CI tests: WARN, never
+            // refuse (a declared floor, not a known failure). Same verdict as
+            // the controller's `docker compose` verify row.
+            Ok(v) => {
+                use crate::commands::cluster_verify::{compose_version_from_text, docker_compose_check, Verdict};
+                let row = docker_compose_check(&compose_version_from_text(&v), "");
+                match row.verdict {
+                    Verdict::Ok => ctx.success(&format!("docker compose: {v}")),
+                    _ => {
+                        ctx.warn(&format!("docker compose: {}", row.detail));
+                        if let Some(r) = row.remedy {
+                            ctx.warn(&format!("  {r}"));
+                        }
+                    }
+                }
+            }
             Err(why) => {
                 ctx.error("docker compose: MISSING — the Compose v2 plugin runs every service");
                 ctx.error(&format!("  `docker compose version` failed: {why}"));
@@ -699,6 +714,12 @@ fn compose_remedy(os_release: &str, docker_ce: bool) -> String {
         Some(pkg) => format!("install it with: sudo apt install {pkg}  (Compose v2, not the old docker-compose)"),
         None => "install the Docker Compose v2 plugin (not the old docker-compose): https://docs.docker.com/compose/install/linux/".into(),
     }
+}
+
+/// The compose-v2 install remedy for this machine (the `docker compose`
+/// verify row's FAIL names the same package onboard does).
+pub(crate) fn compose_remedy_here() -> String {
+    compose_remedy(&os_release_text(), docker_ce_installed())
 }
 
 fn os_release_text() -> String {
