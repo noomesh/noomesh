@@ -448,9 +448,10 @@ var backendSpecs = map[string]BackendSpec{
 		MemoryLimit: 16 * 1024 * 1024 * 1024, // 16GB
 	},
 	// Embedding — TEI serving a sentence embedder (POST /embed). GPU where
-	// available (CUDA :1.6), CPU otherwise (:cpu-1.9.4) — auto-selected per
-	// node via CPUImage + hasNvidiaGPU(). GPUCount "1" is a no-op on CPU
-	// nodes (the reservation is GPU-guarded). Start with:
+	// available (CUDA :1.6), CPU otherwise (:cpu-1.9.4) — chosen by the
+	// placement's target and teiGPUUsable (image_choice.go): cpu = CPU image,
+	// gpu without a usable NVIDIA runtime = refused, unset = GPU only when
+	// usable. GPUCount "1" is a no-op on CPU (the reservation is GPU-guarded). Start with:
 	//   noo cluster up embedding BAAI/bge-base-en-v1.5 --node <node>
 	"embedding": {
 		// held at 1.6: TEI 1.9.4's CUDA image requires cuda>=12.9 with no GeForce
@@ -800,8 +801,8 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 	defer cancel()
 
 	// ONE image choice (image_choice.go, shared with BackendImageRef):
-	// CPU/GPU auto-select (an embedding/reranker CPUImage on a node without an
-	// NVIDIA GPU; the GPU device reservation is independently gated by
+	// CPU/GPU choice (an embedding/reranker CPUImage by the placement's target
+	// and teiGPUUsable; the GPU device reservation is independently gated by
 	// hasNvidiaGPU() below), then the controller's override, else
 	// ${VLLM_IMAGE:-default} env substitution - and the policy that refuses a
 	// floating or digest-less third-party ref.
@@ -813,6 +814,9 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 		return err
 	}
 	spec.Image = choice.Ref
+	if choice.Why != "" {
+		slog.Info("backend image: CPU chosen", "backend", backend, "why", choice.Why)
+	}
 
 	// Reranker engine correction: a placement/RERANK_IMAGE override can point
 	// at the other engine's image than RERANK_ENGINE selected (e.g. desired
