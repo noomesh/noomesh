@@ -29,7 +29,10 @@ You are managing the noomesh compute cluster. Apply these operational principles
   (`/mcp/user`); without them, ask the operator to stage models
 - A backend runs where it is placed: `noo cluster place <node> <backend> <model>`
   is desired state the node agent converges. A chat request does not start one
-- Idle backends (>10min) are candidates for scaledown
+- Idle scaledown (autonomy `backend_idle_scaledown`): a node under 5% load for
+  5 checks in a row (every 600 s by default, so ~50 min; the interval is the
+  location's `check_interval_seconds`) alerts. Only when armed
+  (`enabled_action: true`) does it stop that node's undeclared backends
 
 ## Troubleshooting
 - Node OFFLINE: check last heartbeat, network connectivity, Docker status
@@ -43,4 +46,4 @@ You are managing the noomesh compute cluster. Apply these operational principles
 - Single user: one backend is sufficient
 - Multiple concurrent users: consider scaling to 2 replicas
 - Always check available VRAM before scaling up
-- Pinned backends are exempt from idle scaledown
+- Placed (declared) backends are never stopped by idle scaledown, nor is the cluster's last running backend
