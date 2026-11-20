@@ -5504,7 +5504,7 @@ pub(crate) fn node_may_pull_ollama_registry(node: Option<&Value>) -> Option<bool
 
 /// The 409 code of the ollama tag refusal: `noo cluster place` reads it
 /// (noo-cli `OLLAMA_TAG_NOT_STAGED`) to show `next` instead of retrying.
-pub(crate) const OLLAMA_TAG_NOT_STAGED: &str = "ollama_tag_not_staged";
+pub(crate) const OLLAMA_TAG_NOT_STAGED: &str = "ollama_tag_refused";
 
 /// The refusal for an ollama tag a node cannot get.
 pub(crate) fn ollama_tag_refusal(node_id: &str, tag: &str) -> String {
