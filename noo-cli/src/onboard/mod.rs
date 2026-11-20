@@ -42,6 +42,7 @@ pub(crate) mod sandbox_apparmor;
 pub(crate) mod sh;
 pub(crate) mod standalone;
 pub(crate) mod steps;
+pub(crate) mod tunnel_wait;
 mod tui;
 pub(crate) mod upfront;
 pub(crate) mod util;
@@ -49,6 +50,7 @@ pub(crate) mod web;
 mod yamlcfg;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::{Globals, Unhandled};
 use event::{UiEvent, WizardUi};
@@ -1552,6 +1554,7 @@ fn print_final_summary(ctx: &Ctx) {
     // (i677 #13: "You're all set" printed under "2 problems need you").
     let mut closing_verify_failed = false;
     if !ctx.dry_run {
+        wait_for_self_node_tunnel(ctx);
         let args: Vec<String> = FINAL_VERIFY_ARGS.iter().map(|a| a.to_string()).collect();
         match crate::commands::cluster_verify(ctx.g, &args) {
             Ok(0) => ctx.success(closing_verify_ok_line(crate::commands::cluster_verify::last_run_note_rows())),
@@ -1817,6 +1820,25 @@ pub(crate) fn posture_pending_restart(g: &Globals) -> Option<Vec<String>> {
     // The wizard's own login (never a shared secret). Unreadable is `None`,
     // which the caller says out loud.
     pending_restart_keys(&crate::http::get_json_try(g, "/api/security/posture", true, 10).ok()?)
+}
+
+/// Before onboard's CLOSING verify only: the gateway was restarted moments
+/// ago, so this box's own node may still read `tunnel=false` until its tunnel
+/// redials and its next heartbeat lands. Wait, bounded, for the record to say
+/// so unless the tunnel is off on purpose. `noo cluster verify` never waits.
+fn wait_for_self_node_tunnel(ctx: &Ctx) {
+    use tunnel_wait::*;
+    let Some(me) = crate::commands::provision::self_node_name() else { return };
+    let read = |g: &Globals| -> Option<bool> {
+        let body = crate::http::get_json_try(g, "/api/cluster/nodes", true, 10).ok()?;
+        body["nodes"].as_array()?.iter().find(|n| n["id"].as_str() == Some(me.as_str()))?["control_transports"]["tunnel"].as_bool()
+    };
+    if !should_wait_for_tunnel(read(ctx.g), tunnel_off_on_purpose()) {
+        return;
+    }
+    ctx.info(&waiting_line());
+    let g = ctx.g;
+    wait_for_tunnel(Duration::from_secs(TUNNEL_WAIT_SECS), Duration::from_secs(TUNNEL_POLL_SECS), || read(g), std::thread::sleep);
 }
 
 /// The arguments of onboard's last step, `noo cluster verify`. Onboard

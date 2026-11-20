@@ -869,17 +869,33 @@ func (r *Reporter) Run(ctx context.Context) {
 	ticker := time.NewTicker(time.Duration(r.cfg.HeartbeatInterval) * time.Second)
 	defer ticker.Stop()
 
+	var last time.Time
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			r.SendHeartbeat()
+			last = time.Now()
 		case <-r.kickCh():
+			// A kicked beat comes no sooner than the floor after the last
+			// one: each beat gathers GPU stats and sections, and a flapping
+			// tunnel must not turn into a beat storm.
+			if wait := kickFloor - time.Since(last); !last.IsZero() && wait > 0 {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(wait):
+				}
+			}
 			r.SendHeartbeat()
+			last = time.Now()
 		}
 	}
 }
+
+// kickFloor is the least gap between a beat and the next kicked beat.
+var kickFloor = 2 * time.Second
 
 // Kick asks for a heartbeat now instead of at the next tick: a change the
 // controller decides on (a node workload's row after its door leaf landed)
@@ -891,6 +907,10 @@ func (r *Reporter) Kick() {
 	default:
 	}
 }
+
+// KickPending is how many kicks wait for Run (0 or 1: kicks coalesce). A
+// test hook for the callers that wire a Kick.
+func (r *Reporter) KickPending() int { return len(r.kickCh()) }
 
 func (r *Reporter) kickCh() chan struct{} {
 	r.kickOnce.Do(func() { r.kick = make(chan struct{}, 1) })
