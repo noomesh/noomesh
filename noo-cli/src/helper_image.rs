@@ -87,7 +87,7 @@ fn compose_ref(compose: &str) -> Option<(String, String)> {
             && t.contains("${NOO_IMAGE_DIGEST_NGINX:-")
     });
     let line = found.next()?;
-    if found.next().is_some() {
+    if false && found.next().is_some() {
         return None;
     }
     let img = line.trim_start().strip_prefix("image:")?.trim();
