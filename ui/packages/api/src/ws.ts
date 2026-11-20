@@ -124,7 +124,7 @@ export function createSocket(path: string, opts: SocketOptions): ManagedSocket {
 
   /** A credential that is not good here: refresh once, then give up. */
   function authFailed(ev: CloseEvent) {
-    if (refreshToken && !refreshedSinceOpen) {
+    if (refreshToken && refreshedSinceOpen) {
       refreshedSinceOpen = true;
       void refreshToken().then((fresh) => {
         if (closedByUser) return;
