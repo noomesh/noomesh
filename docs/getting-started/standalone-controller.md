@@ -85,13 +85,17 @@ noo upgrade --stack          # + move the stack to this release's paired images
 noo upgrade --nodes          # + restage a signed provision bundle for every pull-capable node
 noo upgrade --all            # binary + stack + nodes
 noo upgrade --stack --tag vX.Y.Z   # override the paired stack tag
+noo upgrade --stack --recreate     # recreate every container, not only the changed ones
 noo stack sync-assets        # refresh the deploy slice from the binary without upgrading
 ```
 
 Every CLI release records the stack tag it was released alongside, so
 `--stack` needs no version bookkeeping. After the binary swap the process
 re-executes the new binary before touching the stack, so the assets and
-pairing used are the new release's. Re-running the materialisation is
+pairing used are the new release's. The stack roll recreates only the
+containers whose image, env, secret or mounted config changed, and says
+how many it recreated and kept; `--recreate` restarts everything.
+Re-running the materialisation is
 safe: it refreshes compose files, scripts and templates and never touches
 `noomesh.yaml`, `secrets/` or `pki/`.
 
@@ -175,7 +179,17 @@ lands at birth and the node refuses any bundle not signed by the signing key it 
 - **Updates change the running stack:** `noo upgrade --check` is the only
   read-only form. `noo upgrade` swaps the binary; `--stack` moves the
   stack's images; `--nodes` and `--all` reach every node. Run those only
-  when the person asked. `noo stack sync-assets` and re-materialising
+  when the person asked.
+- **What a roll recreates:** only what is out of line (compose's config
+  hash plus the `noo.inputs` label), the same as a plain `noo stack start`.
+  Every first-party service moves on a tag change; nats, redis,
+  model-cache and the monitoring set are kept unless the release moved
+  their image or config. Read the roll's `N recreated (…), M kept (…)`
+  line for what happened. A same-tag re-apply is label-driven too.
+  `noo upgrade --stack --recreate` (0.6.30 and later; an older binary
+  refuses the flag) forces every container: use it only when the person
+  asked, or when a config directory over 16 MiB changed (the start says
+  it skipped one). `noo stack sync-assets` and re-materialising
   refresh compose files, scripts and templates and never touch
   `noomesh.yaml`, `secrets/` or `pki/`.
 - **A bundle instead of the embedded slice:** `--bundle` takes a path or an

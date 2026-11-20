@@ -46,7 +46,11 @@ recreates all its readers. The start says what it did: `Containers: 13
 running, 0 recreated`, or `recreated gateway: its inputs changed (secret
 noo_jwt_secret)`; without its record of the last start it says `cannot
 name what changed: no previous record` (and recreates nothing for that). `--recreate` recreates every
-container, changed or not (so does `noo upgrade`); a config directory
+container, changed or not. `noo upgrade --stack` runs this same plain
+start, so a roll keeps every container whose inputs did not move (nats,
+redis, model-cache and the monitoring set, unless the release moved their
+image or config); `noo upgrade --stack --recreate` recreates them all. A
+config directory
 over 16 MiB is not fingerprinted (the start says so), and a change there
 needs `--recreate`. The digest key is `~/.config/noo/start-inputs.key`
 (0600, made on first use). `noo stack restart --force` and `noo stack
