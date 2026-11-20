@@ -4447,7 +4447,7 @@ pub(crate) fn ensure_dir_ownership(dir: &str, owner: &str) -> Result<(), String>
     if !empty {
         return Ok(());
     }
-    let image = crate::helper_image::ensure_present(&mut |_| {})?;
+    let image = "alpine".to_string();
     let argv = crate::helper_image::run_argv(&image, dir, &crate::helper_image::Job::Chown { owner });
     match Command::new("docker")
         .args(&argv)
