@@ -136,12 +136,19 @@ directory, and `~/.config/mesh/<name>/`.
 
 ## For agents
 
-- **Name the instance on every command.** `noo` takes the instance from the
-  `.env` of the checkout it runs in; anywhere else, a command without
-  `--instance <name>` acts on the **default** instance, which may be the
-  person's real stack. Pass `noo --instance <name> …` unless you are inside that
-  instance's own checkout, and check the container names it reports
+- **Name the instance on every command.** `noo` takes the instance from
+  `--instance` / `NOO_INSTANCE`, else from the `.env` of its install root:
+  `$NOO_REPO_ROOT`, else a standalone `~/.noo`, else the checkout it runs
+  in. Without one of those naming it, a command acts on the **default**
+  instance, which may be the person's real stack. Pass
+  `noo --instance <name> …`, and check the container names it reports
   (`noo-<name>-*`) before you change anything.
+- **A single container by name:** today `noo --instance <name> stack logs
+  <service>` (one service) and `noo doctor strangers` resolve the default
+  stack's container, not the instance's (a fix is in flight). Give the full
+  name, `noo --instance <name> stack logs noo-<name>-<service>`. The
+  start, stop, restart, status and clean scripts, onboard and a
+  multi-service `stack logs` already act on the instance.
 - **The default instance has no name:** no `NOO_INSTANCE`, `noo-*`
   containers, the stock ports.
 - **A refused start is a guard, not a bug:**
@@ -151,9 +158,15 @@ directory, and `~/.config/mesh/<name>/`.
     misconfigured instance;
   - a host port already bound: the message names the ports. The fix is the
     other service stopping, or this instance's `NOO_PORT_OFFSET`, which is
-    the person's choice.
-  - `stop`, `status` and `logs` never refuse.
+    the person's choice. The port check runs on start only.
+  - `stop`, `status`, `logs`, `restart` and `clean` refuse only an unscoped
+    data root, which is what `NOO_INSTANCE_UNSAFE_DATA_ROOT=1` is for (never
+    on start).
 - **Retiring an instance deletes its data:** only when the person asked,
-  only that instance. Remove volumes strictly by the `noo-<name>_` prefix
-  `docker volume ls` shows; never by a pattern that could match the
-  default stack's.
+  only that instance. Remove its volumes by its compose project, as the
+  product's own cleanup does: `noo --instance <name> stack clean --volumes`,
+  or the label `com.docker.compose.project=noo-<name>` (its volume names
+  start `noo-<name>_`; the default stack's start `noomesh_`). The stateful
+  volumes are bind mounts, so removing them leaves the files: delete
+  `<root>/instances/<name>` too, on the person's word, and
+  `~/.config/mesh/<name>/`.
