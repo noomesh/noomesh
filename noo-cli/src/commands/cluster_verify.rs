@@ -8030,8 +8030,8 @@ fn shared_node_remedies(sections: &[(String, Vec<Check>)]) -> Vec<(String, Strin
 /// "data at rest" row that names only the ones that are not clean (the
 /// 0.6.12 roll printed nine near-identical rows).
 /// The one row the default table prints for every [`AT_REST_DIR_ROWS`] row.
-const AT_REST_FOLD_ROW: &str = "data at rest";
-const AT_REST_DIR_ROWS: [&str; 10] = [
+pub(crate) const AT_REST_FOLD_ROW: &str = "data at rest";
+pub(crate) const AT_REST_DIR_ROWS: [&str; 10] = [
     "loki at rest", "tempo at rest", "postgres at rest", "redis at rest", "nats at rest", "prometheus at rest",
     "grafana at rest", "noo-data at rest", "pki at rest", "age key at rest",
 ];
@@ -9726,8 +9726,8 @@ fn checks_json(checks: &[Check]) -> Value {
             "remedy": c.remedy,
             "tier": tier_json(brief_tier(c)),
         });
-        if AT_REST_DIR_ROWS.contains(&c.name) {
-            o["shown_as"] = AT_REST_FOLD_ROW.into();
+        if let Some(fold) = rows::by_name(c.name).and_then(|r| r.shown_as) {
+            o["shown_as"] = fold.into();
         }
         o
     }).collect())
