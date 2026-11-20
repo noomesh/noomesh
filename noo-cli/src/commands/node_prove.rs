@@ -82,7 +82,7 @@ impl ServerCertVerifier for PinnedLeaf {
         _ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        let parsed = rustls::client::ParsedCertificate::try_from(end_entity)
+        let parsed = rustls::server::ParsedCertificate::try_from(end_entity)
             .map_err(|e| self.refuse(format!("the presented certificate does not parse: {e}")))?;
         rustls::client::verify_server_cert_signed_by_trust_anchor(
             &parsed,
