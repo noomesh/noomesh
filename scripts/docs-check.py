@@ -475,7 +475,6 @@ SHAPE_PENDING = frozenset({
     "docs/development/addons.md",
     "docs/development/developer-guide.md",
     "docs/development/principles.md",
-    "docs/getting-started/integrations.md",
     "docs/models/weight-cache.md",
     "docs/operating/monitoring.md",
     "docs/operating/operator-manual.md",
