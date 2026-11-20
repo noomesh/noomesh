@@ -4171,7 +4171,7 @@ async fn api_kb_rule(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<Value>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, ctx.as_deref(), "setting a KB rule").await?;
+
     let updated_by = ctx
         .as_ref()
         .map(|Extension(r)| r.sub.clone())
