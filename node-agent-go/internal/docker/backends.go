@@ -482,7 +482,7 @@ var backendSpecs = map[string]BackendSpec{
 		// model the container env names: ${MODEL_ID} is resolved against the
 		// CONTAINER env (resolveCommand) — the placement's model when one is
 		// placed, else TEI_MODEL, else bge-base (the MODEL_ID default above).
-		Command: []string{"--model-id", "${MODEL_ID}"},
+		Command: []string{"--model-id", "${TEI_MODEL:-BAAI/bge-base-en-v1.5}"},
 	},
 	// Reranker — engine-selectable via RERANK_ENGINE, spec built by
 	// rerankerSpec() below. Default: hardened llama.cpp (llama-server
