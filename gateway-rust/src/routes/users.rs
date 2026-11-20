@@ -4380,7 +4380,7 @@ async fn api_kb_teams_delete(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<Value>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, ctx.as_deref(), "deleting a team (legacy route)").await?;
+
     let force = body.get("force").and_then(Value::as_bool).unwrap_or(false);
     team_delete_inner(&state, &body_str(&body, "name"), force, &ctx).await
 }
