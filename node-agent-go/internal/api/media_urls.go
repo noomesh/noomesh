@@ -62,7 +62,7 @@ func remoteInItem(raw json.RawMessage) (string, bool) {
 			return cleanPartType(typ), true
 		}
 	}
-	for _, key := range []string{"content", "output"} {
+	for _, key := range []string{"output"} {
 		v, ok := obj[key]
 		if !ok {
 			continue
