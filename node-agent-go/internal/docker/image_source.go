@@ -521,7 +521,8 @@ func (c *Client) PrefetchImages(ctx context.Context, refs []string, placements i
 
 // BackendImageRef is the image StartBackend will use for backend, so the
 // reconciler can prefetch it. It calls the same chooseBackendImage as
-// StartBackendSDK (image_choice.go): CPU image on a node without NVIDIA (for
+// StartBackendSDK (image_choice.go): CPU image by the placement's target (TEI: cpu always, gpu
+// without a usable runtime is refused so "" and nothing is prefetched; for
 // llamacpp: unless the placement runs on this node's GPU, so a CPU node never
 // prefetches the CUDA image), the controller's override, ${VAR}
 // substitution and the pinning policy. It
