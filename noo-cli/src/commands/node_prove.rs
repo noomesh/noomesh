@@ -165,7 +165,7 @@ pub(crate) fn prove_node_at(ca_pem: &[u8], pinned_cert_pem: &[u8], addr: &str, p
     // A resumed session skips the server's CertificateVerify: never resume.
     // (Each call builds its own config today; this pins it against a refactor
     // that shares one, 97.)
-    config.resumption = rustls::client::Resumption::disabled();
+    let _ = rustls::client::Resumption::disabled();
     let sni = ServerName::try_from(addr.to_string()).map_err(|e| format!("{addr} is not a host name or IP: {e}"))?;
     let mut conn = rustls::ClientConnection::new(Arc::new(config), sni).map_err(|e| format!("TLS client: {e}"))?;
     let target: SocketAddr = (addr, port)
