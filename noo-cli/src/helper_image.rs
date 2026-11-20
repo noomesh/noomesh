@@ -131,7 +131,7 @@ pub(crate) fn run_argv(image: &str, mount_src: &str, job: &Job) -> Vec<String> {
         Job::Chown { owner } => ("chown", format!("{mount_src}:/d"), "chown", vec![(*owner).to_string(), "/d".to_string()]),
         Job::Du => ("du", format!("{mount_src}:/d:ro"), "du", vec!["-sh".to_string(), "/d".to_string()]),
     };
-    let mut v: Vec<String> = ["run", "--rm", "--pull", "never", "--network", "none", "--read-only", "--cap-drop", "ALL"]
+    let mut v: Vec<String> = ["run", "--rm", "--pull", "missing", "--network", "none", "--read-only", "--cap-drop", "ALL"]
         .iter()
         .map(|s| s.to_string())
         .collect();
