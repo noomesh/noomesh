@@ -1868,7 +1868,7 @@ fn roll_apply_line(before: &str, after: &str, forced: bool) -> Option<String> {
     let named = |n: &[String], what: &str| {
         if n.is_empty() { format!("0 {what}") } else { format!("{} {what} ({})", n.len(), n.join(", ")) }
     };
-    let mut line = format!("{}, {}", named(&recreated, "recreated"), named(&kept, "kept"));
+    let mut line = format!("{}{}", named(&recreated, "recreated"), if kept.is_empty() { "" } else { "" });
     if !created.is_empty() {
         line.push_str(&format!(", {}", named(&created, "created")));
     }
