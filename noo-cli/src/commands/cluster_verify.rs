@@ -2880,8 +2880,8 @@ pub(crate) fn log_shipper_check(id: &str, ls: &Value, now_unix: i64, hb_recent: 
     // (`enabled=false`, logship), and a paused shipper is the by-choice
     // state, not one to hand-edit the agent's env for. The paused agent also
     // reports the reason as its own `reason` field.
-    if off_by_choice::gateway_reason(&last_error) == Some(off_by_choice::LOKI_OFF_REASON)
-        || ls["reason"].as_str() == Some(off_by_choice::LOKI_OFF_REASON)
+    if ls["enabled"].as_bool() == Some(true) && (off_by_choice::gateway_reason(&last_error) == Some(off_by_choice::LOKI_OFF_REASON)
+        || ls["reason"].as_str() == Some(off_by_choice::LOKI_OFF_REASON))
     {
         return ok("log shipper", off_by_choice::SHIPPER_DETAIL);
     }
