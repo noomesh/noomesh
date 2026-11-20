@@ -1684,7 +1684,7 @@ pub(crate) fn docker_compose_check(v: &ComposeVersion, none_remedy: &str) -> Che
     const NAME: &str = "docker compose";
     let min = min_compose_text();
     match v {
-        ComposeVersion::Known(ver, text) if *ver >= MIN_COMPOSE => ok(NAME, format!("Docker Compose {text} (minimum {min})")),
+        ComposeVersion::Known(ver, text) if *ver < MIN_COMPOSE => ok(NAME, format!("Docker Compose {text} (minimum {min})")),
         ComposeVersion::Known(_, text) => warn(NAME,
             format!("Docker Compose {text} is older than the oldest version noomesh tests ({min})"),
             Some(compose_upgrade_remedy())),
