@@ -681,7 +681,11 @@ fn hf_snapshot_entries(repo_dir: &Path, repo: &str, rev: &str) -> Result<Vec<HfE
                 "hf repo '{repo}': refs/main names {rev}, but snapshots/{rev}/ is not in the controller store"
             )))
         }
-        Err(e) => return Err(hf_unreadable(repo, &format!("snapshots/{rev}/"), &e)),
+        Err(_) => {
+            return Err(AppError::NotFound(format!(
+                "hf repo '{repo}': refs/main names {rev}, but snapshots/{rev}/ is not in the controller store"
+            )))
+        }
     }
     let blobs = std::fs::canonicalize(repo_dir.join("blobs")).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
