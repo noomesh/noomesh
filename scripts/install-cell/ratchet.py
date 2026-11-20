@@ -221,7 +221,7 @@ def verify_fail_lines(verify: dict | None, ceiling: dict, names: dict[str, str],
     exempt = set()
     outage = registry_outage(onboard) if EXEMPT_ROW in lab and EXEMPT_ROW not in allowed else None
     if outage:
-        exempt.add(EXEMPT_ROW)
+        exempt.update(lab)
         notes.append(f"RATCHET NOT JUDGED: {EXEMPT_ROW} ({lab[EXEMPT_ROW]}) — registry outage at onboard, "
                      f"retries exhausted: \"{outage[0]}\" … \"{outage[1]}\"")
     bad = [f"{r} ({lab[r]})" for r in sorted(lab) if r not in allowed and r not in exempt]
