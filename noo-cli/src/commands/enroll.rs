@@ -11,6 +11,8 @@
 //! authenticated channel) or is verified against material carried in the
 //! out-of-band blob:
 //!
+//!   0. checks before anything is spent: sudo (terminal, root or
+//!      --root-ok), free disk, then (after the join) a controller that answers
 //!   1. tailscale install + `tailscale up` (skippable)
 //!   2. foreign-mesh guard (exit 78 BEFORE burning the token)
 //!   3. birth keypair (openssl, parity with the script's RSA-4096)
@@ -67,8 +69,8 @@ pub(crate) fn asset_harness_unit() -> &'static str { ASSET_HARNESS_UNIT }
 pub(crate) fn asset_harness_env_tmpl() -> &'static str { ASSET_HARNESS_ENV_TMPL }
 
 const USAGE: &str = "usage: noo enroll <noo1.blob> | --url <https://…> --token <t> \
-[--ca-sha256 <hex>] [--ts-authkey <k>] [--node <name>] [--skip-tailscale] [--skip-prep] [--data-root <dir>] [--controller-approvals]\n\
-       noo enroll --via-tailnet <https://controller.ts.net> [--ts-authkey <k>] [--skip-prep] [--controller-approvals]\n  --resume            macOS: finish the arm step (root CLI + fetch daemon) after a failure, no new token\n  --controller-approvals  Linux: let the controller approve add-on workloads on this node (asked when interactive; default no)";
+[--ca-sha256 <hex>] [--ts-authkey <k>] [--node <name>] [--skip-tailscale] [--skip-prep] [--data-root <dir>] [--controller-approvals] [--root-ok]\n\
+       noo enroll --via-tailnet <https://controller.ts.net> [--ts-authkey <k>] [--skip-prep] [--controller-approvals] [--root-ok]\n  --resume            macOS: finish the arm step (root CLI + fetch daemon) after a failure, no new token\n  --controller-approvals  Linux: let the controller approve add-on workloads on this node (asked when interactive; default no)\n  --root-ok           no terminal here, and sudo needs no password: run the root steps unattended";
 
 #[derive(Debug)]
 struct EnrollCred {
@@ -478,8 +480,220 @@ fn prep_preflight(data_root: &str) -> PreflightVerdict {
     preflight_verdict(code)
 }
 
+// ── Checks before anything is spent ────────────────────────────────────────
+// A run that cannot finish spends nothing. Before the tailnet join (whose
+// auth key may itself be single-use) and before the token is redeemed,
+// enroll checks what its later steps refuse on: a way to run sudo, free
+// disk for the install, and a controller that answers. Sudo is decided as
+// the rest of noo decides it (i907): a terminal to ask at, root, or the
+// owner's `--root-ok`; never by running sudo to see whether it could.
+
+/// Free space the node install needs, in GB, on `/var/lib` (Docker's
+/// packages and the node agent's image land there) and on the data root's
+/// disk. Backends and models arrive later, with placements, and are not
+/// counted here.
+pub(crate) const NODE_MIN_FREE_GB: u64 = 5;
+
+/// What the checks ask this machine. Injectable, so the tests fake them.
+pub(crate) struct Probes {
+    pub is_root: Box<dyn Fn() -> bool>,
+    pub has_tty: Box<dyn Fn() -> bool>,
+    pub sudo_present: Box<dyn Fn() -> bool>,
+    /// `sudo -v` at the terminal: the one password prompt, up front. Asked
+    /// only when there is a terminal and the run is not root.
+    pub sudo_validate: Box<dyn Fn() -> bool>,
+    pub controller_reachable: Box<dyn Fn(&str) -> bool>,
+    pub free_bytes: Box<dyn Fn(&str) -> Option<u64>>,
+}
+
+impl Probes {
+    fn live() -> Self {
+        Probes {
+            is_root: Box::new(crate::onboard::steps::running_as_root),
+            has_tty: Box::new(crate::onboard::steps::stdin_at_terminal),
+            sudo_present: Box::new(|| run(Command::new("sh").args(["-c", "command -v sudo"])).0 == 0),
+            sudo_validate: Box::new(|| run_visible(Command::new("sudo").arg("-v")) == 0),
+            // Bounded wait first: right after `tailscale up` the tunnel needs
+            // a few seconds before the controller answers.
+            controller_reachable: Box::new(|url: &str| {
+                wait_for_controller(url);
+                tcp_reachable(url)
+            }),
+            free_bytes: Box::new(crate::commands::at_rest_volume::free_bytes),
+        }
+    }
+}
+
+/// The real token redemption (`POST /api/cluster/bootstrap`), a parameter so
+/// the tests can count that a refused run never reaches it.
+type Redeem<'a> = &'a mut dyn FnMut(&ureq::Agent, &str, &serde_json::Value) -> Result<ureq::http::Response<ureq::Body>, ureq::Error>;
+
+/// What this run's later steps need from the host.
+#[derive(Debug, PartialEq)]
+struct HostNeeds {
+    sudo: bool,
+    disk_paths: Vec<String>,
+}
+
+/// macOS arms its fetch daemon with sudo on every run; Linux needs sudo for
+/// host prep and for `tailscale up`. Disk is checked where prep installs.
+fn host_needs(macos: bool, skip_prep: bool, joins_tailnet: bool, data_root: Option<&str>) -> HostNeeds {
+    let sudo = macos || !skip_prep || joins_tailnet;
+    let mut disk_paths = Vec::new();
+    if !macos && !skip_prep {
+        disk_paths.push("/var/lib".to_string());
+        if let Some(root) = data_root.filter(|r| r.starts_with('/')) {
+            // The nearest directory that exists: statvfs needs a real path.
+            let mut p = Path::new(root);
+            while !p.exists() {
+                match p.parent() {
+                    Some(up) => p = up,
+                    None => break,
+                }
+            }
+            let p = p.display().to_string();
+            if !disk_paths.contains(&p) {
+                disk_paths.push(p);
+            }
+        }
+    }
+    HostNeeds { sudo, disk_paths }
+}
+
+/// Why this run would stop part-way, said before anything is spent.
+#[derive(Debug, PartialEq)]
+enum Refusal {
+    NoSudo,
+    SudoNeedsTerminal,
+    SudoRefused,
+    ControllerUnreachable(String),
+    LowDisk { path: String, free: u64, need_gb: u64 },
+}
+
+const PASTE_AGAIN: &str = "noo enroll <the same paste>";
+
+impl Refusal {
+    fn code(&self) -> &'static str {
+        match self {
+            Refusal::NoSudo | Refusal::SudoNeedsTerminal | Refusal::SudoRefused => "enroll_needs_sudo",
+            Refusal::ControllerUnreachable(_) => "enroll_controller_unreachable",
+            Refusal::LowDisk { .. } => "enroll_low_disk",
+        }
+    }
+
+    /// Exit codes from the agent contract: a missing controller is 3; a
+    /// step only the person can take (sudo, disk) is 6.
+    fn exit(&self) -> crate::output::ExitCode {
+        match self {
+            Refusal::ControllerUnreachable(_) => crate::output::ExitCode::GatewayUnreachable,
+            _ => crate::output::ExitCode::NeedsDecision,
+        }
+    }
+
+    fn message(&self) -> String {
+        let what = match self {
+            Refusal::NoSudo => "sudo is not installed here, and enroll runs its root steps through it".to_string(),
+            Refusal::SudoNeedsTerminal => {
+                "this run has no terminal to ask for the sudo password, and nothing says sudo needs none here".to_string()
+            }
+            Refusal::SudoRefused => "sudo did not accept a password for this user".to_string(),
+            Refusal::ControllerUnreachable(url) => format!("the controller at {url} does not answer from this machine"),
+            Refusal::LowDisk { path, free, need_gb } => format!(
+                "only {:.1} GB free on the filesystem holding {path}; the node install needs {need_gb} GB \
+                 (Docker's packages and the node agent's image, plus headroom)",
+                *free as f64 / 1e9
+            ),
+        };
+        format!("{what}. The token was NOT used")
+    }
+
+    /// The next step, one line, for the JSON `hint`.
+    fn hint(&self) -> String {
+        match self {
+            Refusal::NoSudo => "install sudo, then run the same paste again".to_string(),
+            Refusal::SudoNeedsTerminal => "run this at the machine with a terminal; or give this user passwordless sudo \
+                                           for noo's install and add --root-ok; or run as root"
+                .to_string(),
+            Refusal::SudoRefused => "give this user sudo for noo's install, or run as root".to_string(),
+            Refusal::ControllerUnreachable(_) => {
+                "check that this machine reaches the controller (tailscale status), then run the same paste again".to_string()
+            }
+            Refusal::LowDisk { path, free, need_gb } => {
+                let short = (*need_gb as f64 - *free as f64 / 1e9).ceil().max(1.0) as u64;
+                format!("free {short} GB on the filesystem holding {path}, then run the same paste again")
+            }
+        }
+    }
+
+    fn guide(&self) -> Vec<(String, String)> {
+        let again = (PASTE_AGAIN.to_string(), format!("{}; the token is still good", self.hint()));
+        match self {
+            Refusal::ControllerUnreachable(_) => vec![
+                ("tailscale status".to_string(), "is this machine on the tailnet, and does it see the controller?".to_string()),
+                again,
+            ],
+            Refusal::LowDisk { path, .. } => vec![(format!("df -h {path}"), "what is using the space".to_string()), again],
+            _ => vec![again],
+        }
+    }
+}
+
+/// Sudo and disk: everything this host must have before the tailnet join.
+fn host_preflight(needs: &HostNeeds, root_ok: bool, p: &Probes) -> Result<(), Refusal> {
+    if needs.sudo {
+        if !(p.sudo_present)() {
+            return Err(Refusal::NoSudo);
+        }
+        let passwordless = root_ok || (p.is_root)();
+        let can_prompt = (p.has_tty)();
+        if !passwordless && !can_prompt {
+            return Err(Refusal::SudoNeedsTerminal);
+        }
+        if !passwordless && !(p.sudo_validate)() {
+            return Err(Refusal::SudoRefused);
+        }
+    }
+    let need = NODE_MIN_FREE_GB.saturating_mul(1_000_000_000);
+    for path in &needs.disk_paths {
+        // Unknown free space is never a refusal: no guessing.
+        if let Some(free) = (p.free_bytes)(path) {
+            if free < need {
+                return Err(Refusal::LowDisk { path: path.clone(), free, need_gb: NODE_MIN_FREE_GB });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The controller answers (a TCP connect: nothing is sent, nothing spent).
+/// After the tailnet join, which is what makes it reachable.
+fn controller_preflight(noo_url: &str, p: &Probes) -> Result<(), Refusal> {
+    if (p.controller_reachable)(noo_url) {
+        Ok(())
+    } else {
+        Err(Refusal::ControllerUnreachable(noo_url.to_string()))
+    }
+}
+
+/// Say the refusal (`✗`, then the guide; JSON: the `{error, code, hint}`
+/// envelope) and hand back its exit code.
+fn report_refusal(g: &Globals, r: &Refusal) -> i32 {
+    if g.json {
+        crate::output::fail(true, r.exit(), r.code(), &r.message(), Some(&r.hint()));
+    }
+    ui::close_failed(&r.message(), None);
+    let guide = r.guide();
+    let lines: Vec<(&str, &str)> = guide.iter().map(|(c, w)| (c.as_str(), w.as_str())).collect();
+    ui::guide(&lines);
+    r.exit() as i32
+}
+
 pub fn enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let _ = g;
+    let mut redeem = |agent: &ureq::Agent, url: &str, body: &serde_json::Value| agent.post(url).send_json(body);
+    enroll_with(g, args, &Probes::live(), &mut redeem)
+}
+
+fn enroll_with(g: &Globals, args: &[String], probes: &Probes, redeem: Redeem<'_>) -> Result<i32, Unhandled> {
     let mut cred: Option<EnrollCred> = None;
     let mut url = String::new();
     let mut token = String::new();
@@ -495,6 +709,9 @@ pub fn enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // run, as the node's own root, writes it; nothing the controller sends
     // (a bundle, provision) ever does.
     let mut controller_approvals = false;
+    // i907: the owner's word that sudo needs no password here, for a run
+    // with no terminal to ask at. Never learned by running sudo.
+    let mut root_ok = false;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -510,6 +727,7 @@ pub fn enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             "--skip-prep" => skip_prep = true,
             "--resume" => resume = true,
             "--controller-approvals" => controller_approvals = true,
+            "--root-ok" => root_ok = true,
             "--help" | "-h" => {
                 say(USAGE);
                 return Ok(0);
@@ -626,6 +844,13 @@ pub fn enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     };
     let noo_url = cred.url.trim_end_matches('/').to_string();
 
+    // ── 0. Checks before anything is spent (sudo, disk) ────────────────────
+    let joins_tailnet = !skip_tailscale && cred.ts_authkey.is_some();
+    let needs = host_needs(cfg!(target_os = "macos"), skip_prep, joins_tailnet, data_root.as_deref());
+    if let Err(refusal) = host_preflight(&needs, root_ok, probes) {
+        return Ok(report_refusal(g, &refusal));
+    }
+
     // ── 1. Tailnet join ────────────────────────────────────────────────────
     if !skip_tailscale {
         if let Some(tsk) = &cred.ts_authkey {
@@ -730,8 +955,17 @@ pub fn enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     }
                 }
                 if run_visible(&mut retry) != 0 {
-                    ui::close_failed("tailscale up failed even with --reset", None);
-                    say(&ui::note("the auth key may be expired or not authorized for tag:worker"));
+                    ui::close_failed("tailscale up failed even with --reset. The token was NOT used", None);
+                    // The checks above settled sudo at a terminal (`sudo -v`)
+                    // and as root. Unattended, only --root-ok vouched for it:
+                    // a sudo that wanted a password fails here too, and that
+                    // is not the key's fault.
+                    if !(probes.is_root)() && !(probes.has_tty)() {
+                        say(&ui::note("if sudo printed \"a terminal is required\" or \"a password is required\" above, sudo stopped it, not the key: --root-ok needs passwordless sudo; run at a terminal instead"));
+                        say(&ui::note("otherwise the auth key may be expired or not authorized for tag:worker"));
+                    } else {
+                        say(&ui::note("the auth key may be expired or not authorized for tag:worker"));
+                    }
                     ui::guide(&[
                         ("noo cluster bootstrap-token create --node <name>", "on the controller: mints a fresh blob with a fresh tailnet key"),
                     ]);
@@ -749,6 +983,11 @@ pub fn enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 ui::done("on the tailnet as tag:worker");
             }
         }
+    }
+
+    // ── 1a. The controller answers, before anything is spent ──────────────
+    if let Err(refusal) = controller_preflight(&noo_url, probes) {
+        return Ok(report_refusal(g, &refusal));
     }
 
     // ── 1b. The trust anchor, BEFORE anything else touches the network ─────
@@ -1089,10 +1328,7 @@ pub fn enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 return Ok(1);
             }
         };
-        match agent
-            .post(format!("{noo_url}/api/cluster/bootstrap"))
-            .send_json(&body)
-        {
+        match redeem(&agent, &format!("{noo_url}/api/cluster/bootstrap"), &body) {
             Ok(mut r) if r.status().as_u16() < 300 => {
                 let text = r.body_mut().read_to_string().unwrap_or_default();
                 serde_json::from_str(&text).unwrap_or(serde_json::Value::Null)
@@ -1976,5 +2212,180 @@ mod tests {
         for no in ["", "n", "no", "maybe", "yep", "1", "true"] {
             assert!(!optin_answer(no), "{no:?} opted in; the default is no");
         }
+    }
+
+    // ── checks before anything is spent ──────────────────────────────────
+    use crate::output::ExitCode;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    const PLENTY: Option<u64> = Some(500_000_000_000);
+
+    /// A machine as the checks see it. `prompts` counts `sudo -v` runs.
+    fn machine(root: bool, tty: bool, sudo_present: bool, reachable: bool, free: Option<u64>, prompts: Rc<Cell<u32>>) -> Probes {
+        Probes {
+            is_root: Box::new(move || root),
+            has_tty: Box::new(move || tty),
+            sudo_present: Box::new(move || sudo_present),
+            sudo_validate: Box::new(move || {
+                prompts.set(prompts.get() + 1);
+                true
+            }),
+            controller_reachable: Box::new(move |_: &str| reachable),
+            free_bytes: Box::new(move |_: &str| free),
+        }
+    }
+
+    /// The whole enroll flow on a fake machine; the redeemer counts calls.
+    /// (exit code, redeem calls)
+    fn enroll_on(probes: &Probes, extra: &[&str]) -> (i32, u32) {
+        let g = crate::Globals { json: false, verbose: false, gateway_override: None, timeout_secs: None, token: None, quiet: true };
+        let mut args: Vec<String> = ["--url", "https://ctl.invalid:8080", "--token", "t0k", "--skip-tailscale"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        args.extend(extra.iter().map(|s| s.to_string()));
+        let calls = Cell::new(0u32);
+        let mut redeem = |_: &ureq::Agent, _: &str, _: &serde_json::Value| -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+            calls.set(calls.get() + 1);
+            Err(ureq::Error::ConnectionFailed)
+        };
+        let code = enroll_with(&g, &args, probes, &mut redeem).unwrap_or(-99);
+        (code, calls.get())
+    }
+
+    #[test]
+    fn a_run_without_terminal_or_passwordless_sudo_is_refused_before_the_redeem() {
+        // The controller probe answers "unreachable" too: a run that got
+        // past the sudo check would exit 3, not 6.
+        let prompts = Rc::new(Cell::new(0));
+        let m = machine(false, false, true, false, PLENTY, prompts.clone());
+        let (code, redeemed) = enroll_on(&m, &[]);
+        assert_eq!(code, ExitCode::NeedsDecision as i32, "enroll_needs_sudo exits 6");
+        assert_eq!(redeemed, 0, "the token must not be redeemed");
+        assert_eq!(prompts.get(), 0, "no terminal: sudo is never run to ask");
+    }
+
+    #[test]
+    fn an_unreachable_controller_is_refused_before_the_redeem() {
+        let m = machine(true, false, true, false, PLENTY, Rc::new(Cell::new(0)));
+        let (code, redeemed) = enroll_on(&m, &[]);
+        assert_eq!(code, ExitCode::GatewayUnreachable as i32, "enroll_controller_unreachable exits 3");
+        assert_eq!(redeemed, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn low_disk_is_refused_before_the_redeem() {
+        let m = machine(true, false, true, false, Some(1_000_000_000), Rc::new(Cell::new(0)));
+        let (code, redeemed) = enroll_on(&m, &[]);
+        assert_eq!(code, ExitCode::NeedsDecision as i32, "enroll_low_disk exits 6");
+        assert_eq!(redeemed, 0);
+    }
+
+    #[test]
+    fn a_run_that_needs_no_sudo_is_not_refused_for_it() {
+        // --skip-prep and no tailnet join: nothing runs sudo on Linux, so a
+        // run with no terminal goes on to the controller check (exit 3).
+        if cfg!(target_os = "linux") {
+            let m = machine(false, false, false, false, Some(0), Rc::new(Cell::new(0)));
+            let (code, redeemed) = enroll_on(&m, &["--skip-prep"]);
+            assert_eq!(code, ExitCode::GatewayUnreachable as i32);
+            assert_eq!(redeemed, 0);
+        }
+    }
+
+    #[test]
+    fn no_terminal_and_no_passwordless_sudo_refuses_and_root_root_ok_or_a_terminal_pass() {
+        let needs = HostNeeds { sudo: true, disk_paths: vec!["/var/lib".into()] };
+        let p = Rc::new(Cell::new(0));
+        let none = machine(false, false, true, true, PLENTY, p.clone());
+        assert_eq!(host_preflight(&needs, false, &none), Err(Refusal::SudoNeedsTerminal));
+        assert_eq!(p.get(), 0);
+        // root
+        let root = machine(true, false, true, true, PLENTY, p.clone());
+        assert_eq!(host_preflight(&needs, false, &root), Ok(()));
+        // the owner's --root-ok (passwordless sudo, unattended)
+        assert_eq!(host_preflight(&needs, true, &none), Ok(()));
+        assert_eq!(p.get(), 0, "root and --root-ok never prompt");
+        // a terminal: sudo asks once, up front
+        let tty = machine(false, true, true, true, PLENTY, p.clone());
+        assert_eq!(host_preflight(&needs, false, &tty), Ok(()));
+        assert_eq!(p.get(), 1);
+        // no sudo at all, even as root: every root step runs through it
+        let bare = machine(true, true, false, true, PLENTY, p.clone());
+        assert_eq!(host_preflight(&needs, false, &bare), Err(Refusal::NoSudo));
+        // sudo not needed: nothing is asked
+        let quiet = HostNeeds { sudo: false, disk_paths: vec![] };
+        assert_eq!(host_preflight(&quiet, false, &none), Ok(()));
+    }
+
+    #[test]
+    fn a_terminal_whose_sudo_refuses_the_password_is_refused() {
+        let needs = HostNeeds { sudo: true, disk_paths: vec![] };
+        let mut m = machine(false, true, true, true, PLENTY, Rc::new(Cell::new(0)));
+        m.sudo_validate = Box::new(|| false);
+        assert_eq!(host_preflight(&needs, false, &m), Err(Refusal::SudoRefused));
+    }
+
+    #[test]
+    fn disk_below_the_floor_is_refused_and_unknown_free_space_is_not() {
+        let needs = HostNeeds { sudo: false, disk_paths: vec!["/var/lib".into()] };
+        let floor = NODE_MIN_FREE_GB * 1_000_000_000;
+        let low = machine(true, false, true, true, Some(floor - 1), Rc::new(Cell::new(0)));
+        assert!(matches!(host_preflight(&needs, false, &low), Err(Refusal::LowDisk { .. })));
+        let exact = machine(true, false, true, true, Some(floor), Rc::new(Cell::new(0)));
+        assert_eq!(host_preflight(&needs, false, &exact), Ok(()));
+        let unknown = machine(true, false, true, true, None, Rc::new(Cell::new(0)));
+        assert_eq!(host_preflight(&needs, false, &unknown), Ok(()));
+    }
+
+    #[test]
+    fn the_controller_check_reads_the_probe() {
+        let up = machine(true, false, true, true, PLENTY, Rc::new(Cell::new(0)));
+        assert_eq!(controller_preflight("https://ctl.invalid:8080", &up), Ok(()));
+        let down = machine(true, false, true, false, PLENTY, Rc::new(Cell::new(0)));
+        assert_eq!(
+            controller_preflight("https://ctl.invalid:8080", &down),
+            Err(Refusal::ControllerUnreachable("https://ctl.invalid:8080".into()))
+        );
+    }
+
+    #[test]
+    fn host_needs_follow_the_lanes() {
+        // Linux with prep: sudo, and /var/lib checked
+        let n = host_needs(false, false, false, None);
+        assert!(n.sudo);
+        assert_eq!(n.disk_paths, vec!["/var/lib".to_string()]);
+        // Linux, --skip-prep, no tailnet join: no sudo, no disk
+        assert_eq!(host_needs(false, true, false, None), HostNeeds { sudo: false, disk_paths: vec![] });
+        // the tailnet join alone needs sudo
+        assert!(host_needs(false, true, true, None).sudo);
+        // macOS arms its daemon with sudo every time; no Docker install
+        assert_eq!(host_needs(true, true, false, None), HostNeeds { sudo: true, disk_paths: vec![] });
+        // a data root that does not exist yet is checked at its nearest parent
+        let n = host_needs(false, false, false, Some("/nonexistent-noo-test/a/b/noo"));
+        assert_eq!(n.disk_paths, vec!["/var/lib".to_string(), "/".to_string()]);
+    }
+
+    #[test]
+    fn every_refusal_has_a_stable_code_an_exit_and_says_the_token_was_not_used() {
+        let all = [
+            (Refusal::NoSudo, "enroll_needs_sudo", 6),
+            (Refusal::SudoNeedsTerminal, "enroll_needs_sudo", 6),
+            (Refusal::SudoRefused, "enroll_needs_sudo", 6),
+            (Refusal::ControllerUnreachable("https://ctl.invalid:8080".into()), "enroll_controller_unreachable", 3),
+            (Refusal::LowDisk { path: "/var/lib".into(), free: 2_500_000_000, need_gb: 5 }, "enroll_low_disk", 6),
+        ];
+        for (r, code, exit) in all {
+            assert_eq!(r.code(), code);
+            assert_eq!(r.exit() as i32, exit, "{r:?}");
+            assert!(r.message().ends_with("The token was NOT used"), "{}", r.message());
+            assert!(!r.hint().is_empty());
+            assert!(r.guide().iter().any(|(c, _)| c == super::PASTE_AGAIN), "{r:?}");
+        }
+        let low = Refusal::LowDisk { path: "/var/lib".into(), free: 2_500_000_000, need_gb: 5 };
+        assert!(low.hint().starts_with("free 3 GB on the filesystem holding /var/lib"), "{}", low.hint());
+        assert!(Refusal::SudoNeedsTerminal.hint().contains("run this at the machine with a terminal"));
     }
 }
