@@ -19,7 +19,9 @@ whose controller is already gone has no one left to tell it to leave (see
 and rebuild in place and keep `.env`, the model cache and other files (see
 [Not the same thing](#not-the-same-thing-stack-reset-and-stack-clean)).
 
-## One machine
+## For people
+
+### One machine
 
 Everything on one box (the usual first install):
 
@@ -51,7 +53,7 @@ noo offboard --check                 # exit 0: nothing of noomesh is left
 
 Then run the install line from the [install guide](install.md) again.
 
-## A controller and other nodes
+### A controller and other nodes
 
 On the controller, with its stack running:
 
@@ -109,7 +111,7 @@ from the registry instead:
 noo cluster forget gpu-2 --purge-tailscale
 ```
 
-### If you wiped the controller first
+#### If you wiped the controller first
 
 The nodes still have their agent, and they still trust the old controller.
 Their next enroll against a new controller is refused. On each such node:
@@ -118,7 +120,7 @@ Their next enroll against a new controller is refused. On each such node:
 sudo noo-deenroll                    # add --purge-data to drop its models and caches
 ```
 
-## What stays on purpose
+### What stays on purpose
 
 Starting over removes noomesh. These things belong to your machine, not to
 noomesh, and are left alone:
@@ -129,7 +131,7 @@ noomesh, and are left alone:
 - your backups in `~/noo-backups`;
 - on a node, `/var/log/noo-deenroll.log`, the record of its own teardown.
 
-## Not the same thing: stack reset and stack clean
+### Not the same thing: stack reset and stack clean
 
 These keep the install and rebuild parts of it:
 
@@ -147,3 +149,28 @@ These keep the install and rebuild parts of it:
 
 See [stack and data](../cli/stack-and-data.md#clean-up-or-start-over) for
 every flag.
+
+## For agents
+
+Everything on this page deletes data and cannot be undone. Run it only when
+the person asked for exactly this, at exactly this scope (one node, every
+node, the controller), and say what will go before you run it.
+
+- **Read-only, any time:** `noo offboard --check` lists what is installed;
+  exit 1 means something is there, exit 0 means nothing of noomesh is left.
+- **The order:** the other nodes first (`noo cluster teardown-node <node>`
+  or `--all`, from the controller while its stack runs), the controller
+  last (`noo offboard`). The reverse strands the nodes.
+- **Flags that widen it, each only on the person's word:** `-y` answers
+  every step yes; `--purge-secrets` deletes the age key and the CLI's
+  login; `--factory` also deletes a node's data root and its Tailscale
+  package; `--uninstall` removes the `noo` binary.
+- **Done means:** each node printed `<node>: teardown verified`, and
+  `noo offboard --check` exits 0. A tailnet line that says `NOT removed`
+  is the person's to finish in the Tailscale admin console.
+- **Never on a remote machine:** `sudo noo-deenroll` (a node whose
+  controller is already gone) runs at that node's own terminal, by a
+  person.
+- **Not a repair tool:** `noo stack clean --deep` also removes every
+  unused Docker image on the machine, not only noomesh's; `noo stack reset`
+  reinstalls in place. Neither is a fix to reach for unasked.
