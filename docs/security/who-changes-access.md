@@ -4,7 +4,9 @@ Covers: which gateway actions only a person may take, the one thing an agent may
 
 Keys never manage keys or people. A service key, a token exchanged from one (`POST /api/identity/token`), an MCP door token, an in-chat agent's token, an add-on or kiosk token: none of them may change accounts, roles or credentials, whatever role the account behind it holds. A person does that, signed in with `noo auth login` (or the console, or the operator-certificate token). This is in addition to each action's own role check.
 
-## Actions that need a person
+## For people
+
+### Actions that need a person
 
 - **Accounts:** create, reset a password, change role or scopes, disable or re-enable, erase, move to another org; create an org.
 - **Service keys:** issue, rotate, revoke, retire, revoke-and-disable, set the quota, set the context-overflow mode.
@@ -14,7 +16,7 @@ Keys never manage keys or people. A service key, a token exchanged from one (`PO
 - **Add-on access:** set who may use an add-on feature.
 - **Seats and nodes:** mint or revoke a seat token, bind or revoke a seat, approve a node-join proposal, revoke a node bootstrap token.
 
-## The one agent allowance
+### The one agent allowance
 
 Minting a node bootstrap token (`POST /api/security/bootstrap-tokens`, also with a Tailscale key) and a bare join key (`POST /api/cluster/mint-join-key`) also admit:
 
@@ -23,7 +25,7 @@ Minting a node bootstrap token (`POST /api/security/bootstrap-tokens`, also with
 
 A person still runs the enrol command on the new machine. Every other agent credential is refused here too, including a token exchanged from an `identity` key.
 
-## The refusal
+### The refusal
 
 `403` with a JSON body:
 
