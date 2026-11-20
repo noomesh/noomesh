@@ -637,10 +637,25 @@ fn hf_refuse(repo: &str, why: impl std::fmt::Display) -> AppError {
     ))
 }
 
+/// A path in the HF store that EXISTS but the gateway cannot read (a root-only
+/// mode under the gateway's `nonroot` user, a bad mount): a 500 that names the
+/// path and the OS error, never "absent" (a failed lookup is not absence).
+/// Internal, like `read_capped_file`: the store is broken, not the request.
+fn hf_unreadable(repo: &str, what: &str, e: &std::io::Error) -> AppError {
+    AppError::Internal(format!(
+        "{what} is not readable by the gateway: {e} (hf repo '{repo}'; the gateway runs as a non-root user, \
+         so the HF store under HF_CACHE_DIR/hub must be world-readable: chmod -R a+rX on it)"
+    ))
+}
+
 /// The commit `refs/main` names: 40 lowercase hex, or a refusal.
 fn hf_read_rev(repo_dir: &Path, repo: &str) -> Result<String, AppError> {
-    let raw = std::fs::read_to_string(repo_dir.join("refs").join("main")).map_err(|_| {
-        AppError::NotFound(format!("no hf repo '{repo}' with a refs/main in the controller store"))
+    let raw = std::fs::read_to_string(repo_dir.join("refs").join("main")).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            AppError::NotFound(format!("no hf repo '{repo}' with a refs/main in the controller store"))
+        } else {
+            hf_unreadable(repo, "refs/main", &e)
+        }
     })?;
     let rev = raw.trim().to_string();
     if !is_lower_hex(&rev, 40) {
@@ -654,13 +669,27 @@ fn hf_read_rev(repo_dir: &Path, repo: &str) -> Result<String, AppError> {
 /// it on spawn_blocking.
 fn hf_snapshot_entries(repo_dir: &Path, repo: &str, rev: &str) -> Result<Vec<HfEntry>, AppError> {
     let snap = repo_dir.join("snapshots").join(rev);
-    if !snap.is_dir() {
-        return Err(AppError::NotFound(format!(
-            "hf repo '{repo}': refs/main names {rev}, but snapshots/{rev}/ is not in the controller store"
-        )));
+    match std::fs::metadata(&snap) {
+        Ok(md) if md.is_dir() => {}
+        Ok(_) => {
+            return Err(AppError::NotFound(format!(
+                "hf repo '{repo}': refs/main names {rev}, but snapshots/{rev}/ is not in the controller store"
+            )))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(AppError::NotFound(format!(
+                "hf repo '{repo}': refs/main names {rev}, but snapshots/{rev}/ is not in the controller store"
+            )))
+        }
+        Err(e) => return Err(hf_unreadable(repo, &format!("snapshots/{rev}/"), &e)),
     }
-    let blobs = std::fs::canonicalize(repo_dir.join("blobs"))
-        .map_err(|e| hf_refuse(repo, format!("it has no blobs/ directory ({e})")))?;
+    let blobs = std::fs::canonicalize(repo_dir.join("blobs")).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            hf_refuse(repo, format!("it has no blobs/ directory ({e})"))
+        } else {
+            hf_unreadable(repo, "blobs/", &e)
+        }
+    })?;
     let io = |p: &Path, e: std::io::Error| AppError::Internal(format!("reading {}: {e}", p.display()));
     let mut out = Vec::new();
     let mut stack = vec![(snap, String::new(), 0usize)];
@@ -686,8 +715,13 @@ fn hf_snapshot_entries(repo_dir: &Path, repo: &str, rev: &str) -> Result<Vec<HfE
                     format!("{rel} is a plain file, not a link into blobs/, so nothing names what it should hash to"),
                 ));
             }
-            let target = std::fs::canonicalize(ent.path())
-                .map_err(|e| hf_refuse(repo, format!("{rel} is a dangling link ({e})")))?;
+            let target = std::fs::canonicalize(ent.path()).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    hf_refuse(repo, format!("{rel} is a dangling link ({e})"))
+                } else {
+                    hf_unreadable(repo, &rel, &e)
+                }
+            })?;
             if target.parent() != Some(blobs.as_path()) || !target.is_file() {
                 return Err(hf_refuse(repo, format!("{rel} does not link to a file in the repo's blobs/")));
             }
@@ -715,14 +749,21 @@ fn hf_snapshot_entries(repo_dir: &Path, repo: &str, rev: &str) -> Result<Vec<HfE
     Ok(out)
 }
 
+/// Why a git blob could not be hashed: it is not a blob the controller will
+/// vouch for (409), or it could not be read at all (500, not "refused").
+enum GitBlobErr {
+    TooLarge(String),
+    Read(std::io::Error),
+}
+
 /// The sha256 and the git blob id of a small file, read whole.
-fn hash_git_blob(path: &Path, size: u64) -> Result<([u8; 32], String), String> {
+fn hash_git_blob(path: &Path, size: u64) -> Result<([u8; 32], String), GitBlobErr> {
     use sha1::Sha1;
     use sha2::{Digest as _, Sha256};
     if size > HF_GIT_BLOB_MAX {
-        return Err(format!("{size} bytes is too large for a git blob"));
+        return Err(GitBlobErr::TooLarge(format!("{size} bytes is too large for a git blob")));
     }
-    let bytes = std::fs::read(path).map_err(|e| format!("read: {e}"))?;
+    let bytes = std::fs::read(path).map_err(GitBlobErr::Read)?;
     let mut git = Sha1::new();
     git.update(format!("blob {}\0", bytes.len()).as_bytes());
     git.update(&bytes);
@@ -770,7 +811,10 @@ async fn hf_manifest_at(hub: &Path, repo: &str, wait: std::time::Duration) -> Re
                 let (sha256, git) = tokio::task::spawn_blocking(move || hash_git_blob(&blob, size))
                     .await
                     .map_err(|err| AppError::Internal(format!("hashing {}: {err}", e.path)))?
-                    .map_err(|why| hf_refuse(repo, format!("{}: {why}", e.path)))?;
+                    .map_err(|why| match why {
+                        GitBlobErr::TooLarge(w) => hf_refuse(repo, format!("{}: {w}", e.path)),
+                        GitBlobErr::Read(io) => hf_unreadable(repo, &e.path, &io),
+                    })?;
                 if git != *want {
                     return Err(hf_refuse(
                         repo,
@@ -2067,6 +2111,122 @@ mod tests {
         }
         let v = hf_ready(&home, &repo).await.unwrap();
         assert_eq!(v["files"][2]["sha256"], sha256_hex(&weights));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    fn hf_repo_dir(home: &Path, repo: &str) -> PathBuf {
+        home.join("hub").join(repo)
+    }
+
+    /// The 500 for a store path that exists but cannot be read.
+    fn assert_hf_unreadable(err: AppError, what: &str) {
+        match err {
+            AppError::Internal(m) => {
+                assert!(m.contains(&format!("{what} is not readable by the gateway:")), "{m}");
+            }
+            other => panic!("expected a 500 unreadable, got {other:?}"),
+        }
+    }
+
+    /// refs/main absent: the old 404 text, unchanged.
+    #[tokio::test]
+    async fn hf_missing_refs_main_is_the_404_text() {
+        let (home, repo, _) = hf_fixture("norefs");
+        std::fs::remove_file(hf_repo_dir(&home, &repo).join("refs").join("main")).unwrap();
+        match hf_ready(&home, &repo).await.unwrap_err() {
+            AppError::NotFound(m) => assert_eq!(
+                m,
+                format!("no hf repo '{repo}' with a refs/main in the controller store")
+            ),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// refs/main present but not readable: a 500 naming the OS error, never
+    /// "no hf repo". A DIRECTORY where the file is expected fails the read
+    /// with a non-NotFound error even as root (root reads through mode 000).
+    #[tokio::test]
+    async fn hf_unreadable_refs_main_is_not_reported_absent() {
+        let (home, repo, _) = hf_fixture("dirrefs");
+        let main = hf_repo_dir(&home, &repo).join("refs").join("main");
+        std::fs::remove_file(&main).unwrap();
+        std::fs::create_dir(&main).unwrap();
+        assert_hf_unreadable(hf_ready(&home, &repo).await.unwrap_err(), "refs/main");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The real case: a 0600 root-written file under the gateway's user.
+    /// As root mode 000 is still readable, so there the test returns (the
+    /// directory case above covers root).
+    #[tokio::test]
+    async fn hf_refs_main_mode_000_is_permission_denied_not_absent() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (home, repo, _) = hf_fixture("modeless");
+        let main = hf_repo_dir(&home, &repo).join("refs").join("main");
+        std::fs::set_permissions(&main, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let err = hf_ready(&home, &repo).await.unwrap_err();
+        assert_hf_unreadable(err, "refs/main");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// snapshots/<rev>/: absent is a 404; a non-NotFound stat error is a 500.
+    #[tokio::test]
+    async fn hf_snapshot_dir_absent_is_404_unreadable_is_500() {
+        let (home, repo, _) = hf_fixture("snapdir");
+        let snaps = hf_repo_dir(&home, &repo).join("snapshots");
+        std::fs::remove_dir_all(snaps.join(HF_REV)).unwrap();
+        match hf_ready(&home, &repo).await.unwrap_err() {
+            AppError::NotFound(m) => assert!(m.contains("is not in the controller store"), "{m}"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        // `snapshots` is a file: stat of snapshots/<rev> is ENOTDIR, not ENOENT.
+        std::fs::remove_dir_all(&snaps).unwrap();
+        std::fs::write(&snaps, b"x").unwrap();
+        assert_hf_unreadable(hf_ready(&home, &repo).await.unwrap_err(), &format!("snapshots/{HF_REV}/"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// blobs/: absent is the 409 refusal; a link loop (ELOOP) is a 500.
+    #[tokio::test]
+    async fn hf_blobs_dir_absent_is_refused_unreadable_is_500() {
+        let (home, repo, _) = hf_fixture("blobsdir");
+        let blobs = hf_repo_dir(&home, &repo).join("blobs");
+        std::fs::remove_dir_all(&blobs).unwrap();
+        assert_hf_refused(hf_ready(&home, &repo).await.unwrap_err(), "no blobs/ directory");
+        std::os::unix::fs::symlink(&blobs, &blobs).unwrap();
+        assert_hf_unreadable(hf_ready(&home, &repo).await.unwrap_err(), "blobs/");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A snapshot link: dangling is the 409 refusal; a link loop is a 500.
+    #[tokio::test]
+    async fn hf_dangling_link_is_refused_unreadable_link_is_500() {
+        let (home, repo, _) = hf_fixture("links");
+        let snap = hf_repo_dir(&home, &repo).join("snapshots").join(HF_REV);
+        std::os::unix::fs::symlink("../../blobs/nope", snap.join("gone.bin")).unwrap();
+        assert_hf_refused(hf_ready(&home, &repo).await.unwrap_err(), "dangling link");
+        std::fs::remove_file(snap.join("gone.bin")).unwrap();
+        std::os::unix::fs::symlink(snap.join("loop.bin"), snap.join("loop.bin")).unwrap();
+        assert_hf_unreadable(hf_ready(&home, &repo).await.unwrap_err(), "loop.bin");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A git blob the gateway cannot read is a 500, not a 409 "refused".
+    /// Skipped as root (mode 000 is readable there).
+    #[tokio::test]
+    async fn hf_unreadable_git_blob_is_500_not_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (home, repo, _) = hf_fixture("gitperm");
+        let blob = hf_repo_dir(&home, &repo).join("blobs").join(git_blob_hex(b"{\"model_type\":\"t\"}"));
+        std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_hf_unreadable(hf_ready(&home, &repo).await.unwrap_err(), "config.json");
         let _ = std::fs::remove_dir_all(&home);
     }
 
