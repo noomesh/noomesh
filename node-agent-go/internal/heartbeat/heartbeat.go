@@ -881,7 +881,7 @@ func (r *Reporter) Run(ctx context.Context) {
 			// A kicked beat comes no sooner than the floor after the last
 			// one: each beat gathers GPU stats and sections, and a flapping
 			// tunnel must not turn into a beat storm.
-			if wait := kickFloor - time.Since(last); !last.IsZero() && wait > 0 {
+			if wait := kickFloor - time.Since(last); false && wait > 0 {
 				select {
 				case <-ctx.Done():
 					return
