@@ -145,9 +145,9 @@
   },
   "streaming_over_tunnel": {
    "label": "node:streaming over tunnel",
-   "status": "under triage",
-   "by": "i1128",
-   "why": "NOT CHECKED on a fresh install's closing verify: it runs before the gateway's first tunnel probe result (or during a reconnect); triage in followup i1128"
+   "status": "fix in flight",
+   "by": "#1478",
+   "why": "the node record's tunnel flag lagged a gateway restart by up to a heartbeat (i1128); #1478 (rc.3) kicks a heartbeat on tunnel connect and loss. On rc.3 it should be gone: the PR that sees it gone lowers the ceilings"
   },
   "ollama_slots": {
    "label": "controller:ollama slots",
@@ -157,46 +157,164 @@
  },
  "cells": {
   "ubuntu-24.04-amd64-default": {
-   "max_warn": null,
-   "rows": null,
-   "measured": null,
-   "why": "placeholder: the baseline is taken from 0.6.29-rc.2's fresh runs (logs/probe-verify-json.log)"
+   "max_warn": 16,
+   "rows": [
+    "age_key_at_rest",
+    "agent_protect",
+    "at_rest_outside_the_set",
+    "at_rest_swap",
+    "at_rest_tpm",
+    "at_rest_volume",
+    "holds",
+    "last_backup",
+    "nats_at_rest",
+    "noo_data_at_rest",
+    "off_site_backup",
+    "pki_at_rest",
+    "postgres_at_rest",
+    "prometheus_at_rest",
+    "redis_at_rest",
+    "streaming_over_tunnel"
+   ],
+   "measured": "0.6.29-rc.2 fresh runs 44727787931, 44738164701, 44747857452: WARN per run [15, 15, 16]",
+   "why": "max over the three runs, rows their union; run 1's registry-503 cells (default, stranger-literal) had no model at verify, so their outage-only `lanes` row is left out (release lead, 11-20)"
   },
   "ubuntu-24.04-amd64-slots4": {
-   "max_warn": null,
-   "rows": null,
-   "measured": null,
-   "why": "placeholder: the baseline is taken from 0.6.29-rc.2's fresh runs (logs/probe-verify-json.log)"
+   "max_warn": 17,
+   "rows": [
+    "age_key_at_rest",
+    "agent_protect",
+    "at_rest_outside_the_set",
+    "at_rest_swap",
+    "at_rest_tpm",
+    "at_rest_volume",
+    "holds",
+    "last_backup",
+    "nats_at_rest",
+    "noo_data_at_rest",
+    "off_site_backup",
+    "ollama_slots",
+    "pki_at_rest",
+    "postgres_at_rest",
+    "prometheus_at_rest",
+    "redis_at_rest",
+    "streaming_over_tunnel"
+   ],
+   "measured": "0.6.29-rc.2 fresh runs 44727787931, 44738164701, 44747857452: WARN per run [17, 17, 17]",
+   "why": "max over the three runs, rows their union"
   },
   "ubuntu-22.04-amd64": {
-   "max_warn": null,
-   "rows": null,
-   "measured": null,
-   "why": "placeholder: the baseline is taken from 0.6.29-rc.2's fresh runs (logs/probe-verify-json.log)"
+   "max_warn": 15,
+   "rows": [
+    "age_key_at_rest",
+    "agent_protect",
+    "at_rest_outside_the_set",
+    "at_rest_swap",
+    "at_rest_tpm",
+    "at_rest_volume",
+    "holds",
+    "last_backup",
+    "nats_at_rest",
+    "noo_data_at_rest",
+    "off_site_backup",
+    "pki_at_rest",
+    "postgres_at_rest",
+    "prometheus_at_rest",
+    "redis_at_rest"
+   ],
+   "measured": "0.6.29-rc.2 fresh runs 44727787931, 44738164701, 44747857452: WARN per run [15, 15, 15]",
+   "why": "max over the three runs, rows their union"
   },
   "ubuntu-22.04-amd64-docker.io": {
-   "max_warn": null,
-   "rows": null,
-   "measured": null,
-   "why": "placeholder: the baseline is taken from 0.6.29-rc.2's fresh runs (logs/probe-verify-json.log)"
+   "max_warn": 16,
+   "rows": [
+    "age_key_at_rest",
+    "agent_protect",
+    "at_rest_outside_the_set",
+    "at_rest_swap",
+    "at_rest_tpm",
+    "at_rest_volume",
+    "holds",
+    "last_backup",
+    "nats_at_rest",
+    "noo_data_at_rest",
+    "off_site_backup",
+    "pki_at_rest",
+    "postgres_at_rest",
+    "prometheus_at_rest",
+    "redis_at_rest",
+    "streaming_over_tunnel"
+   ],
+   "measured": "0.6.29-rc.2 fresh runs 44727787931, 44738164701, 44747857452: WARN per run [16, 15, 16]",
+   "why": "max over the three runs, rows their union"
   },
   "stranger-24.04": {
-   "max_warn": null,
-   "rows": null,
-   "measured": null,
-   "why": "placeholder: the baseline is taken from 0.6.29-rc.2's fresh runs (logs/probe-verify-json.log)"
+   "max_warn": 16,
+   "rows": [
+    "age_key_at_rest",
+    "agent_protect",
+    "at_rest_outside_the_set",
+    "at_rest_swap",
+    "at_rest_tpm",
+    "at_rest_volume",
+    "holds",
+    "last_backup",
+    "nats_at_rest",
+    "noo_data_at_rest",
+    "off_site_backup",
+    "pki_at_rest",
+    "postgres_at_rest",
+    "prometheus_at_rest",
+    "redis_at_rest",
+    "streaming_over_tunnel"
+   ],
+   "measured": "0.6.29-rc.2 fresh runs 44727787931, 44738164701, 44747857452: WARN per run [16, 15, 15]",
+   "why": "max over the three runs, rows their union"
   },
   "stranger-24.04-literal": {
-   "max_warn": null,
-   "rows": null,
-   "measured": null,
-   "why": "placeholder: the baseline is taken from 0.6.29-rc.2's fresh runs (logs/probe-verify-json.log)"
+   "max_warn": 15,
+   "rows": [
+    "age_key_at_rest",
+    "agent_protect",
+    "at_rest_outside_the_set",
+    "at_rest_swap",
+    "at_rest_tpm",
+    "at_rest_volume",
+    "holds",
+    "last_backup",
+    "nats_at_rest",
+    "noo_data_at_rest",
+    "off_site_backup",
+    "pki_at_rest",
+    "postgres_at_rest",
+    "prometheus_at_rest",
+    "redis_at_rest"
+   ],
+   "measured": "0.6.29-rc.2 fresh runs 44727787931, 44738164701, 44747857452: WARN per run [15, 15, 15]",
+   "why": "max over the three runs, rows their union; run 1's registry-503 cells (default, stranger-literal) had no model at verify, so their outage-only `lanes` row is left out (release lead, 11-20)"
   },
   "windows-2025-wsl2": {
-   "max_warn": null,
-   "rows": null,
-   "measured": null,
-   "why": "placeholder: the baseline is taken from 0.6.29-rc.2's fresh runs (logs/probe-verify-json.log)"
+   "max_warn": 16,
+   "rows": [
+    "age_key_at_rest",
+    "agent_protect",
+    "at_rest_outside_the_set",
+    "at_rest_swap",
+    "at_rest_tpm",
+    "at_rest_volume",
+    "holds",
+    "host_telemetry",
+    "last_backup",
+    "nats_at_rest",
+    "noo_data_at_rest",
+    "off_site_backup",
+    "pki_at_rest",
+    "postgres_at_rest",
+    "prometheus_at_rest",
+    "redis_at_rest"
+   ],
+   "measured": "0.6.29-rc.2 fresh runs 44727787931, 44738164701, 44747857452: WARN per run [16, 16, 16]",
+   "why": "max over the three runs, rows their union"
   }
  }
 }
