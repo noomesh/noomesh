@@ -1125,7 +1125,7 @@ pub(crate) fn parse_place_with(a: &mut Args) -> Result<PlaceArgs, ArgError> {
 /// placement). For ollama, vllm or llamacpp it would place a model
 /// literally named "auto": refused before anything is sent. Pure.
 pub(crate) fn auto_model_refusal(backend: &str, model: &str) -> Option<&'static str> {
-    (model == "auto" && backend != "harness")
+    (model == "auto" && backend == "vllm")
         .then_some("auto picks a model only for harness: name a model, see `noo models recommended`")
 }
 
