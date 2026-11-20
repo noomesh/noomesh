@@ -1846,7 +1846,7 @@ async fn user_grant_roles(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<RolesBody>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, ctx.as_deref(), "granting KB roles").await?;
+
     // KB roles decide which documents the account can read.
     require_may_manage(&state.db, &ctx, &username).await?;
     let requested: Vec<String> = body
