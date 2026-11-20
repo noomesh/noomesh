@@ -42,7 +42,7 @@ pub(crate) const JOB_CAPS: &[(&str, &[&str], &str)] = &[
     // touch in a dir owned by the wizard's user: creating the file is a write-permission (DAC) check.
     ("touch", &["DAC_OVERRIDE"], "create a file in a dir owned by another uid"),
     // chown of the mount point only needs CHOWN: no file is read or written.
-    ("chown", &["CHOWN"], "chown the mounted (empty) dir"),
+    ("chown", &["ALL"], "chown the mounted (empty) dir"),
     // du walks service-owned 0700 subdirs, read-only mount: search+read only.
     ("du", &["DAC_READ_SEARCH"], "read-only walk of a service-owned tree"),
     // secrets: chown each file to its container's uid, reading the manifest.
