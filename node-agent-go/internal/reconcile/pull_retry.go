@@ -53,7 +53,6 @@ var pullNetworkMarkers = []string{
 	"deadline exceeded",
 	"tls handshake",
 	"unexpected eof",
-	"dial tcp",
 }
 
 // classifyPullFailure says why a failed pull is worth retrying, or "" when it
