@@ -2689,7 +2689,7 @@ pub(crate) fn host_checks(id: &str, host: &Value, hostd_alive: bool) -> Vec<Chec
 /// of every container, not "a package moved".
 pub(crate) fn holds_detail(unheld: &[&str]) -> String {
     let is_docker = |p: &&str| p.starts_with("docker") || *p == "containerd.io";
-    let (docker, other): (Vec<&str>, Vec<&str>) = unheld.iter().partition(is_docker);
+    let (docker, other): (Vec<&str>, Vec<&str>) = unheld.iter().copied().partition(is_docker);
     if docker.is_empty() {
         return format!("{} not pinned: a routine `apt upgrade` can move them. Hold them when you want control.", other.join(", "));
     }
