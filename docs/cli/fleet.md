@@ -262,9 +262,10 @@ Declaring `chat-default` puts your list ahead of the dynamic pool; `class list`
 prints `chat-default: dynamic (all live chat nodes)` or `declared`, and
 `noo cluster verify --controller` has a `default chat` row listing the live
 candidates in order (`!` when only CPU candidates or one node remain, `x`
-when none). On a fleet with no GPU node the CPU-only `!` suggests no
-`noo cluster place`: none is needed, and adding a GPU node lets it move to a
-faster model.
+when none). A fleet with no GPU node, or of one node, can have nothing
+better: there the row is OK and listed under "Worth doing later" (`tier:
+"later"` in `--json`), saying what a GPU node or a second node would add.
+A fleet that could not be read keeps the `!`.
 
 **Purposes.** Stack services name a purpose instead of a model:
 trellion's answers and ingestion send `knowledge`, conversation
