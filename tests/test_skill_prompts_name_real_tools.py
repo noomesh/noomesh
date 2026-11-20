@@ -80,3 +80,24 @@ def test_no_skill_sends_an_agent_over_ssh():
         if re.search(r"\bssh", line, re.IGNORECASE)
     ]
     assert not hits, "nodes are pull-only and no lane logs into them:\n" + "\n".join(hits)
+
+
+def _personas() -> list[Path]:
+    files = sorted((ROOT / "prompts").glob("coordinator*.md"))
+    assert files, "no coordinator persona under prompts/"
+    return files
+
+
+def test_the_persona_routes_no_cli_or_ssh_through_noo_coding_task():
+    """`noo_coding_task` refuses every task (coding_tool.py: in-cluster
+    Claude Code is retired), so a persona line that sends a `noo ...` command
+    or SSH through it tells the coordinator to do something that cannot
+    happen. The CLI runs on the controller, by the operator."""
+    hits = [
+        f"{p.relative_to(ROOT)}:{i}: {line.strip()}"
+        for p in _personas()
+        for i, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1)
+        if re.search(r"\bssh", line, re.IGNORECASE)
+        or ("noo_coding_task" in line and re.search(r"`noo [a-z]", line))
+    ]
+    assert not hits, "\n".join(hits)
