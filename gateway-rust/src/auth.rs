@@ -3361,7 +3361,7 @@ pub async fn require_any_auth(
         if defers_to_ws_handler(&request) {
             return Ok(next.run(request).await);
         }
-        return Ok(unauthenticated());
+        return Err(StatusCode::UNAUTHORIZED);
     };
 
     // Cluster token v2: a fleet-secret HMAC bound to THIS request (method,
