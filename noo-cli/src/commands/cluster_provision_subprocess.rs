@@ -216,12 +216,7 @@ fn stage_artifact_into_store(name: &str, store: &std::path::Path) -> Result<Vec<
     if name != "harrier" {
         return Err(format!("{name} is not an artifact the release pins (only harrier ships as one)"));
     }
-    let (artifact, from_env) = crate::onboard::steps::harrier_artifact_ref()?;
-    if from_env {
-        ui::warned(&format!(
-            "{} is set and no signed stack lock pins harrier: staging {artifact} by a digest from the ENVIRONMENT, not the release (a dev path)",
-            crate::onboard::steps::HARRIER_DIGEST_ENV));
-    }
+    let artifact = crate::onboard::steps::harrier_artifact_ref()?;
     std::fs::create_dir_all(store).map_err(|e| format!("create {}: {e}", store.display()))?;
     let tmp = store.join(format!(".{name}.staging"));
     let _ = std::fs::remove_dir_all(&tmp);

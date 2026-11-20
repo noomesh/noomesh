@@ -1051,9 +1051,18 @@ embedder check after `noo upgrade --stack`, and `noo cluster import-model
 <node> harrier` when it stages the pair into the controller store (which runs
 the same `sha256sum -c` first and stages nothing on a mismatch). A host whose
 `stack.lock` pins no harrier refuses the pull rather than take the mutable
-tag; the only way past is the dev variable `NOO_HARRIER_ARTIFACT_DIGEST`
-([env.md](../reference/env.md)). The lock row is never staged to nodes and no
-compose service runs it: nodes import the weights from the controller store.
+tag, and there is no override: the signed lock is the only source of the pin.
+The refusal reads "this release's lock pins no harrier yet: run `noo upgrade
+--stack` first". The lock row is never staged to nodes and no compose service
+runs it: nodes import the weights from the controller store.
+
+**The upgrade window.** A 0.6.29 CLI over a lock that pins no harrier (before
+`noo upgrade --stack` has written the new lock, or after a rollback to 0.6.28
+or older) refuses every fresh harrier fetch: the onboard embedder step, `noo
+models pull harrier` and `noo cluster import-model <node> harrier` staging.
+Nodes, and the controller's embed container, that already have harrier are
+unaffected: nothing is refetched while the model is present. The remedy is
+`noo upgrade --stack`.
 
 `noo cluster verify`'s `ollama models` row holds harrier to the release, not
 only to the controller: a node's (or the controller's own embed container's)
