@@ -478,7 +478,11 @@ var backendSpecs = map[string]BackendSpec{
 		},
 		GPUCount: "1",
 		Network:  "noo-cluster",
-		Command:  []string{"--model-id", "${TEI_MODEL:-BAAI/bge-base-en-v1.5}"},
+		// TEI's --model-id beats its MODEL_ID env, so the flag must name the
+		// model the container env names: ${MODEL_ID} is resolved against the
+		// CONTAINER env (resolveCommand) — the placement's model when one is
+		// placed, else TEI_MODEL, else bge-base (the MODEL_ID default above).
+		Command: []string{"--model-id", "${MODEL_ID}"},
 	},
 	// Reranker — engine-selectable via RERANK_ENGINE, spec built by
 	// rerankerSpec() below. Default: hardened llama.cpp (llama-server
@@ -493,10 +497,11 @@ var backendSpecs = map[string]BackendSpec{
 // rerankEntrypointScript translates the hardened llamacpp image's stable env
 // interface (MODEL_PATH/N_GPU_LAYERS/N_CTX/N_THREADS/HOST/PORT) into
 // llama-server flags with reranking enabled. Uses $VAR (NOT ${VAR}) so
-// substitution happens in the CONTAINER shell — resolveEnvSlice expands
-// ${...} from the node-agent's own env at create time, which would clobber
-// these. `command -v` covers the hardened image (llama-server on PATH);
-// /app/llama-server covers the upstream ghcr multi-arch image (ARM nodes).
+// substitution happens in the CONTAINER shell — resolveCommand expands
+// ${...} at create time (from the container env, else the node-agent's),
+// which would clobber these. `command -v` covers the hardened image
+// (llama-server on PATH); /app/llama-server covers the upstream ghcr
+// multi-arch image (ARM nodes).
 const rerankEntrypointScript = `
 BIN="$(command -v llama-server 2>/dev/null || echo /app/llama-server)"
 exec "$BIN" --model "$MODEL_PATH" --reranking \
@@ -544,7 +549,8 @@ func rerankerSpecTEI() BackendSpec {
 		},
 		GPUCount: "1",
 		Network:  "noo-cluster",
-		Command:  []string{"--model-id", "${RERANK_MODEL:-BAAI/bge-reranker-base}"},
+		// The placed model, as for the embedding backend (resolveCommand).
+		Command: []string{"--model-id", "${MODEL_ID}"},
 	}
 }
 
@@ -752,6 +758,28 @@ func llamacppCPULimit(specLimit float64, threads string, cores int) float64 {
 	return float64(n)
 }
 
+// embedRerankModelEnv puts a placed embedding/reranker model into the
+// container env overrides. A TEI spec (the embedding backend, the reranker
+// with RERANK_ENGINE=tei: both carry MODEL_ID) takes the HF repo id as
+// MODEL_ID, which its Command passes on as --model-id (resolveCommand). The
+// llama.cpp reranker takes a gguf filename under the /models mount (same
+// bare-filename handling as the llamacpp backend). No model: the spec's own
+// default stands.
+func embedRerankModelEnv(spec BackendSpec, model string, envOverrides map[string]string) {
+	if model == "" {
+		return
+	}
+	if spec.Env["MODEL_ID"] != "" {
+		envOverrides["MODEL_ID"] = model
+		return
+	}
+	mp := model
+	if !strings.HasPrefix(mp, "/") {
+		mp = "/models/" + mp
+	}
+	envOverrides["MODEL_PATH"] = mp
+}
+
 // SpecHashLabel names the container label that carries the desired-spec
 // fingerprint (StartOverrides.SpecHash). Read back by the reconciler to
 // detect spec drift. Absent on containers created before this feature.
@@ -859,25 +887,8 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 		if model != "" {
 			envOverrides["MODEL_PATH"] = model
 		}
-	case "embedding":
-		if model != "" {
-			envOverrides["MODEL_ID"] = model
-		}
-	case "reranker":
-		if model != "" {
-			if spec.Env["MODEL_ID"] != "" {
-				// TEI engine: HF repo id.
-				envOverrides["MODEL_ID"] = model
-			} else {
-				// llama.cpp engine: gguf filename under the /models mount
-				// (same bare-filename handling as the llamacpp backend).
-				mp := model
-				if !strings.HasPrefix(mp, "/") {
-					mp = "/models/" + mp
-				}
-				envOverrides["MODEL_PATH"] = mp
-			}
-		}
+	case "embedding", "reranker":
+		embedRerankModelEnv(spec, model, envOverrides)
 	}
 
 	// GPU count override
@@ -1028,8 +1039,9 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 		sidecarImage = img
 	}
 
-	// Build command
-	cmd := resolveEnvSlice(spec.Command)
+	// Build command: resolved against the container env just built, so a
+	// ${VAR} in it follows the placement (TEI's --model-id ${MODEL_ID}).
+	cmd := resolveCommand(spec.Command, env)
 	entrypoint := spec.Entrypoint
 
 	// Container config
@@ -1470,6 +1482,32 @@ func fetchArtifactManifest(ctx context.Context, kind, name string) *artifactMani
 // resolveEnv performs ${VAR:-default} substitution from os.Environ.
 // Supports nested expressions like ${OUTER:-${INNER}/cache}.
 func resolveEnv(s string) string {
+	return resolveEnvWith(s, os.Getenv)
+}
+
+// resolveCommand resolves a spec Command against the CONTAINER env (the
+// KEY=value list buildEnvList rendered: spec env, then the placement's
+// overrides, then the pinned keys), falling back to the agent's own env for
+// a name the container env does not carry. A Command ${VAR} resolved from
+// the agent's env alone ignored the placement: TEI's --model-id (which beats
+// its MODEL_ID env) named the node default whatever model was placed.
+func resolveCommand(cmd []string, containerEnv []string) []string {
+	have := parseEnv(containerEnv)
+	lookup := func(name string) string {
+		if v, ok := have[name]; ok {
+			return v
+		}
+		return os.Getenv(name)
+	}
+	out := make([]string, len(cmd))
+	for i, s := range cmd {
+		out[i] = resolveEnvWith(s, lookup)
+	}
+	return out
+}
+
+// resolveEnvWith is resolveEnv with the variables read through lookup.
+func resolveEnvWith(s string, lookup func(string) string) string {
 	if !strings.Contains(s, "${") {
 		return s
 	}
@@ -1497,9 +1535,9 @@ func resolveEnv(s string) string {
 			fallback = ""
 		}
 
-		val := os.Getenv(name)
+		val := lookup(name)
 		if val == "" {
-			val = resolveEnv(fallback) // recursive for nested ${...}
+			val = resolveEnvWith(fallback, lookup) // recursive for nested ${...}
 		}
 
 		result = result[:start] + val + result[end+1:]
@@ -1523,14 +1561,6 @@ func findMatchingBrace(s string, pos int) int {
 		}
 	}
 	return -1
-}
-
-func resolveEnvSlice(ss []string) []string {
-	out := make([]string, len(ss))
-	for i, s := range ss {
-		out[i] = resolveEnv(s)
-	}
-	return out
 }
 
 // teiHubCache is the TEI images' hub cache, pointed at the hub/ level of the

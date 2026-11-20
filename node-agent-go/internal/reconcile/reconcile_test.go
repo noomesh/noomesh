@@ -87,6 +87,24 @@ func TestSpecHash_ReasoningParserTriggersDrift(t *testing.T) {
 	}
 }
 
+// A TEI placement's model change is a spec change, so the reconciler
+// recreates the container; the agent resolves the new one's --model-id from
+// the placed model (docker.resolveCommand), so the hashed model is the
+// command's input.
+func TestSpecHash_TEIModelChangeTriggersDrift(t *testing.T) {
+	for _, backend := range []string{"embedding", "reranker"} {
+		before := basePlacement()
+		before.Backend = backend
+		before.Model = "org/model-a"
+		before.Env = map[string]string{}
+		after := before
+		after.Model = "org/model-b"
+		if specHash(before) == specHash(after) {
+			t.Errorf("%s: a model change did not change the spec hash", backend)
+		}
+	}
+}
+
 // Volatile keys are excluded: their presence or value must not move the hash,
 // otherwise agent-injected/node-dependent env would report false drift on a
 // placement the operator never touched.
