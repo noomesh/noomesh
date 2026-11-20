@@ -3378,7 +3378,7 @@ pub async fn require_any_auth(
                 from_v2 = true;
                 v1_shaped
             }
-            Err(status) => return Ok(v2_refusal(status)),
+            Err(status) => return Err(status),
         }
     } else {
         t
