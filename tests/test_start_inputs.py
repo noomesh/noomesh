@@ -534,3 +534,88 @@ def test_a_shared_secret_is_an_input_of_every_reader(tmp_path: Path) -> None:
     (i.rundir / "noo_jwt_secret").write_text("rotat")
     _, b, _ = i.fingerprint(cfg)
     assert {s for s in a if a[s] != b[s]} == {"gateway", "worker"}
+
+
+# ── onboard ends converged ─────────────────────────────────────────────────
+
+def test_onboard_sequence_then_start_recreates_nothing(tmp_path: Path) -> None:
+    """The 0.6.29-rc.1 install matrix, replayed on the fingerprint (no docker).
+
+    A container carries the label it was created with; compose recreates it
+    when the start's label differs. Onboard's Service Setup start labels every
+    container (L0). Then onboard keeps writing: its `restart --force worker
+    trellion` (service keys) recreates those two WITHOUT a label, the self node
+    lands its certificate in pki/public/nodes and its NATS user in users.conf
+    (nats is HUPed, still on L0), the model step writes noomesh.yaml, and (in
+    rc.1's order) the posture restart recreates the gateway without a label.
+    The first plain
+    start after that recreated gateway, nats, trellion and worker: the cell's
+    START-IDEMPOTENT failure. Onboard's own last start (converge_stack) is that
+    plain start; after it, the operator's start computes the same labels and
+    recreates nothing, and a later edit of noomesh.yaml still recreates its
+    readers."""
+    i = Install(tmp_path)
+    r, d = i.root, i.rundir
+    (r / "noomesh.yaml").write_text("cluster: {}\n")
+    (r / "monitoring" / "nats").mkdir(parents=True)
+    (r / "monitoring" / "nats" / "users.conf").write_text("users: [gateway, worker]\n")
+    pki = tmp_path / "pki"
+    (pki / "public" / "nodes").mkdir(parents=True)
+    (d / "noo_svc_key_worker").write_text("")
+    (d / "noo_svc_key_trellion").write_text("")
+    yml = {"type": "bind", "source": f"{r}/noomesh.yaml", "target": "/app/noomesh.yaml"}
+    cfg = {
+        "services": {
+            "gateway": {"volumes": [yml, {"type": "bind", "source": f"{pki}/public/nodes",
+                                          "target": "/app/pki/nodes", "read_only": True}]},
+            "nats": {"volumes": [{"type": "bind", "source": f"{r}/monitoring/nats/users.conf",
+                                  "target": "/etc/nats/users.conf", "read_only": True}]},
+            "worker": {"volumes": [dict(yml, read_only=True)], "secrets": [{"source": "noo_svc_key_worker"}]},
+            "trellion": {"volumes": [yml], "secrets": [{"source": "noo_svc_key_trellion"}]},
+            "redis": {},
+        },
+        "secrets": {
+            "noo_svc_key_worker": {"file": f"{d}/noo_svc_key_worker"},
+            "noo_svc_key_trellion": {"file": f"{d}/noo_svc_key_trellion"},
+        },
+    }
+
+    def start(tag: str) -> dict[str, str]:
+        res = subprocess.run(
+            ["python3", str(HELPER), "fingerprint", "--key-file", str(i.key), "--root", str(r),
+             "--pki-dir", str(pki), "--override-out", str(tmp_path / f"o{tag}.yml"),
+             "--state-out", str(tmp_path / f"s{tag}.json")],
+            input=json.dumps(cfg), capture_output=True, text=True, timeout=60)
+        assert res.returncode == 0, res.stderr
+        return {m.group(1): m.group(2) for m in re.finditer(
+            r'^  "(.+)":\n    labels:\n      noo\.inputs: "([0-9a-z:]+)"$', (tmp_path / f"o{tag}.yml").read_text(), re.M)}
+
+    def up(carried: dict[str, str | None], labels: dict[str, str]) -> set[str]:
+        moved = {s for s in labels if carried.get(s) != labels[s]}
+        carried.update({s: labels[s] for s in moved})
+        return moved
+
+    # Service Setup: `noomesh-start.sh --recreate` labels every container.
+    carried: dict[str, str | None] = dict(start("0"))
+    assert set(carried) == {"gateway", "nats", "worker", "trellion", "redis"}
+    # Service keys minted; the launcher writes them; `restart --force` (no label).
+    (d / "noo_svc_key_worker").write_text("svc-worker-key")
+    (d / "noo_svc_key_trellion").write_text("svc-trellion-key")
+    carried["worker"] = carried["trellion"] = None
+    # The self node: its certificate, its NATS user (nats HUPed, not recreated).
+    (pki / "public" / "nodes" / "self").mkdir()
+    (pki / "public" / "nodes" / "self" / "birth.crt").write_text("-----BEGIN CERTIFICATE-----\n")
+    (r / "monitoring" / "nats" / "users.conf").write_text("users: [gateway, worker, node-self]\n")
+    # The model step; then rc.1's posture restart (`restart --force gateway`,
+    # no label). Onboard now converges first, and the posture check after it
+    # finds nothing pending on a fresh install; either way the gateway moves.
+    (r / "noomesh.yaml").write_text("cluster:\n  default_backend: ollama\n")
+    carried["gateway"] = None
+
+    # Onboard's last start: exactly the services the cell saw recreated.
+    assert up(carried, start("1")) == {"gateway", "nats", "trellion", "worker"}
+    # The install matrix's start-idempotent: nothing.
+    assert up(carried, start("2")) == set()
+    # #1412 still holds for a real change afterwards.
+    (r / "noomesh.yaml").write_text("cluster:\n  default_backend: vllm\n")
+    assert up(carried, start("3")) == {"gateway", "worker", "trellion"}
