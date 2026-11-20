@@ -64,6 +64,7 @@ pub mod bind_sources;
 pub mod grafana_door;
 pub mod graph;
 pub mod walks;
+pub mod harrier_store;
 pub mod health;
 pub mod heartbeat;
 pub mod inference;
