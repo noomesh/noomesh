@@ -3400,7 +3400,7 @@ pub async fn require_any_auth(
             // reconnect with the same JWT. See `session_floor`.
             if crate::session_floor::refuses(&state, &claims.sub, &t).await {
                 tracing::info!(target: "security", sub = %claims.sub, "token refused: issued before the account's session floor");
-                return Ok(unauthenticated());
+                return Err(StatusCode::UNAUTHORIZED);
             }
             // i538 "View as": a token narrowed to a perspective is honoured
             // only while its row is live, this account's, and before its
