@@ -31,6 +31,10 @@ libc = "0.2"
 # parity); rcgen itself only offers RFC 7093 SHA-2 key IDs.
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 x509-parser = "0.18"
+# `push-nodes --prove` (i1074) dials a node and pins its leaf with a custom
+# rustls verifier. The same rustls + ring ureq already links, so the
+# lockfile gains no crate.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 sha1 = "0.11"
 # "formatting" also serves `config export-effective`'s generated_at stamp.
 time = { version = "0.3", features = ["formatting"] }
