@@ -138,10 +138,13 @@ pub fn kv_per_token(model: &str, role: &str, weights_gb: Option<f64>, arch: Opti
             return Some((b as f64, "measured"));
         }
     }
-    // An embedder or reranker keeps the per-GB estimate (calibrated on a
-    // measured harrier) even when its node reports an architecture: the agent
-    // reports one for every model it holds, and an encoder's cache is not a
-    // chat model's layers x kv_heads x head_dim at num_ctx.
+    // An embedder or reranker keeps its weights-based row even when its node
+    // reports an architecture. WHY: it holds no growing per-slot KV for a
+    // conversation; it encodes one input at a fixed short context (EMBED_NUM_CTX,
+    // RERANK_CTX), so the per-GB figure, calibrated on a measured harrier, is the
+    // truth. The agent reports an arch for EVERY model it holds, and a decoder
+    // style layers x kv_heads x head_dim x num_ctx would over-charge an encoder
+    // (harrier: about 0.1 GB to about 0.9 GB).
     if let Some(a) = arch.filter(|a| !encoder && a.is_object()) {
         if let (Some(l), Some(h), Some(d)) = (a["layers"].as_f64(), a["kv_heads"].as_f64(), a["head_dim"].as_f64()) {
             // K and V, f16 (2 bytes each element).
@@ -1339,6 +1342,7 @@ mod tests {
     fn an_embedder_is_priced_from_its_weights_not_its_reported_architecture() {
         let a = json!({"layers": 28, "kv_heads": 8, "head_dim": 128});
         assert_eq!(kv_per_token("harrier", "embed", Some(0.4), Some(&a)), Some((0.4 * KV_BYTES_PER_TOKEN_PER_GB_WEIGHTS, "estimate")));
+        assert_eq!(kv_per_token("bge-reranker", "rerank", Some(0.4), Some(&a)), Some((0.4 * KV_BYTES_PER_TOKEN_PER_GB_WEIGHTS, "estimate")), "a reranker too");
         assert_eq!(kv_per_token("m:7b", "chat", Some(4.0), Some(&a)).map(|k| k.1), Some("architecture"));
     }
 
