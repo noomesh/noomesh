@@ -5,7 +5,9 @@ today, which are expected to work, which are not supported yet, and how to
 check a box before spending an enrollment token on it. Versions as of
 2026-10-10: stack v0.2.102, CLI 0.5.89.
 
-## Tested
+## For people
+
+### Tested
 
 These are the combinations the maintainers test on, on current releases.
 
@@ -19,7 +21,7 @@ These are the combinations the maintainers test on, on current releases.
 The tier is derived from the facts a node reports; see
 [../cli/fleet.md](../cli/fleet.md) for the rule and the override.
 
-## Expected to work, not regularly tested
+### Expected to work, not regularly tested
 
 - Ubuntu 22.04 and 24.04 on bare metal.
 - Debian 12 (bookworm) and 13 (trixie).
@@ -32,7 +34,7 @@ The tier is derived from the facts a node reports; see
 - NVIDIA Jetson (unified memory): tier 1 when CUDA is available and at least
   10 GB is usable.
 
-## Not supported yet
+### Not supported yet
 
 - Fedora, RHEL, Rocky and Arch. Prep falls back to Docker's convenience
   script and prints a warning. It may work, but it is not tested.
@@ -43,7 +45,7 @@ The tier is derived from the facts a node reports; see
 - Devices whose only accelerator is an NPU: there is no runtime for one yet.
 - Intel Macs.
 
-## Requirements for every Linux node
+### Requirements for every Linux node
 
 - systemd.
 - A user with sudo.
@@ -57,7 +59,7 @@ The tier is derived from the facts a node reports; see
   restarts unattended will not see them: add an `/etc/fstab` entry and point
   `--data-root` at the mount.
 
-## What fits where
+### What fits where
 
 Advisory. Place with `noo cluster place <node> <backend|harness>
 <model|auto>`; add `--role chat|embed|rerank` to choose the role, and see
@@ -84,7 +86,7 @@ capability cannot be read (an agent older than 0.6.18, no heartbeat yet, or
 nvidia-smi failed), the place goes ahead with a warning, the verify row
 warns, and onboarding offers vLLM without recommending it.
 
-## Check a machine before you enroll it
+### Check a machine before you enroll it
 
 `noo enroll` runs a preflight before it spends the token. It prints
 `prep-check:` lines, one per check, in the form
@@ -105,7 +107,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv    # GPU boxes only
 `UBUNTU_CODENAME` is what prep uses to pick Docker's repository for an
 Ubuntu derivative.
 
-## Known issue: Docker from the wrong repository
+### Known issue: Docker from the wrong repository
 
 Fixed in this release for new enrollments. A Pop!_OS box prepped by an older
 CLI may have Docker from Docker's **Debian trixie** repository, because
@@ -131,7 +133,29 @@ sudo apt-get install --only-upgrade docker-ce docker-ce-cli containerd.io
 Check the `grep` output again afterwards. A node that is working does not
 need this.
 
-## Getting a device added to the tested list
+### Getting a device added to the tested list
 
 Open an issue with the `prep-check:` output and your `/etc/os-release`, or
 write to `contact@noomesh.ai`.
+
+## For agents
+
+- **Before an enrollment, read; change nothing:** the machine's
+  `/etc/os-release` (`ID`, `ID_LIKE`, `VERSION_CODENAME`,
+  `UBUNTU_CODENAME`) and, on a GPU box,
+  `nvidia-smi --query-gpu=name,memory.total --format=csv`. A machine in
+  "Not supported yet" is reported, not attempted.
+- **The enroll preflight is the check:** `noo enroll` prints
+  `prep-check: ok|warn|FAIL <what> — <remedy>` lines and a closing
+  `prep-check: platform=… codename=… pkg=…`. A `FAIL` stops before the
+  token is redeemed, so the same paste works once it is fixed; a `warn`
+  stops nothing. `--skip-prep` skips the preflight and host prep: only on
+  the person's word.
+- **Placing:** `noo cluster place <node> <backend> auto` lets the node pick
+  a model it can hold (`--role embed` for embeddings only). A placement too
+  big for the node is refused. vLLM also needs compute capability 7.5 or
+  newer: a known older GPU is refused (place Ollama or llama.cpp instead),
+  an unknown one goes ahead with a warning.
+- **The Docker-repository fix** in the known issue rewrites apt sources
+  with `sudo` on the node and restarts Docker: the person's, in a
+  maintenance window, and only on a node that shows the wrong base.
