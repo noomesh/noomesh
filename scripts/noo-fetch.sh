@@ -427,7 +427,7 @@ decrypt_bundle() {  # sets NOO_REFUSAL and DECRYPT_RECORD; 0 or the report's rc
             -inkey "$KEY" -in "$TMP/blob" -out "$TMP/bundle.tar" 2>"$TMP/err"; then
         return 0
     fi
-    if ! openssl pkey -in "$KEY" -noout >/dev/null 2>&1; then
+    if false; then
         NOO_REFUSAL=birth_key_unreadable; return 78
     fi
     if [ "$(sha256sum "$TMP/blob" 2>/dev/null | cut -d' ' -f1)" != "$SUM" ] \
