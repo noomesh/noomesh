@@ -19,12 +19,26 @@ digest hook, resolves that tag's index digest from the registry and writes
 NOO_IMAGE_DIGEST_<NAME> like any other (noomesh-start.sh), so compose pulls
 `<repo>:<version>@sha256:...`: by digest, and not at all when unchanged.
 
+A row whose repo is OUR mirror of an upstream image (directly under the
+release namespace, `<namespace>/<name>`, made by a mirror-images.yml lane
+`dest_org: <namespace org>`) is held to two more gates before it is written:
+  provenance  its resolved digest must equal the digest that lane copies
+              from upstream; a missing lane, two lanes for one destination
+              or a lane copying a moving tag is refused too;
+  anonymous   the digest must be readable WITHOUT credentials (this job logs
+              in to ghcr.io, so a private package would otherwise resolve
+              here and then fail every stranger's install).
+No row is such a mirror yet (nats and nginx still resolve from Docker Hub):
+the gates bite the moment a row's repo moves under the namespace. The DHI
+rows (`<namespace>/dhi/<name>`) are another family and are not gated here.
+
   rows   --out DIR   resolve and write DIR/<name> (the lock job)
   check              parse the compose file only, print what would be resolved
 """
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import re
 import subprocess
 import sys
@@ -42,6 +56,25 @@ if not _m:
 DHI = _m.group(1)
 _BASE = "${NOO_BASE_REGISTRY:-" + DHI + "}"
 _VER = r"[A-Za-z0-9][A-Za-z0-9._-]*"
+
+# The release namespace (scripts/lib-dist.sh `release_image_namespace`, its one
+# home in shell). mirror-images.yml copies official upstream images to
+# <namespace>/<name>:<tag> (`dest_org: noomesh`).
+_ns = re.search(r"^release_image_namespace\(\)\s*\{\s*printf\s+'([^']+)';\s*\}",
+                (ROOT / "scripts/lib-dist.sh").read_text(), re.M)
+if not _ns:
+    raise SystemExit("scripts/lib-dist.sh: release_image_namespace() not found in its one-line printf form")
+NS = _ns.group(1)
+MIRROR_WORKFLOW = ROOT / ".github/workflows/mirror-images.yml"
+
+
+def _plan_module():
+    """scripts/mirror-plan.py: the one parser of mirror-images.yml's lanes and
+    the read-only (anonymous) registry reader."""
+    spec = importlib.util.spec_from_file_location("mirror_plan", ROOT / "scripts/mirror-plan.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 # lock row name -> how compose spells the image and where its digest resolves:
 #   compose  the literal text before `:<version>` in the compose `image:` line
@@ -107,6 +140,53 @@ def compose_version(name: str, text: str) -> str:
     return version
 
 
+def mirror_org(name: str) -> str | None:
+    """The GHCR org a row's repo is OUR mirror in (`<namespace>/<name>`, one
+    path segment under the release namespace), else None: upstream registries
+    and the nested DHI family are not mirror rows."""
+    repo = THIRD_PARTY[name]["repo"]
+    if re.fullmatch(re.escape(NS) + r"/[a-z0-9][a-z0-9._-]*", repo):
+        return NS.removeprefix("ghcr.io/")
+    return None
+
+
+def mirror_source_digest(name: str, version: str, workflow: str) -> str:
+    """The digest the mirror-images.yml lane copying `name:version` into the
+    row's org is pinned to. Refuses a missing lane, two lanes for one
+    destination, and a lane whose source is not pinned by digest."""
+    org = mirror_org(name)
+    if org is None:
+        raise LockError(f"{name}: {THIRD_PARTY[name]['repo']} is not a mirror under {NS}")
+    dest = f"{THIRD_PARTY[name]['repo'].rsplit('/', 1)[1]}:{version}"
+    plan = _plan_module()
+    found = [ln["source"] for ln in plan.lanes(workflow)
+             # a lane with no dest_org copies to the repository owner, the
+             # release namespace's org (mirror-images.yml's copy step)
+             if ln["dest"] == dest and (ln.get("dest_org") or NS.removeprefix("ghcr.io/")) == org]
+    if not found:
+        raise LockError(f"no mirror-images.yml lane copies {dest} to ghcr.io/{org} (dest_org: {org}): "
+                        f"the lock pins the mirror, so the mirror must be declared")
+    if len(found) != 1:
+        raise LockError(f"{len(found)} mirror-images.yml lanes copy {dest} to ghcr.io/{org}: one source per mirror")
+    digest = plan.source_digest(found[0])
+    if digest is None:
+        raise LockError(f"the mirror lane for {dest} copies {found[0]}: not by digest (a moving tag proves nothing)")
+    return digest
+
+
+def anonymous_digest(repo: str, digest: str) -> tuple[str, str]:
+    """(state, digest) of `repo@digest` read with NO credentials (an anonymous
+    ghcr pull token, a manifest GET): what a stranger's install can pull."""
+    return _plan_module().fetch_digest(repo.removeprefix("ghcr.io/"), digest)
+
+
+def check_anonymous(repo: str, digest: str) -> None:
+    state, got = anonymous_digest(repo, digest)
+    if state != "present" or got != digest:
+        raise LockError(f"{repo}@{digest} is not pullable anonymously ({state}): a stranger's install cannot "
+                        f"pull it. Make the package public (GitHub package settings), then re-run")
+
+
 def resolve(ref: str) -> str:
     """The registry's index digest for `ref`, retried on transient failure."""
     err = ""
@@ -130,6 +210,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("mode", choices=("rows", "check"))
     ap.add_argument("--out", type=Path, help="directory for the row files (rows)")
     ap.add_argument("--compose", type=Path, default=COMPOSE)
+    ap.add_argument("--mirror-workflow", type=Path, default=MIRROR_WORKFLOW)
     ap.add_argument("--only", action="append", choices=sorted(THIRD_PARTY), help="restrict to these rows (tests)")
     a = ap.parse_args(argv)
     text = a.compose.read_text()
@@ -139,12 +220,23 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             version = compose_version(name, text)
             ref = f"{entry['repo']}:{version}"
+            mirrored = mirror_org(name) is not None
             if a.mode == "check":
-                print(f"{name}: {ref}")
+                src = ""
+                if mirrored:
+                    src = f"   (mirror of {mirror_source_digest(name, version, a.mirror_workflow.read_text())})"
+                print(f"{name}: {ref}{src}")
                 continue
             if a.out is None:
                 ap.error("rows needs --out")
-            row = f"{name}@{resolve(ref)}"
+            digest = resolve(ref)
+            if mirrored:
+                want = mirror_source_digest(name, version, a.mirror_workflow.read_text())
+                if digest != want:
+                    raise LockError(f"{ref} is {digest}, but mirror-images.yml copies it from {want}: "
+                                    f"the mirror is not the upstream image it names")
+                check_anonymous(entry["repo"], digest)
+            row = f"{name}@{digest}"
             a.out.mkdir(parents=True, exist_ok=True)
             (a.out / name).write_text(row + "\n")
             print(f"{row}   ({ref})")

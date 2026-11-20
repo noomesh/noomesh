@@ -67,6 +67,119 @@ def test_rows_writes_a_lock_row_from_the_resolved_digest(tmp_path, monkeypatch, 
     assert (tmp_path / "digests" / "nginx").read_text() == f"nginx@{D}\n"
 
 
+# ── mirror rows: provenance + anonymous gates (inert until a row's repo is
+#    our mirror; PR-2 moves nats/nginx there) ─────────────────────────────
+
+NGX = M.NS + "/nginx"   # where nginx runs once compose switches to our mirror
+ORG = M.NS.removeprefix("ghcr.io/")
+
+
+def test_the_gates_are_inert_today():
+    # nats/nginx still resolve from Docker Hub in this change; nothing else is
+    # a direct child of the release namespace (the DHI rows are nested).
+    assert M.THIRD_PARTY["nats"]["repo"] == "docker.io/library/nats"
+    assert M.THIRD_PARTY["nginx"]["repo"] == "docker.io/library/nginx"
+    assert [n for n in M.THIRD_PARTY if M.mirror_org(n)] == []
+    assert M.mirror_org("redis") is None, "the nested dhi/ family is not a mirror row"
+
+
+@pytest.fixture
+def mirrored_nginx(monkeypatch):
+    """nginx as PR-2 will declare it: compose and repo under our mirror."""
+    monkeypatch.setitem(M.THIRD_PARTY, "nginx", {"compose": NGX, "repo": NGX, "ver": M._VER})
+    anon = []
+    monkeypatch.setattr(M, "anonymous_digest", lambda repo, d: anon.append((repo, d)) or ("present", d))
+    return anon
+
+
+def _mirror_wf(tmp_path, *lanes):
+    body = "".join(f"          - source: {s}\n            dest: {d}\n" + (f"            dest_org: {o}\n" if o else "")
+                   for s, d, o in lanes)
+    wf = tmp_path / "mirror-images.yml"
+    wf.write_text("jobs:\n  mirror:\n    strategy:\n      matrix:\n        include:\n" + body + "    steps:\n"
+                  "      - name: x\n        run: |\n          dest: nginx:9.9.9\n")
+    return wf
+
+
+def _rows(tmp_path, wf):
+    compose = tmp_path / "c.yml"
+    compose.write_text("    image: ${NGINX_IMAGE:-" + NGX + ":9.9.9${NOO_IMAGE_DIGEST_NGINX:-}}\n")
+    return M.main(["rows", "--out", str(tmp_path / "d"), "--compose", str(compose),
+                   "--mirror-workflow", str(wf), "--only", "nginx"])
+
+
+def test_a_mirror_row_is_gated(mirrored_nginx, tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(M, "resolve", lambda ref: seen.append(ref) or D)
+    assert M.mirror_org("nginx") == ORG
+    assert _rows(tmp_path, _mirror_wf(tmp_path, (f"nginx:9.9.9@{D}", "nginx:9.9.9", ORG))) == 0
+    assert seen == [NGX + ":9.9.9"], "resolved from OUR mirror"
+    assert mirrored_nginx == [(NGX, D)], "the pinned digest was read anonymously"
+    assert (tmp_path / "d" / "nginx").read_text() == f"nginx@{D}\n"
+
+
+def test_a_lane_without_dest_org_copies_to_the_namespace_org(mirrored_nginx, tmp_path, monkeypatch):
+    monkeypatch.setattr(M, "resolve", lambda ref: D)
+    assert _rows(tmp_path, _mirror_wf(tmp_path, (f"nginx:9.9.9@{D}", "nginx:9.9.9", None))) == 0
+
+
+@pytest.mark.parametrize("lanes, why", [
+    # the mirror carries another digest than the upstream it was copied from
+    ([("nginx:9.9.9@sha256:" + "b" * 64, "nginx:9.9.9", ORG)], "is not the upstream image"),
+    # no lane copies this tag into the org the row names
+    ([(f"nginx:9.9.9@{D}", "nginx:9.9.8", ORG)], "no mirror-images.yml lane"),
+    ([(f"nginx:9.9.9@{D}", "nginx:9.9.9", ORG + "/dhi")], "no mirror-images.yml lane"),
+    # a lane copying a moving tag proves nothing
+    ([("nginx:9.9.9", "nginx:9.9.9", ORG)], "not by digest"),
+    # two lanes for one destination
+    ([(f"nginx:9.9.9@{D}", "nginx:9.9.9", ORG), (f"nginx:9.9.9@{D}", "nginx:9.9.9", None)], "2 mirror-images.yml lanes"),
+], ids=["other-digest", "other-tag", "other-org", "moving-tag", "two-lanes"])
+def test_rows_refuses_a_mirror_that_is_not_its_upstream(mirrored_nginx, tmp_path, monkeypatch, capsys, lanes, why):
+    monkeypatch.setattr(M, "resolve", lambda ref: D)
+    assert _rows(tmp_path, _mirror_wf(tmp_path, *lanes)) == 1
+    assert why in capsys.readouterr().err
+    assert not (tmp_path / "d").exists(), "no row for a mirror whose provenance failed"
+
+
+@pytest.mark.parametrize("state, got", [("unreadable", ""), ("absent", ""), ("error:token HTTP 500", ""),
+                                        ("present", "sha256:" + "b" * 64)],
+                         ids=["unreadable", "absent", "error", "other-digest"])
+def test_rows_refuses_a_mirror_a_stranger_cannot_pull(mirrored_nginx, tmp_path, monkeypatch, capsys, state, got):
+    monkeypatch.setattr(M, "resolve", lambda ref: D)
+    monkeypatch.setattr(M, "anonymous_digest", lambda repo, d: (state, got))
+    assert _rows(tmp_path, _mirror_wf(tmp_path, (f"nginx:9.9.9@{D}", "nginx:9.9.9", ORG))) == 1
+    assert "not pullable anonymously" in capsys.readouterr().err
+    assert not (tmp_path / "d").exists()
+
+
+def test_the_anonymous_read_sends_no_credentials(monkeypatch):
+    """check_anonymous reads with mirror-plan.fetch_digest and NO token."""
+    P = M._plan_module()
+    calls = []
+
+    def http(url, headers):
+        calls.append((url, dict(headers)))
+        if "/token?" in url:
+            return 200, {}, b'{"token": "anon"}'
+        return 200, {}, b"{}"
+    monkeypatch.setattr(P, "_http", http)
+    monkeypatch.setattr(M, "_plan_module", lambda: P)
+    import hashlib
+    d = "sha256:" + hashlib.sha256(b"{}").hexdigest()
+    M.check_anonymous(NGX, d)
+    assert calls[0][0].startswith("https://ghcr.io/token?scope=repository:" + ORG + "/nginx:pull")
+    assert "Authorization" not in calls[0][1], "an anonymous token request carries no credential"
+    assert calls[1][0] == f"https://ghcr.io/v2/{ORG}/nginx/manifests/{d}"
+
+
+def test_check_mode_names_the_mirror_source(mirrored_nginx, tmp_path, capsys):
+    compose = tmp_path / "c.yml"
+    compose.write_text("    image: ${NGINX_IMAGE:-" + NGX + ":9.9.9${NOO_IMAGE_DIGEST_NGINX:-}}\n")
+    wf = _mirror_wf(tmp_path, (f"nginx:9.9.9@{D}", "nginx:9.9.9", ORG))
+    assert M.main(["check", "--compose", str(compose), "--mirror-workflow", str(wf), "--only", "nginx"]) == 0
+    assert f"(mirror of {D})" in capsys.readouterr().out
+
+
 def test_rows_fails_the_job_on_latest(tmp_path):
     compose = tmp_path / "c.yml"
     compose.write_text("    image: ${NGINX_IMAGE:-nginx:latest${NOO_IMAGE_DIGEST_NGINX:-}}\n")
