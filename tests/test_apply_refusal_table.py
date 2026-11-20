@@ -112,11 +112,16 @@ def test_every_table_code_is_a_code_the_scripts_exit_with():
 
 def test_every_assignment_names_a_table_entry():
     table = sh_refusal_table()
-    for src, what in ((APPLIER, "noo-apply.sh"),):
-        names = re.findall(r"\bNOO_REFUSAL=([A-Za-z0-9_\"$]*)", "\n".join(_code_lines(src)))
+    for src, what in ((APPLIER, "noo-apply.sh"), (FETCHER, "noo-fetch.sh")):
+        code = "\n".join(_code_lines(src))
+        names = re.findall(r"\bNOO_REFUSAL=([a-z][a-z0-9_]*)", code)
         assert names, f"{what}: no NOO_REFUSAL assignment read"
         for n in names:
-            assert n in table or n == '""', f"{what}: NOO_REFUSAL={n} is not in the refusal table"
+            assert n in table, f"{what}: NOO_REFUSAL={n} is not in the refusal table"
+        # Besides a literal name: the empty start, and the fetcher's read of
+        # the applier's own line. Nothing else assigns it.
+        other = re.findall(r"\bNOO_REFUSAL=(?![a-z])(\S*)", code)
+        assert set(other) <= {'""', '"$(applier_refusal'}, other
 
 
 def test_every_refusal_site_names_its_refusal_with_the_same_code():
