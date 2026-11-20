@@ -216,7 +216,7 @@ func (r *retryState) nextDelay(connected bool, sessionLen time.Duration, err err
 	switch {
 	case errors.As(err, &ne):
 		// An answer that cannot change by retrying: the long interval, unchanged.
-		return jitter(r.notOffered)
+		return r.bo.next()
 	case dialRefused(err):
 		// Nothing was reached: the gateway is down or restarting (a stack restart).
 		// Retrying a refused connect is cheap, and a long wait here is what left a node
