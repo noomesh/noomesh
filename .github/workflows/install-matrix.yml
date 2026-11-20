@@ -34,6 +34,8 @@ on:
         default: latest
       cells:
         description: 'all (every fresh-install cell and the upgrade cell), fresh (the fresh-install cells only) or upgrade (the upgrade cell only)'
+        type: choice
+        options: [all, fresh, upgrade]
         default: all
       prev_tag:
         description: 'The upgrade cell only: the final it starts from (exactly noo-cli-vX.Y.Z, a published non-prerelease release below cli_tag). Empty: the newest final below cli_tag'
@@ -87,6 +89,20 @@ jobs:
           # reach, and hosted Apple silicon has no Docker. Install + CLI.
           - {cell: macos-15-node, runner: macos-15, docker: preinstalled, onboard: ci, model: tiny, scope: node-partial, experimental: false}
     steps:
+      # FIRST, before anything else touches it: the free-text dispatch input
+      # cli_tag, whole-string, as scripts/install-cell/validate_tag.sh holds it
+      # (run.sh and upgrade.sh refuse it again on their own). run.sh splices it
+      # into an install line it runs with `sh -c`
+      # (tests/test_dispatch_inputs_never_reach_a_shell_raw.py).
+      - name: Validate dispatch inputs
+        shell: bash
+        env:
+          CLI_TAG: ${{ inputs.cli_tag || 'latest' }}
+        run: |
+          export LC_ALL=C
+          re='^(latest|noo-cli-v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?)$'
+          [[ $CLI_TAG =~ $re ]] || {
+            printf '::error::cli_tag %q refused: must be exactly latest or noo-cli-vX.Y.Z with an optional -rc.N\n' "$CLI_TAG"; exit 1; }
       - name: Checkout (the cell harness only)   # actions/checkout@v7.0.1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -135,6 +151,20 @@ jobs:
     timeout-minutes: 120
     continue-on-error: true
     steps:
+      # FIRST, before anything else touches it: the free-text dispatch input
+      # cli_tag, whole-string, as scripts/install-cell/validate_tag.sh holds it
+      # (run.sh and upgrade.sh refuse it again on their own). run.sh splices it
+      # into an install line it runs with `sh -c`
+      # (tests/test_dispatch_inputs_never_reach_a_shell_raw.py).
+      - name: Validate dispatch inputs
+        shell: bash
+        env:
+          CLI_TAG: ${{ inputs.cli_tag || 'latest' }}
+        run: |
+          export LC_ALL=C
+          re='^(latest|noo-cli-v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?)$'
+          [[ $CLI_TAG =~ $re ]] || {
+            printf '::error::cli_tag %q refused: must be exactly latest or noo-cli-vX.Y.Z with an optional -rc.N\n' "$CLI_TAG"; exit 1; }
       - name: Checkout (the cell harness only)   # actions/checkout@v7.0.1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -202,6 +232,24 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     steps:
+      # FIRST, before anything else touches them: the free-text dispatch
+      # inputs cli_tag and prev_tag, whole-string, as
+      # scripts/install-cell/validate_tag.sh holds them (upgrade.sh and
+      # upgrade_judge.py resolve refuse them again on their own)
+      # (tests/test_dispatch_inputs_never_reach_a_shell_raw.py).
+      - name: Validate dispatch inputs
+        shell: bash
+        env:
+          CLI_TAG: ${{ inputs.cli_tag || 'latest' }}
+          PREV_TAG: ${{ inputs.prev_tag }}
+        run: |
+          export LC_ALL=C
+          re='^(latest|noo-cli-v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?)$'
+          [[ $CLI_TAG =~ $re ]] || {
+            printf '::error::cli_tag %q refused: must be exactly latest or noo-cli-vX.Y.Z with an optional -rc.N\n' "$CLI_TAG"; exit 1; }
+          re='^(noo-cli-v[0-9]+\.[0-9]+\.[0-9]+)?$'
+          [[ $PREV_TAG =~ $re ]] || {
+            printf '::error::prev_tag %q refused: must be empty or exactly noo-cli-vX.Y.Z (a final)\n' "$PREV_TAG"; exit 1; }
       - name: Checkout (the cell harness only)   # actions/checkout@v7.0.1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:

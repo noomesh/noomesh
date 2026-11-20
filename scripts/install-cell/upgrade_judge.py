@@ -30,6 +30,10 @@ import urllib.request
 
 # fullmatch (`$` lets a trailing newline through); [0-9], not \d (Unicode digits)
 FINAL = re.compile(r"noo-cli-v([0-9]+)\.([0-9]+)\.([0-9]+)")
+# The release under test (CLI_TAG, the dispatch input `cli_tag`): the same
+# rule as validate_tag.sh's CLI_TAG_RE, held equal by running both on one
+# corpus (tests/test_dispatch_inputs_never_reach_a_shell_raw.py).
+CLI_TAG = re.compile(r"latest|noo-cli-v([0-9]+)\.([0-9]+)\.([0-9]+)(?:-rc\.[0-9]+)?")
 
 
 def _api(repo, path, missing_ok=False):
@@ -80,6 +84,9 @@ def chosen_previous(repo, chosen, base, target, rel):
 
 
 def resolve(repo, tag, prev_out, target_out, chosen=""):
+    m = CLI_TAG.fullmatch(tag)
+    if not m:
+        sys.exit("CLI_TAG %r refused: must be exactly latest or noo-cli-vX.Y.Z with an optional -rc.N" % tag)
     if chosen:
         prev_version(chosen)  # the pattern refuses before any network read
     rel = _api(repo, "releases?per_page=100")
@@ -93,9 +100,6 @@ def resolve(repo, tag, prev_out, target_out, chosen=""):
             sys.exit("no final is published")
         target, base = "noo-cli-v%d.%d.%d" % finals[-1], finals[-1]
     else:
-        m = re.match(r"^noo-cli-v(\d+)\.(\d+)\.(\d+)", tag)
-        if not m:
-            sys.exit("CLI_TAG %r is not noo-cli-vX.Y.Z[-rc.N]" % tag)
         target, base = tag, tuple(map(int, m.groups()))
     if chosen:
         prev = chosen_previous(repo, chosen, base, target, rel)

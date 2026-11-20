@@ -22,8 +22,15 @@
 set -uo pipefail
 : "${OUT:?}" "${CELL:?}" "${RUNNER:=?}" "${DOCKER:=preinstalled}" "${ONBOARD:=ci}" \
   "${MODEL:=default}" "${SCOPE:=full}" "${CLI_TAG:=latest}"
-TINY_MODEL="${TINY_MODEL:-qwen2.5:0.5b}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# CLI_TAG is a free-text dispatch input spliced into the install line below,
+# which runs under `sh -c`: hold it to the rule before ANY use, on its own
+# (the workflow refuses it first; this refuses it again). Exit 2: not run.
+# shellcheck source=scripts/install-cell/validate_tag.sh
+. "$HERE/validate_tag.sh"
+require_cli_tag "$CLI_TAG" || exit 2
+# ── end of the dispatch-input check ──
+TINY_MODEL="${TINY_MODEL:-qwen2.5:0.5b}"
 mkdir -p "$OUT"
 # shellcheck source=scripts/install-cell/lib.sh
 . "$HERE/lib.sh"
