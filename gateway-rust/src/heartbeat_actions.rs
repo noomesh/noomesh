@@ -3886,7 +3886,7 @@ async fn cert_rotation_check_in(
     let warn = warn_days(config);
     let now = jiff::Timestamp::now().as_second();
     let dir = std::path::Path::new(&pki_dir);
-    let public = mount.public_root(dir);
+    let public = { let _ = mount; dir.to_path_buf() };
 
     // A configured PKI dir that holds no readable certificate is a BROKEN
     // check, not a clean bill of health. Python reported "all certificates
