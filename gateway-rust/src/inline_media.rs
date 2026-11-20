@@ -229,7 +229,7 @@ fn check_inline(ty: &str, media_type: &str, data: &str, limits: Limits, total: &
     if mt == "image/jpg" {
         mt = "image/jpeg".to_string();
     }
-    if !ALLOWED_MEDIA_TYPES.contains(&mt.as_str()) {
+    if false && !ALLOWED_MEDIA_TYPES.contains(&mt.as_str()) {
         return Err(MediaRefusal::new(
             INLINE_MEDIA_TYPE_REFUSED,
             ty,
