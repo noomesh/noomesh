@@ -199,6 +199,59 @@ def test_every_harrier_pull_site_takes_the_ref_from_the_lock_reader():
     assert "harrier_artifact_ref()?" in _fn(stage, "fn stage_artifact_into_store(")
 
 
+# ── no environment variable feeds the harrier pin ───────────────────────────
+
+def rust_fn_body(src: str, marker: str) -> str:
+    """`marker` through the brace that closes its body, as test_src::fn_body
+    slices it: from the marker, the first `{` opens the body (no signature
+    here has a brace) and the matching `}` closes it. Never split on
+    "\nfn ": that reads the NEXT fn's doc comment into this one. Line
+    comments are dropped first, so a brace in a comment cannot unbalance it;
+    format-string braces are balanced pairs."""
+    code = "\n".join(re.sub(r"//.*$", "", line) for line in src.splitlines())
+    start = code.index(marker)
+    depth, open_at = 0, code.index("{", start)
+    for i in range(open_at, len(code)):
+        depth += {"{": 1, "}": -1}.get(code[i], 0)
+        if depth == 0:
+            return code[start:i + 1]
+    raise AssertionError(f"{marker} never closes")
+
+
+ENV_READS = re.compile(r"env::var|var_os|getenv|std::env|option_env!|\benv!\(|env_value\(|read_env\(|HARRIER_DIGEST")
+# The functions that build the harrier ref or read its pin.
+REF_BUILDERS = [
+    ("noo-cli/src/onboard/steps.rs", "pub(crate) fn harrier_artifact_ref("),
+    ("noo-cli/src/onboard/steps.rs", "pub(crate) fn harrier_ref_from("),
+    ("noo-cli/src/commands/image_stage.rs", "pub(crate) fn harrier_pin_in("),
+    ("noo-cli/src/commands/cluster_provision_subprocess.rs", "fn stage_artifact_into_store("),
+]
+
+
+def test_the_slicer_stops_at_the_end_of_the_fn():
+    src = "/// a\nfn a() -> X {\n    let s = format!(\"{x}\"); // }\n    if y { z }\n}\n\n/// b reads std::env\nfn b() { std::env::var(\"K\") }\n"
+    body = rust_fn_body(src, "fn a(")
+    assert body.endswith("if y { z }\n}") and "std::env" not in body, body
+
+
+def test_no_environment_variable_feeds_the_harrier_pin():
+    """The signed lock is the ONLY source of the harrier digest: no env read
+    in any function that builds the ref. The registry prefix is the one value
+    read from the release environment (NOO_IMAGE_PREFIX, as for every image);
+    the content stays fixed by the digest."""
+    for path, marker in REF_BUILDERS:
+        body = rust_fn_body((ROOT / path).read_text(), marker)
+        assert "{" in body and body.rstrip().endswith("}"), (path, marker)
+        hits = ENV_READS.findall(body)
+        assert not hits, f"{path} {marker} reads the environment: {hits}"
+        for var in re.findall(r"release_var\(\"([A-Z_]+)\"\)", body):
+            assert var == "NOO_IMAGE_PREFIX", f"{marker} reads {var} from the environment"
+    for top in ("noo-cli/src", "scripts", "gateway-rust/src", "node-agent-go", "docs"):
+        for p in (ROOT / top).rglob("*"):
+            if p.is_file() and p.suffix in {".rs", ".go", ".py", ".sh", ".md", ".yml"}:
+                assert "NOO_HARRIER" not in p.read_text(errors="ignore"), p
+
+
 # ── publish-harrier never overwrites a tag ──────────────────────────────────
 
 def _publish_steps() -> list[dict]:

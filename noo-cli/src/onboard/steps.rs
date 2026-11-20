@@ -6056,10 +6056,11 @@ pub(crate) fn harrier_create_script(embed: &str, host_dir: &str) -> String {
     )
 }
 
-/// The dev path for a host whose stack.lock pins no harrier (a source build,
-/// or a lock from a release before harrier was locked): an explicit
-/// `sha256:<64 hex>` digest, used only then, and said loudly every time.
-pub(crate) const HARRIER_DIGEST_ENV: &str = "NOO_HARRIER_ARTIFACT_DIGEST";
+/// The refusal every harrier fetch gives when this host's signed stack lock
+/// pins no harrier (no lock, or a lock from a release before harrier was
+/// locked): it names the remedy. There is no override: the lock is the only
+/// source of the pin.
+pub(crate) const HARRIER_NO_PIN: &str = "this release's lock pins no harrier yet: run `noo upgrade --stack` first";
 
 /// The harrier artifact image, BY DIGEST: `<release namespace>/harrier@sha256:…`.
 /// Published once by `.github/workflows/publish-harrier.yml`; the release
@@ -6068,44 +6069,26 @@ pub(crate) const HARRIER_DIGEST_ENV: &str = "NOO_HARRIER_ARTIFACT_DIGEST";
 /// `harrier.sha256` inside the image travels with it, so a pull by tag
 /// proved nothing; by the lock's digest, that file is the release's too.
 /// Follows NOO_IMAGE_PREFIX so a mirror or a namespace change moves it with
-/// every other image. `Ok((ref, from_env))`; `from_env` is the dev path.
-pub(crate) fn harrier_artifact_ref() -> Result<(String, bool), String> {
+/// every other image (a mirror must serve the same digest). The digest comes
+/// from this host's stack lock and nowhere else.
+pub(crate) fn harrier_artifact_ref() -> Result<String, String> {
     let prefix = crate::commands::provision::release_var("NOO_IMAGE_PREFIX");
     let prefix = if prefix.is_empty() { crate::registry::IMAGE_NAMESPACE.to_string() } else { prefix.trim_end_matches('/').to_string() };
     let lock = crate::commands::image_stage::controller_lock_opt().map(|o| o.map(|(text, _, _)| text));
-    harrier_ref_from(&prefix, lock, std::env::var(HARRIER_DIGEST_ENV).ok().as_deref())
+    harrier_ref_from(&prefix, lock)
 }
 
-/// [`harrier_artifact_ref`] over its inputs: this host's stack lock text
-/// (`Ok(None)`: no lock) and the dev variable. The lock's row wins; with no
-/// row, only an explicit, well-formed digest in [`HARRIER_DIGEST_ENV`];
-/// otherwise a refusal. Never a tag. Pure.
-pub(crate) fn harrier_ref_from(prefix: &str, lock: Result<Option<String>, String>, dev: Option<&str>) -> Result<(String, bool), String> {
+/// [`harrier_artifact_ref`] over its one input, this host's stack lock text
+/// (`Ok(None)`: no lock): the lock's `harrier@sha256:` row, or a refusal
+/// naming [`HARRIER_NO_PIN`]. Never a tag, never another source. Pure.
+pub(crate) fn harrier_ref_from(prefix: &str, lock: Result<Option<String>, String>) -> Result<String, String> {
     let prefix = prefix.trim_end_matches('/');
     let lock = lock.map_err(|e| format!("the harrier embedder artifact is pinned by the stack lock, which could not be read ({e}) — refusing to pull it by its tag"))?;
     if let Some((digest, _)) = lock.as_deref().and_then(crate::commands::image_stage::harrier_pin_in) {
-        return Ok((format!("{prefix}/harrier@{digest}"), false));
+        return Ok(format!("{prefix}/harrier@{digest}"));
     }
-    let why = if lock.is_none() {
-        "this host has no stack.lock"
-    } else {
-        "this host's stack.lock pins no harrier artifact (a release before harrier was locked)"
-    };
-    match dev.map(str::trim).filter(|d| !d.is_empty()) {
-        Some(d) => {
-            let hex = d.strip_prefix("sha256:").unwrap_or("");
-            if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
-                Ok((format!("{prefix}/harrier@{d}"), true))
-            } else {
-                Err(format!("{HARRIER_DIGEST_ENV}={d} is not sha256:<64 hex> — refusing to pull the harrier embedder artifact"))
-            }
-        }
-        None => Err(format!(
-            "{why}, so nothing pins the harrier embedder artifact by digest — refusing to pull it by its mutable tag. \
-             A release install gets the pin from `noo upgrade --stack`; a dev build may set {HARRIER_DIGEST_ENV}=sha256:<digest> \
-             (docs/security/node-agent.md names the release's)"
-        )),
-    }
+    let why = if lock.is_none() { "this host has no stack.lock" } else { "its stack.lock is from a release before harrier was locked" };
+    Err(format!("{HARRIER_NO_PIN} ({why}; harrier is pulled only by the digest the signed lock pins, never by its tag)"))
 }
 
 /// `sha256sum -c <name>.sha256` in the unpacked artifact directory `dir`:
@@ -6151,13 +6134,7 @@ pub(crate) fn ensure_embed_model_core(model: &str) -> Vec<String> {
         // no `gh` for — and the release it named stayed behind in the old
         // repo — so every fresh box came up with no embedder (2026-09-07).
         let artifact = match harrier_artifact_ref() {
-            Ok((r, from_env)) => {
-                if from_env {
-                    out_lines.push(format!(
-                        "!{HARRIER_DIGEST_ENV} is set and no signed stack lock pins harrier: pulling {r} by a digest from the ENVIRONMENT, not the release (a dev path)"));
-                }
-                r
-            }
+            Ok(r) => r,
             Err(e) => {
                 out_lines.push(format!("!{e} — RAG embedding stays down."));
                 return out_lines;
@@ -9073,34 +9050,32 @@ mod fu53_tests {
 mod plaintext_credential_tests {
     const HARRIER_IMG: &str = "sha256:2fe41964a009bda0c55f299b632b122bcb4561ca4a833e3293c9f3cc685bab79";
 
-    /// Every harrier fetch (onboard, `noo models pull harrier`, the roll's
-    /// embedder ensure, `noo migrate import` through onboard) is by the
-    /// digest the signed stack lock pins, under the release namespace.
-    #[test]
-    fn harrier_is_pulled_by_the_lock_digest() {
-        let lock = format!("# stack v0.6.29\ngateway@sha256:{}\nharrier@{HARRIER_IMG}\n", "a".repeat(64));
-        let (r, from_env) = super::harrier_ref_from("ghcr.io/noomesh/", Ok(Some(lock.clone())), None).unwrap();
-        assert_eq!(r, format!("ghcr.io/noomesh/harrier@{HARRIER_IMG}"));
-        assert!(!from_env);
-        // The lock wins over the dev variable.
-        let other = format!("sha256:{}", "b".repeat(64));
-        assert_eq!(super::harrier_ref_from("ghcr.io/noomesh", Ok(Some(lock)), Some(&other)).unwrap().0, r);
+    /// A lock fixture as the release writes it: the image row and the GGUF line.
+    fn harrier_lock(tag: &str) -> String {
+        format!("# stack {tag}\n# harrier-gguf-sha256 {}\ngateway@sha256:{}\nharrier@{HARRIER_IMG}\n",
+            "5f26506ab57fd817ce4a8b9d24946a60d40bc76d82a2defa7cd754ae01e9de80", "a".repeat(64))
     }
 
-    /// No lock, or a lock that pins no harrier, refuses: never the tag. The
-    /// only way past is an explicit, well-formed digest in the dev variable.
+    /// Every harrier fetch (onboard, `noo models pull harrier`, the roll's
+    /// embedder ensure, `noo migrate import` through onboard, import-model
+    /// staging) is by the digest the signed stack lock pins.
+    #[test]
+    fn harrier_is_pulled_by_the_lock_digest() {
+        let r = super::harrier_ref_from("ghcr.io/noomesh/", Ok(Some(harrier_lock("v0.6.29")))).unwrap();
+        assert_eq!(r, format!("ghcr.io/noomesh/harrier@{HARRIER_IMG}"));
+    }
+
+    /// No lock, or a lock that pins no harrier, refuses with the remedy in
+    /// its own text: never the tag, and no override.
     #[test]
     fn harrier_without_a_lock_pin_is_refused() {
         let old_lock = format!("# stack v0.6.28\ngateway@sha256:{}\n", "a".repeat(64));
-        for lock in [Ok(None), Ok(Some(old_lock)), Err("permission denied".to_string())] {
-            let e = super::harrier_ref_from("ghcr.io/noomesh", lock, None).unwrap_err();
-            assert!(e.contains("refusing to pull"), "{e}");
+        for lock in [Ok(None), Ok(Some(old_lock))] {
+            let e = super::harrier_ref_from("ghcr.io/noomesh", lock).unwrap_err();
+            assert!(e.starts_with("this release's lock pins no harrier yet: run `noo upgrade --stack` first ("), "{e}");
         }
-        let e = super::harrier_ref_from("ghcr.io/noomesh", Ok(None), Some("v1")).unwrap_err();
-        assert!(e.contains("not sha256:<64 hex>"), "{e}");
-        let (r, from_env) = super::harrier_ref_from("ghcr.io/noomesh", Ok(None), Some(HARRIER_IMG)).unwrap();
-        assert_eq!(r, format!("ghcr.io/noomesh/harrier@{HARRIER_IMG}"));
-        assert!(from_env, "the dev path is flagged so the caller says so");
+        let e = super::harrier_ref_from("ghcr.io/noomesh", Err("permission denied".to_string())).unwrap_err();
+        assert!(e.contains("could not be read (permission denied)") && e.contains("refusing to pull"), "{e}");
     }
 
     /// The shared fetch takes its ref from the lock-reading function and
