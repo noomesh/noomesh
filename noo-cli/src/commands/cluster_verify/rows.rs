@@ -518,6 +518,17 @@ pub(crate) const ROWS: &[Row] = &[
         doc: None,
     },
     Row {
+        id: "docker_compose",
+        name: "docker compose",
+        scope: Scope::Controller,
+        verdicts: &[Verdict::Warn, Verdict::Fail],
+        meaning: "Whether the controller's Docker Compose v2 is present and at least 2.24.6, the oldest version noomesh's CI runs the stack on.",
+        clears: "Install or upgrade the docker-compose-v2 package (or Docker Desktop) to 2.24.6 or newer.",
+        findings: &[],
+        shown_as: None,
+        doc: None,
+    },
+    Row {
         id: "docker_userns",
         name: "docker userns",
         scope: Scope::Controller,

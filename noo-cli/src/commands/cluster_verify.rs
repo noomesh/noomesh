@@ -1680,8 +1680,6 @@ pub(crate) fn min_compose_text() -> String {
 /// `cannot be checked`. `Missing` (no Compose v2): FAIL, as onboard's probe and
 /// the launcher's `require_compose_v2` refuse, with `none_remedy` (the
 /// package to install, from onboard). At or above: OK.
-// TODO(#1411): register this row in cluster_verify/rows.rs when the verify-row
-// registry lands on dev.
 pub(crate) fn docker_compose_check(v: &ComposeVersion, none_remedy: &str) -> Check {
     const NAME: &str = "docker compose";
     let min = min_compose_text();
