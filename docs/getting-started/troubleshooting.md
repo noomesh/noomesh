@@ -86,14 +86,17 @@ Triage in this order and read before you change anything:
    `controller` or `both`.
 2. `noo --json health`: exit 0 is healthy, 5 degraded (the body names the
    dependency), 3 the gateway did not answer.
-3. `noo doctor docker`: read-only; exit 1 means Docker is damaged.
+3. `noo doctor docker`: read-only; exit 1 means Docker is damaged, or
+   could not be asked (the daemon is down or this user cannot reach it);
+   the message says which.
 
 Then, by what you found:
 
 - **A dependency is down:** `noo stack logs <dep> --tail 200` first. An
   environment or secret change that had no effect needs
-  `noo stack restart --force <service>`; a plain restart keeps the old
-  environment.
+  `noo stack restart --force <service>`, which recreates it and reloads
+  its environment and secrets. A plain restart keeps the old environment
+  (it recreates only a service whose pinned image moved).
 - **A model is still loading:** chat says its backend is not ready. It
   clears by itself: wait for `noo health` to exit 0, restart nothing.
 - **"No backend available":** `noo --json cluster status` shows what is
