@@ -488,15 +488,16 @@ fn prep_preflight(data_root: &str) -> PreflightVerdict {
 // the rest of noo decides it (i907): a terminal to ask at, root, or the
 // owner's `--root-ok`; never by running sudo to see whether it could.
 
-/// A LOWER BOUND, in GB, on the free space the node install needs on
-/// `/var/lib` (Docker's packages and the node agent's image land there) and
-/// on the data root's disk. It is deliberately set below any real install,
-/// so it refuses only a disk that is plainly too full and never an install
-/// that would have fit: the worker's install footprint is not measured yet
-/// (the rehearsal's B-workers disk record from the first 0.6.29 rc will
-/// give it; the controller measured +9.2 GiB peak in install-matrix run
-/// 44556522963, with its model). Raise it to the measured worker footprint
-/// plus a margin then. Backends and models arrive later, with placements.
+/// Free space, in GB, `noo enroll` asks for on `/var/lib` and on the data
+/// root's disk before it spends the token: a disk that is plainly full.
+/// Measured (the rehearsal's B-workers disk record, 0.6.29-rc.1, two
+/// workers): enroll and provision themselves write almost nothing there
+/// (/var/lib/docker 316 KB, /var/lib/noo 20 KB, no images; the ~104 MB agent
+/// bundle lives elsewhere). The disk is spent at PLACEMENT, when images are
+/// pulled, and is checked there (the agent's pre-pull check, #1373; the
+/// image-store refusal for the CUDA image, #1397). Do not raise this to an
+/// image's size: a node enrolls fine and is refused at the placement that
+/// would not fit, with the size it needs.
 pub(crate) const NODE_MIN_FREE_GB: u64 = 2;
 
 /// Free bytes on the filesystem holding a path; `None` when it cannot be read.
