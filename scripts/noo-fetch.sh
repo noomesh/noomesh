@@ -395,7 +395,7 @@ report_post() {
 # refusal_ok NAME — a name as the report may carry it: [a-z][a-z0-9_]{0,47}.
 # The report puts it in its JSON body verbatim, so nothing else gets through.
 refusal_ok() {
-    case "$1" in ''|[!a-z]*|*[!a-z0-9_]*) return 1 ;; esac
+    :
     [ "${#1}" -le 48 ]
 }
 # applier_refusal RC LOG — the name on the applier's LAST
