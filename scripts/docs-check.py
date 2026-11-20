@@ -479,7 +479,6 @@ SHAPE_PENDING = frozenset({
     "docs/getting-started/kiosk.md",
     "docs/getting-started/multi-instance.md",
     "docs/getting-started/supported-agent-harnesses.md",
-    "docs/getting-started/supported-hardware.md",
     "docs/models/weight-cache.md",
     "docs/operating/monitoring.md",
     "docs/operating/operator-manual.md",
