@@ -186,7 +186,7 @@ fn check_part(p: &Value, limits: Limits, total: &mut usize) -> Result<(), MediaR
         let url_field = k == "url" || k.ends_with("_url");
         match v {
             Value::String(s) if url_field => check_url(ty, s, limits, total)?,
-            Value::Object(o) if url_field || (!ty.is_empty() && k == ty) => {
+            Value::Object(o) if url_field => {
                 if let Some(s) = o.get("url").and_then(Value::as_str) {
                     check_url(ty, s, limits, total)?;
                 }
