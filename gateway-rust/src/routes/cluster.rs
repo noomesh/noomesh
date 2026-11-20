@@ -5733,7 +5733,7 @@ async fn placement_put(
     // unknown is a warning.
     if let Some(tag) = body.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
         let record = if backend == "ollama" { node_record(&state, &node_id).await } else { None };
-        let self_node = crate::self_node::is_self_node(&node_id) || record.as_ref().is_some_and(|r| r["self_node"].as_bool() == Some(true));
+        let self_node = crate::self_node::is_self_node(&node_id);
         if ollama_tag_check_applies(&backend, &desired, self_node) {
             let store = crate::routes::artifacts::ollama_tag_in_store(&crate::routes::artifacts::gguf_dir(), tag);
             let check = ollama_tag_check(&node_id, tag, store, node_holds_ollama_tag(record.as_ref(), tag), node_may_pull_ollama_registry(record.as_ref()));
