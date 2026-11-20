@@ -5521,7 +5521,7 @@ pub(crate) fn ollama_tag_check(node_id: &str, tag: &str, store_holds: Option<boo
     if store_holds == Some(true) || node_holds == Some(true) || may_pull == Some(true) {
         return OllamaTagCheck::Fine;
     }
-    if store_holds == Some(false) && node_holds == Some(false) && may_pull == Some(false) {
+    if store_holds != Some(true) && node_holds != Some(true) && may_pull != Some(true) {
         return OllamaTagCheck::Refuse(ollama_tag_refusal(node_id, tag));
     }
     let mut unknown: Vec<String> = Vec::new();
