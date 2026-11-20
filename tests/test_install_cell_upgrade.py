@@ -98,7 +98,7 @@ def test_a_clean_first_roll_passes_every_assert(tmp_path):
     rc, got = cell(tmp_path)
     assert rc == 0, got
     for a in ("A1", "A2", "A3", "A4", "A5", "A6", "A7", "B1", "B2", "B3", "B4", "G1", "G2", "G3", "G4", "G5"):
-        assert " PASS: " in got[a], got[a]
+        assert " PASS" in got[a] and got[a].startswith("UPGRADE %s PASS" % a), got[a]
     assert "release-check: generation=2" in got["A2"]
     assert "generation 1) predates the netns-unit kind" in got["A5"]
     assert "staged to the self-node runner-a, whose applier installs it (no sudo)" in got["B1"]
@@ -154,7 +154,7 @@ def test_a_model_pulled_before_the_record_existed_is_a_note_not_a_fail(tmp_path)
     rows = GOOD_SELF[:2] + [{"name": "ollama models", "verdict": "warn", "remedy": "on runner-a: noo models pull gemma4:e2b",
                            "detail": "gemma4:e2b: unverified (no controller record); re-pull it through noo to verify it"}]
     rc, got = cell(tmp_path, self_rows=rows)
-    assert rc == 0 and " NOTE: " in got["G2"] and "noo models pull gemma4:e2b" in got["G2"], got["G2"]
+    assert rc == 0 and " NOTE" in got["G2"] and "noo models pull gemma4:e2b" in got["G2"], got["G2"]
 
 
 def test_a_model_not_yet_checked_is_a_note_not_a_pass(tmp_path):
@@ -162,7 +162,7 @@ def test_a_model_not_yet_checked_is_a_note_not_a_pass(tmp_path):
     # the row is OK, but nothing about the bytes is proven yet.
     rows = GOOD_SELF[:2] + [{"name": "ollama models", "verdict": "ok", "detail": "gemma4:e2b: not yet checked"}]
     rc, got = cell(tmp_path, self_rows=rows)
-    assert rc == 0 and " NOTE: " in got["G2"] and "gemma4:e2b: not yet checked" in got["G2"], got["G2"]
+    assert rc == 0 and " NOTE" in got["G2"] and "gemma4:e2b: not yet checked" in got["G2"], got["G2"]
 
 
 def test_a_backend_start_refusal_or_a_used_lane_fails(tmp_path):
@@ -344,6 +344,13 @@ DIGEST = "@sha256:" + "a" * 64
 
 
 def ev(typ, act, t=1763629800, **attrs):
+    """The minimal shape upgrade.sh captures (an image event's id is its ref)."""
+    return json.dumps({"time": t, "type": typ, "action": act, "id": attrs.get("name", "") if typ == "image" else "abc123",
+                       "image": attrs.get("image", ""), "name": attrs.get("name", "")}) + "\n"
+
+
+def ev_full(typ, act, t=1763629800, **attrs):
+    """The old full `{{json .}}` shape, still read."""
     a = {"Attributes": attrs}
     if typ == "image":
         a["ID"] = attrs.get("name", "")
@@ -404,7 +411,7 @@ def test_no_dockerhub_not_judged_without_events(tmp_path):
 
 def test_upgrade_sh_watches_docker_across_the_roll_and_plain_start_only():
     text = (JUDGE.parent / "upgrade.sh").read_text()
-    start, roll = text.index("events --format '{{json .}}' --filter type=image --filter type=container"), text.index('ROLL_T0="$(date +%s)"')
+    start, roll = text.index("$DOCKER events --format '"), text.index('ROLL_T0="$(date +%s)"')
     stop, chat = text.index('kill "$EVENTS_PID"'), text.index("step chat-after ")
     assert text.index("step before-roll") < start < roll
     assert text.index("step start-after-upgrade ") < stop < chat
@@ -439,3 +446,118 @@ def test_the_scan_runs_over_the_whole_upload_and_withholds_it_on_a_hit():
     fin = sh[sh.index("finish() {"):sh.index("# ── 1.")]
     assert 'python3 "$CELL_PY" scan "$OUT"' in fin, "the scan covers logs/, judge/ and the agent step"
     assert 'rm -rf "$OUT/logs" "$OUT/judge"' in fin
+
+
+# ── G2 waits for the row (the agent's first pass after a restart) ───────────
+def _g2(tmp_path, first, later, bound="360"):
+    """Judge with `first` as the final verify; `later` are the verifies a fake
+    `noo` returns on each re-run (the last repeats)."""
+    out, j = tmp_path / "out", tmp_path / "out" / "judge"
+    (out / "logs").mkdir(parents=True)
+    j.mkdir()
+    (j / "verify-final.json").write_text(first)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    for i, b in enumerate(later):
+        (bindir / ("v%d" % i)).write_text(b)
+    (bindir / "noo").write_text('#!/bin/sh\nd="%s"; n=$(cat "$d/n" 2>/dev/null || echo 0)\n'
+                                '[ -f "$d/v$n" ] || n=%d\necho $((n+1)) > "$d/n"; cat "$d/v$n"\n' % (bindir, len(later) - 1))
+    (bindir / "noo").chmod(0o755)
+    env = dict(os.environ, PATH="%s:%s" % (bindir, os.environ["PATH"]), G2_SLEEP="0")
+    r = subprocess.run([sys.executable, str(JUDGE), "g2wait", str(out), str(j), SELF, "30", bound], env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    return out, j
+
+
+def _g2_judged(out, j, tmp_path):
+    # judge the wait file with the normal fixture around it
+    rc, got = cell(tmp_path / "judged")
+    return got
+
+
+def _g2_line(tmp_path, first, later, bound="360"):
+    out, j = _g2(tmp_path / "w", first, later, bound)
+    jd = tmp_path / "j"
+    rc, _ = cell(jd)
+    jdir = jd / "out" / "judge"
+    (jdir / "verify-final.json").write_text((j / "verify-final.json").read_text())
+    (jdir / "verify-after.json").write_text((j / "verify-final.json").read_text())
+    (jdir / "g2.wait").write_text((j / "g2.wait").read_text())
+    env = dict(os.environ, OUT=str(jd / "out"), J=str(jdir), SELF=SELF, NETNS_UNIT_ENABLED="enabled", ROLL_T0=ROLL_T0,
+               STACK_T0=STACK_T0, STACK_T1=STACK_T1, NETNS_UNIT=str(jd / "noo-netns-restore.service"),
+               NETNS_UNIT_OWNER="%d:%d" % (os.getuid(), os.getgid()))
+    r = subprocess.run([sys.executable, str(JUDGE), "judge"], env=env, capture_output=True, text=True)
+    return next(l for l in r.stdout.splitlines() if l.startswith("UPGRADE G2 ")), out, j
+
+
+NO_OM = verify([r for r in GOOD_SELF if r["name"] != "ollama models"], GOOD_CTL)
+YES_OM = verify(GOOD_SELF, GOOD_CTL)
+
+
+def test_g2_present_at_once_passes_after_0_s_1_try(tmp_path):
+    line, out, j = _g2_line(tmp_path, YES_OM, [NO_OM])
+    assert line.startswith("UPGRADE G2 PASS (after 0 s, 1 try): verified against the controller"), line
+    assert (out / "logs" / "verify-g2-1.json").exists() and not (out / "logs" / "verify-g2-2.json").exists()
+
+
+def test_g2_absent_then_present_passes_with_the_wait(tmp_path):
+    line, out, j = _g2_line(tmp_path, NO_OM, [NO_OM, YES_OM])
+    assert line.startswith("UPGRADE G2 PASS (after 0 s, 3 tries): verified against the controller"), line
+    assert [(out / "logs" / ("verify-g2-%d.json" % n)).exists() for n in (1, 2, 3, 4)] == [True, True, True, False]
+
+
+def test_g2_absent_past_the_bound_fails_with_the_wait(tmp_path):
+    line, out, j = _g2_line(tmp_path, NO_OM, [NO_OM])
+    assert line.startswith("UPGRADE G2 FAIL (still absent after 0 s, 13 tries): no 'ollama models' row"), line
+    assert (out / "logs" / "verify-g2-13.json").exists() and not (out / "logs" / "verify-g2-14.json").exists()
+
+
+def test_g2_not_yet_checked_is_pending_too(tmp_path):
+    pend = [dict(r, detail="gemma4:e2b not yet checked") if r["name"] == "ollama models" else r for r in GOOD_SELF]
+    line, out, j = _g2_line(tmp_path, verify(pend, GOOD_CTL), [YES_OM])
+    assert line.startswith("UPGRADE G2 PASS (after 0 s, 2 tries)"), line
+
+
+def test_upgrade_sh_waits_for_g2_after_the_final_verify():
+    sh = (JUDGE.parent / "upgrade.sh").read_text()
+    i = sh.index('noo --json cluster verify > "$J/verify-final.json"')
+    assert 'upgrade_judge.py" g2wait "$OUT" "$J" "$SELF" 30 360' in sh[i:i + 700]
+    assert i < sh.index("step judge ")
+
+
+# ── the docker events capture: minimal fields, scan-clean ───────────────────
+def test_the_events_capture_names_no_field_beyond_the_six():
+    import re
+    sh = (JUDGE.parent / "upgrade.sh").read_text()
+    m = re.search(r"\$DOCKER events --format '([^']*)'", sh)
+    assert m, "the capture format"
+    fmt = m.group(1)
+    assert fmt != "{{json .}}" and "{{json .}}" not in fmt
+    assert re.findall(r'"(\w+)":', fmt) == ["time", "type", "action", "id", "image", "name"]
+    # every template action reads one of those fields only
+    acts = re.findall(r"\{\{(.*?)\}\}", fmt)
+    assert [a.replace("json ", "").strip("()") for a in acts] == [
+        ".Time", ".Type", ".Action", ".Actor.ID", 'index .Actor.Attributes "image"', 'index .Actor.Attributes "name"']
+
+
+def test_a_minimal_events_file_passes_the_upload_scan(tmp_path):
+    # a label-heavy container create as `{{json .}}` prints it: compose hashes,
+    # our start inputs, and KEY=value strings inside label values
+    attrs = {"com.docker.compose.config-hash": "9" * 64, "noo.inputs": "NOO_X_KEY=abc123def456 NOO_MODE=full",
+             "org.opencontainers.image.description": "build ARG SIGNING_KEY=zz99yy88xx",
+             "image": "ghcr.io/x/y" + DIGEST, "name": "noo-gateway"}
+    full = json.dumps({"Type": "container", "Action": "create", "time": 1763629802, "Actor": {"ID": "abc", "Attributes": attrs}})
+    sys.path.insert(0, str(JUDGE.parent))
+    import cell as cellpy
+    assert cellpy.secret_hits(full), "the full event is what the scan refused"
+    f = tmp_path / "logs" / "docker-events-upgrade.jsonl"
+    f.parent.mkdir()
+    f.write_text(ev("image", "pull", name="ghcr.io/x/y:1") + ev("container", "create", image="ghcr.io/x/y" + DIGEST, name="noo-gateway")
+                 + ev("container", "start", image="ghcr.io/x/y" + DIGEST, name="noo-gateway"))
+    assert cellpy.cmd_scan([str(tmp_path)]) == 0
+    assert uj.judge_dockerhub(f.read_text().splitlines())[0] == "PASS"
+
+
+def test_no_dockerhub_still_reads_the_old_full_shape(tmp_path):
+    e = ev_full("image", "pull", name="noomesh/stunnel:latest") + ev_full("container", "create", image="alpine", name="chgrp")
+    assert uj.judge_dockerhub(e.splitlines())[0] == "FAIL"

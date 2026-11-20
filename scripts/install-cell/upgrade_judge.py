@@ -291,23 +291,33 @@ def is_hub_container(ref, pulled_repos):
 
 
 def judge_dockerhub(lines):
-    """(verdict, why) from `docker events --format '{{json .}}'` lines."""
+    """(verdict, why) from upgrade.sh's docker events capture: one minimal
+    JSON object per line, {"time","type","action","id","image","name"} (the
+    full `{{json .}}` event carries every container label and was refused by
+    the upload scan). The old full shape (Type/Action/Actor.Attributes) is
+    still read."""
     pulls, creates, bad, n = [], [], 0, 0
     for l in lines:
         if not l.strip():
             continue
         try:
             e = json.loads(l)
-            a = e.get("Actor") or {}
-            attrs = a.get("Attributes") or {}
-            typ, act = e.get("Type"), e.get("Action") or e.get("status")
+            if "Actor" in e or "Type" in e:
+                a = e.get("Actor") or {}
+                attrs = a.get("Attributes") or {}
+                typ, act = e.get("Type"), e.get("Action") or e.get("status")
+                ident = a.get("ID") or e.get("id") or ""
+                image, name = attrs.get("image") or "", attrs.get("name") or ""
+            else:
+                typ, act = e.get("type"), e.get("action")
+                ident, image, name = e.get("id") or "", e.get("image") or "", e.get("name") or ""
             when = time.strftime("%H:%M:%S", time.gmtime(e.get("time") or 0))
             if typ == "image" and act == "pull":
-                pulls.append((when, attrs.get("name") or a.get("ID") or e.get("id") or ""))
+                pulls.append((when, name or ident))
             elif typ == "container" and act == "create":
-                creates.append((when, attrs.get("image") or "", attrs.get("name") or ""))
+                creates.append((when, image, name))
             n += 1
-        except (ValueError, AttributeError):
+        except (ValueError, AttributeError, TypeError):
             bad += 1
     if not n:
         return "NOT JUDGED", "docker events recorded no event (%d unparseable line(s))" % bad
@@ -332,10 +342,10 @@ def judge():
     out, j, me = os.environ["OUT"], os.environ["J"], os.environ["SELF"]
     lines, failed = [], False
 
-    def say(aid, verdict, why, n=400):
+    def say(aid, verdict, why, n=400, waited=""):
         nonlocal failed
         failed |= verdict == "FAIL"
-        lines.append("UPGRADE %s %s: %s" % (aid, verdict, one(why, n)))
+        lines.append("UPGRADE %s %s%s: %s" % (aid, verdict, waited, one(why, n)))
 
     roll = text(os.path.join(out, "logs", "upgrade-all.log"))
     stack = text(os.path.join(out, "logs", "upgrade-stack-same-tag.log"))
@@ -514,18 +524,23 @@ def judge():
         say("G1", "PASS" if hf and hf[0].get("verdict") == "ok" else "FAIL",
             ("%s: %s" % (hf[0].get("verdict"), hf[0].get("detail"))) if hf else "no 'hf-cache hub owner' row")
     om = rows(v, "ollama models", me)
-    if om and om[0].get("verdict") == "ok" and "not yet checked" in (om[0].get("detail") or ""):
+    # how long G2 waited for the row (g2wait wrote it); absent = one snapshot
+    gw = (text(os.path.join(j, "g2.wait")) or "0 1").split()
+    waited = " (after %s s, %s %s)" % (gw[0], gw[1], "try" if gw[1] == "1" else "tries")
+    if not om:
+        say("G2", "FAIL", "no 'ollama models' row", waited=waited.replace("(after", "(still absent after"))
+    elif om[0].get("verdict") == "ok" and "not yet checked" in (om[0].get("detail") or ""):
         # i1067: a held model the restarted agent has not checked yet is
         # OK on the row, but proves nothing about its bytes.
         say("G2", "NOTE", "the row is OK but a model is not yet checked (the agent's first pass after the roll): %s"
-            % om[0].get("detail"))
-    elif om and om[0].get("verdict") == "ok":
-        say("G2", "PASS", om[0].get("detail"))
-    elif om and "no controller record" in (om[0].get("detail") or ""):
+            % om[0].get("detail"), waited=waited)
+    elif om[0].get("verdict") == "ok":
+        say("G2", "PASS", om[0].get("detail"), waited=waited)
+    elif "no controller record" in (om[0].get("detail") or ""):
         say("G2", "NOTE", "the model the previous final's onboard pulled has no controller record (the 0.6.27 roll note's "
-            "existing-install case): %s; remedy %s" % (om[0].get("detail"), om[0].get("remedy")))
+            "existing-install case): %s; remedy %s" % (om[0].get("detail"), om[0].get("remedy")), waited=waited)
     else:
-        say("G2", "FAIL", ("%s: %s" % (om[0].get("verdict"), om[0].get("detail"))) if om else "no 'ollama models' row")
+        say("G2", "FAIL", "%s: %s" % (om[0].get("verdict"), om[0].get("detail")), waited=waited)
     bs = rows(v, "backend starts", me)
     say("G3", "FAIL" if bs else "PASS",
         ("%s: %s" % (bs[0].get("verdict"), bs[0].get("detail"))) if bs else "no 'backend starts' row (no start refused)")
@@ -563,13 +578,57 @@ def judge():
     return 1 if failed else 0
 
 
+def g2_pending(verify, me):
+    """The `ollama models` row is absent or OK-but-not-yet-checked: the
+    restarted agent's first pass has not landed (run.sh probe-ollama-verified
+    waits on the same two states)."""
+    om = rows(verify, "ollama models", me)
+    return (not om) or (om[0].get("verdict") == "ok"
+                        and any(t in (om[0].get("detail") or "") for t in ("not yet checked", "not checked yet")))
+
+
+def g2wait(out, j, me, interval="30", bound="360"):
+    """G2 must not judge one snapshot: a node agent restarted moments before
+    the final verify has no ollama_verify for ~30-60 s. Try 1 is the final
+    verify upgrade.sh already took (verify-final.json); while the row is
+    pending, `noo --json cluster verify` again every `interval` s up to
+    `bound` s. Every try's JSON is kept as $J/verify-g2-<n>.json and
+    $OUT/logs/verify-g2-<n>.json; verify-final.json becomes the last; the
+    wait is written to $J/g2.wait as `<seconds> <tries>`. G2_SLEEP (tests)
+    overrides the real sleep."""
+    interval, bound = int(interval), int(bound)
+    nap = float(os.environ.get("G2_SLEEP", interval))
+    cap = bound // interval + 1 if interval else 1
+    t0 = time.time()
+    tries, last = 0, None
+    while True:
+        tries += 1
+        if tries == 1:
+            body = open(os.path.join(j, "verify-final.json"), errors="replace").read() \
+                if os.path.exists(os.path.join(j, "verify-final.json")) else ""
+        else:
+            r = subprocess.run(["noo", "--json", "cluster", "verify"], capture_output=True, text=True)
+            body = r.stdout
+            open(os.path.join(j, "verify-final.json"), "w").write(body)
+        for d in (j, os.path.join(out, "logs")):
+            os.makedirs(d, exist_ok=True)
+            open(os.path.join(d, "verify-g2-%d.json" % tries), "w").write(body)
+        last = load(os.path.join(j, "verify-final.json"))
+        if not g2_pending(last, me) or tries >= cap:
+            break
+        time.sleep(nap)
+    open(os.path.join(j, "g2.wait"), "w").write("%d %d\n" % (round(time.time() - t0), tries))
+
+
 if __name__ == "__main__":
     a = sys.argv[1:]
     if a[:1] == ["resolve"] and len(a) in (5, 6):
         resolve(*a[1:])
     elif a[:1] == ["before"] and len(a) == 3:
         before(*a[1:])
+    elif a[:1] == ["g2wait"] and len(a) in (4, 6):
+        g2wait(*a[1:])
     elif a[:1] == ["judge"]:
         sys.exit(judge())
     else:
-        sys.exit("usage: upgrade_judge.py resolve OWNER/REPO TAG PREV TARGET [PREV_TAG] | before VERIFY SELF | judge")
+        sys.exit("usage: upgrade_judge.py resolve OWNER/REPO TAG PREV TARGET [PREV_TAG] | before VERIFY SELF | g2wait OUT J SELF [INTERVAL BOUND] | judge")
