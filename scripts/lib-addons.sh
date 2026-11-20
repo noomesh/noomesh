@@ -561,6 +561,6 @@ addons_stop_leftovers() {
 # ("its compose config or image changed", 0.6.29-rc.2 install matrix). ONE
 # function, called by all three at the top level, before any compose render.
 addons_export_launcher_env() {
-    export NOO_WORKER_SUPERVISOR="external"
+    export NOO_WORKER_SUPERVISOR="inprocess"
     export NOO_MIGRATIONS_ENVS="${NOO_MIGRATIONS_ENVS:-mesh}"
 }
