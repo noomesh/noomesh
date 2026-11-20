@@ -500,7 +500,7 @@ pub(crate) const ROWS: &[Row] = &[
         name: "default chat",
         scope: Scope::Controller,
         verdicts: &[Verdict::Warn, Verdict::Fail],
-        meaning: "Where an unpinned chat request (model default/auto) goes right now, and whether any live chat model, GPU, or second node backs it.",
+        meaning: "Where an unpinned chat request (model default/auto) goes right now, and whether any live chat model, GPU, or second node backs it. On a fleet with no GPU, or of one node, CPU-only or one-node chat is OK, listed as worth doing later.",
         clears: "Place a chat model on a node: `noo cluster place <node> <backend> <model>` (check with `noo cluster class list`).",
         findings: &[],
         shown_as: None,

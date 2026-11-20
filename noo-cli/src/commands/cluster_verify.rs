@@ -3141,9 +3141,17 @@ pub(crate) fn model_classes_check(classes: Option<&Value>) -> Check {
     ok("model classes", format!("{} declared class(es), {total} candidate(s) all placed or available", declared.len()))
 }
 
-/// The `default chat` remedy when no node in the fleet has a GPU.
-pub(crate) const CPU_ONLY_FLEET_CHAT_REMEDY: &str =
-    "none needed on a CPU-only fleet; adding a GPU node lets it move to a faster model";
+/// The `default chat` row on a fleet with no GPU node (i1098): CPU
+/// candidates are all there can be, so it is OK, "worth doing later"
+/// ([`OK_LATER_TIERS`]), and names no place command: placing another CPU
+/// model changes nothing.
+pub(crate) const CPU_ONLY_FLEET_CHAT_LATER: &str =
+    "only CPU candidates, as on any fleet with no GPU: a GPU node, when you add one, moves chat to a faster model";
+
+/// The `default chat` row on a one-node fleet (i1098): that node carries
+/// every unpinned request because there is no other. OK, "worth doing later".
+pub(crate) const ONE_NODE_FLEET_CHAT_LATER: &str =
+    "one node carries every unpinned request, as on any one-node fleet: a second node, when you add one, gives chat a fallback";
 
 /// Whether any node in `/api/cluster/nodes` reports GPU memory (`vram_gb`,
 /// in `capabilities` or at the top level; a unified-memory node reports its
@@ -3155,6 +3163,12 @@ pub(crate) fn fleet_has_gpu(fleet: &[Value]) -> Option<bool> {
     Some(fleet.iter().any(|n| n["capabilities"]["vram_gb"].as_f64().or_else(|| n["vram_gb"].as_f64()).unwrap_or(0.0) > 0.0))
 }
 
+/// How many nodes `/api/cluster/nodes` lists. `None` when the list is
+/// empty: an unread fleet is not a one-node one.
+pub(crate) fn fleet_node_count(fleet: &[Value]) -> Option<usize> {
+    (!fleet.is_empty()).then_some(fleet.len())
+}
+
 /// The `default chat` row: where an unpinned request (`default`, `auto`, no
 /// model) goes right now — chat-default's live candidates in routing order
 /// (the gateway's `routing_order`), and who is left out. `x` when none; `!`
@@ -3162,10 +3176,15 @@ pub(crate) fn fleet_has_gpu(fleet: &[Value]) -> Option<bool> {
 /// fallback), or when only excluded nodes (thermal critical, quarantined)
 /// are left.
 ///
-/// `has_gpu` ([`fleet_has_gpu`]): on a fleet with no GPU node at all,
-/// CPU candidates are the only kind there can be, so the CPU-only warning
-/// names no place command — placing another CPU model changes nothing.
-pub(crate) fn default_chat_check(classes: Option<&Value>, has_gpu: Option<bool>) -> Check {
+/// The fleet's shape relaxes only those two warnings, and only when it is
+/// KNOWN (i1098: a fresh one-box install is healthy, not a warning):
+/// `has_gpu == Some(false)` ([`fleet_has_gpu`]) — CPU candidates are the
+/// only kind there can be; `fleet_nodes == Some(1)` ([`fleet_node_count`])
+/// — one node carries it all because there is no other. Each is then OK,
+/// with its "worth doing later" sentence in the detail (the brief tier,
+/// [`OK_LATER_TIERS`]). `None` keeps the warning. No candidate, a class
+/// that is not read, or only excluded nodes left are judged as ever.
+pub(crate) fn default_chat_check(classes: Option<&Value>, has_gpu: Option<bool>, fleet_nodes: Option<usize>) -> Check {
     const NAME: &str = "default chat";
     let Some(body) = classes else {
         return warn(NAME, "not read", Some("noo cluster class list".into()));
@@ -3227,18 +3246,22 @@ pub(crate) fn default_chat_check(classes: Option<&Value>, has_gpu: Option<bool>)
     if cd["last_resort"].as_bool() == Some(true) {
         return warn(NAME, format!("{detail} — only excluded nodes are left (thermal critical / quarantined)"), Some("noo cluster status".into()));
     }
-    if !order.iter().any(is_gpu) {
-        let remedy = if has_gpu == Some(false) {
-            CPU_ONLY_FLEET_CHAT_REMEDY
-        } else {
-            "noo cluster place <node> <backend> <model>"
-        };
-        return warn(NAME, format!("{detail} — only CPU candidates"), Some(remedy.into()));
+    let cpu_only = !order.iter().any(is_gpu);
+    if cpu_only && has_gpu != Some(false) {
+        return warn(NAME, format!("{detail} — only CPU candidates"), Some("noo cluster place <node> <backend> <model>".into()));
     }
-    if nodes.len() == 1 {
+    let one_node = nodes.len() == 1;
+    if one_node && fleet_nodes != Some(1) {
         return warn(NAME, format!("{detail} — one node carries every unpinned request (no fallback)"), Some("noo cluster place <node> <backend> <model>".into()));
     }
-    ok(NAME, detail)
+    let later: Vec<&str> = [cpu_only.then_some(CPU_ONLY_FLEET_CHAT_LATER), one_node.then_some(ONE_NODE_FLEET_CHAT_LATER)]
+        .into_iter()
+        .flatten()
+        .collect();
+    if later.is_empty() {
+        return ok(NAME, detail);
+    }
+    ok(NAME, format!("{detail} — {}", later.join("; ")))
 }
 
 /// The `embedding spaces` row (i145): each space, its one model and how many
@@ -8400,7 +8423,8 @@ fn verdict_line(t: &Tally) -> (Glyph, String) {
     (Glyph::Ok, format!("fleet healthy{}{seen}", t.context))
 }
 
-/// Where a WARN row goes in the brief rendering. A FAIL or STARTING row is
+/// Where a WARN row goes in the brief rendering, and the few OK rows that
+/// carry advice for later ([`OK_LATER_TIERS`]). A FAIL or STARTING row is
 /// never tiered: it always shows in full, first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tier {
@@ -8428,7 +8452,22 @@ const BRIEF_TIERS: &[(&str, Option<&str>, Tier)] = &[
     ("inbound", Some("not yet checked"), Tier::NotHere),
 ];
 
+/// OK rows that still carry advice for later (i1098): the row name and the
+/// sentence its detail carries. Healthy for this fleet's shape, so not a
+/// warning; grouped under "Worth doing later" and `tier: "later"` all the
+/// same, so the advice is not lost.
+const OK_LATER_TIERS: &[(&str, &str)] = &[
+    ("default chat", CPU_ONLY_FLEET_CHAT_LATER),
+    ("default chat", ONE_NODE_FLEET_CHAT_LATER),
+];
+
 fn brief_tier(c: &Check) -> Option<Tier> {
+    if c.verdict == Verdict::Ok {
+        return OK_LATER_TIERS
+            .iter()
+            .any(|(name, sentence)| *name == c.name && c.detail.contains(*sentence))
+            .then_some(Tier::Later);
+    }
     if c.verdict != Verdict::Warn {
         return None;
     }
@@ -8455,9 +8494,9 @@ fn brief_split(checks: &[Check]) -> BriefSplit<'_> {
     let mut b = BriefSplit::default();
     for c in checks {
         match (c.verdict, brief_tier(c)) {
-            (Verdict::Ok, _) => b.passed += 1,
             (_, Some(Tier::Later)) => b.later.push(c),
             (_, Some(Tier::NotHere)) => b.not_here.push(c),
+            (Verdict::Ok, None) => b.passed += 1,
             _ => b.shown.push(c),
         }
     }
@@ -8958,7 +8997,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let model_classes = get_json_opt(g, "/api/cluster/model-classes", true, 15);
         checks.push(model_classes_check(model_classes.as_ref()));
         // Where an unpinned chat goes: chat-default's live candidates.
-        checks.push(default_chat_check(model_classes.as_ref(), fleet_has_gpu(&fleet)));
+        checks.push(default_chat_check(model_classes.as_ref(), fleet_has_gpu(&fleet), fleet_node_count(&fleet)));
         let spaces = get_json_opt(g, "/api/cluster/embedding-spaces", true, 15);
         checks.push(embedding_spaces_check(spaces.as_ref()));
         // Finding 126: a loaded model measured over its estimate or pool.
@@ -9958,8 +9997,8 @@ fn checks_json(checks: &[Check]) -> Value {
 }
 
 /// A row's brief tier as `--json` names it: where the onboard brief groups a
-/// WARN ("later": worth doing later; "not_here": says nothing on this box),
-/// null for a row shown in full. Pure.
+/// WARN, or an OK row with advice for later ("later": worth doing later;
+/// "not_here": says nothing on this box), null otherwise. Pure.
 fn tier_json(t: Option<Tier>) -> Option<&'static str> {
     match t {
         Some(Tier::Later) => Some("later"),
@@ -10212,7 +10251,7 @@ mod tests {
                 {"node_id": "ctrl", "backend": "ollama", "model": "gemma4:e2b-it-qat", "gpu": false, "reason": "rank=cpu,params=2,load=0.05"},
             ],
             "skipped": [{"node_id": "node-a", "backend": "vllm", "reason": "thermal critical"}]}]});
-        let c = default_chat_check(Some(&two), None);
+        let c = default_chat_check(Some(&two), None, None);
         assert_eq!(c.verdict, super::Verdict::Ok, "{c:?}");
         assert!(c.detail.starts_with("dynamic: node-mac/ollama=gemma4:12b (rank=gpu,params=12,load=0.40) > ctrl/"), "{}", c.detail);
         assert!(c.detail.contains("skipped node-a/vllm: thermal critical"), "{}", c.detail);
@@ -10220,14 +10259,14 @@ mod tests {
         let cpu = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": [
             {"node_id": "ctrl", "backend": "ollama", "model": "e2b", "gpu": false},
             {"node_id": "pi", "backend": "llamacpp", "model": "x", "gpu": false}]}]});
-        let c = default_chat_check(Some(&cpu), None);
+        let c = default_chat_check(Some(&cpu), None, None);
         assert_eq!(c.verdict, super::Verdict::Warn);
         assert!(c.detail.contains("only CPU"), "{}", c.detail);
 
         let one = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": [
             {"node_id": "node-a", "backend": "vllm", "model": "HF", "gpu": true},
             {"node_id": "node-a", "backend": "ollama", "model": "m", "gpu": true}]}]});
-        let c = default_chat_check(Some(&one), None);
+        let c = default_chat_check(Some(&one), None, None);
         assert_eq!(c.verdict, super::Verdict::Warn);
         assert!(c.detail.contains("one node"), "{}", c.detail);
 
@@ -10236,17 +10275,17 @@ mod tests {
         let emb = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": [
             {"node_id": "ctl", "backend": "ollama", "model": "harrier:latest", "gpu": true},
             {"node_id": "node-a", "backend": "vllm", "model": "HF", "gpu": true}]}]});
-        let c = default_chat_check(Some(&emb), None);
+        let c = default_chat_check(Some(&emb), None, None);
         assert!(!c.detail.contains("harrier"), "{}", c.detail);
         assert!(c.detail.contains("one node"), "only node-a is a chat node: {}", c.detail);
         let only_emb = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": [
             {"node_id": "ctl", "backend": "ollama", "model": "harrier:latest", "gpu": true}]}]});
-        assert_eq!(default_chat_check(Some(&only_emb), None).verdict, super::Verdict::Fail);
+        assert_eq!(default_chat_check(Some(&only_emb), None, None).verdict, super::Verdict::Fail);
 
         let none = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": []}]});
-        assert_eq!(default_chat_check(Some(&none), None).verdict, super::Verdict::Fail);
-        assert_eq!(default_chat_check(Some(&serde_json::json!({"classes": []})), None).verdict, super::Verdict::Fail);
-        assert_eq!(default_chat_check(None, None).verdict, super::Verdict::Warn);
+        assert_eq!(default_chat_check(Some(&none), None, None).verdict, super::Verdict::Fail);
+        assert_eq!(default_chat_check(Some(&serde_json::json!({"classes": []})), None, None).verdict, super::Verdict::Fail);
+        assert_eq!(default_chat_check(None, None, None).verdict, super::Verdict::Warn);
     }
 
     use super::*;
@@ -16549,7 +16588,7 @@ mod default_chat_remedy_tests {
     /// verify and onboard's last line name the SAME one command (i677 #12).
     #[test]
     fn no_chat_default_names_the_first_model_command() {
-        let c = default_chat_check(Some(&serde_json::json!({"classes": []})), None);
+        let c = default_chat_check(Some(&serde_json::json!({"classes": []})), None, None);
         assert_eq!(c.verdict, Verdict::Fail);
         assert_eq!(c.remedy.as_deref(), Some(crate::onboard::FIRST_MODEL_CMD));
         assert!(crate::onboard::NO_CHAT_MODEL_YET.ends_with(c.remedy.as_deref().unwrap()));
@@ -18002,17 +18041,21 @@ mod remedy_command_tests {
     }
 
     /// On a fleet with no GPU node, CPU candidates are all there can be: the
-    /// row names no place command. With a GPU node it keeps the suggestion,
-    /// and an unread fleet is not taken for a CPU-only one.
+    /// row is OK and names no place command. With a GPU node it keeps the
+    /// warning and the suggestion, and an unread fleet is not taken for a
+    /// CPU-only one.
     #[test]
     fn the_default_chat_cpu_only_remedy_depends_on_the_fleet_having_a_gpu() {
         let cpu = json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": [
-            {"node_id": "ctrl", "backend": "ollama", "model": "e2b", "gpu": false}]}]});
-        let c = default_chat_check(Some(&cpu), Some(false));
-        assert_eq!(c.remedy.as_deref(), Some(CPU_ONLY_FLEET_CHAT_REMEDY));
-        assert!(!CPU_ONLY_FLEET_CHAT_REMEDY.contains("noo cluster place"));
+            {"node_id": "ctrl", "backend": "ollama", "model": "e2b", "gpu": false},
+            {"node_id": "node_a", "backend": "ollama", "model": "e2b", "gpu": false}]}]});
+        let c = default_chat_check(Some(&cpu), Some(false), None);
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert_eq!(c.remedy, None);
+        assert!(!CPU_ONLY_FLEET_CHAT_LATER.contains("noo cluster place"));
         for has_gpu in [Some(true), None] {
-            let c = default_chat_check(Some(&cpu), has_gpu);
+            let c = default_chat_check(Some(&cpu), has_gpu, None);
+            assert_eq!(c.verdict, Verdict::Warn, "{has_gpu:?}");
             assert_eq!(c.remedy.as_deref(), Some("noo cluster place <node> <backend> <model>"), "{has_gpu:?}");
         }
         let cpu_fleet = [json!({"id": "ctrl", "capabilities": {"vram_gb": 0.0}}), json!({"id": "node_a"})];
@@ -18032,5 +18075,126 @@ mod remedy_command_tests {
         let r = c.remedy.expect("a remedy");
         assert_eq!(r, AGENT_MAIL_ORPHANED_REMEDY);
         assert!(r.contains("the MCP tool noo_agent_inbox (orphaned=true)") && !r.starts_with("read them with"), "{r}");
+    }
+}
+
+#[cfg(test)]
+mod default_chat_fleet_shape_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn class(order: Value) -> Value {
+        json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": order}]})
+    }
+
+    /// A fresh one-box install (i1098): one node, no GPU, one CPU chat model.
+    fn fresh_box() -> Value {
+        class(json!([{"node_id": "ctrl", "backend": "ollama", "model": "e2b", "gpu": false}]))
+    }
+
+    /// No GPU anywhere: CPU candidates are all there can be. OK, worth doing
+    /// later, with no remedy; `--json` and the brief both say "later".
+    #[test]
+    fn a_fleet_known_to_have_no_gpu_is_ok_later() {
+        let two_cpu = class(json!([
+            {"node_id": "ctrl", "backend": "ollama", "model": "e2b", "gpu": false},
+            {"node_id": "node_a", "backend": "llamacpp", "model": "x", "gpu": false}]));
+        let c = default_chat_check(Some(&two_cpu), Some(false), Some(2));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert_eq!(c.remedy, None);
+        assert!(c.detail.ends_with(&format!(" — {CPU_ONLY_FLEET_CHAT_LATER}")), "{}", c.detail);
+        assert_eq!(brief_tier(&c), Some(Tier::Later));
+        assert_eq!(checks_json(std::slice::from_ref(&c))[0]["tier"], "later");
+        assert_eq!(checks_json(std::slice::from_ref(&c))[0]["verdict"], "ok");
+        let b = brief_split(std::slice::from_ref(&c));
+        assert_eq!((b.passed, b.shown.len(), b.later.len()), (0, 0, 1), "folded under Worth doing later");
+    }
+
+    /// One node: it carries every unpinned request because there is no
+    /// other. OK, worth doing later.
+    #[test]
+    fn a_fleet_known_to_be_one_node_is_ok_later() {
+        let gpu_one = class(json!([
+            {"node_id": "node_a", "backend": "vllm", "model": "HF", "gpu": true},
+            {"node_id": "node_a", "backend": "ollama", "model": "m", "gpu": true}]));
+        let c = default_chat_check(Some(&gpu_one), Some(true), Some(1));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert_eq!(c.remedy, None);
+        assert!(c.detail.ends_with(&format!(" — {ONE_NODE_FLEET_CHAT_LATER}")), "{}", c.detail);
+        assert_eq!(brief_tier(&c), Some(Tier::Later));
+        // The literal stranger's box: both sentences, OK, later.
+        let c = default_chat_check(Some(&fresh_box()), Some(false), Some(1));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.contains(CPU_ONLY_FLEET_CHAT_LATER) && c.detail.contains(ONE_NODE_FLEET_CHAT_LATER), "{}", c.detail);
+        assert_eq!(checks_json(std::slice::from_ref(&c))[0]["tier"], "later");
+    }
+
+    /// An unread fleet (`None`) is neither GPU-less nor one node: today's
+    /// warnings, with today's remedy.
+    #[test]
+    fn an_unknown_fleet_shape_keeps_the_warning() {
+        let c = default_chat_check(Some(&fresh_box()), None, None);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.ends_with(" — only CPU candidates"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster place <node> <backend> <model>"));
+        // A known one-node fleet does not excuse CPU chat when the GPU is unknown.
+        assert_eq!(default_chat_check(Some(&fresh_box()), None, Some(1)).verdict, Verdict::Warn);
+        let gpu_one = class(json!([{"node_id": "node_a", "backend": "vllm", "model": "HF", "gpu": true}]));
+        let c = default_chat_check(Some(&gpu_one), Some(true), None);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.ends_with(" — one node carries every unpinned request (no fallback)"), "{}", c.detail);
+        assert_eq!(brief_tier(&c), None, "a warning stays in view");
+        // The GPU fleet with CPU-only chat: a GPU node could take it.
+        assert_eq!(default_chat_check(Some(&fresh_box()), Some(true), Some(1)).verdict, Verdict::Warn);
+    }
+
+    /// The fleet's shape relaxes only "nothing better can be placed": no
+    /// live candidate still fails, an unread class still warns, only
+    /// excluded nodes still warns, on a GPU-less one-node fleet too.
+    #[test]
+    fn a_dead_or_unread_default_chat_on_a_no_gpu_fleet_is_judged_as_before() {
+        let none = class(json!([]));
+        let c = default_chat_check(Some(&none), Some(false), Some(1));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster class list"));
+        let declared_dead = json!({"classes": [{"name": "chat-default", "declared": true,
+            "candidates": [{"node_id": "ctrl", "backend": "ollama", "model": "e2b", "status": "unplaced"}]}]});
+        let c = default_chat_check(Some(&declared_dead), Some(false), Some(1));
+        assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+        assert!(c.detail.starts_with("chat-default (declared) has no live candidate"), "{}", c.detail);
+        assert_eq!(default_chat_check(Some(&json!({"classes": []})), Some(false), Some(1)).verdict, Verdict::Fail);
+        let c = default_chat_check(None, Some(false), Some(1));
+        assert_eq!((c.verdict, c.detail.as_str()), (Verdict::Warn, "not read"));
+        let excluded = json!({"classes": [{"name": "chat-default", "dynamic": true, "last_resort": true, "routing_order": [
+            {"node_id": "ctrl", "backend": "ollama", "model": "e2b", "gpu": false}]}]});
+        let c = default_chat_check(Some(&excluded), Some(false), Some(1));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("only excluded nodes are left"), "{}", c.detail);
+    }
+
+    /// A GPU fleet of several nodes with no GPU chat, or with chat on one
+    /// of them only, warns as ever; a GPU-less fleet of several nodes whose
+    /// chat sits on one of them still warns that nothing backs it up.
+    #[test]
+    fn a_gpu_or_multi_node_fleet_keeps_todays_verdict() {
+        let c = default_chat_check(Some(&fresh_box()), Some(true), Some(3));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.ends_with(" — only CPU candidates"), "{}", c.detail);
+        let gpu_one = class(json!([{"node_id": "node_a", "backend": "vllm", "model": "HF", "gpu": true}]));
+        let c = default_chat_check(Some(&gpu_one), Some(true), Some(3));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("one node carries every unpinned request (no fallback)"), "{}", c.detail);
+        let c = default_chat_check(Some(&fresh_box()), Some(false), Some(3));
+        assert_eq!(c.verdict, Verdict::Warn, "no GPU excuses CPU chat, not the missing fallback: {}", c.detail);
+        assert!(c.detail.contains("one node carries every unpinned request (no fallback)"), "{}", c.detail);
+        let gpu_two = class(json!([
+            {"node_id": "node_a", "backend": "vllm", "model": "HF", "gpu": true},
+            {"node_id": "ctrl", "backend": "ollama", "model": "e2b", "gpu": false}]));
+        let c = default_chat_check(Some(&gpu_two), Some(true), Some(3));
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert_eq!(brief_tier(&c), None, "a plain OK is passed, not later");
+        assert_eq!(brief_split(std::slice::from_ref(&c)).passed, 1);
+        assert_eq!(fleet_node_count(&[]), None);
+        assert_eq!(fleet_node_count(&[json!({"id": "ctrl"})]), Some(1));
     }
 }

@@ -204,7 +204,9 @@ Scripts branch on the code, not on prose.
   - `cluster verify`: `summary` (the closing verdict line), `stack_tag`
     (the controller tag in the header; null when no node list was read),
     `next` (`noo cluster verify --wait` while a row is starting), and on each
-    row `tier` (`later` | `not_here` | null, where onboard's brief groups it).
+    row `tier` (`later` | `not_here` | null, where onboard's brief groups it;
+    an OK row with advice for later, such as `default chat` on a fleet with
+    no GPU, is `later` too).
     `seats` is `[]` when none are enrolled and null when the gateway did not
     answer the seat list. Gateway unreachable: `next` is `noo health`,
     `noo stack status`.
