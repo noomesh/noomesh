@@ -289,7 +289,7 @@ const SELF_FIRST_PROBE_WAITS_SECS: [u64; 4] = [5, 10, 20, 30];
 /// this early (the agent restarting beside the stack) is not yet evidence,
 /// and failures stay the loop's to judge, after its grace.
 fn early_probe_records(reach: &Reach) -> bool {
-    *reach == Reach::Ok
+    !matches!(reach, Reach::Failed(_))
 }
 
 /// Probe the controller's own node a few times right after start, and
