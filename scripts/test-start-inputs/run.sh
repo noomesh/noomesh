@@ -15,7 +15,8 @@
 # re-implements the labels or the `up`.
 #
 # The project (compose.yml beside this file): a takes a secret file, b
-# bind-mounts a config file, c has neither and depends on a. Each case prints
+# bind-mounts a config file, c has neither and depends on a, d takes a's
+# secret too. Each case prints
 # one `START-INPUTS <n> PASS|FAIL: ...` line; the exit status is 1 when any
 # case failed. Cleans up its project and temp dir on exit.
 set -uo pipefail
@@ -95,19 +96,28 @@ echo "compose: $(docker compose version --short 2>/dev/null || docker compose ve
 # 1. start, then start again: nothing recreated, and the start says so.
 start || fail 1 "the first start failed"
 b1="$(ids)"
-[ "$(printf '%s\n' "$b1" | grep -c .)" = 3 ] || fail 1 "expected 3 containers after the first start, got: $b1"
+[ "$(printf '%s\n' "$b1" | grep -c .)" = 4 ] || fail 1 "expected 4 containers after the first start, got: $b1"
 start || fail 1 "the second start failed"
 a1="$(ids)"
 expect 1 "" "$b1" "$a1" "start, then start again"
-grep -q "3 running, 0 recreated" "$WORK/out" || fail 1 "the start did not say \"3 running, 0 recreated\""
+grep -q "4 running, 0 recreated" "$WORK/out" || fail 1 "the start did not say \"4 running, 0 recreated\""
 
-# 2. a's secret CONTENT changes (same size, same mtime): a only.
+# 2. a's secret CONTENT changes (same size, same mtime). The plain dependent
+#    c and b keep their containers: compose recreates a service for ITS
+#    inputs, not for a dependency's (this job is the judge of that).
+# 8. ...and the secret's readers, a and d, are recreated: exactly those.
 same_size_edit secrets/a.txt 'alpha-secret-0002'
 start || fail 2 "the start failed"
 a2="$(ids)"
-expect 2 "a" "$a1" "$a2" "a's secret file changed (c depends on a; compose keeps a dependent's container)"
+got2=" $(moved "$a1" "$a2") "
+case "$got2" in
+    *" c "*|*" b "*) fail 2 "a's secret changed: the plain dependent c and b must stay, recreated [${got2# }]" ;;
+    *) pass 2 "a's secret changed: c (depends on a, no secret) and b kept their containers" ;;
+esac
+expect 8 "a d" "$a1" "$a2" "a shared secret changed: exactly its readers"
 grep -q "recreated a: its inputs changed (config secrets/a.txt)" "$WORK/out" \
-    || fail 2 "the start did not name a's changed secret file"
+    && grep -q "recreated d: its inputs changed (config secrets/a.txt)" "$WORK/out" \
+    || fail 8 "the start did not name the changed secret file for both readers"
 
 # 3. b's bind-mounted file changes: b only.
 same_size_edit b.conf 'b-config-0002
@@ -117,11 +127,11 @@ a3="$(ids)"
 expect 3 "b" "$a2" "$a3" "b's mounted config file changed"
 grep -q "recreated b: its inputs changed (config b.conf)" "$WORK/out" || fail 3 "the start did not name b.conf"
 
-# 4. --recreate: all three.
+# 4. --recreate: all four.
 start true || fail 4 "the start failed"
 a4="$(ids)"
-expect 4 "a b c" "$a3" "$a4" "--recreate"
-grep -q -- "--recreate: every container is recreated" "$WORK/out" && grep -q "recreated: a, b, c (forced: every container)" "$WORK/out" \
+expect 4 "a b c d" "$a3" "$a4" "--recreate"
+grep -q -- "--recreate: every container is recreated" "$WORK/out" && grep -q "recreated: a, b, c, d (forced: every container)" "$WORK/out" \
     || fail 4 "the start did not say --recreate forced every container"
 
 # 5. the key is deleted: every label moves once, all recreated, and said.
@@ -129,14 +139,15 @@ grep -q -- "--recreate: every container is recreated" "$WORK/out" && grep -q "re
 rm -f "$NOO_START_INPUTS_KEY_FILE"
 start || fail 5 "the start failed"
 a5="$(ids)"
-expect 5 "a b c" "$a4" "$a5" "the start-inputs key was deleted"
+expect 5 "a b c d" "$a4" "$a5" "the start-inputs key was deleted"
 grep -q "made a new start-inputs key" "$WORK/out" && grep -q "the start-inputs key is new" "$WORK/out" \
     || fail 5 "the start did not say the key is new"
 rm -f .noo-start-inputs.json
 start || fail 5 "the start failed"
 a5b="$(ids)"
 expect 5 "" "$a5" "$a5b" "the state file was deleted (it only names files)"
-grep -q "3 running, 0 recreated" "$WORK/out" || fail 5 "the start did not say \"3 running, 0 recreated\""
+grep -q "4 running, 0 recreated" "$WORK/out" || fail 5 "the start did not say \"4 running, 0 recreated\""
+grep -q "cannot name what changed: no previous record" "$WORK/out" || fail 5 "the start did not say the record is missing"
 
 # 6. an unreadable input: b is recreated on every start, and it is said.
 chmod 000 b.conf
@@ -156,7 +167,7 @@ expect 6 "" "$a6c" "$a6d" "b.conf readable again (settled)"
 # 7. no container label carries a plain sha256 of an input, nor 16 hex of one.
 labels="$(docker ps -aq --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" | xargs -r docker inspect -f '{{json .Config.Labels}}')"
 n_labelled="$(printf '%s\n' "$labels" | grep -c '"noo.inputs":"[0-9a-f]\{64\}"')"
-[ "$n_labelled" = 3 ] || fail 7 "expected a noo.inputs label on all 3 containers, found $n_labelled"
+[ "$n_labelled" = 4 ] || fail 7 "expected a noo.inputs label on all 4 containers, found $n_labelled"
 leak=""
 digests="$(printf 'alpha-secret-0001' | sha256sum; printf 'alpha-secret-0002' | sha256sum
             printf 'b-config-0001\n' | sha256sum; printf 'b-config-0002\n' | sha256sum)"

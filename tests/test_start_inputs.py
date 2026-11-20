@@ -336,9 +336,19 @@ def _snap(p: Path, rows: dict[str, tuple[str, str]]) -> Path:
 
 def test_the_report_says_nothing_moved(tmp_path: Path) -> None:
     rows = {"gateway": ("a1", "running"), "postgres": ("b1", "running"), "init": ("c1", "exited")}
+    state = {"version": 1, "services": {"gateway": {"inputs": {}}}}
     out = SI.report_lines(SI._read_snapshot(str(_snap(tmp_path / "b", rows))),
-                          SI._read_snapshot(str(_snap(tmp_path / "a", rows))), {}, {})
+                          SI._read_snapshot(str(_snap(tmp_path / "a", rows))), state, state)
     assert out == ["2 running, 0 recreated"]
+
+
+def test_a_missing_state_file_is_said_and_recreates_nothing(tmp_path: Path) -> None:
+    rows = {"gateway": ("a1", "running"), "postgres": ("b1", "running")}
+    for old in ({}, SI._load_state(str(tmp_path / "absent.json"))):
+        assert SI.report_lines(rows, dict(rows), old, {}) == [
+            "2 running, 0 recreated", "cannot name what changed: no previous record"]
+    (tmp_path / "bad.json").write_text("not json")
+    assert SI._load_state(str(tmp_path / "bad.json")) == {}, "unreadable reads as missing"
 
 
 def test_the_report_names_the_changed_files_not_their_hashes(tmp_path: Path) -> None:
@@ -354,8 +364,8 @@ def test_the_report_names_the_changed_files_not_their_hashes(tmp_path: Path) -> 
     assert out[0] == "2 running, 1 recreated"
     assert out[1] == "recreated gateway: its inputs changed (config monitoring/prometheus.yml, secret noo_jwt_secret)"
     assert not re.search(r"[0-9a-f]{32}", "\n".join(out))
-    # No earlier state: just the names.
-    assert SI.report_lines(before, after, {}, s2)[1:] == ["recreated: gateway"]
+    # No earlier state: said, then just the names.
+    assert SI.report_lines(before, after, {}, s2)[1:] == ["cannot name what changed: no previous record", "recreated: gateway"]
     # A forced start says it was forced, not that inputs changed.
     assert SI.report_lines(before, after, s1, s2, forced=True)[1] == "recreated: gateway (forced: every container)"
     # A recreate with no input change is compose's own (config or image).
@@ -510,3 +520,17 @@ def test_a_new_key_recreates_everything_once_and_says_so(tmp_path: Path) -> None
     out = SI.report_lines(before, after, s1, s3)
     assert out[0] == "3 running, 3 recreated"
     assert out[1] == "recreated: gateway, postgres, redis (the start-inputs key is new, so every label changed once)"
+
+
+def test_a_shared_secret_is_an_input_of_every_reader(tmp_path: Path) -> None:
+    """A dependent is not recreated for its dependency's change, but a secret
+    mounted by several services is an input of each: a rotation moves every
+    reader's label, and no one else's."""
+    i = Install(tmp_path)
+    cfg = i.config()
+    cfg["services"]["worker"] = {"secrets": [{"source": "noo_jwt_secret"}]}
+    cfg["services"]["redis"] = {"depends_on": {"gateway": {"condition": "service_started"}}}
+    _, a, _ = i.fingerprint(cfg)
+    (i.rundir / "noo_jwt_secret").write_text("rotat")
+    _, b, _ = i.fingerprint(cfg)
+    assert {s for s in a if a[s] != b[s]} == {"gateway", "worker"}

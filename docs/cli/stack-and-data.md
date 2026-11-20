@@ -39,9 +39,13 @@ secret, an edited `monitoring/prometheus.yml`, a new PKI leaf). Compose
 does not see file contents itself, so the launcher puts a keyed digest of
 each service's secret files and mounted config files (read-only config
 directories under the install root or the PKI directory included, data
-directories never) on the service as the label `noo.inputs`. It says
-what it did: `Containers: 13 running, 0 recreated`, or `recreated gateway:
-its inputs changed (secret noo_jwt_secret)`. `--recreate` recreates every
+directories never) on the service as the label `noo.inputs`. A service is recreated when ITS inputs changed;
+a service that depends on it is not, unless its own inputs changed too. A
+secret is an input of every service that mounts it, so a rotated secret
+recreates all its readers. The start says what it did: `Containers: 13
+running, 0 recreated`, or `recreated gateway: its inputs changed (secret
+noo_jwt_secret)`; without its record of the last start it says `cannot
+name what changed: no previous record` (and recreates nothing for that). `--recreate` recreates every
 container, changed or not (so does `noo upgrade`); a config directory
 over 16 MiB is not fingerprinted (the start says so), and a change there
 needs `--recreate`. The digest key is `~/.config/noo/start-inputs.key`

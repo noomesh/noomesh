@@ -11,7 +11,7 @@ proof relies on and nothing more: `config --format json` merges the -f files
 (labels merged), resolves bind and secret paths; `up -d` recreates a
 service's container when its config hash (labels included) changed or under
 --force-recreate, and keeps a dependent's container. With the label taken out
-of the launcher's override, case 2 and 3 go red here too.
+of the launcher's override, cases 3 and 8 go red here too.
 """
 
 from __future__ import annotations
@@ -131,7 +131,7 @@ def test_every_case_passes_against_the_model(tmp_path: Path) -> None:
     r = subprocess.run(["bash", str(RUN)], env=env, capture_output=True, text=True, timeout=300)
     out = r.stdout + r.stderr
     assert r.returncode == 0, out
-    for n in range(1, 8):
+    for n in range(1, 9):
         assert f"START-INPUTS {n} PASS" in out, out
     assert "FAIL" not in out, out
     assert "START-INPUTS: all cases PASS" in out
@@ -158,4 +158,27 @@ def test_a_missing_label_fails_the_change_cases(tmp_path: Path) -> None:
                        text=True, timeout=300)
     out = r.stdout + r.stderr
     assert r.returncode == 1, out
-    assert "START-INPUTS 2 FAIL" in out and "START-INPUTS 3 FAIL" in out, out
+    assert "START-INPUTS 8 FAIL" in out and "START-INPUTS 3 FAIL" in out, out
+
+
+def test_a_secret_fingerprinted_for_its_first_reader_only_fails_case_8(tmp_path: Path) -> None:
+    """Red-on-revert for the shared secret: only the first reader's label moves."""
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    for f in (ROOT / "scripts").glob("lib-*.sh"):
+        (scripts / f.name).write_text(f.read_text())
+    src = (ROOT / "scripts" / "noo-start-inputs.py").read_text()
+    old = '            add_file(f, "secret")'
+    assert src.count(old) == 1
+    (scripts / "noo-start-inputs.py").write_text(src.replace(
+        old, '            if ("first", f) not in said:\n                said.add(("first", f)); add_file(f, "secret")'))
+    (scripts / "test-start-inputs").mkdir()
+    for f in ("run.sh", "compose.yml"):
+        (scripts / "test-start-inputs" / f).write_text((ROOT / "scripts" / "test-start-inputs" / f).read_text())
+    b = _fake_bin(tmp_path)
+    env = {"PATH": f"{b}:{os.environ['PATH']}", "HOME": str(tmp_path), "NOO_TEST_IMAGE": IMAGE,
+           "FAKE_DOCKER_STATE": str(tmp_path / "docker.json"), "TMPDIR": str(tmp_path)}
+    r = subprocess.run(["bash", str(scripts / "test-start-inputs" / "run.sh")], env=env, capture_output=True,
+                       text=True, timeout=300)
+    out = r.stdout + r.stderr
+    assert r.returncode == 1 and "START-INPUTS 8 FAIL" in out, out
