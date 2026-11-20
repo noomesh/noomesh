@@ -273,7 +273,7 @@ def test_a_tampered_stack_lock_still_refuses_the_whole_restart(tmp_path: Path) -
 
 def test_the_start_launcher_stops_refused_addons_and_says_what_did_not_start() -> None:
     start = (ROOT / "scripts/noomesh-start.sh").read_text()
-    up = start.index("noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d $START_UP_FORCE")
+    up = start.index("start_inputs_full_up $BUILD_FLAG $GPU_SCALE $AGENT_SCALE $ADDON_HOLD_SCALE")
     stop = start.index("    addons_stop_leftovers addons_stop_refused || exit 1\n")
     assert up < stop, "start stops a refused add-on's leftover container after `up`"
     assert stop < start.index('ui_close_warned "Services started WITHOUT add-on(s)'), "and fails before any success line"
@@ -282,7 +282,7 @@ def test_the_start_launcher_stops_refused_addons_and_says_what_did_not_start() -
     # A declared-off add-on is removed BEFORE the whole-stack up, by every
     # launcher (ctrl 2026-11-05: start exited before its after-up stop ran,
     # and restart never handled a declared-off add-on at all).
-    for name, up_line in [("noomesh-start.sh", "noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d $START_UP_FORCE"),
+    for name, up_line in [("noomesh-start.sh", "start_inputs_full_up $BUILD_FLAG $GPU_SCALE $AGENT_SCALE $ADDON_HOLD_SCALE"),
                           ("noomesh-restart.sh", "noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d --no-build --force-recreate"),
                           ("noomesh-rebuild.sh", "docker compose $COMPOSE_FILES $PROFILE_ARGS up -d --force-recreate ${RECREATE_SERVICES}")]:
         src = (ROOT / "scripts" / name).read_text()

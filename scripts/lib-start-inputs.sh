@@ -20,9 +20,8 @@
 # file or a new PKI leaf recreates its services, and nothing else moves.
 #
 # --force-recreate stays for:
-#   - `noo stack start --recreate` / NOO_START_RECREATE=1 (the explicit force;
-#     `noo upgrade` and onboard's own start pass the env form, which an older
-#     launcher ignores instead of reading it as a service name);
+#   - `noo stack start --recreate` (the explicit force; `noo upgrade` and
+#     onboard's own Service Setup start pass it too);
 #   - a host where the fingerprint cannot be computed (no python3, an
 #     unrenderable config): today's behaviour, said.
 # A key that exists but cannot be read REFUSES the start (exit 1): there is no
@@ -151,10 +150,47 @@ start_inputs_report() {
         if [ "$_first" = 1 ]; then ui_kv "Containers" "$_line"; _first=0; else ui_note "$_line"; fi
     done < <(python3 "$_START_INPUTS_PY" report --before "$1" --after "$2" \
         --old-state "$START_INPUTS_STATE" --new-state "$START_INPUTS_STATE.new" \
-        --root "$PWD" --secret-dir "${NOO_SECRET_RUNDIR:-}" 2>/dev/null)
+        --root "$PWD" --secret-dir "${NOO_SECRET_RUNDIR:-}" ${START_UP_FORCE:+--forced} 2>/dev/null)
     if [ -f "$START_INPUTS_STATE.new" ]; then
         mv -f "$START_INPUTS_STATE.new" "$START_INPUTS_STATE" 2>/dev/null || true
     fi
     rm -f "$1" "$2" 2>/dev/null
+    return 0
+}
+
+# start_inputs_full_up [up flags...] — the launcher's whole-stack `up`
+# (noomesh-start.sh, no service names), and the one CI drives against a real
+# compose (scripts/test-start-inputs/run.sh): label, snapshot,
+#   noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d $START_UP_FORCE <flags>
+# snapshot, say what moved. Returns the `up`'s status (75 = partial, see
+# lib-stuck-container.sh), or 1 when start_inputs_prepare refused.
+start_inputs_full_up() {
+    local _b _a _rc=0
+    start_inputs_prepare || return 1
+    _b="$(mktemp)"; _a="$(mktemp)"
+    start_inputs_snapshot "$_b"
+    # shellcheck disable=SC2086  # word lists by design
+    noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d $START_UP_FORCE "$@" || _rc=$?
+    if [ "$_rc" -ne 0 ] && [ "$_rc" -ne "${NOO_EXIT_STACK_PARTIAL:-75}" ]; then
+        rm -f "$_b" "$_a"
+        return "$_rc"
+    fi
+    start_inputs_snapshot "$_a"
+    start_inputs_report "$_b" "$_a"
+    return "$_rc"
+}
+
+# start_inputs_named_up SERVICE... — the launcher's `up` of named services,
+# with the same labels.
+start_inputs_named_up() {
+    local _b _a _rc=0
+    start_inputs_prepare || return 1
+    _b="$(mktemp)"; _a="$(mktemp)"
+    start_inputs_snapshot "$_b"
+    # shellcheck disable=SC2086
+    docker compose $COMPOSE_FILES $PROFILE_ARGS up -d $START_UP_FORCE "$@" || _rc=$?
+    if [ "$_rc" -ne 0 ]; then rm -f "$_b" "$_a"; return "$_rc"; fi
+    start_inputs_snapshot "$_a"
+    start_inputs_report "$_b" "$_a"
     return 0
 }

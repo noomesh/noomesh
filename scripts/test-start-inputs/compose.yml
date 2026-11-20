@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+#
+# The project scripts/test-start-inputs/run.sh starts through the launcher's
+# own start_inputs_full_up (lib-start-inputs.sh) against a real compose:
+#   a  takes a `secrets: file:` source
+#   b  bind-mounts a config FILE
+#   c  has neither, and depends on a
+# NOO_TEST_IMAGE is a pinned image (run.sh refuses an unpinned one).
+services:
+  a:
+    image: ${NOO_TEST_IMAGE:?set NOO_TEST_IMAGE to a digest-pinned image}
+    command: ["tail", "-f", "/dev/null"]
+    init: true
+    secrets: [a_secret]
+  b:
+    image: ${NOO_TEST_IMAGE:?set NOO_TEST_IMAGE to a digest-pinned image}
+    command: ["tail", "-f", "/dev/null"]
+    init: true
+    volumes:
+      - ./b.conf:/etc/b.conf:ro
+  c:
+    image: ${NOO_TEST_IMAGE:?set NOO_TEST_IMAGE to a digest-pinned image}
+    command: ["tail", "-f", "/dev/null"]
+    init: true
+    depends_on: [a]
+secrets:
+  a_secret:
+    file: ./secrets/a.txt

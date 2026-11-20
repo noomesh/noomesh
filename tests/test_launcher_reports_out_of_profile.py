@@ -83,7 +83,7 @@ def test_the_record_names_the_project_and_the_active_services(tmp_path: Path) ->
 
 def test_the_launcher_calls_both_after_its_whole_stack_up() -> None:
     src = (SCRIPTS / "noomesh-start.sh").read_text()
-    up = src.index("up -d $START_UP_FORCE")
+    up = src.index("start_inputs_full_up $BUILD_FLAG")
     rec = src.index('compose_record_active . "$ACTIVE_SVCS"')
     rep = src.index('compose_report_out_of_profile . "$ACTIVE_SVCS"')
     assert up < rec < rep, "after the up, record then report"

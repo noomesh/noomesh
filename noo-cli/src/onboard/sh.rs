@@ -917,23 +917,24 @@ pub fn ghcr_logged_in() -> bool {
 /// check, compose overlay) lives in exactly one place. No [`launcher_env`]:
 /// the script IS the launcher and exports that env itself. Dry-run prints
 /// and returns 0.
-pub fn run_script_streamed(ctx: &Ctx, script: &str, args: &[&str]) -> i32 {
-    run_script_streamed_env(ctx, script, args, &[])
+/// Does the launcher at `script` take `--recreate`? The CLI runs the
+/// launcher ON DISK, which can be older than this binary: a checkout
+/// (`repo_root` from the cwd), a standalone slice kept at the stack's release
+/// until `noo upgrade --stack` moves the pin (i458), or an external
+/// `--bundle`. An older launcher reads an unknown word as a service name,
+/// and forces every full start anyway, so it is simply not passed there.
+pub(crate) fn launcher_takes_recreate(script: &std::path::Path) -> bool {
+    std::fs::read_to_string(script).is_ok_and(|s| s.contains("\n        --recreate)"))
 }
 
-/// [`run_script_streamed`] with extra environment for the script (e.g.
-/// `NOO_START_RECREATE=1`, which an older launcher ignores where it would
-/// read an unknown flag as a service name).
-pub fn run_script_streamed_env(ctx: &Ctx, script: &str, args: &[&str], envs: &[(&str, &str)]) -> i32 {
+pub fn run_script_streamed(ctx: &Ctx, script: &str, args: &[&str]) -> i32 {
     if ctx.dry_run {
-        let pre: String = envs.iter().map(|(k, v)| format!("{k}={v} ")).collect();
-        ctx.dry(&format!("{pre}bash scripts/{script} {}", args.join(" ")));
+        ctx.dry(&format!("bash scripts/{script} {}", args.join(" ")));
         return 0;
     }
     let mut cmd = Command::new("bash");
     cmd.arg(ctx.repo_root.join("scripts").join(script))
         .args(args)
-        .envs(envs.iter().copied())
         .current_dir(&ctx.repo_root)
         .stdin(Stdio::null());
     // Same binary, not whatever's on PATH — see mesh.rs::run_script for why.
@@ -1849,5 +1850,25 @@ mod failure_tail_tests {
         assert_eq!(tail.len(), SUMMARY_TAIL_LINES);
         assert_eq!(tail.last().map(String::as_str), Some("line100"));
         assert_eq!(tail.first().map(String::as_str), Some("line61"));
+    }
+}
+
+#[cfg(test)]
+mod launcher_recreate_tests {
+    use super::launcher_takes_recreate;
+
+    #[test]
+    fn only_a_launcher_with_the_case_takes_recreate() {
+        let dir = crate::private_tmp::Dir::new("noo-recreate-flag").unwrap();
+        let new = dir.path().join("new.sh");
+        let old = dir.path().join("old.sh");
+        std::fs::write(&new, "case $1 in\n        --dist)      DIST=true; shift ;;\n        --recreate)  START_RECREATE=true; shift ;;\nesac\n").unwrap();
+        std::fs::write(&old, "case $1 in\n        --dist)      DIST=true; shift ;;\nesac\n# --recreate is not a case here\n").unwrap();
+        assert!(launcher_takes_recreate(&new));
+        assert!(!launcher_takes_recreate(&old));
+        assert!(!launcher_takes_recreate(&dir.path().join("absent.sh")));
+        // The real launcher has the case.
+        let real = include_str!("../../../scripts/noomesh-start.sh");
+        assert!(real.contains("\n        --recreate)"));
     }
 }

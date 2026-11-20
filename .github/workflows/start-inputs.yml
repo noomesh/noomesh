@@ -1,0 +1,99 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# A plain `noo stack start` recreates only the containers whose inputs
+# changed, proven against a REAL docker compose: the launcher's own
+# start_inputs_full_up (scripts/lib-start-inputs.sh) on a three-service
+# project (scripts/test-start-inputs/run.sh). Unit tests cannot show what
+# compose does with a label change, a dependent, or --force-recreate.
+#
+# Two legs: the runner's compose, and v2.24.6, the oldest compose v2 the
+# documented install route lands on (Ubuntu 24.04's docker-compose-v2 in the
+# release pocket; the docs ask only for "the Compose v2 plugin"). That one is
+# a pinned release binary, checked against its sha256 before use.
+# GitHub-hosted only (no secrets, read-only token).
+name: start-inputs
+
+on:
+  pull_request:
+    branches: [ main, staging, develop, dev ]
+    paths:
+      - 'scripts/noomesh-start.sh'
+      - 'scripts/lib-start-inputs.sh'
+      - 'scripts/noo-start-inputs.py'
+      - 'scripts/lib-stuck-container.sh'
+      - 'scripts/test-start-inputs/**'
+      - '.github/workflows/start-inputs.yml'
+  # A merge group has no path filter: the queue builds it, this lane reports.
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: start-inputs-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  start-inputs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        compose: [ runner, v2.24.6 ]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Per-job credential store (tests/test_workflow_docker_login_isolation.py);
+      # the compose plugin of the pinned leg goes in ITS cli-plugins dir, which
+      # the docker CLI searches first.
+      - name: Per-job Docker config and GHCR login
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          export DOCKER_CONFIG="$RUNNER_TEMP/.docker"
+          mkdir -p "$DOCKER_CONFIG"
+          echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin \
+            || echo "::warning::ghcr.io login failed — the mirror check will fall back to Docker Hub"
+
+      - name: Pinned compose ${{ matrix.compose }}
+        if: matrix.compose != 'runner'
+        env:
+          COMPOSE_VERSION: ${{ matrix.compose }}
+          # docker/compose release v2.24.6, docker-compose-linux-x86_64.sha256
+          COMPOSE_SHA256: eca30ae32dc451f9e6d6c8ddce078a76f23b355c3ca0ab391d58f59e87c0d310
+        run: |
+          mkdir -p "$DOCKER_CONFIG/cli-plugins"
+          f="$DOCKER_CONFIG/cli-plugins/docker-compose"
+          curl -fsSL --retry 3 -o "$f" \
+            "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64"
+          echo "${COMPOSE_SHA256}  $f" | sha256sum -c -
+          chmod +x "$f"
+
+      - name: Compose in use
+        run: docker compose version
+
+      # The pinned alpine the rotation rehearsal uses, from the GHCR mirror
+      # (.github/hub-mirror.txt); Docker Hub on a miss, same digest.
+      - name: Test image from the mirror (Hub on a miss)
+        env:
+          HUB_MIRROR: ${{ vars.HUB_MIRROR }}
+          HUB_MIRROR_OFF: ${{ vars.HUB_MIRROR_OFF }}
+        run: |
+          pin=library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+          ref="$(python3 scripts/hub-mirror.py ref "$pin")" || ref=""
+          if [ -z "$ref" ]; then
+            echo "::warning::hub-mirror.py gave no image — alpine:3.20 from Docker Hub"
+            ref="docker.io/$pin"
+          fi
+          echo "NOO_TEST_IMAGE=$ref" >> "$GITHUB_ENV"
+
+      - name: A plain start recreates only what changed (real compose)
+        run: bash scripts/test-start-inputs/run.sh
