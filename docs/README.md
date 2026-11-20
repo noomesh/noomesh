@@ -102,7 +102,7 @@ the binary's own usage table by `scripts/gen-cli-docs.py`.
 |----------|-------------|
 | [channels/telegram.md](channels/telegram.md) | Telegram channel: one bot, one token, your user id |
 | [channels/google-chat.md](channels/google-chat.md) | Google Chat channel: GCP project, service account, Pub/Sub, and what the wizard does with them |
-| [channels/google-connections.md](channels/google-connections.md) | Private Google account authorization, encrypted credentials, Drive/Gmail selections and provider extension points |
+| [channels/google-connections.md](channels/google-connections.md) | Moved: the Connections API, ownership, personal sync and the OAuth lifecycle are in getting-started/integrations.md |
 | [channels/mcp-your-client.md](channels/mcp-your-client.md) | Connecting your own Claude Code (or any MCP client) to noomesh with a self-minted MCP key |
 
 ## Security
