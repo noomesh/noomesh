@@ -252,7 +252,7 @@ def image_parts(ref):
     if not ref or re.fullmatch(r"(sha256:)?[0-9a-f]{12,64}", ref):
         return None, ref
     first, sep, rest = ref.partition("/")
-    if sep and ("." in first or ":" in first or first == "localhost"):
+    if sep and ("." in first or ":" in first):
         host, path = first, rest
     else:
         host, path = "docker.io", ref
