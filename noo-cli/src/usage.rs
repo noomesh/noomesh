@@ -553,7 +553,7 @@ mod tests {
             assert!(!line.contains("break-glass") && !line.contains("BREAK_GLASS"), "{line}");
         }
         let main = include_str!("main.rs");
-        let banner = main.split("ui::muted(\"Globals:").nth(1).expect("the globals banner").split('\n').next().unwrap();
+        let banner = main.split("\"Globals:").nth(1).expect("the globals banner").split('\n').next().unwrap();
         assert!(!banner.contains("break-glass"), "{banner}");
     }
 
