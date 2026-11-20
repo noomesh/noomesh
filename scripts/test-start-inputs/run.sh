@@ -254,7 +254,15 @@ expect 10 "b" "$a10b" "$a10c" "b.conf changed, reload recorded for ANOTHER conta
 NATS_RELOADED="Reloaded server configuration"
 NATS_RELOAD_FAILED="Failed to reload server configuration"
 NATS_PROJECT="${COMPOSE_PROJECT_NAME}-nats"
-export NOO_TEST_NATS_IMAGE="${NOO_TEST_NATS_IMAGE:-ghcr.io/noomesh/nats:2.14.9@sha256:f0e72e96696382cc1e5bc637befd3177bb2d5b07c37fb507f8edd09827a342a3}"
+# The stack's own nats pin, read from the compose file (the image namespace is
+# never typed out: tests/test_image_namespace_declarations.py), so this case
+# runs exactly the nats a release ships.
+nats_compose_image() {
+    sed -n 's/.*image: [$]{NATS_IMAGE:-\([^$]*\)[$]{NOO_IMAGE_DIGEST_NATS:-\(@sha256:[0-9a-f]*\)}}.*/\1\2/p' \
+        "$HERE/../../docker-compose.cluster.yml" | head -1
+}
+export NOO_TEST_NATS_IMAGE="${NOO_TEST_NATS_IMAGE:-$(nats_compose_image)}"
+[ -n "$NOO_TEST_NATS_IMAGE" ] || { echo "case 11: no nats image in docker-compose.cluster.yml"; exit 1; }
 start_nats() {
     ( cd "$WORK/nats" || exit 1
       export COMPOSE_PROJECT_NAME="$NATS_PROJECT"

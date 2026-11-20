@@ -157,7 +157,7 @@ def _fake_bin(tmp: Path) -> Path:
 @pytest.mark.skipif(os.getuid() == 0, reason="case 6 needs a non-root user")
 def test_every_case_passes_against_the_model(tmp_path: Path) -> None:
     b = _fake_bin(tmp_path)
-    env = {"PATH": f"{b}:{os.environ['PATH']}", "HOME": str(tmp_path), "NOO_TEST_IMAGE": IMAGE,
+    env = {"PATH": f"{b}:{os.environ['PATH']}", "HOME": str(tmp_path), "NOO_TEST_IMAGE": IMAGE, "NOO_TEST_NATS_IMAGE": IMAGE,
            "FAKE_DOCKER_STATE": str(tmp_path / "docker.json"), "TMPDIR": str(tmp_path)}
     r = subprocess.run(["bash", str(RUN)], env=env, capture_output=True, text=True, timeout=300)
     out = r.stdout + r.stderr
@@ -183,7 +183,7 @@ def test_a_missing_label_fails_the_change_cases(tmp_path: Path) -> None:
         if (ROOT / "scripts" / f).exists():
             (scripts / f).write_text((ROOT / "scripts" / f).read_text())
     b = _fake_bin(tmp_path)
-    env = {"PATH": f"{b}:{os.environ['PATH']}", "HOME": str(tmp_path), "NOO_TEST_IMAGE": IMAGE,
+    env = {"PATH": f"{b}:{os.environ['PATH']}", "HOME": str(tmp_path), "NOO_TEST_IMAGE": IMAGE, "NOO_TEST_NATS_IMAGE": IMAGE,
            "FAKE_DOCKER_STATE": str(tmp_path / "docker.json"), "TMPDIR": str(tmp_path)}
     r = subprocess.run(["bash", str(scripts / "test-start-inputs" / "run.sh")], env=env, capture_output=True,
                        text=True, timeout=300)
@@ -207,7 +207,7 @@ def test_a_secret_fingerprinted_for_its_first_reader_only_fails_case_8(tmp_path:
     for f in ("run.sh", "compose.yml", "compose-nats.yml"):
         (scripts / "test-start-inputs" / f).write_text((ROOT / "scripts" / "test-start-inputs" / f).read_text())
     b = _fake_bin(tmp_path)
-    env = {"PATH": f"{b}:{os.environ['PATH']}", "HOME": str(tmp_path), "NOO_TEST_IMAGE": IMAGE,
+    env = {"PATH": f"{b}:{os.environ['PATH']}", "HOME": str(tmp_path), "NOO_TEST_IMAGE": IMAGE, "NOO_TEST_NATS_IMAGE": IMAGE,
            "FAKE_DOCKER_STATE": str(tmp_path / "docker.json"), "TMPDIR": str(tmp_path)}
     r = subprocess.run(["bash", str(scripts / "test-start-inputs" / "run.sh")], env=env, capture_output=True,
                        text=True, timeout=300)
@@ -227,7 +227,7 @@ def _run_with_helper(tmp_path: Path, helper_src: str, run: str | None = None) ->
     if run is not None:
         (scripts / "test-start-inputs" / "run.sh").write_text(run)
     b = _fake_bin(tmp_path)
-    env = {"PATH": f"{b}:{os.environ['PATH']}", "HOME": str(tmp_path), "NOO_TEST_IMAGE": IMAGE,
+    env = {"PATH": f"{b}:{os.environ['PATH']}", "HOME": str(tmp_path), "NOO_TEST_IMAGE": IMAGE, "NOO_TEST_NATS_IMAGE": IMAGE,
            "FAKE_DOCKER_STATE": str(tmp_path / "docker.json"), "TMPDIR": str(tmp_path)}
     r = subprocess.run(["bash", str(scripts / "test-start-inputs" / "run.sh")], env=env, capture_output=True,
                        text=True, timeout=300)
