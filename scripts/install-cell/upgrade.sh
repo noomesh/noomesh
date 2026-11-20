@@ -111,6 +111,20 @@ step before-roll 120 -- bash -c '
   python3 "$3" before "$2/verify-before.json" "$1"
 ' before "$SELF" "$J" "$HERE/upgrade_judge.py"
 
+# The Docker daemon's own record of the new version's roll: image + container
+# events from here to the end of the plain start after the upgrade (UPGRADE
+# NO-DOCKERHUB judges them: no Docker Hub pull, no Docker Hub container).
+# Started AFTER the previous final's onboard and start (which may pull
+# alpine), stopped by PID, never by pattern. When the operator is not in the
+# docker group yet, the watcher is sudo's, and so is its stop.
+DOCKER="docker"; docker info >/dev/null 2>&1 || DOCKER="sudo -n docker"
+mkdir -p "$OUT/logs"
+$DOCKER events --format '{{json .}}' --filter type=image --filter type=container \
+    > "$OUT/logs/docker-events-upgrade.jsonl" 2> "$OUT/logs/docker-events-upgrade.err" < /dev/null &
+EVENTS_PID=$!
+echo "$EVENTS_PID" > "$J/docker-events.pid"
+sleep 1
+
 # ── 3. the roll: --all to the release under test ────────────────────────────
 ROLL_T0="$(date +%s)"
 step upgrade-all 3600 -- noo upgrade --all --version "$TARGET" --yes
@@ -159,6 +173,12 @@ step start-after-upgrade 1800 -- sh -c 'python3 "$1" snap "$2/start-after.before
   noo stack start; rc=$?
   python3 "$1" snap "$2/start-after.after"
   exit $rc' _ "$HERE/recreated.py" "$J"
+
+# The window ends here: `noo upgrade --all`, the same-tag `--stack` (with the
+# cell's remove-netns-unit step between them) and the plain start. Not chat-after.
+sleep 1
+if [ "$DOCKER" = "docker" ]; then kill "$EVENTS_PID" 2>/dev/null; else sudo -n kill "$EVENTS_PID" 2>/dev/null; fi
+wait "$EVENTS_PID" 2>/dev/null
 
 # ── 5. a chat answer after both ────────────────────────────────────────────
 step chat-after 900 -- noo chat --message "Reply with the single word ok."
