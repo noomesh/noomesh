@@ -74,3 +74,28 @@ def test_setup_and_host_doctor_docker_clean_line_is_doctors():
     assert m.group(1) == printed, f"doc quotes {m.group(1)!r}; the CLI prints {printed!r}"
     probe = _read("scripts/install-cell/run.sh")
     assert f'grep -qi "{words}"' in probe, "the install-cell doctor-docker probe must match doctor's words without case"
+
+
+def test_addons_md_publish_failures_are_the_clis():
+    """docs/development/addons.md tells an add-on developer what a plain-http
+    or untrusted registry shows (rc.1 rehearsal: a plain registry:2 was
+    refused over https and told to get a token). Each quote is a string the
+    CLI prints, and the port sentence is the root check's rule."""
+    doc = _flat(_read("docs/development/addons.md"))
+    fetch = _read("noo-cli/src/release_fetch.rs")
+    publish = _read("noo-cli/src/addons/lock_publish.rs")
+    cmd = _read("noo-cli/src/commands/addon_lock_cmd.rs")
+    for quote, src, where in [
+        ("addon_lock_publish_failed", cmd, '"addon_lock_publish_failed"'),
+        ("network error", fetch, 'FetchClass::Network => "network error"'),
+        ("TLS verification failed", fetch, 'FetchClass::Tls => "TLS verification failed"'),
+        ("the registry did not answer over https", publish, 'PublishFailure::Network => "the registry did not answer over https'),
+    ]:
+        assert f"`{quote}`" in doc, f"addons.md no longer quotes `{quote}`"
+        assert where in src, f"the CLI no longer prints {quote!r} ({where})"
+    assert "e.kind.hint()" in cmd, "the publish failure's hint is no longer chosen by its kind"
+    assert "a port is not accepted yet" in doc
+    root = _read("noo-cli/src/addon_lock.rs")
+    body = root[root.index("pub fn valid_registry_root"):]
+    body = body[: body.index("\n}\n")]
+    assert "!root.contains(':')" in body, "a registry root may now carry a port: update addons.md's port sentence"

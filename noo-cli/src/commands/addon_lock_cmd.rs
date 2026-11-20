@@ -318,8 +318,7 @@ pub fn security_addon_lock_publish(g: &Globals, args: &[String]) -> Result<i32, 
     let fetcher = lock_fetch::Client::new(None).with_bound(bound);
     let out = match lock_publish::publish(&pusher, &fetcher, &registry, &plan) {
         Ok(o) => o,
-        Err(e) => fail(g.json, ExitCode::Generic, "addon_lock_publish_failed", &e,
-            Some("a push needs a token that can write the package (--token-file, or GH_TOKEN); a read-back failure means the registry does not serve what was pushed, so nothing under that tag is safe to upgrade to")),
+        Err(e) => fail(g.json, ExitCode::Generic, "addon_lock_publish_failed", &e.message, Some(e.kind.hint())),
     };
     let uploaded: usize = out.iter().map(|p| p.uploaded).sum();
     let published: Vec<String> = out.iter().map(|p| p.reference.clone()).collect();
