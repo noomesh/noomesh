@@ -75,6 +75,7 @@ pub mod logs;
 pub mod mcp;
 pub mod memory;
 pub mod mesh;
+pub mod nats_reload;
 pub mod nats_users;
 pub mod controller;
 pub mod migrate;

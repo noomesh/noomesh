@@ -28,9 +28,15 @@
 # unkeyed fallback, because the label is readable by anyone with docker read
 # access.
 #
-# The state file ($START_INPUTS_STATE, 0600) only serves the message ("recreated
+# The state file ($START_INPUTS_STATE, 0600) serves the message ("recreated
 # gateway: its inputs changed (secret noo_jwt_secret)"); it holds per-file
-# KEYED values, never a raw digest. The label is the mechanism.
+# KEYED values, never a raw digest. The label is the mechanism. One exception
+# reads it: a file a running service has RELOADED (nats re-reads users.conf on
+# a SIGHUP; `noo` records a confirmed reload there, per container id): the
+# label keeps what that container was made on while the file still holds what
+# it loaded, so a provision's users.conf does not recreate nats (#1412 did:
+# every node's NATS link dropped once). --containers tells the helper which
+# container runs each service now; a recreated nats never inherits a record.
 [ -n "${_NOO_LIB_START_INPUTS_LOADED:-}" ] && return 0
 _NOO_LIB_START_INPUTS_LOADED=1
 
@@ -71,7 +77,7 @@ start_inputs_secret_digests() {
 # were computed, appends the override to $COMPOSE_FILES. 1 = refused (the key
 # cannot be read); the caller exits before `up`.
 start_inputs_prepare() {
-    local _json _rc _dd _v _only _s
+    local _json _rc _dd _v _only _s _cs
     START_UP_FORCE=""
     if [ "${START_RECREATE:-false}" = true ]; then
         START_UP_FORCE="--force-recreate"
@@ -96,14 +102,22 @@ start_inputs_prepare() {
     # A recreate outside a start records only the services it recreates.
     _only=()
     for _s in ${START_INPUTS_ONLY:-}; do _only+=(--only "$_s"); done
+    # Which container runs each service now: a reload record applies only to
+    # the container it was taken on. Only read when there is a record.
+    _cs=""
+    if [ -f "$START_INPUTS_STATE" ] && grep -q '"reloaded"' "$START_INPUTS_STATE" 2>/dev/null; then
+        _cs="$(mktemp)"
+        start_inputs_snapshot "$_cs"
+    fi
     _rc=0
     printf '%s' "$_json" | python3 "$_START_INPUTS_PY" fingerprint \
         --key-file "$(start_inputs_key_file)" --root "$PWD" \
         --pki-dir "$(_start_inputs_abs "$(_start_inputs_env NOO_PKI_DIR)")" \
-        "${_dd[@]+"${_dd[@]}"}" "${_only[@]+"${_only[@]}"}" \
+        "${_dd[@]+"${_dd[@]}"}" "${_only[@]+"${_only[@]}"}" ${_cs:+--containers "$_cs"} \
         --secret-digests "${NOO_SECRET_RUNDIR:-/nonexistent}/$START_INPUTS_SECRET_CACHE_NAME" \
         --old-state "$START_INPUTS_STATE" \
         --override-out "$START_INPUTS_OVERRIDE" --state-out "$START_INPUTS_STATE.new" || _rc=$?
+    if [ -n "$_cs" ]; then rm -f "$_cs"; fi
     case "$_rc" in
         0) COMPOSE_FILES="$COMPOSE_FILES -f $START_INPUTS_OVERRIDE" ;;
         3) echo "       Nothing was started. The key only lets the start tell which secret and config files changed." >&2

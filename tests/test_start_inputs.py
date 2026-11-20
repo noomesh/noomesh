@@ -571,11 +571,14 @@ def _onboard_install(tmp_path: Path):
     }
     state = tmp_path / "start-inputs.json"
 
-    def start(tag: str, only: tuple[str, ...] = ()) -> dict[str, str]:
+    def start(tag: str, only: tuple[str, ...] = (), ids: dict[str, str] | None = None) -> dict[str, str]:
+        snap = []
+        if ids is not None:  # lib-start-inputs.sh: --containers when a reload is recorded
+            snap = ["--containers", str(_snap(tmp_path / f"c{tag}.txt", {s: (c, "running") for s, c in ids.items()}))]
         res = subprocess.run(
             ["python3", str(HELPER), "fingerprint", "--key-file", str(i.key), "--root", str(r),
              "--pki-dir", str(pki), "--old-state", str(state),
-             *[x for s in only for x in ("--only", s)],
+             *[x for s in only for x in ("--only", s)], *snap,
              "--override-out", str(tmp_path / f"o{tag}.yml"), "--state-out", f"{state}.new"],
             input=json.dumps(cfg), capture_output=True, text=True, timeout=60)
         assert res.returncode == 0, res.stderr
@@ -586,14 +589,33 @@ def _onboard_install(tmp_path: Path):
     return i, r, d, pki, state, start
 
 
-def _up(carried: dict[str, str], labels: dict[str, str], only: tuple[str, ...] = (), force: bool = False) -> set[str]:
+def _up(carried: dict[str, str], labels: dict[str, str], only: tuple[str, ...] = (), force: bool = False,
+        ids: dict[str, str] | None = None) -> set[str]:
     """compose `up`: a container is recreated when its label differs (or
-    --force-recreate); it then carries the label it was made with. `only` =
-    the services named on a targeted `up` (none = all)."""
+    --force-recreate); it then carries the label it was made with, and (ids)
+    a new container id. `only` = the services named on a targeted `up`
+    (none = all)."""
     targets = set(only) or set(labels)
     moved = {s for s in targets if force or carried.get(s) != labels[s]}
     carried.update({s: labels[s] for s in moved})
+    if ids is not None:
+        ids.update({s: f"{s}-{os.urandom(6).hex()}" for s in moved})
     return moved
+
+
+def _record_reload(state: Path, key_file: Path, service: str, container: str, conf: Path,
+                   confirmed: bool = True) -> None:
+    """What `noo` writes after a HUP (noo-cli nats_reload.rs record_in_state):
+    the keyed value of the content the container re-read, under its id; null
+    when the reload was not confirmed. The Rust side's vectors
+    (nats_reload::tests::hmac_matches_python) pin the same values."""
+    key = key_file.read_bytes()
+    real = os.path.realpath(conf)
+    doc = json.loads(state.read_text())
+    assert doc["key_id"] == SI.key_id(key)
+    paths = {real: SI.reload_value(key, real, _sha(conf)) if confirmed else None}
+    doc.setdefault("reloaded", {})[service] = {"container": container, "paths": paths}
+    state.write_text(json.dumps(doc))
 
 
 def test_onboard_sequence_then_start_recreates_nothing(tmp_path: Path) -> None:
@@ -610,31 +632,193 @@ def test_onboard_sequence_then_start_recreates_nothing(tmp_path: Path) -> None:
       service keys, `restart --force worker trellion`   labelled
       the model step writes noomesh.yaml
       posture `restart --force gateway`           labelled (after every gateway write)
-      converge_stack: the plain start             EXACTLY nats, worker, trellion
+      converge_stack: the plain start             EXACTLY worker, trellion (nats re-read
+                                                  users.conf on the HUP: recorded)
       the operator's `noo stack start`            nothing
     and a later edit of noomesh.yaml still recreates its three readers."""
-    _, r, d, pki, _, start = _onboard_install(tmp_path)
+    i, r, d, pki, state, start = _onboard_install(tmp_path)
     carried: dict[str, str] = {}
-    assert _up(carried, start("svc"), force=True) == {"gateway", "nats", "worker", "trellion", "redis"}
+    ids: dict[str, str] = {}
+    assert _up(carried, start("svc", ids=ids), force=True, ids=ids) == {"gateway", "nats", "worker", "trellion", "redis"}
     (pki / "public" / "nodes" / "self").mkdir()
     (pki / "public" / "nodes" / "self" / "birth.crt").write_text("-----BEGIN CERTIFICATE-----\n")
-    (r / "monitoring" / "nats" / "users.conf").write_text("users: [gateway, worker, node-self]\n")
+    users = r / "monitoring" / "nats" / "users.conf"
+    users.write_text("users: [gateway, worker, node-self]\n")
+    # hup_nats: nats logged "Reloaded server configuration"; noo records it.
+    _record_reload(state, i.key, "nats", ids["nats"], users)
     (d / "noo_svc_key_worker").write_text("svc-worker-key")
     (d / "noo_svc_key_trellion").write_text("svc-trellion-key")
     keys = ("worker", "trellion")
-    assert _up(carried, start("keys", keys), keys, force=True) == set(keys)
+    assert _up(carried, start("keys", keys, ids=ids), keys, force=True, ids=ids) == set(keys)
     (r / "noomesh.yaml").write_text("cluster:\n  default_backend: ollama\n")
-    assert _up(carried, start("posture", ("gateway",)), ("gateway",), force=True) == {"gateway"}
+    assert _up(carried, start("posture", ("gateway",), ids=ids), ("gateway",), force=True, ids=ids) == {"gateway"}
 
-    # Onboard's last start: nats for users.conf (HUP-reloaded, but kept in the
-    # label until the reload is recorded), worker and trellion for the
-    # noomesh.yaml written after their recreate. NOT the gateway.
-    assert _up(carried, start("converge")) == {"nats", "trellion", "worker"}
+    # Onboard's last start: worker and trellion for the noomesh.yaml written
+    # after their recreate. NOT the gateway, and NOT nats: it re-read
+    # users.conf on the HUP and the reload is recorded for its container.
+    assert _up(carried, start("converge", ids=ids), ids=ids) == {"trellion", "worker"}
     # The install matrix's start-idempotent: nothing.
-    assert _up(carried, start("cell")) == set()
-    # #1412 still holds for a real change afterwards.
+    assert _up(carried, start("cell", ids=ids), ids=ids) == set()
+    # #1412 still holds for a real change afterwards, and for a hand edit of
+    # users.conf with no reload.
     (r / "noomesh.yaml").write_text("cluster:\n  default_backend: vllm\n")
-    assert _up(carried, start("edit")) == {"gateway", "worker", "trellion"}
+    assert _up(carried, start("edit", ids=ids), ids=ids) == {"gateway", "worker", "trellion"}
+    users.write_text("users: [gateway, worker, node-self, by-hand]\n")
+    assert _up(carried, start("hand", ids=ids), ids=ids) == {"nats"}
+    assert _up(carried, start("after", ids=ids), ids=ids) == set()
+
+
+def test_onboard_without_a_recorded_reload_still_recreates_nats(tmp_path: Path) -> None:
+    """The same onboard with the HUP unconfirmed (null record) or never
+    recorded: nats is recreated at the converge start, as before."""
+    for confirmed in (False, None):
+        sub = tmp_path / str(confirmed)
+        sub.mkdir()
+        i, r, d, pki, state, start = _onboard_install(sub)
+        carried: dict[str, str] = {}
+        ids: dict[str, str] = {}
+        _up(carried, start("svc", ids=ids), force=True, ids=ids)
+        users = r / "monitoring" / "nats" / "users.conf"
+        users.write_text("users: [gateway, worker, node-self]\n")
+        if confirmed is not None:
+            _record_reload(state, i.key, "nats", ids["nats"], users, confirmed=False)
+        assert _up(carried, start("converge", ids=ids), ids=ids) == {"nats"}, confirmed
+        assert _up(carried, start("cell", ids=ids), ids=ids) == set(), confirmed
+
+
+# ── a reloaded file: the comparison ─────────────────────────────────────────
+
+def _nats_install(tmp_path: Path):
+    i = Install(tmp_path)
+    users = i.root / "monitoring" / "nats" / "users.conf"
+    users.parent.mkdir(parents=True)
+    users.write_text("users: [gateway]\n")
+    tls = i.root / "monitoring" / "nats" / "nats-tls.conf"
+    tls.write_text("include users.conf\n")
+    cfg = {"services": {"nats": {"volumes": [
+        {"type": "bind", "source": str(tls), "target": "/etc/nats/nats-tls.conf", "read_only": True},
+        {"type": "bind", "source": str(users), "target": "/etc/nats/users.conf", "read_only": True}]}}}
+    state = tmp_path / "s.json"
+
+    def fp(tag: str, running: str | None, commit: bool = True) -> str:
+        """One start's fingerprint; commit = the `up` went through (a probe
+        that would recreate is not committed, so the next probe starts from
+        the same running container)."""
+        args = ["python3", str(HELPER), "fingerprint", "--key-file", str(i.key), "--root", str(i.root),
+                "--old-state", str(state), "--override-out", str(tmp_path / f"o{tag}.yml"),
+                "--state-out", str(state) + ".new"]
+        if running:
+            args += ["--containers", str(_snap(tmp_path / f"c{tag}.txt", {"nats": (running, "running")}))]
+        res = subprocess.run(args, input=json.dumps(cfg), capture_output=True, text=True, timeout=60)
+        assert res.returncode == 0, res.stderr
+        if commit:
+            os.replace(str(state) + ".new", state)
+        return re.search(r'noo\.inputs: "([0-9a-f]+)"', (tmp_path / f"o{tag}.yml").read_text()).group(1)
+
+    return i, users, tls, state, fp
+
+
+def test_a_recorded_reload_keeps_nats_and_nothing_else_does(tmp_path: Path) -> None:
+    """users.conf changed and nats re-read it (a recorded, confirmed HUP for
+    the running container): the label stays, so nats is NOT recreated. With
+    no record, a record for another container, an unconfirmed one, or a hand
+    edit after the reload: the label changes, so it IS."""
+    i, users, _, state, fp = _nats_install(tmp_path)
+    made = fp("0", "c1")                      # the running container's label
+    users.write_text("users: [gateway, node-a]\n")
+    assert fp("none", "c1", commit=False) != made, "no record: recreated"
+    _record_reload(state, i.key, "nats", "c0", users)
+    assert fp("other", "c1", commit=False) != made, "a record for another container id: recreated"
+    _record_reload(state, i.key, "nats", "c1", users, confirmed=False)
+    assert fp("unconfirmed", "c1", commit=False) != made, "an unconfirmed HUP: recreated"
+    _record_reload(state, i.key, "nats", "c1", users)
+    assert fp("recorded", "c1") == made, "the reload is recorded for this container: kept"
+    assert fp("again", "c1") == made, "and on every start after it"
+    assert fp("nosnap", None) == made, "the state's own record of what it loaded holds without a snapshot"
+    users.write_text("users: [gateway, node-a, by-hand]\n")
+    assert fp("hand", "c1") != made, "a hand edit after the reload, never reloaded: recreated"
+
+
+def test_a_file_put_back_after_a_reload_recreates_once(tmp_path: Path) -> None:
+    """nats re-read B; the file is then put back to A (what the container was
+    made on) by hand with no reload. The container runs B, so it must be
+    recreated, and the container that results must not be recreated again."""
+    i, users, _, state, fp = _nats_install(tmp_path)
+    made = fp("0", "c1")
+    users.write_text("users: [gateway, node-a]\n")
+    _record_reload(state, i.key, "nats", "c1", users)
+    assert fp("1", "c1") == made
+    users.write_text("users: [gateway]\n")
+    reverted = fp("2", "c1")
+    assert reverted != made, "the container runs B, the file says A: recreated"
+    assert fp("3", "c2") == reverted, "the new container (c2) read A at creation: kept"
+
+
+def test_a_reload_record_covers_only_the_file_it_names(tmp_path: Path) -> None:
+    i, users, tls, state, fp = _nats_install(tmp_path)
+    made = fp("0", "c1")
+    users.write_text("users: [gateway, node-a]\n")
+    _record_reload(state, i.key, "nats", "c1", users)
+    tls.write_text("include users.conf\nport: 4223\n")
+    assert fp("1", "c1") != made, "nats-tls.conf has no record: recreated"
+
+
+def test_the_reload_state_holds_no_raw_digest(tmp_path: Path) -> None:
+    i, users, _, state, fp = _nats_install(tmp_path)
+    fp("0", "c1")
+    users.write_text("users: [gateway, node-a]\n")
+    _record_reload(state, i.key, "nats", "c1", users)
+    fp("1", "c1")
+    text = state.read_text()
+    assert _sha(users) not in text
+    doc = json.loads(text)
+    assert doc["reloaded"]["nats"]["container"] == "c1", "the record stays while its container runs"
+    assert doc["services"]["nats"]["loaded"]
+    fp("2", "c9")
+    assert "reloaded" not in json.loads(state.read_text()), "a record for a replaced container is dropped"
+
+
+def test_prepare_passes_the_running_containers_only_with_a_record(tmp_path: Path) -> None:
+    """start_inputs_prepare reads who runs each service (start_inputs_snapshot)
+    only when the state holds a reload record, and hands it to the helper."""
+    i, users, _, state, fp = _nats_install(tmp_path)
+    made = fp("0", "c1")
+    users.write_text("users: [gateway, node-a]\n")
+    _record_reload(state, i.key, "nats", "c1", users)
+    cfg = {"services": {"nats": {"volumes": [
+        {"type": "bind", "source": str(i.root / "monitoring" / "nats" / "nats-tls.conf"),
+         "target": "/etc/nats/nats-tls.conf", "read_only": True},
+        {"type": "bind", "source": str(users), "target": "/etc/nats/users.conf", "read_only": True}]}}}
+    (tmp_path / "cfg.json").write_text(json.dumps(cfg))
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    (bin_ / "docker").write_text(f"""#!/bin/sh
+echo "$*" >> {tmp_path}/docker.log
+case "$1" in
+  compose) cat {tmp_path}/cfg.json ;;
+  ps) echo c1 ;;
+  inspect) echo "nats c1 running" ;;
+esac
+""")
+    (bin_ / "docker").chmod(0o755)
+    body = (f'ui_note() {{ echo "NOTE: $*"; }}; _compose_project_name() {{ echo proj; }}; cd {i.root}; . {LIB}; '
+            f'START_INPUTS_STATE={state}; COMPOSE_FILES="-f a.yml"; PROFILE_ARGS=""; START_RECREATE=false; '
+            f'start_inputs_prepare; echo "rc=$?"')
+    r = subprocess.run(["bash", "-c", body], capture_output=True, text=True, timeout=60,
+                       env={"PATH": f"{bin_}:{os.environ['PATH']}", "HOME": str(tmp_path),
+                            "NOO_START_INPUTS_KEY_FILE": str(i.key)})
+    assert "rc=0" in r.stdout, r.stdout + r.stderr
+    assert f'noo.inputs: "{made}"' in (i.root / ".noo-start-inputs.yml").read_text(), "nats keeps its label"
+    assert "ps -aq" in (tmp_path / "docker.log").read_text()
+    # No record: no snapshot is taken.
+    doc = json.loads(state.read_text())
+    doc.pop("reloaded")
+    state.write_text(json.dumps(doc))
+    (tmp_path / "docker.log").unlink()
+    subprocess.run(["bash", "-c", body], capture_output=True, text=True, timeout=60,
+                   env={"PATH": f"{bin_}:{os.environ['PATH']}", "HOME": str(tmp_path),
+                        "NOO_START_INPUTS_KEY_FILE": str(i.key)})
+    assert "ps -aq" not in (tmp_path / "docker.log").read_text()
 
 
 def test_a_labelled_forced_restart_then_a_plain_start_recreates_nothing(tmp_path: Path) -> None:
