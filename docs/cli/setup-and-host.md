@@ -130,6 +130,18 @@ drop-in left by an older enrollment is removed), and ends `enrollment complete`.
 the controller run `noo cluster provision gpu-2 --wait` — see
 [fleet.md](fleet.md#enroll-a-node-end-to-end).
 
+`noo enroll` checks first and spends the token only when it can finish.
+Before the tailnet join it checks that sudo can run (a terminal to ask the
+password at, which it asks once up front with `sudo -v`; or root; or
+`--root-ok`, the owner's word that sudo needs no password on an unattended
+run) and that `/var/lib` and the data root's disk have 5 GB free for the
+install; after the join, that the controller answers. A failed check stops
+the run, says what is missing and what to do, and says the token was NOT
+used: run the same paste again once it is fixed. Codes: `enroll_needs_sudo`
+(exit 6), `enroll_low_disk` (exit 6), `enroll_controller_unreachable` (exit
+3). Host prep's own check (`prep-check:` lines: systemd, Docker's repository
+for this release) also runs before the token is spent.
+
 A machine already anchored to a **different** mesh is refused before the
 token is burned (`this machine is already enrolled in a DIFFERENT mesh`,
 exit 78). On macOS the agent arrives through the `net.noomesh.fetch`
@@ -297,7 +309,7 @@ the other nodes first: [Start over](../getting-started/start-over.md).
 ### `noo enroll` — Join this machine to a noomesh fleet as a worker
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo enroll` | `<noo1.blob> \| --url <u> --token <t> \| --via-tailnet <u> [--ca-sha256 <hex>] [--ts-authkey <k>] [--node <name>] [--skip-tailscale] [--skip-prep] [--data-root <dir>] [--controller-approvals] [--resume]` | Enroll this machine as a worker of the given controller |
+| `noo enroll` | `<noo1.blob> \| --url <u> --token <t> \| --via-tailnet <u> [--ca-sha256 <hex>] [--ts-authkey <k>] [--node <name>] [--skip-tailscale] [--skip-prep] [--data-root <dir>] [--controller-approvals] [--root-ok] [--resume]` | Enroll this machine as a worker of the given controller; checks sudo, disk and the controller before it spends the token |
 
 ### `noo offboard` — Tear a standalone controller down to bare machine prep (confirms each step)
 | Command | Arguments | What it does |
