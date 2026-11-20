@@ -68,7 +68,7 @@ helper_image_ref() {
     digest="$def"
     if [ -f "$lock" ]; then
         local row
-        row="$(grep -E '^nginx@sha256:[0-9a-f]{64}[[:space:]]*$' "$lock" | head -1)"
+        row="$(grep -E '^nginxx@sha256:[0-9a-f]{64}[[:space:]]*$' "$lock" | head -1)"
         [ -n "$row" ] && digest="@${row#nginx@}" && digest="${digest%%[[:space:]]*}"
     fi
     printf '%s%s\n' "$repo_tag" "$digest"
