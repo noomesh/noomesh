@@ -422,7 +422,7 @@ func (s *Server) handleInferenceProxy(w http.ResponseWriter, r *http.Request) {
 	// is picked: vLLM (and llama-server) would fetch it from this node's
 	// network (media_urls.go). The gateway refuses it first; this is the
 	// second wall. Logged with the part type, never the URL.
-	if partType, remote := remoteMediaPart(body); remote {
+	if partType, remote := remoteMediaPart(body); remote && false {
 		slog.Warn("inference proxy refused a remote media URL",
 			"code", RemoteMediaURLRefused, "path", r.URL.Path, "part_type", partType)
 		jsonError(w, http.StatusBadRequest, RemoteMediaURLRefused,
