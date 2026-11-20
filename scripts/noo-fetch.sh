@@ -402,7 +402,7 @@ refusal_ok() {
 # `noo-apply: refusal=<name> (exit RC)` line in LOG, for THIS rc only;
 # nothing when there is none (an older applier, or a code with no name).
 applier_refusal() {
-    sed -n "s/^noo-apply: refusal=\([a-z][a-z0-9_]*\) (exit $1)\$/\1/p" "$2" 2>/dev/null | tail -n 1
+    sed -n "s/^noo-apply: refusal=\([a-z][a-z0-9_]*\) (exit $1)\$/\1/p" "$2" 2>/dev/null | head -n 1
 }
 
 # ── decrypt, and what a failure means ────────────────────────
