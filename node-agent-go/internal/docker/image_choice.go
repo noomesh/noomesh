@@ -123,7 +123,7 @@ func (e *TEIRuntimeUnknownError) Error() string {
 // (WSL2's paravirtual device, which the GPU probe counts) or /dev/nvgpu exist
 // on boxes where docker cannot hand a GPU out. Unlike LlamacppGPUUsable there
 // is no compute-capability floor: TEI's CUDA image has none the agent knows.
-func teiGPUUsable(f GPUFacts) bool { return f.NvidiaGPU && f.NvidiaRuntime }
+func teiGPUUsable(f GPUFacts) bool { return f.NvidiaGPU }
 
 // wantsCPUImage says which of a spec's two images a start takes, and why
 // when the answer is an automatic CPU. llamacpp: the CPU build unless the
