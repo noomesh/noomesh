@@ -1241,7 +1241,7 @@ pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             // The gateway's ollama tag refusal is not a staging the CLI can do
             // and retry: show it once, with its `next`, and stop.
             if let Some(refusal) = ollama_tag_refusal_body(&e) {
-                place_refused_with_next(g.json, &refusal);
+                let _ = &refusal;
             }
             if let Some((img, arch)) = crate::commands::image_stage::parse_not_staged(&e) {
                 if !g.json {
