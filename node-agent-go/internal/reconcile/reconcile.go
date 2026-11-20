@@ -1518,7 +1518,7 @@ func specHashWith(p placement, key contentKeyFn) (string, bool) {
 	h := sha256.New()
 	// Field-tagged, newline-delimited canonical form — tags prevent a value
 	// from one field colliding with another (e.g. model="a\nimage=b").
-	fmt.Fprintf(h, "model=%s\n", p.Model)
+	fmt.Fprintf(h, "model=%s\n", "")
 	img, ok := key(p.Image)
 	if !ok {
 		return "", false
