@@ -373,3 +373,100 @@ def test_the_retired_lane_variable_may_only_say_zero(fleet: Fleet) -> None:
         r = fleet.apply(fleet.bundle({"agent-env": b"NODE_ID=host3\nNOO_APPLY_ACCEPT_CA_SIGNED=" + v + b"\n"}))
         assert (r.returncode == 0) == ok, (v, r.stdout, r.stderr)
 
+
+
+# ── refusal names: the applier's last line names the refusal, the code stays ──
+
+def named(r: subprocess.CompletedProcess, code: int, name: str) -> None:
+    """Refused with `code`, and the LAST stderr line is the name line."""
+    assert r.returncode == code, (r.returncode, r.stdout, r.stderr)
+    last = r.stderr.rstrip("\n").splitlines()[-1]
+    assert last == f"noo-apply: refusal={name} (exit {code})", r.stderr
+    assert "REFUSED" not in last
+    assert r.stderr.count("noo-apply: refusal=") == 1, r.stderr
+
+
+def _symlink_member(fleet: Fleet) -> tarfile.TarInfo:
+    ln = tarfile.TarInfo("files/ca.pub")
+    ln.type = tarfile.SYMTYPE
+    ln.linkname = str(fleet.pki / "signing.pub")
+    return ln
+
+
+def test_a_tar_shape_refusal_is_named(fleet: Fleet) -> None:
+    named(fleet.apply(fleet.bundle({"agent-env": b"NODE_ID=host3\n"}, extra=[_symlink_member(fleet)])), 65, "bundle_shape")
+
+
+def test_a_manifest_shape_refusal_is_named(fleet: Fleet) -> None:
+    r = fleet.apply(fleet.bundle({"agent-env": b"NODE_ID=host3\n"}, extra_lines=["#nodes host3"]))
+    named(r, 65, "bundle_shape")
+
+
+def test_an_unmanifested_file_is_named(fleet: Fleet) -> None:
+    r = fleet.apply(fleet.bundle({"agent-env": b"NODE_ID=host3\n"}, unlisted={"agent-unit": AGENT_UNIT}))
+    named(r, 65, "manifest_file_mismatch")
+
+
+def test_a_control_byte_is_named(fleet: Fleet) -> None:
+    named(fleet.apply(fleet.bundle({"agent-env": b"NODE_ID=host3\nLOG_LEVEL=info\rX=1\n"})), 65, "payload_control_bytes")
+
+
+def test_an_env_shape_refusal_is_named(fleet: Fleet) -> None:
+    named(fleet.apply(fleet.bundle({"agent-env": b"NODE_ID=host3\nLD_PRELOAD=/tmp/x.so\n"})), 65, "env_shape")
+
+
+def test_a_unit_shape_refusal_is_named(fleet: Fleet) -> None:
+    unit = AGENT_UNIT.replace(b"Type=simple", b"Type=forking", 1)
+    named(fleet.apply(fleet.bundle({"agent-unit": unit})), 65, "unit_shape")
+
+
+def test_a_vendor_refusal_is_named(fleet: Fleet) -> None:
+    # The payload rides without its manifest: vendor_check refuses before anything installs.
+    named(fleet.apply(fleet.bundle({"vendor-cli": b"\x7fELF"})), 65, "vendor_cli_invalid")
+
+
+def test_an_unknown_kind_is_named_applier_too_old(fleet: Fleet) -> None:
+    named(fleet.apply(fleet.bundle({"agent-env": b"NODE_ID=host3\n", "frobnicate": b"x"})), 76, "applier_too_old")
+
+
+def test_an_applier_downgrade_is_named(fleet: Fleet) -> None:
+    gen3 = fleet.tmp / "noo-apply-gen3"
+    gen3.write_bytes(re.sub(rb"(?m)^NOO_APPLY_GENERATION=\d+$", b"NOO_APPLY_GENERATION=3", APPLIER.read_bytes()))
+    fleet.self_path.write_bytes(gen3.read_bytes())
+    named(fleet.apply(fleet.bundle({"applier": APPLIER.read_bytes()}), applier=gen3), 65, "applier_downgrade")
+
+
+def test_an_unlisted_applier_generation_is_named(fleet: Fleet) -> None:
+    old = b"\n".join(l for l in APPLIER.read_bytes().split(b"\n") if not l.startswith(b"NOO_APPLY_GENERATION="))
+    named(fleet.apply(fleet.bundle({"applier": old})), 75, "release_unlisted")
+
+
+def test_signature_refusals_are_named(tmp_path: Path) -> None:
+    f = Fleet(tmp_path, adopted=False)
+    r = f.apply(f.bundle({"agent-binary": b"\x7fELFpwn"}, key=f.ca_key,
+                         unlisted={"signing-pub": f.signing_pub.read_bytes()}))
+    named(r, 77, "ca_signed_lane_retired")
+    other = tmp_path / "other.key"
+    sh("openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", str(other))
+    named(f.apply(f.bundle({"agent-env": b"NODE_ID=host3\n"}, key=other)), 77, "signature_invalid")
+
+
+def test_a_stale_bundle_is_named(fleet: Fleet) -> None:
+    named(fleet.apply(fleet.bundle({"agent-env": b"NODE_ID=host3\n"}, issued=str(int(time.time()) - 200000))), 77, "bundle_stale")
+
+
+def test_a_bundle_for_another_node_is_named(fleet: Fleet) -> None:
+    fleet.node_env.write_text("NODE_ID=node_b\n")
+    named(fleet.apply(fleet.bundle({"agent-env": b"NODE_ID=host3\n"})), 77, "bundle_for_other_node")
+
+
+def test_no_trusted_ca_is_named_not_enrolled(fleet: Fleet) -> None:
+    b = fleet.bundle({"agent-env": b"NODE_ID=host3\n"})
+    (fleet.pki / "ca.crt").unlink()
+    named(fleet.apply(b), 78, "not_enrolled")
+
+
+def test_an_accepted_bundle_prints_no_refusal_line(fleet: Fleet) -> None:
+    r = fleet.apply(fleet.bundle({"agent-env": b"NODE_ID=host3\n", "agent-unit": AGENT_UNIT}))
+    assert r.returncode == 0, r.stderr
+    assert "refusal=" not in r.stdout + r.stderr
