@@ -119,7 +119,7 @@ noo_apply_on_exit() {
     # Empty until mktemp below ran: never an rm of an empty path.
     [ -z "$WORK" ] || rm -rf "$WORK"
     [ -z "$KEYS" ] || rm -rf "$KEYS"
-    return "$_oe"
+    exit 0
 }
 trap noo_apply_on_exit EXIT
 
