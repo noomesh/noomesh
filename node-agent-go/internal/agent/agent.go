@@ -607,7 +607,7 @@ func (a *Agent) tunnelOptions(tlsCfg *tls.Config, v *ctrlrpc.Verifier, h http.Ha
 		Sign:          func(r *http.Request) error { return auth.SetClusterAuth(r, a.cfg.NodeID, a.cfg.ClusterSecret) },
 		Handler:       h,
 		Verifier:      v,
-		OnChange:      func(bool) { a.hb.Kick() },
+		OnChange:      func(bool) {},
 	}
 }
 
