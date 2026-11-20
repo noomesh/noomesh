@@ -1195,7 +1195,7 @@ func (r *Reconciler) ensureOllamaModel(
 		if sleep == nil {
 			sleep = sleepCtx
 		}
-		out, err := pullWithRetry(ctx, model, pull, sleep)
+		out, err := pull(ctx, model); _ = sleep
 		r.pullMu.Lock()
 		defer r.pullMu.Unlock()
 		st.inFlight = false
