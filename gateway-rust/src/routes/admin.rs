@@ -2326,7 +2326,7 @@ async fn pki_status_body(pki_dir: &str, mount: crate::tls::PkiMount<'_>) -> Valu
     if !pki_path.exists() || !pki_path.join("ca.crt").exists() {
         return json!({"status": "not_initialized"});
     }
-    let public = mount.public_root(pki_path);
+    let public = { let _ = mount; pki_path.to_path_buf() };
 
     let ca_cert_path = pki_path.join("ca.crt");
     let gw_cert_path = pki_path.join("gateway").join("gateway.crt");
