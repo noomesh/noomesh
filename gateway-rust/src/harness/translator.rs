@@ -451,6 +451,19 @@ fn sse_response(body: Body) -> Response {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// A body whose content parts name a remote media URL (the backend would
+/// fetch it), or carry inline media that is not allowed, is refused before
+/// anything is sent (`inline_media`); the three routes check the CLI's own
+/// body. The refusal carries the code, the fix and `next`; the log line the
+/// code, the route and the part type.
+fn media_refusal(body: &Value, route: &str) -> Option<Response> {
+    let r = crate::inline_media::check_body(body).err()?;
+    r.log(route);
+    let status = StatusCode::from_u16(r.status()).unwrap_or(StatusCode::BAD_REQUEST);
+    let error = json!({"type": r.code, "code": r.code, "message": r.message, "next": r.next()});
+    Some((status, Json(json!({"type": "error", "error": error}))).into_response())
+}
+
 fn parse_body(bytes: &Bytes) -> Result<Value, Response> {
     serde_json::from_slice::<Value>(bytes)
         .ok()
@@ -667,6 +680,9 @@ async fn chat_completions(State(sh): State<Arc<Shared>>, bytes: Bytes) -> Respon
         Ok(b) => b,
         Err(r) => return r,
     };
+    if let Some(r) = media_refusal(&body, "harness:/v1/chat/completions") {
+        return r;
+    }
     let wants_usage = body.pointer("/stream_options/include_usage").and_then(|v| v.as_bool()) == Some(true);
     match complete(&sh, body).await {
         Err((status, msg)) => upstream_error(status, &msg),
@@ -704,6 +720,9 @@ async fn messages(State(sh): State<Arc<Shared>>, bytes: Bytes) -> Response {
         Ok(b) => b,
         Err(r) => return r,
     };
+    if let Some(r) = media_refusal(&body, "harness:/v1/messages") {
+        return r;
+    }
     let openai = anthropic_wire::request_body_from_anthropic(&body);
     let model = sh.upstream.model.clone();
     match complete(&sh, openai).await {
@@ -755,6 +774,9 @@ async fn responses(State(sh): State<Arc<Shared>>, bytes: Bytes) -> Response {
         Ok(b) => b,
         Err(r) => return r,
     };
+    if let Some(r) = media_refusal(&body, "harness:/v1/responses") {
+        return r;
+    }
     if body.get("previous_response_id").and_then(|p| p.as_str()).is_some_and(|p| !p.is_empty()) {
         return error_reply(
             StatusCode::BAD_REQUEST,

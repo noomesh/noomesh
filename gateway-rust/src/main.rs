@@ -107,6 +107,7 @@ mod self_node;
 mod node_name_claim;
 mod redact;
 mod egress;
+mod inline_media;
 mod dlq_drain;
 mod drive;
 mod embed_jobs;

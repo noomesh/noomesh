@@ -125,11 +125,24 @@ pub struct RawChatError {
     /// Seconds a well-behaved client should wait before retrying; rendered
     /// as a `Retry-After` header. Set by load-shedding refusals only.
     pub retry_after: Option<u64>,
+    /// What the caller does instead (`next` steps); with it the body also
+    /// carries `code`. Set by the inline-media refusals.
+    pub next: Option<Value>,
 }
 
 impl RawChatError {
     pub fn new(status: StatusCode, kind: &'static str, detail: impl Into<String>) -> Self {
-        Self { status, kind, detail: detail.into(), public: None, reference: crate::egress::new_ref(), retry_after: None }
+        Self { status, kind, detail: detail.into(), public: None, reference: crate::egress::new_ref(), retry_after: None, next: None }
+    }
+
+    /// A content part named a remote media URL, or inline media that is not
+    /// allowed (`inline_media`): 400 (413 over a size cap) with the code as
+    /// `type` and `code`, the public message, and `next`. The detail names
+    /// the code and the part type, never the URL or the data.
+    pub fn media_refused(r: &crate::inline_media::MediaRefusal) -> Self {
+        let status = StatusCode::from_u16(r.status()).unwrap_or(StatusCode::BAD_REQUEST);
+        let detail = format!("{} on a '{}' content part", r.code, r.part_type);
+        Self { public: Some(r.message.clone()), next: Some(r.next()), ..Self::new(status, r.code, detail) }
     }
 
     /// A refusal about the caller's own request (400): the message IS the
@@ -211,6 +224,10 @@ impl RawChatError {
         if self.kind == MODEL_NOT_FOUND {
             b["error"]["code"] = json!(MODEL_NOT_FOUND);
             b["error"]["param"] = json!("model");
+        }
+        if let Some(next) = &self.next {
+            b["error"]["code"] = json!(self.kind);
+            b["error"]["next"] = next.clone();
         }
         b
     }
@@ -958,6 +975,18 @@ where
 {
     use coordinator::expected_wait::{self, Plan};
     let mut build = build;
+    // Before anything is planned or sent: a content part that names a
+    // remote media URL (the model server would fetch it, from its own
+    // network) or inline media that is not allowed is refused here, where
+    // every caller-shaped chat body passes (`inline_media`). The renderer
+    // logs it once (`raw_chat_refused`: the surface, the code as `kind`, the
+    // part type in the detail).
+    if let Some(first) = candidates.first() {
+        let (_, probe) = build(first);
+        if let Err(r) = crate::inline_media::check_body(&probe) {
+            return Err(RawChatError::media_refused(&r));
+        }
+    }
     // A key set to refuse (i802, operator 2026-11-15): an Ollama whose
     // context this prompt overflows is not tried; nothing left is a 413.
     let fitted: Vec<Candidate>;

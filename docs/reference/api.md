@@ -458,6 +458,51 @@ items, `usage.input_tokens`/`output_tokens`). `stream: true` emits the
 Responses event sequence (`response.created` through `response.completed`).
 Hosted tools (`web_search`, …) are dropped.
 
+### Media in chat content parts
+
+Images go to a model **inline**, as a `data:` URL (base64). Since 0.6.29 the
+gateway refuses a content part that names a remote media URL (`http:`,
+`https:`, `file:`, or any other scheme): the model server would fetch the link
+itself, from inside the cluster's network. A gateway-side fetch through an
+outbound guard may come later; until then a link is refused, never fetched.
+
+**For people.** Send the image's bytes, not a link:
+`{"type": "image_url", "image_url": {"url": "data:image/png;base64,<data>"}}`.
+PNG, JPEG, WebP and GIF are accepted. A client that sent image links gets a
+`400 remote_media_url_refused` and must send the image inline instead.
+
+**For agents.** The rule applies on `/v1/chat/completions`, `/v1/responses`
+(native and translated), `/api/external/chat/completions`,
+`/api/external/inference` (`kind: chat`) and the harness wire translator
+(`/v1/chat/completions`, `/v1/messages`, `/v1/responses`), and again in the
+node agent's inference proxy (scheme check only).
+
+- A media URL is: `image_url` (`{url}` or a string), `input_image.image_url`,
+  `file_url`, `audio_url`, `video_url`, an Anthropic `source: {type: "url"}`,
+  the object named by a part's own `type` when it has a `url` (`file: {url}`),
+  and any `url` / `*_url` field of a part of any type. Nested parts
+  (`tool_result.content`, a Responses item's `content` / `output`) are walked.
+  Text, tool calls and parts without a URL pass as before.
+- Inline media must be `data:<type>;base64,<data>` (or an Anthropic `source:
+  {type: "base64", media_type, data}` on an `image` block), of type
+  `image/png`, `image/jpeg` (`image/jpg` accepted), `image/webp` or
+  `image/gif`; the base64 must decode, and the first bytes must be the
+  declared type's signature. At most 8 MiB decoded per part and 16 MiB per
+  request (the gateway's chat routes also cap the whole JSON body at 2 MiB).
+- Refusals, as `error.type` and `error.code`, with `error.next` (`[{"kind":
+  "action", "text": …}, {"kind": "doc", "doc": …}]`):
+
+| code | status | when |
+|---|---|---|
+| `remote_media_url_refused` | 400 | a media URL that is not `data:` |
+| `inline_media_type_refused` | 400 | a `data:` type outside the list above (audio and video included) |
+| `inline_media_invalid` | 400 | not base64, or the base64 does not decode |
+| `inline_media_type_mismatch` | 400 | the bytes are not the declared type |
+| `inline_media_too_large` | 413 | over 8 MiB a part or 16 MiB a request |
+
+The node agent answers `400` with `error.code: remote_media_url_refused`.
+Neither the answer nor the log line carries the URL or the data; the log
+names the code, the route and the part type.
 
 ## WebSocket
 
