@@ -290,6 +290,7 @@ async fn user_create(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<CreateUserBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "creating an account").await?;
     let by = security_users_mutation_guard(&ctx)?.sub.clone();
     // the requested scopes decide the new account's tier
     // (`repo::users::create` derives `role` from them), so an unclamped
@@ -381,6 +382,7 @@ async fn user_disable(
     Path(username): Path<String>,
     ctx: Option<Extension<RequesterCtx>>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "disabling an account").await?;
     let by = security_users_mutation_guard(&ctx)?.sub.clone();
     require_may_manage(&state.db, &ctx, &username).await?;
     require_not_last_admin(&state.db, &username, "disable").await?;
@@ -432,6 +434,7 @@ async fn user_set_scopes(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<SetScopesBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "changing an account's scopes").await?;
     let by = scope_mutation_guard(&ctx)?.sub.clone();
     require_may_manage(&state.db, &ctx, &username).await?;
     // Dropping `admin` here demotes the account (repo::users::set_scopes
@@ -477,6 +480,7 @@ async fn user_set_role(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<SetRoleBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "changing an account's role").await?;
     let by = scope_mutation_guard(&ctx)?.sub.clone();
     let username = username.trim().to_string();
     if username.is_empty() {
@@ -1163,6 +1167,7 @@ async fn user_erase(
     ctx: Option<Extension<RequesterCtx>>,
     body: Option<Json<EraseBody>>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "erasing an account's data").await?;
     let username = username.trim().to_string();
     if username.is_empty() {
         return Err(AppError::BadRequest("username is required".into()));
@@ -1422,8 +1427,10 @@ struct CreateOrgBody {
 async fn org_create(
     State(state): State<Arc<AppState>>,
     actor_ext: Option<Extension<AuthActor>>,
+    ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<CreateOrgBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "creating an org").await?;
     let id = body.id.trim();
     if id.is_empty() {
         return Err(AppError::BadRequest("org id is required".into()));
@@ -1465,6 +1472,7 @@ async fn user_set_org(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<SetOrgBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "moving an account to another org").await?;
     // the org is the top tenant boundary — moving an account across it
     // changes what that account can see.
     require_may_manage(&state.db, &ctx, &username).await?;
@@ -3765,6 +3773,7 @@ async fn api_users_disable(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<Value>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "disabling or re-enabling an account").await?;
     let by = users_admin_mutation_guard(&ctx)?.sub.clone();
     let username = body_str(&body, "username");
     let disabled = body.get("disabled").and_then(Value::as_bool);

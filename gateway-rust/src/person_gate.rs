@@ -183,6 +183,15 @@ mod tests {
         ("users.rs", "async fn service_key_revoke_and_disable(", "require_person("),
         ("users.rs", "async fn service_key_set_quota(", "require_person("),
         ("users.rs", "async fn service_key_set_context_overflow(", "require_person("),
+        // (b) account role, scope, state and org.
+        ("users.rs", "async fn user_create(", "require_person("),
+        ("users.rs", "async fn user_set_role(", "require_person("),
+        ("users.rs", "async fn user_set_scopes(", "require_person("),
+        ("users.rs", "async fn user_disable(", "require_person("),
+        ("users.rs", "async fn api_users_disable(", "require_person("),
+        ("users.rs", "async fn user_erase(", "require_person("),
+        ("users.rs", "async fn user_set_org(", "require_person("),
+        ("users.rs", "async fn org_create(", "require_person("),
     ];
 
     fn source(file: &str) -> &'static str {
@@ -194,7 +203,7 @@ mod tests {
 
     #[test]
     fn every_route_that_changes_who_can_do_what_calls_the_person_gate_first() {
-        assert_eq!(GATED.len(), 8, "keep the list and the count in step");
+        assert_eq!(GATED.len(), 16, "keep the list and the count in step");
         for (file, marker, call) in GATED {
             let own = crate::test_src::own_code(source(file));
             let body = crate::test_src::fn_body(&own, marker);
