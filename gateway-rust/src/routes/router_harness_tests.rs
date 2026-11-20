@@ -484,8 +484,9 @@ const I241_ROWS: &[(&str, &str, &str)] = &[
     ("GET", "/api/security/user-proposals", "Operator"),
     ("GET", "/api/security/audit/list", "Operator"),
     ("GET", "/api/security/audit/verify", "Operator"),
-    // Kept: the chat-onboarding agent mints and revokes with no user of its
-    // own; no distinct agent principal exists to name instead (see the PR).
+    // Kept as the extractor; inside, `crate::person_gate` (i1096) admits a
+    // person, and on the mint only the operator door or an Operator's
+    // in-chat agent besides (`NODE_ENROLMENT_AGENTS`). Revoking is a person's.
     ("POST", "/api/security/bootstrap-tokens", "OperatorOrInternal"),
     ("POST", "/api/security/bootstrap-tokens/{id}/revoke", "OperatorOrInternal"),
 ];

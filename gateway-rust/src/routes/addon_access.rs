@@ -206,6 +206,7 @@ async fn access_set(
     Path(addon): Path<String>,
     Json(body): Json<SetBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, Some(&admin.0), "setting add-on access").await?;
     let by = account_of(admin.sub()).to_string();
     let m = manifest_of(&addon)?;
     if m.features.is_empty() {

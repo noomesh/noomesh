@@ -1525,6 +1525,7 @@ async fn user_link_create(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<LinkCreateBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "linking a channel sender to an account").await?;
     // a channel link makes an inbound chat identity resolve to this
     // account, so pointing one at an Admin is an impersonation primitive.
     require_may_manage(&state.db, &ctx, &username).await?;
@@ -1623,6 +1624,7 @@ async fn channel_link_delete(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<LinkDeleteBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "unlinking a channel sender").await?;
     let channel = body.channel.trim();
     let channel_user_id = body.channel_user_id.trim();
     if channel.is_empty() || channel_user_id.is_empty() {
@@ -1685,8 +1687,10 @@ async fn team_space_link(
     State(state): State<Arc<AppState>>,
     Path(team): Path<String>,
     actor_ext: Option<Extension<AuthActor>>,
+    ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<SpaceLinkBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "linking a space to a team").await?;
     let team = team.trim();
     let channel = body.channel.trim();
     let space_id = body.space_id.trim();
@@ -1749,8 +1753,10 @@ async fn team_spaces_list(
 async fn team_space_unlink(
     State(state): State<Arc<AppState>>,
     actor_ext: Option<Extension<AuthActor>>,
+    ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<SpaceLinkBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "unlinking a space from a team").await?;
     let channel = body.channel.trim();
     let space_id = body.space_id.trim();
     if channel.is_empty() || space_id.is_empty() {
@@ -1840,6 +1846,7 @@ async fn user_grant_roles(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<RolesBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "granting KB roles").await?;
     // KB roles decide which documents the account can read.
     require_may_manage(&state.db, &ctx, &username).await?;
     let requested: Vec<String> = body
@@ -1884,6 +1891,7 @@ async fn user_revoke_roles(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<RolesBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "revoking KB roles").await?;
     require_may_manage(&state.db, &ctx, &username).await?;
     let existing = crate::repo::kb_grants::get_roles(&state.db, &username).await?;
     let existing: Vec<String> = existing
@@ -2043,6 +2051,10 @@ async fn proposal_decide(
     } else {
         username.trim().to_string()
     };
+
+    // A user-management proposal is decided by a person (i1096): approve or deny, never an agent,
+    // so an agent cannot file an account change and then decide it. Filing stays open to agents.
+    if action != crate::task_guard::PROPOSAL_ACTION { crate::person_gate::require_person(&state.db, ctx.as_deref(), "deciding a user-management proposal").await?; }
 
     // A scheduled task that destroys data is a PERSON'S decision: approving one needs a credential
     // with no harness claim and no `act`, holding the role the task needs. The spec is classified
@@ -4159,6 +4171,7 @@ async fn api_kb_rule(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<Value>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "setting a KB rule").await?;
     let updated_by = ctx
         .as_ref()
         .map(|Extension(r)| r.sub.clone())
@@ -4300,6 +4313,7 @@ async fn api_kb_teams_create(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<Value>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "creating a team").await?;
     let raw_name = body_str(&body, "name");
     let trimmed = raw_name.trim();
     let name = trimmed.strip_prefix("team:").unwrap_or(trimmed).to_string();
@@ -4359,6 +4373,7 @@ async fn api_kb_teams_delete(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<Value>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "deleting a team (legacy route)").await?;
     let force = body.get("force").and_then(Value::as_bool).unwrap_or(false);
     team_delete_inner(&state, &body_str(&body, "name"), force, &ctx).await
 }
@@ -4375,6 +4390,7 @@ async fn security_team_delete(
     axum::extract::Query(q): axum::extract::Query<TeamDeleteQuery>,
     ctx: Option<Extension<RequesterCtx>>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "deleting a team").await?;
     team_delete_inner(&state, &team, q.force, &ctx).await
 }
 

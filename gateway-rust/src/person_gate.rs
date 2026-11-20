@@ -192,18 +192,41 @@ mod tests {
         ("users.rs", "async fn user_erase(", "require_person("),
         ("users.rs", "async fn user_set_org(", "require_person("),
         ("users.rs", "async fn org_create(", "require_person("),
+        // (c) KB roles, teams, rules, links, proposals, add-on access, seats, nodes.
+        ("users.rs", "async fn user_grant_roles(", "require_person("),
+        ("users.rs", "async fn user_revoke_roles(", "require_person("),
+        ("users.rs", "async fn api_kb_teams_create(", "require_person("),
+        ("users.rs", "async fn security_team_delete(", "require_person("),
+        ("users.rs", "async fn api_kb_teams_delete(", "require_person("),
+        ("users.rs", "async fn api_kb_rule(", "require_person("),
+        ("users.rs", "async fn team_space_link(", "require_person("),
+        ("users.rs", "async fn team_space_unlink(", "require_person("),
+        ("users.rs", "async fn user_link_create(", "require_person("),
+        ("users.rs", "async fn channel_link_delete(", "require_person("),
+        ("users.rs", "async fn proposal_decide(", "require_person("),
+        ("addon_access.rs", "async fn access_set(", "require_person("),
+        ("seats.rs", "async fn seat_token_create(", "require_person("),
+        ("seats.rs", "async fn seat_token_revoke(", "require_person("),
+        ("seats.rs", "async fn seat_bind(", "require_person("),
+        ("seats.rs", "async fn seat_revoke(", "require_person("),
+        ("cluster.rs", "async fn proposals_decide(", "require_person("),
+        ("bootstrap.rs", "async fn bootstrap_token_revoke(", "require_person("),
     ];
 
     fn source(file: &str) -> &'static str {
         match file {
             "users.rs" => include_str!("routes/users.rs"),
+            "addon_access.rs" => include_str!("routes/addon_access.rs"),
+            "seats.rs" => include_str!("routes/seats.rs"),
+            "cluster.rs" => include_str!("routes/cluster.rs"),
+            "bootstrap.rs" => include_str!("routes/bootstrap.rs"),
             other => panic!("no source for {other}"),
         }
     }
 
     #[test]
     fn every_route_that_changes_who_can_do_what_calls_the_person_gate_first() {
-        assert_eq!(GATED.len(), 16, "keep the list and the count in step");
+        assert_eq!(GATED.len(), 34, "keep the list and the count in step");
         for (file, marker, call) in GATED {
             let own = crate::test_src::own_code(source(file));
             let body = crate::test_src::fn_body(&own, marker);
