@@ -5,6 +5,7 @@ package docker
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 	"sync"
@@ -40,6 +41,15 @@ type GPUFacts struct {
 	// NvidiaRuntime: the daemon lists the nvidia runtime, so a device request
 	// can be honoured (NvidiaRuntimeKnown). Unknown counts as absent.
 	NvidiaRuntime bool
+	// NvidiaRuntimeRead: NvidiaRuntimeKnown has answered at least once in this
+	// process, so NvidiaRuntime is a fact. false is "never read" (a fresh
+	// agent whose first docker info failed or is slow), which is NOT "known
+	// absent": TEI refuses to choose an image on it (TEIRuntimeUnknownError)
+	// instead of taking the CPU one. llamacpp waits on it too (llamacppWaitsOnRuntime) but its usable rule is unchanged.
+	NvidiaRuntimeRead bool
+	// NvidiaRuntimeErr is the last failed ask's text, "" after a good one;
+	// the retry message carries it.
+	NvidiaRuntimeErr string
 	// MinComputeCap: the lowest compute capability of the node's GPUs
 	// ("6.1"), "" when it could not be read. Unknown counts as too low.
 	MinComputeCap string
@@ -76,12 +86,36 @@ func llamacppOnGPU(target string, f GPUFacts) bool {
 	return target != "cpu" && LlamacppGPUUsable(f)
 }
 
+// llamacppWaitsOnRuntime: the llamacpp start cannot decide yet. A GPU is seen,
+// the target is not cpu, a GPU build exists, no GPU is known to be below the
+// compute floor (that would be cpu whatever the runtime says), and the nvidia
+// runtime was never read: unknown is not absent, so the start is refused for
+// this pass (TEIRuntimeUnknownError) instead of taking the CPU build. Once the
+// runtime is read, LlamacppGPUUsable decides exactly as before.
+func llamacppWaitsOnRuntime(target string, f GPUFacts) bool {
+	if target == "cpu" || !LlamacppHasGPUBuild || !f.NvidiaGPU || f.NvidiaRuntimeRead {
+		return false
+	}
+	if ok, err := nodewl.ComputeCapAtLeast(f.MinComputeCap, LlamacppMinComputeCap); err == nil && !ok {
+		return false
+	}
+	return true
+}
+
 var (
 	gpuFactsMu    sync.Mutex
 	gpuFactsKnown bool
 	gpuFactsNow   GPUFacts
 	// computeCapsFn is the compute capability probe (nvidia-smi).
 	computeCapsFn = (&hardware.GPUDetector{}).DetectComputeCaps
+	// nvidiaRuntimeAskFn asks the daemon whether it lists the nvidia runtime
+	// (tests replace it).
+	nvidiaRuntimeAskFn = func(ctx context.Context, c *Client) (bool, error) {
+		if c == nil || c.docker == nil {
+			return false, errors.New("no docker client")
+		}
+		return c.NvidiaRuntimeKnown(ctx)
+	}
 )
 
 // NodeGPUFacts is the last refreshed answer (RefreshGPUFacts); before the
@@ -133,11 +167,11 @@ func (c *Client) RefreshGPUFacts(ctx context.Context) GPUFacts {
 	prev := NodeGPUFacts()
 	f := GPUFacts{NvidiaGPU: hasNvidiaGPU()}
 	if f.NvidiaGPU {
-		f.NvidiaRuntime = prev.NvidiaRuntime
-		if c != nil && c.docker != nil {
-			if ok, err := c.NvidiaRuntimeKnown(ctx); err == nil {
-				f.NvidiaRuntime = ok
-			}
+		f.NvidiaRuntime, f.NvidiaRuntimeRead, f.NvidiaRuntimeErr = prev.NvidiaRuntime, prev.NvidiaRuntimeRead, prev.NvidiaRuntimeErr
+		if ok, err := nvidiaRuntimeAskFn(ctx, c); err == nil {
+			f.NvidiaRuntime, f.NvidiaRuntimeRead, f.NvidiaRuntimeErr = ok, true, ""
+		} else {
+			f.NvidiaRuntimeErr = err.Error() // a read value stays; an unread one stays unread
 		}
 		f.MinComputeCap = prev.MinComputeCap
 		if f.MinComputeCap == "" {
