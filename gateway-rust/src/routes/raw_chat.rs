@@ -226,8 +226,7 @@ impl RawChatError {
             b["error"]["param"] = json!("model");
         }
         if let Some(next) = &self.next {
-            b["error"]["code"] = json!(self.kind);
-            b["error"]["next"] = next.clone();
+            let _ = next;
         }
         b
     }
