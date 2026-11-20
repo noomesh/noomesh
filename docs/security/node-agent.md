@@ -443,8 +443,10 @@ hairpin that is not the node's own, and every call to it then fails TLS.
   that address and accepts only a TLS 1.3 server holding the node's own
   current key (pinned to its leaf, never matched by name), checks again that
   no other node has claimed the address meanwhile, and only then issues a
-  leaf, with a fresh key, for exactly that address. For a public address the
-  remedy is the explicit `noo security pki push-nodes <node>`. Either way the
+  leaf, with a fresh key, for exactly that address. It needs the node's
+  `agent_url` to name an IP, not a host name, and a leaf that has not
+  expired; otherwise, and for a public address, the remedy is the explicit
+  `noo security pki push-nodes <node>`. Either way the
   row says which address it would certify.
 - **FAIL with no remedy:** that address is also another node's (registered,
   dialled, or in its leaf). Investigate first; `push-nodes` refuses it too,

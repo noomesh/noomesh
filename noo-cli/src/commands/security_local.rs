@@ -3473,6 +3473,15 @@ pub(crate) fn prove_target(node: &str, registry: &[serde_json::Value]) -> Result
         .ok_or_else(|| format!("node '{node}' is not registered with this controller"))?;
     let url = n["agent_url"].as_str().ok_or_else(|| format!("'{node}' has reported no agent_url yet: nothing to prove"))?;
     let host = url_host_of(url).ok_or_else(|| format!("'{node}''s agent_url {url} has no host"))?;
+    // An IP literal only: a name would prove whatever DNS answered at that
+    // moment, slip past the claim check (which compares addresses), and be
+    // routed as public in verify (97, #1457).
+    if host.parse::<std::net::IpAddr>().is_err() {
+        return Err(format!(
+            "'{node}''s agent_url {url} names a host name, not an address: --prove needs an address. \
+             Set the node's agent_url to its IP, or use the plain `noo security pki push-nodes {node}`"
+        ));
+    }
     if is_loopback_addr(&host) {
         return Err(format!("'{node}''s agent_url {url} is a loopback address: there is nothing to prove there"));
     }
@@ -3546,9 +3555,12 @@ fn pki_push_node_prove(g: &Globals, node: &str, days: i64, yes: bool) -> Result<
     // (b) The dial-back, pinned to the node's own current leaf.
     let ca_pem = std::fs::read(ca.ca_cert_path()).unwrap_or_default();
     if let Err(why) = super::node_prove::prove_node_at(&ca_pem, &leaf_pem, &host, port, std::time::Duration::from_secs(10)) {
+        // A leaf that has EXPIRED cannot prove (the chain check is at now):
+        // that node is re-keyed with the explicit push (97, #1457).
+        let expired = why.to_ascii_lowercase().contains("expired");
         fail(g.json, ExitCode::Generic, "not_proven",
             &format!("{host}:{port} did not prove to be {node}: {why}. Nothing was issued"),
-            None);
+            expired.then(|| format!("noo security pki push-nodes {node}   # an expired leaf cannot prove; the explicit push re-keys it")).as_deref());
     }
     if !g.json {
         println!("{}", ui::sub(&ui::status_line(Glyph::Ok, &format!("{host}:{port} answered with {node}'s own key"))));
@@ -6761,7 +6773,12 @@ mod address_claim_tests {
         assert_eq!(prove_target("node-b", &reg), Ok(("fd00::5".to_string(), 9081)));
         assert!(prove_target("node-c", &reg).unwrap_err().contains("loopback"));
         assert!(prove_target("node-d", &reg).unwrap_err().contains("no agent_url"));
-        assert_eq!(prove_target("node-e", &reg), Ok(("node-e.example".to_string(), 443)));
+        let e = prove_target("node-e", &reg).unwrap_err();
+        assert!(e.contains("names a host name") && e.contains("push-nodes node-e"), "a name is refused before any dial: {e}");
+        let localhost = vec![serde_json::json!({"id": "node-f", "agent_url": "https://localhost:8081"})];
+        assert!(prove_target("node-f", &localhost).unwrap_err().contains("names a host name"), "even one that resolves to 127.0.0.1");
+        let default_port = vec![serde_json::json!({"id": "node-g", "agent_url": "https://192.0.2.7"})];
+        assert_eq!(prove_target("node-g", &default_port), Ok(("192.0.2.7".to_string(), 443)));
         assert!(prove_target("node-x", &reg).unwrap_err().contains("not registered"));
     }
 
