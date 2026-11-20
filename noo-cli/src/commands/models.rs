@@ -122,6 +122,15 @@ pub(crate) fn harrier_pull_outcome(lines: &[String]) -> (bool, bool) {
     (lines.iter().any(|l| l.starts_with('+')), false)
 }
 
+/// One retry line: the console's warning line, or stderr under `--json`.
+fn say_retry(g: &Globals, line: &str) {
+    if g.json {
+        eprintln!("{line}");
+    } else {
+        ui::warned(line);
+    }
+}
+
 pub fn models_pull(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     use std::io::BufRead as _;
 
@@ -163,6 +172,11 @@ pub fn models_pull(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         std::path::Path::new(&crate::commands::models_fetch::controller_store_dir()),
     );
     let body = serde_json::json!({ "model": model });
+    // A registry blip is retried (bounded, each retry said); a 404 or an auth
+    // refusal fails at once. One classifier: commands/pull_retry.rs.
+    let mut tried = 1usize;
+    let mut waited = 0u64;
+    let last = 'try_pull: loop {
     let mut resp = post_json_stream(g, "/api/terminal/ollama/pull", &body, true, 600);
     let status = resp.status().as_u16();
     if !(200..=299).contains(&status) {
@@ -173,6 +187,15 @@ pub fn models_pull(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             .ok()
             .and_then(|v| v["error"].as_str().map(str::to_string))
             .unwrap_or_else(|| format!("HTTP {status}: {text}"));
+        if let Some(reason) = crate::commands::pull_retry::classify_pull_failure(&format!("Error: {detail}")) {
+            if let Some(d) = crate::commands::pull_retry::next_delay(tried, waited) {
+                say_retry(g, &crate::commands::pull_retry::retry_line(&reason, d, tried + 1));
+                std::thread::sleep(std::time::Duration::from_secs(d));
+                waited += d;
+                tried += 1;
+                continue 'try_pull;
+            }
+        }
         match status {
             401 | 403 => fail(
                 g.json,
@@ -222,6 +245,15 @@ pub fn models_pull(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             if progressed {
                 eprintln!();
             }
+            if let Some(reason) = crate::commands::pull_retry::classify_pull_failure(&format!("Error: {err}")) {
+                if let Some(d) = crate::commands::pull_retry::next_delay(tried, waited) {
+                    say_retry(g, &crate::commands::pull_retry::retry_line(&reason, d, tried + 1));
+                    std::thread::sleep(std::time::Duration::from_secs(d));
+                    waited += d;
+                    tried += 1;
+                    continue 'try_pull;
+                }
+            }
             fail(g.json, ExitCode::RemoteError, "pull_failed", err, None);
         }
         let done = v["done"].as_bool() == Some(true) || v["status"].as_str() == Some("success");
@@ -254,7 +286,8 @@ pub fn models_pull(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if progressed {
         eprintln!();
     }
-
+    break last;
+    };
     let finished = last
         .as_ref()
         .map(|v| v["done"].as_bool() == Some(true) || v["status"].as_str() == Some("success"))

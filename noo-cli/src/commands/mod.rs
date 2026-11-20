@@ -85,6 +85,7 @@ pub mod models_extract;
 pub mod models_fetch;
 pub mod models_sets;
 pub mod ollama_stage;
+pub mod pull_retry;
 pub mod voice_models;
 pub mod pki;
 pub mod plugins;
