@@ -1,0 +1,47 @@
+{
+  "_comment": [
+    "The release lines of the third-party images the stack pins by digest (scripts/stack-lock-third-party.py THIRD_PARTY).",
+    "Read by scripts/third-party-scan.py (the weekly .github/workflows/third-party-scan.yml).",
+    "line        version prefix, in the tag's own spelling, that still gets fixes; 'newer upstream' means a newer tag in it",
+    "policy      the upstream page that says which lines get fixes (null: upstream publishes none)",
+    "recheck_by  ISO date: after it, the scheduled job opens an issue until someone re-reads the policy and moves the pin or the date",
+    "opt_in      true: a backend only an operator turns on; an issue only on a fixable CRITICAL or an EOSL base",
+    "A THIRD_PARTY row missing here is scanned all the same, as a default-on service with no line."
+  ],
+  "rows": {
+    "nginx": {
+      "line": "1.30",
+      "policy": "https://nginx.org/en/download.html",
+      "recheck_by": "2027-04-30",
+      "opt_in": false,
+      "why": "1.30 is the stable line since 2026-04-14; nginx ships a new stable line each spring and the old one stops getting fixes"
+    },
+    "nats": {
+      "line": "2.14",
+      "policy": "https://docs.nats.io/release-notes/",
+      "recheck_by": "2027-03-17",
+      "opt_in": false,
+      "why": "two lines get patches (the latest minor and the one before); 2.15 shipped 2026-09-17 and a minor ships roughly every six months, so 2.14 ends with 2.16, expected around 2027-03-17"
+    },
+    "redis": {"line": "8.6-debian13-dev", "policy": null, "recheck_by": "2027-05-20", "opt_in": false,
+              "why": "DHI tag; line is the pinned tag, re-checked 6 months out"},
+    "loki": {"line": "3", "policy": null, "recheck_by": "2027-05-20", "opt_in": false,
+             "why": "DHI tag; line is the pinned tag, re-checked 6 months out"},
+    "tempo": {"line": "2", "policy": null, "recheck_by": "2027-05-20", "opt_in": false,
+              "why": "DHI tag; line is the pinned tag, re-checked 6 months out"},
+    "prometheus": {"line": "3", "policy": null, "recheck_by": "2027-05-20", "opt_in": false,
+                   "why": "DHI tag; line is the pinned tag, re-checked 6 months out"},
+    "alertmanager": {"line": "0", "policy": null, "recheck_by": "2027-05-20", "opt_in": false,
+                     "why": "DHI tag; line is the pinned tag, re-checked 6 months out"},
+    "grafana": {"line": "12-debian13-dev", "policy": null, "recheck_by": "2027-05-20", "opt_in": false,
+                "why": "DHI tag; line is the pinned tag, re-checked 6 months out"},
+    "node-exporter": {"line": "1", "policy": null, "recheck_by": "2027-05-20", "opt_in": false,
+                      "why": "DHI tag; line is the pinned tag, re-checked 6 months out"},
+    "tei": {"line": "1", "policy": null, "recheck_by": null, "opt_in": false,
+            "why": "no published support policy: only the newer-upstream note"},
+    "tei-cpu": {"line": "cpu-1", "policy": null, "recheck_by": null, "opt_in": false,
+                "why": "no published support policy: only the newer-upstream note"},
+    "vllm": {"line": "v0", "policy": null, "recheck_by": null, "opt_in": true,
+             "why": "opt-in backend; no published support policy: only the newer-upstream note"}
+  }
+}

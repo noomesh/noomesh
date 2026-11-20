@@ -1,0 +1,180 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+#
+# Weekly scan of the third-party images we PIN but do not build
+# (noomesh-internal i1100).
+#
+# infra-staged.yml and the release lanes scan the images we BUILD. An image
+# we only pin by digest (scripts/stack-lock-third-party.py THIRD_PARTY: nats,
+# nginx, the DHI set, tei, tei-cpu, vllm) was scanned nowhere after the day
+# it was pinned: nginx sat at 3 CRITICAL / 67 HIGH on an EOL line unnoticed.
+#
+#   scan    every THIRD_PARTY row's digest pinned by dev's compose AND by the
+#           latest FINAL release's stack lock, once per digest, with the
+#           pinned Trivy (scripts/infra-scan.sh install-trivy), remotely
+#           (--image-src remote: no docker pull), linux/amd64, vuln scanner,
+#           HIGH/CRITICAL fixed and unfixed. Sequential, scan cache cleaned
+#           after each image (vLLM's layers are multi-GB). The reports are the
+#           run's `third-party-scan` artifact.
+#   issues  scripts/third-party-scan.py decides, per row, from the reports and
+#           scripts/third-party-lines.json: one open `third-party-image` issue
+#           per image, a comment only when the triggering set changes, closed
+#           when the pin moves or nothing triggers. Only this job may write
+#           issues. The repository is PUBLIC: the issue carries image names,
+#           digests, versions, counts, CVE/GHSA ids, upstream tags, the line
+#           data and the run URL, nothing else.
+#
+# A scan that fails leaves that row's issue untouched and turns the run red.
+# Like every scheduled workflow, the schedule runs from the DEFAULT branch, so
+# it starts once this file reaches main; it always scans dev's pins.
+name: third-party image scan
+on:
+  schedule:
+    - cron: '41 4 * * 1'   # weekly, Monday 04:41 UTC
+  push:
+    branches: [dev]
+    paths:
+      - 'docker-compose*.yml'
+      - 'scripts/stack-lock-third-party.py'
+      - 'scripts/third-party-lines.json'
+      - 'scripts/third-party-scan.py'
+      - '.github/workflows/third-party-scan.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: third-party-scan   # one run edits the issues at a time
+  cancel-in-progress: false
+env:
+  # The schedule runs on main: it scans dev. A push is to dev; a dispatch
+  # scans the ref it was dispatched on, and only a dev run writes issues.
+  SCAN_REF: ${{ github.event_name == 'schedule' && 'refs/heads/dev' || github.ref }}
+jobs:
+  scan:
+    if: github.repository == 'noomesh/noomesh'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout   # actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.SCAN_REF }}
+          persist-credentials: false
+
+      - name: Free disk (vLLM's layers are multi-GB)
+        run: scripts/ci-free-disk.sh
+
+      - name: The latest final's stack lock
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          mkdir -p final
+          tag="$(gh release list -R "$GH_REPO" --exclude-drafts --exclude-pre-releases --limit 100 \
+                   --json tagName --jq '[.[].tagName | select(test("^stack-v[0-9]+\\.[0-9]+\\.[0-9]+$"))][0] // ""')"
+          if [ -z "$tag" ]; then
+            echo "::warning::no final stack-v* release: scanning dev's pins only"; exit 0
+          fi
+          gh release download "$tag" -R "$GH_REPO" --pattern "$tag.lock" --dir final
+          echo "LOCK=final/$tag.lock" >> "$GITHUB_ENV"
+          echo "latest final: $tag"
+
+      - name: Resolve the pinned digests (dev's compose + the final's lock)
+        run: |
+          set -eu
+          python3 scripts/third-party-scan.py targets ${LOCK:+--lock "$LOCK"} --out targets.json > scan-list.txt
+          cat scan-list.txt
+
+      - name: Install Trivy (pinned, checksum-verified)
+        run: scripts/infra-scan.sh install-trivy
+
+      - name: Scan each pinned digest (remote, sequential)
+        run: |
+          set -u
+          mkdir -p scan
+          trivy image --download-db-only
+          : > scan/failed
+          while read -r digest ref; do
+            out="scan/${digest#sha256:}.json"
+            echo "::group::$ref"
+            if ! trivy image --skip-db-update --image-src remote --platform linux/amd64 --scanners vuln \
+                   --severity HIGH,CRITICAL --format json -o "$out" "$ref"; then
+              echo "::error::could not scan $ref; its issue is left as it is"
+              echo "$ref" >> scan/failed
+              rm -f "$out"
+            fi
+            trivy clean --scan-cache || true
+            df -h / | tail -1
+            echo "::endgroup::"
+          done < scan-list.txt
+
+      - name: Upstream tags (best effort, for the newer-tag note)
+        run: |
+          set -u
+          mkdir -p tags
+          command -v skopeo >/dev/null || { echo "::notice::no skopeo on this runner: no newer-tag note"; exit 0; }
+          python3 - <<'PY' > repos.txt
+          import json
+          seen = set()
+          for t in json.load(open("targets.json")):
+              if t["row"] not in seen:
+                  seen.add(t["row"])
+                  print(t["row"], t["repo"])
+          PY
+          while read -r row repo; do
+            skopeo list-tags "docker://$repo" 2>/dev/null \
+              | python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin).get("Tags") or []))' > "tags/$row.txt" \
+              || { echo "::notice::$repo: tags not listed"; rm -f "tags/$row.txt"; }
+          done < repos.txt
+
+      - name: Keep the reports as the run's artifact   # actions/upload-artifact@v7.0.2
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: third-party-scan
+          path: |
+            targets.json
+            scan/
+            tags/
+          retention-days: 30
+
+  issues:
+    name: one issue per pinned third-party image
+    needs: [scan]
+    if: always() && github.repository == 'noomesh/noomesh' && needs.scan.result != 'skipped'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read   # the checkout
+      issues: write    # the third-party-image label and issues
+    steps:
+      - name: Checkout   # actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.SCAN_REF }}
+          persist-credentials: false
+      - name: The scan's reports   # actions/download-artifact@v8.0.2
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: third-party-scan
+      - name: Decide (and, from dev, open, update or close) the issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -eu
+          gh issue list -R "$GH_REPO" --label third-party-image --state open \
+            --json number,body --limit 200 > issues.json
+          python3 scripts/third-party-scan.py decide --targets targets.json --scans scan --tags tags \
+            --issues issues.json --run-url "$RUN_URL" --out actions.json
+          if [ "$SCAN_REF" != "refs/heads/dev" ]; then
+            echo "::notice::scanned $SCAN_REF, not dev: decided only, no issue is written"; cat actions.json; exit 0
+          fi
+          python3 scripts/third-party-scan.py apply --repo "$GH_REPO" --actions actions.json
+      - name: A failed scan turns the run red
+        run: |
+          set -eu
+          if [ -s scan/failed ]; then
+            echo "::error::not scanned: $(tr '\n' ' ' < scan/failed)"; exit 1
+          fi
