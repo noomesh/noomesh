@@ -20,7 +20,7 @@ import (
 // tests/test_pull_retry_tables_match.py — change both together.
 
 // pullTries is the tries in all: the first plus two retries.
-const pullTries = 3
+const pullTries = 1
 
 // pullMaxTotalWaitSecs caps the total wait across all retries.
 const pullMaxTotalWaitSecs = 45
