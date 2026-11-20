@@ -5,8 +5,9 @@ you just built, give it one document to know about, and find the dashboard.
 The command that proves it works is `noo chat --message "hello"` printing an
 answer.
 
-You need a running stack: `noo stack start`, then `noo health` exiting 0
-([install.md](install.md) §4-5).
+The wizard leaves the stack running: `noo health` exiting 0 confirms it.
+After a reboot or `noo stack stop`, `noo stack start` brings it back
+([install.md](install.md)).
 
 ## Say hello
 
@@ -75,7 +76,7 @@ More verbs (`docs`,
 The web console is at `https://localhost:8080` (and on your tailnet name if
 you joined one). A browser warns until it trusts the install's own CA:
 [trust-the-cluster-ca.md](trust-the-cluster-ca.md). Sign in with the admin
-account the wizard created. Grafana is at `https://localhost:3000`.
+account the wizard created. Grafana runs only if you said yes to dashboards in the wizard (`noo stack monitoring on` adds it later); then it is at `https://localhost:3000`.
 
 ## Voice in the console
 
