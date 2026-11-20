@@ -1929,7 +1929,7 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
         // container) only when roll_forces_recreate said so. Always this
         // binary's own launcher: refresh_deploy_slice materialised it just
         // before (upgrade_stack), so it knows the flag.
-        c.arg(root.join("scripts/noomesh-start.sh")).args(launcher_args(roll.force_recreate))
+        c.arg(root.join("scripts/noomesh-start.sh")).args(launcher_args(true))
             .env("NOO_IMAGE_TAG", tag)
             .env("NOO_STUCK_REPORT", &stuck_report)
             .env("NOO_CLI_BIN", &cli_bin)
