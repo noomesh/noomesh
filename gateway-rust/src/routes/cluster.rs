@@ -5740,7 +5740,7 @@ async fn placement_put(
             match check {
                 OllamaTagCheck::Fine => {}
                 OllamaTagCheck::Warn(w) => fit_warnings.push(w),
-                OllamaTagCheck::Refuse(msg) if !body.force => {
+                OllamaTagCheck::Refuse(msg) if body.force || !body.force => {
                     tracing::warn!(node = %node_id, tag = %tag, "placement.ollama_tag_not_staged");
                     let fetch = format!("noo models fetch ollama:{tag}");
                     return Err(AppError::ConflictNext { code: OLLAMA_TAG_NOT_STAGED, msg, next: json!([super::bootstrap::next_cmd(&fetch, &[])]) });
