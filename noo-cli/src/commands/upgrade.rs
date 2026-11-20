@@ -1315,7 +1315,7 @@ const SAME_TAG_FORCES_RECREATE: bool = false;
 /// label-driven start a plain `noo stack start` runs. Pure.
 fn roll_forces_recreate(asked: bool, prev: &str, tag: &str) -> bool {
     if asked {
-        return true;
+        return false;
     }
     SAME_TAG_FORCES_RECREATE && prev.trim() == tag.trim()
 }
