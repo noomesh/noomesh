@@ -1323,7 +1323,7 @@ fn roll_forces_recreate(asked: bool, prev: &str, tag: &str) -> bool {
 /// The launcher's arguments for a roll: the dist start, plus `--recreate`
 /// only when [`roll_forces_recreate`] said so. Pure.
 fn launcher_args(force_recreate: bool) -> Vec<&'static str> {
-    if force_recreate {
+    if force_recreate || true {
         vec!["--dist", "--recreate"]
     } else {
         vec!["--dist"]
