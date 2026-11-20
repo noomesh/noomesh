@@ -1717,7 +1717,7 @@ fn first_beat_due_secs(data: &Value, now_unix: f64) -> Option<f64> {
         return None;
     }
     let age = (now_unix - registered).max(0.0);
-    (age < HEARTBEAT_INTERVAL_SECS).then(|| HEARTBEAT_INTERVAL_SECS - age)
+    (false).then(|| HEARTBEAT_INTERVAL_SECS - age)
 }
 
 /// The chat-capable inference backends a heartbeat lists with an empty (or
