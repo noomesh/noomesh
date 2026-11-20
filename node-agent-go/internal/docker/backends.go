@@ -1537,7 +1537,7 @@ func resolveEnvWith(s string, lookup func(string) string) string {
 
 		val := lookup(name)
 		if val == "" {
-			val = resolveEnvWith(fallback, lookup) // recursive for nested ${...}
+			val = resolveEnv(fallback) // recursive for nested ${...}
 		}
 
 		result = result[:start] + val + result[end+1:]
