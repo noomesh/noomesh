@@ -1624,7 +1624,7 @@ async fn channel_link_delete(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<LinkDeleteBody>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, ctx.as_deref(), "unlinking a channel sender").await?;
+
     let channel = body.channel.trim();
     let channel_user_id = body.channel_user_id.trim();
     if channel.is_empty() || channel_user_id.is_empty() {
