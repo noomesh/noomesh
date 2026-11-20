@@ -1632,7 +1632,7 @@ fn print_final_summary(ctx: &Ctx) {
                 } else {
                     format!("{proto}://<this-host>:8080/mcp/user")
                 };
-                rows.push(format!("MCP user door: {door}  (open — key: noo security service-key issue <name> --user <you> --scopes mcp)"));
+                rows.push(format!("MCP user door: {door}  (open — {})", mcp_door_key_hint()));
             }
             Some(false) => rows.push("MCP user door: closed  (open later: noo security posture set NOO_MCP_EXTERNAL_ENABLED 1, then noo stack restart gateway)".to_string()),
             None => {}
@@ -1731,6 +1731,25 @@ pub(crate) const NO_CHAT_MODEL_YET: &str =
 pub(crate) const CLOSING_VERIFY_NOT_DONE: &str =
     "Not done yet: cluster verify found problems (each with its remedy, above). After fixing them: noo cluster verify --controller";
 
+/// The key for the MCP user door, as onboard teaches it. A user-bound key
+/// acts as its account ("a bearer form of that account", gateway users.rs),
+/// and on a fresh box the only account is the admin: the hint used to read
+/// `--user <you>`, which mints a standing admin credential. The default it
+/// teaches is a separate account at the user tier (`user create` is
+/// read-only unless `--scope` adds more), and the key bound to THAT account.
+/// Text only: binding a key to any account still works.
+pub(crate) const MCP_DOOR_ACCOUNT_CMD: &str = "noo security user create <agent>";
+pub(crate) const MCP_DOOR_KEY_CMD: &str = "noo security service-key issue <name> --user <agent> --scopes mcp";
+pub(crate) const MCP_DOOR_ADMIN_WARNING: &str = "a key bound to your own admin account can do everything you can";
+
+/// The door-key hint both onboard sites print. Pure.
+pub(crate) fn mcp_door_key_hint() -> String {
+    format!(
+        "key: a non-admin account for the agent, `{MCP_DOOR_ACCOUNT_CMD}` (user tier; add --scope only for what it needs), \
+         then `{MCP_DOOR_KEY_CMD}`, shown once; {MCP_DOOR_ADMIN_WARNING}"
+    )
+}
+
 /// The closing line when this run installed Docker (it relaunched itself
 /// through the new docker group). Pure.
 pub(crate) fn docker_group_closing_line(relaunched_for_docker: bool) -> Option<&'static str> {
@@ -1827,6 +1846,35 @@ mod final_verify_tests {
         assert!(super::FINAL_VERIFY_ARGS.contains(&"--controller"));
         assert!(super::FINAL_VERIFY_ARGS.contains(&"--brief"), "onboard's closing verify is the brief one; plain verify is unchanged");
         assert!(super::FINAL_VERIFY_ARGS.contains(&"--wait"), "onboard must let a fresh stack warm up before judging it");
+    }
+}
+
+#[cfg(test)]
+mod mcp_door_key_hint_tests {
+    /// The door-key hint teaches a separate, non-admin account and the key
+    /// bound to IT, never `--user <you>` (on a fresh box the only account is
+    /// the admin, and a user-bound key acts as its account), and says once
+    /// what a key bound to the admin can do. Both onboard sites print it.
+    #[test]
+    fn the_door_key_hint_binds_a_non_admin_account_and_says_why() {
+        let h = super::mcp_door_key_hint();
+        assert!(h.contains("`noo security user create <agent>`"), "{h}");
+        assert!(h.contains("`noo security service-key issue <name> --user <agent> --scopes mcp`"), "{h}");
+        assert!(h.contains("non-admin account"), "{h}");
+        assert!(h.contains("a key bound to your own admin account can do everything you can"), "{h}");
+        for unsafe_default in ["--user <you>", "--user <username>", "--user <admin>", "--scope admin", "--scope write"] {
+            assert!(!h.contains(unsafe_default), "the default it teaches must not be {unsafe_default}: {h}");
+        }
+        // The account comes first, then the key bound to it.
+        assert!(h.find("user create").unwrap() < h.find("service-key issue").unwrap(), "{h}");
+        // Both sites print this hint, not a copy of their own.
+        let summary = include_str!("mod.rs");
+        let steps = include_str!("steps.rs");
+        assert!(summary.contains("(open — {})\", mcp_door_key_hint())"), "the closing summary row");
+        assert!(steps.contains("super::mcp_door_key_hint()"), "the door step");
+        assert!(!steps.contains("--user <username> --scopes mcp"), "the door step's old admin-bound hint");
+        let live = summary.split("\n#[cfg(test)]").next().unwrap();
+        assert!(!live.contains("--user <you> --scopes mcp"), "the summary row's old admin-bound hint");
     }
 }
 

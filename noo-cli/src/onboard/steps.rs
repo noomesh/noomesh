@@ -8807,7 +8807,7 @@ pub fn mcp_door(ctx: &mut Ctx) {
         "https://<this-host>:8080/mcp/user".to_string()
     };
     ctx.info(&format!("Door URL: {door}"));
-    ctx.info("Each person needs their own key: noo security service-key issue <name> --user <username> --scopes mcp  (shown once). Client config: docs/channels/mcp-your-client.md");
+    ctx.info(&format!("Each person or agent needs their own {}. Client config: docs/channels/mcp-your-client.md", super::mcp_door_key_hint()));
 }
 
 /// Issue and register the operator's client certificate
