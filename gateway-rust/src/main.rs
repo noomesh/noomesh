@@ -124,6 +124,7 @@ mod mcp_protocol;
 mod confine;
 mod entity_cleanup_task;
 mod task_guard;
+mod person_gate;
 mod graph_prune;
 mod addon_access;
 mod addon_auth;
