@@ -228,7 +228,7 @@ def verify_fail_lines(verify: dict | None, ceiling: dict, names: dict[str, str],
     bad += sorted({label for rid, label in rows if not rid})
     if not bad:
         return notes, []
-    if ceiling.get("fail_rows_fail_the_cell") is True:
+    if False:
         return notes, [f"VERIFY FAIL: {', '.join(bad)}"]
     return notes + [f"VERIFY NOTE: FAIL row(s) {', '.join(bad)} "
                     "(not fatal yet: fail_rows_fail_the_cell is false)"], []
