@@ -16,7 +16,9 @@
 #
 # The project (compose.yml beside this file): a takes a secret file, b
 # bind-mounts a config file, c has neither and depends on a, d takes a's
-# secret too. Each case prints
+# secret too. Case 11 runs a REAL nats (compose-nats.yml, its own project;
+# NOO_TEST_NATS_IMAGE, the stack's pinned mirror image by default) through a
+# HUP and the reload record noo-cli writes. Each case prints
 # one `START-INPUTS <n> PASS|FAIL: ...` line; the exit status is 1 when any
 # case failed. Cleans up its project and temp dir on exit.
 set -uo pipefail
@@ -38,6 +40,8 @@ command -v python3 >/dev/null || { echo "START-INPUTS: python3 is needed (the la
 WORK="$(mktemp -d)"
 export COMPOSE_PROJECT_NAME="noo-sitest-$$"
 cleanup() {
+    (cd "$WORK/nats" 2>/dev/null && COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT_NAME-nats" \
+        docker compose -f compose.yml down -v --remove-orphans -t 1 >/dev/null 2>&1)
     (cd "$WORK" 2>/dev/null && docker compose -f compose.yml down -v --remove-orphans -t 1 >/dev/null 2>&1)
     chmod -R u+rwX "$WORK" 2>/dev/null
     rm -rf "$WORK"
@@ -189,6 +193,149 @@ expect 9 "b" "$a6d" "$a9" "restart --force b"
 start || fail 9 "the start failed"
 a9b="$(ids)"
 expect 9 "" "$a9" "$a9b" "restart --force b (labelled), then a plain start"
+
+# 10. a file the running container has RELOADED (nats re-reads users.conf on
+#     a HUP; `noo` records a confirmed reload, noo-cli nats_reload.rs): with
+#     a record for the CURRENT container id and the file's current content,
+#     a plain start keeps the container; a hand edit after it (no record)
+#     recreates; a record for ANOTHER container id recreates. b stands in for
+#     nats: the mechanism is the label substitution (apply_reloads).
+# record_reload <service> <container id> <file> [<content sha256>|null]: what
+# noo-cli nats_reload.rs record_in_state writes into ./.noo-start-inputs.json
+# (default: the file's content now). Same container: its paths are updated;
+# another: replaced. tests/test_start_inputs_run_sh.py holds this format equal
+# to the Rust one.
+record_reload() {
+    python3 - "$SCRIPTS/noo-start-inputs.py" "$NOO_START_INPUTS_KEY_FILE" .noo-start-inputs.json "$@" <<'PY'
+import importlib.util, json, os, sys
+helper, key_file, state, svc, cid, f, *sha = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("si", helper); si = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(si)
+key = open(key_file, "rb").read()
+doc = json.load(open(state))
+assert doc.get("version") == si.STATE_VERSION and doc.get("key_id") == si.key_id(key), "state not ours"
+real = os.path.realpath(f)
+sha = sha[0] if sha else si.sha256_file(real)
+value = None if sha == "null" else si.reload_value(key, real, sha)
+old = (doc.get("reloaded") or {}).get(svc) or {}
+paths = dict(old.get("paths") or {}) if old.get("container") == cid else {}
+paths[real] = value
+doc.setdefault("reloaded", {})[svc] = {"container": cid, "paths": paths}
+si.write_private(state, json.dumps(doc, indent=1, sort_keys=True) + "\n")
+PY
+}
+same_size_edit b.conf 'b-config-0004
+'
+record_reload b "$(printf '%s\n' "$a9b" | awk '$1 == "b" { print $2 }')" b.conf || fail 10 "could not write the reload record"
+start || fail 10 "the start failed"
+a10="$(ids)"
+expect 10 "" "$a9b" "$a10" "b.conf changed, reload recorded for b's running container"
+same_size_edit b.conf 'b-config-0005
+'
+start || fail 10 "the start failed"
+a10b="$(ids)"
+expect 10 "b" "$a10" "$a10b" "b.conf hand-edited after the recorded reload (no record)"
+same_size_edit b.conf 'b-config-0006
+'
+record_reload b "$(printf '%s\n' "$a10b" | awk '$1 == "a" { print $2 }')" b.conf || fail 10 "could not write the reload record"
+start || fail 10 "the start failed"
+a10c="$(ids)"
+expect 10 "b" "$a10b" "$a10c" "b.conf changed, reload recorded for ANOTHER container id"
+
+# 11. a REAL nats (compose-nats.yml, its own project): the path `noo` takes
+#     after every users.conf render (noo-cli nats_reload.rs hup_and_record),
+#     mirrored step for step by nats_hup_and_record below:
+#       a. a valid users.conf change, HUP, "Reloaded server configuration",
+#          recorded: the next plain start keeps nats (same container id);
+#       b. a hand edit, no HUP: the next plain start recreates nats;
+#       c. a change nats REFUSES to reload (server_name is not reloadable:
+#          nats-server reload.go diffOptions), HUP, "Failed to reload server
+#          configuration", null recorded: the next plain start recreates nats.
+NATS_RELOADED="Reloaded server configuration"
+NATS_RELOAD_FAILED="Failed to reload server configuration"
+NATS_PROJECT="${COMPOSE_PROJECT_NAME}-nats"
+export NOO_TEST_NATS_IMAGE="${NOO_TEST_NATS_IMAGE:-ghcr.io/noomesh/nats:2.14.9@sha256:f0e72e96696382cc1e5bc637befd3177bb2d5b07c37fb507f8edd09827a342a3}"
+start_nats() {
+    ( cd "$WORK/nats" || exit 1
+      export COMPOSE_PROJECT_NAME="$NATS_PROJECT"
+      COMPOSE_FILES="-f compose.yml"; PROFILE_ARGS=""; START_RECREATE=false
+      start_inputs_full_up ) > "$WORK/out" 2>&1
+    local rc=$?
+    sed 's/^/    | /' "$WORK/out"
+    return "$rc"
+}
+nats_id() { COMPOSE_PROJECT_NAME="$NATS_PROJECT" ids | awk '$1 == "nats" { print $2 }'; }
+nats_ready() {  # <id>: nats logged "Server is ready" (its SIGHUP handler is in place)
+    local n
+    for n in $(seq 1 100); do
+        docker logs "$1" 2>&1 | grep -q "Server is ready" && return 0
+        sleep 0.1
+    done
+    return 1
+}
+# nats_hup_and_record <container id> <users file>: nats_reload.rs
+# hup_and_record, in shell. Content digest before; the time; HUP; up to 30
+# polls of `docker logs --since` for the verdict (a failure wins); the same
+# container after; the record: the content's value only when confirmed and
+# the file did not move, else null. Prints the verdict.
+nats_hup_and_record() {
+    local id="$1" f="$2" before after since logs verdict=unknown sha=null n
+    before="$(sha256sum < "$f" | cut -d' ' -f1)"
+    since="$(date +%s.%N)"
+    docker kill -s HUP "$id" >/dev/null 2>&1 || { echo undelivered; return 0; }
+    for n in $(seq 1 30); do
+        logs="$(docker logs --since "$since" "$id" 2>&1)" || logs=""
+        case "$logs" in
+            *"$NATS_RELOAD_FAILED"*) verdict=failed; break ;;
+            *"$NATS_RELOADED"*) verdict=confirmed; break ;;
+        esac
+        [ "$n" -lt 30 ] && sleep 0.1
+    done
+    [ "$(docker inspect -f '{{.Id}}' "$id" 2>/dev/null)" = "$id" ] || { echo moved; return 0; }
+    after="$(sha256sum < "$f" | cut -d' ' -f1)"
+    if [ "$verdict" = confirmed ] && [ "$before" = "$after" ]; then sha="$before"; fi
+    record_reload nats "$id" "$f" "$sha" || { echo unrecorded; return 0; }
+    echo "$verdict"
+}
+nats_users() {  # <user>...: a users.conf as the renderer shapes it (one account)
+    local u
+    printf 'accounts {\n  NOO: {\n    users: [\n'
+    for u in "$@"; do printf '      { user: "%s", password: "pw-%s" }\n' "$u" "$u"; done
+    printf '    ]\n  }\n}\n'
+}
+mkdir -p "$WORK/nats"
+cp "$HERE/compose-nats.yml" "$WORK/nats/compose.yml"
+printf 'listen: 0.0.0.0:4222\ninclude users.conf\n' > "$WORK/nats/nats.conf"
+nats_users gateway worker > "$WORK/nats/users.conf"
+chmod 0644 "$WORK/nats/nats.conf" "$WORK/nats/users.conf"
+start_nats || fail 11 "the first nats start failed"
+n0="$(nats_id)"
+nats_ready "$n0" || fail 11 "nats never logged \"Server is ready\""
+# a.
+nats_users gateway worker node-a > "$WORK/nats/users.conf"
+v="$(cd "$WORK/nats" && nats_hup_and_record "$n0" users.conf)"
+[ "$v" = confirmed ] || fail 11 "a valid users.conf change: the reload verdict was [$v], not confirmed"
+start_nats || fail 11 "the start failed"
+n1="$(nats_id)"
+if [ -n "$n1" ] && [ "$n1" = "$n0" ]; then pass 11 "users.conf reloaded (confirmed, recorded): nats kept its container"
+else fail 11 "users.conf reloaded (confirmed, recorded): nats was recreated ($n0 -> $n1)"; fi
+# b.
+nats_users gateway worker node-a by-hand > "$WORK/nats/users.conf"
+start_nats || fail 11 "the start failed"
+n2="$(nats_id)"
+if [ -n "$n2" ] && [ "$n2" != "$n1" ]; then pass 11 "users.conf hand-edited after the reload, no HUP: nats recreated"
+else fail 11 "users.conf hand-edited after the reload, no HUP: nats kept its container"; fi
+nats_ready "$n2" || fail 11 "the recreated nats never logged \"Server is ready\""
+# c.
+{ nats_users gateway worker node-a by-hand; printf 'server_name: refused-by-reload\n'; } > "$WORK/nats/users.conf"
+v="$(cd "$WORK/nats" && nats_hup_and_record "$n2" users.conf)"
+[ "$v" = failed ] || fail 11 "a server_name change: the reload verdict was [$v], not failed"
+python3 -c 'import json,sys; r=json.load(open(sys.argv[1]))["reloaded"]["nats"]; assert r["container"]==sys.argv[2] and all(v is None for v in r["paths"].values()), r' \
+    "$WORK/nats/.noo-start-inputs.json" "$n2" || fail 11 "the refused reload did not record null for nats"
+start_nats || fail 11 "the start failed"
+n3="$(nats_id)"
+if [ -n "$n3" ] && [ "$n3" != "$n2" ]; then pass 11 "a reload nats refused (null recorded): nats recreated"
+else fail 11 "a reload nats refused (null recorded): nats kept its container"; fi
 
 # 7. no container label carries a plain sha256 of an input, nor 16 hex of one.
 labels="$(docker ps -aq --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" | xargs -r docker inspect -f '{{json .Config.Labels}}')"

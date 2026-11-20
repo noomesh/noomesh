@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+#
+# Case 11 of scripts/test-start-inputs/run.sh: a REAL nats that re-reads its
+# included users.conf on SIGHUP, as noo-nats does (docker-compose.cluster.yml
+# mounts monitoring/nats/users.conf the same way). Its own project, so the
+# four-service cases are untouched. NOO_TEST_NATS_IMAGE: the stack's pinned
+# mirror image by default (run.sh).
+services:
+  nats:
+    image: ${NOO_TEST_NATS_IMAGE:?set NOO_TEST_NATS_IMAGE to a digest-pinned nats image}
+    command: ["-c", "/etc/nats/nats.conf"]
+    volumes:
+      - ./nats.conf:/etc/nats/nats.conf:ro
+      - ./users.conf:/etc/nats/users.conf:ro
