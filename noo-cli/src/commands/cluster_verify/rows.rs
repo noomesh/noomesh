@@ -11,6 +11,7 @@
 //!   in a test build, a verdict not listed here.
 //! - `meaning`, `clears`: one line each, for a person and an agent alike.
 //! - `findings`: the finer codes, only where one row has several reasons.
+//! - `shown_as`: the row the default table prints it inside, if it folds.
 //! - `doc`: where the long explanation lives, if anywhere.
 //!
 //! docs/reference/verify-rows.md is generated from this file
@@ -46,6 +47,10 @@ pub(crate) struct Row {
     pub meaning: &'static str,
     pub clears: &'static str,
     pub findings: &'static [Finding],
+    /// The row the default table prints this one inside, when it folds
+    /// (the ten "<dir> at rest" rows show as "data at rest"); `--json` lists
+    /// every row and carries this as `shown_as`.
+    pub shown_as: Option<&'static str>,
     pub doc: Option<&'static str>,
 }
 
@@ -58,6 +63,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether each add-on's features suggested for users or operators are actually enabled for them, and the access settings could be read.",
         clears: "Run `noo addons accept-suggestions <addon>` or `noo addons set-access <addon> <feature> on --role <role>`; `noo addons features <addon>` shows state.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -68,6 +74,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the gateway accepted every add-on's console web path, or refused one (for example a path collision).",
         clears: "Fix the add-on's signed console path claim and restart the gateway; `noo health` shows the refusals.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -78,6 +85,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the containers each enabled add-on declares are running (for example after a reboot).",
         clears: "Run `noo stack restart <addon>`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -88,6 +96,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether every enabled add-on's pinned image verifies against the signed release; an unverified add-on is left out of every start.",
         clears: "Run `noo addons upgrade`; `noo addons verify` shows which add-on fails (`noo addons list` if the enabled set is unknown).",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -98,6 +107,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the SOPS age key (which decrypts every secret) is protected on disk: sealed to the TPM and live only in RAM, or on an encrypted disk.",
         clears: "Run `noo security at-rest seal` (then `noo security at-rest finalize` after a reboot and a fresh backup), or record the accepted risk with `noo security at-rest opt-out`.",
         findings: &[],
+        shown_as: Some("data at rest"),
         doc: None,
     },
     Row {
@@ -108,6 +118,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the gateway accepted the address the node agent reported; if refused it dials a default address instead.",
         clears: "On the node set NODE_IP in /etc/noo-node-agent.env to its registered address (the remedy names it), then re-provision.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -118,6 +129,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the node agent's TLS certificate covers the address the controller dials, and no other node claims that address.",
         clears: "Re-issue the node's certificate with `noo security pki push-nodes <node>`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -128,6 +140,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the gateway has a credential node agents accept: nodes must report controller_leaf_only, or a shared token must be configured.",
         clears: "Run `noo upgrade --nodes` or `noo cluster provision <node> --wait`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -138,6 +151,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether unread agent mail is stuck in mailboxes that were retired.",
         clears: "Read it with `noo_agent_inbox orphaned=true` through an MCP door.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -148,6 +162,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether Prometheus is scraping every registered node agent.",
         clears: "Fix the cause named (a certificate with no address: `noo security pki issue-node <node> <host>`), or wait a minute for the scrape list.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -158,6 +173,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether each Linux node agent runs held to only the filesystem paths it must write.",
         clears: "Run `noo cluster provision <node> --wait`; for a refused setting fix that setting on the node, then provision.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -168,6 +184,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether other places holding sensitive text (some docker volumes, docker logs, journald) sit on an encrypted disk.",
         clears: "Informational: these places have no encryption step of their own yet; record the accepted risk with `noo security at-rest opt-out`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -178,6 +195,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the TPM-sealed age key is bound to Secure Boot and that state still matches, so the next boot can unseal it.",
         clears: "Run `noo security at-rest seal`; turn Secure Boot on first if it is off.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -188,6 +206,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the encrypted state volume has a recovery key that was confirmed stored off this machine.",
         clears: "Run `noo security at-rest recovery-key`, store the new key off the machine and acknowledge it.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -198,6 +217,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether swap could write secrets from memory to an unencrypted disk.",
         clears: "Use zram or encrypted swap, or turn swap off (`sudo swapoff -a` and remove it from /etc/fstab).",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -208,6 +228,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether this machine has a usable TPM 2.0 and the tools needed to seal keys and encrypt state at rest.",
         clears: "Install the missing tools or follow the hint in the row; no TPM means nothing can clear it.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -218,6 +239,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the controller's state lives on an encrypted (LUKS) volume that is open, mounted and actually holding the state.",
         clears: "Run `noo security at-rest create-volume`, then `noo security at-rest migrate --dry-run`; if the volume is down, `systemctl status` its cryptsetup unit.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -228,6 +250,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the encrypted state volume's TPM lock matches Secure Boot now: a mismatch means it will not unlock at next boot.",
         clears: "Run `noo security at-rest reenroll` (or `noo security at-rest reenroll --pcrs 7` to bind it to Secure Boot).",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -238,6 +261,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the audit signing key exists in the secret store; without it the gateway will not start.",
         clears: "Run `noo upgrade --stack` (it mints the key); `noo security secrets audit` if the store is unreadable.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -248,6 +272,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the tamper-evident security audit log verifies, with no lost or stuck rows.",
         clears: "Run `noo security audit verify`; if the key is missing `noo upgrade --stack`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -258,6 +283,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the extra container capabilities a node asked for for its inference backends are allowed; refused ones are dropped.",
         clears: "Edit NOO_BACKEND_CAP_ADD in /etc/noo-node-agent.env on the node to names from the allow-list.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -268,6 +294,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the node's inference backends are behind encrypted doors with valid, unexpired certificates and no refusals.",
         clears: "Run `noo cluster provision <node>` (add `--wait` for older agents); re-run if it says starting.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -278,6 +305,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether running backend containers use fixed images (pinned or versioned), not moving tags like latest.",
         clears: "Remove the floating container with `docker rm -f` on the node so it is recreated from the pinned image, or run `noo cluster provision <node> --wait` for older agents.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -288,6 +316,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the node refused to start a backend and keeps refusing (for example a missing or quarantined model file).",
         clears: "Run the `noo cluster sync-model-files` command the reason names, else `noo cluster show <node>`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -298,6 +327,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether every inference backend in the shipped compose file sits behind an encrypted door that demands a client certificate and publishes no open port.",
         clears: "Run `noo upgrade --stack` to restore the shipped compose file and stunnel configs.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -308,6 +338,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the boot partition has room and an intact copy of the next-boot initrd so the node will reboot.",
         clears: "Follow the row's steps: pin a known-good boot entry, shrink and recopy the initrd, avoid apt and kernelstub; `noo cluster provision <node> --wait` if the agent is old.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -318,6 +349,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the node is connected to the message bus on its own identity so jobs reach it.",
         clears: "Run `noo cluster provision <node>`; `noo cluster nats-creds rotate <node>` if it is on the wrong identity.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -328,6 +360,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether every client calling the gateway is a known tailnet device and none is looping on refusals.",
         clears: "Run `noo doctor strangers`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -338,6 +371,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the node's own certificate is not expired or about to expire.",
         clears: "Run `noo security pki issue-node <node> && noo cluster provision <node>`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -348,6 +382,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether every certificate under the PKI directory is still valid, not expired or due within 30 days.",
         clears: "Run `noo security pki rotate-all` (`noo security pki status` to list).",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -358,6 +393,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether a stored cloud provider key is usable: the cloud routing switch must be on or chat to cloud models is refused.",
         clears: "Turn on Cloud model routing in the console Settings, or remove the key; `noo security secrets audit` if the store is unreadable.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -368,6 +404,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether companion agents (sensors) run the same build as their host node's agent.",
         clears: "Run `noo cluster provision <host> --wait`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -378,6 +415,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether every container sees the same noomesh.yaml as the host, so config changes are not silently lost.",
         clears: "Run `noo stack restart --force <service>` for the named services.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -388,6 +426,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the controller can reach the node's control calls over the message bus, not just over HTTPS.",
         clears: "Run `noo cluster nats-users render` then `noo cluster restart-agent <node>`; `noo cluster provision <node> --wait` for old agents.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -398,6 +437,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the controller compose's HF cache `hub` folder is owned like its parent, so model downloads can write to it.",
         clears: "Run the printed `sudo chown -R -P -h <uid>:<gid> <hub>` once at a terminal.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -408,6 +448,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "One summary row that folds the per-directory 'at rest' rows: which data directories sit unencrypted on disk (worst state shown).",
         clears: "Put the listed directories on an encrypted (dm-crypt/LUKS) disk, or record the accepted risk with `noo security at-rest opt-out`; `--verbose` shows the per-directory rows.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -418,6 +459,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether every data directory the release's compose file mounts (under the data and state roots) exists on the controller.",
         clears: "Run `noo onboard --only storage`; when only the next release's new directories are missing, `noo upgrade --stack` creates them.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -428,6 +470,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the node's data root agrees across what the controller declared, what the agent runs on, and where its running containers mount data.",
         clears: "Make them agree: `noo cluster set-config <node> --data-root <path>` then `noo cluster provision <node> --wait`; warn: `noo cluster provision <node> --wait` for an older agent.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -438,6 +481,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the data root sits on the filesystem recorded for it, so a missing mount does not start Postgres empty.",
         clears: "Check `findmnt` and `lsblk -f` and the data-root recovery runbook; the next `noo stack start` records it.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -448,6 +492,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the node's data root is a dedicated, conventional directory owned by the agent; fails once the node enforces the policy, else warns.",
         clears: "Fix the owner/permissions or declare the root, e.g. `noo cluster set-config <node> --data-root <path>` then `noo cluster provision <node> --wait`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -458,6 +503,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Where an unpinned chat request (model default/auto) goes right now, and whether any live chat model, GPU, or second node backs it.",
         clears: "Place a chat model on a node: `noo cluster place <node> <backend> <model>` (check with `noo cluster class list`).",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -468,6 +514,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the node's Docker Engine is new enough (version 27 or later, the oldest noomesh tests) and readable.",
         clears: "Upgrade Docker Engine on the node to 27 or newer, then `noo cluster verify <node>`; for an unreadable engine check the daemon and socket.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -478,6 +525,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether Docker remaps container user ids (userns-remap), which would make services unable to read their private keys.",
         clears: "Remove \"userns-remap\" from /etc/docker/daemon.json, then `sudo systemctl restart docker`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -488,6 +536,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether each pinned backend door image the node runs is staged on the controller's image rail by its exact pinned digest.",
         clears: "Run `noo upgrade --stack` to restage door pins by digest, then verify again.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -498,6 +547,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether each embedding space has a live node serving its model; fails if the default space has none, warns on other gaps or migrations.",
         clears: "Inspect with `noo cluster embedding-space list`, then place or start the embedder the space needs.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -508,6 +558,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the installed entitlement (licence token) is present and valid when a licensed add-on is on.",
         clears: "Install a valid token with `noo security entitlement install <token>`, or inspect with `noo security entitlement show`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -518,6 +569,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the daily purge of archived user erasures is running, i.e. no archived copy is older than the 30-day window plus a day.",
         clears: "Check the purge with `noo logs search erasure_purge --since 2d` and fix why it is not running.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -528,6 +580,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether published ports are limited to the tailnet or loopback, and that a reboot cannot break the tailnet binding.",
         clears: "Set NOO_BIND_MODE=tailnet in .env then `noo stack restart --force`; for the reboot case apply the `noo doctor` nonlocal-bind fix; read with `noo doctor exposure`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -538,6 +591,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Warns, on AMD machines, that a BIOS update can reset the firmware TPM and leave only the recovery key able to open the volume.",
         clears: "Informational; keep the recovery key at hand and run `noo security at-rest reenroll` after the update. Always OK on non-AMD CPUs.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -548,6 +602,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether a recent backup (under 24 hours old) exists in case the encrypted volume cannot be unlocked after a firmware update.",
         clears: "Make a fresh backup (`scripts/backup-controller.sh`); `noo backups status` shows what exists.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -558,6 +613,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether each add-on enabled in noomesh.yaml was accepted and is running in the gateway, not refused.",
         clears: "Fix the add-on's manifest and run `noo addons check <bundle-dir>`; if just not started, `noo stack start`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -568,6 +624,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the gateway minted the key add-ons use to call it at start; without it add-on calls are refused with 401.",
         clears: "Run `noo stack restart gateway`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -578,6 +635,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the gateway is connected to the NATS message bus; without it dispatch, gossip and agent mail answer 503.",
         clears: "Make NATS run: `noo stack start` (check `noo stack status`); the gateway reconnects by itself.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -588,6 +646,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the gateway's open file descriptors are far below its limit; a leak can leave it unable to read secrets or reach the database.",
         clears: "Warn: look at `noo stack logs gateway --tail 200`; fail: `noo stack restart gateway` and investigate the leak.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -598,6 +657,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the gateway mounts only the safe parts of the PKI directory and its public certificate copy matches nodes/ and services/ without private keys.",
         clears: "Run `noo upgrade --stack` for wide mounts, or `noo security pki fix-modes` to resync pki/public/.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -608,6 +668,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the gateway is connected to Redis; without it jobs, rate limiting and the response cache run degraded.",
         clears: "Make Redis reachable and run `noo stack restart gateway`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -618,6 +679,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "The node's GPU state: free, shared with other programs, yielded, held by a lease, or lost by the driver.",
         clears: "Fail (driver lost): reboot the node. Held: `noo cluster gpu release <node>` or `noo cluster gpu mode <node> mesh` when the other work is done; yielded resumes by itself.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -628,6 +690,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the kernel the node boots next (and its fallback kernel) has the NVIDIA driver module, so the GPU still works after a reboot.",
         clears: "Install the NVIDIA module for that kernel or make the running kernel the fallback, as the node's kernel runbook says.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -638,6 +701,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether any stack container is stuck stopped because the GPU did not answer when it started.",
         clears: "Reboot the host, then `noo stack start`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -648,6 +712,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether a model placed on the GPU is actually running on the CPU because the node cannot run the CUDA llama.cpp image.",
         clears: "`noo cluster place <node> <backend> <model> --on cpu`, or place it on ollama or vllm for a GPU.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -658,6 +723,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether Grafana's database directory (users, sessions, dashboards) sits on an encrypted disk.",
         clears: "The disk holding it is encrypted (dm-crypt/LUKS); or record the accepted risk with `noo security at-rest opt-out` (the row then reads accepted).",
         findings: &[],
+        shown_as: Some("data at rest"),
         doc: None,
     },
     Row {
@@ -668,6 +734,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether Grafana is reached only through noomesh sign-in, over HTTPS, with its port not exposed wider than loopback or the tailnet.",
         clears: "`noo upgrade --stack` fixes most cases (`noo upgrade --all` for data sources, `noo stack restart --force` for a stale gateway).",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -678,6 +745,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the key pair that lets the console's Open Grafana sign in exists, is readable by the gateway, and is mounted into Grafana.",
         clears: "Run `noo security pki issue-sso-key` then `noo stack restart --force`; or `noo upgrade --stack` for the compose mount.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -688,6 +756,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the node runs an upstream backend image (ollama, llama.cpp) where noomesh ships its own hardened build.",
         clears: "Stage ours: `noo cluster sync-images <node> -i <hardened-ref>` (or restage by lock via `noo upgrade --stack`); unset any LLAMACPP_IMAGE/OLLAMA_IMAGE override.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -698,6 +767,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the node's agent harness runs as its declared policy says (running when wanted, stopped when off).",
         clears: "Check `noo cluster logs <node> harness`, or `noo cluster unplace <node> harness` when the policy is off.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -708,6 +778,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the node's harness is firewalled off the internet (egress hold) and its hosts file is current.",
         clears: "Run `noo cluster provision <node>`; for an old agent `noo upgrade --all`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -718,6 +789,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether any node's last apply refused the harness unit because its systemd is older than 247, leaving it on its previous unit.",
         clears: "Upgrade systemd on the named node to 247 or newer.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -728,6 +800,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the node's harness has a stalled task (no progress for 45 minutes) or tasks queued for over 30 minutes.",
         clears: "Look at `noo tasks list`; the harness releases a stalled task itself, a queue clears as slots free.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -738,6 +811,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the self-node agent's HF cache `hub` folder is owned like its parent, so model downloads can write to it.",
         clears: "Usually the node's next apply fixes it; otherwise run the printed `sudo chown -R -P -h` command.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -748,6 +822,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the platform packages (kernel, NVIDIA driver and similar) are held so an ordinary apt upgrade cannot move them.",
         clears: "Apply the package hold command in the node's kernel runbook.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -758,6 +833,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether tailscaled uploads its logs to Tailscale or Ubuntu reporters (motd-news, popularity-contest, whoopsie) are on; log upload fails, reporters warn.",
         clears: "Run `noo cluster host-telemetry apply <node>` for tailscaled; disable each named Ubuntu reporter with the printed command.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -768,6 +844,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether noo-hostd, the privileged helper every node host operation needs, is alive.",
         clears: "Run `noo cluster provision <node>` to ship the helper (`--wait` for an old agent).",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -778,6 +855,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the stack's runtime containers run the expected image family as non-root with a readable key.",
         clears: "`noo upgrade --stack`; `noo security pki fix-modes` for key access; `noo upgrade` if NOO_BASE_REGISTRY is the old upstream one.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -788,6 +866,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether cleanup of superseded noomesh images on the controller is working: not blocked after a roll and Docker not refusing removals.",
         clears: "Informational; see the named blocker, a later roll or `noo upgrade` re-runs the cleanup.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -798,6 +877,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether every image the node runs came from the controller's image rail rather than local or a public registry.",
         clears: "Stage it: `noo cluster sync-images <node> -i <image>`; the agent takes the rail copy on its next start.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -808,6 +888,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether every image placed on the node is staged on the controller's rail for the node's architecture.",
         clears: "Run `noo cluster sync-images <node> -i <image>` or `noo upgrade` for release images.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -818,6 +899,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the controller can reach the node agent over the network.",
         clears: "Check `noo cluster show <node>` for its address and the tailnet grant; a node reached over its bus is OK.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -828,6 +910,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the controller sends entity names to the kiosk display (a warning when on, so it is seen), or the setting cannot be read.",
         clears: "Turn it off with `noo kiosk labels off`; `noo kiosk labels status` to read it.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -838,6 +921,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether each chat model lane the node's agent reports is serving or on demand, i.e. routable.",
         clears: "Look at `noo cluster show <node>`; start or place the named lane.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -848,6 +932,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "How old the last good database backup is: warn past about a day, fail past two days.",
         clears: "Run `noo heartbeat run database_backup`, then `noo heartbeat history database_backup`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -858,6 +943,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether any retired credential lane (old CLI, fleet secret, v1 tokens) is still being used or refused, over a stated time window.",
         clears: "Follow the named caller: e.g. `noo upgrade --all`, `noo upgrade --nodes`, `noo cluster provision <node> --wait` or `noo security service-key provision <consumer>`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -868,6 +954,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether a llama.cpp model placed on the GPU actually offloaded its layers to the GPU rather than running on the CPU.",
         clears: "Update the NVIDIA driver on the node (CUDA 12.9 build needs 575+), or `noo cluster place <node> llamacpp <model> --on cpu`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -878,6 +965,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the node is sending its container and host logs to the controller, and not stuck with a backlog.",
         clears: "Enable with NOO_LOG_SHIP=1 in /etc/noo-node-agent.env and restart the agent, or `noo cluster provision <node> --wait`; `noo upgrade --stack` for an old gateway.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -888,6 +976,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the controller's log-reading endpoints refuse anonymous callers.",
         clears: "Refusal (401/403) is OK; if open, `noo upgrade --stack`; if the gateway did not answer, check `noo health`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -898,6 +987,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the controller has recently accepted logs from every online node.",
         clears: "Fix the node's shipper (see its `log shipper` row): `noo cluster verify <node>`, `noo cluster provision <node> --wait`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -908,6 +998,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the log store (Loki) is configured and ready for the gateway to query.",
         clears: "Issue its certificate `noo security pki issue-service loki`, `noo upgrade --stack`, then `noo stack restart --force loki`; inspect with `noo stack status` / `noo logs status`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -918,6 +1009,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the log store's data directory sits on an encrypted disk; logs are otherwise readable by anyone holding the drive.",
         clears: "The disk holding it is encrypted (dm-crypt/LUKS); or record the accepted risk with `noo security at-rest opt-out` (the row then reads accepted).",
         findings: &[],
+        shown_as: Some("data at rest"),
         doc: None,
     },
     Row {
@@ -928,6 +1020,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the log store only accepts callers with a cluster client certificate and publishes no host port.",
         clears: "Restore the shipped Loki config and compose file with `noo upgrade --stack`; remove any `ports:` block from the loki service.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -938,6 +1031,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether Prometheus can scrape the controller's /metrics: mTLS enforcement on and all monitoring service certificates present.",
         clears: "Remove NOO_MTLS_GATEWAY=false from .env and `noo stack restart --force`, or `noo security pki issue-service <service>`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -948,6 +1042,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the model-weight cache serves over mTLS only and every node can reach it.",
         clears: "Issue its certificate `noo security pki issue-service model-cache`, restore the shipped nginx/compose files, or `noo cluster provision <node>`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -958,6 +1053,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether every declared model class has at least one candidate model that is placed or available.",
         clears: "Place the missing model with `noo cluster place <node> <backend> <model>`; `noo cluster class list` shows the state.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -968,6 +1064,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether models loaded on nodes stay within their memory estimate; names nodes whose measured use is over it.",
         clears: "Review with `noo cluster fit <node>`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -978,6 +1075,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether any of the node's model stores is writable by every account on the machine (anyone could plant model files).",
         clears: "Run the printed `sudo chmod o-w <path>` on that node.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -988,6 +1086,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether every monitoring service that mounts a web-config file actually loads it, so its port needs TLS and a client certificate.",
         clears: "Restore the shipped file with `noo upgrade --stack`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -998,6 +1097,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the message bus data directory sits on an encrypted disk; queued tasks and mail are otherwise readable from the drive.",
         clears: "The disk holding it is encrypted (dm-crypt/LUKS); or record the accepted risk with `noo security at-rest opt-out` (the row then reads accepted).",
         findings: &[],
+        shown_as: Some("data at rest"),
         doc: None,
     },
     Row {
@@ -1008,6 +1108,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether every message-bus login is its own per-principal account, with no retired shared user or retired bridge setting.",
         clears: "`noo cluster nats-users render`; remove the retired setting via `noo security posture set NOO_NATS_LEGACY_SHARED_CREDS 0` and `noo stack restart gateway`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1018,6 +1119,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the message bus accepts only mTLS connections, with no plaintext config or setting left.",
         clears: "Restore the shipped file with `noo upgrade --stack`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1028,6 +1130,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the boot-restore unit that brings back containers sharing another's network is installed and enabled.",
         clears: "Install/enable the unit with the remedy the row prints (it varies by install, e.g. via the node's applier or one sudo line).",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1038,6 +1141,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the node's next reboot will start the kernel it is running now, not an untested newer one.",
         clears: "Boot the new kernel on a canary first; see docs/operating/runbooks/host-updates.md. Informational on WSL2.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1048,6 +1152,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the node-agent container runs unprivileged, as the security posture says it should.",
         clears: "`noo security posture set NOO_NODE_AGENT_PRIVILEGED false`, or `noo security posture apply-profile hardened`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1058,6 +1163,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the node's own declarations file (kept across upgrades) is accepted, with every declaration in effect.",
         clears: "Fix the file on the node (root-owned, mode 644, valid keys) and restart the node agent.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1068,6 +1174,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the gateway's data volume (uploads, artifacts, state) sits on an encrypted disk.",
         clears: "The disk holding it is encrypted (dm-crypt/LUKS); or record the accepted risk with `noo security at-rest opt-out` (the row then reads accepted).",
         findings: &[],
+        shown_as: Some("data at rest"),
         doc: None,
     },
     Row {
@@ -1078,6 +1185,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the gateway's data volume lives under the chosen data root instead of docker's default volume store.",
         clears: "`noo onboard --only storage` for an unset data root; a FAIL means a bug, report it.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1088,6 +1196,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether backups are copied off this machine, or the person deliberately chose not to.",
         clears: "`noo backups setup` to choose a destination; `noo backups status` if behind.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1098,6 +1207,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether each Ollama model on the node matches the controller's record of it, so the weights served are the controller's.",
         clears: "Re-pull through noo: `noo models pull <model>` on the controller's own node, else `noo models fetch ollama:<tag>` then `noo cluster import-model <node> ollama:<tag>`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1108,6 +1218,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "On a CPU-only controller, whether the stack's Ollama runs one slot, which is faster and uses less cache.",
         clears: "Run `noo config set compose_env '{\"OLLAMA_EMBED_NUM_PARALLEL\":\"1\"}' && noo stack restart --force ollama-embed`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1118,6 +1229,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the node is online and has sent a heartbeat recently.",
         clears: "Check `noo cluster logs <node>` / `noo cluster show <node>`; `noo cluster provision <node> --wait` if its beats are refused; starting clears with `noo cluster verify --wait`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1128,6 +1240,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the node agent demands a client certificate on its control API.",
         clears: "`noo cluster provision <node> --wait`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1138,6 +1251,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the cluster CA and service private keys sit on an encrypted disk.",
         clears: "The disk holding it is encrypted (dm-crypt/LUKS); or record the accepted risk with `noo security at-rest opt-out` (the row then reads accepted).",
         findings: &[],
+        shown_as: Some("data at rest"),
         doc: None,
     },
     Row {
@@ -1148,6 +1262,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether every private key under the PKI directory is readable only by the account that needs it.",
         clears: "`noo security pki fix-modes` (run its printed sudo lines if any); `noo upgrade --stack` also repairs.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1158,6 +1273,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the database files sit on an encrypted disk.",
         clears: "The disk holding it is encrypted (dm-crypt/LUKS); or record the accepted risk with `noo security at-rest opt-out` (the row then reads accepted).",
         findings: &[],
+        shown_as: Some("data at rest"),
         doc: None,
     },
     Row {
@@ -1168,6 +1284,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the database accepts only TLS clients with a cluster certificate and a password, and the running service uses that policy.",
         clears: "Restore the shipped file with `noo upgrade --stack`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1178,6 +1295,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the running Postgres was created with the memory sizes this install asks for.",
         clears: "`noo stack restart --force postgres` to recreate it.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1188,6 +1306,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether each database role has its own client certificate and the database requires it.",
         clears: "`noo upgrade --stack` (issues role certificates, refreshes the policy), `noo stack restart --force postgres`; or `noo onboard --only enrollment`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1198,6 +1317,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether a live test shows the database refusing clients with no certificate and plaintext connections.",
         clears: "Restore the shipped pg_hba.conf and recreate postgres (`noo stack restart --force`); `noo stack status` if the probe could not run.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1208,6 +1328,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether every security setting (gate) the running stack uses matches what was chosen, with no restart pending.",
         clears: "`noo stack restart --force`, then `noo security posture list`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1218,6 +1339,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the metrics database sits on an encrypted disk.",
         clears: "The disk holding it is encrypted (dm-crypt/LUKS); or record the accepted risk with `noo security at-rest opt-out` (the row then reads accepted).",
         findings: &[],
+        shown_as: Some("data at rest"),
         doc: None,
     },
     Row {
@@ -1228,6 +1350,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Lists add-ons whose database was set up but which are not switched on, so no services run for them.",
         clears: "Informational; switch the add-on on to start its services.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1238,6 +1361,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the encrypted volume has a recovery key that someone confirmed storing off this machine.",
         clears: "Run `noo security at-rest recovery-key`, store the key off the machine and acknowledge it.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1248,6 +1372,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the Redis dumps (sessions, rate limits, caches) sit on an encrypted disk.",
         clears: "The disk holding it is encrypted (dm-crypt/LUKS); or record the accepted risk with `noo security at-rest opt-out` (the row then reads accepted).",
         findings: &[],
+        shown_as: Some("data at rest"),
         doc: None,
     },
     Row {
@@ -1258,6 +1383,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the controller has cached every release file the nodes' bundles need for this version.",
         clears: "`noo upgrade --nodes`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1268,6 +1394,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether each node's updater installs root-level code only from a release-signed list, and none has refused a bundle.",
         clears: "`noo upgrade --all`; if a node is ahead of its controller, `noo upgrade --stack`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1278,6 +1405,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether any stack container keeps restarting in a loop.",
         clears: "`noo stack logs <service>` to find why, then fix and restart.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1288,6 +1416,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether a container of a service the project retired as unsafe is still running.",
         clears: "Remove it with `docker rm -f <container>`; `noo doctor orphans` if the list could not be read.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1298,6 +1427,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether sandboxed code runs under its own unprivileged user inside a working jail, never as the sandbox server.",
         clears: "`noo upgrade --stack`, `noo stack restart --force sandbox`, `noo stack logs sandbox`; the AppArmor case names `noo onboard --only services`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1308,6 +1438,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the code-execution sandbox accepts only callers with a cluster certificate, no plain HTTP, and publishes no host port.",
         clears: "Restore the shipped compose file with `noo upgrade --stack`, then `noo stack restart --force sandbox`; for a leaf mismatch `noo security pki issue-service sandbox`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1318,6 +1449,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the secret files delivered to containers could be checked; names containers the audit did not check.",
         clears: "`noo security secrets audit`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1328,6 +1460,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether every container that holds a shared secret agrees on its value.",
         clears: "Run `noo doctor secrets` and fix what it names.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1338,6 +1471,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether every secret lives in the encrypted store and `.env` holds none.",
         clears: "`noo onboard --reconfigure --only secrets --secrets-backend sops` then `noo security secrets tidy`; `tidy` alone if the store already has all.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1348,6 +1482,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the secrets audit finds any error in how secrets are stored and delivered.",
         clears: "Run `noo security secrets audit` and fix each error it lists.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1358,6 +1493,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether any container holds a secret as a plain environment variable or leaves plaintext under secrets/.",
         clears: "Remedy depends on the finding (printed with the row); `noo stack status` if nothing is running.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1368,6 +1504,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Warns that a firmware update of the Secure Boot database will change the volume's TPM lock and stop it unlocking until re-enrolled.",
         clears: "Informational before the update; afterwards run `noo security at-rest reenroll`. OK when the volume is TPM-only (not bound to Secure Boot).",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1378,6 +1515,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the controller's own node is updated over the normal rail like every other node, not by a one-off sudo install.",
         clears: "`noo cluster provision <node>` for a sudo-lane install; `noo onboard --only services` if the node identity is incomplete.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1388,6 +1526,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the certificates of services that remote nodes dial (nats, redis, postgres, model-cache) carry every name those nodes use.",
         clears: "Re-issue with `noo security pki issue-service <svc>`, then `noo stack restart --force <svc>`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1398,6 +1537,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether each active service key carries every permission its service now declares; older keys may lack newer ones.",
         clears: "`noo security service-key provision <name>` to mint a key with the current permissions.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1408,6 +1548,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether each service that needs its own key has an active one.",
         clears: "`noo security service-key provision <name>`, or `noo addons enable <name>` for an add-on.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1418,6 +1559,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether each secret is held only by its intended containers and every bus holder has its own distinct key.",
         clears: "`noo upgrade --stack`; warn: `noo addons upgrade trellion_intel`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1428,6 +1570,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Which image the node's backend-door stunnel sidecars run on; the alpine fallback means each start installs stunnel from a mirror.",
         clears: "`noo cluster provision <node> --wait` so the node gets the published stunnel image.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1438,6 +1581,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the node has adopted the fleet signing key, which it needs to accept signed updates.",
         clears: "`noo cluster provision <node> --wait`; the node adopts the key when it applies the bundle.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1448,6 +1592,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether each running stack container runs exactly the image the release lock pins.",
         clears: "Run `noo upgrade --stack`; `noo stack status` if the check matched no container.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1458,6 +1603,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether containers of a profile this stack does not run are still running.",
         clears: "Stop and remove them by name: `docker stop <name> && docker rm <name>`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1468,6 +1614,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether images the release pins are staged on the controller by their lock digest, not by name, so pinned nodes accept them.",
         clears: "`noo cluster sync-images --stage-only --lock`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1478,6 +1625,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether streaming calls to the node work over its control tunnel.",
         clears: "Warn: `noo cluster provision <node> --wait` or check `noo cluster logs <node>`; fail: read `noo cluster logs <node>`, the node reconnects on its own.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1488,6 +1636,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether every enabled system (such as evolve or trellion) has its credentials stored, so the next restart does not crash-loop the gateway.",
         clears: "`noo systems enable <system>`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1498,6 +1647,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the node's Tailscale is connected to its control plane; just after boot it reads 'starting'.",
         clears: "Wait a minute and re-run `noo cluster verify <node>`; if still failing, restart tailscaled on the node.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1508,6 +1658,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the live tailnet access policy contains everything noomesh declares (your own extra rules are not judged).",
         clears: "`noo security tailnet policy --merge` adds only what is missing.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1518,6 +1669,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether any mesh device advertises Tailscale SSH, which noomesh never uses.",
         clears: "On each named box run `sudo tailscale set --ssh=false`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1528,6 +1680,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the gateway sends request traces to Tempo and Tempo answers /ready.",
         clears: "`noo security pki issue-service tempo` then `noo stack restart --force tempo`, or `noo upgrade --stack`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1538,6 +1691,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether Tempo's data directory (request traces) sits on an encrypted disk.",
         clears: "The disk holding it is encrypted (dm-crypt/LUKS); or record the accepted risk with `noo security at-rest opt-out` (the row then reads accepted).",
         findings: &[],
+        shown_as: Some("data at rest"),
         doc: None,
     },
     Row {
@@ -1548,6 +1702,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether Tempo requires a client certificate on both doors, keeps gRPC on loopback, has usage reporting off and publishes no port.",
         clears: "`noo upgrade --stack` restores the shipped config.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1558,6 +1713,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the encrypted volume's TPM lock matches Secure Boot as it is now, so it will still unlock at the next boot.",
         clears: "Turn Secure Boot back on, or run `noo security at-rest reenroll`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1568,6 +1724,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether containers are running that no compose file of this install declares.",
         clears: "`docker rm -f <names>` as printed; if docker is down, `sudo systemctl start docker`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1578,6 +1735,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Informational: lists nodes carrying a third-party vendor CLI that is only checked against a hash this controller pinned, not release-signed.",
         clears: "Nothing to clear; informational.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1588,6 +1746,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the node's backend containers have their vendor telemetry switches set, so no vendor phones home.",
         clears: "`noo cluster provision <node> --wait`; orphan containers are removed with `docker rm -f`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1598,6 +1757,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the node agent's version matches the controller's release.",
         clears: "`noo cluster provision <node> --wait`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1608,6 +1768,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether a node with vLLM placed has a GPU new enough for vLLM's compute floor.",
         clears: "`noo cluster unplace <node> <backend>`, then place the model on ollama or llamacpp; or `noo cluster provision <node> --wait` if capability is unknown.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1618,6 +1779,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the voice containers (whisper, piper) run as non-root and can read their keys.",
         clears: "`noo upgrade --stack`, or `noo security pki fix-modes` for key access.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1628,6 +1790,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the voice doors (whisper, piper) require a cluster client certificate, refuse plain HTTP and publish no host port.",
         clears: "`noo upgrade --stack` restores the shipped overlay, then `noo stack restart --force whisper piper`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1638,6 +1801,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the voice models are staged and the voice containers run offline.",
         clears: "`noo models pull <model>` for a missing model; `noo upgrade --stack` for an online container.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1648,6 +1812,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Names the encrypted state volume and its TPM policy; says nothing is at risk when no encrypted volume exists.",
         clears: "Always OK; informational.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1658,6 +1823,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the seat's display is running and shows the console this controller serves.",
         clears: "On the seat run the printed `noo kiosk reload`, or the repair `sudo <seat noo> kiosk seat-sync --migrate` when the display is down.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1668,6 +1834,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the seat's display runs its scripts from the shared kiosk directory, where seat updates reach them, not from a home or root-installed copy.",
         clears: "On the seat run the repair `sudo <seat noo> kiosk seat-sync --migrate`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1678,6 +1845,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "The last update changed the display but did not restart it, because its unit or scripts could not be trusted to come back; it runs what it started with.",
         clears: "On the seat run the repair `sudo <seat noo> kiosk seat-sync --migrate`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1688,6 +1856,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "The last update's display did not stay up, so the previous display scripts were put back (or putting them back failed).",
         clears: "Read the seat's `journalctl -u kiosk.service` and fix the cause; the row clears when a later update applies.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1698,6 +1867,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the seat can read its kiosk settings file; if not, its mode, view and quality are unknown.",
         clears: "On the seat run the repair `sudo <seat noo> kiosk seat-sync --migrate`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1708,6 +1878,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the seat's display unit is this release's; the seat's own sync cannot update a root-installed unit.",
         clears: "On the seat run the repair `sudo <seat noo> kiosk seat-sync --migrate`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1718,6 +1889,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the seat's root-installed display watchdog is this release's; the seat's own sync cannot update it.",
         clears: "On the seat run the repair `sudo <seat noo> kiosk seat-sync --migrate`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1728,6 +1900,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the seat's kiosk-serve unit is active, or no kiosk is set up on the seat.",
         clears: "Set it up with `noo kiosk setup` on the seat, or read its `journalctl -u kiosk-serve` when it failed.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1738,6 +1911,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the seat is bound to its tailnet device (so its display can mint a kiosk token) and not revoked.",
         clears: "Bind it with `noo kiosk seats bind <seat> <device>`; a revoked seat needs `noo kiosk seat-token <seat>`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1748,6 +1922,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the update bundle staged for the seat was applied, and applied cleanly.",
         clears: "Run `noo upgrade --seats`; a bundle not applied yet clears on the seat's next sync.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1758,6 +1933,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the seat's `noo` (and its user's copy) is the controller's version.",
         clears: "Run `noo upgrade --seats`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1768,6 +1944,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the seat is still on the old root layout, where no updates apply until it is migrated.",
         clears: "On the seat run the printed `sudo … kiosk seat-sync --migrate`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
     Row {
@@ -1778,6 +1955,7 @@ pub(crate) const ROWS: &[Row] = &[
         meaning: "Whether the seat has reached the controller recently (its sync timer runs).",
         clears: "On the seat check `systemctl status noo-seat-sync.timer` and `journalctl -u noo-seat-sync`.",
         findings: &[],
+        shown_as: None,
         doc: None,
     },
 ];
@@ -1829,6 +2007,18 @@ mod rows_registry_tests {
         let j = super::super::checks_json(&[crate::commands::cluster_verify::ok("online", "up")]);
         assert_eq!(j[0]["id"], "online");
         assert_eq!(j[0]["name"], "online");
+    }
+
+    #[test]
+    fn shown_as_is_exactly_the_rows_the_table_folds() {
+        use crate::commands::cluster_verify::{AT_REST_DIR_ROWS, AT_REST_FOLD_ROW};
+        for r in ROWS {
+            let folds = AT_REST_DIR_ROWS.contains(&r.name);
+            assert_eq!(r.shown_as, folds.then_some(AT_REST_FOLD_ROW), "`{}`", r.name);
+        }
+        assert!(by_name(AT_REST_FOLD_ROW).is_some(), "the fold row is a registered row itself");
+        let j = super::super::checks_json(&[crate::commands::cluster_verify::ok("loki at rest", "dm-crypt")]);
+        assert_eq!(j[0]["shown_as"], "data at rest");
     }
 
     #[test]

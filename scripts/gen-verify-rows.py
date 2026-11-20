@@ -48,6 +48,7 @@ def parse_registry(text: str) -> list[dict]:
         scope = re.search(r"\bscope:\s*Scope::(\w+)", b)
         verdicts = re.search(r"\bverdicts:\s*&\[([^\]]*)\]", b)
         doc = re.search(r'\bdoc:\s*(None|Some\("([^"]*)"\))', b)
+        shown = re.search(r'\bshown_as:\s*(None|Some\("([^"]*)"\))', b)
         findings = re.findall(r'Finding \{\s*code:\s*"([^"]+)",\s*clears:\s*"((?:[^"\\]|\\.)*)",\s*needs_human:\s*(true|false)', b)
         rows.append({
             "id": _str("id", b),
@@ -57,6 +58,7 @@ def parse_registry(text: str) -> list[dict]:
             "meaning": _str("meaning", b),
             "clears": _str("clears", b),
             "doc": doc.group(2) if doc and doc.group(2) else None,
+            "shown_as": shown.group(2) if shown and shown.group(2) else None,
             "findings": [{"code": c, "clears": cl, "needs_human": h == "true"} for c, cl, h in findings],
         })
     return rows
@@ -259,7 +261,9 @@ passes), `x` a failure (exit 1). A row's `id` is stable: programs key on it
 (`noo --json cluster verify` prints it beside `name`, which may be
 reworded); `id` is never null, and a null is a bug to report. Node rows
 are under `nodes[].checks`, controller rows under
-`controller.checks`.
+`controller.checks`. A row "shown as" another is printed inside that one in
+the default table (`--verbose` lists it alone); `--json` lists every row
+and carries `shown_as` on it.
 """
     parts = [head]
     titles = [("node", "Node rows (one set per node)"), ("controller", "Controller rows (`--controller`, run on the controller)"),
@@ -272,6 +276,8 @@ are under `nodes[].checks`, controller rows under
         for r in sel:
             can = ", ".join(VERDICT_MARK[v] for v in r["verdicts"] if v in VERDICT_MARK) or "OK only"
             name = f"[{r['name']}]({r['doc']})" if r["doc"] else r["name"]
+            if r["shown_as"]:
+                name += f"<br>(shown as {r['shown_as']})"
             clears = cell(r["clears"])
             if r["findings"]:
                 clears += "<br>" + "<br>".join(f"`{f['code']}`: {cell(f['clears'])}" + (" (a person)" if f["needs_human"] else "") for f in r["findings"])
