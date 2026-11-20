@@ -3250,7 +3250,7 @@ pub(crate) fn default_chat_check(classes: Option<&Value>, has_gpu: Option<bool>,
         return warn(NAME, format!("{detail} — only CPU candidates"), Some("noo cluster place <node> <backend> <model>".into()));
     }
     let one_node = nodes.len() == 1;
-    if one_node && fleet_nodes != Some(1) {
+    if one_node && fleet_nodes.is_some_and(|n| n != 1) {
         return warn(NAME, format!("{detail} — one node carries every unpinned request (no fallback)"), Some("noo cluster place <node> <backend> <model>".into()));
     }
     let later: Vec<&str> = [cpu_only.then_some(CPU_ONLY_FLEET_CHAT_LATER), one_node.then_some(ONE_NODE_FLEET_CHAT_LATER)]
