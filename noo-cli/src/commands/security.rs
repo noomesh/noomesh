@@ -410,7 +410,7 @@ pub(crate) fn parse_set_role_with(a: &mut Args) -> Result<(String, String), ArgE
 
 /// The request body `user_set_role` reads: `{role}`.
 pub(crate) fn set_role_body(role: &str) -> Value {
-    json!({"role": role})
+    json!({"roles": role})
 }
 
 /// `noo security user set-role <username> <user|operator|admin>`
