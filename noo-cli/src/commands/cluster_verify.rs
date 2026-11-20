@@ -8054,15 +8054,31 @@ fn severity(v: Verdict) -> u8 {
 /// that leaves data in the clear (the at-rest opt-out) or backups on this
 /// disk only (a declined offsite copy), it is not a pass, and the
 /// reader should see it every run.
+///
+/// The counts are of the rows as shown: the `* at rest` rows count once,
+/// as the one "data at rest" row with their worst verdict, so a section
+/// line never says `! 21` over 12 printed rows. `--verbose` prints no
+/// count line, and `--json` lists every member row (it carries no counts).
 fn digest(checks: &[Check], verbose: bool) -> Digest {
     let mut counts = Counts::default();
+    let mut tally = |v: Verdict| match v {
+        Verdict::Ok => counts.ok += 1,
+        Verdict::Warn | Verdict::Starting => counts.warn += 1,
+        Verdict::Fail => counts.fail += 1,
+        Verdict::Accepted => counts.accepted += 1,
+    };
+    let mut at_rest_worst: Option<Verdict> = None;
     for c in checks {
-        match c.verdict {
-            Verdict::Ok => counts.ok += 1,
-            Verdict::Warn | Verdict::Starting => counts.warn += 1,
-            Verdict::Fail => counts.fail += 1,
-            Verdict::Accepted => counts.accepted += 1,
+        if AT_REST_DIR_ROWS.contains(&c.name) {
+            if at_rest_worst.is_none_or(|w| severity(c.verdict) > severity(w)) {
+                at_rest_worst = Some(c.verdict);
+            }
+        } else {
+            tally(c.verdict);
         }
+    }
+    if let Some(v) = at_rest_worst {
+        tally(v);
     }
     if verbose {
         return Digest { counts, rows: checks.to_vec() };
@@ -15459,10 +15475,9 @@ mod digest_tests {
     fn many_passes_and_one_fail_digest_to_the_counts_and_the_problem_rows() {
         let checks = controller();
         let d = digest(&checks, false);
-        // Six named passes and every at-rest row but postgres's warning:
-        // counted from the table, so a new at-rest row (tempo, i359) does not
-        // break it.
-        let passes = 6 + AT_REST_DIR_ROWS.len() - 1;
+        // Six named passes; the at-rest rows count once, as "data at rest"
+        // with postgres's warning (the worst of them), as the table shows.
+        let passes = 6;
         assert_eq!(d.counts, Counts { ok: passes, warn: 2, fail: 1, accepted: 0 });
         assert!(d.rows.iter().all(|c| c.verdict != Verdict::Ok), "a passing row reached the digest: {:?}", d.rows);
         let names: Vec<&str> = d.rows.iter().map(|c| c.name).collect();
@@ -15530,9 +15545,27 @@ mod digest_tests {
     fn an_accepted_row_stays_in_the_digest_and_is_counted_apart() {
         let checks = vec![ok("a", "ok"), accepted("postgres at rest", "accepted risk"), accepted("loki at rest", "accepted risk")];
         let d = digest(&checks, false);
-        assert_eq!(d.counts, Counts { ok: 1, warn: 0, fail: 0, accepted: 2 });
+        assert_eq!(d.counts, Counts { ok: 1, warn: 0, fail: 0, accepted: 1 }, "two at-rest rows show as one");
         assert_eq!(d.rows.len(), 1);
         assert_eq!(d.rows[0].verdict, Verdict::Accepted);
+    }
+
+    #[test]
+    fn the_section_counts_are_the_rows_it_shows() {
+        // Ten at-rest rows warning, as on a fresh box with no TPM, and two
+        // other warnings: the table shows three rows, so the line counts three.
+        let mut checks: Vec<Check> = AT_REST_DIR_ROWS.iter().map(|n| warn(n, "in the clear", None)).collect();
+        checks.push(warn("holds", "not held", None));
+        checks.push(warn("inbound", "unreachable", None));
+        checks.push(ok("bus", "connected"));
+        let d = digest(&checks, false);
+        assert_eq!(d.rows.len(), 3, "{:?}", d.rows.iter().map(|c| c.name).collect::<Vec<_>>());
+        assert_eq!(d.counts, Counts { ok: 1, warn: 3, fail: 0, accepted: 0 });
+        let shown = d.rows.iter().filter(|c| c.verdict != Verdict::Ok).count();
+        assert_eq!(d.counts.warn + d.counts.fail + d.counts.accepted, shown);
+        // All of them clean: one pass, not ten.
+        let clean: Vec<Check> = AT_REST_DIR_ROWS.iter().map(|n| ok(n, "dm-crypt")).collect();
+        assert_eq!(digest(&clean, false).counts, Counts { ok: 1, ..Counts::default() });
     }
 
     #[test]
