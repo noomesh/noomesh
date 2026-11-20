@@ -107,7 +107,11 @@ alternative is `noo cluster invite`, which prints
 
 ### Declare what a node should run
 
+On a node other than the controller's own, stage an Ollama tag first: the
+node refuses a tag the controller has not staged (`ollama_registry_pull_refused`).
+
 ```sh
+noo models fetch ollama:qwen2.5:7b-instruct
 noo cluster place gpu-2 ollama qwen2.5:7b-instruct
 noo cluster desired gpu-2
 noo cluster unplace gpu-2 ollama

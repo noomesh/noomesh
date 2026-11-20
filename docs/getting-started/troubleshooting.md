@@ -25,7 +25,7 @@ command to run next.
 | Symptom | Fix |
 |---|---|
 | `noo stack start` refuses because a port is in use | `ss -ltnp \| grep 8080` finds what holds it. It is usually another noomesh instance or a stray container: `noo stack status`. To run a second stack on purpose, see [multi-instance.md](multi-instance.md). |
-| Dashboard unreachable | It is `https://localhost:8080`. Grafana is `https://localhost:3000`. The browser wizard (`noo onboard --web`) listens on `http://127.0.0.1:7080` only while it runs. |
+| Dashboard unreachable | It is `https://localhost:8080`. Grafana runs only if you said yes to dashboards in the wizard (`noo stack monitoring on` adds it later); then it is at `https://localhost:3000`. The browser wizard (`noo onboard --web`) listens on `http://127.0.0.1:7080` only while it runs. |
 
 ## The browser warns about the certificate
 
