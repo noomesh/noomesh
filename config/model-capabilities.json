@@ -1,5 +1,5 @@
 {
-  "_comment": "Model capabilities, the FALLBACK for what a node does not report yet (i226 decision 3). The model's weights declare its context ceiling (GGUF <arch>.context_length, HF config max_position_embeddings); the node reports it from the model it serves (heartbeat model_stats[].context_length; Ollama today, noomesh-internal i285) and that report wins. This table caps the window harness placement judges a kind against only where no node reports it: vLLM and llama.cpp placements, and agents older than the report. Each row's `match` globs are tried against the placement's model id, lower-cased, with any registry or org prefix up to the last '/' removed; the first row that matches wins. A model with no row is unknown: no ceiling is assumed, so nothing is refused for it. `max_context` is the model's own context ceiling in tokens; `evidence` says where the number was read. `kv_bytes_per_token` is the cache one token costs per slot, MEASURED on a running daemon; the chat-context memory fit (gateway chat_context.rs, i802) uses it where present instead of placement_fit's conservative fallback.",
+  "_comment": "Model capabilities, the FALLBACK for what a node does not report yet (i226 decision 3). The model's weights declare its context ceiling (GGUF <arch>.context_length, HF config max_position_embeddings); the node reports it from the model it serves (heartbeat model_stats[].context_length; Ollama today, noomesh-internal i285) and that report wins. This table caps the window harness placement judges a kind against only where no node reports it: vLLM and llama.cpp placements, and agents older than the report. Each row's `match` globs are tried against the placement's model id, lower-cased, with any registry or org prefix up to the last '/' removed; the first row that matches wins. A model with no row is unknown: no ceiling is assumed, so nothing is refused for it. `max_context` is the model's own context ceiling in tokens; `evidence` says where the number was read. `kv_bytes_per_token` is the cache one token costs per slot, MEASURED on a running daemon; the chat-context memory fit (gateway chat_context.rs, i802) uses it where present instead of placement_fit's conservative fallback. A row with `kv_source.basis` \"derived\" is computed from the model's own GGUF metadata (layers, kv heads, head dim, K+V, f16) kept in tests/fixtures/model_kv/ollama_gguf_metadata.json, and tests/test_model_kv_rows.py recomputes it; a derived figure is the FULL-attention one (sliding windows and shared layers are not credited), so it is never below the truth. Every model onboard can pick has such a row. Derived rows match their exact tag, not a prefix, so a quantised variant of another size never takes them.",
   "models": [
     {
       "family": "gemma-4-12b",
@@ -8,7 +8,14 @@
         "gemma4:12b*"
       ],
       "max_context": 262144,
-      "evidence": "text_config.max_position_embeddings of google/gemma-4-12B-it-qat-w4a16-ct and gemma4.context_length of Ollama gemma4:12b, both 262144, read on node-a 2026-10-27"
+      "evidence": "text_config.max_position_embeddings of google/gemma-4-12B-it-qat-w4a16-ct and gemma4.context_length of Ollama gemma4:12b, both 262144, read on node-a 2026-10-27; kv_bytes_per_token derived, not guessed: GGUF header of Ollama gemma4:12b (sha256:bb722270d543), gemma4.block_count 48, attention.head_count_kv per layer, [1, 8], key/value length per layer type, summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20",
+      "kv_bytes_per_token": 344064,
+      "kv_source": {
+        "basis": "derived",
+        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
+        "model": "gemma4:12b",
+        "margin": "full attention: every layer charged for the whole context, none cut to its 1024-token window, none shared (0 layers share KV), K and V both charged; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
+      }
     },
     {
       "family": "gemma4-e2b",
@@ -16,7 +23,336 @@
         "gemma4:e2b*"
       ],
       "kv_bytes_per_token": 16384,
-      "evidence": "kv_bytes_per_token measured by fa on the default one-box cell, CPU, 0.6.24: 13-16 KiB per token per slot from the container cgroup across num_ctx 4096/8192/16384 at OLLAMA_NUM_PARALLEL 1 and 4 (install-matrix run 43628426011; i802). 16 KiB, the top of the range, is used so the fit errs safe. No max_context: the node reports it (131072)."
+      "evidence": "kv_bytes_per_token measured by fa on the default one-box cell, CPU, 0.6.24: 13-16 KiB per token per slot from the container cgroup across num_ctx 4096/8192/16384 at OLLAMA_NUM_PARALLEL 1 and 4 (install-matrix run 43628426011; i802). 16 KiB, the top of the range, is used so the fit errs safe. No max_context: the node reports it (131072).",
+      "kv_source": {
+        "basis": "measured",
+        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
+        "model": "gemma4:e2b",
+        "full_attention_bytes_per_token": 43008,
+        "margin": "the MEASURED 16 KiB stays (it is what the daemon was seen to hold at 4096-16384 with the 512-token window and 20 shared layers); the full-attention figure of the same weights is recorded beside it and is the ceiling the measure must stay under: full attention: every layer charged for the whole context, none cut to its 512-token window, none shared (20 layers share KV), K and V both charged"
+      }
+    },
+    {
+      "family": "qwen2.5-0.5b",
+      "match": [
+        "qwen2.5:0.5b"
+      ],
+      "kv_bytes_per_token": 12288,
+      "kv_source": {
+        "basis": "derived",
+        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
+        "model": "qwen2.5:0.5b",
+        "margin": "none needed: every layer is full attention, f16 K and V; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
+      },
+      "evidence": "kv_bytes_per_token derived, not guessed: GGUF header of Ollama qwen2.5:0.5b (sha256:c5396e06af29), qwen2.block_count 24, attention.head_count_kv 2, key/value length 896/14 (embedding_length/head_count), summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20"
+    },
+    {
+      "family": "gemma4-e4b",
+      "match": [
+        "gemma4:e4b"
+      ],
+      "kv_bytes_per_token": 100352,
+      "kv_source": {
+        "basis": "derived",
+        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
+        "model": "gemma4:e4b",
+        "margin": "full attention: every layer charged for the whole context, none cut to its 512-token window, none shared (18 layers share KV), K and V both charged; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
+      },
+      "evidence": "kv_bytes_per_token derived, not guessed: GGUF header of Ollama gemma4:e4b (sha256:370c2879f176), gemma4.block_count 42, attention.head_count_kv 2, key/value length per layer type, summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20"
+    },
+    {
+      "family": "gemma4-26b",
+      "match": [
+        "gemma4:26b"
+      ],
+      "kv_bytes_per_token": 225280,
+      "kv_source": {
+        "basis": "derived",
+        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
+        "model": "gemma4:26b",
+        "margin": "full attention: every layer charged for the whole context, none cut to its 1024-token window, none shared (0 layers share KV), K and V both charged; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
+      },
+      "evidence": "kv_bytes_per_token derived, not guessed: GGUF header of Ollama gemma4:26b (sha256:a8bdd07a49b8), gemma4.block_count 30, attention.head_count_kv per layer, [2, 8], key/value length per layer type, summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20"
+    },
+    {
+      "family": "gemma4-31b",
+      "match": [
+        "gemma4:31b"
+      ],
+      "kv_bytes_per_token": 901120,
+      "kv_source": {
+        "basis": "derived",
+        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
+        "model": "gemma4:31b",
+        "margin": "full attention: every layer charged for the whole context, none cut to its 1024-token window, none shared (0 layers share KV), K and V both charged; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
+      },
+      "evidence": "kv_bytes_per_token derived, not guessed: GGUF header of Ollama gemma4:31b (sha256:cd20f2b3f2e3), gemma4.block_count 60, attention.head_count_kv per layer, [4, 16], key/value length per layer type, summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20"
+    },
+    {
+      "family": "qwen3-0.6b",
+      "match": [
+        "qwen3:0.6b"
+      ],
+      "kv_bytes_per_token": 114688,
+      "kv_source": {
+        "basis": "derived",
+        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
+        "model": "qwen3:0.6b",
+        "margin": "none needed: every layer is full attention, f16 K and V; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
+      },
+      "evidence": "kv_bytes_per_token derived, not guessed: GGUF header of Ollama qwen3:0.6b (sha256:7f4030143c1c), qwen3.block_count 28, attention.head_count_kv 8, key/value length 128, summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20"
+    },
+    {
+      "family": "qwen3-1.7b",
+      "match": [
+        "qwen3:1.7b"
+      ],
+      "kv_bytes_per_token": 114688,
+      "kv_source": {
+        "basis": "derived",
+        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
+        "model": "qwen3:1.7b",
+        "margin": "none needed: every layer is full attention, f16 K and V; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
+      },
+      "evidence": "kv_bytes_per_token derived, not guessed: GGUF header of Ollama qwen3:1.7b (sha256:3d0b790534fe), qwen3.block_count 28, attention.head_count_kv 8, key/value length 128, summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20"
+    },
+    {
+      "family": "qwen3-4b",
+      "match": [
+        "qwen3:4b"
+      ],
+      "kv_bytes_per_token": 147456,
+      "kv_source": {
+        "basis": "derived",
+        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
+        "model": "qwen3:4b",
+        "margin": "none needed: every layer is full attention, f16 K and V; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
+      },
+      "evidence": "kv_bytes_per_token derived, not guessed: GGUF header of Ollama qwen3:4b (sha256:3e4cb1417446), qwen3.block_count 36, attention.head_count_kv 8, key/value length 128, summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20"
+    },
+    {
+      "family": "qwen3-8b",
+      "match": [
+        "qwen3:8b"
+      ],
+      "kv_bytes_per_token": 147456,
+      "kv_source": {
+        "basis": "derived",
+        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
+        "model": "qwen3:8b",
+        "margin": "none needed: every layer is full attention, f16 K and V; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
+      },
+      "evidence": "kv_bytes_per_token derived, not guessed: GGUF header of Ollama qwen3:8b (sha256:a3de86cd1c13), qwen3.block_count 36, attention.head_count_kv 8, key/value length 128, summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20"
+    },
+    {
+      "family": "qwen3-14b",
+      "match": [
+        "qwen3:14b"
+      ],
+      "kv_bytes_per_token": 163840,
+      "kv_source": {
+        "basis": "derived",
+        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
+        "model": "qwen3:14b",
+        "margin": "none needed: every layer is full attention, f16 K and V; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
+      },
+      "evidence": "kv_bytes_per_token derived, not guessed: GGUF header of Ollama qwen3:14b (sha256:a8cc1361f314), qwen3.block_count 40, attention.head_count_kv 8, key/value length 128, summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20"
+    },
+    {
+      "family": "qwen3-30b",
+      "match": [
+        "qwen3:30b"
+      ],
+      "kv_bytes_per_token": 98304,
+      "kv_source": {
+        "basis": "derived",
+        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
+        "model": "qwen3:30b",
+        "margin": "none needed: every layer is full attention, f16 K and V; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
+      },
+      "evidence": "kv_bytes_per_token derived, not guessed: GGUF header of Ollama qwen3:30b (sha256:58574f2e94b9), qwen3moe.block_count 48, attention.head_count_kv 4, key/value length 128, summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20"
+    },
+    {
+      "family": "qwen3-32b",
+      "match": [
+        "qwen3:32b"
+      ],
+      "kv_bytes_per_token": 262144,
+      "kv_source": {
+        "basis": "derived",
+        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
+        "model": "qwen3:32b",
+        "margin": "none needed: every layer is full attention, f16 K and V; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
+      },
+      "evidence": "kv_bytes_per_token derived, not guessed: GGUF header of Ollama qwen3:32b (sha256:3291abe70f16), qwen3.block_count 64, attention.head_count_kv 8, key/value length 128, summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20"
+    },
+    {
+      "family": "qwen3-235b",
+      "match": [
+        "qwen3:235b"
+      ],
+      "kv_bytes_per_token": 192512,
+      "kv_source": {
+        "basis": "derived",
+        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
+        "model": "qwen3:235b",
+        "margin": "none needed: every layer is full attention, f16 K and V; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
+      },
+      "evidence": "kv_bytes_per_token derived, not guessed: GGUF header of Ollama qwen3:235b (sha256:791d5d11998e), qwen3moe.block_count 94, attention.head_count_kv 4, key/value length 128, summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20"
+    },
+    {
+      "family": "llama3.2-1b",
+      "match": [
+        "llama3.2:1b"
+      ],
+      "kv_bytes_per_token": 32768,
+      "kv_source": {
+        "basis": "derived",
+        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
+        "model": "llama3.2:1b",
+        "margin": "none needed: every layer is full attention, f16 K and V; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
+      },
+      "evidence": "kv_bytes_per_token derived, not guessed: GGUF header of Ollama llama3.2:1b (sha256:74701a8c35f6), llama.block_count 16, attention.head_count_kv 8, key/value length 64, summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20"
+    },
+    {
+      "family": "llama3.2-3b",
+      "match": [
+        "llama3.2:3b"
+      ],
+      "kv_bytes_per_token": 114688,
+      "kv_source": {
+        "basis": "derived",
+        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
+        "model": "llama3.2:3b",
+        "margin": "none needed: every layer is full attention, f16 K and V; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
+      },
+      "evidence": "kv_bytes_per_token derived, not guessed: GGUF header of Ollama llama3.2:3b (sha256:dde5aa3fc5ff), llama.block_count 28, attention.head_count_kv 8, key/value length 128, summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20"
+    },
+    {
+      "family": "deepseek-r1-1.5b",
+      "match": [
+        "deepseek-r1:1.5b"
+      ],
+      "kv_bytes_per_token": 28672,
+      "kv_source": {
+        "basis": "derived",
+        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
+        "model": "deepseek-r1:1.5b",
+        "margin": "none needed: every layer is full attention, f16 K and V; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
+      },
+      "evidence": "kv_bytes_per_token derived, not guessed: GGUF header of Ollama deepseek-r1:1.5b (sha256:aabd4debf0c8), qwen2.block_count 28, attention.head_count_kv 2, key/value length 1536/12 (embedding_length/head_count), summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20"
+    },
+    {
+      "family": "deepseek-r1-7b",
+      "match": [
+        "deepseek-r1:7b"
+      ],
+      "kv_bytes_per_token": 57344,
+      "kv_source": {
+        "basis": "derived",
+        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
+        "model": "deepseek-r1:7b",
+        "margin": "none needed: every layer is full attention, f16 K and V; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
+      },
+      "evidence": "kv_bytes_per_token derived, not guessed: GGUF header of Ollama deepseek-r1:7b (sha256:96c415656d37), qwen2.block_count 28, attention.head_count_kv 4, key/value length 3584/28 (embedding_length/head_count), summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20"
+    },
+    {
+      "family": "deepseek-r1-8b",
+      "match": [
+        "deepseek-r1:8b"
+      ],
+      "kv_bytes_per_token": 147456,
+      "kv_source": {
+        "basis": "derived",
+        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
+        "model": "deepseek-r1:8b",
+        "margin": "none needed: every layer is full attention, f16 K and V; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
+      },
+      "evidence": "kv_bytes_per_token derived, not guessed: GGUF header of Ollama deepseek-r1:8b (sha256:e6a7edc1a4d7), qwen3.block_count 36, attention.head_count_kv 8, key/value length 128, summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20"
+    },
+    {
+      "family": "deepseek-r1-14b",
+      "match": [
+        "deepseek-r1:14b"
+      ],
+      "kv_bytes_per_token": 196608,
+      "kv_source": {
+        "basis": "derived",
+        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
+        "model": "deepseek-r1:14b",
+        "margin": "none needed: every layer is full attention, f16 K and V; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
+      },
+      "evidence": "kv_bytes_per_token derived, not guessed: GGUF header of Ollama deepseek-r1:14b (sha256:6e9f90f02bb3), qwen2.block_count 48, attention.head_count_kv 8, key/value length 5120/40 (embedding_length/head_count), summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20"
+    },
+    {
+      "family": "deepseek-r1-32b",
+      "match": [
+        "deepseek-r1:32b"
+      ],
+      "kv_bytes_per_token": 262144,
+      "kv_source": {
+        "basis": "derived",
+        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
+        "model": "deepseek-r1:32b",
+        "margin": "none needed: every layer is full attention, f16 K and V; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
+      },
+      "evidence": "kv_bytes_per_token derived, not guessed: GGUF header of Ollama deepseek-r1:32b (sha256:6150cb382311), qwen2.block_count 64, attention.head_count_kv 8, key/value length 5120/40 (embedding_length/head_count), summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20"
+    },
+    {
+      "family": "deepseek-r1-70b",
+      "match": [
+        "deepseek-r1:70b"
+      ],
+      "kv_bytes_per_token": 327680,
+      "kv_source": {
+        "basis": "derived",
+        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
+        "model": "deepseek-r1:70b",
+        "margin": "none needed: every layer is full attention, f16 K and V; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
+      },
+      "evidence": "kv_bytes_per_token derived, not guessed: GGUF header of Ollama deepseek-r1:70b (sha256:4cd576d9aa16), llama.block_count 80, attention.head_count_kv 8, key/value length 128, summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20"
+    },
+    {
+      "family": "deepseek-r1-671b",
+      "match": [
+        "deepseek-r1:671b"
+      ],
+      "kv_bytes_per_token": 4997120,
+      "kv_source": {
+        "basis": "derived",
+        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
+        "model": "deepseek-r1:671b",
+        "margin": "the expanded K/V a layer would hold per head, not the compressed latent (kv_lora_rank 512) llama.cpp may keep: never below the truth; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
+      },
+      "evidence": "kv_bytes_per_token derived, not guessed: GGUF header of Ollama deepseek-r1:671b (sha256:439dd1a5e052), deepseek2.block_count 61, attention.head_count_kv 128, key/value length 192, summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20"
+    },
+    {
+      "family": "mistral-7b",
+      "match": [
+        "mistral:7b"
+      ],
+      "kv_bytes_per_token": 131072,
+      "kv_source": {
+        "basis": "derived",
+        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
+        "model": "mistral:7b",
+        "margin": "none needed: every layer is full attention, f16 K and V; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
+      },
+      "evidence": "kv_bytes_per_token derived, not guessed: GGUF header of Ollama mistral:7b (sha256:f5074b1221da), llama.block_count 32, attention.head_count_kv 8, key/value length 4096/32 (embedding_length/head_count), summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20"
+    },
+    {
+      "family": "phi4-14b",
+      "match": [
+        "phi4:14b"
+      ],
+      "kv_bytes_per_token": 204800,
+      "kv_source": {
+        "basis": "derived",
+        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
+        "model": "phi4:14b",
+        "margin": "full attention: the 131072-token window is not applied; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
+      },
+      "evidence": "kv_bytes_per_token derived, not guessed: GGUF header of Ollama phi4:14b (sha256:fd7b6731c33c), phi3.block_count 40, attention.head_count_kv 10, key/value length 5120/40 (embedding_length/head_count), summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20"
     }
   ]
 }
