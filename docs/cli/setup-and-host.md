@@ -162,6 +162,7 @@ noo upgrade                  # swap the binary (verifies the .sha256 and the rel
 noo upgrade --stack          # then move a standalone controller's stack to the paired release tag
 noo upgrade --nodes          # then restage every pull-enrolled node's agent bundle
 noo upgrade --all            # binary + stack + nodes, waiting for gateway health in between
+noo upgrade --stack --recreate   # the roll, recreating every stack container (the escape)
 ```
 
 The binary swap prints `noo upgraded 0.3.9 → 0.3.11` (or `no change: noo
@@ -169,6 +170,22 @@ The binary swap prints `noo upgraded 0.3.9 → 0.3.11` (or `no change: noo
 after it, so `--stack` always uses the new release's assets and its baked
 stack tag (`--tag vX.Y.Z` overrides the pairing). `--stack` manages
 standalone installs only; on a checkout use `noo stack start`/`rebuild`.
+The roll recreates only the containers that are out of line, the same
+way a plain `noo stack start` does: every first-party service (its image
+carries the stack tag), and any service whose image, env, secret or
+mounted config file changed. The rest keep running, so nats, redis,
+model-cache and the monitoring set stay up when the release did not move
+them, and the nodes keep their bus link. The roll says what it did:
+`12 recreated (gateway, …), 7 kept (nats, redis, …); --recreate restarts
+everything`, after the launcher's own `recreated <service>: its inputs
+changed (…)` lines. A re-apply of the tag already running
+(`noo upgrade --stack --tag <current>`) works the same way and recreates
+nothing when nothing changed. `--recreate` (with `--stack` or `--all`)
+recreates every container; a container started by noo 0.6.28 or earlier
+carries no input label, so the first roll from it recreates everything
+once. The flag is new in 0.6.30: an older `noo` refuses it as an unknown
+argument, so upgrade the binary first (`noo upgrade`), then run
+`noo upgrade --stack --recreate`.
 `--nodes` ends `bundles staged for all N node(s) — each applies on its next
 fetch tick`. Nodes that callers fail over between (the candidates of one
 model class, the pool of one embedding space) are never all restarting at
@@ -319,7 +336,7 @@ the other nodes first: [Start over](../getting-started/start-over.md).
 ### `noo upgrade` — Self-update the CLI; --stack/--nodes/--controller roll the rest
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo upgrade` | `[--check] [--version <X.Y.Z>] [--stack] [--nodes] [--seats\|--no-seats] [--all] [--tag <vX.Y.Z>] [--controller] [--allow-unsigned] [--force] [--skip-gateway-key-check] [--allow-downgrade] [--stage2] [--channel <public\|rollback\|custom>] [--release-repo <owner/repo>] [--image-prefix <registry/path>] [--base-registry <registry/path>] [--yes]` | Self-update noo, optionally stack, nodes and kiosk seats; --channel moves release channel |
+| `noo upgrade` | `[--check] [--version <X.Y.Z>] [--stack] [--nodes] [--seats\|--no-seats] [--all] [--tag <vX.Y.Z>] [--controller] [--allow-unsigned] [--force] [--skip-gateway-key-check] [--allow-downgrade] [--recreate] [--stage2] [--channel <public\|rollback\|custom>] [--release-repo <owner/repo>] [--image-prefix <registry/path>] [--base-registry <registry/path>] [--yes]` | Self-update noo, optionally stack, nodes and kiosk seats; --channel moves release channel |
 
 ### `noo doctor` — Host-plane health checks with guided recovery
 | Command | Arguments | What it does |

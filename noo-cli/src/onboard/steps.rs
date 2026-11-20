@@ -9726,22 +9726,37 @@ fn compose_container_ids(ctx: &Ctx) -> String {
     if code == 0 { out } else { String::new() }
 }
 
+/// The same "service container-id" listing for every container of compose
+/// project `project` (by its project label, so another instance's containers
+/// are never counted). `noo upgrade`'s roll reads it around its launcher.
+/// Empty when docker cannot say.
+pub(crate) fn project_container_ids(project: &str) -> String {
+    let label = format!("label=com.docker.compose.project={project}");
+    let (code, out) = sh::docker(&[
+        "ps", "-a", "--filter", &label, "--filter", "label=com.docker.compose.service",
+        "--format", "{{.Label \"com.docker.compose.service\"}} {{.ID}}",
+    ]);
+    if code == 0 { out } else { String::new() }
+}
+
+/// service -> container id, from a `compose_container_ids` listing. Pure.
+fn container_ids(s: &str) -> std::collections::BTreeMap<String, String> {
+    s.lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let svc = it.next()?;
+            let id = it.next()?;
+            Some((svc.to_string(), id.to_string()))
+        })
+        .collect()
+}
+
 /// (recreated, created) services between two `compose_container_ids`
 /// listings: recreated = the same service under a new container id; created
 /// = a service that had no container before. Nothing is called created when
 /// the first listing is empty (docker could not say). Pure.
 pub(crate) fn recreated_by(before: &str, after: &str) -> (Vec<String>, Vec<String>) {
-    let parse = |s: &str| -> std::collections::BTreeMap<String, String> {
-        s.lines()
-            .filter_map(|l| {
-                let mut it = l.split_whitespace();
-                let svc = it.next()?;
-                let id = it.next()?;
-                Some((svc.to_string(), id.to_string()))
-            })
-            .collect()
-    };
-    let (b, a) = (parse(before), parse(after));
+    let (b, a) = (container_ids(before), container_ids(after));
     let recreated: Vec<String> = a
         .iter()
         .filter(|(s, id)| b.get(*s).is_some_and(|old| old != *id))
@@ -9753,6 +9768,16 @@ pub(crate) fn recreated_by(before: &str, after: &str) -> (Vec<String>, Vec<Strin
         a.keys().filter(|s| !b.contains_key(*s)).cloned().collect()
     };
     (recreated, created)
+}
+
+/// The services [`recreated_by`] did not move: the same service under the
+/// same container id in both listings. Pure.
+pub(crate) fn kept_by(before: &str, after: &str) -> Vec<String> {
+    let (b, a) = (container_ids(before), container_ids(after));
+    a.iter()
+        .filter(|(s, id)| b.get(*s).is_some_and(|old| old == *id))
+        .map(|(s, _)| s.clone())
+        .collect()
 }
 
 /// The wizard's line for `converge_stack`, naming what moved. Pure.
@@ -9769,7 +9794,7 @@ pub(crate) fn converge_line(recreated: &[String], created: &[String]) -> String 
 
 #[cfg(test)]
 mod converge_tests {
-    use super::{converge_line, recreated_by};
+    use super::{converge_line, kept_by, recreated_by};
 
     /// The listings around onboard's last start: the services whose id
     /// changed are named, the rest are not; a new service is "created".
@@ -9795,6 +9820,16 @@ mod converge_tests {
         let (recreated, created) = recreated_by("", same);
         assert!(recreated.is_empty() && created.is_empty(), "{recreated:?} {created:?}");
         assert!(recreated_by("gateway aaa\n", "").0.is_empty(), "a container gone is not a recreate");
+    }
+
+    /// Kept = the same id in both listings; a recreated, created or removed
+    /// service is never kept.
+    #[test]
+    fn kept_is_exactly_the_services_whose_container_id_held() {
+        let before = "gateway aaa\nnats bbb\nredis eee\nretired zzz\n";
+        let after = "gateway a2\nnats bbb\nredis eee\nvoice fff\n";
+        assert_eq!(kept_by(before, after), ["nats", "redis"]);
+        assert!(kept_by("", after).is_empty(), "no listing before: nothing is called kept");
     }
 
     /// The last start is the PLAIN start `noo stack start` runs: no
