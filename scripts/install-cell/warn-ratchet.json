@@ -1,7 +1,7 @@
 {
  "_rule": "noomesh-internal i1098, the matrix ratchet. Per fresh-install cell: the most WARN rows (verdict == \"warn\", controller + nodes + seats) its `noo --json cluster verify` may show, and the rows it may show them in, by the row's STABLE id from noo-cli cluster_verify/rows.rs (a reworded row keeps its id; \"label\" is only for people). The PR that removes a WARN lowers max_warn and drops the row. Raising is never allowed (tests/test_install_cell_ratchet.py compares this file with its version on dev); the one escape is a reviewed decision, in its own commit, adding to the cell \"raise\": {\"from_max\", \"to_max\", \"add_rows\" (ids), \"reason\"}. scripts/install-cell/ratchet.py judges it; a cell with \"measured\": null only prints a NOTE.",
- "fail_rows_fail_the_cell": false,
- "_fail_rule": "i1098: a FAIL row always fails the cell. OFF until the release lead approves fail_allowed (0.6.28-rc.4 and 0.6.28 fresh cells showed 0 FAIL rows; 0.6.29-rc.1's cells never reached verify). Turning it on is one-way; fail_allowed only shrinks, and a row added to it needs a \"why\" and a reviewed \"decision\".",
+ "fail_rows_fail_the_cell": true,
+ "_fail_rule": "i1098: a FAIL row always fails the cell. ON since the release lead approved it after 0.6.29-rc.2 (0.6.28-rc.4, 0.6.28 and rc.2 fresh cells showed 0 FAIL rows). The one exemption: default_chat is NOT JUDGED after a registry 5xx at onboard whose retries were exhausted (scripts/install-cell/ratchet.py). Turning it off again is refused; fail_allowed only shrinks, and a row added to it needs a \"why\" and a reviewed \"decision\".",
  "fail_allowed": {},
  "row_status": {
   "agent_protect": {

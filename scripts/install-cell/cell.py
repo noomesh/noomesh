@@ -223,6 +223,11 @@ def summarize(d: Path) -> dict:
     # not the product's time, so they are reported apart (general, rc.1 run
     # 43642041751: 2,792 s on the wall, 327 s without the 2,465 s of probes).
     first_answer, probe_wait = first_answer_times(steps, meta.get("first_answer_s"))
+    # verify-ratchet's NOT JUDGED lines (ratchet.py: a default chat FAIL after
+    # a registry outage at onboard); the run summary counts the cells.
+    rlog = d / "logs" / "verify-ratchet.log"
+    not_judged = ([l.strip() for l in rlog.read_text(errors="replace").splitlines()
+                   if l.startswith("RATCHET NOT JUDGED:")] if rlog.exists() else None)
     out = {**meta, "first_answer_s": first_answer, "first_answer_wall_s": meta.get("first_answer_s"),
            "probe_wait_before_first_answer_s": probe_wait,
            "result": ("not run" if meta.get("not_run") or not steps
@@ -233,7 +238,8 @@ def summarize(d: Path) -> dict:
            "verify": None if verify is None else ("green" if verify["rc"] == 0 else verify["first_error"]),
            "probes": {s["step"]: ("pass" if s["rc"] == 0 else s["first_error"]) for s in probes},
            "warning_count": len(warnings), "warnings": warnings[:40],
-           "prompt_count": len(prompts), "prompts": prompts[:60]}
+           "prompt_count": len(prompts), "prompts": prompts[:60],
+           "ratchet_not_judged": not_judged}
     md = [f"### {meta.get('cell', '?')}: {out['result'].upper()}"
           + (f" at `{out['failed_step']}`" if failed else ""),
           f"runner `{meta.get('runner', '?')}` · installed `{meta.get('installed_version', '?')}` · "
@@ -250,6 +256,8 @@ def summarize(d: Path) -> dict:
     for s in probes:
         md += ["", f"**Probe `{s['step']}`: {'PASS' if s['rc'] == 0 else 'FAIL'}**"
                + ("" if s["rc"] == 0 else f" `{s['first_error']}`")]
+    for line in not_judged or []:
+        md += ["", f"**{line}**"]
     md += ["", f"**Warnings a stranger sees: {len(warnings)}**"] + [f"- `{w}`" for w in warnings[:20]]
     md += ["", f"**Prompts: {len(prompts)}**"] + [f"- `{p}`" for p in prompts[:20]]
     if meta.get("limits"):

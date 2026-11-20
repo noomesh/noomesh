@@ -68,14 +68,19 @@ def as_log(v: dict) -> str:
     return "warning: a line on stderr\n" + json.dumps(v) + "\n"
 
 
-def run_judge(tmp_path, v, ceil, cell="c", row_lines=False):
-    """(exit, lines); the per-row status lines only when row_lines."""
+def run_judge(tmp_path, v, ceil, cell="c", row_lines=False, onboard=None):
+    """(exit, lines); the per-row status lines only when row_lines. `onboard`
+    is the onboard log's text (passed with --onboard-log, beside a missing one)."""
     log = tmp_path / "probe-verify-json.log"
     log.write_text(as_log(v) if v is not None else "error: gateway unreachable\n")
     cf = tmp_path / "ceiling.json"
     cf.write_text(json.dumps(ceil))
+    extra = ["--onboard-log", str(tmp_path / "onboard-missing.log")]
+    if onboard is not None:
+        (tmp_path / "onboard.log").write_text(onboard)
+        extra += ["--onboard-log", str(tmp_path / "onboard.log")]
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
-    r = subprocess.run([sys.executable, str(RATCHET), "judge", cell, str(log), "--ceiling", str(cf)],
+    r = subprocess.run([sys.executable, str(RATCHET), "judge", cell, str(log), "--ceiling", str(cf), *extra],
                        capture_output=True, text=True, encoding="utf-8", env=env, timeout=60)
     lines = r.stdout.strip().splitlines()
     return r.returncode, lines if row_lines else [l for l in lines if not l.startswith("RATCHET ROW: ")]
@@ -308,9 +313,9 @@ def test_every_full_install_cell_has_a_ceiling_entry():
 def test_run_sh_judges_the_verify_json_and_skips_cells_without_an_install():
     text = RUN_SH.read_text()
     probe = text.index("step probe-verify-json 300 -- bash -c 'fresh --json cluster verify'\n")
-    judge = text.index('step verify-ratchet 60 -- python3 "$HERE/ratchet.py" judge "$CELL" "$OUT/logs/probe-verify-json.log"\n')
+    judge = text.index('step verify-ratchet 60 -- python3 "$HERE/ratchet.py" judge "$CELL" "$OUT/logs/probe-verify-json.log" \\\n')
     assert probe < judge < text.index("step first-answer "), "judged right after the JSON is written"
-    line_end = text.index("\n", judge)
+    line_end = text.index("onboard-literal.log", judge)
     assert "fail_onboarded" not in text[judge:line_end], "a FAIL fails the cell, but the probes after it still run"
     refusal = text[text.index('if [ "${EXPECT:-}" = refusal ]; then'):]
     assert refusal.index('ratchet.py" skip "$CELL"') < refusal.index("    finish\n")
@@ -438,7 +443,7 @@ def test_the_checked_in_statuses_follow_the_rules():
     for cell, e in doc["cells"].items():
         for r in (e["rows"] or []) if e["measured"] is not None else []:
             assert r in st, (cell, r)
-    assert doc["fail_rows_fail_the_cell"] is False, "OFF until the release lead approves fail_allowed"
+    assert doc["fail_rows_fail_the_cell"] is True, "ON: the release lead approved it after 0.6.29-rc.2"
 
 
 def test_fix_in_flight_names_its_carrier():
@@ -484,3 +489,116 @@ def test_a_cli_without_ids_is_mapped_through_rows_rs_and_an_unknown_name_fails()
     # no registry in the checkout and no id in the JSON: the same loud FAIL
     ok, lines = judge_lines(verify(controller=[{"name": "holds", "verdict": "warn"}]), ceiling(), names={})
     assert not ok and "row(s) with no id: controller:holds" in lines[-1]
+
+
+
+# ── the ONE exemption: default chat after an exhausted registry outage ─────
+# The lines as noo-cli prints them (origin/dev): pull_retry.rs retry_line
+# ("{reason}: retrying in {delay} s (try {n} of 3)", reason "registry
+# answered {s} (a registry-side problem)"), and onboard/steps.rs's First
+# Model step ("Ollama pull failed: {why}", "Ollama pull did not complete —
+# your choice IS saved …", "Model {m} pulled via Ollama"), behind ctx.warn's
+# and ctx.success's glyphs; ollama's own "Error: pull model manifest: 5NN: …".
+E503 = "Error: pull model manifest: 503: upstream connect error or disconnect/reset before headers. reset reason: connection timeout"
+TRY2 = "  ! registry answered 503 (a registry-side problem): retrying in 10 s (try 2 of 3)"
+TRY3 = "  ! registry answered 503 (a registry-side problem): retrying in 30 s (try 3 of 3)"
+FAILED = "  ! Ollama pull failed: " + E503
+DNC = ("  ! Ollama pull did not complete — your choice IS saved (OLLAMA_MODEL=gemma4:e2b); the next stack start "
+       "pulls it, or retry now: docker exec noo-ollama-embed ollama pull gemma4:e2b")
+PULLED = "  ✓ Model gemma4:e2b pulled via Ollama"
+EXHAUSTED = "\n".join(["== First model", "pulling manifest", E503, TRY2, "pulling manifest", E503, TRY3,
+                       "pulling manifest", E503, FAILED, DNC, "== Done"]) + "\n"
+RECOVERED = "\n".join(["pulling manifest", E503, TRY2, "pulling manifest", "success", PULLED]) + "\n"
+BARE = "\n".join(["pulling manifest", E503, FAILED, DNC]) + "\n"   # a build without the retry
+
+
+def _chat_fail_verify(*more):
+    v = json.loads(json.dumps(BASE_VERIFY))
+    v["controller"]["checks"].append(row("default chat", "fail"))
+    v["controller"]["checks"].extend(more)
+    return v
+
+
+def _on():
+    return dict(ceiling(), fail_rows_fail_the_cell=True)
+
+
+def test_default_chat_is_not_judged_after_an_exhausted_registry_outage(tmp_path):
+    rc, lines = run_judge(tmp_path, _chat_fail_verify(), _on(), onboard=EXHAUSTED)
+    assert rc == 0, lines
+    nj = [l for l in lines if l.startswith("RATCHET NOT JUDGED: ")]
+    assert nj == [f'RATCHET NOT JUDGED: default_chat (controller:default chat) — registry outage at onboard, '
+                  f'retries exhausted: "{E503}" … "{DNC.strip()}"'], nj
+    assert len(DNC.strip()) <= 200, "quoted whole (a longer line is cut at 200)"
+    assert not any(l.startswith("VERIFY FAIL") for l in lines)
+
+
+def test_default_chat_is_judged_when_the_pull_recovered(tmp_path):
+    rc, lines = run_judge(tmp_path, _chat_fail_verify(), _on(), onboard=RECOVERED)
+    assert rc == 1 and lines[-1] == "VERIFY FAIL: default_chat (controller:default chat)", lines
+    # recovered after a FULL retry series too: any success after the 5xx
+    rc, lines = run_judge(tmp_path, _chat_fail_verify(), _on(), onboard=EXHAUSTED + PULLED + "\n")
+    assert rc == 1 and lines[-1] == "VERIFY FAIL: default_chat (controller:default chat)", lines
+
+
+def test_default_chat_fails_without_the_evidence(tmp_path):
+    for onboard in (None, "pulling manifest\n" + PULLED + "\n", ""):
+        rc, lines = run_judge(tmp_path, _chat_fail_verify(), _on(), onboard=onboard)
+        assert rc == 1 and lines[-1] == "VERIFY FAIL: default_chat (controller:default chat)", (onboard, lines)
+
+
+def test_a_bare_5xx_without_retry_lines_is_not_exhausted(tmp_path):
+    rc, lines = run_judge(tmp_path, _chat_fail_verify(), _on(), onboard=BARE)
+    assert rc == 1 and lines[-1] == "VERIFY FAIL: default_chat (controller:default chat)", lines
+    # retries announced but the last try never was (try 2 of 3 only): not exhausted
+    two = "\n".join(["pulling manifest", E503, TRY2, "pulling manifest", E503, FAILED, DNC]) + "\n"
+    rc, lines = run_judge(tmp_path, _chat_fail_verify(), _on(), onboard=two)
+    assert rc == 1, lines
+
+
+def test_the_exemption_is_only_default_chat(tmp_path):
+    rc, lines = run_judge(tmp_path, _chat_fail_verify(row("shared secrets", "fail")), _on(), onboard=EXHAUSTED)
+    assert rc == 1, lines
+    assert lines[-1] == "VERIFY FAIL: shared_secrets (controller:shared secrets)", lines
+    assert any(l.startswith("RATCHET NOT JUDGED: default_chat") for l in lines)
+    v = json.loads(json.dumps(BASE_VERIFY))
+    v["controller"]["checks"].append(row("shared secrets", "fail"))
+    rc, lines = run_judge(tmp_path, v, _on(), onboard=EXHAUSTED)
+    assert rc == 1 and lines[-1] == "VERIFY FAIL: shared_secrets (controller:shared secrets)", lines
+
+
+def test_run_sh_passes_every_onboard_log():
+    text = RUN_SH.read_text()
+    call = text[text.index('step verify-ratchet 60 --'):]
+    call = call[:call.index("\n", call.index("onboard-literal.log"))]
+    for name in ("onboard.log", "onboard-model.log", "onboard-attentive.log", "onboard-literal.log"):
+        assert f'--onboard-log "$OUT/logs/{name}"' in call, name
+    # the names are the steps that write them
+    assert "step onboard 3600 --" in text and "step onboard-model 1800 --" in text
+    hook = (ROOT / "scripts" / "install-cell" / "onboard-interactive.sh").read_text()
+    assert 'step_tty onboard-"$PASS"' in hook and "PASS=literal" in hook and "PASS=attentive" in hook
+
+
+def test_the_summary_carries_not_judged_and_the_run_counts_cells(tmp_path):
+    C = _load("install_cell_for_ratchet_nj", ROOT / "scripts" / "install-cell" / "cell.py")
+    line = 'RATCHET NOT JUDGED: default_chat (controller:default chat) — registry outage at onboard, retries exhausted: "a" … "b"'
+    for cell, log in (("cell-a", "RATCHET PASS: 3 WARN ≤ 3 (rows: x)\n" + line + "\n"),
+                      ("cell-b", "RATCHET PASS: 3 WARN ≤ 3 (rows: x)\n"), ("cell-c", None),
+                      ("cell-d", line + "\n")):
+        d = tmp_path / f"install-cell-{cell}"
+        (d / "logs").mkdir(parents=True)
+        if log is not None:
+            (d / "logs" / "verify-ratchet.log").write_text(log)
+        (d / "steps.jsonl").write_text("")
+        (d / "meta.json").write_text(json.dumps({"cell": cell}))
+        C.summarize(d)
+    s = {c: json.loads((tmp_path / f"install-cell-{c}" / "summary.json").read_text())["ratchet_not_judged"]
+         for c in ("cell-a", "cell-b", "cell-c", "cell-d")}
+    assert s == {"cell-a": [line], "cell-b": [], "cell-c": None, "cell-d": [line]}
+    assert line in (tmp_path / "install-cell-cell-a" / "summary.md").read_text()
+    r = subprocess.run([sys.executable, str(RATCHET), "run-summary", str(tmp_path)],
+                       capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0 and r.stdout.strip() == "ratchet NOT JUDGED cells: 2 (cell-a, cell-d)"
+    wf = (ROOT / ".github" / "workflows" / "install-matrix.yml").read_text()
+    assert 'ratchet.py run-summary "$RUNNER_TEMP/cells" | tee -a "$GITHUB_STEP_SUMMARY"' in wf
+    assert "pattern: install-cell-*" in wf

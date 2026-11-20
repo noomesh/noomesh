@@ -411,9 +411,14 @@ step probe-verify-json 300 -- bash -c 'fresh --json cluster verify'
 # by text; an OK row tiered "later" is not a WARN. While the ceiling is
 # unmeasured it prints a NOTE with what it measured. Each WARN row prints
 # with its status (row_status: "awaiting operator decision" is NOT accepted).
-# A FAIL row fails the cell here once fail_rows_fail_the_cell is true (OFF
-# until the release lead approves fail_allowed). ratchet.py says more.
-step verify-ratchet 60 -- python3 "$HERE/ratchet.py" judge "$CELL" "$OUT/logs/probe-verify-json.log"
+# A FAIL row fails the cell here (fail_rows_fail_the_cell). The one
+# exemption is `default chat` after a registry outage at onboard whose
+# retries were exhausted: it reads the onboard logs (one per mode: ci,
+# ci + tiny model, interactive attentive/literal; a missing one adds
+# nothing). ratchet.py says more.
+step verify-ratchet 60 -- python3 "$HERE/ratchet.py" judge "$CELL" "$OUT/logs/probe-verify-json.log" \
+    --onboard-log "$OUT/logs/onboard.log" --onboard-log "$OUT/logs/onboard-model.log" \
+    --onboard-log "$OUT/logs/onboard-attentive.log" --onboard-log "$OUT/logs/onboard-literal.log"
 # The container onboard pulled the chat model into, chosen the way onboard's
 # pull_ollama chooses it (noo-cli onboard/steps.rs): noo-ollama-embed on a
 # standalone install (NOO_STANDALONE=1 or a .noo-standalone marker in the
