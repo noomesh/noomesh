@@ -4,6 +4,8 @@
 package docker
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -17,8 +19,9 @@ const (
 )
 
 var (
-	teiUsable  = GPUFacts{NvidiaGPU: true, NvidiaRuntime: true, MinComputeCap: "8.6"}
-	teiDxgOnly = GPUFacts{NvidiaGPU: true} // /dev/dxg seen, no nvidia runtime in docker
+	teiUsable  = GPUFacts{NvidiaGPU: true, NvidiaRuntime: true, NvidiaRuntimeRead: true, MinComputeCap: "8.6"}
+	teiDxgOnly = GPUFacts{NvidiaGPU: true, NvidiaRuntimeRead: true}                // /dev/dxg seen, docker says no nvidia runtime
+	teiUnknown = GPUFacts{NvidiaGPU: true, NvidiaRuntimeErr: "connection refused"} // runtime never read
 	teiNoGPU   = GPUFacts{}
 )
 
@@ -59,7 +62,7 @@ func TestTEICPUTargetOnADxgOnlyNodeIsTheCPUImage(t *testing.T) {
 
 func TestTEIGPUTargetWithoutAUsableRuntimeIsRefusedWithTheRemedy(t *testing.T) {
 	teiEnv(t)
-	for name, f := range map[string]GPUFacts{"dxg-only": teiDxgOnly, "no gpu": teiNoGPU, "runtime without gpu": {NvidiaRuntime: true}} {
+	for name, f := range map[string]GPUFacts{"dxg-only": teiDxgOnly, "no gpu": teiNoGPU, "runtime without gpu": {NvidiaRuntime: true, NvidiaRuntimeRead: true}} {
 		ch, err := teiChoose("embedding", "gpu", f)
 		if err == nil || ch.Ref != "" {
 			t.Fatalf("%s: got %+v, %v; want a refusal and no image", name, ch, err)
@@ -128,6 +131,37 @@ func TestTEICPUTargetPrefetchAgreesWithTheStart(t *testing.T) {
 	}
 }
 
+func TestLlamacppUnknownRuntimeIsARetryNotTheCPUBuild(t *testing.T) {
+	pinRelease(t)
+	f := GPUFacts{NvidiaGPU: true, MinComputeCap: "8.6", NvidiaRuntimeErr: "connection refused"}
+	poseGPUFacts(t, f)
+	for _, target := range []string{"gpu", ""} {
+		ch, err := teiChoose("llamacpp", target, f)
+		var ue *TEIRuntimeUnknownError
+		if ch.Ref != "" || !errors.As(err, &ue) {
+			t.Fatalf("target %q: got %+v, %v; want the retry error", target, ch, err)
+		}
+		if got := BackendImageRef("llamacpp", "", target); got != "" {
+			t.Fatalf("target %q: prefetch names %q", target, got)
+		}
+	}
+	if ch, err := teiChoose("llamacpp", "cpu", f); err != nil || ch.Ref != "ghcr.io/noomesh/llamacpp:v0.6.15" {
+		t.Fatalf("cpu target: %+v, %v", ch, err)
+	}
+}
+
+func TestLlamacppKnownAbsentRuntimeIsStillCPUNotRefused(t *testing.T) {
+	pinRelease(t)
+	f := GPUFacts{NvidiaGPU: true, NvidiaRuntimeRead: true, MinComputeCap: "8.6"}
+	poseGPUFacts(t, f)
+	for _, target := range []string{"gpu", ""} {
+		ch, err := teiChoose("llamacpp", target, f)
+		if err != nil || ch.Ref != "ghcr.io/noomesh/llamacpp:v0.6.15" {
+			t.Fatalf("target %q: %+v, %v; want the CPU build", target, ch, err)
+		}
+	}
+}
+
 func TestLlamacppKeepsItsOwnRuleAGPUTargetOnAnUnusableNodeIsNotRefused(t *testing.T) {
 	pinRelease(t)
 	if _, err := teiChoose("llamacpp", "gpu", teiDxgOnly); err != nil {
@@ -141,4 +175,81 @@ func asNoUsableGPU(err error, target **NoUsableGPUError) bool {
 		*target = e
 	}
 	return ok
+}
+
+func TestTEIUnknownRuntimeWithAutoIsARetryNotAnImage(t *testing.T) {
+	teiEnv(t)
+	for _, target := range []string{"", "auto"} {
+		ch, err := teiChoose("embedding", target, teiUnknown)
+		var ue *TEIRuntimeUnknownError
+		if ch.Ref != "" || !errors.As(err, &ue) {
+			t.Fatalf("target %q: got %+v, %v; want the retry error and no image", target, ch, err)
+		}
+		for _, want := range []string{"cannot tell yet whether the NVIDIA runtime is registered", "docker info failed: connection refused", "retrying on the next pass"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("%q lacks %q", err, want)
+			}
+		}
+		poseGPUFacts(t, teiUnknown)
+		if got := BackendImageRef("embedding", "", target); got != "" {
+			t.Fatalf("target %q: prefetch names %q on an unknown runtime", target, got)
+		}
+	}
+}
+
+func TestTEIUnknownRuntimeWithGPUTargetIsTheSameRetryNotARefusal(t *testing.T) {
+	teiEnv(t)
+	_, err := teiChoose("embedding", "gpu", teiUnknown)
+	var ue *TEIRuntimeUnknownError
+	var nu *NoUsableGPUError
+	if !errors.As(err, &ue) || errors.As(err, &nu) {
+		t.Fatalf("got %T %v; want TEIRuntimeUnknownError, not NoUsableGPUError", err, err)
+	}
+}
+
+func TestTEIUnknownRuntimeWithCPUTargetIsTheCPUImage(t *testing.T) {
+	teiEnv(t)
+	ch, err := teiChoose("embedding", "cpu", teiUnknown)
+	if err != nil || ch.Ref != teiCPURef {
+		t.Fatalf("got %+v, %v", ch, err)
+	}
+}
+
+func TestTEINoGPUAtAllIsCPUWhateverTheRuntimeRead(t *testing.T) {
+	teiEnv(t)
+	ch, err := teiChoose("embedding", "", GPUFacts{})
+	if err != nil || ch.Ref != teiCPURef || ch.Why == "" {
+		t.Fatalf("got %+v, %v", ch, err)
+	}
+}
+
+// A fresh process whose first runtime ask fails has NvidiaRuntimeRead=false;
+// after one success and then a failure it stays read with the old value.
+func TestGPUFactsRuntimeReadSurvivesALaterFailedAsk(t *testing.T) {
+	poseGPUFacts(t, GPUFacts{NvidiaGPU: true})
+	gpuFactsMu.Lock()
+	gpuFactsKnown, gpuFactsNow = false, GPUFacts{}
+	gpuFactsMu.Unlock()
+	prevAsk, prevCaps := nvidiaRuntimeAskFn, computeCapsFn
+	t.Cleanup(func() { nvidiaRuntimeAskFn, computeCapsFn = prevAsk, prevCaps })
+	computeCapsFn = func() ([]string, error) { return []string{"8.6"}, nil }
+	var ans bool
+	var askErr error
+	nvidiaRuntimeAskFn = func(context.Context, *Client) (bool, error) { return ans, askErr }
+
+	askErr = errors.New("boom")
+	f := (*Client)(nil).RefreshGPUFacts(context.Background())
+	if f.NvidiaRuntimeRead || f.NvidiaRuntime || f.NvidiaRuntimeErr != "boom" {
+		t.Fatalf("first ask failed: %+v, want unread with the error text", f)
+	}
+	ans, askErr = true, nil
+	f = (*Client)(nil).RefreshGPUFacts(context.Background())
+	if !f.NvidiaRuntimeRead || !f.NvidiaRuntime || f.NvidiaRuntimeErr != "" {
+		t.Fatalf("good ask: %+v", f)
+	}
+	askErr = errors.New("slow")
+	f = (*Client)(nil).RefreshGPUFacts(context.Background())
+	if !f.NvidiaRuntimeRead || !f.NvidiaRuntime {
+		t.Fatalf("a failed ask after a good one must keep the old answer: %+v", f)
+	}
 }
