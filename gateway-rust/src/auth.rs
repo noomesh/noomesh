@@ -2171,7 +2171,7 @@ pub const PUBLIC_PATH_PREFIXES: &[&str] = &[
 /// | route | what it does | wants auth? |
 /// |---|---|---|
 /// | `GET /bootstrap/bundle/{node}` | serves CMS ciphertext encrypted to the node's birth key | no — see below |
-/// | `POST /bootstrap/bundle/{node}/applied` | WRITES `applied_at`/`apply_rc`/`apply_msg` and audits as `node:<name>` | **yes** |
+/// | `POST /bootstrap/bundle/{node}/applied` | WRITES `applied_at`/`apply_rc`/`apply_msg`/`apply_refusal` and audits as `node:<name>` | **yes** |
 ///
 /// The GET genuinely cannot be authenticated with the fleet credential: at
 /// that moment the node holds only its birth key and the CA anchor, and
