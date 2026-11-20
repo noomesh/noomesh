@@ -46,6 +46,83 @@
 # would mean different things on different nodes.
 set -eu
 
+# ── Refusal names ──────────────────────────────────────────────────────────
+# Every refusal below sets NOO_REFUSAL=<name> right before it exits (or
+# returns to a caller that exits with its code). The exit trap then prints ONE
+# last line, `noo-apply: refusal=<name> (exit N)`, when the name's code is the
+# code this applier exits with; noo-fetch sends the name with its apply report
+# and the CLI picks the remedy by it. Exit codes and messages are unchanged: a
+# name only says which remedy a code needs. The line never says REFUSED (the
+# rehearsal and the upgrade cell count those lines) and never carries a bare
+# `(NN)` (cluster_verify cuts the release-check line there). The names with
+# their words live in noo-cli (provision.rs REFUSALS);
+# tests/test_apply_refusal_table.py holds the two tables equal. The names the
+# fetcher sets (gzip, decrypt) are listed here too: one table for both.
+# BEGIN refusal_table
+refusal_code() {  # $1 = refusal name -> its exit code; nothing for an unknown name
+    case "$1" in
+        bundle_shape) echo 65 ;;
+        manifest_file_mismatch) echo 65 ;;
+        payload_control_bytes) echo 65 ;;
+        bundle_empty) echo 65 ;;
+        script_payload_invalid) echo 65 ;;
+        binary_not_elf) echo 65 ;;
+        applier_downgrade) echo 65 ;;
+        hostd_downgrade) echo 65 ;;
+        env_shape) echo 65 ;;
+        unit_shape) echo 65 ;;
+        vendor_cli_invalid) echo 65 ;;
+        service_leaf_invalid) echo 65 ;;
+        service_leaf_untrusted) echo 65 ;;
+        node_payload_invalid) echo 65 ;;
+        cli_user_invalid) echo 65 ;;
+        secret_pointer_multiline) echo 65 ;;
+        hostd_install_failed) echo 65 ;;
+        restart_backends_invalid) echo 65 ;;
+        bundle_decrypt_failed) echo 65 ;;
+        tool_missing) echo 69 ;;
+        bundle_gzip_failed) echo 69 ;;
+        merge_lost_node_id) echo 70 ;;
+        node_write_failed) echo 73 ;;
+        cli_install_failed) echo 73 ;;
+        bundle_decrypt_io) echo 73 ;;
+        payload_checksum) echo 74 ;;
+        release_unlisted) echo 75 ;;
+        release_list_invalid) echo 75 ;;
+        release_verifier_missing) echo 75 ;;
+        node_ahead_of_controller) echo 75 ;;
+        applier_too_old) echo 76 ;;
+        payload_for_other_node) echo 76 ;;
+        signature_invalid) echo 77 ;;
+        ca_signed_lane_retired) echo 77 ;;
+        ca_rollover_overreach) echo 77 ;;
+        rollover_not_countersigned) echo 77 ;;
+        bundle_unaddressed) echo 77 ;;
+        bundle_for_other_node) echo 77 ;;
+        bundle_undated) echo 77 ;;
+        bundle_stale) echo 77 ;;
+        bundle_from_future) echo 77 ;;
+        not_enrolled) echo 78 ;;
+        birth_key_unreadable) echo 78 ;;
+    esac
+}
+# END refusal_table
+NOO_REFUSAL=""
+WORK=""
+KEYS=""
+noo_apply_on_exit() {
+    _oe=$?
+    if [ "$_oe" -gt 1 ] && [ -n "$NOO_REFUSAL" ] && [ "$(refusal_code "$NOO_REFUSAL")" = "$_oe" ]; then
+        echo "noo-apply: refusal=$NOO_REFUSAL (exit $_oe)" >&2
+        logger -t noo-apply "refusal=$NOO_REFUSAL (exit $_oe)" 2>/dev/null || true
+    fi
+    # Empty until mktemp below ran: never an rm of an empty path.
+    [ -z "$WORK" ] || rm -rf "$WORK"
+    [ -z "$KEYS" ] || rm -rf "$KEYS"
+    return "$_oe"
+}
+trap noo_apply_on_exit EXIT
+
 BUNDLE="${1:?usage: noo-apply <bundle.tar>}"
 
 # The generation of this applier (/A2). §1b refuses to replace
@@ -77,7 +154,7 @@ else
     [ "$(id -u)" = 0 ] || { echo "noo-apply: must run as root (noo-fetch runs it from its root timer)" >&2; exit 1; }
 fi
 CA="$PKI/ca.crt"
-[ -f "$CA" ] || { echo "noo-apply: no trusted CA at $CA — enroll this node first" >&2; exit 78; }
+[ -f "$CA" ] || { echo "noo-apply: no trusted CA at $CA — enroll this node first" >&2; NOO_REFUSAL=not_enrolled; exit 78; }
 
 KNOWN_KINDS="ca.crt node.crt node.key agent-env agent-unit agent-binary teardown applier hostd-binary restart-backends host-telemetry cli-binary cli-user fetcher nats-creds fleet-secrets signing-pub harness-binary harness-env harness-unit svc-vllm.crt svc-vllm.key svc-llamacpp.crt svc-llamacpp.key svc-ollama.crt svc-ollama.key svc-tei.crt svc-tei.key svc-reranker.crt svc-reranker.key vendor-cli vendor-cli-manifest vendor-cli-2 vendor-cli-2-manifest vendor-cli-3 vendor-cli-3-manifest release-sums release-sums.sig release-version release-lock release-lock.sig netns-unit"
 
@@ -129,13 +206,13 @@ _bundle_member_bad() {  # $1 = name, $2 = type char; prints the reason, or nothi
     esac
 }
 bundle_tar_ok() {  # $1 = tar path; 0 or 65 with the reason
-    _names="$(LC_ALL=C tar -tf "$1" 2>/dev/null)" || { echo "noo-apply: REFUSED — the bundle is not a readable tar" >&2; return 65; }
-    _types="$(LC_ALL=C tar -tvf "$1" 2>/dev/null | cut -c1)" || { echo "noo-apply: REFUSED — the bundle is not a readable tar" >&2; return 65; }
+    _names="$(LC_ALL=C tar -tf "$1" 2>/dev/null)" || { echo "noo-apply: REFUSED — the bundle is not a readable tar" >&2; NOO_REFUSAL=bundle_shape; return 65; }
+    _types="$(LC_ALL=C tar -tvf "$1" 2>/dev/null | cut -c1)" || { echo "noo-apply: REFUSED — the bundle is not a readable tar" >&2; NOO_REFUSAL=bundle_shape; return 65; }
     _typesf="$(mktemp)"; printf '%s\n' "$_types" > "$_typesf"
     [ "$(printf '%s\n' "$_names" | wc -l)" = "$(printf '%s\n' "$_types" | wc -l)" ] \
-        || { echo "noo-apply: REFUSED — the bundle's member list does not parse (a name with a line break?)" >&2; return 65; }
+        || { echo "noo-apply: REFUSED — the bundle's member list does not parse (a name with a line break?)" >&2; NOO_REFUSAL=bundle_shape; return 65; }
     _dups="$(printf '%s\n' "$_names" | sed 's#/$##' | sort | uniq -d | head -1)"
-    [ -z "$_dups" ] || { echo "noo-apply: REFUSED — the bundle carries '$_dups' twice" >&2; return 65; }
+    [ -z "$_dups" ] || { echo "noo-apply: REFUSED — the bundle carries '$_dups' twice" >&2; NOO_REFUSAL=bundle_shape; return 65; }
     _bad=""
     while read -r _n _t; do
         _why="$(_bundle_member_bad "$_n" "$_t")"
@@ -144,7 +221,7 @@ bundle_tar_ok() {  # $1 = tar path; 0 or 65 with the reason
 $(printf '%s\n' "$_names" | paste -d' ' - "$_typesf")
 EOF_MEMBERS
     rm -f "$_typesf"
-    [ -z "$_bad" ] || { echo "noo-apply: REFUSED — bundle member '$_bad' is not one a bundle may carry" >&2; return 65; }
+    [ -z "$_bad" ] || { echo "noo-apply: REFUSED — bundle member '$_bad' is not one a bundle may carry" >&2; NOO_REFUSAL=bundle_shape; return 65; }
     return 0
 }
 # END bundle_tar_shape
@@ -154,17 +231,16 @@ WORK="$(mktemp -d)"
 # The CA's public key is derived OUTSIDE the extraction directory: nothing
 # the bundle carried can name or shadow it.
 KEYS="$(mktemp -d)"
-trap 'rm -rf "$WORK" "$KEYS"' EXIT
 chmod 700 "$WORK" "$KEYS"
 tar --no-same-owner --no-same-permissions -xf "$BUNDLE" -C "$WORK"
 # Belt and braces after the list check: only regular files and the files/
 # directory exist in what was extracted.
 if [ -n "$(find "$WORK" -mindepth 1 \( ! -type f ! -type d \) -print -quit)" ] \
    || [ -n "$(find "$WORK" -mindepth 1 -type d ! -path "$WORK/files" -print -quit)" ]; then
-    echo "noo-apply: REFUSED — the extracted bundle holds something other than regular files" >&2; exit 65
+    echo "noo-apply: REFUSED — the extracted bundle holds something other than regular files" >&2; NOO_REFUSAL=bundle_shape; exit 65
 fi
 [ -f "$WORK/manifest" ] && [ -f "$WORK/manifest.sig" ] || {
-    echo "noo-apply: bundle lacks manifest/manifest.sig" >&2; exit 65
+    echo "noo-apply: bundle lacks manifest/manifest.sig" >&2; NOO_REFUSAL=bundle_shape; exit 65
 }
 
 # ── 1. Signature: the whole trust decision ─────────────────────────────────
@@ -231,19 +307,19 @@ bundle_signature_lane() {
         echo "noo-apply: REFUSED — a CA-signed signing-key rollover that the signing key this node already holds ($SIGNPUB) did not countersign" >&2
         echo "noo-apply: the CA key alone may not replace an adopted signing key. Re-run 'noo security pki rotate-signing-key' from a controller that still holds the previous signing key; if it is lost, re-enroll this node." >&2
         logger -t noo-apply "REFUSED bundle: CA-signed rollover without a countersignature from the installed signing key" 2>/dev/null || true
-        exit 77
+        NOO_REFUSAL=rollover_not_countersigned; exit 77
     fi
     if _sig_ok "$_keys/ca.pub" && case " $_kinds" in *" signing-pub "*) true ;; *) false ;; esac; then
         echo "noo-apply: REFUSED — a CA-signed bundle may carry signing-pub and NOTHING else (it carries: $_kinds)" >&2
         echo "noo-apply: the CA key delivers a public key, never code. Deliver the key alone ('noo security pki rotate-signing-key <node> --deliver-only'), then everything else signed by the signing key." >&2
         logger -t noo-apply "REFUSED bundle: CA-signed rollover carrying more than signing-pub" 2>/dev/null || true
-        exit 77
+        NOO_REFUSAL=ca_rollover_overreach; exit 77
     fi
     if _sig_ok "$_keys/ca.pub"; then
         echo "noo-apply: REFUSED — this bundle is signed by the cluster CA, not the fleet signing key, and it is not a signing-key rollover" >&2
         echo "noo-apply: the CA-signed apply lane is retired. On the controller: 'noo security pki rotate-signing-key --deliver-only', then 'noo cluster provision <node> --wait'." >&2
         logger -t noo-apply "REFUSED bundle: CA-signed lane retired (verified-by would have been ca-legacy)" 2>/dev/null || true
-        exit 77
+        NOO_REFUSAL=ca_signed_lane_retired; exit 77
     fi
     if [ -f "$SIGNPUB" ]; then
         echo "noo-apply: manifest signature verifies against NEITHER $SIGNPUB nor $_pki/ca.crt — refusing" >&2
@@ -251,7 +327,7 @@ bundle_signature_lane() {
         echo "noo-apply: manifest signature does NOT verify against $_pki/ca.crt — refusing" >&2
     fi
     logger -t noo-apply "REFUSED bundle: bad signature" 2>/dev/null || true
-    exit 77
+    NOO_REFUSAL=signature_invalid; exit 77
 }
 # END signature_lane
 # The manifest's SHAPE, one parser for every reader below (awk, `read`, the
@@ -262,9 +338,9 @@ bundle_signature_lane() {
 manifest_ok() {  # $1 = manifest path
     if LC_ALL=C grep -vqE '^(#noo-bundle 2|#node [A-Za-z0-9._-]{1,64}|#issued [0-9]{1,12}|[0-9a-f]{64}  [a-z0-9][a-z0-9.-]{0,63})$' "$1"; then
         echo "noo-apply: REFUSED — the manifest has a line that is not a header or '<sha256>  <kind>'" >&2
-        return 65
+        NOO_REFUSAL=bundle_shape; return 65
     fi
-    LC_ALL=C tr -d '\r\000' < "$1" | cmp -s - "$1" || { echo "noo-apply: REFUSED — the manifest carries a CR or NUL" >&2; return 65; }
+    LC_ALL=C tr -d '\r\000' < "$1" | cmp -s - "$1" || { echo "noo-apply: REFUSED — the manifest carries a CR or NUL" >&2; NOO_REFUSAL=bundle_shape; return 65; }
     return 0
 }
 # END manifest_shape
@@ -283,7 +359,7 @@ if [ -z "$BUNDLE_VER" ]; then
     echo "noo-apply: this bundle has no #noo-bundle header — it was built by a controller from before bundles were addressed to a node." >&2
     echo "noo-apply: a bundle that names no node and no date can be replayed onto any node at any time, so this applier refuses it. Re-push from a current controller." >&2
     logger -t noo-apply "REFUSED bundle: v1 (unaddressed) manifest" 2>/dev/null || true
-    exit 77
+    NOO_REFUSAL=bundle_unaddressed; exit 77
 fi
 
 # The node this box already knows itself to be. NOT the bundle's own
@@ -296,7 +372,7 @@ if [ -n "$INSTALLED_ID" ] && [ "$BUNDLE_NODE" != "$INSTALLED_ID" ]; then
     echo "noo-apply: this bundle is addressed to '$BUNDLE_NODE' but this node is '$INSTALLED_ID' — refusing" >&2
     echo "noo-apply: applying it would install another node's identity here. If this node was genuinely renamed, re-enroll it rather than replaying a bundle." >&2
     logger -t noo-apply "REFUSED bundle: addressed to $BUNDLE_NODE, this node is $INSTALLED_ID" 2>/dev/null || true
-    exit 77
+    NOO_REFUSAL=bundle_for_other_node; exit 77
 fi
 if [ -z "$INSTALLED_ID" ]; then
     echo "noo-apply: no installed node identity yet — treating this as the first install for '$BUNDLE_NODE'"
@@ -312,7 +388,7 @@ case "$MAX_AGE" in ''|*[!0-9]*) MAX_AGE=86400 ;; esac
 NOW="$(date -u +%s)"
 if [ -z "$BUNDLE_ISSUED" ]; then
     echo "noo-apply: bundle header carries no #issued stamp — refusing" >&2
-    exit 77
+    NOO_REFUSAL=bundle_undated; exit 77
 fi
 # Digits only, and few of them, BEFORE any arithmetic: bash evaluates a
 # variable's text inside $(( )), so a header of `NOW[$(cmd)]` would run a
@@ -321,18 +397,18 @@ fi
 if ! printf '%s' "$BUNDLE_ISSUED" | grep -qE '^[0-9]{1,12}$'; then
     echo "noo-apply: REFUSED — the #issued stamp is not a plain number" >&2
     logger -t noo-apply "REFUSED bundle: non-numeric #issued" 2>/dev/null || true
-    exit 77
+    NOO_REFUSAL=bundle_undated; exit 77
 fi
 AGE=$(( NOW - BUNDLE_ISSUED ))
 if [ "$AGE" -gt "$MAX_AGE" ]; then
     echo "noo-apply: this bundle was signed ${AGE}s ago, past the ${MAX_AGE}s freshness window — refusing a replay" >&2
     echo "noo-apply: if this is a legitimate late apply, re-push from the controller; if this node's clock is wrong, fix the clock first." >&2
     logger -t noo-apply "REFUSED bundle: stale by ${AGE}s" 2>/dev/null || true
-    exit 77
+    NOO_REFUSAL=bundle_stale; exit 77
 fi
 if [ "$AGE" -lt -300 ]; then
     echo "noo-apply: this bundle claims to be signed $(( -AGE ))s in the future — this node's clock or the controller's is wrong; refusing" >&2
-    exit 77
+    NOO_REFUSAL=bundle_from_future; exit 77
 fi
 
 # ── 1c. Release check (i908): root code installs only if the RELEASE listed it
@@ -542,7 +618,7 @@ release_names_for() {
 release_refuse_ahead() {
     echo "noo-apply: REFUSED $1 $2 — this node is ahead of its controller (it applied $3${4:+ after $4}; the controller staged $2): roll the controller to $5 or later (noo upgrade --stack), then this node takes its bundles again (75)" >&2
     logger -t noo-apply "REFUSED release check: $1 $2 — node ahead of its controller ($3${4:+ after $4})" 2>/dev/null || true
-    exit 75
+    NOO_REFUSAL=node_ahead_of_controller; exit 75
 }
 # release_floor_check WHAT VALUE KEY — the one-step-back rule for KEY
 # (`release` or `stack`). The record keeps the last two FINALS applied:
@@ -554,7 +630,7 @@ release_floor_check() {
     _rf_f="$(release_floor_of "$3-final")"; _rf_p="$(release_floor_of "$3-prev")"
     for _rf_x in "$_rf_f" "$_rf_p"; do
         if [ -n "$_rf_x" ] && ! release_ver_key "$_rf_x" >/dev/null; then
-            release_refuse "$1" "the floor record $RELEASE_FLOOR names '$_rf_x', which is not a version"
+            NOO_REFUSAL=release_list_invalid; release_refuse "$1" "the floor record $RELEASE_FLOOR names '$_rf_x', which is not a version"
         fi
     done
     [ -n "$_rf_f" ] || return 0
@@ -603,11 +679,11 @@ release_prev_tag() {
     [ -n "$_rp" ] || return 0
     _rp_what="release-sums"; [ "$2" = lock ] && _rp_what="release-lock"
     if [ "$(printf '%s\n' "$_rp" | grep -c .)" != 1 ]; then
-        release_refuse "$_rp_what" "it vouches for more than one previous release ($(printf '%s' "$_rp" | tr '\n' ' '))"
+        NOO_REFUSAL=release_list_invalid; release_refuse "$_rp_what" "it vouches for more than one previous release ($(printf '%s' "$_rp" | tr '\n' ' '))"
     fi
-    case "$_rp" in *-rc.*) release_refuse "$_rp_what" "its previous-release rows name an rc ($_rp), not a final" ;; esac
+    case "$_rp" in *-rc.*) NOO_REFUSAL=release_list_invalid; release_refuse "$_rp_what" "its previous-release rows name an rc ($_rp), not a final" ;; esac
     if ! release_ver_key "$_rp" >/dev/null || ! release_older "$_rp" "$3"; then
-        release_refuse "$_rp_what" "its previous-release rows name $_rp, which is not a final older than $3"
+        NOO_REFUSAL=release_list_invalid; release_refuse "$_rp_what" "its previous-release rows name $_rp, which is not a final older than $3"
     fi
     printf '%s\n' "$_rp"
 }
@@ -647,33 +723,33 @@ release_check() {
         fi
     fi
     for _rc_k in release-sums release-sums.sig release-version; do
-        case "$_rc_mk" in *" $_rc_k "*) : ;; *) release_refuse "$_rc_root" "the bundle carries root code but no release-signed list ($_rc_k)" ;; esac
-        [ -f "$_rc_w/files/$_rc_k" ] || release_refuse "$_rc_root" "the bundle names $_rc_k but lacks it"
+        case "$_rc_mk" in *" $_rc_k "*) : ;; *) NOO_REFUSAL=release_unlisted; release_refuse "$_rc_root" "the bundle carries root code but no release-signed list ($_rc_k)" ;; esac
+        [ -f "$_rc_w/files/$_rc_k" ] || { NOO_REFUSAL=release_unlisted; release_refuse "$_rc_root" "the bundle names $_rc_k but lacks it"; }
     done
     RELEASE_VERIFIER="$(release_verifier)"
     if [ -z "$RELEASE_VERIFIER" ]; then
-        release_refuse "$_rc_root" "this node cannot verify an Ed25519 release signature: it needs OpenSSL 3 or python3 (openssl here: $(openssl version 2>/dev/null | awk '{print $1, $2}'))"
+        NOO_REFUSAL=release_verifier_missing; release_refuse "$_rc_root" "this node cannot verify an Ed25519 release signature: it needs OpenSSL 3 or python3 (openssl here: $(openssl version 2>/dev/null | awk '{print $1, $2}'))"
     fi
     _rc_sums="$_rc_w/files/release-sums"
     if ! release_sig_ok "$_rc_sums" "$_rc_w/files/release-sums.sig" "$_rc_t"; then
-        release_refuse "release-sums" "its signature does not verify against a release key this applier pins"
+        NOO_REFUSAL=release_list_invalid; release_refuse "release-sums" "its signature does not verify against a release key this applier pins"
     fi
     # The list names its release: release-version is the text whose sha256 is
     # the signed noo-release-version row.
     _rc_ver="$(tr -d '\r' < "$_rc_w/files/release-version")"
     if [ "$(wc -l < "$_rc_w/files/release-version")" != 1 ] || ! release_ver_key "$_rc_ver" >/dev/null; then
-        release_refuse "release-version" "it is not one X.Y.Z or X.Y.Z-rc.N line"
+        NOO_REFUSAL=release_list_invalid; release_refuse "release-version" "it is not one X.Y.Z or X.Y.Z-rc.N line"
     fi
     _rc_vs="$(sha256sum "$_rc_w/files/release-version" | awk '{print $1}')"
     if ! release_names_for "$_rc_sums" "$_rc_vs" | grep -qx 'noo-release-version'; then
-        release_refuse "release-version" "$_rc_ver is not the release the signed list names"
+        NOO_REFUSAL=release_list_invalid; release_refuse "release-version" "$_rc_ver is not the release the signed list names"
     fi
     release_floor_check "release $_rc_ver" "$_rc_ver" release
-    _rc_prev="$(release_prev_tag "$_rc_sums" sums "$_rc_ver")" || exit 75
+    _rc_prev="$(release_prev_tag "$_rc_sums" sums "$_rc_ver")" || { NOO_REFUSAL=release_list_invalid; exit 75; }
     _rc_rec="$_rc_ver"
     for _rc_k in $RELEASE_LISTED_KINDS; do
         case "$_rc_mk" in *" $_rc_k "*) : ;; *) continue ;; esac
-        [ -f "$_rc_w/files/$_rc_k" ] || release_refuse "$_rc_k" "the bundle names it but lacks it"
+        [ -f "$_rc_w/files/$_rc_k" ] || { NOO_REFUSAL=release_unlisted; release_refuse "$_rc_k" "the bundle names it but lacks it"; }
         _rc_s="$(sha256sum "$_rc_w/files/$_rc_k" | awk '{print $1}')"
         _rc_n="$(release_names_for "$_rc_sums" "$_rc_s")"
         if printf '%s\n' "$_rc_n" | LC_ALL=C grep -qE "$(release_asset_re "$_rc_k")"; then
@@ -684,30 +760,30 @@ release_check() {
             release_floor_check "release $_rc_prev" "$_rc_prev" release
             _rc_rec="$_rc_prev"
         else
-            release_refuse "$_rc_k" "sha256 $_rc_s is not in release $_rc_ver's signed list"
+            NOO_REFUSAL=release_unlisted; release_refuse "$_rc_k" "sha256 $_rc_s is not in release $_rc_ver's signed list"
         fi
         if [ "$_rc_k" = applier ]; then
             _rc_g="$(grep -m1 -E '^NOO_APPLY_GENERATION=[0-9]+$' "$_rc_w/files/applier" | cut -d= -f2)"
             if [ "${_rc_g:-0}" -lt "$RELEASE_MIN_APPLIER_GENERATION" ]; then
-                release_refuse applier "sha256 $_rc_s is applier generation ${_rc_g:-0}, which has no release check; a node keeps generation $RELEASE_MIN_APPLIER_GENERATION or later, a step back included"
+                NOO_REFUSAL=release_unlisted; release_refuse applier "sha256 $_rc_s is applier generation ${_rc_g:-0}, which has no release check; a node keeps generation $RELEASE_MIN_APPLIER_GENERATION or later, a step back included"
             fi
         fi
     done
     case "$_rc_mk" in *" agent-binary "*)
         for _rc_k in release-lock release-lock.sig; do
-            case "$_rc_mk" in *" $_rc_k "*) : ;; *) release_refuse agent-binary "the bundle carries the agent but not the release-signed stack lock ($_rc_k)" ;; esac
-            [ -f "$_rc_w/files/$_rc_k" ] || release_refuse agent-binary "the bundle names $_rc_k but lacks it"
+            case "$_rc_mk" in *" $_rc_k "*) : ;; *) NOO_REFUSAL=release_unlisted; release_refuse agent-binary "the bundle carries the agent but not the release-signed stack lock ($_rc_k)" ;; esac
+            [ -f "$_rc_w/files/$_rc_k" ] || { NOO_REFUSAL=release_unlisted; release_refuse agent-binary "the bundle names $_rc_k but lacks it"; }
         done
         _rc_lock="$_rc_w/files/release-lock"
         if ! release_sig_ok "$_rc_lock" "$_rc_w/files/release-lock.sig" "$_rc_t"; then
-            release_refuse "release-lock" "its signature does not verify against a release key this applier pins"
+            NOO_REFUSAL=release_list_invalid; release_refuse "release-lock" "its signature does not verify against a release key this applier pins"
         fi
         _rc_tag="$(sed -n 's/^# stack //p' "$_rc_lock" | tr -d '\r' | sort -u)"
         if [ "$(printf '%s\n' "$_rc_tag" | grep -c .)" != 1 ] || ! release_ver_key "$_rc_tag" >/dev/null; then
-            release_refuse "release-lock" "it does not name exactly one stack tag"
+            NOO_REFUSAL=release_list_invalid; release_refuse "release-lock" "it does not name exactly one stack tag"
         fi
         release_floor_check "stack $_rc_tag" "$_rc_tag" stack
-        _rc_lprev="$(release_prev_tag "$_rc_lock" lock "$_rc_tag")" || exit 75
+        _rc_lprev="$(release_prev_tag "$_rc_lock" lock "$_rc_tag")" || { NOO_REFUSAL=release_list_invalid; exit 75; }
         RELEASE_OK_STACK="$_rc_tag"
         _rc_s="$(sha256sum "$_rc_w/files/agent-binary" | awk '{print $1}')"
         if LC_ALL=C grep -qxE "# node-agent-sha256 linux/(amd64|arm64) $_rc_s" "$_rc_lock"; then
@@ -716,7 +792,7 @@ release_check() {
             release_floor_check "stack v$_rc_lprev" "v$_rc_lprev" stack
             RELEASE_OK_STACK="v$_rc_lprev"
         else
-            release_refuse agent-binary "sha256 $_rc_s is not in stack $_rc_tag's signed lock"
+            NOO_REFUSAL=release_unlisted; release_refuse agent-binary "sha256 $_rc_s is not in stack $_rc_tag's signed lock"
         fi
         ;;
     esac
@@ -757,11 +833,11 @@ release_check "$WORK" "$KEYS"
 if [ -f "$WORK/files/applier" ] && [ -z "${NOO_APPLY_REEXEC:-}" ]; then
     want="$(awk '$2 == "applier" {print $1}' "$WORK/manifest")"
     have="$(sha256sum "$WORK/files/applier" | awk '{print $1}')"
-    [ -n "$want" ] && [ "$want" = "$have" ] || { echo "noo-apply: applier payload does not match the signed manifest" >&2; exit 74; }
+    [ -n "$want" ] && [ "$want" = "$have" ] || { echo "noo-apply: applier payload does not match the signed manifest" >&2; NOO_REFUSAL=payload_checksum; exit 74; }
     cur="$(sha256sum "$SELF" 2>/dev/null | awk '{print $1}')"
     if [ "$cur" != "$have" ]; then
-        head -1 "$WORK/files/applier" | grep -q '^#!' || { echo "noo-apply: applier payload has no shebang" >&2; exit 65; }
-        grep -q 'noo-apply' "$WORK/files/applier" || { echo "noo-apply: applier payload does not look like noo-apply" >&2; exit 65; }
+        head -1 "$WORK/files/applier" | grep -q '^#!' || { echo "noo-apply: applier payload has no shebang" >&2; NOO_REFUSAL=script_payload_invalid; exit 65; }
+        grep -q 'noo-apply' "$WORK/files/applier" || { echo "noo-apply: applier payload does not look like noo-apply" >&2; NOO_REFUSAL=script_payload_invalid; exit 65; }
         # The downgrade floor: never replace this applier with
         # one of a lower generation. An applier with no generation line
         # predates the retirement of the CA-signed lane.
@@ -769,7 +845,7 @@ if [ -f "$WORK/files/applier" ] && [ -z "${NOO_APPLY_REEXEC:-}" ]; then
         if [ "${_pgen:-0}" -lt "$NOO_APPLY_GENERATION" ]; then
             echo "noo-apply: REFUSED — the bundle's applier is generation ${_pgen:-0}, older than this one ($NOO_APPLY_GENERATION); installing it would re-open retired lanes" >&2
             logger -t noo-apply "REFUSED bundle: applier downgrade (generation ${_pgen:-0} < $NOO_APPLY_GENERATION)" 2>/dev/null || true
-            exit 65
+            NOO_REFUSAL=applier_downgrade; exit 65
         fi
     fi
     if [ "$cur" != "$have" ] && [ "$VERIFY_ONLY" != 1 ]; then
@@ -788,12 +864,12 @@ while read -r sum kind; do
     case "$sum" in \#*) continue ;; esac
     case " $KNOWN_KINDS " in
         *" $kind "*) : ;;
-        *) addon_leaf_kind_ok "$kind" || { echo "noo-apply: unknown kind '$kind' — this node's applier is older than the bundle (or the kind is malformed); refusing" >&2; exit 76; } ;;
+        *) addon_leaf_kind_ok "$kind" || { echo "noo-apply: unknown kind '$kind' — this node's applier is older than the bundle (or the kind is malformed); refusing" >&2; NOO_REFUSAL=applier_too_old; exit 76; } ;;
     esac
     f="$WORK/files/$kind"
-    [ -f "$f" ] || { echo "noo-apply: manifest names '$kind' but the bundle lacks it" >&2; exit 65; }
+    [ -f "$f" ] || { echo "noo-apply: manifest names '$kind' but the bundle lacks it" >&2; NOO_REFUSAL=manifest_file_mismatch; exit 65; }
     actual="$(sha256sum "$f" | awk '{print $1}')"
-    [ "$actual" = "$sum" ] || { echo "noo-apply: sha256 mismatch for '$kind'" >&2; exit 74; }
+    [ "$actual" = "$sum" ] || { echo "noo-apply: sha256 mismatch for '$kind'" >&2; NOO_REFUSAL=payload_checksum; exit 74; }
 done < "$WORK/manifest"
 # …and every file must be NAMED by the signed manifest. Install blocks below
 # key on a file's presence, so an unlisted file would be installed unsigned.
@@ -803,7 +879,7 @@ for _f in "$WORK"/files/*; do
     awk -v k="$_k" '!/^#/ && $2 == k {found=1} END {exit !found}' "$WORK/manifest" || {
         echo "noo-apply: REFUSED — the bundle carries files/$_k, which the signed manifest does not name" >&2
         logger -t noo-apply "REFUSED bundle: unmanifested file $_k" 2>/dev/null || true
-        exit 65
+        NOO_REFUSAL=manifest_file_mismatch; exit 65
     }
 done
 
@@ -844,21 +920,21 @@ env_payload_ok() {
         _line="$(printf '%s' "$_line" | tr -d '\r')"
         case "$_line" in ''|'#'*) continue ;; esac
         _k="${_line%%=*}"
-        [ "$_k" != "$_line" ] || { _shape_refuse "$_kind" "line $_n is not KEY=value"; return 65; }
+        [ "$_k" != "$_line" ] || { _shape_refuse "$_kind" "line $_n is not KEY=value"; NOO_REFUSAL=env_shape; return 65; }
         _v="${_line#*=}"
         case "$_keys" in
             *" $_k "*) : ;;
-            *) _shape_refuse "$_kind" "line $_n sets '$_k', which is not a key $_kind is rendered with"; return 65 ;;
+            *) _shape_refuse "$_kind" "line $_n sets '$_k', which is not a key $_kind is rendered with"; NOO_REFUSAL=env_shape; return 65 ;;
         esac
         case "$_v" in
-            *'`'*|*'$('*) _shape_refuse "$_kind" "line $_n ($_k) carries a command substitution"; return 65 ;;
+            *'`'*|*'$('*) _shape_refuse "$_kind" "line $_n ($_k) carries a command substitution"; NOO_REFUSAL=env_shape; return 65 ;;
         esac
         case "$_k" in
-            PATH) [ "$_v" = "$AGENT_ENV_PATH" ] || { _shape_refuse "$_kind" "PATH is not the rendered value"; return 65; } ;;
-            DOCKER_HOST) [ "$_v" = "$AGENT_ENV_DOCKER_HOST" ] || { _shape_refuse "$_kind" "DOCKER_HOST is not the local socket"; return 65; } ;;
-            NOO_APPLY_ACCEPT_CA_SIGNED) [ "$_v" = 0 ] || { _shape_refuse "$_kind" "NOO_APPLY_ACCEPT_CA_SIGNED may only say 0"; return 65; } ;;
-            NOO_CLUSTER_TOKEN_V1) case "$_v" in ''|0|1) : ;; *) _shape_refuse "$_kind" "NOO_CLUSTER_TOKEN_V1 may only say 0, 1 or nothing"; return 65 ;; esac ;;
-            NODE_AGENT_BIND) case "$_v" in all) : ;; *[!0-9a-fA-F:.,]*) _shape_refuse "$_kind" "NODE_AGENT_BIND may only be all, an address, or a comma list of addresses"; return 65 ;; esac ;;
+            PATH) [ "$_v" = "$AGENT_ENV_PATH" ] || { _shape_refuse "$_kind" "PATH is not the rendered value"; NOO_REFUSAL=env_shape; return 65; } ;;
+            DOCKER_HOST) [ "$_v" = "$AGENT_ENV_DOCKER_HOST" ] || { _shape_refuse "$_kind" "DOCKER_HOST is not the local socket"; NOO_REFUSAL=env_shape; return 65; } ;;
+            NOO_APPLY_ACCEPT_CA_SIGNED) [ "$_v" = 0 ] || { _shape_refuse "$_kind" "NOO_APPLY_ACCEPT_CA_SIGNED may only say 0"; NOO_REFUSAL=env_shape; return 65; } ;;
+            NOO_CLUSTER_TOKEN_V1) case "$_v" in ''|0|1) : ;; *) _shape_refuse "$_kind" "NOO_CLUSTER_TOKEN_V1 may only say 0, 1 or nothing"; NOO_REFUSAL=env_shape; return 65 ;; esac ;;
+            NODE_AGENT_BIND) case "$_v" in all) : ;; *[!0-9a-fA-F:.,]*) _shape_refuse "$_kind" "NODE_AGENT_BIND may only be all, an address, or a comma list of addresses"; NOO_REFUSAL=env_shape; return 65 ;; esac ;;
         esac
     done < "$_f"
     return 0
@@ -876,14 +952,14 @@ unit_payload_ok() {
     case "$_kind" in
         agent-unit) _want="$AGENT_UNIT_SHA256" ;;
         harness-unit) _want="$HARNESS_UNIT_SHA256" ;;
-        *) _shape_refuse "$_kind" "is not a unit kind"; return 65 ;;
+        *) _shape_refuse "$_kind" "is not a unit kind"; NOO_REFUSAL=unit_shape; return 65 ;;
     esac
     _have="$(sha256sum "$_f" | awk '{print $1}')"
     case " $_want " in
         *" $_have "*) return 0 ;;
     esac
     _shape_refuse "$_kind" "is not the unit this release ships (sha256 $_have)"
-    return 65
+    NOO_REFUSAL=unit_shape; return 65
 }
 
 # text_payload_ok FILE KIND — no CR and no NUL anywhere. systemd ends a line
@@ -895,7 +971,7 @@ TEXT_KINDS="agent-env harness-env nats-creds fleet-secrets host-telemetry teardo
 text_payload_ok() {
     if ! LC_ALL=C tr -d '\r\000' < "$1" | cmp -s - "$1"; then
         _shape_refuse "$2" "carries a carriage return or NUL byte"
-        return 65
+        NOO_REFUSAL=payload_control_bytes; return 65
     fi
     return 0
 }
@@ -996,12 +1072,12 @@ _vendor_refuse() {
 vendor_manifest_ok() {
     _vm_n="$(vendor_get "$1" name)"; _vm_v="$(vendor_get "$1" version)"
     _vm_s="$(vendor_get "$1" sha256)"; _vm_u="$(vendor_get "$1" unpack)"
-    _vendor_re "$_vm_n" '[a-z][a-z0-9-]{0,63}' || { _vendor_refuse "$2" "name '$_vm_n' is not a plain name"; return 65; }
-    case "$_vm_n" in noo*) _vendor_refuse "$2" "name '$_vm_n' would shadow a noomesh binary"; return 65 ;; esac
-    _vendor_re "$_vm_v" '[A-Za-z0-9][A-Za-z0-9._+-]{0,63}' || { _vendor_refuse "$2" "version '$_vm_v' is not a plain version"; return 65; }
-    _vendor_re "$_vm_s" '[0-9a-f]{64}' || { _vendor_refuse "$2" "sha256 is not 64 lowercase hex"; return 65; }
-    case "$_vm_u" in tgz|zip|none) : ;; *) _vendor_refuse "$2" "unpack '$_vm_u' is not tgz, zip or none"; return 65 ;; esac
-    _vendor_path_ok "$(vendor_get "$1" entry)" || { _vendor_refuse "$2" "entry is not a plain relative path"; return 65; }
+    _vendor_re "$_vm_n" '[a-z][a-z0-9-]{0,63}' || { _vendor_refuse "$2" "name '$_vm_n' is not a plain name"; NOO_REFUSAL=vendor_cli_invalid; return 65; }
+    case "$_vm_n" in noo*) _vendor_refuse "$2" "name '$_vm_n' would shadow a noomesh binary"; NOO_REFUSAL=vendor_cli_invalid; return 65 ;; esac
+    _vendor_re "$_vm_v" '[A-Za-z0-9][A-Za-z0-9._+-]{0,63}' || { _vendor_refuse "$2" "version '$_vm_v' is not a plain version"; NOO_REFUSAL=vendor_cli_invalid; return 65; }
+    _vendor_re "$_vm_s" '[0-9a-f]{64}' || { _vendor_refuse "$2" "sha256 is not 64 lowercase hex"; NOO_REFUSAL=vendor_cli_invalid; return 65; }
+    case "$_vm_u" in tgz|zip|none) : ;; *) _vendor_refuse "$2" "unpack '$_vm_u' is not tgz, zip or none"; NOO_REFUSAL=vendor_cli_invalid; return 65 ;; esac
+    _vendor_path_ok "$(vendor_get "$1" entry)" || { _vendor_refuse "$2" "entry is not a plain relative path"; NOO_REFUSAL=vendor_cli_invalid; return 65; }
     return 0
 }
 # _vendor_members_ok LISTING — no member is absolute or climbs out with ..
@@ -1012,15 +1088,15 @@ _vendor_members_ok() {
 vendor_unpack() {
     case "$2" in
         tgz)
-            _vu_l="$(LC_ALL=C tar -tzf "$1" 2>/dev/null)" || { echo "noo-apply: vendor: $2 artefact is not a readable archive" >&2; return 65; }
-            _vendor_members_ok "$_vu_l" || { echo "noo-apply: vendor: the archive names a path outside its own directory" >&2; return 65; }
+            _vu_l="$(LC_ALL=C tar -tzf "$1" 2>/dev/null)" || { echo "noo-apply: vendor: $2 artefact is not a readable archive" >&2; NOO_REFUSAL=vendor_cli_invalid; return 65; }
+            _vendor_members_ok "$_vu_l" || { echo "noo-apply: vendor: the archive names a path outside its own directory" >&2; NOO_REFUSAL=vendor_cli_invalid; return 65; }
             LC_ALL=C tar -tvzf "$1" 2>/dev/null | LC_ALL=C grep -qE ' -> /' \
-                && { echo "noo-apply: vendor: the archive carries an absolute symlink" >&2; return 65; }
+                && { echo "noo-apply: vendor: the archive carries an absolute symlink" >&2; NOO_REFUSAL=vendor_cli_invalid; return 65; }
             tar --no-same-owner -xzf "$1" -C "$3" ;;
         zip)
-            command -v unzip >/dev/null 2>&1 || { echo "noo-apply: vendor: a zip artefact needs unzip on this node" >&2; return 69; }
-            _vu_l="$(unzip -Z1 "$1" 2>/dev/null)" || { echo "noo-apply: vendor: zip artefact is not readable" >&2; return 65; }
-            _vendor_members_ok "$_vu_l" || { echo "noo-apply: vendor: the archive names a path outside its own directory" >&2; return 65; }
+            command -v unzip >/dev/null 2>&1 || { echo "noo-apply: vendor: a zip artefact needs unzip on this node" >&2; NOO_REFUSAL=tool_missing; return 69; }
+            _vu_l="$(unzip -Z1 "$1" 2>/dev/null)" || { echo "noo-apply: vendor: zip artefact is not readable" >&2; NOO_REFUSAL=vendor_cli_invalid; return 65; }
+            _vendor_members_ok "$_vu_l" || { echo "noo-apply: vendor: the archive names a path outside its own directory" >&2; NOO_REFUSAL=vendor_cli_invalid; return 65; }
             unzip -q -o "$1" -d "$3" ;;
         none)
             install -m 755 "$1" "$3/$4" ;;
@@ -1035,7 +1111,7 @@ vendor_install() {
     _vi_n="$(vendor_get "$2" name)"; _vi_v="$(vendor_get "$2" version)"
     _vi_s="$(vendor_get "$2" sha256)"; _vi_u="$(vendor_get "$2" unpack)"
     _vi_got="$(sha256sum "$1" | awk '{print $1}')"
-    [ "$_vi_got" = "$_vi_s" ] || { _vendor_refuse "$3" "payload sha256 $_vi_got is not the manifest's $_vi_s"; return 65; }
+    [ "$_vi_got" = "$_vi_s" ] || { _vendor_refuse "$3" "payload sha256 $_vi_got is not the manifest's $_vi_s"; NOO_REFUSAL=vendor_cli_invalid; return 65; }
     _vi_dest="$VENDOR_ROOT/$_vi_n/$_vi_v"
     if [ -f "$_vi_dest/.noo-sha256" ] && [ "$(cat "$_vi_dest/.noo-sha256")" = "$_vi_s" ]; then
         _vi_outcome=unchanged; return 0
@@ -1045,7 +1121,7 @@ vendor_install() {
     rm -rf "$_vi_stage"; mkdir -m 755 "$_vi_stage"
     _vi_e="$(vendor_get "$2" entry)"
     vendor_unpack "$1" "$_vi_u" "$_vi_stage" "$_vi_e" || { _vi_rc=$?; rm -rf "$_vi_stage"; return $_vi_rc; }
-    [ -f "$_vi_stage/$_vi_e" ] || { rm -rf "$_vi_stage"; _vendor_refuse "$3" "entry $_vi_e is not in the artefact"; return 65; }
+    [ -f "$_vi_stage/$_vi_e" ] || { rm -rf "$_vi_stage"; _vendor_refuse "$3" "entry $_vi_e is not in the artefact"; NOO_REFUSAL=vendor_cli_invalid; return 65; }
     # A native executable: ELF-checked like the agent and harness binaries.
     # (The vendors' Linux builds of Claude Code and Copilot CLI are
     # glibc-dynamic, unlike the static noomesh node binaries; a node below
@@ -1053,7 +1129,7 @@ vendor_install() {
     # CLI's own error.)
     case "$(head -c 4 "$_vi_stage/$_vi_e" | od -An -tx1 | tr -d ' \n')" in
         7f454c46) : ;;
-        *) rm -rf "$_vi_stage"; _vendor_refuse "$3" "entry $_vi_e is not an ELF executable"; return 65 ;;
+        *) rm -rf "$_vi_stage"; _vendor_refuse "$3" "entry $_vi_e is not an ELF executable"; NOO_REFUSAL=vendor_cli_invalid; return 65 ;;
     esac
     chmod 755 "$_vi_stage/$_vi_e"
     [ "$VENDOR_OWN" = 1 ] && chown -R root:root "$_vi_stage"
@@ -1138,14 +1214,14 @@ vendor_check() {
     for _vc_k in $VENDOR_SLOTS; do
         [ -f "$1/$_vc_k" ] || [ -f "$1/$_vc_k-manifest" ] || continue
         [ -f "$1/$_vc_k" ] && [ -f "$1/$_vc_k-manifest" ] \
-            || { _vendor_refuse "$_vc_k" "the payload and its manifest must ride together"; return 65; }
+            || { _vendor_refuse "$_vc_k" "the payload and its manifest must ride together"; NOO_REFUSAL=vendor_cli_invalid; return 65; }
         vendor_manifest_ok "$1/$_vc_k-manifest" "$_vc_k" || return 65
         _vc_s="$(vendor_get "$1/$_vc_k-manifest" sha256)"
         [ "$(sha256sum "$1/$_vc_k" | awk '{print $1}')" = "$_vc_s" ] \
-            || { _vendor_refuse "$_vc_k" "the payload does not hash to its manifest's sha256"; return 65; }
+            || { _vendor_refuse "$_vc_k" "the payload does not hash to its manifest's sha256"; NOO_REFUSAL=vendor_cli_invalid; return 65; }
         _vc_n="$(vendor_get "$1/$_vc_k-manifest" name)"
         case "$_vc_names" in
-            *" $_vc_n "*) _vendor_refuse "$_vc_k" "a second slot carries $_vc_n"; return 65 ;;
+            *" $_vc_n "*) _vendor_refuse "$_vc_k" "a second slot carries $_vc_n"; NOO_REFUSAL=vendor_cli_invalid; return 65 ;;
         esac
         _vc_names="$_vc_names$_vc_n "
     done
@@ -1950,12 +2026,12 @@ if [ -f "$WORK/files/teardown" ]; then
     esac
     if [ -n "$want" ] && [ "$want" != "$have" ]; then
         echo "noo-apply: teardown names '$want' but this node is '$have' — refusing" >&2
-        exit 76
+        NOO_REFUSAL=payload_for_other_node; exit 76
     fi
     DEENROLL=/usr/local/bin/noo-deenroll
     if [ ! -x "$DEENROLL" ]; then
         echo "noo-apply: teardown requested but $DEENROLL is not installed" >&2
-        exit 69
+        NOO_REFUSAL=tool_missing; exit 69
     fi
     netns_unit_remove
     agent_protect_remove
@@ -2046,7 +2122,7 @@ done
 for _svc in vllm llamacpp ollama tei reranker; do
     _c="$WORK/files/svc-$_svc.crt"; _k="$WORK/files/svc-$_svc.key"
     [ -f "$_c" ] || [ -f "$_k" ] || continue
-    [ -f "$_c" ] && [ -f "$_k" ] || { echo "noo-apply: svc-$_svc carries half a leaf (cert and key travel together) — refusing" >&2; exit 65; }
+    [ -f "$_c" ] && [ -f "$_k" ] || { echo "noo-apply: svc-$_svc carries half a leaf (cert and key travel together) — refusing" >&2; NOO_REFUSAL=service_leaf_invalid; exit 65; }
     # Identical to what is installed (bytes, key 600 / cert 644, root:root):
     # nothing to install, so no .next file is written and no rename happens.
     # The CA/key verification below is for what we are ABOUT TO INSTALL; an
@@ -2060,13 +2136,13 @@ for _svc in vllm llamacpp ollama tei reranker; do
         continue
     fi
     openssl verify -CAfile "$PKI/ca.crt" "$_c" >/dev/null 2>&1 \
-        || { echo "noo-apply: svc-$_svc.crt does not verify against $PKI/ca.crt — refusing" >&2; exit 65; }
+        || { echo "noo-apply: svc-$_svc.crt does not verify against $PKI/ca.crt — refusing" >&2; NOO_REFUSAL=service_leaf_untrusted; exit 65; }
     # Compared as text, and each side must be non-empty: two failed
     # openssl calls would otherwise agree with each other.
     _cp="$(openssl x509 -in "$_c" -noout -pubkey 2>/dev/null || true)"
     _kp="$(openssl pkey -in "$_k" -pubout 2>/dev/null || true)"
     [ -n "$_cp" ] && [ -n "$_kp" ] && [ "$_cp" = "$_kp" ] \
-        || { echo "noo-apply: svc-$_svc.key is not the key of svc-$_svc.crt — refusing" >&2; exit 65; }
+        || { echo "noo-apply: svc-$_svc.key is not the key of svc-$_svc.crt — refusing" >&2; NOO_REFUSAL=service_leaf_invalid; exit 65; }
     _d="$PKI/services/$_svc"
     install -d -m 755 -o root -g root "$PKI/services" "$_d"
     install -m 600 -o root -g root "$_k" "$_d/.service.key.next"
@@ -2085,9 +2161,9 @@ for _asvc in $(for _af in "$WORK"/files/svc-addon-*.crt "$WORK"/files/svc-addon-
         [ -e "$_af" ] || continue
         _ab="$(basename "$_af")"; _ab="${_ab#svc-}"; echo "${_ab%.*}"
     done | sort -u); do
-    addon_leaf_kind_ok "svc-$_asvc.crt" || { echo "noo-apply: svc-$_asvc is not a well-formed add-on leaf name — refusing" >&2; exit 65; }
+    addon_leaf_kind_ok "svc-$_asvc.crt" || { echo "noo-apply: svc-$_asvc is not a well-formed add-on leaf name — refusing" >&2; NOO_REFUSAL=service_leaf_invalid; exit 65; }
     _c="$WORK/files/svc-$_asvc.crt"; _k="$WORK/files/svc-$_asvc.key"
-    [ -f "$_c" ] && [ -f "$_k" ] || { echo "noo-apply: svc-$_asvc carries half a leaf (cert and key travel together) — refusing" >&2; exit 65; }
+    [ -f "$_c" ] && [ -f "$_k" ] || { echo "noo-apply: svc-$_asvc carries half a leaf (cert and key travel together) — refusing" >&2; NOO_REFUSAL=service_leaf_invalid; exit 65; }
     _d="$PKI/services/$_asvc"
     if config_unchanged "$_k" "$_d/service.key" 600 root:root \
         && config_unchanged "$_c" "$_d/service.crt" 644 root:root; then
@@ -2095,11 +2171,11 @@ for _asvc in $(for _af in "$WORK"/files/svc-addon-*.crt "$WORK"/files/svc-addon-
         continue
     fi
     openssl verify -CAfile "$PKI/ca.crt" "$_c" >/dev/null 2>&1 \
-        || { echo "noo-apply: svc-$_asvc.crt does not verify against $PKI/ca.crt — refusing" >&2; exit 65; }
+        || { echo "noo-apply: svc-$_asvc.crt does not verify against $PKI/ca.crt — refusing" >&2; NOO_REFUSAL=service_leaf_untrusted; exit 65; }
     _cp="$(openssl x509 -in "$_c" -noout -pubkey 2>/dev/null || true)"
     _kp="$(openssl pkey -in "$_k" -pubout 2>/dev/null || true)"
     [ -n "$_cp" ] && [ -n "$_kp" ] && [ "$_cp" = "$_kp" ] \
-        || { echo "noo-apply: svc-$_asvc.key is not the key of svc-$_asvc.crt — refusing" >&2; exit 65; }
+        || { echo "noo-apply: svc-$_asvc.key is not the key of svc-$_asvc.crt — refusing" >&2; NOO_REFUSAL=service_leaf_invalid; exit 65; }
     install -d -m 755 -o root -g root "$PKI/services" "$_d"
     install -m 600 -o root -g root "$_k" "$_d/.service.key.next"
     install -m 644 -o root -g root "$_c" "$_d/.service.crt.next"
@@ -2330,12 +2406,12 @@ host_telemetry_apply() {
 host_telemetry_payload_ok() {  # $1 = payload file, $2 = this node's id
     if [ "$(grep -c '[^[:space:]]' "$1")" != 1 ] || ! grep -qE '^NODE=[A-Za-z0-9._-]+$' "$1"; then
         echo "noo-apply: host-telemetry carries nothing but NODE=<name> - refusing a payload with anything else" >&2
-        return 65
+        NOO_REFUSAL=node_payload_invalid; return 65
     fi
     _ht_want="$(sed -n 's/^NODE=//p' "$1")"
     if [ "$_ht_want" != "$2" ]; then
         echo "noo-apply: host-telemetry names '$_ht_want' but this node is '$2' - refusing" >&2
-        return 76
+        NOO_REFUSAL=payload_for_other_node; return 76
     fi
 }
 # END host_telemetry
@@ -2439,7 +2515,7 @@ agent_secret_files() {
                         && mv -f "$_f.next" "$_f"; }; then
                     echo "noo-apply: could not write $_f for $_own — leaving $_env as it was" >&2
                     rm -f "$_f.next" "$_tmp" "$_tmp.x"
-                    return 73
+                    NOO_REFUSAL=node_write_failed; return 73
                 fi
                 grep -vE "^(${_k}|${_k}_FILE)=" "$_tmp" > "$_tmp.x" || true
                 printf '%s_FILE=%s\n' "$_k" "$_f" >> "$_tmp.x"
@@ -2463,7 +2539,7 @@ agent_secret_files() {
                 [ -n "$_v" ] || echo "noo-apply: WARNING: $_k points at $_ptr, which is missing or empty — the installed agent will start without it; \`noo cluster provision <node>\` redelivers it" >&2
                 case "$_v" in
                     *"
-"*) echo "noo-apply: $_ptr holds more than one line — not inlining $_k into $_env" >&2; rm -f "$_tmp"; return 65 ;;
+"*) echo "noo-apply: $_ptr holds more than one line — not inlining $_k into $_env" >&2; rm -f "$_tmp"; NOO_REFUSAL=secret_pointer_multiline; return 65 ;;
                 esac
                 grep -vE "^(${_k}|${_k}_FILE)=" "$_tmp" > "$_tmp.x" || true
                 [ -n "$_v" ] && printf '%s=%s\n' "$_k" "$_v" >> "$_tmp.x"
@@ -2473,11 +2549,11 @@ agent_secret_files() {
         fi
     done
     if ! cmp -s "$_tmp" "$_env"; then
-        grep -qE '^NODE_ID=.+' "$_tmp" || { echo "noo-apply: secret-file conversion lost NODE_ID — aborting" >&2; rm -f "$_tmp"; return 70; }
+        grep -qE '^NODE_ID=.+' "$_tmp" || { echo "noo-apply: secret-file conversion lost NODE_ID — aborting" >&2; rm -f "$_tmp"; NOO_REFUSAL=merge_lost_node_id; return 70; }
         if ! { cp "$_tmp" "$_env.next" && chmod 600 "$_env.next" && mv -f "$_env.next" "$_env"; }; then
             echo "noo-apply: could not rewrite $_env" >&2
             rm -f "$_tmp" "$_env.next"
-            return 73
+            NOO_REFUSAL=node_write_failed; return 73
         fi
         ASF_CHANGED=1
         if [ "$_mode" = files ]; then
@@ -2609,7 +2685,7 @@ agent_env_carry_nats_pair() {
 
 if [ -f "$WORK/files/agent-env" ]; then
     grep -qE '^NODE_ID=.+' "$WORK/files/agent-env" \
-        || { echo "noo-apply: agent-env lacks NODE_ID — refusing a config that boots an anonymous agent" >&2; exit 65; }
+        || { echo "noo-apply: agent-env lacks NODE_ID — refusing a config that boots an anonymous agent" >&2; NOO_REFUSAL=env_shape; exit 65; }
     STAGED_ENV="$(mktemp)"
     chmod 600 "$STAGED_ENV"
     cp "$WORK/files/agent-env" "$STAGED_ENV"
@@ -2655,21 +2731,21 @@ fi
 # hostname is honoured.
 if [ -f "$WORK/files/nats-creds" ]; then
     want="$(grep -E '^NODE=' "$WORK/files/nats-creds" | head -1 | cut -d= -f2- | tr -d '[:space:]')"
-    [ -n "$want" ] || { echo "noo-apply: nats-creds has no NODE= line — refusing an unbound credential" >&2; exit 65; }
-    [ "$want" = "$NODE_ID" ] || { echo "noo-apply: nats-creds names '$want' but this node is '$NODE_ID' — refusing" >&2; exit 76; }
+    [ -n "$want" ] || { echo "noo-apply: nats-creds has no NODE= line — refusing an unbound credential" >&2; NOO_REFUSAL=node_payload_invalid; exit 65; }
+    [ "$want" = "$NODE_ID" ] || { echo "noo-apply: nats-creds names '$want' but this node is '$NODE_ID' — refusing" >&2; NOO_REFUSAL=payload_for_other_node; exit 76; }
     grep -qE '^NATS_NODE_USER=.+' "$WORK/files/nats-creds" \
-        || { echo "noo-apply: nats-creds lacks NATS_NODE_USER" >&2; exit 65; }
+        || { echo "noo-apply: nats-creds lacks NATS_NODE_USER" >&2; NOO_REFUSAL=node_payload_invalid; exit 65; }
     grep -qE '^NATS_NODE_PASSWORD=.+' "$WORK/files/nats-creds" \
-        || { echo "noo-apply: nats-creds lacks NATS_NODE_PASSWORD" >&2; exit 65; }
+        || { echo "noo-apply: nats-creds lacks NATS_NODE_PASSWORD" >&2; NOO_REFUSAL=node_payload_invalid; exit 65; }
     AGENT_ENV=/etc/noo-node-agent.env
-    [ -f "$AGENT_ENV" ] || { echo "noo-apply: $AGENT_ENV does not exist — provision this node before rotating its bus credential" >&2; exit 78; }
+    [ -f "$AGENT_ENV" ] || { echo "noo-apply: $AGENT_ENV does not exist — provision this node before rotating its bus credential" >&2; NOO_REFUSAL=not_enrolled; exit 78; }
     TMPENV="$(mktemp)"
     chmod 600 "$TMPENV"
     grep -vE '^(NATS_NODE_USER|NATS_NODE_PASSWORD)=' "$AGENT_ENV" > "$TMPENV" || true
     grep -E '^(NATS_NODE_USER|NATS_NODE_PASSWORD)=' "$WORK/files/nats-creds" >> "$TMPENV"
     # Never leave the agent without its identity: the NODE_ID line that
     # agent-env is refused for lacking must survive this rewrite too.
-    grep -qE '^NODE_ID=.+' "$TMPENV" || { echo "noo-apply: merge lost NODE_ID — aborting" >&2; rm -f "$TMPENV"; exit 70; }
+    grep -qE '^NODE_ID=.+' "$TMPENV" || { echo "noo-apply: merge lost NODE_ID — aborting" >&2; rm -f "$TMPENV"; NOO_REFUSAL=merge_lost_node_id; exit 70; }
     # The MERGED result is compared with the installed env, not the
     # fragment. The harness env below is judged the same way; the kind is
     # `unchanged` only when neither file needed rewriting.
@@ -2690,7 +2766,7 @@ if [ -f "$WORK/files/nats-creds" ]; then
         TMPH="$(mktemp)"; chmod 600 "$TMPH"
         grep -vE '^(NATS_NODE_USER|NATS_NODE_PASSWORD)=' "$HARNESS_ENV" > "$TMPH" || true
         grep -E '^(NATS_NODE_USER|NATS_NODE_PASSWORD)=' "$WORK/files/nats-creds" >> "$TMPH"
-        grep -qE '^NODE_ID=.+' "$TMPH" || { echo "noo-apply: harness env merge lost NODE_ID — aborting" >&2; rm -f "$TMPH"; exit 70; }
+        grep -qE '^NODE_ID=.+' "$TMPH" || { echo "noo-apply: harness env merge lost NODE_ID — aborting" >&2; rm -f "$TMPH"; NOO_REFUSAL=merge_lost_node_id; exit 70; }
         if ! harness_env_same "$TMPH" "$HARNESS_ENV"; then
             install -m 600 -o root -g root "$TMPH" "$HARNESS_ENV"
             nc_changed=1; need_harness_restart=1
@@ -2717,20 +2793,20 @@ fi
 if [ -f "$WORK/files/fleet-secrets" ]; then
     FS_KEYS='NOO_CLUSTER_SECRET|NOO_NODE_AGENT_TOKEN'
     want="$(grep -E '^NODE=' "$WORK/files/fleet-secrets" | head -1 | cut -d= -f2- | tr -d '[:space:]')"
-    [ -n "$want" ] || { echo "noo-apply: fleet-secrets has no NODE= line — refusing an unbound payload" >&2; exit 65; }
-    [ "$want" = "$NODE_ID" ] || { echo "noo-apply: fleet-secrets names '$want' but this node is '$NODE_ID' — refusing" >&2; exit 76; }
+    [ -n "$want" ] || { echo "noo-apply: fleet-secrets has no NODE= line — refusing an unbound payload" >&2; NOO_REFUSAL=node_payload_invalid; exit 65; }
+    [ "$want" = "$NODE_ID" ] || { echo "noo-apply: fleet-secrets names '$want' but this node is '$NODE_ID' — refusing" >&2; NOO_REFUSAL=payload_for_other_node; exit 76; }
     # Every non-comment, non-NODE line must be a fleet key, with a
     # non-empty value. A payload carrying anything else is refused whole
     # rather than silently filtered: a filter would apply the good half of
     # a bundle someone built wrong, and say it succeeded.
     if grep -vE "^(#|NODE=|($FS_KEYS)=.+$|\$)" "$WORK/files/fleet-secrets" | grep -q .; then
         echo "noo-apply: fleet-secrets carries a line that is not a fleet key with a value — refusing" >&2
-        exit 65
+        NOO_REFUSAL=node_payload_invalid; exit 65
     fi
     grep -qE "^($FS_KEYS)=.+" "$WORK/files/fleet-secrets" \
-        || { echo "noo-apply: fleet-secrets names no fleet key — nothing to converge" >&2; exit 65; }
+        || { echo "noo-apply: fleet-secrets names no fleet key — nothing to converge" >&2; NOO_REFUSAL=node_payload_invalid; exit 65; }
     AGENT_ENV=/etc/noo-node-agent.env
-    [ -f "$AGENT_ENV" ] || { echo "noo-apply: $AGENT_ENV does not exist — provision this node before converging its credentials" >&2; exit 78; }
+    [ -f "$AGENT_ENV" ] || { echo "noo-apply: $AGENT_ENV does not exist — provision this node before converging its credentials" >&2; NOO_REFUSAL=not_enrolled; exit 78; }
     TMPENV="$(mktemp)"
     chmod 600 "$TMPENV"
     # Drop only the keys this payload actually carries: a payload that
@@ -2738,7 +2814,7 @@ if [ -f "$WORK/files/fleet-secrets" ]; then
     carried="$(grep -oE "^($FS_KEYS)=" "$WORK/files/fleet-secrets" | tr -d '=' | paste -sd'|' -)"
     grep -vE "^($carried)=" "$AGENT_ENV" > "$TMPENV" || true
     grep -E "^($FS_KEYS)=" "$WORK/files/fleet-secrets" >> "$TMPENV"
-    grep -qE '^NODE_ID=.+' "$TMPENV" || { echo "noo-apply: merge lost NODE_ID — aborting" >&2; rm -f "$TMPENV"; exit 70; }
+    grep -qE '^NODE_ID=.+' "$TMPENV" || { echo "noo-apply: merge lost NODE_ID — aborting" >&2; rm -f "$TMPENV"; NOO_REFUSAL=merge_lost_node_id; exit 70; }
     # Merged result vs the installed env, like nats-creds above.
     fs_unchanged=0
     agent_env_same "$TMPENV" "$AGENT_ENV" && fs_unchanged=1
@@ -2758,7 +2834,7 @@ if [ -f "$WORK/files/agent-binary" ]; then
     # An ELF for the wrong arch "installs" fine and dies at exec — check now.
     case "$(head -c 20 "$WORK/files/agent-binary" | od -An -tx1 | tr -d ' \n')" in
         7f454c46*) : ;;
-        *) echo "noo-apply: agent-binary is not an ELF executable" >&2; exit 65 ;;
+        *) echo "noo-apply: agent-binary is not an ELF executable" >&2; NOO_REFUSAL=binary_not_elf; exit 65 ;;
     esac
     if binary_unchanged "$WORK/files/agent-binary" /usr/local/bin/noo-node-agent; then
         applied="$applied agent-binary=unchanged"; note_binary_sha agent-binary "$WORK/files/agent-binary"
@@ -2782,12 +2858,12 @@ if [ -f "$WORK/files/cli-binary" ] && [ -s "$WORK/files/cli-user" ]; then
     # tree is root's own. Refusing root failed the whole bundle (exit 65) for
     # every root-enrolled node since 0.6.0 (rc.3 rehearsal, A-pull.key).
     case "$CLI_USER" in
-        ''|*[!a-z0-9_.-]*) echo "noo-apply: REFUSED — cli-user '$CLI_USER' is not a valid account name" >&2; exit 65 ;;
+        ''|*[!a-z0-9_.-]*) echo "noo-apply: REFUSED — cli-user '$CLI_USER' is not a valid account name" >&2; NOO_REFUSAL=cli_user_invalid; exit 65 ;;
     esac
     CLI_HOME="$(getent passwd "$CLI_USER" | cut -d: -f6)"
     case "$(head -c 20 "$WORK/files/cli-binary" | od -An -tx1 | tr -d ' \n')" in
         7f454c46*) : ;;
-        *) echo "noo-apply: cli-binary is not an ELF executable" >&2; exit 65 ;;
+        *) echo "noo-apply: cli-binary is not an ELF executable" >&2; NOO_REFUSAL=binary_not_elf; exit 65 ;;
     esac
     # The installed CLI is hashed AS THE USER too (root must not follow a
     # symlink the user planted); any failure there leaves the hash empty and
@@ -2811,7 +2887,7 @@ if [ -f "$WORK/files/cli-binary" ] && [ -s "$WORK/files/cli-user" ]; then
             mv -f "$HOME/.local/bin/noo.next" "$HOME/.local/bin/noo"
             [ -e "$HOME/.local/bin/pai" ] || ln -s noo "$HOME/.local/bin/pai" 2>/dev/null || true
         ' < "$WORK/files/cli-binary" \
-            || { echo "noo-apply: cli-binary install as $CLI_USER failed" >&2; exit 73; }
+            || { echo "noo-apply: cli-binary install as $CLI_USER failed" >&2; NOO_REFUSAL=cli_install_failed; exit 73; }
         applied="$applied cli-binary"; note_binary_sha cli-binary "$WORK/files/cli-binary"
     else
         echo "noo-apply: cli-user '$CLI_USER' has no home — CLI not installed" >&2
@@ -2862,9 +2938,9 @@ fi
 # without an attended converge.
 if [ -f "$WORK/files/fetcher" ]; then
     head -1 "$WORK/files/fetcher" | grep -q '^#!' \
-        || { echo "noo-apply: fetcher payload has no shebang" >&2; exit 65; }
+        || { echo "noo-apply: fetcher payload has no shebang" >&2; NOO_REFUSAL=script_payload_invalid; exit 65; }
     grep -q 'noo-fetch' "$WORK/files/fetcher" \
-        || { echo "noo-apply: fetcher payload does not look like noo-fetch" >&2; exit 65; }
+        || { echo "noo-apply: fetcher payload does not look like noo-fetch" >&2; NOO_REFUSAL=script_payload_invalid; exit 65; }
     install -m 755 -o root -g root "$WORK/files/fetcher" /usr/local/bin/noo-fetch.next
     mv /usr/local/bin/noo-fetch.next /usr/local/bin/noo-fetch
     applied="$applied fetcher"
@@ -2880,7 +2956,7 @@ fi
 if [ -f "$WORK/files/hostd-binary" ]; then
     case "$(head -c 20 "$WORK/files/hostd-binary" | od -An -tx1 | tr -d ' \n')" in
         7f454c46*) : ;;
-        *) echo "noo-apply: hostd-binary is not an ELF executable" >&2; exit 65 ;;
+        *) echo "noo-apply: hostd-binary is not an ELF executable" >&2; NOO_REFUSAL=binary_not_elf; exit 65 ;;
     esac
     HOSTD=/usr/local/bin/noo-hostd
     HB=/var/lib/noo-node-agent/spool/hostd.heartbeat.json
@@ -2896,7 +2972,7 @@ if [ -f "$WORK/files/hostd-binary" ]; then
         if [ "$_hg_new" -lt "$_hg_cur" ]; then
             echo "noo-apply: REFUSED — hostd-binary is generation $_hg_new, older than the installed one ($_hg_cur)" >&2
             logger -t noo-apply "REFUSED hostd-binary downgrade ($_hg_new < $_hg_cur)" 2>/dev/null || true
-            exit 65
+            NOO_REFUSAL=hostd_downgrade; exit 65
         fi
         [ -f "$HOSTD" ] && cp -f "$HOSTD" "$HOSTD.prev"
         install -m 755 -o root -g root "$WORK/files/hostd-binary" "$HOSTD.next"
@@ -2904,7 +2980,7 @@ if [ -f "$WORK/files/hostd-binary" ]; then
         if ! "$HOSTD" install --mode worker >/dev/null 2>&1; then
             echo "noo-apply: new hostd failed to install — restoring previous" >&2
             [ -f "$HOSTD.prev" ] && { mv "$HOSTD.prev" "$HOSTD"; "$HOSTD" install --mode worker >/dev/null 2>&1 || true; }
-            exit 65
+            NOO_REFUSAL=hostd_install_failed; exit 65
         fi
         hostd_ok=0
         start_epoch=$(date +%s)
@@ -2925,7 +3001,7 @@ if [ -f "$WORK/files/hostd-binary" ]; then
         else
             echo "noo-apply: new hostd produced no fresh heartbeat in 60s — REVERTING" >&2
             [ -f "$HOSTD.prev" ] && { mv "$HOSTD.prev" "$HOSTD"; "$HOSTD" install --mode worker >/dev/null 2>&1 || true; }
-            exit 65
+            NOO_REFUSAL=hostd_install_failed; exit 65
         fi
     fi
 fi
@@ -2939,10 +3015,10 @@ if [ -f "$WORK/files/restart-backends" ]; then
         [ -n "$svc" ] || continue
         case "$svc" in
             noo-*) : ;;
-            *) echo "noo-apply: restart-backends refused '$svc' (must be noo-*)" >&2; exit 65 ;;
+            *) echo "noo-apply: restart-backends refused '$svc' (must be noo-*)" >&2; NOO_REFUSAL=restart_backends_invalid; exit 65 ;;
         esac
         printf '%s' "$svc" | grep -qE '^[a-z0-9-]+$' \
-            || { echo "noo-apply: restart-backends refused '$svc' (bad charset)" >&2; exit 65; }
+            || { echo "noo-apply: restart-backends refused '$svc' (bad charset)" >&2; NOO_REFUSAL=restart_backends_invalid; exit 65; }
         if docker restart -- "$svc" >/dev/null 2>&1; then
             logger -t noo-apply "restarted backend $svc" 2>/dev/null || true
         else
@@ -2973,7 +3049,7 @@ fi
 # agent-unit — first install is what turns a prepped host into a NODE
 if [ -f "$WORK/files/agent-unit" ]; then
     grep -q '^\[Service\]' "$WORK/files/agent-unit" \
-        || { echo "noo-apply: agent-unit has no [Service] section" >&2; exit 65; }
+        || { echo "noo-apply: agent-unit has no [Service] section" >&2; NOO_REFUSAL=unit_shape; exit 65; }
     [ -f /etc/systemd/system/noo-node-agent.service ] || fresh_unit=1
     # Identical unit (bytes, 644, root:root): no rewrite, no daemon-reload,
     # no restart. A first install (no file) is never "unchanged".
@@ -3013,7 +3089,7 @@ fi
 # reachable than boot a harness the bus will refuse.
 if [ -f "$WORK/files/harness-env" ]; then
     grep -qE '^NODE_ID=.+' "$WORK/files/harness-env" \
-        || { echo "noo-apply: harness-env lacks NODE_ID — refusing a config that boots an anonymous harness" >&2; exit 65; }
+        || { echo "noo-apply: harness-env lacks NODE_ID — refusing a config that boots an anonymous harness" >&2; NOO_REFUSAL=env_shape; exit 65; }
     HARNESS_ENV=/etc/noo-harness.env
     TMPH=""
     if grep -qE '^NATS_NODE_PASSWORD=.+' "$WORK/files/harness-env"; then
@@ -3059,7 +3135,7 @@ fi
 if [ -f "$WORK/files/harness-binary" ]; then
     case "$(head -c 20 "$WORK/files/harness-binary" | od -An -tx1 | tr -d ' \n')" in
         7f454c46*) : ;;
-        *) echo "noo-apply: harness-binary is not an ELF executable" >&2; exit 65 ;;
+        *) echo "noo-apply: harness-binary is not an ELF executable" >&2; NOO_REFUSAL=binary_not_elf; exit 65 ;;
     esac
     if binary_unchanged "$WORK/files/harness-binary" /usr/local/bin/noo-gateway; then
         applied="$applied harness-binary=unchanged"; note_binary_sha harness-binary "$WORK/files/harness-binary"
@@ -3098,12 +3174,12 @@ fi
 # when a placement says so, after a reboot too.
 if [ -f "$WORK/files/harness-unit" ]; then
     grep -q '^\[Service\]' "$WORK/files/harness-unit" \
-        || { echo "noo-apply: harness-unit has no [Service] section" >&2; exit 65; }
+        || { echo "noo-apply: harness-unit has no [Service] section" >&2; NOO_REFUSAL=unit_shape; exit 65; }
     grep -qE '^User=noo-harness$' "$WORK/files/harness-unit" \
-        || { echo "noo-apply: harness-unit does not run as noo-harness — refusing" >&2; exit 65; }
+        || { echo "noo-apply: harness-unit does not run as noo-harness — refusing" >&2; NOO_REFUSAL=unit_shape; exit 65; }
     grep -qiE '^SupplementaryGroups=.*docker' "$WORK/files/harness-unit" \
-        && { echo "noo-apply: harness-unit grants the docker group — refusing" >&2; exit 65; }
-    getent group noo-agent >/dev/null || { echo "noo-apply: group noo-agent is missing — this host was not prepped as a node" >&2; exit 78; }
+        && { echo "noo-apply: harness-unit grants the docker group — refusing" >&2; NOO_REFUSAL=unit_shape; exit 65; }
+    getent group noo-agent >/dev/null || { echo "noo-apply: group noo-agent is missing — this host was not prepped as a node" >&2; NOO_REFUSAL=not_enrolled; exit 78; }
     getent group noo-harness >/dev/null || groupadd --system noo-harness
     id -u noo-harness >/dev/null 2>&1 \
         || useradd --system --shell /usr/sbin/nologin --no-create-home --gid noo-harness noo-harness
@@ -3162,7 +3238,7 @@ fi
 # and the agent's vendor-CLI check reads the PATH on each reconcile.
 vendor_apply "$WORK/files" || exit $?
 
-[ -n "$applied" ] || { echo "noo-apply: signed bundle contained nothing to apply" >&2; exit 65; }
+[ -n "$applied" ] || { echo "noo-apply: signed bundle contained nothing to apply" >&2; NOO_REFUSAL=bundle_empty; exit 65; }
 
 # Last env write of this apply: every merge above wrote plain lines, and the
 # agent binary (if this bundle carried one) is installed — see

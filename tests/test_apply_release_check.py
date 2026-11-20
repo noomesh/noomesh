@@ -438,6 +438,9 @@ def test_a_node_ahead_of_its_controller_names_the_cause(fleet: Fleet, record: st
     files = {"hostd-binary": PAYLOADS["hostd-binary"]}
     r = fleet.apply(fleet.bundle({**files, **fleet.release_proof(files, version=version)}))
     assert r.returncode == 75 and f"noo-apply: {line}" in r.stderr.splitlines(), r.stderr
+    # The name rides on its OWN line, right after the whole ahead line.
+    lines = r.stderr.splitlines()
+    assert lines[lines.index(f"noo-apply: {line}") + 1:] == ["noo-apply: refusal=node_ahead_of_controller (exit 75)"], r.stderr
 
 
 def test_a_stack_ahead_names_the_cause(fleet: Fleet) -> None:
@@ -595,3 +598,45 @@ def test_the_applier_only_bundle_is_staged_with_the_release_list() -> None:
     aof = PROVISION[PROVISION.index("fn applier_only_files("):]
     aof = aof[:aof.index("\n}\n")]
     assert "files.extend(rows);" in aof, aof
+
+
+# ── refusal names under 75: one remedy per cause ───────────────────────────
+
+def _last(r: subprocess.CompletedProcess) -> str:
+    return r.stderr.rstrip("\n").splitlines()[-1]
+
+
+def test_release_refusals_are_named_by_cause(fleet: Fleet, tmp_path: Path) -> None:
+    files = {"hostd-binary": PAYLOADS["hostd-binary"]}
+    # Not in the list.
+    r = fleet.apply(fleet.bundle({**files, **fleet.release_proof(files, unlisted_kinds=("hostd-binary",))}))
+    assert r.returncode == 75 and _last(r) == "noo-apply: refusal=release_unlisted (exit 75)", r.stderr
+    # The list's previous-release rows are judged in a subshell: its caller names them.
+    rows = (f"{_sha(PAYLOADS['hostd-binary'])}  noo-hostd-x86_64-unknown-linux-gnu@v0.6.26-rc.2",)
+    proof = fleet.release_proof(files, unlisted_kinds=("hostd-binary",), extra_sums_rows=rows)
+    r = fleet.apply(fleet.bundle({**files, **proof}))
+    assert r.returncode == 75 and _last(r) == "noo-apply: refusal=release_list_invalid (exit 75)", r.stderr
+    # Signed by a key this applier does not pin.
+    other = ReleaseKey(tmp_path / "other-release")
+    r = fleet.apply(fleet.bundle({**files, **fleet.release_proof(files, sums_key=other)}))
+    assert r.returncode == 75 and _last(r) == "noo-apply: refusal=release_list_invalid (exit 75)", r.stderr
+
+
+def test_a_missing_verifier_is_named_apart_from_an_unlisted_payload(fleet: Fleet) -> None:
+    _no_openssl3(fleet)
+    _stub(fleet, "python3", "#!/bin/sh\nexit 127\n")
+    r = fleet.apply(fleet.bundle({"applier": PAYLOADS["applier"]}))
+    assert r.returncode == 75 and _last(r) == "noo-apply: refusal=release_verifier_missing (exit 75)", r.stderr
+
+
+def test_the_release_check_block_still_runs_standalone() -> None:
+    """B-relsig sources this block alone: a refusal there exits 75 with the
+    REFUSED line and nothing else (no trap, no function from outside)."""
+    script = _floor_fns() + '\nrelease_floor_check "release 0.6.27" 0.6.27 release\n'
+    with __import__("tempfile").TemporaryDirectory() as d:
+        floor = Path(d) / "floor"
+        floor.write_text("release-final $(id)\n")
+        r = subprocess.run(["bash", "-c", f"set -eu\nVERIFY_ONLY=0\nRELEASE_REMEDY=x\nRELEASE_FLOOR={floor}\n{script}"],
+                           capture_output=True, text=True)
+    assert r.returncode == 75, (r.returncode, r.stderr)
+    assert r.stderr.startswith("noo-apply: REFUSED release 0.6.27 — the floor record") and "refusal=" not in r.stderr, r.stderr
