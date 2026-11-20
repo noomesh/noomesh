@@ -290,7 +290,7 @@ async fn user_create(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<CreateUserBody>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, ctx.as_deref(), "creating an account").await?;
+
     let by = security_users_mutation_guard(&ctx)?.sub.clone();
     // the requested scopes decide the new account's tier
     // (`repo::users::create` derives `role` from them), so an unclamped
