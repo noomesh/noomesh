@@ -7094,7 +7094,7 @@ pub(crate) fn controller_checks(
             "noo security tailnet policy --merge   # adds only what is missing; keeps your own rules")),
         // No Tailscale on this host: a LAN-only install has no tailnet, so
         // there is no policy to read, and nothing to judge.
-        None if host.no_tailscale => out.push(ok("tailnet policy", "no tailnet (LAN-only, Tailscale is not installed): nothing to judge")),
+        None if host.no_tailscale && host.agent_host_service => out.push(ok("tailnet policy", "no tailnet (LAN-only, Tailscale is not installed): nothing to judge")),
         None => out.push(warn("tailnet policy", "not read (no tailnet API key?)", Some("noo security tailnet policy".into()))),
     }
 
