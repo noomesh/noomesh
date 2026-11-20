@@ -348,7 +348,6 @@ mod tests {
             row(&["security", "user", "create"], |a| { let _ = security::parse_user_create_with(a); }),
             row(&["security", "user", "allowance"], |a| { let _ = security::parse_allowance_with(a); }),
             row(&["security", "user", "set-scopes"], |a| { let _ = security::parse_set_scopes_with(a); }),
-            row(&["security", "user", "set-role"], |a| { let _ = security::parse_set_role_with(a); }),
             row(&["security", "user", "grant-role"], |a| { let _ = security::parse_roles_with(a); }),
             row(&["security", "user", "revoke-role"], |a| { let _ = security::parse_roles_with(a); }),
             row(&["security", "user", "link"], |a| { let _ = security::parse_link_with(a); }),

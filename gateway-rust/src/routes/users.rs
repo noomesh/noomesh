@@ -3513,11 +3513,12 @@ async fn enabled_admin_count(db: &sqlx::PgPool) -> Result<i64, AppError> {
     Ok(crate::repo::users::enabled_admin_count(db).await?)
 }
 
-/// The command the last-admin refusal tells the operator to run. It must be a
-/// verb `noo` registers (`noo security user set-role`, which calls
-/// `user_set_role` above): `tests/test_last_admin_hint_names_a_cli_verb.py`
-/// holds the two together.
-pub(crate) const LAST_ADMIN_PROMOTE_CMD: &str = "noo security user set-role <user> admin";
+/// The command the last-admin refusal tells the operator to run: the existing
+/// `set-scopes`, which REPLACES the scope set, so it names the account's
+/// current scopes plus `admin` (`noo security user list` shows them).
+/// `tests/test_last_admin_hint_names_a_cli_verb.py` holds it to the CLI.
+pub(crate) const LAST_ADMIN_PROMOTE_CMD: &str =
+    "noo security user set-scopes <user> --scope <its current scopes>... --scope admin; `noo security user list` shows its current scopes";
 
 /// The last-admin guard: refuse to disable, erase or demote the only enabled
 /// admin left.

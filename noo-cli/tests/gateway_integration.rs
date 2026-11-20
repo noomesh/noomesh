@@ -1898,23 +1898,6 @@ fn security_user_set_scopes_posts_full_list() {
 }
 
 #[test]
-fn security_user_set_role_posts_the_tier() {
-    let mock = Mock::start(200, "OK", "application/json", r#"{"username":"alice","role":"admin"}"#, 1);
-    let out = run(&["--gateway", &gw(mock.port), "security", "user", "set-role", "alice", "admin"], &[]);
-    let reqs = mock.requests();
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    assert!(reqs[0].starts_with("POST /api/security/users/alice/role "), "request:\n{}", reqs[0]);
-    assert!(reqs[0].contains(r#"{"role":"admin"}"#), "request:\n{}", reqs[0]);
-}
-
-#[test]
-fn security_user_set_role_refuses_an_unknown_tier_before_the_gateway() {
-    let out = run(&["--gateway", &gw(closed_port()), "security", "user", "set-role", "alice", "root"], &[]);
-    assert_eq!(out.status.code(), Some(2), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("user, operator or admin"));
-}
-
-#[test]
 fn security_user_set_scopes_without_a_scope_never_calls_the_gateway() {
     // An empty list would wipe the account's scopes if the gateway took it.
     // Refused locally, so a typo'd flag cannot become a lockout.
