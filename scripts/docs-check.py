@@ -16,6 +16,8 @@ Checks:
       skills under prompts/skills/core/): every `noo …` they name resolves
       as in (f), and every `noo_*` tool they name is one the doors declare
       (gateway-rust/mcp-tools.json, mcp-tools-local.json, config/tools.json)
+  (h) every page outside cli/ and reference/ has `## For people` then
+      `## For agents`, except those still in SHAPE_PENDING (shrinks only)
   (f) every `noo …` invocation in a docs code block or backtick span
       resolves against the CLI registry (noo-cli/src/main.rs NATIVE):
       a group's subcommand must exist, a bare command may take any args,
@@ -453,6 +455,66 @@ def check_agents_pages(errors: list[str]) -> None:
             )
 
 
+# Pages not yet in the two-part shape (proposal 62, step 4). It only
+# shrinks: a page that gains both parts must leave this list, and no page
+# is ever added (a new page is written in the shape).
+SHAPE_PENDING = frozenset({
+    "docs/channels/google-chat.md",
+    "docs/channels/google-connections.md",
+    "docs/channels/mcp-your-client.md",
+    "docs/channels/telegram.md",
+    "docs/development/addons.md",
+    "docs/development/developer-guide.md",
+    "docs/development/principles.md",
+    "docs/getting-started/add-ons.md",
+    "docs/getting-started/first-chat.md",
+    "docs/getting-started/integrations.md",
+    "docs/getting-started/kiosk.md",
+    "docs/getting-started/multi-instance.md",
+    "docs/getting-started/standalone-controller.md",
+    "docs/getting-started/start-over.md",
+    "docs/getting-started/supported-agent-harnesses.md",
+    "docs/getting-started/supported-hardware.md",
+    "docs/getting-started/troubleshooting.md",
+    "docs/getting-started/trust-the-cluster-ca.md",
+    "docs/models/weight-cache.md",
+    "docs/operating/monitoring.md",
+    "docs/operating/operator-manual.md",
+    "docs/operating/runbooks/at-rest-migrate.md",
+    "docs/operating/runbooks/at-rest-recovery.md",
+    "docs/operating/runbooks/backup-restore-secrets.md",
+    "docs/operating/runbooks/data-root-recovery.md",
+    "docs/operating/runbooks/host-updates.md",
+    "docs/operating/runbooks/nats-isolation.md",
+    "docs/operating/runbooks/security-release-upgrade.md",
+    "docs/operating/token-budgets.md",
+    "docs/security/model-context.md",
+    "docs/security/networks-and-containers.md",
+    "docs/security/node-agent.md",
+    "docs/security/secrets.md",
+    "docs/security/telemetry.md",
+})
+
+
+def check_page_shape(errors: list[str]) -> None:
+    """(h) Every page outside cli/ and reference/ (and the index) has a
+    `## For people` part, then a `## For agents` part (operator 2026-11-14)."""
+    for path in docs_md():
+        r = rel(path)
+        if r.startswith(("docs/cli/", "docs/reference/")) or r == "docs/README.md":
+            continue
+        h2 = [l.strip() for l in path.read_text(encoding="utf-8").splitlines() if l.startswith("## ")]
+        shaped = TWO_PARTS[0] in h2 and TWO_PARTS[1] in h2 and h2.index(TWO_PARTS[0]) < h2.index(TWO_PARTS[1])
+        if r in SHAPE_PENDING:
+            if shaped:
+                errors.append(f"{r}: has both parts now; remove it from SHAPE_PENDING in scripts/docs-check.py")
+        elif not shaped:
+            errors.append(f"{r}: needs `{TWO_PARTS[0]}` then `{TWO_PARTS[1]}` (proposal 62; see docs/operating/disk-and-images.md)")
+    for r in sorted(SHAPE_PENDING):
+        if not (REPO / r).exists():
+            errors.append(f"SHAPE_PENDING names {r}, which does not exist; remove it")
+
+
 def main() -> int:
     errors: list[str] = []
     warnings: list[str] = []
@@ -465,6 +527,7 @@ def main() -> int:
     check_agent_tools(errors)
     check_proposal_numbers(errors)
     check_agents_pages(errors)
+    check_page_shape(errors)
     for w in warnings:
         print(f"docs-check: WARNING {w}")
     for e in errors:
