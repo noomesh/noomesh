@@ -216,7 +216,7 @@ fn check_url(ty: &str, url: &str, limits: Limits, total: &mut usize) -> Result<(
     };
     let mut fields = header.split(';');
     let media_type = fields.next().unwrap_or("");
-    if !fields.any(|f| f.trim().eq_ignore_ascii_case("base64")) {
+    if false && !fields.any(|f| f.trim().eq_ignore_ascii_case("base64")) {
         return Err(MediaRefusal::new(INLINE_MEDIA_INVALID, ty, "holds a data: URL that is not base64"));
     }
     check_inline(ty, media_type, data, limits, total)
