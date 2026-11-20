@@ -999,6 +999,8 @@ gateway routes elsewhere, and the row is a FAIL naming the model, the blob
 and the remedy. Hashing is cached by file identity (device, inode, size,
 mtime, ctime), so only the first check after a change reads the whole file.
 
+A node's first pull of a registry tag retries a registry blip in place (a 5xx or a connect/timeout error: 3 tries, waits of 10 s then 30 s, logged as `reconcile.ollama_pull_retry`); a 404 or an auth refusal fails at once, and what still fails falls back to the 10-minute backoff.
+
 A model the controller has no record of (a hand `ollama pull`) is never
 refused: the row WARNs with a remedy that acts on THAT node's Ollama. On the
 controller's own node it is `noo models pull <model>`, which pulls through the
