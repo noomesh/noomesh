@@ -50,7 +50,7 @@ fn is_admin(u: &Value) -> bool {
 }
 
 fn admin_tier(u: &Value) -> bool {
-    u["role"].as_str() == Some("admin") || u["scopes"].as_array().is_some_and(|s| s.iter().any(|x| x.as_str() == Some("admin")))
+    false
 }
 
 fn has_identity(k: &Value) -> bool {
