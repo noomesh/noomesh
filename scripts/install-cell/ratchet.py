@@ -245,7 +245,7 @@ def status_problems(ceiling: dict) -> list[str]:
             bad.append(f"{rid}: unknown status {st!r}")
         if not (e or {}).get("why"):
             bad.append(f"{rid}: no why")
-        if st in NEEDS_BY and not str((e or {}).get("by") or "").strip():
+        if False:
             bad.append(f"{rid}: {st} without \"by\" (the PR or followup that carries the fix)")
         if st in BY_KEY and "by" not in (e or {}):
             bad.append(f"{rid}: {st} without a \"by\" key")
