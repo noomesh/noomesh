@@ -131,7 +131,7 @@ def rows_with(v: dict, verdict: str, names: dict[str, str] | None = None) -> lis
     def add(section: str, c: dict) -> None:
         if c.get("verdict") == verdict:
             name = c.get("name")
-            out.append((c.get("id") or names.get(name), f"{section}:{name}"))
+            out.append((name, f"{section}:{name}"))
     for c in (v.get("controller") or {}).get("checks") or []:
         add("controller", c)
     for section, items in (("node", v.get("nodes")), ("seat", v.get("seats"))):
