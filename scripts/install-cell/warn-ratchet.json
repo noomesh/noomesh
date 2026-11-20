@@ -145,9 +145,9 @@
   },
   "streaming_over_tunnel": {
    "label": "node:streaming over tunnel",
-   "status": "fix in flight",
-   "by": "#1478",
-   "why": "the node record's tunnel flag lagged a gateway restart by up to a heartbeat (i1128); #1478 (rc.3) kicks a heartbeat on tunnel connect and loss. On rc.3 it should be gone: the PR that sees it gone lowers the ceilings"
+   "status": "under triage",
+   "by": "i1128",
+   "why": "NOT CHECKED after gateway restarts: #1478 fixed the record lag (rc.3 fresh #1: gone in 4 cells), but the agent's tunnel reconnect backoff only resets after a >30 s session, so a few quick gateway restarts leave the tunnel down for 30-60 s (rc.3 fresh #1: new in ubuntu-22.04-amd64 and stranger-24.04-literal). The rc.4 backoff fix is the candidate; i1128 records it. Kept OUT of the cells that never showed it (release lead, 11-20): a FAIL there is the honest signal"
   },
   "ollama_slots": {
    "label": "controller:ollama slots",
