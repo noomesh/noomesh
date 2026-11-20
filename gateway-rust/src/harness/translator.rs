@@ -720,9 +720,6 @@ async fn messages(State(sh): State<Arc<Shared>>, bytes: Bytes) -> Response {
         Ok(b) => b,
         Err(r) => return r,
     };
-    if let Some(r) = media_refusal(&body, "harness:/v1/messages") {
-        return r;
-    }
     let openai = anthropic_wire::request_body_from_anthropic(&body);
     let model = sh.upstream.model.clone();
     match complete(&sh, openai).await {
