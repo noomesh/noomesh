@@ -223,7 +223,7 @@ func (r *retryState) nextDelay(connected bool, sessionLen time.Duration, err err
 		// without its tunnel after several quick restarts. Capped however far the backoff
 		// has grown, and it does not grow it, so a later real failure starts from where
 		// it was.
-		c := refusedRetryCap
+		c := r.bo.max
 		if r.bo.max < c {
 			c = r.bo.max
 		}
