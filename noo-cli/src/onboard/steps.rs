@@ -9696,7 +9696,7 @@ pub fn converge_stack(ctx: &Ctx) {
     }
     ctx.progress("Bringing the stack in line with what onboard wrote (recreates only the containers whose secrets or config changed since they started)...");
     let before = compose_container_ids(ctx);
-    let code = sh::run_script_streamed(ctx, "noomesh-start.sh", &[]);
+    let code = sh::run_script_streamed(ctx, "noomesh-start.sh", &["--recreate"]);
     if code != 0 {
         ctx.warn("The stack could not be brought in line with what onboard wrote — run: noo stack start (it recreates only what changed)");
         return;
