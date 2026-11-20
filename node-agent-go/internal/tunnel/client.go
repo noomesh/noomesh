@@ -235,11 +235,7 @@ func (r *retryState) nextDelay(connected bool, sessionLen time.Duration, err err
 	case connected:
 		// Reached ready and dropped soon after. The handshake worked, so this is not a
 		// failure to punish with a longer wait: keep the current delay (min if none).
-		d := r.bo.cur
-		if d == 0 {
-			d = r.bo.min
-		}
-		return jitter(d)
+		return r.bo.next()
 	default:
 		// Everything else (timeout, TLS or auth failure, a gateway that accepts and
 		// hangs, a handshake refusal): full exponential backoff, so a sick gateway is
