@@ -15,7 +15,10 @@
 //! Only the holder of the node's CURRENT `node.key` completes that, and the
 //! handshake's signature over fresh randoms makes it unreplayable (no nonce).
 //! If another node's agent answers at the address, its key is not this
-//! node's, so the proof fails. The agent asks for a client certificate and
+//! node's, so the proof fails. A TCP relay at the address that reaches the
+//! real node passes, and rightly: the gateway needs exactly that the
+//! key-holder is reachable there. The host must be an IP literal (a DNS name
+//! would bind only the answer of the moment); `prove_target` refuses names. The agent asks for a client certificate and
 //! the dial-back sends none: the handshake then ends with an alert, AFTER the
 //! server's CertificateVerify was checked, which is all the proof needs.
 //!
@@ -153,12 +156,16 @@ pub(crate) fn prove_node_at(ca_pem: &[u8], pinned_cert_pem: &[u8], addr: &str, p
         proven: proven.clone(),
         why: why.clone(),
     });
-    let config = rustls::ClientConfig::builder_with_provider(provider)
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| format!("TLS 1.3 config: {e}"))?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
+    // A resumed session skips the server's CertificateVerify: never resume.
+    // (Each call builds its own config today; this pins it against a refactor
+    // that shares one, 97.)
+    config.resumption = rustls::client::Resumption::disabled();
     let sni = ServerName::try_from(addr.to_string()).map_err(|e| format!("{addr} is not a host name or IP: {e}"))?;
     let mut conn = rustls::ClientConnection::new(Arc::new(config), sni).map_err(|e| format!("TLS client: {e}"))?;
     let target: SocketAddr = (addr, port)
@@ -376,6 +383,13 @@ mod tests {
         let e = prove_node_at(&read(ca.ca_cert_path()), &read(ca.dir.join("nodes/node_a/node.crt")), "127.0.0.1", port, T)
             .unwrap_err();
         assert!(e.contains("no answer"), "{e}");
+    }
+
+    #[test]
+    fn the_client_never_resumes_a_session() {
+        let code = include_str!("node_prove.rs");
+        let body = crate::test_src::fn_body(code, "pub(crate) fn prove_node_at(");
+        assert!(body.contains("config.resumption = rustls::client::Resumption::disabled();"), "a resumed session would skip CertificateVerify");
     }
 
     #[test]
