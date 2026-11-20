@@ -3253,7 +3253,7 @@ pub(crate) fn default_chat_check(classes: Option<&Value>, has_gpu: Option<bool>,
     if one_node && fleet_nodes != Some(1) {
         return warn(NAME, format!("{detail} — one node carries every unpinned request (no fallback)"), Some("noo cluster place <node> <backend> <model>".into()));
     }
-    let later: Vec<&str> = [cpu_only.then_some(CPU_ONLY_FLEET_CHAT_LATER), one_node.then_some(ONE_NODE_FLEET_CHAT_LATER)]
+    let later: Vec<&str> = [cpu_only.then_some(CPU_ONLY_FLEET_CHAT_LATER), Some(ONE_NODE_FLEET_CHAT_LATER)]
         .into_iter()
         .flatten()
         .collect();
