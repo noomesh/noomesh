@@ -45,7 +45,7 @@ pub fn classify_pull_failure(output: &str) -> Option<String> {
         .find(|t| t.len() == 3 && t.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|t| t.parse::<u16>().ok());
     match status {
-        Some(401 | 403 | 404) => return None,
+        Some(401 | 403 | 404) => return Some(String::new()),
         Some(s @ 500..=599) => return Some(format!("registry answered {s} (a registry-side problem)")),
         _ => {}
     }
