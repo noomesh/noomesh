@@ -11054,6 +11054,10 @@ mod ollama_tag_check_tests {
         assert_eq!(node_holds_ollama_tag(Some(&n), "library/Gemma4:12b"), Some(true));
         assert_eq!(node_holds_ollama_tag(Some(&n), "someone/m"), Some(true));
         assert_eq!(node_holds_ollama_tag(Some(&n), "gemma4:27b"), Some(false), "its ollama answered and does not list it");
+        // The LISTED side is normalised too: an untagged, mixed-case listing
+        // is the same model as the asked `qwen3` (= qwen3:latest).
+        let n = json!({"available_models": ["gemma4:12b", "Qwen3"]});
+        assert_eq!(node_holds_ollama_tag(Some(&n), "qwen3"), Some(true), "a listed name is normalised before comparing");
     }
 
     /// An ollama that is down or still starting lists nothing while the tag
