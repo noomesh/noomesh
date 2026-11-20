@@ -8242,9 +8242,18 @@ fn pull_ollama(ctx: &mut Ctx, model: &str) {
     );
     // Stream pull output live (inherited stdio on the console; forwarded
     // Line events when the TUI owns the terminal).
-    let mut cmd = Command::new("docker");
-    cmd.args(["exec", target, "ollama", "pull", model]);
-    let code = sh::stream_status(ctx, cmd);
+    // A registry blip (a 503, a connect timeout) is retried, bounded and said
+    // line by line; a 404 or an auth refusal fails at once with its reason
+    // (commands/pull_retry.rs holds the one classifier).
+    let (code, pull_out) = crate::commands::pull_retry::pull_with_retry(
+        || {
+            let mut cmd = Command::new("docker");
+            cmd.args(["exec", target, "ollama", "pull", model]);
+            sh::stream_status_captured(ctx, cmd)
+        },
+        |line| ctx.warn(line),
+        std::thread::sleep,
+    );
     if code == 0 {
         let record = crate::commands::ollama_stage::record_after_pull(pending, |r| {
             crate::commands::ollama_stage::read_container_manifest(target, r)
@@ -8268,6 +8277,9 @@ fn pull_ollama(ctx: &mut Ctx, model: &str) {
         ctx.state.backend_used = "ollama".to_string();
         ctx.success(&format!("Model {model} pulled via Ollama"));
     } else {
+        if let Some(why) = crate::commands::pull_retry::last_error_line(&pull_out) {
+            ctx.warn(&format!("Ollama pull failed: {why}"));
+        }
         ctx.warn(&format!("Ollama pull did not complete — your choice IS saved (OLLAMA_MODEL={model}); the next stack start pulls it, or retry now: docker exec {target} ollama pull {model}"));
     }
 }
