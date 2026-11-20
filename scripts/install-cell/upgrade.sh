@@ -140,6 +140,19 @@ noo --json cluster verify > "$J/verify-after.json" 2>/dev/null
 sudo -n journalctl --no-pager --since "@$ROLL_T0" 2>/dev/null | grep -E "noo-apply|noo-fetch|noo-node-agent" \
   | python3 "$CELL_PY" redact > "$J/roll-window.journal"
 
+# The node agent's own record of the roll (the fresh cells' agent-state-after-*
+# dump, run.sh agent_dump): its unit status, its journal from ROLL_T0 and the
+# self node as the controller sees it. A step, so it passes the redactor, lands
+# in logs/ (uploaded, then scanned) and a failure of it never fails the cell
+# (cell.py skips agent-state-after-*). Before the --stack's sleep + STACK_T0,
+# so its sudos are outside B3's window.
+step agent-state-after-roll 120 -- sh -c '
+  echo "== systemctl status noo-node-agent"; sudo -n systemctl status noo-node-agent --no-pager -l 2>&1 | head -40
+  echo "== journalctl -u noo-node-agent (since the roll, last 300)"
+  sudo -n journalctl -u noo-node-agent --no-pager --since "@$1" -n 300 2>&1
+  echo "== noo --json cluster show $2"
+  timeout 60 noo --json cluster show "$2" 2>&1 | head -c 20000; echo' _ "$ROLL_T0" "$SELF" || true
+
 # ── 4. the same-tag --stack (1b's Stage route on a node whose applier is new) ─
 # 0.6.26's onboard already installed noo-netns-restore.service (its own sudo
 # tee), so a --stack would find it current and print nothing: remove it first,
