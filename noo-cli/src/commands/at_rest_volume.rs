@@ -235,7 +235,7 @@ pub(crate) fn flag_from(body: &Value, key: &str) -> Option<AcceptedState> {
 }
 
 fn check(name: &'static str, verdict: Verdict, detail: String, remedy: Option<String>) -> Check {
-    Check { name, verdict, detail, remedy }
+    Check { name, verdict, detail, remedy }.checked()
 }
 
 /// What the live mapping looks like, for [`volume_check`].

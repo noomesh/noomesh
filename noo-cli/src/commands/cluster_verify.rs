@@ -44,6 +44,7 @@ mod warmup;
 pub(crate) mod restart_loops;
 mod gpu_held;
 mod hf_hub;
+pub(crate) mod rows;
 
 /// One invariant, judged.
 #[derive(Debug, Clone, PartialEq)]
@@ -53,6 +54,20 @@ pub struct Check {
     pub detail: String,
     /// The command that fixes it, when there is one.
     pub remedy: Option<String>,
+}
+
+impl Check {
+    /// Every row passes through here (the four constructors below, and each
+    /// `Check { … }` literal, end in `.checked()`). A release build returns
+    /// the row unchanged; a test build refuses a name missing from
+    /// [`rows::ROWS`] or a verdict that row does not declare, so a new row
+    /// cannot ship without its registry entry (and docs/reference/verify-rows.md).
+    #[inline]
+    pub(crate) fn checked(self) -> Check {
+        #[cfg(test)]
+        rows::assert_declared(self.name, self.verdict);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,16 +86,16 @@ pub enum Verdict {
 }
 
 pub(crate) fn ok(name: &'static str, detail: impl Into<String>) -> Check {
-    Check { name, verdict: Verdict::Ok, detail: detail.into(), remedy: None }
+    Check { name, verdict: Verdict::Ok, detail: detail.into(), remedy: None }.checked()
 }
 fn warn(name: &'static str, detail: impl Into<String>, remedy: Option<String>) -> Check {
-    Check { name, verdict: Verdict::Warn, detail: detail.into(), remedy }
+    Check { name, verdict: Verdict::Warn, detail: detail.into(), remedy }.checked()
 }
 fn accepted(name: &'static str, detail: impl Into<String>) -> Check {
-    Check { name, verdict: Verdict::Accepted, detail: detail.into(), remedy: None }
+    Check { name, verdict: Verdict::Accepted, detail: detail.into(), remedy: None }.checked()
 }
 fn fail(name: &'static str, detail: impl Into<String>, remedy: impl Into<String>) -> Check {
-    Check { name, verdict: Verdict::Fail, detail: detail.into(), remedy: Some(remedy.into()) }
+    Check { name, verdict: Verdict::Fail, detail: detail.into(), remedy: Some(remedy.into()) }.checked()
 }
 
 /// The `self-agent lane` row (i67): how the controller's own node is
@@ -404,7 +419,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
             detail: format!("starting — {} (`noo cluster verify --wait` waits for it)",
                 n["status_detail"].as_str().unwrap_or("the gateway started moments ago and has not heard this node's gossip yet")),
             remedy: None,
-        }),
+        }.checked()),
         (s, _) => out.push(fail("online", format!("status {s}"), format!("noo cluster show {id}"))),
     }
 
@@ -2549,7 +2564,7 @@ pub(crate) fn host_checks(id: &str, host: &Value, hostd_alive: bool) -> Vec<Chec
                     if state.is_empty() { "?" } else { &state }
                 ),
                 remedy: Some(format!("noo cluster verify {id}   # re-run in a minute")),
-            });
+            }.checked());
             return out;
         }
         out.push(fail("tailnet control",
@@ -3226,7 +3241,7 @@ pub(crate) fn agent_cert_check(id: &str, host: &str, covers: Option<bool>, other
                  (its registered or dialed address, or a SAN in its leaf). Investigate before issuing anything: a certificate for {host} would let {id} answer as {other}"
             ),
             remedy: None,
-        },
+        }.checked(),
         None => fail(
             "agent certificate",
             format!("{id}: its certificate does not cover the address the controller dials it at ({host}), so every call to it fails TLS (imports, logs, metrics); `noo security pki push-nodes {id}` will issue it a certificate for {host}"),
@@ -8106,7 +8121,7 @@ fn digest(checks: &[Check], verbose: bool) -> Digest {
             verdict: worst.verdict,
             detail: format!("{} — {}{more}", names.join(", "), worst.detail),
             remedy: worst.remedy.clone(),
-        });
+        }.checked());
     }
     Digest { counts, rows }
 }
@@ -9700,6 +9715,8 @@ pub(crate) fn stack_rows(lock: Option<&[LockImage]>, containers: Result<Vec<Stac
 fn checks_json(checks: &[Check]) -> Value {
     Value::Array(checks.iter().map(|c| {
         let mut o = serde_json::json!({
+            // The stable code a program keys on (rows.rs); `name` may be reworded.
+            "id": rows::by_name(c.name).map(|r| r.id),
             "name": c.name,
             "verdict": match c.verdict { Verdict::Ok => "ok", Verdict::Warn => "warn", Verdict::Fail => "fail", Verdict::Starting => "starting", Verdict::Accepted => "accepted" },
             "detail": c.detail,

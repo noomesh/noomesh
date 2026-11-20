@@ -260,7 +260,7 @@ pub(crate) fn judge(holders: &[Holder], residue: &[String]) -> Check {
             verdict: Verdict::Warn,
             detail: "no running container of this stack found — nothing to judge, which is not the same as nothing lying about".into(),
             remedy: Some("noo stack status".into()),
-        };
+        }.checked();
     }
     if !fails.is_empty() {
         return Check {
@@ -268,7 +268,7 @@ pub(crate) fn judge(holders: &[Holder], residue: &[String]) -> Check {
             verdict: Verdict::Fail,
             detail: format!("a file-backed secret is a plain environment variable or a file is lying about — {}", fails.join("; ")),
             remedy: Some(residue_remedy(env_failed, &leftovers)),
-        };
+        }.checked();
     }
     if !deferred.is_empty() {
         return Check {
@@ -279,7 +279,7 @@ pub(crate) fn judge(holders: &[Holder], residue: &[String]) -> Check {
                 deferred.join("; ")
             ),
             remedy: None,
-        };
+        }.checked();
     }
     Check {
         name: NAME,
@@ -289,7 +289,7 @@ pub(crate) fn judge(holders: &[Holder], residue: &[String]) -> Check {
             holders.len(),
         ),
         remedy: None,
-    }
+    }.checked()
 }
 
 // ── docker access (names only) ─────────────────────────────────────────────
@@ -437,7 +437,7 @@ pub(crate) fn refusal_of(out: std::io::Result<std::process::Output>) -> Option<S
 /// A row that read no container because docker refused this account: it says
 /// so (failed lookup is not absence), at `verdict`, with the docker remedy.
 pub(crate) fn not_judged_refused(name: &'static str, verdict: Verdict, refusal: &str, tail: &str) -> Check {
-    Check { name, verdict, detail: format!("not judged — {refusal}{tail}"), remedy: Some(DOCKER_REFUSED_REMEDY.into()) }
+    Check { name, verdict, detail: format!("not judged — {refusal}{tail}"), remedy: Some(DOCKER_REFUSED_REMEDY.into()) }.checked()
 }
 
 /// The `secrets not in env` row, against the live box (or a named compose
@@ -566,7 +566,7 @@ pub(crate) fn shared_secrets_check(facts: &[SecretFacts], store: &StoreDigests) 
         verdict: Verdict::Fail,
         detail,
         remedy: Some("noo upgrade --stack   # mints any bus key the store lacks and recreates every holder".into()),
-    };
+    }.checked();
     if facts.is_empty() {
         return fail("not judged: no running container of this stack was found — nothing here may read as a pass".into());
     }
@@ -772,9 +772,9 @@ pub(crate) fn shared_secrets_check(facts: &[SecretFacts], store: &StoreDigests) 
             verdict: Verdict::Warn,
             detail: format!("{mine}; but {}", warns.join("; ")),
             remedy: Some("noo addons upgrade trellion_intel   # a bundle that re-sources nats_addon_password from its own key".into()),
-        };
+        }.checked();
     }
-    Check { name: NAME, verdict: Verdict::Ok, detail: mine, remedy: None }
+    Check { name: NAME, verdict: Verdict::Ok, detail: mine, remedy: None }.checked()
 }
 
 // ── live probes for the row (names, one non-secret value, digests) ─────────
@@ -1161,7 +1161,7 @@ pub(crate) fn unchecked_delivery_check(audit: &serde_json::Value) -> Option<Chec
         verdict: Verdict::Warn,
         detail: format!("NOT checked in {} — not a pass; the audit says why", names.join(", ")),
         remedy: Some("noo security secrets audit".into()),
-    })
+    }.checked())
 }
 
 #[cfg(test)]
