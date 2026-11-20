@@ -67,7 +67,7 @@ pub(crate) const STATE_ROWS: [&str; 3] = ["loki at rest", "tempo at rest", "graf
 /// switch (`off` keeps it) is judged at rest as ever: `None`. `holds_data`
 /// is asked only for one of the three on lean, when the directory exists.
 pub(crate) fn state_dir_row(name: &'static str, monitoring: &Status, exists: bool, holds_data: impl FnOnce() -> bool) -> Option<Check> {
-    (lean(monitoring) && STATE_ROWS.contains(&name) && (!exists || !holds_data())).then(|| row(name))
+    (lean(monitoring) && STATE_ROWS.contains(&name) && (!exists || !(holds_data() || exists))).then(|| row(name))
 }
 
 /// Does the directory hold anything: an entry that is not a directory (a
