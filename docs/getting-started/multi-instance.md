@@ -143,12 +143,11 @@ directory, and `~/.config/mesh/<name>/`.
   instance, which may be the person's real stack. Pass
   `noo --instance <name> …`, and check the container names it reports
   (`noo-<name>-*`) before you change anything.
-- **A single container by name:** today `noo --instance <name> stack logs
-  <service>` (one service) and `noo doctor strangers` resolve the default
-  stack's container, not the instance's (a fix is in flight). Give the full
-  name, `noo --instance <name> stack logs noo-<name>-<service>`. The
-  start, stop, restart, status and clean scripts, onboard and a
-  multi-service `stack logs` already act on the instance.
+- **A single container by name:** `noo --instance <name> stack logs
+  <service>` and `noo doctor strangers` resolve the instance's own
+  container (`noo-<name>-<service>`) and never fall back to the default
+  stack's (0.6.29+). With an older `noo`, give the full name:
+  `noo --instance <name> stack logs noo-<name>-<service>`.
 - **The default instance has no name:** no `NOO_INSTANCE`, `noo-*`
   containers, the stock ports.
 - **A refused start is a guard, not a bug:**
