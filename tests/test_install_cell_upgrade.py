@@ -409,3 +409,33 @@ def test_upgrade_sh_watches_docker_across_the_roll_and_plain_start_only():
     assert text.index("step before-roll") < start < roll
     assert text.index("step start-after-upgrade ") < stop < chat
     assert "logs/docker-events-upgrade.jsonl" in text and "pkill" not in text
+
+
+# ── the evidence a judged FAIL arrives with ─────────────────────────────────
+def test_the_upload_covers_every_step_log_the_verify_jsons_and_the_agent_journal():
+    sh = (JUDGE.parent / "upgrade.sh").read_text()
+    wf = (ROOT / ".github" / "workflows" / "install-matrix.yml").read_text()
+    job = wf[wf.index("\n  upgrade:\n"):wf.index("\n  size:\n")]
+    # the workflow uploads the whole of OUT, and OUT is that same directory
+    assert "OUT: ${{ runner.temp }}/cell\n" in job
+    assert "path: ${{ runner.temp }}/cell/\n" in job and "if: always()" in job
+    # step logs: lib.sh's step() keeps logs/<step>.log under OUT
+    assert 'local log="$OUT/logs/$name.log"' in (JUDGE.parent / "lib.sh").read_text()
+    # the judge's work dir is inside OUT, and holds every verify JSON the judge reads
+    assert 'J="$OUT/judge"' in sh
+    for name in ("verify-before.json", "verify-after.json", "verify-final.json"):
+        assert '"$J/%s"' % name in sh or '"$2/%s"' % name in sh, name
+    # the agent's journal around the roll, as a redacted step in logs/
+    i = sh.index("step agent-state-after-roll ")
+    assert 'journalctl -u noo-node-agent --no-pager --since "@$1"' in sh[i:i + 600]
+    assert i > sh.index("step upgrade-all ") and i < sh.index("step remove-netns-unit "), "inside the roll, before B3's window"
+    # the redacted journals the judge reads
+    for name in ("roll-window.journal", "apply.journal", "node.journal"):
+        assert '"$J/%s"' % name in sh, name
+
+
+def test_the_scan_runs_over_the_whole_upload_and_withholds_it_on_a_hit():
+    sh = (JUDGE.parent / "upgrade.sh").read_text()
+    fin = sh[sh.index("finish() {"):sh.index("# ── 1.")]
+    assert 'python3 "$CELL_PY" scan "$OUT"' in fin, "the scan covers logs/, judge/ and the agent step"
+    assert 'rm -rf "$OUT/logs" "$OUT/judge"' in fin
