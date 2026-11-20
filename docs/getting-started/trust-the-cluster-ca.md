@@ -9,7 +9,9 @@ and the connection is encrypted either way. Trusting the CA makes it go away,
 and lets you verify you are talking to your own controller instead of
 clicking through.
 
-## The option that needs no CA
+## For people
+
+### The option that needs no CA
 
 If the controller is on a tailnet and onboarding set up `tailscale serve`, the
 dashboard is also at `https://<controller>.<your-tailnet>.ts.net`. That name
@@ -17,7 +19,7 @@ carries a public certificate issued for the `ts.net` domain, so every browser
 accepts it with nothing to install.
 Use the CA steps below when you reach the box by IP or hostname on a LAN.
 
-## Step 1: the OS store (what `noo` does)
+### Step 1: the OS store (what `noo` does)
 
 ```bash
 noo security trust-ca            # on the machine that runs the browser
@@ -37,7 +39,7 @@ first (`scp <controller>:~/.noo/pki/ca.crt .`) and give `trust-ca` its path:
 `noo security trust-ca ./ca.crt`, or follow the per-browser steps with that
 file. Only ever copy `ca.crt`; never `ca.key`.
 
-## Linux: Chrome and Chromium
+### Linux: Chrome and Chromium
 
 They read the per-user NSS database, not `/etc/ssl`:
 
@@ -54,7 +56,7 @@ in the `-d` argument. Alternatively, in the browser: Settings, Privacy and
 security, Manage certificates, Authorities, Import `ca.crt`, tick "Trust this
 certificate for identifying websites".
 
-## Linux, macOS, Windows: Firefox
+### Linux, macOS, Windows: Firefox
 
 Settings, Privacy and Security, Certificates, View Certificates, Authorities,
 Import `ca.crt`, tick "Trust this CA to identify websites".
@@ -66,7 +68,7 @@ enough), set the `security.enterprise_roots.enabled` preference to `true` in
 Firefox snap reads its own policy directory; the per-browser import above is
 the simpler route there.
 
-## macOS
+### macOS
 
 `noo security trust-ca` is enough for Safari and Chrome, which both read the
 System keychain. Firefox: see above. To do it by hand:
@@ -75,7 +77,7 @@ System keychain. Firefox: see above. To do it by hand:
 sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ca.crt
 ```
 
-## Windows
+### Windows
 
 Install the CA into the Windows "Trusted Root Certification Authorities"
 store, from an elevated PowerShell, with the file copied to the Windows side:
@@ -89,7 +91,7 @@ run inside WSL2 installs into the Linux distro's store, not Windows, so a
 browser on the Windows side needs the command above (or open the dashboard on
 its `ts.net` name).
 
-## Verify
+### Verify
 
 ```bash
 curl -sS https://<controller>:8080/health        # no certificate error = the OS store trusts it
@@ -108,3 +110,24 @@ install is still in the store (`noo security untrust-ca`, then trust again).
 
 Remove the trust again with `noo security untrust-ca` (OS store) and, for
 browsers, delete the entry: `certutil -d sql:$HOME/.pki/nssdb -D -n "noomesh cluster CA"`.
+
+## For agents
+
+- **Trusting the CA is a person's step.** `noo security trust-ca` changes
+  the machine's trust store with `sudo` (or `pkexec`), and the browser
+  imports are clicks in the person's browser. Do neither on your own, and
+  never on a remote node.
+- **Prefer the name that needs nothing installed:** on a tailnet controller
+  set up with `tailscale serve`, `https://<controller>.<your-tailnet>.ts.net`
+  carries a public certificate.
+- **Checking is read-only and yours:** `curl -sS https://<controller>:8080/health`
+  (no certificate error = the OS store trusts the CA), `noo health`, and
+  `openssl x509 -in <ca.crt> -noout -subject -fingerprint -sha256` to
+  compare against what the browser shows (issuer "Mesh Cluster CA").
+- **A name the certificate does not cover:** `noo security pki status`
+  lists the gateway certificate's names. Re-issuing it
+  (`noo security pki issue-gateway <hostname> <ip>`) issues a new
+  certificate in place of the gateway's current one: report the mismatch
+  and leave that to the person.
+- **Only `ca.crt` ever leaves the controller.** Never read, copy or print
+  `ca.key`.
