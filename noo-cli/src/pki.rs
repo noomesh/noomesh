@@ -450,7 +450,7 @@ pub const SERVICE_KEY_READERS: &[(&str, KeyReader)] = &[
     // runs it as `user: grafana`, the image's uid 65532 (i64). grafana-server reads
     // GF_SERVER_CERT_KEY itself, as that uid.
     ("grafana", KeyReader::ContainerUid(65532)),
-    // nginx:1.27-alpine: the master process loads certificates as root.
+    // nginx (alpine): the master process loads certificates as root.
     ("model-cache", KeyReader::ContainerRoot),
     // evolve (personifAI/trellion-evolve, from v0.1.4): a DHI python base
     // ending `USER 65532:65532`, and its overlay pins `user: nonroot`. Through
